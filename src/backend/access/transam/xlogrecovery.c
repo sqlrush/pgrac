@@ -721,6 +721,7 @@ struct ClusterRecoveryStartV1 {
 	ClusterRecoveryCensus *ctrc_observation_census;
 	ClusterRecoveryCensusManifest ctrc_observation_manifest;
 	ClusterColdCtrcPhysicalV1 *ctrc_physical;
+	const ClusterRecoveryCensusPagesV1 *ctrc_pages; /* PGRAC: original census owns this view */
 	char ctrc_observation_refusal[384];
 };
 static struct ClusterRecoveryStartV1 *cluster_recovery_cold_start;
@@ -733,6 +734,7 @@ static void
 cluster_recovery_cold_observation_close(struct ClusterRecoveryStartV1 *start)
 {
 	start->ctrc_observation_complete = false;
+	start->ctrc_pages = NULL;
 	cluster_recovery_census_destroy(start->ctrc_observation_census);
 	start->ctrc_observation_census = NULL;
 	if (start->ctrc_observation_inputs != NULL)
@@ -1198,8 +1200,18 @@ ClusterColdRecoveryCtrcObserve(const struct ClusterRecoveryStartV1 *start, Size 
 				&& memcmp(&confirmed, &state->ctrc_observation_manifest, sizeof(confirmed)) == 0
 				&& cluster_recovery_cold_observation_current(start)
 				&& cluster_recovery_cold_observation_terminals_current(state)) {
-				state->ctrc_observation_complete = true;
-				observed = true;
+				const ClusterRecoveryCensusPagesV1 *pages =
+					cluster_recovery_census_pages_v1(state->ctrc_observation_census);
+
+				/* PGRAC: retain the complete original PAGE view only after all
+				 * original terminals. A repeat cannot replace that borrowed view. */
+				if (pages != NULL && cluster_recovery_cold_observation_current(start)
+					&& (state->ctrc_pages == NULL || state->ctrc_pages == pages)) {
+					state->ctrc_pages = pages;
+					state->ctrc_observation_complete = true;
+					observed = true;
+				} else
+					cluster_recovery_cold_observation_refuse(state, "page_inventory", 0);
 			} else
 				cluster_recovery_cold_observation_refuse(state, "manifest_changed", 0);
 		}
@@ -1320,6 +1332,18 @@ ClusterColdRecoveryCtrcPhysical(const struct ClusterRecoveryStartV1 *start,
 	/* Repeat observation only revalidates the same retained inputs/manifest;
 	 * budget0 cannot start a replacement scope or rebuild a refused view. */
 	return ClusterColdRecoveryCtrcObserve(start, 0) ? start->ctrc_physical : NULL;
+}
+
+const ClusterRecoveryCensusPagesV1 *
+ClusterColdRecoveryCtrcPages(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work)
+{
+	if (start == NULL || start != cluster_recovery_cold_start || CritSectionCount != 0
+		|| !start->ctrc_observation_complete || work != start->ctrc_observation_work)
+		return NULL;
+	/* PGRAC: this is an observation getter before PAGE acquisition. The
+	 * original DONE/ROOT/accepted-TX path may do I/O and retire this view. */
+	return ClusterColdRecoveryCtrcObserve(start, 0) ? start->ctrc_pages : NULL;
 }
 
 /* History endpoints cannot substitute for the current failed source of a TT

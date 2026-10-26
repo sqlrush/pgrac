@@ -166,6 +166,32 @@ typedef struct ClusterColdCtrcPhysicalV1 {
 	ClusterRecoveryUndoEntry entries[FLEXIBLE_ARRAY_MEMBER];
 } ClusterColdCtrcPhysicalV1;
 
+/* Value-only index of every physical relation PAGE, including non-heap and
+ * SPACE pages. No borrowed scanner buffer or ROOT entry is retained here.
+ * The full-byte digest binds an observation, never authority or completion. */
+typedef struct ClusterRecoveryCensusPageV1 {
+	ClusterSpaceReservation reservation;
+	uint64 identity_token, reservation_token;
+	uint32 root_index;
+	ForkNumber forknum;
+	BlockNumber blockno;
+	bool heap;
+	uint8 page_sha256[32];
+} ClusterRecoveryCensusPageV1;
+
+typedef struct ClusterRecoveryCensusPagesV1 {
+	uint32 count;
+	ClusterRecoveryCensusPageV1 entries[FLEXIBLE_ARRAY_MEMBER];
+} ClusterRecoveryCensusPagesV1;
+
+/* Only after all original final rereads. Reuse original DONE/namespace/input
+ * validation and reject any change to the saved index. Borrow immutable bytes
+ * until the cursor is invalidated or destroyed. A complete empty view differs
+ * from NULL. Call before PAGE/content protection; this may validate ROOT.
+ * The view grants no stable-base/PAGE, replay, discharge or completion right. */
+extern const ClusterRecoveryCensusPagesV1 *cluster_recovery_census_pages_v1(
+	ClusterRecoveryCensus *census);
+
 /* Borrow the original live cold inputs and their ROOT-selected isolated
  * namespace fd. The caller holds isolation, retention and these owners for
  * the entire cursor lifetime; this API establishes none of those premises.

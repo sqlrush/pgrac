@@ -967,7 +967,24 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(82);
+	if (getenv("PGRAC_PRE2_TEST_CTRC_PAGE_INVENTORY") != NULL) {
+		UT_PLAN(6);
+	UT_RUN(test_owned_page_inventory_retains_every_space_and_raw_main_page);
+	UT_RUN(test_owned_page_inventory_keeps_original_heap_layout_and_space_identity);
+	UT_RUN(test_owned_page_inventory_never_exports_or_advances_an_observation_prefix);
+	UT_RUN(test_owned_page_inventory_mutation_revokes_the_original_complete_view);
+	UT_RUN(test_owned_page_inventory_scope_loss_is_sticky_without_rebasing_inputs);
+	UT_RUN(test_owned_page_inventory_capacity_never_silently_omits_physical_pages);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	UT_PLAN(88);
+	UT_RUN(test_owned_page_inventory_retains_every_space_and_raw_main_page);
+	UT_RUN(test_owned_page_inventory_keeps_original_heap_layout_and_space_identity);
+	UT_RUN(test_owned_page_inventory_never_exports_or_advances_an_observation_prefix);
+	UT_RUN(test_owned_page_inventory_mutation_revokes_the_original_complete_view);
+	UT_RUN(test_owned_page_inventory_scope_loss_is_sticky_without_rebasing_inputs);
+	UT_RUN(test_owned_page_inventory_capacity_never_silently_omits_physical_pages);
+
 	UT_RUN(test_ctrc_inventory_keeps_original_local_cut_and_native_terminal_bytes);
 	UT_RUN(test_owned_ctrc_census_borrows_namespace_and_revokes_changed_work);
 	UT_RUN(test_owned_ctrc_census_rejects_other_purpose_and_namespace_switch);

@@ -2322,7 +2322,22 @@ int main(void)
 		UT_RUN(test_relmap_failure_revokes_original_episode_without_free_or_release);
 		reset(); UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(131);
+	if (getenv("PGRAC_PRE2_TEST_CTRC_PAGE_INVENTORY") != NULL) {
+		UT_PLAN(5);
+		UT_RUN(test_ctrc_pages_belong_to_the_complete_original_start_observation);
+		UT_RUN(test_ctrc_pages_missing_or_rebound_view_revokes_the_original_observation);
+		UT_RUN(test_ctrc_pages_require_original_work_owner_and_accepted_tx);
+		UT_RUN(test_ctrc_pages_complete_empty_view_is_distinct_from_missing);
+		UT_RUN(test_ctrc_pages_native_error_retires_cursor_before_original_scope);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
+	UT_PLAN(136);
+	UT_RUN(test_ctrc_pages_belong_to_the_complete_original_start_observation);
+	UT_RUN(test_ctrc_pages_missing_or_rebound_view_revokes_the_original_observation);
+	UT_RUN(test_ctrc_pages_require_original_work_owner_and_accepted_tx);
+	UT_RUN(test_ctrc_pages_complete_empty_view_is_distinct_from_missing);
+	UT_RUN(test_ctrc_pages_native_error_retires_cursor_before_original_scope);
+
 	UT_RUN(test_relmap_declaration_withholds_component_complete_and_is_not_success);
 	UT_RUN(test_relmap_declaration_cannot_reopen_accepted_or_observed_episode);
 	UT_RUN(test_relmap_failure_revokes_original_episode_without_free_or_release);

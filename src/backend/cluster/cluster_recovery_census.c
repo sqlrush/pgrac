@@ -21,6 +21,10 @@ struct ClusterRecoveryCensus {
 	ClusterRecoveryMultixactScan *mx;
 	ClusterRecoverySlruScan *slru;
 	ClusterRecoveryRelmapScan *relmap;
+	ClusterRecoveryCensusPagesV1 *pages;
+	uint32 page_count, page_capacity;
+	uint8 pages_sha256[32];
+	bool pages_complete;
 	ClusterRecoveryCensusDiag diag;
 	ClusterRecoveryCensusManifest manifest;
 	ClusterRecoveryCensusResult status;
@@ -37,6 +41,11 @@ census_release(ClusterRecoveryCensus *census)
 {
 	/* Dependents precede their owners. Inventory destruction revokes its
 	 * borrowed graph/roots, so both must still be alive here. */
+	free(census->pages);
+	census->pages = NULL;
+	census->page_count = census->page_capacity = 0;
+	census->pages_complete = false;
+	memset(census->pages_sha256, 0, sizeof(census->pages_sha256));
 	cluster_recovery_page_roots_destroy(census->page_roots);
 	census->page_roots = NULL;
 	cluster_recovery_relation_census_destroy(census->relations);
@@ -82,17 +91,28 @@ cluster_recovery_census_begin(ClusterWalInputsV1 *inputs, int root_fd, size_t me
 	first = cluster_wal_inputs_at_v1(inputs, 0);
 	if (count == 0 || count > CLUSTER_WAL_INPUTS_MAX || first == NULL)
 		return CLUSTER_RECOVERY_CENSUS_INVALID;
-	/* Five concurrent reservations: roots, inventory, undo, TX graph, and
-	 * sequential relation/SLRU/MX scratch. Original consumers enforce each cap.
+	/* Six concurrent reservations: roots, inventory, undo, TX graph,
+	 * sequential relation/SLRU/MX scratch, and retained PAGE metadata.
+	 * Original consumers enforce each cap.
 	 * Divide only after subtraction; never overflow a sum of allocations. */
 	if (memory_budget <= sizeof(*census))
 		return CLUSTER_RECOVERY_CENSUS_CAPACITY;
-	budget = (memory_budget - sizeof(*census)) / 5;
+	budget = (memory_budget - sizeof(*census)) / 6;
 	if (budget < 32 * BLCKSZ)
 		return CLUSTER_RECOVERY_CENSUS_CAPACITY;
 	census = calloc(1, sizeof(*census));
 	if (census == NULL)
 		return CLUSTER_RECOVERY_CENSUS_CAPACITY;
+	/* Reserve the complete metadata cap before traversing any input. This is
+	 * not another page cache: original bytes are reduced to a full-page hash. */
+	census->page_capacity = (uint32)Min((budget - offsetof(ClusterRecoveryCensusPagesV1, entries))
+		/ sizeof(ClusterRecoveryCensusPageV1), (size_t)UINT32_MAX);
+	census->pages = calloc(1, offsetof(ClusterRecoveryCensusPagesV1, entries)
+		+ (size_t)census->page_capacity * sizeof(ClusterRecoveryCensusPageV1));
+	if (census->pages == NULL) {
+		cluster_recovery_census_destroy(census);
+		return CLUSTER_RECOVERY_CENSUS_CAPACITY;
+	}
 	census->inputs = inputs;
 	census->source_count = count;
 	census->system_identifier = first->source.claim.identity.system_identifier;
@@ -211,6 +231,67 @@ census_hash_number(pg_cryptohash_ctx *hash, uint64 value)
 	for (unsigned i = 0; i < sizeof(bytes); ++i)
 		bytes[i] = (uint8)(value >> (8 * i));
 	return pg_cryptohash_update(hash, bytes, sizeof(bytes)) == 0;
+}
+
+/* Hash private value bytes while the original cursor still owns them.
+ * ERROR must release the hash context before the census retires its owners. */
+static bool
+census_hash_bytes(const void *bytes, size_t length, uint8 digest[32])
+{
+	pg_cryptohash_ctx *volatile hash = NULL;
+	volatile bool ok = false;
+
+	PG_TRY();
+	{
+		hash = pg_cryptohash_create(PG_SHA256);
+		ok = hash != NULL && pg_cryptohash_init(hash) == 0
+			&& pg_cryptohash_update(hash, bytes, length) == 0
+			&& pg_cryptohash_final(hash, digest, 32) == 0;
+	}
+	PG_FINALLY();
+	{
+		if (hash != NULL)
+			pg_cryptohash_free(hash);
+	}
+	PG_END_TRY();
+	return ok;
+}
+
+static ClusterRecoveryCensusResult
+census_remember_page(ClusterRecoveryCensus *census,
+	const ClusterRecoveryRelationCensusEntry *entry)
+{
+	ClusterRecoveryCensusPageV1 *value;
+
+	if (entry->kind != CLUSTER_RECOVERY_RELATIONS_PAGE)
+		return CLUSTER_RECOVERY_CENSUS_MORE;
+	if (census->pages == NULL || census->pages_complete || entry->page.page == NULL)
+		return CLUSTER_RECOVERY_CENSUS_REFUSED;
+	if (census->page_count == census->page_capacity)
+		return CLUSTER_RECOVERY_CENSUS_CAPACITY;
+	value = &census->pages->entries[census->page_count];
+	value->reservation = entry->page.reservation;
+	value->identity_token = entry->page.identity_token;
+	value->reservation_token = entry->page.reservation_token;
+	value->root_index = entry->root_index;
+	value->forknum = entry->page.forknum;
+	value->blockno = entry->page.block;
+	value->heap = entry->heap;
+	if (!census_hash_bytes(entry->page.page, BLCKSZ, value->page_sha256))
+		return CLUSTER_RECOVERY_CENSUS_REFUSED;
+	census->pages->count = ++census->page_count;
+	return CLUSTER_RECOVERY_CENSUS_MORE;
+}
+
+/* Native private storage, not a wire encoding or a completion witness. The
+ * separate count bounds every access even if the public readonly view changes. */
+static bool
+census_pages_digest(ClusterRecoveryCensus *census, uint8 digest[32])
+{
+	return census->pages != NULL && census->page_count <= census->page_capacity
+		&& census->pages->count == census->page_count
+		&& census_hash_bytes(census->pages, offsetof(ClusterRecoveryCensusPagesV1, entries)
+			+ (size_t)census->page_count * sizeof(ClusterRecoveryCensusPageV1), digest);
 }
 
 static bool
@@ -414,6 +495,9 @@ census_step(ClusterRecoveryCensus *census, ClusterRecoveryCensusEntry *out)
 			d->relation_result
 				= cluster_recovery_relation_census_next(census->relations, &out->value.relation);
 		if (d->relation_result == CLUSTER_RECOVERY_RELATIONS_ENTRY) {
+			ClusterRecoveryCensusResult result = census_remember_page(census, &out->value.relation);
+			if (result != CLUSTER_RECOVERY_CENSUS_MORE)
+				return census_fail(census, result);
 			d->relation_entries++;
 			return census_entry(out, CLUSTER_RECOVERY_CENSUS_RELATION);
 		}
@@ -600,18 +684,22 @@ census_step(ClusterRecoveryCensus *census, ClusterRecoveryCensusEntry *out)
 		d->inventory_result = cluster_recovery_native_inventory_recheck(
 			census->inputs, census->inventory, &d->inventory);
 		if (d->inventory_result != CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED
-			|| !census_build_manifest(census))
+			|| !census_build_manifest(census)
+			|| !census_pages_digest(census, census->pages_sha256))
 			break;
+		census->pages_complete = true;
 		d->phase = CLUSTER_RECOVERY_CENSUS_DONE;
 		census->status = CLUSTER_RECOVERY_CENSUS_DRAINED;
 		return census->status;
 	case CLUSTER_RECOVERY_CENSUS_DONE: {
-		uint8 digest[32], inputs_digest[32];
+		uint8 digest[32], inputs_digest[32], pages_digest[32];
 		d->input_result = cluster_wal_inputs_revalidate_v1(census->inputs);
 		if (d->input_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 			|| !cluster_recovery_root_set_digest(census->roots, digest)
 			|| !cluster_recovery_reference_graph_observed(census->graph)
 			|| !cluster_recovery_native_inventory_digest(census->inventory, inputs_digest)
+			|| !census->pages_complete || !census_pages_digest(census, pages_digest)
+			|| memcmp(pages_digest, census->pages_sha256, 32) != 0
 			|| census->manifest.encoding_version != 1
 			|| census->manifest.source_count != census->source_count
 			|| census->manifest.root_count != cluster_recovery_root_set_count(census->roots)
@@ -678,6 +766,16 @@ cluster_recovery_census_manifest(ClusterRecoveryCensus *census, ClusterRecoveryC
 		return false;
 	*out = census->manifest;
 	return true;
+}
+
+const ClusterRecoveryCensusPagesV1 *
+cluster_recovery_census_pages_v1(ClusterRecoveryCensus *census)
+{
+	ClusterRecoveryCensusManifest manifest;
+
+	/* The original manifest path owns DONE and ERROR revalidation. Never
+	 * advance a partial census or export a prefix after capacity refusal. */
+	return cluster_recovery_census_manifest(census, &manifest) ? census->pages : NULL;
 }
 
 bool

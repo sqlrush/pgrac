@@ -649,3 +649,210 @@ UT_TEST(test_owned_census_native_slru_drift_and_scope_loss_revoke_outputs)
 		owned_census_done(census, &inputs, fd, path);
 	}
 }
+
+
+/* Original cold PAGE inventory: parser/ROOT/WAL/physical files are real.
+ * Refuse-only mode is a test-first compatibility baseline, never production. */
+#ifdef CTRC_PAGES_REFUSE_ONLY
+const ClusterRecoveryCensusPagesV1 *
+cluster_recovery_census_pages_v1(ClusterRecoveryCensus *census)
+{
+	(void)census;
+	return NULL;
+}
+#endif
+
+static void owned_page_root_files(int root);
+
+UT_TEST(test_owned_page_inventory_retains_every_space_and_raw_main_page)
+{
+	static const uint8 main_digest[32] = {
+		0x31,0x44,0x6d,0xdf,0x76,0xf6,0x02,0xf7,0x8a,0xb1,0xa3,0x70,0xe6,0x67,0xd9,0xe0,
+		0xfc,0xd4,0x18,0x07,0x0d,0x97,0xe1,0x21,0xd3,0xec,0x2e,0xd7,0x5d,0x07,0x54,0xbd
+	};
+	ClusterWalInputsV1 *inputs;
+	char path[MAXPGPATH];
+	int fd;
+	unsigned main_pages = 0, space_pages = 0, empty_fork_pages = 0;
+	ClusterRecoveryCensus *census = owned_census_fixture(&inputs, &fd, path, false);
+	const ClusterRecoveryCensusPagesV1 *pages;
+
+	UT_ASSERT_EQ(owned_census_until(census, 0), CLUSTER_RECOVERY_CENSUS_DRAINED);
+	pages = cluster_recovery_census_pages_v1(census);
+	UT_ASSERT(pages != NULL);
+	if (pages == NULL) {
+		owned_census_done(census, &inputs, fd, path);
+		return;
+	}
+	UT_ASSERT_EQ(pages->count, 5);
+	for (uint32 i = 0; i < pages->count; i++) {
+		const ClusterRecoveryCensusPageV1 *page = &pages->entries[i];
+		const ClusterRecoveryRootEntry *root = cluster_recovery_root_set_entry(census->roots,
+			page->root_index);
+		UT_ASSERT(root != NULL && root->file.kind == CLUSTER_RECOVERY_FILE_RELATION);
+		UT_ASSERT(RelFileLocatorEquals(root->file.locator, page->reservation.identity.key.locator));
+		UT_ASSERT_EQ(root->file.forknum, page->forknum);
+		UT_ASSERT_EQ(page->identity_token, 7); UT_ASSERT_EQ(page->reservation_token, 11);
+		UT_ASSERT_EQ(page->reservation.identity.sequence, 2);
+		UT_ASSERT_EQ(page->reservation.identity.operation, 9);
+		UT_ASSERT_EQ(page->reservation.identity.state, CLUSTER_SPACE_IDENTITY_LIVE);
+		UT_ASSERT_EQ(page->reservation.identity.incarnation[0], 3);
+		UT_ASSERT_EQ(page->reservation.identity.key.locator.spcOid, 1663);
+		UT_ASSERT_EQ(page->reservation.identity.key.locator.dbOid, 5);
+		UT_ASSERT(!page->heap);
+		if (page->forknum == MAIN_FORKNUM) {
+			main_pages++;
+			UT_ASSERT_EQ(page->reservation.identity.key.locator.relNumber, 16385);
+			UT_ASSERT_EQ(page->blockno, 0);
+			UT_ASSERT(memcmp(page->page_sha256, main_digest, 32) == 0);
+		} else {
+			UT_ASSERT_EQ(page->forknum, SPACE_FORKNUM);
+			UT_ASSERT(page->blockno < 2); space_pages++;
+		}
+		empty_fork_pages += page->reservation.identity.key.locator.relNumber == 99999
+			&& page->forknum == MAIN_FORKNUM;
+		if (i != 0) {
+			const ClusterRecoveryCensusPageV1 *before = &pages->entries[i - 1];
+			UT_ASSERT(before->root_index < page->root_index
+				|| (before->root_index == page->root_index && before->blockno < page->blockno));
+		}
+	}
+	UT_ASSERT_EQ(main_pages, 1); UT_ASSERT_EQ(space_pages, 4);
+	UT_ASSERT_EQ(empty_fork_pages, 0);
+	UT_ASSERT(cluster_recovery_census_pages_v1(census) == pages);
+	owned_census_done(census, &inputs, fd, path);
+}
+
+UT_TEST(test_owned_page_inventory_keeps_original_heap_layout_and_space_identity)
+{
+	ClusterWalInputsV1 *inputs;
+	ClusterRecoveryCensus *census;
+	const ClusterRecoveryCensusPagesV1 *pages;
+	char path[MAXPGPATH];
+	int fd;
+	unsigned heap = 0;
+
+	owned_page_roots_fixture = true;
+	census = owned_census_fixture(&inputs, &fd, path, false);
+	owned_page_roots_fixture = false;
+	owned_page_root_files(fd);
+	UT_ASSERT_EQ(owned_census_until(census, 0), CLUSTER_RECOVERY_CENSUS_DRAINED);
+	pages = cluster_recovery_census_pages_v1(census);
+	UT_ASSERT(pages != NULL);
+	if (pages == NULL) {
+		owned_census_done(census, &inputs, fd, path);
+		return;
+	}
+	UT_ASSERT_EQ(pages->count, 5);
+	for (uint32 i = 0; i < pages->count; i++) {
+		if (!pages->entries[i].heap) continue;
+		heap++;
+		UT_ASSERT_EQ(pages->entries[i].forknum, MAIN_FORKNUM);
+		UT_ASSERT_EQ(pages->entries[i].blockno, 0);
+		UT_ASSERT_EQ(pages->entries[i].reservation.identity.key.locator.relNumber, 16385);
+	}
+	UT_ASSERT_EQ(heap, 1);
+	owned_census_done(census, &inputs, fd, path);
+}
+
+UT_TEST(test_owned_page_inventory_never_exports_or_advances_an_observation_prefix)
+{
+	ClusterWalInputsV1 *inputs;
+	ClusterRecoveryCensusDiag a, b;
+	char path[MAXPGPATH];
+	int fd;
+	ClusterRecoveryCensus *census = owned_census_fixture(&inputs, &fd, path, false);
+
+	UT_ASSERT(cluster_recovery_census_pages_v1(NULL) == NULL);
+	UT_ASSERT_EQ(owned_census_until(census, CLUSTER_RECOVERY_CENSUS_RELATIONS), 0);
+	UT_ASSERT(cluster_recovery_census_diag(census, &a));
+	UT_ASSERT(cluster_recovery_census_pages_v1(census) == NULL);
+	UT_ASSERT(cluster_recovery_census_diag(census, &b));
+	UT_ASSERT(memcmp(&a, &b, sizeof(a)) == 0);
+	UT_ASSERT_EQ(owned_census_until(census, 0), CLUSTER_RECOVERY_CENSUS_DRAINED);
+	UT_ASSERT(cluster_recovery_census_pages_v1(census) != NULL);
+	owned_census_done(census, &inputs, fd, path);
+}
+
+UT_TEST(test_owned_page_inventory_mutation_revokes_the_original_complete_view)
+{
+	for (unsigned fault = 0; fault < 6; fault++) {
+		ClusterWalInputsV1 *inputs;
+		char path[MAXPGPATH];
+		int fd;
+		ClusterRecoveryCensus *census = owned_census_fixture(&inputs, &fd, path, false);
+		ClusterRecoveryCensusPagesV1 *pages;
+		ClusterRecoveryCensusManifest manifest;
+		UT_ASSERT_EQ(owned_census_until(census, 0), CLUSTER_RECOVERY_CENSUS_DRAINED);
+		pages = (ClusterRecoveryCensusPagesV1 *)cluster_recovery_census_pages_v1(census);
+		UT_ASSERT(pages != NULL && pages->count == 5);
+		if (pages == NULL || pages->count != 5) {
+			owned_census_done(census, &inputs, fd, path);
+			continue;
+		}
+		if (fault == 0) pages->count--;
+		if (fault == 1) pages->entries[4].root_index++;
+		if (fault == 2) pages->entries[4].reservation.identity.sequence++;
+		if (fault == 3) pages->entries[4].page_sha256[31]++;
+		if (fault == 4) pages->entries[4].heap = !pages->entries[4].heap;
+		if (fault == 5) pages->entries[4].blockno++;
+		UT_ASSERT(cluster_recovery_census_pages_v1(census) == NULL);
+		UT_ASSERT(!cluster_recovery_census_manifest(census, &manifest));
+		owned_census_sticky(census, CLUSTER_RECOVERY_CENSUS_REFUSED);
+		owned_census_done(census, &inputs, fd, path);
+	}
+}
+
+UT_TEST(test_owned_page_inventory_scope_loss_is_sticky_without_rebasing_inputs)
+{
+	ClusterWalInputsV1 *inputs;
+	char path[MAXPGPATH];
+	int fd;
+	ClusterRecoveryCensus *census = owned_census_fixture(&inputs, &fd, path, false);
+	UT_ASSERT_EQ(owned_census_until(census, 0), CLUSTER_RECOVERY_CENSUS_DRAINED);
+	UT_ASSERT(cluster_recovery_census_pages_v1(census) != NULL);
+	inputs_pin_current = false;
+	UT_ASSERT(cluster_recovery_census_pages_v1(census) == NULL);
+	inputs_pin_current = true;
+	UT_ASSERT(cluster_recovery_census_pages_v1(census) == NULL);
+	owned_census_sticky(census, CLUSTER_RECOVERY_CENSUS_REFUSED);
+	owned_census_done(census, &inputs, fd, path);
+}
+
+UT_TEST(test_owned_page_inventory_capacity_never_silently_omits_physical_pages)
+{
+	ClusterWalInputsV1 *inputs;
+	char path[MAXPGPATH];
+	int fd, file;
+	ClusterSpaceReservation reservation;
+	ClusterSpaceIdentityKey key = { 0 };
+	const ClusterWalSourceRef *source;
+	uint64 token;
+	PGAlignedBlock page = { 0 };
+	ClusterRecoveryCensus *census = owned_census_fixture(&inputs, &fd, path, false);
+	cluster_recovery_census_destroy(census); census = NULL;
+	source = &cluster_wal_inputs_at_v1(inputs, 0)->source;
+	key.system_identifier = source->claim.identity.system_identifier;
+	key.database_incarnation = source->claim.database_incarnation;
+	memcpy(key.storage_uuid, source->claim.identity.storage_uuid, 16);
+	key.locator = (RelFileLocator){ 1663, 5, 16385 };
+	file = openat(fd, "base/5/16385_space", O_RDWR);
+	UT_ASSERT(file >= 0);
+	UT_ASSERT_EQ(pread(file, page.data, BLCKSZ, BLCKSZ), BLCKSZ);
+	UT_ASSERT(cluster_space_reservation_page_decode(page.data, BLCKSZ, SPACE_FORKNUM, 1,
+		&key, &reservation, &token));
+	reservation.next_block = 4096;
+	UT_ASSERT(cluster_space_reservation_page_encode(&reservation, 11, page.data, BLCKSZ));
+	UT_ASSERT_EQ(pwrite(file, page.data, BLCKSZ, BLCKSZ), BLCKSZ);
+	UT_ASSERT_EQ(close(file), 0);
+	memset(page.data, 0, BLCKSZ); page.data[BLCKSZ - 1] = 73;
+	file = openat(fd, "base/5/16385", O_WRONLY | O_TRUNC);
+	UT_ASSERT(file >= 0);
+	for (unsigned i = 0; i < 4096; i++) UT_ASSERT_EQ(write(file, page.data, BLCKSZ), BLCKSZ);
+	UT_ASSERT_EQ(close(file), 0);
+	UT_ASSERT_EQ(cluster_recovery_census_begin(inputs, fd, 2 * 1024 * 1024, &census), 0);
+	UT_ASSERT_EQ(owned_census_until(census, 0), CLUSTER_RECOVERY_CENSUS_CAPACITY);
+	UT_ASSERT(cluster_recovery_census_pages_v1(census) == NULL);
+	owned_census_sticky(census, CLUSTER_RECOVERY_CENSUS_CAPACITY);
+	owned_census_done(census, &inputs, fd, path);
+}
