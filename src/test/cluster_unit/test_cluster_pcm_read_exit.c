@@ -110,7 +110,6 @@ ExceptionalCondition(const char *condition pg_attribute_unused(),
 
 static bool gcs_first_fill_arm_slot(BufferDesc *buf pg_attribute_unused(),
 	const ClusterPcmReadSource *source pg_attribute_unused()) { return true; }
-static void gcs_first_fill_source_exit(void) { }
 #define cluster_pcm_lock_check_shutdown_wait() fixture_error()
 #define WaitLatch(...) (fixture_error(), 0)
 #define ResetLatch(latch) ((void)0)

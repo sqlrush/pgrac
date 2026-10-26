@@ -110,8 +110,6 @@ static void gcs_block_forward_reply_immediate_deny(const GcsBlockForwardPayload 
 #define ResetLatch(latch) ((void)0)
 #define MyLatch ((Latch *)1)
 #define ereport(level, ...) pg_re_throw()
-static bool gcs_first_fill_retry_progress(const ClusterPcmReadSource *source pg_attribute_unused(),
-	bool finish pg_attribute_unused()) { return latch_waits > 0; }
 #include "test_cluster_first_fill_holder.inc"
 #undef ereport
 #undef MyLatch
@@ -283,28 +281,6 @@ UT_TEST(holder_capacity_refuses_new_work_without_overwriting_the_live_request)
 	ClusterPcmOwnArray = saved;
 }
 
-UT_TEST(requester_retry_requires_a_specific_event_and_cannot_create_third_attempt)
-{
-	ClusterPcmReadSource source = {0};
-	volatile bool caught = false;
-	latch_waits = cancel_after = 0;
-	PG_TRY(); { cluster_gcs_block_read_source_retry_wait(&source, 0); }
-	PG_CATCH(); { caught = true; } PG_END_TRY();
-	UT_ASSERT(caught);
-	UT_ASSERT_EQ(latch_waits, 0);
-	source.retry_event = source.quiescent = true;
-	source.request_epoch = wait_epoch = 1;
-	cluster_gcs_block_read_source_retry_wait(&source, 0);
-	UT_ASSERT_EQ(latch_waits, 1);
-	caught = false;
-	cancel_after = 4;
-	PG_TRY(); { cluster_gcs_block_read_source_retry_wait(&source, 1); }
-	PG_CATCH(); { caught = true; } PG_END_TRY();
-	UT_ASSERT(caught);
-	UT_ASSERT_EQ(latch_waits, 4);
-	cancel_after = 0;
-}
-
 UT_TEST(native_output_completion_wakes_only_its_registered_workers)
 {
 	ClusterPcmOwnEntry entry = {0};
@@ -417,14 +393,13 @@ UT_TEST(unlock_between_failed_content_check_and_park_is_not_lost)
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(9);
 	UT_RUN(unlock_between_failed_content_check_and_park_is_not_lost);
 	UT_RUN(content_wait_resumes_only_on_native_event_and_wakes_all_same_worker_waiters);
 	UT_RUN(holder_parks_one_request_through_native_io_and_ships_on_completion);
 	UT_RUN(completed_io_with_busy_native_content_retains_the_same_request);
 	UT_RUN(stale_resident_membership_and_stop_retire_without_shipping);
 	UT_RUN(holder_capacity_refuses_new_work_without_overwriting_the_live_request);
-	UT_RUN(requester_retry_requires_a_specific_event_and_cannot_create_third_attempt);
 	UT_RUN(native_output_completion_wakes_only_its_registered_workers);
 	UT_RUN(native_output_episode_never_wraps_into_an_old_write);
 	UT_RUN(native_io_completion_and_abort_both_wake_the_exact_continuation);

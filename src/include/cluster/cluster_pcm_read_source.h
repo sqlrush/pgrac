@@ -11,8 +11,7 @@
 typedef enum ClusterPcmReadSourceKind {
 	CLUSTER_PCM_SOURCE_FAIL = 0,
 	CLUSTER_PCM_SOURCE_DISK_GRANT,
-	CLUSTER_PCM_SOURCE_IMAGE_INSTALLED,
-	CLUSTER_PCM_SOURCE_RETRY
+	CLUSTER_PCM_SOURCE_IMAGE_INSTALLED
 } ClusterPcmReadSourceKind;
 
 /* Stack receipt for an existing GRANT_PENDING reservation, not new shared
@@ -29,7 +28,6 @@ typedef struct ClusterPcmReadSource {
 	bool durable;
 	bool quiescent;
 	bool pending_s; /* Master pre-registration; DONE follows native publication. */
-	bool retry_event; /* Exact master revocation observed, never a timer. */
 } ClusterPcmReadSource;
 
 /* Non-authoritative holder continuation bound to native output IO. No pin or
@@ -46,8 +44,6 @@ extern bool cluster_bufmgr_first_fill_wait_begin(BufferTag tag, int worker,
 	ClusterPcmFirstFillWait *wait);
 extern int cluster_bufmgr_first_fill_wait_ready(const ClusterPcmFirstFillWait *wait);
 extern void cluster_bufmgr_first_fill_service_wakeup(BufferDesc *buf);
-extern void cluster_gcs_block_read_source_retry_wait(const ClusterPcmReadSource *source,
-	unsigned retries);
 
 /* Wire identity, not a grant. The master also checks its pinned registry binding. */
 typedef struct ClusterPcmReadGrantKey {

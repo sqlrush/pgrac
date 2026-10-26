@@ -4803,6 +4803,8 @@ check_r11_source_removal_census:
 # Standard PG targets
 # ----------
 clean distclean maintainer-clean:
+	rm -f test_cluster_first_fill_request.inc test_cluster_first_fill_request.inc.tmp
+	rm -f test_cluster_first_fill_reply.inc test_cluster_first_fill_reply.inc.tmp
 	rm -f test_cluster_first_fill_send.inc test_cluster_first_fill_send.inc.tmp
 	rm -f test_cluster_first_fill_retire.inc test_cluster_first_fill_retire.inc.tmp
 	rm -f test_cluster_first_fill_retire_types.inc test_cluster_first_fill_retire_types.inc.tmp
@@ -9791,9 +9793,8 @@ test_cluster_first_fill_holder.inc: $(top_srcdir)/src/backend/cluster/cluster_gc
 	     /^void$$/ && emit { emit=0; end++ } emit { print } \
 	     END { if (n != 1 || end != 1 || emit) exit 1 }' $< > $@.tmp
 	awk '/^cluster_gcs_block_first_fill_tick\(/ { print "void"; emit=1; n++ } \
-	     /^cluster_gcs_block_read_source_retry_wait\(/ { print "void"; emit=1; n++ } \
 	     /^cluster_gcs_block_read_grant_holder_notify\(/ { print "bool"; emit=1; n++ } \
-	     emit { print } emit && /^}/ { emit=0 } END { if (n != 3 || emit) exit 1 }' $< >> $@.tmp
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 2 || emit) exit 1 }' $< >> $@.tmp
 	mv $@.tmp $@
 
 test_cluster_first_fill_wait: test_cluster_first_fill_wait.c test_cluster_pcm_own test_cluster_pcm_own.c \
@@ -9844,16 +9845,16 @@ test_cluster_first_fill_retire.inc: $(top_srcdir)/src/backend/cluster/cluster_gc
 	     /^gcs_block_compute_invalidate_ack_checksum\(/ { print "static uint32"; emit=1; n++ } \
 	     /^gcs_block_pending_s_notify_(action_internal|action)\(/ { print "static bool"; emit=1; n++ } \
 	     /^gcs_block_pending_s_notify\(/ { print "static void"; emit=1; n++ } \
-	     /^gcs_first_fill_(arm_slot|receipt_matches|receipt_consumed|retry_progress)\(/ { print "static bool"; emit=1; n++ } \
+	     /^gcs_first_fill_(arm_slot|receipt_matches|receipt_consumed)\(/ { print "static bool"; emit=1; n++ } \
 	     /^gcs_first_fill_receipt_count_locked\(/ { print "static unsigned"; emit=1; n++ } \
-	     /^gcs_first_fill_(receipt_offer|receipt_tick|confirm_offer|source_exit)\(/ { print "static void"; emit=1; n++ } \
+	     /^gcs_first_fill_(receipt_offer|receipt_tick|confirm_offer)\(/ { print "static void"; emit=1; n++ } \
 	     /^gcs_first_fill_receipt_revoke\(/ { print "static int"; emit=1; n++ } \
 	     /^gcs_read_source_key\(/ { print "static ClusterPcmReadGrantKey"; emit=1; n++ } \
 	     /^gcs_read_source_arm\(/ { print "static bool"; emit=1; n++ } \
-	     /^cluster_gcs_block_read_source_(complete|retry_wait)\(/ { print "void"; emit=1; n++ } \
+	     /^cluster_gcs_block_read_source_complete\(/ { print "void"; emit=1; n++ } \
 	     /^cluster_gcs_block_read_source_(quiescent|quiesce)\(/ { print "bool"; emit=1; n++ } \
 	     /^gcs_block_(pending_s_delivery_closed|invalidate_execute)\(/ { print "static bool"; emit=1; n++ } \
-	     emit { print } emit && /^}/ { emit=0 } END { if (n != 27 || emit) exit 1 }' $< >> $@.tmp
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 24 || emit) exit 1 }' $< >> $@.tmp
 	mv $@.tmp $@
 
 test_cluster_first_fill_retire: test_cluster_first_fill_retire.c test_cluster_pcm_own test_cluster_pcm_own.c \
@@ -9861,3 +9862,29 @@ test_cluster_first_fill_retire: test_cluster_first_fill_retire.c test_cluster_pc
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-DBUFMGR_SOURCE_PATH='"$(top_srcdir)/src/backend/storage/buffer/bufmgr.c"' \
 		$< $(CLUSTER_PCM_OWN_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# Execute the original native first-fill sender and passive CV wait.
+TESTS += test_cluster_first_fill_request
+all: test_cluster_first_fill_request
+
+test_cluster_first_fill_request.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^gcs_first_fill_nonterminal_reply\(/ { print "static bool"; emit=1; n++ } \
+	     /^gcs_first_fill_enqueue\(/ { print "static bool"; emit=1; n++ } \
+	     /^gcs_first_fill_send_wait\(/ { print "static void"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 3 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_first_fill_request: test_cluster_first_fill_request.c test_cluster_first_fill_retire.c \
+		test_cluster_pcm_own test_cluster_pcm_own.c unit_test.h \
+		test_cluster_first_fill_request.inc test_cluster_first_fill_reply.inc \
+		test_cluster_first_fill_retire_types.inc test_cluster_first_fill_retire.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DBUFMGR_SOURCE_PATH='"$(top_srcdir)/src/backend/storage/buffer/bufmgr.c"' \
+		$< $(CLUSTER_PCM_OWN_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# Complete reply landing and local invalidate publication, with codec boundary controlled.
+test_cluster_first_fill_reply.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^cluster_gcs_handle_block_reply_envelope\(/ { print "void"; emit=1; n++ } \
+	     /^gcs_block_wake_local_pending_s_request\(/ { print "static bool"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
