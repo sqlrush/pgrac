@@ -117,6 +117,12 @@ typedef struct ClusterSpaceIdentityObservationV1 {
  * a missing SPACE identity. */
 extern bool cluster_space_relation_identity_capture_v1(Relation relation,
 														 ClusterSpaceIdentityObservationV1 *out);
+/* Capture the caller's original identity from an already populated cache.
+ * Memory-only: no read, lock, interrupt service or cache population, even on
+ * a miss. False leaves output zero. Retain the original lifecycle boundary;
+ * this observation does not grant publication or writer permission. */
+extern bool cluster_space_relation_identity_cached_capture_v1(
+	Relation relation, const ClusterSpaceIdentity *identity, ClusterSpaceIdentityObservationV1 *out);
 /* Local published-reference/cache/relcache checks only; no namespace service,
  * lock, I/O or cache population. Refill after invalidation never revives the
  * old observation. This reference does not qualify a writer or publication. */

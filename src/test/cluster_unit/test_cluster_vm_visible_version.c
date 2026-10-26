@@ -126,6 +126,10 @@ static bool empty_cancel_after_refusal, empty_refusal_keeps_pin, empty_cancel_af
 static bool empty_cancel_caught;
 static unsigned empty_pin_calls;
 static Buffer empty_cancel_vm_handle;
+static bool empty_identity_available;
+static uint64 empty_identity_generation;
+static unsigned empty_identity_captures, empty_identity_checks;
+static int empty_identity_change_phase;
 /* Deferred repair owns no heap pin/lock; the lower X service may drop its
  * only VM pin before returning a clean reobservation result. */
 static bool repair_retry_fixture, repair_pinned, repair_locked, repair_aux_driving;
@@ -368,6 +372,8 @@ LockBuffer(Buffer buffer, int mode)
 				if (cluster_shared_config)
 					UT_ASSERT(!pinned[1]);
 				empty_heap_waits++;
+				if (empty_identity_change_phase == 2)
+					empty_identity_generation++;
 				if (empty_race == 1)
 					((PageHeader)pages[0].data)->pd_lower += sizeof(ItemIdData);
 				else if (empty_race == 2)
@@ -632,6 +638,8 @@ ClusterBufferCaptureMutationContext(Buffer buffer, ResourceXWriterUseContext *ou
 	*checked = true;
 	if (buffer == 2 && !held[0] && empty_cancel_after_capture)
 		InterruptPending = true;
+	if (buffer == 2 && !held[0] && empty_identity_change_phase == 1)
+		empty_identity_generation++;
 	return true;
 }
 
@@ -648,6 +656,8 @@ ClusterConditionalLockBufferWithMutationContext(Buffer buffer,
 	if (!empty_resume)
 		return false;
 	held[1] = writer[1] = true;
+	if (empty_identity_change_phase == 3)
+		empty_identity_generation++;
 	return true;
 }
 
@@ -1284,7 +1294,44 @@ typedef struct LVRelState {
 	bool shared_maintenance_restricted;
 	ClusterSpaceIdentity identity;
 } LVRelState;
+/* Identity transport leaves are controlled here; the cache fixture separately
+ * executes the real storage guards. Keep every original publication body. */
+static bool
+fixture_empty_identity_capture(Relation rel, const ClusterSpaceIdentity *input,
+							   ClusterSpaceIdentityObservationV1 *out) pg_attribute_unused();
+static bool
+fixture_empty_identity_current(Relation rel,
+							   const ClusterSpaceIdentityObservationV1 *expected) pg_attribute_unused();
+
+static bool
+fixture_empty_identity_capture(Relation rel, const ClusterSpaceIdentity *input,
+							   ClusterSpaceIdentityObservationV1 *out)
+{
+	UT_ASSERT(rel == &relation && input != NULL && held[0] && !held[1]);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	empty_identity_captures++;
+	memset(out, 0, sizeof(*out));
+	if (!empty_identity_available)
+		return false;
+	out->identity = *input;
+	out->invalidations = empty_identity_generation;
+	return true;
+}
+
+static bool
+fixture_empty_identity_current(Relation rel, const ClusterSpaceIdentityObservationV1 *expected)
+{
+	UT_ASSERT(rel == &relation && held[0] && held[1]);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	empty_identity_checks++;
+	return empty_identity_available && expected->invalidations == empty_identity_generation;
+}
+
+#define cluster_space_relation_identity_cached_capture_v1 fixture_empty_identity_capture
+#define cluster_space_relation_identity_current_v1 fixture_empty_identity_current
 #include "test_cluster_vm_empty_scan.inc"
+#undef cluster_space_relation_identity_cached_capture_v1
+#undef cluster_space_relation_identity_current_v1
 
 static LVRelState
 empty_reset(bool visible, uint8 bits)
@@ -1303,6 +1350,10 @@ empty_reset(bool visible, uint8 bits)
 	empty_cancel_after_refusal = empty_refusal_keeps_pin = empty_cancel_after_capture = false;
 	empty_cancel_caught = false;
 	empty_pin_calls = 0;
+	empty_identity_available = true;
+	empty_identity_generation = 1;
+	empty_identity_captures = empty_identity_checks = 0;
+	empty_identity_change_phase = 0;
 	InterruptPending = false;
 	expected_cutoff = InvalidTransactionId;
 	state.rel = &relation;
@@ -2070,10 +2121,69 @@ UT_TEST(test_empty_cancel_after_vm_warm_precedes_heap_wait_and_publication)
 	}
 }
 
+UT_TEST(test_empty_publication_missing_original_identity_preserves_pages_and_scope)
+{
+	for (int share = 0; share < 2; share++) {
+		LVRelState state = empty_reset(false, VISIBILITYMAP_VALID_BITS << 2);
+		Buffer vm = 2;
+
+		empty_identity_available = false;
+		UT_ASSERT(lazy_scan_new_or_empty(&state, 1, 0, pages[0].data, share, &vm));
+		UT_ASSERT(memcmp(pages, before, sizeof(pages)) == 0);
+		UT_ASSERT_EQ(inserts + edge_count + dirty[0] + dirty[1], 0);
+		UT_ASSERT_EQ(next_token, 100);
+		UT_ASSERT_EQ(empty_identity_captures, 1);
+		UT_ASSERT_EQ(empty_identity_checks + empty_aux_calls + empty_resumes, 0);
+		UT_ASSERT_EQ(empty_cleanup_waits, !share);
+		UT_ASSERT_EQ(empty_fsm, 1);
+		UT_ASSERT(!pinned[0] && pinned[1] && !held[0] && !held[1]);
+	}
+}
+
+UT_TEST(test_empty_publication_rejects_identity_drift_across_each_acquisition)
+{
+	for (int phase = 1; phase <= 3; phase++) {
+		for (int share = 0; share < 2; share++) {
+			LVRelState state = empty_reset(false, VISIBILITYMAP_VALID_BITS << 2);
+			Buffer vm = 2;
+
+			empty_identity_change_phase = phase;
+			UT_ASSERT(lazy_scan_new_or_empty(&state, 1, 0, pages[0].data, share, &vm));
+			UT_ASSERT(memcmp(pages, before, sizeof(pages)) == 0);
+			UT_ASSERT_EQ(inserts + edge_count + dirty[0] + dirty[1], 0);
+			UT_ASSERT_EQ(next_token, 100);
+			UT_ASSERT_EQ(empty_identity_captures, 1);
+			UT_ASSERT_EQ(empty_identity_checks, 1);
+			UT_ASSERT_EQ(empty_resumes, 1);
+			UT_ASSERT_EQ(empty_local_unlocks, 1);
+			UT_ASSERT_EQ(empty_fsm, 1);
+			UT_ASSERT(!pinned[0] && pinned[1] && !held[0] && !held[1]);
+		}
+	}
+}
+
+UT_TEST(test_empty_publication_current_identity_keeps_exact_positive_wal)
+{
+	LVRelState state = empty_reset(false, VISIBILITYMAP_VALID_BITS << 2);
+	Buffer vm = 2;
+
+	UT_ASSERT(lazy_scan_new_or_empty(&state, 1, 0, pages[0].data, false, &vm));
+	UT_ASSERT_EQ(empty_identity_captures, 1);
+	UT_ASSERT_EQ(empty_identity_checks, 1);
+	UT_ASSERT_EQ(inserts, 1);
+	UT_ASSERT_EQ(edge_count, 2);
+	UT_ASSERT_EQ(next_token, 101);
+	UT_ASSERT_EQ(edges[0].before.mutation_token, 30);
+	UT_ASSERT_EQ(edges[1].before.mutation_token, 20);
+	UT_ASSERT(PageIsAllVisible(pages[0].data));
+	UT_ASSERT_EQ((uint8)*PageGetContents(pages[1].data), 15);
+	UT_ASSERT(!pinned[0] && pinned[1] && !held[0] && !held[1]);
+}
+
 int
 main(void)
 {
-	UT_PLAN(44);
+	UT_PLAN(47);
 	UT_RUN(test_visible_exact_two_page_batch);
 	UT_RUN(test_no_change_allocates_no_version);
 	UT_RUN(test_nonshared_preserves_native_hint_lsn_rules);
@@ -2118,6 +2228,9 @@ main(void)
 	UT_RUN(test_pair_repair_error_or_unknown_version_precedes_mutation);
 	UT_RUN(test_empty_cancel_after_vm_refusal_precedes_repin_and_heap_wait);
 	UT_RUN(test_empty_cancel_after_vm_warm_precedes_heap_wait_and_publication);
+	UT_RUN(test_empty_publication_missing_original_identity_preserves_pages_and_scope);
+	UT_RUN(test_empty_publication_rejects_identity_drift_across_each_acquisition);
+	UT_RUN(test_empty_publication_current_identity_keeps_exact_positive_wal);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

@@ -147,6 +147,9 @@ static bool recent_pin_held;
 static bool phase_pin_released;
 static bool phase_use_original_resident;
 static bool phase_use_original_recent_pin;
+/* Retain earlier resident observations when the same owner enters native apply. */
+static unsigned phase_prior_lock_activity, phase_prior_authority_activity;
+static unsigned phase_prior_writer_checks, phase_prior_route_checks, phase_prior_authority_checks;
 static bool phase_resident_completed;
 static unsigned phase_resident_expected_resumes;
 static int32 recent_caller_pins;
@@ -486,7 +489,7 @@ cluster_semantic_activation_recheck_r4_terminal_census(
 	if (!local_x) {
 		census_preflight_checks++;
 		UT_ASSERT(token != NULL && token->entered && backend_pin_count == fixture_expected_backend_pins());
-		UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+		UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, phase_prior_lock_activity);
 		return admission_current && fixture_native_admission_current(token, 2);
 	}
 	if (space_observation_checks != 0) {
@@ -633,7 +636,7 @@ cluster_xid_stripe_sample_fence_current(const ClusterXidStripeSampleFence *fence
 {
 	UT_ASSERT(!local_x && !local_share && backend_pin_count == fixture_expected_backend_pins());
 	UT_ASSERT_EQ(CritSectionCount, 0);
-	UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+	UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, phase_prior_lock_activity);
 	UT_ASSERT_EQ(policy_current_checks, 1);
 	UT_ASSERT_EQ(cohort_current_checks + census_preflight_checks, 0);
 	if (expected_current_policy != NULL)
@@ -649,7 +652,7 @@ cluster_heap_freeze_policy_sample_current_v1(const ClusterHeapFreezePolicySample
 {
 	UT_ASSERT(!local_x && !local_share && backend_pin_count == fixture_expected_backend_pins());
 	UT_ASSERT_EQ(CritSectionCount, 0);
-	UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+	UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, phase_prior_lock_activity);
 	UT_ASSERT_EQ(inserts + dirties + flushes + wal_clock_reads, 0);
 	UT_ASSERT_EQ(target_preflight_checks, 1);
 	UT_ASSERT_EQ(census_preflight_checks, 0);
@@ -673,7 +676,7 @@ cluster_undo_cleaner_active_sample(ClusterUndoCleanerActiveSample *out)
 {
 	UT_ASSERT(!local_x && !local_share && backend_pin_count == fixture_expected_backend_pins());
 	UT_ASSERT_EQ(CritSectionCount, 0);
-	UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+	UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, phase_prior_lock_activity);
 	UT_ASSERT_EQ(cohort_current_checks, 1);
 	cohort_sample_reads++;
 	if (cohort_sample_error) elog(ERROR, "injected worker publication read ERROR");
@@ -1607,7 +1610,7 @@ cluster_heap_freeze_cohort_current(const ClusterHeapFreezeCohortObservation *coh
 {
 	UT_ASSERT(!local_x && !local_share && backend_pin_count == fixture_expected_backend_pins());
 	UT_ASSERT_EQ(CritSectionCount, 0);
-	UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+	UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, phase_prior_lock_activity);
 	UT_ASSERT_EQ(inserts + dirties + flushes + wal_clock_reads, 0);
 	UT_ASSERT_EQ(policy_current_checks, 1);
 	UT_ASSERT_EQ(census_preflight_checks, 0);
@@ -1627,8 +1630,8 @@ cluster_semantic_activation_recheck(const ClusterSemanticAdmissionToken *token)
 		target_preflight_checks++;
 		UT_ASSERT(token != NULL && token->entered && backend_pin_count == fixture_expected_backend_pins());
 		UT_ASSERT_EQ(CritSectionCount, 0);
-		UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
-		UT_ASSERT_EQ(writer_checks + route_checks + authority_checks + admission_checks, 0);
+		UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, phase_prior_lock_activity);
+		UT_ASSERT_EQ(writer_checks + route_checks + authority_checks + admission_checks, phase_prior_authority_activity);
 		UT_ASSERT_EQ(wal_clock_reads + inserts + dirties + edges + flushes, 0);
 		if (preflight_target_error) elog(ERROR, "injected unlocked TARGET preflight error");
 		if (preflight_revoke_census) admission_current = false;
@@ -1662,9 +1665,9 @@ cluster_semantic_activation_recheck(const ClusterSemanticAdmissionToken *token)
 	UT_ASSERT(local_x && backend_pin_count == fixture_expected_backend_pins());
 	UT_ASSERT_EQ(CritSectionCount, 0);
 	/* Native final authority + real capture; a resumed scope checked once more. */
-	UT_ASSERT_EQ(writer_checks, resumed_writer ? 3 : 2);
-	UT_ASSERT_EQ(route_checks, 1);
-	UT_ASSERT_EQ(authority_checks, 1);
+	UT_ASSERT_EQ(writer_checks, phase_prior_writer_checks + (resumed_writer ? 3 : 2));
+	UT_ASSERT_EQ(route_checks, phase_prior_route_checks + 1);
+	UT_ASSERT_EQ(authority_checks, phase_prior_authority_checks + 1);
 	UT_ASSERT_EQ(admission_checks, 0);
 	UT_ASSERT_EQ(wal_clock_reads + inserts + dirties + edges + flushes, 0);
 	if (target_recheck_error) elog(ERROR, "injected full TARGET recheck error");
@@ -2176,6 +2179,8 @@ reset(uint8 opcode, bool shared)
 	recent_caller_pins = 0; phase_pin_released = false;
 	phase_use_original_resident = false;
 	phase_use_original_recent_pin = false;
+	phase_prior_lock_activity = phase_prior_authority_activity = 0;
+	phase_prior_writer_checks = phase_prior_route_checks = phase_prior_authority_checks = 0;
 	writer_state = PCM_STATE_X;
 	route_holder = 11;
 	route_master = 12;
@@ -12188,6 +12193,8 @@ fixture_recent_xmin_apply(QualifiedXminFixture *f,
 		&f->admission, targets, count, FullTransactionIdFromEpochAndXid(1, 100), 10);
 }
 
+static void phase_recent_native_begin(const LVRelState *v);
+
 /* The original collector phase now forbids a caller-owned heap pin. Join
  * its complete body directly to the recent-resident native entry, without
  * the older fixture wrapper's synthetic restoration of a pinned caller. */
@@ -12211,6 +12218,8 @@ phase_then_recent_native_owned(QualifiedXminFixture *f, LVRelState *v)
 		if (status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN && rows_current
 			&& v->shared_freeze_xmin_candidates.target_count > 0)
 		{
+			if (phase_use_original_recent_pin && phase_use_original_resident)
+				phase_recent_native_begin(v);
 			phase_copy_to_native(f, v);
 			applied = fixture_recent_xmin_apply(f,
 				v->shared_freeze_xmin_candidates.targets,
@@ -15320,10 +15329,152 @@ UT_TEST(test_original_recent_owner_unpins_before_collector_error_propagation)
 }
 
 
+static void
+phase_recent_native_begin(const LVRelState *v)
+{
+	bool writer = v->shared_freeze_input.writer_context_valid;
+	UT_ASSERT(phase_use_original_recent_pin && phase_use_original_resident && phase_resident_completed);
+	UT_ASSERT_EQ(backend_pin_count, 0);
+	UT_ASSERT(!local_x && !local_share && !resumed_writer && !recent_pin_held);
+	UT_ASSERT_EQ(conditional_resumes, writer ? 1 : 0);
+	UT_ASSERT_EQ(conditional_unlocks, 0); UT_ASSERT_EQ(local_lock_attempts, 1);
+	UT_ASSERT_EQ(writer_checks, writer ? 1 : 0);
+	UT_ASSERT_EQ(route_checks, 1); UT_ASSERT_EQ(authority_checks, 1);
+	UT_ASSERT_EQ(admission_checks, 0);
+	UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+	phase_prior_lock_activity = conditional_resumes + conditional_unlocks + local_lock_attempts;
+	phase_prior_authority_activity = writer_checks + route_checks + authority_checks + admission_checks;
+	phase_prior_writer_checks = writer_checks;
+	phase_prior_route_checks = route_checks; phase_prior_authority_checks = authority_checks;
+}
+
+static void
+phase_recent_native_setup(QualifiedXminFixture *f, LVRelState *v,
+	ClusterHeapFreezeXminTargetV1 targets[3], bool batch, bool writer)
+{
+	phase_recent_owner_setup(f, v, targets, batch, writer);
+	phase_finally_calls = phase_finally_debt = phase_finally_pins = 0;
+	phase_finally_owned_writer = false;
+	UT_ASSERT_EQ(bounds_original_census_enter(&f->admission), CLUSTER_SEMANTIC_ADMISSION_OK);
+	phase_pin_released = false;
+}
+
+static void
+phase_recent_native_finish(const QualifiedXminFixture *f, const LVRelState *v, bool changed)
+{
+	ClusterSemanticAdmissionToken zero = {0};
+	UT_ASSERT_EQ(recent_pin_calls, 2); UT_ASSERT_EQ(recent_unpins, 2);
+	UT_ASSERT_EQ(phase_recent_usage.shared_blks_hit, 2);
+	UT_ASSERT_EQ(phase_recent_usage.local_blks_hit, 0);
+	UT_ASSERT_EQ(phase_recent_ko_samples, 2);
+	UT_ASSERT_EQ(page_owner_original_owner_enlarges, 2);
+	UT_ASSERT_EQ(page_owner_original_owner_allocations, 1);
+	UT_ASSERT_EQ(page_owner_original_owner_remembers, 2);
+	UT_ASSERT_EQ(page_owner_original_owner_forgets, 2);
+	UT_ASSERT_EQ(page_owner_original_private_news, 2);
+	UT_ASSERT_EQ(page_owner_original_private_forgets, 2);
+	UT_ASSERT_EQ(page_owner_primitive_last_pin_reads, 2);
+	UT_ASSERT_EQ(page_owner_native_resource_owner.bufferarr.nitems, 0);
+	UT_ASSERT_EQ(phase_finally_calls, 1); UT_ASSERT_EQ(phase_finally_debt, 8);
+	UT_ASSERT_EQ(phase_finally_pins, 0); UT_ASSERT(!phase_finally_owned_writer);
+	UT_ASSERT_EQ(inserts, changed ? 1 : 0); UT_ASSERT_EQ(flushes, changed ? 1 : 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&native_admission_shared.inflight
+		[CLUSTER_SEMANTIC_TARGET_SIDE][bounds_lifecycle_feature()]), 7);
+	UT_ASSERT_EQ(semantic_activation_local_inflight
+		[CLUSTER_SEMANTIC_TARGET_SIDE][bounds_lifecycle_feature()], 0);
+	UT_ASSERT(memcmp(&f->admission, &zero, sizeof(zero)) == 0);
+	UT_ASSERT(!bounds_original_backend_has_admission());
+	UT_ASSERT(!local_x && !local_share && !resumed_writer && !recent_pin_held);
+	UT_ASSERT_EQ(backend_pin_count, 0);
+	UT_ASSERT(cluster_bufmgr_pcm_x_writer_find(GetBufferDescriptor(0)) == NULL);
+	UT_ASSERT_EQ(BUF_STATE_GET_REFCOUNT(pg_atomic_read_u32(&GetBufferDescriptor(0)->state)), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&GetBufferDescriptor(0)->state) & BM_LOCKED, 0);
+	UT_ASSERT(PG_exception_stack == NULL && error_context_stack == NULL);
+	for (unsigned i = 0; i < lengthof(page_owner_original_private_array); i++) {
+		UT_ASSERT_EQ(page_owner_original_private_array[i].buffer, InvalidBuffer);
+		UT_ASSERT_EQ(page_owner_original_private_array[i].refcount, 0);
+	}
+	if (changed) {
+		UT_ASSERT(v->shared_freeze_xmin_candidates.target_count > 0);
+		for (unsigned i = 1; i <= v->shared_freeze_xmin_candidates.target_count; i++)
+			UT_ASSERT(HeapTupleHeaderXminFrozen(freeze_tuple(current_page.data, i)));
+	} else
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	free(page_owner_native_resource_owner.bufferarr.itemsarr);
+	memset(&page_owner_native_resource_owner, 0, sizeof(page_owner_native_resource_owner));
+	page_owner_original_private_reserved = NULL;
+	page_owner_use_original_resource_owner = page_owner_use_original_private_refs = false;
+	page_owner_use_original_primitive_pin = page_owner_resident_active = false;
+	phase_use_original_recent_pin = false;
+	GetBufferDescriptor(0)->tag = phase_recent_saved_tag;
+	pg_atomic_write_u32(&GetBufferDescriptor(0)->state, phase_recent_saved_state);
+}
+
+UT_TEST(test_original_resident_recent_pin_chain_reaches_same_owner_native_wal)
+{
+	for (unsigned batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+		phase_recent_native_setup(&f, &v, targets, batch != 0, true);
+		UT_ASSERT(phase_then_recent_native_owned(&f, &v));
+		UT_ASSERT_EQ(conditional_resumes, 2); UT_ASSERT_EQ(conditional_unlocks, 1);
+		UT_ASSERT_EQ(local_unlocks, 2);
+		UT_ASSERT_EQ(v.shared_freeze_xmin_candidates.target_count, batch ? 3 : 1);
+		phase_recent_native_finish(&f, &v, true);
+	}
+}
+
+static void
+phase_recent_revoke_cut_on_second_pin(void)
+{
+	if (recent_pin_calls != 2) return;
+	UT_ASSERT(phase_resident_completed && recent_pin_held && recent_pin_admission->entered);
+	UT_ASSERT(!local_x && !resumed_writer);
+	ctrc_note_unqualified_registration();
+}
+
+UT_TEST(test_original_resident_recent_native_refuses_read_context_and_late_cut)
+{
+	for (unsigned batch = 0; batch < 2; batch++) {
+		for (unsigned fault = 0; fault < 2; fault++) {
+			QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+			phase_recent_native_setup(&f, &v, targets, batch != 0, fault != 0);
+			if (fault != 0) recent_pin_observer = phase_recent_revoke_cut_on_second_pin;
+			UT_ASSERT(!phase_then_recent_native_owned(&f, &v));
+			recent_pin_observer = NULL;
+			UT_ASSERT_EQ(conditional_resumes, fault != 0 ? 1 : 0);
+			UT_ASSERT_EQ(conditional_unlocks, 0);
+			UT_ASSERT_EQ(target_preflight_checks + policy_current_checks + cohort_current_checks, 0);
+			phase_recent_native_finish(&f, &v, false);
+		}
+	}
+}
+
+UT_TEST(test_original_resident_recent_native_errors_unwind_two_pin_owner_scopes)
+{
+	QualifiedXminFixture *f = malloc(sizeof(*f)); LVRelState *v = malloc(sizeof(*v));
+	ClusterHeapFreezeXminTargetV1 targets[3];
+	UT_ASSERT(f != NULL && v != NULL);
+	for (unsigned batch = 0; batch < 2; batch++) {
+		for (unsigned stage = 0; stage < 2; stage++) {
+			phase_recent_native_setup(f, v, targets, batch != 0, true);
+			target_recheck_error = stage == 0; flush_error = stage == 1;
+			expecting_error = true;
+			if (setjmp(error_jump) == 0) {
+				(void)phase_then_recent_native_owned(f, v); UT_ASSERT(false);
+			}
+			expecting_error = false;
+			UT_ASSERT_EQ(conditional_resumes, 2); UT_ASSERT_EQ(conditional_unlocks, 1);
+			UT_ASSERT_EQ(local_unlocks, 2);
+			phase_recent_native_finish(f, v, stage == 1);
+		}
+	}
+	free(v); free(f);
+}
+
 int
 main(void)
 {
-	UT_PLAN(325);
+	UT_PLAN(328);
 
 	UT_RUN(test_pin_free_admitted_phase_reaches_recent_native_wal_before_owner_leave);
 	UT_RUN(test_pin_free_phase_recent_refusal_retires_only_its_original_owner);
@@ -15657,6 +15808,9 @@ main(void)
 	UT_RUN(test_original_recent_first_pin_and_owner_release_precede_outer_leave);
 	UT_RUN(test_original_recent_descriptor_misses_never_publish_pin_or_owner);
 	UT_RUN(test_original_recent_owner_unpins_before_collector_error_propagation);
+	UT_RUN(test_original_resident_recent_pin_chain_reaches_same_owner_native_wal);
+	UT_RUN(test_original_resident_recent_native_refuses_read_context_and_late_cut);
+	UT_RUN(test_original_resident_recent_native_errors_unwind_two_pin_owner_scopes);
 
 	UT_DONE();
 	return ut_failed_count != 0;

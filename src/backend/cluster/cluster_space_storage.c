@@ -387,6 +387,29 @@ cluster_space_relation_identity_capture_v1(Relation relation, ClusterSpaceIdenti
 }
 
 bool
+cluster_space_relation_identity_cached_capture_v1(Relation relation,
+												const ClusterSpaceIdentity *identity,
+												ClusterSpaceIdentityObservationV1 *out)
+{
+	ClusterSpaceIdentityObservationV1 candidate;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (relation == NULL || relation->rd_rel == NULL || identity == NULL)
+		return false;
+	memset(&candidate, 0, sizeof(candidate));
+	candidate.identity = *identity;
+	candidate.relid = RelationGetRelid(relation);
+	candidate.invalidations = space_identity_invalidations;
+	if (!cluster_wal_thread_current_v2_ref(&candidate.namespace_source)
+		|| !cluster_space_relation_identity_current_v1(relation, &candidate))
+		return false;
+	*out = candidate;
+	return true;
+}
+
+bool
 cluster_space_relation_identity_current_v1(Relation relation,
 										 const ClusterSpaceIdentityObservationV1 *expected)
 {

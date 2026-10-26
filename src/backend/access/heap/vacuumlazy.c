@@ -2662,9 +2662,15 @@ lazy_publish_shared_empty(LVRelState *vacrel, Buffer buf, BlockNumber blkno, Buf
 	bool object_checked = false, prepared = false;
 	XLogRecPtr vm_lsn = InvalidXLogRecPtr;
 	Buffer recent_vm;
+	ClusterSpaceIdentityObservationV1 identity;
+	bool identity_captured;
 
+	/* Preserve the original input before either acquisition can wait. This
+	 * lookup never fills a missing SPACE cache under the heap content lock. */
+	identity_captured = cluster_space_relation_identity_cached_capture_v1(
+		vacrel->rel, &vacrel->identity, &identity);
 	LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-	if (ClusterLockBufferExclusiveAuxiliaryAware(vmbuffer, &context)) {
+	if (identity_captured && ClusterLockBufferExclusiveAuxiliaryAware(vmbuffer, &context)) {
 		PG_TRY();
 		{
 			prepared = ClusterBufferCaptureMutationContext(*vmbuffer, &vm_writer, &object_revision,
@@ -2708,9 +2714,10 @@ lazy_publish_shared_empty(LVRelState *vacrel, Buffer buf, BlockNumber blkno, Buf
 		return;
 	PG_TRY();
 	{
-		if (PageGetLSN(BufferGetPage(*vmbuffer)) == vm_lsn
+		if (cluster_space_relation_identity_current_v1(vacrel->rel, &identity)
+			&& PageGetLSN(BufferGetPage(*vmbuffer)) == vm_lsn
 			&& ((PageHeader)BufferGetPage(*vmbuffer))->pd_block_scn == vm_version)
-			(void)visibilitymap_set_empty(vacrel->rel, blkno, buf, *vmbuffer, &vacrel->identity);
+			(void)visibilitymap_set_empty(vacrel->rel, blkno, buf, *vmbuffer, &identity.identity);
 	}
 	PG_FINALLY();
 	{

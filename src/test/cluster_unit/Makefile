@@ -3339,7 +3339,9 @@ test_cluster_space_fsm_product.o: $(top_srcdir)/src/backend/storage/freespace/fs
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_space_identity_observation_available.inc: $(top_srcdir)/src/backend/cluster/cluster_space_storage.c Makefile
-	@awk '/^cluster_space_relation_identity_capture_v1\(/ { print "#define FIXTURE_HAS_SPACE_IDENTITY_OBSERVATION 1"; found++ } END { if (found > 1) exit 1 }' $< > $@
+	@awk '/^cluster_space_relation_identity_capture_v1\(/ { print "#define FIXTURE_HAS_SPACE_IDENTITY_OBSERVATION 1"; found++ } \
+		 /^cluster_space_relation_identity_cached_capture_v1\(/ { print "#define FIXTURE_HAS_SPACE_CACHED_OBSERVATION 1"; cached++ } \
+		 END { if (found > 1 || cached > 1) exit 1 }' $< > $@
 
 test_cluster_space_namespace_identity_equal.inc: $(top_srcdir)/src/backend/cluster/cluster_control_root.c Makefile
 	@awk '/^cluster_control_root_identity_equal\(/ { print "bool"; emit=1; found++ } \
