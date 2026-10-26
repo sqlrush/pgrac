@@ -30,6 +30,7 @@
 #include "commands/defrem.h"
 #include "commands/user.h"
 #include "cluster/cluster_ic.h"
+#include "cluster/cluster_tt_local.h"
 #include "commands/tablecmds.h"
 #include "common/controldata_utils.h"
 #include "miscadmin.h"
@@ -207,6 +208,81 @@ PreventInTransactionBlock(bool top, const char *stmt)
 }
 static bool utility_in_transaction;
 static bool utility_storage_mode = true;
+bool XactReadOnly;
+static bool utility_in_child, utility_parallel, utility_bind_ok = true;
+static bool utility_expect_binding;
+static TransactionId utility_top_xid, utility_current_xid;
+static unsigned utility_xids, utility_binds, utility_prepares, utility_unbound;
+
+bool
+IsSubTransaction(void)
+{
+	return utility_in_child;
+}
+
+bool
+IsInParallelMode(void)
+{
+	return utility_parallel;
+}
+
+bool
+RecoveryInProgress(void)
+{
+	return false;
+}
+
+TransactionId
+GetTopTransactionIdIfAny(void)
+{
+	return utility_top_xid;
+}
+
+TransactionId
+GetCurrentTransactionIdIfAny(void)
+{
+	return utility_current_xid;
+}
+
+TransactionId
+GetTopTransactionId(void)
+{
+	if (!TransactionIdIsValid(utility_top_xid)) {
+		utility_top_xid = utility_current_xid = 400;
+		utility_xids++;
+	}
+	return utility_top_xid;
+}
+
+bool
+cluster_tt_local_prepare_canonical_active(TransactionId xid, ClusterCanonicalTxnBinding *binding)
+{
+	utility_prepares++;
+	UT_ASSERT_EQ(xid, 400);
+	if (!utility_bind_ok)
+		return false;
+	if (utility_binds == 0)
+		utility_binds++;
+	MemSet(binding, 0, sizeof(*binding));
+	binding->xid = xid;
+	binding->segment_id = 1;
+	return true;
+}
+
+CommandTag
+CreateCommandTag(Node *statement)
+{
+	return IsA(statement, CreateTableAsStmt) ? CMDTAG_CREATE_TABLE_AS : CMDTAG_CREATE_TABLE;
+}
+
+const char *
+GetCommandTagName(CommandTag tag)
+{
+	return tag == CMDTAG_CREATE_TABLE_AS ? "CREATE TABLE AS" : "CREATE TABLE";
+}
+
+extern bool cluster_storage_mode_enabled(void);
+
 bool
 cluster_storage_mode_enabled(void)
 {
@@ -267,6 +343,23 @@ sql_entry(Node *node)
 	plan.utilityStmt = node;
 #include "test_cluster_fresh_utility.inc"
 	(void)parsetree;
+	utility_after_preflight++;
+}
+
+static void
+create_sql_entry(Node *node)
+{
+	PlannedStmt plan = { 0 };
+	PlannedStmt *pstmt = &plan;
+	Node *parsetree;
+	const char *queryString = "";
+	bool isTopLevel = true;
+	int readonly_flags;
+
+	plan.utilityStmt = node;
+#include "test_cluster_create_utility_entry.inc"
+	if (utility_expect_binding && utility_binds == 0)
+		utility_unbound++;
 	utility_after_preflight++;
 }
 
@@ -971,10 +1064,176 @@ UT_TEST(test_shared_smgr_drop_preflight_is_independent_of_shared_catalog_gucs)
 	utility_storage_mode = true;
 }
 
+/* Actual utility guards/classification/prologue run above. Transaction identity,
+ * canonical publication and later DDL/trigger work are explicit boundaries;
+ * this checks entry ordering, not BIND durability or a live CREATE operation. */
+static void
+reset_create_preflight(void)
+{
+	cluster_shared_catalog = true;
+	cluster_shared_config = true;
+	utility_storage_mode = true;
+	utility_in_child = utility_parallel = XactReadOnly = utility_expect_binding = false;
+	utility_bind_ok = true;
+	utility_top_xid = utility_current_xid = InvalidTransactionId;
+	utility_xids = utility_binds = utility_prepares = utility_unbound = 0;
+	utility_after_preflight = 0;
+	reset_error();
+}
+
+UT_TEST(test_shared_create_binds_before_later_utility_work_and_reuses_top)
+{
+	CreateStmt create = { .type = T_CreateStmt };
+	CreateTableAsStmt ctas = { .type = T_CreateTableAsStmt, .objtype = OBJECT_TABLE };
+	Node *statements[] = { (Node *)&create, (Node *)&ctas };
+
+	for (unsigned i = 0; i < lengthof(statements); i++) {
+		reset_create_preflight();
+		utility_expect_binding = true;
+		create_sql_entry(statements[i]);
+		UT_ASSERT_EQ(utility_unbound, 0);
+		UT_ASSERT_EQ(utility_after_preflight, 1);
+		UT_ASSERT_EQ(utility_xids, 1);
+		UT_ASSERT_EQ(utility_prepares, 1);
+		UT_ASSERT_EQ(utility_binds, 1);
+		create_sql_entry(statements[i]);
+		UT_ASSERT_EQ(utility_unbound, 0);
+		UT_ASSERT_EQ(utility_after_preflight, 2);
+		UT_ASSERT_EQ(utility_xids, 1);
+		UT_ASSERT_EQ(utility_prepares, 2);
+		UT_ASSERT_EQ(utility_binds, 1);
+	}
+}
+
+UT_TEST(test_create_publication_refusal_precedes_later_utility_work)
+{
+	CreateStmt create = { .type = T_CreateStmt };
+	CreateTableAsStmt ctas = { .type = T_CreateTableAsStmt, .objtype = OBJECT_TABLE };
+	Node *statements[] = { (Node *)&create, (Node *)&ctas };
+
+	for (unsigned i = 0; i < lengthof(statements); i++) {
+		int caught;
+
+		reset_create_preflight();
+		utility_bind_ok = false;
+		caught = sigsetjmp(boundary, 1);
+		if (!caught)
+			create_sql_entry(statements[i]);
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(error_code, ERRCODE_DATA_CORRUPTED);
+		UT_ASSERT_EQ(utility_xids, 1);
+		UT_ASSERT_EQ(utility_prepares, 1);
+		UT_ASSERT_EQ(utility_binds, 0);
+		UT_ASSERT_EQ(utility_after_preflight, 0);
+	}
+}
+
+UT_TEST(test_create_rejects_child_or_wrong_top_before_xid_and_binding)
+{
+	CreateStmt create = { .type = T_CreateStmt };
+
+	for (unsigned child = 0; child < 2; child++) {
+		int caught;
+
+		reset_create_preflight();
+		utility_in_child = child != 0;
+		if (!child) {
+			utility_top_xid = 400;
+			utility_current_xid = 401;
+		}
+		caught = sigsetjmp(boundary, 1);
+		if (!caught)
+			create_sql_entry((Node *)&create);
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(error_code, child ? ERRCODE_FEATURE_NOT_SUPPORTED : ERRCODE_INTERNAL_ERROR);
+		UT_ASSERT_EQ(utility_xids, 0);
+		UT_ASSERT_EQ(utility_prepares, 0);
+		UT_ASSERT_EQ(utility_after_preflight, 0);
+	}
+}
+
+UT_TEST(test_create_preflight_only_targets_shared_catalog_storage)
+{
+	CreateStmt create = { .type = T_CreateStmt };
+
+	for (unsigned mode = 0; mode < 4; mode++) {
+		reset_create_preflight();
+		cluster_shared_catalog = (mode & 1) != 0;
+		cluster_shared_config = false;
+		utility_storage_mode = (mode & 2) != 0;
+		create_sql_entry((Node *)&create);
+		UT_ASSERT_EQ(utility_after_preflight, 1);
+		UT_ASSERT_EQ(utility_xids, mode == 3 ? 1 : 0);
+		UT_ASSERT_EQ(utility_prepares, mode == 3 ? 1 : 0);
+		UT_ASSERT_EQ(utility_binds, mode == 3 ? 1 : 0);
+	}
+}
+
+UT_TEST(test_create_original_readonly_and_parallel_guards_precede_binding)
+{
+	CreateStmt create = { .type = T_CreateStmt };
+
+	for (unsigned parallel = 0; parallel < 2; parallel++) {
+		int caught;
+
+		reset_create_preflight();
+		XactReadOnly = parallel == 0;
+		utility_parallel = parallel != 0;
+		caught = sigsetjmp(boundary, 1);
+		if (!caught)
+			create_sql_entry((Node *)&create);
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(error_code, parallel ? ERRCODE_INVALID_TRANSACTION_STATE
+										  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+		UT_ASSERT_EQ(utility_xids, 0);
+		UT_ASSERT_EQ(utility_prepares, 0);
+		UT_ASSERT_EQ(utility_after_preflight, 0);
+	}
+}
+
+UT_TEST(test_unsupported_creates_refuse_before_xid_or_binding)
+{
+	RangeVar target = { .type = T_RangeVar, .relpersistence = RELPERSISTENCE_UNLOGGED };
+	CreateStmt create = { .type = T_CreateStmt, .relation = &target };
+	CreateTableAsStmt ctas = { .type = T_CreateTableAsStmt, .objtype = OBJECT_MATVIEW };
+	Node *statements[] = { (Node *)&create, (Node *)&ctas };
+
+	for (unsigned i = 0; i < lengthof(statements); i++) {
+		int caught;
+
+		reset_create_preflight();
+		caught = sigsetjmp(boundary, 1);
+		if (!caught)
+			create_sql_entry(statements[i]);
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(error_code, ERRCODE_FEATURE_NOT_SUPPORTED);
+		UT_ASSERT_EQ(utility_xids, 0);
+		UT_ASSERT_EQ(utility_prepares, 0);
+		UT_ASSERT_EQ(utility_after_preflight, 0);
+	}
+}
+
+UT_TEST(test_noncreate_utility_does_not_reserve_canonical_binding)
+{
+	VariableShowStmt show = { .type = T_VariableShowStmt };
+	TransactionStmt transaction = { .type = T_TransactionStmt, .kind = TRANS_STMT_BEGIN };
+	VacuumStmt vacuum = { .type = T_VacuumStmt };
+	CopyStmt copy = { .type = T_CopyStmt };
+	Node *statements[] = { (Node *)&show, (Node *)&transaction, (Node *)&vacuum, (Node *)&copy };
+
+	for (unsigned i = 0; i < lengthof(statements); i++) {
+		reset_create_preflight();
+		create_sql_entry(statements[i]);
+		UT_ASSERT_EQ(utility_after_preflight, 1);
+		UT_ASSERT_EQ(utility_xids, 0);
+		UT_ASSERT_EQ(utility_prepares, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(21);
+	UT_PLAN(28);
 	UT_RUN(test_pre1_startup_refuses_before_root_and_without_writes);
 	UT_RUN(test_selected_pre1_image_and_corruption_are_distinct);
 	UT_RUN(test_nonshared_startup_remains_native);
@@ -996,6 +1255,13 @@ main(void)
 	UT_RUN(test_shared_two_phase_refuses_but_transaction_control_remains_native);
 	UT_RUN(test_rdma_drop_checks_native_targets_before_later_utility_work);
 	UT_RUN(test_shared_smgr_drop_preflight_is_independent_of_shared_catalog_gucs);
+	UT_RUN(test_shared_create_binds_before_later_utility_work_and_reuses_top);
+	UT_RUN(test_create_publication_refusal_precedes_later_utility_work);
+	UT_RUN(test_create_rejects_child_or_wrong_top_before_xid_and_binding);
+	UT_RUN(test_create_preflight_only_targets_shared_catalog_storage);
+	UT_RUN(test_create_original_readonly_and_parallel_guards_precede_binding);
+	UT_RUN(test_unsupported_creates_refuse_before_xid_or_binding);
+	UT_RUN(test_noncreate_utility_does_not_reserve_canonical_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
