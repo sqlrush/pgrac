@@ -291,6 +291,31 @@ CreateCommandTag(Node *statement)
 		return ((GrantRoleStmt *)statement)->is_grant ? CMDTAG_GRANT_ROLE : CMDTAG_REVOKE_ROLE;
 	if (IsA(statement, AlterDefaultPrivilegesStmt))
 		return CMDTAG_ALTER_DEFAULT_PRIVILEGES;
+	if (IsA(statement, CreateFunctionStmt))
+		return ((CreateFunctionStmt *)statement)->is_procedure ? CMDTAG_CREATE_PROCEDURE
+															   : CMDTAG_CREATE_FUNCTION;
+	if (IsA(statement, AlterFunctionStmt)) {
+		switch (((AlterFunctionStmt *)statement)->objtype) {
+		case OBJECT_FUNCTION:
+			return CMDTAG_ALTER_FUNCTION;
+		case OBJECT_PROCEDURE:
+			return CMDTAG_ALTER_PROCEDURE;
+		case OBJECT_ROUTINE:
+			return CMDTAG_ALTER_ROUTINE;
+		default:
+			return CMDTAG_UNKNOWN;
+		}
+	}
+	if (IsA(statement, CreateTrigStmt))
+		return CMDTAG_CREATE_TRIGGER;
+	if (IsA(statement, RuleStmt))
+		return CMDTAG_CREATE_RULE;
+	if (IsA(statement, CreatePolicyStmt))
+		return CMDTAG_CREATE_POLICY;
+	if (IsA(statement, AlterPolicyStmt))
+		return CMDTAG_ALTER_POLICY;
+	if (IsA(statement, CommentStmt))
+		return CMDTAG_COMMENT;
 	return IsA(statement, CreateTableAsStmt) ? CMDTAG_CREATE_TABLE_AS : CMDTAG_CREATE_TABLE;
 }
 
@@ -319,6 +344,26 @@ GetCommandTagName(CommandTag tag)
 		return "REVOKE ROLE";
 	if (tag == CMDTAG_ALTER_DEFAULT_PRIVILEGES)
 		return "ALTER DEFAULT PRIVILEGES";
+	if (tag == CMDTAG_CREATE_FUNCTION)
+		return "CREATE FUNCTION";
+	if (tag == CMDTAG_CREATE_PROCEDURE)
+		return "CREATE PROCEDURE";
+	if (tag == CMDTAG_ALTER_FUNCTION)
+		return "ALTER FUNCTION";
+	if (tag == CMDTAG_ALTER_PROCEDURE)
+		return "ALTER PROCEDURE";
+	if (tag == CMDTAG_ALTER_ROUTINE)
+		return "ALTER ROUTINE";
+	if (tag == CMDTAG_CREATE_TRIGGER)
+		return "CREATE TRIGGER";
+	if (tag == CMDTAG_CREATE_RULE)
+		return "CREATE RULE";
+	if (tag == CMDTAG_CREATE_POLICY)
+		return "CREATE POLICY";
+	if (tag == CMDTAG_ALTER_POLICY)
+		return "ALTER POLICY";
+	if (tag == CMDTAG_COMMENT)
+		return "COMMENT";
 	return tag == CMDTAG_CREATE_TABLE_AS ? "CREATE TABLE AS" : "CREATE TABLE";
 }
 
@@ -1460,9 +1505,36 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 								 .objtype = OBJECT_TABLE };
 	AlterDefaultPrivilegesStmt defaults
 		= { .type = T_AlterDefaultPrivilegesStmt, .action = &default_action };
-	Node *statements[]
-		= { (Node *)&schema, (Node *)&sequence, (Node *)&index, (Node *)&view,	  (Node *)&rename,
-			(Node *)&move,	 (Node *)&grant,	(Node *)&role,	(Node *)&defaults };
+	CreateFunctionStmt create_function = { .type = T_CreateFunctionStmt };
+	CreateFunctionStmt create_procedure = { .type = T_CreateFunctionStmt, .is_procedure = true };
+	AlterFunctionStmt alter_function = { .type = T_AlterFunctionStmt, .objtype = OBJECT_FUNCTION };
+	AlterFunctionStmt alter_procedure
+		= { .type = T_AlterFunctionStmt, .objtype = OBJECT_PROCEDURE };
+	AlterFunctionStmt alter_routine = { .type = T_AlterFunctionStmt, .objtype = OBJECT_ROUTINE };
+	CreateTrigStmt trigger = { .type = T_CreateTrigStmt };
+	RuleStmt rule = { .type = T_RuleStmt, .event = CMD_UPDATE };
+	CreatePolicyStmt policy = { .type = T_CreatePolicyStmt, .permissive = true };
+	AlterPolicyStmt alter_policy = { .type = T_AlterPolicyStmt };
+	CommentStmt comment = { .type = T_CommentStmt, .objtype = OBJECT_TABLE };
+	Node *statements[] = { (Node *)&schema,
+						   (Node *)&sequence,
+						   (Node *)&index,
+						   (Node *)&view,
+						   (Node *)&rename,
+						   (Node *)&move,
+						   (Node *)&grant,
+						   (Node *)&role,
+						   (Node *)&defaults,
+						   (Node *)&create_function,
+						   (Node *)&create_procedure,
+						   (Node *)&alter_function,
+						   (Node *)&alter_procedure,
+						   (Node *)&alter_routine,
+						   (Node *)&trigger,
+						   (Node *)&rule,
+						   (Node *)&policy,
+						   (Node *)&alter_policy,
+						   (Node *)&comment };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned skip = 0; skip < 2; skip++) {
@@ -1473,6 +1545,10 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 			rename.missing_ok = move.missing_ok = skip != 0;
 			grant.is_grant = role.is_grant = default_action.is_grant = skip == 0;
 			grant.targtype = skip ? ACL_TARGET_ALL_IN_SCHEMA : ACL_TARGET_OBJECT;
+			create_function.replace = create_procedure.replace = skip != 0;
+			trigger.replace = rule.replace = skip != 0;
+			policy.permissive = skip == 0;
+			comment.comment = skip ? NULL : "test comment";
 			create_sql_entry(statements[i]);
 			UT_ASSERT_EQ(utility_unbound, 0);
 			UT_ASSERT_EQ(utility_after_preflight, 1);
@@ -1499,12 +1575,11 @@ UT_TEST(test_schema_binds_before_catalog_children_and_children_reuse_top)
 						.is_grant = true,
 						.targtype = ACL_TARGET_OBJECT,
 						.objtype = OBJECT_TABLE };
-	ListCell cells[5] = { { .ptr_value = &table },
-						  { .ptr_value = &sequence },
-						  { .ptr_value = &index },
-						  { .ptr_value = &view },
-						  { .ptr_value = &grant } };
-	List children = { .type = T_List, .length = 5, .max_length = 5, .elements = cells };
+	CreateTrigStmt trigger = { .type = T_CreateTrigStmt };
+	ListCell cells[6]
+		= { { .ptr_value = &table }, { .ptr_value = &sequence }, { .ptr_value = &index },
+			{ .ptr_value = &view },	 { .ptr_value = &grant },	 { .ptr_value = &trigger } };
+	List children = { .type = T_List, .length = 6, .max_length = 6, .elements = cells };
 	CreateSchemaStmt schema = { .type = T_CreateSchemaStmt, .schemaElts = &children };
 
 	reset_create_preflight();
@@ -1520,10 +1595,11 @@ UT_TEST(test_schema_binds_before_catalog_children_and_children_reuse_top)
 	create_sql_entry((Node *)&index);
 	create_sql_entry((Node *)&view);
 	create_sql_entry((Node *)&grant);
+	create_sql_entry((Node *)&trigger);
 	UT_ASSERT_EQ(utility_unbound, 0);
-	UT_ASSERT_EQ(utility_after_preflight, 6);
+	UT_ASSERT_EQ(utility_after_preflight, 7);
 	UT_ASSERT_EQ(utility_xids, 1);
-	UT_ASSERT_EQ(utility_prepares, 6);
+	UT_ASSERT_EQ(utility_prepares, 7);
 	UT_ASSERT_EQ(utility_binds, 1);
 }
 
@@ -1547,9 +1623,36 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 								 .objtype = OBJECT_TABLE };
 	AlterDefaultPrivilegesStmt defaults
 		= { .type = T_AlterDefaultPrivilegesStmt, .action = &default_action };
-	Node *statements[]
-		= { (Node *)&schema, (Node *)&sequence, (Node *)&index, (Node *)&view,	  (Node *)&rename,
-			(Node *)&move,	 (Node *)&grant,	(Node *)&role,	(Node *)&defaults };
+	CreateFunctionStmt create_function = { .type = T_CreateFunctionStmt };
+	CreateFunctionStmt create_procedure = { .type = T_CreateFunctionStmt, .is_procedure = true };
+	AlterFunctionStmt alter_function = { .type = T_AlterFunctionStmt, .objtype = OBJECT_FUNCTION };
+	AlterFunctionStmt alter_procedure
+		= { .type = T_AlterFunctionStmt, .objtype = OBJECT_PROCEDURE };
+	AlterFunctionStmt alter_routine = { .type = T_AlterFunctionStmt, .objtype = OBJECT_ROUTINE };
+	CreateTrigStmt trigger = { .type = T_CreateTrigStmt };
+	RuleStmt rule = { .type = T_RuleStmt, .event = CMD_UPDATE };
+	CreatePolicyStmt policy = { .type = T_CreatePolicyStmt, .permissive = true };
+	AlterPolicyStmt alter_policy = { .type = T_AlterPolicyStmt };
+	CommentStmt comment = { .type = T_CommentStmt, .objtype = OBJECT_TABLE };
+	Node *statements[] = { (Node *)&schema,
+						   (Node *)&sequence,
+						   (Node *)&index,
+						   (Node *)&view,
+						   (Node *)&rename,
+						   (Node *)&move,
+						   (Node *)&grant,
+						   (Node *)&role,
+						   (Node *)&defaults,
+						   (Node *)&create_function,
+						   (Node *)&create_procedure,
+						   (Node *)&alter_function,
+						   (Node *)&alter_procedure,
+						   (Node *)&alter_routine,
+						   (Node *)&trigger,
+						   (Node *)&rule,
+						   (Node *)&policy,
+						   (Node *)&alter_policy,
+						   (Node *)&comment };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		int caught;
@@ -1588,9 +1691,36 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 								 .objtype = OBJECT_TABLE };
 	AlterDefaultPrivilegesStmt defaults
 		= { .type = T_AlterDefaultPrivilegesStmt, .action = &default_action };
-	Node *statements[]
-		= { (Node *)&schema, (Node *)&sequence, (Node *)&index, (Node *)&view,	  (Node *)&rename,
-			(Node *)&move,	 (Node *)&grant,	(Node *)&role,	(Node *)&defaults };
+	CreateFunctionStmt create_function = { .type = T_CreateFunctionStmt };
+	CreateFunctionStmt create_procedure = { .type = T_CreateFunctionStmt, .is_procedure = true };
+	AlterFunctionStmt alter_function = { .type = T_AlterFunctionStmt, .objtype = OBJECT_FUNCTION };
+	AlterFunctionStmt alter_procedure
+		= { .type = T_AlterFunctionStmt, .objtype = OBJECT_PROCEDURE };
+	AlterFunctionStmt alter_routine = { .type = T_AlterFunctionStmt, .objtype = OBJECT_ROUTINE };
+	CreateTrigStmt trigger = { .type = T_CreateTrigStmt };
+	RuleStmt rule = { .type = T_RuleStmt, .event = CMD_UPDATE };
+	CreatePolicyStmt policy = { .type = T_CreatePolicyStmt, .permissive = true };
+	AlterPolicyStmt alter_policy = { .type = T_AlterPolicyStmt };
+	CommentStmt comment = { .type = T_CommentStmt, .objtype = OBJECT_TABLE };
+	Node *statements[] = { (Node *)&schema,
+						   (Node *)&sequence,
+						   (Node *)&index,
+						   (Node *)&view,
+						   (Node *)&rename,
+						   (Node *)&move,
+						   (Node *)&grant,
+						   (Node *)&role,
+						   (Node *)&defaults,
+						   (Node *)&create_function,
+						   (Node *)&create_procedure,
+						   (Node *)&alter_function,
+						   (Node *)&alter_procedure,
+						   (Node *)&alter_routine,
+						   (Node *)&trigger,
+						   (Node *)&rule,
+						   (Node *)&policy,
+						   (Node *)&alter_policy,
+						   (Node *)&comment };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned child = 0; child < 2; child++) {
@@ -1635,9 +1765,36 @@ UT_TEST(test_catalog_writes_preflight_requires_shared_catalog_storage)
 								 .objtype = OBJECT_TABLE };
 	AlterDefaultPrivilegesStmt defaults
 		= { .type = T_AlterDefaultPrivilegesStmt, .action = &default_action };
-	Node *statements[]
-		= { (Node *)&schema, (Node *)&sequence, (Node *)&index, (Node *)&view,	  (Node *)&rename,
-			(Node *)&move,	 (Node *)&grant,	(Node *)&role,	(Node *)&defaults };
+	CreateFunctionStmt create_function = { .type = T_CreateFunctionStmt };
+	CreateFunctionStmt create_procedure = { .type = T_CreateFunctionStmt, .is_procedure = true };
+	AlterFunctionStmt alter_function = { .type = T_AlterFunctionStmt, .objtype = OBJECT_FUNCTION };
+	AlterFunctionStmt alter_procedure
+		= { .type = T_AlterFunctionStmt, .objtype = OBJECT_PROCEDURE };
+	AlterFunctionStmt alter_routine = { .type = T_AlterFunctionStmt, .objtype = OBJECT_ROUTINE };
+	CreateTrigStmt trigger = { .type = T_CreateTrigStmt };
+	RuleStmt rule = { .type = T_RuleStmt, .event = CMD_UPDATE };
+	CreatePolicyStmt policy = { .type = T_CreatePolicyStmt, .permissive = true };
+	AlterPolicyStmt alter_policy = { .type = T_AlterPolicyStmt };
+	CommentStmt comment = { .type = T_CommentStmt, .objtype = OBJECT_TABLE };
+	Node *statements[] = { (Node *)&schema,
+						   (Node *)&sequence,
+						   (Node *)&index,
+						   (Node *)&view,
+						   (Node *)&rename,
+						   (Node *)&move,
+						   (Node *)&grant,
+						   (Node *)&role,
+						   (Node *)&defaults,
+						   (Node *)&create_function,
+						   (Node *)&create_procedure,
+						   (Node *)&alter_function,
+						   (Node *)&alter_procedure,
+						   (Node *)&alter_routine,
+						   (Node *)&trigger,
+						   (Node *)&rule,
+						   (Node *)&policy,
+						   (Node *)&alter_policy,
+						   (Node *)&comment };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned mode = 0; mode < 8; mode++) {
@@ -1674,12 +1831,43 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 								 .objtype = OBJECT_TABLE };
 	AlterDefaultPrivilegesStmt defaults
 		= { .type = T_AlterDefaultPrivilegesStmt, .action = &default_action };
-	Node *statements[]
-		= { (Node *)&schema, (Node *)&sequence, (Node *)&index, (Node *)&view,	  (Node *)&rename,
-			(Node *)&move,	 (Node *)&grant,	(Node *)&role,	(Node *)&defaults };
-	const char *tags[] = { "CREATE SCHEMA", "CREATE SEQUENCE", "CREATE INDEX",
-						   "CREATE VIEW",	"ALTER TABLE",	   "ALTER TABLE",
-						   "GRANT",			"GRANT ROLE",	   "ALTER DEFAULT PRIVILEGES" };
+	CreateFunctionStmt create_function = { .type = T_CreateFunctionStmt };
+	CreateFunctionStmt create_procedure = { .type = T_CreateFunctionStmt, .is_procedure = true };
+	AlterFunctionStmt alter_function = { .type = T_AlterFunctionStmt, .objtype = OBJECT_FUNCTION };
+	AlterFunctionStmt alter_procedure
+		= { .type = T_AlterFunctionStmt, .objtype = OBJECT_PROCEDURE };
+	AlterFunctionStmt alter_routine = { .type = T_AlterFunctionStmt, .objtype = OBJECT_ROUTINE };
+	CreateTrigStmt trigger = { .type = T_CreateTrigStmt };
+	RuleStmt rule = { .type = T_RuleStmt, .event = CMD_UPDATE };
+	CreatePolicyStmt policy = { .type = T_CreatePolicyStmt, .permissive = true };
+	AlterPolicyStmt alter_policy = { .type = T_AlterPolicyStmt };
+	CommentStmt comment = { .type = T_CommentStmt, .objtype = OBJECT_TABLE };
+	Node *statements[] = { (Node *)&schema,
+						   (Node *)&sequence,
+						   (Node *)&index,
+						   (Node *)&view,
+						   (Node *)&rename,
+						   (Node *)&move,
+						   (Node *)&grant,
+						   (Node *)&role,
+						   (Node *)&defaults,
+						   (Node *)&create_function,
+						   (Node *)&create_procedure,
+						   (Node *)&alter_function,
+						   (Node *)&alter_procedure,
+						   (Node *)&alter_routine,
+						   (Node *)&trigger,
+						   (Node *)&rule,
+						   (Node *)&policy,
+						   (Node *)&alter_policy,
+						   (Node *)&comment };
+	const char *tags[] = { "CREATE SCHEMA",	  "CREATE SEQUENCE",  "CREATE INDEX",
+						   "CREATE VIEW",	  "ALTER TABLE",	  "ALTER TABLE",
+						   "GRANT",			  "GRANT ROLE",		  "ALTER DEFAULT PRIVILEGES",
+						   "CREATE FUNCTION", "CREATE PROCEDURE", "ALTER FUNCTION",
+						   "ALTER PROCEDURE", "ALTER ROUTINE",	  "CREATE TRIGGER",
+						   "CREATE RULE",	  "CREATE POLICY",	  "ALTER POLICY",
+						   "COMMENT" };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned parallel = 0; parallel < 2; parallel++) {

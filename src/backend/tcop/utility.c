@@ -301,14 +301,19 @@ PreflightClusterSharedCatalogWrite(Node *statement)
 			&& !IsA(statement, IndexStmt) && !IsA(statement, ViewStmt)
 			&& !IsA(statement, RenameStmt) && !IsA(statement, AlterObjectSchemaStmt)
 			&& !IsA(statement, GrantStmt) && !IsA(statement, GrantRoleStmt)
-			&& !IsA(statement, AlterDefaultPrivilegesStmt) && !IsA(statement, TruncateStmt)))
+			&& !IsA(statement, AlterDefaultPrivilegesStmt) && !IsA(statement, CreateFunctionStmt)
+			&& !IsA(statement, AlterFunctionStmt) && !IsA(statement, CreateTrigStmt)
+			&& !IsA(statement, RuleStmt) && !IsA(statement, CreatePolicyStmt)
+			&& !IsA(statement, AlterPolicyStmt) && !IsA(statement, CommentStmt)
+			&& !IsA(statement, TruncateStmt)))
 		return;
 
 	if (IsA(statement, TruncateStmt))
 		action = "truncation";
 	else if (IsA(statement, RenameStmt) || IsA(statement, AlterObjectSchemaStmt)
 			 || IsA(statement, GrantStmt) || IsA(statement, GrantRoleStmt)
-			 || IsA(statement, AlterDefaultPrivilegesStmt))
+			 || IsA(statement, AlterDefaultPrivilegesStmt) || IsA(statement, AlterFunctionStmt)
+			 || IsA(statement, AlterPolicyStmt) || IsA(statement, CommentStmt))
 		action = "alteration";
 	else
 		action = "creation";
