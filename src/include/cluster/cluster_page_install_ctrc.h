@@ -118,5 +118,39 @@ extern bool rf_page_recovery_ctrc_replays_fpi_install_smgr_v1(
 	const RfPageCtrcAuthorityV1 *authority, const RfPageCtrcFpiInsertV1 *inserted,
 	Size subject_count, Size memory_budget);
 
+typedef enum RfPageCtrcStepPhaseV1 {
+	RF_PAGE_CTRC_STEP_REFUSED = 0,
+	RF_PAGE_CTRC_STEP_WAIT,
+	RF_PAGE_CTRC_STEP_UNCHANGED,
+	RF_PAGE_CTRC_STEP_TARGET_SYNCED
+} RfPageCtrcStepPhaseV1;
+
+typedef struct RfPageCtrcStepResultV1 {
+	RfPageCtrcStepPhaseV1 phase;
+	RfPageCtrcFpiInsertV1 inserted;
+} RfPageCtrcStepResultV1;
+
+/* Execute one supplied original target from canonical ITL preparation through
+ * the original Generic/F4 WAL leg and strict sync/postread. Enter with its
+ * unpromoted single-target PAGE object and zero caller-held LWLocks. Full work,
+ * physical observations, source, SPACE/before and accepted TX remain fixed.
+ * Preparation's PAGE is dropped only for hash/WAL capacity preparation; after
+ * exact re-promotion, reread and compare every original MAIN/SPACE byte before
+ * PRE_INSERT. Keep every borrowed input and backing object alive/immutable.
+ * memory_budget covers simultaneous private snapshots, including original F4.
+ * WAIT is only an actual conditional PAGE collision. UNCHANGED is a protected
+ * observation, TARGET_SYNCED only local installation; neither clears debt nor
+ * publishes DURABLE/COMPLETE/OPEN. PAGE remains held after successful promotion
+ * except during the explicit pre-WAL gap; caller destroys it on every exit.
+ * False/ERROR never releases IR/WALR or receipts, and retains exact failed F4
+ * debt. ERROR propagates after private cleanup. Store the by-value result apart
+ * from borrowed inputs; do not reinsert an outstanding operation. */
+extern RfPageCtrcStepResultV1 rf_page_recovery_ctrc_replays_itl_step_smgr_v1(
+	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work,
+	const struct ClusterRecoveryCtrcReplaySetSourceV1 *source,
+	RfPageCtrcAuthorityV1 *authority, const ClusterSpaceIdentity *space,
+	BlockNumber blockno, const RfPageVersionV1 *expected_before,
+	const struct ClusterRecoveryUndoEntry *physical, Size physical_count, Size memory_budget);
+
 #endif /* USE_PGRAC_CLUSTER */
 #endif /* CLUSTER_PAGE_INSTALL_CTRC_H */

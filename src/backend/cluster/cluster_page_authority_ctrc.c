@@ -19,6 +19,7 @@
  */
 #include "postgres.h"
 
+#ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_page_authority_ctrc.h"
 #include "cluster/cluster_wal_inputs.h"
 #include "storage/lwlock.h"
@@ -290,6 +291,17 @@ rf_page_authority_ctrc_replays_revalidate_nowait_v1(const RfPageCtrcAuthorityV1 
 }
 
 bool
+rf_page_authority_ctrc_replays_unpromote_v1(RfPageCtrcAuthorityV1 *a)
+{
+	if (a == NULL || a->magic != RF_PAGE_CTRC_AUTHORITY_MAGIC
+		|| a->state != RF_PAGE_CTRC_PROMOTED)
+		return false;
+	ctrc_page_release(a);
+	a->state = RF_PAGE_CTRC_PREFLIGHTED;
+	return true;
+}
+
+bool
 rf_page_authority_ctrc_replays_covers_nowait_v1(const RfPageCtrcAuthorityV1 *a,
 	const RfPageIdentityV1 *identity, const RfPageVersionV1 *expected_before)
 {
@@ -358,3 +370,4 @@ rf_page_authority_ctrc_replays_destroy_v1(RfPageCtrcAuthorityV1 **authority)
 	ctrc_page_release(a);
 	a->magic = 0; ctrc_page_free(a); *authority = NULL;
 }
+#endif /* USE_PGRAC_CLUSTER */

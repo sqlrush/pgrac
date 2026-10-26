@@ -35,6 +35,7 @@ XLogRecPtr GetFlushRecPtr(TimeLineID *timeline);
 pg_cryptohash_ctx *
 recovery_fpi_hash_create(pg_cryptohash_type type)
 {
+	if (native_step_active) native_step_hash_gap();
 	return native_install_active ? pg_cryptohash_create(type)
 		: native_install_original_hash_create(type);
 }
@@ -42,6 +43,8 @@ recovery_fpi_hash_create(pg_cryptohash_type type)
 void
 ForEachLWLockHeldByMe(void (*callback)(LWLock *, LWLockMode, void *), void *context)
 {
+	/* The unit bitmap also represents an independent process's collision. */
+	if (native_step_active && native_step_foreign_blocker) return;
 	native_install_original_held(callback, context);
 	if (native_install_active && native_insert_caller_lock && native_insert_page_held())
 		callback(NULL, LW_EXCLUSIVE, context);

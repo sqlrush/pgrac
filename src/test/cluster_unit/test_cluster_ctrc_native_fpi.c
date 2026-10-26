@@ -91,6 +91,11 @@ static void *native_fpi_allocation;
 static bool native_fpi_alloc_error;
 static bool native_fpi_complete_writer;
 static bool native_install_setup;
+static bool native_step_active;
+static bool native_step_foreign_blocker;
+static void *native_step_allocations[4];
+static unsigned native_step_allocation_depth;
+static void native_step_hash_gap(void);
 static void *native_stamp_allocation;
 static unsigned native_stamp_allocs, native_stamp_frees;
 static bool native_stamp_alloc_error;
@@ -110,10 +115,12 @@ void ctrc_native_fpi_free(void *pointer);
 void *
 ctrc_native_fpi_alloc0(MemoryContext context, Size size)
 {
-	UT_ASSERT(native_fpi_allocation == NULL);
+	if (!native_step_active) UT_ASSERT(native_fpi_allocation == NULL);
+	else UT_ASSERT(native_step_allocation_depth < lengthof(native_step_allocations));
 	if (native_fpi_alloc_error) pg_re_throw();
 	native_fpi_allocs++;
 	native_fpi_allocation = palloc0(size);
+	if (native_step_active) native_step_allocations[native_step_allocation_depth++] = native_fpi_allocation;
 	return native_fpi_allocation;
 }
 
@@ -121,7 +128,14 @@ void
 ctrc_native_fpi_free(void *pointer)
 {
 	UT_ASSERT(pointer != NULL && pointer == native_fpi_allocation);
-	native_fpi_frees++; native_fpi_allocation = NULL; pfree(pointer);
+	native_fpi_frees++; native_fpi_allocation = NULL;
+	if (native_step_active) {
+		UT_ASSERT(native_step_allocation_depth != 0);
+		UT_ASSERT(native_step_allocations[--native_step_allocation_depth] == pointer);
+		if (native_step_allocation_depth != 0)
+			native_fpi_allocation = native_step_allocations[native_step_allocation_depth - 1];
+	}
+	pfree(pointer);
 }
 
 bool
@@ -431,6 +445,7 @@ bool native_install_original_writer_installed(ClusterWalWriterToken *writer,
 #undef cluster_wal_writer_check
 #undef ClusterStartupInstalledRecoveryWriterV1
 #include "test_cluster_ctrc_native_install.inc"
+#include "test_cluster_ctrc_native_step.inc"
 
 int
 main(int argc, char **argv)
@@ -439,7 +454,7 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(34);
+	UT_PLAN(42);
 	UT_RUN(test_native_fpi_projects_entire_page_from_original_c0_and_commit);
 	UT_RUN(test_native_fpi_empty_and_already_terminal_do_not_mint_wal_frame);
 	UT_RUN(test_native_fpi_bad_count_budget_or_terminal_refuses_before_smgr);
@@ -474,5 +489,13 @@ main(int argc, char **argv)
 	UT_RUN(test_native_install_io_errors_free_only_private_memory);
 	UT_RUN(test_native_install_requires_current_original_inserted_window);
 	UT_RUN(test_native_install_extra_lwlock_refuses_before_owner_snapshot);
+	UT_RUN(test_native_step_prepares_logs_and_installs_under_original_owners);
+	UT_RUN(test_native_step_terminal_page_keeps_observation_and_debt);
+	UT_RUN(test_native_step_wait_keeps_original_preflight_and_native_owners);
+	UT_RUN(test_native_step_bad_entry_refuses_before_owner_snapshot_or_io);
+	UT_RUN(test_native_step_gap_rechecks_inputs_and_all_original_page_bytes);
+	UT_RUN(test_native_step_rechecks_inputs_after_every_protected_read);
+	UT_RUN(test_native_step_error_frees_private_snapshots_and_keeps_debt);
+	UT_RUN(test_native_step_outstanding_operation_cannot_reinsert);
 	UT_DONE(); return ut_failed_count ? 1 : 0;
 }
