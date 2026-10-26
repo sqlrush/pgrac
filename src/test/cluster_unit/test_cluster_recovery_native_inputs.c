@@ -1035,9 +1035,54 @@ UT_TEST(test_ctrc_inventory_keeps_original_local_cut_and_native_terminal_bytes)
 #include "test_cluster_recovery_episode_history.inc"
 #include "test_cluster_recovery_relmap_fold.inc"
 #include "test_cluster_recovery_episode_pending.inc"
+#include "test_cluster_recovery_episode_clog.h"
+static size_t episode_controlled_clog_bytes(void);
+static bool episode_controlled_clog_read(const ClusterRecoveryRelmapSourceV1 *source,
+	uint64 full, ClusterRelmapClogBaseV1 *out, ClusterRelmapClogBaseHandleV1 **held);
+static void episode_controlled_clog_release(ClusterRelmapClogBaseHandleV1 **held);
+#define cluster_clog_relmap_base_custody_bytes_v1 episode_controlled_clog_bytes
+#define cluster_clog_relmap_base_read_v1 episode_controlled_clog_read
+#define cluster_clog_relmap_base_release_v1 episode_controlled_clog_release
 #include "test_cluster_recovery_episode_base.inc"
+#undef cluster_clog_relmap_base_custody_bytes_v1
+#undef cluster_clog_relmap_base_read_v1
+#undef cluster_clog_relmap_base_release_v1
+
+static bool episode_native_clog;
+
+size_t
+cluster_clog_relmap_base_custody_bytes_v1(void)
+{
+	return episode_native_clog ? test_episode_native_clog_bytes()
+		: episode_controlled_clog_bytes();
+}
+
+bool
+cluster_clog_relmap_base_read_v1(const ClusterRecoveryRelmapSourceV1 *source,
+	uint64 full, ClusterRelmapClogBaseV1 *out, ClusterRelmapClogBaseHandleV1 **held)
+{
+	if (episode_native_clog) {
+		void *native = *held;
+		bool ok = test_episode_native_clog_read(source, full, out, &native);
+		*held = native;
+		return ok;
+	}
+	return episode_controlled_clog_read(source, full, out, held);
+}
+
+void
+cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **held)
+{
+	if (episode_native_clog) {
+		void *native = *held;
+		test_episode_native_clog_release(&native);
+		*held = native;
+	} else
+		episode_controlled_clog_release(held);
+}
 #include "test_cluster_recovery_episode_sources.inc"
 #include "test_cluster_recovery_episode_pages.inc"
+#include "test_cluster_recovery_episode_native_clog.inc"
 
 
 int
@@ -1047,6 +1092,13 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_EPISODE_NATIVE_CLOG") != NULL) {
+		UT_PLAN(3);
+		UT_RUN(test_episode_native_clog_keeps_real_fd_and_all_status_observations);
+		UT_RUN(test_episode_native_clog_inode_and_neighbor_change_revoke_same_episode);
+		UT_RUN(test_episode_native_clog_error_retains_fd_and_original_protection);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_EPISODE_PAGES") != NULL) {
 		UT_PLAN(2);
 		UT_RUN(test_episode_pages_borrowed_output_preserves_complete_baseline);
@@ -1140,7 +1192,10 @@ main(int argc, char **argv)
 		UT_RUN(test_episode_base_checks_original_page_bytes_before_and_after_native_read);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(150);
+	UT_PLAN(153);
+	UT_RUN(test_episode_native_clog_keeps_real_fd_and_all_status_observations);
+	UT_RUN(test_episode_native_clog_inode_and_neighbor_change_revoke_same_episode);
+	UT_RUN(test_episode_native_clog_error_retains_fd_and_original_protection);
 	UT_RUN(test_census_page_graph_preserves_original_full_manifest_and_owned_plan);
 	UT_RUN(test_census_page_graph_never_advances_prefix_or_enters_under_caller_lock);
 	UT_RUN(test_census_page_graph_factory_failure_and_final_manifest_drift_are_sticky);
