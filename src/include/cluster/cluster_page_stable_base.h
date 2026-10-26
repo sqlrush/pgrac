@@ -262,6 +262,24 @@ extern bool rf_page_stable_base_proof_matches_ctrc_v1(
 	const RfPageVersionV1 *expected_result,
 	const struct ClusterRecoveryCtrcSubjectAuthorityV1 *authorities, uint32 count,
 	const RfPagePinnedSourceV1 *source, const RfContributorVectorV1 *contributors);
+/* Distinct all-replay set purpose, including contributors without a TT entry.
+ * Supply every original replay index exactly once, with cuts in owner order.
+ * All actual holders must belong to the same original scope/pin/work/ROOT.
+ * The original graph, budget, before-PAGE preflight and borrowed lifetimes
+ * above apply unchanged. Neither TT/RR consumers nor PAGE may use this proof
+ * as authority. Failure/WAIT/ERROR destroys only private copies. */
+struct ClusterRecoveryCtrcReplaySetSourceV1;
+extern RfPageStableCtrcBuildV1 rf_page_stable_base_proof_build_ctrc_replays_v1(
+	const RfPageStableGraphRequestV1 *graph,
+	const struct ClusterRecoveryCtrcReplaySetSourceV1 *authorities, uint32 count,
+	Size memory_budget);
+/* Local, no I/O/allocation/acquire/cleanup; the entire original set and all
+ * graph/source bytes must still match. A retired native set cannot revive. */
+extern bool rf_page_stable_base_proof_matches_ctrc_replays_v1(
+	const RfPageStableBaseProofV1 *proof, const RfPageIdentityV1 *page_identity,
+	const RfPageVersionV1 *expected_result,
+	const struct ClusterRecoveryCtrcReplaySetSourceV1 *authorities, uint32 count,
+	const RfPagePinnedSourceV1 *source, const RfContributorVectorV1 *contributors);
 extern bool rf_page_stable_base_proof_matches_v1(
 	const RfPageStableBaseProofV1 *proof, const RfPageIdentityV1 *page_identity,
 	const RfPageVersionV1 *expected_result, const ClusterRecoveryDutyKey *duties,
