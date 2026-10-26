@@ -255,6 +255,24 @@ rf_page_authority_ctrc_replays_promote_nowait_v1(RfPageCtrcAuthorityV1 *a)
 }
 
 RfPageAuthorityVerdictV1
+rf_page_authority_ctrc_replays_promote_fpi_nowait_v1(RfPageCtrcAuthorityV1 *a,
+	const RfPageIdentityV1 *identity, const RfPageVersionV1 *expected_before)
+{
+	uint32 held = 0;
+
+	if (a == NULL || a->magic != RF_PAGE_CTRC_AUTHORITY_MAGIC
+		|| a->state != RF_PAGE_CTRC_PREFLIGHTED || a->target_count != 1
+		|| !rf_page_identity_equal_v1(identity, &a->targets[0].page_identity)
+		|| !rf_page_version_equal_v1(expected_before, &a->targets[0].expected_result))
+		return RF_PAGE_AUTHORITY_INVALID_ARGUMENT;
+#ifndef USE_CLUSTER_UNIT
+	ForEachLWLockHeldByMe(ctrc_page_count_held, &held);
+#endif
+	if (held != 0) return RF_PAGE_AUTHORITY_WOULD_BLOCK;
+	return rf_page_authority_ctrc_replays_promote_nowait_v1(a);
+}
+
+RfPageAuthorityVerdictV1
 rf_page_authority_ctrc_replays_revalidate_nowait_v1(const RfPageCtrcAuthorityV1 *a)
 {
 	if (a == NULL || a->magic != RF_PAGE_CTRC_AUTHORITY_MAGIC

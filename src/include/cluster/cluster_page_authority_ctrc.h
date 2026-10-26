@@ -46,6 +46,12 @@ extern RfPageCtrcAuthorityBuildV1 rf_page_authority_ctrc_replays_preflight_v1(
  * insufficient remaining capacity is WOULD_BLOCK without partial grants. */
 extern RfPageAuthorityVerdictV1 rf_page_authority_ctrc_replays_promote_nowait_v1(
 	RfPageCtrcAuthorityV1 *authority);
+/* One-image WAL consumer: require exactly this one original target and no
+ * caller-held native LWLocks before PAGE. General batch promotion above is
+ * unchanged; its near-ceiling batches are not native WAL insertion inputs. */
+extern RfPageAuthorityVerdictV1 rf_page_authority_ctrc_replays_promote_fpi_nowait_v1(
+	RfPageCtrcAuthorityV1 *authority, const RfPageIdentityV1 *identity,
+	const RfPageVersionV1 *expected_before);
 extern RfPageAuthorityVerdictV1 rf_page_authority_ctrc_replays_revalidate_nowait_v1(
 	const RfPageCtrcAuthorityV1 *authority);
 /* Exact target version under all original current native owners and PAGE.

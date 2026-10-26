@@ -23,16 +23,19 @@
 
 #ifdef USE_PGRAC_CLUSTER
 #include "access/xlog.h"
+#include "access/xloginsert.h"
 #include "access/xlogrecovery.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_space_reservation.h"
 #include "cluster/cluster_terminal_ref_census.h"
+#include "cluster/cluster_wal_inputs.h"
 #include "utils/memutils.h"
 #include "miscadmin.h"
 #include "postmaster/interrupt.h"
 #include "storage/checksum.h"
+#include "storage/lwlock.h"
 #include "storage/smgr.h"
 
 typedef struct CtrcNativeReadV1 {
@@ -227,6 +230,203 @@ rf_page_recovery_ctrc_replays_read_smgr_v1(const struct ClusterRecoveryStartV1 *
 	if (ctrc_native_read_bind(&context, start, work, authority, space, blockno, expected_before)
 		&& ctrc_native_read_image(&context, &result.image))
 		result.ready = true;
+	return result;
+}
+
+typedef struct CtrcNativeInsertV1 {
+	CtrcNativeReadV1 read;
+	const struct ClusterRecoveryStartV1 *start;
+	const ClusterColdCtrcWorkV1 *work;
+	const ClusterColdCtrcWorkV1 *snapshot;
+	Size work_bytes;
+	const ClusterRecoveryCtrcReplaySetSourceV1 *original_source;
+	ClusterRecoveryCtrcReplaySetSourceV1 source;
+	const GenericXLogRecoveryImageV1 *original_image;
+	ClusterRecoveryTxResultObservationV1 accepted;
+	GenericXLogRecoveryImageDescriptorV1 descriptor;
+} CtrcNativeInsertV1;
+
+static void
+ctrc_native_insert_count_lock(LWLock *lock, LWLockMode mode, void *context)
+{
+	(void)lock; (void)mode;
+	*(uint32 *)context += 1;
+}
+
+static bool
+ctrc_native_insert_inputs_current(const CtrcNativeInsertV1 *context,
+	const RfPageCtrcFpiInsertV1 *result)
+{
+	ClusterRecoveryTxResultObservationV1 accepted;
+
+	return ctrc_native_read_actor()
+		&& ClusterColdRecoveryCtrcWorkCurrent(context->start, context->work)
+		&& memcmp(context->work, context->snapshot, context->work_bytes) == 0
+		&& memcmp(context->original_image, &result->image, sizeof(result->image)) == 0
+		&& memcmp(context->original_source, &context->source, sizeof(context->source)) == 0
+		&& cluster_recovery_ctrc_terminal_result_v1(context->start, context->work, &accepted)
+		&& memcmp(&accepted, &context->accepted, sizeof(accepted)) == 0
+		&& ClusterColdRecoveryCtrcScope(context->start, context->work) == context->source.scope;
+}
+
+/* No hashing, allocation, ROOT/WAL I/O or ownership acquisition. Original
+ * short shared snapshots still validate the same installed writer/holders. */
+static bool
+ctrc_native_insert_current(const CtrcNativeInsertV1 *context,
+	const RfPageCtrcFpiInsertV1 *result)
+{
+	ClusterWalWriterToken writer;
+	uint8 operation_uuid[16];
+	uint64 generation;
+	ClusterRecoveryStampFpiV1 envelope;
+	RfPageCtrcReferenceV1 reference;
+	const ClusterRecoveryCheckpointOwnerV1 *owner = &context->accepted.checkpoint.owner;
+
+	if (!ctrc_native_insert_inputs_current(context, result)
+		|| !ClusterStartupInstalledRecoveryWriterV1(&writer, operation_uuid, &generation)
+		|| memcmp(&writer, &owner->writer, sizeof(writer)) != 0
+		|| memcmp(operation_uuid, owner->operation_uuid, sizeof(operation_uuid)) != 0
+		|| generation != owner->install_generation
+		|| !ctrc_native_read_current(&context->read)
+		|| result->window.kind != CLUSTER_RECOVERY_STAMP_FPI
+		|| result->window.payload_length != sizeof(envelope))
+		return false;
+	memcpy(&envelope, result->window.payload, sizeof(envelope));
+	reference = rf_page_authority_ctrc_replays_reference_nowait_v1(context->read.authority,
+		&context->source, &context->read.identity, &context->read.before);
+	return reference.ready
+		&& memcmp(&envelope.image, &context->descriptor, sizeof(envelope.image)) == 0
+		&& memcmp(&envelope.protection, &reference.reference, sizeof(envelope.protection)) == 0
+		&& memcmp(&result->window.owner.writer, &owner->writer, sizeof(owner->writer)) == 0
+		&& memcmp(&result->window.owner.target, &context->source.selected.source.claim,
+			sizeof(result->window.owner.target)) == 0
+		&& result->window.owner.executor_pid == owner->owner_pid
+		&& result->window.owner.executor_boot == owner->owner_boot
+		&& result->window.owner.recovery_serial == owner->start_serial
+		&& ctrc_native_insert_inputs_current(context, result);
+}
+
+static void
+ctrc_native_insert_wal(CtrcNativeInsertV1 *context, RfPageCtrcAuthorityV1 *authority,
+	Size subject_count, Size stamp_budget, RfPageCtrcFpiInsertV1 *result)
+{
+	if (!ctrc_native_insert_inputs_current(context, result)
+		|| !GenericXLogRecoveryImageDescribe(&result->image, &context->descriptor)
+		|| !ctrc_native_insert_inputs_current(context, result))
+		return;
+	XLogEnsureRecordSpace(0, 0);
+	if (!ctrc_native_insert_inputs_current(context, result)) return;
+	context->read.identity.system_identifier = result->image.identity.key.system_identifier;
+	memcpy(context->read.identity.storage_uuid, result->image.identity.key.storage_uuid, 16);
+	context->read.identity.locator = result->image.identity.key.locator;
+	context->read.identity.forknum = result->image.fork_number;
+	context->read.identity.blockno = result->image.block_number;
+	if (rf_page_authority_ctrc_replays_promote_fpi_nowait_v1(authority,
+			&context->read.identity, &result->image.version.before) != RF_PAGE_AUTHORITY_OK
+		|| !ctrc_native_insert_inputs_current(context, result)
+		|| !ctrc_native_read_bind(&context->read, context->start, context->work, authority,
+			&context->original_image->identity, result->image.block_number, &context->original_image->version.before)
+		|| memcmp(&context->read.owner, &context->accepted.checkpoint.owner, sizeof(context->read.owner)) != 0)
+		return;
+	result->window = cluster_recovery_stamp_prepare_ctrc_fpi_v1(context->start, context->work,
+		context->original_source, authority, &context->read.identity, &context->descriptor,
+		subject_count, stamp_budget);
+	if (result->window.key.window_seq == 0) return;
+	if (cluster_wal_writer_check(&result->window.owner.writer) != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| !ctrc_native_insert_current(context, result)) {
+		if (cluster_recovery_stamp_cancel_v1(&result->window))
+			memset(&result->window, 0, sizeof(result->window));
+		else
+			(void)cluster_recovery_stamp_fail_v1(&result->window);
+		return;
+	}
+	START_CRIT_SECTION();
+	if (!cluster_recovery_stamp_inserting_v1(&result->window))
+		ereport(PANIC, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+			errmsg("could not begin native recovery image insertion"),
+			errhint("Retain the recovery window for the next recovery owner.")));
+	XLogBeginInsert();
+	if (!GenericXLogRecoveryImageRegister(&result->image))
+		ereport(PANIC, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+			errmsg("could not register native recovery image"),
+			errhint("Retain the recovery window for the next recovery owner.")));
+	result->record_end = XLogInsert(RM_GENERIC_ID, 0);
+	result->record_start = ProcLastRecPtr;
+	if (!cluster_recovery_stamp_inserted_v1(&result->window, result->record_start, result->record_end))
+		ereport(PANIC, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+			errmsg("could not record native recovery image insertion"),
+			errhint("Retain the recovery window for the next recovery owner.")));
+	END_CRIT_SECTION();
+	XLogFlush(result->record_end);
+	if (cluster_wal_writer_check(&result->window.owner.writer) == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& ctrc_native_insert_current(context, result)
+		&& cluster_recovery_stamp_fpi_inserted_current_v1(&result->window, result->record_start, result->record_end))
+		result->wal_flushed = true;
+	else
+		(void)cluster_recovery_stamp_fail_v1(&result->window);
+}
+
+/* The output and binding belong to the calling frame, outside this setjmp.
+ * On ERROR the exact published window remains defined for failure marking. */
+static void
+ctrc_native_insert_attempt(CtrcNativeInsertV1 *context, const ClusterColdCtrcWorkV1 *header,
+	RfPageCtrcAuthorityV1 *authority, Size subject_count, Size memory_budget,
+	RfPageCtrcFpiInsertV1 *result)
+{
+	void *volatile snapshot = NULL;
+
+	PG_TRY();
+	{
+		snapshot = MemoryContextAllocZero(CurrentMemoryContext, context->work_bytes);
+		if (ClusterColdRecoveryCtrcWorkCurrent(context->start, context->work)
+			&& memcmp(context->work, header, offsetof(ClusterColdCtrcWorkV1, entries)) == 0) {
+			memcpy((void *)snapshot, context->work, context->work_bytes);
+			context->snapshot = (const ClusterColdCtrcWorkV1 *)snapshot;
+			ctrc_native_insert_wal(context, authority, subject_count,
+				memory_budget - context->work_bytes, result);
+		}
+	}
+	PG_CATCH();
+	{
+		if (result->window.key.window_seq != 0) (void)cluster_recovery_stamp_fail_v1(&result->window);
+		if (snapshot != NULL) pfree((void *)snapshot);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (snapshot != NULL) pfree((void *)snapshot);
+}
+
+RfPageCtrcFpiInsertV1
+rf_page_recovery_ctrc_replays_fpi_insert_v1(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, const ClusterRecoveryCtrcReplaySetSourceV1 *source,
+	RfPageCtrcAuthorityV1 *authority, const GenericXLogRecoveryImageV1 *image,
+	Size subject_count, Size memory_budget)
+{
+	RfPageCtrcFpiInsertV1 result = {0};
+	CtrcNativeInsertV1 context = {0};
+	ClusterColdCtrcWorkV1 header;
+	uint32 held = 0;
+	Size bytes;
+
+	if (!ctrc_native_read_actor() || start == NULL || work == NULL || source == NULL
+		|| authority == NULL || image == NULL)
+		return result;
+	/* Reject a full caller-held list before any original owner snapshot. */
+	ForEachLWLockHeldByMe(ctrc_native_insert_count_lock, &held);
+	if (held != 0 || !ClusterColdRecoveryCtrcWorkCurrent(start, work)
+		|| subject_count != work->counts.subject_count
+		|| subject_count > (MaxAllocSize - offsetof(ClusterColdCtrcWorkV1, entries)) / sizeof(work->entries[0])
+		|| source->scope == NULL || ClusterColdRecoveryCtrcScope(start, work) != source->scope)
+		return result;
+	bytes = offsetof(ClusterColdCtrcWorkV1, entries) + subject_count * sizeof(work->entries[0]);
+	/* The unchanged F4 producer temporarily keeps its own complete snapshot. */
+	if (bytes > memory_budget / 2) return result;
+	memcpy(&header, work, offsetof(ClusterColdCtrcWorkV1, entries));
+	context.start = start; context.work = work; context.work_bytes = bytes;
+	context.original_source = source; context.source = *source;
+	context.original_image = image; result.image = *image;
+	if (!cluster_recovery_ctrc_terminal_result_v1(start, work, &context.accepted)) return result;
+	ctrc_native_insert_attempt(&context, &header, authority, subject_count, memory_budget, &result);
 	return result;
 }
 

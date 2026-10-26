@@ -382,10 +382,31 @@ UT_TEST(test_native_page_original_snapshot_rejects_after_last_page_and_unwinds)
 	UT_ASSERT_EQ(native_owner.state, CLUSTER_LOCK_OWNER_HELD);
 }
 
+UT_TEST(test_native_fpi_promotion_requires_one_exact_page_and_no_caller_locks)
+{
+	for (unsigned fault = 0; fault < 5; fault++) {
+		RfPageCtrcAuthorityBuildV1 result;
+		RfPageIdentityV1 identity;
+		RfPageVersionV1 before;
+
+		fixture(fault == 0 ? 2 : 1, fault == 0 ? 2 : 1, fault == 3 ? 1 : 0);
+		result = build(fault == 0 ? 2 : 1);
+		identity = targets[0].page_identity; before = targets[0].expected_result;
+		if (fault == 1) identity.blockno++;
+		if (fault == 2) before.mutation_token++;
+		UT_ASSERT_EQ(rf_page_authority_ctrc_replays_promote_fpi_nowait_v1(result.authority, &identity, &before),
+			fault < 3 ? RF_PAGE_AUTHORITY_INVALID_ARGUMENT : fault == 3 ? RF_PAGE_AUTHORITY_WOULD_BLOCK : RF_PAGE_AUTHORITY_OK);
+		UT_ASSERT_EQ(acquire_calls, fault == 4 ? 1 : 0);
+		UT_ASSERT_EQ(capacity_errors, 0);
+		if (fault == 4) UT_ASSERT_EQ(peak_held, 2);
+		rf_page_authority_ctrc_replays_destroy_v1(&result.authority);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(11);
 	UT_RUN(test_native_page_batch_exceeding_capacity_takes_no_locks);
 	UT_RUN(test_native_page_batch_leaves_room_for_original_owner_snapshot);
 	UT_RUN(test_native_page_remaining_capacity_waits_without_partial_grants);
@@ -396,6 +417,7 @@ main(void)
 	UT_RUN(test_native_page_single_partition_keeps_one_snapshot_slot_with_caller);
 	UT_RUN(test_native_page_original_snapshot_refuses_exited_owner_before_page);
 	UT_RUN(test_native_page_original_snapshot_rejects_after_last_page_and_unwinds);
+	UT_RUN(test_native_fpi_promotion_requires_one_exact_page_and_no_caller_locks);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
