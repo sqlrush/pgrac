@@ -316,6 +316,12 @@ CreateCommandTag(Node *statement)
 		return CMDTAG_ALTER_POLICY;
 	if (IsA(statement, CommentStmt))
 		return CMDTAG_COMMENT;
+	if (IsA(statement, CreateRoleStmt))
+		return CMDTAG_CREATE_ROLE;
+	if (IsA(statement, AlterRoleStmt) || IsA(statement, AlterRoleSetStmt))
+		return CMDTAG_ALTER_ROLE;
+	if (IsA(statement, DropRoleStmt))
+		return CMDTAG_DROP_ROLE;
 	if (IsA(statement, AlterSeqStmt))
 		return CMDTAG_ALTER_SEQUENCE;
 	if (IsA(statement, AlterTSDictionaryStmt))
@@ -398,6 +404,12 @@ GetCommandTagName(CommandTag tag)
 		return "ALTER POLICY";
 	if (tag == CMDTAG_COMMENT)
 		return "COMMENT";
+	if (tag == CMDTAG_CREATE_ROLE)
+		return "CREATE ROLE";
+	if (tag == CMDTAG_ALTER_ROLE)
+		return "ALTER ROLE";
+	if (tag == CMDTAG_DROP_ROLE)
+		return "DROP ROLE";
 	if (tag == CMDTAG_ALTER_SEQUENCE)
 		return "ALTER SEQUENCE";
 	if (tag == CMDTAG_ALTER_TEXT_SEARCH_DICTIONARY)
@@ -1612,6 +1624,24 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 			.replace = true };
 	AlterTSConfigurationStmt mapping_drop
 		= { .type = T_AlterTSConfigurationStmt, .kind = ALTER_TSCONFIG_DROP_MAPPING };
+	RoleSpec role_target
+		= { .type = T_RoleSpec, .roletype = ROLESPEC_CSTRING, .rolename = "target" };
+	CreateRoleStmt create_role
+		= { .type = T_CreateRoleStmt, .stmt_type = ROLESTMT_ROLE, .role = "target" };
+	CreateRoleStmt create_user
+		= { .type = T_CreateRoleStmt, .stmt_type = ROLESTMT_USER, .role = "target_user" };
+	CreateRoleStmt create_group
+		= { .type = T_CreateRoleStmt, .stmt_type = ROLESTMT_GROUP, .role = "target_group" };
+	AlterRoleStmt alter_role = { .type = T_AlterRoleStmt, .role = &role_target, .action = 1 };
+	VariableSetStmt role_setting
+		= { .type = T_VariableSetStmt, .kind = VAR_RESET, .name = "application_name" };
+	AlterRoleSetStmt alter_settings
+		= { .type = T_AlterRoleSetStmt, .role = &role_target, .setstmt = &role_setting };
+	AlterRoleSetStmt all_settings
+		= { .type = T_AlterRoleSetStmt, .database = "target_database", .setstmt = &role_setting };
+	ListCell role_cell = { .ptr_value = &role_target };
+	List roles = { .type = T_List, .length = 1, .max_length = 1, .elements = &role_cell };
+	DropRoleStmt drop_role = { .type = T_DropRoleStmt, .roles = &roles };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -1648,7 +1678,14 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 						   (Node *)&mapping_alter,
 						   (Node *)&mapping_replace,
 						   (Node *)&mapping_replace_token,
-						   (Node *)&mapping_drop };
+						   (Node *)&mapping_drop,
+						   (Node *)&create_role,
+						   (Node *)&create_user,
+						   (Node *)&create_group,
+						   (Node *)&alter_role,
+						   (Node *)&alter_settings,
+						   (Node *)&all_settings,
+						   (Node *)&drop_role };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned skip = 0; skip < 2; skip++) {
@@ -1667,6 +1704,9 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 			alter_event.tgenabled = skip ? 'D' : 'O';
 			create_stats.if_not_exists = skip != 0;
 			alter_sequence.missing_ok = mapping_drop.missing_ok = skip != 0;
+			drop_role.missing_ok = skip != 0;
+			role_setting.kind = skip ? VAR_RESET_ALL : VAR_RESET;
+			role_setting.name = skip ? NULL : "application_name";
 			create_sql_entry(statements[i]);
 			UT_ASSERT_EQ(utility_unbound, 0);
 			UT_ASSERT_EQ(utility_after_preflight, 1);
@@ -1784,6 +1824,24 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 			.replace = true };
 	AlterTSConfigurationStmt mapping_drop
 		= { .type = T_AlterTSConfigurationStmt, .kind = ALTER_TSCONFIG_DROP_MAPPING };
+	RoleSpec role_target
+		= { .type = T_RoleSpec, .roletype = ROLESPEC_CSTRING, .rolename = "target" };
+	CreateRoleStmt create_role
+		= { .type = T_CreateRoleStmt, .stmt_type = ROLESTMT_ROLE, .role = "target" };
+	CreateRoleStmt create_user
+		= { .type = T_CreateRoleStmt, .stmt_type = ROLESTMT_USER, .role = "target_user" };
+	CreateRoleStmt create_group
+		= { .type = T_CreateRoleStmt, .stmt_type = ROLESTMT_GROUP, .role = "target_group" };
+	AlterRoleStmt alter_role = { .type = T_AlterRoleStmt, .role = &role_target, .action = 1 };
+	VariableSetStmt role_setting
+		= { .type = T_VariableSetStmt, .kind = VAR_RESET, .name = "application_name" };
+	AlterRoleSetStmt alter_settings
+		= { .type = T_AlterRoleSetStmt, .role = &role_target, .setstmt = &role_setting };
+	AlterRoleSetStmt all_settings
+		= { .type = T_AlterRoleSetStmt, .database = "target_database", .setstmt = &role_setting };
+	ListCell role_cell = { .ptr_value = &role_target };
+	List roles = { .type = T_List, .length = 1, .max_length = 1, .elements = &role_cell };
+	DropRoleStmt drop_role = { .type = T_DropRoleStmt, .roles = &roles };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -1820,7 +1878,14 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 						   (Node *)&mapping_alter,
 						   (Node *)&mapping_replace,
 						   (Node *)&mapping_replace_token,
-						   (Node *)&mapping_drop };
+						   (Node *)&mapping_drop,
+						   (Node *)&create_role,
+						   (Node *)&create_user,
+						   (Node *)&create_group,
+						   (Node *)&alter_role,
+						   (Node *)&alter_settings,
+						   (Node *)&all_settings,
+						   (Node *)&drop_role };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		int caught;
@@ -1902,6 +1967,24 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 			.replace = true };
 	AlterTSConfigurationStmt mapping_drop
 		= { .type = T_AlterTSConfigurationStmt, .kind = ALTER_TSCONFIG_DROP_MAPPING };
+	RoleSpec role_target
+		= { .type = T_RoleSpec, .roletype = ROLESPEC_CSTRING, .rolename = "target" };
+	CreateRoleStmt create_role
+		= { .type = T_CreateRoleStmt, .stmt_type = ROLESTMT_ROLE, .role = "target" };
+	CreateRoleStmt create_user
+		= { .type = T_CreateRoleStmt, .stmt_type = ROLESTMT_USER, .role = "target_user" };
+	CreateRoleStmt create_group
+		= { .type = T_CreateRoleStmt, .stmt_type = ROLESTMT_GROUP, .role = "target_group" };
+	AlterRoleStmt alter_role = { .type = T_AlterRoleStmt, .role = &role_target, .action = 1 };
+	VariableSetStmt role_setting
+		= { .type = T_VariableSetStmt, .kind = VAR_RESET, .name = "application_name" };
+	AlterRoleSetStmt alter_settings
+		= { .type = T_AlterRoleSetStmt, .role = &role_target, .setstmt = &role_setting };
+	AlterRoleSetStmt all_settings
+		= { .type = T_AlterRoleSetStmt, .database = "target_database", .setstmt = &role_setting };
+	ListCell role_cell = { .ptr_value = &role_target };
+	List roles = { .type = T_List, .length = 1, .max_length = 1, .elements = &role_cell };
+	DropRoleStmt drop_role = { .type = T_DropRoleStmt, .roles = &roles };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -1938,7 +2021,14 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 						   (Node *)&mapping_alter,
 						   (Node *)&mapping_replace,
 						   (Node *)&mapping_replace_token,
-						   (Node *)&mapping_drop };
+						   (Node *)&mapping_drop,
+						   (Node *)&create_role,
+						   (Node *)&create_user,
+						   (Node *)&create_group,
+						   (Node *)&alter_role,
+						   (Node *)&alter_settings,
+						   (Node *)&all_settings,
+						   (Node *)&drop_role };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned child = 0; child < 2; child++) {
@@ -2026,6 +2116,24 @@ UT_TEST(test_catalog_writes_preflight_requires_shared_catalog_storage)
 			.replace = true };
 	AlterTSConfigurationStmt mapping_drop
 		= { .type = T_AlterTSConfigurationStmt, .kind = ALTER_TSCONFIG_DROP_MAPPING };
+	RoleSpec role_target
+		= { .type = T_RoleSpec, .roletype = ROLESPEC_CSTRING, .rolename = "target" };
+	CreateRoleStmt create_role
+		= { .type = T_CreateRoleStmt, .stmt_type = ROLESTMT_ROLE, .role = "target" };
+	CreateRoleStmt create_user
+		= { .type = T_CreateRoleStmt, .stmt_type = ROLESTMT_USER, .role = "target_user" };
+	CreateRoleStmt create_group
+		= { .type = T_CreateRoleStmt, .stmt_type = ROLESTMT_GROUP, .role = "target_group" };
+	AlterRoleStmt alter_role = { .type = T_AlterRoleStmt, .role = &role_target, .action = 1 };
+	VariableSetStmt role_setting
+		= { .type = T_VariableSetStmt, .kind = VAR_RESET, .name = "application_name" };
+	AlterRoleSetStmt alter_settings
+		= { .type = T_AlterRoleSetStmt, .role = &role_target, .setstmt = &role_setting };
+	AlterRoleSetStmt all_settings
+		= { .type = T_AlterRoleSetStmt, .database = "target_database", .setstmt = &role_setting };
+	ListCell role_cell = { .ptr_value = &role_target };
+	List roles = { .type = T_List, .length = 1, .max_length = 1, .elements = &role_cell };
+	DropRoleStmt drop_role = { .type = T_DropRoleStmt, .roles = &roles };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -2062,7 +2170,14 @@ UT_TEST(test_catalog_writes_preflight_requires_shared_catalog_storage)
 						   (Node *)&mapping_alter,
 						   (Node *)&mapping_replace,
 						   (Node *)&mapping_replace_token,
-						   (Node *)&mapping_drop };
+						   (Node *)&mapping_drop,
+						   (Node *)&create_role,
+						   (Node *)&create_user,
+						   (Node *)&create_group,
+						   (Node *)&alter_role,
+						   (Node *)&alter_settings,
+						   (Node *)&all_settings,
+						   (Node *)&drop_role };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned mode = 0; mode < 8; mode++) {
@@ -2142,6 +2257,24 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 			.replace = true };
 	AlterTSConfigurationStmt mapping_drop
 		= { .type = T_AlterTSConfigurationStmt, .kind = ALTER_TSCONFIG_DROP_MAPPING };
+	RoleSpec role_target
+		= { .type = T_RoleSpec, .roletype = ROLESPEC_CSTRING, .rolename = "target" };
+	CreateRoleStmt create_role
+		= { .type = T_CreateRoleStmt, .stmt_type = ROLESTMT_ROLE, .role = "target" };
+	CreateRoleStmt create_user
+		= { .type = T_CreateRoleStmt, .stmt_type = ROLESTMT_USER, .role = "target_user" };
+	CreateRoleStmt create_group
+		= { .type = T_CreateRoleStmt, .stmt_type = ROLESTMT_GROUP, .role = "target_group" };
+	AlterRoleStmt alter_role = { .type = T_AlterRoleStmt, .role = &role_target, .action = 1 };
+	VariableSetStmt role_setting
+		= { .type = T_VariableSetStmt, .kind = VAR_RESET, .name = "application_name" };
+	AlterRoleSetStmt alter_settings
+		= { .type = T_AlterRoleSetStmt, .role = &role_target, .setstmt = &role_setting };
+	AlterRoleSetStmt all_settings
+		= { .type = T_AlterRoleSetStmt, .database = "target_database", .setstmt = &role_setting };
+	ListCell role_cell = { .ptr_value = &role_target };
+	List roles = { .type = T_List, .length = 1, .max_length = 1, .elements = &role_cell };
+	DropRoleStmt drop_role = { .type = T_DropRoleStmt, .roles = &roles };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -2178,7 +2311,14 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 						   (Node *)&mapping_alter,
 						   (Node *)&mapping_replace,
 						   (Node *)&mapping_replace_token,
-						   (Node *)&mapping_drop };
+						   (Node *)&mapping_drop,
+						   (Node *)&create_role,
+						   (Node *)&create_user,
+						   (Node *)&create_group,
+						   (Node *)&alter_role,
+						   (Node *)&alter_settings,
+						   (Node *)&all_settings,
+						   (Node *)&drop_role };
 	const char *tags[] = { "CREATE SCHEMA",
 						   "CREATE SEQUENCE",
 						   "CREATE INDEX",
@@ -2215,7 +2355,14 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 						   "ALTER TEXT SEARCH CONFIGURATION",
 						   "ALTER TEXT SEARCH CONFIGURATION",
 						   "ALTER TEXT SEARCH CONFIGURATION",
-						   "ALTER TEXT SEARCH CONFIGURATION" };
+						   "ALTER TEXT SEARCH CONFIGURATION",
+						   "CREATE ROLE",
+						   "CREATE ROLE",
+						   "CREATE ROLE",
+						   "ALTER ROLE",
+						   "ALTER ROLE",
+						   "ALTER ROLE",
+						   "DROP ROLE" };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned parallel = 0; parallel < 2; parallel++) {
