@@ -248,6 +248,17 @@ struct ClusterRecoveryCensusPagesV1;
 extern const struct ClusterRecoveryCensusPagesV1 *ClusterColdRecoveryCtrcPages(
 	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work);
 
+/* Same original complete observation and accepted TX; raw, immutable decoded
+ * PAGE WAL inputs of every selected generation. Zero count is complete-empty.
+ * Outputs clear on refusal; readers borrow original cursor/scope lifetime.
+ * Pre-PAGE only: original observation may do I/O/cleanup. No contributor graph,
+ * codec/image validation, native PAGE authority or service completion granted. */
+struct ClusterRecoveryPageWalV1;
+extern bool ClusterColdRecoveryCtrcPageWalCount(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work, uint32 *out_count);
+extern bool ClusterColdRecoveryCtrcPageWalAt(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work, uint32 index, struct ClusterRecoveryPageWalV1 *out);
+
 /* Original post-EOR owner only: require the complete sealed ordinary-effects
  * receipt before consuming any proven physical loser.  This is a read-only
  * input check; the restricted empty-effects proof remains a per-entry

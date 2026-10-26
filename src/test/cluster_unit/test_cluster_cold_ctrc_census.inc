@@ -29,6 +29,36 @@ static union {
 } observation_pages_storage[2];
 #define observation_pages (*(ClusterRecoveryCensusPagesV1 *)observation_pages_storage[0].bytes)
 static unsigned observation_page_fault;
+static unsigned observation_page_wal_fault;
+static uint32 observation_page_wal_count;
+static XLogReaderState observation_page_wal_readers[2];
+
+bool
+cluster_recovery_census_page_wal_count_v1(ClusterRecoveryCensus *cursor, uint32 *out)
+{
+	if (cursor != (ClusterRecoveryCensus *)&observation_cursor_object
+		|| !observation_cursor_live || !observation_scope_live || observation_steps < 3) abort();
+	*out = 0;
+	if (observation_page_wal_fault == 1) return false;
+	if (observation_page_wal_fault == 3) pg_re_throw();
+	*out = observation_page_wal_count + (observation_page_wal_fault == 2 ? 1 : 0);
+	return true;
+}
+
+bool
+cluster_recovery_census_page_wal_at_v1(ClusterRecoveryCensus *cursor, uint32 index,
+	ClusterRecoveryPageWalV1 *out)
+{
+	uint32 count;
+	memset(out, 0, sizeof(*out));
+	if (!cluster_recovery_census_page_wal_count_v1(cursor, &count) || index >= count || index >= 2)
+		return false;
+	if (observation_page_wal_fault == 4) return false;
+	if (observation_page_wal_fault == 5) pg_re_throw();
+	out->source_index = index; out->ordinal = index + 4;
+	out->reader = &observation_page_wal_readers[index];
+	return true;
+}
 
 const ClusterRecoveryCensusPagesV1 *
 cluster_recovery_census_pages_v1(ClusterRecoveryCensus *cursor)
@@ -51,6 +81,9 @@ observation_fixture_reset(void)
 	observation_physical_count = observation_fail_allocation = 0;
 	observation_release_error = observation_early_read = false;
 	observation_page_fault = 0;
+	observation_page_wal_fault = 0;
+	observation_page_wal_count = 2;
+	memset(observation_page_wal_readers, 0, sizeof(observation_page_wal_readers));
 	memset(observation_pages_storage, 0, sizeof(observation_pages_storage));
 	observation_pages.count = 2;
 	observation_pages.entries[0].forknum = MAIN_FORKNUM;
@@ -648,6 +681,117 @@ UT_TEST(test_ctrc_pages_native_error_retires_cursor_before_original_scope)
 	UT_ASSERT(!observation_cursor_live && !observation_scope_live);
 	UT_ASSERT(strstr(observation_events, "DR") != NULL);
 	UT_ASSERT(memcmp(&result, &window_region.checkpoint_owner.ctrc_result, sizeof(result)) == 0);
+	UT_ASSERT_EQ(window_region.checkpoint_owner.ctrc_accepted_generation, 0);
+	ClusterReleaseColdRecoveryInputs(&info);
+}
+
+#ifdef CTRC_PAGE_WAL_START_REFUSE_ONLY
+bool
+ClusterColdRecoveryCtrcPageWalCount(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work, uint32 *out)
+{
+	(void)start; (void)work; if (out != NULL) *out = 0; return false;
+}
+bool
+ClusterColdRecoveryCtrcPageWalAt(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work, uint32 index, struct ClusterRecoveryPageWalV1 *out)
+{
+	(void)start; (void)work; (void)index;
+	if (out != NULL) memset(out, 0, sizeof(*out)); return false;
+}
+#endif
+
+UT_TEST(test_ctrc_page_wal_requires_complete_original_start_and_keeps_service_pending)
+{
+	ClusterRecoveryPageWalV1 value, zero = {0};
+	ClusterRecoveryCtrcResultValueV1 result;
+	uint32 count = 99;
+	observation_two_ready(); result = window_region.checkpoint_owner.ctrc_result;
+	UT_ASSERT(!ClusterColdRecoveryCtrcPageWalCount(info.cluster_tx_start, &native_ctrc_work, &count));
+	UT_ASSERT_EQ(count, 0);
+	UT_ASSERT(ClusterColdRecoveryCtrcObserve(info.cluster_tx_start, 2 * 1024 * 1024));
+	UT_ASSERT(ClusterColdRecoveryCtrcPageWalCount(info.cluster_tx_start, &native_ctrc_work, &count));
+	UT_ASSERT_EQ(count, 2);
+	UT_ASSERT(ClusterColdRecoveryCtrcPageWalAt(info.cluster_tx_start, &native_ctrc_work, 1, &value));
+	UT_ASSERT(value.reader == &observation_page_wal_readers[1]);
+	UT_ASSERT_EQ(value.source_index, 1); UT_ASSERT_EQ(value.ordinal, 5);
+	memset(&value, 0xa5, sizeof(value));
+	UT_ASSERT(!ClusterColdRecoveryCtrcPageWalAt(info.cluster_tx_start, &native_ctrc_work, count, &value));
+	UT_ASSERT(memcmp(&value, &zero, sizeof(value)) == 0);
+	UT_ASSERT_EQ(observation_scope_begins, 1); UT_ASSERT_EQ(observation_census_begins, 1);
+	UT_ASSERT(memcmp(&result, &window_region.checkpoint_owner.ctrc_result, sizeof(result)) == 0);
+	UT_ASSERT_EQ(window_region.checkpoint_owner.ctrc_accepted_generation, 0);
+	ClusterReleaseColdRecoveryInputs(&info);
+}
+
+UT_TEST(test_ctrc_page_wal_changed_missing_or_error_revokes_original_observation)
+{
+	for (unsigned fault = 1; fault <= 5; fault++) {
+		volatile bool caught = false;
+		volatile uint32 count = 99;
+		volatile ClusterRecoveryPageWalV1 value;
+		ClusterRecoveryPageWalV1 zero = {0};
+		observation_two_ready();
+		UT_ASSERT(ClusterColdRecoveryCtrcObserve(info.cluster_tx_start, 2 * 1024 * 1024));
+		observation_page_wal_fault = fault;
+		PG_TRY();
+		{
+			if (fault < 4)
+				UT_ASSERT(!ClusterColdRecoveryCtrcPageWalCount(info.cluster_tx_start, &native_ctrc_work,
+					(uint32 *)&count));
+			else {
+				count = 0;
+				memset((void *)&value, 0xa5, sizeof(value));
+				UT_ASSERT(!ClusterColdRecoveryCtrcPageWalAt(info.cluster_tx_start, &native_ctrc_work, 0,
+					(ClusterRecoveryPageWalV1 *)&value));
+			}
+		}
+		PG_CATCH(); { caught = true; }
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, fault == 3 || fault == 5); UT_ASSERT_EQ(count, 0);
+		if (fault >= 4) UT_ASSERT(memcmp((const void *)&value, &zero, sizeof(value)) == 0);
+		UT_ASSERT(!observation_cursor_live && !observation_scope_live);
+		UT_ASSERT(strstr(observation_events, "DR") != NULL);
+		UT_ASSERT_EQ(window_region.checkpoint_owner.ctrc_accepted_generation, 0);
+		observation_page_wal_fault = 0;
+		UT_ASSERT(!ClusterColdRecoveryCtrcObserve(info.cluster_tx_start, 2 * 1024 * 1024));
+		ClusterReleaseColdRecoveryInputs(&info);
+	}
+}
+
+UT_TEST(test_ctrc_page_wal_requires_exact_work_owner_root_and_accepted_tx)
+{
+	for (unsigned fault = 0; fault < 6; fault++) {
+		const struct ClusterRecoveryStartV1 *start;
+		const ClusterColdCtrcWorkV1 *work;
+		ClusterRecoveryPageWalV1 value, zero = {0};
+		uint32 count = 99;
+		observation_two_ready();
+		UT_ASSERT(ClusterColdRecoveryCtrcObserve(info.cluster_tx_start, 2 * 1024 * 1024));
+		start = info.cluster_tx_start; work = &native_ctrc_work;
+		if (fault == 0) start = (const struct ClusterRecoveryStartV1 *)(uintptr_t)1;
+		if (fault == 1) work = (const ClusterColdCtrcWorkV1 *)&typed;
+		if (fault == 2) owner_boot++;
+		if (fault == 3) native_ctrc_work.entries[1].slot.xid++;
+		if (fault == 4) window_region.checkpoint_owner.tx_accepted_generation = 0;
+		if (fault == 5) typed.census_root.image_sha256[31]++;
+		UT_ASSERT(!ClusterColdRecoveryCtrcPageWalCount(start, work, &count));
+		UT_ASSERT_EQ(count, 0); memset(&value, 0xa5, sizeof(value));
+		UT_ASSERT(!ClusterColdRecoveryCtrcPageWalAt(start, work, 0, &value));
+		UT_ASSERT(memcmp(&value, &zero, sizeof(value)) == 0);
+		if (fault == 2) owner_boot--;
+		release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+		ClusterReleaseColdRecoveryInputs(&info);
+	}
+}
+
+UT_TEST(test_ctrc_page_wal_complete_empty_is_not_a_missing_input)
+{
+	uint32 count = 99;
+	observation_two_ready(); observation_page_wal_count = 0;
+	UT_ASSERT(ClusterColdRecoveryCtrcObserve(info.cluster_tx_start, 2 * 1024 * 1024));
+	UT_ASSERT(ClusterColdRecoveryCtrcPageWalCount(info.cluster_tx_start, &native_ctrc_work, &count));
+	UT_ASSERT_EQ(count, 0);
 	UT_ASSERT_EQ(window_region.checkpoint_owner.ctrc_accepted_generation, 0);
 	ClusterReleaseColdRecoveryInputs(&info);
 }

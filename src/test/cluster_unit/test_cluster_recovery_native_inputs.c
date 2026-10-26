@@ -449,6 +449,68 @@ inventory_write_slru_sequence(const ClusterWalSourceRef *source, WalTestRecord n
 	return next;
 }
 
+/* A mixed ordinary FPI and rebuildable component, with an unused block ID.
+ * The native parser, rather than a fabricated decoded fixture, owns framing. */
+static WalTestRecord
+inventory_write_page(const ClusterWalSourceRef *source, XLogRecPtr at, XLogRecPtr previous,
+	bool changed)
+{
+	uint8 bytes[512] = {0};
+	uint8 *wire = bytes + SizeOfXLogRecord;
+	XLogRecord record = {0};
+	XLogRecordBlockHeader block = {.id = 0, .fork_flags = MAIN_FORKNUM | BKPBLOCK_HAS_IMAGE};
+	XLogRecordBlockImageHeader image = {.length = 64, .hole_offset = 64,
+		.bimg_info = BKPIMAGE_HAS_HOLE | BKPIMAGE_APPLY};
+	RelFileLocator locator = {1663, 5, 16386};
+	BlockNumber number = 7;
+	PGAlignedBlock page = {0};
+	PageHeader header = (PageHeader)page.data;
+	size_t used = SizeOfXLogRecord + XLR_PAGE_VERSION_EDGE_HEADER_SIZE
+		+ 2 * XLR_PAGE_VERSION_EDGE_ENTRY_SIZE;
+	char path[MAXPGPATH];
+	int fd;
+
+	wire[0] = XLR_BLOCK_ID_PAGE_VERSION_EDGE; wire[1] = XLR_PAGE_VERSION_EDGE_FORMAT_V1;
+	wire[2] = 2; wire[3] = XLR_PAGE_VERSION_EDGE_ENTRY_SIZE; wire[8] = 77;
+	wire += XLR_PAGE_VERSION_EDGE_HEADER_SIZE;
+	wire[1] = RF_PAGE_CLASS_ORDINARY;
+	wire[2] = wire[3] = RF_PAGE_STATE_PRESENT;
+	wire[4] = RF_PAGE_EDGE_FULL_IMAGE_APPLY | RF_PAGE_EDGE_FULL_COVERAGE;
+	memset(wire + 8, 0x21, 16); wire[24] = 70; memset(wire + 32, 0x21, 16);
+	wire += XLR_PAGE_VERSION_EDGE_ENTRY_SIZE;
+	wire[0] = 2; wire[1] = RF_PAGE_CLASS_REBUILDABLE_FSM;
+	wire[2] = wire[3] = RF_PAGE_STATE_REBUILDABLE; wire[6] = 1;
+	memcpy(bytes + used, &block, SizeOfXLogRecordBlockHeader); used += SizeOfXLogRecordBlockHeader;
+	memcpy(bytes + used, &image, SizeOfXLogRecordBlockImageHeader); used += SizeOfXLogRecordBlockImageHeader;
+	memcpy(bytes + used, &locator, sizeof(locator)); used += sizeof(locator);
+	memcpy(bytes + used, &number, sizeof(number)); used += sizeof(number);
+	block = (XLogRecordBlockHeader){.id = 2, .fork_flags = FSM_FORKNUM | BKPBLOCK_HAS_DATA,
+		.data_length = 4};
+	locator.relNumber++; number = 31;
+	memcpy(bytes + used, &block, SizeOfXLogRecordBlockHeader); used += SizeOfXLogRecordBlockHeader;
+	memcpy(bytes + used, &locator, sizeof(locator)); used += sizeof(locator);
+	memcpy(bytes + used, &number, sizeof(number)); used += sizeof(number);
+	bytes[used++] = XLR_BLOCK_ID_DATA_SHORT; bytes[used++] = 4;
+	header->pd_lower = SizeOfPageHeaderData; header->pd_upper = header->pd_special = BLCKSZ;
+	header->pd_block_scn = 77;
+	PageSetPageSizeAndVersion(page.data, BLCKSZ, PG_PAGE_LAYOUT_VERSION);
+	memcpy(bytes + used, page.data, 64); used += 64;
+	memcpy(bytes + used, "edge", 4); used += 4;
+	memcpy(bytes + used, changed ? "MAIN" : "main", 4); used += 4;
+	record.xl_tot_len = used; record.xl_prev = previous;
+	record.xl_rmid = RM_GENERIC_ID; record.xl_scn = 5906;
+	INIT_CRC32C(record.xl_crc);
+	COMP_CRC32C(record.xl_crc, bytes + SizeOfXLogRecord, used - SizeOfXLogRecord);
+	COMP_CRC32C(record.xl_crc, &record, offsetof(XLogRecord, xl_crc)); FIN_CRC32C(record.xl_crc);
+	memcpy(bytes, &record, SizeOfXLogRecord);
+	v2_checkpoint_wal_path(&source->claim.identity, at, source->timeline, path);
+	UT_ASSERT(at % XLOG_BLCKSZ + used < XLOG_BLCKSZ);
+	fd = open(path, O_WRONLY); UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(pwrite(fd, bytes, used, at % wal_segment_size), used);
+	UT_ASSERT_EQ(close(fd), 0);
+	return (WalTestRecord){1, MAXALIGN(at + used), at, record.xl_crc};
+}
+
 static ClusterWalInputsV1 *
 inventory_fixture(bool unsupported, bool open_source)
 {
@@ -539,6 +601,8 @@ inventory_fixture(bool unsupported, bool open_source)
 			extra = inventory_write_terminal_sequence(&source, extra, node);
 		if (inventory_extra == 17)
 			extra = inventory_write_relmap_fold_sequence(&source, extra, node);
+		if (inventory_extra == 18)
+			extra = inventory_write_page(&source, extra.exclusive_end, extra.record_start, false);
 		create = inventory_write_record(&source, extra.exclusive_end, extra.record_start,
 										RM_SMGR_ID, XLOG_SMGR_CREATE, &payload, sizeof(payload));
 		if (i == 0) {
@@ -837,6 +901,7 @@ cleanup:
 #include "test_cluster_recovery_terminal_inputs.inc"
 #include "test_cluster_recovery_tt_terminal_inputs.inc"
 #include "test_cluster_recovery_page_roots_inputs.inc"
+#include "test_cluster_recovery_page_wal_inputs.inc"
 
 UT_TEST(test_owned_ctrc_census_borrows_namespace_and_revokes_changed_work)
 {
@@ -974,6 +1039,18 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_CTRC_PAGE_WAL") != NULL) {
+		UT_PLAN(8);
+		UT_RUN(test_page_wal_census_requires_complete_original_observation);
+		UT_RUN(test_page_wal_census_original_scope_loss_never_rebases);
+		UT_RUN(test_page_wal_inputs_keep_all_components_payloads_and_original_sources);
+		UT_RUN(test_page_wal_inputs_do_not_reset_native_effect_cursor_or_fixed_cut);
+		UT_RUN(test_page_wal_inputs_empty_is_complete_and_partial_or_failed_is_not);
+		UT_RUN(test_page_wal_inputs_snapshot_changes_refuse_without_following_rebound_pointers);
+		UT_RUN(test_page_wal_inputs_crc_valid_original_rewrite_refuses_both_passes);
+		UT_RUN(test_page_wal_inputs_charge_original_budget_and_never_export_a_prefix);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_CTRC_PAGE_INVENTORY") != NULL) {
 		UT_PLAN(6);
 	UT_RUN(test_owned_page_inventory_retains_every_space_and_raw_main_page);
@@ -984,7 +1061,15 @@ main(int argc, char **argv)
 	UT_RUN(test_owned_page_inventory_capacity_never_silently_omits_physical_pages);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(100);
+	UT_PLAN(108);
+	UT_RUN(test_page_wal_census_requires_complete_original_observation);
+	UT_RUN(test_page_wal_census_original_scope_loss_never_rebases);
+	UT_RUN(test_page_wal_inputs_keep_all_components_payloads_and_original_sources);
+	UT_RUN(test_page_wal_inputs_do_not_reset_native_effect_cursor_or_fixed_cut);
+	UT_RUN(test_page_wal_inputs_empty_is_complete_and_partial_or_failed_is_not);
+	UT_RUN(test_page_wal_inputs_snapshot_changes_refuse_without_following_rebound_pointers);
+	UT_RUN(test_page_wal_inputs_crc_valid_original_rewrite_refuses_both_passes);
+	UT_RUN(test_page_wal_inputs_charge_original_budget_and_never_export_a_prefix);
 	UT_RUN(test_owned_page_inventory_retains_every_space_and_raw_main_page);
 	UT_RUN(test_owned_page_inventory_keeps_original_heap_layout_and_space_identity);
 	UT_RUN(test_owned_page_inventory_never_exports_or_advances_an_observation_prefix);

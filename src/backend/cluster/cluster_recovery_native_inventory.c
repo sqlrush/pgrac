@@ -37,11 +37,25 @@ typedef struct NativeInventoryRecord {
 	uint64 ordinal;
 } NativeInventoryRecord;
 
+typedef struct NativeInventoryPage {
+	struct NativeInventoryPage *next;
+	XLogReaderState reader;
+	size_t bytes;
+	uint32 source_index;
+	uint64 ordinal;
+	int max_block_id;
+	uint8 digest[32];
+	char error[1024]; /* original RestoreBlockImage diagnostic workspace */
+	/* Normalized decoded header, blocks and owned payloads follow. */
+} NativeInventoryPage;
+
 struct ClusterRecoveryNativeInventory {
 	NativeInventorySource *sources;
 	NativeInventoryRecord *head;
 	NativeInventoryRecord *tail;
 	NativeInventoryRecord *cursor;
+	NativeInventoryPage *pages, *pages_tail, *page_cursor;
+	uint32 page_count;
 	ClusterRecoveryRootSet *roots; /* borrowed; no further access after collection */
 	pg_cryptohash_ctx *hash;
 	ClusterRecoveryNativeInventoryDiag diag;
@@ -224,6 +238,163 @@ inventory_refuse(ClusterRecoveryNativeInventory *work, ClusterRecoveryNativeInve
 	return detail;
 }
 
+static bool
+inventory_page_hash(const XLogReaderState *reader, uint8 out[32])
+{
+	pg_cryptohash_ctx *volatile hash = NULL;
+	volatile bool ok = false;
+
+	PG_TRY();
+	{
+		hash = pg_cryptohash_create(PG_SHA256);
+		ok = hash != NULL && pg_cryptohash_init(hash) == 0
+			&& cluster_recovery_record_hash_update(hash, reader)
+			&& pg_cryptohash_final(hash, out, 32) == 0;
+	}
+	PG_FINALLY();
+	{
+		pg_cryptohash_free(hash);
+	}
+	PG_END_TRY();
+	return ok;
+}
+
+/* Verify every pointer against our one allocation before the record hasher
+ * follows it. Rebound/oversized exported headers must not become reads. */
+static bool
+inventory_page_payload(char **at, const char *end, const char *value, size_t length)
+{
+	size_t aligned = MAXALIGN(length);
+
+	if (aligned > (size_t)(end - *at) || value != (length == 0 ? NULL : *at))
+		return false;
+	*at += aligned;
+	return true;
+}
+
+static bool
+inventory_page_current(const ClusterRecoveryNativeInventory *work, const NativeInventoryPage *page)
+{
+	const DecodedXLogRecord *record = (const DecodedXLogRecord *)
+		((const char *)page + MAXALIGN(sizeof(*page)));
+	size_t fixed = MAXALIGN(sizeof(*page)) + MAXALIGN(sizeof(*record)
+		+ (size_t)(page->max_block_id + 1) * sizeof(DecodedBkpBlock));
+	const char *end = (const char *)page + page->bytes;
+	char *at = (char *)page + fixed;
+	uint8 digest[32];
+
+	if (page->bytes < fixed || page->source_index >= work->source_count
+		|| page->reader.record != record || record->max_block_id != page->max_block_id
+		|| record->next != NULL || record->oversized
+		|| record->size != page->bytes - MAXALIGN(sizeof(*page))
+		|| page->reader.system_identifier
+			!= work->sources[page->source_index].source.claim.identity.system_identifier
+		|| page->reader.ReadRecPtr != record->lsn || page->reader.EndRecPtr != record->next_lsn
+		|| !record->has_page_version_edge
+		|| !inventory_page_payload(&at, end, record->main_data, record->main_data_len))
+		return false;
+	for (int i = 0; i <= page->max_block_id; i++) {
+		const DecodedBkpBlock *block = &record->blocks[i];
+
+		if (!block->in_use)
+			continue;
+		if ((block->has_data && !inventory_page_payload(&at, end, block->data, block->data_len))
+			|| (block->has_image && !inventory_page_payload(&at, end, block->bkp_image, block->bimg_len)))
+			return false;
+	}
+	return at == end && inventory_page_hash(&page->reader, digest)
+		&& memcmp(digest, page->digest, sizeof(digest)) == 0;
+}
+
+static bool
+inventory_pages_current(const ClusterRecoveryNativeInventory *work)
+{
+	const NativeInventoryPage *page = work->pages;
+	uint32 count = 0;
+
+	while (page != NULL && count < work->page_count) {
+		if (!inventory_page_current(work, page))
+			return false;
+		count++;
+		page = page->next;
+	}
+	return page == NULL && count == work->page_count;
+}
+
+static void
+inventory_page_copy(char **at, char **out, const char *source, size_t length)
+{
+	*out = length == 0 ? NULL : *at;
+	if (length != 0)
+		memcpy(*at, source, length);
+	*at += MAXALIGN(length);
+}
+
+static RfPageProofDetailV1
+inventory_page_save(ClusterRecoveryNativeInventory *work, XLogReaderState *reader, uint64 ordinal)
+{
+	const DecodedXLogRecord *source = reader->record;
+	NativeInventoryPage *page;
+	DecodedXLogRecord *record;
+	size_t fixed = MAXALIGN(sizeof(*page)) + MAXALIGN(sizeof(*record)
+		+ (size_t)(source->max_block_id + 1) * sizeof(DecodedBkpBlock));
+	size_t bytes = fixed + MAXALIGN((size_t)source->main_data_len);
+	char *at;
+
+	for (int i = 0; i <= source->max_block_id; i++) {
+		const DecodedBkpBlock *block = &source->blocks[i];
+		if (block->in_use) {
+			if (block->has_data) bytes += MAXALIGN((size_t)block->data_len);
+			if (block->has_image) bytes += MAXALIGN((size_t)block->bimg_len);
+		}
+	}
+	if (work->page_count == UINT32_MAX || bytes > work->budget - work->diag.owned_bytes)
+		return inventory_refuse(work, CLUSTER_RECOVERY_NATIVE_INVENTORY_CAPACITY,
+			RF_PAGE_PROOF_DETAIL_CAPACITY);
+	page = calloc(1, bytes);
+	if (page == NULL)
+		return inventory_refuse(work, CLUSTER_RECOVERY_NATIVE_INVENTORY_CAPACITY,
+			RF_PAGE_PROOF_DETAIL_CAPACITY);
+	/* Link immediately: the original owner also frees this allocation on ERROR. */
+	if (work->pages_tail == NULL) work->pages = page;
+	else work->pages_tail->next = page;
+	work->pages_tail = page; work->page_count++;
+	work->diag.owned_bytes += bytes;
+	page->bytes = bytes; page->max_block_id = source->max_block_id;
+	page->source_index = work->source_cursor; page->ordinal = ordinal;
+	record = (DecodedXLogRecord *)((char *)page + MAXALIGN(sizeof(*page)));
+	memcpy(record, source, sizeof(*record)
+		+ (size_t)(source->max_block_id + 1) * sizeof(DecodedBkpBlock));
+	record->next = NULL; record->oversized = false;
+	record->size = bytes - MAXALIGN(sizeof(*page));
+	at = (char *)page + fixed;
+	inventory_page_copy(&at, &record->main_data, source->main_data, source->main_data_len);
+	for (int i = 0; i <= source->max_block_id; i++) {
+		DecodedBkpBlock *block = &record->blocks[i];
+		if (!block->in_use) { memset(block, 0, sizeof(*block)); continue; }
+		block->prefetch_buffer = InvalidBuffer;
+		block->data = block->bkp_image = NULL;
+		if (block->has_data) {
+			inventory_page_copy(&at, &block->data, source->blocks[i].data, block->data_len);
+			block->data_bufsz = block->data_len;
+		} else block->data_len = block->data_bufsz = 0;
+		if (block->has_image)
+			inventory_page_copy(&at, &block->bkp_image, source->blocks[i].bkp_image, block->bimg_len);
+		else {
+			block->apply_image = false; block->bimg_info = 0;
+			block->bimg_len = block->hole_offset = block->hole_length = 0;
+		}
+	}
+	page->reader.system_identifier = reader->system_identifier;
+	page->reader.ReadRecPtr = reader->ReadRecPtr; page->reader.EndRecPtr = reader->EndRecPtr;
+	page->reader.record = record; page->reader.errormsg_buf = page->error;
+	if (!inventory_page_hash(reader, page->digest)
+		|| !inventory_page_current(work, page))
+		return inventory_refuse(work, CLUSTER_RECOVERY_NATIVE_INVENTORY_INVALID,
+			RF_PAGE_PROOF_DETAIL_SOURCE_GAP);
+	return RF_PAGE_PROOF_DETAIL_OK;
+}
+
 static RfPageProofDetailV1
 inventory_source(const ClusterWalSourceRef *source, const RfContributorStreamCutV1 *cut,
 				 const ClusterWalTailObservation *completed, void *arg)
@@ -327,6 +498,18 @@ inventory_record(XLogReaderState *reader, const ClusterWalSourceRef *source,
 	if (!cluster_recovery_record_hash_update(work->hash, reader))
 		return inventory_refuse(work, CLUSTER_RECOVERY_NATIVE_INVENTORY_INVALID,
 								RF_PAGE_PROOF_DETAIL_SOURCE_GAP);
+	if (reader->record->has_page_version_edge) {
+		if (work->pass == 0) {
+			RfPageProofDetailV1 detail = inventory_page_save(work, reader, ordinal);
+			if (detail != RF_PAGE_PROOF_DETAIL_OK) return detail;
+		} else {
+			NativeInventoryPage *page = work->page_cursor;
+			if (page == NULL || page->source_index != work->source_cursor || page->ordinal != ordinal)
+				return inventory_refuse(work, CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED,
+					RF_PAGE_PROOF_DETAIL_SOURCE_GAP);
+			work->page_cursor = page->next;
+		}
+	}
 	if (work->pass == 0 && work->roots != NULL) {
 		ClusterRecoveryWalTargetsDiag targets;
 
@@ -379,6 +562,7 @@ inventory_record(XLogReaderState *reader, const ClusterWalSourceRef *source,
 			|| record->ordinal != ordinal)
 			return inventory_refuse(work, CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED,
 									RF_PAGE_PROOF_DETAIL_SOURCE_GAP);
+
 		native = cluster_recovery_native_scan_recheck(record->scan, reader, source, cut);
 		work->diag.native_result = native;
 		if (native != CLUSTER_RECOVERY_NATIVE_UNCHANGED)
@@ -446,6 +630,7 @@ inventory_read_pass(ClusterRecoveryNativeInventory *work, ClusterWalInputsV1 *in
 
 	work->source_cursor = 0;
 	work->cursor = work->head;
+	work->page_cursor = work->pages;
 	work->active = false;
 	if (!inventory_history_inputs(work, inputs, work->pass == 0)) {
 		inventory_refuse(work, CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED,
@@ -458,11 +643,15 @@ inventory_read_pass(ClusterRecoveryNativeInventory *work, ClusterWalInputsV1 *in
 		if (work->status == CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED)
 			work->status = CLUSTER_RECOVERY_NATIVE_INVENTORY_INPUT;
 	} else if (work->active || work->source_cursor != work->source_count
-			   || records != work->diag.records || (work->pass == 1 && work->cursor != NULL))
+			   || records != work->diag.records
+			   || (work->pass == 1 && (work->cursor != NULL || work->page_cursor != NULL)))
 		work->status = CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED;
 	else if (!inventory_history_inputs(work, inputs, false))
 		inventory_refuse(work, CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED,
 						 RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH);
+	if (work->status == CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED
+		&& !inventory_pages_current(work))
+		work->status = CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED;
 }
 
 static ClusterRecoveryNativeInventoryResult
@@ -1742,6 +1931,8 @@ cluster_recovery_native_inventory_digest(const ClusterRecoveryNativeInventory *i
 		|| inventory->sources == NULL || inventory->source_count == 0
 		|| inventory->source_count > CLUSTER_WAL_INPUTS_MAX)
 		return false;
+	if (!inventory_pages_current(inventory))
+		return false;
 	PG_TRY();
 	{
 		hash = pg_cryptohash_create(PG_SHA256);
@@ -1763,10 +1954,60 @@ cluster_recovery_native_inventory_digest(const ClusterRecoveryNativeInventory *i
 	return ok;
 }
 
+bool
+cluster_recovery_native_inventory_page_count_v1(ClusterRecoveryNativeInventory *inventory,
+	uint32 *out)
+{
+	if (out != NULL) *out = 0;
+	if (out == NULL || inventory == NULL || !inventory->complete
+		|| inventory->status != CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED)
+		return false;
+	PG_TRY();
+	{
+		if (!inventory_pages_current(inventory)) {
+			inventory->complete = false;
+			(void)inventory_refuse(inventory, CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED,
+				RF_PAGE_PROOF_DETAIL_SOURCE_GAP);
+		}
+	}
+	PG_CATCH();
+	{
+		inventory->complete = false;
+		(void)inventory_refuse(inventory, CLUSTER_RECOVERY_NATIVE_INVENTORY_INVALID,
+			RF_PAGE_PROOF_DETAIL_SOURCE_GAP);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (!inventory->complete) return false;
+	*out = inventory->page_count;
+	return true;
+}
+
+bool
+cluster_recovery_native_inventory_page_at_v1(ClusterRecoveryNativeInventory *inventory,
+	uint32 index, ClusterRecoveryPageWalV1 *out)
+{
+	NativeInventoryPage *page;
+	uint32 count;
+
+	if (out != NULL) memset(out, 0, sizeof(*out));
+	if (out == NULL || !cluster_recovery_native_inventory_page_count_v1(inventory, &count)
+		|| index >= count)
+		return false;
+	page = inventory->pages;
+	for (uint32 i = 0; i < index; i++) page = page->next;
+	out->source = inventory->sources[page->source_index].source;
+	out->cut = inventory->sources[page->source_index].cut;
+	out->source_index = page->source_index; out->ordinal = page->ordinal;
+	out->reader = &page->reader;
+	return true;
+}
+
 void
 cluster_recovery_native_inventory_destroy(ClusterRecoveryNativeInventory *inventory)
 {
 	NativeInventoryRecord *record;
+	NativeInventoryPage *page;
 
 	if (inventory == NULL)
 		return;
@@ -1774,6 +2015,11 @@ cluster_recovery_native_inventory_destroy(ClusterRecoveryNativeInventory *invent
 	cluster_recovery_multixact_join_destroy(inventory->mx_join);
 	cluster_recovery_xact_join_destroy(inventory->xact_join);
 	pg_cryptohash_free(inventory->hash);
+	page = inventory->pages;
+	while (page != NULL) {
+		NativeInventoryPage *next = page->next;
+		free(page); page = next;
+	}
 	record = inventory->head;
 	while (record != NULL) {
 		NativeInventoryRecord *next = record->next;

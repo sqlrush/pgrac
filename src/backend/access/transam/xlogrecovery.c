@@ -722,6 +722,7 @@ struct ClusterRecoveryStartV1 {
 	ClusterRecoveryCensusManifest ctrc_observation_manifest;
 	ClusterColdCtrcPhysicalV1 *ctrc_physical;
 	const ClusterRecoveryCensusPagesV1 *ctrc_pages; /* PGRAC: original census owns this view */
+	uint32 ctrc_page_wal_count; /* PGRAC: full original PAGE WAL observation */
 	char ctrc_observation_refusal[384];
 };
 static struct ClusterRecoveryStartV1 *cluster_recovery_cold_start;
@@ -735,6 +736,7 @@ cluster_recovery_cold_observation_close(struct ClusterRecoveryStartV1 *start)
 {
 	start->ctrc_observation_complete = false;
 	start->ctrc_pages = NULL;
+	start->ctrc_page_wal_count = 0;
 	cluster_recovery_census_destroy(start->ctrc_observation_census);
 	start->ctrc_observation_census = NULL;
 	if (start->ctrc_observation_inputs != NULL)
@@ -1202,12 +1204,19 @@ ClusterColdRecoveryCtrcObserve(const struct ClusterRecoveryStartV1 *start, Size 
 				&& cluster_recovery_cold_observation_terminals_current(state)) {
 				const ClusterRecoveryCensusPagesV1 *pages =
 					cluster_recovery_census_pages_v1(state->ctrc_observation_census);
+				uint32 page_wal_count = 0;
 
 				/* PGRAC: retain the complete original PAGE view only after all
 				 * original terminals. A repeat cannot replace that borrowed view. */
 				if (pages != NULL && cluster_recovery_cold_observation_current(start)
-					&& (state->ctrc_pages == NULL || state->ctrc_pages == pages)) {
+					&& (state->ctrc_pages == NULL || state->ctrc_pages == pages)
+					&& cluster_recovery_census_page_wal_count_v1(state->ctrc_observation_census,
+						&page_wal_count)
+					&& (!state->ctrc_observation_complete
+						|| page_wal_count == state->ctrc_page_wal_count)
+					&& cluster_recovery_cold_observation_current(start)) {
 					state->ctrc_pages = pages;
+					state->ctrc_page_wal_count = page_wal_count;
 					state->ctrc_observation_complete = true;
 					observed = true;
 				} else
@@ -1344,6 +1353,50 @@ ClusterColdRecoveryCtrcPages(const struct ClusterRecoveryStartV1 *start,
 	/* PGRAC: this is an observation getter before PAGE acquisition. The
 	 * original DONE/ROOT/accepted-TX path may do I/O and retire this view. */
 	return ClusterColdRecoveryCtrcObserve(start, 0) ? start->ctrc_pages : NULL;
+}
+
+bool
+ClusterColdRecoveryCtrcPageWalCount(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work, uint32 *out)
+{
+	if (out != NULL) *out = 0;
+	if (out == NULL || start == NULL || start != cluster_recovery_cold_start
+		|| CritSectionCount != 0 || !start->ctrc_observation_complete
+		|| work != start->ctrc_observation_work || !ClusterColdRecoveryCtrcObserve(start, 0))
+		return false;
+	*out = start->ctrc_page_wal_count;
+	return true;
+}
+
+bool
+ClusterColdRecoveryCtrcPageWalAt(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work, uint32 index, struct ClusterRecoveryPageWalV1 *out)
+{
+	struct ClusterRecoveryStartV1 *state = cluster_recovery_cold_start;
+	uint32 count;
+	bool ok = false;
+
+	if (out != NULL) memset(out, 0, sizeof(*out));
+	if (out == NULL || !ClusterColdRecoveryCtrcPageWalCount(start, work, &count) || index >= count)
+		return false;
+	PG_TRY();
+	{
+		ok = cluster_recovery_census_page_wal_at_v1(state->ctrc_observation_census, index, out);
+		if (!ok || !cluster_recovery_cold_observation_current(start)) {
+			memset(out, 0, sizeof(*out)); ok = false;
+			cluster_recovery_cold_observation_refuse(state, "page_wal", 0);
+			cluster_recovery_cold_observation_close(state);
+		}
+	}
+	PG_CATCH();
+	{
+		memset(out, 0, sizeof(*out));
+		cluster_recovery_cold_observation_refuse(state, "page_wal_error", 0);
+		cluster_recovery_cold_observation_close(state);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return ok;
 }
 
 /* History endpoints cannot substitute for the current failed source of a TT
