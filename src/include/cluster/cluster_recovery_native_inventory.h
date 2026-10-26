@@ -16,6 +16,7 @@
 #include "cluster/cluster_recovery_reference_graph.h"
 #include "cluster/cluster_recovery_root_set.h"
 #include "cluster/cluster_wal_inputs.h"
+#include "common/cluster_relmap_v2.h"
 
 typedef enum ClusterRecoveryNativeInventoryResult {
 	CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED = 0,
@@ -66,6 +67,49 @@ typedef struct ClusterRecoveryTerminalSummary {
 	bool has_commit, has_abort, conflict;
 } ClusterRecoveryTerminalSummary;
 
+/* Raw carriers for one complete pending image, never a FullXid/outcome proof.
+ * All selected generations of the physical origin participate. Source LSNs
+ * from different generations are not ordered or treated as interchangeable. */
+typedef enum ClusterRecoveryRelmapFoldResult {
+	CLUSTER_RECOVERY_RELMAP_FOLD_MORE = 0,
+	CLUSTER_RECOVERY_RELMAP_FOLD_ENTRY,
+	CLUSTER_RECOVERY_RELMAP_FOLD_DRAINED,
+	CLUSTER_RECOVERY_RELMAP_FOLD_INVALID,
+	CLUSTER_RECOVERY_RELMAP_FOLD_CHANGED,
+	CLUSTER_RECOVERY_RELMAP_FOLD_CAPACITY
+} ClusterRecoveryRelmapFoldResult;
+
+#define CLUSTER_RECOVERY_RELMAP_FOLD_HEADER_XID (1U << 0)
+#define CLUSTER_RECOVERY_RELMAP_FOLD_WAL_MATCH (1U << 1)
+#define CLUSTER_RECOVERY_RELMAP_FOLD_WAL_ALIAS (1U << 2)
+#define CLUSTER_RECOVERY_RELMAP_FOLD_COMMIT (1U << 3)
+#define CLUSTER_RECOVERY_RELMAP_FOLD_ABORT (1U << 4)
+#define CLUSTER_RECOVERY_RELMAP_FOLD_ASSIGNMENT (1U << 5)
+#define CLUSTER_RECOVERY_RELMAP_FOLD_PREPARE (1U << 6)
+#define CLUSTER_RECOVERY_RELMAP_FOLD_TOP_XID (1U << 7)
+#define CLUSTER_RECOVERY_RELMAP_FOLD_SUBXID (1U << 8)
+#define CLUSTER_RECOVERY_RELMAP_FOLD_CLOG_ZERO (1U << 9)
+#define CLUSTER_RECOVERY_RELMAP_FOLD_CLOG_TRUNCATE (1U << 10)
+#define CLUSTER_RECOVERY_RELMAP_FOLD_RECORD_TOP_XID (1U << 11)
+
+typedef struct ClusterRecoveryRelmapFoldEntry {
+	const ClusterRecoveryNativeRecord *record; /* full original source/cut/payload */
+	ClusterRecoveryNativeKind kind;
+	uint32 source_index;
+	uint64 record_ordinal; /* original all-family ordinal within this source */
+	uint32 flags;
+	uint32 subxid_references; /* every occurrence, not an immediate-parent proof */
+} ClusterRecoveryRelmapFoldEntry;
+
+typedef struct ClusterRecoveryRelmapFoldSummary {
+	uint32 sources, origin_sources; /* includes original explicit empty sources */
+	uint64 header_xid_records, record_top_xid_records;
+	uint64 wal_matches, wal_aliases;
+	uint64 top_commits, top_aborts, assignments, prepares;
+	uint64 child_records, child_references;
+	uint64 clog_zeroes, clog_truncates;
+} ClusterRecoveryRelmapFoldSummary;
+
 typedef struct ClusterRecoveryNativeInventoryDiag {
 	ClusterControlRootResult input_result;
 	RfPageProofDetailV1 input_detail;
@@ -89,6 +133,7 @@ typedef struct ClusterRecoveryNativeInventoryDiag {
 	uint64 tt_head_binding_missing;
 	uint64 terminal_records, terminal_bound, terminal_unbound, terminal_binding_examined;
 	uint64 terminal_lookup_examined;
+	uint64 relmap_examined; /* saved records plus individual subxid inspections */
 	uint64 mx_compared_offsets, mx_compared_members, mx_physical_mismatches;
 	uint64 xact_clog_compared, xact_parents_compared, xact_physical_mismatches;
 	ClusterRecoveryGraphResult graph_result;
@@ -192,6 +237,24 @@ cluster_recovery_native_inventory_terminal_step(ClusterRecoveryNativeInventory *
 extern ClusterRecoveryTerminalResult cluster_recovery_native_inventory_terminal_lookup_step(
 	ClusterRecoveryNativeInventory *inventory, const ClusterRecoveryTxnKey *key,
 	ClusterRecoveryTerminalSummary *out, ClusterRecoveryNativeInventoryDiag *diag);
+/* Independent complete pending-image query. At most 128 saved-record/child
+ * inspections per call, no I/O/allocation and no consumption of other cursors.
+ * ENTRY borrows one original carrier; only DRAINED exports the complete summary.
+ * MORE/refusal clears both outputs. Canonical full pending bytes are fixed
+ * through DRAINED; a later query may then start. Invalid/query drift or failed
+ * final input recheck poisons this inventory and its dependent observations.
+ * RECORD_TOP_XID retains the native top-level label on child-xid carriers.
+ * WAL_MATCH checks full native map bytes, namespace, raw xid, record end and
+ * represented source incarnation only. Membership/boot/FullXid era, reuse,
+ * checkpoint/base lifetime, native/SIDE agreement and terminal qualification
+ * are NOT encoded by that native carrier. Raw terminals and every same-origin
+ * CLOG truncate remain explicit obligations, including historical sources.
+ * Original episode/physical holders and final whole-input checks must remain
+ * current; DRAINED is no COMPLETE, status override, release or OPEN authority. */
+extern ClusterRecoveryRelmapFoldResult cluster_recovery_native_inventory_relmap_step(
+	ClusterRecoveryNativeInventory *inventory, const ClusterRelmapV2Image *pending,
+	ClusterRecoveryRelmapFoldEntry *out, ClusterRecoveryRelmapFoldSummary *summary,
+	ClusterRecoveryNativeInventoryDiag *diag);
 extern void cluster_recovery_native_inventory_destroy(ClusterRecoveryNativeInventory *inventory);
 /* Independent retained terminal/assignment cursor, under the same borrowed
  * ROOT lifetime and failure rules as MX. At most 128 saved records or one

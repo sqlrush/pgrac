@@ -9,7 +9,10 @@
 #include "postgres.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "catalog/storage_xlog.h"
+#include "catalog/pg_tablespace_d.h"
+#include "utils/relmapper.h"
 #include "cluster/cluster_recovery_native_inventory.h"
+#include "cluster/cluster_native_startup.h"
 #include "cluster/cluster_recovery_record_hash.h"
 #include "cluster/cluster_recovery_wal_targets.h"
 #include "cluster/cluster_side_undo.h"
@@ -78,6 +81,13 @@ struct ClusterRecoveryNativeInventory {
 	NativeInventoryRecord *terminal_lookup_cursor;
 	ClusterRecoveryTerminalSummary terminal_lookup;
 	bool terminal_lookup_active;
+	NativeInventoryRecord *relmap_cursor;
+	ClusterRelmapV2Image relmap_query;
+	uint8 relmap_wire[CLUSTER_RELMAP_V2_FILE_SIZE];
+	ClusterRecoveryRelmapFoldEntry relmap_pending;
+	ClusterRecoveryRelmapFoldSummary relmap_summary;
+	uint32 relmap_child_cursor;
+	bool relmap_active;
 };
 
 static void
@@ -819,6 +829,246 @@ cluster_recovery_native_inventory_terminal_lookup_step(ClusterRecoveryNativeInve
 	if (inventory == NULL)
 		return CLUSTER_RECOVERY_TERMINAL_INVALID;
 	result = inventory_terminal_lookup(inventory, key, out);
+	if (diag != NULL)
+		*diag = inventory->diag;
+	return result;
+}
+
+static ClusterRecoveryRelmapFoldResult
+inventory_relmap_fail(ClusterRecoveryNativeInventory *inventory,
+					  ClusterRecoveryRelmapFoldResult result)
+{
+	inventory->status = CLUSTER_RECOVERY_NATIVE_INVENTORY_INVALID;
+	inventory->complete = false;
+	inventory_revoke_dependents(inventory);
+	return result;
+}
+
+/* Native record framing and complete map shape were checked by the original
+ * immutable scan. Compare only identities actually represented by this WAL. */
+static bool
+inventory_relmap_wal_matches(const ClusterRelmapV2Image *pending,
+							 const ClusterRecoveryNativeRecord *record)
+{
+	TransactionId raw = (TransactionId)pending->pending_owner.top_full_xid;
+
+	return record->source.claim.identity.origin_owner_incarnation
+			   == pending->pending_owner.admitted_incarnation
+		   && record->end_lsn == pending->pending_owner.wal_end && record->header.xl_xid == raw
+		   && (!TransactionIdIsValid(record->toplevel_xid) || record->toplevel_xid == raw)
+		   && record->database == pending->identity.dbid
+		   && (pending->identity.shared
+				   ? record->tablespace == GLOBALTABLESPACE_OID
+				   : OidIsValid(record->tablespace) && record->tablespace != GLOBALTABLESPACE_OID)
+		   && record->payload_length == MinSizeOfRelmapUpdate + sizeof(RelMapFile)
+		   && memcmp(record->payload + MinSizeOfRelmapUpdate, &pending->pending, sizeof(RelMapFile))
+				  == 0;
+}
+
+static bool
+inventory_relmap_count(ClusterRecoveryNativeInventory *inventory,
+					   const ClusterRecoveryRelmapFoldEntry *entry)
+{
+	ClusterRecoveryRelmapFoldSummary *summary = &inventory->relmap_summary;
+	uint32 flags = entry->flags;
+
+#define RELMAP_COUNT(condition_, field_)                                                           \
+	do {                                                                                           \
+		if (condition_) {                                                                          \
+			if (summary->field_ == UINT64_MAX)                                                     \
+				return false;                                                                      \
+			summary->field_++;                                                                     \
+		}                                                                                          \
+	} while (0)
+	RELMAP_COUNT(flags & CLUSTER_RECOVERY_RELMAP_FOLD_HEADER_XID, header_xid_records);
+	RELMAP_COUNT(flags & CLUSTER_RECOVERY_RELMAP_FOLD_RECORD_TOP_XID, record_top_xid_records);
+	RELMAP_COUNT(flags & CLUSTER_RECOVERY_RELMAP_FOLD_WAL_MATCH, wal_matches);
+	RELMAP_COUNT(flags & CLUSTER_RECOVERY_RELMAP_FOLD_WAL_ALIAS, wal_aliases);
+	RELMAP_COUNT((flags & CLUSTER_RECOVERY_RELMAP_FOLD_TOP_XID)
+					 && (flags & CLUSTER_RECOVERY_RELMAP_FOLD_COMMIT),
+				 top_commits);
+	RELMAP_COUNT((flags & CLUSTER_RECOVERY_RELMAP_FOLD_TOP_XID)
+					 && (flags & CLUSTER_RECOVERY_RELMAP_FOLD_ABORT),
+				 top_aborts);
+	RELMAP_COUNT(flags & CLUSTER_RECOVERY_RELMAP_FOLD_ASSIGNMENT, assignments);
+	RELMAP_COUNT(flags & CLUSTER_RECOVERY_RELMAP_FOLD_PREPARE, prepares);
+	RELMAP_COUNT(flags & CLUSTER_RECOVERY_RELMAP_FOLD_SUBXID, child_records);
+	RELMAP_COUNT(flags & CLUSTER_RECOVERY_RELMAP_FOLD_CLOG_ZERO, clog_zeroes);
+	RELMAP_COUNT(flags & CLUSTER_RECOVERY_RELMAP_FOLD_CLOG_TRUNCATE, clog_truncates);
+#undef RELMAP_COUNT
+	if (UINT64_MAX - summary->child_references < entry->subxid_references)
+		return false;
+	summary->child_references += entry->subxid_references;
+	return true;
+}
+
+static ClusterRecoveryRelmapFoldResult
+inventory_relmap_step(ClusterRecoveryNativeInventory *inventory,
+					  ClusterRecoveryRelmapFoldEntry *out,
+					  ClusterRecoveryRelmapFoldSummary *summary)
+{
+	ClusterRecoveryRelmapFoldEntry *entry = &inventory->relmap_pending;
+	const ClusterRelmapV2Image *pending = &inventory->relmap_query;
+	TransactionId raw = (TransactionId)pending->pending_owner.top_full_xid;
+	unsigned examined = 0;
+
+	for (;;) {
+		const ClusterRecoveryNativeRecord *record;
+		bool xact;
+
+		if (entry->record == NULL) {
+			NativeInventoryRecord *saved = inventory->relmap_cursor;
+			ClusterRecoveryNativeEffect primary;
+
+			if (saved == NULL) {
+				*summary = inventory->relmap_summary;
+				inventory->relmap_active = false;
+				return CLUSTER_RECOVERY_RELMAP_FOLD_DRAINED;
+			}
+			if (examined == INVENTORY_SEED_TICK)
+				return CLUSTER_RECOVERY_RELMAP_FOLD_MORE;
+			if (inventory->diag.relmap_examined == UINT64_MAX)
+				return inventory_relmap_fail(inventory, CLUSTER_RECOVERY_RELMAP_FOLD_CAPACITY);
+			inventory->diag.relmap_examined++;
+			examined++;
+			if (saved->source_index >= inventory->source_count
+				|| cluster_recovery_native_scan_primary(saved->scan, &primary)
+					   != CLUSTER_RECOVERY_NATIVE_EFFECT
+				|| primary.record == NULL
+				|| !inventory_source_equal(&primary.record->source,
+										   &inventory->sources[saved->source_index].source)
+				|| !inventory_cut_equal(&primary.record->cut,
+										&inventory->sources[saved->source_index].cut))
+				return inventory_relmap_fail(inventory, CLUSTER_RECOVERY_RELMAP_FOLD_CHANGED);
+			record = primary.record;
+			if (record->source.claim.identity.origin_node_id != pending->pending_owner.node) {
+				inventory->relmap_cursor = saved->next;
+				continue;
+			}
+			entry->record = record;
+			entry->kind = primary.kind;
+			entry->source_index = saved->source_index;
+			entry->record_ordinal = saved->ordinal;
+			inventory->relmap_child_cursor = 0;
+			if (record->header.xl_xid == raw)
+				entry->flags |= CLUSTER_RECOVERY_RELMAP_FOLD_HEADER_XID;
+			if (record->toplevel_xid == raw)
+				entry->flags |= CLUSTER_RECOVERY_RELMAP_FOLD_RECORD_TOP_XID;
+			if (primary.kind == CLUSTER_RECOVERY_NATIVE_RELMAP_UPDATE
+				&& (record->header.xl_xid == raw || record->toplevel_xid == raw))
+				entry->flags |= inventory_relmap_wal_matches(pending, record)
+									? CLUSTER_RECOVERY_RELMAP_FOLD_WAL_MATCH
+									: CLUSTER_RECOVERY_RELMAP_FOLD_WAL_ALIAS;
+			if (primary.kind == CLUSTER_RECOVERY_NATIVE_CLOG_ZERO) {
+				int page;
+				memcpy(&page, record->payload, sizeof(page));
+				if ((uint32)page == raw / CLUSTER_NATIVE_CLOG_PER_PAGE)
+					entry->flags |= CLUSTER_RECOVERY_RELMAP_FOLD_CLOG_ZERO;
+			} else if (primary.kind == CLUSTER_RECOVERY_NATIVE_CLOG_TRUNCATE)
+				/* A raw cutoff has no independent FullXid era. Keep every
+				 * truncate of this physical origin, not just a guessed page. */
+				entry->flags |= CLUSTER_RECOVERY_RELMAP_FOLD_CLOG_TRUNCATE;
+		}
+		record = entry->record;
+		xact = entry->kind == CLUSTER_RECOVERY_NATIVE_TERMINAL
+			   || entry->kind == CLUSTER_RECOVERY_NATIVE_ASSIGNMENT
+			   || entry->kind == CLUSTER_RECOVERY_NATIVE_PREPARE;
+		if (xact) {
+			if (record->top_xid == raw)
+				entry->flags |= CLUSTER_RECOVERY_RELMAP_FOLD_TOP_XID;
+			while (inventory->relmap_child_cursor < record->nsubxacts) {
+				TransactionId child;
+				if (examined == INVENTORY_SEED_TICK)
+					return CLUSTER_RECOVERY_RELMAP_FOLD_MORE;
+				if (inventory->diag.relmap_examined == UINT64_MAX)
+					return inventory_relmap_fail(inventory, CLUSTER_RECOVERY_RELMAP_FOLD_CAPACITY);
+				inventory->diag.relmap_examined++;
+				examined++;
+				memcpy(&child,
+					   record->payload + record->subxacts_offset
+						   + (size_t)inventory->relmap_child_cursor * sizeof(child),
+					   sizeof(child));
+				inventory->relmap_child_cursor++;
+				if (child == raw) {
+					entry->flags |= CLUSTER_RECOVERY_RELMAP_FOLD_SUBXID;
+					entry->subxid_references++;
+				}
+			}
+			if (entry->flags
+				& (CLUSTER_RECOVERY_RELMAP_FOLD_TOP_XID | CLUSTER_RECOVERY_RELMAP_FOLD_SUBXID)) {
+				if (entry->kind == CLUSTER_RECOVERY_NATIVE_ASSIGNMENT)
+					entry->flags |= CLUSTER_RECOVERY_RELMAP_FOLD_ASSIGNMENT;
+				else if (entry->kind == CLUSTER_RECOVERY_NATIVE_PREPARE)
+					entry->flags |= CLUSTER_RECOVERY_RELMAP_FOLD_PREPARE;
+				else
+					entry->flags |= (record->header.xl_info & XLOG_XACT_OPMASK) == XLOG_XACT_COMMIT
+										? CLUSTER_RECOVERY_RELMAP_FOLD_COMMIT
+										: CLUSTER_RECOVERY_RELMAP_FOLD_ABORT;
+			}
+		}
+		inventory->relmap_cursor = inventory->relmap_cursor->next;
+		if (!inventory_relmap_count(inventory, entry))
+			return inventory_relmap_fail(inventory, CLUSTER_RECOVERY_RELMAP_FOLD_CAPACITY);
+		if (entry->flags != 0) {
+			*out = *entry;
+			memset(entry, 0, sizeof(*entry));
+			return CLUSTER_RECOVERY_RELMAP_FOLD_ENTRY;
+		}
+		memset(entry, 0, sizeof(*entry));
+	}
+}
+
+ClusterRecoveryRelmapFoldResult
+cluster_recovery_native_inventory_relmap_step(ClusterRecoveryNativeInventory *inventory,
+											  const ClusterRelmapV2Image *pending,
+											  ClusterRecoveryRelmapFoldEntry *out,
+											  ClusterRecoveryRelmapFoldSummary *summary,
+											  ClusterRecoveryNativeInventoryDiag *diag)
+{
+	ClusterRecoveryRelmapFoldResult result;
+	uint8 wire[CLUSTER_RELMAP_V2_FILE_SIZE];
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (summary != NULL)
+		memset(summary, 0, sizeof(*summary));
+	if (diag != NULL)
+		memset(diag, 0, sizeof(*diag));
+	if (inventory == NULL)
+		return CLUSTER_RECOVERY_RELMAP_FOLD_INVALID;
+	if (!inventory->complete || inventory->status != CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED)
+		result = inventory_relmap_fail(inventory, CLUSTER_RECOVERY_RELMAP_FOLD_CHANGED);
+	else if (inventory->sources == NULL || inventory->source_count == 0
+			 || inventory->source_count > CLUSTER_WAL_INPUTS_MAX || out == NULL || summary == NULL
+			 || pending == NULL || pending->pending_generation == 0
+			 || cluster_relmap_v2_encode(pending, wire, sizeof(wire)) != CLUSTER_RELMAP_V2_VALID)
+		result = inventory_relmap_fail(inventory, CLUSTER_RECOVERY_RELMAP_FOLD_INVALID);
+	else if (inventory->relmap_active && memcmp(wire, inventory->relmap_wire, sizeof(wire)) != 0)
+		result = inventory_relmap_fail(inventory, CLUSTER_RECOVERY_RELMAP_FOLD_INVALID);
+	else {
+		if (!inventory->relmap_active) {
+			ClusterRecoveryRelmapFoldSummary *counts = &inventory->relmap_summary;
+			memset(counts, 0, sizeof(*counts));
+			counts->sources = inventory->source_count;
+			for (uint32 i = 0; i < inventory->source_count; ++i) {
+				const ClusterControlRootIdentity *id = &inventory->sources[i].source.claim.identity;
+				if (id->system_identifier != pending->identity.system_identifier
+					|| inventory->sources[i].source.claim.database_incarnation
+						   != pending->identity.database_incarnation)
+					return inventory_relmap_fail(inventory, CLUSTER_RECOVERY_RELMAP_FOLD_INVALID);
+				if (id->origin_node_id == pending->pending_owner.node)
+					counts->origin_sources++;
+			}
+			if (counts->origin_sources == 0)
+				return inventory_relmap_fail(inventory, CLUSTER_RECOVERY_RELMAP_FOLD_INVALID);
+			inventory->relmap_query = *pending;
+			memcpy(inventory->relmap_wire, wire, sizeof(wire));
+			memset(&inventory->relmap_pending, 0, sizeof(inventory->relmap_pending));
+			inventory->relmap_cursor = inventory->head;
+			inventory->relmap_active = true;
+		}
+		result = inventory_relmap_step(inventory, out, summary);
+	}
 	if (diag != NULL)
 		*diag = inventory->diag;
 	return result;
