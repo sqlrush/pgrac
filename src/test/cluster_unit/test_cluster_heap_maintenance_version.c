@@ -12036,6 +12036,7 @@ static unsigned phase_error_stage, phase_finally_calls, phase_finally_debt;
 static unsigned phase_finally_pins;
 static bool phase_finally_owned_writer;
 static bool phase_mixed_proof_subset;
+static uint8 phase_unknown_proof_mask;
 
 static void
 phase_preflight(void)
@@ -12059,7 +12060,8 @@ phase_resolve(const ClusterTxLocator *locator, ClusterTxResolveMode mode,
 	UT_ASSERT(memcmp(locator, &proof->requested_locator, sizeof(*locator)) == 0);
 	if (phase_error_stage == 2) elog(ERROR, "injected admitted resolver ERROR");
 	*out = proof->resolution; *reason = CLUSTER_TX_RESOLVE_NONE;
-	if (phase_mixed_proof_subset && phase_resolves == 2)
+	if ((phase_mixed_proof_subset && phase_resolves == 2)
+		|| (phase_unknown_proof_mask & (1U << (phase_resolves - 1))))
 		out->outcome = CLUSTER_TX_UNKNOWN;
 	return out->outcome;
 }
@@ -12305,7 +12307,8 @@ phase_then_recent_native_owned(QualifiedXminFixture *f, LVRelState *v)
 		phase_pin_released = false;
 		UT_ASSERT_EQ(backend_pin_count, 0);
 		if ((status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN
-			 || (phase_mixed_proof_subset && status == CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN))
+			 || ((phase_mixed_proof_subset || phase_unknown_proof_mask != 0)
+				 && status == CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN))
 			&& rows_current && v->shared_freeze_xmin_candidates.target_count > 0)
 		{
 			if (phase_use_original_recent_pin && phase_use_original_resident)
@@ -16140,10 +16143,58 @@ UT_TEST(test_mixed_admitted_resident_subset_reaches_same_owner_recent_wal)
 	phase_recent_native_finish(&f, &v, true);
 }
 
+/* Every proper terminal subset must use its complete creators for the WAL
+ * horizon, even when the greatest raw XID belongs to the previous epoch. */
+UT_TEST(test_mixed_admitted_subsets_keep_fullxid_wal_horizon_and_unknown_rows)
+{
+	for (unsigned mask = 1; mask < 7; mask++) {
+		QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+		unsigned count = 3 - ((mask & 1) != 0) - ((mask & 2) != 0) - ((mask & 4) != 0);
+		TransactionId horizon = !(mask & 1) ? 77 : !(mask & 4) ? 66 : UINT32_MAX - 2;
+		bool applied;
+
+		phase_recent_native_setup(&f, &v, targets, true, true);
+		expected_nplans = !(mask & 1) + ((mask & 6) != 6);
+		phase_unknown_proof_mask = mask;
+		applied = phase_then_recent_native_owned(&f, &v);
+		phase_unknown_proof_mask = 0;
+		UT_ASSERT(applied);
+		if (!applied) {
+			/* No recent-write pin was taken. Release fixture storage without
+			 * asserting the unrelated outer collector accounting. */
+			free(page_owner_native_resource_owner.bufferarr.itemsarr);
+			memset(&page_owner_native_resource_owner, 0, sizeof(page_owner_native_resource_owner));
+			return;
+		}
+		UT_ASSERT_EQ(phase_preflights, 1); UT_ASSERT_EQ(phase_resolves, 3);
+		UT_ASSERT_EQ(phase_rechecks, 1);
+		UT_ASSERT_EQ(v.shared_freeze_batch.carrier_request_count, 3);
+		UT_ASSERT_EQ(v.shared_freeze_proofs.proof_count, count);
+		UT_ASSERT_EQ(v.shared_freeze_xmin_candidates.target_count, count);
+		UT_ASSERT(!v.shared_freeze_fence_valid);
+		UT_ASSERT_EQ(((xl_heap_freeze_page *)freeze_main_data.data)->snapshotConflictHorizon, horizon);
+		for (int i = 0; i < 3; i++) {
+			PGAlignedBlock expected;
+			HeapTupleHeader tuple = freeze_tuple(current_page.data, i + 1);
+			HeapTupleHeader old = freeze_tuple(before_page.data, i + 1);
+
+			memcpy(expected.data, old, 64);
+			if (!(mask & (1U << i)))
+				((HeapTupleHeader)expected.data)->t_infomask |= HEAP_XMIN_FROZEN;
+			UT_ASSERT(memcmp(tuple, expected.data, 64) == 0);
+			UT_ASSERT(memcmp(ClusterPageGetItlSlot(current_page.data, i),
+				ClusterPageGetItlSlot(before_page.data, i), sizeof(ClusterItlSlotData)) == 0);
+		}
+		check_publication(true);
+		replay_freeze_record();
+		phase_recent_native_finish(&f, &v, true);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(343);
+	UT_PLAN(344);
 
 	UT_RUN(test_pin_free_admitted_phase_reaches_recent_native_wal_before_owner_leave);
 	UT_RUN(test_pin_free_phase_recent_refusal_retires_only_its_original_owner);
@@ -16497,6 +16548,7 @@ main(void)
 	UT_RUN(test_real_outer_collector_errors_retire_continuation_before_admission_leave);
 	UT_RUN(test_admitted_reuse_refusals_retire_previous_continuation);
 	UT_RUN(test_mixed_admitted_resident_subset_reaches_same_owner_recent_wal);
+	UT_RUN(test_mixed_admitted_subsets_keep_fullxid_wal_horizon_and_unknown_rows);
 
 	UT_DONE();
 	return ut_failed_count != 0;

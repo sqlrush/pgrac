@@ -295,8 +295,11 @@ UT_TEST(test_heap_result_survives_error_before_vm_and_finishes_on_reselection)
 	UT_ASSERT_EQ(heap_replay_fsm, 1);
 }
 
+#ifndef VM_HEAP_REPLAY_MAIN
+#define VM_HEAP_REPLAY_MAIN main
+#endif
 int
-main(void)
+VM_HEAP_REPLAY_MAIN(void)
 {
 	UT_PLAN(5);
 	UT_RUN(test_native_visible_redo_restores_heap_and_vm);

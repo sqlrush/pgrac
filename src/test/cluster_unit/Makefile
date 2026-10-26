@@ -2345,9 +2345,9 @@ test_cluster_vm_buffer_matches.inc: $(top_srcdir)/src/backend/access/heap/visibi
 	     emit { print } /^}/ { emit=0 } END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-TESTS += test_cluster_vm_visible_version_noassert test_cluster_vm_visible_replay test_cluster_vm_visible_heap_replay
+TESTS += test_cluster_vm_visible_version_noassert test_cluster_vm_visible_replay test_cluster_vm_visible_heap_replay test_cluster_vm_visible_assemble_replay
 
-all: test_cluster_vm_visible_version_noassert test_cluster_vm_visible_replay test_cluster_vm_visible_heap_replay
+all: test_cluster_vm_visible_version_noassert test_cluster_vm_visible_replay test_cluster_vm_visible_heap_replay test_cluster_vm_visible_assemble_replay
 
 # PGRAC: native VM setter and its original heap-visible WAL logger.
 test_cluster_vm_visible_body.inc: $(top_srcdir)/src/backend/access/heap/visibilitymap.c Makefile
@@ -2429,7 +2429,31 @@ test_cluster_vm_visible_replay: test_cluster_vm_visible_replay.c test_cluster_vm
 		$(top_srcdir)/src/include/cluster/cluster_page_cold_redo.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
 
-test_cluster_vm_visible_heap_replay: test_cluster_vm_visible_heap_replay.c test_cluster_vm_visible_replay.c \
+test_cluster_vm_visible_assemble_replay: test_cluster_vm_visible_assemble_replay.c \
+		test_cluster_vm_visible_assemble_state.inc test_cluster_vm_visible_assemble.inc \
+		$(top_srcdir)/src/include/access/xact.h $(top_srcdir)/src/include/access/xloginsert.h \
+		$(top_srcdir)/src/include/cluster/cluster_page_anchor_cache.h \
+		$(top_srcdir)/src/include/common/pg_lzcompress.h \
+		$(top_srcdir)/src/include/replication/origin.h
+
+# Native private assembly state; the unused allocation context is not needed.
+test_cluster_vm_visible_assemble_state.inc: $(top_srcdir)/src/backend/access/transam/xloginsert.c Makefile
+	awk '/^#ifdef USE_LZ4/ { seen++; if (seen == 2) { emit=1; found++ } } \
+	     emit && /^static XLogRecData \*XLogRecordAssemble/ { emit=0; done++ } \
+	     emit && !/^static MemoryContext xloginsert_cxt;/ { print } \
+	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_vm_visible_assemble.inc: $(top_srcdir)/src/backend/access/transam/xloginsert.c Makefile
+	awk '/^XLog(BeginInsert|ResetInsertion|RegisterBlock|RegisterData|RegisterPageVersionEdge)\(/ \
+	       { print "static void"; emit=1; functions++ } \
+	     /^XLogRecordAssemble\(/ { print "static XLogRecData *"; emit=1; assemble++ } \
+	     /^XLogCompressBackupBlock\(/ { print "static bool"; emit=1; compress++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (functions != 5 || assemble != 1 || compress != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_vm_visible_heap_replay test_cluster_vm_visible_assemble_replay: test_cluster_vm_visible_heap_replay.c test_cluster_vm_visible_replay.c \
 		test_cluster_vm_redo_reader.o test_cluster_vm_visible_replay.inc $(XLOG_PAGE_EDGE_ENCODER_O) \
 		test_cluster_vm_visible_heap_read.inc test_cluster_vm_visible_heap_redo.inc \
 		test_cluster_vm_visible_heap_cold.o $(top_srcdir)/src/include/storage/freespace.h \
@@ -2452,7 +2476,7 @@ test_cluster_vm_visible_heap_cold.o: $(top_srcdir)/src/backend/cluster/cluster_p
 	$(CC) $(CFLAGS) $(CPPFLAGS) -Dcluster_space_relation_read_redo_identity=heap_replay_read_identity \
 		-ffunction-sections -fdata-sections -c $< -o $@
 
-test_cluster_vm_visible_version test_cluster_vm_visible_version_noassert test_cluster_vm_visible_replay test_cluster_vm_visible_heap_replay: test_cluster_vm_visible_version.c test_cluster_heap_maintenance_policy.inc unit_test.h \
+test_cluster_vm_visible_version test_cluster_vm_visible_version_noassert test_cluster_vm_visible_replay test_cluster_vm_visible_heap_replay test_cluster_vm_visible_assemble_replay: test_cluster_vm_visible_version.c test_cluster_heap_maintenance_policy.inc unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_pcm_lock.h \
 		test_cluster_vm_buffer_matches.inc \
 		test_cluster_vm_repair_versioned.inc \
@@ -2467,7 +2491,7 @@ test_cluster_vm_visible_version test_cluster_vm_visible_version_noassert test_cl
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(if $(filter %_noassert,$@),-DFIXTURE_NO_ASSERTS) $(if $(filter %_replay,$@),$(srcdir)/$@.c,$<) test_cluster_space_bufpage_product.o \
 		test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
 		$(if $(filter %_replay,$@),test_cluster_vm_redo_reader.o $(XLOG_PAGE_EDGE_ENCODER_O)) \
-		$(if $(filter test_cluster_vm_visible_heap_replay,$@),test_cluster_vm_visible_heap_cold.o) \
+		$(if $(filter test_cluster_vm_visible_heap_replay test_cluster_vm_visible_assemble_replay,$@),test_cluster_vm_visible_heap_cold.o) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
 		$(if $(filter %_replay,$@),$(LDFLAGS) $(LIBS)) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
@@ -6457,6 +6481,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_heap_multi_loop.inc test_cluster_heap_multi_helpers.inc test_cluster_heap_multi_clear.inc
 	rm -f test_cluster_vm_visible_body.inc test_cluster_vm_visible_log.inc test_cluster_vm_visible_replay.inc
 	rm -f test_cluster_vm_visible_heap_read.inc test_cluster_vm_visible_heap_redo.inc test_cluster_vm_visible_heap_cold.o
+	rm -f test_cluster_vm_visible_assemble_state.inc test_cluster_vm_visible_assemble.inc
 	rm -f test_cluster_vm_visible_wrapper.inc test_cluster_vm_visible_empty.inc
 	rm -f test_cluster_vm_repair_versioned.inc
 	rm -f test_cluster_sf_cap_cut_available.inc
