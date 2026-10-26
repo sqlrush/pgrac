@@ -225,4 +225,19 @@ extern ClusterRelmapRetentionResult cluster_relmap_retention_runtime_allocation_
 extern FullTransactionId cluster_relmap_retention_allocate_xid_v2(bool isSubXact,
 	uint64 system_identifier, uint64 database_incarnation, uint16 origin);
 
+/* Dormant original Startup check AFTER all native/SIDE recovery/import and
+ * BEFORE opening allocation. The original owner authenticates DB incarnation,
+ * complete native/source/base/era/history/lifetime inputs and COMPLETE; numbers
+ * alone supply no certificate. Only the actual local native origin/system are
+ * accepted. Caller ALREADY holds XidGenLock EXCLUSIVE and original final-fold/
+ * admission exclusion, with no retention lock. Read actual cached nextXid and
+ * apply the existing read-only guard in XidGen->retention order. No supplied
+ * candidate, nextXid clamp, last-issued observation or native publication.
+ * Refusal raises53RA3; original caller retains its native lock/ERROR cleanup
+ * duties and every pin/debt. Success is a snapshot, not an admission token:
+ * keep original exclusion until opening; any later import requires recheck.
+ * No live Startup caller, COMPLETE publisher or v2 activation is installed. */
+extern void cluster_relmap_retention_check_recovered_next_v2(uint64 system_identifier,
+	uint64 database_incarnation, uint16 origin);
+
 #endif

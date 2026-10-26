@@ -66,6 +66,7 @@
 #include "storage/proc.h"
 #include "utils/syscache.h"
 #ifdef USE_PGRAC_CLUSTER
+#include "access/xlog.h"
 /* PGRAC (spec-6.14 D6): shared-catalog OID lease path for GetNewObjectId. */
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_oid_lease.h"
@@ -585,6 +586,31 @@ cluster_relmap_retention_allocate_xid_v2(bool isSubXact, uint64 system_identifie
 	allocation.database_incarnation = database_incarnation;
 	allocation.origin = origin;
 	return get_new_transaction_id(isSubXact, &allocation);
+}
+
+/* Original Startup has finished every native/SIDE fold, still excludes new
+ * transactions and holds XidGenLock. Inspect the imported counter itself;
+ * a successful snapshot is neither issuance nor an admission certificate.
+ * Author: SqlRush <sqlrush@gmail.com>
+ * Spec: 2026-10-14-pre2-m5-e1-format-closure-v1.md */
+void
+cluster_relmap_retention_check_recovered_next_v2(uint64 system_identifier,
+	uint64 database_incarnation, uint16 origin)
+{
+	if (!cluster_enabled || !cluster_shared_config || !AmStartupProcess()
+		|| ShmemVariableCache == NULL || cluster_node_id < 0
+		|| origin >= CLUSTER_MAX_NODES || origin != cluster_node_id
+		|| system_identifier == 0 || database_incarnation == 0
+		|| !LWLockHeldByMeInMode(XidGenLock, LW_EXCLUSIVE))
+		ereport(ERROR,
+			(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+			 errmsg("refusing to open transaction ID allocation: relmap recovery context is not qualified")));
+	if (cluster_relmap_retention_runtime_allocation_check_v2(system_identifier,
+		database_incarnation, origin, U64FromFullTransactionId(ShmemVariableCache->nextXid))
+		!= CLUSTER_RELMAP_RETENTION_OK || system_identifier != GetSystemIdentifier())
+		ereport(ERROR,
+			(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+			 errmsg("refusing to open transaction ID allocation: recovered next transaction ID conflicts with relmap retention")));
 }
 #endif
 
