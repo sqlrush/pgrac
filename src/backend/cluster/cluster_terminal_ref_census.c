@@ -5045,8 +5045,39 @@ refuse:
 }
 
 #ifndef CLUSTER_CTRC_UNIT_TEST
+/* Caller holds origin_lock and zeroed the private snapshot. OPEN has no
+ * ACK yet; prove the original start-seal edge without allocating its generation. */
+static bool
+ctrc_capacity_open_snapshot_index_locked(uint64 index,
+										 ClusterCtrcOriginCertificateSnapshot *snapshot)
+{
+	const ClusterCtrcOriginEntry *origin = &ctrc_origin_entries()[index];
+	uint64 nodes = CtrcShared->origin_ack_inbox_entries / CtrcShared->origin_key_entries;
+
+	if (!ctrc_txn_key_valid(&origin->key) || origin->grant_generation == 0
+		|| origin->seal_generation != 0 || origin->close_dispatched_bitmap != 0
+		|| origin->close_confirmed_bitmap != 0 || origin->ack_bitmap != 0
+		|| !ctrc_bytes_zero(origin->close_request_id, sizeof(origin->close_request_id))
+		|| !ctrc_bytes_zero(origin->reserved8, sizeof(origin->reserved8))
+		|| !ctrc_origin_frozen_touch_set_valid(origin) || CtrcShared->global_seal_generation == 0
+		|| CtrcShared->global_seal_generation == UINT64_MAX || nodes == 0
+		|| nodes > CLUSTER_CTRC_MAX_PARTICIPANTS)
+		return false;
+	for (uint16 node = 0; node < CLUSTER_CTRC_MAX_PARTICIPANTS; node++) {
+		if (node >= nodes) {
+			if ((origin->touched_bitmap & (UINT32_C(1) << node)) != 0)
+				return false;
+		} else if (!ctrc_bytes_zero(&ctrc_origin_ack_entries()[index * nodes + node],
+									sizeof(ClusterCtrcLocalReleaseAckV1)))
+			return false;
+	}
+	snapshot->origin_index = index;
+	snapshot->origin = *origin;
+	return true;
+}
+
 /* Caller holds origin_lock. Preserve the actual phase and close bytes;
- * only the original cleaner may advance a seal into CERTIFYING. */
+ * only the original cleaner may advance the terminal pipeline. */
 static bool
 ctrc_capacity_snapshot_index_locked(uint64 index, ClusterCtrcOriginCertificateSnapshot *snapshot)
 {
@@ -5059,6 +5090,8 @@ ctrc_capacity_snapshot_index_locked(uint64 index, ClusterCtrcOriginCertificateSn
 		|| CtrcShared->origin_ack_inbox_entries % CtrcShared->origin_key_entries != 0)
 		return false;
 	origin = &ctrc_origin_entries()[index];
+	if (origin->state == CTRC_ORIGIN_OPEN)
+		return ctrc_capacity_open_snapshot_index_locked(index, snapshot);
 	if (origin->state == CTRC_ORIGIN_CERTIFYING)
 		return ctrc_origin_certificate_snapshot_index_locked(index, snapshot);
 	if (origin->state == CTRC_ORIGIN_RELEASE_PROVEN) {
@@ -5119,8 +5152,8 @@ ctrc_capacity_pool_candidates(uint64 epoch, CtrcCapacityCandidate *candidates,
 			observation->unproven_reasons |= CLUSTER_CAPACITY_UNPROVEN_IDENTITY;
 			continue;
 		}
-		if (origin->state != CTRC_ORIGIN_CERTIFYING && origin->state != CTRC_ORIGIN_RELEASE_PROVEN
-			&& origin->state != CTRC_ORIGIN_SEALED
+		if (origin->state != CTRC_ORIGIN_OPEN && origin->state != CTRC_ORIGIN_CERTIFYING
+			&& origin->state != CTRC_ORIGIN_RELEASE_PROVEN && origin->state != CTRC_ORIGIN_SEALED
 			&& (origin->state != CTRC_ORIGIN_SEALING || origin->touched_bitmap != 0)) {
 			observation->unproven_reasons |= CLUSTER_CAPACITY_UNPROVEN_PHASE;
 			continue;
@@ -5144,11 +5177,11 @@ ctrc_capacity_pool_candidates(uint64 epoch, CtrcCapacityCandidate *candidates,
 	return count;
 }
 
-/* Rebuild the original required-ACK proof around a canonical/native sample.
+/* Rebuild the original phase prerequisites around a canonical/native sample.
  * The caller has completed the inventory and holds no CTRC lock. */
 static ClusterCapacityReasonV1
-ctrc_capacity_certificate_probe(const CtrcCapacityCandidate *candidate,
-								ClusterCapacityObservationV1 *observation)
+ctrc_capacity_candidate_probe(const CtrcCapacityCandidate *candidate,
+							  ClusterCapacityObservationV1 *observation)
 {
 	ClusterCtrcOriginCertificateSnapshot snapshot;
 	ClusterCtrcOriginCertificateSnapshot final_snapshot;
@@ -5182,9 +5215,11 @@ ctrc_capacity_certificate_probe(const CtrcCapacityCandidate *candidate,
 		observation->unproven_reasons |= CLUSTER_CAPACITY_UNPROVEN_OWNER;
 		return CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER;
 	}
-	/* Certificate work can complete before H catches up. This does not
-	 * prove GC/reuse or a real long reader; those remain later gates. */
-	if (!ctrc_cleaner_terminal_sample_mode(&snapshot.origin.key, true, NULL, NULL, &released)
+	/* Sealing and certificate work can precede H. OPEN uses the original
+	 * seal sample: zero flags, with a possible undo chain still to drain.
+	 * Neither phase proof grants GC/reuse or proves a real long reader. */
+	if (!ctrc_cleaner_terminal_sample_mode(
+			&snapshot.origin.key, candidate->phase != CTRC_ORIGIN_OPEN, NULL, NULL, &released)
 		|| (candidate->phase == CTRC_ORIGIN_RELEASE_PROVEN && !released)) {
 		observation->unproven_reasons |= CLUSTER_CAPACITY_UNPROVEN_CANONICAL;
 		return CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER;
@@ -5208,12 +5243,12 @@ ctrc_capacity_certificate_probe(const CtrcCapacityCandidate *candidate,
 #endif
 
 /*
- * cluster_ctrc_capacity_probe_pool_v1 -- Observe existing certificate supply.
+ * cluster_ctrc_capacity_probe_pool_v1 -- Observe existing terminal supply.
  *
  * Inputs: original CURRENT, qualified horizon/epoch and caller-local output.
  * Returns: exact owner work, allocator recheck or missing evidence. Proves
- * completed seals awaiting the original certificate transition, CERTIFYING
- * work and unfinished RELEASE_PROVEN notifications.
+ * terminal OPEN work awaiting its original seal, completed seals awaiting
+ * the certificate transition, CERTIFYING work and RELEASE_PROVEN notifications.
  * Side Effects: advances the original process-local certificate cursor and
  * reads canonical blocks outside CTRC locks. Never grants or reserves supply.
  *
@@ -5260,7 +5295,7 @@ cluster_ctrc_capacity_probe_pool_v1(uint32 current_segment, SCN horizon, uint64 
 		observation->scope = candidates[i].key.segment_id == current_segment
 								 ? CLUSTER_CAPACITY_SCOPE_SLOT
 								 : CLUSTER_CAPACITY_SCOPE_SEGMENT;
-		reason = ctrc_capacity_certificate_probe(&candidates[i], observation);
+		reason = ctrc_capacity_candidate_probe(&candidates[i], observation);
 		if (reason == CLUSTER_CAPACITY_OWNER_PROGRESS_POSSIBLE) {
 			if (epoch != cluster_epoch_get_current()) {
 				observation->unproven_reasons |= CLUSTER_CAPACITY_UNPROVEN_IDENTITY;
