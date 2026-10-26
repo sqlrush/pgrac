@@ -12549,10 +12549,16 @@ UT_TEST(test_cold_terminal_frame_refusal_preserves_pi_inspection)
 	}
 }
 
+#include "test_cluster_side_relmap_terminal.inc"
+
 int
 main(void)
 {
-	UT_PLAN(186);
+	UT_PLAN(190);
+	UT_RUN(test_native_terminal_witness_uses_original_bound_plan_budget);
+	UT_RUN(test_native_terminal_witness_rejects_duplicate_physical_raw_terminal);
+	UT_RUN(test_native_terminal_witness_owns_exact_original_header_and_payload);
+	UT_RUN(test_native_terminal_witness_rejects_unbound_plan);
 	UT_RUN(test_cold_strict_terminals_refuse_unconsumed_frame);
 	UT_RUN(test_cold_effectful_terminals_refuse_unconsumed_frame);
 	UT_RUN(test_cold_terminal_capture_keeps_unconsumed_frame_out_of_history_and_replay);

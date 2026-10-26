@@ -181,6 +181,18 @@ extern bool rf_side_online_plan_recovery_claim_matches_v1(const RfSideOnlinePlan
  * This supplies neither physical participation nor cut/base/owner authority. */
 extern bool rf_side_online_plan_recovery_bound_claim_matches_v1(const RfSideOnlinePlanV1 *plan,
 																const ClusterWalSourceRef *source);
+/* Complete original bound declaration, not one selected claim. */
+extern bool rf_side_online_plan_recovery_sources_match_v1(const RfSideOnlinePlanV1 *plan,
+	const ClusterWalSourceRef *sources, uint32 count);
+/* Exact original native COMMIT/ABORT carrier correspondence only. The
+ * full header/main data are owned by the original bound RECOVERY plan and
+ * charged to its existing budget. UINT32_MAX means invalid/unsealed input;
+ * zero is a valid empty count. Neither query proves FullXid era, CLOG status,
+ * physical lifetime, replay permission or completion. */
+extern uint32 rf_side_online_plan_native_terminal_count_v1(const RfSideOnlinePlanV1 *plan,
+	const ClusterWalSourceRef *source);
+extern bool rf_side_online_plan_terminal_matches_v1(const RfSideOnlinePlanV1 *plan,
+	const ClusterWalSourceRef *source, const XLogReaderState *reader);
 /* UINT32_MAX for an invalid or unsealed plan. */
 extern uint32 rf_side_online_plan_participant_count_v1(const RfSideOnlinePlanV1 *plan);
 /* The physical lower alone must not authorize replay of retained history. */
