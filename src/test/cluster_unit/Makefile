@@ -538,7 +538,9 @@ SIMPLE_TESTS := $(filter-out test_cluster_relmap_arb,$(SIMPLE_TESTS))
 TESTS += test_cluster_relmap_v2
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_v2,$(SIMPLE_TESTS))
 TESTS += test_cluster_relmap_v2_storage
+TESTS += test_cluster_relmap_publish_native
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_v2_storage,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_relmap_publish_native,$(SIMPLE_TESTS))
 TESTS += test_cluster_relmap_retention
 TESTS += test_cluster_relmap_checkpoint
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_checkpoint,$(SIMPLE_TESTS))
@@ -566,7 +568,7 @@ test_cluster_relmap_arb: test_cluster_relmap_arb.c unit_test.h \
 		$(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 test_cluster_relmap_xid_order: test_cluster_relmap_xid_order.c unit_test.h \
-		test_cluster_relmap_producer_stage.inc \
+		test_cluster_relmap_producer_stage.inc test_cluster_relmap_commit_native.h \
 		test_cluster_relmap_producer_prepare.inc \
 		test_cluster_relmap_producer_terminal.inc \
 		test_cluster_relmap_postcommit.inc \
@@ -760,7 +762,8 @@ test_cluster_relmap_v2_storage_product.o: $(top_srcdir)/src/backend/cluster/clus
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_PGRAC_CLUSTER -Dwrite=relmap_test_write -Dread=relmap_test_read \
 		-Drenameat=relmap_test_renameat -Dclose=relmap_test_close -c $< -o $@
 
-test_cluster_relmap_v2_storage: test_cluster_relmap_v2_storage.c unit_test.h \
+test_cluster_relmap_v2_storage test_cluster_relmap_publish_native: %: %.c unit_test.h \
+		test_cluster_relmap_v2_storage.c test_cluster_relmap_commit_native.h \
 		test_cluster_relmap_staged_observation.inc \
 		test_cluster_relmap_runtime_storage.inc \
 		test_cluster_relmap_recovery_arbitration.inc \
@@ -9034,6 +9037,7 @@ test_cluster_wal_cut: test_cluster_wal_cut.c unit_test.h \
 
 # PGRAC: writer runtime checks with native caller boundaries. Author: SqlRush <sqlrush@gmail.com>
 test_cluster_wal_writer: test_cluster_wal_writer.c unit_test.h \
+		test_cluster_relmap_commit_native.h \
 		$(top_srcdir)/src/backend/cluster/cluster_wal_writer.c \
 		$(top_srcdir)/src/include/cluster/cluster_wal_writer.h \
 		test_cluster_relmap_owner.inc \

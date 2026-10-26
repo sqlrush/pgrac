@@ -12,7 +12,12 @@ static void v2_stage_flush(XLogRecPtr end);
 #pragma push_macro("XLogFlush")
 #undef XLogFlush
 #define XLogFlush v2_stage_flush
+#include "test_cluster_relmap_commit_native.h"
+#pragma push_macro("cluster_relmap_recovery_native_terminal_sync")
+#undef cluster_relmap_recovery_native_terminal_sync
+#define cluster_relmap_recovery_native_terminal_sync test_relmap_native_commit_sync
 #include "../../backend/cluster/cluster_relmap_retention_runtime.c"
+#pragma pop_macro("cluster_relmap_recovery_native_terminal_sync")
 #pragma pop_macro("XLogFlush")
 
 static const ClusterShmemRegion *v2_region;

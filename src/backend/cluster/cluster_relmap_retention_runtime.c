@@ -3,12 +3,14 @@
  * Spec: 2026-10-14-pre2-m5-e1-format-closure-v1.md */
 #include "postgres.h"
 
+#include "access/clog.h"
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "catalog/pg_tablespace_d.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_relmap_authority.h"
+#include "cluster/cluster_relmap_recovery.h"
 #include "cluster/cluster_relmap_retention_runtime.h"
 #include "cluster/cluster_shmem.h"
 #include "miscadmin.h"
@@ -356,6 +358,36 @@ relmap_runtime_finish_v2(const ClusterRelmapOwnerSampleV2 *sample,
 	LWLockRelease(&relmap_runtime_shmem->lock);
 	if (result != CLUSTER_RELMAP_RETENTION_OK)
 		return CLUSTER_RELMAP_V2_RETAINED_UNKNOWN;
+
+	if (publish) {
+		ClusterRelmapRecoveryNativeTerminal native = { 0 };
+
+		/* The original native commit precedes this cleanup. Sync/read back
+		 * that current owner's CLOG fact before clearing either pending copy;
+		 * the caller's requested polarity alone is not this observation.
+		 * Abort discards earlier, before its native abort record, unchanged. */
+		if (!cluster_relmap_recovery_native_terminal_sync(sample, &native)
+			|| native.status != TRANSACTION_STATUS_COMMITTED
+			|| native.top_full_xid != key.top_full_xid
+			|| native.bounds.system_identifier != key.identity.system_identifier
+			|| native.bounds.database_incarnation != key.identity.database_incarnation
+			|| native.bounds.origin != key.origin
+			|| native.bounds.membership_epoch != key.membership_epoch
+			|| native.bounds.admitted_incarnation != key.admitted_incarnation
+			|| native.bounds.boot_incarnation != key.boot_incarnation
+			|| native.bounds.native_floor > key.top_full_xid
+			|| native.bounds.last_issued < key.top_full_xid
+			|| !cluster_relmap_owner_terminal_matches_v2(sample))
+			return CLUSTER_RELMAP_V2_RETAINED_UNKNOWN;
+		/* Native I/O can outlive the first directory/pin observation. */
+		LWLockAcquire(&relmap_runtime_shmem->lock, LW_EXCLUSIVE);
+		result = relmap_runtime_directory_matches(directory, &key);
+		if (result == CLUSTER_RELMAP_RETENTION_OK)
+			result = cluster_relmap_retention_stage_check(directory, &key, staged->pending_owner.wal_end);
+		LWLockRelease(&relmap_runtime_shmem->lock);
+		if (result != CLUSTER_RELMAP_RETENTION_OK)
+			return CLUSTER_RELMAP_V2_RETAINED_UNKNOWN;
+	}
 
 	/* Existing storage validates the full image, writes/syncs BOTH copies and
 	 * reads back this call's result, even for a clean retry. Never hold the

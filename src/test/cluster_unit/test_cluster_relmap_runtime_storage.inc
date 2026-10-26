@@ -179,7 +179,12 @@ LWLockRegisterTranche(int tranche, const char *name)
 /* No runtime or owner body copies, alternate stage provider or public writable
  * accessor: private state is visible only because this is one test TU. */
 #include "../../backend/cluster/cluster_relmap_owner.c"
+#include "test_cluster_relmap_commit_native.h"
+#pragma push_macro("cluster_relmap_recovery_native_terminal_sync")
+#undef cluster_relmap_recovery_native_terminal_sync
+#define cluster_relmap_recovery_native_terminal_sync test_relmap_native_commit_sync
 #include "../../backend/cluster/cluster_relmap_retention_runtime.c"
+#pragma pop_macro("cluster_relmap_recovery_native_terminal_sync")
 
 static void
 runtime_storage_setup(ClusterRelmapOwnerSampleV2 *sample,

@@ -85,8 +85,15 @@ extern ClusterRelmapRetentionResult cluster_relmap_retention_runtime_cancel_prep
  * authenticates the matching original commit/abort and applies its original
  * failure polarity, including postcommit fail-stop; these are not recovery
  * terminal classifiers. Route only an exact already-staged runtime pin to the
- * existing dual-copy publish/discard, then recheck owner and pin. Native owner
- * queries and all I/O stay outside the sole retention lock. No internal retry.
+ * existing dual-copy publish/discard, then recheck owner and pin.
+ * Publish first syncs/readbacks that same current writer's native CLOG and
+ * requires COMMITTED with its exact FullXid/full identity, then rechecks the
+ * original owner/directory/staged pin before any pair write. Abort retains
+ * its earlier pre-abort-record order and does not require terminal CLOG here.
+ * This additional current-native observation is no cold base/source/lifetime
+ * or terminal-release certificate; all original qualifications remain.
+ * Native owner queries and all I/O stay outside the sole retention lock.
+ * No internal retry.
  * CLEARED_POSTREAD certifies storage cleanup in this call only, never terminal
  * proof, COMPLETE publication or pin/native/TT/SPACE release. All pins remain,
  * including after a clean retry; later success cannot erase an earlier I/O

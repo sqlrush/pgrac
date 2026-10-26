@@ -50,7 +50,12 @@ static Oid relmap_pending_tablespace;
 #define LWLockHeldByMeInMode relmap_pending_lock_mode
 #define GetCurrentFullTransactionIdIfAny relmap_pending_current_xid
 #define MyDatabaseTableSpace relmap_pending_tablespace
+#include "test_cluster_relmap_commit_native.h"
+#pragma push_macro("cluster_relmap_recovery_native_terminal_sync")
+#undef cluster_relmap_recovery_native_terminal_sync
+#define cluster_relmap_recovery_native_terminal_sync test_relmap_native_commit_sync
 #include "../../backend/cluster/cluster_relmap_retention_runtime.c"
+#pragma pop_macro("cluster_relmap_recovery_native_terminal_sync")
 #pragma pop_macro("MyDatabaseTableSpace")
 #pragma pop_macro("GetCurrentFullTransactionIdIfAny")
 #pragma pop_macro("LWLockHeldByMeInMode")
