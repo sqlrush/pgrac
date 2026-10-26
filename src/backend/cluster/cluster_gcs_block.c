@@ -18055,7 +18055,6 @@ typedef struct GcsFirstFillMasterPark {
 	bool handed_off;
 	bool returned;
 	bool return_ack_pending;
-	bool return_only;
 	uint64 return_session;
 	uint64 holder_session;
 	GcsBlockRequestPayload request;
@@ -18114,6 +18113,149 @@ gcs_first_fill_master_key_matches(const GcsFirstFillMasterPark *park,
 		&& BufferTagsEqual(&park->request.tag, &key->tag);
 }
 
+/* GCS first-fill return receipt begin. */
+/* A sealed H keeps its original park until RETURNED. Its 64 parks bound
+ * these receipts independently of the master's native service capacity. */
+typedef struct GcsFirstFillReturnReceipt {
+	bool in_use;
+	ClusterPcmReadGrant service;
+	uint64 holder_session;
+	int worker;
+	TimestampTz retry_at;
+} GcsFirstFillReturnReceipt;
+static GcsFirstFillReturnReceipt gcs_first_fill_return_receipts[32][GCS_FIRST_FILL_PARK_MAX];
+static uint32 gcs_first_fill_return_receipt_count;
+
+static bool
+gcs_first_fill_return_service_valid(const ClusterPcmReadGrant *service)
+{
+	return service != NULL && service->holder_node >= 0 && service->holder_node < 32
+		&& service->key.requester_node >= 0 && service->key.requester_node < 32
+		&& service->holder_node != service->key.requester_node
+		&& service->key.backend_id > 0 && service->key.backend_id <= MaxBackends
+		&& service->key.request_id != 0 && service->key.request_id != UINT64_MAX
+		&& service->key.epoch != 0 && service->key.epoch != UINT64_MAX
+		&& service->binding_generation != 0 && service->binding_generation != UINT64_MAX
+		&& service->service_generation != 0 && service->service_generation != UINT32_MAX;
+}
+
+static bool
+gcs_first_fill_return_same_service(const ClusterPcmReadGrant *a, const ClusterPcmReadGrant *b)
+{
+	return a->key.request_id == b->key.request_id && a->key.epoch == b->key.epoch
+		&& a->key.requester_node == b->key.requester_node && a->key.backend_id == b->key.backend_id
+		&& BufferTagsEqual(&a->key.tag, &b->key.tag)
+		&& a->binding_generation == b->binding_generation
+		&& a->service_generation == b->service_generation
+		&& a->holder_node == b->holder_node && a->holder_was_x == b->holder_was_x;
+}
+
+static void
+gcs_first_fill_return_receipt_retire(GcsFirstFillReturnReceipt *receipt)
+{
+	Assert(receipt->in_use && gcs_first_fill_return_receipt_count > 0);
+	gcs_first_fill_return_receipt_count--;
+	cluster_block_io_trace_pending_s(&receipt->service.key, "RETURN_RECEIPT_RETIRED", 0,
+		receipt->service.holder_node, receipt->service.binding_generation,
+		gcs_first_fill_return_receipt_count);
+	memset(receipt, 0, sizeof(*receipt));
+}
+
+static bool
+gcs_first_fill_return_receipt_retain(const ClusterPcmReadGrant *service, uint64 session)
+{
+	GcsFirstFillReturnReceipt *free_slot = NULL;
+	int worker = cluster_ic_tier1_my_data_channel();
+	if (!gcs_first_fill_return_service_valid(service) || session == 0
+		|| worker < 0 || worker >= cluster_lms_workers)
+		return false;
+	for (int i = 0; i < GCS_FIRST_FILL_PARK_MAX; i++) {
+		GcsFirstFillReturnReceipt *receipt = &gcs_first_fill_return_receipts[service->holder_node][i];
+		/* The caller has authenticated this same holder's current instance.
+		 * A new instance cannot receive an old sealed producer's receipt. */
+		if (receipt->in_use && receipt->holder_session != session)
+			gcs_first_fill_return_receipt_retire(receipt);
+		if (!receipt->in_use) {
+			if (free_slot == NULL) free_slot = receipt;
+			continue;
+		}
+		if (gcs_first_fill_return_same_service(&receipt->service, service))
+			return receipt->worker == worker; /* One notice owner, no successor lookup. */
+	}
+	if (free_slot == NULL || !cluster_pcm_lock_read_grant_absent(&service->key))
+		return false; /* No credit/proven absence: retain the original carrier. */
+	free_slot->service = *service;
+	free_slot->holder_session = session;
+	free_slot->worker = worker;
+	free_slot->in_use = true;
+	gcs_first_fill_return_receipt_count++;
+	cluster_block_io_trace_pending_s(&service->key, "RETURN_RECEIPT_PENDING", 1,
+		service->holder_node, service->binding_generation, gcs_first_fill_return_receipt_count);
+	return true;
+}
+
+static void
+gcs_first_fill_return_receipt_tick(int worker)
+{
+	TimestampTz now = GetCurrentTimestamp();
+	if (gcs_first_fill_return_receipt_count == 0)
+		return;
+	for (int node = 0; node < 32; node++)
+		for (int i = 0; i < GCS_FIRST_FILL_PARK_MAX; i++) {
+			GcsFirstFillReturnReceipt *receipt = &gcs_first_fill_return_receipts[node][i];
+			const ClusterPcmReadGrant *service = &receipt->service;
+			uint64 session;
+			int master;
+			if (!receipt->in_use || receipt->worker != worker)
+				continue;
+			master = cluster_gcs_lookup_master(service->key.tag);
+			if (service->key.epoch != cluster_epoch_get_current()
+				|| (master >= 0 && master != cluster_node_id)
+				|| cluster_membership_get_state(node) == CLUSTER_MEMBER_DEAD
+				|| cluster_membership_get_state(node) == CLUSTER_MEMBER_REMOVED) {
+				gcs_first_fill_return_receipt_retire(receipt);
+				continue;
+			}
+			if (master < 0
+				|| !gcs_block_pcm_x_authenticated_session(node, service->key.epoch, &session) || session == 0)
+				continue;
+			if (session != receipt->holder_session) {
+				gcs_first_fill_return_receipt_retire(receipt);
+				continue;
+			}
+			if (now < receipt->retry_at)
+				continue;
+			receipt->retry_at = now + 10000;
+			/* This retires only H's sealed full-service receipt. A successor
+			 * buffer/native grant is neither consulted nor changed. */
+			if (gcs_first_fill_returned_notice(service))
+				gcs_first_fill_return_receipt_retire(receipt);
+		}
+}
+
+static ClusterNormalStopPollResult
+gcs_first_fill_return_receipt_poll(const char **reason)
+{
+	uint32 count = 0;
+	*reason = "GCS_FIRST_FILL_RETURN_RECEIPT_INVALID";
+	for (int node = 0; node < 32; node++)
+		for (int i = 0; i < GCS_FIRST_FILL_PARK_MAX; i++) {
+			const GcsFirstFillReturnReceipt *receipt = &gcs_first_fill_return_receipts[node][i];
+			if (!receipt->in_use)
+				continue;
+			if (!gcs_first_fill_return_service_valid(&receipt->service)
+				|| receipt->service.holder_node != node || receipt->holder_session == 0
+				|| receipt->worker < 0 || receipt->worker >= cluster_lms_workers)
+				return CLUSTER_NORMAL_STOP_INVALID;
+			count++;
+		}
+	if (count != gcs_first_fill_return_receipt_count)
+		return CLUSTER_NORMAL_STOP_INVALID;
+	*reason = count > 0 ? "GCS_FIRST_FILL_RETURN_RECEIPT" : "NONE";
+	return count > 0 ? CLUSTER_NORMAL_STOP_PENDING : CLUSTER_NORMAL_STOP_READY;
+}
+/* GCS first-fill return receipt end. */
+
 /* RETURN is emitted only by a sealed holder owner that has offered no reply
  * to R (or whose offer was explicitly NOT_ADMITTED). Actual takeover may
  * never return here. A retained master item consumes this exact responsibility;
@@ -18121,11 +18263,9 @@ gcs_first_fill_master_key_matches(const GcsFirstFillMasterPark *park,
 static bool
 gcs_first_fill_master_return(const ClusterPcmReadGrant *service, uint64 session)
 {
-	GcsFirstFillMasterPark *free_slot = NULL;
 	for (int i = 0; i < GCS_FIRST_FILL_PARK_MAX; i++) {
 		GcsFirstFillMasterPark *park = &gcs_first_fill_master_parks[i];
 		if (!park->in_use) {
-			if (free_slot == NULL) free_slot = park;
 			continue;
 		}
 		if (!gcs_first_fill_master_key_matches(park, &service->key))
@@ -18143,19 +18283,7 @@ gcs_first_fill_master_return(const ClusterPcmReadGrant *service, uint64 session)
 		park->retry_at = 0;
 		return true;
 	}
-	if (free_slot == NULL || !cluster_pcm_lock_read_grant_absent(&service->key))
-		return false; /* Original receive owner retains this return. */
-	memset(free_slot, 0, sizeof(*free_slot));
-	free_slot->in_use = free_slot->returned = free_slot->return_ack_pending = true;
-	free_slot->return_only = true;
-	free_slot->grant = *service;
-	free_slot->return_session = session;
-	free_slot->request.tag = service->key.tag;
-	free_slot->request.request_id = service->key.request_id;
-	free_slot->request.epoch = service->key.epoch;
-	free_slot->request.sender_node = service->key.requester_node;
-	free_slot->request.requester_backend_id = service->key.backend_id;
-	return true;
+	return gcs_first_fill_return_receipt_retain(service, session);
 }
 
 static bool
@@ -18820,7 +18948,7 @@ gcs_first_fill_master_tick(int worker)
 			if (!gcs_first_fill_returned_notice(&saved.grant))
 				continue;
 			park->return_ack_pending = false;
-			if (saved.return_only || saved.cancelling
+			if (saved.cancelling
 				|| cluster_pcm_lock_read_grant_absent(&saved.grant.key)) {
 				memset(park, 0, sizeof(*park));
 				continue;
@@ -18942,6 +19070,7 @@ gcs_first_fill_master_tick(int worker)
 				gcs_block_first_fill_request(&saved.request, &saved.key, worker, true);
 		}
 	}
+	gcs_first_fill_return_receipt_tick(worker);
 	gcs_first_fill_ingress_tick(worker);
 }
 
@@ -25101,7 +25230,14 @@ cluster_gcs_block_normal_stop_local_poll(int *slot_out, const char **reason_out)
 	}
 	{
 		const char *ingress_reason;
+		const char *return_reason;
 		ClusterNormalStopPollResult ingress = gcs_first_fill_ingress_poll(&ingress_reason);
+		ClusterNormalStopPollResult returned = gcs_first_fill_return_receipt_poll(&return_reason);
+		if (returned != CLUSTER_NORMAL_STOP_READY && ingress != CLUSTER_NORMAL_STOP_INVALID) {
+			*slot_out = -1;
+			*reason_out = return_reason;
+			return returned;
+		}
 		if (ingress != CLUSTER_NORMAL_STOP_READY) {
 			*slot_out = -1;
 			*reason_out = ingress_reason;

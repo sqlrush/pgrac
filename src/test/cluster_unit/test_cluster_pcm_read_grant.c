@@ -230,6 +230,7 @@ static unsigned read_retirements;
 static unsigned read_ungranted;
 static bool read_managed, read_serving, read_quorum, read_member;
 static bool read_join_rebuilt, read_recovering, read_home;
+static bool read_unknown_home;
 static bool read_stop;
 static GcsBlockRequestPayload read_request;
 static void
@@ -372,7 +373,7 @@ read_ingress_defer(const ClusterICEnvelope *env)
 #define cluster_grd_join_remaster_active_for_shard(tag) true
 #define cluster_grd_block_view_rebuilt(tag) read_join_rebuilt
 #define cluster_gcs_block_phase_for_tag(tag) (read_recovering ? GCS_BLOCK_RECOVERING : GCS_BLOCK_NORMAL)
-#define cluster_gcs_lookup_master(tag) (read_home ? cluster_node_id : cluster_node_id + 1)
+#define cluster_gcs_lookup_master(tag) (read_unknown_home ? -1 : (read_home ? cluster_node_id : cluster_node_id + 1))
 #define cluster_gcs_block_note_send_outcome(family, result) ((void)(result))
 #define gcs_block_compute_checksum(data) 0
 #define cluster_block_io_trace_pending_s(key, phase, state, holder, binding, result) ((void)0)
@@ -451,6 +452,8 @@ read_wire_setup(BufferTag tag)
 	GcsBlockDedupKey key = {0};
 	while (gcs_first_fill_ingress_head != NULL)
 		gcs_first_fill_ingress_forget(gcs_first_fill_ingress_head);
+	memset(gcs_first_fill_return_receipts, 0, sizeof(gcs_first_fill_return_receipts));
+	gcs_first_fill_return_receipt_count = 0;
 	read_forwards = read_replies = read_local_forwards = 0;
 	read_notices = read_revokes = read_cleanup_lookups = 0;
 	read_cleanup_capacity = true;
@@ -473,6 +476,7 @@ read_wire_setup(BufferTag tag)
 	read_ungranted = 0;
 	read_managed = read_serving = read_quorum = read_member = true;
 	read_join_rebuilt = read_home = true;
+	read_unknown_home = false;
 	read_recovering = false;
 	read_stop = false;
 	read_master_time = 1;
@@ -1587,6 +1591,203 @@ read_return_wire(const ClusterPcmReadGrant *service)
 	cluster_gcs_handle_block_done_envelope(&env, &done);
 }
 
+UT_TEST(orphan_return_does_not_retain_the_receive_head_at_master_capacity)
+{
+	BufferTag tag = make_tag(198);
+	ClusterPcmReadGrant service = {0};
+	GcsFirstFillMasterPark before[GCS_FIRST_FILL_PARK_MAX];
+	reset_fake_pcm_runtime(4); (void)read_wire_setup(tag);
+	service.key.tag = tag; service.key.request_id = 71; service.key.epoch = 1;
+	service.key.requester_node = 1; service.key.backend_id = 13;
+	service.binding_generation = 7; service.service_generation = 1; service.holder_node = 0;
+	UT_ASSERT(cluster_pcm_lock_read_grant_absent(&service.key));
+	for (int i = 0; i < GCS_FIRST_FILL_PARK_MAX; i++) {
+		gcs_first_fill_master_parks[i].in_use = true;
+		gcs_first_fill_master_parks[i].key.request_id = 1000 + i;
+		gcs_first_fill_master_parks[i].retry_at = INT64_MAX;
+	}
+	memcpy(before, gcs_first_fill_master_parks, sizeof(before));
+	read_return_wire(&service);
+	UT_ASSERT_EQ(read_ingress_defers, 0);
+	UT_ASSERT_EQ(memcmp(before, gcs_first_fill_master_parks, sizeof(before)), 0);
+	read_master_time += 10000;
+	gcs_first_fill_master_tick(1);
+	UT_ASSERT_EQ(read_notices, 1);
+	UT_ASSERT_EQ(read_forwards + read_replies + read_revokes, 0);
+	UT_ASSERT(cluster_pcm_lock_read_grant_absent(&service.key));
+}
+
+static ClusterPcmReadGrant
+read_orphan_return_setup(BlockNumber block)
+{
+	ClusterPcmReadGrant service = {0};
+	reset_fake_pcm_runtime(4); (void)read_wire_setup(make_tag(block));
+	service.key.tag = read_request.tag; service.key.request_id = 71; service.key.epoch = 1;
+	service.key.requester_node = 1; service.key.backend_id = 13;
+	service.binding_generation = 7; service.service_generation = 1; service.holder_node = 0;
+	return service;
+}
+
+UT_TEST(orphan_return_receipts_are_bounded_per_original_sealed_holder)
+{
+	ClusterPcmReadGrant service = read_orphan_return_setup(199);
+	const char *reason;
+	for (int i = 0; i < GCS_FIRST_FILL_PARK_MAX; i++) {
+		service.key.request_id = 71 + i;
+		read_return_wire(&service);
+	}
+	UT_ASSERT_EQ(gcs_first_fill_return_receipt_count, 64);
+	UT_ASSERT_EQ(read_ingress_defers, 0);
+	read_return_wire(&service); /* Exact duplicate shares a receipt at capacity. */
+	UT_ASSERT_EQ(gcs_first_fill_return_receipt_count, 64);
+	service.service_generation++;
+	read_return_wire(&service);
+	UT_ASSERT_EQ(read_ingress_defers, 1);
+	UT_ASSERT_EQ(gcs_first_fill_return_receipt_count, 64);
+	UT_ASSERT_EQ(gcs_first_fill_return_receipts[0][63].service.service_generation, 1);
+	/* A second source holder owns a separate set of at most64 sealed parks. */
+	service.holder_node = 2;
+	read_return_wire(&service);
+	UT_ASSERT_EQ(gcs_first_fill_return_receipt_count, 65);
+	UT_ASSERT_EQ(gcs_first_fill_return_receipt_poll(&reason), CLUSTER_NORMAL_STOP_PENDING);
+	read_notice_result = CLUSTER_IC_SEND_DONE;
+	gcs_first_fill_master_tick(1);
+	UT_ASSERT_EQ(read_notices, 65);
+	UT_ASSERT_EQ(gcs_first_fill_return_receipt_count, 0);
+	UT_ASSERT_EQ(gcs_first_fill_return_receipt_poll(&reason), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(read_forwards + read_replies + read_revokes, 0);
+}
+
+UT_TEST(new_authenticated_holder_instance_can_retire_its_full_old_receipt_row)
+{
+	ClusterPcmReadGrant service = read_orphan_return_setup(205);
+	for (int i = 0; i < GCS_FIRST_FILL_PARK_MAX; i++) {
+		service.key.request_id = 71 + i;
+		read_return_wire(&service);
+	}
+	UT_ASSERT_EQ(gcs_first_fill_return_receipt_count, 64);
+	read_done_incarnation++;
+	service.key.request_id++;
+	read_return_wire(&service);
+	UT_ASSERT_EQ(gcs_first_fill_return_receipt_count, 1);
+	UT_ASSERT_EQ(gcs_first_fill_return_receipts[0][0].holder_session, read_done_incarnation);
+	UT_ASSERT_EQ(read_ingress_defers, 0);
+	UT_ASSERT_EQ(read_notices + read_forwards + read_replies + read_revokes, 0);
+}
+
+UT_TEST(orphan_receipt_waits_through_age_unknown_session_send_refusal_and_stop)
+{
+	ClusterPcmReadGrant service = read_orphan_return_setup(200), echoed;
+	const char *reason;
+	read_return_wire(&service);
+	gcs_first_fill_return_receipt_tick(0); /* Not the routed worker. */
+	UT_ASSERT_EQ(read_notices, 0);
+	read_master_time += 1000000000;
+	gcs_first_fill_return_receipt_tick(1);
+	UT_ASSERT_EQ(read_notices, 1);
+	UT_ASSERT_EQ(gcs_first_fill_return_receipt_count, 1);
+	read_unknown_home = true;
+	read_master_time += 10000;
+	gcs_first_fill_return_receipt_tick(1);
+	UT_ASSERT_EQ(read_notices, 1);
+	UT_ASSERT_EQ(gcs_first_fill_return_receipt_count, 1);
+	read_unknown_home = false;
+	read_done_session = false;
+	read_master_time += 1000000000;
+	gcs_first_fill_return_receipt_tick(1);
+	UT_ASSERT_EQ(read_notices, 1);
+	read_done_session = true;
+	read_stop = true;
+	read_serving = read_quorum = read_member = read_join_rebuilt = false;
+	read_recovering = true;
+	read_notice_result = CLUSTER_IC_SEND_HARD_ERROR;
+	gcs_first_fill_return_receipt_tick(1);
+	UT_ASSERT_EQ(read_notices, 2);
+	UT_ASSERT_EQ(gcs_first_fill_return_receipt_poll(&reason), CLUSTER_NORMAL_STOP_PENDING);
+	read_notice_result = CLUSTER_IC_SEND_WOULD_BLOCK;
+	read_master_time += 10000;
+	gcs_first_fill_return_receipt_tick(1);
+	UT_ASSERT_EQ(gcs_first_fill_return_receipt_count, 0);
+	UT_ASSERT(GcsBlockDonePayloadPendingSService(&read_notice, &echoed));
+	UT_ASSERT(gcs_first_fill_return_same_service(&service, &echoed));
+	UT_ASSERT_EQ(gcs_first_fill_return_receipt_poll(&reason), CLUSTER_NORMAL_STOP_READY);
+	gcs_first_fill_return_receipt_tick(1);
+	UT_ASSERT_EQ(read_notices, 3);
+	UT_ASSERT_EQ(read_forwards + read_replies + read_revokes, 0);
+}
+
+UT_TEST(orphan_receipt_retires_only_for_proved_master_or_holder_reconfiguration)
+{
+	for (int why = 0; why < 5; why++) {
+		ClusterPcmReadGrant service = read_orphan_return_setup(201);
+		read_return_wire(&service);
+		if (why == 0) read_epoch++;
+		if (why == 1) read_home = false;
+		if (why == 2) read_holder_state = CLUSTER_MEMBER_DEAD;
+		if (why == 3) read_holder_state = CLUSTER_MEMBER_REMOVED;
+		if (why == 4) read_done_incarnation++;
+		gcs_first_fill_return_receipt_tick(1);
+		UT_ASSERT_EQ(gcs_first_fill_return_receipt_count, 0);
+		UT_ASSERT_EQ(read_notices + read_forwards + read_replies + read_revokes, 0);
+	}
+}
+
+UT_TEST(orphan_receipt_does_not_borrow_or_retire_a_native_successor)
+{
+	ClusterPcmReadGrant service = read_orphan_return_setup(202), next, current;
+	read_return_wire(&service);
+	next = begin_read(service.key.tag, 1, 13, service.key.request_id);
+	UT_ASSERT(next.binding_generation != service.binding_generation);
+	read_return_wire(&service); /* Same receipt is independent of the successor. */
+	UT_ASSERT_EQ(read_ingress_defers, 0);
+	UT_ASSERT_EQ(gcs_first_fill_return_receipt_count, 1);
+	read_notice_result = CLUSTER_IC_SEND_DONE;
+	gcs_first_fill_return_receipt_tick(1);
+	UT_ASSERT_EQ(gcs_first_fill_return_receipt_count, 0);
+	UT_ASSERT(cluster_pcm_lock_read_grant_blocker_snapshot(service.key.tag, 1, &current));
+	UT_ASSERT_EQ(current.binding_generation, next.binding_generation);
+	UT_ASSERT_EQ(current.service_generation, next.service_generation);
+	UT_ASSERT(!current.revoking);
+	UT_ASSERT(cluster_pcm_lock_read_grant_done(&next.key, 1, true));
+}
+
+UT_TEST(orphan_receipt_poll_rejects_corrupt_credit_and_identity)
+{
+	ClusterPcmReadGrant service = read_orphan_return_setup(203);
+	GcsFirstFillReturnReceipt saved;
+	const char *reason;
+	read_return_wire(&service);
+	saved = gcs_first_fill_return_receipts[0][0];
+	gcs_first_fill_return_receipt_count++;
+	UT_ASSERT_EQ(gcs_first_fill_return_receipt_poll(&reason), CLUSTER_NORMAL_STOP_INVALID);
+	gcs_first_fill_return_receipt_count--;
+	for (int bad = 0; bad < 4; bad++) {
+		GcsFirstFillReturnReceipt *receipt = &gcs_first_fill_return_receipts[0][0];
+		*receipt = saved;
+		if (bad == 0) receipt->service.holder_node = 2;
+		if (bad == 1) receipt->holder_session = 0;
+		if (bad == 2) receipt->worker = 2;
+		if (bad == 3) receipt->service.binding_generation = 0;
+		UT_ASSERT_EQ(gcs_first_fill_return_receipt_poll(&reason), CLUSTER_NORMAL_STOP_INVALID);
+	}
+	gcs_first_fill_return_receipts[0][0] = saved;
+	UT_ASSERT_EQ(gcs_first_fill_return_receipt_poll(&reason), CLUSTER_NORMAL_STOP_PENDING);
+}
+
+UT_TEST(unproved_orphan_return_keeps_original_carrier_and_native_owner)
+{
+	ClusterPcmReadGrant service = read_orphan_return_setup(204), active, current;
+	active = begin_read(service.key.tag, 1, 13, service.key.request_id);
+	read_return_wire(&service);
+	UT_ASSERT_EQ(read_ingress_defers, 1);
+	UT_ASSERT_EQ(gcs_first_fill_return_receipt_count, 0);
+	UT_ASSERT(cluster_pcm_lock_read_grant_blocker_snapshot(service.key.tag, 1, &current));
+	UT_ASSERT_EQ(current.binding_generation, active.binding_generation);
+	UT_ASSERT(!current.revoking);
+	UT_ASSERT_EQ(read_notices + read_forwards + read_replies + read_revokes, 0);
+	UT_ASSERT(cluster_pcm_lock_read_grant_done(&active.key, 1, true));
+}
+
 UT_TEST(master_consumes_quiet_return_before_reselecting_original_request)
 {
 	BufferTag tag = make_tag(172);
@@ -1684,8 +1885,10 @@ UT_TEST(master_quiet_return_preserves_exact_cancel_and_late_consumption)
 	UT_ASSERT(cluster_pcm_lock_read_grant_revoke_ack(&grant.key));
 	UT_ASSERT(cluster_pcm_lock_read_grant_retire_notice_admitted(&grant.key));
 	read_return_wire(&grant); /* Original native owner is already retired. */
-	UT_ASSERT(gcs_first_fill_master_parks[0].return_only);
+	UT_ASSERT_EQ(gcs_first_fill_return_receipt_count, 1);
+	UT_ASSERT(!gcs_first_fill_master_parks[0].in_use);
 	read_master_time += 10000; gcs_first_fill_master_tick(1);
+	UT_ASSERT_EQ(gcs_first_fill_return_receipt_count, 0);
 	UT_ASSERT(!gcs_first_fill_master_parks[0].in_use);
 	UT_ASSERT_EQ(read_forwards, 1);
 }
@@ -2111,7 +2314,15 @@ UT_TEST(first_fill_replays_without_local_ownership_cannot_create_service)
 int
 main(void)
 {
-	UT_PLAN(60);
+	UT_PLAN(68);
+	UT_RUN(new_authenticated_holder_instance_can_retire_its_full_old_receipt_row);
+	UT_RUN(orphan_return_receipts_are_bounded_per_original_sealed_holder);
+	UT_RUN(orphan_receipt_waits_through_age_unknown_session_send_refusal_and_stop);
+	UT_RUN(orphan_receipt_retires_only_for_proved_master_or_holder_reconfiguration);
+	UT_RUN(orphan_receipt_does_not_borrow_or_retire_a_native_successor);
+	UT_RUN(orphan_receipt_poll_rejects_corrupt_credit_and_identity);
+	UT_RUN(unproved_orphan_return_keeps_original_carrier_and_native_owner);
+	UT_RUN(orphan_return_does_not_retain_the_receive_head_at_master_capacity);
 	UT_RUN(queued_cancel_preserves_original_lifetime_for_fresh_dedup_registration);
 	UT_RUN(queued_ingress_uses_existing_backend_credit_without_evicting_originals);
 	UT_RUN(queued_ingress_rechecks_each_authority_gate_without_fabricated_admission);

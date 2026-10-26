@@ -9790,6 +9790,11 @@ test_cluster_first_fill_ingress.inc: $(top_srcdir)/src/backend/cluster/cluster_g
 	     END { if (n != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
 	awk '/^gcs_block_first_fill_ingress\(/ { print "static void"; emit=1; n++ } \
 	     emit { print } emit && /^}/ { emit=0 } END { if (n != 1 || emit) exit 1 }' $< >> $@.tmp
+	awk '/^gcs_first_fill_returned_notice\(/ { print "static bool"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 1 || emit) exit 1 }' $< >> $@.tmp
+	awk '/^\/\* GCS first-fill return receipt begin/ { emit=1; n++ } \
+	     emit { print } /^\/\* GCS first-fill return receipt end/ { emit=0; done++ } \
+	     END { if (n != 1 || done != 1 || emit) exit 1 }' $< >> $@.tmp
 	mv $@.tmp $@
 
 test_cluster_first_fill_ingress_tcp: test_cluster_first_fill_ingress_tcp.c \
