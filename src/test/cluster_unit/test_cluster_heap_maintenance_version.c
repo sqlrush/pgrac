@@ -9474,8 +9474,9 @@ bounds_assert_unlocked(void)
 }
 
 /* Acquisition now executes the original local fold, worker publication getter,
- * R4 capture/current, and before/after-end-clock guards. History acquisition,
- * maintenance coverage, peer acquisition and time remain controlled leaves. */
+ * R4 capture/current, and before/after-end-clock guards. Original local history
+ * sampling uses explicit clock/ProcArray-lock/MRP leaves; maintenance coverage,
+ * peer acquisition and source timing remain controlled. */
 static unsigned bounds_acquire_fault, bounds_acquire_gets, bounds_acquire_ticks;
 static unsigned bounds_acquire_history_reads, bounds_acquire_peer_reads;
 static ClusterHeapFreezeCohortStatus bounds_acquire_status;
@@ -9521,16 +9522,101 @@ bounds_source_worker_get(ClusterUndoCleanerActiveSample *out)
 	return true;
 }
 
+/* Original history fold and ProcArray sampler, with explicit local scheduling
+ * and clock inputs. This is a bounded unit interleaving, not native concurrency. */
+static SCN bounds_history_clock, bounds_history_mrp_bound;
+static PGPROC *bounds_history_all_procs = sampler_slots;
+static bool bounds_history_held, bounds_history_register_on_unlock;
+static bool bounds_history_mrp_active;
+static unsigned bounds_history_locks, bounds_history_unlocks, bounds_history_clocks;
+
+static void
+bounds_history_acquire(LWLock *lock, LWLockMode mode)
+{
+	bounds_assert_unlocked();
+	UT_ASSERT(lock == sampler_proc_lock && mode == LW_EXCLUSIVE);
+	UT_ASSERT(!bounds_history_held && !sampler_lock_held);
+	bounds_history_held = true; bounds_history_locks++;
+}
+
+static void
+bounds_history_release(LWLock *lock)
+{
+	UT_ASSERT(lock == sampler_proc_lock && bounds_history_held);
+	bounds_history_held = false; bounds_history_unlocks++;
+	if (bounds_history_register_on_unlock) {
+		bounds_history_register_on_unlock = false;
+		ctrc_note_unqualified_registration();
+	}
+}
+
+static SCN
+bounds_history_clock_current(void)
+{
+	UT_ASSERT(bounds_history_held);
+	bounds_history_clocks++;
+	return bounds_history_clock;
+}
+
+static bool
+bounds_history_mrp_should_start(void)
+{
+	UT_ASSERT(!bounds_history_held);
+	return bounds_history_mrp_active;
+}
+
+static SCN
+bounds_history_mrp_consistent_scn(void)
+{
+	UT_ASSERT(bounds_history_mrp_active && !bounds_history_held);
+	return bounds_history_mrp_bound;
+}
+
+#define cluster_undo_retention_sample_min bounds_original_retention_min
+#include "test_cluster_heap_freeze_retention_min.inc"
+#undef cluster_undo_retention_sample_min
+
+static bool bounds_original_retention_sample(ClusterUndoRetentionSample *out);
+static SCN bounds_original_retention_horizon(void);
+
+#define procArray sampler_proc_array
+#define allProcs bounds_history_all_procs
+#define MainLWLockArray sampler_locks
+#define LWLockAcquire bounds_history_acquire
+#define LWLockRelease bounds_history_release
+#define cluster_scn_current bounds_history_clock_current
+#define UINT32_ACCESS_ONCE(x) ((uint32) (x))
+#define cluster_undo_retention_sample_min bounds_original_retention_min
+#define cluster_undo_retention_horizon_sample bounds_original_retention_sample
+#define cluster_undo_retention_horizon bounds_original_retention_horizon
+#include "test_cluster_retention_sample.inc"
+#undef cluster_undo_retention_horizon
+#undef cluster_undo_retention_horizon_sample
+#undef cluster_undo_retention_sample_min
+#undef UINT32_ACCESS_ONCE
+#undef cluster_scn_current
+#undef LWLockRelease
+#undef LWLockAcquire
+#undef MainLWLockArray
+#undef allProcs
+#undef procArray
+
+#define cluster_undo_retention_horizon_sample bounds_original_retention_sample
+#define cluster_mrp_should_start bounds_history_mrp_should_start
+#define cluster_mrp_standby_consistent_scn bounds_history_mrp_consistent_scn
+#define undo_horizon_sample_local_report bounds_original_local_report
+#include "test_cluster_heap_freeze_local_history.inc"
+#undef undo_horizon_sample_local_report
+#undef cluster_mrp_standby_consistent_scn
+#undef cluster_mrp_should_start
+#undef cluster_undo_retention_horizon_sample
+
 static bool
 bounds_source_history(ClusterUndoRetentionSample *out)
 {
 	bounds_assert_unlocked(); bounds_acquire_history_reads++;
 	if (bounds_acquire_fault == 1) return false;
-	memset(out, 0, sizeof(*out));
-	out->horizon_scn = bounds_source->cohort.source_local_horizon_scn;
-	out->clock_scn = bounds_source->cohort.source_local_history.sample_clock_scn;
-	out->contributor_kind = bounds_source->cohort.source_local_history.contributor_kind;
-	out->contributor_token = bounds_source->cohort.source_local_history.contributor_token;
+	if (!bounds_original_local_report(out)) return false;
 	if (bounds_acquire_fault == 2) out->clock_scn = 0;
 	if (bounds_acquire_fault == 3) out->horizon_scn = out->clock_scn + 1;
 	if (bounds_acquire_fault == 4) out->horizon_scn = CLUSTER_UNDO_HORIZON_REPORT_UNCONSTRAINED;
@@ -9699,6 +9785,12 @@ bounds_observer_setup(LVRelState *v, QualifiedXminFixture *f)
 	bounds_acquire_fault = bounds_acquire_gets = bounds_acquire_ticks = 0;
 	bounds_acquire_history_reads = bounds_acquire_peer_reads = 0;
 	bounds_acquire_status = CLUSTER_HEAP_FREEZE_COHORT_INVALID;
+	bounds_history_clock = f->cohort.source_local_history.sample_clock_scn;
+	bounds_history_mrp_bound = InvalidScn;
+	bounds_history_all_procs = sampler_slots;
+	bounds_history_held = bounds_history_register_on_unlock = false;
+	bounds_history_mrp_active = false;
+	bounds_history_locks = bounds_history_unlocks = bounds_history_clocks = 0;
 	bounds_policy_reads = bounds_cohort_reads = bounds_census_reads = 0;
 	bounds_clock_reads = bounds_clock_observes = bounds_target_reads = 0;
 	bounds_fault = 0;
@@ -9946,10 +10038,168 @@ UT_TEST(test_collector_original_cohort_provider_error_retains_caller_resources)
 	}
 }
 
+UT_TEST(test_collector_original_history_same_cut_clock_and_compact_snapshot)
+{
+	QualifiedXminFixture f; LVRelState v; ClusterUndoRetentionSample history;
+	qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI); bounds_observer_setup(&v, &f);
+	UT_ASSERT(bounds_original_local_report(&history));
+	UT_ASSERT_EQ(history.horizon_scn, 10); UT_ASSERT_EQ(history.clock_scn, 10);
+	UT_ASSERT_EQ(history.contributor_kind, CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK);
+	UT_ASSERT_EQ(history.contributor_token, 0);
+	UT_ASSERT_EQ(bounds_original_retention_horizon(), 10);
+	/* Visit an unknown entry first, then the equal-time known compact member.
+	 * The diagnostic token is its physical slot, not the compact ordinal. */
+	sampler_proc_array->numProcs = 2;
+	sampler_proc_array->pgprocnos[0] = 0; sampler_proc_array->pgprocnos[1] = 2;
+	sampler_slots[0].xmin = sampler_slots[2].xmin = 100;
+	sampler_slots[0].pid = 0; sampler_slots[2].pid = 42;
+	pg_atomic_write_u64(&sampler_slots[0].cluster_read_scn_atomic, 8);
+	pg_atomic_write_u64(&sampler_slots[2].cluster_read_scn_atomic, 8);
+	UT_ASSERT(bounds_original_local_report(&history));
+	UT_ASSERT_EQ(history.horizon_scn, 8); UT_ASSERT_EQ(history.clock_scn, 10);
+	UT_ASSERT_EQ(history.contributor_kind, CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT);
+	UT_ASSERT_EQ(history.contributor_token, 3);
+	UT_ASSERT_EQ(bounds_history_locks, 3); UT_ASSERT_EQ(bounds_history_unlocks, 3);
+	UT_ASSERT_EQ(bounds_history_clocks, 3); UT_ASSERT(!bounds_history_held);
+	bounds_assert_unlocked();
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+}
+
+UT_TEST(test_collector_original_history_refusals_block_single_and_batch_wal)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (unsigned fault = 0; fault < 10; fault++) {
+			QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+			LVRelState v; ClusterHeapFreezeObservedBoundsV1 bounds = {0};
+			ClusterUndoRetentionSample history, zero = {0};
+			if (batch) qualified_xmin_batch_setup(&f, targets);
+			else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+			bounds_observer_setup(&v, &f); fixture_wal_clock = 5;
+			switch (fault) {
+			case 0: sampler_slots[0].xmin = 100; break;
+			case 1: sampler_proc_array->replication_slot_xmin = 100; break;
+			case 2: sampler_proc_array->replication_slot_catalog_xmin = 100; break;
+			case 3: pg_atomic_write_u64(&sampler_slots[0].cluster_read_scn_atomic, UINT64_MAX); break;
+			case 4: bounds_history_clock = UINT64_MAX; break;
+			case 5: bounds_history_clock = InvalidScn; break;
+			case 6: sampler_proc_array->numProcs = -1; break;
+			case 7: sampler_proc_array->numProcs = sampler_proc_array->maxProcs + 1; break;
+			case 8: bounds_history_mrp_active = true; bounds_history_mrp_bound = InvalidScn; break;
+			case 9: bounds_history_mrp_active = true; bounds_history_mrp_bound = UINT64_MAX; break;
+			}
+			memset(&history, 0xa5, sizeof(history));
+			UT_ASSERT(!bounds_original_local_report(&history));
+			UT_ASSERT(memcmp(&history, &zero, sizeof(history)) == 0);
+			UT_ASSERT_EQ(lazy_observe_shared_freeze_bounds(&v, &f.admission,
+				CLUSTER_HEAP_FREEZE_PROOF_PROVEN, &bounds), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+			UT_ASSERT(bounds_acquire_status != CLUSTER_HEAP_FREEZE_COHORT_READY);
+			UT_ASSERT(!v.shared_freeze_cohort_observed);
+			UT_ASSERT(v.shared_freeze_input.freeze_policy == NULL && v.shared_freeze_input.freeze_cohort == NULL);
+			f.input = v.shared_freeze_input;
+			UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0)));
+			UT_ASSERT_EQ(bounds_history_locks, bounds_history_unlocks);
+			UT_ASSERT_EQ(bounds_history_locks, bounds_history_clocks);
+			UT_ASSERT(!bounds_history_held && !local_x && f.admission.entered);
+			UT_ASSERT_EQ(backend_pin_count, 1);
+			UT_ASSERT_EQ(inserts + edges + dirties + flushes + conditional_resumes, 0);
+			UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		}
+	}
+}
+
+UT_TEST(test_collector_original_history_mrp_fold_keeps_same_cut_attribution)
+{
+	for (unsigned variant = 0; variant < 7; variant++) {
+		QualifiedXminFixture f; LVRelState v; ClusterUndoRetentionSample history, zero = {0};
+		qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI); bounds_observer_setup(&v, &f);
+		bounds_history_mrp_active = true;
+		bounds_history_mrp_bound = variant == 0 ? InvalidScn : variant == 1 ? UINT64_MAX
+			: variant == 2 ? 8 : variant == 4 ? 12 : 10;
+		if (variant >= 5) {
+			sampler_proc_array->pgprocnos[0] = 2;
+			sampler_slots[2].xmin = 100; sampler_slots[2].pid = variant == 5 ? 42 : 0;
+			pg_atomic_write_u64(&sampler_slots[2].cluster_read_scn_atomic, 10);
+		}
+		memset(&history, 0xa5, sizeof(history));
+		if (variant < 2) {
+			UT_ASSERT(!bounds_original_local_report(&history));
+			UT_ASSERT(memcmp(&history, &zero, sizeof(history)) == 0);
+		} else {
+			UT_ASSERT(bounds_original_local_report(&history));
+			UT_ASSERT_EQ(history.horizon_scn, variant == 2 ? 8 : 10);
+			UT_ASSERT_EQ(history.clock_scn, 10);
+			UT_ASSERT_EQ(history.contributor_kind, variant == 4
+				? CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK : variant == 5
+				? CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT
+				: CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_REPLICATION);
+			UT_ASSERT_EQ(history.contributor_token, variant == 5 ? 3 : 0);
+		}
+		UT_ASSERT_EQ(bounds_history_locks, 1); UT_ASSERT_EQ(bounds_history_unlocks, 1);
+		UT_ASSERT_EQ(bounds_history_clocks, 1); UT_ASSERT(!bounds_history_held);
+		bounds_assert_unlocked();
+	}
+}
+
+UT_TEST(test_collector_original_history_minimum_reaches_native_creation_plan)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+		LVRelState v; ClusterHeapFreezeObservedBoundsV1 bounds = {0};
+		if (batch) qualified_xmin_batch_setup(&f, targets);
+		else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		f.cohort.horizon_scn = f.cohort.source_local_horizon_scn = 8;
+		f.cohort.source_local_history.contributor_kind = CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT;
+		f.cohort.source_local_history.contributor_token = 3;
+		bounds_observer_setup(&v, &f); fixture_wal_clock = 5;
+		sampler_proc_array->numProcs = 2; sampler_proc_array->pgprocnos[1] = 2;
+		sampler_slots[2].xmin = 100; sampler_slots[2].pid = 42;
+		pg_atomic_write_u64(&sampler_slots[2].cluster_read_scn_atomic, 8);
+		UT_ASSERT_EQ(lazy_observe_shared_freeze_bounds(&v, &f.admission,
+			CLUSTER_HEAP_FREEZE_PROOF_PROVEN, &bounds), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+		UT_ASSERT(v.shared_freeze_cohort_observed);
+		UT_ASSERT_EQ(bounds.horizon_scn, 8);
+		UT_ASSERT_EQ(v.shared_freeze_cohort.source_local_history.contributor_token, 3);
+		f.input = v.shared_freeze_input;
+		/* Creation SCN 9 is newer than the actually observed H=8. Do not use
+		 * the convenience helpers' constant H=10 in this connection check. */
+		UT_ASSERT(!(batch ? cluster_heap_freeze_apply_xmin_batch_v1(&relation_data, 1,
+			&f.input, &f.page, &f.proofs, &f.fence, &f.authority, &f.admission,
+			targets, 3, bounds.freeze_limit, bounds.horizon_scn)
+			: cluster_heap_freeze_apply_xmin_v1(&relation_data, 1, &f.input,
+			&f.page, &f.proofs, &f.fence, &f.authority, &f.admission, 0,
+			FullTransactionIdFromEpochAndXid(1, 77), bounds.freeze_limit, bounds.horizon_scn)));
+		UT_ASSERT_EQ(inserts + edges + dirties + flushes + conditional_resumes, 0);
+		UT_ASSERT(!local_x && f.admission.entered); UT_ASSERT_EQ(backend_pin_count, 1);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_collector_original_history_unlock_registration_invalidates_cut)
+{
+	QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeObservedBoundsV1 bounds = {0};
+	qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI); bounds_observer_setup(&v, &f);
+	bounds_history_register_on_unlock = true; fixture_wal_clock = 5;
+	UT_ASSERT_EQ(lazy_observe_shared_freeze_bounds(&v, &f.admission,
+		CLUSTER_HEAP_FREEZE_PROOF_PROVEN, &bounds), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT_EQ(bounds_history_locks, 1); UT_ASSERT_EQ(bounds_history_unlocks, 1);
+	UT_ASSERT(!bounds_history_held && !bounds_history_register_on_unlock);
+	UT_ASSERT(bounds_acquire_status != CLUSTER_HEAP_FREEZE_COHORT_READY);
+	UT_ASSERT(!v.shared_freeze_cohort_observed); f.input = v.shared_freeze_input;
+	UT_ASSERT(!qualified_xmin_apply(&f, 0));
+	UT_ASSERT_EQ(inserts + edges + dirties + flushes + conditional_resumes, 0);
+	UT_ASSERT(!local_x && f.admission.entered); UT_ASSERT_EQ(backend_pin_count, 1);
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(231);
+	UT_PLAN(236);
+	UT_RUN(test_collector_original_history_same_cut_clock_and_compact_snapshot);
+	UT_RUN(test_collector_original_history_refusals_block_single_and_batch_wal);
+	UT_RUN(test_collector_original_history_mrp_fold_keeps_same_cut_attribution);
+	UT_RUN(test_collector_original_history_minimum_reaches_native_creation_plan);
+	UT_RUN(test_collector_original_history_unlock_registration_invalidates_cut);
 	UT_RUN(test_collector_original_cohort_acquisition_publishes_only_after_full_local_checks);
 	UT_RUN(test_collector_original_cohort_acquisition_refusal_blocks_single_and_batch_wal);
 	UT_RUN(test_collector_original_cohort_end_clock_rechecks_worker_admission_and_ingress);
