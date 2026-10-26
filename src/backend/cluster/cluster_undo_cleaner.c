@@ -283,7 +283,12 @@ undo_cleaner_publish_active_sample(void)
 	LWLockAcquire(&undo_cleaner_state->lwlock, LW_EXCLUSIVE);
 	sample = &undo_cleaner_state->active_sample;
 	MemSet(sample, 0, sizeof(*sample));
+	/* A status label cannot replace the completed traversal. Never publish
+	 * an empty, partial/overrun or still-busy cursor as a new F source. */
 	if (undo_cleaner_active_scan.status == CTRC_ACTIVE_SCAN_COMPLETE
+		&& undo_cleaner_active_scan.total_entries != 0
+		&& undo_cleaner_active_scan.next_index == undo_cleaner_active_scan.total_entries
+		&& !undo_cleaner_active_scan.lock_busy
 		&& !undo_cleaner_state->shutdown_requested
 		&& undo_cleaner_state->workers[0].status == UNDO_CLEANER_READY
 		&& undo_cleaner_state->workers[0].pid == MyProcPid
