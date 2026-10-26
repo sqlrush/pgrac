@@ -6093,6 +6093,8 @@ clean distclean maintainer-clean:
 		test_cluster_first_fill_holder.inc test_cluster_first_fill_holder.inc.tmp \
 		test_cluster_pcm_first_fill_master.inc test_cluster_pcm_first_fill_master.inc.tmp
 	rm -f test_cluster_pcm_read_source_owner.inc test_cluster_pcm_read_source_owner.inc.tmp
+	rm -f test_cluster_pcm_read_source_stop.inc test_cluster_pcm_read_source_stop.inc.tmp \
+		test_cluster_pcm_failed_read_eviction.inc test_cluster_pcm_failed_read_eviction.inc.tmp
 	rm -f test_cluster_ko_writeback_io.inc test_cluster_ko_writeback_io.inc.tmp \
 		test_cluster_ko_writeback_smgr.inc test_cluster_ko_writeback_smgr.inc.tmp
 	rm -f test_cluster_ko_sync_io.inc test_cluster_ko_sync_io.inc.tmp \
@@ -6250,6 +6252,7 @@ clean distclean maintainer-clean:
 		test_cluster_pcm_snapshot_owner.inc \
 		test_cluster_pcm_transition_owner.inc \
 		test_cluster_pcm_abort_read_image.inc \
+		test_cluster_pcm_failed_read_eviction.inc \
 		test_cluster_pcm_gcs_drop.inc test_cluster_pcm_downgrade.inc test_cluster_pcm_eviction_gate.inc \
 		test_cluster_pcm_flush_owner.inc \
 		test_cluster_pcm_barrier_proof.inc \
@@ -6967,9 +6970,19 @@ test_cluster_pcm_transition_owner.inc: $(top_srcdir)/src/backend/storage/buffer/
 
 test_cluster_pcm_abort_read_image.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
 	awk '/^cluster_bufmgr_pcm_read_image_last_pin\(/ { print "static void"; emit=1; retire++ } \
+	     /^cluster_bufmgr_failed_read_held_lock\(/ { print "static void"; emit=1; held++ } \
+	     /^cluster_bufmgr_failed_read_unpin_lock\(/ { print "static LWLock *"; emit=1; lock++ } \
+	     /^cluster_bufmgr_failed_read_unpin_finish\(/ { print "static void"; emit=1; finish++ } \
 	     /^UnpinBuffer\(/ { print "static void"; emit=1; unpin++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (unpin != 1 || retire != 1 || emit) exit 1 }' $< > $@.tmp
+	     END { if (unpin != 1 || retire != 1 || held != 1 || lock != 1 || finish != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_pcm_failed_read_eviction.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^InvalidateBufferCommitLocked\(/ { print "static bool"; emit=1; commit++ } \
+	     /^InvalidateBufferCommitTailLocked\(/ { print "static void"; emit=1; tail++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (commit != 1 || tail != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_pcm_target_prepare.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
@@ -7167,6 +7180,7 @@ test_cluster_pcm_own: test_cluster_pcm_own.c unit_test.h \
 		test_cluster_pcm_page_identity.inc \
 		test_cluster_pcm_snapshot_owner.inc test_cluster_pcm_transition_owner.inc \
 		test_cluster_pcm_abort_read_image.inc \
+		test_cluster_pcm_failed_read_eviction.inc \
 		test_cluster_pcm_flush_owner.inc \
 		test_cluster_pcm_gcs_drop.inc test_cluster_pcm_downgrade.inc test_cluster_pcm_eviction_gate.inc \
 		test_cluster_pcm_barrier_proof.inc \
@@ -12651,7 +12665,15 @@ test_cluster_pcm_read_source_owner.inc: $(top_srcdir)/src/backend/storage/buffer
 	     END { if (found != 1 || emit) exit 1 }' $< >> $@.tmp
 	mv $@.tmp $@
 
+test_cluster_pcm_read_source_stop.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^cluster_bufmgr_stop_held_lock\(/ { print "static void"; emit=1; held++ } \
+	     /^cluster_bufmgr_stop_poll\(/ { print "static ClusterNormalStopPollResult"; emit=1; scan++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (held != 1 || scan != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_pcm_read_source: test_cluster_pcm_read_source.c test_cluster_pcm_own \
+		test_cluster_pcm_read_source_stop.inc \
 		test_cluster_pcm_read_source_owner.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_block_io_trace.c \
 		$(top_srcdir)/src/include/cluster/cluster_block_io_trace.h

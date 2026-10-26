@@ -9317,6 +9317,78 @@ cluster_bufmgr_pcm_read_image_last_pin(BufferDesc *buf)
 	(void) cluster_pcm_own_reclaim_read_image_exact(buf, &published, &cleared_generation);
 	LWLockRelease(content_lock);
 }
+
+static void
+cluster_bufmgr_failed_read_held_lock(LWLock *lock, LWLockMode mode, void *context)
+{
+	(void)lock;
+	(void)mode;
+	*(bool *)context = true;
+}
+
+/* Native IO abort leaves IO_ERROR on a failed input frame. Its original
+ * ResourceOwner pin releaser removes the unused N residency through the
+ * normal eviction owner, rather than making the error look successful.
+ * Serialize final pin releases with the existing mapping lock: checking for
+ * one shared pin before unpinning would let two final releasers both miss it.
+ * Acquire before forgetting the pin so a lock-acquisition ERROR preserves
+ * the original cleanup owner. No lock may be carried into this acquisition.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static LWLock *
+cluster_bufmgr_failed_read_unpin_lock(BufferDesc *buf, BufferTag *tag, uint32 *hash)
+{
+	LWLock *partition;
+	uint32 state;
+	bool held_lock = false;
+
+	if (!cluster_enabled || !cluster_shared_config || CritSectionCount != 0
+		|| ClusterPcmOwnArray == NULL)
+		return NULL;
+	state = pg_atomic_read_u32(&buf->state);
+	/* Include an active invalid read: its IO owner may publish IO_ERROR
+	 * after this sample and release another pin before our decrement. */
+	if ((state & (BM_TAG_VALID | BM_VALID)) != BM_TAG_VALID)
+		return NULL;
+	ForEachLWLockHeldByMe(cluster_bufmgr_failed_read_held_lock, &held_lock);
+	if (held_lock)
+		return NULL;
+	state = LockBufHdr(buf);
+	*tag = buf->tag;
+	UnlockBufHdr(buf, state);
+	*hash = BufTableHashCode(tag);
+	partition = BufMappingPartitionLock(*hash);
+	LWLockAcquire(partition, LW_EXCLUSIVE);
+	return partition;
+}
+
+static void
+cluster_bufmgr_failed_read_unpin_finish(BufferDesc *buf, BufferTag *tag, uint32 hash,
+									   LWLock *partition)
+{
+	ClusterPcmOwnSnapshot own;
+	uint32 state = LockBufHdr(buf);
+
+	cluster_pcm_own_snapshot_post_state_locked(buf, state, &own);
+	if (BUF_STATE_GET_REFCOUNT(state) == 0 && BufferTagsEqual(&buf->tag, tag)
+		&& (state & (BM_TAG_VALID | BM_IO_ERROR)) == (BM_TAG_VALID | BM_IO_ERROR)
+		&& (state & (BM_VALID | BM_IO_IN_PROGRESS | BM_DIRTY | BM_JUST_DIRTIED
+					| BM_CHECKPOINT_NEEDED | BM_PIN_COUNT_WAITER)) == 0
+		&& own.buffer_type == (uint8) BUF_TYPE_CURRENT
+		&& own.pcm_state == (uint8) PCM_STATE_N
+		&& own.flags == 0 && own.writer_activation_token == 0
+		&& own.resource_x_activation_generation == 0
+		&& own.generation < UINT64_MAX - 1 && own.reservation_token != UINT64_MAX
+		&& cluster_pcm_own_delivery_attempt_get(buf->buf_id) == 0) {
+		/* This N-only, unpinned commit cannot release a foreign holder or
+		 * write data. It owns the original tag/flag reset, mapping removal
+		 * and free-list publication, and releases both locks itself. */
+		(void) InvalidateBufferCommitLocked(buf, tag, hash, partition, state);
+		return;
+	}
+	UnlockBufHdr(buf, state);
+	LWLockRelease(partition);
+}
 #endif
 
 static void
@@ -9324,6 +9396,11 @@ UnpinBuffer(BufferDesc *buf)
 {
 	PrivateRefCountEntry *ref;
 	Buffer		b = BufferDescriptorGetBuffer(buf);
+#ifdef USE_PGRAC_CLUSTER
+	BufferTag failed_read_tag;
+	uint32 failed_read_hash = 0;
+	LWLock *failed_read_partition = NULL;
+#endif
 
 	Assert(!BufferIsLocal(b));
 
@@ -9335,8 +9412,11 @@ UnpinBuffer(BufferDesc *buf)
 	/* Conditional lock acquisition can ERROR at the native held-lock limit.
 	 * Keep both the ResourceOwner pin and private count until it has returned,
 	 * so ordinary abort cleanup can still release this original reference. */
-	if (ref->refcount == 1)
+	if (ref->refcount == 1) {
 		cluster_bufmgr_pcm_read_image_last_pin(buf);
+		failed_read_partition = cluster_bufmgr_failed_read_unpin_lock(
+			buf, &failed_read_tag, &failed_read_hash);
+	}
 #endif
 
 	ResourceOwnerForgetBuffer(CurrentResourceOwner, b);
@@ -9406,6 +9486,11 @@ UnpinBuffer(BufferDesc *buf)
 			else
 				UnlockBufHdr(buf, buf_state);
 		}
+#ifdef USE_PGRAC_CLUSTER
+		if (failed_read_partition != NULL)
+			cluster_bufmgr_failed_read_unpin_finish(
+				buf, &failed_read_tag, failed_read_hash, failed_read_partition);
+#endif
 		ForgetPrivateRefCountEntry(ref);
 	}
 }
