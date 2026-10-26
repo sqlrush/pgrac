@@ -360,6 +360,7 @@ relmap_runtime_finish_v2(const ClusterRelmapOwnerSampleV2 *sample,
 		return CLUSTER_RELMAP_V2_RETAINED_UNKNOWN;
 
 	if (publish) {
+#ifdef USE_PGRAC_CLUSTER
 		ClusterRelmapRecoveryNativeTerminal native = { 0 };
 
 		/* The original native commit precedes this cleanup. Sync/read back
@@ -387,6 +388,10 @@ relmap_runtime_finish_v2(const ClusterRelmapOwnerSampleV2 *sample,
 		LWLockRelease(&relmap_runtime_shmem->lock);
 		if (result != CLUSTER_RELMAP_RETENTION_OK)
 			return CLUSTER_RELMAP_V2_RETAINED_UNKNOWN;
+#else
+		/* Native terminal observation is unavailable without cluster support. */
+		return CLUSTER_RELMAP_V2_RETAINED_UNKNOWN;
+#endif
 	}
 
 	/* Existing storage validates the full image, writes/syncs BOTH copies and
