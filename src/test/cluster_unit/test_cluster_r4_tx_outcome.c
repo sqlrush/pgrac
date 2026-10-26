@@ -143,6 +143,8 @@ static ClusterCtrcTxnKeyV1 test_original_key;
 static int test_original_calls;
 static int test_original_drift;
 static bool test_candidate_copy_generation_drift;
+static void (*test_candidate_after_block0_copy)(uint64 root_id);
+static ClusterUndoBlock0Result test_candidate_copy_result;
 static bool test_candidate_root_drift;
 static uint32 test_tt_segment_seen;
 static uint16 test_tt_slot_seen;
@@ -850,6 +852,8 @@ cluster_undo_block0_current_copy_resident(
 	UndoSegmentHeaderData *header = (UndoSegmentHeaderData *)private_page;
 
 	test_candidate_block0_copy_calls++;
+	if (test_candidate_copy_result != CLUSTER_UNDO_BLOCK0_OK)
+		return test_candidate_copy_result;
 	UT_ASSERT(expected->known);
 	UT_ASSERT_EQ(expected->value, root->root_id == 91 ? test_candidate_data_generation
 													  : test_candidate_tt_generation);
@@ -858,6 +862,8 @@ cluster_undo_block0_current_copy_resident(
 		header->tt_slots[TEST_TT_OFFSET] = test_tt_slot;
 	if (test_candidate_copy_generation_drift)
 		test_candidate_tt_generation++;
+	if (test_candidate_after_block0_copy != NULL)
+		test_candidate_after_block0_copy(root->root_id);
 	return CLUSTER_UNDO_BLOCK0_OK;
 }
 
@@ -1368,6 +1374,8 @@ reset_exact_origin_fixture(void)
 	g_retained_origin_drift = 0;
 	memset(&g_retained_origin_key, 0, sizeof(g_retained_origin_key));
 	test_candidate_copy_generation_drift = false;
+	test_candidate_after_block0_copy = NULL;
+	test_candidate_copy_result = CLUSTER_UNDO_BLOCK0_OK;
 	test_candidate_root_drift = false;
 	test_tt_segment_seen = 0;
 	test_tt_slot_seen = 0;
@@ -7480,10 +7488,30 @@ UT_TEST(test_retained_slot_identity_does_not_escape_original_final_fences)
 	}
 }
 
+#include "test_cluster_r4_canonical_sampling.h"
+
 int
 main(void)
 {
-	UT_PLAN(206);
+	UT_PLAN(224);
+	UT_RUN(test_canonical_commit_resample_physical);
+	UT_RUN(test_canonical_commit_resample_owner_preserves_allocator_fence);
+	UT_RUN(test_canonical_commit_resample_same_segment);
+	UT_RUN(test_canonical_commit_resample_split_segment);
+	UT_RUN(test_canonical_commit_resample_keeps_terminal_census_mode);
+	UT_RUN(test_canonical_native_abort_does_not_resample);
+	UT_RUN(test_canonical_preabort_physical);
+	UT_RUN(test_canonical_preabort_owner);
+	UT_RUN(test_canonical_preabort_same_segment);
+	UT_RUN(test_canonical_preabort_split_segment);
+	UT_RUN(test_canonical_commit_resample_incomplete_is_bounded);
+	UT_RUN(test_canonical_commit_resample_preserves_identity_fences);
+	UT_RUN(test_canonical_commit_resample_excludes_subtrans);
+	UT_RUN(test_canonical_preabort_malformed_stays_unknown);
+	UT_RUN(test_canonical_preabort_does_not_grant_terminal_or_prepared_active);
+	UT_RUN(test_canonical_preabort_preserves_current_allocator_corroboration);
+	UT_RUN(test_canonical_preabort_rechecks_data_and_guard_exit);
+	UT_RUN(test_canonical_commit_resample_rechecks_data_and_guard_exit);
 	UT_RUN(test_original_full_xid_reaches_same_and_cross_segment_census_result);
 	UT_RUN(test_original_full_xid_missing_or_key_alias_keeps_verdict_without_identity);
 	UT_RUN(test_original_full_xid_not_queried_for_other_roles_or_abort);

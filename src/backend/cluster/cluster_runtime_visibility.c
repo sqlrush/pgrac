@@ -390,20 +390,30 @@ cluster_runtime_visibility_candidate_root_matches(const ClusterUndoBlock0Resolve
 		   && left->root_id == right->root_id && left->root_generation == right->root_generation;
 }
 
+static bool
+cluster_runtime_visibility_slot_is_preabort(const TTSlot *slot)
+{
+	return slot->status == TT_SLOT_ABORTED && slot->flags == TT_FLAGS_RESERVED
+		   && slot->commit_scn == InvalidScn && UBA_is_invalid(slot->first_undo_block);
+}
+
 static ClusterTxOutcome
 cluster_runtime_visibility_candidate_decide(const ClusterTxLocator *locator,
 											ClusterTxResolveMode mode, const TTSlot *exact_slot,
 											TransactionId *top_xid_out,
 											ClusterTxProofKind *proof_kind_out, SCN *commit_scn_out,
 											ClusterTxResolveReason *reason_out,
-											ClusterRuntimeVisibilityCanonicalDiagnostic *diagnostic)
+											ClusterRuntimeVisibilityCanonicalDiagnostic *diagnostic,
+											bool *current_commit_gap_out)
 {
 	XidStatus native_status;
 	TransactionId top_xid = locator->xid;
 	ClusterTxProofKind proof_kind = CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG;
 	SCN commit_scn = InvalidScn;
 	bool prepared = false;
+	bool direct_committed;
 
+	*current_commit_gap_out = false;
 	if (diagnostic != NULL) {
 		diagnostic->locator_xid = locator->xid;
 		diagnostic->locator_wrap = locator->tt_wrap;
@@ -426,6 +436,7 @@ cluster_runtime_visibility_candidate_decide(const ClusterTxLocator *locator,
 	}
 
 	native_status = cluster_runtime_visibility_direct_xid_status(locator->xid);
+	direct_committed = native_status == TRANSACTION_STATUS_COMMITTED;
 	if (diagnostic != NULL) {
 		diagnostic->native_sampled = true;
 		diagnostic->native_status = native_status;
@@ -482,6 +493,7 @@ cluster_runtime_visibility_candidate_decide(const ClusterTxLocator *locator,
 		}
 		if (exact_slot->status != TT_SLOT_COMMITTED || !SCN_VALID(exact_slot->commit_scn)) {
 			*reason_out = CLUSTER_TX_RESOLVE_COVERAGE_GAP;
+			*current_commit_gap_out = direct_committed;
 			return CLUSTER_TX_UNKNOWN;
 		}
 		commit_scn = exact_slot->commit_scn;
@@ -501,7 +513,8 @@ cluster_runtime_visibility_candidate_decide(const ClusterTxLocator *locator,
 		if (!prepared && mode == CLUSTER_TX_RESOLVE_VISIBILITY
 			&& (exact_slot->status == TT_SLOT_ACTIVE
 				|| (exact_slot->status == TT_SLOT_COMMITTED
-					&& SCN_VALID(exact_slot->commit_scn)))) {
+					&& SCN_VALID(exact_slot->commit_scn))
+				|| cluster_runtime_visibility_slot_is_preabort(exact_slot))) {
 			*top_xid_out = top_xid;
 			*proof_kind_out = proof_kind;
 			*commit_scn_out = InvalidScn;
@@ -513,6 +526,62 @@ cluster_runtime_visibility_candidate_decide(const ClusterTxLocator *locator,
 		diagnostic->first_failure = CLUSTER_RUNTIME_VISIBILITY_CANONICAL_FAILURE_NATIVE_OUTCOME;
 	*reason_out = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
 	return CLUSTER_TX_UNKNOWN;
+}
+
+/* A private ACTIVE copy can precede the native COMMITTED observation.  Copy
+ * once more under the same guard and generation; only a complete terminal
+ * successor can close that gap.  The caller still owns every final fence.
+ */
+static ClusterTxOutcome
+cluster_runtime_visibility_candidate_decide_current(
+	const ClusterTxLocator *locator, ClusterTxResolveMode mode, uint16 slot_offset,
+	ClusterUndoBlock0CurrentGuard *guard, const ClusterUndoBlock0ResolvedRoot *root,
+	const ClusterUndoBlock0Generation *generation, TTSlot *exact_slot,
+	TransactionId *top_xid_out, ClusterTxProofKind *proof_kind_out, SCN *commit_scn_out,
+	ClusterTxResolveReason *reason_out, ClusterRuntimeVisibilityCanonicalDiagnostic *diagnostic)
+{
+	ClusterUndoBlock0Generation observed = { false, 0 };
+	ClusterTxResolveReason reason;
+	ClusterTxOutcome outcome;
+	ClusterTxProofKind proof_kind = CLUSTER_TX_PROOF_NONE;
+	TransactionId top_xid = InvalidTransactionId;
+	SCN commit_scn = InvalidScn;
+	PGAlignedBlock block0;
+	TTSlot successor;
+	bool current_commit_gap = false;
+
+	outcome = cluster_runtime_visibility_candidate_decide(
+		locator, mode, exact_slot, top_xid_out, proof_kind_out, commit_scn_out, reason_out,
+		diagnostic, &current_commit_gap);
+	if (outcome != CLUSTER_TX_UNKNOWN || *reason_out != CLUSTER_TX_RESOLVE_COVERAGE_GAP
+		|| exact_slot->status != TT_SLOT_ACTIVE || exact_slot->commit_scn != InvalidScn
+		|| !current_commit_gap)
+		return outcome;
+
+	if (guard == NULL || root == NULL || generation == NULL || !generation->known
+		|| generation->value == UINT32_MAX || slot_offset >= TT_SLOTS_PER_SEGMENT
+		|| cluster_undo_block0_current_sample_generation(guard, root, &observed)
+			   != CLUSTER_UNDO_BLOCK0_OK
+		|| !observed.known || observed.value != generation->value
+		|| cluster_undo_block0_current_copy_resident(guard, root, generation, block0.data)
+			   != CLUSTER_UNDO_BLOCK0_OK)
+		return CLUSTER_TX_UNKNOWN;
+
+	successor = ((const UndoSegmentHeaderData *)block0.data)->tt_slots[slot_offset];
+	reason = *reason_out;
+	outcome = cluster_runtime_visibility_candidate_decide(
+		locator, mode, &successor, &top_xid, &proof_kind, &commit_scn, &reason, diagnostic,
+		&current_commit_gap);
+	if (outcome != CLUSTER_TX_COMMITTED) {
+		if (outcome == CLUSTER_TX_UNKNOWN)
+			*reason_out = reason;
+		return CLUSTER_TX_UNKNOWN;
+	}
+	*exact_slot = successor;
+	*top_xid_out = top_xid;
+	*proof_kind_out = proof_kind;
+	*commit_scn_out = commit_scn;
+	return outcome;
 }
 
 static bool
@@ -575,7 +644,8 @@ cluster_runtime_visibility_current_owner_slot_matches(const ClusterTTSlotCurrent
 	case CTS_ACTIVE:
 		return outcome == CLUSTER_TX_IN_PROGRESS
 			   && (slot->status == TT_SLOT_ACTIVE
-				   || (slot->status == TT_SLOT_COMMITTED && SCN_VALID(slot->commit_scn)))
+				   || (slot->status == TT_SLOT_COMMITTED && SCN_VALID(slot->commit_scn))
+				   || cluster_runtime_visibility_slot_is_preabort(slot))
 			   && commit_scn == InvalidScn;
 	case CTS_COMMITTED:
 		return outcome == CLUSTER_TX_COMMITTED && slot->status == TT_SLOT_COMMITTED
@@ -620,7 +690,8 @@ cluster_runtime_visibility_physical_locator_slot_matches(
 	case CLUSTER_TX_IN_PROGRESS:
 		return commit_scn == InvalidScn
 			   && (slot->status == TT_SLOT_ACTIVE
-				   || (slot->status == TT_SLOT_COMMITTED && SCN_VALID(slot->commit_scn)));
+				   || (slot->status == TT_SLOT_COMMITTED && SCN_VALID(slot->commit_scn))
+				   || cluster_runtime_visibility_slot_is_preabort(slot));
 	case CLUSTER_TX_COMMITTED:
 		return slot->status == TT_SLOT_COMMITTED && SCN_VALID(commit_scn)
 			   && commit_scn == slot->commit_scn;
@@ -724,9 +795,9 @@ cluster_runtime_visibility_physical_locator_sample_held(
 		locator->xid, locator->wrap, locator->segment_id, generation.value, locator->slot_offset,
 		root, &exact_slot, &top_xid, &proof_kind, &commit_scn, NULL);
 	if (outcome == CLUSTER_TX_UNKNOWN)
-		outcome = cluster_runtime_visibility_candidate_decide(
-			&tx_locator, CLUSTER_TX_RESOLVE_VISIBILITY, &exact_slot, &top_xid, &proof_kind,
-			&commit_scn, &reason, NULL);
+		outcome = cluster_runtime_visibility_candidate_decide_current(
+			&tx_locator, CLUSTER_TX_RESOLVE_VISIBILITY, locator->slot_offset, guard, root,
+			&generation, &exact_slot, &top_xid, &proof_kind, &commit_scn, &reason, NULL);
 	if (outcome == CLUSTER_TX_UNKNOWN || outcome == CLUSTER_TX_PREPARED || top_xid != locator->xid
 		|| !cluster_tx_outcome_proof_is_valid(outcome, proof_kind)
 		|| !cluster_runtime_visibility_physical_locator_slot_matches(locator, &exact_slot, outcome,
@@ -903,9 +974,9 @@ cluster_runtime_visibility_current_owner_sample_held_internal(
 	exact_slot = header->tt_slots[expected_owner->slot_offset];
 	locator.xid = xid;
 	locator.tt_wrap = expected_owner->wrap;
-	outcome = cluster_runtime_visibility_candidate_decide(&locator, CLUSTER_TX_RESOLVE_VISIBILITY,
-														  &exact_slot, &top_xid, &proof_kind,
-														  &commit_scn, &reason, NULL);
+	outcome = cluster_runtime_visibility_candidate_decide_current(
+		&locator, CLUSTER_TX_RESOLVE_VISIBILITY, expected_owner->slot_offset, guard, root,
+		&generation, &exact_slot, &top_xid, &proof_kind, &commit_scn, &reason, NULL);
 	if (outcome == CLUSTER_TX_UNKNOWN || outcome == CLUSTER_TX_PREPARED || top_xid != xid
 		|| !cluster_tx_outcome_proof_is_valid(outcome, proof_kind)
 		|| !cluster_runtime_visibility_current_owner_slot_matches(expected_owner, &exact_slot,
@@ -1814,11 +1885,13 @@ static ClusterTxOutcome
 cluster_runtime_visibility_origin_candidate_decide(
 	const ClusterTxLocator *locator, ClusterTxResolveMode mode, uint32 segment_id,
 	uint32 generation, uint16 slot_offset, const ClusterUndoBlock0ResolvedRoot *root,
-	const TTSlot *exact_slot, TransactionId *top_xid_out, ClusterTxProofKind *proof_kind_out,
+	ClusterUndoBlock0CurrentGuard *guard, TTSlot *exact_slot,
+	TransactionId *top_xid_out, ClusterTxProofKind *proof_kind_out,
 	SCN *commit_scn_out, ClusterTxResolveReason *reason_out,
 	ClusterRuntimeVisibilityCanonicalDiagnostic *diagnostic)
 {
 	ClusterTxOutcome outcome = CLUSTER_TX_UNKNOWN;
+	ClusterUndoBlock0Generation expected_generation = { true, generation };
 
 	if (uba_origin_node_id(locator->uba) == (NodeId)cluster_node_id)
 		outcome = cluster_runtime_visibility_terminal_lookup(
@@ -1826,9 +1899,9 @@ cluster_runtime_visibility_origin_candidate_decide(
 			top_xid_out, proof_kind_out, commit_scn_out, diagnostic);
 	if (outcome != CLUSTER_TX_UNKNOWN)
 		return outcome;
-	return cluster_runtime_visibility_candidate_decide(locator, mode, exact_slot, top_xid_out,
-													   proof_kind_out, commit_scn_out, reason_out,
-													   diagnostic);
+	return cluster_runtime_visibility_candidate_decide_current(
+		locator, mode, slot_offset, guard, root, &expected_generation, exact_slot, top_xid_out,
+		proof_kind_out, commit_scn_out, reason_out, diagnostic);
 }
 
 /* Called only once the continuation's DATA/TT identity checks have passed.
@@ -2276,7 +2349,7 @@ cluster_runtime_visibility_origin_plan_freeze_data_internal(
 	header = (const UndoSegmentHeaderData *)block0.data;
 	exact_slot = header->tt_slots[tt_slot_offset];
 	outcome = cluster_runtime_visibility_origin_candidate_decide(
-		&canonical_locator, mode, tt_segment_id, generation.value, tt_slot_offset, root,
+		&canonical_locator, mode, tt_segment_id, generation.value, tt_slot_offset, root, guard,
 		&exact_slot, &top_xid, &proof_kind, &commit_scn, &reason, NULL);
 	if (outcome == CLUSTER_TX_UNKNOWN
 		&& cluster_runtime_visibility_origin_recycled_abort_candidate(
@@ -2480,7 +2553,7 @@ cluster_runtime_visibility_origin_plan_sample_canonical_held(
 	exact_slot = header->tt_slots[plan_data->tt_slot_offset];
 	outcome = cluster_runtime_visibility_origin_candidate_decide(
 		&plan_data->canonical_locator, mode, plan_data->tt_logical.segment_id, generation.value,
-		plan_data->tt_slot_offset, root, &exact_slot, &top_xid, &proof_kind, &commit_scn, &reason,
+		plan_data->tt_slot_offset, root, guard, &exact_slot, &top_xid, &proof_kind, &commit_scn, &reason,
 		&plan_data->canonical_diagnostic);
 	if (outcome == CLUSTER_TX_UNKNOWN
 		&& cluster_runtime_visibility_origin_recycled_abort_candidate(

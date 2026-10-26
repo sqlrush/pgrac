@@ -7510,7 +7510,7 @@ test_cluster_undo_pending_product.o: test_cluster_undo_pending_product.c \
 		$(top_srcdir)/src/include/cluster/cluster_undo_record_api.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
-test_cluster_r4_tx_outcome: test_cluster_r4_tx_outcome.c unit_test.h \
+test_cluster_r4_tx_outcome: test_cluster_r4_tx_outcome.c test_cluster_r4_canonical_sampling.h unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_tx_resolve.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_record.h \
 		test_cluster_current_mx_local_sample.inc \
