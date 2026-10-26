@@ -37,7 +37,8 @@
  * PGRAC MODIFICATIONS
  *     Modified by: SqlRush <sqlrush@gmail.com>
  *
- *     Add original-origin recovery I/O and declared Startup CLOG inputs.
+ *     Add original-origin recovery I/O, declared Startup CLOG inputs and
+ *     the dormant FullXid page-birth producer.
  *     Spec: 2026-10-14-pre2-m5-e1-format-closure-v1.md
  *-------------------------------------------------------------------------
  */
@@ -1916,6 +1917,44 @@ ExtendCLOG(TransactionId newestXact)
 }
 
 
+/* A full page-generation birth is emitted only by the original native
+ * allocator's explicit entry. The ordinary raw entry above remains legacy;
+ * a caller's query or current epoch is never used to upgrade its records. */
+static bool
+clog_full_birth_valid(const xl_clog_zeropage_full *birth)
+{
+	TransactionId raw = (TransactionId)birth->first_full_xid;
+
+	return birth->reserved_zero == 0 && birth->pageno >= 0
+		&& TransactionIdIsNormal(raw)
+		&& (TransactionIdToPgIndex(raw) == 0 || raw == FirstNormalTransactionId)
+		&& TransactionIdToPage(raw) == birth->pageno;
+}
+
+void
+ExtendCLOGFull(FullTransactionId newestXact)
+{
+	TransactionId raw = XidFromFullTransactionId(newestXact);
+	xl_clog_zeropage_full birth = {0};
+
+	/* This is a production guard, including release builds. The original
+	 * caller supplies its actual candidate, not an inferred raw-xid era. */
+	if (!LWLockHeldByMeInMode(XidGenLock, LW_EXCLUSIVE) || !TransactionIdIsNormal(raw))
+		elog(ERROR, "full CLOG page birth requires the original native issuer");
+	if (TransactionIdToPgIndex(raw) != 0 && raw != FirstNormalTransactionId)
+		return;
+	birth.pageno = TransactionIdToPage(raw);
+	birth.first_full_xid = U64FromFullTransactionId(newestXact);
+
+	LWLockAcquire(XactSLRULock, LW_EXCLUSIVE);
+	ZeroCLOGPage(birth.pageno, false);
+	XLogBeginInsert();
+	XLogRegisterData((char *)&birth, sizeof(birth));
+	(void)XLogInsert(RM_CLOG_ID, CLOG_ZEROPAGE_FULL);
+	LWLockRelease(XactSLRULock);
+}
+
+
 /*
  * Remove all CLOG segments before the one holding the passed transaction ID
  *
@@ -2044,9 +2083,28 @@ clog_redo(XLogReaderState *record)
 	uint8		info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
 
 	/* Backup blocks are not used in clog records */
-	Assert(!XLogRecHasAnyBlockRefs(record));
+	Assert(info == CLOG_ZEROPAGE_FULL || !XLogRecHasAnyBlockRefs(record));
 
-	if (info == CLOG_ZEROPAGE)
+	if (info == CLOG_ZEROPAGE_FULL)
+	{
+		xl_clog_zeropage_full birth;
+		int slotno;
+
+		/* Check every FULL byte/geometry before touching native shared state.
+		 * Legacy WAL keeps its original independent branch below. */
+		if (XLogRecHasAnyBlockRefs(record) || XLogRecGetData(record) == NULL
+			|| XLogRecGetDataLen(record) != sizeof(birth))
+			elog(PANIC, "clog_redo: invalid full page birth record");
+		memcpy(&birth, XLogRecGetData(record), sizeof(birth));
+		if (!clog_full_birth_valid(&birth))
+			elog(PANIC, "clog_redo: invalid full page birth generation");
+		LWLockAcquire(XactSLRULock, LW_EXCLUSIVE);
+		slotno = ZeroCLOGPage(birth.pageno, false);
+		SimpleLruWritePage(XactCtl, slotno);
+		Assert(!XactCtl->shared->page_dirty[slotno]);
+		LWLockRelease(XactSLRULock);
+	}
+	else if (info == CLOG_ZEROPAGE)
 	{
 		int			pageno;
 		int			slotno;

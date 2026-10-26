@@ -129,7 +129,10 @@ typedef struct ClusterRecoveryNativeScan ClusterRecoveryNativeScan;
  * status, timestamp-validity, retention or deletion-completion proofs.
  * ZERO targets only the original source's physical namespace; TRUNCATE
  * retains a separate lifecycle obligation. No shared commit_ts replay is
- * enabled by this inspector, and no SUBTRANS parent relationship is inferred. */
+ * enabled by this inspector, and no SUBTRANS parent relationship is inferred.
+ * CLOG_ZEROPAGE_FULL is a distinct 16-byte native image: its actual first-normal
+ * FullXid names page initialization, not an issued transaction. Legacy ZERO
+ * remains raw-only. Neither shape supplies held lifetime or terminal rights. */
 
 /* RELMAP_UPDATE retains the entire native image (including inactive slots);
  * RELMAP_ENTRY exposes each active original mapping with its exact ordinal.

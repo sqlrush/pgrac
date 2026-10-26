@@ -167,3 +167,71 @@ UT_TEST(test_native_slru_full_recheck_after_drain_is_sticky)
 		cluster_recovery_native_scan_destroy(scan);
 	}
 }
+
+/* The full first-normal value identifies a physical page generation only.
+ * Keep the complete source and bytes; do not relabel legacy raw ZERO. */
+UT_TEST(test_native_clog_full_birth_retains_exact_generation)
+{
+	const uint64 first[] = {3, (UINT64_C(1) << 32) | 3,
+		(UINT64_C(7) << 32) | (127 * CLUSTER_NATIVE_CLOG_PER_PAGE),
+		(UINT64_C(0xFFFFFFFF) << 32) | (UINT32_MAX & ~(CLUSTER_NATIVE_CLOG_PER_PAGE - 1))};
+	for (unsigned i = 0; i < lengthof(first); ++i) {
+		ClusterRecoveryNativeScan *scan = NULL;
+		ClusterRecoveryNativeEffect effect;
+		xl_clog_zeropage_full image = {(TransactionId)first[i] / CLUSTER_NATIVE_CLOG_PER_PAGE,
+			0, first[i]}, copy;
+		fixture(RM_CLOG_ID, CLOG_ZEROPAGE_FULL);
+		append(&image, sizeof(image));
+		UT_ASSERT_EQ(begin(&scan), CLUSTER_RECOVERY_NATIVE_MORE);
+		if (scan == NULL) continue;
+		UT_ASSERT_EQ(cluster_recovery_native_scan_next(scan, &effect), CLUSTER_RECOVERY_NATIVE_EFFECT);
+		UT_ASSERT_EQ(effect.kind, CLUSTER_RECOVERY_NATIVE_CLOG_ZERO);
+		UT_ASSERT_EQ(effect.length, sizeof(image));
+		memcpy(&copy, effect.bytes, sizeof(copy));
+		UT_ASSERT_EQ(memcmp(&image, &copy, sizeof(image)), 0);
+		UT_ASSERT_EQ(memcmp(&effect.record->source, &source, sizeof(source)), 0);
+		UT_ASSERT_EQ(effect.record->header.xl_info, CLOG_ZEROPAGE_FULL);
+		UT_ASSERT_EQ(effect.record->top_xid, 0);
+		UT_ASSERT_EQ(cluster_recovery_native_scan_next(scan, &effect), CLUSTER_RECOVERY_NATIVE_END);
+		cluster_recovery_native_scan_destroy(scan);
+	}
+}
+
+UT_TEST(test_native_clog_full_birth_rejects_bad_generation_shapes)
+{
+	for (unsigned fault = 0; fault < 10; ++fault) {
+		ClusterRecoveryNativeScan *scan = NULL;
+		xl_clog_zeropage_full image = {1, 0, (UINT64_C(7) << 32) | CLUSTER_NATIVE_CLOG_PER_PAGE};
+		fixture(RM_CLOG_ID, CLOG_ZEROPAGE_FULL);
+		if (fault == 0) image.reserved_zero = 1;
+		if (fault == 1) image.pageno = -1;
+		if (fault == 2) image.pageno = 2;
+		if (fault == 3) image.first_full_xid++;
+		if (fault == 4) image.first_full_xid = (UINT64_C(7) << 32) | FrozenTransactionId;
+		if (fault == 5) {image.pageno = 0; image.first_full_xid = UINT64_C(7) << 32;}
+		append(&image, sizeof(image));
+		if (fault == 6) decoded.main_data_len--;
+		if (fault == 7) decoded.main_data_len++;
+		if (fault == 8) decoded.header.xl_info = CLOG_ZEROPAGE;
+		if (fault == 9) decoded.header.xl_rmid = RM_COMMIT_TS_ID;
+		UT_ASSERT(begin(&scan) != CLUSTER_RECOVERY_NATIVE_MORE);
+		UT_ASSERT(scan == NULL);
+	}
+}
+
+UT_TEST(test_native_clog_full_birth_recheck_cannot_rebase)
+{
+	ClusterRecoveryNativeScan *scan = NULL;
+	ClusterRecoveryNativeEffect effect;
+	xl_clog_zeropage_full image = {1, 0, (UINT64_C(7) << 32) | CLUSTER_NATIVE_CLOG_PER_PAGE};
+	fixture(RM_CLOG_ID, CLOG_ZEROPAGE_FULL);
+	append(&image, sizeof(image));
+	UT_ASSERT_EQ(begin(&scan), CLUSTER_RECOVERY_NATIVE_MORE);
+	if (scan == NULL) return;
+	image.first_full_xid += UINT64_C(1) << 32;
+	memcpy(payload.bytes, &image, sizeof(image));
+	UT_ASSERT_NE(cluster_recovery_native_scan_recheck(scan, &reader, &source, &cut),
+		CLUSTER_RECOVERY_NATIVE_UNCHANGED);
+	UT_ASSERT_NE(cluster_recovery_native_scan_next(scan, &effect), CLUSTER_RECOVERY_NATIVE_EFFECT);
+	cluster_recovery_native_scan_destroy(scan);
+}
