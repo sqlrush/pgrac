@@ -1122,6 +1122,17 @@ check_cluster_shared_catalog(bool *newval, void **extra, GucSource source)
 }
 
 static bool
+check_cluster_undo_cleaner_enabled(bool *newval, void **extra, GucSource source)
+{
+	if (!*newval && cluster_shared_config) {
+		GUC_check_errcode(ERRCODE_INVALID_PARAMETER_VALUE);
+		GUC_check_errdetail("shared configuration requires cluster.undo_cleaner_enabled=on");
+		return false;
+	}
+	return true;
+}
+
+static bool
 check_cluster_shared_data_dir(char **newval, void **extra, GucSource source)
 {
 	if (*newval != NULL && (*newval)[0] != '\0' && !is_absolute_path(*newval)) {
@@ -2392,11 +2403,26 @@ cluster_init_guc(void)
 		"cluster.storage_quorum_cluster", gettext_noop("Expected Corosync storage cluster name."),
 		NULL, &cluster_storage_quorum_cluster, "", PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
+	/* Preserve a requested off value until both startup placeholders have
+	 * been converted. Rejecting it during conversion would only warn and
+	 * silently retain the cleaner's on default. */
+	DefineCustomBoolVariable(
+		"cluster.undo_cleaner_enabled",
+		gettext_noop("Enable proactive undo/TT-slot retention GC passes."),
+		gettext_noop("Must be on with cluster.shared_config. Outside shared configuration, "
+					 "off keeps the process resident but disables cleaner passes."),
+		&cluster_undo_cleaner_enabled, true, PGC_SIGHUP, 0, check_cluster_undo_cleaner_enabled,
+		NULL, NULL);
 	DefineCustomBoolVariable(
 		"cluster.shared_config", gettext_noop("Use the shared root-v2 configuration profile."),
 		gettext_noop("Requires a fully qualified root-v2 migration and startup path. "
 					 "The incomplete profile is rejected before legacy control migration."),
 		&cluster_shared_config, false, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+	if (cluster_shared_config && !cluster_undo_cleaner_enabled)
+		ereport(FATAL,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("shared configuration requires cluster.undo_cleaner_enabled=on"),
+				 errhint("Enable the cleaner in the shared COMMON configuration before startup.")));
 
 	/*
 	 * cluster.shared_storage_uuid -- optional external-preset identity for
@@ -3405,12 +3431,6 @@ cluster_init_guc(void)
 										 "(spec-3.13). 0 = pressure-wakeup only."),
 							&cluster_undo_cleaner_interval_ms, 30000, 0, 3600000, PGC_SIGHUP, 0,
 							NULL, NULL, NULL);
-	DefineCustomBoolVariable(
-		"cluster.undo_cleaner_enabled",
-		gettext_noop("Enable proactive undo/TT-slot retention GC passes."),
-		gettext_noop("off = the Undo Cleaner process stays resident but each pass no-ops, "
-					 "reverting to spec-3.12 lazy-only recycling."),
-		&cluster_undo_cleaner_enabled, true, PGC_SIGHUP, 0, NULL, NULL, NULL);
 	DefineCustomIntVariable(
 		"cluster.undo_cleaner_batch_segments",
 		gettext_noop("Max own-instance undo segments scanned per cleaner pass."),

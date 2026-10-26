@@ -105,6 +105,10 @@ static const char *visibility_trace_boot;
 static GucContext visibility_trace_context = PGC_INTERNAL;
 static GucStringCheckHook visibility_trace_check;
 static GucStringAssignHook visibility_trace_assign;
+static bool *undo_cleaner_value_addr;
+static bool undo_cleaner_boot_value;
+static GucContext undo_cleaner_context;
+static GucBoolCheckHook undo_cleaner_check_hook;
 
 static int *undo_buffers_value_addr = NULL;
 static int undo_buffers_boot_value = -1;
@@ -277,6 +281,12 @@ DefineCustomBoolVariable(const char *name, const char *short_desc pg_attribute_u
 		smart_fusion_value_addr = valueAddr;
 		smart_fusion_boot_value = bootValue;
 		smart_fusion_context = context;
+	}
+	if (strcmp(name, "cluster.undo_cleaner_enabled") == 0) {
+		undo_cleaner_value_addr = valueAddr;
+		undo_cleaner_boot_value = bootValue;
+		undo_cleaner_context = context;
+		undo_cleaner_check_hook = check_hook;
 	}
 	if (strcmp(name, "cluster.trace_normal_stop") == 0) {
 		normal_stop_trace_value_addr = valueAddr;
@@ -826,6 +836,50 @@ UT_TEST(test_shared_catalog_requires_durable_checkpoint_publication)
 	cluster_shared_catalog = false;
 }
 
+UT_TEST(test_shared_cleaner_cannot_be_disabled)
+{
+	bool enabled = true;
+	bool disabled = false;
+	void *extra = NULL;
+
+	cluster_init_guc();
+	UT_ASSERT(undo_cleaner_value_addr == &cluster_undo_cleaner_enabled);
+	UT_ASSERT(undo_cleaner_boot_value);
+	UT_ASSERT_EQ(undo_cleaner_context, PGC_SIGHUP);
+	UT_ASSERT_NOT_NULL(undo_cleaner_check_hook);
+	if (undo_cleaner_check_hook != NULL) {
+		cluster_shared_config = false;
+		UT_ASSERT(undo_cleaner_check_hook(&disabled, &extra, PGC_S_FILE));
+		cluster_shared_config = true;
+		last_guc_check_errcode = 0;
+		UT_ASSERT(!undo_cleaner_check_hook(&disabled, &extra, PGC_S_FILE));
+		UT_ASSERT_EQ(last_guc_check_errcode, ERRCODE_INVALID_PARAMETER_VALUE);
+		UT_ASSERT(!disabled);
+		UT_ASSERT(undo_cleaner_check_hook(&enabled, &extra, PGC_S_FILE));
+		UT_ASSERT(enabled);
+		cluster_shared_config = false;
+	}
+}
+
+UT_TEST(test_shared_cleaner_startup_checks_final_values)
+{
+	cluster_shared_config = true;
+	cluster_undo_cleaner_enabled = false;
+	last_reported_level = 0;
+	expect_fatal = true;
+	if (sigsetjmp(expected_fatal_jmp, 1) == 0) {
+		cluster_init_guc();
+		UT_ASSERT(false);
+	}
+	expect_fatal = false;
+	UT_ASSERT_EQ(last_reported_level, FATAL);
+	cluster_shared_config = false;
+	last_reported_level = 0;
+	cluster_init_guc();
+	UT_ASSERT_EQ(last_reported_level, 0);
+	cluster_undo_cleaner_enabled = true;
+}
+
 UT_TEST(test_catalog_trace_is_off_and_superuser_scoped)
 {
 	cluster_init_guc();
@@ -887,9 +941,9 @@ int
 main(void)
 {
 #ifdef ENABLE_INJECTION
-	UT_PLAN(17);
+	UT_PLAN(19);
 #else
-	UT_PLAN(16);
+	UT_PLAN(18);
 #endif
 	UT_RUN(test_terminal_writer_chaining_defaults_on);
 	UT_RUN(test_terminal_writer_chaining_registration_defaults_on);
@@ -906,6 +960,8 @@ main(void)
 	UT_RUN(test_cold_plan_memory_guc_bounds_and_startup_owner);
 	UT_RUN(test_shared_catalog_requires_wal_for_new_files);
 	UT_RUN(test_shared_catalog_requires_durable_checkpoint_publication);
+	UT_RUN(test_shared_cleaner_cannot_be_disabled);
+	UT_RUN(test_shared_cleaner_startup_checks_final_values);
 	UT_RUN(test_normal_stop_trace_is_default_off_and_reloadable);
 #ifdef ENABLE_INJECTION
 	UT_RUN(test_pcm_x_retain_flush_error_target_guc_contract);

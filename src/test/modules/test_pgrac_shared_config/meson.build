@@ -23,5 +23,6 @@ tests += {
                     't/017_selection_memory.pl', 't/018_native_delivery.pl',
                     't/023_transaction_delivery.pl', 't/025_common_use.pl',
                     't/031_shared_alter_system.pl', 't/032_shared_index_scope.pl',
+                    't/035_undo_cleaner_policy.pl',
                     't/101_storage_sync_error.pl']},
 }
