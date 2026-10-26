@@ -68,6 +68,7 @@
 #include "cluster/cluster_undo_cleaner.h"
 #include "cluster/cluster_undo_horizon.h"
 #include "cluster/cluster_undo_record.h"
+#include "cluster/cluster_undo_record_api.h"
 #include "cluster/cluster_undo_retention.h"
 #include "cluster/storage/cluster_undo_block0.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
@@ -4772,7 +4773,7 @@ cluster_ctrc_origin_next_close_dispatch_shared(ClusterCtrcCloseDispatch *dispatc
 static bool
 ctrc_cleaner_terminal_sample_mode(const ClusterCtrcTxnKeyV1 *key, bool capacity_probe,
 								  ClusterCtrcTerminalStatus *status_out, SCN *commit_scn_out,
-								  bool *released_out)
+								  bool *released_out, PGAlignedBlock *header_out)
 {
 	ClusterSemanticAdmissionToken admission;
 	ClusterUndoBlock0LogicalKey logical;
@@ -4802,6 +4803,8 @@ ctrc_cleaner_terminal_sample_mode(const ClusterCtrcTxnKeyV1 *key, bool capacity_
 		*commit_scn_out = InvalidScn;
 	if (released_out != NULL)
 		*released_out = false;
+	if (header_out != NULL)
+		MemSet(header_out, 0, sizeof(*header_out));
 
 	MemSet(&admission, 0, sizeof(admission));
 	MemSet(&logical, 0, sizeof(logical));
@@ -4927,6 +4930,8 @@ ctrc_cleaner_terminal_sample_mode(const ClusterCtrcTxnKeyV1 *key, bool capacity_
 		*commit_scn_out = slot.status == TT_SLOT_COMMITTED ? slot.commit_scn : InvalidScn;
 	if (terminal && released_out != NULL)
 		*released_out = slot.flags == TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+	if (terminal && header_out != NULL)
+		memcpy(header_out, &page, sizeof(page));
 	return terminal;
 }
 
@@ -4936,7 +4941,7 @@ ctrc_cleaner_terminal_sample_exact(const ClusterCtrcTxnKeyV1 *key,
 {
 	/* The seal consumer retains its flags-zero contract. Capacity sampling
 	 * cannot broaden any release/certificate producer's acceptance set. */
-	return ctrc_cleaner_terminal_sample_mode(key, false, status_out, commit_scn_out, NULL);
+	return ctrc_cleaner_terminal_sample_mode(key, false, status_out, commit_scn_out, NULL, NULL);
 }
 
 /* Validate only the original local CURRENT scope, never slot availability. */
@@ -5008,8 +5013,8 @@ ctrc_capacity_current_gc_candidate(uint32 segment_id, uint16 slot_offset, SCN ho
 				: owner.commit_scn != InvalidScn)
 		|| !ctrc_origin_index(&key, &index) || !ctrc_capacity_origin_absent(index))
 		return CLUSTER_CTRC_CAPACITY_REFUSE;
-	if (!ctrc_cleaner_terminal_sample_mode(&key, true, &status, &commit_scn, &released) || !released
-		|| commit_scn != owner.commit_scn
+	if (!ctrc_cleaner_terminal_sample_mode(&key, true, &status, &commit_scn, &released, NULL)
+		|| !released || commit_scn != owner.commit_scn
 		|| status
 			   != (owner.status == CTS_COMMITTED ? CTRC_TERMINAL_COMMITTED : CTRC_TERMINAL_ABORTED))
 		return CLUSTER_CTRC_CAPACITY_REFUSE;
@@ -5073,7 +5078,7 @@ cluster_ctrc_capacity_probe_current(uint32 segment_id, SCN horizon, uint64 epoch
 			}
 			key = snapshot.origin.key;
 		}
-		if (!ctrc_cleaner_terminal_sample_mode(&key, true, &status, &commit_scn, &released)
+		if (!ctrc_cleaner_terminal_sample_mode(&key, true, &status, &commit_scn, &released, NULL)
 			|| (status == CTRC_TERMINAL_COMMITTED && scn_time_cmp(commit_scn, horizon) > 0))
 			continue;
 	capacity_sampled:
@@ -5103,7 +5108,8 @@ cluster_ctrc_capacity_probe_current(uint32 segment_id, SCN horizon, uint64 epoch
 				/* Completion after SCUR release can remove CERTIFYING. Reprove
 				 * once against the exact durable flag; absence alone cannot
 				 * authorize waiting, and a failed second proof is not retried. */
-				if (!ctrc_cleaner_terminal_sample_mode(&key, true, &status, &commit_scn, &released)
+				if (!ctrc_cleaner_terminal_sample_mode(&key, true, &status, &commit_scn, &released,
+													   NULL)
 					|| !released
 					|| (status == CTRC_TERMINAL_COMMITTED && scn_time_cmp(commit_scn, horizon) > 0))
 					goto refuse;
@@ -5238,7 +5244,7 @@ ctrc_capacity_phase_supported(uint8 phase)
 
 /* Caller holds origin_lock. The key is a hint, never a saved phase or proof. */
 static bool
-ctrc_capacity_hint_locked(uint64 epoch, const ClusterCtrcTxnKeyV1 *hint,
+ctrc_capacity_hint_locked(uint64 epoch, uint32 current_segment, const ClusterCtrcTxnKeyV1 *hint,
 						  CtrcCapacityCandidate *candidate, bool *recheck)
 {
 	const ClusterCtrcOriginEntry *origin;
@@ -5250,7 +5256,13 @@ ctrc_capacity_hint_locked(uint64 epoch, const ClusterCtrcTxnKeyV1 *hint,
 	origin = &ctrc_origin_entries()[index];
 	if (memcmp(&origin->key, hint, sizeof(*hint)) != 0) {
 		*recheck = true;
-		return false;
+		if (hint->segment_id == current_segment || !ctrc_bytes_zero(origin, sizeof(*origin)))
+			return false;
+		candidate->index = index;
+		candidate->seal_generation = 0;
+		candidate->key = *hint;
+		candidate->phase = CTRC_ORIGIN_EMPTY;
+		return true;
 	}
 	if (!ctrc_capacity_phase_supported(origin->state))
 		return false;
@@ -5264,7 +5276,7 @@ ctrc_capacity_hint_locked(uint64 epoch, const ClusterCtrcTxnKeyV1 *hint,
 /* Inventory only: no origin mutation, physical read or cached authority.
  * Advance the original cursor without enlarging a cleaner action batch. */
 static unsigned
-ctrc_capacity_pool_candidates(uint64 epoch, const ClusterCtrcTxnKeyV1 *hint,
+ctrc_capacity_pool_candidates(uint64 epoch, uint32 current_segment, const ClusterCtrcTxnKeyV1 *hint,
 							  CtrcCapacityCandidate *candidates,
 							  ClusterCapacityObservationV1 *observation, bool *recheck)
 {
@@ -5276,7 +5288,7 @@ ctrc_capacity_pool_candidates(uint64 epoch, const ClusterCtrcTxnKeyV1 *hint,
 
 	CHECK_FOR_INTERRUPTS();
 	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
-	have_preferred = ctrc_capacity_hint_locked(epoch, hint, &preferred, recheck);
+	have_preferred = ctrc_capacity_hint_locked(epoch, current_segment, hint, &preferred, recheck);
 	if (have_preferred)
 		ordinary_limit--;
 	for (uint64 visited = 0; visited < CtrcShared->origin_key_entries; visited++) {
@@ -5325,10 +5337,68 @@ ctrc_capacity_pool_candidates(uint64 epoch, const ClusterCtrcTxnKeyV1 *hint,
 	return count;
 }
 
+/* Original optional whole-GC work belongs to coordinator zero, outside the
+ * record cursor. A READY CTRC shard alone does not prove that GC may run. */
+static bool
+ctrc_capacity_pool_gc_context(uint32 segment_id, uint32 *record_segment)
+{
+	uint32 first = (uint32)cluster_node_id * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+
+	if (!cluster_undo_cleaner_enabled || !cluster_undo_retention_horizon_enabled
+		|| cluster_normal_stop_maintenance_cut())
+		return false;
+	*record_segment = cluster_undo_record_active_segment_id();
+	return *record_segment >= first && *record_segment - first < CLUSTER_UNDO_SEGS_PER_INSTANCE
+		   && *record_segment != segment_id;
+}
+
+/* An already-held old key can outlive its original publisher row. Reprove
+ * whole-segment GC with that same key and the same single physical sample;
+ * one released slot never proves that the segment is recyclable. */
+static ClusterCapacityReasonV1
+ctrc_capacity_pool_gc_candidate(const CtrcCapacityCandidate *candidate, SCN horizon,
+								ClusterCapacityObservationV1 *observation)
+{
+	PGAlignedBlock page;
+	const UndoSegmentHeaderData *header = (const UndoSegmentHeaderData *)page.data;
+	uint32 record_segment, final_record;
+	uint64 coordinator, worker, final_coordinator, final_worker;
+	bool released;
+
+	if (!ctrc_capacity_origin_absent(candidate->index))
+		return CLUSTER_CAPACITY_SUPPLY_RECHECK;
+	if (!ctrc_capacity_pool_gc_context(candidate->key.segment_id, &record_segment)
+		|| !cluster_undo_cleaner_capacity_owner_snapshot(observation->owner_worker, &coordinator,
+														 &worker)) {
+		observation->unproven_reasons |= CLUSTER_CAPACITY_UNPROVEN_OWNER;
+		return CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER;
+	}
+	if (!ctrc_cleaner_terminal_sample_mode(&candidate->key, true, NULL, NULL, &released, &page)
+		|| !released || !cluster_undo_segment_recyclable_for_mode(header, horizon, true)
+		|| !cluster_ctrc_reuse_handoff_complete(header, INVALID_TT_SLOT_OFFSET)) {
+		observation->unproven_reasons |= CLUSTER_CAPACITY_UNPROVEN_CANONICAL;
+		return CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER;
+	}
+	if (!ctrc_capacity_origin_absent(candidate->index)
+		|| !ctrc_capacity_pool_gc_context(candidate->key.segment_id, &final_record)
+		|| record_segment != final_record)
+		return CLUSTER_CAPACITY_SUPPLY_RECHECK;
+	if (!cluster_undo_cleaner_capacity_owner_snapshot(observation->owner_worker, &final_coordinator,
+													  &final_worker)) {
+		observation->unproven_reasons |= CLUSTER_CAPACITY_UNPROVEN_OWNER;
+		return CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER;
+	}
+	if (coordinator != final_coordinator || worker != final_worker)
+		return CLUSTER_CAPACITY_SUPPLY_RECHECK;
+	observation->coordinator_generation = coordinator;
+	observation->owner_generation = worker;
+	return CLUSTER_CAPACITY_OWNER_PROGRESS_POSSIBLE;
+}
+
 /* Rebuild the original phase prerequisites around a canonical/native sample.
  * The caller has completed the inventory and holds no CTRC lock. */
 static ClusterCapacityReasonV1
-ctrc_capacity_candidate_probe(const CtrcCapacityCandidate *candidate,
+ctrc_capacity_candidate_probe(const CtrcCapacityCandidate *candidate, SCN horizon,
 							  ClusterCapacityObservationV1 *observation)
 {
 	ClusterCtrcOriginCertificateSnapshot snapshot;
@@ -5345,6 +5415,8 @@ ctrc_capacity_candidate_probe(const CtrcCapacityCandidate *candidate,
 	observation->phase = candidate->phase;
 	observation->owner_worker = worker;
 	observation->coordinator_generation = observation->owner_generation = 0;
+	if (candidate->phase == CTRC_ORIGIN_EMPTY)
+		return ctrc_capacity_pool_gc_candidate(candidate, horizon, observation);
 	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
 	origin = &ctrc_origin_entries()[candidate->index];
 	same_identity = origin->state == candidate->phase
@@ -5370,7 +5442,7 @@ ctrc_capacity_candidate_probe(const CtrcCapacityCandidate *candidate,
 										   candidate->phase != CTRC_ORIGIN_OPEN
 											   && snapshot.origin.ack_bitmap
 													  == snapshot.origin.touched_bitmap,
-										   NULL, NULL, &released)
+										   NULL, NULL, &released, NULL)
 		|| (candidate->phase == CTRC_ORIGIN_RELEASE_PROVEN && !released)) {
 		observation->unproven_reasons |= CLUSTER_CAPACITY_UNPROVEN_CANONICAL;
 		return CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER;
@@ -5456,7 +5528,8 @@ cluster_ctrc_capacity_probe_pool_continuation_v1(uint32 current_segment, SCN hor
 		return observation->reason;
 	}
 	observation->unproven_reasons = 0;
-	count = ctrc_capacity_pool_candidates(epoch, hint, candidates, observation, &recheck);
+	count = ctrc_capacity_pool_candidates(epoch, current_segment, hint, candidates, observation,
+										  &recheck);
 	for (unsigned i = 0; i < count; i++) {
 		ClusterCapacityReasonV1 reason;
 
@@ -5464,7 +5537,7 @@ cluster_ctrc_capacity_probe_pool_continuation_v1(uint32 current_segment, SCN hor
 		observation->scope = candidates[i].key.segment_id == current_segment
 								 ? CLUSTER_CAPACITY_SCOPE_SLOT
 								 : CLUSTER_CAPACITY_SCOPE_SEGMENT;
-		reason = ctrc_capacity_candidate_probe(&candidates[i], observation);
+		reason = ctrc_capacity_candidate_probe(&candidates[i], horizon, observation);
 		if (reason == CLUSTER_CAPACITY_OWNER_PROGRESS_POSSIBLE) {
 			observation->reason = reason;
 			return ctrc_capacity_pool_finish(current_segment, epoch, false, observation);

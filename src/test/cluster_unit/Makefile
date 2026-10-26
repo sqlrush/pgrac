@@ -9978,8 +9978,10 @@ test_cluster_ctrc_itl_reuse test_cluster_ctrc_successor_fence: test_cluster_ctrc
 
 test_cluster_ctrc_capacity: test_cluster_ctrc_capacity.c test_cluster_ctrc_cleaner.c test_cluster_ctrc_run_pass.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
-		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h unit_test.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h unit_test.h $(CLUSTER_UNDO_RETENTION_O) \
+		$(top_srcdir)/src/include/cluster/cluster_undo_record_api.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_retention.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< $(CLUSTER_UNDO_RETENTION_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) \
 		$(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
