@@ -85,6 +85,7 @@
 #include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_tt_status.h"
 #include "cluster/cluster_tt_local.h"		/* PGRAC: spec-4.5a G4 peek binding wrap */
+#include "cluster/cluster_tt_durable.h"
 #include "cluster/cluster_recovery_merge.h" /* PGRAC: spec-4.5a is_materialized */
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_shmem.h"
@@ -5879,5 +5880,286 @@ cluster_undo_record_stage_savepoint_pending(ClusterUndoSavepointControl *control
 		cluster_semantic_activation_leave(&admission);
 	}
 	PG_END_TRY();
+	return complete;
+}
+
+/* Execution-local inputs for the original owners, not a second TT service
+ * or a retention/rollback authority. No pointer escapes this call. */
+typedef struct UndoSavepointHeadPublish {
+	ClusterUndoSavepointControl *control;
+	ClusterUndoSavepointBounds bounds;
+	UBA expected_tt_head;
+	xl_undo_tt_slot_set_head_operation request;
+	const ClusterSemanticAdmissionToken *admission;
+	PGPROC *proc;
+	LocalTransactionId lxid;
+	int local_head_idx;
+	XLogRecPtr chain_lsn;
+} UndoSavepointHeadPublish;
+
+static bool
+undo_savepoint_head_request(UndoSavepointHeadPublish *stage)
+{
+	const ClusterUndoSavepointControl *control = stage->control;
+	const ClusterSavepointOperation *operation = &control->operation;
+	char reserved[UNDO_REC_SAVEPOINT_ROLLBACK_TOTAL_LEN];
+	xl_undo_tt_slot_set_head_operation *request = &stage->request;
+
+	if (!undo_savepoint_control_encode(control, 1, reserved))
+		return false;
+	memset(request, 0, sizeof(*request));
+	request->head.segment_id = operation->top.segment_id;
+	request->head.slot_offset = operation->top.slot_offset;
+	request->head.wrap = operation->top.slot_wrap;
+	request->head.xid = operation->top.xid;
+	request->head.instance = operation->top.origin_instance;
+	request->head._pad[0] = CLUSTER_UNDO_TT_SET_HEAD_OPERATION_FLAG;
+	request->head.first_undo_block = control->uba;
+	memcpy(&request->operation,
+		   reserved + sizeof(UndoRecordHeader) + UNDO_SAVEPOINT_ROLLBACK_LENGTH,
+		   sizeof(request->operation));
+	return cluster_undo_head_operation_valid(request);
+}
+
+static bool
+undo_savepoint_head_recheck(const UndoSavepointHeadPublish *stage)
+{
+	return MyProc == stage->proc && MyProc != NULL && MyProc->lxid == stage->lxid
+		   && undo_savepoint_pending_inputs(stage->control, &stage->bounds)
+		   && stage->local_head_idx
+				  == cluster_undo_local_head_find(stage->control->operation.top.segment_id,
+												  stage->control->operation.top.slot_offset)
+		   && cluster_semantic_activation_modifier_recheck(stage->admission, true);
+}
+
+/* Disposition is deliberately not a visibility decision here. A discarded
+ * DATA record or old COMPLETE control remains part of the retained chain. */
+static bool
+undo_savepoint_chain_payload(const UndoSavepointHeadPublish *stage, UBA address,
+							 const UndoRecordHeader *member, const char *payload)
+{
+	const xl_undo_tt_slot_set_head_operation *request = &stage->request;
+	UndoOperationTrailer operation;
+	UndoSavepointRollbackPayload body;
+	UndoItlHistoryTrailer history;
+	uint16 body_length;
+
+	if (member->record_type == UNDO_RECORD_SAVEPOINT_ROLLBACK) {
+		xl_undo_tt_slot_set_head_operation present = *request;
+
+		if (!cluster_undo_record_decode_rollback_payload(member, payload, member->payload_length,
+														 &body, &operation))
+			return false;
+		present.head.first_undo_block = address;
+		present.operation = operation;
+		if (!cluster_undo_head_operation_matches_control(&present, member, payload,
+														 member->payload_length))
+			return false;
+	} else if ((member->flags & UNDO_REC_FLAG_HAS_OPERATION) != 0) {
+		if (!cluster_undo_record_decode_operation_payload(member, payload, member->payload_length,
+														  &body_length, &history, &operation))
+			return false;
+	} else
+		return member->xid == request->head.xid
+			   && cluster_undo_record_decode_payload(member, payload, member->payload_length,
+													 &body_length, &history);
+	return operation.canonical_top_fxid == request->operation.canonical_top_fxid
+		   && operation.canonical_segment_generation
+				  == request->operation.canonical_segment_generation
+		   && operation.operation_sequence != request->operation.operation_sequence;
+}
+
+static bool
+undo_savepoint_chain_member(UndoSavepointHeadPublish *stage, UBA address, const char image[BLCKSZ],
+							uint16 row, UBA *previous)
+{
+	const UndoBlockHeader *block = (const UndoBlockHeader *)image;
+	const xl_undo_tt_slot_set_head *owner = &stage->request.head;
+	const UndoSlotDirEntry *slot;
+	UndoRecordHeader member;
+
+	if (block->magic != PGRAC_UNDO_BLOCK_MAGIC || block->block_version != UNDO_BLOCK_VERSION_1
+		|| XLogRecPtrIsInvalid(block->block_lsn)
+		|| !cluster_undo_record_slot_index_valid(block->slot_count, row))
+		return false;
+	slot = UNDO_SLOT_DIR_PTR(image, row);
+	if (!cluster_undo_record_slot_range_valid(block->slot_count, row, slot->record_offset,
+											  slot->record_length)
+		|| slot->record_length < sizeof(member)
+		|| (uint64)slot->record_offset + slot->record_length > block->free_offset
+		|| block->free_offset > BLCKSZ - (uint32)block->slot_count * sizeof(*slot))
+		return false;
+	memcpy(&member, image + slot->record_offset, sizeof(member));
+	if (slot->record_type != member.record_type || slot->flags != member.flags
+		|| member.payload_length != slot->record_length - sizeof(member)
+		|| member.origin_node_id != owner->instance - 1
+		|| member.tt_slot_segment_id != owner->segment_id
+		|| member.tt_slot_id != (uint32)owner->slot_offset + 1
+		|| member.tt_wrap_plus1 != (uint32)owner->wrap + 1 || !TransactionIdIsNormal(member.xid)
+		|| !SCN_VALID(member.write_scn)
+		|| !cluster_undo_rollback_address_valid(&member, member.prev_uba, true)
+		|| cluster_undo_record_uba_equal(address, member.prev_uba)
+		|| (cluster_undo_record_uba_equal(address, stage->expected_tt_head)
+			&& member.record_type != UNDO_RECORD_SAVEPOINT_ROLLBACK)
+		|| !undo_savepoint_chain_payload(stage, address, &member,
+										 image + slot->record_offset + sizeof(member)))
+		return false;
+	stage->chain_lsn = Max(stage->chain_lsn, block->block_lsn);
+	*previous = member.prev_uba;
+	return true;
+}
+
+/* Same original origin owner as DATA production: a current segment
+ * publication plus its pool S pin. No disabled-pool or recovery smgr bypass.
+ * Keep the producer's integrity policy; decoding cannot invent a CRC proof. */
+static bool
+undo_savepoint_chain_read(UndoSavepointHeadPublish *stage, UBA address, uint64 deadline,
+						  UBA *previous)
+{
+	ClusterUndoBlock0LiveOwnerPublication publication;
+	volatile ClusterUndoBufPin pin = { .slot = -1 };
+	uint32 segment, block;
+	uint16 tt, row;
+	volatile bool valid = false;
+	const char *resident;
+
+	if (!undo_savepoint_control_address_valid(&stage->control->operation, address, false)
+		|| cluster_undo_record_uba_equal(address, stage->control->uba)
+		|| !uba_decode_record(address, &segment, &block, &tt, &row)
+		|| !undo_savepoint_head_recheck(stage)
+		|| !cluster_undo_record_ensure_block0_current(stage->request.head.instance, segment,
+													  deadline, &publication))
+		return false;
+	PG_TRY();
+	{
+		resident = cluster_undo_buf_pin(segment, stage->request.head.instance, block,
+										CLUSTER_UNDO_BUF_SHARED, (ClusterUndoBufPin *)&pin);
+		if (resident != NULL && pin.slot >= 0 && undo_savepoint_head_recheck(stage)
+			&& cluster_undo_block0_current_live_owner_publication_recheck_conditional(&publication))
+			valid = undo_savepoint_chain_member(stage, address, resident, row, previous);
+	}
+	PG_FINALLY();
+	{
+		if (pin.slot >= 0)
+			cluster_undo_buf_unpin((ClusterUndoBufPin *)&pin);
+	}
+	PG_END_TRY();
+	return valid;
+}
+
+/* Validate the suffix below both boundaries too. Brent's constant-memory
+ * detector proves termination without a fixed prefix cap or UBA ordering. */
+static bool
+undo_savepoint_chain_prove(UndoSavepointHeadPublish *stage, uint64 deadline)
+{
+	UBA current = stage->bounds.current_head, checkpoint = current;
+	uint64 power = 1, period = 0;
+	bool stop_found = UBA_is_invalid(stage->bounds.stop_uba);
+	bool head_found = UBA_is_invalid(stage->expected_tt_head);
+
+	while (!UBA_is_invalid(current)) {
+		UBA previous;
+
+		CHECK_FOR_INTERRUPTS();
+		if (!undo_savepoint_chain_read(stage, current, deadline, &previous))
+			return false;
+		stop_found |= cluster_undo_record_uba_equal(current, stage->bounds.stop_uba);
+		head_found |= cluster_undo_record_uba_equal(current, stage->expected_tt_head);
+		current = previous;
+		period++;
+		if (cluster_undo_record_uba_equal(current, checkpoint))
+			return false;
+		if (period == power) {
+			checkpoint = current;
+			period = 0;
+			if (power > UINT64_MAX / 2)
+				return false;
+			power *= 2;
+		}
+	}
+	return stop_found && head_found && undo_savepoint_head_recheck(stage);
+}
+
+static void undo_savepoint_head_fail(void) pg_attribute_noreturn();
+
+static void
+undo_savepoint_head_fail(void)
+{
+	ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+					errmsg("cannot finish staged savepoint undo head publication"),
+					errhint("Restart recovery with the transaction's retained undo before "
+							"continuing rollback.")));
+	pg_unreachable();
+}
+
+/* Spec: 2026-10-26-pre2-p013-full-savepoint-design.md. This deliberately
+ * stops at head publication; only a durable cursor/mark owner can authorize
+ * rollback completion or native subtransaction cleanup. */
+bool
+cluster_undo_record_publish_savepoint_pending(ClusterUndoSavepointControl *control,
+											  const ClusterUndoSavepointBounds *expected,
+											  UBA expected_tt_head, uint64 deadline,
+											  XLogRecPtr *cut_out)
+{
+	ClusterUndoSavepointControl *owned = undo_savepoint_control_find(control);
+	UndoSavepointHeadPublish stage = { 0 };
+	ClusterSemanticAdmissionToken admission = { 0 };
+	volatile bool complete = false;
+
+	if (cut_out == NULL)
+		return false;
+	*cut_out = InvalidXLogRecPtr;
+	if (owned == NULL || !cluster_shared_config || !cluster_enabled || MyProc == NULL
+		|| !LocalTransactionIdIsValid(MyProc->lxid) || cluster_node_id < 0
+		|| owned->operation.top.origin_instance != (uint8)(cluster_node_id + 1) || !owned->reserved
+		|| !XLogRecPtrIsInvalid(owned->pending_lsn) || deadline <= (uint64)GetCurrentTimestamp()
+		|| !undo_savepoint_pending_inputs(owned, expected)
+		|| !undo_savepoint_control_address_valid(&owned->operation, expected_tt_head, true)
+		|| cluster_undo_record_uba_equal(owned->uba, expected_tt_head))
+		return false;
+	stage.control = owned;
+	stage.bounds = *expected;
+	stage.expected_tt_head = expected_tt_head;
+	stage.proc = MyProc;
+	stage.lxid = MyProc->lxid;
+	stage.admission = &admission;
+	stage.local_head_idx = cluster_undo_local_head_find(owned->operation.top.segment_id,
+														owned->operation.top.slot_offset);
+	if (stage.local_head_idx < 0 || !undo_savepoint_head_request(&stage)
+		|| cluster_semantic_activation_modifier_enter(true, &admission)
+			   != CLUSTER_SEMANTIC_ADMISSION_OK)
+		return false;
+	PG_TRY();
+	{
+		XLogRecPtr pending_cut, head_cut;
+
+		if (undo_savepoint_chain_prove(&stage, deadline)
+			&& cluster_undo_record_stage_savepoint_pending(owned, &stage.bounds, deadline,
+														   &pending_cut)) {
+			if (XLogRecPtrIsInvalid(pending_cut) || pending_cut <= stage.chain_lsn
+				|| !undo_savepoint_head_recheck(&stage))
+				undo_savepoint_head_fail();
+			head_cut = cluster_tt_slot_durable_publish_operation_head(
+				&stage.request, stage.expected_tt_head, pending_cut, &admission);
+			if (XLogRecPtrIsInvalid(head_cut) || head_cut <= pending_cut
+				|| GetFlushRecPtr(NULL) < head_cut || !undo_savepoint_head_recheck(&stage))
+				undo_savepoint_head_fail();
+			START_CRIT_SECTION();
+			cluster_undo_local_heads[stage.local_head_idx].head = owned->uba;
+			*cut_out = head_cut;
+			complete = true;
+			END_CRIT_SECTION();
+		} else if (!XLogRecPtrIsInvalid(owned->pending_lsn))
+			undo_savepoint_head_fail();
+	}
+	PG_CATCH();
+	{
+		cluster_semantic_activation_leave(&admission);
+		if (!XLogRecPtrIsInvalid(owned->pending_lsn))
+			undo_savepoint_head_fail();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	cluster_semantic_activation_leave(&admission);
 	return complete;
 }

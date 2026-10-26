@@ -133,6 +133,11 @@ static bool pending_test_install_throw;
 static int pending_test_wal_calls, pending_test_install_calls;
 static PGAlignedBlock pending_test_wal_image;
 static uint16 pending_test_record_offset, pending_test_slot_offset;
+static bool head_pipeline_test_mode;
+static int head_pipeline_test_reads, head_pipeline_test_drift, head_pipeline_test_tt_mode;
+static int head_pipeline_test_tt_calls;
+static XLogRecPtr head_pipeline_test_flushed;
+static void head_pipeline_test_after_pin(ClusterUndoBufPin *pin);
 static void pending_test_after_pin(ClusterUndoBufPin *pin);
 static XLogRecPtr pending_test_emit(uint8 instance, uint32 segment, uint32 block, const char *image,
 									XLogRecPtr old_lsn, uint16 rec_off, uint16 rec_len,
@@ -6067,11 +6072,24 @@ UT_TEST(test_exact_zero_abort_keeps_cleanup_after_native_scope_ends)
 
 #include "test_cluster_undo_savepoint_reserve.inc"
 #include "test_cluster_undo_savepoint_pending.inc"
+#include "test_cluster_undo_savepoint_head.inc"
 
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(195);
+	UT_PLAN(207);
+	UT_RUN(test_control_head_pipeline_publishes_after_complete_chain_proof);
+	UT_RUN(test_control_head_pipeline_nil_tt_and_stop_preserve_full_chain);
+	UT_RUN(test_control_head_pipeline_rejects_malformed_retained_members);
+	UT_RUN(test_control_head_pipeline_requires_stop_and_canonical_ancestry);
+	UT_RUN(test_control_head_pipeline_validates_below_stop);
+	UT_RUN(test_control_head_pipeline_rechecks_original_pin_publication);
+	UT_RUN(test_control_head_pipeline_refuses_unknown_preparation_debt);
+	UT_RUN(test_control_head_pipeline_promotes_tt_errors_after_pending);
+	UT_RUN(test_control_head_pipeline_requires_later_durable_cut);
+	UT_RUN(test_control_head_pipeline_rechecks_scope_and_local_owner_after_tt);
+	UT_RUN(test_control_head_pipeline_refuses_second_publication);
+	UT_RUN(test_control_head_pipeline_reserved_controls_are_off_chain);
 	UT_RUN(test_control_pending_installs_literal_image_before_head_publication);
 	UT_RUN(test_control_pending_repeat_requires_identical_pending_bytes);
 	UT_RUN(test_control_pending_refuses_changed_bounds_without_effects);

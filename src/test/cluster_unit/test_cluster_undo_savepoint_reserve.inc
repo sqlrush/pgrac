@@ -42,16 +42,23 @@ cluster_undo_buf_pin(uint32 segment_id, uint8 owner, uint32 block_no, ClusterUnd
 	UT_ASSERT_EQ(owner, 1);
 	UT_ASSERT(block_no >= 1 && block_no <= 2);
 	pin->slot = 7 + block_no - 1;
+	pin->segment_id = segment_id;
+	pin->owner = owner;
+	pin->block_no = block_no;
+	pin->mode = mode;
 	if (pending_test_mode && pending_test_pin_fail) {
 		pin->slot = -1;
 		return NULL;
 	}
 	reserve_test_pins++;
 	if (pending_test_mode) {
-		UT_ASSERT_EQ(mode, CLUSTER_UNDO_BUF_EXCLUSIVE);
+		UT_ASSERT(head_pipeline_test_mode || mode == CLUSTER_UNDO_BUF_EXCLUSIVE);
 		UT_ASSERT(!receipt_buffer_locked);
 		receipt_buffer_locked = true;
-		pending_test_after_pin(pin);
+		if (head_pipeline_test_mode && mode == CLUSTER_UNDO_BUF_SHARED)
+			head_pipeline_test_after_pin(pin);
+		else
+			pending_test_after_pin(pin);
 	}
 	if (reserve_test_expire_at_pin)
 		receipt_clock_us = 100;

@@ -98,6 +98,7 @@ typedef enum ClusterUndoRecordConsumePreflightResult {
 #define CLUSTER_UNDO_SAVEPOINT_RESERVE_PRESENT 1
 #define CLUSTER_UNDO_SAVEPOINT_BOUNDS_PRESENT 1
 #define CLUSTER_UNDO_SAVEPOINT_PENDING_PRESENT 1
+#define CLUSTER_UNDO_SAVEPOINT_HEAD_PRESENT 1
 
 typedef struct ClusterUndoSavepointControl ClusterUndoSavepointControl;
 /* Before any data effect or DATA receipt, with no content/entry lock held.
@@ -148,6 +149,24 @@ extern bool cluster_undo_record_stage_savepoint_pending(ClusterUndoSavepointCont
 														const ClusterUndoSavepointBounds *expected,
 														uint64 absolute_deadline_us,
 														XLogRecPtr *cut_out);
+
+/* First activation only, before rollback effects and outside content locks.
+ * Validate the full original retained chain, including below the exclusive
+ * stop, using original live-owner publications and own-origin pool pins.
+ * expected_tt_head is a compare input, not authority: the original canonical
+ * TT owner must prove it again. Nonempty expected heads must be retained
+ * activated controls, never a DATA address or an operation-sequence guess.
+ *
+ * Install PENDING, publish/flush its canonical ACTIVE head through the original
+ * TT owner, then advance the existing local head to this retained control.
+ * Original control refs remain owned by top cleanup. false clears *cut_out
+ * before staging; an uncertain failure after PENDING is fatal, not catchable
+ * by a parent EXCEPTION block. Success proves head publication only: it does
+ * not discard an operation, advance a cursor, complete rollback, or permit
+ * native child cleanup. A second activation requires a new reserved control. */
+extern bool cluster_undo_record_publish_savepoint_pending(
+	ClusterUndoSavepointControl *control, const ClusterUndoSavepointBounds *expected,
+	UBA expected_tt_head, uint64 absolute_deadline_us, XLogRecPtr *cut_out);
 
 
 /* Stack-only identity for one backend-local prepared DATA reservation.  It is
