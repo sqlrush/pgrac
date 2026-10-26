@@ -26020,6 +26020,7 @@ UT_TEST(test_tx_inputs_parent_subject_and_wait_revalidation)
 #include "test_cluster_control_ctrc_source_plan.inc"
 #include "test_cluster_control_ctrc_replay_set.inc"
 #include "test_cluster_control_ctrc_stable.inc"
+#include "test_cluster_control_ctrc_replay_stable.inc"
 
 /*
  * Keep the long control-root suite deterministic when an individual test
@@ -26233,6 +26234,19 @@ main(int argc, char **argv)
 	if (getenv("PGRAC_PRE2_TEST_STAMP_WORKER_ENTRY") != NULL) {
 		UT_PLAN(1);
 		UT_RUN(test_runtime_v3_failure_worker_entry_establishes_resource_owner);
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_CTRC_REPLAY_STABLE") != NULL) {
+		UT_PLAN(8);
+		UT_RUN(test_ctrc_replay_stable_two_actual_origins_without_tt);
+		UT_RUN(test_ctrc_replay_stable_refuses_omitted_or_duplicated_set_origin);
+		UT_RUN(test_ctrc_replay_stable_refuses_changed_native_source_or_uncovered_cut);
+		UT_RUN(test_ctrc_replay_stable_preserves_budget_and_full_graph_refusals);
+		UT_RUN(test_ctrc_replay_stable_freezes_every_owner_and_graph_byte);
+		UT_RUN(test_ctrc_replay_stable_cf_wait_and_lost_holder_keep_all_debt);
+		UT_RUN(test_ctrc_replay_stable_late_change_or_error_never_publishes);
+		UT_RUN(test_ctrc_replay_stable_retired_scope_cannot_revive_private_proof);
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
@@ -26532,7 +26546,15 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(574);
+	UT_PLAN(582);
+	UT_RUN(test_ctrc_replay_stable_two_actual_origins_without_tt);
+	UT_RUN(test_ctrc_replay_stable_refuses_omitted_or_duplicated_set_origin);
+	UT_RUN(test_ctrc_replay_stable_refuses_changed_native_source_or_uncovered_cut);
+	UT_RUN(test_ctrc_replay_stable_preserves_budget_and_full_graph_refusals);
+	UT_RUN(test_ctrc_replay_stable_freezes_every_owner_and_graph_byte);
+	UT_RUN(test_ctrc_replay_stable_cf_wait_and_lost_holder_keep_all_debt);
+	UT_RUN(test_ctrc_replay_stable_late_change_or_error_never_publishes);
+	UT_RUN(test_ctrc_replay_stable_retired_scope_cannot_revive_private_proof);
 	UT_RUN(test_ctrc_set_holds_unordered_original_origins_without_tt_subjects);
 	UT_RUN(test_ctrc_set_partial_native_wait_withholds_every_source_view);
 	UT_RUN(test_ctrc_set_postgrant_cf_wait_keeps_all_original_holders);

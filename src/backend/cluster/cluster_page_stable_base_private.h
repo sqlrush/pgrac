@@ -23,6 +23,7 @@
 #include "cluster/cluster_page_stable_base.h"
 
 struct ClusterRecoveryCtrcSubjectAuthorityV1;
+struct ClusterRecoveryCtrcReplaySetSourceV1;
 struct RfPageStableCtrcStorageV1;
 
 #define RF_PAGE_STABLE_PROOF_MAGIC UINT32_C(0x52505350)
@@ -46,6 +47,8 @@ struct RfPageStableBaseProofV1 {
 	/* Native CTRC purpose; private copies own no original scope or grants. */
 	const struct ClusterRecoveryCtrcSubjectAuthorityV1 *ctrc_authorities;
 	struct ClusterRecoveryCtrcSubjectAuthorityV1 *ctrc_owners;
+	const struct ClusterRecoveryCtrcReplaySetSourceV1 *ctrc_replay_authorities;
+	struct ClusterRecoveryCtrcReplaySetSourceV1 *ctrc_replay_owners;
 	struct RfPageStableCtrcStorageV1 *ctrc_storage;
 	uint32 *ctrc_scratch;
 };

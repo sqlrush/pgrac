@@ -697,7 +697,7 @@ rf_page_stable_base_proof_matches_sources_v1(const RfPageStableBaseProofV1 *proo
 											 const RfContributorVectorV1 *contributors)
 {
 	if (proof == NULL || proof->magic != RF_PAGE_STABLE_PROOF_MAGIC || proof->source_owners == NULL
-		|| proof->ctrc_owners != NULL
+		|| proof->ctrc_owners != NULL || proof->ctrc_replay_owners != NULL
 		|| proof->source_authorities != authorities || proof->participant_count != count
 		|| count == 0 || count > RF_PAGE_STABLE_MAX_PARTICIPANTS
 		|| !rf_page_identity_equal_v1(&proof->page_identity, page_identity)
@@ -806,6 +806,7 @@ rf_page_stable_base_proof_matches_v1(
 {
 	return proof != NULL && proof->magic == RF_PAGE_STABLE_PROOF_MAGIC && participant_count != 0
 		   && proof->source_authorities == NULL && proof->ctrc_owners == NULL
+		   && proof->ctrc_replay_owners == NULL
 		   && proof->participant_count == participant_count
 		   && rf_page_identity_equal_v1(&proof->page_identity, page_identity)
 		   && rf_page_version_equal_v1(&proof->expected_result, expected_result)
@@ -832,6 +833,8 @@ rf_page_stable_base_proof_destroy_v1(RfPageStableBaseProofV1 **proof_pointer)
 		stable_free(proof->source_owners);
 	if (proof->ctrc_owners != NULL)
 		stable_free(proof->ctrc_owners);
+	if (proof->ctrc_replay_owners != NULL)
+		stable_free(proof->ctrc_replay_owners);
 	if (proof->ctrc_storage != NULL)
 		stable_free(proof->ctrc_storage);
 	if (proof->ctrc_scratch != NULL)
