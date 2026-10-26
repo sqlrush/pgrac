@@ -1185,136 +1185,144 @@ cluster_runtime_visibility_current_owner_lookup_internal(
 											 CLUSTER_SEMANTIC_TARGET_SIDE, &admission)
 			   != CLUSTER_SEMANTIC_ADMISSION_OK)
 		return false;
-	if (cluster_tt_local_get_published_binding(xid, &local_binding)) {
-		if (!cluster_runtime_visibility_current_owner_from_local_binding(xid, &local_binding,
-																		 &owner))
-			goto done;
-		expected_binding = &local_binding;
-	} else if (cluster_tt_slot_current_owner_by_xid(cluster_node_id, xid, &owner)) {
-		if (!cluster_runtime_visibility_current_owner_shape_valid(xid, &owner))
-			goto done;
-	} else {
-		uint16 segment = 0;
-		uint16 slot = TT_SLOTS_PER_SEGMENT;
-		uint16 wrap = TT_WRAP_INVALID;
-
-		if (!cluster_runtime_visibility_locate_scope_capture(xid, &admission, &locate_scope)
-			|| cluster_tt_slot_durable_locate_any_by_xid_origin(cluster_node_id, xid, &segment,
-																&slot, &wrap, NULL)
-				   != CLUSTER_TT_DURABLE_LOCATE_FOUND)
-			goto done;
-		physical_locator.segment_id = segment;
-		physical_locator.xid = xid;
-		physical_locator.slot_offset = slot;
-		physical_locator.wrap = wrap;
-		if (!cluster_runtime_visibility_physical_locator_shape_valid(&physical_locator)
-			|| !cluster_runtime_visibility_locate_scope_current(xid, &admission, &locate_scope))
-			goto done;
-		/* Only identity is reused for the CTRC key.  Disk status is not a
-		 * verdict, and the CURRENT-only recheck is inapplicable to old slots. */
-		memset(&owner, 0, sizeof(owner));
-		owner.segment_id = segment;
-		owner.xid = xid;
-		owner.slot_offset = slot;
-		owner.wrap = wrap;
-		located_physical = true;
-	}
-	logical.owner_instance = (uint8)((uint32)cluster_node_id + 1);
-	logical.segment_id = owner.segment_id;
-	if (!cluster_runtime_visibility_resolve_root_admitted(
-			CLUSTER_TX_RESOLVE_VISIBILITY, &admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
-			logical.owner_instance, logical.segment_id, &root)
-		|| !cluster_runtime_visibility_admission_current(CLUSTER_TX_RESOLVE_VISIBILITY, &admission))
-		goto done;
-
-	cluster_runtime_visibility_ensure_exit_hooks();
-	PG_ENSURE_ERROR_CLEANUP(cluster_runtime_visibility_candidate_cleanup,
-							PointerGetDatum(&cleanup));
+	/* The borrowed guard must unwind before this caller-owned admission. */
+	PG_TRY();
 	{
-		if (cluster_runtime_visibility_candidate_acquire(&logical, &admission, &guard, &cleanup,
-														 &current_result)
-			== CLUSTER_UNDO_BLOCK0_CURRENT_HELD) {
-			if (located_physical)
-				sampled = cluster_runtime_visibility_physical_locator_sample_held(
-							  &physical_locator, &admission, &guard, &root, key_out, result_out,
-							  &ctrc_physical_active, NULL)
-						  && cluster_runtime_visibility_locate_scope_current(xid, &admission,
-																			 &locate_scope);
-			else
-				sampled = cluster_runtime_visibility_current_owner_sample_held_internal(
-					xid, &owner, expected_binding, &admission, &guard, &root, key_out, result_out,
-					&ctrc_physical_active);
-		}
-		if (sampled && ctrc_required && !ctrc_physical_active)
-			sampled = false;
-		if (sampled && ctrc_required && result_out->status == CLUSTER_TT_STATUS_IN_PROGRESS) {
-			ClusterCtrcTouchResult touch_result;
+		if (cluster_tt_local_get_published_binding(xid, &local_binding)) {
+			if (!cluster_runtime_visibility_current_owner_from_local_binding(xid, &local_binding,
+																			 &owner))
+				goto done;
+			expected_binding = &local_binding;
+		} else if (cluster_tt_slot_current_owner_by_xid(cluster_node_id, xid, &owner)) {
+			if (!cluster_runtime_visibility_current_owner_shape_valid(xid, &owner))
+				goto done;
+		} else {
+			uint16 segment = 0;
+			uint16 slot = TT_SLOTS_PER_SEGMENT;
+			uint16 wrap = TT_WRAP_INVALID;
 
-			if (admission.record_generation > UINT32_MAX
-				|| cluster_undo_block0_current_sample_generation(&guard, &root, &ctrc_generation)
-					   != CLUSTER_UNDO_BLOCK0_OK
-				|| !cluster_runtime_visibility_ctrc_key_fill(&owner, &ctrc_generation, &root,
-															 &admission, &ctrc_key))
-				sampled = false;
-			else {
-				participant.node_id = (uint16)cluster_node_id;
-				participant.capability_record_generation = (uint32)admission.record_generation;
-				participant.boot_incarnation = ctrc_key.origin_boot_incarnation;
-				participant.formation_epoch = admission.formation_epoch;
-				participant.admission_record_generation = admission.record_generation;
-				touch_result = cluster_ctrc_origin_touch_exact(&ctrc_key, &participant,
-															   CTRC_PROOF_ACTIVE, &grant);
-				sampled = touch_result == CLUSTER_CTRC_TOUCH_RECORDED
-						  || touch_result == CLUSTER_CTRC_TOUCH_DUPLICATE;
-				if (sampled
-					&& (grant == 0
-						|| cluster_undo_block0_current_sample_generation(&guard, &root,
-																		 &final_generation)
-							   != CLUSTER_UNDO_BLOCK0_OK
-						|| !final_generation.known
-						|| final_generation.value != ctrc_generation.value
-						|| !cluster_runtime_visibility_resolve_root_admitted(
-							CLUSTER_TX_RESOLVE_VISIBILITY, &admission,
-							CLUSTER_UNDO_PATH_RUNTIME_SHARED, (uint32)cluster_node_id + 1,
-							owner.segment_id, &final_root)
-						|| !cluster_runtime_visibility_candidate_root_matches(&root, &final_root)
-						|| !cluster_runtime_visibility_admission_current(
-							CLUSTER_TX_RESOLVE_VISIBILITY, &admission)
-						|| cluster_qvotec_get_self_incarnation()
-							   != ctrc_key.origin_boot_incarnation))
-					sampled = false;
-			}
+			if (!cluster_runtime_visibility_locate_scope_capture(xid, &admission, &locate_scope)
+				|| cluster_tt_slot_durable_locate_any_by_xid_origin(cluster_node_id, xid, &segment,
+																	&slot, &wrap, NULL)
+					   != CLUSTER_TT_DURABLE_LOCATE_FOUND)
+				goto done;
+			physical_locator.segment_id = segment;
+			physical_locator.xid = xid;
+			physical_locator.slot_offset = slot;
+			physical_locator.wrap = wrap;
+			if (!cluster_runtime_visibility_physical_locator_shape_valid(&physical_locator)
+				|| !cluster_runtime_visibility_locate_scope_current(xid, &admission, &locate_scope))
+				goto done;
+			/* Only identity is reused for the CTRC key.  Disk status is not a
+			 * verdict, and the CURRENT-only recheck is inapplicable to old slots. */
+			memset(&owner, 0, sizeof(owner));
+			owner.segment_id = segment;
+			owner.xid = xid;
+			owner.slot_offset = slot;
+			owner.wrap = wrap;
+			located_physical = true;
 		}
-		if (cleanup.active) {
-			if (cluster_runtime_visibility_candidate_release(&guard, &current_result)
-				!= CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED) {
-				cluster_undo_block0_current_cancel(&guard);
-				sampled = false;
-			}
-			cleanup.active = false;
-		}
-	}
-	PG_END_ENSURE_ERROR_CLEANUP(cluster_runtime_visibility_candidate_cleanup,
-								PointerGetDatum(&cleanup));
-	/* Release can wait: every source must still identify the sampled slot
-	 * before its verdict or ACTIVE grant escapes.  These checks stay local. */
-	if (sampled)
-		sampled
-			= located_physical
-				  ? cluster_runtime_visibility_locate_scope_current(xid, &admission, &locate_scope)
-				  : cluster_runtime_visibility_current_owner_recheck(xid, &owner, expected_binding);
-	if (sampled
-		&& (!cluster_runtime_visibility_admission_current(CLUSTER_TX_RESOLVE_VISIBILITY, &admission)
-			|| !cluster_runtime_visibility_resolve_root_admitted(
+		logical.owner_instance = (uint8)((uint32)cluster_node_id + 1);
+		logical.segment_id = owner.segment_id;
+		if (!cluster_runtime_visibility_resolve_root_admitted(
 				CLUSTER_TX_RESOLVE_VISIBILITY, &admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
-				logical.owner_instance, logical.segment_id, &final_root)
-			|| !cluster_runtime_visibility_candidate_root_matches(&root, &final_root)
-			|| (ctrc_required
-				&& cluster_qvotec_get_self_incarnation() != ctrc_key.origin_boot_incarnation)))
-		sampled = false;
+				logical.owner_instance, logical.segment_id, &root)
+			|| !cluster_runtime_visibility_admission_current(CLUSTER_TX_RESOLVE_VISIBILITY, &admission))
+			goto done;
 
-done:
-	cluster_semantic_activation_leave(&admission);
+		cluster_runtime_visibility_ensure_exit_hooks();
+		PG_ENSURE_ERROR_CLEANUP(cluster_runtime_visibility_candidate_cleanup,
+								PointerGetDatum(&cleanup));
+		{
+			if (cluster_runtime_visibility_candidate_acquire(&logical, &admission, &guard, &cleanup,
+															 &current_result)
+				== CLUSTER_UNDO_BLOCK0_CURRENT_HELD) {
+				if (located_physical)
+					sampled = cluster_runtime_visibility_physical_locator_sample_held(
+								  &physical_locator, &admission, &guard, &root, key_out, result_out,
+								  &ctrc_physical_active, NULL)
+							  && cluster_runtime_visibility_locate_scope_current(xid, &admission,
+																				 &locate_scope);
+				else
+					sampled = cluster_runtime_visibility_current_owner_sample_held_internal(
+						xid, &owner, expected_binding, &admission, &guard, &root, key_out, result_out,
+						&ctrc_physical_active);
+			}
+			if (sampled && ctrc_required && !ctrc_physical_active)
+				sampled = false;
+			if (sampled && ctrc_required && result_out->status == CLUSTER_TT_STATUS_IN_PROGRESS) {
+				ClusterCtrcTouchResult touch_result;
+
+				if (admission.record_generation > UINT32_MAX
+					|| cluster_undo_block0_current_sample_generation(&guard, &root, &ctrc_generation)
+						   != CLUSTER_UNDO_BLOCK0_OK
+					|| !cluster_runtime_visibility_ctrc_key_fill(&owner, &ctrc_generation, &root,
+																 &admission, &ctrc_key))
+					sampled = false;
+				else {
+					participant.node_id = (uint16)cluster_node_id;
+					participant.capability_record_generation = (uint32)admission.record_generation;
+					participant.boot_incarnation = ctrc_key.origin_boot_incarnation;
+					participant.formation_epoch = admission.formation_epoch;
+					participant.admission_record_generation = admission.record_generation;
+					touch_result = cluster_ctrc_origin_touch_exact(&ctrc_key, &participant,
+																   CTRC_PROOF_ACTIVE, &grant);
+					sampled = touch_result == CLUSTER_CTRC_TOUCH_RECORDED
+							  || touch_result == CLUSTER_CTRC_TOUCH_DUPLICATE;
+					if (sampled
+						&& (grant == 0
+							|| cluster_undo_block0_current_sample_generation(&guard, &root,
+																			 &final_generation)
+								   != CLUSTER_UNDO_BLOCK0_OK
+							|| !final_generation.known
+							|| final_generation.value != ctrc_generation.value
+							|| !cluster_runtime_visibility_resolve_root_admitted(
+								CLUSTER_TX_RESOLVE_VISIBILITY, &admission,
+								CLUSTER_UNDO_PATH_RUNTIME_SHARED, (uint32)cluster_node_id + 1,
+								owner.segment_id, &final_root)
+							|| !cluster_runtime_visibility_candidate_root_matches(&root, &final_root)
+							|| !cluster_runtime_visibility_admission_current(
+								CLUSTER_TX_RESOLVE_VISIBILITY, &admission)
+							|| cluster_qvotec_get_self_incarnation()
+								   != ctrc_key.origin_boot_incarnation))
+						sampled = false;
+				}
+			}
+			if (cleanup.active) {
+				if (cluster_runtime_visibility_candidate_release(&guard, &current_result)
+					!= CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED) {
+					cluster_undo_block0_current_cancel(&guard);
+					sampled = false;
+				}
+				cleanup.active = false;
+			}
+		}
+		PG_END_ENSURE_ERROR_CLEANUP(cluster_runtime_visibility_candidate_cleanup,
+									PointerGetDatum(&cleanup));
+		/* Release can wait: every source must still identify the sampled slot
+		 * before its verdict or ACTIVE grant escapes.  These checks stay local. */
+		if (sampled)
+			sampled
+				= located_physical
+					  ? cluster_runtime_visibility_locate_scope_current(xid, &admission, &locate_scope)
+					  : cluster_runtime_visibility_current_owner_recheck(xid, &owner, expected_binding);
+		if (sampled
+			&& (!cluster_runtime_visibility_admission_current(CLUSTER_TX_RESOLVE_VISIBILITY, &admission)
+				|| !cluster_runtime_visibility_resolve_root_admitted(
+					CLUSTER_TX_RESOLVE_VISIBILITY, &admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+					logical.owner_instance, logical.segment_id, &final_root)
+				|| !cluster_runtime_visibility_candidate_root_matches(&root, &final_root)
+				|| (ctrc_required
+					&& cluster_qvotec_get_self_incarnation() != ctrc_key.origin_boot_incarnation)))
+			sampled = false;
+
+		done:;
+	}
+	PG_FINALLY();
+	{
+		cluster_semantic_activation_leave(&admission);
+	}
+	PG_END_TRY();
 	if (!sampled) {
 		memset(key_out, 0, sizeof(*key_out));
 		memset(result_out, 0, sizeof(*result_out));
@@ -1421,72 +1429,80 @@ cluster_runtime_visibility_local_terminal_lookup_exact(TransactionId xid,
 		return false;
 	if (cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
 										  CLUSTER_SEMANTIC_TARGET_SIDE, &admission)
-			!= CLUSTER_SEMANTIC_ADMISSION_OK
-		|| !cluster_runtime_visibility_locate_scope_capture(xid, &admission, &locate_scope))
-		goto done;
-	/* The raw-xid locator supplies identity only within this admitted native
-	 * interval.  Epoch zero remains valid; no native lock spans disk I/O. */
-	locate_result = cluster_tt_slot_durable_locate_any_by_xid_origin(
-		cluster_node_id, xid, &segment_id, &slot_offset, &slot_wrap, NULL);
-	if (locate_result != CLUSTER_TT_DURABLE_LOCATE_FOUND || segment_id == 0
-		|| slot_offset >= TT_SLOTS_PER_SEGMENT || slot_wrap == TT_WRAP_INVALID
-		|| !cluster_runtime_visibility_locate_scope_current(xid, &admission, &locate_scope))
-		goto done;
-	locator.segment_id = segment_id;
-	locator.xid = xid;
-	locator.slot_offset = slot_offset;
-	locator.wrap = slot_wrap;
-
-	logical.owner_instance = (uint8)((uint32)cluster_node_id + 1);
-	logical.segment_id = segment_id;
-	if (!cluster_runtime_visibility_resolve_root_admitted(
-			CLUSTER_TX_RESOLVE_VISIBILITY, &admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
-			logical.owner_instance, logical.segment_id, &root)
-		|| !cluster_runtime_visibility_admission_current(CLUSTER_TX_RESOLVE_VISIBILITY, &admission))
-		goto done;
-
-	cluster_runtime_visibility_ensure_exit_hooks();
-	PG_ENSURE_ERROR_CLEANUP(cluster_runtime_visibility_candidate_cleanup,
-							PointerGetDatum(&cleanup));
+			!= CLUSTER_SEMANTIC_ADMISSION_OK)
+		return false;
+	/* The borrowed guard must unwind before this caller-owned admission. */
+	PG_TRY();
 	{
-		if (cluster_runtime_visibility_candidate_acquire(&logical, &admission, &guard, &cleanup,
-														 &current_result)
-			== CLUSTER_UNDO_BLOCK0_CURRENT_HELD)
-			sampled = cluster_runtime_visibility_physical_locator_sample_held(
-				&locator, &admission, &guard, &root, key_out, result_out, &physical_active,
-				&precommit_retry);
-		if (sampled
-			&& (physical_active
-				|| (result_out->status != CLUSTER_TT_STATUS_COMMITTED
-					&& result_out->status != CLUSTER_TT_STATUS_ABORTED)))
-			sampled = false;
-		if (cleanup.active) {
-			if (cluster_runtime_visibility_candidate_release(&guard, &current_result)
-				!= CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED) {
-				cluster_undo_block0_current_cancel(&guard);
-				sampled = false;
-				precommit_retry = false;
-			}
-			cleanup.active = false;
-		}
-	}
-	PG_END_ENSURE_ERROR_CLEANUP(cluster_runtime_visibility_candidate_cleanup,
-								PointerGetDatum(&cleanup));
-	if ((sampled || precommit_retry)
-		&& (!cluster_runtime_visibility_locate_scope_current(xid, &admission, &locate_scope)
-			|| !cluster_runtime_visibility_resolve_root_admitted(
-				CLUSTER_TX_RESOLVE_VISIBILITY, &admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
-				logical.owner_instance, logical.segment_id, &final_root)
-			|| !cluster_runtime_visibility_candidate_root_matches(&root, &final_root)
-			|| !cluster_runtime_visibility_admission_current(CLUSTER_TX_RESOLVE_VISIBILITY,
-															 &admission))) {
-		sampled = false;
-		precommit_retry = false;
-	}
+		if (!cluster_runtime_visibility_locate_scope_capture(xid, &admission, &locate_scope))
+			goto done;
+		/* The raw-xid locator supplies identity only within this admitted native
+		 * interval.  Epoch zero remains valid; no native lock spans disk I/O. */
+		locate_result = cluster_tt_slot_durable_locate_any_by_xid_origin(
+			cluster_node_id, xid, &segment_id, &slot_offset, &slot_wrap, NULL);
+		if (locate_result != CLUSTER_TT_DURABLE_LOCATE_FOUND || segment_id == 0
+			|| slot_offset >= TT_SLOTS_PER_SEGMENT || slot_wrap == TT_WRAP_INVALID
+			|| !cluster_runtime_visibility_locate_scope_current(xid, &admission, &locate_scope))
+			goto done;
+		locator.segment_id = segment_id;
+		locator.xid = xid;
+		locator.slot_offset = slot_offset;
+		locator.wrap = slot_wrap;
 
-done:
-	if (admission.entered)
+		logical.owner_instance = (uint8)((uint32)cluster_node_id + 1);
+		logical.segment_id = segment_id;
+		if (!cluster_runtime_visibility_resolve_root_admitted(
+				CLUSTER_TX_RESOLVE_VISIBILITY, &admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+				logical.owner_instance, logical.segment_id, &root)
+			|| !cluster_runtime_visibility_admission_current(CLUSTER_TX_RESOLVE_VISIBILITY, &admission))
+			goto done;
+
+		cluster_runtime_visibility_ensure_exit_hooks();
+		PG_ENSURE_ERROR_CLEANUP(cluster_runtime_visibility_candidate_cleanup,
+								PointerGetDatum(&cleanup));
+		{
+			if (cluster_runtime_visibility_candidate_acquire(&logical, &admission, &guard, &cleanup,
+															 &current_result)
+				== CLUSTER_UNDO_BLOCK0_CURRENT_HELD)
+				sampled = cluster_runtime_visibility_physical_locator_sample_held(
+					&locator, &admission, &guard, &root, key_out, result_out, &physical_active,
+					&precommit_retry);
+			if (sampled
+				&& (physical_active
+					|| (result_out->status != CLUSTER_TT_STATUS_COMMITTED
+						&& result_out->status != CLUSTER_TT_STATUS_ABORTED)))
+				sampled = false;
+			if (cleanup.active) {
+				if (cluster_runtime_visibility_candidate_release(&guard, &current_result)
+					!= CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED) {
+					cluster_undo_block0_current_cancel(&guard);
+					sampled = false;
+					precommit_retry = false;
+				}
+				cleanup.active = false;
+			}
+		}
+		PG_END_ENSURE_ERROR_CLEANUP(cluster_runtime_visibility_candidate_cleanup,
+									PointerGetDatum(&cleanup));
+		if ((sampled || precommit_retry)
+			&& (!cluster_runtime_visibility_locate_scope_current(xid, &admission, &locate_scope)
+				|| !cluster_runtime_visibility_resolve_root_admitted(
+					CLUSTER_TX_RESOLVE_VISIBILITY, &admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+					logical.owner_instance, logical.segment_id, &final_root)
+				|| !cluster_runtime_visibility_candidate_root_matches(&root, &final_root)
+				|| !cluster_runtime_visibility_admission_current(CLUSTER_TX_RESOLVE_VISIBILITY,
+																 &admission))) {
+			sampled = false;
+			precommit_retry = false;
+		}
+
+		done:;
+	}
+	PG_FINALLY();
+	{
 		cluster_semantic_activation_leave(&admission);
+	}
+	PG_END_TRY();
 	if (!sampled) {
 		MemSet(key_out, 0, sizeof(*key_out));
 		MemSet(result_out, 0, sizeof(*result_out));
@@ -2734,7 +2750,6 @@ cluster_runtime_visibility_current_mx_updater_provenance_exact(
 	bool physical_active = false;
 	bool sampled = false;
 	bool precommit_retry = false;
-	bool entered = false;
 
 	if (precommit_retry_out != NULL)
 		*precommit_retry_out = false;
@@ -2791,161 +2806,167 @@ cluster_runtime_visibility_current_mx_updater_provenance_exact(
 											 CLUSTER_SEMANTIC_TARGET_SIDE, &admission)
 			   != CLUSTER_SEMANTIC_ADMISSION_OK)
 		return false;
-	entered = true;
-	if (admission.formation_epoch != epoch)
-		goto done;
-
-	data_logical.owner_instance = (uint8)((uint32)origin + 1);
-	data_logical.segment_id = data_segment;
-	if (!cluster_runtime_visibility_resolve_root_admitted(
-			CLUSTER_TX_RESOLVE_VISIBILITY, &admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
-			data_logical.owner_instance, data_logical.segment_id, &data_root)
-		|| !cluster_runtime_visibility_admission_current(CLUSTER_TX_RESOLVE_VISIBILITY, &admission))
-		goto done;
-
-	cluster_runtime_visibility_ensure_exit_hooks();
-	PG_ENSURE_ERROR_CLEANUP(cluster_runtime_visibility_candidate_cleanup,
-							PointerGetDatum(&cleanup));
+	/* The borrowed guard must unwind before this caller-owned admission. */
+	PG_TRY();
 	{
-		if (cluster_runtime_visibility_candidate_acquire_until(&data_logical, &admission, &guard,
-															   &cleanup, &current_result, deadline)
-			!= CLUSTER_UNDO_BLOCK0_CURRENT_HELD)
-			goto protected_done;
-		phase_root = data_root;
-		origin_step = cluster_runtime_visibility_origin_plan_freeze_data_held(
-			locator, CLUSTER_TX_RESOLVE_VISIBILITY, &admission, NULL, &guard, &phase_root, &plan,
-			&resolution, &reason);
-		if (origin_step == CLUSTER_RUNTIME_VISIBILITY_ORIGIN_FAILED
-			|| !cluster_runtime_visibility_origin_plan_canonical_physical(&plan, &physical,
-																		  &same_segment)
-			|| (origin_step == CLUSTER_RUNTIME_VISIBILITY_ORIGIN_COMPLETE && !same_segment)
-			|| (origin_step == CLUSTER_RUNTIME_VISIBILITY_ORIGIN_NEEDS_CANONICAL && same_segment))
-			goto protected_done;
+		if (admission.formation_epoch != epoch)
+			goto done;
 
-		if (!same_segment) {
-			if (cluster_runtime_visibility_candidate_release_until(&guard, &current_result,
-																   deadline)
-				!= CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED)
-				goto protected_done;
-			cleanup.active = false;
-			memset(&guard, 0, sizeof(guard));
-			if (!cluster_runtime_visibility_origin_plan_canonical_logical(&plan, &tt_logical)
-				|| !cluster_runtime_visibility_resolve_root_admitted(
-					CLUSTER_TX_RESOLVE_VISIBILITY, &admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
-					tt_logical.owner_instance, tt_logical.segment_id, &phase_root)
-				|| cluster_runtime_visibility_candidate_acquire_until(
-					   &tt_logical, &admission, &guard, &cleanup, &current_result, deadline)
-					   != CLUSTER_UNDO_BLOCK0_CURRENT_HELD
-				|| !cluster_runtime_visibility_origin_plan_sample_canonical_held(
-					&plan, CLUSTER_TX_RESOLVE_VISIBILITY, &admission, &guard, &phase_root, &reason))
-				goto protected_done;
-		}
+		data_logical.owner_instance = (uint8)((uint32)origin + 1);
+		data_logical.segment_id = data_segment;
+		if (!cluster_runtime_visibility_resolve_root_admitted(
+				CLUSTER_TX_RESOLVE_VISIBILITY, &admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+				data_logical.owner_instance, data_logical.segment_id, &data_root)
+			|| !cluster_runtime_visibility_admission_current(CLUSTER_TX_RESOLVE_VISIBILITY, &admission))
+			goto done;
 
-		if (!cluster_runtime_visibility_physical_locator_sample_held(
-				&physical, &admission, &guard, &phase_root, &sampled_key, &sampled_result,
-				&physical_active, &precommit_retry))
-			goto protected_done;
-		/* This observation cannot authorize a member or updater proof.  Let
-		 * cleanup release SCUR before the caller can retry the whole batch. */
-		if (precommit_retry)
-			goto protected_done;
-		if (sampled_result.status == CLUSTER_TT_STATUS_IN_PROGRESS) {
-			owner.segment_id = physical.segment_id;
-			owner.xid = physical.xid;
-			owner.slot_offset = physical.slot_offset;
-			owner.wrap = physical.wrap;
-			if (!physical_active || admission.record_generation > UINT32_MAX
-				|| cluster_undo_block0_current_sample_generation(&guard, &phase_root, &generation)
-					   != CLUSTER_UNDO_BLOCK0_OK
-				|| !cluster_runtime_visibility_ctrc_key_fill(&owner, &generation, &phase_root,
-															 &admission, &ctrc_key))
-				goto protected_done;
-			participant.node_id = (uint16)cluster_node_id;
-			participant.capability_record_generation = (uint32)admission.record_generation;
-			participant.boot_incarnation = ctrc_key.origin_boot_incarnation;
-			participant.formation_epoch = admission.formation_epoch;
-			participant.admission_record_generation = admission.record_generation;
-			touch_result = cluster_ctrc_origin_touch_exact(&ctrc_key, &participant,
-														   CTRC_PROOF_ACTIVE, &grant);
-			if ((touch_result != CLUSTER_CTRC_TOUCH_RECORDED
-				 && touch_result != CLUSTER_CTRC_TOUCH_DUPLICATE)
-				|| grant == 0
-				|| cluster_undo_block0_current_sample_generation(&guard, &phase_root,
-																 &final_generation)
-					   != CLUSTER_UNDO_BLOCK0_OK
-				|| !final_generation.known || final_generation.value != generation.value
-				|| !cluster_runtime_visibility_resolve_root_admitted(
-					CLUSTER_TX_RESOLVE_VISIBILITY, &admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
-					same_segment ? data_logical.owner_instance : tt_logical.owner_instance,
-					physical.segment_id, &final_tt_root)
-				|| !cluster_runtime_visibility_candidate_root_matches(&phase_root, &final_tt_root)
-				|| cluster_qvotec_get_self_incarnation() != ctrc_key.origin_boot_incarnation)
-				goto protected_done;
-		} else if (physical_active
-				   || (sampled_result.status != CLUSTER_TT_STATUS_COMMITTED
-					   && sampled_result.status != CLUSTER_TT_STATUS_ABORTED))
-			goto protected_done;
-
-		if (!same_segment) {
-			if (cluster_runtime_visibility_candidate_release_until(&guard, &current_result,
-																   deadline)
-				!= CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED)
-				goto protected_done;
-			cleanup.active = false;
-			memset(&guard, 0, sizeof(guard));
-			if (!cluster_runtime_visibility_resolve_root_admitted(
-					CLUSTER_TX_RESOLVE_VISIBILITY, &admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
-					data_logical.owner_instance, data_logical.segment_id, &final_data_root)
-				|| !cluster_runtime_visibility_candidate_root_matches(&data_root, &final_data_root)
-				|| cluster_runtime_visibility_candidate_acquire_until(
-					   &data_logical, &admission, &guard, &cleanup, &current_result, deadline)
-					   != CLUSTER_UNDO_BLOCK0_CURRENT_HELD)
-				goto protected_done;
-			phase_root = final_data_root;
-		}
-		outcome = cluster_runtime_visibility_origin_plan_recheck_data_held(
-			&plan, CLUSTER_TX_RESOLVE_VISIBILITY, &admission, &guard, &phase_root, &resolution,
-			&reason);
-		if (outcome == CLUSTER_TX_UNKNOWN
-			|| !cluster_tx_locator_reply_matches(locator, &resolution.locator_echo)
-			|| (outcome == CLUSTER_TX_IN_PROGRESS
-				&& sampled_result.status != CLUSTER_TT_STATUS_IN_PROGRESS)
-			|| (outcome == CLUSTER_TX_COMMITTED
-				&& sampled_result.status != CLUSTER_TT_STATUS_COMMITTED)
-			|| (outcome == CLUSTER_TX_ABORTED && sampled_result.status != CLUSTER_TT_STATUS_ABORTED)
-			|| (grant != 0
-				&& !cluster_ctrc_origin_grant_publishable(&ctrc_key, &participant, grant)))
-			goto protected_done;
-		sampled = true;
-
-	protected_done:
-		if (cleanup.active) {
-			if (cluster_runtime_visibility_candidate_release_until(&guard, &current_result,
-																   deadline)
-				!= CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED) {
-				cluster_undo_block0_current_cancel(&guard);
-				sampled = false;
-				precommit_retry = false;
-			}
-			cleanup.active = false;
-		}
-	}
-	PG_END_ENSURE_ERROR_CLEANUP(cluster_runtime_visibility_candidate_cleanup,
+		cluster_runtime_visibility_ensure_exit_hooks();
+		PG_ENSURE_ERROR_CLEANUP(cluster_runtime_visibility_candidate_cleanup,
 								PointerGetDatum(&cleanup));
+		{
+			if (cluster_runtime_visibility_candidate_acquire_until(&data_logical, &admission, &guard,
+																   &cleanup, &current_result, deadline)
+				!= CLUSTER_UNDO_BLOCK0_CURRENT_HELD)
+				goto protected_done;
+			phase_root = data_root;
+			origin_step = cluster_runtime_visibility_origin_plan_freeze_data_held(
+				locator, CLUSTER_TX_RESOLVE_VISIBILITY, &admission, NULL, &guard, &phase_root, &plan,
+				&resolution, &reason);
+			if (origin_step == CLUSTER_RUNTIME_VISIBILITY_ORIGIN_FAILED
+				|| !cluster_runtime_visibility_origin_plan_canonical_physical(&plan, &physical,
+																			  &same_segment)
+				|| (origin_step == CLUSTER_RUNTIME_VISIBILITY_ORIGIN_COMPLETE && !same_segment)
+				|| (origin_step == CLUSTER_RUNTIME_VISIBILITY_ORIGIN_NEEDS_CANONICAL && same_segment))
+				goto protected_done;
 
-	if ((sampled || precommit_retry)
-		&& (cluster_epoch_get_current() != epoch
-			|| !cluster_runtime_visibility_admission_current(CLUSTER_TX_RESOLVE_VISIBILITY,
-															 &admission)
-			|| (grant != 0
-				&& !cluster_ctrc_origin_grant_publishable(&ctrc_key, &participant, grant)))) {
-		sampled = false;
-		precommit_retry = false;
+			if (!same_segment) {
+				if (cluster_runtime_visibility_candidate_release_until(&guard, &current_result,
+																	   deadline)
+					!= CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED)
+					goto protected_done;
+				cleanup.active = false;
+				memset(&guard, 0, sizeof(guard));
+				if (!cluster_runtime_visibility_origin_plan_canonical_logical(&plan, &tt_logical)
+					|| !cluster_runtime_visibility_resolve_root_admitted(
+						CLUSTER_TX_RESOLVE_VISIBILITY, &admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+						tt_logical.owner_instance, tt_logical.segment_id, &phase_root)
+					|| cluster_runtime_visibility_candidate_acquire_until(
+						   &tt_logical, &admission, &guard, &cleanup, &current_result, deadline)
+						   != CLUSTER_UNDO_BLOCK0_CURRENT_HELD
+					|| !cluster_runtime_visibility_origin_plan_sample_canonical_held(
+						&plan, CLUSTER_TX_RESOLVE_VISIBILITY, &admission, &guard, &phase_root, &reason))
+					goto protected_done;
+			}
+
+			if (!cluster_runtime_visibility_physical_locator_sample_held(
+					&physical, &admission, &guard, &phase_root, &sampled_key, &sampled_result,
+					&physical_active, &precommit_retry))
+				goto protected_done;
+			/* This observation cannot authorize a member or updater proof.  Let
+			 * cleanup release SCUR before the caller can retry the whole batch. */
+			if (precommit_retry)
+				goto protected_done;
+			if (sampled_result.status == CLUSTER_TT_STATUS_IN_PROGRESS) {
+				owner.segment_id = physical.segment_id;
+				owner.xid = physical.xid;
+				owner.slot_offset = physical.slot_offset;
+				owner.wrap = physical.wrap;
+				if (!physical_active || admission.record_generation > UINT32_MAX
+					|| cluster_undo_block0_current_sample_generation(&guard, &phase_root, &generation)
+						   != CLUSTER_UNDO_BLOCK0_OK
+					|| !cluster_runtime_visibility_ctrc_key_fill(&owner, &generation, &phase_root,
+																 &admission, &ctrc_key))
+					goto protected_done;
+				participant.node_id = (uint16)cluster_node_id;
+				participant.capability_record_generation = (uint32)admission.record_generation;
+				participant.boot_incarnation = ctrc_key.origin_boot_incarnation;
+				participant.formation_epoch = admission.formation_epoch;
+				participant.admission_record_generation = admission.record_generation;
+				touch_result = cluster_ctrc_origin_touch_exact(&ctrc_key, &participant,
+															   CTRC_PROOF_ACTIVE, &grant);
+				if ((touch_result != CLUSTER_CTRC_TOUCH_RECORDED
+					 && touch_result != CLUSTER_CTRC_TOUCH_DUPLICATE)
+					|| grant == 0
+					|| cluster_undo_block0_current_sample_generation(&guard, &phase_root,
+																	 &final_generation)
+						   != CLUSTER_UNDO_BLOCK0_OK
+					|| !final_generation.known || final_generation.value != generation.value
+					|| !cluster_runtime_visibility_resolve_root_admitted(
+						CLUSTER_TX_RESOLVE_VISIBILITY, &admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+						same_segment ? data_logical.owner_instance : tt_logical.owner_instance,
+						physical.segment_id, &final_tt_root)
+					|| !cluster_runtime_visibility_candidate_root_matches(&phase_root, &final_tt_root)
+					|| cluster_qvotec_get_self_incarnation() != ctrc_key.origin_boot_incarnation)
+					goto protected_done;
+			} else if (physical_active
+					   || (sampled_result.status != CLUSTER_TT_STATUS_COMMITTED
+						   && sampled_result.status != CLUSTER_TT_STATUS_ABORTED))
+				goto protected_done;
+
+			if (!same_segment) {
+				if (cluster_runtime_visibility_candidate_release_until(&guard, &current_result,
+																	   deadline)
+					!= CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED)
+					goto protected_done;
+				cleanup.active = false;
+				memset(&guard, 0, sizeof(guard));
+				if (!cluster_runtime_visibility_resolve_root_admitted(
+						CLUSTER_TX_RESOLVE_VISIBILITY, &admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+						data_logical.owner_instance, data_logical.segment_id, &final_data_root)
+					|| !cluster_runtime_visibility_candidate_root_matches(&data_root, &final_data_root)
+					|| cluster_runtime_visibility_candidate_acquire_until(
+						   &data_logical, &admission, &guard, &cleanup, &current_result, deadline)
+						   != CLUSTER_UNDO_BLOCK0_CURRENT_HELD)
+					goto protected_done;
+				phase_root = final_data_root;
+			}
+			outcome = cluster_runtime_visibility_origin_plan_recheck_data_held(
+				&plan, CLUSTER_TX_RESOLVE_VISIBILITY, &admission, &guard, &phase_root, &resolution,
+				&reason);
+			if (outcome == CLUSTER_TX_UNKNOWN
+				|| !cluster_tx_locator_reply_matches(locator, &resolution.locator_echo)
+				|| (outcome == CLUSTER_TX_IN_PROGRESS
+					&& sampled_result.status != CLUSTER_TT_STATUS_IN_PROGRESS)
+				|| (outcome == CLUSTER_TX_COMMITTED
+					&& sampled_result.status != CLUSTER_TT_STATUS_COMMITTED)
+				|| (outcome == CLUSTER_TX_ABORTED && sampled_result.status != CLUSTER_TT_STATUS_ABORTED)
+				|| (grant != 0
+					&& !cluster_ctrc_origin_grant_publishable(&ctrc_key, &participant, grant)))
+				goto protected_done;
+			sampled = true;
+
+		protected_done:
+			if (cleanup.active) {
+				if (cluster_runtime_visibility_candidate_release_until(&guard, &current_result,
+																	   deadline)
+					!= CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED) {
+					cluster_undo_block0_current_cancel(&guard);
+					sampled = false;
+					precommit_retry = false;
+				}
+				cleanup.active = false;
+			}
+		}
+		PG_END_ENSURE_ERROR_CLEANUP(cluster_runtime_visibility_candidate_cleanup,
+									PointerGetDatum(&cleanup));
+
+		if ((sampled || precommit_retry)
+			&& (cluster_epoch_get_current() != epoch
+				|| !cluster_runtime_visibility_admission_current(CLUSTER_TX_RESOLVE_VISIBILITY,
+																 &admission)
+				|| (grant != 0
+					&& !cluster_ctrc_origin_grant_publishable(&ctrc_key, &participant, grant)))) {
+			sampled = false;
+			precommit_retry = false;
+		}
+
+		done:;
 	}
-
-done:
-	if (entered)
+	PG_FINALLY();
+	{
 		cluster_semantic_activation_leave(&admission);
+	}
+	PG_END_TRY();
 	if (precommit_retry_out != NULL)
 		*precommit_retry_out = precommit_retry;
 	if (!sampled)
