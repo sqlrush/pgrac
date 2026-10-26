@@ -298,6 +298,7 @@ PreflightClusterSharedCatalogWrite(Node *statement)
 	if (!cluster_shared_catalog || !cluster_storage_mode_enabled()
 		|| (!IsA(statement, CreateStmt) && !IsA(statement, CreateTableAsStmt)
 			&& !IsA(statement, CreateSchemaStmt) && !IsA(statement, CreateSeqStmt)
+			&& !IsA(statement, IndexStmt) && !IsA(statement, ViewStmt)
 			&& !IsA(statement, TruncateStmt)))
 		return;
 

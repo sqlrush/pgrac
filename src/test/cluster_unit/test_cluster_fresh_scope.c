@@ -278,6 +278,10 @@ CreateCommandTag(Node *statement)
 		return CMDTAG_CREATE_SCHEMA;
 	if (IsA(statement, CreateSeqStmt))
 		return CMDTAG_CREATE_SEQUENCE;
+	if (IsA(statement, IndexStmt))
+		return CMDTAG_CREATE_INDEX;
+	if (IsA(statement, ViewStmt))
+		return CMDTAG_CREATE_VIEW;
 	return IsA(statement, CreateTableAsStmt) ? CMDTAG_CREATE_TABLE_AS : CMDTAG_CREATE_TABLE;
 }
 
@@ -290,6 +294,10 @@ GetCommandTagName(CommandTag tag)
 		return "CREATE SCHEMA";
 	if (tag == CMDTAG_CREATE_SEQUENCE)
 		return "CREATE SEQUENCE";
+	if (tag == CMDTAG_CREATE_INDEX)
+		return "CREATE INDEX";
+	if (tag == CMDTAG_CREATE_VIEW)
+		return "CREATE VIEW";
 	return tag == CMDTAG_CREATE_TABLE_AS ? "CREATE TABLE AS" : "CREATE TABLE";
 }
 
@@ -1363,17 +1371,20 @@ UT_TEST(test_truncate_original_readonly_parallel_guards_precede_binding)
 	}
 }
 
-UT_TEST(test_schema_sequence_bind_before_later_work_and_reuse_top)
+UT_TEST(test_catalog_creations_bind_before_later_work_and_reuse_top)
 {
 	CreateSchemaStmt schema = { .type = T_CreateSchemaStmt };
 	CreateSeqStmt sequence = { .type = T_CreateSeqStmt };
-	Node *statements[] = { (Node *)&schema, (Node *)&sequence };
+	IndexStmt index = { .type = T_IndexStmt };
+	ViewStmt view = { .type = T_ViewStmt };
+	Node *statements[] = { (Node *)&schema, (Node *)&sequence, (Node *)&index, (Node *)&view };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned skip = 0; skip < 2; skip++) {
 			reset_create_preflight();
 			utility_expect_binding = true;
 			schema.if_not_exists = sequence.if_not_exists = skip != 0;
+			index.if_not_exists = index.unique = view.replace = skip != 0;
 			create_sql_entry(statements[i]);
 			UT_ASSERT_EQ(utility_unbound, 0);
 			UT_ASSERT_EQ(utility_after_preflight, 1);
@@ -1390,12 +1401,17 @@ UT_TEST(test_schema_sequence_bind_before_later_work_and_reuse_top)
 	}
 }
 
-UT_TEST(test_schema_binds_before_children_and_children_reuse_top)
+UT_TEST(test_schema_binds_before_catalog_children_and_children_reuse_top)
 {
 	CreateStmt table = { .type = T_CreateStmt };
 	CreateSeqStmt sequence = { .type = T_CreateSeqStmt };
-	ListCell cells[2] = { { .ptr_value = &table }, { .ptr_value = &sequence } };
-	List children = { .type = T_List, .length = 2, .max_length = 2, .elements = cells };
+	IndexStmt index = { .type = T_IndexStmt };
+	ViewStmt view = { .type = T_ViewStmt };
+	ListCell cells[4] = { { .ptr_value = &table },
+						  { .ptr_value = &sequence },
+						  { .ptr_value = &index },
+						  { .ptr_value = &view } };
+	List children = { .type = T_List, .length = 4, .max_length = 4, .elements = cells };
 	CreateSchemaStmt schema = { .type = T_CreateSchemaStmt, .schemaElts = &children };
 
 	reset_create_preflight();
@@ -1408,18 +1424,22 @@ UT_TEST(test_schema_binds_before_children_and_children_reuse_top)
 	 * utility prologue here, after the namespace would already exist. */
 	create_sql_entry((Node *)&table);
 	create_sql_entry((Node *)&sequence);
+	create_sql_entry((Node *)&index);
+	create_sql_entry((Node *)&view);
 	UT_ASSERT_EQ(utility_unbound, 0);
-	UT_ASSERT_EQ(utility_after_preflight, 3);
+	UT_ASSERT_EQ(utility_after_preflight, 5);
 	UT_ASSERT_EQ(utility_xids, 1);
-	UT_ASSERT_EQ(utility_prepares, 3);
+	UT_ASSERT_EQ(utility_prepares, 5);
 	UT_ASSERT_EQ(utility_binds, 1);
 }
 
-UT_TEST(test_schema_sequence_publication_refusal_precedes_later_work)
+UT_TEST(test_catalog_creations_publication_refusal_precedes_later_work)
 {
 	CreateSchemaStmt schema = { .type = T_CreateSchemaStmt };
 	CreateSeqStmt sequence = { .type = T_CreateSeqStmt };
-	Node *statements[] = { (Node *)&schema, (Node *)&sequence };
+	IndexStmt index = { .type = T_IndexStmt };
+	ViewStmt view = { .type = T_ViewStmt };
+	Node *statements[] = { (Node *)&schema, (Node *)&sequence, (Node *)&index, (Node *)&view };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		int caught;
@@ -1438,11 +1458,13 @@ UT_TEST(test_schema_sequence_publication_refusal_precedes_later_work)
 	}
 }
 
-UT_TEST(test_schema_sequence_child_or_wrong_top_refuses_before_allocation)
+UT_TEST(test_catalog_creations_child_or_wrong_top_refuses_before_allocation)
 {
 	CreateSchemaStmt schema = { .type = T_CreateSchemaStmt };
 	CreateSeqStmt sequence = { .type = T_CreateSeqStmt };
-	Node *statements[] = { (Node *)&schema, (Node *)&sequence };
+	IndexStmt index = { .type = T_IndexStmt };
+	ViewStmt view = { .type = T_ViewStmt };
+	Node *statements[] = { (Node *)&schema, (Node *)&sequence, (Node *)&index, (Node *)&view };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned child = 0; child < 2; child++) {
@@ -1467,11 +1489,13 @@ UT_TEST(test_schema_sequence_child_or_wrong_top_refuses_before_allocation)
 	}
 }
 
-UT_TEST(test_schema_sequence_preflight_requires_shared_catalog_storage)
+UT_TEST(test_catalog_creations_preflight_requires_shared_catalog_storage)
 {
 	CreateSchemaStmt schema = { .type = T_CreateSchemaStmt };
 	CreateSeqStmt sequence = { .type = T_CreateSeqStmt };
-	Node *statements[] = { (Node *)&schema, (Node *)&sequence };
+	IndexStmt index = { .type = T_IndexStmt };
+	ViewStmt view = { .type = T_ViewStmt };
+	Node *statements[] = { (Node *)&schema, (Node *)&sequence, (Node *)&index, (Node *)&view };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned mode = 0; mode < 8; mode++) {
@@ -1488,11 +1512,14 @@ UT_TEST(test_schema_sequence_preflight_requires_shared_catalog_storage)
 	}
 }
 
-UT_TEST(test_schema_sequence_readonly_parallel_guards_precede_binding)
+UT_TEST(test_catalog_creations_readonly_parallel_guards_precede_binding)
 {
 	CreateSchemaStmt schema = { .type = T_CreateSchemaStmt };
 	CreateSeqStmt sequence = { .type = T_CreateSeqStmt };
-	Node *statements[] = { (Node *)&schema, (Node *)&sequence };
+	IndexStmt index = { .type = T_IndexStmt };
+	ViewStmt view = { .type = T_ViewStmt };
+	Node *statements[] = { (Node *)&schema, (Node *)&sequence, (Node *)&index, (Node *)&view };
+	const char *tags[] = { "CREATE SCHEMA", "CREATE SEQUENCE", "CREATE INDEX", "CREATE VIEW" };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned parallel = 0; parallel < 2; parallel++) {
@@ -1507,7 +1534,7 @@ UT_TEST(test_schema_sequence_readonly_parallel_guards_precede_binding)
 			UT_ASSERT(caught);
 			UT_ASSERT_EQ(error_code, parallel ? ERRCODE_INVALID_TRANSACTION_STATE
 											  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
-			UT_ASSERT(strstr(error_message, i == 0 ? "CREATE SCHEMA" : "CREATE SEQUENCE") != NULL);
+			UT_ASSERT(strstr(error_message, tags[i]) != NULL);
 			UT_ASSERT_EQ(utility_xids, 0);
 			UT_ASSERT_EQ(utility_prepares, 0);
 			UT_ASSERT_EQ(utility_after_preflight, 0);
@@ -1569,16 +1596,44 @@ UT_TEST(test_unlogged_sequence_refuses_before_binding_only_in_shared_catalog)
 	}
 }
 
+UT_TEST(test_unsupported_index_refuses_before_binding_and_schema_work)
+{
+	IndexStmt index = { .type = T_IndexStmt };
+	ListCell cell = { .ptr_value = &index };
+	List children = { .type = T_List, .length = 1, .max_length = 1, .elements = &cell };
+	CreateSchemaStmt schema = { .type = T_CreateSchemaStmt, .schemaElts = &children };
+	Node *statements[] = { (Node *)&index, (Node *)&schema };
+
+	for (unsigned i = 0; i < lengthof(statements); i++) {
+		for (unsigned concurrent = 0; concurrent < 2; concurrent++) {
+			int caught;
+
+			reset_create_preflight();
+			index.accessMethod = concurrent ? "btree" : "hash";
+			index.concurrent = concurrent != 0;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				create_sql_entry(statements[i]);
+			UT_ASSERT(caught);
+			UT_ASSERT_EQ(error_code, ERRCODE_FEATURE_NOT_SUPPORTED);
+			UT_ASSERT_EQ(utility_xids, 0);
+			UT_ASSERT_EQ(utility_prepares, 0);
+			UT_ASSERT_EQ(utility_after_preflight, 0);
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(42);
-	UT_RUN(test_schema_sequence_bind_before_later_work_and_reuse_top);
-	UT_RUN(test_schema_binds_before_children_and_children_reuse_top);
-	UT_RUN(test_schema_sequence_publication_refusal_precedes_later_work);
-	UT_RUN(test_schema_sequence_child_or_wrong_top_refuses_before_allocation);
-	UT_RUN(test_schema_sequence_preflight_requires_shared_catalog_storage);
-	UT_RUN(test_schema_sequence_readonly_parallel_guards_precede_binding);
+	UT_PLAN(43);
+	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
+	UT_RUN(test_catalog_creations_bind_before_later_work_and_reuse_top);
+	UT_RUN(test_schema_binds_before_catalog_children_and_children_reuse_top);
+	UT_RUN(test_catalog_creations_publication_refusal_precedes_later_work);
+	UT_RUN(test_catalog_creations_child_or_wrong_top_refuses_before_allocation);
+	UT_RUN(test_catalog_creations_preflight_requires_shared_catalog_storage);
+	UT_RUN(test_catalog_creations_readonly_parallel_guards_precede_binding);
 	UT_RUN(test_schema_unsupported_children_refuse_before_binding);
 	UT_RUN(test_unlogged_sequence_refuses_before_binding_only_in_shared_catalog);
 	UT_RUN(test_shared_truncate_variants_and_targets_bind_before_later_work);
