@@ -100,8 +100,6 @@ $a->safe_psql('postgres', q{CREATE TABLE first_fill_hot_data(id int, v int, pad 
 $a->safe_psql('postgres', 'VACUUM(FREEZE) first_fill_hot_data');
 $a->safe_psql('postgres', 'CHECKPOINT');
 $a->safe_psql('postgres', 'UPDATE first_fill_hot_data SET v=2');
-is($a->safe_psql('postgres', q{SELECT pg_relation_size('first_fill_hot_data')}),
-	'8192', 'all original and updated tuples occupy the one target heap block');
 my $tag = $a->safe_psql('postgres', q{SELECT
 	COALESCE(NULLIF(c.reltablespace,0),d.dattablespace)::text || '/' ||
 	d.oid::text || '/' || pg_relation_filenode(c.oid)::text || '/0/0'
@@ -110,6 +108,11 @@ my $tag = $a->safe_psql('postgres', q{SELECT
 require_true($tag =~ /^([1-9][0-9]*)\/([1-9][0-9]*)\/([1-9][0-9]*)\/0\/0$/,
 	'exact native target BufferTag is required');
 my ($spc, $db, $rel) = ($1, $2, $3);
+require_true($spc == 1663, 'the fixture uses the default tablespace layout');
+# Measure the declared native shared heap, rather than a node-local path.
+my $physical_heap = $cluster->shared_root . "/base/$db/$rel";
+is(-s $physical_heap, 8192,
+	'all original and updated tuples occupy the one target heap block');
 my $target = qr/tag=\Q$tag\E /;
 
 # All clients, module loads, relation metadata and statement shapes are ready
