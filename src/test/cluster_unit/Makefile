@@ -2304,6 +2304,7 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		$(top_srcdir)/src/include/cluster/cluster_xid_stripe.h \
 		test_cluster_active_sample_types.inc test_cluster_active_sample_fence.inc \
 		test_cluster_heap_freeze_admission_current.inc \
+		test_cluster_heap_freeze_admission_lifecycle.inc \
 		$(top_srcdir)/src/include/cluster/cluster_wal_thread.h \
 		test_cluster_heap_freeze_startup_types.inc test_cluster_heap_freeze_startup_source.inc \
 		$(top_srcdir)/src/include/cluster/cluster_reconfig.h \
@@ -8619,6 +8620,19 @@ test_cluster_heap_freeze_admission_current.inc: $(top_srcdir)/src/backend/cluste
 	     END { if (count != 6 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Original terminal-census admission, debt counters and backend exit cleanup.
+test_cluster_heap_freeze_admission_lifecycle.inc: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c Makefile
+	awk '/^#define CLUSTER_SEMANTIC_ADMISSION_COUNTER_TRIES / { print; constants++ } \
+	     /^cluster_semantic_activation_backend_has_admission\(/ { print "bool"; emit=1; count++ } \
+	     /^semantic_activation_(counter_increment|ensure_exit_hook)\(/ { print "static bool"; emit=1; count++ } \
+	     /^semantic_activation_(counter_subtract|exit_cleanup|release_debt)\(/ { print "static void"; emit=1; count++ } \
+	     /^semantic_activation_enter_internal\(/ { print "static ClusterSemanticAdmissionResult"; emit=1; count++ } \
+	     /^cluster_semantic_activation_enter_r4_terminal_census\(/ { print "ClusterSemanticAdmissionResult"; emit=1; count++ } \
+	     /^cluster_semantic_activation_leave\(/ { print "void"; emit=1; count++ } \
+	     emit { print } /^}$$/ { emit=0 } \
+	     END { if (count != 9 || constants != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_active_sample_fence.inc: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c Makefile
 	awk '/^semantic_activation_(snapshot|modifier_policy)\(/ { print "static bool"; emit=1; count++ } \
 	     /^cluster_semantic_activation_active_sample_(capture|current)\(/ { print "bool"; emit=1; count++ } \
@@ -10526,6 +10540,7 @@ clean-active-sample-fence:
 	rm -f test_cluster_active_sample_types.inc test_cluster_active_sample_types.inc.tmp
 	rm -f test_cluster_active_sample_fence.inc test_cluster_active_sample_fence.inc.tmp
 	rm -f test_cluster_heap_freeze_admission_current.inc test_cluster_heap_freeze_admission_current.inc.tmp
+	rm -f test_cluster_heap_freeze_admission_lifecycle.inc test_cluster_heap_freeze_admission_lifecycle.inc.tmp
 	rm -f test_cluster_heap_freeze_startup_types.inc test_cluster_heap_freeze_startup_types.inc.tmp
 	rm -f test_cluster_heap_freeze_startup_source.inc test_cluster_heap_freeze_startup_source.inc.tmp
 
