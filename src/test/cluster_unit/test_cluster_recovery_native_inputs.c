@@ -967,6 +967,7 @@ UT_TEST(test_ctrc_inventory_keeps_original_local_cut_and_native_terminal_bytes)
 #include "test_cluster_recovery_episode_history.inc"
 #include "test_cluster_recovery_relmap_fold.inc"
 #include "test_cluster_recovery_episode_pending.inc"
+#include "test_cluster_recovery_episode_base.inc"
 
 int
 main(int argc, char **argv)
@@ -975,7 +976,7 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(101);
+	UT_PLAN(108);
 	UT_RUN(test_ctrc_inventory_keeps_original_local_cut_and_native_terminal_bytes);
 	UT_RUN(test_owned_ctrc_census_borrows_namespace_and_revokes_changed_work);
 	UT_RUN(test_owned_ctrc_census_rejects_other_purpose_and_namespace_switch);
@@ -1077,6 +1078,13 @@ main(int argc, char **argv)
 	UT_RUN(test_episode_pending_first_current_error_retains_original_protection);
 	UT_RUN(test_episode_pending_final_reread_drift_never_revives_the_query);
 	UT_RUN(test_episode_pending_output_and_caller_lock_preconditions_preserve_custody);
+	UT_RUN(test_episode_base_requires_drain_and_retains_actual_query_source);
+	UT_RUN(test_episode_base_rejects_unqualified_or_ambiguous_native_source);
+	UT_RUN(test_episode_base_bound_query_cannot_restart_or_replace_custody);
+	UT_RUN(test_episode_base_final_physical_reread_keeps_the_original_baseline);
+	UT_RUN(test_episode_base_first_and_existing_errors_never_drop_protection);
+	UT_RUN(test_episode_base_after_read_source_drift_discards_only_local_output);
+	UT_RUN(test_episode_base_output_lock_and_budget_preconditions_do_not_poison);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
