@@ -197,6 +197,7 @@ typedef struct ClusterRuntimeVisibilityDataDiagnostic {
 	bool record_extracted;
 	size_t record_length;
 	uint32 tt_segment_id;
+	int32 data_copy_result; /* ClusterUndoBufResidentCopyResult before any readthrough */
 } ClusterRuntimeVisibilityDataDiagnostic;
 
 extern void cluster_runtime_visibility_ensure_exit_hooks(void);

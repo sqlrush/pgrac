@@ -742,6 +742,15 @@ cluster_undo_buf_pin(uint32 segment_id, uint8 owner, uint32 block_no, ClusterUnd
 }
 
 
+static bool
+resident_copy_observe(ClusterUndoBufResidentCopyResult *result,
+					  ClusterUndoBufResidentCopyResult observed)
+{
+	if (result != NULL)
+		*result = observed;
+	return observed == CLUSTER_UNDO_BUF_RESIDENT_COPIED;
+}
+
 /*
  * cluster_undo_buf_copy_resident -- copy an exact resident DATA image without
  * read-through fill.  The map-lock pin closes eviction/reuse between lookup
@@ -752,11 +761,22 @@ cluster_undo_buf_pin(uint32 segment_id, uint8 owner, uint32 block_no, ClusterUnd
 bool
 cluster_undo_buf_copy_resident(uint32 segment_id, uint8 owner, uint32 block_no, char dst[BLCKSZ])
 {
+	return cluster_undo_buf_copy_resident_observed(segment_id, owner, block_no, dst, NULL);
+}
+
+bool
+cluster_undo_buf_copy_resident_observed(uint32 segment_id, uint8 owner, uint32 block_no,
+										char dst[BLCKSZ], ClusterUndoBufResidentCopyResult *result)
+{
 	int slotno = -1;
 	UndoBufSlot *slot;
 
-	if (dst == NULL || block_no < CLUSTER_UNDO_BUF_FIRST_DATA_BLOCK || UndoBufPool == NULL)
-		return false;
+	if (dst == NULL)
+		return resident_copy_observe(result, CLUSTER_UNDO_BUF_RESIDENT_BAD_DESTINATION);
+	if (block_no < CLUSTER_UNDO_BUF_FIRST_DATA_BLOCK)
+		return resident_copy_observe(result, CLUSTER_UNDO_BUF_RESIDENT_BAD_BLOCK);
+	if (UndoBufPool == NULL)
+		return resident_copy_observe(result, CLUSTER_UNDO_BUF_RESIDENT_DISABLED);
 
 	LWLockAcquire(&UndoBufPool->map_lock, LW_EXCLUSIVE);
 	for (int i = 0; i < UndoBufPool->nslots; i++) {
@@ -766,9 +786,13 @@ cluster_undo_buf_copy_resident(uint32 segment_id, uint8 owner, uint32 block_no, 
 		}
 	}
 	if (slotno < 0 || UndoBufSlots[slotno].io_in_progress) {
+		ClusterUndoBufResidentCopyResult observed
+			= slotno < 0 ? CLUSTER_UNDO_BUF_RESIDENT_MISS : CLUSTER_UNDO_BUF_RESIDENT_FILLING;
+
 		LWLockRelease(&UndoBufPool->map_lock);
-		return false;
+		return resident_copy_observe(result, observed);
 	}
+
 	slot = &UndoBufSlots[slotno];
 	pg_atomic_fetch_add_u32(&slot->pincount, 1);
 	slot->clock_used = 1;
@@ -778,7 +802,7 @@ cluster_undo_buf_copy_resident(uint32 segment_id, uint8 owner, uint32 block_no, 
 	memcpy(dst, SLOT_DATA(slotno), BLCKSZ);
 	LWLockRelease(&slot->content_lock);
 	pg_atomic_fetch_sub_u32(&slot->pincount, 1);
-	return true;
+	return resident_copy_observe(result, CLUSTER_UNDO_BUF_RESIDENT_COPIED);
 }
 
 

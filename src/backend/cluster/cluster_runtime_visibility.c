@@ -2137,12 +2137,13 @@ cluster_runtime_visibility_origin_recycled_abort_candidate(
  * cannot. No pool pin/content lock survives into the canonical TT phase. */
 static bool
 cluster_runtime_visibility_origin_data_copy(uint32 segment_id, uint8 owner, uint32 block_no,
-											char data_out[BLCKSZ], bool allow_readthrough)
+											char data_out[BLCKSZ], bool allow_readthrough,
+											ClusterUndoBufResidentCopyResult *copy_result)
 {
 	ClusterUndoBufPin pin;
 	char *page;
 
-	if (cluster_undo_buf_copy_resident(segment_id, owner, block_no, data_out))
+	if (cluster_undo_buf_copy_resident_observed(segment_id, owner, block_no, data_out, copy_result))
 		return true;
 	if (!allow_readthrough)
 		return false;
@@ -2328,6 +2329,7 @@ cluster_runtime_visibility_origin_plan_freeze_data_internal(
 	ClusterRuntimeVisibilityDataFailure failure = CLUSTER_RUNTIME_VISIBILITY_DATA_FAILURE_INPUT;
 	ClusterUndoBlock0Result generation_result;
 	ClusterUndoBlock0Result resident_copy_result;
+	ClusterUndoBufResidentCopyResult data_copy_result = CLUSTER_UNDO_BUF_RESIDENT_NOT_ATTEMPTED;
 	bool copied;
 	bool extracted;
 
@@ -2408,10 +2410,11 @@ cluster_runtime_visibility_origin_plan_freeze_data_internal(
 	failure = CLUSTER_RUNTIME_VISIBILITY_DATA_FAILURE_DATA_COPY;
 	copied = cluster_runtime_visibility_origin_data_copy(
 		segment_id, plan_data->data_logical.owner_instance, block_no, data_page.data,
-		allow_readthrough);
+		allow_readthrough, diagnostic != NULL ? &data_copy_result : NULL);
 	if (diagnostic != NULL) {
 		diagnostic->data_copy_attempted = true;
 		diagnostic->data_copied = copied;
+		diagnostic->data_copy_result = data_copy_result;
 	}
 	if (!copied)
 		goto failed;
@@ -2826,7 +2829,7 @@ cluster_runtime_visibility_origin_plan_recheck_data_internal(
 		|| !generation.known || generation.value != plan_data->data_generation.value
 		|| !cluster_runtime_visibility_origin_data_copy(
 			plan_data->data_logical.segment_id, plan_data->data_logical.owner_instance,
-			plan_data->data_block_no, data_page.data, allow_readthrough)
+			plan_data->data_block_no, data_page.data, allow_readthrough, NULL)
 		|| !cluster_cr_r4_extract_resident_record(data_page.data, &plan_data->locator,
 												  record_buf.data, &record_length,
 												  &rechecked_locator)

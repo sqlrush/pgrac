@@ -236,6 +236,8 @@ ShmemInitStruct(const char *name pg_attribute_unused(), Size size, bool *foundPt
 /* ----- LWLock stubs (single-threaded test) ----- */
 static LWLock *undo_test_conditionally_held_lock = NULL;
 static bool undo_test_conditional_acquire_allowed = true;
+static int resident_lock_acquires;
+static int resident_lock_releases;
 
 void
 LWLockInitialize(LWLock *lock pg_attribute_unused(), int tranche_id pg_attribute_unused())
@@ -243,11 +245,13 @@ LWLockInitialize(LWLock *lock pg_attribute_unused(), int tranche_id pg_attribute
 bool
 LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
 {
+	resident_lock_acquires++;
 	return true;
 }
 void
 LWLockRelease(LWLock *lock)
 {
+	resident_lock_releases++;
 	if (undo_test_conditionally_held_lock == lock)
 		undo_test_conditionally_held_lock = NULL;
 }
@@ -373,14 +377,16 @@ static bool smgr_last_write_fsync = true;
 static uint32 smgr_last_write_block = 0;
 static char smgr_last_write_byte0 = 0;
 static char smgr_last_write_image[BLCKSZ];
+static void (*resident_fill_probe)(uint32 segment, uint8 owner, uint32 block);
 static XLogRecPtr undo_test_flushed_lsn;
 
 bool
-cluster_undo_smgr_read_block(ClusterUndoPathIntent intent pg_attribute_unused(),
-							 uint32 segment_id pg_attribute_unused(),
-							 uint8 owner_instance pg_attribute_unused(), uint32 block_no, char *buf)
+cluster_undo_smgr_read_block(ClusterUndoPathIntent intent pg_attribute_unused(), uint32 segment_id,
+							 uint8 owner_instance, uint32 block_no, char *buf)
 {
 	smgr_read_calls++;
+	if (resident_fill_probe != NULL)
+		resident_fill_probe(segment_id, owner_instance, block_no);
 	memset(buf, 0, BLCKSZ);
 	buf[0] = (char)block_no; /* marker so we can tell which block was read */
 	return true;
@@ -459,6 +465,7 @@ fresh_pool(void)
 		shmem_buf = NULL;
 	}
 	smgr_read_calls = smgr_write_calls = smgr_fsync_write_calls = 0;
+	resident_fill_probe = NULL;
 	smgr_last_write_fsync = true;
 	undo_test_flushed_lsn = InvalidXLogRecPtr;
 	undo_test_trap_error = false;
@@ -584,6 +591,117 @@ UT_TEST(test_undo_buf_copy_resident_never_fills_on_miss)
 	UT_ASSERT(!cluster_undo_buf_copy_resident(7, 0, 0, copied));
 	UT_ASSERT_EQ((int)(unsigned char)copied[0], 0xa5);
 	UT_ASSERT_EQ(smgr_read_calls, 0);
+}
+
+
+/* Catch a wrong refusal category, changed destination, new I/O, or an extra
+ * lock in the observed path. The real pool and legacy bool share the same
+ * exact fixture; only OS/backend primitives are stubbed. */
+static void
+check_resident_observation(uint32 segment, uint8 owner, uint32 block, bool null_dst,
+						   ClusterUndoBufResidentCopyResult want, bool copied, int locks)
+{
+	char dst[BLCKSZ], expected[BLCKSZ];
+	int reads = smgr_read_calls, writes = smgr_write_calls;
+
+	memset(expected, copied ? 0x5a : 0xa5, sizeof(expected));
+	for (int entry = 0; entry < 3; entry++) {
+		ClusterUndoBufResidentCopyResult result = CLUSTER_UNDO_BUF_RESIDENT_NOT_ATTEMPTED;
+		bool actual;
+
+		resident_lock_acquires = resident_lock_releases = 0;
+		memset(dst, 0xa5, sizeof(dst));
+		if (entry == 0)
+			actual = cluster_undo_buf_copy_resident_observed(segment, owner, block,
+															 null_dst ? NULL : dst, &result);
+		else if (entry == 1)
+			actual = cluster_undo_buf_copy_resident(segment, owner, block, null_dst ? NULL : dst);
+		else
+			actual = cluster_undo_buf_copy_resident_observed(segment, owner, block,
+															 null_dst ? NULL : dst, NULL);
+		UT_ASSERT_EQ(actual, copied);
+		if (entry == 0)
+			UT_ASSERT_EQ(result, want);
+		UT_ASSERT_EQ(memcmp(dst, expected, sizeof(dst)), 0);
+		UT_ASSERT_EQ(resident_lock_acquires, locks);
+		UT_ASSERT_EQ(resident_lock_releases, locks);
+		UT_ASSERT_EQ(smgr_read_calls, reads);
+		UT_ASSERT_EQ(smgr_write_calls, writes);
+	}
+}
+
+UT_TEST(test_resident_copy_observes_preflight_in_original_order)
+{
+	fresh_pool();
+	check_resident_observation(7, 0, 5, true, CLUSTER_UNDO_BUF_RESIDENT_BAD_DESTINATION, false, 0);
+	check_resident_observation(7, 0, 0, false, CLUSTER_UNDO_BUF_RESIDENT_BAD_BLOCK, false, 0);
+	cluster_undo_buffers = 0;
+	fresh_pool();
+	check_resident_observation(7, 0, 0, true, CLUSTER_UNDO_BUF_RESIDENT_BAD_DESTINATION, false, 0);
+	check_resident_observation(7, 0, 0, false, CLUSTER_UNDO_BUF_RESIDENT_BAD_BLOCK, false, 0);
+	check_resident_observation(7, 0, 5, false, CLUSTER_UNDO_BUF_RESIDENT_DISABLED, false, 0);
+	cluster_undo_buffers = 4;
+	fresh_pool();
+}
+
+UT_TEST(test_resident_copy_miss_keeps_all_key_dimensions_distinct)
+{
+	ClusterUndoBufPin pin;
+	char *image;
+
+	fresh_pool();
+	image = cluster_undo_buf_pin(7, 0, 5, CLUSTER_UNDO_BUF_EXCLUSIVE, &pin);
+	UT_ASSERT_NOT_NULL(image);
+	memset(image, 0x5a, BLCKSZ);
+	cluster_undo_buf_unpin(&pin);
+	check_resident_observation(8, 0, 5, false, CLUSTER_UNDO_BUF_RESIDENT_MISS, false, 1);
+	check_resident_observation(7, 1, 5, false, CLUSTER_UNDO_BUF_RESIDENT_MISS, false, 1);
+	check_resident_observation(7, 0, 6, false, CLUSTER_UNDO_BUF_RESIDENT_MISS, false, 1);
+}
+
+static void
+check_in_progress_fill(uint32 segment, uint8 owner, uint32 block)
+{
+	/* Invoked by smgr after the real pool reserves the exact slot and drops
+	 * its map lock. Resident copy must refuse before acquiring content. */
+	check_resident_observation(segment, owner, block, false, CLUSTER_UNDO_BUF_RESIDENT_FILLING,
+							   false, 1);
+}
+
+UT_TEST(test_resident_copy_observes_fill_without_joining_or_reading)
+{
+	ClusterUndoBufPin pin;
+	char *image;
+
+	fresh_pool();
+	resident_fill_probe = check_in_progress_fill;
+	image = cluster_undo_buf_pin(7, 0, 5, CLUSTER_UNDO_BUF_EXCLUSIVE, &pin);
+	resident_fill_probe = NULL;
+	UT_ASSERT_NOT_NULL(image);
+	UT_ASSERT_EQ(smgr_read_calls, 1);
+	memset(image, 0x5a, BLCKSZ);
+	cluster_undo_buf_unpin(&pin);
+	check_resident_observation(7, 0, 5, false, CLUSTER_UNDO_BUF_RESIDENT_COPIED, true, 2);
+}
+
+UT_TEST(test_resident_copy_observation_preserves_copy_and_releases_pin)
+{
+	ClusterUndoBufPin pin;
+	char *image;
+
+	fresh_pool();
+	image = cluster_undo_buf_pin(7, 0, 5, CLUSTER_UNDO_BUF_EXCLUSIVE, &pin);
+	UT_ASSERT_NOT_NULL(image);
+	memset(image, 0x5a, BLCKSZ);
+	cluster_undo_buf_unpin(&pin);
+	check_resident_observation(7, 0, 5, false, CLUSTER_UNDO_BUF_RESIDENT_COPIED, true, 2);
+	/* Enough replacements to require the copied slot to be evictable. */
+	for (uint32 block = 6; block < 14; block++) {
+		image = cluster_undo_buf_pin(7, 0, block, CLUSTER_UNDO_BUF_SHARED, &pin);
+		UT_ASSERT_NOT_NULL(image);
+		cluster_undo_buf_unpin(&pin);
+	}
+	check_resident_observation(7, 0, 5, false, CLUSTER_UNDO_BUF_RESIDENT_MISS, false, 1);
 }
 
 
@@ -1043,12 +1161,17 @@ UT_TEST(test_undo_buf_remote_evidence_hold_under_peers)
 int
 main(void)
 {
+	UT_PLAN(22);
 	UT_RUN(test_undo_buf_writeback_gated_off);
 	UT_RUN(test_undo_buf_writeback_gate_truth_table);
 	UT_RUN(test_undo_buf_invalidate_segment);
 	UT_RUN(test_undo_buf_block0_not_poolable);
 	UT_RUN(test_undo_buf_miss_then_hit);
 	UT_RUN(test_undo_buf_copy_resident_never_fills_on_miss);
+	UT_RUN(test_resident_copy_observes_preflight_in_original_order);
+	UT_RUN(test_resident_copy_miss_keeps_all_key_dimensions_distinct);
+	UT_RUN(test_resident_copy_observes_fill_without_joining_or_reading);
+	UT_RUN(test_resident_copy_observation_preserves_copy_and_releases_pin);
 	UT_RUN(test_undo_buf_prepared_consume_lock_window);
 	UT_RUN(test_native_prepared_undo_is_checkpoint_visible_with_legacy_gate_off);
 	UT_RUN(test_native_prepared_undo_rejects_unowned_or_invalid_wal_before_copy);

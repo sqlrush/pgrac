@@ -177,6 +177,8 @@ static int test_candidate_acquire_calls;
 static int test_candidate_sample_calls;
 static int test_candidate_block0_copy_calls;
 static int test_candidate_data_copy_calls;
+static ClusterUndoBufResidentCopyResult test_candidate_data_refusal
+	= CLUSTER_UNDO_BUF_RESIDENT_MISS;
 static unsigned test_candidate_cold_copy_mask;
 static int test_candidate_data_pin_calls;
 static int test_candidate_data_unpin_calls;
@@ -1183,6 +1185,18 @@ cluster_undo_buf_copy_resident(uint32 segment_id, uint8 owner, uint32 block_no, 
 	return true;
 }
 
+
+bool
+cluster_undo_buf_copy_resident_observed(uint32 segment_id, uint8 owner, uint32 block_no,
+										char dst[BLCKSZ], ClusterUndoBufResidentCopyResult *result)
+{
+	bool copied = cluster_undo_buf_copy_resident(segment_id, owner, block_no, dst);
+
+	if (result != NULL)
+		*result = copied ? CLUSTER_UNDO_BUF_RESIDENT_COPIED : test_candidate_data_refusal;
+	return copied;
+}
+
 char *
 cluster_undo_buf_pin(uint32 segment_id, uint8 owner, uint32 block_no, ClusterUndoBufMode mode,
 					 ClusterUndoBufPin *pin)
@@ -1449,6 +1463,7 @@ reset_exact_origin_fixture(void)
 	test_candidate_sample_calls = 0;
 	test_candidate_block0_copy_calls = 0;
 	test_candidate_data_copy_calls = 0;
+	test_candidate_data_refusal = CLUSTER_UNDO_BUF_RESIDENT_MISS;
 	test_candidate_cold_copy_mask = 0;
 	test_candidate_data_pin_calls = 0;
 	test_candidate_data_unpin_calls = 0;
@@ -5037,7 +5052,66 @@ UT_TEST(test_data_freeze_observation_distinguishes_original_refusals)
 															  ? CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED
 															  : CLUSTER_UNDO_BLOCK0_OK);
 			UT_ASSERT_EQ(diagnostic.data_copy_attempted, i >= 7);
+			UT_ASSERT_EQ(diagnostic.data_copy_result, i < 7
+														  ? CLUSTER_UNDO_BUF_RESIDENT_NOT_ATTEMPTED
+													  : i == 7 ? CLUSTER_UNDO_BUF_RESIDENT_MISS
+															   : CLUSTER_UNDO_BUF_RESIDENT_COPIED);
 			UT_ASSERT_EQ(diagnostic.record_extract_attempted, i >= 8);
+		}
+	}
+}
+
+
+/* Catch loss of the pool's first refusal at the real DATA_FREEZE consumer,
+ * accidental readthrough/retry, or stale observation granting a proof plan. */
+UT_TEST(test_data_freeze_keeps_resident_refusal_and_clears_unattempted_copy)
+{
+	const ClusterUndoBufResidentCopyResult refusals[]
+		= { CLUSTER_UNDO_BUF_RESIDENT_DISABLED, CLUSTER_UNDO_BUF_RESIDENT_MISS,
+			CLUSTER_UNDO_BUF_RESIDENT_FILLING };
+	const ClusterTxResolveMode modes[]
+		= { CLUSTER_TX_RESOLVE_VISIBILITY, CLUSTER_TX_RESOLVE_TERMINAL_CENSUS };
+	ClusterRuntimeVisibilityOriginPlan plan, zero_plan = { 0 };
+	ClusterRuntimeVisibilityDataDiagnostic diagnostic;
+	ClusterTxResolution resolution, zero_resolution = { 0 };
+	ClusterTxResolveReason reason;
+	ClusterUndoBlock0Generation expected = { true, 17 };
+
+	for (size_t m = 0; m < lengthof(modes); m++) {
+		for (size_t i = 0; i < lengthof(refusals); i++) {
+			reset_exact_origin_fixture();
+			test_origin_locator.tt_wrap = TT_WRAP_INVALID;
+			test_candidate_cold_copy_mask = 1;
+			test_candidate_data_refusal = refusals[i];
+			memset(&diagnostic, 0xa5, sizeof(diagnostic));
+			memset(&plan, 0xa5, sizeof(plan));
+			memset(&resolution, 0xa5, sizeof(resolution));
+			UT_ASSERT_EQ(data_diagnostic_sample(true, modes[m], &expected, &plan, &resolution,
+												&reason, &diagnostic),
+						 CLUSTER_RUNTIME_VISIBILITY_ORIGIN_FAILED);
+			UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE);
+			UT_ASSERT(diagnostic.valid);
+			UT_ASSERT_EQ(diagnostic.first_failure,
+						 CLUSTER_RUNTIME_VISIBILITY_DATA_FAILURE_DATA_COPY);
+			UT_ASSERT_EQ(diagnostic.data_copy_result, refusals[i]);
+			UT_ASSERT(diagnostic.data_copy_attempted && !diagnostic.data_copied);
+			UT_ASSERT_EQ(memcmp(&plan, &zero_plan, sizeof(plan)), 0);
+			UT_ASSERT_EQ(memcmp(&resolution, &zero_resolution, sizeof(resolution)), 0);
+			UT_ASSERT_EQ(test_candidate_data_copy_calls, 1);
+			UT_ASSERT_EQ(test_candidate_data_pin_calls, 0);
+			UT_ASSERT_EQ(test_candidate_extract_calls, 0);
+			UT_ASSERT_EQ(test_native_status_calls, 0);
+			UT_ASSERT_EQ(test_candidate_acquire_calls, 0);
+			UT_ASSERT_EQ(test_candidate_release_calls, 0);
+
+			/* Reuse a previously failed observation at an earlier fence. */
+			test_candidate_sample_known = false;
+			UT_ASSERT_EQ(data_diagnostic_sample(true, modes[m], &expected, &plan, &resolution,
+												&reason, &diagnostic),
+						 CLUSTER_RUNTIME_VISIBILITY_ORIGIN_FAILED);
+			UT_ASSERT_EQ(diagnostic.data_copy_result, CLUSTER_UNDO_BUF_RESIDENT_NOT_ATTEMPTED);
+			UT_ASSERT(!diagnostic.data_copy_attempted);
+			UT_ASSERT_EQ(test_candidate_data_copy_calls, 1);
 		}
 	}
 }
@@ -7765,9 +7839,9 @@ int
 main(void)
 {
 #ifdef USE_ASSERT_CHECKING
-	UT_PLAN(234);
+	UT_PLAN(235);
 #else
-	UT_PLAN(233);
+	UT_PLAN(234);
 #endif
 	UT_RUN(test_canonical_trace_identifies_four_real_callers_and_recopies);
 	UT_RUN(test_canonical_pause_cancel_releases_original_guard);
@@ -7928,6 +8002,7 @@ main(void)
 	UT_RUN(test_visibility_precommit_committed_slot_with_live_origin_stays_in_progress);
 	UT_RUN(test_canonical_sample_reports_first_failed_predicate);
 	UT_RUN(test_data_freeze_observation_distinguishes_original_refusals);
+	UT_RUN(test_data_freeze_keeps_resident_refusal_and_clears_unattempted_copy);
 	UT_RUN(test_data_freeze_observation_is_fresh_and_does_not_grant_a_plan);
 	UT_RUN(test_data_freeze_observation_preserves_legacy_results_and_work);
 	UT_RUN(test_recycled_canonical_abort_rechecks_exact_data_and_origin);

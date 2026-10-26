@@ -98,6 +98,23 @@ extern char *cluster_undo_buf_pin(uint32 segment_id, uint8 owner, uint32 block_n
 extern bool cluster_undo_buf_copy_resident(uint32 segment_id, uint8 owner, uint32 block_no,
 										   char dst[BLCKSZ]);
 
+
+/* Process-local observation only; never a transaction outcome or authority.
+ * The observed entry reports the original branch and permits a NULL result. */
+typedef enum ClusterUndoBufResidentCopyResult {
+	CLUSTER_UNDO_BUF_RESIDENT_NOT_ATTEMPTED = 0,
+	CLUSTER_UNDO_BUF_RESIDENT_COPIED,
+	CLUSTER_UNDO_BUF_RESIDENT_BAD_DESTINATION,
+	CLUSTER_UNDO_BUF_RESIDENT_BAD_BLOCK,
+	CLUSTER_UNDO_BUF_RESIDENT_DISABLED,
+	CLUSTER_UNDO_BUF_RESIDENT_MISS,
+	CLUSTER_UNDO_BUF_RESIDENT_FILLING
+} ClusterUndoBufResidentCopyResult;
+
+extern bool cluster_undo_buf_copy_resident_observed(uint32 segment_id, uint8 owner, uint32 block_no,
+													char dst[BLCKSZ],
+													ClusterUndoBufResidentCopyResult *result);
+
 /*
  * cluster_undo_buf_mark_dirty -- the EXCLUSIVE-pinned block was modified,
  *	protected by the XLOG_UNDO_BLOCK_WRITE at wal_lsn (D2).  In D1

@@ -9190,7 +9190,7 @@ gcs_block_r4_tx_origin_log_first_denied(const GcsBlockR4TxOriginContext *context
 			"data_select_generation=%u expected_generation_known=%d "
 			"data_diag=%d data_first_predicate=%d "
 			"data_generation_result=%d data_generation_known=%d data_generation=%u "
-			"data_resident_result=%d data_copy_attempted=%d data_copied=%d "
+			"data_resident_result=%d data_copy_attempted=%d data_copied=%d data_copy_result=%d "
 			"data_extract_attempted=%d data_extracted=%d data_record_length=%zu "
 			"data_tt_segment=%u data_uba0=" UINT64_FORMAT " data_uba1=" UINT64_FORMAT
 			" data_locator_wrap=%u data_itl_kind=%u data_itl_index=%u "
@@ -9219,6 +9219,7 @@ gcs_block_r4_tx_origin_log_first_denied(const GcsBlockR4TxOriginContext *context
 			context->data_diagnostic.generation_known, context->data_diagnostic.generation_value,
 			context->data_diagnostic.resident_copy_result,
 			context->data_diagnostic.data_copy_attempted, context->data_diagnostic.data_copied,
+			context->data_diagnostic.data_copy_result,
 			context->data_diagnostic.record_extract_attempted,
 			context->data_diagnostic.record_extracted, context->data_diagnostic.record_length,
 			context->data_diagnostic.tt_segment_id, context->locator.uba.raw[0],
