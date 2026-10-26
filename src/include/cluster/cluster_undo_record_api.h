@@ -346,10 +346,13 @@ extern const char *cluster_undo_segment_observation_status_string(void);
  *	fresh undo segment when retained COMMITTED slots fill the active one (takes
  *	lifecycle_lock internally).  Returns the new active TT segment_id, or 0 on
  *	extend failure (*out_at_hard_cap distinguishes the 53R9E hard cap).
+ *	*out_no_side_effects is true only when this entire invocation is proven
+ *	not to have provisioned, reused, activated or published a segment. It is
+ *	false for unknown or already-started effects, including internal retries.
  *	cluster_undo_tt_retention_rollover_count: observability counter accessor.
  */
 extern uint32 cluster_undo_tt_rollover_locked(int node_id, uint32 old_segment_id,
-											  bool *out_at_hard_cap);
+											  bool *out_at_hard_cap, bool *out_no_side_effects);
 extern uint64 cluster_undo_tt_retention_rollover_count(void);
 /* S3 forensics step 1a — TT-rollover FAILURE split (hard cap vs autoextend);
  * counts only cluster_undo_tt_rollover_locked fails, NOT the record-extent

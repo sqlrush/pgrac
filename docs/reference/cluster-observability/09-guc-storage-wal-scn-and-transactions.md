@@ -499,9 +499,9 @@ SELECT name, setting, unit, context, source, pending_restart FROM pg_settings WH
 | 单位 | — |
 | 内置短说明（与 `pg_settings.short_desc` 对应） | Enable proactive undo/TT-slot retention GC passes. |
 
-工作原理与调节影响：开关 undo / `cleaner` / 启用状态 路径。改变值只影响该开关明确覆盖的路径；安全拒绝条件不因关闭诊断开关而消失。
+工作原理与调节影响：控制主动 undo/TT 清理。`cluster.shared_config=on` 时必须保持 `on`；COMMON 配置的创建、变更、启动和 reload 均拒绝 `off`。非 shared 配置允许关闭，进程仍驻留，清理 pass 不执行。
 
-依赖与保护：无额外配置钩子；组合约束仍可能在启动或运行入口检查。
+依赖与保护：GUC check hook 拒绝在 shared 配置下关闭；启动及共享配置应用还会检查最终值，不能依靠参数加载顺序绕过约束。
 
 观察入口：`pg_cluster_state 的 undo/scn/xid_stripe/tt_* 分类`。
 

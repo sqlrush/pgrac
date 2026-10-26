@@ -9,6 +9,7 @@ int durable_fixture_main(int argc, char **argv);
 #define main durable_fixture_main
 #include "test_cluster_tt_durable.c"
 #undef main
+#include "cluster/cluster_xid_stripe_boot.h"
 #include "../../backend/cluster/cluster_tt_slot.c"
 #include "../../backend/cluster/cluster_tt_local.c"
 
@@ -36,6 +37,28 @@ static TTSlot cold_old_slot;
 static ClusterNormalStartState active_owner_start_state = CLUSTER_NORMAL_START_TARGET_READY;
 static bool active_owner_recovered_open = true;
 static bool fail_next_memory_allocation;
+static bool capacity_test;
+static bool capacity_cancel;
+static bool capacity_other_admission;
+static bool capacity_lease_available;
+static bool capacity_lease_current;
+static unsigned capacity_waits;
+static unsigned capacity_rechecks;
+static unsigned capacity_supply_after;
+static unsigned capacity_admission_change;
+static unsigned capacity_lease_captures;
+static uint32 capacity_selected_segment;
+static bool capacity_rollover_fill_once;
+static bool capacity_passive_rollover;
+static bool capacity_selection_unknown;
+static bool capacity_prior_reservation;
+static void fill_selected_segment(ClusterTTSlotAllocStatus status);
+bool cluster_shared_catalog;
+bool cluster_xid_striping;
+static VariableCacheData capacity_variables;
+VariableCache ShmemVariableCache = &capacity_variables;
+static LWLockPadded capacity_locks[NUM_INDIVIDUAL_LWLOCKS];
+LWLockPadded *MainLWLockArray = capacity_locks;
 bool cluster_enabled = true;
 BackendType MyBackendType = B_BACKEND;
 bool cluster_undo_retention_horizon_enabled = false;
@@ -173,6 +196,16 @@ cluster_semantic_activation_modifier_enter(bool writable, ClusterSemanticAdmissi
 	}
 	first_recheck_pending = true;
 	*token = target_modifier_token();
+	if (capacity_test && modifier_enters > 1) {
+		if (capacity_admission_change == 1)
+			token->feature_bit++;
+		else if (capacity_admission_change == 2)
+			token->record_generation++;
+		else if (capacity_admission_change == 3)
+			token->formation_epoch++;
+		else if (capacity_admission_change == 4)
+			token->side = CLUSTER_SEMANTIC_SOURCE_SIDE;
+	}
 	return CLUSTER_SEMANTIC_ADMISSION_OK;
 }
 
@@ -181,7 +214,9 @@ cluster_semantic_activation_modifier_enter(bool writable, ClusterSemanticAdmissi
 static void
 active_owner_first_recheck(void)
 {
-	if (!first_recheck_pending)
+	/* Capacity reentry checks admission before it owns any slot. Keep this
+	 * physical-publication interleaving at its original post-allocation seam. */
+	if (!first_recheck_pending || cluster_tt_local_binding_count == 0)
 		return;
 	first_recheck_pending = false;
 	if (rollovers_on_enter > 0) {
@@ -207,28 +242,84 @@ cluster_undo_active_segment_for_node_or_create(int node pg_attribute_unused())
 }
 
 uint32
-cluster_undo_tt_rollover_locked(int node, uint32 old, bool *hard_cap)
+cluster_undo_tt_rollover_locked(int node, uint32 old, bool *hard_cap, bool *no_side_effects)
 {
 	UT_ASSERT(cold_fixture);
 	UT_ASSERT_EQ(node, 0);
-	UT_ASSERT_EQ(old, 0);
+	UT_ASSERT_EQ(old, capacity_selected_segment);
 	UT_ASSERT_EQ(lock_depth, 0);
 	cold_selection_calls++;
 	*hard_cap = cold_capacity_refused;
+	/* The original producer's exact output is tested separately. Unknown
+	 * leaves the caller's pessimistic initial value untouched. */
+	if (!capacity_selection_unknown)
+		*no_side_effects
+			= cold_capacity_refused || (capacity_rollover_fill_once && capacity_passive_rollover);
 	if (cold_capacity_refused)
 		return 0;
 	/* Only physical selection/current publication is doubled. The actual
 	 * allocator, local consumer and durable ACTIVE producer run below. */
 	cluster_tt_slot_rollover(node, cold_successor, NULL);
-	return cold_successor;
+	if (capacity_rollover_fill_once) {
+		capacity_rollover_fill_once = false;
+		capacity_selected_segment = cold_successor++;
+		fill_selected_segment(CTS_COMMITTED);
+		cold_capacity_refused = true;
+	}
+	return cluster_tt_slot_current_segment(node);
 }
 
 bool
-cluster_undo_cleaner_wait_for_capacity(uint32 segment pg_attribute_unused(),
-									   ClusterCtrcTxnKeyV1 *key pg_attribute_unused())
+cluster_undo_cleaner_wait_for_capacity(uint32 segment, ClusterCtrcTxnKeyV1 *key)
 {
 	UT_ASSERT(cold_fixture && cold_capacity_refused);
+	if (capacity_test) {
+		capacity_waits++;
+		UT_ASSERT_EQ(segment, capacity_selected_segment);
+		UT_ASSERT(key != NULL);
+		UT_ASSERT_EQ(lock_depth, 0);
+		UT_ASSERT_EQ(cluster_tt_local_binding_count, 0);
+		UT_ASSERT_EQ(g_bind_emit_calls, 0);
+		UT_ASSERT_EQ(g_ctrc_reserve_calls, 0);
+		UT_ASSERT_EQ(g_current_acquire_calls, capacity_prior_reservation ? 1 : 0);
+		/* The real safe-context predicate refuses any held admission. */
+		if (modifier_enters != modifier_leaves || capacity_other_admission)
+			return false;
+		if (capacity_cancel)
+			ereport(ERROR, (errcode(ERRCODE_QUERY_CANCELED), errmsg("capacity wait cancelled")));
+		if (capacity_admission_change == 5)
+			modifier_refused = true;
+		if (capacity_admission_change == 6)
+			capacity_lease_current = false;
+		if (capacity_waits >= capacity_supply_after)
+			cold_capacity_refused = false;
+		return true; /* Existing timed recheck; does not itself grant capacity. */
+	}
 	return false;
+}
+
+bool
+cluster_xid_stripe_sample_future(FullTransactionId reference, FullTransactionId *future,
+								 ClusterXidStripeSampleFence *fence)
+{
+	UT_ASSERT(capacity_test && cluster_shared_catalog && cluster_xid_striping);
+	UT_ASSERT_EQ(lock_depth, 1);
+	UT_ASSERT_EQ(modifier_enters, modifier_leaves + 1);
+	UT_ASSERT(FullTransactionIdEquals(reference, ShmemVariableCache->nextXid));
+	capacity_lease_captures++;
+	memset(fence, 0, sizeof(*fence));
+	fence->activation_generation = 7;
+	*future = reference;
+	return capacity_lease_available;
+}
+
+bool
+cluster_xid_stripe_sample_fence_current(const ClusterXidStripeSampleFence *fence)
+{
+	UT_ASSERT(capacity_test && fence->activation_generation == 7);
+	UT_ASSERT_EQ(lock_depth, 0);
+	capacity_rechecks++;
+	return capacity_lease_current;
 }
 
 TimestampTz
@@ -307,6 +398,16 @@ reset_active_owner(void)
 	cold_fixture = cold_capacity_refused = false;
 	cold_selection_calls = 0;
 	fail_next_memory_allocation = false;
+	capacity_test = capacity_cancel = capacity_other_admission = false;
+	capacity_lease_available = capacity_lease_current = true;
+	capacity_waits = capacity_rechecks = capacity_lease_captures = 0;
+	capacity_supply_after = 1;
+	capacity_admission_change = 0;
+	capacity_selected_segment = 0;
+	capacity_rollover_fill_once = capacity_passive_rollover = capacity_selection_unknown
+		= capacity_prior_reservation = false;
+	cluster_shared_catalog = cluster_xid_striping = false;
+	ShmemVariableCache->nextXid = FullTransactionIdFromU64(300);
 	cold_successor = 2;
 	memset(&cold_old_slot, 0, sizeof(cold_old_slot));
 	cluster_tt_slot_rollover(0, 1, NULL);
@@ -443,8 +544,10 @@ UT_TEST(test_binding_growth_error_preserves_existing_reservations)
 		uint32 segment;
 		uint16 slot;
 		uint32 slot_id;
+		bool preflight_safe = true;
 
-		UT_ASSERT(cluster_tt_local_reserve_binding(101 + i, &segment, &slot, &slot_id));
+		UT_ASSERT(
+			cluster_tt_local_reserve_binding(101 + i, &segment, &slot, &slot_id, &preflight_safe));
 	}
 	UT_ASSERT_EQ(cluster_tt_local_binding_count, 8);
 	UT_ASSERT_EQ(cluster_tt_local_binding_capacity, 8);
@@ -525,6 +628,243 @@ UT_TEST(test_cold_full_pool_refuses_before_binding_or_bind_wal)
 	UT_ASSERT_EQ(cluster_tt_slot_current_segment(0), 0);
 	UT_ASSERT_EQ(cluster_tt_local_binding_count, 0);
 	UT_ASSERT_EQ(g_bind_emit_calls, 0);
+}
+
+static void
+start_capacity_test(void)
+{
+	reset_active_owner();
+	memset(&allocator_storage, 0, sizeof(allocator_storage));
+	cold_fixture = cold_capacity_refused = capacity_test = true;
+}
+
+static void
+require_capacity_error(int expected_code)
+{
+	ClusterCanonicalTxnBinding result;
+	ClusterCanonicalTxnBinding zero = { 0 };
+	volatile bool caught = false;
+
+	PG_TRY();
+	{
+		(void)cluster_tt_local_prepare_canonical_active(100, &result);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(last_ereport_errcode, expected_code);
+	UT_ASSERT_EQ(memcmp(&result, &zero, sizeof(result)), 0);
+	UT_ASSERT_EQ(cluster_tt_local_binding_count, 0);
+	UT_ASSERT_EQ(g_bind_emit_calls, 0);
+	UT_ASSERT_EQ(g_ctrc_reserve_calls, 0);
+	UT_ASSERT_EQ(g_current_acquire_calls, 0);
+	UT_ASSERT_EQ(modifier_enters, modifier_leaves + (modifier_refused ? 1 : 0));
+	UT_ASSERT_EQ(lock_depth, 0);
+}
+
+UT_TEST(test_capacity_wait_releases_only_own_modifier_before_retry)
+{
+	start_capacity_test();
+	require_published_on(2);
+	UT_ASSERT_EQ(capacity_waits, 1);
+	UT_ASSERT_EQ(cold_selection_calls, 2);
+	UT_ASSERT_EQ(modifier_enters, 2);
+	UT_ASSERT_EQ(capacity_lease_captures, 0);
+}
+
+UT_TEST(test_capacity_timed_rechecks_do_not_fail_or_reserve_early)
+{
+	start_capacity_test();
+	capacity_supply_after = 4;
+	require_published_on(2);
+	UT_ASSERT_EQ(capacity_waits, 4);
+	UT_ASSERT_EQ(cold_selection_calls, 5);
+	UT_ASSERT_EQ(modifier_enters, 5);
+}
+
+UT_TEST(test_capacity_wait_preserves_other_admission_refusal)
+{
+	start_capacity_test();
+	capacity_other_admission = true;
+	require_capacity_error(ERRCODE_PROGRAM_LIMIT_EXCEEDED);
+	UT_ASSERT(capacity_other_admission);
+	UT_ASSERT_EQ(capacity_waits, 1);
+	UT_ASSERT_EQ(modifier_enters, 1);
+}
+
+UT_TEST(test_capacity_cancel_has_no_publication_or_double_leave)
+{
+	start_capacity_test();
+	capacity_cancel = true;
+	require_capacity_error(ERRCODE_QUERY_CANCELED);
+	UT_ASSERT_EQ(capacity_waits, 1);
+	UT_ASSERT_EQ(modifier_enters, 1);
+}
+
+UT_TEST(test_capacity_reentry_rejects_changed_admission_before_allocation)
+{
+	for (unsigned change = 1; change <= 5; change++) {
+		start_capacity_test();
+		capacity_admission_change = change;
+		require_capacity_error(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS);
+		UT_ASSERT_EQ(capacity_waits, 1);
+		UT_ASSERT_EQ(cold_selection_calls, 1);
+		UT_ASSERT_EQ(modifier_enters, 2);
+	}
+}
+
+UT_TEST(test_capacity_wait_captures_and_rechecks_original_lease)
+{
+	start_capacity_test();
+	cluster_shared_catalog = cluster_xid_striping = true;
+	require_published_on(2);
+	UT_ASSERT_EQ(capacity_waits, 1);
+	UT_ASSERT_EQ(capacity_lease_captures, 1);
+	UT_ASSERT(capacity_rechecks > 0);
+}
+
+UT_TEST(test_capacity_unknown_lease_refuses_before_sleep)
+{
+	start_capacity_test();
+	cluster_shared_catalog = cluster_xid_striping = true;
+	capacity_lease_available = false;
+	require_capacity_error(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE);
+	UT_ASSERT_EQ(capacity_waits, 0);
+	UT_ASSERT_EQ(capacity_lease_captures, 1);
+}
+
+UT_TEST(test_capacity_changed_lease_refuses_before_allocation)
+{
+	start_capacity_test();
+	cluster_shared_catalog = cluster_xid_striping = true;
+	capacity_admission_change = 6;
+	require_capacity_error(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS);
+	UT_ASSERT_EQ(capacity_waits, 1);
+	UT_ASSERT_EQ(cold_selection_calls, 1);
+	UT_ASSERT_EQ(modifier_enters, 2);
+}
+
+static void
+fill_selected_segment(ClusterTTSlotAllocStatus status)
+{
+	for (unsigned i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
+		ClusterTTSlotAllocEntry *entry = &allocator_storage.per_node[0].slots[i];
+
+		entry->status = status;
+		entry->xid = 200 + i;
+		entry->commit_scn = status == CTS_COMMITTED ? (SCN)91 : InvalidScn;
+	}
+}
+
+UT_TEST(test_retained_selected_segment_rechecks_allocator_after_capacity_wait)
+{
+	reset_active_owner();
+	cold_fixture = cold_capacity_refused = capacity_test = true;
+	capacity_selected_segment = 1;
+	cluster_undo_retention_horizon_enabled = true;
+	fill_selected_segment(CTS_COMMITTED);
+	require_published_on(2);
+	UT_ASSERT_EQ(capacity_waits, 1);
+	UT_ASSERT_EQ(cold_selection_calls, 2);
+	UT_ASSERT_EQ(modifier_enters, 2);
+	cluster_undo_retention_horizon_enabled = false;
+}
+
+/* A later hard-cap selection cannot erase an earlier rollover's effects in
+ * this same reserve call. The actual allocator consumes the intervening
+ * CURRENT change; only the physical rollover producer is a boundary input. */
+UT_TEST(test_capacity_after_successful_rollover_keeps_error_boundary)
+{
+	for (int cold = 0; cold < 2; cold++) {
+		start_capacity_test();
+		if (!cold) {
+			cluster_tt_slot_rollover(0, 1, NULL);
+			capacity_selected_segment = 1;
+			fill_selected_segment(CTS_COMMITTED);
+		}
+		cluster_undo_retention_horizon_enabled = true;
+		cold_capacity_refused = false;
+		capacity_rollover_fill_once = true;
+		require_capacity_error(ERRCODE_PROGRAM_LIMIT_EXCEEDED);
+		UT_ASSERT_EQ(capacity_waits, 0);
+		UT_ASSERT_EQ(cold_selection_calls, 2);
+		UT_ASSERT_EQ(cluster_tt_slot_current_segment(0), 2);
+		UT_ASSERT_EQ(modifier_enters, 1);
+		cluster_undo_retention_horizon_enabled = false;
+	}
+}
+
+UT_TEST(test_capacity_unknown_rollover_effects_do_not_enter_wait)
+{
+	start_capacity_test();
+	capacity_selection_unknown = capacity_other_admission = true;
+	require_capacity_error(ERRCODE_PROGRAM_LIMIT_EXCEEDED);
+	UT_ASSERT_EQ(capacity_waits, 0);
+	UT_ASSERT_EQ(cold_selection_calls, 1);
+}
+
+UT_TEST(test_capacity_passive_winner_adoption_preserves_safe_wait)
+{
+	start_capacity_test();
+	cluster_undo_retention_horizon_enabled = true;
+	cold_capacity_refused = false;
+	capacity_rollover_fill_once = capacity_passive_rollover = true;
+	require_published_on(3);
+	UT_ASSERT_EQ(capacity_waits, 1);
+	UT_ASSERT_EQ(cold_selection_calls, 3);
+	UT_ASSERT_EQ(modifier_enters, 2);
+	cluster_undo_retention_horizon_enabled = false;
+}
+
+static void
+roll_away_to_retained_capacity(void)
+{
+	roll_current_once();
+	capacity_selected_segment = cluster_tt_slot_current_segment(0);
+	fill_selected_segment(CTS_COMMITTED);
+}
+
+/* An unpublished durable-producer retry has already owned a local slot.
+ * Forgetting that reservation must not reset the whole prepare's preflight. */
+UT_TEST(test_capacity_after_unpublished_reservation_does_not_reenter_preflight)
+{
+	ClusterCanonicalTxnBinding result;
+	ClusterCanonicalTxnBinding zero = { 0 };
+	volatile bool caught = false;
+
+	reset_active_owner();
+	cold_fixture = cold_capacity_refused = capacity_test = true;
+	capacity_prior_reservation = capacity_other_admission = true;
+	cluster_undo_retention_horizon_enabled = true;
+	g_before_current_acquire_hook = roll_away_to_retained_capacity;
+	PG_TRY();
+	{
+		(void)cluster_tt_local_prepare_canonical_active(100, &result);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(last_ereport_errcode, ERRCODE_PROGRAM_LIMIT_EXCEEDED);
+	UT_ASSERT_EQ(memcmp(&result, &zero, sizeof(result)), 0);
+	UT_ASSERT_EQ(capacity_waits, 0);
+	UT_ASSERT_EQ(cold_selection_calls, 1);
+	UT_ASSERT_EQ(cluster_tt_slot_current_segment(0), 2);
+	UT_ASSERT_EQ(cluster_tt_local_binding_count, 0);
+	UT_ASSERT_EQ(g_bind_emit_calls, 0);
+	UT_ASSERT_EQ(g_ctrc_reserve_calls, 0);
+	UT_ASSERT_EQ(g_current_acquire_calls, 1);
+	UT_ASSERT_EQ(g_current_pin_calls, g_current_unpin_calls);
+	UT_ASSERT_EQ(g_current_acquire_calls, g_current_cancel_calls);
+	UT_ASSERT_EQ(modifier_enters, 2);
+	UT_ASSERT_EQ(modifier_enters, modifier_leaves);
+	UT_ASSERT_EQ(lock_depth, 0);
+	cluster_undo_retention_horizon_enabled = false;
 }
 
 UT_TEST(test_modifier_refusal_precedes_allocation_and_leaves_abort_without_effects)
@@ -878,7 +1218,7 @@ int TT_ACTIVE_OWNER_FIXTURE_MAIN(void);
 int
 main(void)
 {
-	UT_PLAN(24);
+	UT_PLAN(37);
 	UT_RUN(test_recovered_open_gate_precedes_canonical_reservation);
 	UT_RUN(test_binding_memory_error_precedes_allocator_and_cold_selection);
 	UT_RUN(test_binding_growth_error_preserves_existing_reservations);
@@ -903,6 +1243,19 @@ main(void)
 	UT_RUN(test_original_identity_survives_origin_retirement_and_terminal);
 	UT_RUN(test_original_identity_exact_key_and_slot_lifetime);
 	UT_RUN(test_missing_origin_identity_never_changes_active_success);
+	UT_RUN(test_capacity_wait_releases_only_own_modifier_before_retry);
+	UT_RUN(test_capacity_timed_rechecks_do_not_fail_or_reserve_early);
+	UT_RUN(test_capacity_wait_preserves_other_admission_refusal);
+	UT_RUN(test_capacity_cancel_has_no_publication_or_double_leave);
+	UT_RUN(test_capacity_reentry_rejects_changed_admission_before_allocation);
+	UT_RUN(test_capacity_wait_captures_and_rechecks_original_lease);
+	UT_RUN(test_capacity_unknown_lease_refuses_before_sleep);
+	UT_RUN(test_capacity_changed_lease_refuses_before_allocation);
+	UT_RUN(test_retained_selected_segment_rechecks_allocator_after_capacity_wait);
+	UT_RUN(test_capacity_after_successful_rollover_keeps_error_boundary);
+	UT_RUN(test_capacity_unknown_rollover_effects_do_not_enter_wait);
+	UT_RUN(test_capacity_passive_winner_adoption_preserves_safe_wait);
+	UT_RUN(test_capacity_after_unpublished_reservation_does_not_reenter_preflight);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

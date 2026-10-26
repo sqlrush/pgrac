@@ -506,6 +506,13 @@ policy_check(const ClusterSharedConfigEntry *entry, bool online_change, bool nat
 	if (((policy & POLICY_PATH) && !policy_path_valid(entry->value))
 		|| ((policy & POLICY_UUID) && !policy_uuid_valid(entry->value)))
 		return policy_refuse(report, entry, CLUSTER_CONFIG_POLICY_REFERENCE);
+	/* Check the proposed COMMON value even before shared_config is assigned.
+	 * Bootstrap uses this same policy without native check hooks. */
+	if (strcmp(entry->name, "cluster.undo_cleaner_enabled") == 0) {
+		bool enabled;
+		if (!parse_bool(entry->value, &enabled) || !enabled)
+			return policy_refuse(report, entry, CLUSTER_CONFIG_POLICY_VALUE);
+	}
 
 	/* PGRAC: the shared recovery profile does not implement this optional
 	 * native SIDE. Refuse persistence too, not just its later activation. */
@@ -1156,6 +1163,11 @@ cluster_shared_config_apply_startup(const char *bytes, size_t len,
 	startup_config_release(owner, saved_owner, true);
 	/* Check actual inherited/command-line values even if the selected object
 	 * omitted the parameter. Never publish a successful shared application. */
+	if (!cluster_undo_cleaner_enabled)
+		ereport(FATAL,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("shared configuration requires cluster.undo_cleaner_enabled=on"),
+				 errhint("Enable the cleaner in the shared COMMON configuration before startup.")));
 	if (track_commit_timestamp)
 		ereport(FATAL,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -1423,6 +1435,11 @@ cluster_shared_config_apply_reload(const char *old_bytes, size_t old_len,
 		 * a simultaneously usable deployment profile. */
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			result = cluster_shared_config_check_gucs(new_bytes, new_len, new_ref, report);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && !cluster_undo_cleaner_enabled) {
+			ClusterSharedConfigEntry entry
+				= { CLUSTER_SHARED_CONFIG_COMMON, "cluster.undo_cleaner_enabled", NULL };
+			result = policy_refuse(report, &entry, CLUSTER_CONFIG_POLICY_VALUE);
+		}
 	}
 	PG_CATCH();
 	{

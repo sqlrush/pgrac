@@ -36,6 +36,8 @@
  *	      cleaner; cluster.undo_cleaner_enabled=off -> process stays
  *	      resident but each pass no-ops (diagnostic parity with the
  *	      3.12 lazy-only mode).
+ *	      Shared configuration requires the setting to remain on;
+ *	      startup and COMMON configuration changes reject off.
  *	  HC5: normal shutdown via proc_exit(0) -> reaper normal-exit path
  *	      -> no crash recovery; abnormal exit -> HandleChildCrash.
  *	  HC6: stale CTS_ACTIVE / TT_SLOT_ACTIVE / SEGMENT_ACTIVE entries
