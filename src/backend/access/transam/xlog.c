@@ -8290,6 +8290,12 @@ StartupXLOG(void)
 			(Size)cluster_cold_recovery_plan_memory * 1024 / 4))
 		ereport(FATAL, (errmsg("could not prepare original Startup CTRC PAGE graph"),
 			errdetail("%s", ClusterColdRecoveryCtrcObservationRefusal(endOfRecoveryInfo->cluster_tx_start))));
+	/* Retain the first pending PAGE operation in this original episode.
+	 * Its installation is separate from complete debt/service acceptance. */
+	if (!ClusterColdRecoveryCtrcPageAdvance(endOfRecoveryInfo->cluster_tx_start,
+			(Size)cluster_cold_recovery_plan_memory * 1024 / 4))
+		ereport(FATAL, (errmsg("could not advance original Startup CTRC PAGE graph"),
+			errdetail("%s", ClusterColdRecoveryCtrcObservationRefusal(endOfRecoveryInfo->cluster_tx_start))));
 	/* The same original executor/input must survive independent CTRC service.
 	 * TX acceptance alone cannot transfer or destroy its private work. */
 	if (!cluster_recovery_ctrc_result_wait_v1(endOfRecoveryInfo->cluster_tx_start))

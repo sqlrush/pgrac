@@ -56,6 +56,8 @@ typedef struct CtrcNativeStepV1 {
 	ClusterRecoveryTxResultObservationV1 accepted;
 	Size work_bytes, physical_bytes;
 	CtrcNativeStepImagesV1 images;
+	const char *original_canonical;
+	PGAlignedBlock canonical;
 } CtrcNativeStepV1;
 
 typedef struct CtrcNativeReadV1 {
@@ -105,6 +107,8 @@ ctrc_native_step_current(const CtrcNativeStepV1 *step)
 		&& cluster_space_identity_encode(step->original_space, encoded, sizeof(encoded))
 		&& memcmp(encoded, step->space_identity, sizeof(encoded)) == 0
 		&& memcmp(step->original_before, &step->before, sizeof(step->before)) == 0
+		&& (step->original_canonical == NULL
+			|| memcmp(step->original_canonical, step->canonical.data, BLCKSZ) == 0)
 		&& ClusterColdRecoveryCtrcScope(step->start, step->work) == step->source.scope
 		&& cluster_recovery_ctrc_terminal_result_v1(step->start, step->work, &accepted)
 		&& memcmp(&accepted, &step->accepted, sizeof(accepted)) == 0;
@@ -791,6 +795,19 @@ ctrc_native_fpi_current(const CtrcNativeFpiV1 *context)
 		&& ctrc_native_fpi_inputs_current(context);
 }
 
+/* The storage checksum was verified by the original reader. Every other
+ * byte, including the exact thread-qualified LSN, must match the fixed graph. */
+static bool
+ctrc_native_graph_image(const CtrcNativeStepV1 *step, const PGAlignedBlock *image)
+{
+	const Size offset = offsetof(PageHeaderData, pd_checksum);
+	const Size end = offset + sizeof(((PageHeader)0)->pd_checksum);
+
+	return step == NULL || step->original_canonical == NULL
+		|| (memcmp(image->data, step->canonical.data, offset) == 0
+			&& memcmp(image->data + end, step->canonical.data + end, BLCKSZ - end) == 0);
+}
+
 static void
 ctrc_native_fpi_prepare(CtrcNativeFpiV1 *context, void *snapshot, RfPageCtrcFpiV1 *out)
 {
@@ -818,6 +835,7 @@ ctrc_native_fpi_prepare(CtrcNativeFpiV1 *context, void *snapshot, RfPageCtrcFpiV
 			return;
 	if (!ctrc_native_fpi_current(context)
 		|| !ctrc_native_read_image(&context->read, &before)
+		|| !ctrc_native_graph_image(context->read.step, &before)
 		|| !ctrc_native_fpi_current(context))
 		return;
 	projected = cluster_ctrc_recovery_itl_page_image_v1(context->terminals, context->count,
@@ -968,11 +986,11 @@ ctrc_native_step_attempt(CtrcNativeStepV1 *context, const ClusterColdCtrcWorkV1 
 	if (snapshot != NULL) pfree((void *)snapshot);
 }
 
-RfPageCtrcStepResultV1
-rf_page_recovery_ctrc_replays_itl_step_smgr_v1(const struct ClusterRecoveryStartV1 *start,
+static RfPageCtrcStepResultV1
+ctrc_native_itl_step(const struct ClusterRecoveryStartV1 *start,
 	const ClusterColdCtrcWorkV1 *work, const ClusterRecoveryCtrcReplaySetSourceV1 *source,
 	RfPageCtrcAuthorityV1 *authority, const ClusterSpaceIdentity *space,
-	BlockNumber blockno, const RfPageVersionV1 *expected_before,
+	BlockNumber blockno, const RfPageVersionV1 *expected_before, const char *canonical,
 	const ClusterRecoveryUndoEntry *physical, Size physical_count, Size memory_budget)
 {
 	RfPageCtrcStepResultV1 result = {0};
@@ -1014,8 +1032,33 @@ rf_page_recovery_ctrc_replays_itl_step_smgr_v1(const struct ClusterRecoveryStart
 		return result;
 	context.original_before = expected_before; memcpy(&context.before, expected_before, sizeof(context.before));
 	context.original_physical = physical;
+	context.original_canonical = canonical;
+	if (canonical != NULL) memcpy(context.canonical.data, canonical, BLCKSZ);
 	if (!cluster_recovery_ctrc_terminal_result_v1(start, work, &context.accepted)) return result;
 	ctrc_native_step_attempt(&context, &header, authority, blockno, physical_count, bytes, memory_budget, &result);
 	return result;
+}
+
+RfPageCtrcStepResultV1
+rf_page_recovery_ctrc_replays_itl_step_smgr_v1(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, const ClusterRecoveryCtrcReplaySetSourceV1 *source,
+	RfPageCtrcAuthorityV1 *authority, const ClusterSpaceIdentity *space,
+	BlockNumber blockno, const RfPageVersionV1 *expected_before,
+	const ClusterRecoveryUndoEntry *physical, Size physical_count, Size memory_budget)
+{
+	return ctrc_native_itl_step(start, work, source, authority, space, blockno,
+		expected_before, NULL, physical, physical_count, memory_budget);
+}
+
+RfPageCtrcStepResultV1
+rf_page_recovery_ctrc_replays_itl_graph_step_smgr_v1(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, const ClusterRecoveryCtrcReplaySetSourceV1 *source,
+	RfPageCtrcAuthorityV1 *authority, const ClusterSpaceIdentity *space,
+	BlockNumber blockno, const RfPageVersionV1 *expected_before, const char canonical[BLCKSZ],
+	const ClusterRecoveryUndoEntry *physical, Size physical_count, Size memory_budget)
+{
+	if (canonical == NULL) return (RfPageCtrcStepResultV1){0};
+	return ctrc_native_itl_step(start, work, source, authority, space, blockno,
+		expected_before, canonical, physical, physical_count, memory_budget);
 }
 #endif /* USE_PGRAC_CLUSTER */

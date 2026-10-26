@@ -19,6 +19,7 @@
  */
 static unsigned native_step_fault, native_step_hashes;
 static bool native_step_null_physical;
+static PGAlignedBlock *native_graph_changed_input;
 
 static void
 native_step_hash_gap(void)
@@ -50,6 +51,7 @@ native_step_hash_gap(void)
 	case 9: pg_re_throw(); break;
 	case 10: native_fpi_region.checkpoint_owner.tx_result.processed_count++; break;
 	case 11: cluster_wal_inputs_release_v1(&native_insert_live->page.replay.inputs); break;
+	case 12: native_graph_changed_input->data[BLCKSZ - 1]++; break;
 	}
 }
 

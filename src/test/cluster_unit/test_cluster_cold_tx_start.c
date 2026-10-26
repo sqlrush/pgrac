@@ -32,6 +32,7 @@
 #undef printf
 #undef fprintf
 #include "unit_test.h"
+#include "cluster/cluster_page_install_ctrc.h"
 
 UT_DEFINE_GLOBALS();
 /* Assert-enabled libpgport formatting may call this backend boundary. */
@@ -136,6 +137,7 @@ static unsigned observation_physical_count, observation_fail_allocation;
 static bool observation_release_error, observation_early_read;
 static void observation_fixture_reset(void);
 static void page_graph_fixture_reset(void);
+static void page_prefix_fixture_reset(void);
 static void page_source_fixture_reset(void);
 static void observation_scope_release(void);
 static bool observation_work_allocation(Size size, int flags);
@@ -695,6 +697,7 @@ static void reset(void)
 	observed_writer.startup_first_lsn = clusterStartupWriter.first_segment_lsn;
 	observation_fixture_reset();
 	page_graph_fixture_reset();
+	page_prefix_fixture_reset();
 }
 static void retain(void)
 {
@@ -2319,9 +2322,28 @@ UT_TEST(test_relmap_failure_revokes_original_episode_without_free_or_release)
 
 #include "test_cluster_cold_ctrc_page_plan.inc"
 #include "test_cluster_cold_ctrc_page_sources.inc"
+#include "test_cluster_cold_ctrc_page_prefix.inc"
 
 int main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_STARTUP_PAGE_PREFIX") != NULL) {
+		UT_PLAN(12);
+		UT_RUN(test_actual_startup_retains_first_inserted_page_before_service);
+		UT_RUN(test_actual_startup_refuses_changed_page_target_before_wal);
+		UT_RUN(test_startup_page_prefix_repeat_retains_exact_pending_result);
+		UT_RUN(test_startup_page_prefix_unchanged_is_not_completion);
+		UT_RUN(test_startup_page_prefix_wait_retains_original_target_and_owners);
+		UT_RUN(test_startup_page_prefix_refuses_ambiguous_or_unbound_terminal_edge);
+		UT_RUN(test_startup_page_prefix_error_or_retirement_cleans_only_private_proof);
+		UT_RUN(test_startup_page_prefix_inserted_refusal_retains_original_debt);
+
+				UT_RUN(test_startup_page_prefix_uses_graph_ordinal_not_input_or_replay_index);
+		UT_RUN(test_startup_page_prefix_refuses_duplicate_physical_and_terminal_targets);
+		UT_RUN(test_startup_page_prefix_wait_rechecks_owner_before_second_attempt);
+		UT_RUN(test_startup_page_prefix_capacity_and_caller_locks_precede_execution);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
+
 	if (getenv("PGRAC_PRE2_TEST_STARTUP_PAGE_SOURCES") != NULL) {
 		UT_PLAN(9);
 		UT_RUN(test_startup_page_sources_refuse_missing_or_changed_binding);
@@ -2382,7 +2404,22 @@ int main(void)
 		UT_RUN(test_ctrc_pages_native_error_retires_cursor_before_original_scope);
 		reset(); UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(158);
+	UT_PLAN(170);
+	UT_RUN(test_startup_page_prefix_uses_graph_ordinal_not_input_or_replay_index);
+	UT_RUN(test_startup_page_prefix_refuses_duplicate_physical_and_terminal_targets);
+	UT_RUN(test_startup_page_prefix_wait_rechecks_owner_before_second_attempt);
+	UT_RUN(test_startup_page_prefix_capacity_and_caller_locks_precede_execution);
+
+	UT_RUN(test_startup_page_prefix_repeat_retains_exact_pending_result);
+	UT_RUN(test_startup_page_prefix_unchanged_is_not_completion);
+	UT_RUN(test_startup_page_prefix_wait_retains_original_target_and_owners);
+	UT_RUN(test_startup_page_prefix_refuses_ambiguous_or_unbound_terminal_edge);
+	UT_RUN(test_startup_page_prefix_error_or_retirement_cleans_only_private_proof);
+	UT_RUN(test_startup_page_prefix_inserted_refusal_retains_original_debt);
+
+	UT_RUN(test_actual_startup_retains_first_inserted_page_before_service);
+	UT_RUN(test_actual_startup_refuses_changed_page_target_before_wal);
+
 	UT_RUN(test_startup_page_sources_bind_three_original_indexes_in_graph_order);
 	UT_RUN(test_startup_page_sources_reject_changed_full_value_and_original_cut);
 	UT_RUN(test_startup_page_sources_callback_retirement_preserves_pointer_lifetime);

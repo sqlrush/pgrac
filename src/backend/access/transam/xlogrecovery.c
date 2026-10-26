@@ -205,6 +205,7 @@
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_recovery_census.h"
+#include "cluster/cluster_page_install_ctrc.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_wal_writer.h"
 #include "cluster/storage/cluster_undo_block0.h"
@@ -696,6 +697,16 @@ static ClusterColdTypedV1 *cluster_recovery_cold_inputs;
 /* Input identity for the original post-EOR attempt. Old subject identities
  * stay in inputs; writer is a separate, actual installed successor. No child
  * read/flush/write scope can be obtained from this resource yet. */
+typedef struct ClusterColdCtrcPageProgressV1 {
+	Size budget;
+	const RfPageOnlinePlanV1 *plan;
+	const ClusterRecoveryCtrcReplaySetSourceV1 *sources;
+	uint32 source_count, target_count;
+	uint32 next_target;
+	bool pending;
+	RfPageCtrcStepResultV1 result;
+} ClusterColdCtrcPageProgressV1;
+
 struct ClusterRecoveryStartV1 {
 	const ClusterColdTypedV1 *inputs;
 	const ClusterColdTopTxCensusV1 *census;
@@ -716,6 +727,7 @@ struct ClusterRecoveryStartV1 {
 	RfPageOnlinePlanV1 *ctrc_page_plan;
 	ClusterRecoveryCtrcReplaySetSourceV1 *ctrc_page_sources;
 	uint32 ctrc_page_source_count;
+	ClusterColdCtrcPageProgressV1 *ctrc_page_progress;
 	const ClusterColdCtrcWorkV1 *ctrc_observation_work;
 	ClusterColdCtrcWorkV1 *ctrc_observation_work_copy;
 	Size ctrc_observation_work_bytes;
@@ -745,6 +757,11 @@ cluster_recovery_cold_observation_close(struct ClusterRecoveryStartV1 *start)
 	/* Retire borrowed source storage before any dependent callback. */
 	start->ctrc_page_sources = NULL;
 	start->ctrc_page_source_count = 0;
+	/* Private image storage is not the original failed/INSERTED window. */
+	if (start->ctrc_page_progress != NULL) {
+		pfree(start->ctrc_page_progress);
+		start->ctrc_page_progress = NULL;
+	}
 	rf_page_online_plan_destroy_v1(&start->ctrc_page_plan);
 	if (page_sources != NULL) pfree(page_sources);
 	start->ctrc_pages = NULL;
@@ -1586,6 +1603,263 @@ ClusterColdRecoveryCtrcPageSources(const struct ClusterRecoveryStartV1 *start,
 		|| participant_count != start->ctrc_page_source_count)
 		return NULL;
 	return ClusterColdRecoveryCtrcPagePlanPrepare(start, 0) ? start->ctrc_page_sources : NULL;
+}
+
+/* Re-locate every borrowed graph/vector/progress through the original Start
+ * after calls which may retire its observation. This runs only outside PAGE. */
+static bool
+cluster_recovery_cold_page_advance_current(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, ClusterWalInputsV1 *scope,
+	const ClusterColdCtrcPageProgressV1 *progress)
+{
+	return cluster_recovery_cold_page_plan_current(start, work, scope)
+		&& start->ctrc_page_progress == progress
+		&& (progress == NULL || (progress->plan == start->ctrc_page_plan
+			&& progress->sources == start->ctrc_page_sources
+			&& progress->source_count == start->ctrc_page_source_count))
+		&& cluster_recovery_cold_page_sources_current(start, work, scope,
+			start->ctrc_page_plan, start->ctrc_page_sources, start->ctrc_page_source_count);
+}
+
+/* Identity mapping is provisional; the existing native proof and protected
+ * reader still establish graph/holder/SPACE/version/complete-byte validity. */
+static bool
+cluster_recovery_cold_page_target(const struct ClusterRecoveryStartV1 *start,
+	const RfPageOnlineTargetViewV1 *target, ClusterRecoveryCensusPageV1 *out)
+{
+	const RfPageIdentityV1 *id = &target->page_identity;
+	bool found = false;
+
+	if (start->ctrc_pages == NULL) return false;
+	for (uint32 i = 0; i < start->ctrc_pages->count; i++) {
+		const ClusterRecoveryCensusPageV1 *page = &start->ctrc_pages->entries[i];
+		const ClusterSpaceIdentity *space = &page->reservation.identity;
+
+		if (id->system_identifier != space->key.system_identifier
+			|| memcmp(id->storage_uuid, space->key.storage_uuid, 16) != 0
+			|| id->locator.spcOid != space->key.locator.spcOid
+			|| id->locator.dbOid != space->key.locator.dbOid
+			|| id->locator.relNumber != space->key.locator.relNumber
+			|| id->forknum != (uint32)page->forknum || id->blockno != page->blockno)
+			continue;
+		if (found || space->state != CLUSTER_SPACE_IDENTITY_LIVE
+			|| (page->forknum == MAIN_FORKNUM && page->blockno >= page->reservation.next_block)
+			|| memcmp(target->expected_result.segment_incarnation, space->incarnation, 16) != 0)
+			return false;
+		*out = *page;
+		found = true;
+	}
+	return found;
+}
+
+/* Select the terminal edge's original generation, not a TT/census/replay
+ * ordinal or a numerically greatest LSN from unrelated threads. */
+static bool
+cluster_recovery_cold_page_tail(const struct ClusterRecoveryStartV1 *start,
+	const RfPageOnlineTargetViewV1 *target, uint32 *index)
+{
+	const RfContributorVectorV1 *v = target->contributors;
+	bool found = false;
+
+	if (v == NULL || v->edges == NULL || v->edge_count == 0
+		|| v->edge_count > RF_PAGE_STABLE_MAX_EDGES) return false;
+	for (uint32 i = 0; i < v->edge_count; i++) {
+		const RfPageStableEdgeInputV1 *edge = &v->edges[i];
+		const ClusterRecoveryCtrcReplaySetSourceV1 *source;
+		const RfPageReplayRecordIdentityV1 *record = &edge->record_identity;
+
+		if (edge->result_token != target->expected_result.mutation_token
+			|| memcmp(edge->edge.result_incarnation, target->expected_result.segment_incarnation, 16) != 0)
+			continue;
+		if (found || edge->edge.result_kind != RF_PAGE_STATE_PRESENT
+			|| memcmp(&edge->page_identity, &target->page_identity, sizeof(edge->page_identity)) != 0
+			|| edge->participant_index >= start->ctrc_page_source_count)
+			return false;
+		source = &start->ctrc_page_sources[edge->participant_index];
+		if (record->origin_thread != source->generation.source.claim.identity.origin_thread_id
+			|| record->timeline_id != source->generation.source.timeline
+			|| record->read_rec_ptr < source->generation_begin
+			|| record->read_rec_ptr >= record->end_rec_ptr || record->end_rec_ptr > source->generation_end)
+			return false;
+		*index = edge->participant_index;
+		found = true;
+	}
+	return found;
+}
+
+/* Preserve a returned INSERTED/failed operation before classifying the
+ * result. Failed installation never turns that operation into a new attempt. */
+static RfPageProofDetailV1
+cluster_recovery_cold_page_step_result(ClusterColdCtrcPageProgressV1 *progress,
+	const RfPageCtrcStepResultV1 *step)
+{
+	if (step->inserted.window.key.window_seq != 0 || step->inserted.record_start != 0
+		|| step->inserted.record_end != 0 || step->inserted.wal_flushed) {
+		progress->result = *step;
+		progress->pending = true;
+		if (step->phase == RF_PAGE_CTRC_STEP_TARGET_SYNCED
+			&& step->inserted.window.key.window_seq != 0 && step->inserted.wal_flushed
+			&& step->inserted.record_start < step->inserted.record_end)
+			return RF_PAGE_PROOF_DETAIL_OK;
+		return RF_PAGE_PROOF_DETAIL_IMAGE_INTEGRITY_FAILED;
+	}
+	if (step->phase == RF_PAGE_CTRC_STEP_WAIT) return RF_PAGE_PROOF_DETAIL_WOULD_BLOCK;
+	if (step->phase == RF_PAGE_CTRC_STEP_UNCHANGED) {
+		progress->next_target++;
+		return RF_PAGE_PROOF_DETAIL_OK;
+	}
+	return RF_PAGE_PROOF_DETAIL_IMAGE_INTEGRITY_FAILED;
+}
+
+/* Private PAGE/proof cleanup never retires a borrowed IR/WALR or an INSERTED
+ * window. The original native step retains failed WAL debt on every ERROR. */
+static RfPageProofDetailV1
+cluster_recovery_cold_page_attempt(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, ClusterWalInputsV1 *scope,
+	ClusterColdCtrcPageProgressV1 *progress, const RfPageOnlineTargetViewV1 *view,
+	const ClusterRecoveryCensusPageV1 *physical_page, uint32 source_index)
+{
+	RfPageStableBaseProofV1 *volatile proof = NULL;
+	RfPageCtrcAuthorityV1 *volatile authority = NULL;
+	RfPageAuthorityTargetV1 target = {0};
+	RfPageProofDetailV1 detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+	Size available = progress->budget - sizeof(*progress);
+	Size part = available / 3;
+
+	PG_TRY();
+	{
+		RfPageStableCtrcBuildV1 built = rf_page_stable_base_proof_build_ctrc_replays_v1(
+			view->graph, start->ctrc_page_sources, start->ctrc_page_source_count, part);
+		proof = built.proof;
+		detail = built.detail;
+		if (detail == RF_PAGE_PROOF_DETAIL_OK && proof != NULL
+			&& cluster_recovery_cold_page_advance_current(start, work, scope, progress)) {
+			RfPageCtrcAuthorityBuildV1 page;
+
+			target.page_identity = view->page_identity;
+			target.expected_result = view->expected_result;
+			target.stable_base = proof;
+			target.source = view->source;
+			target.contributors = view->contributors;
+			page = rf_page_authority_ctrc_replays_preflight_v1(&target, 1,
+				start->ctrc_page_sources, start->ctrc_page_source_count, part);
+			authority = page.authority;
+			detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+			if (page.verdict == RF_PAGE_AUTHORITY_OK && authority != NULL
+				&& cluster_recovery_cold_page_advance_current(start, work, scope, progress)) {
+				RfPageCtrcStepResultV1 step = rf_page_recovery_ctrc_replays_itl_graph_step_smgr_v1(
+					start, work, &start->ctrc_page_sources[source_index], authority,
+					&physical_page->reservation.identity, view->page_identity.blockno,
+					&view->expected_result, view->canonical_page, start->ctrc_physical->entries,
+					start->ctrc_physical->count, available - 2 * part);
+				RfPageCtrcAuthorityV1 *release = authority;
+
+				authority = NULL;
+				rf_page_authority_ctrc_replays_destroy_v1(&release);
+				/* PAGE is gone before any original ROOT/current snapshot. */
+				if (cluster_recovery_cold_page_advance_current(start, work, scope, progress))
+					detail = cluster_recovery_cold_page_step_result(progress, &step);
+			}
+		}
+		if (detail == RF_PAGE_PROOF_DETAIL_OK && proof == NULL)
+			detail = RF_PAGE_PROOF_DETAIL_INTERNAL;
+	}
+	PG_FINALLY();
+	{
+		RfPageCtrcAuthorityV1 *release = authority;
+		RfPageStableBaseProofV1 *discard = proof;
+		authority = NULL; proof = NULL;
+		rf_page_authority_ctrc_replays_destroy_v1(&release);
+		rf_page_stable_base_proof_destroy_v1(&discard);
+	}
+	PG_END_TRY();
+	return detail;
+}
+
+bool
+ClusterColdRecoveryCtrcPageAdvance(const struct ClusterRecoveryStartV1 *start,
+	Size memory_budget)
+{
+	struct ClusterRecoveryStartV1 *state;
+	const ClusterColdCtrcWorkV1 *work;
+	ClusterWalInputsV1 *scope;
+	ClusterColdCtrcPageProgressV1 *progress;
+	uint32 count;
+	bool ready = false;
+
+	if (start == NULL) return true;
+	if (!cluster_recovery_cold_ctrc_replays_actor() || start != cluster_recovery_cold_start
+		|| !ClusterColdRecoveryCtrcPagePlanPrepare(start, 0)) return false;
+	state = cluster_recovery_cold_start;
+	work = state->ctrc_observation_work;
+	scope = state->ctrc_observation_inputs;
+	progress = state->ctrc_page_progress;
+	if (!cluster_recovery_cold_page_advance_current(start, work, scope, progress)) return false;
+	count = rf_page_online_plan_target_count_v1(start->ctrc_page_plan);
+	/* Empty PAGE input is still subject to the original independent service. */
+	if (count == 0) return true;
+	if (progress == NULL) {
+		Size budget = Min(memory_budget, (Size)RF_PAGE_ONLINE_PLAN_MAX_BYTES);
+
+		if (budget <= sizeof(*progress)) {
+			cluster_recovery_cold_page_plan_refuse(state, RF_PAGE_PROOF_DETAIL_CAPACITY);
+			return false;
+		}
+		progress = MemoryContextAllocExtended(TopMemoryContext, sizeof(*progress),
+			MCXT_ALLOC_ZERO | MCXT_ALLOC_NO_OOM);
+		if (progress == NULL) {
+			cluster_recovery_cold_page_plan_refuse(state, RF_PAGE_PROOF_DETAIL_OOM);
+			return false;
+		}
+		progress->budget = budget;
+		progress->plan = state->ctrc_page_plan;
+		progress->sources = state->ctrc_page_sources;
+		progress->source_count = state->ctrc_page_source_count;
+		progress->target_count = count;
+		state->ctrc_page_progress = progress;
+	}
+	PG_TRY();
+	{
+		for (;;) {
+			RfPageOnlineTargetViewV1 view;
+			ClusterRecoveryCensusPageV1 physical_page;
+			RfPageProofDetailV1 detail = RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+			uint32 source_index;
+
+			ResetLatch(MyLatch);
+			HandleStartupProcInterrupts();
+			if (!cluster_recovery_cold_page_advance_current(start, work, scope, progress)) break;
+			if (progress->target_count != count) break;
+			if (progress->pending || progress->next_target == count) { ready = true; break; }
+			if (progress->next_target > count
+				|| !rf_page_online_plan_target_v1(start->ctrc_page_plan, progress->next_target, &view)) break;
+			/* These targets remain original obligations, not ITL projections. */
+			if (view.history_only || view.page_identity.forknum != MAIN_FORKNUM) {
+				progress->next_target++; continue;
+			}
+			if (!cluster_recovery_cold_page_target(start, &view, &physical_page)) break;
+			if (!physical_page.heap) { progress->next_target++; continue; }
+			if (!cluster_recovery_cold_page_tail(start, &view, &source_index)) break;
+			detail = cluster_recovery_cold_page_attempt(start, work, scope, progress,
+				&view, &physical_page, source_index);
+			if (detail == RF_PAGE_PROOF_DETAIL_OK) continue;
+			if (detail != RF_PAGE_PROOF_DETAIL_WOULD_BLOCK) {
+				if (start == cluster_recovery_cold_start)
+					cluster_recovery_cold_observation_refuse(state, "page_execute", (int)detail);
+				break;
+			}
+			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+				100L, WAIT_EVENT_CLUSTER_THREAD_RECOVERY);
+		}
+	}
+	PG_CATCH();
+	{
+		cluster_recovery_cold_page_plan_refuse(state, RF_PAGE_PROOF_DETAIL_INTERNAL);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (!ready) cluster_recovery_cold_page_plan_refuse(state, RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH);
+	return ready;
 }
 
 const char *

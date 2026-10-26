@@ -446,6 +446,7 @@ bool native_install_original_writer_installed(ClusterWalWriterToken *writer,
 #undef ClusterStartupInstalledRecoveryWriterV1
 #include "test_cluster_ctrc_native_install.inc"
 #include "test_cluster_ctrc_native_step.inc"
+#include "test_cluster_ctrc_native_graph_step.inc"
 
 int
 main(int argc, char **argv)
@@ -454,7 +455,20 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(42);
+	if (getenv("PGRAC_PRE2_TEST_NATIVE_GRAPH_STEP") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_native_graph_step_accepts_only_storage_checksum_normalization);
+		UT_RUN(test_native_graph_step_refuses_terminal_bytes_lsn_and_origin_mismatch);
+		UT_RUN(test_native_graph_step_fixed_input_cannot_change_during_wal_preparation);
+		UT_RUN(test_native_graph_step_error_keeps_original_inserted_debt);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	UT_PLAN(46);
+	UT_RUN(test_native_graph_step_accepts_only_storage_checksum_normalization);
+	UT_RUN(test_native_graph_step_refuses_terminal_bytes_lsn_and_origin_mismatch);
+	UT_RUN(test_native_graph_step_fixed_input_cannot_change_during_wal_preparation);
+	UT_RUN(test_native_graph_step_error_keeps_original_inserted_debt);
+
 	UT_RUN(test_native_fpi_projects_entire_page_from_original_c0_and_commit);
 	UT_RUN(test_native_fpi_empty_and_already_terminal_do_not_mint_wal_frame);
 	UT_RUN(test_native_fpi_bad_count_budget_or_terminal_refuses_before_smgr);

@@ -10417,3 +10417,7 @@ test_cluster_recovery_native_inputs: test_cluster_recovery_census_page_plan.inc
 
 # Original Startup full-generation PAGE source binding.
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_page_sources.inc
+
+# Original Startup fixed-graph PAGE prefix ownership.
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_page_prefix.inc
+test_cluster_ctrc_native_fpi: test_cluster_ctrc_native_graph_step.inc
