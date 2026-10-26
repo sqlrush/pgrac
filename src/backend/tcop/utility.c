@@ -307,8 +307,17 @@ PreflightClusterSharedCatalogWrite(Node *statement)
 			&& !IsA(statement, AlterPolicyStmt) && !IsA(statement, CommentStmt)
 			&& !IsA(statement, AlterStatsStmt) && !IsA(statement, CreateEventTrigStmt)
 			&& !IsA(statement, AlterEventTrigStmt) && !IsA(statement, AlterCollationStmt)
-			&& !IsA(statement, DefineStmt) && !IsA(statement, TruncateStmt)))
+			&& !IsA(statement, DefineStmt) && !IsA(statement, CreateStatsStmt)
+			&& !IsA(statement, TruncateStmt)))
 		return;
+
+	if (IsA(statement, CreateStatsStmt)) {
+		CreateStatsStmt *stats = (CreateStatsStmt *)statement;
+
+		/* Leave unsupported FROM forms on their original rejection paths. */
+		if (list_length(stats->relations) != 1 || !IsA(linitial(stats->relations), RangeVar))
+			return;
+	}
 
 	if (IsA(statement, TruncateStmt))
 		action = "truncation";

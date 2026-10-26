@@ -316,6 +316,8 @@ CreateCommandTag(Node *statement)
 		return CMDTAG_ALTER_POLICY;
 	if (IsA(statement, CommentStmt))
 		return CMDTAG_COMMENT;
+	if (IsA(statement, CreateStatsStmt))
+		return CMDTAG_CREATE_STATISTICS;
 	if (IsA(statement, AlterStatsStmt))
 		return CMDTAG_ALTER_STATISTICS;
 	if (IsA(statement, CreateEventTrigStmt))
@@ -390,6 +392,8 @@ GetCommandTagName(CommandTag tag)
 		return "ALTER POLICY";
 	if (tag == CMDTAG_COMMENT)
 		return "COMMENT";
+	if (tag == CMDTAG_CREATE_STATISTICS)
+		return "CREATE STATISTICS";
 	if (tag == CMDTAG_ALTER_STATISTICS)
 		return "ALTER STATISTICS";
 	if (tag == CMDTAG_CREATE_EVENT_TRIGGER)
@@ -1575,6 +1579,11 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 	DefineStmt dictionary = { .type = T_DefineStmt, .kind = OBJECT_TSDICTIONARY };
 	DefineStmt template = { .type = T_DefineStmt, .kind = OBJECT_TSTEMPLATE };
 	DefineStmt configuration = { .type = T_DefineStmt, .kind = OBJECT_TSCONFIGURATION };
+	RangeVar stats_relation = { .type = T_RangeVar, .relname = "target" };
+	ListCell stats_cell = { .ptr_value = &stats_relation };
+	List stats_relations
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &stats_cell };
+	CreateStatsStmt create_stats = { .type = T_CreateStatsStmt, .relations = &stats_relations };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -1603,7 +1612,8 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 						   (Node *)&parser,
 						   (Node *)&dictionary,
 						   (Node *)&template,
-						   (Node *)&configuration };
+						   (Node *)&configuration,
+						   (Node *)&create_stats };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned skip = 0; skip < 2; skip++) {
@@ -1620,6 +1630,7 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 			comment.comment = skip ? NULL : "test comment";
 			statistics.missing_ok = collation.if_not_exists = aggregate.replace = skip != 0;
 			alter_event.tgenabled = skip ? 'D' : 'O';
+			create_stats.if_not_exists = skip != 0;
 			create_sql_entry(statements[i]);
 			UT_ASSERT_EQ(utility_unbound, 0);
 			UT_ASSERT_EQ(utility_after_preflight, 1);
@@ -1716,6 +1727,11 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 	DefineStmt dictionary = { .type = T_DefineStmt, .kind = OBJECT_TSDICTIONARY };
 	DefineStmt template = { .type = T_DefineStmt, .kind = OBJECT_TSTEMPLATE };
 	DefineStmt configuration = { .type = T_DefineStmt, .kind = OBJECT_TSCONFIGURATION };
+	RangeVar stats_relation = { .type = T_RangeVar, .relname = "target" };
+	ListCell stats_cell = { .ptr_value = &stats_relation };
+	List stats_relations
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &stats_cell };
+	CreateStatsStmt create_stats = { .type = T_CreateStatsStmt, .relations = &stats_relations };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -1744,7 +1760,8 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 						   (Node *)&parser,
 						   (Node *)&dictionary,
 						   (Node *)&template,
-						   (Node *)&configuration };
+						   (Node *)&configuration,
+						   (Node *)&create_stats };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		int caught;
@@ -1805,6 +1822,11 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 	DefineStmt dictionary = { .type = T_DefineStmt, .kind = OBJECT_TSDICTIONARY };
 	DefineStmt template = { .type = T_DefineStmt, .kind = OBJECT_TSTEMPLATE };
 	DefineStmt configuration = { .type = T_DefineStmt, .kind = OBJECT_TSCONFIGURATION };
+	RangeVar stats_relation = { .type = T_RangeVar, .relname = "target" };
+	ListCell stats_cell = { .ptr_value = &stats_relation };
+	List stats_relations
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &stats_cell };
+	CreateStatsStmt create_stats = { .type = T_CreateStatsStmt, .relations = &stats_relations };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -1833,7 +1855,8 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 						   (Node *)&parser,
 						   (Node *)&dictionary,
 						   (Node *)&template,
-						   (Node *)&configuration };
+						   (Node *)&configuration,
+						   (Node *)&create_stats };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned child = 0; child < 2; child++) {
@@ -1900,6 +1923,11 @@ UT_TEST(test_catalog_writes_preflight_requires_shared_catalog_storage)
 	DefineStmt dictionary = { .type = T_DefineStmt, .kind = OBJECT_TSDICTIONARY };
 	DefineStmt template = { .type = T_DefineStmt, .kind = OBJECT_TSTEMPLATE };
 	DefineStmt configuration = { .type = T_DefineStmt, .kind = OBJECT_TSCONFIGURATION };
+	RangeVar stats_relation = { .type = T_RangeVar, .relname = "target" };
+	ListCell stats_cell = { .ptr_value = &stats_relation };
+	List stats_relations
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &stats_cell };
+	CreateStatsStmt create_stats = { .type = T_CreateStatsStmt, .relations = &stats_relations };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -1928,7 +1956,8 @@ UT_TEST(test_catalog_writes_preflight_requires_shared_catalog_storage)
 						   (Node *)&parser,
 						   (Node *)&dictionary,
 						   (Node *)&template,
-						   (Node *)&configuration };
+						   (Node *)&configuration,
+						   (Node *)&create_stats };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned mode = 0; mode < 8; mode++) {
@@ -1987,6 +2016,11 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 	DefineStmt dictionary = { .type = T_DefineStmt, .kind = OBJECT_TSDICTIONARY };
 	DefineStmt template = { .type = T_DefineStmt, .kind = OBJECT_TSTEMPLATE };
 	DefineStmt configuration = { .type = T_DefineStmt, .kind = OBJECT_TSCONFIGURATION };
+	RangeVar stats_relation = { .type = T_RangeVar, .relname = "target" };
+	ListCell stats_cell = { .ptr_value = &stats_relation };
+	List stats_relations
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &stats_cell };
+	CreateStatsStmt create_stats = { .type = T_CreateStatsStmt, .relations = &stats_relations };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -2015,7 +2049,8 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 						   (Node *)&parser,
 						   (Node *)&dictionary,
 						   (Node *)&template,
-						   (Node *)&configuration };
+						   (Node *)&configuration,
+						   (Node *)&create_stats };
 	const char *tags[] = { "CREATE SCHEMA",
 						   "CREATE SEQUENCE",
 						   "CREATE INDEX",
@@ -2044,7 +2079,8 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 						   "CREATE TEXT SEARCH PARSER",
 						   "CREATE TEXT SEARCH DICTIONARY",
 						   "CREATE TEXT SEARCH TEMPLATE",
-						   "CREATE TEXT SEARCH CONFIGURATION" };
+						   "CREATE TEXT SEARCH CONFIGURATION",
+						   "CREATE STATISTICS" };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned parallel = 0; parallel < 2; parallel++) {
@@ -2148,10 +2184,40 @@ UT_TEST(test_unsupported_index_refuses_before_binding_and_schema_work)
 	}
 }
 
+/* Unsupported FROM forms keep their original native validation path.
+ * This prologue boundary proves no early allocation, not the later error. */
+UT_TEST(test_unsupported_statistics_from_keeps_native_path_without_binding)
+{
+	RangeVar targets[2] = { { .type = T_RangeVar }, { .type = T_RangeVar } };
+	JoinExpr join = { .type = T_JoinExpr,
+					  .jointype = JOIN_INNER,
+					  .larg = (Node *)&targets[0],
+					  .rarg = (Node *)&targets[1] };
+	RangeSubselect subquery = { .type = T_RangeSubselect };
+	Node *froms[] = { (Node *)&targets[0], (Node *)&join, (Node *)&subquery };
+	ListCell cells[2] = { { .ptr_value = &targets[0] }, { .ptr_value = &targets[1] } };
+	List relations = { .type = T_List, .length = 2, .max_length = 2, .elements = cells };
+	CreateStatsStmt statistics = { .type = T_CreateStatsStmt, .relations = &relations };
+
+	for (unsigned variant = 0; variant < lengthof(froms); variant++) {
+		cells[0].ptr_value = froms[variant];
+		relations.length = relations.max_length = variant == 0 ? 2 : 1;
+		for (unsigned skip = 0; skip < 2; skip++) {
+			reset_create_preflight();
+			statistics.if_not_exists = skip != 0;
+			create_sql_entry((Node *)&statistics);
+			UT_ASSERT_EQ(utility_xids, 0);
+			UT_ASSERT_EQ(utility_prepares, 0);
+			UT_ASSERT_EQ(utility_binds, 0);
+			UT_ASSERT_EQ(utility_after_preflight, 1);
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(44);
+	UT_PLAN(45);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -2196,6 +2262,7 @@ main(void)
 	UT_RUN(test_create_original_readonly_and_parallel_guards_precede_binding);
 	UT_RUN(test_unsupported_creates_refuse_before_xid_or_binding);
 	UT_RUN(test_noncreate_utility_does_not_reserve_canonical_binding);
+	UT_RUN(test_unsupported_statistics_from_keeps_native_path_without_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
