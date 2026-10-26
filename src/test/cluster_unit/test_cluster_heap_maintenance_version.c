@@ -65,6 +65,7 @@
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/storage/cluster_smgr.h"
 #include "commands/vacuum.h"
+#include "executor/instrument.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/buf_internals.h"
@@ -127,6 +128,7 @@ static bool recent_caller_local_x, recent_caller_writer, recent_caller_share;
 static bool recent_pin_held;
 static bool phase_pin_released;
 static bool phase_use_original_resident;
+static bool phase_use_original_recent_pin;
 static bool phase_resident_completed;
 static unsigned phase_resident_expected_resumes;
 static int32 recent_caller_pins;
@@ -255,12 +257,17 @@ GetPrivateRefCount(Buffer buffer)
 	return backend_pin_count;
 }
 #include "test_cluster_heap_borrowed_pin.inc"
-/* Resident I/O is a leaf double; the complete native continuation and its
- * writer cleanup are extracted production bodies. No page fetch is modeled. */
+static bool phase_original_recent_pin(RelFileLocator locator, ForkNumber fork,
+									 BlockNumber block, Buffer recent_buffer);
+static void phase_original_recent_release(Buffer buffer);
+/* Legacy tests retain their pin leaf; the opt-in resident chain below uses
+ * the original recent lookup, private refs and ResourceOwner operations. */
 bool
 ReadRecentBuffer(RelFileLocator locator, ForkNumber fork, BlockNumber block,
 				 Buffer recent_buffer)
 {
+	if (phase_use_original_recent_pin)
+		return phase_original_recent_pin(locator, fork, block, recent_buffer);
 	recent_pin_calls++;
 	UT_ASSERT(RelFileLocatorEquals(locator, relation_data.rd_locator));
 	UT_ASSERT_EQ(fork, MAIN_FORKNUM); UT_ASSERT_EQ(block, 7);
@@ -278,6 +285,10 @@ ReadRecentBuffer(RelFileLocator locator, ForkNumber fork, BlockNumber block,
 void
 ReleaseBuffer(Buffer buffer)
 {
+	if (phase_use_original_recent_pin) {
+		phase_original_recent_release(buffer);
+		return;
+	}
 	UT_ASSERT_EQ(buffer, 1); UT_ASSERT(recent_pin_held);
 	UT_ASSERT_EQ(backend_pin_count, recent_caller_pins + 1);
 	UT_ASSERT_EQ(local_x, recent_caller_local_x);
@@ -2146,6 +2157,7 @@ reset(uint8 opcode, bool shared)
 	recent_caller_local_x = recent_caller_writer = recent_caller_share = recent_pin_held = false;
 	recent_caller_pins = 0; phase_pin_released = false;
 	phase_use_original_resident = false;
+	phase_use_original_recent_pin = false;
 	writer_state = PCM_STATE_X;
 	route_holder = 11;
 	route_master = 12;
@@ -14976,10 +14988,324 @@ UT_TEST(test_original_resident_errors_unpin_before_real_outer_error_propagation)
 	free(v); free(f);
 }
 
+
+/* First-pin recent lookup uses the existing original private array,
+ * ResourceOwner and native CAS unpin implementations. Header contention,
+ * local buffers and an active KO read bracket are outside this MAIN-fork
+ * fixture; unsupported branches fail loudly instead of granting authority. */
+static BufferUsage phase_recent_usage;
+static unsigned phase_recent_fault, phase_recent_ko_samples;
+static uint32 phase_recent_saved_state;
+static BufferTag phase_recent_saved_tag;
+
+static void
+phase_recent_enlarge(ResourceOwner owner)
+{
+	UT_ASSERT(phase_use_original_recent_pin && owner == page_owner_active_resource_owner());
+	UT_ASSERT_EQ(owner->bufferarr.nitems, 0);
+	UT_ASSERT_EQ(backend_pin_count, 0);
+	UT_ASSERT(!local_x && !local_share && recent_pin_admission->entered);
+	original_touch_owner_enlarge(owner);
+	page_owner_original_owner_enlarges++;
+}
+
+static void
+phase_recent_reserve(void)
+{
+	UT_ASSERT(phase_use_original_recent_pin && page_owner_resident_active);
+	UT_ASSERT(!page_owner_resident_partition_held && !page_owner_page_locked && !local_x);
+	UT_ASSERT(!page_owner_primitive_reserved && !page_owner_primitive_ref_live);
+	original_touch_private_reserve(); page_owner_original_private_reserves++;
+	UT_ASSERT(page_owner_original_private_reserved == &page_owner_original_private_array[0]);
+	page_owner_primitive_reserved = true; page_owner_primitive_reserves++;
+}
+
+static int32
+phase_recent_private_count(Buffer buffer)
+{
+	PrivateRefCountEntry *ref = original_touch_private_get(buffer, false);
+	UT_ASSERT(phase_use_original_recent_pin); UT_ASSERT_EQ(buffer, 1);
+	UT_ASSERT(ref == NULL); /* The actual collector released its capture pin. */
+	UT_ASSERT_EQ(backend_pin_count, 0);
+	return ref == NULL ? 0 : ref->refcount;
+}
+
+static bool
+phase_recent_ko_unavailable(RelFileLocator locator, ForkNumber fork,
+	BlockNumber block, ClusterKoPeerAdmissionV3 *sample)
+{
+	UT_ASSERT(phase_use_original_recent_pin && !local_x);
+	UT_ASSERT(RelFileLocatorEquals(locator, relation_data.rd_locator));
+	UT_ASSERT_EQ(fork, MAIN_FORKNUM); UT_ASSERT_EQ(block, 7);
+	UT_ASSERT(sample != NULL); phase_recent_ko_samples++;
+	return false; /* No native KO bracket is qualified by this unit fixture. */
+}
+
+static bool
+phase_recent_ko_current_unexpected(const ClusterKoPeerAdmissionV3 *sample,
+	RelFileLocator locator, ForkNumber fork, BlockNumber block)
+{
+	(void)sample; (void)locator; (void)fork; (void)block;
+	UT_ASSERT(false);
+	return false;
+}
+
+static void
+phase_recent_ko_remember_unexpected(BufferDesc *buf, const ClusterKoPeerAdmissionV3 *sample)
+{
+	(void)buf; (void)sample; UT_ASSERT(false);
+	ereport(ERROR, (errmsg("unexpected KO pin publication in first-pin fixture")));
+}
+
+static bool
+phase_recent_pcm_active(void)
+{
+	UT_ASSERT(phase_use_original_recent_pin && recent_pin_admission->entered);
+	UT_ASSERT_EQ(GetBufferDescriptor(0)->tag.forkNum, MAIN_FORKNUM);
+	return true;
+}
+
+static BufferDesc *
+phase_recent_local_unexpected(uint32 id)
+{
+	(void)id; UT_ASSERT(false);
+	ereport(ERROR, (errmsg("local buffer outside shared recent-pin fixture")));
+	return NULL;
+}
+
+static bool
+phase_recent_pin_local_unexpected(BufferDesc *buf, bool adjust)
+{
+	(void)buf; (void)adjust; UT_ASSERT(false);
+	ereport(ERROR, (errmsg("local pin outside shared recent-pin fixture")));
+	return false;
+}
+
+static void
+phase_recent_unpin_local_unexpected(Buffer buffer)
+{
+	(void)buffer; UT_ASSERT(false);
+	ereport(ERROR, (errmsg("local unpin outside shared recent-pin fixture")));
+}
+
+static void phase_actual_pin_locked(BufferDesc *buf);
+#define ResourceOwnerEnlargeBuffers phase_recent_enlarge
+#define ReservePrivateRefCountEntry phase_recent_reserve
+#define GetPrivateRefCount phase_recent_private_count
+#define GetPrivateRefCountEntry page_owner_primitive_private_ref
+#define NewPrivateRefCountEntry page_owner_primitive_new_ref
+#define ResourceOwnerRememberBuffer page_owner_primitive_remember
+#define CurrentResourceOwner page_owner_active_resource_owner()
+#define LockBufHdr original_touch_header_lock
+#define cluster_bufmgr_ko_native_read_sample phase_recent_ko_unavailable
+#define cluster_ko_peer_read_current_v3 phase_recent_ko_current_unexpected
+#define cluster_bufmgr_ko_remember_pin phase_recent_ko_remember_unexpected
+#define cluster_pcm_is_active phase_recent_pcm_active
+#define cluster_bufmgr_should_pcm_track original_touch_pin_tracked
+#define GetLocalBufferDescriptor phase_recent_local_unexpected
+#define PinLocalBuffer phase_recent_pin_local_unexpected
+#define UnpinLocalBuffer phase_recent_unpin_local_unexpected
+#define pgBufferUsage phase_recent_usage
+#define PinBuffer original_touch_primitive_pin
+#define UnpinBuffer original_touch_primitive_unpin
+#define PinBuffer_Locked phase_actual_pin_locked
+#define ReadRecentBuffer phase_actual_read_recent
+#define ReleaseBuffer phase_actual_release_recent
+#include "test_cluster_vacuum_recent_pin.inc"
+#undef ReleaseBuffer
+#undef ReadRecentBuffer
+#undef PinBuffer_Locked
+#undef UnpinBuffer
+#undef PinBuffer
+#undef pgBufferUsage
+#undef UnpinLocalBuffer
+#undef PinLocalBuffer
+#undef GetLocalBufferDescriptor
+#undef cluster_bufmgr_should_pcm_track
+#undef cluster_pcm_is_active
+#undef cluster_bufmgr_ko_remember_pin
+#undef cluster_ko_peer_read_current_v3
+#undef cluster_bufmgr_ko_native_read_sample
+#undef LockBufHdr
+#undef CurrentResourceOwner
+#undef ResourceOwnerRememberBuffer
+#undef NewPrivateRefCountEntry
+#undef GetPrivateRefCountEntry
+#undef GetPrivateRefCount
+#undef ReservePrivateRefCountEntry
+#undef ResourceOwnerEnlargeBuffers
+
+static bool
+phase_original_recent_pin(RelFileLocator locator, ForkNumber fork,
+	BlockNumber block, Buffer recent_buffer)
+{
+	bool pinned;
+	BufferDesc *buf = GetBufferDescriptor(0);
+
+	recent_pin_calls++;
+	UT_ASSERT_EQ(recent_buffer, 1); UT_ASSERT_EQ(backend_pin_count, 0);
+	UT_ASSERT(!recent_pin_held && !local_x && !local_share && recent_pin_admission->entered);
+	/* Inject a descriptor change after proof collection, before original lookup. */
+	if (phase_recent_fault == 1)
+		pg_atomic_write_u32(&buf->state, phase_recent_saved_state & ~BM_VALID);
+	if (phase_recent_fault == 2) buf->tag.blockNum++;
+	pinned = phase_actual_read_recent(locator, fork, block, recent_buffer);
+	if (!pinned) {
+		UT_ASSERT_EQ(backend_pin_count, 0);
+		UT_ASSERT_EQ(BUF_STATE_GET_REFCOUNT(pg_atomic_read_u32(&buf->state)), 0);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&buf->state) & BM_LOCKED, 0);
+		buf->tag = phase_recent_saved_tag;
+		pg_atomic_write_u32(&buf->state, phase_recent_saved_state | BUF_USAGECOUNT_ONE);
+		return false;
+	}
+	UT_ASSERT_EQ(backend_pin_count, 1);
+	UT_ASSERT_EQ(page_owner_native_resource_owner.bufferarr.nitems, 1);
+	UT_ASSERT_EQ(page_owner_active_private_ref()->refcount, 1);
+	recent_pin_held = true;
+	if (recent_pin_observer != NULL) recent_pin_observer();
+	return true;
+}
+
+static void
+phase_original_recent_release(Buffer buffer)
+{
+	UT_ASSERT_EQ(buffer, 1); UT_ASSERT(recent_pin_held);
+	UT_ASSERT_EQ(backend_pin_count, 1);
+	UT_ASSERT(!local_x && !local_share && !resumed_writer);
+	UT_ASSERT(recent_pin_admission->entered);
+	phase_actual_release_recent(buffer);
+	UT_ASSERT_EQ(backend_pin_count, 0);
+	UT_ASSERT_EQ(page_owner_native_resource_owner.bufferarr.nitems, 0);
+	recent_unpins++; recent_pin_held = false;
+}
+
+static void
+phase_recent_owner_setup(QualifiedXminFixture *f, LVRelState *v,
+	ClusterHeapFreezeXminTargetV1 targets[3], bool batch, bool writer)
+{
+	phase_real_resident_setup(f, v, targets, batch, writer);
+	phase_use_original_recent_pin = true;
+	phase_recent_fault = phase_recent_ko_samples = 0;
+	phase_recent_saved_tag = GetBufferDescriptor(0)->tag;
+	phase_recent_saved_state = pg_atomic_read_u32(&GetBufferDescriptor(0)->state);
+	UT_ASSERT_EQ(BUF_STATE_GET_REFCOUNT(phase_recent_saved_state), 0);
+	pg_atomic_write_u32(&GetBufferDescriptor(0)->state, BM_VALID | BUF_USAGECOUNT_ONE);
+	memset(&phase_recent_usage, 0, sizeof(phase_recent_usage));
+	page_owner_resident_active = true;
+	page_owner_resident_partition_held = page_owner_page_locked = false;
+	page_owner_resident_saved.pins = 0;
+	page_owner_use_original_primitive_pin = page_owner_use_original_private_refs = true;
+	page_owner_use_original_resource_owner = true;
+	page_owner_primitive_ref_live = page_owner_primitive_reserved = false;
+	page_owner_primitive_reserves = page_owner_primitive_new_refs = 0;
+	page_owner_primitive_remembers = page_owner_primitive_forgets = page_owner_primitive_unpins = 0;
+	page_owner_primitive_private_reads = page_owner_primitive_last_pin_reads = 0;
+	page_owner_original_private_gets = page_owner_original_private_reserves = 0;
+	page_owner_original_private_news = page_owner_original_private_forgets = 0;
+	memset(page_owner_original_private_array, 0, sizeof(page_owner_original_private_array));
+	page_owner_original_private_reserved = NULL;
+	page_owner_original_private_overflowed = 0; page_owner_original_private_clock = 0;
+	page_owner_original_owner_enlarges = page_owner_original_owner_remembers = 0;
+	page_owner_original_owner_forgets = page_owner_original_owner_allocations = 0;
+	memset(&page_owner_native_resource_owner, 0, sizeof(page_owner_native_resource_owner));
+	page_owner_native_resource_owner.name = "actual-recent-pin-unit";
+	original_touch_owner_array_init(&page_owner_native_resource_owner.bufferarr,
+		page_owner_buffer_datum(InvalidBuffer));
+}
+
+static void
+phase_recent_owner_finish(LVRelState *v, bool pinned)
+{
+	UT_ASSERT_EQ(recent_pin_calls, 1); UT_ASSERT_EQ(recent_unpins, pinned ? 1 : 0);
+	UT_ASSERT_EQ(phase_recent_usage.shared_blks_hit, pinned ? 1 : 0);
+	UT_ASSERT_EQ(phase_recent_usage.local_blks_hit, 0);
+	UT_ASSERT_EQ(phase_recent_ko_samples, 1);
+	UT_ASSERT_EQ(page_owner_original_owner_enlarges, 1);
+	UT_ASSERT_EQ(page_owner_original_owner_allocations, 1);
+	UT_ASSERT_EQ(page_owner_original_owner_remembers, pinned ? 1 : 0);
+	UT_ASSERT_EQ(page_owner_original_owner_forgets, pinned ? 1 : 0);
+	UT_ASSERT_EQ(page_owner_original_private_news, pinned ? 1 : 0);
+	UT_ASSERT_EQ(page_owner_original_private_forgets, pinned ? 1 : 0);
+	UT_ASSERT_EQ(page_owner_primitive_last_pin_reads, pinned ? 1 : 0);
+	UT_ASSERT_EQ(page_owner_native_resource_owner.bufferarr.nitems, 0);
+	UT_ASSERT_EQ(BUF_STATE_GET_REFCOUNT(pg_atomic_read_u32(&GetBufferDescriptor(0)->state)), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&GetBufferDescriptor(0)->state) & BM_LOCKED, 0);
+	for (unsigned i = 0; i < lengthof(page_owner_original_private_array); i++) {
+		UT_ASSERT_EQ(page_owner_original_private_array[i].buffer, InvalidBuffer);
+		UT_ASSERT_EQ(page_owner_original_private_array[i].refcount, 0);
+	}
+	UT_ASSERT(page_owner_original_private_reserved == &page_owner_original_private_array[0]);
+	proof_owner_assert_released(v, true);
+	free(page_owner_native_resource_owner.bufferarr.itemsarr);
+	memset(&page_owner_native_resource_owner, 0, sizeof(page_owner_native_resource_owner));
+	page_owner_original_private_reserved = NULL;
+	page_owner_use_original_resource_owner = page_owner_use_original_private_refs = false;
+	page_owner_use_original_primitive_pin = page_owner_resident_active = false;
+	phase_use_original_recent_pin = false;
+	GetBufferDescriptor(0)->tag = phase_recent_saved_tag;
+	pg_atomic_write_u32(&GetBufferDescriptor(0)->state, phase_recent_saved_state);
+}
+
+UT_TEST(test_original_recent_first_pin_and_owner_release_precede_outer_leave)
+{
+	for (unsigned writer = 0; writer < 2; writer++) {
+		for (unsigned batch = 0; batch < 2; batch++) {
+			QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+			phase_recent_owner_setup(&f, &v, targets, batch != 0, writer != 0);
+			UT_ASSERT_EQ(proof_owner_collect(&v, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+			UT_ASSERT_EQ(v.shared_freeze_xmin_candidates.target_count, batch ? 3 : 1);
+			UT_ASSERT_EQ(phase_resident_releases[1], writer ? 0 : 1);
+			UT_ASSERT_EQ(phase_resident_releases[2], writer ? 1 : 0);
+			phase_recent_owner_finish(&v, true);
+		}
+	}
+}
+
+UT_TEST(test_original_recent_descriptor_misses_never_publish_pin_or_owner)
+{
+	for (unsigned fault = 1; fault < 3; fault++) {
+		QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+		phase_recent_owner_setup(&f, &v, targets, true, true);
+		phase_recent_fault = fault; phase_resident_expected_resumes = 0;
+		UT_ASSERT(proof_owner_collect(&v, 1) != CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+		UT_ASSERT(!v.shared_freeze_fence_valid);
+		UT_ASSERT_EQ(v.shared_freeze_xmin_candidates.target_count, 0);
+		UT_ASSERT_EQ(conditional_resumes, 0);
+		phase_recent_owner_finish(&v, false);
+	}
+}
+
+UT_TEST(test_original_recent_owner_unpins_before_collector_error_propagation)
+{
+	QualifiedXminFixture *f = malloc(sizeof(*f));
+	LVRelState *v = malloc(sizeof(*v));
+	ClusterHeapFreezeXminTargetV1 targets[3];
+	UT_ASSERT(f != NULL && v != NULL);
+	for (unsigned writer = 0; writer < 2; writer++) {
+		for (unsigned stage = 0; stage < 2; stage++) {
+			phase_recent_owner_setup(f, v, targets, true, writer != 0);
+			if (stage == 0) recent_pin_observer = phase_resident_census_error_at_pin;
+			if (stage == 1) phase_resident_hint_error = true;
+			expecting_error = true;
+			if (setjmp(error_jump) == 0) {
+				(void)proof_owner_collect(v, 1);
+				UT_ASSERT(false);
+			}
+			expecting_error = false; recent_pin_observer = NULL;
+			UT_ASSERT_EQ(phase_resident_releases[0], !writer && stage == 0 ? 1 : 0);
+			UT_ASSERT_EQ(phase_resident_releases[1], !writer && stage == 1 ? 1 : 0);
+			UT_ASSERT_EQ(phase_resident_releases[2], writer ? 1 : 0);
+			phase_recent_owner_finish(v, true);
+		}
+	}
+	free(v); free(f);
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(322);
+	UT_PLAN(325);
 
 	UT_RUN(test_pin_free_admitted_phase_reaches_recent_native_wal_before_owner_leave);
 	UT_RUN(test_pin_free_phase_recent_refusal_retires_only_its_original_owner);
@@ -15310,6 +15636,9 @@ main(void)
 	UT_RUN(test_original_resident_recheck_unpins_before_real_outer_admission_leave);
 	UT_RUN(test_original_resident_refusals_release_only_their_pin_before_outer_leave);
 	UT_RUN(test_original_resident_errors_unpin_before_real_outer_error_propagation);
+	UT_RUN(test_original_recent_first_pin_and_owner_release_precede_outer_leave);
+	UT_RUN(test_original_recent_descriptor_misses_never_publish_pin_or_owner);
+	UT_RUN(test_original_recent_owner_unpins_before_collector_error_propagation);
 
 	UT_DONE();
 	return ut_failed_count != 0;
