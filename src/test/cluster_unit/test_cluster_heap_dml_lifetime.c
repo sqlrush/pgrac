@@ -282,6 +282,7 @@ rebind_negative(int fault)
 	FormData_pg_class form = { 0 };
 	HeapTupleData tuple = { 0 }, tuple_before;
 	TransactionId creator = 700;
+	Buffer vmbuffer = InvalidBuffer;
 	Page page = (Page)current_page.data;
 	ItemId lp;
 	sigjmp_buf jump;
@@ -327,7 +328,7 @@ rebind_negative(int fault)
 	locked = false;
 	PG_exception_stack = &jump;
 	if (sigsetjmp(jump, 0) == 0)
-		heap_lock_tuple_buffer(&relation, 1, &tuple, &creator);
+		heap_lock_tuple_buffer(&relation, 1, &tuple, &creator, &vmbuffer);
 	else
 		caught = true;
 	PG_exception_stack = NULL;
@@ -360,6 +361,7 @@ excluded_rebind(bool native)
 	FormData_pg_class form = { 0 };
 	HeapTupleData tuple = { 0 }, before;
 	TransactionId creator = 700;
+	Buffer vmbuffer = InvalidBuffer;
 
 	relation.rd_rel = &form;
 	form.relpersistence = native ? RELPERSISTENCE_PERMANENT : RELPERSISTENCE_TEMP;
@@ -371,7 +373,7 @@ excluded_rebind(bool native)
 	before = tuple;
 	replace_image = poison_after_unlock = false;
 	locked = false;
-	heap_lock_tuple_buffer(&relation, 1, &tuple, &creator);
+	heap_lock_tuple_buffer(&relation, 1, &tuple, &creator, &vmbuffer);
 	UT_ASSERT(locked);
 	UT_ASSERT_EQ(creator, 700);
 	UT_ASSERT_EQ(memcmp(&before, &tuple, sizeof(tuple)), 0);

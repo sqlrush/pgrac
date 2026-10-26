@@ -16057,9 +16057,17 @@ cluster_heap_rebind_locked_tuple(Relation relation, Buffer buffer,
 
 static void
 heap_lock_tuple_buffer(Relation relation, Buffer buffer, HeapTuple tuple,
-	TransactionId *creation_xmin)
+					   TransactionId *creation_xmin, Buffer *vmbuffer)
 {
-	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+#ifdef USE_PGRAC_CLUSTER
+	/* The row-lock owner must not obstruct a VM transfer while waiting for
+	 * heap current. Rebind only after exact resident repin and heap recheck. */
+	if (cluster_heap_read_needs_copy(relation))
+		cluster_heap_lock_with_vm_repin(relation, ItemPointerGetBlockNumber(&tuple->t_self), buffer,
+										vmbuffer);
+	else
+#endif
+		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 #ifdef USE_PGRAC_CLUSTER
 	cluster_heap_rebind_locked_tuple(relation, buffer, tuple, creation_xmin);
 #endif
@@ -16201,7 +16209,7 @@ heap_lock_tuple_internal(Relation relation, HeapTuple tuple,
 	if (PageIsAllVisible(BufferGetPage(*buffer)))
 		visibilitymap_pin(relation, block, &vmbuffer);
 
-	heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin);
+	heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin, &vmbuffer);
 
 	page = BufferGetPage(*buffer);
 	lp = PageGetItemId(page, ItemPointerGetOffsetNumber(tid));
@@ -16302,7 +16310,7 @@ l3:
 					follow_result = heap_lock_updated_tuple_authoritative(
 						relation, &cluster_current_mx.successor_proof,
 						GetCurrentTransactionId(), mode);
-					heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin);
+					heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin, &vmbuffer);
 					if (xmax_infomask_changed(tuple->t_data->t_infomask,
 											 infomask)
 						|| !TransactionIdEquals(
@@ -16533,7 +16541,7 @@ l3:
 						uint16		marker_origin = 0;
 						bool		remote_multi;
 
-						heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin);
+						heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin, &vmbuffer);
 						if (xmax_infomask_changed(tuple->t_data->t_infomask, infomask) ||
 							!TransactionIdEquals(HeapTupleHeaderGetRawXmax(tuple->t_data),
 												 xwait))
@@ -16562,12 +16570,12 @@ l3:
 					{
 						result = res;
 						/* recovery code expects to have buffer lock held */
-						heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin);
+						heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin, &vmbuffer);
 						goto failed;
 					}
 				}
 
-				heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin);
+				heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin, &vmbuffer);
 
 				/*
 				 * Make sure it's still an appropriate lock, else start over.
@@ -16602,7 +16610,7 @@ l3:
 			if (HEAP_XMAX_IS_LOCKED_ONLY(infomask) &&
 				!HEAP_XMAX_IS_EXCL_LOCKED(infomask))
 			{
-				heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin);
+				heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin, &vmbuffer);
 
 				/*
 				 * Make sure it's still an appropriate lock, else start over.
@@ -16630,7 +16638,7 @@ l3:
 					 * No conflict, but if the xmax changed under us in the
 					 * meantime, start over.
 					 */
-					heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin);
+					heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin, &vmbuffer);
 					if (xmax_infomask_changed(tuple->t_data->t_infomask, infomask) ||
 						!TransactionIdEquals(HeapTupleHeaderGetRawXmax(tuple->t_data),
 											 xwait))
@@ -16642,7 +16650,7 @@ l3:
 			}
 			else if (HEAP_XMAX_IS_KEYSHR_LOCKED(infomask))
 			{
-				heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin);
+				heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin, &vmbuffer);
 
 				/* if the xmax changed in the meantime, start over */
 				if (xmax_infomask_changed(tuple->t_data->t_infomask, infomask) ||
@@ -16677,7 +16685,7 @@ l3:
 			)
 		{
 			/* ... but if the xmax changed in the meantime, start over */
-			heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin);
+			heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin, &vmbuffer);
 			if (xmax_infomask_changed(tuple->t_data->t_infomask, infomask) ||
 				!TransactionIdEquals(HeapTupleHeaderGetRawXmax(tuple->t_data),
 									 xwait))
@@ -16699,7 +16707,7 @@ l3:
 		 */
 		if (require_sleep && (result == TM_Updated || result == TM_Deleted))
 		{
-			heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin);
+			heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin, &vmbuffer);
 			goto failed;
 		} else if (require_sleep) {
 			/*
@@ -16722,7 +16730,7 @@ l3:
 				 */
 				result = TM_WouldBlock;
 				/* recovery code expects to have buffer lock held */
-				heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin);
+				heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin, &vmbuffer);
 				goto failed;
 			}
 
@@ -16750,7 +16758,7 @@ l3:
 					uint16		marker_origin = 0;
 					bool		remote_multi;
 
-					heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin);
+					heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin, &vmbuffer);
 					if (xmax_infomask_changed(tuple->t_data->t_infomask, infomask) ||
 						!TransactionIdEquals(HeapTupleHeaderGetRawXmax(tuple->t_data),
 											 xwait))
@@ -16784,7 +16792,7 @@ l3:
 						{
 							result = TM_WouldBlock;
 							/* recovery code expects to have buffer lock held */
-							heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin);
+							heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin, &vmbuffer);
 							goto failed;
 						}
 						break;
@@ -16835,7 +16843,7 @@ l3:
 					 * (it expects the content lock held), like all other
 					 * writer consumers. DATA and LOCK_ONLY share this owner.
 					 */
-					heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin);
+					heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin, &vmbuffer);
 					if (xmax_infomask_changed(tuple->t_data->t_infomask, infomask) ||
 						!TransactionIdEquals(HeapTupleHeaderGetRawXmax(tuple->t_data),
 											 xwait))
@@ -16898,7 +16906,7 @@ l3:
 						{
 							result = TM_WouldBlock;
 							/* recovery code expects to have buffer lock held */
-							heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin);
+							heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin, &vmbuffer);
 							goto failed;
 						}
 						break;
@@ -16926,12 +16934,12 @@ l3:
 				{
 					result = res;
 					/* recovery code expects to have buffer lock held */
-					heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin);
+					heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin, &vmbuffer);
 					goto failed;
 				}
 			}
 
-			heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin);
+			heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin, &vmbuffer);
 
 			/*
 			 * xwait is done, but if xwait had just locked the tuple then some
@@ -17027,7 +17035,7 @@ failed:
 	{
 		LockBuffer(*buffer, BUFFER_LOCK_UNLOCK);
 		visibilitymap_pin(relation, block, &vmbuffer);
-		heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin);
+		heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin, &vmbuffer);
 		goto l3;
 	}
 
@@ -18426,7 +18434,12 @@ l4:
 		else
 			pinned_desired_page = false;
 
-		heap_lock_tuple_buffer(rel, buf, &mytup, &creation_xmin);
+		heap_lock_tuple_buffer(rel, buf, &mytup, &creation_xmin, &vmbuffer);
+#ifdef USE_PGRAC_CLUSTER
+		/* The shared acquisition already handled an installed AV image. */
+		if (cluster_heap_read_needs_copy(rel))
+			pinned_desired_page = BufferIsValid(vmbuffer);
+#endif
 
 		/*
 		 * If we didn't pin the visibility map page and the page has become
@@ -18443,7 +18456,7 @@ l4:
 		{
 			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 			visibilitymap_pin(rel, block, &vmbuffer);
-			heap_lock_tuple_buffer(rel, buf, &mytup, &creation_xmin);
+			heap_lock_tuple_buffer(rel, buf, &mytup, &creation_xmin, &vmbuffer);
 		}
 
 #ifdef USE_PGRAC_CLUSTER
@@ -18760,7 +18773,7 @@ l4:
 							 errmsg("cluster undo reservation failed before update-chain lock"),
 							 cluster_heap_undo_receipt_errdetail(false)));
 				cluster_chain_receipt_owned = true;
-				heap_lock_tuple_buffer(rel, buf, &mytup, &creation_xmin);
+				heap_lock_tuple_buffer(rel, buf, &mytup, &creation_xmin, &vmbuffer);
 				goto l4;
 			}
 
@@ -18798,7 +18811,7 @@ l4:
 										   cluster_node_id)));
 					cluster_chain_receipt_owned = requalified == CLUSTER_UNDO_RECORD_PREPARE_READY;
 				}
-				heap_lock_tuple_buffer(rel, buf, &mytup, &creation_xmin);
+				heap_lock_tuple_buffer(rel, buf, &mytup, &creation_xmin, &vmbuffer);
 				goto l4;
 			}
 			if (undo_result != CLUSTER_HEAP_PREPARED_UNDO_READY)
@@ -18896,7 +18909,7 @@ l4:
 												  cluster_undo_record_receipt_last_reason(),
 												  cluster_node_id)));
 					cluster_chain_receipt_owned = requalified == CLUSTER_UNDO_RECORD_PREPARE_READY;
-					heap_lock_tuple_buffer(rel, buf, &mytup, &creation_xmin);
+					heap_lock_tuple_buffer(rel, buf, &mytup, &creation_xmin, &vmbuffer);
 					goto l4;
 				}
 				if (boundary_result != CLUSTER_HEAP_BOUNDARY_APPLIED)
