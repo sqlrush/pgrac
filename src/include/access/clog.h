@@ -8,6 +8,14 @@
  *
  * src/include/access/clog.h
  */
+/*-------------------------------------------------------------------------
+ * PGRAC MODIFICATIONS
+ *     Modified by: SqlRush <sqlrush@gmail.com>
+ *
+ *     Declare original-origin recovery I/O and Startup CLOG base observations.
+ *     Spec: 2026-10-14-pre2-m5-e1-format-closure-v1.md
+ *-------------------------------------------------------------------------
+ */
 #ifndef CLOG_H
 #define CLOG_H
 
@@ -43,6 +51,35 @@ extern XidStatus TransactionIdGetStatus(TransactionId xid, XLogRecPtr *lsn);
 extern void ClusterClogAdoptNativeStatus(TransactionId xid, XidStatus status);
 
 #ifdef USE_PGRAC_CLUSTER
+/* Original declared Startup participant only. The selected source retains
+ * the original simultaneous replay IR set; it is not a C0/cold-write grant.
+ * Query FullXid is an identity to inspect, never a certified native era. */
+struct ClusterRecoveryRelmapSourceV1;
+typedef struct ClusterRelmapClogBaseV1 {
+	uint64 queried_full_xid;
+	int origin;
+	uint32 page_number;
+	XidStatus status;
+	dev_t device;
+	ino_t inode;
+	off_t size;
+	uint8 image[BLCKSZ];
+} ClusterRelmapClogBaseV1;
+typedef struct ClusterRelmapClogBaseHandleV1 ClusterRelmapClogBaseHandleV1;
+/* Start with *held NULL. Subsequent reads require the exact original source,
+ * query and full disk image on the same tracked fd. Entered refusal/ERROR
+ * poisons custody and the original episode, retaining original protection.
+ * Native locks cover only each read; no lock is retained between calls.
+ * Missing/short/aliased files refuse. IN_PROGRESS stays IN_PROGRESS.
+ * No caller native/CF lock or critical section; output/held/source are
+ * exclusive and disjoint. Precondition refusal performs no I/O/revocation.
+ * Release local custody on every exit before original scope/fd.c teardown.
+ * This observes a base; native reuse/truncation/FullXid era/history, complete
+ * native/SIDE fold and final joint COMPLETE still need their original proof. */
+extern bool cluster_clog_relmap_base_read_v1(
+	const struct ClusterRecoveryRelmapSourceV1 *source, uint64 requested_full_xid,
+	ClusterRelmapClogBaseV1 *out, ClusterRelmapClogBaseHandleV1 **held);
+extern void cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **held);
 /* Original-origin storage only. The recovery owner must first prove the
  * complete terminal record, original source/base/era and mutation authority.
  * These calls neither resolve an unknown transaction nor publish visibility.

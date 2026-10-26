@@ -53,6 +53,7 @@ LWLockPadded *MainLWLockArray;
 static LWLockPadded own_main_locks[NUM_INDIVIDUAL_LWLOCKS];
 static bool authority = true, revoke_on_lock, expect_error, fail_open, fail_sync, fail_dirsync;
 static bool c0_authority;
+static bool relmap_base_interrupts;
 static bool revoke_after_read, revoke_after_sync;
 static bool fail_read, fail_unlink;
 static bool fail_sync_close;
@@ -86,8 +87,12 @@ errstart(int level, const char *domain pg_attribute_unused())
 {
 	if (level < ERROR)
 		return false;
-	if (expect_error && PG_exception_stack != NULL)
+	if (expect_error && PG_exception_stack != NULL) {
+		/* Match elog ERROR after it clears the original lock holdoff. */
+		if (relmap_base_interrupts)
+			InterruptHoldoffCount = 0;
 		siglongjmp(*PG_exception_stack, 1);
+	}
 	abort();
 }
 bool
@@ -201,6 +206,8 @@ LWLockAcquire(LWLock *lock, LWLockMode mode pg_attribute_unused())
 	unsigned i = fixture_lock_index(lock);
 	UT_ASSERT(!fixture_locks[i].held);
 	fixture_locks[i].held = true;
+	if (relmap_base_interrupts)
+		HOLD_INTERRUPTS();
 	if (revoke_on_lock && (lock == &ClogRecoveryLocks[3].lock
 		|| (c0_origin == 0 && lock == XactCtl->shared->ControlLock)))
 		authority = c0_authority = false;
@@ -212,6 +219,8 @@ LWLockRelease(LWLock *lock)
 	unsigned i = fixture_lock_index(lock);
 	UT_ASSERT(fixture_locks[i].held);
 	fixture_locks[i].held = false;
+	if (relmap_base_interrupts)
+		RESUME_INTERRUPTS();
 }
 bool
 LWLockHeldByMe(LWLock *lock)
@@ -1243,6 +1252,8 @@ UT_TEST(own_c0_native_error_and_revocation_preserve_cache_ownership)
 	c0_authority = false;
 }
 
+#include "test_cluster_clog_relmap_participant.inc"
+
 static void
 fixture_cleanup(void)
 {
@@ -1292,6 +1303,8 @@ main(void)
 	clog_recovery_shmem_init();
 	MainLWLockArray = own_main_locks;
 	LWLockInitialize(XactSLRULock, LWTRANCHE_XACT_BUFFER);
+	LWLockInitialize(XactTruncationLock, LWTRANCHE_XACT_BUFFER);
+	LWLockInitialize(XidGenLock, LWTRANCHE_XACT_BUFFER);
 	SimpleLruInit(XactCtl, "Xact own fixture", 4, CLOG_LSNS_PER_PAGE, XactSLRULock,
 		"pg_xact", LWTRANCHE_XACT_BUFFER, SYNC_HANDLER_NONE);
 	XactCtl->PagePrecedes = CLOGPagePrecedes;
@@ -1300,7 +1313,7 @@ main(void)
 	snprintf(path, sizeof(path), "%s/native_side/origin_0/pg_xact", fixture_root);
 	if (symlink(path, "pg_xact") != 0)
 		return 2;
-	UT_PLAN(26);
+	UT_PLAN(34);
 	UT_RUN(separate_original_origin_controls);
 	UT_RUN(commit_and_abort_persist_full_tree_without_local_pollution);
 	UT_RUN(conflicting_late_child_refuses_before_any_tree_write);
@@ -1327,6 +1340,14 @@ main(void)
 	UT_RUN(own_c0_rejects_committed_disk_or_cache_and_requires_disk_readback);
 	UT_RUN(own_c0_keeps_exact_scope_and_original_directory_route);
 	UT_RUN(own_c0_native_error_and_revocation_preserve_cache_ownership);
+	UT_RUN(relmap_episode_base_all_statuses_and_original_origin_routes);
+	UT_RUN(relmap_episode_preconditions_keep_caller_locks_and_original_debt);
+	UT_RUN(relmap_episode_same_fd_replacement_and_full_image_change_are_sticky);
+	UT_RUN(relmap_episode_native_failures_keep_unknown_and_original_protection);
+	UT_RUN(relmap_episode_late_holder_loss_revokes_after_io);
+	UT_RUN(relmap_episode_error_keeps_held_fd_until_local_cleanup);
+	UT_RUN(relmap_episode_own_route_and_cache_are_not_substituted);
+	UT_RUN(relmap_episode_exact_source_history_and_root_recheck);
 	fixture_cleanup();
 	UT_DONE();
 	return ut_failed_count != 0;

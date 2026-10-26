@@ -26590,8 +26590,10 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(609);
+	UT_PLAN(611);
 	UT_RUN(test_relmap_native_input_refuses_caller_cf_or_critical_without_revocation);
+	UT_RUN(test_relmap_source_whole_root_recheck_retains_original_holder_debt);
+	UT_RUN(test_relmap_source_failure_is_original_incarnation_only_and_owner_sticky);
 	UT_RUN(test_relmap_input_vector_keeps_every_original_history_generation);
 	UT_RUN(test_relmap_inputs_require_declaration_and_all_original_holders);
 	UT_RUN(test_relmap_native_input_reads_original_checkpoint_end_and_window);
