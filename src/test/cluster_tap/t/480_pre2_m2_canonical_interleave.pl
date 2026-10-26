@@ -291,6 +291,13 @@ M2CanonicalOrigin::run_prepared_cases(\@matrix,\&prepare_case,sub {
   my $path=$remote ? 'origin' : $caller;
   my $sql=$remote ? M2CanonicalOrigin::origin_query($cell->{locator},$key,$caller)
    : "SELECT test_pgrac_m2_sample('$path','$table',0,'$xid'::xid)";
+  if($remote) {
+   $cell->{stage}='data_resident_prepare';
+   $cell->{data_prepare}=M2CanonicalOrigin::prepare_data($w,$cell->{locator},$key,$caller);
+   save_json("data-prepare-$number",{kind=>$kind,caller=>$caller,key=>$key,
+    locator=>$cell->{locator},producer_node=>0,producer_pid=>$wpid,
+    preparation=>$cell->{data_prepare},authoritative=>JSON::PP::false});
+  }
   $cell->{stage}='sampling';
   save_json("context-$number",$cell);
   note("M2_CALLER_REQUEST case=$number kind=$kind caller=$caller xid=$xid producer=$wpid reader=$rpid path=$path");

@@ -45,4 +45,22 @@ sub origin_query
  return "SELECT test_pgrac_m2_sample_locator($locator->{uba0},$locator->{uba1},"
   ."'$locator->{xid}'::xid,$locator->{wrap},$locator->{itl_kind},$locator->{itl_slot_index})";
 }
+
+# Open transactions preserve locator identity, not DATA pool residency after
+# another cell's rollover. Use the existing own-instance record reader before
+# any pause; the peer still samples through the original resident-only RPC.
+sub prepare_data
+{
+ my ($writer,$locator,$key,$caller)=@_;
+ origin_query($locator,$key,$caller);
+ # The SQL reader consumes the native in-memory representation of both UBA
+ # words. The fixture and its database run on the same host.
+ my $hex=unpack('H*',pack('Q2',@{$locator}{qw(uba0 uba1)}));
+ my $bytes=$writer->query_safe(
+  "SELECT octet_length(cluster_undo_get_record(decode('$hex','hex')))");
+ die "owner DATA preparation did not read the exact record\n"
+  unless defined($bytes) && $bytes =~ /\A[1-9][0-9]*\z/ && $bytes<=8192;
+ return {record_bytes=>0+$bytes,uba0=>"$locator->{uba0}",uba1=>"$locator->{uba1}",
+  xid=>0+$locator->{xid},authoritative=>0};
+}
 1;

@@ -67,6 +67,83 @@ print encode_json({sql=>$sql,error=>$@});''',
                 self.assertIn('locator', self.query(locator=dict(self.locator,
                                                                uba0=value))['error'])
 
+    def prepare_data(self, reply='244', locator=None):
+        return perl(r'''my $v=decode_json(do {local $/; <STDIN>});
+my @queries;
+{package DataOwner; sub query_safe {push @queries,$_[1]; return $_[0]->{reply};}}
+my $owner=bless {reply=>$v->{reply}},'DataOwner';
+my $result=eval {M2CanonicalOrigin::prepare_data($owner,$v->{locator},$v->{key},'freeze_data')};
+print encode_json({result=>$result,error=>$@,queries=>\@queries});''',
+                    dict(reply=reply, locator=locator or self.locator, key=self.key))
+
+    def test_prepare_reads_exact_uba_on_owner_without_changing_the_resolver(self):
+        result = self.prepare_data()
+        self.assertEqual(result['error'], '')
+        # Native 16-byte UBA consumed by the existing SQL reader on this host.
+        self.assertEqual(result['queries'], [
+            "SELECT octet_length(cluster_undo_get_record("
+            "decode('01000000010000000200040000000000','hex')))"])
+        self.assertEqual(result['result'], dict(record_bytes=244, uba0='4294967297',
+                                                uba1='262146', xid=4195408,
+                                                authoritative=0))
+
+    def test_prepare_refuses_identity_drift_before_any_owner_read(self):
+        result = self.prepare_data(locator=dict(self.locator, xid=4195456))
+        self.assertIn('identity', result['error'])
+        self.assertEqual(result['queries'], [])
+
+    def preparation_stage(self, kind, caller, reply):
+        source = (HERE.parent / 't/480_pre2_m2_canonical_interleave.pl').read_text()
+        start = source.index("  my $path=$remote ? 'origin' : $caller;")
+        stage = source[start:source.index("  $cell->{stage}='sampling';", start)]
+        locator = dict(self.locator)
+        if caller == 'sample_canonical':
+            locator.update(data_segment=2, uba0='4294967298')
+        return perl(r'''my $v=decode_json(do {local $/; <STDIN>});
+my (@events,@saved);
+{package DataOwner; sub query_safe {push @events,{read=>$_[1]}; return $_[0]->{reply};}}
+sub save_json {push @saved,$_[1];}
+my $cell={locator=>$v->{locator},stage=>'caller_qualification'};
+my ($kind,$caller,$key)=@{$v}{qw(kind caller key)};
+my $remote=$caller eq 'freeze_data' || $caller eq 'sample_canonical';
+my $w=bless {reply=>$v->{reply}},'DataOwner';
+my ($table,$xid,$name)=('fixture',$key->{xid},'fixture');
+my $error=''; my $sql;
+eval {
+''' + stage.replace('my $sql=', '$sql=') + r'''
+push @events,{pause=>$kind},{reader=>$sql};
+1;} or $error=$@;
+print encode_json({events=>\@events,error=>$error,saved=>\@saved});''',
+                    dict(kind=kind, caller=caller, reply=reply,
+                         locator=locator, key=self.key))
+
+    def test_real_fixture_rewarms_after_pressure_before_each_remote_pause_and_reader(self):
+        # Removing the preparation call must leave no read before either pause.
+        for kind in ('A1', 'A2'):
+            for caller in ('freeze_data', 'sample_canonical', 'physical', 'owner'):
+                with self.subTest(kind=kind, caller=caller):
+                    result = self.preparation_stage(kind, caller, '244')
+                    self.assertEqual(result['error'], '')
+                    events = result['events']
+                    if caller in ('freeze_data', 'sample_canonical'):
+                        self.assertEqual(len(events), 3)
+                        self.assertIn('cluster_undo_get_record', events[0]['read'])
+                        self.assertEqual(events[1], dict(pause=kind))
+                        self.assertIn('test_pgrac_m2_sample_locator', events[2]['reader'])
+                        self.assertEqual(len(result['saved']), 1)
+                    else:
+                        self.assertEqual(len(events), 2)
+                        self.assertEqual(events[0], dict(pause=kind))
+
+    def test_failed_owner_read_prevents_remote_pause_and_sampling(self):
+        for reply in (None, '', '0', '-1', 'unreadable', '8193'):
+            with self.subTest(reply=reply):
+                result = self.preparation_stage('A2', 'freeze_data', reply)
+                self.assertIn('DATA preparation', result['error'])
+                self.assertEqual(len(result['events']), 1)
+                self.assertIn('read', result['events'][0])
+                self.assertEqual(result['saved'], [])
+
     def test_freeze_producers_are_prepared_before_rollover_without_reordering_cells(self):
         result = perl(r'''
 my (@events,@records);
