@@ -18420,6 +18420,7 @@ heap_lock_updated_tuple_rec(Relation rel, TransactionId priorXmax,
 #endif
 
 l4:
+		/* Retry entry owns neither heap nor VM content locks. */
 		CHECK_FOR_INTERRUPTS();
 
 		/*
@@ -18775,7 +18776,6 @@ l4:
 							 errmsg("cluster undo reservation failed before update-chain lock"),
 							 cluster_heap_undo_receipt_errdetail(false)));
 				cluster_chain_receipt_owned = true;
-				heap_lock_tuple_buffer(rel, buf, &mytup, &creation_xmin, &vmbuffer);
 				goto l4;
 			}
 
@@ -18813,7 +18813,6 @@ l4:
 										   cluster_node_id)));
 					cluster_chain_receipt_owned = requalified == CLUSTER_UNDO_RECORD_PREPARE_READY;
 				}
-				heap_lock_tuple_buffer(rel, buf, &mytup, &creation_xmin, &vmbuffer);
 				goto l4;
 			}
 			if (undo_result != CLUSTER_HEAP_PREPARED_UNDO_READY)
@@ -18918,7 +18917,6 @@ l4:
 												  cluster_undo_record_receipt_last_reason(),
 												  cluster_node_id)));
 					cluster_chain_receipt_owned = requalified == CLUSTER_UNDO_RECORD_PREPARE_READY;
-					heap_lock_tuple_buffer(rel, buf, &mytup, &creation_xmin, &vmbuffer);
 					goto l4;
 				}
 				if (boundary_result != CLUSTER_HEAP_BOUNDARY_APPLIED)

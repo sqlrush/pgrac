@@ -6201,6 +6201,8 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_undo_path_native.inc test_cluster_undo_fd_native.inc test_cluster_undo_dir_native.inc
 	rm -f test_cluster_heap_lock_vm_needed.inc
 	rm -f test_cluster_heap_chain_vm_itl.inc test_cluster_heap_chain_vm_no_itl.inc
+	rm -f test_cluster_heap_chain_receipt_types.inc test_cluster_heap_chain_receipt_reserve.inc \
+		test_cluster_heap_chain_receipt_prepare.inc test_cluster_heap_chain_receipt_boundary.inc
 	rm -f test_cluster_btree_structure_helpers.inc test_cluster_btree_structure_alloc.inc \
 		test_cluster_btree_structure_root.inc \
 		test_cluster_btree_structure_delete.inc \
@@ -9515,10 +9517,32 @@ test_cluster_heap_chain_vm_itl.inc test_cluster_heap_chain_vm_no_itl.inc: $(top_
 	     /^}/ { in_chain=0 } END { if (found != 2 || candidate) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_heap_chain_receipt_types.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^typedef enum (ClusterHeapPreparedUndoResult|ClusterHeapNoRetryBoundaryResult)$$/ { emit=1; enums++ } \
+	     /^cluster_heap_prepare_undo_record_exact\(/ { print "static bool"; emit=1; helpers++ } \
+	     emit { print } /^} ClusterHeap(PreparedUndoResult|NoRetryBoundaryResult);/ { emit=0; done++ } \
+	     emit && /^}/ { emit=0; complete++ } \
+	     END { if (enums != 2 || done != 2 || helpers != 1 || complete != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_chain_receipt_reserve.inc test_cluster_heap_chain_receipt_prepare.inc test_cluster_heap_chain_receipt_boundary.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk -v wanted=$(if $(filter %_reserve.inc,$@),1,$(if $(filter %_prepare.inc,$@),2,3)) \
+	    '/^heap_lock_updated_tuple_rec\(/ { in_chain=1 } \
+	     in_chain && ((wanted == 1 && /if \(!cluster_chain_receipt_owned\)/) \
+	       || (wanted == 2 && /if \(undo_result == CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED\)/) \
+	       || (wanted == 3 && /if \(boundary_result$$/)) { emit=1; found++ } \
+	     emit { print; s=$$0; opens=gsub(/\{/, "", s); s=$$0; closes=gsub(/}/, "", s); \
+	       depth+=opens-closes; if (opens) opened=1; \
+	       if (opened && depth == 0) { emit=0; done++; exit } } \
+	     /^}/ { in_chain=0 } END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_heap_lock_vm_pin test_cluster_heap_lock_vm_pin_noassert: test_cluster_heap_lock_vm_pin.c unit_test.h \
 		test_cluster_heap_lock_rebind.inc test_cluster_heap_vm_unwind_helpers.inc \
 		test_cluster_heap_lock_vm_recent.inc test_cluster_heap_lock_chain_pin.inc \
-		test_cluster_heap_chain_vm_itl.inc test_cluster_heap_chain_vm_no_itl.inc $(CLUSTER_HOT_BUFPAGE_TEST_O)
+		test_cluster_heap_chain_vm_itl.inc test_cluster_heap_chain_vm_no_itl.inc \
+		test_cluster_heap_chain_receipt_types.inc test_cluster_heap_chain_receipt_reserve.inc \
+		test_cluster_heap_chain_receipt_prepare.inc test_cluster_heap_chain_receipt_boundary.inc $(CLUSTER_HOT_BUFPAGE_TEST_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(if $(filter %_noassert,$@),-DFIXTURE_NO_ASSERTS) $< \
 		$(CLUSTER_HOT_BUFPAGE_TEST_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@

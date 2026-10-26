@@ -14,6 +14,7 @@
 #include "access/heapam.h"
 #include "access/visibilitymap.h"
 #include "cluster/cluster_pcm_lock.h"
+#include "cluster/cluster_tt_local.h"
 #include "storage/bufmgr.h"
 #include "storage/smgr.h"
 #include "utils/rel.h"
@@ -75,6 +76,11 @@ errmsg(const char *fmt, ...)
 }
 int
 errmsg_internal(const char *fmt, ...)
+{
+	return 0;
+}
+int
+errdetail(const char *fmt, ...)
 {
 	return 0;
 }
@@ -673,10 +679,381 @@ UT_TEST(chain_warm_error_holds_no_content_lock_and_never_reaches_apply)
 	chain_error(0, true);
 }
 
+static unsigned receipt_prepares, receipt_pending, receipt_requals, receipt_deadlines;
+static unsigned receipt_interrupts, receipt_returns, receipt_prepare_retries;
+static bool receipt_refused, receipt_error, receipt_binding_ready, receipt_identity_ready;
+static bool receipt_invalidated, receipt_install_image;
+static uint64 receipt_expected_deadline, receipt_returned_deadline;
+static ClusterUndoRecordPrepareResult receipt_retry_result;
+static ClusterUndoRecordPrepareReceipt receipt_returned;
+static bool receipt_returned_owned;
+
+static void
+receipt_interrupt(void)
+{
+	UT_ASSERT(!locked && !vm_locked);
+	receipt_interrupts++;
+}
+
+#undef CHECK_FOR_INTERRUPTS
+#define CHECK_FOR_INTERRUPTS() receipt_interrupt()
+#define cluster_heap_prepare_undo_record_call cluster_undo_record_prepare
+#include "test_cluster_heap_chain_receipt_types.inc"
+#undef cluster_heap_prepare_undo_record_call
+#undef CHECK_FOR_INTERRUPTS
+
+/* Services may block only after the actual retry block released content
+ * ownership. Their canonical/receipt decisions are controlled leaves. */
+static void
+receipt_service(void)
+{
+	UT_ASSERT(!locked && !vm_locked);
+	if (receipt_error)
+		elog(ERROR, "controlled receipt service error");
+	if (receipt_install_image)
+		replace_image = true;
+}
+
+uint64
+cluster_undo_record_prepare_deadline_us(void)
+{
+	receipt_service();
+	receipt_deadlines++;
+	return 7000;
+}
+
+bool
+cluster_tt_local_get_published_binding(TransactionId xid, ClusterCanonicalTxnBinding *binding)
+{
+	receipt_service();
+	UT_ASSERT_EQ(xid, 501);
+	memset(binding, 0, sizeof(*binding));
+	binding->xid = xid;
+	binding->segment_id = 17;
+	binding->slot_offset = 19;
+	return receipt_binding_ready;
+}
+
+static bool
+cluster_heap_itl_receipt_identity_admitted(TransactionId xid, uint32 segment)
+{
+	receipt_service();
+	UT_ASSERT_EQ(xid, 501);
+	UT_ASSERT_EQ(segment, 17);
+	return receipt_identity_ready;
+}
+
+ClusterUndoRecordPrepareResult
+cluster_undo_record_prepare(uint8 type, uint16 capacity, uint16 segment, uint16 slot, UBA previous,
+							uint64 deadline, ClusterUndoRecordPrepareReceipt *receipt)
+{
+	receipt_service();
+	UT_ASSERT_EQ(type, UNDO_RECORD_ITL);
+	UT_ASSERT_EQ(capacity, sizeof(UndoItlPayload));
+	UT_ASSERT_EQ(segment, 17);
+	UT_ASSERT_EQ(slot, 19);
+	UT_ASSERT(UBA_is_invalid(previous));
+	UT_ASSERT_EQ(deadline, receipt_expected_deadline);
+	receipt_prepares++;
+	if (receipt_refused)
+		return CLUSTER_UNDO_RECORD_PREPARE_REFUSED;
+	if (receipt_prepare_retries > 0) {
+		receipt_prepare_retries--;
+		return CLUSTER_UNDO_RECORD_PREPARE_RETRY_REQUIRED;
+	}
+	receipt->reservation_sequence = 909;
+	receipt->absolute_deadline_us = deadline;
+	return CLUSTER_UNDO_RECORD_PREPARE_READY;
+}
+
+static int
+cluster_heap_undo_receipt_errdetail(bool ctrc)
+{
+	return 0;
+}
+
+const char *
+cluster_undo_record_receipt_last_reason(void)
+{
+	return "controlled receipt refusal";
+}
+
+bool
+cluster_undo_record_ctrc_prepare_pending(ClusterUndoRecordPrepareReceipt *receipt, uint8 ordinal)
+{
+	receipt_service();
+	UT_ASSERT_EQ(ordinal, 0);
+	UT_ASSERT_EQ(receipt->reservation_sequence, 909);
+	UT_ASSERT_EQ(receipt->absolute_deadline_us, receipt_expected_deadline);
+	receipt_pending++;
+	if (receipt_refused)
+		return false;
+	receipt->ctrc_prepared_mask = 1;
+	return true;
+}
+
+ClusterUndoRecordPrepareResult
+cluster_undo_record_requalify_for_retry(ClusterUndoRecordPrepareReceipt *receipt, uint16 capacity,
+										bool invalidated)
+{
+	receipt_service();
+	UT_ASSERT_EQ(capacity, sizeof(UndoItlPayload));
+	UT_ASSERT_EQ(receipt->reservation_sequence, 909);
+	UT_ASSERT_EQ(receipt->absolute_deadline_us, receipt_expected_deadline);
+	UT_ASSERT_EQ(invalidated, receipt_invalidated);
+	receipt_requals++;
+	if (receipt_refused)
+		return CLUSTER_UNDO_RECORD_PREPARE_REFUSED;
+	if (receipt_retry_result == CLUSTER_UNDO_RECORD_PREPARE_RETRY_REQUIRED)
+		receipt->reservation_sequence = 0;
+	return receipt_retry_result;
+}
+
+static void
+reset_receipt(void)
+{
+	reset(true, true);
+	receipt_prepares = receipt_pending = receipt_requals = receipt_deadlines = 0;
+	receipt_interrupts = receipt_returns = receipt_prepare_retries = 0;
+	receipt_refused = receipt_error = receipt_invalidated = receipt_install_image = false;
+	receipt_binding_ready = receipt_identity_ready = true;
+	receipt_expected_deadline = 7000;
+	receipt_returned_deadline = 0;
+	receipt_returned_owned = false;
+	receipt_retry_result = CLUSTER_UNDO_RECORD_PREPARE_READY;
+	memset(&receipt_returned, 0, sizeof(receipt_returned));
+}
+
+/* Execute all three full retry blocks, not only their final goto. The
+ * driver chooses controlled pre-APPLY outcomes and stops after the next
+ * original l4 acquisition; it does not replace the full receipt planner. */
+static void
+chain_receipt(int edge, bool content_unlocked, bool pending, bool vm_content, unsigned iterations,
+			  uint64 initial_deadline)
+{
+	Relation rel = &relation;
+	Buffer buf = 1, vmbuffer = vm;
+	BlockNumber block = 17;
+	HeapTupleData mytup = tuple;
+	TransactionId creation_xmin = creator, canonical_xid = 501;
+	bool pinned_desired_page, cluster_chain_vm_locked = false;
+	bool cluster_chain_receipt_owned = edge != 0, targets_invalidated = receipt_invalidated;
+	ClusterUndoRecordPrepareReceipt cluster_chain_receipt = { 0 };
+	uint64 cluster_chain_prepare_deadline_us = initial_deadline;
+	ClusterHeapPreparedUndoResult undo_result = CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED;
+	ClusterHeapNoRetryBoundaryResult boundary_result = CLUSTER_HEAP_BOUNDARY_ZERO_APPLY_RETRY;
+	unsigned visits = 0;
+
+	cluster_chain_receipt.reservation_sequence = 909;
+	cluster_chain_receipt.absolute_deadline_us = receipt_expected_deadline;
+	cluster_chain_receipt.ctrc_pending_mask = pending ? 1 : 0;
+l4:
+#include "test_cluster_heap_lock_chain_pin.inc"
+	if (visits++ < iterations) {
+		if (edge == 0) {
+#include "test_cluster_heap_chain_receipt_reserve.inc"
+		} else if (edge == 1) {
+			/* The real prepare caller reports whether it already unlocked. */
+			if (content_unlocked)
+				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+#include "test_cluster_heap_chain_receipt_prepare.inc"
+		} else {
+			/* A ZERO_APPLY boundary can own the already acquired VM-X. */
+			vm_locked = cluster_chain_vm_locked = vm_content;
+#include "test_cluster_heap_chain_receipt_boundary.inc"
+		}
+		UT_ASSERT(false); /* Every selected retry must return through l4. */
+		return;
+	}
+	UT_ASSERT(!vm_locked && !cluster_chain_vm_locked);
+	vm = vmbuffer;
+	tuple = mytup;
+	creator = creation_xmin;
+	receipt_returned = cluster_chain_receipt;
+	receipt_returned_owned = cluster_chain_receipt_owned;
+	receipt_returned_deadline = cluster_chain_prepare_deadline_us;
+	receipt_returns++;
+}
+
+static void
+check_receipt_retry(unsigned acquisitions)
+{
+	check_current();
+	UT_ASSERT(vm_pinned && !vm_locked);
+	UT_ASSERT_EQ(waits, acquisitions);
+	UT_ASSERT_EQ(receipt_returns, 1);
+	UT_ASSERT_EQ(receipt_returned.absolute_deadline_us, receipt_expected_deadline);
+}
+
+UT_TEST(receipt_reservation_returns_unlocked_to_the_single_l4_acquisition)
+{
+	reset_receipt();
+	chain_receipt(0, false, false, false, 1, 0);
+	check_receipt_retry(2);
+	UT_ASSERT(receipt_returned_owned);
+	UT_ASSERT_EQ(receipt_returned.reservation_sequence, 909);
+	UT_ASSERT_EQ(receipt_returned_deadline, 7000);
+	UT_ASSERT_EQ(receipt_prepares, 1);
+	UT_ASSERT_EQ(receipt_deadlines, 1);
+	UT_ASSERT_EQ(receipt_pending + receipt_requals, 0);
+}
+
+UT_TEST(receipt_ready_retry_preserves_reservation_with_either_unlock_owner)
+{
+	for (int unlocked = 0; unlocked < 2; unlocked++) {
+		reset_receipt();
+		chain_receipt(1, unlocked != 0, false, false, 1, 7000);
+		check_receipt_retry(2);
+		UT_ASSERT(receipt_returned_owned);
+		UT_ASSERT_EQ(receipt_returned.reservation_sequence, 909);
+		UT_ASSERT_EQ(receipt_requals, 1);
+		UT_ASSERT_EQ(receipt_prepares + receipt_pending + receipt_deadlines, 0);
+	}
+}
+
+UT_TEST(receipt_pending_target_prepare_does_not_reacquire_before_l4)
+{
+	for (int unlocked = 0; unlocked < 2; unlocked++) {
+		reset_receipt();
+		chain_receipt(1, unlocked != 0, true, false, 1, 7000);
+		check_receipt_retry(2);
+		UT_ASSERT(receipt_returned_owned);
+		UT_ASSERT_EQ(receipt_returned.reservation_sequence, 909);
+		UT_ASSERT_EQ(receipt_returned.ctrc_prepared_mask, 1);
+		UT_ASSERT_EQ(receipt_pending, 1);
+		UT_ASSERT_EQ(receipt_requals + receipt_prepares, 0);
+	}
+}
+
+UT_TEST(receipt_invalidated_target_keeps_original_reprepare_decision_and_budget)
+{
+	reset_receipt();
+	receipt_invalidated = true;
+	receipt_retry_result = CLUSTER_UNDO_RECORD_PREPARE_RETRY_REQUIRED;
+	chain_receipt(1, false, true, false, 1, 7000);
+	check_receipt_retry(2);
+	UT_ASSERT(!receipt_returned_owned);
+	UT_ASSERT_EQ(receipt_returned.reservation_sequence, 0);
+	UT_ASSERT_EQ(receipt_returned_deadline, 7000);
+	UT_ASSERT_EQ(receipt_requals, 1);
+	UT_ASSERT_EQ(receipt_pending + receipt_prepares + receipt_deadlines, 0);
+}
+
+UT_TEST(receipt_zero_apply_retry_releases_vm_and_heap_before_requalifying)
+{
+	for (int map = 0; map < 2; map++) {
+		reset_receipt();
+		chain_receipt(2, false, false, map != 0, 1, 7000);
+		check_receipt_retry(2);
+		UT_ASSERT(receipt_returned_owned);
+		UT_ASSERT_EQ(receipt_returned.reservation_sequence, 909);
+		UT_ASSERT_EQ(receipt_requals, 1);
+	}
+}
+
+UT_TEST(receipt_repeated_zero_apply_retries_do_not_accumulate_heap_ownership)
+{
+	for (int edge = 1; edge < 3; edge++) {
+		reset_receipt();
+		chain_receipt(edge, false, false, true, 3, 7000);
+		check_receipt_retry(4);
+		UT_ASSERT_EQ(receipt_requals, 3);
+		UT_ASSERT_EQ(receipt_returned.reservation_sequence, 909);
+		UT_ASSERT_EQ(receipt_deadlines + receipt_prepares, 0);
+	}
+}
+
+UT_TEST(receipt_prepare_retries_keep_the_original_operation_deadline)
+{
+	reset_receipt();
+	receipt_expected_deadline = 6000;
+	receipt_prepare_retries = 2;
+	chain_receipt(0, false, false, false, 1, 6000);
+	check_receipt_retry(2);
+	UT_ASSERT_EQ(receipt_returned_deadline, 6000);
+	UT_ASSERT_EQ(receipt_prepares, 3);
+	UT_ASSERT_EQ(receipt_interrupts, 2);
+	UT_ASSERT_EQ(receipt_deadlines, 0);
+}
+
+UT_TEST(receipt_wait_rebinds_the_installed_compacted_tuple_before_returning)
+{
+	for (int edge = 0; edge < 3; edge++) {
+		HeapTupleHeader old_address;
+
+		reset_receipt();
+		replace_image = false;
+		receipt_install_image = true;
+		old_address = tuple.t_data;
+		chain_receipt(edge, false, false, edge == 2, 1, 7000);
+		check_receipt_retry(2);
+		UT_ASSERT(tuple.t_data != old_address);
+		UT_ASSERT_EQ(creator, 700);
+	}
+}
+
+static void
+receipt_error_path(int edge)
+{
+	sigjmp_buf jump;
+	volatile bool caught = false;
+
+	PG_exception_stack = &jump;
+	if (sigsetjmp(jump, 0) == 0)
+		chain_receipt(edge, false, false, edge == 2, 1, 7000);
+	else
+		caught = true;
+	PG_exception_stack = NULL;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(receipt_returns, 0);
+	UT_ASSERT(!vm_locked);
+	UT_ASSERT_EQ(waits_with_vm, 0);
+}
+
+UT_TEST(receipt_wait_creator_contradiction_cannot_reach_the_next_apply_boundary)
+{
+	for (int edge = 0; edge < 3; edge++) {
+		reset_receipt();
+		replace_image = false;
+		receipt_install_image = true;
+		HeapTupleHeaderSetXmin(
+			(HeapTupleHeader)PageGetItem(incoming.data, PageGetItemId(incoming.data, 2)), 701);
+		receipt_error_path(edge);
+		UT_ASSERT(locked);
+		UT_ASSERT_EQ(creator, 700);
+	}
+}
+
+UT_TEST(receipt_service_refusal_or_error_keeps_content_unlocked)
+{
+	for (int edge = 0; edge < 3; edge++)
+		for (int error = 0; error < 2; error++) {
+			reset_receipt();
+			receipt_error = error != 0;
+			receipt_refused = error == 0;
+			receipt_error_path(edge);
+			UT_ASSERT(!locked);
+			UT_ASSERT_EQ(waits, 1);
+		}
+}
+
+UT_TEST(receipt_missing_canonical_binding_or_admission_never_reacquires_heap)
+{
+	for (int admission = 0; admission < 2; admission++) {
+		reset_receipt();
+		receipt_binding_ready = admission != 0;
+		receipt_identity_ready = admission == 0;
+		receipt_error_path(0);
+		UT_ASSERT(!locked);
+		UT_ASSERT_EQ(receipt_prepares, 0);
+		UT_ASSERT_EQ(waits, 1);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(22);
+	UT_PLAN(33);
 	UT_RUN(cached_vm_pin_is_released_before_heap_current);
 	UT_RUN(cold_vm_is_prepared_outside_heap_content);
 	UT_RUN(new_all_visible_image_gets_exact_pin_before_tuple_rebind);
@@ -699,6 +1076,17 @@ main(void)
 	UT_RUN(chain_creator_contradiction_after_vm_wait_cannot_reach_apply);
 	UT_RUN(chain_pruned_tuple_after_vm_wait_cannot_reach_apply);
 	UT_RUN(chain_warm_error_holds_no_content_lock_and_never_reaches_apply);
+	UT_RUN(receipt_reservation_returns_unlocked_to_the_single_l4_acquisition);
+	UT_RUN(receipt_ready_retry_preserves_reservation_with_either_unlock_owner);
+	UT_RUN(receipt_pending_target_prepare_does_not_reacquire_before_l4);
+	UT_RUN(receipt_invalidated_target_keeps_original_reprepare_decision_and_budget);
+	UT_RUN(receipt_zero_apply_retry_releases_vm_and_heap_before_requalifying);
+	UT_RUN(receipt_repeated_zero_apply_retries_do_not_accumulate_heap_ownership);
+	UT_RUN(receipt_prepare_retries_keep_the_original_operation_deadline);
+	UT_RUN(receipt_wait_rebinds_the_installed_compacted_tuple_before_returning);
+	UT_RUN(receipt_wait_creator_contradiction_cannot_reach_the_next_apply_boundary);
+	UT_RUN(receipt_service_refusal_or_error_keeps_content_unlocked);
+	UT_RUN(receipt_missing_canonical_binding_or_admission_never_reacquires_heap);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
