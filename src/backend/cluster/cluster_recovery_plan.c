@@ -56,6 +56,8 @@
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_recovery_plan.h"
+#include "cluster/cluster_page_authority_ctrc.h"
+#include "cluster/cluster_wal_inputs.h"
 #include "cluster/cluster_recovery_ctrc_record.h"
 #include "cluster/cluster_recovery_undo_scan.h"
 #include "cluster/cluster_recovery_worker.h" /* pool lives in this wrapper (spec-4.4 D5) */
@@ -1970,6 +1972,126 @@ cluster_recovery_stamp_prepare_fpi_v1(const ClusterRecoveryStampOwnerV1 *owner,
 			&image->version.before, &fpi.protection))
 		return false;
 	return stamp_prepare(owner, CLUSTER_RECOVERY_STAMP_FPI, (const uint8 *)&fpi, sizeof(fpi), out);
+}
+
+/* Snapshot-only admission for the original native CTRC path. Hashing and
+ * capacity preparation belong before this PAGE promotion, outside this API. */
+static ClusterRecoveryStampHandleV1
+stamp_ctrc_fpi_prepare(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, const ClusterRecoveryCtrcReplaySetSourceV1 *source,
+	const RfPageCtrcAuthorityV1 *authority, const RfPageIdentityV1 *target,
+	const GenericXLogRecoveryImageDescriptorV1 *image,
+	const ClusterColdCtrcWorkV1 *snapshot, Size work_bytes)
+{
+	ClusterRecoveryStampHandleV1 handle = {0};
+	ClusterRecoveryStampOwnerV1 owner = {0};
+	ClusterRecoveryStampFpiV1 fpi = {0};
+	ClusterRecoveryTxResultObservationV1 accepted, confirmed;
+	ClusterRecoveryCtrcReplaySetSourceV1 fixed_source;
+	RfPageIdentityV1 fixed_target;
+	RfPageCtrcReferenceV1 reference, verified;
+	ClusterWalWriterToken installed = {0};
+	uint8 operation_uuid[16];
+	uint64 generation;
+
+	if (!stamp_actor() || MyBackendType != B_STARTUP || CritSectionCount != 0
+		|| ShutdownRequestPending || RecoveryInProgress() || start == NULL || work == NULL
+		|| source == NULL || authority == NULL || target == NULL || image == NULL)
+		return handle;
+	fixed_source = *source;
+	fixed_target = *target;
+	fpi.image = *image;
+	fpi.locator = fixed_target.locator;
+	if (memcmp(work, snapshot, work_bytes) != 0
+		|| !cluster_recovery_ctrc_terminal_result_v1(start, work, &accepted)
+		|| accepted.checkpoint.owner.owner_pid != MyProcPid
+		|| fixed_source.work_generation != work->generation
+		|| ClusterColdRecoveryCtrcScope(start, work) != fixed_source.scope
+		|| fixed_target.system_identifier != fixed_source.selected.source.claim.identity.system_identifier
+		|| memcmp(fixed_target.storage_uuid, fixed_source.selected.source.claim.identity.storage_uuid, 16) != 0
+		|| fixed_target.reserved_zero != 0 || fixed_target.forknum != fpi.image.fork_number
+		|| fixed_target.blockno != fpi.image.block_number)
+		return handle;
+	owner.writer = accepted.checkpoint.owner.writer;
+	owner.target = fixed_source.selected.source.claim;
+	owner.executor_boot = accepted.checkpoint.owner.owner_boot;
+	owner.recovery_serial = accepted.checkpoint.owner.start_serial;
+	owner.executor_pid = accepted.checkpoint.owner.owner_pid;
+	if (!stamp_owner_valid(&owner) || !stamp_fpi_image_matches(&owner, &fpi))
+		return handle;
+	reference = rf_page_authority_ctrc_replays_reference_nowait_v1(authority,
+		&fixed_source, &fixed_target, &fpi.image.version.before);
+	if (!reference.ready
+		|| !ClusterStartupInstalledRecoveryWriterV1(&installed, operation_uuid, &generation)
+		|| memcmp(&installed, &owner.writer, sizeof(installed)) != 0
+		|| generation != accepted.checkpoint.owner.install_generation
+		|| memcmp(operation_uuid, accepted.checkpoint.owner.operation_uuid, 16) != 0
+		|| memcmp(source, &fixed_source, sizeof(fixed_source)) != 0
+		|| memcmp(target, &fixed_target, sizeof(fixed_target)) != 0
+		|| memcmp(image, &fpi.image, sizeof(fpi.image)) != 0
+		|| memcmp(work, snapshot, work_bytes) != 0
+		|| !cluster_recovery_ctrc_terminal_result_v1(start, work, &confirmed)
+		|| memcmp(&confirmed, &accepted, sizeof(accepted)) != 0
+		|| ClusterColdRecoveryCtrcScope(start, work) != fixed_source.scope)
+		return handle;
+	verified = rf_page_authority_ctrc_replays_reference_nowait_v1(authority,
+		&fixed_source, &fixed_target, &fpi.image.version.before);
+	if (!verified.ready || memcmp(&verified.reference, &reference.reference, sizeof(reference.reference)) != 0
+		|| memcmp(source, &fixed_source, sizeof(fixed_source)) != 0
+		|| memcmp(target, &fixed_target, sizeof(fixed_target)) != 0
+		|| memcmp(image, &fpi.image, sizeof(fpi.image)) != 0
+		|| memcmp(work, snapshot, work_bytes) != 0)
+		return handle;
+	fpi.protection = reference.reference;
+	(void)stamp_prepare(&owner, CLUSTER_RECOVERY_STAMP_FPI, (const uint8 *)&fpi, sizeof(fpi), &handle);
+	return handle;
+}
+
+ClusterRecoveryStampHandleV1
+cluster_recovery_stamp_prepare_ctrc_fpi_v1(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, const ClusterRecoveryCtrcReplaySetSourceV1 *source,
+	const RfPageCtrcAuthorityV1 *authority, const RfPageIdentityV1 *target,
+	const GenericXLogRecoveryImageDescriptorV1 *image, Size subject_count, Size memory_budget)
+{
+	ClusterRecoveryStampHandleV1 handle = {0};
+	ClusterColdCtrcWorkV1 header;
+	void *volatile snapshot = NULL;
+	Size bytes;
+
+	if (!stamp_actor() || MyBackendType != B_STARTUP || CritSectionCount != 0
+		|| ShutdownRequestPending || RecoveryInProgress() || source == NULL
+		|| authority == NULL || target == NULL || image == NULL
+		|| !ClusterColdRecoveryCtrcWorkCurrent(start, work)
+		|| subject_count != work->counts.subject_count
+		|| subject_count > (MaxAllocSize - offsetof(ClusterColdCtrcWorkV1, entries))
+			/ sizeof(work->entries[0])
+		|| source->scope == NULL || ClusterColdRecoveryCtrcScope(start, work) != source->scope)
+		return handle;
+	bytes = offsetof(ClusterColdCtrcWorkV1, entries)
+		+ subject_count * sizeof(work->entries[0]);
+	if (bytes > memory_budget)
+		return handle;
+	memcpy(&header, work, offsetof(ClusterColdCtrcWorkV1, entries));
+	PG_TRY();
+	{
+		snapshot = palloc(bytes);
+		if (ClusterColdRecoveryCtrcWorkCurrent(start, work)
+			&& memcmp(work, &header, offsetof(ClusterColdCtrcWorkV1, entries)) == 0) {
+			memcpy((void *)snapshot, work, bytes);
+			handle = stamp_ctrc_fpi_prepare(start, work, source, authority, target, image,
+				(const ClusterColdCtrcWorkV1 *)snapshot, bytes);
+		}
+	}
+	PG_CATCH();
+	{
+		if (snapshot != NULL)
+			pfree((void *)snapshot);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (snapshot != NULL)
+		pfree((void *)snapshot);
+	return handle;
 }
 
 static bool

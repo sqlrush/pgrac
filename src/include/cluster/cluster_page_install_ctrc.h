@@ -12,7 +12,7 @@
  *     src/include/cluster/cluster_page_install_ctrc.h
  *
  * NOTES
- *     No ordinary RR guard/serial/pin conversion or storage mutation.
+ *     No ordinary RR guard/serial/pin conversion or target mutation.
  *
  *-------------------------------------------------------------------------
  */
@@ -25,6 +25,7 @@
 #include "storage/bufpage.h"
 
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_recovery_stamp.h"
 struct ClusterRecoveryStartV1;
 struct ClusterColdCtrcWorkV1;
 struct ClusterRecoveryUndoEntry;
@@ -71,6 +72,33 @@ extern RfPageCtrcFpiV1 rf_page_recovery_ctrc_replays_itl_fpi_smgr_v1(
 	const RfPageCtrcAuthorityV1 *authority, const ClusterSpaceIdentity *space,
 	BlockNumber blockno, const RfPageVersionV1 *expected_before,
 	const struct ClusterRecoveryUndoEntry *physical, Size physical_count, Size memory_budget);
+
+typedef struct RfPageCtrcFpiInsertV1 {
+	GenericXLogRecoveryImageV1 image;
+	ClusterRecoveryStampHandleV1 window;
+	XLogRecPtr record_start;
+	XLogRecPtr record_end;
+	bool wal_flushed;
+} RfPageCtrcFpiInsertV1;
+
+/* Original accepted post-DONE Start/work and all native replay owners.
+ * Supply an unpromoted native PAGE object for exactly this one image target,
+ * with no caller-held LWLocks. Copy/hash and native record capacity preparation
+ * precede the exact single-target PAGE promotion. All borrowed inputs and
+ * backing storage must remain alive and immutable through return and later
+ * installation/discharge; store this by-value result separately from them.
+ * memory_budget covers both simultaneous full-work snapshots, including the
+ * original F4 producer's snapshot. False/ERROR retain original PAGE/IR/WALR;
+ * the caller destroys PAGE even if promotion succeeded but insertion failed.
+ * Only exact PRE_INSERT cancellation is allowed before insertion. Any later
+ * failure preserves failed window debt. wal_flushed proves this WAL leg only,
+ * not target installation, discharge, DURABLE, COMPLETE or OPEN. Never reuse
+ * an outstanding operation to begin a second record. */
+extern RfPageCtrcFpiInsertV1 rf_page_recovery_ctrc_replays_fpi_insert_v1(
+	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work,
+	const struct ClusterRecoveryCtrcReplaySetSourceV1 *source,
+	RfPageCtrcAuthorityV1 *authority, const GenericXLogRecoveryImageV1 *image,
+	Size subject_count, Size memory_budget);
 
 #endif /* USE_PGRAC_CLUSTER */
 #endif /* CLUSTER_PAGE_INSTALL_CTRC_H */

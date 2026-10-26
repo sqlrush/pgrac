@@ -126,7 +126,7 @@ extern bool cluster_recovery_stamp_worker_stopped_v1(uint16 thread, uint64 attem
 extern bool cluster_recovery_stamp_prepare_v1(const ClusterRecoveryStampOwnerV1 *owner,
 											  ClusterRecoveryStampKindV1 kind, const uint8 *payload,
 											  Size length, ClusterRecoveryStampHandleV1 *out);
-/* The sole FPI admission path. Describe the local image before promotion;
+/* Original ordinary-RR FPI admission path. Describe the local image before promotion;
  * consume its exact typed target and original promoted PAGE/serial/pin here.
  * This only records PRE_INSERT, never insertion, installation or completion.
  * Retain all borrowed objects and the local image through the actual work.
@@ -135,6 +135,31 @@ extern bool cluster_recovery_stamp_prepare_fpi_v1(const ClusterRecoveryStampOwne
 	const RfPageIdentityV1 *target, const GenericXLogRecoveryImageDescriptorV1 *image,
 	const RfPageAuthorityGuardV1 *guard, ClusterRecoverySerialGuard *serial_guard,
 	ClusterWalRetentionPin *retention_pin, ClusterRecoveryStampHandleV1 *out);
+struct ClusterRecoveryStartV1;
+struct ClusterColdCtrcWorkV1;
+struct ClusterRecoveryCtrcReplaySetSourceV1;
+struct RfPageCtrcAuthorityV1;
+/* Original post-DONE Startup, accepted TX result and exact native all-replay
+ * PAGE custody. Derive the owner from that original checkpoint owner and the
+ * selected old claim; retain its original Start serial. Record only PRE_INSERT
+ * through the unchanged F4 state machine/envelope. The descriptor must already
+ * describe the exact immutable full frame (hash before PAGE promotion); this
+ * API checks its canonical metadata, not the full image or its hash producer.
+ * Later insertion must revalidate that frame and live native custody again.
+ * All inputs/backing storage stay alive and immutable. Return a handle by
+ * value, zero on refusal, stored separately; no caller output is written.
+ * subject_count is the caller-retained original complete entry count; it must
+ * match the live work before any array read. memory_budget bounds one private
+ * full-work snapshot, captured before writer
+ * observation and freed on all normal/ERROR paths. No I/O/new acquisition,
+ * WAL/flush/install/discharge or borrowed-owner
+ * release. A returned window remains pending until original exact completion
+ * or valid pre-insertion cancellation, including after subsequent failure. */
+extern ClusterRecoveryStampHandleV1 cluster_recovery_stamp_prepare_ctrc_fpi_v1(
+	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work,
+	const struct ClusterRecoveryCtrcReplaySetSourceV1 *source,
+	const struct RfPageCtrcAuthorityV1 *authority, const RfPageIdentityV1 *target,
+	const GenericXLogRecoveryImageDescriptorV1 *image, Size subject_count, Size memory_budget);
 /* Both insertion transitions require the original executor's critical section.
  * INSERTED records the actual XLogInsert start/end; no insertion lock is held.
  * All transitions match the unchanged prepared operation, without allocation,

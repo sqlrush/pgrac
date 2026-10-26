@@ -34,6 +34,9 @@
 #define RF_PAGE_CTRC_AUTHORITY_MAGIC UINT32_C(0x52504341)
 #define RF_PAGE_CTRC_PREFLIGHTED 1
 #define RF_PAGE_CTRC_PROMOTED 2
+/* Original WALR/IR owner checks snapshot one shared control request at a
+ * time. Keep that transient slot available while the PAGE batch is held. */
+#define RF_PAGE_CTRC_CURRENT_LWLOCKS 1
 
 struct RfPageCtrcAuthorityV1 {
 	uint32 magic;
@@ -199,11 +202,13 @@ ctrc_page_capacity(const RfPageCtrcAuthorityV1 *a)
 		if (partition >= RF_PAGE_GUARD_PARTITIONS) return RF_PAGE_AUTHORITY_INTERNAL;
 		if (!seen[partition]) { seen[partition] = true; needed++; }
 	}
-	if (needed > LWLOCK_MAX_HELD_BY_PROC) return RF_PAGE_AUTHORITY_INVALID_ARGUMENT;
+	if (needed > LWLOCK_MAX_HELD_BY_PROC - RF_PAGE_CTRC_CURRENT_LWLOCKS)
+		return RF_PAGE_AUTHORITY_INVALID_ARGUMENT;
 #ifndef USE_CLUSTER_UNIT
 	ForEachLWLockHeldByMe(ctrc_page_count_held, &held);
 #endif
-	if (held > LWLOCK_MAX_HELD_BY_PROC - needed) return RF_PAGE_AUTHORITY_WOULD_BLOCK;
+	if (held > LWLOCK_MAX_HELD_BY_PROC - RF_PAGE_CTRC_CURRENT_LWLOCKS - needed)
+		return RF_PAGE_AUTHORITY_WOULD_BLOCK;
 	return RF_PAGE_AUTHORITY_OK;
 }
 
@@ -216,9 +221,9 @@ rf_page_authority_ctrc_replays_promote_nowait_v1(RfPageCtrcAuthorityV1 *a)
 	if (a == NULL || a->magic != RF_PAGE_CTRC_AUTHORITY_MAGIC
 		|| a->state != RF_PAGE_CTRC_PREFLIGHTED)
 		return RF_PAGE_AUTHORITY_INVALID_ARGUMENT;
-	if (!ctrc_page_owners_current(a)) return RF_PAGE_AUTHORITY_NO_STABLE_BASE;
 	capacity = ctrc_page_capacity(a);
 	if (capacity != RF_PAGE_AUTHORITY_OK) return capacity;
+	if (!ctrc_page_owners_current(a)) return RF_PAGE_AUTHORITY_NO_STABLE_BASE;
 	memset(partitions, -1, sizeof(partitions));
 	for (uint32 i = 0; i < a->target_count; i++) {
 		uint32 partition = a->page_preflights[i].partition;
@@ -247,6 +252,24 @@ rf_page_authority_ctrc_replays_promote_nowait_v1(RfPageCtrcAuthorityV1 *a)
 	}
 	a->state = RF_PAGE_CTRC_PROMOTED;
 	return RF_PAGE_AUTHORITY_OK;
+}
+
+RfPageAuthorityVerdictV1
+rf_page_authority_ctrc_replays_promote_fpi_nowait_v1(RfPageCtrcAuthorityV1 *a,
+	const RfPageIdentityV1 *identity, const RfPageVersionV1 *expected_before)
+{
+	uint32 held = 0;
+
+	if (a == NULL || a->magic != RF_PAGE_CTRC_AUTHORITY_MAGIC
+		|| a->state != RF_PAGE_CTRC_PREFLIGHTED || a->target_count != 1
+		|| !rf_page_identity_equal_v1(identity, &a->targets[0].page_identity)
+		|| !rf_page_version_equal_v1(expected_before, &a->targets[0].expected_result))
+		return RF_PAGE_AUTHORITY_INVALID_ARGUMENT;
+#ifndef USE_CLUSTER_UNIT
+	ForEachLWLockHeldByMe(ctrc_page_count_held, &held);
+#endif
+	if (held != 0) return RF_PAGE_AUTHORITY_WOULD_BLOCK;
+	return rf_page_authority_ctrc_replays_promote_nowait_v1(a);
 }
 
 RfPageAuthorityVerdictV1
@@ -286,6 +309,42 @@ rf_page_authority_ctrc_replays_scope_nowait_v1(const RfPageCtrcAuthorityV1 *a,
 	return scope != NULL && a != NULL && a->magic == RF_PAGE_CTRC_AUTHORITY_MAGIC
 		&& a->source_count != 0 && a->sources[0].scope == scope
 		&& rf_page_authority_ctrc_replays_revalidate_nowait_v1(a) == RF_PAGE_AUTHORITY_OK;
+}
+
+RfPageCtrcReferenceV1
+rf_page_authority_ctrc_replays_reference_nowait_v1(const RfPageCtrcAuthorityV1 *a,
+	const ClusterRecoveryCtrcReplaySetSourceV1 *source,
+	const RfPageIdentityV1 *identity, const RfPageVersionV1 *expected_before)
+{
+	RfPageCtrcReferenceV1 result = {0};
+	bool member = false;
+
+	if (source == NULL || identity == NULL || expected_before == NULL
+		|| rf_page_authority_ctrc_replays_revalidate_nowait_v1(a) != RF_PAGE_AUTHORITY_OK)
+		return result;
+	for (uint32 i = 0; i < a->source_count; i++)
+		if (memcmp(source, &a->sources[i], sizeof(*source)) == 0) {
+			member = true;
+			break;
+		}
+	if (!member || source->ir_request_id == 0)
+		return result;
+	for (uint32 i = 0; i < a->target_count; i++) {
+		uint8 index = a->target_guard_index[i];
+
+		if (!rf_page_identity_equal_v1(identity, &a->targets[i].page_identity)
+			|| !rf_page_version_equal_v1(expected_before, &a->targets[i].expected_result))
+			continue;
+		if (index >= a->guard_count
+			|| !rf_page_guard_covers_nowait_v1(&a->page_guards[index], identity))
+			return result;
+		result.reference.source_binding_cookie = source->ir_request_id;
+		result.reference.protection_fingerprint = a->page_guards[index].identity_fingerprint;
+		result.reference.partition = a->page_guards[index].partition;
+		result.ready = true;
+		return result;
+	}
+	return result;
 }
 
 void

@@ -33,7 +33,13 @@ bool ctrc_native_fpi_original_c0(const struct ClusterRecoveryStartV1 *start,
 #define cluster_recovery_checkpoint_current_v1 ctrc_native_fpi_fixture_cluster_recovery_checkpoint_current_v1
 #define cluster_recovery_checkpoint_observe_v1 ctrc_native_fpi_fixture_cluster_recovery_checkpoint_observe_v1
 #define cluster_recovery_stamp_worker_begin_v1 ctrc_native_fpi_fixture_cluster_recovery_stamp_worker_begin_v1
+#define cluster_wal_writer_check native_insert_original_writer_check
+#define XLogFlush native_insert_original_flush
+#define ClusterColdRecoveryCtrcWorkCurrent native_insert_original_work_current
 #include "test_cluster_control_root.c"
+#undef ClusterColdRecoveryCtrcWorkCurrent
+#undef XLogFlush
+#undef cluster_wal_writer_check
 #undef cluster_thread_recovery_pin_projection
 #undef cluster_thread_recovery_projection_current
 #undef cluster_recovery_checkpoint_current_v1
@@ -43,6 +49,8 @@ bool ctrc_native_fpi_original_c0(const struct ClusterRecoveryStartV1 *start,
 #undef main
 #undef ClusterColdRecoveryTxC0Candidate
 
+bool ClusterColdRecoveryCtrcWorkCurrent(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work);
 #include "cluster/cluster_itl.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_uba.h"
@@ -59,7 +67,15 @@ bool cluster_recovery_checkpoint_current_v1(const struct ClusterRecoveryCheckpoi
 	ClusterWalWriterToken *writer);
 bool cluster_recovery_checkpoint_observe_v1(ClusterRecoveryCheckpointObservationV1 *out);
 bool cluster_recovery_stamp_worker_begin_v1(uint16 thread, uint64 attempt);
+ClusterControlRootResult cluster_wal_writer_check(const ClusterWalWriterToken *writer);
+void XLogFlush(XLogRecPtr end);
+static void *native_stamp_alloc(Size size);
+static void native_stamp_free(void *pointer);
+#define palloc native_stamp_alloc
+#define pfree native_stamp_free
 #include "../../backend/cluster/cluster_recovery_plan.c"
+#undef palloc
+#undef pfree
 
 static ClusterRecoveryPlanShmem native_fpi_region;
 static PGAlignedBlock native_fpi_top_storage;
@@ -71,6 +87,10 @@ static unsigned native_fpi_tokens, native_fpi_token_fault;
 static unsigned native_fpi_allocs, native_fpi_frees;
 static void *native_fpi_allocation;
 static bool native_fpi_alloc_error;
+static bool native_fpi_complete_writer;
+static void *native_stamp_allocation;
+static unsigned native_stamp_allocs, native_stamp_frees;
+static bool native_stamp_alloc_error;
 
 /* Single-threaded fixture: any actual spin contention is unexpected. */
 int
@@ -180,6 +200,10 @@ native_fpi_fixture(CtrcReadNativeFixture *f, unsigned itls, bool checksums)
 	rf_page_stable_base_proof_destroy_v1(&f->page.proof.proof);
 	root = f->page.replay.owners[0].root;
 	cluster_wal_inputs_release_v1(&f->page.replay.inputs); ctrc_ir_original_scope = NULL;
+	if (native_fpi_complete_writer) {
+		ctrc_inputs_owner.owner_boot = ctrc_inputs_owner.writer.ref.claim.identity.origin_owner_incarnation;
+		ctrc_inputs_owner.writer.startup_first_lsn = 0x100;
+	}
 	memset(&native_fpi_top_storage, 0, sizeof(native_fpi_top_storage));
 	memset(native_fpi_physical, 0, sizeof(native_fpi_physical));
 	native_fpi_top->plan = tx_inputs_typed.plan;
@@ -242,6 +266,7 @@ static void
 native_fpi_finish(CtrcReadNativeFixture *f)
 {
 	UT_ASSERT(native_fpi_allocation == NULL); UT_ASSERT_EQ(native_fpi_allocs, native_fpi_frees);
+	UT_ASSERT(native_stamp_allocation == NULL); UT_ASSERT_EQ(native_stamp_allocs, native_stamp_frees);
 	cluster_recovery_checkpoint_revoke_v1(tx_inputs_start);
 	ctrc_read_native_finish(f); native_fpi_live = NULL;
 }
@@ -262,6 +287,7 @@ native_fpi_refused(CtrcReadNativeFixture *f)
 	UT_ASSERT(!result.ready && !result.rewritten && result.frame.result_token == 0);
 	UT_ASSERT(memcmp(&result.frame.image, &zero, sizeof(zero)) == 0);
 	UT_ASSERT(native_fpi_allocation == NULL); UT_ASSERT_EQ(native_fpi_allocs, native_fpi_frees);
+	UT_ASSERT(native_stamp_allocation == NULL); UT_ASSERT_EQ(native_stamp_allocs, native_stamp_frees);
 }
 
 UT_TEST(test_native_fpi_projects_entire_page_from_original_c0_and_commit)
@@ -381,6 +407,13 @@ UT_TEST(test_native_fpi_retired_scope_cannot_publish_or_release_borrowed_owner)
 	native_fpi_refused(&f); UT_ASSERT_EQ(native_fpi_tokens, 1); native_fpi_finish(&f);
 }
 
+bool native_insert_original_installed_writer(ClusterWalWriterToken *writer,
+	uint8 operation_uuid[16], uint64 *generation);
+#define ClusterStartupInstalledRecoveryWriterV1 native_insert_original_installed_writer
+#include "test_cluster_ctrc_native_stamp.inc"
+#undef ClusterStartupInstalledRecoveryWriterV1
+#include "test_cluster_ctrc_native_insert.inc"
+
 int
 main(int argc, char **argv)
 {
@@ -388,7 +421,7 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(7);
+	UT_PLAN(25);
 	UT_RUN(test_native_fpi_projects_entire_page_from_original_c0_and_commit);
 	UT_RUN(test_native_fpi_empty_and_already_terminal_do_not_mint_wal_frame);
 	UT_RUN(test_native_fpi_bad_count_budget_or_terminal_refuses_before_smgr);
@@ -396,5 +429,23 @@ main(int argc, char **argv)
 	UT_RUN(test_native_fpi_rechecks_all_original_inputs_after_token_producer);
 	UT_RUN(test_native_fpi_error_frees_only_private_snapshot);
 	UT_RUN(test_native_fpi_retired_scope_cannot_publish_or_release_borrowed_owner);
+	UT_RUN(test_native_stamp_reference_uses_original_grant_and_page);
+	UT_RUN(test_native_stamp_reference_refuses_changed_source_target_or_custody);
+	UT_RUN(test_native_stamp_admits_each_original_source_without_rr);
+	UT_RUN(test_native_stamp_refuses_unaccepted_or_wrong_original_owner);
+	UT_RUN(test_native_stamp_requires_exact_canonical_descriptor);
+	UT_RUN(test_native_stamp_rechecks_inputs_after_installed_writer_callback);
+	UT_RUN(test_native_stamp_failed_window_keeps_original_debt_and_owners);
+	UT_RUN(test_native_stamp_uses_unchanged_critical_insertion_transitions);
+	UT_RUN(test_native_insert_registers_exact_image_edge_and_original_window);
+	UT_RUN(test_native_insert_refuses_held_lwlocks_before_hash_or_capacity);
+	UT_RUN(test_native_insert_page_collision_keeps_all_original_owners);
+	UT_RUN(test_native_insert_rejects_bad_actor_count_budget_and_frame);
+	UT_RUN(test_native_insert_rechecks_original_bytes_across_preparation);
+	UT_RUN(test_native_insert_preinsert_refusal_cancels_only_its_window);
+	UT_RUN(test_native_insert_errors_free_private_memory_and_keep_debt);
+	UT_RUN(test_native_insert_registration_and_insert_failure_keep_failed_window);
+	UT_RUN(test_native_insert_flush_failure_and_drift_keep_inserted_debt);
+	UT_RUN(test_native_insert_pending_window_cannot_start_another_record);
 	UT_DONE(); return ut_failed_count ? 1 : 0;
 }
