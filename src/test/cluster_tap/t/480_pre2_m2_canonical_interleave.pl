@@ -71,6 +71,16 @@ sub pause_witness {
  }
  return undef;
 }
+sub start_reader {
+ my ($cell,$reader,$sql)=@_;
+ $reader->query_until(qr/READER_SENT/,"\\echo READER_SENT\n$sql;\n");
+ # This echo precedes SQL execution. Queued bytes and the requested SQL
+ # are client facts only; COPY/PgSleep remain the original pause witness.
+ save_json("reader-echo-$cell->{number}",{
+  (map { $_=>$cell->{$_} } qw(number kind caller xid producer_pid reader_pid)),
+  phase=>'CLIENT_ECHO_SEEN',query=>$sql,pending_input_bytes=>length($reader->{stdin}),
+  monotonic=>clock_gettime(CLOCK_MONOTONIC),authoritative=>JSON::PP::false});
+}
 sub producer_key {
  my ($trace,$xid)=@_;
  my @rows=grep { $_->{kind} == 2 && $_->{key_known} && $_->{key}{xid} == $xid }
@@ -229,7 +239,7 @@ run_cases(\@matrix,sub {
   if($kind eq 'A1') {
    if($remote) { $cell->{pause_armed}=1; reload_pause($a,1); }
    else { $r->query_safe("SELECT cluster_inject_fault('cluster-tx-canonical-copy','sleep',$pause)"); }
-   $r->query_until(qr/READER_SENT/,"\\echo READER_SENT\n$sql;\n");
+   start_reader($cell,$r,$sql);
    $sample_pid=pause_witness($a,$remote ? undef : $rpid,
     qr/TX_CANONICAL phase=COPY caller=$caller pid=(\d+) .*xid=$xid /,$offset[0]);
    $reached=defined($sample_pid);
@@ -243,7 +253,7 @@ run_cases(\@matrix,sub {
     if($a->safe_psql('postgres',"SELECT count(*) FROM pg_stat_activity WHERE pid=$wpid AND wait_event='PgSleep'") eq '1') { $reached=1; last; }
     sleep(0.03);
    }
-   $r->query_until(qr/READER_SENT/,"\\echo READER_SENT\n$sql;\n");
+   start_reader($cell,$r,$sql);
   }
   my $result=json_result($r->query_safe("SELECT 'READER_DONE'"));
   $cell->{probe_results}{initial}=$result;
