@@ -10,6 +10,14 @@ int pcm_read_source_fixture_main(void);
 #undef main
 
 #include "cluster/cluster_pcm_read_source.h"
+#include "cluster/cluster_clean_leave.h"
+#include "cluster/cluster_pi_shadow.h"
+
+bool IsUnderPostmaster = true;
+static BufferDescPadded failed_read_descriptors[1];
+BufferDescPadded *BufferDescriptors = failed_read_descriptors;
+static SCN failed_read_shadow[1];
+SCN *ClusterPiShadow = failed_read_shadow;
 
 UT_TEST(test_typed_source_allows_disk_only_for_exact_disk_grant)
 {
@@ -69,6 +77,7 @@ cluster_pcm_lock_acquire_buffer(BufferDesc *buf pg_attribute_unused(),
 static ClusterPcmReadSourceKind fixture_kind = CLUSTER_PCM_SOURCE_FAIL;
 static bool fixture_cancel = true, fixture_quiet = true, fixture_release_error;
 static bool fixture_cancel_wait, fixture_shutdown, fixture_shutdown_checked;
+static bool fixture_native_io;
 static unsigned fixture_calls, fixture_io_aborts, fixture_releases;
 
 ClusterPcmReadSourceKind
@@ -141,6 +150,10 @@ fixture_abort_io(Buffer b)
 	UT_ASSERT_EQ(b, 1);
 	UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0);
 	fixture_io_aborts++;
+	if (fixture_native_io) {
+		transition_production_abort(b);
+		return;
+	}
 	pg_atomic_fetch_and_u32(&transition_buf->state, ~BM_IO_IN_PROGRESS);
 	pg_atomic_fetch_or_u32(&transition_buf->state, BM_IO_ERROR);
 }
@@ -202,6 +215,271 @@ fixture_source_complete(BufferDesc *buf, ClusterPcmReadSource *source, bool inst
 #undef cluster_gcs_block_read_source_complete
 #undef cluster_block_io_trace_source
 #undef cluster_bufmgr_trace_cleanup
+
+/* The stop census and all state predicates are the production bodies. Only
+ * the descriptor inventory is reduced to the single first-fill fixture. */
+#define NBuffers 1
+#define GetBufferDescriptor(id) ((void)(id), transition_buf)
+#define LockBufHdr transition_lock_header
+#include "test_cluster_pcm_read_source_stop.inc"
+#undef LockBufHdr
+#undef GetBufferDescriptor
+#undef NBuffers
+
+static void
+failed_read_fixture(BufferDesc *buf, ClusterPcmOwnEntry *entry)
+{
+	n_predecessor_fixture(buf, entry, BUF_TYPE_CURRENT);
+	transition_buf = buf;
+	transition_content_held = transition_mapping_held = false;
+	read_reclaim_drift = 0;
+	CritSectionCount = 0;
+	cluster_enabled = cluster_shared_config = true;
+	pg_atomic_write_u32(&buf->state, BM_TAG_VALID | BM_IO_ERROR | BUF_REFCOUNT_ONE);
+	abort_read_image_pin.refcount = 1;
+	abort_read_image_forgets = abort_read_image_freed = abort_read_image_signals = 0;
+	failed_read_deletes = failed_read_frees = failed_read_lock_acquires = 0;
+	failed_read_lock_error = failed_read_expect_mapping = false;
+	failed_read_abort_on_forget = failed_read_other_pin_deferred = false;
+	failed_read_lock_drift = 0;
+}
+
+UT_TEST(test_cancelled_first_fill_last_pin_closes_strict_stop)
+{
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	bool saved_shared = cluster_shared_config;
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterBufmgrReadSource read = { 0 };
+	const char *reason = NULL;
+	volatile bool caught = false;
+	uint32 state;
+
+	n_predecessor_fixture(&buf, &entry, BUF_TYPE_CURRENT);
+	transition_buf = &buf;
+	transition_content_held = transition_mapping_held = false;
+	cluster_enabled = cluster_shared_config = true;
+	pg_atomic_write_u32(&buf.state, BM_TAG_VALID | BUF_REFCOUNT_ONE);
+	transition_owned_io = transition_io_wakes = 0;
+	UT_ASSERT(StartBufferIO(&buf, true));
+	fixture_native_io = fixture_cancel = fixture_quiet = true;
+	fixture_shutdown = fixture_cancel_wait = fixture_release_error = false;
+	fixture_io_aborts = 0;
+	read.buf = &buf;
+	PG_TRY();
+	{
+		cluster_bufmgr_pcm_read_source_begin(&buf, &read);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+		cluster_bufmgr_pcm_read_source_error(0, PointerGetDatum(&read));
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(fixture_io_aborts, 1);
+	UT_ASSERT_EQ(transition_owned_io, 0);
+	UT_ASSERT_EQ(transition_io_wakes, 1);
+	UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0);
+	UT_ASSERT_EQ(buf.pcm_state, PCM_STATE_N);
+	state = pg_atomic_read_u32(&buf.state);
+	UT_ASSERT((state & (BM_TAG_VALID | BM_IO_ERROR)) == (BM_TAG_VALID | BM_IO_ERROR));
+	UT_ASSERT((state & (BM_VALID | BM_IO_IN_PROGRESS)) == 0);
+	UT_ASSERT_EQ(cluster_bufmgr_stop_poll(false, false, NULL, NULL, &reason, NULL),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT(strcmp(reason, "BUFMGR_SHAPE_INVALID") == 0);
+	abort_read_image_pin.refcount = 1;
+	abort_read_image_forgets = abort_read_image_freed = 0;
+	failed_read_deletes = failed_read_frees = 0;
+	abort_read_image_unpin(&buf);
+	UT_ASSERT_EQ(abort_read_image_forgets, 1);
+	UT_ASSERT_EQ(abort_read_image_freed, 1);
+	UT_ASSERT_EQ(BUF_STATE_GET_REFCOUNT(pg_atomic_read_u32(&buf.state)), 0);
+	UT_ASSERT_EQ(cluster_bufmgr_stop_poll(false, false, NULL, NULL, &reason, NULL),
+				 CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(failed_read_deletes, 1);
+	UT_ASSERT_EQ(failed_read_frees, 1);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&buf.state) & BUF_FLAG_MASK, 0);
+	fixture_native_io = false;
+	cluster_shared_config = saved_shared;
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_failed_read_last_pin_preserves_unretired_frames)
+{
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	bool saved_shared = cluster_shared_config;
+	bool saved_enabled = cluster_enabled;
+	for (int scenario = 0; scenario < 23; scenario++) {
+		BufferDesc buf;
+		ClusterPcmOwnEntry entry, before;
+		BufferTag tag;
+		uint32 state;
+		failed_read_fixture(&buf, &entry);
+		state = pg_atomic_read_u32(&buf.state);
+		switch (scenario) {
+			case 0: state |= BM_VALID | BM_DIRTY; break;
+			case 1: state |= BM_IO_IN_PROGRESS; break;
+			case 2: state |= BM_DIRTY; break;
+			case 3: state |= BM_JUST_DIRTIED; break;
+			case 4: state |= BM_CHECKPOINT_NEEDED; break;
+			case 5: state |= BM_PIN_COUNT_WAITER; break;
+			case 6: pg_atomic_write_u32(&entry.flags, PCM_OWN_FLAG_GRANT_PENDING); break;
+			case 7: pg_atomic_write_u32(&entry.flags, PCM_OWN_FLAG_REVOKING); break;
+			case 8: pg_atomic_write_u64(&entry.writer_activation_token, 48); break;
+			case 9: pg_atomic_write_u64(&entry.resource_x_activation_generation, 48); break;
+			case 10: pg_atomic_write_u64(&entry.delivery_attempt, 49); break;
+			case 11: pg_atomic_write_u64(&entry.generation, UINT64_MAX); break;
+			case 12: pg_atomic_write_u64(&entry.generation, UINT64_MAX - 1); break;
+			case 13: pg_atomic_write_u64(&entry.reservation_token, UINT64_MAX); break;
+			case 14: buf.pcm_state = PCM_STATE_S; break;
+			case 15: buf.pcm_state = PCM_STATE_READ_IMAGE; break;
+			case 16: buf.buffer_type = BUF_TYPE_PI; break;
+			case 17: buf.buffer_type = BUF_TYPE_CR; break;
+			case 18: cluster_shared_config = false; break;
+			case 19: cluster_enabled = false; break;
+			case 20: CritSectionCount = 1; break;
+			case 21: transition_mapping_held = true; break;
+			case 22: state &= ~BM_TAG_VALID; break;
+		}
+		pg_atomic_write_u32(&buf.state, state);
+		tag = buf.tag;
+		memcpy(&before, &entry, sizeof(before));
+		abort_read_image_unpin(&buf);
+		UT_ASSERT_EQ(failed_read_deletes + failed_read_frees, 0);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&buf.state), state - BUF_REFCOUNT_ONE);
+		UT_ASSERT(BufferTagsEqual(&tag, &buf.tag));
+		UT_ASSERT_EQ(memcmp(&entry, &before, sizeof(entry)), 0);
+		UT_ASSERT_EQ(abort_read_image_forgets, 1);
+		UT_ASSERT_EQ(abort_read_image_freed, 1);
+		UT_ASSERT_EQ(transition_mapping_held, scenario == 21);
+		transition_mapping_held = false;
+		CritSectionCount = 0;
+	}
+	cluster_enabled = saved_enabled;
+	cluster_shared_config = saved_shared;
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_failed_read_multiple_pins_retire_only_on_final_release)
+{
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	bool saved_shared = cluster_shared_config;
+	for (int private_pins = 0; private_pins < 2; private_pins++) {
+		BufferDesc buf;
+		ClusterPcmOwnEntry entry;
+		failed_read_fixture(&buf, &entry);
+		if (private_pins)
+			abort_read_image_pin.refcount = 2;
+		else
+			pg_atomic_fetch_add_u32(&buf.state, BUF_REFCOUNT_ONE);
+		failed_read_expect_mapping = !private_pins;
+		abort_read_image_unpin(&buf);
+		UT_ASSERT_EQ(failed_read_deletes + failed_read_frees, 0);
+		UT_ASSERT_EQ(BUF_STATE_GET_REFCOUNT(pg_atomic_read_u32(&buf.state)), 1);
+		UT_ASSERT(pg_atomic_read_u32(&buf.state) & BM_IO_ERROR);
+		UT_ASSERT_EQ(failed_read_lock_acquires, !private_pins);
+		/* The other process has its own final private pin; the original
+		 * mapping lock must cover both shared decrements, including 2->1. */
+		abort_read_image_pin.refcount = 1;
+		failed_read_expect_mapping = true;
+		abort_read_image_unpin(&buf);
+		UT_ASSERT_EQ(failed_read_lock_acquires, private_pins ? 1 : 2);
+		UT_ASSERT_EQ(failed_read_deletes, 1);
+		UT_ASSERT_EQ(failed_read_frees, 1);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&buf.state) & (BUF_FLAG_MASK | BUF_REFCOUNT_MASK), 0);
+		UT_ASSERT_EQ(cluster_bufmgr_stop_poll(false, false, NULL, NULL, NULL, NULL),
+					 CLUSTER_NORMAL_STOP_READY);
+		UT_ASSERT(!transition_mapping_held);
+	}
+	failed_read_expect_mapping = false;
+	cluster_shared_config = saved_shared;
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_failed_read_lock_error_preserves_original_pin_owner)
+{
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	bool saved_shared = cluster_shared_config;
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	volatile bool caught = false;
+	uint32 state;
+	failed_read_fixture(&buf, &entry);
+	state = pg_atomic_read_u32(&buf.state);
+	failed_read_lock_error = true;
+	PG_TRY();
+	{
+		abort_read_image_unpin(&buf);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(abort_read_image_forgets + abort_read_image_freed, 0);
+	UT_ASSERT_EQ(abort_read_image_pin.refcount, 1);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&buf.state), state);
+	UT_ASSERT(!transition_mapping_held);
+	abort_read_image_unpin(&buf);
+	UT_ASSERT_EQ(failed_read_deletes, 1);
+	UT_ASSERT_EQ(failed_read_frees, 1);
+	cluster_shared_config = saved_shared;
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_failed_read_revalidates_under_mapping_lock)
+{
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	bool saved_shared = cluster_shared_config;
+	for (int drift = 1; drift <= 4; drift++) {
+		BufferDesc buf;
+		ClusterPcmOwnEntry entry;
+		failed_read_fixture(&buf, &entry);
+		failed_read_lock_drift = drift;
+		abort_read_image_unpin(&buf);
+		UT_ASSERT_EQ(failed_read_lock_acquires, 1);
+		UT_ASSERT_EQ(failed_read_deletes + failed_read_frees, 0);
+		UT_ASSERT(pg_atomic_read_u32(&buf.state) & BM_IO_ERROR);
+		UT_ASSERT(!transition_mapping_held);
+		UT_ASSERT_EQ(cluster_bufmgr_stop_poll(false, false, NULL, NULL, NULL, NULL),
+					 CLUSTER_NORMAL_STOP_INVALID);
+	}
+	cluster_shared_config = saved_shared;
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_io_abort_crossing_last_pin_probe_still_retires_frame)
+{
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	bool saved_shared = cluster_shared_config;
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	failed_read_fixture(&buf, &entry);
+	pg_atomic_write_u32(&buf.state, BM_TAG_VALID | 2 * BUF_REFCOUNT_ONE);
+	transition_owned_io = transition_io_wakes = 0;
+	UT_ASSERT(StartBufferIO(&buf, true));
+	failed_read_abort_on_forget = true;
+	abort_read_image_unpin(&buf);
+	if (failed_read_other_pin_deferred) {
+		UT_ASSERT_EQ(BUF_STATE_GET_REFCOUNT(pg_atomic_read_u32(&buf.state)), 1);
+		abort_read_image_pin.refcount = 1;
+		abort_read_image_unpin(&buf);
+	}
+	UT_ASSERT_EQ(transition_owned_io, 0);
+	UT_ASSERT_EQ(transition_io_wakes, 1);
+	UT_ASSERT_EQ(abort_read_image_forgets, 2);
+	UT_ASSERT_EQ(abort_read_image_freed, 2);
+	UT_ASSERT_EQ(failed_read_deletes, 1);
+	UT_ASSERT_EQ(failed_read_frees, 1);
+	UT_ASSERT_EQ(failed_read_lock_acquires, 2);
+	UT_ASSERT_EQ(cluster_bufmgr_stop_poll(false, false, NULL, NULL, NULL, NULL),
+				 CLUSTER_NORMAL_STOP_READY);
+	failed_read_other_pin_deferred = false;
+	cluster_shared_config = saved_shared;
+	ClusterPcmOwnArray = saved;
+}
 
 /* Break caught: generic buffer cleanup must not clear IO first and strand
  * the source reservation. Execute the real pre-cleanup PG_CATCH owner. */
@@ -715,7 +993,13 @@ UT_TEST(test_quiet_receipt_count_trace_is_default_off_and_reports_consumption_dr
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(20);
+	UT_RUN(test_cancelled_first_fill_last_pin_closes_strict_stop);
+	UT_RUN(test_failed_read_last_pin_preserves_unretired_frames);
+	UT_RUN(test_failed_read_multiple_pins_retire_only_on_final_release);
+	UT_RUN(test_failed_read_lock_error_preserves_original_pin_owner);
+	UT_RUN(test_failed_read_revalidates_under_mapping_lock);
+	UT_RUN(test_io_abort_crossing_last_pin_probe_still_retires_frame);
 	UT_RUN(test_master_trace_default_off_then_binds_real_key_and_marks_unknown);
 	UT_RUN(test_quiet_receipt_count_trace_is_default_off_and_reports_consumption_drop);
 	UT_RUN(test_typed_source_allows_disk_only_for_exact_disk_grant);

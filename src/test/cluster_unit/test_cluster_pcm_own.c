@@ -421,6 +421,10 @@ static int n_predecessor_header_step;
 static int read_reclaim_drift;
 static bool read_reclaim_error;
 static bool read_unpin_lock_error;
+static bool failed_read_lock_error, failed_read_expect_mapping;
+static bool failed_read_abort_on_forget, failed_read_other_pin_deferred;
+static unsigned failed_read_lock_acquires;
+static int failed_read_lock_drift;
 static ResourceXApplyResult route_bind_result = RESOURCE_X_APPLY_APPLIED;
 
 /* Only process-local ledger presence is a fixture. The exact production
@@ -515,10 +519,27 @@ transition_lock_acquire(LWLock *lock, LWLockMode mode)
 	if (lock == &transition_mapping_lock) {
 		UT_ASSERT(mode == LW_SHARED || (mode == LW_EXCLUSIVE && transition_drop_active)
 				  || (mode == LW_EXCLUSIVE
+					  && (pg_atomic_read_u32(&transition_buf->state)
+						  & (BM_TAG_VALID | BM_VALID)) == BM_TAG_VALID)
+				  || (mode == LW_EXCLUSIVE
 					  && cluster_pcm_x_revoke_finish_mode(&transition_buf->tag, 0)
 							 == CLUSTER_PCM_X_REVOKE_FINISH_DROP));
 		UT_ASSERT(!transition_mapping_held);
+		if (failed_read_lock_error) {
+			failed_read_lock_error = false;
+			pg_re_throw();
+		}
 		transition_mapping_held = true;
+		failed_read_lock_acquires++;
+		if (failed_read_lock_drift == 1)
+			pg_atomic_fetch_or_u32(&transition_buf->state, BM_IO_IN_PROGRESS);
+		else if (failed_read_lock_drift == 2)
+			pg_atomic_write_u64(&ClusterPcmOwnArray[0].delivery_attempt, 17);
+		else if (failed_read_lock_drift == 3)
+			transition_buf->tag.blockNum++;
+		else if (failed_read_lock_drift == 4)
+			pg_atomic_write_u64(&ClusterPcmOwnArray[0].generation, UINT64_MAX);
+		failed_read_lock_drift = 0;
 	} else {
 		UT_ASSERT(lock == BufferDescriptorGetContentLock(transition_buf));
 		if (read_unpin_lock_error) {
@@ -561,6 +582,15 @@ transition_lock_release(LWLock *lock)
 		UT_ASSERT(transition_content_held);
 		transition_content_held = false;
 	}
+}
+
+void
+ForEachLWLockHeldByMe(void (*callback)(LWLock *, LWLockMode, void *), void *context)
+{
+	if (transition_mapping_held)
+		callback(&transition_mapping_lock, LW_EXCLUSIVE, context);
+	if (transition_content_held)
+		callback(BufferDescriptorGetContentLock(transition_buf), LW_EXCLUSIVE, context);
 }
 
 static void
@@ -863,15 +893,42 @@ typedef struct AbortReadImagePin
 } AbortReadImagePin;
 static AbortReadImagePin abort_read_image_pin;
 static unsigned abort_read_image_forgets, abort_read_image_freed, abort_read_image_signals;
+static unsigned failed_read_deletes, failed_read_frees;
+static bool failed_read_native_commit(BufferDesc *, BufferTag *, uint32, LWLock *, uint32);
+static void abort_read_image_unpin(BufferDesc *buf);
+static void
+abort_read_image_forget_pin(Buffer buffer)
+{
+	UT_ASSERT_EQ(buffer, BufferDescriptorGetBuffer(transition_buf));
+	if (failed_read_expect_mapping)
+		UT_ASSERT(transition_mapping_held);
+	abort_read_image_forgets++;
+	if (failed_read_abort_on_forget) {
+		AbortReadImagePin original_pin = abort_read_image_pin;
+		failed_read_abort_on_forget = false;
+		/* A second process publishes native IO abort after this releaser's
+		 * initial sample. If mapping-X is already held, that process's unpin
+		 * must wait; otherwise run its complete unpin before resuming A. */
+		transition_production_abort(buffer);
+		failed_read_other_pin_deferred = transition_mapping_held;
+		if (!failed_read_other_pin_deferred) {
+			abort_read_image_pin.refcount = 1;
+			abort_read_image_unpin(transition_buf);
+			abort_read_image_pin = original_pin;
+		}
+	}
+}
 #define PrivateRefCountEntry AbortReadImagePin
 #define GetPrivateRefCountEntry(buffer, move) ((void)(buffer), &abort_read_image_pin)
-#define ResourceOwnerForgetBuffer(owner, buffer) ((void)(buffer), abort_read_image_forgets++)
+#define ResourceOwnerForgetBuffer(owner, buffer) abort_read_image_forget_pin(buffer)
 #define ForgetPrivateRefCountEntry(ref) ((void)(ref), abort_read_image_freed++)
 #define WaitBufHdrUnlocked(buf) (pg_atomic_read_u32(&(buf)->state) & ~BM_LOCKED)
 #define ProcSendSignal(procno) ((void)(procno), abort_read_image_signals++)
 #define VALGRIND_MAKE_MEM_NOACCESS(address, bytes) ((void)0)
 #define UnpinBuffer abort_read_image_unpin
+#define InvalidateBufferCommitLocked failed_read_native_commit
 #include "test_cluster_pcm_abort_read_image.inc"
+#undef InvalidateBufferCommitLocked
 #undef UnpinBuffer
 #undef VALGRIND_MAKE_MEM_NOACCESS
 #undef ProcSendSignal
@@ -3690,6 +3747,22 @@ eviction_legacy_tail(BufferDesc *buf, BufferTag *tag, uint32 state, PcmLockMode 
 #include "test_cluster_pcm_eviction_gate.inc"
 #undef cluster_bufmgr_cr_invalidate_locked
 #undef InvalidateBufferCommitTailLocked
+
+/* Failed-read cleanup uses both original eviction bodies. TARGET and CR
+ * remain covered by their existing fixtures; these cases must enter as N. */
+static void failed_read_native_tail(BufferDesc *, BufferTag *, uint32, LWLock *,
+								   uint32, uint8, bool);
+#define InvalidateBufferCommitLocked failed_read_native_commit
+#define InvalidateBufferCommitTailLocked failed_read_native_tail
+#undef BufTableDelete
+#define BufTableDelete(tag, hash) ((void)(tag), (void)(hash), failed_read_deletes++)
+#undef StrategyFreeBuffer
+#define StrategyFreeBuffer(buf) ((void)(buf), failed_read_frees++)
+#define cluster_bufmgr_cr_invalidate_locked(buf, hash, state) (abort(), CLUSTER_PCM_OWN_INVALID)
+#include "test_cluster_pcm_failed_read_eviction.inc"
+#undef cluster_bufmgr_cr_invalidate_locked
+#undef InvalidateBufferCommitTailLocked
+#undef InvalidateBufferCommitLocked
 #undef cluster_pcm_lock_release_saved_tag_for_eviction
 #undef cluster_pcm_x_buffer_tag_tracked
 #undef cluster_pcm_is_active

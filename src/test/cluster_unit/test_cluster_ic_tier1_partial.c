@@ -334,6 +334,13 @@ errstart_cold(int elevel, const char *domain)
 	return false;
 }
 
+bool
+message_level_is_interesting(int elevel)
+{
+	(void)elevel;
+	return true;
+}
+
 void
 ExceptionalCondition(const char *conditionName, const char *fileName, int lineNumber)
 {
@@ -727,6 +734,42 @@ UT_TEST(test_stream_capture_is_actual_native_connected_owner)
 	UT_ASSERT(!cluster_ic_tier1_stream_current(&ut_first_stream));
 	--ut_epoch;
 	UT_ASSERT(cluster_ic_tier1_stream_current(&ut_first_stream));
+}
+
+UT_TEST(test_connection_trace_does_not_consume_socket_error)
+{
+	struct sockaddr_in sa;
+	socklen_t len = sizeof(sa);
+	int reserved = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	int probe = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	int socket_error = 0;
+	fd_set wfds;
+	struct timeval tv = { 5, 0 };
+
+	UT_ASSERT(reserved >= 0 && probe >= 0);
+	memset(&sa, 0, sizeof(sa));
+	sa.sin_family = AF_INET;
+	sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	/* A freshly closed local port produces a native asynchronous refusal. */
+	UT_ASSERT_EQ(bind(reserved, (struct sockaddr *)&sa, sizeof(sa)), 0);
+	UT_ASSERT_EQ(getsockname(reserved, (struct sockaddr *)&sa, &len), 0);
+	close(reserved);
+	UT_ASSERT_EQ(set_socket_nonblocking(probe), 0);
+	UT_ASSERT_EQ(connect(probe, (struct sockaddr *)&sa, len), -1);
+	UT_ASSERT_EQ(errno, EINPROGRESS);
+	FD_ZERO(&wfds);
+	FD_SET(probe, &wfds);
+	UT_ASSERT_EQ(select(probe + 1, NULL, &wfds, NULL, &tv), 1);
+
+	errno = EDOM;
+	cluster_ic_tier1_trace_connection(DEBUG1, "pending-error", -1, probe, -1,
+									 -1, -1, WL_SOCKET_WRITEABLE, 0);
+	UT_ASSERT_EQ(errno, EDOM);
+	len = sizeof(socket_error);
+	UT_ASSERT_EQ(getsockopt(probe, SOL_SOCKET, SO_ERROR, &socket_error, &len), 0);
+	UT_ASSERT_EQ(socket_error, ECONNREFUSED);
+	UT_ASSERT(cluster_ic_tier1_stream_current(&ut_first_stream));
+	close(probe);
 }
 
 UT_TEST(test_initial_eagain_queues_full_frame)
@@ -1896,11 +1939,12 @@ int
 main(void)
 {
 	MyProcPid = getpid();
-	UT_PLAN(34);
+	UT_PLAN(35);
 
 	UT_RUN(test_stop_poll_requires_initialized_actual_plane_owner);
 	UT_RUN(test_connect_registers_peer_fd);
 	UT_RUN(test_stream_capture_is_actual_native_connected_owner);
+	UT_RUN(test_connection_trace_does_not_consume_socket_error);
 	UT_RUN(test_initial_eagain_queues_full_frame);
 	UT_RUN(test_drain_delivers_frame_a_intact);
 	UT_RUN(test_smaller_frame_reuses_grown_buffer);

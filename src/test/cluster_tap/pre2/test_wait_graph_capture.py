@@ -8,6 +8,46 @@ import wait_graph_capture as graph
 
 
 class GraphTests(unittest.TestCase):
+    def test_gcs_native_wait_does_not_claim_a_complete_holder_graph(self):
+        proc = dict(pid=42, procno=7, backend_id=8, proc_generation=17,
+                    wait_event_info=1, wait_name='ClusterGCSBlockShipWait')
+        for owners in ([], [dict(node=1, pid=42, procno=7, backend_id=8,
+                                backend_start=9, proc_generation=17)]):
+            result = graph.build_graph([dict(node=1, owners=owners, procs=[proc])], [])
+            self.assertFalse(result['complete'])
+            self.assertTrue(any(row['reason'] == 'gcs_wait_graph_unresolved' for row in result['unknown']))
+            self.assertEqual(result['edges'], [])
+
+    def test_gcs_receiver_separates_repeated_captures_from_real_stop_deadline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            receiver = graph.DeadlineReceiver(1, 0, Path(directory)/'gcs.log')
+            with graph.socket.socket(graph.socket.AF_INET, graph.socket.SOCK_DGRAM) as sender:
+                address = receiver.socket.getsockname()
+                for capture in (1, 2):
+                    sender.sendto(f'node=1 observer=42 sequence=1 capture={capture} PGRAC_WAIT_GCS_BEGIN node=1\n'.encode(), address)
+                    sender.sendto(f'node=1 observer=42 sequence=2 capture={capture} PGRAC_WAIT_GCS_SLOT node=1 slot=0 source_request=9007199254740993\n'.encode(), address)
+                    sender.sendto(f'node=1 observer=42 sequence=3 capture={capture} PGRAC_WAIT_GCS_END node=1 dropped=0\n'.encode(), address)
+                sender.sendto(b'node=1 observer=42 sequence=1 PGRAC_WAIT_DEADLINE_BEGIN node=1\n', address)
+                sender.sendto(b'node=1 observer=42 sequence=2 PGRAC_WAIT_DEADLINE_END node=1 dropped=0\n', address)
+                result = receiver.close()
+            self.assertTrue(result['complete'])
+            self.assertEqual(result['errors'], [])
+            self.assertEqual([(o.get('family'), o.get('capture'), o['records']) for o in result['observers']],
+                             [('GCS', 1, 3), ('GCS', 2, 3), ('DEADLINE', 0, 2)])
+            self.assertEqual(result['completeness_scope'], 'datagram_stream_only')
+            self.assertIn('source_request=9007199254740993', receiver.path.read_text())
+
+    def test_gcs_receiver_preserves_missing_or_dropped_capture_as_unknown(self):
+        for sequence, dropped in ((3, 0), (2, 1)):
+            with self.subTest(sequence=sequence, dropped=dropped), tempfile.TemporaryDirectory() as directory:
+                receiver = graph.DeadlineReceiver(1, 0, Path(directory)/'gcs.log')
+                with graph.socket.socket(graph.socket.AF_INET, graph.socket.SOCK_DGRAM) as sender:
+                    address = receiver.socket.getsockname()
+                    sender.sendto(b'node=1 observer=42 sequence=1 capture=1 PGRAC_WAIT_GCS_BEGIN node=1\n', address)
+                    sender.sendto(f'node=1 observer=42 sequence={sequence} capture=1 PGRAC_WAIT_GCS_END node=1 dropped={dropped}\n'.encode(), address)
+                    result = receiver.close()
+                self.assertFalse(result['complete'])
+
     def test_deadline_receiver_sidecar_save_error_preserves_native_stream_proof(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)/'deadline.log'

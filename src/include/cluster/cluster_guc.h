@@ -156,6 +156,7 @@ extern bool cluster_xnode_profile_enabled;
 /* Diagnostic per-storage-UPDATE phase trace (default off). */
 extern bool cluster_update_trace_enabled;
 extern bool cluster_trace_tx_identity;
+extern bool cluster_trace_gcs_capacity;
 extern bool cluster_trace_block_io;
 
 /* Empty OID list disables passive visibility diagnostics. */

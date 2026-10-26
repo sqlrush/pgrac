@@ -62,6 +62,7 @@
 #include "fmgr.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "storage/latch.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
 #include "utils/builtins.h"
@@ -841,6 +842,89 @@ peer_addr(int32 peer_id)
 		Tier1Shmem->peers[peer_id].node_id = peer_id;
 	}
 	return addr;
+}
+
+/*
+ * Observe the original connection before a close or accumulator reset loses
+ * its evidence. Never sample SO_ERROR here: getsockopt consumes that error.
+ * Endpoint inspection must also leave the caller's errno intact.
+ */
+void
+cluster_ic_tier1_trace_connection(int elevel, const char *phase, int32 peer_id, int peer_fd,
+								int anon_slot, int connect_rc, int socket_error, uint32 events,
+								int64 age_us)
+{
+	int saved_errno = errno;
+	struct sockaddr_in sa;
+	socklen_t len;
+	char local[INET_ADDRSTRLEN] = "?";
+	char remote[INET_ADDRSTRLEN] = "?";
+	char target[CLUSTER_IC_TIER1_ADDR_LEN] = "?";
+	int local_port = -1;
+	int remote_port = -1;
+	int target_port = -1;
+	bool known = peer_id >= 0 && peer_id < CLUSTER_MAX_NODES;
+	bool anonymous = anon_slot >= 0 && anon_slot < CLUSTER_MAX_NODES;
+	ClusterICPeerStateShmem *peer = known && Tier1Shmem != NULL
+										 ? &Tier1Shmem->peers[peer_id] : NULL;
+	const ClusterNodeInfo *node;
+
+	if (!message_level_is_interesting(elevel)) {
+		errno = saved_errno;
+		return;
+	}
+
+	len = sizeof(sa);
+	if (peer_fd >= 0 && getsockname(peer_fd, (struct sockaddr *)&sa, &len) == 0
+		&& sa.sin_family == AF_INET) {
+		(void)inet_ntop(AF_INET, &sa.sin_addr, local, sizeof(local));
+		local_port = ntohs(sa.sin_port);
+	}
+	len = sizeof(sa);
+	if (peer_fd >= 0 && getpeername(peer_fd, (struct sockaddr *)&sa, &len) == 0
+		&& sa.sin_family == AF_INET) {
+		(void)inet_ntop(AF_INET, &sa.sin_addr, remote, sizeof(remote));
+		remote_port = ntohs(sa.sin_port);
+	}
+	node = known ? cluster_conf_lookup_node(peer_id) : NULL;
+	if (node != NULL
+		&& parse_host_port(tier1_my_plane == CLUSTER_IC_PLANE_DATA ? node->data_addr
+																		: node->interconnect_addr,
+						   target, sizeof(target), &target_port))
+		target_port += tier1_my_port_offset();
+
+	ereport(elevel,
+			(errmsg("cluster_ic tier1 connection phase=%s node=%d pid=%d "
+					"plane=%s worker=%d workers=%d peer=%d anon=%d fd=%d "
+					"local=%s:%d remote=%s:%d target=%s:%d "
+					"listener_incarnation=%llu stream_serial=%llu stream_generation=%llu "
+					"conn_epoch=%llu peer_state=%d hello_remaining=%d hello_received=%d "
+					"send_tail=%d fifo_frames=%d fifo_bytes=%zu recv_header=%d "
+					"recv_payload=%d/%d connect_rc=%d socket_error=%d events=%u "
+					"age_us=%lld last_errno=%d",
+					phase, cluster_node_id, MyProcPid,
+					tier1_my_plane == CLUSTER_IC_PLANE_DATA ? "DATA" : "CONTROL",
+					tier1_my_plane == CLUSTER_IC_PLANE_DATA ? tier1_my_data_channel : -1,
+					tier1_my_n_workers, peer_id, anon_slot, peer_fd, local, local_port,
+					remote, remote_port, target, target_port,
+					(unsigned long long)(Tier1Shmem != NULL ? Tier1Shmem->listener_incarnation : 0),
+					(unsigned long long)(known ? tier1_stream_serial[peer_id] : 0),
+					(unsigned long long)(peer != NULL
+						? pg_atomic_read_u64(&peer->resource_x_stream_generation)
+						: 0),
+					(unsigned long long)(peer != NULL ? peer->conn_epoch : 0),
+					peer != NULL ? peer->state : -1,
+					known ? tier1_hello_send_remaining[peer_id] : -1,
+					anonymous ? tier1_anon_hello_len[anon_slot] : -1,
+					known ? tier1_outbound_remaining[peer_id] : -1,
+					known ? tier1_outbound_fifo_frames[peer_id] : -1,
+					known ? tier1_outbound_fifo_bytes[peer_id] : (Size)0,
+					known ? tier1_recv_buf_len[peer_id] : -1,
+					known ? tier1_recv_payload_filled[peer_id] : -1,
+					known ? tier1_recv_payload_total[peer_id] : -1,
+					connect_rc, socket_error, events, (long long)age_us,
+					peer != NULL ? peer->last_errno : 0)));
+	errno = saved_errno;
 }
 
 
@@ -2114,6 +2198,8 @@ cluster_ic_tier1_connect_one(int32 peer_id, int *out_peer_fd)
 	pgstat_report_wait_start(WAIT_EVENT_CLUSTER_IC_TCP_CONNECT);
 	rc = connect(fd, (struct sockaddr *)&sa, sizeof(sa));
 	pgstat_report_wait_end();
+	cluster_ic_tier1_trace_connection(DEBUG1, "connect-result", peer_id, fd, -1, rc,
+									 rc < 0 ? errno : 0, 0, 0);
 	if (rc < 0 && errno != EINPROGRESS) {
 		int saved = errno;
 
@@ -2138,8 +2224,12 @@ cluster_ic_tier1_finish_connect(int32 peer_id, int peer_fd)
 	int so_error = 0;
 	socklen_t so_error_len = sizeof(so_error);
 	const char *self_cluster_name;
+	int rc;
 
-	if (getsockopt(peer_fd, SOL_SOCKET, SO_ERROR, &so_error, &so_error_len) < 0 || so_error != 0) {
+	rc = getsockopt(peer_fd, SOL_SOCKET, SO_ERROR, &so_error, &so_error_len);
+	cluster_ic_tier1_trace_connection(DEBUG1, "connect-complete", peer_id, peer_fd, -1, rc,
+									 rc < 0 ? errno : so_error, WL_SOCKET_WRITEABLE, 0);
+	if (rc < 0 || so_error != 0) {
 		int saved = (so_error != 0) ? so_error : errno;
 
 		peer_record_error(peer_id, saved, "08001", "connect SO_ERROR: %s", strerror(saved));
@@ -2210,11 +2300,15 @@ cluster_ic_tier1_continue_hello_send(int32 peer_id, int peer_fd)
 			return true; /* will retry on next WRITEABLE */
 
 		peer_record_error(peer_id, saved, "08006", "HELLO send: %s", strerror(saved));
+		cluster_ic_tier1_trace_connection(DEBUG1, "hello-send-error", peer_id, peer_fd, -1,
+										 -1, saved, 0, 0);
 		cluster_ic_tier1_close_peer(peer_id, "HELLO send error");
 		return false;
 	}
 
 	tier1_hello_send_remaining[peer_id] -= (int)sent;
+	cluster_ic_tier1_trace_connection(DEBUG1, "hello-send", peer_id, peer_fd, -1,
+									 -1, 0, 0, 0);
 
 	if (tier1_hello_send_remaining[peer_id] > 0)
 		return true; /* partial; LMON re-enters on next WRITEABLE */
@@ -2232,6 +2326,8 @@ cluster_ic_tier1_continue_hello_send(int32 peer_id, int peer_fd)
 		Tier1Shmem->peers[peer_id].conn_epoch = cluster_epoch_get_current();
 		Tier1Shmem->peers[peer_id].last_connect_at = GetCurrentTimestamp();
 	}
+	cluster_ic_tier1_trace_connection(DEBUG1, "hello-sent", peer_id, peer_fd, -1,
+									 -1, 0, 0, 0);
 	ereport(LOG,
 			(errmsg("cluster_ic tier1 peer %d HELLO sent, state CONNECTED (active)", peer_id)));
 	return true;
@@ -2659,16 +2755,22 @@ cluster_ic_tier1_continue_hello_recv(int anon_slot, int peer_fd, int32 *out_lear
 
 			if (saved == EAGAIN || saved == EWOULDBLOCK)
 				return true; /* wait next WL_SOCKET_READABLE */
+			cluster_ic_tier1_trace_connection(DEBUG1, "hello-recv-error", -1, peer_fd, anon_slot,
+											 -1, saved, 0, 0);
 			ereport(LOG, (errmsg("cluster_ic tier1 HELLO recv error on anon slot %d: %s", anon_slot,
 								 strerror(saved))));
 			return false;
 		}
 		if (got == 0) {
+			cluster_ic_tier1_trace_connection(DEBUG1, "hello-eof", -1, peer_fd, anon_slot,
+											 -1, 0, 0, 0);
 			ereport(LOG,
 					(errmsg("cluster_ic tier1 HELLO recv: peer EOF on anon slot %d", anon_slot)));
 			return false;
 		}
 		tier1_anon_hello_len[anon_slot] += (int)got;
+		cluster_ic_tier1_trace_connection(DEBUG1, "hello-recv", -1, peer_fd, anon_slot,
+										 -1, 0, 0, 0);
 
 		if (tier1_anon_hello_len[anon_slot] < PGRAC_IC_HELLO_BYTES)
 			return true; /* partial; wait next READABLE */
@@ -2786,6 +2888,8 @@ cluster_ic_tier1_continue_hello_recv(int anon_slot, int peer_fd, int32 *out_lear
 
 	if (out_learned_peer_id != NULL)
 		*out_learned_peer_id = learned;
+	cluster_ic_tier1_trace_connection(DEBUG1, "hello-verified", learned, peer_fd, anon_slot,
+									 -1, 0, 0, 0);
 
 	/* spec-7.3 D3 — same DATA-plane channel tag on the anon (accept) path. */
 	if (tier1_my_plane == CLUSTER_IC_PLANE_DATA)
@@ -3144,6 +3248,8 @@ cluster_ic_tier1_close_peer(int32 peer_id, const char *reason)
 
 	if (peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
 		return;
+	cluster_ic_tier1_trace_connection(DEBUG1, "close", peer_id, tier1_peer_fds[peer_id], -1,
+									 -1, -1, 0, 0);
 	tier1_stream_serial[peer_id] = 0;
 	tier1_resource_x_finish(&tier1_resource_x_tail[peer_id], false);
 

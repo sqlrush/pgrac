@@ -9,6 +9,8 @@
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_gcs_block.h"
+#include "cluster/cluster_lms.h"
+#include "cluster/cluster_block_io_trace.h"
 #include "cluster/cluster_pcm_own.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_pi_shadow.h"
@@ -34,6 +36,7 @@ static ConditionVariableMinimallyPadded io_cvs[4];
 ConditionVariableMinimallyPadded *BufferIOCVArray = io_cvs;
 static SCN shadow[4];
 SCN *ClusterPiShadow = shadow;
+static PGIOAlignedBlock fixture_pages[4];
 static ClusterPcmOwnEntry own_storage[4];
 ResourceOwner CurrentResourceOwner;
 static LWLock mapping_lock;
@@ -41,6 +44,7 @@ static bool mapping_held;
 static bool caller_lock_held;
 static int header_reads, discarded, io_forgotten, io_wakes;
 bool cluster_trace_cleanup;
+bool cluster_trace_block_io;
 volatile uint32 InterruptHoldoffCount = 1, CritSectionCount = 0;
 static unsigned trace_count;
 static char trace_message[1024];
@@ -205,8 +209,30 @@ ConditionVariableBroadcast(ConditionVariable *cv)
 	io_wakes++;
 }
 
+/* Scheduler and diagnostic sinks remain standalone boundaries. Neither
+ * changes the ownership tuple, frame state or stop observer result. */
+void
+cluster_lms_wakeup(int worker)
+{
+	UT_ASSERT(worker >= 0 && worker < CLUSTER_LMS_MAX_WORKERS);
+}
+
+void
+cluster_block_io_trace_pi_retired(BufferTag tag, int buffer_id, uint64 generation,
+								uint64 token, SCN version)
+{
+	(void)tag;
+	(void)generation;
+	(void)token;
+	(void)version;
+	UT_ASSERT(buffer_id >= 0 && buffer_id < NBuffers);
+	UT_ASSERT(!mapping_held);
+}
+
 #include "test_cluster_pcm_snapshot_owner.inc"
+#define BufHdrGetBlock(buf) ((Block)fixture_pages[(buf)->buf_id].data)
 #include "test_cluster_bufmgr_stop_owner.inc"
+#undef BufHdrGetBlock
 
 static void
 reset_fixture(void)
@@ -394,6 +420,7 @@ test_io_original_completion_and_failure(void)
 	UT_ASSERT_EQ(poll_stop(false), CLUSTER_NORMAL_STOP_READY);
 	UT_ASSERT_EQ(poll_stop(true), CLUSTER_NORMAL_STOP_PENDING);
 	/* Native IO start/pin is the boundary, completion is the real body. */
+	UT_ASSERT_EQ(cluster_pcm_own_write_io_begin(buf->buf_id), CLUSTER_PCM_OWN_OK);
 	pg_atomic_fetch_or_u32(&buf->state, BM_IO_IN_PROGRESS);
 	pg_atomic_fetch_add_u32(&buf->state, 1);
 	UT_ASSERT_EQ(poll_stop(false), CLUSTER_NORMAL_STOP_PENDING);
@@ -403,6 +430,7 @@ test_io_original_completion_and_failure(void)
 	UT_ASSERT_EQ(poll_stop(true), CLUSTER_NORMAL_STOP_READY);
 	UT_ASSERT_EQ(io_forgotten, 1);
 	UT_ASSERT_EQ(io_wakes, 1);
+	UT_ASSERT_EQ(cluster_pcm_own_write_io_begin(buf->buf_id), CLUSTER_PCM_OWN_OK);
 	pg_atomic_fetch_or_u32(&buf->state, BM_IO_IN_PROGRESS);
 	TerminateBufferIO(buf, false, BM_IO_ERROR);
 	UT_ASSERT_EQ(poll_stop(false), CLUSTER_NORMAL_STOP_INVALID);

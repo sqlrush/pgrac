@@ -21,8 +21,9 @@ int first_fill_retire_own_fixture_main(void);
 #define MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND CLUSTER_GCS_BLOCK_MAX_OUTSTANDING_PER_BACKEND
 #include "test_cluster_first_fill_retire_types.inc"
 static void gcs_block_clear_slot_locked(ClusterGcsBlockOutstandingSlot *slot);
-static ClusterGcsBlockBackendBlock retire_blocks[1];
+static ClusterGcsBlockBackendBlock retire_blocks[122];
 static ClusterGcsBlockBackendBlock *gcs_block_backend_blocks = retire_blocks;
+static int retire_max_backends = 1;
 static struct {
 	pg_atomic_uint64 invalidate_busy_sent_count;
 	pg_atomic_uint64 done_sent_count, done_enqueue_drop_count;
@@ -42,8 +43,33 @@ static GcsBlockInvalidateAckPayload retire_ack;
 static bool retire_session = true, retire_cancel;
 static void (*retire_on_wait)(void);
 static ClusterPcmReadSource retire_wait_source;
+bool cluster_trace_gcs_capacity;
+static unsigned retire_trace_cuts, retire_trace_scans, retire_lock_depth;
+static uint64 retire_scan_end;
+#ifdef CLUSTER_CONTENT_TRACE_GCS_SLOTS
+static ClusterContentTraceGcsCapacity retire_trace_cut;
+void
+cluster_content_trace_gcs_capacity(const ClusterContentTraceGcsCapacity *value)
+{
+	UT_ASSERT_EQ(retire_lock_depth, 0);
+	retire_trace_cut = *value; retire_trace_cuts++;
+}
+void
+cluster_content_trace_gcs_scan(int worker, int workers, uint64 begin, uint64 end,
+	uint64 cap, int64 sampled_at)
+{
+	UT_ASSERT_EQ(retire_lock_depth, 0);
+	UT_ASSERT_EQ(worker, 0); UT_ASSERT_EQ(workers, 1);
+	if (retire_max_backends == 1) {
+		UT_ASSERT_EQ(end - begin, 8); UT_ASSERT_EQ(cap, 8);
+	}
+	UT_ASSERT_EQ(sampled_at, retire_now);
+	retire_scan_end = end;
+	retire_trace_scans++;
+}
+#endif
 #define ClusterGcsBlock (&retire_shared)
-#define MaxBackends 1
+#define MaxBackends retire_max_backends
 #define MyBackendId retire_backend
 #define MyProcPid retire_pid
 #define MyStartTimestamp retire_start
@@ -58,8 +84,8 @@ static ClusterPcmReadSource retire_wait_source;
 #define cluster_sf_peer_supports_gcs_done(node) true
 #define cluster_injection_should_skip(name) false
 #define GetCurrentTimestamp() retire_now
-#define LWLockAcquire(lock, mode) ((void)0)
-#define LWLockRelease(lock) ((void)0)
+#define LWLockAcquire(lock, mode) (++retire_lock_depth)
+#define LWLockRelease(lock) (--retire_lock_depth)
 #define LockBufHdr transition_lock_header
 #define ConditionVariablePrepareToSleep(cv) ((void)0)
 #define ConditionVariableCancelSleep() ((void)0)
@@ -177,6 +203,7 @@ retire_reset(BufferDesc *buf, ClusterPcmOwnEntry *entry, bool fresh)
 	memset(gcs_read_source_attempts, 0, sizeof(gcs_read_source_attempts));
 	gcs_read_source_exit_registered = true;
 	retire_blocks[0].next_request_id = 1;
+	retire_max_backends = 1;
 	retire_backend = 1; retire_pid = 71; retire_start = 700; retire_route = 2;
 	retire_now = 10; retire_epoch = 1; retire_peer_session = 17;
 	memset(&retire_ack, 0, sizeof(retire_ack));
@@ -186,6 +213,8 @@ retire_reset(BufferDesc *buf, ClusterPcmOwnEntry *entry, bool fresh)
 	retire_session = true; retire_cancel = false; retire_on_wait = NULL;
 	retire_confirm_admit = false;
 	retire_confirm_sends = retire_confirm_handed = retire_worker_wakes = 0;
+	cluster_trace_gcs_capacity = cluster_trace_tx_identity = false;
+	retire_trace_cuts = retire_trace_scans = retire_lock_depth = 0;
 	retire_master_state = CLUSTER_MEMBER_MEMBER;
 	memset(&retire_confirm, 0, sizeof(retire_confirm));
 	memset(&retire_shared, 0, sizeof(retire_shared));
@@ -420,6 +449,47 @@ UT_TEST(test_never_admitted_cancel_needs_no_remote_receipt)
 	retire_reset(&buf, &entry, false); a = retire_arm(&buf, false); retire_abort(&buf, &a);
 	UT_ASSERT(!a.pending_s); UT_ASSERT(!retire_blocks[0].slots[0].in_use);
 	UT_ASSERT_EQ(retire_trace_published, 0); UT_ASSERT_EQ(retire_sends, 0);
+}
+
+UT_TEST(test_capacity_observer_copies_original_full_source_keys_without_holding_lock)
+{
+#ifdef CLUSTER_CONTENT_TRACE_GCS_SLOTS
+	BufferDesc buf; ClusterPcmOwnEntry entry; ClusterPcmReadSource a;
+	uint64 id;
+	retire_reset(&buf, &entry, true);
+	for (int i = 0; i < MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND; i++) {
+		GcsBlockInvalidatePayload inv;
+		a = retire_arm(&buf, true); retire_abort(&buf, &a);
+		inv = retire_invalidate(&a); retire_result = CLUSTER_IC_SEND_DONE;
+		UT_ASSERT(gcs_block_invalidate_execute(&inv));
+		UT_ASSERT(retire_ack_handed(&a));
+	}
+	cluster_trace_gcs_capacity = cluster_trace_tx_identity = true;
+	retire_wait_source = a; retire_on_wait = retire_free_after_two;
+	(void)gcs_block_reserve_slot(buf.tag, PCM_TRANS_N_TO_S, 2, &id, true);
+	UT_ASSERT_EQ(retire_trace_cuts, 2); UT_ASSERT_EQ(retire_sleeps, 2);
+	UT_ASSERT_EQ(retire_trace_cut.nslots, 8); UT_ASSERT_EQ(retire_trace_cut.max_backends, 1);
+	for (unsigned i = 0; i < retire_trace_cut.nslots; i++) {
+		const ClusterContentTraceGcsSlot *s = &retire_trace_cut.slots[i];
+		UT_ASSERT(s->in_use && s->armed && s->quiet && s->ack_handed);
+		UT_ASSERT_EQ(s->owner_pid, 71); UT_ASSERT_EQ(s->backend_incarnation, 700);
+		UT_ASSERT_EQ(s->request_id, s->source.request_id);
+		UT_ASSERT_EQ(s->request_epoch, s->source.request_epoch);
+		UT_ASSERT_EQ(s->expected_master_node, s->source.master_node);
+		UT_ASSERT_EQ(s->progress_waiter, -1);
+		UT_ASSERT(BufferTagsEqual(&s->tag, &s->source.tag));
+	}
+	/* Original native ACK freed the last slot. The exported cut is owned. */
+	UT_ASSERT(retire_trace_cut.slots[7].quiet);
+	UT_ASSERT(!retire_blocks[0].slots[7].first_fill.quiet);
+	gcs_first_fill_receipt_tick(0);
+	UT_ASSERT_EQ(retire_trace_scans, 1);
+	cluster_trace_gcs_capacity = false;
+	gcs_first_fill_receipt_tick(0);
+	UT_ASSERT_EQ(retire_trace_scans, 1);
+#else
+	UT_ASSERT(false); /* Parent has no observation at the native capacity site. */
+#endif
 }
 UT_TEST(test_exit_preserves_quiet_debt_and_reused_backend_cannot_take_it)
 {
@@ -666,11 +736,44 @@ UT_TEST(test_repeated_installed_confirmations_return_original_bounded_slots)
 	}
 }
 
+UT_TEST(test_woken_worker_retires_ready_receipts_across_the_bounded_table)
+{
+	BufferDesc buf; ClusterPcmOwnEntry entry;
+	ClusterGcsBlockBackendBlock *blk;
+	uint64 cap;
+	retire_reset(&buf, &entry, true);
+	retire_max_backends = lengthof(retire_blocks);
+	cap = (uint64)retire_max_backends * MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND;
+	cluster_trace_gcs_capacity = cluster_trace_tx_identity = true;
+	gcs_first_fill_receipt_tick(0);
+	/* Place real installed receipts beyond the next 64 positions. A wake
+	 * must not leave them behind another ordinary LMS idle interval. */
+	retire_backend = ((retire_scan_end + 128) % cap)
+		/ MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND + 1;
+	blk = &retire_blocks[retire_backend - 1];
+	blk->next_request_id = 1;
+	for (int episode = 0; episode < MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND; episode++) {
+		ClusterPcmReadSource source;
+		buf.pcm_state = PCM_STATE_N;
+		pg_atomic_write_u32(&buf.state, BM_TAG_VALID | BM_IO_IN_PROGRESS | BUF_REFCOUNT_ONE);
+		source = retire_arm(&buf, true);
+		retire_prepare_install(&buf, &entry, &source);
+		cluster_gcs_block_read_source_complete(&buf, &source, true);
+	}
+	UT_ASSERT_EQ(retire_worker_wakes, MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND);
+	retire_confirm_admit = true;
+	gcs_first_fill_receipt_tick(0);
+	for (int slot = 0; slot < MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND; slot++)
+		UT_ASSERT(!blk->slots[slot].in_use);
+	UT_ASSERT_EQ(retire_confirm_handed, MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND);
+}
+
 int
 FIRST_FILL_RETIRE_MAIN(void)
 {
-	UT_PLAN(19);
+	UT_PLAN(21);
 	UT_RUN(test_deferred_original_notice_keeps_receipt_then_retires_without_successor_state);
+	UT_RUN(test_capacity_observer_copies_original_full_source_keys_without_holding_lock);
 	UT_RUN(test_installed_confirm_refusal_keeps_original_owner_until_real_handoff);
 	UT_RUN(test_installed_confirm_survives_exit_and_never_reads_successor_buffer);
 	UT_RUN(test_installed_confirm_waits_for_unknown_session_but_retires_on_proved_reconfiguration);
@@ -689,5 +792,6 @@ FIRST_FILL_RETIRE_MAIN(void)
 	UT_RUN(test_master_consumption_releases_capacity_without_a_backend_waiter);
 	UT_RUN(test_unknown_invalidate_still_observes_native_io_protection);
 	UT_RUN(test_admitted_original_master_notice_survives_route_change);
+	UT_RUN(test_woken_worker_retires_ready_receipts_across_the_bounded_table);
 	UT_DONE(); return ut_failed_count == 0 ? 0 : 1;
 }

@@ -45,6 +45,7 @@ static uint32 held_lifetime_count;
 static int deadline_fd = -1;
 static struct sockaddr_in deadline_address;
 static uint32 deadline_sequence, deadline_dropped;
+static uint32 deadline_capture, gcs_captures;
 static struct { LWLock *lock; uint64 lifetime; } held_lifetimes[CLUSTER_CONTENT_TRACE_LOCKS];
 
 static uint64
@@ -177,6 +178,8 @@ content_trace_publish(bool entering_wait)
 	uint64 revision;
 	bool was_live = local_owner.pid != 0;
 
+	if (!cluster_trace_gcs_capacity)
+		memset(&local_owner.gcs_scan, 0, sizeof(local_owner.gcs_scan));
 	if (!cluster_trace_tx_identity) {
 		memset(held_lifetimes, 0, sizeof(held_lifetimes));
 		held_lifetime_count = 0;
@@ -694,6 +697,27 @@ content_trace_native_proc(uint32 slot, ClusterContentTraceNativeProc *out)
 
 static void content_trace_deadline_send(const char *fmt,...) pg_attribute_printf(1,2);
 
+/* Shared local transport for original DEADLINE and separately identified GCS
+ * observations. The caller restores errno and never retries a failed send. */
+static bool
+content_trace_udp_open(uint32 capture)
+{
+	deadline_sequence = deadline_dropped = 0;
+	deadline_capture = capture;
+	deadline_fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (deadline_fd < 0)
+		return false;
+	if (fcntl(deadline_fd, F_SETFL, O_NONBLOCK) < 0) {
+		close(deadline_fd); deadline_fd = -1;
+		return false;
+	}
+	memset(&deadline_address, 0, sizeof(deadline_address));
+	deadline_address.sin_family = AF_INET;
+	deadline_address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	deadline_address.sin_port = htons((uint16)PostPortNumber);
+	return true;
+}
+
 /* Dedicated local UDP socket, O_NONBLOCK plus MSG_DONTWAIT. Never stdio,
  * logging, a file write or a retry while the original stop lock is held.
  * Receiver must check sequence/END/dropped; missing datagrams are UNKNOWN. */
@@ -705,6 +729,8 @@ content_trace_deadline_send(const char *fmt,...)
 	int prefix, n;
 	prefix = snprintf(row, sizeof(row), "node=%d observer=%d sequence=%u ",
 		cluster_node_id, MyProcPid, ++deadline_sequence);
+	if (deadline_capture != 0)
+		prefix += snprintf(row + prefix, sizeof(row) - prefix, "capture=%u ", deadline_capture);
 	va_start(ap, fmt);
 	n = vsnprintf(row + prefix, sizeof(row) - prefix, fmt, ap);
 	va_end(ap);
@@ -712,6 +738,88 @@ content_trace_deadline_send(const char *fmt,...)
 		sendto(deadline_fd, row, prefix + n, MSG_DONTWAIT,
 			(struct sockaddr *)&deadline_address, sizeof(deadline_address)) != prefix + n)
 		deadline_dropped++;
+}
+
+void
+cluster_content_trace_gcs_scan(int worker, int workers, uint64 begin,
+	uint64 end, uint64 cap, int64 sampled_at)
+{
+	if (!cluster_trace_tx_identity || !cluster_trace_gcs_capacity)
+		return;
+	local_owner.gcs_scan = (ClusterContentTraceGcsScan){
+		.active = true, .worker = worker, .workers = workers,
+		.begin = begin, .end = end, .cap = cap, .sampled_at = sampled_at
+	};
+	content_trace_publish(false);
+}
+
+static void
+content_trace_gcs_scanner(const ClusterContentTraceOwner *owner, void *arg)
+{
+	const ClusterContentTraceGcsScan *s = &owner->gcs_scan;
+	(void)arg;
+	if (!s->active)
+		return;
+	content_trace_deadline_send("PGRAC_WAIT_GCS_SCAN node=%d pid=%d proc=%u backend=%d start=" INT64_FORMAT
+		" generation=" UINT64_FORMAT " revision=" UINT64_FORMAT
+		" worker=%d workers=%d begin=" UINT64_FORMAT " end=" UINT64_FORMAT
+		" cap=" UINT64_FORMAT " sampled_at=" INT64_FORMAT "\n",
+		cluster_node_id, owner->pid, owner->procno, owner->backend_id, owner->backend_start,
+		owner->proc_generation, owner->revision, s->worker, s->workers,
+		s->begin, s->end, s->cap, s->sampled_at);
+}
+
+void
+cluster_content_trace_gcs_capacity(const ClusterContentTraceGcsCapacity *cut)
+{
+	ClusterContentTraceWalkStats stats;
+	int saved_errno = errno;
+
+	if (!cluster_trace_tx_identity || !cluster_trace_gcs_capacity || MyProc == NULL ||
+		cut == NULL || cut->nslots != CLUSTER_CONTENT_TRACE_GCS_SLOTS || gcs_captures >= 8)
+		return;
+	/* A failed socket/send consumes its bounded capture too. No new wait, file,
+	 * SQL connection, or fallback logging on the original capacity-wait path. */
+	if (!content_trace_udp_open(++gcs_captures)) {
+		errno = saved_errno; return;
+	}
+	content_trace_deadline_send("PGRAC_WAIT_GCS_BEGIN node=%d pid=%d proc=%u backend=%d start=" INT64_FORMAT
+		" generation=" UINT64_FORMAT " identity_valid=%d site=capacity_before_sleep"
+		" sampled_at=" INT64_FORMAT " max_backends=%u slots=%u tag=%u/%u/%u/%d/%u transition=%u master=%d atomic_graph=0\n",
+		cluster_node_id, MyProcPid, MyProc->pgprocno, MyProc->backendId, MyStartTimestamp,
+		MyProc->cluster_grd_generation, MyProc->pid == MyProcPid && MyProc->cluster_grd_generation != 0,
+		cut->sampled_at, cut->max_backends, cut->nslots, cut->tag.spcOid, cut->tag.dbOid,
+		cut->tag.relNumber, cut->tag.forkNum, cut->tag.blockNum, cut->transition_id, cut->master_node);
+	for (uint32 i = 0; i < cut->nslots; i++) {
+		const ClusterContentTraceGcsSlot *s = &cut->slots[i];
+		const ClusterPcmReadSource *r = &s->source;
+		content_trace_deadline_send("PGRAC_WAIT_GCS_SLOT node=%d pid=%d slot=%u in_use=%d request=" UINT64_FORMAT
+			" epoch=" UINT64_FORMAT " master=%d expected_master=%d tag=%u/%u/%u/%d/%u transition=%u domain=%u"
+			" reply=%d stale=%d revoked=%d source_request=" UINT64_FORMAT " source_epoch=" UINT64_FORMAT
+			" source_master=%d source_tag=%u/%u/%u/%d/%u base=" UINT64_FORMAT " token=" UINT64_FORMAT
+			" watermark=" UINT64_FORMAT " kind=%d durable=%d quiescent=%d pending_s=%d"
+			" retry_at=" INT64_FORMAT " buffer=%d owner_pid=%d incarnation=" UINT64_FORMAT " session=" UINT64_FORMAT
+			" armed=%d delivery_closed=%d admitted=%d quiet=%d ack_ready=%d ack_handed=%d ack_consumed=%d"
+			" confirm_pending=%d progress_waiter=%d\n",
+			cluster_node_id, MyProcPid, i, s->in_use, s->request_id, s->request_epoch,
+			s->master_node, s->expected_master_node, s->tag.spcOid, s->tag.dbOid, s->tag.relNumber,
+			s->tag.forkNum, s->tag.blockNum, s->transition_id, s->reply_domain,
+			s->reply_received, s->stale, s->first_fill_revoked, r->request_id, r->request_epoch,
+			r->master_node, r->tag.spcOid, r->tag.dbOid, r->tag.relNumber, r->tag.forkNum, r->tag.blockNum,
+			r->base_generation, r->reservation_token, r->watermark, r->kind, r->durable, r->quiescent,
+			r->pending_s, s->retry_at, s->buf_id, s->owner_pid,
+			s->backend_incarnation, s->master_session, s->armed, s->delivery_closed,
+			s->request_admitted, s->quiet, s->ack_ready, s->ack_handed, s->ack_consumed,
+			s->confirm_pending, s->progress_waiter);
+	}
+	/* Existing S2 native PGPROC-generation/revision validation. Missing/racing
+	 * scanners are UNKNOWN. This is not an atomic cross-process wait graph. */
+	cluster_content_trace_walk(content_trace_gcs_scanner, NULL, &stats);
+	content_trace_deadline_send("PGRAC_WAIT_GCS_END node=%d available=%d scanned=%u owners=%u busy=%u changed=%u dead=%u omitted=%u dropped=%u\n",
+		cluster_node_id, stats.available, stats.scanned, stats.owners, stats.busy,
+		stats.changed, stats.dead, stats.omitted_locks, deadline_dropped);
+	close(deadline_fd); deadline_fd = -1;
+	errno = saved_errno;
 }
 
 static void
@@ -780,16 +888,9 @@ cluster_content_trace_deadline_dump(uint32 reason)
 	int saved_errno = errno;
 	if (!cluster_trace_tx_identity || emitted || ProcGlobal == NULL) return;
 	emitted = true;
-	deadline_fd = socket(AF_INET, SOCK_DGRAM, 0);
-	if (deadline_fd < 0) { errno = saved_errno; return; }
-	if (fcntl(deadline_fd, F_SETFL, O_NONBLOCK) < 0) {
-		close(deadline_fd); deadline_fd = -1; errno = saved_errno; return;
+	if (!content_trace_udp_open(0)) {
+		errno = saved_errno; return;
 	}
-	memset(&deadline_address, 0, sizeof(deadline_address));
-	deadline_address.sin_family = AF_INET;
-	deadline_address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-	/* Local diagnostic UDP uses the node's existing TCP port number. */
-	deadline_address.sin_port = htons((uint16)PostPortNumber);
 	content_trace_deadline_send("PGRAC_WAIT_DEADLINE_BEGIN node=%d observer=%d reason=%u slots=%u termination_receipt=UNKNOWN\n",
 		cluster_node_id, MyProcPid, reason, ProcGlobal->allProcCount);
 	for (uint32 i = 0; i < ProcGlobal->allProcCount; i++) {
