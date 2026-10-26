@@ -8685,6 +8685,10 @@ test_cluster_tt_active_owner test_cluster_tt_slot_allocator: \
 		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h \
 		$(top_srcdir)/src/include/cluster/cluster_tt_slot.h
 
+test_cluster_tt_durable test_cluster_tt_rollback_entry test_cluster_tt_abort_owner \
+test_cluster_tt_active_owner test_cluster_tt_terminal_trace test_cluster_relmap_native_tt.o: \
+		$(srcdir)/test_cluster_tt_live_head.inc
+
 # spec-3.11 D2/D9: test_cluster_tt_durable — pure decision predicates
 # (redo wrap table / slot match) + lookup / by-xid scan with a mocked
 # cluster_undo_smgr.  File-I/O behavior is e2e in cluster_tap t/219.

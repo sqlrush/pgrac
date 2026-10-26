@@ -42,6 +42,7 @@
 
 #include "access/transam.h"
 #include "access/xlog.h"
+#include "miscadmin.h"
 #include "storage/bufpage.h"
 #include "storage/proc.h"
 #include "utils/timestamp.h"
@@ -91,6 +92,7 @@ UT_DEFINE_GLOBALS();
 
 static void (*g_epoch_hook)(void) = NULL;
 static void (*g_modifier_recheck_hook)(void) = NULL;
+static bool g_live_head_test_mode = false;
 
 uint64
 GetSystemIdentifier(void)
@@ -162,6 +164,9 @@ static int last_ereport_elevel = 0;
 bool
 errstart(int elevel, const char *domain pg_attribute_unused())
 {
+	/* Match the native error escalation in this publisher's WAL window. */
+	if (g_live_head_test_mode && elevel == ERROR && CritSectionCount > 0)
+		elevel = PANIC;
 	if (elevel >= ERROR)
 		last_ereport_elevel = elevel;
 	return elevel >= ERROR;
@@ -253,6 +258,8 @@ static bool g_current_recheck_ok = true;
 static ClusterUndoBlock0Result g_current_empty_result = CLUSTER_UNDO_BLOCK0_OK;
 static bool g_current_release_ok = true;
 static bool g_current_active = false;
+static int g_current_acquire_pending = 0;
+static int g_current_wait_calls = 0;
 static int g_current_root_calls = 0;
 static int g_current_acquire_calls = 0;
 static int g_current_sample_calls = 0;
@@ -349,7 +356,8 @@ cluster_undo_block0_current_acquire_begin_live_owner_source(
 	}
 	guard->opaque[0] = 1;
 	g_current_active = true;
-	return CLUSTER_UNDO_BLOCK0_CURRENT_HELD;
+	return g_current_acquire_pending > 0 ? CLUSTER_UNDO_BLOCK0_CURRENT_PENDING
+										 : CLUSTER_UNDO_BLOCK0_CURRENT_HELD;
 }
 
 ClusterUndoBlock0CurrentStep
@@ -374,13 +382,16 @@ cluster_undo_block0_current_acquire_begin_live_owner_target(
 	}
 	guard->opaque[0] = 1;
 	g_current_active = true;
-	return CLUSTER_UNDO_BLOCK0_CURRENT_HELD;
+	return g_current_acquire_pending > 0 ? CLUSTER_UNDO_BLOCK0_CURRENT_PENDING
+										 : CLUSTER_UNDO_BLOCK0_CURRENT_HELD;
 }
 
 ClusterUndoBlock0CurrentStep
 cluster_undo_block0_current_acquire_poll(ClusterUndoBlock0CurrentGuard *guard pg_attribute_unused(),
 										 ClusterUndoBlock0Result *failure pg_attribute_unused())
 {
+	if (g_current_active && g_current_acquire_pending > 0 && --g_current_acquire_pending > 0)
+		return CLUSTER_UNDO_BLOCK0_CURRENT_PENDING;
 	return g_current_active ? CLUSTER_UNDO_BLOCK0_CURRENT_HELD : CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
 }
 
@@ -388,6 +399,10 @@ bool
 cluster_undo_block0_current_wait_reply(ClusterUndoBlock0CurrentGuard *guard pg_attribute_unused(),
 									   ClusterUndoBlock0ReplyWaitSite site pg_attribute_unused())
 {
+	if (g_live_head_test_mode && g_current_active && g_current_acquire_pending > 0) {
+		g_current_wait_calls++;
+		return true;
+	}
 	/* These current-guard fixtures complete synchronously.  A new pending
 	 * path must add an explicit fixture, not receive a fabricated wake. */
 	abort();
@@ -569,6 +584,7 @@ static int g_abort_exact_emit_calls = 0;
 static int g_emit_delay_flags = -1;	 /* MyProc->delayChkptFlags at the 0x60 insert */
 static int g_write_delay_flags = -1; /* ... and at the header write */
 static XLogRecPtr g_abort_exact_lsn = (XLogRecPtr)0xfedcba;
+static void (*g_live_head_flush_hook)(XLogRecPtr) = NULL;
 static XLogRecPtr g_flushed_lsn = InvalidXLogRecPtr;
 static bool g_abort_flush_seen = false;
 static bool g_require_abort_flush_before_write = false;
@@ -790,6 +806,8 @@ XLogFlush(XLogRecPtr record)
 {
 	g_flushed_lsn = record;
 	g_abort_flush_seen = true;
+	if (g_live_head_flush_hook != NULL)
+		g_live_head_flush_hook(record);
 }
 
 /* spec-4.8 D7-A stub: 0x90 set-head emit (WAL machinery not linked in unit). */
@@ -1122,6 +1140,8 @@ reset_current_write_mock(void)
 	g_current_empty_result = CLUSTER_UNDO_BLOCK0_OK;
 	g_current_release_ok = true;
 	g_current_active = false;
+	g_current_acquire_pending = 0;
+	g_current_wait_calls = 0;
 	g_current_root_calls = 0;
 	g_current_acquire_calls = 0;
 	g_current_sample_calls = 0;
@@ -3916,6 +3936,7 @@ UT_TEST(test_operation_head_present_barrier_failure_is_fatal)
 }
 
 #include "test_cluster_tt_head_chain.inc"
+#include "test_cluster_tt_live_head.inc"
 
 /*
  * F-D-29 restart residue: a crash restart rebuilds shared memory -- and the
@@ -4191,7 +4212,7 @@ UT_TEST(test_revert_delete_identity_mismatch_failclosed)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(130);
+	UT_PLAN(143);
 	UT_RUN(test_head_chain_forward_crosses_data_and_completed_control);
 	UT_RUN(test_head_chain_stale_follows_ancestry_not_sequence);
 	UT_RUN(test_head_chain_rejects_corrupt_or_unknown_members);
@@ -4335,6 +4356,20 @@ main(int argc, char **argv)
 	UT_RUN(test_revert_delete_already_clear_skip_done);
 	UT_RUN(test_revert_delete_identity_match_apply);
 	UT_RUN(test_revert_delete_identity_mismatch_failclosed);
+
+	UT_RUN(test_live_head_target_orders_wal_flush_and_exact_slot);
+	UT_RUN(test_live_head_source_preserves_prior_retained_head);
+	UT_RUN(test_live_head_already_present_still_flushes_exact_wal);
+	UT_RUN(test_live_head_rejects_invalid_requests_before_current);
+	UT_RUN(test_live_head_rejects_invalid_previous_head);
+	UT_RUN(test_live_head_rejects_physical_or_current_uncertainty);
+	UT_RUN(test_live_head_rechecks_before_wal);
+	UT_RUN(test_live_head_open_failure_is_before_wal);
+	UT_RUN(test_live_head_invalid_wal_cut_panics_without_write);
+	UT_RUN(test_live_head_failed_flush_panics_without_write);
+	UT_RUN(test_live_head_post_flush_conflicts_never_return_success);
+	UT_RUN(test_live_head_original_wait_and_cancel);
+	UT_RUN(test_live_head_rolled_away_binding_uses_physical_owner);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;

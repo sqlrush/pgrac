@@ -49,6 +49,23 @@ cluster_tt_durable_redo_set_head_operation(const xl_undo_tt_slot_set_head_operat
 typedef struct ClusterSemanticAdmissionToken ClusterSemanticAdmissionToken;
 
 /*
+ * Publish an exact local ACTIVE retained head through the original TT owner.
+ * The caller has quiesced effects and proved the exact PENDING control, its
+ * retained ancestry and original references. Neither this function nor its
+ * structural request checks grants control/DATA read or discard authority.
+ * pending_lsn is the original installed control's WAL end, not a durability
+ * claim. The returned 0x90 cut is flushed and covers that earlier record.
+ * Ordinary errors are possible only before head WAL; the enclosing rollback
+ * owner must still fail stop if its already-installed PENDING cannot finish.
+ * Call without heap/content locks or a critical section; admission is borrowed.
+ */
+#define CLUSTER_TT_LIVE_OPERATION_HEAD_PRESENT 1
+extern XLogRecPtr
+cluster_tt_slot_durable_publish_operation_head(const xl_undo_tt_slot_set_head_operation *record,
+											   UBA expected_head, XLogRecPtr pending_lsn,
+											   const ClusterSemanticAdmissionToken *admission);
+
+/*
  * Pure decision predicates (no I/O) -- shared by the runtime lookup/redo paths
  * and exercised directly by cluster_unit (file I/O behavior is e2e in t/219).
  */
