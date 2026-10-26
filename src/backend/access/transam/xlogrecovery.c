@@ -710,6 +710,7 @@ struct ClusterRecoveryStartV1 {
 	ClusterWalWriterToken writer;
 	uint8 operation_uuid[16];
 	bool revoked;
+	bool relmap_declared;
 	bool ctrc_observation_started, ctrc_observation_complete;
 	const ClusterColdCtrcWorkV1 *ctrc_observation_work;
 	ClusterColdCtrcWorkV1 *ctrc_observation_work_copy;
@@ -854,6 +855,39 @@ ClusterColdRecoveryTxCheckpointOwnerV1(const struct ClusterRecoveryStartV1 *star
 	out->owner_boot = start->owner_boot;
 	out->owner_pid = start->pid;
 	return true;
+}
+
+bool
+ClusterColdRecoveryRelmapDeclare(const struct ClusterRecoveryStartV1 *start)
+{
+	if (MyBackendType != B_STARTUP || CritSectionCount != 0
+		|| !ClusterColdRecoveryTxCurrent(start))
+		return false;
+	if (start->relmap_declared)
+		return true;
+	if (start->ctrc_observation_started || !cluster_recovery_ctrc_require_relmap_v1(start))
+		return false;
+	/* The shared obligation is installed before exposing any input. */
+	cluster_recovery_cold_start->relmap_declared = true;
+	return true;
+}
+
+bool
+ClusterColdRecoveryRelmapCurrent(const struct ClusterRecoveryStartV1 *start)
+{
+	return ClusterColdRecoveryTxCurrent(start) && start->relmap_declared;
+}
+
+void
+ClusterColdRecoveryRelmapFail(const struct ClusterRecoveryStartV1 *start)
+{
+	/* A stale borrowed pointer is never dereferenced or used for cleanup. */
+	if (start == NULL || start != cluster_recovery_cold_start
+		|| !start->relmap_declared || start->pid != MyProcPid)
+		return;
+	cluster_recovery_cold_start->revoked = true;
+	cluster_recovery_checkpoint_revoke_v1(start);
+	/* Dependents, IR and WALR remain for the original reverse cleanup. */
 }
 
 const struct ClusterColdTypedV1 *

@@ -149,6 +149,14 @@ extern void ShutdownWalRecovery(void);
 extern void ClusterReleaseColdRecoveryInputs(EndOfWalRecoveryInfo *info);
 extern bool ClusterBeginColdRecoveryTx(EndOfWalRecoveryInfo *info);
 extern bool ClusterColdRecoveryTxCurrent(const struct ClusterRecoveryStartV1 *start);
+/* Fixed obligation in the original episode; no relmap success certificate.
+ * Declare before physical observation or accepted CTRC handoff. Declaration
+ * withholds independent CTRC COMPLETE until the original joint publisher is
+ * connected. Failure revokes this entire original episode, retaining cleanup
+ * debt and all original resources. No caller-supplied completion polarity. */
+extern bool ClusterColdRecoveryRelmapDeclare(const struct ClusterRecoveryStartV1 *start);
+extern bool ClusterColdRecoveryRelmapCurrent(const struct ClusterRecoveryStartV1 *start);
+extern void ClusterColdRecoveryRelmapFail(const struct ClusterRecoveryStartV1 *start);
 struct ClusterRecoveryCheckpointOwnerV1;
 /* Original recovered INSTALL only; ordinary CLEAN/first creation cannot
  * provide this checkpoint input. The output clears on refusal. */

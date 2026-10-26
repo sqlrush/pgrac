@@ -26019,6 +26019,7 @@ UT_TEST(test_tx_inputs_parent_subject_and_wait_revalidation)
 #include "test_cluster_control_ctrc_replay_ir.inc"
 #include "test_cluster_control_ctrc_source_plan.inc"
 #include "test_cluster_control_ctrc_replay_set.inc"
+#include "test_cluster_control_relmap_participant.inc"
 #include "test_cluster_control_ctrc_stable.inc"
 #include "test_cluster_control_ctrc_replay_stable.inc"
 #include "test_cluster_control_ctrc_page.inc"
@@ -26291,6 +26292,20 @@ main(int argc, char **argv)
 		UT_RUN(test_ctrc_stable_late_scope_loss_and_error_never_publish_proof);
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_RELMAP_INPUTS") != NULL) {
+		UT_PLAN(10);
+		UT_RUN(test_relmap_native_input_refuses_caller_cf_or_critical_without_revocation);
+		UT_RUN(test_relmap_input_vector_keeps_every_original_history_generation);
+		UT_RUN(test_relmap_inputs_require_declaration_and_all_original_holders);
+		UT_RUN(test_relmap_native_input_reads_original_checkpoint_end_and_window);
+		UT_RUN(test_relmap_source_rejects_changed_values_without_revoking_original);
+		UT_RUN(test_relmap_source_loss_of_sibling_holder_never_renews_old_input);
+		UT_RUN(test_relmap_native_input_refuses_self_consistent_wrong_checkpoint_end);
+		UT_RUN(test_relmap_legacy_native_input_revokes_whole_declared_episode);
+		UT_RUN(test_relmap_native_physical_refusal_retains_all_original_holders);
+		UT_RUN(test_relmap_native_error_revokes_without_releasing_original_owners);
+		UT_DONE(); return ut_failed_count != 0;
 	}
 	if (getenv("PGRAC_PRE2_TEST_CTRC_REPLAY_SET") != NULL) {
 		UT_PLAN(10);
@@ -26575,7 +26590,18 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(599);
+	UT_PLAN(609);
+	UT_RUN(test_relmap_native_input_refuses_caller_cf_or_critical_without_revocation);
+	UT_RUN(test_relmap_input_vector_keeps_every_original_history_generation);
+	UT_RUN(test_relmap_inputs_require_declaration_and_all_original_holders);
+	UT_RUN(test_relmap_native_input_reads_original_checkpoint_end_and_window);
+	UT_RUN(test_relmap_source_rejects_changed_values_without_revoking_original);
+	UT_RUN(test_relmap_source_loss_of_sibling_holder_never_renews_old_input);
+	UT_RUN(test_relmap_native_input_refuses_self_consistent_wrong_checkpoint_end);
+	UT_RUN(test_relmap_legacy_native_input_revokes_whole_declared_episode);
+	UT_RUN(test_relmap_native_physical_refusal_retains_all_original_holders);
+	UT_RUN(test_relmap_native_error_revokes_without_releasing_original_owners);
+
 	UT_RUN(test_ctrc_native_read_exact_five_reads_under_original_owners);
 	UT_RUN(test_ctrc_native_read_refuses_wrong_scope_actor_or_target_before_io);
 	UT_RUN(test_ctrc_native_read_refuses_torn_space_and_wrong_page_version);

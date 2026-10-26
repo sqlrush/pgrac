@@ -2253,9 +2253,79 @@ UT_TEST(test_c0_error_closes_target_before_ir_and_walr)
 
 #include "test_cluster_cold_claim_service.inc"
 
+UT_TEST(test_relmap_declaration_withholds_component_complete_and_is_not_success)
+{
+	ClusterRecoveryCtrcResultObservationV1 out;
+	c0_subject();
+	ctrc_census.subject_count = ctrc_census.unresolved_count = 0;
+	UT_ASSERT(!ClusterColdRecoveryRelmapCurrent(info.cluster_tx_start));
+	/* An existing unaccepted component observation is withdrawn, never reused. */
+	UT_ASSERT(cluster_recovery_ctrc_result_collect_v1(info.cluster_tx_start));
+	UT_ASSERT_EQ(window_region.checkpoint_owner.ctrc_result.state,
+		CLUSTER_RECOVERY_CTRC_RESULT_COMPLETE);
+	UT_ASSERT(ClusterColdRecoveryRelmapDeclare(info.cluster_tx_start));
+	UT_ASSERT_EQ(window_region.checkpoint_owner.ctrc_result.state,
+		CLUSTER_RECOVERY_CTRC_RESULT_PENDING);
+	UT_ASSERT(ClusterColdRecoveryRelmapDeclare(info.cluster_tx_start));
+	UT_ASSERT(ClusterColdRecoveryRelmapCurrent(info.cluster_tx_start));
+	UT_ASSERT(cluster_recovery_ctrc_result_collect_v1(info.cluster_tx_start));
+	UT_ASSERT_EQ(window_region.checkpoint_owner.ctrc_result.state,
+		CLUSTER_RECOVERY_CTRC_RESULT_PENDING);
+	serving_actor();
+	UT_ASSERT(!cluster_recovery_ctrc_result_accept_v1());
+	UT_ASSERT(!cluster_recovery_ctrc_result_observe_accepted_v1(&out));
+	startup_actor();
+	UT_ASSERT(ClusterColdRecoveryTxCurrent(info.cluster_tx_start));
+	UT_ASSERT(!cluster_recovery_checkpoint_handoff_v1(info.cluster_tx_start));
+}
+
+UT_TEST(test_relmap_declaration_cannot_reopen_accepted_or_observed_episode)
+{
+	c0_subject();
+	ctrc_census.subject_count = ctrc_census.unresolved_count = 0;
+	UT_ASSERT(cluster_recovery_ctrc_result_collect_v1(info.cluster_tx_start));
+	serving_actor(); UT_ASSERT(cluster_recovery_ctrc_result_accept_v1()); startup_actor();
+	UT_ASSERT(!ClusterColdRecoveryRelmapDeclare(info.cluster_tx_start));
+	UT_ASSERT(!ClusterColdRecoveryRelmapCurrent(info.cluster_tx_start));
+	c0_subject();
+	info.cluster_tx_start->ctrc_observation_started = true;
+	UT_ASSERT(!ClusterColdRecoveryRelmapDeclare(info.cluster_tx_start));
+	UT_ASSERT(!ClusterColdRecoveryRelmapDeclare((const struct ClusterRecoveryStartV1 *)(uintptr_t)1));
+}
+
+UT_TEST(test_relmap_failure_revokes_original_episode_without_free_or_release)
+{
+	for (unsigned changed_owner = 0; changed_owner < 2; changed_owner++) {
+		unsigned destroyed; ResourceOwner original;
+		c0_subject();
+		UT_ASSERT(ClusterColdRecoveryRelmapDeclare(info.cluster_tx_start));
+		destroyed = input_destroys; original = CurrentResourceOwner;
+		if (changed_owner) CurrentResourceOwner = (ResourceOwner)(uintptr_t)42;
+		ClusterColdRecoveryRelmapFail(info.cluster_tx_start);
+		CurrentResourceOwner = original;
+		UT_ASSERT(!ClusterColdRecoveryRelmapCurrent(info.cluster_tx_start));
+		UT_ASSERT(!ClusterColdRecoveryTxCurrent(info.cluster_tx_start));
+		UT_ASSERT(!cluster_recovery_ctrc_result_collect_v1(info.cluster_tx_start));
+		UT_ASSERT(!ClusterColdRecoveryRelmapDeclare(info.cluster_tx_start));
+		UT_ASSERT_EQ(input_destroys, destroyed);
+		UT_ASSERT(claim_held);
+		UT_ASSERT(!window_region.checkpoint_owner.valid);
+	}
+}
+
 int main(void)
 {
-	UT_PLAN(128);
+	if (getenv("PGRAC_PRE2_TEST_RELMAP_PARTICIPANT") != NULL) {
+		UT_PLAN(3);
+		UT_RUN(test_relmap_declaration_withholds_component_complete_and_is_not_success);
+		UT_RUN(test_relmap_declaration_cannot_reopen_accepted_or_observed_episode);
+		UT_RUN(test_relmap_failure_revokes_original_episode_without_free_or_release);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
+	UT_PLAN(131);
+	UT_RUN(test_relmap_declaration_withholds_component_complete_and_is_not_success);
+	UT_RUN(test_relmap_declaration_cannot_reopen_accepted_or_observed_episode);
+	UT_RUN(test_relmap_failure_revokes_original_episode_without_free_or_release);
 	UT_RUN(test_startup_acquires_native_replay_set_before_independent_service);
 	UT_RUN(test_startup_replay_acquisition_requires_original_complete_observation);
 	UT_RUN(test_startup_replay_wait_retains_partial_owners_without_deadline);
