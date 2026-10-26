@@ -337,6 +337,51 @@ typedef struct ClusterRecoveryRelmapPendingTerminalV1 {
 extern bool cluster_recovery_relmap_history_pending_terminal_v1(
 	ClusterRecoveryRelmapHistory *history, const ClusterRelmapV2Image *pending,
 	ClusterRecoveryRelmapPendingTerminalV1 *out, ClusterRecoveryNativeInventoryDiag *diag);
+/* Original native counter fold, not an allocation/FullXid-era certificate.
+ * Replay the selected generation's complete native-redo suffix through the
+ * unchanged cold decoder/counter rules during one original physical reread.
+ * Keep the checkpoint seed and exact unique map's before/after/tail candidates.
+ * A nonmonotone or half-range-ambiguous candidate, or a pending FullXid outside
+ * that map-to-tail half-space, refuses. This necessary consistency check does
+ * not prove raw-ID non-reuse, historical retention or CLOG page lifetime.
+ * Synchronous full-census/decoder scratch work is not a bounded pending tick.
+ * No CLOG I/O, allocator publication, new scope, COMPLETE/OPEN or release.
+ * Output/caller-lock preconditions preserve custody; entered failure/ERROR
+ * revokes the original episode while retaining all original pins/debt. */
+/* Every native CLOG ZERO/TRUNCATE of this physical origin in the SAME
+ * complete selected set, including other generations and pages. Positions
+ * refer to the original immutable history source, never replay-set order.
+ * Only an event inside the actual selected native-redo counter suffix has
+ * observed before/after candidates; zero fields elsewhere mean UNKNOWN.
+ * Raw page/horizon and counter agreement prove neither birth era nor that
+ * truncation ran/completed. Retain all events as unresolved lifecycle input.
+ * Fixed-capacity overflow refuses the whole observation, never a prefix. */
+#define CLUSTER_RECOVERY_RELMAP_CLOG_HISTORY_MAX 128
+
+typedef struct ClusterRecoveryRelmapClogEventV1 {
+	uint32 source_index;
+	uint64 record_ordinal;
+	XLogRecPtr read_lsn, end_lsn;
+	uint32 record_crc;
+	ClusterRecoveryNativeKind kind;
+	int page;
+	TransactionId oldest_xact;
+	Oid oldest_database;
+	bool counter_observed;
+	uint64 counter_before, counter_after;
+} ClusterRecoveryRelmapClogEventV1;
+
+typedef struct ClusterRecoveryRelmapPendingXidV1 {
+	ClusterRecoveryRelmapHistoryEntryV1 history;
+	uint64 checkpoint_next, before_map, after_map, tail_next;
+	uint64 records, map_ordinal;
+	XLogRecPtr map_start, map_end;
+	uint32 clog_count;
+	ClusterRecoveryRelmapClogEventV1 clog[CLUSTER_RECOVERY_RELMAP_CLOG_HISTORY_MAX];
+} ClusterRecoveryRelmapPendingXidV1;
+extern bool cluster_recovery_relmap_history_pending_xid_v1(
+	ClusterRecoveryRelmapHistory *history, const ClusterRelmapV2Image *pending,
+	ClusterRecoveryRelmapPendingXidV1 *out, ClusterRecoveryNativeInventoryDiag *diag);
 extern void cluster_recovery_relmap_history_destroy_v1(ClusterRecoveryRelmapHistory **history);
 
 /* Borrow the original startup cold scope for two complete physical passes.
