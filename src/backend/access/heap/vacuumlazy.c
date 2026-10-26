@@ -928,39 +928,75 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
 /* Repair the original heap/VM inconsistency with one ordinary two-page
  * versioned FPI. The caller holds heap-X and its pre-lock SPACE identity;
  * acquire VM-X and capture both predecessors before changing either page.
+ * A refused conversion drops heap content ownership, but retains its pin.
+ * Return with heap-X held; callers must revalidate any earlier page proof.
  * Author: SqlRush <sqlrush@gmail.com> */
 static void
 lazy_clear_visibility_versioned(Relation rel, const ClusterSpaceIdentity *identity, Buffer heapbuf,
-								BlockNumber heapblk, Buffer vmbuf)
+								BlockNumber heapblk, Buffer *vmbuf)
 {
-	Buffer buffers[2] = { vmbuf, heapbuf };
+	Buffer buffers[2];
 	const uint8 ids[2] = { 0, 1 };
 	RfPageProducerBatchV1 versions;
+	ResourceXAuxiliaryAcquireContext context = {0};
 	XLogRecPtr recptr;
 
 	Assert(CritSectionCount == 0);
-	if (!BufferIsValid(vmbuf) || !visibilitymap_pin_ok(heapblk, vmbuf))
+	if (vmbuf == NULL || !BufferIsValid(*vmbuf) || !visibilitymap_pin_ok(heapblk, *vmbuf))
 		elog(ERROR, "shared visibility repair requires the exact VM buffer");
-	LockBuffer(vmbuf, BUFFER_LOCK_EXCLUSIVE);
+	while (!ClusterLockBufferExclusiveAuxiliaryAware(vmbuf, &context))
+	{
+		LockBuffer(heapbuf, BUFFER_LOCK_UNLOCK);
+		/* Warm VM-X without a content lock. A clean refusal may already
+		 * have released the VM pin; preserve its acquisition cursor. */
+		do
+		{
+			if (BufferIsValid(*vmbuf))
+				ReleaseBuffer(*vmbuf);
+			*vmbuf = InvalidBuffer;
+			CHECK_FOR_INTERRUPTS();
+			visibilitymap_pin(rel, heapblk, vmbuf);
+		} while (!ClusterLockBufferExclusiveAuxiliaryAware(vmbuf, &context));
+		LockBuffer(*vmbuf, BUFFER_LOCK_UNLOCK);
+
+		for (;;)
+		{
+			Buffer recent_vm = *vmbuf;
+
+			/* No VM pin may cross the heap-current wait. Re-pin only the
+			 * exact resident map under heap-X, without I/O or a grant. */
+			ReleaseBuffer(*vmbuf);
+			*vmbuf = InvalidBuffer;
+			LockBuffer(heapbuf, BUFFER_LOCK_EXCLUSIVE);
+			if (visibilitymap_pin_recent(rel, heapblk, recent_vm, vmbuf))
+				break;
+			LockBuffer(heapbuf, BUFFER_LOCK_UNLOCK);
+			CHECK_FOR_INTERRUPTS();
+			visibilitymap_pin(rel, heapblk, vmbuf);
+		}
+	}
+	/* A reobservation may have replaced the caller's original VM handle. */
+	buffers[0] = *vmbuf;
+	buffers[1] = heapbuf;
 	if (!cluster_space_prepare_buffer_versions(identity, buffers, ids, 2, &versions))
 		elog(ERROR, "shared visibility repair cannot capture exact page versions");
 	START_CRIT_SECTION();
 	if (!rf_page_producer_stamp_v1(&versions))
 		elog(PANIC, "shared visibility repair page versions changed before mutation");
 	PageClearAllVisible(BufferGetPage(heapbuf));
-	(void)visibilitymap_clear_locked(rel, heapblk, vmbuf, VISIBILITYMAP_VALID_BITS);
+	(void)visibilitymap_clear_locked(rel, heapblk, *vmbuf, VISIBILITYMAP_VALID_BITS);
 	MarkBufferDirty(heapbuf);
-	MarkBufferDirty(vmbuf);
+	MarkBufferDirty(*vmbuf);
 	XLogBeginInsert();
-	XLogRegisterBuffer(0, vmbuf, REGBUF_FORCE_IMAGE);
+	XLogRegisterBuffer(0, *vmbuf, REGBUF_FORCE_IMAGE);
 	XLogRegisterBuffer(1, heapbuf, REGBUF_FORCE_IMAGE | REGBUF_STANDARD);
 	if (!rf_page_producer_register_wal_v1(&versions))
 		elog(PANIC, "shared visibility repair cannot register page versions");
 	recptr = XLogInsert(RM_XLOG_ID, XLOG_FPI);
 	PageSetLSN(BufferGetPage(heapbuf), recptr);
-	PageSetLSN(BufferGetPage(vmbuf), recptr);
+	PageSetLSN(BufferGetPage(*vmbuf), recptr);
 	END_CRIT_SECTION();
-	LockBuffer(vmbuf, BUFFER_LOCK_UNLOCK);
+	LockBuffer(*vmbuf, BUFFER_LOCK_UNLOCK);
 }
 
 /*
@@ -1500,7 +1536,7 @@ lazy_scan_heap(LVRelState *vacrel)
 #ifdef USE_PGRAC_CLUSTER
 			if (vacrel->versioned)
 				lazy_clear_visibility_versioned(vacrel->rel, &vacrel->identity, buf, blkno,
-												vmbuffer);
+												&vmbuffer);
 			else
 #endif
 				visibilitymap_clear(vacrel->rel, blkno, vmbuffer, VISIBILITYMAP_VALID_BITS);
@@ -1528,7 +1564,7 @@ lazy_scan_heap(LVRelState *vacrel)
 #ifdef USE_PGRAC_CLUSTER
 			if (vacrel->versioned)
 				lazy_clear_visibility_versioned(vacrel->rel, &vacrel->identity, buf, blkno,
-												vmbuffer);
+												&vmbuffer);
 			else
 #endif
 			{

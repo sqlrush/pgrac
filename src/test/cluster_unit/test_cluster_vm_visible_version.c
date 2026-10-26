@@ -131,12 +131,27 @@ static unsigned repair_error_at;
 static Buffer repair_vm_handle;
 static ResourceXAuxiliaryAcquireContext *repair_context;
 static PGAlignedBlock repair_current;
+/* Two-page repair retains its original heap pin across a content-lock
+ * handoff; no VM pin may survive a resumed heap-X acquisition. */
+static bool pair_fixture, pair_retain_pin, pair_aux_driving, pair_caught;
+static bool pair_cancel_refusal, pair_cancel_miss, pair_peer_change;
+static unsigned pair_refusals, pair_attempts, pair_pin_calls, pair_unpins;
+static unsigned pair_repins, pair_repin_misses, pair_heap_waits, pair_heap_unlocks;
+static unsigned pair_warm_success, pair_nested_success, pair_error_at, pair_reobserves;
+static Buffer pair_vm_handle;
+static ResourceXAuxiliaryAcquireContext *pair_context;
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
 volatile sig_atomic_t InterruptPending;
 void
 ProcessInterrupts(void)
 {
+	if (pair_fixture) {
+		UT_ASSERT(pinned[0] && !held[0] && !held[1] && !pinned[1]);
+		UT_ASSERT(pair_cancel_refusal || pair_cancel_miss);
+		InterruptPending = false;
+		elog(ERROR, "controlled cancellation at unlocked two-page repair retry");
+	}
 	if (repair_retry_fixture) {
 		UT_ASSERT(repair_cancel && !repair_pinned && !repair_locked);
 		InterruptPending = false;
@@ -279,6 +294,38 @@ visibilitymap_pin_ok(BlockNumber block, Buffer buffer)
 void
 LockBuffer(Buffer buffer, int mode)
 {
+	if (pair_fixture) {
+		UT_ASSERT(buffer == 1 || buffer == 2);
+		UT_ASSERT_EQ(CritSectionCount, 0);
+		if (mode == BUFFER_LOCK_UNLOCK) {
+			UT_ASSERT(held[buffer - 1]);
+			held[buffer - 1] = writer[buffer - 1] = false;
+			if (buffer == 1) {
+				pair_heap_unlocks++;
+				if (pair_peer_change) {
+					((PageHeader)pages[0].data)->pd_block_scn = 60;
+					((PageHeader)pages[1].data)->pd_block_scn = 70;
+					PageSetAllVisible(pages[0].data);
+					pages[0].data[BLCKSZ - 1] = 51;
+					memcpy(before, pages, sizeof(pages));
+					pair_peer_change = false;
+				}
+			}
+		} else {
+			UT_ASSERT_EQ(mode, BUFFER_LOCK_EXCLUSIVE);
+			UT_ASSERT(pinned[buffer - 1] && !held[buffer - 1]);
+			if (buffer == 1) {
+				UT_ASSERT(!held[1] && !pinned[1]);
+				pair_heap_waits++;
+			} else if (!pair_aux_driving && pair_refusals != 0) {
+				/* The ordinary nested API reports a barrier refusal as an
+				 * error rather than returning a replaceable handle. */
+				elog(ERROR, "ordinary nested VM lock cannot return a clean refusal");
+			}
+			held[buffer - 1] = writer[buffer - 1] = true;
+		}
+		return;
+	}
 	if (repair_retry_fixture) {
 		UT_ASSERT_EQ(buffer, 2);
 		UT_ASSERT_EQ(CritSectionCount, 0);
@@ -343,6 +390,8 @@ log_newpage_buffer(Buffer buffer, bool standard)
 SCN
 cluster_scn_advance(void)
 {
+	if (pair_fixture)
+		UT_ASSERT(held[0] && held[1] && pinned[0] && pinned[1]);
 	UT_ASSERT_EQ(CritSectionCount, 0);
 	UT_ASSERT(memcmp(pages, before, sizeof(pages)) == 0);
 	return ++next_token;
@@ -412,6 +461,16 @@ vm_readbuf(Relation rel, BlockNumber block, bool extend)
 void
 ReleaseBuffer(Buffer buffer)
 {
+	if (pair_fixture) {
+		UT_ASSERT(buffer == 1 || buffer == 2);
+		UT_ASSERT(pinned[buffer - 1] && !held[buffer - 1]);
+		pinned[buffer - 1] = false;
+		if (buffer == 2) {
+			pair_unpins++;
+			pair_vm_handle = InvalidBuffer;
+		}
+		return;
+	}
 	if (repair_retry_fixture) {
 		UT_ASSERT_EQ(buffer, 2);
 		UT_ASSERT(repair_pinned && !repair_locked);
@@ -442,6 +501,50 @@ LockBufferForCleanup(Buffer buffer)
 bool
 ClusterLockBufferExclusiveAuxiliaryAware(Buffer *buffer, ResourceXAuxiliaryAcquireContext *context)
 {
+	if (pair_fixture) {
+		UT_ASSERT(context != NULL && pinned[0] && pinned[1] && !held[1]);
+		UT_ASSERT_EQ(*buffer, 2);
+		UT_ASSERT_EQ(CritSectionCount, 0);
+		pair_attempts++;
+		if (!context->active) {
+			UT_ASSERT_EQ(pair_reobserves, 0);
+			pair_context = context;
+			context->active = true;
+			context->absolute_deadline_us = 81;
+			context->diagnostic_request_sequence = 91;
+		} else {
+			UT_ASSERT(context == pair_context);
+			UT_ASSERT_EQ(context->absolute_deadline_us, 81);
+			UT_ASSERT_EQ(context->diagnostic_request_sequence, 91);
+			UT_ASSERT_EQ(context->reobserve_count, pair_reobserves);
+		}
+		if (pair_attempts == pair_error_at)
+			elog(ERROR, "controlled two-page repair acquisition failure");
+		if (pair_refusals != 0) {
+			pair_refusals--;
+			context->reobserve = !pair_retain_pin;
+			if (!pair_retain_pin) {
+				context->reobserve_count = ++pair_reobserves;
+				ReleaseBuffer(*buffer);
+				*buffer = InvalidBuffer;
+				pair_vm_handle = InvalidBuffer;
+				fixture_locators[1].relNumber++;
+			}
+			if (pair_cancel_refusal)
+				InterruptPending = true;
+			return false;
+		}
+		if (held[0])
+			pair_nested_success++;
+		else
+			pair_warm_success++;
+		pair_aux_driving = true;
+		LockBuffer(*buffer, BUFFER_LOCK_EXCLUSIVE);
+		pair_aux_driving = false;
+		memset(context, 0, sizeof(*context));
+		pair_reobserves = 0;
+		return true;
+	}
 	if (repair_retry_fixture) {
 		UT_ASSERT(context != NULL && repair_pinned && !repair_locked);
 		UT_ASSERT_EQ(*buffer, 2);
@@ -483,6 +586,10 @@ ClusterLockBufferExclusiveAuxiliaryAware(Buffer *buffer, ResourceXAuxiliaryAcqui
 		return true;
 	}
 	if (repairing_vm_only) {
+		LockBuffer(*buffer, BUFFER_LOCK_EXCLUSIVE);
+		return true;
+	}
+	if (repairing && !empty_fixture) {
 		LockBuffer(*buffer, BUFFER_LOCK_EXCLUSIVE);
 		return true;
 	}
@@ -545,6 +652,21 @@ ClusterUnlockBufferAfterConditionalMutation(Buffer buffer)
 bool
 visibilitymap_pin_recent(Relation rel, BlockNumber block, Buffer recent, Buffer *buffer)
 {
+	if (pair_fixture) {
+		UT_ASSERT(rel == &relation && block == 0 && recent == 2);
+		UT_ASSERT(held[0] && pinned[0] && !held[1] && !pinned[1]);
+		UT_ASSERT_EQ(*buffer, InvalidBuffer);
+		pair_repins++;
+		if (pair_repin_misses != 0) {
+			pair_repin_misses--;
+			if (pair_cancel_miss)
+				InterruptPending = true;
+			return false;
+		}
+		pinned[1] = true;
+		*buffer = pair_vm_handle = 2;
+		return true;
+	}
 	UT_ASSERT(empty_fixture && rel == &relation && block == 0 && recent == 2);
 	UT_ASSERT(held[0] && !held[1] && !pinned[1]);
 	empty_repins++;
@@ -583,6 +705,17 @@ RecordPageWithFreeSpace(Relation rel, BlockNumber block, Size space)
 void
 visibilitymap_pin(Relation rel, BlockNumber block, Buffer *buffer)
 {
+	if (pair_fixture) {
+		UT_ASSERT(rel == &relation && block == 0);
+		UT_ASSERT(pinned[0] && !held[0] && !held[1] && !pinned[1]);
+		UT_ASSERT_EQ(*buffer, InvalidBuffer);
+		UT_ASSERT_EQ(CritSectionCount, 0);
+		pair_pin_calls++;
+		pinned[1] = true;
+		fixture_locators[1] = relation.rd_locator;
+		*buffer = pair_vm_handle = 2;
+		return;
+	}
 	UT_ASSERT(rel == &relation);
 	UT_ASSERT_EQ(block, 0);
 	UT_ASSERT(!BufferIsValid(*buffer) || *buffer == 2);
@@ -617,6 +750,7 @@ run_set(Relation rel, BlockNumber heapBlk, Buffer heapBuf, XLogRecPtr recptr, Bu
 
 	static void reset(bool shared, bool visible, uint8 vm_bits)
 {
+	pair_fixture = false;
 	empty_fixture = false;
 	repair_retry_fixture = false;
 	memset(&relation, 0, sizeof(relation));
@@ -826,6 +960,8 @@ run_actual_visibility_repair(bool lpdead)
 	} else {
 #include "test_cluster_vm_repair_missing_heap.inc"
 	}
+	if (pair_fixture)
+		pair_vm_handle = vmbuffer;
 	repairing = false;
 }
 
@@ -1676,10 +1812,184 @@ UT_TEST(test_vm_only_repair_error_preserves_only_the_callers_current_pin)
 	}
 }
 
+
+static void
+setup_pair_repair(bool lpdead, bool retain_pin, unsigned refusals)
+{
+	reset(true, lpdead, VISIBILITYMAP_VALID_BITS | (VISIBILITYMAP_VALID_BITS << 2));
+	pair_fixture = true;
+	memset(held, 0, sizeof(held));
+	memset(pinned, 0, sizeof(pinned));
+	memset(writer, 0, sizeof(writer));
+	pinned[0] = pinned[1] = held[0] = writer[0] = true;
+	pair_retain_pin = retain_pin;
+	pair_aux_driving = pair_caught = false;
+	pair_cancel_refusal = pair_cancel_miss = pair_peer_change = false;
+	pair_refusals = refusals;
+	pair_attempts = pair_pin_calls = pair_unpins = pair_repins = pair_repin_misses = 0;
+	pair_heap_waits = pair_heap_unlocks = pair_warm_success = pair_nested_success = 0;
+	pair_error_at = pair_reobserves = 0;
+	pair_vm_handle = 2;
+	pair_context = NULL;
+	InterruptPending = false;
+}
+
+static void
+run_pair_repair(bool lpdead)
+{
+	expecting_error = true;
+	if (setjmp(error_jump) == 0)
+		run_actual_visibility_repair(lpdead);
+	else
+		pair_caught = true;
+	expecting_error = false;
+}
+
+static void
+release_pair_repair(void)
+{
+	for (int i = 0; i < 2; i++) {
+		if (held[i])
+			LockBuffer(i + 1, BUFFER_LOCK_UNLOCK);
+		if (pinned[i])
+			ReleaseBuffer(i + 1);
+	}
+}
+
+static void
+check_pair_repair(uint64 heap_before, uint64 vm_before)
+{
+	UT_ASSERT(!pair_caught);
+	UT_ASSERT(held[0] && pinned[0] && !held[1] && pinned[1]);
+	UT_ASSERT_EQ(pair_vm_handle, 2);
+	UT_ASSERT_EQ(assertion_failures, 0);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT_EQ(inserts, 1);
+	UT_ASSERT_EQ(edge_count, 2);
+	UT_ASSERT_EQ(edge_token, 101);
+	UT_ASSERT_EQ(edges[0].before.mutation_token, vm_before);
+	UT_ASSERT_EQ(edges[1].before.mutation_token, heap_before);
+	UT_ASSERT_EQ(next_token, 101);
+	UT_ASSERT(!PageIsAllVisible(pages[0].data));
+	UT_ASSERT_EQ(*PageGetContents(pages[1].data), VISIBILITYMAP_VALID_BITS << 2);
+	for (int i = 0; i < 2; i++) {
+		/* clear_locked and the outer repair both dirty the VM. */
+		UT_ASSERT_EQ(dirty[i], i == 0 ? 1 : 2);
+		UT_ASSERT_EQ(registered[i], 1);
+		UT_ASSERT_EQ(((PageHeader)pages[i].data)->pd_block_scn, 101);
+		UT_ASSERT_EQ(PageGetLSN(pages[i].data), UINT64_C(0x9000));
+	}
+	UT_ASSERT_EQ(register_flags[0], REGBUF_FORCE_IMAGE);
+	UT_ASSERT_EQ(register_flags[1], REGBUF_FORCE_IMAGE | REGBUF_STANDARD);
+}
+
+UT_TEST(test_pair_repair_reobserves_with_original_heap_pin)
+{
+	for (unsigned lpdead = 0; lpdead < 2; lpdead++) {
+		for (unsigned retain = 0; retain < 2; retain++) {
+			for (unsigned refusals = 0; refusals <= 4; refusals += refusals == 0 ? 1 : 3) {
+				setup_pair_repair(lpdead != 0, retain != 0, refusals);
+				run_pair_repair(lpdead != 0);
+				check_pair_repair(20, 30);
+				UT_ASSERT_EQ(pair_attempts, refusals == 0 ? 1 : refusals + 2);
+				UT_ASSERT_EQ(pair_heap_waits, refusals == 0 ? 0 : 1);
+				UT_ASSERT_EQ(pair_heap_unlocks, pair_heap_waits);
+				UT_ASSERT_EQ(pair_warm_success, refusals == 0 ? 0 : 1);
+				UT_ASSERT_EQ(pair_nested_success, 1);
+				UT_ASSERT_EQ(pair_pin_calls, refusals);
+				UT_ASSERT_EQ(pair_unpins, refusals == 0 ? 0 : refusals + 1);
+				release_pair_repair();
+			}
+		}
+	}
+}
+
+UT_TEST(test_pair_repair_resident_misses_release_heap_before_vm_io)
+{
+	for (unsigned lpdead = 0; lpdead < 2; lpdead++) {
+		for (unsigned misses = 1; misses <= 3; misses += 2) {
+			setup_pair_repair(lpdead != 0, false, 1);
+			pair_repin_misses = misses;
+			run_pair_repair(lpdead != 0);
+			check_pair_repair(20, 30);
+			UT_ASSERT_EQ(pair_attempts, 3);
+			UT_ASSERT_EQ(pair_repins, misses + 1);
+			UT_ASSERT_EQ(pair_heap_waits, misses + 1);
+			UT_ASSERT_EQ(pair_heap_unlocks, misses + 1);
+			UT_ASSERT_EQ(pair_pin_calls, misses + 1);
+			UT_ASSERT_EQ(pair_unpins, misses + 2);
+			release_pair_repair();
+		}
+	}
+}
+
+UT_TEST(test_pair_repair_captures_only_fresh_two_page_predecessors)
+{
+	for (unsigned lpdead = 0; lpdead < 2; lpdead++) {
+		setup_pair_repair(lpdead != 0, false, 1);
+		pair_peer_change = true;
+		run_pair_repair(lpdead != 0);
+		check_pair_repair(60, 70);
+		UT_ASSERT(!pair_peer_change);
+		UT_ASSERT_EQ(pages[0].data[BLCKSZ - 1], 51);
+		UT_ASSERT_EQ(images[1].data[BLCKSZ - 1], 51);
+		release_pair_repair();
+	}
+}
+
+UT_TEST(test_pair_repair_cancel_keeps_only_original_heap_pin)
+{
+	for (unsigned at_miss = 0; at_miss < 2; at_miss++) {
+		for (unsigned retain = 0; retain < 2; retain++) {
+			setup_pair_repair(true, retain != 0, 1);
+			pair_cancel_refusal = at_miss == 0;
+			pair_cancel_miss = at_miss != 0;
+			pair_repin_misses = at_miss;
+			run_pair_repair(true);
+			UT_ASSERT(pair_caught && !InterruptPending);
+			UT_ASSERT(pinned[0] && !held[0] && !pinned[1] && !held[1]);
+			UT_ASSERT_EQ(pair_vm_handle, InvalidBuffer);
+			UT_ASSERT_EQ(pair_attempts, at_miss == 0 ? 1 : 2);
+			UT_ASSERT_EQ(pair_heap_waits, at_miss);
+			UT_ASSERT_EQ(pair_pin_calls, at_miss);
+			UT_ASSERT_EQ(assertion_failures, 0);
+			UT_ASSERT_EQ(CritSectionCount, 0);
+			UT_ASSERT_EQ(next_token, 100);
+			UT_ASSERT_EQ(inserts + edge_count + dirty[0] + dirty[1], 0);
+			UT_ASSERT_EQ(memcmp(pages, before, sizeof(pages)), 0);
+			release_pair_repair();
+		}
+	}
+}
+
+UT_TEST(test_pair_repair_error_or_unknown_version_precedes_mutation)
+{
+	for (unsigned at_capture = 0; at_capture < 2; at_capture++) {
+		for (unsigned lpdead = 0; lpdead < 2; lpdead++) {
+			setup_pair_repair(lpdead != 0, false, 1);
+			if (at_capture != 0) {
+				((PageHeader)pages[0].data)->pd_block_scn = 0;
+				memcpy(before, pages, sizeof(pages));
+			} else
+				pair_error_at = 2;
+			run_pair_repair(lpdead != 0);
+			UT_ASSERT(pair_caught && pinned[0] && pinned[1]);
+			UT_ASSERT_EQ(held[0], at_capture != 0);
+			UT_ASSERT_EQ(held[1], at_capture != 0);
+			UT_ASSERT_EQ(assertion_failures, 0);
+			UT_ASSERT_EQ(CritSectionCount, 0);
+			UT_ASSERT_EQ(next_token, 100);
+			UT_ASSERT_EQ(inserts + edge_count + dirty[0] + dirty[1], 0);
+			UT_ASSERT_EQ(memcmp(pages, before, sizeof(pages)), 0);
+			release_pair_repair();
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(37);
+	UT_PLAN(42);
 	UT_RUN(test_visible_exact_two_page_batch);
 	UT_RUN(test_no_change_allocates_no_version);
 	UT_RUN(test_nonshared_preserves_native_hint_lsn_rules);
@@ -1717,6 +2027,11 @@ main(void)
 	UT_RUN(test_vm_only_repair_rechecks_clear_after_refetch_without_wal);
 	UT_RUN(test_vm_only_repair_cancel_stops_before_next_pin_or_mutation);
 	UT_RUN(test_vm_only_repair_error_preserves_only_the_callers_current_pin);
+	UT_RUN(test_pair_repair_reobserves_with_original_heap_pin);
+	UT_RUN(test_pair_repair_resident_misses_release_heap_before_vm_io);
+	UT_RUN(test_pair_repair_captures_only_fresh_two_page_predecessors);
+	UT_RUN(test_pair_repair_cancel_keeps_only_original_heap_pin);
+	UT_RUN(test_pair_repair_error_or_unknown_version_precedes_mutation);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
