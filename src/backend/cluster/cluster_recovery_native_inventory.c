@@ -19,7 +19,9 @@
 #include "cluster/cluster_side_undo.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "miscadmin.h"
+#include "postmaster/interrupt.h"
 #include "replication/origin.h"
+#include "storage/lwlock.h"
 
 #define INVENTORY_SEED_TICK 128
 
@@ -60,6 +62,7 @@ struct ClusterRecoveryNativeInventory {
 	NativeInventoryRecord *tail;
 	NativeInventoryRecord *cursor;
 	NativeInventoryPage *pages, *pages_tail, *page_cursor;
+	RfPageOnlinePlanV1 *page_build; /* private, only during an explicit physical recheck */
 	uint32 page_count;
 	ClusterRecoveryRootSet *roots; /* borrowed; no further access after collection */
 	pg_cryptohash_ctx *hash;
@@ -484,6 +487,56 @@ inventory_source(const ClusterWalSourceRef *source, const RfContributorStreamCut
 }
 
 static RfPageProofDetailV1
+inventory_page_rebuildable(void *arg, const RfOpcodeRouteV1 *route,
+	const RfPageVersionEdgeEntryV1 *edge, const DecodedBkpBlock *block)
+{
+	(void)arg;
+	return route != NULL && route->record_owner == RF_ROUTE_OWNER_PAGE_CODEC
+		&& edge != NULL && block != NULL && block->in_use
+		&& edge->page_class == RF_PAGE_CLASS_REBUILDABLE_FSM
+		? RF_PAGE_PROOF_DETAIL_OK : RF_PAGE_PROOF_DETAIL_CLASS_UNKNOWN;
+}
+
+static RfPageProofDetailV1
+inventory_page_plan_feed(ClusterRecoveryNativeInventory *work, XLogReaderState *reader)
+{
+	const NativeInventorySource *source = &work->sources[work->source_cursor];
+	RfDetachedRecordPlanV1 detached = {0};
+	RfPageOnlineRecordIdentityV1 identity = {0};
+	RfPageProofDetailV1 detail;
+
+	if (reader->record->has_page_version_edge) {
+		RfDetachedOwnerOpsV1 ops = {0};
+
+		/* A class label cannot qualify a SIDE component. Only the original
+		 * PAGE codecs and independently rebuildable FSM inputs belong here. */
+		ops.preflight_rebuildable_component = inventory_page_rebuildable;
+		detail = rf_page_detached_preflight_v1(reader, true, &ops, &detached);
+		if (detail != RF_PAGE_PROOF_DETAIL_OK)
+			return detail;
+	} else {
+		/* Advance the COMPLETE physical transcript through native/control
+		 * tails too. This zero-component projection neither executes nor
+		 * qualifies SIDE effects. Never hide an unversioned block reference. */
+		if (reader->record->max_block_id >= 0)
+			return RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE;
+		detached.source_record = reader;
+		detached.preflight_complete = true;
+	}
+	identity.record.system_identifier = source->source.claim.identity.system_identifier;
+	memcpy(identity.record.storage_uuid, source->source.claim.identity.storage_uuid, 16);
+	identity.record.origin_thread = source->cut.failed_thread;
+	identity.record.timeline_id = source->cut.timeline_id;
+	identity.record.read_rec_ptr = reader->ReadRecPtr;
+	identity.record.end_rec_ptr = reader->EndRecPtr;
+	identity.record.record_crc = (uint32)reader->record->header.xl_crc;
+	identity.record.rmid = reader->record->header.xl_rmid;
+	identity.record.info = reader->record->header.xl_info;
+	identity.participant_index = (uint16)work->source_cursor;
+	return rf_page_online_plan_queue_record_v1(work->page_build, &detached, &identity);
+}
+
+static RfPageProofDetailV1
 inventory_record(XLogReaderState *reader, const ClusterWalSourceRef *source,
 				 const RfContributorStreamCutV1 *cut, void *arg)
 {
@@ -517,6 +570,15 @@ inventory_record(XLogReaderState *reader, const ClusterWalSourceRef *source,
 					RF_PAGE_PROOF_DETAIL_SOURCE_GAP);
 			work->page_cursor = page->next;
 		}
+	}
+	if (work->page_build != NULL) {
+		RfPageProofDetailV1 detail = inventory_page_plan_feed(work, reader);
+
+		if (detail != RF_PAGE_PROOF_DETAIL_OK)
+			return inventory_refuse(work,
+				detail == RF_PAGE_PROOF_DETAIL_CAPACITY || detail == RF_PAGE_PROOF_DETAIL_OOM
+					? CLUSTER_RECOVERY_NATIVE_INVENTORY_CAPACITY
+					: CLUSTER_RECOVERY_NATIVE_INVENTORY_UNSUPPORTED, detail);
 	}
 	if (work->pass == 0 && work->roots != NULL) {
 		ClusterRecoveryWalTargetsDiag targets;
@@ -810,6 +872,135 @@ cluster_recovery_native_inventory_recheck(ClusterWalInputsV1 *inputs,
 		inventory_revoke_dependents(inventory);
 	*diag = inventory->diag;
 	return inventory->status;
+}
+
+static void
+inventory_page_lock_held(LWLock *lock, LWLockMode mode, void *arg)
+{
+	(void)lock;
+	(void)mode;
+	*(bool *)arg = true;
+}
+
+ClusterRecoveryPagePlanBuildV1
+cluster_recovery_native_inventory_page_plan_v1(ClusterWalInputsV1 *inputs,
+	ClusterRecoveryNativeInventory *inventory, Size memory_budget)
+{
+	typedef struct PageBuild {
+		RfPageOnlinePlanV1 *plan;
+		RfPageProofDetailV1 detail;
+		ClusterRecoveryNativeInventoryDiag diag;
+	} PageBuild;
+	ClusterRecoveryPagePlanBuildV1 result = {NULL, RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT};
+	RfPageOnlinePlanRequestV1 request = {0};
+	PageBuild *build;
+	ClusterWalSourceRef *sources;
+	RfContributorStreamCutV1 *cuts;
+	XLogRecPtr *redo;
+	Size bytes, budget = memory_budget == 0 ? RF_PAGE_ONLINE_PLAN_MAX_BYTES : memory_budget;
+	uint32 count;
+	bool held = false;
+
+	if (inputs == NULL || inventory == NULL || !inventory->complete
+		|| inventory->status != CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED
+		|| inventory->page_build != NULL || CritSectionCount != 0 || ShutdownRequestPending)
+		return result;
+	/* No physical/ROOT I/O or native owner snapshot under caller PAGE/content
+	 * protection, including a caller with no temporary LWLock headroom. */
+	ForEachLWLockHeldByMe(inventory_page_lock_held, &held);
+	if (held) {
+		result.detail = RF_PAGE_PROOF_DETAIL_WOULD_BLOCK;
+		return result;
+	}
+	count = inventory->source_count;
+	if (count == 0 || count > RF_PAGE_STABLE_MAX_PARTICIPANTS || inventory->sources == NULL)
+		return result;
+	bytes = MAXALIGN(sizeof(*build)) + count * (MAXALIGN(sizeof(*sources))
+		+ MAXALIGN(sizeof(*cuts)) + MAXALIGN(sizeof(*redo)));
+	if (budget > RF_PAGE_ONLINE_PLAN_MAX_BYTES || budget <= bytes) {
+		result.detail = RF_PAGE_PROOF_DETAIL_CAPACITY;
+		return result;
+	}
+	build = calloc(1, bytes);
+	if (build == NULL) {
+		result.detail = RF_PAGE_PROOF_DETAIL_OOM;
+		return result;
+	}
+	sources = (ClusterWalSourceRef *)((char *)build + MAXALIGN(sizeof(*build)));
+	cuts = (RfContributorStreamCutV1 *)((char *)sources + count * MAXALIGN(sizeof(*sources)));
+	redo = (XLogRecPtr *)((char *)cuts + count * MAXALIGN(sizeof(*cuts)));
+	build->detail = RF_PAGE_PROOF_DETAIL_OK;
+	PG_TRY();
+	{
+		for (uint32 i = 0; i < count; i++) {
+			const NativeInventorySource *saved = &inventory->sources[i];
+			const ClusterWalInputV1 *input = &saved->history.input;
+
+			sources[i] = saved->source; cuts[i] = saved->cut;
+			if (!inventory_source_equal(&sources[i], &input->source)) {
+				build->detail = RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+				break;
+			}
+			if (input->kind == CLUSTER_WAL_INPUT_CHECKPOINT && saved->history.checkpoint_observed)
+				redo[i] = input->native_redo;
+			else if (input->kind == CLUSTER_WAL_INPUT_INITIALIZER_TERMINAL)
+				redo[i] = cuts[i].scan_end_exclusive;
+			else {
+				build->detail = RF_PAGE_PROOF_DETAIL_SOURCE_GAP;
+				break;
+			}
+		}
+		if (build->detail == RF_PAGE_PROOF_DETAIL_OK) {
+			request.system_identifier = sources[0].claim.identity.system_identifier;
+			memcpy(request.storage_uuid, sources[0].claim.identity.storage_uuid, 16);
+			request.physical_cuts = cuts; request.redo_starts = redo;
+			request.participant_count = count;
+			/* Pure input binding only, never a native authority cookie. */
+			request.retention_binding_cookie = (uint64)(uintptr_t)inventory;
+			request.memory_budget = budget - bytes;
+			build->detail = rf_page_online_plan_create_v1(&request, &build->plan);
+		}
+		if (build->detail == RF_PAGE_PROOF_DETAIL_OK
+			&& !rf_page_online_plan_bind_sources_v1(build->plan, sources, count))
+			build->detail = RF_PAGE_PROOF_DETAIL_CAPACITY;
+		if (build->detail == RF_PAGE_PROOF_DETAIL_OK) {
+			/* The original physical reread compares every full-generation
+			 * source, checkpoint, tail, transcript and saved native/PAGE record.
+			 * Its existing cursor restoration preserves native effect iteration. */
+			inventory->page_build = build->plan;
+			if (cluster_recovery_native_inventory_recheck(inputs, inventory, &build->diag)
+				!= CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED)
+				build->detail = build->diag.input_detail != RF_PAGE_PROOF_DETAIL_OK
+					? build->diag.input_detail : RF_PAGE_PROOF_DETAIL_SOURCE_GAP;
+			inventory->page_build = NULL;
+		}
+		if (build->detail == RF_PAGE_PROOF_DETAIL_OK)
+			build->detail = rf_page_online_plan_seal_v1(build->plan);
+	}
+	PG_CATCH();
+	{
+		inventory->page_build = NULL;
+		inventory->complete = false;
+		(void)inventory_refuse(inventory, CLUSTER_RECOVERY_NATIVE_INVENTORY_INVALID,
+			RF_PAGE_PROOF_DETAIL_SOURCE_GAP);
+		rf_page_online_plan_destroy_v1(&build->plan);
+		free(build);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	result.detail = build->detail;
+	if (result.detail == RF_PAGE_PROOF_DETAIL_OK)
+		result.plan = build->plan;
+	else {
+		inventory->complete = false;
+		(void)inventory_refuse(inventory,
+			result.detail == RF_PAGE_PROOF_DETAIL_CAPACITY || result.detail == RF_PAGE_PROOF_DETAIL_OOM
+				? CLUSTER_RECOVERY_NATIVE_INVENTORY_CAPACITY : CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED,
+			result.detail);
+		rf_page_online_plan_destroy_v1(&build->plan);
+	}
+	free(build);
+	return result;
 }
 
 ClusterRecoveryNativeInventoryResult

@@ -166,6 +166,27 @@ typedef struct ClusterRecoveryNativeInventoryDiag {
 
 typedef struct ClusterRecoveryNativeInventory ClusterRecoveryNativeInventory;
 
+typedef struct ClusterRecoveryPagePlanBuildV1 {
+	RfPageOnlinePlanV1 *plan;
+	RfPageProofDetailV1 detail;
+} ClusterRecoveryPagePlanBuildV1;
+
+/* Before PAGE/content locks, build a caller-owned immutable PAGE input graph
+ * by rereading every original physical source/cut and comparing its complete
+ * saved metadata, tail and transcript. All generations and explicit empty
+ * sources remain bound; native redo comes from the same original checkpoint.
+ * Non-PAGE records advance full-cut coverage only, never SIDE qualification.
+ * memory_budget bounds the additional private build/plan allocation; zero
+ * uses RF_PAGE_ONLINE_PLAN_MAX_BYTES. Existing inventory memory is separate.
+ * Caller-held LWLocks refuse before allocation or I/O, preserving the input.
+ * Destroy the returned plan with rf_page_online_plan_destroy_v1. Retain and
+ * revalidate original inventory/scope/native owners before any authority use.
+ * Refusal/ERROR after entry invalidates the inventory and frees only private
+ * output; it never releases original custody or supplies PAGE/DATA rights,
+ * physical-target coverage, discharge, COMPLETE or OPEN. */
+extern ClusterRecoveryPagePlanBuildV1 cluster_recovery_native_inventory_page_plan_v1(
+	ClusterWalInputsV1 *inputs, ClusterRecoveryNativeInventory *inventory, Size memory_budget);
+
 /* Original complete two-pass observation, including sources with no PAGE
  * records and explicit empty terminals. The transcript covers every record
  * family in the exact full cut. source_index is the physical census/PAGE WAL
