@@ -66,6 +66,12 @@ static bool fixture_storage;
 static int fixture_smgr, fixture_pins, fixture_locks;
 static int fixture_vm_pins;
 static unsigned fixture_reads, fixture_vm_acquires, fixture_vm_releases;
+static unsigned fixture_vm_heap_reads, fixture_vm_heap_locks, fixture_vm_prepare_with_heap;
+static unsigned fixture_vm_repin_calls, fixture_vm_repins, fixture_vm_repin_misses;
+static unsigned fixture_cleanup_waits, fixture_interrupt_checks;
+static bool fixture_vm_miss_cleanup_only, fixture_vm_miss_read_error, fixture_cancel_on_retry;
+static Relation fixture_vm_relation;
+static BlockNumber fixture_vm_block;
 static unsigned fixture_vm_observations;
 static bool fixture_vm_coherent_ok, fixture_vm_repair_unlocked;
 static uint8 fixture_vm_bits;
@@ -160,6 +166,7 @@ fixture_prepare_page(const ClusterHeapFreezePageInputV1 *input, ClusterHeapFreez
 static LVRelState state;
 static RelationData relation;
 static FormData_pg_class form;
+static const ClusterHeapFreezePageBatchV1 *prepared_batch(void);
 static union {
 	max_align_t alignment;
 	char bytes[sizeof(VacDeadItems) + 2 * MaxHeapTuplesPerPage * sizeof(ItemPointerData)];
@@ -206,6 +213,12 @@ setup(bool cleanup)
 	fixture_pins = fixture_locks = 0;
 	fixture_vm_pins = 0;
 	fixture_reads = fixture_vm_acquires = fixture_vm_releases = 0;
+	fixture_vm_heap_reads = fixture_vm_heap_locks = fixture_vm_prepare_with_heap = 0;
+	fixture_vm_repin_calls = fixture_vm_repins = fixture_vm_repin_misses = 0;
+	fixture_cleanup_waits = fixture_interrupt_checks = 0;
+	fixture_vm_miss_cleanup_only = fixture_vm_miss_read_error = fixture_cancel_on_retry = false;
+	fixture_vm_relation = NULL;
+	fixture_vm_block = InvalidBlockNumber;
 	fixture_vm_observations = 0;
 	fixture_vm_coherent_ok = fixture_vm_repair_unlocked = false;
 	fixture_vm_bits = 0;
@@ -306,6 +319,137 @@ UT_TEST(coherent_positive_repairs_only_after_heap_ownership_is_released)
 		UT_ASSERT_EQ(state.NewRelminMxid, InvalidMultiXactId);
 		UT_ASSERT_EQ(fixture_pins + fixture_locks + fixture_vm_pins, 0);
 		UT_ASSERT(!PageIsAllVisible((Page)fixture_pages[0].data));
+	}
+}
+
+UT_TEST(shared_heap_waits_carry_no_vm_pin)
+{
+	for (unsigned cleanup = 0; cleanup < 2; cleanup++) {
+		setup(cleanup);
+		make_page(0, false, 33);
+		lazy_scan_heap(&state);
+		UT_ASSERT_EQ(fixture_vm_heap_reads + fixture_vm_heap_locks, 0);
+		UT_ASSERT_EQ(fixture_vm_prepare_with_heap, 0);
+		UT_ASSERT_EQ(fixture_reads, 1);
+		UT_ASSERT_EQ(fixture_vm_repin_calls, 1);
+		UT_ASSERT_EQ(fixture_vm_repins, 1);
+		UT_ASSERT_EQ(fixture_prepares, 1);
+		UT_ASSERT_EQ(fixture_prepare_held_mask, 0);
+		UT_ASSERT_EQ(fixture_pins + fixture_locks + fixture_vm_pins, 0);
+	}
+}
+
+UT_TEST(shared_vm_repin_misses_retry_before_processing_the_same_page)
+{
+	for (unsigned cleanup = 0; cleanup < 2; cleanup++)
+		for (unsigned misses = 1; misses <= 3; misses += 2) {
+			setup(cleanup);
+			make_page(0, false, 33);
+			state.dead_items->num_items = 1;
+			fixture_vm_repin_misses = misses;
+			lazy_scan_heap(&state);
+			UT_ASSERT_EQ(fixture_vm_heap_reads + fixture_vm_heap_locks, 0);
+			UT_ASSERT_EQ(fixture_vm_prepare_with_heap, 0);
+			UT_ASSERT_EQ(fixture_reads, misses + 1);
+			UT_ASSERT_EQ(fixture_vm_repin_calls, misses + 1);
+			UT_ASSERT_EQ(fixture_vm_repins, 1);
+			UT_ASSERT_EQ(fixture_vm_acquires, misses + 2);
+			UT_ASSERT_EQ(fixture_vm_releases, fixture_vm_acquires);
+			UT_ASSERT_EQ(state.scanned_pages, 1);
+			UT_ASSERT_EQ(state.live_tuples, 1);
+			UT_ASSERT_EQ(fixture_prune + fixture_noprune, 1);
+			UT_ASSERT_EQ(fixture_consumed_dead, 1);
+			UT_ASSERT_EQ(fixture_prepares, 1);
+			UT_ASSERT_EQ(fixture_prepare_held_mask, 0);
+			UT_ASSERT_EQ(fixture_pins + fixture_locks + fixture_vm_pins, 0);
+			fixture_publish_cutoffs(&state);
+			UT_ASSERT_EQ(state.NewRelfrozenXid, InvalidTransactionId);
+			UT_ASSERT_EQ(state.NewRelminMxid, InvalidMultiXactId);
+		}
+}
+
+UT_TEST(shared_cleanup_fallback_releases_vm_and_rechecks_after_repin_misses)
+{
+	for (unsigned misses = 0; misses <= 2; misses += 2) {
+		setup(false);
+		make_page(0, false, 33);
+		state.aggressive = true;
+		fixture_finish_noprune = false;
+		fixture_cleanup_xmin = 88;
+		fixture_vm_repin_misses = misses;
+		fixture_vm_miss_cleanup_only = true;
+		lazy_scan_heap(&state);
+		UT_ASSERT_EQ(fixture_vm_heap_reads + fixture_vm_heap_locks, 0);
+		UT_ASSERT_EQ(fixture_vm_prepare_with_heap, 0);
+		UT_ASSERT_EQ(fixture_reads, misses + 2);
+		UT_ASSERT_EQ(fixture_cleanup_waits, misses + 1);
+		UT_ASSERT_EQ(fixture_vm_repin_calls, misses + 2);
+		UT_ASSERT_EQ(fixture_vm_repins, 2);
+		UT_ASSERT_EQ(fixture_noprune, 1);
+		UT_ASSERT_EQ(fixture_prune, 1);
+		UT_ASSERT_EQ(state.scanned_pages, 1);
+		UT_ASSERT_EQ(state.live_tuples, 1);
+		UT_ASSERT_EQ(fixture_prepares, 1);
+		UT_ASSERT_EQ(fixture_prepare_held_mask, 0);
+		UT_ASSERT(prepared_batch() != NULL);
+		if (prepared_batch() != NULL)
+			UT_ASSERT_EQ(prepared_batch()->tuples[0].raw_xmin, 88);
+		UT_ASSERT_EQ(fixture_pins + fixture_locks + fixture_vm_pins, 0);
+	}
+}
+
+UT_TEST(shared_heap_read_error_has_no_predecessor_vm_pin)
+{
+	for (unsigned retry = 0; retry < 2; retry++) {
+		setup(true);
+		fixture_read_error = !retry;
+		fixture_vm_repin_misses = retry;
+		fixture_vm_miss_read_error = retry;
+		if (setjmp(fixture_error) == 0) {
+			lazy_scan_heap(&state);
+			UT_ASSERT(false);
+		}
+		UT_ASSERT_EQ(fixture_reads, retry);
+		UT_ASSERT_EQ(fixture_vm_acquires, fixture_vm_releases);
+		UT_ASSERT_EQ(fixture_pins + fixture_locks + fixture_vm_pins, 0);
+		UT_ASSERT_EQ(fixture_prune + fixture_noprune + fixture_prepares, 0);
+	}
+}
+
+UT_TEST(shared_repin_retry_can_cancel_without_buffer_ownership)
+{
+	setup(true);
+	fixture_vm_repin_misses = 1;
+	fixture_cancel_on_retry = true;
+	if (setjmp(fixture_error) == 0) {
+		lazy_scan_heap(&state);
+		UT_ASSERT(false);
+	}
+	UT_ASSERT_EQ(fixture_error_code, ERRCODE_QUERY_CANCELED);
+	UT_ASSERT_EQ(fixture_interrupt_checks, 1);
+	UT_ASSERT_EQ(fixture_vm_acquires, fixture_vm_releases);
+	UT_ASSERT_EQ(fixture_pins + fixture_locks + fixture_vm_pins, 0);
+	UT_ASSERT_EQ(fixture_prune + fixture_noprune + fixture_prepares, 0);
+}
+
+UT_TEST(native_heap_scan_keeps_original_vm_pin_and_cleanup_fallback)
+{
+	for (unsigned mode = 0; mode < 3; mode++) {
+		setup(mode == 0);
+		fixture_storage = fixture_peer = false;
+		fixture_bind_relation(&state, &relation);
+		state.aggressive = mode == 2;
+		fixture_finish_noprune = mode != 2;
+		lazy_scan_heap(&state);
+		UT_ASSERT_EQ(fixture_vm_repin_calls, 0);
+		UT_ASSERT_EQ(fixture_reads, 1);
+		UT_ASSERT_EQ(fixture_vm_heap_reads, 1);
+		UT_ASSERT_EQ(fixture_vm_acquires, 1);
+		UT_ASSERT_EQ(fixture_vm_releases, 1);
+		UT_ASSERT_EQ(fixture_cleanup_waits, mode == 2 ? 1 : 0);
+		UT_ASSERT_EQ(fixture_prune, mode != 1 ? 1 : 0);
+		UT_ASSERT_EQ(fixture_noprune, mode != 0 ? 1 : 0);
+		UT_ASSERT_EQ(fixture_pins + fixture_locks + fixture_vm_pins, 0);
 	}
 }
 
@@ -1351,8 +1495,8 @@ UT_TEST(real_scan_prepares_after_heap_lock_and_both_pins_are_released)
 			UT_ASSERT_EQ(fixture_prepares, 1);
 			UT_ASSERT_EQ(fixture_prepare_held_mask, 0);
 			UT_ASSERT_EQ(fixture_reads, 1);
-			UT_ASSERT_EQ(fixture_vm_acquires, 1);
-			UT_ASSERT_EQ(fixture_vm_releases, 1);
+			UT_ASSERT_EQ(fixture_vm_acquires, 2);
+			UT_ASSERT_EQ(fixture_vm_releases, 2);
 			UT_ASSERT_EQ(fixture_pins + fixture_locks + fixture_vm_pins, 0);
 			UT_ASSERT(prepared_batch() != NULL);
 			/* The real consumer has no transport/fence provider yet. */
@@ -1411,7 +1555,7 @@ UT_TEST(cleanup_fallback_prepares_only_its_refreshed_capture)
 	UT_ASSERT_EQ(fixture_prepare_held_mask, 0);
 	UT_ASSERT_EQ(fixture_noprune, 1);
 	UT_ASSERT_EQ(fixture_prune, 1);
-	UT_ASSERT_EQ(fixture_reads, 1);
+	UT_ASSERT_EQ(fixture_reads, 2);
 	UT_ASSERT_EQ(fixture_pins + fixture_locks + fixture_vm_pins, 0);
 }
 
@@ -1429,7 +1573,7 @@ UT_TEST(indexed_lpdead_exit_also_releases_before_preparation)
 	UT_ASSERT_EQ(fixture_pins + fixture_locks + fixture_vm_pins, 0);
 }
 
-UT_TEST(nontarget_keeps_vm_pin_reuse_and_never_prepares)
+UT_TEST(nonpeer_shared_storage_repins_without_freeze_preparation)
 {
 	setup(true);
 	fixture_peer = false;
@@ -1439,8 +1583,8 @@ UT_TEST(nontarget_keeps_vm_pin_reuse_and_never_prepares)
 	UT_ASSERT_EQ(fixture_prepares, 0);
 	UT_ASSERT_EQ(fixture_prune, 2);
 	UT_ASSERT_EQ(fixture_reads, 2);
-	UT_ASSERT_EQ(fixture_vm_acquires, 1);
-	UT_ASSERT_EQ(fixture_vm_releases, 1);
+	UT_ASSERT_EQ(fixture_vm_acquires, 3);
+	UT_ASSERT_EQ(fixture_vm_releases, 3);
 	UT_ASSERT_EQ(fixture_pins + fixture_locks + fixture_vm_pins, 0);
 	UT_ASSERT(prepared_batch() == NULL);
 }
@@ -1462,8 +1606,8 @@ UT_TEST(each_captured_page_gets_one_unpinned_preparation)
 	UT_ASSERT_EQ(fixture_prepares, 2);
 	UT_ASSERT_EQ(fixture_prepare_held_mask, 0);
 	UT_ASSERT_EQ(fixture_reads, 2);
-	UT_ASSERT_EQ(fixture_vm_acquires, 2);
-	UT_ASSERT_EQ(fixture_vm_releases, 2);
+	UT_ASSERT_EQ(fixture_vm_acquires, 4);
+	UT_ASSERT_EQ(fixture_vm_releases, 4);
 	UT_ASSERT_EQ(fixture_pins + fixture_locks + fixture_vm_pins, 0);
 }
 
@@ -1495,8 +1639,8 @@ UT_TEST(noindex_lpdead_exit_prepares_once_after_all_buffers_are_released)
 	UT_ASSERT_EQ(fixture_reads, 1);
 	UT_ASSERT_EQ(fixture_prune, 1);
 	UT_ASSERT_EQ(fixture_fsm_writes, 1);
-	UT_ASSERT_EQ(fixture_vm_acquires, 1);
-	UT_ASSERT_EQ(fixture_vm_releases, 1);
+	UT_ASSERT_EQ(fixture_vm_acquires, 2);
+	UT_ASSERT_EQ(fixture_vm_releases, 2);
 	UT_ASSERT_EQ(fixture_pins + fixture_locks + fixture_vm_pins, 0);
 }
 
@@ -3559,7 +3703,7 @@ UT_TEST(xmin_origin_or_generation_alias_cannot_retain_or_prepare_identity)
 int
 main(void)
 {
-	UT_PLAN(116);
+	UT_PLAN(122);
 	UT_RUN(canonical_proof_requires_same_origin_and_known_generation);
 	UT_RUN(xmin_origin_or_generation_alias_cannot_retain_or_prepare_identity);
 	UT_RUN(xmin_mixed_binding_selects_only_its_exact_proven_carrier);
@@ -3597,6 +3741,12 @@ main(void)
 	UT_RUN(creation_provenance_keeps_distinct_carriers_with_equal_raw_xmin);
 	UT_RUN(shared_scan_observes_vm_before_heap_pins_without_skipping);
 	UT_RUN(coherent_positive_repairs_only_after_heap_ownership_is_released);
+	UT_RUN(shared_heap_waits_carry_no_vm_pin);
+	UT_RUN(shared_vm_repin_misses_retry_before_processing_the_same_page);
+	UT_RUN(shared_cleanup_fallback_releases_vm_and_rechecks_after_repin_misses);
+	UT_RUN(shared_heap_read_error_has_no_predecessor_vm_pin);
+	UT_RUN(shared_repin_retry_can_cancel_without_buffer_ownership);
+	UT_RUN(native_heap_scan_keeps_original_vm_pin_and_cleanup_fallback);
 	UT_RUN(share_scan_preserves_every_reference_before_native_consumer);
 	UT_RUN(cleanup_scan_preserves_before_prune_and_freeze);
 	UT_RUN(raw_multi_value_never_selects_local_reader);
@@ -3632,7 +3782,7 @@ main(void)
 	UT_RUN(released_live_page_cannot_replace_owned_preparation_input);
 	UT_RUN(cleanup_fallback_prepares_only_its_refreshed_capture);
 	UT_RUN(indexed_lpdead_exit_also_releases_before_preparation);
-	UT_RUN(nontarget_keeps_vm_pin_reuse_and_never_prepares);
+	UT_RUN(nonpeer_shared_storage_repins_without_freeze_preparation);
 	UT_RUN(each_captured_page_gets_one_unpinned_preparation);
 	UT_RUN(cleanup_fallback_to_empty_discards_pending_capture);
 	UT_RUN(noindex_lpdead_exit_prepares_once_after_all_buffers_are_released);

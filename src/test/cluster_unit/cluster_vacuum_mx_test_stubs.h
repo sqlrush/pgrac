@@ -39,6 +39,15 @@
 #define BufferIsValid(buf) ((buf) != InvalidBuffer)
 #undef VM_ALL_FROZEN
 #define VM_ALL_FROZEN(...) false
+#undef CHECK_FOR_INTERRUPTS
+#define CHECK_FOR_INTERRUPTS()                                                                     \
+	do {                                                                                           \
+		fixture_interrupt_checks++;                                                                \
+		if (fixture_cancel_on_retry) {                                                             \
+			fixture_error_code = ERRCODE_QUERY_CANCELED;                                           \
+			longjmp(fixture_error, 1);                                                             \
+		}                                                                                          \
+	} while (0)
 
 static ClusterHeapFreezeProofStatusV1
 lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
@@ -78,13 +87,39 @@ fixture_visibilitymap_get_status_coherent(Relation rel, BlockNumber block, Buffe
 void
 visibilitymap_pin(Relation rel, BlockNumber block, Buffer *vm)
 {
-	(void)rel;
-	(void)block;
+	fixture_vm_relation = rel;
+	fixture_vm_block = block;
+	if (fixture_pins || fixture_locks)
+		fixture_vm_prepare_with_heap++;
 	if (!BufferIsValid(*vm)) {
 		*vm = FIXTURE_VM_BUFFER;
 		fixture_vm_pins++;
 		fixture_vm_acquires++;
 	}
+}
+
+bool
+visibilitymap_pin_recent(Relation rel, BlockNumber block, Buffer recent, Buffer *vm)
+{
+	UT_ASSERT_EQ(rel, fixture_vm_relation);
+	UT_ASSERT_EQ(block, fixture_vm_block);
+	UT_ASSERT_EQ(recent, FIXTURE_VM_BUFFER);
+	UT_ASSERT_EQ(*vm, InvalidBuffer);
+	UT_ASSERT_EQ(fixture_vm_pins, 0);
+	UT_ASSERT_EQ(fixture_pins, 1);
+	UT_ASSERT_EQ(fixture_locks, 1);
+	fixture_vm_repin_calls++;
+	if (fixture_vm_repin_misses && (!fixture_vm_miss_cleanup_only || fixture_cleanup_waits)) {
+		fixture_vm_repin_misses--;
+		if (fixture_vm_miss_read_error)
+			fixture_read_error = true;
+		return false;
+	}
+	*vm = FIXTURE_VM_BUFFER;
+	fixture_vm_pins++;
+	fixture_vm_acquires++;
+	fixture_vm_repins++;
+	return true;
 }
 
 Buffer
@@ -95,6 +130,8 @@ ReadBufferExtended(Relation rel, ForkNumber fork, BlockNumber block, ReadBufferM
 	(void)fork;
 	(void)mode;
 	(void)strategy;
+	if (fixture_vm_pins)
+		fixture_vm_heap_reads++;
 	if (fixture_read_error)
 		longjmp(fixture_error, 1);
 	fixture_reads++;
@@ -106,6 +143,8 @@ bool
 ConditionalLockBufferForCleanup(Buffer buf)
 {
 	(void)buf;
+	if (fixture_vm_pins)
+		fixture_vm_heap_locks++;
 	if (fixture_cleanup)
 		fixture_locks++;
 	return fixture_cleanup;
@@ -115,12 +154,17 @@ void
 LockBuffer(Buffer buf, int mode)
 {
 	(void)buf;
+	if (mode != BUFFER_LOCK_UNLOCK && fixture_vm_pins)
+		fixture_vm_heap_locks++;
 	fixture_locks += mode == BUFFER_LOCK_UNLOCK ? -1 : 1;
 }
 
 void
 LockBufferForCleanup(Buffer buf)
 {
+	if (fixture_vm_pins)
+		fixture_vm_heap_locks++;
+	fixture_cleanup_waits++;
 	fixture_locks++;
 	if (fixture_cleanup_empty)
 		((PageHeader)BufferGetPage(buf))->pd_lower = SizeOfPageHeaderData;

@@ -300,6 +300,8 @@ typedef struct LVSavedErrInfo
 /* non-export function prototypes */
 static void lazy_scan_heap(LVRelState *vacrel);
 #ifdef USE_PGRAC_CLUSTER
+static Buffer lazy_read_shared_heap(LVRelState *vacrel, BlockNumber blkno, Buffer *vmbuffer,
+									bool force_cleanup, bool *cleanup_lock);
 static bool lazy_scan_shared_mx(LVRelState *vacrel, Page page, BlockNumber blkno);
 static void lazy_validate_shared_freeze(LVRelState *vacrel, Page page, BlockNumber blkno, Buffer buffer);
 static ClusterHeapFreezeProofStatusV1 lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer);
@@ -1002,6 +1004,40 @@ lazy_clear_vm_after_heap(Relation rel, const ClusterSpaceIdentity *identity, Blo
 
 #endif
 
+#ifdef USE_PGRAC_CLUSTER
+/* Acquire heap ownership without carrying a passive VM pin into the wait. */
+static Buffer
+lazy_read_shared_heap(LVRelState *vacrel, BlockNumber blkno, Buffer *vmbuffer, bool force_cleanup,
+					  bool *cleanup_lock)
+{
+	for (;;) {
+		Buffer recent_vm = *vmbuffer;
+		Buffer buf;
+
+		Assert(BufferIsValid(recent_vm));
+		ReleaseBuffer(recent_vm);
+		*vmbuffer = InvalidBuffer;
+		buf = ReadBufferExtended(vacrel->rel, MAIN_FORKNUM, blkno, RBM_NORMAL, vacrel->bstrategy);
+		if (force_cleanup) {
+			LockBufferForCleanup(buf);
+			*cleanup_lock = true;
+		} else {
+			*cleanup_lock = ConditionalLockBufferForCleanup(buf);
+			if (!*cleanup_lock)
+				LockBuffer(buf, BUFFER_LOCK_SHARE);
+		}
+
+		/* This exact resident repin cannot fetch or initialize a VM page. */
+		if (visibilitymap_pin_recent(vacrel->rel, blkno, recent_vm, vmbuffer))
+			return buf;
+
+		UnlockReleaseBuffer(buf);
+		CHECK_FOR_INTERRUPTS();
+		visibilitymap_pin(vacrel->rel, blkno, vmbuffer);
+	}
+}
+#endif
+
 /*
  *	lazy_scan_heap() -- workhorse function for VACUUM
  *
@@ -1079,6 +1115,7 @@ lazy_scan_heap(LVRelState *vacrel)
 		Buffer		buf;
 		Page		page;
 		bool		all_visible_according_to_vm;
+		bool cleanup_lock;
 		LVPagePruneState prunestate;
 
 #ifdef USE_PGRAC_CLUSTER
@@ -1205,15 +1242,22 @@ lazy_scan_heap(LVRelState *vacrel)
 		 * a cleanup lock right away, we may be able to settle for reduced
 		 * processing using lazy_scan_noprune.
 		 */
-		buf = ReadBufferExtended(vacrel->rel, MAIN_FORKNUM, blkno, RBM_NORMAL,
-								 vacrel->bstrategy);
-		page = BufferGetPage(buf);
-		if (!ConditionalLockBufferForCleanup(buf))
+#ifdef USE_PGRAC_CLUSTER
+		if (vacrel->shared_maintenance_restricted)
+			buf = lazy_read_shared_heap(vacrel, blkno, &vmbuffer, false, &cleanup_lock);
+		else
+#endif
 		{
+			buf = ReadBufferExtended(vacrel->rel, MAIN_FORKNUM, blkno, RBM_NORMAL,
+									 vacrel->bstrategy);
+			cleanup_lock = ConditionalLockBufferForCleanup(buf);
+			if (!cleanup_lock)
+				LockBuffer(buf, BUFFER_LOCK_SHARE);
+		}
+		page = BufferGetPage(buf);
+		if (!cleanup_lock) {
 			bool		hastup,
 						recordfreespace;
-
-			LockBuffer(buf, BUFFER_LOCK_SHARE);
 
 			/* Check for new or empty pages before lazy_scan_noprune call */
 			if (lazy_scan_new_or_empty(vacrel, buf, blkno, page, true,
@@ -1267,8 +1311,17 @@ lazy_scan_heap(LVRelState *vacrel)
 			 * for a cleanup lock, and call lazy_scan_prune in the usual way.
 			 */
 			Assert(vacrel->aggressive);
-			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-			LockBufferForCleanup(buf);
+#ifdef USE_PGRAC_CLUSTER
+			if (vacrel->shared_maintenance_restricted) {
+				UnlockReleaseBuffer(buf);
+				buf = lazy_read_shared_heap(vacrel, blkno, &vmbuffer, true, &cleanup_lock);
+				page = BufferGetPage(buf);
+			} else
+#endif
+			{
+				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+				LockBufferForCleanup(buf);
+			}
 		}
 
 		/* Check for new or empty pages before lazy_scan_prune call */
