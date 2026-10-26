@@ -2234,6 +2234,15 @@ test_cluster_heap_resident_stamp_types.inc: $(top_srcdir)/src/backend/storage/bu
 	     END { if (found != 1 || private_type != 1 || done != 2 || address != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_heap_private_ref.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	@awk '/^#define REFCOUNT_ARRAY_ENTRIES / { print; constants++ } \
+	     /^static .*PrivateRefCountArray\[/ || /^static .*PrivateRefCountHash =/ || /^static .*PrivateRefCountOverflowed =/ || /^static .*PrivateRefCountClock =/ || /^static .*ReservedRefCountEntry =/ { print; states++ } \
+	     /^ReservePrivateRefCountEntry\(/ || /^ForgetPrivateRefCountEntry\(/ { print "static void"; emit=1; found++ } \
+	     /^NewPrivateRefCountEntry\(/ || /^GetPrivateRefCountEntry\(/ { print "static PrivateRefCountEntry *"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (constants != 1 || states != 5 || found != 4 || done != 4 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_heap_primitive_pin.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
 	@awk '/^PinBuffer\(/ { print "static bool"; emit=1; found++ } \
 	     /^UnpinBuffer\(/ { print "static void"; emit=1; found++ } \
@@ -2373,6 +2382,7 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_heap_itl_publication.inc \
 		test_cluster_heap_touch_authority.inc \
 		test_cluster_heap_resident_stamp_types.inc test_cluster_heap_resident_stamp.inc \
+		test_cluster_heap_private_ref.inc $(top_srcdir)/src/include/utils/hsearch.h \
 		test_cluster_heap_primitive_pin.inc \
 		test_cluster_heap_lookup_pin.inc $(top_srcdir)/src/include/utils/memdebug.h \
 		$(top_srcdir)/src/include/utils/resowner.h \
@@ -5346,6 +5356,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_heap_resident_stamp.inc test_cluster_heap_resident_stamp.inc.tmp
 	rm -f test_cluster_heap_lookup_pin.inc test_cluster_heap_lookup_pin.inc.tmp
 	rm -f test_cluster_heap_primitive_pin.inc test_cluster_heap_primitive_pin.inc.tmp
+	rm -f test_cluster_heap_private_ref.inc test_cluster_heap_private_ref.inc.tmp
 	rm -f test_cluster_heap_ctrc_certificate.inc test_cluster_heap_ctrc_certificate.inc.tmp
 	rm -f test_cluster_heap_ctrc_ack.inc test_cluster_heap_ctrc_ack.inc.tmp
 	rm -f test_cluster_heap_ctrc_origin_reply.inc test_cluster_heap_ctrc_origin_reply.inc.tmp
