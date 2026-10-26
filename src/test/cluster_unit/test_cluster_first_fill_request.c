@@ -206,7 +206,7 @@ request_retire_consumed(BufferDesc *buf)
 	UT_ASSERT_EQ(gcs_first_fill_receipt_revoke(&inv), 1);
 	UT_ASSERT(request_slot->first_fill.ack_handed);
 	done = retire_notice(&request_source);
-	UT_ASSERT(gcs_first_fill_receipt_consumed(&done));
+	UT_ASSERT(retire_consume(&done));
 	UT_ASSERT(!request_slot->in_use);
 	UT_ASSERT_EQ(retire_receipts, 0);
 }

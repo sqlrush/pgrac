@@ -3220,6 +3220,35 @@ static GcsReadSourceAttempt gcs_read_source_attempts[GCS_READ_SOURCE_LEDGER_MAX]
 static bool gcs_read_source_exit_registered;
 static bool gcs_first_fill_holder_notify_retain(const ClusterPcmReadGrant *service, int master);
 
+/* A one-shot completion already belongs to this verified receive carrier.
+ * UNKNOWN cannot discard it after the sender handed off its only frame.
+ * This proves routing/instance only; exact consumers still own authority.
+ * expected_master=-1 uses the original receipt's pinned master instead of
+ * a successor tag route; the consumer must still match that exact receipt. */
+static bool
+gcs_block_pending_s_carrier_current(const ClusterICEnvelope *env, BufferTag tag,
+	int source, int expected_master, uint64 *session_out)
+{
+	int master;
+	uint64 session;
+	if (env == NULL || source < 0 || source >= 32 || expected_master < -1 || expected_master >= 32
+		|| env->source_node_id != (uint32)source || env->dest_node_id != (uint32)cluster_node_id)
+		return false;
+	master = expected_master < 0 ? -1 : cluster_gcs_lookup_master(tag);
+	if ((expected_master >= 0 && master >= 0 && master != expected_master)
+		|| cluster_membership_get_state(source) == CLUSTER_MEMBER_DEAD
+		|| cluster_membership_get_state(source) == CLUSTER_MEMBER_REMOVED)
+		return false; /* Established reconfiguration owns old authority. */
+	if ((expected_master >= 0 && master < 0)
+		|| !gcs_block_pcm_x_authenticated_session(source, cluster_epoch_get_current(), &session)
+		|| session == 0) {
+		cluster_ic_dispatch_defer(env);
+		return false;
+	}
+	*session_out = session;
+	return true;
+}
+
 /* Existing DONE family, asynchronously queued. Native authority retains debt
  * until confirmation or exact cleanup; there is no ACK wait here. */
 static bool
@@ -3545,19 +3574,17 @@ gcs_first_fill_receipt_revoke(const GcsBlockInvalidatePayload *inv)
 /* The notice is authoritative only after authenticated master ACK consumption.
  * Never examine the current BufferDesc: it may already belong to successor B. */
 static bool
-gcs_first_fill_receipt_consumed(const GcsBlockDonePayload *done)
+gcs_first_fill_receipt_consumed(const GcsBlockDonePayload *done, uint64 session)
 {
 	ClusterPcmReadGrantKey key;
 	ClusterGcsBlockBackendBlock *blk;
 	GcsFirstFillReceipt retired;
 	unsigned count = 0;
-	uint64 session;
 	bool applied = false;
 	if (!GcsBlockDonePayloadPendingSKey(done, &key)
 		|| done->reserved_0[0] != GCS_BLOCK_DONE_PENDING_S_RETIRED
 		|| key.requester_node != cluster_node_id || key.backend_id <= 0 || key.backend_id > MaxBackends
-		|| !gcs_block_pcm_x_authenticated_session(done->sender_node,
-			cluster_epoch_get_current(), &session) || gcs_block_backend_blocks == NULL)
+		|| session == 0 || gcs_block_backend_blocks == NULL)
 		return false;
 	blk = &gcs_block_backend_blocks[key.backend_id - 1];
 	LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
@@ -24152,25 +24179,15 @@ cluster_gcs_handle_block_done_envelope(const ClusterICEnvelope *env, const void 
 		ClusterPcmReadGrant service;
 		uint64 session;
 		bool sealed = done->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_SEALED;
-		int master;
 		if (env->dest_node_id != (uint32)cluster_node_id || env->epoch != done->epoch
 			|| done->epoch != cluster_epoch_get_current()
 			|| !GcsBlockDonePayloadPendingSService(done, &service)
 			|| !gcs_first_fill_return_service_valid(&service)
 			|| (!sealed && service.holder_node != cluster_node_id))
 			return;
-		master = cluster_gcs_lookup_master(done->tag);
-		if ((master >= 0 && master != (sealed ? cluster_node_id : done->sender_node))
-			|| cluster_membership_get_state(done->sender_node) == CLUSTER_MEMBER_DEAD
-			|| cluster_membership_get_state(done->sender_node) == CLUSTER_MEMBER_REMOVED)
-			return; /* Proved old authority; membership/remaster owns its cleanup. */
-		if (master < 0 || !gcs_block_pcm_x_authenticated_session(done->sender_node, done->epoch, &session)
-			|| session == 0) {
-			/* The sender already transferred its only frame. UNKNOWN is
-			 * not rejection: preserve this real carrier until proof returns. */
-			cluster_ic_dispatch_defer(env);
+		if (!gcs_block_pending_s_carrier_current(env, done->tag, done->sender_node,
+			sealed ? cluster_node_id : done->sender_node, &session))
 			return;
-		}
 		if (sealed)
 			gcs_first_fill_master_holder_completed(&service.key, &service, session, true);
 		else if (!gcs_first_fill_holder_seal(done, session))
@@ -24185,8 +24202,10 @@ cluster_gcs_handle_block_done_envelope(const ClusterICEnvelope *env, const void 
 		if (env->dest_node_id != (uint32)cluster_node_id
 			|| done->epoch != cluster_epoch_get_current()
 			|| !GcsBlockDonePayloadPendingSService(done, &service)
-			|| !gcs_block_pcm_x_authenticated_session(done->sender_node, done->epoch, &session)
-			|| cluster_gcs_lookup_master(done->tag) != (returned ? done->sender_node : cluster_node_id))
+			|| !gcs_first_fill_return_service_valid(&service)
+			|| (returned && service.holder_node != cluster_node_id)
+			|| !gcs_block_pending_s_carrier_current(env, done->tag, done->sender_node,
+				returned ? done->sender_node : cluster_node_id, &session))
 			return;
 		if (returned)
 			(void)gcs_first_fill_holder_returned(done, session);
@@ -24195,7 +24214,14 @@ cluster_gcs_handle_block_done_envelope(const ClusterICEnvelope *env, const void 
 		return;
 	}
 	if (done->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_RETIRED) {
-		(void)gcs_first_fill_receipt_consumed(done);
+		ClusterPcmReadGrantKey retired;
+		uint64 session;
+		if (!GcsBlockDonePayloadPendingSKey(done, &retired)
+			|| retired.requester_node != cluster_node_id || retired.backend_id > MaxBackends
+			|| !gcs_block_pending_s_carrier_current(env, done->tag, done->sender_node,
+				-1, &session))
+			return;
+		(void)gcs_first_fill_receipt_consumed(done, session);
 		return;
 	}
 	if (done->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_CONFIRM
@@ -24206,10 +24232,10 @@ cluster_gcs_handle_block_done_envelope(const ClusterICEnvelope *env, const void 
 		bool installed = done->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_CONFIRM;
 		bool applied;
 		if (!GcsBlockDonePayloadPendingSKey(done, &grant_key)
-			|| cluster_gcs_lookup_master(done->tag) != cluster_node_id
-			|| !gcs_block_pcm_x_authenticated_session(done->sender_node,
-				cluster_epoch_get_current(), &session)
-			|| (installed && done->epoch != cluster_epoch_get_current()))
+			|| grant_key.backend_id > MaxBackends
+			|| (installed && done->epoch != cluster_epoch_get_current())
+			|| !gcs_block_pending_s_carrier_current(env, done->tag, done->sender_node,
+				cluster_node_id, &session))
 			return;
 		if (done->reserved_0[0] == GCS_BLOCK_DONE_PENDING_S_HOLDER
 			|| (!installed && done->sender_node != grant_key.requester_node)) {
@@ -26084,9 +26110,9 @@ cluster_gcs_handle_block_invalidate_ack_envelope(const ClusterICEnvelope *env, c
 		bool decoded = GcsBlockInvalidateAckPayloadPendingSKey(ack, &key);
 		bool applied = false;
 		if (decoded && (ack->ack_status == 0 || ack->ack_status == 2)
-			&& cluster_gcs_lookup_master(ack->tag) == cluster_node_id
-			&& gcs_block_pcm_x_authenticated_session(ack->sender_node,
-				cluster_epoch_get_current(), &session)) {
+			&& key.backend_id <= MaxBackends && env->payload_length == sizeof(*ack)
+			&& gcs_block_pending_s_carrier_current(env, ack->tag, ack->sender_node,
+				cluster_node_id, &session)) {
 			if (ack->reserved_0[0] == GCS_BLOCK_INVALIDATE_ACK_KEPT_PI)
 				cluster_pcm_lock_pi_holder_note(ack->tag, ack->sender_node);
 			applied = cluster_pcm_lock_read_grant_revoke_ack(&key);

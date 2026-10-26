@@ -9768,7 +9768,8 @@ test_cluster_tt_terminal_trace: test_cluster_tt_terminal_trace.c test_cluster_tt
 # Execute the production first-fill master decision with native PCM owners.
 test_cluster_pcm_first_fill_master.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
 	awk '/^gcs_first_fill_retired_notice\(/ { print "static bool"; emit=1; n++ } \
-	     emit { print } emit && /^}/ { emit=0 } END { if (n != 1 || emit) exit 1 }' $< > $@.tmp
+	     /^gcs_block_pending_s_carrier_current\(/ { print "static bool"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 2 || emit) exit 1 }' $< > $@.tmp
 	awk '/^#define GCS_FIRST_FILL_PARK_MAX/ { emit=1; n++ } \
 	     /^void$$/ && emit { emit=0; done++ } emit { print } \
 	     END { if (n != 1 || done != 1 || emit) exit 1 }' $< >> $@.tmp
@@ -9776,6 +9777,9 @@ test_cluster_pcm_first_fill_master.inc: $(top_srcdir)/src/backend/cluster/cluste
 	     emit { print } emit && /^}/ { emit=0 } END { if (n != 1 || emit) exit 1 }' $< >> $@.tmp
 	awk '/^cluster_gcs_handle_block_done_envelope\(/ { print "static void"; emit=1; n++ } \
 	     emit { print } emit && /^}/ { emit=0 } END { if (n != 1 || emit) exit 1 }' $< >> $@.tmp
+	awk '/^cluster_gcs_handle_block_invalidate_ack_envelope\(/ { print "static void"; emit=1; n++ } \
+	     emit && /if \(ack->ack_status == GCS_BLOCK_INVALIDATE_ACK_STATUS_RETRYABLE_BUSY\)/ { print "}"; emit=0; end++ } \
+	     emit { print } END { if (n != 1 || end != 1 || emit) exit 1 }' $< >> $@.tmp
 	mv $@.tmp $@
 test_cluster_pcm_read_grant: test_cluster_pcm_first_fill_master.inc
 
@@ -9925,6 +9929,7 @@ test_cluster_first_fill_retire.inc: $(top_srcdir)/src/backend/cluster/cluster_gc
 	     /^gcs_block_pending_s_notify_(action_internal|action)\(/ { print "static bool"; emit=1; n++ } \
 	     /^gcs_block_pending_s_notify\(/ { print "static void"; emit=1; n++ } \
 	     /^gcs_first_fill_(arm_slot|receipt_matches|receipt_consumed)\(/ { print "static bool"; emit=1; n++ } \
+	     /^gcs_block_pending_s_carrier_current\(/ { print "static bool"; emit=1; n++ } \
 	     /^gcs_first_fill_receipt_count_locked\(/ { print "static unsigned"; emit=1; n++ } \
 	     /^gcs_first_fill_(receipt_offer|receipt_tick|confirm_offer)\(/ { print "static void"; emit=1; n++ } \
 	     /^gcs_first_fill_receipt_revoke\(/ { print "static int"; emit=1; n++ } \
@@ -9933,7 +9938,7 @@ test_cluster_first_fill_retire.inc: $(top_srcdir)/src/backend/cluster/cluster_gc
 	     /^cluster_gcs_block_read_source_complete\(/ { print "void"; emit=1; n++ } \
 	     /^cluster_gcs_block_read_source_(quiescent|quiesce)\(/ { print "bool"; emit=1; n++ } \
 	     /^gcs_block_(pending_s_delivery_closed|invalidate_execute)\(/ { print "static bool"; emit=1; n++ } \
-	     emit { print } emit && /^}/ { emit=0 } END { if (n != 24 || emit) exit 1 }' $< >> $@.tmp
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 25 || emit) exit 1 }' $< >> $@.tmp
 	mv $@.tmp $@
 
 test_cluster_first_fill_retire: test_cluster_first_fill_retire.c test_cluster_pcm_own test_cluster_pcm_own.c \

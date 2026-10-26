@@ -11,10 +11,13 @@ UT_DEFINE_GLOBALS();
 ProcessingMode Mode = NormalProcessing;
 int MaxBackends = 4;
 BackendId MyBackendId = 1;
+int MyProcPid = 101;
+TimestampTz MyStartTimestamp = 1000;
 int cluster_node_id = 0;
 bool IsUnderPostmaster = true;
 AuxProcType MyAuxProcType = LmsProcess;
 bool cluster_past_image = true;
+bool cluster_trace_block_io = false;
 int cluster_gcs_block_invalidate_ack_timeout_ms = 5000;
 static void *shared_allocation;
 static LWLock *held_lock;
@@ -152,6 +155,9 @@ stop_fixture_pi_durable(BufferTag tag, SCN written)
 #define gcs_block_try_resource_x_frame stop_fixture_resource_x_frame
 #define gcs_block_pi_discard_master_apply stop_fixture_pi_durable
 #define cluster_pcm_lock_pi_holder_note stop_fixture_pi_kept
+/* This fixture covers unsolicited PI; exact first-fill ACK ownership is
+ * exercised with the native PCM authority in pcm_read_grant. */
+#define gcs_block_pending_s_carrier_current(env, tag, source, master, session) false
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-variable"
 #include "test_cluster_gcs_stop_pi_ack.inc"
@@ -160,6 +166,13 @@ stop_fixture_pi_durable(BufferTag tag, SCN written)
 #undef gcs_block_try_resource_x_frame
 #undef gcs_block_pi_discard_master_apply
 #undef cluster_pcm_lock_pi_holder_note
+#undef gcs_block_pending_s_carrier_current
+
+void
+cluster_pcm_lock_check_shutdown_wait(void)
+{
+	abort(); /* Legacy non-waiting reserve must never enter this seam. */
+}
 
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
@@ -200,6 +213,21 @@ void
 ConditionVariableInit(ConditionVariable *cv)
 {
 	memset(cv, 0, sizeof(*cv));
+}
+void
+ConditionVariableBroadcast(ConditionVariable *cv)
+{
+	Assert(held_count == 1 && cv == &gcs_block_my_block()->capacity_cv);
+}
+void
+ConditionVariablePrepareToSleep(ConditionVariable *cv)
+{
+	abort(); /* These legacy slot tests always request non-waiting reserve. */
+}
+bool
+ConditionVariableCancelSleep(void)
+{
+	abort();
 }
 bool
 LWLockAcquire(LWLock *lock, LWLockMode mode)
@@ -276,6 +304,19 @@ cluster_lever_h_note_write_note(bool overflowed)
 {
 	Assert(!overflowed);
 }
+/* This fixture does not qualify trace-ON behavior. */
+void
+cluster_block_io_trace_note(BufferTag tag, const char *event, uint64 version,
+	uint64 sequence, uint32 holders)
+{
+	Assert(!cluster_trace_block_io);
+}
+void
+cluster_block_io_trace_pending_s(const ClusterPcmReadGrantKey *key, const char *event,
+	int phase, int holder, uint64 binding, int result)
+{
+	Assert(!cluster_trace_block_io);
+}
 void
 cluster_undo_block0_current_cancel(ClusterUndoBlock0CurrentGuard *guard)
 {
@@ -340,7 +381,7 @@ UT_TEST(test_all_three_real_requester_domains_need_original_release)
 	uint64 request;
 	reset_test();
 	tag.relNumber = 99;
-	slots[0] = gcs_block_reserve_slot(tag, PCM_TRANS_N_TO_X, 1, &request);
+	slots[0] = gcs_block_reserve_slot(tag, PCM_TRANS_N_TO_X, 1, &request, false);
 	slots[1] = gcs_block_try_reserve_r4_slot(tag, 8, 1, &request);
 	slots[2] = gcs_block_try_reserve_current_mx_slot(
 		&mx, 8, 1, GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT, &request);
