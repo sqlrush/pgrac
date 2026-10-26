@@ -66,6 +66,9 @@ static bool fixture_storage;
 static int fixture_smgr, fixture_pins, fixture_locks;
 static int fixture_vm_pins;
 static unsigned fixture_reads, fixture_vm_acquires, fixture_vm_releases;
+static unsigned fixture_vm_observations;
+static bool fixture_vm_coherent_ok, fixture_vm_repair_unlocked;
+static uint8 fixture_vm_bits;
 static unsigned fixture_prepares, fixture_prepare_held_mask;
 static bool fixture_finish_noprune, fixture_recordspace, fixture_prune_lpdead;
 static bool fixture_noprune_hint, fixture_vacuum_change;
@@ -203,6 +206,9 @@ setup(bool cleanup)
 	fixture_pins = fixture_locks = 0;
 	fixture_vm_pins = 0;
 	fixture_reads = fixture_vm_acquires = fixture_vm_releases = 0;
+	fixture_vm_observations = 0;
+	fixture_vm_coherent_ok = fixture_vm_repair_unlocked = false;
+	fixture_vm_bits = 0;
 	fixture_prepares = fixture_prepare_held_mask = 0;
 	fixture_finish_noprune = true;
 	fixture_recordspace = fixture_prune_lpdead = false;
@@ -259,6 +265,48 @@ deferred_tuples(void)
 #else
 	return 0;
 #endif
+}
+
+/* An omitted scan call, or moving it below the heap pin, breaks this case. */
+UT_TEST(shared_scan_observes_vm_before_heap_pins_without_skipping)
+{
+	for (unsigned cleanup = 0; cleanup < 2; cleanup++) {
+		setup(cleanup);
+		state.rel_pages = 2;
+		make_page(1, true, 34);
+		lazy_scan_heap(&state);
+		UT_ASSERT_EQ(fixture_vm_observations, 2);
+		UT_ASSERT_EQ(state.scanned_pages, 2);
+		UT_ASSERT_EQ(fixture_prune + fixture_noprune, 0);
+		UT_ASSERT_EQ(fixture_vm_writes + fixture_dirties, 0);
+		UT_ASSERT_EQ(fixture_locks + fixture_pins + fixture_vm_pins, 0);
+	}
+	setup(true);
+	fixture_storage = fixture_peer = false;
+	fixture_bind_relation(&state, &relation);
+	lazy_scan_heap(&state);
+	UT_ASSERT_EQ(fixture_vm_observations, 0);
+}
+
+UT_TEST(coherent_positive_repairs_only_after_heap_ownership_is_released)
+{
+	for (unsigned result = 0; result < 3; result++) {
+		setup(true);
+		make_page(0, false, 33);
+		fixture_vm_repair_unlocked = true;
+		fixture_vm_coherent_ok = result != 0;
+		fixture_vm_bits = result == 1 ? 0 : VISIBILITYMAP_VALID_BITS;
+		lazy_scan_heap(&state);
+		fixture_publish_cutoffs(&state);
+		UT_ASSERT_EQ(fixture_vm_observations, 1);
+		UT_ASSERT_EQ(fixture_prune, 1);
+		UT_ASSERT_EQ(fixture_vm_writes, result == 2 ? 1 : 0);
+		UT_ASSERT_EQ(state.scanned_pages, 1);
+		UT_ASSERT_EQ(state.NewRelfrozenXid, InvalidTransactionId);
+		UT_ASSERT_EQ(state.NewRelminMxid, InvalidMultiXactId);
+		UT_ASSERT_EQ(fixture_pins + fixture_locks + fixture_vm_pins, 0);
+		UT_ASSERT(!PageIsAllVisible((Page)fixture_pages[0].data));
+	}
 }
 
 UT_TEST(share_scan_preserves_every_reference_before_native_consumer)
@@ -3511,7 +3559,7 @@ UT_TEST(xmin_origin_or_generation_alias_cannot_retain_or_prepare_identity)
 int
 main(void)
 {
-	UT_PLAN(114);
+	UT_PLAN(116);
 	UT_RUN(canonical_proof_requires_same_origin_and_known_generation);
 	UT_RUN(xmin_origin_or_generation_alias_cannot_retain_or_prepare_identity);
 	UT_RUN(xmin_mixed_binding_selects_only_its_exact_proven_carrier);
@@ -3547,6 +3595,8 @@ main(void)
 	UT_RUN(creation_provenance_missing_or_raw_mismatch_never_guesses_an_epoch);
 	UT_RUN(creation_provenance_rejection_clears_preceding_attempt);
 	UT_RUN(creation_provenance_keeps_distinct_carriers_with_equal_raw_xmin);
+	UT_RUN(shared_scan_observes_vm_before_heap_pins_without_skipping);
+	UT_RUN(coherent_positive_repairs_only_after_heap_ownership_is_released);
 	UT_RUN(share_scan_preserves_every_reference_before_native_consumer);
 	UT_RUN(cleanup_scan_preserves_before_prune_and_freeze);
 	UT_RUN(raw_multi_value_never_selects_local_reader);

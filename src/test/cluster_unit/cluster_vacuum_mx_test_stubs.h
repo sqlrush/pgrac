@@ -60,6 +60,21 @@ lazy_scan_skip(LVRelState *vacrel, Buffer *vm, BlockNumber next, bool *allvis, b
 	return next;
 }
 
+/* The original reader is exercised separately; this leaf verifies scan order. */
+static bool
+fixture_visibilitymap_get_status_coherent(Relation rel, BlockNumber block, Buffer *vm,
+										  uint8 *status)
+{
+	(void)rel;
+	(void)block;
+	(void)vm;
+	UT_ASSERT_EQ(fixture_pins + fixture_locks, 0);
+	fixture_vm_observations++;
+	*status = fixture_vm_bits;
+	return fixture_vm_coherent_ok;
+}
+#define visibilitymap_get_status_coherent fixture_visibilitymap_get_status_coherent
+
 void
 visibilitymap_pin(Relation rel, BlockNumber block, Buffer *vm)
 {
@@ -216,13 +231,28 @@ lazy_clear_visibility_versioned(Relation rel, const ClusterSpaceIdentity *identi
 	(void)buf;
 	(void)block;
 	(void)vm;
+	if (fixture_vm_repair_unlocked)
+		UT_ASSERT_EQ(fixture_pins + fixture_locks, 0);
 	fixture_vm_writes++;
 }
+
+static void
+fixture_clear_vm_after_heap(Relation rel, const ClusterSpaceIdentity *identity, BlockNumber block,
+							Buffer *vm)
+{
+	(void)rel;
+	(void)identity;
+	(void)block;
+	(void)vm;
+	UT_ASSERT_EQ(fixture_pins + fixture_locks, 0);
+	fixture_vm_writes++;
+}
+#define lazy_clear_vm_after_heap fixture_clear_vm_after_heap
 
 #define MarkBufferDirty(buf) (fixture_dirties++)
 #define RecordPageWithFreeSpace(rel, block, space) ((void)(space), fixture_fsm_writes++)
 #define FreeSpaceMapVacuumRange(...) ((void)0)
-#define visibilitymap_get_status(...) 0
+#define visibilitymap_get_status(...) fixture_vm_bits
 #define visibilitymap_clear(...) (fixture_vm_writes++)
 #define visibilitymap_set(rel, block, buf, lsn, vm, cutoff, flags, identity)                       \
 	((void)(flags), fixture_vm_writes++)

@@ -23,6 +23,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_space_storage.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/storage/cluster_smgr.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
@@ -32,6 +33,26 @@
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+
+/* Online page/version fixtures use TARGET_READY; recovered admission is
+ * controlled separately and is never granted by these storage leaves. */
+BackendType MyBackendType = B_BACKEND;
+ClusterNormalStartState
+cluster_semantic_normal_start_state(void)
+{
+	return CLUSTER_NORMAL_START_TARGET_READY;
+}
+bool
+cluster_semantic_activation_phase1_pristine(void)
+{
+	return false;
+}
+bool
+cluster_semantic_activation_recovered_open_current(void)
+{
+	return false;
+}
+
 
 #define MAPSIZE (BLCKSZ - MAXALIGN(SizeOfPageHeaderData))
 #define HEAPBLOCKS_PER_PAGE (MAPSIZE * 4)

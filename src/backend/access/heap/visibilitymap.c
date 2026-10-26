@@ -40,6 +40,10 @@
  *	Out-of-crit callers keep using visibilitymap_clear unchanged, and
  *	single-node builds see only the (behavior-identical) split.
  *
+ *	Coherent bitmap observations acquire and revalidate shared authority on
+ *	every read, including cached pins. Raw diagnostic reads remain separate.
+ *
+ *	Spec: 2026-10-19-pre2-m1-vm-positive-paths.md
  *	Spec: spec-2.36-gcs-block-transfer.md
  *
  * NOTES
@@ -123,6 +127,7 @@
 #include "catalog/pg_control.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_mode.h"
+#include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_page_cold_redo.h"
 #include "cluster/storage/cluster_smgr.h"
@@ -826,6 +831,77 @@ visibilitymap_get_status(Relation rel, BlockNumber heapBlk, Buffer *vmbuf)
 	 */
 	result = ((map[mapByte] >> mapOffset) & VISIBILITYMAP_VALID_BITS);
 	return result;
+}
+
+/*
+ * visibilitymap_get_status_coherent -- observe bits under current read authority.
+ *
+ * The relation owner retains its lifecycle lock. Call before taking any heap
+ * content lock: a cold or revoked VM pin can require a remote acquisition.
+ * The caller retains the returned pin, but no read authority survives this
+ * call. A coherent bitmap alone does not authorize visibility or freeze skips.
+ * False clears status and preserves the caller's releasable pin, if any.
+ */
+bool
+visibilitymap_get_status_coherent(Relation rel, BlockNumber heapBlk, Buffer *vmbuf, uint8 *status)
+{
+	BlockNumber mapBlock = HEAPBLK_TO_MAPBLOCK(heapBlk);
+	RelFileLocator locator;
+	ForkNumber forknum;
+	BlockNumber block;
+	Page page;
+	uint8 observed = 0;
+	bool valid;
+	static const PGAlignedBlock zero;
+
+	if (status != NULL)
+		*status = 0;
+	if (rel == NULL || vmbuf == NULL || status == NULL || heapBlk == InvalidBlockNumber)
+		return false;
+	if (!cluster_heap_maintenance_restricted(rel)) {
+		*status = visibilitymap_get_status(rel, heapBlk, vmbuf);
+		return true;
+	}
+#ifdef USE_PGRAC_CLUSTER
+	/* A local content lock cannot substitute for unavailable PCM authority. */
+	if (!cluster_pcm_is_active())
+		return false;
+#endif
+	if (BufferIsValid(*vmbuf)) {
+		BufferGetTag(*vmbuf, &locator, &forknum, &block);
+		if (!RelFileLocatorEquals(locator, rel->rd_locator) || forknum != VISIBILITYMAP_FORKNUM
+			|| block != mapBlock) {
+			ReleaseBuffer(*vmbuf);
+			*vmbuf = InvalidBuffer;
+		}
+	}
+	if (!BufferIsValid(*vmbuf)) {
+		*vmbuf = vm_readbuf(rel, mapBlock, false);
+		if (!BufferIsValid(*vmbuf))
+			return true;
+	}
+	/* A pin is not a grant. This also revalidates an existing cached grant. */
+	if (!ClusterLockBufferShareBarrierAware(*vmbuf))
+		return false;
+	BufferGetTag(*vmbuf, &locator, &forknum, &block);
+	page = BufferGetPage(*vmbuf);
+	valid = RelFileLocatorEquals(locator, rel->rd_locator) && forknum == VISIBILITYMAP_FORKNUM
+			&& block == mapBlock;
+#ifdef USE_PGRAC_CLUSTER
+	valid = valid
+			&& (PageIsNew(page) ? memcmp(page, zero.data, BLCKSZ) == 0 : vm_redo_page_valid(page));
+#else
+	(void)zero;
+#endif
+	if (valid) {
+		observed = ((uint8 *)PageGetContents(page))[HEAPBLK_TO_MAPBYTE(heapBlk)];
+		observed = (observed >> HEAPBLK_TO_OFFSET(heapBlk)) & VISIBILITYMAP_VALID_BITS;
+		valid = observed != VISIBILITYMAP_ALL_FROZEN;
+	}
+	LockBuffer(*vmbuf, BUFFER_LOCK_UNLOCK);
+	if (valid)
+		*status = observed;
+	return valid;
 }
 
 /*

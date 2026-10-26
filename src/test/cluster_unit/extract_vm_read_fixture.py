@@ -17,6 +17,10 @@ if "\ncluster_heap_maintenance_restricted(" in vm:
     print(function(vm, "cluster_heap_maintenance_restricted", "bool"))
 print(function(vm, "vm_readbuf", "static Buffer"))
 print(function(vm, "visibilitymap_get_status", "uint8"))
+if "\nvisibilitymap_get_status_coherent(" in vm:
+    print("#define FIXTURE_HAS_COHERENT_VM_READER 1")
+    print(function(vm, "vm_redo_page_valid", "static bool"))
+    print(function(vm, "visibilitymap_get_status_coherent", "bool"))
 print(function((root / "executor/nodeIndexonlyscan.c").read_text(),
                "IndexOnlyNext", "static TupleTableSlot *"))
 

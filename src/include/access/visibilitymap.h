@@ -7,6 +7,10 @@
  * Portions Copyright (c) 2007-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
+ * PGRAC MODIFICATIONS by SqlRush <sqlrush@gmail.com>
+ *    Separate coherent bitmap observations from raw diagnostic reads.
+ *    Spec: 2026-10-19-pre2-m1-vm-positive-paths.md
+ *
  * src/include/access/visibilitymap.h
  *
  *-------------------------------------------------------------------------
@@ -75,6 +79,11 @@ extern bool visibilitymap_set_retry_aware(Relation rel, BlockNumber heapBlk, Buf
 #endif
 										  );
 extern uint8 visibilitymap_get_status(Relation rel, BlockNumber heapBlk, Buffer *vmbuf);
+/* No content locks on entry; relation lifecycle lock retained. False clears
+ * status. Success observes bits only, without granting visibility/freeze skips.
+ * The returned pin remains caller-owned, with no retained content lock. */
+extern bool visibilitymap_get_status_coherent(Relation rel, BlockNumber heapBlk, Buffer *vmbuf,
+											  uint8 *status);
 extern void visibilitymap_count(Relation rel, BlockNumber *all_visible, BlockNumber *all_frozen);
 extern BlockNumber visibilitymap_prepare_truncate(Relation rel,
 												  BlockNumber nheapblocks);

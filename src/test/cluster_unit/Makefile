@@ -2364,12 +2364,14 @@ test_cluster_vm_visible_empty.inc: $(top_srcdir)/src/backend/access/heap/vacuuml
 
 test_cluster_vm_repair_versioned.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
 	awk '/^lazy_clear_visibility_versioned\(/ { print "static void"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	     /^lazy_clear_vm_after_heap\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 2) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_vm_repair_clear.inc: $(top_srcdir)/src/backend/access/heap/visibilitymap.c Makefile
 	awk '/^visibilitymap_clear(_locked)?\(/ { print "bool"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 2) exit 1 }' $< > $@.tmp
+	     /^visibilitymap_get_status\(/ { print "uint8"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 3) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_vm_repair_missing_heap.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile

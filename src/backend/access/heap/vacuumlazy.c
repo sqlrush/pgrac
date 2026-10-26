@@ -35,6 +35,8 @@
  *    can be maintained safely. Validate owned freeze inputs before releasing
  *    the original content lock. See spec-3.6b-multixact-current-dml.md and
  *    2026-10-11-pre2-p0-m5-f-multixact-am01.md.
+ *    Observe coherent VM bits before heap pins and defer VM-only repair until
+ *    heap ownership is released. Spec: 2026-10-19-pre2-m1-vm-positive-paths.md
  *
  *-------------------------------------------------------------------------
  */
@@ -958,6 +960,46 @@ lazy_clear_visibility_versioned(Relation rel, const ClusterSpaceIdentity *identi
 	END_CRIT_SECTION();
 	LockBuffer(vmbuf, BUFFER_LOCK_UNLOCK);
 }
+
+/*
+ * Clear only the VM after the scan releases heap ownership. A concurrent heap
+ * change cannot make clearing AV/AF unsafe, so no second heap fetch is needed.
+ * The original relation lifecycle lock and SPACE identity still belong to the
+ * VACUUM owner. Capture and WAL-log only this VM predecessor under its own X.
+ */
+static void
+lazy_clear_vm_after_heap(Relation rel, const ClusterSpaceIdentity *identity, BlockNumber heapblk,
+						 Buffer *vmbuf)
+{
+	const uint8 block_id = 0;
+	RfPageProducerBatchV1 versions;
+	XLogRecPtr recptr;
+
+	visibilitymap_pin(rel, heapblk, vmbuf);
+	LockBuffer(*vmbuf, BUFFER_LOCK_EXCLUSIVE);
+	/* The observed positive may already have been cleared by its writer. */
+	if (visibilitymap_get_status(rel, heapblk, vmbuf) == 0) {
+		LockBuffer(*vmbuf, BUFFER_LOCK_UNLOCK);
+		return;
+	}
+	if (!cluster_space_prepare_buffer_versions(identity, vmbuf, &block_id, 1, &versions))
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("shared visibility map repair requires an exact page version"),
+						errhint("Retry VACUUM after shared storage authority becomes available.")));
+	START_CRIT_SECTION();
+	if (!rf_page_producer_stamp_v1(&versions))
+		elog(PANIC, "shared visibility map repair predecessor changed before mutation");
+	(void)visibilitymap_clear_locked(rel, heapblk, *vmbuf, VISIBILITYMAP_VALID_BITS);
+	XLogBeginInsert();
+	XLogRegisterBuffer(0, *vmbuf, REGBUF_FORCE_IMAGE);
+	if (!rf_page_producer_register_wal_v1(&versions))
+		elog(PANIC, "shared visibility map repair cannot register its page version");
+	recptr = XLogInsert(RM_XLOG_ID, XLOG_FPI);
+	PageSetLSN(BufferGetPage(*vmbuf), recptr);
+	END_CRIT_SECTION();
+	LockBuffer(*vmbuf, BUFFER_LOCK_UNLOCK);
+}
+
 #endif
 
 /*
@@ -1000,6 +1042,8 @@ lazy_clear_visibility_versioned(Relation rel, const ClusterSpaceIdentity *identi
  * What changed: Both lock branches preserve peer MX pages before native
  * pruning or member enumeration, and compare captured inputs before unlock.
  * Why: Cleanup locking does not provide remote member authority.
+ * Shared VM observations precede heap pins; VM-only repair follows heap release
+ * so a remote VM acquisition cannot nest below this scan's heap content lock.
  */
 
 static void
@@ -1038,6 +1082,9 @@ lazy_scan_heap(LVRelState *vacrel)
 		LVPagePruneState prunestate;
 
 #ifdef USE_PGRAC_CLUSTER
+		uint8 shared_vm_status = 0;
+		bool shared_vm_clear = false;
+
 		/* A skipped/new/empty/error page must not inherit the preceding input. */
 		vacrel->shared_freeze_input_captured = false;
 		vacrel->shared_freeze_input_valid = false;
@@ -1142,6 +1189,14 @@ lazy_scan_heap(LVRelState *vacrel)
 		 * all-visible.  In most cases this will be very cheap, because we'll
 		 * already have the correct page pinned anyway.
 		 */
+#ifdef USE_PGRAC_CLUSTER
+		/* PGRAC: bitmap observations do not authorize shared page skipping.
+		 * Acquire VM-S before heap pins; conservative repair is deferred until
+		 * the original heap lock and pin have both been released. */
+		if (vacrel->shared_maintenance_restricted
+			&& !visibilitymap_get_status_coherent(vacrel->rel, blkno, &vmbuffer, &shared_vm_status))
+			shared_vm_status = 0;
+#endif
 		visibilitymap_pin(vacrel->rel, blkno, &vmbuffer);
 
 		/*
@@ -1318,6 +1373,10 @@ lazy_scan_heap(LVRelState *vacrel)
 			Assert(dead_items->num_items == 0);
 		}
 
+#ifdef USE_PGRAC_CLUSTER
+		shared_vm_clear = vacrel->versioned && (shared_vm_status & VISIBILITYMAP_ALL_VISIBLE) != 0
+						  && !PageIsAllVisible(page);
+#endif
 		/*
 		 * Handle setting visibility map bit based on information from the VM
 		 * (as of last lazy_scan_skip() call), and from prunestate
@@ -1504,6 +1563,10 @@ lazy_scan_heap(LVRelState *vacrel)
 #endif
 			RecordPageWithFreeSpace(vacrel->rel, blkno, freespace);
 		}
+#ifdef USE_PGRAC_CLUSTER
+		if (shared_vm_clear)
+			lazy_clear_vm_after_heap(vacrel->rel, &vacrel->identity, blkno, &vmbuffer);
+#endif
 	}
 
 	vacrel->blkno = InvalidBlockNumber;

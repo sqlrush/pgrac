@@ -30,6 +30,7 @@
 #include "catalog/pg_control.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_space_storage.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/storage/cluster_smgr.h"
 #include "miscadmin.h"
@@ -41,6 +42,26 @@
 #include "test_cluster_heap_maintenance_policy.inc"
 
 UT_DEFINE_GLOBALS();
+
+/* Online page/version fixtures use TARGET_READY; recovered admission is
+ * controlled separately and is never granted by these storage leaves. */
+BackendType MyBackendType = B_BACKEND;
+ClusterNormalStartState
+cluster_semantic_normal_start_state(void)
+{
+	return CLUSTER_NORMAL_START_TARGET_READY;
+}
+bool
+cluster_semantic_activation_phase1_pristine(void)
+{
+	return false;
+}
+bool
+cluster_semantic_activation_recovered_open_current(void)
+{
+	return false;
+}
+
 
 #ifdef USE_ASSERT_CHECKING
 /* Preserve assertion failure while allowing directives inside the native call
@@ -79,7 +100,7 @@ static unsigned edge_count, inserts, dirty[2], registered[2], lock_calls;
 static TransactionId expected_cutoff;
 static int nonpermanent_buffer;
 static uint8 register_flags[2];
-static bool begun, expecting_error, checksums, repairing;
+static bool begun, expecting_error, checksums, repairing, repairing_vm_only;
 static jmp_buf error_jump;
 
 void
@@ -252,8 +273,8 @@ void
 XLogRegisterPageVersionEdge(uint64 token, const RfPageVersionEdgeEntryV1 *entries, uint8 count)
 {
 	UT_ASSERT(begun);
-	UT_ASSERT_EQ(count, 2);
-	memcpy(edges, entries, sizeof(edges));
+	UT_ASSERT_EQ(count, repairing_vm_only ? 1 : 2);
+	memcpy(edges, entries, count * sizeof(*edges));
 	edge_count = count;
 	edge_token = token;
 }
@@ -261,13 +282,39 @@ XLogRecPtr
 XLogInsert(RmgrId rmgr, uint8 info)
 {
 	UT_ASSERT(begun && dirty[1] > 0);
-	if (cluster_shared_config)
+	if (cluster_shared_config && !repairing_vm_only)
 		UT_ASSERT(dirty[0] > 0);
 	UT_ASSERT_EQ(rmgr, repairing ? RM_XLOG_ID : RM_HEAP2_ID);
 	UT_ASSERT_EQ(info, repairing ? XLOG_FPI : XLOG_HEAP2_VISIBLE);
 	begun = false;
 	inserts++;
 	return UINT64_C(0x9000);
+}
+
+/* These storage leaves must stay unreachable with the original exact pin. */
+static Buffer
+vm_readbuf(Relation rel, BlockNumber block, bool extend)
+{
+	(void)rel;
+	(void)block;
+	(void)extend;
+	abort();
+}
+
+void
+ReleaseBuffer(Buffer buffer)
+{
+	(void)buffer;
+	abort();
+}
+
+void
+visibilitymap_pin(Relation rel, BlockNumber block, Buffer *buffer)
+{
+	UT_ASSERT(rel == &relation);
+	UT_ASSERT_EQ(block, 0);
+	UT_ASSERT(!BufferIsValid(*buffer) || *buffer == 2);
+	*buffer = 2;
 }
 
 #include "test_cluster_vm_repair_clear.inc"
@@ -297,6 +344,7 @@ run_set(Relation rel, BlockNumber heapBlk, Buffer heapBuf, XLogRecPtr recptr, Bu
 	expected_cutoff = 70;
 	nonpermanent_buffer = 0;
 	begun = expecting_error = InRecovery = wal_log_hints = checksums = repairing = false;
+	repairing_vm_only = false;
 	next_token = 100;
 	edge_token = 0;
 	relation.rd_rel = &relform;
@@ -484,6 +532,65 @@ run_actual_visibility_repair(bool lpdead)
 	repairing = false;
 }
 
+UT_TEST(test_deferred_vm_clear_logs_only_vm_and_preserves_heap_and_other_bits)
+{
+	Buffer vm = InvalidBuffer;
+
+	reset(true, false, VISIBILITYMAP_VALID_BITS | (VISIBILITYMAP_VALID_BITS << 2));
+	repairing = repairing_vm_only = true;
+	lazy_clear_vm_after_heap(&relation, &identity, 0, &vm);
+	UT_ASSERT_EQ(vm, 2);
+	UT_ASSERT_EQ(inserts, 1);
+	UT_ASSERT_EQ(edge_count, 1);
+	UT_ASSERT_EQ(edges[0].block_id, 0);
+	UT_ASSERT_EQ(edges[0].before.mutation_token, 30);
+	UT_ASSERT_EQ(edge_token, 101);
+	UT_ASSERT_EQ(registered[0], 1);
+	UT_ASSERT_EQ(registered[1], 0);
+	UT_ASSERT_EQ(register_flags[0], REGBUF_FORCE_IMAGE);
+	UT_ASSERT_EQ(dirty[0], 0);
+	UT_ASSERT_EQ(dirty[1], 1);
+	UT_ASSERT_EQ(memcmp(pages[0].data, before[0].data, BLCKSZ), 0);
+	UT_ASSERT_EQ(*PageGetContents(pages[1].data), VISIBILITYMAP_VALID_BITS << 2);
+	UT_ASSERT_EQ(*PageGetContents(images[0].data), VISIBILITYMAP_VALID_BITS << 2);
+	UT_ASSERT_EQ(((PageHeader)pages[1].data)->pd_block_scn, 101);
+	UT_ASSERT_EQ(PageGetLSN(pages[1].data), UINT64_C(0x9000));
+	UT_ASSERT_EQ(lock_calls, 2);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+}
+
+UT_TEST(test_deferred_vm_clear_rechecks_current_before_allocating_version)
+{
+	Buffer vm = 2;
+
+	reset(true, false, 0);
+	repairing = repairing_vm_only = true;
+	lazy_clear_vm_after_heap(&relation, &identity, 0, &vm);
+	UT_ASSERT_EQ(inserts + edge_count + dirty[0] + dirty[1], 0);
+	UT_ASSERT_EQ(next_token, 100);
+	UT_ASSERT_EQ(lock_calls, 2);
+	UT_ASSERT_EQ(memcmp(pages, before, sizeof(pages)), 0);
+}
+
+UT_TEST(test_deferred_vm_clear_refuses_missing_version_before_modification)
+{
+	Buffer vm = 2;
+
+	reset(true, false, VISIBILITYMAP_VALID_BITS);
+	((PageHeader)pages[1].data)->pd_block_scn = 0;
+	memcpy(before, pages, sizeof(pages));
+	repairing = repairing_vm_only = expecting_error = true;
+	if (setjmp(error_jump) == 0) {
+		lazy_clear_vm_after_heap(&relation, &identity, 0, &vm);
+		UT_ASSERT(false);
+	}
+	expecting_error = false;
+	UT_ASSERT_EQ(next_token, 100);
+	UT_ASSERT_EQ(inserts + edge_count + dirty[0] + dirty[1], 0);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT_EQ(memcmp(pages, before, sizeof(pages)), 0);
+}
+
 UT_TEST(test_actual_vacuum_repairs_version_both_pages)
 {
 	for (int lpdead = 0; lpdead < 2; lpdead++) {
@@ -578,7 +685,7 @@ UT_TEST(test_actual_empty_vacuum_does_not_acquire_vm_in_critical)
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(14);
 	UT_RUN(test_visible_exact_two_page_batch);
 	UT_RUN(test_no_change_allocates_no_version);
 	UT_RUN(test_nonshared_preserves_native_hint_lsn_rules);
@@ -587,6 +694,9 @@ main(void)
 	UT_RUN(test_bad_component_refuses_before_either_page_changes);
 	UT_RUN(test_recovery_uses_record_lsn_without_runtime_identity_or_wal);
 	UT_RUN(test_actual_empty_vacuum_does_not_acquire_vm_in_critical);
+	UT_RUN(test_deferred_vm_clear_logs_only_vm_and_preserves_heap_and_other_bits);
+	UT_RUN(test_deferred_vm_clear_rechecks_current_before_allocating_version);
+	UT_RUN(test_deferred_vm_clear_refuses_missing_version_before_modification);
 	UT_RUN(test_actual_vacuum_repairs_version_both_pages);
 	UT_RUN(test_actual_vacuum_repair_refuses_before_modification);
 	UT_RUN(test_nonshared_vacuum_repairs_keep_original_behavior);
