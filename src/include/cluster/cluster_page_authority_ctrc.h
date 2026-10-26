@@ -52,6 +52,10 @@ extern RfPageAuthorityVerdictV1 rf_page_authority_ctrc_replays_promote_nowait_v1
 extern RfPageAuthorityVerdictV1 rf_page_authority_ctrc_replays_promote_fpi_nowait_v1(
 	RfPageCtrcAuthorityV1 *authority, const RfPageIdentityV1 *identity,
 	const RfPageVersionV1 *expected_before);
+/* Drop only local PAGE locks and retain the same immutable preflight for an
+ * exact later promotion. No I/O, allocation or borrowed-owner dereference or
+ * retirement. The caller must revalidate/reobserve before using PAGE again. */
+extern bool rf_page_authority_ctrc_replays_unpromote_v1(RfPageCtrcAuthorityV1 *authority);
 extern RfPageAuthorityVerdictV1 rf_page_authority_ctrc_replays_revalidate_nowait_v1(
 	const RfPageCtrcAuthorityV1 *authority);
 /* Exact target version under all original current native owners and PAGE.
