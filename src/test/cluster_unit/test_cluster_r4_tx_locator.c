@@ -42,6 +42,10 @@ extern ClusterTxOutcome cluster_runtime_visibility_resolve_terminal_census_retai
 
 UT_DEFINE_GLOBALS();
 
+/* Execute the actual test-module entry against the production resolver.
+ * Admission and providers below remain explicit backend-free fixtures. */
+#include "test_cluster_m2_sample_origin.inc"
+
 bool cluster_enabled = true;
 bool cluster_shared_config = false;
 int cluster_node_id = 0;
@@ -530,9 +534,9 @@ UT_TEST(test_resolver_refuses_before_target_admission_until_recovered_open)
 	test_recovered_open = false;
 	test_admission_result = CLUSTER_SEMANTIC_ADMISSION_OK;
 	memset(&resolution, 0xA5, sizeof(resolution));
-	UT_ASSERT_EQ(cluster_tx_resolve_exact(&locator, CLUSTER_TX_RESOLVE_VISIBILITY, &resolution,
-										 &reason),
-					 CLUSTER_TX_UNKNOWN);
+	UT_ASSERT_EQ(
+		cluster_tx_resolve_exact(&locator, CLUSTER_TX_RESOLVE_VISIBILITY, &resolution, &reason),
+		CLUSTER_TX_UNKNOWN);
 	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_RF_DEFERRED);
 	UT_ASSERT(bytes_are_zero(&resolution, sizeof(resolution)));
 	UT_ASSERT_EQ(test_enter_calls, 0);
@@ -540,7 +544,7 @@ UT_TEST(test_resolver_refuses_before_target_admission_until_recovered_open)
 	reason = CLUSTER_TX_RESOLVE_NONE;
 	memset(&multi_resolution, 0xA5, sizeof(multi_resolution));
 	UT_ASSERT_EQ(cluster_tx_resolve_multixact((MultiXactId)91, &multi_resolution, &reason),
-					 CLUSTER_TX_UNKNOWN);
+				 CLUSTER_TX_UNKNOWN);
 	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_RF_DEFERRED);
 	UT_ASSERT(bytes_are_zero(&multi_resolution, sizeof(multi_resolution)));
 	UT_ASSERT_EQ(test_enter_calls, 0);
@@ -985,6 +989,158 @@ prepare_shared_row_wait_fixture(int origin)
 	test_provider_resolution.top_xid = locator.xid;
 	test_provider_resolution.authority.origin_epoch = test_formation_epoch;
 	return locator;
+}
+
+UT_TEST(test_m2_origin_probe_uses_admitted_visibility_with_canonical_echo)
+{
+	int epoch, origin, leg;
+
+	for (epoch = 0; epoch <= 1; epoch++) {
+		for (origin = 1; origin <= 2; origin++) {
+			for (leg = 0; leg < 3; leg++) {
+				ClusterTxLocator locator = prepare_shared_row_wait_fixture(origin);
+				ClusterTxLocator before = locator;
+				ClusterTxLocator partial = locator;
+				ClusterTxResolution resolution;
+				ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+				ClusterTxOutcome expected = leg == 0   ? CLUSTER_TX_IN_PROGRESS
+											: leg == 1 ? CLUSTER_TX_COMMITTED
+													   : CLUSTER_TX_ABORTED;
+
+				test_formation_epoch = epoch;
+				/* Page ITL incarnation zero is independent of canonical TT wrap. */
+				test_provider_resolution.locator_echo.tt_wrap = 7;
+				partial.tt_wrap = TT_WRAP_INVALID;
+				test_provider_resolution.authority.origin_epoch = epoch;
+				test_provider_outcome = expected;
+				test_provider_resolution.outcome = expected;
+				test_provider_resolution.commit_scn = leg == 1 ? (SCN)101 : InvalidScn;
+				UT_ASSERT_EQ(sample_origin(&locator, &resolution, &reason), expected);
+				UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_NONE);
+				UT_ASSERT_EQ(test_admitted_provider_calls, 1);
+				UT_ASSERT_EQ(test_legacy_provider_calls, 0);
+				UT_ASSERT_EQ(test_provider_locator.tt_wrap, TT_WRAP_INVALID);
+				UT_ASSERT_EQ(test_provider_mode, CLUSTER_TX_RESOLVE_VISIBILITY);
+				UT_ASSERT_EQ(test_provider_epoch, epoch);
+				UT_ASSERT(cluster_tx_locator_reply_matches(&partial, &resolution.locator_echo));
+				UT_ASSERT_EQ(resolution.locator_echo.tt_wrap, 7);
+				UT_ASSERT_EQ(memcmp(&locator, &before, sizeof(locator)), 0);
+				UT_ASSERT_EQ(test_enter_calls, 1);
+				UT_ASSERT_EQ(test_recheck_calls, epoch == 0 ? 2 : 1);
+				UT_ASSERT_EQ(test_leave_calls, 1);
+				UT_ASSERT_EQ(test_terminal_census_enter_calls, 0);
+			}
+		}
+	}
+}
+
+UT_TEST(test_m2_origin_probe_rejects_partial_page_input_and_invalid_canonical_wrap)
+{
+	int leg;
+
+	for (leg = 0; leg < 2; leg++) {
+		ClusterTxLocator locator = prepare_shared_row_wait_fixture(2);
+		ClusterTxResolution resolution;
+		ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_NONE;
+
+		if (leg == 0)
+			locator.tt_wrap = TT_WRAP_INVALID;
+		else
+			test_provider_resolution.locator_echo.tt_wrap = TT_WRAP_INVALID;
+		memset(&resolution, 0xA5, sizeof(resolution));
+		UT_ASSERT_EQ(sample_origin(&locator, &resolution, &reason), CLUSTER_TX_UNKNOWN);
+		UT_ASSERT(reason != CLUSTER_TX_RESOLVE_NONE);
+		UT_ASSERT(bytes_are_zero(&resolution, sizeof(resolution)));
+		UT_ASSERT_EQ(test_admitted_provider_calls, leg == 0 ? 0 : 1);
+		UT_ASSERT_EQ(test_legacy_provider_calls, 0);
+		UT_ASSERT_EQ(test_enter_calls, leg == 0 ? 0 : 1);
+		UT_ASSERT_EQ(test_leave_calls, leg == 0 ? 0 : 1);
+	}
+}
+
+UT_TEST(test_m2_origin_probe_rejects_full_locator_drift)
+{
+	int leg;
+
+	for (leg = 0; leg < 5; leg++) {
+		ClusterTxLocator locator = prepare_shared_row_wait_fixture(2);
+		ClusterTxResolution resolution;
+		ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_NONE;
+
+		if (leg == 0)
+			test_provider_resolution.locator_echo.uba.raw[0]++;
+		if (leg == 1)
+			test_provider_resolution.locator_echo.uba.raw[1]++;
+		if (leg == 2)
+			test_provider_resolution.locator_echo.xid++;
+		if (leg == 3)
+			test_provider_resolution.locator_echo.itl_kind = ITL_FLAG_LOCK_ONLY_ACTIVE;
+		if (leg == 4)
+			test_provider_resolution.locator_echo.itl_slot_index++;
+		memset(&resolution, 0xA5, sizeof(resolution));
+		UT_ASSERT_EQ(sample_origin(&locator, &resolution, &reason), CLUSTER_TX_UNKNOWN);
+		UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_PROTOCOL);
+		UT_ASSERT(bytes_are_zero(&resolution, sizeof(resolution)));
+		UT_ASSERT_EQ(test_admitted_provider_calls, 1);
+		UT_ASSERT_EQ(test_legacy_provider_calls, 0);
+		UT_ASSERT_EQ(test_leave_calls, 1);
+	}
+}
+
+UT_TEST(test_m2_origin_probe_unknown_keeps_original_qualification_fences)
+{
+	int leg;
+
+	for (leg = 0; leg < 5; leg++) {
+		ClusterTxLocator locator = prepare_shared_row_wait_fixture(2);
+		ClusterTxResolution resolution;
+		ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_NONE;
+
+		if (leg == 0) {
+			test_provider_outcome = CLUSTER_TX_UNKNOWN;
+			test_provider_reason = CLUSTER_TX_RESOLVE_IO_ERROR;
+		}
+		if (leg == 1)
+			test_recheck_result = false;
+		if (leg == 2)
+			test_provider_mutates_epoch = true;
+		if (leg == 3)
+			test_admission_result = CLUSTER_SEMANTIC_ADMISSION_TARGET_DISABLED;
+		if (leg == 4)
+			test_provider_resolution.authority.origin_epoch++;
+		memset(&resolution, 0xA5, sizeof(resolution));
+		UT_ASSERT_EQ(sample_origin(&locator, &resolution, &reason), CLUSTER_TX_UNKNOWN);
+		UT_ASSERT(reason != CLUSTER_TX_RESOLVE_NONE);
+		if (leg == 0)
+			UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_IO_ERROR);
+		UT_ASSERT(bytes_are_zero(&resolution, sizeof(resolution)));
+		UT_ASSERT_EQ(test_admitted_provider_calls, leg == 3 ? 0 : 1);
+		UT_ASSERT_EQ(test_legacy_provider_calls, 0);
+		UT_ASSERT_EQ(test_leave_calls, leg == 3 ? 0 : 1);
+	}
+}
+
+UT_TEST(test_m2_origin_probe_provider_error_releases_original_admission)
+{
+	ClusterTxLocator locator = prepare_shared_row_wait_fixture(2);
+	ClusterTxResolution resolution;
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_NONE;
+	volatile bool caught = false;
+
+	test_provider_raise = true;
+	PG_TRY();
+	{
+		(void)sample_origin(&locator, &resolution, &reason);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(test_admitted_provider_calls, 1);
+	UT_ASSERT_EQ(test_legacy_provider_calls, 0);
+	UT_ASSERT_EQ(test_leave_calls, 1);
 }
 
 UT_TEST(test_shared_row_wait_uses_current_origin_at_nonzero_epoch)
@@ -1634,7 +1790,12 @@ UT_TEST(test_terminal_census_batch_preflight_delegates_exit_hook_ensure)
 int
 main(void)
 {
-	UT_PLAN(68);
+	UT_PLAN(73);
+	UT_RUN(test_m2_origin_probe_uses_admitted_visibility_with_canonical_echo);
+	UT_RUN(test_m2_origin_probe_rejects_partial_page_input_and_invalid_canonical_wrap);
+	UT_RUN(test_m2_origin_probe_rejects_full_locator_drift);
+	UT_RUN(test_m2_origin_probe_unknown_keeps_original_qualification_fences);
+	UT_RUN(test_m2_origin_probe_provider_error_releases_original_admission);
 	UT_RUN(test_shared_row_wait_uses_current_origin_at_nonzero_epoch);
 	UT_RUN(test_shared_row_wait_rejects_canonical_identity_and_admission_drift);
 	UT_RUN(test_shared_row_wait_unknown_does_not_fall_back_to_legacy_provider);

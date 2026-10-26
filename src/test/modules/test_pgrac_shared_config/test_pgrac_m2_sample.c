@@ -160,6 +160,25 @@ done:
 	return sampled;
 }
 
+static ClusterTxOutcome
+sample_origin(const ClusterTxLocator *locator, ClusterTxResolution *resolution,
+			  ClusterTxResolveReason *reason)
+{
+	ClusterTxLocator request = *locator;
+
+	/* As in the heap's partial visibility callers, page ITL wrap identifies
+	 * the page slot, not the canonical TT incarnation. Only the original
+	 * exact origin proof supplies TT wrap. The resolver checks the complete
+	 * UBA/xid/ITL echo, native proof and current admission before returning. */
+	if (locator->tt_wrap == TT_WRAP_INVALID) {
+		memset(resolution, 0, sizeof(*resolution));
+		*reason = CLUSTER_TX_RESOLVE_WRAP_MISMATCH;
+		return CLUSTER_TX_UNKNOWN;
+	}
+	request.tt_wrap = TT_WRAP_INVALID;
+	return cluster_tx_resolve_exact(&request, CLUSTER_TX_RESOLVE_VISIBILITY, resolution, reason);
+}
+
 static bool
 page_locator(Oid relid, int32 block, TransactionId xid, ClusterTxLocator *locator)
 {
@@ -215,8 +234,7 @@ test_pgrac_m2_sample(PG_FUNCTION_ARGS)
 		else if (strcmp(path, "origin") == 0) {
 			locator_found = page_locator(PG_GETARG_OID(1), PG_GETARG_INT32(2), xid, &locator);
 			if (locator_found) {
-				outcome = cluster_tx_resolve_exact(&locator, CLUSTER_TX_RESOLVE_VISIBILITY,
-												   &resolution, &reason);
+				outcome = sample_origin(&locator, &resolution, &reason);
 				if (outcome != CLUSTER_TX_UNKNOWN)
 					scn = resolution.commit_scn;
 			}
