@@ -345,7 +345,8 @@ cluster_tt_local_rollover_error(uint32 seg, bool at_hard_cap)
  */
 static ClusterTTLocalReserveResult
 cluster_tt_local_reserve_binding(TransactionId top_xid, uint32 *out_segment_id,
-								 uint16 *out_slot_offset, uint32 *out_tt_slot_id)
+								 uint16 *out_slot_offset, uint32 *out_tt_slot_id,
+								 bool *capacity_preflight_safe)
 {
 	if (!cluster_enabled || cluster_node_id < 0)
 		return CLUSTER_TT_LOCAL_UNAVAILABLE;
@@ -358,6 +359,7 @@ cluster_tt_local_reserve_binding(TransactionId top_xid, uint32 *out_segment_id,
 		if (idx >= 0) {
 			const ClusterTTLocalBinding *b = &cluster_tt_local_bindings[idx];
 
+			*capacity_preflight_safe = false;
 			if (b->publish_state == CLUSTER_CANONICAL_TXN_FAILED)
 				ereport(ERROR,
 						(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
@@ -404,8 +406,10 @@ cluster_tt_local_reserve_binding(TransactionId top_xid, uint32 *out_segment_id,
 					cluster_node_id, seg, top_xid, &retained_pressure, &current_drift, &wrap);
 			if (current_drift)
 				continue;
-			if (off != INVALID_TT_SLOT_OFFSET)
+			if (off != INVALID_TT_SLOT_OFFSET) {
+				*capacity_preflight_safe = false;
 				break;
+			}
 
 			if (!retained_pressure)
 				/* All 48 slots ACTIVE -- genuine in-flight concurrency limit. */
@@ -430,19 +434,22 @@ cluster_tt_local_reserve_binding(TransactionId top_xid, uint32 *out_segment_id,
 			 */
 			{
 				bool at_hard_cap = false;
-				uint32 new_seg
-					= cluster_undo_tt_rollover_locked(cluster_node_id, seg, &at_hard_cap);
+				bool no_side_effects = false;
+				uint32 new_seg = cluster_undo_tt_rollover_locked(cluster_node_id, seg, &at_hard_cap,
+																 &no_side_effects);
+
+				*capacity_preflight_safe &= no_side_effects;
 
 				if (new_seg == 0) {
-					if (at_hard_cap) {
-						/* No slot, canonical BIND or CTRC responsibility exists.
-						 * The caller must leave its modifier before waiting. */
+					if (at_hard_cap && *capacity_preflight_safe) {
+						/* The entire prepare still precedes slot allocation and
+						 * segment effects, not just this last selection. */
 						*out_segment_id = seg;
 						*out_slot_offset = INVALID_TT_SLOT_OFFSET;
 						*out_tt_slot_id = 0;
 						return CLUSTER_TT_LOCAL_NEED_CAPACITY;
 					}
-					cluster_tt_local_rollover_error(seg, false);
+					cluster_tt_local_rollover_error(seg, at_hard_cap);
 				}
 			}
 		}
@@ -847,6 +854,9 @@ cluster_tt_local_prepare_canonical_active(TransactionId top_xid,
 	ClusterXidStripeSampleFence capacity_lease = { 0 };
 	bool capacity_pending = false;
 	bool capacity_striped = false;
+	/* Never regain preflight after this prepare has owned a slot or started
+	 * a segment producer, even if an unpublished binding is later forgotten. */
+	bool capacity_preflight_safe = true;
 
 	if (binding_out == NULL)
 		return false;
@@ -921,8 +931,8 @@ cluster_tt_local_prepare_canonical_active(TransactionId top_xid,
 			if (capacity_pending)
 				cluster_tt_local_modifier_recheck_or_error(&modifier_token);
 
-			reserve_result
-				= cluster_tt_local_reserve_binding(top_xid, &segment_id, &slot_offset, &tt_slot_id);
+			reserve_result = cluster_tt_local_reserve_binding(
+				top_xid, &segment_id, &slot_offset, &tt_slot_id, &capacity_preflight_safe);
 			if (reserve_result == CLUSTER_TT_LOCAL_NEED_CAPACITY) {
 				cluster_tt_local_modifier_recheck_or_error(&modifier_token);
 				if (!capacity_pending) {

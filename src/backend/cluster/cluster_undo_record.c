@@ -4433,7 +4433,8 @@ cluster_undo_autoextend_count(void)
  *	their exact locks below.
  */
 uint32
-cluster_undo_tt_rollover_locked(int node_id, uint32 old_segment_id, bool *out_at_hard_cap)
+cluster_undo_tt_rollover_locked(int node_id, uint32 old_segment_id, bool *out_at_hard_cap,
+								bool *out_no_side_effects)
 {
 	uint8 owner_instance = (uint8)(node_id + 1);
 	ClusterUndoBlock0LogicalKey logical;
@@ -4445,9 +4446,12 @@ cluster_undo_tt_rollover_locked(int node_id, uint32 old_segment_id, bool *out_at
 	uint32 reused = 0;
 	bool selected = false;
 	bool mark_old_committed = false;
+	bool no_side_effects = true;
 
 	if (out_at_hard_cap != NULL)
 		*out_at_hard_cap = false;
+	if (out_no_side_effects != NULL)
+		*out_no_side_effects = false;
 
 	if (UndoRecordShared == NULL)
 		return 0;
@@ -4459,6 +4463,8 @@ rollover_retry_locked:
 	/* Double-checked: a peer may already have rolled this node over. */
 	cur = cluster_tt_slot_current_segment(node_id);
 	if (cur != 0 && cur != old_segment_id) {
+		if (out_no_side_effects != NULL)
+			*out_no_side_effects = no_side_effects;
 		LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
 		LWLockRelease(&UndoRecordShared->cursor_lock.lock);
 		return cur;
@@ -4476,6 +4482,8 @@ rollover_retry_locked:
 	if (!selected) {
 		if (out_at_hard_cap != NULL)
 			*out_at_hard_cap = extend_plan.at_hard_cap;
+		if (out_no_side_effects != NULL)
+			*out_no_side_effects = no_side_effects;
 		/* S3 forensics step 1a — TT-rollover-specific failure split (the
 		 * record-extent CLAIM path counts its own hard-cap fails). */
 		if (out_at_hard_cap != NULL && *out_at_hard_cap)
@@ -4492,6 +4500,9 @@ rollover_retry_locked:
 	}
 	new_segment_id = extend_plan.segment_id;
 	if (extend_plan.needs_reuse || extend_plan.needs_provision) {
+		/* A later selection failure does not undo this producer attempt.
+		 * Preserve that fact across rollover_retry_locked. */
+		no_side_effects = false;
 		LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
 		PG_TRY();
 		{
@@ -4539,6 +4550,7 @@ rollover_retry_locked:
 	 * lifecycle state as record segments so a later drained rollover can advance
 	 * ACTIVE -> COMMITTED -> RECYCLABLE.
 	 */
+	no_side_effects = false;
 	LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
 	PG_TRY();
 	{

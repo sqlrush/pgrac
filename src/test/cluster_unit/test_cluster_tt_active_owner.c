@@ -48,6 +48,11 @@ static unsigned capacity_supply_after;
 static unsigned capacity_admission_change;
 static unsigned capacity_lease_captures;
 static uint32 capacity_selected_segment;
+static bool capacity_rollover_fill_once;
+static bool capacity_passive_rollover;
+static bool capacity_selection_unknown;
+static bool capacity_prior_reservation;
+static void fill_selected_segment(ClusterTTSlotAllocStatus status);
 bool cluster_shared_catalog;
 bool cluster_xid_striping;
 static VariableCacheData capacity_variables;
@@ -237,7 +242,7 @@ cluster_undo_active_segment_for_node_or_create(int node pg_attribute_unused())
 }
 
 uint32
-cluster_undo_tt_rollover_locked(int node, uint32 old, bool *hard_cap)
+cluster_undo_tt_rollover_locked(int node, uint32 old, bool *hard_cap, bool *no_side_effects)
 {
 	UT_ASSERT(cold_fixture);
 	UT_ASSERT_EQ(node, 0);
@@ -245,12 +250,23 @@ cluster_undo_tt_rollover_locked(int node, uint32 old, bool *hard_cap)
 	UT_ASSERT_EQ(lock_depth, 0);
 	cold_selection_calls++;
 	*hard_cap = cold_capacity_refused;
+	/* The original producer's exact output is tested separately. Unknown
+	 * leaves the caller's pessimistic initial value untouched. */
+	if (!capacity_selection_unknown)
+		*no_side_effects
+			= cold_capacity_refused || (capacity_rollover_fill_once && capacity_passive_rollover);
 	if (cold_capacity_refused)
 		return 0;
 	/* Only physical selection/current publication is doubled. The actual
 	 * allocator, local consumer and durable ACTIVE producer run below. */
 	cluster_tt_slot_rollover(node, cold_successor, NULL);
-	return cold_successor;
+	if (capacity_rollover_fill_once) {
+		capacity_rollover_fill_once = false;
+		capacity_selected_segment = cold_successor++;
+		fill_selected_segment(CTS_COMMITTED);
+		cold_capacity_refused = true;
+	}
+	return cluster_tt_slot_current_segment(node);
 }
 
 bool
@@ -265,7 +281,7 @@ cluster_undo_cleaner_wait_for_capacity(uint32 segment, ClusterCtrcTxnKeyV1 *key)
 		UT_ASSERT_EQ(cluster_tt_local_binding_count, 0);
 		UT_ASSERT_EQ(g_bind_emit_calls, 0);
 		UT_ASSERT_EQ(g_ctrc_reserve_calls, 0);
-		UT_ASSERT_EQ(g_current_acquire_calls, 0);
+		UT_ASSERT_EQ(g_current_acquire_calls, capacity_prior_reservation ? 1 : 0);
 		/* The real safe-context predicate refuses any held admission. */
 		if (modifier_enters != modifier_leaves || capacity_other_admission)
 			return false;
@@ -388,6 +404,8 @@ reset_active_owner(void)
 	capacity_supply_after = 1;
 	capacity_admission_change = 0;
 	capacity_selected_segment = 0;
+	capacity_rollover_fill_once = capacity_passive_rollover = capacity_selection_unknown
+		= capacity_prior_reservation = false;
 	cluster_shared_catalog = cluster_xid_striping = false;
 	ShmemVariableCache->nextXid = FullTransactionIdFromU64(300);
 	cold_successor = 2;
@@ -526,8 +544,10 @@ UT_TEST(test_binding_growth_error_preserves_existing_reservations)
 		uint32 segment;
 		uint16 slot;
 		uint32 slot_id;
+		bool preflight_safe = true;
 
-		UT_ASSERT(cluster_tt_local_reserve_binding(101 + i, &segment, &slot, &slot_id));
+		UT_ASSERT(
+			cluster_tt_local_reserve_binding(101 + i, &segment, &slot, &slot_id, &preflight_safe));
 	}
 	UT_ASSERT_EQ(cluster_tt_local_binding_count, 8);
 	UT_ASSERT_EQ(cluster_tt_local_binding_capacity, 8);
@@ -750,6 +770,100 @@ UT_TEST(test_retained_selected_segment_rechecks_allocator_after_capacity_wait)
 	UT_ASSERT_EQ(capacity_waits, 1);
 	UT_ASSERT_EQ(cold_selection_calls, 2);
 	UT_ASSERT_EQ(modifier_enters, 2);
+	cluster_undo_retention_horizon_enabled = false;
+}
+
+/* A later hard-cap selection cannot erase an earlier rollover's effects in
+ * this same reserve call. The actual allocator consumes the intervening
+ * CURRENT change; only the physical rollover producer is a boundary input. */
+UT_TEST(test_capacity_after_successful_rollover_keeps_error_boundary)
+{
+	for (int cold = 0; cold < 2; cold++) {
+		start_capacity_test();
+		if (!cold) {
+			cluster_tt_slot_rollover(0, 1, NULL);
+			capacity_selected_segment = 1;
+			fill_selected_segment(CTS_COMMITTED);
+		}
+		cluster_undo_retention_horizon_enabled = true;
+		cold_capacity_refused = false;
+		capacity_rollover_fill_once = true;
+		require_capacity_error(ERRCODE_PROGRAM_LIMIT_EXCEEDED);
+		UT_ASSERT_EQ(capacity_waits, 0);
+		UT_ASSERT_EQ(cold_selection_calls, 2);
+		UT_ASSERT_EQ(cluster_tt_slot_current_segment(0), 2);
+		UT_ASSERT_EQ(modifier_enters, 1);
+		cluster_undo_retention_horizon_enabled = false;
+	}
+}
+
+UT_TEST(test_capacity_unknown_rollover_effects_do_not_enter_wait)
+{
+	start_capacity_test();
+	capacity_selection_unknown = capacity_other_admission = true;
+	require_capacity_error(ERRCODE_PROGRAM_LIMIT_EXCEEDED);
+	UT_ASSERT_EQ(capacity_waits, 0);
+	UT_ASSERT_EQ(cold_selection_calls, 1);
+}
+
+UT_TEST(test_capacity_passive_winner_adoption_preserves_safe_wait)
+{
+	start_capacity_test();
+	cluster_undo_retention_horizon_enabled = true;
+	cold_capacity_refused = false;
+	capacity_rollover_fill_once = capacity_passive_rollover = true;
+	require_published_on(3);
+	UT_ASSERT_EQ(capacity_waits, 1);
+	UT_ASSERT_EQ(cold_selection_calls, 3);
+	UT_ASSERT_EQ(modifier_enters, 2);
+	cluster_undo_retention_horizon_enabled = false;
+}
+
+static void
+roll_away_to_retained_capacity(void)
+{
+	roll_current_once();
+	capacity_selected_segment = cluster_tt_slot_current_segment(0);
+	fill_selected_segment(CTS_COMMITTED);
+}
+
+/* An unpublished durable-producer retry has already owned a local slot.
+ * Forgetting that reservation must not reset the whole prepare's preflight. */
+UT_TEST(test_capacity_after_unpublished_reservation_does_not_reenter_preflight)
+{
+	ClusterCanonicalTxnBinding result;
+	ClusterCanonicalTxnBinding zero = { 0 };
+	volatile bool caught = false;
+
+	reset_active_owner();
+	cold_fixture = cold_capacity_refused = capacity_test = true;
+	capacity_prior_reservation = capacity_other_admission = true;
+	cluster_undo_retention_horizon_enabled = true;
+	g_before_current_acquire_hook = roll_away_to_retained_capacity;
+	PG_TRY();
+	{
+		(void)cluster_tt_local_prepare_canonical_active(100, &result);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(last_ereport_errcode, ERRCODE_PROGRAM_LIMIT_EXCEEDED);
+	UT_ASSERT_EQ(memcmp(&result, &zero, sizeof(result)), 0);
+	UT_ASSERT_EQ(capacity_waits, 0);
+	UT_ASSERT_EQ(cold_selection_calls, 1);
+	UT_ASSERT_EQ(cluster_tt_slot_current_segment(0), 2);
+	UT_ASSERT_EQ(cluster_tt_local_binding_count, 0);
+	UT_ASSERT_EQ(g_bind_emit_calls, 0);
+	UT_ASSERT_EQ(g_ctrc_reserve_calls, 0);
+	UT_ASSERT_EQ(g_current_acquire_calls, 1);
+	UT_ASSERT_EQ(g_current_pin_calls, g_current_unpin_calls);
+	UT_ASSERT_EQ(g_current_acquire_calls, g_current_cancel_calls);
+	UT_ASSERT_EQ(modifier_enters, 2);
+	UT_ASSERT_EQ(modifier_enters, modifier_leaves);
+	UT_ASSERT_EQ(lock_depth, 0);
 	cluster_undo_retention_horizon_enabled = false;
 }
 
@@ -1104,7 +1218,7 @@ int TT_ACTIVE_OWNER_FIXTURE_MAIN(void);
 int
 main(void)
 {
-	UT_PLAN(33);
+	UT_PLAN(37);
 	UT_RUN(test_recovered_open_gate_precedes_canonical_reservation);
 	UT_RUN(test_binding_memory_error_precedes_allocator_and_cold_selection);
 	UT_RUN(test_binding_growth_error_preserves_existing_reservations);
@@ -1138,6 +1252,10 @@ main(void)
 	UT_RUN(test_capacity_unknown_lease_refuses_before_sleep);
 	UT_RUN(test_capacity_changed_lease_refuses_before_allocation);
 	UT_RUN(test_retained_selected_segment_rechecks_allocator_after_capacity_wait);
+	UT_RUN(test_capacity_after_successful_rollover_keeps_error_boundary);
+	UT_RUN(test_capacity_unknown_rollover_effects_do_not_enter_wait);
+	UT_RUN(test_capacity_passive_winner_adoption_preserves_safe_wait);
+	UT_RUN(test_capacity_after_unpublished_reservation_does_not_reenter_preflight);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
