@@ -4,18 +4,24 @@
 #include "postgres.h"
 
 #include "access/table.h"
+#include "access/transam.h"
+#include "access/xlog.h"
 #include "catalog/pg_class.h"
 #include "fmgr.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
+#include "storage/lwlock.h"
 #include "utils/builtins.h"
 #include "utils/rel.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_epoch.h"
 #include "cluster/cluster_itl.h"
+#include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_runtime_visibility.h"
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_tt_durable.h"
 #include "cluster/cluster_tt_slot.h"
 #include "cluster/cluster_tt_status.h"
 #include "cluster/cluster_tx_resolve.h"
@@ -43,15 +49,77 @@ check_reader(void)
 }
 
 #ifdef USE_PGRAC_CLUSTER
-/* Only identity comes from the allocator. The original provider samples
- * physical bytes and native CLOG, and retains all its corroboration checks.
- * This wrapper neither creates a CTRC participant nor requests an X guard. */
+/* Begin physical probe. */
+typedef struct M2PhysicalLocateScope {
+	FullTransactionId full_xid;
+	uint64 formation_epoch;
+	uint64 system_identifier;
+	uint64 boot_incarnation;
+	uint32 current_segment;
+	int origin_node_id;
+} M2PhysicalLocateScope;
+
+/* The durable locator supplies identity, never an outcome. Keep the same
+ * raw-xid interpretation bracket as the runtime's local physical lookup.
+ * No native lock spans the scan or a current-guard wait. */
+static bool
+sample_physical_scope_capture(TransactionId xid, const ClusterSemanticAdmissionToken *admission,
+							  M2PhysicalLocateScope *scope)
+{
+	FullTransactionId next;
+	TransactionId oldest_clog;
+
+	if (!TransactionIdIsNormal(xid) || !cluster_semantic_activation_recheck(admission))
+		return false;
+	next = ReadNextFullTransactionId();
+	if (!FullTransactionIdIsValid(next) || EpochFromFullTransactionId(next) != 0
+		|| xid >= XidFromFullTransactionId(next))
+		return false;
+	LWLockAcquire(XactTruncationLock, LW_SHARED);
+	oldest_clog = ShmemVariableCache->oldestClogXid;
+	LWLockRelease(XactTruncationLock);
+	if (!TransactionIdIsNormal(oldest_clog) || xid < oldest_clog
+		|| cluster_xid_origin_slot(xid) != cluster_node_id)
+		return false;
+
+	memset(scope, 0, sizeof(*scope));
+	scope->full_xid = FullTransactionIdFromEpochAndXid(0, xid);
+	scope->formation_epoch = cluster_epoch_get_current();
+	scope->system_identifier = GetSystemIdentifier();
+	scope->boot_incarnation = cluster_qvotec_get_self_incarnation();
+	scope->current_segment = cluster_tt_slot_current_segment(cluster_node_id);
+	scope->origin_node_id = cluster_node_id;
+	return scope->formation_epoch == admission->formation_epoch
+		   && scope->formation_epoch <= UINT32_MAX && scope->system_identifier != 0
+		   && scope->boot_incarnation != 0 && scope->current_segment != 0
+		   && cluster_semantic_activation_recheck(admission);
+}
+
+static bool
+sample_physical_scope_current(TransactionId xid, const ClusterSemanticAdmissionToken *admission,
+							  const M2PhysicalLocateScope *expected)
+{
+	M2PhysicalLocateScope current;
+
+	return sample_physical_scope_capture(xid, admission, &current)
+		   && FullTransactionIdEquals(current.full_xid, expected->full_xid)
+		   && current.formation_epoch == expected->formation_epoch
+		   && current.system_identifier == expected->system_identifier
+		   && current.boot_incarnation == expected->boot_incarnation
+		   && current.current_segment == expected->current_segment
+		   && current.origin_node_id == expected->origin_node_id;
+}
+
+/* The original provider samples physical bytes and native CLOG, and retains
+ * all corroboration checks. This wrapper neither creates a CTRC participant
+ * nor requests an X guard. All locator state belongs to this one call. */
 static bool
 sample_physical(TransactionId xid, ClusterTTStatusResult *result)
 {
 	ClusterSemanticAdmissionToken admission = { 0 };
 	ClusterTTSlotCurrentOwner owner;
 	ClusterTTSlotCurrentOwner final_owner;
+	M2PhysicalLocateScope locate_scope;
 	ClusterTTSlotPhysicalLocator locator = { 0 };
 	ClusterTTStatusKey key;
 	ClusterUndoBlock0LogicalKey logical = { 0 };
@@ -63,6 +131,8 @@ sample_physical(TransactionId xid, ClusterTTStatusResult *result)
 	volatile bool started = false;
 	bool sampled = false;
 	bool physical_active = false;
+	bool located_physical = false;
+	bool current_owner;
 	const char *stage = "origin";
 
 	if (cluster_xid_origin_slot(xid) != cluster_node_id)
@@ -76,7 +146,31 @@ sample_physical(TransactionId xid, ClusterTTStatusResult *result)
 											  CLUSTER_SEMANTIC_TARGET_SIDE, &admission)
 			== CLUSTER_SEMANTIC_ADMISSION_OK) {
 			stage = "owner";
-			if (cluster_tt_slot_current_owner_by_xid(cluster_node_id, xid, &owner)) {
+			current_owner = cluster_tt_slot_current_owner_by_xid(cluster_node_id, xid, &owner);
+			if (!current_owner) {
+				uint16 segment = 0;
+				uint16 slot = TT_SLOTS_PER_SEGMENT;
+				uint16 wrap = TT_WRAP_INVALID;
+
+				stage = "locate_scope";
+				if (sample_physical_scope_capture(xid, &admission, &locate_scope)) {
+					stage = "locate";
+					if (cluster_tt_slot_durable_locate_any_by_xid_origin(
+							cluster_node_id, xid, &segment, &slot, &wrap, NULL)
+							== CLUSTER_TT_DURABLE_LOCATE_FOUND
+						&& segment != 0 && slot < TT_SLOTS_PER_SEGMENT && wrap != TT_WRAP_INVALID) {
+						stage = "locate_recheck";
+						located_physical
+							= sample_physical_scope_current(xid, &admission, &locate_scope);
+						memset(&owner, 0, sizeof(owner));
+						owner.segment_id = segment;
+						owner.xid = xid;
+						owner.slot_offset = slot;
+						owner.wrap = wrap;
+					}
+				}
+			}
+			if (current_owner || located_physical) {
 				logical.owner_instance = (uint8)(cluster_node_id + 1);
 				logical.segment_id = owner.segment_id;
 				locator.segment_id = owner.segment_id;
@@ -104,6 +198,10 @@ sample_physical(TransactionId xid, ClusterTTStatusResult *result)
 						sampled = cluster_runtime_visibility_physical_locator_sample_held(
 							&locator, &admission, &guard, &root, &key, result, &physical_active,
 							NULL);
+						if (sampled && located_physical) {
+							stage = "sample_scope";
+							sampled = sample_physical_scope_current(xid, &admission, &locate_scope);
+						}
 						if (sampled)
 							stage = "release";
 						step = cluster_undo_block0_current_release_begin(&guard, &failure);
@@ -119,12 +217,18 @@ sample_physical(TransactionId xid, ClusterTTStatusResult *result)
 					}
 					/* Release can wait. Keep the identity/root/admission fences. */
 					if (sampled) {
-						stage = "final_owner";
-						sampled = cluster_tt_slot_current_owner_by_xid(cluster_node_id, xid,
-																	   &final_owner)
-								  && final_owner.segment_id == owner.segment_id
-								  && final_owner.xid == owner.xid && final_owner.wrap == owner.wrap
-								  && final_owner.slot_offset == owner.slot_offset;
+						if (located_physical) {
+							stage = "final_scope";
+							sampled = sample_physical_scope_current(xid, &admission, &locate_scope);
+						} else {
+							stage = "final_owner";
+							sampled = cluster_tt_slot_current_owner_by_xid(cluster_node_id, xid,
+																		   &final_owner)
+									  && final_owner.segment_id == owner.segment_id
+									  && final_owner.xid == owner.xid
+									  && final_owner.wrap == owner.wrap
+									  && final_owner.slot_offset == owner.slot_offset;
+						}
 					}
 					if (sampled) {
 						stage = "final_root";
@@ -159,6 +263,7 @@ done:
 		 sampled);
 	return sampled;
 }
+/* End physical probe. */
 
 static ClusterTxOutcome
 sample_origin(const ClusterTxLocator *locator, ClusterTxResolution *resolution,

@@ -7466,8 +7466,8 @@ test_cluster_r4_static_model: test_cluster_r4_static_model.c unit_test.h
 CLUSTER_TX_RESOLVE_O = $(top_builddir)/src/backend/cluster/cluster_tx_resolve.o
 CLUSTER_R4_TX_LOCATOR_UBA_O = $(top_builddir)/src/backend/cluster/cluster_uba.o
 test_cluster_m2_sample_diagnostic.inc: $(top_srcdir)/src/test/modules/test_pgrac_shared_config/test_pgrac_m2_sample.c Makefile
-	awk '/^sample_physical\(/ { print "static bool"; emit=1; found++ } \
-	     emit { print } emit && /^}/ { emit=0 } \
+	awk '/^\/\* Begin physical probe\. \*\// { emit=1; found++ } \
+	     /^\/\* End physical probe\. \*\// { emit=0 } emit { print } \
 	     END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
