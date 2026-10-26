@@ -9540,10 +9540,10 @@ test_cluster_heap_chain_vm_itl.inc test_cluster_heap_chain_vm_no_itl.inc: $(top_
 
 test_cluster_heap_chain_receipt_types.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
 	awk '/^typedef enum (ClusterHeapPreparedUndoResult|ClusterHeapNoRetryBoundaryResult)$$/ { emit=1; enums++ } \
-	     /^cluster_heap_prepare_undo_record_exact\(/ { print "static bool"; emit=1; helpers++ } \
+	     /^cluster_heap_(prepare|retry)_undo_record_exact\(/ { print "static bool"; emit=1; helpers++ } \
 	     emit { print } /^} ClusterHeap(PreparedUndoResult|NoRetryBoundaryResult);/ { emit=0; done++ } \
 	     emit && /^}/ { emit=0; complete++ } \
-	     END { if (enums != 2 || done != 2 || helpers != 1 || complete != 1 || emit) exit 1 }' $< > $@.tmp
+	     END { if (enums != 2 || done != 2 || helpers != 2 || complete != 2 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_heap_chain_receipt_reserve.inc test_cluster_heap_chain_receipt_prepare.inc test_cluster_heap_chain_receipt_boundary.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
@@ -9556,6 +9556,22 @@ test_cluster_heap_chain_receipt_reserve.inc test_cluster_heap_chain_receipt_prep
 	       depth+=opens-closes; if (opens) opened=1; \
 	       if (opened && depth == 0) { emit=0; done++; exit } } \
 	     /^}/ { in_chain=0 } END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Original receipt-service entry brackets; all slow decisions remain in C.
+test_cluster_heap_receipt_delete_vm.inc test_cluster_heap_receipt_update_vm.inc test_cluster_heap_receipt_lock_vm.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk -v target=$(if $(filter %_delete_vm.inc,$@),heap_delete,$(if $(filter %_update_vm.inc,$@),heap_update,heap_lock_tuple_internal)) \
+	    '$$0 ~ "^" target "\\(" { in_fn=1 } \
+	     in_fn && /if \(undo_result$$/ { retry=1; edge=0 } \
+	     in_fn && /if \(boundary_result == CLUSTER_HEAP_BOUNDARY_ZERO_APPLY_RETRY\)/ { retry=1; edge=1 } \
+	     retry && /LockBuffer\(\*?buffer, BUFFER_LOCK_UNLOCK\);/ { \
+	       emit=1; print "case " edge ":"; found++; \
+	       if (prev ~ /if \(!content_unlocked\)/) print prev } \
+	     emit && (/if \(ctrc_prepare_only/ || /A different insertion page/ \
+	       || /if \(had_undo_ready\)/ || /if \(!cluster_heap_retry_undo_record_exact\(/) { \
+	       emit=retry=0; done++; print "break;" } \
+	     emit { print } { prev=$$0 } /^}/ { in_fn=0 } \
+	     END { if (found != 2 || done != 2 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_heap_dml_vm_relock.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
@@ -9639,6 +9655,8 @@ test_cluster_heap_row_wait_helpers.inc: $(top_srcdir)/src/backend/access/heap/he
 test_cluster_heap_lock_vm_pin test_cluster_heap_lock_vm_pin_noassert: test_cluster_heap_lock_vm_pin.c unit_test.h \
 		test_cluster_heap_lock_rebind.inc test_cluster_heap_vm_unwind_helpers.inc \
 		test_cluster_heap_dml_vm_relock.inc \
+		test_cluster_heap_receipt_delete_vm.inc test_cluster_heap_receipt_update_vm.inc \
+		test_cluster_heap_receipt_lock_vm.inc \
 		test_cluster_heap_native_wait_vm.inc \
 		test_cluster_heap_chain_call_vm.inc test_cluster_heap_chain_call_primitives.inc \
 		test_cluster_heap_row_wait_vm.inc test_cluster_heap_row_wait_helpers.inc \

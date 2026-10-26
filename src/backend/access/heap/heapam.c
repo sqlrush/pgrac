@@ -11941,6 +11941,11 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 				cid = pgrac_entry_cid;
 				iscombo = false;
 				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+				if (cluster_heap_read_needs_copy(relation) && BufferIsValid(vmbuffer))
+				{
+					ReleaseBuffer(vmbuffer);
+					vmbuffer = InvalidBuffer;
+				}
 				if (ctrc_prepare_only && !targets_invalidated) {
 					if (!cluster_undo_record_ctrc_prepare_pending(
 							&undo_receipt, 0))
@@ -12244,6 +12249,11 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 			cid = pgrac_entry_cid;
 			iscombo = false;
 			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+			if (cluster_heap_read_needs_copy(relation) && BufferIsValid(vmbuffer))
+			{
+				ReleaseBuffer(vmbuffer);
+				vmbuffer = InvalidBuffer;
+			}
 			if (!cluster_heap_retry_undo_record_exact(
 					UNDO_RECORD_DELETE, (uint16)cluster_undo_record_inline_max_bytes,
 					(uint16)canonical_binding.segment_id, canonical_binding.slot_offset,
@@ -14533,6 +14543,11 @@ l_pgrac_reacquire:
 					}
 				}
 				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+				if (cluster_heap_read_needs_copy(relation) && BufferIsValid(vmbuffer))
+				{
+					ReleaseBuffer(vmbuffer);
+					vmbuffer = InvalidBuffer;
+				}
 				/* A different insertion page invalidates its unpublished
 				 * child intent, not an otherwise exact READY undo extent.
 				 * Rebind only a completely captured UPDATE target set, with
@@ -15207,6 +15222,11 @@ l_pgrac_reacquire:
 				}
 			}
 			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+			if (cluster_heap_read_needs_copy(relation) && BufferIsValid(vmbuffer))
+			{
+				ReleaseBuffer(vmbuffer);
+				vmbuffer = InvalidBuffer;
+			}
 			if (had_undo_ready)
 			{
 				if (!cluster_heap_retry_undo_record_exact(
@@ -17387,6 +17407,11 @@ failed:
 
 					if (!content_unlocked)
 						LockBuffer(*buffer, BUFFER_LOCK_UNLOCK);
+					if (cluster_heap_read_needs_copy(relation) && BufferIsValid(vmbuffer))
+					{
+						ReleaseBuffer(vmbuffer);
+						vmbuffer = InvalidBuffer;
+					}
 					if (ctrc_prepare_only && !targets_invalidated) {
 						if (!cluster_undo_record_ctrc_prepare_pending(
 								&undo_receipt, 0))
@@ -17669,6 +17694,11 @@ failed:
 			cluster_lock_undo_ready = false;
 			cluster_lock_slot_idx = CLUSTER_ITL_SLOT_UNALLOCATED;
 			LockBuffer(*buffer, BUFFER_LOCK_UNLOCK);
+			if (cluster_heap_read_needs_copy(relation) && BufferIsValid(vmbuffer))
+			{
+				ReleaseBuffer(vmbuffer);
+				vmbuffer = InvalidBuffer;
+			}
 			if (had_undo_ready)
 			{
 				if (!cluster_heap_retry_undo_record_exact(
@@ -18890,6 +18920,11 @@ l4:
 				/* Receipt reservation can allocate/wait; never do it while the
 				 * heap content lock is held. */
 				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+				if (cluster_heap_read_needs_copy(rel) && BufferIsValid(vmbuffer))
+				{
+					ReleaseBuffer(vmbuffer);
+					vmbuffer = InvalidBuffer;
+				}
 				if (cluster_chain_prepare_deadline_us == 0)
 					cluster_chain_prepare_deadline_us = cluster_undo_record_prepare_deadline_us();
 				if (!cluster_tt_local_get_published_binding(
@@ -18931,6 +18966,11 @@ l4:
 
 				if (!content_unlocked)
 					LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+				if (cluster_heap_read_needs_copy(rel) && BufferIsValid(vmbuffer))
+				{
+					ReleaseBuffer(vmbuffer);
+					vmbuffer = InvalidBuffer;
+				}
 				if (prepare_only && !targets_invalidated) {
 					if (!cluster_undo_record_ctrc_prepare_pending(
 							&cluster_chain_receipt, 0))
@@ -19047,6 +19087,11 @@ l4:
 						cluster_chain_vm_locked = false;
 					}
 					LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+					if (cluster_heap_read_needs_copy(rel) && BufferIsValid(vmbuffer))
+					{
+						ReleaseBuffer(vmbuffer);
+						vmbuffer = InvalidBuffer;
+					}
 					requalified = cluster_undo_record_requalify_for_retry(
 						&cluster_chain_receipt, sizeof(UndoItlPayload), false);
 					if (requalified == CLUSTER_UNDO_RECORD_PREPARE_REFUSED)
