@@ -21002,6 +21002,52 @@ cluster_heap_freeze_apply_xmin_batch_v1(
 }
 
 bool
+cluster_heap_freeze_apply_xmin_batch_recent_v1(
+	Relation rel, Buffer recent_buffer,
+	const ClusterHeapFreezePageInputV1 *input,
+	const ClusterHeapFreezePageBatchV1 *page,
+	const ClusterHeapFreezeProofBatchV1 *proofs,
+	const ClusterHeapFreezeFinalFenceV1 *fence,
+	const PcmAuthoritySnapshot *authority_before,
+	const ClusterSemanticAdmissionToken *admission,
+	const ClusterHeapFreezeXminTargetV1 *targets, uint16 target_count,
+	FullTransactionId freeze_limit_full, SCN horizon_scn)
+{
+	volatile bool applied = false;
+
+	/* The proof phase may have released its pin. Reuse only the original
+	 * resident hint under the caller's still-entered admission: no fetch,
+	 * new current, proof request or replacement source observation. */
+	if (rel == NULL || !rel->rd_isvalid || input == NULL || page == NULL
+		|| proofs == NULL || fence == NULL || authority_before == NULL
+		|| admission == NULL || !admission->entered || targets == NULL
+		|| target_count == 0 || target_count > MaxHeapTuplesPerPage
+		|| recent_buffer <= 0 || recent_buffer > NBuffers
+		|| BufferDescriptors == NULL
+		|| admission->record_generation != fence->admission_generation
+		|| !RelFileLocatorEquals(rel->rd_locator, fence->identity.key.locator)
+		|| !ReadRecentBuffer(rel->rd_locator, MAIN_FORKNUM, fence->block,
+			recent_buffer))
+		return false;
+
+	PG_TRY();
+	{
+		applied = cluster_heap_freeze_apply_xmin_batch_v1(rel, recent_buffer,
+			input, page, proofs, fence, authority_before, admission,
+			targets, target_count, freeze_limit_full, horizon_scn);
+	}
+	PG_FINALLY();
+	{
+		/* The inner continuation has already unwound its temporary writer
+		 * and local X. Drop exactly this pin before the caller leaves its
+		 * admission, preserving any pin/lock the caller already owned. */
+		ReleaseBuffer(recent_buffer);
+	}
+	PG_END_TRY();
+	return applied;
+}
+
+bool
 cluster_heap_freeze_apply_xmin_v1(
 	Relation rel, Buffer buffer,
 	const ClusterHeapFreezePageInputV1 *input,
