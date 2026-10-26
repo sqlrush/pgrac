@@ -5227,10 +5227,131 @@ UT_TEST(test_exact_zero_later_ordinal_does_not_erase_first_apply)
 	UT_ASSERT_EQ(receipt_cancel_calls + receipt_unref_calls + receipt_leave_calls, 0);
 }
 
+static void
+receipt_assert_uncertain_abort(void)
+{
+	receipt_error_level = 0;
+	receipt_error_detail[0] = '\0';
+	receipt_trap_error = true;
+	if (sigsetjmp(receipt_error_jump, 1) == 0) {
+		receipt_abort_after_lwlock_release();
+		UT_ASSERT(false);
+	} else {
+		UT_ASSERT_EQ(receipt_error_level, PANIC);
+		UT_ASSERT(strstr(receipt_error_detail, "PGRAC_REASON=UNDO_ABORT_EFFECT_UNCERTAIN ") != NULL);
+	}
+	receipt_trap_error = false;
+	UT_ASSERT(cluster_undo_record_reservation.active);
+	UT_ASSERT_EQ(receipt_cancel_calls + receipt_unref_calls + receipt_leave_calls, 0);
+}
+
+/* The native return-point ERROR precedes the local applied bit. A PANIC
+ * without the original shared result must not stand in for an APPLIED cut. */
+UT_TEST(test_abort_detail_identifies_applied_before_local_accounting)
+{
+	ClusterUndoRecordPrepareReceipt receipt;
+	ClusterCtrcApplyToken token;
+	ClusterCtrcTargetV1 target = { 0 };
+
+	receipt_abort_fixture(&receipt);
+	target.block_number = 37;
+	cluster_trace_normal_stop = true;
+	cluster_injection_armed_count = 1;
+	receipt_trap_error = true;
+	if (sigsetjmp(receipt_error_jump, 1) == 0) {
+		(void)cluster_undo_record_ctrc_apply_prepared(&receipt, 0, &target, &token);
+		UT_ASSERT(false);
+	} else
+		UT_ASSERT_EQ(receipt_error_level, ERROR);
+	cluster_injection_armed_count = 0;
+	UT_ASSERT_EQ(receipt.ctrc_applied_mask, 0);
+	receipt_assert_uncertain_abort();
+	UT_ASSERT(strstr(receipt_error_detail, "attempted_mask=1 zero_effect_mask=0 pending_mask=1 prepared_mask=1 ") != NULL);
+	UT_ASSERT(strstr(receipt_error_detail, "trace_sample_mask=1 shared_result_known_mask=1 shared_result_0=1 shared_result_1=0 apply_call_count_0=1 apply_call_count_1=0 authoritative=0") != NULL);
+}
+
+UT_TEST(test_abort_detail_does_not_invent_a_shared_result_after_error)
+{
+	ClusterUndoRecordPrepareReceipt receipt;
+	ClusterCtrcApplyToken token;
+	ClusterCtrcTargetV1 target = { 0 };
+
+	receipt_abort_fixture(&receipt);
+	target.block_number = 37;
+	cluster_trace_normal_stop = true;
+	receipt_throw_apply = true;
+	receipt_trap_error = true;
+	if (sigsetjmp(receipt_error_jump, 1) == 0) {
+		(void)cluster_undo_record_ctrc_apply_prepared(&receipt, 0, &target, &token);
+		UT_ASSERT(false);
+	}
+	receipt_throw_apply = false;
+	UT_ASSERT_EQ(receipt_apply_calls, 1);
+	receipt_assert_uncertain_abort();
+	UT_ASSERT(strstr(receipt_error_detail, "trace_sample_mask=1 shared_result_known_mask=0 shared_result_0=0 shared_result_1=0 apply_call_count_0=1 apply_call_count_1=0 authoritative=0") != NULL);
+}
+
+UT_TEST(test_abort_detail_keeps_both_ordinals_at_second_return_error)
+{
+	ClusterUndoRecordPrepareReceipt receipt;
+	ClusterCtrcApplyToken token;
+	ClusterCtrcTargetV1 target = { 0 };
+
+	receipt_zero_two_target_fixture(&receipt, 0);
+	cluster_trace_normal_stop = true;
+	target.block_number = 37;
+	UT_ASSERT_EQ(cluster_undo_record_ctrc_apply_prepared(&receipt, 0, &target, &token),
+		CLUSTER_CTRC_APPLY_APPLIED);
+	target.block_number = 38;
+	target.itl_slot_index = 1;
+	cluster_injection_armed_count = 1;
+	receipt_trap_error = true;
+	if (sigsetjmp(receipt_error_jump, 1) == 0) {
+		(void)cluster_undo_record_ctrc_apply_prepared(&receipt, 1, &target, &token);
+		UT_ASSERT(false);
+	} else
+		UT_ASSERT_EQ(receipt_error_level, ERROR);
+	cluster_injection_armed_count = 0;
+	UT_ASSERT_EQ(receipt.ctrc_applied_mask, 1);
+	receipt_assert_uncertain_abort();
+	UT_ASSERT(strstr(receipt_error_detail, "applied=1 reuse=0 attempted_mask=3 zero_effect_mask=0 pending_mask=3 prepared_mask=3 ") != NULL);
+	UT_ASSERT(strstr(receipt_error_detail, "trace_sample_mask=3 shared_result_known_mask=3 shared_result_0=1 shared_result_1=1 apply_call_count_0=1 apply_call_count_1=1 authoritative=0") != NULL);
+}
+
+UT_TEST(test_abort_detail_refuses_stale_or_disabled_sample_identity)
+{
+	for (unsigned variant = 0; variant < 7; variant++) {
+		ClusterUndoRecordPrepareReceipt receipt;
+		ClusterCtrcApplyToken token;
+		ClusterCtrcTargetV1 target = { 0 };
+
+		receipt_abort_fixture(&receipt);
+		target.block_number = 37;
+		cluster_trace_normal_stop = true;
+		UT_ASSERT_EQ(cluster_undo_record_ctrc_apply_prepared(&receipt, 0, &target, &token),
+			CLUSTER_CTRC_APPLY_APPLIED);
+		switch (variant) {
+			case 0: cluster_trace_normal_stop = false; break;
+			case 1: undo_receipt_consumer_trace.valid = false; break;
+			case 2: undo_receipt_consumer_trace.sequence++; break;
+			case 3: undo_receipt_consumer_trace.attempt++; break;
+			case 4: undo_receipt_consumer_trace.handles[0].journal_slot_generation++; break;
+			case 5: undo_receipt_consumer_trace.attempted = 0; break;
+			case 6: cluster_undo_record_reservation.receipt.reservation_sequence++; break;
+		}
+		receipt_assert_uncertain_abort();
+		UT_ASSERT(strstr(receipt_error_detail, "trace_sample_mask=0 shared_result_known_mask=0 shared_result_0=0 shared_result_1=0 apply_call_count_0=0 apply_call_count_1=0 authoritative=0") != NULL);
+	}
+}
+
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(120);
+	UT_PLAN(124);
+	UT_RUN(test_abort_detail_identifies_applied_before_local_accounting);
+	UT_RUN(test_abort_detail_does_not_invent_a_shared_result_after_error);
+	UT_RUN(test_abort_detail_keeps_both_ordinals_at_second_return_error);
+	UT_RUN(test_abort_detail_refuses_stale_or_disabled_sample_identity);
 	UT_RUN(test_native_after_apply_error_keeps_original_branch_cleanup_polarity);
 	UT_RUN(test_exact_zero_later_ordinal_does_not_erase_first_apply);
 	UT_RUN(test_exact_zero_cannot_overwrite_an_earlier_unknown_call);

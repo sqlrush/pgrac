@@ -3825,15 +3825,52 @@ cluster_undo_record_abort_prepared_after_lwlock_release(void)
 	reservation->consume_locked = false;
 	reservation->consume_local_head_idx = -1;
 	reservation->consume_effective_prev_uba = InvalidUba;
-	if (reservation->apply_attempted || reservation->receipt.ctrc_applied_mask != 0)
+	if (reservation->apply_attempted || reservation->receipt.ctrc_applied_mask != 0) {
+		const UndoReceiptConsumerTrace *sample = &undo_receipt_consumer_trace;
+		uint8 sample_mask = 0;
+		uint8 shared_known;
+
+		/* A native return-point ERROR can precede the local applied bit.
+		 * Attribute only this owner's already captured result, without any
+		 * shared dereference or change to its fatal cleanup obligation. */
+		if (cluster_trace_normal_stop && sample->valid
+			&& sample->sequence == reservation->sequence
+			&& sample->sequence == reservation->receipt.reservation_sequence
+			&& sample->attempt == reservation->receipt.ctrc_attempt_generation) {
+			for (uint8 ordinal = 0; ordinal < CLUSTER_UNDO_RECORD_CTRC_TARGETS; ordinal++) {
+				uint8 bit = UINT8_C(1) << ordinal;
+
+				if ((sample->attempted & reservation->apply_attempted_mask
+					 & reservation->receipt.ctrc_pending_mask
+					 & reservation->receipt.ctrc_prepared_mask & bit) != 0
+					&& memcmp(&sample->handles[ordinal],
+						&reservation->receipt.ctrc_handles[ordinal],
+						sizeof(sample->handles[ordinal])) == 0)
+					sample_mask |= bit;
+			}
+		}
+		shared_known = sample->shared_known & sample_mask;
 		ereport(PANIC,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("cluster undo abort cannot retire an attempted shared effect"),
 				 errdetail("PGRAC_REASON=UNDO_ABORT_EFFECT_UNCERTAIN "
-						   "sequence=" UINT64_FORMAT " apply_attempted=%d applied=%u reuse=%u",
+						   "sequence=" UINT64_FORMAT " apply_attempted=%d applied=%u reuse=%u "
+						   "attempted_mask=%u zero_effect_mask=%u pending_mask=%u prepared_mask=%u "
+						   "attempt=%u trace_sample_mask=%u shared_result_known_mask=%u "
+						   "shared_result_0=%d shared_result_1=%d "
+						   "apply_call_count_0=%u apply_call_count_1=%u authoritative=0",
 						   reservation->sequence, reservation->apply_attempted,
 						   reservation->receipt.ctrc_applied_mask,
-						   reservation->receipt.ctrc_reuse_mask)));
+						   reservation->receipt.ctrc_reuse_mask,
+						   reservation->apply_attempted_mask, reservation->zero_effect_mask,
+						   reservation->receipt.ctrc_pending_mask,
+						   reservation->receipt.ctrc_prepared_mask,
+						   reservation->receipt.ctrc_attempt_generation, sample_mask, shared_known,
+						   (shared_known & 1) != 0 ? sample->shared_result[0] : 0,
+						   (shared_known & 2) != 0 ? sample->shared_result[1] : 0,
+						   (sample_mask & 1) != 0 ? sample->apply_calls[0] : 0,
+						   (sample_mask & 2) != 0 ? sample->apply_calls[1] : 0)));
+	}
 
 	/* No APPLY was attempted.  Keep the original cancellation policy:
 	 * borrowed handles and failed cancellation CAS retain their shared owner. */
