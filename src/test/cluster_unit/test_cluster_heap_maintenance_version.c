@@ -1119,6 +1119,9 @@ sampler_stripe_future(FullTransactionId reference, FullTransactionId *future,
  * member is an explicit scheduling leaf; semaphore waiters remain outside. */
 static bool source_exit_lock_held;
 static bool source_exit_group_requested;
+static bool source_exit_history_requested;
+static unsigned source_exit_history_samples;
+static ClusterUndoRetentionSample source_exit_history_report;
 static bool source_exit_member_requested;
 static unsigned source_exit_member_wakeups;
 static FullTransactionId source_exit_member_wait_minimum, source_exit_member_wake_minimum;
@@ -10429,7 +10432,16 @@ bounds_clock_observe(SCN horizon)
 	bounds_assert_unlocked();
 	bounds_clock_observes++;
 	if (bounds_fault == 7) elog(ERROR, "injected collector clock ERROR");
-	if (bounds_fault != 9) fixture_wal_clock = horizon;
+	if (bounds_fault != 9)
+	{
+		if (source_exit_history_requested)
+		{
+			/* The new combined source uses a later clock than H. Keep this
+			 * explicit clock leaf monotone, as the original observer does. */
+			if (scn_time_cmp(fixture_wal_clock, horizon) < 0) fixture_wal_clock = horizon;
+		}
+		else fixture_wal_clock = horizon;
+	}
 	bounds_after_clock = true;
 }
 
@@ -13952,6 +13964,34 @@ source_exit_member_wakeup(PGSemaphore sema)
 	UT_ASSERT_EQ(census_step_lock_releases, census_step_lock_acquires);
 	source_exit_member_census_minimum = scan.min_full;
 	UT_ASSERT(FullTransactionIdEquals(scan.min_full, source_exit_member_wait_minimum));
+	if (source_exit_history_requested)
+	{
+		ClusterUndoRetentionSample history, zero = {0};
+		PGPROC *reader = &sampler_slots[2];
+
+		/* The queued transactions have retired, but this independent
+		 * snapshot is still installed. Unknown SCN and a replication pin
+		 * each refuse the original sampler; neither may become CLOCK. */
+		UT_ASSERT_EQ(reader->xmin, 90);
+		pg_atomic_write_u64(&reader->cluster_read_scn_atomic, InvalidScn);
+		memset(&history, 0xa5, sizeof(history));
+		UT_ASSERT(!bounds_original_retention_sample(&history));
+		UT_ASSERT(memcmp(&history, &zero, sizeof(history)) == 0);
+		pg_atomic_write_u64(&reader->cluster_read_scn_atomic, 10);
+		sampler_proc_array->replication_slot_xmin = 90;
+		memset(&history, 0xa5, sizeof(history));
+		UT_ASSERT(!bounds_original_retention_sample(&history));
+		UT_ASSERT(memcmp(&history, &zero, sizeof(history)) == 0);
+		sampler_proc_array->replication_slot_xmin = InvalidTransactionId;
+		UT_ASSERT(bounds_original_local_report(&history));
+		UT_ASSERT_EQ(history.clock_scn, 20); UT_ASSERT_EQ(history.horizon_scn, 10);
+		UT_ASSERT_EQ(history.contributor_kind, CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT);
+		UT_ASSERT_EQ(history.contributor_token, 3);
+		UT_ASSERT_EQ(bounds_history_locks, 3); UT_ASSERT_EQ(bounds_history_unlocks, 3);
+		UT_ASSERT(!bounds_history_held);
+		source_exit_history_report = history;
+		source_exit_history_samples++;
+	}
 	source_exit_member_wakeups++;
 }
 
@@ -14046,7 +14086,32 @@ full_source_then_recent_lifecycle_case(bool batch, bool late_receiver, bool reti
 			source_exit_member_census_minimum = InvalidFullTransactionId;
 			source_exit_member_source = f.cohort.admission_fence;
 		}
+		if (source_exit_history_requested)
+		{
+			PGPROC *reader = &sampler_slots[2];
+
+			UT_ASSERT(source_exit_group_requested && source_exit_member_requested);
+			/* Snapshot publication is a controlled leaf. Both complete
+			 * original samplers consume this same compact ProcArray. */
+			reader->pgprocno = reader->pgxactoff = 2;
+			reader->pid = proc->pid + 2; reader->xmin = 90;
+			reader->xid = sampler_xids[2] = InvalidTransactionId;
+			pg_atomic_write_u64(&reader->cluster_top_full_xid_atomic, 0);
+			pg_atomic_write_u64(&reader->cluster_read_scn_atomic, 10);
+			sampler_proc_array->numProcs = 3; sampler_proc_array->pgprocnos[2] = 2;
+			bounds_history_clock = 20;
+			fixture_wal_clock = 20;
+		}
 		source_exit_end_transaction(proc, key.xid);
+		if (source_exit_history_requested)
+		{
+			/* The cached expected source comes from the original wake-time
+			 * sampler; the admitted cohort independently samples it again. */
+			f.cohort.source_local_history.sample_clock_scn = source_exit_history_report.clock_scn;
+			f.cohort.source_local_history.contributor_kind = source_exit_history_report.contributor_kind;
+			f.cohort.source_local_history.contributor_token = source_exit_history_report.contributor_token;
+		}
+
 		UT_ASSERT_EQ(source_exit_locks, 1); UT_ASSERT_EQ(source_exit_unlocks, 1);
 		UT_ASSERT(!source_exit_lock_held);
 		UT_ASSERT_EQ(proc->xid, InvalidTransactionId); UT_ASSERT_EQ(sampler_xids[0], InvalidTransactionId);
@@ -14192,6 +14257,22 @@ full_source_then_recent_lifecycle_case(bool batch, bool late_receiver, bool reti
 	relation_data.rd_isvalid = resume_allowed = true;
 	if (source_exit_group_requested) phase_pin_released = false;
 	UT_ASSERT_EQ(phase_then_recent_native_owned(&f, &v), !late_receiver);
+	if (source_exit_history_requested)
+	{
+		UT_ASSERT_EQ(source_exit_history_samples, 1);
+		UT_ASSERT_EQ(v.shared_freeze_cohort.horizon_scn, 10);
+		UT_ASSERT_EQ(v.shared_freeze_cohort.source_local_horizon_scn, 10);
+		UT_ASSERT_EQ(v.shared_freeze_cohort.source_local_history.sample_clock_scn, 20);
+		UT_ASSERT_EQ(v.shared_freeze_cohort.source_local_history.contributor_kind,
+			CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT);
+		UT_ASSERT_EQ(v.shared_freeze_cohort.source_local_history.contributor_token, 3);
+		UT_ASSERT_EQ(bounds_history_locks, 4); UT_ASSERT_EQ(bounds_history_unlocks, 4);
+		UT_ASSERT_EQ(bounds_history_clocks, 4); UT_ASSERT(!bounds_history_held);
+		UT_ASSERT_EQ(sampler_slots[2].xmin, 90);
+		UT_ASSERT_EQ(inserted_wal_clock, late_receiver ? InvalidScn : 20);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&sampler_slots[2].cluster_read_scn_atomic), 10);
+	}
+
 	recent_pin_observer = NULL;
 	UT_ASSERT_EQ(phase_preflights, 1); UT_ASSERT_EQ(phase_rechecks, 1);
 	UT_ASSERT_EQ(phase_resolves, f.page.carrier_request_count);
@@ -15859,10 +15940,25 @@ UT_TEST(test_recent_xmin_saved_bounds_refuse_before_pin)
 }
 
 
+UT_TEST(test_original_snapshot_h_survives_group_exit_to_recent_wal)
+{
+	source_exit_history_requested = true;
+	source_exit_group_requested = source_exit_member_requested = true;
+	for (unsigned receipt = 0; receipt < 3; receipt++)
+		for (unsigned batch = 0; batch < 2; batch++) {
+			source_exit_history_samples = 0;
+			full_source_then_recent_lifecycle_case(batch != 0, false, true, receipt, 0);
+			UT_ASSERT_EQ(source_exit_history_samples, 1);
+		}
+	source_exit_history_requested = false;
+	source_exit_group_requested = source_exit_member_requested = false;
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(338);
+	UT_PLAN(339);
 
 	UT_RUN(test_pin_free_admitted_phase_reaches_recent_native_wal_before_owner_leave);
 	UT_RUN(test_pin_free_phase_recent_refusal_retires_only_its_original_owner);
@@ -16210,6 +16306,8 @@ main(void)
 	UT_RUN(test_original_group_member_exit_certificate_needs_fresh_recent_cut);
 
 	UT_RUN(test_recent_xmin_saved_bounds_refuse_before_pin);
+
+	UT_RUN(test_original_snapshot_h_survives_group_exit_to_recent_wal);
 
 	UT_DONE();
 	return ut_failed_count != 0;
