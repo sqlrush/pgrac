@@ -6,6 +6,9 @@ int first_fill_retire_own_fixture_main(void);
 #define main first_fill_retire_own_fixture_main
 #include "test_cluster_pcm_own.c"
 #undef main
+#ifndef FIRST_FILL_RETIRE_MAIN
+#define FIRST_FILL_RETIRE_MAIN main
+#endif
 #include "cluster/cluster_gcs_reqid.h"
 #include "cluster/cluster_multixact_current_wire.h"
 #include "cluster/cluster_block_io_trace.h"
@@ -23,6 +26,7 @@ static ClusterGcsBlockBackendBlock *gcs_block_backend_blocks = retire_blocks;
 static struct {
 	pg_atomic_uint64 invalidate_busy_sent_count;
 	pg_atomic_uint64 done_sent_count, done_enqueue_drop_count;
+	pg_atomic_uint64 stale_reply_drop_count, starvation_denied_pending_x_count;
 } retire_shared;
 static int retire_backend = 1, retire_pid = 71, retire_route = 2;
 static TimestampTz retire_start = 700, retire_now = 10;
@@ -196,8 +200,7 @@ retire_arm(BufferDesc *buf, bool admitted)
 	source.request_epoch = slot->request_epoch = 1;
 	source.master_node = 2;
 	source.pending_s = true;
-	source.kind = CLUSTER_PCM_SOURCE_RETRY;
-	source.retry_event = true;
+	source.kind = CLUSTER_PCM_SOURCE_FAIL;
 	UT_ASSERT(gcs_read_source_arm(buf, &source));
 	slot->first_fill.request_admitted = admitted;
 	return source;
@@ -232,6 +235,18 @@ retire_notice(const ClusterPcmReadSource *source)
 	done.reserved_0[0] = GCS_BLOCK_DONE_PENDING_S_RETIRED; done.reserved_0[1] = 3;
 	return done;
 }
+static bool
+retire_ack_handed(const ClusterPcmReadSource *source)
+{
+	for (int i = 0; i < MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND; i++) {
+		const ClusterGcsBlockOutstandingSlot *slot = &retire_blocks[0].slots[i];
+		if (slot->in_use && slot->request_id == source->request_id
+			&& slot->request_epoch == source->request_epoch
+			&& BufferTagsEqual(&slot->tag, &source->tag))
+			return slot->first_fill.ack_handed;
+	}
+	return false;
+}
 UT_TEST(test_old_quiet_a_never_reads_or_revokes_successor_b)
 {
 	BufferDesc buf; ClusterPcmOwnEntry entry;
@@ -261,7 +276,7 @@ UT_TEST(test_ack_refusal_keeps_frame_and_receipt_until_real_takeover)
 		a = retire_arm(&buf, true); retire_abort(&buf, &a); inv = retire_invalidate(&a);
 		UT_ASSERT(gcs_block_invalidate_execute(&inv)); first = retire_ack;
 		UT_ASSERT_EQ(retire_admitted, 0);
-		UT_ASSERT(!gcs_first_fill_retry_progress(&a, false));
+		UT_ASSERT(!retire_ack_handed(&a));
 		retire_result = CLUSTER_IC_SEND_HARD_ERROR;
 		retire_now += 10000; gcs_first_fill_receipt_tick(0);
 		UT_ASSERT_EQ(memcmp(&first, &retire_ack, sizeof(first)), 0);
@@ -269,7 +284,7 @@ UT_TEST(test_ack_refusal_keeps_frame_and_receipt_until_real_takeover)
 		retire_result = which ? CLUSTER_IC_SEND_WOULD_BLOCK : CLUSTER_IC_SEND_DONE;
 		retire_now += 10000; gcs_first_fill_receipt_tick(0);
 		UT_ASSERT_EQ(retire_admitted, 1);
-		UT_ASSERT(gcs_first_fill_retry_progress(&a, false));
+		UT_ASSERT(retire_ack_handed(&a));
 		UT_ASSERT_EQ(retire_receipts, 1);
 		UT_ASSERT(gcs_block_invalidate_execute(&inv));
 		retire_now += 10000; gcs_first_fill_receipt_tick(0);
@@ -284,7 +299,7 @@ UT_TEST(test_master_consumption_retires_count_and_only_the_exact_old_receipt)
 	a = retire_arm(&buf, true); retire_abort(&buf, &a);
 	retire_result = CLUSTER_IC_SEND_DONE; inv = retire_invalidate(&a);
 	UT_ASSERT(gcs_block_invalidate_execute(&inv));
-	UT_ASSERT(gcs_first_fill_retry_progress(&a, true));
+	UT_ASSERT(retire_ack_handed(&a));
 	b = retire_arm(&buf, true); done = retire_notice(&a);
 	done.request_id = b.request_id; UT_ASSERT(!gcs_first_fill_receipt_consumed(&done));
 	done = retire_notice(&a); done.epoch++; UT_ASSERT(!gcs_first_fill_receipt_consumed(&done));
@@ -323,42 +338,35 @@ UT_TEST(test_native_retirement_must_be_proven_before_quiet_publication)
 		UT_ASSERT_EQ(retire_trace_published, 0);
 	}
 }
-static void
-retire_after_two_timers(void)
-{
-	if (retire_sleeps == 2) {
-		GcsBlockInvalidatePayload inv = retire_invalidate(&retire_wait_source);
-		retire_result = CLUSTER_IC_SEND_DONE;
-		UT_ASSERT(gcs_block_invalidate_execute(&inv));
-	}
-}
-UT_TEST(test_retry_requires_actual_ack_handoff_not_a_timer)
+UT_TEST(test_quiet_receipt_age_cannot_handoff_ack_or_retire)
 {
 	BufferDesc buf; ClusterPcmOwnEntry entry; ClusterPcmReadSource a;
+	GcsBlockInvalidatePayload inv;
 	retire_reset(&buf, &entry, true); a = retire_arm(&buf, true); retire_abort(&buf, &a);
-	retire_wait_source = a; retire_on_wait = retire_after_two_timers;
-	cluster_gcs_block_read_source_retry_wait(&a, 0);
-	UT_ASSERT_EQ(retire_sleeps, 2); UT_ASSERT_EQ(retire_admitted, 1);
+	for (int tick = 0; tick < 3; tick++) {
+		retire_now += 100000000; gcs_first_fill_receipt_tick(0);
+		UT_ASSERT(retire_blocks[0].slots[0].in_use);
+		UT_ASSERT_EQ(retire_receipts, 1); UT_ASSERT_EQ(retire_admitted, 0);
+	}
+	inv = retire_invalidate(&a); retire_result = CLUSTER_IC_SEND_DONE;
+	UT_ASSERT(gcs_block_invalidate_execute(&inv));
+	UT_ASSERT_EQ(retire_admitted, 1); UT_ASSERT(retire_ack_handed(&a));
 	UT_ASSERT(retire_blocks[0].slots[0].first_fill.quiet);
 }
-static void
-retire_cancel_after_three(void)
-{
-	if (retire_sleeps == 3) retire_cancel = true;
-}
-UT_TEST(test_second_retry_stays_local_until_caller_cancels)
+UT_TEST(test_caller_cancel_cannot_discard_its_shared_quiet_receipt)
 {
 	BufferDesc buf; ClusterPcmOwnEntry entry; ClusterPcmReadSource a;
-	volatile bool caught = false;
+	GcsBlockInvalidatePayload inv; GcsBlockDonePayload done;
 	retire_reset(&buf, &entry, false); a = retire_arm(&buf, true); retire_abort(&buf, &a);
-	retire_result = CLUSTER_IC_SEND_DONE;
-	{ GcsBlockInvalidatePayload inv = retire_invalidate(&a); UT_ASSERT(gcs_block_invalidate_execute(&inv)); }
-	retire_on_wait = retire_cancel_after_three;
-	PG_TRY(); { cluster_gcs_block_read_source_retry_wait(&a, 1); }
-	PG_CATCH(); { caught = true; } PG_END_TRY();
-	UT_ASSERT(caught); UT_ASSERT_EQ(retire_sleeps, 3);
+	retire_cancel = true;
+	gcs_block_release_slot(&retire_blocks[0].slots[0]);
 	UT_ASSERT(retire_blocks[0].slots[0].first_fill.quiet);
-	UT_ASSERT(!retire_blocks[0].slots[0].first_fill.progress_waiter);
+	retire_result = CLUSTER_IC_SEND_DONE; inv = retire_invalidate(&a);
+	UT_ASSERT(gcs_block_invalidate_execute(&inv));
+	UT_ASSERT(retire_ack_handed(&a));
+	done = retire_notice(&a); UT_ASSERT(gcs_first_fill_receipt_consumed(&done));
+	UT_ASSERT(!retire_blocks[0].slots[0].in_use);
+	UT_ASSERT_EQ(retire_receipts, 0);
 }
 static void
 retire_free_after_two(void)
@@ -378,7 +386,7 @@ UT_TEST(test_full_original_container_waits_without_eviction_or_transaction_error
 		a = retire_arm(&buf, true); retire_abort(&buf, &a);
 		inv = retire_invalidate(&a); retire_result = CLUSTER_IC_SEND_DONE;
 		UT_ASSERT(gcs_block_invalidate_execute(&inv));
-		UT_ASSERT(gcs_first_fill_retry_progress(&a, true));
+		UT_ASSERT(retire_ack_handed(&a));
 	}
 	UT_ASSERT_EQ(retire_receipts, MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND);
 	retire_wait_source = a; retire_on_wait = retire_free_after_two;
@@ -402,18 +410,17 @@ UT_TEST(test_exit_preserves_quiet_debt_and_reused_backend_cannot_take_it)
 	GcsBlockInvalidatePayload inv; GcsBlockDonePayload done;
 	retire_reset(&buf, &entry, true); a = retire_arm(&buf, true); retire_abort(&buf, &a);
 	retire_start++;
-	gcs_first_fill_source_exit();
-	UT_ASSERT(retire_blocks[0].slots[0].first_fill.progress_waiter);
+	gcs_block_release_slot(&retire_blocks[0].slots[0]);
+	UT_ASSERT_EQ(retire_blocks[0].slots[0].first_fill.backend_incarnation, 700);
 	retire_start--;
-	gcs_first_fill_source_exit();
-	UT_ASSERT(!retire_blocks[0].slots[0].first_fill.progress_waiter);
+	gcs_block_release_slot(&retire_blocks[0].slots[0]);
 	UT_ASSERT(retire_blocks[0].slots[0].first_fill.quiet);
 	retire_result = CLUSTER_IC_SEND_DONE; inv = retire_invalidate(&a);
 	UT_ASSERT(gcs_block_invalidate_execute(&inv)); done = retire_notice(&a);
 	UT_ASSERT(gcs_first_fill_receipt_consumed(&done));
 	UT_ASSERT_EQ(retire_receipts, 0); UT_ASSERT(!retire_blocks[0].slots[0].in_use);
 }
-UT_TEST(test_master_consumed_before_wait_keeps_only_exact_local_progress)
+UT_TEST(test_master_consumption_releases_capacity_without_a_backend_waiter)
 {
 	BufferDesc buf; ClusterPcmOwnEntry entry; ClusterPcmReadSource a;
 	GcsBlockInvalidatePayload inv; GcsBlockDonePayload done;
@@ -421,9 +428,8 @@ UT_TEST(test_master_consumed_before_wait_keeps_only_exact_local_progress)
 	retire_result = CLUSTER_IC_SEND_WOULD_BLOCK; inv = retire_invalidate(&a);
 	UT_ASSERT(gcs_block_invalidate_execute(&inv)); done = retire_notice(&a);
 	UT_ASSERT(gcs_first_fill_receipt_consumed(&done));
-	UT_ASSERT_EQ(retire_receipts, 0); UT_ASSERT(retire_blocks[0].slots[0].in_use);
-	cluster_gcs_block_read_source_retry_wait(&a, 0);
-	UT_ASSERT_EQ(retire_sleeps, 0); UT_ASSERT(!retire_blocks[0].slots[0].in_use);
+	UT_ASSERT_EQ(retire_receipts, 0); UT_ASSERT(!retire_blocks[0].slots[0].in_use);
+	UT_ASSERT_EQ(retire_sleeps, 0); UT_ASSERT(retire_wakes > 0);
 }
 UT_TEST(test_unknown_invalidate_still_observes_native_io_protection)
 {
@@ -445,7 +451,7 @@ UT_TEST(test_admitted_original_master_notice_survives_route_change)
 	retire_reset(&buf, &entry, true); a = retire_arm(&buf, true); retire_abort(&buf, &a);
 	retire_result = CLUSTER_IC_SEND_DONE; inv = retire_invalidate(&a);
 	UT_ASSERT(gcs_block_invalidate_execute(&inv));
-	UT_ASSERT(gcs_first_fill_retry_progress(&a, true));
+	UT_ASSERT(retire_ack_handed(&a));
 	retire_route = 1; done = retire_notice(&a);
 	UT_ASSERT(gcs_first_fill_receipt_consumed(&done));
 	UT_ASSERT_EQ(retire_receipts, 0);
@@ -509,7 +515,7 @@ UT_TEST(test_installed_confirm_survives_exit_and_never_reads_successor_buffer)
 	if (!retire_blocks[0].slots[0].in_use) return;
 	for (int n = 0; n < GCS_READ_SOURCE_LEDGER_MAX; n++)
 		UT_ASSERT(!gcs_read_source_attempts[n].used);
-	gcs_first_fill_source_exit(); retire_pid++; retire_start++;
+	retire_pid++; retire_start++;
 	gcs_block_release_slot(&retire_blocks[0].slots[0]);
 	UT_ASSERT(retire_blocks[0].slots[0].in_use);
 	buf.tag.relNumber++; buf.pcm_state = PCM_STATE_N;
@@ -607,7 +613,7 @@ UT_TEST(test_repeated_installed_confirmations_return_original_bounded_slots)
 }
 
 int
-main(void)
+FIRST_FILL_RETIRE_MAIN(void)
 {
 	UT_PLAN(18);
 	UT_RUN(test_installed_confirm_refusal_keeps_original_owner_until_real_handoff);
@@ -620,12 +626,12 @@ main(void)
 	UT_RUN(test_ack_refusal_keeps_frame_and_receipt_until_real_takeover);
 	UT_RUN(test_master_consumption_retires_count_and_only_the_exact_old_receipt);
 	UT_RUN(test_native_retirement_must_be_proven_before_quiet_publication);
-	UT_RUN(test_retry_requires_actual_ack_handoff_not_a_timer);
-	UT_RUN(test_second_retry_stays_local_until_caller_cancels);
+	UT_RUN(test_quiet_receipt_age_cannot_handoff_ack_or_retire);
+	UT_RUN(test_caller_cancel_cannot_discard_its_shared_quiet_receipt);
 	UT_RUN(test_full_original_container_waits_without_eviction_or_transaction_error);
 	UT_RUN(test_never_admitted_cancel_needs_no_remote_receipt);
 	UT_RUN(test_exit_preserves_quiet_debt_and_reused_backend_cannot_take_it);
-	UT_RUN(test_master_consumed_before_wait_keeps_only_exact_local_progress);
+	UT_RUN(test_master_consumption_releases_capacity_without_a_backend_waiter);
 	UT_RUN(test_unknown_invalidate_still_observes_native_io_protection);
 	UT_RUN(test_admitted_original_master_notice_survives_route_change);
 	UT_DONE(); return ut_failed_count == 0 ? 0 : 1;

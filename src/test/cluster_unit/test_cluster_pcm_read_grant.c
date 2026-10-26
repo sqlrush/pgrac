@@ -205,7 +205,10 @@ UT_TEST(test_nack_membership_and_entry_lifetime_keep_pending_responsibility)
 #include "cluster/cluster_gcs_block_dedup.h"
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_gcs_reqid.h"
-static struct { pg_atomic_uint64 block_forward_sent_count; } read_wire_counters;
+static struct {
+	pg_atomic_uint64 block_forward_sent_count;
+	pg_atomic_uint64 block_reply_count;
+} read_wire_counters;
 static GcsBlockForwardPayload read_forward;
 static GcsBlockReplyHeader read_reply;
 static unsigned read_forwards, read_replies, read_local_forwards;
@@ -217,6 +220,11 @@ static char read_reply_frame[sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE];
 static GcsBlockDonePayload read_notice;
 static unsigned read_notices, read_revokes, read_cleanup_lookups;
 static bool read_cleanup_capacity = true;
+static GcsBlockDedupResult read_ingress_result;
+static GcsBlockDedupEntry read_ingress_cached;
+static bool read_flags_match;
+static unsigned read_flag_pins, read_cached_resends, read_ingress_defers;
+static const ClusterICEnvelope *read_deferred_envelope;
 static TimestampTz read_master_time;
 static unsigned read_retirements;
 static unsigned read_ungranted;
@@ -302,14 +310,28 @@ read_mock_ungranted(int worker, const GcsBlockDedupKey *key, const BufferTag *ta
 }
 static GcsBlockDedupResult
 read_cleanup_lookup(int worker pg_attribute_unused(), const GcsBlockDedupKey *key,
-	BufferTag tag, uint8 transition, uint32 hint pg_attribute_unused(),
-	bool capable pg_attribute_unused(), GcsBlockDedupEntry *cached pg_attribute_unused())
+	BufferTag tag, uint8 transition, uint32 hint,
+	bool capable, GcsBlockDedupEntry *cached);
+static bool read_lifetime_guard;
+static uint32 read_last_lifetime_hint;
+static GcsBlockDedupResult
+read_cleanup_lookup(int worker pg_attribute_unused(), const GcsBlockDedupKey *key,
+	BufferTag tag, uint8 transition, uint32 hint,
+	bool capable, GcsBlockDedupEntry *cached)
 {
 	UT_ASSERT_EQ(transition, PCM_TRANS_N_TO_S);
 	UT_ASSERT_EQ(key->request_id, read_request.request_id);
 	UT_ASSERT(BufferTagsEqual(&tag, &read_request.tag));
 	read_cleanup_lookups++;
-	return read_cleanup_capacity ? GCS_BLOCK_DEDUP_MISS_REGISTERED : GCS_BLOCK_DEDUP_FULL;
+	read_last_lifetime_hint = hint;
+	*cached = read_ingress_cached;
+	/* Registration boundary: a real DONE-capable MISS rejects a zero or
+	 * illegal lifetime before creating a dedup entry. Most legacy tests
+	 * control replay directly; this arm covers fresh queued cancellation. */
+	if (read_lifetime_guard && read_ingress_result == GCS_BLOCK_DEDUP_MISS_REGISTERED
+		&& capable && (hint == 0 || (int64)hint > GCS_BLOCK_DEDUP_MAX_PROTOCOL_LIFETIME_MS))
+		return GCS_BLOCK_DEDUP_VALIDATION_FAIL;
+	return read_cleanup_capacity ? read_ingress_result : GCS_BLOCK_DEDUP_FULL;
 }
 static bool
 read_cleanup_flags(int worker pg_attribute_unused(), const GcsBlockDedupKey *key,
@@ -319,7 +341,22 @@ read_cleanup_flags(int worker pg_attribute_unused(), const GcsBlockDedupKey *key
 	UT_ASSERT(BufferTagsEqual(tag, &read_request.tag));
 	UT_ASSERT_EQ(transition, PCM_TRANS_N_TO_S);
 	UT_ASSERT_EQ(flags, GCS_BLOCK_DEDUP_REQUEST_F_READ_MISS);
+	read_flag_pins++;
+	return read_flags_match;
+}
+static bool
+gcs_block_resend_cached_reply(int32 dest, const GcsBlockDedupEntry *cached)
+{
+	UT_ASSERT_EQ(dest, read_request.sender_node);
+	read_cached_resends++;
+	read_reply = cached->reply_header;
 	return true;
+}
+static void
+read_ingress_defer(const ClusterICEnvelope *env)
+{
+	read_ingress_defers++;
+	read_deferred_envelope = env;
 }
 #define cluster_gcs_block_dedup_lookup_or_register read_cleanup_lookup
 #define cluster_gcs_block_dedup_set_request_flags_exact read_cleanup_flags
@@ -364,9 +401,13 @@ read_done_auth(int node pg_attribute_unused(), uint64 epoch, uint64 *session)
 #define cluster_gcs_block_dedup_note_done_mismatch(worker) ((void)0)
 #define gcs_first_fill_receipt_consumed(done) false
 #define gcs_first_fill_holder_returned(done, session) false
-#define cluster_ic_dispatch_defer(env) ((void)(env))
+#define cluster_ic_dispatch_defer read_ingress_defer
 #define gcs_block_pcm_x_authenticated_session read_done_auth
+#define MemoryContextAllocZero(context, size) calloc(1, (size))
+#define pfree free
 #include "test_cluster_pcm_first_fill_master.inc"
+#undef pfree
+#undef MemoryContextAllocZero
 #undef gcs_block_pcm_x_authenticated_session
 #undef cluster_ic_dispatch_defer
 #undef gcs_first_fill_holder_returned
@@ -408,12 +449,23 @@ static GcsBlockDedupKey
 read_wire_setup(BufferTag tag)
 {
 	GcsBlockDedupKey key = {0};
+	while (gcs_first_fill_ingress_head != NULL)
+		gcs_first_fill_ingress_forget(gcs_first_fill_ingress_head);
 	read_forwards = read_replies = read_local_forwards = 0;
 	read_notices = read_revokes = read_cleanup_lookups = 0;
 	read_cleanup_capacity = true;
+	read_lifetime_guard = false;
+	read_last_lifetime_hint = 0;
+	read_ingress_result = GCS_BLOCK_DEDUP_MISS_REGISTERED;
+	memset(&read_ingress_cached, 0, sizeof(read_ingress_cached));
+	read_flags_match = true;
+	read_flag_pins = read_cached_resends = read_ingress_defers = 0;
+	read_deferred_envelope = NULL;
+	memset(&read_wire_counters, 0, sizeof(read_wire_counters));
 	read_notice_result = CLUSTER_IC_SEND_NOT_ADMITTED;
 	read_disk_result = CLUSTER_IC_SEND_DONE;
 	read_epoch = 1;
+	read_done_session = true;
 	read_done_incarnation = 9;
 	read_requester_state = read_holder_state = CLUSTER_MEMBER_MEMBER;
 	memset(read_reply_frame, 0, sizeof(read_reply_frame));
@@ -434,6 +486,7 @@ read_wire_setup(BufferTag tag)
 	read_request.requester_backend_id = 13;
 	read_request.transition_id = PCM_TRANS_N_TO_S;
 	GcsBlockRequestPayloadSetReadMiss(&read_request, true);
+	GcsBlockRequestPayloadSetLifetimeHintMs(&read_request, 5000);
 	key.origin_node_id = 1;
 	key.requester_backend_id = 13;
 	key.request_id = 71;
@@ -768,16 +821,22 @@ UT_TEST(test_requester_nack_can_admit_cleanup_after_initial_master_capacity_refu
 	BufferTag tag = make_tag(139);
 	GcsBlockDedupKey wire;
 	ClusterPcmReadGrantKey key = {0};
+	ClusterICEnvelope env = {0};
 	reset_fake_pcm_runtime(4); wire = read_wire_setup(tag);
 	wire.request_id = read_request.request_id = gcs_reqid_requester(1, 12, 71);
 	key.tag = tag; key.request_id = wire.request_id; key.epoch = wire.cluster_epoch;
 	key.requester_node = wire.origin_node_id; key.backend_id = wire.requester_backend_id;
-	/* The original request was refused before either a native grant or park
-	 * existed. The retained requester NACK, not another REQUEST, supplies the
+	/* The original request waits before either a native grant or park
+	 * exists. The retained requester NACK, not another REQUEST, supplies the
 	 * exact cleanup identity when the master's bounded capacity is available. */
 	for (int i = 0; i < GCS_FIRST_FILL_PARK_MAX; i++)
 		gcs_first_fill_master_parks[i].in_use = true;
+	gcs_block_first_fill_ingress(&env, &read_request, &wire, 1);
+	UT_ASSERT_EQ(read_ingress_defers, 0);
+	UT_ASSERT_EQ(gcs_first_fill_ingress_count, 1);
+	UT_ASSERT_EQ(read_forwards + read_replies, 0);
 	UT_ASSERT(!gcs_first_fill_master_cancel(&key, 1));
+	UT_ASSERT(gcs_first_fill_ingress_head->cancelling);
 	UT_ASSERT_EQ(read_cleanup_lookups, 0);
 	for (int i = 0; i < GCS_FIRST_FILL_PARK_MAX; i++)
 		UT_ASSERT(gcs_first_fill_master_parks[i].in_use);
@@ -788,9 +847,15 @@ UT_TEST(test_requester_nack_can_admit_cleanup_after_initial_master_capacity_refu
 	UT_ASSERT(!gcs_first_fill_master_parks[0].in_use);
 	read_cleanup_capacity = true;
 	UT_ASSERT(gcs_first_fill_master_cancel(&key, 1));
+	UT_ASSERT_EQ(gcs_first_fill_ingress_count, 0);
+	UT_ASSERT(gcs_first_fill_ingress_head == NULL);
 	UT_ASSERT_EQ(read_cleanup_lookups, 2);
 	UT_ASSERT(gcs_first_fill_master_parks[0].in_use);
 	UT_ASSERT(gcs_first_fill_master_parks[0].cancelling);
+	read_ingress_result = GCS_BLOCK_DEDUP_IN_FLIGHT_DUPLICATE;
+	gcs_block_first_fill_ingress(&env, &read_request, &wire, 1);
+	UT_ASSERT(gcs_first_fill_master_parks[0].cancelling);
+	UT_ASSERT(cluster_pcm_lock_read_grant_absent(&key));
 	UT_ASSERT_EQ(read_forwards, 0);
 	gcs_first_fill_master_tick(1);
 	UT_ASSERT_EQ(read_revokes, 1);
@@ -801,6 +866,12 @@ UT_TEST(test_requester_nack_can_admit_cleanup_after_initial_master_capacity_refu
 	read_notice_result = CLUSTER_IC_SEND_DONE; read_master_time += 10000;
 	gcs_first_fill_master_tick(1);
 	UT_ASSERT(!gcs_first_fill_master_parks[0].in_use);
+	read_ingress_result = GCS_BLOCK_DEDUP_CACHED_REPLY;
+	read_ingress_cached.reply_header.status = GCS_BLOCK_REPLY_DENIED_PENDING_X;
+	gcs_block_first_fill_ingress(&env, &read_request, &wire, 1);
+	UT_ASSERT_EQ(read_cached_resends, 1);
+	UT_ASSERT(!gcs_first_fill_master_parks[0].in_use);
+	UT_ASSERT(cluster_pcm_lock_read_grant_absent(&key));
 }
 
 UT_TEST(test_absent_old_key_cleanup_does_not_consume_successor_native_grant)
@@ -1069,6 +1140,7 @@ UT_TEST(test_master_capacity_precedes_native_grant_and_never_evicts)
 	memcpy(before, gcs_first_fill_master_parks, sizeof(before));
 	gcs_block_first_fill_request(&read_request, &key, 1, true);
 	UT_ASSERT_EQ(memcmp(before, gcs_first_fill_master_parks, sizeof(before)), 0);
+	UT_ASSERT_EQ(read_replies, 0);
 	UT_ASSERT_EQ(cluster_pcm_lock_query_s_holders_bitmap(tag), 0);
 	native.tag = tag; native.request_id = 71; native.epoch = 1;
 	native.requester_node = 1; native.backend_id = 13;
@@ -1678,10 +1750,380 @@ UT_TEST(master_handed_off_service_ends_only_on_proved_holder_death_or_new_incarn
 	read_done_session = true;
 }
 
+/* One real native service owns slot zero. Other occupied slots are bounded
+ * capacity sentinels; their unchanged bytes are checked, not native claims. */
+static void
+read_fill_other_master_slots(void)
+{
+	for (int i = 1; i < GCS_FIRST_FILL_PARK_MAX; i++) {
+		GcsFirstFillMasterPark *park = &gcs_first_fill_master_parks[i];
+		park->in_use = true;
+		park->key.request_id = 1000 + i;
+		park->retry_at = INT64_MAX;
+	}
+}
+
+UT_TEST(master_full_ingress_waits_before_dedup_then_admits_the_same_frame)
+{
+	GcsBlockDedupKey key;
+	GcsBlockRequestPayload original;
+	ClusterICEnvelope env = {0}, original_env;
+	ClusterPcmReadGrant old;
+	GcsFirstFillMasterPark before[GCS_FIRST_FILL_PARK_MAX];
+	reset_fake_pcm_runtime(4); key = read_wire_setup(make_tag(180));
+	gcs_block_first_fill_request(&read_request, &key, 1, true);
+	old = gcs_first_fill_master_parks[0].grant;
+	read_fill_other_master_slots();
+	memcpy(before, gcs_first_fill_master_parks, sizeof(before));
+	read_request.tag = make_tag(181);
+	read_request.request_id = key.request_id = gcs_reqid_requester(1, 12, 72);
+	original = read_request;
+	env.payload_length = sizeof(read_request);
+	original_env = env;
+	for (int dispatch = 0; dispatch < 3; dispatch++) {
+		gcs_block_first_fill_ingress(&env, &read_request, &key, 1);
+		UT_ASSERT_EQ(read_ingress_defers, 0);
+		UT_ASSERT(read_deferred_envelope == NULL);
+		UT_ASSERT_EQ(gcs_first_fill_ingress_count, 1);
+		UT_ASSERT_EQ(memcmp(&gcs_first_fill_ingress_head->request, &original, sizeof(original)), 0);
+		UT_ASSERT_EQ(read_cleanup_lookups + read_flag_pins, 0);
+		UT_ASSERT_EQ(read_forwards + read_replies, 1);
+		UT_ASSERT_EQ(memcmp(before, gcs_first_fill_master_parks, sizeof(before)), 0);
+		UT_ASSERT_EQ(cluster_pcm_lock_query_s_holders_bitmap(read_request.tag), 0);
+		read_master_time += 10000;
+	}
+	UT_ASSERT(cluster_pcm_lock_read_grant_done(&old.key, 1, true));
+	gcs_first_fill_master_tick(1);
+	UT_ASSERT(gcs_first_fill_master_parks[0].in_use);
+	UT_ASSERT_EQ(gcs_first_fill_ingress_count, 0);
+	UT_ASSERT_EQ(read_ingress_defers, 0);
+	UT_ASSERT_EQ(read_cleanup_lookups, 1);
+	UT_ASSERT_EQ(read_flag_pins, 1);
+	UT_ASSERT_EQ(read_forwards + read_replies, 2);
+	UT_ASSERT_EQ(gcs_first_fill_master_parks[0].request.request_id, original.request_id);
+	UT_ASSERT_EQ(memcmp(before + 1, gcs_first_fill_master_parks + 1,
+		sizeof(before) - sizeof(before[0])), 0);
+	UT_ASSERT_EQ(memcmp(&original, &read_request, sizeof(original)), 0);
+	UT_ASSERT_EQ(memcmp(&original_env, &env, sizeof(env)), 0);
+	read_confirm_original_service();
+	UT_ASSERT(!gcs_first_fill_master_parks[0].in_use);
+}
+
+UT_TEST(dedup_full_ingress_keeps_the_frame_without_grant_or_local_owner)
+{
+	GcsBlockDedupKey key;
+	ClusterICEnvelope env = {0};
+	GcsFirstFillMasterPark before[GCS_FIRST_FILL_PARK_MAX];
+	reset_fake_pcm_runtime(4); key = read_wire_setup(make_tag(182));
+	read_request.request_id = key.request_id = gcs_reqid_requester(1, 12, 73);
+	memcpy(before, gcs_first_fill_master_parks, sizeof(before));
+	read_cleanup_capacity = false;
+	for (int dispatch = 0; dispatch < 3; dispatch++) {
+		gcs_block_first_fill_ingress(&env, &read_request, &key, 1);
+		UT_ASSERT_EQ(read_cleanup_lookups, 1);
+		UT_ASSERT_EQ(read_ingress_defers, 0);
+		UT_ASSERT(read_deferred_envelope == NULL);
+		UT_ASSERT_EQ(gcs_first_fill_ingress_count, 1);
+		UT_ASSERT_EQ(read_flag_pins + read_forwards + read_replies, 0);
+		UT_ASSERT_EQ(memcmp(before, gcs_first_fill_master_parks, sizeof(before)), 0);
+		UT_ASSERT_EQ(cluster_pcm_lock_query_s_holders_bitmap(read_request.tag), 0);
+	}
+	read_master_time += 1000000000;
+	gcs_first_fill_master_tick(1);
+	UT_ASSERT_EQ(read_cleanup_lookups, 2);
+	UT_ASSERT_EQ(gcs_first_fill_ingress_count, 1);
+	read_cleanup_capacity = true;
+	gcs_first_fill_master_tick(1);
+	UT_ASSERT_EQ(read_ingress_defers, 0);
+	UT_ASSERT_EQ(read_cleanup_lookups, 3);
+	UT_ASSERT_EQ(gcs_first_fill_ingress_count, 0);
+	UT_ASSERT_EQ(read_flag_pins, 1);
+	UT_ASSERT_EQ(read_replies, 1);
+	UT_ASSERT(gcs_first_fill_master_parks[0].registered);
+	UT_ASSERT_EQ(gcs_first_fill_master_parks[0].request.request_id, key.request_id);
+	read_confirm_original_service();
+	UT_ASSERT(!gcs_first_fill_master_parks[0].in_use);
+}
+
+static GcsBlockDedupKey
+read_queue_at_capacity(BlockNumber block)
+{
+	GcsBlockDedupKey key = read_wire_setup(make_tag(block));
+	read_request.request_id = key.request_id = gcs_reqid_requester(1, 12, block);
+	for (int i = 0; i < GCS_FIRST_FILL_PARK_MAX; i++) {
+		gcs_first_fill_master_parks[i].in_use = true;
+		gcs_first_fill_master_parks[i].retry_at = INT64_MAX;
+	}
+	return key;
+}
+
+UT_TEST(queued_ingress_uses_existing_backend_credit_without_evicting_originals)
+{
+	GcsBlockDedupKey key;
+	ClusterICEnvelope env = {0};
+	GcsBlockRequestPayload original;
+	const char *reason;
+	reset_fake_pcm_runtime(4); key = read_queue_at_capacity(190);
+	for (int i = 0; i < CLUSTER_GCS_BLOCK_MAX_OUTSTANDING_PER_BACKEND; i++) {
+		read_request.request_id = key.request_id = gcs_reqid_requester(1, 12, 100 + i);
+		gcs_block_first_fill_ingress(&env, &read_request, &key, 1);
+	}
+	UT_ASSERT_EQ(gcs_first_fill_ingress_count, 8);
+	original = read_request;
+	/* A duplicate at the credit limit shares its existing owner. A changed
+	 * payload with that same identity cannot replace its immutable bytes. */
+	gcs_block_first_fill_ingress(&env, &read_request, &key, 1);
+	UT_ASSERT_EQ(read_ingress_defers, 0);
+	read_request.tag.blockNum++;
+	gcs_block_first_fill_ingress(&env, &read_request, &key, 1);
+	UT_ASSERT_EQ(read_ingress_defers, 1);
+	UT_ASSERT_EQ(memcmp(&gcs_first_fill_ingress_tail->request, &original, sizeof(original)), 0);
+	read_request = original;
+	read_request.request_id = key.request_id = gcs_reqid_requester(1, 12, 108);
+	gcs_block_first_fill_ingress(&env, &read_request, &key, 1);
+	UT_ASSERT_EQ(gcs_first_fill_ingress_count, 8);
+	UT_ASSERT_EQ(read_ingress_defers, 2);
+	/* Another backend has its own original shared-slot credit. */
+	read_request.requester_backend_id = key.requester_backend_id = 14;
+	read_request.request_id = key.request_id = gcs_reqid_requester(1, 13, 109);
+	gcs_block_first_fill_ingress(&env, &read_request, &key, 1);
+	UT_ASSERT_EQ(gcs_first_fill_ingress_count, 9);
+	UT_ASSERT_EQ(read_ingress_defers, 2);
+	UT_ASSERT_EQ(read_cleanup_lookups + read_flag_pins + read_replies + read_forwards, 0);
+	UT_ASSERT_EQ(gcs_first_fill_ingress_poll(&reason), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT(strcmp(reason, "GCS_FIRST_FILL_INGRESS_WAIT") == 0);
+	/* Test teardown does not stand in for protocol completion. */
+	while (gcs_first_fill_ingress_head != NULL)
+		gcs_first_fill_ingress_forget(gcs_first_fill_ingress_head);
+	UT_ASSERT_EQ(gcs_first_fill_ingress_poll(&reason), CLUSTER_NORMAL_STOP_READY);
+}
+
+UT_TEST(queued_ingress_rechecks_each_authority_gate_without_fabricated_admission)
+{
+	for (int gate = 0; gate < 7; gate++) {
+		GcsBlockDedupKey key;
+		ClusterICEnvelope env = {0};
+		reset_fake_pcm_runtime(4); key = read_queue_at_capacity(191);
+		gcs_block_first_fill_ingress(&env, &read_request, &key, 1);
+		memset(gcs_first_fill_master_parks, 0, sizeof(gcs_first_fill_master_parks));
+		if (gate == 0) read_serving = false;
+		if (gate == 1) { read_managed = false; read_quorum = false; }
+		if (gate == 2) read_member = false;
+		if (gate == 3) read_join_rebuilt = false;
+		if (gate == 4) read_recovering = true;
+		if (gate == 5) read_done_session = false;
+		/* An unrelated worker cannot consume the routed owner. */
+		read_master_time += 1000000000;
+		gcs_first_fill_master_tick(gate == 6 ? 0 : 1);
+		UT_ASSERT_EQ(gcs_first_fill_ingress_count, 1);
+		UT_ASSERT_EQ(read_cleanup_lookups + read_flag_pins + read_replies + read_forwards, 0);
+		read_serving = read_quorum = read_member = read_join_rebuilt = read_done_session = true;
+		read_recovering = false;
+		gcs_first_fill_master_tick(1);
+		UT_ASSERT_EQ(gcs_first_fill_ingress_count, 0);
+		UT_ASSERT_EQ(read_cleanup_lookups, 1);
+		read_confirm_original_service();
+	}
+}
+
+UT_TEST(queued_ingress_retires_only_on_proved_reconfiguration_or_incarnation_change)
+{
+	for (int why = 0; why < 5; why++) {
+		GcsBlockDedupKey key;
+		ClusterICEnvelope env = {0};
+		const char *reason;
+		reset_fake_pcm_runtime(4); key = read_queue_at_capacity(192);
+		gcs_block_first_fill_ingress(&env, &read_request, &key, 1);
+		if (why == 0) read_epoch++;
+		if (why == 1) read_requester_state = CLUSTER_MEMBER_DEAD;
+		if (why == 2) read_requester_state = CLUSTER_MEMBER_REMOVED;
+		if (why == 3) read_done_incarnation++;
+		if (why == 4) read_home = false;
+		gcs_first_fill_master_tick(1);
+		UT_ASSERT_EQ(gcs_first_fill_ingress_count, 0);
+		UT_ASSERT_EQ(read_cleanup_lookups + read_flag_pins + read_replies + read_forwards, 0);
+		UT_ASSERT_EQ(gcs_first_fill_ingress_poll(&reason), CLUSTER_NORMAL_STOP_READY);
+		UT_ASSERT_EQ(cluster_pcm_lock_query_s_holders_bitmap(read_request.tag), 0);
+	}
+}
+
+UT_TEST(queued_ingress_normal_stop_drives_exact_cleanup_and_never_grants)
+{
+	GcsBlockDedupKey key;
+	ClusterPcmReadGrantKey native = {0};
+	ClusterICEnvelope env = {0};
+	const char *reason;
+	reset_fake_pcm_runtime(4); key = read_queue_at_capacity(193);
+	native.tag = read_request.tag; native.request_id = key.request_id; native.epoch = 1;
+	native.requester_node = 1; native.backend_id = 13;
+	gcs_block_first_fill_ingress(&env, &read_request, &key, 1);
+	read_stop = true;
+	gcs_first_fill_master_tick(1);
+	UT_ASSERT(gcs_first_fill_ingress_head->cancelling);
+	UT_ASSERT_EQ(gcs_first_fill_ingress_poll(&reason), CLUSTER_NORMAL_STOP_PENDING);
+	memset(gcs_first_fill_master_parks, 0, sizeof(gcs_first_fill_master_parks));
+	read_cleanup_capacity = false;
+	gcs_first_fill_master_tick(1);
+	UT_ASSERT_EQ(gcs_first_fill_ingress_count, 1);
+	read_cleanup_capacity = true;
+	gcs_first_fill_master_tick(1);
+	UT_ASSERT_EQ(gcs_first_fill_ingress_count, 0);
+	UT_ASSERT(gcs_first_fill_master_parks[0].cancelling);
+	UT_ASSERT(cluster_pcm_lock_read_grant_absent(&native));
+	UT_ASSERT_EQ(read_forwards + read_replies, 0);
+	/* Its original REQUEST copy is gone before the quiet ACK can retire
+	 * the terminal replay history or release original requester credit. */
+	UT_ASSERT(gcs_first_fill_master_cancel_ack(&native));
+	read_notice_result = CLUSTER_IC_SEND_DONE;
+	gcs_first_fill_master_tick(1);
+	UT_ASSERT(!gcs_first_fill_master_parks[0].in_use);
+	UT_ASSERT_EQ(gcs_first_fill_ingress_poll(&reason), CLUSTER_NORMAL_STOP_READY);
+}
+
+UT_TEST(queued_cancel_preserves_original_lifetime_for_fresh_dedup_registration)
+{
+	GcsBlockDedupKey wire;
+	ClusterPcmReadGrantKey key = {0};
+	ClusterICEnvelope env = {0};
+	reset_fake_pcm_runtime(4); wire = read_queue_at_capacity(196);
+	GcsBlockRequestPayloadSetLifetimeHintMs(&read_request, 23456);
+	key.tag = read_request.tag; key.request_id = wire.request_id; key.epoch = wire.cluster_epoch;
+	key.requester_node = wire.origin_node_id; key.backend_id = wire.requester_backend_id;
+	gcs_block_first_fill_ingress(&env, &read_request, &wire, 1);
+	memset(gcs_first_fill_master_parks, 0, sizeof(gcs_first_fill_master_parks));
+	read_lifetime_guard = true;
+	UT_ASSERT(gcs_first_fill_master_cancel(&key, 1));
+	UT_ASSERT_EQ(read_last_lifetime_hint, 23456);
+	UT_ASSERT_EQ(gcs_first_fill_ingress_count, 0);
+	UT_ASSERT(gcs_first_fill_ingress_head == NULL);
+	UT_ASSERT(gcs_first_fill_master_parks[0].cancelling);
+	UT_ASSERT_EQ(read_forwards + read_replies, 0);
+	UT_ASSERT(cluster_pcm_lock_read_grant_absent(&key));
+}
+
+UT_TEST(queued_ingress_keeps_carrier_when_identity_or_session_is_unprovable)
+{
+	for (int bad = 0; bad < 6; bad++) {
+		GcsBlockDedupKey key;
+		ClusterICEnvelope env = {0};
+		reset_fake_pcm_runtime(4); key = read_queue_at_capacity(194);
+		if (bad == 0) read_done_session = false;
+		if (bad == 1) read_done_incarnation = 0;
+		if (bad == 2) read_request.request_id = key.request_id = 71;
+		if (bad == 3) key.requester_backend_id++;
+		if (bad == 4) read_request.requester_backend_id = key.requester_backend_id = MaxBackends + 1;
+		if (bad == 5) GcsBlockRequestPayloadSetCleanEligible(&read_request, true);
+		gcs_block_first_fill_ingress(&env, &read_request, &key, 1);
+		UT_ASSERT_EQ(gcs_first_fill_ingress_count, 0);
+		UT_ASSERT_EQ(read_ingress_defers, 1);
+		UT_ASSERT(read_deferred_envelope == &env);
+		UT_ASSERT_EQ(read_cleanup_lookups + read_flag_pins + read_replies + read_forwards, 0);
+	}
+}
+
+UT_TEST(queued_ingress_poll_rejects_malformed_count_credit_and_chain)
+{
+	GcsBlockDedupKey key;
+	ClusterICEnvelope env = {0};
+	const char *reason;
+	reset_fake_pcm_runtime(4); key = read_queue_at_capacity(195);
+	gcs_block_first_fill_ingress(&env, &read_request, &key, 1);
+	gcs_first_fill_ingress_count++;
+	UT_ASSERT_EQ(gcs_first_fill_ingress_poll(&reason), CLUSTER_NORMAL_STOP_INVALID);
+	gcs_first_fill_ingress_count--;
+	gcs_first_fill_ingress_credit[1][12]++;
+	UT_ASSERT_EQ(gcs_first_fill_ingress_poll(&reason), CLUSTER_NORMAL_STOP_INVALID);
+	gcs_first_fill_ingress_credit[1][12]--;
+	gcs_first_fill_ingress_head->next = gcs_first_fill_ingress_head;
+	UT_ASSERT_EQ(gcs_first_fill_ingress_poll(&reason), CLUSTER_NORMAL_STOP_INVALID);
+	gcs_first_fill_ingress_head->next = NULL;
+	UT_ASSERT_EQ(gcs_first_fill_ingress_poll(&reason), CLUSTER_NORMAL_STOP_PENDING);
+}
+
+UT_TEST(full_master_accepts_exact_duplicates_without_reoffering_service)
+{
+	const GcsBlockDedupResult results[] = {
+		GCS_BLOCK_DEDUP_IN_FLIGHT_DUPLICATE, GCS_BLOCK_DEDUP_FORWARDED_DUPLICATE,
+		GCS_BLOCK_DEDUP_CACHED_REPLY
+	};
+	GcsBlockDedupKey key;
+	ClusterICEnvelope env = {0};
+	GcsFirstFillMasterPark before[GCS_FIRST_FILL_PARK_MAX];
+	reset_fake_pcm_runtime(4); key = read_wire_setup(make_tag(183));
+	gcs_block_first_fill_request(&read_request, &key, 1, true);
+	read_fill_other_master_slots();
+	memcpy(before, gcs_first_fill_master_parks, sizeof(before));
+	read_ingress_cached.reply_header = read_reply;
+	UT_ASSERT(GcsBlockReplyHeaderHasPendingS(&read_ingress_cached.reply_header));
+	for (unsigned duplicate = 0; duplicate < lengthof(results); duplicate++) {
+		read_ingress_result = results[duplicate];
+		gcs_block_first_fill_ingress(&env, &read_request, &key, 1);
+		UT_ASSERT_EQ(read_cleanup_lookups, duplicate + 1);
+		UT_ASSERT_EQ(read_flag_pins, duplicate + 1);
+		UT_ASSERT_EQ(read_ingress_defers + read_cached_resends, 0);
+		UT_ASSERT_EQ(read_forwards + read_replies, 1);
+		UT_ASSERT_EQ(memcmp(before, gcs_first_fill_master_parks, sizeof(before)), 0);
+	}
+}
+
+UT_TEST(first_fill_ingress_preserves_validation_and_immutable_flag_rejections)
+{
+	for (int collision = 0; collision < 2; collision++) {
+		GcsBlockDedupKey key;
+		ClusterICEnvelope env = {0};
+		reset_fake_pcm_runtime(4); key = read_wire_setup(make_tag(184));
+		if (collision) read_flags_match = false;
+		else read_ingress_result = GCS_BLOCK_DEDUP_VALIDATION_FAIL;
+		gcs_block_first_fill_ingress(&env, &read_request, &key, 1);
+		UT_ASSERT_EQ(read_replies, 1);
+		UT_ASSERT_EQ(read_reply.status, GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT);
+		UT_ASSERT_EQ(read_flag_pins, collision);
+		UT_ASSERT_EQ(read_ingress_defers + read_forwards, 0);
+		UT_ASSERT(!gcs_first_fill_master_parks[0].in_use);
+		UT_ASSERT_EQ(cluster_pcm_lock_query_s_holders_bitmap(read_request.tag), 0);
+	}
+}
+
+UT_TEST(first_fill_replays_without_local_ownership_cannot_create_service)
+{
+	for (int replay = 0; replay < 4; replay++) {
+		GcsBlockDedupKey key;
+		ClusterICEnvelope env = {0};
+		reset_fake_pcm_runtime(4); key = read_wire_setup(make_tag(185));
+		read_ingress_result = replay == 0 ? GCS_BLOCK_DEDUP_IN_FLIGHT_DUPLICATE
+			: replay == 1 ? GCS_BLOCK_DEDUP_FORWARDED_DUPLICATE : GCS_BLOCK_DEDUP_CACHED_REPLY;
+		if (replay == 2)
+			read_ingress_cached.reply_header.reserved_0[5] = GCS_BLOCK_PENDING_S_REPLY_MARK;
+		read_ingress_cached.reply_header.transition_id = PCM_TRANS_N_TO_S;
+		read_ingress_cached.reply_header.status = replay == 2
+			? GCS_BLOCK_REPLY_GRANTED_STORAGE_FALLBACK : GCS_BLOCK_REPLY_DENIED_PENDING_X;
+		UT_ASSERT_EQ(GcsBlockReplyHeaderHasPendingS(&read_ingress_cached.reply_header), replay == 2);
+		gcs_block_first_fill_ingress(&env, &read_request, &key, 1);
+		UT_ASSERT_EQ(read_cleanup_lookups, 1);
+		UT_ASSERT_EQ(read_flag_pins, 1);
+		UT_ASSERT_EQ(read_cached_resends, replay == 3 ? 1 : 0);
+		UT_ASSERT_EQ(read_ingress_defers + read_forwards + read_replies, 0);
+		UT_ASSERT(!gcs_first_fill_master_parks[0].in_use);
+		UT_ASSERT_EQ(cluster_pcm_lock_query_s_holders_bitmap(read_request.tag), 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(48);
+	UT_PLAN(60);
+	UT_RUN(queued_cancel_preserves_original_lifetime_for_fresh_dedup_registration);
+	UT_RUN(queued_ingress_uses_existing_backend_credit_without_evicting_originals);
+	UT_RUN(queued_ingress_rechecks_each_authority_gate_without_fabricated_admission);
+	UT_RUN(queued_ingress_retires_only_on_proved_reconfiguration_or_incarnation_change);
+	UT_RUN(queued_ingress_normal_stop_drives_exact_cleanup_and_never_grants);
+	UT_RUN(queued_ingress_keeps_carrier_when_identity_or_session_is_unprovable);
+	UT_RUN(queued_ingress_poll_rejects_malformed_count_credit_and_chain);
+	UT_RUN(master_full_ingress_waits_before_dedup_then_admits_the_same_frame);
+	UT_RUN(dedup_full_ingress_keeps_the_frame_without_grant_or_local_owner);
+	UT_RUN(full_master_accepts_exact_duplicates_without_reoffering_service);
+	UT_RUN(first_fill_ingress_preserves_validation_and_immutable_flag_rejections);
+	UT_RUN(first_fill_replays_without_local_ownership_cannot_create_service);
 	UT_RUN(master_handed_off_service_ends_only_on_proved_holder_death_or_new_incarnation);
 	UT_RUN(return_from_a_different_holder_incarnation_cannot_reset_service);
 	UT_RUN(returned_service_observes_a_native_release_and_reacquire_of_same_holder);

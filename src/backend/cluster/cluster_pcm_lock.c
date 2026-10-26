@@ -8673,7 +8673,8 @@ cluster_pcm_lock_acquire_buffer_source(BufferDesc *buf, ClusterPcmReadSource *so
 		source->durable = pcm_lock_acquire_buffer(buf, PCM_LOCK_MODE_S,
 			&retry_denied, source);
 		if (retry_denied)
-			source->kind = CLUSTER_PCM_SOURCE_RETRY;
+			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+				errmsg("first-read source returned a legacy retry result")));
 	}
 	PG_FINALLY();
 	{

@@ -3305,8 +3305,8 @@ cluster_bufmgr_pcm_acquire_shared_owned(BufferDesc *buf,
 	{
 		cluster_bufmgr_trace_cleanup(buf, "shared_acquire_enter", reservation_token);
 		if (source != NULL) {
-			ClusterPcmReadSourceKind kind = cluster_pcm_lock_acquire_buffer_source(buf, source);
-			*retry_denied = kind == CLUSTER_PCM_SOURCE_RETRY;
+			(void)cluster_pcm_lock_acquire_buffer_source(buf, source);
+			*retry_denied = false;
 			acquired = source->durable;
 		} else
 			acquired = cluster_pcm_lock_acquire_buffer(buf, PCM_LOCK_MODE_S, retry_denied);
@@ -5881,39 +5881,27 @@ typedef struct ClusterBufmgrReadSource
 static void
 cluster_bufmgr_pcm_read_source_begin(BufferDesc *buf, ClusterBufmgrReadSource *read)
 {
-	unsigned retries = 0;
-	for (;;)
-	{
-		ClusterPcmOwnResult result;
-		bool covered = false;
-		bool retry = false;
+	ClusterPcmOwnResult result;
+	bool covered = false;
+	bool retry = false;
 
-		result = cluster_bufmgr_pcm_begin_grant_reservation_wait(buf, PCM_LOCK_MODE_S,
-			&read->base, &read->token, &covered, NULL);
-		if (result != CLUSTER_PCM_OWN_OK || covered)
-			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
-				errmsg("first buffer fill could not reserve its exact source")));
-		read->pending = true;
-		memset(&read->source, 0, sizeof(read->source));
-		read->source.tag = read->base.tag;
-		read->source.base_generation = read->base.generation;
-		read->source.reservation_token = read->token;
-		cluster_block_io_trace_source(&read->source, "REQUEST");
-		(void)cluster_bufmgr_pcm_acquire_shared_owned(buf, &read->base, read->token,
-			&retry, &read->source);
-		cluster_block_io_trace_source(&read->source, "DECISION");
-		if (!retry)
-			break;
-		result = cluster_bufmgr_pcm_abort_shared_owned(buf, &read->base,
-			read->token, &read->source);
-		if (result != CLUSTER_PCM_OWN_OK)
-			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
-				errmsg("first buffer fill retry could not retire its exact source")));
-		cluster_gcs_block_read_source_complete(buf, &read->source, false);
-		read->pending = false;
-		cluster_pcm_lock_check_shutdown_wait();
-		cluster_gcs_block_read_source_retry_wait(&read->source, retries++);
-	}
+	result = cluster_bufmgr_pcm_begin_grant_reservation_wait(buf, PCM_LOCK_MODE_S,
+		&read->base, &read->token, &covered, NULL);
+	if (result != CLUSTER_PCM_OWN_OK || covered)
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+			errmsg("first buffer fill could not reserve its exact source")));
+	read->pending = true;
+	memset(&read->source, 0, sizeof(read->source));
+	read->source.tag = read->base.tag;
+	read->source.base_generation = read->base.generation;
+	read->source.reservation_token = read->token;
+	cluster_block_io_trace_source(&read->source, "REQUEST");
+	(void)cluster_bufmgr_pcm_acquire_shared_owned(buf, &read->base, read->token,
+		&retry, &read->source);
+	cluster_block_io_trace_source(&read->source, "DECISION");
+	if (retry)
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+			errmsg("first buffer fill returned a legacy retry result")));
 	if (!read->source.durable
 		|| !cluster_pcm_read_source_bound(&read->source, &read->base.tag,
 			read->base.generation, read->token)
@@ -5998,9 +5986,7 @@ cluster_bufmgr_pcm_read_source_cleanup(BufferDesc *buf, ClusterBufmgrReadSource 
 		LWLockRelease(BufferDescriptorGetContentLock(buf));
 		read->content_locked = false;
 	}
-	/* A RETRY may already have retired its reservation before cancellation
-	 * at the local wait. It still owns native IO, so finish that suffix too. */
-	if (!read->pending && read->source.kind != CLUSTER_PCM_SOURCE_RETRY)
+	if (!read->pending)
 		return;
 	/* FileRead/smgrread are synchronous; at this catch their frames have
 	 * returned. No asynchronous disk target exists. Independently close the

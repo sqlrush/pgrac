@@ -27,7 +27,7 @@ UT_TEST(test_typed_source_allows_disk_only_for_exact_disk_grant)
 	UT_ASSERT(cluster_pcm_read_source_allows_disk(&source, &tag, 48, 49));
 	source.kind = CLUSTER_PCM_SOURCE_IMAGE_INSTALLED;
 	UT_ASSERT(!cluster_pcm_read_source_allows_disk(&source, &tag, 48, 49));
-	source.kind = CLUSTER_PCM_SOURCE_RETRY;
+	source.kind = (ClusterPcmReadSourceKind)3;
 	UT_ASSERT(!cluster_pcm_read_source_allows_disk(&source, &tag, 48, 49));
 	source.kind = CLUSTER_PCM_SOURCE_FAIL;
 	UT_ASSERT(!cluster_pcm_read_source_allows_disk(&source, &tag, 48, 49));
@@ -68,42 +68,30 @@ cluster_pcm_lock_acquire_buffer(BufferDesc *buf pg_attribute_unused(),
 
 static ClusterPcmReadSourceKind fixture_kind = CLUSTER_PCM_SOURCE_FAIL;
 static bool fixture_cancel = true, fixture_quiet = true, fixture_release_error;
-static bool fixture_cancel_retry_wait, fixture_shutdown, fixture_shutdown_checked;
-static unsigned fixture_calls, fixture_retries, fixture_io_aborts, fixture_releases;
+static bool fixture_cancel_wait, fixture_shutdown, fixture_shutdown_checked;
+static unsigned fixture_calls, fixture_io_aborts, fixture_releases;
 
 ClusterPcmReadSourceKind
 cluster_pcm_lock_acquire_buffer_source(BufferDesc *buf pg_attribute_unused(),
 									   ClusterPcmReadSource *source)
 {
 	fixture_calls++;
-	if (fixture_shutdown && fixture_calls > 3)
-		pg_re_throw(); /* A broken loop must fail without hanging this test. */
 	source->quiescent = fixture_quiet;
-	if (fixture_cancel)
+	if (fixture_cancel || fixture_cancel_wait || fixture_shutdown) {
+		if (fixture_shutdown) fixture_shutdown_checked = true;
 		pg_re_throw();
-	source->kind = fixture_kind;
-	if (fixture_retries > 0) {
-		fixture_retries--;
-		source->kind = CLUSTER_PCM_SOURCE_RETRY;
-		source->retry_event = true;
 	}
+	source->kind = fixture_kind;
 	source->durable = source->kind == CLUSTER_PCM_SOURCE_DISK_GRANT
 		|| source->kind == CLUSTER_PCM_SOURCE_IMAGE_INSTALLED;
 	return source->kind;
 }
 
 void
-cluster_gcs_block_read_source_retry_wait(const ClusterPcmReadSource *source, unsigned retries)
-{
-	UT_ASSERT(source->retry_event && source->quiescent);
-	UT_ASSERT_EQ(retries, 0);
-}
-
-void
 cluster_pcm_lock_check_shutdown_wait(void)
 {
-	if (fixture_shutdown || fixture_cancel_retry_wait) {
-		UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0);
+	if (fixture_shutdown || fixture_cancel_wait) {
+		UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), PCM_OWN_FLAG_GRANT_PENDING);
 		fixture_shutdown_checked = true;
 		pg_re_throw();
 	}
@@ -178,7 +166,7 @@ fixture_source_complete(BufferDesc *buf, ClusterPcmReadSource *source, bool inst
 #define AbortBufferIO fixture_abort_io
 #define CHECK_FOR_INTERRUPTS()                                                                     \
 	do {                                                                                           \
-		if (fixture_cancel_retry_wait)                                                             \
+		if (fixture_cancel_wait)                                                             \
 			pg_re_throw();                                                                         \
 	} while (0)
 #define pgstat_report_wait_start(event) ((void)0)
@@ -277,10 +265,10 @@ UT_TEST(test_unknown_delivery_cannot_use_generic_io_cleanup_as_proof)
 	ClusterPcmOwnArray = saved;
 }
 
-UT_TEST(test_native_first_fill_owners_four_results_and_local_retry)
+UT_TEST(test_native_first_fill_accepts_three_results_without_rearming)
 {
 	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
-	for (int k = CLUSTER_PCM_SOURCE_FAIL; k <= CLUSTER_PCM_SOURCE_RETRY; k++) {
+	for (int k = CLUSTER_PCM_SOURCE_FAIL; k <= (ClusterPcmReadSourceKind)3; k++) {
 		BufferDesc buf;
 		ClusterPcmOwnEntry entry;
 		ClusterBufmgrReadSource read = { 0 };
@@ -293,9 +281,6 @@ UT_TEST(test_native_first_fill_owners_four_results_and_local_retry)
 		fixture_cancel = false;
 		fixture_quiet = true;
 		fixture_calls = 0;
-		fixture_retries = k == CLUSTER_PCM_SOURCE_RETRY ? 1 : 0;
-		if (k == CLUSTER_PCM_SOURCE_RETRY)
-			fixture_kind = CLUSTER_PCM_SOURCE_DISK_GRANT;
 		read.buf = &buf;
 		PG_TRY();
 		{
@@ -306,8 +291,8 @@ UT_TEST(test_native_first_fill_owners_four_results_and_local_retry)
 			caught = true;
 		}
 		PG_END_TRY();
-		UT_ASSERT_EQ(caught, k == CLUSTER_PCM_SOURCE_FAIL);
-		UT_ASSERT_EQ(fixture_calls, k == CLUSTER_PCM_SOURCE_RETRY ? 2 : 1);
+		UT_ASSERT_EQ(caught, k == CLUSTER_PCM_SOURCE_FAIL || k == (ClusterPcmReadSourceKind)3);
+		UT_ASSERT_EQ(fixture_calls, 1);
 		if (!caught) {
 			UT_ASSERT_EQ(cluster_bufmgr_pcm_read_source_disk_allowed(&buf, &read),
 						 k != CLUSTER_PCM_SOURCE_IMAGE_INSTALLED);
@@ -340,7 +325,6 @@ UT_TEST(test_first_fill_error_owner_orders_rollback_retirement_and_io_abort)
 		pg_atomic_write_u32(&buf.state, BM_TAG_VALID | BM_IO_IN_PROGRESS | BUF_REFCOUNT_ONE);
 		fixture_cancel = false;
 		fixture_kind = CLUSTER_PCM_SOURCE_DISK_GRANT;
-		fixture_retries = 0;
 		fixture_quiet = true;
 		read.buf = &buf;
 		cluster_bufmgr_pcm_read_source_begin(&buf, &read);
@@ -391,7 +375,6 @@ UT_TEST(test_invalidate_sees_entire_first_fill_until_native_io_publication)
 	pg_atomic_write_u32(&buf.state, BM_TAG_VALID | BM_IO_IN_PROGRESS | BUF_REFCOUNT_ONE);
 	fixture_cancel = false;
 	fixture_quiet = true;
-	fixture_retries = 0;
 	fixture_kind = CLUSTER_PCM_SOURCE_DISK_GRANT;
 	cluster_bufmgr_pcm_read_source_begin(&buf, &read);
 	UT_ASSERT(cluster_bufmgr_block_grant_pending(buf.tag));
@@ -424,7 +407,7 @@ UT_TEST(test_invalidate_sees_entire_first_fill_until_native_io_publication)
 	ClusterPcmOwnArray = saved;
 }
 
-UT_TEST(test_cancel_after_retry_retirement_still_finishes_native_io)
+UT_TEST(test_cancel_original_wait_still_finishes_native_io)
 {
 	BufferDesc buf;
 	ClusterPcmOwnEntry entry;
@@ -437,8 +420,7 @@ UT_TEST(test_cancel_after_retry_retirement_still_finishes_native_io)
 	pg_atomic_write_u32(&buf.state, BM_TAG_VALID | BM_IO_IN_PROGRESS | BUF_REFCOUNT_ONE);
 	fixture_cancel = false;
 	fixture_quiet = true;
-	fixture_cancel_retry_wait = true;
-	fixture_retries = 1;
+	fixture_cancel_wait = true;
 	fixture_kind = CLUSTER_PCM_SOURCE_DISK_GRANT;
 	read.buf = &buf;
 	fixture_io_aborts = 0;
@@ -452,12 +434,12 @@ UT_TEST(test_cancel_after_retry_retirement_still_finishes_native_io)
 	}
 	PG_END_TRY();
 	UT_ASSERT(caught);
-	UT_ASSERT(!read.pending);
+	UT_ASSERT(read.pending);
 	UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0);
 	cluster_bufmgr_pcm_read_source_error(0, PointerGetDatum(&read));
 	UT_ASSERT_EQ(fixture_io_aborts, 1);
 	UT_ASSERT(!(pg_atomic_read_u32(&buf.state) & BM_IO_IN_PROGRESS));
-	fixture_cancel_retry_wait = false;
+	fixture_cancel_wait = false;
 	fixture_cancel = true;
 	ClusterPcmOwnArray = saved;
 }
@@ -472,7 +454,7 @@ UT_TEST(test_first_fill_consumes_only_proven_terminal_cover_and_keeps_pi)
 			PGAlignedBlock image;
 			XLogRecPtr lsn;
 			ClusterBufmgrGcsCopyRefusal refusal;
-			ClusterPcmReadGrantKey key = { 0 };
+			ClusterPcmReadGrant service = { 0 };
 			ClusterBufmgrGcsDowngradeOutcome result;
 			drop_fixture(&buf, &entry, true);
 			buf.pcm_state = PCM_STATE_X;
@@ -480,12 +462,16 @@ UT_TEST(test_first_fill_consumes_only_proven_terminal_cover_and_keeps_pi)
 			transition_downgrade_active = true;
 			downgrade_applies = downgrade_notifies = downgrade_fuses = 0;
 			downgrade_preflight = stale ? RESOURCE_X_APPLY_STALE : RESOURCE_X_APPLY_APPLIED;
-			key.tag = buf.tag;
-			key.request_id = 12;
-			key.epoch = 1;
-			key.backend_id = 1;
-			key.requester_node = 3;
-			result = cluster_bufmgr_first_fill_s_prepare_image(&key,
+			service.key.tag = buf.tag;
+			service.key.request_id = 12;
+			service.key.epoch = 1;
+			service.key.backend_id = 1;
+			service.key.requester_node = 3;
+			service.binding_generation = 7;
+			service.service_generation = 1;
+			service.holder_node = cluster_node_id;
+			service.holder_was_x = true;
+			result = cluster_bufmgr_first_fill_s_prepare_image(&service,
 				remote ? 2 : cluster_node_id, &lsn, image.data, &refusal);
 			UT_ASSERT_EQ(result, stale ? CLUSTER_BUFMGR_GCS_DOWNGRADE_REFUSED_PRE_NOTIFY
 				: CLUSTER_BUFMGR_GCS_DOWNGRADE_COMMITTED);
@@ -500,7 +486,7 @@ UT_TEST(test_first_fill_consumes_only_proven_terminal_cover_and_keeps_pi)
 	}
 }
 
-UT_TEST(test_retired_retry_reservation_can_ack_exact_revoke_without_clearing_io)
+UT_TEST(test_retired_failed_reservation_can_ack_exact_revoke_without_clearing_io)
 {
 	BufferDesc buf;
 	ClusterPcmOwnEntry entry;
@@ -531,7 +517,7 @@ UT_TEST(test_retired_retry_reservation_can_ack_exact_revoke_without_clearing_io)
 	ClusterPcmOwnArray = saved;
 }
 
-UT_TEST(test_shutdown_retry_unwinds_only_after_exact_retirement)
+UT_TEST(test_shutdown_original_wait_unwinds_only_after_exact_retirement)
 {
 	BufferDesc buf;
 	ClusterPcmOwnEntry entry;
@@ -546,7 +532,6 @@ UT_TEST(test_shutdown_retry_unwinds_only_after_exact_retirement)
 	fixture_quiet = true;
 	fixture_shutdown = true;
 	fixture_shutdown_checked = false;
-	fixture_retries = 100;
 	fixture_calls = 0;
 	read.buf = &buf;
 	fixture_io_aborts = 0;
@@ -562,11 +547,10 @@ UT_TEST(test_shutdown_retry_unwinds_only_after_exact_retirement)
 	UT_ASSERT(caught);
 	UT_ASSERT(fixture_shutdown_checked);
 	UT_ASSERT_EQ(fixture_calls, 1);
-	UT_ASSERT(!read.pending);
+	UT_ASSERT(read.pending);
 	cluster_bufmgr_pcm_read_source_error(0, PointerGetDatum(&read));
 	UT_ASSERT_EQ(fixture_io_aborts, 1);
 	fixture_shutdown = false;
-	fixture_retries = 0;
 	fixture_cancel = true;
 	ClusterPcmOwnArray = saved;
 }
@@ -738,13 +722,13 @@ main(void)
 	UT_RUN(test_source_cannot_authorize_successor_or_active_delivery);
 	UT_RUN(test_cancel_first_fill_retires_exact_reservation_before_io_cleanup);
 	UT_RUN(test_unknown_delivery_cannot_use_generic_io_cleanup_as_proof);
-	UT_RUN(test_native_first_fill_owners_four_results_and_local_retry);
+	UT_RUN(test_native_first_fill_accepts_three_results_without_rearming);
 	UT_RUN(test_first_fill_error_owner_orders_rollback_retirement_and_io_abort);
 	UT_RUN(test_trace_is_default_off_and_captures_exact_failed_bytes_without_overwrite);
 	UT_RUN(test_invalidate_sees_entire_first_fill_until_native_io_publication);
-	UT_RUN(test_cancel_after_retry_retirement_still_finishes_native_io);
-	UT_RUN(test_shutdown_retry_unwinds_only_after_exact_retirement);
-	UT_RUN(test_retired_retry_reservation_can_ack_exact_revoke_without_clearing_io);
+	UT_RUN(test_cancel_original_wait_still_finishes_native_io);
+	UT_RUN(test_shutdown_original_wait_unwinds_only_after_exact_retirement);
+	UT_RUN(test_retired_failed_reservation_can_ack_exact_revoke_without_clearing_io);
 	UT_RUN(test_first_fill_consumes_only_proven_terminal_cover_and_keeps_pi);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
