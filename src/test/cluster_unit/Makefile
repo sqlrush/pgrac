@@ -2424,6 +2424,7 @@ test_cluster_vm_visible_replay.inc: $(top_srcdir)/src/backend/access/heap/visibi
 
 test_cluster_vm_visible_replay: test_cluster_vm_visible_replay.c test_cluster_vm_redo_reader.o \
 		test_cluster_vm_visible_replay.inc $(XLOG_PAGE_EDGE_ENCODER_O) \
+		$(top_srcdir)/src/include/access/xlog_internal.h \
 		$(top_srcdir)/src/include/access/xlogutils.h \
 		$(top_srcdir)/src/include/cluster/cluster_page_cold_redo.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
@@ -3242,7 +3243,12 @@ test_cluster_vm_redo_xlogutils.o: $(top_srcdir)/src/backend/access/transam/xlogu
 		-DXLogReadBufferForRedoExtended=vm_redo_unused_for_redo \
 		-ffunction-sections -fdata-sections -c $< -o $@
 
-test_cluster_vm_redo_reader.o: $(top_srcdir)/src/backend/access/transam/xlogreader.c
+test_cluster_vm_redo_reader.o: $(top_srcdir)/src/backend/access/transam/xlogreader.c \
+		$(top_srcdir)/src/include/access/xlogreader.h \
+		$(top_srcdir)/src/include/access/xlogrecord.h \
+		$(top_srcdir)/src/include/access/xlog_internal.h \
+		$(top_srcdir)/src/include/port/pg_crc32c.h \
+		$(top_srcdir)/src/include/utils/palloc.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_page_cold_redo_product.o: $(top_srcdir)/src/backend/cluster/cluster_page_cold_redo.c \

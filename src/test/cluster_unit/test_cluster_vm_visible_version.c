@@ -499,6 +499,8 @@ XLogRegisterPageVersionEdge(uint64 token, const RfPageVersionEdgeEntryV1 *entrie
 	edge_count = count;
 	edge_token = token;
 }
+static XLogRecPtr insert_end_lsn = UINT64_C(0x9000);
+
 XLogRecPtr
 XLogInsert(RmgrId rmgr, uint8 info)
 {
@@ -509,7 +511,7 @@ XLogInsert(RmgrId rmgr, uint8 info)
 	UT_ASSERT_EQ(info, repairing ? XLOG_FPI : XLOG_HEAP2_VISIBLE);
 	begun = false;
 	inserts++;
-	return UINT64_C(0x9000);
+	return insert_end_lsn;
 }
 
 /* These storage leaves must stay unreachable with the original exact pin. */

@@ -2442,9 +2442,19 @@ lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
 			vacrel->shared_freeze_proof_requests, vacrel->shared_freeze_proof_exchanges};
 		bool complete = true;
 
-		/* Release the original owner first, also on ERROR/cancel. These
-		 * observations are local, allocation-free and cannot dispatch work. */
+		/* A qualified continuation must finish under this original owner.
+		 * Retain read-only proofs, but retire its borrowed sources, candidates
+		 * and fence before leave, also on ERROR/cancel. */
+		vacrel->shared_freeze_fence_valid = false;
+		vacrel->shared_freeze_cohort_observed = false;
+		vacrel->shared_freeze_input.freeze_policy = NULL;
+		vacrel->shared_freeze_input.freeze_cohort = NULL;
+		vacrel->shared_freeze_xmin_candidates.target_count = 0;
+		vacrel->shared_freeze_aborted_xmax_candidates.target_count = 0;
+		vacrel->shared_freeze_candidate_limit_full = InvalidFullTransactionId;
+		memset(&vacrel->shared_freeze_cohort, 0, sizeof(vacrel->shared_freeze_cohort));
 		cluster_semantic_activation_leave(&admission);
+		/* Cost observations follow the original leave and cannot dispatch work. */
 		lazy_shared_freeze_transport_snapshot(after);
 		for (unsigned i = 0; i < lengthof(after); i++)
 		{
