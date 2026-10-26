@@ -279,6 +279,15 @@ rf_page_authority_ctrc_replays_covers_nowait_v1(const RfPageCtrcAuthorityV1 *a,
 	return false;
 }
 
+bool
+rf_page_authority_ctrc_replays_scope_nowait_v1(const RfPageCtrcAuthorityV1 *a,
+	const struct ClusterWalInputsV1 *scope)
+{
+	return scope != NULL && a != NULL && a->magic == RF_PAGE_CTRC_AUTHORITY_MAGIC
+		&& a->source_count != 0 && a->sources[0].scope == scope
+		&& rf_page_authority_ctrc_replays_revalidate_nowait_v1(a) == RF_PAGE_AUTHORITY_OK;
+}
+
 void
 rf_page_authority_ctrc_replays_destroy_v1(RfPageCtrcAuthorityV1 **authority)
 {

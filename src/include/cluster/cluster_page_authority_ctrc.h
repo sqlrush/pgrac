@@ -53,6 +53,11 @@ extern RfPageAuthorityVerdictV1 rf_page_authority_ctrc_replays_revalidate_nowait
 extern bool rf_page_authority_ctrc_replays_covers_nowait_v1(
 	const RfPageCtrcAuthorityV1 *authority, const RfPageIdentityV1 *identity,
 	const RfPageVersionV1 *expected_before);
+/* Bind the promoted PAGE object to the exact original observation scope.
+ * All its original native holders and PAGE locks must still be current.
+ * Local only, with no I/O/allocation/acquisition or borrowed-owner release. */
+extern bool rf_page_authority_ctrc_replays_scope_nowait_v1(
+	const RfPageCtrcAuthorityV1 *authority, const struct ClusterWalInputsV1 *scope);
 /* Reverse-release local PAGE locks, then private memory, even if original
  * native custody has retired. Never dereference/release a borrowed owner. */
 extern void rf_page_authority_ctrc_replays_destroy_v1(RfPageCtrcAuthorityV1 **authority);

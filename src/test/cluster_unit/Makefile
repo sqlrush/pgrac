@@ -3347,6 +3347,13 @@ test_cluster_control_root test_cluster_recovery_native_inputs: test_cluster_cont
 test_cluster_control_root test_cluster_recovery_native_inputs: test_cluster_control_ctrc_stable.inc
 test_cluster_control_root test_cluster_recovery_native_inputs: test_cluster_control_ctrc_replay_stable.inc
 test_cluster_control_root test_cluster_recovery_native_inputs: test_cluster_control_ctrc_page.inc
+test_cluster_control_root test_cluster_recovery_native_inputs: test_cluster_control_ctrc_read_native.inc
+
+# Compile the production native SMGR reader, with file transport in the test.
+cluster_page_install_ctrc_test.o: $(top_srcdir)/src/backend/cluster/cluster_page_install_ctrc.c \
+		$(top_srcdir)/src/include/cluster/cluster_page_install_ctrc.h \
+		$(top_srcdir)/src/include/cluster/cluster_page_authority_ctrc.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 # Native CTRC PAGE protection uses the original PAGE primitive independently.
 cluster_page_authority_ctrc_test.o: $(top_srcdir)/src/backend/cluster/cluster_page_authority_ctrc.c \
@@ -3467,7 +3474,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs: %: %.c test_clust
 		test_cluster_control_native_xid.inc \
 		$(WAL_INPUT_CONTRIBUTION_TEST_OBJS) \
 		test_cluster_page_stable_ctrc.o \
-		cluster_page_authority_ctrc_test.o $(CLUSTER_PAGE_GUARD_O) \
+		cluster_page_authority_ctrc_test.o cluster_page_install_ctrc_test.o $(CLUSTER_PAGE_GUARD_O) \
 		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
 		test_cluster_wal_inputs_product.o \
 		$(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
@@ -3494,7 +3501,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs: %: %.c test_clust
 		$(top_builddir)/src/backend/cluster/cluster_thread_recovery_finalize.o \
 		$(WAL_INPUT_CONTRIBUTION_TEST_OBJS) \
 		test_cluster_page_stable_ctrc.o \
-		cluster_page_authority_ctrc_test.o $(CLUSTER_PAGE_GUARD_O) \
+		cluster_page_authority_ctrc_test.o cluster_page_install_ctrc_test.o $(CLUSTER_PAGE_GUARD_O) \
 		test_cluster_wal_inputs_product.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_history.o \
 		$(top_builddir)/src/backend/cluster/cluster_control_bootstrap.o \

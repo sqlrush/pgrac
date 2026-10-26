@@ -26022,6 +26022,7 @@ UT_TEST(test_tx_inputs_parent_subject_and_wait_revalidation)
 #include "test_cluster_control_ctrc_stable.inc"
 #include "test_cluster_control_ctrc_replay_stable.inc"
 #include "test_cluster_control_ctrc_page.inc"
+#include "test_cluster_control_ctrc_read_native.inc"
 
 /*
  * Keep the long control-root suite deterministic when an individual test
@@ -26235,6 +26236,20 @@ main(int argc, char **argv)
 	if (getenv("PGRAC_PRE2_TEST_STAMP_WORKER_ENTRY") != NULL) {
 		UT_PLAN(1);
 		UT_RUN(test_runtime_v3_failure_worker_entry_establishes_resource_owner);
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_CTRC_NATIVE_READ") != NULL) {
+		UT_PLAN(9);
+		UT_RUN(test_ctrc_native_read_exact_five_reads_under_original_owners);
+		UT_RUN(test_ctrc_native_read_refuses_wrong_scope_actor_or_target_before_io);
+		UT_RUN(test_ctrc_native_read_refuses_torn_space_and_wrong_page_version);
+		UT_RUN(test_ctrc_native_read_lost_owner_after_each_read_retains_page_and_debt);
+		UT_RUN(test_ctrc_native_read_rechecks_original_inputs_after_each_io);
+		UT_RUN(test_ctrc_native_read_rereads_both_space_pages_before_publication);
+		UT_RUN(test_ctrc_native_read_error_propagates_without_retiring_owners);
+		UT_RUN(test_ctrc_native_read_retired_scope_never_revives_borrowed_authority);
+		UT_RUN(test_ctrc_native_page_scope_match_requires_exact_live_promoted_scope);
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
@@ -26560,7 +26575,17 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(590);
+	UT_PLAN(599);
+	UT_RUN(test_ctrc_native_read_exact_five_reads_under_original_owners);
+	UT_RUN(test_ctrc_native_read_refuses_wrong_scope_actor_or_target_before_io);
+	UT_RUN(test_ctrc_native_read_refuses_torn_space_and_wrong_page_version);
+	UT_RUN(test_ctrc_native_read_lost_owner_after_each_read_retains_page_and_debt);
+	UT_RUN(test_ctrc_native_read_rechecks_original_inputs_after_each_io);
+	UT_RUN(test_ctrc_native_read_rereads_both_space_pages_before_publication);
+	UT_RUN(test_ctrc_native_read_error_propagates_without_retiring_owners);
+	UT_RUN(test_ctrc_native_read_retired_scope_never_revives_borrowed_authority);
+	UT_RUN(test_ctrc_native_page_scope_match_requires_exact_live_promoted_scope);
+
 	UT_RUN(test_ctrc_page_native_set_promotes_exact_target_without_rr);
 	UT_RUN(test_ctrc_page_refuses_budget_shape_and_omitted_native_origin);
 	UT_RUN(test_ctrc_page_freezes_complete_target_and_native_owner_bytes);

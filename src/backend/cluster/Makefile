@@ -86,6 +86,7 @@ OBJS = \
 	cluster_page_authority.o \
 	cluster_page_authority_ctrc.o \
 	cluster_page_install.o \
+	cluster_page_install_ctrc.o \
 	cluster_page_online_plan.o \
 	cluster_page_replay_batch.o \
 	cluster_page_recovery.o \
