@@ -2226,6 +2226,20 @@ test_cluster_heap_itl_finish_discharge.inc: $(top_srcdir)/src/backend/cluster/cl
 	     END { if (found != 14 || done != 14 || emit || structure || structures != 5 || constants != 1 || initial_constants != 1 || starts != 1 || stops != 1) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_heap_resident_stamp_types.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	@awk '/^#define BufHdrGetBlock\(bufHdr\)/ { print; address++ } \
+	     /^typedef enum PinBufferLookupResult/ { emit=1; found++ } \
+	     emit { print } emit && /^} PinBufferLookupResult;/ { emit=0; done++ } \
+	     END { if (found != 1 || done != 1 || address != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_resident_stamp.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	@awk '/^cluster_bufmgr_lock_resident_for_exact_itl_stamp\(/ { print "static Buffer"; emit=1; found++ } \
+	     /^cluster_bufmgr_unlock_resident_stamp\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (found != 2 || done != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_heap_touch_authority.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
 	@awk '/^cluster_pcm_own_snapshot_post_state_locked\(/ { print "static inline void"; emit=1; found++ } \
 	     /^cluster_pcm_own_snapshot_locked\(/ { print "static inline void"; emit=1; found++ } \
@@ -2343,6 +2357,8 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_heap_itl_finish_discharge.inc \
 		test_cluster_heap_itl_publication.inc \
 		test_cluster_heap_touch_authority.inc \
+		test_cluster_heap_resident_stamp_types.inc test_cluster_heap_resident_stamp.inc \
+		$(top_srcdir)/src/include/utils/resowner.h \
 		$(top_srcdir)/src/include/utils/memutils.h \
 		$(top_srcdir)/src/include/utils/palloc.h \
 		$(top_srcdir)/src/include/cluster/cluster_itl_touch.h \
@@ -5309,6 +5325,8 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_heap_itl_finish_discharge.inc test_cluster_heap_itl_finish_discharge.inc.tmp
 	rm -f test_cluster_heap_itl_publication.inc test_cluster_heap_itl_publication.inc.tmp
 	rm -f test_cluster_heap_touch_authority.inc test_cluster_heap_touch_authority.inc.tmp
+	rm -f test_cluster_heap_resident_stamp_types.inc test_cluster_heap_resident_stamp_types.inc.tmp
+	rm -f test_cluster_heap_resident_stamp.inc test_cluster_heap_resident_stamp.inc.tmp
 	rm -f test_cluster_heap_ctrc_certificate.inc test_cluster_heap_ctrc_certificate.inc.tmp
 	rm -f test_cluster_heap_ctrc_ack.inc test_cluster_heap_ctrc_ack.inc.tmp
 	rm -f test_cluster_heap_ctrc_origin_reply.inc test_cluster_heap_ctrc_origin_reply.inc.tmp
