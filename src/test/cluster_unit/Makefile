@@ -10222,6 +10222,13 @@ test_cluster_vacuum_proof_cleanup.inc: $(top_srcdir)/src/backend/access/heap/vac
 	     emit { print } /^}/ { emit=0 } END { if (found != 3 || cleanout > 1 || cost > 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# The real seqlock read used by opt-in collector admission ownership tests.
+test_cluster_vacuum_admission_snapshot.inc: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c Makefile
+	awk '/^semantic_activation_snapshot\(/ { print "static bool"; emit=1; count++ } \
+	     emit { print } /^}$$/ { emit=0 } \
+	     END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_vacuum_freeze_bound_observer.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
 	awk '/^lazy_observe_shared_freeze_bounds\(/ { print "static ClusterHeapFreezeProofStatusV1"; emit=1; found++ } \
 	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
@@ -10230,6 +10237,7 @@ test_cluster_vacuum_freeze_bound_observer.inc: $(top_srcdir)/src/backend/access/
 .PHONY: clean-vacuum-freeze-bound-observer
 clean-vacuum-freeze-bound-observer:
 	rm -f test_cluster_vacuum_freeze_bound_observer.inc test_cluster_vacuum_freeze_bound_observer.inc.tmp
+	rm -f test_cluster_vacuum_admission_snapshot.inc test_cluster_vacuum_admission_snapshot.inc.tmp
 
 clean distclean maintainer-clean: clean-vacuum-freeze-bound-observer
 
@@ -10269,6 +10277,8 @@ test_cluster_vacuum_proof_cleanup: test_cluster_vacuum_proof_cleanup.c unit_test
 		$(top_srcdir)/src/include/cluster/cluster_gcs_block.h \
 		$(top_srcdir)/src/include/cluster/cluster_scn.h test_cluster_heap_small_scn.inc \
 		test_cluster_vacuum_observed_bounds.inc \
+		test_cluster_active_sample_types.inc test_cluster_vacuum_admission_snapshot.inc \
+		test_cluster_heap_freeze_admission_current.inc test_cluster_heap_freeze_admission_lifecycle.inc \
 		$(top_srcdir)/src/include/cluster/cluster_heap_horizon.h \
 		$(top_srcdir)/src/include/cluster/cluster_xid_stripe_boot.h \
 		$(top_srcdir)/src/include/commands/vacuum.h \
