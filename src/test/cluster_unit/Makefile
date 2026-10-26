@@ -2475,6 +2475,7 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		$(top_srcdir)/src/include/cluster/cluster_xid_stripe_boot.h \
 		test_cluster_vacuum_observed_bounds.inc test_cluster_vacuum_freeze_bound_observer.inc \
 		test_cluster_vacuum_admitted_phase.inc \
+		test_cluster_vacuum_proof_owner.inc \
 		test_cluster_freeze_writer_context.inc $(CLUSTER_RESOURCE_X_IDENTITY_O) test_cluster_heap_maintenance_policy.inc unit_test.h \
 		test_cluster_heap_borrowed_pin.inc $(top_srcdir)/src/include/storage/bufmgr.h \
 		test_cluster_vacuum_freeze_locators.inc \
@@ -10445,6 +10446,18 @@ test_cluster_vacuum_admitted_phase.inc: $(top_srcdir)/src/backend/access/heap/va
 	awk '/^lazy_collect_shared_freeze_proofs_admitted\(/ { print "static ClusterHeapFreezeProofStatusV1"; emit=1; found++ } \
 	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
+
+# Execute the original outer VACUUM admission owner around the admitted phase.
+test_cluster_vacuum_proof_owner.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
+	awk '/^lazy_collect_shared_freeze_proofs\(/ { print "static ClusterHeapFreezeProofStatusV1"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+.PHONY: clean-vacuum-proof-owner
+clean-vacuum-proof-owner:
+	rm -f test_cluster_vacuum_proof_owner.inc test_cluster_vacuum_proof_owner.inc.tmp
+
+clean distclean maintainer-clean: clean-vacuum-proof-owner
 
 test_cluster_vacuum_admission_snapshot.inc: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c Makefile
 	awk '/^semantic_activation_snapshot\(/ { print "static bool"; emit=1; count++ } \
