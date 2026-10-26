@@ -646,6 +646,221 @@ UT_TEST(u40_reuse_lookup_returns_only_the_exact_live_itl_receipt)
 	UT_ASSERT(!found.valid);
 }
 
+UT_TEST(child_data_abort_retains_top_itl_and_applied_receipt)
+{
+	ClusterItlTouchHandle touch = registration_handle();
+	ClusterItlSlotData *slot = reset_registration_fixture(700);
+	ClusterCtrcReceiptHandle ctrc;
+	ClusterCtrcReceipt saved_receipt;
+	PGAlignedBlock saved_page;
+
+	touch.flags = CLUSTER_ITL_TOUCH_FLAG_NEEDS_WAL;
+	slot->undo_segment_head.raw[0] = 31;
+	ctrc = registration_ctrc_handle(0, &touch, slot);
+	ctrc.receipt->state = CTRC_RECEIPT_APPLIED;
+	test_capture_authority = true;
+	test_generic_finish_lsn = 300;
+	cluster_itl_touch_subxact_start(2);
+	cluster_itl_touch_register_exact_ctrc(&touch, 1, 700, &ctrc, NULL);
+	memcpy(&saved_page, &test_buffer_block, sizeof(saved_page));
+	saved_receipt = *ctrc.receipt;
+
+	cluster_itl_xact_subabort_finish(701, 2);
+	UT_ASSERT_EQ(memcmp(&saved_page, &test_buffer_block, sizeof(saved_page)), 0);
+	UT_ASSERT_EQ(memcmp(&saved_receipt, ctrc.receipt, sizeof(saved_receipt)), 0);
+	UT_ASSERT_EQ(cluster_itl_touch_count(), 1);
+	UT_ASSERT_EQ(test_stamp_lock_calls, 0);
+	UT_ASSERT_EQ(test_generic_finish_calls, 0);
+	UT_ASSERT_EQ(test_xlog_flush_sequence, 0);
+	UT_ASSERT_EQ(test_discharge_calls, 0);
+
+	cluster_itl_xact_precommit_finish(700, 99);
+	UT_ASSERT_EQ(slot->flags, ITL_FLAG_NEEDS_CLEANOUT);
+	UT_ASSERT_EQ(slot->commit_scn, 99);
+	UT_ASSERT_EQ(ctrc.receipt->state, CTRC_RECEIPT_APPLIED);
+	UT_ASSERT_EQ(test_discharge_calls, 0);
+}
+
+UT_TEST(child_lock_abort_preserves_parent_lock_until_top_abort)
+{
+	ClusterItlTouchHandle touch = registration_handle();
+	ClusterItlSlotData *slot = reset_registration_fixture(700);
+	Page page = (Page)test_buffer_block.data;
+	PageHeader header = (PageHeader)page;
+	HeapTupleHeader tuple;
+	ClusterCtrcReceiptHandle ctrc;
+
+	header->pd_lower += sizeof(ItemIdData);
+	header->pd_upper -= MAXALIGN(SizeofHeapTupleHeader);
+	ItemIdSetNormal(PageGetItemId(page, FirstOffsetNumber), header->pd_upper,
+					SizeofHeapTupleHeader);
+	tuple = (HeapTupleHeader)PageGetItem(page, PageGetItemId(page, FirstOffsetNumber));
+	tuple->t_hoff = SizeofHeapTupleHeader;
+	tuple->t_infomask = HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_EXCL_LOCK;
+	HeapTupleHeaderSetXmin(tuple, 600);
+	HeapTupleHeaderSetXmax(tuple, 700);
+	slot->flags = ITL_FLAG_LOCK_ONLY_ACTIVE;
+	slot->undo_segment_head.raw[0] = 23;
+	touch.flags = CLUSTER_ITL_TOUCH_FLAG_NEEDS_WAL;
+	ctrc = registration_ctrc_handle(0, &touch, slot);
+	ctrc.receipt->state = CTRC_RECEIPT_APPLIED;
+	test_capture_authority = true;
+	test_generic_finish_lsn = 500;
+	cluster_itl_touch_subxact_start(2);
+	cluster_itl_touch_register_exact_ctrc(&touch, 1, 700, &ctrc, NULL);
+
+	cluster_itl_xact_subabort_finish(701, 2);
+	UT_ASSERT_EQ(slot->flags, ITL_FLAG_LOCK_ONLY_ACTIVE);
+	UT_ASSERT_EQ(tuple->t_infomask & HEAP_XMAX_INVALID, 0);
+	UT_ASSERT_EQ(HeapTupleHeaderGetRawXmax(tuple), 700);
+	UT_ASSERT_EQ(ctrc.receipt->state, CTRC_RECEIPT_APPLIED);
+	UT_ASSERT_EQ(test_stamp_lock_calls, 0);
+	UT_ASSERT_EQ(test_discharge_calls, 0);
+
+	cluster_itl_xact_abort_finish(700);
+	UT_ASSERT_EQ(slot->flags, ITL_FLAG_LOCK_ONLY_ABORTED);
+	UT_ASSERT((tuple->t_infomask & HEAP_XMAX_INVALID) != 0);
+	UT_ASSERT_EQ(HeapTupleHeaderGetRawXmin(tuple), 600);
+	UT_ASSERT_EQ(test_discharge_calls, 1);
+	UT_ASSERT(test_discharged_receipt == ctrc.receipt);
+	UT_ASSERT(test_generic_finish_sequence > 0);
+	UT_ASSERT(test_stamp_unlock_sequence > test_generic_finish_sequence);
+	UT_ASSERT(test_xlog_flush_sequence > test_stamp_unlock_sequence);
+	UT_ASSERT(test_discharge_sequence > test_xlog_flush_sequence);
+}
+
+UT_TEST(child_abort_pops_only_boundary_for_parent_recapture)
+{
+	ClusterItlTouchHandle parent = registration_handle();
+	ClusterItlTouchHandle child = parent;
+	ClusterItlSlotData *slots = reset_registration_fixture(700);
+
+	child.slot_idx = 1;
+	slots[0].undo_segment_head.raw[0] = 31;
+	slots[1] = slots[0];
+	slots[1].undo_segment_head.raw[0] = 41;
+	test_capture_authority = true;
+	cluster_itl_touch_register_exact(&parent, 1, 700);
+	cluster_itl_touch_subxact_start(2);
+	cluster_itl_touch_register_exact(&child, 1, 700);
+	cluster_itl_xact_subabort_finish(701, 2);
+	UT_ASSERT_EQ(cluster_itl_touch_count(), 2);
+	UT_ASSERT_EQ(slots[0].flags, ITL_FLAG_ACTIVE);
+	UT_ASSERT_EQ(slots[1].flags, ITL_FLAG_ACTIVE);
+	UT_ASSERT_EQ(test_stamp_lock_calls, 0);
+
+	/* A stale child boundary would append a third record for the parent. */
+	slots[0].undo_segment_head.raw[0] = 32;
+	cluster_itl_touch_register_exact(&parent, 1, 700);
+	UT_ASSERT_EQ(cluster_itl_touch_count(), 2);
+	cluster_itl_xact_precommit_finish(700, 99);
+	UT_ASSERT_EQ(slots[0].flags, ITL_FLAG_NEEDS_CLEANOUT);
+	UT_ASSERT_EQ(slots[1].flags, ITL_FLAG_NEEDS_CLEANOUT);
+}
+
+UT_TEST(released_grandchild_touch_survives_ancestor_abort)
+{
+	ClusterItlTouchHandle touch = registration_handle();
+	ClusterItlSlotData *slot = reset_registration_fixture(700);
+	ClusterCtrcReceiptHandle first;
+	ClusterCtrcReceiptHandle latest;
+
+	touch.flags = CLUSTER_ITL_TOUCH_FLAG_NEEDS_WAL;
+	slot->undo_segment_head.raw[0] = 31;
+	first = registration_ctrc_handle(0, &touch, slot);
+	first.receipt->state = CTRC_RECEIPT_APPLIED;
+	test_capture_authority = true;
+	test_generic_finish_lsn = 500;
+	cluster_itl_touch_register_exact_ctrc(&touch, 1, 700, &first, NULL);
+	cluster_itl_touch_subxact_start(2);
+	cluster_itl_touch_subxact_start(3);
+	slot->undo_segment_head.raw[0] = 32;
+	latest = registration_ctrc_handle(1, &touch, slot);
+	latest.receipt->state = CTRC_RECEIPT_APPLIED;
+	cluster_itl_touch_register_exact_ctrc(&touch, 1, 700, &latest, NULL);
+	cluster_itl_touch_subxact_commit(3);
+	cluster_itl_xact_subabort_finish(701, 2);
+	UT_ASSERT_EQ(cluster_itl_touch_count(), 2);
+	UT_ASSERT_EQ(slot->flags, ITL_FLAG_ACTIVE);
+	UT_ASSERT_EQ(test_stamp_lock_calls, 0);
+	UT_ASSERT_EQ(test_discharge_calls, 0);
+	UT_ASSERT_EQ(first.receipt->state, CTRC_RECEIPT_APPLIED);
+	UT_ASSERT_EQ(latest.receipt->state, CTRC_RECEIPT_APPLIED);
+
+	cluster_itl_xact_abort_finish(700);
+	UT_ASSERT_EQ(slot->flags, ITL_FLAG_ABORTED);
+	UT_ASSERT_EQ(test_discharge_calls, 1);
+	UT_ASSERT(test_discharged_receipt == latest.receipt);
+	UT_ASSERT_EQ(test_discharge_target.uba[0], 32);
+	UT_ASSERT_EQ(first.receipt->state, CTRC_RECEIPT_APPLIED);
+}
+
+UT_TEST(empty_xidless_child_retires_boundary_without_losing_parent_touch)
+{
+	ClusterItlTouchHandle parent = registration_handle();
+	ClusterItlTouchHandle child = parent;
+	ClusterItlSlotData *slots = reset_registration_fixture(700);
+
+	child.slot_idx = 1;
+	slots[0].undo_segment_head.raw[0] = 31;
+	slots[1] = slots[0];
+	slots[1].undo_segment_head.raw[0] = 41;
+	test_capture_authority = true;
+	cluster_itl_touch_register_exact(&parent, 1, 700);
+	cluster_itl_touch_subxact_start(2);
+	cluster_itl_xact_subabort_finish(InvalidTransactionId, 2);
+	slots[0].undo_segment_head.raw[0] = 32;
+	cluster_itl_touch_register_exact(&parent, 1, 700);
+	UT_ASSERT_EQ(cluster_itl_touch_count(), 1);
+	UT_ASSERT_EQ(test_stamp_lock_calls, 0);
+
+	cluster_itl_touch_subxact_start(3);
+	cluster_itl_touch_register_exact(&child, 1, 700);
+	cluster_itl_xact_subabort_finish(702, 3);
+	/* A missing boundary during partial startup is harmless to the top set. */
+	cluster_itl_xact_subabort_finish(InvalidTransactionId, 4);
+	UT_ASSERT_EQ(cluster_itl_touch_count(), 2);
+	UT_ASSERT_EQ(test_generic_finish_calls, 0);
+	UT_ASSERT_EQ(test_discharge_calls, 0);
+	cluster_itl_xact_precommit_finish(700, 99);
+	UT_ASSERT_EQ(slots[0].flags, ITL_FLAG_NEEDS_CLEANOUT);
+	UT_ASSERT_EQ(slots[1].flags, ITL_FLAG_NEEDS_CLEANOUT);
+}
+
+UT_TEST(aborted_scope_invalid_latest_proof_cannot_reuse_ancestor_authority)
+{
+	ClusterItlTouchHandle touch = registration_handle();
+	ClusterItlSlotData *slot = reset_registration_fixture(700);
+	ClusterCtrcReceiptHandle ancestor;
+	ClusterCtrcReceiptHandle latest;
+
+	slot->undo_segment_head.raw[0] = 31;
+	ancestor = registration_ctrc_handle(0, &touch, slot);
+	ancestor.receipt->state = CTRC_RECEIPT_APPLIED;
+	test_capture_authority = true;
+	cluster_itl_touch_register_exact_ctrc(&touch, 1, 700, &ancestor, NULL);
+	cluster_itl_touch_subxact_start(2);
+	slot->undo_segment_head.raw[0] = 32;
+	latest = registration_ctrc_handle(1, &touch, slot);
+	latest.receipt->state = CTRC_RECEIPT_APPLIED;
+	cluster_itl_touch_register_exact_ctrc(&touch, 1, 700, &latest, NULL);
+	test_capture_authority = false;
+	cluster_itl_touch_register_exact_ctrc(&touch, 1, 700, &latest, NULL);
+	cluster_itl_xact_subabort_finish(701, 2);
+	UT_ASSERT_EQ(cluster_itl_touch_count(), 2);
+	UT_ASSERT_EQ(test_stamp_lock_calls, 0);
+	UT_ASSERT_EQ(test_discharge_calls, 0);
+
+	cluster_itl_xact_abort_finish(700);
+	UT_ASSERT_EQ(slot->flags, ITL_FLAG_ACTIVE);
+	UT_ASSERT_EQ(slot->undo_segment_head.raw[0], 32);
+	UT_ASSERT_EQ(test_generic_register_calls, 0);
+	UT_ASSERT_EQ(test_generic_finish_calls, 0);
+	UT_ASSERT_EQ(test_discharge_calls, 0);
+	UT_ASSERT_EQ(ancestor.receipt->state, CTRC_RECEIPT_APPLIED);
+	UT_ASSERT_EQ(latest.receipt->state, CTRC_RECEIPT_APPLIED);
+}
+
 UT_TEST(u21_first_failed_capture_does_not_append)
 {
 	ClusterItlTouchHandle handle = registration_handle();
@@ -931,7 +1146,7 @@ UT_TEST(shared_finish_retains_dml_identity_without_fetch)
 int
 main(void)
 {
-	UT_PLAN(31);
+	UT_PLAN(37);
 	UT_RUN(lock_terminal_finish_preserves_precommit_and_clears_only_exact_abort);
 	UT_RUN(u13_exact_owner_proof_matches);
 	UT_RUN(u14_missing_owner_proof_is_rejected);
@@ -961,6 +1176,12 @@ main(void)
 	UT_RUN(u38_lock_precommit_retains_authority_until_real_terminal_proof);
 	UT_RUN(u39_same_slot_recapture_replaces_only_the_eager_receipt_handle);
 	UT_RUN(u40_reuse_lookup_returns_only_the_exact_live_itl_receipt);
+	UT_RUN(child_data_abort_retains_top_itl_and_applied_receipt);
+	UT_RUN(child_lock_abort_preserves_parent_lock_until_top_abort);
+	UT_RUN(child_abort_pops_only_boundary_for_parent_recapture);
+	UT_RUN(released_grandchild_touch_survives_ancestor_abort);
+	UT_RUN(empty_xidless_child_retires_boundary_without_losing_parent_touch);
+	UT_RUN(aborted_scope_invalid_latest_proof_cannot_reuse_ancestor_authority);
 	UT_RUN(shared_finish_without_space_identity_must_skip);
 	UT_RUN(shared_finish_retains_dml_identity_without_fetch);
 	UT_DONE();

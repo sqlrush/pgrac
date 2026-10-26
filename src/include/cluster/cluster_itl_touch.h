@@ -254,12 +254,13 @@ extern bool cluster_itl_touch_lookup_reusable_ctrc(const ClusterItlTouchHandle *
 												   ClusterCtrcReceiptHandle *ctrc_handle_out);
 
 /*
- * spec-3.5 hardening: subxact range ownership for touched ITL slots.
+ * Subxact registration ranges for top-owned touched ITL slots.
  *
  * StartSubTransaction records the current touch_count as the subxact range
  * start.  CommitSubTransaction promotes the range to the parent by popping
- * the boundary only.  AbortSubTransaction stamps and truncates the current
- * subxact range through cluster_itl_xact_subabort_finish().
+ * the boundary only.  AbortSubTransaction also pops only the boundary
+ * through cluster_itl_xact_subabort_finish(), even for an empty/xidless
+ * scope.  Both retain successful captures until top-level termination.
  */
 extern void cluster_itl_touch_subxact_start(SubTransactionId subid);
 extern void cluster_itl_touch_subxact_commit(SubTransactionId subid);
@@ -355,6 +356,7 @@ extern bool cluster_itl_touch_has_pending(void);
  */
 extern void cluster_itl_xact_precommit_finish(TransactionId xid, SCN commit_scn);
 extern void cluster_itl_xact_abort_finish(TransactionId xid);
+/* Local boundary cleanup only; neither terminal stamping nor logical undo. */
 extern void cluster_itl_xact_subabort_finish(TransactionId xid, SubTransactionId subid);
 
 #endif /* CLUSTER_ITL_TOUCH_H */

@@ -28,11 +28,11 @@
  *	    state stays with the TT/CLOG/undo authority.
  *
  *	  Subxact:
- *	    spec-3.5 removes the prior GetCurrentTransactionNestLevel() gate.
- *	    We track a stack of touch_count boundaries so aborting a child
- *	    subtransaction stamps only its own ITL slots ABORTED and truncates
- *	    them.  A subcommit only pops the boundary, promoting its touched
- *	    slots to the parent range.
+ *	    Boundaries scope registration and receipt reuse.  Both subcommit
+ *	    and subabort pop only the local boundary: successful exact touches
+ *	    remain until top-level termination.  A child rollback must not
+ *	    terminal-stamp a slot owned by the shared top transaction or cancel
+ *	    an APPLIED reference.  Operation rollback is a separate contract.
  *
  * Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -42,6 +42,7 @@
  *
  * Spec: spec-3.4a-itl-write-path-activation-minimal-wal.md (v1.0 FROZEN 2026-05-23)
  * Spec: spec-8.3-active-itl-current-block-transfer-semantics.md
+ * Spec: 2026-10-26-pre2-p013-full-savepoint-design.md
  *
  * IDENTIFICATION
  *	  src/backend/cluster/cluster_itl_touch.c
@@ -234,9 +235,9 @@ itl_touch_register_exact_internal(const ClusterItlTouchHandle *handle, Buffer bu
 
 	/*
 	 * Dedupe by (rloc, fork, block, slot, xid, slot_wrap) within the
-	 * current subtransaction owner range only: an entry before the range
-	 * start belongs to an ancestor and must never be updated, or a nested
-	 * subabort would stamp (or lose) an ancestor-owned slot.
+	 * current subtransaction registration range only.  Keep ancestor
+	 * captures separate while this boundary is open; closing it retains
+	 * all captures for the top-level exact-proof finisher.
 	 */
 	if (subxact_depth > 0)
 		range_start = subxact_stack[subxact_depth - 1].start_count;
@@ -391,8 +392,8 @@ itl_touch_pop_subxact(SubTransactionId subid, uint32 *start_count_out)
 	/*
 	 * PG subxacts close in strict LIFO order.  If an error path ever
 	 * reaches us out-of-order, fail soft: find the matching boundary and
-	 * drop everything above it as part of the same cleanup rather than
-	 * leaving stale child ranges to be committed by the parent.
+	 * drop the boundary metadata above it as part of the same cleanup.
+	 * The top-level touch records are retained regardless.
 	 */
 	if (subxact_stack[subxact_depth - 1].subid != subid) {
 		int i;
@@ -421,8 +422,7 @@ cluster_itl_touch_subxact_commit(SubTransactionId subid)
 
 	/*
 	 * Promote child touches to the parent by popping only the boundary.
-	 * The records remain in touch_list and will be finalized by the parent
-	 * commit/abort or an ancestor subabort.
+	 * The records remain in touch_list until top-level commit/abort.
 	 */
 	(void)itl_touch_pop_subxact(subid, &ignored);
 }
@@ -836,8 +836,7 @@ itl_finish_flush_batch(ItlFinishBatchCtx *bctx)
  *
  *	Sorts the range so same-page records are consecutive, groups them into
  *	page runs and flushes runs in GenericXLog-sized batches of equal WAL
- *	requirement.  Used by top commit, top abort and subabort; the caller
- *	owns the range semantics (spec-3.4a D6 / spec-3.5 subxact ranges).
+ *	requirement.  Only top-level commit and abort supply a terminal outcome.
  */
 static void
 itl_finish_range(uint32 start, uint32 end, const ItlFinishCtx *finish)
@@ -936,37 +935,20 @@ cluster_itl_xact_abort_finish(TransactionId xid)
 void
 cluster_itl_xact_subabort_finish(TransactionId xid, SubTransactionId subid)
 {
-	ItlFinishCtx finish;
-	uint32 start_count;
-	uint32 end_count;
+	uint32 ignored;
 
 	(void)xid;
 
 	if (!cluster_enabled || cluster_node_id < 0)
 		return;
-	if (touch_count == 0) {
-		(void)itl_touch_pop_subxact(subid, &start_count);
-		return;
-	}
-	if (!itl_touch_pop_subxact(subid, &start_count))
-		return;
-
-	end_count = touch_count;
-	if (start_count >= end_count) {
-		touch_count = start_count;
-		return;
-	}
-
-	finish.commit_scn = InvalidScn;
-	finish.is_commit = false;
-	itl_finish_range(start_count, end_count, &finish);
 
 	/*
-	 * Remove aborted child records so a later parent commit cannot stamp
-	 * them COMMITTED.  This is the spec-3.5 SUBTRANS invariant that was
-	 * absent while spec-3.4a kept subxacts on PG-native path.
+	 * PGRAC: the ITL belongs to the top transaction, including captures
+	 * made by a rolled-back child.  Retain the latest exact proof and its
+	 * reference duty for the real top terminal path.  This local cleanup
+	 * neither proves operation rollback nor accesses shared state.
 	 */
-	touch_count = start_count;
+	(void)itl_touch_pop_subxact(subid, &ignored);
 }
 
 #else /* !USE_PGRAC_CLUSTER */

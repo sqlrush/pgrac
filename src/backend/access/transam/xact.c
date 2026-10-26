@@ -2261,18 +2261,6 @@ RecordTransactionAbort(bool isSubXact)
 			if (cluster_itl_touch_has_pending())
 				cluster_itl_xact_abort_finish(xid);
 		}
-		else
-		{
-			/*
-			 * PGRAC spec-3.5 hardening: subxact DML now stamps ITL slots.
-			 * Abort only the current subxact range and truncate it so a
-			 * later parent commit cannot stamp aborted child slots
-			 * COMMITTED.  Subxact abort keeps abort_scn InvalidScn per
-			 * spec-1.16 Q4.
-			 */
-			if (cluster_itl_touch_has_pending())
-				cluster_itl_xact_subabort_finish(xid, CurrentTransactionState->subTransactionId);
-		}
 	}
 #endif
 
@@ -5921,10 +5909,9 @@ StartSubTransaction(void)
 
 #ifdef USE_PGRAC_CLUSTER
 	/*
-	 * PGRAC spec-3.5 hardening: mark the current touch_count as this
-	 * subxact's ITL ownership boundary.  Subcommit promotes the range to
-	 * the parent; subabort stamps/truncates only this range before the
-	 * abort record is written.
+	 * PGRAC: scope touch registration and receipt reuse to this subxact.
+	 * Subcommit and subabort pop only this boundary; exact touches remain
+	 * owned by the top transaction until its real terminal path.
 	 */
 	cluster_itl_touch_subxact_start(s->subTransactionId);
 #endif
@@ -6177,6 +6164,18 @@ AbortSubTransaction(void)
 		AtEOSubXact_Parallel(false, s->subTransactionId);
 		s->parallelModeLevel = 0;
 	}
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: retire local touch metadata even for an empty/xidless scope
+	 * or a partial start.  RecordTransactionAbort() may return before its
+	 * hooks in those cases.  No terminal stamp or shared cleanup occurs
+	 * here: successful captures and APPLIED references stay with the top.
+	 */
+	if (cluster_storage_mode_enabled())
+		cluster_itl_xact_subabort_finish(XidFromFullTransactionId(s->fullTransactionId),
+										 s->subTransactionId);
+#endif
 
 	/*
 	 * We can skip all this stuff if the subxact failed before creating a
