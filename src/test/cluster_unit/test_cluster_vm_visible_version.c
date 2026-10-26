@@ -122,6 +122,10 @@ static int empty_race, empty_vm_race, empty_repin_misses;
 static unsigned empty_aux_calls, empty_resumes, empty_heap_waits, empty_cleanup_waits;
 static unsigned empty_repins, empty_local_unlocks, empty_fsm;
 static bool empty_error_after_resume, empty_error_at_capture, empty_cancel_repin;
+static bool empty_cancel_after_refusal, empty_refusal_keeps_pin, empty_cancel_after_capture;
+static bool empty_cancel_caught;
+static unsigned empty_pin_calls;
+static Buffer empty_cancel_vm_handle;
 /* Deferred repair owns no heap pin/lock; the lower X service may drop its
  * only VM pin before returning a clean reobservation result. */
 static bool repair_retry_fixture, repair_pinned, repair_locked, repair_aux_driving;
@@ -158,7 +162,7 @@ ProcessInterrupts(void)
 		elog(ERROR, "controlled cancellation at unpinned VM repair retry");
 	}
 	UT_ASSERT(empty_fixture && !held[0] && !held[1] && !pinned[1]);
-	UT_ASSERT(empty_cancel_repin);
+	UT_ASSERT(empty_cancel_repin || empty_cancel_after_refusal || empty_cancel_after_capture);
 	InterruptPending = false;
 	elog(ERROR, "controlled cancellation at unpinned VM retry");
 }
@@ -597,8 +601,12 @@ ClusterLockBufferExclusiveAuxiliaryAware(Buffer *buffer, ResourceXAuxiliaryAcqui
 	UT_ASSERT_EQ(*buffer, 2);
 	empty_aux_calls++;
 	if (!empty_aux) {
-		ReleaseBuffer(*buffer);
-		*buffer = InvalidBuffer;
+		if (!empty_refusal_keeps_pin) {
+			ReleaseBuffer(*buffer);
+			*buffer = InvalidBuffer;
+		}
+		if (empty_cancel_after_refusal)
+			InterruptPending = true;
 		return false;
 	}
 	LockBuffer(*buffer, BUFFER_LOCK_EXCLUSIVE);
@@ -622,6 +630,8 @@ ClusterBufferCaptureMutationContext(Buffer buffer, ResourceXWriterUseContext *ou
 	out->writer_activation_token = 80 + buffer;
 	*revision = 33;
 	*checked = true;
+	if (buffer == 2 && !held[0] && empty_cancel_after_capture)
+		InterruptPending = true;
 	return true;
 }
 
@@ -731,6 +741,7 @@ visibilitymap_pin(Relation rel, BlockNumber block, Buffer *buffer)
 	}
 	if (empty_fixture) {
 		UT_ASSERT(!held[0] && !held[1]);
+		empty_pin_calls++;
 		pinned[1] = true;
 	}
 	*buffer = 2;
@@ -1289,6 +1300,9 @@ empty_reset(bool visible, uint8 bits)
 	empty_aux_calls = empty_resumes = empty_heap_waits = empty_cleanup_waits = 0;
 	empty_repins = empty_local_unlocks = empty_fsm = 0;
 	empty_error_after_resume = empty_error_at_capture = empty_cancel_repin = false;
+	empty_cancel_after_refusal = empty_refusal_keeps_pin = empty_cancel_after_capture = false;
+	empty_cancel_caught = false;
+	empty_pin_calls = 0;
 	InterruptPending = false;
 	expected_cutoff = InvalidTransactionId;
 	state.rel = &relation;
@@ -1986,10 +2000,80 @@ UT_TEST(test_pair_repair_error_or_unknown_version_precedes_mutation)
 	}
 }
 
+
+static void
+run_empty_cancel_scan(LVRelState *state, bool share)
+{
+	empty_cancel_vm_handle = 2;
+	expecting_error = true;
+	if (setjmp(error_jump) == 0)
+		(void)lazy_scan_new_or_empty(state, 1, 0, pages[0].data, share, &empty_cancel_vm_handle);
+	else
+		empty_cancel_caught = true;
+	expecting_error = false;
+}
+
+static void
+check_empty_cancel_before_heap_wait(void)
+{
+	UT_ASSERT(empty_cancel_caught && !InterruptPending);
+	UT_ASSERT(!held[0] && !held[1] && pinned[0] && !pinned[1]);
+	UT_ASSERT_EQ(empty_cancel_vm_handle, InvalidBuffer);
+	UT_ASSERT_EQ(empty_aux_calls, 1);
+	UT_ASSERT_EQ(empty_pin_calls + empty_heap_waits + empty_cleanup_waits + empty_repins, 0);
+	UT_ASSERT_EQ(empty_resumes + empty_local_unlocks + empty_fsm, 0);
+	UT_ASSERT_EQ(inserts + edge_count + dirty[0] + dirty[1], 0);
+	UT_ASSERT_EQ(next_token, 100);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT_EQ(assertion_failures, 0);
+	UT_ASSERT_EQ(memcmp(pages, before, sizeof(pages)), 0);
+}
+
+/* Explicit fixture cleanup after catch; this is not native ResourceOwner
+ * unwind coverage. The original heap pin belongs to the caller on ERROR. */
+static void
+release_empty_cancel_fixture(void)
+{
+	for (int i = 0; i < 2; i++) {
+		if (held[i])
+			LockBuffer(i + 1, BUFFER_LOCK_UNLOCK);
+		if (pinned[i])
+			ReleaseBuffer(i + 1);
+	}
+}
+
+UT_TEST(test_empty_cancel_after_vm_refusal_precedes_repin_and_heap_wait)
+{
+	for (unsigned retain = 0; retain < 2; retain++) {
+		for (unsigned share = 0; share < 2; share++) {
+			LVRelState state = empty_reset(false, VISIBILITYMAP_VALID_BITS << 2);
+
+			empty_aux = false;
+			empty_refusal_keeps_pin = retain != 0;
+			empty_cancel_after_refusal = true;
+			run_empty_cancel_scan(&state, share != 0);
+			check_empty_cancel_before_heap_wait();
+			release_empty_cancel_fixture();
+		}
+	}
+}
+
+UT_TEST(test_empty_cancel_after_vm_warm_precedes_heap_wait_and_publication)
+{
+	for (unsigned share = 0; share < 2; share++) {
+		LVRelState state = empty_reset(false, VISIBILITYMAP_VALID_BITS << 2);
+
+		empty_cancel_after_capture = true;
+		run_empty_cancel_scan(&state, share != 0);
+		check_empty_cancel_before_heap_wait();
+		release_empty_cancel_fixture();
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(42);
+	UT_PLAN(44);
 	UT_RUN(test_visible_exact_two_page_batch);
 	UT_RUN(test_no_change_allocates_no_version);
 	UT_RUN(test_nonshared_preserves_native_hint_lsn_rules);
@@ -2032,6 +2116,8 @@ main(void)
 	UT_RUN(test_pair_repair_captures_only_fresh_two_page_predecessors);
 	UT_RUN(test_pair_repair_cancel_keeps_only_original_heap_pin);
 	UT_RUN(test_pair_repair_error_or_unknown_version_precedes_mutation);
+	UT_RUN(test_empty_cancel_after_vm_refusal_precedes_repin_and_heap_wait);
+	UT_RUN(test_empty_cancel_after_vm_warm_precedes_heap_wait_and_publication);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

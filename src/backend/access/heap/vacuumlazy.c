@@ -2682,11 +2682,14 @@ lazy_publish_shared_empty(LVRelState *vacrel, Buffer buf, BlockNumber blkno, Buf
 	}
 
 	for (;;) {
-		if (!BufferIsValid(*vmbuffer))
+		if (!BufferIsValid(*vmbuffer)) {
+			CHECK_FOR_INTERRUPTS();
 			visibilitymap_pin(vacrel->rel, blkno, vmbuffer);
+		}
 		recent_vm = *vmbuffer;
 		ReleaseBuffer(recent_vm);
 		*vmbuffer = InvalidBuffer;
+		CHECK_FOR_INTERRUPTS();
 		if (cleanup_lock)
 			LockBufferForCleanup(buf);
 		else

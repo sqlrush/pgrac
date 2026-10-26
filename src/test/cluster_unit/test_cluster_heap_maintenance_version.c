@@ -43,6 +43,8 @@
 #include "utils/resowner.h"
 #include "utils/memdebug.h"
 #include "utils/hsearch.h"
+#include "common/hashfn.h"
+#include "storage/lock.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_pcm_lock.h"
@@ -12686,6 +12688,9 @@ page_owner_capture_from_original(Buffer buffer, const BufferTag *tag,
 /* Mapping, private pin/resource owner and LWLock scheduling are controlled.
  * Original resident bodies own all live checks and refusal/success cleanup. */
 #include "test_cluster_heap_resident_stamp_types.inc"
+static bool page_owner_use_original_resource_owner;
+static unsigned page_owner_original_owner_enlarges, page_owner_original_owner_remembers;
+static unsigned page_owner_original_owner_forgets, page_owner_original_owner_allocations;
 static LWLock page_owner_resident_mapping_lock;
 static bool page_owner_resident_active, page_owner_resident_partition_held;
 static unsigned page_owner_resident_pins, page_owner_resident_unpins;
@@ -12718,11 +12723,83 @@ page_owner_resident_reserve(void)
 {
 	UT_ASSERT(page_owner_resident_active && !page_owner_resident_partition_held && !page_owner_page_locked);
 }
+/* Original buffer ResourceOwner/array routines and complete private types.
+ * Memory context allocation is a bounded provider, not a PG context lifetime. */
+static void *
+page_owner_resource_alloc(MemoryContext context, Size size)
+{
+	void *memory;
+	UT_ASSERT(context == (MemoryContext)&page_owner_context_cookie);
+	UT_ASSERT(page_owner_use_original_resource_owner && page_owner_resident_active);
+	UT_ASSERT(!page_owner_resident_partition_held && !page_owner_page_locked && !local_x);
+	UT_ASSERT_EQ(page_owner_original_owner_allocations, 0);
+	UT_ASSERT_EQ(size, 16 * sizeof(Datum));
+	memory = malloc(size); UT_ASSERT(memory != NULL);
+	memset(memory, 0xa5, size); page_owner_original_owner_allocations++;
+	return memory;
+}
+static void
+page_owner_resource_free_unexpected(void *memory)
+{
+	UT_ASSERT(false); /* No growth/rehash is required for one outstanding pin. */
+	free(memory);
+}
+#define MemoryContextAlloc page_owner_resource_alloc
+#define TopMemoryContext ((MemoryContext)&page_owner_context_cookie)
+#define pfree page_owner_resource_free_unexpected
+#define ResourceArrayInit original_touch_owner_array_init
+#define ResourceArrayEnlarge original_touch_owner_array_enlarge
+#define ResourceArrayAdd original_touch_owner_array_add
+#define ResourceArrayRemove original_touch_owner_array_remove
+#define ResourceOwnerEnlargeBuffers original_touch_owner_enlarge
+#define ResourceOwnerRememberBuffer original_touch_owner_remember
+#define ResourceOwnerForgetBuffer original_touch_owner_forget
+#include "test_cluster_heap_resource_owner.inc"
+
+static Datum
+page_owner_buffer_datum(Buffer buffer)
+{
+	return BufferGetDatum(buffer);
+}
+#undef BufferGetDatum
+#undef ResourceOwnerForgetBuffer
+#undef ResourceOwnerRememberBuffer
+#undef ResourceOwnerEnlargeBuffers
+#undef ResourceArrayRemove
+#undef ResourceArrayAdd
+#undef ResourceArrayEnlarge
+#undef ResourceArrayInit
+#undef pfree
+#undef TopMemoryContext
+#undef MemoryContextAlloc
+#undef MAX_RESOWNER_LOCKS
+#undef RESARRAY_MAX_ITEMS
+#undef RESARRAY_IS_ARRAY
+#undef RESARRAY_MAX_ARRAY
+#undef RESARRAY_INIT_SIZE
+
+static ResourceOwnerData page_owner_native_resource_owner;
+static ResourceOwner
+page_owner_active_resource_owner(void)
+{
+	return page_owner_use_original_resource_owner
+		? &page_owner_native_resource_owner : (ResourceOwner)&page_owner_wal_cookie;
+}
+
 static void
 page_owner_resident_enlarge(ResourceOwner owner)
 {
-	UT_ASSERT(owner == (ResourceOwner)&page_owner_wal_cookie);
+	UT_ASSERT(owner == page_owner_active_resource_owner());
 	page_owner_resident_reserve();
+	if (page_owner_use_original_resource_owner)
+	{
+		UT_ASSERT_EQ(owner->bufferarr.nitems, 0);
+		original_touch_owner_enlarge(owner); page_owner_original_owner_enlarges++;
+		UT_ASSERT_EQ(owner->bufferarr.capacity, 16); UT_ASSERT_EQ(owner->bufferarr.maxitems, 16);
+		if (page_owner_original_owner_enlarges == 1)
+			for (unsigned i = 0; i < owner->bufferarr.capacity; i++)
+				UT_ASSERT_EQ(owner->bufferarr.itemsarr[i], page_owner_buffer_datum(InvalidBuffer));
+	}
 }
 static bool
 page_owner_resident_lock(LWLock *lock, LWLockMode mode)
@@ -12881,20 +12958,33 @@ static void
 page_owner_primitive_remember(ResourceOwner owner, Buffer buffer)
 {
 	uint32 state = pg_atomic_read_u32(&GetBufferDescriptor(0)->state);
-	UT_ASSERT(owner == (ResourceOwner)&page_owner_wal_cookie); UT_ASSERT_EQ(buffer, 1);
+	UT_ASSERT(owner == page_owner_active_resource_owner()); UT_ASSERT_EQ(buffer, 1);
 	UT_ASSERT(page_owner_primitive_ref_live && !page_owner_primitive_reserved);
 	UT_ASSERT_EQ(page_owner_active_private_ref()->refcount, 1);
 	UT_ASSERT_EQ(state, BM_VALID | BUF_REFCOUNT_ONE | BUF_USAGECOUNT_ONE);
 	UT_ASSERT_EQ(backend_pin_count, page_owner_resident_saved.pins);
+	if (page_owner_use_original_resource_owner)
+	{
+		UT_ASSERT_EQ(owner->bufferarr.nitems, 0);
+		original_touch_owner_remember(owner, buffer); page_owner_original_owner_remembers++;
+		UT_ASSERT_EQ(owner->bufferarr.nitems, 1); UT_ASSERT_EQ(owner->bufferarr.lastidx, 0);
+		UT_ASSERT_EQ(owner->bufferarr.itemsarr[0], page_owner_buffer_datum(buffer));
+	}
 	backend_pin_count++; page_owner_resident_pins++; page_owner_primitive_remembers++;
 }
 static void
 page_owner_primitive_forget(ResourceOwner owner, Buffer buffer)
 {
-	UT_ASSERT(owner == (ResourceOwner)&page_owner_wal_cookie); UT_ASSERT_EQ(buffer, 1);
+	UT_ASSERT(owner == page_owner_active_resource_owner()); UT_ASSERT_EQ(buffer, 1);
 	UT_ASSERT(page_owner_primitive_ref_live && !page_owner_resident_partition_held);
 	UT_ASSERT_EQ(page_owner_active_private_ref()->refcount, 1);
 	UT_ASSERT_EQ(backend_pin_count, page_owner_resident_saved.pins + 1);
+	if (page_owner_use_original_resource_owner)
+	{
+		UT_ASSERT_EQ(owner->bufferarr.nitems, 1);
+		original_touch_owner_forget(owner, buffer); page_owner_original_owner_forgets++;
+		UT_ASSERT_EQ(owner->bufferarr.nitems, 0);
+	}
 	backend_pin_count--; page_owner_primitive_forgets++;
 }
 static void
@@ -12945,7 +13035,7 @@ page_owner_primitive_signal(int pgprocno)
 #define ForgetPrivateRefCountEntry page_owner_primitive_forget_ref
 #define ResourceOwnerRememberBuffer page_owner_primitive_remember
 #define ResourceOwnerForgetBuffer page_owner_primitive_forget
-#define CurrentResourceOwner ((ResourceOwner)&page_owner_wal_cookie)
+#define CurrentResourceOwner page_owner_active_resource_owner()
 #define WaitBufHdrUnlocked page_owner_primitive_wait_header
 #define cluster_bufmgr_pcm_read_image_last_pin page_owner_primitive_last_pin
 #define LWLockHeldByMe page_owner_primitive_content_held
@@ -13037,7 +13127,7 @@ page_owner_lookup_aux_remember(ResourceOwner owner, Buffer buffer)
 #define LockBufHdr original_touch_header_lock
 #define NewPrivateRefCountEntry page_owner_lookup_aux_ref
 #define ResourceOwnerRememberBuffer page_owner_lookup_aux_remember
-#define CurrentResourceOwner ((ResourceOwner)&page_owner_wal_cookie)
+#define CurrentResourceOwner page_owner_active_resource_owner()
 #define PinBuffer page_owner_lookup_pin_leaf
 #define PinBufferForLookup original_touch_lookup_pin
 #include "test_cluster_heap_lookup_pin.inc"
@@ -13111,7 +13201,7 @@ page_owner_resident_error_detail(const char *format, ...)
 #define BufMappingPartitionLock page_owner_resident_partition
 #define ReservePrivateRefCountEntry page_owner_resident_reserve
 #define ResourceOwnerEnlargeBuffers page_owner_resident_enlarge
-#define CurrentResourceOwner ((ResourceOwner)&page_owner_wal_cookie)
+#define CurrentResourceOwner page_owner_active_resource_owner()
 #define LWLockAcquire page_owner_resident_lock
 #define LWLockRelease page_owner_resident_release_lock
 #define BufTableLookup page_owner_resident_lookup
@@ -14001,6 +14091,29 @@ UT_TEST(test_original_private_ref_table_feeds_pin_stamp_and_recent_freeze)
 	page_owner_use_original_private_refs = false;
 }
 
+UT_TEST(test_original_resource_owner_feeds_pin_stamp_and_recent_freeze)
+{
+	page_owner_use_original_resource_owner = true;
+	page_owner_original_owner_enlarges = page_owner_original_owner_remembers = 0;
+	page_owner_original_owner_forgets = page_owner_original_owner_allocations = 0;
+	memset(&page_owner_native_resource_owner, 0, sizeof(page_owner_native_resource_owner));
+	page_owner_native_resource_owner.name = "freeze-maintenance-unit";
+	original_touch_owner_array_init(&page_owner_native_resource_owner.bufferarr, page_owner_buffer_datum(InvalidBuffer));
+	test_original_private_ref_table_feeds_pin_stamp_and_recent_freeze();
+	UT_ASSERT_EQ(page_owner_original_owner_enlarges, 24);
+	UT_ASSERT_EQ(page_owner_original_owner_remembers, 16);
+	UT_ASSERT_EQ(page_owner_original_owner_forgets, 16);
+	UT_ASSERT_EQ(page_owner_original_owner_allocations, 1);
+	UT_ASSERT_EQ(page_owner_native_resource_owner.bufferarr.nitems, 0);
+	UT_ASSERT_EQ(page_owner_native_resource_owner.bufferarr.capacity, 16);
+	UT_ASSERT_EQ(page_owner_native_resource_owner.bufferarr.maxitems, 16);
+	UT_ASSERT_EQ(page_owner_native_resource_owner.bufferarr.invalidval, page_owner_buffer_datum(InvalidBuffer));
+	UT_ASSERT(page_owner_native_resource_owner.bufferarr.itemsarr != NULL);
+	free(page_owner_native_resource_owner.bufferarr.itemsarr);
+	memset(&page_owner_native_resource_owner, 0, sizeof(page_owner_native_resource_owner));
+	page_owner_use_original_resource_owner = false;
+}
+
 UT_TEST(test_original_resident_stamp_owner_feeds_shared_retention_and_recent_freeze)
 {
 	page_owner_use_native_resident = page_owner_use_native_authority = true;
@@ -14405,7 +14518,7 @@ UT_TEST(test_recent_xmin_share_lock_refusal_keeps_borrowed_pin_without_upgrade)
 int
 main(void)
 {
-	UT_PLAN(313);
+	UT_PLAN(314);
 
 	UT_RUN(test_pin_free_admitted_phase_reaches_recent_native_wal_before_owner_leave);
 	UT_RUN(test_pin_free_phase_recent_refusal_retires_only_its_original_owner);
@@ -14417,6 +14530,7 @@ main(void)
 	UT_RUN(test_original_lookup_pin_feeds_resident_stamp_and_recent_freeze);
 	UT_RUN(test_original_primitive_pin_feeds_resident_stamp_and_recent_freeze);
 	UT_RUN(test_original_private_ref_table_feeds_pin_stamp_and_recent_freeze);
+	UT_RUN(test_original_resource_owner_feeds_pin_stamp_and_recent_freeze);
 	UT_RUN(test_original_resident_stamp_owner_feeds_shared_retention_and_recent_freeze);
 	UT_RUN(test_original_bufmgr_authority_feeds_touch_registration_and_recent_freeze);
 	UT_RUN(test_original_exact_touch_registration_feeds_finish_and_recent_freeze);
