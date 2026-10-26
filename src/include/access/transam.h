@@ -9,6 +9,12 @@
  *
  * src/include/access/transam.h
  *
+ * PGRAC MODIFICATIONS
+ * Modified by: SqlRush <sqlrush@gmail.com>
+ * Spec: 2026-10-14-pre2-m5-e1-format-closure-v1.md
+ * What changed: declare the explicit dormant FullXid CLOG allocation entry.
+ * Why: preserve the original allocator FullXid in native page-birth input.
+ *
  *-------------------------------------------------------------------------
  */
 #ifndef TRANSAM_H
@@ -286,6 +292,9 @@ extern XLogRecPtr TransactionIdGetCommitLSN(TransactionId xid);
 
 /* in transam/varsup.c */
 extern FullTransactionId GetNewTransactionId(bool isSubXact);
+/* PGRAC: dormant original allocation with native FullXid CLOG page birth.
+ * No live caller, retained-lifetime grant or recovery completion authority. */
+extern FullTransactionId GetNewTransactionIdFullCLOG(bool isSubXact);
 extern void AdvanceNextFullTransactionIdPastXid(TransactionId xid);
 extern FullTransactionId ReadNextFullTransactionId(void);
 extern void SetTransactionIdLimit(TransactionId oldest_datfrozenxid,

@@ -35,6 +35,7 @@
 #include "storage/proc.h"
 #undef printf
 #include "unit_test.h"
+#include <setjmp.h>
 UT_DEFINE_GLOBALS();
 
 bool cluster_enabled, cluster_shared_catalog, cluster_xid_striping;
@@ -55,6 +56,8 @@ static bool held, reservation, jump, advance_while_unlocked;
 static unsigned waits, extensions, early_extensions, lock_errors;
 static uint64 floor_full, limit_full;
 int cluster_injection_armed_count;
+
+#include "test_cluster_xid_full_clog.inc"
 
 bool
 IsInParallelMode(void)
@@ -140,6 +143,8 @@ extended(void)
 void
 ExtendCLOG(TransactionId xid)
 {
+	if (full_clog_fixture.active)
+		full_clog_fixture.raw_calls++;
 	extended();
 }
 void
@@ -170,11 +175,15 @@ ExceptionalCondition(const char *condition, const char *file, int line)
 bool
 errstart(int level, const char *domain)
 {
+	if (full_clog_fixture.expect_error)
+		longjmp(full_clog_fixture.error, 1);
 	abort();
 }
 bool
 errstart_cold(int level, const char *domain)
 {
+	if (full_clog_fixture.expect_error)
+		longjmp(full_clog_fixture.error, 1);
 	abort();
 }
 void
@@ -242,10 +251,16 @@ UT_TEST(native_allocation_preserves_ordinary_counter)
 int
 main(void)
 {
-	UT_PLAN(3);
+	UT_PLAN(9);
 	UT_RUN(no_storage_or_procarray_mutation_before_reservation);
 	UT_RUN(wait_rederives_native_counter_and_new_boot_floor);
 	UT_RUN(native_allocation_preserves_ordinary_counter);
+	UT_RUN(full_clog_allocator_uses_original_candidate_and_gap);
+	UT_RUN(full_clog_allocator_keeps_epoch_across_native_wrap);
+	UT_RUN(full_clog_allocator_rederives_after_original_lease_wait);
+	UT_RUN(full_clog_extension_error_precedes_native_publication);
+	UT_RUN(full_clog_entry_refuses_non_normal_processing);
+	UT_RUN(ordinary_allocator_keeps_raw_clog_route);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }
