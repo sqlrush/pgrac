@@ -5391,6 +5391,26 @@ ctrc_capacity_candidate_probe(const CtrcCapacityCandidate *candidate,
 	observation->owner_generation = worker_generation;
 	return CLUSTER_CAPACITY_OWNER_PROGRESS_POSSIBLE;
 }
+
+/* Every pool outcome belongs to the original CURRENT and epoch. A failed
+ * candidate cannot make an old scope's refusal valid after a rollover;
+ * missing identity still takes precedence over any hint-driven recheck.
+ * Check epoch after the original CURRENT snapshot's local lock boundary.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static ClusterCapacityReasonV1
+ctrc_capacity_pool_finish(uint32 segment_id, uint64 epoch, bool recheck,
+						  ClusterCapacityObservationV1 *observation)
+{
+	uint32 current;
+
+	if (!ctrc_capacity_local_current(segment_id, &current)
+		|| epoch != cluster_epoch_get_current()) {
+		observation->reason = CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER;
+		observation->unproven_reasons |= CLUSTER_CAPACITY_UNPROVEN_IDENTITY;
+	} else if (current != segment_id || recheck)
+		observation->reason = CLUSTER_CAPACITY_SUPPLY_RECHECK;
+	return observation->reason;
+}
 #endif
 
 /*
@@ -5446,28 +5466,13 @@ cluster_ctrc_capacity_probe_pool_continuation_v1(uint32 current_segment, SCN hor
 								 : CLUSTER_CAPACITY_SCOPE_SEGMENT;
 		reason = ctrc_capacity_candidate_probe(&candidates[i], observation);
 		if (reason == CLUSTER_CAPACITY_OWNER_PROGRESS_POSSIBLE) {
-			if (epoch != cluster_epoch_get_current()) {
-				observation->unproven_reasons |= CLUSTER_CAPACITY_UNPROVEN_IDENTITY;
-				return observation->reason;
-			}
-			current = cluster_tt_slot_current_segment(cluster_node_id);
-			if (current != current_segment) {
-				if (current < first || current - first >= CLUSTER_UNDO_SEGS_PER_INSTANCE)
-					observation->unproven_reasons |= CLUSTER_CAPACITY_UNPROVEN_IDENTITY;
-				else
-					observation->reason = CLUSTER_CAPACITY_SUPPLY_RECHECK;
-				return observation->reason;
-			}
 			observation->reason = reason;
-			return observation->reason;
+			return ctrc_capacity_pool_finish(current_segment, epoch, false, observation);
 		}
 		if (reason == CLUSTER_CAPACITY_SUPPLY_RECHECK)
 			recheck = true;
 	}
-	if (epoch != cluster_epoch_get_current())
-		observation->unproven_reasons |= CLUSTER_CAPACITY_UNPROVEN_IDENTITY;
-	else if (recheck)
-		observation->reason = CLUSTER_CAPACITY_SUPPLY_RECHECK;
+	return ctrc_capacity_pool_finish(current_segment, epoch, recheck, observation);
 #else
 	(void)current_segment;
 	(void)horizon;
