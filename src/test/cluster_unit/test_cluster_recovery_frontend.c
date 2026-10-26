@@ -17,6 +17,7 @@
 UT_DEFINE_GLOBALS();
 
 #include "test_cluster_undo_operation.inc"
+#include "test_cluster_undo_rollback.inc"
 
 UT_TEST(test_frontend_time_comparison_matches_original_backend)
 {
@@ -92,7 +93,19 @@ UT_TEST(test_frontend_original_undo_history_guards_keep_time_order)
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(23);
+	UT_RUN(test_rollback_codec_reserved_unaligned_zero_progress);
+	UT_RUN(test_rollback_codec_active_phases_and_cross_segment_stops);
+	UT_RUN(test_rollback_codec_marking_initial_and_last_cursor_cut);
+	UT_RUN(test_rollback_codec_full_xid_wrap_and_counter_boundaries);
+	UT_RUN(test_rollback_codec_rejects_body_domain_drift);
+	UT_RUN(test_rollback_codec_rejects_owner_tail_drift);
+	UT_RUN(test_rollback_codec_rejects_header_domain_drift);
+	UT_RUN(test_rollback_codec_rejects_nonrecord_or_foreign_cursor_addresses);
+	UT_RUN(test_rollback_codec_rejects_phase_progress_contradictions);
+	UT_RUN(test_rollback_codec_short_null_and_missing_outputs);
+	UT_RUN(test_rollback_encoder_exact_bytes_and_capacity_before_copy);
+	UT_RUN(test_rollback_codec_legacy_data_consumers_stay_closed);
 	UT_RUN(test_operation_codec_unaligned_live_and_discarded);
 	UT_RUN(test_operation_codec_all_original_body_shapes);
 	UT_RUN(test_operation_codec_epoch_and_counter_boundaries);

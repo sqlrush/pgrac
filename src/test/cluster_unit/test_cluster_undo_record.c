@@ -75,6 +75,7 @@
 UT_DEFINE_GLOBALS();
 
 #include "test_cluster_undo_operation.inc"
+#include "test_cluster_undo_rollback.inc"
 
 /* Let the exact parent caller run, so missing observations are behavioral
  * failures rather than an absent-type compile failure. */
@@ -5946,7 +5947,19 @@ UT_TEST(test_exact_zero_abort_keeps_cleanup_after_native_scope_ends)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(149);
+	UT_PLAN(161);
+	UT_RUN(test_rollback_codec_reserved_unaligned_zero_progress);
+	UT_RUN(test_rollback_codec_active_phases_and_cross_segment_stops);
+	UT_RUN(test_rollback_codec_marking_initial_and_last_cursor_cut);
+	UT_RUN(test_rollback_codec_full_xid_wrap_and_counter_boundaries);
+	UT_RUN(test_rollback_codec_rejects_body_domain_drift);
+	UT_RUN(test_rollback_codec_rejects_owner_tail_drift);
+	UT_RUN(test_rollback_codec_rejects_header_domain_drift);
+	UT_RUN(test_rollback_codec_rejects_nonrecord_or_foreign_cursor_addresses);
+	UT_RUN(test_rollback_codec_rejects_phase_progress_contradictions);
+	UT_RUN(test_rollback_codec_short_null_and_missing_outputs);
+	UT_RUN(test_rollback_encoder_exact_bytes_and_capacity_before_copy);
+	UT_RUN(test_rollback_codec_legacy_data_consumers_stay_closed);
 	UT_RUN(test_payload_encoder_preserves_v1_and_emits_exact_child_tail);
 	UT_RUN(test_payload_encoder_refuses_short_candidate_before_any_copy);
 	UT_RUN(test_payload_encoder_rejects_malformed_operation_or_body);

@@ -847,7 +847,8 @@ test_cluster_recovery_frontend_compare.inc: $(top_srcdir)/src/backend/cluster/cl
 	mv $@.tmp $@
 
 test_cluster_recovery_frontend: test_cluster_recovery_frontend.c \
-		test_cluster_recovery_frontend_compare.inc test_cluster_undo_operation.inc unit_test.h \
+		test_cluster_recovery_frontend_compare.inc test_cluster_undo_operation.inc \
+		test_cluster_undo_rollback.inc unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_uba.c \
 		$(top_srcdir)/src/include/cluster/cluster_scn.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_record.h \
@@ -9718,7 +9719,8 @@ test_cluster_undo_ctrc_product.o: $(top_srcdir)/src/backend/cluster/cluster_term
 		-Dcluster_ctrc_receipt_apply_evidence_recheck=undo_ctrc_unavailable_apply_evidence_recheck \
 		-c $< -o $@
 
-test_cluster_undo_record: test_cluster_undo_record.c test_cluster_undo_operation.inc unit_test.h \
+test_cluster_undo_record: test_cluster_undo_record.c test_cluster_undo_operation.inc \
+		test_cluster_undo_rollback.inc unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_undo_retention.c \
 		test_cluster_undo_ctrc_product.o \
 		$(CLUSTER_UBA_O) \
@@ -9750,7 +9752,7 @@ test_cluster_heap_receipt_product.o: test_cluster_heap_receipt_product.c \
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_heap_receipt: test_cluster_heap_receipt.c test_cluster_undo_record.c \
-		test_cluster_undo_operation.inc \
+		test_cluster_undo_operation.inc test_cluster_undo_rollback.inc \
 		$(top_srcdir)/src/include/cluster/cluster_undo_record.h \
 		$(top_srcdir)/src/backend/cluster/cluster_undo_retention.c \
 		$(CLUSTER_UBA_O) \
