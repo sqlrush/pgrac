@@ -90,6 +90,16 @@ static PGAlignedBlock resident_page;
 static unsigned repins, lock_attempts, page_checks, validations;
 static unsigned generic_unlocks, remote_releases, ownership_mirrors;
 static bool pin_held, content_locked, resident, lock_available;
+
+/* Original backend-private pin reader; only its refcount storage is a leaf. */
+static int32
+GetPrivateRefCount(Buffer buffer)
+{
+	UT_ASSERT_EQ(buffer, 1);
+	return pin_held ? 1 : 0;
+}
+#include "test_cluster_heap_borrowed_pin.inc"
+
 static bool remote_release_error, leave_with_ownership;
 static bool changed_holder, changed_master, changed_admission;
 static bool error_page_check, validation_under_lock;
@@ -3730,10 +3740,48 @@ UT_TEST(admitted_phase_error_unwinds_local_owners_but_keeps_caller_admission)
 	}
 }
 
+UT_TEST(admitted_phase_requires_released_resident_hint_before_proof_transport)
+{
+	for (int fault = 0; fault < 3; fault++) {
+		ClusterSemanticAdmissionToken token = {0}; PcmAuthoritySnapshot authority;
+		BufferTag tag; uint64 master; SCN page_scn;
+		volatile bool caught = false; bool rows_current = true;
+		ClusterHeapFreezeProofStatusV1 status = CLUSTER_HEAP_FREEZE_PROOF_PROVEN;
+		reset_fixture(); fixture_original_admission_setup();
+		InitBufferTag(&tag, &relation.rd_locator, MAIN_FORKNUM, vacrel.shared_freeze_batch.block);
+		UT_ASSERT(cluster_pcm_lock_r4_route_snapshot(tag, &authority, &master, &page_scn));
+		UT_ASSERT_EQ(cluster_semantic_activation_enter_r4_terminal_census(&token), CLUSTER_SEMANTIC_ADMISSION_OK);
+		pin_held = fault == 0;
+		/* Any preflight call is visible without entering a blocking resolver. */
+		error_preflight = true;
+		PG_TRY();
+		{
+			status = lazy_collect_shared_freeze_proofs_admitted(&vacrel,
+				fault == 1 ? InvalidBuffer : fault == 2 ? NBuffers + 1 : 1,
+				&authority, master, &token, &rows_current);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(!caught); UT_ASSERT_EQ(status, CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+		UT_ASSERT(!rows_current); UT_ASSERT_EQ(pin_held, fault == 0);
+		UT_ASSERT(token.entered); UT_ASSERT_EQ(debt, 1);
+		UT_ASSERT_EQ(fixture_original_admission_debt(), 1); UT_ASSERT_EQ(leaves, 0);
+		UT_ASSERT_EQ(resolves + repins + lock_attempts, 0); UT_ASSERT_STR_EQ(cleanup_order, "");
+		/* The rejected helper does not own this test caller's pin or token. */
+		pin_held = false;
+		cluster_semantic_activation_leave(&token);
+		UT_ASSERT(!token.entered); UT_ASSERT_EQ(fixture_original_admission_debt(), 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(135);
+	UT_PLAN(136);
+	UT_RUN(admitted_phase_requires_released_resident_hint_before_proof_transport);
 	UT_RUN(admitted_phase_refuses_missing_borrowed_owner_without_side_effects);
 	UT_RUN(admitted_phase_error_unwinds_local_owners_but_keeps_caller_admission);
 	UT_RUN(admitted_phase_returns_to_original_owner_before_leave);

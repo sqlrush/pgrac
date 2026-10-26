@@ -10280,6 +10280,7 @@ test_cluster_vacuum_observed_bounds.inc: $(top_srcdir)/src/backend/cluster/clust
 	mv $@.tmp $@
 
 test_cluster_vacuum_proof_cleanup: test_cluster_vacuum_proof_cleanup.c unit_test.h \
+		test_cluster_heap_borrowed_pin.inc \
 		$(top_srcdir)/src/include/cluster/cluster_gcs_block.h \
 		$(top_srcdir)/src/include/cluster/cluster_scn.h test_cluster_heap_small_scn.inc \
 		test_cluster_vacuum_observed_bounds.inc \

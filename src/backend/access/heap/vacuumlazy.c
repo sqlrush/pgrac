@@ -2052,6 +2052,12 @@ lazy_collect_shared_freeze_proofs_admitted(LVRelState *vacrel, Buffer recent_buf
 	if (vacrel == NULL || authority_before == NULL || admission == NULL
 		|| !admission->entered || row_inputs_current_out == NULL)
 		return status;
+	/* Proof transport must not retain the captured heap's original pin.
+	 * recent_buffer is only a resident hint until the later local recheck;
+	 * leave any unexpected caller-owned pin and admission with that caller. */
+	if (recent_buffer <= 0 || recent_buffer > NBuffers
+		|| ClusterBufferHasSharedPin(recent_buffer))
+		return status;
 	memset(&proofs, 0, sizeof(proofs));
 	memset(retained, 0, sizeof(retained));
 	memset(&expected_fence, 0, sizeof(expected_fence));

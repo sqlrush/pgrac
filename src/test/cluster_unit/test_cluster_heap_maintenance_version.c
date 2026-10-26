@@ -112,6 +112,7 @@ static unsigned recent_pin_calls, recent_unpins;
 static bool recent_pin_allowed, recent_pin_error;
 static bool recent_caller_local_x, recent_caller_writer, recent_caller_share;
 static bool recent_pin_held;
+static bool phase_pin_released;
 static int32 recent_caller_pins;
 
 /* The original path owns one pin. The recent entry temporarily adds exactly
@@ -119,7 +120,7 @@ static int32 recent_caller_pins;
 static int32
 fixture_expected_backend_pins(void)
 {
-	return recent_pin_held ? recent_caller_pins + 1 : 1;
+	return phase_pin_released ? 0 : recent_pin_held ? recent_caller_pins + 1 : 1;
 }
 static const ClusterSemanticAdmissionToken *recent_pin_admission;
 static bool flush_error;
@@ -2024,7 +2025,7 @@ reset(uint8 opcode, bool shared)
 	recent_pin_calls = recent_unpins = 0;
 	recent_pin_allowed = true; recent_pin_error = false; recent_pin_admission = NULL;
 	recent_caller_local_x = recent_caller_writer = recent_caller_share = recent_pin_held = false;
-	recent_caller_pins = 0;
+	recent_caller_pins = 0; phase_pin_released = false;
 	writer_state = PCM_STATE_X;
 	route_holder = 11;
 	route_master = 12;
@@ -9582,7 +9583,7 @@ static bool bounds_after_clock, bounds_after_target;
 static void
 bounds_assert_unlocked(void)
 {
-	UT_ASSERT(!local_x && !local_share && backend_pin_count == 1);
+	UT_ASSERT(!local_x && !local_share && backend_pin_count == fixture_expected_backend_pins());
 	UT_ASSERT_EQ(CritSectionCount, 0);
 	UT_ASSERT_EQ(inserts + edges + dirties + flushes + conditional_resumes, 0);
 }
@@ -11709,7 +11710,7 @@ static void
 phase_preflight(void)
 {
 	UT_ASSERT(phase_source->admission.entered && bounds_original_backend_has_admission());
-	UT_ASSERT(!local_x && !local_share && backend_pin_count == 1);
+	UT_ASSERT(!local_x && !local_share && backend_pin_count == 0);
 	phase_preflights++;
 	if (phase_error_stage == 1) elog(ERROR, "injected admitted preflight ERROR");
 }
@@ -11750,7 +11751,7 @@ phase_resident_recheck(LVRelState *v, Buffer buffer,
 	(void)retained;
 	UT_ASSERT(v != NULL && buffer == 1 && authority == &phase_source->authority);
 	UT_ASSERT(token == &phase_source->admission && token->entered);
-	UT_ASSERT(!local_x && !local_share && backend_pin_count == 1);
+	UT_ASSERT(!local_x && !local_share && backend_pin_count == 0);
 	UT_ASSERT_EQ(retained_mask, 0); UT_ASSERT_EQ(proofs->proof_count, phase_resolves);
 	phase_rechecks++;
 	if (phase_error_stage == 3) elog(ERROR, "injected admitted resident check ERROR");
@@ -11768,11 +11769,39 @@ phase_resident_recheck(LVRelState *v, Buffer buffer,
 #define cluster_tx_resolve_exact_admitted phase_resolve
 #define cluster_tx_resolve_terminal_census_retained_admitted phase_retained_resolve
 #define lazy_recheck_shared_freeze_page phase_resident_recheck
+#define lazy_collect_shared_freeze_proofs_admitted phase_actual_admitted
 #include "test_cluster_vacuum_admitted_phase.inc"
+#undef lazy_collect_shared_freeze_proofs_admitted
 #undef lazy_recheck_shared_freeze_page
 #undef cluster_tx_resolve_terminal_census_retained_admitted
 #undef cluster_tx_resolve_exact_admitted
 #undef cluster_tx_resolve_terminal_census_batch_preflight
+
+/* Legacy phase/native cases borrow a controlled fixture pin around the
+ * phase. Model its release for proof callbacks and restore only that model
+ * before the separately tested pinned native API. No production pin API or
+ * qualification is replaced: phase_actual_admitted is the complete body. */
+static ClusterHeapFreezeProofStatusV1
+lazy_collect_shared_freeze_proofs_admitted(LVRelState *v, Buffer buffer,
+	const PcmAuthoritySnapshot *authority, uint64 master,
+	const ClusterSemanticAdmissionToken *token, bool *rows_current)
+{
+	volatile ClusterHeapFreezeProofStatusV1 status = CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN;
+	UT_ASSERT_EQ(backend_pin_count, 1);
+	UT_ASSERT(!local_x && !local_share && !phase_pin_released);
+	backend_pin_count = 0; phase_pin_released = true;
+	PG_TRY();
+	{
+		status = phase_actual_admitted(v, buffer, authority, master, token, rows_current);
+	}
+	PG_FINALLY();
+	{
+		UT_ASSERT_EQ(backend_pin_count, 0);
+		phase_pin_released = false; backend_pin_count = 1;
+	}
+	PG_END_TRY();
+	return status;
+}
 
 static void
 phase_setup(QualifiedXminFixture *f, LVRelState *v,
