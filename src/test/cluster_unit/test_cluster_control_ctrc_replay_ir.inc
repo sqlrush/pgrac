@@ -18,12 +18,20 @@
  *
  *-------------------------------------------------------------------------
  */
+/* Keep the original single-source leaf unchanged unless a set fixture opts in. */
+static bool (*ctrc_replay_current_override)(const struct ClusterRecoveryStartV1 *,
+	const struct ClusterColdCtrcWorkV1 *, uint32, ClusterWalInputsV1 *,
+	const ClusterRecoverySerialRequest *);
+
 bool
 ClusterColdRecoveryCtrcReplayRequestCurrent(const struct ClusterRecoveryStartV1 *start,
 	const struct ClusterColdCtrcWorkV1 *work, uint32 index, ClusterWalInputsV1 *scope,
 	const ClusterRecoverySerialRequest *request)
 {
 	ClusterRecoverySerialRequest expected = ctrc_ir_provisional();
+
+	if (ctrc_replay_current_override != NULL)
+		return ctrc_replay_current_override(start, work, index, scope, request);
 	expected.tx_closure_scope = scope;
 	return ctrc_ir_start_current && ClusterColdRecoveryCtrcWorkCurrent(start, work)
 		&& index < tx_inputs_typed.replay_count && index == 0

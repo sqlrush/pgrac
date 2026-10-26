@@ -53,13 +53,22 @@ typedef struct ClusterRecoveryTxIoScopeV1 {
 	bool ir_revoked;
 } ClusterRecoveryTxIoScopeV1;
 
+typedef struct ClusterRecoveryCtrcReplayOwnerV1 {
+	ClusterRecoverySerialRequest request;
+	ClusterRecoverySerialGuard ir;
+} ClusterRecoveryCtrcReplayOwnerV1;
+
 /* Original full source plan, captured before this scope performs I/O.
  * Only cold census allocates it, in the same creation context as its scope.
- * Mutable scan progress and TX results keep their original separate owners. */
+ * Mutable scan progress and TX results keep their original separate owners.
+ * The bounded native replay owners share its lifetime, not its identity. */
 typedef struct ClusterRecoveryCtrcSourcePlanV1 {
 	uint32 participant_count, replay_count;
 	ClusterColdParticipantV1 participants[CLUSTER_COLD_MAX_PARTICIPANTS];
 	ClusterWalSourceRef sources[CLUSTER_COLD_MAX_PARTICIPANTS];
+	ClusterRecoveryCtrcReplayOwnerV1 replay[CLUSTER_COLD_MAX_PARTICIPANTS];
+	uint16 order[CLUSTER_COLD_MAX_PARTICIPANTS];
+	bool set_started, set_prepared, set_ready, set_revoked;
 } ClusterRecoveryCtrcSourcePlanV1;
 
 typedef struct ClusterRecoveryCtrcIoScopeV1 {
@@ -109,6 +118,21 @@ struct ClusterWalInputsV1 {
 static ClusterRecoveryTxRetentionV1 active_tx_retention;
 /* A separate purpose locator; borrowing this never makes census a C0 scope. */
 static ClusterRecoveryTxRetentionV1 active_ctrc_retention;
+
+/* Scope retirement clears this locator before freeing either allocation.
+ * The captured pin incarnation excludes a same-address replacement. This is
+ * an allocation-lifetime check only; actual authority still requires current
+ * native holders. It may be used when proof loss requires debt revocation. */
+static bool
+inputs_ctrc_replays_scope_same(const ClusterRecoveryTxRetentionV1 *original)
+{
+	return original->scope != NULL && original->scope == active_ctrc_retention.scope
+		&& original->serial == active_ctrc_retention.serial
+		&& memcmp(&original->input_owner, &active_ctrc_retention.input_owner,
+			sizeof(original->input_owner)) == 0;
+}
+
+static void inputs_ctrc_replays_release(ClusterWalInputsV1 *inputs);
 
 typedef struct WalInputsWork {
 	ControlRootImage root;
@@ -429,6 +453,7 @@ inputs_namespace_close(ClusterWalInputsV1 *inputs)
 static void
 inputs_tx_serial_release(ClusterWalInputsV1 *inputs)
 {
+	inputs_ctrc_replays_release(inputs);
 	if (!inputs->tx.ir.held && !inputs->tx.ir.release_uncertain)
 		return;
 	inputs->tx.ir_ready = false;
@@ -1832,11 +1857,10 @@ inputs_ctrc_serial_current(ClusterWalInputsV1 *inputs, uint32 index,
  * token is retained verbatim; current COMPLETE/history comes solely from this
  * scope's actual full ROOT selection, original source cut and WALR owner. */
 static bool
-inputs_tx_subject_request(ClusterWalInputsV1 *inputs, ClusterRecoverySerialRequest *out,
+inputs_tx_complete_request(ClusterWalInputsV1 *inputs, const ClusterColdTypedV1 *typed,
+	ClusterRecoverySerialRequest request, ClusterRecoverySerialRequest *out,
 	const ClusterWalInputV1 **out_selected)
 {
-	ClusterRecoverySerialRequest request;
-	const ClusterColdTypedV1 *typed;
 	const ClusterWalSourceRef *source = NULL;
 	const ClusterWalInputV1 *selected = NULL;
 	const uint32 required = CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID
@@ -1844,22 +1868,6 @@ inputs_tx_subject_request(ClusterWalInputsV1 *inputs, ClusterRecoverySerialReque
 		| CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID | CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID
 		| CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_LAST_RECORD_VALID;
 
-	if (!inputs_current(inputs) || inputs->tx.ir_revoked)
-		return false;
-	if (inputs->purpose == WAL_INPUTS_CTRC_CENSUS) {
-		if (!inputs->ctrc.serial_prepared
-			|| !inputs_ctrc_serial_current(inputs, inputs->ctrc.serial_subject,
-				&inputs->ctrc.serial_request, inputs->ctrc.serial_replay))
-			return false;
-		request = inputs->ctrc.serial_request;
-		request.tx_closure_scope = NULL;
-		typed = inputs->ctrc.inputs;
-	} else {
-		if (inputs->purpose != WAL_INPUTS_TX_CLOSURE
-			|| !ClusterColdRecoveryTxSerialRequest(inputs->tx.start, inputs->tx.subject, &request))
-			return false;
-		typed = inputs->tx.inputs;
-	}
 	if (request.mode != CLUSTER_RECOVERY_SERIAL_TX_CLOSURE || request.tx_closure_scope != NULL)
 		return false;
 	if (inputs_tx_reselect_original(inputs, typed) != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
@@ -1901,6 +1909,76 @@ inputs_tx_subject_request(ClusterWalInputsV1 *inputs, ClusterRecoverySerialReque
 }
 
 static bool
+inputs_tx_subject_request(ClusterWalInputsV1 *inputs, ClusterRecoverySerialRequest *out,
+	const ClusterWalInputV1 **out_selected)
+{
+	ClusterRecoverySerialRequest request;
+	const ClusterColdTypedV1 *typed;
+
+	if (!inputs_current(inputs) || inputs->tx.ir_revoked)
+		return false;
+	if (inputs->purpose == WAL_INPUTS_CTRC_CENSUS) {
+		if (!inputs->ctrc.serial_prepared
+			|| !inputs_ctrc_serial_current(inputs, inputs->ctrc.serial_subject,
+				&inputs->ctrc.serial_request, inputs->ctrc.serial_replay))
+			return false;
+		request = inputs->ctrc.serial_request;
+		request.tx_closure_scope = NULL;
+		typed = inputs->ctrc.inputs;
+	} else {
+		if (inputs->purpose != WAL_INPUTS_TX_CLOSURE
+			|| !ClusterColdRecoveryTxSerialRequest(inputs->tx.start, inputs->tx.subject, &request))
+			return false;
+		typed = inputs->tx.inputs;
+	}
+	return inputs_tx_complete_request(inputs, typed, request, out, out_selected);
+}
+
+/* Native IR callbacks validate only the fixed original inputs here. They
+ * must not recurse into holder revalidation or require an already-ready set. */
+static bool
+inputs_ctrc_replays_request(ClusterWalInputsV1 *inputs, uint32 index,
+	ClusterRecoverySerialRequest *out, const ClusterWalInputV1 **out_selected)
+{
+	ClusterRecoveryCtrcSourcePlanV1 *plan;
+	ClusterRecoverySerialRequest request;
+
+	if (!inputs_current(inputs) || inputs->purpose != WAL_INPUTS_CTRC_CENSUS
+		|| inputs->tx.ir_revoked)
+		return false;
+	plan = inputs->ctrc.source_plan;
+	if (plan == NULL || !plan->set_prepared || plan->set_revoked
+		|| index >= plan->replay_count)
+		return false;
+	request = plan->replay[index].request;
+	if (!ClusterColdRecoveryCtrcReplayRequestCurrent(inputs->ctrc.start,
+			inputs->ctrc.work, index, inputs, &request))
+		return false;
+	request.tx_closure_scope = NULL;
+	return inputs_tx_complete_request(inputs, inputs->ctrc.inputs, request, out, out_selected);
+}
+
+static bool
+inputs_ctrc_replays_serial_request(ClusterWalInputsV1 *inputs,
+	const ClusterRecoverySerialRequest *request, ClusterRecoverySerialRequest *out)
+{
+	ClusterRecoveryCtrcSourcePlanV1 *plan = inputs->ctrc.source_plan;
+	uint32 index = CLUSTER_COLD_MAX_PARTICIPANTS;
+
+	if (plan == NULL || !plan->set_prepared || plan->set_revoked)
+		return false;
+	for (uint32 i = 0; i < plan->replay_count; i++) {
+		if (memcmp(&request->duty, &plan->replay[i].request.duty, sizeof(request->duty)) != 0)
+			continue;
+		if (index != CLUSTER_COLD_MAX_PARTICIPANTS)
+			return false;
+		index = i;
+	}
+	return index != CLUSTER_COLD_MAX_PARTICIPANTS
+		&& inputs_ctrc_replays_request(inputs, index, out, NULL);
+}
+
+static bool
 inputs_tx_serial_request(ClusterWalInputsV1 *inputs, ClusterRecoverySerialRequest *out)
 {
 	return inputs_tx_subject_request(inputs, out, NULL);
@@ -1912,7 +1990,11 @@ cluster_wal_inputs_tx_serial_current_v1(ClusterWalInputsV1 *inputs,
 {
 	ClusterRecoverySerialRequest original;
 
-	return request != NULL && inputs_tx_serial_request(inputs, &original)
+	return request != NULL && inputs_owned(inputs)
+		&& (inputs->purpose == WAL_INPUTS_CTRC_CENSUS && inputs->ctrc.source_plan != NULL
+			&& inputs->ctrc.source_plan->set_started
+			? inputs_ctrc_replays_serial_request(inputs, request, &original)
+			: inputs_tx_serial_request(inputs, &original))
 		&& request->mode == original.mode && request->tx_closure_scope == inputs
 		&& memcmp(&request->duty, &original.duty, sizeof(original.duty)) == 0
 		&& memcmp(&request->expected_root_token, &original.expected_root_token, sizeof(original.expected_root_token)) == 0
@@ -2026,7 +2108,8 @@ inputs_ctrc_acquire(ClusterWalInputsV1 *inputs, uint32 subject_index,
 	if (CritSectionCount != 0 || cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	if (provisional == NULL || !inputs_current(inputs)
-		|| inputs->purpose != WAL_INPUTS_CTRC_CENSUS || inputs->tx.ir_revoked)
+		|| inputs->purpose != WAL_INPUTS_CTRC_CENSUS || inputs->tx.ir_revoked
+		|| inputs->ctrc.source_plan->set_started)
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	memcpy(&request, provisional, sizeof(request));
 	if (request.mode != CLUSTER_RECOVERY_SERIAL_TX_CLOSURE || request.tx_closure_scope != NULL)
@@ -2157,6 +2240,247 @@ ClusterControlRootResult
 cluster_wal_inputs_ctrc_replay_release_v1(ClusterWalInputsV1 *inputs, uint32 source_index)
 {
 	return inputs_ctrc_release(inputs, source_index, true);
+}
+
+/* Prepare every original source before taking the first IR. Keep original
+ * source indexes, but acquire by thread so concurrent recoverers cannot take
+ * these same origins in opposite orders. Never resample a started set. */
+static bool
+inputs_ctrc_replays_prepare(ClusterWalInputsV1 *inputs,
+	const ClusterRecoveryTxRetentionV1 *lifetime)
+{
+	ClusterRecoveryCtrcSourcePlanV1 *plan = inputs->ctrc.source_plan;
+
+	plan->set_started = true;
+	if (plan->replay_count == 0 || plan->replay_count > plan->participant_count
+		|| plan->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS)
+		return false;
+	for (uint32 i = 0; i < plan->replay_count; i++) {
+		ClusterRecoverySerialRequest request
+			= ClusterColdRecoveryCtrcReplayRequest(inputs->ctrc.start, inputs->ctrc.work, i);
+		uint32 at = i;
+
+		/* Full observation may retire this very scope on refusal or ERROR.
+		 * Do not touch inputs/plan again before checking its outside locator. */
+		if (!inputs_ctrc_replays_scope_same(lifetime)
+			|| !inputs_current(inputs) || request.mode != CLUSTER_RECOVERY_SERIAL_TX_CLOSURE
+			|| request.tx_closure_scope != NULL)
+			return false;
+		request.tx_closure_scope = inputs;
+		if (!ClusterColdRecoveryCtrcReplayRequestCurrent(inputs->ctrc.start,
+				inputs->ctrc.work, i, inputs, &request))
+			return false;
+		request.tx_closure_scope = NULL;
+		if (!inputs_tx_complete_request(inputs, inputs->ctrc.inputs, request,
+				&plan->replay[i].request, NULL))
+			return false;
+		while (at > 0
+			&& plan->replay[plan->order[at - 1]].request.duty.origin_thread_id
+				> request.duty.origin_thread_id) {
+			plan->order[at] = plan->order[at - 1];
+			at--;
+		}
+		if (at > 0 && plan->replay[plan->order[at - 1]].request.duty.origin_thread_id
+				== request.duty.origin_thread_id)
+			return false;
+		plan->order[at] = i;
+	}
+	plan->set_prepared = true;
+	return true;
+}
+
+/* Check the entire prepared vector before the first or any later grant. */
+static bool
+inputs_ctrc_replays_requests_current(ClusterWalInputsV1 *inputs)
+{
+	ClusterRecoveryCtrcSourcePlanV1 *plan = inputs->ctrc.source_plan;
+
+	if (!inputs_current(inputs) || plan == NULL || !plan->set_prepared
+		|| plan->set_revoked || inputs->tx.ir_revoked)
+		return false;
+	for (uint32 i = 0; i < plan->replay_count; i++) {
+		ClusterRecoverySerialRequest request;
+
+		if (!inputs_ctrc_replays_request(inputs, i, &request, NULL)
+			|| memcmp(&request, &plan->replay[i].request, sizeof(request)) != 0)
+			return false;
+	}
+	return inputs_current(inputs);
+}
+
+/* All actual holders and original sources are required together. The native
+ * IR callback above checks request inputs only, so this cannot recurse. */
+static bool
+inputs_ctrc_replays_current(ClusterWalInputsV1 *inputs)
+{
+	ClusterRecoveryCtrcSourcePlanV1 *plan = inputs->ctrc.source_plan;
+
+	if (!inputs_ctrc_replays_requests_current(inputs))
+		return false;
+	for (uint32 i = 0; i < plan->replay_count; i++) {
+		if (cluster_recovery_serial_tx_revalidate(&plan->replay[i].ir)
+				!= CLUSTER_RECOVERY_SERIAL_CURRENT)
+			return false;
+	}
+	return inputs_current(inputs);
+}
+
+bool
+cluster_wal_inputs_ctrc_replays_authorized_v1(ClusterWalInputsV1 *inputs)
+{
+	ClusterRecoveryCtrcSourcePlanV1 *plan;
+
+	if (inputs == NULL || inputs != active_ctrc_retention.scope
+		|| !inputs_owned(inputs) || inputs->purpose != WAL_INPUTS_CTRC_CENSUS)
+		return false;
+	plan = inputs->ctrc.source_plan;
+	if (plan == NULL || !plan->set_ready || plan->set_revoked)
+		return false;
+	if (!inputs_ctrc_replays_current(inputs)) {
+		plan->set_ready = false;
+		plan->set_revoked = true;
+		return false;
+	}
+	return true;
+}
+
+/* A BUSY/RETRY leaves earlier grants on this same prepared set. No rollback,
+ * new overall deadline or partially usable source view is introduced. */
+static ClusterControlRootResult
+inputs_ctrc_replays_grant(ClusterWalInputsV1 *inputs)
+{
+	ClusterRecoveryCtrcSourcePlanV1 *plan = inputs->ctrc.source_plan;
+	ClusterControlRootResult result;
+
+	if (!inputs_ctrc_replays_requests_current(inputs)) {
+		plan->set_revoked = true;
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	}
+	for (uint32 at = 0; at < plan->replay_count; at++) {
+		ClusterRecoveryCtrcReplayOwnerV1 *owner = &plan->replay[plan->order[at]];
+		ClusterRecoverySerialAcquireResult acquired;
+
+		if (owner->ir.release_uncertain) {
+			plan->set_revoked = true;
+			return CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN;
+		}
+		if (owner->ir.held) {
+			if (cluster_recovery_serial_tx_revalidate(&owner->ir)
+					!= CLUSTER_RECOVERY_SERIAL_CURRENT) {
+				plan->set_revoked = true;
+				return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+			}
+			continue;
+		}
+		acquired = cluster_recovery_serial_acquire(&owner->request, &owner->ir);
+		if (acquired == CLUSTER_RECOVERY_SERIAL_GRANTED)
+			continue;
+		if (owner->ir.held || owner->ir.release_uncertain) {
+			plan->set_revoked = true;
+			return CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN;
+		}
+		if (acquired == CLUSTER_RECOVERY_SERIAL_BUSY || acquired == CLUSTER_RECOVERY_SERIAL_RETRY)
+			return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+		plan->set_revoked = true;
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	}
+	result = cluster_wal_inputs_revalidate_v1(inputs);
+	if (result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE)
+		return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY || !inputs_ctrc_replays_current(inputs)) {
+		plan->set_revoked = true;
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	}
+	plan->set_ready = true;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+ClusterControlRootResult
+cluster_wal_inputs_ctrc_replays_acquire_v1(ClusterWalInputsV1 *inputs)
+{
+	ClusterRecoveryCtrcSourcePlanV1 *plan;
+	ClusterRecoveryTxRetentionV1 lifetime;
+	ClusterControlRootResult result;
+
+	if (CritSectionCount != 0 || cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (inputs == NULL || inputs != active_ctrc_retention.scope
+		|| !inputs_owned(inputs) || inputs->purpose != WAL_INPUTS_CTRC_CENSUS
+		|| inputs->ctrc.source_plan == NULL || inputs->ctrc.serial_prepared
+		|| inputs->tx.ir.held || inputs->tx.ir.release_uncertain || inputs->tx.ir_revoked)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	plan = inputs->ctrc.source_plan;
+	memcpy(&lifetime, &active_ctrc_retention, sizeof(lifetime));
+	if (plan->set_revoked)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if (!inputs_current(inputs)) {
+		plan->set_ready = false;
+		plan->set_revoked = true;
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	}
+	plan->set_ready = false;
+	PG_TRY();
+	{
+		if (!plan->set_started)
+			(void)inputs_ctrc_replays_prepare(inputs, &lifetime);
+		if (!inputs_ctrc_replays_scope_same(&lifetime))
+			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		else if (!plan->set_prepared) {
+			plan->set_revoked = true;
+			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		} else
+			result = inputs_ctrc_replays_grant(inputs);
+	}
+	PG_CATCH();
+	{
+		if (inputs_ctrc_replays_scope_same(&lifetime)) {
+			plan->set_ready = false;
+			plan->set_revoked = true;
+		}
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return result;
+}
+
+/* Exact reverse release does not depend on still-current Start/ROOT/proofs.
+ * On uncertainty leave every remaining native guard and WALR debt intact. */
+static void
+inputs_ctrc_replays_release(ClusterWalInputsV1 *inputs)
+{
+	ClusterRecoveryCtrcSourcePlanV1 *plan = inputs->ctrc.source_plan;
+
+	if (plan == NULL || !plan->set_started)
+		return;
+	plan->set_ready = false;
+	plan->set_revoked = true;
+	/* Preparation cannot grant any IR, including when its callback throws. */
+	if (!plan->set_prepared)
+		return;
+	for (uint32 at = plan->replay_count; at > 0; at--) {
+		uint32 i = plan->order[at - 1];
+		ClusterRecoverySerialGuard *ir = &plan->replay[i].ir;
+
+		if (!ir->held && !ir->release_uncertain)
+			continue;
+		if (cluster_recovery_serial_release(ir) != CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED)
+			ereport(FATAL, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				errmsg("could not release CTRC replay recovery serial owner"),
+				errhint("Confirm recovery-owner cleanup before restarting this instance.")));
+	}
+}
+
+ClusterControlRootResult
+cluster_wal_inputs_ctrc_replays_release_v1(ClusterWalInputsV1 *inputs)
+{
+	if (CritSectionCount != 0 || cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (inputs == NULL || inputs != active_ctrc_retention.scope
+		|| !inputs_owned(inputs) || inputs->purpose != WAL_INPUTS_CTRC_CENSUS
+		|| inputs->ctrc.source_plan == NULL || !inputs->ctrc.source_plan->set_started)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	inputs_ctrc_replays_release(inputs);
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
 static bool
@@ -2452,6 +2776,94 @@ cluster_wal_inputs_ctrc_replay_source_covers_window_v1(
 		&& lower >= original.source.selected.checkpoint.checkpoint_lower_lsn
 		&& upper <= original.source.selected.checkpoint.validated_tail_lsn_exclusive
 		&& memcmp(authority, &original, sizeof(original)) == 0;
+}
+
+/* Check the native incarnation before touching any borrowed scope. Unlike
+ * the single-holder view this purpose exposes no internal IR address. */
+static bool
+inputs_ctrc_replays_locator_current(const ClusterRecoveryCtrcReplaySetSourceV1 *source)
+{
+	return source->scope != NULL && source->scope == active_ctrc_retention.scope
+		&& memcmp(&source->input_owner, &active_ctrc_retention.input_owner,
+			sizeof(source->input_owner)) == 0
+		&& cluster_wal_read_pin_owner_current_v1(&source->input_owner);
+}
+
+static bool
+inputs_ctrc_replays_source(ClusterWalInputsV1 *inputs, uint32 index,
+	ClusterRecoveryCtrcReplaySetSourceV1 *out)
+{
+	ClusterRecoveryCtrcReplaySetSourceV1 source = {0};
+	ClusterRecoverySerialRequest request;
+	const ClusterWalInputV1 *selected;
+
+	if (inputs == NULL || inputs != active_ctrc_retention.scope)
+		return false;
+	source.scope = inputs;
+	memcpy(&source.input_owner, &active_ctrc_retention.input_owner, sizeof(source.input_owner));
+	if (!inputs_ctrc_replays_locator_current(&source)
+		|| !cluster_wal_inputs_ctrc_replays_authorized_v1(inputs)
+		|| !inputs_ctrc_replays_request(inputs, index, &request, &selected))
+		return false;
+	source.ir_request_id = inputs->ctrc.source_plan->replay[index].ir.lock_request.request_id;
+	if (source.ir_request_id == 0)
+		return false;
+	source.work_generation = inputs->ctrc.work_generation;
+	source.source_index = index;
+	source.replay_count = inputs->ctrc.source_plan->replay_count;
+	memcpy(&source.root, &inputs->token, sizeof(source.root));
+	memcpy(&source.selected, selected, sizeof(source.selected));
+	memcpy(&source.replay_token, &request.expected_root_token, sizeof(source.replay_token));
+	if (!inputs_ctrc_replays_locator_current(&source)
+		|| !cluster_wal_inputs_ctrc_replays_authorized_v1(inputs)
+		|| source.ir_request_id != inputs->ctrc.source_plan->replay[index].ir.lock_request.request_id
+		|| source.work_generation != inputs->ctrc.work_generation)
+		return false;
+	memcpy(out, &source, sizeof(source));
+	return true;
+}
+
+ClusterRecoveryCtrcReplaySetSourceV1
+cluster_wal_inputs_ctrc_replays_source_v1(ClusterWalInputsV1 *inputs, uint32 source_index)
+{
+	ClusterRecoveryCtrcReplaySetSourceV1 source = {0};
+	ClusterRecoveryCtrcReplaySetSourceV1 empty = {0};
+
+	if (!inputs_ctrc_replays_source(inputs, source_index, &source))
+		return empty;
+	return source;
+}
+
+bool
+cluster_wal_inputs_ctrc_replays_source_current_v1(const ClusterRecoveryCtrcReplaySetSourceV1 *source)
+{
+	ClusterRecoveryCtrcReplaySetSourceV1 original, expected;
+
+	if (source == NULL)
+		return false;
+	memcpy(&original, source, sizeof(original));
+	return inputs_ctrc_replays_locator_current(&original)
+		&& inputs_ctrc_replays_source(original.scope, original.source_index, &expected)
+		&& memcmp(&original, &expected, sizeof(original)) == 0
+		&& memcmp(source, &original, sizeof(original)) == 0;
+}
+
+bool
+cluster_wal_inputs_ctrc_replays_source_covers_window_v1(
+	const ClusterRecoveryCtrcReplaySetSourceV1 *source, uint16 thread,
+	XLogRecPtr lower, XLogRecPtr upper)
+{
+	ClusterRecoveryCtrcReplaySetSourceV1 original;
+
+	if (source == NULL)
+		return false;
+	memcpy(&original, source, sizeof(original));
+	return lower != InvalidXLogRecPtr && upper > lower
+		&& cluster_wal_inputs_ctrc_replays_source_current_v1(&original)
+		&& thread == original.selected.source.claim.identity.origin_thread_id
+		&& lower >= original.selected.checkpoint.checkpoint_lower_lsn
+		&& upper <= original.selected.checkpoint.validated_tail_lsn_exclusive
+		&& memcmp(source, &original, sizeof(original)) == 0;
 }
 
 bool

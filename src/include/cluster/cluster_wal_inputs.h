@@ -257,6 +257,46 @@ extern bool cluster_wal_inputs_ctrc_replay_source_current_v1(
 extern bool cluster_wal_inputs_ctrc_replay_source_covers_window_v1(
 	const ClusterRecoveryCtrcReplayAuthorityV1 *authority, uint16 thread,
 	XLogRecPtr lower, XLogRecPtr upper);
+/* All original replay origins on the same retained census scope. Native IR
+ * is acquired in thread order; BUSY/RETRY/CF contention retains this exact
+ * prepared set and partial grants, without an overall deadline or partial
+ * source permission. Every original COMPLETE/history input is checked before
+ * the first grant. Full Start preflight may retire the original observation
+ * scope on refusal/ERROR; the caller must obtain its current scope from Start
+ * again rather than release or dereference a retired borrowed pointer.
+ * Confirmed reverse release is terminal for the set. */
+extern ClusterControlRootResult cluster_wal_inputs_ctrc_replays_acquire_v1(
+	ClusterWalInputsV1 *inputs);
+extern bool cluster_wal_inputs_ctrc_replays_authorized_v1(ClusterWalInputsV1 *inputs);
+extern ClusterControlRootResult cluster_wal_inputs_ctrc_replays_release_v1(
+	ClusterWalInputsV1 *inputs);
+/* Distinct set purpose, by value and zero on refusal. No nested guard pointer
+ * is exposed. Bind the original native scope/pin incarnation, this actual IR
+ * request, complete ROOT/selected input and immutable old replay token. Every
+ * current check requires the entire set of actual holders. Retain Start and
+ * the scope. This is neither RR/PAGE authority nor a completion receipt. */
+typedef struct ClusterRecoveryCtrcReplaySetSourceV1 {
+	ClusterWalInputsV1 *scope;
+	ClusterWalReadPinOwnerV1 input_owner;
+	uint64 ir_request_id;
+	uint64 work_generation;
+	uint32 source_index;
+	uint32 replay_count;
+	ClusterControlRootFileToken root;
+	ClusterWalInputV1 selected;
+	ClusterControlRootReadToken replay_token;
+} ClusterRecoveryCtrcReplaySetSourceV1;
+extern ClusterRecoveryCtrcReplaySetSourceV1 cluster_wal_inputs_ctrc_replays_source_v1(
+	ClusterWalInputsV1 *inputs, uint32 source_index);
+/* No I/O/allocation/acquire/cleanup. Locate the native incarnation before
+ * dereferencing a borrowed scope; across I/O also revalidate the original
+ * whole ROOT outside native locks. Old single/TT source views cannot replace
+ * this set purpose, including when their source indexes happen to agree. */
+extern bool cluster_wal_inputs_ctrc_replays_source_current_v1(
+	const ClusterRecoveryCtrcReplaySetSourceV1 *source);
+extern bool cluster_wal_inputs_ctrc_replays_source_covers_window_v1(
+	const ClusterRecoveryCtrcReplaySetSourceV1 *source, uint16 thread,
+	XLogRecPtr lower, XLogRecPtr upper);
 struct ClusterRecoverySerialRequest;
 /* IR purpose callbacks: validate includes original whole ROOT I/O outside CF;
  * current is no-wait and never calls the IR holder revalidation recursively. */

@@ -1413,10 +1413,17 @@ cluster_wal_retention_root_publish_sealed_current(const ClusterWalRootPublishGua
 /* PGRAC: inject the distributed IR owner, not the physical root/WAL reader.
  * The production IR implementation is exercised by recovery_serial tests.
  * Author: SqlRush <sqlrush@gmail.com> */
+/* Default-NULL controlled GES dispatch for simultaneous native-owner tests. */
+static ClusterRecoverySerialAcquireResult (*test_ctrc_set_acquire_hook)(
+	const ClusterRecoverySerialRequest *, ClusterRecoverySerialGuard *);
+static ClusterRecoverySerialReleaseResult (*test_ctrc_set_release_hook)(ClusterRecoverySerialGuard *);
+
 ClusterRecoverySerialAcquireResult
 cluster_recovery_serial_acquire(const ClusterRecoverySerialRequest *request,
 								ClusterRecoverySerialGuard *guard)
 {
+	if (test_ctrc_set_acquire_hook != NULL)
+		return test_ctrc_set_acquire_hook(request, guard);
 	UT_ASSERT_EQ(test_actual_cf, NoLock);
 	if (request->mode == CLUSTER_RECOVERY_SERIAL_INPUT_SEAL) {
 		test_input_acquires++;
@@ -1509,6 +1516,8 @@ cluster_recovery_serial_tx_revalidate(ClusterRecoverySerialGuard *guard)
 ClusterRecoverySerialReleaseResult
 cluster_recovery_serial_release(ClusterRecoverySerialGuard *guard)
 {
+	if (test_ctrc_set_release_hook != NULL)
+		return test_ctrc_set_release_hook(guard);
 	if (guard->mode == CLUSTER_RECOVERY_SERIAL_INPUT_SEAL)
 		test_input_releases++;
 	test_input_release_order = ++test_order_seq;
@@ -26009,6 +26018,7 @@ UT_TEST(test_tx_inputs_parent_subject_and_wait_revalidation)
 #include "test_cluster_control_ctrc_ir.inc"
 #include "test_cluster_control_ctrc_replay_ir.inc"
 #include "test_cluster_control_ctrc_source_plan.inc"
+#include "test_cluster_control_ctrc_replay_set.inc"
 #include "test_cluster_control_ctrc_stable.inc"
 
 /*
@@ -26236,6 +26246,21 @@ main(int argc, char **argv)
 		UT_RUN(test_ctrc_stable_new_native_grant_cannot_revive_old_proof);
 		UT_RUN(test_ctrc_stable_cf_wait_and_changed_root_keep_original_owners);
 		UT_RUN(test_ctrc_stable_late_scope_loss_and_error_never_publish_proof);
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_CTRC_REPLAY_SET") != NULL) {
+		UT_PLAN(10);
+		UT_RUN(test_ctrc_set_holds_unordered_original_origins_without_tt_subjects);
+		UT_RUN(test_ctrc_set_partial_native_wait_withholds_every_source_view);
+		UT_RUN(test_ctrc_set_postgrant_cf_wait_keeps_all_original_holders);
+		UT_RUN(test_ctrc_set_validates_every_source_before_first_native_grant);
+		UT_RUN(test_ctrc_set_late_original_loss_never_discards_native_cleanup_debt);
+		UT_RUN(test_ctrc_set_source_rejects_every_changed_byte_and_other_window);
+		UT_RUN(test_ctrc_set_reverse_uncertain_release_keeps_remaining_ir_and_walr);
+		UT_RUN(test_ctrc_set_native_error_keeps_exact_holders_and_original_purpose);
+		UT_RUN(test_ctrc_set_full_preflight_refusal_can_retire_original_scope);
+		UT_RUN(test_ctrc_set_full_preflight_error_can_retire_original_scope);
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
@@ -26507,7 +26532,18 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(564);
+	UT_PLAN(574);
+	UT_RUN(test_ctrc_set_holds_unordered_original_origins_without_tt_subjects);
+	UT_RUN(test_ctrc_set_partial_native_wait_withholds_every_source_view);
+	UT_RUN(test_ctrc_set_postgrant_cf_wait_keeps_all_original_holders);
+	UT_RUN(test_ctrc_set_validates_every_source_before_first_native_grant);
+	UT_RUN(test_ctrc_set_late_original_loss_never_discards_native_cleanup_debt);
+	UT_RUN(test_ctrc_set_source_rejects_every_changed_byte_and_other_window);
+	UT_RUN(test_ctrc_set_reverse_uncertain_release_keeps_remaining_ir_and_walr);
+	UT_RUN(test_ctrc_set_native_error_keeps_exact_holders_and_original_purpose);
+	UT_RUN(test_ctrc_set_full_preflight_refusal_can_retire_original_scope);
+	UT_RUN(test_ctrc_set_full_preflight_error_can_retire_original_scope);
+
 	UT_RUN(test_ctrc_source_plan_preserves_unchanged_local_scope);
 	UT_RUN(test_ctrc_source_plan_rejects_every_source_and_participant_byte);
 	UT_RUN(test_ctrc_source_plan_refuses_all_later_count_changes);
