@@ -2210,16 +2210,16 @@ test_cluster_heap_ctrc_participant.inc: $(top_srcdir)/src/backend/cluster/cluste
 	mv $@.tmp $@
 
 # Original receipt apply/cancel bookkeeping and exact-handle/target checks.
-# Original complete page-owner stamp/WAL and post-unlock discharge closure.
+# Original complete page-owner sort/group, stamp/WAL and post-unlock discharge closure.
 test_cluster_heap_itl_finish_discharge.inc: $(top_srcdir)/src/backend/cluster/cluster_itl_touch.c Makefile
-	@awk 'BEGIN { pattern = "^(itl_finish_expected_target|itl_finish_discharge_batch|itl_finish_stamp_page|itl_finish_flush_batch)\\(" } \
+	@awk 'BEGIN { pattern = "^(itl_finish_expected_target|itl_finish_discharge_batch|itl_finish_stamp_page|itl_finish_flush_batch|itl_touch_record_cmp|itl_finish_range)\\(" } \
 	     /^typedef struct (ItlFinishCtx|ItlFinishPageRun|ItlFinishBatchCtx|ItlFinishDischarge) \{/ { structure=1; structures++ } \
 	     structure { print; if (/^} (ItlFinishCtx|ItlFinishPageRun|ItlFinishBatchCtx|ItlFinishDischarge);/) structure=0; next } \
 	     /^#define CLUSTER_ITL_FINISH_MAX_DISCHARGES / { print; getline; print; constants++; next } \
 	     $$0 ~ pattern { name=$$0; sub(/\(.*/, "", name); if (seen[name]++) exit 1; order[++found]=name; ret=prev; sub(/^static[ \t]+/, "", ret); returns[name]="static " ret; emit=1; head=1 } \
 	     emit { body[name]=body[name] $$0 "\n"; if (/^\{/) head=0; else if (head) declaration[name]=declaration[name] $$0 "\n" } \
 	     emit && /^}/ { emit=0; done++ } { prev=$$0 } \
-	     END { if (found != 4 || done != 4 || emit || structure || structures != 4 || constants != 1) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $< > $@.tmp
+	     END { if (found != 6 || done != 6 || emit || structure || structures != 4 || constants != 1) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_heap_ctrc_terminal.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
