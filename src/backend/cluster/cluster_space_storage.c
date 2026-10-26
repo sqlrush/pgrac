@@ -129,6 +129,16 @@ space_identity_key_matches(const ClusterSpaceIdentityKey *a, const ClusterSpaceI
 }
 
 static bool
+space_namespace_source_matches(const ClusterWalSourceRef *a, const ClusterWalSourceRef *b)
+{
+	return cluster_control_root_identity_equal(&a->claim.identity, &b->claim.identity)
+		   && a->claim.database_incarnation == b->claim.database_incarnation
+		   && a->claim.max_config_generation == b->claim.max_config_generation
+		   && memcmp(a->claim.claim_sha256, b->claim.claim_sha256, sizeof(a->claim.claim_sha256)) == 0
+		   && a->timeline == b->timeline;
+}
+
+static bool
 space_namespace_capture(RelFileLocator locator, bool redo, ClusterSpaceIdentityKey *out,
 	uint16 *thread, ClusterWalSourceRef *source)
 {
@@ -365,7 +375,8 @@ cluster_space_relation_identity_capture_v1(Relation relation, ClusterSpaceIdenti
 	memset(&candidate, 0, sizeof(candidate));
 	candidate.relid = RelationGetRelid(relation);
 	locator = relation->rd_locator;
-	if (!cluster_space_relation_get_identity(relation, &candidate.identity))
+	if (!cluster_wal_thread_current_v2_ref(&candidate.namespace_source)
+		|| !cluster_space_relation_get_identity(relation, &candidate.identity))
 		return false;
 	candidate.invalidations = space_identity_invalidations;
 	if (!RelFileLocatorEquals(locator, candidate.identity.key.locator)
@@ -380,6 +391,7 @@ cluster_space_relation_identity_current_v1(Relation relation,
 										 const ClusterSpaceIdentityObservationV1 *expected)
 {
 	SpaceIdentityCacheEntry *entry;
+	ClusterWalSourceRef current;
 
 	if (relation == NULL || relation->rd_rel == NULL || !relation->rd_isvalid
 		|| expected == NULL || !OidIsValid(expected->relid)
@@ -388,6 +400,12 @@ cluster_space_relation_identity_current_v1(Relation relation,
 		|| expected->identity.state != CLUSTER_SPACE_IDENTITY_LIVE
 		|| expected->invalidations == UINT64_MAX
 		|| expected->invalidations != space_identity_invalidations || space_identity_cache == NULL)
+		return false;
+	if (!cluster_wal_thread_current_v2_ref(&current)
+		|| !space_namespace_source_matches(&current, &expected->namespace_source)
+		|| current.claim.identity.system_identifier != expected->identity.key.system_identifier
+		|| current.claim.database_incarnation != expected->identity.key.database_incarnation
+		|| memcmp(current.claim.identity.storage_uuid, expected->identity.key.storage_uuid, 16) != 0)
 		return false;
 	entry = hash_search(space_identity_cache, &expected->relid, HASH_FIND, NULL);
 	return entry != NULL && space_identity_key_matches(&entry->identity.key, &expected->identity.key)

@@ -101,21 +101,25 @@ extern bool cluster_space_cold_install_v1(const ClusterSpaceIdentityKey *key,
  * existing reliable invalidation barrier before releasing lifecycle locks. */
 extern bool cluster_space_relation_get_identity(Relation relation, ClusterSpaceIdentity *out);
 
-/* Operation-local copy of the native cache identity, not lifecycle, namespace,
- * retention or publication authority. Retain the original relation lock and
- * invalidation boundary. No hash/SMgr pointer is borrowed by this value. */
+/* Operation-local copy of the native cache identity and published namespace
+ * reference, not lifecycle, retention or publication authority. Retain the
+ * original relation lock and invalidation boundary. No hash/SMgr pointer is
+ * borrowed by this value. */
 typedef struct ClusterSpaceIdentityObservationV1 {
 	ClusterSpaceIdentity identity;
+	ClusterWalSourceRef namespace_source;
 	uint64 invalidations;
 	Oid relid;
 } ClusterSpaceIdentityObservationV1;
 
-/* Before content locks, through the original cache/read path. False/ERROR
- * leaves a zero observation; this does not create a missing SPACE identity. */
+/* Before content locks, sample the published namespace before the original
+ * cache/read path. False/ERROR leaves a zero observation; this does not create
+ * a missing SPACE identity. */
 extern bool cluster_space_relation_identity_capture_v1(Relation relation,
 														 ClusterSpaceIdentityObservationV1 *out);
-/* Local cache/relcache checks only; no namespace service, lock, I/O or cache
- * population. Refill after invalidation never revives the old observation. */
+/* Local published-reference/cache/relcache checks only; no namespace service,
+ * lock, I/O or cache population. Refill after invalidation never revives the
+ * old observation. This reference does not qualify a writer or publication. */
 extern bool cluster_space_relation_identity_current_v1(
 	Relation relation, const ClusterSpaceIdentityObservationV1 *expected);
 

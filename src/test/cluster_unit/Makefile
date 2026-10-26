@@ -2971,6 +2971,7 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_vacuum_admitted_phase.inc \
 		test_cluster_vacuum_proof_owner.inc \
 		test_cluster_vacuum_resident_recheck.inc \
+		test_cluster_vacuum_recent_pin.inc \
 		test_cluster_vacuum_resident_release.inc \
 		test_cluster_freeze_writer_context.inc $(CLUSTER_RESOURCE_X_IDENTITY_O) test_cluster_heap_maintenance_policy.inc unit_test.h \
 		test_cluster_heap_borrowed_pin.inc $(top_srcdir)/src/include/storage/bufmgr.h \
@@ -3340,7 +3341,12 @@ test_cluster_space_fsm_product.o: $(top_srcdir)/src/backend/storage/freespace/fs
 test_cluster_space_identity_observation_available.inc: $(top_srcdir)/src/backend/cluster/cluster_space_storage.c Makefile
 	@awk '/^cluster_space_relation_identity_capture_v1\(/ { print "#define FIXTURE_HAS_SPACE_IDENTITY_OBSERVATION 1"; found++ } END { if (found > 1) exit 1 }' $< > $@
 
+test_cluster_space_namespace_identity_equal.inc: $(top_srcdir)/src/backend/cluster/cluster_control_root.c Makefile
+	@awk '/^cluster_control_root_identity_equal\(/ { print "bool"; emit=1; found++ } \
+		emit { print } emit && /^}$$/ { emit=0 } END { if (emit || found != 1) exit 1 }' $< > $@
+
 test_cluster_space_cache: test_cluster_space_cache.c unit_test.h test_cluster_space_hint_owners.inc \
+		test_cluster_space_namespace_identity_equal.inc \
 		test_cluster_space_identity_observation_available.inc $(top_srcdir)/src/include/cluster/cluster_space_storage.h \
 		test_cluster_space_hint_write_gate.inc $(top_srcdir)/src/include/cluster/cluster_pcm_x_bufmgr.h \
 		test_cluster_space_xmax_hint.inc \
@@ -6400,6 +6406,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_vm_repair_versioned.inc
 	rm -f test_cluster_sf_cap_cut_available.inc
 	rm -f test_cluster_space_identity_observation_available.inc
+	rm -f test_cluster_space_namespace_identity_equal.inc
 	rm -f test_cluster_vm_snapshot_read.inc
 	rm -f test_cluster_vm_native_chain.inc
 	rm -f test_cluster_vm_buffer_matches.inc test_cluster_vm_repair_clear.inc test_cluster_vm_repair_missing_heap.inc test_cluster_vm_repair_lpdead.inc
@@ -12601,6 +12608,14 @@ test_cluster_vacuum_resident_recheck.inc: $(top_srcdir)/src/backend/access/heap/
 	     emit { print } /^}/ { emit=0 } END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Original recent-resident lookup, first-pin owner and release API.
+test_cluster_vacuum_recent_pin.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^ReadRecentBuffer\(/ { print "static bool"; emit=1; found++ } \
+	     /^(PinBuffer_Locked|ReleaseBuffer)\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 3 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+
 # Original read/hint local-unlock/unpin pairs; mutation already comes from
 # test_cluster_freeze_writer_context.inc, with no duplicate definition.
 test_cluster_vacuum_resident_release.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
@@ -12612,6 +12627,7 @@ test_cluster_vacuum_resident_release.inc: $(top_srcdir)/src/backend/storage/buff
 clean-vacuum-proof-owner:
 	rm -f test_cluster_vacuum_proof_owner.inc test_cluster_vacuum_proof_owner.inc.tmp
 	rm -f test_cluster_vacuum_resident_recheck.inc test_cluster_vacuum_resident_recheck.inc.tmp
+	rm -f test_cluster_vacuum_recent_pin.inc test_cluster_vacuum_recent_pin.inc.tmp
 	rm -f test_cluster_vacuum_resident_release.inc test_cluster_vacuum_resident_release.inc.tmp
 
 clean distclean maintainer-clean: clean-vacuum-proof-owner
