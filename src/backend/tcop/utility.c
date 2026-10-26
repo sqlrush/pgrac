@@ -285,7 +285,7 @@ storage_preflight:
 		CheckOwnedObjectsStorageDrop((DropOwnedStmt *)statement, isTopLevel);
 }
 
-/* PGRAC: complete the original top binding before CREATE or TRUNCATE reaches
+/* PGRAC: complete the original top binding before these catalog writes reach
  * triggers, catalog relations or DDL locks. Other utility callers keep their
  * existing paths. Author: SqlRush <sqlrush@gmail.com> */
 static void
@@ -299,10 +299,16 @@ PreflightClusterSharedCatalogWrite(Node *statement)
 		|| (!IsA(statement, CreateStmt) && !IsA(statement, CreateTableAsStmt)
 			&& !IsA(statement, CreateSchemaStmt) && !IsA(statement, CreateSeqStmt)
 			&& !IsA(statement, IndexStmt) && !IsA(statement, ViewStmt)
+			&& !IsA(statement, RenameStmt) && !IsA(statement, AlterObjectSchemaStmt)
 			&& !IsA(statement, TruncateStmt)))
 		return;
 
-	action = IsA(statement, TruncateStmt) ? "truncation" : "creation";
+	if (IsA(statement, TruncateStmt))
+		action = "truncation";
+	else if (IsA(statement, RenameStmt) || IsA(statement, AlterObjectSchemaStmt))
+		action = "alteration";
+	else
+		action = "creation";
 	if (IsSubTransaction())
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("shared catalog %s does not support subtransactions", action)));
