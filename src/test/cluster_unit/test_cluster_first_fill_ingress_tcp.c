@@ -349,6 +349,7 @@ UT_TEST(socket_close_or_unknown_session_does_not_erase_master_responsibility)
 	UT_ASSERT_EQ(ingress_admitted + ingress_cancelled, 0);
 }
 
+#ifndef FIRST_FILL_TCP_FIXTURE_ONLY
 int
 main(void)
 {
@@ -365,3 +366,4 @@ main(void)
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
+#endif

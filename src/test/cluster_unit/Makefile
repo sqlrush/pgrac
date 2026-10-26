@@ -9855,6 +9855,15 @@ test_cluster_first_fill_send: test_cluster_first_fill_send.c test_cluster_pcm_ow
 		$< $(CLUSTER_PCM_OWN_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 TESTS += test_cluster_first_fill_seal
+TESTS += test_cluster_first_fill_holder_ingress
+all: test_cluster_first_fill_holder_ingress
+test_cluster_first_fill_holder_ingress: test_cluster_first_fill_holder_ingress.c \
+		test_cluster_first_fill_send.c test_cluster_pcm_own test_cluster_pcm_own.c \
+		test_cluster_first_fill_bufmgr.inc test_cluster_first_fill_send.inc unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_gcs_block.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DBUFMGR_SOURCE_PATH='"$(top_srcdir)/src/backend/storage/buffer/bufmgr.c"' \
+		$< $(CLUSTER_PCM_OWN_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 all: test_cluster_first_fill_seal
 test_cluster_first_fill_seal: test_cluster_first_fill_seal.c test_cluster_first_fill_send.c \
 		test_cluster_pcm_own test_cluster_pcm_own.c test_cluster_first_fill_bufmgr.inc \
@@ -9863,6 +9872,34 @@ test_cluster_first_fill_seal: test_cluster_first_fill_seal.c test_cluster_first_
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-DBUFMGR_SOURCE_PATH='"$(top_srcdir)/src/backend/storage/buffer/bufmgr.c"' \
 		$< $(CLUSTER_PCM_OWN_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# Real TCP carrier progress with the production bounded holder ingress.
+TESTS += test_cluster_first_fill_holder_ingress_tcp
+all: test_cluster_first_fill_holder_ingress_tcp
+test_cluster_first_fill_holder_ingress_tcp.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^typedef struct GcsFirstFillHolderPark/ { emit=1; n++ } \
+	     emit { print } /^} GcsFirstFillHolderMasterState;/ { emit=0; done++ } \
+	     END { if (n != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	awk '/^gcs_first_fill_holder_master_state\(/ { print "static GcsFirstFillHolderMasterState"; emit=1; n++ } \
+	     /^gcs_first_fill_same_forward\(/ { print "static bool"; emit=1; n++ } \
+	     /^gcs_first_fill_holder_reserve\(/ { print "static GcsFirstFillHolderPark *"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 3 || emit) exit 1 }' $< >> $@.tmp
+	awk '/^\/\* GCS first-fill holder ingress begin/ { emit=1; n++ } \
+	     emit { print } /^\/\* GCS first-fill holder ingress end/ { emit=0; done++ } \
+	     END { if (n != 1 || done != 1 || emit) exit 1 }' $< >> $@.tmp
+	mv $@.tmp $@
+test_cluster_first_fill_holder_ingress_tcp: test_cluster_first_fill_holder_ingress_tcp.c \
+		test_cluster_first_fill_ingress_tcp.c test_cluster_first_fill_ingress.inc \
+		test_cluster_first_fill_holder_ingress_tcp.inc test_cluster_ic_tier1_partial.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_ic_tier1.c $(CLUSTER_VERSION_O) \
+		$(top_srcdir)/src/include/cluster/cluster_gcs_block.h \
+		$(top_srcdir)/src/include/cluster/cluster_pcm_read_source.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+clean distclean maintainer-clean: clean-first-fill-holder-ingress
+.PHONY: clean-first-fill-holder-ingress
+clean-first-fill-holder-ingress:
+	rm -f test_cluster_first_fill_holder_ingress_tcp.inc test_cluster_first_fill_holder_ingress_tcp.inc.tmp
 
 # Native first-fill retirement and the real invalidate/transport handoff owner.
 TESTS += test_cluster_first_fill_retire

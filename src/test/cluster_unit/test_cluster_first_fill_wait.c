@@ -91,6 +91,8 @@ static void gcs_block_forward_reply_immediate_deny(const GcsBlockForwardPayload 
 	UT_ASSERT_EQ(fwd->master_node, 2);
 }
 #define GCS_FIRST_FILL_PARK_MAX 64
+#define MemoryContextAllocZero(context, n) calloc(1, (n))
+#define pfree free
 #define cluster_lms_workers 2
 #define gcs_block_send_envelope_or_loopback(...) (pg_re_throw(), CLUSTER_IC_SEND_HARD_ERROR)
 #define ClusterGcsBlock ((void *)1)
@@ -113,6 +115,8 @@ static void gcs_block_forward_reply_immediate_deny(const GcsBlockForwardPayload 
 #define MyLatch ((Latch *)1)
 #define ereport(level, ...) pg_re_throw()
 #include "test_cluster_first_fill_holder.inc"
+#undef pfree
+#undef MemoryContextAllocZero
 #undef gcs_block_send_envelope_or_loopback
 #undef cluster_lms_workers
 #undef ereport
