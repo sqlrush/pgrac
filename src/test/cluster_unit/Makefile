@@ -3482,9 +3482,21 @@ test_cluster_recovery_native_inputs: $(top_srcdir)/src/include/access/twophase_r
 test_cluster_recovery_native_inputs: $(top_srcdir)/src/backend/cluster/cluster_recovery_census.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_census.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_page_roots.h
+test_cluster_recovery_episode_clog.o: test_cluster_recovery_episode_clog.c \
+        test_cluster_recovery_episode_clog.h test_cluster_recovery_episode_clog_namespace.h \
+        test_cluster_clog_recovery.c test_cluster_clog_relmap_participant.inc unit_test.h \
+        $(top_srcdir)/src/backend/access/transam/clog.c \
+        $(top_srcdir)/src/backend/access/transam/slru.c \
+        $(top_srcdir)/src/include/access/clog.h \
+        $(top_srcdir)/src/include/cluster/cluster_wal_inputs.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -Werror -c $< -o $@
+
+test_cluster_recovery_native_inputs: test_cluster_recovery_episode_native_clog.inc \
+        test_cluster_recovery_episode_clog.h test_cluster_recovery_episode_clog.o
 test_cluster_recovery_native_inputs: test_cluster_recovery_episode_history.inc \
 		test_cluster_recovery_relmap_fold.inc test_cluster_recovery_episode_pending.inc \
-		test_cluster_recovery_episode_base.inc $(top_srcdir)/src/include/access/clog.h \
+		test_cluster_recovery_episode_base.inc test_cluster_recovery_episode_sources.inc \
+		$(top_srcdir)/src/include/access/clog.h \
 		$(top_srcdir)/src/include/common/cluster_relmap_v2.h
 test_cluster_recovery_native_inputs: test_cluster_recovery_manifest_inputs.inc test_cluster_recovery_terminal_inputs.inc test_cluster_recovery_tt_terminal_inputs.inc test_cluster_recovery_page_roots_inputs.inc test_cluster_recovery_page_wal_inputs.inc
 test_cluster_recovery_native_inputs: test_cluster_recovery_wal_sources.inc
@@ -3536,7 +3548,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_ctrc_
 		$(top_builddir)/src/backend/cluster/cluster_recovery_native_scan.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_multixact_join.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_xact_join.o \
-		$(if $(filter test_cluster_recovery_native_inputs,$@),$(top_builddir)/src/backend/cluster/cluster_recovery_reference_graph.o $(top_builddir)/src/backend/cluster/cluster_recovery_undo_store.o $(top_builddir)/src/backend/cluster/cluster_recovery_undo_scan.o $(RECOVERY_CENSUS_TEST_OBJS)) \
+		$(if $(filter test_cluster_recovery_native_inputs,$@),test_cluster_recovery_episode_clog.o $(top_builddir)/src/backend/cluster/cluster_recovery_reference_graph.o $(top_builddir)/src/backend/cluster/cluster_recovery_undo_store.o $(top_builddir)/src/backend/cluster/cluster_recovery_undo_scan.o $(RECOVERY_CENSUS_TEST_OBJS)) \
 		$(top_builddir)/src/backend/cluster/cluster_thread_recovery_finalize.o \
 		$(WAL_INPUT_CONTRIBUTION_TEST_OBJS) \
 		test_cluster_page_stable_ctrc.o \
@@ -5071,6 +5083,7 @@ check_r11_source_removal_census:
 # Standard PG targets
 # ----------
 clean distclean maintainer-clean:
+	rm -f test_cluster_recovery_episode_clog.o
 	rm -f test_cluster_external_fence_duty.inc
 	rm -f test_cluster_data_sync_policy.inc test_cluster_sync_providers.inc \
 		test_cluster_sync_dispatch.inc test_cluster_sync_smgr.inc

@@ -1034,7 +1034,53 @@ UT_TEST(test_ctrc_inventory_keeps_original_local_cut_and_native_terminal_bytes)
 #include "test_cluster_recovery_episode_history.inc"
 #include "test_cluster_recovery_relmap_fold.inc"
 #include "test_cluster_recovery_episode_pending.inc"
+#include "test_cluster_recovery_episode_clog.h"
+static size_t episode_controlled_clog_bytes(void);
+static bool episode_controlled_clog_read(const ClusterRecoveryRelmapSourceV1 *source,
+	uint64 full, ClusterRelmapClogBaseV1 *out, ClusterRelmapClogBaseHandleV1 **held);
+static void episode_controlled_clog_release(ClusterRelmapClogBaseHandleV1 **held);
+#define cluster_clog_relmap_base_custody_bytes_v1 episode_controlled_clog_bytes
+#define cluster_clog_relmap_base_read_v1 episode_controlled_clog_read
+#define cluster_clog_relmap_base_release_v1 episode_controlled_clog_release
 #include "test_cluster_recovery_episode_base.inc"
+#undef cluster_clog_relmap_base_custody_bytes_v1
+#undef cluster_clog_relmap_base_read_v1
+#undef cluster_clog_relmap_base_release_v1
+
+static bool episode_native_clog;
+
+size_t
+cluster_clog_relmap_base_custody_bytes_v1(void)
+{
+	return episode_native_clog ? test_episode_native_clog_bytes()
+		: episode_controlled_clog_bytes();
+}
+
+bool
+cluster_clog_relmap_base_read_v1(const ClusterRecoveryRelmapSourceV1 *source,
+	uint64 full, ClusterRelmapClogBaseV1 *out, ClusterRelmapClogBaseHandleV1 **held)
+{
+	if (episode_native_clog) {
+		void *native = *held;
+		bool ok = test_episode_native_clog_read(source, full, out, &native);
+		*held = native;
+		return ok;
+	}
+	return episode_controlled_clog_read(source, full, out, held);
+}
+
+void
+cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **held)
+{
+	if (episode_native_clog) {
+		void *native = *held;
+		test_episode_native_clog_release(&native);
+		*held = native;
+	} else
+		episode_controlled_clog_release(held);
+}
+#include "test_cluster_recovery_episode_sources.inc"
+#include "test_cluster_recovery_episode_native_clog.inc"
 
 
 int
@@ -1115,7 +1161,10 @@ main(int argc, char **argv)
 		UT_RUN(test_episode_base_checks_original_page_bytes_before_and_after_native_read);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(140);
+	UT_PLAN(147);
+	UT_RUN(test_episode_native_clog_keeps_real_fd_and_all_status_observations);
+	UT_RUN(test_episode_native_clog_inode_and_neighbor_change_revoke_same_episode);
+	UT_RUN(test_episode_native_clog_error_retains_fd_and_original_protection);
 	UT_RUN(test_page_graph_original_full_cuts_order_cross_thread_page_edges);
 	UT_RUN(test_page_graph_no_page_sources_and_original_native_cursor_remain);
 	UT_RUN(test_page_graph_keeps_explicit_empty_and_historical_generations);
@@ -1257,6 +1306,10 @@ main(int argc, char **argv)
 	UT_RUN(test_episode_base_output_lock_and_budget_preconditions_do_not_poison);
 	UT_RUN(test_episode_base_preserves_original_borrowed_page_storage);
 	UT_RUN(test_episode_base_checks_original_page_bytes_before_and_after_native_read);
+	UT_RUN(test_episode_sources_keep_complete_zero_page_generations_by_value);
+	UT_RUN(test_episode_sources_base_keeps_full_tail_after_native_map);
+	UT_RUN(test_episode_sources_reject_borrowed_output_without_changing_baseline);
+	UT_RUN(test_episode_sources_sibling_metadata_drift_revokes_complete_view);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
