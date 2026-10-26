@@ -39,6 +39,7 @@ include $(top_builddir)/src/Makefile.global
 ifeq ($(enable_pgrac_cluster), yes)
 OBJS = \
 	cluster.o \
+	cluster_savepoint.o \
 	cluster_catalog_trace.o \
 	cluster_initdb_base.o \
 	cluster_initdb_config.o \

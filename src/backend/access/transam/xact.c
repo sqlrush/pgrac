@@ -188,6 +188,7 @@
 #include "cluster/cluster_itl_touch.h" /* PGRAC: spec-3.4a D6 pre-commit/abort */
 #include "cluster/cluster_tt_2pc.h"	 /* PGRAC: spec-3.15 PREPARE record */
 #include "cluster/cluster_subtrans.h"  /* PGRAC: spec-3.5 D7 subxact lifecycle hook */
+#include "cluster/cluster_savepoint.h" /* PGRAC: savepoint frame/name lifecycle */
 #include "cluster/cluster_undo_record_api.h"  /* PGRAC: undo xact lifecycle */
 #include "cluster/cluster_touched_peers.h"	  /* PGRAC: spec-5.14 D1 per-tx reset */
 #include "cluster/cluster_visibility_resolve.h" /* PGRAC: spec-6.14 D8 depth reset */
@@ -4236,6 +4237,10 @@ CommitTransactionCommand(void)
 				s->name = name;
 				s->savepointLevel = savepointLevel;
 
+#ifdef USE_PGRAC_CLUSTER
+				cluster_savepoint_define(s->subTransactionId, &s->name, s->savepointLevel);
+#endif
+
 				/* This is the same as TBLOCK_SUBBEGIN case */
 				Assert(s->blockState == TBLOCK_SUBBEGIN);
 				StartSubTransaction();
@@ -4263,6 +4268,10 @@ CommitTransactionCommand(void)
 				s = CurrentTransactionState;	/* changed by push */
 				s->name = name;
 				s->savepointLevel = savepointLevel;
+
+#ifdef USE_PGRAC_CLUSTER
+				cluster_savepoint_define(s->subTransactionId, &s->name, s->savepointLevel);
+#endif
 
 				/* This is the same as TBLOCK_SUBBEGIN case */
 				Assert(s->blockState == TBLOCK_SUBBEGIN);
@@ -5220,7 +5229,12 @@ DefineSavepoint(const char *name)
 			 * in TopTransactionContext.
 			 */
 			if (name)
+			{
 				s->name = MemoryContextStrdup(TopTransactionContext, name);
+#ifdef USE_PGRAC_CLUSTER
+				cluster_savepoint_define(s->subTransactionId, &s->name, s->savepointLevel);
+#endif
+			}
 			break;
 
 			/*
@@ -6332,6 +6346,9 @@ PushTransaction(void)
 	 * assume that it necessarily has a transaction context, resource owner,
 	 * or XID.
 	 */
+#ifdef USE_PGRAC_CLUSTER
+	cluster_savepoint_start(s->subTransactionId);
+#endif
 }
 
 /*
@@ -6352,6 +6369,11 @@ PopTransaction(void)
 
 	if (s->parent == NULL)
 		elog(FATAL, "PopTransaction with no parent");
+
+#ifdef USE_PGRAC_CLUSTER
+	/* Retire metadata before freeing the native name slot, for every exit. */
+	cluster_savepoint_forget(s->subTransactionId);
+#endif
 
 	CurrentTransactionState = s->parent;
 

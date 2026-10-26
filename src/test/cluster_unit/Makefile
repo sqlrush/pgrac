@@ -250,6 +250,8 @@ CLUSTER_ELOG_O = $(top_builddir)/src/backend/cluster/cluster_elog.o
 # Include path for unit_test.h (this dir) and cluster headers.
 override CPPFLAGS := -I. -I$(top_srcdir)/src/include $(CPPFLAGS)
 
+TESTS += test_cluster_savepoint
+
 
 # ----------
 # Default target: build all tests
@@ -257,6 +259,12 @@ override CPPFLAGS := -I. -I$(top_srcdir)/src/include $(CPPFLAGS)
 TESTS += test_cluster_space_lazy_fork
 
 all: $(TESTS) check_resource_x_send_c1
+
+test_cluster_savepoint_native.inc: $(top_srcdir)/src/backend/access/transam/xact.c $(srcdir)/extract_cluster_savepoint_xact.py Makefile
+	python3 $(srcdir)/extract_cluster_savepoint_xact.py $< $@
+
+test_cluster_savepoint: test_cluster_savepoint.c test_cluster_savepoint_native.inc unit_test.h $(top_srcdir)/src/backend/cluster/cluster_savepoint.c $(top_srcdir)/src/include/cluster/cluster_savepoint.h $(top_builddir)/src/port/libpgport_srv.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(top_builddir)/src/port/libpgport_srv.a $(LDFLAGS) -o $@
 
 cluster_unit_port_stubs.o: cluster_unit_port_stubs.c
 
@@ -5375,7 +5383,7 @@ test_cluster_thread_orchestrator: test_cluster_thread_orchestrator.c unit_test.h
 # judge cluster_write_fence_decide (a header inline -- no cluster object needed;
 # only libpgcommon/libpgport for the unit harness).  The token region + qvotec
 # refresh + hot-path gating land as cluster_tap (D8).
-SIMPLE_TESTS := $(filter-out test_cluster_cold_xid_native_completion test_cluster_same_host_fence test_cluster_same_host_provider,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_savepoint test_cluster_cold_xid_native_completion test_cluster_same_host_fence test_cluster_same_host_provider,$(SIMPLE_TESTS))
 
 test_cluster_write_fence: test_cluster_write_fence.c unit_test.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
@@ -11164,8 +11172,8 @@ test_cluster_port_runtime: test_cluster_port_runtime.c unit_test.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # Append after the source prerequisites so recipes using $< still compile
-# their test source. Changes to the logging boundary must relink every test.
-$(TESTS): cluster_unit_port_stubs.o
+# their test source. The savepoint fixture supplies its own error boundary.
+$(filter-out test_cluster_savepoint,$(TESTS)): cluster_unit_port_stubs.o
 
 # PGRAC: value-owned recovery carriers require consistent test/product layouts.
 # Author: SqlRush <sqlrush@gmail.com>
