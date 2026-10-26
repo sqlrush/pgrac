@@ -279,22 +279,25 @@ storage_preflight:
 		CheckOwnedObjectsStorageDrop((DropOwnedStmt *)statement, isTopLevel);
 }
 
-/* PGRAC: reserve the original top-level binding before CREATE reaches event
+/* PGRAC: complete the original top binding before CREATE or TRUNCATE reaches
  * triggers, catalog relations or DDL locks. Other utility callers keep their
  * existing paths. Author: SqlRush <sqlrush@gmail.com> */
 static void
-PreflightClusterSharedCatalogCreate(Node *statement)
+PreflightClusterSharedCatalogWrite(Node *statement)
 {
 	ClusterCanonicalTxnBinding binding;
 	TransactionId current_xid;
+	const char *action;
 
 	if (!cluster_shared_catalog || !cluster_storage_mode_enabled()
-		|| (!IsA(statement, CreateStmt) && !IsA(statement, CreateTableAsStmt)))
+		|| (!IsA(statement, CreateStmt) && !IsA(statement, CreateTableAsStmt)
+			&& !IsA(statement, TruncateStmt)))
 		return;
 
+	action = IsA(statement, TruncateStmt) ? "truncation" : "creation";
 	if (IsSubTransaction())
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("shared catalog creation does not support subtransactions")));
+						errmsg("shared catalog %s does not support subtransactions", action)));
 	current_xid = GetCurrentTransactionIdIfAny();
 	if (TransactionIdIsValid(current_xid)
 		&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
@@ -303,7 +306,7 @@ PreflightClusterSharedCatalogCreate(Node *statement)
 	if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("canonical ACTIVE publication failed before shared catalog creation")));
+				 errmsg("canonical ACTIVE publication failed before shared catalog %s", action)));
 }
 #endif
 
@@ -858,7 +861,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 	}
 
 #ifdef USE_PGRAC_CLUSTER
-	PreflightClusterSharedCatalogCreate(parsetree);
+	PreflightClusterSharedCatalogWrite(parsetree);
 #endif
 
 	pstate = make_parsestate(NULL);

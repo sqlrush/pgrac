@@ -909,11 +909,12 @@ test_cluster_create_utility_entry.inc: $(top_srcdir)/src/backend/tcop/utility.c 
 test_cluster_shared_utility.inc: $(top_srcdir)/src/backend/tcop/utility.c Makefile
 	awk '/^CheckClusterSharedUtilitySupport\(/ { print "static void"; emit=1; count++ } \
 	     /^ClassifyUtilityCommandAsReadOnly\(/ { print "static int"; emit=1; classify++ } \
-	     /^PreflightClusterSharedCatalogCreate\(/ { print "static void"; emit=1; preflight++ } \
+	     /^PreflightClusterSharedCatalog(Create|Write)\(/ \
+	     { print "static void"; emit=1; preflight++ } \
 	     /^PreventCommand(IfReadOnly|IfParallelMode|DuringRecovery)\(/ \
 	     { print "void"; emit=1; guards++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (count != 1 || classify != 1 || preflight > 1 || guards != 3 || emit) exit 1 }' $< > $@.tmp
+	     END { if (count != 1 || classify != 1 || preflight != 1 || guards != 3 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 test_cluster_fresh_catalog_index.inc: $(top_srcdir)/src/backend/catalog/index.c Makefile
 	awk '/^index_create\(/ { print "Oid"; emit=1; count++ } \
@@ -11936,6 +11937,9 @@ test_cluster_heap_insert_preflight.inc: $(top_srcdir)/src/backend/access/heap/he
 	awk '/^typedef struct (ClusterHeapItlTerminalCensus|ClusterHeapDmlAuthorityGuard|ClusterCurrentMxStampPlan|ClusterCurrentMxHeapFingerprint|ClusterCurrentMxDescriptorMemo|ClusterCurrentMxOperationState|ClusterCurrentMxHeapResult)$$/ \
 	     { emit=1; n++ } emit { print } /^} .*;/ { emit=0 } \
 	     END { if(n!=7) exit 1 }' $< > $@.tmp
+	awk '/^typedef struct HeapHotR4Update(Page)?Trace[[:space:]]*\{/ \
+	     { emit=1; n++ } emit { print } /^} HeapHotR4Update(Page)?Trace;/ { emit=0 } \
+	     END { if(n!=2 || emit) exit 1 }' $< >> $@.tmp
 	awk '/^(cluster_heap_itl_relation_route|cluster_itl_write_path_enabled)\(/ \
 	     { print "static bool"; emit=1; n++ } \
 	     /^cluster_heap_preflight_write\(/ { print "bool"; emit=1; n++ } \
