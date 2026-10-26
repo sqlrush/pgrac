@@ -537,9 +537,12 @@ cold_record_flags(XLogReaderState *reader, uint64 system_identifier, const uint8
 			/* Prepared resolution can emit these standalone carriers before
 			 * its XACT terminal. Refuse them even in retained history: a
 			 * checkpoint is not a complete prepared-transaction consumer.
-			 * Ordinary abort has its separate exact-generation carrier. */
-			if (info != XLOG_UNDO_TT_SLOT_ABORT
-				|| undo.format_version != CLUSTER_UNDO_TT_ABORT_EXACT_VERSION)
+			 * Ordinary abort and partial-rollback heads have their own
+			 * exact-generation carriers. */
+			if (!(info == XLOG_UNDO_TT_SLOT_ABORT
+				  && undo.format_version == CLUSTER_UNDO_TT_ABORT_EXACT_VERSION)
+				&& !(info == XLOG_UNDO_TT_SLOT_SET_HEAD
+					 && undo.flags == CLUSTER_UNDO_TT_SET_HEAD_OPERATION_FLAG))
 				*flags = CLUSTER_COLD_RECORD_UNSUPPORTED;
 		} else if (info == XLOG_UNDO_RECOVERY_TT_ABORT) {
 			ClusterRecoveryTTAbortV1 c0;
@@ -707,7 +710,9 @@ cold_foreign_side(XLogReaderState *reader, const RfDetachedRecordPlanV1 *plan,
 			   && XLogRecGetData(reader) != NULL && cluster_undo_decode(reader, &undo)
 			   && cluster_undo_preflight(&undo)
 			   && (info != XLOG_UNDO_TT_SLOT_ABORT
-				   || undo.format_version == CLUSTER_UNDO_TT_ABORT_EXACT_VERSION);
+				   || undo.format_version == CLUSTER_UNDO_TT_ABORT_EXACT_VERSION)
+			   && (info != XLOG_UNDO_TT_SLOT_SET_HEAD
+				   || undo.flags == CLUSTER_UNDO_TT_SET_HEAD_OPERATION_FLAG);
 	}
 	if (plan->route.codec_id != RF_ROUTE_CODEC_SIDE_STANDARD)
 		return false;

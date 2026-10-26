@@ -448,6 +448,18 @@ cluster_undo_emit_tt_slot_set_head(uint8 instance, uint32 segment_id, uint16 slo
 	return lsn;
 }
 
+/* The record owner retains current/control authority and flush ordering. */
+XLogRecPtr
+cluster_undo_emit_tt_slot_set_head_operation(const xl_undo_tt_slot_set_head_operation *record)
+{
+	if (!cluster_undo_head_operation_valid(record))
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("invalid operation TT head WAL identity")));
+	XLogBeginInsert();
+	XLogRegisterData((char *)record, sizeof(*record));
+	return XLogInsert(RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_SET_HEAD);
+}
+
 /* Spec 8.4D §12.10: insert the sole field-coded release certificate.  The
  * caller owns block-0 X-current and flushes this LSN before publishing the
  * exact TT release bit. */
@@ -1331,20 +1343,21 @@ cluster_undo_redo_tt_slot_abort(const ClusterUndoDecoded *decoded)
 }
 
 
-/*
- * Replay XLOG_UNDO_TT_SLOT_SET_HEAD (spec-4.8 D7-A).
- *
- *   Block-0 RMW stamping TTSlot.first_undo_block (the undo-chain head) WITHOUT
- *   changing slot.status -- the paired 0x60 abort (emitted just before this
- *   record) already set ABORTED + xid + wrap, so here the on-disk slot owns
- *   exactly (rec.xid, rec.wrap).  Gate on that identity: if the slot was
- *   recycled to a different owner since (xid or wrap differ), SKIP -- never
- *   stamp a head onto another transaction's slot (规则 8.A).  Idempotent: a
- *   re-applied record writes the same head.
- */
+/* Length-selected 0x90 replay: the original top-only branch keeps its
+ * ABORTED-only semantics; the operation branch binds an ACTIVE retained
+ * control to the WAL's exact canonical generation and full identities. */
 static void
 cluster_undo_redo_tt_slot_set_head(const ClusterUndoDecoded *decoded)
 {
+	if (decoded->flags == CLUSTER_UNDO_TT_SET_HEAD_OPERATION_FLAG) {
+		xl_undo_tt_slot_set_head_operation record;
+
+		if (!cluster_undo_head_operation_from_decoded(decoded, &record))
+			ereport(PANIC,
+					(errcode(ERRCODE_DATA_CORRUPTED), errmsg("invalid decoded operation TT head")));
+		cluster_tt_durable_redo_set_head_operation(&record);
+		return;
+	}
 	cluster_tt_durable_redo_set_head_slot(decoded->instance, decoded->segment_id,
 										  decoded->slot_offset, decoded->wrap, decoded->xid,
 										  decoded->first_undo_block);

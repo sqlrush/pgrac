@@ -278,6 +278,53 @@ UT_TEST(test_tt_producer_identity_and_polarity)
 	UT_ASSERT(memcmp(&out.first_undo_block, &head, sizeof(head)) == 0);
 }
 
+#include "test_cluster_undo_head_operation.inc"
+
+UT_TEST(test_operation_head_emitter_preserves_full_identity)
+{
+	TestUndoHeadOperation value = test_head_operation();
+	ClusterUndoDecoded out;
+
+#ifdef CLUSTER_UNDO_TT_SET_HEAD_OPERATION_FLAG
+	cluster_undo_emit_tt_slot_set_head_operation(
+		(const xl_undo_tt_slot_set_head_operation *)&value);
+#else
+	cluster_undo_emit_tt_slot_set_head(value.head.instance, value.head.segment_id,
+									   value.head.slot_offset, value.head.wrap, value.head.xid,
+									   value.head.first_undo_block);
+#endif
+	UT_ASSERT_EQ(payload_length, 80);
+	UT_ASSERT_EQ(emitted_info, 0x90);
+	UT_ASSERT(memcmp(payload, &value, 80) == 0);
+	out = decode_emitted(true);
+	UT_ASSERT_EQ(out.expected_generation, 4);
+}
+
+UT_TEST(test_operation_head_bad_emitter_input_has_zero_wal)
+{
+	TestUndoHeadOperation value = test_head_operation();
+	char before[sizeof(payload)];
+
+	value.operation.operation_sequence = 0;
+	memset(payload, 0xa5, sizeof(payload));
+	memcpy(before, payload, sizeof(before));
+	payload_length = 123;
+	expect_panic = true;
+	if (setjmp(panic_jump) == 0) {
+#ifdef CLUSTER_UNDO_TT_SET_HEAD_OPERATION_FLAG
+		cluster_undo_emit_tt_slot_set_head_operation(
+			(const xl_undo_tt_slot_set_head_operation *)&value);
+#else
+		cluster_undo_emit_tt_slot_set_head(1, 1, 7, 5, 778, value.head.first_undo_block);
+#endif
+		expect_panic = false;
+		UT_ASSERT(false);
+	}
+	expect_panic = false;
+	UT_ASSERT_EQ(payload_length, 123);
+	UT_ASSERT(memcmp(payload, before, sizeof(before)) == 0);
+}
+
 UT_TEST(test_ctrc_release_producer_certificate)
 {
 	xl_undo_tt_slot_ctrc_release_v1 certificate = { 0 };
@@ -481,7 +528,9 @@ UT_TEST(test_native_block_writer_uses_typed_preparation_before_write_and_sync)
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(10);
+	UT_RUN(test_operation_head_bad_emitter_input_has_zero_wal);
+	UT_RUN(test_operation_head_emitter_preserves_full_identity);
 	UT_RUN(test_segment_lifecycle_producer_payloads);
 	UT_RUN(test_tt_producer_identity_and_polarity);
 	UT_RUN(test_ctrc_release_producer_certificate);

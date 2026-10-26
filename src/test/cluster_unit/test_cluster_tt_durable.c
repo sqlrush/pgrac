@@ -962,12 +962,19 @@ cluster_undo_smgr_header_writer_close(int fd)
 }
 
 static uint32 g_read_block_absent_once_segment;
+static char g_head_control_block[BLCKSZ];
+static bool g_head_control_enabled;
+
 
 bool
 cluster_undo_smgr_read_block(ClusterUndoPathIntent intent pg_attribute_unused(), uint32 segment_id,
 							 uint8 owner_instance pg_attribute_unused(), uint32 block_no, char *buf)
 {
 	g_read_block_calls++;
+	if (g_head_control_enabled && segment_id == 1 && block_no == 9 && buf != NULL) {
+		memcpy(buf, g_head_control_block, BLCKSZ);
+		return true;
+	}
 	if (segment_id == g_read_block_absent_once_segment) {
 		g_read_block_absent_once_segment = 0;
 		return false;
@@ -3577,6 +3584,332 @@ seed_exact_abort_block(uint8 status, uint16 wrap, uint32 generation)
 	g_canned_block_segment = 1;
 }
 
+#include "test_cluster_undo_head_operation.inc"
+
+static void
+seed_operation_head_control(const TestUndoHeadOperation *value)
+{
+	UndoBlockHeader *block = (UndoBlockHeader *)g_head_control_block;
+	UndoRecordHeader record = { 0 };
+	UndoSavepointRollbackPayload body = { 0 };
+	UndoSlotDirEntry *slot;
+
+	memset(g_head_control_block, 0, BLCKSZ);
+	block->magic = 0x55444f31;
+	block->block_version = 1;
+	block->slot_count = 1;
+	block->free_offset = 256;
+	block->block_lsn = 200;
+	record.record_type = UNDO_RECORD_SAVEPOINT_ROLLBACK;
+	record.flags = UNDO_REC_FLAG_HAS_OPERATION;
+	record.payload_length = 144;
+	record.xid = 779;
+	record.origin_node_id = 0;
+	record.tt_slot_segment_id = 1;
+	record.tt_slot_id = 8;
+	record.tt_wrap_plus1 = value->head.wrap + 1;
+	record.write_scn = 201;
+	record.prev_uba = uba_encode(1, 8, 7, 0);
+	body.version = 1;
+	body.length = 96;
+	body.phase = UNDO_SAVEPOINT_ROLLBACK_PENDING;
+	body.rollback_sequence = 31;
+	body.start_uba = body.next_uba = record.prev_uba;
+	body.scope_child_fxid = value->operation.operation_fxid;
+	memcpy(g_head_control_block + 48, &record, 64);
+	memcpy(g_head_control_block + 112, &body, 96);
+	memcpy(g_head_control_block + 208, &value->operation, 48);
+	slot = UNDO_SLOT_DIR_PTR(g_head_control_block, 0);
+	slot->record_offset = 48;
+	slot->record_length = 208;
+	slot->record_type = record.record_type;
+	slot->flags = record.flags;
+	g_head_control_enabled = true;
+}
+
+static void
+replay_operation_head(const TestUndoHeadOperation *value)
+{
+#ifdef CLUSTER_UNDO_TT_SET_HEAD_OPERATION_FLAG
+	cluster_tt_durable_redo_set_head_operation((const xl_undo_tt_slot_set_head_operation *)value);
+#else
+	cluster_tt_durable_redo_set_head_slot(value->head.instance, value->head.segment_id,
+										  value->head.slot_offset, value->head.wrap,
+										  value->head.xid, value->head.first_undo_block);
+#endif
+}
+
+UT_TEST(test_operation_head_native_preserves_active_and_is_durable)
+{
+	TestUndoHeadOperation value = test_head_operation();
+	TTSlot before;
+	TTSlot *slot = &((UndoSegmentHeaderData *)g_canned_block)->tt_slots[7];
+
+	seed_exact_abort_block(TT_SLOT_ACTIVE, 5, 4);
+	seed_operation_head_control(&value);
+	enable_sealed_header_io();
+#ifdef CLUSTER_UNDO_TT_SET_HEAD_OPERATION_FLAG
+	UT_ASSERT(cluster_undo_head_operation_matches_control(
+		(const xl_undo_tt_slot_set_head_operation *)&value,
+		(const UndoRecordHeader *)(g_head_control_block + 48), g_head_control_block + 112, 144));
+	UT_ASSERT_EQ(cluster_tt_durable_set_head_operation_preflight(
+					 (const xl_undo_tt_slot_set_head_operation *)&value),
+				 CLUSTER_UNDO_HEAD_OPERATION_APPLY);
+#endif
+	before = *slot;
+	g_write_hdr_ok = true;
+	g_write_hdr_calls = g_fsync_segment_calls = g_present_durable_calls = 0;
+	{
+		volatile bool caught = false;
+		PG_TRY();
+		{
+			replay_operation_head(&value);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		g_head_control_enabled = false;
+		g_sealed_header_io = false;
+		UT_ASSERT(!caught);
+	}
+	UT_ASSERT_EQ(g_write_hdr_calls, 1);
+	UT_ASSERT_EQ(g_fsync_segment_calls, 1);
+	before.first_undo_block = value.head.first_undo_block;
+	UT_ASSERT(memcmp(slot, &before, sizeof(before)) == 0);
+	g_head_control_enabled = true;
+	replay_operation_head(&value);
+	g_head_control_enabled = false;
+	UT_ASSERT_EQ(g_write_hdr_calls, 1);
+	UT_ASSERT_EQ(g_present_durable_calls, 1);
+}
+
+UT_TEST(test_operation_head_native_rejects_unknown_or_aliased_control)
+{
+	TestUndoHeadOperation value = test_head_operation();
+	int i;
+
+	for (i = 0; i < 14; i++) {
+		TestUndoHeadOperation bad = value;
+		volatile bool caught = false;
+		seed_exact_abort_block(TT_SLOT_ACTIVE, 5, 4);
+		seed_operation_head_control(&value);
+		switch (i) {
+		case 0:
+			g_head_control_enabled = false;
+			break;
+		case 1:
+			bad.operation.operation_sequence++;
+			break;
+		case 2:
+			bad.operation.canonical_top_fxid += UINT64_C(1) << 32;
+			break;
+		case 3:
+			bad.operation.operation_fxid++;
+			break;
+		case 4:
+			((UndoSegmentHeaderData *)g_canned_block)->wrap_count = 3;
+			break;
+		case 5:
+			UNDO_SLOT_DIR_PTR(g_head_control_block, 0)->record_length--;
+			break;
+		case 6:
+			((UndoSegmentHeaderData *)g_canned_block)->tt_slots[7].status = TT_SLOT_COMMITTED;
+			break;
+		case 7:
+			((UndoSegmentHeaderData *)g_canned_block)->tt_slots[7].status = TT_SLOT_ABORTED;
+			((UndoSegmentHeaderData *)g_canned_block)->tt_slots[7].commit_scn = 1;
+			break;
+		case 8:
+			((UndoSegmentHeaderData *)g_canned_block)->tt_slots[7].flags
+				= TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+			break;
+		case 9:
+			((UndoSegmentHeaderData *)g_canned_block)->tt_slots[7].status = 255;
+			break;
+		case 10:
+			((UndoSavepointRollbackPayload *)(g_head_control_block + 112))->rollback_sequence++;
+			break;
+		case 11:
+			((UndoBlockHeader *)g_head_control_block)->block_lsn = 0;
+			break;
+		case 12:
+			UNDO_SLOT_DIR_PTR(g_head_control_block, 0)->flags = 0;
+			break;
+		case 13:
+			((UndoRecordHeader *)(g_head_control_block + 48))->xid++;
+			break;
+		}
+		g_write_hdr_calls = g_fsync_segment_calls = g_present_durable_calls = 0;
+		PG_TRY();
+		{
+			replay_operation_head(&bad);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		g_head_control_enabled = false;
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(g_write_hdr_calls + g_fsync_segment_calls + g_present_durable_calls, 0);
+	}
+}
+
+UT_TEST(test_operation_head_native_stale_never_revives_terminal)
+{
+	TestUndoHeadOperation value = test_head_operation();
+	int i;
+
+	for (i = 0; i < 3; i++) {
+		seed_exact_abort_block(i == 0 ? TT_SLOT_ACTIVE
+									  : (i == 1 ? TT_SLOT_COMMITTED : TT_SLOT_ABORTED),
+							   5, i == 0 ? 5 : 4);
+		if (i == 1)
+			((UndoSegmentHeaderData *)g_canned_block)->tt_slots[7].commit_scn = 888;
+		g_write_hdr_calls = g_fsync_segment_calls = g_present_durable_calls = 0;
+		replay_operation_head(&value);
+		UT_ASSERT_EQ(g_write_hdr_calls + g_fsync_segment_calls, 0);
+		UT_ASSERT_EQ(g_present_durable_calls, 1);
+	}
+}
+
+UT_TEST(test_operation_head_native_never_regresses_retained_control)
+{
+	TestUndoHeadOperation value = test_head_operation();
+	UndoRecordHeader next_header;
+	UndoSavepointRollbackPayload next_body;
+	UndoOperationTrailer next_operation;
+	UndoBlockHeader *block = (UndoBlockHeader *)g_head_control_block;
+	UndoSlotDirEntry *next_slot;
+	TTSlot *slot = &((UndoSegmentHeaderData *)g_canned_block)->tt_slots[7];
+	UBA later = uba_encode(1, 9, 7, 1);
+
+	seed_exact_abort_block(TT_SLOT_ACTIVE, 5, 4);
+	seed_operation_head_control(&value);
+	memcpy(&next_header, g_head_control_block + 48, 64);
+	memcpy(&next_body, g_head_control_block + 112, 96);
+	next_operation = value.operation;
+	next_operation.operation_sequence++;
+	next_body.rollback_sequence++;
+	next_header.prev_uba = value.head.first_undo_block;
+	next_body.start_uba = next_body.next_uba = next_header.prev_uba;
+	memcpy(g_head_control_block + 256, &next_header, 64);
+	memcpy(g_head_control_block + 320, &next_body, 96);
+	memcpy(g_head_control_block + 416, &next_operation, 48);
+	block->slot_count = 2;
+	block->free_offset = 464;
+	next_slot = UNDO_SLOT_DIR_PTR(g_head_control_block, 1);
+	*next_slot = *UNDO_SLOT_DIR_PTR(g_head_control_block, 0);
+	next_slot->record_offset = 256;
+	slot->first_undo_block = later;
+	g_write_hdr_calls = g_fsync_segment_calls = g_present_durable_calls = 0;
+	replay_operation_head(&value);
+	g_head_control_enabled = false;
+	UT_ASSERT_EQ(g_write_hdr_calls + g_fsync_segment_calls, 0);
+	UT_ASSERT_EQ(g_present_durable_calls, 1);
+	UT_ASSERT(memcmp(&slot->first_undo_block, &later, sizeof(later)) == 0);
+	/* A later publication may advance the same retained chain. */
+	slot->first_undo_block = value.head.first_undo_block;
+	value.head.first_undo_block = later;
+	value.operation.operation_sequence++;
+	g_head_control_enabled = true;
+	enable_sealed_header_io();
+	g_write_hdr_calls = g_fsync_segment_calls = g_present_durable_calls = 0;
+	replay_operation_head(&value);
+	g_head_control_enabled = false;
+	g_sealed_header_io = false;
+	UT_ASSERT_EQ(g_write_hdr_calls, 1);
+	UT_ASSERT_EQ(g_fsync_segment_calls, 1);
+	UT_ASSERT(memcmp(&slot->first_undo_block, &later, sizeof(later)) == 0);
+}
+
+UT_TEST(test_operation_head_outer_reservation_can_publish_after_inner)
+{
+	TestUndoHeadOperation outer = test_head_operation();
+	UndoRecordHeader inner_header;
+	UndoSavepointRollbackPayload inner_body;
+	UndoOperationTrailer inner_operation;
+	UndoBlockHeader *block = (UndoBlockHeader *)g_head_control_block;
+	UndoRecordHeader *outer_header = (UndoRecordHeader *)(g_head_control_block + 48);
+	UndoSavepointRollbackPayload *outer_body
+		= (UndoSavepointRollbackPayload *)(g_head_control_block + 112);
+	TTSlot *slot = &((UndoSegmentHeaderData *)g_canned_block)->tt_slots[7];
+	UBA inner = uba_encode(1, 9, 7, 1);
+
+	seed_exact_abort_block(TT_SLOT_ACTIVE, 5, 4);
+	seed_operation_head_control(&outer);
+	memcpy(&inner_header, outer_header, 64);
+	memcpy(&inner_body, outer_body, 96);
+	inner_operation = outer.operation;
+	inner_operation.operation_sequence = inner_body.rollback_sequence = 32;
+	memcpy(g_head_control_block + 256, &inner_header, 64);
+	memcpy(g_head_control_block + 320, &inner_body, 96);
+	memcpy(g_head_control_block + 416, &inner_operation, 48);
+	block->slot_count = 2;
+	block->free_offset = 464;
+	*UNDO_SLOT_DIR_PTR(g_head_control_block, 1) = *UNDO_SLOT_DIR_PTR(g_head_control_block, 0);
+	UNDO_SLOT_DIR_PTR(g_head_control_block, 1)->record_offset = 256;
+	outer_header->prev_uba = outer_body->start_uba = outer_body->next_uba = inner;
+	slot->first_undo_block = inner;
+	enable_sealed_header_io();
+	g_write_hdr_calls = g_fsync_segment_calls = g_present_durable_calls = 0;
+	replay_operation_head(&outer);
+	g_head_control_enabled = false;
+	g_sealed_header_io = false;
+	UT_ASSERT_EQ(g_write_hdr_calls, 1);
+	UT_ASSERT_EQ(g_fsync_segment_calls, 1);
+	UT_ASSERT_EQ(slot->status, TT_SLOT_ACTIVE);
+	UT_ASSERT(memcmp(&slot->first_undo_block, &outer.head.first_undo_block, sizeof(UBA)) == 0);
+	/* Conflicting two-way edges are not publication evidence. */
+	inner_header.prev_uba = inner_body.start_uba = inner_body.next_uba
+		= outer.head.first_undo_block;
+	memcpy(g_head_control_block + 256, &inner_header, 64);
+	memcpy(g_head_control_block + 320, &inner_body, 96);
+	slot->first_undo_block = inner;
+	g_head_control_enabled = true;
+	g_write_hdr_calls = g_fsync_segment_calls = g_present_durable_calls = 0;
+	{
+		volatile bool caught = false;
+		PG_TRY();
+		{
+			replay_operation_head(&outer);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		g_head_control_enabled = false;
+		UT_ASSERT(caught);
+	}
+	UT_ASSERT_EQ(g_write_hdr_calls + g_fsync_segment_calls + g_present_durable_calls, 0);
+}
+
+UT_TEST(test_operation_head_present_barrier_failure_is_fatal)
+{
+	TestUndoHeadOperation value = test_head_operation();
+	volatile bool caught = false;
+
+	seed_exact_abort_block(TT_SLOT_ACTIVE, 5, 5);
+	g_present_durable_ok = false;
+	g_write_hdr_calls = g_fsync_segment_calls = g_present_durable_calls = 0;
+	PG_TRY();
+	{
+		replay_operation_head(&value);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	g_present_durable_ok = true;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(g_write_hdr_calls + g_fsync_segment_calls, 0);
+	UT_ASSERT_EQ(g_present_durable_calls, 1);
+}
+
 /*
  * F-D-29 restart residue: a crash restart rebuilds shared memory -- and the
  * checkpoint's record of unsynced header writes -- while the page cache still
@@ -3851,7 +4184,13 @@ UT_TEST(test_revert_delete_identity_mismatch_failclosed)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(116);
+	UT_PLAN(122);
+	UT_RUN(test_operation_head_outer_reservation_can_publish_after_inner);
+	UT_RUN(test_operation_head_native_never_regresses_retained_control);
+	UT_RUN(test_operation_head_present_barrier_failure_is_fatal);
+	UT_RUN(test_operation_head_native_preserves_active_and_is_durable);
+	UT_RUN(test_operation_head_native_rejects_unknown_or_aliased_control);
+	UT_RUN(test_operation_head_native_stale_never_revives_terminal);
 
 	UT_RUN(test_layout_sizes);
 

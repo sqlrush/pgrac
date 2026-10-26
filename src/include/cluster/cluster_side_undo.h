@@ -32,6 +32,8 @@
  * Portions Copyright (c) 1994, Regents of the University of California
  * Portions Copyright (c) 2026, pgrac contributors
  *
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
  * IDENTIFICATION
  *	  src/include/cluster/cluster_side_undo.h
  *
@@ -44,6 +46,7 @@
 #include "cluster/cluster_scn.h"	  /* SCN */
 #include "cluster/cluster_itl_slot.h" /* UBA */
 #include "cluster/cluster_tt_slot.h"
+#include "cluster/storage/cluster_undo_xlog.h"
 #include "storage/itemptr.h" /* TransactionId */
 
 typedef enum ClusterUndoDecodedKind {
@@ -103,6 +106,7 @@ typedef struct ClusterUndoDecoded {
 	uint8 new_state;
 	uint8 reserved_zero[1];
 	UBA first_undo_block;
+	UndoOperationTrailer head_operation;
 } ClusterUndoDecoded;
 
 /*
@@ -110,6 +114,9 @@ typedef struct ClusterUndoDecoded {
  * false (BLOCKED) on NULL inputs, unknown/illegal info, or a malformed
  * payload length — the caller must not mutate anything (U-SIDE-04).
  */
+extern bool cluster_undo_head_operation_from_decoded(const ClusterUndoDecoded *decoded,
+													 xl_undo_tt_slot_set_head_operation *record);
+
 extern bool cluster_undo_decode(XLogReaderState *record, ClusterUndoDecoded *out);
 
 /*

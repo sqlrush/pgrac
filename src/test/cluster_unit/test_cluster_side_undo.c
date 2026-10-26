@@ -25,6 +25,7 @@
 #include "cluster/cluster_side_undo.h"
 #include "cluster/cluster_tt_durable.h"
 #include "cluster/cluster_tt_slot.h"
+#include "cluster/cluster_undo_segment_init.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 
 #include "unit_test.h"
@@ -45,6 +46,20 @@ static TTSlot apply_slot;
 static uint32 apply_generation = 9;
 static int apply_read_calls;
 static int apply_fail_on_read;
+
+ClusterUndoHeadOperationDecision
+cluster_tt_durable_set_head_operation_preflight(const xl_undo_tt_slot_set_head_operation *record)
+{
+	return cluster_undo_head_operation_decide(apply_generation, &apply_slot, record);
+}
+
+void
+cluster_tt_durable_redo_set_head_operation(const xl_undo_tt_slot_set_head_operation *record)
+{
+	if (cluster_tt_durable_set_head_operation_preflight(record)
+		== CLUSTER_UNDO_HEAD_OPERATION_APPLY)
+		apply_slot.first_undo_block = record->head.first_undo_block;
+}
 
 void
 cluster_tt_durable_redo_stamp_slot(uint8 instance pg_attribute_unused(),
@@ -212,6 +227,145 @@ make_record(FakeRecord *fr, RmgrId rmid, uint8 info, const void *payload, uint32
 	}
 	fr->st.record = dec;
 	return &fr->st;
+}
+
+#include "test_cluster_undo_head_operation.inc"
+
+UT_TEST(test_operation_head_decodes_exact_80_bytes)
+{
+	TestUndoHeadOperation value = test_head_operation();
+	FakeRecord fr;
+	ClusterUndoDecoded out;
+	XLogReaderState *record;
+
+	UT_ASSERT_EQ(sizeof(value), 80);
+	record = make_record(&fr, RM_CLUSTER_UNDO_ID, 0x90, &value, 80);
+	UT_ASSERT(cluster_undo_decode(record, &out));
+	UT_ASSERT(cluster_undo_preflight(&out));
+	UT_ASSERT_EQ(out.expected_generation, 4);
+	UT_ASSERT_EQ(out.flags, 1);
+#ifdef CLUSTER_UNDO_TT_SET_HEAD_OPERATION_FLAG
+	UT_ASSERT(memcmp(&out.head_operation, &value.operation, 48) == 0);
+#endif
+	memmove(fr.data + 1, fr.data, 80);
+	fr.u.dec.main_data = (char *)fr.data + 1;
+	UT_ASSERT(cluster_undo_decode(record, &out));
+	value.head.wrap = 0;
+	value.head.first_undo_block = uba_encode(2, 9, 7, 0);
+	record = make_record(&fr, RM_CLUSTER_UNDO_ID, 0x90, &value, 80);
+	UT_ASSERT(cluster_undo_decode(record, &out));
+	UT_ASSERT(cluster_undo_preflight(&out));
+}
+
+UT_TEST(test_operation_head_length_flags_and_identity_fail_closed)
+{
+	TestUndoHeadOperation value = test_head_operation();
+	FakeRecord fr;
+	ClusterUndoDecoded out;
+	uint8 length_input[81] = { 0 };
+	int i;
+
+	memcpy(length_input, &value, sizeof(value));
+	UT_ASSERT(cluster_undo_decode(make_record(&fr, RM_CLUSTER_UNDO_ID, 0x90, &value, 80), &out));
+	for (i = 1; i <= 81; i++) {
+		if (i != 80)
+			UT_ASSERT(!cluster_undo_decode(
+				make_record(&fr, RM_CLUSTER_UNDO_ID, 0x90, length_input, i), &out));
+	}
+	for (i = 0; i < 8; i++) {
+		TestUndoHeadOperation bad = value;
+		switch (i) {
+		case 0:
+			bad.head._pad[0] = 0;
+			break;
+		case 1:
+			bad.head._pad[1] = 1;
+			break;
+		case 2:
+			bad.operation.length = 47;
+			break;
+		case 3:
+			bad.operation.canonical_top_fxid++;
+			break;
+		case 4:
+			bad.operation.canonical_segment_generation = UINT32_MAX;
+			break;
+		case 5:
+			bad.operation.operation_sequence = 0;
+			break;
+		case 6:
+			bad.operation.effect_state = CLUSTER_SAVEPOINT_EFFECT_DISCARDED;
+			break;
+		case 7:
+			bad.operation.reserved_end = 1;
+			break;
+		}
+		UT_ASSERT(!cluster_undo_decode(make_record(&fr, RM_CLUSTER_UNDO_ID, 0x90, &bad, 80), &out));
+	}
+	value.head._pad[0] = 0;
+	UT_ASSERT(cluster_undo_decode(make_record(&fr, RM_CLUSTER_UNDO_ID, 0x90, &value, 32), &out));
+	UT_ASSERT_EQ(out.flags, 0);
+}
+
+UT_TEST(test_operation_head_e1_candidate_keeps_active_identity)
+{
+	TestUndoHeadOperation value = test_head_operation();
+	FakeRecord fr;
+	ClusterUndoDecoded decoded;
+	PGAlignedBlock base, out;
+	UndoSegmentHeaderData *header = (UndoSegmentHeaderData *)base.data;
+	const UndoSegmentHeaderData *successor = (const UndoSegmentHeaderData *)out.data;
+	TTSlot before;
+
+	UT_ASSERT(
+		cluster_undo_decode(make_record(&fr, RM_CLUSTER_UNDO_ID, 0x90, &value, 80), &decoded));
+	cluster_undo_segment_make_header_bytes(1, 1, base.data);
+	header->wrap_count = 4;
+	memset(&header->tt_slots[7], 0, sizeof(TTSlot));
+	header->tt_slots[7].status = TT_SLOT_ACTIVE;
+	header->tt_slots[7].xid = 778;
+	header->tt_slots[7].wrap = 5;
+	before = header->tt_slots[7];
+	UT_ASSERT_EQ(cluster_undo_prepare_header_v1(&decoded, NULL, 0, base.data, out.data),
+				 CLUSTER_UNDO_HEADER_APPLY);
+	before.first_undo_block = value.head.first_undo_block;
+	UT_ASSERT(memcmp(&successor->tt_slots[7], &before, sizeof(before)) == 0);
+	memcpy(base.data, out.data, BLCKSZ);
+	memset(out.data, 0xa5, BLCKSZ);
+	UT_ASSERT_EQ(cluster_undo_prepare_header_v1(&decoded, NULL, 0, base.data, out.data),
+				 CLUSTER_UNDO_HEADER_ALREADY);
+	UT_ASSERT_EQ((uint8)out.data[0], 0xa5);
+	header->wrap_count = 5;
+	UT_ASSERT_EQ(cluster_undo_prepare_header_v1(&decoded, NULL, 0, base.data, out.data),
+				 CLUSTER_UNDO_HEADER_SKIP_STALE);
+	header->wrap_count = 3;
+	UT_ASSERT_EQ(cluster_undo_prepare_header_v1(&decoded, NULL, 0, base.data, out.data),
+				 CLUSTER_UNDO_HEADER_BLOCKED);
+}
+
+UT_TEST(test_operation_head_side_apply_uses_exact_predecessor_and_post_read)
+{
+	TestUndoHeadOperation value = test_head_operation();
+	FakeRecord fr;
+	ClusterUndoDecoded decoded;
+	TTSlot before;
+
+	UT_ASSERT(
+		cluster_undo_decode(make_record(&fr, RM_CLUSTER_UNDO_ID, 0x90, &value, 80), &decoded));
+	apply_generation = 4;
+	memset(&apply_slot, 0, sizeof(apply_slot));
+	apply_slot.status = TT_SLOT_ACTIVE;
+	apply_slot.xid = 778;
+	apply_slot.wrap = 5;
+	before = apply_slot;
+	UT_ASSERT_EQ(cluster_undo_preflight_tt_target_v1(&decoded), CLUSTER_UNDO_TARGET_APPLY);
+	UT_ASSERT_EQ(cluster_undo_apply_tt_v1(&decoded), CLUSTER_UNDO_APPLY_OK);
+	before.first_undo_block = value.head.first_undo_block;
+	UT_ASSERT(memcmp(&apply_slot, &before, sizeof(before)) == 0);
+	UT_ASSERT_EQ(cluster_undo_apply_tt_v1(&decoded), CLUSTER_UNDO_APPLY_OK);
+	decoded.expected_generation++;
+	UT_ASSERT_EQ(cluster_undo_apply_tt_v1(&decoded), CLUSTER_UNDO_APPLY_BLOCKED);
+	apply_generation = 9;
 }
 
 UT_TEST(test_decode_tt_commit_fields)
@@ -735,7 +889,11 @@ UT_TEST(test_recovery_abort_codec_does_not_authorize_ordinary_side)
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(17);
+	UT_RUN(test_operation_head_e1_candidate_keeps_active_identity);
+	UT_RUN(test_operation_head_side_apply_uses_exact_predecessor_and_post_read);
+	UT_RUN(test_operation_head_decodes_exact_80_bytes);
+	UT_RUN(test_operation_head_length_flags_and_identity_fail_closed);
 
 	UT_RUN(test_decode_tt_commit_fields);
 	UT_RUN(test_decode_tt_bind_exact_shape_and_reserved_bytes);

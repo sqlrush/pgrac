@@ -1170,10 +1170,40 @@ UT_TEST(test_stripe_join_rejects_incomplete_or_unbound_original_frame)
 	}
 }
 
+#include "cluster/storage/cluster_undo_xlog.h"
+#include "test_cluster_undo_head_operation.inc"
+
+UT_TEST(test_operation_head_has_exact_native_typed_owner)
+{
+	TestUndoHeadOperation value = test_head_operation();
+	FakeRecord record;
+	ClusterColdDecodedV1 out = { 0 };
+
+	fake_record(&record, RM_CLUSTER_UNDO_ID, 0x90, 0);
+	preflight_plan.route.codec_id = RF_ROUTE_CODEC_SIDE_CLUSTER_UNDO;
+	memcpy(record.data, &value, 80);
+	record.storage.decoded.main_data_len = 80;
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, false, &out),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT((out.record.record_flags & CLUSTER_COLD_RECORD_UNSUPPORTED) == 0);
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_FOREIGN_SIDE);
+	value.head._pad[0] = 0;
+	memcpy(record.data, &value, 80);
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, false, &out),
+				 CLUSTER_COLD_COMPONENT_INVALID);
+	record.storage.decoded.main_data_len = 32;
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, false, &out),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT((out.record.record_flags & CLUSTER_COLD_RECORD_UNSUPPORTED) != 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(21);
+	UT_PLAN(22);
+	UT_RUN(test_operation_head_has_exact_native_typed_owner);
 	UT_RUN(test_stripe_join_uses_real_native_or_foreign_consumer);
 	UT_RUN(test_stripe_join_rejects_incomplete_or_unbound_original_frame);
 	UT_RUN(test_complete_standby_payloads_keep_original_effect_routes);

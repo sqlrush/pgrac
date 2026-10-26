@@ -3833,7 +3833,7 @@ test_cluster_undo_tt_transition.inc: $(top_srcdir)/src/backend/cluster/cluster_t
 test_cluster_undo_producer_owner.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_xlog.c Makefile
 	awk '/^(cluster_undo_emit_[a-z_]+|cluster_hw_emit_reserve|cluster_undo_xlog_insert_tt_ctrc_release)\(/ \
 	     { print "XLogRecPtr"; emit=1; found++ } emit { print } /^}/ { emit=0 } \
-	     END { if (found != 12) exit 1 }' $< > $@.tmp
+	     END { if (found != 13) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_undo_block_native.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_xlog.c Makefile
@@ -3918,22 +3918,26 @@ test_cluster_undo_native_lifecycle: test_cluster_undo_native_lifecycle.c unit_te
 		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 test_cluster_undo_producer: test_cluster_undo_producer.c unit_test.h \
+		$(srcdir)/test_cluster_undo_head_operation.inc \
 		test_cluster_undo_producer_owner.inc test_cluster_undo_block_native.inc \
 		$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h \
 		$(top_srcdir)/src/include/cluster/cluster_side_undo.h \
 		test_cluster_side_xact_undo_product.o $(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) \
-		xlogreader_fs.o
+		xlogreader_fs.o \
+		$(top_builddir)/src/backend/cluster/cluster_uba.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_side_xact_undo_product.o \
 		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) xlogreader_fs.o \
 		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \
-		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -lssl -lcrypto $(filter -llz4 -lzstd,$(LIBS)) -o $@
+		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -lssl -lcrypto $(filter -llz4 -lzstd,$(LIBS)) $(top_builddir)/src/backend/cluster/cluster_uba.o -o $@
 
 test_cluster_side_undo: test_cluster_side_undo.c unit_test.h \
+		$(srcdir)/test_cluster_undo_head_operation.inc \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_tt_record.h \
-		$(CLUSTER_SIDE_UNDO_O) $(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O)
+		$(CLUSTER_SIDE_UNDO_O) $(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) \
+		$(top_builddir)/src/backend/cluster/cluster_uba.o test_cluster_undo_segment_init.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_SIDE_UNDO_O) $(CLUSTER_SIDE_ROUTE_O) \
 		$(CLUSTER_RF_ROUTE_O) \
-		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+		$(CLUSTER_UNIT_PORT_LIBS) $(top_builddir)/src/backend/cluster/cluster_uba.o test_cluster_undo_segment_init.o -o $@
 
 CLUSTER_SIDE_XACT_O = test_cluster_side_xact_product.o
 CLUSTER_REMOTE_XACT_IDENTITY_O = \
@@ -8685,12 +8689,14 @@ test_cluster_tt_active_owner test_cluster_tt_slot_allocator: \
 # (redo wrap table / slot match) + lookup / by-xid scan with a mocked
 # cluster_undo_smgr.  File-I/O behavior is e2e in cluster_tap t/219.
 test_cluster_tt_durable: test_cluster_tt_durable.c unit_test.h \
+		$(srcdir)/test_cluster_undo_head_operation.inc \
 		$(top_srcdir)/src/include/cluster/cluster_undo_segment_init.h \
-		$(CLUSTER_TT_DURABLE_O)
+		$(CLUSTER_TT_DURABLE_O) \
+		$(top_builddir)/src/backend/cluster/cluster_uba.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_TT_DURABLE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+		$(CLUSTER_UNIT_PORT_LIBS) $(top_builddir)/src/backend/cluster/cluster_uba.o -o $@
 
 # Includes the real local consumer to seed otherwise unreachable partial
 # publication states; dead stripping removes unrelated local entry points.
@@ -11287,15 +11293,17 @@ $(CLUSTER_COLD_DECODE_O): $(top_srcdir)/src/backend/cluster/cluster_cold_recover
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -c $< -o $@
 
 test_cluster_cold_recovery_decode: test_cluster_cold_recovery_decode.c unit_test.h $(CLUSTER_COLD_DECODE_O) \
+		$(srcdir)/test_cluster_undo_head_operation.inc \
 		$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) \
 		$(CLUSTER_SIDE_UNDO_O) $(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		cluster_unit_port_stubs.o $(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
+		cluster_unit_port_stubs.o $(top_srcdir)/src/include/cluster/cluster_cold_recovery.h \
+		$(top_builddir)/src/backend/cluster/cluster_uba.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< $(CLUSTER_COLD_DECODE_O) \
 		$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) \
 		$(CLUSTER_SIDE_UNDO_O) $(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(top_builddir)/src/backend/cluster/cluster_uba.o -o $@
 
 test_cluster_cold_xid_completion_children.inc: $(top_srcdir)/src/backend/cluster/cluster_side_xact.c Makefile
 	awk '/^rf_side_xact_children_preflight_v1\(/ { print "bool"; emit=1; count++ } \

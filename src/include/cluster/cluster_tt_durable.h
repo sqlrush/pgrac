@@ -39,6 +39,12 @@
 #include "cluster/cluster_itl_slot.h" /* UBA (spec-4.8 D7-A set_head) */
 #include "cluster/cluster_scn.h"	  /* SCN */
 #include "cluster/cluster_tt_slot.h"  /* TTSlot */
+#include "cluster/storage/cluster_undo_xlog.h"
+
+extern ClusterUndoHeadOperationDecision
+cluster_tt_durable_set_head_operation_preflight(const xl_undo_tt_slot_set_head_operation *record);
+extern void
+cluster_tt_durable_redo_set_head_operation(const xl_undo_tt_slot_set_head_operation *record);
 
 typedef struct ClusterSemanticAdmissionToken ClusterSemanticAdmissionToken;
 
