@@ -1329,6 +1329,12 @@ vm_readbuf(Relation rel, BlockNumber blkno, bool extend)
 	 */
 	for (;;)
 	{
+#ifdef USE_PGRAC_CLUSTER
+		/* A replaced init pin leaves this retry unowned. Honor cancellation
+		 * before obtaining another mapping or initializing its page. */
+		if (versioned)
+			CHECK_FOR_INTERRUPTS();
+#endif
 		/* The init wait can release the pin and invalidate SMgr; reacquire
 		 * the original relation's mapping on every retry. */
 		reln = RelationGetSmgr(rel);

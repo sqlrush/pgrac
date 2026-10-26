@@ -65,6 +65,7 @@
 #include "storage/standby.h"
 #include "storage/proc.h"
 #include "storage/proclist.h"
+#include "storage/s_lock.h"
 #include "utils/rel.h"
 #include "unit_test.h"
 #include "cluster/cluster_mode.h"
@@ -12554,6 +12555,119 @@ page_owner_record_realloc(void *address, Size size)
 	return NULL;
 }
 
+static bool page_owner_use_native_authority;
+static unsigned page_owner_native_authority_calls;
+static unsigned page_owner_native_authority_refusals;
+ClusterPcmOwnEntry *ClusterPcmOwnArray;
+
+/* The original authority body reads the real header lock and PCM sidecar.
+ * Configured topology, epoch, grant acquisition and scheduling remain leaves;
+ * this fixture installs an exact ACTIVE writer round, not a new live grant. */
+static int page_owner_authority_node_count(void) { return 4; }
+static uint64 page_owner_authority_epoch(void) { return 9; }
+static bool page_owner_authority_storage(void) { return true; }
+static bool
+page_owner_authority_target_current(const ResourceXWriterUseContext *context)
+{
+	UT_ASSERT(page_owner_use_native_authority && local_x && backend_pin_count > 0);
+	UT_ASSERT(resource_x_assertion_valid(&context->ref.assertion));
+	UT_ASSERT_EQ(context->ref.assertion.requester_node, cluster_node_id);
+	UT_ASSERT_EQ(context->buffer_ownership_generation, page_owner_capture_generation);
+	return true;
+}
+
+static void
+page_owner_unexpected_header_spin(SpinDelayStatus *status)
+{
+	(void)status;
+	UT_ASSERT(false);
+}
+static void
+page_owner_finish_header_spin(SpinDelayStatus *status)
+{
+	UT_ASSERT_EQ(status->spins, 0); UT_ASSERT_EQ(status->delays, 0);
+	UT_ASSERT_EQ(status->cur_delay, 0);
+}
+
+#define LockBufHdr original_touch_header_lock
+#define perform_spin_delay page_owner_unexpected_header_spin
+#define finish_spin_delay page_owner_finish_header_spin
+#define cluster_pcm_own_snapshot_post_state_locked original_touch_snapshot_post_state
+#define cluster_pcm_own_snapshot_locked original_touch_snapshot_locked
+#define cluster_bufmgr_pcm_x_retained_image_locked original_touch_retained_image
+#define cluster_bufmgr_terminal_stamp_authority original_touch_capture_authority
+#define cluster_conf_node_count page_owner_authority_node_count
+#define cluster_epoch_get_current page_owner_authority_epoch
+#define cluster_storage_mode_enabled page_owner_authority_storage
+#define cluster_gcs_resource_x_target_context_recheck_exact page_owner_authority_target_current
+#include "test_cluster_heap_touch_authority.inc"
+#undef cluster_gcs_resource_x_target_context_recheck_exact
+#undef cluster_storage_mode_enabled
+#undef cluster_epoch_get_current
+#undef cluster_conf_node_count
+#undef cluster_bufmgr_terminal_stamp_authority
+#undef cluster_bufmgr_pcm_x_retained_image_locked
+#undef cluster_pcm_own_snapshot_locked
+#undef cluster_pcm_own_snapshot_post_state_locked
+#undef finish_spin_delay
+#undef perform_spin_delay
+#undef LockBufHdr
+
+static bool
+page_owner_capture_from_original(Buffer buffer, const BufferTag *tag,
+	uint64 *generation, uint64 *epoch, uint8 *state)
+{
+	BufferDesc *buf = GetBufferDescriptor(0);
+	ClusterPcmXWriterLedgerEntry *entry = &cluster_bufmgr_pcm_x_writer_ledger[0];
+	ClusterPcmXWriterLedgerEntry saved_entry = *entry;
+	ClusterPcmOwnEntry own, *saved_array = ClusterPcmOwnArray;
+	BufferTag saved_tag = buf->tag;
+	uint32 saved_state = pg_atomic_read_u32(&buf->state);
+	uint8 saved_pcm = buf->pcm_state, saved_type = buf->buffer_type;
+	bool saved_x = local_x, result;
+	int32 saved_pins = backend_pin_count;
+
+	UT_ASSERT_EQ(saved_state & BM_LOCKED, 0);
+	memset(&own, 0, sizeof(own));
+	pg_atomic_init_u64(&own.generation, page_owner_capture_generation);
+	pg_atomic_init_u64(&own.reservation_token, page_owner_capture_ok ? 0 : 1);
+	pg_atomic_init_u64(&own.writer_activation_token, 0);
+	pg_atomic_init_u64(&own.resource_x_activation_generation, 0);
+	pg_atomic_init_u32(&own.flags, page_owner_capture_ok ? 0 : PCM_OWN_FLAG_REVOKING);
+	pg_atomic_init_u64(&own.delivery_attempt, 0);
+	ClusterPcmOwnArray = &own;
+	buf->tag = *tag; buf->pcm_state = PCM_STATE_X; buf->buffer_type = BUF_TYPE_CURRENT;
+	pg_atomic_write_u32(&buf->state, BM_VALID);
+	memset(entry, 0, sizeof(*entry));
+	entry->phase = PCM_X_WRITER_LEDGER_ACTIVE; entry->buffer_id = buf->buf_id;
+	entry->content_lock = BufferDescriptorGetContentLock(buf);
+	entry->authority = original_writer_context;
+	entry->authority.ref.assertion.resource = *tag;
+	entry->authority.buffer_ownership_generation = page_owner_capture_generation;
+	entry->granted.tag = *tag; entry->granted.generation = page_owner_capture_generation;
+	entry->granted.pcm_state = PCM_STATE_X;
+	local_x = true; backend_pin_count = saved_pins + 1;
+	result = original_touch_capture_authority(buffer, tag, generation, epoch, state);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&buf->state), BM_VALID);
+	UT_ASSERT_EQ(result, page_owner_capture_ok);
+	if (!result)
+	{
+		UT_ASSERT_EQ(*generation, 0); UT_ASSERT_EQ(*epoch, 0); UT_ASSERT_EQ(*state, PCM_STATE_N);
+		page_owner_native_authority_refusals++;
+	}
+	else
+	{
+		UT_ASSERT_EQ(*generation, page_owner_capture_generation);
+		UT_ASSERT_EQ(*epoch, 9); UT_ASSERT_EQ(*state, PCM_STATE_X);
+	}
+	local_x = saved_x; backend_pin_count = saved_pins;
+	*entry = saved_entry; ClusterPcmOwnArray = saved_array;
+	buf->tag = saved_tag; buf->pcm_state = saved_pcm; buf->buffer_type = saved_type;
+	pg_atomic_write_u32(&buf->state, saved_state);
+	page_owner_native_authority_calls++;
+	return result;
+}
+
 static bool
 page_owner_capture_authority(Buffer buffer, const BufferTag *tag,
 	uint64 *generation, uint64 *epoch, uint8 *state)
@@ -12563,6 +12677,11 @@ page_owner_capture_authority(Buffer buffer, const BufferTag *tag,
 	UT_ASSERT(RelFileLocatorEquals(BufTagGetRelFileLocator(tag), page_owner_registration_source->key.rloc));
 	UT_ASSERT_EQ(tag->forkNum, page_owner_registration_source->key.forknum);
 	UT_ASSERT_EQ(tag->blockNum, page_owner_registration_source->key.block);
+	if (page_owner_use_native_authority)
+	{
+		page_owner_capture_calls++;
+		return page_owner_capture_from_original(buffer, tag, generation, epoch, state);
+	}
 	*generation = page_owner_capture_generation; *epoch = 9; *state = PCM_STATE_X;
 	page_owner_capture_calls++;
 	return page_owner_capture_ok;
@@ -13250,6 +13369,23 @@ full_source_then_recent_case(bool batch, bool late_receiver)
 	full_source_then_recent_lifecycle_case(batch, late_receiver, false, 0, 0);
 }
 
+UT_TEST(test_original_bufmgr_authority_feeds_touch_registration_and_recent_freeze)
+{
+	page_owner_use_native_authority = true;
+	page_owner_native_authority_calls = page_owner_native_authority_refusals = 0;
+	page_owner_use_registration = page_owner_use_xact_owner = page_owner_use_range = page_owner_use_full_batch = native_exit_use_page_owner_discharge = true;
+	page_owner_registered_records = 0;
+	for (unsigned retirement = 1; retirement <= 2; retirement++)
+		for (unsigned batch = 0; batch < 2; batch++)
+			full_source_then_recent_lifecycle_case(batch != 0, false, true, 2, retirement);
+	UT_ASSERT_EQ(page_owner_registered_records, 32);
+	UT_ASSERT_EQ(page_owner_native_authority_calls, 80);
+	UT_ASSERT_EQ(page_owner_native_authority_refusals, 16);
+	UT_ASSERT(ClusterPcmOwnArray == NULL);
+	page_owner_use_registration = page_owner_use_xact_owner = page_owner_use_range = page_owner_use_full_batch = native_exit_use_page_owner_discharge = false;
+	page_owner_use_native_authority = false;
+}
+
 UT_TEST(test_original_exact_touch_registration_feeds_finish_and_recent_freeze)
 {
 	page_owner_use_registration = page_owner_use_xact_owner = page_owner_use_range = page_owner_use_full_batch = native_exit_use_page_owner_discharge = true;
@@ -13609,7 +13745,7 @@ UT_TEST(test_recent_xmin_share_lock_refusal_keeps_borrowed_pin_without_upgrade)
 int
 main(void)
 {
-	UT_PLAN(308);
+	UT_PLAN(309);
 
 	UT_RUN(test_pin_free_admitted_phase_reaches_recent_native_wal_before_owner_leave);
 	UT_RUN(test_pin_free_phase_recent_refusal_retires_only_its_original_owner);
@@ -13618,6 +13754,7 @@ main(void)
 	UT_RUN(test_recent_refused_receiver_keeps_original_cut_and_native_continuation);
 	UT_RUN(test_full_original_source_reaches_pin_free_collector_and_recent_wal);
 	UT_RUN(test_full_original_source_late_receiver_revokes_recent_wal);
+	UT_RUN(test_original_bufmgr_authority_feeds_touch_registration_and_recent_freeze);
 	UT_RUN(test_original_exact_touch_registration_feeds_finish_and_recent_freeze);
 	UT_RUN(test_original_top_xact_finish_retires_local_touches_before_recent_freeze);
 	UT_RUN(test_original_page_owner_range_groups_reused_slot_before_recent_freeze);

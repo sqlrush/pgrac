@@ -88,6 +88,20 @@ static PGAlignedBlock wal_image;
 static ReadBufferMode read_mode;
 static int last_lock_mode;
 static jmp_buf error_jump;
+static unsigned retry_replacements, retry_cancel_after, retry_handoffs, retry_cancellations;
+volatile sig_atomic_t InterruptPending;
+
+/* A real init handoff has already released the obsolete pin. Cancellation
+ * must be observed before the relation-aware loop fetches another mapping. */
+void
+ProcessInterrupts(void)
+{
+	if (!expecting_error || pins != 0 || locks != unlocks || CritSectionCount != 0)
+		abort();
+	InterruptPending = false;
+	retry_cancellations++;
+	elog(ERROR, "controlled cancellation at unpinned VM initialization retry");
+}
 
 /* The original native VM routine calls these through its normal interfaces. */
 static Buffer vm_readbuf(Relation rel, BlockNumber block, bool extend);
@@ -264,6 +278,14 @@ LockBufferForVisibilityMapPageInit(Buffer buffer)
 {
 	if (buffer != 1 || pins != 1)
 		abort();
+	if (retry_replacements > 0) {
+		retry_replacements--;
+		retry_handoffs++;
+		ReleaseBuffer(buffer);
+		if (retry_cancel_after != 0 && retry_handoffs == retry_cancel_after)
+			InterruptPending = true;
+		return InvalidBuffer;
+	}
 	if (release_on_lock) {
 		release_on_lock = false;
 		ReleaseBuffer(buffer);
@@ -444,6 +466,8 @@ reset(bool shared)
 	fixture_locator = relation.rd_locator;
 	fixture_fork = VISIBILITYMAP_FORKNUM;
 	fixture_block = 0;
+	retry_replacements = retry_cancel_after = retry_handoffs = retry_cancellations = 0;
+	InterruptPending = false;
 }
 
 UT_TEST(test_shared_read_observes_zero_without_initialization)
@@ -851,10 +875,132 @@ UT_TEST(test_write_pin_reuses_exact_initialized_target_without_io)
 	ReleaseBuffer(buffer);
 }
 
+/* Execute the full original VM lookup; only its I/O and init-handoff edges
+ * above are controlled. A failed call returns no caller-owned buffer. */
+static Buffer
+try_vm_init(bool extend)
+{
+	expecting_error = true;
+	if (setjmp(error_jump) == 0) {
+		Buffer result = vm_readbuf(&relation, 0, extend);
+
+		expecting_error = false;
+		return result;
+	}
+	expecting_error = false;
+	return InvalidBuffer;
+}
+
+UT_TEST(test_shared_init_cancel_after_replacement_cannot_fetch_or_publish_again)
+{
+	for (int missing = 0; missing < 2; missing++) {
+		for (int replacements = 1; replacements <= 4; replacements += 3) {
+			for (int cancel_at = 1; cancel_at <= replacements; cancel_at += 3) {
+				Buffer result;
+
+				reset(true);
+				if (missing)
+					storage.smgr_cached_nblocks[VISIBILITYMAP_FORKNUM] = 0;
+				retry_replacements = replacements;
+				retry_cancel_after = cancel_at;
+				result = try_vm_init(true);
+				UT_ASSERT_EQ(result, InvalidBuffer);
+				UT_ASSERT_EQ(retry_cancellations, 1);
+				UT_ASSERT_EQ(retry_handoffs, cancel_at);
+				UT_ASSERT_EQ(reads, cancel_at);
+				UT_ASSERT_EQ(extensions, missing);
+				UT_ASSERT_EQ(invalidations, missing);
+				UT_ASSERT_EQ(identities, 1);
+				UT_ASSERT_EQ(pins + locks + unlocks + init_calls + dirty + wal_records, 0);
+				UT_ASSERT_EQ(releases, cancel_at);
+				UT_ASSERT(PageIsNew(vm.data));
+				UT_ASSERT_EQ(((PageHeader)vm.data)->pd_block_scn, 0);
+				if (BufferIsValid(result))
+					ReleaseBuffer(result);
+			}
+		}
+	}
+}
+
+UT_TEST(test_pending_shared_vm_cancel_precedes_first_storage_access)
+{
+	for (int extend = 0; extend < 2; extend++) {
+		Buffer result;
+
+		reset(true);
+		InterruptPending = true;
+		result = try_vm_init(extend != 0);
+		UT_ASSERT_EQ(result, InvalidBuffer);
+		UT_ASSERT_EQ(retry_cancellations, 1);
+		UT_ASSERT_EQ(identities, extend);
+		UT_ASSERT_EQ(reads + extensions + invalidations + pins + locks + init_calls + dirty, 0);
+		UT_ASSERT(PageIsNew(vm.data));
+		if (BufferIsValid(result))
+			ReleaseBuffer(result);
+	}
+}
+
+UT_TEST(test_shared_init_replacements_without_cancel_preserve_one_initialization)
+{
+	for (int missing = 0; missing < 2; missing++) {
+		for (int replacements = 1; replacements <= 4; replacements += 3) {
+			Buffer result;
+
+			reset(true);
+			if (missing)
+				storage.smgr_cached_nblocks[VISIBILITYMAP_FORKNUM] = 0;
+			retry_replacements = replacements;
+			result = try_vm_init(true);
+			UT_ASSERT_EQ(result, 1);
+			UT_ASSERT_EQ(retry_cancellations, 0);
+			UT_ASSERT_EQ(retry_handoffs, replacements);
+			UT_ASSERT_EQ(reads, replacements + 1);
+			UT_ASSERT_EQ(releases, replacements);
+			UT_ASSERT_EQ(extensions, missing);
+			UT_ASSERT_EQ(invalidations, missing);
+			UT_ASSERT_EQ(identities, 1);
+			UT_ASSERT_EQ(pins, 1);
+			UT_ASSERT_EQ(locks, 1);
+			UT_ASSERT_EQ(unlocks, 1);
+			UT_ASSERT_EQ(init_calls, 1);
+			UT_ASSERT_EQ(((PageHeader)vm.data)->pd_block_scn, 101);
+			ReleaseBuffer(result);
+			UT_ASSERT_EQ(pins, 0);
+		}
+	}
+}
+
+UT_TEST(test_nonversioned_vm_lookup_keeps_original_interrupt_and_init_profile)
+{
+	for (int profile = 0; profile < 2; profile++) {
+		Buffer result;
+
+		reset(profile != 0);
+		if (profile)
+			relform.relpersistence = RELPERSISTENCE_UNLOGGED;
+		InterruptPending = true;
+		result = try_vm_init(false);
+		UT_ASSERT_EQ(result, 1);
+		UT_ASSERT_EQ(retry_cancellations + identities + init_calls, 0);
+		UT_ASSERT_EQ(reads, 1);
+		UT_ASSERT_EQ(read_mode, RBM_ZERO_ON_ERROR);
+		UT_ASSERT(!PageIsNew(vm.data));
+		UT_ASSERT_EQ(pins, 1);
+		UT_ASSERT_EQ(locks, 1);
+		UT_ASSERT_EQ(unlocks, 1);
+		ReleaseBuffer(result);
+		UT_ASSERT_EQ(pins, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(19);
+	UT_PLAN(23);
+	UT_RUN(test_shared_init_cancel_after_replacement_cannot_fetch_or_publish_again);
+	UT_RUN(test_pending_shared_vm_cancel_precedes_first_storage_access);
+	UT_RUN(test_shared_init_replacements_without_cancel_preserve_one_initialization);
+	UT_RUN(test_nonversioned_vm_lookup_keeps_original_interrupt_and_init_profile);
 	UT_RUN(test_cold_truncate_reads_clear_tail_without_mutation);
 	UT_RUN(test_cold_truncate_rejects_nonclear_tail_and_wrong_mode);
 	UT_RUN(test_cold_truncate_page_boundary_and_short_fork_need_no_read);

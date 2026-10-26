@@ -2720,6 +2720,16 @@ test_cluster_heap_itl_finish_discharge.inc: $(top_srcdir)/src/backend/cluster/cl
 	     END { if (found != 14 || done != 14 || emit || structure || structures != 5 || constants != 1 || initial_constants != 1 || starts != 1 || stops != 1) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_heap_touch_authority.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	@awk '/^cluster_pcm_own_snapshot_post_state_locked\(/ { print "static inline void"; emit=1; found++ } \
+	     /^cluster_pcm_own_snapshot_locked\(/ { print "static inline void"; emit=1; found++ } \
+	     /^cluster_bufmgr_pcm_x_retained_image_locked\(/ { print "static inline bool"; emit=1; found++ } \
+	     /^LockBufHdr\(/ { print "static uint32"; emit=1; found++ } \
+	     /^cluster_bufmgr_terminal_stamp_authority\(/ { print "static bool"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (found != 5 || done != 5 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_heap_itl_publication.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
 	@awk '/^static const ClusterShmemRegion cluster_ctrc_region =/ { boundary++; exit } \
 	     /^cluster_ctrc_note_publication_after_apply\(/ { print "static void"; emit=1; found++ } \
@@ -2826,6 +2836,7 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_heap_ctrc_participant.inc test_cluster_heap_ctrc_terminal.inc \
 		test_cluster_heap_itl_finish_discharge.inc \
 		test_cluster_heap_itl_publication.inc \
+		test_cluster_heap_touch_authority.inc \
 		$(top_srcdir)/src/include/utils/memutils.h \
 		$(top_srcdir)/src/include/utils/palloc.h \
 		$(top_srcdir)/src/include/cluster/cluster_itl_touch.h \
@@ -6327,6 +6338,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_heap_ctrc_terminal.inc test_cluster_heap_ctrc_terminal.inc.tmp
 	rm -f test_cluster_heap_itl_finish_discharge.inc test_cluster_heap_itl_finish_discharge.inc.tmp
 	rm -f test_cluster_heap_itl_publication.inc test_cluster_heap_itl_publication.inc.tmp
+	rm -f test_cluster_heap_touch_authority.inc test_cluster_heap_touch_authority.inc.tmp
 	rm -f test_cluster_heap_ctrc_certificate.inc test_cluster_heap_ctrc_certificate.inc.tmp
 	rm -f test_cluster_heap_ctrc_ack.inc test_cluster_heap_ctrc_ack.inc.tmp
 	rm -f test_cluster_heap_ctrc_origin_reply.inc test_cluster_heap_ctrc_origin_reply.inc.tmp
