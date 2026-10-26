@@ -21,6 +21,7 @@
 #include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_recovery_tt_record.h"
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_side_online_plan.h"
 #include "cluster/cluster_wal_inputs.h"
 #include "cluster/cluster_wal_retention.h"
 #include "cluster/cluster_wal_thread.h"
@@ -3004,6 +3005,117 @@ cluster_wal_inputs_relmap_source_revalidate_v1(const ClusterRecoveryRelmapSource
 	if (!ok)
 		cluster_wal_inputs_relmap_source_fail_v1(&original);
 	return ok;
+}
+
+/* Resolve only an original generation's immutable SIDE plan. Census order
+ * and replay-origin order are distinct; neither is a typed participant index.
+ * This supplies carrier correspondence, never native era/lifetime or COMPLETE. */
+static const RfSideOnlinePlanV1 *
+inputs_relmap_terminal_plan(const ClusterRecoveryRelmapSourceV1 *source)
+{
+	const ClusterColdTypedV1 *typed;
+	const ClusterColdParticipantV1 *participant;
+	const RfSideOnlinePlanV1 *plan;
+	RfContributorStreamCutV1 cut = {0};
+	uint32 found = CLUSTER_COLD_MAX_PARTICIPANTS;
+
+	if (!cluster_wal_inputs_relmap_source_current_v1(source))
+		return NULL;
+	typed = ClusterColdRecoveryTxInputs(source->scope->ctrc.start);
+	if (typed == NULL || typed != source->scope->ctrc.inputs
+		|| typed->participant_count == 0 || typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
+		|| source->selected.kind != CLUSTER_WAL_INPUT_CHECKPOINT)
+		return NULL;
+	for (uint32 i = 0; i < typed->participant_count; i++) {
+		if (memcmp(&typed->sources[i], &source->selected.source, sizeof(typed->sources[i])) != 0)
+			continue;
+		if (found != CLUSTER_COLD_MAX_PARTICIPANTS)
+			return NULL;
+		found = i;
+	}
+	if (found == CLUSTER_COLD_MAX_PARTICIPANTS || typed->side_capture_detail[found] != 0
+		|| (plan = typed->side_plans[found]) == NULL)
+		return NULL;
+	participant = &typed->participants[found];
+	if (participant->thread_id != source->selected.source.claim.identity.origin_thread_id
+		|| participant->owner_incarnation != source->selected.source.claim.identity.origin_owner_incarnation
+		|| participant->timeline != source->selected.source.timeline
+		|| participant->physical_lower != source->selected.checkpoint.checkpoint_lower_lsn
+		|| participant->tail_end != source->selected.checkpoint.validated_tail_lsn_exclusive)
+		return NULL;
+	cut.failed_thread = participant->thread_id;
+	cut.timeline_id = participant->timeline;
+	cut.origin_owner_incarnation = participant->owner_incarnation;
+	cut.scan_begin_inclusive = participant->physical_lower;
+	cut.scan_end_exclusive = participant->tail_end;
+	cut.flags = RF_CONTRIBUTOR_CUT_COMPLETE
+		| (cut.scan_begin_inclusive == cut.scan_end_exclusive ? RF_CONTRIBUTOR_CUT_EXPLICIT_EMPTY : 0);
+	return rf_side_online_plan_participant_count_v1(plan) == 1
+		&& rf_side_online_plan_recovery_source_matches_v1(plan, typed->system_identifier,
+			source->selected.source.claim.identity.storage_uuid, &cut)
+		&& rf_side_online_plan_replay_start_matches_v1(plan, participant->thread_id,
+			participant->owner_incarnation, source->selected.source.claim.database_incarnation,
+			participant->native_redo)
+		&& rf_side_online_plan_recovery_sources_match_v1(plan, typed->sources, typed->participant_count)
+		&& cluster_wal_inputs_relmap_source_current_v1(source) ? plan : NULL;
+}
+
+/* One read-only observation under the original all-IR/WALR lifetime. A caller
+ * precondition refuses without poisoning an unrelated/stale value; after entry,
+ * any missing plan/carrier or ERROR revokes the whole original episode. */
+static uint32
+inputs_relmap_terminal_observe(const ClusterRecoveryRelmapSourceV1 *source,
+	const XLogReaderState *reader, bool match)
+{
+	ClusterRecoveryRelmapSourceV1 original;
+	const RfSideOnlinePlanV1 *plan;
+	uint32 count = UINT32_MAX;
+	bool ok = false, entered = false;
+
+	if (source == NULL || CritSectionCount != 0
+		|| cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
+		return UINT32_MAX;
+	memcpy(&original, source, sizeof(original));
+	PG_TRY();
+	{
+		/* Native owner checks can raise ERROR too. Keep ordinary false a
+		 * precondition refusal, but retain sticky failure on every ERROR. */
+		entered = cluster_wal_inputs_relmap_source_current_v1(&original);
+		plan = entered ? inputs_relmap_terminal_plan(&original) : NULL;
+		if (plan != NULL) {
+			count = rf_side_online_plan_native_terminal_count_v1(plan, &original.selected.source);
+			ok = count != UINT32_MAX
+				&& (!match || rf_side_online_plan_terminal_matches_v1(plan, &original.selected.source, reader))
+				&& inputs_relmap_terminal_plan(&original) == plan
+				&& memcmp(source, &original, sizeof(original)) == 0;
+		}
+	}
+	PG_CATCH();
+	{
+		cluster_wal_inputs_relmap_source_fail_v1(&original);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (!entered)
+		return UINT32_MAX;
+	if (!ok) {
+		cluster_wal_inputs_relmap_source_fail_v1(&original);
+		return UINT32_MAX;
+	}
+	return count;
+}
+
+uint32
+cluster_wal_inputs_relmap_terminal_count_v1(const ClusterRecoveryRelmapSourceV1 *source)
+{
+	return inputs_relmap_terminal_observe(source, NULL, false);
+}
+
+bool
+cluster_wal_inputs_relmap_terminal_matches_v1(const ClusterRecoveryRelmapSourceV1 *source,
+	const XLogReaderState *reader)
+{
+	return inputs_relmap_terminal_observe(source, reader, true) != UINT32_MAX;
 }
 
 typedef struct RelmapNativeInputRead {
