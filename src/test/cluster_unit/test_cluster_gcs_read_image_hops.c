@@ -1,4 +1,4 @@
-/* Exact legacy decoder and reply receiver with controlled disjoint dispatch boundaries.
+/* Exact reply decoder and receiver with controlled disjoint dispatch boundaries.
  * Slot storage is a private fixture projection, not a wire/authority model. */
 #include "postgres.h"
 
@@ -12,6 +12,7 @@
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_sf_dep.h"
+#include "port/pg_crc32c.h"
 #include "storage/backendid.h"
 #include "storage/buf_internals.h"
 #include "storage/condition_variable.h"
@@ -43,6 +44,9 @@ typedef struct ClusterGcsBlockOutstandingSlot {
 	ClusterSfDepVec reply_sf_dep_vec;
 	uint64 reply_undo_tt_generation, reply_undo_authority_scn;
 	ConditionVariable reply_cv;
+	struct {
+		bool delivery_closed;
+	} first_fill;
 } ClusterGcsBlockOutstandingSlot;
 typedef struct ClusterGcsBlockBackendBlock {
 	LWLockPadded lock;
@@ -105,8 +109,6 @@ static bool gcs_block_try_land_ctrc_reply(const ClusterICEnvelope *e pg_attribut
 										const void *p pg_attribute_unused()) { return false; }
 static bool gcs_block_try_land_current_mx_reply(const ClusterICEnvelope *e pg_attribute_unused(),
 											  const void *p pg_attribute_unused()) { return false; }
-static bool gcs_block_try_land_r4_terminal_reply(const ClusterICEnvelope *e pg_attribute_unused(),
-											   const void *p pg_attribute_unused()) { return false; }
 bool
 cluster_cr_server_r4_land_foreign_undo(const ClusterICEnvelope *e pg_attribute_unused(),
 									 const GcsBlockReplyHeader *h pg_attribute_unused(),
@@ -154,6 +156,193 @@ reset_fixture(bool trace)
 	logs[0] = '\0';
 }
 static void receive(void) { cluster_gcs_handle_block_reply_envelope(&envelope, &payload); }
+
+static void
+r4_tx_fixture(void)
+{
+	ClusterTxResolution resolution = { 0 };
+
+	reset_fixture(false);
+	blocks[1].slots[0].reply_domain = CLUSTER_GCS_BLOCK_REPLY_DOMAIN_R4_CR;
+	blocks[1].slots[0].expected_master_node = 1;
+	payload.hdr.epoch = 70;
+	payload.hdr.status = GCS_BLOCK_REPLY_R4_TX_RESOLVE_RESULT;
+	GcsBlockReplyHeaderSetForwardingMasterNode(&payload.hdr, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+	resolution.locator_echo.uba.raw[0] = UINT64CONST(0x0102030405060708);
+	resolution.locator_echo.uba.raw[1] = UINT64CONST(0x1112131415161718);
+	resolution.locator_echo.xid = 798;
+	resolution.locator_echo.tt_wrap = 7;
+	resolution.locator_echo.itl_kind = ITL_FLAG_ACTIVE;
+	resolution.locator_echo.itl_slot_index = 3;
+	resolution.top_xid = 700;
+	resolution.outcome = CLUSTER_TX_COMMITTED;
+	resolution.proof_kind = CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG;
+	resolution.commit_scn = 9001;
+	resolution.authority.origin_epoch = 70;
+	resolution.authority.tt_generation = 77;
+	resolution.authority.authority_scn = 9002;
+	UT_ASSERT(ClusterR4TxVerdictPageEncode((uint8 *)payload.data, &resolution));
+	/* Independent CRC32C vector for this entire canonical page. */
+	payload.hdr.checksum = UINT32_C(0xd3c893eb);
+	envelope.msg_type = PGRAC_IC_MSG_GCS_BLOCK_REPLY;
+	envelope.epoch = 70;
+}
+
+UT_TEST(r4_tx_exact_reply_publishes_once_without_rewriting_a_consumer)
+{
+	ClusterGcsBlockBackendBlock before[4];
+	ClusterGcsBlockOutstandingSlot *slot;
+
+	r4_tx_fixture();
+	slot = &blocks[1].slots[0];
+	slot->reply_sf_dep_valid = slot->reply_undo_trailer_valid = true;
+	slot->reply_sf_flags = 255;
+	slot->reply_sf_dep_vec.required[1] = 55;
+	slot->reply_undo_tt_generation = 66;
+	slot->reply_undo_authority_scn = 77;
+	receive();
+	UT_ASSERT(slot->reply_received && locks == 0 && signals == 1);
+	UT_ASSERT_EQ(memcmp(&slot->reply_header, &payload.hdr, sizeof(payload.hdr)), 0);
+	UT_ASSERT_EQ(memcmp(slot->reply_block_data, payload.data, BLCKSZ), 0);
+	UT_ASSERT(!slot->reply_sf_dep_valid && !slot->reply_undo_trailer_valid);
+	UT_ASSERT_EQ(slot->reply_sf_flags, 0);
+	UT_ASSERT(cluster_sf_dep_vec_is_empty(&slot->reply_sf_dep_vec));
+	UT_ASSERT_EQ(slot->reply_undo_tt_generation + slot->reply_undo_authority_scn, 0);
+	memcpy(before, blocks, sizeof(blocks));
+	/* A second checksum-valid terminal result cannot tear the first reply. */
+	payload.data[8] = CLUSTER_TX_ABORTED;
+	memset(payload.data + 40, 0, 8);
+	payload.hdr.checksum = UINT32_C(0x35d8e802);
+	receive();
+	UT_ASSERT_EQ(memcmp(before, blocks, sizeof(blocks)), 0);
+	UT_ASSERT_EQ(signals, 1);
+	UT_ASSERT_EQ(locks, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&counts.stale_reply_drop_count), 1);
+}
+
+UT_TEST(r4_tx_identity_and_shape_refuse_before_any_slot_mutation)
+{
+	const int drops[] = { 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 0 };
+	ClusterGcsBlockBackendBlock before[4];
+
+	for (int fault = 0; fault < lengthof(drops); fault++) {
+		r4_tx_fixture();
+		switch (fault) {
+		case 0:
+			payload.hdr.epoch = 69;
+			break;
+		case 1:
+			payload.hdr.epoch = 71;
+			break;
+		case 2:
+			envelope.source_node_id = 3;
+			break;
+		case 3:
+			envelope.dest_node_id = 3;
+			break;
+		case 4:
+			envelope.msg_type = PGRAC_IC_MSG_GCS_BLOCK_FORWARD;
+			break;
+		case 5:
+			payload.hdr.sender_node = 0;
+			break;
+		case 6:
+			payload.hdr.transition_id = PCM_TRANS_N_TO_X;
+			break;
+		case 7:
+			payload.hdr.checksum ^= 1;
+			break;
+		case 8:
+			envelope.payload_length--;
+			break;
+		case 9:
+			payload.hdr.requester_backend_id = 0;
+			break;
+		case 10:
+			payload.hdr.reserved_0[0] = 1;
+			break;
+		case 11:
+			GcsBlockReplyHeaderSetForwardingMasterNode(&payload.hdr, 0);
+			break;
+		case 12:
+			payload.hdr.page_lsn = 0;
+			break;
+		case 13:
+			payload.hdr.request_id = 999;
+			break;
+		}
+		memcpy(before, blocks, sizeof(blocks));
+		receive();
+		UT_ASSERT_EQ(memcmp(before, blocks, sizeof(blocks)), 0);
+		UT_ASSERT_EQ(signals + locks, 0);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&counts.stale_reply_drop_count), drops[fault]);
+	}
+	r4_tx_fixture();
+	receive();
+	UT_ASSERT(blocks[1].slots[0].reply_received && signals == 1 && locks == 0);
+}
+
+UT_TEST(r4_tx_late_reply_cannot_populate_a_reused_owner_slot)
+{
+	for (int index = 0; index < MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND; index++) {
+		ClusterGcsBlockBackendBlock before[4];
+		ClusterGcsBlockOutstandingSlot seed;
+		ClusterGcsBlockOutstandingSlot *slot;
+
+		r4_tx_fixture();
+		seed = blocks[1].slots[0];
+		/* Retirement/reuse is a fixture input, not the real slot allocator. */
+		blocks[1].slots[0].in_use = false;
+		blocks[1].slots[index] = seed;
+		slot = &blocks[1].slots[index];
+		slot->request_id = 52;
+		blocks[1].slots[1 - index] = seed;
+		blocks[1].slots[1 - index].request_id = 90;
+		blocks[2].slots[0] = seed;
+		memcpy(before, blocks, sizeof(blocks));
+		receive(); /* The old request51 belongs to neither live owner here. */
+		UT_ASSERT_EQ(memcmp(before, blocks, sizeof(blocks)), 0);
+		UT_ASSERT_EQ(signals + locks, 0);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&counts.stale_reply_drop_count), 0);
+		payload.hdr.request_id = 52;
+		receive();
+		UT_ASSERT(slot->reply_received && signals == 1 && locks == 0);
+		UT_ASSERT_EQ(slot->reply_header.request_id, 52);
+		UT_ASSERT_EQ(memcmp(slot->reply_block_data, payload.data, BLCKSZ), 0);
+		UT_ASSERT_EQ(memcmp(&blocks[1].slots[1 - index], &before[1].slots[1 - index], sizeof(seed)),
+					 0);
+		UT_ASSERT_EQ(memcmp(&blocks[2], &before[2], sizeof(blocks[2])), 0);
+	}
+}
+
+UT_TEST(r4_tx_reply_preserves_foreign_domains_and_direct_owners)
+{
+	ClusterGcsBlockBackendBlock before[4];
+
+	for (int owner = 0; owner < 5; owner++) {
+		ClusterGcsBlockOutstandingSlot *slot;
+
+		r4_tx_fixture();
+		slot = &blocks[1].slots[0];
+		if (owner == 0)
+			slot->reply_domain = CLUSTER_GCS_BLOCK_REPLY_DOMAIN_LEGACY_ACQUIRE;
+		else if (owner == 1)
+			slot->reply_received = true;
+		else
+			slot->direct_state = owner == 2	  ? GCS_BLOCK_DIRECT_ARMED
+								 : owner == 3 ? GCS_BLOCK_DIRECT_LANDED
+											  : GCS_BLOCK_DIRECT_ABORTING;
+		slot->reply_block_data[0] = 99;
+		memcpy(before, blocks, sizeof(blocks));
+		receive();
+		UT_ASSERT_EQ(memcmp(before, blocks, sizeof(blocks)), 0);
+		UT_ASSERT_EQ(signals + locks, 0);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&counts.stale_reply_drop_count), 1);
+	}
+	r4_tx_fixture();
+	receive();
+	UT_ASSERT(blocks[1].slots[0].reply_received && signals == 1 && locks == 0);
+}
 
 UT_TEST(default_off_preserves_original_publish_and_signal)
 {
@@ -542,7 +731,7 @@ UT_TEST(forward_refusal_logging_stays_inside_original_refusal_branches)
 int
 main(void)
 {
-	UT_PLAN(32);
+	UT_PLAN(36);
 	UT_RUN(default_off_preserves_original_publish_and_signal);
 	UT_RUN(accepted_reply_logs_original_identity_after_unlock);
 	UT_RUN(epoch_refusal_keeps_result_bytes_unchanged);
@@ -575,6 +764,10 @@ main(void)
 	UT_RUN(decoder_log_error_follows_original_reset_and_counter);
 	UT_RUN(forward_rejection_capture_is_bounded_and_non_authoritative);
 	UT_RUN(forward_refusal_logging_stays_inside_original_refusal_branches);
+	UT_RUN(r4_tx_exact_reply_publishes_once_without_rewriting_a_consumer);
+	UT_RUN(r4_tx_identity_and_shape_refuse_before_any_slot_mutation);
+	UT_RUN(r4_tx_late_reply_cannot_populate_a_reused_owner_slot);
+	UT_RUN(r4_tx_reply_preserves_foreign_domains_and_direct_owners);
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;
 }
