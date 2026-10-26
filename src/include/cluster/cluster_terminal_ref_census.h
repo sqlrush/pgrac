@@ -1086,10 +1086,27 @@ typedef enum ClusterCapacityScopeV1 {
 #define CLUSTER_CAPACITY_UNPROVEN_REQUIRED_ACK UINT32_C(0x04)
 #define CLUSTER_CAPACITY_UNPROVEN_CANONICAL UINT32_C(0x08)
 #define CLUSTER_CAPACITY_UNPROVEN_OWNER UINT32_C(0x10)
+/* Local to one observation/wait. It is neither a transaction key nor a grant. */
+#define CLUSTER_CTRC_CAPACITY_SEGMENT_V1 1
+typedef struct ClusterCapacitySegmentIdentityV1 {
+	uint32 owner_instance;
+	uint32 segment_id;
+	uint32 segment_generation;
+	uint32 current_segment;
+	uint64 current_binding_generation;
+	uint64 epoch;
+	uint64 system_identifier;
+	uint64 origin_boot_incarnation;
+	uint64 formation_epoch;
+	uint64 admission_record_generation;
+	uint64 root_id;
+	uint64 root_generation;
+} ClusterCapacitySegmentIdentityV1;
 typedef struct ClusterCapacityObservationV1 {
 	ClusterCapacityReasonV1 reason;
 	ClusterCapacityScopeV1 scope;
 	ClusterCtrcTxnKeyV1 key;
+	ClusterCapacitySegmentIdentityV1 segment;
 	ClusterCtrcOriginState phase;
 	unsigned owner_worker;
 	uint64 owner_generation;
@@ -1109,6 +1126,12 @@ extern ClusterCapacityReasonV1
 cluster_ctrc_capacity_probe_pool_continuation_v1(uint32 current_segment, SCN horizon, uint64 epoch,
 												 const ClusterCtrcTxnKeyV1 *hint,
 												 ClusterCapacityObservationV1 *observation);
+/* Also discover original whole-segment GC after the transaction key retires.
+ * A zero key stays zero; segment identity must be sampled on every call. */
+extern ClusterCapacityReasonV1
+cluster_ctrc_capacity_probe_pool_segment_v1(uint32 current_segment, SCN horizon, uint64 epoch,
+											const ClusterCtrcTxnKeyV1 *hint,
+											ClusterCapacityObservationV1 *observation);
 
 /*
  * L11/L12 canonical release sampler for the current allocator GC.  The

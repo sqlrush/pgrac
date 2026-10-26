@@ -1885,6 +1885,8 @@ static CtrcCleanerBatch CtrcBatch;
 static CtrcCleanerOriginHint CtrcOriginHint[CTRC_CLEANER_ORIGINS];
 static uint64 CtrcDispatchCursor;
 static uint64 CtrcCertificateCursor;
+/* Scheduling only; no identity or authority survives a probe call. */
+static uint32 CtrcCapacitySegmentCursor;
 static int CtrcWorkerId = -1;
 static uint64 CtrcLocalProgress;
 static uint64 CtrcLocalPasses;
@@ -5277,19 +5279,19 @@ ctrc_capacity_hint_locked(uint64 epoch, uint32 current_segment, const ClusterCtr
  * Advance the original cursor without enlarging a cleaner action batch. */
 static unsigned
 ctrc_capacity_pool_candidates(uint64 epoch, uint32 current_segment, const ClusterCtrcTxnKeyV1 *hint,
-							  CtrcCapacityCandidate *candidates,
-							  ClusterCapacityObservationV1 *observation, bool *recheck)
+							  unsigned limit, CtrcCapacityCandidate *candidates,
+							  ClusterCapacityObservationV1 *observation, bool *recheck,
+							  bool *have_preferred)
 {
 	uint64 start = CtrcCertificateCursor % CtrcShared->origin_key_entries;
 	unsigned count = 0;
-	unsigned ordinary_limit = CTRC_CLEANER_CERTIFICATE_BATCH;
+	unsigned ordinary_limit = limit;
 	CtrcCapacityCandidate preferred;
-	bool have_preferred;
 
 	CHECK_FOR_INTERRUPTS();
 	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
-	have_preferred = ctrc_capacity_hint_locked(epoch, current_segment, hint, &preferred, recheck);
-	if (have_preferred)
+	*have_preferred = ctrc_capacity_hint_locked(epoch, current_segment, hint, &preferred, recheck);
+	if (*have_preferred)
 		ordinary_limit--;
 	for (uint64 visited = 0; visited < CtrcShared->origin_key_entries; visited++) {
 		uint64 index;
@@ -5314,7 +5316,7 @@ ctrc_capacity_pool_candidates(uint64 epoch, uint32 current_segment, const Cluste
 			observation->unproven_reasons |= CLUSTER_CAPACITY_UNPROVEN_PHASE;
 			continue;
 		}
-		if (count == ordinary_limit || (have_preferred && index == preferred.index))
+		if (count == ordinary_limit || (*have_preferred && index == preferred.index))
 			continue;
 		candidates[count].index = index;
 		candidates[count].seal_generation = origin->seal_generation;
@@ -5325,7 +5327,7 @@ ctrc_capacity_pool_candidates(uint64 epoch, uint32 current_segment, const Cluste
 	LWLockRelease(&CtrcShared->origin_lock);
 	/* Ordinary work wins first. The exact hint shares the same batch and
 	 * cannot displace the original cursor's next ordinary circumference. */
-	if (have_preferred)
+	if (*have_preferred)
 		candidates[count++] = preferred;
 	/* An empty complete circumference must still advance next position.
 	 * A full batch retains the successor of its last selected candidate. */
@@ -5350,6 +5352,280 @@ ctrc_capacity_pool_gc_context(uint32 segment_id, uint32 *record_segment)
 	*record_segment = cluster_undo_record_active_segment_id();
 	return *record_segment >= first && *record_segment - first < CLUSTER_UNDO_SEGS_PER_INSTANCE
 		   && *record_segment != segment_id;
+}
+
+typedef struct CtrcCapacitySegmentSample {
+	ClusterCapacitySegmentIdentityV1 identity;
+	ClusterSemanticAdmissionToken admission;
+	ClusterUndoBlock0LogicalKey logical;
+	ClusterUndoBlock0ResolvedRoot root;
+	ClusterUndoBlock0Generation generation;
+	ClusterUndoBlock0CurrentGuard guard;
+	PGAlignedBlock page;
+} CtrcCapacitySegmentSample;
+
+/* At most48 original rows under the original lock, with no physical I/O.
+ * Absence discovers work; only the admitted canonical sample can prove it. */
+static bool
+ctrc_capacity_segment_origins_absent(uint32 segment_id)
+{
+	uint64 start
+		= (uint64)((segment_id - 1) % CLUSTER_UNDO_SEGS_PER_INSTANCE) * TT_SLOTS_PER_SEGMENT;
+	bool absent = true;
+
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+	for (unsigned i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
+		if (!ctrc_bytes_zero(&ctrc_origin_entries()[start + i], sizeof(ClusterCtrcOriginEntry))) {
+			absent = false;
+			break;
+		}
+	}
+	LWLockRelease(&CtrcShared->origin_lock);
+	return absent;
+}
+
+/* Every bound terminal slot has its own stable native bracket. Unused and
+ * recyclable slots retain the original retention predicate's acceptance. */
+static bool
+ctrc_capacity_segment_native(const UndoSegmentHeaderData *header)
+{
+	for (unsigned i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
+		const TTSlot *slot = &header->tt_slots[i];
+		bool committed, aborted, active;
+
+		if (slot->status == TT_SLOT_UNUSED || slot->status == TT_SLOT_RECYCLABLE)
+			continue;
+		if (!TransactionIdIsNormal(slot->xid)
+			|| (slot->status != TT_SLOT_COMMITTED && slot->status != TT_SLOT_ABORTED))
+			return false;
+		committed = TransactionIdDidCommit(slot->xid);
+		aborted = TransactionIdDidAbort(slot->xid);
+		active = TransactionIdIsInProgress(slot->xid);
+		if (committed != TransactionIdDidCommit(slot->xid)
+			|| aborted != TransactionIdDidAbort(slot->xid)
+			|| active != TransactionIdIsInProgress(slot->xid) || active
+			|| committed != (slot->status == TT_SLOT_COMMITTED)
+			|| aborted != (slot->status == TT_SLOT_ABORTED))
+			return false;
+	}
+	return true;
+}
+
+/* CURRENT identity is copied under its original TT lock, never an origin key. */
+static bool
+ctrc_capacity_segment_current(const ClusterCapacitySegmentIdentityV1 *identity)
+{
+	ClusterTTSlotCurrentSnapshot snapshot;
+
+	return cluster_tt_slot_current_snapshot(cluster_node_id, &snapshot)
+		   && snapshot.segment_id == identity->current_segment
+		   && snapshot.binding_generation == identity->current_binding_generation
+		   && identity->epoch == cluster_epoch_get_current()
+		   && identity->system_identifier == GetSystemIdentifier()
+		   && identity->origin_boot_incarnation == cluster_qvotec_get_self_incarnation();
+}
+
+/* Original admission/root recheck, usable both while held and after release.
+ * Canonical generation itself is compared only under the original guard. */
+static bool
+ctrc_capacity_segment_root_current(const CtrcCapacitySegmentSample *sample)
+{
+	ClusterUndoBlock0ResolvedRoot root = { 0 };
+
+	return cluster_semantic_activation_recheck_r4_terminal_census(&sample->admission)
+		   && cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
+			   &sample->admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, sample->logical.owner_instance,
+			   sample->logical.segment_id, &root)
+		   && cluster_undo_block0_root_matches(&sample->root, &root);
+}
+
+static bool
+ctrc_capacity_segment_read(CtrcCapacitySegmentSample *sample, SCN horizon)
+{
+	const UndoSegmentHeaderData *header = (const UndoSegmentHeaderData *)sample->page.data;
+	ClusterUndoBlock0Generation final_generation = { false, 0 };
+
+	if (cluster_undo_block0_current_sample_generation(&sample->guard, &sample->root,
+													  &sample->generation)
+			!= CLUSTER_UNDO_BLOCK0_OK
+		|| !sample->generation.known || sample->generation.value == 0
+		|| sample->generation.value == UINT32_MAX
+		|| cluster_undo_block0_current_copy_resident(&sample->guard, &sample->root,
+													 &sample->generation, sample->page.data)
+			   != CLUSTER_UNDO_BLOCK0_OK
+		|| header->segment_id != sample->logical.segment_id
+		|| header->owner_instance != sample->logical.owner_instance
+		|| header->wrap_count != sample->generation.value
+		|| header->tt_slots_count != TT_SLOTS_PER_SEGMENT
+		|| !cluster_undo_segment_recyclable_for_mode(header, horizon, true)
+		|| !ctrc_capacity_segment_native(header) || !ctrc_capacity_segment_root_current(sample)
+		|| cluster_undo_block0_current_sample_generation(&sample->guard, &sample->root,
+														 &final_generation)
+			   != CLUSTER_UNDO_BLOCK0_OK
+		|| !final_generation.known || final_generation.value != sample->generation.value)
+		return false;
+	sample->identity.segment_generation = sample->generation.value;
+	return true;
+}
+
+/* One original admitted SCUR, including its original pending/release cleanup.
+ * The returned page is only a wait observation; it never admits reuse or GC. */
+static bool
+ctrc_capacity_segment_sample(CtrcCapacitySegmentSample *sample, SCN horizon)
+{
+	ClusterUndoBlock0CurrentStep step;
+	ClusterUndoBlock0Result failure = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+	volatile bool active = false;
+	bool proven = false;
+
+	if (cluster_semantic_activation_enter_r4_terminal_census(&sample->admission)
+		!= CLUSTER_SEMANTIC_ADMISSION_OK)
+		return false;
+	PG_TRY();
+	{
+		if (sample->admission.formation_epoch == 0 || sample->admission.record_generation == 0
+			|| !cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
+				&sample->admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+				sample->logical.owner_instance, sample->logical.segment_id, &sample->root)
+			|| sample->root.intent != CLUSTER_UNDO_PATH_RUNTIME_SHARED || sample->root.root_id == 0
+			|| sample->root.root_generation == 0)
+			goto segment_done;
+		step = cluster_undo_block0_current_acquire_begin_admitted(
+			&sample->logical, CLUSTER_UNDO_BLOCK0_SCUR, cluster_ges_request_timeout_ms,
+			&sample->admission, &sample->guard, &failure);
+		if (step == CLUSTER_UNDO_BLOCK0_CURRENT_FAILED)
+			goto segment_done;
+		active = true;
+		while (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING) {
+			CHECK_FOR_INTERRUPTS();
+			step = cluster_undo_block0_current_acquire_poll(&sample->guard, &failure);
+			if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING
+				&& !cluster_undo_block0_current_wait_reply(
+					&sample->guard, CLUSTER_UNDO_BLOCK0_WAIT_CTRC_CLEANER_SAMPLE_ACQUIRE))
+				pg_usleep(1000L);
+		}
+		if (step == CLUSTER_UNDO_BLOCK0_CURRENT_HELD)
+			proven = ctrc_capacity_segment_read(sample, horizon);
+	segment_done:
+		if (active) {
+			step = cluster_undo_block0_current_release_begin(&sample->guard, &failure);
+			while (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING) {
+				CHECK_FOR_INTERRUPTS();
+				step = cluster_undo_block0_current_release_poll(&sample->guard, &failure);
+				if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING
+					&& !cluster_undo_block0_current_wait_reply(
+						&sample->guard, CLUSTER_UNDO_BLOCK0_WAIT_CTRC_CLEANER_SAMPLE_RELEASE))
+					pg_usleep(1000L);
+			}
+			active = false;
+			proven = proven && step == CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED;
+		}
+		proven = proven && ctrc_capacity_segment_root_current(sample)
+				 && ctrc_capacity_segment_current(&sample->identity);
+	}
+	PG_CATCH();
+	{
+		if (active)
+			cluster_undo_block0_current_cancel(&sample->guard);
+		cluster_semantic_activation_leave(&sample->admission);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	cluster_semantic_activation_leave(&sample->admission);
+	if (proven) {
+		sample->identity.formation_epoch = sample->admission.formation_epoch;
+		sample->identity.admission_record_generation = sample->admission.record_generation;
+		sample->identity.root_id = sample->root.root_id;
+		sample->identity.root_generation = sample->root.root_generation;
+	}
+	return proven;
+}
+
+static bool
+ctrc_capacity_unarmed_gc_candidate(uint32 segment_id, uint32 current_segment, SCN horizon,
+								   uint64 epoch, ClusterCapacityObservationV1 *observation)
+{
+	CtrcCapacitySegmentSample sample;
+	ClusterTTSlotCurrentSnapshot current;
+	const UndoSegmentHeaderData *header = (const UndoSegmentHeaderData *)sample.page.data;
+	uint32 record, final_record;
+	uint64 coordinator, worker, final_coordinator, final_worker;
+	unsigned worker_id = (segment_id - 1) % CLUSTER_CTRC_CLEANER_WORKERS;
+
+	MemSet(&sample, 0, sizeof(sample));
+	if (!ctrc_capacity_pool_gc_context(segment_id, &record)
+		|| !ctrc_capacity_segment_origins_absent(segment_id)
+		|| !cluster_undo_cleaner_capacity_owner_snapshot(worker_id, &coordinator, &worker)) {
+		observation->unproven_reasons |= CLUSTER_CAPACITY_UNPROVEN_OWNER;
+		return false;
+	}
+	if (!cluster_tt_slot_current_snapshot(cluster_node_id, &current)
+		|| current.segment_id != current_segment || current.segment_id == segment_id
+		|| current.binding_generation == 0 || current.binding_generation == UINT64_MAX) {
+		observation->unproven_reasons |= CLUSTER_CAPACITY_UNPROVEN_IDENTITY;
+		return false;
+	}
+	sample.logical.owner_instance = cluster_node_id + 1;
+	sample.logical.segment_id = segment_id;
+	sample.identity.owner_instance = sample.logical.owner_instance;
+	sample.identity.segment_id = segment_id;
+	sample.identity.current_segment = current.segment_id;
+	sample.identity.current_binding_generation = current.binding_generation;
+	sample.identity.epoch = epoch;
+	sample.identity.system_identifier = GetSystemIdentifier();
+	sample.identity.origin_boot_incarnation = cluster_qvotec_get_self_incarnation();
+	if (sample.identity.system_identifier == 0 || sample.identity.origin_boot_incarnation == 0
+		|| !ctrc_capacity_segment_sample(&sample, horizon)) {
+		observation->unproven_reasons |= CLUSTER_CAPACITY_UNPROVEN_CANONICAL;
+		return false;
+	}
+	if (!cluster_ctrc_reuse_handoff_complete(header, INVALID_TT_SLOT_OFFSET)
+		|| !ctrc_capacity_segment_origins_absent(segment_id)
+		|| !ctrc_capacity_pool_gc_context(segment_id, &final_record) || record != final_record
+		|| !cluster_undo_cleaner_capacity_owner_snapshot(worker_id, &final_coordinator,
+														 &final_worker)
+		|| coordinator != final_coordinator || worker != final_worker
+		|| !ctrc_capacity_segment_current(&sample.identity)) {
+		observation->unproven_reasons |= CLUSTER_CAPACITY_UNPROVEN_IDENTITY;
+		return false;
+	}
+	MemSet(&observation->key, 0, sizeof(observation->key));
+	observation->segment = sample.identity;
+	observation->scope = CLUSTER_CAPACITY_SCOPE_SEGMENT;
+	observation->phase = CTRC_ORIGIN_EMPTY;
+	observation->owner_worker = worker_id;
+	observation->coordinator_generation = coordinator;
+	observation->owner_generation = worker;
+	return true;
+}
+
+/* A separate bounded walk preserves GC fairness even if ordinary origin work
+ * repeatedly fails. Each attempted sample spends one of the same pool16 gets;
+ * skip only logical positions actually considered, never unprobed batches. */
+static bool
+ctrc_capacity_unarmed_gc_probe(uint32 current_segment, SCN horizon, uint64 epoch, unsigned budget,
+							   ClusterCapacityObservationV1 *observation)
+{
+	uint32 first = (uint32)cluster_node_id * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+	unsigned attempted = 0;
+
+	for (unsigned visited = 0; visited < CLUSTER_UNDO_SEGS_PER_INSTANCE && attempted < budget;
+		 visited++) {
+		uint32 segment_id = first + CtrcCapacitySegmentCursor % CLUSTER_UNDO_SEGS_PER_INSTANCE;
+		uint32 record;
+
+		CtrcCapacitySegmentCursor
+			= (CtrcCapacitySegmentCursor + 1) % CLUSTER_UNDO_SEGS_PER_INSTANCE;
+		CHECK_FOR_INTERRUPTS();
+		if (segment_id == current_segment || !ctrc_capacity_pool_gc_context(segment_id, &record)
+			|| !ctrc_capacity_segment_origins_absent(segment_id))
+			continue;
+		attempted++;
+		if (ctrc_capacity_unarmed_gc_candidate(segment_id, current_segment, horizon, epoch,
+											   observation))
+			return true;
+	}
+	return false;
 }
 
 /* An already-held old key can outlive its original publisher row. Reprove
@@ -5481,6 +5757,14 @@ ctrc_capacity_pool_finish(uint32 segment_id, uint64 epoch, bool recheck,
 		observation->unproven_reasons |= CLUSTER_CAPACITY_UNPROVEN_IDENTITY;
 	} else if (current != segment_id || recheck)
 		observation->reason = CLUSTER_CAPACITY_SUPPLY_RECHECK;
+	if (observation->reason == CLUSTER_CAPACITY_OWNER_PROGRESS_POSSIBLE
+		&& observation->segment.segment_id != 0
+		&& !ctrc_capacity_segment_current(&observation->segment)) {
+		observation->reason = CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER;
+		observation->unproven_reasons |= CLUSTER_CAPACITY_UNPROVEN_IDENTITY;
+	}
+	if (observation->reason != CLUSTER_CAPACITY_OWNER_PROGRESS_POSSIBLE)
+		MemSet(&observation->segment, 0, sizeof(observation->segment));
 	return observation->reason;
 }
 #endif
@@ -5494,16 +5778,17 @@ ctrc_capacity_pool_finish(uint32 segment_id, uint64 epoch, bool recheck,
  * the ordinary physical budget and cannot supply cached phase or authority.
  * Author: SqlRush <sqlrush@gmail.com>
  */
-ClusterCapacityReasonV1
-cluster_ctrc_capacity_probe_pool_continuation_v1(uint32 current_segment, SCN horizon, uint64 epoch,
-												 const ClusterCtrcTxnKeyV1 *hint,
-												 ClusterCapacityObservationV1 *observation)
+static ClusterCapacityReasonV1
+ctrc_capacity_probe_pool(uint32 current_segment, SCN horizon, uint64 epoch,
+						 const ClusterCtrcTxnKeyV1 *hint, bool allow_segments,
+						 ClusterCapacityObservationV1 *observation)
 {
 #ifndef CLUSTER_CTRC_UNIT_TEST
 	CtrcCapacityCandidate candidates[CTRC_CLEANER_CERTIFICATE_BATCH];
 	uint32 first;
 	uint32 current;
-	unsigned count;
+	unsigned count, ordinary;
+	bool have_preferred;
 	bool recheck = false;
 #endif
 
@@ -5528,16 +5813,32 @@ cluster_ctrc_capacity_probe_pool_continuation_v1(uint32 current_segment, SCN hor
 		return observation->reason;
 	}
 	observation->unproven_reasons = 0;
-	count = ctrc_capacity_pool_candidates(epoch, current_segment, hint, candidates, observation,
-										  &recheck);
-	for (unsigned i = 0; i < count; i++) {
+	count = ctrc_capacity_pool_candidates(epoch, current_segment, hint,
+										  CTRC_CLEANER_CERTIFICATE_BATCH - (allow_segments ? 1 : 0),
+										  candidates, observation, &recheck, &have_preferred);
+	ordinary = count - (have_preferred ? 1 : 0);
+	/* Keep ordinary work first and the exact hint last. Reserve one physical
+	 * slot for independent whole-GC even when ordinary work fills the batch. */
+	for (unsigned i = 0; i < count + (allow_segments ? 1 : 0); i++) {
 		ClusterCapacityReasonV1 reason;
+		unsigned candidate = i;
 
 		CHECK_FOR_INTERRUPTS();
-		observation->scope = candidates[i].key.segment_id == current_segment
+		if (allow_segments && i == ordinary) {
+			if (ctrc_capacity_unarmed_gc_probe(current_segment, horizon, epoch,
+											   CTRC_CLEANER_CERTIFICATE_BATCH - count,
+											   observation)) {
+				observation->reason = CLUSTER_CAPACITY_OWNER_PROGRESS_POSSIBLE;
+				return ctrc_capacity_pool_finish(current_segment, epoch, false, observation);
+			}
+			continue;
+		}
+		if (allow_segments && i > ordinary)
+			candidate--;
+		observation->scope = candidates[candidate].key.segment_id == current_segment
 								 ? CLUSTER_CAPACITY_SCOPE_SLOT
 								 : CLUSTER_CAPACITY_SCOPE_SEGMENT;
-		reason = ctrc_capacity_candidate_probe(&candidates[i], horizon, observation);
+		reason = ctrc_capacity_candidate_probe(&candidates[candidate], horizon, observation);
 		if (reason == CLUSTER_CAPACITY_OWNER_PROGRESS_POSSIBLE) {
 			observation->reason = reason;
 			return ctrc_capacity_pool_finish(current_segment, epoch, false, observation);
@@ -5551,8 +5852,25 @@ cluster_ctrc_capacity_probe_pool_continuation_v1(uint32 current_segment, SCN hor
 	(void)horizon;
 	(void)epoch;
 	(void)hint;
+	(void)allow_segments;
 #endif
 	return observation->reason;
+}
+
+ClusterCapacityReasonV1
+cluster_ctrc_capacity_probe_pool_continuation_v1(uint32 current_segment, SCN horizon, uint64 epoch,
+												 const ClusterCtrcTxnKeyV1 *hint,
+												 ClusterCapacityObservationV1 *observation)
+{
+	return ctrc_capacity_probe_pool(current_segment, horizon, epoch, hint, false, observation);
+}
+
+ClusterCapacityReasonV1
+cluster_ctrc_capacity_probe_pool_segment_v1(uint32 current_segment, SCN horizon, uint64 epoch,
+											const ClusterCtrcTxnKeyV1 *hint,
+											ClusterCapacityObservationV1 *observation)
+{
+	return ctrc_capacity_probe_pool(current_segment, horizon, epoch, hint, true, observation);
 }
 
 /*

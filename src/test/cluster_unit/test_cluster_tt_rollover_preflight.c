@@ -509,10 +509,46 @@ UT_TEST(test_retained_stats_preserve_unsigned_counts_for_every_valid_origin)
 	}
 }
 
+UT_TEST(test_actual_rollover_retires_old_volatile_origin_provenance)
+{
+	ClusterTTSlotAllocPerSegment *segment;
+	ClusterTTSlotCurrentSnapshot before, after;
+	ClusterCtrcTxnKeyV1 key, empty_key = { 0 };
+	ClusterTTSlotCurrentOwner owner, empty_owner = { 0 };
+	uint64 binding = 99;
+	bool had_active = true;
+
+	reset_rollover();
+	segment = &slot_storage.per_node[0];
+	/* Seed only the volatile provenance boundary. Publication is not mocked:
+	 * the original allocator performs the rollover and clears these bytes. */
+	segment->origins[7].key.segment_id = 1;
+	segment->origins[7].key.xid = 9123;
+	segment->origins[7].original_full_xid = FullTransactionIdFromEpochAndXid(1, 9123);
+	segment->origins[7].binding_generation = segment->binding_generation;
+	segment->slots[7].status = CTS_COMMITTED;
+	UT_ASSERT(cluster_tt_slot_current_snapshot(0, &before));
+	cluster_tt_slot_rollover(0, 2, &had_active);
+	UT_ASSERT(!had_active);
+	UT_ASSERT(cluster_tt_slot_current_snapshot(0, &after));
+	UT_ASSERT_EQ(after.segment_id, 2);
+	UT_ASSERT_EQ(after.binding_generation, before.binding_generation + 1);
+	for (unsigned i = 0; i < sizeof(segment->origins); i++)
+		UT_ASSERT_EQ(((const unsigned char *)segment->origins)[i], 0);
+	MemSet(&key, 0x7f, sizeof(key));
+	MemSet(&owner, 0x7f, sizeof(owner));
+	UT_ASSERT(!cluster_tt_slot_current_origin_snapshot(1, 7, &key, &owner, &binding));
+	UT_ASSERT_EQ(memcmp(&key, &empty_key, sizeof(key)), 0);
+	UT_ASSERT_EQ(memcmp(&owner, &empty_owner, sizeof(owner)), 0);
+	UT_ASSERT_EQ(binding, 0);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(14);
+	UT_RUN(test_actual_rollover_retires_old_volatile_origin_provenance);
 	UT_RUN(test_pure_selection_failure_proves_no_effects);
 	UT_RUN(test_passive_winner_adoption_has_no_local_effects);
 	UT_RUN(test_reselection_after_provision_or_reuse_never_regains_no_effects);

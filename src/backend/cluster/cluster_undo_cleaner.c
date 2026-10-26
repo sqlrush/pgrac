@@ -497,11 +497,41 @@ cluster_undo_cleaner_capacity_owner_snapshot(unsigned worker_id, uint64 *coordin
 	return true;
 }
 
+/* A retired transaction key stays wholly empty. Route only the freshly
+ * admitted SEGMENT observation, which lives for this one original CV wait. */
+static bool
+undo_cleaner_capacity_segment_worker(uint32 current_segment, uint64 epoch,
+									 const ClusterCapacityObservationV1 *observation,
+									 unsigned *worker)
+{
+	const ClusterCapacitySegmentIdentityV1 *identity = &observation->segment;
+	uint32 first;
+
+	if (cluster_node_id < 0 || cluster_node_id >= CLUSTER_CTRC_MAX_PARTICIPANTS)
+		return false;
+	first = (uint32)cluster_node_id * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+	if (observation->scope != CLUSTER_CAPACITY_SCOPE_SEGMENT
+		|| observation->phase != CTRC_ORIGIN_EMPTY
+		|| identity->owner_instance != (uint32)cluster_node_id + 1 || identity->segment_id < first
+		|| identity->segment_id - first >= CLUSTER_UNDO_SEGS_PER_INSTANCE
+		|| identity->segment_id == current_segment || identity->current_segment != current_segment
+		|| identity->current_binding_generation == 0
+		|| identity->current_binding_generation == UINT64_MAX || identity->epoch != epoch
+		|| identity->segment_generation == 0 || identity->segment_generation == UINT32_MAX
+		|| identity->system_identifier == 0 || identity->origin_boot_incarnation == 0
+		|| identity->formation_epoch == 0 || identity->admission_record_generation == 0
+		|| identity->root_id == 0 || identity->root_generation == 0)
+		return false;
+	*worker = (identity->segment_id - 1) % CLUSTER_UNDO_CLEANER_WORKER_TYPES;
+	return *worker == observation->owner_worker;
+}
+
 /* The CURRENT-only preflight may clear an old pool key. Preserve its exact
  * provenance while observing both paths under the original owner bracket. */
 static ClusterCtrcCapacityProbeResult
 undo_cleaner_capacity_probe(uint32 segment_id, const ClusterUndoHorizonFloor *floor,
-							ClusterCtrcTxnKeyV1 *continuation, uint64 *owner_generations)
+							ClusterCtrcTxnKeyV1 *continuation, uint64 *owner_generations,
+							unsigned *worker)
 {
 	ClusterCtrcTxnKeyV1 prior = *continuation;
 	ClusterCtrcCapacityProbeResult proof;
@@ -513,11 +543,24 @@ undo_cleaner_capacity_probe(uint32 segment_id, const ClusterUndoHorizonFloor *fl
 		owner_generations[i] = undo_cleaner_capacity_owner_generation_locked(i);
 	LWLockRelease(&undo_cleaner_state->lwlock);
 	proof = cluster_ctrc_capacity_probe_current(segment_id, floor->scn, floor->epoch, continuation);
-	if (proof != CLUSTER_CTRC_CAPACITY_REFUSE)
+	if (proof != CLUSTER_CTRC_CAPACITY_REFUSE) {
+		*worker = (continuation->segment_id - 1) % CLUSTER_UNDO_CLEANER_WORKER_TYPES;
 		return proof;
-	reason = cluster_ctrc_capacity_probe_pool_continuation_v1(segment_id, floor->scn, floor->epoch,
-															  &prior, &observation);
+	}
+	reason = cluster_ctrc_capacity_probe_pool_segment_v1(segment_id, floor->scn, floor->epoch,
+														 &prior, &observation);
 	if (reason == CLUSTER_CAPACITY_OWNER_PROGRESS_POSSIBLE) {
+		ClusterCtrcTxnKeyV1 empty;
+
+		MemSet(&empty, 0, sizeof(empty));
+		if (memcmp(&observation.key, &empty, sizeof(empty)) == 0) {
+			if (!undo_cleaner_capacity_segment_worker(segment_id, floor->epoch, &observation,
+													  worker)) {
+				MemSet(continuation, 0, sizeof(*continuation));
+				return CLUSTER_CTRC_CAPACITY_REFUSE;
+			}
+		} else
+			*worker = (observation.key.segment_id - 1) % CLUSTER_UNDO_CLEANER_WORKER_TYPES;
 		*continuation = observation.key;
 		return CLUSTER_CTRC_CAPACITY_WAIT;
 	}
@@ -550,16 +593,16 @@ cluster_undo_cleaner_wait_for_capacity(uint32 segment_id, ClusterCtrcTxnKeyV1 *c
 		ClusterUndoHorizonFloor floor;
 		ClusterCtrcCapacityProbeResult proof = CLUSTER_CTRC_CAPACITY_REFUSE;
 		uint64 owner_generations[CLUSTER_UNDO_CLEANER_WORKER_TYPES] = { 0 };
+		unsigned worker = 0;
 
 		CHECK_FOR_INTERRUPTS();
 		if (cluster_undo_cleaner_enabled && cluster_storage_mode_enabled()
 			&& undo_cleaner_capacity_floor(&floor))
-			proof
-				= undo_cleaner_capacity_probe(segment_id, &floor, continuation, owner_generations);
+			proof = undo_cleaner_capacity_probe(segment_id, &floor, continuation, owner_generations,
+												&worker);
 		if (proof == CLUSTER_CTRC_CAPACITY_RETRY)
 			retry = true;
 		else if (proof == CLUSTER_CTRC_CAPACITY_WAIT && undo_cleaner_capacity_context_safe()) {
-			unsigned worker = (continuation->segment_id - 1) % CLUSTER_UNDO_CLEANER_WORKER_TYPES;
 			bool supplied;
 			bool owner_changed;
 			uint64 coordinator_generation;
