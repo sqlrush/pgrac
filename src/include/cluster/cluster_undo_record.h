@@ -93,6 +93,7 @@ typedef enum UndoRecordType {
 #define UNDO_REC_FLAG_CONTINUED 0x02	   /* continued from previous block (future) */
 #define UNDO_REC_FLAG_TOAST 0x04		   /* payload references TOAST (future) */
 #define UNDO_REC_FLAG_HAS_ITL_HISTORY 0x08 /* complete prior page-slot images */
+#define UNDO_REC_FLAG_HAS_OPERATION 0x10 /* explicit operation identity trailer */
 
 
 /*
@@ -391,6 +392,48 @@ typedef struct UndoItlHistoryTrailer {
 StaticAssertDecl(sizeof(UndoItlHistoryEntry) == 64, "undo history entry is 64B");
 StaticAssertDecl(sizeof(UndoItlHistoryTrailer) == 136, "undo history trailer is 136B");
 
+/* The explicitly flagged operation trailer follows the ITL history.  Its
+ * fields use the same native byte order as the containing undo record.
+ * Copy it from an unaligned payload before accessing any field. */
+#define UNDO_OPERATION_TRAILER_VERSION 1
+#define UNDO_OPERATION_TRAILER_LENGTH 48
+
+typedef enum ClusterSavepointEffectState {
+	CLUSTER_SAVEPOINT_EFFECT_LIVE = 1,
+	CLUSTER_SAVEPOINT_EFFECT_DISCARDED = 2
+} ClusterSavepointEffectState;
+
+typedef struct UndoOperationTrailer {
+	uint16 version;
+	uint16 length;
+	uint8 effect_state;
+	uint8 reserved[3];
+	uint64 canonical_top_fxid;
+	uint64 operation_fxid;
+	uint64 operation_sequence;
+	uint32 canonical_segment_generation;
+	CommandId command_id;
+	SubTransactionId subid;
+	uint32 reserved_end;
+} UndoOperationTrailer;
+
+StaticAssertDecl(sizeof(UndoOperationTrailer) == UNDO_OPERATION_TRAILER_LENGTH,
+				 "undo operation trailer is 48B");
+StaticAssertDecl(offsetof(UndoOperationTrailer, version) == 0, "operation version offset");
+StaticAssertDecl(offsetof(UndoOperationTrailer, length) == 2, "operation length offset");
+StaticAssertDecl(offsetof(UndoOperationTrailer, effect_state) == 4, "operation state offset");
+StaticAssertDecl(offsetof(UndoOperationTrailer, reserved) == 5, "operation reserved offset");
+StaticAssertDecl(offsetof(UndoOperationTrailer, canonical_top_fxid) == 8, "operation top offset");
+StaticAssertDecl(offsetof(UndoOperationTrailer, operation_fxid) == 16, "operation writer offset");
+StaticAssertDecl(offsetof(UndoOperationTrailer, operation_sequence) == 24,
+				 "operation sequence offset");
+StaticAssertDecl(offsetof(UndoOperationTrailer, canonical_segment_generation) == 32,
+				 "operation canonical generation offset");
+StaticAssertDecl(offsetof(UndoOperationTrailer, command_id) == 36, "operation command offset");
+StaticAssertDecl(offsetof(UndoOperationTrailer, subid) == 40, "operation subid offset");
+StaticAssertDecl(offsetof(UndoOperationTrailer, reserved_end) == 44,
+				 "operation reserved end offset");
+
 #ifdef USE_PGRAC_CLUSTER
 static inline bool
 cluster_undo_history_prior_valid(const ClusterItlSlotData *prior)
@@ -562,6 +605,71 @@ cluster_undo_record_decode_payload(const UndoRecordHeader *record, const void *p
 	}
 	*body_length_out = (uint16)body_length;
 	*history_out = history;
+	return true;
+}
+
+/* Decode data records with an explicit child operation, not legacy V1 or
+ * rollback controls.  The original decoder continues rejecting this flag.
+ *
+ * This validates structure only.  Callers must separately validate the
+ * protected block/CRC/read scope, exact canonical TT owner and FullXid,
+ * canonical segment generation, and sequence order along the chain.  A
+ * decoded effect state alone is not a transaction visibility decision.
+ * All outputs are cleared on failure; the input header must be aligned,
+ * while payload may be unaligned. */
+static inline bool
+cluster_undo_record_decode_operation_payload(const UndoRecordHeader *record, const void *payload,
+											 size_t payload_bytes, uint16 *body_length_out,
+											 UndoItlHistoryTrailer *history_out,
+											 UndoOperationTrailer *operation_out)
+{
+	UndoOperationTrailer operation;
+	UndoItlHistoryTrailer history;
+	UndoRecordHeader body_record;
+	uint16 body_length;
+	size_t original_bytes;
+	const uint8 required = UNDO_REC_FLAG_HAS_OPERATION | UNDO_REC_FLAG_HAS_ITL_HISTORY;
+
+	if (body_length_out != NULL)
+		*body_length_out = 0;
+	if (history_out != NULL)
+		memset(history_out, 0, sizeof(*history_out));
+	if (operation_out != NULL)
+		memset(operation_out, 0, sizeof(*operation_out));
+	if (record == NULL || payload == NULL || body_length_out == NULL || history_out == NULL
+		|| operation_out == NULL || payload_bytes != record->payload_length
+		|| payload_bytes < sizeof(operation) || (record->flags & required) != required
+		|| record->record_type < UNDO_RECORD_INSERT || record->record_type > UNDO_RECORD_ITL)
+		return false;
+
+	original_bytes = payload_bytes - sizeof(operation);
+	memcpy(&operation, (const char *)payload + original_bytes, sizeof(operation));
+	if (operation.version != UNDO_OPERATION_TRAILER_VERSION
+		|| operation.length != UNDO_OPERATION_TRAILER_LENGTH
+		|| (operation.effect_state != CLUSTER_SAVEPOINT_EFFECT_LIVE
+			&& operation.effect_state != CLUSTER_SAVEPOINT_EFFECT_DISCARDED)
+		|| operation.reserved[0] != 0 || operation.reserved[1] != 0 || operation.reserved[2] != 0
+		|| operation.reserved_end != 0
+		|| !TransactionIdIsNormal((TransactionId)operation.canonical_top_fxid)
+		|| !TransactionIdIsNormal((TransactionId)operation.operation_fxid)
+		|| (TransactionId)operation.operation_fxid != record->xid
+		|| operation.operation_fxid <= operation.canonical_top_fxid
+		|| operation.operation_sequence == 0
+		|| operation.canonical_segment_generation == PG_UINT32_MAX
+		|| operation.command_id == InvalidCommandId || operation.subid <= TopSubTransactionId)
+		return false;
+
+	/* Preserve the raw writer and original body offsets for all old checks,
+	 * including ITL lock_xid.  Only this local view loses the extension. */
+	body_record = *record;
+	body_record.flags &= ~UNDO_REC_FLAG_HAS_OPERATION;
+	body_record.payload_length = (uint16)original_bytes;
+	if (!cluster_undo_record_decode_payload(&body_record, payload, original_bytes, &body_length,
+											&history))
+		return false;
+	*body_length_out = body_length;
+	*history_out = history;
+	*operation_out = operation;
 	return true;
 }
 #endif

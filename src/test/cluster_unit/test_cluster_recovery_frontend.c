@@ -16,6 +16,8 @@
 
 UT_DEFINE_GLOBALS();
 
+#include "test_cluster_undo_operation.inc"
+
 UT_TEST(test_frontend_time_comparison_matches_original_backend)
 {
 	const uint64 times[] = {0, 1, 255, SCN_MAX_LOCAL - 1, SCN_MAX_LOCAL};
@@ -90,7 +92,15 @@ UT_TEST(test_frontend_original_undo_history_guards_keep_time_order)
 int
 main(void)
 {
-	UT_PLAN(3);
+	UT_PLAN(11);
+	UT_RUN(test_operation_codec_unaligned_live_and_discarded);
+	UT_RUN(test_operation_codec_all_original_body_shapes);
+	UT_RUN(test_operation_codec_epoch_and_counter_boundaries);
+	UT_RUN(test_operation_codec_rejects_unproved_tail_fields);
+	UT_RUN(test_operation_codec_rejects_record_domain_drift);
+	UT_RUN(test_operation_codec_short_null_and_missing_outputs);
+	UT_RUN(test_operation_codec_keeps_original_body_and_history_guards);
+	UT_RUN(test_operation_codec_legacy_consumers_stay_closed);
 	UT_RUN(test_frontend_time_comparison_matches_original_backend);
 	UT_RUN(test_frontend_time_comparison_ignores_node_tie_break);
 	UT_RUN(test_frontend_original_undo_history_guards_keep_time_order);

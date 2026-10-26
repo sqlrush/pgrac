@@ -73,6 +73,8 @@
 
 UT_DEFINE_GLOBALS();
 
+#include "test_cluster_undo_operation.inc"
+
 /* Let the exact parent caller run, so missing observations are behavioral
  * failures rather than an absent-type compile failure. */
 #ifndef CLUSTER_CTRC_PREPARE_PATH_PRESENT
@@ -5611,7 +5613,15 @@ UT_TEST(test_exact_zero_abort_keeps_cleanup_after_native_scope_ends)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(133);
+	UT_PLAN(141);
+	UT_RUN(test_operation_codec_unaligned_live_and_discarded);
+	UT_RUN(test_operation_codec_all_original_body_shapes);
+	UT_RUN(test_operation_codec_epoch_and_counter_boundaries);
+	UT_RUN(test_operation_codec_rejects_unproved_tail_fields);
+	UT_RUN(test_operation_codec_rejects_record_domain_drift);
+	UT_RUN(test_operation_codec_short_null_and_missing_outputs);
+	UT_RUN(test_operation_codec_keeps_original_body_and_history_guards);
+	UT_RUN(test_operation_codec_legacy_consumers_stay_closed);
 	UT_RUN(test_receipt_sync_cannot_replace_frozen_operation);
 	UT_RUN(test_operation_capture_precedes_reservation_side_effects);
 	UT_RUN(test_operation_capture_refuses_unproved_owner_and_old_format_child);
