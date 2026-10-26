@@ -12318,8 +12318,64 @@ recent_registration_case(bool batch, bool refuse)
  * origin/participant publishers and every slice of the original worker pass.
  * Source authentication, process scheduling, resolver and resident I/O leaves
  * remain controlled; this does not create a production VACUUM caller. */
+/* Use the original ACK/publisher/reply state machines. Canonical I/O,
+ * authentication and process scheduling remain the existing controlled leaves. */
 static void
-full_source_then_recent_lifecycle_case(bool batch, bool late_receiver, bool retire_native, unsigned terminal_receipt)
+native_exit_certificate_retire(const ClusterCtrcReceiptHandle *handle, bool final_reply)
+{
+	ClusterCtrcOriginCertificateSnapshot snapshot;
+	ClusterCtrcOriginEntry *origin;
+	ClusterCtrcLocalReleaseAckV1 *ack;
+	uint64 index;
+	uint16 node = handle->participant->identity.node_id;
+
+	UT_ASSERT_EQ(handle->receipt->state, CTRC_RECEIPT_CANCELLED);
+	UT_ASSERT_EQ(original_certificate_participant_close(handle->participant, &handle->participant->identity,
+		handle->participant->grant_generation, 17), CLUSTER_CTRC_CLOSE_ACK_READY);
+	ack_observers_reset(handle);
+	UT_ASSERT(census_original_nonempty_ack_freeze(handle));
+	UT_ASSERT_EQ(ack_capture_calls, 2); UT_ASSERT_EQ(ack_barriers, 1);
+	UT_ASSERT_EQ(ack_alloc_live, 0); UT_ASSERT_EQ(handle->receipt->state, CTRC_RECEIPT_ACK_FROZEN);
+	UT_ASSERT(original_census_origin_index(&handle->key, &index));
+	origin = &ctrc_origin_entries()[index];
+	ack = &original_certificate_participant_ack_entries()[handle->participant_index];
+	participant_publisher_lock_acquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+	UT_ASSERT(original_origin_reply_origin_begin_seal_entry(origin, 17));
+	UT_ASSERT(original_origin_reply_origin_arm_close_entry(origin, node, 11));
+	UT_ASSERT(original_origin_reply_origin_note_close_reply_entry(origin, node, 11, CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK));
+	UT_ASSERT(original_origin_reply_origin_begin_cleaning_entry(origin));
+	participant_publisher_lock_release(&CtrcShared->origin_lock);
+	UT_ASSERT(original_origin_reply_origin_ack_land_shared(11, ack));
+	participant_publisher_lock_acquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+	UT_ASSERT(original_origin_reply_origin_certificate_snapshot_index_locked(index, &snapshot));
+	participant_publisher_lock_release(&CtrcShared->origin_lock);
+	durable_observers_reset(&snapshot);
+	UT_ASSERT(census_origin_durable_certificate_publish(&snapshot));
+	UT_ASSERT_EQ(durable_commits, 1); UT_ASSERT_EQ(durable_wals, 1); UT_ASSERT_EQ(durable_flushes, 1);
+	UT_ASSERT_EQ(durable_enters, durable_leaves); UT_ASSERT(!durable_admitted && !durable_current && !durable_pinned);
+	UT_ASSERT_EQ(origin->state, CTRC_ORIGIN_RELEASE_PROVEN);
+	UT_ASSERT(FullTransactionIdEquals(origin->original_full_xid, handle->original_full_xid));
+	participant_publisher_lock_acquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+	UT_ASSERT(original_origin_reply_origin_arm_certificate_entry(origin, node, 123));
+	participant_publisher_lock_release(&CtrcShared->origin_lock);
+	certificate_observers_reset();
+	UT_ASSERT(origin_reply_reclaim_receiver(handle));
+	UT_ASSERT(ctrc_bytes_zero(handle->participant, sizeof(*handle->participant)));
+	UT_ASSERT(ctrc_bytes_zero(handle->receipt, sizeof(*handle->receipt)));
+	UT_ASSERT(FullTransactionIdEquals(origin->original_full_xid, handle->original_full_xid));
+	if (final_reply)
+	{
+		UT_ASSERT(census_origin_certificate_reply(123, node));
+		UT_ASSERT(ctrc_bytes_zero(origin, sizeof(*origin)));
+		UT_ASSERT(!census_origin_certificate_reply(123, node));
+	}
+	UT_ASSERT_EQ(participant_lock_depth, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation), 1);
+	UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+}
+
+static void
+full_source_then_recent_lifecycle_case(bool batch, bool late_receiver, bool retire_native, unsigned terminal_receipt, unsigned certificate_retirement)
 {
 	QualifiedXminFixture f;
 	LVRelState v;
@@ -12444,6 +12500,37 @@ full_source_then_recent_lifecycle_case(bool batch, bool late_receiver, bool reti
 	f.cohort.local_registration_cut = publisher_scan;
 	UT_ASSERT(cluster_ctrc_active_scan_registration_current(&f.cohort.local_registration_cut));
 	UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+	if (certificate_retirement)
+	{
+		ClusterUndoCleanerActiveSample old_sample = native_worker_shared.active_sample;
+		uint64 before_locks = census_step_lock_acquires;
+		FullTransactionId expected = certificate_retirement == 2
+			? publisher_scan.future_full : full;
+
+		UT_ASSERT(retire_native && terminal_receipt == 1 && !late_receiver);
+		native_exit_certificate_retire(&handle, certificate_retirement == 2);
+		UT_ASSERT_EQ(handle.participant->receipt_count, 0);
+		/* A new complete original pass, not an in-place edit of the old cut. */
+		passes = 1;
+		worker_original_sample_pass_fixture(&f.cohort);
+		while (pass_pending && passes <= expected_passes) { original_worker_sample_active_pass(); passes++; }
+		UT_ASSERT_EQ(passes, expected_passes); UT_ASSERT(!pass_pending);
+		UT_ASSERT_EQ(publisher_scan.status, CTRC_ACTIVE_SCAN_COMPLETE);
+		UT_ASSERT_EQ(publisher_scan.next_index, total); UT_ASSERT_EQ(publisher_scan.unqualified_entries, 0);
+		UT_ASSERT(FullTransactionIdEquals(publisher_scan.min_full, expected));
+		UT_ASSERT_EQ(census_step_lock_acquires, before_locks + total);
+		UT_ASSERT_EQ(census_step_lock_releases, census_step_lock_acquires);
+		UT_ASSERT_EQ(native_worker_shared.active_sample.sample_id, old_sample.sample_id + 1);
+		UT_ASSERT(!original_worker_publication_current(&old_sample));
+		/* These fields come from the new original publication. The admitted
+		 * phase still acquires and checks its own full cohort before writing. */
+		f.cohort.active_full_xid_min = U64FromFullTransactionId(publisher_scan.min_full);
+		f.cohort.source_local_sample_id = native_worker_shared.active_sample.sample_id;
+		f.cohort.local_registration_cut = publisher_scan;
+		UT_ASSERT(cluster_ctrc_active_scan_registration_current(&f.cohort.local_registration_cut));
+		UT_ASSERT_EQ(pg_atomic_read_u32(&native_admission_shared.inflight
+			[CLUSTER_SEMANTIC_TARGET_SIDE][bounds_lifecycle_feature()]), 1);
+	}
 	if (late_receiver)
 	{
 		uint64 known_index, late_index;
@@ -12475,9 +12562,17 @@ full_source_then_recent_lifecycle_case(bool batch, bool late_receiver, bool reti
 	UT_ASSERT_EQ(phase_finally_pins, 0); UT_ASSERT(!phase_finally_owned_writer);
 	UT_ASSERT_EQ(backend_pin_count, 0);
 	UT_ASSERT(!recent_pin_held && !local_x && !resumed_writer);
-	UT_ASSERT(FullTransactionIdEquals(handle.participant->original_full_xid, full));
-	UT_ASSERT_EQ(handle.participant->receipt_count, 1);
-	if (terminal_receipt)
+	if (!certificate_retirement)
+	{
+		UT_ASSERT(FullTransactionIdEquals(handle.participant->original_full_xid, full));
+		UT_ASSERT_EQ(handle.participant->receipt_count, 1);
+	}
+	else
+	{
+		UT_ASSERT(ctrc_bytes_zero(handle.participant, sizeof(*handle.participant)));
+		UT_ASSERT(ctrc_bytes_zero(handle.receipt, sizeof(*handle.receipt)));
+	}
+	if (terminal_receipt && !certificate_retirement)
 	{
 		UT_ASSERT_EQ(handle.receipt->state, terminal_receipt == 1 ? CTRC_RECEIPT_CANCELLED : CTRC_RECEIPT_APPLIED);
 		UT_ASSERT_EQ(handle.participant->prepared_count, 0);
@@ -12498,31 +12593,43 @@ full_source_then_recent_lifecycle_case(bool batch, bool late_receiver, bool reti
 static void
 full_source_then_recent_case(bool batch, bool late_receiver)
 {
-	full_source_then_recent_lifecycle_case(batch, late_receiver, false, 0);
+	full_source_then_recent_lifecycle_case(batch, late_receiver, false, 0, 0);
+}
+
+UT_TEST(test_original_native_exit_certificate_receiver_retirement_keeps_origin_in_recent_cut)
+{
+	for (unsigned batch = 0; batch < 2; batch++)
+		full_source_then_recent_lifecycle_case(batch != 0, false, true, 1, 1);
+}
+
+UT_TEST(test_original_native_exit_final_certificate_reply_precedes_fresh_recent_cut)
+{
+	for (unsigned batch = 0; batch < 2; batch++)
+		full_source_then_recent_lifecycle_case(batch != 0, false, true, 1, 2);
 }
 
 UT_TEST(test_original_pgproc_exit_cancelled_receipt_keeps_source_through_recent_wal)
 {
 	for (unsigned batch = 0; batch < 2; batch++)
-		full_source_then_recent_lifecycle_case(batch != 0, false, true, 1);
+		full_source_then_recent_lifecycle_case(batch != 0, false, true, 1, 0);
 }
 
 UT_TEST(test_original_pgproc_exit_applied_receipt_keeps_source_through_recent_wal)
 {
 	for (unsigned batch = 0; batch < 2; batch++)
-		full_source_then_recent_lifecycle_case(batch != 0, false, true, 2);
+		full_source_then_recent_lifecycle_case(batch != 0, false, true, 2, 0);
 }
 
 UT_TEST(test_original_pgproc_exit_keeps_retained_source_through_recent_wal)
 {
 	for (unsigned batch = 0; batch < 2; batch++)
-		full_source_then_recent_lifecycle_case(batch != 0, false, true, 0);
+		full_source_then_recent_lifecycle_case(batch != 0, false, true, 0, 0);
 }
 
 UT_TEST(test_original_pgproc_exit_late_receiver_still_revokes_recent_wal)
 {
 	for (unsigned batch = 0; batch < 2; batch++)
-		full_source_then_recent_lifecycle_case(batch != 0, true, true, 0);
+		full_source_then_recent_lifecycle_case(batch != 0, true, true, 0, 0);
 }
 
 UT_TEST(test_full_original_source_reaches_pin_free_collector_and_recent_wal)
@@ -12790,7 +12897,7 @@ UT_TEST(test_recent_xmin_share_lock_refusal_keeps_borrowed_pin_without_upgrade)
 int
 main(void)
 {
-	UT_PLAN(300);
+	UT_PLAN(302);
 
 	UT_RUN(test_pin_free_admitted_phase_reaches_recent_native_wal_before_owner_leave);
 	UT_RUN(test_pin_free_phase_recent_refusal_retires_only_its_original_owner);
@@ -12799,6 +12906,8 @@ main(void)
 	UT_RUN(test_recent_refused_receiver_keeps_original_cut_and_native_continuation);
 	UT_RUN(test_full_original_source_reaches_pin_free_collector_and_recent_wal);
 	UT_RUN(test_full_original_source_late_receiver_revokes_recent_wal);
+	UT_RUN(test_original_native_exit_certificate_receiver_retirement_keeps_origin_in_recent_cut);
+	UT_RUN(test_original_native_exit_final_certificate_reply_precedes_fresh_recent_cut);
 	UT_RUN(test_original_pgproc_exit_cancelled_receipt_keeps_source_through_recent_wal);
 	UT_RUN(test_original_pgproc_exit_applied_receipt_keeps_source_through_recent_wal);
 	UT_RUN(test_original_pgproc_exit_keeps_retained_source_through_recent_wal);
