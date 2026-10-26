@@ -12369,6 +12369,11 @@ static unsigned page_owner_finishes, page_owner_aborts, page_owner_unlocks, page
 static bool page_owner_use_range;
 static unsigned page_owner_range_calls;
 static uint32 page_owner_touch_count;
+static bool page_owner_use_xact_owner;
+static unsigned page_owner_xact_finishes;
+static bool page_owner_cluster_enabled;
+static uint32 page_owner_touch_capacity, page_owner_subxact_depth, page_owner_subxact_capacity;
+static struct ClusterItlTouchSubxactBoundary *page_owner_subxact_stack;
 
 static void
 page_owner_require_unlocked(void)
@@ -12492,6 +12497,14 @@ page_owner_stamp_skip(void)
 
 #define touch_list page_owner_touch_list
 #define touch_count page_owner_touch_count
+#define touch_capacity page_owner_touch_capacity
+#define subxact_stack page_owner_subxact_stack
+#define subxact_depth page_owner_subxact_depth
+#define subxact_capacity page_owner_subxact_capacity
+#define cluster_enabled page_owner_cluster_enabled
+#define cluster_itl_touch_reset_at_end_xact original_page_owner_reset
+#define cluster_itl_xact_precommit_finish original_page_owner_precommit
+#define cluster_itl_xact_abort_finish original_page_owner_abort
 #define itl_touch_record_cmp original_page_owner_record_cmp
 #define itl_finish_range original_page_owner_finish_range
 #define cluster_node_id page_owner_node_id
@@ -12531,6 +12544,14 @@ page_owner_stamp_skip(void)
 #undef cluster_node_id
 #undef itl_finish_range
 #undef itl_touch_record_cmp
+#undef cluster_itl_xact_abort_finish
+#undef cluster_itl_xact_precommit_finish
+#undef cluster_itl_touch_reset_at_end_xact
+#undef cluster_enabled
+#undef subxact_capacity
+#undef subxact_depth
+#undef subxact_stack
+#undef touch_capacity
 #undef touch_count
 #undef touch_list
 
@@ -12551,7 +12572,27 @@ page_owner_finish_original_range(ClusterItlTouchRecord *record,
 	records[1].proof.own_generation--;
 	page_owner_touch_list = records;
 	page_owner_touch_count = lengthof(records);
-	original_page_owner_finish_range(0, page_owner_touch_count, finish);
+	if (page_owner_use_xact_owner)
+	{
+		ClusterItlTouchSubxactBoundary boundary = { 77, 1 };
+
+		page_owner_cluster_enabled = true;
+		page_owner_touch_capacity = 8;
+		page_owner_subxact_stack = &boundary;
+		page_owner_subxact_depth = 1; page_owner_subxact_capacity = 4;
+		if (finish->is_commit)
+			original_page_owner_precommit(record->proof.xid, finish->commit_scn);
+		else
+			original_page_owner_abort(record->proof.xid);
+		UT_ASSERT(page_owner_touch_list == NULL && page_owner_subxact_stack == NULL);
+		UT_ASSERT_EQ(page_owner_touch_count, 0); UT_ASSERT_EQ(page_owner_touch_capacity, 0);
+		UT_ASSERT_EQ(page_owner_subxact_depth, 0); UT_ASSERT_EQ(page_owner_subxact_capacity, 0);
+		UT_ASSERT(!page_owner_page_locked);
+		page_owner_cluster_enabled = false;
+		page_owner_xact_finishes++;
+	}
+	else
+		original_page_owner_finish_range(0, page_owner_touch_count, finish);
 	UT_ASSERT_EQ(records[0].proof.xid, record->proof.xid - 1);
 	UT_ASSERT_EQ(records[1].proof.xid, record->proof.xid);
 	page_owner_touch_count = 0;
@@ -13040,6 +13081,17 @@ full_source_then_recent_case(bool batch, bool late_receiver)
 	full_source_then_recent_lifecycle_case(batch, late_receiver, false, 0, 0);
 }
 
+UT_TEST(test_original_top_xact_finish_retires_local_touches_before_recent_freeze)
+{
+	page_owner_use_xact_owner = page_owner_use_range = page_owner_use_full_batch = native_exit_use_page_owner_discharge = true;
+	page_owner_xact_finishes = 0;
+	for (unsigned retirement = 1; retirement <= 2; retirement++)
+		for (unsigned batch = 0; batch < 2; batch++)
+			full_source_then_recent_lifecycle_case(batch != 0, false, true, 2, retirement);
+	UT_ASSERT_EQ(page_owner_xact_finishes, 16);
+	page_owner_use_xact_owner = page_owner_use_range = page_owner_use_full_batch = native_exit_use_page_owner_discharge = false;
+}
+
 UT_TEST(test_original_page_owner_range_groups_reused_slot_before_recent_freeze)
 {
 	page_owner_use_range = page_owner_use_full_batch = native_exit_use_page_owner_discharge = true;
@@ -13377,7 +13429,7 @@ UT_TEST(test_recent_xmin_share_lock_refusal_keeps_borrowed_pin_without_upgrade)
 int
 main(void)
 {
-	UT_PLAN(306);
+	UT_PLAN(307);
 
 	UT_RUN(test_pin_free_admitted_phase_reaches_recent_native_wal_before_owner_leave);
 	UT_RUN(test_pin_free_phase_recent_refusal_retires_only_its_original_owner);
@@ -13386,6 +13438,7 @@ main(void)
 	UT_RUN(test_recent_refused_receiver_keeps_original_cut_and_native_continuation);
 	UT_RUN(test_full_original_source_reaches_pin_free_collector_and_recent_wal);
 	UT_RUN(test_full_original_source_late_receiver_revokes_recent_wal);
+	UT_RUN(test_original_top_xact_finish_retires_local_touches_before_recent_freeze);
 	UT_RUN(test_original_page_owner_range_groups_reused_slot_before_recent_freeze);
 	UT_RUN(test_original_page_owner_stamp_wal_discharge_feeds_recent_freeze);
 	UT_RUN(test_original_page_owner_discharge_feeds_certificate_recent_wal);
