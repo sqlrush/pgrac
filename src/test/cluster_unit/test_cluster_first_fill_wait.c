@@ -29,6 +29,7 @@ int first_fill_own_fixture_main(void);
 int cluster_gcs_block_retransmit_initial_backoff_ms = 100;
 int cluster_gcs_block_retransmit_max_retries = 4;
 int cluster_gcs_reply_timeout_ms = 5000;
+int MaxBackends = 32;
 
 static unsigned woke_workers, shipments, cancellations;
 static uint64 wait_epoch = 1;
