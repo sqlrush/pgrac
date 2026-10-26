@@ -85,8 +85,15 @@ extern ClusterRelmapRetentionResult cluster_relmap_retention_runtime_cancel_prep
  * authenticates the matching original commit/abort and applies its original
  * failure polarity, including postcommit fail-stop; these are not recovery
  * terminal classifiers. Route only an exact already-staged runtime pin to the
- * existing dual-copy publish/discard, then recheck owner and pin. Native owner
- * queries and all I/O stay outside the sole retention lock. No internal retry.
+ * existing dual-copy publish/discard, then recheck owner and pin.
+ * Publish first syncs/readbacks that same current writer's native CLOG and
+ * requires COMMITTED with its exact FullXid/full identity, then rechecks the
+ * original owner/directory/staged pin before any pair write. Abort retains
+ * its earlier pre-abort-record order and does not require terminal CLOG here.
+ * This additional current-native observation is no cold base/source/lifetime
+ * or terminal-release certificate; all original qualifications remain.
+ * Native owner queries and all I/O stay outside the sole retention lock.
+ * No internal retry.
  * CLEARED_POSTREAD certifies storage cleanup in this call only, never terminal
  * proof, COMPLETE publication or pin/native/TT/SPACE release. All pins remain,
  * including after a clean retry; later success cannot erase an earlier I/O
@@ -165,6 +172,23 @@ extern ClusterRelmapRetentionResult cluster_relmap_retention_runtime_truncate_co
 extern ClusterRelmapRetentionResult cluster_relmap_retention_runtime_truncate_uncertain_v2(
 	const ClusterRelmapRetentionRuntimeTruncateV2 *reservation);
 
+/* Dormant entry into original LOCAL native TruncateCLOG. The original owner
+ * must authenticate sysid/DB/origin and the FullXid cut, qualify COMPLETE and
+ * all native/source/base/era/history/lifetime inputs, and retain its original
+ * truncation exclusion, checked as WrapLimitsVacuumLock(X). Numbers are only
+ * routing, never a certificate.
+ * Require normal non-recovery context and no caller-held XidGen/SLRU/native
+ * truncation/retention lock. Reserve the stricter cut against late begin,
+ * then run unchanged native floor/WAL/SLRU work outside retention. Confirm
+ * no eligible files remain before completing; a clean no-op may advance the
+ * conservative runtime floor without changing native oldestClogXid.
+ * Entered false/ERROR may follow durable WAL, advanced native floor or partial
+ * deletion; do not retry or infer rollback. Uncertain work preserves pins and
+ * reservation as UNKNOWN. ERROR releases only this call's native locks and
+ * rethrows. No pin retirement, live caller, COMPLETE publisher or v2 activation. */
+extern bool cluster_relmap_retention_truncate_clog_v2(FullTransactionId oldestXact,
+	Oid oldestxid_datoid, uint64 system_identifier, uint64 database_incarnation, uint16 origin);
+
 /* Dormant original allocator only, with its original XidGenLock EXCLUSIVE.
  * The caller authenticates the original 0-based origin, sys/DB incarnation and
  * qualified COMPLETE floor/issued inputs, and preserves every original wrap,
@@ -193,5 +217,34 @@ typedef void (*ClusterRelmapRetentionAllocationPublishV2)(void *argument);
 extern ClusterRelmapRetentionResult cluster_relmap_retention_runtime_allocation_publish_v2(
 	uint64 system_identifier, uint64 database_incarnation, uint16 origin, uint64 candidate,
 	ClusterRelmapRetentionAllocationPublishV2 publish, void *argument);
+
+/* Dormant entry into the ORIGINAL native allocator. The original caller must
+ * already authenticate this origin/system/DB and qualify its complete native
+ * floor/issued/history/lifetime inputs; these numbers supply no certificate.
+ * Enter from the original allocation context with neither XidGenLock nor the
+ * retention lock held; this function acquires and releases the native lock.
+ * Reuses all original native wrap/StopLimit/stripe/herding/lease checks and
+ * SLRU extension. First and recomputed candidates are checked before extension;
+ * the final candidate and original nofail stores share XidGenLock->retention.
+ * Refusal raises existing53RB5 with no fallback or automatic retry. Ordinary
+ * GetNewTransactionId remains unchanged in behavior. No live caller, COMPLETE
+ * publisher, boot admission or v2 activation is installed by this entry. */
+extern FullTransactionId cluster_relmap_retention_allocate_xid_v2(bool isSubXact,
+	uint64 system_identifier, uint64 database_incarnation, uint16 origin);
+
+/* Dormant original Startup check AFTER all native/SIDE recovery/import and
+ * BEFORE opening allocation. The original owner authenticates DB incarnation,
+ * complete native/source/base/era/history/lifetime inputs and COMPLETE; numbers
+ * alone supply no certificate. Only the actual local native origin/system are
+ * accepted. Caller ALREADY holds XidGenLock EXCLUSIVE and original final-fold/
+ * admission exclusion, with no retention lock. Read actual cached nextXid and
+ * apply the existing read-only guard in XidGen->retention order. No supplied
+ * candidate, nextXid clamp, last-issued observation or native publication.
+ * Refusal raises53RA3; original caller retains its native lock/ERROR cleanup
+ * duties and every pin/debt. Success is a snapshot, not an admission token:
+ * keep original exclusion until opening; any later import requires recheck.
+ * No live Startup caller, COMPLETE publisher or v2 activation is installed. */
+extern void cluster_relmap_retention_check_recovered_next_v2(uint64 system_identifier,
+	uint64 database_incarnation, uint16 origin);
 
 #endif

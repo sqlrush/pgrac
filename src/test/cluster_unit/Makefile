@@ -199,7 +199,7 @@ TESTS = test_cluster_relmap_lock test_cluster_vm_read_visibility test_cluster_he
         test_cluster_membership \
         test_cluster_node_remove test_cluster_node_remove_stop test_cluster_recovery_stop test_cluster_backup_stop test_cluster_mrp_stop \
         test_cluster_hang_acceptance \
-        test_cluster_xid_stripe test_cluster_heap_horizon test_cluster_xid_stripe_evidence test_cluster_xid_stripe_boot test_cluster_xid_allocation \
+        test_cluster_xid_stripe test_cluster_heap_horizon test_cluster_xid_stripe_evidence test_cluster_xid_stripe_boot test_cluster_xid_allocation test_cluster_xid_retention \
         test_cluster_undo_resid \
         test_cluster_undo_authority \
         test_cluster_undo_gcs \
@@ -425,7 +425,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_heap_cr_reuse test_cluster_snapshot_ad
 		test_cluster_resource_x_handoff test_cluster_retained_remote \
 		test_cluster_r4_d10_hint_source test_cluster_r4_d10_tt_source \
 		test_cluster_r4_d10_multi_source test_cluster_sf_dep test_cluster_wal_state_rmw \
-		test_cluster_ges_reply_wait test_cluster_xid_stripe_evidence test_cluster_xid_stripe_boot test_cluster_xid_allocation \
+		test_cluster_ges_reply_wait test_cluster_xid_stripe_evidence test_cluster_xid_stripe_boot test_cluster_xid_allocation test_cluster_xid_retention \
 		test_cluster_replacement_episode \
 		test_cluster_replacement_request \
 		test_cluster_undo_root_descriptor \
@@ -510,6 +510,8 @@ TESTS += test_cluster_undo_recovery
 TESTS += test_cluster_remote_xact_directory
 TESTS += test_cluster_multixact_recovery
 TESTS += test_cluster_clog_recovery
+TESTS += test_cluster_clog_retention
+TESTS += test_cluster_xid_recovery_retention
 TESTS += test_cluster_subtrans_recovery
 TESTS += test_cluster_space_reservation
 TESTS += test_cluster_recovery_namespace
@@ -563,7 +565,9 @@ SIMPLE_TESTS := $(filter-out test_cluster_relmap_arb,$(SIMPLE_TESTS))
 TESTS += test_cluster_relmap_v2
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_v2,$(SIMPLE_TESTS))
 TESTS += test_cluster_relmap_v2_storage
+TESTS += test_cluster_relmap_publish_native
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_v2_storage,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_relmap_publish_native,$(SIMPLE_TESTS))
 TESTS += test_cluster_relmap_retention
 TESTS += test_cluster_relmap_checkpoint
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_checkpoint,$(SIMPLE_TESTS))
@@ -591,7 +595,7 @@ test_cluster_relmap_arb: test_cluster_relmap_arb.c unit_test.h \
 		$(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 test_cluster_relmap_xid_order: test_cluster_relmap_xid_order.c unit_test.h \
-		test_cluster_relmap_producer_stage.inc \
+		test_cluster_relmap_producer_stage.inc test_cluster_relmap_commit_native.h \
 		test_cluster_relmap_producer_prepare.inc \
 		test_cluster_relmap_producer_terminal.inc \
 		test_cluster_relmap_postcommit.inc \
@@ -785,7 +789,8 @@ test_cluster_relmap_v2_storage_product.o: $(top_srcdir)/src/backend/cluster/clus
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_PGRAC_CLUSTER -Dwrite=relmap_test_write -Dread=relmap_test_read \
 		-Drenameat=relmap_test_renameat -Dclose=relmap_test_close -c $< -o $@
 
-test_cluster_relmap_v2_storage: test_cluster_relmap_v2_storage.c unit_test.h \
+test_cluster_relmap_v2_storage test_cluster_relmap_publish_native: %: %.c unit_test.h \
+		test_cluster_relmap_v2_storage.c test_cluster_relmap_commit_native.h \
 		test_cluster_relmap_staged_observation.inc \
 		test_cluster_relmap_runtime_storage.inc \
 		test_cluster_relmap_recovery_arbitration.inc \
@@ -5373,6 +5378,24 @@ test_cluster_clog_recovery: test_cluster_clog_recovery.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
 		$< $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
+# Original native truncate and floor publication with the real retention core.
+test_cluster_clog_retention_floor.inc: $(top_srcdir)/src/backend/access/transam/varsup.c Makefile
+	awk '/^AdvanceOldestClogXid\(/ { print "void"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_clog_retention: test_cluster_clog_retention.c test_cluster_clog_recovery.c \
+		test_cluster_clog_retention_floor.inc unit_test.h \
+		$(top_srcdir)/src/backend/access/transam/clog.c \
+		$(top_srcdir)/src/backend/access/transam/slru.c \
+		$(top_srcdir)/src/include/access/clog.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_retention_runtime.c \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_retention.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
+		$< $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+
 # PGRAC: original-origin ASSIGNMENT with disposable native SLRU files.
 test_cluster_subtrans_recovery: test_cluster_subtrans_recovery.c unit_test.h \
 		$(top_srcdir)/src/backend/access/transam/subtrans.c \
@@ -5959,6 +5982,15 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_space_copy_index.inc test_cluster_space_copy_index.inc.tmp \
 		test_cluster_space_copy_heap.inc test_cluster_space_copy_heap.inc.tmp
 	rm -f test_cluster_space_copy_create.inc test_cluster_space_copy_create.inc.tmp
+	rm -f test_cluster_xid_allocation.inc test_cluster_xid_allocation.inc.tmp
+	rm -f test_cluster_xid_allocation_stripe.inc test_cluster_xid_allocation_stripe.inc.tmp
+	rm -f test_cluster_xid_retention_runtime.inc test_cluster_xid_retention_runtime.inc.tmp
+	rm -f test_cluster_xid_recovery_native.inc test_cluster_xid_recovery_native.inc.tmp
+	rm -f test_cluster_xid_recovery_runtime.inc test_cluster_xid_recovery_runtime.inc.tmp
+	rm -f test_cluster_xid_retention_owner.inc test_cluster_xid_retention_owner.inc.tmp
+	rm -f test_cluster_clog_retention_floor.inc test_cluster_clog_retention_floor.inc.tmp
+	rm -f test_cluster_xid_retention_xact_types.inc test_cluster_xid_retention_xact_types.inc.tmp
+	rm -f test_cluster_xid_retention_xact_functions.inc test_cluster_xid_retention_xact_functions.inc.tmp
 	rm -f test_cluster_data_sync_policy.inc test_cluster_sync_providers.inc \
 		test_cluster_sync_dispatch.inc test_cluster_sync_smgr.inc
 	rm -f test_cluster_tt_rollback_entry.inc
@@ -10212,6 +10244,7 @@ test_cluster_wal_cut: test_cluster_wal_cut.c unit_test.h \
 
 # PGRAC: writer runtime checks with native caller boundaries. Author: SqlRush <sqlrush@gmail.com>
 test_cluster_wal_writer: test_cluster_wal_writer.c unit_test.h \
+		test_cluster_relmap_commit_native.h \
 		$(top_srcdir)/src/backend/cluster/cluster_wal_writer.c \
 		$(top_srcdir)/src/include/cluster/cluster_wal_writer.h \
 		$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h \
@@ -10486,14 +10519,16 @@ test_cluster_xid_allocation.inc: $(top_srcdir)/src/backend/access/transam/varsup
 		$(top_srcdir)/src/backend/access/transam/transam.c \
 		$(top_srcdir)/src/backend/access/transam/twophase.c \
 		$(top_srcdir)/src/backend/storage/ipc/procarray.c Makefile
-	awk '/^publish_new_transaction_id\(/ { print "static void"; emit=1; found++ } \
-	     /^GetNewTransactionId\(/ { print "FullTransactionId"; emit=1; found++ } \
+	awk '/^typedef struct RelmapXidAllocationV2 / { emit=1; types++ } \
+	     /^(publish_new_transaction_id|relmap_xid_publication|relmap_xid_candidate_check)\(/ { print "static void"; emit=1; found++ } \
+	     /^get_new_transaction_id\(/ { print "static FullTransactionId"; emit=1; found++ } \
+	     /^(GetNewTransactionId|cluster_relmap_retention_allocate_xid_v2)\(/ { print "FullTransactionId"; emit=1; found++ } \
 	     /^TransactionId(Precedes|FollowsOrEquals)\(/ { print "bool"; emit=1; found++ } \
 	     /^ProcArrayGetActiveFullXidSample\(/ { print "bool"; emit=1; found++ } \
 	     /^MarkAsPreparingGuts\(/ { print "static void"; emit=1; found++ } \
 	     /^ProcArrayClearTransaction\(/ { print "void"; emit=1; found++ } \
 	     /^ProcArrayEndTransactionInternal\(/ { print "static void"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 8) exit 1 }' $(filter %.c,$^) > $@.tmp
+	     emit { print } /^}/ { emit=0 } END { if (types != 1 || found != 12) exit 1 }' $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_xid_allocation_stripe.inc: $(top_srcdir)/src/backend/cluster/cluster_xid_stripe_boot.c Makefile
@@ -10511,6 +10546,7 @@ test_cluster_xid_allocation: test_cluster_xid_allocation.c unit_test.h \
 		$(CLUSTER_XID_STRIPE_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_relmap_recovery.c \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h \
 		$(top_srcdir)/src/include/access/transam.h \
 		test_cluster_pgproc_active_types.inc \
 		test_cluster_xid_allocation_stripe.inc \
@@ -10521,6 +10557,94 @@ test_cluster_xid_allocation: test_cluster_xid_allocation.c unit_test.h \
 		$(top_srcdir)/src/include/access/twophase.h \
 		$(top_srcdir)/src/include/storage/proc.h \
 		$(top_srcdir)/src/include/storage/procarray.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_XID_STRIPE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# Compose the original native allocator with its actual runtime guard and core.
+test_cluster_xid_recovery_native.inc: $(top_srcdir)/src/backend/access/transam/varsup.c \
+		$(top_srcdir)/src/backend/access/transam/transam.c Makefile
+	awk '/^cluster_relmap_retention_check_recovered_next_v2\(/ { print "void"; emit=1; checks++ } \
+	     /^AdvanceNextFullTransactionIdPastXid\(/ { print "void"; emit=1; advances++ } \
+	     /^TransactionIdFollowsOrEquals\(/ { print "bool"; emit=1; compares++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (checks != 1 || advances != 1 || compares != 1) exit 1 }' $(filter %.c,$^) > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_xid_recovery_runtime.inc: $(top_srcdir)/src/backend/cluster/cluster_relmap_retention_runtime.c Makefile
+	awk '/^typedef struct RelmapRetentionRuntimeShmem / { emit=1; types++ } \
+	     /^static RelmapRetentionRuntimeShmem \*relmap_runtime_shmem;/ { print; pointers++ } \
+	     /^relmap_runtime_(origin_matches|allocation_guard)\(/ { print "static ClusterRelmapRetentionResult"; emit=1; functions++ } \
+	     /^cluster_relmap_retention_runtime_allocation_check_v2\(/ { print "ClusterRelmapRetentionResult"; emit=1; functions++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (types != 1 || pointers != 1 || functions != 3) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_xid_recovery_retention: test_cluster_xid_recovery_retention.c unit_test.h \
+		test_cluster_xid_recovery_native.inc test_cluster_xid_recovery_runtime.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_retention.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+test_cluster_xid_retention_runtime.inc: $(top_srcdir)/src/backend/cluster/cluster_relmap_retention_runtime.c Makefile
+	awk '/^typedef struct RelmapRetentionRuntimeShmem / { emit=1; types++ } \
+	     /^static RelmapRetentionRuntimeShmem \*relmap_runtime_shmem;/ { print; pointers++ } \
+	     /^static struct \{/ { emit=1; owners++ } \
+	     /^relmap_runtime_(origin_matches|allocation_guard)\(/ { print "static ClusterRelmapRetentionResult"; emit=1; functions++ } \
+	     /^cluster_relmap_retention_runtime_allocation_(check|publish)_v2\(/ { print "ClusterRelmapRetentionResult"; emit=1; functions++ } \
+	     /^cluster_relmap_retention_runtime_begin_v2\(/ { print "ClusterRelmapRetentionResult"; emit=1; functions++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (types != 1 || pointers != 1 || owners != 1 || functions != 5) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_xid_retention_owner.inc: $(top_srcdir)/src/backend/cluster/cluster_relmap_owner.c Makefile
+	awk '/^relmap_owner_(context|matches_v2)\(/ { print "static bool"; emit=1; functions++ } \
+	     /^cluster_relmap_owner_(capture|matches)_v2\(/ { print "bool"; emit=1; functions++ } \
+	     /^cluster_relmap_owner_retention_begin_v2\(/ { print "ClusterRelmapRetentionResult"; emit=1; functions++ } \
+	     emit { print } /^}/ { emit=0 } END { if (functions != 5) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_xid_retention_xact_types.inc: $(top_srcdir)/src/backend/access/transam/xact.c Makefile
+	awk '/^typedef enum (TransState|TBlockState)$$/ { emit=1; types++ } \
+	     /^typedef struct TransactionStateData$$/ { emit=1; types++ } \
+	     /^typedef TransactionStateData \*TransactionState;/ { print; pointers++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (types != 3 || pointers != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_xid_retention_xact_functions.inc: $(top_srcdir)/src/backend/access/transam/xact.c Makefile
+	awk '/^AssignTransactionId\(/ { print "static void"; emit=1; functions++ } \
+	     /^IsTransactionState\(/ { print "static bool"; emit=1; functions++ } \
+	     /^GetTopTransactionId\(/ { print "static TransactionId"; emit=1; functions++ } \
+	     /^GetTopFullTransactionId(IfAny)?\(/ { print "static FullTransactionId"; emit=1; functions++ } \
+	     emit { print } /^}/ { emit=0 } END { if (functions != 5) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_xid_retention: test_cluster_xid_retention.c test_cluster_xid_allocation.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h \
+		$(top_srcdir)/src/include/access/transam.h \
+		test_cluster_pgproc_active_types.inc \
+		test_cluster_xid_allocation_stripe.inc \
+		$(top_srcdir)/src/include/cluster/cluster_xid_stripe_boot.h \
+		$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h \
+		$(top_srcdir)/src/include/storage/condition_variable.h \
+		$(top_srcdir)/src/include/access/twophase.h \
+		$(top_srcdir)/src/include/storage/proc.h \
+		$(top_srcdir)/src/include/storage/procarray.h \
+		test_cluster_xid_publication.inc test_cluster_xid_allocation.inc \
+		test_cluster_xid_retention_caller.inc test_cluster_xid_retention_owner.inc \
+		test_cluster_xid_retention_xact.inc test_cluster_xid_retention_xact_types.inc \
+		test_cluster_xid_retention_xact_functions.inc \
+		test_cluster_xid_retention_runtime.inc unit_test.h $(CLUSTER_XID_STRIPE_O) \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_retention.c \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_recovery.c \
+		$(top_srcdir)/src/include/cluster/cluster_membership.h \
+		$(top_srcdir)/src/include/cluster/cluster_qvotec.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_authority.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_owner.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_lock.h \
+		$(top_srcdir)/src/include/cluster/cluster_reconfig.h \
+		$(top_srcdir)/src/include/access/xloginsert.h \
+		$(top_srcdir)/src/include/utils/resowner.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_XID_STRIPE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # Exercise the original recovery -> seed -> claim -> WAL gate. Dependency

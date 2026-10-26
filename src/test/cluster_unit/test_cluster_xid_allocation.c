@@ -29,6 +29,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_relmap_owner.h"
 #include "cluster/cluster_relmap_recovery.h"
+#include "cluster/cluster_relmap_retention_runtime.h"
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_qvotec.h"
@@ -51,11 +52,13 @@ UT_DEFINE_GLOBALS();
 volatile uint32 InterruptHoldoffCount;
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
+#ifndef CLUSTER_XID_RETENTION_TEST
 void
 pg_re_throw(void)
 {
 	abort();
 }
+#endif
 XidStatus
 TransactionIdGetStatus(TransactionId xid, XLogRecPtr *lsn)
 {
@@ -151,15 +154,21 @@ cluster_qvotec_in_quorum(void)
 {
 	return stripe_quorum;
 }
+#ifndef CLUSTER_XID_RETENTION_TEST
 uint64
 cluster_qvotec_get_self_incarnation(void)
 {
 	return stripe_incarnation;
 }
+#endif
 bool
 LWLockHeldByMe(LWLock *lock)
 {
+#ifdef CLUSTER_XID_RETENTION_TEST
+	return retention_native_lock_held(lock, LW_EXCLUSIVE);
+#else
 	return (held && held_lock == lock) || (stripe_lock_held && stripe_lock == lock);
+#endif
 }
 
 static void
@@ -171,7 +180,11 @@ MaintainLatestCompletedXid(TransactionId xid)
 bool
 LWLockHeldByMeInMode(LWLock *lock, LWLockMode mode)
 {
+#ifdef CLUSTER_XID_RETENTION_TEST
+	return retention_native_lock_held(lock, mode);
+#else
 	return held && held_lock == lock && held_mode == mode;
+#endif
 }
 
 bool
@@ -187,6 +200,9 @@ RecoveryInProgress(void)
 bool
 LWLockAcquire(LWLock *lock, LWLockMode mode)
 {
+#ifdef CLUSTER_XID_RETENTION_TEST
+	return retention_native_lock_acquire(lock, mode);
+#else
 	if (real_stripe && lock == stripe_lock) {
 		if (stripe_lock_held || mode != LW_SHARED || (held && held_lock != XidGenLock))
 			lock_errors++;
@@ -208,10 +224,14 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 	if (sampling)
 		sample_lock_phase++;
 	return false;
+#endif
 }
 void
 LWLockRelease(LWLock *lock)
 {
+#ifdef CLUSTER_XID_RETENTION_TEST
+	retention_native_lock_release(lock);
+#else
 	FullTransactionId published;
 
 	if (real_stripe && lock == stripe_lock) {
@@ -234,6 +254,7 @@ LWLockRelease(LWLock *lock)
 		sample_lock_phase++;
 	held = false;
 	held_lock = NULL;
+#endif
 }
 bool
 cluster_xid_stripe_sample_future(FullTransactionId reference, FullTransactionId *future,
@@ -279,9 +300,13 @@ cluster_xid_stripe_window_exceeded(FullTransactionId candidate)
 bool
 cluster_xid_wrap_barrier_passed(void)
 {
+#ifdef CLUSTER_XID_RETENTION_TEST
+	return retention_wrap_ready;
+#else
 	if (real_stripe)
 		return allocation_real_wrap_passed();
 	return true;
+#endif
 }
 bool
 cluster_xid_stripe_lease_ready(FullTransactionId candidate)
@@ -324,6 +349,9 @@ extended(void)
 		early_extensions++;
 	if (!held)
 		lock_errors++;
+#ifdef CLUSTER_XID_RETENTION_TEST
+	retention_native_extended();
+#endif
 }
 void
 ExtendCLOG(TransactionId xid)
@@ -346,6 +374,10 @@ SendPostmasterSignal(PMSignalReason reason)
 char *
 get_database_name(Oid databaseid)
 {
+#ifdef CLUSTER_XID_RETENTION_TEST
+	if (retention_error_expected)
+		return NULL;
+#endif
 	abort();
 }
 void
@@ -353,6 +385,7 @@ ExceptionalCondition(const char *condition, const char *file, int line)
 {
 	abort();
 }
+#ifndef CLUSTER_XID_RETENTION_TEST
 #undef errstart
 #undef errstart_cold
 bool
@@ -386,6 +419,33 @@ errfinish(const char *file, int line, const char *function)
 	siglongjmp(allocation_error_env, 1);
 }
 
+/* The ordinary allocator fixture supplies no qualified v2 directory. */
+ClusterRelmapRetentionResult
+cluster_relmap_retention_runtime_allocation_check_v2(uint64 system_identifier,
+	uint64 database_incarnation, uint16 origin, uint64 candidate)
+{
+	(void)system_identifier;
+	(void)database_incarnation;
+	(void)origin;
+	(void)candidate;
+	abort();
+}
+
+ClusterRelmapRetentionResult
+cluster_relmap_retention_runtime_allocation_publish_v2(uint64 system_identifier,
+	uint64 database_incarnation, uint16 origin, uint64 candidate,
+	ClusterRelmapRetentionAllocationPublishV2 publish, void *argument)
+{
+	(void)system_identifier;
+	(void)database_incarnation;
+	(void)origin;
+	(void)candidate;
+	(void)publish;
+	(void)argument;
+	abort();
+}
+#endif
+
 bool
 cluster_relmap_owner_terminal_matches_v2(const ClusterRelmapOwnerSampleV2 *owner)
 {
@@ -396,7 +456,11 @@ cluster_relmap_owner_terminal_matches_v2(const ClusterRelmapOwnerSampleV2 *owner
 bool
 LWLockHeldByMe(LWLock *lock)
 {
+#ifdef CLUSTER_XID_RETENTION_TEST
+	return retention_native_lock_held(lock, LW_EXCLUSIVE);
+#else
 	return lock == XidGenLock && held;
+#endif
 }
 #include "../../backend/cluster/cluster_relmap_recovery.c"
 #undef LWLockHeldByMe
@@ -414,6 +478,9 @@ native_publication_checked(FullTransactionId issued)
 	if (!held || (!top && !child && !MyProc->subxidStatus.overflowed))
 		native_publish_order_errors++;
 	native_publish_count++;
+#ifdef CLUSTER_XID_RETENTION_TEST
+	retention_native_published(issued);
+#endif
 	cluster_relmap_recovery_issued_publish(issued);
 }
 #define cluster_relmap_recovery_issued_publish native_publication_checked
@@ -958,7 +1025,9 @@ UT_TEST(actual_stripe_future_keeps_prepared_fullxid_until_original_retirement)
 
 #define proc entries[0]
 #include "test_cluster_xid_publication.inc"
+#ifndef CLUSTER_XID_RETENTION_TEST
 #undef proc
+#endif
 
 int
 main(void)
