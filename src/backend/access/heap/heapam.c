@@ -8672,6 +8672,23 @@ cluster_current_mx_hot_updater_for_chain(
 	return true;
 }
 
+/* Reuse only the caller's resident VM pin under heap X. A miss must take
+ * the original unlocked pin path and then return to full DML qualification;
+ * its new observations cannot validate the saved member proof. */
+static bool
+cluster_current_mx_relock_with_vm(Relation relation, Buffer buffer, Buffer *vmbuffer,
+								  Buffer recent_vm)
+{
+	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+	if (relation == NULL || vmbuffer == NULL || !cluster_heap_read_needs_copy(relation)
+		|| !PageIsAllVisible(BufferGetPage(buffer))
+		|| visibilitymap_pin_recent(relation, BufferGetBlockNumber(buffer), recent_vm, vmbuffer))
+		return true;
+	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+	cluster_heap_lock_with_vm_repin(relation, BufferGetBlockNumber(buffer), buffer, vmbuffer);
+	return false;
+}
+
 /*
  * The first mixed-member composition starts from a single remote lock-only
  * xmax.  Preserve that member from its exact on-page ITL/TT binding rather
@@ -8684,8 +8701,9 @@ cluster_current_mx_compose_remote_single(
 	Buffer buffer, HeapTuple tuple, TransactionId requester_xid,
 	LockTupleMode lock_mode, bool is_update,
 	ClusterCurrentMxHeapResult *heap_result,
-	ClusterCurrentMxOperationState *operation)
+	ClusterCurrentMxOperationState *operation, Relation relation, Buffer *vmbuffer)
 {
+	Buffer recent_vm = vmbuffer != NULL ? *vmbuffer : InvalidBuffer;
 	ClusterCurrentMxHeapFingerprint before;
 	ClusterCurrentMxHeapFingerprint live;
 	ClusterCurrentMxKey descriptor_key;
@@ -8781,6 +8799,7 @@ cluster_current_mx_compose_remote_single(
 	memset(&updater_proof, 0, sizeof(updater_proof));
 	descriptor_member.xid = old_xmax;
 	descriptor_member.member_status = (uint8) old_status;
+	cluster_heap_release_vm_pins_for_wait(relation, vmbuffer, NULL);
 	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 	descriptor_mxid = MultiXactIdCreateLocalCurrentMembers(
 		1, &materialized_member);
@@ -8808,8 +8827,8 @@ cluster_current_mx_compose_remote_single(
 				ClusterCurrentMemberProofGetCtrcGrant(&proof),
 				proof_capability_generation,
 				(uint64)GetCurrentTimestamp())));
-	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
-	if (!cluster_current_mx_capture(buffer, tuple, &live)
+	if (!cluster_current_mx_relock_with_vm(relation, buffer, vmbuffer, recent_vm)
+		|| !cluster_current_mx_capture(buffer, tuple, &live)
 		|| !cluster_current_mx_capture_equal(&before, &live)) {
 		cluster_multixact_current_stats_bump(CMX_STAT_ABA_RESTART);
 		cluster_current_mx_operation_restart(operation);
@@ -8871,8 +8890,9 @@ cluster_current_mx_authorize(Relation relation, Buffer buffer, HeapTuple tuple,
 							 LockWaitPolicy wait_policy, bool wait_for_conflict,
 							 bool follow_updates,
 							 ClusterCurrentMxHeapResult *heap_result,
-							 ClusterCurrentMxOperationState *operation)
+							 ClusterCurrentMxOperationState *operation, Buffer *vmbuffer)
 {
+	Buffer recent_vm = vmbuffer != NULL ? *vmbuffer : InvalidBuffer;
 	ClusterCurrentMxHeapFingerprint before;
 	ClusterCurrentMxHeapFingerprint live;
 	ClusterCurrentMxHeapFingerprint candidate_before;
@@ -8951,12 +8971,13 @@ cluster_current_mx_authorize(Relation relation, Buffer buffer, HeapTuple tuple,
 			operation, &key, raw_mxid, &before, members,
 			lengthof(members), &nmembers, &reported_total))
 	{
+		cluster_heap_release_vm_pins_for_wait(relation, vmbuffer, NULL);
 		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 		describe_result = cluster_multixact_current_describe(
 			&key, members, lengthof(members), &nmembers,
 			&reported_total);
-		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
-		if (!cluster_current_mx_capture(buffer, tuple, &live)
+		if (!cluster_current_mx_relock_with_vm(relation, buffer, vmbuffer, recent_vm)
+			|| !cluster_current_mx_capture(buffer, tuple, &live)
 			|| !cluster_current_mx_capture_equal(&before, &live))
 		{
 			cluster_multixact_current_stats_bump(CMX_STAT_ABA_RESTART);
@@ -9019,13 +9040,14 @@ cluster_current_mx_authorize(Relation relation, Buffer buffer, HeapTuple tuple,
 
 	descriptor_hash
 		= cluster_multixact_current_descriptor_hash(&key, members, nmembers);
+	cluster_heap_release_vm_pins_for_wait(relation, vmbuffer, NULL);
 	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 	resolve_result = cluster_multixact_current_members_resolve_until(
 		&key, members, nmembers, descriptor_hash,
 		have_challenge ? &challenge : NULL, proofs, &updater_proof,
 		proof_capability_generations, &operation->proof_deadline);
-	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
-	if (!cluster_current_mx_capture(buffer, tuple, &live)
+	if (!cluster_current_mx_relock_with_vm(relation, buffer, vmbuffer, recent_vm)
+		|| !cluster_current_mx_capture(buffer, tuple, &live)
 		|| !cluster_current_mx_capture_equal(&before, &live)
 		|| (have_challenge
 			&& !cluster_current_mx_hot_capture_still_exact(
@@ -9197,6 +9219,7 @@ cluster_current_mx_authorize(Relation relation, Buffer buffer, HeapTuple tuple,
 			ClusterTxwResult txw;
 
 			cluster_multixact_current_stats_bump(CMX_STAT_WAIT);
+			cluster_heap_release_vm_pins_for_wait(relation, vmbuffer, NULL);
 			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 			PG_TRY();
 			{
@@ -9245,7 +9268,7 @@ cluster_current_mx_authorize(Relation relation, Buffer buffer, HeapTuple tuple,
 							 errdetail("The current MultiXact TX wait was selected as the victim.")));
 					break;
 			}
-			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+			(void)cluster_current_mx_relock_with_vm(relation, buffer, vmbuffer, recent_vm);
 			cluster_current_mx_operation_restart(operation);
 			return CCMH_RESTART;
 		}
@@ -9293,6 +9316,30 @@ cluster_current_mx_authorize(Relation relation, Buffer buffer, HeapTuple tuple,
 }
 
 #ifdef USE_CLUSTER_UNIT
+int
+cluster_heap_test_current_mx_with_vm(Relation relation, Buffer buffer, HeapTuple tuple,
+									 TransactionId requester_xid, bool single,
+									 LockTupleMode lock_mode, LockWaitPolicy wait_policy,
+									 Buffer *vmbuffer, TM_Result *result, uint16 *normalized_count)
+{
+	ClusterCurrentMxHeapResult heap_result;
+	ClusterCurrentMxOperationState operation = { 0 };
+	ClusterCurrentMxHeapDisposition disposition;
+
+	if (single)
+		disposition = cluster_current_mx_compose_remote_single(buffer, tuple, requester_xid,
+															   lock_mode, false, &heap_result,
+															   &operation, relation, vmbuffer);
+	else
+		disposition = cluster_current_mx_authorize(relation, buffer, tuple, requester_xid,
+												   CCM_ACTION_LOCK, lock_mode, false, wait_policy,
+												   true, false, &heap_result, &operation, vmbuffer);
+	*result = heap_result.result;
+	*normalized_count = heap_result.normalized_count;
+	cluster_current_mx_operation_finish(&operation);
+	return (int)disposition;
+}
+
 bool
 cluster_heap_test_current_mx_epoch_supported(uint64 epoch)
 {
@@ -9324,7 +9371,7 @@ cluster_heap_test_current_mx_authorize_keyshare(
 	disposition = cluster_current_mx_authorize(
 		relation, buffer, tuple, requester_xid, CCM_ACTION_LOCK,
 		LockTupleKeyShare, false, LockWaitBlock, true, false,
-		&heap_result, &operation);
+		&heap_result, &operation, NULL);
 	if (disposition != CCMH_DECIDED
 		|| heap_result.normalized_count > normalized_cap)
 		return false;
@@ -11645,7 +11692,7 @@ l1:
 			current_mx_disposition = cluster_current_mx_authorize(
 				relation, buffer, &tp, xid, CCM_ACTION_DELETE,
 				LockTupleExclusive, true, LockWaitBlock, wait, true,
-				&cluster_current_mx, &cluster_current_mx_operation);
+				&cluster_current_mx, &cluster_current_mx_operation, &vmbuffer);
 			if (current_mx_disposition == CCMH_RESTART)
 				goto l1;
 			if (current_mx_disposition == CCMH_DECIDED)
@@ -13080,7 +13127,7 @@ l2:
 			current_mx_disposition = cluster_current_mx_authorize(
 				relation, buffer, &oldtup, xid, CCM_ACTION_UPDATE,
 				*lockmode, true, LockWaitBlock, wait, true,
-				&cluster_current_mx, &cluster_current_mx_operation);
+				&cluster_current_mx, &cluster_current_mx_operation, &vmbuffer);
 			if (current_mx_disposition == CCMH_RESTART)
 				goto l2;
 			if (current_mx_disposition == CCMH_DECIDED)
@@ -13103,7 +13150,7 @@ l2:
 
 			current_mx_disposition = cluster_current_mx_compose_remote_single(
 				buffer, &oldtup, xid, *lockmode, true,
-				&cluster_current_mx, &cluster_current_mx_operation);
+				&cluster_current_mx, &cluster_current_mx_operation, relation, &vmbuffer);
 			if (current_mx_disposition == CCMH_RESTART)
 				goto l2;
 			if (current_mx_disposition == CCMH_DECIDED)
@@ -16475,7 +16522,7 @@ l3:
 				relation, *buffer, tuple, GetCurrentTransactionId(),
 				CCM_ACTION_LOCK, mode, false, wait_policy, true,
 				follow_updates, &cluster_current_mx,
-				&cluster_current_mx_operation);
+				&cluster_current_mx_operation, &vmbuffer);
 			if (current_mx_disposition == CCMH_RESTART)
 				goto l3;
 			if (current_mx_disposition == CCMH_DECIDED)
@@ -16529,7 +16576,7 @@ l3:
 				&cluster_current_mx_operation);
 			current_mx_disposition = cluster_current_mx_compose_remote_single(
 				*buffer, tuple, GetCurrentTransactionId(), mode, false,
-				&cluster_current_mx, &cluster_current_mx_operation);
+				&cluster_current_mx, &cluster_current_mx_operation, relation, &vmbuffer);
 			if (current_mx_disposition == CCMH_RESTART)
 				goto l3;
 			if (current_mx_disposition == CCMH_DECIDED)
@@ -20075,7 +20122,7 @@ heap_inplace_lock(Relation relation,
 				relation, buffer, &oldtup, GetCurrentTransactionId(),
 				CCM_ACTION_LOCK, LockTupleNoKeyExclusive, false,
 				LockWaitBlock, true, false, &current_mx,
-				&cluster_current_mx_operation);
+				&cluster_current_mx_operation, NULL);
 			if (current_mx_disposition != CCMH_NOT_APPLICABLE)
 			{
 				ret = current_mx_disposition == CCMH_DECIDED

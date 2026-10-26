@@ -360,6 +360,9 @@ extern bool cluster_heap_test_current_mx_authorize_keyshare(
 	TransactionId requester_xid, TM_Result *result,
 	MultiXactMember *normalized, uint16 normalized_cap,
 	uint16 *normalized_count);
+extern int cluster_heap_test_current_mx_with_vm(Relation relation, Buffer buffer,
+	HeapTuple tuple, TransactionId requester_xid, bool single, LockTupleMode lock_mode,
+	LockWaitPolicy wait_policy, Buffer *vmbuffer, TM_Result *result, uint16 *normalized_count);
 extern bool cluster_heap_test_current_mx_epoch_supported(uint64 epoch);
 extern bool cluster_heap_test_current_mx_read_requalification(
 	const ClusterPcmOwnSnapshot *before,

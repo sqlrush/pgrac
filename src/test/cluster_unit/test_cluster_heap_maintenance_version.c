@@ -23,6 +23,7 @@
 #include <setjmp.h>
 #include <unistd.h>
 
+#include "access/generic_xlog.h"
 #include "access/heapam.h"
 #include "access/heapam_xlog.h"
 #include "access/htup_details.h"
@@ -36,6 +37,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_heap_freeze.h"
 #include "cluster/cluster_itl_touch.h"
+#include "cluster/cluster_itl.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_pcm_lock.h"
@@ -12378,12 +12380,25 @@ static XLogRecPtr page_owner_local_flush, page_owner_remote_flush;
 static unsigned page_owner_flush_calls, page_owner_local_reads;
 static unsigned page_owner_remote_reads, page_owner_discharge_calls;
 static int page_owner_node_id;
+static bool page_owner_page_locked;
+static PGAlignedBlock page_owner_stamp_live, page_owner_stamp_image, page_owner_wal_cookie;
+static unsigned page_owner_stamp_case, page_owner_starts, page_owner_registers;
+static unsigned page_owner_finishes, page_owner_aborts, page_owner_unlocks, page_owner_skips;
+static bool page_owner_use_range;
+static unsigned page_owner_range_calls;
+static uint32 page_owner_touch_count;
+static bool page_owner_use_xact_owner;
+static unsigned page_owner_xact_finishes;
+static bool page_owner_cluster_enabled;
+static uint32 page_owner_touch_capacity, page_owner_subxact_depth, page_owner_subxact_capacity;
+static struct ClusterItlTouchSubxactBoundary *page_owner_subxact_stack;
 
 static void
 page_owner_require_unlocked(void)
 {
 	worker_pass_assert_unlocked(); UT_ASSERT_EQ(participant_lock_depth, 0);
 	UT_ASSERT(!local_x && !resumed_writer);
+	UT_ASSERT(!page_owner_page_locked);
 }
 
 static void
@@ -12418,7 +12433,98 @@ page_owner_shared_discharge(const ClusterCtrcReceiptHandle *handle,
 	return original_terminal_receipt_discharge_itl_shared(handle, expected, projection, durability);
 }
 
+/* These providers model buffer locking and GenericXLog I/O. The original
+ * owner performs all live-slot checks, page stamping, pending selection and
+ * ordering; no production PCM/SPACE or physical WAL success is inferred. */
+static GenericXLogState *
+page_owner_generic_start(bool logged, GenericXLogInternalOwner owner)
+{
+	page_owner_require_unlocked(); UT_ASSERT(logged);
+	UT_ASSERT_EQ(owner, GENERIC_XLOG_ITL_FINISH); page_owner_starts++;
+	return (GenericXLogState *)&page_owner_wal_cookie;
+}
+
+static Buffer
+page_owner_stamp_acquire(const ClusterItlTouchRecord *record, ClusterItlStampSkipReason *reason)
+{
+	page_owner_require_unlocked();
+	if (page_owner_use_range)
+		UT_ASSERT(record == page_owner_touch_list || record == page_owner_touch_list + 1);
+	else
+		UT_ASSERT(record == page_owner_touch_list);
+	UT_ASSERT(reason != NULL); *reason = (ClusterItlStampSkipReason)0;
+	if (page_owner_stamp_case == 0)
+		return InvalidBuffer;
+	page_owner_page_locked = true;
+	return 1;
+}
+
+static void
+page_owner_stamp_unlock(Buffer buffer)
+{
+	UT_ASSERT_EQ(buffer, 1); UT_ASSERT(page_owner_page_locked);
+	UT_ASSERT_EQ(page_owner_touch_list->ctrc_handle.receipt->state, CTRC_RECEIPT_APPLIED);
+	page_owner_page_locked = false; page_owner_unlocks++;
+}
+
+static bool
+page_owner_ship_dependencies(Buffer buffer, ClusterSfDepVec *out)
+{
+	UT_ASSERT_EQ(buffer, 1); UT_ASSERT(page_owner_page_locked);
+	UT_ASSERT_EQ(page_owner_flush_calls + page_owner_discharge_calls, 0);
+	out->required[0] = 400; out->required[1] = 700;
+	return true;
+}
+
+static Page
+page_owner_generic_register(GenericXLogState *state, Buffer buffer, int flags,
+	const ClusterSpaceIdentity *identity)
+{
+	UT_ASSERT(state == (GenericXLogState *)&page_owner_wal_cookie);
+	UT_ASSERT_EQ(buffer, 1); UT_ASSERT_EQ(flags, 0); UT_ASSERT(page_owner_page_locked);
+	UT_ASSERT(identity == &(page_owner_touch_list[page_owner_use_range ? 1 : 0].space_identity));
+	memcpy(page_owner_stamp_image.data, page_owner_stamp_live.data, BLCKSZ);
+	page_owner_registers++;
+	return page_owner_stamp_image.data;
+}
+
+static XLogRecPtr
+page_owner_generic_finish(GenericXLogState *state)
+{
+	UT_ASSERT(state == (GenericXLogState *)&page_owner_wal_cookie);
+	UT_ASSERT(page_owner_page_locked); UT_ASSERT_EQ(page_owner_registers, 1);
+	UT_ASSERT_EQ(page_owner_touch_list->ctrc_handle.receipt->state, CTRC_RECEIPT_APPLIED);
+	memcpy(page_owner_stamp_live.data, page_owner_stamp_image.data, BLCKSZ);
+	PageSetLSN(page_owner_stamp_live.data, 400); page_owner_finishes++;
+	return 400;
+}
+
+static void
+page_owner_generic_abort(GenericXLogState *state)
+{
+	UT_ASSERT(state == (GenericXLogState *)&page_owner_wal_cookie);
+	page_owner_require_unlocked(); UT_ASSERT_EQ(page_owner_registers, 0);
+	page_owner_aborts++;
+}
+
+static void
+page_owner_stamp_skip(void)
+{
+	page_owner_skips++;
+}
+
 #define touch_list page_owner_touch_list
+#define touch_count page_owner_touch_count
+#define touch_capacity page_owner_touch_capacity
+#define subxact_stack page_owner_subxact_stack
+#define subxact_depth page_owner_subxact_depth
+#define subxact_capacity page_owner_subxact_capacity
+#define cluster_enabled page_owner_cluster_enabled
+#define cluster_itl_touch_reset_at_end_xact original_page_owner_reset
+#define cluster_itl_xact_precommit_finish original_page_owner_precommit
+#define cluster_itl_xact_abort_finish original_page_owner_abort
+#define itl_touch_record_cmp original_page_owner_record_cmp
+#define itl_finish_range original_page_owner_finish_range
 #define cluster_node_id page_owner_node_id
 #define XLogFlush page_owner_flush
 #define GetFlushRecPtr page_owner_get_flush
@@ -12426,7 +12532,27 @@ page_owner_shared_discharge(const ClusterCtrcReceiptHandle *handle,
 #define cluster_ctrc_receipt_discharge_itl_shared page_owner_shared_discharge
 #define itl_finish_expected_target original_page_owner_expected_target
 #define itl_finish_discharge_batch original_page_owner_discharge_batch
+#define itl_finish_stamp_page original_page_owner_stamp_page
+#define itl_finish_flush_batch original_page_owner_flush_batch
+#define GenericXLogStartInternal page_owner_generic_start
+#define GenericXLogRegisterBufferVersioned page_owner_generic_register
+#define GenericXLogFinish page_owner_generic_finish
+#define GenericXLogAbort page_owner_generic_abort
+#define cluster_bufmgr_lock_resident_for_exact_itl_stamp page_owner_stamp_acquire
+#define cluster_bufmgr_unlock_resident_stamp page_owner_stamp_unlock
+#define cluster_sf_dep_vec_for_ship page_owner_ship_dependencies
+#define cluster_lever_g_note_stamp_skipped page_owner_stamp_skip
 #include "test_cluster_heap_itl_finish_discharge.inc"
+#undef cluster_lever_g_note_stamp_skipped
+#undef cluster_sf_dep_vec_for_ship
+#undef cluster_bufmgr_unlock_resident_stamp
+#undef cluster_bufmgr_lock_resident_for_exact_itl_stamp
+#undef GenericXLogAbort
+#undef GenericXLogFinish
+#undef GenericXLogRegisterBufferVersioned
+#undef GenericXLogStartInternal
+#undef itl_finish_flush_batch
+#undef itl_finish_stamp_page
 #undef itl_finish_discharge_batch
 #undef itl_finish_expected_target
 #undef cluster_ctrc_receipt_discharge_itl_shared
@@ -12434,8 +12560,145 @@ page_owner_shared_discharge(const ClusterCtrcReceiptHandle *handle,
 #undef GetFlushRecPtr
 #undef XLogFlush
 #undef cluster_node_id
+#undef itl_finish_range
+#undef itl_touch_record_cmp
+#undef cluster_itl_xact_abort_finish
+#undef cluster_itl_xact_precommit_finish
+#undef cluster_itl_touch_reset_at_end_xact
+#undef cluster_enabled
+#undef subxact_capacity
+#undef subxact_depth
+#undef subxact_stack
+#undef touch_capacity
+#undef touch_count
 #undef touch_list
 
+/* Execute the original qsort/range grouping with an older proof first only
+ * after sorting. The same-page stale record must not borrow the current
+ * slot's proof or create a second WAL image/discharge. */
+static void
+page_owner_finish_original_range(ClusterItlTouchRecord *record,
+	const ItlFinishCtx *finish)
+{
+	ClusterItlTouchRecord records[2];
+	ClusterItlTouchRecord *saved_list = page_owner_touch_list;
+
+	UT_ASSERT(record->proof.xid > FirstNormalTransactionId);
+	UT_ASSERT(record->proof.own_generation > 0);
+	records[0] = records[1] = *record;
+	records[1].proof.xid--;
+	records[1].proof.own_generation--;
+	page_owner_touch_list = records;
+	page_owner_touch_count = lengthof(records);
+	if (page_owner_use_xact_owner)
+	{
+		ClusterItlTouchSubxactBoundary boundary = { 77, 1 };
+
+		page_owner_cluster_enabled = true;
+		page_owner_touch_capacity = 8;
+		page_owner_subxact_stack = &boundary;
+		page_owner_subxact_depth = 1; page_owner_subxact_capacity = 4;
+		if (finish->is_commit)
+			original_page_owner_precommit(record->proof.xid, finish->commit_scn);
+		else
+			original_page_owner_abort(record->proof.xid);
+		UT_ASSERT(page_owner_touch_list == NULL && page_owner_subxact_stack == NULL);
+		UT_ASSERT_EQ(page_owner_touch_count, 0); UT_ASSERT_EQ(page_owner_touch_capacity, 0);
+		UT_ASSERT_EQ(page_owner_subxact_depth, 0); UT_ASSERT_EQ(page_owner_subxact_capacity, 0);
+		UT_ASSERT(!page_owner_page_locked);
+		page_owner_cluster_enabled = false;
+		page_owner_xact_finishes++;
+	}
+	else
+		original_page_owner_finish_range(0, page_owner_touch_count, finish);
+	UT_ASSERT_EQ(records[0].proof.xid, record->proof.xid - 1);
+	UT_ASSERT_EQ(records[1].proof.xid, record->proof.xid);
+	page_owner_touch_count = 0;
+	page_owner_touch_list = saved_list;
+	page_owner_range_calls++;
+}
+
+static void
+page_owner_finish_full_batch(ClusterItlTouchRecord *record)
+{
+	const ClusterCtrcTargetV1 *target = &record->ctrc_handle.receipt->target;
+	ClusterCtrcParticipantEntry participant = *record->ctrc_handle.participant;
+	ClusterCtrcReceipt receipt = *record->ctrc_handle.receipt;
+	unsigned wakeups = receipt_terminal_wakeups;
+	char *saved_blocks = BufferBlocks;
+	uint16 wrap = target->itl_slot_wrap;
+
+	for (page_owner_stamp_case = 0; page_owner_stamp_case < 4; page_owner_stamp_case++)
+	{
+		ItlFinishBatchCtx batch;
+		ClusterItlSlotData *slot;
+
+		memset(&batch, 0, sizeof(batch));
+		batch.finish.is_commit = page_owner_stamp_case == 2;
+		batch.finish.commit_scn = batch.finish.is_commit ? 9 : InvalidScn;
+		batch.needs_wal = batch.runs[0].needs_wal = true;
+		batch.nruns = 1; batch.runs[0].count = 1;
+		memcpy(page_owner_stamp_live.data, saved_blocks, BLCKSZ);
+		UT_ASSERT(PageHasItl(page_owner_stamp_live.data));
+		slot = &ClusterPageGetItlSlots(page_owner_stamp_live.data)[record->key.slot_idx];
+		memset(slot, 0, sizeof(*slot));
+		slot->xid = record->proof.xid; slot->wrap = wrap;
+		slot->flags = ITL_FLAG_ACTIVE; slot->undo_segment_head = record->proof.undo_segment_head;
+		record->proof.valid = true; record->proof.buffer_id = 1;
+		record->proof.own_generation = 7; record->proof.acquisition_epoch = 9;
+		record->proof.slot_class = ITL_FLAG_ACTIVE;
+		record->proof.slot_wrap = wrap + (page_owner_stamp_case == 1);
+		page_owner_page_locked = false;
+		page_owner_starts = page_owner_registers = page_owner_finishes = page_owner_aborts = 0;
+		page_owner_unlocks = page_owner_skips = 0;
+		page_owner_flush_calls = page_owner_local_reads = page_owner_remote_reads = page_owner_discharge_calls = 0;
+		page_owner_local_flush = 400; page_owner_remote_flush = 700;
+		BufferBlocks = page_owner_stamp_live.data;
+		if (page_owner_use_range)
+			page_owner_finish_original_range(record, &batch.finish);
+		else
+			original_page_owner_flush_batch(&batch);
+		BufferBlocks = saved_blocks;
+		if (!page_owner_use_range)
+			UT_ASSERT_EQ(batch.nruns, 0);
+		UT_ASSERT(!page_owner_page_locked);
+		UT_ASSERT_EQ(page_owner_starts, 1);
+		UT_ASSERT_EQ(page_owner_unlocks, page_owner_stamp_case != 0);
+		if (page_owner_stamp_case < 2)
+		{
+			UT_ASSERT_EQ(page_owner_skips, page_owner_use_range ? 2 : 1);
+			UT_ASSERT_EQ(page_owner_aborts, 1);
+			UT_ASSERT_EQ(page_owner_registers + page_owner_finishes, 0);
+			UT_ASSERT_EQ(slot->flags, ITL_FLAG_ACTIVE);
+		}
+		else
+		{
+			UT_ASSERT_EQ(page_owner_skips, page_owner_use_range ? 1 : 0);
+			UT_ASSERT_EQ(page_owner_aborts, 0);
+			UT_ASSERT_EQ(page_owner_registers, 1); UT_ASSERT_EQ(page_owner_finishes, 1);
+			UT_ASSERT_EQ(PageGetLSN(page_owner_stamp_live.data), 400);
+			UT_ASSERT_EQ(slot->flags, page_owner_stamp_case == 2 ? ITL_FLAG_NEEDS_CLEANOUT : ITL_FLAG_ABORTED);
+			UT_ASSERT_EQ(slot->commit_scn, page_owner_stamp_case == 2 ? 9 : InvalidScn);
+		}
+		if (page_owner_stamp_case < 3)
+		{
+			UT_ASSERT_EQ(page_owner_flush_calls + page_owner_local_reads + page_owner_remote_reads + page_owner_discharge_calls, 0);
+			UT_ASSERT(memcmp(record->ctrc_handle.participant, &participant, sizeof(participant)) == 0);
+			UT_ASSERT(memcmp(record->ctrc_handle.receipt, &receipt, sizeof(receipt)) == 0);
+			UT_ASSERT_EQ(receipt_terminal_wakeups, wakeups);
+		}
+		else
+		{
+			UT_ASSERT_EQ(record->ctrc_handle.receipt->state, CTRC_RECEIPT_CLEANED);
+			UT_ASSERT_EQ(page_owner_flush_calls, 1); UT_ASSERT_EQ(page_owner_local_reads, 1);
+			UT_ASSERT_EQ(page_owner_remote_reads, CLUSTER_SF_DEP_MAX_ORIGINS - 1);
+			UT_ASSERT_EQ(page_owner_discharge_calls, 1);
+			UT_ASSERT_EQ(receipt_terminal_wakeups, wakeups + 1);
+		}
+	}
+}
+
+static bool page_owner_use_full_batch;
 static void
 page_owner_finish_discharge(const ClusterCtrcReceiptHandle *handle)
 {
@@ -12459,6 +12722,12 @@ page_owner_finish_discharge(const ClusterCtrcReceiptHandle *handle)
 	dependencies.required[0] = 400; dependencies.required[1] = 700;
 	page_owner_touch_list = &record; page_owner_node_id = 0;
 	page_owner_flush_calls = page_owner_local_reads = page_owner_remote_reads = page_owner_discharge_calls = 0;
+	if (page_owner_use_full_batch)
+	{
+		page_owner_finish_full_batch(&record);
+		page_owner_touch_list = NULL;
+		return;
+	}
 	original_page_owner_discharge_batch(true, 400, &pending, 0, &dependencies);
 	UT_ASSERT_EQ(page_owner_flush_calls + page_owner_local_reads + page_owner_remote_reads + page_owner_discharge_calls, 0);
 	for (unsigned fault = 0; fault < 4; fault++)
@@ -12830,6 +13099,37 @@ full_source_then_recent_case(bool batch, bool late_receiver)
 	full_source_then_recent_lifecycle_case(batch, late_receiver, false, 0, 0);
 }
 
+UT_TEST(test_original_top_xact_finish_retires_local_touches_before_recent_freeze)
+{
+	page_owner_use_xact_owner = page_owner_use_range = page_owner_use_full_batch = native_exit_use_page_owner_discharge = true;
+	page_owner_xact_finishes = 0;
+	for (unsigned retirement = 1; retirement <= 2; retirement++)
+		for (unsigned batch = 0; batch < 2; batch++)
+			full_source_then_recent_lifecycle_case(batch != 0, false, true, 2, retirement);
+	UT_ASSERT_EQ(page_owner_xact_finishes, 16);
+	page_owner_use_xact_owner = page_owner_use_range = page_owner_use_full_batch = native_exit_use_page_owner_discharge = false;
+}
+
+UT_TEST(test_original_page_owner_range_groups_reused_slot_before_recent_freeze)
+{
+	page_owner_use_range = page_owner_use_full_batch = native_exit_use_page_owner_discharge = true;
+	page_owner_range_calls = 0;
+	for (unsigned retirement = 1; retirement <= 2; retirement++)
+		for (unsigned batch = 0; batch < 2; batch++)
+			full_source_then_recent_lifecycle_case(batch != 0, false, true, 2, retirement);
+	UT_ASSERT_EQ(page_owner_range_calls, 16);
+	page_owner_use_range = page_owner_use_full_batch = native_exit_use_page_owner_discharge = false;
+}
+
+UT_TEST(test_original_page_owner_stamp_wal_discharge_feeds_recent_freeze)
+{
+	page_owner_use_full_batch = native_exit_use_page_owner_discharge = true;
+	for (unsigned retirement = 1; retirement <= 2; retirement++)
+		for (unsigned batch = 0; batch < 2; batch++)
+			full_source_then_recent_lifecycle_case(batch != 0, false, true, 2, retirement);
+	page_owner_use_full_batch = native_exit_use_page_owner_discharge = false;
+}
+
 UT_TEST(test_original_page_owner_discharge_feeds_certificate_recent_wal)
 {
 	native_exit_use_page_owner_discharge = true;
@@ -13147,7 +13447,7 @@ UT_TEST(test_recent_xmin_share_lock_refusal_keeps_borrowed_pin_without_upgrade)
 int
 main(void)
 {
-	UT_PLAN(304);
+	UT_PLAN(307);
 
 	UT_RUN(test_pin_free_admitted_phase_reaches_recent_native_wal_before_owner_leave);
 	UT_RUN(test_pin_free_phase_recent_refusal_retires_only_its_original_owner);
@@ -13156,6 +13456,9 @@ main(void)
 	UT_RUN(test_recent_refused_receiver_keeps_original_cut_and_native_continuation);
 	UT_RUN(test_full_original_source_reaches_pin_free_collector_and_recent_wal);
 	UT_RUN(test_full_original_source_late_receiver_revokes_recent_wal);
+	UT_RUN(test_original_top_xact_finish_retires_local_touches_before_recent_freeze);
+	UT_RUN(test_original_page_owner_range_groups_reused_slot_before_recent_freeze);
+	UT_RUN(test_original_page_owner_stamp_wal_discharge_feeds_recent_freeze);
 	UT_RUN(test_original_page_owner_discharge_feeds_certificate_recent_wal);
 	UT_RUN(test_original_native_exit_applied_certificate_retirement_precedes_recent_wal);
 	UT_RUN(test_original_native_exit_certificate_receiver_retirement_keeps_origin_in_recent_cut);
