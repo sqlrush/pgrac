@@ -823,6 +823,41 @@ test_cluster_runtime_visibility: test_cluster_runtime_visibility.c unit_test.h $
 		$(CLUSTER_VERSION_O) $(CLUSTER_RUNTIME_VIS_POLICY_O) \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
+# Execute owned visibility callers and their actual shared/local debt release.
+TESTS += test_cluster_visibility_admission
+all: test_cluster_visibility_admission
+
+test_cluster_visibility_admission_types.inc: $(top_srcdir)/src/backend/cluster/cluster_runtime_visibility.c \
+		$(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c Makefile
+	awk '/^#define CLUSTER_SEMANTIC_ADMISSION_COUNTER_TRIES / { print; found++ } \
+	     /^typedef struct (ClusterRuntimeCandidateCleanup|ClusterSemanticActivationShmem) / { emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 3 || emit) exit 1 }' \
+		$(top_srcdir)/src/backend/cluster/cluster_runtime_visibility.c \
+		$(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_visibility_admission_debt.inc: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c Makefile
+	awk '/^(semantic_activation_feature_bit_index|semantic_activation_feature_index|semantic_activation_counter_increment|semantic_activation_counter_subtract|semantic_activation_release_debt|cluster_semantic_activation_leave)\(/ \
+	     { print previous; emit=1; found++ } emit { print } /^}/ { emit=0 } \
+	     { previous=$$0 } END { if (found != 6 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_visibility_admission_callers.inc: $(top_srcdir)/src/backend/cluster/cluster_runtime_visibility.c Makefile
+	awk '/^(cluster_runtime_visibility_candidate_cleanup|cluster_runtime_visibility_current_owner_lookup_internal|cluster_runtime_visibility_local_terminal_lookup_exact|cluster_runtime_visibility_current_mx_updater_provenance_exact)\(/ \
+	     { print previous; emit=1; found++ } emit { print } /^}/ { emit=0 } \
+	     { previous=$$0 } END { if (found != 4 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_visibility_admission: test_cluster_visibility_admission.c unit_test.h \
+		test_cluster_visibility_admission_types.inc test_cluster_visibility_admission_debt.inc \
+		test_cluster_visibility_admission_callers.inc $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+.PHONY: clean-visibility-admission
+clean-visibility-admission:
+	rm -f test_cluster_visibility_admission_*.inc test_cluster_visibility_admission_*.inc.tmp
+clean distclean maintainer-clean: clean-visibility-admission
+
 # Exercise the original requester branch and live membership wrapper, with
 # proof/transport boundaries supplied by the fixture rather than copied logic.
 test_cluster_tt_terminal_route.inc: $(top_srcdir)/src/backend/cluster/cluster_runtime_visibility.c \
