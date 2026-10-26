@@ -97,6 +97,27 @@ typedef struct ClusterRecoveryNativeInventoryDiag {
 
 typedef struct ClusterRecoveryNativeInventory ClusterRecoveryNativeInventory;
 
+/* Full decoded PageVersion-bearing input, not a contribution-graph verdict.
+ * reader owns no files/callbacks and borrows this inventory's immutable copy.
+ * All components, payloads and original source generations are retained. */
+typedef struct ClusterRecoveryPageWalV1 {
+	ClusterWalSourceRef source;
+	RfContributorStreamCutV1 cut;
+	uint32 source_index;
+	uint64 ordinal;
+	const XLogReaderState *reader;
+} ClusterRecoveryPageWalV1;
+
+/* Complete two-pass observations only. Count zero is a complete empty set,
+ * not missing coverage. No I/O or cursor reset; snapshots are checked before
+ * exposure. at() clears out on refusal/out-of-range. Borrowed readers expire
+ * with the inventory. Original full input and physical rechecks, codec/image
+ * validation and native custody remain necessary; no replay/PAGE/OPEN grant. */
+extern bool cluster_recovery_native_inventory_page_count_v1(
+	ClusterRecoveryNativeInventory *inventory, uint32 *out_count);
+extern bool cluster_recovery_native_inventory_page_at_v1(
+	ClusterRecoveryNativeInventory *inventory, uint32 index, ClusterRecoveryPageWalV1 *out);
+
 /* Borrow the original startup cold scope for two complete physical passes.
  * Retain native effects and original undo WAL with complete owned payloads.
  * Every source (including explicit empty terminals), exact cut, record

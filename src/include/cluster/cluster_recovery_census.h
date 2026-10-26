@@ -20,6 +20,15 @@
 #ifdef USE_PGRAC_CLUSTER
 typedef struct ClusterRecoveryCensus ClusterRecoveryCensus;
 
+/* Original complete source generations and full PAGE WAL observations.
+ * Same DONE/manifest/namespace/error path as other census views; prefix and
+ * changed inputs expose nothing. Readers borrow the original census lifetime.
+ * Call before PAGE/content locks; no graph, image or completion authority. */
+extern bool cluster_recovery_census_page_wal_count_v1(ClusterRecoveryCensus *census,
+	uint32 *out_count);
+extern bool cluster_recovery_census_page_wal_at_v1(ClusterRecoveryCensus *census,
+	uint32 index, ClusterRecoveryPageWalV1 *out);
+
 typedef enum ClusterRecoveryCensusResult {
 	CLUSTER_RECOVERY_CENSUS_MORE = 0,
 	CLUSTER_RECOVERY_CENSUS_ENTRY,
