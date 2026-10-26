@@ -993,6 +993,211 @@ fresh_origin_key(void)
 	return key;
 }
 
+/* Exercise the real selectors. Only the scheduling/producer boundary is
+ * controlled here; none of these inputs is a release or supply verdict. */
+static void
+seed_scan_work(CtrcCleanerScanKind kind, uint64 position)
+{
+	uint64 nodes = CtrcShared->participant_key_entries / CtrcShared->origin_key_entries;
+	unsigned origin_index = kind == CTRC_SCAN_ACK ? position / nodes : position;
+	ClusterCtrcOriginEntry origin;
+	ClusterCtrcOriginEntry *entry;
+	uint64 participant_index;
+
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+	entry = seed_origin(origin_index, kind == CTRC_SCAN_RECEIPT || kind == CTRC_SCAN_ACK ? 1 : 0);
+	if (kind == CTRC_SCAN_OPEN) {
+		ClusterCtrcTxnKeyV1 key = entry->key;
+
+		MemSet(entry, 0, sizeof(*entry));
+		if (cluster_ctrc_origin_open_active(entry, &key, 7) != CLUSTER_CTRC_ORIGIN_OPENED)
+			abort();
+	} else if (kind == CTRC_SCAN_CERTIFICATE)
+		(void)ctrc_origin_dispatchable_locked(entry);
+	origin = *entry;
+	LWLockRelease(&CtrcShared->origin_lock);
+	if (kind != CTRC_SCAN_RECEIPT && kind != CTRC_SCAN_ACK)
+		return;
+	if (!ctrc_participant_index(&origin.key, 0, &participant_index)
+		|| (kind == CTRC_SCAN_ACK && participant_index != position))
+		abort();
+	ctrc_participant_locks_acquire(CTRC_PARTICIPANT_ALL_SHARDS);
+	LWLockAcquire(&CtrcShared->receipt_lock, LW_EXCLUSIVE);
+	{
+		ClusterCtrcParticipantEntry *participant = &ctrc_participant_entries()[participant_index];
+
+		if (cluster_ctrc_participant_open(participant, &origin.key, origin.grant_generation,
+										  &origin.touched[0])
+			!= CLUSTER_CTRC_PARTICIPANT_OPENED)
+			abort();
+		if (kind == CTRC_SCAN_RECEIPT) {
+			ClusterCtrcReceipt *receipt = &ctrc_receipt_entries()[position];
+
+			participant->receipt_count = participant->applied_count = 1;
+			participant->last_key_sequence = 1;
+			participant->next_key_sequence = 2;
+			receipt->key = origin.key;
+			receipt->publication.grant_generation = origin.grant_generation;
+			pg_atomic_write_u32((pg_atomic_uint32 *)&receipt->state, CTRC_RECEIPT_APPLIED);
+		}
+		if (cluster_ctrc_participant_close(participant, &origin.touched[0], origin.grant_generation,
+										   origin.seal_generation)
+			!= (kind == CTRC_SCAN_RECEIPT ? CLUSTER_CTRC_CLOSE_PENDING_DRAIN
+										  : CLUSTER_CTRC_CLOSE_ACK_READY))
+			abort();
+	}
+	LWLockRelease(&CtrcShared->receipt_lock);
+	ctrc_participant_locks_release(CTRC_PARTICIPANT_ALL_SHARDS);
+}
+
+static bool
+select_scan_work(CtrcCleanerScanKind kind, uint64 *position)
+{
+	ClusterCtrcTxnKeyV1 key;
+	ClusterCtrcOriginCertificateSnapshot certificate;
+	ClusterCtrcParticipantEntry participant;
+	ClusterCtrcReceipt receipt;
+	uint64 participant_index;
+
+	*position = UINT64_MAX;
+	switch (kind) {
+	case CTRC_SCAN_OPEN:
+		if (!cluster_ctrc_origin_next_open_shared(&key))
+			return false;
+		*position = (uint64)(key.segment_id - 1) * TT_SLOTS_PER_SEGMENT + key.slot_offset;
+		return true;
+	case CTRC_SCAN_CERTIFICATE:
+		if (!ctrc_origin_next_certificate_snapshot_shared(&certificate))
+			return false;
+		*position = certificate.origin_index;
+		return true;
+	case CTRC_SCAN_RECEIPT:
+		return ctrc_cleaner_next_applied_receipt(&participant, &receipt, &participant_index,
+												 position);
+	case CTRC_SCAN_ACK:
+		return ctrc_participant_find_ack_ready(&participant, position);
+	default:
+		abort();
+	}
+}
+
+static uint64
+scan_work_capacity(CtrcCleanerScanKind kind)
+{
+	return kind == CTRC_SCAN_RECEIPT ? CtrcShared->receipt_entries
+		   : kind == CTRC_SCAN_ACK	 ? CtrcShared->participant_key_entries
+									 : CtrcShared->origin_key_entries;
+}
+
+static CtrcCleanerScanKind scan_unlock_kind;
+static bool scan_unlock_registered;
+
+static bool
+register_scan_work_on_unlock(LWLock *lock, LWLockMode mode pg_attribute_unused(), bool acquiring)
+{
+	if (acquiring || held_count != 1 || scan_unlock_registered)
+		return false;
+	/* Model another producer only after every original lock has been released. */
+	test_lock_leave(lock);
+	scan_unlock_registered = true;
+	external_lock_hook = NULL;
+	seed_scan_work(scan_unlock_kind, 128);
+	return true;
+}
+
+UT_TEST(test_bounded_pool_selectors_observe_work_after_intervening_unlock)
+{
+	for (unsigned kind = 0; kind < CTRC_SCAN_COUNT; kind++) {
+		uint64 position;
+
+		reset_fixture();
+		seed_scan_work(kind, 0);
+		UT_ASSERT(select_scan_work(kind, &position));
+		UT_ASSERT_EQ(position, 0);
+		/* The successful selection above leaves the original cursor at 1. */
+		reset_fixture();
+		CtrcBatch.active = true;
+		CtrcBatch.remaining[kind] = 128;
+		scan_unlock_kind = kind;
+		scan_unlock_registered = false;
+		external_lock_hook = register_scan_work_on_unlock;
+		UT_ASSERT(select_scan_work(kind, &position));
+		UT_ASSERT(scan_unlock_registered);
+		UT_ASSERT_EQ(position, 128);
+		UT_ASSERT_EQ(CtrcBatch.remaining[kind], 0);
+		UT_ASSERT_EQ(held_count, 0);
+		CtrcBatch.active = false;
+	}
+}
+
+UT_TEST(test_empty_bounded_pool_scan_keeps_round_robin_position)
+{
+	for (unsigned kind = 0; kind < CTRC_SCAN_COUNT; kind++) {
+		uint64 position;
+
+		reset_fixture();
+		seed_scan_work(kind, 0);
+		UT_ASSERT(select_scan_work(kind, &position));
+		UT_ASSERT_EQ(position, 0);
+		reset_fixture();
+		CtrcBatch.active = true;
+		CtrcBatch.remaining[kind] = 128;
+		UT_ASSERT(!select_scan_work(kind, &position));
+		UT_ASSERT_EQ(CtrcBatch.remaining[kind], 0);
+		/* On the next pass, new low-index work must not reset the cursor. */
+		seed_scan_work(kind, 4);
+		seed_scan_work(kind, 256);
+		CtrcBatch.remaining[kind] = scan_work_capacity(kind);
+		UT_ASSERT(select_scan_work(kind, &position));
+		UT_ASSERT_EQ(position, 256);
+		UT_ASSERT_EQ(held_count, 0);
+		CtrcBatch.active = false;
+	}
+}
+
+UT_TEST(test_empty_pool_selectors_cancel_without_retaining_shared_locks)
+{
+	for (unsigned kind = 0; kind < CTRC_SCAN_COUNT; kind++) {
+		uint64 position;
+		volatile bool caught = false;
+
+		reset_fixture();
+		InterruptPending = 1;
+		PG_TRY();
+		{
+			(void)select_scan_work(kind, &position);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		InterruptPending = 0;
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
+UT_TEST(test_empty_dispatch_pool_scan_cancels_without_retaining_origin_lock)
+{
+	volatile bool caught = false;
+
+	reset_fixture();
+	InterruptPending = 1;
+	PG_TRY();
+	{
+		ctrc_dispatch_batch_collect();
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	InterruptPending = 0;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
 UT_TEST(test_origin_reserve_requires_published_local_top_protection)
 {
 	unsigned fault;
@@ -7020,7 +7225,11 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(167);
+	UT_PLAN(171);
+	UT_RUN(test_bounded_pool_selectors_observe_work_after_intervening_unlock);
+	UT_RUN(test_empty_bounded_pool_scan_keeps_round_robin_position);
+	UT_RUN(test_empty_pool_selectors_cancel_without_retaining_shared_locks);
+	UT_RUN(test_empty_dispatch_pool_scan_cancels_without_retaining_origin_lock);
 	UT_RUN(test_receipt_observed_identity_refusal_precedes_chain_blocking);
 	UT_RUN(test_receipt_original_identity_refusal_precedes_chain_blocking);
 	UT_RUN(test_prepare_path_namespace_precedes_input_and_resets_output);
