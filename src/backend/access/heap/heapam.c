@@ -10749,11 +10749,14 @@ cluster_heap_wait_successor(const ClusterTxLocator *locator, LockWaitPolicy wait
 	return cluster_heap_writer_wait_target(&partial, wait_policy, deadline_us, &proof);
 }
 
+/* Shared callers release their VM pin before entry. Restore that same
+ * caller-owned handle before returning under heap X, then rebind/recheck the
+ * original tuple and proof. A missing pin must not restart an AV row forever. */
 static bool
 cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple tup,
 									TransactionId xwait, uint16 saved_infomask,
 									LockWaitPolicy wait_policy, TM_Result *res,
-									uint64 *wait_deadline_us)
+									uint64 *wait_deadline_us, Buffer *vmbuffer)
 {
 	Page		page = BufferGetPage(buffer);
 	ClusterUndoTTSlotRef cref;
@@ -10822,7 +10825,11 @@ cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple 
 		evidence = cluster_heap_resolve_recycled_writer_ref(buffer, xwait, &cref, false, &recycled);
 
 		if (evidence == CLUSTER_VIS_EVIDENCE_LOCAL) {
-			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+			if (cluster_heap_read_needs_copy(relation))
+				cluster_heap_lock_with_vm_repin(
+					relation, ItemPointerGetBlockNumber(&tup->t_self), buffer, vmbuffer);
+			else
+				LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 			cluster_heap_rebind_locked_tuple(relation, buffer, tup, &creation_xmin);
 			return false; /* existing resolver proved a genuinely own xid */
 		}
@@ -10954,7 +10961,11 @@ cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple 
 			 */
 			if (wait_policy == LockWaitSkip)
 			{
-				LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+				if (cluster_heap_read_needs_copy(relation))
+					cluster_heap_lock_with_vm_repin(
+						relation, ItemPointerGetBlockNumber(&tup->t_self), buffer, vmbuffer);
+				else
+					LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 				cluster_heap_rebind_locked_tuple(relation, buffer, tup, &creation_xmin);
 				*res = TM_WouldBlock;
 				return true;
@@ -11063,7 +11074,11 @@ cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple 
 	 *   instead of running the unsafe native path.
 	 */
 cluster_remote_writer_terminal:
-	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+	if (cluster_heap_read_needs_copy(relation))
+		cluster_heap_lock_with_vm_repin(
+			relation, ItemPointerGetBlockNumber(&tup->t_self), buffer, vmbuffer);
+	else
+		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 	cluster_heap_rebind_locked_tuple(relation, buffer, tup, &creation_xmin);
 	if (recycled_terminal || target_terminal || target_would_block) {
 		OffsetNumber offset = ItemPointerGetOffsetNumber(&tup->t_self);
@@ -11228,12 +11243,12 @@ cluster_remote_writer_terminal:
 #ifdef USE_CLUSTER_UNIT
 bool
 cluster_heap_test_writer_wait(Relation relation, Buffer buffer, HeapTuple tuple, TransactionId xid,
-							  uint16 infomask, TM_Result *result)
+							  uint16 infomask, TM_Result *result, Buffer *vmbuffer)
 {
 	uint64 deadline_us = 0;
 
 	return cluster_heap_writer_wait_failclosed(relation, buffer, tuple, xid, infomask,
-											   LockWaitBlock, result, &deadline_us);
+											   LockWaitBlock, result, &deadline_us, vmbuffer);
 }
 #endif
 
@@ -11581,9 +11596,15 @@ l1:
 		 * below then yields TM_Ok.  A false return means a local locker; the
 		 * native path is correct.  A remote writer / timeout / wait-off raises.
 		 */
+			/* The bridge can wait for a writer which needs this VM page. */
+			if (cluster_heap_read_needs_copy(relation) && BufferIsValid(vmbuffer))
+			{
+				ReleaseBuffer(vmbuffer);
+				vmbuffer = InvalidBuffer;
+			}
 			if (cluster_heap_writer_wait_failclosed(relation, buffer, &tp, xwait, infomask,
 													LockWaitBlock, &cluster_writer_res,
-													&cluster_writer_wait_deadline_us)) {
+													&cluster_writer_wait_deadline_us, &vmbuffer)) {
 				if (cluster_writer_res == TM_BeingModified)
 					goto l1;
 				/*
@@ -13025,9 +13046,15 @@ l2:
 		 * false return means a local locker; the native path below is correct.
 		 * A remote writer / timeout / wait-off raises inside.
 		 */
+		/* The bridge can wait for a writer which needs this VM page. */
+		if (cluster_heap_read_needs_copy(relation) && BufferIsValid(vmbuffer))
+		{
+			ReleaseBuffer(vmbuffer);
+			vmbuffer = InvalidBuffer;
+		}
 		if (cluster_heap_writer_wait_failclosed(relation, buffer, &oldtup, xwait, infomask,
 												LockWaitBlock, &cluster_writer_res,
-												&cluster_writer_wait_deadline_us)) {
+												&cluster_writer_wait_deadline_us, &vmbuffer)) {
 			if (cluster_writer_res == TM_BeingModified)
 				goto l2;
 			/*
@@ -16930,9 +16957,15 @@ l3:
 											 xwait))
 						goto l3;
 
+					/* The bridge can wait for a writer which needs this VM page. */
+					if (cluster_heap_read_needs_copy(relation) && BufferIsValid(vmbuffer))
+					{
+						ReleaseBuffer(vmbuffer);
+						vmbuffer = InvalidBuffer;
+					}
 					if (cluster_heap_writer_wait_failclosed(relation, *buffer, tuple, xwait,
 															infomask, wait_policy, &cwres,
-															&cluster_writer_wait_deadline_us)) {
+															&cluster_writer_wait_deadline_us, &vmbuffer)) {
 						if (cwres == TM_BeingModified)
 							goto l3;
 						/*

@@ -9870,7 +9870,31 @@ test_cluster_heap_update_temp_lock: test_cluster_heap_update_temp_lock.c unit_te
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_space_producer_product.o \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
+test_cluster_heap_writer_wait_delete.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_delete\(/ { in_entry=1 } \
+	     in_entry && /spec-5.2.*C4\/D11/ { print "/*"; emit=1; found++ } \
+	     emit { print } emit && /\)\) \{/ { emit=0; done++ } \
+	     /^}/ { in_entry=0 } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_writer_wait_update.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_update\(/ { in_entry=1 } \
+	     in_entry && /spec-5.2.*C4\/D11/ { print "/*"; emit=1; found++ } \
+	     emit { print } emit && /\)\) \{/ { emit=0; done++ } \
+	     /^}/ { in_entry=0 } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_writer_wait_lock.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_lock_tuple_internal\(/ { in_entry=1 } \
+	     in_entry && /F10: PG released the buffer lock before sleeping/ { ready=1 } \
+	     ready && /goto l3;/ { emit=1; found++; ready=0; next } \
+	     emit { print } emit && /\)\) \{/ { emit=0; done++ } \
+	     /^}/ { in_entry=0 } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_r4_lock_order: test_cluster_r4_lock_order.c unit_test.h \
+		test_cluster_heap_writer_wait_delete.inc test_cluster_heap_writer_wait_update.inc \
+		test_cluster_heap_writer_wait_lock.inc \
 		cluster_snapshot_test_stubs.h \
 		test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
 		cluster_r4_activation_test_stubs.h \
@@ -9896,6 +9920,8 @@ test_cluster_r4_lock_order: test_cluster_r4_lock_order.c unit_test.h \
 # PGRAC: keep the real terminal-only resolver in the ITL capacity consumer
 # test. Origin responses and TX wakeups are controlled by the fixture.
 test_cluster_r4_itl_capacity: test_cluster_r4_itl_capacity.c test_cluster_r4_lock_order.c \
+		test_cluster_heap_writer_wait_delete.inc test_cluster_heap_writer_wait_update.inc \
+		test_cluster_heap_writer_wait_lock.inc \
 		unit_test.h cluster_r4_activation_test_stubs.h \
 		$(CLUSTER_SEMANTIC_ACTIVATION_C) $(CLUSTER_SEMANTIC_ACTIVATION_H) \
 		$(CLUSTER_R4_MULTI_RESOLVE_TEST_O) $(CLUSTER_R4_HOT_HEAPAM_TEST_O) \

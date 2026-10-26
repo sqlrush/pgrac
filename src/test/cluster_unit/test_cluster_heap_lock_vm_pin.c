@@ -1809,7 +1809,7 @@ row_conditional_mx_wait(MultiXactId multi, MultiXactStatus status, uint16 infoma
 static bool
 cluster_heap_writer_wait_failclosed(Relation rel, Buffer buffer, HeapTuple target,
 									TransactionId xid, uint16 infomask, LockWaitPolicy policy,
-									TM_Result *result, uint64 *deadline)
+									TM_Result *result, uint64 *deadline, Buffer *vmbuffer pg_attribute_unused())
 {
 	UT_ASSERT(rel == &relation && target == &tuple && locked);
 	UT_ASSERT_EQ(buffer, 1);

@@ -17,6 +17,7 @@
 #include "access/htup_details.h"
 #include "access/multixact.h"
 #include "access/xact.h"
+#include "access/visibilitymap.h"
 #include "access/xloginsert.h"
 #include "access/tableam.h"
 #include "catalog/pg_class.h"
@@ -361,6 +362,11 @@ static ClusterUndoTTSlotRef ut_scratch_expected_ref;
 static ClusterVisEvidence ut_scratch_resolve_evidence;
 static ClusterTTStatus ut_scratch_resolve_status;
 static bool ut_writer_bridge_fixture;
+/* An independent caller-owned VM pin; never a heap buffer reference. */
+static bool ut_writer_vm_active, ut_writer_vm_pinned;
+static unsigned ut_writer_vm_releases, ut_writer_vm_service_calls, ut_writer_vm_service_pins;
+static unsigned ut_writer_vm_unlock_pins, ut_writer_vm_relock_pins;
+static unsigned ut_writer_vm_warms, ut_writer_vm_repins, ut_writer_vm_misses;
 static int ut_writer_bridge_mutation;
 static int ut_writer_bridge_tuple_pulls;
 static bool ut_writer_target_fixture;
@@ -493,6 +499,10 @@ ClusterTxwResult
 cluster_tx_enqueue_wait_exact(const ClusterTxLocator *locator, int effective_timeout_ms,
 							  ClusterTxResolveReason *reason_out)
 {
+	if (ut_writer_vm_active) {
+		ut_writer_vm_service_calls++;
+		ut_writer_vm_service_pins += ut_writer_vm_pinned;
+	}
 	ut_itl_wait_calls++;
 	ut_itl_wait_locator = *locator;
 	ut_itl_wait_budget_ms = effective_timeout_ms;
@@ -641,6 +651,10 @@ void
 cluster_visibility_resolve_from_ref_scn(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref,
 										XLogRecPtr anchor_lsn, SCN read_scn, ClusterVisResolve *out)
 {
+	if (ut_writer_vm_active) {
+		ut_writer_vm_service_calls++;
+		ut_writer_vm_service_pins += ut_writer_vm_pinned;
+	}
 	ut_scratch_exact_resolve_calls++;
 	if (ut_hot_production_core_active)
 		UT_ASSERT(!ut_hot_content_lock_held);
@@ -1234,6 +1248,10 @@ cluster_tx_resolve_exact(const ClusterTxLocator *locator, ClusterTxResolveMode m
 		UT_ASSERT_EQ(mode, CLUSTER_TX_RESOLVE_VISIBILITY);
 		return ut_itl_resolve_fixture(locator, mode, NULL, out, reason_out);
 	}
+	if (ut_writer_vm_active) {
+		ut_writer_vm_service_calls++;
+		ut_writer_vm_service_pins += ut_writer_vm_pinned;
+	}
 	UT_ASSERT(ut_writer_target_fixture);
 	UT_ASSERT(!ut_hot_content_lock_held);
 	UT_ASSERT_EQ(semantic_activation_local_inflight[CLUSTER_SEMANTIC_TARGET_SIDE][0], 0);
@@ -1776,6 +1794,12 @@ IncrBufferRefCount(Buffer buffer)
 void
 ReleaseBuffer(Buffer buffer)
 {
+	if (ut_writer_vm_active && buffer == (Buffer)2) {
+		UT_ASSERT(ut_writer_vm_pinned);
+		ut_writer_vm_pinned = false;
+		ut_writer_vm_releases++;
+		return;
+	}
 	UT_ASSERT_EQ(buffer, ut_itl_pair_active ? 2 : 1);
 	if (ut_itl_pair_active) {
 		UT_ASSERT(!ut_itl_pair_content_lock_held[0]);
@@ -2471,6 +2495,12 @@ LockBuffer(Buffer buffer, int mode)
 		fixture->lock_modes[fixture->lock_calls] = mode;
 	fixture->lock_calls++;
 
+	if (ut_writer_vm_active) {
+		if (mode == BUFFER_LOCK_UNLOCK)
+			ut_writer_vm_unlock_pins += ut_writer_vm_pinned;
+		else
+			ut_writer_vm_relock_pins += ut_writer_vm_pinned;
+	}
 	if (mode == BUFFER_LOCK_UNLOCK) {
 		UT_ASSERT(ut_hot_content_lock_held);
 		ut_hot_content_lock_held = false;
@@ -5775,19 +5805,287 @@ UT_TEST(test_lock_only_xid_breach_never_asks_fallback_or_changes_page)
 	ut_itl_census_end();
 }
 
+/* VM I/O/residency leaves for the actual production repin helper. */
+void
+visibilitymap_pin(Relation relation, BlockNumber block, Buffer *map)
+{
+	UT_ASSERT(ut_writer_vm_active && !ut_hot_content_lock_held);
+	UT_ASSERT(!ut_writer_vm_pinned && !BufferIsValid(*map));
+	UT_ASSERT_EQ(block, UT_HOT_BLOCK);
+	UT_ASSERT(!RelationUsesLocalBuffers(relation));
+	ut_writer_vm_warms++;
+	ut_writer_vm_pinned = true;
+	*map = (Buffer)2;
+}
+
+bool
+visibilitymap_pin_recent(Relation relation, BlockNumber block, Buffer recent, Buffer *map)
+{
+	UT_ASSERT(ut_writer_vm_active && ut_hot_content_lock_held);
+	UT_ASSERT(!ut_writer_vm_pinned && !BufferIsValid(*map));
+	UT_ASSERT_EQ(block, UT_HOT_BLOCK);
+	UT_ASSERT_EQ(recent, (Buffer)2);
+	UT_ASSERT(!RelationUsesLocalBuffers(relation));
+	if (ut_writer_vm_misses > 0) {
+		ut_writer_vm_misses--;
+		return false;
+	}
+	ut_writer_vm_repins++;
+	ut_writer_vm_pinned = true;
+	*map = (Buffer)2;
+	return true;
+}
+
 static bool
 ut_writer_wait_with_relation(Buffer buffer, HeapTuple tuple, TransactionId xid, uint16 infomask,
 							 TM_Result *result)
 {
 	RelationData relation = { 0 };
 	FormData_pg_class form = { 0 };
+	Buffer map = InvalidBuffer;
+	bool handled;
 
 	relation.rd_id = UT_HOT_TABLE_OID;
 	relation.rd_rel = &form;
 	form.relpersistence = RELPERSISTENCE_PERMANENT;
-	return cluster_heap_test_writer_wait(&relation, buffer, tuple, xid, infomask, result);
+	handled = cluster_heap_test_writer_wait(&relation, buffer, tuple, xid, infomask, result, &map);
+	if (BufferIsValid(map))
+		ReleaseBuffer(map);
+	return handled;
 }
 
+/* The original callers own this pin. Execute each source pre-call bracket
+ * with the full compiled bridge; only the existing authority/lock leaves are
+ * controlled. The seam fixes Block policy, so these cases qualify Block only. */
+static bool
+ut_writer_vm_bridge(Relation relation, Buffer buffer, HeapTuple tuple, TransactionId xid,
+					uint16 infomask, LockWaitPolicy policy, TM_Result *result, uint64 *deadline,
+					Buffer *map)
+{
+	UT_ASSERT_EQ(policy, LockWaitBlock);
+	UT_ASSERT_EQ(*deadline, 0);
+	return cluster_heap_test_writer_wait(relation, buffer, tuple, xid, infomask, result, map);
+}
+
+#define cluster_heap_writer_wait_failclosed ut_writer_vm_bridge
+/* The included source opens the if block closed below. */
+/* clang-format off */
+
+static bool
+ut_writer_vm_delete_entry(Relation relation, HeapTuple target, Buffer *map, TM_Result *result)
+{
+	HeapTupleData tp = *target;
+	Buffer buffer = UT_HOT_BUFFER;
+	Buffer vmbuffer = *map;
+	TransactionId xwait = HeapTupleHeaderGetRawXmax(target->t_data);
+	uint16 infomask = target->t_data->t_infomask;
+	uint64 cluster_writer_wait_deadline_us = 0;
+	TM_Result cluster_writer_res = TM_Invisible;
+	bool handled = false;
+
+#include "test_cluster_heap_writer_wait_delete.inc"
+		handled = true;
+	}
+	*map = vmbuffer;
+	*result = cluster_writer_res;
+	return handled;
+}
+
+static bool
+ut_writer_vm_update_entry(Relation relation, HeapTuple target, Buffer *map, TM_Result *result)
+{
+	HeapTupleData oldtup = *target;
+	Buffer buffer = UT_HOT_BUFFER;
+	Buffer vmbuffer = *map;
+	TransactionId xwait = HeapTupleHeaderGetRawXmax(target->t_data);
+	uint16 infomask = target->t_data->t_infomask;
+	uint64 cluster_writer_wait_deadline_us = 0;
+	TM_Result cluster_writer_res = TM_Invisible;
+	bool handled = false;
+
+#include "test_cluster_heap_writer_wait_update.inc"
+		handled = true;
+	}
+	*map = vmbuffer;
+	*result = cluster_writer_res;
+	return handled;
+}
+
+static bool
+ut_writer_vm_lock_entry(Relation relation, HeapTuple target, Buffer *map, TM_Result *result)
+{
+	HeapTuple tuple = target;
+	Buffer heap = UT_HOT_BUFFER, *buffer = &heap;
+	LockWaitPolicy wait_policy = LockWaitBlock;
+	Buffer vmbuffer = *map;
+	TransactionId xwait = HeapTupleHeaderGetRawXmax(target->t_data);
+	uint16 infomask = target->t_data->t_infomask;
+	uint64 cluster_writer_wait_deadline_us = 0;
+	TM_Result cwres = TM_Invisible;
+	bool handled = false;
+
+#include "test_cluster_heap_writer_wait_lock.inc"
+		handled = true;
+	}
+	*map = vmbuffer;
+	*result = cwres;
+	return handled;
+}
+#undef cluster_heap_writer_wait_failclosed
+/* clang-format on */
+
+typedef bool (*UtWriterVmEntry)(Relation, HeapTuple, Buffer *, TM_Result *);
+
+static void
+ut_writer_vm_entry_cases(UtWriterVmEntry entry, bool all_visible)
+{
+	volatile int leg;
+
+	for (leg = 0; leg < 14; leg++) {
+		UtR4HotProductFixture fixture;
+		HeapHotSearchResult hot;
+		HeapTupleData tuple = { 0 };
+		RelationData relation = { 0 };
+		FormData_pg_class form = { 0 };
+		ClusterItlSlotData *slot;
+		PGAlignedBlock before;
+		Buffer map = leg == 9 ? InvalidBuffer : (Buffer)2;
+		TM_Result result = TM_Invisible;
+		volatile bool caught = false, handled = false;
+		bool recycled = leg == 6 || leg == 7 || leg == 13;
+		bool expect_error = leg == 4 || leg == 7 || leg == 8;
+		bool drops_pin = leg != 9 && leg != 10 && leg != 11;
+		bool repins = all_visible && !expect_error && leg != 10 && leg != 11 && leg != 12;
+		unsigned attempts = repins ? (leg == 5 ? 3 : 1) : 0;
+
+		ut_itl_census_begin(&fixture, &hot, false);
+		pg_atomic_write_u64(&ut_itl_census_semantic.active_bits,
+							CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1);
+		relation.rd_id = UT_HOT_TABLE_OID;
+		relation.rd_rel = &form;
+		form.relpersistence = leg == 11 ? RELPERSISTENCE_TEMP : RELPERSISTENCE_PERMANENT;
+		tuple.t_data = ut_r4_hot_tuple_at((Page)fixture.live_page, UT_HOT_ROOT_OFF);
+		tuple.t_len = UT_HOT_TUPLE_LEN;
+		tuple.t_tableOid = UT_HOT_TABLE_OID;
+		ItemPointerSet(&tuple.t_self, UT_HOT_BLOCK, UT_HOT_ROOT_OFF);
+		tuple.t_data->t_ctid = tuple.t_self;
+		tuple.t_data->t_infomask = HEAP_XMIN_COMMITTED;
+		tuple.t_data->t_itl_slot_idx = 2;
+		HeapTupleHeaderSetXmax(tuple.t_data, 1200);
+		slot = &ClusterPageGetItlSlots((Page)fixture.live_page)[2];
+		slot->xid = 1200;
+		slot->undo_segment_head = uba_encode(CLUSTER_UNDO_SEGS_PER_INSTANCE + 1, 3, 2, 0);
+		memset(&ut_scratch_expected_ref, 0, sizeof(ut_scratch_expected_ref));
+		ut_scratch_expected_ref.origin_node_id = leg == 12 || leg == 13 ? 0 : 1;
+		ut_scratch_expected_ref.tt_slot_id = 3;
+		ut_scratch_expected_ref.local_xid = recycled ? 1536 : 1200;
+		if (all_visible)
+			PageSetAllVisible((Page)fixture.live_page);
+		ut_scratch_expected_xid = 1200;
+		ut_scratch_expected_lsn = PageGetLSN((Page)fixture.live_page);
+		ut_scratch_expected_read_scn = InvalidScn;
+		ut_scratch_resolve_evidence = leg == 7	  ? CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS
+									  : leg == 13 ? CLUSTER_VIS_EVIDENCE_LOCAL
+												  : CLUSTER_VIS_EVIDENCE_REMOTE;
+		ut_scratch_resolve_status = CLUSTER_TT_STATUS_COMMITTED;
+		ut_scratch_resolve_scn = (SCN)9001;
+		ut_scratch_exact_resolve_calls = 0;
+		ut_writer_bridge_fixture = ut_writer_target_fixture = true;
+		ut_writer_bridge_mutation = leg == 3 ? 1 : leg == 5 ? 2 : 0;
+		ut_writer_bridge_tuple_pulls = 0;
+		ut_writer_target_resolve_calls = 0;
+		ut_writer_target_already_terminal = leg == 2;
+		ut_writer_target_outcome = leg == 1	  ? CLUSTER_TX_ABORTED
+								   : leg == 8 ? CLUSTER_TX_UNKNOWN
+											  : CLUSTER_TX_COMMITTED;
+		if (leg == 4)
+			ut_itl_wait_result = CLUSTER_TXW_UNPROVABLE;
+		ut_successor_proof_fixture = leg == 4 || leg == 8; /* existing error-name leaf */
+		ut_successor_proof_fault = 0;
+		cluster_shared_config = true;
+		cluster_enabled = leg != 10;
+		ut_writer_vm_active = true;
+		ut_writer_vm_pinned = BufferIsValid(map);
+		ut_writer_vm_releases = ut_writer_vm_service_calls = ut_writer_vm_service_pins = 0;
+		ut_writer_vm_unlock_pins = ut_writer_vm_relock_pins = 0;
+		ut_writer_vm_warms = ut_writer_vm_repins = 0;
+		ut_writer_vm_misses = all_visible && leg == 5 ? 2 : 0;
+		memcpy(before.data, fixture.live_page, BLCKSZ);
+		ut_capture_error = true;
+		PG_TRY();
+		{
+			handled = entry(&relation, &tuple, &map, &result);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		ut_capture_error = false;
+		UT_ASSERT_EQ(caught, expect_error);
+		UT_ASSERT_EQ(ut_writer_vm_releases, (drops_pin ? 1 : 0) + attempts);
+		UT_ASSERT_EQ(ut_writer_vm_warms, attempts);
+		UT_ASSERT_EQ(ut_writer_vm_repins, repins ? 1 : 0);
+		UT_ASSERT_EQ(ut_writer_vm_pinned, repins || leg == 10 || leg == 11);
+		UT_ASSERT_EQ(ut_writer_vm_service_calls, recycled				  ? 1
+												 : leg == 10 || leg == 12 ? 0
+												 : leg == 2				  ? 1
+												 : leg == 4				  ? 2
+																		  : 3);
+		UT_ASSERT_EQ(ut_writer_vm_service_pins,
+					 leg == 10 || leg == 11 ? ut_writer_vm_service_calls : 0);
+		if (!expect_error) {
+			UT_ASSERT_EQ(map, repins || leg == 10 || leg == 11 ? (Buffer)2 : InvalidBuffer);
+			UT_ASSERT_EQ(handled, leg != 10 && leg != 12 && leg != 13);
+			UT_ASSERT_EQ(result, leg == 10 || leg == 12 || leg == 13 ? TM_Invisible
+								 : leg == 3 || leg == 5				 ? TM_BeingModified
+								 : leg == 1							 ? TM_Ok
+																	 : TM_Deleted);
+			UT_ASSERT(ut_hot_content_lock_held);
+		}
+		UT_ASSERT_EQ(ut_writer_vm_unlock_pins, leg == 11 ? 1 : 0);
+		UT_ASSERT_EQ(ut_writer_vm_relock_pins, leg == 11 ? 1 : 0);
+		UT_ASSERT_EQ(ut_writer_bridge_tuple_pulls, 0);
+		if (leg != 3 && leg != 5)
+			UT_ASSERT_EQ(memcmp(before.data, fixture.live_page, BLCKSZ), 0);
+		ut_writer_vm_active = ut_writer_vm_pinned = false;
+		cluster_shared_config = false;
+		cluster_enabled = true;
+		ut_successor_proof_fixture = ut_writer_target_fixture = ut_writer_bridge_fixture = false;
+		if (!ut_hot_content_lock_held)
+			LockBuffer(UT_HOT_BUFFER, BUFFER_LOCK_EXCLUSIVE);
+		ut_itl_census_end();
+	}
+}
+
+UT_TEST(test_delete_writer_bridge_releases_its_own_vm_pin)
+{
+	ut_writer_vm_entry_cases(ut_writer_vm_delete_entry, false);
+}
+
+UT_TEST(test_update_writer_bridge_releases_its_own_vm_pin)
+{
+	ut_writer_vm_entry_cases(ut_writer_vm_update_entry, false);
+}
+
+UT_TEST(test_row_lock_writer_bridge_releases_its_own_vm_pin)
+{
+	ut_writer_vm_entry_cases(ut_writer_vm_lock_entry, false);
+}
+UT_TEST(test_delete_writer_bridge_restores_vm_pin_before_av_retry)
+{
+	ut_writer_vm_entry_cases(ut_writer_vm_delete_entry, true);
+}
+
+UT_TEST(test_update_writer_bridge_restores_vm_pin_before_av_retry)
+{
+	ut_writer_vm_entry_cases(ut_writer_vm_update_entry, true);
+}
+
+UT_TEST(test_lock_writer_bridge_restores_vm_pin_before_av_retry)
+{
+	ut_writer_vm_entry_cases(ut_writer_vm_lock_entry, true);
+}
 UT_TEST(test_recycled_writer_terminal_consumes_proof_only_after_fresh_recheck)
 {
 	int leg;
@@ -7471,7 +7769,7 @@ UT_TEST(pinned_hot_slot_must_keep_selected_tuple_after_remote_image_replacement)
 int
 main(void)
 {
-	UT_PLAN(152);
+	UT_PLAN(158);
 	UT_RUN(test_prune_trace_off_keeps_real_prune_quiet);
 	UT_RUN(test_prune_trace_on_records_real_redirect_unused_and_actual_tag);
 	UT_RUN(test_prune_trace_capture_refusal_never_reads_unknown_image);
@@ -7530,6 +7828,12 @@ main(void)
 	UT_RUN(test_released_xmax_without_write_authority_preserves_every_byte);
 	UT_RUN(test_update_live_and_committed_writers_never_normalize_xmax);
 	UT_RUN(test_target_writer_uses_bit0_exact_wait_and_requalifies_terminal_proof);
+	UT_RUN(test_delete_writer_bridge_releases_its_own_vm_pin);
+	UT_RUN(test_update_writer_bridge_releases_its_own_vm_pin);
+	UT_RUN(test_row_lock_writer_bridge_releases_its_own_vm_pin);
+	UT_RUN(test_delete_writer_bridge_restores_vm_pin_before_av_retry);
+	UT_RUN(test_update_writer_bridge_restores_vm_pin_before_av_retry);
+	UT_RUN(test_lock_writer_bridge_restores_vm_pin_before_av_retry);
 	UT_RUN(test_recycled_writer_terminal_consumes_proof_only_after_fresh_recheck);
 	UT_RUN(test_local_writer_ref_requires_matching_identity_or_resolver_proof);
 	UT_RUN(test_itl_wait_negative_boundaries_preserve_page_and_close_owners);

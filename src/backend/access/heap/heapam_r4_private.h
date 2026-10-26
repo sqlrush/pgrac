@@ -286,7 +286,8 @@ extern bool cluster_heap_tuple_satisfies_visibility_waitable(
 #ifdef USE_CLUSTER_UNIT
 extern bool cluster_heap_test_satisfies_mvcc(HeapTuple tuple, Snapshot snapshot, Buffer buffer);
 extern bool cluster_heap_test_writer_wait(Relation relation, Buffer buffer, HeapTuple tuple,
-										  TransactionId xid, uint16 infomask, TM_Result *result);
+										  TransactionId xid, uint16 infomask, TM_Result *result,
+										  Buffer *vmbuffer);
 extern bool cluster_heap_test_r4_target_reachable(void);
 extern HeapHotSearchResultKind cluster_heap_test_r4_hot_full_cycle(
 	BufferTag tag, ItemPointerData logical_root, SCN read_scn,
