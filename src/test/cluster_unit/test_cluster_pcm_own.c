@@ -7519,7 +7519,7 @@ UT_TEST(test_shmem_initializes_complete_entry)
 
 	reset_fixture();
 	UT_ASSERT_EQ(cluster_pcm_own_shmem_size(), (Size)NBuffers * sizeof(ClusterPcmOwnEntry));
-	UT_ASSERT_EQ(sizeof(ClusterPcmOwnEntry), 56);
+	UT_ASSERT_EQ(sizeof(ClusterPcmOwnEntry), 64);
 	UT_ASSERT_EQ(offsetof(ClusterPcmOwnEntry, resource_x_activation_generation), 24);
 	for (i = 0; i < NBuffers; i++) {
 		UT_ASSERT_EQ(pg_atomic_read_u64(&ClusterPcmOwnArray[i].generation), 0);
@@ -7528,6 +7528,7 @@ UT_TEST(test_shmem_initializes_complete_entry)
 		UT_ASSERT_EQ(pg_atomic_read_u64(&ClusterPcmOwnArray[i].resource_x_activation_generation),
 					 0);
 		UT_ASSERT_EQ(pg_atomic_read_u32(&ClusterPcmOwnArray[i].flags), 0);
+		UT_ASSERT_EQ(ClusterPcmOwnArray[i].service_event_generation, 0);
 		UT_ASSERT_EQ(pg_atomic_read_u64(&ClusterPcmOwnArray[i].delivery_attempt), 0);
 	}
 }

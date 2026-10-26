@@ -69,9 +69,10 @@ typedef struct ClusterPcmOwnEntry {
 	uint32 service_waiters; /* LMS worker bits, protected by the buffer header. */
 	pg_atomic_uint64 delivery_attempt;				   /* non-authoritative target residency hold */
 	pg_atomic_uint64 write_io_generation; /* odd: native output IO; even: completed. */
+	uint64 service_event_generation; /* non-authoritative, under buffer header */
 } ClusterPcmOwnEntry;
 
-StaticAssertDecl(sizeof(ClusterPcmOwnEntry) == 56, "ClusterPcmOwnEntry must remain 56 bytes");
+StaticAssertDecl(sizeof(ClusterPcmOwnEntry) == 64, "ClusterPcmOwnEntry must remain 64 bytes");
 StaticAssertDecl(offsetof(ClusterPcmOwnEntry, writer_activation_token) == 16,
 				 "writer activation fence offset must remain stable");
 StaticAssertDecl(offsetof(ClusterPcmOwnEntry, resource_x_activation_generation) == 24,

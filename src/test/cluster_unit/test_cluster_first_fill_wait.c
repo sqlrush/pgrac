@@ -79,7 +79,7 @@ gcs_block_pending_s_notify_service(const ClusterPcmReadGrant *service, int maste
 	const ClusterPcmReadGrantKey *key = &service->key;
 	UT_ASSERT_EQ(service->binding_generation, 7);
 	UT_ASSERT_EQ(service->service_generation, 1);
-	UT_ASSERT_EQ(action, GCS_BLOCK_DONE_PENDING_S_NACK);
+	UT_ASSERT(action == GCS_BLOCK_DONE_PENDING_S_NACK || action == GCS_BLOCK_DONE_PENDING_S_RETURN);
 	UT_ASSERT_EQ(key->requester_node, 1);
 	UT_ASSERT_EQ(master, 2);
 	cancellations++;
@@ -93,7 +93,7 @@ static void gcs_block_forward_reply_immediate_deny(const GcsBlockForwardPayload 
 #define ClusterGcsBlock ((void *)1)
 /* These IO-only cases must never enter the real reply-send stage. */
 #define cluster_gcs_lookup_master(tag) 2
-#define gcs_block_pcm_x_authenticated_session(master, epoch, session) true
+#define gcs_block_pcm_x_authenticated_session(master, epoch, session) (*(session) = 9, true)
 #define cluster_ic_send_envelope(...) (pg_re_throw(), CLUSTER_IC_SEND_HARD_ERROR)
 #define cluster_gcs_block_note_send_outcome(...) ((void)0)
 #define cluster_ic_tier1_my_data_channel wait_channel
@@ -130,6 +130,16 @@ static bool gcs_first_fill_retry_progress(const ClusterPcmReadSource *source pg_
 #undef ClusterGcsBlock
 #undef cluster_lms_wakeup
 
+static bool
+wait_park(const GcsBlockFirstFillForwardPayload *fwd, bool busy)
+{
+	bool created;
+	GcsFirstFillHolderPark *slot = gcs_first_fill_holder_reserve(fwd, 9, &created);
+	if (slot == NULL) return false;
+	if (busy && created) (void)gcs_first_fill_holder_park(fwd, false);
+	return gcs_first_fill_holder_park(fwd, busy);
+}
+
 /* Transport/production boundary: the real continuation must call it once,
  * after IO. A conditional content refusal retains the same owner locally. */
 static void
@@ -140,13 +150,15 @@ wait_serve(const ClusterICEnvelope *env, const void *payload)
 	UT_ASSERT_EQ(env->payload_length, sizeof(*fwd));
 	UT_ASSERT_EQ(fwd->binding_generation, 7);
 	UT_ASSERT_EQ(fwd->service_generation, 1);
-	UT_ASSERT(!gcs_first_fill_holder_park(fwd, false));
+	UT_ASSERT(!wait_park(fwd, false));
 	if (serve_busy) {
-		UT_ASSERT(gcs_first_fill_holder_park(fwd, true));
+		UT_ASSERT(wait_park(fwd, true));
 		return;
 	}
 	UT_ASSERT(!(pg_atomic_read_u32(&transition_buf->state) & BM_IO_IN_PROGRESS));
 	shipments++;
+	/* Controlled transport success, mirroring actual holder_sent takeover. */
+	memset(gcs_first_fill_resuming, 0, sizeof(*gcs_first_fill_resuming));
 }
 
 static GcsBlockFirstFillForwardPayload
@@ -186,9 +198,9 @@ UT_TEST(holder_parks_one_request_through_native_io_and_ships_on_completion)
 	uint32 workers;
 	UT_ASSERT_EQ(cluster_pcm_own_write_io_begin(0), CLUSTER_PCM_OWN_OK);
 	pg_atomic_fetch_or_u32(&buf.state, BM_IO_IN_PROGRESS);
-	UT_ASSERT(gcs_first_fill_holder_park(&fwd, false));
+	UT_ASSERT(wait_park(&fwd, false));
 	for (int i = 0; i < 100; i++) {
-		UT_ASSERT(gcs_first_fill_holder_park(&fwd, false));
+		UT_ASSERT(wait_park(&fwd, false));
 		cluster_gcs_block_first_fill_tick();
 	}
 	/* A response/replay timer is not native write completion. */
@@ -213,12 +225,14 @@ UT_TEST(completed_io_with_busy_native_content_retains_the_same_request)
 	ClusterPcmOwnEntry entry;
 	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
 	GcsBlockFirstFillForwardPayload fwd = wait_setup(&buf, &entry);
-	UT_ASSERT(gcs_first_fill_holder_park(&fwd, true));
+	UT_ASSERT(wait_park(&fwd, true));
 	serve_busy = true;
+	cluster_bufmgr_first_fill_service_wakeup(&buf);
 	cluster_gcs_block_first_fill_tick();
 	UT_ASSERT(gcs_first_fill_holder_parks[0].in_use);
 	UT_ASSERT_EQ(shipments + cancellations, 0);
 	serve_busy = false;
+	cluster_bufmgr_first_fill_service_wakeup(&buf);
 	wait_now += 10000;
 	cluster_gcs_block_first_fill_tick();
 	UT_ASSERT_EQ(shipments, 1);
@@ -233,7 +247,7 @@ UT_TEST(stale_resident_membership_and_stop_retire_without_shipping)
 		BufferDesc buf;
 		ClusterPcmOwnEntry entry;
 		GcsBlockFirstFillForwardPayload fwd = wait_setup(&buf, &entry);
-		UT_ASSERT(gcs_first_fill_holder_park(&fwd, true));
+		UT_ASSERT(wait_park(&fwd, true));
 		if (why == 0) buf.tag.blockNum++;
 		if (why == 1) pg_atomic_fetch_add_u64(&entry.generation, 1);
 		if (why == 2) wait_epoch++;
@@ -241,7 +255,8 @@ UT_TEST(stale_resident_membership_and_stop_retire_without_shipping)
 		cluster_gcs_block_first_fill_tick();
 		UT_ASSERT_EQ(shipments, 0);
 		UT_ASSERT_EQ(cancellations, 1);
-		UT_ASSERT(!gcs_first_fill_holder_parks[0].in_use);
+		UT_ASSERT_EQ(gcs_first_fill_holder_parks[0].in_use, why < 2);
+		if (why < 2) UT_ASSERT(gcs_first_fill_holder_parks[0].returned);
 	}
 	ClusterPcmOwnArray = saved;
 }
@@ -254,11 +269,11 @@ UT_TEST(holder_capacity_refuses_new_work_without_overwriting_the_live_request)
 	GcsBlockFirstFillForwardPayload fwd = wait_setup(&buf, &entry);
 	for (unsigned i = 0; i < 64; i++) {
 		fwd.forward.request_id = 71 + i;
-		UT_ASSERT(gcs_first_fill_holder_park(&fwd, true));
+		UT_ASSERT(wait_park(&fwd, true));
 	}
 	fwd.forward.request_id = 900;
-	UT_ASSERT(gcs_first_fill_holder_park(&fwd, true));
-	UT_ASSERT_EQ(cancellations, 1);
+	UT_ASSERT(!wait_park(&fwd, true));
+	UT_ASSERT_EQ(cancellations, 0);
 	UT_ASSERT_EQ(gcs_first_fill_holder_parks[0].forward.forward.request_id, 71);
 	UT_ASSERT_EQ(gcs_first_fill_holder_parks[63].forward.forward.request_id, 134);
 	UT_ASSERT_EQ(shipments, 0);
@@ -331,7 +346,7 @@ UT_TEST(native_io_completion_and_abort_both_wake_the_exact_continuation)
 		transition_owned_io = transition_io_wakes = native_service_wake_workers = 0;
 		UT_ASSERT(StartBufferIO(&buf, false));
 		UT_ASSERT_EQ(transition_owned_io, 1);
-		UT_ASSERT(gcs_first_fill_holder_park(&fwd, false));
+		UT_ASSERT(wait_park(&fwd, false));
 		if (abort_write)
 			transition_production_abort(BufferDescriptorGetBuffer(&buf));
 		else
@@ -360,10 +375,48 @@ UT_TEST(native_io_completion_and_abort_both_wake_the_exact_continuation)
 	ClusterPcmOwnArray = saved;
 }
 
+UT_TEST(content_wait_resumes_only_on_native_event_and_wakes_all_same_worker_waiters)
+{
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	GcsBlockFirstFillForwardPayload fwd = wait_setup(&buf, &entry);
+	UT_ASSERT(wait_park(&fwd, true));
+	fwd.forward.request_id++;
+	UT_ASSERT(wait_park(&fwd, true));
+	for (int i = 0; i < 100; i++) {
+		wait_now += 10000;
+		cluster_gcs_block_first_fill_tick();
+	}
+	UT_ASSERT_EQ(shipments + cancellations, 0);
+	cluster_bufmgr_first_fill_service_wakeup(&buf);
+	cluster_gcs_block_first_fill_tick();
+	UT_ASSERT_EQ(shipments, 2);
+	UT_ASSERT_EQ(cancellations, 0);
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(unlock_between_failed_content_check_and_park_is_not_lost)
+{
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	GcsBlockFirstFillForwardPayload fwd = wait_setup(&buf, &entry);
+	UT_ASSERT(!wait_park(&fwd, false)); /* register before conditional attempt */
+	cluster_bufmgr_first_fill_service_wakeup(&buf); /* the failed check races unlock */
+	UT_ASSERT(wait_park(&fwd, true));
+	cluster_gcs_block_first_fill_tick();
+	UT_ASSERT_EQ(shipments, 1);
+	UT_ASSERT_EQ(cancellations, 0);
+	ClusterPcmOwnArray = saved;
+}
+
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(10);
+	UT_RUN(unlock_between_failed_content_check_and_park_is_not_lost);
+	UT_RUN(content_wait_resumes_only_on_native_event_and_wakes_all_same_worker_waiters);
 	UT_RUN(holder_parks_one_request_through_native_io_and_ships_on_completion);
 	UT_RUN(completed_io_with_busy_native_content_retains_the_same_request);
 	UT_RUN(stale_resident_membership_and_stop_retire_without_shipping);

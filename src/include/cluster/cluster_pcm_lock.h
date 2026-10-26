@@ -1416,6 +1416,10 @@ extern bool cluster_pcm_lock_read_grant_holder_done(const ClusterPcmReadGrant *s
 	int32 authenticated_holder);
 extern bool cluster_pcm_lock_read_grant_holder_failed(const ClusterPcmReadGrant *service,
 	int32 authenticated_holder);
+/* The caller first consumes the exact holder's no-delivery return. This
+ * reselects only after a native source change, preserving the original claim. */
+extern PcmGcsTransitionApplyResult cluster_pcm_lock_read_grant_reselect_returned(
+	const ClusterPcmReadGrant *service, int32 authenticated_holder, ClusterPcmReadGrant *out);
 extern void cluster_pcm_lock_check_shutdown_wait(void);
 extern bool cluster_pcm_lock_read_grant_revoke_ack(const ClusterPcmReadGrantKey *key);
 extern bool cluster_pcm_lock_read_grant_retire_notice_admitted(const ClusterPcmReadGrantKey *key);

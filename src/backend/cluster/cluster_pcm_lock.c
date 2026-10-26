@@ -7497,7 +7497,14 @@ pcm_transition_apply_internal(struct GrdEntry *entry, PcmLockTransition trans, i
 void
 cluster_pcm_transition_apply(struct GrdEntry *entry, PcmLockTransition trans, int holder_node_id)
 {
+	ClusterPcmResourceXMasterState *state;
+
 	pcm_transition_apply_internal(entry, trans, holder_node_id, false);
+	/* A returned first-fill service waits on directory release/downgrade,
+	 * never on another requester REQUEST. Wake its tag-owning DATA worker. */
+	state = pcm_resource_x_master_state_for_entry(entry);
+	if (state != NULL && state->pending_s_bitmap != 0)
+		cluster_lms_wakeup(cluster_lms_shard_for_tag(&entry->tag, cluster_lms_workers));
 }
 
 /* The legacy pending-X cookie, native Resource-X head, and S-holder bitmap are
@@ -11337,6 +11344,7 @@ pcm_read_grant_snapshot(struct GrdEntry *entry, int node, const ClusterPcmPendin
 	out->binding_generation = entry->binding_generation;
 	out->service_generation = claim->service_generation;
 	out->holder_node = claim->holder_node;
+	out->source_transition_generation = pg_atomic_read_u64(&entry->transition_count_local);
 	out->holder_was_x = claim->holder_was_x != 0;
 	out->revoking = claim->phase == 2;
 	out->ack_consumed = claim->phase == 3;
@@ -11492,6 +11500,77 @@ pcm_read_grant_service_matches_locked(struct GrdEntry *entry, const ClusterPcmPe
 		&& service->binding_generation == entry->binding_generation
 		&& service->service_generation == claim->service_generation
 		&& service->holder_was_x == (claim->holder_was_x != 0);
+}
+
+/* GCS has retained and consumed this holder's exact no-delivery receipt.
+ * The original pending-S remains ahead of queued X. An unchanged directory,
+ * uncertain PI, or no proven image producer leaves that same request queued.
+ * No elapsed time, replay, or requester resubmission can change its service. */
+PcmGcsTransitionApplyResult
+cluster_pcm_lock_read_grant_reselect_returned(const ClusterPcmReadGrant *service,
+	int32 holder, ClusterPcmReadGrant *out)
+{
+	PcmEntryRef ref;
+	PcmEntryAcquireResult acquired;
+	struct GrdEntry *entry;
+	ClusterPcmResourceXMasterState *state;
+	ClusterPcmPendingS *claim;
+	PcmGcsTransitionApplyResult result = PCM_GCS_TRANSITION_INCOMPATIBLE;
+	PcmState mode;
+	uint32 bit, holders, sources;
+	int next_holder = -1;
+	bool next_x;
+
+	if (service == NULL || out == NULL || service->source_transition_generation == 0
+		|| service->source_transition_generation == UINT64_MAX
+		|| !pcm_entry_ref_acquire(&service->key.tag, false, &ref, &acquired))
+		return result;
+	entry = ref.entry;
+	pcm_entry_lock_exclusive(entry);
+	claim = pcm_read_grant_lookup_locked(entry, &service->key);
+	if (!pcm_read_grant_service_matches_locked(entry, claim, service, holder)
+		|| claim->phase != 1 || claim->service_generation >= UINT32_MAX - 1
+		|| pg_atomic_read_u64(&entry->transition_count_local) < service->source_transition_generation)
+		goto done;
+	state = pcm_resource_x_master_state_for_entry(entry);
+	result = PCM_GCS_TRANSITION_PENDING_X;
+	bit = UINT32_C(1) << service->key.requester_node;
+	mode = (PcmState)pg_atomic_read_u32(&entry->master_state);
+	holders = pg_atomic_read_u32(&entry->s_holders_bitmap);
+	next_x = mode == PCM_STATE_X;
+	if ((mode == PCM_STATE_N || (mode == PCM_STATE_S && holders == bit))
+		&& pg_atomic_read_u32(&entry->pi_holders_bitmap) == 0) {
+		/* The same disk-source rule as initial admission, under entry_lock. */
+	} else if (mode == PCM_STATE_X && entry->x_holder_node >= 0
+		&& entry->x_holder_node != service->key.requester_node)
+		next_holder = entry->x_holder_node;
+	else if (mode == PCM_STATE_S) {
+		sources = holders & ~bit & ~state->pending_s_bitmap;
+		if (!service->holder_was_x && (sources & ~(UINT32_C(1) << holder)) != 0)
+			sources &= ~(UINT32_C(1) << holder);
+		if (sources == 0)
+			goto done;
+		next_holder = pcm_lowest_set_bit_node(sources);
+		if ((sources & (UINT32_C(1) << cluster_node_id)) != 0)
+			next_holder = cluster_node_id;
+	} else
+		goto done;
+	if (next_holder == holder && next_x == service->holder_was_x
+		&& pg_atomic_read_u64(&entry->transition_count_local) == service->source_transition_generation)
+		goto done;
+	if (pg_atomic_read_u64(&entry->transition_count_local) == UINT64_MAX)
+		goto done; /* An exhausted event identity cannot prove a new source. */
+	if (next_holder < 0 && mode == PCM_STATE_N)
+		cluster_pcm_transition_apply(entry, PCM_TRANS_N_TO_S, service->key.requester_node);
+	claim->holder_node = next_holder;
+	claim->holder_was_x = next_x;
+	claim->service_generation++;
+	pcm_read_grant_snapshot(entry, service->key.requester_node, claim, out);
+	result = PCM_GCS_TRANSITION_APPLIED;
+done:
+	LWLockRelease(&entry->entry_lock.lock);
+	pcm_entry_ref_release(&ref);
+	return result;
 }
 
 /* A holder cannot address a later source service with an episode-only key. */

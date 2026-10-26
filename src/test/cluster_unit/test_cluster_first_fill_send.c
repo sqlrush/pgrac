@@ -21,15 +21,16 @@ int first_fill_send_own_fixture_main(void);
 
 /* Keep the native wait witness and the whole production forward handler.
  * Only peer transport and unrelated request families are fixture boundaries. */
-static uint64 send_epoch = 1;
+static uint64 send_epoch = 1, send_master_incarnation = 9;
 static TimestampTz send_now = 10;
 static bool send_stop, send_session = true;
 static int send_master = 2;
-static unsigned send_calls, send_admitted, send_nacks, send_copies, send_releases;
+static unsigned send_calls, send_admitted, send_nacks, send_returns, send_deferred, send_copies, send_releases;
+static bool send_notice_admit = true;
 static ClusterICSendResult send_result;
 static char send_first[sizeof(GcsBlockReplyHeaderV2) + GCS_BLOCK_DATA_SIZE];
 static size_t send_length;
-static bool send_borrowed, send_downgrade, send_cancel_check = true;
+static bool send_borrowed, send_downgrade, send_copy_failure, send_cancel_check = true;
 static void send_wakeup(int worker pg_attribute_unused()) { }
 #define LockBufHdr transition_lock_header
 #define LWLockAcquire transition_lock_acquire
@@ -58,9 +59,9 @@ gcs_block_pending_s_notify_service(const ClusterPcmReadGrant *service, int maste
 	if (send_cancel_check) UT_ASSERT_EQ(key->request_id, 71);
 	UT_ASSERT_EQ(key->requester_node, 1);
 	UT_ASSERT_EQ(master, 2);
-	UT_ASSERT_EQ(action, GCS_BLOCK_DONE_PENDING_S_NACK);
-	send_nacks++;
-	return true;
+	UT_ASSERT(action == GCS_BLOCK_DONE_PENDING_S_NACK || action == GCS_BLOCK_DONE_PENDING_S_RETURN);
+	if (action == GCS_BLOCK_DONE_PENDING_S_RETURN) send_returns++; else send_nacks++;
+	return send_notice_admit;
 }
 static void gcs_block_forward_reply_immediate_deny(const GcsBlockForwardPayload *fwd)
 {
@@ -69,7 +70,7 @@ static void gcs_block_forward_reply_immediate_deny(const GcsBlockForwardPayload 
 static bool
 send_auth(int master, uint64 epoch, uint64 *session)
 {
-	*session = 9;
+	*session = send_master_incarnation;
 	return send_session && master == send_master && epoch == send_epoch;
 }
 static void
@@ -96,6 +97,11 @@ send_image(BufferTag tag, int requester, bool forwarded, XLogRecPtr *lsn,
 	UT_ASSERT(forwarded);
 	UT_ASSERT(!(pg_atomic_read_u32(&transition_buf->state) & BM_IO_IN_PROGRESS));
 	send_copies++;
+	if (send_copy_failure) {
+		pg_atomic_fetch_and_u32(&transition_buf->state, ~BM_VALID);
+		*refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_NOT_RESIDENT;
+		return false;
+	}
 	*lsn = 42;
 	if (send_borrowed) {
 		*bytes = transition_page.data;
@@ -196,6 +202,7 @@ static struct {
 #define palloc0(n) calloc(1, (n))
 #define pfree(p) free(p)
 #define cluster_ic_tier1_my_data_channel() 0
+#define cluster_ic_dispatch_defer(env) ((void)(env), ++send_deferred)
 #define GetCurrentTimestamp() send_now
 #define cluster_epoch_get_current() send_epoch
 #define cluster_normal_stop_requested() send_stop
@@ -237,6 +244,7 @@ static struct {
 #define cluster_xp_end(scope) ((void)(scope))
 #define cluster_bufmgr_drop_block_for_gcs_no_wire(tag, lsn, out) ((void)(out), CLUSTER_BUFMGR_GCS_DROP_NOT_RESIDENT)
 #define GCS_BLOCK_LOG_MASTER_NOT_HOLDER_FORWARD(...) ((void)0)
+#define cluster_bufmgr_gcs_copy_refusal_name(refusal) "fixture-refusal"
 #define cluster_bufmgr_block_is_pi(tag) false
 #define gcs_block_pi_kept_note_send(...) ((void)0)
 #define gcs_block_try_send_direct_reply(...) false
@@ -269,13 +277,15 @@ send_setup(BufferDesc *buf, ClusterPcmOwnEntry *entry)
 	memset(gcs_first_fill_holder_parks, 0, sizeof(gcs_first_fill_holder_parks));
 	memset(transition_page.data, 0x5a, GCS_BLOCK_DATA_SIZE);
 	memset(send_first, 0, sizeof(send_first));
-	send_length = send_calls = send_admitted = send_nacks = send_copies = send_releases = 0;
+	send_length = send_calls = send_admitted = send_nacks = send_returns = send_deferred = send_copies = send_releases = 0;
+	send_notice_admit = true;
 	send_epoch = 1;
+	send_master_incarnation = 9;
 	send_now = 10;
 	send_stop = false;
 	send_session = true;
 	send_master = 2;
-	send_borrowed = send_downgrade = false;
+	send_borrowed = send_downgrade = send_copy_failure = false;
 	send_cancel_check = true;
 	send_result = CLUSTER_IC_SEND_NOT_ADMITTED;
 	fwd.forward.tag = buf->tag;
@@ -488,7 +498,7 @@ UT_TEST(local_backoff_does_not_reoffer_before_the_next_service_tick)
 	ClusterPcmOwnArray = saved;
 }
 
-UT_TEST(reply_capacity_cancels_only_new_work_and_preserves_owned_frames)
+UT_TEST(reply_capacity_defers_new_work_before_production_and_preserves_owned_frames)
 {
 	BufferDesc buf;
 	ClusterPcmOwnEntry entry;
@@ -505,7 +515,9 @@ UT_TEST(reply_capacity_cancels_only_new_work_and_preserves_owned_frames)
 	send_forward(&fwd);
 	UT_ASSERT_EQ(send_owned(), 64);
 	UT_ASSERT_EQ(send_calls, 1);
-	UT_ASSERT_EQ(send_nacks, 1);
+	UT_ASSERT_EQ(send_nacks + send_returns, 0);
+	UT_ASSERT_EQ(send_deferred, 1);
+	UT_ASSERT_EQ(send_copies, 1);
 	UT_ASSERT_EQ(gcs_first_fill_holder_parks[0].forward.forward.request_id, 71);
 	UT_ASSERT_EQ(gcs_first_fill_holder_parks[63].forward.forward.request_id, 134);
 	for (int i = 1; i < 64; i++) gcs_first_fill_holder_parks[i].in_use = false;
@@ -550,10 +562,134 @@ UT_TEST(actual_handler_rejects_unbound_and_malformed_first_fill_before_io)
 	}
 }
 
+UT_TEST(actual_holder_refusal_never_tells_requester_to_retry)
+{
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	GcsBlockFirstFillForwardPayload fwd = send_setup(&buf, &entry);
+	send_copy_failure = true;
+	send_forward(&fwd);
+	UT_ASSERT_EQ(send_copies, 1);
+	UT_ASSERT_EQ(send_calls, 0);
+	UT_ASSERT_EQ(send_owned(), 1);
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(quiet_holder_return_waits_for_exact_master_consumption)
+{
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	GcsBlockFirstFillForwardPayload fwd = send_setup(&buf, &entry);
+	ClusterPcmReadGrant service;
+	GcsBlockDonePayload done = {0};
+	send_copy_failure = true;
+	send_notice_admit = false;
+	send_forward(&fwd);
+	UT_ASSERT_EQ(send_returns, 1);
+	UT_ASSERT(gcs_first_fill_holder_parks[0].returned);
+	UT_ASSERT(!gcs_first_fill_holder_parks[0].notice_admitted);
+	for (int i = 0; i < 10; i++) send_tick();
+	UT_ASSERT_EQ(send_owned(), 1);
+	UT_ASSERT_EQ(send_calls + send_nacks, 0);
+	UT_ASSERT_EQ(send_copies, 1);
+	send_notice_admit = true;
+	send_tick();
+	UT_ASSERT(gcs_first_fill_holder_parks[0].notice_admitted);
+	UT_ASSERT_EQ(send_owned(), 1); /* enqueue admission is not consumption */
+	send_forward(&fwd);
+	for (int i = 0; i < 10; i++) send_tick();
+	UT_ASSERT_EQ(send_copies, 1);
+	UT_ASSERT_EQ(send_returns, 12);
+	UT_ASSERT(GcsBlockFirstFillForwardPayloadGrant(&fwd, cluster_node_id, &service));
+	done.request_id = service.key.request_id; done.epoch = service.key.epoch;
+	done.tag = service.key.tag; done.sender_node = 2;
+	done.requester_backend_id = service.key.backend_id;
+	done.transition_id = PCM_TRANS_N_TO_S;
+	done.reserved_0[0] = GCS_BLOCK_DONE_PENDING_S_RETURNED;
+	done.reserved_0[1] = 1;
+	GcsBlockDonePayloadSetPendingSService(&done, &service);
+	for (int bad = 0; bad < 11; bad++) {
+		GcsBlockDonePayload wrong = done;
+		uint64 session = 9;
+		switch (bad) {
+		case 0: wrong.reserved_0[2]++; break;
+		case 1: wrong.reserved_0[10]++; break;
+		case 2: wrong.reserved_0[15] = 4; break;
+		case 3: wrong.reserved_0[14] = 1; break;
+		case 4: wrong.request_id++; break;
+		case 5: wrong.requester_backend_id++; break;
+		case 6: wrong.epoch++; break;
+		case 7: wrong.tag.blockNum++; break;
+		case 8: wrong.sender_node++; break;
+		case 9: session++; break;
+		case 10: wrong.reserved_0[16] = 1; break;
+		}
+		UT_ASSERT(!gcs_first_fill_holder_returned(&wrong, session));
+		UT_ASSERT_EQ(send_owned(), 1);
+	}
+	UT_ASSERT(gcs_first_fill_holder_returned(&done, 9));
+	UT_ASSERT_EQ(send_owned(), 0);
+	UT_ASSERT(!gcs_first_fill_holder_returned(&done, 9));
+	send_tick();
+	UT_ASSERT_EQ(send_calls, 0);
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(terminal_holder_nack_retains_ownership_without_reselecting)
+{
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	GcsBlockFirstFillForwardPayload fwd = send_setup(&buf, &entry);
+	send_result = CLUSTER_IC_SEND_HARD_ERROR;
+	send_notice_admit = false;
+	send_forward(&fwd);
+	UT_ASSERT_EQ(send_owned(), 1);
+	UT_ASSERT(gcs_first_fill_holder_parks[0].terminal);
+	UT_ASSERT_EQ(send_calls, 1);
+	for (int i = 0; i < 10; i++) send_tick();
+	UT_ASSERT_EQ(send_owned(), 1);
+	UT_ASSERT_EQ(send_returns, 0);
+	UT_ASSERT_EQ(send_calls, 1);
+	send_notice_admit = true;
+	send_tick();
+	UT_ASSERT_EQ(send_owned(), 0);
+	UT_ASSERT_EQ(send_calls, 1);
+	UT_ASSERT_EQ(send_returns, 0);
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(quiet_return_ends_on_proved_master_reconfiguration_but_not_unknown_session)
+{
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	for (int why = 0; why < 4; why++) {
+		BufferDesc buf;
+		ClusterPcmOwnEntry entry;
+		GcsBlockFirstFillForwardPayload fwd = send_setup(&buf, &entry);
+		send_copy_failure = true;
+		send_forward(&fwd);
+		UT_ASSERT_EQ(send_owned(), 1);
+		if (why == 0) send_master_incarnation++;
+		if (why == 1) send_epoch++;
+		if (why == 2) send_master++;
+		if (why == 3) send_session = false;
+		send_tick();
+		UT_ASSERT_EQ(send_owned(), why == 3);
+		UT_ASSERT_EQ(send_calls + send_nacks, 0);
+	}
+	ClusterPcmOwnArray = saved;
+}
+
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(13);
+	UT_RUN(quiet_return_ends_on_proved_master_reconfiguration_but_not_unknown_session);
+	UT_RUN(quiet_holder_return_waits_for_exact_master_consumption);
+	UT_RUN(terminal_holder_nack_retains_ownership_without_reselecting);
+	UT_RUN(actual_holder_refusal_never_tells_requester_to_retry);
 	UT_RUN(actual_handler_rejects_unbound_and_malformed_first_fill_before_io);
 	UT_RUN(actual_handler_retains_rejected_reply_until_transport_admission);
 	UT_RUN(immediate_reply_keeps_owned_bytes_after_sge_release);
@@ -562,7 +698,7 @@ main(void)
 	UT_RUN(retained_reply_checks_terminal_identity_and_stop_before_reoffer);
 	UT_RUN(hard_error_terminates_with_exact_cancellation);
 	UT_RUN(local_backoff_does_not_reoffer_before_the_next_service_tick);
-	UT_RUN(reply_capacity_cancels_only_new_work_and_preserves_owned_frames);
+	UT_RUN(reply_capacity_defers_new_work_before_production_and_preserves_owned_frames);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
