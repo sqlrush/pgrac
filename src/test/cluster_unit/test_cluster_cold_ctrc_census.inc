@@ -21,6 +21,26 @@ observation_event(char event)
 	}
 }
 
+
+static union {
+	uint64 align;
+	uint8 bytes[offsetof(ClusterRecoveryCensusPagesV1, entries)
+		+ 2 * sizeof(ClusterRecoveryCensusPageV1)];
+} observation_pages_storage[2];
+#define observation_pages (*(ClusterRecoveryCensusPagesV1 *)observation_pages_storage[0].bytes)
+static unsigned observation_page_fault;
+
+const ClusterRecoveryCensusPagesV1 *
+cluster_recovery_census_pages_v1(ClusterRecoveryCensus *cursor)
+{
+	if (cursor != (ClusterRecoveryCensus *)&observation_cursor_object
+		|| !observation_cursor_live || !observation_scope_live || observation_steps < 3) abort();
+	if (observation_page_fault == 1) return NULL;
+	if (observation_page_fault == 3) pg_re_throw();
+	return (const ClusterRecoveryCensusPagesV1 *)observation_pages_storage[
+		observation_page_fault == 2 ? 1 : 0].bytes;
+}
+
 static void
 observation_fixture_reset(void)
 {
@@ -30,6 +50,13 @@ observation_fixture_reset(void)
 	observation_fault = observation_fault_at = observation_event_count = 0;
 	observation_physical_count = observation_fail_allocation = 0;
 	observation_release_error = observation_early_read = false;
+	observation_page_fault = 0;
+	memset(observation_pages_storage, 0, sizeof(observation_pages_storage));
+	observation_pages.count = 2;
+	observation_pages.entries[0].forknum = MAIN_FORKNUM;
+	observation_pages.entries[0].blockno = 23;
+	observation_pages.entries[1].forknum = SPACE_FORKNUM;
+	observation_pages.entries[1].blockno = 1;
 	memset(observation_physical, 0, sizeof(observation_physical));
 	memset(observation_events, 0, sizeof(observation_events));
 	memset(&observation_manifest, 0, sizeof(observation_manifest));
@@ -518,4 +545,109 @@ UT_TEST(test_ctrc_physical_input_retains_storage_on_original_scope_release_error
 	ClusterReleaseColdRecoveryInputs(&info);
 	UT_ASSERT_EQ(frees, freed + 3); /* physical view, original copy, opaque Start */
 	UT_ASSERT(!observation_scope_live);
+}
+
+
+#ifdef CTRC_PAGES_REFUSE_ONLY
+const struct ClusterRecoveryCensusPagesV1 *
+ClusterColdRecoveryCtrcPages(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work)
+{
+	(void)start; (void)work;
+	return NULL;
+}
+#endif
+
+UT_TEST(test_ctrc_pages_belong_to_the_complete_original_start_observation)
+{
+	const ClusterRecoveryCensusPagesV1 *pages;
+	ClusterRecoveryCtrcResultValueV1 result;
+	observation_two_ready(); result = window_region.checkpoint_owner.ctrc_result;
+	UT_ASSERT(ClusterColdRecoveryCtrcPages(info.cluster_tx_start, &native_ctrc_work) == NULL);
+	UT_ASSERT(ClusterColdRecoveryCtrcObserve(info.cluster_tx_start, 2 * 1024 * 1024));
+	pages = ClusterColdRecoveryCtrcPages(info.cluster_tx_start, &native_ctrc_work);
+	UT_ASSERT(pages == &observation_pages);
+	if (pages == NULL) {
+		ClusterReleaseColdRecoveryInputs(&info);
+		return;
+	}
+	UT_ASSERT_EQ(pages->count, 2); UT_ASSERT_EQ(pages->entries[0].blockno, 23);
+	UT_ASSERT_EQ(pages->entries[1].forknum, SPACE_FORKNUM);
+	UT_ASSERT(memcmp(&result, &window_region.checkpoint_owner.ctrc_result, sizeof(result)) == 0);
+	UT_ASSERT_EQ(window_region.checkpoint_owner.ctrc_accepted_generation, 0);
+	UT_ASSERT(observation_cursor_live && observation_scope_live);
+	ClusterReleaseColdRecoveryInputs(&info);
+}
+
+UT_TEST(test_ctrc_pages_missing_or_rebound_view_revokes_the_original_observation)
+{
+	for (unsigned fault = 1; fault <= 2; fault++) {
+		observation_two_ready();
+		UT_ASSERT(ClusterColdRecoveryCtrcObserve(info.cluster_tx_start, 2 * 1024 * 1024));
+		observation_page_fault = fault;
+		UT_ASSERT(!ClusterColdRecoveryCtrcObserve(info.cluster_tx_start, 0));
+		UT_ASSERT(ClusterColdRecoveryCtrcPages(info.cluster_tx_start, &native_ctrc_work) == NULL);
+		UT_ASSERT(!observation_cursor_live && !observation_scope_live);
+		UT_ASSERT_EQ(window_region.checkpoint_owner.ctrc_accepted_generation, 0);
+		observation_page_fault = 0;
+		UT_ASSERT(!ClusterColdRecoveryCtrcObserve(info.cluster_tx_start, 2 * 1024 * 1024));
+		ClusterReleaseColdRecoveryInputs(&info);
+	}
+}
+
+UT_TEST(test_ctrc_pages_require_original_work_owner_and_accepted_tx)
+{
+	for (unsigned fault = 0; fault < 6; fault++) {
+		const struct ClusterRecoveryStartV1 *start;
+		const ClusterColdCtrcWorkV1 *work;
+		observation_two_ready();
+		UT_ASSERT(ClusterColdRecoveryCtrcObserve(info.cluster_tx_start, 2 * 1024 * 1024));
+		start = info.cluster_tx_start; work = &native_ctrc_work;
+		if (fault == 0) start = (const struct ClusterRecoveryStartV1 *)&typed;
+		if (fault == 1) work = (const ClusterColdCtrcWorkV1 *)&typed;
+		if (fault == 2) owner_boot++;
+		if (fault == 3) native_ctrc_work.entries[1].slot.xid++;
+		if (fault == 4) window_region.checkpoint_owner.tx_accepted_generation = 0;
+		if (fault == 5) typed.census_root.image_sha256[31]++;
+		UT_ASSERT(ClusterColdRecoveryCtrcPages(start, work) == NULL);
+		UT_ASSERT_EQ(window_region.checkpoint_owner.ctrc_accepted_generation, 0);
+		if (fault == 2) owner_boot--;
+		/* Refused owner/work is error cleanup, never a successful handoff. */
+		release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+		ClusterReleaseColdRecoveryInputs(&info);
+	}
+}
+
+UT_TEST(test_ctrc_pages_complete_empty_view_is_distinct_from_missing)
+{
+	observation_two_ready(); observation_pages.count = 0;
+	UT_ASSERT(ClusterColdRecoveryCtrcObserve(info.cluster_tx_start, 2 * 1024 * 1024));
+	UT_ASSERT(ClusterColdRecoveryCtrcPages(info.cluster_tx_start, &native_ctrc_work)
+		== &observation_pages);
+	UT_ASSERT_EQ(observation_pages.count, 0);
+	UT_ASSERT_EQ(window_region.checkpoint_owner.ctrc_accepted_generation, 0);
+	ClusterReleaseColdRecoveryInputs(&info);
+}
+
+UT_TEST(test_ctrc_pages_native_error_retires_cursor_before_original_scope)
+{
+	ClusterRecoveryCtrcResultValueV1 result;
+	volatile bool caught = false;
+	observation_two_ready(); result = window_region.checkpoint_owner.ctrc_result;
+	observation_page_fault = 3;
+	PG_TRY();
+	{
+		(void)ClusterColdRecoveryCtrcObserve(info.cluster_tx_start, 2 * 1024 * 1024);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT(!observation_cursor_live && !observation_scope_live);
+	UT_ASSERT(strstr(observation_events, "DR") != NULL);
+	UT_ASSERT(memcmp(&result, &window_region.checkpoint_owner.ctrc_result, sizeof(result)) == 0);
+	UT_ASSERT_EQ(window_region.checkpoint_owner.ctrc_accepted_generation, 0);
+	ClusterReleaseColdRecoveryInputs(&info);
 }

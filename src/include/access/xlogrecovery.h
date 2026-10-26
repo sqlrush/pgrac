@@ -239,6 +239,15 @@ struct ClusterColdCtrcPhysicalV1;
 extern const struct ClusterColdCtrcPhysicalV1 *ClusterColdRecoveryCtrcPhysical(
 	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work);
 
+/* PGRAC: same original completed observation/work and accepted TX. Borrow every
+ * physical relation target's value-only metadata and full-page digest under
+ * this same Start/cursor/scope lifetime, after repeat original validation.
+ * Call before PAGE/content locks. NULL refuses; a count-zero view is valid.
+ * No source refresh, stable-base/PAGE authority, FPI or completion is supplied. */
+struct ClusterRecoveryCensusPagesV1;
+extern const struct ClusterRecoveryCensusPagesV1 *ClusterColdRecoveryCtrcPages(
+	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work);
+
 /* Original post-EOR owner only: require the complete sealed ordinary-effects
  * receipt before consuming any proven physical loser.  This is a read-only
  * input check; the restricted empty-effects proof remains a per-entry
