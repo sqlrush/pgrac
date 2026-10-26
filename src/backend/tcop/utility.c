@@ -305,7 +305,9 @@ PreflightClusterSharedCatalogWrite(Node *statement)
 			&& !IsA(statement, AlterFunctionStmt) && !IsA(statement, CreateTrigStmt)
 			&& !IsA(statement, RuleStmt) && !IsA(statement, CreatePolicyStmt)
 			&& !IsA(statement, AlterPolicyStmt) && !IsA(statement, CommentStmt)
-			&& !IsA(statement, TruncateStmt)))
+			&& !IsA(statement, AlterStatsStmt) && !IsA(statement, CreateEventTrigStmt)
+			&& !IsA(statement, AlterEventTrigStmt) && !IsA(statement, AlterCollationStmt)
+			&& !IsA(statement, DefineStmt) && !IsA(statement, TruncateStmt)))
 		return;
 
 	if (IsA(statement, TruncateStmt))
@@ -313,7 +315,9 @@ PreflightClusterSharedCatalogWrite(Node *statement)
 	else if (IsA(statement, RenameStmt) || IsA(statement, AlterObjectSchemaStmt)
 			 || IsA(statement, GrantStmt) || IsA(statement, GrantRoleStmt)
 			 || IsA(statement, AlterDefaultPrivilegesStmt) || IsA(statement, AlterFunctionStmt)
-			 || IsA(statement, AlterPolicyStmt) || IsA(statement, CommentStmt))
+			 || IsA(statement, AlterPolicyStmt) || IsA(statement, CommentStmt)
+			 || IsA(statement, AlterStatsStmt) || IsA(statement, AlterEventTrigStmt)
+			 || IsA(statement, AlterCollationStmt))
 		action = "alteration";
 	else
 		action = "creation";

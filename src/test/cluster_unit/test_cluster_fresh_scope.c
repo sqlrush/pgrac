@@ -316,6 +316,32 @@ CreateCommandTag(Node *statement)
 		return CMDTAG_ALTER_POLICY;
 	if (IsA(statement, CommentStmt))
 		return CMDTAG_COMMENT;
+	if (IsA(statement, AlterStatsStmt))
+		return CMDTAG_ALTER_STATISTICS;
+	if (IsA(statement, CreateEventTrigStmt))
+		return CMDTAG_CREATE_EVENT_TRIGGER;
+	if (IsA(statement, AlterEventTrigStmt))
+		return CMDTAG_ALTER_EVENT_TRIGGER;
+	if (IsA(statement, AlterCollationStmt))
+		return CMDTAG_ALTER_COLLATION;
+	if (IsA(statement, DefineStmt)) {
+		switch (((DefineStmt *)statement)->kind) {
+		case OBJECT_AGGREGATE:
+			return CMDTAG_CREATE_AGGREGATE;
+		case OBJECT_COLLATION:
+			return CMDTAG_CREATE_COLLATION;
+		case OBJECT_TSPARSER:
+			return CMDTAG_CREATE_TEXT_SEARCH_PARSER;
+		case OBJECT_TSDICTIONARY:
+			return CMDTAG_CREATE_TEXT_SEARCH_DICTIONARY;
+		case OBJECT_TSTEMPLATE:
+			return CMDTAG_CREATE_TEXT_SEARCH_TEMPLATE;
+		case OBJECT_TSCONFIGURATION:
+			return CMDTAG_CREATE_TEXT_SEARCH_CONFIGURATION;
+		default:
+			return CMDTAG_UNKNOWN;
+		}
+	}
 	return IsA(statement, CreateTableAsStmt) ? CMDTAG_CREATE_TABLE_AS : CMDTAG_CREATE_TABLE;
 }
 
@@ -364,6 +390,26 @@ GetCommandTagName(CommandTag tag)
 		return "ALTER POLICY";
 	if (tag == CMDTAG_COMMENT)
 		return "COMMENT";
+	if (tag == CMDTAG_ALTER_STATISTICS)
+		return "ALTER STATISTICS";
+	if (tag == CMDTAG_CREATE_EVENT_TRIGGER)
+		return "CREATE EVENT TRIGGER";
+	if (tag == CMDTAG_ALTER_EVENT_TRIGGER)
+		return "ALTER EVENT TRIGGER";
+	if (tag == CMDTAG_ALTER_COLLATION)
+		return "ALTER COLLATION";
+	if (tag == CMDTAG_CREATE_AGGREGATE)
+		return "CREATE AGGREGATE";
+	if (tag == CMDTAG_CREATE_COLLATION)
+		return "CREATE COLLATION";
+	if (tag == CMDTAG_CREATE_TEXT_SEARCH_PARSER)
+		return "CREATE TEXT SEARCH PARSER";
+	if (tag == CMDTAG_CREATE_TEXT_SEARCH_DICTIONARY)
+		return "CREATE TEXT SEARCH DICTIONARY";
+	if (tag == CMDTAG_CREATE_TEXT_SEARCH_TEMPLATE)
+		return "CREATE TEXT SEARCH TEMPLATE";
+	if (tag == CMDTAG_CREATE_TEXT_SEARCH_CONFIGURATION)
+		return "CREATE TEXT SEARCH CONFIGURATION";
 	return tag == CMDTAG_CREATE_TABLE_AS ? "CREATE TABLE AS" : "CREATE TABLE";
 }
 
@@ -1282,7 +1328,9 @@ UT_TEST(test_unsupported_creates_refuse_before_xid_or_binding)
 	RangeVar target = { .type = T_RangeVar, .relpersistence = RELPERSISTENCE_UNLOGGED };
 	CreateStmt create = { .type = T_CreateStmt, .relation = &target };
 	CreateTableAsStmt ctas = { .type = T_CreateTableAsStmt, .objtype = OBJECT_MATVIEW };
-	Node *statements[] = { (Node *)&create, (Node *)&ctas };
+	DefineStmt type = { .type = T_DefineStmt, .kind = OBJECT_TYPE };
+	DefineStmt operator= {.type = T_DefineStmt, .kind = OBJECT_OPERATOR };
+	Node *statements[] = { (Node *)&create, (Node *)&ctas, (Node *)&type, (Node *)&operator};
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		int caught;
@@ -1516,6 +1564,17 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 	CreatePolicyStmt policy = { .type = T_CreatePolicyStmt, .permissive = true };
 	AlterPolicyStmt alter_policy = { .type = T_AlterPolicyStmt };
 	CommentStmt comment = { .type = T_CommentStmt, .objtype = OBJECT_TABLE };
+	AlterStatsStmt statistics = { .type = T_AlterStatsStmt, .stxstattarget = 100 };
+	CreateEventTrigStmt create_event
+		= { .type = T_CreateEventTrigStmt, .eventname = "ddl_command_start" };
+	AlterEventTrigStmt alter_event = { .type = T_AlterEventTrigStmt, .tgenabled = 'O' };
+	AlterCollationStmt alter_collation = { .type = T_AlterCollationStmt };
+	DefineStmt aggregate = { .type = T_DefineStmt, .kind = OBJECT_AGGREGATE };
+	DefineStmt collation = { .type = T_DefineStmt, .kind = OBJECT_COLLATION };
+	DefineStmt parser = { .type = T_DefineStmt, .kind = OBJECT_TSPARSER };
+	DefineStmt dictionary = { .type = T_DefineStmt, .kind = OBJECT_TSDICTIONARY };
+	DefineStmt template = { .type = T_DefineStmt, .kind = OBJECT_TSTEMPLATE };
+	DefineStmt configuration = { .type = T_DefineStmt, .kind = OBJECT_TSCONFIGURATION };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -1534,7 +1593,17 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 						   (Node *)&rule,
 						   (Node *)&policy,
 						   (Node *)&alter_policy,
-						   (Node *)&comment };
+						   (Node *)&comment,
+						   (Node *)&statistics,
+						   (Node *)&create_event,
+						   (Node *)&alter_event,
+						   (Node *)&alter_collation,
+						   (Node *)&aggregate,
+						   (Node *)&collation,
+						   (Node *)&parser,
+						   (Node *)&dictionary,
+						   (Node *)&template,
+						   (Node *)&configuration };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned skip = 0; skip < 2; skip++) {
@@ -1549,6 +1618,8 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 			trigger.replace = rule.replace = skip != 0;
 			policy.permissive = skip == 0;
 			comment.comment = skip ? NULL : "test comment";
+			statistics.missing_ok = collation.if_not_exists = aggregate.replace = skip != 0;
+			alter_event.tgenabled = skip ? 'D' : 'O';
 			create_sql_entry(statements[i]);
 			UT_ASSERT_EQ(utility_unbound, 0);
 			UT_ASSERT_EQ(utility_after_preflight, 1);
@@ -1634,6 +1705,17 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 	CreatePolicyStmt policy = { .type = T_CreatePolicyStmt, .permissive = true };
 	AlterPolicyStmt alter_policy = { .type = T_AlterPolicyStmt };
 	CommentStmt comment = { .type = T_CommentStmt, .objtype = OBJECT_TABLE };
+	AlterStatsStmt statistics = { .type = T_AlterStatsStmt, .stxstattarget = 100 };
+	CreateEventTrigStmt create_event
+		= { .type = T_CreateEventTrigStmt, .eventname = "ddl_command_start" };
+	AlterEventTrigStmt alter_event = { .type = T_AlterEventTrigStmt, .tgenabled = 'O' };
+	AlterCollationStmt alter_collation = { .type = T_AlterCollationStmt };
+	DefineStmt aggregate = { .type = T_DefineStmt, .kind = OBJECT_AGGREGATE };
+	DefineStmt collation = { .type = T_DefineStmt, .kind = OBJECT_COLLATION };
+	DefineStmt parser = { .type = T_DefineStmt, .kind = OBJECT_TSPARSER };
+	DefineStmt dictionary = { .type = T_DefineStmt, .kind = OBJECT_TSDICTIONARY };
+	DefineStmt template = { .type = T_DefineStmt, .kind = OBJECT_TSTEMPLATE };
+	DefineStmt configuration = { .type = T_DefineStmt, .kind = OBJECT_TSCONFIGURATION };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -1652,7 +1734,17 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 						   (Node *)&rule,
 						   (Node *)&policy,
 						   (Node *)&alter_policy,
-						   (Node *)&comment };
+						   (Node *)&comment,
+						   (Node *)&statistics,
+						   (Node *)&create_event,
+						   (Node *)&alter_event,
+						   (Node *)&alter_collation,
+						   (Node *)&aggregate,
+						   (Node *)&collation,
+						   (Node *)&parser,
+						   (Node *)&dictionary,
+						   (Node *)&template,
+						   (Node *)&configuration };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		int caught;
@@ -1702,6 +1794,17 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 	CreatePolicyStmt policy = { .type = T_CreatePolicyStmt, .permissive = true };
 	AlterPolicyStmt alter_policy = { .type = T_AlterPolicyStmt };
 	CommentStmt comment = { .type = T_CommentStmt, .objtype = OBJECT_TABLE };
+	AlterStatsStmt statistics = { .type = T_AlterStatsStmt, .stxstattarget = 100 };
+	CreateEventTrigStmt create_event
+		= { .type = T_CreateEventTrigStmt, .eventname = "ddl_command_start" };
+	AlterEventTrigStmt alter_event = { .type = T_AlterEventTrigStmt, .tgenabled = 'O' };
+	AlterCollationStmt alter_collation = { .type = T_AlterCollationStmt };
+	DefineStmt aggregate = { .type = T_DefineStmt, .kind = OBJECT_AGGREGATE };
+	DefineStmt collation = { .type = T_DefineStmt, .kind = OBJECT_COLLATION };
+	DefineStmt parser = { .type = T_DefineStmt, .kind = OBJECT_TSPARSER };
+	DefineStmt dictionary = { .type = T_DefineStmt, .kind = OBJECT_TSDICTIONARY };
+	DefineStmt template = { .type = T_DefineStmt, .kind = OBJECT_TSTEMPLATE };
+	DefineStmt configuration = { .type = T_DefineStmt, .kind = OBJECT_TSCONFIGURATION };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -1720,7 +1823,17 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 						   (Node *)&rule,
 						   (Node *)&policy,
 						   (Node *)&alter_policy,
-						   (Node *)&comment };
+						   (Node *)&comment,
+						   (Node *)&statistics,
+						   (Node *)&create_event,
+						   (Node *)&alter_event,
+						   (Node *)&alter_collation,
+						   (Node *)&aggregate,
+						   (Node *)&collation,
+						   (Node *)&parser,
+						   (Node *)&dictionary,
+						   (Node *)&template,
+						   (Node *)&configuration };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned child = 0; child < 2; child++) {
@@ -1776,6 +1889,17 @@ UT_TEST(test_catalog_writes_preflight_requires_shared_catalog_storage)
 	CreatePolicyStmt policy = { .type = T_CreatePolicyStmt, .permissive = true };
 	AlterPolicyStmt alter_policy = { .type = T_AlterPolicyStmt };
 	CommentStmt comment = { .type = T_CommentStmt, .objtype = OBJECT_TABLE };
+	AlterStatsStmt statistics = { .type = T_AlterStatsStmt, .stxstattarget = 100 };
+	CreateEventTrigStmt create_event
+		= { .type = T_CreateEventTrigStmt, .eventname = "ddl_command_start" };
+	AlterEventTrigStmt alter_event = { .type = T_AlterEventTrigStmt, .tgenabled = 'O' };
+	AlterCollationStmt alter_collation = { .type = T_AlterCollationStmt };
+	DefineStmt aggregate = { .type = T_DefineStmt, .kind = OBJECT_AGGREGATE };
+	DefineStmt collation = { .type = T_DefineStmt, .kind = OBJECT_COLLATION };
+	DefineStmt parser = { .type = T_DefineStmt, .kind = OBJECT_TSPARSER };
+	DefineStmt dictionary = { .type = T_DefineStmt, .kind = OBJECT_TSDICTIONARY };
+	DefineStmt template = { .type = T_DefineStmt, .kind = OBJECT_TSTEMPLATE };
+	DefineStmt configuration = { .type = T_DefineStmt, .kind = OBJECT_TSCONFIGURATION };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -1794,7 +1918,17 @@ UT_TEST(test_catalog_writes_preflight_requires_shared_catalog_storage)
 						   (Node *)&rule,
 						   (Node *)&policy,
 						   (Node *)&alter_policy,
-						   (Node *)&comment };
+						   (Node *)&comment,
+						   (Node *)&statistics,
+						   (Node *)&create_event,
+						   (Node *)&alter_event,
+						   (Node *)&alter_collation,
+						   (Node *)&aggregate,
+						   (Node *)&collation,
+						   (Node *)&parser,
+						   (Node *)&dictionary,
+						   (Node *)&template,
+						   (Node *)&configuration };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned mode = 0; mode < 8; mode++) {
@@ -1842,6 +1976,17 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 	CreatePolicyStmt policy = { .type = T_CreatePolicyStmt, .permissive = true };
 	AlterPolicyStmt alter_policy = { .type = T_AlterPolicyStmt };
 	CommentStmt comment = { .type = T_CommentStmt, .objtype = OBJECT_TABLE };
+	AlterStatsStmt statistics = { .type = T_AlterStatsStmt, .stxstattarget = 100 };
+	CreateEventTrigStmt create_event
+		= { .type = T_CreateEventTrigStmt, .eventname = "ddl_command_start" };
+	AlterEventTrigStmt alter_event = { .type = T_AlterEventTrigStmt, .tgenabled = 'O' };
+	AlterCollationStmt alter_collation = { .type = T_AlterCollationStmt };
+	DefineStmt aggregate = { .type = T_DefineStmt, .kind = OBJECT_AGGREGATE };
+	DefineStmt collation = { .type = T_DefineStmt, .kind = OBJECT_COLLATION };
+	DefineStmt parser = { .type = T_DefineStmt, .kind = OBJECT_TSPARSER };
+	DefineStmt dictionary = { .type = T_DefineStmt, .kind = OBJECT_TSDICTIONARY };
+	DefineStmt template = { .type = T_DefineStmt, .kind = OBJECT_TSTEMPLATE };
+	DefineStmt configuration = { .type = T_DefineStmt, .kind = OBJECT_TSCONFIGURATION };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -1860,14 +2005,46 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 						   (Node *)&rule,
 						   (Node *)&policy,
 						   (Node *)&alter_policy,
-						   (Node *)&comment };
-	const char *tags[] = { "CREATE SCHEMA",	  "CREATE SEQUENCE",  "CREATE INDEX",
-						   "CREATE VIEW",	  "ALTER TABLE",	  "ALTER TABLE",
-						   "GRANT",			  "GRANT ROLE",		  "ALTER DEFAULT PRIVILEGES",
-						   "CREATE FUNCTION", "CREATE PROCEDURE", "ALTER FUNCTION",
-						   "ALTER PROCEDURE", "ALTER ROUTINE",	  "CREATE TRIGGER",
-						   "CREATE RULE",	  "CREATE POLICY",	  "ALTER POLICY",
-						   "COMMENT" };
+						   (Node *)&comment,
+						   (Node *)&statistics,
+						   (Node *)&create_event,
+						   (Node *)&alter_event,
+						   (Node *)&alter_collation,
+						   (Node *)&aggregate,
+						   (Node *)&collation,
+						   (Node *)&parser,
+						   (Node *)&dictionary,
+						   (Node *)&template,
+						   (Node *)&configuration };
+	const char *tags[] = { "CREATE SCHEMA",
+						   "CREATE SEQUENCE",
+						   "CREATE INDEX",
+						   "CREATE VIEW",
+						   "ALTER TABLE",
+						   "ALTER TABLE",
+						   "GRANT",
+						   "GRANT ROLE",
+						   "ALTER DEFAULT PRIVILEGES",
+						   "CREATE FUNCTION",
+						   "CREATE PROCEDURE",
+						   "ALTER FUNCTION",
+						   "ALTER PROCEDURE",
+						   "ALTER ROUTINE",
+						   "CREATE TRIGGER",
+						   "CREATE RULE",
+						   "CREATE POLICY",
+						   "ALTER POLICY",
+						   "COMMENT",
+						   "ALTER STATISTICS",
+						   "CREATE EVENT TRIGGER",
+						   "ALTER EVENT TRIGGER",
+						   "ALTER COLLATION",
+						   "CREATE AGGREGATE",
+						   "CREATE COLLATION",
+						   "CREATE TEXT SEARCH PARSER",
+						   "CREATE TEXT SEARCH DICTIONARY",
+						   "CREATE TEXT SEARCH TEMPLATE",
+						   "CREATE TEXT SEARCH CONFIGURATION" };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned parallel = 0; parallel < 2; parallel++) {
