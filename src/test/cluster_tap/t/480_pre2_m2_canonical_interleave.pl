@@ -8,6 +8,7 @@ use FindBin;
 use lib "$FindBin::RealBin/../../perl";
 use lib "$FindBin::RealBin/../pre2";
 use M2CanonicalCases qw(run_cases);
+use M2CanonicalOrigin;
 use M2CanonicalRollover qw(rollover_workload check_rollover_budget);
 use PostgreSQL::Test::ClusterPRE2;
 use PostgreSQL::Test::Utils qw(slurp_file);
@@ -17,9 +18,9 @@ use IPC::Run qw(run timeout);
 use Time::HiRes qw(clock_gettime CLOCK_MONOTONIC sleep);
 
 my $cluster;
-my @sessions;
+my %sessions;
 END {
- eval { $_->quit } for @sessions;
+ eval { $_->quit } for map { @$_ } values %sessions;
  eval { $cluster->stop_cluster } if defined $cluster;
 }
 my $pause = 12000000;
@@ -31,16 +32,18 @@ sub save_json {
  close $f or die $!;
 }
 sub session {
- my ($node)=@_;
+ my ($node,$cell)=@_;
  my $s=$node->background_psql('postgres',timeout=>180);
- push @sessions,$s;
+ push @{$sessions{$cell->{number}}},$s;
  $s->query_safe('SET statement_timeout=90000');
  return $s;
 }
 sub finish_sessions {
+ my ($cell)=@_;
  my @errors;
- for my $s (@sessions) { eval { $s->quit; 1; } or push @errors,$@; }
- @sessions=();
+ for my $s (@{delete($sessions{$cell->{number}}) // []}) {
+  eval { $s->quit; 1; } or push @errors,$@;
+ }
  die join('',@errors) if @errors;
 }
 sub json_result {
@@ -139,6 +142,12 @@ $a->safe_psql('postgres',q{
  CREATE FUNCTION test_pgrac_m2_sample(text,regclass,integer,xid) RETURNS text
  AS '$libdir/test_pgrac_shared_config', 'test_pgrac_m2_sample'
  LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
+ CREATE FUNCTION test_pgrac_m2_locator(regclass,integer,xid) RETURNS text
+ AS '$libdir/test_pgrac_shared_config', 'test_pgrac_m2_locator'
+ LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
+ CREATE FUNCTION test_pgrac_m2_sample_locator(bigint,bigint,xid,integer,integer,integer) RETURNS text
+ AS '$libdir/test_pgrac_shared_config', 'test_pgrac_m2_sample_locator'
+ LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
  CREATE FUNCTION test_pgrac_m2_guards_clear() RETURNS boolean
  AS '$libdir/test_pgrac_shared_config', 'test_pgrac_m2_guards_clear'
  LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
@@ -147,6 +156,8 @@ $a->safe_psql('postgres',q{
  LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
  REVOKE ALL ON FUNCTION test_pgrac_native_itl_trace() FROM PUBLIC;
  REVOKE ALL ON FUNCTION test_pgrac_m2_sample(text,regclass,integer,xid) FROM PUBLIC;
+ REVOKE ALL ON FUNCTION test_pgrac_m2_locator(regclass,integer,xid) FROM PUBLIC;
+ REVOKE ALL ON FUNCTION test_pgrac_m2_sample_locator(bigint,bigint,xid,integer,integer,integer) FROM PUBLIC;
  REVOKE ALL ON FUNCTION test_pgrac_m2_guards_clear() FROM PUBLIC;
  REVOKE ALL ON FUNCTION test_pgrac_m2_limits() FROM PUBLIC;
 });
@@ -185,10 +196,10 @@ sub cleanup_cell {
  my @errors;
  # Disarm the existing process-local hook even when a remote cell failed.
  if($cell->{pause_armed}) { eval { reload_pause($a,0); 1; } or push @errors,$@; }
- eval { finish_sessions(); 1; } or push @errors,$@;
+ eval { finish_sessions($cell); 1; } or push @errors,$@;
  die join('',@errors) if @errors;
 }
-run_cases(\@matrix,sub {
+sub prepare_case {
   my ($cell)=@_;
   my ($kind,$caller,$number)=@{$cell}{qw(kind caller number)};
   my $name=lc("$kind-$caller");
@@ -196,9 +207,9 @@ run_cases(\@matrix,sub {
   $cell->{stage}='setup';
   $a->safe_psql('postgres',"CREATE TABLE $table(id int,v int); INSERT INTO $table VALUES(1,10)");
   $a->safe_psql('postgres',"VACUUM(FREEZE) $table");
-  my $w=session($a);
+  my $w=session($a,$cell);
   my $remote=$caller eq 'freeze_data' || $caller eq 'sample_canonical';
-  my $r=session($remote ? $b : $a);
+  my $r=session($remote ? $b : $a,$cell);
   my $wpid=0+$w->query_safe('SELECT pg_backend_pid()');
   my $rpid=0+$r->query_safe('SELECT pg_backend_pid()');
   $w->query_safe("BEGIN; UPDATE $table SET v=20 WHERE id=1");
@@ -223,15 +234,34 @@ run_cases(\@matrix,sub {
    save_json("context-$number",$cell);
    $w->query_safe("SET cluster.trace_tx_identity=off; UPDATE m2_roll SET v=v+1; SET cluster.trace_tx_identity=on; UPDATE $table SET v=21 WHERE id=1");
   }
+  if($remote) {
+   $cell->{stage}='locator_prepare';
+   # Copy the actual producer page before any pause/abort. No peer heap
+   # acquisition or process-local locator cache belongs in the timed window.
+   $cell->{locator}=decode_json($w->query_safe("SELECT test_pgrac_m2_locator('$table',0,'$xid'::xid)"));
+   save_json("locator-$number",{context=>$cell,authoritative=>JSON::PP::false});
+  }
+  return {writer=>$w,reader=>$r};
+}
+M2CanonicalOrigin::run_prepared_cases(\@matrix,\&prepare_case,sub {
+  my ($cell,$prepared)=@_;
+  my ($kind,$caller,$number,$xid,$wpid,$rpid)=@{$cell}{qw(kind caller number xid producer_pid reader_pid)};
+  my $name=lc("$kind-$caller");
+  my $table='m2_case_'.$number;
+  my ($w,$r)=@{$prepared}{qw(writer reader)};
+  my $remote=$caller eq 'freeze_data' || $caller eq 'sample_canonical';
   my $before=decode_json($a->safe_psql('postgres','SELECT test_pgrac_native_itl_trace()'));
   my $key=producer_key($before,$xid);
   my @offset=map {-s $_->logfile} @nodes;
   $cell->{log_offsets}=\@offset;
   $cell->{key}=$key;
-  $cell->{stage}='sampling';
+  $cell->{stage}='caller_qualification';
   save_json("context-$number",$cell);
   my $path=$remote ? 'origin' : $caller;
-  my $sql="SELECT test_pgrac_m2_sample('$path','$table',0,'$xid'::xid)";
+  my $sql=$remote ? M2CanonicalOrigin::origin_query($cell->{locator},$key,$caller)
+   : "SELECT test_pgrac_m2_sample('$path','$table',0,'$xid'::xid)";
+  $cell->{stage}='sampling';
+  save_json("context-$number",$cell);
   note("M2_CALLER_REQUEST case=$number kind=$kind caller=$caller xid=$xid producer=$wpid reader=$rpid path=$path");
   my $sample_pid;
   my $reached=0;
@@ -297,8 +327,8 @@ my ($cell)=@_;
 $cell->{stage}='cancel';
 $a->safe_psql('postgres','CREATE TABLE m2_cancel(id int,v int); INSERT INTO m2_cancel VALUES(1,10)');
 $a->safe_psql('postgres','VACUUM(FREEZE) m2_cancel');
-my $w=session($a);
-my $r=session($a);
+my $w=session($a,$cell);
+my $r=session($a,$cell);
 $w->query_safe('BEGIN; UPDATE m2_cancel SET v=20');
 my $xid=0+$w->query_safe('SELECT pg_current_xact_id()::text');
 my $rpid=0+$r->query_safe('SELECT pg_backend_pid()');

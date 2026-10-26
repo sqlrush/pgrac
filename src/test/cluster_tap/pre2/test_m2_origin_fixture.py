@@ -1,0 +1,140 @@
+"""Run the remote-locator fixture without a database or VM."""
+import json
+from pathlib import Path
+import subprocess
+import unittest
+
+HERE = Path(__file__).resolve().parent
+
+
+def perl(code, value=None):
+    result = subprocess.run(
+        ['perl', '-I'+str(HERE), '-MJSON::PP', '-MM2CanonicalOrigin', '-e', code],
+        input=json.dumps(value), text=True, capture_output=True, timeout=10)
+    if result.returncode:
+        raise AssertionError(result.stderr)
+    return json.loads(result.stdout)
+
+
+class OriginFixture(unittest.TestCase):
+    def setUp(self):
+        self.locator = dict(uba0='4294967297', uba1='262146', xid=4195408,
+                            wrap=0, itl_kind=1, itl_slot_index=0,
+                            data_segment=1, tt_slot=2, origin=0,
+                            authoritative=False)
+        self.key = dict(xid=4195408, origin=0, segment=1, slot=2, wrap=7,
+                        generation=1, root=9, root_generation=2)
+
+    def query(self, caller='freeze_data', locator=None, key=None):
+        return perl(r'''my $v=decode_json(do {local $/; <STDIN>});
+my $sql=eval { M2CanonicalOrigin::origin_query(@$v) };
+print encode_json({sql=>$sql,error=>$@});''',
+                    [locator or self.locator, key or self.key, caller])
+
+    def test_copied_locator_query_needs_no_heap_read_and_keeps_page_wrap_zero(self):
+        result = self.query()
+        self.assertEqual(result['error'], '')
+        self.assertEqual(result['sql'],
+                         "SELECT test_pgrac_m2_sample_locator(4294967297,262146,"
+                         "'4195408'::xid,0,1,0)")
+
+    def test_canonical_caller_requires_real_different_data_segment(self):
+        locator = dict(self.locator, uba0='4294967298', data_segment=2)
+        self.assertEqual(self.query('sample_canonical', locator)['error'], '')
+        for caller, loc in [('freeze_data', locator),
+                            ('sample_canonical', self.locator)]:
+            with self.subTest(caller=caller):
+                result = self.query(caller, loc)
+                self.assertIsNone(result['sql'])
+                self.assertIn('caller mismatch', result['error'])
+
+    def test_wrong_producer_identity_and_slot_refuse_before_scheduling(self):
+        for field, value in [('xid', 4195456), ('origin', 1), ('tt_slot', 3)]:
+            with self.subTest(field=field):
+                result = self.query(locator=dict(self.locator, **{field: value}))
+                self.assertIsNone(result['sql'])
+                self.assertIn('identity', result['error'])
+
+    def test_missing_or_non_numeric_values_cannot_become_sql(self):
+        for field in ('uba0', 'uba1', 'xid', 'wrap', 'itl_kind', 'itl_slot_index',
+                      'data_segment', 'tt_slot', 'origin'):
+            with self.subTest(field=field):
+                locator = dict(self.locator)
+                del locator[field]
+                self.assertIn('locator', self.query(locator=locator)['error'])
+        for value in ('0); SELECT 1', '-1', '18446744073709551616', '1.5'):
+            with self.subTest(value=value):
+                self.assertIn('locator', self.query(locator=dict(self.locator,
+                                                               uba0=value))['error'])
+
+    def test_freeze_producers_are_prepared_before_rollover_without_reordering_cells(self):
+        result = perl(r'''
+my (@events,@records);
+my $n=0;
+my @cases=map {my $kind=$_; map {{kind=>$kind,caller=>$_,number=>++$n}}
+ qw(physical owner freeze_data sample_canonical)} qw(A1 A2);
+M2CanonicalOrigin::run_prepared_cases(\@cases,
+ sub {my ($c)=@_; push @events,"prepare$c->{number}"; return $c->{number};},
+ sub {my ($c,$p)=@_; die "wrong resource" unless $p==$c->{number};
+      push @events,"body$c->{number}";},
+ sub {push @events,"cleanup$_[0]->{number}";},
+ sub {my ($c,$r)=@_; push @records,{number=>$c->{number},%$r};});
+print encode_json({events=>\@events,records=>\@records});
+''')
+        events = result['events']
+        self.assertEqual(events[:2], ['prepare3', 'prepare7'])
+        self.assertLess(events.index('prepare7'), events.index('prepare4'))
+        self.assertEqual([e for e in events if e.startswith('body')],
+                         ['body'+str(i) for i in range(1, 9)])
+        self.assertTrue(all(r['completed'] and not r['error']
+                            for r in result['records']))
+
+    def test_failed_preparation_and_rollover_keep_each_other_cell_and_cleanup(self):
+        result = perl(r'''
+my (@prepared,@ran,@cleaned,@records);
+my $n=0;
+my @cases=map {my $kind=$_; map {{kind=>$kind,caller=>$_,number=>++$n}}
+ qw(physical owner freeze_data sample_canonical)} qw(A1 A2);
+push @cases,{number=>9,caller=>'physical',kind=>'CANCEL'};
+M2CanonicalOrigin::run_prepared_cases(\@cases,
+ sub {my ($c)=@_; push @prepared,$c->{number};
+      die "prepare7 failed\n" if $c->{number}==7; return {};},
+ sub {my ($c)=@_; push @ran,$c->{number}; die "rollover failed\n" if $c->{number}==4;},
+ sub {push @cleaned,$_[0]->{number};},
+ sub {my ($c,$r)=@_; push @records,{number=>$c->{number},%$r};});
+print encode_json({prepared=>\@prepared,ran=>\@ran,cleaned=>\@cleaned,records=>\@records});
+''')
+        self.assertEqual(result['prepared'].count(7), 1)
+        self.assertEqual(result['ran'], [1, 2, 3, 4, 5, 6, 8, 9])
+        self.assertEqual(result['cleaned'], list(range(1, 10)))
+        self.assertEqual(result['records'][3]['error'], 'rollover failed\n')
+        self.assertEqual(result['records'][6]['error'], 'prepare7 failed\n')
+        self.assertTrue(result['records'][-1]['completed'])
+
+    def test_real_session_cleanup_keeps_the_other_prepared_producer_open(self):
+        source = (HERE.parent / 't/480_pre2_m2_canonical_interleave.pl').read_text()
+        helpers = source[source.index('sub session {'):source.index('sub json_result {')]
+        result = perl(r'''
+my %sessions;
+my (@closed,@queries);
+{package FixtureNode; sub background_psql {return bless {id=>++$_[0]->{id}},'FixtureSession';}}
+{package FixtureSession; sub query_safe {push @queries,[$_[0]->{id},$_[1]];}
+ sub quit {push @closed,$_[0]->{id};}}
+''' + helpers + r'''
+my $node=bless {},'FixtureNode';
+session($node,{number=>3}); session($node,{number=>7});
+finish_sessions({number=>3});
+my @after3=@closed;
+my @remaining=sort keys %sessions;
+finish_sessions({number=>7});
+print encode_json({after3=>\@after3,remaining=>\@remaining,closed=>\@closed,queries=>\@queries});
+''')
+        self.assertEqual(result['after3'], [1])
+        self.assertEqual(result['remaining'], ['7'])
+        self.assertEqual(result['closed'], [1, 2])
+        self.assertEqual(result['queries'], [[1, 'SET statement_timeout=90000'],
+                                             [2, 'SET statement_timeout=90000']])
+
+
+if __name__ == '__main__':
+    unittest.main()

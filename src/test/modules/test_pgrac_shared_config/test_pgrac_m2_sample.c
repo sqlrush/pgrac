@@ -32,6 +32,8 @@
 #endif
 
 PG_FUNCTION_INFO_V1(test_pgrac_m2_sample);
+PG_FUNCTION_INFO_V1(test_pgrac_m2_locator);
+PG_FUNCTION_INFO_V1(test_pgrac_m2_sample_locator);
 PG_FUNCTION_INFO_V1(test_pgrac_m2_guards_clear);
 PG_FUNCTION_INFO_V1(test_pgrac_m2_limits);
 
@@ -311,6 +313,42 @@ sample_origin(const ClusterTxLocator *locator, ClusterTxResolution *resolution,
 	return cluster_tx_resolve_exact(&request, CLUSTER_TX_RESOLVE_VISIBILITY, resolution, reason);
 }
 
+/* Explicit per-call input copied by the fixture before arming a pause.
+ * There is no backend cache and no page access in the sampling call. */
+static ClusterTxOutcome
+sample_origin_values(int64 uba0, int64 uba1, TransactionId xid, int32 wrap, int32 kind, int32 slot,
+					 ClusterTxResolution *resolution, ClusterTxResolveReason *reason)
+{
+	ClusterTxLocator locator = { 0 };
+
+	memset(resolution, 0, sizeof(*resolution));
+	*reason = CLUSTER_TX_RESOLVE_BAD_LOCATOR;
+	if (uba0 < 0 || uba1 < 0 || wrap < 0 || wrap > TT_WRAP_MAX || kind < 0 || kind > UINT8_MAX
+		|| slot < 0 || slot > UINT8_MAX)
+		return CLUSTER_TX_UNKNOWN;
+	locator.uba.raw[0] = (uint64)uba0;
+	locator.uba.raw[1] = (uint64)uba1;
+	locator.xid = xid;
+	locator.tt_wrap = (uint16)wrap;
+	locator.itl_kind = (uint8)kind;
+	locator.itl_slot_index = (uint8)slot;
+	return sample_origin(&locator, resolution, reason);
+}
+
+static text *
+sample_result(ClusterTxOutcome outcome, SCN scn, ClusterTxResolveReason reason)
+{
+	StringInfoData out;
+
+	initStringInfo(&out);
+	appendStringInfo(&out,
+					 "{\"outcome\":%d,\"scn\":" UINT64_FORMAT
+					 ",\"reason\":%d,\"pid\":%d,\"guard_clear\":%s,\"authoritative\":false}",
+					 outcome, (uint64)scn, reason, MyProcPid,
+					 cluster_undo_block0_current_backend_has_guards() ? "false" : "true");
+	return cstring_to_text(out.data);
+}
+
 static bool
 page_locator(Oid relid, int32 block, TransactionId xid, ClusterTxLocator *locator)
 {
@@ -341,6 +379,66 @@ page_locator(Oid relid, int32 block, TransactionId xid, ClusterTxLocator *locato
 #endif
 
 Datum
+test_pgrac_m2_locator(PG_FUNCTION_ARGS)
+{
+	check_reader();
+#ifdef USE_PGRAC_CLUSTER
+	{
+		ClusterTxLocator locator = { 0 };
+		TransactionId xid = PG_GETARG_TRANSACTIONID(2);
+		uint32 segment, block;
+		uint16 slot, row;
+		StringInfoData out;
+
+		if (!page_locator(PG_GETARG_OID(0), PG_GETARG_INT32(1), xid, &locator)
+			|| !uba_decode(locator.uba, &segment, &block, &slot, &row))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("native visibility probe did not find the requested page locator")));
+		initStringInfo(&out);
+		appendStringInfo(
+			&out,
+			"{\"uba0\":\"" UINT64_FORMAT "\",\"uba1\":\"" UINT64_FORMAT
+			"\",\"xid\":%u,\"wrap\":%u,\"itl_kind\":%u,\"itl_slot_index\":%u,"
+			"\"data_segment\":%u,\"tt_slot\":%u,\"origin\":%u,\"authoritative\":false}",
+			locator.uba.raw[0], locator.uba.raw[1], xid, locator.tt_wrap, locator.itl_kind,
+			locator.itl_slot_index, segment, slot, (uint32)uba_origin_node_id(locator.uba));
+		PG_RETURN_TEXT_P(cstring_to_text(out.data));
+	}
+#else
+	PG_RETURN_NULL();
+#endif
+}
+
+Datum
+test_pgrac_m2_sample_locator(PG_FUNCTION_ARGS)
+{
+	check_reader();
+#ifdef USE_PGRAC_CLUSTER
+	{
+		ClusterTxResolution resolution;
+		ClusterTxResolveReason reason;
+		ClusterTxOutcome outcome;
+		SCN scn;
+
+		outcome = sample_origin_values(
+			PG_GETARG_INT64(0), PG_GETARG_INT64(1), PG_GETARG_TRANSACTIONID(2), PG_GETARG_INT32(3),
+			PG_GETARG_INT32(4), PG_GETARG_INT32(5), &resolution, &reason);
+		scn = outcome == CLUSTER_TX_UNKNOWN ? InvalidScn : resolution.commit_scn;
+		elog(LOG,
+			 "M2_PROBE path=origin_prepared xid=%u phase=RETURN pid=%d outcome=%d reason=%d "
+			 "locator_uba0=" UINT64_FORMAT " locator_uba1=" UINT64_FORMAT
+			 " locator_wrap=%d authoritative=false",
+			 PG_GETARG_TRANSACTIONID(2), MyProcPid, outcome, reason, (uint64)PG_GETARG_INT64(0),
+			 (uint64)PG_GETARG_INT64(1), PG_GETARG_INT32(3));
+		PG_RETURN_TEXT_P(sample_result(outcome, scn, reason));
+	}
+#else
+	PG_RETURN_NULL();
+#endif
+}
+
+Datum
 test_pgrac_m2_sample(PG_FUNCTION_ARGS)
 {
 	check_reader();
@@ -357,7 +455,6 @@ test_pgrac_m2_sample(PG_FUNCTION_ARGS)
 		SCN scn = InvalidScn;
 		bool sampled = false;
 		bool locator_found = false;
-		StringInfoData out;
 
 		if (strcmp(path, "owner") == 0)
 			sampled = cluster_runtime_visibility_current_owner_lookup_exact(xid, &key, &result);
@@ -388,13 +485,7 @@ test_pgrac_m2_sample(PG_FUNCTION_ARGS)
 			 " locator_wrap=%u authoritative=false",
 			 path, xid, MyProcPid, sampled, outcome, reason, locator_found, locator.uba.raw[0],
 			 locator.uba.raw[1], locator.tt_wrap);
-		initStringInfo(&out);
-		appendStringInfo(&out,
-						 "{\"outcome\":%d,\"scn\":" UINT64_FORMAT
-						 ",\"reason\":%d,\"pid\":%d,\"guard_clear\":%s,\"authoritative\":false}",
-						 outcome, (uint64)scn, reason, MyProcPid,
-						 cluster_undo_block0_current_backend_has_guards() ? "false" : "true");
-		PG_RETURN_TEXT_P(cstring_to_text(out.data));
+		PG_RETURN_TEXT_P(sample_result(outcome, scn, reason));
 	}
 #else
 	PG_RETURN_NULL();

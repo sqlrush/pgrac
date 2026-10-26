@@ -7476,9 +7476,9 @@ test_cluster_m2_sample_diagnostic: test_cluster_m2_sample_diagnostic.c \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
 
 test_cluster_m2_sample_origin.inc: $(top_srcdir)/src/test/modules/test_pgrac_shared_config/test_pgrac_m2_sample.c Makefile
-	awk '/^sample_origin\(/ { print "static ClusterTxOutcome"; emit=1; found++ } \
+	awk '/^(sample_origin|sample_origin_values)\(/ { print "static ClusterTxOutcome"; emit=1; found++ } \
 	     emit { print } emit && /^}/ { emit=0 } \
-	     END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
+	     END { if (found != 2 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_r4_tx_locator: test_cluster_r4_tx_locator.c unit_test.h \

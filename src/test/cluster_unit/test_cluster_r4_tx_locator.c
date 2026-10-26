@@ -1034,6 +1034,110 @@ UT_TEST(test_m2_origin_probe_uses_admitted_visibility_with_canonical_echo)
 	}
 }
 
+UT_TEST(test_m2_copied_locator_probe_preserves_identity_and_original_provider)
+{
+	for (int origin = 0; origin <= 2; origin++) {
+		for (int leg = 0; leg < 3; leg++) {
+			ClusterTxLocator locator = prepare_shared_row_wait_fixture(origin);
+			ClusterTxResolution resolution;
+			ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+			ClusterTxOutcome expected = leg == 0   ? CLUSTER_TX_IN_PROGRESS
+										: leg == 1 ? CLUSTER_TX_COMMITTED
+												   : CLUSTER_TX_ABORTED;
+
+			test_provider_outcome = expected;
+			test_provider_resolution.outcome = expected;
+			test_provider_resolution.commit_scn = leg == 1 ? (SCN)101 : InvalidScn;
+			test_provider_resolution.locator_echo.tt_wrap = 7;
+			UT_ASSERT_EQ(sample_origin_values(locator.uba.raw[0], locator.uba.raw[1], locator.xid,
+											  locator.tt_wrap, locator.itl_kind,
+											  locator.itl_slot_index, &resolution, &reason),
+						 expected);
+			UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_NONE);
+			UT_ASSERT_EQ(test_admitted_provider_calls, 1);
+			UT_ASSERT_EQ(test_legacy_provider_calls, 0);
+			UT_ASSERT_EQ(test_provider_locator.uba.raw[0], locator.uba.raw[0]);
+			UT_ASSERT_EQ(test_provider_locator.uba.raw[1], locator.uba.raw[1]);
+			UT_ASSERT_EQ(test_provider_locator.xid, locator.xid);
+			UT_ASSERT_EQ(test_provider_locator.itl_kind, locator.itl_kind);
+			UT_ASSERT_EQ(test_provider_locator.itl_slot_index, locator.itl_slot_index);
+			UT_ASSERT_EQ(test_provider_locator.tt_wrap, TT_WRAP_INVALID);
+			UT_ASSERT_EQ(resolution.locator_echo.tt_wrap, 7);
+			UT_ASSERT_EQ(test_enter_calls, 1);
+			UT_ASSERT_EQ(test_leave_calls, 1);
+		}
+	}
+}
+
+UT_TEST(test_m2_copied_locator_probe_rejects_narrowing_before_resolver_entry)
+{
+	for (int leg = 0; leg < 10; leg++) {
+		ClusterTxLocator locator = prepare_shared_row_wait_fixture(0);
+		ClusterTxResolution resolution;
+		ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_NONE;
+		int64 uba0 = locator.uba.raw[0];
+		int64 uba1 = locator.uba.raw[1];
+		int32 wrap = locator.tt_wrap;
+		int32 kind = locator.itl_kind;
+		int32 slot = locator.itl_slot_index;
+
+		if (leg == 0)
+			uba0 = -1;
+		if (leg == 1)
+			uba1 = -1;
+		if (leg == 2)
+			wrap = -1;
+		if (leg == 3)
+			wrap = TT_WRAP_INVALID;
+		if (leg == 4)
+			wrap = 65536;
+		if (leg == 5)
+			kind = -1;
+		if (leg == 6)
+			kind = 256;
+		if (leg == 7)
+			slot = -1;
+		if (leg == 8)
+			slot = 256;
+		if (leg == 9)
+			slot = 65536;
+		memset(&resolution, 0xA5, sizeof(resolution));
+		UT_ASSERT_EQ(
+			sample_origin_values(uba0, uba1, locator.xid, wrap, kind, slot, &resolution, &reason),
+			CLUSTER_TX_UNKNOWN);
+		UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_BAD_LOCATOR);
+		UT_ASSERT(bytes_are_zero(&resolution, sizeof(resolution)));
+		UT_ASSERT_EQ(test_enter_calls, 0);
+		UT_ASSERT_EQ(test_provider_calls, 0);
+	}
+}
+
+UT_TEST(test_m2_copied_locator_probe_unknown_and_stale_do_not_publish)
+{
+	for (int leg = 0; leg < 4; leg++) {
+		ClusterTxLocator locator = prepare_shared_row_wait_fixture(0);
+		ClusterTxResolution resolution;
+		ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_NONE;
+
+		if (leg == 0)
+			test_provider_outcome = CLUSTER_TX_UNKNOWN;
+		if (leg == 1)
+			test_provider_resolution.locator_echo.uba.raw[1]++;
+		if (leg == 2)
+			test_provider_mutates_epoch = true;
+		if (leg == 3)
+			test_recheck_result = false;
+		memset(&resolution, 0xA5, sizeof(resolution));
+		UT_ASSERT_EQ(sample_origin_values(locator.uba.raw[0], locator.uba.raw[1], locator.xid,
+										  locator.tt_wrap, locator.itl_kind, locator.itl_slot_index,
+										  &resolution, &reason),
+					 CLUSTER_TX_UNKNOWN);
+		UT_ASSERT(bytes_are_zero(&resolution, sizeof(resolution)));
+		UT_ASSERT_EQ(test_legacy_provider_calls, 0);
+		UT_ASSERT_EQ(test_leave_calls, 1);
+	}
+}
+
 UT_TEST(test_m2_origin_probe_rejects_partial_page_input_and_invalid_canonical_wrap)
 {
 	int leg;
@@ -1790,7 +1894,10 @@ UT_TEST(test_terminal_census_batch_preflight_delegates_exit_hook_ensure)
 int
 main(void)
 {
-	UT_PLAN(73);
+	UT_PLAN(76);
+	UT_RUN(test_m2_copied_locator_probe_preserves_identity_and_original_provider);
+	UT_RUN(test_m2_copied_locator_probe_rejects_narrowing_before_resolver_entry);
+	UT_RUN(test_m2_copied_locator_probe_unknown_and_stale_do_not_publish);
 	UT_RUN(test_m2_origin_probe_uses_admitted_visibility_with_canonical_echo);
 	UT_RUN(test_m2_origin_probe_rejects_partial_page_input_and_invalid_canonical_wrap);
 	UT_RUN(test_m2_origin_probe_rejects_full_locator_drift);
