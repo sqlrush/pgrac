@@ -102,6 +102,7 @@ static RelationData relation;
 static FormData_pg_class relform;
 static ClusterSpaceIdentity identity;
 static RfPageVersionEdgeEntryV1 edges[2];
+static xl_heap_visible published_visible_payload;
 static uint64 next_token, edge_token;
 static unsigned edge_count, inserts, dirty[2], registered[2], lock_calls;
 static unsigned assertion_failures;
@@ -478,6 +479,7 @@ XLogRegisterData(char *data, uint32 length)
 	UT_ASSERT(begun);
 	UT_ASSERT_EQ(length, SizeOfHeapVisible);
 	UT_ASSERT_EQ(((xl_heap_visible *)data)->snapshotConflictHorizon, expected_cutoff);
+	memcpy(&published_visible_payload, data, SizeOfHeapVisible);
 }
 void
 XLogRegisterBuffer(uint8 id, Buffer buffer, uint8 flags)

@@ -39,6 +39,7 @@ int cluster_node_id, NBuffers = 2, NLocBuffer, wal_level = WAL_LEVEL_REPLICA;
 char *BufferBlocks;
 Block *LocalBufferBlockPointers;
 volatile uint32 CritSectionCount;
+volatile sig_atomic_t InterruptPending;
 bool cluster_recmerge_window_active, cluster_recmerge_apply_foreign;
 uint64 cluster_recmerge_window_scn, cluster_recmerge_window_own_lsn;
 
@@ -56,6 +57,12 @@ static bool error_ready;
 BackendType MyBackendType = B_STARTUP;
 static bool cold_published;
 static unsigned cold_skip_mask, data_reads;
+
+void
+ProcessInterrupts(void)
+{
+	abort(); /* An unexpected runtime interrupt is not a replay success. */
+}
 
 bool
 cluster_cold_redo_block_decision_v1(XLogReaderState *record, uint8 id, ClusterColdRedoBlockV1 *out)

@@ -21710,13 +21710,16 @@ cluster_heap_freeze_apply_xmin_batch_recent_v1(
 	const ClusterHeapFreezeXminTargetV1 *targets, uint16 target_count,
 	FullTransactionId freeze_limit_full, SCN horizon_scn)
 {
+	ClusterHeapFreezeObservedBoundsV1 bounds;
 	volatile bool applied = false;
 
 	/* The proof phase may have released its pin. Reuse only the original
 	 * resident hint under the caller's still-entered admission: no fetch,
 	 * new current, proof request or replacement source observation.
-	 * Reject an already obsolete local ingress cut before acquiring this
-	 * pin; the pinned continuation repeats the same check after acquisition. */
+	 * Match the original saved F/H and reject an already obsolete local
+	 * ingress cut before acquiring this pin. These pure checks supply no
+	 * provenance or retention authority; the pinned continuation repeats
+	 * them after acquisition and retains its final TARGET/WAL fences. */
 	if (rel == NULL || !rel->rd_isvalid || input == NULL || page == NULL
 		|| proofs == NULL || fence == NULL || authority_before == NULL
 		|| admission == NULL || !admission->entered || targets == NULL
@@ -21725,6 +21728,10 @@ cluster_heap_freeze_apply_xmin_batch_recent_v1(
 		|| BufferDescriptors == NULL
 		|| admission->record_generation != fence->admission_generation
 		|| !RelFileLocatorEquals(rel->rd_locator, fence->identity.key.locator)
+		|| !cluster_heap_freeze_observed_bounds_v1(input->freeze_policy,
+			input->freeze_cohort, admission, cluster_node_id, &bounds)
+		|| !FullTransactionIdEquals(bounds.freeze_limit, freeze_limit_full)
+		|| bounds.horizon_scn != horizon_scn
 		|| input->freeze_cohort == NULL
 		|| input->freeze_cohort->local_registration_cut.status != CTRC_ACTIVE_SCAN_COMPLETE
 		|| input->freeze_cohort->local_registration_cut.unqualified_entries != 0

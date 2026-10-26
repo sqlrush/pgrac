@@ -2345,9 +2345,9 @@ test_cluster_vm_buffer_matches.inc: $(top_srcdir)/src/backend/access/heap/visibi
 	     emit { print } /^}/ { emit=0 } END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-TESTS += test_cluster_vm_visible_version_noassert
+TESTS += test_cluster_vm_visible_version_noassert test_cluster_vm_visible_replay
 
-all: test_cluster_vm_visible_version_noassert
+all: test_cluster_vm_visible_version_noassert test_cluster_vm_visible_replay
 
 # PGRAC: native VM setter and its original heap-visible WAL logger.
 test_cluster_vm_visible_body.inc: $(top_srcdir)/src/backend/access/heap/visibilitymap.c Makefile
@@ -2415,7 +2415,20 @@ test_cluster_vm_repair_lpdead.inc: $(top_srcdir)/src/backend/access/heap/vacuuml
 	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_vm_visible_version test_cluster_vm_visible_version_noassert: test_cluster_vm_visible_version.c test_cluster_heap_maintenance_policy.inc unit_test.h \
+# Preserve both complete native redo functions, without rewriting their bodies.
+test_cluster_vm_visible_replay.inc: $(top_srcdir)/src/backend/access/heap/visibilitymap.c Makefile
+	awk '/^vm_image_versioned_redo\(/ { print "static void"; emit=1; found++ } \
+	     /^visibilitymap_set_versioned_redo\(/ { print "bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_vm_visible_replay: test_cluster_vm_visible_replay.c test_cluster_vm_redo_reader.o \
+		test_cluster_vm_visible_replay.inc $(XLOG_PAGE_EDGE_ENCODER_O) \
+		$(top_srcdir)/src/include/access/xlogutils.h \
+		$(top_srcdir)/src/include/cluster/cluster_page_cold_redo.h \
+		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
+
+test_cluster_vm_visible_version test_cluster_vm_visible_version_noassert test_cluster_vm_visible_replay: test_cluster_vm_visible_version.c test_cluster_heap_maintenance_policy.inc unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_pcm_lock.h \
 		test_cluster_vm_buffer_matches.inc \
 		test_cluster_vm_repair_versioned.inc \
@@ -2427,9 +2440,11 @@ test_cluster_vm_visible_version test_cluster_vm_visible_version_noassert: test_c
 		test_cluster_space_bufpage_product.o test_cluster_space_producer_product.o \
 		test_cluster_space_storage_product.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $(if $(filter %_noassert,$@),-DFIXTURE_NO_ASSERTS) $< test_cluster_space_bufpage_product.o \
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(if $(filter %_noassert,$@),-DFIXTURE_NO_ASSERTS) $(if $(filter %_replay,$@),$(srcdir)/test_cluster_vm_visible_replay.c,$<) test_cluster_space_bufpage_product.o \
 		test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
+		$(if $(filter %_replay,$@),test_cluster_vm_redo_reader.o $(XLOG_PAGE_EDGE_ENCODER_O)) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(if $(filter %_replay,$@),$(LDFLAGS) $(LIBS)) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 # PGRAC: native maintenance mutation/WAL bodies and tuple/page helpers.
@@ -6410,7 +6425,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_heap_maintenance_native.inc
 	rm -f test_cluster_heap_multi_version.inc test_cluster_heap_multi_capture.inc
 	rm -f test_cluster_heap_multi_loop.inc test_cluster_heap_multi_helpers.inc test_cluster_heap_multi_clear.inc
-	rm -f test_cluster_vm_visible_body.inc test_cluster_vm_visible_log.inc
+	rm -f test_cluster_vm_visible_body.inc test_cluster_vm_visible_log.inc test_cluster_vm_visible_replay.inc
 	rm -f test_cluster_vm_visible_wrapper.inc test_cluster_vm_visible_empty.inc
 	rm -f test_cluster_vm_repair_versioned.inc
 	rm -f test_cluster_sf_cap_cut_available.inc
