@@ -2264,7 +2264,8 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		$(top_srcdir)/src/include/cluster/cluster_conf.h \
 		test_cluster_heap_freeze_policy_current.inc \
 		$(top_srcdir)/src/include/cluster/cluster_xid_stripe_boot.h \
-		test_cluster_vacuum_observed_bounds.inc test_cluster_freeze_writer_context.inc $(CLUSTER_RESOURCE_X_IDENTITY_O) test_cluster_heap_maintenance_policy.inc unit_test.h \
+		test_cluster_vacuum_observed_bounds.inc test_cluster_vacuum_freeze_bound_observer.inc \
+		test_cluster_freeze_writer_context.inc $(CLUSTER_RESOURCE_X_IDENTITY_O) test_cluster_heap_maintenance_policy.inc unit_test.h \
 		test_cluster_heap_borrowed_pin.inc $(top_srcdir)/src/include/storage/bufmgr.h \
 		test_cluster_vacuum_freeze_locators.inc \
 		$(top_srcdir)/src/include/cluster/cluster_heap_horizon.h \
@@ -10114,6 +10115,17 @@ test_cluster_vacuum_proof_cleanup.inc: $(top_srcdir)/src/backend/access/heap/vac
 	     /^(lazy_recheck_shared_freeze_page|lazy_observe_shared_freeze_bounds|lazy_collect_shared_freeze_proofs)\(/ { print "static ClusterHeapFreezeProofStatusV1"; emit=1; found++ } \
 	     emit { print } /^}/ { emit=0 } END { if (found != 3 || cleanout > 1 || cost > 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
+
+test_cluster_vacuum_freeze_bound_observer.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
+	awk '/^lazy_observe_shared_freeze_bounds\(/ { print "static ClusterHeapFreezeProofStatusV1"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+.PHONY: clean-vacuum-freeze-bound-observer
+clean-vacuum-freeze-bound-observer:
+	rm -f test_cluster_vacuum_freeze_bound_observer.inc test_cluster_vacuum_freeze_bound_observer.inc.tmp
+
+clean distclean maintainer-clean: clean-vacuum-freeze-bound-observer
 
 test_cluster_vacuum_proof_cleanout.inc: $(top_srcdir)/src/backend/cluster/cluster_itl_cleanout.c Makefile
 	awk '/^cluster_itl_cleanout_can_stamp\(/ && !found { print "bool"; emit=1; found++ } \
