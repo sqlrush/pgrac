@@ -37,6 +37,7 @@
  */
 #include "postgres.h"
 
+#include "access/transam.h"
 #include "access/xact.h" /* spec-3.18 D4.1: xl_xact_tt_commit fold delta */
 #include "miscadmin.h"
 #include "port/atomics.h"
@@ -62,6 +63,7 @@
 #include "cluster/cluster_undo_cleaner.h"	 /* S3 forensics — cleaner stall state in errdetail */
 #endif
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_xid_stripe_boot.h"
 #include "cluster/cluster_undo_record_api.h" /* spec-3.12 D2b cluster_undo_tt_rollover_locked */
 #endif
 #include "cluster/cluster_tt_status.h"
@@ -269,31 +271,86 @@ cluster_tt_local_append_binding(void)
 }
 
 
+typedef enum ClusterTTLocalReserveResult {
+	CLUSTER_TT_LOCAL_UNAVAILABLE = 0,
+	CLUSTER_TT_LOCAL_RESERVED,
+	CLUSTER_TT_LOCAL_NEED_CAPACITY
+} ClusterTTLocalReserveResult;
+
+static void
+cluster_tt_local_rollover_error(uint32 seg, bool at_hard_cap)
+{
+	/* S3 forensics step 1/1a — the errdetail separates "cleaner
+	 * stopped reclaiming" (cleaner status/iters/liveness stale,
+	 * recycle counters flat, horizon far behind current_scn)
+	 * from "pool genuinely at capacity under live retention"
+	 * before anyone reaches for the GUC.  The rollover-failure
+	 * counters are TT-specific; record_extent_hard_cap_fail is
+	 * the OTHER (record-extent CLAIM) path, labeled as such. */
+	TimestampTz cleaner_tick = cluster_undo_cleaner_last_liveness_tick_at();
+	long cleaner_tick_age_ms
+		= cleaner_tick > 0 ? (long)((GetCurrentTimestamp() - cleaner_tick) / 1000) : -1;
+
+	ereport(
+		ERROR,
+		(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+		 errmsg("cluster TT slot allocator: retention rollover failed for "
+				"segment %u (%s)",
+				seg,
+				at_hard_cap ? "undo segment pool hard cap reached"
+							: "undo segment rollover refused; see lifecycle diagnostic"),
+		 errdetail(
+			 "node=%d retention_horizon_scn=" UINT64_FORMAT " current_scn=" UINT64_FORMAT
+			 " retain_skip=" UINT64_FORMAT " retention_recycle=" UINT64_FORMAT
+			 " retention_off_recycle=" UINT64_FORMAT " wrap_retired=" UINT64_FORMAT
+			 " segment_reuse=" UINT64_FORMAT " segment_switch=" UINT64_FORMAT
+			 " tt_rollover_fail_hard_cap=" UINT64_FORMAT " tt_rollover_fail_extend=" UINT64_FORMAT
+			 " tt_rollover_fail_activate=" UINT64_FORMAT
+			 " record_extent_hard_cap_fail=" UINT64_FORMAT
+			 " segments_max_per_instance=%d cleaner_status=%s"
+			 " cleaner_loop_iters=" INT64_FORMAT " cleaner_tick_age_ms=%ld.",
+			 cluster_node_id, cluster_tt_slot_retention_horizon_scn(),
+			 (uint64)cluster_scn_current(), cluster_tt_slot_retain_skip_count(),
+			 cluster_tt_slot_retention_recycle_count(),
+			 cluster_tt_slot_retention_off_recycle_count(), cluster_tt_slot_wrap_retired_count(),
+			 cluster_undo_segment_reuse_count(), cluster_undo_segment_switch_count(),
+			 cluster_undo_tt_rollover_fail_hard_cap_count(),
+			 cluster_undo_tt_rollover_fail_extend_count(),
+			 cluster_undo_tt_rollover_fail_activate_count(),
+			 cluster_undo_segment_hard_cap_fail_count(), cluster_undo_segments_max_per_instance,
+			 cluster_undo_cleaner_status_to_string(cluster_undo_cleaner_status()),
+			 cluster_undo_cleaner_main_loop_iters(), cleaner_tick_age_ms),
+		 errhint(at_hard_cap ? "A long-running reader is retaining committed undo; end it, "
+							   "or raise cluster.undo_segments_max_per_instance."
+							 : "Inspect the preceding undo lifecycle stage/predicate for "
+							   "selection, publication, activation or binding refusal.")));
+}
+
 /*
  * cluster_tt_local_reserve_binding
  *
- *	Public entry point for heap DML (D5).  On first call within an
- *	xact, allocates a real TT slot via cluster_tt_slot_alloc().  On
+ *	Reservation stage for canonical ACTIVE. On first call within an
+ *	xact, allocates a real TT slot via the original allocator. On
  *	subsequent calls within the same xact, returns the cached binding.
  *
- *	Returns true when binding is available (caller proceeds with UBA
- *	encode); returns false when cluster mode is disabled or xid is not
- *	a normal transaction id (caller falls back to PG-native silent
- *	per spec-3.4a A6).  F7: NO provisional fallback on allocator
- *	failure -- raises ERROR fail-closed.
+ *	Returns RESERVED when the exact binding is available, UNAVAILABLE
+ *	when cluster mode is disabled or xid is not normal, and NEED_CAPACITY
+ *	on pool hard cap before owning a slot or canonical responsibility.
+ *	Only the caller may wait, after leaving its modifier. Other failures
+ *	retain their original ERROR path, with no provisional fallback.
  *
  *	Caller MUST NOT be inside a critical section: this function may
  *	take LWLocks (allocator) and call cluster_undo_segment_allocate
  *	(which emits WAL on first segment creation).
  */
-static bool
+static ClusterTTLocalReserveResult
 cluster_tt_local_reserve_binding(TransactionId top_xid, uint32 *out_segment_id,
 								 uint16 *out_slot_offset, uint32 *out_tt_slot_id)
 {
 	if (!cluster_enabled || cluster_node_id < 0)
-		return false;
+		return CLUSTER_TT_LOCAL_UNAVAILABLE;
 	if (!TransactionIdIsNormal(top_xid))
-		return false;
+		return CLUSTER_TT_LOCAL_UNAVAILABLE;
 
 	{
 		int idx = cluster_tt_local_find_binding(top_xid);
@@ -310,7 +367,7 @@ cluster_tt_local_reserve_binding(TransactionId top_xid, uint32 *out_segment_id,
 			*out_segment_id = b->segment_id;
 			*out_slot_offset = b->slot_offset;
 			*out_tt_slot_id = cluster_tt_slot_offset_to_id(b->slot_offset);
-			return true;
+			return CLUSTER_TT_LOCAL_RESERVED;
 		}
 	}
 
@@ -319,7 +376,6 @@ cluster_tt_local_reserve_binding(TransactionId top_xid, uint32 *out_segment_id,
 		uint32 seg;
 		uint16 off;
 		uint16 wrap;
-		ClusterCtrcTxnKeyV1 capacity_continuation = { 0 };
 
 		cluster_tt_local_prepare_binding_capacity();
 		for (;;) {
@@ -378,61 +434,15 @@ cluster_tt_local_reserve_binding(TransactionId top_xid, uint32 *out_segment_id,
 					= cluster_undo_tt_rollover_locked(cluster_node_id, seg, &at_hard_cap);
 
 				if (new_seg == 0) {
-					/* S3 forensics step 1/1a — the errdetail separates "cleaner
-					 * stopped reclaiming" (cleaner status/iters/liveness stale,
-					 * recycle counters flat, horizon far behind current_scn)
-					 * from "pool genuinely at capacity under live retention"
-					 * before anyone reaches for the GUC.  The rollover-failure
-					 * counters are TT-specific; record_extent_hard_cap_fail is
-					 * the OTHER (record-extent CLAIM) path, labeled as such. */
-					TimestampTz cleaner_tick = cluster_undo_cleaner_last_liveness_tick_at();
-					long cleaner_tick_age_ms
-						= cleaner_tick > 0 ? (long)((GetCurrentTimestamp() - cleaner_tick) / 1000)
-										   : -1;
-
-					if (at_hard_cap
-						&& cluster_undo_cleaner_wait_for_capacity(seg, &capacity_continuation))
-						continue;
-
-					ereport(
-						ERROR,
-						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-						 errmsg("cluster TT slot allocator: retention rollover failed for "
-								"segment %u (%s)",
-								seg,
-								at_hard_cap ? "undo segment pool hard cap reached"
-											: "undo segment rollover refused; see lifecycle diagnostic"),
-						 errdetail(
-							 "node=%d retention_horizon_scn=" UINT64_FORMAT
-							 " current_scn=" UINT64_FORMAT " retain_skip=" UINT64_FORMAT
-							 " retention_recycle=" UINT64_FORMAT
-							 " retention_off_recycle=" UINT64_FORMAT " wrap_retired=" UINT64_FORMAT
-							 " segment_reuse=" UINT64_FORMAT " segment_switch=" UINT64_FORMAT
-							 " tt_rollover_fail_hard_cap=" UINT64_FORMAT
-							 " tt_rollover_fail_extend=" UINT64_FORMAT
-							 " tt_rollover_fail_activate=" UINT64_FORMAT
-							 " record_extent_hard_cap_fail=" UINT64_FORMAT
-							 " segments_max_per_instance=%d cleaner_status=%s"
-							 " cleaner_loop_iters=" INT64_FORMAT " cleaner_tick_age_ms=%ld.",
-							 cluster_node_id, cluster_tt_slot_retention_horizon_scn(),
-							 (uint64)cluster_scn_current(), cluster_tt_slot_retain_skip_count(),
-							 cluster_tt_slot_retention_recycle_count(),
-							 cluster_tt_slot_retention_off_recycle_count(),
-							 cluster_tt_slot_wrap_retired_count(),
-							 cluster_undo_segment_reuse_count(),
-							 cluster_undo_segment_switch_count(),
-							 cluster_undo_tt_rollover_fail_hard_cap_count(),
-							 cluster_undo_tt_rollover_fail_extend_count(),
-							 cluster_undo_tt_rollover_fail_activate_count(),
-							 cluster_undo_segment_hard_cap_fail_count(),
-							 cluster_undo_segments_max_per_instance,
-							 cluster_undo_cleaner_status_to_string(cluster_undo_cleaner_status()),
-							 cluster_undo_cleaner_main_loop_iters(), cleaner_tick_age_ms),
-						 errhint(at_hard_cap
-								 ? "A long-running reader is retaining committed undo; end it, "
-								   "or raise cluster.undo_segments_max_per_instance."
-								 : "Inspect the preceding undo lifecycle stage/predicate for "
-								   "selection, publication, activation or binding refusal.")));
+					if (at_hard_cap) {
+						/* No slot, canonical BIND or CTRC responsibility exists.
+						 * The caller must leave its modifier before waiting. */
+						*out_segment_id = seg;
+						*out_slot_offset = INVALID_TT_SLOT_OFFSET;
+						*out_tt_slot_id = 0;
+						return CLUSTER_TT_LOCAL_NEED_CAPACITY;
+					}
+					cluster_tt_local_rollover_error(seg, false);
 				}
 			}
 		}
@@ -449,7 +459,7 @@ cluster_tt_local_reserve_binding(TransactionId top_xid, uint32 *out_segment_id,
 		*out_segment_id = seg;
 		*out_slot_offset = off;
 		*out_tt_slot_id = cluster_tt_slot_offset_to_id(off);
-		return true;
+		return CLUSTER_TT_LOCAL_RESERVED;
 	}
 }
 
@@ -832,6 +842,11 @@ cluster_tt_local_prepare_canonical_active(TransactionId top_xid,
 										  ClusterCanonicalTxnBinding *binding_out)
 {
 	uint64 retry_count = 0;
+	ClusterCtrcTxnKeyV1 capacity_continuation = { 0 };
+	ClusterSemanticAdmissionToken capacity_admission = { 0 };
+	ClusterXidStripeSampleFence capacity_lease = { 0 };
+	bool capacity_pending = false;
+	bool capacity_striped = false;
 
 	if (binding_out == NULL)
 		return false;
@@ -860,7 +875,7 @@ cluster_tt_local_prepare_canonical_active(TransactionId top_xid,
 		TTSlot zero_slot;
 		volatile bool retry_unpublished = false;
 		volatile bool publication_started = false;
-		bool reserved = false;
+		ClusterTTLocalReserveResult reserve_result = CLUSTER_TT_LOCAL_UNAVAILABLE;
 		int idx;
 
 		CHECK_FOR_INTERRUPTS();
@@ -890,9 +905,50 @@ cluster_tt_local_prepare_canonical_active(TransactionId top_xid,
 
 		PG_TRY();
 		{
-			reserved
+			/* Reentry acquires new debt. It must not reuse a positive capacity
+			 * observation from a different admission or allocation promise. The
+			 * allocator itself reselects CURRENT and rechecks under its lock. */
+			if (capacity_pending
+				&& (modifier_token.feature_bit != capacity_admission.feature_bit
+					|| modifier_token.record_generation != capacity_admission.record_generation
+					|| modifier_token.formation_epoch != capacity_admission.formation_epoch
+					|| modifier_token.side != capacity_admission.side
+					|| (capacity_striped
+						&& !cluster_xid_stripe_sample_fence_current(&capacity_lease))))
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+						 errmsg("cluster admission changed while waiting for undo capacity")));
+			if (capacity_pending)
+				cluster_tt_local_modifier_recheck_or_error(&modifier_token);
+
+			reserve_result
 				= cluster_tt_local_reserve_binding(top_xid, &segment_id, &slot_offset, &tt_slot_id);
-			if (reserved) {
+			if (reserve_result == CLUSTER_TT_LOCAL_NEED_CAPACITY) {
+				cluster_tt_local_modifier_recheck_or_error(&modifier_token);
+				if (!capacity_pending) {
+					capacity_admission = modifier_token;
+					capacity_striped = cluster_shared_catalog && cluster_xid_striping;
+					if (capacity_striped) {
+						FullTransactionId future;
+						bool captured;
+
+						/* Read the original lease identity without allocating or
+						 * waiting for a lease while holding modifier admission. */
+						LWLockAcquire(XidGenLock, LW_SHARED);
+						captured = cluster_xid_stripe_sample_future(ShmemVariableCache->nextXid,
+																	&future, &capacity_lease);
+						LWLockRelease(XidGenLock);
+						if (!captured)
+							ereport(
+								ERROR,
+								(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+								 errmsg("undo capacity progress is not proven"),
+								 errdetail("The current allocation lease could not be observed.")));
+					}
+					capacity_pending = true;
+				}
+				cluster_tt_local_modifier_recheck_or_error(&modifier_token);
+			} else if (reserve_result == CLUSTER_TT_LOCAL_RESERVED) {
 				(void)tt_slot_id;
 				idx = cluster_tt_local_find_binding(top_xid);
 				Assert(idx >= 0);
@@ -966,7 +1022,14 @@ cluster_tt_local_prepare_canonical_active(TransactionId top_xid,
 		PG_END_TRY();
 
 		cluster_semantic_activation_leave(&modifier_token);
-		if (!reserved)
+		if (reserve_result == CLUSTER_TT_LOCAL_NEED_CAPACITY) {
+			/* Only this invocation's token was released. The original wait
+			 * predicate still refuses pins, locks and any other admission. */
+			if (cluster_undo_cleaner_wait_for_capacity(segment_id, &capacity_continuation))
+				continue;
+			cluster_tt_local_rollover_error(segment_id, true);
+		}
+		if (reserve_result == CLUSTER_TT_LOCAL_UNAVAILABLE)
 			return false;
 		if (!retry_unpublished) {
 			cluster_tt_local_bind_relmap_pending(top_xid);
