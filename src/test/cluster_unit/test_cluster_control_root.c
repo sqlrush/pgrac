@@ -26159,6 +26159,7 @@ UT_TEST(test_tx_inputs_parent_subject_and_wait_revalidation)
 #include "test_cluster_control_ctrc_source_plan.inc"
 #include "test_cluster_control_ctrc_replay_set.inc"
 #include "test_cluster_control_relmap_participant.inc"
+#include "test_cluster_control_relmap_terminal.inc"
 #include "test_cluster_control_ctrc_stable.inc"
 #include "test_cluster_control_ctrc_replay_stable.inc"
 #include "test_cluster_control_ctrc_page.inc"
@@ -26433,7 +26434,13 @@ main(int argc, char **argv)
 		return ut_failed_count ? 1 : 0;
 	}
 	if (getenv("PGRAC_PRE2_TEST_RELMAP_INPUTS") != NULL) {
-		UT_PLAN(10);
+		UT_PLAN(15);
+		UT_RUN(test_relmap_episode_terminal_first_owner_error_is_sticky);
+		UT_RUN(test_relmap_episode_terminal_uses_original_generation_not_input_order);
+		UT_RUN(test_relmap_episode_terminal_refuses_partial_unsealed_or_wrong_original_plan);
+		UT_RUN(test_relmap_episode_terminal_wrong_native_bytes_revoke_without_cleanup);
+		UT_RUN(test_relmap_episode_terminal_preconditions_keep_original_episode);
+
 		UT_RUN(test_relmap_native_input_refuses_caller_cf_or_critical_without_revocation);
 		UT_RUN(test_relmap_input_vector_keeps_every_original_history_generation);
 		UT_RUN(test_relmap_inputs_require_declaration_and_all_original_holders);
@@ -26760,7 +26767,13 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(613);
+	UT_PLAN(618);
+	UT_RUN(test_relmap_episode_terminal_first_owner_error_is_sticky);
+	UT_RUN(test_relmap_episode_terminal_uses_original_generation_not_input_order);
+	UT_RUN(test_relmap_episode_terminal_refuses_partial_unsealed_or_wrong_original_plan);
+	UT_RUN(test_relmap_episode_terminal_wrong_native_bytes_revoke_without_cleanup);
+	UT_RUN(test_relmap_episode_terminal_preconditions_keep_original_episode);
+
 	UT_RUN(test_relmap_native_input_refuses_caller_cf_or_critical_without_revocation);
 	UT_RUN(test_relmap_source_whole_root_recheck_retains_original_holder_debt);
 	UT_RUN(test_relmap_source_failure_is_original_incarnation_only_and_owner_sticky);

@@ -346,6 +346,16 @@ typedef struct ClusterRecoveryRelmapNativeInputV1 {
  * physical lifetime, no truncation/reuse, terminal polarity or COMPLETE. */
 extern ClusterRecoveryRelmapNativeInputV1 cluster_wal_inputs_relmap_native_v1(
 	ClusterWalInputsV1 *inputs, uint32 input_index);
+/* Original all-source episode's sealed SIDE/native COMMIT/ABORT carrier
+ * correspondence. UINT32_MAX means refusal; zero is a valid empty count.
+ * Both calls recheck the selected generation, complete original bound plan,
+ * source/ROOT token and every original holder before/after lookup. No physical
+ * reread, native FullXid/era/CLOG/lifetime qualification or COMPLETE is implied.
+ * Entered refusal/ERROR revokes the episode without releasing its protection. */
+extern uint32 cluster_wal_inputs_relmap_terminal_count_v1(
+	const ClusterRecoveryRelmapSourceV1 *source);
+extern bool cluster_wal_inputs_relmap_terminal_matches_v1(
+	const ClusterRecoveryRelmapSourceV1 *source, const XLogReaderState *reader);
 struct ClusterRecoverySerialRequest;
 /* IR purpose callbacks: validate includes original whole ROOT I/O outside CF;
  * current is no-wait and never calls the IR holder revalidation recursively. */

@@ -198,6 +198,9 @@ extern bool rf_side_online_plan_terminal_matches_v1(const RfSideOnlinePlanV1 *pl
  * original sealed RECOVERY plan/source. Structural count only, no completion. */
 extern uint32 rf_side_online_plan_native_terminal_count_v1(const RfSideOnlinePlanV1 *plan,
 														   const ClusterWalSourceRef *source);
+/* Complete original bound declaration, not one selected claim. */
+extern bool rf_side_online_plan_recovery_sources_match_v1(const RfSideOnlinePlanV1 *plan,
+	const ClusterWalSourceRef *sources, uint32 count);
 /* UINT32_MAX for an invalid or unsealed plan. */
 extern uint32 rf_side_online_plan_participant_count_v1(const RfSideOnlinePlanV1 *plan);
 /* The physical lower alone must not authorize replay of retained history. */

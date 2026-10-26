@@ -8,6 +8,8 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+#include "utils/memutils.h"
+
 #include "access/clog.h"
 #include "access/commit_ts.h"
 #include "access/multixact.h"
@@ -1483,6 +1485,26 @@ rf_side_online_plan_recovery_claim_matches_v1(const RfSideOnlinePlanV1 *plan,
 											  const ClusterWalSourceRef *source)
 {
 	return side_recovery_claim_matches(plan, source, true);
+}
+
+/* Exact complete original declaration; a selected-source match alone must
+ * not turn a partial bound census into the episode's original plan. */
+bool
+rf_side_online_plan_recovery_sources_match_v1(const RfSideOnlinePlanV1 *plan,
+	const ClusterWalSourceRef *sources, uint32 count)
+{
+	if (plan == NULL || sources == NULL || count == 0 || count != plan->source_count)
+		return false;
+	for (uint32 i = 0; i < count; i++) {
+		if (!side_recovery_claim_matches(plan, &sources[i], false))
+			return false;
+		for (uint32 j = 0; j < i; j++)
+			if (sources[j].claim.identity.origin_thread_id == sources[i].claim.identity.origin_thread_id
+				&& sources[j].claim.identity.origin_owner_incarnation
+					== sources[i].claim.identity.origin_owner_incarnation)
+				return false;
+	}
+	return true;
 }
 
 bool

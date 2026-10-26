@@ -4119,6 +4119,9 @@ test_cluster_side_xact_budget_product.o: $(top_srcdir)/src/backend/cluster/clust
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DRF_SIDE_XACT_TESTING \
 		-Dmalloc=side_xact_fixture_malloc -Dfree=side_xact_fixture_free \
 		-ffunction-sections -fdata-sections -c $< -o $@
+test_cluster_side_xact test_cluster_pi_contribution test_cluster_recovery_c0_plan test_cluster_cold_tt_redo: test_cluster_side_relmap_terminal.inc
+test_cluster_side_xact: $(top_builddir)/src/backend/cluster/cluster_wal_claim.o
+
 CLUSTER_SIDE_ONLINE_PLAN_TEST_O = test_cluster_side_online_plan.o
 $(CLUSTER_SIDE_ONLINE_PLAN_TEST_O): \
 		$(top_srcdir)/src/backend/cluster/cluster_side_online_plan.c \
@@ -4419,6 +4422,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_ctrc_
 test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_ctrc_native_fpi: test_cluster_control_ctrc_source_plan.inc
 test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_ctrc_native_fpi: test_cluster_control_ctrc_replay_set.inc
 test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_ctrc_native_fpi: test_cluster_control_relmap_participant.inc
+test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_ctrc_native_fpi: test_cluster_control_relmap_terminal.inc
 test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_ctrc_native_fpi: test_cluster_control_ctrc_stable.inc
 test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_ctrc_native_fpi: test_cluster_control_ctrc_replay_stable.inc
 test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_ctrc_native_fpi: test_cluster_control_ctrc_page.inc
