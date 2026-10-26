@@ -117,7 +117,20 @@ save_json('formation',{
  # These two providers are local-origin APIs. Their direct diagnostic
  # calls stay on node 0; origin RPC readers run on node 1.
  local_providers=>[qw(physical owner)],remote_providers=>[qw(freeze_data sample_canonical)]});
-$a->safe_psql('postgres','CREATE EXTENSION test_pgrac_shared_config');
+$a->safe_psql('postgres',q{
+ CREATE FUNCTION test_pgrac_native_itl_trace() RETURNS text
+ AS '$libdir/test_pgrac_shared_config', 'test_pgrac_native_itl_trace'
+ LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
+ CREATE FUNCTION test_pgrac_m2_sample(text,regclass,integer,xid) RETURNS text
+ AS '$libdir/test_pgrac_shared_config', 'test_pgrac_m2_sample'
+ LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
+ CREATE FUNCTION test_pgrac_m2_guards_clear() RETURNS boolean
+ AS '$libdir/test_pgrac_shared_config', 'test_pgrac_m2_guards_clear'
+ LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
+ REVOKE ALL ON FUNCTION test_pgrac_native_itl_trace() FROM PUBLIC;
+ REVOKE ALL ON FUNCTION test_pgrac_m2_sample(text,regclass,integer,xid) FROM PUBLIC;
+ REVOKE ALL ON FUNCTION test_pgrac_m2_guards_clear() FROM PUBLIC;
+});
 
 # Real DATA rollover is induced with one ordinary transaction. The padding
 # is stored inline; no TT/UBA/generation setter or forced rollover is used.
