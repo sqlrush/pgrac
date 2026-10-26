@@ -9464,6 +9464,9 @@ static const QualifiedXminFixture *bounds_source;
 static unsigned bounds_policy_reads, bounds_cohort_reads, bounds_census_reads;
 static unsigned bounds_clock_reads, bounds_clock_observes, bounds_target_reads;
 static unsigned bounds_fault;
+static unsigned bounds_saved_policy_calls, bounds_saved_policy_fences;
+static unsigned bounds_policy_fault, bounds_policy_fault_at;
+static bool bounds_saved_policy_result;
 static unsigned bounds_saved_current_calls, bounds_current_fault, bounds_current_fault_at;
 static ClusterHeapFreezeCohortStatus bounds_saved_current_status;
 static bool bounds_after_clock, bounds_after_target;
@@ -9750,6 +9753,22 @@ bounds_cohort_observe(ClusterHeapFreezeCohortObservation *out)
 }
 
 static bool
+bounds_saved_allocation_fence_current(const ClusterXidStripeSampleFence *fence)
+{
+	bounds_assert_unlocked();
+	bounds_saved_policy_fences++;
+	return original_retained_lease_current(fence);
+}
+
+/* Preserve the original predicate with independent collector counters, rather
+ * than routing through the native-entry adapter's unrelated assertions. */
+#define cluster_xid_stripe_sample_fence_current bounds_saved_allocation_fence_current
+#define cluster_heap_freeze_policy_sample_current_v1 bounds_saved_policy_current
+#include "test_cluster_heap_freeze_policy_current.inc"
+#undef cluster_heap_freeze_policy_sample_current_v1
+#undef cluster_xid_stripe_sample_fence_current
+
+static bool
 bounds_policy_current(const ClusterHeapFreezePolicySampleV1 *sample)
 {
 	bounds_assert_unlocked();
@@ -9757,8 +9776,24 @@ bounds_policy_current(const ClusterHeapFreezePolicySampleV1 *sample)
 	bounds_policy_reads++;
 	if (bounds_after_target && bounds_fault == 8)
 		elog(ERROR, "injected collector final source ERROR");
-	return !(bounds_after_target && bounds_fault == 1)
-		&& !(bounds_after_clock && bounds_fault == 5);
+	if ((bounds_after_target && bounds_fault == 1)
+		|| (bounds_after_clock && bounds_fault == 5))
+		return false;
+	if (bounds_policy_reads == bounds_policy_fault_at) {
+		if (bounds_policy_fault == 1) cluster_shared_config = false;
+		else if (bounds_policy_fault == 2) cluster_enabled = false;
+		else if (bounds_policy_fault == 3) cluster_xid_striping = false;
+		else if (bounds_policy_fault >= 4 && bounds_policy_fault <= 17)
+			retained_lease_fault(bounds_policy_fault - 4);
+		else if (bounds_policy_fault == 18 || bounds_policy_fault == 19) {
+			lease_revoke_after_unlock = lease_lock_releases + 1;
+			lease_revoke_kind = bounds_policy_fault == 18 ? 1 : 2;
+		} else if (bounds_policy_fault == 20 || bounds_policy_fault == 21)
+			lease_error_read = lease_incarnation_reads + (bounds_policy_fault == 20 ? 1 : 2);
+	}
+	bounds_saved_policy_calls++;
+	bounds_saved_policy_result = bounds_saved_policy_current(sample);
+	return bounds_saved_policy_result;
 }
 
 static ClusterHeapFreezeCohortStatus
@@ -9869,6 +9904,8 @@ bounds_observer_setup(LVRelState *v, QualifiedXminFixture *f)
 	bounds_history_locks = bounds_history_unlocks = bounds_history_clocks = 0;
 	bounds_policy_reads = bounds_cohort_reads = bounds_census_reads = 0;
 	bounds_saved_current_calls = bounds_current_fault = bounds_current_fault_at = 0;
+	bounds_saved_policy_calls = bounds_saved_policy_fences = 0;
+	bounds_policy_fault = bounds_policy_fault_at = 0; bounds_saved_policy_result = false;
 	bounds_saved_current_status = CLUSTER_HEAP_FREEZE_COHORT_INVALID;
 	bounds_clock_reads = bounds_clock_observes = bounds_target_reads = 0;
 	bounds_fault = 0;
@@ -10556,10 +10593,158 @@ UT_TEST(test_collector_saved_current_error_preserves_caller_page_pin_and_admissi
 	}
 }
 
+UT_TEST(test_collector_saved_policy_original_fence_reaches_native_wal_without_resample)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+		LVRelState v; ClusterHeapFreezeObservedBoundsV1 bounds = {0}; unsigned native_reads;
+		if (batch) qualified_xmin_batch_setup(&f, targets);
+		else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+		bounds_observer_setup(&v, &f); fixture_wal_clock = 5; native_reads = pass_native_reads;
+		UT_ASSERT_EQ(lazy_observe_shared_freeze_bounds(&v, &f.admission,
+			CLUSTER_HEAP_FREEZE_PROOF_PROVEN, &bounds), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+		UT_ASSERT(v.shared_freeze_cohort_observed && bounds_saved_policy_result);
+		UT_ASSERT_EQ(bounds_saved_policy_calls, 3); UT_ASSERT_EQ(bounds_saved_policy_fences, 3);
+		UT_ASSERT_EQ(bounds_saved_current_calls, 3); UT_ASSERT_EQ(bounds_acquire_history_reads, 1);
+		UT_ASSERT_EQ(pass_native_reads, native_reads);
+		UT_ASSERT_EQ(policy_current_checks + allocation_fence_checks, 0);
+		f.input = v.shared_freeze_input;
+		UT_ASSERT(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0));
+		UT_ASSERT_EQ(policy_current_checks, 1); UT_ASSERT_EQ(allocation_fence_checks, 1);
+		UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1);
+		UT_ASSERT_EQ(conditional_resumes, 1); UT_ASSERT_EQ(conditional_unlocks, 1);
+		UT_ASSERT_EQ(lease_lock_acquires, lease_lock_releases);
+		UT_ASSERT(!lease_lock_held && !local_x && !resumed_writer && f.admission.entered);
+		UT_ASSERT_EQ(backend_pin_count, 1);
+	}
+}
+
+UT_TEST(test_collector_saved_policy_config_refusal_precedes_original_fence)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (unsigned phase = 1; phase <= 3; phase++) {
+			for (unsigned fault = 1; fault <= 3; fault++) {
+				QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+				LVRelState v; ClusterHeapFreezeObservedBoundsV1 bounds = {0};
+				if (batch) qualified_xmin_batch_setup(&f, targets);
+				else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+				bounds_observer_setup(&v, &f); fixture_wal_clock = 5;
+				bounds_policy_fault_at = phase; bounds_policy_fault = fault;
+				UT_ASSERT_EQ(lazy_observe_shared_freeze_bounds(&v, &f.admission,
+					CLUSTER_HEAP_FREEZE_PROOF_PROVEN, &bounds), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+				UT_ASSERT_EQ(bounds_saved_policy_calls, phase);
+				UT_ASSERT_EQ(bounds_saved_policy_fences, phase - 1);
+				UT_ASSERT(!bounds_saved_policy_result && !v.shared_freeze_cohort_observed);
+				UT_ASSERT(v.shared_freeze_input.freeze_policy == NULL && v.shared_freeze_input.freeze_cohort == NULL);
+				f.input = v.shared_freeze_input;
+				UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0)));
+				UT_ASSERT_EQ(inserts + edges + dirties + flushes + conditional_resumes, 0);
+				UT_ASSERT_EQ(lease_lock_acquires, lease_lock_releases);
+				UT_ASSERT(!lease_lock_held && !local_x && f.admission.entered);
+				UT_ASSERT_EQ(backend_pin_count, 1);
+				UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+			}
+		}
+	}
+}
+
+UT_TEST(test_collector_saved_policy_original_lease_fields_reject_before_writer)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (unsigned phase = 1; phase <= 3; phase++) {
+			for (unsigned fault = 4; fault <= 17; fault++) {
+				QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+				LVRelState v; ClusterHeapFreezeObservedBoundsV1 bounds = {0};
+				if (batch) qualified_xmin_batch_setup(&f, targets);
+				else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+				bounds_observer_setup(&v, &f); fixture_wal_clock = 5;
+				bounds_policy_fault_at = phase; bounds_policy_fault = fault;
+				UT_ASSERT_EQ(lazy_observe_shared_freeze_bounds(&v, &f.admission,
+					CLUSTER_HEAP_FREEZE_PROOF_PROVEN, &bounds), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+				UT_ASSERT_EQ(bounds_saved_policy_calls, phase); UT_ASSERT_EQ(bounds_saved_policy_fences, phase);
+				UT_ASSERT(!bounds_saved_policy_result && !v.shared_freeze_cohort_observed);
+				UT_ASSERT(v.shared_freeze_input.freeze_policy == NULL && v.shared_freeze_input.freeze_cohort == NULL);
+				UT_ASSERT_EQ(bounds_acquire_history_reads, 1);
+				f.input = v.shared_freeze_input;
+				UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0)));
+				UT_ASSERT_EQ(inserts + edges + dirties + flushes + conditional_resumes, 0);
+				UT_ASSERT_EQ(lease_lock_acquires, lease_lock_releases);
+				UT_ASSERT(!lease_lock_held && !local_x && f.admission.entered);
+				UT_ASSERT_EQ(backend_pin_count, 1);
+				UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+			}
+		}
+	}
+}
+
+UT_TEST(test_collector_saved_policy_rechecks_incarnation_and_quorum_after_unlock)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (unsigned phase = 1; phase <= 3; phase++) {
+			for (unsigned fault = 18; fault <= 19; fault++) {
+				QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+				LVRelState v; ClusterHeapFreezeObservedBoundsV1 bounds = {0};
+				if (batch) qualified_xmin_batch_setup(&f, targets);
+				else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+				bounds_observer_setup(&v, &f); fixture_wal_clock = 5;
+				bounds_policy_fault_at = phase; bounds_policy_fault = fault;
+				UT_ASSERT_EQ(lazy_observe_shared_freeze_bounds(&v, &f.admission,
+					CLUSTER_HEAP_FREEZE_PROOF_PROVEN, &bounds), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+				UT_ASSERT_EQ(bounds_saved_policy_calls, phase); UT_ASSERT_EQ(bounds_saved_policy_fences, phase);
+				UT_ASSERT(!bounds_saved_policy_result && !v.shared_freeze_cohort_observed);
+				UT_ASSERT_EQ(lease_lock_releases, lease_revoke_after_unlock);
+				f.input = v.shared_freeze_input;
+				UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0)));
+				UT_ASSERT_EQ(inserts + edges + dirties + flushes + conditional_resumes, 0);
+				UT_ASSERT_EQ(lease_lock_acquires, lease_lock_releases);
+				UT_ASSERT(!lease_lock_held && !local_x && f.admission.entered);
+				UT_ASSERT_EQ(backend_pin_count, 1);
+				UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+			}
+		}
+	}
+}
+
+UT_TEST(test_collector_saved_policy_error_leaves_original_lease_lock_and_caller_intact)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		for (unsigned phase = 1; phase <= 3; phase++) {
+			for (unsigned fault = 20; fault <= 21; fault++) {
+				QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+				LVRelState v; ClusterHeapFreezeObservedBoundsV1 bounds = {0};
+				if (batch) qualified_xmin_batch_setup(&f, targets);
+				else qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+				bounds_observer_setup(&v, &f); fixture_wal_clock = 5;
+				bounds_policy_fault_at = phase; bounds_policy_fault = fault;
+				expecting_error = true;
+				if (setjmp(error_jump) == 0) {
+					(void)lazy_observe_shared_freeze_bounds(&v, &f.admission,
+						CLUSTER_HEAP_FREEZE_PROOF_PROVEN, &bounds);
+					UT_ASSERT(false);
+				}
+				UT_ASSERT_EQ(bounds_saved_policy_calls, phase); UT_ASSERT_EQ(bounds_saved_policy_fences, phase);
+				UT_ASSERT(!v.shared_freeze_cohort_observed);
+				UT_ASSERT(v.shared_freeze_input.freeze_policy == NULL && v.shared_freeze_input.freeze_cohort == NULL);
+				UT_ASSERT_EQ(inserts + edges + dirties + flushes + conditional_resumes, 0);
+				UT_ASSERT_EQ(lease_lock_acquires, lease_lock_releases);
+				UT_ASSERT(!lease_lock_held && !local_x && f.admission.entered);
+				UT_ASSERT_EQ(backend_pin_count, 1);
+				UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+				expecting_error = false;
+			}
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(246);
+	UT_PLAN(251);
+	UT_RUN(test_collector_saved_policy_original_fence_reaches_native_wal_without_resample);
+	UT_RUN(test_collector_saved_policy_config_refusal_precedes_original_fence);
+	UT_RUN(test_collector_saved_policy_original_lease_fields_reject_before_writer);
+	UT_RUN(test_collector_saved_policy_rechecks_incarnation_and_quorum_after_unlock);
+	UT_RUN(test_collector_saved_policy_error_leaves_original_lease_lock_and_caller_intact);
 	UT_RUN(test_collector_saved_current_uses_original_sources_without_history_resample);
 	UT_RUN(test_collector_saved_current_refuses_worker_lease_and_admission_drift);
 	UT_RUN(test_collector_saved_current_refuses_original_registration_changes);
