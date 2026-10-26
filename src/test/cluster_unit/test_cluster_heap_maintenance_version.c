@@ -41,6 +41,7 @@
 #include "cluster/cluster_itl.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
+#include "utils/memdebug.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_pcm_lock.h"
@@ -12749,12 +12750,93 @@ page_owner_resident_lookup(BufferTag *tag, uint32 hash)
 	UT_ASSERT_EQ(hash, 73); UT_ASSERT(BufferTagsEqual(tag, &GetBufferDescriptor(0)->tag));
 	return page_owner_stamp_case == 0 ? -1 : 0;
 }
+static bool page_owner_use_original_lookup_pin;
+static unsigned page_owner_original_lookup_pin_calls;
+static unsigned page_owner_lookup_private_reads, page_owner_lookup_pin_leaf_calls;
+
+/* Actual lookup routing and the original PCM tracking predicate below;
+ * private-refcount storage, runtime/config and primitive pin stay controlled.
+ * Auxiliary publication is outside these MAIN-fork cases and fails loudly. */
+static PrivateRefCountEntry *
+page_owner_lookup_private_ref(Buffer buffer, bool move)
+{
+	UT_ASSERT(page_owner_use_original_lookup_pin && page_owner_resident_partition_held);
+	UT_ASSERT_EQ(buffer, 1); UT_ASSERT(move);
+	page_owner_lookup_private_reads++;
+	return NULL;
+}
+static bool
+page_owner_lookup_pcm_active(void)
+{
+	UT_ASSERT(page_owner_use_original_lookup_pin && page_owner_resident_active && page_owner_resident_partition_held);
+	return true;
+}
+static bool
+page_owner_lookup_pin_leaf(BufferDesc *buf, BufferAccessStrategy strategy)
+{
+	UT_ASSERT(buf == GetBufferDescriptor(0) && strategy == NULL);
+	UT_ASSERT_EQ(buf->tag.forkNum, MAIN_FORKNUM);
+	UT_ASSERT(page_owner_resident_partition_held && !page_owner_page_locked);
+	UT_ASSERT_EQ(backend_pin_count, page_owner_resident_saved.pins);
+	backend_pin_count++; page_owner_resident_pins++;
+	page_owner_lookup_pin_leaf_calls++;
+	return true;
+}
+static void
+page_owner_lookup_aux_reserve(void)
+{
+	UT_ASSERT(false);
+}
+static PrivateRefCountEntry *
+page_owner_lookup_aux_ref(Buffer buffer)
+{
+	(void)buffer;
+	UT_ASSERT(false);
+	return NULL;
+}
+static void
+page_owner_lookup_aux_remember(ResourceOwner owner, Buffer buffer)
+{
+	(void)owner; (void)buffer;
+	UT_ASSERT(false);
+}
+
+#define GetPrivateRefCountEntry page_owner_lookup_private_ref
+#define cluster_pcm_is_active page_owner_lookup_pcm_active
+#define cluster_shared_catalog true
+#define cluster_bufmgr_should_pcm_track original_touch_pin_tracked
+#define ReservePrivateRefCountEntry page_owner_lookup_aux_reserve
+#define LockBufHdr original_touch_header_lock
+#define NewPrivateRefCountEntry page_owner_lookup_aux_ref
+#define ResourceOwnerRememberBuffer page_owner_lookup_aux_remember
+#define CurrentResourceOwner ((ResourceOwner)&page_owner_wal_cookie)
+#define PinBuffer page_owner_lookup_pin_leaf
+#define PinBufferForLookup original_touch_lookup_pin
+#include "test_cluster_heap_lookup_pin.inc"
+#undef PinBufferForLookup
+#undef PinBuffer
+#undef CurrentResourceOwner
+#undef ResourceOwnerRememberBuffer
+#undef NewPrivateRefCountEntry
+#undef LockBufHdr
+#undef ReservePrivateRefCountEntry
+#undef cluster_bufmgr_should_pcm_track
+#undef cluster_shared_catalog
+#undef cluster_pcm_is_active
+#undef GetPrivateRefCountEntry
+
 static PinBufferLookupResult
 page_owner_resident_pin(BufferDesc *buf, BufferAccessStrategy strategy)
 {
 	UT_ASSERT(buf == GetBufferDescriptor(0) && strategy == NULL);
 	UT_ASSERT(page_owner_resident_partition_held && !page_owner_page_locked);
 	UT_ASSERT_EQ(backend_pin_count, page_owner_resident_saved.pins);
+	if (page_owner_use_original_lookup_pin)
+	{
+		PinBufferLookupResult result = original_touch_lookup_pin(buf, strategy);
+		page_owner_original_lookup_pin_calls++;
+		return result;
+	}
 	backend_pin_count++; page_owner_resident_pins++;
 	return PIN_BUFFER_LOOKUP_VALID;
 }
@@ -13601,6 +13683,41 @@ full_source_then_recent_case(bool batch, bool late_receiver)
 	full_source_then_recent_lifecycle_case(batch, late_receiver, false, 0, 0);
 }
 
+UT_TEST(test_original_lookup_pin_feeds_resident_stamp_and_recent_freeze)
+{
+	page_owner_use_original_lookup_pin = true;
+	page_owner_original_lookup_pin_calls = 0;
+	page_owner_lookup_private_reads = page_owner_lookup_pin_leaf_calls = 0;
+	page_owner_use_native_resident = page_owner_use_native_authority = true;
+	page_owner_native_resident_calls = 0;
+	page_owner_resident_pins = page_owner_resident_unpins = 0;
+	page_owner_resident_releases = page_owner_resident_successes = 0;
+	page_owner_resident_missing = page_owner_resident_wrap = page_owner_resident_generation = 0;
+	page_owner_native_authority_calls = page_owner_native_authority_refusals = 0;
+	page_owner_use_registration = page_owner_use_xact_owner = page_owner_use_range = page_owner_use_full_batch = native_exit_use_page_owner_discharge = true;
+	page_owner_registered_records = 0;
+	for (unsigned retirement = 1; retirement <= 2; retirement++)
+		for (unsigned batch = 0; batch < 2; batch++)
+			full_source_then_recent_lifecycle_case(batch != 0, false, true, 2, retirement);
+	UT_ASSERT_EQ(page_owner_registered_records, 32);
+	UT_ASSERT_EQ(page_owner_native_authority_calls, 80);
+	UT_ASSERT_EQ(page_owner_native_authority_refusals, 16);
+	UT_ASSERT_EQ(page_owner_native_resident_calls, 24);
+	UT_ASSERT_EQ(page_owner_resident_successes, 8);
+	UT_ASSERT_EQ(page_owner_resident_pins, 16); UT_ASSERT_EQ(page_owner_resident_unpins, 16);
+	UT_ASSERT_EQ(page_owner_resident_releases, 16);
+	UT_ASSERT_EQ(page_owner_resident_missing, 8);
+	UT_ASSERT_EQ(page_owner_resident_wrap, 4); UT_ASSERT_EQ(page_owner_resident_generation, 4);
+	UT_ASSERT_EQ(page_owner_original_lookup_pin_calls, 16);
+	UT_ASSERT_EQ(page_owner_lookup_private_reads, 16);
+	UT_ASSERT_EQ(page_owner_lookup_pin_leaf_calls, 16);
+	UT_ASSERT(!page_owner_resident_active && !page_owner_resident_partition_held && !page_owner_page_locked);
+	UT_ASSERT(ClusterPcmOwnArray == NULL);
+	page_owner_use_registration = page_owner_use_xact_owner = page_owner_use_range = page_owner_use_full_batch = native_exit_use_page_owner_discharge = false;
+	page_owner_use_native_resident = page_owner_use_native_authority = false;
+	page_owner_use_original_lookup_pin = false;
+}
+
 UT_TEST(test_original_resident_stamp_owner_feeds_shared_retention_and_recent_freeze)
 {
 	page_owner_use_native_resident = page_owner_use_native_authority = true;
@@ -14005,7 +14122,7 @@ UT_TEST(test_recent_xmin_share_lock_refusal_keeps_borrowed_pin_without_upgrade)
 int
 main(void)
 {
-	UT_PLAN(310);
+	UT_PLAN(311);
 
 	UT_RUN(test_pin_free_admitted_phase_reaches_recent_native_wal_before_owner_leave);
 	UT_RUN(test_pin_free_phase_recent_refusal_retires_only_its_original_owner);
@@ -14014,6 +14131,7 @@ main(void)
 	UT_RUN(test_recent_refused_receiver_keeps_original_cut_and_native_continuation);
 	UT_RUN(test_full_original_source_reaches_pin_free_collector_and_recent_wal);
 	UT_RUN(test_full_original_source_late_receiver_revokes_recent_wal);
+	UT_RUN(test_original_lookup_pin_feeds_resident_stamp_and_recent_freeze);
 	UT_RUN(test_original_resident_stamp_owner_feeds_shared_retention_and_recent_freeze);
 	UT_RUN(test_original_bufmgr_authority_feeds_touch_registration_and_recent_freeze);
 	UT_RUN(test_original_exact_touch_registration_feeds_finish_and_recent_freeze);
