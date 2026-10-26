@@ -11936,6 +11936,146 @@ fixture_recent_xmin_apply(QualifiedXminFixture *f,
 		&f->admission, targets, count, FullTransactionIdFromEpochAndXid(1, 100), 10);
 }
 
+/* The original collector phase now forbids a caller-owned heap pin. Join
+ * its complete body directly to the recent-resident native entry, without
+ * the older fixture wrapper's synthetic restoration of a pinned caller. */
+static bool
+phase_then_recent_native_owned(QualifiedXminFixture *f, LVRelState *v)
+{
+	volatile bool applied = false;
+
+	UT_ASSERT_EQ(backend_pin_count, 0);
+	UT_ASSERT(!local_x && !local_share && !phase_pin_released);
+	PG_TRY();
+	{
+		bool rows_current = false;
+		ClusterHeapFreezeProofStatusV1 status;
+
+		phase_pin_released = true;
+		status = phase_actual_admitted(v, 1, &f->authority,
+			f->fence.master_sequence, &f->admission, &rows_current);
+		phase_pin_released = false;
+		UT_ASSERT_EQ(backend_pin_count, 0);
+		if (status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN && rows_current
+			&& v->shared_freeze_xmin_candidates.target_count > 0)
+		{
+			phase_copy_to_native(f, v);
+			applied = fixture_recent_xmin_apply(f,
+				v->shared_freeze_xmin_candidates.targets,
+				v->shared_freeze_xmin_candidates.target_count);
+		}
+	}
+	PG_FINALLY();
+	{
+		phase_pin_released = false;
+		phase_finally_calls++;
+		phase_finally_debt = pg_atomic_read_u32(&native_admission_shared.inflight
+			[CLUSTER_SEMANTIC_TARGET_SIDE][bounds_lifecycle_feature()]);
+		phase_finally_pins = backend_pin_count;
+		phase_finally_owned_writer = local_x || resumed_writer;
+		bounds_original_census_leave(&f->admission);
+	}
+	PG_END_TRY();
+	return applied;
+}
+
+UT_TEST(test_pin_free_admitted_phase_reaches_recent_native_wal_before_owner_leave)
+{
+	for (unsigned batch = 0; batch < 2; batch++)
+	{
+		QualifiedXminFixture f;
+		LVRelState v;
+		ClusterHeapFreezeXminTargetV1 targets[3];
+
+		phase_setup(&f, &v, targets, batch != 0);
+		/* Model the caller's already completed release, never restore it. */
+		backend_pin_count = 0;
+		relation_data.rd_isvalid = resume_allowed = true;
+		UT_ASSERT(phase_then_recent_native_owned(&f, &v));
+		UT_ASSERT_EQ(phase_preflights, 1);
+		UT_ASSERT_EQ(phase_resolves, f.page.carrier_request_count);
+		UT_ASSERT_EQ(phase_rechecks, 1);
+		UT_ASSERT_EQ(recent_pin_calls, 1); UT_ASSERT_EQ(recent_unpins, 1);
+		UT_ASSERT_EQ(conditional_resumes, 1); UT_ASSERT_EQ(conditional_unlocks, 1);
+		UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1);
+		UT_ASSERT_EQ(phase_finally_calls, 1); UT_ASSERT_EQ(phase_finally_debt, 1);
+		UT_ASSERT_EQ(phase_finally_pins, 0); UT_ASSERT(!phase_finally_owned_writer);
+		UT_ASSERT_EQ(backend_pin_count, 0);
+		UT_ASSERT(!recent_pin_held && !local_x && !resumed_writer);
+		bounds_lifecycle_assert_empty(&f.admission);
+	}
+}
+
+UT_TEST(test_pin_free_phase_recent_refusal_retires_only_its_original_owner)
+{
+	for (unsigned batch = 0; batch < 2; batch++)
+	{
+		for (unsigned fault = 0; fault < 3; fault++)
+		{
+			QualifiedXminFixture f;
+			LVRelState v;
+			ClusterHeapFreezeXminTargetV1 targets[3];
+
+			phase_setup(&f, &v, targets, batch != 0);
+			backend_pin_count = 0;
+			relation_data.rd_isvalid = true;
+			recent_pin_allowed = fault != 0; resume_allowed = fault != 1;
+			if (fault == 2) authority_current = false;
+			UT_ASSERT(!phase_then_recent_native_owned(&f, &v));
+			UT_ASSERT_EQ(phase_preflights, 1); UT_ASSERT_EQ(phase_rechecks, 1);
+			UT_ASSERT_EQ(recent_pin_calls, 1); UT_ASSERT_EQ(recent_unpins, fault != 0);
+			UT_ASSERT_EQ(phase_finally_calls, 1); UT_ASSERT_EQ(phase_finally_debt, 1);
+			UT_ASSERT_EQ(phase_finally_pins, 0); UT_ASSERT(!phase_finally_owned_writer);
+			UT_ASSERT_EQ(backend_pin_count, 0);
+			UT_ASSERT(!recent_pin_held && !local_x && !resumed_writer);
+			UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+			UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+			bounds_lifecycle_assert_empty(&f.admission);
+		}
+	}
+}
+
+UT_TEST(test_pin_free_phase_recent_errors_unwind_pin_before_original_owner_leave)
+{
+	for (unsigned batch = 0; batch < 2; batch++)
+	{
+		for (unsigned stage = 1; stage <= 5; stage++)
+		{
+			/* The longjmp modifies pointees, not automatic fixture objects. */
+			QualifiedXminFixture *f = calloc(1, sizeof(*f));
+			LVRelState *v = calloc(1, sizeof(*v));
+			ClusterHeapFreezeXminTargetV1 targets[3];
+
+			UT_ASSERT(f != NULL && v != NULL);
+			phase_setup(f, v, targets, batch != 0);
+			backend_pin_count = 0;
+			relation_data.rd_isvalid = resume_allowed = true;
+			if (stage <= 3) phase_error_stage = stage;
+			if (stage == 4) recent_pin_error = true;
+			if (stage == 5) error_after_ledger_bind = true;
+			expecting_error = true;
+			if (setjmp(error_jump) == 0)
+			{
+				(void) phase_then_recent_native_owned(f, v);
+				UT_ASSERT(false);
+			}
+			expecting_error = false;
+			UT_ASSERT_EQ(phase_finally_calls, 1); UT_ASSERT_EQ(phase_finally_debt, 1);
+			UT_ASSERT_EQ(phase_finally_pins, 0); UT_ASSERT(!phase_finally_owned_writer);
+			UT_ASSERT_EQ(recent_pin_calls, stage >= 4);
+			UT_ASSERT_EQ(recent_unpins, stage == 5);
+			UT_ASSERT_EQ(backend_pin_count, 0);
+			UT_ASSERT(!recent_pin_held && !local_x && !resumed_writer);
+			UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+			UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+			UT_ASSERT(cluster_bufmgr_pcm_x_writer_find(GetBufferDescriptor(0)) == NULL);
+			UT_ASSERT(PG_exception_stack == NULL && error_context_stack == NULL);
+			bounds_lifecycle_assert_empty(&f->admission);
+			free(v); free(f);
+		}
+	}
+}
+
 UT_TEST(test_recent_xmin_pin_continues_original_admission_to_native_wal)
 {
 	for (int batch = 0; batch < 2; batch++) {
@@ -12140,8 +12280,11 @@ UT_TEST(test_recent_xmin_share_lock_refusal_keeps_borrowed_pin_without_upgrade)
 int
 main(void)
 {
-	UT_PLAN(287);
+	UT_PLAN(290);
 
+	UT_RUN(test_pin_free_admitted_phase_reaches_recent_native_wal_before_owner_leave);
+	UT_RUN(test_pin_free_phase_recent_refusal_retires_only_its_original_owner);
+	UT_RUN(test_pin_free_phase_recent_errors_unwind_pin_before_original_owner_leave);
 	UT_RUN(test_recent_xmin_success_preserves_preowned_pin_and_writer);
 	UT_RUN(test_recent_xmin_errors_keep_borrowed_pin_and_writer_scope);
 	UT_RUN(test_recent_xmin_share_lock_refusal_keeps_borrowed_pin_without_upgrade);
