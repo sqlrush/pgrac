@@ -51,11 +51,15 @@ extern bool visibilitymap_pin_ok(BlockNumber heapBlk, Buffer vmbuf);
 #ifdef USE_PGRAC_CLUSTER
 /* PGRAC: callers copy this identity before acquiring page content locks. */
 struct ClusterSpaceIdentity;
+struct ClusterSpaceIdentityObservationV1;
 /* Both exact native content-X/ACTIVE writer brackets are caller-owned.
+ * Pass the original operation's SPACE observation, captured before waiting;
+ * the setter checks it locally before any page version or WAL publication.
  * No I/O, locking, page initialization or general tuple visibility proof.
  * False preserves both pages; true includes an already-qualified no-op. */
 extern bool visibilitymap_set_empty(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
-								   Buffer vmBuf, const struct ClusterSpaceIdentity *identity);
+								   Buffer vmBuf,
+								   const struct ClusterSpaceIdentityObservationV1 *observation);
 /* True only after exact shared VM replay; false selects native nonshared redo. */
 extern bool visibilitymap_set_versioned_redo(struct XLogReaderState *record,
 											RelFileLocator locator, BlockNumber heapBlk,

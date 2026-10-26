@@ -2381,10 +2381,13 @@ test_cluster_vm_empty_scan.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy
 	mv $@.tmp $@
 
 test_cluster_vm_empty_set.inc: $(top_srcdir)/src/backend/access/heap/visibilitymap.c Makefile
+	@awk '/^visibilitymap_set_empty\(/ { signature=1 } \
+	     signature && /ClusterSpaceIdentityObservationV1/ { found++ } \
+	     signature && /^{/ { signature=0 } END { if (found == 1) print "#define FIXTURE_HAS_VM_EMPTY_OBSERVATION 1"; else if (found > 1) exit 1 }' $< > $@.tmp
 	awk '/^vm_redo_page_valid\(/ { print "static bool"; emit=1; found++ } \
 	     /^visibilitymap_get_status_pinned\(/ { print "bool"; emit=1; found++ } \
 	     /^visibilitymap_set_empty\(/ { print "bool"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 3 || emit) exit 1 }' $< > $@.tmp
+	     emit { print } /^}/ { emit=0 } END { if (found != 3 || emit) exit 1 }' $< >> $@.tmp
 	mv $@.tmp $@
 
 test_cluster_vm_repair_versioned.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile

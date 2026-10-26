@@ -704,7 +704,7 @@ visibilitymap_set_retry_aware(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
  * or initialize a page here. The original visible WAL couples both versions. */
 bool
 visibilitymap_set_empty(Relation rel, BlockNumber heapBlk, Buffer heapBuf, Buffer vmBuf,
-						const ClusterSpaceIdentity *identity)
+						const ClusterSpaceIdentityObservationV1 *observation)
 {
 	ResourceXWriterUseContext writer;
 	uint64 object_revision;
@@ -712,6 +712,7 @@ visibilitymap_set_empty(Relation rel, BlockNumber heapBlk, Buffer heapBuf, Buffe
 	Page page;
 	PageHeader header;
 	RfPageProducerComponentV1 heap_component, vm_component;
+	const ClusterSpaceIdentity *identity = observation != NULL ? &observation->identity : NULL;
 
 	if (rel == NULL || identity == NULL || InRecovery || !cluster_heap_maintenance_restricted(rel)
 		|| !cluster_shared_config || rel->rd_rel->relpersistence != RELPERSISTENCE_PERMANENT
@@ -719,7 +720,8 @@ visibilitymap_set_empty(Relation rel, BlockNumber heapBlk, Buffer heapBuf, Buffe
 		|| heapBlk == InvalidBlockNumber || !vm_buffer_matches(rel, heapBuf, MAIN_FORKNUM, heapBlk)
 		|| !vm_buffer_matches(rel, vmBuf, VISIBILITYMAP_FORKNUM, HEAPBLK_TO_MAPBLOCK(heapBlk))
 		|| !ClusterBufferCaptureMutationContext(heapBuf, &writer, &object_revision, &object_checked)
-		|| !ClusterBufferCaptureMutationContext(vmBuf, &writer, &object_revision, &object_checked))
+		|| !ClusterBufferCaptureMutationContext(vmBuf, &writer, &object_revision, &object_checked)
+		|| !cluster_space_relation_identity_current_v1(rel, observation))
 		return false;
 
 	page = BufferGetPage(heapBuf);

@@ -766,8 +766,38 @@ run_set(Relation rel, BlockNumber heapBlk, Buffer heapBuf, XLogRecPtr recptr, Bu
 #include "test_cluster_vm_visible_body.inc"
 #define visibilitymap_set_locked run_set
 #include "test_cluster_vm_visible_wrapper.inc"
+static bool
+fixture_empty_identity_current(Relation rel,
+							   const ClusterSpaceIdentityObservationV1 *expected) pg_attribute_unused();
+#define cluster_space_relation_identity_current_v1 fixture_empty_identity_current
 #include "test_cluster_vm_empty_set.inc"
+#undef cluster_space_relation_identity_current_v1
 #undef visibilitymap_set_locked
+
+/* Adapt only the argument type when executing the unchanged parent setter. */
+static bool
+fixture_set_empty_observed(const ClusterSpaceIdentityObservationV1 *observation)
+{
+#ifdef FIXTURE_HAS_VM_EMPTY_OBSERVATION
+	return visibilitymap_set_empty(&relation, 0, 1, 2, observation);
+#else
+	return visibilitymap_set_empty(&relation, 0, 1, 2,
+								   observation != NULL ? &observation->identity : NULL);
+#endif
+}
+
+/* Original direct-entry negative cases keep their input mutations. */
+static bool
+fixture_set_empty_identity(Relation rel, BlockNumber heapblk, Buffer heapbuf, Buffer vmbuf,
+						   const ClusterSpaceIdentity *input)
+{
+	ClusterSpaceIdentityObservationV1 observation = {0};
+
+	UT_ASSERT(rel == &relation && heapblk == 0 && heapbuf == 1 && vmbuf == 2);
+	observation.identity = *input;
+	observation.invalidations = empty_identity_generation;
+	return fixture_set_empty_observed(&observation);
+}
 
 	static void reset(bool shared, bool visible, uint8 vm_bits)
 {
@@ -1300,10 +1330,6 @@ static bool
 fixture_empty_identity_capture(Relation rel, const ClusterSpaceIdentity *input,
 							   ClusterSpaceIdentityObservationV1 *out) pg_attribute_unused();
 static bool
-fixture_empty_identity_current(Relation rel,
-							   const ClusterSpaceIdentityObservationV1 *expected) pg_attribute_unused();
-
-static bool
 fixture_empty_identity_capture(Relation rel, const ClusterSpaceIdentity *input,
 							   ClusterSpaceIdentityObservationV1 *out)
 {
@@ -1324,7 +1350,9 @@ fixture_empty_identity_current(Relation rel, const ClusterSpaceIdentityObservati
 	UT_ASSERT(rel == &relation && held[0] && held[1]);
 	UT_ASSERT_EQ(CritSectionCount, 0);
 	empty_identity_checks++;
-	return empty_identity_available && expected->invalidations == empty_identity_generation;
+	return empty_identity_available && expected != NULL
+		   && expected->invalidations == empty_identity_generation
+		   && memcmp(&expected->identity, &identity, sizeof(identity)) == 0;
 }
 
 #define cluster_space_relation_identity_cached_capture_v1 fixture_empty_identity_capture
@@ -1529,7 +1557,7 @@ UT_TEST(test_empty_direct_entry_requires_both_original_writers_and_exact_tags)
 				state.identity.key.database_incarnation++;
 				break;
 			}
-		UT_ASSERT(!visibilitymap_set_empty(&relation, 0, 1, 2, &state.identity));
+		UT_ASSERT(!fixture_set_empty_identity(&relation, 0, 1, 2, &state.identity));
 		UT_ASSERT_EQ(inserts + edge_count + dirty[0] + dirty[1], 0);
 		UT_ASSERT_EQ(next_token, 100);
 		UT_ASSERT(memcmp(before, pages, sizeof(pages)) == 0);
@@ -1583,7 +1611,7 @@ UT_TEST(test_empty_direct_entry_rejects_nonempty_new_and_malformed_heap)
 			break;
 		}
 		memcpy(before, pages, sizeof(pages));
-		UT_ASSERT(!visibilitymap_set_empty(&relation, 0, 1, 2, &state.identity));
+		UT_ASSERT(!fixture_set_empty_identity(&relation, 0, 1, 2, &state.identity));
 		UT_ASSERT_EQ(inserts + edge_count + dirty[0] + dirty[1], 0);
 		UT_ASSERT_EQ(next_token, 100);
 		UT_ASSERT(memcmp(before, pages, sizeof(pages)) == 0);
@@ -2180,10 +2208,67 @@ UT_TEST(test_empty_publication_current_identity_keeps_exact_positive_wal)
 	UT_ASSERT(!pinned[0] && pinned[1] && !held[0] && !held[1]);
 }
 
+UT_TEST(test_empty_direct_setter_refuses_absent_stale_and_zero_observation)
+{
+	for (int reason = 0; reason < 4; reason++) {
+		LVRelState state = empty_reset(false, VISIBILITYMAP_VALID_BITS << 2);
+		ClusterSpaceIdentityObservationV1 observation;
+
+		UT_ASSERT(fixture_empty_identity_capture(&relation, &state.identity, &observation));
+		held[1] = writer[0] = writer[1] = true;
+		if (reason == 1)
+			empty_identity_available = false;
+		else if (reason == 2)
+			empty_identity_generation++;
+		else if (reason == 3)
+			memset(&observation, 0, sizeof(observation));
+		UT_ASSERT(!fixture_set_empty_observed(reason == 0 ? NULL : &observation));
+		UT_ASSERT(memcmp(pages, before, sizeof(pages)) == 0);
+		UT_ASSERT_EQ(inserts + edge_count + dirty[0] + dirty[1], 0);
+		UT_ASSERT_EQ(next_token, 100);
+		UT_ASSERT(held[0] && held[1] && pinned[0] && pinned[1] && writer[0] && writer[1]);
+	}
+}
+
+UT_TEST(test_empty_direct_setter_refuses_replaced_original_identity)
+{
+	LVRelState state = empty_reset(false, VISIBILITYMAP_VALID_BITS << 2);
+	ClusterSpaceIdentityObservationV1 observation;
+
+	UT_ASSERT(fixture_empty_identity_capture(&relation, &state.identity, &observation));
+	observation.identity.sequence++;
+	held[1] = writer[0] = writer[1] = true;
+	UT_ASSERT(!fixture_set_empty_observed(&observation));
+	UT_ASSERT(memcmp(pages, before, sizeof(pages)) == 0);
+	UT_ASSERT_EQ(inserts + edge_count + dirty[0] + dirty[1], 0);
+	UT_ASSERT_EQ(next_token, 100);
+	UT_ASSERT(held[0] && held[1] && pinned[0] && pinned[1] && writer[0] && writer[1]);
+}
+
+UT_TEST(test_empty_direct_setter_current_observation_keeps_wal_and_qualified_noop)
+{
+	for (int noop = 0; noop < 2; noop++) {
+		LVRelState state = empty_reset(noop != 0,
+			VISIBILITYMAP_VALID_BITS << 2 | (noop ? VISIBILITYMAP_VALID_BITS : 0));
+		ClusterSpaceIdentityObservationV1 observation;
+
+		UT_ASSERT(fixture_empty_identity_capture(&relation, &state.identity, &observation));
+		held[1] = writer[0] = writer[1] = true;
+		UT_ASSERT(fixture_set_empty_observed(&observation));
+		UT_ASSERT_EQ(empty_identity_checks, 1);
+		UT_ASSERT_EQ(inserts, !noop);
+		UT_ASSERT_EQ(edge_count, noop ? 0 : 2);
+		UT_ASSERT_EQ(next_token, noop ? 100 : 101);
+		UT_ASSERT(PageIsAllVisible(pages[0].data));
+		UT_ASSERT_EQ((uint8)*PageGetContents(pages[1].data), 15);
+		UT_ASSERT(held[0] && held[1] && pinned[0] && pinned[1] && writer[0] && writer[1]);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(47);
+	UT_PLAN(50);
 	UT_RUN(test_visible_exact_two_page_batch);
 	UT_RUN(test_no_change_allocates_no_version);
 	UT_RUN(test_nonshared_preserves_native_hint_lsn_rules);
@@ -2231,6 +2316,9 @@ main(void)
 	UT_RUN(test_empty_publication_missing_original_identity_preserves_pages_and_scope);
 	UT_RUN(test_empty_publication_rejects_identity_drift_across_each_acquisition);
 	UT_RUN(test_empty_publication_current_identity_keeps_exact_positive_wal);
+	UT_RUN(test_empty_direct_setter_refuses_absent_stale_and_zero_observation);
+	UT_RUN(test_empty_direct_setter_refuses_replaced_original_identity);
+	UT_RUN(test_empty_direct_setter_current_observation_keeps_wal_and_qualified_noop);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
