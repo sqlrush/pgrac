@@ -2548,6 +2548,44 @@ test_cluster_heap_freeze_cohort_current.inc: $(top_srcdir)/src/backend/cluster/c
 	     END { if (found != 2 || done != 2 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Original local observation fold and its before/after-end-clock guards.
+test_cluster_heap_freeze_cohort_observe.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_horizon_ic.c Makefile
+	@awk '/^typedef struct UndoHorizonV2MaintenanceObservation / { types=1; typecount++ } \
+	     types { print } /^} UndoHorizonV2MaintenanceObservation;/ { types=0 } \
+	     /^undo_horizon_local_source_current\(/ { print "static bool"; emit=1; found++ } \
+	     /^undo_horizon_v2_cohort_current\(/ { print "static ClusterHeapFreezeCohortStatus"; emit=1; found++ } \
+	     /^undo_horizon_v2_cohort_observe\(/ { seen++; if (seen == 2) { print "static ClusterHeapFreezeCohortStatus"; emit=1; found++ } } \
+	     /^cluster_heap_freeze_cohort_observe\(/ { print "static ClusterHeapFreezeCohortStatus"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (typecount != 1 || types || seen != 2 || found != 4 || done != 4 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_freeze_local_history.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_horizon_ic.c Makefile
+	@awk '/^undo_horizon_sample_local_report\(/ { print "static bool"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_freeze_scn_total.inc: $(top_srcdir)/src/backend/cluster/cluster_scn.c Makefile
+	@awk '/^scn_total_cmp\(/ { print "static int"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_freeze_mrp_source.inc: $(top_srcdir)/src/backend/cluster/cluster_mrp.c Makefile
+	@awk '/^cluster_mrp_(config_allows_start|should_start)\(/ { print "static bool"; emit=1; found++ } \
+	     /^cluster_mrp_publish_consistent_scn\(/ { print "static void"; emit=1; found++ } \
+	     /^cluster_mrp_standby_consistent_scn\(/ { print "static SCN"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (found != 4 || done != 4 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_freeze_retention_min.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_retention.c Makefile
+	@awk '/^cluster_undo_retention_sample_min\(/ { print "static SCN"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 # Original source-current predicate, private to the native writer fixture.
 test_cluster_heap_freeze_policy_current.inc: $(top_srcdir)/src/backend/cluster/cluster_heap_horizon.c Makefile
 	@awk '/^cluster_heap_freeze_policy_sample_current_v1\(/ { print "static bool"; emit=1; found++ } \
@@ -2613,6 +2651,72 @@ test_cluster_heap_ctrc_origin.inc: $(top_srcdir)/src/backend/cluster/cluster_ter
 	     END { if (stats != 2 || found != 8 || done != 8 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Full original participant/receipt publication closure; production bodies,
+# scoped by the fixture, with exact function-count and completion gates.
+test_cluster_heap_ctrc_participant.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
+	@awk 'BEGIN { pattern = "^(cluster_ctrc_origin_has_exact_touch|cluster_ctrc_origin_record_touched|cluster_ctrc_participant_index_compute|cluster_ctrc_participant_open|cluster_ctrc_receipt_prepare_shared_observed|ctrc_allocate_journal_sequence|ctrc_origin_protects_local_receipt_locked|ctrc_participant_identity_valid|ctrc_participant_index|ctrc_participant_locks_acquire|ctrc_participant_locks_release|ctrc_participant_receipt_heads|ctrc_publication_prepare_valid|ctrc_publication_request_equal|ctrc_receipt_chain_exact_locked|ctrc_receipt_entries|ctrc_receipt_handle_fill|ctrc_receipt_hash_bytes|ctrc_receipt_links|ctrc_receipt_prepare_existing_locked|ctrc_receipt_prepare_locators_valid_locked|ctrc_receipt_prepare_refused|ctrc_receipt_prepare_shared_internal|ctrc_receipt_prepare_table_observed|ctrc_receipt_prepare_with_sequence|ctrc_receipt_probe_hash|ctrc_receipt_probe_states|ctrc_receipt_publication_matches|ctrc_relation_namespace_valid|ctrc_target_pending_itl_valid|ctrc_target_pending_offnum_valid|ctrc_target_predecessor_version_valid)\\(" } \
+	     $$0 ~ pattern { name=$$0; sub(/\(.*/, "", name); if (seen[name]++) exit 1; order[++found]=name; ret=prev; sub(/^static[ \t]+/, "", ret); returns[name]="static " ret; emit=1; head=1 } \
+	     emit { body[name]=body[name] $$0 "\n"; if (/^\{/) head=0; else if (head) declaration[name]=declaration[name] $$0 "\n" } \
+	     emit && /^}/ { emit=0; done++ } { prev=$$0 } \
+	     END { if (found != 32 || done != 32 || emit) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Original receipt apply/cancel bookkeeping and exact-handle/target checks.
+test_cluster_heap_ctrc_terminal.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
+	@awk 'BEGIN { pattern = "^(cluster_ctrc_page_version_order|cluster_ctrc_pending_itl_target_recheck|cluster_ctrc_receipt_apply_prepared|cluster_ctrc_receipt_apply_shared|cluster_ctrc_receipt_cancel_prepared|cluster_ctrc_receipt_cancel_shared|ctrc_bytes_nonzero|ctrc_receipt_handle_exact|ctrc_target_exact_itl_valid|ctrc_target_exact_tid_valid|ctrc_target_itl_finalizes_exact|ctrc_target_itl_finalizes_prepared|ctrc_target_offnum_finalizes_exact)\\(" } \
+	     $$0 ~ pattern { name=$$0; sub(/\(.*/, "", name); if (seen[name]++) exit 1; order[++found]=name; ret=prev; sub(/^static[ \t]+/, "", ret); returns[name]="static " ret; emit=1; head=1 } \
+	     emit { body[name]=body[name] $$0 "\n"; if (/^\{/) head=0; else if (head) declaration[name]=declaration[name] $$0 "\n" } \
+	     emit && /^}/ { emit=0; done++ } { prev=$$0 } \
+	     END { if (found != 13 || done != 13 || emit) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Original certificate consumer/reclaim closure; skip the original forward declaration.
+test_cluster_heap_ctrc_certificate.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
+	@awk 'BEGIN { pattern = "^(ctrc_put_u16_le|ctrc_put_u32_le|ctrc_put_u64_le|ctrc_get_u32_le|ctrc_crc32c_exact|ctrc_txn_key_encode|ctrc_seal_suboperation_valid|ctrc_local_ack_shape_valid|cluster_ctrc_local_release_ack_encode|ctrc_semantic_progress|ctrc_participant_ack_entries|ctrc_reclaim_work_find|ctrc_receipts_reclaim_validate|ctrc_receipt_collapse_deleted_probe|ctrc_receipts_reclaim_shared_locked|ctrc_ack_bytes_exact|ctrc_frozen_ack_summary_exact|cluster_ctrc_participant_request_apply|ctrc_participant_certificate_batch_apply_shared|cluster_ctrc_participant_certificate_batch_shared|cluster_ctrc_participant_close_or_tombstone|cluster_ctrc_participant_close)\\(" } \
+	     /^const uint8 cluster_ctrc_empty_sha256\[32\] = \{/ { constant=1; constants++; print "static " $$0; next } \
+	     constant { print; if (/^};/) constant=0; next } \
+	     $$0 ~ pattern { name=$$0; sub(/\(.*/, "", name); ret=prev; sub(/^static[ \t]+/, "", ret); candidate=1; head=1; text=""; decl="" } \
+	     candidate { text=text $$0 "\n"; if (/^\{/) { head=0; if (seen[name]++) exit 1; order[++found]=name; returns[name]="static " ret } else if (head) { decl=decl $$0 "\n"; if (/;[ \t]*$$/) candidate=0 } } \
+	     candidate && /^}/ { candidate=0; body[name]=text; declaration[name]=decl; done++ } { prev=$$0 } \
+	     END { if (found != 22 || done != 22 || candidate || constant || constants != 1) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Original nonempty ACK producer, actual two captures/hash/final freeze and cleanup.
+test_cluster_heap_ctrc_ack.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
+	@awk 'BEGIN { pattern = "^(ctrc_tlv_bytes|ctrc_tlv_u8|ctrc_tlv_u16|ctrc_tlv_u32|ctrc_tlv_u64|ctrc_publication_id_encode|ctrc_target_encode|ctrc_cleaner_owns_key|ctrc_scan_limit|ctrc_scan_charge|ctrc_participant_scan_lock_mask|ctrc_receipt_snapshot_valid|ctrc_receipt_row_encode|ctrc_receipt_key_sequence_cmp|ctrc_receipt_durability_covered|cluster_ctrc_participant_ack_from_snapshot|ctrc_participant_find_ack_ready|ctrc_participant_capture_durability|ctrc_ack_batch_inputs|ctrc_ack_participant_exact|ctrc_ack_block_if_same|ctrc_ack_work_find|ctrc_participant_copy_ack_batch|ctrc_participant_freeze_ack_batch_exact|ctrc_participant_freeze_ack_batch_shared)\\(" } \
+	     /^#define (CTRC_CLEANER_ACK_BATCH|CTRC_PARTICIPANT_ALL_SHARDS) / { print; constants++ } \
+	     /^typedef struct CtrcAckWork \{/ { structure=1; structures++ } \
+	     structure { print; if (/^} CtrcAckWork;/) structure=0; next } \
+	     $$0 ~ pattern { name=$$0; sub(/\(.*/, "", name); ret=prev; sub(/^static[ \t]+/, "", ret); candidate=1; head=1; text=""; decl="" } \
+	     candidate { text=text $$0 "\n"; if (/^\{/) { head=0; if (seen[name]++) exit 1; order[++found]=name; returns[name]="static " ret } else if (head) { decl=decl $$0 "\n"; if (/;[ \t]*$$/) candidate=0 } } \
+	     candidate && /^}/ { candidate=0; body[name]=text; declaration[name]=decl; done++ } { prev=$$0 } \
+	     END { if (found != 25 || done != 25 || candidate || structure || structures != 1 || constants != 2) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Original volatile origin/inbox terminal edge; canonical block0 publisher is separate.
+test_cluster_heap_ctrc_origin_reply.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
+	@awk '/^typedef struct CtrcOriginBatchReplyTrace CtrcOriginBatchReplyTrace;/ { print; forward++ } \
+	     /^typedef struct CtrcOriginBatchTraceState / { emit=1; state++ } \
+	     /^struct CtrcOriginBatchReplyTrace / { emit=1; batch++ } \
+	     /^static uint64 CtrcReplyTrace(Sequence|UnsafeSkipped);/ { print; counters++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (forward != 1 || state != 1 || batch != 1 || counters != 2 || emit) exit 1 }' $< > $@.tmp
+	@awk 'BEGIN { pattern = "^(ctrc_origin_reply_trace_lock|ctrc_origin_reply_trace|ctrc_origin_batch_trace_state|ctrc_origin_batch_trace_before|ctrc_origin_batch_trace_after|ctrc_origin_ack_entries|ctrc_origin_ack_index|ctrc_origin_frozen_touch_set_valid|cluster_ctrc_origin_begin_seal_entry|cluster_ctrc_origin_arm_close_entry|cluster_ctrc_origin_note_close_reply_entry|cluster_ctrc_origin_begin_cleaning_entry|cluster_ctrc_origin_ack_land_entry|ctrc_origin_ack_land_locked|cluster_ctrc_origin_ack_land_shared|cluster_ctrc_origin_certificate_validate|cluster_ctrc_origin_certificate_snapshot_entry|cluster_ctrc_origin_certificate_commit_entry|ctrc_origin_certificate_snapshot_index_locked|ctrc_origin_certificate_commit_shared|cluster_ctrc_origin_arm_certificate_entry|cluster_ctrc_origin_note_certificate_reply_entry|ctrc_origin_release_reclaim_locked|ctrc_origin_note_certificate_match_locked|cluster_ctrc_origin_note_certificate_reply_shared)\\(" } \
+	     $$0 ~ pattern { name=$$0; sub(/\(.*/, "", name); ret=prev; sub(/^static[ \t]+/, "", ret); candidate=1; head=1; text=""; decl="" } \
+	     candidate { text=text $$0 "\n"; if (/^\{/) { head=0; if (seen[name]++) exit 1; order[++found]=name; returns[name]="static " ret } else if (head) { decl=decl $$0 "\n"; if (/;[ \t]*$$/) candidate=0 } } \
+	     candidate && /^}/ { candidate=0; body[name]=text; declaration[name]=decl; done++ } { prev=$$0 } \
+	     END { if (found != 25 || done != 25 || candidate) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $< >> $@.tmp
+	mv $@.tmp $@
+
+# Exact original certificate publisher; I/O and scheduling leaves are controlled.
+test_cluster_heap_ctrc_durable_certificate.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c $(top_srcdir)/src/backend/cluster/storage/cluster_undo_block0.c Makefile
+	@awk 'BEGIN { pattern = "^(cluster_ctrc_origin_certificate_digest|ctrc_origin_certificate_snapshot_matches_shared|ctrc_cleaner_publish_certificate|cluster_undo_block0_root_valid|cluster_undo_block0_root_matches|cluster_undo_block0_generation_matches)\\(" } \
+	     $$0 ~ pattern { name=$$0; sub(/\(.*/, "", name); ret=prev; sub(/^static[ \t]+/, "", ret); candidate=1; head=1; text=""; decl="" } \
+	     candidate { text=text $$0 "\n"; if (/^\{/) { head=0; if (seen[name]++) exit 1; order[++found]=name; returns[name]="static " ret } else if (head) { decl=decl $$0 "\n"; if (/;[ \t]*$$/) candidate=0 } } \
+	     candidate && /^}/ { candidate=0; body[name]=text; declaration[name]=decl; done++ } { prev=$$0 } \
+	     END { if (found != 6 || done != 6 || candidate) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $(filter %.c,$^) > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_heap_ctrc_begin.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
 	@awk '/^cluster_ctrc_active_scan_begin\(/ { print "static bool"; emit=1; found++ } \
 	     emit { print } emit && /^}/ { emit=0; done++ } \
@@ -2646,8 +2750,21 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		$(top_srcdir)/src/include/storage/proclist_types.h $(top_srcdir)/src/include/storage/lwlock.h \
 		test_cluster_heap_ctrc_types.inc test_cluster_heap_ctrc_begin.inc \
 		test_cluster_heap_ctrc_step.inc test_cluster_heap_ctrc_origin.inc \
+		test_cluster_heap_ctrc_participant.inc test_cluster_heap_ctrc_terminal.inc \
+		test_cluster_heap_ctrc_certificate.inc $(top_srcdir)/src/include/port/pg_crc32c.h \
+		test_cluster_heap_ctrc_ack.inc $(top_srcdir)/src/common/sha2_int.h \
+		test_cluster_heap_ctrc_origin_reply.inc \
+		test_cluster_heap_ctrc_durable_certificate.inc \
+		$(top_srcdir)/src/include/utils/memutils.h \
 		test_cluster_heap_freeze_cohort_current.inc \
 		test_cluster_heap_freeze_cohort_backend.inc \
+		test_cluster_heap_freeze_cohort_observe.inc \
+		test_cluster_heap_freeze_local_history.inc test_cluster_retention_sample.inc \
+		test_cluster_heap_freeze_retention_min.inc \
+		test_cluster_heap_freeze_mrp_source.inc \
+		test_cluster_heap_freeze_scn_total.inc \
+		$(top_srcdir)/src/include/cluster/cluster_mrp.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_retention.h \
 		test_cluster_heap_freeze_worker_current.inc \
 		test_cluster_heap_freeze_worker_getter.inc \
 		test_cluster_heap_freeze_worker_publisher.inc \
@@ -2658,13 +2775,15 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_heap_freeze_lease_current.inc \
 		$(top_srcdir)/src/include/cluster/cluster_xid_stripe.h \
 		test_cluster_active_sample_types.inc test_cluster_active_sample_fence.inc \
+		test_cluster_heap_freeze_admission_current.inc \
 		$(top_srcdir)/src/include/cluster/cluster_reconfig.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_cleaner.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_horizon.h \
 		$(top_srcdir)/src/include/cluster/cluster_conf.h \
 		test_cluster_heap_freeze_policy_current.inc \
 		$(top_srcdir)/src/include/cluster/cluster_xid_stripe_boot.h \
-		test_cluster_vacuum_observed_bounds.inc test_cluster_freeze_writer_context.inc $(CLUSTER_RESOURCE_X_IDENTITY_O) test_cluster_heap_maintenance_policy.inc unit_test.h \
+		test_cluster_vacuum_observed_bounds.inc test_cluster_vacuum_freeze_bound_observer.inc \
+		test_cluster_freeze_writer_context.inc $(CLUSTER_RESOURCE_X_IDENTITY_O) test_cluster_heap_maintenance_policy.inc unit_test.h \
 		test_cluster_heap_borrowed_pin.inc $(top_srcdir)/src/include/storage/bufmgr.h \
 		test_cluster_vacuum_freeze_locators.inc \
 		$(top_srcdir)/src/include/cluster/cluster_heap_horizon.h \
@@ -6065,6 +6184,11 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_heap_freeze_policy_sample.inc test_cluster_heap_freeze_policy_sample.inc.tmp
 	rm -f test_cluster_heap_freeze_cohort_current.inc test_cluster_heap_freeze_cohort_current.inc.tmp
 	rm -f test_cluster_heap_freeze_cohort_backend.inc test_cluster_heap_freeze_cohort_backend.inc.tmp
+	rm -f test_cluster_heap_freeze_cohort_observe.inc test_cluster_heap_freeze_cohort_observe.inc.tmp
+	rm -f test_cluster_heap_freeze_local_history.inc test_cluster_heap_freeze_local_history.inc.tmp
+	rm -f test_cluster_heap_freeze_retention_min.inc test_cluster_heap_freeze_retention_min.inc.tmp
+	rm -f test_cluster_heap_freeze_mrp_source.inc test_cluster_heap_freeze_mrp_source.inc.tmp
+	rm -f test_cluster_heap_freeze_scn_total.inc test_cluster_heap_freeze_scn_total.inc.tmp
 	rm -f test_cluster_heap_freeze_worker_current.inc test_cluster_heap_freeze_worker_current.inc.tmp
 	rm -f test_cluster_heap_freeze_worker_getter.inc test_cluster_heap_freeze_worker_getter.inc.tmp
 	rm -f test_cluster_heap_freeze_worker_publisher.inc test_cluster_heap_freeze_worker_publisher.inc.tmp
@@ -6074,6 +6198,12 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_heap_ctrc_types.inc test_cluster_heap_ctrc_types.inc.tmp test_cluster_heap_ctrc_begin.inc test_cluster_heap_ctrc_begin.inc.tmp
 	rm -f test_cluster_heap_ctrc_step.inc test_cluster_heap_ctrc_step.inc.tmp
 	rm -f test_cluster_heap_ctrc_origin.inc test_cluster_heap_ctrc_origin.inc.tmp
+	rm -f test_cluster_heap_ctrc_participant.inc test_cluster_heap_ctrc_participant.inc.tmp
+	rm -f test_cluster_heap_ctrc_terminal.inc test_cluster_heap_ctrc_terminal.inc.tmp
+	rm -f test_cluster_heap_ctrc_certificate.inc test_cluster_heap_ctrc_certificate.inc.tmp
+	rm -f test_cluster_heap_ctrc_ack.inc test_cluster_heap_ctrc_ack.inc.tmp
+	rm -f test_cluster_heap_ctrc_origin_reply.inc test_cluster_heap_ctrc_origin_reply.inc.tmp
+	rm -f test_cluster_heap_ctrc_durable_certificate.inc test_cluster_heap_ctrc_durable_certificate.inc.tmp
 	rm -f test_cluster_heap_ctrc_attachment.inc test_cluster_heap_ctrc_attachment.inc.tmp
 	rm -f test_cluster_heap_ctrc_ready.inc test_cluster_heap_ctrc_ready.inc.tmp
 	rm -f test_cluster_heap_ctrc_init_state.inc test_cluster_heap_ctrc_init_state.inc.tmp
@@ -9722,6 +9852,15 @@ test_cluster_active_sample_types.inc: $(top_srcdir)/src/backend/cluster/cluster_
 	     END { if (count != 3 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Execute the original ordinary TARGET and read-only census admission checks.
+test_cluster_heap_freeze_admission_current.inc: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c Makefile
+	awk '/^semantic_activation_(admission_policy|r4_terminal_census_policy)\(/ { print "static ClusterSemanticAdmissionResult"; emit=1; count++ } \
+	     /^semantic_activation_feature_(bit_)?index\(/ { print "static bool"; emit=1; count++ } \
+	     /^cluster_semantic_activation_recheck(_r4_terminal_census)?\(/ { print "bool"; emit=1; count++ } \
+	     emit { print } /^}$$/ { emit=0 } \
+	     END { if (count != 6 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_active_sample_fence.inc: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c Makefile
 	awk '/^semantic_activation_(snapshot|modifier_policy)\(/ { print "static bool"; emit=1; count++ } \
 	     /^cluster_semantic_activation_active_sample_(capture|current)\(/ { print "bool"; emit=1; count++ } \
@@ -11872,9 +12011,20 @@ test_cluster_vacuum_shared_mx.inc: $(top_srcdir)/src/backend/access/heap/vacuuml
 test_cluster_vacuum_proof_cleanup.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
 	awk '/^lazy_cleanout_shared_freeze_page\(/ { print "static bool"; emit=1; cleanout++ } \
 	     /^lazy_shared_freeze_transport_snapshot\(/ { print "static void"; emit=1; cost++ } \
-	     /^(lazy_recheck_shared_freeze_page|lazy_collect_shared_freeze_proofs)\(/ { print "static ClusterHeapFreezeProofStatusV1"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 2 || cleanout > 1 || cost > 1) exit 1 }' $< > $@.tmp
+	     /^(lazy_recheck_shared_freeze_page|lazy_observe_shared_freeze_bounds|lazy_collect_shared_freeze_proofs)\(/ { print "static ClusterHeapFreezeProofStatusV1"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 3 || cleanout > 1 || cost > 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
+
+test_cluster_vacuum_freeze_bound_observer.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
+	awk '/^lazy_observe_shared_freeze_bounds\(/ { print "static ClusterHeapFreezeProofStatusV1"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+.PHONY: clean-vacuum-freeze-bound-observer
+clean-vacuum-freeze-bound-observer:
+	rm -f test_cluster_vacuum_freeze_bound_observer.inc test_cluster_vacuum_freeze_bound_observer.inc.tmp
+
+clean distclean maintainer-clean: clean-vacuum-freeze-bound-observer
 
 test_cluster_vacuum_proof_cleanout.inc: $(top_srcdir)/src/backend/cluster/cluster_itl_cleanout.c Makefile
 	awk '/^cluster_itl_cleanout_can_stamp\(/ && !found { print "bool"; emit=1; found++ } \
@@ -12577,6 +12727,7 @@ clean distclean maintainer-clean: clean-active-sample-fence
 clean-active-sample-fence:
 	rm -f test_cluster_active_sample_types.inc test_cluster_active_sample_types.inc.tmp
 	rm -f test_cluster_active_sample_fence.inc test_cluster_active_sample_fence.inc.tmp
+	rm -f test_cluster_heap_freeze_admission_current.inc test_cluster_heap_freeze_admission_current.inc.tmp
 
 clean distclean maintainer-clean: clean-retention-sample
 .PHONY: clean-retention-sample

@@ -1920,6 +1920,105 @@ lazy_shared_freeze_transport_snapshot(uint64 *out)
 	}
 }
 
+/* Retain only observations borrowed by this attempt, under its original
+ * entered token. This does not supply F/H provenance or producer retention
+ * qualification and cannot invoke native freeze apply. */
+static ClusterHeapFreezeProofStatusV1
+lazy_observe_shared_freeze_bounds(LVRelState *vacrel,
+								 const ClusterSemanticAdmissionToken *admission,
+								 ClusterHeapFreezeProofStatusV1 status,
+								 ClusterHeapFreezeObservedBoundsV1 *observed_bounds)
+{
+	if (FullTransactionIdIsValid(vacrel->cutoffs.SharedFreezeLimitFull)
+		&& U64FromFullTransactionId(vacrel->cutoffs.SharedFreezeLimitFull) != UINT64_MAX
+		&& TransactionIdIsNormal(XidFromFullTransactionId(vacrel->cutoffs.SharedFreezeLimitFull))
+		&& XidFromFullTransactionId(vacrel->cutoffs.SharedFreezeLimitFull)
+		== vacrel->cutoffs.FreezeLimit
+		&& FullTransactionIdEquals(vacrel->cutoffs.SharedFreezePolicySample.freeze_limit,
+								   vacrel->cutoffs.SharedFreezeLimitFull))
+	{
+		ClusterHeapFreezeCohortObservation cohort;
+		ClusterHeapFreezeCohortStatus cohort_status;
+		bool policy_current;
+		bool cohort_current;
+
+		memset(&cohort, 0, sizeof(cohort));
+		cohort_status = cluster_heap_freeze_cohort_observe(&cohort);
+		policy_current = cohort_status == CLUSTER_HEAP_FREEZE_COHORT_READY
+			&& cluster_heap_freeze_policy_sample_current_v1(&vacrel->cutoffs.SharedFreezePolicySample);
+		/* Recheck the same local/peer publications and H end-clock after
+		 * identity callbacks, then recheck our original entered token. */
+		cohort_current = policy_current
+			&& cluster_heap_freeze_cohort_current(&cohort) == CLUSTER_HEAP_FREEZE_COHORT_READY;
+		if (!cluster_semantic_activation_recheck_r4_terminal_census(admission))
+			status = CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED;
+		else if (cohort_status == CLUSTER_HEAP_FREEZE_COHORT_READY
+				 && cohort_current
+				 && cluster_heap_freeze_observed_bounds_v1(
+					 &vacrel->cutoffs.SharedFreezePolicySample, &cohort,
+					 admission, cluster_node_id, observed_bounds))
+		{
+			SCN wal_clock = cluster_scn_current();
+
+			/* Observe this same H after releasing page/proof ownership.
+			 * The native apply entry only checks the clock under its lock.
+			 * Clock callbacks can invalidate the original protection, so
+			 * repeat the same checks before retaining any candidate. */
+			if (!SCN_VALID(wal_clock)
+				|| scn_time_cmp(wal_clock, observed_bounds->horizon_scn) < 0)
+			{
+				cluster_scn_observe(observed_bounds->horizon_scn);
+				wal_clock = cluster_scn_current();
+				policy_current = cluster_heap_freeze_policy_sample_current_v1(
+					&vacrel->cutoffs.SharedFreezePolicySample);
+				cohort_current = policy_current
+					&& cluster_heap_freeze_cohort_current(&cohort)
+					== CLUSTER_HEAP_FREEZE_COHORT_READY;
+				if (!cluster_semantic_activation_recheck_r4_terminal_census(admission))
+					status = CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED;
+			}
+			if ((status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN
+				 || status == CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN)
+				&& policy_current && cohort_current && SCN_VALID(wal_clock)
+				&& scn_time_cmp(wal_clock, observed_bounds->horizon_scn) >= 0)
+			{
+				bool target_current = cluster_semantic_activation_recheck(admission);
+
+				/* TARGET callbacks may retire the saved source observations.
+				 * Match the same policy/cohort again before retaining them;
+				 * the original census recheck must follow these callbacks. */
+				if (target_current)
+				{
+					policy_current = cluster_heap_freeze_policy_sample_current_v1(
+						&vacrel->cutoffs.SharedFreezePolicySample);
+					cohort_current = policy_current
+						&& cluster_heap_freeze_cohort_current(&cohort)
+						== CLUSTER_HEAP_FREEZE_COHORT_READY;
+				}
+
+				/* Census admission permits proof reads before ordinary TARGET
+				 * writes are open. Only the same token's full TARGET policy
+				 * can retain inputs for later positive freeze admission. */
+				if (!cluster_semantic_activation_recheck_r4_terminal_census(admission))
+					status = CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED;
+				else if (target_current && policy_current && cohort_current)
+				{
+					memcpy(&vacrel->shared_freeze_cohort, &cohort, sizeof(cohort));
+					vacrel->shared_freeze_candidate_limit_full = observed_bounds->freeze_limit;
+					vacrel->shared_freeze_cohort_observed = true;
+					/* Borrow only the owned observations in this original context;
+					 * these companions do not promote candidate F/H to authority. */
+					vacrel->shared_freeze_input.freeze_policy =
+						&vacrel->cutoffs.SharedFreezePolicySample;
+					vacrel->shared_freeze_input.freeze_cohort =
+						&vacrel->shared_freeze_cohort;
+				}
+			}
+		}
+	}
+	return status;
+}
+
 /*
  * Resolve every captured carrier through the terminal-census provider while
  * retaining one R4 admission, then recheck the resident page under local X.
@@ -2079,94 +2178,9 @@ lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
 		 * bounded, read-only cohort observation to this original admission and
 		 * the retained policy bound. Neither grants a positive F/H certificate:
 		 * producer protection/provenance must close before any freeze apply. */
-		if (row_inputs_current && !cleaned
-			&& FullTransactionIdIsValid(vacrel->cutoffs.SharedFreezeLimitFull)
-			&& U64FromFullTransactionId(vacrel->cutoffs.SharedFreezeLimitFull) != UINT64_MAX
-			&& TransactionIdIsNormal(XidFromFullTransactionId(vacrel->cutoffs.SharedFreezeLimitFull))
-			&& XidFromFullTransactionId(vacrel->cutoffs.SharedFreezeLimitFull)
-			== vacrel->cutoffs.FreezeLimit
-			&& FullTransactionIdEquals(vacrel->cutoffs.SharedFreezePolicySample.freeze_limit,
-									   vacrel->cutoffs.SharedFreezeLimitFull))
-		{
-			ClusterHeapFreezeCohortObservation cohort;
-			ClusterHeapFreezeCohortStatus cohort_status;
-			bool policy_current;
-			bool cohort_current;
-
-			memset(&cohort, 0, sizeof(cohort));
-			cohort_status = cluster_heap_freeze_cohort_observe(&cohort);
-			policy_current = cohort_status == CLUSTER_HEAP_FREEZE_COHORT_READY
-				&& cluster_heap_freeze_policy_sample_current_v1(&vacrel->cutoffs.SharedFreezePolicySample);
-			/* Recheck the same local/peer publications and H end-clock after
-			 * identity callbacks, then recheck our original entered token. */
-			cohort_current = policy_current
-				&& cluster_heap_freeze_cohort_current(&cohort) == CLUSTER_HEAP_FREEZE_COHORT_READY;
-			if (!cluster_semantic_activation_recheck_r4_terminal_census(&admission))
-				status = CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED;
-			else if (cohort_status == CLUSTER_HEAP_FREEZE_COHORT_READY
-					 && cohort_current
-					 && cluster_heap_freeze_observed_bounds_v1(
-						 &vacrel->cutoffs.SharedFreezePolicySample, &cohort,
-						 &admission, cluster_node_id, &observed_bounds))
-			{
-				SCN wal_clock = cluster_scn_current();
-
-				/* Observe this same H after releasing page/proof ownership.
-				 * The native apply entry only checks the clock under its lock.
-				 * Clock callbacks can invalidate the original protection, so
-				 * repeat the same checks before retaining any candidate. */
-				if (!SCN_VALID(wal_clock)
-					|| scn_time_cmp(wal_clock, observed_bounds.horizon_scn) < 0)
-				{
-					cluster_scn_observe(observed_bounds.horizon_scn);
-					wal_clock = cluster_scn_current();
-					policy_current = cluster_heap_freeze_policy_sample_current_v1(
-						&vacrel->cutoffs.SharedFreezePolicySample);
-					cohort_current = policy_current
-						&& cluster_heap_freeze_cohort_current(&cohort)
-						== CLUSTER_HEAP_FREEZE_COHORT_READY;
-					if (!cluster_semantic_activation_recheck_r4_terminal_census(&admission))
-						status = CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED;
-				}
-				if ((status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN
-					 || status == CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN)
-					&& policy_current && cohort_current && SCN_VALID(wal_clock)
-					&& scn_time_cmp(wal_clock, observed_bounds.horizon_scn) >= 0)
-				{
-					bool target_current = cluster_semantic_activation_recheck(&admission);
-
-					/* TARGET callbacks may retire the saved source observations.
-					 * Match the same policy/cohort again before retaining them;
-					 * the original census recheck must follow these callbacks. */
-					if (target_current)
-					{
-						policy_current = cluster_heap_freeze_policy_sample_current_v1(
-							&vacrel->cutoffs.SharedFreezePolicySample);
-						cohort_current = policy_current
-							&& cluster_heap_freeze_cohort_current(&cohort)
-							== CLUSTER_HEAP_FREEZE_COHORT_READY;
-					}
-
-					/* Census admission permits proof reads before ordinary TARGET
-					 * writes are open. Only the same token's full TARGET policy
-					 * can retain inputs for later positive freeze admission. */
-					if (!cluster_semantic_activation_recheck_r4_terminal_census(&admission))
-						status = CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED;
-					else if (target_current && policy_current && cohort_current)
-					{
-						memcpy(&vacrel->shared_freeze_cohort, &cohort, sizeof(cohort));
-						vacrel->shared_freeze_candidate_limit_full = observed_bounds.freeze_limit;
-						vacrel->shared_freeze_cohort_observed = true;
-						/* Borrow only the owned observations in this original context;
-						 * these companions do not promote candidate F/H to authority. */
-						vacrel->shared_freeze_input.freeze_policy =
-							&vacrel->cutoffs.SharedFreezePolicySample;
-						vacrel->shared_freeze_input.freeze_cohort =
-							&vacrel->shared_freeze_cohort;
-					}
-				}
-			}
-		}
+		if (row_inputs_current && !cleaned)
+			status = lazy_observe_shared_freeze_bounds(vacrel, &admission, status,
+													&observed_bounds);
 		/* This remains only a physical association, never row-freeze permission. */
 		if (row_inputs_current && !cleaned
 			&& (status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN
