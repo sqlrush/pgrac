@@ -377,6 +377,10 @@ extern uint32 cluster_wal_inputs_relmap_terminal_count_v1(
 	const ClusterRecoveryRelmapSourceV1 *source);
 extern bool cluster_wal_inputs_relmap_terminal_matches_v1(
 	const ClusterRecoveryRelmapSourceV1 *source, const XLogReaderState *reader);
+/* Original sealed native CLOG carriers; UINT32_MAX/false on refusal. */
+extern uint32 cluster_wal_inputs_relmap_clog_count_v1(const ClusterRecoveryRelmapSourceV1 *source);
+extern bool cluster_wal_inputs_relmap_clog_matches_v1(const ClusterRecoveryRelmapSourceV1 *source,
+	const XLogReaderState *reader);
 struct ClusterRecoverySerialRequest;
 /* IR purpose callbacks: validate includes original whole ROOT I/O outside CF;
  * current is no-wait and never calls the IR holder revalidation recursively. */
