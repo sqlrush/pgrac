@@ -404,6 +404,22 @@ typedef struct ClusterRecoveryRelmapPendingXidV1 {
 extern bool cluster_recovery_relmap_history_pending_xid_v1(
 	ClusterRecoveryRelmapHistory *history, const ClusterRelmapV2Image *pending,
 	ClusterRecoveryRelmapPendingXidV1 *out, ClusterRecoveryNativeInventoryDiag *diag);
+/* Strict necessary correspondence within the SAME original physical reread:
+ * one selected generation for this origin, one FULL birth of the exact
+ * pending page/FullXid before its map, and no subsequent same-page ZERO or
+ * any TRUNCATE. Raw/counter inputs remain complete and separately visible.
+ * No earlier era, continuous native lifetime, terminal/SIDE/dual-copy or
+ * COMPLETE/OPEN/release authority follows. The original final conjunction
+ * and recheck are still required. Entered refusal/ERROR fails the original
+ * episode with all native custody/pins/debt retained; ordinary disjoint-output
+ * and caller-lock preconditions preserve it. No caller birth certificate. */
+typedef struct ClusterRecoveryRelmapPendingBirthV1 {
+	ClusterRecoveryRelmapPendingXidV1 inputs;
+	uint32 birth_index;
+} ClusterRecoveryRelmapPendingBirthV1;
+extern bool cluster_recovery_relmap_history_pending_birth_v1(
+	ClusterRecoveryRelmapHistory *history, const ClusterRelmapV2Image *pending,
+	ClusterRecoveryRelmapPendingBirthV1 *out, ClusterRecoveryNativeInventoryDiag *diag);
 extern void cluster_recovery_relmap_history_destroy_v1(ClusterRecoveryRelmapHistory **history);
 
 /* Borrow the original startup cold scope for two complete physical passes.

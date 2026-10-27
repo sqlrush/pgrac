@@ -1087,6 +1087,7 @@ cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **held)
 #include "test_cluster_recovery_episode_xid.inc"
 #include "test_cluster_recovery_episode_clog_history.inc"
 #include "test_cluster_recovery_episode_clog_birth.inc"
+#include "test_cluster_recovery_episode_birth_match.inc"
 #include "test_cluster_recovery_episode_generation_xid.inc"
 #include "test_cluster_recovery_clog_full_roots.inc"
 
@@ -1098,6 +1099,15 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_EPISODE_BIRTH_MATCH") != NULL) {
+		UT_PLAN(5);
+		UT_RUN(test_episode_birth_match_retains_original_source_counter_and_complete_input);
+		UT_RUN(test_episode_birth_match_refuses_absent_legacy_wrong_era_and_other_page);
+		UT_RUN(test_episode_birth_match_rejects_duplicate_late_birth_reset_and_truncate);
+		UT_RUN(test_episode_birth_match_preconditions_preserve_original_query_and_custody);
+		UT_RUN(test_episode_birth_match_owner_error_keeps_original_held_fd_and_pins);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_EPISODE_CLOG_BIRTH") != NULL) {
 		UT_PLAN(4);
 		UT_RUN(test_episode_clog_birth_retains_full_native_image_beside_legacy_history);
@@ -1252,7 +1262,7 @@ main(int argc, char **argv)
 		UT_RUN(test_episode_terminal_preconditions_preserve_original_base_and_query);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(183);
+	UT_PLAN(188);
 	UT_RUN(test_clog_full_roots_keep_original_origin_and_page_extent);
 	UT_RUN(test_clog_full_roots_reject_malformed_or_detached_births_stickily);
 	UT_RUN(test_clog_full_roots_read_whole_original_file_and_revoke_on_drift);
@@ -1266,6 +1276,11 @@ main(int argc, char **argv)
 	UT_RUN(test_episode_clog_birth_keeps_native_epochs_separate_from_counter_candidates);
 	UT_RUN(test_episode_clog_birth_capacity_never_publishes_a_partial_history);
 	UT_RUN(test_episode_clog_birth_late_error_keeps_original_held_fd_and_all_protections);
+	UT_RUN(test_episode_birth_match_retains_original_source_counter_and_complete_input);
+	UT_RUN(test_episode_birth_match_refuses_absent_legacy_wrong_era_and_other_page);
+	UT_RUN(test_episode_birth_match_rejects_duplicate_late_birth_reset_and_truncate);
+	UT_RUN(test_episode_birth_match_preconditions_preserve_original_query_and_custody);
+	UT_RUN(test_episode_birth_match_owner_error_keeps_original_held_fd_and_pins);
 	UT_RUN(test_episode_generation_xid_keeps_every_original_source_and_counter);
 	UT_RUN(test_episode_generation_xid_sibling_frames_cannot_hide_behind_the_map);
 	UT_RUN(test_episode_generation_xid_sibling_half_range_refuses_without_rebase);
