@@ -436,6 +436,11 @@ typedef struct ClusterRecoveryRelmapPendingNativeV1 {
 extern bool cluster_recovery_relmap_history_pending_native_v1(
 	ClusterRecoveryRelmapHistory *history, const ClusterRelmapV2Image *pending,
 	ClusterRecoveryRelmapPendingNativeV1 *out, ClusterRecoveryNativeInventoryDiag *diag);
+/* Same original native input, additionally matching every sealed SIDE CLOG
+ * carrier in the one physical reread. Necessary input, no lifetime grant. */
+extern bool cluster_recovery_relmap_history_pending_native_side_v1(
+	ClusterRecoveryRelmapHistory *history, const ClusterRelmapV2Image *pending,
+	ClusterRecoveryRelmapPendingNativeV1 *out, ClusterRecoveryNativeInventoryDiag *diag);
 extern void cluster_recovery_relmap_history_destroy_v1(ClusterRecoveryRelmapHistory **history);
 
 /* Borrow the original startup cold scope for two complete physical passes.
