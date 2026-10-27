@@ -15651,20 +15651,21 @@ phase_recent_native_setup(QualifiedXminFixture *f, LVRelState *v,
 }
 
 static void
-phase_recent_native_finish(const QualifiedXminFixture *f, const LVRelState *v, bool changed)
+phase_recent_native_finish_pins(const QualifiedXminFixture *f, const LVRelState *v,
+	bool changed, unsigned pins)
 {
 	ClusterSemanticAdmissionToken zero = {0};
-	UT_ASSERT_EQ(recent_pin_calls, 2); UT_ASSERT_EQ(recent_unpins, 2);
-	UT_ASSERT_EQ(phase_recent_usage.shared_blks_hit, 2);
+	UT_ASSERT_EQ(recent_pin_calls, pins); UT_ASSERT_EQ(recent_unpins, pins);
+	UT_ASSERT_EQ(phase_recent_usage.shared_blks_hit, pins);
 	UT_ASSERT_EQ(phase_recent_usage.local_blks_hit, 0);
-	UT_ASSERT_EQ(phase_recent_ko_samples, 2);
-	UT_ASSERT_EQ(page_owner_original_owner_enlarges, 2);
-	UT_ASSERT_EQ(page_owner_original_owner_allocations, 1);
-	UT_ASSERT_EQ(page_owner_original_owner_remembers, 2);
-	UT_ASSERT_EQ(page_owner_original_owner_forgets, 2);
-	UT_ASSERT_EQ(page_owner_original_private_news, 2);
-	UT_ASSERT_EQ(page_owner_original_private_forgets, 2);
-	UT_ASSERT_EQ(page_owner_primitive_last_pin_reads, 2);
+	UT_ASSERT_EQ(phase_recent_ko_samples, pins);
+	UT_ASSERT_EQ(page_owner_original_owner_enlarges, pins);
+	UT_ASSERT_EQ(page_owner_original_owner_allocations, pins != 0);
+	UT_ASSERT_EQ(page_owner_original_owner_remembers, pins);
+	UT_ASSERT_EQ(page_owner_original_owner_forgets, pins);
+	UT_ASSERT_EQ(page_owner_original_private_news, pins);
+	UT_ASSERT_EQ(page_owner_original_private_forgets, pins);
+	UT_ASSERT_EQ(page_owner_primitive_last_pin_reads, pins);
 	UT_ASSERT_EQ(page_owner_native_resource_owner.bufferarr.nitems, 0);
 	UT_ASSERT_EQ(phase_finally_calls, 1); UT_ASSERT_EQ(phase_finally_debt, 8);
 	UT_ASSERT_EQ(phase_finally_pins, 0); UT_ASSERT(!phase_finally_owned_writer);
@@ -15706,6 +15707,12 @@ phase_recent_native_finish(const QualifiedXminFixture *f, const LVRelState *v, b
 	phase_use_original_recent_pin = false;
 	GetBufferDescriptor(0)->tag = phase_recent_saved_tag;
 	pg_atomic_write_u32(&GetBufferDescriptor(0)->state, phase_recent_saved_state);
+}
+
+static void
+phase_recent_native_finish(const QualifiedXminFixture *f, const LVRelState *v, bool changed)
+{
+	phase_recent_native_finish_pins(f, v, changed, 2);
 }
 
 UT_TEST(test_original_resident_recent_pin_chain_reaches_same_owner_native_wal)
@@ -16191,10 +16198,117 @@ UT_TEST(test_mixed_admitted_subsets_keep_fullxid_wal_horizon_and_unknown_rows)
 	}
 }
 
+/* Invalid selected-target requests cannot start a recent-resident write. */
+UT_TEST(test_recent_xmin_invalid_target_batch_refuses_before_resident_pin)
+{
+	for (int pins = 0; pins < 2; pins++) {
+		for (int writer = 0; writer < 2; writer++) {
+			for (int fault = 0; fault < 4; fault++) {
+				QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+				ClusterSemanticAdmissionToken saved_admission;
+				uint16 count;
+
+				qualified_xmin_batch_setup(&f, targets);
+				if (!writer) { fixture_release_original_writer(); resume_allowed = true; }
+				relation_data.rd_isvalid = true; backend_pin_count = pins;
+				count = fault == 0 ? 0 : fault == 1 ? MaxHeapTuplesPerPage + 1 : 4;
+				if (fault == 3) { f.page.tuple_count = 0; count = 1; }
+				saved_admission = f.admission;
+				UT_ASSERT(!fixture_recent_xmin_apply(&f, targets, count));
+				UT_ASSERT_EQ(recent_pin_calls + recent_unpins, 0);
+				UT_ASSERT_EQ(backend_pin_count, pins); UT_ASSERT_EQ(local_x, writer);
+				UT_ASSERT_EQ(cluster_bufmgr_pcm_x_writer_find(GetBufferDescriptor(0)) != NULL, writer);
+				UT_ASSERT(memcmp(&f.admission, &saved_admission, sizeof(saved_admission)) == 0);
+				UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + inserts + edges + dirties + flushes, 0);
+				UT_ASSERT(!recent_pin_held && !resumed_writer);
+				UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+			}
+		}
+	}
+}
+
+/* Finite cutoff inputs cannot replace missing terminal proof. */
+UT_TEST(test_all_unknown_admitted_carriers_skip_resident_and_native_work)
+{
+	QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+
+	phase_recent_native_setup(&f, &v, targets, true, true);
+	UT_ASSERT(FullTransactionIdIsValid(f.policy.freeze_limit));
+	UT_ASSERT(SCN_VALID(f.cohort.horizon_scn));
+	phase_unknown_proof_mask = 7;
+	UT_ASSERT(!phase_then_recent_native_owned(&f, &v));
+	phase_unknown_proof_mask = 0;
+	UT_ASSERT_EQ(phase_preflights, 1); UT_ASSERT_EQ(phase_resolves, 3);
+	UT_ASSERT_EQ(phase_rechecks, 0);
+	UT_ASSERT_EQ(v.shared_freeze_batch.carrier_request_count, 3);
+	UT_ASSERT_EQ(v.shared_freeze_proofs.proof_count, 0);
+	UT_ASSERT_EQ(v.shared_freeze_xmin_candidates.target_count, 0);
+	UT_ASSERT_EQ(v.shared_freeze_aborted_xmax_candidates.target_count, 0);
+	UT_ASSERT(!v.shared_freeze_fence_valid);
+	UT_ASSERT(!v.shared_freeze_cohort_observed);
+	UT_ASSERT(!FullTransactionIdIsValid(v.shared_freeze_candidate_limit_full));
+	UT_ASSERT_EQ(recent_pin_calls, 0); UT_ASSERT_EQ(recent_unpins, 0);
+	UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + inserts + edges + dirties + flushes, 0);
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	phase_recent_native_finish_pins(&f, &v, false, 0);
+}
+
+/* A canonical aborted modifier remains separate from a committed creator,
+ * even when its old row has the same raw xmin as another proven carrier. */
+UT_TEST(test_mixed_aborted_modifier_stays_unchanged_through_recent_xmin_wal)
+{
+	QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+	HeapTupleHeader modified;
+	ClusterTxResolution *abort;
+
+	phase_recent_native_setup(&f, &v, targets, true, true);
+	modified = freeze_tuple(current_page.data, 2);
+	HeapTupleHeaderSetXmin(modified, 77);
+	HeapTupleHeaderSetXmax(modified, UINT32_MAX - 2);
+	modified->t_infomask &= ~HEAP_XMAX_BITS;
+	memcpy(before_page.data, current_page.data, BLCKSZ);
+	memcpy(f.input.image.data, current_page.data, BLCKSZ);
+	UT_ASSERT(cluster_heap_freeze_prepare_page_v1(&f.input, &f.page));
+	v.shared_freeze_input = f.input; v.shared_freeze_batch = f.page;
+	abort = &f.proofs.proofs[1].resolution;
+	abort->outcome = CLUSTER_TX_ABORTED;
+	abort->commit_scn = InvalidScn;
+	abort->local_creation_target.valid = false;
+	abort->local_aborted_xmax_target = (ClusterTxModificationTarget) {
+		.locator = relation_data.rd_locator, .fork = MAIN_FORKNUM,
+		.block = 7, .offset = 2, .tuple_length = 64, .valid = true };
+	UT_ASSERT(phase_then_recent_native_owned(&f, &v));
+	UT_ASSERT_EQ(phase_resolves, 3); UT_ASSERT_EQ(phase_rechecks, 1);
+	UT_ASSERT_EQ(v.shared_freeze_proofs.proof_count, 3);
+	UT_ASSERT(v.shared_freeze_fence_valid);
+	UT_ASSERT_EQ(v.shared_freeze_xmin_candidates.target_count, 2);
+	UT_ASSERT_EQ(v.shared_freeze_xmin_candidates.targets[0].tuple_index, 0);
+	UT_ASSERT_EQ(v.shared_freeze_xmin_candidates.targets[1].tuple_index, 2);
+	UT_ASSERT_EQ(v.shared_freeze_proofs.proofs[1].resolution.outcome, CLUSTER_TX_ABORTED);
+	UT_ASSERT_EQ(v.shared_freeze_aborted_xmax_candidates.target_count, 1);
+	UT_ASSERT_EQ(v.shared_freeze_aborted_xmax_candidates.tuple_indexes[0], 1);
+	UT_ASSERT_EQ(((xl_heap_freeze_page *)freeze_main_data.data)->snapshotConflictHorizon, 77);
+	UT_ASSERT(memcmp(freeze_tuple(current_page.data, 2),
+		freeze_tuple(before_page.data, 2), 64) == 0);
+	UT_ASSERT_EQ(HeapTupleHeaderGetRawXmax(freeze_tuple(current_page.data, 2)), UINT32_MAX - 2);
+	for (int i = 0; i < 3; i++) {
+		PGAlignedBlock expected;
+		memcpy(expected.data, freeze_tuple(before_page.data, i + 1), 64);
+		if (i != 1)
+			((HeapTupleHeader)expected.data)->t_infomask |= HEAP_XMIN_FROZEN;
+		UT_ASSERT(memcmp(freeze_tuple(current_page.data, i + 1), expected.data, 64) == 0);
+		UT_ASSERT(memcmp(ClusterPageGetItlSlot(current_page.data, i),
+			ClusterPageGetItlSlot(before_page.data, i), sizeof(ClusterItlSlotData)) == 0);
+	}
+	check_publication(true);
+	replay_freeze_record();
+	phase_recent_native_finish(&f, &v, true);
+}
+
 int
 main(void)
 {
-	UT_PLAN(344);
+	UT_PLAN(347);
 
 	UT_RUN(test_pin_free_admitted_phase_reaches_recent_native_wal_before_owner_leave);
 	UT_RUN(test_pin_free_phase_recent_refusal_retires_only_its_original_owner);
@@ -16549,6 +16663,9 @@ main(void)
 	UT_RUN(test_admitted_reuse_refusals_retire_previous_continuation);
 	UT_RUN(test_mixed_admitted_resident_subset_reaches_same_owner_recent_wal);
 	UT_RUN(test_mixed_admitted_subsets_keep_fullxid_wal_horizon_and_unknown_rows);
+	UT_RUN(test_recent_xmin_invalid_target_batch_refuses_before_resident_pin);
+	UT_RUN(test_all_unknown_admitted_carriers_skip_resident_and_native_work);
+	UT_RUN(test_mixed_aborted_modifier_stays_unchanged_through_recent_xmin_wal);
 
 	UT_DONE();
 	return ut_failed_count != 0;

@@ -2349,6 +2349,21 @@ TESTS += test_cluster_vm_visible_version_noassert test_cluster_vm_visible_replay
 
 all: test_cluster_vm_visible_version_noassert test_cluster_vm_visible_replay test_cluster_vm_visible_heap_replay test_cluster_vm_visible_assemble_replay
 
+TESTS += test_cluster_vm_vacuum_empty test_cluster_vm_vacuum_empty_noassert
+all: test_cluster_vm_vacuum_empty test_cluster_vm_vacuum_empty_noassert
+
+# Keep the whole native cleanup-to-publication entry, including its old gates.
+test_cluster_vm_vacuum_empty.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
+	@awk '/^lazy_vacuum_heap_page\(/ { signature=1 } \
+	     signature && /Buffer \*vmbuffer/ { print "#define FIXTURE_VACUUM_VM_POINTER 1"; found++ } \
+	     signature && /^{/ { signature=0 } END { if (found > 1) exit 1 }' $< > $@.tmp
+	awk '/^lazy_vacuum_heap_page\(/ { print "static int"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1 || emit) exit 1 }' $< >> $@.tmp
+	mv $@.tmp $@
+
+test_cluster_vm_vacuum_empty test_cluster_vm_vacuum_empty_noassert: test_cluster_vm_vacuum_empty.c \
+		test_cluster_vm_vacuum_empty.inc $(top_srcdir)/src/include/commands/progress.h
+
 # PGRAC: native VM setter and its original heap-visible WAL logger.
 test_cluster_vm_visible_body.inc: $(top_srcdir)/src/backend/access/heap/visibilitymap.c Makefile
 	awk '/^visibilitymap_set_locked\(/ { inside=1; found++ } \
@@ -2476,8 +2491,10 @@ test_cluster_vm_visible_heap_cold.o: $(top_srcdir)/src/backend/cluster/cluster_p
 	$(CC) $(CFLAGS) $(CPPFLAGS) -Dcluster_space_relation_read_redo_identity=heap_replay_read_identity \
 		-ffunction-sections -fdata-sections -c $< -o $@
 
+test_cluster_vm_vacuum_empty test_cluster_vm_vacuum_empty_noassert \
 test_cluster_vm_visible_version test_cluster_vm_visible_version_noassert test_cluster_vm_visible_replay test_cluster_vm_visible_heap_replay test_cluster_vm_visible_assemble_replay: test_cluster_vm_visible_version.c test_cluster_heap_maintenance_policy.inc unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_pcm_lock.h \
+		$(top_srcdir)/src/include/commands/vacuum.h \
 		test_cluster_vm_buffer_matches.inc \
 		test_cluster_vm_repair_versioned.inc \
 		test_cluster_vm_repair_clear.inc test_cluster_vm_repair_missing_heap.inc \
@@ -2488,7 +2505,7 @@ test_cluster_vm_visible_version test_cluster_vm_visible_version_noassert test_cl
 		test_cluster_space_bufpage_product.o test_cluster_space_producer_product.o \
 		test_cluster_space_storage_product.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $(if $(filter %_noassert,$@),-DFIXTURE_NO_ASSERTS) $(if $(filter %_replay,$@),$(srcdir)/$@.c,$<) test_cluster_space_bufpage_product.o \
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(if $(filter %_noassert,$@),-DFIXTURE_NO_ASSERTS) $(if $(filter test_cluster_vm_vacuum_empty%,$@),$(srcdir)/test_cluster_vm_vacuum_empty.c,$(if $(filter %_replay,$@),$(srcdir)/$@.c,$<)) test_cluster_space_bufpage_product.o \
 		test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
 		$(if $(filter %_replay,$@),test_cluster_vm_redo_reader.o $(XLOG_PAGE_EDGE_ENCODER_O)) \
 		$(if $(filter test_cluster_vm_visible_heap_replay test_cluster_vm_visible_assemble_replay,$@),test_cluster_vm_visible_heap_cold.o) \

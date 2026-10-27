@@ -35,6 +35,7 @@
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/storage/cluster_smgr.h"
+#include "commands/vacuum.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/freespace.h"
@@ -1379,6 +1380,10 @@ typedef struct LVRelState {
 	bool versioned;
 	bool shared_maintenance_restricted;
 	ClusterSpaceIdentity identity;
+	/* Native page-vacuum composition keeps its own dead-item owner. */
+	VacDeadItems *dead_items;
+	int nindexes;
+	bool do_index_vacuuming;
 } LVRelState;
 /* Identity transport leaves are controlled here; the cache fixture separately
  * executes the real storage guards. Keep every original publication body. */

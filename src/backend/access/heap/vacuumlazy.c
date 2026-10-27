@@ -324,7 +324,7 @@ static void lazy_vacuum(LVRelState *vacrel);
 static bool lazy_vacuum_all_indexes(LVRelState *vacrel);
 static void lazy_vacuum_heap_rel(LVRelState *vacrel);
 static int	lazy_vacuum_heap_page(LVRelState *vacrel, BlockNumber blkno,
-								  Buffer buffer, int index, Buffer vmbuffer);
+								  Buffer buffer, int index, Buffer *vmbuffer, bool cleanup_lock);
 static bool lazy_check_wraparound_failsafe(LVRelState *vacrel);
 static void lazy_cleanup_all_indexes(LVRelState *vacrel);
 static IndexBulkDeleteResult *lazy_vacuum_one_index(Relation indrel,
@@ -1424,7 +1424,7 @@ lazy_scan_heap(LVRelState *vacrel)
 			{
 				Size		freespace;
 
-				lazy_vacuum_heap_page(vacrel, blkno, buf, 0, vmbuffer);
+				lazy_vacuum_heap_page(vacrel, blkno, buf, 0, &vmbuffer, true);
 
 				/* Forget the LP_DEAD items that we just vacuumed */
 				dead_items->num_items = 0;
@@ -3878,7 +3878,7 @@ lazy_vacuum_heap_rel(LVRelState *vacrel)
 		buf = ReadBufferExtended(vacrel->rel, MAIN_FORKNUM, blkno, RBM_NORMAL,
 								 vacrel->bstrategy);
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-		index = lazy_vacuum_heap_page(vacrel, blkno, buf, index, vmbuffer);
+		index = lazy_vacuum_heap_page(vacrel, blkno, buf, index, &vmbuffer, false);
 
 		/* Now that we've vacuumed the page, record its available space */
 		page = BufferGetPage(buf);
@@ -3915,8 +3915,11 @@ lazy_vacuum_heap_rel(LVRelState *vacrel)
  *						  vacrel->dead_items array.
  *
  * Caller must have an exclusive buffer lock on the buffer (though a full
- * cleanup lock is also acceptable).  vmbuffer must be valid and already have
- * a pin on blkno's visibility map page.
+ * cleanup lock is also acceptable).  *vmbuffer must be valid and already have
+ * a pin on blkno's visibility map page.  cleanup_lock preserves the caller's
+ * cleanup ownership across shared empty-page publication; otherwise only
+ * exclusive content ownership is restored.  Any replacement VM pin is
+ * returned to the caller.
  *
  * index is an offset into the vacrel->dead_items array for the first listed
  * LP_DEAD item on the page.  The return value is the first index immediately
@@ -3924,7 +3927,7 @@ lazy_vacuum_heap_rel(LVRelState *vacrel)
  */
 static int
 lazy_vacuum_heap_page(LVRelState *vacrel, BlockNumber blkno, Buffer buffer,
-					  int index, Buffer vmbuffer)
+					  int index, Buffer *vmbuffer, bool cleanup_lock)
 {
 	VacDeadItems *dead_items = vacrel->dead_items;
 	Page		page = BufferGetPage(buffer);
@@ -4030,6 +4033,15 @@ lazy_vacuum_heap_page(LVRelState *vacrel, BlockNumber blkno, Buffer buffer,
 	 * emitted.
 	 */
 	Assert(!PageIsAllVisible(page));
+#ifdef USE_PGRAC_CLUSTER
+	/* Native cleanup is already WAL-logged.  An empty result needs no tuple
+	 * proof, but still needs both exact current pages.  Reuse the original
+	 * empty publisher outside critical, with no VM pin across the heap wait;
+	 * it rechecks emptiness and identity after restoring the caller's lock. */
+	if (vacrel->shared_maintenance_restricted
+		&& visibilitymap_heap_page_is_empty(page))
+		lazy_publish_shared_empty(vacrel, buffer, blkno, vmbuffer, cleanup_lock);
+#endif
 	if (!vacrel->shared_maintenance_restricted &&
 		heap_page_is_all_visible(vacrel, buffer, &visibility_cutoff_xid,
 								 &all_frozen))
@@ -4047,7 +4059,7 @@ lazy_vacuum_heap_page(LVRelState *vacrel, BlockNumber blkno, Buffer buffer,
 #endif
 			PageSetAllVisible(page);
 		visibilitymap_set(vacrel->rel, blkno, buffer, InvalidXLogRecPtr,
-						  vmbuffer, visibility_cutoff_xid, flags
+						  *vmbuffer, visibility_cutoff_xid, flags
 #ifdef USE_PGRAC_CLUSTER
 						  , vacrel->versioned ? &vacrel->identity : NULL
 #endif
