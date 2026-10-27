@@ -43,7 +43,10 @@ typedef enum RetryFault {
 	RETRY_FAULT_MODIFIER,
 	RETRY_FAULT_BINDING,
 	RETRY_FAULT_CANCEL,
-	RETRY_FAULT_ADMISSION
+	RETRY_FAULT_ADMISSION,
+	RETRY_FAULT_TUPLE_UNUSED,
+	RETRY_FAULT_TUPLE_REDIRECT,
+	RETRY_FAULT_TUPLE_DEAD
 } RetryFault;
 
 static RetryFault retry_fault;
@@ -188,6 +191,15 @@ cluster_heap_itl_wait_capacity_after_census(Buffer old_buffer, Buffer new_buffer
 	ItemIdSetNormal(item, fresh_offset, SizeofHeapTupleHeader);
 	header = (HeapTupleHeader)PageGetItem(page, item);
 	header->t_infomask ^= HEAP_XMAX_INVALID;
+	/* Inject only the page change while the original heap lock is absent.
+	 * Requalification and the refusal/receipt owner remain production code. */
+	UT_ASSERT(!heap_locked[old_buffer]);
+	if (retry_fault == RETRY_FAULT_TUPLE_UNUSED)
+		ItemIdSetUnused(item);
+	else if (retry_fault == RETRY_FAULT_TUPLE_REDIRECT)
+		ItemIdSetRedirect(item, FirstOffsetNumber + 1);
+	else if (retry_fault == RETRY_FAULT_TUPLE_DEAD)
+		ItemIdSetDead(item);
 	/* Publication coordinates are the runtime fixture, not a WAL replay. */
 	PageSetLSN(page, 200);
 	((PageHeader)page)->pd_block_scn = 200;
@@ -304,6 +316,15 @@ run_retry(bool pair, bool temporary_lock, int vm_kind, RetryFault fault, Cluster
 		UT_ASSERT_EQ(
 			PageAddItem(image.data, (Item)&header, sizeof(header), FirstOffsetNumber, false, true),
 			FirstOffsetNumber);
+		if (fault == RETRY_FAULT_TUPLE_REDIRECT) {
+			/* The redirect points to an allocated line pointer. This does
+			 * not execute or certify a native HOT pruning operation. */
+			header.t_infomask2 = HEAP_ONLY_TUPLE;
+			ItemPointerSet(&header.t_ctid, block, FirstOffsetNumber + 1);
+			UT_ASSERT_EQ(PageAddItem(image.data, (Item)&header, sizeof(header),
+									 FirstOffsetNumber + 1, false, true),
+						 FirstOffsetNumber + 1);
+		}
 	}
 	PageSetLSN(image.data, 100);
 	((PageHeader)image.data)->pd_block_scn = 100;
@@ -555,10 +576,71 @@ UT_TEST(wait_errors_preserve_cancel_or_admission_sqlstate_and_abort_owner)
 					error ? ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS : ERRCODE_QUERY_CANCELED, NULL);
 }
 
+/* Removing the real consumer's post-wait line-pointer check must not let
+ * a pruned or redirected tuple reach l2 using the old READY plan. */
+UT_TEST(pruned_tuple_after_capacity_wait_refuses_and_keeps_exact_abort_owner)
+{
+	const RetryFault faults[]
+		= { RETRY_FAULT_TUPLE_UNUSED, RETRY_FAULT_TUPLE_REDIRECT, RETRY_FAULT_TUPLE_DEAD };
+
+	for (unsigned fault = 0; fault < lengthof(faults); fault++)
+		for (int result = 0; result < 2; result++)
+			for (int vm_kind = 0; vm_kind < 2; vm_kind++) {
+				ClusterUndoRecordPrepareReceipt receipt;
+				RetryObservation observed;
+
+				recent_misses = 0;
+				observed = run_retry(false, false, vm_kind, faults[fault],
+									 result ? CLUSTER_TXW_RETRY : CLUSTER_TXW_RESOLVED, &receipt);
+				UT_ASSERT(observed.errored && !observed.requalified && !observed.reacquire);
+				UT_ASSERT_EQ(receipt_error_code, ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA);
+				UT_ASSERT_STR_CONTAINS(receipt_error_detail, "PGRAC_REASON=CALLER_CAUSE_UNPROVEN");
+				UT_ASSERT_EQ(wait_calls, 1);
+				UT_ASSERT_EQ(vm_pins_during_wait, 0);
+				UT_ASSERT_EQ(vm_pins_at_relock, 0);
+				UT_ASSERT_EQ(heap_relocks, 1);
+				UT_ASSERT_EQ(recent_calls, vm_kind);
+				UT_ASSERT_EQ(key_frees, 1);
+				UT_ASSERT_EQ(observed.deadline, 500);
+				UT_ASSERT_EQ(receipt.absolute_deadline_us, 100);
+				UT_ASSERT_EQ(memcmp(&receipt, &before_wait_receipt, sizeof(receipt)), 0);
+				UT_ASSERT_EQ(
+					memcmp(&receipt, &cluster_undo_record_reservation.receipt, sizeof(receipt)), 0);
+				UT_ASSERT(cluster_undo_record_reservation.active);
+				UT_ASSERT_EQ(receipt.ctrc_prepared_mask, 1);
+				UT_ASSERT_EQ(receipt_prepare_calls, 1);
+				UT_ASSERT_EQ(receipt_cancel_calls + receipt_unref_calls + receipt_leave_calls, 0);
+				UT_ASSERT_EQ(receipt_apply_calls + receipt_wal_calls, 0);
+				UT_ASSERT(heap_locked[1] && !heap_locked[2]);
+				UT_ASSERT_EQ(pins[1], 1);
+				UT_ASSERT_EQ(pins[2] + pins[4], 0);
+				UT_ASSERT_EQ(pins[3], vm_kind);
+				UT_ASSERT_EQ(observed.old_vm, vm_kind ? 3 : InvalidBuffer);
+				UT_ASSERT_EQ(observed.new_vm, InvalidBuffer);
+
+				/* The refusal occurs after the original relock/repin. Model
+				 * buffer cleanup, then invoke the real receipt abort owner. */
+				if (heap_locked[1])
+					LockBuffer(1, BUFFER_LOCK_UNLOCK);
+				if (BufferIsValid(observed.old_vm))
+					ReleaseBuffer(observed.old_vm);
+				ReleaseBuffer(1);
+				receipt_abort_after_lwlock_release();
+				UT_ASSERT(!cluster_undo_record_reservation.active);
+				UT_ASSERT(!cluster_undo_record_reservation.consume_locked);
+				UT_ASSERT_EQ(receipt_cancel_calls, 1);
+				UT_ASSERT_EQ(receipt_unref_calls, 1);
+				UT_ASSERT_EQ(receipt_leave_calls, 1);
+				UT_ASSERT_EQ(receipt_apply_calls + receipt_wal_calls, 0);
+				receipt_abort_after_lwlock_release();
+				UT_ASSERT_EQ(receipt_cancel_calls + receipt_unref_calls + receipt_leave_calls, 3);
+			}
+}
+
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(9);
 	UT_RUN(single_page_retry_releases_vm_before_wait_and_reloads_tuple);
 	UT_RUN(pair_retry_releases_each_vm_reference_before_page_choice_reentry);
 	UT_RUN(repin_retries_a_resident_miss_without_carrying_a_vm_pin);
@@ -567,6 +649,7 @@ main(void)
 	UT_RUN(capacity_deadlock_keeps_original_sqlstate_and_abort_owner);
 	UT_RUN(unprovable_capacity_keeps_refusal_and_abort_owner);
 	UT_RUN(wait_errors_preserve_cancel_or_admission_sqlstate_and_abort_owner);
+	UT_RUN(pruned_tuple_after_capacity_wait_refuses_and_keeps_exact_abort_owner);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
