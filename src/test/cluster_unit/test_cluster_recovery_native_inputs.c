@@ -903,6 +903,7 @@ cleanup:
 #include "test_cluster_recovery_page_roots_inputs.inc"
 #include "test_cluster_recovery_page_wal_inputs.inc"
 #include "test_cluster_recovery_wal_sources.inc"
+#include "test_cluster_recovery_page_graph.inc"
 
 UT_TEST(test_owned_ctrc_census_borrows_namespace_and_revokes_changed_work)
 {
@@ -1091,7 +1092,29 @@ main(int argc, char **argv)
 	UT_RUN(test_owned_page_inventory_capacity_never_silently_omits_physical_pages);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(128);
+	if (getenv("PGRAC_PRE2_TEST_CTRC_PAGE_GRAPH") != NULL) {
+		UT_PLAN(9);
+		UT_RUN(test_page_graph_original_full_cuts_order_cross_thread_page_edges);
+		UT_RUN(test_page_graph_no_page_sources_and_original_native_cursor_remain);
+		UT_RUN(test_page_graph_keeps_explicit_empty_and_historical_generations);
+		UT_RUN(test_page_graph_budget_refuses_without_exporting_a_prefix);
+		UT_RUN(test_page_graph_crc_valid_original_rewrite_is_sticky);
+		UT_RUN(test_page_graph_bad_codec_and_cycle_keep_original_debt);
+		UT_RUN(test_page_graph_changed_native_checkpoint_never_rebases);
+		UT_RUN(test_page_graph_native_error_cleans_private_state_only);
+		UT_RUN(test_page_graph_refuses_caller_locks_before_any_original_io);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	UT_PLAN(137);
+	UT_RUN(test_page_graph_original_full_cuts_order_cross_thread_page_edges);
+	UT_RUN(test_page_graph_no_page_sources_and_original_native_cursor_remain);
+	UT_RUN(test_page_graph_keeps_explicit_empty_and_historical_generations);
+	UT_RUN(test_page_graph_budget_refuses_without_exporting_a_prefix);
+	UT_RUN(test_page_graph_crc_valid_original_rewrite_is_sticky);
+	UT_RUN(test_page_graph_bad_codec_and_cycle_keep_original_debt);
+	UT_RUN(test_page_graph_changed_native_checkpoint_never_rebases);
+	UT_RUN(test_page_graph_native_error_cleans_private_state_only);
+	UT_RUN(test_page_graph_refuses_caller_locks_before_any_original_io);
 	UT_RUN(test_wal_sources_include_all_records_without_page_inputs);
 	UT_RUN(test_wal_sources_keep_explicit_empty_and_every_original_generation);
 	UT_RUN(test_wal_sources_preserve_page_and_native_effect_cursors);
