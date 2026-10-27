@@ -162,6 +162,7 @@ CheckClusterSharedUtilitySupport(Node *statement, bool isTopLevel)
 			}
 			break;
 		case T_CreateStmt:
+		case T_CreateForeignTableStmt:
 			if (((CreateStmt *) statement)->relation != NULL
 				&& ((CreateStmt *) statement)->relation->relpersistence == RELPERSISTENCE_UNLOGGED)
 				unsupported = "UNLOGGED tables";
@@ -324,7 +325,7 @@ PreflightClusterSharedCatalogWrite(Node *statement)
 			&& !IsA(statement, AlterUserMappingStmt) && !IsA(statement, DropUserMappingStmt)
 			&& !IsA(statement, CreatePublicationStmt) && !IsA(statement, AlterPublicationStmt)
 			&& !IsA(statement, AlterObjectDependsStmt) && !IsA(statement, ReassignOwnedStmt)
-			&& !IsA(statement, TruncateStmt)))
+			&& !IsA(statement, CreateForeignTableStmt) && !IsA(statement, TruncateStmt)))
 		return;
 
 	if (IsA(statement, CreateStatsStmt)) {

@@ -275,6 +275,8 @@ CreateCommandTag(Node *statement)
 {
 	if (IsA(statement, TruncateStmt))
 		return CMDTAG_TRUNCATE_TABLE;
+	if (IsA(statement, CreateForeignTableStmt))
+		return CMDTAG_CREATE_FOREIGN_TABLE;
 	if (IsA(statement, CreateSchemaStmt))
 		return CMDTAG_CREATE_SCHEMA;
 	if (IsA(statement, CreateSeqStmt))
@@ -415,6 +417,8 @@ GetCommandTagName(CommandTag tag)
 {
 	if (tag == CMDTAG_TRUNCATE_TABLE)
 		return "TRUNCATE TABLE";
+	if (tag == CMDTAG_CREATE_FOREIGN_TABLE)
+		return "CREATE FOREIGN TABLE";
 	if (tag == CMDTAG_CREATE_SCHEMA)
 		return "CREATE SCHEMA";
 	if (tag == CMDTAG_CREATE_SEQUENCE)
@@ -1889,6 +1893,21 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 		= { .type = T_List, .length = 1, .max_length = 1, .elements = &reassign_self_cell };
 	ReassignOwnedStmt reassign_context
 		= { .type = T_ReassignOwnedStmt, .roles = &reassign_self_roles, .newrole = &reassign_self };
+	RangeVar foreign_relation = { .type = T_RangeVar,
+								  .schemaname = "g_preflight",
+								  .relname = "foreign_target",
+								  .relpersistence = RELPERSISTENCE_PERMANENT };
+	String foreign_option_value = { .type = T_String, .sval = "preflight" };
+	DefElem foreign_option
+		= { .type = T_DefElem, .defname = "g_preflight", .arg = (Node *)&foreign_option_value };
+	ListCell foreign_option_cell = { .ptr_value = &foreign_option };
+	List foreign_options
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &foreign_option_cell };
+	CreateForeignTableStmt foreign_table = { .base = { .type = T_CreateForeignTableStmt,
+													   .relation = &foreign_relation,
+													   .oncommit = ONCOMMIT_NOOP },
+											 .servername = "target_server",
+											 .options = &foreign_options };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -1959,12 +1978,14 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 						   (Node *)&depends_trigger,
 						   (Node *)&depends_index,
 						   (Node *)&reassign_named,
-						   (Node *)&reassign_context };
+						   (Node *)&reassign_context,
+						   (Node *)&foreign_table };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned skip = 0; skip < 2; skip++) {
 			reset_create_preflight();
 			utility_expect_binding = true;
+			foreign_table.base.if_not_exists = skip != 0;
 			schema.if_not_exists = sequence.if_not_exists = skip != 0;
 			index.if_not_exists = index.unique = view.replace = skip != 0;
 			rename.missing_ok = move.missing_ok = skip != 0;
@@ -2283,6 +2304,21 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 		= { .type = T_List, .length = 1, .max_length = 1, .elements = &reassign_self_cell };
 	ReassignOwnedStmt reassign_context
 		= { .type = T_ReassignOwnedStmt, .roles = &reassign_self_roles, .newrole = &reassign_self };
+	RangeVar foreign_relation = { .type = T_RangeVar,
+								  .schemaname = "g_preflight",
+								  .relname = "foreign_target",
+								  .relpersistence = RELPERSISTENCE_PERMANENT };
+	String foreign_option_value = { .type = T_String, .sval = "preflight" };
+	DefElem foreign_option
+		= { .type = T_DefElem, .defname = "g_preflight", .arg = (Node *)&foreign_option_value };
+	ListCell foreign_option_cell = { .ptr_value = &foreign_option };
+	List foreign_options
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &foreign_option_cell };
+	CreateForeignTableStmt foreign_table = { .base = { .type = T_CreateForeignTableStmt,
+													   .relation = &foreign_relation,
+													   .oncommit = ONCOMMIT_NOOP },
+											 .servername = "target_server",
+											 .options = &foreign_options };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -2353,7 +2389,8 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 						   (Node *)&depends_trigger,
 						   (Node *)&depends_index,
 						   (Node *)&reassign_named,
-						   (Node *)&reassign_context };
+						   (Node *)&reassign_context,
+						   (Node *)&foreign_table };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		int caught;
@@ -2604,6 +2641,21 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 		= { .type = T_List, .length = 1, .max_length = 1, .elements = &reassign_self_cell };
 	ReassignOwnedStmt reassign_context
 		= { .type = T_ReassignOwnedStmt, .roles = &reassign_self_roles, .newrole = &reassign_self };
+	RangeVar foreign_relation = { .type = T_RangeVar,
+								  .schemaname = "g_preflight",
+								  .relname = "foreign_target",
+								  .relpersistence = RELPERSISTENCE_PERMANENT };
+	String foreign_option_value = { .type = T_String, .sval = "preflight" };
+	DefElem foreign_option
+		= { .type = T_DefElem, .defname = "g_preflight", .arg = (Node *)&foreign_option_value };
+	ListCell foreign_option_cell = { .ptr_value = &foreign_option };
+	List foreign_options
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &foreign_option_cell };
+	CreateForeignTableStmt foreign_table = { .base = { .type = T_CreateForeignTableStmt,
+													   .relation = &foreign_relation,
+													   .oncommit = ONCOMMIT_NOOP },
+											 .servername = "target_server",
+											 .options = &foreign_options };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -2674,7 +2726,8 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 						   (Node *)&depends_trigger,
 						   (Node *)&depends_index,
 						   (Node *)&reassign_named,
-						   (Node *)&reassign_context };
+						   (Node *)&reassign_context,
+						   (Node *)&foreign_table };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned child = 0; child < 2; child++) {
@@ -2931,6 +2984,21 @@ UT_TEST(test_catalog_writes_preflight_requires_shared_catalog_storage)
 		= { .type = T_List, .length = 1, .max_length = 1, .elements = &reassign_self_cell };
 	ReassignOwnedStmt reassign_context
 		= { .type = T_ReassignOwnedStmt, .roles = &reassign_self_roles, .newrole = &reassign_self };
+	RangeVar foreign_relation = { .type = T_RangeVar,
+								  .schemaname = "g_preflight",
+								  .relname = "foreign_target",
+								  .relpersistence = RELPERSISTENCE_PERMANENT };
+	String foreign_option_value = { .type = T_String, .sval = "preflight" };
+	DefElem foreign_option
+		= { .type = T_DefElem, .defname = "g_preflight", .arg = (Node *)&foreign_option_value };
+	ListCell foreign_option_cell = { .ptr_value = &foreign_option };
+	List foreign_options
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &foreign_option_cell };
+	CreateForeignTableStmt foreign_table = { .base = { .type = T_CreateForeignTableStmt,
+													   .relation = &foreign_relation,
+													   .oncommit = ONCOMMIT_NOOP },
+											 .servername = "target_server",
+											 .options = &foreign_options };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -3001,7 +3069,8 @@ UT_TEST(test_catalog_writes_preflight_requires_shared_catalog_storage)
 						   (Node *)&depends_trigger,
 						   (Node *)&depends_index,
 						   (Node *)&reassign_named,
-						   (Node *)&reassign_context };
+						   (Node *)&reassign_context,
+						   (Node *)&foreign_table };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned mode = 0; mode < 8; mode++) {
@@ -3250,6 +3319,21 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 		= { .type = T_List, .length = 1, .max_length = 1, .elements = &reassign_self_cell };
 	ReassignOwnedStmt reassign_context
 		= { .type = T_ReassignOwnedStmt, .roles = &reassign_self_roles, .newrole = &reassign_self };
+	RangeVar foreign_relation = { .type = T_RangeVar,
+								  .schemaname = "g_preflight",
+								  .relname = "foreign_target",
+								  .relpersistence = RELPERSISTENCE_PERMANENT };
+	String foreign_option_value = { .type = T_String, .sval = "preflight" };
+	DefElem foreign_option
+		= { .type = T_DefElem, .defname = "g_preflight", .arg = (Node *)&foreign_option_value };
+	ListCell foreign_option_cell = { .ptr_value = &foreign_option };
+	List foreign_options
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &foreign_option_cell };
+	CreateForeignTableStmt foreign_table = { .base = { .type = T_CreateForeignTableStmt,
+													   .relation = &foreign_relation,
+													   .oncommit = ONCOMMIT_NOOP },
+											 .servername = "target_server",
+											 .options = &foreign_options };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -3320,7 +3404,8 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 						   (Node *)&depends_trigger,
 						   (Node *)&depends_index,
 						   (Node *)&reassign_named,
-						   (Node *)&reassign_context };
+						   (Node *)&reassign_context,
+						   (Node *)&foreign_table };
 	const char *tags[] = { "CREATE SCHEMA",
 						   "CREATE SEQUENCE",
 						   "CREATE INDEX",
@@ -3391,7 +3476,8 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 						   "ALTER TRIGGER",
 						   "ALTER INDEX",
 						   "REASSIGN OWNED",
-						   "REASSIGN OWNED" };
+						   "REASSIGN OWNED",
+						   "CREATE FOREIGN TABLE" };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned parallel = 0; parallel < 2; parallel++) {
@@ -3564,10 +3650,63 @@ UT_TEST(test_materialized_view_dependency_refuses_before_binding)
 	}
 }
 
+UT_TEST(test_foreign_table_unsupported_base_refuses_before_binding)
+{
+	RangeVar relation = { .type = T_RangeVar, .relname = "foreign_target" };
+	RangeVar parent = { .type = T_RangeVar, .relname = "parent" };
+	ListCell parent_cell = { .ptr_value = &parent };
+	List parents = { .type = T_List, .length = 1, .max_length = 1, .elements = &parent_cell };
+	PartitionBoundSpec partbound = { .type = T_PartitionBoundSpec, .is_default = true };
+	CreateForeignTableStmt foreign_table = { .base = { .type = T_CreateForeignTableStmt,
+													   .relation = &relation,
+													   .oncommit = ONCOMMIT_NOOP },
+											 .servername = "target_server" };
+	ListCell schema_cell = { .ptr_value = &foreign_table };
+	List children = { .type = T_List, .length = 1, .max_length = 1, .elements = &schema_cell };
+	CreateSchemaStmt schema = { .type = T_CreateSchemaStmt, .schemaElts = &children };
+	Node *statements[] = { (Node *)&foreign_table, (Node *)&schema };
+
+	/* UNLOGGED and the nested schema are raw routing inputs, not parsed SQL. */
+	for (unsigned mode = 0; mode < 8; mode++) {
+		for (unsigned variant = 0; variant < 3; variant++) {
+			foreign_table.base.inhRelations = variant < 2 ? &parents : NIL;
+			foreign_table.base.partbound = variant == 1 ? &partbound : NULL;
+			relation.relpersistence
+				= variant == 2 ? RELPERSISTENCE_UNLOGGED : RELPERSISTENCE_PERMANENT;
+			for (unsigned child = 0; child < 2; child++) {
+				for (unsigned i = 0; i < lengthof(statements); i++) {
+					int caught;
+
+					reset_create_preflight();
+					cluster_shared_catalog = (mode & 1) != 0;
+					utility_storage_mode = (mode & 2) != 0;
+					cluster_shared_config = (mode & 4) != 0;
+					utility_in_child = child != 0;
+					caught = sigsetjmp(boundary, 1);
+					if (!caught)
+						create_sql_entry(statements[i]);
+					UT_ASSERT_EQ(caught != 0, (mode & 5) != 0);
+					if (caught) {
+						UT_ASSERT_EQ(error_code, ERRCODE_FEATURE_NOT_SUPPORTED);
+						UT_ASSERT(strstr(error_message,
+										 variant == 2 ? "UNLOGGED tables"
+													  : "partition and inheritance attachment")
+								  != NULL);
+					}
+					UT_ASSERT_EQ(utility_xids, 0);
+					UT_ASSERT_EQ(utility_prepares, 0);
+					UT_ASSERT_EQ(utility_binds, 0);
+					UT_ASSERT_EQ(utility_after_preflight, (mode & 5) == 0);
+				}
+			}
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(46);
+	UT_PLAN(47);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -3614,6 +3753,7 @@ main(void)
 	UT_RUN(test_noncreate_utility_does_not_reserve_canonical_binding);
 	UT_RUN(test_unsupported_statistics_from_keeps_native_path_without_binding);
 	UT_RUN(test_materialized_view_dependency_refuses_before_binding);
+	UT_RUN(test_foreign_table_unsupported_base_refuses_before_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
