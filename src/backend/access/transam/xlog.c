@@ -6513,6 +6513,54 @@ ClusterStartupCrashSeal(void)
 					LSN_FORMAT_ARGS(sealed.validated_tail_lsn_exclusive))));
 }
 
+/* PGRAC: attach only to the existing refusal. The first failure is captured by
+ * the guard; other values are post-refusal local observations, not an
+ * atomic snapshot or permission to continue.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static int
+ClusterStartupWriterBeginPreconditionDetail(const EndOfWalRecoveryInfo *input, bool native_recovery,
+											unsigned first_failed)
+{
+	static const char *const names[]
+		= { "input_null",		"backend_type",			"shared_config",	"enabled",
+			"shared_authority", "writer_bound",			"writer_installed", "critical_section",
+			"shutdown",			"archive_recovery",		"standby_signal",	"recovery_signal",
+			"aborted_record",	"missing_continuation", "control_state",	"native_cf_lock",
+			"cf_s_retained",	"cf_x_retained" };
+	int state, native_cf_lock;
+
+	if (!cluster_trace_control_config)
+		return 0;
+	state = ControlFile != NULL ? (int)ControlFile->state : -1;
+	native_cf_lock = MyProc != NULL ? (int)LWLockHeldByMe(ControlFileLock) : -1;
+	return errdetail(
+		"PGRAC_FAMILY=STARTUP_CONTROL operation=writer_begin_precondition "
+		"first_failed=%u first_failed_name=%s "
+		"observation=POST_REFUSAL unknown=-1 selected=%d native_recovery=%d "
+		"control_state=%d expected_control_state=%d "
+		"failed_input_null=%d failed_backend_type=%d failed_shared_config=%d "
+		"failed_enabled=%d failed_shared_authority=%d failed_writer_bound=%d "
+		"failed_writer_installed=%d failed_critical_section=%d failed_shutdown=%d "
+		"failed_archive_recovery=%d failed_standby_signal=%d failed_recovery_signal=%d "
+		"failed_aborted_record=%d failed_missing_continuation=%d failed_control_state=%d "
+		"failed_native_cf_lock=%d failed_cf_s_retained=%d failed_cf_x_retained=%d",
+		first_failed,
+		first_failed > 0 && first_failed <= lengthof(names) ? names[first_failed - 1] : "UNKNOWN",
+		clusterStartupWriterSelected, native_recovery, state,
+		(int)(native_recovery ? DB_IN_CRASH_RECOVERY : DB_SHUTDOWNED), input == NULL,
+		MyBackendType != B_STARTUP, !cluster_shared_config, !cluster_enabled,
+		!cluster_controlfile_shared_authority, clusterStartupWriterBound,
+		clusterStartupWriterInstalled, CritSectionCount != 0, ShutdownRequestPending != 0,
+		ArchiveRecoveryRequested, input != NULL ? (int)input->standby_signal_file_found : -1,
+		input != NULL ? (int)input->recovery_signal_file_found : -1,
+		input != NULL ? (int)(input->abortedRecPtr != InvalidXLogRecPtr) : -1,
+		input != NULL ? (int)(input->missingContrecPtr != InvalidXLogRecPtr) : -1,
+		ControlFile != NULL
+			? (int)(state != (native_recovery ? DB_IN_CRASH_RECOVERY : DB_SHUTDOWNED))
+			: -1,
+		native_cf_lock, cluster_cf_held(ShareLock), cluster_cf_held(ExclusiveLock));
+}
+
 /* PGRAC: after FinishWalRecovery, revalidate the selected initializer and
  * bind its independent successor stream before native WAL writes.
  * Author: SqlRush <sqlrush@gmail.com> */
@@ -6524,22 +6572,32 @@ ClusterStartupWriterBegin(const EndOfWalRecoveryInfo *input)
 	XLogRecPtr first = InvalidXLogRecPtr;
 	const char *operation = "read";
 	unsigned step = 0;
+	unsigned first_failed = 0;
 	bool wait_logged = false;
 	bool native_recovery = InRecovery;
 	ClusterCfAttemptObservation waiting = { 0 };
 
-	if (input == NULL || MyBackendType != B_STARTUP || !cluster_shared_config || !cluster_enabled
-		|| !cluster_controlfile_shared_authority
-		|| clusterStartupWriterBound || clusterStartupWriterInstalled || CritSectionCount != 0
-		|| ShutdownRequestPending || ArchiveRecoveryRequested
-		|| input->standby_signal_file_found || input->recovery_signal_file_found
-		|| input->abortedRecPtr != InvalidXLogRecPtr
-		|| input->missingContrecPtr != InvalidXLogRecPtr
-		|| ControlFile->state != (native_recovery ? DB_IN_CRASH_RECOVERY : DB_SHUTDOWNED)
-		|| LWLockHeldByMe(ControlFileLock) || cluster_cf_held(ShareLock)
-		|| cluster_cf_held(ExclusiveLock))
+	/* PGRAC: preserve the original predicate order and short circuit. */
+	if ((first_failed = 1, input == NULL) || (first_failed = 2, MyBackendType != B_STARTUP)
+		|| (first_failed = 3, !cluster_shared_config) || (first_failed = 4, !cluster_enabled)
+		|| (first_failed = 5, !cluster_controlfile_shared_authority)
+		|| (first_failed = 6, clusterStartupWriterBound)
+		|| (first_failed = 7, clusterStartupWriterInstalled)
+		|| (first_failed = 8, CritSectionCount != 0) || (first_failed = 9, ShutdownRequestPending)
+		|| (first_failed = 10, ArchiveRecoveryRequested)
+		|| (first_failed = 11, input->standby_signal_file_found)
+		|| (first_failed = 12, input->recovery_signal_file_found)
+		|| (first_failed = 13, input->abortedRecPtr != InvalidXLogRecPtr)
+		|| (first_failed = 14, input->missingContrecPtr != InvalidXLogRecPtr)
+		|| (first_failed = 15,
+			ControlFile->state != (native_recovery ? DB_IN_CRASH_RECOVERY : DB_SHUTDOWNED))
+		|| (first_failed = 16, LWLockHeldByMe(ControlFileLock))
+		|| (first_failed = 17, cluster_cf_held(ShareLock))
+		|| (first_failed = 18, cluster_cf_held(ExclusiveLock)))
 		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
-						errmsg("native startup has no selected initialization owner")));
+						errmsg("native startup has no selected initialization owner"),
+						ClusterStartupWriterBeginPreconditionDetail(input, native_recovery,
+																	first_failed)));
 	/* The crash branch sealed its old stream before native directory work.
 	 * Its RECOVERED successor can only be selected after redo has completed
 	 * the retained input cache, while native recovery is still in progress. */
