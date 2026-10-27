@@ -86,7 +86,7 @@
 #endif
 
 #define CLUSTER_CTRC_SHMEM_MAGIC UINT32_C(0x43545243)
-#define CLUSTER_CTRC_SHMEM_VERSION UINT32_C(14)
+#define CLUSTER_CTRC_SHMEM_VERSION UINT32_C(15)
 #ifndef CLUSTER_CTRC_TEST_TABLE_VISIT
 #define CLUSTER_CTRC_TEST_TABLE_VISIT(kind) ((void)0)
 #endif
@@ -390,7 +390,8 @@ ctrc_participant_delegations_empty(const ClusterCtrcParticipantEntry *participan
 {
 	return participant->delegation_count == 0 && participant->delegation_reserved == 0
 		&& participant->last_delegation_sequence == 0
-		&& ctrc_bytes_zero(participant->delegations, sizeof(participant->delegations));
+		&& ctrc_bytes_zero(participant->delegations, sizeof(participant->delegations))
+		&& ctrc_bytes_zero(&participant->delegation_parent, sizeof(participant->delegation_parent));
 }
 
 static bool
@@ -398,7 +399,19 @@ ctrc_participant_delegations_valid(const ClusterCtrcParticipantEntry *participan
 {
 	uint32 count = 0;
 	uint32 sequences = 0;
+	const ClusterCtrcDelegationCustodyV1 *parent = &participant->delegation_parent;
+	FullTransactionId original;
 
+	if (!ctrc_bytes_zero(parent, sizeof(*parent))
+		&& (parent->sequence == 0 || parent->sequence >= CLUSTER_CTRC_MAX_PARTICIPANTS
+			|| !ctrc_participant_identity_valid(&participant->key, &parent->receiver)
+			|| parent->receiver.node_id == participant->identity.node_id
+			|| participant->key.origin_node_id == participant->identity.node_id
+			|| !cluster_ctrc_origin_fullxid_match_v2(participant->original_identity_v2,
+				sizeof(participant->original_identity_v2), &participant->key,
+				&parent->receiver, participant->grant_generation, &original)
+			|| !FullTransactionIdEquals(original, participant->original_full_xid)))
+		return false;
 	if (participant->delegation_reserved != 0
 		|| participant->delegation_count >= CLUSTER_CTRC_MAX_PARTICIPANTS
 		|| participant->last_delegation_sequence != participant->delegation_count)
@@ -440,6 +453,53 @@ ctrc_delegation_identity_encode(const ClusterCtrcParticipantIdentity *identity, 
 	ctrc_delegation_put_be(bytes + 8, identity->boot_incarnation, 8);
 	ctrc_delegation_put_be(bytes + 16, identity->formation_epoch, 8);
 	ctrc_delegation_put_be(bytes + 24, identity->admission_record_generation, 8);
+}
+
+
+static uint64
+ctrc_delegation_get_be(const uint8 *bytes, unsigned length)
+{
+	uint64 value = 0;
+
+	for (unsigned i = 0; i < length; i++)
+		value = (value << 8) | bytes[i];
+	return value;
+}
+
+/* The two expected identities are protected transport inputs, not decoded
+ * authority. The original V2 continues to name B; it is never rewritten to C. */
+static bool
+ctrc_delegation_first_hop_match(const uint8 *record, Size length,
+	const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcParticipantIdentity *sender,
+	const ClusterCtrcParticipantIdentity *receiver, uint32 grant,
+	FullTransactionId *full_out, uint64 *sequence_out)
+{
+	uint8 expected_sender[32];
+	uint8 expected_receiver[32];
+	uint64 sequence;
+
+	*full_out = InvalidFullTransactionId;
+	*sequence_out = 0;
+	if (record == NULL || length != CLUSTER_CTRC_DELEGATION_V1_BYTES
+		|| !ctrc_txn_key_valid(key) || !ctrc_participant_identity_valid(key, sender)
+		|| !ctrc_participant_identity_valid(key, receiver) || grant == 0
+		|| sender->node_id == receiver->node_id || receiver->node_id == key->origin_node_id
+		|| ctrc_delegation_get_be(record, 2) != CLUSTER_CTRC_DELEGATION_V1_VERSION
+		|| ctrc_delegation_get_be(record + 2, 2) != length
+		|| ctrc_delegation_get_be(record + 4, 2) != 1
+		|| !ctrc_bytes_zero(record + 6, 2))
+		return false;
+	ctrc_delegation_identity_encode(sender, expected_sender);
+	ctrc_delegation_identity_encode(receiver, expected_receiver);
+	sequence = ctrc_delegation_get_be(record + 216, 8);
+	if (memcmp(record + 152, expected_sender, sizeof(expected_sender)) != 0
+		|| memcmp(record + 184, expected_receiver, sizeof(expected_receiver)) != 0
+		|| sequence == 0 || sequence >= CLUSTER_CTRC_MAX_PARTICIPANTS
+		|| !cluster_ctrc_origin_fullxid_match_v2(record + 8,
+			CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES, key, sender, grant, full_out))
+		return false;
+	*sequence_out = sequence;
+	return true;
 }
 
 
@@ -5810,7 +5870,8 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 									 ClusterCtrcReceiptHandle *handle,
 									 const ClusterKoPeerAdmissionV3 *continuation,
 									 ClusterCtrcPreparePath *path_out,
-									 const uint8 *received_origin_v2)
+									 const uint8 *received_origin_v2,
+									 const ClusterCtrcDelegationCustodyV1 *received_parent)
 {
 	ClusterCtrcParticipantEntry *participant;
 	ClusterCtrcReceipt *receipts;
@@ -5851,8 +5912,9 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 	}
 	if (received_origin_v2 != NULL
 		&& !cluster_ctrc_origin_fullxid_match_v2(received_origin_v2,
-			CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES, key, identity, grant_generation,
-			&received_full))
+			CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES, key,
+			received_parent != NULL ? &received_parent->receiver : identity,
+			grant_generation, &received_full))
 		return ctrc_receipt_prepare_refused(false);
 	locator = (RelFileLocator){ target->spc_oid, target->db_oid, target->rel_number };
 	check_object = cluster_shared_config && cluster_interconnect_tier == CLUSTER_IC_TIER_1
@@ -5915,7 +5977,10 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 	if (received_origin_v2 != NULL && !participant_was_empty
 		&& (!FullTransactionIdIsValid(participant->original_full_xid)
 			|| memcmp(participant->original_identity_v2, received_origin_v2,
-					  CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES) != 0)) {
+					  CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES) != 0
+			|| (received_parent != NULL
+				&& memcmp(&participant->delegation_parent, received_parent,
+					sizeof(*received_parent)) != 0))) {
 		/* Numeric identity alone cannot retroactively establish original
 		 * custody. Exact duplicates preserve their first immutable bytes. */
 		if (path_out != NULL)
@@ -5983,6 +6048,8 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 			if (original_v2 != NULL)
 				memcpy(participant->original_identity_v2, original_v2,
 					   sizeof(participant->original_identity_v2));
+			if (received_parent != NULL)
+				participant->delegation_parent = *received_parent;
 		}
 		ctrc_receipt_handle_fill(handle, participant, participant_index, &receipts[receipt_index],
 								 receipt_index);
@@ -6007,6 +6074,35 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 #endif
 
 ClusterCtrcPrepareResult
+cluster_ctrc_receipt_prepare_delegation_v1(const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcParticipantIdentity *authenticated_sender,
+	const ClusterCtrcParticipantIdentity *receiver, uint32 grant,
+	const ClusterCtrcPublicationIdV1 *publication, const ClusterCtrcTargetV1 *target,
+	const uint8 *record, Size length, ClusterCtrcReceiptHandle *handle)
+{
+	ClusterCtrcDelegationCustodyV1 parent = { 0 };
+	FullTransactionId original;
+
+	if (handle != NULL)
+		MemSet(handle, 0, sizeof(*handle));
+	if (handle == NULL || cluster_node_id < 0 || receiver == NULL
+		|| receiver->node_id != (uint16)cluster_node_id
+		|| !ctrc_delegation_first_hop_match(record, length, key, authenticated_sender,
+			receiver, grant, &original, &parent.sequence))
+		return CLUSTER_CTRC_PREPARE_REFUSED;
+	parent.receiver = *authenticated_sender;
+#ifndef CLUSTER_CTRC_UNIT_TEST
+	/* Original object admission and participant -> receipt locks still own
+	 * publication. Parent/full identity are installed before its handle.
+	 * No re-signed origin V2 is synthesized for the delegated receiver. */
+	return ctrc_receipt_prepare_shared_internal(key, receiver, grant, publication,
+		target, handle, NULL, NULL, record + 8, &parent);
+#else
+	return CLUSTER_CTRC_PREPARE_REFUSED;
+#endif
+}
+
+ClusterCtrcPrepareResult
 cluster_ctrc_receipt_prepare_origin_v2(const ClusterCtrcTxnKeyV1 *key,
 	const ClusterCtrcParticipantIdentity *receiver, uint32 grant,
 	const ClusterCtrcPublicationIdV1 *publication, const ClusterCtrcTargetV1 *target,
@@ -6020,7 +6116,7 @@ cluster_ctrc_receipt_prepare_origin_v2(const ClusterCtrcTxnKeyV1 *key,
 		return CLUSTER_CTRC_PREPARE_REFUSED;
 #ifndef CLUSTER_CTRC_UNIT_TEST
 	return ctrc_receipt_prepare_shared_internal(key, receiver, grant, publication,
-		target, handle, NULL, NULL, bytes);
+		target, handle, NULL, NULL, bytes, NULL);
 #else
 	return CLUSTER_CTRC_PREPARE_REFUSED;
 #endif
@@ -6046,7 +6142,7 @@ cluster_ctrc_receipt_prepare_shared_observed(const ClusterCtrcTxnKeyV1 *key,
 {
 #ifndef CLUSTER_CTRC_UNIT_TEST
 	return ctrc_receipt_prepare_shared_internal(key, identity, grant_generation, publication,
-												target, handle, NULL, path_out, NULL);
+												target, handle, NULL, path_out, NULL, NULL);
 #else
 	if (path_out != NULL)
 		*path_out = CLUSTER_CTRC_PREPARE_PATH_UNKNOWN;
@@ -8805,7 +8901,7 @@ ctrc_cleaner_prepare_current_mx_successor(
 			&key, &participant, grant, &publication, &pending_target, &handles[prepared_count],
 			check_object ? &admission : NULL, NULL,
 			key.origin_node_id != (uint16)cluster_node_id
-				? proofs[source_ordinal].origin_fullxid_v2 : NULL);
+				? proofs[source_ordinal].origin_fullxid_v2 : NULL, NULL);
 		if (prepare_result != CLUSTER_CTRC_PREPARE_READY
 			&& prepare_result != CLUSTER_CTRC_PREPARE_DUPLICATE)
 			goto successor_failed;

@@ -408,6 +408,9 @@ typedef struct ClusterCtrcParticipantEntry {
 	uint64 cancelled_count;
 	uint64 cleaned_count;
 	uint64 ack_frozen_count;
+	/* First-hop parent remains retained independently of local receipts.
+	 * The immutable original above stays bound to this parent, not to us. */
+	ClusterCtrcDelegationCustodyV1 delegation_parent;
 	uint32 delegation_count;
 	uint32 delegation_reserved;
 	uint64 last_delegation_sequence;
@@ -1009,6 +1012,17 @@ extern bool cluster_ctrc_participant_delegate_prepare_v1(
 	const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcParticipantIdentity *sender,
 	uint32 grant, const ClusterCtrcParticipantIdentity *receiver,
 	uint8 *record, Size length);
+/* First receipt at the delegated receiver only. authenticated_sender must
+ * come from the existing protected current/PI transport, never the record.
+ * A successful registration retains the parent before exposing a handle;
+ * neither an old raw-only row nor a different parent may be backfilled.
+ * No page/current authority, parent ACK, or live V3 install is granted. */
+extern ClusterCtrcPrepareResult cluster_ctrc_receipt_prepare_delegation_v1(
+	const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcParticipantIdentity *authenticated_sender,
+	const ClusterCtrcParticipantIdentity *receiver, uint32 grant,
+	const ClusterCtrcPublicationIdV1 *publication, const ClusterCtrcTargetV1 *target,
+	const uint8 *record, Size length, ClusterCtrcReceiptHandle *handle);
 extern bool cluster_ctrc_origin_begin_seal_entry(ClusterCtrcOriginEntry *origin,
 												 uint64 seal_generation);
 extern bool cluster_ctrc_origin_arm_close_entry(ClusterCtrcOriginEntry *origin,

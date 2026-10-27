@@ -540,6 +540,30 @@ _classify_owners(
     "NO_REFERENCE_TO_DISCHARGE",
     "MXA-T40",
 )
+# First-hop matching checks the original sender binding; receiving a local
+# receipt does not authorize retiring its incoming parent responsibility.
+_classify_owners(
+    "CTRC_ORIGIN_PROVENANCE",
+    "src/backend/cluster/cluster_terminal_ref_census.c",
+    ("ctrc_delegation_first_hop_match", "ctrc_participant_delegations_valid"),
+    "REGISTERED_REFERENCE",
+    "ALL_CTRC_REFERENCE_KINDS",
+    "ALL_CTRC_TARGET_KINDS",
+    "cluster_ctrc_receipt_prepare_delegation_v1",
+    "RETAIN_PENDING_PARENT_CLOSE_ACK",
+    "MXA-T40",
+)
+_classify_owners(
+    "CTRC_RECEIPT_LIFECYCLE",
+    "src/backend/cluster/cluster_terminal_ref_census.c",
+    ("cluster_ctrc_receipt_prepare_delegation_v1",),
+    "REGISTERED_REFERENCE",
+    "ALL_CTRC_REFERENCE_KINDS",
+    "ALL_CTRC_TARGET_KINDS",
+    "cluster_ctrc_receipt_prepare_delegation_v1",
+    "LOCAL_RECEIPT_DISCHARGE_ONLY|RETAIN_PENDING_PARENT_CLOSE_ACK",
+    "MXA-T21",
+)
 # The new producer retains outgoing custody; receipt discharge cannot close
 # it. The subtree CLOSE/ACK owner remains unimplemented and live use is closed.
 _classify_owners(
