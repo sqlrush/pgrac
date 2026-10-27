@@ -27,6 +27,7 @@
 #include "catalog/index.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_control.h"
+#include "catalog/pg_type_d.h"
 #include "commands/defrem.h"
 #include "commands/user.h"
 #include "cluster/cluster_ic.h"
@@ -324,6 +325,16 @@ CreateCommandTag(Node *statement)
 		return CMDTAG_DROP_ROLE;
 	if (IsA(statement, AlterDatabaseSetStmt) || IsA(statement, AlterDatabaseRefreshCollStmt))
 		return CMDTAG_ALTER_DATABASE;
+	if (IsA(statement, CreatePLangStmt))
+		return CMDTAG_CREATE_LANGUAGE;
+	if (IsA(statement, CreateConversionStmt))
+		return CMDTAG_CREATE_CONVERSION;
+	if (IsA(statement, CreateCastStmt))
+		return CMDTAG_CREATE_CAST;
+	if (IsA(statement, CreateTransformStmt))
+		return CMDTAG_CREATE_TRANSFORM;
+	if (IsA(statement, CreateAmStmt))
+		return CMDTAG_CREATE_ACCESS_METHOD;
 	if (IsA(statement, AlterSeqStmt))
 		return CMDTAG_ALTER_SEQUENCE;
 	if (IsA(statement, AlterTSDictionaryStmt))
@@ -414,6 +425,16 @@ GetCommandTagName(CommandTag tag)
 		return "DROP ROLE";
 	if (tag == CMDTAG_ALTER_DATABASE)
 		return "ALTER DATABASE";
+	if (tag == CMDTAG_CREATE_LANGUAGE)
+		return "CREATE LANGUAGE";
+	if (tag == CMDTAG_CREATE_CONVERSION)
+		return "CREATE CONVERSION";
+	if (tag == CMDTAG_CREATE_CAST)
+		return "CREATE CAST";
+	if (tag == CMDTAG_CREATE_TRANSFORM)
+		return "CREATE TRANSFORM";
+	if (tag == CMDTAG_CREATE_ACCESS_METHOD)
+		return "CREATE ACCESS METHOD";
 	if (tag == CMDTAG_ALTER_SEQUENCE)
 		return "ALTER SEQUENCE";
 	if (tag == CMDTAG_ALTER_TEXT_SEARCH_DICTIONARY)
@@ -1362,7 +1383,14 @@ UT_TEST(test_unsupported_creates_refuse_before_xid_or_binding)
 	CreateTableAsStmt ctas = { .type = T_CreateTableAsStmt, .objtype = OBJECT_MATVIEW };
 	DefineStmt type = { .type = T_DefineStmt, .kind = OBJECT_TYPE };
 	DefineStmt operator= {.type = T_DefineStmt, .kind = OBJECT_OPERATOR };
-	Node *statements[] = { (Node *)&create, (Node *)&ctas, (Node *)&type, (Node *)&operator};
+	/* Grammar routes CREATE LANGUAGE without HANDLER through CREATE EXTENSION. */
+	CreateExtensionStmt language_extension
+		= { .type = T_CreateExtensionStmt, .extname = "target_language" };
+	CreateExtensionStmt replace_language_extension
+		= { .type = T_CreateExtensionStmt, .extname = "target_language", .if_not_exists = true };
+	Node *statements[]
+		= { (Node *)&create, (Node *)&ctas, (Node *)&type,
+			(Node *)&operator,(Node *) & language_extension, (Node *)&replace_language_extension };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		int caught;
@@ -1653,6 +1681,34 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 											   .setstmt = &database_setting };
 	AlterDatabaseRefreshCollStmt database_collation
 		= { .type = T_AlterDatabaseRefreshCollStmt, .dbname = "target_database" };
+	String definition_name = { .type = T_String, .sval = "target_handler" };
+	ListCell definition_cell = { .ptr_value = &definition_name };
+	List definition_names
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &definition_cell };
+	CreatePLangStmt language = { .type = T_CreatePLangStmt,
+								 .plname = "target_language",
+								 .plhandler = &definition_names };
+	CreateConversionStmt conversion = { .type = T_CreateConversionStmt,
+										.conversion_name = &definition_names,
+										.for_encoding_name = "UTF8",
+										.to_encoding_name = "LATIN1",
+										.func_name = &definition_names };
+	TypeName source_type = { .type = T_TypeName, .typeOid = INT4OID, .typemod = -1 };
+	TypeName target_type = { .type = T_TypeName, .typeOid = TEXTOID, .typemod = -1 };
+	CreateCastStmt cast = { .type = T_CreateCastStmt,
+							.sourcetype = &source_type,
+							.targettype = &target_type,
+							.context = COERCION_EXPLICIT,
+							.inout = true };
+	ObjectWithArgs transform_function = { .type = T_ObjectWithArgs, .objname = &definition_names };
+	CreateTransformStmt transform = { .type = T_CreateTransformStmt,
+									  .type_name = &source_type,
+									  .lang = "target_language",
+									  .fromsql = &transform_function };
+	CreateAmStmt access_method = { .type = T_CreateAmStmt,
+								   .amname = "target_am",
+								   .handler_name = &definition_names,
+								   .amtype = AMTYPE_INDEX };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -1698,7 +1754,12 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 						   (Node *)&all_settings,
 						   (Node *)&drop_role,
 						   (Node *)&database_settings,
-						   (Node *)&database_collation };
+						   (Node *)&database_collation,
+						   (Node *)&language,
+						   (Node *)&conversion,
+						   (Node *)&cast,
+						   (Node *)&transform,
+						   (Node *)&access_method };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned skip = 0; skip < 2; skip++) {
@@ -1722,6 +1783,9 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 			role_setting.name = skip ? NULL : "application_name";
 			database_setting.kind = skip ? VAR_RESET_ALL : VAR_RESET;
 			database_setting.name = skip ? NULL : "application_name";
+			language.replace = language.pltrusted = transform.replace = conversion.def = skip != 0;
+			cast.context = skip ? COERCION_ASSIGNMENT : COERCION_EXPLICIT;
+			access_method.amtype = skip ? AMTYPE_TABLE : AMTYPE_INDEX;
 			create_sql_entry(statements[i]);
 			UT_ASSERT_EQ(utility_unbound, 0);
 			UT_ASSERT_EQ(utility_after_preflight, 1);
@@ -1864,6 +1928,34 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 											   .setstmt = &database_setting };
 	AlterDatabaseRefreshCollStmt database_collation
 		= { .type = T_AlterDatabaseRefreshCollStmt, .dbname = "target_database" };
+	String definition_name = { .type = T_String, .sval = "target_handler" };
+	ListCell definition_cell = { .ptr_value = &definition_name };
+	List definition_names
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &definition_cell };
+	CreatePLangStmt language = { .type = T_CreatePLangStmt,
+								 .plname = "target_language",
+								 .plhandler = &definition_names };
+	CreateConversionStmt conversion = { .type = T_CreateConversionStmt,
+										.conversion_name = &definition_names,
+										.for_encoding_name = "UTF8",
+										.to_encoding_name = "LATIN1",
+										.func_name = &definition_names };
+	TypeName source_type = { .type = T_TypeName, .typeOid = INT4OID, .typemod = -1 };
+	TypeName target_type = { .type = T_TypeName, .typeOid = TEXTOID, .typemod = -1 };
+	CreateCastStmt cast = { .type = T_CreateCastStmt,
+							.sourcetype = &source_type,
+							.targettype = &target_type,
+							.context = COERCION_EXPLICIT,
+							.inout = true };
+	ObjectWithArgs transform_function = { .type = T_ObjectWithArgs, .objname = &definition_names };
+	CreateTransformStmt transform = { .type = T_CreateTransformStmt,
+									  .type_name = &source_type,
+									  .lang = "target_language",
+									  .fromsql = &transform_function };
+	CreateAmStmt access_method = { .type = T_CreateAmStmt,
+								   .amname = "target_am",
+								   .handler_name = &definition_names,
+								   .amtype = AMTYPE_INDEX };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -1909,7 +2001,12 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 						   (Node *)&all_settings,
 						   (Node *)&drop_role,
 						   (Node *)&database_settings,
-						   (Node *)&database_collation };
+						   (Node *)&database_collation,
+						   (Node *)&language,
+						   (Node *)&conversion,
+						   (Node *)&cast,
+						   (Node *)&transform,
+						   (Node *)&access_method };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		int caught;
@@ -2016,6 +2113,34 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 											   .setstmt = &database_setting };
 	AlterDatabaseRefreshCollStmt database_collation
 		= { .type = T_AlterDatabaseRefreshCollStmt, .dbname = "target_database" };
+	String definition_name = { .type = T_String, .sval = "target_handler" };
+	ListCell definition_cell = { .ptr_value = &definition_name };
+	List definition_names
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &definition_cell };
+	CreatePLangStmt language = { .type = T_CreatePLangStmt,
+								 .plname = "target_language",
+								 .plhandler = &definition_names };
+	CreateConversionStmt conversion = { .type = T_CreateConversionStmt,
+										.conversion_name = &definition_names,
+										.for_encoding_name = "UTF8",
+										.to_encoding_name = "LATIN1",
+										.func_name = &definition_names };
+	TypeName source_type = { .type = T_TypeName, .typeOid = INT4OID, .typemod = -1 };
+	TypeName target_type = { .type = T_TypeName, .typeOid = TEXTOID, .typemod = -1 };
+	CreateCastStmt cast = { .type = T_CreateCastStmt,
+							.sourcetype = &source_type,
+							.targettype = &target_type,
+							.context = COERCION_EXPLICIT,
+							.inout = true };
+	ObjectWithArgs transform_function = { .type = T_ObjectWithArgs, .objname = &definition_names };
+	CreateTransformStmt transform = { .type = T_CreateTransformStmt,
+									  .type_name = &source_type,
+									  .lang = "target_language",
+									  .fromsql = &transform_function };
+	CreateAmStmt access_method = { .type = T_CreateAmStmt,
+								   .amname = "target_am",
+								   .handler_name = &definition_names,
+								   .amtype = AMTYPE_INDEX };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -2061,7 +2186,12 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 						   (Node *)&all_settings,
 						   (Node *)&drop_role,
 						   (Node *)&database_settings,
-						   (Node *)&database_collation };
+						   (Node *)&database_collation,
+						   (Node *)&language,
+						   (Node *)&conversion,
+						   (Node *)&cast,
+						   (Node *)&transform,
+						   (Node *)&access_method };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned child = 0; child < 2; child++) {
@@ -2174,6 +2304,34 @@ UT_TEST(test_catalog_writes_preflight_requires_shared_catalog_storage)
 											   .setstmt = &database_setting };
 	AlterDatabaseRefreshCollStmt database_collation
 		= { .type = T_AlterDatabaseRefreshCollStmt, .dbname = "target_database" };
+	String definition_name = { .type = T_String, .sval = "target_handler" };
+	ListCell definition_cell = { .ptr_value = &definition_name };
+	List definition_names
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &definition_cell };
+	CreatePLangStmt language = { .type = T_CreatePLangStmt,
+								 .plname = "target_language",
+								 .plhandler = &definition_names };
+	CreateConversionStmt conversion = { .type = T_CreateConversionStmt,
+										.conversion_name = &definition_names,
+										.for_encoding_name = "UTF8",
+										.to_encoding_name = "LATIN1",
+										.func_name = &definition_names };
+	TypeName source_type = { .type = T_TypeName, .typeOid = INT4OID, .typemod = -1 };
+	TypeName target_type = { .type = T_TypeName, .typeOid = TEXTOID, .typemod = -1 };
+	CreateCastStmt cast = { .type = T_CreateCastStmt,
+							.sourcetype = &source_type,
+							.targettype = &target_type,
+							.context = COERCION_EXPLICIT,
+							.inout = true };
+	ObjectWithArgs transform_function = { .type = T_ObjectWithArgs, .objname = &definition_names };
+	CreateTransformStmt transform = { .type = T_CreateTransformStmt,
+									  .type_name = &source_type,
+									  .lang = "target_language",
+									  .fromsql = &transform_function };
+	CreateAmStmt access_method = { .type = T_CreateAmStmt,
+								   .amname = "target_am",
+								   .handler_name = &definition_names,
+								   .amtype = AMTYPE_INDEX };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -2219,7 +2377,12 @@ UT_TEST(test_catalog_writes_preflight_requires_shared_catalog_storage)
 						   (Node *)&all_settings,
 						   (Node *)&drop_role,
 						   (Node *)&database_settings,
-						   (Node *)&database_collation };
+						   (Node *)&database_collation,
+						   (Node *)&language,
+						   (Node *)&conversion,
+						   (Node *)&cast,
+						   (Node *)&transform,
+						   (Node *)&access_method };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned mode = 0; mode < 8; mode++) {
@@ -2324,6 +2487,34 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 											   .setstmt = &database_setting };
 	AlterDatabaseRefreshCollStmt database_collation
 		= { .type = T_AlterDatabaseRefreshCollStmt, .dbname = "target_database" };
+	String definition_name = { .type = T_String, .sval = "target_handler" };
+	ListCell definition_cell = { .ptr_value = &definition_name };
+	List definition_names
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &definition_cell };
+	CreatePLangStmt language = { .type = T_CreatePLangStmt,
+								 .plname = "target_language",
+								 .plhandler = &definition_names };
+	CreateConversionStmt conversion = { .type = T_CreateConversionStmt,
+										.conversion_name = &definition_names,
+										.for_encoding_name = "UTF8",
+										.to_encoding_name = "LATIN1",
+										.func_name = &definition_names };
+	TypeName source_type = { .type = T_TypeName, .typeOid = INT4OID, .typemod = -1 };
+	TypeName target_type = { .type = T_TypeName, .typeOid = TEXTOID, .typemod = -1 };
+	CreateCastStmt cast = { .type = T_CreateCastStmt,
+							.sourcetype = &source_type,
+							.targettype = &target_type,
+							.context = COERCION_EXPLICIT,
+							.inout = true };
+	ObjectWithArgs transform_function = { .type = T_ObjectWithArgs, .objname = &definition_names };
+	CreateTransformStmt transform = { .type = T_CreateTransformStmt,
+									  .type_name = &source_type,
+									  .lang = "target_language",
+									  .fromsql = &transform_function };
+	CreateAmStmt access_method = { .type = T_CreateAmStmt,
+								   .amname = "target_am",
+								   .handler_name = &definition_names,
+								   .amtype = AMTYPE_INDEX };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -2369,7 +2560,12 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 						   (Node *)&all_settings,
 						   (Node *)&drop_role,
 						   (Node *)&database_settings,
-						   (Node *)&database_collation };
+						   (Node *)&database_collation,
+						   (Node *)&language,
+						   (Node *)&conversion,
+						   (Node *)&cast,
+						   (Node *)&transform,
+						   (Node *)&access_method };
 	const char *tags[] = { "CREATE SCHEMA",
 						   "CREATE SEQUENCE",
 						   "CREATE INDEX",
@@ -2415,7 +2611,12 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 						   "ALTER ROLE",
 						   "DROP ROLE",
 						   "ALTER DATABASE",
-						   "ALTER DATABASE" };
+						   "ALTER DATABASE",
+						   "CREATE LANGUAGE",
+						   "CREATE CONVERSION",
+						   "CREATE CAST",
+						   "CREATE TRANSFORM",
+						   "CREATE ACCESS METHOD" };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned parallel = 0; parallel < 2; parallel++) {

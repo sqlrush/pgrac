@@ -313,7 +313,9 @@ PreflightClusterSharedCatalogWrite(Node *statement)
 			&& !IsA(statement, AlterRoleSetStmt) && !IsA(statement, DropRoleStmt)
 			&& !IsA(statement, AlterDatabaseSetStmt)
 			&& !IsA(statement, AlterDatabaseRefreshCollStmt) && !IsA(statement, CreateStatsStmt)
-			&& !IsA(statement, TruncateStmt)))
+			&& !IsA(statement, CreatePLangStmt) && !IsA(statement, CreateConversionStmt)
+			&& !IsA(statement, CreateCastStmt) && !IsA(statement, CreateTransformStmt)
+			&& !IsA(statement, CreateAmStmt) && !IsA(statement, TruncateStmt)))
 		return;
 
 	if (IsA(statement, CreateStatsStmt)) {
