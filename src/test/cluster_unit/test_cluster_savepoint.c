@@ -53,6 +53,7 @@ static void *end_callback_arg;
 static jmp_buf error_jump;
 static bool expect_error;
 static int error_code;
+static int error_level;
 static int fail_allocation;
 static int allocations;
 static void *last_allocation;
@@ -65,8 +66,19 @@ fixture_error(void)
 		longjmp(error_jump, 1);
 	abort();
 }
-#define elog(level, ...) fixture_error()
-#define ereport(level, rest) do { (void) (rest); fixture_error(); } while (0)
+#define elog(level, ...)                                                                           \
+	do {                                                                                           \
+		if ((level) >= ERROR) {                                                                    \
+			error_level = (level);                                                                 \
+			fixture_error();                                                                       \
+		}                                                                                          \
+	} while (0)
+#define ereport(level, rest)                                                                       \
+	do {                                                                                           \
+		(void)(rest);                                                                              \
+		error_level = (level);                                                                     \
+		fixture_error();                                                                           \
+	} while (0)
 #define MemoryContextSwitchTo(context) (CurrentMemoryContext = (context))
 
 int
@@ -79,6 +91,12 @@ int
 errmsg(const char *format, ...)
 {
 	(void) format;
+	return 0;
+}
+int
+errhint(const char *format, ...)
+{
+	(void)format;
 	return 0;
 }
 void
@@ -149,6 +167,8 @@ static void StartSubTransaction(void);
 static void CommitSubTransaction(void);
 static void AbortSubTransaction(void);
 static void CleanupSubTransaction(void);
+#define ShowTransactionState(label) ((void)(label))
+#define TransStateAsString(state) "fixture"
 #include "../../backend/cluster/cluster_savepoint.c"
 #include "test_cluster_savepoint_native.inc"
 
@@ -258,7 +278,7 @@ CommitSubTransaction(void)
 static void
 AbortSubTransaction(void)
 {
-	CurrentTransactionState->state = TRANS_ABORT;
+	test_native_subabort_transition();
 }
 static void
 CleanupSubTransaction(void)
@@ -991,11 +1011,12 @@ UT_TEST(test_frame_sequence_exhaustion_keeps_ancestor_proof_without_wrapping)
 }
 
 #include "test_cluster_savepoint_reserve.inc"
+#include "test_cluster_savepoint_subabort.inc"
 
 int
 main(void)
 {
-	UT_PLAN(37);
+	UT_PLAN(43);
 	UT_RUN(test_frame_xact_callback_retires_controls_before_metadata);
 	UT_RUN(test_frame_reserve_top_and_empty_scopes_need_no_storage);
 	UT_RUN(test_frame_reserve_prepares_all_new_ancestors_once);
@@ -1033,6 +1054,12 @@ main(void)
 	UT_RUN(test_failed_metadata_keeps_parent_frame);
 	UT_RUN(test_failed_name_keeps_old_point);
 	UT_RUN(test_top_end_retires_frame_memory);
+	UT_RUN(test_subabort_runs_rollback_before_native_state_and_frame_cleanup);
+	UT_RUN(test_subabort_empty_and_readonly_frames_do_not_assign_xid);
+	UT_RUN(test_subabort_partial_metadata_start_has_no_effects);
+	UT_RUN(test_subabort_nested_release_keeps_original_ancestor_boundary);
+	UT_RUN(test_subabort_failed_or_unknown_owner_cannot_resume_parent);
+	UT_RUN(test_subabort_disabled_storage_leaves_native_lifecycle);
 	fresh_transaction();
 	UT_DONE();
 	return ut_failed_count != 0;

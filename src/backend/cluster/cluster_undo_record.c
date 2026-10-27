@@ -6114,11 +6114,10 @@ undo_savepoint_head_fail(void)
 /* Spec: 2026-10-26-pre2-p013-full-savepoint-design.md. This deliberately
  * stops at head publication; only a durable cursor/mark owner can authorize
  * rollback completion or native subtransaction cleanup. */
-bool
-cluster_undo_record_publish_savepoint_pending(ClusterUndoSavepointControl *control,
-											  const ClusterUndoSavepointBounds *expected,
-											  UBA expected_tt_head, uint64 deadline,
-											  XLogRecPtr *cut_out)
+static bool
+undo_savepoint_publish_pending(ClusterUndoSavepointControl *control,
+							   const ClusterUndoSavepointBounds *expected, UBA expected_tt_head,
+							   bool sample_head, uint64 deadline, XLogRecPtr *cut_out)
 {
 	ClusterUndoSavepointControl *owned = undo_savepoint_control_find(control);
 	UndoSavepointHeadPublish stage = { 0 };
@@ -6152,6 +6151,13 @@ cluster_undo_record_publish_savepoint_pending(ClusterUndoSavepointControl *contr
 	{
 		XLogRecPtr pending_cut, head_cut;
 
+		if (sample_head
+			&& (!cluster_tt_slot_durable_sample_operation_head(&stage.request, &admission,
+															   &stage.expected_tt_head)
+				|| !undo_savepoint_control_address_valid(&owned->operation, stage.expected_tt_head,
+														 true)
+				|| cluster_undo_record_uba_equal(owned->uba, stage.expected_tt_head)))
+			undo_savepoint_head_fail();
 		if (undo_savepoint_chain_prove(&stage, deadline)
 			&& cluster_undo_record_stage_savepoint_pending(owned, &stage.bounds, deadline,
 														   &pending_cut)) {
@@ -6182,6 +6188,16 @@ cluster_undo_record_publish_savepoint_pending(ClusterUndoSavepointControl *contr
 	PG_END_TRY();
 	cluster_semantic_activation_leave(&admission);
 	return complete;
+}
+
+bool
+cluster_undo_record_publish_savepoint_pending(ClusterUndoSavepointControl *control,
+											  const ClusterUndoSavepointBounds *expected,
+											  UBA expected_tt_head, uint64 deadline,
+											  XLogRecPtr *cut_out)
+{
+	return undo_savepoint_publish_pending(control, expected, expected_tt_head, false, deadline,
+										  cut_out);
 }
 
 typedef struct UndoSavepointCursorAdvance {
@@ -6807,9 +6823,9 @@ undo_savepoint_rollback_finish(ClusterUndoSavepointControl *control, uint64 dead
  * Own the whole live rollback error boundary. Component preparation can return
  * false or ERROR before PENDING, but this caller already owns accepted DATA;
  * native child cleanup must never turn that refusal into parent continuation. */
-bool
-cluster_undo_record_rollback_savepoint(ClusterUndoSavepointControl *control, UBA expected_tt_head,
-									   uint64 deadline, XLogRecPtr *cut_out)
+static bool
+undo_savepoint_rollback(ClusterUndoSavepointControl *control, UBA expected_tt_head,
+						bool sample_head, uint64 deadline, XLogRecPtr *cut_out)
 {
 	ClusterUndoSavepointControl *owned = undo_savepoint_control_find(control);
 	ClusterUndoSavepointBounds bounds;
@@ -6835,8 +6851,8 @@ cluster_undo_record_rollback_savepoint(ClusterUndoSavepointControl *control, UBA
 				|| !cluster_undo_record_savepoint_control_bounds(owned, &bounds))
 				undo_savepoint_cursor_fail();
 			if (!cluster_undo_record_uba_equal(bounds.current_head, bounds.stop_uba)) {
-				if (!cluster_undo_record_publish_savepoint_pending(owned, &bounds, expected_tt_head,
-																   deadline, &head_cut)
+				if (!undo_savepoint_publish_pending(owned, &bounds, expected_tt_head, sample_head,
+													deadline, &head_cut)
 					|| XLogRecPtrIsInvalid(head_cut))
 					undo_savepoint_cursor_fail();
 				complete_cut = undo_savepoint_rollback_finish(owned, deadline);
@@ -6853,6 +6869,20 @@ cluster_undo_record_rollback_savepoint(ClusterUndoSavepointControl *control, UBA
 	PG_END_TRY();
 	*cut_out = complete_cut;
 	return true;
+}
+
+bool
+cluster_undo_record_rollback_savepoint(ClusterUndoSavepointControl *control, UBA expected_tt_head,
+									   uint64 deadline, XLogRecPtr *cut_out)
+{
+	return undo_savepoint_rollback(control, expected_tt_head, false, deadline, cut_out);
+}
+
+bool
+cluster_undo_record_rollback_savepoint_current(ClusterUndoSavepointControl *control,
+											   uint64 deadline, XLogRecPtr *cut_out)
+{
+	return undo_savepoint_rollback(control, InvalidUba, true, deadline, cut_out);
 }
 
 /* Surviving LIVE operations may precede the original completed control.

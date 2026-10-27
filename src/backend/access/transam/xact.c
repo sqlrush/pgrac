@@ -18,6 +18,8 @@
  *
  *	Modified by: SqlRush <sqlrush@gmail.com>
  *	Reconcile prepared undo ownership after abort releases LWLocks.
+ *	Finish live savepoint rollback before native child abort publication.
+ *	Spec: 2026-10-26-pre2-p013-full-savepoint-design.md
  *	Defer DROP SPACE dirty marking until the committed publication.
  *	Spec: 2026-10-16-pre2-p014-am05-shared-ddl-autocommit.md
  *	Spec: spec-1.16-local-scn-maintenance.md (commit/abort SCN advance)
@@ -6087,6 +6089,11 @@ CommitSubTransaction(void)
 
 /*
  * AbortSubTransaction
+ *
+ * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
+ * What changed: finish original savepoint rollback before TRANS_ABORT.
+ * Why: child terminal publication must follow proven undo completion.
+ * Spec: 2026-10-26-pre2-p013-full-savepoint-design.md
  */
 static void
 AbortSubTransaction(void)
@@ -6163,6 +6170,12 @@ AbortSubTransaction(void)
 		elog(WARNING, "AbortSubTransaction while in %s state",
 			 TransStateAsString(s->state));
 
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: finish local undo while the native frame is still provable.
+	 * Child WAL/CLOG and resource teardown must follow durable completion.
+	 * Spec: 2026-10-26-pre2-p013-full-savepoint-design.md */
+	cluster_savepoint_subabort(s->subTransactionId);
+#endif
 	s->state = TRANS_ABORT;
 
 	/*

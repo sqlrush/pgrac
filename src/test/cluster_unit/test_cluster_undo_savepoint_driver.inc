@@ -1,6 +1,22 @@
-/* Real record-owner rollback composition, with the existing explicit
- * pool/current/WAL/TT boundary services. No native cleanup is simulated.
+/*-------------------------------------------------------------------------
+ *
+ * test_cluster_undo_savepoint_driver.inc
+ *    Exercise original record-owner rollback composition.
+ *
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2026, pgrac contributors
+ *
  * Author: SqlRush <sqlrush@gmail.com>
+ *
+ * IDENTIFICATION
+ *    src/test/cluster_unit/test_cluster_undo_savepoint_driver.inc
+ *
+ * NOTES
+ *    PGRAC-original tests use explicit pool/current/WAL/TT boundaries.
+ *    The record owner is real; no native child cleanup is simulated.
+ *
+ *-------------------------------------------------------------------------
  */
 #ifndef CLUSTER_UNDO_SAVEPOINT_DRIVER_PRESENT
 static bool
@@ -15,6 +31,41 @@ cluster_undo_record_rollback_savepoint(ClusterUndoSavepointControl *control, UBA
 	return false;
 }
 #endif
+
+#ifndef CLUSTER_UNDO_SAVEPOINT_CURRENT_DRIVER_PRESENT
+static bool
+cluster_undo_record_rollback_savepoint_current(ClusterUndoSavepointControl *control,
+											   uint64 deadline, XLogRecPtr *cut)
+{
+	(void)control;
+	(void)deadline;
+	if (cut != NULL)
+		*cut = InvalidXLogRecPtr;
+	return false;
+}
+#endif
+
+/* The linked TT fixture separately executes the real current sampler.
+ * This boundary supplies only its exact compare input to the real record
+ * chain proof, PENDING/head publication, cursor and COMPLETE consumers. */
+bool
+cluster_tt_slot_durable_sample_operation_head(const xl_undo_tt_slot_set_head_operation *record,
+											  const ClusterSemanticAdmissionToken *admission,
+											  UBA *out)
+{
+	rollback_driver_test_samples++;
+	UT_ASSERT(rollback_driver_test_mode && admission->entered);
+	UT_ASSERT(cluster_undo_head_operation_valid(record));
+	UT_ASSERT_EQ(pending_test_wal_calls, 0);
+	UT_ASSERT_EQ(reserve_test_pins, 0);
+	*out = InvalidUba;
+	if (rollback_driver_test_sample_fault == 1)
+		return false;
+	if (rollback_driver_test_sample_fault == 2)
+		undo_savepoint_cursor_fail();
+	*out = rollback_driver_test_expected;
+	return true;
+}
 
 static void
 rollback_driver_test_after_head(void)
@@ -48,6 +99,7 @@ rollback_driver_test_begin(ClusterUndoSavepointControl **control,
 	rollback_driver_test_mode = true;
 	rollback_driver_test_fault = 0;
 	rollback_driver_test_expected = InvalidUba;
+	rollback_driver_test_samples = rollback_driver_test_sample_fault = 0;
 }
 
 static void
@@ -309,4 +361,76 @@ UT_TEST(test_rollback_driver_post_complete_corruption_is_fatal)
 	UT_ASSERT_EQ(cursor_test_wal_calls, 3);
 	UT_ASSERT_EQ(head_pipeline_test_flushed, 603);
 	rollback_driver_test_end();
+}
+
+UT_TEST(test_current_rollback_driver_samples_exact_canonical_head_once)
+{
+	for (unsigned previous = 0; previous < 2; previous++) {
+		ClusterUndoSavepointControl *control;
+		ClusterUndoSavepointBounds bounds;
+		XLogRecPtr cut = 99;
+
+		rollback_driver_test_begin(&control, &bounds);
+		if (previous != 0)
+			rollback_driver_test_expected = head_pipeline_address(2);
+		UT_ASSERT(cluster_undo_record_rollback_savepoint_current(control, 100, &cut));
+		UT_ASSERT_EQ(cut, 603);
+		UT_ASSERT_EQ(rollback_driver_test_samples, 1);
+		UT_ASSERT_EQ(head_pipeline_test_tt_calls, 1);
+		UT_ASSERT_EQ(cursor_test_body()->phase, 4);
+		UT_ASSERT(control->owns_ref);
+		UT_ASSERT(cluster_undo_record_rollback_savepoint_current(control, 100, &cut));
+		UT_ASSERT_EQ(rollback_driver_test_samples, 1);
+		UT_ASSERT_EQ(cut, 603);
+		rollback_driver_test_end();
+	}
+}
+
+UT_TEST(test_current_rollback_driver_empty_range_does_not_sample_tt)
+{
+	ClusterUndoSavepointControl *control;
+	ClusterUndoSavepointBounds bounds;
+	XLogRecPtr cut = 99;
+
+	rollback_driver_test_begin(&control, &bounds);
+	reserve_test_set_head(bounds.stop_uba);
+	UT_ASSERT(cluster_undo_record_rollback_savepoint_current(control, 100, &cut));
+	UT_ASSERT_EQ(cut, 0);
+	UT_ASSERT_EQ(rollback_driver_test_samples, 0);
+	UT_ASSERT(control->owns_ref && control->reserved);
+	rollback_driver_test_end();
+}
+
+UT_TEST(test_current_rollback_driver_unproven_sample_cannot_resume_parent)
+{
+	for (unsigned fault = 1; fault <= 3; fault++) {
+		ClusterUndoSavepointControl *control;
+		ClusterUndoSavepointBounds bounds;
+		XLogRecPtr cut = 99;
+		volatile bool caught = false;
+
+		rollback_driver_test_begin(&control, &bounds);
+		rollback_driver_test_sample_fault = fault;
+		if (fault == 3)
+			rollback_driver_test_expected = head_pipeline_address(1); /* DATA, not a control. */
+		receipt_trap_error = true;
+		receipt_error_level = 0;
+		PG_TRY();
+		{
+			(void)cluster_undo_record_rollback_savepoint_current(control, 100, &cut);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		receipt_trap_error = false;
+		UT_ASSERT(caught && receipt_error_level == PANIC);
+		UT_ASSERT_EQ(cut, 0);
+		UT_ASSERT_EQ(rollback_driver_test_samples, 1);
+		UT_ASSERT_EQ(pending_test_wal_calls + head_pipeline_test_tt_calls, 0);
+		UT_ASSERT_EQ(reserve_test_pins, 0);
+		UT_ASSERT(control->owns_ref && control->reserved);
+		rollback_driver_test_end();
+	}
 }

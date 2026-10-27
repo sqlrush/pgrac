@@ -31,6 +31,15 @@ for name in names:
         raise SystemExit("native function end not found: " + name)
     bodies.append(source[start.start():start.end() + end.end()] + "\n")
 
+# Execute the native state transition with its real cluster hook, if present.
+# The rest of abort's unchanged resource machinery is outside this fixture.
+abort = source.index("static void\nAbortSubTransaction(void)\n{")
+start = source.index('\tShowTransactionState("AbortSubTransaction");', abort)
+end = source.index("\ts->state = TRANS_ABORT;", start) + len("\ts->state = TRANS_ABORT;")
+bodies.append("static void\ntest_native_subabort_transition(void)\n{\n"
+              "\tTransactionState s = CurrentTransactionState;\n"
+              + source[start:end] + "\n}\n")
+
 command = source.index("void\nCommitTransactionCommand(void)")
 for state, name in (("TBLOCK_SUBRESTART", "test_native_restart_live"),
                     ("TBLOCK_SUBABORT_RESTART", "test_native_restart_aborted")):

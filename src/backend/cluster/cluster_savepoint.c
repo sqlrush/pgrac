@@ -316,6 +316,39 @@ cluster_savepoint_define(SubTransactionId subid, char **name_slot, int savepoint
 	}
 }
 
+/* Spec: 2026-10-26-pre2-p013-full-savepoint-design.md.
+ * Native identity remains live through the original durable rollback driver. */
+void
+cluster_savepoint_subabort(SubTransactionId subid)
+{
+	ClusterSavepointFrame *frame = savepoint_frames;
+	XLogRecPtr complete_cut;
+	bool incomplete_empty;
+
+	if (!cluster_storage_mode_enabled())
+		return;
+	/* Failed metadata allocation precedes any first-effect producer. Native
+	 * PopTransaction will clear pending_start after its ordinary cleanup. */
+	incomplete_empty = pending_start == subid && (frame == NULL || frame->subid != subid)
+					   && !FullTransactionIdIsValid(GetCurrentFullTransactionIdIfAny());
+	if (subid > TopSubTransactionId && GetCurrentSubTransactionId() == subid
+		&& (incomplete_empty
+			|| (pending_start == InvalidSubTransactionId && frame != NULL
+				&& frame->subid == subid))) {
+		if (incomplete_empty || frame->control == NULL)
+			return;
+		/* The driver proves the live frame, quiescence, exact canonical head,
+		 * all marks/cursors and actual COMPLETE before native cleanup. */
+		if (cluster_undo_record_rollback_savepoint_current(
+				frame->control, cluster_undo_record_prepare_deadline_us(), &complete_cut))
+			return;
+	}
+	ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+					errmsg("cannot finish savepoint rollback before native child cleanup"),
+					errhint("Retain the transaction's undo and recover its canonical owner before "
+							"continuing.")));
+}
+
 void
 cluster_savepoint_forget(SubTransactionId subid)
 {

@@ -222,6 +222,15 @@ extern bool cluster_undo_record_rollback_savepoint(ClusterUndoSavepointControl *
 												   uint64 absolute_deadline_us,
 												   XLogRecPtr *cut_out);
 
+/* Live native cleanup entry. Sample the predecessor through the original TT
+ * current owner, then independently recheck it in the existing publisher.
+ * The frame must still be active. Same completion/fail-stop contract as above;
+ * empty scopes and already completed controls need no new TT sample. */
+#define CLUSTER_UNDO_SAVEPOINT_CURRENT_DRIVER_PRESENT 1
+extern bool cluster_undo_record_rollback_savepoint_current(ClusterUndoSavepointControl *control,
+														   uint64 absolute_deadline_us,
+														   XLogRecPtr *cut_out);
+
 
 /* Stack-only identity for one backend-local prepared DATA reservation.  It is
  * neither shared state nor authority: the block0 publication is a retained

@@ -148,6 +148,8 @@ static bool complete_test_mode;
 static bool rollback_driver_test_mode;
 static int rollback_driver_test_fault;
 static UBA rollback_driver_test_expected;
+static int rollback_driver_test_samples;
+static int rollback_driver_test_sample_fault;
 static void rollback_driver_test_after_head(void);
 static void rollback_driver_test_after_cursor(void);
 static bool precommit_test_mode, precommit_test_binding_missing, precommit_test_refuse_current;
@@ -6145,7 +6147,7 @@ UT_TEST(test_exact_zero_abort_keeps_cleanup_after_native_scope_ends)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(253);
+	UT_PLAN(256);
 	UT_RUN(test_rollback_driver_publishes_marks_and_reads_complete);
 	UT_RUN(test_rollback_driver_empty_range_keeps_unused_reservation);
 	UT_RUN(test_rollback_driver_runs_every_physical_block);
@@ -6404,6 +6406,9 @@ main(int argc, char **argv)
 	UT_RUN(test_receipt_lifecycle_critical_and_held_lock_gaps_do_not_change_prepare);
 	UT_RUN(test_receipt_lifecycle_two_targets_keep_distinct_publication_operations);
 	UT_RUN(test_receipt_lifecycle_cancel_is_idempotent_and_does_not_read_shared_pointer);
+	UT_RUN(test_current_rollback_driver_samples_exact_canonical_head_once);
+	UT_RUN(test_current_rollback_driver_empty_range_does_not_sample_tt);
+	UT_RUN(test_current_rollback_driver_unproven_sample_cannot_resume_parent);
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;
 }

@@ -65,6 +65,18 @@ cluster_tt_slot_durable_publish_operation_head(const xl_undo_tt_slot_set_head_op
 											   UBA expected_head, XLogRecPtr pending_lsn,
 											   const ClusterSemanticAdmissionToken *admission);
 
+/* Sample the exact local ACTIVE predecessor through that same current owner.
+ * No WAL or header writer is prepared. The result is only a compare input:
+ * later publication must independently recheck it and the complete identity.
+ * Borrow admission; call without content locks or a critical section.
+ * Unproven identity/current/content raises ERROR and leaves out canonical nil;
+ * false is possible only for a NULL output. Not historical/read authority. */
+#define CLUSTER_TT_SAMPLE_OPERATION_HEAD_PRESENT 1
+extern bool
+cluster_tt_slot_durable_sample_operation_head(const xl_undo_tt_slot_set_head_operation *record,
+											  const ClusterSemanticAdmissionToken *admission,
+											  UBA *out);
+
 /*
  * Pure decision predicates (no I/O) -- shared by the runtime lookup/redo paths
  * and exercised directly by cluster_unit (file I/O behavior is e2e in t/219).

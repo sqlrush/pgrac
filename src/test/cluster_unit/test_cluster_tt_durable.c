@@ -3941,6 +3941,7 @@ UT_TEST(test_operation_head_present_barrier_failure_is_fatal)
 
 #include "test_cluster_tt_head_chain.inc"
 #include "test_cluster_tt_live_head.inc"
+#include "test_cluster_tt_sample_head.inc"
 
 /*
  * F-D-29 restart residue: a crash restart rebuilds shared memory -- and the
@@ -4219,7 +4220,7 @@ UT_TEST(test_revert_delete_identity_mismatch_failclosed)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(156);
+	UT_PLAN(162);
 	UT_RUN(test_retained_commit_stages_before_flush_and_preserves_head);
 	UT_RUN(test_retained_commit_unstage_keeps_original_abort_obligation);
 	UT_RUN(test_retained_commit_rejects_invalid_head_and_predecessor);
@@ -4392,6 +4393,12 @@ main(int argc, char **argv)
 	UT_RUN(test_live_head_original_wait_and_cancel);
 	UT_RUN(test_live_head_rolled_away_binding_uses_physical_owner);
 
+	UT_RUN(test_sample_head_returns_exact_current_source_and_target);
+	UT_RUN(test_sample_head_is_only_an_exact_compare_input);
+	UT_RUN(test_sample_head_rejects_incomplete_identity_before_current);
+	UT_RUN(test_sample_head_rejects_unknown_current_or_canonical_bytes);
+	UT_RUN(test_sample_head_rechecks_actor_root_and_current_before_return);
+	UT_RUN(test_sample_head_keeps_original_wait_and_request_snapshot);
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;
 }

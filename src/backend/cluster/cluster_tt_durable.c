@@ -1174,24 +1174,46 @@ tt_live_head_fail(int level, const char *stage)
 }
 
 static bool
+tt_live_head_actor_valid(const xl_undo_tt_slot_set_head_operation *record,
+						 const ClusterSemanticAdmissionToken *admission)
+{
+	return cluster_undo_head_operation_valid(record) && cluster_shared_config
+		   && cluster_node_id >= 0 && record->head.instance == (uint32)cluster_node_id + 1
+		   && record->operation.canonical_segment_generation != UINT32_MAX && admission != NULL
+		   && admission->entered
+		   && (admission->side == CLUSTER_SEMANTIC_SOURCE_SIDE
+			   || admission->side == CLUSTER_SEMANTIC_TARGET_SIDE)
+		   && MyProc != NULL && LocalTransactionIdIsValid(MyProc->lxid) && CritSectionCount == 0
+		   && !tt_live_head_stage.busy && !tt_commit_stage.armed;
+}
+
+static bool
 tt_live_head_input_valid(const xl_undo_tt_slot_set_head_operation *record, UBA expected_head,
 						 XLogRecPtr pending_lsn, const ClusterSemanticAdmissionToken *admission)
 {
 	UndoRecordHeader owner = { 0 };
 
-	if (!cluster_undo_head_operation_valid(record) || XLogRecPtrIsInvalid(pending_lsn)
-		|| !cluster_shared_config || cluster_node_id < 0
-		|| record->head.instance != (uint32)cluster_node_id + 1
-		|| record->operation.canonical_segment_generation == UINT32_MAX || admission == NULL
-		|| !admission->entered
-		|| (admission->side != CLUSTER_SEMANTIC_SOURCE_SIDE
-			&& admission->side != CLUSTER_SEMANTIC_TARGET_SIDE)
-		|| MyProc == NULL || !LocalTransactionIdIsValid(MyProc->lxid) || CritSectionCount != 0
-		|| tt_live_head_stage.busy || tt_commit_stage.armed)
+	if (!tt_live_head_actor_valid(record, admission) || XLogRecPtrIsInvalid(pending_lsn))
 		return false;
 	owner.origin_node_id = record->head.instance - 1;
 	owner.tt_slot_id = record->head.slot_offset + 1;
 	return cluster_undo_rollback_address_valid(&owner, expected_head, true);
+}
+
+static void
+tt_live_head_begin(TTLiveHeadStage *stage, const xl_undo_tt_slot_set_head_operation *record,
+				   const ClusterSemanticAdmissionToken *admission)
+{
+	stage->busy = true;
+	stage->record = *record;
+	stage->admission = admission;
+	stage->lxid = MyProc->lxid;
+	stage->proc = MyProc;
+	stage->allocator.segment_id = record->head.segment_id;
+	stage->allocator.xid = record->head.xid;
+	stage->allocator.slot_offset = record->head.slot_offset;
+	stage->allocator.wrap = record->head.wrap;
+	stage->allocator.status = CTS_ACTIVE;
 }
 
 static bool
@@ -1270,12 +1292,13 @@ tt_live_head_header_matches(TTLiveHeadStage *stage, const UndoSegmentHeaderData 
 }
 
 static void
-tt_live_head_snapshot(TTLiveHeadStage *stage)
+tt_live_head_snapshot(TTLiveHeadStage *stage, bool sampling)
 {
 	PGAlignedBlock disk;
 	const UndoSegmentHeaderData *header = (const UndoSegmentHeaderData *)disk.data;
 	const xl_undo_tt_slot_set_head *head = &stage->record.head;
 	ClusterUndoHeadOperationDecision decision;
+	UndoRecordHeader owner = { 0 };
 	bool read_ok;
 
 	cluster_tt_durable_io_wait_start();
@@ -1291,33 +1314,44 @@ tt_live_head_snapshot(TTLiveHeadStage *stage)
 	stage->predecessor = header->tt_slots[head->slot_offset];
 	decision = cluster_undo_head_operation_decide(stage->generation.value, &stage->predecessor,
 												  &stage->record);
+	owner.origin_node_id = head->instance - 1;
+	owner.tt_slot_id = head->slot_offset + 1;
 	if ((decision != CLUSTER_UNDO_HEAD_OPERATION_APPLY
 		 && decision != CLUSTER_UNDO_HEAD_OPERATION_ALREADY)
-		|| !cluster_undo_record_uba_equal(stage->expected_head,
-										  stage->predecessor.first_undo_block))
+		|| !cluster_undo_rollback_address_valid(&owner, stage->predecessor.first_undo_block, true)
+		|| (!sampling
+			&& !cluster_undo_record_uba_equal(stage->expected_head,
+											  stage->predecessor.first_undo_block)))
 		tt_live_head_fail(ERROR, "canonical ACTIVE retained head is not exact");
 	stage->successor = stage->predecessor;
 	stage->successor.first_undo_block = head->first_undo_block;
 }
 
+static bool
+tt_live_head_recheck(TTLiveHeadStage *stage)
+{
+	ClusterUndoBlock0ResolvedRoot final_root;
+
+	return tt_live_head_resolve(stage, &final_root)
+		   && cluster_undo_block0_root_matches(&stage->root, &final_root) && MyProc == stage->proc
+		   && MyProc->lxid == stage->lxid
+		   && cluster_semantic_activation_modifier_recheck(stage->admission, true)
+		   && cluster_undo_block0_current_recheck_exclusive(&stage->guard) == CLUSTER_UNDO_BLOCK0_OK
+		   && tt_allocator_corroborates_or_rolled_away(&stage->allocator)
+		   && tt_live_head_header_matches(stage, stage->resident)
+		   && memcmp(&stage->resident->tt_slots[stage->record.head.slot_offset],
+					 &stage->predecessor, sizeof(TTSlot))
+				  == 0;
+}
+
 static void
 tt_live_head_prepare(TTLiveHeadStage *stage)
 {
-	ClusterUndoBlock0ResolvedRoot final_root;
 	const xl_undo_tt_slot_set_head *head = &stage->record.head;
 
 	tt_live_head_acquire(stage);
-	tt_live_head_snapshot(stage);
-	if (!tt_live_head_resolve(stage, &final_root)
-		|| !cluster_undo_block0_root_matches(&stage->root, &final_root) || MyProc != stage->proc
-		|| MyProc->lxid != stage->lxid
-		|| !cluster_semantic_activation_modifier_recheck(stage->admission, true)
-		|| cluster_undo_block0_current_recheck_exclusive(&stage->guard) != CLUSTER_UNDO_BLOCK0_OK
-		|| !tt_allocator_corroborates_or_rolled_away(&stage->allocator)
-		|| !tt_live_head_header_matches(stage, stage->resident)
-		|| memcmp(&stage->resident->tt_slots[head->slot_offset], &stage->predecessor,
-				  sizeof(TTSlot))
-			   != 0)
+	tt_live_head_snapshot(stage, false);
+	if (!tt_live_head_recheck(stage))
 		tt_live_head_fail(ERROR, "canonical authority changed before head WAL");
 	stage->fd = cluster_undo_smgr_header_writer_open(stage->root.intent, head->segment_id,
 													 head->instance);
@@ -1384,6 +1418,40 @@ tt_live_head_release(TTLiveHeadStage *stage)
 	stage->pin.slot = -1;
 }
 
+/* Spec: 2026-10-26-pre2-p013-full-savepoint-design.md.
+ * Observe the canonical predecessor without creating publication authority.
+ * Its consumer must still prove retained ancestry and exact head publication. */
+bool
+cluster_tt_slot_durable_sample_operation_head(const xl_undo_tt_slot_set_head_operation *record,
+											  const ClusterSemanticAdmissionToken *admission,
+											  UBA *out)
+{
+	TTLiveHeadStage *stage = &tt_live_head_stage;
+	UBA sampled;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (!tt_live_head_actor_valid(record, admission))
+		tt_live_head_fail(ERROR, "invalid local head sample request");
+	tt_live_head_begin(stage, record, admission);
+	PG_TRY();
+	{
+		tt_live_head_acquire(stage);
+		tt_live_head_snapshot(stage, true);
+		if (!tt_live_head_recheck(stage))
+			tt_live_head_fail(ERROR, "canonical authority changed before head sample return");
+		sampled = stage->predecessor.first_undo_block;
+	}
+	PG_FINALLY();
+	{
+		tt_live_head_release(stage);
+	}
+	PG_END_TRY();
+	*out = sampled;
+	return true;
+}
+
 XLogRecPtr
 cluster_tt_slot_durable_publish_operation_head(const xl_undo_tt_slot_set_head_operation *record,
 											   UBA expected_head, XLogRecPtr pending_lsn,
@@ -1398,18 +1466,9 @@ cluster_tt_slot_durable_publish_operation_head(const xl_undo_tt_slot_set_head_op
 	if (!tt_live_head_input_valid(record, expected_head, pending_lsn, admission))
 		tt_live_head_fail(ERROR, "invalid local publication request");
 	saved_flags = proc->delayChkptFlags;
-	stage->busy = true;
-	stage->record = *record;
+	tt_live_head_begin(stage, record, admission);
 	stage->expected_head = expected_head;
 	stage->pending_lsn = pending_lsn;
-	stage->admission = admission;
-	stage->lxid = proc->lxid;
-	stage->proc = proc;
-	stage->allocator.segment_id = record->head.segment_id;
-	stage->allocator.xid = record->head.xid;
-	stage->allocator.slot_offset = record->head.slot_offset;
-	stage->allocator.wrap = record->head.wrap;
-	stage->allocator.status = CTS_ACTIVE;
 	PG_TRY();
 	{
 		tt_live_head_prepare(stage);

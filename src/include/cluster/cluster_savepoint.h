@@ -14,6 +14,7 @@
 #define CLUSTER_SAVEPOINT_OPERATION_PRESENT 1
 #define CLUSTER_SAVEPOINT_FRAME_OPERATION_PRESENT 1
 #define CLUSTER_SAVEPOINT_RESERVE_PRESENT 1
+#define CLUSTER_SAVEPOINT_SUBABORT_PRESENT 1
 
 /* Backend-local capture, never a substitute for canonical TT authority.
  * Raw tuple/index writers retain operation_fxid; top alone owns the TT slot. */
@@ -63,6 +64,12 @@ extern void cluster_savepoint_start(SubTransactionId subid);
  * Older names at this savepoint level are retired; their frames stay live. */
 extern void cluster_savepoint_define(SubTransactionId subid, char **name_slot,
 									 int savepoint_level);
+
+/* After original receipt/lock cleanup but before native TRANS_ABORT, child
+ * CLOG/WAL or resource teardown. No xid assignment for empty/partial starts.
+ * A nonempty live frame cannot return without original durable completion;
+ * UNKNOWN/refusal is PANIC. Does not pop metadata or terminate top's ITL/TT. */
+extern void cluster_savepoint_subabort(SubTransactionId subid);
 
 /* Native PopTransaction calls this for RELEASE and abort cleanup, including
  * an incomplete start. This releases only unused control references and metadata, not effects. */

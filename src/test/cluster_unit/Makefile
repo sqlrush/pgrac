@@ -264,7 +264,8 @@ test_cluster_savepoint_native.inc: $(top_srcdir)/src/backend/access/transam/xact
 	python3 $(srcdir)/extract_cluster_savepoint_xact.py $< $@
 
 test_cluster_savepoint: test_cluster_savepoint.c test_cluster_savepoint_native.inc unit_test.h $(top_srcdir)/src/backend/cluster/cluster_savepoint.c $(top_srcdir)/src/include/cluster/cluster_savepoint.h $(top_srcdir)/src/include/cluster/cluster_tt_local.h $(top_srcdir)/src/include/cluster/cluster_tt_slot.h $(top_builddir)/src/port/libpgport_srv.a \
-	test_cluster_savepoint_reserve.inc $(top_srcdir)/src/include/cluster/cluster_undo_record_api.h
+	test_cluster_savepoint_reserve.inc test_cluster_savepoint_subabort.inc \
+	$(top_srcdir)/src/include/cluster/cluster_undo_record_api.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(top_builddir)/src/port/libpgport_srv.a $(LDFLAGS) -o $@
 
 cluster_unit_port_stubs.o: cluster_unit_port_stubs.c
@@ -8693,6 +8694,7 @@ test_cluster_tt_active_owner test_cluster_tt_slot_allocator: \
 test_cluster_tt_durable test_cluster_tt_rollback_entry test_cluster_tt_abort_owner \
 test_cluster_tt_active_owner test_cluster_tt_terminal_trace test_cluster_relmap_native_tt.o: \
 		$(srcdir)/test_cluster_tt_live_head.inc \
+		$(srcdir)/test_cluster_tt_sample_head.inc \
 		$(srcdir)/test_cluster_tt_abort_retained.inc \
 		$(srcdir)/test_cluster_tt_commit_retained.inc
 
