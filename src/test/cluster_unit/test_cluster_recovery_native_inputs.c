@@ -1033,6 +1033,9 @@ UT_TEST(test_ctrc_inventory_keeps_original_local_cut_and_native_terminal_bytes)
 #include "test_cluster_recovery_relmap_fold.inc"
 #include "test_cluster_recovery_relmap_history.inc"
 
+#include "test_cluster_recovery_episode_history.inc"
+
+
 int
 main(int argc, char **argv)
 {
@@ -1040,6 +1043,18 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_EPISODE_HISTORY") != NULL) {
+		UT_PLAN(8);
+		UT_RUN(test_episode_history_selected_window_drift_invalidates_inventory);
+		UT_RUN(test_episode_history_uses_all_original_sources_and_actual_window);
+		UT_RUN(test_episode_history_requires_declaration_and_complete_original_holders);
+		UT_RUN(test_episode_history_refusal_revokes_episode_and_keeps_protection);
+		UT_RUN(test_episode_history_first_current_error_is_sticky);
+		UT_RUN(test_episode_history_stops_before_second_pass_after_sibling_loss);
+		UT_RUN(test_episode_history_retains_history_and_current_generations_together);
+		UT_RUN(test_episode_history_budget_index_and_alias_refusals_do_not_rebase);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_CTRC_WAL_SOURCES") != NULL) {
 		UT_PLAN(7);
 		UT_RUN(test_wal_sources_include_all_records_without_page_inputs);
@@ -1073,7 +1088,7 @@ main(int argc, char **argv)
 	UT_RUN(test_owned_page_inventory_capacity_never_silently_omits_physical_pages);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(115);
+	UT_PLAN(123);
 	UT_RUN(test_wal_sources_include_all_records_without_page_inputs);
 	UT_RUN(test_wal_sources_keep_explicit_empty_and_every_original_generation);
 	UT_RUN(test_wal_sources_preserve_page_and_native_effect_cursors);
@@ -1190,6 +1205,14 @@ main(int argc, char **argv)
 	UT_RUN(test_relmap_history_metadata_drift_revokes_original_inventory);
 	UT_RUN(test_relmap_history_owner_window_and_borrowed_record_source);
 	UT_RUN(test_relmap_history_preserves_sorted_empty_and_initializer_inputs);
+	UT_RUN(test_episode_history_selected_window_drift_invalidates_inventory);
+	UT_RUN(test_episode_history_uses_all_original_sources_and_actual_window);
+	UT_RUN(test_episode_history_requires_declaration_and_complete_original_holders);
+	UT_RUN(test_episode_history_refusal_revokes_episode_and_keeps_protection);
+	UT_RUN(test_episode_history_first_current_error_is_sticky);
+	UT_RUN(test_episode_history_stops_before_second_pass_after_sibling_loss);
+	UT_RUN(test_episode_history_retains_history_and_current_generations_together);
+	UT_RUN(test_episode_history_budget_index_and_alias_refusals_do_not_rebase);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

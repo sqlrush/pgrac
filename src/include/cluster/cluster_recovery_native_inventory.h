@@ -211,6 +211,43 @@ extern bool cluster_recovery_native_inventory_page_count_v1(
 extern bool cluster_recovery_native_inventory_page_at_v1(
 	ClusterRecoveryNativeInventory *inventory, uint32 index, ClusterRecoveryPageWalV1 *out);
 
+/* Complete generation inputs from the original declared relmap episode.
+ * source.selected remains the full original selector value; census ordinal
+ * and source.input_index need not agree. Flags describe observed bytes,
+ * never a record's FullXid era, CLOG lifetime or terminal qualification. */
+typedef struct ClusterRecoveryRelmapHistoryEntryV1 {
+	ClusterRecoveryRelmapSourceV1 source;
+	XLogRecPtr checkpoint_end;
+	ClusterRelmapCheckpointWindow window;
+	uint64 post_flush_issued;
+	bool checkpoint_observed, window_observed;
+} ClusterRecoveryRelmapHistoryEntryV1;
+
+typedef struct ClusterRecoveryRelmapHistory ClusterRecoveryRelmapHistory;
+
+/* Borrow the same all-replay IR/WALR scope, not a new per-origin owner.
+ * The budget includes this handle and the complete two-pass inventory.
+ * Missing/legacy windows stay explicit unqualified inputs. Entered refusal
+ * or ERROR revokes the original episode, retaining its protections/debt.
+ * Destroy local custody before the original scope/ResourceOwner ends.
+ * No native allocation, CLOG truncation, COMPLETE, OPEN or release right. */
+extern ClusterRecoveryNativeInventoryResult cluster_recovery_relmap_history_build_v1(
+	const ClusterRecoveryRelmapSourceV1 *source, size_t memory_budget,
+	ClusterRecoveryRelmapHistory **out,
+	ClusterRecoveryNativeInventoryDiag *diag);
+/* One original generation in census order, including empty/history sources.
+ * No I/O/cursor changes. Current checks bracket publication of copied bytes.
+ * Invalid index/overlapping output is a precondition refusal; other failure
+ * is sticky. All outputs remain provisional until the full final recheck. */
+extern bool cluster_recovery_relmap_history_source_v1(ClusterRecoveryRelmapHistory *history,
+	uint32 ordinal, ClusterRecoveryRelmapHistoryEntryV1 *out);
+/* Reread every original physical input and full selected metadata, comparing
+ * to the saved baseline under the same original episode. Never rebase.
+ * One full synchronous census, not a bounded metadata tick. */
+extern ClusterRecoveryNativeInventoryResult cluster_recovery_relmap_history_recheck_v1(
+	ClusterRecoveryRelmapHistory *history, ClusterRecoveryNativeInventoryDiag *diag);
+extern void cluster_recovery_relmap_history_destroy_v1(ClusterRecoveryRelmapHistory **history);
+
 /* Borrow the original startup cold scope for two complete physical passes.
  * Retain native effects and original undo WAL with complete owned payloads.
  * Every source (including explicit empty terminals), exact cut, record
