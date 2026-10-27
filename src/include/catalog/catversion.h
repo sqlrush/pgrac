@@ -712,7 +712,9 @@
  * Fresh homogeneous databases only; not an in-place/rolling format upgrade. */
 /* Current grant proof V6 carries original FullXid V2 identities.
  * Fresh clusters only; existing data directories require reinitialization. */
-#define CATALOG_VERSION_NO 202610271
+/* Retained IMAGE V3 owner/join capacity changes shared-memory geometry.
+ * Fresh homogeneous clusters only; no in-place upgrade. */
+#define CATALOG_VERSION_NO 202610272
 
 /* spec-5.13 (2026-06-27): clean-leave catalog surface — cluster_get_clean_leave_state
  * SRF (oid 8960) + pg_cluster_clean_leave_state view + pg_cluster_clean_leave_request

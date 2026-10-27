@@ -883,10 +883,41 @@ UT_TEST(test_resource_x_length_collisions_preserve_legacy_domains)
 				 -1);
 }
 
+UT_TEST(test_resource_x_v3_image_routes_complete_validated_frame)
+{
+	BufferTag tag = make_tag(1663, 5, 37003, MAIN_FORKNUM, 773);
+	uint8 payload[RESOURCE_X_IMAGE_V3_MAX_BYTES];
+	ResourceXDecodedFrame image;
+	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
+	uint16 bytes;
+	uint8 *bundle;
+	uint8 *record;
+
+	bytes = make_resource_x_route_frame(RESOURCE_X_WIRE_IMAGE_ENVELOPE,
+		RESOURCE_X_MSG_IMAGE_OR_GRANT, tag, payload, RESOURCE_X_IMAGE_V2_BYTES);
+	UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, payload,
+		bytes, &image, &reject));
+	bundle = image.body.image_envelope.ctrc_delegation;
+	record = bundle + RESOURCE_X_CTRC_BUNDLE_HEADER_BYTES;
+	/* Structural opaque fixture, not origin/delegation authentication. */
+	image.body.image_envelope.ctrc_delegation_bytes = 232;
+	bundle[1] = 1; bundle[3] = 232; bundle[5] = 1;
+	record[1] = 1; record[3] = 224; record[5] = 1;
+	record[8] = 2; record[10] = 144;
+	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, &image,
+		payload, sizeof(payload), &bytes, &reject));
+	UT_ASSERT_EQ(bytes, RESOURCE_X_IMAGE_V3_MIN_BYTES);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(RESOURCE_X_MSG_IMAGE_OR_GRANT,
+		payload, bytes, CLUSTER_LMS_MAX_WORKERS), cluster_lms_shard_for_tag(&tag, CLUSTER_LMS_MAX_WORKERS));
+	payload[bytes - 1] ^= 1;
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(RESOURCE_X_MSG_IMAGE_OR_GRANT,
+		payload, bytes, CLUSTER_LMS_MAX_WORKERS), -1);
+}
+
 int
 main(void)
 {
-	UT_PLAN(16);
+	UT_PLAN(17);
 	UT_RUN(test_route_matches_shard_for_tag);
 	UT_RUN(test_route_ack_request_interleave_affinity);
 	UT_RUN(test_route_registry_partition);
@@ -903,6 +934,7 @@ main(void)
 	UT_RUN(test_pi_durable_note_routes_to_exact_tag_worker);
 	UT_RUN(test_resource_x_reused_types_route_only_after_strict_domain_decode);
 	UT_RUN(test_resource_x_length_collisions_preserve_legacy_domains);
+	UT_RUN(test_resource_x_v3_image_routes_complete_validated_frame);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

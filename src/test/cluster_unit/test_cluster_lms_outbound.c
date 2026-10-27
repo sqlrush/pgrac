@@ -172,7 +172,7 @@ cluster_ic_tier1_resource_x_stream_generation(int32 peer, int channel)
 static uint32 ut_peer_capabilities[CLUSTER_MAX_NODES];
 static uint32 ut_peer_cap_generation[CLUSTER_MAX_NODES];
 static ResourceXIntentSlot ut_resource_x_owner_slot;
-static uint8 ut_resource_x_owner_payload[RESOURCE_X_IMAGE_V2_BYTES];
+static uint8 ut_resource_x_owner_payload[RESOURCE_X_IMAGE_V3_MAX_BYTES];
 static int ut_resource_x_stage_count = 0;
 static bool ut_resource_x_stage_not_due;
 static int ut_resource_x_rearm_count = 0;
@@ -2620,10 +2620,37 @@ UT_TEST(test_plain_frame_old_head_does_not_block_new_cut_frame)
 	UT_ASSERT_EQ(ut_sent_log[0].marker, 0xa9);
 }
 
+UT_TEST(test_resource_x_v3_image_intent_uses_retained_owner_without_truncation)
+{
+	const uint16 sizes[] = { RESOURCE_X_IMAGE_V3_MIN_BYTES, RESOURCE_X_IMAGE_V3_MAX_BYTES };
+
+	for (unsigned i = 0; i < lengthof(sizes); i++) {
+		ResourceXIntentSlot intent;
+
+		ut_reset_log();
+		intent = ut_resource_x_image_intent(UT_PEER_X);
+		intent.payload_bytes = sizes[i];
+		ut_resource_x_owner_slot = intent;
+		memset(ut_resource_x_owner_payload, 0xAA, sizes[i]);
+		ut_peer_capabilities[UT_PEER_X] = PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1;
+		ut_peer_cap_generation[UT_PEER_X] = 84;
+		ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_DONE;
+		UT_ASSERT_EQ(cluster_lms_outbound_enqueue_resource_x_intent(0, &intent, 84, UINT64_MAX),
+			CLUSTER_LMS_ENQUEUE_ADMITTED);
+		UT_ASSERT_EQ(cluster_lms_outbound_drain_send(0), 1);
+		UT_ASSERT_EQ(ut_sent_n, 1);
+		UT_ASSERT_EQ(ut_sent_log[0].payload_len, sizes[i]);
+		UT_ASSERT_EQ(ut_sent_log[0].marker, 0xAA);
+		UT_ASSERT_EQ(ut_resource_x_rebind_count, 1);
+		UT_ASSERT_EQ(ut_resource_x_complete_count, 1);
+		UT_ASSERT_EQ(ut_resource_x_owner_slot.state, RESOURCE_X_INTENT_SLOT_EMPTY);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(58);
+	UT_PLAN(59);
 
 	UT_RUN(test_normal_stop_missing_outbound_is_not_empty);
 	UT_RUN(test_ring_shmem_init);
@@ -2652,6 +2679,7 @@ main(void)
 	UT_RUN(test_resource_x_holder_release_transport_waits_for_actual_send);
 	UT_RUN(test_resource_x_source_settlement_ack_fits_ordinary_data_ring);
 	UT_RUN(test_resource_x_image_intent_rebinds_transport_generation);
+	UT_RUN(test_resource_x_v3_image_intent_uses_retained_owner_without_truncation);
 	UT_RUN(test_resource_x_intent_transport_refusal_rearms_without_ring_copy);
 	UT_RUN(test_resource_x_intent_capability_drift_rearms_before_send);
 	UT_RUN(test_resource_x_intent_physical_deadline_rearms_before_send);

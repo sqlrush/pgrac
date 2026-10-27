@@ -541,7 +541,7 @@ lms_outbound_resource_x_intent_valid(const ResourceXIntentSlot *intent)
 			   && intent->body.owner_generation == intent->logical_generation
 			   && intent->body.owner_index == 0;
 	case RESOURCE_X_INTENT_OWNER_HOLDER_IMAGE:
-		return intent->payload_bytes == RESOURCE_X_IMAGE_V2_BYTES
+		return resource_x_image_payload_length_valid(intent->payload_bytes)
 			   && intent->kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE
 			   && intent->body.assertion.requester_node == (int32)intent->destination_node
 			   && intent->body.owner_generation == intent->logical_generation
@@ -769,7 +769,7 @@ int
 cluster_lms_outbound_resource_x_intent_pump(void)
 {
 	ResourceXIntentSlot intent;
-	uint8 payload[RESOURCE_X_IMAGE_V2_BYTES];
+	uint8 payload[RESOURCE_X_IMAGE_V3_MAX_BYTES];
 	int staged = 0;
 	int call;
 
@@ -1073,7 +1073,7 @@ cluster_lms_outbound_drain_send(int worker_id)
 		ResourceXIntentSlot resource_x_intent;
 		ResourceXIntentSlot resource_x_current;
 		ResourceXWireReject resource_x_reject = RESOURCE_X_WIRE_REJECT_NONE;
-		uint8 resource_x_payload[RESOURCE_X_IMAGE_V2_BYTES];
+		uint8 resource_x_payload[RESOURCE_X_IMAGE_V3_MAX_BYTES];
 		const void *send_payload;
 		uint32 send_payload_len;
 		ClusterICSendResult rc;

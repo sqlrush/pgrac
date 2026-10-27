@@ -13110,17 +13110,47 @@ retarget_resource_x_remote_join_pair(ResourceXDecodedFrame *grant, ResourceXDeco
 	grant->body.authority_grant.source_proof_crc32c = image->common.semantic_crc32c;
 }
 
+/* Opaque carrier bytes exercise retention only, never CTRC authentication. */
+static void
+attach_resource_x_test_delegation(ResourceXDecodedFrame *image, bool maximum)
+{
+	uint8 *bundle = image->body.image_envelope.ctrc_delegation;
+	uint16 records = maximum ? 7 : 1;
+	uint16 hops = maximum ? 6 : 1;
+	uint16 record_bytes = RESOURCE_X_CTRC_RECORD_BASE_BYTES
+		+ hops * RESOURCE_X_CTRC_DELEGATION_HOP_BYTES;
+	uint16 total = RESOURCE_X_CTRC_BUNDLE_HEADER_BYTES + records * record_bytes;
+
+	memset(bundle, 0, RESOURCE_X_CTRC_BUNDLE_MAX_BYTES);
+	image->body.image_envelope.ctrc_delegation_bytes = total;
+	bundle[1] = RESOURCE_X_CTRC_BUNDLE_VERSION;
+	bundle[2] = (uint8)(total >> 8); bundle[3] = (uint8)total;
+	bundle[5] = (uint8)records;
+	for (uint16 n = 0; n < records; n++) {
+		uint8 *record = bundle + RESOURCE_X_CTRC_BUNDLE_HEADER_BYTES + n * record_bytes;
+
+		record[1] = RESOURCE_X_CTRC_RECORD_VERSION;
+		record[2] = (uint8)(record_bytes >> 8); record[3] = (uint8)record_bytes;
+		record[5] = (uint8)hops;
+		for (unsigned i = 0; i < 144; i++) record[8 + i] = (uint8)(i ^ (n + 17));
+		record[8] = 2; record[9] = 0; record[10] = 144; record[11] = 0;
+		for (unsigned i = RESOURCE_X_CTRC_RECORD_BASE_BYTES; i < record_bytes; i++)
+			record[i] = (uint8)(i + n + 1);
+	}
+}
+
 static void
 canonicalize_resource_x_test_image(ResourceXDecodedFrame *image)
 {
 	ResourceXDecodedFrame decoded;
 	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
-	uint8 payload[RESOURCE_X_IMAGE_V2_BYTES];
+	uint8 payload[RESOURCE_X_IMAGE_V3_MAX_BYTES];
 	uint16 payload_bytes = 0;
 
 	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, image, payload,
 											 sizeof(payload), &payload_bytes, &reject));
-	UT_ASSERT_EQ(payload_bytes, RESOURCE_X_IMAGE_V2_BYTES);
+	UT_ASSERT_EQ(payload_bytes, RESOURCE_X_IMAGE_V2_BYTES
+		+ image->body.image_envelope.ctrc_delegation_bytes);
 	UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, payload, payload_bytes,
 											 &decoded, &reject));
 	*image = decoded;
@@ -13182,11 +13212,11 @@ setup_resource_x_test_terminal_cover(BufferTag tag, uint64 cached_generation)
 }
 
 static void
-retain_resource_x_test_settlement_pair_at_attempt(BufferTag tag, uint8 source_mode,
+retain_resource_x_test_settlement_pair_at_attempt_internal(BufferTag tag, uint8 source_mode,
 												  uint64 source_generation,
 												  uint64 carrier_generation,
 												  uint64 final_authority_generation, uint64 attempt,
-												  ResourceXDecodedFrame *settlement_out)
+												  ResourceXDecodedFrame *settlement_out, bool delegation, bool maximum)
 {
 	ClusterPcmOwnSnapshot prepared;
 	ResourceXDecodedFrame block;
@@ -13196,7 +13226,7 @@ retain_resource_x_test_settlement_pair_at_attempt(BufferTag tag, uint8 source_mo
 	ResourceXIntentSlot image_intent;
 	ResourceXIntentSlot status_intent;
 	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
-	uint8 image_payload[RESOURCE_X_IMAGE_V2_BYTES];
+	uint8 image_payload[RESOURCE_X_IMAGE_V3_MAX_BYTES];
 	uint8 status_payload[RESOURCE_X_PROOF_V1_BYTES];
 
 	block = make_resource_x_master_frame(RESOURCE_X_WIRE_BLOCK_TO_N, tag, 2, 1);
@@ -13218,6 +13248,8 @@ retain_resource_x_test_settlement_pair_at_attempt(BufferTag tag, uint8 source_mo
 	if (source_mode == (uint8)PCM_STATE_S)
 		((PageHeader)image.body.image_envelope.page_bytes)->pd_block_scn
 			= image.body.image_envelope.page_scn_lsn;
+	if (delegation)
+		attach_resource_x_test_delegation(&image, maximum);
 	canonicalize_resource_x_test_image(&image);
 	status = make_resource_x_remote_blocked_frame(tag, 2, 1);
 	status.common.assertion_sequence = attempt;
@@ -13277,6 +13309,15 @@ retain_resource_x_test_settlement_pair_at_attempt(BufferTag tag, uint8 source_mo
 	settlement_out->common.sender_connection_generation = 71;
 	settlement_out->common.outcome = RESOURCE_X_OUTCOME_NONE;
 	settlement_out->common.flags = 0;
+}
+
+static void
+retain_resource_x_test_settlement_pair_at_attempt(BufferTag tag, uint8 source_mode,
+	uint64 source_generation, uint64 carrier_generation, uint64 final_authority_generation,
+	uint64 attempt, ResourceXDecodedFrame *settlement_out)
+{
+	retain_resource_x_test_settlement_pair_at_attempt_internal(tag, source_mode, source_generation,
+		carrier_generation, final_authority_generation, attempt, settlement_out, false, false);
 }
 
 static void
@@ -23834,16 +23875,134 @@ UT_TEST(test_resource_x_master_work_duplicate_and_error_leave_original_owner)
 	cluster_shared_config = false;
 }
 
+UT_TEST(test_resource_x_retained_v3_pair_replay_keeps_entire_carrier)
+{
+	for (unsigned maximum = 0; maximum < 2; maximum++) {
+		BufferTag tag = make_tag(420);
+		ResourceXDecodedFrame settlement, retained, decoded;
+		ResourceXIntentSlot intent;
+		ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
+		uint8 payload[RESOURCE_X_IMAGE_V3_MAX_BYTES];
+		uint8 before[RESOURCE_X_IMAGE_V3_MAX_BYTES];
+		uint16 expected_bytes = maximum ? RESOURCE_X_IMAGE_V3_MAX_BYTES : RESOURCE_X_IMAGE_V3_MIN_BYTES;
+
+		reset_fake_pcm_runtime(4);
+		cluster_node_id = 1;
+		fake_gcs_master_node = 0;
+		fake_pcm_clock_us = 100;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17), RESOURCE_X_APPLY_APPLIED);
+		(void)setup_resource_x_test_terminal_cover(tag, 60);
+		retain_resource_x_test_settlement_pair_at_attempt_internal(tag, PCM_STATE_X, 60, 61, 5,
+			41, &settlement, true, maximum != 0);
+		if (ut_current_failed) return;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_image_exact(&settlement.common.logical_assertion,
+			&retained), RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(retained.payload_bytes, expected_bytes);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_pair_replay_exact(
+			&settlement.common.logical_assertion, 41, 0, 31), RESOURCE_X_APPLY_APPLIED);
+		memset(payload, 0x5a, sizeof(payload));
+		memcpy(before, payload, sizeof(before));
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_image_intent_snapshot_exact(
+			&settlement.common.logical_assertion, &intent, payload, expected_bytes - 1),
+			RESOURCE_X_APPLY_INVALID);
+		UT_ASSERT_EQ(memcmp(payload, before, sizeof(payload)), 0);
+		UT_ASSERT_EQ(intent.state, RESOURCE_X_INTENT_SLOT_EMPTY);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_image_intent_snapshot_exact(
+			&settlement.common.logical_assertion, &intent, payload, sizeof(payload)), RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(intent.payload_bytes, expected_bytes);
+		UT_ASSERT(cluster_resource_x_wire_rebind_sender_generation(RESOURCE_X_MSG_IMAGE_OR_GRANT,
+			payload, intent.payload_bytes, 99, &reject));
+		UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, payload,
+			intent.payload_bytes, &decoded, &reject));
+		UT_ASSERT_EQ(decoded.common.sender_connection_generation, 99);
+		UT_ASSERT_EQ(decoded.body.image_envelope.ctrc_delegation_bytes,
+			retained.body.image_envelope.ctrc_delegation_bytes);
+		UT_ASSERT_EQ(memcmp(decoded.body.image_envelope.ctrc_delegation,
+			retained.body.image_envelope.ctrc_delegation, RESOURCE_X_CTRC_BUNDLE_MAX_BYTES), 0);
+		UT_ASSERT_EQ(memcmp(decoded.body.image_envelope.page_bytes,
+			retained.body.image_envelope.page_bytes, RESOURCE_X_PAGE_BYTES), 0);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(&intent, 200), RESOURCE_X_INTENT_STAGED);
+		UT_ASSERT(cluster_pcm_lock_resource_x_outbound_intent_complete_exact(&intent));
+	}
+}
+
+UT_TEST(test_resource_x_retained_v3_join_reconnect_never_replaces_original_bytes)
+{
+	for (unsigned image_first = 0; image_first < 2; image_first++) {
+		BufferTag tag = make_tag(421);
+		ResourceXDecodedFrame grant, image, changed, saved_grant, saved_image;
+		ResourceXRequesterJoinSnapshot snapshot, first;
+
+		reset_fake_pcm_runtime(4);
+		cluster_node_id = 2;
+		cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_S);
+		cluster_pcm_lock_release(tag);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17), RESOURCE_X_APPLY_APPLIED);
+		make_resource_x_remote_join_pair(tag, 2, &grant, &image);
+		attach_resource_x_test_delegation(&image, image_first != 0);
+		canonicalize_resource_x_test_image(&image);
+		grant.body.authority_grant.source_proof_crc32c = image.common.semantic_crc32c;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_join_exact(image_first ? &image : &grant,
+			image_first ? 0 : 2, &snapshot), RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_join_exact(image_first ? &grant : &image,
+			image_first ? 2 : 0, &snapshot), RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT((snapshot.flags & RESOURCE_X_REQUESTER_JOIN_READY) != 0);
+		first = snapshot;
+		changed = image;
+		changed.common.sender_connection_generation++;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_join_exact(&changed, 0, &snapshot), RESOURCE_X_APPLY_DUPLICATE);
+		UT_ASSERT_EQ(snapshot.t_image_us, first.t_image_us);
+		changed = image;
+		changed.body.image_envelope.ctrc_delegation[32] ^= 1;
+		canonicalize_resource_x_test_image(&changed);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_join_exact(&changed, 0, &snapshot), RESOURCE_X_APPLY_STALE);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_join_frames_exact(&image.common.logical_assertion,
+			&saved_grant, &saved_image, &snapshot), RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(saved_image.payload_bytes, image.payload_bytes);
+		UT_ASSERT_EQ(memcmp(saved_image.body.image_envelope.ctrc_delegation,
+			image.body.image_envelope.ctrc_delegation, RESOURCE_X_CTRC_BUNDLE_MAX_BYTES), 0);
+	}
+}
+
+UT_TEST(test_resource_x_v3_image_intent_length_bounds_preserve_owner)
+{
+	const uint16 lengths[] = { RESOURCE_X_IMAGE_V3_MIN_BYTES, RESOURCE_X_IMAGE_V3_MAX_BYTES,
+		RESOURCE_X_IMAGE_V2_BYTES - 1, RESOURCE_X_IMAGE_V2_BYTES + 1,
+		RESOURCE_X_IMAGE_V3_MIN_BYTES - 1, RESOURCE_X_IMAGE_V3_MAX_BYTES + 1 };
+	ResourceXIntentBodyHandle handle;
+	ResourceXIntentSlot slot, before;
+	BufferTag tag = make_tag(422);
+
+	memset(&handle, 0, sizeof(handle));
+	UT_ASSERT(resource_x_assertion_init(&tag, 2, &handle.assertion));
+	handle.owner_generation = 51;
+	handle.owner_node = 1;
+	handle.owner_kind = RESOURCE_X_INTENT_OWNER_HOLDER_IMAGE;
+	for (unsigned i = 0; i < lengthof(lengths); i++) {
+		memset(&slot, 0, sizeof(slot));
+		before = slot;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_intent_arm_exact(&slot, &handle,
+			51, 61, 71, 2, lengths[i], RESOURCE_X_WIRE_IMAGE_ENVELOPE), i < 2);
+		if (i < 2) {
+			UT_ASSERT_EQ(slot.payload_bytes, lengths[i]);
+			UT_ASSERT_EQ(slot.body.owner_kind, RESOURCE_X_INTENT_OWNER_HOLDER_IMAGE);
+		} else UT_ASSERT_EQ(memcmp(&slot, &before, sizeof(slot)), 0);
+	}
+}
+
 int
 main(void)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
-	UT_PLAN(361);
+	UT_PLAN(364);
 	/* Observe the actual startup state before any runtime fixture overrides
 	 * the postmaster GUC or initializes shared PCM state and counters. */
 	UT_RUN(test_pcm_grd_max_entries_default_is_minus_one);
 	UT_RUN(test_pcm_disable_path_counters_return_zero);
 	UT_RUN(test_pcm_normal_stop_missing_is_not_empty);
+	UT_RUN(test_resource_x_retained_v3_pair_replay_keeps_entire_carrier);
+	UT_RUN(test_resource_x_retained_v3_join_reconnect_never_replaces_original_bytes);
+	UT_RUN(test_resource_x_v3_image_intent_length_bounds_preserve_owner);
 
 	UT_RUN(test_resource_x_pi_complete_resumes_native_master_without_new_assert);
 	UT_RUN(test_resource_x_master_work_never_substitutes_for_pi_or_admission);

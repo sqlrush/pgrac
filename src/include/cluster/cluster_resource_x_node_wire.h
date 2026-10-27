@@ -45,6 +45,16 @@
 #define RESOURCE_X_SOURCE_FENCE_BYTES 34
 #define RESOURCE_X_REQUEST_TAIL_BYTES 20
 
+/* Storage/transport bounds only: the complete codec still validates framing,
+ * and original CTRC custody must be established before an image is visible. */
+static inline bool
+resource_x_image_payload_length_valid(Size payload_bytes)
+{
+	return payload_bytes == RESOURCE_X_IMAGE_V2_BYTES
+		|| (payload_bytes >= RESOURCE_X_IMAGE_V3_MIN_BYTES
+			&& payload_bytes <= RESOURCE_X_IMAGE_V3_MAX_BYTES);
+}
+
 #define RESOURCE_X_MSG_ASSERT_X PGRAC_IC_MSG_GCS_BLOCK_REQUEST
 #define RESOURCE_X_MSG_IMAGE_OR_GRANT PGRAC_IC_MSG_GCS_BLOCK_REPLY
 #define RESOURCE_X_MSG_BLOCK_TO_N PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE
