@@ -4214,17 +4214,23 @@ UT_TEST(test_revert_delete_identity_mismatch_failclosed)
 
 
 #include "test_cluster_tt_abort_retained.inc"
+#include "test_cluster_tt_commit_retained.inc"
 
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(151);
+	UT_PLAN(156);
+	UT_RUN(test_retained_commit_stages_before_flush_and_preserves_head);
+	UT_RUN(test_retained_commit_unstage_keeps_original_abort_obligation);
+	UT_RUN(test_retained_commit_rejects_invalid_head_and_predecessor);
+	UT_RUN(test_retained_commit_post_stage_head_drift_cannot_publish);
+	UT_RUN(test_retained_commit_write_failure_preserves_unfinished_stage);
 	UT_RUN(test_retained_abort_runtime_preserves_original_head);
 	UT_RUN(test_retained_abort_redo_and_preflight_are_exact_and_idempotent);
 	UT_RUN(test_retained_abort_rejects_bad_head_namespace);
 	UT_RUN(test_retained_abort_rejects_wrong_identity_state_or_flags);
 	UT_RUN(test_retained_abort_keeps_original_current_authority_checks);
-	UT_RUN(test_retained_abort_does_not_authorize_commit_or_rebind);
+	UT_RUN(test_retained_terminal_does_not_authorize_generic_transition_or_rebind);
 	UT_RUN(test_retained_abort_preflight_refuses_unstable_or_missing_header);
 	UT_RUN(test_retained_abort_write_failure_keeps_original_head);
 	reset_current_write_mock();

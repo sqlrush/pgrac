@@ -758,7 +758,6 @@ cluster_undo_prepare_commit_v1(uint8 instance, uint32 segment_id, uint32 generat
 	UndoSegmentHeaderData *header = (UndoSegmentHeaderData *)prepared.data;
 	TTSlot *slot;
 	ClusterTTTerminalTransitionDecision decision;
-	static const UBA invalid_head = InvalidUba_init;
 
 	if (base == NULL || out == NULL || instance == 0 || instance > 128 || segment_id == 0
 		|| ((segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE) + 1 != instance
@@ -769,8 +768,9 @@ cluster_undo_prepare_commit_v1(uint8 instance, uint32 segment_id, uint32 generat
 	if (!UndoSegmentHeader_identity_matches(prepared.data, segment_id, instance))
 		return CLUSTER_UNDO_HEADER_BLOCKED;
 	slot = &header->tt_slots[slot_offset];
-	decision = cluster_tt_terminal_transition_decide(slot, header->wrap_count, generation, xid,
-													 wrap, TT_SLOT_COMMITTED, commit_scn);
+	decision = cluster_tt_terminal_retained_transition_decide(slot, header->wrap_count, generation,
+															  segment_id, slot_offset, xid, wrap,
+															  TT_SLOT_COMMITTED, commit_scn);
 	if (decision == CLUSTER_TT_TERMINAL_STALE)
 		return CLUSTER_UNDO_HEADER_SKIP_STALE;
 	if (decision == CLUSTER_TT_TERMINAL_IDEMPOTENT)
@@ -780,7 +780,6 @@ cluster_undo_prepare_commit_v1(uint8 instance, uint32 segment_id, uint32 generat
 	slot->status = TT_SLOT_COMMITTED;
 	slot->flags = TT_FLAGS_RESERVED;
 	slot->commit_scn = commit_scn;
-	slot->first_undo_block = invalid_head;
 	memcpy(out, prepared.data, BLCKSZ);
 	return CLUSTER_UNDO_HEADER_APPLY;
 }

@@ -931,10 +931,16 @@ UT_TEST(test_native_delta_rejects_corrupt_header_before_identity)
 	}
 }
 
+#include "test_cluster_undo_commit_retained.inc"
+
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(18);
+	UT_RUN(test_private_exact_commit_preserves_head_and_unrelated_bytes);
+	UT_RUN(test_native_exact_commit_retains_head_across_repeat_and_release_marker);
+	UT_RUN(test_exact_commit_projection_and_redo_reject_conflicts_without_mutation);
+	UT_RUN(test_exact_commit_retained_stale_and_present_durability_failure);
 	UT_RUN(test_native_header_writers_seal_full_pages);
 	UT_RUN(test_native_delta_rejects_corrupt_header_before_identity);
 	UT_RUN(test_native_exact_commit_rejects_bad_header_before_write);

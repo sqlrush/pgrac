@@ -264,28 +264,13 @@ UT_TEST(test_retained_abort_keeps_original_current_authority_checks)
 	}
 }
 
-UT_TEST(test_retained_abort_does_not_authorize_commit_or_rebind)
+UT_TEST(test_retained_terminal_does_not_authorize_generic_transition_or_rebind)
 {
-	ClusterSemanticAdmissionToken admission = target_modifier_token();
 	TTSlot before = retained_abort_seed(2);
-	TTSlot out = { 0 };
-	volatile bool caught = false;
 
 	UT_ASSERT_EQ(cluster_tt_terminal_transition_decide(&before, 4, 4, 100, 5, TT_SLOT_COMMITTED,
 													   scn_encode(1, 42)),
 				 CLUSTER_TT_TERMINAL_CORRUPT);
-	PG_TRY();
-	{
-		(void)cluster_tt_slot_durable_commit_stage(1, 4, 7, 100, 5, scn_encode(1, 42), &admission,
-												   &out);
-	}
-	PG_CATCH();
-	{
-		caught = true;
-	}
-	PG_END_TRY();
-	UT_ASSERT(caught);
-	UT_ASSERT_EQ(g_write_hdr_calls + g_abort_exact_emit_calls, 0);
 	before.status = TT_SLOT_ABORTED;
 	retained_abort_store(&before);
 	UT_ASSERT_EQ(cluster_tt_durable_bind_preflight_exact(1, 1, 4, 7, 6, 101),

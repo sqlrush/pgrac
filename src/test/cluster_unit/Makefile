@@ -3824,11 +3824,13 @@ CLUSTER_SIDE_UNDO_O = test_cluster_side_xact_undo_product.o
 # header preparation tests. The extracted functions retain their real bodies.
 test_cluster_undo_tt_transition.inc: $(top_srcdir)/src/backend/cluster/cluster_tt_durable.c Makefile
 	awk 'BEGIN { print "#include \"postgres.h\""; print "#include \"cluster/cluster_tt_durable.h\""; \
-	             print "#include \"cluster/cluster_uba.h\"" } \
+	             print "#include \"cluster/cluster_uba.h\""; \
+	             print "#include \"cluster/cluster_undo_record.h\"" } \
 	     /^cluster_tt_durable_redo_decide\(/ { print "ClusterTTRedoDecision"; emit=1; found++ } \
 	     /^cluster_tt_active_transition_decide\(/ { print "ClusterTTActiveTransitionDecision"; emit=1; found++ } \
 	     /^cluster_tt_terminal_transition_decide\(/ { print "ClusterTTTerminalTransitionDecision"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 3) exit 1 }' $< > $@.tmp
+	     /^cluster_tt_terminal_retained_transition_decide\(/ { print "ClusterTTTerminalTransitionDecision"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 4) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 test_cluster_undo_producer_owner.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_xlog.c Makefile
 	awk '/^(cluster_undo_emit_[a-z_]+|cluster_hw_emit_reserve|cluster_undo_xlog_insert_tt_ctrc_release)\(/ \
@@ -3906,6 +3908,7 @@ test_cluster_undo_recovery: test_cluster_undo_recovery.c unit_test.h \
 		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 test_cluster_undo_native_lifecycle: test_cluster_undo_native_lifecycle.c unit_test.h \
+		$(srcdir)/test_cluster_undo_commit_retained.inc \
 		test_cluster_undo_lifecycle_native.inc test_cluster_undo_header_identity.inc \
 		test_cluster_undo_bind_native.inc \
 		$(top_srcdir)/src/include/cluster/cluster_undo_segment_init.h \
@@ -8688,7 +8691,8 @@ test_cluster_tt_active_owner test_cluster_tt_slot_allocator: \
 test_cluster_tt_durable test_cluster_tt_rollback_entry test_cluster_tt_abort_owner \
 test_cluster_tt_active_owner test_cluster_tt_terminal_trace test_cluster_relmap_native_tt.o: \
 		$(srcdir)/test_cluster_tt_live_head.inc \
-		$(srcdir)/test_cluster_tt_abort_retained.inc
+		$(srcdir)/test_cluster_tt_abort_retained.inc \
+		$(srcdir)/test_cluster_tt_commit_retained.inc
 
 # spec-3.11 D2/D9: test_cluster_tt_durable — pure decision predicates
 # (redo wrap table / slot match) + lookup / by-xid scan with a mocked

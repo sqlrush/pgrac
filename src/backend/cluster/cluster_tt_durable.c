@@ -235,32 +235,37 @@ tt_active_owner_matches(const ClusterTTSlotCurrentOwner *expected,
 		   && memcmp(expected->reserved8, observed->reserved8, sizeof(expected->reserved8)) == 0;
 }
 
-/* A real top abort retains the original chain for readers and recovery.
- * This context-qualified branch does not authorize commit or slot reuse.
- * Keep the generic nil-head transition table unchanged for those callers. */
-static ClusterTTTerminalTransitionDecision
-tt_abort_transition_decide(const TTSlot *predecessor, uint32 disk_generation,
-						   uint32 expected_generation, uint32 segment_id, uint16 slot_offset,
-						   TransactionId xid, uint16 wrap)
+/* Exact top termination retains the original chain for readers and recovery.
+ * This comparison supplies no commit, control-completion or slot-reuse proof.
+ * The generic nil-head table remains the authority for all other callers. */
+ClusterTTTerminalTransitionDecision
+cluster_tt_terminal_retained_transition_decide(const TTSlot *predecessor, uint32 disk_generation,
+											   uint32 expected_generation, uint32 segment_id,
+											   uint16 slot_offset, TransactionId xid, uint16 wrap,
+											   uint8 terminal_status, SCN commit_scn)
 {
 	ClusterTTTerminalTransitionDecision decision;
 	UndoRecordHeader owner = { 0 };
 	TTSlot retained;
 
+	if (segment_id == 0
+		|| segment_id > ((uint32)SCN_MAX_VALID_NODE_ID + 1) * CLUSTER_UNDO_SEGS_PER_INSTANCE
+		|| slot_offset >= TT_SLOTS_PER_SEGMENT)
+		return CLUSTER_TT_TERMINAL_CORRUPT;
 	decision = cluster_tt_terminal_transition_decide(
-		predecessor, disk_generation, expected_generation, xid, wrap, TT_SLOT_ABORTED, InvalidScn);
+		predecessor, disk_generation, expected_generation, xid, wrap, terminal_status, commit_scn);
 	if (decision != CLUSTER_TT_TERMINAL_CORRUPT || predecessor == NULL
 		|| (predecessor->flags & ~TT_SLOT_FLAGS_KNOWN) != 0
-		|| (predecessor->status != TT_SLOT_ACTIVE && predecessor->status != TT_SLOT_ABORTED))
+		|| (predecessor->status != TT_SLOT_ACTIVE && predecessor->status != terminal_status))
 		return decision;
-	owner.origin_node_id = tt_owner_instance_for_segment(segment_id) - 1;
+	owner.origin_node_id = (segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE;
 	owner.tt_slot_id = (uint32)slot_offset + 1;
 	if (!cluster_undo_rollback_address_valid(&owner, predecessor->first_undo_block, false))
 		return CLUSTER_TT_TERMINAL_CORRUPT;
 	retained = *predecessor;
 	retained.first_undo_block = (UBA)InvalidUba_init;
 	return cluster_tt_terminal_transition_decide(&retained, disk_generation, expected_generation,
-												 xid, wrap, TT_SLOT_ABORTED, InvalidScn);
+												 xid, wrap, terminal_status, commit_scn);
 }
 
 /*
@@ -823,9 +828,9 @@ cluster_tt_durable_abort_preflight_exact(uint8 instance, uint32 segment_id,
 				  sizeof(TTSlot))
 			   != 0)
 		return CLUSTER_TT_TERMINAL_CONFLICT;
-	return tt_abort_transition_decide(&first_header->tt_slots[slot_offset],
-									  first_header->wrap_count, segment_generation, segment_id,
-									  slot_offset, xid, wrap);
+	return cluster_tt_terminal_retained_transition_decide(
+		&first_header->tt_slots[slot_offset], first_header->wrap_count, segment_generation,
+		segment_id, slot_offset, xid, wrap, TT_SLOT_ABORTED, InvalidScn);
 }
 
 ClusterUndoTtCtrcReleaseRedoDecision
@@ -1596,13 +1601,9 @@ tt_slot_durable_terminal_exact(uint32 segment_id, uint32 segment_generation, uin
 			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
 							errmsg("canonical TT commit identity or generation mismatch")));
 
-		decision = terminal_status == TT_SLOT_ABORTED
-					   ? tt_abort_transition_decide(&disk_header->tt_slots[slot_offset],
-													disk_header->wrap_count, segment_generation,
-													segment_id, slot_offset, xid, wrap)
-					   : cluster_tt_terminal_transition_decide(
-							 &disk_header->tt_slots[slot_offset], disk_header->wrap_count,
-							 segment_generation, xid, wrap, terminal_status, terminal_scn);
+		decision = cluster_tt_terminal_retained_transition_decide(
+			&disk_header->tt_slots[slot_offset], disk_header->wrap_count, segment_generation,
+			segment_id, slot_offset, xid, wrap, terminal_status, terminal_scn);
 		if (decision != CLUSTER_TT_TERMINAL_APPLY && decision != CLUSTER_TT_TERMINAL_IDEMPOTENT)
 			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
 							errmsg("canonical TT commit predecessor is not exact")));
@@ -1610,8 +1611,6 @@ tt_slot_durable_terminal_exact(uint32 segment_id, uint32 segment_generation, uin
 		successor.status = terminal_status;
 		successor.flags = TT_FLAGS_RESERVED;
 		successor.commit_scn = terminal_scn;
-		if (terminal_status == TT_SLOT_COMMITTED)
-			successor.first_undo_block = InvalidUbaVal;
 		final_expected = apply_transition ? successor : disk_header->tt_slots[slot_offset];
 
 		memset(&final_root, 0, sizeof(final_root));
@@ -2153,8 +2152,9 @@ cluster_tt_durable_redo_abort_slot_exact(uint8 instance, uint32 segment_id,
 		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("conflicting undo segment header for exact abort redo")));
 	}
-	decision = tt_abort_transition_decide(&header->tt_slots[slot_offset], header->wrap_count,
-										  segment_generation, segment_id, slot_offset, xid, wrap);
+	decision = cluster_tt_terminal_retained_transition_decide(
+		&header->tt_slots[slot_offset], header->wrap_count, segment_generation, segment_id,
+		slot_offset, xid, wrap, TT_SLOT_ABORTED, InvalidScn);
 	if (decision == CLUSTER_TT_TERMINAL_STALE) {
 		tt_redo_present_durable(instance, segment_id);
 		cluster_tt_durable_io_wait_end();

@@ -105,6 +105,17 @@ cluster_tt_terminal_transition_decide(const TTSlot *predecessor, uint32 disk_gen
 									  uint32 expected_generation, TransactionId xid, uint16 wrap,
 									  uint8 terminal_status, SCN commit_scn);
 
+/* Exact top-only terminal comparison for the original canonical slot. A
+ * nonempty head must be a record address in that origin's retained chain
+ * with the same TT slot. This preserves the pointer; it proves neither
+ * control completion nor retention, recovery authority or capacity release.
+ * Callers retain their original admission/commit/recovery prerequisites. */
+extern ClusterTTTerminalTransitionDecision
+cluster_tt_terminal_retained_transition_decide(const TTSlot *predecessor, uint32 disk_generation,
+											   uint32 expected_generation, uint32 segment_id,
+											   uint16 slot_offset, TransactionId xid, uint16 wrap,
+											   uint8 terminal_status, SCN commit_scn);
+
 /*
  * Publish the canonical physical ACTIVE predecessor for one exact current
  * allocator owner.  This may wait for block-zero current authority and perform
@@ -241,11 +252,12 @@ extern void cluster_tt_slot_durable_prepared_release(ClusterTTPreparedStage *sta
  *	once that record is flushed, or cluster_tt_slot_durable_commit_unstage()
  *	if the commit fails before it.  Returns the owner instance (1..128) for the
  *	delta's path-resolution field and copies the exact successor to
- *	`successor_out`.  The caller supplies its already-held normal modifier
+ *	`successor_out`, preserving the predecessor's retained undo head. The
+ *	caller supplies its already-held normal modifier
  *	admission and keeps it until apply or unstage; this function borrows it
  *	while acquiring the exact local block0 current and resident content
  *	authority.  ereport(ERROR) on authority or I/O failure.  Redo side:
- *	cluster_tt_durable_redo_stamp_slot() (cluster_undo_xlog.c), driven by
+ *	cluster_tt_durable_redo_stamp_slot_exact() (cluster_undo_xlog.c), driven by
  *	xact_redo_commit instead of the 0x30 redo.
  */
 extern uint8 cluster_tt_slot_durable_commit_stage(uint32 segment_id, uint32 segment_generation,

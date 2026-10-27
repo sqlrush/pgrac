@@ -351,10 +351,83 @@ UT_TEST(test_local_retained_abort_write_failure_cannot_publish_cleanup)
 	g_write_hdr_ok = true;
 }
 
+static bool
+retained_local_precommit(xl_xact_tt_commit *fold)
+{
+	volatile bool success = false;
+
+	PG_TRY();
+	{
+		success = cluster_tt_local_precommit_durable_finish(100, scn_encode(1, 42), fold);
+	}
+	PG_CATCH();
+	{}
+	PG_END_TRY();
+	return success;
+}
+
+UT_TEST(test_local_commit_retains_head_and_original_32_byte_fold)
+{
+	ClusterTTLocalBinding binding;
+	xl_xact_tt_commit fold = { 0 };
+	xl_xact_tt_commit expected = { 0 };
+	TTSlot successor = retained_commit_seed();
+
+	seed_binding(&binding, CLUSTER_CANONICAL_TXN_PUBLISHED, CLUSTER_TT_LOCAL_TERMINAL_NONE);
+	binding.active_lsn = (XLogRecPtr)0x1000;
+	expected.segment_id = 1;
+	expected.segment_generation = 4;
+	expected.xid = 100;
+	expected.slot_offset = 7;
+	expected.wrap = 5;
+	expected.instance = 1;
+	expected.format_version = CLUSTER_XACT_TT_COMMIT_VERSION;
+	expected.commit_scn = scn_encode(1, 42);
+	if (!retained_local_precommit(&fold)) {
+		UT_ASSERT(false);
+		return;
+	}
+	UT_ASSERT_EQ(memcmp(&fold, &expected, sizeof(fold)), 0);
+	UT_ASSERT_EQ(sizeof(fold), 32);
+	UT_ASSERT_EQ(binding.terminal_state, CLUSTER_TT_LOCAL_TERMINAL_COMMIT_STAGED);
+	UT_ASSERT_EQ(g_write_hdr_calls + status_installs + hint_emits + abort_marks, 0);
+	g_flush_ptr = (XLogRecPtr)0x5000;
+	MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+	CritSectionCount++;
+	cluster_tt_local_commit_durable_apply(g_flush_ptr);
+	CritSectionCount--;
+	MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
+	successor.status = TT_SLOT_COMMITTED;
+	successor.commit_scn = scn_encode(1, 42);
+	UT_ASSERT_EQ(memcmp(&g_last_written_slot, &successor, sizeof(successor)), 0);
+	UT_ASSERT(!cluster_tt_local_commit_admission.entered);
+	UT_ASSERT_EQ(status_installs + hint_emits + abort_marks, 0);
+}
+
+UT_TEST(test_local_commit_refusal_keeps_binding_without_terminal_cleanup)
+{
+	ClusterTTLocalBinding binding;
+	xl_xact_tt_commit fold = { 0 };
+	TTSlot before = retained_commit_seed();
+
+	before.first_undo_block = uba_encode(257, 9, 7, 3);
+	retained_abort_store(&before);
+	seed_binding(&binding, CLUSTER_CANONICAL_TXN_PUBLISHED, CLUSTER_TT_LOCAL_TERMINAL_NONE);
+	binding.active_lsn = (XLogRecPtr)0x1000;
+	UT_ASSERT(!retained_local_precommit(&fold));
+	UT_ASSERT_EQ(binding.terminal_state, CLUSTER_TT_LOCAL_TERMINAL_NONE);
+	UT_ASSERT_EQ(binding.publish_state, CLUSTER_CANONICAL_TXN_PUBLISHED);
+	UT_ASSERT_EQ(g_write_hdr_calls + status_installs + hint_emits + abort_marks, 0);
+	UT_ASSERT_EQ(g_writer_fd_open, 0);
+	UT_ASSERT(!cluster_tt_local_commit_admission.entered);
+}
+
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(10);
+	UT_RUN(test_local_commit_retains_head_and_original_32_byte_fold);
+	UT_RUN(test_local_commit_refusal_keeps_binding_without_terminal_cleanup);
 	UT_RUN(test_local_abort_accepts_retained_successor_without_losing_head);
 	UT_RUN(test_local_retained_abort_write_failure_cannot_publish_cleanup);
 	UT_RUN(test_unproved_publication_cannot_skip_durable_abort);
