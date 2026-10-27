@@ -569,7 +569,7 @@ _classify_owners(
 _classify_owners(
     "CTRC_ORIGIN_PROVENANCE",
     "src/backend/cluster/cluster_terminal_ref_census.c",
-    ("cluster_ctrc_participant_delegate_prepare_v1",),
+    ("ctrc_participant_delegate_prepare_locked",),
     "REGISTERED_REFERENCE",
     "ALL_CTRC_REFERENCE_KINDS",
     "ALL_CTRC_TARGET_KINDS",

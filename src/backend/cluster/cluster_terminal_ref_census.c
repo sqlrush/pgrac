@@ -5785,35 +5785,23 @@ cluster_ctrc_origin_grant_fullxid_v2(const ClusterCtrcTxnKeyV1 *key,
 	return result;
 }
 
-bool
-cluster_ctrc_participant_delegate_prepare_v1(const ClusterCtrcTxnKeyV1 *key,
-	const ClusterCtrcParticipantIdentity *sender, uint32 grant,
-	const ClusterCtrcParticipantIdentity *receiver, uint8 *record, Size length)
+/* Caller holds the original participant shard EX lock. This is the
+ * original producer kernel; source-receipt validation must retain that lock
+ * through custody publication so CLOSE cannot retire the selected key. */
+static bool
+ctrc_participant_delegate_prepare_locked(ClusterCtrcParticipantEntry *participant,
+	const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcParticipantIdentity *sender,
+	uint32 grant, const ClusterCtrcParticipantIdentity *receiver, uint8 *record)
 {
-	ClusterCtrcParticipantEntry *participant;
 	ClusterCtrcDelegationCustodyV1 *entry;
 	FullTransactionId original;
 	uint8 encoded[CLUSTER_CTRC_DELEGATION_V1_BYTES] = { 0 };
-	uint64 index;
 	uint64 sequence;
-	uint32 lock_mask;
-	bool prepared = false;
 
-	StaticAssertStmt(CLUSTER_CTRC_DELEGATION_V1_BYTES == 8 + 144 + 72,
-		"CTRC first-hop record must match IMAGE V3 framing");
-	if (record != NULL && length <= CLUSTER_CTRC_DELEGATION_V1_BYTES)
-		MemSet(record, 0, length);
-	if (record == NULL || length != sizeof(encoded) || !cluster_ctrc_shmem_ready()
-		|| !ctrc_txn_key_valid(key) || !ctrc_participant_identity_valid(key, sender)
+	if (!ctrc_txn_key_valid(key) || !ctrc_participant_identity_valid(key, sender)
 		|| !ctrc_participant_identity_valid(key, receiver) || grant == 0
-		|| cluster_node_id < 0 || sender->node_id != (uint16)cluster_node_id
-		|| receiver->node_id == sender->node_id || receiver->node_id == key->origin_node_id
-		|| !ctrc_participant_index(key, sender->node_id, &index))
+		|| receiver->node_id == sender->node_id || receiver->node_id == key->origin_node_id)
 		return false;
-
-	lock_mask = ctrc_participant_lock_mask(index);
-	ctrc_participant_locks_acquire(lock_mask);
-	participant = &ctrc_participant_entries()[index];
 	if (participant->state != CTRC_PARTICIPANT_OPEN || participant->seal_generation != 0
 		|| participant->grant_generation != grant
 		|| memcmp(&participant->key, key, sizeof(*key)) != 0
@@ -5823,17 +5811,17 @@ cluster_ctrc_participant_delegate_prepare_v1(const ClusterCtrcTxnKeyV1 *key,
 		|| !cluster_ctrc_origin_fullxid_match_v2(participant->original_identity_v2,
 			sizeof(participant->original_identity_v2), key, sender, grant, &original)
 		|| !FullTransactionIdEquals(original, participant->original_full_xid))
-		goto done;
+		return false;
 
 	entry = &participant->delegations[receiver->node_id];
 	sequence = entry->sequence;
 	if (sequence != 0) {
 		/* A changed incarnation is not closure and cannot replace old custody. */
 		if (memcmp(&entry->receiver, receiver, sizeof(*receiver)) != 0)
-			goto done;
+			return false;
 	} else {
 		if (participant->delegation_count >= CLUSTER_CTRC_MAX_PARTICIPANTS - 1)
-			goto done;
+			return false;
 		sequence = participant->last_delegation_sequence + 1;
 	}
 
@@ -5855,8 +5843,124 @@ cluster_ctrc_participant_delegate_prepare_v1(const ClusterCtrcTxnKeyV1 *key,
 	/* The same lock serializes this responsibility with CLOSE and ACK. No
 	 * output becomes available before custody exists; a retry adds no edge. */
 	memcpy(record, encoded, sizeof(encoded));
-	prepared = true;
+	return true;
+}
+
+bool
+cluster_ctrc_participant_delegate_prepare_v1(const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcParticipantIdentity *sender, uint32 grant,
+	const ClusterCtrcParticipantIdentity *receiver, uint8 *record, Size length)
+{
+	ClusterCtrcParticipantEntry *participant;
+	uint64 index;
+	uint32 lock_mask;
+	bool prepared;
+
+	StaticAssertStmt(CLUSTER_CTRC_DELEGATION_V1_BYTES == 8 + 144 + 72,
+		"CTRC first-hop record must match IMAGE V3 framing");
+	if (record != NULL && length <= CLUSTER_CTRC_DELEGATION_V1_BYTES)
+		MemSet(record, 0, length);
+	if (record == NULL || length != CLUSTER_CTRC_DELEGATION_V1_BYTES
+		|| !cluster_ctrc_shmem_ready()
+		|| !ctrc_txn_key_valid(key) || !ctrc_participant_identity_valid(key, sender)
+		|| !ctrc_participant_identity_valid(key, receiver) || grant == 0
+		|| cluster_node_id < 0 || sender->node_id != (uint16)cluster_node_id
+		|| receiver->node_id == sender->node_id || receiver->node_id == key->origin_node_id
+		|| !ctrc_participant_index(key, sender->node_id, &index))
+		return false;
+
+	lock_mask = ctrc_participant_lock_mask(index);
+	ctrc_participant_locks_acquire(lock_mask);
+	participant = &ctrc_participant_entries()[index];
+	prepared = ctrc_participant_delegate_prepare_locked(participant, key, sender,
+		grant, receiver, record);
+	ctrc_participant_locks_release(lock_mask);
+	return prepared;
+}
+
+bool
+cluster_ctrc_itl_delegate_prepare_v1(
+	const ClusterCtrcItlTargetIdentity *target, const ClusterItlSlotData *slot,
+	const ClusterCtrcParticipantIdentity *sender,
+	const ClusterCtrcParticipantIdentity *receiver, uint8 *record, Size length)
+{
+	ClusterCtrcParticipantEntry *participant;
+	uint8 slot_sha256[32];
+	uint32 segment, block;
+	uint16 tt_offset, row_offset;
+	NodeId origin;
+	uint64 origin_index, index, cursor;
+	uint32 lock_mask;
+	unsigned matches = 0;
+	bool prepared = false;
+
+	if (record != NULL && length <= CLUSTER_CTRC_DELEGATION_V1_BYTES)
+		MemSet(record, 0, length);
+	if (record == NULL || length != CLUSTER_CTRC_DELEGATION_V1_BYTES
+		|| !cluster_ctrc_shmem_ready() || target == NULL || slot == NULL
+		|| sender == NULL || receiver == NULL || cluster_node_id < 0
+		|| sender->node_id != (uint16)cluster_node_id
+		|| sender->node_id >= CLUSTER_CTRC_MAX_PARTICIPANTS
+		|| !ctrc_relation_namespace_valid(target->spc_oid, target->db_oid, target->rel_number)
+		|| target->fork_number != MAIN_FORKNUM || target->block_number == InvalidBlockNumber
+		|| !target->needs_wal || !ctrc_bytes_zero(target->reserved8, sizeof(target->reserved8))
+		|| target->itl_slot_index >= CLUSTER_ITL_INITRANS_DEFAULT
+		|| !TransactionIdIsNormal(slot->xid) || target->itl_xid != slot->xid
+		|| target->itl_slot_wrap != slot->wrap || target->itl_class != slot->flags
+		|| slot->flags < ITL_FLAG_ACTIVE || slot->flags > ITL_FLAG_NEEDS_CLEANOUT
+		|| memcmp(target->uba, &slot->undo_segment_head, sizeof(target->uba)) != 0
+		|| !uba_decode(slot->undo_segment_head, &segment, &block, &tt_offset, &row_offset))
+		return false;
+	origin = uba_origin_node_id(slot->undo_segment_head);
+	if (origin == InvalidNodeId || origin >= CLUSTER_CTRC_MAX_PARTICIPANTS)
+		return false;
+	/* UBA supplies only a bounded physical lookup, never a transaction key
+	 * or epoch. The locked, fully checked existing row supplies both. */
+	origin_index = (uint64)((segment - 1) % CLUSTER_UNDO_SEGS_PER_INSTANCE)
+		* TT_SLOTS_PER_SEGMENT + tt_offset;
+	if (!cluster_ctrc_participant_index_compute(origin_index, CtrcShared->origin_key_entries,
+			CtrcShared->participant_key_entries, sender->node_id, &index)
+		|| !cluster_ctrc_sha256_exact(slot, sizeof(*slot), slot_sha256))
+		return false;
+
+	lock_mask = ctrc_participant_lock_mask(index);
+	ctrc_participant_locks_acquire(lock_mask);
+	LWLockAcquire(&CtrcShared->receipt_lock, LW_SHARED);
+	participant = &ctrc_participant_entries()[index];
+	if (participant->state != CTRC_PARTICIPANT_OPEN || participant->seal_generation != 0
+		|| !ctrc_txn_key_valid(&participant->key)
+		|| participant->key.origin_node_id != origin || participant->key.segment_id != segment
+		|| participant->key.slot_offset != tt_offset || participant->key.xid != slot->xid
+		|| memcmp(&participant->identity, sender, sizeof(*sender)) != 0
+		|| !ctrc_receipt_chain_exact_locked(index, false))
+		goto done;
+	/* The complete chain was bounded and validated above. A second matching
+	 * applied owner is ambiguous; never pick whichever was inserted first. */
+	for (cursor = ctrc_participant_receipt_heads()[index]; cursor != 0;
+		 cursor = ctrc_receipt_links()[cursor - 1].next_plus_one) {
+		const ClusterCtrcReceipt *receipt = &ctrc_receipt_entries()[cursor - 1];
+
+		if (pg_atomic_read_u32((pg_atomic_uint32 *)&receipt->state) == CTRC_RECEIPT_APPLIED
+			&& receipt->publication.grant_generation == participant->grant_generation
+			&& receipt->publication.requester_node_id == sender->node_id
+			&& receipt->publication.requester_boot_incarnation == sender->boot_incarnation
+			&& receipt->publication.capability_record_generation
+				== sender->capability_record_generation
+			&& receipt->publication.reference_kind == CTRC_REF_HEAP_ITL_UBA
+			&& receipt->publication.target_kind == CTRC_TARGET_PAGE_PENDING_ITL_SLOT
+			&& receipt->disposition == CTRC_RELEASE_NONE
+			&& receipt->target.relation_persistence == RELPERSISTENCE_PERMANENT
+			&& ctrc_target_exact_itl_valid(&participant->key, &receipt->target)
+			&& cluster_ctrc_itl_target_identity_matches(&receipt->target, target)
+			&& memcmp(receipt->target.planned_successor_sha256, slot_sha256,
+				sizeof(slot_sha256)) == 0)
+			matches++;
+	}
+	if (matches == 1)
+		prepared = ctrc_participant_delegate_prepare_locked(participant, &participant->key,
+			sender, participant->grant_generation, receiver, record);
 done:
+	LWLockRelease(&CtrcShared->receipt_lock);
 	ctrc_participant_locks_release(lock_mask);
 	return prepared;
 }

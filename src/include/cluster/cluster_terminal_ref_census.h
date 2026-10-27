@@ -1012,6 +1012,15 @@ extern bool cluster_ctrc_participant_delegate_prepare_v1(
 	const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcParticipantIdentity *sender,
 	uint32 grant, const ClusterCtrcParticipantIdentity *receiver,
 	uint8 *record, Size length);
+/* Source owner keeps the original current/PI page protection. Select only
+ * the exact APPLIED ordinary ITL receipt matching the complete copied slot;
+ * use its retained original key/FullXid, never a key inferred from raw XID.
+ * Outgoing custody precedes record publication under the same shard lock.
+ * This supplies neither page-install authority nor parent/tree retirement. */
+extern bool cluster_ctrc_itl_delegate_prepare_v1(
+	const ClusterCtrcItlTargetIdentity *target, const ClusterItlSlotData *slot,
+	const ClusterCtrcParticipantIdentity *sender,
+	const ClusterCtrcParticipantIdentity *receiver, uint8 *record, Size length);
 /* First receipt at the delegated receiver only. authenticated_sender must
  * come from the existing protected current/PI transport, never the record.
  * A successful registration retains the parent before exposing a handle;
