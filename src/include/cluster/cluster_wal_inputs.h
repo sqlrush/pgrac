@@ -287,9 +287,23 @@ typedef struct ClusterRecoveryCtrcReplaySetSourceV1 {
 	ClusterControlRootFileToken root;
 	ClusterWalInputV1 selected;
 	ClusterControlRootReadToken replay_token;
+	/* Zero for the original replay-origin view. An explicit generation view
+	 * retains selected/replay_token as its original COMPLETE IR owner, and
+	 * binds one immutable input from the entire retained selection below.
+	 * These indexes are not replay-origin or sorted census indexes. */
+	uint32 generation_index, generation_count;
+	ClusterWalInputV1 generation;
+	XLogRecPtr generation_begin, generation_end;
+	uint32 generation_flags;
 } ClusterRecoveryCtrcReplaySetSourceV1;
 extern ClusterRecoveryCtrcReplaySetSourceV1 cluster_wal_inputs_ctrc_replays_source_v1(
 	ClusterWalInputsV1 *inputs, uint32 source_index);
+/* Every selected history/current/terminal generation, under the SAME whole
+ * native replay IR set and WALR incarnation. By value, zero on refusal. No
+ * I/O, flush, resampling or acquire: an own OPEN cut must already be fixed
+ * by the original census. A foreign OPEN input still refuses. */
+extern ClusterRecoveryCtrcReplaySetSourceV1 cluster_wal_inputs_ctrc_generation_v1(
+	ClusterWalInputsV1 *inputs, uint32 input_index);
 /* No I/O/allocation/acquire/cleanup. Locate the native incarnation before
  * dereferencing a borrowed scope; across I/O also revalidate the original
  * whole ROOT outside native locks. Old single/TT source views cannot replace

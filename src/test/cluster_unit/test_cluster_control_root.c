@@ -26164,6 +26164,7 @@ UT_TEST(test_tx_inputs_parent_subject_and_wait_revalidation)
 #include "test_cluster_control_ctrc_replay_stable.inc"
 #include "test_cluster_control_ctrc_page.inc"
 #include "test_cluster_control_ctrc_read_native.inc"
+#include "test_cluster_control_ctrc_generations.inc"
 
 /*
  * Keep the long control-root suite deterministic when an individual test
@@ -26377,6 +26378,18 @@ main(int argc, char **argv)
 	if (getenv("PGRAC_PRE2_TEST_STAMP_WORKER_ENTRY") != NULL) {
 		UT_PLAN(1);
 		UT_RUN(test_runtime_v3_failure_worker_entry_establishes_resource_owner);
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_CTRC_GENERATIONS") != NULL) {
+		UT_PLAN(7);
+		UT_RUN(test_ctrc_generations_bind_all_history_and_current_to_one_original_ir);
+		UT_RUN(test_ctrc_generations_reject_omitted_duplicate_or_mixed_generation);
+		UT_RUN(test_ctrc_generations_freeze_full_input_and_reject_changed_cut);
+		UT_RUN(test_ctrc_generations_promote_original_page_without_new_ir);
+		UT_RUN(test_ctrc_generations_cf_wait_and_retirement_keep_original_debt);
+		UT_RUN(test_ctrc_generations_local_open_requires_original_fixed_native_cut);
+		UT_RUN(test_ctrc_generations_initializer_terminal_never_bypasses_original_ir);
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
@@ -26767,7 +26780,14 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(618);
+	UT_PLAN(625);
+	UT_RUN(test_ctrc_generations_bind_all_history_and_current_to_one_original_ir);
+	UT_RUN(test_ctrc_generations_reject_omitted_duplicate_or_mixed_generation);
+	UT_RUN(test_ctrc_generations_freeze_full_input_and_reject_changed_cut);
+	UT_RUN(test_ctrc_generations_promote_original_page_without_new_ir);
+	UT_RUN(test_ctrc_generations_cf_wait_and_retirement_keep_original_debt);
+	UT_RUN(test_ctrc_generations_local_open_requires_original_fixed_native_cut);
+	UT_RUN(test_ctrc_generations_initializer_terminal_never_bypasses_original_ir);
 	UT_RUN(test_relmap_episode_terminal_first_owner_error_is_sticky);
 	UT_RUN(test_relmap_episode_terminal_uses_original_generation_not_input_order);
 	UT_RUN(test_relmap_episode_terminal_refuses_partial_unsealed_or_wrong_original_plan);

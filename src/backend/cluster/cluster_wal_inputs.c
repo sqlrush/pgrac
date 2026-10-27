@@ -2838,6 +2838,93 @@ cluster_wal_inputs_ctrc_replays_source_v1(ClusterWalInputsV1 *inputs, uint32 sou
 	return source;
 }
 
+/* Explicit generation binding keeps the COMPLETE replay IR owner separate
+ * from the retained source it protects. No relmap view supplies authority. */
+static bool
+inputs_ctrc_generation(ClusterWalInputsV1 *inputs, uint32 index,
+	ClusterRecoveryCtrcReplaySetSourceV1 *out)
+{
+	ClusterRecoveryCtrcReplaySetSourceV1 source, owner, confirmed;
+	const ClusterWalInputV1 *item;
+	uint32 replay_index = CLUSTER_COLD_MAX_PARTICIPANTS;
+
+	if (inputs == NULL || inputs != active_ctrc_retention.scope
+		|| !cluster_wal_inputs_ctrc_replays_authorized_v1(inputs)
+		|| inputs->count == 0 || inputs->count > CLUSTER_WAL_INPUTS_MAX || index >= inputs->count)
+		return false;
+	item = &inputs->items[index];
+	for (uint32 i = 0; i < inputs->ctrc.source_plan->replay_count; i++) {
+		if (inputs->ctrc.source_plan->sources[i].claim.identity.origin_thread_id
+			!= item->source.claim.identity.origin_thread_id)
+			continue;
+		if (replay_index != CLUSTER_COLD_MAX_PARTICIPANTS)
+			return false;
+		replay_index = i;
+	}
+	if (replay_index == CLUSTER_COLD_MAX_PARTICIPANTS
+		|| !inputs_ctrc_replays_source(inputs, replay_index, &owner))
+		return false;
+	memcpy(&source, &owner, sizeof(source));
+	source.generation_index = index;
+	source.generation_count = inputs->count;
+	memcpy(&source.generation, item, sizeof(source.generation));
+	source.generation_flags = RF_CONTRIBUTOR_CUT_COMPLETE;
+	if (item->kind == CLUSTER_WAL_INPUT_CHECKPOINT) {
+		source.generation_begin = item->checkpoint.checkpoint_lower_lsn;
+		source.generation_end = item->checkpoint.validated_tail_lsn_exclusive;
+		if (item->checkpoint.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN) {
+			/* The original physical census, not this local matcher, fixes and
+			 * flushes this exact end. Never sample or adopt a later reservation. */
+			if (!inputs_ctrc_local_open(inputs, index) || inputs->local_index != index
+				|| inputs->local_minimum == InvalidXLogRecPtr
+				|| inputs->local_cut.complete_end != inputs->local_minimum
+				|| inputs->local_cut.flushed_end < inputs->local_minimum
+				|| memcmp(&inputs->local_cut.writer, &inputs->ctrc.owner.writer,
+					sizeof(inputs->local_cut.writer)) != 0
+				|| cluster_wal_writer_check(&inputs->local_cut.writer) != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+				return false;
+			source.generation_end = inputs->local_cut.complete_end;
+		} else if (item->checkpoint.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED
+			&& item->checkpoint.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+			&& item->checkpoint.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE)
+			return false;
+		if (item->source.timeline == 0 || item->checkpoint.checkpoint_tli != item->source.timeline
+			|| item->checkpoint.tail_tli != item->source.timeline
+			|| source.generation_begin == InvalidXLogRecPtr
+			|| source.generation_end <= source.generation_begin)
+			return false;
+	} else if (item->kind == CLUSTER_WAL_INPUT_INITIALIZER_TERMINAL) {
+		if (item->source.timeline == 0 || item->first_segment > UINT64_MAX - SizeOfXLogLongPHD)
+			return false;
+		source.generation_begin = item->first_segment + SizeOfXLogLongPHD;
+		source.generation_end = item->terminal.tail.complete_end;
+		if (item->terminal.tail.records == 0) {
+			source.generation_flags |= RF_CONTRIBUTOR_CUT_EXPLICIT_EMPTY;
+			source.generation_end = source.generation_begin;
+		} else if (source.generation_end <= source.generation_begin)
+			return false;
+	} else
+		return false;
+	if (!inputs_ctrc_replays_locator_current(&source)
+		|| !inputs_ctrc_replays_source(inputs, replay_index, &confirmed)
+		|| memcmp(&owner, &confirmed, sizeof(owner)) != 0
+		|| source.generation_count != inputs->count
+		|| memcmp(&source.generation, &inputs->items[index], sizeof(source.generation)) != 0)
+		return false;
+	memcpy(out, &source, sizeof(source));
+	return true;
+}
+
+ClusterRecoveryCtrcReplaySetSourceV1
+cluster_wal_inputs_ctrc_generation_v1(ClusterWalInputsV1 *inputs, uint32 input_index)
+{
+	ClusterRecoveryCtrcReplaySetSourceV1 source = {0}, empty = {0};
+
+	if (!inputs_ctrc_generation(inputs, input_index, &source))
+		return empty;
+	return source;
+}
+
 bool
 cluster_wal_inputs_ctrc_replays_source_current_v1(const ClusterRecoveryCtrcReplaySetSourceV1 *source)
 {
@@ -2847,7 +2934,9 @@ cluster_wal_inputs_ctrc_replays_source_current_v1(const ClusterRecoveryCtrcRepla
 		return false;
 	memcpy(&original, source, sizeof(original));
 	return inputs_ctrc_replays_locator_current(&original)
-		&& inputs_ctrc_replays_source(original.scope, original.source_index, &expected)
+		&& (original.generation_count != 0
+			? inputs_ctrc_generation(original.scope, original.generation_index, &expected)
+			: inputs_ctrc_replays_source(original.scope, original.source_index, &expected))
 		&& memcmp(&original, &expected, sizeof(original)) == 0
 		&& memcmp(source, &original, sizeof(original)) == 0;
 }
@@ -2864,9 +2953,13 @@ cluster_wal_inputs_ctrc_replays_source_covers_window_v1(
 	memcpy(&original, source, sizeof(original));
 	return lower != InvalidXLogRecPtr && upper > lower
 		&& cluster_wal_inputs_ctrc_replays_source_current_v1(&original)
-		&& thread == original.selected.source.claim.identity.origin_thread_id
-		&& lower >= original.selected.checkpoint.checkpoint_lower_lsn
-		&& upper <= original.selected.checkpoint.validated_tail_lsn_exclusive
+		&& (original.generation_count != 0
+			? (thread == original.generation.source.claim.identity.origin_thread_id
+				&& lower >= original.generation_begin && upper <= original.generation_end
+				&& !(original.generation_flags & RF_CONTRIBUTOR_CUT_EXPLICIT_EMPTY))
+			: (thread == original.selected.source.claim.identity.origin_thread_id
+				&& lower >= original.selected.checkpoint.checkpoint_lower_lsn
+				&& upper <= original.selected.checkpoint.validated_tail_lsn_exclusive))
 		&& memcmp(source, &original, sizeof(original)) == 0;
 }
 

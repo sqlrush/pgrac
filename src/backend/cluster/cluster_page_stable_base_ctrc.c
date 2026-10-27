@@ -103,7 +103,7 @@ ctrc_replay_owners_current(const RfPageIdentityV1 *identity,
 		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
 	for (uint32 i = 0; i < count; i++) {
 		const ClusterRecoveryCtrcReplaySetSourceV1 *a = &owners[i];
-		const ClusterWalInputV1 *selected = &a->selected;
+		const ClusterWalInputV1 *selected = a->generation_count != 0 ? &a->generation : &a->selected;
 		const ClusterControlRootSnapshot *checkpoint = &selected->checkpoint;
 		const ClusterRecoveryDutyKey *duty = &selected->source.claim.identity;
 		const RfContributorStreamCutV1 *cut = &vector->cuts[i];
@@ -111,9 +111,18 @@ ctrc_replay_owners_current(const RfPageIdentityV1 *identity,
 		/* Locate the native incarnation before reading any borrowed scope. */
 		if (!cluster_wal_inputs_ctrc_replays_source_current_v1(a))
 			return RF_PAGE_PROOF_DETAIL_ROOT_STALE;
-		if (a->replay_count != count || a->source_index >= count || seen[a->source_index])
+		if ((a->generation_count != 0) != (owners[0].generation_count != 0))
 			return RF_PAGE_PROOF_DETAIL_PARTICIPANT_MISSING;
-		seen[a->source_index] = true;
+		if (a->generation_count != 0) {
+			if (a->generation_count != count || a->generation_index >= count
+				|| seen[a->generation_index])
+				return RF_PAGE_PROOF_DETAIL_PARTICIPANT_MISSING;
+			seen[a->generation_index] = true;
+		} else {
+			if (a->replay_count != count || a->source_index >= count || seen[a->source_index])
+				return RF_PAGE_PROOF_DETAIL_PARTICIPANT_MISSING;
+			seen[a->source_index] = true;
+		}
 		if (a->scope != owners[0].scope
 			|| memcmp(&a->input_owner, &owners[0].input_owner, sizeof(a->input_owner)) != 0
 			|| a->work_generation != owners[0].work_generation
@@ -125,6 +134,17 @@ ctrc_replay_owners_current(const RfPageIdentityV1 *identity,
 			|| cut->origin_owner_incarnation == 0
 			|| cut->origin_owner_incarnation != duty->origin_owner_incarnation)
 			return RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+		/* Exact original full-input cuts, including empty terminals and the
+		 * once-fixed local OPEN end. The original COMPLETE replay input still
+		 * names the actual IR holder; it never replaces this generation. */
+		if (a->generation_count != 0) {
+			if (cut->timeline_id != selected->source.timeline
+				|| cut->flags != a->generation_flags
+				|| cut->scan_begin_inclusive != a->generation_begin
+				|| cut->scan_end_exclusive != a->generation_end)
+				return RF_PAGE_PROOF_DETAIL_SOURCE_GAP;
+			continue;
+		}
 		if (checkpoint->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE
 			|| selected->source.timeline == 0
 			|| checkpoint->checkpoint_tli != selected->source.timeline
