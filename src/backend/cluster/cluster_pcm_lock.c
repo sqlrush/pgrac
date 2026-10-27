@@ -21553,6 +21553,127 @@ cluster_pcm_lock_resource_x_acquire_service_snapshot_exact(
 	return result;
 }
 
+/* Pure planning under the original master owner. The proposed generation is
+ * not reserved and no frame can leave this helper. The eventual publisher
+ * must run this builder again before its original no-cancel-through seal. */
+static ResourceXApplyResult
+pcm_resource_x_acquire_decision_plan_locked(struct GrdEntry *entry,
+										  ClusterPcmResourceXMasterState *state,
+										  const ResourceXBootstrapWork *work,
+										  const ResourceXAcquireServiceSnapshot *expected,
+										  ResourceXAcquireDecisionPlan *plan)
+{
+	ResourceXAcquireServiceSnapshot input;
+	ResourceXDecodedAcquireDecision *decision;
+	ResourceXApplyResult result;
+	uint32 requester_bit;
+	int32 requester = work->request.logical_assertion.requester_node;
+	int32 source;
+
+	result = pcm_resource_x_acquire_service_snapshot_locked(entry, state, work, &input);
+	if (result != RESOURCE_X_APPLY_APPLIED)
+		return result;
+	if (expected != NULL && memcmp(expected, &input, sizeof(input)) != 0)
+		return RESOURCE_X_APPLY_STALE;
+	if (input.authority_generation >= UINT64_MAX - 1)
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	/* An omitted or old-domain incumbent is not permission to read disk or
+	 * to reduce the master-selected witness set, even for a compatible S. */
+	if (input.known_holders_bitmap != input.current_holders_bitmap)
+		return RESOURCE_X_APPLY_BAD_STATE;
+	if (input.current_holders_bitmap == 0 && input.pi_holders_bitmap != 0)
+		return RESOURCE_X_APPLY_BAD_STATE;
+	requester_bit = UINT32_C(1) << requester;
+	if ((input.current_holders_bitmap & requester_bit) != 0
+		&& input.holders[requester].boot_incarnation != input.work.acquire_intent.requester_incarnation)
+		return RESOURCE_X_APPLY_STALE;
+
+	memset(plan, 0, sizeof(*plan));
+	plan->input = input;
+	plan->proposed_authority_generation = input.authority_generation + 1;
+	plan->service_holders_bitmap = input.required_holders_bitmap;
+	decision = &plan->decision;
+	pcm_resource_x_acquire_identity_copy(&decision->episode, &input.work.acquire_intent);
+	decision->resource_binding = input.work.binding_generation;
+	decision->enqueue_order = input.work.enqueue_order;
+	decision->master_node = input.master_node;
+	decision->holders_bitmap = input.current_holders_bitmap;
+	decision->required_holders_bitmap = input.required_holders_bitmap;
+	decision->pi_holders_bitmap = input.pi_holders_bitmap;
+	/* Name the receiving endpoint: these are the two independent original
+	 * R->M ingress and M->R ingress identities, not a transport rebind. */
+	decision->master_ingress_generation = input.work.authenticated_ingress_connection_generation;
+	decision->requester_ingress_generation = input.work.master_sender_connection_generation;
+	decision->directory_mode = (uint8)input.directory.state;
+	memcpy(decision->holders, input.holders, sizeof(decision->holders));
+	if (input.current_holders_bitmap == 0) {
+		decision->source_kind = RESOURCE_X_ACQUIRE_SOURCE_DISK;
+		decision->source_node = -1;
+		return RESOURCE_X_APPLY_APPLIED;
+	}
+	/* Reuse the original current-carrier policy only after preferring the
+	 * requester's own proven current. PI is never a candidate current. */
+	source = (input.current_holders_bitmap & requester_bit) != 0
+		? requester
+		: pcm_resource_x_select_shared_current_carrier_locked(entry, input.current_holders_bitmap);
+	if (source < 0 || source >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+		|| (input.current_holders_bitmap & (UINT32_C(1) << source)) == 0)
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	decision->source_node = source;
+	decision->source_service_generation = plan->proposed_authority_generation;
+	if (source == requester)
+		decision->source_kind = RESOURCE_X_ACQUIRE_SOURCE_LOCAL_CURRENT;
+	else {
+		decision->source_kind = RESOURCE_X_ACQUIRE_SOURCE_REMOTE_CURRENT;
+		plan->service_holders_bitmap |= UINT32_C(1) << source;
+	}
+	return RESOURCE_X_APPLY_APPLIED;
+}
+
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_acquire_decision_plan_exact(
+	const ResourceXBootstrapWork *work, const ResourceXAcquireServiceSnapshot *expected,
+	ResourceXAcquireDecisionPlan *out)
+{
+	ResourceXAcquireDecisionPlan plan;
+	ClusterPcmResourceXMasterState *state;
+	PcmEntryRef ref;
+	PcmEntryAcquireResult acquired;
+	ResourceXApplyResult result;
+	const BufferTag *tag;
+
+	if (work == NULL || out == NULL || !work->has_acquire_intent || ClusterPcm == NULL
+		|| !resource_x_assertion_valid(&work->request.logical_assertion)
+		|| cluster_node_id < 0 || cluster_node_id >= RESOURCE_X_PROTOCOL_NODE_LIMIT)
+		return RESOURCE_X_APPLY_INVALID;
+	tag = &work->request.logical_assertion.resource;
+	if (cluster_gcs_lookup_master(*tag) != cluster_node_id
+		|| cluster_qvotec_get_self_incarnation() != work->request.master_session_incarnation)
+		return RESOURCE_X_APPLY_STALE;
+	if (!cluster_pcm_lock_resource_x_gate_open_exact(work->request.resource_formation)
+		|| cluster_grd_pi_rebuild_blocked_v1(*tag))
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (!pcm_entry_ref_acquire(tag, false, &ref, &acquired))
+		return acquired == PCM_ENTRY_ACQUIRE_NOT_FOUND ? RESOURCE_X_APPLY_NOT_FOUND
+			: RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	pcm_entry_lock_exclusive(ref.entry);
+	state = pcm_resource_x_master_state_for_entry(ref.entry);
+	result = pcm_resource_x_acquire_decision_plan_locked(ref.entry, state, work, expected, &plan);
+	if (result == RESOURCE_X_APPLY_APPLIED) {
+		if (cluster_gcs_lookup_master(*tag) != cluster_node_id
+			|| cluster_qvotec_get_self_incarnation() != work->request.master_session_incarnation)
+			result = RESOURCE_X_APPLY_STALE;
+		else if (!cluster_pcm_lock_resource_x_gate_open_exact(work->request.resource_formation)
+				 || cluster_grd_pi_rebuild_blocked_v1(*tag))
+			result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	}
+	LWLockRelease(&ref.entry->entry_lock.lock);
+	pcm_entry_ref_release(&ref);
+	if (result == RESOURCE_X_APPLY_APPLIED)
+		*out = plan;
+	return result;
+}
+
 void
 cluster_pcm_lock_resource_x_bootstrap_forget_exact(const ResourceXBootstrapWork *work)
 {

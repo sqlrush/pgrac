@@ -1284,6 +1284,21 @@ typedef struct ResourceXAcquireServiceSnapshot {
 StaticAssertDecl(sizeof(ResourceXAcquireServiceSnapshot) == 832,
 				 "acquisition service input must remain bounded and process-local");
 
+/* Unpublished master plan, never a wire grant or authority reservation.
+ * A publisher must rebuild it under the original entry owner before sealing
+ * the same E and reserving proposed_authority_generation.  Discarding this
+ * process-local value changes no shared responsibility. */
+typedef struct ResourceXAcquireDecisionPlan {
+	ResourceXAcquireServiceSnapshot input;
+	ResourceXDecodedAcquireDecision decision;
+	uint64 proposed_authority_generation;
+	uint32 service_holders_bitmap;
+	uint32 reserved;
+} ResourceXAcquireDecisionPlan;
+
+StaticAssertDecl(sizeof(ResourceXAcquireDecisionPlan) == 1480,
+				 "unpublished acquisition plan must remain bounded and local");
+
 typedef enum PcmXTransferCommitResult {
 	PCM_X_TRANSFER_COMMIT_OK = 0,
 	PCM_X_TRANSFER_COMMIT_NOT_FOUND,
@@ -1621,6 +1636,13 @@ cluster_pcm_lock_resource_x_bootstrap_resume_exact(const ResourceXBootstrapWork 
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_service_snapshot_exact(
 	const ResourceXBootstrapWork *work, const ResourceXAcquireServiceSnapshot *expected,
 	ResourceXAcquireServiceSnapshot *out);
+/* Same authenticated caller contract as the input snapshot. Choose only a
+ * fully proven current source or an N/no-PI disk source. No shared state,
+ * producer, wire frame or permission is published. All refusals preserve out,
+ * including expected == &out->input; ordinary unavailability stays local. */
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_decision_plan_exact(
+	const ResourceXBootstrapWork *work, const ResourceXAcquireServiceSnapshot *expected,
+	ResourceXAcquireDecisionPlan *out);
 extern void cluster_pcm_lock_resource_x_bootstrap_forget_exact(const ResourceXBootstrapWork *work);
 extern bool cluster_pcm_lock_resource_x_s_barrier_active(const BufferTag *tag);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_assert_bootstrapped_exact(

@@ -1780,10 +1780,533 @@ UT_TEST(test_provenance_r8_owner_retires_only_exact_old_domain_knowledge)
 	}
 }
 
+/* Source decisions use the actual canonical/master owner. Typed provenance
+ * injection below is restricted to policy/fault cases, not proof that the
+ * future authenticated remote grant producer is implemented. */
+static ResourceXAcquireDecisionPlan
+decision_plan_read(const ResourceXBootstrapWork *work)
+{
+	ResourceXAcquireDecisionPlan plan = {0};
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_decision_plan_exact(work, NULL, &plan),
+		RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	return plan;
+}
+
+static void
+decision_plan_refused(const ResourceXBootstrapWork *work,
+					  const ResourceXAcquireServiceSnapshot *expected, ResourceXApplyResult result)
+{
+	ResourceXAcquireDecisionPlan plan, original;
+	memset(&plan, 0xa5, sizeof(plan));
+	original = plan;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_decision_plan_exact(work, expected, &plan), result);
+	UT_ASSERT(memcmp(&plan, &original, sizeof(plan)) == 0);
+	UT_ASSERT_EQ(fake_lwlock_depth, 0);
+}
+
+static ResourceXDecodedFrame
+decision_plan_codec_frame(const ResourceXAcquireDecisionPlan *plan, bool block, int32 action)
+{
+	ResourceXDecodedFrame frame = {0}, decoded = {0};
+	ResourceXWireReject reject;
+	uint8 bytes[RESOURCE_X_DECISION_V3_BYTES];
+	uint16 len = 0;
+	uint8 type = block ? RESOURCE_X_MSG_BLOCK_TO_N : RESOURCE_X_MSG_IMAGE_OR_GRANT;
+
+	frame.kind = block ? RESOURCE_X_WIRE_BLOCK_TO_N : RESOURCE_X_WIRE_AUTHORITY_GRANT;
+	frame.payload_bytes = RESOURCE_X_DECISION_V3_BYTES;
+	frame.has_acquire_decision = true;
+	frame.common = plan->input.work.request;
+	frame.common.base_authority_generation = plan->input.authority_generation;
+	frame.common.authority_generation = plan->proposed_authority_generation;
+	frame.common.action_node = action;
+	frame.common.flags = 0;
+	frame.common.semantic_crc32c = 0;
+	frame.body.acquire_decision = plan->decision;
+	UT_ASSERT(cluster_resource_x_wire_encode(type, &frame, bytes, sizeof(bytes), &len, &reject));
+	UT_ASSERT_EQ(len, 736);
+	UT_ASSERT(cluster_resource_x_wire_decode(type, bytes, len, &decoded, &reject));
+	UT_ASSERT(decoded.has_acquire_decision && !decoded.has_acquire_intent);
+	UT_ASSERT_EQ(decoded.common.target_mode, plan->input.work.request.target_mode);
+	UT_ASSERT_EQ(decoded.body.acquire_decision.required_holders_bitmap,
+		plan->decision.required_holders_bitmap);
+	return decoded;
+}
+
+static ResourceXHolderGrantProvenance *
+decision_plan_inject_shared_holder(int32 node, uint64 boot)
+{
+	ResourceXHolderGrantProvenance *holders = provenance_original_record();
+	if (holders == NULL) return NULL;
+	service_directory_transition(PCM_TRANS_N_TO_S, node);
+	/* The product's typed original array, reached by its unique real record.
+	 * This is a deliberate metadata injection, not a synthetic grant API. */
+	holders[node] = (ResourceXHolderGrantProvenance){boot, 2, 17, 31, 0, 0};
+	return &holders[node];
+}
+
+UT_TEST(test_decision_plan_disk_preserves_each_original_intent)
+{
+	for (int path = RESOURCE_X_ACQUIRE_FIRST_FILL; path <= RESOURCE_X_ACQUIRE_RESIDENT; path++)
+		for (int mode = PCM_STATE_N; mode <= PCM_STATE_X; mode++)
+			for (int target = PCM_STATE_S; target <= PCM_STATE_X; target++) {
+				ResourceXDecodedFrame frame, decoded;
+				ResourceXBootstrapWork work;
+				ResourceXAcquireDecisionPlan plan;
+				if (path == RESOURCE_X_ACQUIRE_FIRST_FILL && mode != PCM_STATE_N) continue;
+				acquire_reset();
+				frame = acquire_frame(1, path, mode, target);
+				if (!acquire_canonical_start(&frame, &work)) continue;
+				plan = decision_plan_read(&work);
+				UT_ASSERT_EQ(plan.proposed_authority_generation, 2);
+				UT_ASSERT_EQ(plan.decision.source_kind, RESOURCE_X_ACQUIRE_SOURCE_DISK);
+				UT_ASSERT_EQ(plan.decision.source_node, -1);
+				UT_ASSERT_EQ(plan.decision.source_service_generation, 0);
+				UT_ASSERT_EQ(plan.decision.holders_bitmap, 0);
+				UT_ASSERT_EQ(plan.decision.required_holders_bitmap, 0);
+				UT_ASSERT_EQ(plan.service_holders_bitmap, 0);
+				UT_ASSERT_EQ(plan.decision.pi_holders_bitmap, 0);
+				UT_ASSERT(memcmp(&plan.input.work, &work, sizeof(work)) == 0);
+				UT_ASSERT(memcmp(&plan.decision.episode, &work.acquire_intent,
+					sizeof(work.acquire_intent)) == 0);
+				UT_ASSERT_EQ(plan.decision.resource_binding, work.binding_generation);
+				UT_ASSERT_EQ(plan.decision.enqueue_order, work.enqueue_order);
+				UT_ASSERT_EQ(plan.decision.master_node, 0);
+				UT_ASSERT_EQ(plan.decision.requester_ingress_generation, 61);
+				UT_ASSERT_EQ(plan.decision.master_ingress_generation, 61);
+				decoded = decision_plan_codec_frame(&plan, false, 1);
+				UT_ASSERT_EQ(decoded.body.acquire_decision.episode.path, path);
+				acquire_canonical_check(&frame);
+			}
+}
+
+UT_TEST(test_decision_plan_never_reserves_or_arms_original_owner)
+{
+	ResourceXDecodedFrame frame;
+	ResourceXBootstrapWork work;
+	ResourceXAcquireDecisionPlan first, second;
+	ResourceXMasterSnapshot before, after;
+	ResourceXIntentSlot intent;
+	uint8 payload[RESOURCE_X_DECISION_V3_BYTES];
+	unsigned char *bytes;
+	if (!service_snapshot_start(PCM_STATE_N, PCM_STATE_X, &frame, &work)) return;
+	bytes = malloc(fake_pcm_header_requested_size);
+	UT_ASSERT(bytes != NULL);
+	if (bytes == NULL) return;
+	memcpy(bytes, fake_pcm_header.data, fake_pcm_header_requested_size);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_master_snapshot_exact(
+		&frame.common.logical_assertion, &before), RESOURCE_X_APPLY_APPLIED);
+	first = decision_plan_read(&work);
+	second = decision_plan_read(&work);
+	UT_ASSERT(memcmp(&first, &second, sizeof(first)) == 0);
+	UT_ASSERT(memcmp(bytes, fake_pcm_header.data, fake_pcm_header_requested_size) == 0);
+	free(bytes);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_master_snapshot_exact(
+		&frame.common.logical_assertion, &after), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(memcmp(&before, &after, sizeof(before)) == 0);
+	UT_ASSERT_EQ(after.final_authority_generation, 0);
+	UT_ASSERT_EQ(after.source_node, -1);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_grant_intent_snapshot_exact(
+		&frame.common.logical_assertion, &intent, payload, sizeof(payload)), RESOURCE_X_APPLY_NOT_FOUND);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_block_intent_snapshot_exact(
+		&frame.common.logical_assertion, 0, &intent, payload, sizeof(payload)), RESOURCE_X_APPLY_NOT_FOUND);
+}
+
+UT_TEST(test_decision_plan_pi_without_current_never_becomes_disk_permission)
+{
+	ResourceXDecodedFrame frame;
+	ResourceXBootstrapWork work;
+	struct StopPcmEntryLayout *entry;
+	if (!service_snapshot_start(PCM_STATE_N, PCM_STATE_S, &frame, &work)) return;
+	entry = (struct StopPcmEntryLayout *)fake_pcm_entries.data[0];
+	for (int n = 0; n < 3; n++) {
+		uint32 mask = n == 0 ? UINT32_C(1) : n == 1 ? UINT32_C(1) << 31 : UINT32_MAX;
+		pg_atomic_write_u32(&entry->pi_holders_bitmap, mask);
+		decision_plan_refused(&work, NULL, RESOURCE_X_APPLY_BAD_STATE);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&entry->pi_holders_bitmap), mask);
+	}
+	pg_atomic_write_u32(&entry->pi_holders_bitmap, 0);
+	UT_ASSERT_EQ(decision_plan_read(&work).decision.source_kind, RESOURCE_X_ACQUIRE_SOURCE_DISK);
+}
+
+UT_TEST(test_decision_plan_real_x_holder_supplies_same_source_and_required_set)
+{
+	for (int target = PCM_STATE_S; target <= PCM_STATE_X; target++) {
+		ResourceXDecodedFrame frame;
+		ResourceXBootstrapWork work;
+		ResourceXAcquireDecisionPlan plan;
+		provenance_grant(0);
+		frame = acquire_frame(1, RESOURCE_X_ACQUIRE_RESIDENT, PCM_STATE_N, target);
+		if (!acquire_canonical_start(&frame, &work)) continue;
+		plan = decision_plan_read(&work);
+		UT_ASSERT_EQ(plan.proposed_authority_generation, 3);
+		UT_ASSERT_EQ(plan.decision.directory_mode, PCM_STATE_X);
+		UT_ASSERT_EQ(plan.decision.source_kind, RESOURCE_X_ACQUIRE_SOURCE_REMOTE_CURRENT);
+		UT_ASSERT_EQ(plan.decision.source_node, 0);
+		UT_ASSERT_EQ(plan.decision.source_service_generation, 3);
+		UT_ASSERT_EQ(plan.decision.holders_bitmap, 1);
+		UT_ASSERT_EQ(plan.decision.required_holders_bitmap, 1);
+		UT_ASSERT_EQ(plan.service_holders_bitmap, 1);
+		UT_ASSERT_EQ(plan.decision.pi_holders_bitmap, 0);
+		UT_ASSERT_EQ(plan.decision.holders[0].boot_incarnation, 31);
+		UT_ASSERT_EQ(plan.decision.holders[0].grant_generation, 2);
+		(void)decision_plan_codec_frame(&plan, false, 1);
+		(void)decision_plan_codec_frame(&plan, true, 0);
+	}
+}
+
+UT_TEST(test_decision_plan_real_s_source_does_not_trim_pi_or_required_set)
+{
+	for (int target = PCM_STATE_S; target <= PCM_STATE_X; target++) {
+		ResourceXDecodedFrame frame;
+		ResourceXBootstrapWork work;
+		ResourceXAcquireDecisionPlan plan;
+		provenance_grant(0);
+		service_directory_transition(PCM_TRANS_X_TO_S_DOWNGRADE, 0);
+		frame = acquire_frame(1, RESOURCE_X_ACQUIRE_RESIDENT, PCM_STATE_N, target);
+		if (!acquire_canonical_start(&frame, &work)) continue;
+		plan = decision_plan_read(&work);
+		UT_ASSERT_EQ(plan.decision.directory_mode, PCM_STATE_S);
+		UT_ASSERT_EQ(plan.decision.source_kind, RESOURCE_X_ACQUIRE_SOURCE_REMOTE_CURRENT);
+		UT_ASSERT_EQ(plan.decision.source_node, 0);
+		UT_ASSERT_EQ(plan.decision.required_holders_bitmap, target == PCM_STATE_X ? 1 : 0);
+		UT_ASSERT_EQ(plan.service_holders_bitmap, 1);
+		UT_ASSERT_EQ(plan.decision.pi_holders_bitmap, 1);
+		UT_ASSERT_EQ(plan.decision.holders[0].grant_generation, 2);
+		(void)decision_plan_codec_frame(&plan, false, 1);
+		(void)decision_plan_codec_frame(&plan, true, 0);
+	}
+}
+
+UT_TEST(test_decision_plan_local_current_is_not_another_remote_fetch)
+{
+	for (int state = PCM_STATE_S; state <= PCM_STATE_X; state++)
+		for (int target = PCM_STATE_S; target <= PCM_STATE_X; target++) {
+			ResourceXDecodedFrame frame;
+			ResourceXBootstrapWork work;
+			ResourceXAcquireDecisionPlan plan;
+			provenance_grant(0);
+			if (state == PCM_STATE_S) service_directory_transition(PCM_TRANS_X_TO_S_DOWNGRADE, 0);
+			frame = acquire_frame(0, RESOURCE_X_ACQUIRE_RESIDENT, state, target);
+			frame.common.assertion_sequence = 99;
+			if (!acquire_canonical_start(&frame, &work)) continue;
+			plan = decision_plan_read(&work);
+			UT_ASSERT_EQ(plan.decision.source_kind, RESOURCE_X_ACQUIRE_SOURCE_LOCAL_CURRENT);
+			UT_ASSERT_EQ(plan.decision.source_node, 0);
+			UT_ASSERT_EQ(plan.decision.required_holders_bitmap,
+				state == PCM_STATE_X && target == PCM_STATE_S ? 1 : 0);
+			UT_ASSERT_EQ(plan.service_holders_bitmap,
+				state == PCM_STATE_X && target == PCM_STATE_S ? 1 : 0);
+			UT_ASSERT_EQ(plan.decision.episode.requester_incarnation, 31);
+			(void)decision_plan_codec_frame(&plan, false, 0);
+		}
+}
+
+UT_TEST(test_decision_plan_unknown_legacy_current_never_samples_fresh_peer_boot)
+{
+	for (int state = PCM_STATE_S; state <= PCM_STATE_X; state++)
+		for (int target = PCM_STATE_S; target <= PCM_STATE_X; target++) {
+			ResourceXDecodedFrame frame;
+			ResourceXBootstrapWork work;
+			provenance_grant(2);
+			if (state == PCM_STATE_S) service_directory_transition(PCM_TRANS_X_TO_S_DOWNGRADE, 2);
+			frame = acquire_frame(1, RESOURCE_X_ACQUIRE_RESIDENT, PCM_STATE_N, target);
+			if (!acquire_canonical_start(&frame, &work)) continue;
+			auth_peer_boot++;
+			decision_plan_refused(&work, NULL, RESOURCE_X_APPLY_BAD_STATE);
+		}
+}
+
+UT_TEST(test_decision_plan_partial_known_shared_set_cannot_be_clipped)
+{
+	ResourceXDecodedFrame frame;
+	ResourceXBootstrapWork work;
+	ResourceXAcquireDecisionPlan plan;
+	provenance_grant(0);
+	service_directory_transition(PCM_TRANS_X_TO_S_DOWNGRADE, 0);
+	service_directory_transition(PCM_TRANS_N_TO_S, 2);
+	frame = acquire_frame(1, RESOURCE_X_ACQUIRE_RESIDENT, PCM_STATE_N, PCM_STATE_S);
+	if (!acquire_canonical_start(&frame, &work)) return;
+	decision_plan_refused(&work, NULL, RESOURCE_X_APPLY_BAD_STATE);
+	service_directory_transition(PCM_TRANS_S_TO_N_RELEASE, 2);
+	plan = decision_plan_read(&work);
+	UT_ASSERT_EQ(plan.decision.holders_bitmap, 1);
+	UT_ASSERT_EQ(plan.decision.source_node, 0);
+}
+
+UT_TEST(test_decision_plan_complete_injected_shared_set_keeps_every_holder)
+{
+	ResourceXDecodedFrame frame;
+	ResourceXBootstrapWork work;
+	ResourceXAcquireDecisionPlan plan;
+	provenance_grant(0);
+	service_directory_transition(PCM_TRANS_X_TO_S_DOWNGRADE, 0);
+	if (decision_plan_inject_shared_holder(2, 102) == NULL) return;
+	if (decision_plan_inject_shared_holder(3, 103) == NULL) return;
+	frame = acquire_frame(1, RESOURCE_X_ACQUIRE_RESIDENT, PCM_STATE_N, PCM_STATE_X);
+	if (!acquire_canonical_start(&frame, &work)) return;
+	plan = decision_plan_read(&work);
+	UT_ASSERT_EQ(plan.decision.source_node, 0);
+	UT_ASSERT_EQ(plan.decision.holders_bitmap, 13);
+	UT_ASSERT_EQ(plan.decision.required_holders_bitmap, 13);
+	UT_ASSERT_EQ(plan.service_holders_bitmap, 13);
+	UT_ASSERT_EQ(plan.decision.holders[2].boot_incarnation, 102);
+	UT_ASSERT_EQ(plan.decision.holders[3].boot_incarnation, 103);
+	for (int node = 0; node < 4; node++)
+		if (node != 1) (void)decision_plan_codec_frame(&plan, true, node);
+}
+
+UT_TEST(test_decision_plan_requester_current_precedes_another_known_source)
+{
+	ResourceXDecodedFrame frame;
+	ResourceXBootstrapWork work;
+	ResourceXAcquireDecisionPlan plan;
+	provenance_grant(0);
+	service_directory_transition(PCM_TRANS_X_TO_S_DOWNGRADE, 0);
+	if (decision_plan_inject_shared_holder(2, 101) == NULL) return;
+	frame = acquire_frame(2, RESOURCE_X_ACQUIRE_RESIDENT, PCM_STATE_S, PCM_STATE_X);
+	if (!acquire_canonical_start(&frame, &work)) return;
+	plan = decision_plan_read(&work);
+	UT_ASSERT_EQ(plan.decision.source_kind, RESOURCE_X_ACQUIRE_SOURCE_LOCAL_CURRENT);
+	UT_ASSERT_EQ(plan.decision.source_node, 2);
+	UT_ASSERT_EQ(plan.decision.holders_bitmap, 5);
+	UT_ASSERT_EQ(plan.decision.required_holders_bitmap, 1);
+	UT_ASSERT_EQ(plan.service_holders_bitmap, 1);
+	(void)decision_plan_codec_frame(&plan, false, 2);
+}
+
+UT_TEST(test_decision_plan_requester_incarnation_must_match_incumbent_grant)
+{
+	ResourceXDecodedFrame frame;
+	ResourceXBootstrapWork work;
+	ResourceXHolderGrantProvenance *holder;
+	provenance_grant(0);
+	service_directory_transition(PCM_TRANS_X_TO_S_DOWNGRADE, 0);
+	holder = decision_plan_inject_shared_holder(2, 102);
+	if (holder == NULL) return;
+	frame = acquire_frame(2, RESOURCE_X_ACQUIRE_RESIDENT, PCM_STATE_S, PCM_STATE_X);
+	if (!acquire_canonical_start(&frame, &work)) return;
+	decision_plan_refused(&work, NULL, RESOURCE_X_APPLY_STALE);
+	holder->boot_incarnation = 101;
+	UT_ASSERT_EQ(decision_plan_read(&work).decision.source_node, 2);
+}
+
+UT_TEST(test_decision_plan_exact_input_and_alias_preserve_output_on_refusal)
+{
+	ResourceXDecodedFrame frame;
+	ResourceXBootstrapWork work;
+	ResourceXAcquireDecisionPlan plan, original;
+	ResourceXAcquireServiceSnapshot wrong;
+	if (!service_snapshot_start(PCM_STATE_N, PCM_STATE_X, &frame, &work)) return;
+	plan = decision_plan_read(&work);
+	for (Size pos = 0; pos < sizeof(wrong); pos++) {
+		wrong = plan.input;
+		((uint8 *)&wrong)[pos] ^= 1;
+		decision_plan_refused(&work, &wrong, RESOURCE_X_APPLY_STALE);
+	}
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_decision_plan_exact(&work, &plan.input, &plan),
+		RESOURCE_X_APPLY_APPLIED);
+	plan.input.pi_watermark_lsn++;
+	original = plan;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_decision_plan_exact(&work, &plan.input, &plan),
+		RESOURCE_X_APPLY_STALE);
+	UT_ASSERT(memcmp(&plan, &original, sizeof(plan)) == 0);
+}
+
+UT_TEST(test_decision_plan_physical_aba_requires_a_new_locked_cut)
+{
+	ResourceXDecodedFrame frame;
+	ResourceXBootstrapWork work;
+	ResourceXAcquireDecisionPlan before, after;
+	if (!provenance_start(0, &frame, &work)) return;
+	before = decision_plan_read(&work);
+	service_directory_transition(PCM_TRANS_X_TO_S_DOWNGRADE, 0);
+	service_directory_transition(PCM_TRANS_S_TO_X_UPGRADE, 0);
+	decision_plan_refused(&work, &before.input, RESOURCE_X_APPLY_STALE);
+	/* The replacement also lost original-grant provenance; a fresh cut is
+	 * not enough to turn that tag-only grant into a usable source. */
+	decision_plan_refused(&work, NULL, RESOURCE_X_APPLY_BAD_STATE);
+	(void)after;
+}
+
+UT_TEST(test_decision_plan_cancelled_a_cannot_authorize_or_cancel_successor_b)
+{
+	ResourceXDecodedFrame frame;
+	ResourceXBootstrapWork work, next;
+	ResourceXAcquireDecisionPlan first, second;
+	if (!service_snapshot_start(PCM_STATE_N, PCM_STATE_X, &frame, &work)) return;
+	first = decision_plan_read(&work);
+	cluster_pcm_lock_resource_x_bootstrap_forget_exact(&work);
+	frame.common.assertion_sequence++;
+	if (!acquire_canonical_start(&frame, &next)) return;
+	decision_plan_refused(&work, NULL, RESOURCE_X_APPLY_STALE);
+	second = decision_plan_read(&next);
+	UT_ASSERT_EQ(first.proposed_authority_generation, second.proposed_authority_generation);
+	UT_ASSERT_NE(first.input.work.request.assertion_sequence, second.input.work.request.assertion_sequence);
+	cluster_pcm_lock_resource_x_bootstrap_forget_exact(&work);
+	UT_ASSERT_EQ(decision_plan_read(&next).input.work.enqueue_order, next.enqueue_order);
+}
+
+UT_TEST(test_decision_plan_domain_changes_are_checked_after_entry_acquisition)
+{
+	ResourceXDecodedFrame frame;
+	ResourceXBootstrapWork work;
+	if (!service_snapshot_start(PCM_STATE_N, PCM_STATE_S, &frame, &work)) return;
+	object_entry_lock_hook = service_master_turnover_at_entry_lock;
+	decision_plan_refused(&work, NULL, RESOURCE_X_APPLY_STALE);
+	UT_ASSERT(object_entry_lock_hook == NULL);
+	ut_master_session--;
+	fake_gcs_master_node = 2;
+	decision_plan_refused(&work, NULL, RESOURCE_X_APPLY_STALE);
+	fake_gcs_master_node = -1;
+	pi_service_blocked = true;
+	decision_plan_refused(&work, NULL, RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+	pi_service_blocked = false;
+	UT_ASSERT_EQ(decision_plan_read(&work).decision.source_kind, RESOURCE_X_ACQUIRE_SOURCE_DISK);
+}
+
+UT_TEST(test_decision_plan_malformed_provenance_is_not_treated_as_unknown)
+{
+	ResourceXDecodedFrame frame;
+	ResourceXBootstrapWork work;
+	ResourceXHolderGrantProvenance *holder;
+	if (!provenance_start(0, &frame, &work)) return;
+	holder = provenance_original_record();
+	if (holder == NULL) return;
+	holder->reserved = 1;
+	decision_plan_refused(&work, NULL, RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+	UT_ASSERT_EQ(holder->reserved, 1);
+	holder->reserved = 0;
+	UT_ASSERT_EQ(decision_plan_read(&work).decision.source_node, 0);
+}
+
+UT_TEST(test_decision_plan_cannot_skip_uncanonical_or_successor_fifo_work)
+{
+	ResourceXDecodedFrame first, second;
+	ResourceXBootstrapWork work, later;
+	acquire_reset();
+	first = acquire_frame(1, RESOURCE_X_ACQUIRE_FIRST_FILL, PCM_STATE_N, PCM_STATE_X);
+	UT_ASSERT_EQ(acquire_deliver(&first), RESOURCE_X_APPLY_APPLIED);
+	work = bootstrap_next_work();
+	decision_plan_refused(&work, NULL, RESOURCE_X_APPLY_BAD_STATE);
+	UT_ASSERT_EQ(cluster_gcs_block_resource_x_bootstrap_tick(&work), RESOURCE_X_APPLY_APPLIED);
+	second = acquire_frame(2, RESOURCE_X_ACQUIRE_FIRST_FILL, PCM_STATE_N, PCM_STATE_S);
+	UT_ASSERT_EQ(acquire_deliver(&second), RESOURCE_X_APPLY_APPLIED);
+	later = work;
+	later.request = second.common;
+	later.acquire_intent = second.body.acquire_intent;
+	later.enqueue_order++;
+	decision_plan_refused(&later, NULL, RESOURCE_X_APPLY_BAD_STATE);
+	UT_ASSERT_EQ(decision_plan_read(&work).input.work.enqueue_order, 1);
+}
+
+UT_TEST(test_decision_plan_is_not_a_legacy_native_grant_or_holder_revoke)
+{
+	ResourceXDecodedFrame frame, candidate;
+	ResourceXBootstrapWork work;
+	ResourceXAcquireDecisionPlan plan;
+	ResourceXMasterSnapshot out;
+	ResourceXRequesterJoinSnapshot join;
+	ResourceXAssertion assertion;
+	if (!provenance_start(0, &frame, &work)) return;
+	plan = decision_plan_read(&work);
+	candidate = decision_plan_codec_frame(&plan, false, 1);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_join_exact(&candidate, 0, &join),
+		RESOURCE_X_APPLY_INVALID);
+	candidate = decision_plan_codec_frame(&plan, true, 0);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_block_to_n_exact(&candidate, 0),
+		RESOURCE_X_APPLY_INVALID);
+	assertion = frame.common.logical_assertion;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_master_snapshot_exact(&assertion, &out),
+		RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(out.final_authority_generation, 0);
+	UT_ASSERT_EQ(out.source_node, -1);
+}
+
+UT_TEST(test_decision_plan_exhausted_authority_never_wraps_to_a_new_service)
+{
+	BufferTag tag = make_tag(850);
+	ResourceXDecodedFrame frame;
+	ResourceXBootstrapWork work;
+	PcmAuthoritySnapshot authority;
+	struct StopPcmEntryLayout *entry;
+	acquire_reset();
+	UT_ASSERT(cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_N_TO_S, 0));
+	entry = (struct StopPcmEntryLayout *)fake_pcm_entries.data[0];
+	pg_atomic_write_u64(&entry->transition_count_local, UINT64_MAX - 1);
+	UT_ASSERT(cluster_pcm_lock_authority_snapshot(tag, &authority));
+	frame = acquire_frame(1, RESOURCE_X_ACQUIRE_RESIDENT, PCM_STATE_N, PCM_STATE_X);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_adapter_base_bind_exact(&frame.common.logical_assertion,
+		17, UINT64_MAX - 1, &authority), RESOURCE_X_APPLY_APPLIED);
+	if (!acquire_canonical_start(&frame, &work)) return;
+	decision_plan_refused(&work, NULL, RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+}
+
+UT_TEST(test_decision_plan_invalid_and_missing_work_preserve_caller_storage)
+{
+	ResourceXDecodedFrame frame;
+	ResourceXBootstrapWork work, wrong;
+	if (!service_snapshot_start(PCM_STATE_N, PCM_STATE_S, &frame, &work)) return;
+	decision_plan_refused(NULL, NULL, RESOURCE_X_APPLY_INVALID);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_decision_plan_exact(&work, NULL, NULL),
+		RESOURCE_X_APPLY_INVALID);
+	wrong = work;
+	wrong.has_acquire_intent = false;
+	decision_plan_refused(&wrong, NULL, RESOURCE_X_APPLY_INVALID);
+	wrong = work;
+	wrong.request.logical_assertion.requester_node = 32;
+	decision_plan_refused(&wrong, NULL, RESOURCE_X_APPLY_INVALID);
+	wrong = work;
+	wrong.request.logical_assertion.resource.blockNum++;
+	decision_plan_refused(&wrong, NULL, RESOURCE_X_APPLY_NOT_FOUND);
+}
+
+UT_TEST(test_decision_plan_binds_each_direction_of_the_original_connection)
+{
+	ResourceXDecodedFrame frame, ack;
+	ResourceXBootstrapWork work;
+	ResourceXAcquireDecisionPlan plan;
+	acquire_reset();
+	frame = acquire_frame(1, RESOURCE_X_ACQUIRE_FIRST_FILL, PCM_STATE_N, PCM_STATE_S);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(&frame, 1, 61, 77,
+		31, 71, &ack), RESOURCE_X_APPLY_APPLIED);
+	work = bootstrap_next_work();
+	/* Direct original owner after the independent caller admission contract;
+	 * direction values differ so swapped endpoint meanings cannot pass. */
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_resume_exact(&work, &ack),
+		RESOURCE_X_APPLY_APPLIED);
+	plan = decision_plan_read(&work);
+	UT_ASSERT_EQ(plan.decision.master_ingress_generation, 61); /* R -> M */
+	UT_ASSERT_EQ(plan.decision.requester_ingress_generation, 71); /* M -> R */
+	(void)decision_plan_codec_frame(&plan, false, 1);
+}
+
+UT_TEST(test_decision_plan_all32_bits_and_original_master_source_are_preserved)
+{
+	ResourceXDecodedFrame frame;
+	ResourceXBootstrapWork work;
+	ResourceXAcquireDecisionPlan plan;
+	provenance_grant(0);
+	service_directory_transition(PCM_TRANS_X_TO_S_DOWNGRADE, 0);
+	for (int node = 2; node < 32; node++)
+		if (decision_plan_inject_shared_holder(node, (uint64)200 + node) == NULL) return;
+	frame = acquire_frame(1, RESOURCE_X_ACQUIRE_RESIDENT, PCM_STATE_N, PCM_STATE_X);
+	if (!acquire_canonical_start(&frame, &work)) return;
+	plan = decision_plan_read(&work);
+	UT_ASSERT_EQ(plan.decision.holders_bitmap, UINT32_C(0xfffffffd));
+	UT_ASSERT_EQ(plan.decision.required_holders_bitmap, UINT32_C(0xfffffffd));
+	UT_ASSERT_EQ(plan.service_holders_bitmap, UINT32_C(0xfffffffd));
+	UT_ASSERT_EQ(plan.decision.source_node, 0);
+	UT_ASSERT_EQ(plan.decision.holders[31].boot_incarnation, 231);
+	UT_ASSERT_EQ(plan.decision.holders[31].grant_generation, 2);
+	(void)decision_plan_codec_frame(&plan, true, 31);
+}
+
 int
 main(void)
 {
-	UT_PLAN(67);
+	UT_PLAN(89);
 	UT_RUN(test_acquire_payload_selects_only_exact_request_length);
 	UT_RUN(test_acquire_all_ordinary_intents_queue_without_authority_or_ack);
 	UT_RUN(test_acquire_local_request_uses_self_boot_without_remote_observation);
@@ -1851,6 +2374,28 @@ main(void)
 	UT_RUN(test_provenance_valid_current_is_not_protocol_debt_but_corruption_is);
 	UT_RUN(test_provenance_detached_from_current_set_cannot_supply_a_holder);
 	UT_RUN(test_provenance_r8_owner_retires_only_exact_old_domain_knowledge);
+	UT_RUN(test_decision_plan_disk_preserves_each_original_intent);
+	UT_RUN(test_decision_plan_never_reserves_or_arms_original_owner);
+	UT_RUN(test_decision_plan_pi_without_current_never_becomes_disk_permission);
+	UT_RUN(test_decision_plan_real_x_holder_supplies_same_source_and_required_set);
+	UT_RUN(test_decision_plan_real_s_source_does_not_trim_pi_or_required_set);
+	UT_RUN(test_decision_plan_local_current_is_not_another_remote_fetch);
+	UT_RUN(test_decision_plan_unknown_legacy_current_never_samples_fresh_peer_boot);
+	UT_RUN(test_decision_plan_partial_known_shared_set_cannot_be_clipped);
+	UT_RUN(test_decision_plan_complete_injected_shared_set_keeps_every_holder);
+	UT_RUN(test_decision_plan_requester_current_precedes_another_known_source);
+	UT_RUN(test_decision_plan_requester_incarnation_must_match_incumbent_grant);
+	UT_RUN(test_decision_plan_exact_input_and_alias_preserve_output_on_refusal);
+	UT_RUN(test_decision_plan_physical_aba_requires_a_new_locked_cut);
+	UT_RUN(test_decision_plan_cancelled_a_cannot_authorize_or_cancel_successor_b);
+	UT_RUN(test_decision_plan_domain_changes_are_checked_after_entry_acquisition);
+	UT_RUN(test_decision_plan_malformed_provenance_is_not_treated_as_unknown);
+	UT_RUN(test_decision_plan_cannot_skip_uncanonical_or_successor_fifo_work);
+	UT_RUN(test_decision_plan_is_not_a_legacy_native_grant_or_holder_revoke);
+	UT_RUN(test_decision_plan_exhausted_authority_never_wraps_to_a_new_service);
+	UT_RUN(test_decision_plan_invalid_and_missing_work_preserve_caller_storage);
+	UT_RUN(test_decision_plan_binds_each_direction_of_the_original_connection);
+	UT_RUN(test_decision_plan_all32_bits_and_original_master_source_are_preserved);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
