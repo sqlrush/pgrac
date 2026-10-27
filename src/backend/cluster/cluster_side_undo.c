@@ -705,7 +705,8 @@ cluster_undo_prepare_header_v1(const ClusterUndoDecoded *decoded, const uint8 *p
 															before->segment_state, &record);
 		if (decision == CLUSTER_SEGRECYCLE_REDO_SKIP_STALE)
 			return CLUSTER_UNDO_HEADER_SKIP_STALE;
-		if (decision != CLUSTER_SEGRECYCLE_REDO_APPLY)
+		if (decision != CLUSTER_SEGRECYCLE_REDO_APPLY
+			|| !UndoSegmentHeader_undo_heads_empty(before))
 			return CLUSTER_UNDO_HEADER_BLOCKED;
 		prepared = prior;
 		header->segment_state = decoded->new_state;
@@ -719,7 +720,8 @@ cluster_undo_prepare_header_v1(const ClusterUndoDecoded *decoded, const uint8 *p
 			|| header->segment_state != SEGMENT_ALLOCATED
 			|| header->wrap_count
 				   != (decoded->kind == CLUSTER_UNDO_KIND_SEGMENT_INIT ? 0
-																	   : decoded->new_generation))
+																	   : decoded->new_generation)
+			|| !UndoSegmentHeader_undo_heads_empty(header))
 			return CLUSTER_UNDO_HEADER_BLOCKED;
 		if (decoded->kind == CLUSTER_UNDO_KIND_SEGMENT_REUSE) {
 			xl_undo_segment_reuse record = { 0 };
@@ -732,6 +734,11 @@ cluster_undo_prepare_header_v1(const ClusterUndoDecoded *decoded, const uint8 *p
 			if (decision == CLUSTER_SEGREUSE_REDO_SKIP_STALE)
 				return CLUSTER_UNDO_HEADER_SKIP_STALE;
 			if (decision != CLUSTER_SEGREUSE_REDO_APPLY)
+				return CLUSTER_UNDO_HEADER_BLOCKED;
+			/* Replacing the old generation destroys its chain. Same-new-gen
+			 * image replay keeps the original WAL-order recovery semantics. */
+			if (base_valid && before->wrap_count == decoded->expected_generation
+				&& !UndoSegmentHeader_undo_heads_empty(before))
 				return CLUSTER_UNDO_HEADER_BLOCKED;
 		}
 	} else {

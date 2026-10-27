@@ -3908,6 +3908,7 @@ test_cluster_undo_recovery: test_cluster_undo_recovery.c unit_test.h \
 		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 test_cluster_undo_native_lifecycle: test_cluster_undo_native_lifecycle.c unit_test.h \
+		$(srcdir)/test_cluster_segment_native_retained.inc \
 		$(srcdir)/test_cluster_undo_commit_retained.inc \
 		test_cluster_undo_lifecycle_native.inc test_cluster_undo_header_identity.inc \
 		test_cluster_undo_bind_native.inc \
@@ -5207,6 +5208,7 @@ test_cluster_writer_chain: test_cluster_writer_chain.c unit_test.h \
 		$(CLUSTER_WRITER_CHAIN_O) \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 test_cluster_retention: test_cluster_retention.c unit_test.h \
+		$(srcdir)/test_cluster_segment_retained.inc \
 		$(CLUSTER_UNDO_RETENTION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_UNDO_RETENTION_O) \
@@ -9069,13 +9071,14 @@ test_cluster_undo_block0: test_cluster_undo_block0.c unit_test.h \
 
 # Spec 8.4A Candidate-2: the fixture includes the exact current owner source
 # so it can pin private key/phase invariants without exporting test-only ABI.
-# The fixture stubs every adjacent seam and includes the current owner source, so
-# the production objects are compile prerequisites only.  Linking those objects
-# as well would create duplicate definitions instead of adding coverage.
+# The fixture includes the current owner and links the real pure retention
+# predicate. Other adjacent seams are stubbed, so their production objects are
+# compile prerequisites only; linking them would create duplicate definitions.
 test_cluster_undo_block0_current: test_cluster_undo_block0_current.c unit_test.h \
+		$(srcdir)/test_cluster_segment_current_retained.inc $(CLUSTER_UNDO_RETENTION_O) \
 		$(CLUSTER_UNDO_BLOCK0_CURRENT_O) $(CLUSTER_UNDO_BLOCK0_O) \
 		$(CLUSTER_UNDO_BLOCK0_RESIDENT_O) $(CLUSTER_GES_REPLY_WAIT_O) $(CLUSTER_GES_O)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNDO_RETENTION_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 

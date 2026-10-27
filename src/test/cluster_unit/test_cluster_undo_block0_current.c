@@ -13,6 +13,7 @@
 
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_undo_segment.h"
+#include "cluster/cluster_uba.h"
 #include "cluster/cluster_undo_segment_init.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
 
@@ -923,36 +924,7 @@ cluster_undo_emit_segment_recycle(uint8 instance pg_attribute_unused(),
 	return fake_recycle_lsn;
 }
 
-bool
-cluster_undo_segment_recyclable_for_mode(const struct UndoSegmentHeaderData *header, SCN horizon,
-										 bool peer_mode)
-{
-	int i;
-
-	if (header == NULL || header->segment_state != SEGMENT_COMMITTED)
-		return false;
-	if (!peer_mode)
-		return true;
-	for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
-		const TTSlot *slot = &header->tt_slots[i];
-
-		if (slot->status == TT_SLOT_COMMITTED) {
-			if (!TransactionIdIsNormal(slot->xid) || slot->flags != TT_SLOT_FLAG_CTRC_RELEASE_PROVEN
-				|| !SCN_VALID(slot->commit_scn) || !SCN_VALID(horizon)
-				|| scn_time_cmp(slot->commit_scn, horizon) > 0)
-				return false;
-		} else if (slot->status == TT_SLOT_ABORTED) {
-			if (!TransactionIdIsNormal(slot->xid) || slot->flags != TT_SLOT_FLAG_CTRC_RELEASE_PROVEN
-				|| slot->commit_scn != InvalidScn)
-				return false;
-		} else if ((slot->status == TT_SLOT_UNUSED || slot->status == TT_SLOT_RECYCLABLE)
-				   && slot->flags != TT_FLAGS_RESERVED)
-			return false;
-		else if (slot->status != TT_SLOT_UNUSED && slot->status != TT_SLOT_RECYCLABLE)
-			return false;
-	}
-	return true;
-}
+/* The original pure retention object supplies the capacity decision. */
 
 int
 scn_time_cmp(SCN a, SCN b)
@@ -3682,6 +3654,8 @@ UT_TEST(test_live_owner_recycle_converges_exact_committed_disk_successor)
 	resident->segment_state = SEGMENT_ACTIVE;
 	resident->tail_block = 1;
 	disk->tail_block = 9;
+	UndoSegmentHeader_set_record_seal_upper_scn(disk, 20);
+	UndoSegmentHeader_set_record_drain_upper_scn(disk, 30);
 
 	UT_ASSERT_EQ(
 		cluster_undo_block0_current_live_owner_recycle_exact(&key, UINT64_C(100), fake_epoch, 1000),
@@ -3973,10 +3947,15 @@ UT_TEST(test_readiness_denial_names_first_false_gate_without_side_effects)
 	reset_fixture();
 }
 
+#include "test_cluster_segment_current_retained.inc"
+
 int
 main(void)
 {
-	UT_PLAN(95);
+	UT_PLAN(98);
+	UT_RUN(test_live_recycle_and_already_retain_undo_head_in_both_modes);
+	UT_RUN(test_live_direct_reuse_rejects_retained_head_before_generation_wal);
+	UT_RUN(test_live_segment_capacity_reopens_only_after_original_head_retirement);
 	UT_RUN(test_first_publication_deny_preserves_private_bytes_and_can_retry);
 	UT_RUN(test_first_publication_deny_does_not_intercept_existing_or_rejected_owners);
 	UT_RUN(test_first_publication_injected_error_uses_original_owner_cleanup);

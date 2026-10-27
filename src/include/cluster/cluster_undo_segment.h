@@ -363,6 +363,25 @@ UndoSegmentHeader_owner(const UndoSegmentHeaderData *hdr)
 	return hdr->owner_instance;
 }
 
+/* A retained chain is a dependency even after its top is terminal. This is
+ * only a necessary physical shape for whole-segment reuse, never proof of
+ * completed fold, reader/recovery retirement, or CTRC reference release.
+ * Inspect every fixed slot: a nonzero head in an unused/recyclable slot or
+ * an incomplete UBA is unproven, not permission to destroy the segment. */
+static inline bool
+UndoSegmentHeader_undo_heads_empty(const UndoSegmentHeaderData *hdr)
+{
+	unsigned i;
+
+	if (hdr == NULL || hdr->tt_slots_count != TT_SLOTS_PER_SEGMENT)
+		return false;
+	for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
+		if (!UBA_is_invalid(hdr->tt_slots[i].first_undo_block))
+			return false;
+	}
+	return true;
+}
+
 
 /*
  * spec-4.12a record_seal_upper_scn alias (Q10-A).

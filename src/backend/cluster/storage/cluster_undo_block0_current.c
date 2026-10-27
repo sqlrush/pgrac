@@ -1991,7 +1991,8 @@ current_reuse_predecessor_exact(const char disk_page[BLCKSZ], const char residen
 
 	if (!current_reuse_page_identity(disk_page, key, generation, SEGMENT_RECYCLABLE)
 		|| !current_reuse_page_identity(resident_page, key, generation, SEGMENT_RECYCLABLE)
-		|| memcmp(disk_page, resident_page, BLCKSZ) != 0)
+		|| memcmp(disk_page, resident_page, BLCKSZ) != 0
+		|| !UndoSegmentHeader_undo_heads_empty(disk))
 		return false;
 	for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
 		if (disk->tt_slots[i].status == TT_SLOT_ACTIVE
@@ -2563,6 +2564,13 @@ cluster_undo_block0_current_live_owner_recycle_exact(const ClusterUndoBlock0Logi
 					  sizeof(disk->tt_slots))
 				   != 0)
 			goto recycle_done;
+
+		/* Check before the RECYCLABLE repeat branch as well: a lifecycle
+		 * label or release certificate cannot retire an anchored chain. */
+		if (!UndoSegmentHeader_undo_heads_empty(disk)) {
+			recycle_result = CLUSTER_UNDO_BLOCK0_RECYCLE_RETAINED;
+			goto recycle_done;
+		}
 
 		/* Parallel certificate workers can have durable flags while their
 		 * exact shared-origin handoff is still pending. Never expose the

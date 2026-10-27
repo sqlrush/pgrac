@@ -43,6 +43,7 @@
 #include <string.h>
 
 #include "cluster/cluster_scn.h"
+#include "cluster/cluster_uba.h"
 #include "cluster/cluster_tt_slot.h"
 #include "cluster/cluster_undo_retention.h"
 #include "cluster/cluster_undo_segment.h"
@@ -702,9 +703,15 @@ UT_TEST(test_d3_retain_during_recovery)
 }
 
 
+#include "test_cluster_segment_retained.inc"
+
 int
 main(void)
 {
+	UT_PLAN(41);
+	UT_RUN(test_segment_every_anchored_slot_retains_in_both_modes);
+	UT_RUN(test_segment_partial_anchor_and_unknown_slot_count_retain);
+	UT_RUN(test_segment_anchor_is_independent_of_release_and_record_drain);
 	UT_RUN(test_u1_committed_below_horizon_recyclable);
 	UT_RUN(test_u2_committed_above_horizon_retained);
 	UT_RUN(test_u3_aborted_always_recyclable);

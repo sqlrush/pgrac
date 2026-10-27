@@ -100,6 +100,10 @@ extern bool cluster_undo_retention_all_quiescent(void);
  *	  retention watermark (= max commit_scn over the header's COMMITTED TT
  *	  slots) is strictly below the horizon.  ACTIVE / ALLOCATED / FULL-but-
  *	  ACTIVE are never recyclable (C5), even when they carry no COMMITTED slot.
+ *	  Both modes require an exact slot count and empty undo anchors in every
+ *	  slot. A retained head survives terminal status, record drain, horizon,
+ *	  and release flags until the original retirement owner removes it after
+ *	  its independent fold/reference proofs. This shape alone proves no release.
  *	  Both modes retain a segment containing any ACTIVE slot, unknown slot
  *	  status or terminal slot with an invalid xid/wrap, even if no undo record
  *	  has been written yet. A segment with no COMMITTED slot is recyclable only

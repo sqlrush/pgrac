@@ -112,6 +112,8 @@ cluster_tt_slot_recyclable(uint8 cts_status, SCN commit_scn, SCN horizon)
  *	Precondition: SEGMENT_COMMITTED (C5).  The segment's retention watermark is
  *	the max commit_scn over the COMMITTED on-disk TT slots in its header; the
  *	segment is recyclable only when that watermark is strictly below horizon.
+ *	Both modes require every retained undo anchor to have been retired by its
+ *	original owner. Terminal status, record drain and SCN do not prove this.
  *	In peer mode, every terminal slot additionally requires the exact durable
  *	CTRC release bit.  COMMITTED retains its valid folded-horizon gate; ABORTED
  *	requires no invented time horizon.  Unknown/illegal flags or status shapes
@@ -126,7 +128,7 @@ cluster_undo_segment_recyclable_for_mode(const struct UndoSegmentHeaderData *hdr
 	bool saw_unresolved_committed = false;
 	int i;
 
-	if (hdr == NULL)
+	if (!UndoSegmentHeader_undo_heads_empty(hdr))
 		return false;
 
 	/*

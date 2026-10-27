@@ -933,10 +933,17 @@ UT_TEST(test_native_delta_rejects_corrupt_header_before_identity)
 
 #include "test_cluster_undo_commit_retained.inc"
 
+#include "test_cluster_segment_native_retained.inc"
+
 int
 main(void)
 {
-	UT_PLAN(18);
+	UT_PLAN(23);
+	UT_RUN(test_private_recycle_retains_head_in_every_same_generation_state);
+	UT_RUN(test_private_reuse_retains_old_generation_undo_head);
+	UT_RUN(test_private_fresh_segment_image_cannot_publish_an_undo_head);
+	UT_RUN(test_native_segment_replay_rejects_anchored_generation_before_write);
+	UT_RUN(test_segment_generation_order_precedes_retained_head_shape);
 	UT_RUN(test_private_exact_commit_preserves_head_and_unrelated_bytes);
 	UT_RUN(test_native_exact_commit_retains_head_across_repeat_and_release_marker);
 	UT_RUN(test_exact_commit_projection_and_redo_reject_conflicts_without_mutation);
