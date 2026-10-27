@@ -713,7 +713,7 @@ cold_foreign_side(XLogReaderState *reader, const RfDetachedRecordPlanV1 *plan,
 		return false;
 	switch (XLogRecGetRmid(reader)) {
 	case RM_CLOG_ID:
-		return (info == CLOG_ZEROPAGE || info == CLOG_TRUNCATE)
+		return (info == CLOG_ZEROPAGE || info == CLOG_TRUNCATE || info == CLOG_ZEROPAGE_FULL)
 			   && rf_side_online_projection_record_shape_v1(reader, true);
 	case RM_MULTIXACT_ID:
 		return (info == XLOG_MULTIXACT_ZERO_OFF_PAGE || info == XLOG_MULTIXACT_ZERO_MEM_PAGE

@@ -3068,12 +3068,14 @@ test_cluster_side_xact_budget_product.o: $(top_srcdir)/src/backend/cluster/clust
 		-ffunction-sections -fdata-sections -c $< -o $@
 test_cluster_side_xact test_cluster_pi_contribution test_cluster_recovery_c0_plan test_cluster_cold_tt_redo: test_cluster_side_relmap_terminal.inc
 test_cluster_side_xact: $(top_builddir)/src/backend/cluster/cluster_wal_claim.o
+test_cluster_side_xact: test_cluster_side_clog_full.inc
 
 CLUSTER_SIDE_ONLINE_PLAN_TEST_O = test_cluster_side_online_plan.o
 $(CLUSTER_SIDE_ONLINE_PLAN_TEST_O): \
 		$(top_srcdir)/src/backend/cluster/cluster_side_online_plan.c \
 		Makefile \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_tt_record.h \
+		$(top_srcdir)/src/include/access/clog.h \
 		$(top_srcdir)/src/include/cluster/cluster_side_online_plan.h \
 		$(top_srcdir)/src/include/cluster/cluster_side_xact.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_segment_init.h \
@@ -3204,6 +3206,7 @@ test_cluster_side_prepared: test_cluster_side_prepared.c unit_test.h \
 # judgements (verified / rebuildable / fail-closed lookup).
 CLUSTER_SIDE_PROJECTION_O = $(top_builddir)/src/backend/cluster/cluster_side_projection.o
 $(CLUSTER_SIDE_PROJECTION_O): $(top_srcdir)/src/include/cluster/cluster_side_online_plan.h \
+		$(top_srcdir)/src/include/access/clog.h \
 		$(top_srcdir)/src/include/cluster/cluster_side_xact.h
 test_cluster_side_projection: test_cluster_side_projection.c unit_test.h \
 		$(CLUSTER_SIDE_PROJECTION_O)
@@ -3489,7 +3492,7 @@ test_cluster_recovery_native_inputs: $(top_srcdir)/src/backend/cluster/cluster_r
 test_cluster_recovery_episode_clog.o: test_cluster_recovery_episode_clog.c \
         test_cluster_recovery_episode_clog.h test_cluster_recovery_episode_clog_namespace.h \
         test_cluster_clog_recovery.c test_cluster_clog_relmap_participant.inc \
-        test_cluster_clog_page_birth.inc unit_test.h \
+        test_cluster_clog_page_birth.inc test_cluster_clog_full_consumer.inc unit_test.h \
         $(top_srcdir)/src/backend/access/transam/clog.c \
         $(top_srcdir)/src/backend/access/transam/slru.c \
         $(top_srcdir)/src/include/access/clog.h \
@@ -4536,6 +4539,7 @@ test_cluster_multixact_recovery test_cluster_multixact_limits_io: %: %.c unit_te
 # Author: SqlRush <sqlrush@gmail.com>
 test_cluster_clog_recovery: test_cluster_clog_recovery.c unit_test.h \
 		test_cluster_clog_relmap_participant.inc test_cluster_clog_page_birth.inc \
+		test_cluster_clog_full_consumer.inc \
 		$(top_srcdir)/src/backend/access/transam/clog.c \
 		$(top_srcdir)/src/include/access/clog.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h \

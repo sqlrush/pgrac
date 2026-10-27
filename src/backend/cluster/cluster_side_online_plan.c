@@ -513,6 +513,28 @@ side_projection_decode(const RfDetachedRecordPlanV1 *record_plan,
 	projection->page_number = -1;
 	if (record_plan->route.rmid == RM_CLOG_ID) {
 		projection->kind = CLUSTER_SIDE_PROJECTION_CLOG;
+		if (info == CLOG_ZEROPAGE_FULL) {
+			xl_clog_zeropage_full birth;
+			TransactionId raw;
+
+			if (data == NULL || data_length != sizeof(birth)
+				|| XLogRecGetInfo(record) != CLOG_ZEROPAGE_FULL
+				|| XLogRecHasAnyBlockRefs(record)
+				|| XLogRecGetOrigin(record) != InvalidRepOriginId
+				|| record->record->has_page_version_edge)
+				return false;
+			memcpy(&birth, data, sizeof(birth));
+			raw = (TransactionId)birth.first_full_xid;
+			if (birth.reserved_zero != 0 || birth.pageno < 0 || !TransactionIdIsNormal(raw)
+				|| (raw % CLUSTER_NATIVE_CLOG_PER_PAGE != 0 && raw != FirstNormalTransactionId)
+				|| raw / CLUSTER_NATIVE_CLOG_PER_PAGE != (uint32)birth.pageno)
+				return false;
+			projection->page_number = birth.pageno;
+			projection->action = CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE;
+			/* Own every native birth byte; the raw projection is not its era. */
+			*payload_length = sizeof(birth);
+			return true;
+		}
 		if (info == CLOG_ZEROPAGE) {
 			if (data_length != sizeof(int))
 				return false;

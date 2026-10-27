@@ -205,6 +205,26 @@ cluster_clog_native_recovery_record_verify_v1(int origin pg_attribute_unused(),
 }
 
 bool
+cluster_clog_native_recovery_full_record_apply_v1(
+	int origin pg_attribute_unused(),
+	const ClusterSideProjectionOperationV1 *operation pg_attribute_unused(),
+	const uint8 *payload pg_attribute_unused(), uint32 length pg_attribute_unused())
+{
+	UT_ASSERT(false);
+	return false;
+}
+
+bool
+cluster_clog_native_recovery_full_record_verify_v1(
+	int origin pg_attribute_unused(),
+	const ClusterSideProjectionOperationV1 *operation pg_attribute_unused(),
+	const uint8 *payload pg_attribute_unused(), uint32 length pg_attribute_unused())
+{
+	UT_ASSERT(false);
+	return false;
+}
+
+bool
 cluster_clog_native_recovery_apply_v1(int origin pg_attribute_unused(),
 									  TransactionId xid pg_attribute_unused(),
 									  int count pg_attribute_unused(),
