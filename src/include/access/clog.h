@@ -133,6 +133,8 @@ extern bool cluster_clog_relmap_base_read_v1(
 	const struct ClusterRecoveryRelmapSourceV1 *source, uint64 requested_full_xid,
 	ClusterRelmapClogBaseV1 *out, ClusterRelmapClogBaseHandleV1 **held);
 extern void cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **held);
+/* Exact fixed native custody allocation, for the original owner's budget. */
+extern size_t cluster_clog_relmap_base_custody_bytes_v1(void);
 /* Original-origin storage only. The recovery owner must first prove the
  * complete terminal record, original source/base/era and mutation authority.
  * These calls neither resolve an unknown transaction nor publish visibility.

@@ -113,6 +113,7 @@ struct ClusterRecoveryNativeInventory {
 	ClusterRecoveryRelmapFoldSummary relmap_summary;
 	uint32 relmap_child_cursor;
 	bool relmap_active;
+	bool relmap_drained;
 	uint32 relmap_wal_source;
 	struct {
 		uint64 before, after, overlap;
@@ -1473,6 +1474,7 @@ inventory_relmap_step(ClusterRecoveryNativeInventory *inventory,
 					return inventory_relmap_fail(inventory, CLUSTER_RECOVERY_RELMAP_FOLD_CAPACITY);
 				*summary = inventory->relmap_summary;
 				inventory->relmap_active = false;
+				inventory->relmap_drained = true;
 				return CLUSTER_RECOVERY_RELMAP_FOLD_DRAINED;
 			}
 			if (examined == INVENTORY_SEED_TICK)
@@ -1640,6 +1642,7 @@ cluster_recovery_native_inventory_relmap_step(ClusterRecoveryNativeInventory *in
 			memset(&inventory->relmap_pending, 0, sizeof(inventory->relmap_pending));
 			inventory->relmap_cursor = inventory->head;
 			inventory->relmap_active = true;
+			inventory->relmap_drained = false;
 		}
 		result = inventory_relmap_step(inventory, out, summary);
 	}
@@ -2283,6 +2286,7 @@ cluster_recovery_native_inventory_destroy(ClusterRecoveryNativeInventory *invent
 struct ClusterRecoveryRelmapHistory {
 	ClusterRecoveryRelmapSourceV1 original;
 	ClusterRecoveryNativeInventory *inventory;
+	ClusterRelmapClogBaseHandleV1 *native_base;
 	bool failed;
 };
 
@@ -2291,6 +2295,54 @@ history_overlap(const void *a, size_t an, const void *b, size_t bn)
 {
 	uintptr_t x = (uintptr_t)a, y = (uintptr_t)b;
 	return a != NULL && b != NULL && (x <= y ? y - x < an : x - y < bn);
+}
+
+static size_t
+history_owned_bytes(const ClusterRecoveryRelmapHistory *history)
+{
+	return sizeof(*history) + (history->native_base == NULL ? 0
+		: cluster_clog_relmap_base_custody_bytes_v1());
+}
+
+/* The synchronous base accessor must not clear borrowed records/payloads or
+ * original custody when rejecting an aliased caller output. */
+static bool
+history_storage_overlap(const ClusterRecoveryRelmapHistory *history, const void *p, size_t n)
+{
+	const ClusterRecoveryNativeInventory *inventory;
+	const NativeInventoryRecord *record;
+	const NativeInventoryPage *page;
+
+	if (history == NULL)
+		return false;
+	if (history_overlap(p, n, history, sizeof(*history))
+		|| history_overlap(p, n, history->native_base,
+			cluster_clog_relmap_base_custody_bytes_v1()))
+		return true;
+	inventory = history->inventory;
+	if (inventory == NULL)
+		return false;
+	if (history_overlap(p, n, inventory, MAXALIGN(sizeof(*inventory))
+		+ inventory->source_count * sizeof(*inventory->sources)))
+		return true;
+	for (record = inventory->head; record != NULL; record = record->next)
+		if (history_overlap(p, n, record, sizeof(*record))
+			|| history_overlap(p, n, record->scan, cluster_recovery_native_scan_bytes(record->scan)))
+			return true;
+	for (page = inventory->pages; page != NULL; page = page->next)
+		if (history_overlap(p, n, page, page->bytes))
+			return true;
+	return false;
+}
+
+/* Canonical bytes include both full map slots, not only the queried owner. */
+static bool
+history_pending_same(const ClusterRecoveryRelmapHistory *history, const ClusterRelmapV2Image *pending)
+{
+	uint8 wire[CLUSTER_RELMAP_V2_FILE_SIZE];
+	return pending->pending_generation != 0
+		&& cluster_relmap_v2_encode(pending, wire, sizeof(wire)) == CLUSTER_RELMAP_V2_VALID
+		&& memcmp(wire, history->inventory->relmap_wire, sizeof(wire)) == 0;
 }
 
 static void
@@ -2314,6 +2366,8 @@ cluster_recovery_relmap_history_build_v1(const ClusterRecoveryRelmapSourceV1 *so
 	ClusterRecoveryRelmapHistory *volatile history = NULL;
 	volatile ClusterRecoveryNativeInventoryResult result = CLUSTER_RECOVERY_NATIVE_INVENTORY_INVALID;
 	volatile bool entered = false;
+	size_t native_bytes = cluster_clog_relmap_base_custody_bytes_v1();
+	size_t reserved;
 
 	if (out == NULL || diag == NULL || source == NULL
 		|| history_overlap(out, sizeof(*out), source, sizeof(*source))
@@ -2325,7 +2379,10 @@ cluster_recovery_relmap_history_build_v1(const ClusterRecoveryRelmapSourceV1 *so
 	memcpy(&original, source, sizeof(original));
 	if (CritSectionCount != 0 || cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
 		return result;
-	if (memory_budget < sizeof(*history))
+	if (native_bytes > SIZE_MAX - sizeof(*history))
+		return CLUSTER_RECOVERY_NATIVE_INVENTORY_CAPACITY;
+	reserved = sizeof(*history) + native_bytes;
+	if (memory_budget < reserved)
 		return CLUSTER_RECOVERY_NATIVE_INVENTORY_CAPACITY;
 	PG_TRY();
 	{
@@ -2338,9 +2395,9 @@ cluster_recovery_relmap_history_build_v1(const ClusterRecoveryRelmapSourceV1 *so
 				result = CLUSTER_RECOVERY_NATIVE_INVENTORY_CAPACITY;
 			else {
 				memcpy(&history->original, &original, sizeof(original));
-				result = inventory_build(original.scope, NULL, memory_budget - sizeof(*history),
+				result = inventory_build(original.scope, NULL, memory_budget - reserved,
 					&history->inventory, diag, &history->original);
-				diag->owned_bytes += sizeof(*history);
+				diag->owned_bytes += history_owned_bytes(history);
 				if (result == CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED
 					&& (!cluster_wal_inputs_relmap_source_current_v1(&original)
 						|| history->inventory->source_count != original.input_count
@@ -2418,6 +2475,58 @@ cluster_recovery_relmap_history_source_v1(ClusterRecoveryRelmapHistory *history,
 	return ok;
 }
 
+static bool
+history_pending_base_read(ClusterRecoveryRelmapHistory *history,
+	ClusterRecoveryRelmapPendingBaseV1 *out)
+{
+	ClusterRecoveryNativeInventory *inventory = history->inventory;
+	const ClusterRelmapV2Image *query = &inventory->relmap_query;
+	const NativeInventorySource *saved;
+	const NativeInventoryHistory *selected;
+	const ClusterRelmapCheckpointWindow *window;
+	uint64 xid = query->pending_owner.top_full_xid;
+
+	if (!inventory->complete || inventory->status != CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED
+		|| !inventory->relmap_drained || inventory->relmap_active
+		|| inventory->relmap_summary.wal_matches != 1
+		|| inventory->relmap_summary.query_window_sources != 1
+		|| inventory->relmap_summary.owner_window_sources != 1
+		|| inventory->relmap_wal_source >= inventory->source_count
+		|| !inventory_pages_current(inventory)
+		|| !inventory_history_inputs(inventory, history->original.scope, false))
+		return false;
+	saved = &inventory->sources[inventory->relmap_wal_source];
+	selected = &saved->history;
+	window = &selected->window;
+	if (!selected->checkpoint_observed || !selected->window_observed
+		|| window->origin != query->pending_owner.node
+		|| window->epoch != query->pending_owner.membership_epoch
+		|| window->admitted_incarnation != query->pending_owner.admitted_incarnation
+		|| window->boot_incarnation != query->pending_owner.boot_incarnation
+		|| xid < window->native_floor || xid > selected->post_flush_issued
+		|| selected->post_flush_issued - window->native_floor >= UINT64_C(0x80000000))
+		return false;
+	out->history.source = cluster_wal_inputs_relmap_source_v1(history->original.scope,
+		selected->input_index);
+	if (!cluster_wal_inputs_relmap_source_current_v1(&out->history.source)
+		|| memcmp(&out->history.source.selected, &selected->input, sizeof(selected->input)) != 0
+		|| !inventory_source_equal(&saved->source, &out->history.source.selected.source)
+		|| !cluster_clog_relmap_base_read_v1(&out->history.source, xid, &out->native,
+			&history->native_base)
+		|| history->native_base == NULL
+		|| !cluster_wal_inputs_relmap_source_current_v1(&out->history.source)
+		|| !inventory_pages_current(inventory)
+		|| !inventory_history_inputs(inventory, history->original.scope, false))
+		return false;
+	out->history.checkpoint_end = selected->checkpoint_end;
+	out->history.window = selected->window;
+	out->history.post_flush_issued = selected->post_flush_issued;
+	out->history.checkpoint_observed = selected->checkpoint_observed;
+	out->history.window_observed = selected->window_observed;
+	out->fold = inventory->relmap_summary;
+	return true;
+}
+
 ClusterRecoveryNativeInventoryResult
 cluster_recovery_relmap_history_recheck_v1(ClusterRecoveryRelmapHistory *history,
 	ClusterRecoveryNativeInventoryDiag *diag)
@@ -2438,6 +2547,11 @@ cluster_recovery_relmap_history_recheck_v1(ClusterRecoveryRelmapHistory *history
 		if (cluster_wal_inputs_relmap_source_current_v1(&history->original)) {
 			result = cluster_recovery_native_inventory_recheck(history->original.scope,
 				history->inventory, diag);
+			if (result == CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED && history->native_base != NULL) {
+				ClusterRecoveryRelmapPendingBaseV1 base = {0};
+				if (!history_pending_base_read(history, &base))
+					result = CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED;
+			}
 			if (result == CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED
 				&& !cluster_wal_inputs_relmap_source_current_v1(&history->original))
 				result = CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED;
@@ -2449,7 +2563,7 @@ cluster_recovery_relmap_history_recheck_v1(ClusterRecoveryRelmapHistory *history
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-	diag->owned_bytes += sizeof(*history);
+	diag->owned_bytes += history_owned_bytes(history);
 	if (result == CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED)
 		history->failed = false;
 	else
@@ -2486,7 +2600,7 @@ cluster_recovery_relmap_history_pending_step_v1(ClusterRecoveryRelmapHistory *hi
 	if (history == NULL || history->inventory == NULL)
 		return result;
 	*diag = history->inventory->diag;
-	diag->owned_bytes += sizeof(*history);
+	diag->owned_bytes += history_owned_bytes(history);
 	if (history->failed)
 		return result;
 	if (CritSectionCount != 0 || cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
@@ -2498,8 +2612,14 @@ cluster_recovery_relmap_history_pending_step_v1(ClusterRecoveryRelmapHistory *hi
 	PG_TRY();
 	{
 		if (inventory_history_inputs(history->inventory, history->original.scope, false)) {
-			result = cluster_recovery_native_inventory_relmap_step(history->inventory, pending,
-				&entry, &counts, NULL);
+			if (history->native_base != NULL) {
+				if (history->inventory->relmap_drained && history_pending_same(history, pending)) {
+					counts = history->inventory->relmap_summary;
+					result = CLUSTER_RECOVERY_RELMAP_FOLD_DRAINED;
+				}
+			} else
+				result = cluster_recovery_native_inventory_relmap_step(history->inventory, pending,
+					&entry, &counts, NULL);
 			current = result <= CLUSTER_RECOVERY_RELMAP_FOLD_DRAINED;
 			if (current && result == CLUSTER_RECOVERY_RELMAP_FOLD_ENTRY) {
 				const NativeInventorySource *saved;
@@ -2525,7 +2645,7 @@ cluster_recovery_relmap_history_pending_step_v1(ClusterRecoveryRelmapHistory *hi
 	PG_END_TRY();
 
 	*diag = history->inventory->diag;
-	diag->owned_bytes += sizeof(*history);
+	diag->owned_bytes += history_owned_bytes(history);
 	if (current) {
 		history->failed = false;
 		*out = entry;
@@ -2533,6 +2653,55 @@ cluster_recovery_relmap_history_pending_step_v1(ClusterRecoveryRelmapHistory *hi
 	} else
 		history_fail(history);
 	return result;
+}
+
+bool
+cluster_recovery_relmap_history_pending_base_v1(ClusterRecoveryRelmapHistory *history,
+	const ClusterRelmapV2Image *pending, ClusterRecoveryRelmapPendingBaseV1 *out,
+	ClusterRecoveryNativeInventoryDiag *diag)
+{
+	ClusterRecoveryRelmapPendingBaseV1 base = {0};
+	volatile bool ok = false;
+
+	if (pending == NULL || out == NULL || diag == NULL
+		|| history_overlap(out, sizeof(*out), pending, sizeof(*pending))
+		|| history_overlap(diag, sizeof(*diag), pending, sizeof(*pending))
+		|| history_overlap(out, sizeof(*out), diag, sizeof(*diag))
+		|| history_storage_overlap(history, out, sizeof(*out))
+		|| history_storage_overlap(history, diag, sizeof(*diag)))
+		return false;
+	memset(out, 0, sizeof(*out));
+	memset(diag, 0, sizeof(*diag));
+	if (history == NULL || history->inventory == NULL)
+		return false;
+	*diag = history->inventory->diag;
+	diag->owned_bytes += history_owned_bytes(history);
+	if (history->failed || CritSectionCount != 0
+		|| cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock)
+		|| !history->inventory->relmap_drained)
+		return false;
+
+	/* Latch before any original owner check or native read can raise ERROR.
+	 * The native handle, if acquired, survives late refusal for local destroy. */
+	history->failed = true;
+	PG_TRY();
+	{
+		ok = history_pending_same(history, pending) && history_pending_base_read(history, &base);
+	}
+	PG_CATCH();
+	{
+		history_fail(history);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	*diag = history->inventory->diag;
+	diag->owned_bytes += history_owned_bytes(history);
+	if (ok) {
+		history->failed = false;
+		memcpy(out, &base, sizeof(base));
+	} else
+		history_fail(history);
+	return ok;
 }
 
 void
@@ -2544,6 +2713,7 @@ cluster_recovery_relmap_history_destroy_v1(ClusterRecoveryRelmapHistory **custod
 		return;
 	history = *custody;
 	*custody = NULL;
+	cluster_clog_relmap_base_release_v1(&history->native_base);
 	cluster_recovery_native_inventory_destroy(history->inventory);
 	free(history);
 }
