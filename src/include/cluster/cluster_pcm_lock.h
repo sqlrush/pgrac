@@ -941,6 +941,9 @@ typedef struct ResourceXBootstrapWork {
 	uint64 r4_record_generation;
 	uint32 authenticated_ingress_connection_generation;
 	uint32 master_sender_connection_generation;
+	ResourceXDecodedAcquireIntent acquire_intent;
+	bool has_acquire_intent;
+	uint8 reserved[7];
 } ResourceXBootstrapWork;
 
 StaticAssertDecl(sizeof(ResourceXBootstrapWork) <= RESOURCE_X_PROOF_V1_BYTES,
@@ -1557,6 +1560,8 @@ cluster_pcm_lock_resource_x_assert_exact(const ResourceXDecodedFrame *assertion,
  * caller passes independently authenticated/current connection, R4, and
  * master-session values; the exact ASSERT consumes the receipt under the
  * same resource entry lock that creates the canonical master request. */
+/* V3 intents retain their complete identity in the original admission FIFO.
+ * APPLIED/DUPLICATE leaves ack_out empty; this is not a grant or completion. */
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_bootstrap_request_exact(
 	const ResourceXDecodedFrame *request, int32 authenticated_source_node,
 	uint32 authenticated_ingress_connection_generation, uint64 r4_record_generation,

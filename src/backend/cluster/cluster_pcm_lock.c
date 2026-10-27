@@ -585,8 +585,10 @@ typedef struct ClusterPcmResourceXBootstrapPriority {
 	uint64 enqueue_order;
 	uint32 authenticated_ingress_connection_generation;
 	uint32 master_sender_connection_generation;
+	ResourceXDecodedAcquireIntent acquire_intent;
 	uint8 state;
-	uint8 reserved[7];
+	bool has_acquire_intent;
+	uint8 reserved[6];
 } ClusterPcmResourceXBootstrapPriority;
 
 /* PGRAC adaptation: fixed, non-authority master receipt for one requester.
@@ -752,7 +754,7 @@ StaticAssertDecl(sizeof(ClusterPcmResourceXMasterRequest) == 352,
 				 "Resource-X master request must retain exact grant physical lineage");
 StaticAssertDecl(sizeof(ClusterPcmResourceXTerminalTombstone) == 360,
 				 "Resource-X terminal tombstone must retain the complete grant");
-StaticAssertDecl(sizeof(ClusterPcmResourceXBootstrapPriority) == 128,
+StaticAssertDecl(sizeof(ClusterPcmResourceXBootstrapPriority) == 192,
 				 "Resource-X bootstrap queue item must remain bounded");
 StaticAssertDecl(sizeof(ClusterPcmResourceXBootstrapReceipt) == 224,
 				 "Resource-X bootstrap receipt layout must remain 224 bytes");
@@ -770,7 +772,7 @@ StaticAssertDecl(sizeof(ClusterPcmResourceXRequesterJoin) == 9120,
 				 "Resource-X requester join layout must remain 9120 bytes");
 StaticAssertDecl(sizeof(ClusterPcmResourceXDeferredSettlement) == 160,
 				 "Resource-X deferred settlement must remain bounded");
-StaticAssertDecl(sizeof(ClusterPcmResourceXMasterState) == 51504,
+StaticAssertDecl(sizeof(ClusterPcmResourceXMasterState) == 53552,
 				 "D4 Resource-X master state must bind object generation");
 
 typedef struct ClusterPcmShared {
@@ -989,6 +991,7 @@ pcm_resource_x_bootstrap_receipt_invalidate(ClusterPcmResourceXBootstrapReceipt 
 static bool
 pcm_resource_x_bootstrap_priority_valid(const ClusterPcmResourceXBootstrapPriority *priority);
 static void pcm_resource_x_bootstrap_priority_clear(ClusterPcmResourceXBootstrapPriority *priority);
+static bool pcm_resource_x_acquire_queue_active(const ClusterPcmResourceXMasterState *state);
 static bool pcm_resource_x_bootstrap_queue_empty(const ClusterPcmResourceXMasterState *state);
 static bool pcm_resource_x_bootstrap_queue_valid(const ClusterPcmResourceXMasterState *state,
 												 const BufferTag *tag);
@@ -2599,6 +2602,19 @@ pcm_resource_x_reconfig_proof_slot_locked(struct GrdEntry *entry,
 				digest, (uint64)priority->master_sender_connection_generation);
 			digest = pcm_resource_x_proof_digest_u64(digest,
 													 (uint64)priority->request.semantic_crc32c);
+			digest = pcm_resource_x_proof_digest_u64(digest, priority->has_acquire_intent);
+			if (priority->has_acquire_intent) {
+				const ResourceXDecodedAcquireIntent *e = &priority->acquire_intent;
+				digest = pcm_resource_x_proof_digest_u64(digest, e->requester_incarnation);
+				digest = pcm_resource_x_proof_digest_u64(digest, e->backend_generation);
+				digest = pcm_resource_x_proof_digest_u64(digest, e->base_generation);
+				digest = pcm_resource_x_proof_digest_u64(digest, e->reservation_token);
+				digest = pcm_resource_x_proof_digest_u64(digest, e->cluster_epoch);
+				digest = pcm_resource_x_proof_digest_u64(digest, e->r4_generation);
+				digest = pcm_resource_x_proof_digest_u64(digest, (uint32)e->backend_id);
+				digest = pcm_resource_x_proof_digest_u64(digest, (uint32)e->buffer_id);
+				digest = pcm_resource_x_proof_digest_u64(digest, e->path);
+			}
 		}
 	}
 
@@ -11105,7 +11121,8 @@ pcm_resource_x_s_barrier_active_locked(struct GrdEntry *entry)
 	state = pcm_resource_x_master_state_for_entry(entry);
 	if (state == NULL || state->authority_generation == 0
 		|| state->authority_generation == UINT64_MAX || state->next_enqueue_order == 0
-		|| state->next_enqueue_order == UINT64_MAX) {
+		|| state->next_enqueue_order == UINT64_MAX
+		|| pcm_resource_x_acquire_queue_active(state)) {
 		active = true;
 		goto out;
 	}
@@ -19844,6 +19861,67 @@ pcm_resource_x_common_equal(const ResourceXDecodedCommon *left, const ResourceXD
 		   && left->semantic_crc32c == right->semantic_crc32c;
 }
 
+/* These scalars identify a native acquisition; none conveys authority. */
+static bool
+pcm_resource_x_acquire_identity_equal(const ResourceXDecodedAcquireIntent *left,
+									  const ResourceXDecodedAcquireIntent *right)
+{
+	return left->requester_incarnation == right->requester_incarnation
+		   && left->backend_generation == right->backend_generation
+		   && left->base_generation == right->base_generation
+		   && left->reservation_token == right->reservation_token
+		   && left->cluster_epoch == right->cluster_epoch
+		   && left->r4_generation == right->r4_generation && left->backend_id == right->backend_id
+		   && left->buffer_id == right->buffer_id && left->path == right->path;
+}
+
+static void
+pcm_resource_x_acquire_identity_copy(ResourceXDecodedAcquireIntent *to,
+									 const ResourceXDecodedAcquireIntent *from)
+{
+	memset(to, 0, sizeof(*to));
+	to->requester_incarnation = from->requester_incarnation;
+	to->backend_generation = from->backend_generation;
+	to->base_generation = from->base_generation;
+	to->reservation_token = from->reservation_token;
+	to->cluster_epoch = from->cluster_epoch;
+	to->r4_generation = from->r4_generation;
+	to->backend_id = from->backend_id;
+	to->buffer_id = from->buffer_id;
+	to->path = from->path;
+}
+
+static bool
+pcm_resource_x_acquire_identity_valid(const ResourceXDecodedCommon *request,
+									  const ResourceXDecodedAcquireIntent *intent,
+									  uint64 r4_record_generation)
+{
+	return resource_x_assertion_valid(&request->logical_assertion)
+		   && request->base_authority_generation == 0 && request->authority_generation == 0
+		   && request->resource_formation != 0 && request->resource_formation != UINT64_MAX
+		   && request->master_session_incarnation != 0
+		   && request->master_session_incarnation != UINT64_MAX && request->assertion_sequence != 0
+		   && request->assertion_sequence != UINT64_MAX && request->ordered_lane == 0
+		   && request->action_node == request->logical_assertion.requester_node
+		   && request->observed_mode <= (uint8)PCM_STATE_X
+		   && (request->target_mode == (uint8)PCM_STATE_S
+			   || request->target_mode == (uint8)PCM_STATE_X)
+		   && request->source_candidate == 0 && request->retain_pi_if_dirty == 0
+		   && request->sender_connection_generation != 0
+		   && request->sender_connection_generation != UINT32_MAX
+		   && request->outcome == RESOURCE_X_OUTCOME_NONE && request->flags == 0
+		   && intent->requester_incarnation != 0 && intent->requester_incarnation != UINT64_MAX
+		   && intent->backend_generation != 0 && intent->backend_generation != UINT64_MAX
+		   && intent->base_generation != UINT64_MAX && intent->reservation_token != 0
+		   && intent->reservation_token != UINT64_MAX && intent->cluster_epoch != 0
+		   && intent->cluster_epoch != UINT64_MAX && intent->r4_generation != 0
+		   && intent->r4_generation != UINT64_MAX && intent->r4_generation == r4_record_generation
+		   && intent->backend_id >= 0 && intent->buffer_id >= 0
+		   && (intent->path == RESOURCE_X_ACQUIRE_RESIDENT
+			   || (intent->path == RESOURCE_X_ACQUIRE_FIRST_FILL
+				   && request->observed_mode == (uint8)PCM_STATE_N));
+}
+
 static bool
 pcm_resource_x_bootstrap_request_valid(const ResourceXDecodedFrame *request,
 									   int32 authenticated_source_node,
@@ -19852,6 +19930,18 @@ pcm_resource_x_bootstrap_request_valid(const ResourceXDecodedFrame *request,
 									   uint64 current_master_session_incarnation,
 									   uint32 master_sender_connection_generation)
 {
+	if (request != NULL && request->has_acquire_intent)
+		return request->kind == RESOURCE_X_WIRE_ASSERT_X
+			&& request->payload_bytes == RESOURCE_X_ACQUIRE_V3_BYTES
+			&& !request->blocked_has_remote_proof
+			&& pcm_resource_x_acquire_identity_valid(&request->common,
+				&request->body.acquire_intent, r4_record_generation)
+			&& authenticated_source_node == request->common.logical_assertion.requester_node
+			&& authenticated_ingress_connection_generation != 0
+			&& authenticated_ingress_connection_generation != UINT32_MAX
+			&& current_master_session_incarnation == request->common.master_session_incarnation
+			&& master_sender_connection_generation != 0
+			&& master_sender_connection_generation != UINT32_MAX;
 	return request != NULL && request->kind == RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP
 		   && request->payload_bytes == RESOURCE_X_CONTROL_V1_BYTES
 		   && !request->blocked_has_remote_proof
@@ -19885,7 +19975,8 @@ static bool
 pcm_resource_x_bootstrap_priority_valid(const ClusterPcmResourceXBootstrapPriority *priority)
 {
 	static const ClusterPcmResourceXBootstrapPriority empty_priority;
-	static const uint8 empty_reserved[7];
+	static const uint8 empty_reserved[6];
+	static const ResourceXDecodedAcquireIntent empty_intent;
 	const ResourceXDecodedCommon *request;
 
 	if (priority == NULL || memcmp(priority->reserved, empty_reserved, sizeof(empty_reserved)) != 0)
@@ -19895,6 +19986,16 @@ pcm_resource_x_bootstrap_priority_valid(const ClusterPcmResourceXBootstrapPriori
 	if (priority->state != RESOURCE_X_BOOTSTRAP_PRIORITY_NEXT_ADMISSION)
 		return false;
 	request = &priority->request;
+	if (priority->has_acquire_intent)
+		return pcm_resource_x_acquire_identity_valid(request, &priority->acquire_intent,
+				priority->r4_record_generation)
+			&& priority->enqueue_order != 0 && priority->enqueue_order != UINT64_MAX
+			&& priority->authenticated_ingress_connection_generation != 0
+			&& priority->authenticated_ingress_connection_generation != UINT32_MAX
+			&& priority->master_sender_connection_generation != 0
+			&& priority->master_sender_connection_generation != UINT32_MAX;
+	if (memcmp(&priority->acquire_intent, &empty_intent, sizeof(empty_intent)) != 0)
+		return false;
 	return resource_x_assertion_valid(&request->logical_assertion)
 		   && request->base_authority_generation == 0 && request->authority_generation == 0
 		   && request->resource_formation != 0 && request->resource_formation != UINT64_MAX
@@ -19937,6 +20038,18 @@ pcm_resource_x_bootstrap_queue_empty(const ClusterPcmResourceXMasterState *state
 	return true;
 }
 
+/* Complete intents retain their FIFO fence before becoming canonical. */
+static bool
+pcm_resource_x_acquire_queue_active(const ClusterPcmResourceXMasterState *state)
+{
+	for (int32 node = 0; node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++) {
+		const ClusterPcmResourceXBootstrapPriority *priority = &state->bootstrap_priority[node];
+		if (!pcm_resource_x_bootstrap_priority_valid(priority) || priority->has_acquire_intent)
+			return true;
+	}
+	return false;
+}
+
 static bool
 pcm_resource_x_bootstrap_queue_valid(const ClusterPcmResourceXMasterState *state,
 									 const BufferTag *tag)
@@ -19973,7 +20086,17 @@ pcm_resource_x_bootstrap_work_matches(const ClusterPcmResourceXMasterState *stat
 									  const ClusterPcmResourceXBootstrapPriority *priority,
 									  const ResourceXBootstrapWork *work)
 {
-	return priority->state == RESOURCE_X_BOOTSTRAP_PRIORITY_NEXT_ADMISSION
+	static const uint8 empty_reserved[7];
+	static const ResourceXDecodedAcquireIntent empty_intent;
+
+	return pcm_resource_x_bootstrap_priority_valid(priority)
+		   && memcmp(work->reserved, empty_reserved, sizeof(empty_reserved)) == 0
+		   && priority->has_acquire_intent == work->has_acquire_intent
+		   && (work->has_acquire_intent
+			   ? pcm_resource_x_acquire_identity_equal(&priority->acquire_intent,
+					&work->acquire_intent)
+			   : memcmp(&work->acquire_intent, &empty_intent, sizeof(empty_intent)) == 0)
+		   && priority->state == RESOURCE_X_BOOTSTRAP_PRIORITY_NEXT_ADMISSION
 		   && state->binding_generation == work->binding_generation
 		   && priority->enqueue_order == work->enqueue_order
 		   && pcm_resource_x_common_equal(&priority->request, &work->request)
@@ -20531,6 +20654,78 @@ pcm_resource_x_admitted_assertion_snapshot(const ClusterPcmResourceXBootstrapRec
 	out->common.semantic_crc32c = 0;
 }
 
+/* Caller owns the entry lock and has validated the complete request and
+ * original session/admission tuple. Retention does not sample a grant base.
+ * The ordinary service bridge consumes this identity separately; it must not
+ * turn this queue item into the legacy bootstrap ACK/ASSERT exchange. */
+static ResourceXApplyResult
+pcm_resource_x_acquire_enqueue_locked(ClusterPcmResourceXMasterState *state,
+									  const ResourceXDecodedFrame *request, uint32 ingress,
+									  uint64 r4, uint32 master_sender,
+									  const ResourceXBootstrapWork *work)
+{
+	static const ClusterPcmResourceXMasterRequest empty_request;
+	int32 node = request->common.logical_assertion.requester_node;
+	ClusterPcmResourceXBootstrapPriority *priority = &state->bootstrap_priority[node];
+	ClusterPcmResourceXBootstrapReceipt *receipt = &state->bootstrap_receipts[node];
+	ClusterPcmResourceXMasterRequest *canonical = &state->requests[node];
+	uint64 floor;
+
+	if (!pcm_resource_x_bootstrap_receipt_valid(receipt))
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (work != NULL && !pcm_resource_x_bootstrap_work_matches(state, priority, work))
+		return RESOURCE_X_APPLY_STALE;
+	if (priority->state != RESOURCE_X_BOOTSTRAP_PRIORITY_EMPTY) {
+		bool exact = priority->has_acquire_intent
+					 && pcm_resource_x_common_equal(&priority->request, &request->common)
+					 && pcm_resource_x_acquire_identity_equal(&priority->acquire_intent,
+															  &request->body.acquire_intent)
+					 && priority->r4_record_generation == r4
+					 && priority->authenticated_ingress_connection_generation == ingress
+					 && priority->master_sender_connection_generation == master_sender;
+		if (exact)
+			return work == NULL ? RESOURCE_X_APPLY_DUPLICATE : RESOURCE_X_APPLY_BAD_STATE;
+		/* Capacity belongs to the original episode. No higher attempt, domain
+		 * drift or legacy packet can replace it before an exact terminator. */
+		return request->common.assertion_sequence > priority->request.assertion_sequence
+				   ? RESOURCE_X_APPLY_BAD_STATE
+				   : RESOURCE_X_APPLY_STALE;
+	}
+	if (work != NULL)
+		return RESOURCE_X_APPLY_STALE;
+	floor = receipt->highest_attempt_floor;
+	if (canonical->assertion_sequence > floor)
+		floor = canonical->assertion_sequence;
+	if (pcm_resource_x_terminal_tombstone_valid(&state->terminal_tombstone)
+		&& state->terminal_tombstone.requester_node == node
+		&& state->terminal_tombstone.request.assertion_sequence > floor)
+		floor = state->terminal_tombstone.request.assertion_sequence;
+	if (request->common.assertion_sequence <= floor)
+		return RESOURCE_X_APPLY_STALE;
+	if (memcmp(canonical, &empty_request, sizeof(empty_request)) != 0)
+		return RESOURCE_X_APPLY_BAD_STATE;
+	if (receipt->state != RESOURCE_X_BOOTSTRAP_RECEIPT_EMPTY
+		&& !pcm_resource_x_bootstrap_receipt_supersedable(receipt, canonical, &request->common,
+														  state->authority_generation, r4, ingress,
+														  master_sender))
+		return RESOURCE_X_APPLY_BAD_STATE;
+	if (state->next_enqueue_order == UINT64_MAX || !cluster_normal_stop_service_new_work(true))
+		return RESOURCE_X_APPLY_BAD_STATE;
+	pcm_resource_x_bootstrap_receipt_invalidate(receipt);
+	receipt->highest_attempt_floor = request->common.assertion_sequence;
+	memset(priority, 0, sizeof(*priority));
+	pcm_resource_x_common_copy(&priority->request, &request->common);
+	pcm_resource_x_acquire_identity_copy(&priority->acquire_intent, &request->body.acquire_intent);
+	priority->has_acquire_intent = true;
+	priority->r4_record_generation = r4;
+	priority->enqueue_order = state->next_enqueue_order++;
+	priority->authenticated_ingress_connection_generation = ingress;
+	priority->master_sender_connection_generation = master_sender;
+	priority->state = RESOURCE_X_BOOTSTRAP_PRIORITY_NEXT_ADMISSION;
+	pcm_resource_x_intent_mark_dirty();
+	return RESOURCE_X_APPLY_APPLIED;
+}
+
 static ResourceXApplyResult
 pcm_resource_x_bootstrap_request(
 	const ResourceXDecodedFrame *request, int32 authenticated_source_node,
@@ -20595,6 +20790,24 @@ pcm_resource_x_bootstrap_request(
 		LWLockRelease(&entry->entry_lock.lock);
 		pcm_entry_ref_release(&entry_ref);
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	}
+	if (request->has_acquire_intent) {
+		if (pg_atomic_read_u32(&ClusterPcm->resource_x_gate_phase) != RESOURCE_X_GATE_OPEN
+			|| pg_atomic_read_u64(&ClusterPcm->resource_x_gate_formation)
+				!= request->common.resource_formation)
+			result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		else
+			result = pcm_resource_x_acquire_enqueue_locked(state, request,
+				authenticated_ingress_connection_generation, r4_record_generation,
+				master_sender_connection_generation, queued_work);
+		LWLockRelease(&entry->entry_lock.lock);
+		pcm_entry_ref_release(&entry_ref);
+		return result;
+	}
+	if (priority->has_acquire_intent) {
+		LWLockRelease(&entry->entry_lock.lock);
+		pcm_entry_ref_release(&entry_ref);
+		return RESOURCE_X_APPLY_STALE;
 	}
 	if (queued_work != NULL
 		&& !pcm_resource_x_bootstrap_work_matches(state, priority, queued_work)) {
@@ -20877,8 +21090,13 @@ cluster_pcm_lock_resource_x_bootstrap_resume_exact(const ResourceXBootstrapWork 
 	if (work == NULL)
 		return RESOURCE_X_APPLY_INVALID;
 	memset(&request, 0, sizeof(request));
-	request.kind = RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP;
-	request.payload_bytes = RESOURCE_X_CONTROL_V1_BYTES;
+	request.kind = work->has_acquire_intent ? RESOURCE_X_WIRE_ASSERT_X
+		: RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP;
+	request.payload_bytes = work->has_acquire_intent ? RESOURCE_X_ACQUIRE_V3_BYTES
+		: RESOURCE_X_CONTROL_V1_BYTES;
+	request.has_acquire_intent = work->has_acquire_intent;
+	if (work->has_acquire_intent)
+		pcm_resource_x_acquire_identity_copy(&request.body.acquire_intent, &work->acquire_intent);
 	pcm_resource_x_common_copy(&request.common, &work->request);
 	return pcm_resource_x_bootstrap_request(
 		&request, request.common.logical_assertion.requester_node,
@@ -20930,7 +21148,8 @@ cluster_pcm_lock_resource_x_s_barrier_active(const BufferTag *tag)
 	state = pcm_resource_x_master_state_for_entry(entry);
 	if (state == NULL || state->authority_generation == 0
 		|| state->authority_generation == UINT64_MAX || state->next_enqueue_order == 0
-		|| state->next_enqueue_order == UINT64_MAX) {
+		|| state->next_enqueue_order == UINT64_MAX
+		|| pcm_resource_x_acquire_queue_active(state)) {
 		barrier_active = true;
 		goto out;
 	}
@@ -21080,6 +21299,10 @@ pcm_resource_x_assert_locked(struct GrdEntry *entry, const ResourceXDecodedFrame
 						 : (same_attempt ? RESOURCE_X_APPLY_DUPLICATE : RESOURCE_X_APPLY_STALE);
 			goto unlock;
 		}
+	}
+	if (pcm_resource_x_acquire_queue_active(state)) {
+		result = RESOURCE_X_APPLY_BAD_STATE;
+		goto unlock;
 	}
 	if (require_bootstrap) {
 		receipt = &state->bootstrap_receipts[requester_node];
@@ -27880,6 +28103,9 @@ cluster_pcm_lock_resource_x_outbound_work_probe_exact(uint32 probe_budget,
 					continue;
 				memset(&work, 0, sizeof(work));
 				pcm_resource_x_common_copy(&work.request, &head->request);
+				work.has_acquire_intent = head->has_acquire_intent;
+				if (head->has_acquire_intent)
+					pcm_resource_x_acquire_identity_copy(&work.acquire_intent, &head->acquire_intent);
 				work.binding_generation = state->binding_generation;
 				work.enqueue_order = head->enqueue_order;
 				work.r4_record_generation = head->r4_record_generation;
