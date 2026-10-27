@@ -424,6 +424,9 @@ extern bool cluster_undo_record_is_touched(void);
  *	on fsync failure (runs before the commit critical section -> clean abort).
  *	No-op for a xact that wrote no undo.  A release-build runtime guard rejects
  *	any deferred block that remains pending after the flush.
+ *	Published local rollback controls must also pass current COMPLETE and
+ *	discarded-range readback before either synchronization early return.
+ *	Their child frames may have ended; the native top binding is rechecked.
  */
 extern void cluster_undo_xact_precommit_flush(void);
 

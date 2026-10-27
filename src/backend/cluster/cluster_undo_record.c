@@ -471,6 +471,7 @@ cluster_undo_record_receipt_last_reason(void)
 }
 
 static bool cluster_undo_pending_flush_internal(bool error_on_fail);
+static void undo_savepoint_precommit_check(void);
 static void cluster_undo_record_observation_apply_locked(uint8 owner_instance);
 
 /*
@@ -4517,6 +4518,7 @@ cluster_undo_xact_precommit_flush(void)
 								"flush failure.")));
 
 	undo_receipt_consumer_trace_flush("precommit_after_pending");
+	undo_savepoint_precommit_check();
 
 	if (cluster_undo_touched_seg_count == 0)
 		return;
@@ -6184,6 +6186,7 @@ cluster_undo_record_publish_savepoint_pending(ClusterUndoSavepointControl *contr
 
 typedef struct UndoSavepointCursorAdvance {
 	UndoSavepointHeadPublish owner;
+	const ClusterCanonicalTxnBinding *precommit_top;
 	PGAlignedBlock image;
 	UBA next;
 	uint64 visited;
@@ -6210,6 +6213,35 @@ undo_savepoint_cursor_fail(void)
 }
 
 static bool
+undo_savepoint_precommit_binding_equal(const ClusterCanonicalTxnBinding *a,
+									   const ClusterCanonicalTxnBinding *b)
+{
+	return a->segment_id == b->segment_id && a->segment_generation == b->segment_generation
+		   && a->xid == b->xid && a->slot_offset == b->slot_offset && a->slot_wrap == b->slot_wrap
+		   && a->origin_instance == b->origin_instance
+		   && a->publish_state == CLUSTER_CANONICAL_TXN_PUBLISHED
+		   && b->publish_state == CLUSTER_CANONICAL_TXN_PUBLISHED && a->reserved16 == 0
+		   && b->reserved16 == 0 && !XLogRecPtrIsInvalid(a->active_lsn)
+		   && a->active_lsn == b->active_lsn;
+}
+
+/* Child frames may be gone at precommit. Requalify the native top and its
+ * original local publication instead; this is not TT terminal authority. */
+static bool
+undo_savepoint_precommit_actor(const UndoSavepointCursorAdvance *stage)
+{
+	const ClusterSavepointOperation *operation = &stage->owner.control->operation;
+	ClusterCanonicalTxnBinding current;
+
+	return GetCurrentTransactionNestLevel() == 1
+		   && FullTransactionIdEquals(GetTopFullTransactionIdIfAny(), operation->top_fxid)
+		   && GetTopTransactionIdIfAny() == stage->precommit_top->xid
+		   && undo_savepoint_precommit_binding_equal(&operation->top, stage->precommit_top)
+		   && cluster_tt_local_get_published_binding(stage->precommit_top->xid, &current)
+		   && undo_savepoint_precommit_binding_equal(&current, stage->precommit_top);
+}
+
+static bool
 undo_savepoint_cursor_recheck(const UndoSavepointCursorAdvance *stage)
 {
 	const ClusterUndoSavepointControl *control = stage->owner.control;
@@ -6226,9 +6258,12 @@ undo_savepoint_cursor_recheck(const UndoSavepointCursorAdvance *stage)
 		   && control->owns_ref && control->ref_slot >= 0 && !control->reserved
 		   && control->head_lsn > control->pending_lsn && !XLogRecPtrIsInvalid(control->pending_lsn)
 		   && control->cursor_lsn >= control->pending_lsn
-		   && cluster_savepoint_operation_matches_frame(&control->operation)
+		   && (stage->precommit_top == NULL
+				   ? cluster_savepoint_operation_matches_frame(&control->operation)
+				   : undo_savepoint_precommit_actor(stage))
 		   && undo_savepoint_control_read_head(&control->operation, &head)
-		   && cluster_undo_record_uba_equal(head, control->uba)
+		   && cluster_undo_record_uba_equal(
+			   head, stage->precommit_top == NULL ? control->uba : stage->owner.bounds.current_head)
 		   && cluster_semantic_activation_modifier_recheck(stage->owner.admission, true);
 }
 
@@ -6335,6 +6370,8 @@ undo_savepoint_cursor_control(UndoSavepointCursorAdvance *stage, uint64 deadline
 	const char *resident;
 	volatile XLogRecPtr cut = control->cursor_lsn;
 
+	if (stage->precommit_top != NULL)
+		deadline = cluster_undo_record_prepare_deadline_us();
 	if (!uba_decode_record(control->uba, &segment, &block, &tt, &row)
 		|| !cluster_undo_record_ensure_block0_current(control->operation.top.origin_instance,
 													  segment, deadline, &publication))
@@ -6577,7 +6614,7 @@ cluster_undo_record_advance_savepoint(ClusterUndoSavepointControl *control, uint
  * Neither a cached COMPLETE nor visited_count can supply this evidence. */
 static UBA
 undo_savepoint_complete_member(UndoSavepointCursorAdvance *stage, UBA address,
-							   const char image[BLCKSZ], uint16 row)
+							   const char image[BLCKSZ], uint16 row, bool require_discarded)
 {
 	const UndoSlotDirEntry *slot;
 	UndoRecordHeader member;
@@ -6598,16 +6635,18 @@ undo_savepoint_complete_member(UndoSavepointCursorAdvance *stage, UBA address,
 														 &body, &operation)
 			|| body.phase != UNDO_SAVEPOINT_ROLLBACK_COMPLETE)
 			undo_savepoint_cursor_fail();
-	} else if ((member.flags & UNDO_REC_FLAG_HAS_OPERATION) == 0
-			   || !cluster_undo_record_decode_operation_payload(
-				   &member, payload, member.payload_length, &body_length, &history, &operation)
-			   || operation.effect_state != CLUSTER_SAVEPOINT_EFFECT_DISCARDED)
+	} else if (require_discarded
+			   && ((member.flags & UNDO_REC_FLAG_HAS_OPERATION) == 0
+				   || !cluster_undo_record_decode_operation_payload(
+					   &member, payload, member.payload_length, &body_length, &history, &operation)
+				   || operation.effect_state != CLUSTER_SAVEPOINT_EFFECT_DISCARDED))
 		undo_savepoint_cursor_fail();
 	return previous;
 }
 
 static void
-undo_savepoint_complete_read(UndoSavepointCursorAdvance *stage, uint64 deadline)
+undo_savepoint_complete_read(UndoSavepointCursorAdvance *stage, uint64 deadline,
+							 bool require_discarded)
 {
 	ClusterUndoSavepointControl *control = stage->owner.control;
 	ClusterUndoBlock0LiveOwnerPublication publication;
@@ -6616,6 +6655,8 @@ undo_savepoint_complete_read(UndoSavepointCursorAdvance *stage, uint64 deadline)
 	uint16 tt, row;
 	const char *resident;
 
+	if (stage->precommit_top != NULL)
+		deadline = cluster_undo_record_prepare_deadline_us();
 	if (!undo_savepoint_control_address_valid(&control->operation, stage->next, false)
 		|| cluster_undo_record_uba_equal(stage->next, control->uba)
 		|| !uba_decode_record(stage->next, &segment, &block, &tt, &row)
@@ -6631,7 +6672,8 @@ undo_savepoint_complete_read(UndoSavepointCursorAdvance *stage, uint64 deadline)
 			|| !cluster_undo_block0_current_live_owner_publication_recheck_conditional(
 				&publication))
 			undo_savepoint_cursor_fail();
-		stage->next = undo_savepoint_complete_member(stage, stage->next, resident, row);
+		stage->next
+			= undo_savepoint_complete_member(stage, stage->next, resident, row, require_discarded);
 	}
 	PG_FINALLY();
 	{
@@ -6654,7 +6696,7 @@ undo_savepoint_complete_prove(UndoSavepointCursorAdvance *stage, uint64 deadline
 	stage->owner.chain_lsn = InvalidXLogRecPtr;
 	while (!cluster_undo_record_uba_equal(stage->next, control->stop_uba)) {
 		CHECK_FOR_INTERRUPTS();
-		undo_savepoint_complete_read(stage, deadline);
+		undo_savepoint_complete_read(stage, deadline, true);
 		if (stage->visited == UINT64_MAX)
 			undo_savepoint_cursor_fail();
 		stage->visited++;
@@ -6727,4 +6769,96 @@ cluster_undo_record_complete_savepoint(ClusterUndoSavepointControl *control, uin
 	cluster_semantic_activation_leave(&admission);
 	*cut_out = cut;
 	return true;
+}
+
+/* Surviving LIVE operations may precede the original completed control.
+ * Prove actual retained ancestry, never numeric UBA or sequence order. */
+static void
+undo_savepoint_precommit_prefix(UndoSavepointCursorAdvance *stage)
+{
+	stage->next = stage->checkpoint = stage->owner.bounds.current_head;
+	stage->power = 1;
+	stage->period = 0;
+	stage->owner.chain_lsn = InvalidXLogRecPtr;
+	while (!cluster_undo_record_uba_equal(stage->next, stage->owner.control->uba)) {
+		CHECK_FOR_INTERRUPTS();
+		undo_savepoint_complete_read(stage, 0, false);
+		undo_savepoint_cursor_cycle_step(stage);
+	}
+}
+
+/* The preallocated handle supplies expectations, not a completion receipt.
+ * Read its whole control and discarded range under the original owner. */
+static void
+undo_savepoint_precommit_control(UndoSavepointCursorAdvance *stage,
+								 ClusterUndoSavepointControl *control)
+{
+	XLogRecPtr cut;
+
+	stage->owner.control = control;
+	if (control->operation.top.origin_instance != (uint8)(cluster_node_id + 1)
+		|| !undo_savepoint_head_request(&stage->owner)
+		|| !undo_savepoint_control_read_head(&control->operation, &stage->owner.bounds.current_head)
+		|| !undo_savepoint_cursor_recheck(stage)
+		|| control->cursor.phase != UNDO_SAVEPOINT_ROLLBACK_COMPLETE
+		|| !cluster_undo_record_uba_equal(control->cursor.next_uba, control->stop_uba)
+		|| control->cursor.last_effect_wal_lsn <= control->head_lsn
+		|| control->cursor_lsn <= control->cursor.last_effect_wal_lsn
+		|| GetFlushRecPtr(NULL) < control->cursor_lsn)
+		undo_savepoint_cursor_fail();
+	cut = undo_savepoint_cursor_control(stage, 0, NULL, InvalidXLogRecPtr, true);
+	undo_savepoint_precommit_prefix(stage);
+	undo_savepoint_complete_prove(stage, 0);
+	if (undo_savepoint_cursor_control(stage, 0, NULL, InvalidXLogRecPtr, true) != cut
+		|| GetFlushRecPtr(NULL) < cut || !undo_savepoint_cursor_recheck(stage))
+		undo_savepoint_cursor_fail();
+}
+
+/* Spec: 2026-10-26-pre2-p013-full-savepoint-design.md
+ * Run before commit fold and either old synchronization early return.
+ * Unused off-chain reservations do not acquire a fake COMPLETE state. */
+static void
+undo_savepoint_precommit_check(void)
+{
+	ClusterUndoSavepointControl *control;
+	ClusterSemanticAdmissionToken admission = { 0 };
+	ClusterCanonicalTxnBinding top;
+	UndoSavepointCursorAdvance stage = { 0 };
+	bool pending = false;
+
+	for (control = undo_savepoint_controls; control != NULL; control = control->next) {
+		if (!XLogRecPtrIsInvalid(control->pending_lsn))
+			pending = true;
+		else if (!XLogRecPtrIsInvalid(control->head_lsn)
+				 || !XLogRecPtrIsInvalid(control->cursor_lsn))
+			undo_savepoint_cursor_fail();
+	}
+	if (!pending)
+		return;
+	if (undo_savepoint_cursor_active || CritSectionCount != 0 || MyProc == NULL
+		|| !LocalTransactionIdIsValid(MyProc->lxid) || cluster_node_id < 0
+		|| !cluster_tt_local_get_published_binding(GetTopTransactionIdIfAny(), &top)
+		|| cluster_semantic_activation_modifier_enter(true, &admission)
+			   != CLUSTER_SEMANTIC_ADMISSION_OK)
+		undo_savepoint_cursor_fail();
+	stage.owner.proc = MyProc;
+	stage.owner.lxid = MyProc->lxid;
+	stage.owner.admission = &admission;
+	stage.precommit_top = &top;
+	undo_savepoint_cursor_active = true;
+	PG_TRY();
+	{
+		for (control = undo_savepoint_controls; control != NULL; control = control->next)
+			if (!XLogRecPtrIsInvalid(control->pending_lsn))
+				undo_savepoint_precommit_control(&stage, control);
+	}
+	PG_CATCH();
+	{
+		undo_savepoint_cursor_active = false;
+		cluster_semantic_activation_leave(&admission);
+		undo_savepoint_cursor_fail();
+	}
+	PG_END_TRY();
+	undo_savepoint_cursor_active = false;
+	cluster_semantic_activation_leave(&admission);
 }

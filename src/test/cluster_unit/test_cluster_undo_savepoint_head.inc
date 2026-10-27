@@ -116,15 +116,16 @@ head_pipeline_old_control(void)
 }
 
 static void
-head_pipeline_begin(ClusterUndoSavepointControl **control, ClusterUndoSavepointBounds *bounds)
+head_pipeline_begin_controls(ClusterUndoSavepointControl **control,
+							 ClusterUndoSavepointBounds *bounds, uint32 count)
 {
 	UndoBlockHeader *block;
 
 	reserve_test_fixture();
 	reserve_test_proc.lxid = 1;
 	reserve_test_set_head(head_pipeline_address(0));
-	UT_ASSERT(
-		cluster_undo_record_reserve_savepoint_controls(reserve_test_operations, 1, 100, control));
+	UT_ASSERT(cluster_undo_record_reserve_savepoint_controls(reserve_test_operations, count, 100,
+															 control));
 	block = (UndoBlockHeader *)reserve_test_images[1].data;
 	block->magic = PGRAC_UNDO_BLOCK_MAGIC;
 	block->block_version = UNDO_BLOCK_VERSION_1;
@@ -145,6 +146,12 @@ head_pipeline_begin(ClusterUndoSavepointControl **control, ClusterUndoSavepointB
 	head_pipeline_test_reads = head_pipeline_test_drift = head_pipeline_test_tt_mode = 0;
 	head_pipeline_test_tt_calls = 0;
 	head_pipeline_test_flushed = 0;
+}
+
+static void
+head_pipeline_begin(ClusterUndoSavepointControl **control, ClusterUndoSavepointBounds *bounds)
+{
+	head_pipeline_begin_controls(control, bounds, 1);
 }
 
 static void

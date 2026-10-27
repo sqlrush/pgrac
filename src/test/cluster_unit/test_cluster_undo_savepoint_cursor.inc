@@ -122,6 +122,10 @@ cursor_test_after_pin(ClusterUndoBufPin *pin)
 	int kind = pin->mode == CLUSTER_UNDO_BUF_SHARED ? 1 : pin->block_no == 2 ? 2 : 3;
 
 	UT_ASSERT_EQ(reserve_test_pins, 1);
+	if (precommit_test_mode) {
+		precommit_test_after_pin();
+		return;
+	}
 	if (complete_test_mode) {
 		complete_test_after_pin();
 		return;

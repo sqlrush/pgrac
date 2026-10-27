@@ -158,8 +158,9 @@ cluster_undo_block0_current_live_owner_ensure_resident_exact(
 	(void)key;
 	(void)timeout;
 	(void)publication;
-	/* Completion may deliberately revoke the supplied publication at flush. */
-	UT_ASSERT(complete_test_mode && complete_test_flush_drift == 3);
+	/* Completion and precommit may deliberately revoke the supplied publication. */
+	UT_ASSERT((complete_test_mode && complete_test_flush_drift == 3)
+			  || (precommit_test_mode && precommit_test_refuse_current));
 	return CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
 }
 ClusterUndoBlock0Result

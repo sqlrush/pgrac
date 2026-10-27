@@ -145,6 +145,13 @@ static int cursor_test_bad_cut_at, cursor_test_drift_pin, cursor_test_drift_kind
 static bool cursor_test_flush_throw, cursor_test_flush_short;
 static XLogRecPtr cursor_test_last_lsn;
 static bool complete_test_mode;
+static bool precommit_test_mode, precommit_test_binding_missing, precommit_test_refuse_current;
+static int precommit_test_level = 1;
+static int precommit_test_pins, precommit_test_binding_calls;
+static int precommit_test_drift_at, precommit_test_drift_kind;
+static FullTransactionId precommit_test_top;
+static ClusterCanonicalTxnBinding precommit_test_binding;
+static void precommit_test_after_pin(void);
 static int complete_test_pins, complete_test_drift_at, complete_test_drift_kind;
 static int complete_test_flush_drift;
 static void complete_test_after_pin(void);
@@ -673,6 +680,28 @@ TransactionId
 GetTopTransactionIdIfAny(void)
 {
 	return (TransactionId)700;
+}
+
+FullTransactionId
+GetTopFullTransactionIdIfAny(void)
+{
+	return precommit_test_mode ? precommit_test_top : receipt_operation.top_fxid;
+}
+
+int
+GetCurrentTransactionNestLevel(void)
+{
+	return precommit_test_mode ? precommit_test_level : 1;
+}
+
+bool
+cluster_tt_local_get_published_binding(TransactionId xid, ClusterCanonicalTxnBinding *out)
+{
+	precommit_test_binding_calls++;
+	if (precommit_test_mode && precommit_test_binding_missing)
+		return false;
+	*out = precommit_test_mode ? precommit_test_binding : receipt_operation.top;
+	return xid == out->xid;
 }
 
 TransactionId
@@ -2819,9 +2848,11 @@ UT_TEST(test_prepared_receipt_retains_exact_admission_until_close)
 	}
 	if (recheck != NULL && recheck_end != NULL) {
 		const char *exact = strstr(recheck, "cluster_semantic_activation_modifier_recheck(");
+		const char *fresh = strstr(recheck, "cluster_undo_record_prepare_deadline_us(");
 
 		UT_ASSERT(exact != NULL && exact < recheck_end);
-		UT_ASSERT(strstr(recheck, "cluster_undo_record_prepare_deadline_us(") == NULL);
+		/* Later readers own independent acquisitions, outside this receipt. */
+		UT_ASSERT(fresh == NULL || fresh >= recheck_end);
 	}
 	if (cancel != NULL && cancel_end != NULL) {
 		const char *leave = strstr(cancel, "cluster_semantic_activation_leave(");
@@ -2830,17 +2861,19 @@ UT_TEST(test_prepared_receipt_retains_exact_admission_until_close)
 	}
 	if (preflight != NULL && preflight_end != NULL) {
 		const char *exact = strstr(preflight, "cluster_semantic_activation_modifier_recheck(");
+		const char *fresh = strstr(preflight, "cluster_undo_record_prepare_deadline_us(");
 
 		UT_ASSERT(exact != NULL && exact < preflight_end);
-		UT_ASSERT(strstr(preflight, "cluster_undo_record_prepare_deadline_us(") == NULL);
+		UT_ASSERT(fresh == NULL || fresh >= preflight_end);
 	}
 	if (consume != NULL && consume_end != NULL) {
 		const char *leave = strstr(consume, "cluster_semantic_activation_leave(");
 		const char *enter = strstr(consume, "cluster_semantic_activation_modifier_enter(");
+		const char *fresh = strstr(consume, "cluster_undo_record_prepare_deadline_us(");
 
 		UT_ASSERT(leave != NULL && leave < consume_end);
 		UT_ASSERT(enter == NULL || enter >= consume_end);
-		UT_ASSERT(strstr(consume, "cluster_undo_record_prepare_deadline_us(") == NULL);
+		UT_ASSERT(fresh == NULL || fresh >= consume_end);
 	}
 	free(source);
 }
@@ -6101,11 +6134,22 @@ UT_TEST(test_exact_zero_abort_keeps_cleanup_after_native_scope_ends)
 #include "test_cluster_undo_savepoint_head.inc"
 #include "test_cluster_undo_savepoint_cursor.inc"
 #include "test_cluster_undo_savepoint_complete.inc"
+#include "test_cluster_undo_savepoint_precommit.inc"
 
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(234);
+	UT_PLAN(244);
+	UT_RUN(test_precommit_qualifies_complete_after_child_frame_is_gone);
+	UT_RUN(test_precommit_allows_live_prefix_but_requires_control_reachable);
+	UT_RUN(test_precommit_refuses_native_or_canonical_identity_drift);
+	UT_RUN(test_precommit_cannot_commit_pending_or_marking_control);
+	UT_RUN(test_precommit_refuses_staged_unpublished_control);
+	UT_RUN(test_precommit_rechecks_actual_control_and_discarded_range);
+	UT_RUN(test_precommit_rechecks_current_native_head_and_binding_at_each_pin);
+	UT_RUN(test_precommit_repeat_still_reads_real_disposition);
+	UT_RUN(test_precommit_unused_reservations_and_empty_list_are_not_completed);
+	UT_RUN(test_precommit_checks_all_controls_in_original_list);
 	UT_RUN(test_complete_publishes_exact_body_after_all_marks_read_back);
 	UT_RUN(test_complete_repeat_requalifies_without_new_wal);
 	UT_RUN(test_complete_rejects_incomplete_published_cursor);
