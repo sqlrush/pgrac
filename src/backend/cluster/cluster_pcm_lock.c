@@ -21230,6 +21230,140 @@ cluster_pcm_lock_resource_x_bootstrap_resume_exact(const ResourceXBootstrapWork 
 		ack_out);
 }
 
+/* Build service input while the original canonical owner is locked. This
+ * does not reserve a generation, prove a holder identity, or publish A. */
+static ResourceXApplyResult
+pcm_resource_x_acquire_service_snapshot_locked(struct GrdEntry *entry,
+											 ClusterPcmResourceXMasterState *state,
+											 const ResourceXBootstrapWork *work,
+											 ResourceXAcquireServiceSnapshot *snapshot)
+{
+	const ClusterPcmResourceXBootstrapPriority *priority;
+	const ClusterPcmResourceXMasterRequest *canonical;
+	ResourceXDecodedFrame settlement;
+	PcmAuthoritySnapshot directory;
+	uint32 holders;
+	uint32 requester_bit;
+	int32 head_node = -1;
+	int32 requester = work->request.logical_assertion.requester_node;
+
+	if (state == NULL || !pcm_resource_x_bootstrap_queue_valid(state, &entry->tag)
+		|| state->authority_generation == 0 || state->authority_generation == UINT64_MAX
+		|| !pcm_read_grant_state_valid(state)
+		|| !pcm_resource_x_source_settlement_debt_decode_locked(entry, state, &settlement))
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	priority = &state->bootstrap_priority[requester];
+	if (!pcm_resource_x_bootstrap_work_matches(state, priority, work))
+		return RESOURCE_X_APPLY_STALE;
+	if (priority->state != RESOURCE_X_BOOTSTRAP_PRIORITY_CANONICAL
+		|| pcm_resource_x_bootstrap_queue_head(state) != priority)
+		return RESOURCE_X_APPLY_BAD_STATE;
+	canonical = pcm_resource_x_master_head(state, &head_node);
+	if (head_node != requester || canonical != &state->requests[requester])
+		return RESOURCE_X_APPLY_BAD_STATE;
+	if (!pcm_resource_x_acquire_canonical_unsealed(state, requester))
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (state->pending_s_bitmap != 0
+		|| state->source_settlement.state == RESOURCE_X_SOURCE_SETTLEMENT_PENDING)
+		return RESOURCE_X_APPLY_BAD_STATE;
+	pcm_authority_snapshot_locked(entry, &directory);
+	if (directory.transition_count == UINT64_MAX
+		|| directory.state < PCM_STATE_N || directory.state > PCM_STATE_X)
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (directory.state == PCM_STATE_N) {
+		if (directory.x_holder_node != -1 || directory.s_holders_bitmap != 0
+			|| pcm_master_holder_is_valid(entry))
+			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		holders = 0;
+	} else if (directory.state == PCM_STATE_S) {
+		if (directory.x_holder_node != -1 || directory.s_holders_bitmap == 0
+			|| directory.master_holder.node_id >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+			|| !(directory.s_holders_bitmap & (UINT32_C(1) << directory.master_holder.node_id)))
+			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		holders = directory.s_holders_bitmap;
+	} else {
+		if (directory.x_holder_node < 0 || directory.x_holder_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+			|| directory.s_holders_bitmap != 0
+			|| directory.master_holder.node_id != (uint32)directory.x_holder_node)
+			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		holders = UINT32_C(1) << directory.x_holder_node;
+	}
+	if (directory.pending_x_requester_node != -1)
+		return RESOURCE_X_APPLY_BAD_STATE;
+	if (directory.pending_x_since_lsn != 0)
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+
+	memset(snapshot, 0, sizeof(*snapshot));
+	/* Copy the retained owner, not caller padding or non-identity fields. */
+	pcm_resource_x_common_copy(&snapshot->work.request, &priority->request);
+	snapshot->work.binding_generation = state->binding_generation;
+	snapshot->work.enqueue_order = priority->enqueue_order;
+	snapshot->work.r4_record_generation = priority->r4_record_generation;
+	snapshot->work.authenticated_ingress_connection_generation
+		= priority->authenticated_ingress_connection_generation;
+	snapshot->work.master_sender_connection_generation = priority->master_sender_connection_generation;
+	pcm_resource_x_acquire_identity_copy(&snapshot->work.acquire_intent, &priority->acquire_intent);
+	snapshot->work.has_acquire_intent = true;
+	snapshot->directory = directory;
+	snapshot->authority_generation = state->authority_generation;
+	snapshot->canonical_base_generation = canonical->base_authority_generation;
+	snapshot->pi_watermark_lsn = entry->pi_watermark_lsn;
+	snapshot->pi_watermark_scn = entry->pi_watermark_scn;
+	snapshot->current_holders_bitmap = holders;
+	requester_bit = UINT32_C(1) << requester;
+	snapshot->required_holders_bitmap = priority->request.target_mode == (uint8)PCM_STATE_X
+		? holders & ~requester_bit : directory.state == PCM_STATE_X ? holders : 0;
+	snapshot->pi_holders_bitmap = pg_atomic_read_u32(&entry->pi_holders_bitmap);
+	snapshot->master_node = cluster_node_id;
+	return RESOURCE_X_APPLY_APPLIED;
+}
+
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_acquire_service_snapshot_exact(
+	const ResourceXBootstrapWork *work, const ResourceXAcquireServiceSnapshot *expected,
+	ResourceXAcquireServiceSnapshot *out)
+{
+	ResourceXAcquireServiceSnapshot snapshot;
+	ClusterPcmResourceXMasterState *state;
+	PcmEntryRef ref;
+	PcmEntryAcquireResult acquired;
+	ResourceXApplyResult result;
+	const BufferTag *tag;
+
+	if (work == NULL || out == NULL || !work->has_acquire_intent || ClusterPcm == NULL
+		|| !resource_x_assertion_valid(&work->request.logical_assertion)
+		|| cluster_node_id < 0 || cluster_node_id >= RESOURCE_X_PROTOCOL_NODE_LIMIT)
+		return RESOURCE_X_APPLY_INVALID;
+	tag = &work->request.logical_assertion.resource;
+	if (cluster_gcs_lookup_master(*tag) != cluster_node_id
+		|| cluster_qvotec_get_self_incarnation() != work->request.master_session_incarnation)
+		return RESOURCE_X_APPLY_STALE;
+	if (!cluster_pcm_lock_resource_x_gate_open_exact(work->request.resource_formation)
+		|| cluster_grd_pi_rebuild_blocked_v1(*tag))
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (!pcm_entry_ref_acquire(tag, false, &ref, &acquired))
+		return acquired == PCM_ENTRY_ACQUIRE_NOT_FOUND ? RESOURCE_X_APPLY_NOT_FOUND
+			: RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	pcm_entry_lock_exclusive(ref.entry);
+	state = pcm_resource_x_master_state_for_entry(ref.entry);
+	result = pcm_resource_x_acquire_service_snapshot_locked(ref.entry, state, work, &snapshot);
+	if (result == RESOURCE_X_APPLY_APPLIED) {
+		if (cluster_gcs_lookup_master(*tag) != cluster_node_id
+			|| cluster_qvotec_get_self_incarnation() != work->request.master_session_incarnation)
+			result = RESOURCE_X_APPLY_STALE;
+		else if (!cluster_pcm_lock_resource_x_gate_open_exact(work->request.resource_formation)
+				 || cluster_grd_pi_rebuild_blocked_v1(*tag))
+			result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		else if (expected != NULL && memcmp(expected, &snapshot, sizeof(snapshot)) != 0)
+			result = RESOURCE_X_APPLY_STALE;
+	}
+	LWLockRelease(&ref.entry->entry_lock.lock);
+	pcm_entry_ref_release(&ref);
+	if (result == RESOURCE_X_APPLY_APPLIED)
+		*out = snapshot;
+	return result;
+}
+
 void
 cluster_pcm_lock_resource_x_bootstrap_forget_exact(const ResourceXBootstrapWork *work)
 {

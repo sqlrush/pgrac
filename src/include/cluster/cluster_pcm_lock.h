@@ -1246,6 +1246,25 @@ typedef struct PcmAuthoritySnapshot {
 StaticAssertDecl(sizeof(PcmAuthoritySnapshot) == 64,
 				 "PcmAuthoritySnapshot process-local layout must remain 64 bytes");
 
+/* Process-local input to the master service, not an authority decision or
+ * a source grant. Holder bitmaps do not prove holder boot/grant identities.
+ * Publication must recheck this input in the original entry owner. */
+typedef struct ResourceXAcquireServiceSnapshot {
+	ResourceXBootstrapWork work;
+	PcmAuthoritySnapshot directory;
+	uint64 authority_generation;
+	uint64 canonical_base_generation;
+	uint64 pi_watermark_lsn;
+	uint64 pi_watermark_scn;
+	uint32 current_holders_bitmap;
+	uint32 required_holders_bitmap;
+	uint32 pi_holders_bitmap;
+	int32 master_node;
+} ResourceXAcquireServiceSnapshot;
+
+StaticAssertDecl(sizeof(ResourceXAcquireServiceSnapshot) == 312,
+				 "acquisition service input must remain bounded and process-local");
+
 typedef enum PcmXTransferCommitResult {
 	PCM_X_TRANSFER_COMMIT_OK = 0,
 	PCM_X_TRANSFER_COMMIT_NOT_FOUND,
@@ -1574,6 +1593,15 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_bootstrap_request_exact(
 extern ResourceXApplyResult
 cluster_pcm_lock_resource_x_bootstrap_resume_exact(const ResourceXBootstrapWork *work,
 												   ResourceXDecodedFrame *ack_out);
+/* Caller authenticates/rechecks semantic, peer and R4 domains as for resume.
+ * Snapshot only an exact, unsealed canonical FIFO head under the entry lock.
+ * If expected is supplied it must match that entire coherent input. Refusal
+ * preserves out, including when expected == out. No raw entry reference or
+ * authorization leaves this helper; a future issuer must use the locked
+ * builder again before reserving authority or arming an original producer. */
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_service_snapshot_exact(
+	const ResourceXBootstrapWork *work, const ResourceXAcquireServiceSnapshot *expected,
+	ResourceXAcquireServiceSnapshot *out);
 extern void cluster_pcm_lock_resource_x_bootstrap_forget_exact(const ResourceXBootstrapWork *work);
 extern bool cluster_pcm_lock_resource_x_s_barrier_active(const BufferTag *tag);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_assert_bootstrapped_exact(
