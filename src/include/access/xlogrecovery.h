@@ -222,6 +222,20 @@ extern bool ClusterColdRecoveryCtrcObserve(const struct ClusterRecoveryStartV1 *
  * False/ERROR leaves original cleanup responsibility in place, including any
  * original observation cleanup triggered by preflight refusal. */
 extern bool ClusterColdRecoveryCtrcReplaysAcquire(const struct ClusterRecoveryStartV1 *start);
+/* Prepare once after original all-replay IR acquisition, outside native
+ * recovery/critical sections and with zero caller LWLocks. Keep the complete
+ * all-generation graph on the same Start; callbacks revalidate original full
+ * work/manifest/scope/actual holders before publication. Zero budget only
+ * revalidates an existing graph; nonzero budget is additional private storage,
+ * capped at the existing PAGE plan limit. Entered failure/ERROR revokes this
+ * episode and retains original cleanup/debt. Destroy before census/scope.
+ * Getter repeats original full validation and borrows immutable Start storage.
+ * NULL Start is the clean-start no-op; no mutation, completion or release. */
+struct RfPageOnlinePlanV1;
+extern bool ClusterColdRecoveryCtrcPagePlanPrepare(const struct ClusterRecoveryStartV1 *start,
+	Size memory_budget);
+extern const struct RfPageOnlinePlanV1 *ClusterColdRecoveryCtrcPagePlan(
+	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work);
 /* First bounded observation refusal, valid only while original Start lives. */
 extern const char *ClusterColdRecoveryCtrcObservationRefusal(
 	const struct ClusterRecoveryStartV1 *start);

@@ -13596,3 +13596,7 @@ test_cluster_first_fill_reply.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs
 	     /^gcs_block_wake_local_pending_s_request\(/ { print "static bool"; emit=1; n++ } \
 	     emit { print } emit && /^}/ { emit=0 } END { if (n != 2 || emit) exit 1 }' $< >> $@.tmp
 	mv $@.tmp $@
+
+# Original Startup PAGE graph preparation and complete census wrapper.
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_page_plan.inc
+test_cluster_recovery_native_inputs: test_cluster_recovery_census_page_plan.inc

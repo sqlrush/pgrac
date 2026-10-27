@@ -9,6 +9,9 @@
 #include "postgres.h"
 #include "cluster/cluster_recovery_census.h"
 #include "common/cryptohash.h"
+#include "storage/lwlock.h"
+#include "miscadmin.h"
+#include "postmaster/interrupt.h"
 #ifdef USE_PGRAC_CLUSTER
 struct ClusterRecoveryCensus {
 	ClusterWalInputsV1 *inputs;
@@ -766,6 +769,64 @@ cluster_recovery_census_manifest(ClusterRecoveryCensus *census, ClusterRecoveryC
 		return false;
 	*out = census->manifest;
 	return true;
+}
+
+static void
+census_page_lock_held(LWLock *lock, LWLockMode mode, void *arg)
+{
+	(void)lock; (void)mode;
+	*(bool *)arg = true;
+}
+
+ClusterRecoveryPagePlanBuildV1
+cluster_recovery_census_page_plan_v1(ClusterRecoveryCensus *census, Size memory_budget)
+{
+	ClusterRecoveryPagePlanBuildV1 result = {NULL, RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT};
+	ClusterRecoveryCensusManifest before, after;
+	RfPageOnlinePlanV1 *volatile plan = NULL;
+	bool held = false;
+
+	if (census == NULL || census->status != CLUSTER_RECOVERY_CENSUS_DRAINED
+		|| memory_budget == 0 || CritSectionCount != 0 || ShutdownRequestPending)
+		return result;
+	/* The manifest path itself needs native owner snapshots and may do I/O. */
+	ForEachLWLockHeldByMe(census_page_lock_held, &held);
+	if (held) {
+		result.detail = RF_PAGE_PROOF_DETAIL_WOULD_BLOCK;
+		return result;
+	}
+	PG_TRY();
+	{
+		if (cluster_recovery_census_manifest(census, &before)) {
+			result = cluster_recovery_native_inventory_page_plan_v1(census->inputs,
+				census->inventory, memory_budget);
+			plan = result.plan;
+			if (result.detail == RF_PAGE_PROOF_DETAIL_OK && plan != NULL
+				&& cluster_recovery_census_manifest(census, &after)
+				&& memcmp(&before, &after, sizeof(before)) == 0)
+				plan = NULL; /* caller receives the independent private graph */
+			else {
+				RfPageOnlinePlanV1 *discard = plan;
+				plan = NULL;
+				rf_page_online_plan_destroy_v1(&discard);
+				result.plan = NULL;
+				if (result.detail == RF_PAGE_PROOF_DETAIL_OK)
+					result.detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+				(void)census_fail(census, CLUSTER_RECOVERY_CENSUS_REFUSED);
+			}
+		} else
+			result.detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+	}
+	PG_CATCH();
+	{
+		RfPageOnlinePlanV1 *discard = plan;
+		plan = NULL;
+		rf_page_online_plan_destroy_v1(&discard);
+		(void)census_fail(census, CLUSTER_RECOVERY_CENSUS_REFUSED);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return result;
 }
 
 const ClusterRecoveryCensusPagesV1 *

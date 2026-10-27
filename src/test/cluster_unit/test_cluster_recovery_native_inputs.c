@@ -904,6 +904,7 @@ cleanup:
 #include "test_cluster_recovery_page_wal_inputs.inc"
 #include "test_cluster_recovery_wal_sources.inc"
 #include "test_cluster_recovery_page_graph.inc"
+#include "test_cluster_recovery_census_page_plan.inc"
 
 UT_TEST(test_owned_ctrc_census_borrows_namespace_and_revokes_changed_work)
 {
@@ -1048,6 +1049,14 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_CENSUS_PAGE_PLAN") != NULL) {
+		UT_PLAN(4);
+	UT_RUN(test_census_page_graph_preserves_original_full_manifest_and_owned_plan);
+	UT_RUN(test_census_page_graph_never_advances_prefix_or_enters_under_caller_lock);
+	UT_RUN(test_census_page_graph_factory_failure_and_final_manifest_drift_are_sticky);
+	UT_RUN(test_census_page_graph_error_invalidates_observation_without_releasing_input);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_EPISODE_HISTORY") != NULL) {
 		UT_PLAN(8);
 		UT_RUN(test_episode_history_selected_window_drift_invalidates_inventory);
@@ -1119,7 +1128,11 @@ main(int argc, char **argv)
 		UT_RUN(test_episode_base_checks_original_page_bytes_before_and_after_native_read);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(146);
+	UT_PLAN(150);
+	UT_RUN(test_census_page_graph_preserves_original_full_manifest_and_owned_plan);
+	UT_RUN(test_census_page_graph_never_advances_prefix_or_enters_under_caller_lock);
+	UT_RUN(test_census_page_graph_factory_failure_and_final_manifest_drift_are_sticky);
+	UT_RUN(test_census_page_graph_error_invalidates_observation_without_releasing_input);
 	UT_RUN(test_page_graph_original_full_cuts_order_cross_thread_page_edges);
 	UT_RUN(test_page_graph_no_page_sources_and_original_native_cursor_remain);
 	UT_RUN(test_page_graph_keeps_explicit_empty_and_historical_generations);
