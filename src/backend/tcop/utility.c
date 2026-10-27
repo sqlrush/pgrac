@@ -315,7 +315,11 @@ PreflightClusterSharedCatalogWrite(Node *statement)
 			&& !IsA(statement, AlterDatabaseRefreshCollStmt) && !IsA(statement, CreateStatsStmt)
 			&& !IsA(statement, CreatePLangStmt) && !IsA(statement, CreateConversionStmt)
 			&& !IsA(statement, CreateCastStmt) && !IsA(statement, CreateTransformStmt)
-			&& !IsA(statement, CreateAmStmt) && !IsA(statement, TruncateStmt)))
+			&& !IsA(statement, CreateAmStmt) && !IsA(statement, CreateFdwStmt)
+			&& !IsA(statement, AlterFdwStmt) && !IsA(statement, CreateForeignServerStmt)
+			&& !IsA(statement, AlterForeignServerStmt) && !IsA(statement, CreateUserMappingStmt)
+			&& !IsA(statement, AlterUserMappingStmt) && !IsA(statement, DropUserMappingStmt)
+			&& !IsA(statement, TruncateStmt)))
 		return;
 
 	if (IsA(statement, CreateStatsStmt)) {
@@ -337,7 +341,9 @@ PreflightClusterSharedCatalogWrite(Node *statement)
 			 || IsA(statement, AlterTSDictionaryStmt) || IsA(statement, AlterTSConfigurationStmt)
 			 || IsA(statement, AlterRoleStmt) || IsA(statement, AlterRoleSetStmt)
 			 || IsA(statement, DropRoleStmt) || IsA(statement, AlterDatabaseSetStmt)
-			 || IsA(statement, AlterDatabaseRefreshCollStmt))
+			 || IsA(statement, AlterDatabaseRefreshCollStmt) || IsA(statement, AlterFdwStmt)
+			 || IsA(statement, AlterForeignServerStmt) || IsA(statement, AlterUserMappingStmt)
+			 || IsA(statement, DropUserMappingStmt))
 		action = "alteration";
 	else
 		action = "creation";

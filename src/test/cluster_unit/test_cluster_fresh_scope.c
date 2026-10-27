@@ -335,6 +335,20 @@ CreateCommandTag(Node *statement)
 		return CMDTAG_CREATE_TRANSFORM;
 	if (IsA(statement, CreateAmStmt))
 		return CMDTAG_CREATE_ACCESS_METHOD;
+	if (IsA(statement, CreateFdwStmt))
+		return CMDTAG_CREATE_FOREIGN_DATA_WRAPPER;
+	if (IsA(statement, AlterFdwStmt))
+		return CMDTAG_ALTER_FOREIGN_DATA_WRAPPER;
+	if (IsA(statement, CreateForeignServerStmt))
+		return CMDTAG_CREATE_SERVER;
+	if (IsA(statement, AlterForeignServerStmt))
+		return CMDTAG_ALTER_SERVER;
+	if (IsA(statement, CreateUserMappingStmt))
+		return CMDTAG_CREATE_USER_MAPPING;
+	if (IsA(statement, AlterUserMappingStmt))
+		return CMDTAG_ALTER_USER_MAPPING;
+	if (IsA(statement, DropUserMappingStmt))
+		return CMDTAG_DROP_USER_MAPPING;
 	if (IsA(statement, AlterSeqStmt))
 		return CMDTAG_ALTER_SEQUENCE;
 	if (IsA(statement, AlterTSDictionaryStmt))
@@ -435,6 +449,20 @@ GetCommandTagName(CommandTag tag)
 		return "CREATE TRANSFORM";
 	if (tag == CMDTAG_CREATE_ACCESS_METHOD)
 		return "CREATE ACCESS METHOD";
+	if (tag == CMDTAG_CREATE_FOREIGN_DATA_WRAPPER)
+		return "CREATE FOREIGN DATA WRAPPER";
+	if (tag == CMDTAG_ALTER_FOREIGN_DATA_WRAPPER)
+		return "ALTER FOREIGN DATA WRAPPER";
+	if (tag == CMDTAG_CREATE_SERVER)
+		return "CREATE SERVER";
+	if (tag == CMDTAG_ALTER_SERVER)
+		return "ALTER SERVER";
+	if (tag == CMDTAG_CREATE_USER_MAPPING)
+		return "CREATE USER MAPPING";
+	if (tag == CMDTAG_ALTER_USER_MAPPING)
+		return "ALTER USER MAPPING";
+	if (tag == CMDTAG_DROP_USER_MAPPING)
+		return "DROP USER MAPPING";
 	if (tag == CMDTAG_ALTER_SEQUENCE)
 		return "ALTER SEQUENCE";
 	if (tag == CMDTAG_ALTER_TEXT_SEARCH_DICTIONARY)
@@ -1709,6 +1737,38 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 								   .amname = "target_am",
 								   .handler_name = &definition_names,
 								   .amtype = AMTYPE_INDEX };
+	DefElem no_validator = { .type = T_DefElem, .defname = "validator" };
+	ListCell validator_cell = { .ptr_value = &no_validator };
+	List validator_options
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &validator_cell };
+	CreateFdwStmt create_fdw
+		= { .type = T_CreateFdwStmt, .fdwname = "target_fdw", .func_options = &validator_options };
+	AlterFdwStmt alter_fdw
+		= { .type = T_AlterFdwStmt, .fdwname = "target_fdw", .func_options = &validator_options };
+	CreateForeignServerStmt create_server = { .type = T_CreateForeignServerStmt,
+											  .servername = "target_server",
+											  .fdwname = "target_fdw" };
+	AlterForeignServerStmt alter_server = { .type = T_AlterForeignServerStmt,
+											.servername = "target_server",
+											.version = "preflight",
+											.has_version = true };
+	RoleSpec mapping_user = { .type = T_RoleSpec, .roletype = ROLESPEC_CURRENT_USER };
+	CreateUserMappingStmt create_mapping
+		= { .type = T_CreateUserMappingStmt, .user = &mapping_user, .servername = "target_server" };
+	String mapping_option_value = { .type = T_String, .sval = "enabled" };
+	DefElem mapping_option = { .type = T_DefElem,
+							   .defname = "g_preflight",
+							   .arg = (Node *)&mapping_option_value,
+							   .defaction = DEFELEM_ADD };
+	ListCell mapping_cell = { .ptr_value = &mapping_option };
+	List mapping_options
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &mapping_cell };
+	AlterUserMappingStmt alter_mapping = { .type = T_AlterUserMappingStmt,
+										   .user = &mapping_user,
+										   .servername = "target_server",
+										   .options = &mapping_options };
+	DropUserMappingStmt drop_mapping
+		= { .type = T_DropUserMappingStmt, .user = &mapping_user, .servername = "target_server" };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -1759,7 +1819,14 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 						   (Node *)&conversion,
 						   (Node *)&cast,
 						   (Node *)&transform,
-						   (Node *)&access_method };
+						   (Node *)&access_method,
+						   (Node *)&create_fdw,
+						   (Node *)&alter_fdw,
+						   (Node *)&create_server,
+						   (Node *)&alter_server,
+						   (Node *)&create_mapping,
+						   (Node *)&alter_mapping,
+						   (Node *)&drop_mapping };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned skip = 0; skip < 2; skip++) {
@@ -1786,6 +1853,11 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 			language.replace = language.pltrusted = transform.replace = conversion.def = skip != 0;
 			cast.context = skip ? COERCION_ASSIGNMENT : COERCION_EXPLICIT;
 			access_method.amtype = skip ? AMTYPE_TABLE : AMTYPE_INDEX;
+			create_server.if_not_exists = create_mapping.if_not_exists = drop_mapping.missing_ok
+				= skip != 0;
+			alter_server.version = skip ? NULL : "preflight";
+			mapping_user.roletype = skip ? ROLESPEC_PUBLIC : ROLESPEC_CURRENT_USER;
+			mapping_option.defaction = skip ? DEFELEM_SET : DEFELEM_ADD;
 			create_sql_entry(statements[i]);
 			UT_ASSERT_EQ(utility_unbound, 0);
 			UT_ASSERT_EQ(utility_after_preflight, 1);
@@ -1956,6 +2028,38 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 								   .amname = "target_am",
 								   .handler_name = &definition_names,
 								   .amtype = AMTYPE_INDEX };
+	DefElem no_validator = { .type = T_DefElem, .defname = "validator" };
+	ListCell validator_cell = { .ptr_value = &no_validator };
+	List validator_options
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &validator_cell };
+	CreateFdwStmt create_fdw
+		= { .type = T_CreateFdwStmt, .fdwname = "target_fdw", .func_options = &validator_options };
+	AlterFdwStmt alter_fdw
+		= { .type = T_AlterFdwStmt, .fdwname = "target_fdw", .func_options = &validator_options };
+	CreateForeignServerStmt create_server = { .type = T_CreateForeignServerStmt,
+											  .servername = "target_server",
+											  .fdwname = "target_fdw" };
+	AlterForeignServerStmt alter_server = { .type = T_AlterForeignServerStmt,
+											.servername = "target_server",
+											.version = "preflight",
+											.has_version = true };
+	RoleSpec mapping_user = { .type = T_RoleSpec, .roletype = ROLESPEC_CURRENT_USER };
+	CreateUserMappingStmt create_mapping
+		= { .type = T_CreateUserMappingStmt, .user = &mapping_user, .servername = "target_server" };
+	String mapping_option_value = { .type = T_String, .sval = "enabled" };
+	DefElem mapping_option = { .type = T_DefElem,
+							   .defname = "g_preflight",
+							   .arg = (Node *)&mapping_option_value,
+							   .defaction = DEFELEM_ADD };
+	ListCell mapping_cell = { .ptr_value = &mapping_option };
+	List mapping_options
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &mapping_cell };
+	AlterUserMappingStmt alter_mapping = { .type = T_AlterUserMappingStmt,
+										   .user = &mapping_user,
+										   .servername = "target_server",
+										   .options = &mapping_options };
+	DropUserMappingStmt drop_mapping
+		= { .type = T_DropUserMappingStmt, .user = &mapping_user, .servername = "target_server" };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -2006,7 +2110,14 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 						   (Node *)&conversion,
 						   (Node *)&cast,
 						   (Node *)&transform,
-						   (Node *)&access_method };
+						   (Node *)&access_method,
+						   (Node *)&create_fdw,
+						   (Node *)&alter_fdw,
+						   (Node *)&create_server,
+						   (Node *)&alter_server,
+						   (Node *)&create_mapping,
+						   (Node *)&alter_mapping,
+						   (Node *)&drop_mapping };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		int caught;
@@ -2141,6 +2252,38 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 								   .amname = "target_am",
 								   .handler_name = &definition_names,
 								   .amtype = AMTYPE_INDEX };
+	DefElem no_validator = { .type = T_DefElem, .defname = "validator" };
+	ListCell validator_cell = { .ptr_value = &no_validator };
+	List validator_options
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &validator_cell };
+	CreateFdwStmt create_fdw
+		= { .type = T_CreateFdwStmt, .fdwname = "target_fdw", .func_options = &validator_options };
+	AlterFdwStmt alter_fdw
+		= { .type = T_AlterFdwStmt, .fdwname = "target_fdw", .func_options = &validator_options };
+	CreateForeignServerStmt create_server = { .type = T_CreateForeignServerStmt,
+											  .servername = "target_server",
+											  .fdwname = "target_fdw" };
+	AlterForeignServerStmt alter_server = { .type = T_AlterForeignServerStmt,
+											.servername = "target_server",
+											.version = "preflight",
+											.has_version = true };
+	RoleSpec mapping_user = { .type = T_RoleSpec, .roletype = ROLESPEC_CURRENT_USER };
+	CreateUserMappingStmt create_mapping
+		= { .type = T_CreateUserMappingStmt, .user = &mapping_user, .servername = "target_server" };
+	String mapping_option_value = { .type = T_String, .sval = "enabled" };
+	DefElem mapping_option = { .type = T_DefElem,
+							   .defname = "g_preflight",
+							   .arg = (Node *)&mapping_option_value,
+							   .defaction = DEFELEM_ADD };
+	ListCell mapping_cell = { .ptr_value = &mapping_option };
+	List mapping_options
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &mapping_cell };
+	AlterUserMappingStmt alter_mapping = { .type = T_AlterUserMappingStmt,
+										   .user = &mapping_user,
+										   .servername = "target_server",
+										   .options = &mapping_options };
+	DropUserMappingStmt drop_mapping
+		= { .type = T_DropUserMappingStmt, .user = &mapping_user, .servername = "target_server" };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -2191,7 +2334,14 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 						   (Node *)&conversion,
 						   (Node *)&cast,
 						   (Node *)&transform,
-						   (Node *)&access_method };
+						   (Node *)&access_method,
+						   (Node *)&create_fdw,
+						   (Node *)&alter_fdw,
+						   (Node *)&create_server,
+						   (Node *)&alter_server,
+						   (Node *)&create_mapping,
+						   (Node *)&alter_mapping,
+						   (Node *)&drop_mapping };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned child = 0; child < 2; child++) {
@@ -2332,6 +2482,38 @@ UT_TEST(test_catalog_writes_preflight_requires_shared_catalog_storage)
 								   .amname = "target_am",
 								   .handler_name = &definition_names,
 								   .amtype = AMTYPE_INDEX };
+	DefElem no_validator = { .type = T_DefElem, .defname = "validator" };
+	ListCell validator_cell = { .ptr_value = &no_validator };
+	List validator_options
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &validator_cell };
+	CreateFdwStmt create_fdw
+		= { .type = T_CreateFdwStmt, .fdwname = "target_fdw", .func_options = &validator_options };
+	AlterFdwStmt alter_fdw
+		= { .type = T_AlterFdwStmt, .fdwname = "target_fdw", .func_options = &validator_options };
+	CreateForeignServerStmt create_server = { .type = T_CreateForeignServerStmt,
+											  .servername = "target_server",
+											  .fdwname = "target_fdw" };
+	AlterForeignServerStmt alter_server = { .type = T_AlterForeignServerStmt,
+											.servername = "target_server",
+											.version = "preflight",
+											.has_version = true };
+	RoleSpec mapping_user = { .type = T_RoleSpec, .roletype = ROLESPEC_CURRENT_USER };
+	CreateUserMappingStmt create_mapping
+		= { .type = T_CreateUserMappingStmt, .user = &mapping_user, .servername = "target_server" };
+	String mapping_option_value = { .type = T_String, .sval = "enabled" };
+	DefElem mapping_option = { .type = T_DefElem,
+							   .defname = "g_preflight",
+							   .arg = (Node *)&mapping_option_value,
+							   .defaction = DEFELEM_ADD };
+	ListCell mapping_cell = { .ptr_value = &mapping_option };
+	List mapping_options
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &mapping_cell };
+	AlterUserMappingStmt alter_mapping = { .type = T_AlterUserMappingStmt,
+										   .user = &mapping_user,
+										   .servername = "target_server",
+										   .options = &mapping_options };
+	DropUserMappingStmt drop_mapping
+		= { .type = T_DropUserMappingStmt, .user = &mapping_user, .servername = "target_server" };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -2382,7 +2564,14 @@ UT_TEST(test_catalog_writes_preflight_requires_shared_catalog_storage)
 						   (Node *)&conversion,
 						   (Node *)&cast,
 						   (Node *)&transform,
-						   (Node *)&access_method };
+						   (Node *)&access_method,
+						   (Node *)&create_fdw,
+						   (Node *)&alter_fdw,
+						   (Node *)&create_server,
+						   (Node *)&alter_server,
+						   (Node *)&create_mapping,
+						   (Node *)&alter_mapping,
+						   (Node *)&drop_mapping };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned mode = 0; mode < 8; mode++) {
@@ -2515,6 +2704,38 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 								   .amname = "target_am",
 								   .handler_name = &definition_names,
 								   .amtype = AMTYPE_INDEX };
+	DefElem no_validator = { .type = T_DefElem, .defname = "validator" };
+	ListCell validator_cell = { .ptr_value = &no_validator };
+	List validator_options
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &validator_cell };
+	CreateFdwStmt create_fdw
+		= { .type = T_CreateFdwStmt, .fdwname = "target_fdw", .func_options = &validator_options };
+	AlterFdwStmt alter_fdw
+		= { .type = T_AlterFdwStmt, .fdwname = "target_fdw", .func_options = &validator_options };
+	CreateForeignServerStmt create_server = { .type = T_CreateForeignServerStmt,
+											  .servername = "target_server",
+											  .fdwname = "target_fdw" };
+	AlterForeignServerStmt alter_server = { .type = T_AlterForeignServerStmt,
+											.servername = "target_server",
+											.version = "preflight",
+											.has_version = true };
+	RoleSpec mapping_user = { .type = T_RoleSpec, .roletype = ROLESPEC_CURRENT_USER };
+	CreateUserMappingStmt create_mapping
+		= { .type = T_CreateUserMappingStmt, .user = &mapping_user, .servername = "target_server" };
+	String mapping_option_value = { .type = T_String, .sval = "enabled" };
+	DefElem mapping_option = { .type = T_DefElem,
+							   .defname = "g_preflight",
+							   .arg = (Node *)&mapping_option_value,
+							   .defaction = DEFELEM_ADD };
+	ListCell mapping_cell = { .ptr_value = &mapping_option };
+	List mapping_options
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &mapping_cell };
+	AlterUserMappingStmt alter_mapping = { .type = T_AlterUserMappingStmt,
+										   .user = &mapping_user,
+										   .servername = "target_server",
+										   .options = &mapping_options };
+	DropUserMappingStmt drop_mapping
+		= { .type = T_DropUserMappingStmt, .user = &mapping_user, .servername = "target_server" };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -2565,7 +2786,14 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 						   (Node *)&conversion,
 						   (Node *)&cast,
 						   (Node *)&transform,
-						   (Node *)&access_method };
+						   (Node *)&access_method,
+						   (Node *)&create_fdw,
+						   (Node *)&alter_fdw,
+						   (Node *)&create_server,
+						   (Node *)&alter_server,
+						   (Node *)&create_mapping,
+						   (Node *)&alter_mapping,
+						   (Node *)&drop_mapping };
 	const char *tags[] = { "CREATE SCHEMA",
 						   "CREATE SEQUENCE",
 						   "CREATE INDEX",
@@ -2616,7 +2844,14 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 						   "CREATE CONVERSION",
 						   "CREATE CAST",
 						   "CREATE TRANSFORM",
-						   "CREATE ACCESS METHOD" };
+						   "CREATE ACCESS METHOD",
+						   "CREATE FOREIGN DATA WRAPPER",
+						   "ALTER FOREIGN DATA WRAPPER",
+						   "CREATE SERVER",
+						   "ALTER SERVER",
+						   "CREATE USER MAPPING",
+						   "ALTER USER MAPPING",
+						   "DROP USER MAPPING" };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned parallel = 0; parallel < 2; parallel++) {
