@@ -123,7 +123,8 @@ typedef enum RfPageCtrcStepPhaseV1 {
 	RF_PAGE_CTRC_STEP_WAIT,
 	RF_PAGE_CTRC_STEP_UNCHANGED,
 	RF_PAGE_CTRC_STEP_TARGET_SYNCED,
-	RF_PAGE_CTRC_STEP_FPI_DURABLE
+	RF_PAGE_CTRC_STEP_FPI_DURABLE,
+	RF_PAGE_CTRC_STEP_UNCHANGED_SYNCED
 } RfPageCtrcStepPhaseV1;
 
 typedef struct RfPageCtrcStepResultV1 {
@@ -181,6 +182,21 @@ extern RfPageCtrcStepResultV1 rf_page_recovery_ctrc_replays_itl_graph_step_smgr_
  * later discharge. The two older step entries retain TARGET_SYNCED semantics.
  * All original budget, immutable-input, PAGE and ERROR contracts still apply. */
 extern RfPageCtrcStepResultV1 rf_page_recovery_ctrc_replays_itl_graph_durable_smgr_v1(
+	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work,
+	const struct ClusterRecoveryCtrcReplaySetSourceV1 *source,
+	RfPageCtrcAuthorityV1 *authority, const struct ClusterSpaceIdentity *space,
+	BlockNumber blockno, const RfPageVersionV1 *expected_before, const char canonical[BLCKSZ],
+	const struct ClusterRecoveryUndoEntry *physical, Size physical_count, Size memory_budget);
+
+/* Also sync an unchanged terminal MAIN page under the original PAGE and raw
+ * descriptors, then repeat the complete five-read MAIN/SPACE observation and
+ * compare every byte with preparation. Only UNCHANGED_SYNCED reports this
+ * local completion; the older entries still return observation-only UNCHANGED.
+ * No FPI, WAL or write is produced for an unchanged page. Rewritten pages use
+ * the original FPI_DURABLE branch. False/ERROR/close failure retains all debt;
+ * neither phase grants post-return FD custody, discharge or service completion.
+ * All original immutable-input, budget and cleanup contracts apply. */
+extern RfPageCtrcStepResultV1 rf_page_recovery_ctrc_replays_itl_graph_sync_smgr_v1(
 	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work,
 	const struct ClusterRecoveryCtrcReplaySetSourceV1 *source,
 	RfPageCtrcAuthorityV1 *authority, const struct ClusterSpaceIdentity *space,

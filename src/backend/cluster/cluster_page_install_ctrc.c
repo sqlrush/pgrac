@@ -61,6 +61,7 @@ typedef struct CtrcNativeStepV1 {
 	PGAlignedBlock canonical;
 	ClusterSharedFsPageV1 *storage;
 	bool publish_durable;
+	bool sync_unchanged;
 } CtrcNativeStepV1;
 
 typedef struct CtrcNativeReadV1 {
@@ -968,6 +969,33 @@ rf_page_recovery_ctrc_replays_itl_fpi_smgr_v1(const struct ClusterRecoveryStartV
 	return ctrc_native_itl_fpi(start, work, authority, space, blockno, expected_before,
 		physical, physical_count, memory_budget, NULL, NULL);
 }
+
+/* Preparation already proved the complete graph/ITL terminal image. Keep its
+ * PAGE and original raw descriptors while making that observation durable;
+ * no stamp/WAL mutation is needed when every byte remains unchanged. */
+static bool
+ctrc_native_step_sync_unchanged(CtrcNativeStepV1 *context,
+	const RfPageCtrcAuthorityV1 *authority, BlockNumber blockno)
+{
+	CtrcNativeReadV1 read = {0};
+	CtrcNativeStepImagesV1 verified = {0};
+
+	read.step = context; read.step_current = ctrc_native_step_current;
+	read.capture = &verified;
+	if (context->storage == NULL || !context->images.ready || !ctrc_native_step_current(context)
+		|| !ctrc_native_read_bind(&read, context->start, context->work, authority,
+			context->original_space, blockno, context->original_before)
+		|| !ctrc_native_read_current(&read) || !ctrc_native_read_target_current(&read, NULL)
+		|| !cluster_shared_fs_page_sync_v1(context->storage)
+		|| !ctrc_native_read_image(&read, &verified.page) || !verified.ready
+		|| memcmp(verified.page.data, context->images.page.data, BLCKSZ) != 0
+		|| memcmp(verified.space0.data, context->images.space0.data, BLCKSZ) != 0
+		|| memcmp(verified.space1.data, context->images.space1.data, BLCKSZ) != 0)
+		return false;
+	return ctrc_native_read_current(&read) && ctrc_native_read_target_current(&read, NULL)
+		&& ctrc_native_step_current(context);
+}
+
 static void
 ctrc_native_step_execute(CtrcNativeStepV1 *context, RfPageCtrcAuthorityV1 *authority,
 	BlockNumber blockno, Size count, Size memory_budget, RfPageCtrcStepResultV1 *result)
@@ -989,7 +1017,12 @@ ctrc_native_step_execute(CtrcNativeStepV1 *context, RfPageCtrcAuthorityV1 *autho
 		context->original_space, blockno, context->original_before,
 		context->original_physical, count, memory_budget, context, &context->images);
 	if (!prepared.ready || !ctrc_native_step_current(context)) return;
-	if (!prepared.rewritten) { result->phase = RF_PAGE_CTRC_STEP_UNCHANGED; return; }
+	if (!prepared.rewritten) {
+		if (!context->sync_unchanged) result->phase = RF_PAGE_CTRC_STEP_UNCHANGED;
+		else if (ctrc_native_step_sync_unchanged(context, authority, blockno))
+			result->phase = RF_PAGE_CTRC_STEP_UNCHANGED_SYNCED;
+		return;
+	}
 	if (!rf_page_authority_ctrc_replays_unpromote_v1(authority)
 		|| !ctrc_native_step_current(context))
 		return;
@@ -1066,7 +1099,8 @@ ctrc_native_itl_step(const struct ClusterRecoveryStartV1 *start,
 	const ClusterColdCtrcWorkV1 *work, const ClusterRecoveryCtrcReplaySetSourceV1 *source,
 	RfPageCtrcAuthorityV1 *authority, const ClusterSpaceIdentity *space,
 	BlockNumber blockno, const RfPageVersionV1 *expected_before, const char *canonical,
-	const ClusterRecoveryUndoEntry *physical, Size physical_count, Size memory_budget, bool publish_durable)
+	const ClusterRecoveryUndoEntry *physical, Size physical_count, Size memory_budget,
+	bool publish_durable, bool sync_unchanged)
 {
 	RfPageCtrcStepResultV1 result = {0};
 	CtrcNativeStepV1 context = {0};
@@ -1102,6 +1136,7 @@ ctrc_native_itl_step(const struct ClusterRecoveryStartV1 *start,
 	memcpy(&header, work, offsetof(ClusterColdCtrcWorkV1, entries));
 	context.start = start; context.work = work;
 	context.publish_durable = publish_durable;
+	context.sync_unchanged = sync_unchanged;
 	context.original_source = source; memcpy(&context.source, source, sizeof(context.source));
 	context.original_space = space; memcpy(&context.space, space, sizeof(context.space));
 	if (space->state != CLUSTER_SPACE_IDENTITY_LIVE
@@ -1124,7 +1159,7 @@ rf_page_recovery_ctrc_replays_itl_step_smgr_v1(const struct ClusterRecoveryStart
 	const ClusterRecoveryUndoEntry *physical, Size physical_count, Size memory_budget)
 {
 	return ctrc_native_itl_step(start, work, source, authority, space, blockno,
-		expected_before, NULL, physical, physical_count, memory_budget, false);
+		expected_before, NULL, physical, physical_count, memory_budget, false, false);
 }
 
 RfPageCtrcStepResultV1
@@ -1136,7 +1171,7 @@ rf_page_recovery_ctrc_replays_itl_graph_step_smgr_v1(const struct ClusterRecover
 {
 	if (canonical == NULL) return (RfPageCtrcStepResultV1){0};
 	return ctrc_native_itl_step(start, work, source, authority, space, blockno,
-		expected_before, canonical, physical, physical_count, memory_budget, false);
+		expected_before, canonical, physical, physical_count, memory_budget, false, false);
 }
 
 RfPageCtrcStepResultV1
@@ -1148,6 +1183,18 @@ rf_page_recovery_ctrc_replays_itl_graph_durable_smgr_v1(const struct ClusterReco
 {
 	if (canonical == NULL) return (RfPageCtrcStepResultV1){0};
 	return ctrc_native_itl_step(start, work, source, authority, space, blockno,
-		expected_before, canonical, physical, physical_count, memory_budget, true);
+		expected_before, canonical, physical, physical_count, memory_budget, true, false);
+}
+
+RfPageCtrcStepResultV1
+rf_page_recovery_ctrc_replays_itl_graph_sync_smgr_v1(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, const ClusterRecoveryCtrcReplaySetSourceV1 *source,
+	RfPageCtrcAuthorityV1 *authority, const ClusterSpaceIdentity *space,
+	BlockNumber blockno, const RfPageVersionV1 *expected_before, const char canonical[BLCKSZ],
+	const ClusterRecoveryUndoEntry *physical, Size physical_count, Size memory_budget)
+{
+	if (canonical == NULL) return (RfPageCtrcStepResultV1){0};
+	return ctrc_native_itl_step(start, work, source, authority, space, blockno,
+		expected_before, canonical, physical, physical_count, memory_budget, true, true);
 }
 #endif /* USE_PGRAC_CLUSTER */

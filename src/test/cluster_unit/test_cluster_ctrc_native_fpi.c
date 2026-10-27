@@ -458,6 +458,7 @@ bool native_install_original_writer_installed(ClusterWalWriterToken *writer,
 #include "test_cluster_ctrc_native_page_fd.inc"
 #include "test_cluster_ctrc_native_durable.inc"
 #include "test_cluster_ctrc_native_writer_retention.inc"
+#include "test_cluster_ctrc_native_unchanged_sync.inc"
 
 int
 main(int argc, char **argv)
@@ -466,6 +467,16 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_NATIVE_UNCHANGED_SYNC") != NULL) {
+		UT_PLAN(6);
+		UT_RUN(test_native_unchanged_syncs_same_fd_and_full_image_without_wal);
+		UT_RUN(test_native_unchanged_sync_rechecks_original_inputs_after_sync_and_each_read);
+		UT_RUN(test_native_unchanged_sync_io_failure_error_and_close_keep_original_owners);
+		UT_RUN(test_native_unchanged_sync_refuses_changed_full_main_or_space_bytes);
+		UT_RUN(test_native_unchanged_sync_preserves_old_entries_and_rewritten_fpi_debt);
+		UT_RUN(test_native_unchanged_sync_requires_original_entry_guards_and_canonical_image);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_NATIVE_WRITER_RETENTION") != NULL) {
 		UT_PLAN(1);
 		UT_RUN(test_native_fpi_refuses_writer_outside_original_retention);
@@ -501,7 +512,13 @@ main(int argc, char **argv)
 		UT_RUN(test_native_step_fixed_fd_close_failure_cannot_claim_target_synced);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(61);
+	UT_PLAN(67);
+	UT_RUN(test_native_unchanged_syncs_same_fd_and_full_image_without_wal);
+	UT_RUN(test_native_unchanged_sync_rechecks_original_inputs_after_sync_and_each_read);
+	UT_RUN(test_native_unchanged_sync_io_failure_error_and_close_keep_original_owners);
+	UT_RUN(test_native_unchanged_sync_refuses_changed_full_main_or_space_bytes);
+	UT_RUN(test_native_unchanged_sync_preserves_old_entries_and_rewritten_fpi_debt);
+	UT_RUN(test_native_unchanged_sync_requires_original_entry_guards_and_canonical_image);
 	UT_RUN(test_native_fpi_refuses_writer_outside_original_retention);
 	UT_RUN(test_native_durable_marks_under_original_page_and_fd);
 	UT_RUN(test_native_durable_snapshot_is_exact_and_read_only);

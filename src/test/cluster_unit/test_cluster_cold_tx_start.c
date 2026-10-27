@@ -2323,9 +2323,16 @@ UT_TEST(test_relmap_failure_revokes_original_episode_without_free_or_release)
 #include "test_cluster_cold_ctrc_page_plan.inc"
 #include "test_cluster_cold_ctrc_page_sources.inc"
 #include "test_cluster_cold_ctrc_page_prefix.inc"
+#include "test_cluster_cold_ctrc_unchanged_sync.inc"
 
 int main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_STARTUP_UNCHANGED_SYNC") != NULL) {
+		UT_PLAN(2);
+		UT_RUN(test_startup_unchanged_sync_advances_without_service_completion);
+		UT_RUN(test_startup_legacy_unchanged_cannot_advance_or_complete);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_STARTUP_PAGE_PREFIX") != NULL) {
 		UT_PLAN(14);
 		UT_RUN(test_startup_page_prefix_durable_retains_window_and_service_debt);
@@ -2406,7 +2413,9 @@ int main(void)
 		UT_RUN(test_ctrc_pages_native_error_retires_cursor_before_original_scope);
 		reset(); UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(172);
+	UT_PLAN(174);
+	UT_RUN(test_startup_unchanged_sync_advances_without_service_completion);
+	UT_RUN(test_startup_legacy_unchanged_cannot_advance_or_complete);
 	UT_RUN(test_startup_page_prefix_durable_retains_window_and_service_debt);
 	UT_RUN(test_startup_page_prefix_legacy_synced_cannot_supply_durable);
 	UT_RUN(test_startup_page_prefix_uses_graph_ordinal_not_input_or_replay_index);
