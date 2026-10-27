@@ -48,6 +48,7 @@
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_content_trace.h"
 #include "cluster/cluster_cssd.h" /* spec-4.7a D4 — ClusterCssdPeerState for stub */
+#include "cluster/cluster_epoch.h"
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_gcs.h"
@@ -59,6 +60,7 @@
 #include "cluster/cluster_pi_write.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_qvotec.h"
+#include "cluster/cluster_reconfig.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_ko.h"
@@ -492,6 +494,46 @@ cluster_ic_tier1_resource_x_stream_generation(int32 peer, int channel)
 	return fake_rx_stream_generation;
 }
 
+/* QVOTEC/HELLO observation providers used by the actual GCS session sampler. */
+static uint64 auth_peer_boot = 31, auth_slot_generation = 1, auth_epoch = 17;
+static bool auth_connection_valid = true, auth_slot_valid = true, auth_fresh = true;
+static unsigned auth_slot_reads, auth_connection_reads;
+static void (*auth_observation_hook)(int32 node, unsigned slot_read);
+
+bool
+cluster_sf_peer_pcm_x_connection_generation(int32 node, uint32 *generation)
+{
+	UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	UT_ASSERT(node >= 0 && node < RESOURCE_X_PROTOCOL_NODE_LIMIT);
+	auth_connection_reads++;
+	*generation = fake_rx_capability_generation;
+	return auth_connection_valid;
+}
+
+bool
+cluster_reconfig_get_observed_slot(int32 node, uint64 *incarnation, uint64 *generation)
+{
+	UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	auth_slot_reads++;
+	if (auth_observation_hook != NULL)
+		auth_observation_hook(node, auth_slot_reads);
+	*incarnation = auth_peer_boot;
+	*generation = auth_slot_generation;
+	return auth_slot_valid;
+}
+
+uint64
+cluster_reconfig_get_observed_epoch(int32 node pg_attribute_unused())
+{
+	return auth_epoch;
+}
+
+bool
+cluster_reconfig_get_observed_fresh_alive(int32 node pg_attribute_unused())
+{
+	return auth_fresh;
+}
+
 static void (*fake_pcm_clock_hook)(void);
 static unsigned int fake_pcm_clock_hook_countdown;
 int cluster_test_pcm_clock_gettime(clockid_t clock_id, struct timespec *time_out);
@@ -748,6 +790,10 @@ s_lock(volatile slock_t *lock, const char *file pg_attribute_unused(),
 static void
 reset_fake_pcm_runtime(int max_entries)
 {
+	auth_peer_boot = 31; auth_slot_generation = 1; auth_epoch = 17;
+	auth_connection_valid = auth_slot_valid = auth_fresh = true;
+	auth_slot_reads = auth_connection_reads = 0;
+	auth_observation_hook = NULL;
 	object_drop_retired = object_origin_discard = false;
 	memset(&object_drop_locator, 0, sizeof(object_drop_locator));
 	object_drop_queries = 0;
@@ -24784,6 +24830,10 @@ cluster_semantic_activation_resource_x_peer_open_check(const ClusterSemanticAdmi
 			   ? CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH
 			   : CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_CAPABILITY_DRIFT;
 }
+
+static PcmXSessionAuthResult
+gcs_block_pcm_x_authenticated_session_result(int32 node, uint64 epoch, uint64 *session,
+	ClusterGcsPcmXAuthSample *sample);
 
 #include "test_cluster_pcm_bootstrap_tick.inc"
 

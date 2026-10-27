@@ -10349,7 +10349,8 @@ gcs_block_resource_x_payload_candidate(uint8 msg_type, uint32 payload_length)
 {
 	if (msg_type == RESOURCE_X_MSG_ASSERT_X)
 		return payload_length == RESOURCE_X_CONTROL_V1_BYTES
-			   || payload_length == RESOURCE_X_SHORT_V1_BYTES;
+			   || payload_length == RESOURCE_X_SHORT_V1_BYTES
+			   || payload_length == RESOURCE_X_ACQUIRE_V3_BYTES;
 	if (msg_type == RESOURCE_X_MSG_IMAGE_OR_GRANT)
 		return payload_length == RESOURCE_X_CONTROL_V1_BYTES
 			   || payload_length == RESOURCE_X_PROOF_V1_BYTES
@@ -14897,6 +14898,146 @@ done:
 		gcs_block_resource_x_stage_ready_tag(&frame->common.logical_assertion.resource);
 }
 
+/* The wire sender generation belongs to the sender, not to our capability
+ * record. Authenticate the complete episode against the current DATA peer
+ * and fresh QVOTEC boot observations instead. This only admits retained work;
+ * it does not manufacture a source, canonical request, grant or bootstrap ACK.
+ * An unavailable observation retains the same owner. Only coherent identity
+ * or admission-domain drift may retire its exact unconsumed work reference. */
+static ResourceXApplyResult
+gcs_block_resource_x_acquire_context_result(
+	const ResourceXDecodedCommon *request, const ResourceXDecodedAcquireIntent *intent,
+	const ClusterSemanticAdmissionToken *admission, uint32 authenticated_ingress,
+	uint32 *master_sender_out)
+{
+	ResourceXGateSnapshot gate;
+	ResourceXApplyResult result;
+	PcmXSessionAuthResult session_result;
+	ClusterGcsPcmXAuthSample sample;
+	uint64 master_session = 0;
+	uint64 requester_session = 0;
+	uint32 outbound = 0;
+	uint32 current_outbound = 0;
+	int32 master = -1;
+	int32 requester;
+
+	if (master_sender_out != NULL)
+		*master_sender_out = 0;
+	if (request == NULL || intent == NULL || admission == NULL || master_sender_out == NULL
+		|| authenticated_ingress == 0 || authenticated_ingress == UINT32_MAX
+		|| intent->requester_incarnation == 0 || intent->requester_incarnation == UINT64_MAX)
+		return RESOURCE_X_APPLY_INVALID;
+	requester = request->logical_assertion.requester_node;
+	if (intent->cluster_epoch != cluster_epoch_get_current()
+		|| intent->cluster_epoch != admission->formation_epoch
+		|| request->resource_formation != admission->formation_epoch
+		|| intent->r4_generation != admission->record_generation)
+		return RESOURCE_X_APPLY_STALE;
+	result = gcs_block_resource_x_target_peer_result_exact(admission, requester,
+														 authenticated_ingress);
+	if (result != RESOURCE_X_APPLY_APPLIED)
+		return result;
+	session_result = gcs_block_resource_x_gate_session_snapshot_result(
+		&request->logical_assertion.resource, &gate, &master, &master_session);
+	if (gate.phase != RESOURCE_X_GATE_OPEN || gate.formation != request->resource_formation
+		|| master != cluster_node_id || !cluster_semantic_activation_recheck(admission))
+		return RESOURCE_X_APPLY_STALE;
+	if (cluster_gcs_pcm_x_auth_result_retryable(session_result))
+		return RESOURCE_X_APPLY_BAD_STATE;
+	if (session_result != PCM_X_SESSION_AUTH_OK || master_session == 0
+		|| master_session == UINT64_MAX || master_session != request->master_session_incarnation)
+		return RESOURCE_X_APPLY_STALE;
+	if (!gcs_block_pcm_x_resource_x_peer_ready_exact(requester, &outbound))
+		return RESOURCE_X_APPLY_BAD_STATE;
+	if (outbound == 0 || outbound == UINT32_MAX)
+		return RESOURCE_X_APPLY_INVALID;
+
+	/* Each pass is itself a double sample in one connection generation. The
+	 * second pass closes changes while the independent gate/session owners
+	 * were observed; neither pass creates another request or authority. */
+	for (int pass = 0; pass < 2; pass++) {
+		session_result = gcs_block_pcm_x_authenticated_session_result(
+			requester, intent->cluster_epoch, &requester_session, &sample);
+		if (cluster_gcs_pcm_x_auth_result_retryable(session_result))
+			return RESOURCE_X_APPLY_BAD_STATE;
+		if (session_result != PCM_X_SESSION_AUTH_OK || requester_session == 0
+			|| requester_session == UINT64_MAX)
+			return RESOURCE_X_APPLY_INVALID;
+		if (requester_session != intent->requester_incarnation)
+			return RESOURCE_X_APPLY_STALE;
+		if (requester != cluster_node_id) {
+			if (sample.connection_generation_before == 0
+				|| sample.connection_generation_before == UINT32_MAX
+				|| sample.slot_generation_before == UINT64_MAX)
+				return RESOURCE_X_APPLY_INVALID;
+			if (sample.connection_generation_before != authenticated_ingress)
+				return RESOURCE_X_APPLY_STALE;
+		}
+		result = gcs_block_resource_x_gate_session_recheck_result(
+			&request->logical_assertion.resource, &gate, master, master_session);
+		if (result != RESOURCE_X_APPLY_APPLIED)
+			return result;
+	}
+	result = gcs_block_resource_x_target_peer_result_exact(admission, requester,
+														 authenticated_ingress);
+	if (result != RESOURCE_X_APPLY_APPLIED)
+		return result;
+	if (!gcs_block_pcm_x_resource_x_peer_ready_exact(requester, &current_outbound))
+		return RESOURCE_X_APPLY_BAD_STATE;
+	if (current_outbound != outbound || !cluster_semantic_activation_recheck(admission))
+		return RESOURCE_X_APPLY_STALE;
+	*master_sender_out = outbound;
+	return RESOURCE_X_APPLY_APPLIED;
+}
+
+static ResourceXApplyResult
+gcs_block_resource_x_acquire_ingress(const ClusterICEnvelope *env,
+									 const ResourceXDecodedFrame *frame, uint32 authenticated_ingress,
+									 ResourceXMasterSnapshot *snapshot)
+{
+	ClusterSemanticAdmissionToken admission = {0};
+	ResourceXDecodedFrame unused_outbound;
+	volatile ResourceXApplyResult result = RESOURCE_X_APPLY_BAD_STATE;
+	uint32 outbound = 0;
+	int32 requester;
+
+	if (snapshot != NULL) {
+		memset(snapshot, 0, sizeof(*snapshot));
+		snapshot->source_node = -1;
+	}
+	if (env == NULL || frame == NULL || snapshot == NULL || !frame->has_acquire_intent
+		|| frame->kind != RESOURCE_X_WIRE_ASSERT_X || frame->common.ordered_lane != 0
+		|| frame->payload_bytes != RESOURCE_X_ACQUIRE_V3_BYTES
+		|| env->msg_type != RESOURCE_X_MSG_ASSERT_X
+		|| env->payload_length != RESOURCE_X_ACQUIRE_V3_BYTES
+		|| env->dest_node_id != (uint32)cluster_node_id
+		|| env->epoch != frame->body.acquire_intent.cluster_epoch)
+		return RESOURCE_X_APPLY_INVALID;
+	requester = frame->common.logical_assertion.requester_node;
+	if (requester < 0 || requester >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+		|| env->source_node_id != (uint32)requester)
+		return RESOURCE_X_APPLY_INVALID;
+	if (cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1,
+										  CLUSTER_SEMANTIC_TARGET_SIDE, &admission)
+		!= CLUSTER_SEMANTIC_ADMISSION_OK)
+		return RESOURCE_X_APPLY_BAD_STATE;
+	PG_TRY();
+	{
+		result = gcs_block_resource_x_acquire_context_result(
+			&frame->common, &frame->body.acquire_intent, &admission, authenticated_ingress, &outbound);
+		if (result == RESOURCE_X_APPLY_APPLIED)
+			result = cluster_pcm_lock_resource_x_bootstrap_request_exact(
+				frame, requester, authenticated_ingress, admission.record_generation,
+				frame->common.master_session_incarnation, outbound, &unused_outbound);
+	}
+	PG_FINALLY();
+	{
+		cluster_semantic_activation_leave(&admission);
+	}
+	PG_END_TRY();
+	return result;
+}
+
 /* A retained request is not a newly authenticated packet. Revalidate its
  * original ingress and return connection, plus all current admission domains,
  * before the master samples a base. Temporary unavailability retains work. */
@@ -14911,6 +15052,15 @@ gcs_block_resource_x_bootstrap_admitted(const ResourceXBootstrapWork *work,
 	int32 master;
 	int32 requester = work->request.logical_assertion.requester_node;
 
+	if (work->has_acquire_intent) {
+		result = gcs_block_resource_x_acquire_context_result(
+			&work->request, &work->acquire_intent, admission,
+			work->authenticated_ingress_connection_generation, &outbound_connection);
+		if (result != RESOURCE_X_APPLY_APPLIED)
+			return result;
+		return outbound_connection == work->master_sender_connection_generation
+				   ? RESOURCE_X_APPLY_APPLIED : RESOURCE_X_APPLY_STALE;
+	}
 	if (admission->record_generation != work->r4_record_generation)
 		return RESOURCE_X_APPLY_STALE;
 	result = gcs_block_resource_x_target_peer_result_exact(
@@ -14992,6 +15142,9 @@ gcs_block_resource_x_bootstrapped_assert_ingress(const ClusterICEnvelope *env,
 	int32 master_node = -1;
 	int32 source_node;
 
+	if (assertion != NULL && assertion->has_acquire_intent)
+		return gcs_block_resource_x_acquire_ingress(env, assertion,
+													 authenticated_connection_generation, snapshot);
 	memset(&admission, 0, sizeof(admission));
 	if (env == NULL || assertion == NULL || snapshot == NULL
 		|| assertion->kind != RESOURCE_X_WIRE_ASSERT_X || assertion->common.ordered_lane != 0)

@@ -5573,8 +5573,12 @@ test_cluster_pcm_bootstrap_tick.inc: $(top_srcdir)/src/backend/cluster/cluster_g
 	     /^gcs_block_resource_x_bootstrap_ack_stage_exact\(/ { print "static bool"; emit=1; count++ } \
 	     /^gcs_block_resource_x_bootstrap_admitted\(/ { print "static ResourceXApplyResult"; emit=1; count++ } \
 	     /^cluster_gcs_block_resource_x_bootstrap_tick\(/ { print "ResourceXApplyResult"; emit=1; count++ } \
+	     /^gcs_block_resource_x_gate_session_recheck_result\(/ { print "static ResourceXApplyResult"; emit=1; count++ } \
+	     /^gcs_block_resource_x_acquire_context_result\(/ { print "static ResourceXApplyResult"; emit=1; count++ } \
+	     /^\/\* Resolve the boot session used by the PCM-X frontier/ { auth_section=1 } \
+	     auth_section && /^gcs_block_pcm_x_authenticated_session_result\(/ { print "static PcmXSessionAuthResult"; emit=1; count++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (count != 4 || emit) exit 1 }' $< > $@.tmp
+	     END { if (count != 7 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Exercise the actual final LMS0 wait adjustment with the real PCM fixture.
@@ -5592,7 +5596,7 @@ test_cluster_pcm_settlement_ingress.inc: $(top_srcdir)/src/backend/cluster/clust
 	     END { if (count != 4 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_pcm_lock test_cluster_pcm_object_retire test_cluster_pcm_stop_cv test_cluster_pcm_read_grant: %: %.c test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
+test_cluster_pcm_lock test_cluster_pcm_object_retire test_cluster_pcm_stop_cv test_cluster_pcm_read_grant test_cluster_resource_x_acquire_ingress: %: %.c test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
 		test_cluster_pcm_master_durable.inc \
 		test_cluster_pcm_bootstrap_tick.inc \
 		test_cluster_pcm_settlement_ingress.inc \
@@ -6922,6 +6926,7 @@ test_cluster_resource_x_terminal_owner.inc: $(top_srcdir)/src/backend/cluster/cl
 	     /^gcs_block_resource_x_type17_ingress\(/ { print "static ResourceXApplyResult"; emit=1; type17++ } \
 	     /^cluster_gcs_block_resource_x_source_(drain|finish)_tick\(/ { print "ResourceXApplyResult"; emit=1; service_tick++ } \
 	     /^gcs_block_resource_x_bootstrapped_assert_ingress\(/ { print "static ResourceXApplyResult"; emit=1; assertion++ } \
+	     /^gcs_block_resource_x_acquire_(context_result|ingress)\(/ { print "static ResourceXApplyResult"; emit=1; acquisition++ } \
 	     /^gcs_block_resource_x_requester_join_ingress\(/ { print "static ResourceXApplyResult"; emit=1; join++ } \
 	     /^cluster_gcs_resource_x_target_context_recheck_result_exact\(/ { print "ResourceXApplyResult"; emit=1; context++ } \
 	     /^cluster_gcs_resource_x_target_context_recheck_exact\(/ { print "bool"; emit=1; context_bool++ } \
@@ -6929,7 +6934,7 @@ test_cluster_resource_x_terminal_owner.inc: $(top_srcdir)/src/backend/cluster/cl
 	     /^gcs_block_resource_x_target_recycle_inputs_result_exact\(/ { print "static ResourceXApplyResult"; emit=1; recycle_input++ } \
 	     /^cluster_gcs_resource_x_target_itl_recycle_(begin|finish)_exact\(/ { print "ResourceXApplyResult"; emit=1; recycle++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (service_admission != 1 || service_tick != 2 || owner != 1 || admission != 1 || join != 1 || finish != 1 || run != 1 || tick != 1 || cleanup != 1 || context != 1 || context_bool != 1 || peer != 1 || type17 != 1 || assertion != 1 || recycle_input != 1 || recycle != 2) exit 1 }' $< > $@.tmp
+	     END { if (service_admission != 1 || service_tick != 2 || owner != 1 || admission != 1 || join != 1 || finish != 1 || run != 1 || tick != 1 || cleanup != 1 || context != 1 || context_bool != 1 || peer != 1 || type17 != 1 || assertion != 1 || acquisition != 2 || recycle_input != 1 || recycle != 2) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_resource_x_terminal_gate_consumer.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
@@ -10070,3 +10075,22 @@ test_cluster_first_fill_reply.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs
 	     /^gcs_block_wake_local_pending_s_request\(/ { print "static bool"; emit=1; n++ } \
 	     emit { print } emit && /^}/ { emit=0 } END { if (n != 2 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
+
+# Complete acquisition ingress executes original GCS owners and the PCM queue.
+TESTS += test_cluster_resource_x_acquire_ingress
+all: test_cluster_resource_x_acquire_ingress
+
+test_cluster_resource_x_acquire_ingress: test_cluster_resource_x_acquire_candidate.inc cluster_unit_port_stubs.o
+
+test_cluster_resource_x_acquire_candidate.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^gcs_block_resource_x_payload_candidate\(/ { print "static bool"; emit=1; count++ } \
+	     /^gcs_block_resource_x_acquire_ingress\(/ { print "static ResourceXApplyResult"; emit=1; count++ } \
+	     /^gcs_block_resource_x_bootstrapped_assert_ingress\(/ { print "static ResourceXApplyResult"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (count != 3 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+clean distclean maintainer-clean: clean-acquire-ingress
+.PHONY: clean-acquire-ingress
+clean-acquire-ingress:
+	rm -f test_cluster_resource_x_acquire_candidate.inc test_cluster_resource_x_acquire_candidate.inc.tmp
