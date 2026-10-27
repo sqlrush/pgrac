@@ -309,6 +309,22 @@ CreateCommandTag(Node *statement)
 			return CMDTAG_UNKNOWN;
 		}
 	}
+	if (IsA(statement, AlterOwnerStmt)) {
+		switch (((AlterOwnerStmt *)statement)->objectType) {
+		case OBJECT_DATABASE:
+			return CMDTAG_ALTER_DATABASE;
+		case OBJECT_SCHEMA:
+			return CMDTAG_ALTER_SCHEMA;
+		case OBJECT_FUNCTION:
+			return CMDTAG_ALTER_FUNCTION;
+		case OBJECT_COLLATION:
+			return CMDTAG_ALTER_COLLATION;
+		case OBJECT_TABLESPACE:
+			return CMDTAG_ALTER_TABLESPACE;
+		default:
+			return CMDTAG_UNKNOWN;
+		}
+	}
 	if (IsA(statement, AlterObjectDependsStmt)) {
 		switch (((AlterObjectDependsStmt *)statement)->objectType) {
 		case OBJECT_FUNCTION:
@@ -427,6 +443,10 @@ GetCommandTagName(CommandTag tag)
 		return "CREATE INDEX";
 	if (tag == CMDTAG_CREATE_VIEW)
 		return "CREATE VIEW";
+	if (tag == CMDTAG_ALTER_SCHEMA)
+		return "ALTER SCHEMA";
+	if (tag == CMDTAG_ALTER_TABLESPACE)
+		return "ALTER TABLESPACE";
 	if (tag == CMDTAG_ALTER_TABLE)
 		return "ALTER TABLE";
 	if (tag == CMDTAG_GRANT)
@@ -1619,14 +1639,15 @@ UT_TEST(test_unsupported_rename_or_schema_move_refuses_before_binding)
 								 OBJECT_OPCLASS, OBJECT_OPFAMILY, OBJECT_EXTENSION };
 	RenameStmt rename = { .type = T_RenameStmt, .relationType = OBJECT_TABLE };
 	AlterObjectSchemaStmt move = { .type = T_AlterObjectSchemaStmt };
-	Node *statements[] = { (Node *)&rename, (Node *)&move };
+	AlterOwnerStmt owner = { .type = T_AlterOwnerStmt };
+	Node *statements[] = { (Node *)&rename, (Node *)&move, (Node *)&owner };
 	const RenameStmt variants[]
 		= { { .type = T_RenameStmt, .renameType = OBJECT_COLUMN, .relationType = OBJECT_MATVIEW },
 			{ .type = T_RenameStmt, .renameType = OBJECT_ATTRIBUTE, .relationType = OBJECT_TYPE },
 			{ .type = T_RenameStmt, .renameType = OBJECT_DOMCONSTRAINT } };
 
 	for (unsigned i = 0; i < lengthof(types); i++) {
-		rename.renameType = move.objectType = types[i];
+		rename.renameType = move.objectType = owner.objectType = types[i];
 		for (unsigned j = 0; j < lengthof(statements); j++) {
 			int caught;
 
@@ -1908,6 +1929,31 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 													   .oncommit = ONCOMMIT_NOOP },
 											 .servername = "target_server",
 											 .options = &foreign_options };
+	RoleSpec owner_receiver
+		= { .type = T_RoleSpec, .roletype = ROLESPEC_CSTRING, .rolename = "receiving_owner" };
+	String owner_target = { .type = T_String, .sval = "owner_target" };
+	String owner_schema_name = { .type = T_String, .sval = "pg_undo" };
+	String owner_space_name = { .type = T_String, .sval = "g_preflight_tablespace" };
+	AlterOwnerStmt owner_database = { .type = T_AlterOwnerStmt,
+									  .objectType = OBJECT_DATABASE,
+									  .object = (Node *)&owner_target,
+									  .newowner = &owner_receiver };
+	AlterOwnerStmt owner_schema = { .type = T_AlterOwnerStmt,
+									.objectType = OBJECT_SCHEMA,
+									.object = (Node *)&owner_schema_name,
+									.newowner = &reassign_self };
+	AlterOwnerStmt owner_function = { .type = T_AlterOwnerStmt,
+									  .objectType = OBJECT_FUNCTION,
+									  .object = (Node *)&dependency_routine,
+									  .newowner = &owner_receiver };
+	AlterOwnerStmt owner_collation = { .type = T_AlterOwnerStmt,
+									   .objectType = OBJECT_COLLATION,
+									   .object = (Node *)&dependency_names,
+									   .newowner = &owner_receiver };
+	AlterOwnerStmt owner_tablespace = { .type = T_AlterOwnerStmt,
+										.objectType = OBJECT_TABLESPACE,
+										.object = (Node *)&owner_space_name,
+										.newowner = &owner_receiver };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -1979,12 +2025,19 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 						   (Node *)&depends_index,
 						   (Node *)&reassign_named,
 						   (Node *)&reassign_context,
-						   (Node *)&foreign_table };
+						   (Node *)&foreign_table,
+						   (Node *)&owner_database,
+						   (Node *)&owner_schema,
+						   (Node *)&owner_function,
+						   (Node *)&owner_collation,
+						   (Node *)&owner_tablespace };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned skip = 0; skip < 2; skip++) {
 			reset_create_preflight();
 			utility_expect_binding = true;
+			owner_space_name.sval = skip ? "PG_UNDO" : "g_preflight_tablespace";
+			owner_tablespace.newowner = skip ? &reassign_self : &owner_receiver;
 			foreign_table.base.if_not_exists = skip != 0;
 			schema.if_not_exists = sequence.if_not_exists = skip != 0;
 			index.if_not_exists = index.unique = view.replace = skip != 0;
@@ -2319,6 +2372,31 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 													   .oncommit = ONCOMMIT_NOOP },
 											 .servername = "target_server",
 											 .options = &foreign_options };
+	RoleSpec owner_receiver
+		= { .type = T_RoleSpec, .roletype = ROLESPEC_CSTRING, .rolename = "receiving_owner" };
+	String owner_target = { .type = T_String, .sval = "owner_target" };
+	String owner_schema_name = { .type = T_String, .sval = "pg_undo" };
+	String owner_space_name = { .type = T_String, .sval = "g_preflight_tablespace" };
+	AlterOwnerStmt owner_database = { .type = T_AlterOwnerStmt,
+									  .objectType = OBJECT_DATABASE,
+									  .object = (Node *)&owner_target,
+									  .newowner = &owner_receiver };
+	AlterOwnerStmt owner_schema = { .type = T_AlterOwnerStmt,
+									.objectType = OBJECT_SCHEMA,
+									.object = (Node *)&owner_schema_name,
+									.newowner = &reassign_self };
+	AlterOwnerStmt owner_function = { .type = T_AlterOwnerStmt,
+									  .objectType = OBJECT_FUNCTION,
+									  .object = (Node *)&dependency_routine,
+									  .newowner = &owner_receiver };
+	AlterOwnerStmt owner_collation = { .type = T_AlterOwnerStmt,
+									   .objectType = OBJECT_COLLATION,
+									   .object = (Node *)&dependency_names,
+									   .newowner = &owner_receiver };
+	AlterOwnerStmt owner_tablespace = { .type = T_AlterOwnerStmt,
+										.objectType = OBJECT_TABLESPACE,
+										.object = (Node *)&owner_space_name,
+										.newowner = &owner_receiver };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -2390,7 +2468,12 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 						   (Node *)&depends_index,
 						   (Node *)&reassign_named,
 						   (Node *)&reassign_context,
-						   (Node *)&foreign_table };
+						   (Node *)&foreign_table,
+						   (Node *)&owner_database,
+						   (Node *)&owner_schema,
+						   (Node *)&owner_function,
+						   (Node *)&owner_collation,
+						   (Node *)&owner_tablespace };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		int caught;
@@ -2656,6 +2739,31 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 													   .oncommit = ONCOMMIT_NOOP },
 											 .servername = "target_server",
 											 .options = &foreign_options };
+	RoleSpec owner_receiver
+		= { .type = T_RoleSpec, .roletype = ROLESPEC_CSTRING, .rolename = "receiving_owner" };
+	String owner_target = { .type = T_String, .sval = "owner_target" };
+	String owner_schema_name = { .type = T_String, .sval = "pg_undo" };
+	String owner_space_name = { .type = T_String, .sval = "g_preflight_tablespace" };
+	AlterOwnerStmt owner_database = { .type = T_AlterOwnerStmt,
+									  .objectType = OBJECT_DATABASE,
+									  .object = (Node *)&owner_target,
+									  .newowner = &owner_receiver };
+	AlterOwnerStmt owner_schema = { .type = T_AlterOwnerStmt,
+									.objectType = OBJECT_SCHEMA,
+									.object = (Node *)&owner_schema_name,
+									.newowner = &reassign_self };
+	AlterOwnerStmt owner_function = { .type = T_AlterOwnerStmt,
+									  .objectType = OBJECT_FUNCTION,
+									  .object = (Node *)&dependency_routine,
+									  .newowner = &owner_receiver };
+	AlterOwnerStmt owner_collation = { .type = T_AlterOwnerStmt,
+									   .objectType = OBJECT_COLLATION,
+									   .object = (Node *)&dependency_names,
+									   .newowner = &owner_receiver };
+	AlterOwnerStmt owner_tablespace = { .type = T_AlterOwnerStmt,
+										.objectType = OBJECT_TABLESPACE,
+										.object = (Node *)&owner_space_name,
+										.newowner = &owner_receiver };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -2727,7 +2835,12 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 						   (Node *)&depends_index,
 						   (Node *)&reassign_named,
 						   (Node *)&reassign_context,
-						   (Node *)&foreign_table };
+						   (Node *)&foreign_table,
+						   (Node *)&owner_database,
+						   (Node *)&owner_schema,
+						   (Node *)&owner_function,
+						   (Node *)&owner_collation,
+						   (Node *)&owner_tablespace };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned child = 0; child < 2; child++) {
@@ -2999,6 +3112,31 @@ UT_TEST(test_catalog_writes_preflight_requires_shared_catalog_storage)
 													   .oncommit = ONCOMMIT_NOOP },
 											 .servername = "target_server",
 											 .options = &foreign_options };
+	RoleSpec owner_receiver
+		= { .type = T_RoleSpec, .roletype = ROLESPEC_CSTRING, .rolename = "receiving_owner" };
+	String owner_target = { .type = T_String, .sval = "owner_target" };
+	String owner_schema_name = { .type = T_String, .sval = "pg_undo" };
+	String owner_space_name = { .type = T_String, .sval = "g_preflight_tablespace" };
+	AlterOwnerStmt owner_database = { .type = T_AlterOwnerStmt,
+									  .objectType = OBJECT_DATABASE,
+									  .object = (Node *)&owner_target,
+									  .newowner = &owner_receiver };
+	AlterOwnerStmt owner_schema = { .type = T_AlterOwnerStmt,
+									.objectType = OBJECT_SCHEMA,
+									.object = (Node *)&owner_schema_name,
+									.newowner = &reassign_self };
+	AlterOwnerStmt owner_function = { .type = T_AlterOwnerStmt,
+									  .objectType = OBJECT_FUNCTION,
+									  .object = (Node *)&dependency_routine,
+									  .newowner = &owner_receiver };
+	AlterOwnerStmt owner_collation = { .type = T_AlterOwnerStmt,
+									   .objectType = OBJECT_COLLATION,
+									   .object = (Node *)&dependency_names,
+									   .newowner = &owner_receiver };
+	AlterOwnerStmt owner_tablespace = { .type = T_AlterOwnerStmt,
+										.objectType = OBJECT_TABLESPACE,
+										.object = (Node *)&owner_space_name,
+										.newowner = &owner_receiver };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -3070,7 +3208,12 @@ UT_TEST(test_catalog_writes_preflight_requires_shared_catalog_storage)
 						   (Node *)&depends_index,
 						   (Node *)&reassign_named,
 						   (Node *)&reassign_context,
-						   (Node *)&foreign_table };
+						   (Node *)&foreign_table,
+						   (Node *)&owner_database,
+						   (Node *)&owner_schema,
+						   (Node *)&owner_function,
+						   (Node *)&owner_collation,
+						   (Node *)&owner_tablespace };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned mode = 0; mode < 8; mode++) {
@@ -3334,6 +3477,31 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 													   .oncommit = ONCOMMIT_NOOP },
 											 .servername = "target_server",
 											 .options = &foreign_options };
+	RoleSpec owner_receiver
+		= { .type = T_RoleSpec, .roletype = ROLESPEC_CSTRING, .rolename = "receiving_owner" };
+	String owner_target = { .type = T_String, .sval = "owner_target" };
+	String owner_schema_name = { .type = T_String, .sval = "pg_undo" };
+	String owner_space_name = { .type = T_String, .sval = "g_preflight_tablespace" };
+	AlterOwnerStmt owner_database = { .type = T_AlterOwnerStmt,
+									  .objectType = OBJECT_DATABASE,
+									  .object = (Node *)&owner_target,
+									  .newowner = &owner_receiver };
+	AlterOwnerStmt owner_schema = { .type = T_AlterOwnerStmt,
+									.objectType = OBJECT_SCHEMA,
+									.object = (Node *)&owner_schema_name,
+									.newowner = &reassign_self };
+	AlterOwnerStmt owner_function = { .type = T_AlterOwnerStmt,
+									  .objectType = OBJECT_FUNCTION,
+									  .object = (Node *)&dependency_routine,
+									  .newowner = &owner_receiver };
+	AlterOwnerStmt owner_collation = { .type = T_AlterOwnerStmt,
+									   .objectType = OBJECT_COLLATION,
+									   .object = (Node *)&dependency_names,
+									   .newowner = &owner_receiver };
+	AlterOwnerStmt owner_tablespace = { .type = T_AlterOwnerStmt,
+										.objectType = OBJECT_TABLESPACE,
+										.object = (Node *)&owner_space_name,
+										.newowner = &owner_receiver };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -3405,7 +3573,12 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 						   (Node *)&depends_index,
 						   (Node *)&reassign_named,
 						   (Node *)&reassign_context,
-						   (Node *)&foreign_table };
+						   (Node *)&foreign_table,
+						   (Node *)&owner_database,
+						   (Node *)&owner_schema,
+						   (Node *)&owner_function,
+						   (Node *)&owner_collation,
+						   (Node *)&owner_tablespace };
 	const char *tags[] = { "CREATE SCHEMA",
 						   "CREATE SEQUENCE",
 						   "CREATE INDEX",
@@ -3477,7 +3650,12 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 						   "ALTER INDEX",
 						   "REASSIGN OWNED",
 						   "REASSIGN OWNED",
-						   "CREATE FOREIGN TABLE" };
+						   "CREATE FOREIGN TABLE",
+						   "ALTER DATABASE",
+						   "ALTER SCHEMA",
+						   "ALTER FUNCTION",
+						   "ALTER COLLATION",
+						   "ALTER TABLESPACE" };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned parallel = 0; parallel < 2; parallel++) {
@@ -3703,10 +3881,56 @@ UT_TEST(test_foreign_table_unsupported_base_refuses_before_binding)
 	}
 }
 
+UT_TEST(test_undo_tablespace_owner_refuses_before_binding)
+{
+	String undo_name = { .type = T_String, .sval = "pg_undo" };
+	RoleSpec receiver = { .type = T_RoleSpec, .rolename = "g_missing_owner" };
+	AlterOwnerStmt owner = { .type = T_AlterOwnerStmt,
+							 .objectType = OBJECT_TABLESPACE,
+							 .object = (Node *)&undo_name,
+							 .newowner = &receiver };
+	ListCell child_cell = { .ptr_value = &owner };
+	List children = { .type = T_List, .length = 1, .max_length = 1, .elements = &child_cell };
+	CreateSchemaStmt schema = { .type = T_CreateSchemaStmt, .schemaElts = &children };
+	Node *statements[] = { (Node *)&owner, (Node *)&schema };
+
+	/* Synthetic schema recursion; reaching the native boundary outside
+	 * shared scope does not bypass the original OID-based rejection. */
+	for (unsigned mode = 0; mode < 8; mode++) {
+		for (unsigned child = 0; child < 2; child++) {
+			receiver.roletype = child ? ROLESPEC_CSTRING : ROLESPEC_CURRENT_USER;
+			for (unsigned i = 0; i < lengthof(statements); i++) {
+				int caught;
+
+				reset_create_preflight();
+				cluster_shared_catalog = (mode & 1) != 0;
+				utility_storage_mode = (mode & 2) != 0;
+				cluster_shared_config = (mode & 4) != 0;
+				utility_in_child = child != 0;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					create_sql_entry(statements[i]);
+				UT_ASSERT_EQ(caught != 0, (mode & 5) != 0);
+				if (caught) {
+					UT_ASSERT_EQ(error_code, ERRCODE_FEATURE_NOT_SUPPORTED);
+					UT_ASSERT(strcmp(error_message, "pg_undo cannot be altered") == 0);
+					UT_ASSERT(strcmp(error_hint, "pg_undo is a hard-coded system tablespace; owner "
+												 "changes are not supported.")
+							  == 0);
+				}
+				UT_ASSERT_EQ(utility_xids, 0);
+				UT_ASSERT_EQ(utility_prepares, 0);
+				UT_ASSERT_EQ(utility_binds, 0);
+				UT_ASSERT_EQ(utility_after_preflight, (mode & 5) == 0);
+			}
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(47);
+	UT_PLAN(48);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -3754,6 +3978,7 @@ main(void)
 	UT_RUN(test_unsupported_statistics_from_keeps_native_path_without_binding);
 	UT_RUN(test_materialized_view_dependency_refuses_before_binding);
 	UT_RUN(test_foreign_table_unsupported_base_refuses_before_binding);
+	UT_RUN(test_undo_tablespace_owner_refuses_before_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

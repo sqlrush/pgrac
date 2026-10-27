@@ -227,6 +227,13 @@ CheckClusterSharedUtilitySupport(Node *statement, bool isTopLevel)
 			break;
 		case T_AlterOwnerStmt:
 			object_type = ((AlterOwnerStmt *) statement)->objectType;
+			if (object_type == OBJECT_TABLESPACE && ((AlterOwnerStmt *)statement)->object != NULL
+				&& IsA(((AlterOwnerStmt *)statement)->object, String)
+				&& strcmp(strVal(((AlterOwnerStmt *)statement)->object), "pg_undo") == 0)
+				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								errmsg("pg_undo cannot be altered"),
+								errhint("pg_undo is a hard-coded system tablespace; "
+										"owner changes are not supported.")));
 			break;
 		case T_CreateSchemaStmt:
 			foreach(lc, ((CreateSchemaStmt *) statement)->schemaElts)
@@ -325,7 +332,8 @@ PreflightClusterSharedCatalogWrite(Node *statement)
 			&& !IsA(statement, AlterUserMappingStmt) && !IsA(statement, DropUserMappingStmt)
 			&& !IsA(statement, CreatePublicationStmt) && !IsA(statement, AlterPublicationStmt)
 			&& !IsA(statement, AlterObjectDependsStmt) && !IsA(statement, ReassignOwnedStmt)
-			&& !IsA(statement, CreateForeignTableStmt) && !IsA(statement, TruncateStmt)))
+			&& !IsA(statement, CreateForeignTableStmt) && !IsA(statement, AlterOwnerStmt)
+			&& !IsA(statement, TruncateStmt)))
 		return;
 
 	if (IsA(statement, CreateStatsStmt)) {
@@ -350,7 +358,8 @@ PreflightClusterSharedCatalogWrite(Node *statement)
 			 || IsA(statement, AlterDatabaseRefreshCollStmt) || IsA(statement, AlterFdwStmt)
 			 || IsA(statement, AlterForeignServerStmt) || IsA(statement, AlterUserMappingStmt)
 			 || IsA(statement, DropUserMappingStmt) || IsA(statement, AlterPublicationStmt)
-			 || IsA(statement, AlterObjectDependsStmt) || IsA(statement, ReassignOwnedStmt))
+			 || IsA(statement, AlterObjectDependsStmt) || IsA(statement, ReassignOwnedStmt)
+			 || IsA(statement, AlterOwnerStmt))
 		action = "alteration";
 	else
 		action = "creation";
