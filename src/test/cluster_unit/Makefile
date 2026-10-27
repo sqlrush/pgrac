@@ -12887,6 +12887,7 @@ test_cluster_gcs_read_image_hops.inc: $(top_srcdir)/src/backend/cluster/cluster_
 	     /^gcs_block_try_reserve_r4_slot\(/ { print "static ClusterGcsBlockOutstandingSlot *"; emit=1; r4_reserves++ } \
 	     /^gcs_block_clear_slot_locked\(/ { print "static void"; emit=1; slot_clears++ } \
 	     /^gcs_block_release_slot\(/ { print "static void"; emit=1; releases++ } \
+	     /^cluster_gcs_block_r4_tx_resolve_fetch_and_wait_trace_impl\(/ { print "#define GCS_R4_TX_RPC_CONSUMER_PRESENT 1"; print "static ClusterTxOutcome"; emit=1; tx_consumers++ } \
 	     /^typedef struct GcsBlockR4ReplyExpectation/ { emit=1; r4_types++ } \
 	     /^gcs_block_compute_checksum\(/ { print "static uint32"; emit=1; checksums++ } \
 	     /^gcs_block_decode_r4_reply_payload\(/ { print "static bool"; emit=1; r4_decoders++ } \
@@ -12898,7 +12899,7 @@ test_cluster_gcs_read_image_hops.inc: $(top_srcdir)/src/backend/cluster/cluster_
 	     /^cluster_gcs_handle_block_reply_envelope\(/ { print "void"; emit=1; receivers++ } \
 	     emit { print } \
 	     emit && (/^}$$/ || /^} GcsReadImageHopTrace;$$/ || /^} GcsBlockR4ReplyExpectation;$$/) { emit=0 } \
-	     END { if (receivers != 1 || decoders != 1 || rejects > 1 || types > 1 || loggers > 1 || captures > 1 || r4_types != 1 || checksums != 1 || r4_decoders != 1 || r4_receivers != 1 || mx_clears != 1 || r4_reserves != 1 || slot_clears != 1 || releases != 1) exit 1 }' $< > $@.tmp
+	     END { if (receivers != 1 || decoders != 1 || rejects > 1 || types > 1 || loggers > 1 || captures > 1 || r4_types != 1 || checksums != 1 || r4_decoders != 1 || r4_receivers != 1 || mx_clears != 1 || r4_reserves != 1 || slot_clears != 1 || releases != 1 || tx_consumers != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_gcs_read_image_hops: test_cluster_gcs_read_image_hops.c unit_test.h \
