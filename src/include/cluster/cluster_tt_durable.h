@@ -263,8 +263,9 @@ extern void cluster_tt_slot_durable_commit_apply(XLogRecPtr commit_end);
 /* Never throws: release a staged stamp that was never written. */
 extern void cluster_tt_slot_durable_commit_unstage(void);
 
-/* Ordinary abort: verify exact ACTIVE, emit+flush exact 0x60, then
- * apply the identical ABORTED successor before allocator reuse. */
+/* Ordinary top abort: verify exact ACTIVE, emit+flush the original exact
+ * carrier, then apply ABORTED while preserving its retained undo head.
+ * A retained head is not an allocator or CTRC capacity-release proof. */
 extern XLogRecPtr cluster_tt_slot_durable_abort_exact(
 	uint32 segment_id, uint32 segment_generation, uint16 slot_offset, TransactionId xid,
 	uint16 wrap, const ClusterSemanticAdmissionToken *admission, TTSlot *successor_out);

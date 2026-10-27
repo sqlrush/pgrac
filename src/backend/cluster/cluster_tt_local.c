@@ -1164,10 +1164,11 @@ cluster_tt_local_preabort_durable_finish(TransactionId xid)
 		cluster_tt_local_modifier_recheck_or_error(&modifier_token);
 		if (XLogRecPtrIsInvalid(abort_lsn) || successor.status != TT_SLOT_ABORTED
 			|| successor.xid != binding->top_xid || successor.wrap != binding->wrap
-			|| successor.flags != TT_FLAGS_RESERVED || SCN_VALID(successor.commit_scn)
-			|| !UBA_is_invalid(successor.first_undo_block))
+			|| successor.flags != TT_FLAGS_RESERVED || SCN_VALID(successor.commit_scn))
 			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
 							errmsg("canonical abort publisher returned an invalid successor")));
+		/* The qualified producer preserves a nonempty retained head. The
+		 * original retention/release owner, not abort, decides its retirement. */
 		binding->terminal_state = CLUSTER_TT_LOCAL_TERMINAL_ABORT_DURABLE;
 	}
 	PG_FINALLY();

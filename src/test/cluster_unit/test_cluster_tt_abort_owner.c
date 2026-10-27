@@ -288,10 +288,75 @@ UT_TEST(test_commit_staged_binding_without_its_own_stage_is_refused)
 	cluster_tt_local_reset_binding();
 }
 
+UT_TEST(test_local_abort_accepts_retained_successor_without_losing_head)
+{
+	ClusterTTLocalBinding binding;
+	TTSlot before = retained_abort_seed(2);
+	volatile bool success = false;
+
+	seed_binding(&binding, CLUSTER_CANONICAL_TXN_PUBLISHED, CLUSTER_TT_LOCAL_TERMINAL_NONE);
+	PG_TRY();
+	{
+		success = cluster_tt_local_preabort_durable_finish(100);
+	}
+	PG_CATCH();
+	{}
+	PG_END_TRY();
+	UT_ASSERT(success);
+	UT_ASSERT_EQ(binding.terminal_state, CLUSTER_TT_LOCAL_TERMINAL_ABORT_DURABLE);
+	UT_ASSERT_EQ(g_abort_exact_emit_calls, 1);
+	UT_ASSERT_EQ(
+		memcmp(&g_last_written_slot.first_undo_block, &before.first_undo_block, sizeof(UBA)), 0);
+	if (success) {
+		UT_ASSERT(cluster_tt_local_preabort_durable_finish(100));
+		UT_ASSERT_EQ(g_abort_exact_emit_calls, 1);
+		cluster_tt_local_record_abort(100);
+		UT_ASSERT_EQ(abort_marks, 1);
+		UT_ASSERT_EQ(hint_emits, 1);
+		UT_ASSERT_EQ(cluster_tt_local_binding_count, 0);
+		UT_ASSERT_EQ(
+			memcmp(&((UndoSegmentHeaderData *)g_canned_block)->tt_slots[7].first_undo_block,
+				   &before.first_undo_block, sizeof(UBA)),
+			0);
+	}
+	cluster_tt_local_reset_binding();
+}
+
+UT_TEST(test_local_retained_abort_write_failure_cannot_publish_cleanup)
+{
+	ClusterTTLocalBinding binding;
+	TTSlot before = retained_abort_seed(2);
+	volatile bool rejected = false;
+
+	seed_binding(&binding, CLUSTER_CANONICAL_TXN_PUBLISHED, CLUSTER_TT_LOCAL_TERMINAL_NONE);
+	g_write_hdr_ok = false;
+	PG_TRY();
+	{
+		(void)cluster_tt_local_preabort_durable_finish(100);
+	}
+	PG_CATCH();
+	{
+		rejected = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(rejected);
+	UT_ASSERT_EQ(g_abort_exact_emit_calls, 1);
+	UT_ASSERT(g_abort_flush_seen);
+	UT_ASSERT_EQ(binding.terminal_state, CLUSTER_TT_LOCAL_TERMINAL_NONE);
+	UT_ASSERT_EQ(abort_marks + hint_emits + status_installs, 0);
+	UT_ASSERT_EQ(
+		memcmp(&((UndoSegmentHeaderData *)g_canned_block)->tt_slots[7], &before, sizeof(before)),
+		0);
+	cluster_tt_local_reset_binding();
+	g_write_hdr_ok = true;
+}
+
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(8);
+	UT_RUN(test_local_abort_accepts_retained_successor_without_losing_head);
+	UT_RUN(test_local_retained_abort_write_failure_cannot_publish_cleanup);
 	UT_RUN(test_unproved_publication_cannot_skip_durable_abort);
 	UT_RUN(test_batch_rejected_before_any_hint_or_allocator_mutation);
 	UT_RUN(test_reservation_and_proved_abort_keep_existing_cleanup);

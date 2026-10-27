@@ -980,6 +980,7 @@ cluster_undo_smgr_header_writer_close(int fd)
 }
 
 static uint32 g_read_block_absent_once_segment;
+static void (*g_retained_abort_after_read)(void);
 static char g_head_control_block[BLCKSZ];
 static bool g_head_control_enabled;
 static bool head_chain_fixture_read(uint32 segment, uint32 block, char *buf);
@@ -1004,6 +1005,8 @@ cluster_undo_smgr_read_block(ClusterUndoPathIntent intent pg_attribute_unused(),
 	if (!g_read_block_ok || buf == NULL || block_no != 0 || segment_id != g_canned_block_segment)
 		return false; /* other segments "don't exist" -> by-xid skips them */
 	memcpy(buf, g_canned_block, BLCKSZ);
+	if (g_retained_abort_after_read != NULL)
+		g_retained_abort_after_read();
 	return true;
 }
 
@@ -1069,6 +1072,7 @@ reset_current_write_mock(void)
 {
 	reset_header_read_mock();
 	g_epoch_hook = NULL;
+	g_retained_abort_after_read = NULL;
 	g_modifier_recheck_hook = NULL;
 	g_before_current_acquire_hook = NULL;
 	g_after_bind_emit_hook = NULL;
@@ -4209,10 +4213,21 @@ UT_TEST(test_revert_delete_identity_mismatch_failclosed)
 }
 
 
+#include "test_cluster_tt_abort_retained.inc"
+
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(143);
+	UT_PLAN(151);
+	UT_RUN(test_retained_abort_runtime_preserves_original_head);
+	UT_RUN(test_retained_abort_redo_and_preflight_are_exact_and_idempotent);
+	UT_RUN(test_retained_abort_rejects_bad_head_namespace);
+	UT_RUN(test_retained_abort_rejects_wrong_identity_state_or_flags);
+	UT_RUN(test_retained_abort_keeps_original_current_authority_checks);
+	UT_RUN(test_retained_abort_does_not_authorize_commit_or_rebind);
+	UT_RUN(test_retained_abort_preflight_refuses_unstable_or_missing_header);
+	UT_RUN(test_retained_abort_write_failure_keeps_original_head);
+	reset_current_write_mock();
 	UT_RUN(test_head_chain_forward_crosses_data_and_completed_control);
 	UT_RUN(test_head_chain_stale_follows_ancestry_not_sequence);
 	UT_RUN(test_head_chain_rejects_corrupt_or_unknown_members);
