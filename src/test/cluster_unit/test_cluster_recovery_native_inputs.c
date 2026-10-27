@@ -1040,6 +1040,7 @@ UT_TEST(test_ctrc_inventory_keeps_original_local_cut_and_native_terminal_bytes)
 #include "test_cluster_recovery_episode_pending.inc"
 #undef relmap_history_fixture
 #include "test_cluster_recovery_episode_base.inc"
+#include "test_cluster_recovery_episode_sources.inc"
 
 
 int
@@ -1049,6 +1050,14 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_EPISODE_SOURCES") != NULL) {
+		UT_PLAN(4);
+	UT_RUN(test_episode_sources_keep_complete_zero_page_generations_by_value);
+	UT_RUN(test_episode_sources_base_keeps_full_tail_after_native_map);
+	UT_RUN(test_episode_sources_reject_borrowed_output_without_changing_baseline);
+	UT_RUN(test_episode_sources_sibling_metadata_drift_revokes_complete_view);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_CENSUS_PAGE_PLAN") != NULL) {
 		UT_PLAN(4);
 	UT_RUN(test_census_page_graph_preserves_original_full_manifest_and_owned_plan);
@@ -1128,7 +1137,7 @@ main(int argc, char **argv)
 		UT_RUN(test_episode_base_checks_original_page_bytes_before_and_after_native_read);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(150);
+	UT_PLAN(154);
 	UT_RUN(test_census_page_graph_preserves_original_full_manifest_and_owned_plan);
 	UT_RUN(test_census_page_graph_never_advances_prefix_or_enters_under_caller_lock);
 	UT_RUN(test_census_page_graph_factory_failure_and_final_manifest_drift_are_sticky);
@@ -1280,6 +1289,10 @@ main(int argc, char **argv)
 	UT_RUN(test_episode_base_output_lock_and_budget_preconditions_do_not_poison);
 	UT_RUN(test_episode_base_preserves_original_borrowed_page_storage);
 	UT_RUN(test_episode_base_checks_original_page_bytes_before_and_after_native_read);
+	UT_RUN(test_episode_sources_keep_complete_zero_page_generations_by_value);
+	UT_RUN(test_episode_sources_base_keeps_full_tail_after_native_map);
+	UT_RUN(test_episode_sources_reject_borrowed_output_without_changing_baseline);
+	UT_RUN(test_episode_sources_sibling_metadata_drift_revokes_complete_view);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

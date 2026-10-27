@@ -239,6 +239,7 @@ extern bool cluster_recovery_native_inventory_page_at_v1(
  * never a record's FullXid era, CLOG lifetime or terminal qualification. */
 typedef struct ClusterRecoveryRelmapHistoryEntryV1 {
 	ClusterRecoveryRelmapSourceV1 source;
+	ClusterRecoveryWalSourceObservationV1 observation;
 	XLogRecPtr checkpoint_end;
 	ClusterRelmapCheckpointWindow window;
 	uint64 post_flush_issued;
@@ -267,6 +268,9 @@ extern ClusterRecoveryNativeInventoryResult cluster_recovery_relmap_history_buil
 	ClusterRecoveryRelmapHistory **out,
 	ClusterRecoveryNativeInventoryDiag *diag);
 /* One original generation in census order, including empty/history sources.
+ * Complete cut/tail/all-record transcript is copied from the SAME inventory,
+ * not a PAGE or native-map prefix. source.input_index and observation's
+ * source_index identify separate views; join them by complete generation.
  * No I/O/cursor changes. Current checks bracket publication of copied bytes.
  * Invalid index/overlapping output is a precondition refusal; other failure
  * is sticky. All outputs remain provisional until the full final recheck. */
