@@ -13618,3 +13618,6 @@ test_cluster_first_fill_reply.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs
 # Original Startup PAGE graph preparation and complete census wrapper.
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_page_plan.inc
 test_cluster_recovery_native_inputs: test_cluster_recovery_census_page_plan.inc
+
+# Original Startup full-generation PAGE source binding.
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_page_sources.inc
