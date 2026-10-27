@@ -23,11 +23,18 @@
  * This is a request identity, never a master grant or native completion. */
 #define RESOURCE_X_ACQUIRE_WIRE_VERSION 3
 #define RESOURCE_X_ACQUIRE_V3_BYTES 160
+#define RESOURCE_X_DECISION_V3_BYTES 736
 
 typedef enum ResourceXAcquirePath {
 	RESOURCE_X_ACQUIRE_FIRST_FILL = 1,
 	RESOURCE_X_ACQUIRE_RESIDENT = 2
 } ResourceXAcquirePath;
+
+typedef enum ResourceXAcquireSource {
+	RESOURCE_X_ACQUIRE_SOURCE_DISK = 1,
+	RESOURCE_X_ACQUIRE_SOURCE_REMOTE_CURRENT = 2,
+	RESOURCE_X_ACQUIRE_SOURCE_LOCAL_CURRENT = 3
+} ResourceXAcquireSource;
 
 #define RESOURCE_X_CONTROL_V1_BYTES 96
 #define RESOURCE_X_SHORT_V1_BYTES 152
@@ -166,6 +173,30 @@ typedef struct ResourceXAcquireRequestV3 {
 	uint8 path;
 	uint8 zero_reserved[7];
 } ResourceXAcquireRequestV3;
+
+typedef struct ResourceXAcquireHolderV3 {
+	uint8 boot_incarnation[8];
+	uint8 grant_generation[8];
+} ResourceXAcquireHolderV3;
+
+/* Conditional master decision, not a completed native grant. */
+typedef struct ResourceXAcquireDecisionV3 {
+	ResourceXAcquireRequestV3 episode;
+	uint8 resource_binding[8];
+	uint8 enqueue_order[8];
+	uint8 source_service_generation[8];
+	uint8 master_node[4];
+	uint8 source_node[4];
+	uint8 holders_bitmap[4];
+	uint8 required_holders_bitmap[4];
+	uint8 pi_holders_bitmap[4];
+	uint8 requester_ingress_generation[4];
+	uint8 master_ingress_generation[4];
+	uint8 directory_mode;
+	uint8 source_kind;
+	uint8 zero_reserved[10];
+	ResourceXAcquireHolderV3 holders[RESOURCE_X_PROTOCOL_NODE_LIMIT];
+} ResourceXAcquireDecisionV3;
 
 typedef struct ResourceXLocalProofDeclarationV1 {
 	ResourceXWireCommonV1 common;
@@ -363,6 +394,28 @@ typedef struct ResourceXDecodedAcquireIntent {
 	uint8 path;
 } ResourceXDecodedAcquireIntent;
 
+typedef struct ResourceXDecodedAcquireHolder {
+	uint64 boot_incarnation;
+	uint64 grant_generation;
+} ResourceXDecodedAcquireHolder;
+
+typedef struct ResourceXDecodedAcquireDecision {
+	ResourceXDecodedAcquireIntent episode;
+	uint64 resource_binding;
+	uint64 enqueue_order;
+	uint64 source_service_generation;
+	int32 master_node;
+	int32 source_node;
+	uint32 holders_bitmap;
+	uint32 required_holders_bitmap;
+	uint32 pi_holders_bitmap;
+	uint32 requester_ingress_generation;
+	uint32 master_ingress_generation;
+	uint8 directory_mode;
+	uint8 source_kind;
+	ResourceXDecodedAcquireHolder holders[RESOURCE_X_PROTOCOL_NODE_LIMIT];
+} ResourceXDecodedAcquireDecision;
+
 typedef struct ResourceXDecodedFrame {
 	ResourceXWireKind kind;
 	uint16 payload_bytes;
@@ -376,7 +429,9 @@ typedef struct ResourceXDecodedFrame {
 		ResourceXDecodedImageEnvelope image_envelope;
 		ResourceXDecodedInstallSettlement install_settlement;
 		ResourceXDecodedAcquireIntent acquire_intent;
+		ResourceXDecodedAcquireDecision acquire_decision;
 	} body;
+	bool has_acquire_decision; /* Conditional V3 GRANT/BLOCK, never legacy grant. */
 } ResourceXDecodedFrame;
 
 StaticAssertDecl(BLCKSZ == RESOURCE_X_PAGE_BYTES,
@@ -391,6 +446,16 @@ StaticAssertDecl(offsetof(ResourceXAcquireRequestV3, requester_incarnation) == 9
 					 && offsetof(ResourceXAcquireRequestV3, path) == 152
 					 && offsetof(ResourceXAcquireRequestV3, zero_reserved) == 153,
 				 "Resource-X acquisition V3 offsets changed");
+StaticAssertDecl(sizeof(ResourceXAcquireHolderV3) == 16
+					 && sizeof(ResourceXAcquireDecisionV3) == RESOURCE_X_DECISION_V3_BYTES,
+				 "Resource-X decision V3 wire size changed");
+StaticAssertDecl(offsetof(ResourceXAcquireDecisionV3, resource_binding) == 160
+					 && offsetof(ResourceXAcquireDecisionV3, master_node) == 184
+					 && offsetof(ResourceXAcquireDecisionV3, holders_bitmap) == 192
+					 && offsetof(ResourceXAcquireDecisionV3, directory_mode) == 212
+					 && offsetof(ResourceXAcquireDecisionV3, zero_reserved) == 214
+					 && offsetof(ResourceXAcquireDecisionV3, holders) == 224,
+				 "Resource-X decision V3 offsets changed");
 StaticAssertDecl(offsetof(ResourceXWireCommonV1, logical_assertion) == 8
 					 && offsetof(ResourceXWireCommonV1, authority_generation) == 88,
 				 "Resource-X common V1 offsets changed");

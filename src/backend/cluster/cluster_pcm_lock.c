@@ -22013,7 +22013,7 @@ cluster_pcm_lock_resource_x_block_to_n_exact(const ResourceXDecodedFrame *block,
 	uint16 payload_len = 0;
 	bool broadcast = false;
 
-	if (block == NULL || block->kind != RESOURCE_X_WIRE_BLOCK_TO_N
+	if (block == NULL || block->has_acquire_decision || block->kind != RESOURCE_X_WIRE_BLOCK_TO_N
 		|| !resource_x_assertion_valid(&block->common.logical_assertion)
 		|| authenticated_master_node < 0
 		|| authenticated_master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT || cluster_node_id < 0
@@ -22626,7 +22626,7 @@ pcm_resource_x_block_to_n_source_exact_internal(
 	bool shared_s_source;
 	uint8 source_mode;
 
-	if (block == NULL)
+	if (block == NULL || block->has_acquire_decision)
 		return RESOURCE_X_APPLY_INVALID;
 	source_mode = block->common.observed_mode;
 	shared_s_source = source_mode == (uint8)PCM_STATE_S;
@@ -25142,6 +25142,7 @@ pcm_resource_x_requester_join_normalize(const ResourceXDecodedFrame *frame, uint
 	if (payload_bytes_out != NULL)
 		*payload_bytes_out = 0;
 	if (frame == NULL || payload == NULL || payload_bytes_out == NULL
+		|| frame->has_acquire_decision
 		|| (frame->kind != RESOURCE_X_WIRE_AUTHORITY_GRANT
 			&& frame->kind != RESOURCE_X_WIRE_IMAGE_ENVELOPE))
 		return false;
@@ -25762,7 +25763,7 @@ pcm_resource_x_requester_join_internal(
 
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
-	if (frame == NULL || out == NULL
+	if (frame == NULL || out == NULL || frame->has_acquire_decision
 		|| (frame->kind != RESOURCE_X_WIRE_AUTHORITY_GRANT
 			&& frame->kind != RESOURCE_X_WIRE_IMAGE_ENVELOPE)
 		|| !resource_x_assertion_valid(&frame->common.logical_assertion)

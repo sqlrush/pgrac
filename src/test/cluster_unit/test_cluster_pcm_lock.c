@@ -25673,11 +25673,59 @@ UT_TEST(test_resource_x_master_work_duplicate_and_error_leave_original_owner)
 	cluster_shared_config = false;
 }
 
+UT_TEST(test_resource_x_legacy_requester_rejects_conditional_decision_before_join)
+{
+	BufferTag tag = make_tag(155);
+	ResourceXDecodedFrame grant, image;
+	ResourceXRequesterJoinSnapshot snapshot;
+	char unchanged[sizeof(fake_pcm_entries)];
+
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 2;
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_S);
+	cluster_pcm_lock_release(tag);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17), RESOURCE_X_APPLY_APPLIED);
+	make_resource_x_remote_join_pair(tag, 2, &grant, &image);
+	/* Even an otherwise complete old grant must not erase the typed boundary. */
+	grant.has_acquire_decision = true;
+	memcpy(unchanged, &fake_pcm_entries, sizeof(unchanged));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_join_exact(&grant, 2, &snapshot),
+		RESOURCE_X_APPLY_INVALID);
+	UT_ASSERT(memcmp(unchanged, &fake_pcm_entries, sizeof(unchanged)) == 0);
+	grant.has_acquire_decision = false;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_join_exact(&grant, 2, &snapshot),
+		RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(snapshot.flags, RESOURCE_X_REQUESTER_JOIN_HAS_GRANT);
+}
+
+UT_TEST(test_resource_x_legacy_holder_rejects_conditional_decision_before_revoke)
+{
+	BufferTag tag = make_tag(175);
+	ResourceXDecodedFrame block;
+	char unchanged[sizeof(fake_pcm_entries)];
+
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 0;
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_S);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17), RESOURCE_X_APPLY_APPLIED);
+	block = make_resource_x_master_frame(RESOURCE_X_WIRE_BLOCK_TO_N, tag, 2, 0);
+	block.common.observed_mode = PCM_STATE_S;
+	block.common.target_mode = PCM_STATE_N;
+	block.common.source_candidate = 0;
+	block.common.retain_pi_if_dirty = 0;
+	block.has_acquire_decision = true;
+	memcpy(unchanged, &fake_pcm_entries, sizeof(unchanged));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_block_to_n_exact(&block, 0), RESOURCE_X_APPLY_INVALID);
+	UT_ASSERT(memcmp(unchanged, &fake_pcm_entries, sizeof(unchanged)) == 0);
+	block.has_acquire_decision = false;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_block_to_n_exact(&block, 0), RESOURCE_X_APPLY_APPLIED);
+}
+
 int
 main(void)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
-	UT_PLAN(388);
+	UT_PLAN(390);
 	/* Observe the actual startup state before any runtime fixture overrides
 	 * the postmaster GUC or initializes shared PCM state and counters. */
 	UT_RUN(test_pcm_grd_max_entries_default_is_minus_one);
@@ -26070,6 +26118,8 @@ main(void)
 	UT_RUN(test_pi_relation_scan_rejects_wrong_gate_and_pending_transfer);
 	UT_RUN(test_pcm_wait_graph_claim_identity_is_original_not_proc_slot_sample);
 	UT_RUN(test_pcm_wait_graph_local_owner_preserves_holder_and_successor);
+	UT_RUN(test_resource_x_legacy_requester_rejects_conditional_decision_before_join);
+	UT_RUN(test_resource_x_legacy_holder_rejects_conditional_decision_before_revoke);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
