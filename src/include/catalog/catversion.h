@@ -710,7 +710,9 @@
  * builtins before recovery-serial activation.  Bump 202607060 -> 202608150. */
 /* Shared catalog, SPACE identity/reservations and original ROOT initialization.
  * Fresh homogeneous databases only; not an in-place/rolling format upgrade. */
-#define CATALOG_VERSION_NO 202609290
+/* Current grant proof V6 carries original FullXid V2 identities.
+ * Fresh clusters only; existing data directories require reinitialization. */
+#define CATALOG_VERSION_NO 202610270
 
 /* spec-5.13 (2026-06-27): clean-leave catalog surface — cluster_get_clean_leave_state
  * SRF (oid 8960) + pg_cluster_clean_leave_state view + pg_cluster_clean_leave_request

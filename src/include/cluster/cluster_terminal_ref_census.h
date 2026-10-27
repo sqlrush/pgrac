@@ -24,6 +24,7 @@
 #define CLUSTER_TERMINAL_REF_CENSUS_H
 
 #include "c.h"
+#include "cluster/cluster_ctrc_origin_fullxid.h"
 
 #include "access/transam.h"
 #include "access/xlogdefs.h"
@@ -956,6 +957,22 @@ extern bool cluster_ctrc_origin_original_full_xid_exact(
 extern bool cluster_ctrc_origin_original_full_xid_shared(
 												const ClusterCtrcTxnKeyV1 *key,
 												FullTransactionId *full_xid_out);
+/* Capture only under the original local origin lock after its exact grant
+ * registered this receiver. V1 key bytes and reserved zeros are unchanged.
+ * Decode is a source match, not authentication: production consumers must
+ * receive these bytes only from the original authenticated origin reply. */
+extern bool cluster_ctrc_origin_fullxid_capture_v2(const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcParticipantIdentity *receiver, uint32 grant,
+	uint8 bytes[CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES]);
+extern bool cluster_ctrc_origin_fullxid_match_v2(const uint8 *bytes, Size length,
+	const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcParticipantIdentity *receiver,
+	uint32 grant, FullTransactionId *out);
+/* New receivers only; an old raw-only participant is never backfilled. */
+extern ClusterCtrcPrepareResult cluster_ctrc_receipt_prepare_origin_v2(
+	const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcParticipantIdentity *receiver,
+	uint32 grant, const ClusterCtrcPublicationIdV1 *publication,
+	const ClusterCtrcTargetV1 *target, const uint8 *bytes, Size length,
+	ClusterCtrcReceiptHandle *handle);
 extern bool cluster_ctrc_origin_begin_seal_entry(ClusterCtrcOriginEntry *origin,
 												 uint64 seal_generation);
 extern bool cluster_ctrc_origin_arm_close_entry(ClusterCtrcOriginEntry *origin,

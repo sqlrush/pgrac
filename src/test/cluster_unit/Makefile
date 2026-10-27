@@ -798,7 +798,10 @@ test_cluster_hang_acceptance: test_cluster_hang_acceptance.c unit_test.h $(CLUST
 CLUSTER_CR_SERVER_POLICY_O = $(top_builddir)/src/backend/cluster/cluster_cr_server_policy.o
 CLUSTER_CR_SERVER_C0_TEST_O = test_cluster_cr_server_c0_product.o
 $(CLUSTER_CR_SERVER_C0_TEST_O): $(top_srcdir)/src/backend/cluster/cluster_cr_server.c \
-		$(top_srcdir)/src/include/cluster/cluster_cr_server.h
+		$(top_srcdir)/src/include/cluster/cluster_cr_server.h \
+		$(top_srcdir)/src/include/cluster/cluster_multixact_current.h \
+		$(top_srcdir)/src/include/cluster/cluster_multixact_current_wire.h \
+		$(top_srcdir)/src/include/cluster/cluster_ctrc_origin_fullxid.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -ffunction-sections -fdata-sections \
 		-c $< -o $@
 

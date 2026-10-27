@@ -351,6 +351,39 @@ ctrc_seal_suboperation_valid(uint8 suboperation)
 }
 
 bool
+cluster_ctrc_origin_fullxid_match_v2(const uint8 *bytes, Size length,
+	const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcParticipantIdentity *receiver,
+	uint32 grant, FullTransactionId *out)
+{
+	ClusterCtrcTxnKeyV1 decoded;
+	FullTransactionId full;
+
+	if (out != NULL)
+		*out = InvalidFullTransactionId;
+	if (bytes == NULL || out == NULL || key == NULL || receiver == NULL
+		|| length != CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES || grant == 0
+		|| ctrc_get_u16_le(bytes) != CLUSTER_CTRC_ORIGIN_FULLXID_V2_VERSION
+		|| ctrc_get_u16_le(bytes + 2) != CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES
+		|| ctrc_get_u32_le(bytes + 4) != grant
+		|| !ctrc_txn_key_decode(bytes + 16, &decoded)
+		|| memcmp(&decoded, key, sizeof(decoded)) != 0
+		|| receiver->reserved16 != 0 || ctrc_get_u16_le(bytes + 114) != 0
+		|| ctrc_get_u16_le(bytes + 112) != receiver->node_id
+		|| ctrc_get_u32_le(bytes + 116) != receiver->capability_record_generation
+		|| ctrc_get_u64_le(bytes + 120) != receiver->boot_incarnation
+		|| ctrc_get_u64_le(bytes + 128) != receiver->formation_epoch
+		|| ctrc_get_u64_le(bytes + 136) != receiver->admission_record_generation)
+		return false;
+	full = FullTransactionIdFromU64(ctrc_get_u64_le(bytes + 8));
+	if (!FullTransactionIdIsNormal(full) || U64FromFullTransactionId(full) == UINT64_MAX
+		|| XidFromFullTransactionId(full) != key->xid)
+		return false;
+	*out = full;
+	return true;
+}
+
+
+bool
 cluster_ctrc_seal_request_encode(const ClusterCtrcTxnKeyV1 *key, uint64 request_id,
 								 uint32 grant_generation, uint64 seal_generation,
 								 uint32 participant_capability_record_generation,
@@ -5537,6 +5570,44 @@ ctrc_origin_protects_local_receipt_locked(const ClusterCtrcTxnKeyV1 *key,
 	return protects;
 }
 
+/* V2 is a separate envelope: header8, FullXid8, unchanged key96,
+ * exact receiver32. No pointer/host padding is serialized. */
+bool
+cluster_ctrc_origin_fullxid_capture_v2(const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcParticipantIdentity *receiver, uint32 grant,
+	uint8 bytes[CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES])
+{
+	FullTransactionId full = InvalidFullTransactionId;
+	bool valid;
+
+	if (bytes == NULL)
+		return false;
+	MemSet(bytes, 0, CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES);
+	if (CtrcShared == NULL || key == NULL || receiver == NULL
+		|| cluster_node_id < 0 || key->origin_node_id != (uint16)cluster_node_id
+		|| !ctrc_txn_key_valid(key) || receiver->reserved16 != 0)
+		return false;
+	LWLockAcquire(&CtrcShared->origin_lock, LW_SHARED);
+	valid = ctrc_origin_protects_local_receipt_locked(key, receiver, grant, &full)
+		&& FullTransactionIdIsNormal(full) && U64FromFullTransactionId(full) != UINT64_MAX;
+	if (valid) {
+		ctrc_put_u16_le(bytes, CLUSTER_CTRC_ORIGIN_FULLXID_V2_VERSION);
+		ctrc_put_u16_le(bytes + 2, CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES);
+		ctrc_put_u32_le(bytes + 4, grant);
+		ctrc_put_u64_le(bytes + 8, U64FromFullTransactionId(full));
+		valid = ctrc_txn_key_encode(key, bytes + 16);
+		ctrc_put_u16_le(bytes + 112, receiver->node_id);
+		ctrc_put_u32_le(bytes + 116, receiver->capability_record_generation);
+		ctrc_put_u64_le(bytes + 120, receiver->boot_incarnation);
+		ctrc_put_u64_le(bytes + 128, receiver->formation_epoch);
+		ctrc_put_u64_le(bytes + 136, receiver->admission_record_generation);
+	}
+	LWLockRelease(&CtrcShared->origin_lock);
+	if (!valid)
+		MemSet(bytes, 0, CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES);
+	return valid;
+}
+
 static ClusterCtrcPrepareResult
 ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 									 const ClusterCtrcParticipantIdentity *identity,
@@ -5545,7 +5616,8 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 									 const ClusterCtrcTargetV1 *target,
 									 ClusterCtrcReceiptHandle *handle,
 									 const ClusterKoPeerAdmissionV3 *continuation,
-									 ClusterCtrcPreparePath *path_out)
+									 ClusterCtrcPreparePath *path_out,
+									 const FullTransactionId *received_full)
 {
 	ClusterCtrcParticipantEntry *participant;
 	ClusterCtrcReceipt *receipts;
@@ -5613,6 +5685,8 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 			return ctrc_receipt_prepare_refused(false);
 		}
 	}
+	if (!local_origin && received_full != NULL)
+		original_full_xid = *received_full;
 	participant = &ctrc_participant_entries()[participant_index];
 	receipts = ctrc_receipt_entries();
 	ctrc_participant_locks_acquire(ctrc_participant_lock_mask(participant_index));
@@ -5620,7 +5694,13 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 	participant_was_empty = ctrc_bytes_zero(participant, sizeof(*participant));
 	/* Only scalar call-local stores accompany the original predicates under
 	 * these locks. Do not log, call an observer, or repeat a table probe here. */
-	if (FullTransactionIdIsValid(original_full_xid)
+	if (received_full != NULL && !participant_was_empty
+		&& !FullTransactionIdIsValid(participant->original_full_xid)) {
+		/* A new envelope cannot retroactively qualify a raw-only owner. */
+		if (path_out != NULL)
+			*path_out = CLUSTER_CTRC_PREPARE_PATH_ORIGINAL_FULL_XID;
+		result = CLUSTER_CTRC_PREPARE_REFUSED;
+	} else if (FullTransactionIdIsValid(original_full_xid)
 		&& FullTransactionIdIsValid(participant->original_full_xid)
 		&& !FullTransactionIdEquals(original_full_xid, participant->original_full_xid)) {
 		/* Same physical grant cannot silently acquire another original epoch.
@@ -5702,6 +5782,27 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 #endif
 
 ClusterCtrcPrepareResult
+cluster_ctrc_receipt_prepare_origin_v2(const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcParticipantIdentity *receiver, uint32 grant,
+	const ClusterCtrcPublicationIdV1 *publication, const ClusterCtrcTargetV1 *target,
+	const uint8 *bytes, Size length, ClusterCtrcReceiptHandle *handle)
+{
+	FullTransactionId full;
+
+	if (handle != NULL)
+		MemSet(handle, 0, sizeof(*handle));
+	if (!cluster_ctrc_origin_fullxid_match_v2(bytes, length, key, receiver, grant, &full)
+		|| key->origin_node_id == (uint16)cluster_node_id)
+		return CLUSTER_CTRC_PREPARE_REFUSED;
+#ifndef CLUSTER_CTRC_UNIT_TEST
+	return ctrc_receipt_prepare_shared_internal(key, receiver, grant, publication,
+		target, handle, NULL, NULL, &full);
+#else
+	return CLUSTER_CTRC_PREPARE_REFUSED;
+#endif
+}
+
+ClusterCtrcPrepareResult
 cluster_ctrc_receipt_prepare_shared(const ClusterCtrcTxnKeyV1 *key,
 									const ClusterCtrcParticipantIdentity *identity,
 									uint32 grant_generation,
@@ -5721,7 +5822,7 @@ cluster_ctrc_receipt_prepare_shared_observed(const ClusterCtrcTxnKeyV1 *key,
 {
 #ifndef CLUSTER_CTRC_UNIT_TEST
 	return ctrc_receipt_prepare_shared_internal(key, identity, grant_generation, publication,
-												target, handle, NULL, path_out);
+												target, handle, NULL, path_out, NULL);
 #else
 	if (path_out != NULL)
 		*path_out = CLUSTER_CTRC_PREPARE_PATH_UNKNOWN;
@@ -8428,6 +8529,7 @@ ctrc_cleaner_prepare_current_mx_successor(
 		ClusterCtrcParticipantIdentity participant;
 		ClusterCtrcPublicationIdV1 publication;
 		ClusterCtrcPrepareResult prepare_result;
+		FullTransactionId received_full = InvalidFullTransactionId;
 		uint32 grant = 0;
 		uint16 source_ordinal;
 		bool found = false;
@@ -8450,6 +8552,12 @@ ctrc_cleaner_prepare_current_mx_successor(
 				&proofs[source_ordinal].key, grant, proof_capability_generations[source_ordinal],
 				&key, &participant))
 			goto successor_failed;
+		if (key.origin_node_id != (uint16)cluster_node_id
+			&& !cluster_ctrc_origin_fullxid_match_v2(
+				proofs[source_ordinal].origin_fullxid_v2,
+				sizeof(proofs[source_ordinal].origin_fullxid_v2),
+				&key, &participant, grant, &received_full))
+			goto successor_failed;
 
 		MemSet(&publication, 0, sizeof(publication));
 		publication.requester_node_id = participant.node_id;
@@ -8467,7 +8575,8 @@ ctrc_cleaner_prepare_current_mx_successor(
 		publication.grant_generation = grant;
 		prepare_result = ctrc_receipt_prepare_shared_internal(
 			&key, &participant, grant, &publication, &pending_target, &handles[prepared_count],
-			check_object ? &admission : NULL, NULL);
+			check_object ? &admission : NULL, NULL,
+			key.origin_node_id != (uint16)cluster_node_id ? &received_full : NULL);
 		if (prepare_result != CLUSTER_CTRC_PREPARE_READY
 			&& prepare_result != CLUSTER_CTRC_PREPARE_DUPLICATE)
 			goto successor_failed;

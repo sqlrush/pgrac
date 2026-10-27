@@ -9209,9 +9209,15 @@ cluster_current_mx_stamp_prepare_slow(
 				: CTRC_REF_RECOMPOSED_SURVIVOR;
 		publication.target_kind = CTRC_TARGET_PAGE_PENDING_OFFNUM;
 		publication.grant_generation = grant;
-		prepare_result = cluster_ctrc_receipt_prepare_shared(
-			&ctrc_key, &participant, grant, &publication,
-			pending_target, &handles[*receipt_count]);
+		if (found && ctrc_key.origin_node_id != (uint16)cluster_node_id)
+			prepare_result = cluster_ctrc_receipt_prepare_origin_v2(
+				&ctrc_key, &participant, grant, &publication, pending_target,
+				proof.origin_fullxid_v2, sizeof(proof.origin_fullxid_v2),
+				&handles[*receipt_count]);
+		else
+			prepare_result = cluster_ctrc_receipt_prepare_shared(
+				&ctrc_key, &participant, grant, &publication,
+				pending_target, &handles[*receipt_count]);
 		if (prepare_result != CLUSTER_CTRC_PREPARE_READY
 			&& prepare_result != CLUSTER_CTRC_PREPARE_DUPLICATE)
 		{

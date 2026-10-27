@@ -8020,12 +8020,15 @@ gcs_block_current_mx_origin_sample_held(GcsBlockR4TxOriginContext *context)
 				|| cluster_qvotec_get_self_incarnation() != ctrc_key.origin_boot_incarnation)
 				return false;
 			ClusterCurrentMemberProofSetCtrcGrant(&context->current_mx_proofs[i], ctrc_grant);
-			if (!cluster_multixact_current_member_proof_bind_ctrc(&context->current_mx_proofs[i],
-																  &ctrc_key))
+			if (!cluster_multixact_current_member_proof_bind_origin_v2(&context->current_mx_proofs[i],
+				&ctrc_key, &context->current_mx_requester_identity))
 				return false;
 			context->current_mx_ctrc_keys[i] = ctrc_key;
-		} else
+		} else {
 			ClusterCurrentMemberProofSetCtrcGrant(&context->current_mx_proofs[i], 0);
+			memset(context->current_mx_proofs[i].origin_fullxid_v2, 0,
+				   sizeof(context->current_mx_proofs[i].origin_fullxid_v2));
+		}
 		context->current_mx_sampled_bitmap |= (uint8)(1U << i);
 	}
 	if (request->prefix.body_kind == CLUSTER_CURRENT_MX_PROOF_BODY_UPDATER_CHALLENGE) {
