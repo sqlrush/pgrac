@@ -251,6 +251,7 @@ CLUSTER_ELOG_O = $(top_builddir)/src/backend/cluster/cluster_elog.o
 override CPPFLAGS := -I. -I$(top_srcdir)/src/include $(CPPFLAGS)
 
 TESTS += test_cluster_savepoint
+TESTS += test_cluster_savepoint_reader
 
 
 # ----------
@@ -5395,7 +5396,7 @@ test_cluster_thread_orchestrator: test_cluster_thread_orchestrator.c unit_test.h
 # judge cluster_write_fence_decide (a header inline -- no cluster object needed;
 # only libpgcommon/libpgport for the unit harness).  The token region + qvotec
 # refresh + hot-path gating land as cluster_tap (D8).
-SIMPLE_TESTS := $(filter-out test_cluster_savepoint test_cluster_cold_xid_native_completion test_cluster_same_host_fence test_cluster_same_host_provider,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_savepoint test_cluster_savepoint_reader test_cluster_cold_xid_native_completion test_cluster_same_host_fence test_cluster_same_host_provider,$(SIMPLE_TESTS))
 
 test_cluster_write_fence: test_cluster_write_fence.c unit_test.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
@@ -10496,6 +10497,18 @@ test_cluster_undo_lifecycle: test_cluster_undo_lifecycle.c unit_test.h \
 # helpers (cluster_cr_apply.o) on a synthetic ITL page.  Chain walker /
 # tuple remap / visibility / MVCC gate coverage lives in cluster_tap t/215.
 CLUSTER_CR_APPLY_O = $(top_builddir)/src/backend/cluster/cluster_cr_apply.o
+CLUSTER_SAVEPOINT_READER_O = $(top_builddir)/src/backend/cluster/cluster_savepoint_reader.o
+test_cluster_savepoint_reader: test_cluster_savepoint_reader.c unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_cr_history.h \
+		$(top_srcdir)/src/include/cluster/cluster_savepoint_reader.h \
+		$(CLUSTER_CR_APPLY_O) $(CLUSTER_R4_CONTINUATION_PAGE_O) \
+		$(CLUSTER_R4_SLOT_RESERVATION_UBA_O) $(CLUSTER_SAVEPOINT_READER_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_CR_APPLY_O) $(CLUSTER_R4_CONTINUATION_PAGE_O) \
+		$(CLUSTER_R4_SLOT_RESERVATION_UBA_O) $(CLUSTER_SAVEPOINT_READER_O) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
 test_cluster_cr: test_cluster_cr.c unit_test.h \
 		$(CLUSTER_CR_APPLY_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
