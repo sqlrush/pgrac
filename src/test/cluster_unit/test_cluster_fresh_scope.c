@@ -279,6 +279,8 @@ CreateCommandTag(Node *statement)
 		return CMDTAG_CREATE_FOREIGN_TABLE;
 	if (IsA(statement, ImportForeignSchemaStmt))
 		return CMDTAG_IMPORT_FOREIGN_SCHEMA;
+	if (IsA(statement, AlterExtensionContentsStmt) || IsA(statement, AlterExtensionStmt))
+		return CMDTAG_ALTER_EXTENSION;
 	if (IsA(statement, CreateSchemaStmt))
 		return CMDTAG_CREATE_SCHEMA;
 	if (IsA(statement, CreateSeqStmt))
@@ -446,6 +448,8 @@ GetCommandTagName(CommandTag tag)
 		return "CREATE FOREIGN TABLE";
 	if (tag == CMDTAG_IMPORT_FOREIGN_SCHEMA)
 		return "IMPORT FOREIGN SCHEMA";
+	if (tag == CMDTAG_ALTER_EXTENSION)
+		return "ALTER EXTENSION";
 	if (tag == CMDTAG_CREATE_SCHEMA)
 		return "CREATE SCHEMA";
 	if (tag == CMDTAG_CREATE_SEQUENCE)
@@ -1514,7 +1518,19 @@ UT_TEST(test_noncreate_utility_does_not_reserve_canonical_binding)
 	TransactionStmt transaction = { .type = T_TransactionStmt, .kind = TRANS_STMT_BEGIN };
 	VacuumStmt vacuum = { .type = T_VacuumStmt };
 	CopyStmt copy = { .type = T_CopyStmt };
-	Node *statements[] = { (Node *)&show, (Node *)&transaction, (Node *)&vacuum, (Node *)&copy };
+	String extension_version = { .type = T_String, .sval = "2.0" };
+	DefElem version_option
+		= { .type = T_DefElem, .defname = "new_version", .arg = (Node *)&extension_version };
+	ListCell version_cell = { .ptr_value = &version_option };
+	List version_options
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &version_cell };
+	AlterExtensionStmt extension_default
+		= { .type = T_AlterExtensionStmt, .extname = "existing_extension" };
+	AlterExtensionStmt extension_explicit = { .type = T_AlterExtensionStmt,
+											  .extname = "existing_extension",
+											  .options = &version_options };
+	Node *statements[] = { (Node *)&show, (Node *)&transaction,		  (Node *)&vacuum,
+						   (Node *)&copy, (Node *)&extension_default, (Node *)&extension_explicit };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		reset_create_preflight();
@@ -1522,6 +1538,7 @@ UT_TEST(test_noncreate_utility_does_not_reserve_canonical_binding)
 		UT_ASSERT_EQ(utility_after_preflight, 1);
 		UT_ASSERT_EQ(utility_xids, 0);
 		UT_ASSERT_EQ(utility_prepares, 0);
+		UT_ASSERT_EQ(utility_binds, 0);
 	}
 }
 
@@ -2106,6 +2123,26 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 											  .list_type = FDW_IMPORT_SCHEMA_EXCEPT,
 											  .table_list = &import_tables,
 											  .options = &import_options };
+	AlterExtensionContentsStmt extension_add_table = { .type = T_AlterExtensionContentsStmt,
+													   .extname = "existing_extension",
+													   .action = 1,
+													   .objtype = OBJECT_TABLE,
+													   .object = (Node *)&dependency_names };
+	AlterExtensionContentsStmt extension_drop_table = { .type = T_AlterExtensionContentsStmt,
+														.extname = "existing_extension",
+														.action = -1,
+														.objtype = OBJECT_TABLE,
+														.object = (Node *)&dependency_names };
+	AlterExtensionContentsStmt extension_add_function = { .type = T_AlterExtensionContentsStmt,
+														  .extname = "existing_extension",
+														  .action = 1,
+														  .objtype = OBJECT_FUNCTION,
+														  .object = (Node *)&dependency_routine };
+	AlterExtensionContentsStmt extension_drop_function = { .type = T_AlterExtensionContentsStmt,
+														   .extname = "existing_extension",
+														   .action = -1,
+														   .objtype = OBJECT_FUNCTION,
+														   .object = (Node *)&dependency_routine };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -2195,7 +2232,11 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 						   (Node *)&static_options,
 						   (Node *)&import_all,
 						   (Node *)&import_limit,
-						   (Node *)&import_except };
+						   (Node *)&import_except,
+						   (Node *)&extension_add_table,
+						   (Node *)&extension_drop_table,
+						   (Node *)&extension_add_function,
+						   (Node *)&extension_drop_function };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned skip = 0; skip < 2; skip++) {
@@ -2722,6 +2763,26 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 											  .list_type = FDW_IMPORT_SCHEMA_EXCEPT,
 											  .table_list = &import_tables,
 											  .options = &import_options };
+	AlterExtensionContentsStmt extension_add_table = { .type = T_AlterExtensionContentsStmt,
+													   .extname = "existing_extension",
+													   .action = 1,
+													   .objtype = OBJECT_TABLE,
+													   .object = (Node *)&dependency_names };
+	AlterExtensionContentsStmt extension_drop_table = { .type = T_AlterExtensionContentsStmt,
+														.extname = "existing_extension",
+														.action = -1,
+														.objtype = OBJECT_TABLE,
+														.object = (Node *)&dependency_names };
+	AlterExtensionContentsStmt extension_add_function = { .type = T_AlterExtensionContentsStmt,
+														  .extname = "existing_extension",
+														  .action = 1,
+														  .objtype = OBJECT_FUNCTION,
+														  .object = (Node *)&dependency_routine };
+	AlterExtensionContentsStmt extension_drop_function = { .type = T_AlterExtensionContentsStmt,
+														   .extname = "existing_extension",
+														   .action = -1,
+														   .objtype = OBJECT_FUNCTION,
+														   .object = (Node *)&dependency_routine };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -2811,7 +2872,11 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 						   (Node *)&static_options,
 						   (Node *)&import_all,
 						   (Node *)&import_limit,
-						   (Node *)&import_except };
+						   (Node *)&import_except,
+						   (Node *)&extension_add_table,
+						   (Node *)&extension_drop_table,
+						   (Node *)&extension_add_function,
+						   (Node *)&extension_drop_function };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		int caught;
@@ -2823,7 +2888,8 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 			create_sql_entry(statements[i]);
 		UT_ASSERT(caught);
 		UT_ASSERT_EQ(error_code, ERRCODE_DATA_CORRUPTED);
-		if (IsA(statements[i], SecLabelStmt) || IsA(statements[i], AlterTableStmt))
+		if (IsA(statements[i], SecLabelStmt) || IsA(statements[i], AlterTableStmt)
+			|| IsA(statements[i], AlterExtensionContentsStmt))
 			UT_ASSERT(strcmp(error_message,
 							 "canonical ACTIVE publication failed before shared catalog alteration")
 					  == 0);
@@ -3249,6 +3315,26 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 											  .list_type = FDW_IMPORT_SCHEMA_EXCEPT,
 											  .table_list = &import_tables,
 											  .options = &import_options };
+	AlterExtensionContentsStmt extension_add_table = { .type = T_AlterExtensionContentsStmt,
+													   .extname = "existing_extension",
+													   .action = 1,
+													   .objtype = OBJECT_TABLE,
+													   .object = (Node *)&dependency_names };
+	AlterExtensionContentsStmt extension_drop_table = { .type = T_AlterExtensionContentsStmt,
+														.extname = "existing_extension",
+														.action = -1,
+														.objtype = OBJECT_TABLE,
+														.object = (Node *)&dependency_names };
+	AlterExtensionContentsStmt extension_add_function = { .type = T_AlterExtensionContentsStmt,
+														  .extname = "existing_extension",
+														  .action = 1,
+														  .objtype = OBJECT_FUNCTION,
+														  .object = (Node *)&dependency_routine };
+	AlterExtensionContentsStmt extension_drop_function = { .type = T_AlterExtensionContentsStmt,
+														   .extname = "existing_extension",
+														   .action = -1,
+														   .objtype = OBJECT_FUNCTION,
+														   .object = (Node *)&dependency_routine };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -3338,7 +3424,11 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 						   (Node *)&static_options,
 						   (Node *)&import_all,
 						   (Node *)&import_limit,
-						   (Node *)&import_except };
+						   (Node *)&import_except,
+						   (Node *)&extension_add_table,
+						   (Node *)&extension_drop_table,
+						   (Node *)&extension_add_function,
+						   (Node *)&extension_drop_function };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned child = 0; child < 2; child++) {
@@ -3356,7 +3446,9 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 			UT_ASSERT(caught);
 			UT_ASSERT_EQ(error_code,
 						 child ? ERRCODE_FEATURE_NOT_SUPPORTED : ERRCODE_INTERNAL_ERROR);
-			if (child && (IsA(statements[i], SecLabelStmt) || IsA(statements[i], AlterTableStmt)))
+			if (child
+				&& (IsA(statements[i], SecLabelStmt) || IsA(statements[i], AlterTableStmt)
+					|| IsA(statements[i], AlterExtensionContentsStmt)))
 				UT_ASSERT(strcmp(error_message,
 								 "shared catalog alteration does not support subtransactions")
 						  == 0);
@@ -3782,6 +3874,26 @@ UT_TEST(test_catalog_writes_preflight_requires_shared_catalog_storage)
 											  .list_type = FDW_IMPORT_SCHEMA_EXCEPT,
 											  .table_list = &import_tables,
 											  .options = &import_options };
+	AlterExtensionContentsStmt extension_add_table = { .type = T_AlterExtensionContentsStmt,
+													   .extname = "existing_extension",
+													   .action = 1,
+													   .objtype = OBJECT_TABLE,
+													   .object = (Node *)&dependency_names };
+	AlterExtensionContentsStmt extension_drop_table = { .type = T_AlterExtensionContentsStmt,
+														.extname = "existing_extension",
+														.action = -1,
+														.objtype = OBJECT_TABLE,
+														.object = (Node *)&dependency_names };
+	AlterExtensionContentsStmt extension_add_function = { .type = T_AlterExtensionContentsStmt,
+														  .extname = "existing_extension",
+														  .action = 1,
+														  .objtype = OBJECT_FUNCTION,
+														  .object = (Node *)&dependency_routine };
+	AlterExtensionContentsStmt extension_drop_function = { .type = T_AlterExtensionContentsStmt,
+														   .extname = "existing_extension",
+														   .action = -1,
+														   .objtype = OBJECT_FUNCTION,
+														   .object = (Node *)&dependency_routine };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -3871,7 +3983,11 @@ UT_TEST(test_catalog_writes_preflight_requires_shared_catalog_storage)
 						   (Node *)&static_options,
 						   (Node *)&import_all,
 						   (Node *)&import_limit,
-						   (Node *)&import_except };
+						   (Node *)&import_except,
+						   (Node *)&extension_add_table,
+						   (Node *)&extension_drop_table,
+						   (Node *)&extension_add_function,
+						   (Node *)&extension_drop_function };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned mode = 0; mode < 8; mode++) {
@@ -4299,6 +4415,26 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 											  .list_type = FDW_IMPORT_SCHEMA_EXCEPT,
 											  .table_list = &import_tables,
 											  .options = &import_options };
+	AlterExtensionContentsStmt extension_add_table = { .type = T_AlterExtensionContentsStmt,
+													   .extname = "existing_extension",
+													   .action = 1,
+													   .objtype = OBJECT_TABLE,
+													   .object = (Node *)&dependency_names };
+	AlterExtensionContentsStmt extension_drop_table = { .type = T_AlterExtensionContentsStmt,
+														.extname = "existing_extension",
+														.action = -1,
+														.objtype = OBJECT_TABLE,
+														.object = (Node *)&dependency_names };
+	AlterExtensionContentsStmt extension_add_function = { .type = T_AlterExtensionContentsStmt,
+														  .extname = "existing_extension",
+														  .action = 1,
+														  .objtype = OBJECT_FUNCTION,
+														  .object = (Node *)&dependency_routine };
+	AlterExtensionContentsStmt extension_drop_function = { .type = T_AlterExtensionContentsStmt,
+														   .extname = "existing_extension",
+														   .action = -1,
+														   .objtype = OBJECT_FUNCTION,
+														   .object = (Node *)&dependency_routine };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -4388,7 +4524,11 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 						   (Node *)&static_options,
 						   (Node *)&import_all,
 						   (Node *)&import_limit,
-						   (Node *)&import_except };
+						   (Node *)&import_except,
+						   (Node *)&extension_add_table,
+						   (Node *)&extension_drop_table,
+						   (Node *)&extension_add_function,
+						   (Node *)&extension_drop_function };
 	const char *tags[] = { "CREATE SCHEMA",
 						   "CREATE SEQUENCE",
 						   "CREATE INDEX",
@@ -4478,7 +4618,11 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 						   "ALTER TABLE",
 						   "IMPORT FOREIGN SCHEMA",
 						   "IMPORT FOREIGN SCHEMA",
-						   "IMPORT FOREIGN SCHEMA" };
+						   "IMPORT FOREIGN SCHEMA",
+						   "ALTER EXTENSION",
+						   "ALTER EXTENSION",
+						   "ALTER EXTENSION",
+						   "ALTER EXTENSION" };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned parallel = 0; parallel < 2; parallel++) {
