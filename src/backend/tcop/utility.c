@@ -234,6 +234,9 @@ CheckClusterSharedUtilitySupport(Node *statement, bool isTopLevel)
 		case T_AlterObjectSchemaStmt:
 			object_type = ((AlterObjectSchemaStmt *) statement)->objectType;
 			break;
+		case T_SecLabelStmt:
+			object_type = ((SecLabelStmt *)statement)->objtype;
+			break;
 		case T_AlterOwnerStmt:
 			object_type = ((AlterOwnerStmt *) statement)->objectType;
 			if (object_type == OBJECT_TABLESPACE && ((AlterOwnerStmt *)statement)->object != NULL
@@ -343,7 +346,7 @@ PreflightClusterSharedCatalogWrite(Node *statement)
 			&& !IsA(statement, AlterObjectDependsStmt) && !IsA(statement, ReassignOwnedStmt)
 			&& !IsA(statement, CreateForeignTableStmt) && !IsA(statement, AlterOwnerStmt)
 			&& !IsA(statement, AlterDatabaseStmt) && !IsA(statement, AlterTableSpaceOptionsStmt)
-			&& !IsA(statement, TruncateStmt)))
+			&& !IsA(statement, SecLabelStmt) && !IsA(statement, TruncateStmt)))
 		return;
 
 	if (IsA(statement, AlterDatabaseStmt)) {
@@ -382,7 +385,7 @@ PreflightClusterSharedCatalogWrite(Node *statement)
 			 || IsA(statement, DropUserMappingStmt) || IsA(statement, AlterPublicationStmt)
 			 || IsA(statement, AlterObjectDependsStmt) || IsA(statement, ReassignOwnedStmt)
 			 || IsA(statement, AlterOwnerStmt) || IsA(statement, AlterDatabaseStmt)
-			 || IsA(statement, AlterTableSpaceOptionsStmt))
+			 || IsA(statement, AlterTableSpaceOptionsStmt) || IsA(statement, SecLabelStmt))
 		action = "alteration";
 	else
 		action = "creation";

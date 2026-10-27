@@ -353,6 +353,8 @@ CreateCommandTag(Node *statement)
 		return CMDTAG_ALTER_POLICY;
 	if (IsA(statement, CommentStmt))
 		return CMDTAG_COMMENT;
+	if (IsA(statement, SecLabelStmt))
+		return CMDTAG_SECURITY_LABEL;
 	if (IsA(statement, CreateRoleStmt))
 		return CMDTAG_CREATE_ROLE;
 	if (IsA(statement, AlterRoleStmt) || IsA(statement, AlterRoleSetStmt))
@@ -488,6 +490,8 @@ GetCommandTagName(CommandTag tag)
 		return "ALTER POLICY";
 	if (tag == CMDTAG_COMMENT)
 		return "COMMENT";
+	if (tag == CMDTAG_SECURITY_LABEL)
+		return "SECURITY LABEL";
 	if (tag == CMDTAG_CREATE_ROLE)
 		return "CREATE ROLE";
 	if (tag == CMDTAG_ALTER_ROLE)
@@ -1990,6 +1994,31 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 	AlterTableSpaceOptionsStmt tablespace_options = { .type = T_AlterTableSpaceOptionsStmt,
 													  .tablespacename = "g_preflight_tablespace",
 													  .options = &tablespace_option_list };
+	String label_name = { .type = T_String, .sval = "label_target" };
+	String label_column_name = { .type = T_String, .sval = "label_column" };
+	ListCell label_name_cell = { .ptr_value = &label_name };
+	List label_names
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &label_name_cell };
+	ListCell label_column_cells[2]
+		= { { .ptr_value = &label_name }, { .ptr_value = &label_column_name } };
+	List label_column_names
+		= { .type = T_List, .length = 2, .max_length = 2, .elements = label_column_cells };
+	ObjectWithArgs label_routine = { .type = T_ObjectWithArgs, .objname = &label_names };
+	SecLabelStmt label_table = { .type = T_SecLabelStmt,
+								 .objtype = OBJECT_TABLE,
+								 .object = (Node *)&label_names,
+								 .provider = "g_label_provider",
+								 .label = "table_label" };
+	SecLabelStmt label_column = { .type = T_SecLabelStmt,
+								  .objtype = OBJECT_COLUMN,
+								  .object = (Node *)&label_column_names };
+	SecLabelStmt label_function = { .type = T_SecLabelStmt,
+									.objtype = OBJECT_FUNCTION,
+									.object = (Node *)&label_routine,
+									.provider = "g_label_provider",
+									.label = "routine_label" };
+	SecLabelStmt label_database
+		= { .type = T_SecLabelStmt, .objtype = OBJECT_DATABASE, .object = (Node *)&label_name };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -2069,12 +2098,22 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 						   (Node *)&owner_tablespace,
 						   (Node *)&database_flags,
 						   (Node *)&database_limit,
-						   (Node *)&tablespace_options };
+						   (Node *)&tablespace_options,
+						   (Node *)&label_table,
+						   (Node *)&label_column,
+						   (Node *)&label_function,
+						   (Node *)&label_database };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned skip = 0; skip < 2; skip++) {
 			reset_create_preflight();
 			utility_expect_binding = true;
+			label_table.label = skip ? NULL : "table_label";
+			label_column.label = skip ? "column_label" : NULL;
+			label_function.label = skip ? NULL : "routine_label";
+			label_database.label = skip ? "database_label" : NULL;
+			label_table.provider = label_function.provider = skip ? NULL : "g_label_provider";
+			label_column.provider = label_database.provider = skip ? "g_label_provider" : NULL;
 			database_template_value.sval = skip ? "true" : "false";
 			database_allow_value.sval = skip ? "false" : "true";
 			database_limit_value.ival = skip ? -1 : 100;
@@ -2475,6 +2514,31 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 	AlterTableSpaceOptionsStmt tablespace_options = { .type = T_AlterTableSpaceOptionsStmt,
 													  .tablespacename = "g_preflight_tablespace",
 													  .options = &tablespace_option_list };
+	String label_name = { .type = T_String, .sval = "label_target" };
+	String label_column_name = { .type = T_String, .sval = "label_column" };
+	ListCell label_name_cell = { .ptr_value = &label_name };
+	List label_names
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &label_name_cell };
+	ListCell label_column_cells[2]
+		= { { .ptr_value = &label_name }, { .ptr_value = &label_column_name } };
+	List label_column_names
+		= { .type = T_List, .length = 2, .max_length = 2, .elements = label_column_cells };
+	ObjectWithArgs label_routine = { .type = T_ObjectWithArgs, .objname = &label_names };
+	SecLabelStmt label_table = { .type = T_SecLabelStmt,
+								 .objtype = OBJECT_TABLE,
+								 .object = (Node *)&label_names,
+								 .provider = "g_label_provider",
+								 .label = "table_label" };
+	SecLabelStmt label_column = { .type = T_SecLabelStmt,
+								  .objtype = OBJECT_COLUMN,
+								  .object = (Node *)&label_column_names };
+	SecLabelStmt label_function = { .type = T_SecLabelStmt,
+									.objtype = OBJECT_FUNCTION,
+									.object = (Node *)&label_routine,
+									.provider = "g_label_provider",
+									.label = "routine_label" };
+	SecLabelStmt label_database
+		= { .type = T_SecLabelStmt, .objtype = OBJECT_DATABASE, .object = (Node *)&label_name };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -2554,7 +2618,11 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 						   (Node *)&owner_tablespace,
 						   (Node *)&database_flags,
 						   (Node *)&database_limit,
-						   (Node *)&tablespace_options };
+						   (Node *)&tablespace_options,
+						   (Node *)&label_table,
+						   (Node *)&label_column,
+						   (Node *)&label_function,
+						   (Node *)&label_database };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		int caught;
@@ -2566,6 +2634,10 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 			create_sql_entry(statements[i]);
 		UT_ASSERT(caught);
 		UT_ASSERT_EQ(error_code, ERRCODE_DATA_CORRUPTED);
+		if (IsA(statements[i], SecLabelStmt))
+			UT_ASSERT(strcmp(error_message,
+							 "canonical ACTIVE publication failed before shared catalog alteration")
+					  == 0);
 		UT_ASSERT_EQ(utility_xids, 1);
 		UT_ASSERT_EQ(utility_prepares, 1);
 		UT_ASSERT_EQ(utility_binds, 0);
@@ -2878,6 +2950,31 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 	AlterTableSpaceOptionsStmt tablespace_options = { .type = T_AlterTableSpaceOptionsStmt,
 													  .tablespacename = "g_preflight_tablespace",
 													  .options = &tablespace_option_list };
+	String label_name = { .type = T_String, .sval = "label_target" };
+	String label_column_name = { .type = T_String, .sval = "label_column" };
+	ListCell label_name_cell = { .ptr_value = &label_name };
+	List label_names
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &label_name_cell };
+	ListCell label_column_cells[2]
+		= { { .ptr_value = &label_name }, { .ptr_value = &label_column_name } };
+	List label_column_names
+		= { .type = T_List, .length = 2, .max_length = 2, .elements = label_column_cells };
+	ObjectWithArgs label_routine = { .type = T_ObjectWithArgs, .objname = &label_names };
+	SecLabelStmt label_table = { .type = T_SecLabelStmt,
+								 .objtype = OBJECT_TABLE,
+								 .object = (Node *)&label_names,
+								 .provider = "g_label_provider",
+								 .label = "table_label" };
+	SecLabelStmt label_column = { .type = T_SecLabelStmt,
+								  .objtype = OBJECT_COLUMN,
+								  .object = (Node *)&label_column_names };
+	SecLabelStmt label_function = { .type = T_SecLabelStmt,
+									.objtype = OBJECT_FUNCTION,
+									.object = (Node *)&label_routine,
+									.provider = "g_label_provider",
+									.label = "routine_label" };
+	SecLabelStmt label_database
+		= { .type = T_SecLabelStmt, .objtype = OBJECT_DATABASE, .object = (Node *)&label_name };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -2957,7 +3054,11 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 						   (Node *)&owner_tablespace,
 						   (Node *)&database_flags,
 						   (Node *)&database_limit,
-						   (Node *)&tablespace_options };
+						   (Node *)&tablespace_options,
+						   (Node *)&label_table,
+						   (Node *)&label_column,
+						   (Node *)&label_function,
+						   (Node *)&label_database };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned child = 0; child < 2; child++) {
@@ -2975,6 +3076,10 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 			UT_ASSERT(caught);
 			UT_ASSERT_EQ(error_code,
 						 child ? ERRCODE_FEATURE_NOT_SUPPORTED : ERRCODE_INTERNAL_ERROR);
+			if (child && IsA(statements[i], SecLabelStmt))
+				UT_ASSERT(strcmp(error_message,
+								 "shared catalog alteration does not support subtransactions")
+						  == 0);
 			UT_ASSERT_EQ(utility_xids, 0);
 			UT_ASSERT_EQ(utility_prepares, 0);
 			UT_ASSERT_EQ(utility_after_preflight, 0);
@@ -3287,6 +3392,31 @@ UT_TEST(test_catalog_writes_preflight_requires_shared_catalog_storage)
 	AlterTableSpaceOptionsStmt tablespace_options = { .type = T_AlterTableSpaceOptionsStmt,
 													  .tablespacename = "g_preflight_tablespace",
 													  .options = &tablespace_option_list };
+	String label_name = { .type = T_String, .sval = "label_target" };
+	String label_column_name = { .type = T_String, .sval = "label_column" };
+	ListCell label_name_cell = { .ptr_value = &label_name };
+	List label_names
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &label_name_cell };
+	ListCell label_column_cells[2]
+		= { { .ptr_value = &label_name }, { .ptr_value = &label_column_name } };
+	List label_column_names
+		= { .type = T_List, .length = 2, .max_length = 2, .elements = label_column_cells };
+	ObjectWithArgs label_routine = { .type = T_ObjectWithArgs, .objname = &label_names };
+	SecLabelStmt label_table = { .type = T_SecLabelStmt,
+								 .objtype = OBJECT_TABLE,
+								 .object = (Node *)&label_names,
+								 .provider = "g_label_provider",
+								 .label = "table_label" };
+	SecLabelStmt label_column = { .type = T_SecLabelStmt,
+								  .objtype = OBJECT_COLUMN,
+								  .object = (Node *)&label_column_names };
+	SecLabelStmt label_function = { .type = T_SecLabelStmt,
+									.objtype = OBJECT_FUNCTION,
+									.object = (Node *)&label_routine,
+									.provider = "g_label_provider",
+									.label = "routine_label" };
+	SecLabelStmt label_database
+		= { .type = T_SecLabelStmt, .objtype = OBJECT_DATABASE, .object = (Node *)&label_name };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -3366,7 +3496,11 @@ UT_TEST(test_catalog_writes_preflight_requires_shared_catalog_storage)
 						   (Node *)&owner_tablespace,
 						   (Node *)&database_flags,
 						   (Node *)&database_limit,
-						   (Node *)&tablespace_options };
+						   (Node *)&tablespace_options,
+						   (Node *)&label_table,
+						   (Node *)&label_column,
+						   (Node *)&label_function,
+						   (Node *)&label_database };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned mode = 0; mode < 8; mode++) {
@@ -3688,6 +3822,31 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 	AlterTableSpaceOptionsStmt tablespace_options = { .type = T_AlterTableSpaceOptionsStmt,
 													  .tablespacename = "g_preflight_tablespace",
 													  .options = &tablespace_option_list };
+	String label_name = { .type = T_String, .sval = "label_target" };
+	String label_column_name = { .type = T_String, .sval = "label_column" };
+	ListCell label_name_cell = { .ptr_value = &label_name };
+	List label_names
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &label_name_cell };
+	ListCell label_column_cells[2]
+		= { { .ptr_value = &label_name }, { .ptr_value = &label_column_name } };
+	List label_column_names
+		= { .type = T_List, .length = 2, .max_length = 2, .elements = label_column_cells };
+	ObjectWithArgs label_routine = { .type = T_ObjectWithArgs, .objname = &label_names };
+	SecLabelStmt label_table = { .type = T_SecLabelStmt,
+								 .objtype = OBJECT_TABLE,
+								 .object = (Node *)&label_names,
+								 .provider = "g_label_provider",
+								 .label = "table_label" };
+	SecLabelStmt label_column = { .type = T_SecLabelStmt,
+								  .objtype = OBJECT_COLUMN,
+								  .object = (Node *)&label_column_names };
+	SecLabelStmt label_function = { .type = T_SecLabelStmt,
+									.objtype = OBJECT_FUNCTION,
+									.object = (Node *)&label_routine,
+									.provider = "g_label_provider",
+									.label = "routine_label" };
+	SecLabelStmt label_database
+		= { .type = T_SecLabelStmt, .objtype = OBJECT_DATABASE, .object = (Node *)&label_name };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -3767,7 +3926,11 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 						   (Node *)&owner_tablespace,
 						   (Node *)&database_flags,
 						   (Node *)&database_limit,
-						   (Node *)&tablespace_options };
+						   (Node *)&tablespace_options,
+						   (Node *)&label_table,
+						   (Node *)&label_column,
+						   (Node *)&label_function,
+						   (Node *)&label_database };
 	const char *tags[] = { "CREATE SCHEMA",
 						   "CREATE SEQUENCE",
 						   "CREATE INDEX",
@@ -3847,7 +4010,11 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 						   "ALTER TABLESPACE",
 						   "ALTER DATABASE",
 						   "ALTER DATABASE",
-						   "ALTER TABLESPACE" };
+						   "ALTER TABLESPACE",
+						   "SECURITY LABEL",
+						   "SECURITY LABEL",
+						   "SECURITY LABEL",
+						   "SECURITY LABEL" };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned parallel = 0; parallel < 2; parallel++) {
@@ -4208,10 +4375,66 @@ UT_TEST(test_database_move_keeps_native_path_without_binding)
 	}
 }
 
+UT_TEST(test_unsupported_security_labels_refuse_before_binding)
+{
+	String target = { .type = T_String, .sval = "label_target" };
+	ListCell target_cell = { .ptr_value = &target };
+	List names = { .type = T_List, .length = 1, .max_length = 1, .elements = &target_cell };
+	TypeName type_name = { .type = T_TypeName, .names = &names, .typemod = -1, .location = -1 };
+	SecLabelStmt materialized
+		= { .type = T_SecLabelStmt, .objtype = OBJECT_MATVIEW, .object = (Node *)&names };
+	SecLabelStmt type_label
+		= { .type = T_SecLabelStmt, .objtype = OBJECT_TYPE, .object = (Node *)&type_name };
+	SecLabelStmt domain_label
+		= { .type = T_SecLabelStmt, .objtype = OBJECT_DOMAIN, .object = (Node *)&type_name };
+	SecLabelStmt *labels[] = { &materialized, &type_label, &domain_label };
+	const char *messages[] = { "materialized views is not supported in shared mode",
+							   "custom types is not supported in shared mode",
+							   "custom types is not supported in shared mode" };
+	ListCell child_cell = { .ptr_value = &materialized };
+	List children = { .type = T_List, .length = 1, .max_length = 1, .elements = &child_cell };
+	CreateSchemaStmt schema = { .type = T_CreateSchemaStmt, .schemaElts = &children };
+
+	/* Nested schema is a raw support-recursion input, not parsed label SQL. */
+	for (unsigned mode = 0; mode < 8; mode++) {
+		for (unsigned kind = 0; kind < lengthof(labels); kind++) {
+			for (unsigned remove = 0; remove < 2; remove++) {
+				labels[kind]->provider = remove ? NULL : "g_label_provider";
+				labels[kind]->label = remove ? NULL : "new_label";
+				child_cell.ptr_value = labels[kind];
+				for (unsigned child = 0; child < 2; child++) {
+					for (unsigned nested = 0; nested < 2; nested++) {
+						int caught;
+						Node *statement = nested ? (Node *)&schema : (Node *)labels[kind];
+
+						reset_create_preflight();
+						cluster_shared_catalog = (mode & 1) != 0;
+						utility_storage_mode = (mode & 2) != 0;
+						cluster_shared_config = (mode & 4) != 0;
+						utility_in_child = child != 0;
+						caught = sigsetjmp(boundary, 1);
+						if (!caught)
+							create_sql_entry(statement);
+						UT_ASSERT_EQ(caught != 0, (mode & 5) != 0);
+						if (caught) {
+							UT_ASSERT_EQ(error_code, ERRCODE_FEATURE_NOT_SUPPORTED);
+							UT_ASSERT(strcmp(error_message, messages[kind]) == 0);
+						}
+						UT_ASSERT_EQ(utility_xids, 0);
+						UT_ASSERT_EQ(utility_prepares, 0);
+						UT_ASSERT_EQ(utility_binds, 0);
+						UT_ASSERT_EQ(utility_after_preflight, (mode & 5) == 0);
+					}
+				}
+			}
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(50);
+	UT_PLAN(51);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -4262,6 +4485,7 @@ main(void)
 	UT_RUN(test_undo_tablespace_owner_refuses_before_binding);
 	UT_RUN(test_undo_tablespace_options_refuses_before_binding);
 	UT_RUN(test_database_move_keeps_native_path_without_binding);
+	UT_RUN(test_unsupported_security_labels_refuse_before_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
