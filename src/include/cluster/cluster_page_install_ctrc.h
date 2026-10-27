@@ -122,7 +122,8 @@ typedef enum RfPageCtrcStepPhaseV1 {
 	RF_PAGE_CTRC_STEP_REFUSED = 0,
 	RF_PAGE_CTRC_STEP_WAIT,
 	RF_PAGE_CTRC_STEP_UNCHANGED,
-	RF_PAGE_CTRC_STEP_TARGET_SYNCED
+	RF_PAGE_CTRC_STEP_TARGET_SYNCED,
+	RF_PAGE_CTRC_STEP_FPI_DURABLE
 } RfPageCtrcStepPhaseV1;
 
 typedef struct RfPageCtrcStepResultV1 {
@@ -164,6 +165,22 @@ extern RfPageCtrcStepResultV1 rf_page_recovery_ctrc_replays_itl_step_smgr_v1(
  * storage immutable/disjoint through return; refusal never authorizes redo
  * over a predecessor, discharge or a second pending insertion. */
 extern RfPageCtrcStepResultV1 rf_page_recovery_ctrc_replays_itl_graph_step_smgr_v1(
+	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work,
+	const struct ClusterRecoveryCtrcReplaySetSourceV1 *source,
+	RfPageCtrcAuthorityV1 *authority, const struct ClusterSpaceIdentity *space,
+	BlockNumber blockno, const RfPageVersionV1 *expected_before, const char canonical[BLCKSZ],
+	const struct ClusterRecoveryUndoEntry *physical, Size physical_count, Size memory_budget);
+
+/* Opt in to recording the original FPI DURABLE before releasing the same raw
+ * descriptors and private snapshots used for sync/full postread. Revalidate
+ * full original custody, installed writer, flush/range and target identity on
+ * both sides of that transition. FPI_DURABLE retains the window and every
+ * first/pin/companion/IR/WALR obligation; it never clears a window or supplies
+ * service completion. Close failure or late loss refuses and marks the exact
+ * window failed even after DURABLE. A saved result is not a held-FD proof for
+ * later discharge. The two older step entries retain TARGET_SYNCED semantics.
+ * All original budget, immutable-input, PAGE and ERROR contracts still apply. */
+extern RfPageCtrcStepResultV1 rf_page_recovery_ctrc_replays_itl_graph_durable_smgr_v1(
 	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work,
 	const struct ClusterRecoveryCtrcReplaySetSourceV1 *source,
 	RfPageCtrcAuthorityV1 *authority, const struct ClusterSpaceIdentity *space,

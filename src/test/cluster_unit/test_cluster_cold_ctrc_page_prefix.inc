@@ -26,6 +26,8 @@ static unsigned prefix_steps, prefix_proofs, prefix_pages, prefix_destroyed;
 static unsigned prefix_proof_token, prefix_page_token;
 static uint32 prefix_source_ordinal;
 static bool prefix_error, prefix_wait, prefix_unchanged, prefix_bad_physical, prefix_insert_refuse;
+static bool prefix_legacy_synced;
+static unsigned prefix_durable_steps;
 static void (*prefix_callback)(void);
 
 static void
@@ -34,6 +36,7 @@ page_prefix_fixture_reset(void)
  prefix_count = prefix_steps = prefix_proofs = prefix_pages = prefix_destroyed = 0;
  prefix_source_ordinal = 0;
  prefix_error = prefix_wait = prefix_unchanged = prefix_bad_physical = prefix_insert_refuse = false;
+ prefix_legacy_synced = false; prefix_durable_steps = 0;
  prefix_callback = NULL;
  memset(prefix_targets, 0, sizeof(prefix_targets));
  memset(prefix_graph, 0, sizeof(prefix_graph));
@@ -120,6 +123,23 @@ rf_page_recovery_ctrc_replays_itl_graph_step_smgr_v1(const struct ClusterRecover
  result.inserted.window.key.window_seq = 311;
  result.inserted.record_start = 40000; result.inserted.record_end = 40128;
  result.inserted.wal_flushed = true;
+ return result;
+}
+
+/* The production caller opts into same-executor physical completion. The
+ * old step leaf remains intact for its independent TARGET_SYNCED contract. */
+RfPageCtrcStepResultV1
+rf_page_recovery_ctrc_replays_itl_graph_durable_smgr_v1(const struct ClusterRecoveryStartV1 *start,
+ const ClusterColdCtrcWorkV1 *work, const ClusterRecoveryCtrcReplaySetSourceV1 *source,
+ RfPageCtrcAuthorityV1 *authority, const ClusterSpaceIdentity *space, BlockNumber block,
+ const RfPageVersionV1 *before, const char canonical[BLCKSZ],
+ const ClusterRecoveryUndoEntry *physical, Size count, Size budget)
+{
+ RfPageCtrcStepResultV1 result = rf_page_recovery_ctrc_replays_itl_graph_step_smgr_v1(
+  start, work, source, authority, space, block, before, canonical, physical, count, budget);
+ prefix_durable_steps++;
+ if (result.phase == RF_PAGE_CTRC_STEP_TARGET_SYNCED && !prefix_legacy_synced)
+  result.phase = RF_PAGE_CTRC_STEP_FPI_DURABLE;
  return result;
 }
 
@@ -212,6 +232,35 @@ UT_TEST(test_startup_page_prefix_repeat_retains_exact_pending_result)
  UT_ASSERT_EQ(cluster_recovery_cold_start->ctrc_page_progress->next_target, 0);
  UT_ASSERT(memcmp(&saved, &cluster_recovery_cold_start->ctrc_page_progress->result, sizeof(saved)) == 0);
  UT_ASSERT_EQ(window_region.checkpoint_owner.ctrc_accepted_generation, 0);
+ UT_ASSERT_EQ(observation_scope_releases + observation_census_destroys, 0);
+}
+
+UT_TEST(test_startup_page_prefix_durable_retains_window_and_service_debt)
+{
+ RfPageCtrcStepResultV1 saved;
+ prefix_ready();
+ UT_ASSERT(ClusterColdRecoveryCtrcPageAdvance(info.cluster_tx_start, 1024 * 1024));
+ saved = cluster_recovery_cold_start->ctrc_page_progress->result;
+ UT_ASSERT_EQ(saved.phase, RF_PAGE_CTRC_STEP_FPI_DURABLE); UT_ASSERT_EQ(prefix_durable_steps, 1);
+ UT_ASSERT(cluster_recovery_cold_start->ctrc_page_progress->pending);
+ UT_ASSERT_EQ(cluster_recovery_cold_start->ctrc_page_progress->next_target, 0);
+ UT_ASSERT(ClusterColdRecoveryCtrcPageAdvance(info.cluster_tx_start, 0));
+ UT_ASSERT_EQ(prefix_durable_steps, 1); UT_ASSERT_EQ(prefix_steps, 1);
+ UT_ASSERT(memcmp(&saved, &cluster_recovery_cold_start->ctrc_page_progress->result, sizeof(saved)) == 0);
+ UT_ASSERT_EQ(window_region.checkpoint_owner.ctrc_accepted_generation, 0);
+ UT_ASSERT_EQ(observation_scope_releases + observation_census_destroys, 0);
+}
+
+UT_TEST(test_startup_page_prefix_legacy_synced_cannot_supply_durable)
+{
+ prefix_ready(); prefix_legacy_synced = true;
+ UT_ASSERT(!ClusterColdRecoveryCtrcPageAdvance(info.cluster_tx_start, 1024 * 1024));
+ UT_ASSERT_EQ(prefix_durable_steps, 1); UT_ASSERT_EQ(prefix_steps, 1);
+ UT_ASSERT(cluster_recovery_cold_start->ctrc_page_progress->pending);
+ UT_ASSERT_EQ(cluster_recovery_cold_start->ctrc_page_progress->result.phase, RF_PAGE_CTRC_STEP_TARGET_SYNCED);
+ UT_ASSERT(!ClusterColdRecoveryTxCurrent(info.cluster_tx_start));
+ UT_ASSERT(!ClusterColdRecoveryCtrcPageAdvance(info.cluster_tx_start, 0));
+ UT_ASSERT_EQ(prefix_steps, 1); UT_ASSERT_EQ(window_region.checkpoint_owner.ctrc_accepted_generation, 0);
  UT_ASSERT_EQ(observation_scope_releases + observation_census_destroys, 0);
 }
 
