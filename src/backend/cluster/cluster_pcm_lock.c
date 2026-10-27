@@ -750,6 +750,9 @@ typedef struct ClusterPcmResourceXMasterState {
 	uint32 pending_s_bitmap;
 	uint32 pending_s_reserved;
 	ClusterPcmPendingS pending_s[RESOURCE_X_PROTOCOL_NODE_LIMIT];
+	/* Knowledge from the original grant owner, not a second authority or PI
+	 * obligation. Unknown legacy grants have an entirely zero record. */
+	ResourceXHolderGrantProvenance holder_grants[RESOURCE_X_PROTOCOL_NODE_LIMIT];
 } ClusterPcmResourceXMasterState;
 
 StaticAssertDecl(sizeof(ClusterPcmResourceXMasterRequest) == 352,
@@ -774,7 +777,7 @@ StaticAssertDecl(sizeof(ClusterPcmResourceXRequesterJoin) == 9120,
 				 "Resource-X requester join layout must remain 9120 bytes");
 StaticAssertDecl(sizeof(ClusterPcmResourceXDeferredSettlement) == 160,
 				 "Resource-X deferred settlement must remain bounded");
-StaticAssertDecl(sizeof(ClusterPcmResourceXMasterState) == 53552,
+StaticAssertDecl(sizeof(ClusterPcmResourceXMasterState) == 54832,
 				 "D4 Resource-X master state must bind object generation");
 
 typedef struct ClusterPcmShared {
@@ -1838,6 +1841,100 @@ pcm_resource_x_proof_digest_tag(uint64 digest, const BufferTag *tag)
 	return pcm_resource_x_proof_digest_u64(digest, (uint64)tag->blockNum);
 }
 
+/* Provenance is subordinate to the original directory. An unproved legacy
+ * holder remains UNKNOWN, never a boot sampled from today's membership. */
+static bool
+pcm_resource_x_holder_grants_valid_locked(struct GrdEntry *entry,
+										 const ClusterPcmResourceXMasterState *state)
+{
+	static const ResourceXHolderGrantProvenance empty;
+	PcmState mode = (PcmState)pg_atomic_read_u32(&entry->master_state);
+	uint32 holders = mode == PCM_STATE_S ? pg_atomic_read_u32(&entry->s_holders_bitmap) : 0;
+
+	if (state == NULL)
+		return false;
+	if (mode == PCM_STATE_X && entry->x_holder_node >= 0
+		&& entry->x_holder_node < RESOURCE_X_PROTOCOL_NODE_LIMIT)
+		holders = UINT32_C(1) << entry->x_holder_node;
+	for (int node = 0; node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++) {
+		const ResourceXHolderGrantProvenance *grant = &state->holder_grants[node];
+
+		if (memcmp(grant, &empty, sizeof(*grant)) == 0)
+			continue;
+		if ((holders & (UINT32_C(1) << node)) == 0 || grant->boot_incarnation == 0
+			|| grant->boot_incarnation == UINT64_MAX || grant->grant_generation == 0
+			|| grant->grant_generation == UINT64_MAX
+			|| grant->grant_generation > state->authority_generation
+			|| grant->resource_formation == 0 || grant->resource_formation == UINT64_MAX
+			|| grant->master_session_incarnation == 0
+			|| grant->master_session_incarnation == UINT64_MAX || grant->master_node < 0
+			|| grant->master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT || grant->reserved != 0
+			|| (node == grant->master_node
+				&& grant->boot_incarnation != grant->master_session_incarnation))
+			return false;
+	}
+	return true;
+}
+
+static void
+pcm_resource_x_holder_grants_digest_locked(const ClusterPcmResourceXMasterState *state,
+										  uint64 *digest)
+{
+	for (int node = 0; node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++) {
+		const ResourceXHolderGrantProvenance *grant = &state->holder_grants[node];
+
+		*digest = pcm_resource_x_proof_digest_u64(*digest, grant->boot_incarnation);
+		*digest = pcm_resource_x_proof_digest_u64(*digest, grant->grant_generation);
+		*digest = pcm_resource_x_proof_digest_u64(*digest, grant->resource_formation);
+		*digest = pcm_resource_x_proof_digest_u64(*digest, grant->master_session_incarnation);
+		*digest = pcm_resource_x_proof_digest_u64(*digest, (uint64)(uint32)grant->master_node);
+		*digest = pcm_resource_x_proof_digest_u64(*digest, grant->reserved);
+	}
+}
+
+/* Called only by the original physical replacement/removal owner. Clearing
+ * knowledge does not release a grant, transport fence, PI or DATA duty. */
+static void
+pcm_resource_x_holder_grant_forget_locked(struct GrdEntry *entry, int32 node)
+{
+	ClusterPcmResourceXMasterState *state = pcm_resource_x_master_state_for_entry(entry);
+
+	if (state == NULL || node < -1 || node >= RESOURCE_X_PROTOCOL_NODE_LIMIT)
+		return;
+	if (node == -1)
+		memset(state->holder_grants, 0, sizeof(state->holder_grants));
+	else
+		memset(&state->holder_grants[node], 0, sizeof(state->holder_grants[node]));
+}
+
+/* The legacy remote request does not carry requester boot. Only the actual
+ * colocated grant's original master session proves that identity. Future
+ * conditional producers must instead bind their authenticated complete E. */
+static void
+pcm_resource_x_holder_grant_note_local_locked(struct GrdEntry *entry,
+	ClusterPcmResourceXMasterState *state, const ClusterPcmResourceXMasterRequest *request,
+	int32 requester, uint64 authority)
+{
+	ResourceXHolderGrantProvenance *grant;
+
+	if (requester < 0 || requester >= RESOURCE_X_PROTOCOL_NODE_LIMIT)
+		return;
+	grant = &state->holder_grants[requester];
+	memset(grant, 0, sizeof(*grant));
+	if (requester != cluster_node_id || cluster_gcs_lookup_master(entry->tag) != cluster_node_id
+		|| request->master_session_incarnation == 0
+		|| request->master_session_incarnation == UINT64_MAX
+		|| request->master_session_incarnation != cluster_qvotec_get_self_incarnation()
+		|| request->resource_formation == 0 || request->resource_formation == UINT64_MAX
+		|| authority == 0 || authority == UINT64_MAX)
+		return;
+	grant->boot_incarnation = request->master_session_incarnation;
+	grant->grant_generation = authority;
+	grant->resource_formation = request->resource_formation;
+	grant->master_session_incarnation = request->master_session_incarnation;
+	grant->master_node = cluster_node_id;
+}
+
 static ResourceXApplyResult
 pcm_resource_x_holder_pair_decode_locked(const ClusterPcmResourceXMasterState *state,
 										 ResourceXDecodedFrame *status_out,
@@ -2124,6 +2221,7 @@ pcm_entry_retire_eligible_locked(struct GrdEntry *entry, uint64 expected_generat
 		return false;
 	}
 	if (!pcm_read_grant_state_valid(state) || state->pending_s_bitmap != 0
+		|| !pcm_resource_x_holder_grants_valid_locked(entry, state)
 		|| state->holder_status.valid != 0 || state->holder_image.valid != 0
 		|| state->holder_pi_first.source_flags != 0 /* D S09 R-A22 */
 		|| state->holder_status_intent.slot.state != RESOURCE_X_INTENT_SLOT_EMPTY
@@ -2532,9 +2630,23 @@ pcm_resource_x_reconfig_proof_slot_locked(struct GrdEntry *entry,
 	Assert(old_residual_out != NULL);
 	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_SHARED));
 	*old_residual_out = false;
-	if (!pcm_read_grant_state_valid(state) || state->pending_s_bitmap != 0)
+	if (!pcm_read_grant_state_valid(state) || state->pending_s_bitmap != 0
+		|| !pcm_resource_x_holder_grants_valid_locked(entry, state))
 		return false;
 	digest = pcm_resource_x_proof_digest_tag(*digest_io, &entry->tag);
+	pcm_resource_x_holder_grants_digest_locked(state, &digest);
+	for (int node = 0; node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++) {
+		const ResourceXHolderGrantProvenance *grant = &state->holder_grants[node];
+
+		if (grant->boot_incarnation == 0)
+			continue;
+		if (grant->resource_formation == token->old_formation)
+			*old_residual_out = true;
+		else if (token->new_formation != 0 && grant->resource_formation == token->new_formation)
+			(*successor_count_io)++;
+		else
+			return false;
+	}
 
 	if (!pcm_resource_x_active_empty_locked(entry)) {
 		if (entry->resource_x_requester_node < 0
@@ -3387,11 +3499,28 @@ cluster_resource_x_reconfig_sweep(const ResourceXReconfigToken *token, uint32 pr
 		}
 		dead_requester_bitmap = token->dead_requester_bitmap;
 		master_state = pcm_resource_x_master_state_for_entry(entry);
-		if (!pcm_read_grant_state_valid(master_state)) {
+		if (!pcm_read_grant_state_valid(master_state)
+			|| !pcm_resource_x_holder_grants_valid_locked(entry, master_state)) {
 			LWLockRelease(&entry->entry_lock.lock);
 			pcm_resource_x_reconfig_block();
 			return pcm_resource_x_reconfig_return_release(&entry_ref, RESOURCE_X_RECONFIG_CORRUPT);
 		}
+		/* Reconfiguration retires only original-domain knowledge. Current,
+		 * source/PI and native debt still pass all original owners below. */
+		for (int node = 0; node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++) {
+			const ResourceXHolderGrantProvenance *grant = &master_state->holder_grants[node];
+
+			if (grant->boot_incarnation != 0 && grant->resource_formation != token->old_formation
+				&& (token->new_formation == 0 || grant->resource_formation != token->new_formation)) {
+				LWLockRelease(&entry->entry_lock.lock);
+				pcm_resource_x_reconfig_block();
+				return pcm_resource_x_reconfig_return_release(&entry_ref, RESOURCE_X_RECONFIG_CORRUPT);
+			}
+		}
+		for (int node = 0; node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++)
+			if (master_state->holder_grants[node].boot_incarnation != 0
+				&& master_state->holder_grants[node].resource_formation == token->old_formation)
+				pcm_resource_x_holder_grant_forget_locked(entry, node);
 		if (master_state->pending_s_bitmap != 0) {
 			for (int n = 0; n < RESOURCE_X_PROTOCOL_NODE_LIMIT; n++) {
 				uint32 bit = UINT32_C(1) << n;
@@ -4007,6 +4136,8 @@ pcm_resource_x_terminal_state_locked(struct GrdEntry *entry,
 		;
 	else
 		return pcm_protocol_refuse(diagnostic, 202, __LINE__, -1);
+	if (!pcm_resource_x_holder_grants_valid_locked(entry, state))
+		return pcm_protocol_refuse(diagnostic, 220, __LINE__, -1);
 	/* D S09 R-A22: a PENDING first record is unretired WAL responsibility. */
 	if (state->holder_pi_first.source_flags != 0)
 		return pcm_protocol_refuse(diagnostic, 203, __LINE__, -1);
@@ -4035,6 +4166,7 @@ pcm_resource_x_terminal_state_locked(struct GrdEntry *entry,
 		return pcm_protocol_refuse(diagnostic, 206, __LINE__, -1);
 
 	digest = pcm_resource_x_proof_digest_tag(*digest_io, &entry->tag);
+	pcm_resource_x_holder_grants_digest_locked(state, &digest);
 	digest = pcm_resource_x_proof_digest_u64(
 		digest, entry->resource_x_bootstrap_round.highest_attempt_floor);
 	digest = pcm_resource_x_proof_digest_u64(
@@ -6251,11 +6383,13 @@ cluster_pcm_lock_cleanup_on_node_dead(int32 dead_node)
 			= pcm_master_holder_is_valid(entry) && (int32)entry->master_holder.node_id == dead_node;
 
 		if (entry->x_holder_node == dead_node) {
+			pcm_resource_x_holder_grant_forget_locked(entry, dead_node);
 			entry->x_holder_node = -1;
 			changed = true;
 		}
 		s_bitmap = pg_atomic_read_u32(&entry->s_holders_bitmap);
 		if ((s_bitmap & dead_bit) != 0) {
+			pcm_resource_x_holder_grant_forget_locked(entry, dead_node);
 			s_bitmap &= ~dead_bit;
 			pg_atomic_write_u32(&entry->s_holders_bitmap, s_bitmap);
 			changed = true;
@@ -6354,10 +6488,12 @@ cluster_pcm_lock_clean_leave_release_all_self(uint64 leave_epoch)
 		LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
 
 		if (!cluster_shared_config && entry->x_holder_node == cluster_node_id) {
+			pcm_resource_x_holder_grant_forget_locked(entry, cluster_node_id);
 			entry->x_holder_node = -1;
 			changed = true;
 		}
 		if ((pg_atomic_read_u32(&entry->s_holders_bitmap) & self_bit) != 0) {
+			pcm_resource_x_holder_grant_forget_locked(entry, cluster_node_id);
 			pg_atomic_fetch_and_u32(&entry->s_holders_bitmap, ~self_bit);
 			changed = true;
 		}
@@ -6550,6 +6686,7 @@ cluster_gcs_block_master_rebuild_from_redeclare(BufferTag tag, uint8 held_mode, 
 			pcm_entry_ref_release(&entry_ref);
 			return false;
 		}
+		pcm_resource_x_holder_grant_forget_locked(entry, -1);
 		/* X holder is authoritative for the block (first declarer, or the same
 		 * node re-declaring). */
 		pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_X);
@@ -6569,6 +6706,7 @@ cluster_gcs_block_master_rebuild_from_redeclare(BufferTag tag, uint8 held_mode, 
 		pcm_entry_ref_release(&entry_ref);
 		return false;
 	} else {
+		pcm_resource_x_holder_grant_forget_locked(entry, source_node);
 		/* S residency: merge the bit;  raise N→S. */
 		pg_atomic_fetch_or_u32(&entry->s_holders_bitmap, holder_bit);
 		if ((PcmState)pg_atomic_read_u32(&entry->master_state) == PCM_STATE_N)
@@ -6659,6 +6797,7 @@ cluster_pcm_lock_master_take_x_after_transfer(BufferTag tag, const PcmAuthorityS
 		return PCM_X_TRANSFER_COMMIT_BAD_STATE;
 	}
 
+	pcm_resource_x_holder_grant_forget_locked(entry, -1);
 	pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_X);
 	entry->x_holder_node = cluster_node_id;
 	pg_atomic_write_u32(&entry->s_holders_bitmap, 0);
@@ -6749,6 +6888,7 @@ cluster_pcm_lock_master_grant_x_to(BufferTag tag, int32 requester_node, XLogRecP
 			pg_atomic_fetch_or_u32(&entry->pi_holders_bitmap, (uint32)1u << previous);
 		pg_atomic_fetch_add_u64(&entry->transition_count_local, 1);
 	}
+	pcm_resource_x_holder_grant_forget_locked(entry, -1);
 	pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_X);
 	entry->x_holder_node = requester_node;
 	pg_atomic_write_u32(&entry->s_holders_bitmap, 0);
@@ -7333,6 +7473,9 @@ pcm_transition_apply_internal(struct GrdEntry *entry, PcmLockTransition trans, i
 							  bool preserve_resource_x_terminal_cover)
 {
 	uint32 holder_bit;
+	uint32 previous_s_holders;
+	PcmState previous_state;
+	int32 previous_x_holder;
 
 	Assert(entry != NULL);
 	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
@@ -7357,6 +7500,9 @@ pcm_transition_apply_internal(struct GrdEntry *entry, PcmLockTransition trans, i
 						   (unsigned long long)
 							   entry->resource_x_bootstrap_round.request.assertion_sequence)));
 
+	previous_state = (PcmState)pg_atomic_read_u32(&entry->master_state);
+	previous_s_holders = pg_atomic_read_u32(&entry->s_holders_bitmap);
+	previous_x_holder = entry->x_holder_node;
 	holder_bit = (uint32)1u << (uint32)holder_node_id;
 	switch (trans) {
 	case PCM_TRANS_N_TO_S:
@@ -7461,6 +7607,30 @@ pcm_transition_apply_internal(struct GrdEntry *entry, PcmLockTransition trans, i
 						errhint("ITL cleanout (Trans-9) wires in Stage 3 AD-006 第五轮 "
 								"(spec-2.36+);  do not invoke this transition.")));
 		break;
+	}
+	/* Follow the actual physical owner, not a delayed caller's tag-level
+	 * observation. PI and source/transport records are independent. */
+	switch (trans) {
+	case PCM_TRANS_N_TO_X:
+	case PCM_TRANS_S_TO_X_UPGRADE:
+	case PCM_TRANS_X_TO_N_DOWNGRADE:
+	case PCM_TRANS_X_TO_N_RELEASE:
+		pcm_resource_x_holder_grant_forget_locked(entry, -1);
+		break;
+	case PCM_TRANS_S_TO_N_INVALIDATE:
+	case PCM_TRANS_S_TO_N_RELEASE:
+		pcm_resource_x_holder_grant_forget_locked(entry, holder_node_id);
+		break;
+	case PCM_TRANS_N_TO_S:
+		if (previous_state != PCM_STATE_S || (previous_s_holders & holder_bit) == 0)
+			pcm_resource_x_holder_grant_forget_locked(entry, holder_node_id);
+		break;
+	case PCM_TRANS_X_TO_S_DOWNGRADE:
+		if (previous_state != PCM_STATE_X || previous_x_holder != holder_node_id)
+			pcm_resource_x_holder_grant_forget_locked(entry, holder_node_id);
+		break;
+	case PCM_TRANS_S_TO_X_CLEANOUT:
+		break; /* The original unsupported transition raises before here. */
 	}
 	/* A completed node-level S conversion/revocation ends all declarations
 	 * of that local S cover.  Keep this paired with the directory transition,
@@ -7638,6 +7808,8 @@ pcm_lock_apply_gcs_transition_result(BufferTag tag, PcmLockTransition trans,
 	 * S and only gains another S holder bit.
 	 */
 	if (trans == PCM_TRANS_N_TO_S && cur == PCM_STATE_S) {
+		if ((pg_atomic_read_u32(&entry->s_holders_bitmap) & holder_bit) == 0)
+			pcm_resource_x_holder_grant_forget_locked(entry, holder_node_id);
 		pg_atomic_fetch_or_u32(&entry->s_holders_bitmap, holder_bit);
 		result = PCM_GCS_TRANSITION_APPLIED;
 		goto unlock;
@@ -7972,6 +8144,7 @@ pcm_lock_acquire_local_pinned(BufferTag tag, PcmLockMode mode, PcmAuthoritySnaps
 				if ((pg_atomic_read_u32(&entry->s_holders_bitmap) & holder_bit) != 0)
 					entry->s_holder_refcount_local++;
 				else {
+					pcm_resource_x_holder_grant_forget_locked(entry, holder_node);
 					pg_atomic_fetch_or_u32(&entry->s_holders_bitmap, holder_bit);
 					entry->s_holder_refcount_local = 1;
 				}
@@ -9836,6 +10009,8 @@ pcm_resource_x_protocol_state_locked(struct GrdEntry *entry, bool *active_out, b
 		else if (state->source_settlement.state == RESOURCE_X_SOURCE_SETTLEMENT_PENDING)
 			retained = true;
 
+		if (!pcm_resource_x_holder_grants_valid_locked(entry, state))
+			PCM_PROTOCOL_INVALID(116, -1);
 		if (!pcm_resource_x_bootstrap_queue_valid(state, &entry->tag))
 			PCM_PROTOCOL_INVALID(111, -1);
 		else if (!pcm_resource_x_bootstrap_queue_empty(state))
@@ -12833,6 +13008,8 @@ pcm_ko_local_terminal_discard_locked(struct GrdEntry *entry,
 		} else if (entry->master_holder.node_id == (uint32)cluster_node_id)
 			pcm_master_holder_set_node(entry, pcm_lowest_set_bit_node(holders));
 	}
+	if (local_current)
+		pcm_resource_x_holder_grant_forget_locked(entry, cluster_node_id);
 	if (has_pi || terminal || local_current)
 		ConditionVariableBroadcast(&entry->wait_cv);
 	return CLUSTER_PCM_PI_RELATION_EMPTY;
@@ -21248,6 +21425,7 @@ pcm_resource_x_acquire_service_snapshot_locked(struct GrdEntry *entry,
 	int32 requester = work->request.logical_assertion.requester_node;
 
 	if (state == NULL || !pcm_resource_x_bootstrap_queue_valid(state, &entry->tag)
+		|| !pcm_resource_x_holder_grants_valid_locked(entry, state)
 		|| state->authority_generation == 0 || state->authority_generation == UINT64_MAX
 		|| !pcm_read_grant_state_valid(state)
 		|| !pcm_resource_x_source_settlement_debt_decode_locked(entry, state, &settlement))
@@ -21315,6 +21493,17 @@ pcm_resource_x_acquire_service_snapshot_locked(struct GrdEntry *entry,
 		? holders & ~requester_bit : directory.state == PCM_STATE_X ? holders : 0;
 	snapshot->pi_holders_bitmap = pg_atomic_read_u32(&entry->pi_holders_bitmap);
 	snapshot->master_node = cluster_node_id;
+	for (int node = 0; node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++) {
+		const ResourceXHolderGrantProvenance *grant = &state->holder_grants[node];
+
+		if (grant->boot_incarnation == 0 || grant->master_node != cluster_node_id
+			|| grant->resource_formation != priority->request.resource_formation
+			|| grant->master_session_incarnation != priority->request.master_session_incarnation)
+			continue;
+		snapshot->holders[node].boot_incarnation = grant->boot_incarnation;
+		snapshot->holders[node].grant_generation = grant->grant_generation;
+		snapshot->known_holders_bitmap |= UINT32_C(1) << node;
+	}
 	return RESOURCE_X_APPLY_APPLIED;
 }
 
@@ -26649,6 +26838,8 @@ commit_directory:
 	request->final_authority_generation = final_authority_generation;
 	request->grant_transition_generation = pg_atomic_read_u64(&entry->transition_count_local);
 	request->phase = RESOURCE_X_MASTER_GRANT_COMMITTED;
+	pcm_resource_x_holder_grant_note_local_locked(entry, state, request, requester_node,
+		final_authority_generation);
 	return RESOURCE_X_APPLY_APPLIED;
 }
 

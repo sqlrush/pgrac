@@ -556,10 +556,9 @@ cluster_test_pcm_clock_gettime(clockid_t clock_id, struct timespec *time_out)
 
 static union {
 	uint64 force_align;
-	/* Sized above sizeof(ClusterPcmShared) plus the 17-entry Resource-X
-	 * reconfiguration fixture.  The retained holder image adds one full
-	 * page per Resource-X master state; fake ShmemInitStruct asserts fit. */
-	char data[2097152];
+	/* Cover the original 24-entry pump cohort including bounded per-holder
+	 * grant provenance. Keep the exact ShmemInitStruct fit assertion below. */
+	char data[2162688];
 } fake_pcm_header;
 
 static union {

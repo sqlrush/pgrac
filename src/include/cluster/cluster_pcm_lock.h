@@ -1246,8 +1246,24 @@ typedef struct PcmAuthoritySnapshot {
 StaticAssertDecl(sizeof(PcmAuthoritySnapshot) == 64,
 				 "PcmAuthoritySnapshot process-local layout must remain 64 bytes");
 
+/* Provenance of an original current grant, never an independent permission.
+ * All-zero means UNKNOWN. The original physical owner retires this record;
+ * fresh membership observations cannot supply the boot of an old grant. */
+typedef struct ResourceXHolderGrantProvenance {
+	uint64 boot_incarnation;
+	uint64 grant_generation;
+	uint64 resource_formation;
+	uint64 master_session_incarnation;
+	int32 master_node;
+	uint32 reserved;
+} ResourceXHolderGrantProvenance;
+
+StaticAssertDecl(sizeof(ResourceXHolderGrantProvenance) == 40,
+				 "original holder grant provenance must remain bounded");
+
 /* Process-local input to the master service, not an authority decision or
- * a source grant. Holder bitmaps do not prove holder boot/grant identities.
+ * a source grant. Only known_holders_bitmap entries have original boot/grant
+ * provenance in this domain; all other holder pairs remain zero/UNKNOWN.
  * Publication must recheck this input in the original entry owner. */
 typedef struct ResourceXAcquireServiceSnapshot {
 	ResourceXBootstrapWork work;
@@ -1260,9 +1276,12 @@ typedef struct ResourceXAcquireServiceSnapshot {
 	uint32 required_holders_bitmap;
 	uint32 pi_holders_bitmap;
 	int32 master_node;
+	ResourceXDecodedAcquireHolder holders[RESOURCE_X_PROTOCOL_NODE_LIMIT];
+	uint32 known_holders_bitmap;
+	uint32 reserved;
 } ResourceXAcquireServiceSnapshot;
 
-StaticAssertDecl(sizeof(ResourceXAcquireServiceSnapshot) == 312,
+StaticAssertDecl(sizeof(ResourceXAcquireServiceSnapshot) == 832,
 				 "acquisition service input must remain bounded and process-local");
 
 typedef enum PcmXTransferCommitResult {

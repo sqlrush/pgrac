@@ -1348,10 +1348,442 @@ UT_TEST(test_service_snapshot_unsealed_proof_is_required_for_entire_canonical)
 	}
 }
 
+/* Actual master grant, transport completion and settlement owners. The old
+ * wire lacks a remote requester boot; only a colocated original session can
+ * produce known provenance before the complete conditional producer exists. */
+static void
+provenance_grant(int32 node)
+{
+	BufferTag tag = make_tag(850);
+	ResourceXDecodedFrame assertion, settlement;
+	ResourceXDurableProof durable = {0};
+	ResourceXMasterSnapshot snapshot;
+	ResourceXIntentSlot intent;
+	uint8 payload[RESOURCE_X_PROOF_V1_BYTES];
+
+	acquire_reset();
+	cluster_shared_config = true;
+	assertion = make_resource_x_master_frame(RESOURCE_X_WIRE_ASSERT_X, tag, node, node);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_exact(&assertion, node, &snapshot),
+		RESOURCE_X_APPLY_APPLIED);
+	durable.assertion = assertion.common.logical_assertion;
+	durable.base_authority_generation = 1;
+	durable.resource_formation = 17;
+	durable.master_session_incarnation = 31;
+	durable.assertion_sequence = 41;
+	durable.requester_target_generation = 41;
+	durable.page_scn_lsn = 82;
+	durable.page_checksum = UINT32_C(0x12345678);
+	durable.source_proof_crc32c = UINT32_C(0x87654321);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_durable_proof_exact(&durable, &snapshot),
+		RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_grant_intent_snapshot_exact(
+		&assertion.common.logical_assertion, &intent, payload, sizeof(payload)), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_grant_intent_stage_exact(&intent,
+		intent.first_armed_us + 1), RESOURCE_X_INTENT_STAGED);
+	UT_ASSERT(cluster_pcm_lock_resource_x_grant_intent_complete_exact(&intent));
+	settlement = make_resource_x_master_frame(RESOURCE_X_WIRE_INSTALL_SETTLEMENT, tag, node, node);
+	settlement.common.outcome = RESOURCE_X_OUTCOME_OK;
+	settlement.common.authority_generation = 2;
+	settlement.body.install_settlement.conversion_base_generation = 1;
+	settlement.body.install_settlement.final_authority_generation = 2;
+	settlement.body.install_settlement.requester_connection_generation = 91;
+	settlement.body.install_settlement.requester_target_generation = 41;
+	settlement.body.install_settlement.page_scn_lsn = 82;
+	settlement.body.install_settlement.page_checksum = UINT32_C(0x12345678);
+	settlement.body.install_settlement.source_proof_crc32c = UINT32_C(0x87654321);
+	settlement.body.install_settlement.installed_mode = PCM_STATE_X;
+	settlement.body.install_settlement.requester_role = RESOURCE_X_REQUESTER_ROLE_ACQUIRER;
+	settlement.body.install_settlement.terminal_outcome = RESOURCE_X_OUTCOME_OK;
+	settlement.body.install_settlement.terminal_state = RESOURCE_X_SETTLEMENT_TERMINAL_INSTALLED;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_install_settlement_exact(&settlement, node, &snapshot),
+		RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_SETTLED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_settled_retire_exact(
+		&assertion.common.logical_assertion, 41, &snapshot), RESOURCE_X_APPLY_APPLIED);
+}
+
+static bool
+provenance_start(int32 node, ResourceXDecodedFrame *frame, ResourceXBootstrapWork *work)
+{
+	provenance_grant(node);
+	*frame = acquire_frame(1, RESOURCE_X_ACQUIRE_RESIDENT, PCM_STATE_N, PCM_STATE_X);
+	return acquire_canonical_start(frame, work);
+}
+
+static ResourceXAcquireServiceSnapshot
+provenance_snapshot(const ResourceXBootstrapWork *work)
+{
+	ResourceXAcquireServiceSnapshot out = {0};
+
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_service_snapshot_exact(work, NULL, &out),
+		RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	return out;
+}
+
+static ResourceXHolderGrantProvenance *
+provenance_original_record(void)
+{
+	ResourceXHolderGrantProvenance expected = {31, 2, 17, 31, 0, 0};
+	ResourceXHolderGrantProvenance *record = NULL;
+	unsigned char *memory = (unsigned char *)fake_pcm_header.data;
+	Size matches = 0;
+
+	/* Inspect the actual bounded shared owner using its real public type.
+	 * This is fault injection only, not a duplicate product layout/producer. */
+	for (Size n = 0; n + sizeof(expected) <= fake_pcm_header_requested_size; n += 8)
+		if (memcmp(memory + n, &expected, sizeof(expected)) == 0) {
+			record = (ResourceXHolderGrantProvenance *)(memory + n);
+			matches++;
+		}
+	UT_ASSERT_EQ(matches, 1);
+	return matches == 1 ? record : NULL;
+}
+
+UT_TEST(test_provenance_original_local_grant_is_known)
+{
+	ResourceXDecodedFrame frame;
+	ResourceXBootstrapWork work;
+	ResourceXAcquireServiceSnapshot out;
+	if (!provenance_start(0, &frame, &work)) return;
+	out = provenance_snapshot(&work);
+	UT_ASSERT_EQ(out.current_holders_bitmap, 1);
+	UT_ASSERT_EQ(out.known_holders_bitmap, 1);
+	UT_ASSERT_EQ(out.holders[0].boot_incarnation, 31);
+	UT_ASSERT_EQ(out.holders[0].grant_generation, 2);
+	for (int node = 1; node < 32; node++) {
+		UT_ASSERT_EQ(out.holders[node].boot_incarnation, 0);
+		UT_ASSERT_EQ(out.holders[node].grant_generation, 0);
+	}
+	UT_ASSERT_EQ(out.reserved, 0);
+}
+
+UT_TEST(test_provenance_old_remote_grant_never_uses_fresh_peer_boot)
+{
+	ResourceXDecodedFrame frame;
+	ResourceXBootstrapWork work;
+	ResourceXAcquireServiceSnapshot out;
+	if (!provenance_start(2, &frame, &work)) return;
+	out = provenance_snapshot(&work);
+	UT_ASSERT_EQ(out.current_holders_bitmap, 4);
+	UT_ASSERT_EQ(out.known_holders_bitmap, 0);
+	UT_ASSERT_EQ(out.holders[2].boot_incarnation, 0);
+	UT_ASSERT_EQ(out.holders[2].grant_generation, 0);
+	UT_ASSERT_EQ(auth_peer_boot, 101);
+}
+
+UT_TEST(test_provenance_tag_only_local_grant_is_unknown)
+{
+	ResourceXDecodedFrame frame;
+	ResourceXBootstrapWork work;
+	ResourceXAcquireServiceSnapshot out;
+	if (!service_snapshot_start(PCM_STATE_N, PCM_STATE_X, &frame, &work)) return;
+	service_directory_transition(PCM_TRANS_N_TO_X, 0);
+	out = provenance_snapshot(&work);
+	UT_ASSERT_EQ(out.current_holders_bitmap, 1);
+	UT_ASSERT_EQ(out.known_holders_bitmap, 0);
+	UT_ASSERT_EQ(out.holders[0].boot_incarnation, 0);
+}
+
+UT_TEST(test_provenance_exact_x_to_s_preserves_original_grant)
+{
+	ResourceXDecodedFrame frame;
+	ResourceXBootstrapWork work;
+	ResourceXAcquireServiceSnapshot before, out;
+	if (!provenance_start(0, &frame, &work)) return;
+	before = provenance_snapshot(&work);
+	service_directory_transition(PCM_TRANS_X_TO_S_DOWNGRADE, 0);
+	out = provenance_snapshot(&work);
+	UT_ASSERT_EQ(out.directory.state, PCM_STATE_S);
+	UT_ASSERT_EQ(out.known_holders_bitmap, 1);
+	UT_ASSERT(memcmp(&out.holders[0], &before.holders[0], sizeof(out.holders[0])) == 0);
+	UT_ASSERT_EQ(out.pi_holders_bitmap, 1);
+}
+
+UT_TEST(test_provenance_compatible_s_join_does_not_erase_other_holder)
+{
+	ResourceXDecodedFrame frame;
+	ResourceXBootstrapWork work;
+	ResourceXAcquireServiceSnapshot out;
+	if (!provenance_start(0, &frame, &work)) return;
+	service_directory_transition(PCM_TRANS_X_TO_S_DOWNGRADE, 0);
+	service_directory_transition(PCM_TRANS_N_TO_S, 2);
+	out = provenance_snapshot(&work);
+	UT_ASSERT_EQ(out.current_holders_bitmap, 5);
+	UT_ASSERT_EQ(out.known_holders_bitmap, 1);
+	UT_ASSERT_EQ(out.holders[0].grant_generation, 2);
+	UT_ASSERT_EQ(out.holders[2].boot_incarnation, 0);
+	service_directory_transition(PCM_TRANS_S_TO_N_RELEASE, 2);
+	out = provenance_snapshot(&work);
+	UT_ASSERT_EQ(out.known_holders_bitmap, 1);
+}
+
+UT_TEST(test_provenance_s_release_retires_knowledge_but_not_pi)
+{
+	ResourceXDecodedFrame frame;
+	ResourceXBootstrapWork work;
+	ResourceXAcquireServiceSnapshot out;
+	if (!provenance_start(0, &frame, &work)) return;
+	service_directory_transition(PCM_TRANS_X_TO_S_DOWNGRADE, 0);
+	service_directory_transition(PCM_TRANS_S_TO_N_RELEASE, 0);
+	out = provenance_snapshot(&work);
+	UT_ASSERT_EQ(out.current_holders_bitmap, 0);
+	UT_ASSERT_EQ(out.known_holders_bitmap, 0);
+	UT_ASSERT_EQ(out.holders[0].boot_incarnation, 0);
+	UT_ASSERT_EQ(out.pi_holders_bitmap, 1);
+}
+
+UT_TEST(test_provenance_x_release_retires_knowledge_but_not_pi)
+{
+	ResourceXDecodedFrame frame;
+	ResourceXBootstrapWork work;
+	ResourceXAcquireServiceSnapshot out;
+	if (!provenance_start(0, &frame, &work)) return;
+	cluster_pcm_lock_pi_holder_note(frame.common.logical_assertion.resource, 0);
+	service_directory_transition(PCM_TRANS_X_TO_N_RELEASE, 0);
+	out = provenance_snapshot(&work);
+	UT_ASSERT_EQ(out.current_holders_bitmap, 0);
+	UT_ASSERT_EQ(out.known_holders_bitmap, 0);
+	UT_ASSERT_EQ(out.pi_holders_bitmap, 1);
+}
+
+UT_TEST(test_provenance_tag_upgrade_does_not_reuse_an_old_x_grant)
+{
+	ResourceXDecodedFrame frame;
+	ResourceXBootstrapWork work;
+	ResourceXAcquireServiceSnapshot out;
+	if (!provenance_start(0, &frame, &work)) return;
+	service_directory_transition(PCM_TRANS_X_TO_S_DOWNGRADE, 0);
+	service_directory_transition(PCM_TRANS_S_TO_X_UPGRADE, 0);
+	out = provenance_snapshot(&work);
+	UT_ASSERT_EQ(out.current_holders_bitmap, 1);
+	UT_ASSERT_EQ(out.known_holders_bitmap, 0);
+	UT_ASSERT_EQ(out.holders[0].grant_generation, 0);
+}
+
+UT_TEST(test_provenance_member_removal_retires_current_knowledge_only)
+{
+	ResourceXDecodedFrame frame;
+	ResourceXBootstrapWork work;
+	ResourceXAcquireServiceSnapshot out;
+	if (!provenance_start(0, &frame, &work)) return;
+	cluster_pcm_lock_pi_holder_note(frame.common.logical_assertion.resource, 0);
+	UT_ASSERT_EQ(cluster_pcm_lock_cleanup_on_node_dead(0), 1);
+	out = provenance_snapshot(&work);
+	UT_ASSERT_EQ(out.current_holders_bitmap, 0);
+	UT_ASSERT_EQ(out.known_holders_bitmap, 0);
+	UT_ASSERT_EQ(out.pi_holders_bitmap, 1);
+}
+
+UT_TEST(test_provenance_clean_leave_s_retires_only_original_node)
+{
+	ResourceXDecodedFrame frame;
+	ResourceXBootstrapWork work;
+	ResourceXHolderGrantProvenance *record;
+	static const ResourceXHolderGrantProvenance empty;
+	if (!provenance_start(0, &frame, &work)) return;
+	service_directory_transition(PCM_TRANS_X_TO_S_DOWNGRADE, 0);
+	record = provenance_original_record();
+	if (record == NULL) return;
+	UT_ASSERT_EQ(cluster_pcm_lock_clean_leave_release_all_self(19), 1);
+	UT_ASSERT(memcmp(record, &empty, sizeof(empty)) == 0);
+}
+
+UT_TEST(test_provenance_redeclare_x_cannot_recreate_original_grant_identity)
+{
+	ResourceXDecodedFrame frame;
+	ResourceXBootstrapWork work;
+	ResourceXAcquireServiceSnapshot out;
+	if (!provenance_start(0, &frame, &work)) return;
+	UT_ASSERT(cluster_gcs_block_master_rebuild_from_redeclare(frame.common.logical_assertion.resource,
+		PCM_STATE_X, 82, 91, 0, 7));
+	out = provenance_snapshot(&work);
+	UT_ASSERT_EQ(out.current_holders_bitmap, 1);
+	UT_ASSERT_EQ(out.known_holders_bitmap, 0);
+	UT_ASSERT_EQ(out.holders[0].boot_incarnation, 0);
+}
+
+UT_TEST(test_provenance_redeclare_s_cannot_reuse_same_bitmap_provenance)
+{
+	ResourceXDecodedFrame frame;
+	ResourceXBootstrapWork work;
+	ResourceXAcquireServiceSnapshot out;
+	if (!provenance_start(0, &frame, &work)) return;
+	service_directory_transition(PCM_TRANS_X_TO_S_DOWNGRADE, 0);
+	UT_ASSERT(cluster_gcs_block_master_rebuild_from_redeclare(frame.common.logical_assertion.resource,
+		PCM_STATE_S, 82, 91, 0, 7));
+	out = provenance_snapshot(&work);
+	UT_ASSERT_EQ(out.current_holders_bitmap, 1);
+	UT_ASSERT_EQ(out.known_holders_bitmap, 0);
+}
+
+UT_TEST(test_provenance_valid_old_domain_stays_unknown)
+{
+	ResourceXDecodedFrame frame;
+	ResourceXBootstrapWork work;
+	ResourceXHolderGrantProvenance *record, original;
+	ResourceXAcquireServiceSnapshot out;
+	if (!provenance_start(0, &frame, &work)) return;
+	record = provenance_original_record();
+	if (record == NULL) return;
+	original = *record;
+	for (int field = 0; field < 3; field++) {
+		*record = original;
+		if (field == 0) record->resource_formation++;
+		if (field == 1) { record->master_session_incarnation++; record->boot_incarnation++; }
+		if (field == 2) record->master_node++;
+		out = provenance_snapshot(&work);
+		UT_ASSERT_EQ(out.known_holders_bitmap, 0);
+		UT_ASSERT_EQ(out.holders[0].boot_incarnation, 0);
+	}
+	*record = original;
+	out = provenance_snapshot(&work);
+	UT_ASSERT_EQ(out.known_holders_bitmap, 1);
+}
+
+UT_TEST(test_provenance_malformed_original_record_fails_closed_unchanged)
+{
+	ResourceXDecodedFrame frame;
+	ResourceXBootstrapWork work;
+	ResourceXHolderGrantProvenance *record, original;
+	if (!provenance_start(0, &frame, &work)) return;
+	record = provenance_original_record();
+	if (record == NULL) return;
+	original = *record;
+	for (int field = 0; field < 8; field++) {
+		*record = original;
+		switch (field) {
+		case 0: record->boot_incarnation = 0; break;
+		case 1: record->boot_incarnation = UINT64_MAX; break;
+		case 2: record->grant_generation = 0; break;
+		case 3: record->grant_generation = 3; break;
+		case 4: record->resource_formation = 0; break;
+		case 5: record->master_session_incarnation = UINT64_MAX; break;
+		case 6: record->master_node = 32; break;
+		case 7: record->reserved = 1; break;
+		}
+		service_snapshot_refused(&work, NULL, RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+	}
+	*record = original;
+}
+
+UT_TEST(test_provenance_release_reacquire_same_bitmap_rejects_old_cut)
+{
+	ResourceXDecodedFrame frame;
+	ResourceXBootstrapWork work;
+	ResourceXAcquireServiceSnapshot original, out;
+	if (!provenance_start(0, &frame, &work)) return;
+	original = provenance_snapshot(&work);
+	UT_ASSERT_EQ(original.known_holders_bitmap, 1);
+	service_directory_transition(PCM_TRANS_X_TO_N_RELEASE, 0);
+	service_directory_transition(PCM_TRANS_N_TO_X, 0);
+	service_snapshot_refused(&work, &original, RESOURCE_X_APPLY_STALE);
+	out = provenance_snapshot(&work);
+	UT_ASSERT_EQ(out.current_holders_bitmap, original.current_holders_bitmap);
+	UT_ASSERT_EQ(out.known_holders_bitmap, 0);
+}
+
+UT_TEST(test_provenance_cancelled_waiter_cannot_erase_current_grant)
+{
+	ResourceXDecodedFrame frame, successor;
+	ResourceXBootstrapWork work, next;
+	ResourceXAcquireServiceSnapshot before, out;
+	if (!provenance_start(0, &frame, &work)) return;
+	before = provenance_snapshot(&work);
+	cluster_pcm_lock_resource_x_bootstrap_forget_exact(&work);
+	successor = frame;
+	successor.common.assertion_sequence++;
+	successor.body.acquire_intent.reservation_token++;
+	UT_ASSERT(acquire_canonical_start(&successor, &next));
+	cluster_pcm_lock_resource_x_bootstrap_forget_exact(&work);
+	out = provenance_snapshot(&next);
+	UT_ASSERT_EQ(out.known_holders_bitmap, 1);
+	UT_ASSERT(memcmp(&out.holders[0], &before.holders[0], sizeof(out.holders[0])) == 0);
+}
+
+UT_TEST(test_provenance_valid_current_is_not_protocol_debt_but_corruption_is)
+{
+	ResourceXHolderGrantProvenance *record, original;
+	PcmGrdProtocolDebtStats debt;
+
+	provenance_grant(0);
+	record = provenance_original_record();
+	if (record == NULL) return;
+	original = *record;
+	cluster_pcm_grd_protocol_debt_snapshot(&debt);
+	UT_ASSERT_EQ(debt.invalid_entry_count, 0);
+	UT_ASSERT_EQ(debt.active_resource_x_entry_count, 0);
+	UT_ASSERT_EQ(debt.retained_entry_count, 0);
+	record->reserved = 1;
+	cluster_pcm_grd_protocol_debt_snapshot(&debt);
+	UT_ASSERT_EQ(debt.invalid_entry_count, 1);
+	*record = original;
+	cluster_pcm_grd_protocol_debt_snapshot(&debt);
+	UT_ASSERT_EQ(debt.invalid_entry_count, 0);
+}
+
+UT_TEST(test_provenance_detached_from_current_set_cannot_supply_a_holder)
+{
+	ResourceXDecodedFrame frame;
+	ResourceXBootstrapWork work;
+	ResourceXAcquireServiceSnapshot before, after;
+	struct StopPcmEntryLayout *entry;
+
+	if (!provenance_start(0, &frame, &work)) return;
+	before = provenance_snapshot(&work);
+	UT_ASSERT_EQ(before.known_holders_bitmap, 1);
+	entry = (struct StopPcmEntryLayout *)fake_pcm_entries.data[0];
+	/* Deliberately damage only the directory in an otherwise valid X cut.
+	 * There is no production transition/cleanup proof for this replacement. */
+	entry->x_holder_node = 2;
+	entry->master_holder.node_id = 2;
+	service_snapshot_refused(&work, NULL, RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+	entry->x_holder_node = 0;
+	entry->master_holder.node_id = 0;
+	after = provenance_snapshot(&work);
+	UT_ASSERT(memcmp(&before, &after, sizeof(before)) == 0);
+}
+
+UT_TEST(test_provenance_r8_owner_retires_only_exact_old_domain_knowledge)
+{
+	static const ResourceXHolderGrantProvenance empty;
+	for (uint64 formation = 17; formation <= 19; formation++) {
+		ResourceXHolderGrantProvenance *record, original;
+		ResourceXReconfigToken token;
+		ResourceXReconfigBatch batch;
+		ResourceXReconfigResult result;
+		PcmAuthoritySnapshot before, after;
+
+		provenance_grant(0);
+		record = provenance_original_record();
+		if (record == NULL) continue;
+		record->resource_formation = formation;
+		original = *record;
+		UT_ASSERT(cluster_pcm_lock_authority_snapshot(make_tag(850), &before));
+		UT_ASSERT(cluster_resource_x_reconfig_freeze(17, 18, &token));
+		result = RESOURCE_X_RECONFIG_MORE;
+		for (int scan = 0; scan < 8 && (result == RESOURCE_X_RECONFIG_MORE
+			|| result == RESOURCE_X_RECONFIG_RETRY); scan++)
+			result = cluster_resource_x_reconfig_sweep(&token, 4, &batch);
+		if (formation == 19) {
+			UT_ASSERT_EQ(result, RESOURCE_X_RECONFIG_CORRUPT);
+			UT_ASSERT(memcmp(record, &original, sizeof(original)) == 0);
+			continue;
+		}
+		/* The old native X/terminal record remains the original ORPHAN.
+		 * Removing knowledge must not fake its release or a zero proof. */
+		UT_ASSERT_EQ(result, RESOURCE_X_RECONFIG_ORPHAN);
+		UT_ASSERT(memcmp(record, formation == 17 ? &empty : &original, sizeof(original)) == 0);
+		UT_ASSERT(cluster_pcm_lock_authority_snapshot(make_tag(850), &after));
+		UT_ASSERT(memcmp(&before, &after, sizeof(before)) == 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(48);
+	UT_PLAN(67);
 	UT_RUN(test_acquire_payload_selects_only_exact_request_length);
 	UT_RUN(test_acquire_all_ordinary_intents_queue_without_authority_or_ack);
 	UT_RUN(test_acquire_local_request_uses_self_boot_without_remote_observation);
@@ -1400,6 +1832,25 @@ main(void)
 	UT_RUN(test_service_snapshot_rechecks_master_after_entry_acquisition);
 	UT_RUN(test_service_snapshot_existing_stop_seal_does_not_create_or_strand_owner);
 	UT_RUN(test_service_snapshot_unsealed_proof_is_required_for_entire_canonical);
+	UT_RUN(test_provenance_original_local_grant_is_known);
+	UT_RUN(test_provenance_old_remote_grant_never_uses_fresh_peer_boot);
+	UT_RUN(test_provenance_tag_only_local_grant_is_unknown);
+	UT_RUN(test_provenance_exact_x_to_s_preserves_original_grant);
+	UT_RUN(test_provenance_compatible_s_join_does_not_erase_other_holder);
+	UT_RUN(test_provenance_s_release_retires_knowledge_but_not_pi);
+	UT_RUN(test_provenance_x_release_retires_knowledge_but_not_pi);
+	UT_RUN(test_provenance_tag_upgrade_does_not_reuse_an_old_x_grant);
+	UT_RUN(test_provenance_member_removal_retires_current_knowledge_only);
+	UT_RUN(test_provenance_clean_leave_s_retires_only_original_node);
+	UT_RUN(test_provenance_redeclare_x_cannot_recreate_original_grant_identity);
+	UT_RUN(test_provenance_redeclare_s_cannot_reuse_same_bitmap_provenance);
+	UT_RUN(test_provenance_valid_old_domain_stays_unknown);
+	UT_RUN(test_provenance_malformed_original_record_fails_closed_unchanged);
+	UT_RUN(test_provenance_release_reacquire_same_bitmap_rejects_old_cut);
+	UT_RUN(test_provenance_cancelled_waiter_cannot_erase_current_grant);
+	UT_RUN(test_provenance_valid_current_is_not_protocol_debt_but_corruption_is);
+	UT_RUN(test_provenance_detached_from_current_set_cannot_supply_a_holder);
+	UT_RUN(test_provenance_r8_owner_retires_only_exact_old_domain_knowledge);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
