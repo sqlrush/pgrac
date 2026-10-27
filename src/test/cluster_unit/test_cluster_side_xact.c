@@ -12551,10 +12551,20 @@ UT_TEST(test_cold_terminal_frame_refusal_preserves_pi_inspection)
 
 #include "test_cluster_side_relmap_terminal.inc"
 #include "test_cluster_side_clog_full.inc"
+#include "test_cluster_side_clog_witness.inc"
 
 int
 main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_CLOG_WITNESS") != NULL) {
+		UT_PLAN(4);
+	UT_RUN(test_clog_witness_keeps_complete_native_bytes_after_reader_reuse);
+	UT_RUN(test_clog_witness_refuses_changed_full_header_payload_and_source);
+	UT_RUN(test_clog_witness_requires_original_physical_recovery_binding);
+	UT_RUN(test_clog_witness_charges_original_budget_and_counts_complete_stream);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_CLOG_FULL_SIDE") != NULL) {
 		UT_PLAN(3);
 		UT_RUN(test_full_clog_plan_owns_all_original_birth_bytes);
@@ -12563,7 +12573,12 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(193);
+	UT_PLAN(197);
+	UT_RUN(test_clog_witness_keeps_complete_native_bytes_after_reader_reuse);
+	UT_RUN(test_clog_witness_refuses_changed_full_header_payload_and_source);
+	UT_RUN(test_clog_witness_requires_original_physical_recovery_binding);
+	UT_RUN(test_clog_witness_charges_original_budget_and_counts_complete_stream);
+
 	UT_RUN(test_full_clog_plan_owns_all_original_birth_bytes);
 	UT_RUN(test_full_clog_shape_refuses_incomplete_or_unconsumed_frame);
 	UT_RUN(test_full_clog_cold_owner_keeps_native_postread_before_projection);

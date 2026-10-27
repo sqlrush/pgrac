@@ -52,6 +52,16 @@ typedef struct SideNativeTerminalWitness {
 	uint8 payload[FLEXIBLE_ARRAY_MEMBER];
 } SideNativeTerminalWitness;
 
+/* Keep native CLOG bytes separate from the exported typed projection. Raw
+ * ZERO/TRUNCATE retain their original empty owned_payload contract. */
+typedef struct SideNativeClogWitness {
+	struct SideNativeClogWitness *next;
+	uint32 operation_index;
+	uint32 payload_length;
+	XLogRecord header;
+	uint8 payload[FLEXIBLE_ARRAY_MEMBER];
+} SideNativeClogWitness;
+
 struct RfSideOnlinePlanV1 {
 	uint32 magic;
 	bool sealed;
@@ -80,6 +90,7 @@ struct RfSideOnlinePlanV1 {
 	ClusterSpaceIdentityKey *space_targets;
 	uint32 space_target_count;
 	SideNativeTerminalWitness *native_terminals;
+	SideNativeClogWitness *native_clog;
 };
 
 /* A rejected binding cannot leave an earlier sealed view consumable. */
@@ -1288,6 +1299,31 @@ side_capture_native_terminal(RfSideOnlinePlanV1 *plan, const XLogReaderState *re
 	return true;
 }
 
+static bool
+side_capture_native_clog(RfSideOnlinePlanV1 *plan, const XLogReaderState *reader)
+{
+	uint32 length = XLogRecGetDataLen(reader);
+	Size bytes;
+	SideNativeClogWitness *witness;
+
+	if (length == 0 || XLogRecGetData(reader) == NULL
+		|| length > MaxAllocSize - offsetof(SideNativeClogWitness, payload))
+		return false;
+	bytes = offsetof(SideNativeClogWitness, payload) + (Size)length;
+	if (bytes > plan->memory_budget || !side_plan_reserve(plan, bytes))
+		return false;
+	witness = side_alloc0(bytes);
+	if (witness == NULL)
+		return false;
+	witness->operation_index = plan->operation_count;
+	witness->payload_length = length;
+	memcpy(&witness->header, &reader->record->header, SizeOfXLogRecord);
+	memcpy(witness->payload, XLogRecGetData(reader), length);
+	witness->next = plan->native_clog;
+	plan->native_clog = witness;
+	return true;
+}
+
 RfPageProofDetailV1
 rf_side_online_plan_feed_record_v1(RfSideOnlinePlanV1 *plan,
 								   const RfDetachedRecordPlanV1 *record_plan,
@@ -1343,6 +1379,13 @@ rf_side_online_plan_feed_record_v1(RfSideOnlinePlanV1 *plan,
 			&& (candidate.xact.kind == RF_SIDE_XACT_COMMIT
 				|| candidate.xact.kind == RF_SIDE_XACT_ABORT)
 			&& !side_capture_native_terminal(plan, record_plan->source_record)) {
+			(void)side_source_bind_failed(plan);
+			return RF_PAGE_PROOF_DETAIL_CAPACITY;
+		}
+		if (plan->purpose == RF_SIDE_PLAN_RECOVERY && plan->sources != NULL
+			&& candidate.kind == RF_SIDE_ONLINE_OPERATION_PROJECTION
+			&& candidate.identity.record.rmid == RM_CLOG_ID
+			&& !side_capture_native_clog(plan, record_plan->source_record)) {
 			(void)side_source_bind_failed(plan);
 			return RF_PAGE_PROOF_DETAIL_CAPACITY;
 		}
@@ -1632,6 +1675,111 @@ rf_side_online_plan_terminal_matches_v1(const RfSideOnlinePlanV1 *plan,
 		   && selected->payload_length == XLogRecGetDataLen(reader)
 		   && memcmp(&selected->header, &reader->record->header, SizeOfXLogRecord) == 0
 		   && memcmp(selected->payload, XLogRecGetData(reader), selected->payload_length) == 0;
+}
+
+static const RfSideOnlineOperationV1 *
+side_clog_witness_operation(const RfSideOnlinePlanV1 *plan,
+	const SideNativeClogWitness *witness)
+{
+	const RfSideOnlineOperationV1 *operation;
+	const RfContributorStreamCutV1 *cut;
+
+	if (witness->operation_index >= plan->operation_count || witness->payload_length == 0)
+		return NULL;
+	operation = &plan->operations[witness->operation_index];
+	if (operation->identity.participant_index >= plan->participant_count
+		|| operation->kind != RF_SIDE_ONLINE_OPERATION_PROJECTION
+		|| operation->purpose != RF_SIDE_PLAN_RECOVERY
+		|| operation->identity.record.rmid != RM_CLOG_ID
+		|| operation->projection.kind != CLUSTER_SIDE_PROJECTION_CLOG)
+		return NULL;
+	cut = &plan->physical_cuts[operation->identity.participant_index];
+	return operation->identity.record.read_rec_ptr >= cut->scan_begin_inclusive
+		&& operation->identity.record.end_rec_ptr <= cut->scan_end_exclusive
+		&& operation->identity.record.end_rec_ptr > operation->identity.record.read_rec_ptr
+		? operation : NULL;
+}
+
+static bool
+side_clog_witness_source(const RfSideOnlinePlanV1 *plan,
+	const RfSideOnlineOperationV1 *operation, const ClusterWalSourceRef *source)
+{
+	const RfContributorStreamCutV1 *cut = &plan->physical_cuts[operation->identity.participant_index];
+
+	return cut->failed_thread == source->claim.identity.origin_thread_id
+		&& cut->origin_owner_incarnation == source->claim.identity.origin_owner_incarnation
+		&& cut->timeline_id == source->timeline;
+}
+
+uint32
+rf_side_online_plan_native_clog_count_v1(const RfSideOnlinePlanV1 *plan,
+	const ClusterWalSourceRef *source)
+{
+	uint32 count = 0;
+
+	if (!rf_side_online_plan_recovery_claim_matches_v1(plan, source))
+		return UINT32_MAX;
+	for (const SideNativeClogWitness *witness = plan->native_clog; witness != NULL;
+		 witness = witness->next) {
+		const RfSideOnlineOperationV1 *operation = side_clog_witness_operation(plan, witness);
+		if (operation == NULL)
+			return UINT32_MAX;
+		if (side_clog_witness_source(plan, operation, source)) {
+			if (count == UINT32_MAX - 1)
+				return UINT32_MAX;
+			count++;
+		}
+	}
+	return count;
+}
+
+/* Compare against the already validated immutable original, never reconstruct
+ * a native header from the typed projection or a legacy raw page number. */
+bool
+rf_side_online_plan_clog_matches_v1(const RfSideOnlinePlanV1 *plan,
+	const ClusterWalSourceRef *source, const XLogReaderState *reader)
+{
+	const SideNativeClogWitness *selected = NULL;
+	const RfSideOnlineOperationV1 *operation = NULL;
+	const RfPageReplayRecordIdentityV1 *identity;
+
+	if (!rf_side_online_plan_recovery_claim_matches_v1(plan, source) || reader == NULL
+		|| reader->record == NULL || reader->cluster_record_crc_failed
+		|| reader->system_identifier != source->claim.identity.system_identifier
+		|| reader->cluster_expected_thread_id != source->claim.identity.origin_thread_id
+		|| reader->seg.ws_tli != source->timeline || reader->ReadRecPtr != reader->record->lsn
+		|| reader->EndRecPtr != reader->record->next_lsn || reader->ReadRecPtr == InvalidXLogRecPtr
+		|| reader->EndRecPtr <= reader->ReadRecPtr || XLogRecGetRmid(reader) != RM_CLOG_ID
+		|| XLogRecMaxBlockId(reader) >= 0 || reader->record->has_page_version_edge
+		|| XLogRecGetOrigin(reader) != InvalidRepOriginId || XLogRecGetData(reader) == NULL)
+		return false;
+	for (const SideNativeClogWitness *witness = plan->native_clog; witness != NULL;
+		 witness = witness->next) {
+		const RfSideOnlineOperationV1 *op = side_clog_witness_operation(plan, witness);
+		if (op == NULL)
+			return false;
+		if (!side_clog_witness_source(plan, op, source)
+			|| op->identity.record.read_rec_ptr != reader->ReadRecPtr)
+			continue;
+		if (selected != NULL)
+			return false;
+		selected = witness;
+		operation = op;
+	}
+	if (selected == NULL)
+		return false;
+	identity = &operation->identity.record;
+	return identity->system_identifier == reader->system_identifier
+		&& memcmp(identity->storage_uuid, source->claim.identity.storage_uuid, 16) == 0
+		&& identity->origin_thread == source->claim.identity.origin_thread_id
+		&& identity->timeline_id == source->timeline
+		&& identity->read_rec_ptr == reader->ReadRecPtr && identity->end_rec_ptr == reader->EndRecPtr
+		&& identity->record_crc == (uint32)reader->record->header.xl_crc
+		&& identity->rmid == XLogRecGetRmid(reader) && identity->info == XLogRecGetInfo(reader)
+		&& operation->source_top_xid == reader->record->toplevel_xid
+		&& selected->payload_length == XLogRecGetDataLen(reader)
+		&& memcmp(&selected->header, &reader->record->header, SizeOfXLogRecord) == 0
+		&& memcmp(selected->payload, XLogRecGetData(reader), selected->payload_length) == 0;
 }
 
 bool
@@ -3567,6 +3715,11 @@ rf_side_online_plan_destroy_v1(RfSideOnlinePlanV1 **plan_address)
 	while (plan->native_terminals != NULL) {
 		SideNativeTerminalWitness *witness = plan->native_terminals;
 		plan->native_terminals = witness->next;
+		side_free(witness);
+	}
+	while (plan->native_clog != NULL) {
+		SideNativeClogWitness *witness = plan->native_clog;
+		plan->native_clog = witness->next;
 		side_free(witness);
 	}
 	memset(plan, 0, sizeof(*plan));
