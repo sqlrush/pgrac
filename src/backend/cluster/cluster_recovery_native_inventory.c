@@ -72,6 +72,7 @@ typedef struct NativeInventoryRelmapXid {
 	uint64 before_map, after_map, map_ordinal;
 	XLogRecPtr map_start, map_end;
 	ClusterRecoveryRelmapPendingXidV1 *result; /* stack-only unpublished output */
+	ClusterColdXidProgressV1 generations[CLUSTER_WAL_INPUTS_MAX]; /* other original sources */
 } NativeInventoryRelmapXid;
 
 struct ClusterRecoveryNativeInventory {
@@ -513,8 +514,8 @@ inventory_source(const ClusterWalSourceRef *source, const RfContributorStreamCut
 }
 
 /* Preserve the complete physical origin's lifecycle stream, not just the
- * queried raw page. Another generation or a pre-redo record has no counter
- * candidate in this pass; keep it explicitly unobserved, never attach an era.
+ * queried raw page. A pre-redo record or generation without a checkpoint
+ * has no counter candidate; keep it explicitly unobserved, never attach an era.
  * The original native recheck has compared this complete owned record first. */
 static bool
 inventory_relmap_clog_record(ClusterRecoveryNativeInventory *work,
@@ -569,16 +570,22 @@ inventory_relmap_xid_record(ClusterRecoveryNativeInventory *work, XLogReaderStat
 {
 	NativeInventoryRelmapXid *xid = work->relmap_xid;
 	volatile ClusterColdDecodedV1 decoded = {0};
+	ClusterColdXidProgressV1 *progress;
+	const ClusterColdParticipantV1 *participant;
 	uint64 before;
 	volatile bool ok = false;
 
 	if (xid == NULL)
 		return true;
-	if (work->source_cursor != xid->source_index
-		|| reader->ReadRecPtr < xid->source.native_redo)
+	if (work->source_cursor >= CLUSTER_WAL_INPUTS_MAX)
+		return false;
+	progress = work->source_cursor == xid->source_index
+		? &xid->progress : &xid->generations[work->source_cursor];
+	participant = work->source_cursor == xid->source_index ? &xid->source : &progress->source;
+	if (!progress->begun || reader->ReadRecPtr < participant->native_redo)
 		return XLogRecGetRmid(reader) != RM_CLOG_ID
 			|| inventory_relmap_clog_record(work, saved, 0, 0, false);
-	if (xid->progress.records == 0 && reader->ReadRecPtr != xid->source.native_redo)
+	if (progress->records == 0 && reader->ReadRecPtr != participant->native_redo)
 		return false;
 	/* Preserve the original cold decoder's frame-identity rejection even
 	 * for a separate participant's RELMAP counter input. Native scan equality
@@ -590,10 +597,10 @@ inventory_relmap_xid_record(ClusterRecoveryNativeInventory *work, XLogReaderStat
 				|| !TransactionIdIsNormal(reader->record->header.xl_xid)
 				|| reader->record->toplevel_xid != reader->record->header.xl_xid)))
 		return false;
-	before = xid->progress.next_xid;
+	before = progress->next_xid;
 	PG_TRY();
 	{
-		const ClusterWalSourceRef *source = &work->sources[xid->source_index].source;
+		const ClusterWalSourceRef *source = &work->sources[work->source_cursor].source;
 		if (XLogRecGetRmid(reader) == RM_RELMAP_ID) {
 			ClusterRecoveryNativeEffect effect;
 			/* The generic cold effect decoder deliberately has no RELMAP
@@ -615,27 +622,28 @@ inventory_relmap_xid_record(ClusterRecoveryNativeInventory *work, XLogReaderStat
 			ok = cluster_cold_recovery_decode_v1(reader, source->claim.identity.system_identifier,
 				source->claim.identity.storage_uuid, false, false, (ClusterColdDecodedV1 *)&decoded)
 					== CLUSTER_COLD_OK;
-		ok = ok && cluster_cold_xid_record_v1(&xid->progress, &xid->source,
+		ok = ok && cluster_cold_xid_record_v1(progress, participant,
 				(const ClusterColdRecordV1 *)&decoded.record,
 				(const ClusterColdXidInputV1 *)&decoded.xid_input)
-			&& xid->progress.next_xid >= before;
+			&& progress->next_xid >= before;
 	}
 	PG_FINALLY();
 	{
 		cluster_cold_decoded_release_v1((ClusterColdDecodedV1 *)&decoded);
 	}
 	PG_END_TRY();
-	if (ok && reader->EndRecPtr == work->relmap_query.pending_owner.wal_end) {
+	if (ok && work->source_cursor == xid->source_index
+		&& reader->EndRecPtr == work->relmap_query.pending_owner.wal_end) {
 		if (xid->map_end != InvalidXLogRecPtr || XLogRecGetRmid(reader) != RM_RELMAP_ID)
 			return false;
 		xid->before_map = before;
-		xid->after_map = xid->progress.next_xid;
+		xid->after_map = progress->next_xid;
 		xid->map_start = reader->ReadRecPtr;
 		xid->map_end = reader->EndRecPtr;
 		xid->map_ordinal = ordinal;
 	}
 	return ok && (XLogRecGetRmid(reader) != RM_CLOG_ID
-		|| inventory_relmap_clog_record(work, saved, before, xid->progress.next_xid, true));
+		|| inventory_relmap_clog_record(work, saved, before, progress->next_xid, true));
 }
 
 static RfPageProofDetailV1
@@ -3065,6 +3073,66 @@ history_pending_xid_source(ClusterRecoveryRelmapHistory *history, uint32 index,
 		&& inventory_history_inputs(inventory, history->original.scope, false);
 }
 
+/* Bind every original physical generation before the one full reread.
+ * No order/continuity is inferred between distinct claims or timelines.
+ * Explicit initializer terminals remain visible without an invented seed. */
+static bool
+history_pending_xid_generations(ClusterRecoveryRelmapHistory *history,
+	NativeInventoryRelmapXid *xid, ClusterRecoveryRelmapPendingXidV1 *result, bool finish)
+{
+	ClusterRecoveryNativeInventory *inventory = history->inventory;
+
+	if (inventory->source_count == 0 || inventory->source_count > CLUSTER_WAL_INPUTS_MAX
+		|| (finish && result->generation_count != inventory->source_count))
+		return false;
+	for (uint32 i = 0; i < inventory->source_count; ++i) {
+		ClusterRecoveryRelmapHistoryEntryV1 entry = {0};
+		ClusterRecoveryRelmapXidGenerationV1 *generation = &result->generations[i];
+		ClusterColdXidProgressV1 *progress = i == xid->source_index
+			? &xid->progress : &xid->generations[i];
+		ClusterColdParticipantV1 participant = {0};
+		const NativeInventorySource *saved = &inventory->sources[i];
+
+		if (!history_pending_xid_source(history, i, &entry))
+			return false;
+		if (finish) {
+			if (memcmp(&generation->observation, &entry.observation, sizeof(entry.observation)) != 0
+				|| generation->input_index != entry.source.input_index)
+				return false;
+			if (!progress->begun)
+				continue; /* no checkpoint: no candidate or era */
+			if (!cluster_cold_xid_candidate_v1(progress, &progress->source, &generation->tail_next)
+				|| generation->tail_next < generation->checkpoint_next
+				|| generation->tail_next - generation->checkpoint_next >= UINT64_C(0x80000000))
+				return false;
+			generation->records = progress->records;
+			generation->counter_observed = true;
+			continue;
+		}
+		generation->observation = entry.observation;
+		generation->input_index = entry.source.input_index;
+		if (entry.source.selected.kind == CLUSTER_WAL_INPUT_INITIALIZER_TERMINAL)
+			continue;
+		if (entry.source.selected.kind != CLUSTER_WAL_INPUT_CHECKPOINT || !entry.checkpoint_observed)
+			return false;
+		generation->native_redo = saved->history.input.native_checkpoint.redo;
+		generation->checkpoint_next = U64FromFullTransactionId(saved->history.input.native_checkpoint.nextXid);
+		participant.thread_id = saved->cut.failed_thread;
+		participant.timeline = saved->cut.timeline_id;
+		participant.owner_incarnation = saved->cut.origin_owner_incarnation;
+		participant.physical_lower = saved->cut.scan_begin_inclusive;
+		participant.native_redo = generation->native_redo;
+		participant.tail_end = saved->cut.scan_end_exclusive;
+		if (!cluster_cold_xid_begin_v1(progress, &participant,
+			generation->checkpoint_next, saved->native_redo_records))
+			return false;
+		if (i == xid->source_index)
+			xid->source = participant;
+	}
+	result->generation_count = inventory->source_count;
+	return true;
+}
+
 bool
 cluster_recovery_relmap_history_pending_xid_v1(ClusterRecoveryRelmapHistory *history,
 	const ClusterRelmapV2Image *pending, ClusterRecoveryRelmapPendingXidV1 *out,
@@ -3117,28 +3185,22 @@ cluster_recovery_relmap_history_pending_xid_v1(ClusterRecoveryRelmapHistory *his
 			result.checkpoint_next = U64FromFullTransactionId(
 				saved->history.input.native_checkpoint.nextXid);
 			xid.source_index = index;
-		xid.result = &result;
-			xid.source.thread_id = saved->cut.failed_thread;
-			xid.source.timeline = saved->cut.timeline_id;
-			xid.source.owner_incarnation = saved->cut.origin_owner_incarnation;
-			xid.source.physical_lower = saved->cut.scan_begin_inclusive;
-			xid.source.native_redo = saved->history.input.native_checkpoint.redo;
-			xid.source.tail_end = saved->cut.scan_end_exclusive;
+			xid.result = &result;
 			ok = window->origin == pending->pending_owner.node
 				&& window->epoch == pending->pending_owner.membership_epoch
 				&& window->admitted_incarnation == pending->pending_owner.admitted_incarnation
 				&& window->boot_incarnation == pending->pending_owner.boot_incarnation
 				&& query >= window->native_floor && query <= result.history.post_flush_issued
 				&& result.history.post_flush_issued - window->native_floor < UINT64_C(0x80000000)
-				&& cluster_cold_xid_begin_v1(&xid.progress, &xid.source,
-					result.checkpoint_next, saved->native_redo_records);
+				&& history_pending_xid_generations(history, &xid, &result, false);
 		}
 		if (ok) {
 			inventory->relmap_xid = &xid;
 			ok = cluster_recovery_native_inventory_recheck(history->original.scope,
 				inventory, diag) == CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED;
 			inventory->relmap_xid = NULL;
-			ok = ok && xid.map_end == pending->pending_owner.wal_end
+			ok = ok && history_pending_xid_generations(history, &xid, &result, true)
+				&& xid.map_end == pending->pending_owner.wal_end
 				&& xid.map_start < xid.map_end
 				&& cluster_cold_xid_candidate_v1(&xid.progress, &xid.source, &result.tail_next)
 				&& history_pending_xid_bounds(pending->pending_owner.top_full_xid,
