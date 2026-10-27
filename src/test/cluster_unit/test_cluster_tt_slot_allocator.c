@@ -307,6 +307,7 @@ s_lock(volatile slock_t *lock, const char *file, int line, const char *func)
 /* spec-3.12: the shmem size/init now gate on cluster being enabled (so bootstrap
  * skips the ~96 KB region); the standalone test runs as an enabled node. */
 bool cluster_enabled = true;
+bool cluster_shared_config = false;
 int cluster_node_id = 0;
 bool IsUnderPostmaster = false;
 BackendType MyBackendType = B_INVALID;
@@ -369,6 +370,7 @@ reset_allocator(void)
 	mock_retention_horizon = InvalidScn;
 	cluster_undo_retention_horizon_enabled = true;
 	mock_cluster_conf.node_count = 1;
+	cluster_shared_config = false;
 }
 
 
@@ -1609,11 +1611,20 @@ UT_TEST(test_stop_tt_last_invalid_is_not_hidden_by_first_active)
 	UT_ASSERT_EQ(stop_tt_poll(), CLUSTER_NORMAL_STOP_READY);
 }
 
+#include "test_cluster_tt_slot_shared_retained.inc"
+
 int
 main(void)
 {
+	UT_PLAN(67);
 	cluster_tt_slot_shmem_init(); /* one-time init for tests that
 										   don't call reset_allocator */
+
+	UT_RUN(test_shared_solo_terminal_is_not_direct_allocator_capacity);
+	UT_RUN(test_shared_solo_gc_refusal_preserves_original_owner);
+	UT_RUN(test_shared_solo_gc_reopens_only_with_original_release_sample);
+	UT_RUN(test_shared_solo_gc_rejects_binding_aba_after_sample);
+	UT_RUN(test_shared_solo_free_and_own_active_need_no_release_sample);
 
 	UT_RUN(test_t1_invalid_offset_sentinel);
 	UT_RUN(test_t2_slots_per_segment);

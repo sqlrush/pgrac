@@ -270,7 +270,7 @@ typedef enum ClusterTTSlotAllocStatus {
 	CTS_FREE = 0,	   /* available for allocation */
 	CTS_ACTIVE = 1,	   /* owned by an in-flight xact */
 	CTS_COMMITTED = 2, /* committed; recyclable once commit_scn is older than horizon */
-	CTS_ABORTED = 3	   /* aborted; C7 local reuse or peer canonical retention */
+	CTS_ABORTED = 3	   /* aborted; local C7 or shared/peer canonical retention */
 } ClusterTTSlotAllocStatus;
 
 /* Stack-only read snapshot of one exact owner in the allocator's current
@@ -327,9 +327,10 @@ cluster_tt_slot_id_to_offset(uint32 tt_slot_id)
  *	    1) reuse a slot already owned by `top_xid` (idempotent)
  *	    2) take any FREE slot
  *	    3) recycle a COMMITTED / ABORTED slot, wrap++
- *	  In peer mode, direct Pass-2 reuse is limited to ABORTED.  COMMITTED
- *	  evidence is first recycled to FREE by the epoch-fenced cluster-horizon
- *	  cleaner, then consumed through Pass 1.
+ *	  Shared storage, including a deployment without peers, and peer mode
+ *	  never reuse terminal entries directly in Pass 2. The original cleaner
+ *	  must sample exact canonical release and retire them to FREE under its
+ *	  horizon/epoch/binding checks; Pass 1 then consumes that proven capacity.
  *	  Returns offset in [0, TT_SLOTS_PER_SEGMENT) on success, or
  *	  INVALID_TT_SLOT_OFFSET when all slots are ACTIVE.  Caller MUST be
  *	  outside critical section (function takes LWLock).
@@ -375,8 +376,9 @@ extern uint16 cluster_tt_slot_get_wrap(uint32 segment_id, uint16 slot_offset);
  *	  the spec-3.4b commit-time cluster_tt_slot_free().
  *
  *	cluster_tt_slot_mark_aborted:
- *	  ACTIVE -> ABORTED; commit_scn is cleared.  Single-node C7 permits immediate
- *	  reuse, while peer mode retains the canonical slot until exact release.
+ *	  ACTIVE -> ABORTED; commit_scn is cleared. Nonshared local C7 permits
+ *	  immediate reuse; shared/peer storage retains the slot until exact
+ *	  canonical release, independent of peer count or the horizon GUC.
  *
  *	Both are idempotent / defensive: only an ACTIVE slot with the caller's
  *	bound xid and valid expected_wrap may transition. Callers must not refresh

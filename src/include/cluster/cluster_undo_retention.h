@@ -88,12 +88,15 @@ extern bool cluster_undo_retention_all_quiescent(void);
  *	cluster_tt_slot_recyclable:
  *	  Given a TT-slot allocator status (ClusterTTSlotAllocStatus value), its
  *	  commit_scn, and the current horizon, decide whether the slot may be
- *	  recycled.  ABORTED -> single-node C7 true; COMMITTED -> only when
+ *	  recycled under the nonshared local policy. ABORTED -> C7 true; COMMITTED -> only when
  *	  commit_scn is strictly older than the horizon (a reader at the same SCN
  *	  as commit_scn still needs the pre-image). InvalidScn horizon is unproven
  *	  and retains COMMITTED; GUC-off permission belongs to the caller.
  *	  A COMMITTED slot with an unresolved (InvalidScn) commit_scn is retained
  *	  (rule 8.A fail-closed).
+ *	  This status/SCN predicate has no head or reference evidence. Shared/peer
+ *	  storage must additionally use its original canonical release owner,
+ *	  including without peers or with the local horizon GUC disabled.
  *
  *	cluster_undo_segment_recyclable:
  *	  An undo segment may be recycled only when it is SEGMENT_COMMITTED AND its

@@ -8750,6 +8750,7 @@ test_cluster_tt_active_owner: test_cluster_tt_active_owner.c test_cluster_tt_dur
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 test_cluster_tt_slot_allocator: test_cluster_tt_slot_allocator.c unit_test.h \
+		$(srcdir)/test_cluster_tt_slot_shared_retained.inc \
 		$(CLUSTER_VERSION_O) $(CLUSTER_TT_SLOT_O) $(CLUSTER_UNDO_RETENTION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_TT_SLOT_O) $(CLUSTER_UNDO_RETENTION_O) \
@@ -10007,6 +10008,7 @@ test_cluster_ctrc_itl_reuse test_cluster_ctrc_successor_fence: test_cluster_ctrc
 		$(top_srcdir)/src/include/cluster/cluster_undo_cleaner.h
 
 test_cluster_ctrc_capacity: test_cluster_ctrc_capacity.c test_cluster_ctrc_cleaner.c test_cluster_ctrc_run_pass.inc \
+		$(srcdir)/test_cluster_ctrc_slot_retained.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
 		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h unit_test.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \

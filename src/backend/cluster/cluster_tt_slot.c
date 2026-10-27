@@ -499,7 +499,8 @@ tt_slot_entry_recycle_locked(ClusterTTSlotAllocEntry *e, TransactionId new_owner
  */
 static uint16
 cluster_tt_slot_alloc_locked(ClusterTTSlotAllocPerSegment *seg, uint32 segment_id,
-							 TransactionId top_xid, bool gate_enabled, bool peer_mode, SCN horizon,
+							 TransactionId top_xid, bool gate_enabled,
+							 bool canonical_release_required, SCN horizon,
 							 bool *out_retained_pressure, uint16 *out_wrap)
 {
 	int reusable_idx = -1;
@@ -522,14 +523,12 @@ cluster_tt_slot_alloc_locked(ClusterTTSlotAllocPerSegment *seg, uint32 segment_i
 			if (free_idx < 0 && !cluster_tt_slot_is_protected(segment_id, (uint16)i))
 				free_idx = i;
 		} else if (e->status == CTS_COMMITTED || e->status == CTS_ABORTED) {
-			/* A local ProcArray horizon cannot authorize destruction of evidence
-			 * still needed by a peer snapshot or current-MX canonical proof. */
-			bool recyclable
-				= (peer_mode && (e->status == CTS_COMMITTED || e->status == CTS_ABORTED))
-					  ? false
-					  : (gate_enabled
-							 ? cluster_tt_slot_recyclable(e->status, e->commit_scn, horizon)
-							 : true);
+			/* Shared undo remains canonical without peers too. These compact
+			 * entries cannot prove head retirement: only the original cleaner
+			 * may expose FREE after sampling canonical release without this lock. */
+			bool recyclable = !canonical_release_required
+							  && (!gate_enabled
+								  || cluster_tt_slot_recyclable(e->status, e->commit_scn, horizon));
 
 			if (recyclable && tt_slot_entry_wrap_retired(e)) {
 				recyclable = false;
@@ -596,14 +595,15 @@ cluster_tt_slot_alloc_locked(ClusterTTSlotAllocPerSegment *seg, uint32 segment_i
  *	    3) recycle a *retention-eligible* COMMITTED / ABORTED slot, wrap++
  *	A COMMITTED slot is retention-eligible only when commit_scn is older than
  *	the horizon
- *	(cluster_tt_slot_recyclable); single-node ABORTED is eligible (C7).  When the
- *	retention GUC is off, the gate is bypassed (spec-3.11 immediate recycle, C6).
- *	In peer mode, allocator Pass 2 never recycles COMMITTED directly: the local
- *	ProcArray horizon does not cover remote snapshots.  The cluster undo cleaner
+ *	(cluster_tt_slot_recyclable); nonshared local ABORTED is eligible (C7).
+ *	For that local policy, GUC off bypasses the horizon gate (C6).
+ *	In shared storage or peer mode, Pass 2 never recycles terminal entries
+ *	directly: the compact allocator cannot prove retained-head retirement or
+ *	canonical release, even without peers. The cluster undo cleaner
  *	is the sole COMMITTED recycler there; it folds every required peer report
  *	into an epoch-paired cluster floor and fences each COMMITTED -> FREE mutation.
- *	Allocator Pass 1 may then consume that proven FREE slot.  In peer mode,
- *	ABORTED is also retained as canonical current-MX evidence until an exact
+ *	Allocator Pass 1 may then consume that proven FREE slot. ABORTED is also
+ *	retained as canonical undo/current-MX evidence until an exact
  *	reference-release owner exists.
  *
  *	Returns INVALID_TT_SLOT_OFFSET when no slot can be handed out.  In that
@@ -622,7 +622,7 @@ cluster_tt_slot_alloc_ext(uint32 segment_id, TransactionId top_xid, bool *out_re
 {
 	ClusterTTSlotAllocPerSegment *seg;
 	bool gate_enabled;
-	bool peer_mode;
+	bool canonical_release_required;
 	SCN horizon = InvalidScn;
 	uint16 result;
 
@@ -638,7 +638,7 @@ cluster_tt_slot_alloc_ext(uint32 segment_id, TransactionId top_xid, bool *out_re
 	 * GUC is off we skip the scan entirely and bypass the gate.
 	 */
 	gate_enabled = cluster_undo_retention_horizon_enabled;
-	peer_mode = cluster_peer_mode_enabled();
+	canonical_release_required = cluster_shared_config || cluster_peer_mode_enabled();
 	if (gate_enabled) {
 		horizon = cluster_undo_retention_horizon();
 		/* spec-3.12 D5 / C16: sample the horizon gauge at the decision point. */
@@ -649,8 +649,9 @@ cluster_tt_slot_alloc_ext(uint32 segment_id, TransactionId top_xid, bool *out_re
 	seg = cluster_tt_slot_get_or_init(segment_id);
 
 	LWLockAcquire(&seg->lock, LW_EXCLUSIVE);
-	result = cluster_tt_slot_alloc_locked(seg, segment_id, top_xid, gate_enabled, peer_mode,
-										  horizon, out_retained_pressure, NULL);
+	result = cluster_tt_slot_alloc_locked(seg, segment_id, top_xid, gate_enabled,
+										  canonical_release_required, horizon,
+										  out_retained_pressure, NULL);
 	LWLockRelease(&seg->lock);
 	return result;
 }
@@ -671,7 +672,7 @@ cluster_tt_slot_alloc_current_exact(int node_id, uint32 expected_segment_id, Tra
 {
 	ClusterTTSlotAllocPerSegment *seg;
 	bool gate_enabled;
-	bool peer_mode;
+	bool canonical_release_required;
 	SCN horizon = InvalidScn;
 	uint16 result;
 
@@ -696,7 +697,7 @@ cluster_tt_slot_alloc_current_exact(int node_id, uint32 expected_segment_id, Tra
 						errmsg("cluster_tt_slot_alloc_current_exact: top_xid must be valid")));
 
 	gate_enabled = cluster_undo_retention_horizon_enabled;
-	peer_mode = cluster_peer_mode_enabled();
+	canonical_release_required = cluster_shared_config || cluster_peer_mode_enabled();
 	if (gate_enabled) {
 		horizon = cluster_undo_retention_horizon();
 		pg_atomic_write_u64(&ClusterTTSlotShm->retention_horizon_scn, (uint64)horizon);
@@ -714,7 +715,8 @@ cluster_tt_slot_alloc_current_exact(int node_id, uint32 expected_segment_id, Tra
 	}
 
 	result = cluster_tt_slot_alloc_locked(seg, expected_segment_id, top_xid, gate_enabled,
-										  peer_mode, horizon, out_retained_pressure, out_wrap);
+										  canonical_release_required, horizon,
+										  out_retained_pressure, out_wrap);
 	LWLockRelease(&seg->lock);
 	return result;
 }
@@ -730,10 +732,11 @@ cluster_tt_slot_alloc_current_exact(int node_id, uint32 expected_segment_id, Tra
  *	durable headers are covered by the read-only scan pass (D2-B).
  *
  *	Caller computed `horizon` BEFORE any seg->lock (C17) and only calls
- *	with the retention gate enabled: with the GUC off, alloc Pass-2
- *	already recycles immediately (C6) and there is nothing to pre-free.
+ *	with the retention gate enabled. With GUC off, the nonshared local
+ *	allocator can recycle directly (C6); shared/peer storage must still retain
+ *	terminal entries without canonical proof and use the original rollover.
  *
- *	Peer-mode ABORTED entries are canonical current-MX evidence and are skipped
+ *	Shared/peer ABORTED entries are canonical undo/current-MX evidence and are skipped
  *	until an exact release owner exists.  CTS_ACTIVE entries here are live
  *	in-flight transactions (this is the
  *	current segment), NOT crash residue — they are simply skipped and
@@ -747,7 +750,7 @@ cluster_tt_slot_gc_current_pass(SCN horizon, uint64 expected_epoch,
 	ClusterTTSlotAllocPerSegment *seg;
 	uint32 gcd = 0;
 	bool fence_ok = true;
-	bool peer_mode;
+	bool canonical_release_required;
 	int i;
 
 	Assert(stats != NULL);
@@ -761,7 +764,7 @@ cluster_tt_slot_gc_current_pass(SCN horizon, uint64 expected_epoch,
 		return true; /* no binding yet this incarnation */
 
 	seg = &ClusterTTSlotShm->per_node[cluster_node_id];
-	peer_mode = cluster_peer_mode_enabled();
+	canonical_release_required = cluster_shared_config || cluster_peer_mode_enabled();
 
 	for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
 		ClusterTTSlotAllocEntry candidate;
@@ -788,10 +791,10 @@ cluster_tt_slot_gc_current_pass(SCN horizon, uint64 expected_epoch,
 			continue; /* D5: ABA guard exhausted; wait for rollover/reuse */
 		}
 
-		/* Phase 2: evaluate the horizon and, in peer mode, sample the sole
+		/* Phase 2: evaluate the horizon and, in shared/peer mode, sample the sole
 		 * durable release authority with no allocator lock held.  The current
 		 * 8.4D floor is inclusive; ABORTED has no invented SCN horizon. */
-		if (peer_mode) {
+		if (canonical_release_required) {
 			recyclable = candidate.status == CTS_ABORTED
 							 ? candidate.commit_scn == InvalidScn
 							 : SCN_VALID(candidate.commit_scn) && SCN_VALID(horizon)
@@ -846,7 +849,7 @@ cluster_tt_slot_gc_current_pass(SCN horizon, uint64 expected_epoch,
 		}
 		tt_slot_entry_recycle_locked(&seg->slots[i], InvalidTransactionId);
 		memset(&seg->origins[i], 0, sizeof(seg->origins[i]));
-		if (peer_mode)
+		if (canonical_release_required)
 			cluster_ctrc_stat_bump(CTRC_STAT_L12_RECYCLE);
 		LWLockRelease(&seg->lock);
 		gcd++;
@@ -992,7 +995,7 @@ cluster_tt_slot_mark_committed(uint32 segment_id, uint16 slot_offset, Transactio
  * cluster_tt_slot_mark_aborted -- spec-3.12 D2 / C7.
  *
  *	ACTIVE -> ABORTED.  commit_scn is cleared.  Single-node C7 may recycle it
- *	immediately; peer mode retains the physical slot as canonical current-MX
+ *	immediately in nonshared local mode; shared/peer storage retains canonical undo/current-MX
  *	evidence until an exact release owner exists.  Same defensive xid/wrap
  *	ownership + rolled-away (D2b) guards as mark_committed.
  */

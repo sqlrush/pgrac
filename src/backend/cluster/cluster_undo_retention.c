@@ -78,7 +78,7 @@ cluster_undo_retention_sample_min(SCN sampled_clock, TransactionId xmin, SCN pub
 bool
 cluster_tt_slot_recyclable(uint8 cts_status, SCN commit_scn, SCN horizon)
 {
-	/* Single-node C7 policy; peer-mode callers add the canonical-proof gate. */
+	/* Local C7 policy; shared/peer callers add the canonical-proof gate. */
 	if (cts_status == CTS_ABORTED)
 		return true;
 

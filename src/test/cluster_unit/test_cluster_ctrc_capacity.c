@@ -30,11 +30,12 @@ static PGAlignedBlock certificate_resident;
 static bool certificate_current, certificate_pin, certificate_error_after_flush;
 static unsigned certificate_wal_calls, certificate_flush_calls;
 static bool sample_copy_error;
+static int sample_node_count = 4;
 
 int
 cluster_conf_node_count(void)
 {
-	return 4;
+	return sample_node_count;
 }
 
 uint64
@@ -336,6 +337,7 @@ reset_capacity_sample(void)
 	certificate_current = certificate_pin = certificate_error_after_flush = false;
 	certificate_wal_calls = certificate_flush_calls = 0;
 	sample_copy_error = false;
+	sample_node_count = 4;
 	return origin->key;
 }
 
@@ -635,10 +637,13 @@ UT_TEST(test_capacity_abort_and_witness_loss_are_not_guessed)
 	UT_ASSERT(ctrc_bytes_zero(&continuation, sizeof(continuation)));
 }
 
+#include "test_cluster_ctrc_slot_retained.inc"
+
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(9);
+	UT_RUN(test_solo_actual_release_sampler_retains_every_undo_head_byte);
 	UT_RUN(test_sampler_error_releases_current_and_admission_under_optimization);
 	UT_RUN(test_actual_certificate_error_after_flush_retains_then_replays_handoff);
 	UT_RUN(test_handoff_exact_identity_and_all_slot_scan_never_mutate);
