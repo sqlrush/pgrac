@@ -7600,6 +7600,26 @@ participant_object_read_current(const ClusterKoPeerAdmissionV3 *admission, RelFi
 	return participant_object_admission_current(admission, locator);
 }
 
+#define ctrc_put_u16_le original_participant_origin_put_u16_le
+#define ctrc_put_u32_le original_participant_origin_put_u32_le
+#define ctrc_put_u64_le original_participant_origin_put_u64_le
+#define ctrc_get_u16_le original_participant_origin_get_u16_le
+#define ctrc_get_u32_le original_participant_origin_get_u32_le
+#define ctrc_get_u64_le original_participant_origin_get_u64_le
+#define ctrc_txn_key_encode original_participant_origin_txn_key_encode
+#define ctrc_txn_key_decode original_participant_origin_txn_key_decode
+#define cluster_ctrc_origin_fullxid_match_v2 original_participant_origin_fullxid_match_v2
+#define ctrc_origin_fullxid_encode_v2 original_participant_origin_fullxid_encode_v2
+#include "test_cluster_heap_ctrc_origin_v2.inc"
+#undef ctrc_txn_key_decode
+#undef ctrc_txn_key_encode
+#undef ctrc_get_u64_le
+#undef ctrc_get_u32_le
+#undef ctrc_get_u16_le
+#undef ctrc_put_u64_le
+#undef ctrc_put_u32_le
+#undef ctrc_put_u16_le
+
 #define cluster_ctrc_shmem_ready original_census_shmem_ready
 #define cluster_ctrc_stat_bump original_census_stat_bump
 #define ctrc_origin_index original_census_origin_index
@@ -7641,6 +7661,8 @@ participant_object_read_current(const ClusterKoPeerAdmissionV3 *admission, RelFi
 #define ctrc_target_pending_offnum_valid original_participant_target_pending_offnum_valid
 #define ctrc_target_predecessor_version_valid original_participant_target_predecessor_version_valid
 #include "test_cluster_heap_ctrc_participant.inc"
+#undef ctrc_origin_fullxid_encode_v2
+#undef cluster_ctrc_origin_fullxid_match_v2
 #undef ctrc_target_predecessor_version_valid
 #undef ctrc_target_pending_offnum_valid
 #undef ctrc_target_pending_itl_valid

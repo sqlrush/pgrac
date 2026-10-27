@@ -86,7 +86,7 @@
 #endif
 
 #define CLUSTER_CTRC_SHMEM_MAGIC UINT32_C(0x43545243)
-#define CLUSTER_CTRC_SHMEM_VERSION UINT32_C(12)
+#define CLUSTER_CTRC_SHMEM_VERSION UINT32_C(13)
 #ifndef CLUSTER_CTRC_TEST_TABLE_VISIT
 #define CLUSTER_CTRC_TEST_TABLE_VISIT(kind) ((void)0)
 #endif
@@ -5674,12 +5674,15 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 									 ClusterCtrcReceiptHandle *handle,
 									 const ClusterKoPeerAdmissionV3 *continuation,
 									 ClusterCtrcPreparePath *path_out,
-									 const FullTransactionId *received_full)
+									 const uint8 *received_origin_v2)
 {
 	ClusterCtrcParticipantEntry *participant;
 	ClusterCtrcReceipt *receipts;
 	ClusterCtrcPrepareResult result;
 	FullTransactionId original_full_xid = InvalidFullTransactionId;
+	FullTransactionId received_full = InvalidFullTransactionId;
+	uint8 local_original_v2[CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES];
+	const uint8 *original_v2 = received_origin_v2;
 	uint64 participant_index;
 	uint64 receipt_index = UINT64_MAX;
 	uint64 journal_sequence = 0;
@@ -5710,6 +5713,11 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 			*path_out = CLUSTER_CTRC_PREPARE_PATH_INPUT;
 		return ctrc_receipt_prepare_refused(false);
 	}
+	if (received_origin_v2 != NULL
+		&& !cluster_ctrc_origin_fullxid_match_v2(received_origin_v2,
+			CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES, key, identity, grant_generation,
+			&received_full))
+		return ctrc_receipt_prepare_refused(false);
 	locator = (RelFileLocator){ target->spc_oid, target->db_oid, target->rel_number };
 	check_object = cluster_shared_config && cluster_interconnect_tier == CLUSTER_IC_TIER_1
 				   && cluster_smgr_which_for(locator, InvalidBackendId) == 1;
@@ -5738,17 +5746,29 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 		LWLockAcquire(&CtrcShared->origin_lock, LW_SHARED);
 		if (!ctrc_origin_protects_local_receipt_locked(key, identity, grant_generation,
 													 &original_full_xid)
-			|| (received_full != NULL
-				&& !FullTransactionIdEquals(original_full_xid, *received_full))) {
+			|| (received_origin_v2 != NULL
+				&& !FullTransactionIdEquals(original_full_xid, received_full))) {
 			/* An explicit original identity must still be the value protected
 			 * by this exact origin/grant. Refuse before either receiver table
 			 * changes; the original lock then spans successful publication. */
 			LWLockRelease(&CtrcShared->origin_lock);
 			return ctrc_receipt_prepare_refused(false);
 		}
+		if (original_v2 == NULL && FullTransactionIdIsNormal(original_full_xid)
+			&& U64FromFullTransactionId(original_full_xid) != UINT64_MAX) {
+			/* A first local legacy registration may copy the actual protected
+			 * origin; a foreign legacy row has no authority to reconstruct it. */
+			MemSet(local_original_v2, 0, sizeof(local_original_v2));
+			if (!ctrc_origin_fullxid_encode_v2(key, identity, grant_generation,
+				original_full_xid, local_original_v2)) {
+				LWLockRelease(&CtrcShared->origin_lock);
+				return ctrc_receipt_prepare_refused(false);
+			}
+			original_v2 = local_original_v2;
+		}
 	}
-	if (!local_origin && received_full != NULL)
-		original_full_xid = *received_full;
+	if (!local_origin && received_origin_v2 != NULL)
+		original_full_xid = received_full;
 	participant = &ctrc_participant_entries()[participant_index];
 	receipts = ctrc_receipt_entries();
 	ctrc_participant_locks_acquire(ctrc_participant_lock_mask(participant_index));
@@ -5756,9 +5776,12 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 	participant_was_empty = ctrc_bytes_zero(participant, sizeof(*participant));
 	/* Only scalar call-local stores accompany the original predicates under
 	 * these locks. Do not log, call an observer, or repeat a table probe here. */
-	if (received_full != NULL && !participant_was_empty
-		&& !FullTransactionIdIsValid(participant->original_full_xid)) {
-		/* A new envelope cannot retroactively qualify a raw-only owner. */
+	if (received_origin_v2 != NULL && !participant_was_empty
+		&& (!FullTransactionIdIsValid(participant->original_full_xid)
+			|| memcmp(participant->original_identity_v2, received_origin_v2,
+					  CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES) != 0)) {
+		/* Numeric identity alone cannot retroactively establish original
+		 * custody. Exact duplicates preserve their first immutable bytes. */
 		if (path_out != NULL)
 			*path_out = CLUSTER_CTRC_PREPARE_PATH_ORIGINAL_FULL_XID;
 		result = CLUSTER_CTRC_PREPARE_REFUSED;
@@ -5819,8 +5842,12 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 		 * Keep that participant unqualified until its actual reclamation;
 		 * known matching receivers retain their identity through CLOSE/ACK. */
 		if (participant_was_empty && FullTransactionIdIsValid(original_full_xid)
-			&& !FullTransactionIdIsValid(participant->original_full_xid))
+			&& !FullTransactionIdIsValid(participant->original_full_xid)) {
 			participant->original_full_xid = original_full_xid;
+			if (original_v2 != NULL)
+				memcpy(participant->original_identity_v2, original_v2,
+					   sizeof(participant->original_identity_v2));
+		}
 		ctrc_receipt_handle_fill(handle, participant, participant_index, &receipts[receipt_index],
 								 receipt_index);
 	}
@@ -5857,7 +5884,7 @@ cluster_ctrc_receipt_prepare_origin_v2(const ClusterCtrcTxnKeyV1 *key,
 		return CLUSTER_CTRC_PREPARE_REFUSED;
 #ifndef CLUSTER_CTRC_UNIT_TEST
 	return ctrc_receipt_prepare_shared_internal(key, receiver, grant, publication,
-		target, handle, NULL, NULL, &full);
+		target, handle, NULL, NULL, bytes);
 #else
 	return CLUSTER_CTRC_PREPARE_REFUSED;
 #endif
@@ -8637,7 +8664,8 @@ ctrc_cleaner_prepare_current_mx_successor(
 		prepare_result = ctrc_receipt_prepare_shared_internal(
 			&key, &participant, grant, &publication, &pending_target, &handles[prepared_count],
 			check_object ? &admission : NULL, NULL,
-			key.origin_node_id != (uint16)cluster_node_id ? &received_full : NULL);
+			key.origin_node_id != (uint16)cluster_node_id
+				? proofs[source_ordinal].origin_fullxid_v2 : NULL);
 		if (prepare_result != CLUSTER_CTRC_PREPARE_READY
 			&& prepare_result != CLUSTER_CTRC_PREPARE_DUPLICATE)
 			goto successor_failed;

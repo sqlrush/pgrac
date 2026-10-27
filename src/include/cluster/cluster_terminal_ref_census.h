@@ -384,6 +384,9 @@ typedef struct ClusterCtrcParticipantEntry {
 	/* Volatile original identity handed off by a protected local origin.
 	 * Invalid remains unknown, particularly for unqualified foreign grants. */
 	FullTransactionId original_full_xid;
+	/* Immutable origin-issued bytes for ordinary DATA/PI delegation. A
+	 * numeric FullXid cannot reconstruct or replace this receiver binding. */
+	uint8 original_identity_v2[CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES];
 	uint32 grant_generation;
 	uint8 state;
 	uint8 reserved8[3];

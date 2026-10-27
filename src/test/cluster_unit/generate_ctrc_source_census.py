@@ -545,6 +545,7 @@ _classify_owners(
     "src/backend/cluster/cluster_terminal_ref_census.c",
     (
         "ctrc_origin_fullxid_encode_v2",
+        "ctrc_receipt_prepare_shared_internal",
         "cluster_ctrc_origin_fullxid_capture_v2",
         "cluster_ctrc_origin_grant_fullxid_v2",
         "cluster_ctrc_origin_fullxid_match_v2",

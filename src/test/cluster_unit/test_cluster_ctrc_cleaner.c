@@ -6530,6 +6530,101 @@ UT_TEST(test_origin_grant_v2_refuses_unknown_identity_before_registration)
 	}
 }
 
+UT_TEST(test_receiver_retains_original_v2_bytes_for_delegation)
+{
+	ClusterCtrcOriginEntry *origin;
+	ClusterCtrcParticipantIdentity receiver;
+	ClusterCtrcPublicationIdV1 publication;
+	ClusterCtrcTargetV1 target;
+	ClusterCtrcReceiptHandle handle;
+	uint8 bytes[CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES];
+	uint8 saved[CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES];
+
+	reset_fixture();
+	cluster_node_id = 0;
+	origin = seed_origin(0, 2);
+	receiver = origin->touched[1];
+	UT_ASSERT(cluster_ctrc_origin_fullxid_capture_v2(&origin->key, &receiver,
+		origin->grant_generation, bytes));
+	memcpy(saved, bytes, sizeof(saved));
+	fixture_receipt_inputs(origin, 909, &publication, &target);
+	publication.requester_node_id = receiver.node_id;
+	publication.requester_boot_incarnation = receiver.boot_incarnation;
+	cluster_node_id = receiver.node_id;
+	UT_ASSERT_EQ(cluster_ctrc_receipt_prepare_origin_v2(&origin->key, &receiver,
+		origin->grant_generation, &publication, &target, bytes, sizeof(bytes), &handle),
+		CLUSTER_CTRC_PREPARE_READY);
+	UT_ASSERT(memcmp(handle.participant->original_identity_v2, saved, sizeof(saved)) == 0);
+	memset(bytes, 0xa5, sizeof(bytes));
+	UT_ASSERT(memcmp(handle.participant->original_identity_v2, saved, sizeof(saved)) == 0);
+	UT_ASSERT_EQ(cluster_ctrc_receipt_prepare_origin_v2(&origin->key, &receiver,
+		origin->grant_generation, &publication, &target, saved, sizeof(saved), &handle),
+		CLUSTER_CTRC_PREPARE_DUPLICATE);
+	UT_ASSERT(memcmp(handle.participant->original_identity_v2, saved, sizeof(saved)) == 0);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_local_first_registration_captures_protected_original_v2)
+{
+	ClusterCtrcOriginEntry *origin;
+	ClusterCtrcReceiptHandle handle;
+	FullTransactionId full;
+	uint8 expected[CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES];
+
+	reset_fixture();
+	cluster_node_id = 0;
+	origin = seed_origin(0, 1);
+	UT_ASSERT(cluster_ctrc_origin_fullxid_capture_v2(&origin->key, &origin->touched[0],
+		origin->grant_generation, expected));
+	UT_ASSERT_EQ(prepare_fixture_receipt(origin, 910, &handle), CLUSTER_CTRC_PREPARE_READY);
+	UT_ASSERT(memcmp(handle.participant->original_identity_v2, expected, sizeof(expected)) == 0);
+	UT_ASSERT(cluster_ctrc_origin_fullxid_match_v2(handle.participant->original_identity_v2,
+		sizeof(handle.participant->original_identity_v2), &origin->key, &origin->touched[0],
+		origin->grant_generation, &full));
+	UT_ASSERT(FullTransactionIdEquals(full, origin->original_full_xid));
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_v2_registration_never_backfills_missing_original_bytes)
+{
+	ClusterCtrcOriginEntry *origin;
+	ClusterCtrcParticipantIdentity receiver;
+	ClusterCtrcPublicationIdV1 publication;
+	ClusterCtrcTargetV1 target;
+	ClusterCtrcReceiptHandle handle;
+	ClusterCtrcParticipantEntry *participant, saved;
+	ClusterCtrcReceipt *receipt, saved_receipt;
+	uint8 bytes[CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES];
+
+	reset_fixture();
+	cluster_node_id = 0;
+	origin = seed_origin(0, 2);
+	receiver = origin->touched[1];
+	UT_ASSERT(cluster_ctrc_origin_fullxid_capture_v2(&origin->key, &receiver,
+		origin->grant_generation, bytes));
+	fixture_receipt_inputs(origin, 911, &publication, &target);
+	publication.requester_node_id = receiver.node_id;
+	publication.requester_boot_incarnation = receiver.boot_incarnation;
+	cluster_node_id = receiver.node_id;
+	UT_ASSERT_EQ(cluster_ctrc_receipt_prepare_shared(&origin->key, &receiver,
+		origin->grant_generation, &publication, &target, &handle), CLUSTER_CTRC_PREPARE_READY);
+	participant = handle.participant;
+	receipt = handle.receipt;
+	UT_ASSERT(ctrc_bytes_zero(participant->original_identity_v2,
+		sizeof(participant->original_identity_v2)));
+	/* Numeric FullXid alone must not retroactively qualify missing custody. */
+	participant->original_full_xid = origin->original_full_xid;
+	saved = *participant;
+	saved_receipt = *receipt;
+	UT_ASSERT_EQ(cluster_ctrc_receipt_prepare_origin_v2(&origin->key, &receiver,
+		origin->grant_generation, &publication, &target, bytes, sizeof(bytes), &handle),
+		CLUSTER_CTRC_PREPARE_REFUSED);
+	UT_ASSERT(memcmp(participant, &saved, sizeof(saved)) == 0);
+	UT_ASSERT(memcmp(receipt, &saved_receipt, sizeof(saved_receipt)) == 0);
+	UT_ASSERT(!handle.valid);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
 /* Local producers use the same explicit envelope, but the origin remains
  * locked through the original receiver publication and revalidates its value. */
 UT_TEST(test_origin_fullxid_v2_local_producer_retains_source)
@@ -6692,7 +6787,7 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(150);
+	UT_PLAN(153);
 	UT_RUN(test_prepare_path_namespace_precedes_input_and_resets_output);
 	UT_RUN(test_prepare_path_input_precedes_journal_exhaustion);
 	UT_RUN(test_prepare_path_chain_precedes_locator_and_keeps_blocked_state);
@@ -6842,6 +6937,9 @@ main(void)
 	UT_RUN(test_origin_fullxid_v2_foreign_receiver_retains_source);
 	UT_RUN(test_origin_grant_v2_registers_and_captures_in_one_original_lock);
 	UT_RUN(test_origin_grant_v2_refuses_unknown_identity_before_registration);
+	UT_RUN(test_receiver_retains_original_v2_bytes_for_delegation);
+	UT_RUN(test_local_first_registration_captures_protected_original_v2);
+	UT_RUN(test_v2_registration_never_backfills_missing_original_bytes);
 	UT_RUN(test_origin_fullxid_v2_local_producer_retains_source);
 	UT_RUN(test_origin_fullxid_v2_local_producer_rechecks_locked_source);
 	UT_RUN(test_origin_fullxid_v2_rejects_missing_or_mismatched_identity);
