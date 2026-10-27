@@ -635,10 +635,53 @@ UT_TEST(test_capacity_abort_and_witness_loss_are_not_guessed)
 	UT_ASSERT(ctrc_bytes_zero(&continuation, sizeof(continuation)));
 }
 
+UT_TEST(test_terminal_observation_uses_the_actual_sampler_predicates)
+{
+	static const char *expected[] = {
+		"terminal.slot_flags", "terminal.native_commit_stable", "terminal.native_idle",
+		"terminal.slot_xid", "terminal.admission_enter", "none"
+	};
+	for (unsigned fault = 0; fault < lengthof(expected); fault++) {
+		ClusterCtrcTxnKeyV1 key = reset_capacity_sample();
+		ClusterCtrcParticipantEntry p = { 0 };
+		ClusterCtrcReceipt r = { 0 };
+		UndoSegmentHeaderData before;
+		bool terminal;
+		char expected_failure[128];
+		p.key = r.key = key;
+		/* A private diagnostic context around the original terminal sampler;
+		 * this test does not claim a selected native APPLIED receipt. */
+		switch (fault) {
+		case 0: sample_header.tt_slots[0].flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN; break;
+		case 1: sample_native_drift = true; break;
+		case 2: sample_active = true; break;
+		case 3: sample_header.tt_slots[0].xid++; break;
+		case 4: sample_admitted = false; break;
+		}
+		before = sample_header;
+		origin_log_enabled = cluster_trace_normal_stop = true;
+		ctrc_cleaner_observation_begin(&p, &r, 0, 0);
+		terminal = ctrc_cleaner_terminal_sample_exact(&key, NULL, NULL);
+		ctrc_cleaner_observation_leave(0, false, true);
+		ctrc_cleaner_observation_emit(terminal);
+		UT_ASSERT_EQ(terminal, fault == 5);
+		UT_ASSERT_EQ(cleaner_log_count, 1);
+		UT_ASSERT(strstr(cleaner_last_log, " sampled_tt_wrap=") != NULL);
+		snprintf(expected_failure, sizeof(expected_failure), "first_failed=%s ", expected[fault]);
+		UT_ASSERT(strstr(cleaner_last_log, expected_failure) != NULL);
+		UT_ASSERT(strstr(cleaner_last_log, fault == 4 ? "tt_sample_known=0 " : "tt_sample_known=1 ") != NULL);
+		UT_ASSERT_EQ(sample_holds, sample_releases);
+		UT_ASSERT_EQ(sample_enters, sample_leaves);
+		UT_ASSERT_EQ(memcmp(&before, &sample_header, sizeof(before)), 0);
+		printf("# original-terminal-observation %s\n", cleaner_last_log);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(9);
+	UT_RUN(test_terminal_observation_uses_the_actual_sampler_predicates);
 	UT_RUN(test_sampler_error_releases_current_and_admission_under_optimization);
 	UT_RUN(test_actual_certificate_error_after_flush_retains_then_replays_handoff);
 	UT_RUN(test_handoff_exact_identity_and_all_slot_scan_never_mutate);

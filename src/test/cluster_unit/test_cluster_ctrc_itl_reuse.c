@@ -2129,10 +2129,115 @@ UT_TEST(test_retired_image_refusal_and_aliases_preserve_all_bytes)
 	}
 }
 
+UT_TEST(test_original_itl_cleaner_observation_names_first_actual_failure)
+{
+	static const char *expected[] = {
+		"itl.terminal_sample", "page.tag_relation", "itl.relation_exists",
+		"itl.first_current", "itl.second_current", "itl.first_admission_recheck",
+		"itl.second_admission_recheck", "itl.space_identity", "itl.dependencies_equal",
+		"durability.origin_lsn", "itl.cleanout_result", "history.commit_before_floor", "none"
+	};
+	for (unsigned fault = 0; fault < lengthof(expected); fault++) {
+		PGAlignedBlock before;
+		ClusterCtrcReceipt receipt_before;
+		uint64 serial = 0;
+		bool cleaned;
+		char expected_failure[128];
+		reuse_setup(true);
+		if (fault == 11) reuse_data_setup();
+		/* The existing physical fixture starts CLOSED_DRAINING without a seal.
+		 * Enter through the actual close and read-scope admission for this test. */
+		reuse_handle.participant->state = CTRC_PARTICIPANT_OPEN;
+		UT_ASSERT_EQ(cluster_ctrc_participant_close(reuse_handle.participant,
+			&ctrc_origin_entries()[0].touched[0], ctrc_origin_entries()[0].grant_generation,
+			ctrc_origin_entries()[0].seal_generation), CLUSTER_CTRC_CLOSE_PENDING_DRAIN);
+		reuse_participant = *reuse_handle.participant;
+		switch (fault) {
+		case 0: reuse_terminal_ok = false; break;
+		case 1: reuse_tag_ok = false; break;
+		case 2: reuse_exists = false; break;
+		case 3: reuse_fail_lock = 1; break;
+		case 4: reuse_fail_lock = 2; break;
+		case 5: reuse_fail_recheck = 1; break;
+		case 6: reuse_fail_recheck = 2; break;
+		case 7: cluster_shared_config = true; reuse_space_available = false; break;
+		case 8: reuse_dependency_drift = true; break;
+		case 9: reuse_peer_flush = 0; break;
+		case 10: reuse_receipt.target.itl_class = 1; break;
+		case 11: reuse_local_floor = 900; break;
+		}
+		/* Scope admission binds the actual selected snapshot, including a
+		 * controlled physical-target input in the retain-result case. */
+		*reuse_handle.receipt = reuse_receipt;
+		before = reuse_page; receipt_before = *reuse_handle.receipt;
+		CtrcWorkerId = 0; MyBackendType = B_UNDO_CLEANER; MyAuxProcType = UndoCleanerProcess;
+		origin_log_enabled = cluster_trace_normal_stop = true;
+		ctrc_cleaner_observation_begin(&reuse_participant, &reuse_receipt,
+			reuse_handle.participant_index, reuse_handle.receipt_index);
+		UT_ASSERT(ctrc_cleaner_read_scope_begin(&reuse_participant, &reuse_receipt,
+			reuse_handle.participant_index, reuse_handle.receipt_index, &serial));
+		cleaned = reuse_run();
+		UT_ASSERT_EQ(cleaned, fault == 12);
+		ctrc_cleaner_observation_leave(serial, ctrc_cleaner_read_scope_end(serial), true);
+		ctrc_cleaner_observation_emit(cleaned);
+		UT_ASSERT_EQ(cleaner_log_count, 1);
+		snprintf(expected_failure, sizeof(expected_failure), "first_failed=%s ", expected[fault]);
+		UT_ASSERT(strstr(cleaner_last_log, expected_failure) != NULL);
+		UT_ASSERT(strstr(cleaner_last_log, "scope_ended=1 ") != NULL);
+		UT_ASSERT(strstr(cleaner_last_log, fault == 12 ? "discharge_known=1 "
+			: "discharge_known=0 ") != NULL);
+		if (!cleaned) {
+			UT_ASSERT_EQ(memcmp(&before, &reuse_page, sizeof(before)), 0);
+			UT_ASSERT_EQ(memcmp(&receipt_before, reuse_handle.receipt, sizeof(receipt_before)), 0);
+		}
+		UT_ASSERT_EQ(read_scope_entered, read_scope_left);
+		UT_ASSERT_EQ(reuse_enters, reuse_leaves);
+		UT_ASSERT_EQ(reuse_pins, 0); UT_ASSERT_EQ(reuse_xlocks, 0);
+		printf("# original-physical-observation %s\n", cleaner_last_log);
+	}
+	reuse_space_available = true;
+}
+
+UT_TEST(test_original_itl_cleaner_observation_preserves_outcome_page_and_work)
+{
+	for (unsigned refuse = 0; refuse < 3; refuse++) {
+		PGAlignedBlock pages[2];
+		ClusterCtrcReceipt receipts[2];
+		ClusterCtrcParticipantEntry participants[2];
+		unsigned locks[2], flushes[2], enters[2], rechecks[2];
+		for (unsigned enabled = 0; enabled < 2; enabled++) {
+			bool result;
+			reuse_setup(true);
+			if (refuse == 1) reuse_terminal_ok = false;
+			if (refuse == 2) reuse_dependency_drift = true;
+			origin_log_enabled = true; cluster_trace_normal_stop = enabled;
+			ctrc_cleaner_observation_begin(&reuse_participant, &reuse_receipt,
+				reuse_handle.participant_index, reuse_handle.receipt_index);
+			result = reuse_run();
+			ctrc_cleaner_observation_leave(0, false, true);
+			ctrc_cleaner_observation_emit(result);
+			UT_ASSERT_EQ(result, refuse == 0);
+			pages[enabled] = reuse_page;
+			receipts[enabled] = *reuse_handle.receipt;
+			participants[enabled] = *reuse_handle.participant;
+			locks[enabled] = reuse_locks; flushes[enabled] = flush_calls;
+			enters[enabled] = reuse_enters; rechecks[enabled] = reuse_rechecks;
+			UT_ASSERT_EQ(cleaner_log_count, enabled);
+		}
+		UT_ASSERT_EQ(memcmp(&pages[0], &pages[1], sizeof(pages[0])), 0);
+		UT_ASSERT_EQ(memcmp(&receipts[0], &receipts[1], sizeof(receipts[0])), 0);
+		UT_ASSERT_EQ(memcmp(&participants[0], &participants[1], sizeof(participants[0])), 0);
+		UT_ASSERT_EQ(locks[0], locks[1]); UT_ASSERT_EQ(flushes[0], flushes[1]);
+		UT_ASSERT_EQ(enters[0], enters[1]); UT_ASSERT_EQ(rechecks[0], rechecks[1]);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(52);
+	UT_PLAN(54);
+	UT_RUN(test_original_itl_cleaner_observation_names_first_actual_failure);
+	UT_RUN(test_original_itl_cleaner_observation_preserves_outcome_page_and_work);
 	UT_RUN(test_retired_image_observation_keeps_page_receipts_and_owners_unchanged);
 	UT_RUN(test_retired_image_captures_exact_terminal_companion_without_clearing_it);
 	UT_RUN(test_retired_image_refusal_and_aliases_preserve_all_bytes);

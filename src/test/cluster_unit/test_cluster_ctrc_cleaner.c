@@ -161,6 +161,8 @@ static unsigned batch_reply_log_count, batch_reply_log_throw_at;
 static char batch_reply_logs[CLUSTER_CTRC_RECLAIM_BATCH_MAX][8192];
 static unsigned participant_log_count;
 static char participant_logs[32][8192];
+static unsigned cleaner_log_count;
+static char cleaner_last_log[8192];
 BackendType MyBackendType = B_BACKEND;
 AuxProcType MyAuxProcType = NotAnAuxProcess;
 int MyProcPid = 2901;
@@ -867,6 +869,10 @@ errfinish(const char *file pg_attribute_unused(), int line pg_attribute_unused()
 				strlcpy(participant_logs[participant_log_count], origin_last_log,
 						sizeof(participant_logs[0]));
 			participant_log_count++;
+		} else if (strstr(origin_last_log, "PGRAC_FAMILY=CTRC_CLEANER_ATTEMPT") != NULL) {
+			UT_ASSERT(!CtrcReadScope.active);
+			cleaner_log_count++;
+			strlcpy(cleaner_last_log, origin_last_log, sizeof(cleaner_last_log));
 		} else {
 			if (origin_require_dispatch_return) UT_ASSERT(origin_dispatch_returned);
 			origin_log_count++;
@@ -901,6 +907,13 @@ reset_fixture(void)
 	reply_log_count = 0; reply_last_log[0] = '\0';
 	batch_reply_log_count = batch_reply_log_throw_at = 0;
 	participant_log_count = 0; MemSet(participant_logs, 0, sizeof(participant_logs));
+	cleaner_log_count = 0; cleaner_last_log[0] = '\0';
+#ifdef CLUSTER_CTRC_CLEANER_OBSERVATION_PRESENT
+	MemSet(CtrcCleanerBuckets, 0, sizeof(CtrcCleanerBuckets));
+	MemSet(&CtrcCleanerObservation, 0, sizeof(CtrcCleanerObservation));
+	MemSet(&CtrcCleanerScan, 0, sizeof(CtrcCleanerScan));
+	CtrcCleanerUnsafeDropped = CtrcCleanerErrorDropped = CtrcCleanerCaptureDropped = 0;
+#endif
 	origin_log_count = origin_dispatch_calls = 0; origin_last_log[0] = '\0';
 #ifdef CLUSTER_CTRC_ORIGIN_DISPATCH_TRACE_PRESENT
 	CtrcOriginTraceCriticalSkipped = CtrcOriginTraceLwlockSkipped = 0;
@@ -7250,6 +7263,264 @@ UT_TEST(test_participant_stop_trace_exception_releases_only_observation_owner)
 	}
 }
 
+/* On the parent these are observation no-ops, never product-success stubs.
+ * The original scope/selector/physical bodies still execute for RED. */
+#ifndef CLUSTER_CTRC_CLEANER_OBSERVATION_PRESENT
+static void
+ctrc_cleaner_observation_begin(const ClusterCtrcParticipantEntry *p pg_attribute_unused(),
+	const ClusterCtrcReceipt *r pg_attribute_unused(), uint64 pi pg_attribute_unused(),
+	uint64 ri pg_attribute_unused())
+{
+}
+static void
+ctrc_cleaner_observation_leave(uint64 serial pg_attribute_unused(),
+	bool ended pg_attribute_unused(), bool normal pg_attribute_unused())
+{
+}
+static void
+ctrc_cleaner_observation_emit(bool cleaned pg_attribute_unused())
+{
+}
+#endif
+
+UT_TEST(test_cleaner_observation_records_actual_scope_first_failure)
+{
+	static const char *failures[] = {
+		"scope.owner", "scope.seal", "scope.participant_snapshot",
+		"scope.receipt_snapshot", "scope.link_participant", "scope.serial_available",
+		"scope.ko_enter"
+	};
+	for (unsigned fault = 0; fault < lengthof(failures); fault++) {
+		ClusterCtrcParticipantEntry p;
+		ClusterCtrcReceipt r;
+		uint64 pi, ri, serial = 0;
+		char expected_failure[128];
+		reset_fixture();
+		UT_ASSERT(seed_applied_read_scope(&p, &r, &pi, &ri));
+		switch (fault) {
+		case 0: MyBackendType = B_BACKEND; break;
+		case 1: p.seal_generation = 0; break;
+		case 2: p.seal_generation++; break;
+		case 3: ctrc_receipt_entries()[ri].target.block_number++; break;
+		case 4: ctrc_receipt_links()[ri].participant_plus_one++; break;
+		case 5: CtrcReadSerial = UINT64_MAX; break;
+		case 6: read_scope_enter_refused = true; break;
+		}
+		origin_log_enabled = cluster_trace_normal_stop = true;
+		ctrc_cleaner_observation_begin(&p, &r, pi, ri);
+		UT_ASSERT(!ctrc_cleaner_read_scope_begin(&p, &r, pi, ri, &serial));
+		ctrc_cleaner_observation_leave(serial, ctrc_cleaner_read_scope_end(serial), true);
+		ctrc_cleaner_observation_emit(false);
+		UT_ASSERT_EQ(cleaner_log_count, 1);
+		snprintf(expected_failure, sizeof(expected_failure), "first_failed=%s ", failures[fault]);
+		UT_ASSERT(strstr(cleaner_last_log, expected_failure) != NULL);
+		UT_ASSERT(strstr(cleaner_last_log, "proc_generation_known=0 ") != NULL);
+		UT_ASSERT(strstr(cleaner_last_log, "discharge_known=0 ") != NULL);
+		UT_ASSERT(!CtrcReadScope.active);
+		UT_ASSERT_EQ(held_count, 0);
+		printf("# original-scope-observation %s\n", cleaner_last_log);
+	}
+}
+
+UT_TEST(test_cleaner_observation_original_driver_results_and_unwind)
+{
+	for (unsigned mode = 0; mode < 4; mode++) {
+		ClusterCtrcParticipantEntry p;
+		ClusterCtrcReceipt r;
+		uint64 pi, ri;
+		volatile bool caught = false, result = false;
+		reset_fixture();
+		UT_ASSERT(seed_applied_read_scope(&p, &r, &pi, &ri));
+		read_driver_mode = mode; read_driver_calls = 0;
+		read_scope_enter_refused = mode == 3;
+		origin_log_enabled = cluster_trace_normal_stop = true;
+		PG_TRY(); { result = read_driver_next(); }
+		PG_CATCH(); { caught = true; }
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, mode == 2);
+		UT_ASSERT_EQ(result, mode == 1);
+		UT_ASSERT_EQ(cleaner_log_count, mode == 2 ? 0 : 1);
+		if (mode != 2) {
+			UT_ASSERT(strstr(cleaner_last_log, "scan_known=1 ") != NULL);
+			UT_ASSERT(strstr(cleaner_last_log, mode == 1 ? "first_failed=none "
+				: mode == 3 ? "first_failed=scope.ko_enter " : "first_failed=physical.return ") != NULL);
+		} else {
+			read_driver_mode = 1; read_driver_calls = 0;
+			read_scope_entered = read_scope_left = 0;
+			UT_ASSERT(read_driver_next());
+			UT_ASSERT(strstr(cleaner_last_log, "error_dropped=1 ") != NULL);
+			UT_ASSERT(strstr(cleaner_last_log, "first_failed=none ") != NULL);
+		}
+		UT_ASSERT_EQ(read_scope_entered, read_scope_left);
+		UT_ASSERT(!CtrcReadScope.active);
+		UT_ASSERT_EQ(ctrc_receipt_entries()[ri].state, CTRC_RECEIPT_APPLIED);
+	}
+}
+
+UT_TEST(test_cleaner_observation_late_key_and_receipt_have_independent_budgets)
+{
+	ClusterCtrcParticipantEntry p;
+	ClusterCtrcReceipt r;
+	uint64 pi, ri;
+	unsigned before;
+	reset_fixture();
+	UT_ASSERT(seed_applied_read_scope(&p, &r, &pi, &ri));
+	read_driver_mode = 0; read_driver_calls = 0;
+	origin_log_enabled = cluster_trace_normal_stop = true;
+	for (unsigned i = 0; i < 160; i++) {
+		read_scope_entered = read_scope_left = 0;
+		UT_ASSERT(!read_driver_next());
+		UT_ASSERT_EQ(read_scope_entered, read_scope_left);
+	}
+	UT_ASSERT(cleaner_log_count > 0 && cleaner_log_count < 32);
+	UT_ASSERT(strstr(cleaner_last_log, "sample_kind=drop_summary ") != NULL);
+	printf("# exhausted-signature %s\n", cleaner_last_log);
+	before = cleaner_log_count;
+	/* Controlled valid namespace input; execute the real scope checks again.
+	 * This is not a claim that a native transaction was created here. */
+	p.key.xid++; r.key = p.key; r.target.itl_xid = p.key.xid;
+	ctrc_participant_entries()[pi] = p;
+	ctrc_receipt_entries()[ri] = r;
+	read_scope_entered = read_scope_left = 0;
+	UT_ASSERT(!read_driver_next());
+	UT_ASSERT_EQ(cleaner_log_count, before + 1);
+	UT_ASSERT(strstr(cleaner_last_log, "sample_kind=detail ") != NULL);
+	printf("# late-key-observation %s\n", cleaner_last_log);
+	before = cleaner_log_count;
+	/* Same key, a distinct actual receipt-generation tuple must not inherit
+	 * the previous receipt's exhausted diagnostic signature. */
+	r.publication.journal_slot_generation++;
+	ctrc_receipt_entries()[ri] = r;
+	ctrc_receipt_links()[ri].journal_generation = r.publication.journal_slot_generation;
+	read_scope_entered = read_scope_left = 0;
+	UT_ASSERT(!read_driver_next());
+	UT_ASSERT_EQ(cleaner_log_count, before + 1);
+	UT_ASSERT(strstr(cleaner_last_log, "sample_kind=detail ") != NULL);
+	UT_ASSERT_EQ(read_scope_entered, read_scope_left);
+}
+
+UT_TEST(test_cleaner_observation_disabled_and_enabled_preserve_original_bytes_and_locks)
+{
+	ClusterCtrcParticipantEntry final_p[2];
+	ClusterCtrcReceipt final_r[2];
+	unsigned locks[2];
+	uint64 remaining[2];
+	for (unsigned enabled = 0; enabled < 2; enabled++) {
+		ClusterCtrcParticipantEntry p;
+		ClusterCtrcReceipt r;
+		uint64 pi, ri;
+		reset_fixture();
+		UT_ASSERT(seed_applied_read_scope(&p, &r, &pi, &ri));
+		read_driver_mode = 0; read_driver_calls = 0;
+		origin_log_enabled = true; cluster_trace_normal_stop = enabled;
+		CtrcBatch.active = true;
+		CtrcBatch.remaining[CTRC_SCAN_RECEIPT] = CtrcShared->receipt_entries;
+		locks[enabled] = sleepable_acquisitions;
+		UT_ASSERT(!read_driver_next());
+		locks[enabled] = sleepable_acquisitions - locks[enabled];
+		remaining[enabled] = CtrcBatch.remaining[CTRC_SCAN_RECEIPT];
+		MemSet(&CtrcBatch, 0, sizeof(CtrcBatch));
+		final_p[enabled] = ctrc_participant_entries()[pi];
+		final_r[enabled] = ctrc_receipt_entries()[ri];
+		UT_ASSERT_EQ(memcmp(&final_p[enabled], &p, sizeof(p)), 0);
+		UT_ASSERT_EQ(memcmp(&final_r[enabled], &r, sizeof(r)), 0);
+		UT_ASSERT_EQ(cleaner_log_count, enabled);
+		UT_ASSERT_EQ(read_scope_entered, read_scope_left);
+	}
+	UT_ASSERT_EQ(memcmp(&final_p[0], &final_p[1], sizeof(final_p[0])), 0);
+	UT_ASSERT_EQ(memcmp(&final_r[0], &final_r[1], sizeof(final_r[0])), 0);
+	UT_ASSERT_EQ(locks[0], locks[1]);
+	UT_ASSERT_EQ(remaining[0], remaining[1]);
+}
+
+UT_TEST(test_cleaner_observation_selector_first_rejection_is_an_actual_visit)
+{
+	ClusterCtrcParticipantEntry p, out_p;
+	ClusterCtrcReceipt r, out_r;
+	uint64 pi, ri, out_pi, out_ri;
+	char expected[96];
+	reset_fixture();
+	UT_ASSERT(seed_applied_read_scope(&p, &r, &pi, &ri));
+	ctrc_participant_entries()[pi].state = CTRC_PARTICIPANT_OPEN;
+	ctrc_participant_entries()[pi].applied_count = 0;
+	ctrc_participant_entries()[pi].grant_generation++;
+	p = ctrc_participant_entries()[pi];
+	origin_log_enabled = cluster_trace_normal_stop = true;
+	UT_ASSERT(!ctrc_cleaner_next_applied_receipt(&out_p, &out_r, &out_pi, &out_ri));
+	UT_ASSERT_EQ(cleaner_log_count, 1);
+	UT_ASSERT(strstr(cleaner_last_log, "selected=0 first_failed=selector.participant_state ") != NULL);
+	snprintf(expected, sizeof(expected), "scan_visited=" UINT64_FORMAT " ", CtrcShared->receipt_entries);
+	UT_ASSERT(strstr(cleaner_last_log, expected) != NULL);
+	snprintf(expected, sizeof(expected), "receipt_index=" UINT64_FORMAT " ", ri);
+	UT_ASSERT(strstr(cleaner_last_log, expected) != NULL);
+	UT_ASSERT_EQ(out_pi, UINT64_MAX); UT_ASSERT_EQ(out_ri, UINT64_MAX);
+	UT_ASSERT_EQ(memcmp(&p, &ctrc_participant_entries()[pi], sizeof(p)), 0);
+	UT_ASSERT_EQ(memcmp(&r, &ctrc_receipt_entries()[ri], sizeof(r)), 0);
+	UT_ASSERT_EQ(read_scope_entered, 0); UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_cleaner_observation_late_key_survives_bucket_collisions)
+{
+	ClusterCtrcParticipantEntry p;
+	ClusterCtrcReceipt r;
+	uint64 pi, ri;
+	bool eviction_seen = false;
+	reset_fixture();
+	UT_ASSERT(seed_applied_read_scope(&p, &r, &pi, &ri));
+	read_driver_mode = 0; read_driver_calls = 0;
+	origin_log_enabled = cluster_trace_normal_stop = true;
+	for (unsigned i = 0; i < 80; i++) {
+		const char *counter;
+		p.key.xid++; r.key = p.key; r.target.itl_xid = p.key.xid;
+		ctrc_participant_entries()[pi] = p; ctrc_receipt_entries()[ri] = r;
+		read_scope_entered = read_scope_left = 0;
+		UT_ASSERT(!read_driver_next());
+		UT_ASSERT_EQ(cleaner_log_count, i + 1);
+		UT_ASSERT(strstr(cleaner_last_log, "sample_kind=detail ") != NULL);
+		counter = strstr(cleaner_last_log, "bucket_evictions=");
+		UT_ASSERT(counter != NULL);
+		if (counter != NULL && strtoull(counter + strlen("bucket_evictions="), NULL, 10) != 0)
+			eviction_seen = true;
+	}
+	UT_ASSERT(eviction_seen);
+	printf("# collision-observation %s\n", cleaner_last_log);
+#ifdef CLUSTER_CTRC_CLEANER_OBSERVATION_PRESENT
+	printf("# cleaner-observation-storage buckets=%zu candidates=%zu current=%zu scan=%zu touched=%zu\n",
+		sizeof(CtrcCleanerBuckets), sizeof(CtrcCleanerCandidates), sizeof(CtrcCleanerObservation),
+		sizeof(CtrcCleanerScan), sizeof(CtrcCleanerTouched));
+#endif
+}
+
+UT_TEST(test_cleaner_observation_unsafe_gap_and_log_error_do_not_leak_scope)
+{
+	ClusterCtrcParticipantEntry p;
+	ClusterCtrcReceipt r;
+	uint64 pi, ri;
+	volatile bool caught = false;
+	reset_fixture();
+	UT_ASSERT(seed_applied_read_scope(&p, &r, &pi, &ri));
+	origin_log_enabled = cluster_trace_normal_stop = true;
+	ctrc_cleaner_observation_begin(&p, &r, pi, ri);
+	ctrc_cleaner_observation_leave(0, false, true);
+	CritSectionCount = 1;
+	ctrc_cleaner_observation_emit(false);
+	CritSectionCount = 0;
+	UT_ASSERT_EQ(cleaner_log_count, 0);
+	read_driver_mode = 1; read_driver_calls = 0;
+	origin_log_throw = true;
+	PG_TRY(); { (void)read_driver_next(); }
+	PG_CATCH(); { caught = true; }
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(read_scope_entered, read_scope_left);
+	UT_ASSERT(!CtrcReadScope.active);
+	origin_log_throw = false;
+	read_scope_entered = read_scope_left = 0;
+	UT_ASSERT(read_driver_next());
+	UT_ASSERT(strstr(cleaner_last_log, "unsafe_dropped=1 ") != NULL);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
 int
 main(void)
 {
@@ -7257,7 +7528,14 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(174);
+	UT_PLAN(181);
+	UT_RUN(test_cleaner_observation_records_actual_scope_first_failure);
+	UT_RUN(test_cleaner_observation_original_driver_results_and_unwind);
+	UT_RUN(test_cleaner_observation_late_key_and_receipt_have_independent_budgets);
+	UT_RUN(test_cleaner_observation_disabled_and_enabled_preserve_original_bytes_and_locks);
+	UT_RUN(test_cleaner_observation_unsafe_gap_and_log_error_do_not_leak_scope);
+	UT_RUN(test_cleaner_observation_selector_first_rejection_is_an_actual_visit);
+	UT_RUN(test_cleaner_observation_late_key_survives_bucket_collisions);
 	UT_RUN(test_participant_stop_trace_exception_releases_only_observation_owner);
 	UT_RUN(test_participant_stop_trace_reports_prepared_and_applied_pending);
 	UT_RUN(test_participant_stop_trace_distinguishes_nonempty_ack_wait_and_frozen_reply);
