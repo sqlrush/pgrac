@@ -111,6 +111,9 @@ struct ClusterRecoveryNativeEffect;
  * sentinel and wrapped members), never local SLRU targets. TRUNCATE/member
  * proofs remain independent. Native CLOG/commit_ts ZERO similarly preserves
  * the original-origin segment and page extent, without creating local files.
+ * Native CLOG FULL ZERO validates the exact16B page-birth shape before the
+ * same origin/file extent is added; its FullXid remains original native
+ * record input, not a certified era or a physical lifetime.
  * Native terminal records add top/child CLOG targets; assignments add only
  * child SUBTRANS targets. Raw addresses prove neither era nor parent/status;
  * no commit_ts target is inferred without a historical enabled-profile proof.
