@@ -540,6 +540,19 @@ _classify_owners(
     "NO_REFERENCE_TO_DISCHARGE",
     "MXA-T40",
 )
+# The new producer retains outgoing custody; receipt discharge cannot close
+# it. The subtree CLOSE/ACK owner remains unimplemented and live use is closed.
+_classify_owners(
+    "CTRC_ORIGIN_PROVENANCE",
+    "src/backend/cluster/cluster_terminal_ref_census.c",
+    ("cluster_ctrc_participant_delegate_prepare_v1",),
+    "REGISTERED_REFERENCE",
+    "ALL_CTRC_REFERENCE_KINDS",
+    "ALL_CTRC_TARGET_KINDS",
+    "cluster_ctrc_participant_delegate_prepare_v1",
+    "RETAIN_PENDING_SUBTREE_CLOSE_ACK",
+    "MXA-T40",
+)
 _classify_owners(
     "CTRC_ORIGIN_PROVENANCE",
     "src/backend/cluster/cluster_terminal_ref_census.c",

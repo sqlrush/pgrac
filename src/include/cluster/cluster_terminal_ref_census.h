@@ -378,6 +378,15 @@ typedef struct ClusterCtrcOriginReservation {
 	uint8 reserved8[6];
 } ClusterCtrcOriginReservation;
 
+/* Pending outgoing responsibility, not evidence that the receiver installed
+ * a tree edge. It survives local receipt drain until subtree CLOSE/ACK. */
+typedef struct ClusterCtrcDelegationCustodyV1 {
+	ClusterCtrcParticipantIdentity receiver;
+	uint64 sequence;
+} ClusterCtrcDelegationCustodyV1;
+StaticAssertDecl(sizeof(ClusterCtrcDelegationCustodyV1) == 40,
+	"CTRC custody entry must remain 40 bytes");
+
 typedef struct ClusterCtrcParticipantEntry {
 	ClusterCtrcTxnKeyV1 key;
 	ClusterCtrcParticipantIdentity identity;
@@ -399,6 +408,10 @@ typedef struct ClusterCtrcParticipantEntry {
 	uint64 cancelled_count;
 	uint64 cleaned_count;
 	uint64 ack_frozen_count;
+	uint32 delegation_count;
+	uint32 delegation_reserved;
+	uint64 last_delegation_sequence;
+	ClusterCtrcDelegationCustodyV1 delegations[CLUSTER_CTRC_MAX_PARTICIPANTS];
 } ClusterCtrcParticipantEntry;
 
 typedef struct ClusterCtrcReceipt {
@@ -987,6 +1000,15 @@ extern ClusterCtrcPrepareResult cluster_ctrc_receipt_prepare_origin_v2(
 	uint32 grant, const ClusterCtrcPublicationIdV1 *publication,
 	const ClusterCtrcTargetV1 *target, const uint8 *bytes, Size length,
 	ClusterCtrcReceiptHandle *handle);
+/* First-hop custody only: use this node's exact OPEN participant and its
+ * immutable origin-issued receiver binding. Retain responsibility under the
+ * original participant lock before publishing the record; retries reuse it.
+ * No new origin grant, tree admission, receiver installation or release.
+ * Callers must keep their original current/PI admission protection. */
+extern bool cluster_ctrc_participant_delegate_prepare_v1(
+	const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcParticipantIdentity *sender,
+	uint32 grant, const ClusterCtrcParticipantIdentity *receiver,
+	uint8 *record, Size length);
 extern bool cluster_ctrc_origin_begin_seal_entry(ClusterCtrcOriginEntry *origin,
 												 uint64 seal_generation);
 extern bool cluster_ctrc_origin_arm_close_entry(ClusterCtrcOriginEntry *origin,

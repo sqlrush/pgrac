@@ -86,7 +86,7 @@
 #endif
 
 #define CLUSTER_CTRC_SHMEM_MAGIC UINT32_C(0x43545243)
-#define CLUSTER_CTRC_SHMEM_VERSION UINT32_C(13)
+#define CLUSTER_CTRC_SHMEM_VERSION UINT32_C(14)
 #ifndef CLUSTER_CTRC_TEST_TABLE_VISIT
 #define CLUSTER_CTRC_TEST_TABLE_VISIT(kind) ((void)0)
 #endif
@@ -380,6 +380,66 @@ cluster_ctrc_origin_fullxid_match_v2(const uint8 *bytes, Size length,
 		return false;
 	*out = full;
 	return true;
+}
+
+
+/* No subtree ACK implementation may retire this pending custody yet. A zero
+ * count alone cannot conceal an occupied slot or a consumed sequence. */
+static bool
+ctrc_participant_delegations_empty(const ClusterCtrcParticipantEntry *participant)
+{
+	return participant->delegation_count == 0 && participant->delegation_reserved == 0
+		&& participant->last_delegation_sequence == 0
+		&& ctrc_bytes_zero(participant->delegations, sizeof(participant->delegations));
+}
+
+static bool
+ctrc_participant_delegations_valid(const ClusterCtrcParticipantEntry *participant)
+{
+	uint32 count = 0;
+	uint32 sequences = 0;
+
+	if (participant->delegation_reserved != 0
+		|| participant->delegation_count >= CLUSTER_CTRC_MAX_PARTICIPANTS
+		|| participant->last_delegation_sequence != participant->delegation_count)
+		return false;
+	for (uint16 node = 0; node < CLUSTER_CTRC_MAX_PARTICIPANTS; node++) {
+		const ClusterCtrcDelegationCustodyV1 *entry = &participant->delegations[node];
+		uint32 bit;
+
+		if (ctrc_bytes_zero(entry, sizeof(*entry)))
+			continue;
+		if (!ctrc_participant_identity_valid(&participant->key, &entry->receiver)
+			|| entry->receiver.node_id != node || node == participant->identity.node_id
+			|| node == participant->key.origin_node_id || entry->sequence == 0
+			|| entry->sequence > participant->last_delegation_sequence)
+			return false;
+		/* At most N-1 occupied slots, with one never-reused sequence each. */
+		bit = UINT32_C(1) << (entry->sequence - 1);
+		if ((sequences & bit) != 0)
+			return false;
+		sequences |= bit;
+		count++;
+	}
+	return count == participant->delegation_count;
+}
+
+static void
+ctrc_delegation_put_be(uint8 *bytes, uint64 value, unsigned length)
+{
+	for (unsigned i = 0; i < length; i++)
+		bytes[length - i - 1] = (uint8)(value >> (8 * i));
+}
+
+static void
+ctrc_delegation_identity_encode(const ClusterCtrcParticipantIdentity *identity, uint8 *bytes)
+{
+	ctrc_delegation_put_be(bytes, identity->node_id, 2);
+	ctrc_delegation_put_be(bytes + 2, 0, 2);
+	ctrc_delegation_put_be(bytes + 4, identity->capability_record_generation, 4);
+	ctrc_delegation_put_be(bytes + 8, identity->boot_incarnation, 8);
+	ctrc_delegation_put_be(bytes + 16, identity->formation_epoch, 8);
+	ctrc_delegation_put_be(bytes + 24, identity->admission_record_generation, 8);
 }
 
 
@@ -5665,6 +5725,82 @@ cluster_ctrc_origin_grant_fullxid_v2(const ClusterCtrcTxnKeyV1 *key,
 	return result;
 }
 
+bool
+cluster_ctrc_participant_delegate_prepare_v1(const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcParticipantIdentity *sender, uint32 grant,
+	const ClusterCtrcParticipantIdentity *receiver, uint8 *record, Size length)
+{
+	ClusterCtrcParticipantEntry *participant;
+	ClusterCtrcDelegationCustodyV1 *entry;
+	FullTransactionId original;
+	uint8 encoded[CLUSTER_CTRC_DELEGATION_V1_BYTES] = { 0 };
+	uint64 index;
+	uint64 sequence;
+	uint32 lock_mask;
+	bool prepared = false;
+
+	StaticAssertStmt(CLUSTER_CTRC_DELEGATION_V1_BYTES == 8 + 144 + 72,
+		"CTRC first-hop record must match IMAGE V3 framing");
+	if (record != NULL && length <= CLUSTER_CTRC_DELEGATION_V1_BYTES)
+		MemSet(record, 0, length);
+	if (record == NULL || length != sizeof(encoded) || !cluster_ctrc_shmem_ready()
+		|| !ctrc_txn_key_valid(key) || !ctrc_participant_identity_valid(key, sender)
+		|| !ctrc_participant_identity_valid(key, receiver) || grant == 0
+		|| cluster_node_id < 0 || sender->node_id != (uint16)cluster_node_id
+		|| receiver->node_id == sender->node_id || receiver->node_id == key->origin_node_id
+		|| !ctrc_participant_index(key, sender->node_id, &index))
+		return false;
+
+	lock_mask = ctrc_participant_lock_mask(index);
+	ctrc_participant_locks_acquire(lock_mask);
+	participant = &ctrc_participant_entries()[index];
+	if (participant->state != CTRC_PARTICIPANT_OPEN || participant->seal_generation != 0
+		|| participant->grant_generation != grant
+		|| memcmp(&participant->key, key, sizeof(*key)) != 0
+		|| memcmp(&participant->identity, sender, sizeof(*sender)) != 0
+		|| !ctrc_bytes_zero(participant->reserved8, sizeof(participant->reserved8))
+		|| !ctrc_participant_delegations_valid(participant)
+		|| !cluster_ctrc_origin_fullxid_match_v2(participant->original_identity_v2,
+			sizeof(participant->original_identity_v2), key, sender, grant, &original)
+		|| !FullTransactionIdEquals(original, participant->original_full_xid))
+		goto done;
+
+	entry = &participant->delegations[receiver->node_id];
+	sequence = entry->sequence;
+	if (sequence != 0) {
+		/* A changed incarnation is not closure and cannot replace old custody. */
+		if (memcmp(&entry->receiver, receiver, sizeof(*receiver)) != 0)
+			goto done;
+	} else {
+		if (participant->delegation_count >= CLUSTER_CTRC_MAX_PARTICIPANTS - 1)
+			goto done;
+		sequence = participant->last_delegation_sequence + 1;
+	}
+
+	ctrc_delegation_put_be(encoded, CLUSTER_CTRC_DELEGATION_V1_VERSION, 2);
+	ctrc_delegation_put_be(encoded + 2, sizeof(encoded), 2);
+	ctrc_delegation_put_be(encoded + 4, 1, 2);
+	/* Never re-encode, re-sign or infer an origin identity from a raw XID. */
+	memcpy(encoded + 8, participant->original_identity_v2, 144);
+	ctrc_delegation_identity_encode(sender, encoded + 152);
+	ctrc_delegation_identity_encode(receiver, encoded + 184);
+	ctrc_delegation_put_be(encoded + 216, sequence, 8);
+
+	if (entry->sequence == 0) {
+		entry->receiver = *receiver;
+		entry->sequence = sequence;
+		participant->last_delegation_sequence = sequence;
+		participant->delegation_count++;
+	}
+	/* The same lock serializes this responsibility with CLOSE and ACK. No
+	 * output becomes available before custody exists; a retry adds no edge. */
+	memcpy(record, encoded, sizeof(encoded));
+	prepared = true;
+done:
+	ctrc_participant_locks_release(lock_mask);
+	return prepared;
+}
+
 static ClusterCtrcPrepareResult
 ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 									 const ClusterCtrcParticipantIdentity *identity,
@@ -6509,7 +6645,8 @@ ctrc_frozen_ack_summary_exact(const ClusterCtrcParticipantEntry *participant,
 							  const ClusterCtrcLocalReleaseAckV1 *summary)
 {
 	return participant != NULL && summary != NULL
-		   && participant->state == CTRC_PARTICIPANT_ACK_FROZEN && ctrc_ack_bytes_exact(summary)
+		   && participant->state == CTRC_PARTICIPANT_ACK_FROZEN
+		   && ctrc_participant_delegations_empty(participant) && ctrc_ack_bytes_exact(summary)
 		   && memcmp(&summary->transaction_key, &participant->key, sizeof(participant->key)) == 0
 		   && summary->grant_generation == participant->grant_generation
 		   && summary->seal_generation == participant->seal_generation
@@ -6971,11 +7108,13 @@ cluster_ctrc_participant_close(ClusterCtrcParticipantEntry *participant,
 		|| participant->prepared_count > participant->receipt_count
 		|| participant->applied_count > participant->receipt_count
 		|| participant->cancelled_count > participant->receipt_count
-		|| participant->cleaned_count > participant->receipt_count) {
+		|| participant->cleaned_count > participant->receipt_count
+		|| !ctrc_participant_delegations_valid(participant)) {
 		participant->state = CTRC_PARTICIPANT_BLOCKED;
 		return CLUSTER_CTRC_CLOSE_BLOCKED_RETAIN;
 	}
-	if (participant->prepared_count != 0 || participant->applied_count != 0)
+	if (participant->prepared_count != 0 || participant->applied_count != 0
+		|| !ctrc_participant_delegations_empty(participant))
 		return CLUSTER_CTRC_CLOSE_PENDING_DRAIN;
 
 	terminal_count = participant->cancelled_count + participant->cleaned_count;
@@ -7510,6 +7649,7 @@ cluster_ctrc_participant_ack_from_snapshot(const ClusterCtrcParticipantEntry *pa
 		MemSet(ack, 0, sizeof(*ack));
 	if (participant == NULL || durability == NULL || ack == NULL
 		|| participant->state != CTRC_PARTICIPANT_ACK_READY
+		|| !ctrc_participant_delegations_empty(participant)
 		|| !ctrc_txn_key_valid(&participant->key)
 		|| !ctrc_participant_identity_valid(&participant->key, &participant->identity)
 		|| participant->grant_generation == 0 || participant->seal_generation == 0
@@ -9806,6 +9946,7 @@ ctrc_ack_participant_exact(const CtrcAckWork *work)
 
 	return memcmp(participant, &work->participant, sizeof(*participant)) == 0
 		   && participant->state == CTRC_PARTICIPANT_ACK_READY
+		   && ctrc_participant_delegations_empty(participant)
 		   && participant->receipt_count == work->receipt_count;
 }
 

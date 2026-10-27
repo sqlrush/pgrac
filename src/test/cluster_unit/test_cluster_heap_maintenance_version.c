@@ -8417,7 +8417,12 @@ certificate_pool_upgrade(void)
 #define CtrcLocalProgress certificate_local_progress
 #define LWLockAcquire participant_publisher_lock_acquire
 #define LWLockRelease participant_publisher_lock_release
+#define ctrc_participant_delegations_empty original_certificate_participant_delegations_empty
+#define ctrc_participant_delegations_valid original_certificate_participant_delegations_valid
+#include "test_cluster_heap_ctrc_delegation.inc"
 #include "test_cluster_heap_ctrc_certificate.inc"
+#undef ctrc_participant_delegations_valid
+#undef ctrc_participant_delegations_empty
 #undef LWLockRelease
 #undef LWLockAcquire
 #undef CtrcLocalProgress
@@ -8830,7 +8835,9 @@ static volatile sig_atomic_t ack_interrupt_pending;
 static void ack_process_interrupts(void) { UT_ASSERT(false); }
 #define ctrc_scan_participant_relock original_ack_scan_participant_relock
 #include "test_cluster_heap_ctrc_g_scan_relock.inc"
+#define ctrc_participant_delegations_empty original_certificate_participant_delegations_empty
 #include "test_cluster_heap_ctrc_ack.inc"
+#undef ctrc_participant_delegations_empty
 #undef ctrc_scan_participant_relock
 #undef ProcessInterrupts
 #undef InterruptPending

@@ -2314,6 +2314,15 @@ test_cluster_heap_ctrc_terminal.inc: $(top_srcdir)/src/backend/cluster/cluster_t
 	     END { if (found != 17 || done != 17 || emit) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Exact pending-custody retirement helpers, separate from original core counts.
+test_cluster_heap_ctrc_delegation.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
+	@awk 'BEGIN { pattern = "^(ctrc_participant_delegations_empty|ctrc_participant_delegations_valid)\\(" } \
+	     $$0 ~ pattern { name=$$0; sub(/\(.*/, "", name); if (seen[name]++) exit 1; order[++found]=name; ret=prev; sub(/^static[ \t]+/, "", ret); returns[name]="static " ret; emit=1; head=1 } \
+	     emit { body[name]=body[name] $$0 "\n"; if (/^\{/) head=0; else if (head) declaration[name]=declaration[name] $$0 "\n" } \
+	     emit && /^}/ { emit=0; done++ } { prev=$$0 } \
+	     END { if (found != 2 || done != 2 || emit) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $< > $@.tmp
+	mv $@.tmp $@
+
 # Original certificate consumer/reclaim closure; skip the original forward declaration.
 test_cluster_heap_ctrc_certificate.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
 	@awk 'BEGIN { pattern = "^(ctrc_put_u16_le|ctrc_put_u32_le|ctrc_put_u64_le|ctrc_get_u32_le|ctrc_crc32c_exact|ctrc_txn_key_encode|ctrc_seal_suboperation_valid|ctrc_local_ack_shape_valid|cluster_ctrc_local_release_ack_encode|ctrc_semantic_progress|ctrc_participant_ack_entries|ctrc_reclaim_work_find|ctrc_receipts_reclaim_validate|ctrc_receipt_collapse_deleted_probe|ctrc_receipts_reclaim_shared_locked|ctrc_ack_bytes_exact|ctrc_frozen_ack_summary_exact|cluster_ctrc_participant_request_apply|ctrc_participant_certificate_batch_apply_shared|cluster_ctrc_participant_certificate_batch_shared|cluster_ctrc_participant_close_or_tombstone|cluster_ctrc_participant_close)\\(" } \
@@ -2447,6 +2456,7 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		$(top_srcdir)/src/include/cluster/cluster_sf_dep.h \
 		$(top_srcdir)/src/include/access/generic_xlog.h \
 		$(top_srcdir)/src/include/cluster/cluster_itl.h \
+		test_cluster_heap_ctrc_delegation.inc \
 		test_cluster_heap_ctrc_certificate.inc $(top_srcdir)/src/include/port/pg_crc32c.h \
 		test_cluster_heap_ctrc_g_scan_relock.inc \
 		test_cluster_heap_ctrc_ack.inc $(top_srcdir)/src/common/sha2_int.h \
@@ -5422,6 +5432,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_heap_primitive_pin.inc test_cluster_heap_primitive_pin.inc.tmp
 	rm -f test_cluster_heap_private_ref.inc test_cluster_heap_private_ref.inc.tmp
 	rm -f test_cluster_heap_resource_owner.inc test_cluster_heap_resource_owner.inc.tmp
+	rm -f test_cluster_heap_ctrc_delegation.inc test_cluster_heap_ctrc_delegation.inc.tmp
 	rm -f test_cluster_heap_ctrc_certificate.inc test_cluster_heap_ctrc_certificate.inc.tmp
 	rm -f test_cluster_heap_ctrc_g_scan_relock.inc test_cluster_heap_ctrc_g_scan_relock.inc.tmp
 	rm -f test_cluster_heap_ctrc_ack.inc test_cluster_heap_ctrc_ack.inc.tmp
