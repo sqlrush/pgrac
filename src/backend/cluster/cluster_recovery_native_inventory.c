@@ -56,6 +56,13 @@ typedef struct NativeInventoryPage {
 	/* Normalized decoded header, blocks and owned payloads follow. */
 } NativeInventoryPage;
 
+/* Stack-local correspondence work during one explicit full physical reread.
+ * Never retained as an authority or across a returned/refused call. */
+typedef struct NativeInventoryRelmapTerminal {
+	ClusterRecoveryRelmapSourceV1 source;
+	uint32 source_index, expected, matched;
+} NativeInventoryRelmapTerminal;
+
 struct ClusterRecoveryNativeInventory {
 	const ClusterRecoveryRelmapSourceV1 *relmap_owner; /* borrowed opaque history custody */
 	NativeInventorySource *sources;
@@ -64,6 +71,7 @@ struct ClusterRecoveryNativeInventory {
 	NativeInventoryRecord *cursor;
 	NativeInventoryPage *pages, *pages_tail, *page_cursor;
 	RfPageOnlinePlanV1 *page_build; /* private, only during an explicit physical recheck */
+	NativeInventoryRelmapTerminal *relmap_terminal; /* private synchronous recheck only */
 	uint32 page_count;
 	ClusterRecoveryRootSet *roots; /* borrowed; no further access after collection */
 	pg_cryptohash_ctx *hash;
@@ -640,6 +648,18 @@ inventory_record(XLogReaderState *reader, const ClusterWalSourceRef *source,
 		if (native != CLUSTER_RECOVERY_NATIVE_UNCHANGED)
 			return inventory_refuse(work, CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED,
 									RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH);
+		if (work->relmap_terminal != NULL
+			&& work->source_cursor == work->relmap_terminal->source_index
+			&& XLogRecGetRmid(reader) == RM_XACT_ID
+			&& ((XLogRecGetInfo(reader) & XLOG_XACT_OPMASK) == XLOG_XACT_COMMIT
+				|| (XLogRecGetInfo(reader) & XLOG_XACT_OPMASK) == XLOG_XACT_ABORT)) {
+			NativeInventoryRelmapTerminal *terminal = work->relmap_terminal;
+			if (terminal->matched >= terminal->expected
+				|| !cluster_wal_inputs_relmap_terminal_matches_v1(&terminal->source, reader))
+				return inventory_refuse(work, CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED,
+					RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
+			terminal->matched++;
+		}
 		work->cursor = record->next;
 		return RF_PAGE_PROOF_DETAIL_OK;
 	}
@@ -2716,6 +2736,132 @@ cluster_recovery_relmap_history_pending_base_v1(ClusterRecoveryRelmapHistory *hi
 	if (ok) {
 		history->failed = false;
 		memcpy(out, &base, sizeof(base));
+	} else
+		history_fail(history);
+	return ok;
+}
+
+/* Select only represented, unambiguous native carriers. Even this complete
+ * negative screen cannot prove an earlier page birth or a FullXid era. */
+static const NativeInventoryRecord *
+history_pending_terminal_record(const ClusterRecoveryNativeInventory *inventory)
+{
+	const ClusterRecoveryRelmapFoldSummary *summary = &inventory->relmap_summary;
+	const ClusterRelmapV2Image *query = &inventory->relmap_query;
+	TransactionId raw = (TransactionId)query->pending_owner.top_full_xid;
+
+	if (!inventory->complete || inventory->status != CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED
+		|| !inventory->relmap_drained || inventory->relmap_active || inventory->relmap_terminal != NULL
+		|| summary->wal_matches != 1 || summary->wal_aliases != 0
+		|| summary->child_references != 0 || summary->assignments != 0 || summary->prepares != 0
+		|| summary->clog_after_wal != 0 || summary->clog_unordered != 0
+		|| !((summary->top_commits == 1 && summary->top_aborts == 0)
+			|| (summary->top_commits == 0 && summary->top_aborts == 1)))
+		return NULL;
+	for (const NativeInventoryRecord *saved = inventory->head; saved != NULL; saved = saved->next) {
+		ClusterRecoveryNativeEffect effect;
+		const ClusterRecoveryNativeRecord *record;
+
+		if (cluster_recovery_native_scan_primary(saved->scan, &effect) != CLUSTER_RECOVERY_NATIVE_EFFECT)
+			return NULL;
+		record = effect.record;
+		if (effect.kind != CLUSTER_RECOVERY_NATIVE_TERMINAL || record == NULL
+			|| record->source.claim.identity.origin_node_id != query->pending_owner.node
+			|| record->top_xid != raw)
+			continue;
+		return saved->source_index == inventory->relmap_wal_source
+			&& saved->source_index < inventory->source_count
+			&& record->read_lsn >= query->pending_owner.wal_end
+			&& (!TransactionIdIsValid(record->toplevel_xid) || record->toplevel_xid == raw)
+			&& inventory_source_equal(&record->source, &inventory->sources[saved->source_index].source)
+			? saved : NULL;
+	}
+	return NULL;
+}
+
+bool
+cluster_recovery_relmap_history_pending_terminal_v1(ClusterRecoveryRelmapHistory *history,
+	const ClusterRelmapV2Image *pending, ClusterRecoveryRelmapPendingTerminalV1 *out,
+	ClusterRecoveryNativeInventoryDiag *diag)
+{
+	ClusterRecoveryRelmapPendingTerminalV1 result = {0};
+	NativeInventoryRelmapTerminal terminal = {0};
+	const NativeInventoryRecord *saved;
+	ClusterRecoveryNativeEffect effect;
+	bool held = false;
+	volatile bool ok = false;
+
+	if (pending == NULL || out == NULL || diag == NULL
+		|| history_overlap(out, sizeof(*out), pending, sizeof(*pending))
+		|| history_overlap(diag, sizeof(*diag), pending, sizeof(*pending))
+		|| history_overlap(out, sizeof(*out), diag, sizeof(*diag))
+		|| history_storage_overlap(history, out, sizeof(*out))
+		|| history_storage_overlap(history, diag, sizeof(*diag)))
+		return false;
+	memset(out, 0, sizeof(*out));
+	memset(diag, 0, sizeof(*diag));
+	if (history == NULL || history->inventory == NULL)
+		return false;
+	*diag = history->inventory->diag;
+	diag->owned_bytes += history_owned_bytes(history);
+	if (history->failed || CritSectionCount != 0
+		|| cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock)
+		|| !history->inventory->relmap_drained)
+		return false;
+	ForEachLWLockHeldByMe(inventory_page_lock_held, &held);
+	if (held)
+		return false;
+
+	/* Latch before the first original owner/plan/native operation can ERROR.
+	 * Custody survives late failure; only explicit local destroy closes it. */
+	history->failed = true;
+	PG_TRY();
+	{
+		saved = history_pending_same(history, pending)
+			? history_pending_terminal_record(history->inventory) : NULL;
+		ok = saved != NULL && history_pending_base_read(history, &result.base);
+		if (ok) {
+			ok = cluster_recovery_native_scan_primary(saved->scan, &effect)
+				== CLUSTER_RECOVERY_NATIVE_EFFECT
+				&& result.base.native.status == (history->inventory->relmap_summary.top_commits == 1
+					? TRANSACTION_STATUS_COMMITTED : TRANSACTION_STATUS_ABORTED);
+		}
+		if (ok) {
+			terminal.source = result.base.history.source;
+			terminal.source_index = saved->source_index;
+			terminal.expected = cluster_wal_inputs_relmap_terminal_count_v1(&terminal.source);
+			ok = terminal.expected != 0 && terminal.expected != UINT32_MAX;
+		}
+		if (ok) {
+			history->inventory->relmap_terminal = &terminal;
+			ok = cluster_recovery_native_inventory_recheck(history->original.scope,
+				history->inventory, diag) == CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED;
+			history->inventory->relmap_terminal = NULL;
+			ok = ok && terminal.matched == terminal.expected
+				&& cluster_wal_inputs_relmap_terminal_count_v1(&terminal.source) == terminal.expected
+				&& history_pending_base_read(history, &result.base)
+				&& cluster_wal_inputs_relmap_terminal_count_v1(&terminal.source) == terminal.expected
+				&& inventory_history_inputs(history->inventory, history->original.scope, false);
+		}
+		if (ok) {
+			result.terminal_start = effect.record->read_lsn;
+			result.terminal_end = effect.record->end_lsn;
+			result.terminal_source_index = saved->source_index;
+			result.terminal_ordinal = saved->ordinal;
+		}
+	}
+	PG_CATCH();
+	{
+		history->inventory->relmap_terminal = NULL;
+		history_fail(history);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	*diag = history->inventory->diag;
+	diag->owned_bytes += history_owned_bytes(history);
+	if (ok) {
+		history->failed = false;
+		memcpy(out, &result, sizeof(result));
 	} else
 		history_fail(history);
 	return ok;
