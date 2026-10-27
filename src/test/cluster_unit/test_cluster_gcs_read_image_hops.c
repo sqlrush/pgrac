@@ -1,4 +1,4 @@
-/* Exact reply decoder and receiver with controlled disjoint dispatch boundaries.
+/* Exact R4 requester lifecycle and reply RX with controlled dispatch boundaries.
  * Slot storage is a private fixture projection, not a wire/authority model. */
 #include "postgres.h"
 
@@ -7,10 +7,13 @@
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_cr_server.h"
 #include "cluster/cluster_gcs_block.h"
+#include "cluster/cluster_gcs_reqid.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_pcm_lock.h"
+#include "cluster/cluster_multixact_current_wire.h"
+#include "cluster/cluster_resource_x_identity.h"
 #include "cluster/cluster_sf_dep.h"
 #include "port/pg_crc32c.h"
 #include "storage/backendid.h"
@@ -33,11 +36,20 @@ UT_DEFINE_GLOBALS();
 #define CLUSTER_GCS_BLOCK_REPLY_DOMAIN_R4_CR 1
 typedef struct ClusterGcsBlockOutstandingSlot {
 	bool in_use, reply_received, stale, reply_sf_dep_valid, reply_undo_trailer_valid;
+	bool first_fill_revoked, direct_target_prepared;
 	uint8 reply_domain, transition_id, reply_sf_flags;
+	uint8 expected_reply_status;
 	uint64 request_id, request_epoch;
-	uint32 direct_generation;
-	int32 expected_master_node;
+	uint32 direct_generation, direct_arm_id, direct_target_lkey;
+	int32 expected_master_node, master_node, direct_expected_peer;
 	ClusterGcsBlockDirectState direct_state;
+	ClusterGcsBlockDirectTargetKind direct_target_kind;
+	ClusterGcsBlockDirectAbortReason direct_abort_reason;
+	BufferDesc *direct_target_buf;
+	void *direct_target_addr;
+	bool expected_current_mx_key_valid, expected_current_mx_proof_valid;
+	ClusterCurrentMxKey expected_current_mx_key;
+	ClusterCurrentMxProofForwardV2 expected_current_mx_proof;
 	BufferTag tag;
 	GcsBlockReplyHeader reply_header;
 	char reply_block_data[GCS_BLOCK_DATA_SIZE];
@@ -45,12 +57,14 @@ typedef struct ClusterGcsBlockOutstandingSlot {
 	uint64 reply_undo_tt_generation, reply_undo_authority_scn;
 	ConditionVariable reply_cv;
 	struct {
-		bool delivery_closed;
+		bool armed, delivery_closed;
 	} first_fill;
 } ClusterGcsBlockOutstandingSlot;
 typedef struct ClusterGcsBlockBackendBlock {
 	LWLockPadded lock;
 	ClusterGcsBlockOutstandingSlot slots[MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND];
+	uint64 next_request_id;
+	ConditionVariable capacity_cv;
 } ClusterGcsBlockBackendBlock;
 
 static ClusterGcsBlockBackendBlock blocks[4], *gcs_block_backend_blocks = blocks;
@@ -64,7 +78,7 @@ BackendType MyBackendType = B_LMS_WORKER;
 PGPROC *MyProc = NULL;
 sigjmp_buf *PG_exception_stack = NULL;
 ErrorContextCallback *error_context_stack = NULL;
-static int locks, signals, event_count, injected_log_errors;
+static int locks, signals, broadcasts, event_count, injected_log_errors;
 static bool fail_log;
 static int lost_failclosed;
 void cluster_sf_dep_note_lost_failclosed(void) { lost_failclosed++; }
@@ -102,6 +116,20 @@ bool LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attrib
 { locks++; return true; }
 void LWLockRelease(LWLock *lock pg_attribute_unused()) { locks--; }
 void ConditionVariableSignal(ConditionVariable *cv pg_attribute_unused()) { signals++; }
+void
+ConditionVariableBroadcast(ConditionVariable *cv pg_attribute_unused())
+{
+	broadcasts++;
+}
+
+/* Private storage mapping; no PGPROC allocation or incarnation is simulated. */
+static ClusterGcsBlockBackendBlock *
+gcs_block_my_block(void)
+{
+	if (MyBackendId <= 0 || MyBackendId > MaxBackends)
+		abort();
+	return &blocks[MyBackendId - 1];
+}
 
 static bool gcs_block_try_resource_x_frame(const ClusterICEnvelope *e pg_attribute_unused(),
 										 const void *p pg_attribute_unused()) { return false; }
@@ -117,6 +145,10 @@ cluster_cr_server_r4_land_foreign_undo(const ClusterICEnvelope *e pg_attribute_u
 { return false; }
 
 #include "test_cluster_gcs_read_image_hops.inc"
+
+#ifndef GCS_R4_REQUESTER_LIFECYCLE_PRESENT
+#error "R4 requester lifecycle extraction is required"
+#endif
 
 static struct { GcsBlockReplyHeader hdr; char data[GCS_BLOCK_DATA_SIZE]; } payload;
 static ClusterICEnvelope envelope;
@@ -146,7 +178,7 @@ reset_fixture(bool trace)
 	GcsBlockReplyHeaderSetForwardingMasterNode(&payload.hdr, 0);
 	payload.data[0] = 42;
 	envelope.source_node_id = 1; envelope.dest_node_id = 2; envelope.epoch = 71;
-	locks = signals = event_count = injected_log_errors = 0;
+	locks = signals = broadcasts = event_count = injected_log_errors = 0;
 	fail_log = false;
 	cluster_smart_fusion = false;
 	lost_failclosed = 0;
@@ -728,10 +760,244 @@ UT_TEST(forward_refusal_logging_stays_inside_original_refusal_branches)
 	free(source);
 }
 
+/* Keep the canonical RX input, but allocate every owner through the real body. */
+static BufferTag
+r4_requester_fixture(void)
+{
+	BufferTag tag;
+	int i;
+
+	r4_tx_fixture();
+	tag = blocks[1].slots[0].tag;
+	memset(blocks, 0, sizeof(blocks));
+	for (i = 0; i < MaxBackends; i++)
+		blocks[i].next_request_id = 51;
+	MyBackendId = 2;
+	return tag;
+}
+
+UT_TEST(r4_requester_reserve_land_release_and_reuse_clear_stale_state)
+{
+	BufferTag tag = r4_requester_fixture();
+	ClusterGcsBlockOutstandingSlot *slot = &blocks[1].slots[0], *next;
+	const ClusterGcsBlockOutstandingSlot zero = { 0 };
+	uint64 request_id = 0;
+
+	/* Dirty a free slot only; no live direct or first-fill owner is simulated. */
+	slot->reply_received = slot->stale = slot->first_fill_revoked = true;
+	slot->reply_sf_dep_valid = slot->reply_undo_trailer_valid = true;
+	slot->reply_sf_flags = 255;
+	slot->reply_sf_dep_vec.required[1] = 55;
+	slot->reply_undo_tt_generation = 66;
+	slot->reply_undo_authority_scn = 77;
+	slot->expected_reply_status = GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT;
+	slot->expected_current_mx_key_valid = slot->expected_current_mx_proof_valid = true;
+	memset(&slot->expected_current_mx_key, 0x55, sizeof(slot->expected_current_mx_key));
+	memset(&slot->expected_current_mx_proof, 0x66, sizeof(slot->expected_current_mx_proof));
+	memset(&slot->reply_header, 0xa5, sizeof(slot->reply_header));
+	memset(slot->reply_block_data, 0x5a, sizeof(slot->reply_block_data));
+	slot->direct_generation = 9;
+	slot = gcs_block_try_reserve_r4_slot(tag, 70, 1, &request_id);
+	UT_ASSERT_NOT_NULL(slot);
+	if (slot == NULL)
+		return;
+	UT_ASSERT(slot == &blocks[1].slots[0] && slot->in_use);
+	UT_ASSERT_EQ(request_id, UINT64CONST(0x0200010000000033));
+	UT_ASSERT_EQ(slot->request_id, request_id);
+	UT_ASSERT_EQ(blocks[1].next_request_id, 52);
+	UT_ASSERT_EQ(slot->request_epoch, 70);
+	UT_ASSERT_EQ(slot->master_node, 1);
+	UT_ASSERT_EQ(slot->expected_master_node, 1);
+	UT_ASSERT_EQ(slot->transition_id, PCM_TRANS_N_TO_S);
+	UT_ASSERT_EQ(slot->reply_domain, CLUSTER_GCS_BLOCK_REPLY_DOMAIN_R4_CR);
+	UT_ASSERT_EQ(memcmp(&slot->tag, &tag, sizeof(tag)), 0);
+	UT_ASSERT(!slot->reply_received && !slot->stale && !slot->first_fill_revoked);
+	UT_ASSERT(!slot->reply_sf_dep_valid && !slot->reply_undo_trailer_valid);
+	UT_ASSERT_EQ(slot->reply_sf_flags, 0);
+	UT_ASSERT(cluster_sf_dep_vec_is_empty(&slot->reply_sf_dep_vec));
+	UT_ASSERT_EQ(slot->reply_undo_tt_generation | slot->reply_undo_authority_scn, 0);
+	UT_ASSERT_EQ(slot->expected_reply_status, 0);
+	UT_ASSERT(!slot->expected_current_mx_key_valid && !slot->expected_current_mx_proof_valid);
+	UT_ASSERT_EQ(memcmp(&slot->expected_current_mx_key, &zero.expected_current_mx_key,
+						sizeof(slot->expected_current_mx_key)),
+				 0);
+	UT_ASSERT_EQ(memcmp(&slot->expected_current_mx_proof, &zero.expected_current_mx_proof,
+						sizeof(slot->expected_current_mx_proof)),
+				 0);
+	UT_ASSERT_EQ(memcmp(&slot->reply_header, &zero.reply_header, sizeof(slot->reply_header)), 0);
+	UT_ASSERT_EQ(memcmp(slot->reply_block_data, zero.reply_block_data, BLCKSZ), 0);
+	UT_ASSERT_EQ(slot->direct_state, GCS_BLOCK_DIRECT_UNARMED);
+	UT_ASSERT_EQ(slot->direct_generation, 9);
+	UT_ASSERT_EQ(locks | signals | broadcasts, 0);
+
+	payload.hdr.request_id = request_id;
+	receive();
+	UT_ASSERT(slot->reply_received && signals == 1 && locks == 0);
+	UT_ASSERT_EQ(memcmp(slot->reply_block_data, payload.data, BLCKSZ), 0);
+	gcs_block_release_slot(slot);
+	UT_ASSERT(!slot->in_use && !slot->reply_received && locks == 0 && broadcasts == 1);
+	UT_ASSERT_EQ(slot->request_id | slot->request_epoch, 0);
+	UT_ASSERT_EQ(slot->reply_domain, CLUSTER_GCS_BLOCK_REPLY_DOMAIN_LEGACY_ACQUIRE);
+	UT_ASSERT_EQ(slot->transition_id, 0);
+	UT_ASSERT_EQ(slot->master_node, -1);
+	UT_ASSERT_EQ(slot->expected_master_node, -1);
+	UT_ASSERT(!slot->first_fill.armed && !slot->first_fill.delivery_closed);
+	/* Retired bytes have no owner; the next reservation erases them. */
+	UT_ASSERT_EQ(memcmp(slot->reply_block_data, payload.data, BLCKSZ), 0);
+	next = gcs_block_try_reserve_r4_slot(tag, 71, 3, &request_id);
+	UT_ASSERT(next == slot);
+	if (next == NULL)
+		return;
+	UT_ASSERT_EQ(request_id, UINT64CONST(0x0200010000000034));
+	UT_ASSERT_EQ(next->request_epoch, 71);
+	UT_ASSERT_EQ(next->expected_master_node, 3);
+	UT_ASSERT(!next->reply_received);
+	UT_ASSERT_EQ(memcmp(&next->reply_header, &zero.reply_header, sizeof(next->reply_header)), 0);
+	UT_ASSERT_EQ(memcmp(next->reply_block_data, zero.reply_block_data, BLCKSZ), 0);
+	UT_ASSERT_EQ(next->direct_generation, 9);
+	gcs_block_release_slot(next);
+	UT_ASSERT_EQ(broadcasts, 2);
+}
+
+UT_TEST(r4_requester_real_reuse_rejects_old_reply_and_preserves_both_peers)
+{
+	BufferTag tag = r4_requester_fixture();
+	ClusterGcsBlockOutstandingSlot *slot, *same_backend, *other_backend, *reused;
+	ClusterGcsBlockBackendBlock before[4];
+	uint64 request_id, old_request_id;
+
+	slot = gcs_block_try_reserve_r4_slot(tag, 70, 1, &old_request_id);
+	same_backend = gcs_block_try_reserve_r4_slot(tag, 70, 1, &request_id);
+	MyBackendId = 3;
+	blocks[2].next_request_id = 151;
+	other_backend = gcs_block_try_reserve_r4_slot(tag, 70, 1, &request_id);
+	MyBackendId = 2;
+	UT_ASSERT(slot != NULL && same_backend != NULL && other_backend != NULL);
+	if (slot == NULL || same_backend == NULL || other_backend == NULL)
+		return;
+	UT_ASSERT_EQ(old_request_id, UINT64CONST(0x0200010000000033));
+	UT_ASSERT_EQ(same_backend->request_id, UINT64CONST(0x0200010000000034));
+	UT_ASSERT_EQ(other_backend->request_id, UINT64CONST(0x0200020000000097));
+	gcs_block_release_slot(slot);
+	reused = gcs_block_try_reserve_r4_slot(tag, 70, 1, &request_id);
+	UT_ASSERT(reused == slot);
+	if (reused == NULL)
+		return;
+	UT_ASSERT_EQ(request_id, UINT64CONST(0x0200010000000035));
+	memcpy(before, blocks, sizeof(blocks));
+	payload.hdr.request_id = old_request_id;
+	receive();
+	UT_ASSERT_EQ(memcmp(before, blocks, sizeof(blocks)), 0);
+	UT_ASSERT_EQ(signals | locks, 0);
+	/* No owner matches: preserve the original silent-drop counter boundary. */
+	UT_ASSERT_EQ(pg_atomic_read_u64(&counts.stale_reply_drop_count), 0);
+	payload.hdr.request_id = request_id;
+	receive();
+	UT_ASSERT(reused->reply_received && signals == 1 && locks == 0);
+	UT_ASSERT_EQ(memcmp(&reused->reply_header, &payload.hdr, sizeof(payload.hdr)), 0);
+	UT_ASSERT_EQ(memcmp(reused->reply_block_data, payload.data, BLCKSZ), 0);
+	UT_ASSERT_EQ(memcmp(same_backend, &before[1].slots[1], sizeof(*same_backend)), 0);
+	UT_ASSERT_EQ(memcmp(other_backend, &before[2].slots[0], sizeof(*other_backend)), 0);
+	gcs_block_release_slot(reused);
+	gcs_block_release_slot(same_backend);
+	MyBackendId = 3;
+	gcs_block_release_slot(other_backend);
+	MyBackendId = 2;
+}
+
+UT_TEST(r4_requester_full_capacity_does_not_consume_a_sequence)
+{
+	BufferTag tag = r4_requester_fixture();
+	ClusterGcsBlockOutstandingSlot *first, *second, *next;
+	ClusterGcsBlockBackendBlock before[4];
+	uint64 request_id;
+
+	first = gcs_block_try_reserve_r4_slot(tag, 70, 1, &request_id);
+	second = gcs_block_try_reserve_r4_slot(tag, 70, 1, &request_id);
+	UT_ASSERT(first != NULL && second != NULL);
+	if (first == NULL || second == NULL)
+		return;
+	memcpy(before, blocks, sizeof(blocks));
+	request_id = 999;
+	UT_ASSERT(gcs_block_try_reserve_r4_slot(tag, 70, 1, &request_id) == NULL);
+	UT_ASSERT_EQ(request_id, 0);
+	UT_ASSERT_EQ(memcmp(before, blocks, sizeof(blocks)), 0);
+	UT_ASSERT_EQ(blocks[1].next_request_id, 53);
+	UT_ASSERT_EQ(locks | signals | broadcasts, 0);
+	gcs_block_release_slot(first);
+	UT_ASSERT_EQ(broadcasts, 1);
+	next = gcs_block_try_reserve_r4_slot(tag, 70, 1, &request_id);
+	UT_ASSERT(next == first);
+	if (next == NULL)
+		return;
+	UT_ASSERT_EQ(request_id, UINT64CONST(0x0200010000000035));
+	UT_ASSERT_EQ(blocks[1].next_request_id, 54);
+	UT_ASSERT_EQ(memcmp(second, &before[1].slots[1], sizeof(*second)), 0);
+	gcs_block_release_slot(next);
+	gcs_block_release_slot(second);
+	UT_ASSERT_EQ(broadcasts, 3);
+	UT_ASSERT_EQ(locks, 0);
+}
+
+UT_TEST(r4_requester_exhausted_sequence_and_invalid_callers_never_alias)
+{
+	static const struct {
+		BackendId backend;
+		int32 master;
+		bool null_output;
+	} invalid[] = { { -1, 1, false },
+					{ 0, 1, false },
+					{ 5, 1, false },
+					{ 2, -1, false },
+					{ 2, RESOURCE_X_PROTOCOL_NODE_LIMIT, false },
+					{ 2, 1, true } };
+	BufferTag tag = r4_requester_fixture();
+	ClusterGcsBlockOutstandingSlot *slot;
+	ClusterGcsBlockBackendBlock before[4];
+	uint64 request_id;
+	size_t i;
+
+	blocks[1].next_request_id = GCS_REQID_REQUESTER_SEQ_MASK;
+	slot = gcs_block_try_reserve_r4_slot(tag, 70, 1, &request_id);
+	UT_ASSERT_NOT_NULL(slot);
+	if (slot == NULL)
+		return;
+	UT_ASSERT_EQ(request_id, UINT64CONST(0x020001ffffffffff));
+	UT_ASSERT_EQ(blocks[1].next_request_id, GCS_REQID_REQUESTER_SEQ_MASK + 1);
+	gcs_block_release_slot(slot);
+	memcpy(before, blocks, sizeof(blocks));
+	request_id = 999;
+	UT_ASSERT(gcs_block_try_reserve_r4_slot(tag, 70, 1, &request_id) == NULL);
+	UT_ASSERT_EQ(request_id, 0);
+	UT_ASSERT_EQ(memcmp(before, blocks, sizeof(blocks)), 0);
+
+	tag = r4_requester_fixture();
+	blocks[1].next_request_id = 0;
+	memcpy(before, blocks, sizeof(blocks));
+	request_id = 999;
+	UT_ASSERT(gcs_block_try_reserve_r4_slot(tag, 70, 1, &request_id) == NULL);
+	UT_ASSERT_EQ(request_id, 0);
+	UT_ASSERT_EQ(memcmp(before, blocks, sizeof(blocks)), 0);
+
+	tag = r4_requester_fixture();
+	memcpy(before, blocks, sizeof(blocks));
+	for (i = 0; i < lengthof(invalid); i++) {
+		MyBackendId = invalid[i].backend;
+		request_id = 999;
+		UT_ASSERT(gcs_block_try_reserve_r4_slot(tag, 70, invalid[i].master,
+												invalid[i].null_output ? NULL : &request_id)
+				  == NULL);
+		UT_ASSERT_EQ(request_id, invalid[i].null_output ? 999 : 0);
+		UT_ASSERT_EQ(memcmp(before, blocks, sizeof(blocks)), 0);
+		UT_ASSERT_EQ(locks | signals | broadcasts, 0);
+	}
+	MyBackendId = 2;
+}
+
 int
 main(void)
 {
-	UT_PLAN(36);
+	UT_PLAN(40);
 	UT_RUN(default_off_preserves_original_publish_and_signal);
 	UT_RUN(accepted_reply_logs_original_identity_after_unlock);
 	UT_RUN(epoch_refusal_keeps_result_bytes_unchanged);
@@ -768,6 +1034,10 @@ main(void)
 	UT_RUN(r4_tx_identity_and_shape_refuse_before_any_slot_mutation);
 	UT_RUN(r4_tx_late_reply_cannot_populate_a_reused_owner_slot);
 	UT_RUN(r4_tx_reply_preserves_foreign_domains_and_direct_owners);
+	UT_RUN(r4_requester_reserve_land_release_and_reuse_clear_stale_state);
+	UT_RUN(r4_requester_real_reuse_rejects_old_reply_and_preserves_both_peers);
+	UT_RUN(r4_requester_full_capacity_does_not_consume_a_sequence);
+	UT_RUN(r4_requester_exhausted_sequence_and_invalid_callers_never_alias);
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;
 }
