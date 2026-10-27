@@ -359,9 +359,12 @@ CreateCommandTag(Node *statement)
 		return CMDTAG_ALTER_ROLE;
 	if (IsA(statement, DropRoleStmt))
 		return CMDTAG_DROP_ROLE;
+	if (IsA(statement, AlterTableSpaceOptionsStmt))
+		return CMDTAG_ALTER_TABLESPACE;
 	if (IsA(statement, ReassignOwnedStmt))
 		return CMDTAG_REASSIGN_OWNED;
-	if (IsA(statement, AlterDatabaseSetStmt) || IsA(statement, AlterDatabaseRefreshCollStmt))
+	if (IsA(statement, AlterDatabaseSetStmt) || IsA(statement, AlterDatabaseRefreshCollStmt)
+		|| IsA(statement, AlterDatabaseStmt))
 		return CMDTAG_ALTER_DATABASE;
 	if (IsA(statement, CreatePLangStmt))
 		return CMDTAG_CREATE_LANGUAGE;
@@ -1954,6 +1957,39 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 										.objectType = OBJECT_TABLESPACE,
 										.object = (Node *)&owner_space_name,
 										.newowner = &owner_receiver };
+	String database_template_value = { .type = T_String, .sval = "false" };
+	String database_allow_value = { .type = T_String, .sval = "true" };
+	Integer database_limit_value = { .type = T_Integer, .ival = 100 };
+	DefElem database_template_option
+		= { .type = T_DefElem, .defname = "is_template", .arg = (Node *)&database_template_value };
+	DefElem database_allow_option = { .type = T_DefElem,
+									  .defname = "allow_connections",
+									  .arg = (Node *)&database_allow_value };
+	DefElem database_limit_option = { .type = T_DefElem,
+									  .defname = "connection_limit",
+									  .arg = (Node *)&database_limit_value };
+	ListCell database_flags_cells[2]
+		= { { .ptr_value = &database_template_option }, { .ptr_value = &database_allow_option } };
+	List database_flags_options
+		= { .type = T_List, .length = 2, .max_length = 2, .elements = database_flags_cells };
+	ListCell database_limit_cell = { .ptr_value = &database_limit_option };
+	List database_limit_options
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &database_limit_cell };
+	AlterDatabaseStmt database_flags = { .type = T_AlterDatabaseStmt,
+										 .dbname = "target_database",
+										 .options = &database_flags_options };
+	AlterDatabaseStmt database_limit = { .type = T_AlterDatabaseStmt,
+										 .dbname = "target_database",
+										 .options = &database_limit_options };
+	Integer tablespace_cost_value = { .type = T_Integer, .ival = 1 };
+	DefElem tablespace_option
+		= { .type = T_DefElem, .defname = "seq_page_cost", .arg = (Node *)&tablespace_cost_value };
+	ListCell tablespace_option_cell = { .ptr_value = &tablespace_option };
+	List tablespace_option_list
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &tablespace_option_cell };
+	AlterTableSpaceOptionsStmt tablespace_options = { .type = T_AlterTableSpaceOptionsStmt,
+													  .tablespacename = "g_preflight_tablespace",
+													  .options = &tablespace_option_list };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -2030,12 +2066,21 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 						   (Node *)&owner_schema,
 						   (Node *)&owner_function,
 						   (Node *)&owner_collation,
-						   (Node *)&owner_tablespace };
+						   (Node *)&owner_tablespace,
+						   (Node *)&database_flags,
+						   (Node *)&database_limit,
+						   (Node *)&tablespace_options };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned skip = 0; skip < 2; skip++) {
 			reset_create_preflight();
 			utility_expect_binding = true;
+			database_template_value.sval = skip ? "true" : "false";
+			database_allow_value.sval = skip ? "false" : "true";
+			database_limit_value.ival = skip ? -1 : 100;
+			tablespace_options.isReset = skip != 0;
+			tablespace_options.tablespacename = skip ? "PG_UNDO" : "g_preflight_tablespace";
+			tablespace_option.arg = skip ? NULL : (Node *)&tablespace_cost_value;
 			owner_space_name.sval = skip ? "PG_UNDO" : "g_preflight_tablespace";
 			owner_tablespace.newowner = skip ? &reassign_self : &owner_receiver;
 			foreign_table.base.if_not_exists = skip != 0;
@@ -2397,6 +2442,39 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 										.objectType = OBJECT_TABLESPACE,
 										.object = (Node *)&owner_space_name,
 										.newowner = &owner_receiver };
+	String database_template_value = { .type = T_String, .sval = "false" };
+	String database_allow_value = { .type = T_String, .sval = "true" };
+	Integer database_limit_value = { .type = T_Integer, .ival = 100 };
+	DefElem database_template_option
+		= { .type = T_DefElem, .defname = "is_template", .arg = (Node *)&database_template_value };
+	DefElem database_allow_option = { .type = T_DefElem,
+									  .defname = "allow_connections",
+									  .arg = (Node *)&database_allow_value };
+	DefElem database_limit_option = { .type = T_DefElem,
+									  .defname = "connection_limit",
+									  .arg = (Node *)&database_limit_value };
+	ListCell database_flags_cells[2]
+		= { { .ptr_value = &database_template_option }, { .ptr_value = &database_allow_option } };
+	List database_flags_options
+		= { .type = T_List, .length = 2, .max_length = 2, .elements = database_flags_cells };
+	ListCell database_limit_cell = { .ptr_value = &database_limit_option };
+	List database_limit_options
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &database_limit_cell };
+	AlterDatabaseStmt database_flags = { .type = T_AlterDatabaseStmt,
+										 .dbname = "target_database",
+										 .options = &database_flags_options };
+	AlterDatabaseStmt database_limit = { .type = T_AlterDatabaseStmt,
+										 .dbname = "target_database",
+										 .options = &database_limit_options };
+	Integer tablespace_cost_value = { .type = T_Integer, .ival = 1 };
+	DefElem tablespace_option
+		= { .type = T_DefElem, .defname = "seq_page_cost", .arg = (Node *)&tablespace_cost_value };
+	ListCell tablespace_option_cell = { .ptr_value = &tablespace_option };
+	List tablespace_option_list
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &tablespace_option_cell };
+	AlterTableSpaceOptionsStmt tablespace_options = { .type = T_AlterTableSpaceOptionsStmt,
+													  .tablespacename = "g_preflight_tablespace",
+													  .options = &tablespace_option_list };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -2473,7 +2551,10 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 						   (Node *)&owner_schema,
 						   (Node *)&owner_function,
 						   (Node *)&owner_collation,
-						   (Node *)&owner_tablespace };
+						   (Node *)&owner_tablespace,
+						   (Node *)&database_flags,
+						   (Node *)&database_limit,
+						   (Node *)&tablespace_options };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		int caught;
@@ -2764,6 +2845,39 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 										.objectType = OBJECT_TABLESPACE,
 										.object = (Node *)&owner_space_name,
 										.newowner = &owner_receiver };
+	String database_template_value = { .type = T_String, .sval = "false" };
+	String database_allow_value = { .type = T_String, .sval = "true" };
+	Integer database_limit_value = { .type = T_Integer, .ival = 100 };
+	DefElem database_template_option
+		= { .type = T_DefElem, .defname = "is_template", .arg = (Node *)&database_template_value };
+	DefElem database_allow_option = { .type = T_DefElem,
+									  .defname = "allow_connections",
+									  .arg = (Node *)&database_allow_value };
+	DefElem database_limit_option = { .type = T_DefElem,
+									  .defname = "connection_limit",
+									  .arg = (Node *)&database_limit_value };
+	ListCell database_flags_cells[2]
+		= { { .ptr_value = &database_template_option }, { .ptr_value = &database_allow_option } };
+	List database_flags_options
+		= { .type = T_List, .length = 2, .max_length = 2, .elements = database_flags_cells };
+	ListCell database_limit_cell = { .ptr_value = &database_limit_option };
+	List database_limit_options
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &database_limit_cell };
+	AlterDatabaseStmt database_flags = { .type = T_AlterDatabaseStmt,
+										 .dbname = "target_database",
+										 .options = &database_flags_options };
+	AlterDatabaseStmt database_limit = { .type = T_AlterDatabaseStmt,
+										 .dbname = "target_database",
+										 .options = &database_limit_options };
+	Integer tablespace_cost_value = { .type = T_Integer, .ival = 1 };
+	DefElem tablespace_option
+		= { .type = T_DefElem, .defname = "seq_page_cost", .arg = (Node *)&tablespace_cost_value };
+	ListCell tablespace_option_cell = { .ptr_value = &tablespace_option };
+	List tablespace_option_list
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &tablespace_option_cell };
+	AlterTableSpaceOptionsStmt tablespace_options = { .type = T_AlterTableSpaceOptionsStmt,
+													  .tablespacename = "g_preflight_tablespace",
+													  .options = &tablespace_option_list };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -2840,7 +2954,10 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 						   (Node *)&owner_schema,
 						   (Node *)&owner_function,
 						   (Node *)&owner_collation,
-						   (Node *)&owner_tablespace };
+						   (Node *)&owner_tablespace,
+						   (Node *)&database_flags,
+						   (Node *)&database_limit,
+						   (Node *)&tablespace_options };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned child = 0; child < 2; child++) {
@@ -3137,6 +3254,39 @@ UT_TEST(test_catalog_writes_preflight_requires_shared_catalog_storage)
 										.objectType = OBJECT_TABLESPACE,
 										.object = (Node *)&owner_space_name,
 										.newowner = &owner_receiver };
+	String database_template_value = { .type = T_String, .sval = "false" };
+	String database_allow_value = { .type = T_String, .sval = "true" };
+	Integer database_limit_value = { .type = T_Integer, .ival = 100 };
+	DefElem database_template_option
+		= { .type = T_DefElem, .defname = "is_template", .arg = (Node *)&database_template_value };
+	DefElem database_allow_option = { .type = T_DefElem,
+									  .defname = "allow_connections",
+									  .arg = (Node *)&database_allow_value };
+	DefElem database_limit_option = { .type = T_DefElem,
+									  .defname = "connection_limit",
+									  .arg = (Node *)&database_limit_value };
+	ListCell database_flags_cells[2]
+		= { { .ptr_value = &database_template_option }, { .ptr_value = &database_allow_option } };
+	List database_flags_options
+		= { .type = T_List, .length = 2, .max_length = 2, .elements = database_flags_cells };
+	ListCell database_limit_cell = { .ptr_value = &database_limit_option };
+	List database_limit_options
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &database_limit_cell };
+	AlterDatabaseStmt database_flags = { .type = T_AlterDatabaseStmt,
+										 .dbname = "target_database",
+										 .options = &database_flags_options };
+	AlterDatabaseStmt database_limit = { .type = T_AlterDatabaseStmt,
+										 .dbname = "target_database",
+										 .options = &database_limit_options };
+	Integer tablespace_cost_value = { .type = T_Integer, .ival = 1 };
+	DefElem tablespace_option
+		= { .type = T_DefElem, .defname = "seq_page_cost", .arg = (Node *)&tablespace_cost_value };
+	ListCell tablespace_option_cell = { .ptr_value = &tablespace_option };
+	List tablespace_option_list
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &tablespace_option_cell };
+	AlterTableSpaceOptionsStmt tablespace_options = { .type = T_AlterTableSpaceOptionsStmt,
+													  .tablespacename = "g_preflight_tablespace",
+													  .options = &tablespace_option_list };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -3213,7 +3363,10 @@ UT_TEST(test_catalog_writes_preflight_requires_shared_catalog_storage)
 						   (Node *)&owner_schema,
 						   (Node *)&owner_function,
 						   (Node *)&owner_collation,
-						   (Node *)&owner_tablespace };
+						   (Node *)&owner_tablespace,
+						   (Node *)&database_flags,
+						   (Node *)&database_limit,
+						   (Node *)&tablespace_options };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned mode = 0; mode < 8; mode++) {
@@ -3502,6 +3655,39 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 										.objectType = OBJECT_TABLESPACE,
 										.object = (Node *)&owner_space_name,
 										.newowner = &owner_receiver };
+	String database_template_value = { .type = T_String, .sval = "false" };
+	String database_allow_value = { .type = T_String, .sval = "true" };
+	Integer database_limit_value = { .type = T_Integer, .ival = 100 };
+	DefElem database_template_option
+		= { .type = T_DefElem, .defname = "is_template", .arg = (Node *)&database_template_value };
+	DefElem database_allow_option = { .type = T_DefElem,
+									  .defname = "allow_connections",
+									  .arg = (Node *)&database_allow_value };
+	DefElem database_limit_option = { .type = T_DefElem,
+									  .defname = "connection_limit",
+									  .arg = (Node *)&database_limit_value };
+	ListCell database_flags_cells[2]
+		= { { .ptr_value = &database_template_option }, { .ptr_value = &database_allow_option } };
+	List database_flags_options
+		= { .type = T_List, .length = 2, .max_length = 2, .elements = database_flags_cells };
+	ListCell database_limit_cell = { .ptr_value = &database_limit_option };
+	List database_limit_options
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &database_limit_cell };
+	AlterDatabaseStmt database_flags = { .type = T_AlterDatabaseStmt,
+										 .dbname = "target_database",
+										 .options = &database_flags_options };
+	AlterDatabaseStmt database_limit = { .type = T_AlterDatabaseStmt,
+										 .dbname = "target_database",
+										 .options = &database_limit_options };
+	Integer tablespace_cost_value = { .type = T_Integer, .ival = 1 };
+	DefElem tablespace_option
+		= { .type = T_DefElem, .defname = "seq_page_cost", .arg = (Node *)&tablespace_cost_value };
+	ListCell tablespace_option_cell = { .ptr_value = &tablespace_option };
+	List tablespace_option_list
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &tablespace_option_cell };
+	AlterTableSpaceOptionsStmt tablespace_options = { .type = T_AlterTableSpaceOptionsStmt,
+													  .tablespacename = "g_preflight_tablespace",
+													  .options = &tablespace_option_list };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -3578,7 +3764,10 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 						   (Node *)&owner_schema,
 						   (Node *)&owner_function,
 						   (Node *)&owner_collation,
-						   (Node *)&owner_tablespace };
+						   (Node *)&owner_tablespace,
+						   (Node *)&database_flags,
+						   (Node *)&database_limit,
+						   (Node *)&tablespace_options };
 	const char *tags[] = { "CREATE SCHEMA",
 						   "CREATE SEQUENCE",
 						   "CREATE INDEX",
@@ -3655,6 +3844,9 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 						   "ALTER SCHEMA",
 						   "ALTER FUNCTION",
 						   "ALTER COLLATION",
+						   "ALTER TABLESPACE",
+						   "ALTER DATABASE",
+						   "ALTER DATABASE",
 						   "ALTER TABLESPACE" };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
@@ -3927,10 +4119,99 @@ UT_TEST(test_undo_tablespace_owner_refuses_before_binding)
 	}
 }
 
+UT_TEST(test_undo_tablespace_options_refuses_before_binding)
+{
+	Integer cost = { .type = T_Integer, .ival = 1 };
+	DefElem option = { .type = T_DefElem, .defname = "seq_page_cost" };
+	ListCell option_cell = { .ptr_value = &option };
+	List options = { .type = T_List, .length = 1, .max_length = 1, .elements = &option_cell };
+	AlterTableSpaceOptionsStmt alter = { .type = T_AlterTableSpaceOptionsStmt,
+										 .tablespacename = "pg_undo",
+										 .options = &options };
+	ListCell child_cell = { .ptr_value = &alter };
+	List children = { .type = T_List, .length = 1, .max_length = 1, .elements = &child_cell };
+	CreateSchemaStmt schema = { .type = T_CreateSchemaStmt, .schemaElts = &children };
+	Node *statements[] = { (Node *)&alter, (Node *)&schema };
+
+	/* Synthetic recursion; nonshared native boundary still has the OID gate. */
+	for (unsigned mode = 0; mode < 8; mode++) {
+		for (unsigned reset = 0; reset < 2; reset++) {
+			alter.isReset = reset != 0;
+			option.arg = reset ? NULL : (Node *)&cost;
+			for (unsigned child = 0; child < 2; child++) {
+				for (unsigned i = 0; i < lengthof(statements); i++) {
+					int caught;
+
+					reset_create_preflight();
+					cluster_shared_catalog = (mode & 1) != 0;
+					utility_storage_mode = (mode & 2) != 0;
+					cluster_shared_config = (mode & 4) != 0;
+					utility_in_child = child != 0;
+					caught = sigsetjmp(boundary, 1);
+					if (!caught)
+						create_sql_entry(statements[i]);
+					UT_ASSERT_EQ(caught != 0, (mode & 5) != 0);
+					if (caught) {
+						UT_ASSERT_EQ(error_code, ERRCODE_FEATURE_NOT_SUPPORTED);
+						UT_ASSERT(strcmp(error_message, "pg_undo cannot be altered") == 0);
+						UT_ASSERT(strcmp(error_hint,
+										 "pg_undo is managed by the cluster runtime; Stage "
+										 "1.22 does not support modifying its options.")
+								  == 0);
+					}
+					UT_ASSERT_EQ(utility_xids, 0);
+					UT_ASSERT_EQ(utility_prepares, 0);
+					UT_ASSERT_EQ(utility_binds, 0);
+					UT_ASSERT_EQ(utility_after_preflight, (mode & 5) == 0);
+				}
+			}
+		}
+	}
+}
+
+UT_TEST(test_database_move_keeps_native_path_without_binding)
+{
+	String tablespace = { .type = T_String, .sval = "g_preflight_tablespace" };
+	Integer limit = { .type = T_Integer, .ival = 100 };
+	DefElem move = { .type = T_DefElem, .defname = "tablespace", .arg = (Node *)&tablespace };
+	DefElem metadata = { .type = T_DefElem, .defname = "connection_limit", .arg = (Node *)&limit };
+	ListCell move_cell = { .ptr_value = &move };
+	ListCell move_first[2] = { { .ptr_value = &move }, { .ptr_value = &metadata } };
+	ListCell move_last[2] = { { .ptr_value = &metadata }, { .ptr_value = &move } };
+	List options[3] = { { .type = T_List, .length = 1, .max_length = 1, .elements = &move_cell },
+						{ .type = T_List, .length = 2, .max_length = 2, .elements = move_first },
+						{ .type = T_List, .length = 2, .max_length = 2, .elements = move_last } };
+	AlterDatabaseStmt alter = { .type = T_AlterDatabaseStmt, .dbname = "target_database" };
+
+	/* Native move/combination/transaction-block errors are beyond this boundary. */
+	for (unsigned mode = 0; mode < 8; mode++) {
+		for (unsigned variant = 0; variant < lengthof(options); variant++) {
+			for (unsigned child = 0; child < 2; child++) {
+				int caught;
+
+				alter.options = &options[variant];
+				reset_create_preflight();
+				cluster_shared_catalog = (mode & 1) != 0;
+				utility_storage_mode = (mode & 2) != 0;
+				cluster_shared_config = (mode & 4) != 0;
+				utility_in_child = utility_in_transaction = child != 0;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					create_sql_entry((Node *)&alter);
+				UT_ASSERT_EQ(caught, 0);
+				UT_ASSERT_EQ(utility_xids, 0);
+				UT_ASSERT_EQ(utility_prepares, 0);
+				UT_ASSERT_EQ(utility_binds, 0);
+				UT_ASSERT_EQ(utility_after_preflight, 1);
+			}
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(48);
+	UT_PLAN(50);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -3979,6 +4260,8 @@ main(void)
 	UT_RUN(test_materialized_view_dependency_refuses_before_binding);
 	UT_RUN(test_foreign_table_unsupported_base_refuses_before_binding);
 	UT_RUN(test_undo_tablespace_owner_refuses_before_binding);
+	UT_RUN(test_undo_tablespace_options_refuses_before_binding);
+	UT_RUN(test_database_move_keeps_native_path_without_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

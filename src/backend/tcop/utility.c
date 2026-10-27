@@ -121,6 +121,15 @@ CheckClusterSharedUtilitySupport(Node *statement, bool isTopLevel)
 		case T_DropTableSpaceStmt:
 			unsupported = "CREATE/DROP TABLESPACE";
 			break;
+		case T_AlterTableSpaceOptionsStmt:
+			if (((AlterTableSpaceOptionsStmt *)statement)->tablespacename != NULL
+				&& strcmp(((AlterTableSpaceOptionsStmt *)statement)->tablespacename, "pg_undo")
+					   == 0)
+				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								errmsg("pg_undo cannot be altered"),
+								errhint("pg_undo is managed by the cluster runtime; "
+										"Stage 1.22 does not support modifying its options.")));
+			break;
 		case T_CreateExtensionStmt:
 			unsupported = "CREATE EXTENSION";
 			break;
@@ -333,8 +342,21 @@ PreflightClusterSharedCatalogWrite(Node *statement)
 			&& !IsA(statement, CreatePublicationStmt) && !IsA(statement, AlterPublicationStmt)
 			&& !IsA(statement, AlterObjectDependsStmt) && !IsA(statement, ReassignOwnedStmt)
 			&& !IsA(statement, CreateForeignTableStmt) && !IsA(statement, AlterOwnerStmt)
+			&& !IsA(statement, AlterDatabaseStmt) && !IsA(statement, AlterTableSpaceOptionsStmt)
 			&& !IsA(statement, TruncateStmt)))
 		return;
+
+	if (IsA(statement, AlterDatabaseStmt)) {
+		ListCell *lc;
+
+		/* Keep database moves on their original transaction-restriction path. */
+		foreach (lc, ((AlterDatabaseStmt *)statement)->options) {
+			DefElem *option = (DefElem *)lfirst(lc);
+
+			if (strcmp(option->defname, "tablespace") == 0)
+				return;
+		}
+	}
 
 	if (IsA(statement, CreateStatsStmt)) {
 		CreateStatsStmt *stats = (CreateStatsStmt *)statement;
@@ -359,7 +381,8 @@ PreflightClusterSharedCatalogWrite(Node *statement)
 			 || IsA(statement, AlterForeignServerStmt) || IsA(statement, AlterUserMappingStmt)
 			 || IsA(statement, DropUserMappingStmt) || IsA(statement, AlterPublicationStmt)
 			 || IsA(statement, AlterObjectDependsStmt) || IsA(statement, ReassignOwnedStmt)
-			 || IsA(statement, AlterOwnerStmt))
+			 || IsA(statement, AlterOwnerStmt) || IsA(statement, AlterDatabaseStmt)
+			 || IsA(statement, AlterTableSpaceOptionsStmt))
 		action = "alteration";
 	else
 		action = "creation";
