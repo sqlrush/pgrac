@@ -311,7 +311,9 @@ PreflightClusterSharedCatalogWrite(Node *statement)
 			&& !IsA(statement, AlterTSConfigurationStmt) && !IsA(statement, DefineStmt)
 			&& !IsA(statement, CreateRoleStmt) && !IsA(statement, AlterRoleStmt)
 			&& !IsA(statement, AlterRoleSetStmt) && !IsA(statement, DropRoleStmt)
-			&& !IsA(statement, CreateStatsStmt) && !IsA(statement, TruncateStmt)))
+			&& !IsA(statement, AlterDatabaseSetStmt)
+			&& !IsA(statement, AlterDatabaseRefreshCollStmt) && !IsA(statement, CreateStatsStmt)
+			&& !IsA(statement, TruncateStmt)))
 		return;
 
 	if (IsA(statement, CreateStatsStmt)) {
@@ -332,7 +334,8 @@ PreflightClusterSharedCatalogWrite(Node *statement)
 			 || IsA(statement, AlterCollationStmt) || IsA(statement, AlterSeqStmt)
 			 || IsA(statement, AlterTSDictionaryStmt) || IsA(statement, AlterTSConfigurationStmt)
 			 || IsA(statement, AlterRoleStmt) || IsA(statement, AlterRoleSetStmt)
-			 || IsA(statement, DropRoleStmt))
+			 || IsA(statement, DropRoleStmt) || IsA(statement, AlterDatabaseSetStmt)
+			 || IsA(statement, AlterDatabaseRefreshCollStmt))
 		action = "alteration";
 	else
 		action = "creation";

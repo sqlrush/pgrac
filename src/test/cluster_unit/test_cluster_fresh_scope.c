@@ -322,6 +322,8 @@ CreateCommandTag(Node *statement)
 		return CMDTAG_ALTER_ROLE;
 	if (IsA(statement, DropRoleStmt))
 		return CMDTAG_DROP_ROLE;
+	if (IsA(statement, AlterDatabaseSetStmt) || IsA(statement, AlterDatabaseRefreshCollStmt))
+		return CMDTAG_ALTER_DATABASE;
 	if (IsA(statement, AlterSeqStmt))
 		return CMDTAG_ALTER_SEQUENCE;
 	if (IsA(statement, AlterTSDictionaryStmt))
@@ -410,6 +412,8 @@ GetCommandTagName(CommandTag tag)
 		return "ALTER ROLE";
 	if (tag == CMDTAG_DROP_ROLE)
 		return "DROP ROLE";
+	if (tag == CMDTAG_ALTER_DATABASE)
+		return "ALTER DATABASE";
 	if (tag == CMDTAG_ALTER_SEQUENCE)
 		return "ALTER SEQUENCE";
 	if (tag == CMDTAG_ALTER_TEXT_SEARCH_DICTIONARY)
@@ -1642,6 +1646,13 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 	ListCell role_cell = { .ptr_value = &role_target };
 	List roles = { .type = T_List, .length = 1, .max_length = 1, .elements = &role_cell };
 	DropRoleStmt drop_role = { .type = T_DropRoleStmt, .roles = &roles };
+	VariableSetStmt database_setting
+		= { .type = T_VariableSetStmt, .kind = VAR_RESET, .name = "application_name" };
+	AlterDatabaseSetStmt database_settings = { .type = T_AlterDatabaseSetStmt,
+											   .dbname = "target_database",
+											   .setstmt = &database_setting };
+	AlterDatabaseRefreshCollStmt database_collation
+		= { .type = T_AlterDatabaseRefreshCollStmt, .dbname = "target_database" };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -1685,7 +1696,9 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 						   (Node *)&alter_role,
 						   (Node *)&alter_settings,
 						   (Node *)&all_settings,
-						   (Node *)&drop_role };
+						   (Node *)&drop_role,
+						   (Node *)&database_settings,
+						   (Node *)&database_collation };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned skip = 0; skip < 2; skip++) {
@@ -1707,6 +1720,8 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 			drop_role.missing_ok = skip != 0;
 			role_setting.kind = skip ? VAR_RESET_ALL : VAR_RESET;
 			role_setting.name = skip ? NULL : "application_name";
+			database_setting.kind = skip ? VAR_RESET_ALL : VAR_RESET;
+			database_setting.name = skip ? NULL : "application_name";
 			create_sql_entry(statements[i]);
 			UT_ASSERT_EQ(utility_unbound, 0);
 			UT_ASSERT_EQ(utility_after_preflight, 1);
@@ -1842,6 +1857,13 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 	ListCell role_cell = { .ptr_value = &role_target };
 	List roles = { .type = T_List, .length = 1, .max_length = 1, .elements = &role_cell };
 	DropRoleStmt drop_role = { .type = T_DropRoleStmt, .roles = &roles };
+	VariableSetStmt database_setting
+		= { .type = T_VariableSetStmt, .kind = VAR_RESET, .name = "application_name" };
+	AlterDatabaseSetStmt database_settings = { .type = T_AlterDatabaseSetStmt,
+											   .dbname = "target_database",
+											   .setstmt = &database_setting };
+	AlterDatabaseRefreshCollStmt database_collation
+		= { .type = T_AlterDatabaseRefreshCollStmt, .dbname = "target_database" };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -1885,7 +1907,9 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 						   (Node *)&alter_role,
 						   (Node *)&alter_settings,
 						   (Node *)&all_settings,
-						   (Node *)&drop_role };
+						   (Node *)&drop_role,
+						   (Node *)&database_settings,
+						   (Node *)&database_collation };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		int caught;
@@ -1985,6 +2009,13 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 	ListCell role_cell = { .ptr_value = &role_target };
 	List roles = { .type = T_List, .length = 1, .max_length = 1, .elements = &role_cell };
 	DropRoleStmt drop_role = { .type = T_DropRoleStmt, .roles = &roles };
+	VariableSetStmt database_setting
+		= { .type = T_VariableSetStmt, .kind = VAR_RESET, .name = "application_name" };
+	AlterDatabaseSetStmt database_settings = { .type = T_AlterDatabaseSetStmt,
+											   .dbname = "target_database",
+											   .setstmt = &database_setting };
+	AlterDatabaseRefreshCollStmt database_collation
+		= { .type = T_AlterDatabaseRefreshCollStmt, .dbname = "target_database" };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -2028,7 +2059,9 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 						   (Node *)&alter_role,
 						   (Node *)&alter_settings,
 						   (Node *)&all_settings,
-						   (Node *)&drop_role };
+						   (Node *)&drop_role,
+						   (Node *)&database_settings,
+						   (Node *)&database_collation };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned child = 0; child < 2; child++) {
@@ -2134,6 +2167,13 @@ UT_TEST(test_catalog_writes_preflight_requires_shared_catalog_storage)
 	ListCell role_cell = { .ptr_value = &role_target };
 	List roles = { .type = T_List, .length = 1, .max_length = 1, .elements = &role_cell };
 	DropRoleStmt drop_role = { .type = T_DropRoleStmt, .roles = &roles };
+	VariableSetStmt database_setting
+		= { .type = T_VariableSetStmt, .kind = VAR_RESET, .name = "application_name" };
+	AlterDatabaseSetStmt database_settings = { .type = T_AlterDatabaseSetStmt,
+											   .dbname = "target_database",
+											   .setstmt = &database_setting };
+	AlterDatabaseRefreshCollStmt database_collation
+		= { .type = T_AlterDatabaseRefreshCollStmt, .dbname = "target_database" };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -2177,7 +2217,9 @@ UT_TEST(test_catalog_writes_preflight_requires_shared_catalog_storage)
 						   (Node *)&alter_role,
 						   (Node *)&alter_settings,
 						   (Node *)&all_settings,
-						   (Node *)&drop_role };
+						   (Node *)&drop_role,
+						   (Node *)&database_settings,
+						   (Node *)&database_collation };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned mode = 0; mode < 8; mode++) {
@@ -2275,6 +2317,13 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 	ListCell role_cell = { .ptr_value = &role_target };
 	List roles = { .type = T_List, .length = 1, .max_length = 1, .elements = &role_cell };
 	DropRoleStmt drop_role = { .type = T_DropRoleStmt, .roles = &roles };
+	VariableSetStmt database_setting
+		= { .type = T_VariableSetStmt, .kind = VAR_RESET, .name = "application_name" };
+	AlterDatabaseSetStmt database_settings = { .type = T_AlterDatabaseSetStmt,
+											   .dbname = "target_database",
+											   .setstmt = &database_setting };
+	AlterDatabaseRefreshCollStmt database_collation
+		= { .type = T_AlterDatabaseRefreshCollStmt, .dbname = "target_database" };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -2318,7 +2367,9 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 						   (Node *)&alter_role,
 						   (Node *)&alter_settings,
 						   (Node *)&all_settings,
-						   (Node *)&drop_role };
+						   (Node *)&drop_role,
+						   (Node *)&database_settings,
+						   (Node *)&database_collation };
 	const char *tags[] = { "CREATE SCHEMA",
 						   "CREATE SEQUENCE",
 						   "CREATE INDEX",
@@ -2362,7 +2413,9 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 						   "ALTER ROLE",
 						   "ALTER ROLE",
 						   "ALTER ROLE",
-						   "DROP ROLE" };
+						   "DROP ROLE",
+						   "ALTER DATABASE",
+						   "ALTER DATABASE" };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned parallel = 0; parallel < 2; parallel++) {
