@@ -369,6 +369,11 @@ typedef struct ClusterRecoveryRelmapClogEventV1 {
 	Oid oldest_database;
 	bool counter_observed;
 	uint64 counter_before, counter_after;
+	/* Only the original FULL opcode supplies this complete native image.
+	 * Legacy ZERO/TRUNCATE remain unobserved. A page birth is not issuance,
+	 * a queried transaction's era, no-reuse or continuous physical lifetime. */
+	bool full_birth_observed;
+	xl_clog_zeropage_full full_birth;
 } ClusterRecoveryRelmapClogEventV1;
 
 /* One original physical generation's complete native-redo counter fold.
