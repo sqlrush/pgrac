@@ -7536,6 +7536,7 @@ test_cluster_undo_pending_product.o: test_cluster_undo_pending_product.c \
 
 test_cluster_r4_tx_outcome: test_cluster_r4_tx_outcome.c unit_test.h \
 		test_cluster_savepoint_origin_plan.inc $(CLUSTER_SAVEPOINT_READER_O) \
+		test_cluster_savepoint_origin_driver.inc \
 		$(top_srcdir)/src/include/cluster/cluster_runtime_visibility.h \
 		$(top_srcdir)/src/include/cluster/cluster_savepoint_reader.h \
 		$(top_srcdir)/src/include/cluster/cluster_tx_resolve.h \

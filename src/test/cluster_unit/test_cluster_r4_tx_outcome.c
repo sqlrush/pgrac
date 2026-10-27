@@ -204,6 +204,12 @@ static int test_candidate_extract_calls;
 static bool test_candidate_mutate_record_on_recheck;
 static bool test_operation_page_enabled;
 static PGAlignedBlock test_operation_page;
+static int test_operation_acquire_failure_call;
+static int test_operation_pin_depth;
+static int test_operation_release_pending_call;
+static int test_operation_release_poll_count;
+static int test_operation_release_wait_count;
+static void (*test_operation_release_observer)(void);
 
 /* Existing pending-receipt tests model the backend-local top capture only;
  * they do not execute the live frame/capture implementation. */
@@ -810,6 +816,11 @@ cluster_undo_block0_current_acquire_begin_admitted(
 	UT_ASSERT_EQ(mode, CLUSTER_UNDO_BLOCK0_SCUR);
 	UT_ASSERT_EQ(test_xact_lock_depth, 0);
 	UT_ASSERT(test_admission_token_exact(admission));
+	if (test_operation_release_pending_call != 0
+		&& test_operation_release_pending_call == test_candidate_release_calls)
+		UT_ASSERT_EQ(test_operation_release_poll_count, 2);
+	if (test_operation_acquire_failure_call == test_candidate_acquire_calls)
+		return CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
 	if (test_candidate_acquire_step == CLUSTER_UNDO_BLOCK0_CURRENT_HELD) {
 		test_candidate_held_count++;
 		if (test_candidate_max_held_count < test_candidate_held_count)
@@ -837,6 +848,13 @@ cluster_undo_block0_current_wait_reply(ClusterUndoBlock0CurrentGuard *guard pg_a
 {
 	UT_ASSERT(site == CLUSTER_UNDO_BLOCK0_WAIT_RUNTIME_VIS_ACQUIRE
 			  || site == CLUSTER_UNDO_BLOCK0_WAIT_RUNTIME_VIS_RELEASE);
+	if (site == CLUSTER_UNDO_BLOCK0_WAIT_RUNTIME_VIS_RELEASE) {
+		test_operation_release_wait_count++;
+		UT_ASSERT_EQ(test_operation_release_poll_count, 1);
+		if (test_operation_release_observer != NULL)
+			test_operation_release_observer();
+		return true;
+	}
 	test_candidate_wait_calls++;
 	UT_ASSERT_EQ(test_candidate_poll_calls, test_candidate_wait_calls);
 	/* A wake alone is not a grant: the product must repoll each time. */
@@ -1184,7 +1202,11 @@ cluster_undo_buf_pin(uint32 segment_id, uint8 owner, uint32 block_no, ClusterUnd
 		return NULL;
 	pin->slot = 0;
 	pin->mode = mode;
+	if (test_operation_page_enabled)
+		test_operation_pin_depth++;
 	memset(test_candidate_io_page.data, 0x5a, BLCKSZ);
+	if (test_operation_page_enabled)
+		memcpy(test_candidate_io_page.data, test_operation_page.data, BLCKSZ);
 	if (test_candidate_data_io_generation_drift && test_candidate_data_pin_calls == 2)
 		test_candidate_data_generation++;
 	return test_candidate_io_page.data;
@@ -1197,6 +1219,8 @@ cluster_undo_buf_unpin(ClusterUndoBufPin *pin)
 	UT_ASSERT_EQ(pin->mode, CLUSTER_UNDO_BUF_SHARED);
 	UT_ASSERT_EQ(test_candidate_held_count, 1);
 	test_candidate_data_unpin_calls++;
+	if (test_operation_page_enabled)
+		test_operation_pin_depth--;
 	pin->slot = -1;
 }
 
@@ -1233,6 +1257,8 @@ cluster_undo_block0_current_release_begin(ClusterUndoBlock0CurrentGuard *guard
 		UT_ASSERT(!*test_updater_retry_observer);
 	UT_ASSERT(test_candidate_held_count > 0);
 	test_candidate_held_count--;
+	if (test_operation_release_observer != NULL)
+		test_operation_release_observer();
 	if (test_candidate_release_fault_call != 0
 		&& test_candidate_release_calls != test_candidate_release_fault_call)
 		return CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED;
@@ -1295,6 +1321,8 @@ cluster_undo_block0_current_release_begin(ClusterUndoBlock0CurrentGuard *guard
 	}
 	if (test_candidate_release_failed)
 		return CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
+	if (test_candidate_release_calls == test_operation_release_pending_call)
+		return CLUSTER_UNDO_BLOCK0_CURRENT_PENDING;
 	return CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED;
 }
 
@@ -1302,6 +1330,11 @@ ClusterUndoBlock0CurrentStep
 cluster_undo_block0_current_release_poll(ClusterUndoBlock0CurrentGuard *guard pg_attribute_unused(),
 										 ClusterUndoBlock0Result *failure pg_attribute_unused())
 {
+	if (test_operation_release_pending_call != 0) {
+		test_operation_release_poll_count++;
+		return test_operation_release_poll_count == 1 ? CLUSTER_UNDO_BLOCK0_CURRENT_PENDING
+													  : CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED;
+	}
 	UT_ASSERT(false);
 	return CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
 }
@@ -1310,6 +1343,9 @@ void
 cluster_undo_block0_current_cancel(ClusterUndoBlock0CurrentGuard *guard pg_attribute_unused())
 {
 	test_candidate_cancel_calls++;
+	/* The original cancel detaches this guard and stages no-wait cleanup;
+	 * this counter models attached guards, not physical release completion. */
+	test_candidate_held_count = 0;
 }
 
 ClusterTxOutcome
@@ -1452,6 +1488,12 @@ reset_exact_origin_fixture(void)
 	test_candidate_extract_calls = 0;
 	test_candidate_mutate_record_on_recheck = false;
 	test_operation_page_enabled = false;
+	test_operation_acquire_failure_call = 0;
+	test_operation_pin_depth = 0;
+	test_operation_release_pending_call = 0;
+	test_operation_release_poll_count = 0;
+	test_operation_release_wait_count = 0;
+	test_operation_release_observer = NULL;
 	test_candidate_sample_result = CLUSTER_UNDO_BLOCK0_OK;
 	test_candidate_data_generation = 17;
 	test_candidate_tt_generation = 23;
@@ -7510,11 +7552,24 @@ UT_TEST(test_retained_slot_identity_does_not_escape_original_final_fences)
 }
 
 #include "test_cluster_savepoint_origin_plan.inc"
+#include "test_cluster_savepoint_origin_driver.inc"
 
 int
 main(void)
 {
-	UT_PLAN(218);
+	UT_PLAN(230);
+	UT_RUN(test_operation_driver_three_current_phases);
+	UT_RUN(test_operation_driver_post_top_discard);
+	UT_RUN(test_operation_driver_preserves_sampled_active);
+	UT_RUN(test_operation_driver_acquire_failures);
+	UT_RUN(test_operation_driver_release_failures);
+	UT_RUN(test_operation_driver_release_authority_fences);
+	UT_RUN(test_operation_driver_changed_data_refuses);
+	UT_RUN(test_operation_driver_cold_reads);
+	UT_RUN(test_operation_driver_cold_miss_refuses);
+	UT_RUN(test_operation_driver_error_cleanup);
+	UT_RUN(test_operation_driver_pending_waits);
+	UT_RUN(test_operation_driver_bad_and_foreign_inputs);
 	UT_RUN(test_operation_plan_requires_three_phases);
 	UT_RUN(test_operation_plan_consumes_post_top_discard);
 	UT_RUN(test_operation_plan_keeps_sampled_active);

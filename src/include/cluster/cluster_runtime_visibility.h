@@ -213,6 +213,19 @@ extern ClusterTxOutcome cluster_runtime_visibility_origin_plan_copy_operation_he
 	const ClusterUndoBlock0ResolvedRoot *root, ClusterTxResolution *top_out,
 	ClusterSavepointReaderRecord *operation_out, char data_out[BLCKSZ],
 	ClusterTxResolveReason *reason_out);
+
+/* Synchronous local-origin owner for the explicit operation plan. It performs
+ * three original SCUR acquisitions, releases every phase and stages outputs
+ * through final release/admission. Cold DATA uses the original pool only in
+ * DATA phases; no pin/guard spans the TT sample. Caller owns independent
+ * expected identity and reader/retention scope. Foreign requests remain
+ * UNKNOWN until an operation-aware peer consumer exists; no ordinary RPC
+ * fallback may discard disposition. LMS uses the split held entries above. */
+extern ClusterTxOutcome cluster_runtime_visibility_resolve_operation_origin_admitted(
+	const ClusterTxLocator *locator, const ClusterSavepointOperation *expected,
+	ClusterTxResolveMode mode, const ClusterSemanticAdmissionToken *admission,
+	ClusterTxResolution *top_out, ClusterSavepointReaderRecord *operation_out,
+	char data_out[BLCKSZ], ClusterTxResolveReason *reason_out);
 extern bool cluster_runtime_visibility_origin_plan_canonical_logical(
 	const ClusterRuntimeVisibilityOriginPlan *plan, ClusterUndoBlock0LogicalKey *logical_out);
 extern bool cluster_runtime_visibility_origin_plan_canonical_physical(
