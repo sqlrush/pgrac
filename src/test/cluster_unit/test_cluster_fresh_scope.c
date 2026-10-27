@@ -341,6 +341,8 @@ CreateCommandTag(Node *statement)
 		return CMDTAG_ALTER_ROLE;
 	if (IsA(statement, DropRoleStmt))
 		return CMDTAG_DROP_ROLE;
+	if (IsA(statement, ReassignOwnedStmt))
+		return CMDTAG_REASSIGN_OWNED;
 	if (IsA(statement, AlterDatabaseSetStmt) || IsA(statement, AlterDatabaseRefreshCollStmt))
 		return CMDTAG_ALTER_DATABASE;
 	if (IsA(statement, CreatePLangStmt))
@@ -465,6 +467,8 @@ GetCommandTagName(CommandTag tag)
 		return "ALTER ROLE";
 	if (tag == CMDTAG_DROP_ROLE)
 		return "DROP ROLE";
+	if (tag == CMDTAG_REASSIGN_OWNED)
+		return "REASSIGN OWNED";
 	if (tag == CMDTAG_ALTER_DATABASE)
 		return "ALTER DATABASE";
 	if (tag == CMDTAG_CREATE_LANGUAGE)
@@ -1867,6 +1871,24 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 											 .objectType = OBJECT_INDEX,
 											 .relation = &stats_relation,
 											 .extname = &dependency_extension };
+	RoleSpec reassign_first
+		= { .type = T_RoleSpec, .roletype = ROLESPEC_CSTRING, .rolename = "source_owner" };
+	RoleSpec reassign_second
+		= { .type = T_RoleSpec, .roletype = ROLESPEC_CSTRING, .rolename = "second_owner" };
+	RoleSpec reassign_receiver
+		= { .type = T_RoleSpec, .roletype = ROLESPEC_CSTRING, .rolename = "receiving_owner" };
+	ListCell reassign_cells[2]
+		= { { .ptr_value = &reassign_first }, { .ptr_value = &reassign_second } };
+	List reassign_roles
+		= { .type = T_List, .length = 2, .max_length = 2, .elements = reassign_cells };
+	ReassignOwnedStmt reassign_named
+		= { .type = T_ReassignOwnedStmt, .roles = &reassign_roles, .newrole = &reassign_receiver };
+	RoleSpec reassign_self = { .type = T_RoleSpec, .roletype = ROLESPEC_CURRENT_USER };
+	ListCell reassign_self_cell = { .ptr_value = &reassign_self };
+	List reassign_self_roles
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &reassign_self_cell };
+	ReassignOwnedStmt reassign_context
+		= { .type = T_ReassignOwnedStmt, .roles = &reassign_self_roles, .newrole = &reassign_self };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -1935,7 +1957,9 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 						   (Node *)&depends_procedure,
 						   (Node *)&depends_routine,
 						   (Node *)&depends_trigger,
-						   (Node *)&depends_index };
+						   (Node *)&depends_index,
+						   (Node *)&reassign_named,
+						   (Node *)&reassign_context };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned skip = 0; skip < 2; skip++) {
@@ -1971,6 +1995,8 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 			publish_value.sval = skip ? "insert, update" : "insert";
 			depends_function.remove = depends_procedure.remove = depends_routine.remove
 				= depends_trigger.remove = depends_index.remove = skip != 0;
+			reassign_named.newrole = skip ? &reassign_first : &reassign_receiver;
+			reassign_self.roletype = skip ? ROLESPEC_SESSION_USER : ROLESPEC_CURRENT_USER;
 			create_sql_entry(statements[i]);
 			UT_ASSERT_EQ(utility_unbound, 0);
 			UT_ASSERT_EQ(utility_after_preflight, 1);
@@ -2239,6 +2265,24 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 											 .objectType = OBJECT_INDEX,
 											 .relation = &stats_relation,
 											 .extname = &dependency_extension };
+	RoleSpec reassign_first
+		= { .type = T_RoleSpec, .roletype = ROLESPEC_CSTRING, .rolename = "source_owner" };
+	RoleSpec reassign_second
+		= { .type = T_RoleSpec, .roletype = ROLESPEC_CSTRING, .rolename = "second_owner" };
+	RoleSpec reassign_receiver
+		= { .type = T_RoleSpec, .roletype = ROLESPEC_CSTRING, .rolename = "receiving_owner" };
+	ListCell reassign_cells[2]
+		= { { .ptr_value = &reassign_first }, { .ptr_value = &reassign_second } };
+	List reassign_roles
+		= { .type = T_List, .length = 2, .max_length = 2, .elements = reassign_cells };
+	ReassignOwnedStmt reassign_named
+		= { .type = T_ReassignOwnedStmt, .roles = &reassign_roles, .newrole = &reassign_receiver };
+	RoleSpec reassign_self = { .type = T_RoleSpec, .roletype = ROLESPEC_CURRENT_USER };
+	ListCell reassign_self_cell = { .ptr_value = &reassign_self };
+	List reassign_self_roles
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &reassign_self_cell };
+	ReassignOwnedStmt reassign_context
+		= { .type = T_ReassignOwnedStmt, .roles = &reassign_self_roles, .newrole = &reassign_self };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -2307,7 +2351,9 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 						   (Node *)&depends_procedure,
 						   (Node *)&depends_routine,
 						   (Node *)&depends_trigger,
-						   (Node *)&depends_index };
+						   (Node *)&depends_index,
+						   (Node *)&reassign_named,
+						   (Node *)&reassign_context };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		int caught;
@@ -2540,6 +2586,24 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 											 .objectType = OBJECT_INDEX,
 											 .relation = &stats_relation,
 											 .extname = &dependency_extension };
+	RoleSpec reassign_first
+		= { .type = T_RoleSpec, .roletype = ROLESPEC_CSTRING, .rolename = "source_owner" };
+	RoleSpec reassign_second
+		= { .type = T_RoleSpec, .roletype = ROLESPEC_CSTRING, .rolename = "second_owner" };
+	RoleSpec reassign_receiver
+		= { .type = T_RoleSpec, .roletype = ROLESPEC_CSTRING, .rolename = "receiving_owner" };
+	ListCell reassign_cells[2]
+		= { { .ptr_value = &reassign_first }, { .ptr_value = &reassign_second } };
+	List reassign_roles
+		= { .type = T_List, .length = 2, .max_length = 2, .elements = reassign_cells };
+	ReassignOwnedStmt reassign_named
+		= { .type = T_ReassignOwnedStmt, .roles = &reassign_roles, .newrole = &reassign_receiver };
+	RoleSpec reassign_self = { .type = T_RoleSpec, .roletype = ROLESPEC_CURRENT_USER };
+	ListCell reassign_self_cell = { .ptr_value = &reassign_self };
+	List reassign_self_roles
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &reassign_self_cell };
+	ReassignOwnedStmt reassign_context
+		= { .type = T_ReassignOwnedStmt, .roles = &reassign_self_roles, .newrole = &reassign_self };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -2608,7 +2672,9 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 						   (Node *)&depends_procedure,
 						   (Node *)&depends_routine,
 						   (Node *)&depends_trigger,
-						   (Node *)&depends_index };
+						   (Node *)&depends_index,
+						   (Node *)&reassign_named,
+						   (Node *)&reassign_context };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned child = 0; child < 2; child++) {
@@ -2847,6 +2913,24 @@ UT_TEST(test_catalog_writes_preflight_requires_shared_catalog_storage)
 											 .objectType = OBJECT_INDEX,
 											 .relation = &stats_relation,
 											 .extname = &dependency_extension };
+	RoleSpec reassign_first
+		= { .type = T_RoleSpec, .roletype = ROLESPEC_CSTRING, .rolename = "source_owner" };
+	RoleSpec reassign_second
+		= { .type = T_RoleSpec, .roletype = ROLESPEC_CSTRING, .rolename = "second_owner" };
+	RoleSpec reassign_receiver
+		= { .type = T_RoleSpec, .roletype = ROLESPEC_CSTRING, .rolename = "receiving_owner" };
+	ListCell reassign_cells[2]
+		= { { .ptr_value = &reassign_first }, { .ptr_value = &reassign_second } };
+	List reassign_roles
+		= { .type = T_List, .length = 2, .max_length = 2, .elements = reassign_cells };
+	ReassignOwnedStmt reassign_named
+		= { .type = T_ReassignOwnedStmt, .roles = &reassign_roles, .newrole = &reassign_receiver };
+	RoleSpec reassign_self = { .type = T_RoleSpec, .roletype = ROLESPEC_CURRENT_USER };
+	ListCell reassign_self_cell = { .ptr_value = &reassign_self };
+	List reassign_self_roles
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &reassign_self_cell };
+	ReassignOwnedStmt reassign_context
+		= { .type = T_ReassignOwnedStmt, .roles = &reassign_self_roles, .newrole = &reassign_self };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -2915,7 +2999,9 @@ UT_TEST(test_catalog_writes_preflight_requires_shared_catalog_storage)
 						   (Node *)&depends_procedure,
 						   (Node *)&depends_routine,
 						   (Node *)&depends_trigger,
-						   (Node *)&depends_index };
+						   (Node *)&depends_index,
+						   (Node *)&reassign_named,
+						   (Node *)&reassign_context };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned mode = 0; mode < 8; mode++) {
@@ -3146,6 +3232,24 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 											 .objectType = OBJECT_INDEX,
 											 .relation = &stats_relation,
 											 .extname = &dependency_extension };
+	RoleSpec reassign_first
+		= { .type = T_RoleSpec, .roletype = ROLESPEC_CSTRING, .rolename = "source_owner" };
+	RoleSpec reassign_second
+		= { .type = T_RoleSpec, .roletype = ROLESPEC_CSTRING, .rolename = "second_owner" };
+	RoleSpec reassign_receiver
+		= { .type = T_RoleSpec, .roletype = ROLESPEC_CSTRING, .rolename = "receiving_owner" };
+	ListCell reassign_cells[2]
+		= { { .ptr_value = &reassign_first }, { .ptr_value = &reassign_second } };
+	List reassign_roles
+		= { .type = T_List, .length = 2, .max_length = 2, .elements = reassign_cells };
+	ReassignOwnedStmt reassign_named
+		= { .type = T_ReassignOwnedStmt, .roles = &reassign_roles, .newrole = &reassign_receiver };
+	RoleSpec reassign_self = { .type = T_RoleSpec, .roletype = ROLESPEC_CURRENT_USER };
+	ListCell reassign_self_cell = { .ptr_value = &reassign_self };
+	List reassign_self_roles
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &reassign_self_cell };
+	ReassignOwnedStmt reassign_context
+		= { .type = T_ReassignOwnedStmt, .roles = &reassign_self_roles, .newrole = &reassign_self };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -3214,7 +3318,9 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 						   (Node *)&depends_procedure,
 						   (Node *)&depends_routine,
 						   (Node *)&depends_trigger,
-						   (Node *)&depends_index };
+						   (Node *)&depends_index,
+						   (Node *)&reassign_named,
+						   (Node *)&reassign_context };
 	const char *tags[] = { "CREATE SCHEMA",
 						   "CREATE SEQUENCE",
 						   "CREATE INDEX",
@@ -3283,7 +3389,9 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 						   "ALTER PROCEDURE",
 						   "ALTER ROUTINE",
 						   "ALTER TRIGGER",
-						   "ALTER INDEX" };
+						   "ALTER INDEX",
+						   "REASSIGN OWNED",
+						   "REASSIGN OWNED" };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned parallel = 0; parallel < 2; parallel++) {
