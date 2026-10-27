@@ -18,6 +18,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "access/clog.h"
 
 #include "cluster/cluster_multixact.h"
 #include "cluster/cluster_side_online_plan.h"
@@ -406,10 +407,39 @@ UT_TEST(test_online_owner_wires_retained_source_identity_and_real_callbacks)
 	UT_ASSERT(!rf_side_online_projection_apply_owned_v1(&owner, &operation));
 }
 
+UT_TEST(test_full_clog_projection_requires_complete_original_birth)
+{
+	for (unsigned fault = 0; fault < 12; fault++) {
+		xl_clog_zeropage_full birth = { 97, 0, (UINT64_C(7) << 32) | UINT64_C(3178496) };
+		ClusterSideProjectionOperationV1 operation = { .kind = CLUSTER_SIDE_PROJECTION_CLOG,
+			.action = CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE,
+			.normalized_info = CLOG_ZEROPAGE_FULL, .page_number = 97 };
+		ClusterSideProjectionApplyInputV1 input = { .operation = &operation,
+			.owned_payload = (const uint8 *)&birth, .owned_payload_length = sizeof(birth),
+			.origin_thread = 3, .source_retained = true, .cluster_epoch = 19,
+			.source_lsn = 100, .source_end_lsn = 200 };
+
+		if (fault == 1) input.owned_payload = NULL;
+		if (fault == 2) input.owned_payload_length--;
+		if (fault == 3) birth.reserved_zero = 1;
+		if (fault == 4) birth.first_full_xid++;
+		if (fault == 5) operation.page_number++;
+		if (fault == 6) input.source_retained = false;
+		if (fault == 7) input.source_lsn = 0;
+		if (fault == 8) input.source_end_lsn = 100;
+		if (fault == 9) input.cluster_epoch = 0;
+		if (fault == 10) operation.oldest_xid = 3;
+		if (fault == 11) operation.oldest_database = 5;
+		UT_ASSERT_EQ(cluster_side_projection_target_preflight_v1(&input),
+			fault == 0 ? CLUSTER_SIDE_PROJECTION_APPLY_OK : CLUSTER_SIDE_PROJECTION_APPLY_BLOCKED);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(7);
+	UT_PLAN(8);
+	UT_RUN(test_full_clog_projection_requires_complete_original_birth);
 
 	UT_RUN(test_projection_verified_conjunction);
 	UT_RUN(test_projection_lookup_fail_closed);

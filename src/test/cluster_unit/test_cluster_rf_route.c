@@ -84,16 +84,16 @@ find_manifest_route(uint8 rmid, uint8 normalized_info, RfOpcodeRouteV1 *route, b
 UT_TEST(test_route_abi_and_counts)
 {
 	UT_ASSERT_EQ(sizeof(RfOpcodeRouteV1), 8);
-	UT_ASSERT_EQ(rf_opcode_route_manifest_count_v1(), 141);
-	UT_ASSERT_EQ(rf_opcode_route_manifest_live_count_v1(), 141);
+	UT_ASSERT_EQ(rf_opcode_route_manifest_count_v1(), 142);
+	UT_ASSERT_EQ(rf_opcode_route_manifest_live_count_v1(), 142);
 }
 
 UT_TEST(test_route_canonical_key_stream)
 {
 	static const uint8 expected[PG_SHA256_DIGEST_LENGTH]
-		= { 0xbd, 0xb4, 0x41, 0x12, 0x05, 0x38, 0x09, 0xe0, 0x64, 0x2c, 0xcc,
-			0x49, 0x41, 0x0c, 0xce, 0x6e, 0x5f, 0x66, 0xd9, 0x93, 0x94, 0xd4,
-			0x83, 0xe3, 0x31, 0x3d, 0x43, 0x9f, 0xaf, 0x3d, 0x77, 0x6e };
+		= { 0xab, 0x75, 0xd0, 0x89, 0x5a, 0x26, 0xce, 0x90, 0xa3, 0x0d, 0x20,
+			0x33, 0xfa, 0xd5, 0x15, 0x74, 0xfd, 0xec, 0x06, 0x05, 0x68, 0x58,
+			0xf3, 0xa6, 0x0e, 0x91, 0xdc, 0x3d, 0xd7, 0x09, 0x69, 0x27 };
 	char stream[1024];
 	uint8 digest[PG_SHA256_DIGEST_LENGTH];
 	RfOpcodeRouteV1 route;
@@ -115,7 +115,7 @@ UT_TEST(test_route_canonical_key_stream)
 		used += pg_snprintf(stream + used, sizeof(stream) - used, "%03u:%02X\n", route.rmid,
 							route.normalized_info);
 	}
-	UT_ASSERT_EQ(used, 987);
+	UT_ASSERT_EQ(used, 994);
 	sha256_bytes((const uint8 *)stream, used, digest);
 	if (memcmp(digest, expected, sizeof(expected)) != 0) {
 		size_t j;
@@ -249,7 +249,7 @@ UT_TEST(test_every_manifest_row_has_one_total_route)
 	}
 
 	UT_ASSERT_EQ(page_count, 77);
-	UT_ASSERT_EQ(side_count, 63);
+	UT_ASSERT_EQ(side_count, 64);
 	UT_ASSERT_EQ(logical_count, 1);
 }
 
@@ -351,10 +351,23 @@ UT_TEST(test_route_failures_leave_output_untouched)
 	UT_ASSERT(memcmp(&route, &before, sizeof(route)) == 0);
 }
 
+UT_TEST(test_full_clog_route_keeps_side_owner_and_forbids_blocks)
+{
+	RfOpcodeRouteV1 route;
+	UT_ASSERT_EQ(rf_opcode_route_lookup_v1(3, 0x20, false, false, &route), RF_OPCODE_ROUTE_OK);
+	UT_ASSERT_EQ(route.record_owner, RF_ROUTE_OWNER_SIDE_TYPED);
+	UT_ASSERT_EQ(route.codec_id, RF_ROUTE_CODEC_SIDE_STANDARD);
+	UT_ASSERT_EQ(rf_opcode_route_lookup_v1(3, 0x20, true, false, &route),
+				 RF_OPCODE_ROUTE_BLOCK_SHAPE_INVALID);
+	UT_ASSERT_EQ(rf_opcode_route_lookup_v1(3, 0x30, false, false, &route),
+				 RF_OPCODE_ROUTE_OPCODE_UNSUPPORTED);
+}
+
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(12);
+	UT_RUN(test_full_clog_route_keeps_side_owner_and_forbids_blocks);
 	UT_RUN(test_route_abi_and_counts);
 	UT_RUN(test_route_canonical_key_stream);
 	UT_RUN(test_route_page_and_side_block_policies);

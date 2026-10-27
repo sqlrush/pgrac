@@ -1617,8 +1617,32 @@ clog_recovery_truncate(int origin, int page, bool verify)
 	return clog_recovery_directory_ready(origin);
 }
 
+/* Validate the complete retained native birth before original native locks or
+ * I/O. These bytes retain a producer input, not an issuer or lifetime grant. */
 static bool
-clog_recovery_record(int origin, const ClusterSideProjectionOperationV1 *op, bool verify)
+clog_recovery_full_record_shape(const ClusterSideProjectionOperationV1 *op,
+								const uint8 *payload, uint32 length)
+{
+	xl_clog_zeropage_full birth;
+	TransactionId raw;
+
+	if (op == NULL || op->kind != CLUSTER_SIDE_PROJECTION_CLOG
+		|| op->action != CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE
+		|| op->normalized_info != CLOG_ZEROPAGE_FULL
+		|| TransactionIdIsValid(op->oldest_xid) || OidIsValid(op->oldest_database)
+		|| payload == NULL || length != sizeof(birth))
+		return false;
+	memcpy(&birth, payload, sizeof(birth));
+	raw = (TransactionId)birth.first_full_xid;
+	return birth.reserved_zero == 0 && birth.pageno >= 0 && birth.pageno == op->page_number
+		&& TransactionIdIsNormal(raw)
+		&& (raw % CLOG_XACTS_PER_PAGE == 0 || raw == FirstNormalTransactionId)
+		&& raw / CLOG_XACTS_PER_PAGE == (uint32)birth.pageno;
+}
+
+static bool
+clog_recovery_record(int origin, const ClusterSideProjectionOperationV1 *op, bool verify,
+					 const uint8 *payload, uint32 length)
 {
 	volatile bool locked = false, ok = false;
 	LWLock *lock;
@@ -1626,8 +1650,14 @@ clog_recovery_record(int origin, const ClusterSideProjectionOperationV1 *op, boo
 	if (!clog_recovery_permitted(origin) || op == NULL || op->kind != CLUSTER_SIDE_PROJECTION_CLOG
 		|| op->page_number < 0 || (uint32)op->page_number > UINT32_MAX / CLOG_XACTS_PER_PAGE)
 		return false;
+	if (op->normalized_info == CLOG_ZEROPAGE_FULL) {
+		if (!clog_recovery_full_record_shape(op, payload, length))
+			return false;
+	} else if (payload != NULL || length != 0)
+		return false;
 	if (op->action == CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE) {
-		if (op->normalized_info != CLOG_ZEROPAGE || TransactionIdIsValid(op->oldest_xid)
+		if ((op->normalized_info != CLOG_ZEROPAGE && op->normalized_info != CLOG_ZEROPAGE_FULL)
+			|| TransactionIdIsValid(op->oldest_xid)
 			|| OidIsValid(op->oldest_database))
 			return false;
 	} else if (op->action == CLUSTER_SIDE_PROJECTION_ACTION_TRUNCATE) {
@@ -1663,14 +1693,32 @@ bool
 cluster_clog_native_recovery_record_apply_v1(int origin,
 											 const ClusterSideProjectionOperationV1 *operation)
 {
-	return clog_recovery_record(origin, operation, false);
+	return clog_recovery_record(origin, operation, false, NULL, 0);
 }
 
 bool
 cluster_clog_native_recovery_record_verify_v1(int origin,
 											  const ClusterSideProjectionOperationV1 *operation)
 {
-	return clog_recovery_record(origin, operation, true);
+	return clog_recovery_record(origin, operation, true, NULL, 0);
+}
+
+bool
+cluster_clog_native_recovery_full_record_apply_v1(
+	int origin, const ClusterSideProjectionOperationV1 *operation,
+	const uint8 *payload, uint32 length)
+{
+	return operation != NULL && operation->normalized_info == CLOG_ZEROPAGE_FULL
+		&& clog_recovery_record(origin, operation, false, payload, length);
+}
+
+bool
+cluster_clog_native_recovery_full_record_verify_v1(
+	int origin, const ClusterSideProjectionOperationV1 *operation,
+	const uint8 *payload, uint32 length)
+{
+	return operation != NULL && operation->normalized_info == CLOG_ZEROPAGE_FULL
+		&& clog_recovery_record(origin, operation, true, payload, length);
 }
 
 static void

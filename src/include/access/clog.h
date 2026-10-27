@@ -111,6 +111,15 @@ extern bool cluster_clog_native_recovery_record_apply_v1(
 	int origin, const struct ClusterSideProjectionOperationV1 *operation);
 extern bool cluster_clog_native_recovery_record_verify_v1(
 	int origin, const struct ClusterSideProjectionOperationV1 *operation);
+/* FULL requires every owned native16B birth byte, without translating it to
+ * a legacy page number. Same original cold authority and native write/sync/
+ * readback; these calls do not certify issuance, era or physical lifetime. */
+extern bool cluster_clog_native_recovery_full_record_apply_v1(
+	int origin, const struct ClusterSideProjectionOperationV1 *operation,
+	const uint8 *payload, uint32 length);
+extern bool cluster_clog_native_recovery_full_record_verify_v1(
+	int origin, const struct ClusterSideProjectionOperationV1 *operation,
+	const uint8 *payload, uint32 length);
 #endif
 
 extern Size CLOGShmemBuffers(void);
