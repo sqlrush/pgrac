@@ -133,6 +133,10 @@ static bool receipt_block0_conditional_available;
 static bool receipt_buffer_available;
 static bool receipt_buffer_locked;
 static int receipt_prepare_calls;
+static int receipt_origin_capture_calls;
+static int receipt_origin_prepare_calls;
+static bool receipt_origin_capture_available;
+static uint8 receipt_origin_capture[CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES];
 static int receipt_apply_calls;
 static int receipt_cancel_calls;
 static int receipt_cancel_fail_at;
@@ -455,6 +459,35 @@ cluster_ctrc_receipt_prepare_shared(
 	handle->valid = true;
 	receipt_prepare_calls++;
 	return CLUSTER_CTRC_PREPARE_READY;
+}
+
+/* Origin capture/receiver codecs are controlled boundaries here; their
+ * actual shared engine is exercised by test_cluster_ctrc_cleaner. */
+bool
+cluster_ctrc_origin_fullxid_capture_v2(const ClusterCtrcTxnKeyV1 *key pg_attribute_unused(),
+	const ClusterCtrcParticipantIdentity *receiver pg_attribute_unused(), uint32 grant,
+	uint8 bytes[CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES])
+{
+	UT_ASSERT_EQ(grant, 1);
+	receipt_origin_capture_calls++;
+	memset(bytes, 0, CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES);
+	if (!receipt_origin_capture_available)
+		return false;
+	memcpy(bytes, receipt_origin_capture, sizeof(receipt_origin_capture));
+	return true;
+}
+
+ClusterCtrcPrepareResult
+cluster_ctrc_receipt_prepare_origin_v2(const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcParticipantIdentity *receiver, uint32 grant,
+	const ClusterCtrcPublicationIdV1 *publication, const ClusterCtrcTargetV1 *target,
+	const uint8 *bytes, Size length, ClusterCtrcReceiptHandle *handle)
+{
+	UT_ASSERT_EQ(receipt_origin_capture_calls, receipt_origin_prepare_calls + 1);
+	UT_ASSERT_EQ(length, sizeof(receipt_origin_capture));
+	UT_ASSERT(memcmp(bytes, receipt_origin_capture, length) == 0);
+	receipt_origin_prepare_calls++;
+	return cluster_ctrc_receipt_prepare_shared(key, receiver, grant, publication, target, handle);
 }
 
 ClusterCtrcApplyResult
@@ -2588,6 +2621,9 @@ receipt_fixture_ready(uint8 record_type, ClusterUndoRecordPrepareReceipt *receip
 	receipt_buffer_available = true;
 	receipt_buffer_locked = false;
 	receipt_prepare_calls = receipt_apply_calls = receipt_cancel_calls = 0;
+	receipt_origin_capture_calls = receipt_origin_prepare_calls = 0;
+	receipt_origin_capture_available = true;
+	memset(receipt_origin_capture, 0xa6, sizeof(receipt_origin_capture));
 	receipt_cancel_fail_at = 0;
 	receipt_child_attempt = 0;
 	receipt_leave_calls = receipt_unref_calls = receipt_install_calls = 0;
@@ -2618,6 +2654,44 @@ receipt_fixture_ready(uint8 record_type, ClusterUndoRecordPrepareReceipt *receip
 	header->magic = PGRAC_UNDO_BLOCK_MAGIC;
 	header->block_version = UNDO_BLOCK_VERSION_1;
 	header->free_offset = sizeof(UndoBlockHeader);
+}
+
+UT_TEST(test_itl_prepare_requires_original_fullxid_before_receiver_publication)
+{
+	ClusterUndoRecordPrepareReceipt receipt, saved;
+
+	receipt_fixture_ready(UNDO_RECORD_UPDATE, &receipt);
+	receipt.ctrc_pending_mask = 1;
+	receipt.ctrc_pending_targets[0].block_number = 37;
+	UT_ASSERT(cluster_undo_record_receipt_sync(&receipt));
+	saved = receipt;
+	receipt_origin_capture_available = false;
+	UT_ASSERT(!cluster_undo_record_ctrc_prepare_pending(&receipt, 0));
+	UT_ASSERT_EQ(receipt_origin_capture_calls, 1);
+	UT_ASSERT_EQ(receipt_prepare_calls + receipt_origin_prepare_calls, 0);
+	UT_ASSERT(memcmp(&receipt, &saved, sizeof(receipt)) == 0);
+	UT_ASSERT(memcmp(&cluster_undo_record_reservation.receipt, &saved, sizeof(receipt)) == 0);
+	UT_ASSERT_EQ(receipt_apply_calls + receipt_cancel_calls + receipt_install_calls
+		+ receipt_leave_calls + receipt_unref_calls, 0);
+	UT_ASSERT_EQ(strcmp(cluster_undo_record_receipt_last_reason(), "CTRC_ORIGINAL_FULL_XID_REQUIRED"), 0);
+}
+
+UT_TEST(test_itl_prepare_passes_exact_original_envelope_to_receiver)
+{
+	ClusterUndoRecordPrepareReceipt receipt;
+
+	receipt_fixture_ready(UNDO_RECORD_INSERT, &receipt);
+	receipt.ctrc_pending_mask = 1;
+	receipt.ctrc_pending_targets[0].block_number = 37;
+	UT_ASSERT(cluster_undo_record_receipt_sync(&receipt));
+	UT_ASSERT(cluster_undo_record_ctrc_prepare_pending(&receipt, 0));
+	UT_ASSERT_EQ(receipt_origin_capture_calls, 1);
+	UT_ASSERT_EQ(receipt_origin_prepare_calls, 1);
+	UT_ASSERT_EQ(receipt_prepare_calls, 1);
+	UT_ASSERT(receipt.ctrc_handles[0].valid);
+	UT_ASSERT_EQ(receipt.ctrc_prepared_mask, 1);
+	UT_ASSERT_EQ(receipt_apply_calls + receipt_cancel_calls + receipt_install_calls
+		+ receipt_leave_calls + receipt_unref_calls, 0);
 }
 
 /* PGRAC: the baseline build selects the original caller's exact cleanup. */
@@ -3789,7 +3863,9 @@ UT_TEST(test_a148_undo_stop_does_not_confuse_extent_and_cursor_cache_with_writer
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(77);
+	UT_PLAN(79);
+	UT_RUN(test_itl_prepare_requires_original_fullxid_before_receiver_publication);
+	UT_RUN(test_itl_prepare_passes_exact_original_envelope_to_receiver);
 	UT_RUN(test_abort_prepared_after_lock_release_is_idempotent);
 	UT_RUN(test_abort_prepared_cancel_failure_and_borrowed_owner_do_not_panic);
 	UT_RUN(test_abort_attempted_or_applied_retains_debt_and_panics);

@@ -2591,6 +2591,7 @@ cluster_undo_record_ctrc_prepare_pending(ClusterUndoRecordPrepareReceipt *receip
 	ClusterCtrcPublicationIdV1 publication;
 	ClusterCtrcReceiptHandle handle;
 	ClusterCtrcPrepareResult result;
+	uint8 original_identity[CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES];
 	TransactionId xid = GetTopTransactionIdIfAny();
 	uint32 grant = 0;
 	uint8 target_bit;
@@ -2618,6 +2619,13 @@ cluster_undo_record_ctrc_prepare_pending(ClusterUndoRecordPrepareReceipt *receip
 		|| status_key.undo_segment_id != receipt->tt_slot_segment_id
 		|| status_key.tt_slot_id != cluster_tt_slot_offset_to_id(receipt->tt_slot_offset))
 		return false;
+	/* Ordinary ITL publication must register its original identity while the
+	 * origin still protects the exact grant. A later raw-only participant
+	 * cannot be qualified after native PGPROC responsibility has retired. */
+	if (!cluster_ctrc_origin_fullxid_capture_v2(&key, &participant, grant, original_identity)) {
+		cluster_undo_receipt_reason = "CTRC_ORIGINAL_FULL_XID_REQUIRED";
+		return false;
+	}
 
 	publication.requester_node_id = participant.node_id;
 	publication.requester_boot_incarnation = participant.boot_incarnation;
@@ -2634,9 +2642,9 @@ cluster_undo_record_ctrc_prepare_pending(ClusterUndoRecordPrepareReceipt *receip
 	publication.reference_kind = CTRC_REF_HEAP_ITL_UBA;
 	publication.target_kind = CTRC_TARGET_PAGE_PENDING_ITL_SLOT;
 	publication.grant_generation = grant;
-	result = cluster_ctrc_receipt_prepare_shared(&key, &participant, grant, &publication,
-												 &receipt->ctrc_pending_targets[target_ordinal],
-												 &handle);
+	result = cluster_ctrc_receipt_prepare_origin_v2(&key, &participant, grant, &publication,
+		&receipt->ctrc_pending_targets[target_ordinal], original_identity,
+		sizeof(original_identity), &handle);
 	if (result != CLUSTER_CTRC_PREPARE_READY && result != CLUSTER_CTRC_PREPARE_DUPLICATE) {
 		cluster_undo_receipt_reason = "CTRC_PREPARE_REFUSED";
 		return false;

@@ -960,14 +960,18 @@ extern bool cluster_ctrc_origin_original_full_xid_shared(
 /* Capture only under the original local origin lock after its exact grant
  * registered this receiver. V1 key bytes and reserved zeros are unchanged.
  * Decode is a source match, not authentication: production consumers must
- * receive these bytes only from the original authenticated origin reply. */
+ * receive these bytes only from the original authenticated origin reply
+ * or this backend's protected local origin capture. */
 extern bool cluster_ctrc_origin_fullxid_capture_v2(const ClusterCtrcTxnKeyV1 *key,
 	const ClusterCtrcParticipantIdentity *receiver, uint32 grant,
 	uint8 bytes[CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES]);
 extern bool cluster_ctrc_origin_fullxid_match_v2(const uint8 *bytes, Size length,
 	const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcParticipantIdentity *receiver,
 	uint32 grant, FullTransactionId *out);
-/* New receivers only; an old raw-only participant is never backfilled. */
+/* New receivers only; an old raw-only participant is never backfilled.
+ * Local producers recheck the envelope's FullXid under origin_lock and retain
+ * that lock through receiver publication; foreign producers use the original
+ * authenticated grant/CLOSE responsibility handoff. */
 extern ClusterCtrcPrepareResult cluster_ctrc_receipt_prepare_origin_v2(
 	const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcParticipantIdentity *receiver,
 	uint32 grant, const ClusterCtrcPublicationIdV1 *publication,

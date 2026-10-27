@@ -6451,6 +6451,84 @@ UT_TEST(test_origin_fullxid_v2_foreign_receiver_retains_source)
 	UT_ASSERT_EQ(held_count, 0);
 }
 
+/* Local producers use the same explicit envelope, but the origin remains
+ * locked through the original receiver publication and revalidates its value. */
+UT_TEST(test_origin_fullxid_v2_local_producer_retains_source)
+{
+	ClusterCtrcOriginEntry *origin;
+	ClusterCtrcParticipantIdentity receiver;
+	ClusterCtrcPublicationIdV1 publication;
+	ClusterCtrcTargetV1 target;
+	ClusterCtrcReceiptHandle handle;
+	ClusterCtrcActiveScan scan;
+	FullTransactionId original;
+	uint8 bytes[CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES];
+
+	reset_fixture();
+	cluster_node_id = 0;
+	origin = seed_origin(0, 1);
+	receiver = origin->touched[0];
+	original = origin->original_full_xid;
+	fixture_receipt_inputs(origin, 950, &publication, &target);
+	UT_ASSERT(cluster_ctrc_origin_fullxid_capture_v2(&origin->key, &receiver,
+		origin->grant_generation, bytes));
+	UT_ASSERT_EQ(cluster_ctrc_receipt_prepare_origin_v2(&origin->key, &receiver,
+		origin->grant_generation, &publication, &target, bytes, sizeof(bytes), &handle),
+		CLUSTER_CTRC_PREPARE_READY);
+	UT_ASSERT(handle.valid);
+	UT_ASSERT(FullTransactionIdEquals(handle.original_full_xid, original));
+	UT_ASSERT_EQ(cluster_ctrc_receipt_prepare_origin_v2(&origin->key, &receiver,
+		origin->grant_generation, &publication, &target, bytes, sizeof(bytes), &handle),
+		CLUSTER_CTRC_PREPARE_DUPLICATE);
+	/* This controlled retirement is not a certificate. The real participant
+	 * alone must continue to constrain the original completed census. */
+	MemSet(origin, 0, sizeof(*origin));
+	UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(9, 10000)));
+	finish_active_scan(&scan);
+	UT_ASSERT_EQ(scan.status, CTRC_ACTIVE_SCAN_COMPLETE);
+	UT_ASSERT_EQ(scan.unqualified_entries, 0);
+	UT_ASSERT(FullTransactionIdEquals(scan.min_full, original));
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_origin_fullxid_v2_local_producer_rechecks_locked_source)
+{
+	for (unsigned fault = 0; fault < 4; fault++) {
+		ClusterCtrcOriginEntry *origin;
+		ClusterCtrcParticipantIdentity receiver;
+		ClusterCtrcPublicationIdV1 publication;
+		ClusterCtrcTargetV1 target;
+		ClusterCtrcReceiptHandle handle;
+		uint8 bytes[CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES];
+
+		reset_fixture();
+		cluster_node_id = 0;
+		origin = seed_origin(0, 1);
+		receiver = origin->touched[0];
+		fixture_receipt_inputs(origin, 951, &publication, &target);
+		UT_ASSERT(cluster_ctrc_origin_fullxid_capture_v2(&origin->key, &receiver,
+			origin->grant_generation, bytes));
+		if (fault == 0)
+			origin->original_full_xid = FullTransactionIdFromEpochAndXid(
+				EpochFromFullTransactionId(origin->original_full_xid) + 1, origin->key.xid);
+		else if (fault == 1)
+			origin->original_full_xid = InvalidFullTransactionId;
+		else if (fault == 2)
+			origin->grant_generation++;
+		else
+			origin->touched[0].boot_incarnation++;
+		UT_ASSERT_EQ(cluster_ctrc_receipt_prepare_origin_v2(&origin->key, &receiver,
+			publication.grant_generation, &publication, &target, bytes, sizeof(bytes), &handle),
+			CLUSTER_CTRC_PREPARE_REFUSED);
+		UT_ASSERT(!handle.valid);
+		UT_ASSERT(ctrc_bytes_zero(ctrc_participant_entries(),
+			CtrcShared->participant_key_entries * sizeof(ClusterCtrcParticipantEntry)));
+		UT_ASSERT(ctrc_bytes_zero(ctrc_receipt_entries(),
+			CtrcShared->receipt_entries * sizeof(ClusterCtrcReceipt)));
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
 UT_TEST(test_origin_fullxid_v2_rejects_missing_or_mismatched_identity)
 {
 	for (unsigned fault = 0; fault < 11; fault++) {
@@ -6535,7 +6613,7 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(146);
+	UT_PLAN(148);
 	UT_RUN(test_prepare_path_namespace_precedes_input_and_resets_output);
 	UT_RUN(test_prepare_path_input_precedes_journal_exhaustion);
 	UT_RUN(test_prepare_path_chain_precedes_locator_and_keeps_blocked_state);
@@ -6683,6 +6761,8 @@ main(void)
 	UT_RUN(test_actual_worker_active_pass_restarts_after_original_source_refusal);
 	UT_RUN(test_actual_worker_active_pass_does_not_sample_native_without_source);
 	UT_RUN(test_origin_fullxid_v2_foreign_receiver_retains_source);
+	UT_RUN(test_origin_fullxid_v2_local_producer_retains_source);
+	UT_RUN(test_origin_fullxid_v2_local_producer_rechecks_locked_source);
 	UT_RUN(test_origin_fullxid_v2_rejects_missing_or_mismatched_identity);
 	UT_RUN(test_origin_fullxid_v2_refuses_raw_only_receiver_backfill);
 	free(CtrcShared);

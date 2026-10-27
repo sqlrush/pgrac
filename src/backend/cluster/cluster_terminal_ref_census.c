@@ -5680,7 +5680,12 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 	if (local_origin) {
 		LWLockAcquire(&CtrcShared->origin_lock, LW_SHARED);
 		if (!ctrc_origin_protects_local_receipt_locked(key, identity, grant_generation,
-													 &original_full_xid)) {
+													 &original_full_xid)
+			|| (received_full != NULL
+				&& !FullTransactionIdEquals(original_full_xid, *received_full))) {
+			/* An explicit original identity must still be the value protected
+			 * by this exact origin/grant. Refuse before either receiver table
+			 * changes; the original lock then spans successful publication. */
 			LWLockRelease(&CtrcShared->origin_lock);
 			return ctrc_receipt_prepare_refused(false);
 		}
@@ -5791,8 +5796,7 @@ cluster_ctrc_receipt_prepare_origin_v2(const ClusterCtrcTxnKeyV1 *key,
 
 	if (handle != NULL)
 		MemSet(handle, 0, sizeof(*handle));
-	if (!cluster_ctrc_origin_fullxid_match_v2(bytes, length, key, receiver, grant, &full)
-		|| key->origin_node_id == (uint16)cluster_node_id)
+	if (!cluster_ctrc_origin_fullxid_match_v2(bytes, length, key, receiver, grant, &full))
 		return CLUSTER_CTRC_PREPARE_REFUSED;
 #ifndef CLUSTER_CTRC_UNIT_TEST
 	return ctrc_receipt_prepare_shared_internal(key, receiver, grant, publication,

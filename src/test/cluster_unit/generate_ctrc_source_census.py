@@ -206,6 +206,7 @@ SCAN_RULES: Tuple[ScanRule, ...] = (
         "CTRC_ORIGIN_PROVENANCE",
         (
             "src/backend/cluster/cluster_terminal_ref_census.c",
+            "src/backend/cluster/cluster_undo_record.c",
             "src/backend/cluster/cluster_multixact_current.c",
             "src/backend/cluster/cluster_gcs_block.c",
             "src/backend/cluster/cluster_runtime_visibility.c",
@@ -554,6 +555,17 @@ _classify_owners(
     "cluster_ctrc_receipt_prepare_origin_v2",
     "cluster_ctrc_receipt_discharge_current_mx_shared|cluster_ctrc_receipt_discharge_itl_shared",
     "MXA-T40",
+)
+_classify_owners(
+    "CTRC_ORIGIN_PROVENANCE",
+    "src/backend/cluster/cluster_undo_record.c",
+    ("cluster_undo_record_ctrc_prepare_pending",),
+    "REGISTERED_REFERENCE",
+    "CTRC_REF_HEAP_ITL_UBA",
+    "CTRC_TARGET_PAGE_PENDING_ITL_SLOT|CTRC_TARGET_EXACT_ITL_SLOT",
+    "cluster_ctrc_receipt_prepare_origin_v2",
+    "cluster_ctrc_receipt_discharge_itl_shared",
+    "MXA-T23",
 )
 _classify_owners(
     "CTRC_ORIGIN_PROVENANCE",
