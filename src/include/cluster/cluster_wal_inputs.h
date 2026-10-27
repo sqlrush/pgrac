@@ -313,6 +313,13 @@ extern bool cluster_wal_inputs_ctrc_replays_source_current_v1(
 extern bool cluster_wal_inputs_ctrc_replays_source_covers_window_v1(
 	const ClusterRecoveryCtrcReplaySetSourceV1 *source, uint16 thread,
 	XLogRecPtr lower, XLogRecPtr upper);
+/* Retention only for the original episode's exact installed recovery writer,
+ * including its newly inserted WAL beyond the original fixed source cuts.
+ * Same all-replay IR set and actual writer-thread WALR pin, with no I/O,
+ * sampling, acquire or release. Does not grant writer admission, durability,
+ * source-range coverage, retirement or service completion. */
+extern bool cluster_wal_inputs_ctrc_writer_retained_v1(
+	const ClusterRecoveryCtrcReplaySetSourceV1 *source, const ClusterWalWriterToken *writer);
 /* Declared relmap participant of the ORIGINAL Startup episode only. The
  * complete original replay IR set and WALR incarnation must remain held.
  * input_index enumerates every selected generation, including history and

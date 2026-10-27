@@ -391,6 +391,7 @@ ctrc_native_insert_current(const CtrcNativeInsertV1 *context,
 		|| memcmp(operation_uuid, owner->operation_uuid, sizeof(operation_uuid)) != 0
 		|| generation != owner->install_generation
 		|| !ctrc_native_read_current(&context->read)
+		|| !cluster_wal_inputs_ctrc_writer_retained_v1(&context->source, &owner->writer)
 		|| result->window.kind != CLUSTER_RECOVERY_STAMP_FPI
 		|| result->window.payload_length != sizeof(envelope))
 		return false;

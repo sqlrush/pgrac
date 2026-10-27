@@ -26026,6 +26026,7 @@ UT_TEST(test_tx_inputs_parent_subject_and_wait_revalidation)
 #include "test_cluster_control_ctrc_page.inc"
 #include "test_cluster_control_ctrc_read_native.inc"
 #include "test_cluster_control_ctrc_generations.inc"
+#include "test_cluster_control_ctrc_writer_retention.inc"
 
 /*
  * Keep the long control-root suite deterministic when an individual test
@@ -26241,6 +26242,16 @@ main(int argc, char **argv)
 		UT_RUN(test_runtime_v3_failure_worker_entry_establishes_resource_owner);
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_CTRC_WRITER_RETENTION") != NULL) {
+		UT_PLAN(6);
+		UT_RUN(test_ctrc_writer_retention_binds_both_original_sources_without_new_cut);
+		UT_RUN(test_ctrc_writer_retention_rejects_different_complete_writer_or_source);
+		UT_RUN(test_ctrc_writer_retention_requires_actual_writer_thread_not_first_pin);
+		UT_RUN(test_ctrc_writer_retention_loss_preserves_original_cleanup_debt);
+		UT_RUN(test_ctrc_writer_retention_old_incarnation_cannot_borrow_reopened_scope);
+		UT_RUN(test_ctrc_writer_retention_rechecks_complete_inputs_after_original_callbacks);
+		UT_DONE(); return ut_failed_count != 0;
 	}
 	if (getenv("PGRAC_PRE2_TEST_CTRC_GENERATIONS") != NULL) {
 		UT_PLAN(7);
@@ -26610,7 +26621,13 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(623);
+	UT_PLAN(629);
+	UT_RUN(test_ctrc_writer_retention_binds_both_original_sources_without_new_cut);
+	UT_RUN(test_ctrc_writer_retention_rejects_different_complete_writer_or_source);
+	UT_RUN(test_ctrc_writer_retention_requires_actual_writer_thread_not_first_pin);
+	UT_RUN(test_ctrc_writer_retention_loss_preserves_original_cleanup_debt);
+	UT_RUN(test_ctrc_writer_retention_old_incarnation_cannot_borrow_reopened_scope);
+	UT_RUN(test_ctrc_writer_retention_rechecks_complete_inputs_after_original_callbacks);
 	UT_RUN(test_ctrc_generations_bind_all_history_and_current_to_one_original_ir);
 	UT_RUN(test_ctrc_generations_reject_omitted_duplicate_or_mixed_generation);
 	UT_RUN(test_ctrc_generations_freeze_full_input_and_reject_changed_cut);
