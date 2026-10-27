@@ -338,6 +338,26 @@ typedef struct ClusterRecoveryRelmapPendingTerminalV1 {
 extern bool cluster_recovery_relmap_history_pending_terminal_v1(
 	ClusterRecoveryRelmapHistory *history, const ClusterRelmapV2Image *pending,
 	ClusterRecoveryRelmapPendingTerminalV1 *out, ClusterRecoveryNativeInventoryDiag *diag);
+/* Original native counter fold, not an allocation/FullXid-era certificate.
+ * Replay the selected generation's complete native-redo suffix through the
+ * unchanged cold decoder/counter rules during one original physical reread.
+ * Keep the checkpoint seed and exact unique map's before/after/tail candidates.
+ * A nonmonotone or half-range-ambiguous candidate, or a pending FullXid outside
+ * that map-to-tail half-space, refuses. This necessary consistency check does
+ * not prove raw-ID non-reuse, historical retention or CLOG page lifetime.
+ * Synchronous full-census/decoder scratch work is not a bounded pending tick.
+ * No CLOG I/O, allocator publication, new scope, COMPLETE/OPEN or release.
+ * Output/caller-lock preconditions preserve custody; entered failure/ERROR
+ * revokes the original episode while retaining all original pins/debt. */
+typedef struct ClusterRecoveryRelmapPendingXidV1 {
+	ClusterRecoveryRelmapHistoryEntryV1 history;
+	uint64 checkpoint_next, before_map, after_map, tail_next;
+	uint64 records, map_ordinal;
+	XLogRecPtr map_start, map_end;
+} ClusterRecoveryRelmapPendingXidV1;
+extern bool cluster_recovery_relmap_history_pending_xid_v1(
+	ClusterRecoveryRelmapHistory *history, const ClusterRelmapV2Image *pending,
+	ClusterRecoveryRelmapPendingXidV1 *out, ClusterRecoveryNativeInventoryDiag *diag);
 extern void cluster_recovery_relmap_history_destroy_v1(ClusterRecoveryRelmapHistory **history);
 
 /* Borrow the original startup cold scope for two complete physical passes.
