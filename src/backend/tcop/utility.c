@@ -218,6 +218,9 @@ CheckClusterSharedUtilitySupport(Node *statement, bool isTopLevel)
 				|| ((RenameStmt *) statement)->relationType == OBJECT_MATVIEW)
 				unsupported = "materialized views";
 			break;
+		case T_AlterObjectDependsStmt:
+			object_type = ((AlterObjectDependsStmt *)statement)->objectType;
+			break;
 		case T_AlterObjectSchemaStmt:
 			object_type = ((AlterObjectSchemaStmt *) statement)->objectType;
 			break;
@@ -320,7 +323,7 @@ PreflightClusterSharedCatalogWrite(Node *statement)
 			&& !IsA(statement, AlterForeignServerStmt) && !IsA(statement, CreateUserMappingStmt)
 			&& !IsA(statement, AlterUserMappingStmt) && !IsA(statement, DropUserMappingStmt)
 			&& !IsA(statement, CreatePublicationStmt) && !IsA(statement, AlterPublicationStmt)
-			&& !IsA(statement, TruncateStmt)))
+			&& !IsA(statement, AlterObjectDependsStmt) && !IsA(statement, TruncateStmt)))
 		return;
 
 	if (IsA(statement, CreateStatsStmt)) {
@@ -344,7 +347,8 @@ PreflightClusterSharedCatalogWrite(Node *statement)
 			 || IsA(statement, DropRoleStmt) || IsA(statement, AlterDatabaseSetStmt)
 			 || IsA(statement, AlterDatabaseRefreshCollStmt) || IsA(statement, AlterFdwStmt)
 			 || IsA(statement, AlterForeignServerStmt) || IsA(statement, AlterUserMappingStmt)
-			 || IsA(statement, DropUserMappingStmt) || IsA(statement, AlterPublicationStmt))
+			 || IsA(statement, DropUserMappingStmt) || IsA(statement, AlterPublicationStmt)
+			 || IsA(statement, AlterObjectDependsStmt))
 		action = "alteration";
 	else
 		action = "creation";

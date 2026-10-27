@@ -307,6 +307,24 @@ CreateCommandTag(Node *statement)
 			return CMDTAG_UNKNOWN;
 		}
 	}
+	if (IsA(statement, AlterObjectDependsStmt)) {
+		switch (((AlterObjectDependsStmt *)statement)->objectType) {
+		case OBJECT_FUNCTION:
+			return CMDTAG_ALTER_FUNCTION;
+		case OBJECT_PROCEDURE:
+			return CMDTAG_ALTER_PROCEDURE;
+		case OBJECT_ROUTINE:
+			return CMDTAG_ALTER_ROUTINE;
+		case OBJECT_TRIGGER:
+			return CMDTAG_ALTER_TRIGGER;
+		case OBJECT_INDEX:
+			return CMDTAG_ALTER_INDEX;
+		case OBJECT_MATVIEW:
+			return CMDTAG_ALTER_MATERIALIZED_VIEW;
+		default:
+			return CMDTAG_UNKNOWN;
+		}
+	}
 	if (IsA(statement, CreateTrigStmt))
 		return CMDTAG_CREATE_TRIGGER;
 	if (IsA(statement, RuleStmt))
@@ -425,6 +443,12 @@ GetCommandTagName(CommandTag tag)
 		return "ALTER PROCEDURE";
 	if (tag == CMDTAG_ALTER_ROUTINE)
 		return "ALTER ROUTINE";
+	if (tag == CMDTAG_ALTER_TRIGGER)
+		return "ALTER TRIGGER";
+	if (tag == CMDTAG_ALTER_INDEX)
+		return "ALTER INDEX";
+	if (tag == CMDTAG_ALTER_MATERIALIZED_VIEW)
+		return "ALTER MATERIALIZED VIEW";
 	if (tag == CMDTAG_CREATE_TRIGGER)
 		return "CREATE TRIGGER";
 	if (tag == CMDTAG_CREATE_RULE)
@@ -1816,6 +1840,33 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 											 .pubname = "target_publication",
 											 .pubobjects = &publication_objects,
 											 .action = AP_SetObjects };
+	String dependency_name = { .type = T_String, .sval = "target_object" };
+	ListCell dependency_name_cell = { .ptr_value = &dependency_name };
+	List dependency_names
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &dependency_name_cell };
+	ObjectWithArgs dependency_routine = { .type = T_ObjectWithArgs, .objname = &dependency_names };
+	String dependency_extension = { .type = T_String, .sval = "target_extension" };
+	AlterObjectDependsStmt depends_function = { .type = T_AlterObjectDependsStmt,
+												.objectType = OBJECT_FUNCTION,
+												.object = (Node *)&dependency_routine,
+												.extname = &dependency_extension };
+	AlterObjectDependsStmt depends_procedure = { .type = T_AlterObjectDependsStmt,
+												 .objectType = OBJECT_PROCEDURE,
+												 .object = (Node *)&dependency_routine,
+												 .extname = &dependency_extension };
+	AlterObjectDependsStmt depends_routine = { .type = T_AlterObjectDependsStmt,
+											   .objectType = OBJECT_ROUTINE,
+											   .object = (Node *)&dependency_routine,
+											   .extname = &dependency_extension };
+	AlterObjectDependsStmt depends_trigger = { .type = T_AlterObjectDependsStmt,
+											   .objectType = OBJECT_TRIGGER,
+											   .relation = &stats_relation,
+											   .object = (Node *)&dependency_names,
+											   .extname = &dependency_extension };
+	AlterObjectDependsStmt depends_index = { .type = T_AlterObjectDependsStmt,
+											 .objectType = OBJECT_INDEX,
+											 .relation = &stats_relation,
+											 .extname = &dependency_extension };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -1879,7 +1930,12 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 						   (Node *)&alter_publication_options,
 						   (Node *)&publication_add,
 						   (Node *)&publication_drop,
-						   (Node *)&publication_set };
+						   (Node *)&publication_set,
+						   (Node *)&depends_function,
+						   (Node *)&depends_procedure,
+						   (Node *)&depends_routine,
+						   (Node *)&depends_trigger,
+						   (Node *)&depends_index };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned skip = 0; skip < 2; skip++) {
@@ -1913,6 +1969,8 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 			mapping_option.defaction = skip ? DEFELEM_SET : DEFELEM_ADD;
 			create_publication.for_all_tables = skip != 0;
 			publish_value.sval = skip ? "insert, update" : "insert";
+			depends_function.remove = depends_procedure.remove = depends_routine.remove
+				= depends_trigger.remove = depends_index.remove = skip != 0;
 			create_sql_entry(statements[i]);
 			UT_ASSERT_EQ(utility_unbound, 0);
 			UT_ASSERT_EQ(utility_after_preflight, 1);
@@ -2154,6 +2212,33 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 											 .pubname = "target_publication",
 											 .pubobjects = &publication_objects,
 											 .action = AP_SetObjects };
+	String dependency_name = { .type = T_String, .sval = "target_object" };
+	ListCell dependency_name_cell = { .ptr_value = &dependency_name };
+	List dependency_names
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &dependency_name_cell };
+	ObjectWithArgs dependency_routine = { .type = T_ObjectWithArgs, .objname = &dependency_names };
+	String dependency_extension = { .type = T_String, .sval = "target_extension" };
+	AlterObjectDependsStmt depends_function = { .type = T_AlterObjectDependsStmt,
+												.objectType = OBJECT_FUNCTION,
+												.object = (Node *)&dependency_routine,
+												.extname = &dependency_extension };
+	AlterObjectDependsStmt depends_procedure = { .type = T_AlterObjectDependsStmt,
+												 .objectType = OBJECT_PROCEDURE,
+												 .object = (Node *)&dependency_routine,
+												 .extname = &dependency_extension };
+	AlterObjectDependsStmt depends_routine = { .type = T_AlterObjectDependsStmt,
+											   .objectType = OBJECT_ROUTINE,
+											   .object = (Node *)&dependency_routine,
+											   .extname = &dependency_extension };
+	AlterObjectDependsStmt depends_trigger = { .type = T_AlterObjectDependsStmt,
+											   .objectType = OBJECT_TRIGGER,
+											   .relation = &stats_relation,
+											   .object = (Node *)&dependency_names,
+											   .extname = &dependency_extension };
+	AlterObjectDependsStmt depends_index = { .type = T_AlterObjectDependsStmt,
+											 .objectType = OBJECT_INDEX,
+											 .relation = &stats_relation,
+											 .extname = &dependency_extension };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -2217,7 +2302,12 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 						   (Node *)&alter_publication_options,
 						   (Node *)&publication_add,
 						   (Node *)&publication_drop,
-						   (Node *)&publication_set };
+						   (Node *)&publication_set,
+						   (Node *)&depends_function,
+						   (Node *)&depends_procedure,
+						   (Node *)&depends_routine,
+						   (Node *)&depends_trigger,
+						   (Node *)&depends_index };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		int caught;
@@ -2423,6 +2513,33 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 											 .pubname = "target_publication",
 											 .pubobjects = &publication_objects,
 											 .action = AP_SetObjects };
+	String dependency_name = { .type = T_String, .sval = "target_object" };
+	ListCell dependency_name_cell = { .ptr_value = &dependency_name };
+	List dependency_names
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &dependency_name_cell };
+	ObjectWithArgs dependency_routine = { .type = T_ObjectWithArgs, .objname = &dependency_names };
+	String dependency_extension = { .type = T_String, .sval = "target_extension" };
+	AlterObjectDependsStmt depends_function = { .type = T_AlterObjectDependsStmt,
+												.objectType = OBJECT_FUNCTION,
+												.object = (Node *)&dependency_routine,
+												.extname = &dependency_extension };
+	AlterObjectDependsStmt depends_procedure = { .type = T_AlterObjectDependsStmt,
+												 .objectType = OBJECT_PROCEDURE,
+												 .object = (Node *)&dependency_routine,
+												 .extname = &dependency_extension };
+	AlterObjectDependsStmt depends_routine = { .type = T_AlterObjectDependsStmt,
+											   .objectType = OBJECT_ROUTINE,
+											   .object = (Node *)&dependency_routine,
+											   .extname = &dependency_extension };
+	AlterObjectDependsStmt depends_trigger = { .type = T_AlterObjectDependsStmt,
+											   .objectType = OBJECT_TRIGGER,
+											   .relation = &stats_relation,
+											   .object = (Node *)&dependency_names,
+											   .extname = &dependency_extension };
+	AlterObjectDependsStmt depends_index = { .type = T_AlterObjectDependsStmt,
+											 .objectType = OBJECT_INDEX,
+											 .relation = &stats_relation,
+											 .extname = &dependency_extension };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -2486,7 +2603,12 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 						   (Node *)&alter_publication_options,
 						   (Node *)&publication_add,
 						   (Node *)&publication_drop,
-						   (Node *)&publication_set };
+						   (Node *)&publication_set,
+						   (Node *)&depends_function,
+						   (Node *)&depends_procedure,
+						   (Node *)&depends_routine,
+						   (Node *)&depends_trigger,
+						   (Node *)&depends_index };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned child = 0; child < 2; child++) {
@@ -2698,6 +2820,33 @@ UT_TEST(test_catalog_writes_preflight_requires_shared_catalog_storage)
 											 .pubname = "target_publication",
 											 .pubobjects = &publication_objects,
 											 .action = AP_SetObjects };
+	String dependency_name = { .type = T_String, .sval = "target_object" };
+	ListCell dependency_name_cell = { .ptr_value = &dependency_name };
+	List dependency_names
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &dependency_name_cell };
+	ObjectWithArgs dependency_routine = { .type = T_ObjectWithArgs, .objname = &dependency_names };
+	String dependency_extension = { .type = T_String, .sval = "target_extension" };
+	AlterObjectDependsStmt depends_function = { .type = T_AlterObjectDependsStmt,
+												.objectType = OBJECT_FUNCTION,
+												.object = (Node *)&dependency_routine,
+												.extname = &dependency_extension };
+	AlterObjectDependsStmt depends_procedure = { .type = T_AlterObjectDependsStmt,
+												 .objectType = OBJECT_PROCEDURE,
+												 .object = (Node *)&dependency_routine,
+												 .extname = &dependency_extension };
+	AlterObjectDependsStmt depends_routine = { .type = T_AlterObjectDependsStmt,
+											   .objectType = OBJECT_ROUTINE,
+											   .object = (Node *)&dependency_routine,
+											   .extname = &dependency_extension };
+	AlterObjectDependsStmt depends_trigger = { .type = T_AlterObjectDependsStmt,
+											   .objectType = OBJECT_TRIGGER,
+											   .relation = &stats_relation,
+											   .object = (Node *)&dependency_names,
+											   .extname = &dependency_extension };
+	AlterObjectDependsStmt depends_index = { .type = T_AlterObjectDependsStmt,
+											 .objectType = OBJECT_INDEX,
+											 .relation = &stats_relation,
+											 .extname = &dependency_extension };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -2761,7 +2910,12 @@ UT_TEST(test_catalog_writes_preflight_requires_shared_catalog_storage)
 						   (Node *)&alter_publication_options,
 						   (Node *)&publication_add,
 						   (Node *)&publication_drop,
-						   (Node *)&publication_set };
+						   (Node *)&publication_set,
+						   (Node *)&depends_function,
+						   (Node *)&depends_procedure,
+						   (Node *)&depends_routine,
+						   (Node *)&depends_trigger,
+						   (Node *)&depends_index };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned mode = 0; mode < 8; mode++) {
@@ -2965,6 +3119,33 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 											 .pubname = "target_publication",
 											 .pubobjects = &publication_objects,
 											 .action = AP_SetObjects };
+	String dependency_name = { .type = T_String, .sval = "target_object" };
+	ListCell dependency_name_cell = { .ptr_value = &dependency_name };
+	List dependency_names
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &dependency_name_cell };
+	ObjectWithArgs dependency_routine = { .type = T_ObjectWithArgs, .objname = &dependency_names };
+	String dependency_extension = { .type = T_String, .sval = "target_extension" };
+	AlterObjectDependsStmt depends_function = { .type = T_AlterObjectDependsStmt,
+												.objectType = OBJECT_FUNCTION,
+												.object = (Node *)&dependency_routine,
+												.extname = &dependency_extension };
+	AlterObjectDependsStmt depends_procedure = { .type = T_AlterObjectDependsStmt,
+												 .objectType = OBJECT_PROCEDURE,
+												 .object = (Node *)&dependency_routine,
+												 .extname = &dependency_extension };
+	AlterObjectDependsStmt depends_routine = { .type = T_AlterObjectDependsStmt,
+											   .objectType = OBJECT_ROUTINE,
+											   .object = (Node *)&dependency_routine,
+											   .extname = &dependency_extension };
+	AlterObjectDependsStmt depends_trigger = { .type = T_AlterObjectDependsStmt,
+											   .objectType = OBJECT_TRIGGER,
+											   .relation = &stats_relation,
+											   .object = (Node *)&dependency_names,
+											   .extname = &dependency_extension };
+	AlterObjectDependsStmt depends_index = { .type = T_AlterObjectDependsStmt,
+											 .objectType = OBJECT_INDEX,
+											 .relation = &stats_relation,
+											 .extname = &dependency_extension };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -3028,7 +3209,12 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 						   (Node *)&alter_publication_options,
 						   (Node *)&publication_add,
 						   (Node *)&publication_drop,
-						   (Node *)&publication_set };
+						   (Node *)&publication_set,
+						   (Node *)&depends_function,
+						   (Node *)&depends_procedure,
+						   (Node *)&depends_routine,
+						   (Node *)&depends_trigger,
+						   (Node *)&depends_index };
 	const char *tags[] = { "CREATE SCHEMA",
 						   "CREATE SEQUENCE",
 						   "CREATE INDEX",
@@ -3092,7 +3278,12 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 						   "ALTER PUBLICATION",
 						   "ALTER PUBLICATION",
 						   "ALTER PUBLICATION",
-						   "ALTER PUBLICATION" };
+						   "ALTER PUBLICATION",
+						   "ALTER FUNCTION",
+						   "ALTER PROCEDURE",
+						   "ALTER ROUTINE",
+						   "ALTER TRIGGER",
+						   "ALTER INDEX" };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned parallel = 0; parallel < 2; parallel++) {
@@ -3226,10 +3417,49 @@ UT_TEST(test_unsupported_statistics_from_keeps_native_path_without_binding)
 	}
 }
 
+UT_TEST(test_materialized_view_dependency_refuses_before_binding)
+{
+	RangeVar relation = { .type = T_RangeVar, .relname = "target_matview" };
+	String extension = { .type = T_String, .sval = "target_extension" };
+	AlterObjectDependsStmt depends = { .type = T_AlterObjectDependsStmt,
+									   .objectType = OBJECT_MATVIEW,
+									   .relation = &relation,
+									   .extname = &extension };
+	ListCell child = { .ptr_value = &depends };
+	List children = { .type = T_List, .length = 1, .max_length = 1, .elements = &child };
+	CreateSchemaStmt schema = { .type = T_CreateSchemaStmt, .schemaElts = &children };
+	Node *statements[] = { (Node *)&depends, (Node *)&schema };
+
+	/* The nested raw AST exercises support recursion, not parsed schema SQL. */
+	for (unsigned mode = 0; mode < 8; mode++) {
+		for (unsigned remove = 0; remove < 2; remove++) {
+			depends.remove = remove != 0;
+			for (unsigned i = 0; i < lengthof(statements); i++) {
+				int caught;
+
+				reset_create_preflight();
+				cluster_shared_catalog = (mode & 1) != 0;
+				utility_storage_mode = (mode & 2) != 0;
+				cluster_shared_config = (mode & 4) != 0;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					create_sql_entry(statements[i]);
+				UT_ASSERT_EQ(caught != 0, (mode & 5) != 0);
+				if (caught)
+					UT_ASSERT_EQ(error_code, ERRCODE_FEATURE_NOT_SUPPORTED);
+				UT_ASSERT_EQ(utility_xids, 0);
+				UT_ASSERT_EQ(utility_prepares, 0);
+				UT_ASSERT_EQ(utility_binds, 0);
+				UT_ASSERT_EQ(utility_after_preflight, (mode & 5) == 0);
+			}
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(45);
+	UT_PLAN(46);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -3275,6 +3505,7 @@ main(void)
 	UT_RUN(test_unsupported_creates_refuse_before_xid_or_binding);
 	UT_RUN(test_noncreate_utility_does_not_reserve_canonical_binding);
 	UT_RUN(test_unsupported_statistics_from_keeps_native_path_without_binding);
+	UT_RUN(test_materialized_view_dependency_refuses_before_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
