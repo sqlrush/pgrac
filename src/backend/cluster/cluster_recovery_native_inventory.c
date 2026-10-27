@@ -2925,10 +2925,18 @@ history_pending_terminal_record(const ClusterRecoveryNativeInventory *inventory)
 	return NULL;
 }
 
-bool
-cluster_recovery_relmap_history_pending_terminal_v1(ClusterRecoveryRelmapHistory *history,
+static bool history_pending_xid_begin(ClusterRecoveryRelmapHistory *,
+	const ClusterRelmapV2Image *, NativeInventoryRelmapXid *, ClusterRecoveryRelmapPendingXidV1 *);
+static bool history_pending_xid_finish(ClusterRecoveryRelmapHistory *,
+	const ClusterRelmapV2Image *, NativeInventoryRelmapXid *, ClusterRecoveryRelmapPendingXidV1 *);
+static bool history_pending_birth_match(const ClusterRecoveryRelmapPendingXidV1 *,
+	const ClusterRelmapV2Image *, uint32 *);
+
+static bool
+history_pending_terminal_read(ClusterRecoveryRelmapHistory *history,
 	const ClusterRelmapV2Image *pending, ClusterRecoveryRelmapPendingTerminalV1 *out,
-	ClusterRecoveryNativeInventoryDiag *diag)
+	ClusterRecoveryNativeInventoryDiag *diag, ClusterRecoveryRelmapPendingBirthV1 *birth,
+	NativeInventoryRelmapXid *xid)
 {
 	ClusterRecoveryRelmapPendingTerminalV1 result = {0};
 	NativeInventoryRelmapTerminal terminal = {0};
@@ -2965,7 +2973,9 @@ cluster_recovery_relmap_history_pending_terminal_v1(ClusterRecoveryRelmapHistory
 	{
 		saved = history_pending_same(history, pending)
 			? history_pending_terminal_record(history->inventory) : NULL;
-		ok = saved != NULL && history_pending_base_read(history, &result.base);
+		ok = saved != NULL
+			&& (birth == NULL || history_pending_xid_begin(history, pending, xid, &birth->inputs))
+			&& history_pending_base_read(history, &result.base);
 		if (ok) {
 			ok = cluster_recovery_native_scan_primary(saved->scan, &effect)
 				== CLUSTER_RECOVERY_NATIVE_EFFECT
@@ -2980,14 +2990,27 @@ cluster_recovery_relmap_history_pending_terminal_v1(ClusterRecoveryRelmapHistory
 		}
 		if (ok) {
 			history->inventory->relmap_terminal = &terminal;
+			if (xid != NULL)
+				history->inventory->relmap_xid = xid;
 			ok = cluster_recovery_native_inventory_recheck(history->original.scope,
 				history->inventory, diag) == CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED;
 			history->inventory->relmap_terminal = NULL;
+			if (xid != NULL)
+				history->inventory->relmap_xid = NULL;
 			ok = ok && terminal.matched == terminal.expected
 				&& cluster_wal_inputs_relmap_terminal_count_v1(&terminal.source) == terminal.expected
 				&& history_pending_base_read(history, &result.base)
 				&& cluster_wal_inputs_relmap_terminal_count_v1(&terminal.source) == terminal.expected
 				&& inventory_history_inputs(history->inventory, history->original.scope, false);
+		}
+		if (ok && birth != NULL) {
+			ok = history_pending_xid_finish(history, pending, xid, &birth->inputs)
+				&& history_pending_birth_match(&birth->inputs, pending, &birth->birth_index)
+				&& memcmp(&birth->inputs.history, &result.base.history,
+					sizeof(result.base.history)) == 0
+				&& saved->source_index == birth->inputs.history.observation.source_index
+				&& saved->ordinal > birth->inputs.map_ordinal
+				&& effect.record->read_lsn >= birth->inputs.map_end;
 		}
 		if (ok) {
 			result.terminal_start = effect.record->read_lsn;
@@ -2999,6 +3022,8 @@ cluster_recovery_relmap_history_pending_terminal_v1(ClusterRecoveryRelmapHistory
 	PG_CATCH();
 	{
 		history->inventory->relmap_terminal = NULL;
+		if (xid != NULL)
+			history->inventory->relmap_xid = NULL;
 		history_fail(history);
 		PG_RE_THROW();
 	}
@@ -3011,6 +3036,14 @@ cluster_recovery_relmap_history_pending_terminal_v1(ClusterRecoveryRelmapHistory
 	} else
 		history_fail(history);
 	return ok;
+}
+
+bool
+cluster_recovery_relmap_history_pending_terminal_v1(ClusterRecoveryRelmapHistory *history,
+	const ClusterRelmapV2Image *pending, ClusterRecoveryRelmapPendingTerminalV1 *out,
+	ClusterRecoveryNativeInventoryDiag *diag)
+{
+	return history_pending_terminal_read(history, pending, out, diag, NULL, NULL);
 }
 
 /* Full counters only: never manufacture an era by attaching a current epoch
@@ -3120,6 +3153,71 @@ history_pending_xid_generations(ClusterRecoveryRelmapHistory *history,
 	return true;
 }
 
+static bool
+history_pending_xid_begin(ClusterRecoveryRelmapHistory *history,
+	const ClusterRelmapV2Image *pending, NativeInventoryRelmapXid *xid,
+	ClusterRecoveryRelmapPendingXidV1 *result)
+{
+	ClusterRecoveryNativeInventory *inventory = history->inventory;
+	bool ok;
+
+	uint32 index = inventory->relmap_wal_source;
+	ok = history_pending_same(history, pending) && !inventory->relmap_active
+		&& inventory->relmap_xid == NULL && inventory->relmap_terminal == NULL
+		&& inventory->relmap_summary.wal_matches == 1
+		&& inventory->relmap_summary.wal_aliases == 0
+		&& inventory->relmap_summary.owner_window_sources == 1
+		&& inventory->relmap_summary.query_window_sources == 1
+		&& index < inventory->source_count
+		&& history_pending_xid_source(history, index, &result->history)
+		&& result->history.checkpoint_observed && result->history.window_observed;
+	if (ok) {
+		const NativeInventorySource *saved = &inventory->sources[index];
+		const ClusterRelmapCheckpointWindow *window = &result->history.window;
+		uint64 query = pending->pending_owner.top_full_xid;
+		result->checkpoint_next = U64FromFullTransactionId(
+			saved->history.input.native_checkpoint.nextXid);
+		xid->source_index = index;
+		xid->result = result;
+		ok = window->origin == pending->pending_owner.node
+			&& window->epoch == pending->pending_owner.membership_epoch
+			&& window->admitted_incarnation == pending->pending_owner.admitted_incarnation
+			&& window->boot_incarnation == pending->pending_owner.boot_incarnation
+			&& query >= window->native_floor && query <= result->history.post_flush_issued
+			&& result->history.post_flush_issued - window->native_floor < UINT64_C(0x80000000)
+			&& history_pending_xid_generations(history, xid, result, false);
+	}
+	return ok;
+}
+
+static bool
+history_pending_xid_finish(ClusterRecoveryRelmapHistory *history,
+	const ClusterRelmapV2Image *pending, NativeInventoryRelmapXid *xid,
+	ClusterRecoveryRelmapPendingXidV1 *result)
+{
+	ClusterRecoveryNativeInventory *inventory = history->inventory;
+	bool ok;
+
+	ok = history_pending_xid_generations(history, xid, result, true)
+		&& xid->map_end == pending->pending_owner.wal_end
+		&& xid->map_start < xid->map_end
+		&& cluster_cold_xid_candidate_v1(&xid->progress, &xid->source, &result->tail_next)
+		&& history_pending_xid_bounds(pending->pending_owner.top_full_xid,
+			result->checkpoint_next, xid->before_map, xid->after_map, result->tail_next)
+		&& history_pending_xid_source(history, xid->source_index,
+			&result->history)
+		&& inventory_history_inputs(inventory, history->original.scope, false);
+	if (ok) {
+		result->before_map = xid->before_map;
+		result->after_map = xid->after_map;
+		result->records = xid->progress.records;
+		result->map_ordinal = xid->map_ordinal;
+		result->map_start = xid->map_start;
+		result->map_end = xid->map_end;
+	}
+	return ok;
+}
+
 /* This correspondence is deliberately narrower than native lifetime proof.
  * Never order distinct physical generations, infer an era from raw ZERO, or
  * treat a matching page birth as an issued/terminal transaction. */
@@ -3225,57 +3323,16 @@ history_pending_xid_read(ClusterRecoveryRelmapHistory *history,
 	history->failed = true;
 	PG_TRY();
 	{
-		uint32 index = inventory->relmap_wal_source;
-		ok = history_pending_same(history, pending) && !inventory->relmap_active
-			&& inventory->relmap_xid == NULL && inventory->relmap_terminal == NULL
-			&& inventory->relmap_summary.wal_matches == 1
-			&& inventory->relmap_summary.wal_aliases == 0
-			&& inventory->relmap_summary.owner_window_sources == 1
-			&& inventory->relmap_summary.query_window_sources == 1
-			&& index < inventory->source_count
-			&& history_pending_xid_source(history, index, &result.history)
-			&& result.history.checkpoint_observed && result.history.window_observed;
-		if (ok) {
-			const NativeInventorySource *saved = &inventory->sources[index];
-			const ClusterRelmapCheckpointWindow *window = &result.history.window;
-			uint64 query = pending->pending_owner.top_full_xid;
-			result.checkpoint_next = U64FromFullTransactionId(
-				saved->history.input.native_checkpoint.nextXid);
-			xid.source_index = index;
-			xid.result = &result;
-			ok = window->origin == pending->pending_owner.node
-				&& window->epoch == pending->pending_owner.membership_epoch
-				&& window->admitted_incarnation == pending->pending_owner.admitted_incarnation
-				&& window->boot_incarnation == pending->pending_owner.boot_incarnation
-				&& query >= window->native_floor && query <= result.history.post_flush_issued
-				&& result.history.post_flush_issued - window->native_floor < UINT64_C(0x80000000)
-				&& history_pending_xid_generations(history, &xid, &result, false);
-		}
+		ok = history_pending_xid_begin(history, pending, &xid, &result);
 		if (ok) {
 			inventory->relmap_xid = &xid;
 			ok = cluster_recovery_native_inventory_recheck(history->original.scope,
 				inventory, diag) == CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED;
 			inventory->relmap_xid = NULL;
-			ok = ok && history_pending_xid_generations(history, &xid, &result, true)
-				&& xid.map_end == pending->pending_owner.wal_end
-				&& xid.map_start < xid.map_end
-				&& cluster_cold_xid_candidate_v1(&xid.progress, &xid.source, &result.tail_next)
-				&& history_pending_xid_bounds(pending->pending_owner.top_full_xid,
-					result.checkpoint_next, xid.before_map, xid.after_map, result.tail_next)
-				&& history_pending_xid_source(history, xid.source_index,
-					&result.history)
-				&& inventory_history_inputs(inventory, history->original.scope, false);
+			ok = ok && history_pending_xid_finish(history, pending, &xid, &result);
 		}
-		if (ok) {
-			result.before_map = xid.before_map;
-			result.after_map = xid.after_map;
-			result.records = xid.progress.records;
-			result.map_ordinal = xid.map_ordinal;
-			result.map_start = xid.map_start;
-			result.map_end = xid.map_end;
-			if (birth_index != NULL)
-				ok = history_pending_birth_match(&result, pending, birth_index);
-		}
+		if (ok && birth_index != NULL)
+			ok = history_pending_birth_match(&result, pending, birth_index);
 	}
 	PG_CATCH();
 	{
@@ -3320,6 +3377,29 @@ cluster_recovery_relmap_history_pending_birth_v1(ClusterRecoveryRelmapHistory *h
 	if (!history_pending_xid_read(history, pending, &out->inputs, diag, &birth_index))
 		return false;
 	out->birth_index = birth_index;
+	return true;
+}
+
+bool
+cluster_recovery_relmap_history_pending_native_v1(ClusterRecoveryRelmapHistory *history,
+	const ClusterRelmapV2Image *pending, ClusterRecoveryRelmapPendingNativeV1 *out,
+	ClusterRecoveryNativeInventoryDiag *diag)
+{
+	ClusterRecoveryRelmapPendingNativeV1 result = {0};
+	NativeInventoryRelmapXid xid = {0};
+
+	if (pending == NULL || out == NULL || diag == NULL
+		|| history_overlap(out, sizeof(*out), pending, sizeof(*pending))
+		|| history_overlap(diag, sizeof(*diag), pending, sizeof(*pending))
+		|| history_overlap(out, sizeof(*out), diag, sizeof(*diag))
+		|| history_storage_overlap(history, out, sizeof(*out))
+		|| history_storage_overlap(history, diag, sizeof(*diag)))
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (!history_pending_terminal_read(history, pending, &result.terminal, diag,
+		&result.birth, &xid))
+		return false;
+	memcpy(out, &result, sizeof(result));
 	return true;
 }
 
