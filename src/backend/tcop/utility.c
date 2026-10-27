@@ -346,8 +346,22 @@ PreflightClusterSharedCatalogWrite(Node *statement)
 			&& !IsA(statement, AlterObjectDependsStmt) && !IsA(statement, ReassignOwnedStmt)
 			&& !IsA(statement, CreateForeignTableStmt) && !IsA(statement, AlterOwnerStmt)
 			&& !IsA(statement, AlterDatabaseStmt) && !IsA(statement, AlterTableSpaceOptionsStmt)
-			&& !IsA(statement, SecLabelStmt) && !IsA(statement, TruncateStmt)))
+			&& !IsA(statement, SecLabelStmt) && !IsA(statement, AlterTableStmt)
+			&& !IsA(statement, TruncateStmt)))
 		return;
+
+	if (IsA(statement, AlterTableStmt)) {
+		ListCell *lc;
+
+		/* The original candidate precheck can already hold DDL locks. */
+		foreach (lc, ((AlterTableStmt *)statement)->cmds) {
+			AlterTableCmd *cmd = (AlterTableCmd *)lfirst(lc);
+
+			if (cmd->subtype == AT_AddColumn || cmd->subtype == AT_AlterColumnType
+				|| cmd->subtype == AT_SetAccessMethod || cmd->subtype == AT_SetLogged)
+				return;
+		}
+	}
 
 	if (IsA(statement, AlterDatabaseStmt)) {
 		ListCell *lc;
@@ -385,7 +399,8 @@ PreflightClusterSharedCatalogWrite(Node *statement)
 			 || IsA(statement, DropUserMappingStmt) || IsA(statement, AlterPublicationStmt)
 			 || IsA(statement, AlterObjectDependsStmt) || IsA(statement, ReassignOwnedStmt)
 			 || IsA(statement, AlterOwnerStmt) || IsA(statement, AlterDatabaseStmt)
-			 || IsA(statement, AlterTableSpaceOptionsStmt) || IsA(statement, SecLabelStmt))
+			 || IsA(statement, AlterTableSpaceOptionsStmt) || IsA(statement, SecLabelStmt)
+			 || IsA(statement, AlterTableStmt))
 		action = "alteration";
 	else
 		action = "creation";

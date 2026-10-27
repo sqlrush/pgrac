@@ -285,6 +285,8 @@ CreateCommandTag(Node *statement)
 		return CMDTAG_CREATE_INDEX;
 	if (IsA(statement, ViewStmt))
 		return CMDTAG_CREATE_VIEW;
+	if (IsA(statement, AlterTableStmt))
+		return CMDTAG_ALTER_TABLE;
 	/* This boundary models the table rename/schema-move cases below. */
 	if (IsA(statement, RenameStmt) || IsA(statement, AlterObjectSchemaStmt))
 		return CMDTAG_ALTER_TABLE;
@@ -2019,6 +2021,56 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 									.label = "routine_label" };
 	SecLabelStmt label_database
 		= { .type = T_SecLabelStmt, .objtype = OBJECT_DATABASE, .object = (Node *)&label_name };
+	RangeVar static_relation = { .type = T_RangeVar,
+								 .relname = "alter_target",
+								 .inh = true,
+								 .relpersistence = RELPERSISTENCE_PERMANENT };
+	Integer static_stats_value = { .type = T_Integer, .ival = 100 };
+	AlterTableCmd static_stats_cmd = { .type = T_AlterTableCmd,
+									   .subtype = AT_SetStatistics,
+									   .name = "target_column",
+									   .def = (Node *)&static_stats_value };
+	RoleSpec static_owner_role
+		= { .type = T_RoleSpec, .roletype = ROLESPEC_CSTRING, .rolename = "receiving_owner" };
+	AlterTableCmd static_owner_cmd
+		= { .type = T_AlterTableCmd, .subtype = AT_ChangeOwner, .newowner = &static_owner_role };
+	Integer static_fillfactor = { .type = T_Integer, .ival = 90 };
+	DefElem static_set_option
+		= { .type = T_DefElem, .defname = "fillfactor", .arg = (Node *)&static_fillfactor };
+	DefElem static_reset_option = { .type = T_DefElem, .defname = "autovacuum_enabled" };
+	ListCell static_set_cell = { .ptr_value = &static_set_option };
+	ListCell static_reset_cell = { .ptr_value = &static_reset_option };
+	List static_set_list
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &static_set_cell };
+	List static_reset_list
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &static_reset_cell };
+	AlterTableCmd static_set_cmd
+		= { .type = T_AlterTableCmd, .subtype = AT_SetRelOptions, .def = (Node *)&static_set_list };
+	AlterTableCmd static_reset_cmd = { .type = T_AlterTableCmd,
+									   .subtype = AT_ResetRelOptions,
+									   .def = (Node *)&static_reset_list };
+	ListCell static_stats_cell = { .ptr_value = &static_stats_cmd };
+	ListCell static_owner_cell = { .ptr_value = &static_owner_cmd };
+	ListCell static_option_cells[2]
+		= { { .ptr_value = &static_set_cmd }, { .ptr_value = &static_reset_cmd } };
+	List static_stats_cmds
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &static_stats_cell };
+	List static_owner_cmds
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &static_owner_cell };
+	List static_option_cmds
+		= { .type = T_List, .length = 2, .max_length = 2, .elements = static_option_cells };
+	AlterTableStmt static_statistics = { .type = T_AlterTableStmt,
+										 .objtype = OBJECT_TABLE,
+										 .relation = &static_relation,
+										 .cmds = &static_stats_cmds };
+	AlterTableStmt static_owner = { .type = T_AlterTableStmt,
+									.objtype = OBJECT_TABLE,
+									.relation = &static_relation,
+									.cmds = &static_owner_cmds };
+	AlterTableStmt static_options = { .type = T_AlterTableStmt,
+									  .objtype = OBJECT_TABLE,
+									  .relation = &static_relation,
+									  .cmds = &static_option_cmds };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -2102,12 +2154,22 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 						   (Node *)&label_table,
 						   (Node *)&label_column,
 						   (Node *)&label_function,
-						   (Node *)&label_database };
+						   (Node *)&label_database,
+						   (Node *)&static_statistics,
+						   (Node *)&static_owner,
+						   (Node *)&static_options };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned skip = 0; skip < 2; skip++) {
 			reset_create_preflight();
 			utility_expect_binding = true;
+			static_stats_value.ival = skip ? -1 : 100;
+			static_fillfactor.ival = skip ? 80 : 90;
+			static_owner_role.roletype = skip ? ROLESPEC_CURRENT_USER : ROLESPEC_CSTRING;
+			static_owner_role.rolename = skip ? NULL : "receiving_owner";
+			static_statistics.missing_ok = static_owner.missing_ok = static_options.missing_ok
+				= skip != 0;
+			static_relation.inh = skip == 0;
 			label_table.label = skip ? NULL : "table_label";
 			label_column.label = skip ? "column_label" : NULL;
 			label_function.label = skip ? NULL : "routine_label";
@@ -2539,6 +2601,56 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 									.label = "routine_label" };
 	SecLabelStmt label_database
 		= { .type = T_SecLabelStmt, .objtype = OBJECT_DATABASE, .object = (Node *)&label_name };
+	RangeVar static_relation = { .type = T_RangeVar,
+								 .relname = "alter_target",
+								 .inh = true,
+								 .relpersistence = RELPERSISTENCE_PERMANENT };
+	Integer static_stats_value = { .type = T_Integer, .ival = 100 };
+	AlterTableCmd static_stats_cmd = { .type = T_AlterTableCmd,
+									   .subtype = AT_SetStatistics,
+									   .name = "target_column",
+									   .def = (Node *)&static_stats_value };
+	RoleSpec static_owner_role
+		= { .type = T_RoleSpec, .roletype = ROLESPEC_CSTRING, .rolename = "receiving_owner" };
+	AlterTableCmd static_owner_cmd
+		= { .type = T_AlterTableCmd, .subtype = AT_ChangeOwner, .newowner = &static_owner_role };
+	Integer static_fillfactor = { .type = T_Integer, .ival = 90 };
+	DefElem static_set_option
+		= { .type = T_DefElem, .defname = "fillfactor", .arg = (Node *)&static_fillfactor };
+	DefElem static_reset_option = { .type = T_DefElem, .defname = "autovacuum_enabled" };
+	ListCell static_set_cell = { .ptr_value = &static_set_option };
+	ListCell static_reset_cell = { .ptr_value = &static_reset_option };
+	List static_set_list
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &static_set_cell };
+	List static_reset_list
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &static_reset_cell };
+	AlterTableCmd static_set_cmd
+		= { .type = T_AlterTableCmd, .subtype = AT_SetRelOptions, .def = (Node *)&static_set_list };
+	AlterTableCmd static_reset_cmd = { .type = T_AlterTableCmd,
+									   .subtype = AT_ResetRelOptions,
+									   .def = (Node *)&static_reset_list };
+	ListCell static_stats_cell = { .ptr_value = &static_stats_cmd };
+	ListCell static_owner_cell = { .ptr_value = &static_owner_cmd };
+	ListCell static_option_cells[2]
+		= { { .ptr_value = &static_set_cmd }, { .ptr_value = &static_reset_cmd } };
+	List static_stats_cmds
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &static_stats_cell };
+	List static_owner_cmds
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &static_owner_cell };
+	List static_option_cmds
+		= { .type = T_List, .length = 2, .max_length = 2, .elements = static_option_cells };
+	AlterTableStmt static_statistics = { .type = T_AlterTableStmt,
+										 .objtype = OBJECT_TABLE,
+										 .relation = &static_relation,
+										 .cmds = &static_stats_cmds };
+	AlterTableStmt static_owner = { .type = T_AlterTableStmt,
+									.objtype = OBJECT_TABLE,
+									.relation = &static_relation,
+									.cmds = &static_owner_cmds };
+	AlterTableStmt static_options = { .type = T_AlterTableStmt,
+									  .objtype = OBJECT_TABLE,
+									  .relation = &static_relation,
+									  .cmds = &static_option_cmds };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -2622,7 +2734,10 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 						   (Node *)&label_table,
 						   (Node *)&label_column,
 						   (Node *)&label_function,
-						   (Node *)&label_database };
+						   (Node *)&label_database,
+						   (Node *)&static_statistics,
+						   (Node *)&static_owner,
+						   (Node *)&static_options };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		int caught;
@@ -2634,7 +2749,7 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 			create_sql_entry(statements[i]);
 		UT_ASSERT(caught);
 		UT_ASSERT_EQ(error_code, ERRCODE_DATA_CORRUPTED);
-		if (IsA(statements[i], SecLabelStmt))
+		if (IsA(statements[i], SecLabelStmt) || IsA(statements[i], AlterTableStmt))
 			UT_ASSERT(strcmp(error_message,
 							 "canonical ACTIVE publication failed before shared catalog alteration")
 					  == 0);
@@ -2975,6 +3090,56 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 									.label = "routine_label" };
 	SecLabelStmt label_database
 		= { .type = T_SecLabelStmt, .objtype = OBJECT_DATABASE, .object = (Node *)&label_name };
+	RangeVar static_relation = { .type = T_RangeVar,
+								 .relname = "alter_target",
+								 .inh = true,
+								 .relpersistence = RELPERSISTENCE_PERMANENT };
+	Integer static_stats_value = { .type = T_Integer, .ival = 100 };
+	AlterTableCmd static_stats_cmd = { .type = T_AlterTableCmd,
+									   .subtype = AT_SetStatistics,
+									   .name = "target_column",
+									   .def = (Node *)&static_stats_value };
+	RoleSpec static_owner_role
+		= { .type = T_RoleSpec, .roletype = ROLESPEC_CSTRING, .rolename = "receiving_owner" };
+	AlterTableCmd static_owner_cmd
+		= { .type = T_AlterTableCmd, .subtype = AT_ChangeOwner, .newowner = &static_owner_role };
+	Integer static_fillfactor = { .type = T_Integer, .ival = 90 };
+	DefElem static_set_option
+		= { .type = T_DefElem, .defname = "fillfactor", .arg = (Node *)&static_fillfactor };
+	DefElem static_reset_option = { .type = T_DefElem, .defname = "autovacuum_enabled" };
+	ListCell static_set_cell = { .ptr_value = &static_set_option };
+	ListCell static_reset_cell = { .ptr_value = &static_reset_option };
+	List static_set_list
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &static_set_cell };
+	List static_reset_list
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &static_reset_cell };
+	AlterTableCmd static_set_cmd
+		= { .type = T_AlterTableCmd, .subtype = AT_SetRelOptions, .def = (Node *)&static_set_list };
+	AlterTableCmd static_reset_cmd = { .type = T_AlterTableCmd,
+									   .subtype = AT_ResetRelOptions,
+									   .def = (Node *)&static_reset_list };
+	ListCell static_stats_cell = { .ptr_value = &static_stats_cmd };
+	ListCell static_owner_cell = { .ptr_value = &static_owner_cmd };
+	ListCell static_option_cells[2]
+		= { { .ptr_value = &static_set_cmd }, { .ptr_value = &static_reset_cmd } };
+	List static_stats_cmds
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &static_stats_cell };
+	List static_owner_cmds
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &static_owner_cell };
+	List static_option_cmds
+		= { .type = T_List, .length = 2, .max_length = 2, .elements = static_option_cells };
+	AlterTableStmt static_statistics = { .type = T_AlterTableStmt,
+										 .objtype = OBJECT_TABLE,
+										 .relation = &static_relation,
+										 .cmds = &static_stats_cmds };
+	AlterTableStmt static_owner = { .type = T_AlterTableStmt,
+									.objtype = OBJECT_TABLE,
+									.relation = &static_relation,
+									.cmds = &static_owner_cmds };
+	AlterTableStmt static_options = { .type = T_AlterTableStmt,
+									  .objtype = OBJECT_TABLE,
+									  .relation = &static_relation,
+									  .cmds = &static_option_cmds };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -3058,7 +3223,10 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 						   (Node *)&label_table,
 						   (Node *)&label_column,
 						   (Node *)&label_function,
-						   (Node *)&label_database };
+						   (Node *)&label_database,
+						   (Node *)&static_statistics,
+						   (Node *)&static_owner,
+						   (Node *)&static_options };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned child = 0; child < 2; child++) {
@@ -3076,7 +3244,7 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 			UT_ASSERT(caught);
 			UT_ASSERT_EQ(error_code,
 						 child ? ERRCODE_FEATURE_NOT_SUPPORTED : ERRCODE_INTERNAL_ERROR);
-			if (child && IsA(statements[i], SecLabelStmt))
+			if (child && (IsA(statements[i], SecLabelStmt) || IsA(statements[i], AlterTableStmt)))
 				UT_ASSERT(strcmp(error_message,
 								 "shared catalog alteration does not support subtransactions")
 						  == 0);
@@ -3417,6 +3585,56 @@ UT_TEST(test_catalog_writes_preflight_requires_shared_catalog_storage)
 									.label = "routine_label" };
 	SecLabelStmt label_database
 		= { .type = T_SecLabelStmt, .objtype = OBJECT_DATABASE, .object = (Node *)&label_name };
+	RangeVar static_relation = { .type = T_RangeVar,
+								 .relname = "alter_target",
+								 .inh = true,
+								 .relpersistence = RELPERSISTENCE_PERMANENT };
+	Integer static_stats_value = { .type = T_Integer, .ival = 100 };
+	AlterTableCmd static_stats_cmd = { .type = T_AlterTableCmd,
+									   .subtype = AT_SetStatistics,
+									   .name = "target_column",
+									   .def = (Node *)&static_stats_value };
+	RoleSpec static_owner_role
+		= { .type = T_RoleSpec, .roletype = ROLESPEC_CSTRING, .rolename = "receiving_owner" };
+	AlterTableCmd static_owner_cmd
+		= { .type = T_AlterTableCmd, .subtype = AT_ChangeOwner, .newowner = &static_owner_role };
+	Integer static_fillfactor = { .type = T_Integer, .ival = 90 };
+	DefElem static_set_option
+		= { .type = T_DefElem, .defname = "fillfactor", .arg = (Node *)&static_fillfactor };
+	DefElem static_reset_option = { .type = T_DefElem, .defname = "autovacuum_enabled" };
+	ListCell static_set_cell = { .ptr_value = &static_set_option };
+	ListCell static_reset_cell = { .ptr_value = &static_reset_option };
+	List static_set_list
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &static_set_cell };
+	List static_reset_list
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &static_reset_cell };
+	AlterTableCmd static_set_cmd
+		= { .type = T_AlterTableCmd, .subtype = AT_SetRelOptions, .def = (Node *)&static_set_list };
+	AlterTableCmd static_reset_cmd = { .type = T_AlterTableCmd,
+									   .subtype = AT_ResetRelOptions,
+									   .def = (Node *)&static_reset_list };
+	ListCell static_stats_cell = { .ptr_value = &static_stats_cmd };
+	ListCell static_owner_cell = { .ptr_value = &static_owner_cmd };
+	ListCell static_option_cells[2]
+		= { { .ptr_value = &static_set_cmd }, { .ptr_value = &static_reset_cmd } };
+	List static_stats_cmds
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &static_stats_cell };
+	List static_owner_cmds
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &static_owner_cell };
+	List static_option_cmds
+		= { .type = T_List, .length = 2, .max_length = 2, .elements = static_option_cells };
+	AlterTableStmt static_statistics = { .type = T_AlterTableStmt,
+										 .objtype = OBJECT_TABLE,
+										 .relation = &static_relation,
+										 .cmds = &static_stats_cmds };
+	AlterTableStmt static_owner = { .type = T_AlterTableStmt,
+									.objtype = OBJECT_TABLE,
+									.relation = &static_relation,
+									.cmds = &static_owner_cmds };
+	AlterTableStmt static_options = { .type = T_AlterTableStmt,
+									  .objtype = OBJECT_TABLE,
+									  .relation = &static_relation,
+									  .cmds = &static_option_cmds };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -3500,7 +3718,10 @@ UT_TEST(test_catalog_writes_preflight_requires_shared_catalog_storage)
 						   (Node *)&label_table,
 						   (Node *)&label_column,
 						   (Node *)&label_function,
-						   (Node *)&label_database };
+						   (Node *)&label_database,
+						   (Node *)&static_statistics,
+						   (Node *)&static_owner,
+						   (Node *)&static_options };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned mode = 0; mode < 8; mode++) {
@@ -3847,6 +4068,56 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 									.label = "routine_label" };
 	SecLabelStmt label_database
 		= { .type = T_SecLabelStmt, .objtype = OBJECT_DATABASE, .object = (Node *)&label_name };
+	RangeVar static_relation = { .type = T_RangeVar,
+								 .relname = "alter_target",
+								 .inh = true,
+								 .relpersistence = RELPERSISTENCE_PERMANENT };
+	Integer static_stats_value = { .type = T_Integer, .ival = 100 };
+	AlterTableCmd static_stats_cmd = { .type = T_AlterTableCmd,
+									   .subtype = AT_SetStatistics,
+									   .name = "target_column",
+									   .def = (Node *)&static_stats_value };
+	RoleSpec static_owner_role
+		= { .type = T_RoleSpec, .roletype = ROLESPEC_CSTRING, .rolename = "receiving_owner" };
+	AlterTableCmd static_owner_cmd
+		= { .type = T_AlterTableCmd, .subtype = AT_ChangeOwner, .newowner = &static_owner_role };
+	Integer static_fillfactor = { .type = T_Integer, .ival = 90 };
+	DefElem static_set_option
+		= { .type = T_DefElem, .defname = "fillfactor", .arg = (Node *)&static_fillfactor };
+	DefElem static_reset_option = { .type = T_DefElem, .defname = "autovacuum_enabled" };
+	ListCell static_set_cell = { .ptr_value = &static_set_option };
+	ListCell static_reset_cell = { .ptr_value = &static_reset_option };
+	List static_set_list
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &static_set_cell };
+	List static_reset_list
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &static_reset_cell };
+	AlterTableCmd static_set_cmd
+		= { .type = T_AlterTableCmd, .subtype = AT_SetRelOptions, .def = (Node *)&static_set_list };
+	AlterTableCmd static_reset_cmd = { .type = T_AlterTableCmd,
+									   .subtype = AT_ResetRelOptions,
+									   .def = (Node *)&static_reset_list };
+	ListCell static_stats_cell = { .ptr_value = &static_stats_cmd };
+	ListCell static_owner_cell = { .ptr_value = &static_owner_cmd };
+	ListCell static_option_cells[2]
+		= { { .ptr_value = &static_set_cmd }, { .ptr_value = &static_reset_cmd } };
+	List static_stats_cmds
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &static_stats_cell };
+	List static_owner_cmds
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &static_owner_cell };
+	List static_option_cmds
+		= { .type = T_List, .length = 2, .max_length = 2, .elements = static_option_cells };
+	AlterTableStmt static_statistics = { .type = T_AlterTableStmt,
+										 .objtype = OBJECT_TABLE,
+										 .relation = &static_relation,
+										 .cmds = &static_stats_cmds };
+	AlterTableStmt static_owner = { .type = T_AlterTableStmt,
+									.objtype = OBJECT_TABLE,
+									.relation = &static_relation,
+									.cmds = &static_owner_cmds };
+	AlterTableStmt static_options = { .type = T_AlterTableStmt,
+									  .objtype = OBJECT_TABLE,
+									  .relation = &static_relation,
+									  .cmds = &static_option_cmds };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -3930,7 +4201,10 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 						   (Node *)&label_table,
 						   (Node *)&label_column,
 						   (Node *)&label_function,
-						   (Node *)&label_database };
+						   (Node *)&label_database,
+						   (Node *)&static_statistics,
+						   (Node *)&static_owner,
+						   (Node *)&static_options };
 	const char *tags[] = { "CREATE SCHEMA",
 						   "CREATE SEQUENCE",
 						   "CREATE INDEX",
@@ -4014,7 +4288,10 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 						   "SECURITY LABEL",
 						   "SECURITY LABEL",
 						   "SECURITY LABEL",
-						   "SECURITY LABEL" };
+						   "SECURITY LABEL",
+						   "ALTER TABLE",
+						   "ALTER TABLE",
+						   "ALTER TABLE" };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned parallel = 0; parallel < 2; parallel++) {
@@ -4431,10 +4708,147 @@ UT_TEST(test_unsupported_security_labels_refuse_before_binding)
 	}
 }
 
+UT_TEST(test_alter_rewrite_candidates_keep_native_path_without_binding)
+{
+	RangeVar relation = { .type = T_RangeVar,
+						  .relname = "alter_target",
+						  .inh = true,
+						  .relpersistence = RELPERSISTENCE_PERMANENT };
+	String type_name = { .type = T_String, .sval = "int4" };
+	ListCell type_cell = { .ptr_value = &type_name };
+	List type_names = { .type = T_List, .length = 1, .max_length = 1, .elements = &type_cell };
+	TypeName type = { .type = T_TypeName, .names = &type_names, .typemod = -1, .location = -1 };
+	ColumnDef add_column
+		= { .type = T_ColumnDef, .colname = "new_column", .typeName = &type, .location = -1 };
+	ColumnDef type_column = { .type = T_ColumnDef, .typeName = &type, .location = -1 };
+	AlterTableCmd candidates[]
+		= { { .type = T_AlterTableCmd, .subtype = AT_AddColumn, .def = (Node *)&add_column },
+			{ .type = T_AlterTableCmd,
+			  .subtype = AT_AlterColumnType,
+			  .name = "target_column",
+			  .def = (Node *)&type_column },
+			{ .type = T_AlterTableCmd, .subtype = AT_SetAccessMethod, .name = "heap" },
+			{ .type = T_AlterTableCmd, .subtype = AT_SetLogged } };
+	Integer stats_value = { .type = T_Integer, .ival = 100 };
+	AlterTableCmd metadata = { .type = T_AlterTableCmd,
+							   .subtype = AT_SetStatistics,
+							   .name = "target_column",
+							   .def = (Node *)&stats_value };
+	ListCell candidate_cell = { .ptr_value = &candidates[0] };
+	ListCell metadata_first[2] = { { .ptr_value = &metadata }, { .ptr_value = &candidates[0] } };
+	ListCell metadata_last[2] = { { .ptr_value = &candidates[0] }, { .ptr_value = &metadata } };
+	List command_lists[]
+		= { { .type = T_List, .length = 1, .max_length = 1, .elements = &candidate_cell },
+			{ .type = T_List, .length = 2, .max_length = 2, .elements = metadata_first },
+			{ .type = T_List, .length = 2, .max_length = 2, .elements = metadata_last } };
+	AlterTableStmt alter
+		= { .type = T_AlterTableStmt, .objtype = OBJECT_TABLE, .relation = &relation };
+
+	/* Native dynamic precheck/locks/DDL are explicit boundaries in this fixture. */
+	for (unsigned mode = 0; mode < 8; mode++) {
+		for (unsigned kind = 0; kind < lengthof(candidates); kind++) {
+			candidate_cell.ptr_value = metadata_first[1].ptr_value = metadata_last[0].ptr_value
+				= &candidates[kind];
+			for (unsigned variant = 0; variant < lengthof(command_lists); variant++) {
+				alter.cmds = &command_lists[variant];
+				for (unsigned skip = 0; skip < 2; skip++) {
+					alter.missing_ok = skip != 0;
+					candidates[kind].missing_ok = kind == 0 && skip != 0;
+					relation.inh = skip == 0;
+					for (unsigned child = 0; child < 2; child++) {
+						int caught;
+
+						reset_create_preflight();
+						cluster_shared_catalog = (mode & 1) != 0;
+						utility_storage_mode = (mode & 2) != 0;
+						cluster_shared_config = (mode & 4) != 0;
+						utility_in_child = utility_in_transaction = child != 0;
+						caught = sigsetjmp(boundary, 1);
+						if (!caught)
+							create_sql_entry((Node *)&alter);
+						UT_ASSERT_EQ(caught, 0);
+						UT_ASSERT_EQ(utility_xids, 0);
+						UT_ASSERT_EQ(utility_prepares, 0);
+						UT_ASSERT_EQ(utility_binds, 0);
+						UT_ASSERT_EQ(utility_after_preflight, 1);
+					}
+				}
+			}
+		}
+	}
+}
+
+UT_TEST(test_unsupported_alter_table_refuses_before_binding)
+{
+	RangeVar relation = { .type = T_RangeVar,
+						  .relname = "alter_target",
+						  .inh = true,
+						  .relpersistence = RELPERSISTENCE_PERMANENT };
+	RangeVar parent = { .type = T_RangeVar, .relname = "parent_target" };
+	PartitionBoundSpec bound = { .type = T_PartitionBoundSpec, .is_default = true };
+	PartitionCmd partition = { .type = T_PartitionCmd, .name = &parent, .bound = &bound };
+	Integer stats_value = { .type = T_Integer, .ival = 100 };
+	AlterTableCmd commands[]
+		= { { .type = T_AlterTableCmd, .subtype = AT_SetUnLogged },
+			{ .type = T_AlterTableCmd, .subtype = AT_SetTableSpace, .name = "target_space" },
+			{ .type = T_AlterTableCmd, .subtype = AT_AddInherit, .def = (Node *)&parent },
+			{ .type = T_AlterTableCmd, .subtype = AT_DropInherit, .def = (Node *)&parent },
+			{ .type = T_AlterTableCmd, .subtype = AT_AttachPartition, .def = (Node *)&partition },
+			{ .type = T_AlterTableCmd, .subtype = AT_DetachPartition, .def = (Node *)&partition },
+			{ .type = T_AlterTableCmd,
+			  .subtype = AT_DetachPartitionFinalize,
+			  .def = (Node *)&partition },
+			{ .type = T_AlterTableCmd,
+			  .subtype = AT_SetStatistics,
+			  .name = "target_column",
+			  .def = (Node *)&stats_value } };
+	ListCell command_cell = { .ptr_value = &commands[0] };
+	List cmds = { .type = T_List, .length = 1, .max_length = 1, .elements = &command_cell };
+	AlterTableStmt alter = { .type = T_AlterTableStmt,
+							 .objtype = OBJECT_TABLE,
+							 .relation = &relation,
+							 .cmds = &cmds };
+	ListCell schema_cell = { .ptr_value = &alter };
+	List children = { .type = T_List, .length = 1, .max_length = 1, .elements = &schema_cell };
+	CreateSchemaStmt schema = { .type = T_CreateSchemaStmt, .schemaElts = &children };
+	Node *statements[] = { (Node *)&alter, (Node *)&schema };
+
+	/* Synthetic schema only exercises the original raw support recursion. */
+	for (unsigned mode = 0; mode < 8; mode++) {
+		for (unsigned kind = 0; kind < lengthof(commands); kind++) {
+			command_cell.ptr_value = &commands[kind];
+			alter.objtype = kind == lengthof(commands) - 1 ? OBJECT_MATVIEW : OBJECT_TABLE;
+			for (unsigned child = 0; child < 2; child++) {
+				for (unsigned i = 0; i < lengthof(statements); i++) {
+					int caught;
+
+					reset_create_preflight();
+					cluster_shared_catalog = (mode & 1) != 0;
+					utility_storage_mode = (mode & 2) != 0;
+					cluster_shared_config = (mode & 4) != 0;
+					utility_in_child = child != 0;
+					caught = sigsetjmp(boundary, 1);
+					if (!caught)
+						create_sql_entry(statements[i]);
+					UT_ASSERT_EQ(caught != 0, (mode & 5) != 0);
+					if (caught) {
+						UT_ASSERT_EQ(error_code, ERRCODE_FEATURE_NOT_SUPPORTED);
+						UT_ASSERT(strstr(error_message, "is not supported in shared mode") != NULL);
+					}
+					UT_ASSERT_EQ(utility_xids, 0);
+					UT_ASSERT_EQ(utility_prepares, 0);
+					UT_ASSERT_EQ(utility_binds, 0);
+					UT_ASSERT_EQ(utility_after_preflight, (mode & 5) == 0);
+				}
+			}
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(51);
+	UT_PLAN(53);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -4486,6 +4900,8 @@ main(void)
 	UT_RUN(test_undo_tablespace_options_refuses_before_binding);
 	UT_RUN(test_database_move_keeps_native_path_without_binding);
 	UT_RUN(test_unsupported_security_labels_refuse_before_binding);
+	UT_RUN(test_alter_rewrite_candidates_keep_native_path_without_binding);
+	UT_RUN(test_unsupported_alter_table_refuses_before_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
