@@ -21,6 +21,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_page_install_ctrc.h"
+#include "cluster/cluster_page_buffer_ctrc.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "access/xlogrecovery.h"
@@ -62,6 +63,9 @@ typedef struct CtrcNativeStepV1 {
 	ClusterSharedFsPageV1 *storage;
 	bool publish_durable;
 	bool sync_unchanged;
+	bool cache_retired;
+	const RfPageCtrcAuthorityV1 *cache_authority;
+	BlockNumber cache_block;
 } CtrcNativeStepV1;
 
 typedef struct CtrcNativeReadV1 {
@@ -116,7 +120,10 @@ ctrc_native_step_current(const CtrcNativeStepV1 *step)
 			|| memcmp(step->original_canonical, step->canonical.data, BLCKSZ) == 0)
 		&& ClusterColdRecoveryCtrcScope(step->start, step->work) == step->source.scope
 		&& cluster_recovery_ctrc_terminal_result_v1(step->start, step->work, &accepted)
-		&& memcmp(&accepted, &step->accepted, sizeof(accepted)) == 0;
+		&& memcmp(&accepted, &step->accepted, sizeof(accepted)) == 0
+		&& (!step->cache_retired || cluster_bufmgr_ctrc_page_cache_v1(step->start,
+			step->work, step->cache_authority, step->original_space, step->cache_block,
+			step->original_before, NULL) == CLUSTER_CTRC_PAGE_CACHE_ABSENT);
 }
 
 static bool
@@ -1022,6 +1029,15 @@ ctrc_native_step_execute(CtrcNativeStepV1 *context, RfPageCtrcAuthorityV1 *autho
 		else if (ctrc_native_step_sync_unchanged(context, authority, blockno))
 			result->phase = RF_PAGE_CTRC_STEP_UNCHANGED_SYNCED;
 		return;
+	}
+	if (context->sync_unchanged) {
+		ClusterCtrcPageCacheResultV1 cache = cluster_bufmgr_ctrc_page_cache_v1(context->start,
+			context->work, authority, context->original_space, blockno, context->original_before,
+			context->images.page.data);
+		if (cache == CLUSTER_CTRC_PAGE_CACHE_WAIT) { result->phase = RF_PAGE_CTRC_STEP_WAIT; return; }
+		if (cache != CLUSTER_CTRC_PAGE_CACHE_ABSENT) return;
+		context->cache_authority = authority; context->cache_block = blockno;
+		context->cache_retired = true;
 	}
 	if (!rf_page_authority_ctrc_replays_unpromote_v1(authority)
 		|| !ctrc_native_step_current(context))

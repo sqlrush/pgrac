@@ -56,6 +56,7 @@ bool ctrc_native_fpi_original_c0(const struct ClusterRecoveryStartV1 *start,
 bool ClusterColdRecoveryCtrcWorkCurrent(const struct ClusterRecoveryStartV1 *start,
 	const struct ClusterColdCtrcWorkV1 *work);
 #include "cluster/cluster_itl.h"
+#include "cluster/cluster_page_buffer_ctrc.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_uba.h"
 #include "cluster/cluster_terminal_ref_census.h"
@@ -459,6 +460,7 @@ bool native_install_original_writer_installed(ClusterWalWriterToken *writer,
 #include "test_cluster_ctrc_native_durable.inc"
 #include "test_cluster_ctrc_native_writer_retention.inc"
 #include "test_cluster_ctrc_native_unchanged_sync.inc"
+#include "test_cluster_ctrc_native_cache.inc"
 
 int
 main(int argc, char **argv)
@@ -467,6 +469,16 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_NATIVE_CACHE") != NULL) {
+		UT_PLAN(6);
+		UT_RUN(test_native_cache_retires_exact_predecessor_before_bufferless_fpi);
+		UT_RUN(test_native_cache_busy_waits_without_wal_or_duty_retirement);
+		UT_RUN(test_native_cache_refusal_and_error_keep_original_owners);
+		UT_RUN(test_native_cache_reappearance_keeps_exact_inserted_window);
+		UT_RUN(test_native_cache_noop_keeps_matching_cache_and_old_components);
+		UT_RUN(test_native_cache_stale_canonical_refuses_before_cache_mutation);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_NATIVE_UNCHANGED_SYNC") != NULL) {
 		UT_PLAN(6);
 		UT_RUN(test_native_unchanged_syncs_same_fd_and_full_image_without_wal);
@@ -512,7 +524,13 @@ main(int argc, char **argv)
 		UT_RUN(test_native_step_fixed_fd_close_failure_cannot_claim_target_synced);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(67);
+	UT_PLAN(73);
+	UT_RUN(test_native_cache_retires_exact_predecessor_before_bufferless_fpi);
+	UT_RUN(test_native_cache_busy_waits_without_wal_or_duty_retirement);
+	UT_RUN(test_native_cache_refusal_and_error_keep_original_owners);
+	UT_RUN(test_native_cache_reappearance_keeps_exact_inserted_window);
+	UT_RUN(test_native_cache_noop_keeps_matching_cache_and_old_components);
+	UT_RUN(test_native_cache_stale_canonical_refuses_before_cache_mutation);
 	UT_RUN(test_native_unchanged_syncs_same_fd_and_full_image_without_wal);
 	UT_RUN(test_native_unchanged_sync_rechecks_original_inputs_after_sync_and_each_read);
 	UT_RUN(test_native_unchanged_sync_io_failure_error_and_close_keep_original_owners);
