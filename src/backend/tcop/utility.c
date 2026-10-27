@@ -348,7 +348,8 @@ PreflightClusterSharedCatalogWrite(Node *statement)
 			&& !IsA(statement, AlterDatabaseStmt) && !IsA(statement, AlterTableSpaceOptionsStmt)
 			&& !IsA(statement, SecLabelStmt) && !IsA(statement, AlterTableStmt)
 			&& !IsA(statement, ImportForeignSchemaStmt)
-			&& !IsA(statement, AlterExtensionContentsStmt) && !IsA(statement, TruncateStmt)))
+			&& !IsA(statement, AlterExtensionContentsStmt) && !IsA(statement, AlterExtensionStmt)
+			&& !IsA(statement, TruncateStmt)))
 		return;
 
 	if (IsA(statement, AlterTableStmt)) {
@@ -401,7 +402,8 @@ PreflightClusterSharedCatalogWrite(Node *statement)
 			 || IsA(statement, AlterObjectDependsStmt) || IsA(statement, ReassignOwnedStmt)
 			 || IsA(statement, AlterOwnerStmt) || IsA(statement, AlterDatabaseStmt)
 			 || IsA(statement, AlterTableSpaceOptionsStmt) || IsA(statement, SecLabelStmt)
-			 || IsA(statement, AlterTableStmt) || IsA(statement, AlterExtensionContentsStmt))
+			 || IsA(statement, AlterTableStmt) || IsA(statement, AlterExtensionContentsStmt)
+			 || IsA(statement, AlterExtensionStmt))
 		action = "alteration";
 	else
 		action = "creation";

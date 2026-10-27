@@ -1518,19 +1518,7 @@ UT_TEST(test_noncreate_utility_does_not_reserve_canonical_binding)
 	TransactionStmt transaction = { .type = T_TransactionStmt, .kind = TRANS_STMT_BEGIN };
 	VacuumStmt vacuum = { .type = T_VacuumStmt };
 	CopyStmt copy = { .type = T_CopyStmt };
-	String extension_version = { .type = T_String, .sval = "2.0" };
-	DefElem version_option
-		= { .type = T_DefElem, .defname = "new_version", .arg = (Node *)&extension_version };
-	ListCell version_cell = { .ptr_value = &version_option };
-	List version_options
-		= { .type = T_List, .length = 1, .max_length = 1, .elements = &version_cell };
-	AlterExtensionStmt extension_default
-		= { .type = T_AlterExtensionStmt, .extname = "existing_extension" };
-	AlterExtensionStmt extension_explicit = { .type = T_AlterExtensionStmt,
-											  .extname = "existing_extension",
-											  .options = &version_options };
-	Node *statements[] = { (Node *)&show, (Node *)&transaction,		  (Node *)&vacuum,
-						   (Node *)&copy, (Node *)&extension_default, (Node *)&extension_explicit };
+	Node *statements[] = { (Node *)&show, (Node *)&transaction, (Node *)&vacuum, (Node *)&copy };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		reset_create_preflight();
@@ -2143,6 +2131,17 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 														   .action = -1,
 														   .objtype = OBJECT_FUNCTION,
 														   .object = (Node *)&dependency_routine };
+	String extension_version = { .type = T_String, .sval = "2.0" };
+	DefElem version_option
+		= { .type = T_DefElem, .defname = "new_version", .arg = (Node *)&extension_version };
+	ListCell version_cell = { .ptr_value = &version_option };
+	List version_options
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &version_cell };
+	AlterExtensionStmt extension_default
+		= { .type = T_AlterExtensionStmt, .extname = "existing_extension" };
+	AlterExtensionStmt extension_explicit = { .type = T_AlterExtensionStmt,
+											  .extname = "existing_extension",
+											  .options = &version_options };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -2236,7 +2235,9 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 						   (Node *)&extension_add_table,
 						   (Node *)&extension_drop_table,
 						   (Node *)&extension_add_function,
-						   (Node *)&extension_drop_function };
+						   (Node *)&extension_drop_function,
+						   (Node *)&extension_default,
+						   (Node *)&extension_explicit };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned skip = 0; skip < 2; skip++) {
@@ -2783,6 +2784,17 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 														   .action = -1,
 														   .objtype = OBJECT_FUNCTION,
 														   .object = (Node *)&dependency_routine };
+	String extension_version = { .type = T_String, .sval = "2.0" };
+	DefElem version_option
+		= { .type = T_DefElem, .defname = "new_version", .arg = (Node *)&extension_version };
+	ListCell version_cell = { .ptr_value = &version_option };
+	List version_options
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &version_cell };
+	AlterExtensionStmt extension_default
+		= { .type = T_AlterExtensionStmt, .extname = "existing_extension" };
+	AlterExtensionStmt extension_explicit = { .type = T_AlterExtensionStmt,
+											  .extname = "existing_extension",
+											  .options = &version_options };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -2876,7 +2888,9 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 						   (Node *)&extension_add_table,
 						   (Node *)&extension_drop_table,
 						   (Node *)&extension_add_function,
-						   (Node *)&extension_drop_function };
+						   (Node *)&extension_drop_function,
+						   (Node *)&extension_default,
+						   (Node *)&extension_explicit };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		int caught;
@@ -2889,7 +2903,8 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 		UT_ASSERT(caught);
 		UT_ASSERT_EQ(error_code, ERRCODE_DATA_CORRUPTED);
 		if (IsA(statements[i], SecLabelStmt) || IsA(statements[i], AlterTableStmt)
-			|| IsA(statements[i], AlterExtensionContentsStmt))
+			|| IsA(statements[i], AlterExtensionContentsStmt)
+			|| IsA(statements[i], AlterExtensionStmt))
 			UT_ASSERT(strcmp(error_message,
 							 "canonical ACTIVE publication failed before shared catalog alteration")
 					  == 0);
@@ -3335,6 +3350,17 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 														   .action = -1,
 														   .objtype = OBJECT_FUNCTION,
 														   .object = (Node *)&dependency_routine };
+	String extension_version = { .type = T_String, .sval = "2.0" };
+	DefElem version_option
+		= { .type = T_DefElem, .defname = "new_version", .arg = (Node *)&extension_version };
+	ListCell version_cell = { .ptr_value = &version_option };
+	List version_options
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &version_cell };
+	AlterExtensionStmt extension_default
+		= { .type = T_AlterExtensionStmt, .extname = "existing_extension" };
+	AlterExtensionStmt extension_explicit = { .type = T_AlterExtensionStmt,
+											  .extname = "existing_extension",
+											  .options = &version_options };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -3428,7 +3454,9 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 						   (Node *)&extension_add_table,
 						   (Node *)&extension_drop_table,
 						   (Node *)&extension_add_function,
-						   (Node *)&extension_drop_function };
+						   (Node *)&extension_drop_function,
+						   (Node *)&extension_default,
+						   (Node *)&extension_explicit };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned child = 0; child < 2; child++) {
@@ -3448,7 +3476,8 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 						 child ? ERRCODE_FEATURE_NOT_SUPPORTED : ERRCODE_INTERNAL_ERROR);
 			if (child
 				&& (IsA(statements[i], SecLabelStmt) || IsA(statements[i], AlterTableStmt)
-					|| IsA(statements[i], AlterExtensionContentsStmt)))
+					|| IsA(statements[i], AlterExtensionContentsStmt)
+					|| IsA(statements[i], AlterExtensionStmt)))
 				UT_ASSERT(strcmp(error_message,
 								 "shared catalog alteration does not support subtransactions")
 						  == 0);
@@ -3894,6 +3923,17 @@ UT_TEST(test_catalog_writes_preflight_requires_shared_catalog_storage)
 														   .action = -1,
 														   .objtype = OBJECT_FUNCTION,
 														   .object = (Node *)&dependency_routine };
+	String extension_version = { .type = T_String, .sval = "2.0" };
+	DefElem version_option
+		= { .type = T_DefElem, .defname = "new_version", .arg = (Node *)&extension_version };
+	ListCell version_cell = { .ptr_value = &version_option };
+	List version_options
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &version_cell };
+	AlterExtensionStmt extension_default
+		= { .type = T_AlterExtensionStmt, .extname = "existing_extension" };
+	AlterExtensionStmt extension_explicit = { .type = T_AlterExtensionStmt,
+											  .extname = "existing_extension",
+											  .options = &version_options };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -3987,7 +4027,9 @@ UT_TEST(test_catalog_writes_preflight_requires_shared_catalog_storage)
 						   (Node *)&extension_add_table,
 						   (Node *)&extension_drop_table,
 						   (Node *)&extension_add_function,
-						   (Node *)&extension_drop_function };
+						   (Node *)&extension_drop_function,
+						   (Node *)&extension_default,
+						   (Node *)&extension_explicit };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned mode = 0; mode < 8; mode++) {
@@ -4435,6 +4477,17 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 														   .action = -1,
 														   .objtype = OBJECT_FUNCTION,
 														   .object = (Node *)&dependency_routine };
+	String extension_version = { .type = T_String, .sval = "2.0" };
+	DefElem version_option
+		= { .type = T_DefElem, .defname = "new_version", .arg = (Node *)&extension_version };
+	ListCell version_cell = { .ptr_value = &version_option };
+	List version_options
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &version_cell };
+	AlterExtensionStmt extension_default
+		= { .type = T_AlterExtensionStmt, .extname = "existing_extension" };
+	AlterExtensionStmt extension_explicit = { .type = T_AlterExtensionStmt,
+											  .extname = "existing_extension",
+											  .options = &version_options };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -4528,7 +4581,9 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 						   (Node *)&extension_add_table,
 						   (Node *)&extension_drop_table,
 						   (Node *)&extension_add_function,
-						   (Node *)&extension_drop_function };
+						   (Node *)&extension_drop_function,
+						   (Node *)&extension_default,
+						   (Node *)&extension_explicit };
 	const char *tags[] = { "CREATE SCHEMA",
 						   "CREATE SEQUENCE",
 						   "CREATE INDEX",
@@ -4619,6 +4674,8 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 						   "IMPORT FOREIGN SCHEMA",
 						   "IMPORT FOREIGN SCHEMA",
 						   "IMPORT FOREIGN SCHEMA",
+						   "ALTER EXTENSION",
+						   "ALTER EXTENSION",
 						   "ALTER EXTENSION",
 						   "ALTER EXTENSION",
 						   "ALTER EXTENSION",
