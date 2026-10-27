@@ -156,7 +156,9 @@ sub native_lmon
 		&& defined($after->{postmaster_start})
 		&& $before->{postmaster_start} eq $after->{postmaster_start};
 	my $proc = row_for($cut->{graph}{procs}, 'pid', $before->{lmon}{pid});
-	return undef unless uint_fields($proc, qw(pid procno backend_id proc_generation))
+	return undef unless uint_fields($proc, qw(pid procno proc_generation))
+		&& defined($proc->{backend_id}) && !ref($proc->{backend_id})
+		&& $proc->{backend_id} eq '-1'
 		&& bool_fields($proc, 'stable') && $proc->{stable} && $proc->{proc_generation} > 0;
 	return {pid => $proc->{pid}, procno => $proc->{procno}, backend_id => $proc->{backend_id},
 		proc_generation => $proc->{proc_generation},
