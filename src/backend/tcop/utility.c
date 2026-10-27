@@ -347,7 +347,7 @@ PreflightClusterSharedCatalogWrite(Node *statement)
 			&& !IsA(statement, CreateForeignTableStmt) && !IsA(statement, AlterOwnerStmt)
 			&& !IsA(statement, AlterDatabaseStmt) && !IsA(statement, AlterTableSpaceOptionsStmt)
 			&& !IsA(statement, SecLabelStmt) && !IsA(statement, AlterTableStmt)
-			&& !IsA(statement, TruncateStmt)))
+			&& !IsA(statement, ImportForeignSchemaStmt) && !IsA(statement, TruncateStmt)))
 		return;
 
 	if (IsA(statement, AlterTableStmt)) {

@@ -277,6 +277,8 @@ CreateCommandTag(Node *statement)
 		return CMDTAG_TRUNCATE_TABLE;
 	if (IsA(statement, CreateForeignTableStmt))
 		return CMDTAG_CREATE_FOREIGN_TABLE;
+	if (IsA(statement, ImportForeignSchemaStmt))
+		return CMDTAG_IMPORT_FOREIGN_SCHEMA;
 	if (IsA(statement, CreateSchemaStmt))
 		return CMDTAG_CREATE_SCHEMA;
 	if (IsA(statement, CreateSeqStmt))
@@ -442,6 +444,8 @@ GetCommandTagName(CommandTag tag)
 		return "TRUNCATE TABLE";
 	if (tag == CMDTAG_CREATE_FOREIGN_TABLE)
 		return "CREATE FOREIGN TABLE";
+	if (tag == CMDTAG_IMPORT_FOREIGN_SCHEMA)
+		return "IMPORT FOREIGN SCHEMA";
 	if (tag == CMDTAG_CREATE_SCHEMA)
 		return "CREATE SCHEMA";
 	if (tag == CMDTAG_CREATE_SEQUENCE)
@@ -2071,6 +2075,37 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 									  .objtype = OBJECT_TABLE,
 									  .relation = &static_relation,
 									  .cmds = &static_option_cmds };
+	RangeVar import_first = { .type = T_RangeVar, .relname = "import_first", .location = -1 };
+	RangeVar import_second = { .type = T_RangeVar, .relname = "import_second", .location = -1 };
+	ListCell import_table_cells[2]
+		= { { .ptr_value = &import_first }, { .ptr_value = &import_second } };
+	List import_tables
+		= { .type = T_List, .length = 2, .max_length = 2, .elements = import_table_cells };
+	String import_option_value = { .type = T_String, .sval = "true" };
+	DefElem import_option
+		= { .type = T_DefElem, .defname = "import_default", .arg = (Node *)&import_option_value };
+	ListCell import_option_cell = { .ptr_value = &import_option };
+	List import_options
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &import_option_cell };
+	ImportForeignSchemaStmt import_all = { .type = T_ImportForeignSchemaStmt,
+										   .server_name = "target_server",
+										   .remote_schema = "remote_schema",
+										   .local_schema = "local_schema",
+										   .list_type = FDW_IMPORT_SCHEMA_ALL };
+	ImportForeignSchemaStmt import_limit = { .type = T_ImportForeignSchemaStmt,
+											 .server_name = "target_server",
+											 .remote_schema = "remote_schema",
+											 .local_schema = "local_schema",
+											 .list_type = FDW_IMPORT_SCHEMA_LIMIT_TO,
+											 .table_list = &import_tables,
+											 .options = &import_options };
+	ImportForeignSchemaStmt import_except = { .type = T_ImportForeignSchemaStmt,
+											  .server_name = "target_server",
+											  .remote_schema = "remote_schema",
+											  .local_schema = "local_schema",
+											  .list_type = FDW_IMPORT_SCHEMA_EXCEPT,
+											  .table_list = &import_tables,
+											  .options = &import_options };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -2157,12 +2192,17 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 						   (Node *)&label_database,
 						   (Node *)&static_statistics,
 						   (Node *)&static_owner,
-						   (Node *)&static_options };
+						   (Node *)&static_options,
+						   (Node *)&import_all,
+						   (Node *)&import_limit,
+						   (Node *)&import_except };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned skip = 0; skip < 2; skip++) {
 			reset_create_preflight();
 			utility_expect_binding = true;
+			import_option_value.sval = skip ? "false" : "true";
+			import_all.options = skip ? &import_options : NIL;
 			static_stats_value.ival = skip ? -1 : 100;
 			static_fillfactor.ival = skip ? 80 : 90;
 			static_owner_role.roletype = skip ? ROLESPEC_CURRENT_USER : ROLESPEC_CSTRING;
@@ -2651,6 +2691,37 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 									  .objtype = OBJECT_TABLE,
 									  .relation = &static_relation,
 									  .cmds = &static_option_cmds };
+	RangeVar import_first = { .type = T_RangeVar, .relname = "import_first", .location = -1 };
+	RangeVar import_second = { .type = T_RangeVar, .relname = "import_second", .location = -1 };
+	ListCell import_table_cells[2]
+		= { { .ptr_value = &import_first }, { .ptr_value = &import_second } };
+	List import_tables
+		= { .type = T_List, .length = 2, .max_length = 2, .elements = import_table_cells };
+	String import_option_value = { .type = T_String, .sval = "true" };
+	DefElem import_option
+		= { .type = T_DefElem, .defname = "import_default", .arg = (Node *)&import_option_value };
+	ListCell import_option_cell = { .ptr_value = &import_option };
+	List import_options
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &import_option_cell };
+	ImportForeignSchemaStmt import_all = { .type = T_ImportForeignSchemaStmt,
+										   .server_name = "target_server",
+										   .remote_schema = "remote_schema",
+										   .local_schema = "local_schema",
+										   .list_type = FDW_IMPORT_SCHEMA_ALL };
+	ImportForeignSchemaStmt import_limit = { .type = T_ImportForeignSchemaStmt,
+											 .server_name = "target_server",
+											 .remote_schema = "remote_schema",
+											 .local_schema = "local_schema",
+											 .list_type = FDW_IMPORT_SCHEMA_LIMIT_TO,
+											 .table_list = &import_tables,
+											 .options = &import_options };
+	ImportForeignSchemaStmt import_except = { .type = T_ImportForeignSchemaStmt,
+											  .server_name = "target_server",
+											  .remote_schema = "remote_schema",
+											  .local_schema = "local_schema",
+											  .list_type = FDW_IMPORT_SCHEMA_EXCEPT,
+											  .table_list = &import_tables,
+											  .options = &import_options };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -2737,7 +2808,10 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 						   (Node *)&label_database,
 						   (Node *)&static_statistics,
 						   (Node *)&static_owner,
-						   (Node *)&static_options };
+						   (Node *)&static_options,
+						   (Node *)&import_all,
+						   (Node *)&import_limit,
+						   (Node *)&import_except };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		int caught;
@@ -2752,6 +2826,10 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 		if (IsA(statements[i], SecLabelStmt) || IsA(statements[i], AlterTableStmt))
 			UT_ASSERT(strcmp(error_message,
 							 "canonical ACTIVE publication failed before shared catalog alteration")
+					  == 0);
+		if (IsA(statements[i], ImportForeignSchemaStmt))
+			UT_ASSERT(strcmp(error_message,
+							 "canonical ACTIVE publication failed before shared catalog creation")
 					  == 0);
 		UT_ASSERT_EQ(utility_xids, 1);
 		UT_ASSERT_EQ(utility_prepares, 1);
@@ -3140,6 +3218,37 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 									  .objtype = OBJECT_TABLE,
 									  .relation = &static_relation,
 									  .cmds = &static_option_cmds };
+	RangeVar import_first = { .type = T_RangeVar, .relname = "import_first", .location = -1 };
+	RangeVar import_second = { .type = T_RangeVar, .relname = "import_second", .location = -1 };
+	ListCell import_table_cells[2]
+		= { { .ptr_value = &import_first }, { .ptr_value = &import_second } };
+	List import_tables
+		= { .type = T_List, .length = 2, .max_length = 2, .elements = import_table_cells };
+	String import_option_value = { .type = T_String, .sval = "true" };
+	DefElem import_option
+		= { .type = T_DefElem, .defname = "import_default", .arg = (Node *)&import_option_value };
+	ListCell import_option_cell = { .ptr_value = &import_option };
+	List import_options
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &import_option_cell };
+	ImportForeignSchemaStmt import_all = { .type = T_ImportForeignSchemaStmt,
+										   .server_name = "target_server",
+										   .remote_schema = "remote_schema",
+										   .local_schema = "local_schema",
+										   .list_type = FDW_IMPORT_SCHEMA_ALL };
+	ImportForeignSchemaStmt import_limit = { .type = T_ImportForeignSchemaStmt,
+											 .server_name = "target_server",
+											 .remote_schema = "remote_schema",
+											 .local_schema = "local_schema",
+											 .list_type = FDW_IMPORT_SCHEMA_LIMIT_TO,
+											 .table_list = &import_tables,
+											 .options = &import_options };
+	ImportForeignSchemaStmt import_except = { .type = T_ImportForeignSchemaStmt,
+											  .server_name = "target_server",
+											  .remote_schema = "remote_schema",
+											  .local_schema = "local_schema",
+											  .list_type = FDW_IMPORT_SCHEMA_EXCEPT,
+											  .table_list = &import_tables,
+											  .options = &import_options };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -3226,7 +3335,10 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 						   (Node *)&label_database,
 						   (Node *)&static_statistics,
 						   (Node *)&static_owner,
-						   (Node *)&static_options };
+						   (Node *)&static_options,
+						   (Node *)&import_all,
+						   (Node *)&import_limit,
+						   (Node *)&import_except };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned child = 0; child < 2; child++) {
@@ -3247,6 +3359,10 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 			if (child && (IsA(statements[i], SecLabelStmt) || IsA(statements[i], AlterTableStmt)))
 				UT_ASSERT(strcmp(error_message,
 								 "shared catalog alteration does not support subtransactions")
+						  == 0);
+			if (child && IsA(statements[i], ImportForeignSchemaStmt))
+				UT_ASSERT(strcmp(error_message,
+								 "shared catalog creation does not support subtransactions")
 						  == 0);
 			UT_ASSERT_EQ(utility_xids, 0);
 			UT_ASSERT_EQ(utility_prepares, 0);
@@ -3635,6 +3751,37 @@ UT_TEST(test_catalog_writes_preflight_requires_shared_catalog_storage)
 									  .objtype = OBJECT_TABLE,
 									  .relation = &static_relation,
 									  .cmds = &static_option_cmds };
+	RangeVar import_first = { .type = T_RangeVar, .relname = "import_first", .location = -1 };
+	RangeVar import_second = { .type = T_RangeVar, .relname = "import_second", .location = -1 };
+	ListCell import_table_cells[2]
+		= { { .ptr_value = &import_first }, { .ptr_value = &import_second } };
+	List import_tables
+		= { .type = T_List, .length = 2, .max_length = 2, .elements = import_table_cells };
+	String import_option_value = { .type = T_String, .sval = "true" };
+	DefElem import_option
+		= { .type = T_DefElem, .defname = "import_default", .arg = (Node *)&import_option_value };
+	ListCell import_option_cell = { .ptr_value = &import_option };
+	List import_options
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &import_option_cell };
+	ImportForeignSchemaStmt import_all = { .type = T_ImportForeignSchemaStmt,
+										   .server_name = "target_server",
+										   .remote_schema = "remote_schema",
+										   .local_schema = "local_schema",
+										   .list_type = FDW_IMPORT_SCHEMA_ALL };
+	ImportForeignSchemaStmt import_limit = { .type = T_ImportForeignSchemaStmt,
+											 .server_name = "target_server",
+											 .remote_schema = "remote_schema",
+											 .local_schema = "local_schema",
+											 .list_type = FDW_IMPORT_SCHEMA_LIMIT_TO,
+											 .table_list = &import_tables,
+											 .options = &import_options };
+	ImportForeignSchemaStmt import_except = { .type = T_ImportForeignSchemaStmt,
+											  .server_name = "target_server",
+											  .remote_schema = "remote_schema",
+											  .local_schema = "local_schema",
+											  .list_type = FDW_IMPORT_SCHEMA_EXCEPT,
+											  .table_list = &import_tables,
+											  .options = &import_options };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -3721,7 +3868,10 @@ UT_TEST(test_catalog_writes_preflight_requires_shared_catalog_storage)
 						   (Node *)&label_database,
 						   (Node *)&static_statistics,
 						   (Node *)&static_owner,
-						   (Node *)&static_options };
+						   (Node *)&static_options,
+						   (Node *)&import_all,
+						   (Node *)&import_limit,
+						   (Node *)&import_except };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned mode = 0; mode < 8; mode++) {
@@ -4118,6 +4268,37 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 									  .objtype = OBJECT_TABLE,
 									  .relation = &static_relation,
 									  .cmds = &static_option_cmds };
+	RangeVar import_first = { .type = T_RangeVar, .relname = "import_first", .location = -1 };
+	RangeVar import_second = { .type = T_RangeVar, .relname = "import_second", .location = -1 };
+	ListCell import_table_cells[2]
+		= { { .ptr_value = &import_first }, { .ptr_value = &import_second } };
+	List import_tables
+		= { .type = T_List, .length = 2, .max_length = 2, .elements = import_table_cells };
+	String import_option_value = { .type = T_String, .sval = "true" };
+	DefElem import_option
+		= { .type = T_DefElem, .defname = "import_default", .arg = (Node *)&import_option_value };
+	ListCell import_option_cell = { .ptr_value = &import_option };
+	List import_options
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &import_option_cell };
+	ImportForeignSchemaStmt import_all = { .type = T_ImportForeignSchemaStmt,
+										   .server_name = "target_server",
+										   .remote_schema = "remote_schema",
+										   .local_schema = "local_schema",
+										   .list_type = FDW_IMPORT_SCHEMA_ALL };
+	ImportForeignSchemaStmt import_limit = { .type = T_ImportForeignSchemaStmt,
+											 .server_name = "target_server",
+											 .remote_schema = "remote_schema",
+											 .local_schema = "local_schema",
+											 .list_type = FDW_IMPORT_SCHEMA_LIMIT_TO,
+											 .table_list = &import_tables,
+											 .options = &import_options };
+	ImportForeignSchemaStmt import_except = { .type = T_ImportForeignSchemaStmt,
+											  .server_name = "target_server",
+											  .remote_schema = "remote_schema",
+											  .local_schema = "local_schema",
+											  .list_type = FDW_IMPORT_SCHEMA_EXCEPT,
+											  .table_list = &import_tables,
+											  .options = &import_options };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -4204,7 +4385,10 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 						   (Node *)&label_database,
 						   (Node *)&static_statistics,
 						   (Node *)&static_owner,
-						   (Node *)&static_options };
+						   (Node *)&static_options,
+						   (Node *)&import_all,
+						   (Node *)&import_limit,
+						   (Node *)&import_except };
 	const char *tags[] = { "CREATE SCHEMA",
 						   "CREATE SEQUENCE",
 						   "CREATE INDEX",
@@ -4291,7 +4475,10 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 						   "SECURITY LABEL",
 						   "ALTER TABLE",
 						   "ALTER TABLE",
-						   "ALTER TABLE" };
+						   "ALTER TABLE",
+						   "IMPORT FOREIGN SCHEMA",
+						   "IMPORT FOREIGN SCHEMA",
+						   "IMPORT FOREIGN SCHEMA" };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned parallel = 0; parallel < 2; parallel++) {
