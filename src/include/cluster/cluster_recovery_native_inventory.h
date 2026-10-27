@@ -246,6 +246,21 @@ extern bool cluster_recovery_relmap_history_source_v1(ClusterRecoveryRelmapHisto
  * One full synchronous census, not a bounded metadata tick. */
 extern ClusterRecoveryNativeInventoryResult cluster_recovery_relmap_history_recheck_v1(
 	ClusterRecoveryRelmapHistory *history, ClusterRecoveryNativeInventoryDiag *diag);
+/* Fold one complete canonical pending image under this SAME original episode.
+ * At most128 saved record/child inspections plus two complete saved-source
+ * metadata comparisons per tick; no I/O, allocation, new IR or release.
+ * ENTRY borrows the history's immutable record and selected metadata until
+ * local destroy; MORE/refusal clears entry/summary. Buffers must be disjoint
+ * from each other, the query and all borrowed history storage.
+ * Ordinary caller-lock/output preconditions do not revoke custody. Once
+ * entered, any input/query drift or ERROR is sticky and fails the original
+ * episode, retaining protections/debt. Full final physical recheck remains
+ * mandatory. DRAINED is raw correspondence, never era/lifetime/terminal,
+ * COMPLETE, OPEN, native allocation/CLOG truncate or release authority. */
+extern ClusterRecoveryRelmapFoldResult cluster_recovery_relmap_history_pending_step_v1(
+	ClusterRecoveryRelmapHistory *history, const ClusterRelmapV2Image *pending,
+	ClusterRecoveryRelmapFoldEntry *out, ClusterRecoveryRelmapFoldSummary *summary,
+	ClusterRecoveryNativeInventoryDiag *diag);
 extern void cluster_recovery_relmap_history_destroy_v1(ClusterRecoveryRelmapHistory **history);
 
 /* Borrow the original startup cold scope for two complete physical passes.

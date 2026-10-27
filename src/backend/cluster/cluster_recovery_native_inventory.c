@@ -24,14 +24,7 @@
 
 #define INVENTORY_SEED_TICK 128
 
-typedef struct NativeInventoryHistory {
-	ClusterWalInputV1 input;
-	uint32 input_index;
-	XLogRecPtr checkpoint_end;
-	ClusterRelmapCheckpointWindow window;
-	uint64 post_flush_issued;
-	bool checkpoint_observed, window_observed;
-} NativeInventoryHistory;
+typedef ClusterRecoveryRelmapHistorySource NativeInventoryHistory;
 
 typedef struct NativeInventorySource {
 	ClusterWalSourceRef source;
@@ -2269,6 +2262,84 @@ cluster_recovery_relmap_history_recheck_v1(ClusterRecoveryRelmapHistory *history
 	if (result == CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED)
 		history->failed = false;
 	else
+		history_fail(history);
+	return result;
+}
+
+ClusterRecoveryRelmapFoldResult
+cluster_recovery_relmap_history_pending_step_v1(ClusterRecoveryRelmapHistory *history,
+	const ClusterRelmapV2Image *pending, ClusterRecoveryRelmapFoldEntry *out,
+	ClusterRecoveryRelmapFoldSummary *summary, ClusterRecoveryNativeInventoryDiag *diag)
+{
+	ClusterRecoveryRelmapFoldEntry entry = {0};
+	ClusterRecoveryRelmapFoldSummary counts = {0};
+	volatile ClusterRecoveryRelmapFoldResult result = CLUSTER_RECOVERY_RELMAP_FOLD_CHANGED;
+	volatile bool current = false;
+
+	/* Check aliases before clearing anything: the query and original custody
+	 * must survive an ordinary caller precondition refusal unchanged. */
+	if (out == NULL || summary == NULL || diag == NULL || pending == NULL
+		|| history_overlap(out, sizeof(*out), pending, sizeof(*pending))
+		|| history_overlap(summary, sizeof(*summary), pending, sizeof(*pending))
+		|| history_overlap(diag, sizeof(*diag), pending, sizeof(*pending))
+		|| history_overlap(out, sizeof(*out), summary, sizeof(*summary))
+		|| history_overlap(out, sizeof(*out), diag, sizeof(*diag))
+		|| history_overlap(summary, sizeof(*summary), diag, sizeof(*diag))
+		|| history_overlap(out, sizeof(*out), history, sizeof(*history))
+		|| history_overlap(summary, sizeof(*summary), history, sizeof(*history))
+		|| history_overlap(diag, sizeof(*diag), history, sizeof(*history)))
+		return CLUSTER_RECOVERY_RELMAP_FOLD_INVALID;
+	memset(out, 0, sizeof(*out));
+	memset(summary, 0, sizeof(*summary));
+	memset(diag, 0, sizeof(*diag));
+	if (history == NULL || history->inventory == NULL)
+		return result;
+	*diag = history->inventory->diag;
+	diag->owned_bytes += sizeof(*history);
+	if (history->failed)
+		return result;
+	if (CritSectionCount != 0 || cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
+		return CLUSTER_RECOVERY_RELMAP_FOLD_INVALID;
+
+	/* Latch before even the first original all-holder check, which can ERROR.
+	 * Never publish a partial tick or make failed observations current again. */
+	history->failed = true;
+	PG_TRY();
+	{
+		if (inventory_history_inputs(history->inventory, history->original.scope, false)) {
+			result = cluster_recovery_native_inventory_relmap_step(history->inventory, pending,
+				&entry, &counts, NULL);
+			current = result <= CLUSTER_RECOVERY_RELMAP_FOLD_DRAINED;
+			if (current && result == CLUSTER_RECOVERY_RELMAP_FOLD_ENTRY) {
+				const NativeInventorySource *saved;
+				current = entry.source_index < history->inventory->source_count;
+				if (current) {
+					saved = &history->inventory->sources[entry.source_index];
+					current = entry.record != NULL && entry.history == &saved->history
+						&& inventory_source_equal(&entry.record->source, &saved->source);
+				}
+			}
+			if (current)
+				current = inventory_history_inputs(history->inventory, history->original.scope,
+					false);
+			if (!current && result <= CLUSTER_RECOVERY_RELMAP_FOLD_DRAINED)
+				result = CLUSTER_RECOVERY_RELMAP_FOLD_CHANGED;
+		}
+	}
+	PG_CATCH();
+	{
+		history_fail(history);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	*diag = history->inventory->diag;
+	diag->owned_bytes += sizeof(*history);
+	if (current) {
+		history->failed = false;
+		*out = entry;
+		*summary = counts;
+	} else
 		history_fail(history);
 	return result;
 }

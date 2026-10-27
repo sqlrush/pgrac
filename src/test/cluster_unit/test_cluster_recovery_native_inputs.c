@@ -1034,6 +1034,9 @@ UT_TEST(test_ctrc_inventory_keeps_original_local_cut_and_native_terminal_bytes)
 #include "test_cluster_recovery_relmap_history.inc"
 
 #include "test_cluster_recovery_episode_history.inc"
+#define relmap_history_fixture episode_pending_relmap_history_fixture
+#include "test_cluster_recovery_episode_pending.inc"
+#undef relmap_history_fixture
 
 
 int
@@ -1088,7 +1091,7 @@ main(int argc, char **argv)
 	UT_RUN(test_owned_page_inventory_capacity_never_silently_omits_physical_pages);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(123);
+	UT_PLAN(128);
 	UT_RUN(test_wal_sources_include_all_records_without_page_inputs);
 	UT_RUN(test_wal_sources_keep_explicit_empty_and_every_original_generation);
 	UT_RUN(test_wal_sources_preserve_page_and_native_effect_cursors);
@@ -1213,6 +1216,11 @@ main(int argc, char **argv)
 	UT_RUN(test_episode_history_stops_before_second_pass_after_sibling_loss);
 	UT_RUN(test_episode_history_retains_history_and_current_generations_together);
 	UT_RUN(test_episode_history_budget_index_and_alias_refusals_do_not_rebase);
+	UT_RUN(test_episode_pending_keeps_full_history_and_lifecycle_obligations);
+	UT_RUN(test_episode_pending_bounds_ticks_and_rejects_changed_query_or_holder);
+	UT_RUN(test_episode_pending_first_current_error_retains_original_protection);
+	UT_RUN(test_episode_pending_final_reread_drift_never_revives_the_query);
+	UT_RUN(test_episode_pending_output_and_caller_lock_preconditions_preserve_custody);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
