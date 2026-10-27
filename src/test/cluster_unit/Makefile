@@ -155,6 +155,7 @@ TESTS = test_cluster_relmap_lock test_cluster_vm_read_visibility test_cluster_he
 		test_cluster_service_observe \
 		test_cluster_control_root \
 		test_cluster_checkpoint_native \
+		test_cluster_startup_cf_entry \
 		test_cluster_startup_sync \
 		test_cluster_checkpoint_buffers \
 		test_cluster_page_data test_cluster_pi_writeback test_cluster_block_redeclare \
@@ -1400,6 +1401,33 @@ test_cluster_startup_writer_native.inc: $(top_srcdir)/src/backend/access/transam
 	     /^ClusterXLogStartupNativeEmptyMultiXactInput\(/ { print "bool"; emit=1; count++ } \
 	     emit { print } /^}/ { emit=0 } END { if (count != 7 || details != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
+
+# Join the actual CF timeout/retirement producer to the native caller boundary.
+test_cluster_startup_cf_entry.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
+	awk '/^ClusterCf(ConsumerWaitSlice|RetirementPending)\(/ { print "static bool"; emit=1; consumers++ } \
+	     /^ClusterStartupWriterBeginPreconditionDetail\(/ { print "static int"; emit=1; details++ } \
+	     /^ClusterStartupWriterAwaitCfRetirement\(/ { print "static void"; emit=1; waiters++ } \
+	     /^ClusterStartupWriterBegin\(/ { print "static XLogRecPtr"; emit=1; begins++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (consumers != 2 || details != 1 || begins != 1 || waiters != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_startup_cf_callsite.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
+	awk '/^StartupXLOG\(/ { owner=1 } \
+	     owner && /FinishWalRecovery consumed the old stream/ { boundary=1 } \
+	     boundary && /if \(cluster_shared_config\)/ { emit=1; boundary=0; calls++ } \
+	     emit && /^\#endif/ { emit=0; complete++ } \
+	     emit { print } /^}/ { owner=0 } \
+	     END { if (calls != 1 || complete != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_startup_cf_entry: test_cluster_startup_cf_entry.c test_cluster_cf_enqueue.c \
+		test_cluster_startup_cf_entry.inc test_cluster_startup_cf_callsite.inc \
+		test_cluster_cf_blocker_trace.inc test_cluster_startup_interrupt.inc unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_cf_enqueue.c \
+		$(top_srcdir)/src/backend/cluster/cluster_lock_owner.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_request.c $(CLUSTER_LMD_WAIT_STATE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # PGRAC: execute the real earliest startup-directory mutation call site.
 # Selecting initialization later than this boundary cannot close a killed
