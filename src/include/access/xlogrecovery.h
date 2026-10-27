@@ -254,6 +254,14 @@ extern const struct ClusterRecoveryCensusPagesV1 *ClusterColdRecoveryCtrcPages(
  * Pre-PAGE only: original observation may do I/O/cleanup. No contributor graph,
  * codec/image validation, native PAGE authority or service completion granted. */
 struct ClusterRecoveryPageWalV1;
+struct ClusterRecoveryWalSourceObservationV1;
+/* Complete original source observations, before PAGE acquisition. Getters
+ * repeat the original full observation/current checks and may do I/O. */
+extern bool ClusterColdRecoveryCtrcWalSourceCount(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work, uint32 *out_count);
+extern bool ClusterColdRecoveryCtrcWalSourceAt(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work, uint32 index,
+	struct ClusterRecoveryWalSourceObservationV1 *out);
 extern bool ClusterColdRecoveryCtrcPageWalCount(const struct ClusterRecoveryStartV1 *start,
 	const struct ClusterColdCtrcWorkV1 *work, uint32 *out_count);
 extern bool ClusterColdRecoveryCtrcPageWalAt(const struct ClusterRecoveryStartV1 *start,

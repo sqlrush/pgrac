@@ -2155,6 +2155,7 @@ UT_TEST(test_original_error_revokes_ctrc_registration_with_the_owner_slot)
 #include "test_cluster_cold_tx_ctrc_subject.inc"
 #include "test_cluster_cold_ctrc_handoff.inc"
 #include "test_cluster_cold_ctrc_census.inc"
+#include "test_cluster_cold_ctrc_wal_sources.inc"
 #include "test_cluster_cold_ctrc_terminals.inc"
 #include "test_cluster_cold_ctrc_source_request.inc"
 #include "test_cluster_cold_ctrc_replay_source.inc"
@@ -2315,6 +2316,14 @@ UT_TEST(test_relmap_failure_revokes_original_episode_without_free_or_release)
 
 int main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_CTRC_WAL_SOURCES") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_ctrc_wal_sources_bind_complete_original_start_and_do_not_complete_service);
+		UT_RUN(test_ctrc_wal_sources_missing_count_drift_and_error_revoke_original_observation);
+		UT_RUN(test_ctrc_wal_sources_require_exact_start_work_owner_root_and_accepted_tx);
+		UT_RUN(test_ctrc_wal_sources_no_page_input_is_not_a_missing_source_set);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_CTRC_PAGE_WAL") != NULL) {
 		UT_PLAN(4);
 		UT_RUN(test_ctrc_page_wal_requires_complete_original_start_and_keeps_service_pending);
@@ -2339,7 +2348,11 @@ int main(void)
 		UT_RUN(test_ctrc_pages_native_error_retires_cursor_before_original_scope);
 		reset(); UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(140);
+	UT_PLAN(144);
+	UT_RUN(test_ctrc_wal_sources_bind_complete_original_start_and_do_not_complete_service);
+	UT_RUN(test_ctrc_wal_sources_missing_count_drift_and_error_revoke_original_observation);
+	UT_RUN(test_ctrc_wal_sources_require_exact_start_work_owner_root_and_accepted_tx);
+	UT_RUN(test_ctrc_wal_sources_no_page_input_is_not_a_missing_source_set);
 	UT_RUN(test_ctrc_page_wal_requires_complete_original_start_and_keeps_service_pending);
 	UT_RUN(test_ctrc_page_wal_changed_missing_or_error_revokes_original_observation);
 	UT_RUN(test_ctrc_page_wal_requires_exact_work_owner_root_and_accepted_tx);

@@ -902,6 +902,7 @@ cleanup:
 #include "test_cluster_recovery_tt_terminal_inputs.inc"
 #include "test_cluster_recovery_page_roots_inputs.inc"
 #include "test_cluster_recovery_page_wal_inputs.inc"
+#include "test_cluster_recovery_wal_sources.inc"
 
 UT_TEST(test_owned_ctrc_census_borrows_namespace_and_revokes_changed_work)
 {
@@ -1039,6 +1040,17 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_CTRC_WAL_SOURCES") != NULL) {
+		UT_PLAN(7);
+		UT_RUN(test_wal_sources_include_all_records_without_page_inputs);
+		UT_RUN(test_wal_sources_keep_explicit_empty_and_every_original_generation);
+		UT_RUN(test_wal_sources_preserve_page_and_native_effect_cursors);
+		UT_RUN(test_wal_sources_missing_incomplete_and_crc_valid_rewrite_refuse);
+		UT_RUN(test_wal_sources_census_requires_full_manifest_and_retains_zero_page_sources);
+		UT_RUN(test_wal_sources_census_scope_loss_or_original_rewrite_is_sticky);
+		UT_RUN(test_wal_sources_census_full_source_bytes_remain_bound_to_original_manifest);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_CTRC_PAGE_WAL") != NULL) {
 		UT_PLAN(8);
 		UT_RUN(test_page_wal_census_requires_complete_original_observation);
@@ -1061,7 +1073,14 @@ main(int argc, char **argv)
 	UT_RUN(test_owned_page_inventory_capacity_never_silently_omits_physical_pages);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(108);
+	UT_PLAN(115);
+	UT_RUN(test_wal_sources_include_all_records_without_page_inputs);
+	UT_RUN(test_wal_sources_keep_explicit_empty_and_every_original_generation);
+	UT_RUN(test_wal_sources_preserve_page_and_native_effect_cursors);
+	UT_RUN(test_wal_sources_missing_incomplete_and_crc_valid_rewrite_refuse);
+	UT_RUN(test_wal_sources_census_requires_full_manifest_and_retains_zero_page_sources);
+	UT_RUN(test_wal_sources_census_scope_loss_or_original_rewrite_is_sticky);
+	UT_RUN(test_wal_sources_census_full_source_bytes_remain_bound_to_original_manifest);
 	UT_RUN(test_page_wal_census_requires_complete_original_observation);
 	UT_RUN(test_page_wal_census_original_scope_loss_never_rebases);
 	UT_RUN(test_page_wal_inputs_keep_all_components_payloads_and_original_sources);

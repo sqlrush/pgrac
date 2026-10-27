@@ -779,6 +779,62 @@ cluster_recovery_census_pages_v1(ClusterRecoveryCensus *census)
 }
 
 bool
+cluster_recovery_census_wal_source_count_v1(ClusterRecoveryCensus *census, uint32 *out)
+{
+	ClusterRecoveryCensusManifest manifest;
+	bool ok = false;
+
+	if (out != NULL) *out = 0;
+	if (out == NULL || census == NULL)
+		return false;
+	PG_TRY();
+	{
+		if (cluster_recovery_census_manifest(census, &manifest)) {
+			ok = cluster_recovery_native_inventory_source_count_v1(census->inventory, out)
+				&& *out == manifest.source_count;
+			if (!ok) {
+				*out = 0;
+				(void)census_fail(census, CLUSTER_RECOVERY_CENSUS_REFUSED);
+			}
+		}
+	}
+	PG_CATCH();
+	{
+		*out = 0;
+		(void)census_fail(census, CLUSTER_RECOVERY_CENSUS_REFUSED);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return ok;
+}
+
+bool
+cluster_recovery_census_wal_source_at_v1(ClusterRecoveryCensus *census, uint32 index,
+	ClusterRecoveryWalSourceObservationV1 *out)
+{
+	uint32 count;
+	bool ok = false;
+
+	if (out != NULL) memset(out, 0, sizeof(*out));
+	if (out == NULL || !cluster_recovery_census_wal_source_count_v1(census, &count)
+		|| index >= count)
+		return false;
+	PG_TRY();
+	{
+		ok = cluster_recovery_native_inventory_source_at_v1(census->inventory, index, out);
+		if (!ok) (void)census_fail(census, CLUSTER_RECOVERY_CENSUS_REFUSED);
+	}
+	PG_CATCH();
+	{
+		memset(out, 0, sizeof(*out));
+		(void)census_fail(census, CLUSTER_RECOVERY_CENSUS_REFUSED);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return ok;
+}
+
+bool
 cluster_recovery_census_page_wal_count_v1(ClusterRecoveryCensus *census, uint32 *out)
 {
 	ClusterRecoveryCensusManifest manifest;

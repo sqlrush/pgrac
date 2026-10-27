@@ -1955,6 +1955,52 @@ cluster_recovery_native_inventory_digest(const ClusterRecoveryNativeInventory *i
 }
 
 bool
+cluster_recovery_native_inventory_source_count_v1(ClusterRecoveryNativeInventory *inventory,
+	uint32 *out)
+{
+	uint32 pages;
+
+	if (out != NULL) *out = 0;
+	if (out == NULL || inventory == NULL || !inventory->complete
+		|| inventory->status != CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED)
+		return false;
+	/* Reuse the original complete/snapshot gate, without filtering sources
+	 * by PAGE presence or changing any native-effect cursor. */
+	if (inventory->sources == NULL || inventory->source_count == 0
+		|| inventory->source_count > CLUSTER_WAL_INPUTS_MAX
+		|| inventory->source_count != inventory->diag.sources) {
+		inventory->complete = false;
+		(void)inventory_refuse(inventory, CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED,
+			RF_PAGE_PROOF_DETAIL_SOURCE_GAP);
+		return false;
+	}
+	if (!cluster_recovery_native_inventory_page_count_v1(inventory, &pages))
+		return false;
+	*out = inventory->source_count;
+	return true;
+}
+
+bool
+cluster_recovery_native_inventory_source_at_v1(ClusterRecoveryNativeInventory *inventory,
+	uint32 index, ClusterRecoveryWalSourceObservationV1 *out)
+{
+	const NativeInventorySource *saved;
+	uint32 count;
+
+	if (out != NULL) memset(out, 0, sizeof(*out));
+	if (out == NULL || !cluster_recovery_native_inventory_source_count_v1(inventory, &count)
+		|| index >= count)
+		return false;
+	saved = &inventory->sources[index];
+	out->source = saved->source;
+	out->cut = saved->cut;
+	out->observed = saved->observed;
+	memcpy(out->transcript_sha256, saved->transcript, sizeof(out->transcript_sha256));
+	out->source_index = index;
+	return true;
+}
+
+bool
 cluster_recovery_native_inventory_page_count_v1(ClusterRecoveryNativeInventory *inventory,
 	uint32 *out)
 {
