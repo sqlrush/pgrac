@@ -1089,6 +1089,8 @@ cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **held)
 #include "test_cluster_recovery_episode_clog_birth.inc"
 #include "test_cluster_recovery_episode_birth_match.inc"
 #include "test_cluster_recovery_episode_birth_terminal.inc"
+#include "test_cluster_recovery_episode_clog_side.inc"
+#include "test_cluster_recovery_episode_birth_halfspace.inc"
 #include "test_cluster_recovery_episode_generation_xid.inc"
 #include "test_cluster_recovery_clog_full_roots.inc"
 
@@ -1271,7 +1273,29 @@ main(int argc, char **argv)
 		UT_RUN(test_episode_terminal_preconditions_preserve_original_base_and_query);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(192);
+	if (getenv("PGRAC_PRE2_TEST_CLOG_SIDE") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_episode_clog_side_matches_all_physical_generations_in_one_original_pass);
+		UT_RUN(test_episode_clog_side_refuses_complete_native_header_and_payload_mismatches);
+		UT_RUN(test_episode_clog_side_requires_every_original_plan_before_and_after_reread);
+		UT_RUN(test_episode_clog_side_whole_output_owner_error_retains_original_custody);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_BIRTH_HALFSPACE") != NULL) {
+		UT_PLAN(3);
+		UT_RUN(test_episode_birth_halfspace_accepts_last_unambiguous_whole_page_position);
+		UT_RUN(test_episode_birth_halfspace_refuses_exact_whole_page_half_cycle);
+		UT_RUN(test_episode_birth_halfspace_refuses_later_tail_with_legal_query_distance);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	UT_PLAN(199);
+	UT_RUN(test_episode_birth_halfspace_accepts_last_unambiguous_whole_page_position);
+	UT_RUN(test_episode_birth_halfspace_refuses_exact_whole_page_half_cycle);
+	UT_RUN(test_episode_birth_halfspace_refuses_later_tail_with_legal_query_distance);
+	UT_RUN(test_episode_clog_side_matches_all_physical_generations_in_one_original_pass);
+	UT_RUN(test_episode_clog_side_refuses_complete_native_header_and_payload_mismatches);
+	UT_RUN(test_episode_clog_side_requires_every_original_plan_before_and_after_reread);
+	UT_RUN(test_episode_clog_side_whole_output_owner_error_retains_original_custody);
 	UT_RUN(test_episode_birth_terminal_joins_source_counter_and_both_polarities_in_one_pass);
 	UT_RUN(test_episode_birth_terminal_refuses_old_terminal_without_exact_birth);
 	UT_RUN(test_episode_birth_terminal_keeps_original_side_and_native_status_refusals);

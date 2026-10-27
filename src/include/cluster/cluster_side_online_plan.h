@@ -193,6 +193,14 @@ extern uint32 rf_side_online_plan_native_terminal_count_v1(const RfSideOnlinePla
 	const ClusterWalSourceRef *source);
 extern bool rf_side_online_plan_terminal_matches_v1(const RfSideOnlinePlanV1 *plan,
 	const ClusterWalSourceRef *source, const XLogReaderState *reader);
+/* Original bound RECOVERY CLOG carrier bytes, including legacy records.
+ * UINT32_MAX refuses; zero is a valid empty count. Exact source/header/main
+ * correspondence is an input observation, never era, physical lifetime,
+ * replay permission, COMPLETE or release authority. */
+extern uint32 rf_side_online_plan_native_clog_count_v1(const RfSideOnlinePlanV1 *plan,
+	const ClusterWalSourceRef *source);
+extern bool rf_side_online_plan_clog_matches_v1(const RfSideOnlinePlanV1 *plan,
+	const ClusterWalSourceRef *source, const XLogReaderState *reader);
 /* UINT32_MAX for an invalid or unsealed plan. */
 extern uint32 rf_side_online_plan_participant_count_v1(const RfSideOnlinePlanV1 *plan);
 /* The physical lower alone must not authorize replay of retained history. */

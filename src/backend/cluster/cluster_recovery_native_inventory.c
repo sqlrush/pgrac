@@ -72,6 +72,8 @@ typedef struct NativeInventoryRelmapXid {
 	XLogRecPtr map_start, map_end;
 	ClusterRecoveryRelmapPendingXidV1 *result; /* stack-only unpublished output */
 	ClusterColdXidProgressV1 generations[CLUSTER_WAL_INPUTS_MAX]; /* other original sources */
+	bool side_clog; /* opt-in exact carriers during this same private reread */
+	uint32 clog_expected[CLUSTER_WAL_INPUTS_MAX], clog_matched[CLUSTER_WAL_INPUTS_MAX];
 } NativeInventoryRelmapXid;
 
 struct ClusterRecoveryNativeInventory {
@@ -584,6 +586,21 @@ inventory_relmap_xid_record(ClusterRecoveryNativeInventory *work, XLogReaderStat
 		return true;
 	if (work->source_cursor >= CLUSTER_WAL_INPUTS_MAX)
 		return false;
+	if (xid->side_clog && XLogRecGetRmid(reader) == RM_CLOG_ID) {
+		uint32 index = work->source_cursor;
+		const NativeInventorySource *saved_source;
+		ClusterRecoveryRelmapSourceV1 source;
+		if (index >= work->source_count || work->relmap_owner == NULL
+			|| xid->clog_matched[index] >= xid->clog_expected[index])
+			return false;
+		saved_source = &work->sources[index];
+		source = cluster_wal_inputs_relmap_source_v1(work->relmap_owner->scope,
+			saved_source->history.input_index);
+		if (!inventory_source_equal(&saved_source->source, &source.selected.source)
+			|| !cluster_wal_inputs_relmap_clog_matches_v1(&source, reader))
+			return false;
+		xid->clog_matched[index]++;
+	}
 	progress = work->source_cursor == xid->source_index
 		? &xid->progress : &xid->generations[work->source_cursor];
 	participant = work->source_cursor == xid->source_index ? &xid->source : &progress->source;
@@ -2932,6 +2949,58 @@ static bool history_pending_xid_finish(ClusterRecoveryRelmapHistory *,
 static bool history_pending_birth_match(const ClusterRecoveryRelmapPendingXidV1 *,
 	const ClusterRelmapV2Image *, uint32 *);
 
+/* Bind and re-observe every original physical generation independently.
+ * Indexes below are physical inventory indexes, resolved through the saved
+ * selector index. No cross-generation LSN order or lifetime is inferred. */
+static bool
+history_pending_clog_side_counts(ClusterRecoveryRelmapHistory *history,
+	NativeInventoryRelmapXid *xid, bool finish)
+{
+	ClusterRecoveryNativeInventory *inventory = history->inventory;
+
+	if (xid == NULL || !xid->side_clog)
+		return true;
+	if (inventory->source_count == 0 || inventory->source_count > CLUSTER_WAL_INPUTS_MAX)
+		return false;
+	for (uint32 i = 0; i < inventory->source_count; i++) {
+		const NativeInventorySource *saved = &inventory->sources[i];
+		ClusterRecoveryRelmapSourceV1 source = cluster_wal_inputs_relmap_source_v1(
+			history->original.scope, saved->history.input_index);
+		uint32 count;
+
+		if (!inventory_source_equal(&saved->source, &source.selected.source)
+			|| memcmp(&saved->history.input, &source.selected, sizeof(source.selected)) != 0)
+			return false;
+		count = cluster_wal_inputs_relmap_clog_count_v1(&source);
+		if (count == UINT32_MAX)
+			return false;
+		if (finish) {
+			if (count != xid->clog_expected[i] || xid->clog_matched[i] != count)
+				return false;
+		} else
+			xid->clog_expected[i] = count;
+	}
+	return inventory_history_inputs(inventory, history->original.scope, false);
+}
+
+/* The original bounds already order every counter between checkpoint and
+ * tail and keep that interval below half a raw cycle. The exact FULL page
+ * first can precede checkpoint and query; include it in that same interval.
+ * This necessary consistency check grants no native era or lifetime. */
+static bool
+history_pending_birth_halfspace(const ClusterRecoveryRelmapPendingBirthV1 *birth)
+{
+	const ClusterRecoveryRelmapPendingXidV1 *inputs = &birth->inputs;
+	uint64 first;
+
+	if (birth->birth_index >= inputs->clog_count
+		|| birth->birth_index >= CLUSTER_RECOVERY_RELMAP_CLOG_HISTORY_MAX)
+		return false;
+	first = inputs->clog[birth->birth_index].full_birth.first_full_xid;
+	return first <= inputs->tail_next
+		&& inputs->tail_next - first < UINT64_C(0x80000000);
+}
+
 static bool
 history_pending_terminal_read(ClusterRecoveryRelmapHistory *history,
 	const ClusterRelmapV2Image *pending, ClusterRecoveryRelmapPendingTerminalV1 *out,
@@ -2975,6 +3044,7 @@ history_pending_terminal_read(ClusterRecoveryRelmapHistory *history,
 			? history_pending_terminal_record(history->inventory) : NULL;
 		ok = saved != NULL
 			&& (birth == NULL || history_pending_xid_begin(history, pending, xid, &birth->inputs))
+			&& history_pending_clog_side_counts(history, xid, false)
 			&& history_pending_base_read(history, &result.base);
 		if (ok) {
 			ok = cluster_recovery_native_scan_primary(saved->scan, &effect)
@@ -2999,13 +3069,16 @@ history_pending_terminal_read(ClusterRecoveryRelmapHistory *history,
 				history->inventory->relmap_xid = NULL;
 			ok = ok && terminal.matched == terminal.expected
 				&& cluster_wal_inputs_relmap_terminal_count_v1(&terminal.source) == terminal.expected
+				&& history_pending_clog_side_counts(history, xid, true)
 				&& history_pending_base_read(history, &result.base)
 				&& cluster_wal_inputs_relmap_terminal_count_v1(&terminal.source) == terminal.expected
+				&& history_pending_clog_side_counts(history, xid, true)
 				&& inventory_history_inputs(history->inventory, history->original.scope, false);
 		}
 		if (ok && birth != NULL) {
 			ok = history_pending_xid_finish(history, pending, xid, &birth->inputs)
 				&& history_pending_birth_match(&birth->inputs, pending, &birth->birth_index)
+				&& (!xid->side_clog || history_pending_birth_halfspace(birth))
 				&& memcmp(&birth->inputs.history, &result.base.history,
 					sizeof(result.base.history)) == 0
 				&& saved->source_index == birth->inputs.history.observation.source_index
@@ -3380,14 +3453,15 @@ cluster_recovery_relmap_history_pending_birth_v1(ClusterRecoveryRelmapHistory *h
 	return true;
 }
 
-bool
-cluster_recovery_relmap_history_pending_native_v1(ClusterRecoveryRelmapHistory *history,
+static bool
+history_pending_native_read(ClusterRecoveryRelmapHistory *history,
 	const ClusterRelmapV2Image *pending, ClusterRecoveryRelmapPendingNativeV1 *out,
-	ClusterRecoveryNativeInventoryDiag *diag)
+	ClusterRecoveryNativeInventoryDiag *diag, bool side_clog)
 {
 	ClusterRecoveryRelmapPendingNativeV1 result = {0};
 	NativeInventoryRelmapXid xid = {0};
 
+	xid.side_clog = side_clog;
 	if (pending == NULL || out == NULL || diag == NULL
 		|| history_overlap(out, sizeof(*out), pending, sizeof(*pending))
 		|| history_overlap(diag, sizeof(*diag), pending, sizeof(*pending))
@@ -3401,6 +3475,22 @@ cluster_recovery_relmap_history_pending_native_v1(ClusterRecoveryRelmapHistory *
 		return false;
 	memcpy(out, &result, sizeof(result));
 	return true;
+}
+
+bool
+cluster_recovery_relmap_history_pending_native_v1(ClusterRecoveryRelmapHistory *history,
+	const ClusterRelmapV2Image *pending, ClusterRecoveryRelmapPendingNativeV1 *out,
+	ClusterRecoveryNativeInventoryDiag *diag)
+{
+	return history_pending_native_read(history, pending, out, diag, false);
+}
+
+bool
+cluster_recovery_relmap_history_pending_native_side_v1(ClusterRecoveryRelmapHistory *history,
+	const ClusterRelmapV2Image *pending, ClusterRecoveryRelmapPendingNativeV1 *out,
+	ClusterRecoveryNativeInventoryDiag *diag)
+{
+	return history_pending_native_read(history, pending, out, diag, true);
 }
 
 void
