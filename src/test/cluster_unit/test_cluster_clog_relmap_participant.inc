@@ -33,6 +33,7 @@ static bool relmap_base_declared, relmap_base_all_held;
 static bool relmap_base_root_ok;
 static unsigned relmap_base_failures, relmap_base_rechecks;
 
+#ifndef TEST_CLUSTER_EPISODE_CLOG
 bool
 cluster_wal_inputs_relmap_source_current_v1(const ClusterRecoveryRelmapSourceV1 *source)
 {
@@ -64,6 +65,7 @@ cluster_wal_inputs_relmap_source_revalidate_v1(const ClusterRecoveryRelmapSource
 		cluster_wal_inputs_relmap_source_fail_v1(source);
 	return ok;
 }
+#endif
 
 #ifdef USE_RELMAP_CLOG_REFUSAL_SHIM
 bool

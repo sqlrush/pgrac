@@ -31,7 +31,9 @@ static int fixture_unlink(const char *path);
 #undef fprintf
 #undef snprintf
 #include "unit_test.h"
+#ifndef TEST_CLUSTER_EPISODE_CLOG
 UT_DEFINE_GLOBALS();
+#endif
 
 bool cluster_shared_config = true;
 int cluster_node_id = 0;
@@ -44,8 +46,10 @@ volatile uint32 CritSectionCount;
 volatile sig_atomic_t InterruptPending;
 volatile uint32 InterruptHoldoffCount;
 int pg_file_create_mode = 0600;
+#ifndef TEST_CLUSTER_EPISODE_CLOG
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
+#endif
 CheckpointStatsData CheckpointStats;
 static uint32 wait_event;
 uint32 *my_wait_event_info = &wait_event;

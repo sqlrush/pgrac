@@ -1,0 +1,120 @@
+/*-------------------------------------------------------------------------
+ * test_cluster_recovery_episode_clog_namespace.h
+ *     Isolate original native CLOG fixture providers in the episode binary.
+ *
+ * Copyright (c) 2026, pgrac contributors
+ * Author: SqlRush <sqlrush@gmail.com>
+ * IDENTIFICATION
+ *     src/test/cluster_unit/test_cluster_recovery_episode_clog_namespace.h
+ * NOTES
+ *     ERROR context and TAP state are shared with the caller. The native
+ *     handle has a private tag; the bridge transfers opaque pointers only.
+ *-------------------------------------------------------------------------
+ */
+#ifndef TEST_CLUSTER_RECOVERY_EPISODE_CLOG_NAMESPACE_H
+#define TEST_CLUSTER_RECOVERY_EPISODE_CLOG_NAMESPACE_H
+#include "pg_config.h"
+#define ClusterRelmapClogBaseHandleV1 D3EpisodeClogHandleV1
+#define AbsorbSyncRequests d3_episode_clog_AbsorbSyncRequests
+#define AllocateDir d3_episode_clog_AllocateDir
+#define BootStrapCLOG d3_episode_clog_BootStrapCLOG
+#define CLOGShmemBuffers d3_episode_clog_CLOGShmemBuffers
+#define CLOGShmemInit d3_episode_clog_CLOGShmemInit
+#define CLOGShmemSize d3_episode_clog_CLOGShmemSize
+#define CheckPointCLOG d3_episode_clog_CheckPointCLOG
+#define CheckpointStats d3_episode_clog_CheckpointStats
+#define CloseTransientFile d3_episode_clog_CloseTransientFile
+#define ClusterClogAdoptNativeStatus d3_episode_clog_ClusterClogAdoptNativeStatus
+#define CritSectionCount d3_episode_clog_CritSectionCount
+#define ExceptionalCondition d3_episode_clog_ExceptionalCondition
+#define ExtendCLOG d3_episode_clog_ExtendCLOG
+#define FreeDir d3_episode_clog_FreeDir
+#define InRecovery d3_episode_clog_InRecovery
+#define InterruptHoldoffCount d3_episode_clog_InterruptHoldoffCount
+#define InterruptPending d3_episode_clog_InterruptPending
+#define IsUnderPostmaster d3_episode_clog_IsUnderPostmaster
+#define LWLockAcquire d3_episode_clog_LWLockAcquire
+#define LWLockConditionalAcquire d3_episode_clog_LWLockConditionalAcquire
+#define LWLockHeldByMe d3_episode_clog_LWLockHeldByMe
+#define LWLockInitialize d3_episode_clog_LWLockInitialize
+#define LWLockRelease d3_episode_clog_LWLockRelease
+#define MainLWLockArray d3_episode_clog_MainLWLockArray
+#define MyAuxProcType d3_episode_clog_MyAuxProcType
+#define MyBackendType d3_episode_clog_MyBackendType
+#define OpenTransientFile d3_episode_clog_OpenTransientFile
+#define ProcessInterrupts d3_episode_clog_ProcessInterrupts
+#define ReadDir d3_episode_clog_ReadDir
+#define RegisterSyncRequest d3_episode_clog_RegisterSyncRequest
+#define ShmemInitStruct d3_episode_clog_ShmemInitStruct
+#define SimpleLruDoesPhysicalPageExist d3_episode_clog_SimpleLruDoesPhysicalPageExist
+#define SimpleLruInit d3_episode_clog_SimpleLruInit
+#define SimpleLruReadPage d3_episode_clog_SimpleLruReadPage
+#define SimpleLruReadPage_ReadOnly d3_episode_clog_SimpleLruReadPage_ReadOnly
+#define SimpleLruShmemSize d3_episode_clog_SimpleLruShmemSize
+#define SimpleLruTruncate d3_episode_clog_SimpleLruTruncate
+#define SimpleLruWriteAll d3_episode_clog_SimpleLruWriteAll
+#define SimpleLruWritePage d3_episode_clog_SimpleLruWritePage
+#define SimpleLruZeroPage d3_episode_clog_SimpleLruZeroPage
+#ifdef USE_ASSERT_CHECKING
+#define SlruPagePrecedesUnitTests d3_episode_clog_SlruPagePrecedesUnitTests
+#endif
+#define SlruDeleteSegment d3_episode_clog_SlruDeleteSegment
+#define SlruScanDirCbDeleteAll d3_episode_clog_SlruScanDirCbDeleteAll
+#define SlruScanDirCbReportPresence d3_episode_clog_SlruScanDirCbReportPresence
+#define SlruScanDirectory d3_episode_clog_SlruScanDirectory
+#define SlruSyncFileTag d3_episode_clog_SlruSyncFileTag
+#define StartupCLOG d3_episode_clog_StartupCLOG
+#define TransactionIdFollowsOrEquals d3_episode_clog_TransactionIdFollowsOrEquals
+#define TransactionIdGetStatus d3_episode_clog_TransactionIdGetStatus
+#define TransactionIdPrecedes d3_episode_clog_TransactionIdPrecedes
+#define TransactionIdSetTreeStatus d3_episode_clog_TransactionIdSetTreeStatus
+#define TrimCLOG d3_episode_clog_TrimCLOG
+#define TruncateCLOG d3_episode_clog_TruncateCLOG
+#define XLogFlush d3_episode_clog_XLogFlush
+#define clog_redo d3_episode_clog_clog_redo
+#define clogsyncfiletag d3_episode_clog_clogsyncfiletag
+#define cluster_cf_held d3_episode_clog_cluster_cf_held
+#define cluster_clog_native_recovery_apply_v1 d3_episode_clog_cluster_clog_native_recovery_apply_v1
+#define cluster_clog_native_recovery_record_apply_v1 d3_episode_clog_cluster_clog_native_recovery_record_apply_v1
+#define cluster_clog_native_recovery_record_verify_v1 d3_episode_clog_cluster_clog_native_recovery_record_verify_v1
+#define cluster_clog_native_recovery_verify_v1 d3_episode_clog_cluster_clog_native_recovery_verify_v1
+#define cluster_clog_relmap_base_custody_bytes_v1 d3_episode_clog_cluster_clog_relmap_base_custody_bytes_v1
+#define cluster_clog_relmap_base_read_v1 d3_episode_clog_cluster_clog_relmap_base_read_v1
+#define cluster_clog_relmap_base_release_v1 d3_episode_clog_cluster_clog_relmap_base_release_v1
+#define cluster_node_id d3_episode_clog_cluster_node_id
+#define cluster_shared_config d3_episode_clog_cluster_shared_config
+#define cluster_shared_data_dir d3_episode_clog_cluster_shared_data_dir
+#define cluster_undo_recovery_abort_clog_authorized_v1 d3_episode_clog_cluster_undo_recovery_abort_clog_authorized_v1
+#define cluster_undo_recovery_cold_origin_authorized_v1 d3_episode_clog_cluster_undo_recovery_cold_origin_authorized_v1
+#define cluster_wal_inputs_relmap_source_current_v1 d3_episode_clog_cluster_wal_inputs_relmap_source_current_v1
+#define cluster_wal_inputs_relmap_source_fail_v1 d3_episode_clog_cluster_wal_inputs_relmap_source_fail_v1
+#define cluster_wal_inputs_relmap_source_revalidate_v1 d3_episode_clog_cluster_wal_inputs_relmap_source_revalidate_v1
+#define data_sync_elevel d3_episode_clog_data_sync_elevel
+#define enableFsync d3_episode_clog_enableFsync
+#define errcode d3_episode_clog_errcode
+#define errcode_for_file_access d3_episode_clog_errcode_for_file_access
+#define errdetail d3_episode_clog_errdetail
+#define errfinish d3_episode_clog_errfinish
+#define errmsg d3_episode_clog_errmsg
+#define errmsg_internal d3_episode_clog_errmsg_internal
+#define errstart d3_episode_clog_errstart
+#define errstart_cold d3_episode_clog_errstart_cold
+#define fsync_fname d3_episode_clog_fsync_fname
+#define main d3_episode_clog_main
+#define my_wait_event_info d3_episode_clog_my_wait_event_info
+#define pg_file_create_mode d3_episode_clog_pg_file_create_mode
+#define pg_fsync d3_episode_clog_pg_fsync
+#define pg_re_throw d3_episode_clog_pg_re_throw
+#define pgstat_count_slru_flush d3_episode_clog_pgstat_count_slru_flush
+#define pgstat_count_slru_page_hit d3_episode_clog_pgstat_count_slru_page_hit
+#define pgstat_count_slru_page_read d3_episode_clog_pgstat_count_slru_page_read
+#define pgstat_count_slru_page_written d3_episode_clog_pgstat_count_slru_page_written
+#define pgstat_count_slru_page_zeroed d3_episode_clog_pgstat_count_slru_page_zeroed
+#define pgstat_count_slru_truncate d3_episode_clog_pgstat_count_slru_truncate
+#define pgstat_get_slru_index d3_episode_clog_pgstat_get_slru_index
+#define cluster_clog_native_terminal_sync_v1 d3_episode_clog_cluster_clog_native_terminal_sync_v1
+#define cluster_clog_native_recovery_base_read_v1 d3_episode_clog_cluster_clog_native_recovery_base_read_v1
+#define cluster_clog_native_recovery_base_read_held_v1 d3_episode_clog_cluster_clog_native_recovery_base_read_held_v1
+#define cluster_clog_native_recovery_base_release_v1 d3_episode_clog_cluster_clog_native_recovery_base_release_v1
+#define cluster_relmap_retention_truncate_clog_v2 d3_episode_clog_cluster_relmap_retention_truncate_clog_v2
+#endif
