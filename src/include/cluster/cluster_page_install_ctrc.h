@@ -152,5 +152,17 @@ extern RfPageCtrcStepResultV1 rf_page_recovery_ctrc_replays_itl_step_smgr_v1(
 	BlockNumber blockno, const RfPageVersionV1 *expected_before,
 	const struct ClusterRecoveryUndoEntry *physical, Size physical_count, Size memory_budget);
 
+/* Same native step, additionally requiring the first protected MAIN image
+ * to equal the complete fixed graph terminal bytes. Only the independently
+ * verified storage checksum is normalized. Keep canonical and all backing
+ * storage immutable/disjoint through return; refusal never authorizes redo
+ * over a predecessor, discharge or a second pending insertion. */
+extern RfPageCtrcStepResultV1 rf_page_recovery_ctrc_replays_itl_graph_step_smgr_v1(
+	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work,
+	const struct ClusterRecoveryCtrcReplaySetSourceV1 *source,
+	RfPageCtrcAuthorityV1 *authority, const struct ClusterSpaceIdentity *space,
+	BlockNumber blockno, const RfPageVersionV1 *expected_before, const char canonical[BLCKSZ],
+	const struct ClusterRecoveryUndoEntry *physical, Size physical_count, Size memory_budget);
+
 #endif /* USE_PGRAC_CLUSTER */
 #endif /* CLUSTER_PAGE_INSTALL_CTRC_H */

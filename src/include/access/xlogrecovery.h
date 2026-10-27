@@ -235,6 +235,12 @@ extern bool ClusterColdRecoveryCtrcReplaysAcquire(const struct ClusterRecoverySt
 struct RfPageOnlinePlanV1;
 extern bool ClusterColdRecoveryCtrcPagePlanPrepare(const struct ClusterRecoveryStartV1 *start,
 	Size memory_budget);
+/* Advance the original immutable PAGE graph to its first pending FPI.
+ * Native local WAIT retains the same owners without an overall deadline.
+ * The original Start retains INSERTED/image state; repeats cannot reinsert.
+ * A true result is only a retained prefix, never discharge or service COMPLETE. */
+extern bool ClusterColdRecoveryCtrcPageAdvance(const struct ClusterRecoveryStartV1 *start,
+	Size memory_budget);
 extern const struct RfPageOnlinePlanV1 *ClusterColdRecoveryCtrcPagePlan(
 	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work);
 /* Original complete generation vector in the SAME sealed graph's participant
