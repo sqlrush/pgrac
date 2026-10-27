@@ -5572,6 +5572,25 @@ ctrc_origin_protects_local_receipt_locked(const ClusterCtrcTxnKeyV1 *key,
 
 /* V2 is a separate envelope: header8, FullXid8, unchanged key96,
  * exact receiver32. No pointer/host padding is serialized. */
+static bool
+ctrc_origin_fullxid_encode_v2(const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcParticipantIdentity *receiver, uint32 grant, FullTransactionId full,
+	uint8 bytes[CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES])
+{
+	ctrc_put_u16_le(bytes, CLUSTER_CTRC_ORIGIN_FULLXID_V2_VERSION);
+	ctrc_put_u16_le(bytes + 2, CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES);
+	ctrc_put_u32_le(bytes + 4, grant);
+	ctrc_put_u64_le(bytes + 8, U64FromFullTransactionId(full));
+	if (!ctrc_txn_key_encode(key, bytes + 16))
+		return false;
+	ctrc_put_u16_le(bytes + 112, receiver->node_id);
+	ctrc_put_u32_le(bytes + 116, receiver->capability_record_generation);
+	ctrc_put_u64_le(bytes + 120, receiver->boot_incarnation);
+	ctrc_put_u64_le(bytes + 128, receiver->formation_epoch);
+	ctrc_put_u64_le(bytes + 136, receiver->admission_record_generation);
+	return true;
+}
+
 bool
 cluster_ctrc_origin_fullxid_capture_v2(const ClusterCtrcTxnKeyV1 *key,
 	const ClusterCtrcParticipantIdentity *receiver, uint32 grant,
@@ -5590,22 +5609,60 @@ cluster_ctrc_origin_fullxid_capture_v2(const ClusterCtrcTxnKeyV1 *key,
 	LWLockAcquire(&CtrcShared->origin_lock, LW_SHARED);
 	valid = ctrc_origin_protects_local_receipt_locked(key, receiver, grant, &full)
 		&& FullTransactionIdIsNormal(full) && U64FromFullTransactionId(full) != UINT64_MAX;
-	if (valid) {
-		ctrc_put_u16_le(bytes, CLUSTER_CTRC_ORIGIN_FULLXID_V2_VERSION);
-		ctrc_put_u16_le(bytes + 2, CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES);
-		ctrc_put_u32_le(bytes + 4, grant);
-		ctrc_put_u64_le(bytes + 8, U64FromFullTransactionId(full));
-		valid = ctrc_txn_key_encode(key, bytes + 16);
-		ctrc_put_u16_le(bytes + 112, receiver->node_id);
-		ctrc_put_u32_le(bytes + 116, receiver->capability_record_generation);
-		ctrc_put_u64_le(bytes + 120, receiver->boot_incarnation);
-		ctrc_put_u64_le(bytes + 128, receiver->formation_epoch);
-		ctrc_put_u64_le(bytes + 136, receiver->admission_record_generation);
-	}
+	if (valid)
+		valid = ctrc_origin_fullxid_encode_v2(key, receiver, grant, full, bytes);
 	LWLockRelease(&CtrcShared->origin_lock);
 	if (!valid)
 		MemSet(bytes, 0, CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES);
 	return valid;
+}
+
+ClusterCtrcTouchResult
+cluster_ctrc_origin_grant_fullxid_v2(const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcParticipantIdentity *receiver, ClusterCtrcProofClass proof_class,
+	uint32 *grant_out, uint8 bytes[CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES])
+{
+	ClusterCtrcTouchResult result = CLUSTER_CTRC_TOUCH_REFUSED;
+	ClusterCtrcOriginEntry *origin;
+	FullTransactionId full;
+	uint64 index;
+
+	if (grant_out != NULL)
+		*grant_out = 0;
+	if (bytes == NULL)
+		return CLUSTER_CTRC_TOUCH_REFUSED;
+	MemSet(bytes, 0, CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES);
+	if (proof_class == CTRC_PROOF_UNKNOWN || proof_class == CTRC_PROOF_COMMITTED
+		|| proof_class == CTRC_PROOF_ABORTED)
+		return CLUSTER_CTRC_TOUCH_TERMINAL_NO_GRANT;
+	if (grant_out == NULL || !cluster_ctrc_shmem_ready() || !ctrc_txn_key_valid(key)
+		|| cluster_node_id < 0 || key->origin_node_id != (uint16)cluster_node_id
+		|| !ctrc_participant_identity_valid(key, receiver) || !ctrc_origin_index(key, &index))
+		return CLUSTER_CTRC_TOUCH_REFUSED;
+
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+	origin = &ctrc_origin_entries()[index];
+	full = origin->original_full_xid;
+	if (memcmp(&origin->key, key, sizeof(*key)) != 0) {
+		/* Preserve the original grant producer's identity-conflict refusal. */
+		origin->state = CTRC_ORIGIN_BLOCKED;
+		CtrcShared->full_refusal_count++;
+	} else if (origin->state == CTRC_ORIGIN_OPEN && origin->grant_generation != 0
+		&& FullTransactionIdIsNormal(full) && U64FromFullTransactionId(full) != UINT64_MAX
+		&& XidFromFullTransactionId(full) == key->xid
+		&& ctrc_origin_fullxid_encode_v2(key, receiver, origin->grant_generation, full, bytes)) {
+		/* No receiver responsibility is created until its complete original
+		 * identity is available. Both are published under the original lock. */
+		result = cluster_ctrc_origin_record_touched(origin, receiver, proof_class, grant_out);
+	}
+	LWLockRelease(&CtrcShared->origin_lock);
+	if (result != CLUSTER_CTRC_TOUCH_RECORDED && result != CLUSTER_CTRC_TOUCH_DUPLICATE) {
+		*grant_out = 0;
+		MemSet(bytes, 0, CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES);
+	}
+	if (result == CLUSTER_CTRC_TOUCH_REFUSED)
+		cluster_ctrc_stat_bump(CTRC_STAT_GRANT_REFUSED);
+	return result;
 }
 
 static ClusterCtrcPrepareResult

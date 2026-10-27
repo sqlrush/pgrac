@@ -7951,6 +7951,7 @@ gcs_block_current_mx_origin_sample_held(GcsBlockR4TxOriginContext *context)
 		ClusterUndoBlock0Generation final_generation = { false, 0 };
 		ClusterUndoBlock0ResolvedRoot final_root;
 		ClusterCtrcTxnKeyV1 ctrc_key;
+		uint8 origin_fullxid_v2[CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES];
 		ClusterCtrcTouchResult touch_result;
 		bool ctrc_physical_active = false;
 		bool precommit_retry = false;
@@ -8001,11 +8002,11 @@ gcs_block_current_mx_origin_sample_held(GcsBlockR4TxOriginContext *context)
 					!= CLUSTER_UNDO_BLOCK0_OK
 				|| !gcs_block_current_mx_ctrc_key(context, i, &generation, &ctrc_key))
 				return false;
-			touch_result = cluster_ctrc_origin_touch_exact(
+			touch_result = cluster_ctrc_origin_grant_fullxid_v2(
 				&ctrc_key, &context->current_mx_requester_identity,
 				context->current_mx_proofs[i].state == CCM_SELF ? CTRC_PROOF_SELF
 																: CTRC_PROOF_ACTIVE,
-				&ctrc_grant);
+				&ctrc_grant, origin_fullxid_v2);
 			if ((touch_result != CLUSTER_CTRC_TOUCH_RECORDED
 				 && touch_result != CLUSTER_CTRC_TOUCH_DUPLICATE)
 				|| ctrc_grant == 0
@@ -8020,9 +8021,11 @@ gcs_block_current_mx_origin_sample_held(GcsBlockR4TxOriginContext *context)
 				|| cluster_qvotec_get_self_incarnation() != ctrc_key.origin_boot_incarnation)
 				return false;
 			ClusterCurrentMemberProofSetCtrcGrant(&context->current_mx_proofs[i], ctrc_grant);
-			if (!cluster_multixact_current_member_proof_bind_origin_v2(&context->current_mx_proofs[i],
-				&ctrc_key, &context->current_mx_requester_identity))
+			if (!cluster_multixact_current_member_proof_bind_ctrc(&context->current_mx_proofs[i],
+				&ctrc_key))
 				return false;
+			memcpy(context->current_mx_proofs[i].origin_fullxid_v2, origin_fullxid_v2,
+				   sizeof(origin_fullxid_v2));
 			context->current_mx_ctrc_keys[i] = ctrc_key;
 		} else {
 			ClusterCurrentMemberProofSetCtrcGrant(&context->current_mx_proofs[i], 0);

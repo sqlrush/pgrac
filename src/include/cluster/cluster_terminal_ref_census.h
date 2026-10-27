@@ -965,6 +965,13 @@ extern bool cluster_ctrc_origin_original_full_xid_shared(
 extern bool cluster_ctrc_origin_fullxid_capture_v2(const ClusterCtrcTxnKeyV1 *key,
 	const ClusterCtrcParticipantIdentity *receiver, uint32 grant,
 	uint8 bytes[CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES]);
+/* Original current/grant producer: validate its original FullXid before
+ * registering the receiver, and copy both identities under that same lock.
+ * Legacy/raw-only origins cannot create a V2 grant. */
+extern ClusterCtrcTouchResult cluster_ctrc_origin_grant_fullxid_v2(
+	const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcParticipantIdentity *receiver,
+	ClusterCtrcProofClass proof_class, uint32 *grant_out,
+	uint8 bytes[CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES]);
 extern bool cluster_ctrc_origin_fullxid_match_v2(const uint8 *bytes, Size length,
 	const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcParticipantIdentity *receiver,
 	uint32 grant, FullTransactionId *out);

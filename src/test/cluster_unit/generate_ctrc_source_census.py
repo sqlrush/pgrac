@@ -200,7 +200,7 @@ SCAN_RULES: Tuple[ScanRule, ...] = (
             "src/backend/cluster/cluster_runtime_visibility.c",
             "src/backend/cluster/cluster_terminal_ref_census.c",
         ),
-        r"\bcluster_ctrc_origin_touch_exact\s*\(",
+        r"\bcluster_ctrc_origin_(?:touch_exact|grant_fullxid_v2)\s*\(",
     ),
     ScanRule(
         "CTRC_ORIGIN_PROVENANCE",
@@ -213,7 +213,7 @@ SCAN_RULES: Tuple[ScanRule, ...] = (
             "src/backend/cluster/cluster_tt_slot.c",
             "src/backend/cluster/cluster_tt_durable.c",
         ),
-        r"\b(?:cluster_ctrc_origin_original_full_xid_(?:exact|shared)|cluster_ctrc_origin_fullxid_(?:capture_v2|match_v2)|cluster_multixact_current_member_proof_bind_origin_v2|cluster_tt_slot_origin_identity_(?:retain|read))\s*\(",
+        r"\b(?:cluster_ctrc_origin_original_full_xid_(?:exact|shared)|cluster_ctrc_origin_fullxid_(?:capture_v2|match_v2)|cluster_ctrc_origin_grant_fullxid_v2|ctrc_origin_fullxid_encode_v2|cluster_multixact_current_member_proof_bind_origin_v2|cluster_tt_slot_origin_identity_(?:retain|read))\s*\(",
     ),
     ScanRule(
         "CTRC_RECEIPT_LIFECYCLE",
@@ -544,7 +544,9 @@ _classify_owners(
     "CTRC_ORIGIN_PROVENANCE",
     "src/backend/cluster/cluster_terminal_ref_census.c",
     (
+        "ctrc_origin_fullxid_encode_v2",
         "cluster_ctrc_origin_fullxid_capture_v2",
+        "cluster_ctrc_origin_grant_fullxid_v2",
         "cluster_ctrc_origin_fullxid_match_v2",
         "cluster_ctrc_receipt_prepare_origin_v2",
         "ctrc_cleaner_prepare_current_mx_successor",
@@ -582,6 +584,17 @@ _classify_owners(
     "CTRC_ORIGIN_PROVENANCE",
     "src/backend/cluster/cluster_gcs_block.c",
     ("gcs_block_current_mx_origin_sample_held",),
+    "REGISTERED_REFERENCE",
+    "CTRC_REF_CURRENT_MX_LOCKER|CTRC_REF_CURRENT_MX_UPDATER|CTRC_REF_HOT_FOLLOW_EDGE",
+    "CTRC_TARGET_EXACT_TID",
+    "cluster_ctrc_receipt_prepare_origin_v2",
+    "cluster_ctrc_receipt_discharge_current_mx_shared",
+    "MXA-T40",
+)
+_classify_owners(
+    "CTRC_TOUCH_BEFORE_PROOF",
+    "src/backend/cluster/cluster_terminal_ref_census.c",
+    ("cluster_ctrc_origin_grant_fullxid_v2",),
     "REGISTERED_REFERENCE",
     "CTRC_REF_CURRENT_MX_LOCKER|CTRC_REF_CURRENT_MX_UPDATER|CTRC_REF_HOT_FOLLOW_EDGE",
     "CTRC_TARGET_EXACT_TID",
