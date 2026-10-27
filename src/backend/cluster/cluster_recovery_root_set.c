@@ -489,6 +489,28 @@ roots_add_slru_zero(ClusterRecoveryRootSet *roots, const ClusterRecoveryNativeEf
 	uint32 per_page = cts ? CLUSTER_NATIVE_COMMIT_TS_PER_PAGE : CLUSTER_NATIVE_CLOG_PER_PAGE;
 	int page;
 
+	/* FULL adds the same physical file obligation as legacy ZERO. Retain
+	 * the actual page-generation bytes in the original native observation;
+	 * page geometry alone proves no transaction era or physical lifetime. */
+	if (!cts && (record->header.xl_info & ~XLR_INFO_MASK) == CLOG_ZEROPAGE_FULL) {
+		xl_clog_zeropage_full birth;
+		TransactionId raw;
+
+		if (!cluster_wal_claim_v2_ref_valid(&record->source.claim)
+			|| record->header.xl_rmid != RM_CLOG_ID || effect->bytes != record->payload
+			|| effect->length != record->payload_length || effect->length != sizeof(birth)
+			|| effect->ordinal != 0)
+			return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
+		memcpy(&birth, effect->bytes, sizeof(birth));
+		raw = (TransactionId)birth.first_full_xid;
+		if (birth.reserved_zero != 0 || birth.pageno < 0 || !TransactionIdIsNormal(raw)
+			|| (raw % per_page != 0 && raw != FirstNormalTransactionId)
+			|| raw / per_page != (uint32)birth.pageno)
+			return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
+		return roots_add_slru_page(roots, node, CLUSTER_RECOVERY_NATIVE_FAMILY_XACT,
+								  (uint32)birth.pageno);
+	}
+
 	if (!cluster_wal_claim_v2_ref_valid(&record->source.claim)
 		|| record->header.xl_rmid != (cts ? RM_COMMIT_TS_ID : RM_CLOG_ID)
 		|| (record->header.xl_info & ~XLR_INFO_MASK) != (cts ? COMMIT_TS_ZEROPAGE : CLOG_ZEROPAGE)
