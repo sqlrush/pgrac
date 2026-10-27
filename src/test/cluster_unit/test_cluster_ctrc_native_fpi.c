@@ -447,6 +447,7 @@ bool native_install_original_writer_installed(ClusterWalWriterToken *writer,
 #include "test_cluster_ctrc_native_install.inc"
 #include "test_cluster_ctrc_native_step.inc"
 #include "test_cluster_ctrc_native_graph_step.inc"
+#include "test_cluster_ctrc_native_page_fd.inc"
 
 int
 main(int argc, char **argv)
@@ -463,7 +464,24 @@ main(int argc, char **argv)
 		UT_RUN(test_native_graph_step_error_keeps_original_inserted_debt);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(46);
+	if (getenv("PGRAC_PRE2_TEST_NATIVE_PAGE_FD") != NULL) {
+		UT_PLAN(6);
+		UT_RUN(test_native_step_fixed_fd_precedes_page_and_covers_all_io);
+		UT_RUN(test_native_step_fixed_fd_open_failure_precedes_page_and_wal);
+		UT_RUN(test_native_step_fixed_fd_gap_loss_cannot_insert);
+		UT_RUN(test_native_step_fixed_fd_late_failure_keeps_inserted_debt);
+		UT_RUN(test_native_step_fixed_fd_error_always_closes_private_storage);
+		UT_RUN(test_native_step_fixed_fd_close_failure_cannot_claim_target_synced);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	UT_PLAN(52);
+	UT_RUN(test_native_step_fixed_fd_precedes_page_and_covers_all_io);
+	UT_RUN(test_native_step_fixed_fd_open_failure_precedes_page_and_wal);
+	UT_RUN(test_native_step_fixed_fd_gap_loss_cannot_insert);
+	UT_RUN(test_native_step_fixed_fd_late_failure_keeps_inserted_debt);
+	UT_RUN(test_native_step_fixed_fd_error_always_closes_private_storage);
+	UT_RUN(test_native_step_fixed_fd_close_failure_cannot_claim_target_synced);
+
 	UT_RUN(test_native_graph_step_accepts_only_storage_checksum_normalization);
 	UT_RUN(test_native_graph_step_refuses_terminal_bytes_lsn_and_origin_mismatch);
 	UT_RUN(test_native_graph_step_fixed_input_cannot_change_during_wal_preparation);

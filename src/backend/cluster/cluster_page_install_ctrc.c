@@ -30,6 +30,7 @@
 #include "cluster/cluster_space_reservation.h"
 #include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_wal_inputs.h"
+#include "cluster/storage/cluster_shared_fs_page.h"
 #include "utils/memutils.h"
 #include "miscadmin.h"
 #include "postmaster/interrupt.h"
@@ -58,6 +59,7 @@ typedef struct CtrcNativeStepV1 {
 	CtrcNativeStepImagesV1 images;
 	const char *original_canonical;
 	PGAlignedBlock canonical;
+	ClusterSharedFsPageV1 *storage;
 } CtrcNativeStepV1;
 
 typedef struct CtrcNativeReadV1 {
@@ -99,6 +101,7 @@ ctrc_native_step_current(const CtrcNativeStepV1 *step)
 
 	if (step == NULL) return true;
 	return ctrc_native_read_actor()
+		&& (step->storage == NULL || cluster_shared_fs_page_current_v1(step->storage))
 		&& ClusterColdRecoveryCtrcWorkCurrent(step->start, step->work)
 		&& memcmp(step->work, step->snapshot, step->work_bytes) == 0
 		&& (step->physical_bytes == 0
@@ -162,16 +165,28 @@ ctrc_native_read_storage(SMgrRelation relation, BlockNumber blockno)
 }
 
 static bool
+ctrc_native_read_target_current(const CtrcNativeReadV1 *context, SMgrRelation relation)
+{
+	return context->step != NULL
+		? context->step->storage != NULL && cluster_shared_fs_page_current_v1(context->step->storage)
+		: ctrc_native_read_storage(relation, context->identity.blockno);
+}
+
+static bool
 ctrc_native_read_page(const CtrcNativeReadV1 *context, SMgrRelation relation,
 	ForkNumber forknum, BlockNumber blockno, PGAlignedBlock *out)
 {
 	if (!ctrc_native_read_current(context)
-		|| !ctrc_native_read_storage(relation, context->identity.blockno)
+		|| !ctrc_native_read_target_current(context, relation)
 		|| !ctrc_native_read_current(context))
 		return false;
-	smgrread(relation, forknum, blockno, out->data);
+	if (context->step != NULL) {
+		if (!cluster_shared_fs_page_read_v1(context->step->storage, forknum, blockno, out->data))
+			return false;
+	} else
+		smgrread(relation, forknum, blockno, out->data);
 	return ctrc_native_read_current(context)
-		&& ctrc_native_read_storage(relation, context->identity.blockno)
+		&& ctrc_native_read_target_current(context, relation)
 		&& ctrc_native_read_current(context);
 }
 
@@ -249,7 +264,7 @@ ctrc_native_read_image(const CtrcNativeReadV1 *context, PGAlignedBlock *out)
 	uint64 token;
 	BlockNumber blockno = context->identity.blockno;
 
-	relation = smgropen(context->identity.locator, InvalidBackendId);
+	relation = context->step == NULL ? smgropen(context->identity.locator, InvalidBackendId) : NULL;
 	if (!ctrc_native_read_page(context, relation, SPACE_FORKNUM, 0, &space0)
 		|| !ctrc_native_read_integrity(context, &space0, 0)
 		|| !cluster_space_identity_page_decode(space0.data, BLCKSZ, SPACE_FORKNUM, 0,
@@ -355,7 +370,9 @@ ctrc_native_insert_gap_current(CtrcNativeReadV1 *read)
 }
 
 /* No hashing, allocation, ROOT/WAL I/O or ownership acquisition. Original
- * short shared snapshots still validate the same installed writer/holders. */
+ * short shared snapshots still validate the same installed writer/holders.
+ * A step also rechecks its already-held target namespace outside critical
+ * sections; this never reopens a file or acquires another resource. */
 static bool
 ctrc_native_insert_current(const CtrcNativeInsertV1 *context,
 	const RfPageCtrcFpiInsertV1 *result)
@@ -611,7 +628,7 @@ static bool
 ctrc_native_install_storage_current(const CtrcNativeInstallV1 *context, SMgrRelation relation)
 {
 	return ctrc_native_install_current(context)
-		&& ctrc_native_read_storage(relation, context->binding.read.identity.blockno)
+		&& ctrc_native_read_target_current(&context->binding.read, relation)
 		&& ctrc_native_install_current(context);
 }
 
@@ -650,7 +667,7 @@ ctrc_native_install_image(CtrcNativeInstallV1 *context, const RfPageCtrcAuthorit
 		|| ((PageHeader)canonical.data)->pd_block_scn != fixed->image.result_token
 		|| !ctrc_native_install_current(context))
 		return false;
-	relation = smgropen(binding->read.identity.locator, InvalidBackendId);
+	relation = binding->read.step == NULL ? smgropen(binding->read.identity.locator, InvalidBackendId) : NULL;
 	if (!ctrc_native_install_current(context)
 		|| !ctrc_native_install_observe(context, relation, true, &current))
 		return false;
@@ -659,12 +676,18 @@ ctrc_native_install_image(CtrcNativeInstallV1 *context, const RfPageCtrcAuthorit
 		if (memcmp(&current, &canonical, sizeof(current)) != 0) return false;
 	} else if (token == fixed->image.version.before.mutation_token) {
 		if (!ctrc_native_install_storage_current(context, relation)) return false;
-		smgrwrite(relation, MAIN_FORKNUM, fixed->image.block_number, canonical.data, false);
+		if (binding->read.step != NULL) {
+			if (!cluster_shared_fs_page_write_v1(binding->read.step->storage, canonical.data)) return false;
+		} else
+			smgrwrite(relation, MAIN_FORKNUM, fixed->image.block_number, canonical.data, false);
 		if (!ctrc_native_install_storage_current(context, relation)) return false;
 	} else
 		return false;
 	if (!ctrc_native_install_storage_current(context, relation)) return false;
-	smgrimmedsync(relation, MAIN_FORKNUM);
+	if (binding->read.step != NULL) {
+		if (!cluster_shared_fs_page_sync_v1(binding->read.step->storage)) return false;
+	} else
+		smgrimmedsync(relation, MAIN_FORKNUM);
 	return ctrc_native_install_storage_current(context, relation)
 		&& ctrc_native_install_observe(context, relation, false, &current)
 		&& memcmp(&current, &canonical, sizeof(current)) == 0
@@ -972,17 +995,32 @@ ctrc_native_step_attempt(CtrcNativeStepV1 *context, const ClusterColdCtrcWorkV1 
 			memcpy((void *)context->snapshot, context->work, context->work_bytes);
 			if (context->physical_bytes != 0)
 				memcpy((void *)context->physical, context->original_physical, context->physical_bytes);
-			ctrc_native_step_execute(context, authority, blockno, count, memory_budget - bytes, result);
+			/* Fix namespace/inode/extent and raw descriptors before the first
+			 * PAGE. No VFD reopen is permitted in the subsequent WAL window. */
+			if (ctrc_native_step_current(context)) {
+				context->storage = cluster_shared_fs_page_open_v1(context->space.key.locator,
+					blockno, memory_budget - bytes);
+				if (context->storage != NULL && ctrc_native_step_current(context))
+					ctrc_native_step_execute(context, authority, blockno, count,
+						memory_budget - bytes - cluster_shared_fs_page_bytes_v1(), result);
+			}
 		}
 	}
 	PG_CATCH();
 	{
 		if (result->inserted.window.key.window_seq != 0)
 			(void)cluster_recovery_stamp_fail_v1(&result->inserted.window);
+		(void)cluster_shared_fs_page_close_v1(context->storage); context->storage = NULL;
 		if (snapshot != NULL) pfree((void *)snapshot);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+	if (!cluster_shared_fs_page_close_v1(context->storage)) {
+		result->phase = RF_PAGE_CTRC_STEP_REFUSED;
+		if (result->inserted.window.key.window_seq != 0)
+			(void)cluster_recovery_stamp_fail_v1(&result->inserted.window);
+	}
+	context->storage = NULL;
 	if (snapshot != NULL) pfree((void *)snapshot);
 }
 
@@ -996,7 +1034,7 @@ ctrc_native_itl_step(const struct ClusterRecoveryStartV1 *start,
 	RfPageCtrcStepResultV1 result = {0};
 	CtrcNativeStepV1 context = {0};
 	ClusterColdCtrcWorkV1 header;
-	Size bytes, prepare_bytes;
+	Size bytes, prepare_bytes, storage_bytes = cluster_shared_fs_page_bytes_v1();
 	uint32 held = 0;
 	const Size per_subject = 2 * MAXALIGN(sizeof(ClusterColdTtSlotInputV1))
 		+ MAXALIGN(sizeof(ClusterRecoveryUndoEntry));
@@ -1020,8 +1058,9 @@ ctrc_native_itl_step(const struct ClusterRecoveryStartV1 *start,
 	bytes = MAXALIGN(context.work_bytes) + context.physical_bytes;
 	prepare_bytes = 2 * MAXALIGN(physical_count * sizeof(work->entries[0])) + MAXALIGN(context.physical_bytes);
 	/* Reserve the peak before any PAGE lock, including the original F4 copy. */
-	if (bytes > memory_budget || prepare_bytes > memory_budget - bytes
-		|| context.work_bytes > (memory_budget - bytes) / 2)
+	if (storage_bytes > memory_budget || bytes > memory_budget - storage_bytes
+		|| prepare_bytes > memory_budget - storage_bytes - bytes
+		|| context.work_bytes > (memory_budget - storage_bytes - bytes) / 2)
 		return result;
 	memcpy(&header, work, offsetof(ClusterColdCtrcWorkV1, entries));
 	context.start = start; context.work = work;
