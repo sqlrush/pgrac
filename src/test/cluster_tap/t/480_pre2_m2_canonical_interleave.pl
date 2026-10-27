@@ -127,7 +127,7 @@ sub remote_pause {
 
 $cluster=PostgreSQL::Test::ClusterPRE2->new_cluster('m2_a08',nodes=>4,blackbox=>1,
  required_operations=>[],extra_conf=>['shared_buffers=512MB','autovacuum=off','cluster.trace_tx_identity=on',
-  'log_error_verbosity=verbose','log_line_prefix=\'%m [%p] \'']);
+  'cluster.trace_control_config=on','log_error_verbosity=verbose','log_line_prefix=\'%m [%p] \'']);
 my @nodes=$cluster->nodes;
 # Preload is local postmaster setup after the original native creation;
 # it is not a supported shared bootstrap-profile parameter.
