@@ -199,6 +199,29 @@ extern bool cluster_undo_record_complete_savepoint(ClusterUndoSavepointControl *
 												   uint64 absolute_deadline_us,
 												   XLogRecPtr *cut_out);
 
+#define CLUSTER_UNDO_SAVEPOINT_DRIVER_PRESENT 1
+
+/* Drive the original live control from its reserved range through all mark
+ * batches and current COMPLETE readback. Drain the original deferred DATA
+ * owner first; never cancel an unresolved receipt or release a retained ref.
+ * expected_tt_head is only the first-publication compare input described
+ * above, not a second head authority. An already published handle remains
+ * qualified by its original live frame and physical control, not this input.
+ *
+ * Unknown/unowned handles return false and clear *cut_out; false never grants
+ * native cleanup. Once an owned live handle is accepted, uncertainty is fatal,
+ * including refusal before PENDING: accepted DATA cannot resume in its parent.
+ * true with cut=0 proves only an unchanged empty local range, keeping its
+ * unused reservation for native frame cleanup. Otherwise the cut covers
+ * COMPLETE and its actual readback. Repetition requalifies that physical state.
+ * No allocation or native cleanup, top/ITL terminal stamp or retention release
+ * is performed. This entry alone does not open child DML or authorize a parent
+ * handler; the native caller must still finish all original child cleanup. */
+extern bool cluster_undo_record_rollback_savepoint(ClusterUndoSavepointControl *control,
+												   UBA expected_tt_head,
+												   uint64 absolute_deadline_us,
+												   XLogRecPtr *cut_out);
+
 
 /* Stack-only identity for one backend-local prepared DATA reservation.  It is
  * neither shared state nor authority: the block0 publication is a retained

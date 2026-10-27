@@ -244,6 +244,10 @@ cluster_tt_slot_durable_publish_operation_head(const xl_undo_tt_slot_set_head_op
 		break;
 	}
 	head_pipeline_test_flushed = pending_lsn + 1;
+	if (rollback_driver_test_mode) {
+		UT_ASSERT(reserve_test_uba_equal(expected_head, rollback_driver_test_expected));
+		rollback_driver_test_after_head();
+	}
 	return pending_lsn + 1;
 }
 

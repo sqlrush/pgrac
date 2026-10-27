@@ -6771,6 +6771,90 @@ cluster_undo_record_complete_savepoint(ClusterUndoSavepointControl *control, uin
 	return true;
 }
 
+static bool
+undo_savepoint_rollback_quiesced(void)
+{
+	const ClusterUndoRecordReservation *reservation = &cluster_undo_record_reservation;
+
+	return CritSectionCount == 0 && !undo_savepoint_cursor_active && !reservation->active
+		   && !reservation->owns_ref && !reservation->consume_locked
+		   && reservation->receipt.ctrc_pending_mask == 0
+		   && reservation->receipt.ctrc_prepared_mask == 0
+		   && reservation->receipt.ctrc_applied_mask == 0
+		   && !reservation->receipt.modifier_admission.entered;
+}
+
+/* Keep cursor batching and termination in the original owner. In particular,
+ * at_stop is only a position; COMPLETE still proves the full discarded range. */
+static XLogRecPtr
+undo_savepoint_rollback_finish(ClusterUndoSavepointControl *control, uint64 deadline)
+{
+	XLogRecPtr cut;
+	bool at_stop = false;
+
+	while (control->cursor.phase != UNDO_SAVEPOINT_ROLLBACK_COMPLETE && !at_stop) {
+		CHECK_FOR_INTERRUPTS();
+		if (!cluster_undo_record_advance_savepoint(control, deadline, &cut, &at_stop))
+			undo_savepoint_cursor_fail();
+	}
+	if (!cluster_undo_record_complete_savepoint(control, deadline, &cut) || XLogRecPtrIsInvalid(cut)
+		|| GetFlushRecPtr(NULL) < cut)
+		undo_savepoint_cursor_fail();
+	return cut;
+}
+
+/* Spec: 2026-10-26-pre2-p013-full-savepoint-design.md, J-C2.
+ * Own the whole live rollback error boundary. Component preparation can return
+ * false or ERROR before PENDING, but this caller already owns accepted DATA;
+ * native child cleanup must never turn that refusal into parent continuation. */
+bool
+cluster_undo_record_rollback_savepoint(ClusterUndoSavepointControl *control, UBA expected_tt_head,
+									   uint64 deadline, XLogRecPtr *cut_out)
+{
+	ClusterUndoSavepointControl *owned = undo_savepoint_control_find(control);
+	ClusterUndoSavepointBounds bounds;
+	XLogRecPtr complete_cut = InvalidXLogRecPtr;
+
+	if (cut_out == NULL)
+		return false;
+	*cut_out = InvalidXLogRecPtr;
+	if (owned == NULL || !cluster_shared_config || !cluster_enabled || !owned->owns_ref
+		|| owned->ref_slot < 0 || !cluster_savepoint_operation_matches_frame(&owned->operation))
+		return false;
+	PG_TRY();
+	{
+		if (!undo_savepoint_rollback_quiesced() || deadline <= (uint64)GetCurrentTimestamp()
+			|| (cluster_undo_pending.active && !cluster_undo_pending_flush_internal(false))
+			|| !undo_savepoint_rollback_quiesced() || cluster_undo_pending.active)
+			undo_savepoint_cursor_fail();
+		if (owned->reserved) {
+			XLogRecPtr head_cut;
+
+			if (!XLogRecPtrIsInvalid(owned->pending_lsn) || !XLogRecPtrIsInvalid(owned->head_lsn)
+				|| !XLogRecPtrIsInvalid(owned->cursor_lsn)
+				|| !cluster_undo_record_savepoint_control_bounds(owned, &bounds))
+				undo_savepoint_cursor_fail();
+			if (!cluster_undo_record_uba_equal(bounds.current_head, bounds.stop_uba)) {
+				if (!cluster_undo_record_publish_savepoint_pending(owned, &bounds, expected_tt_head,
+																   deadline, &head_cut)
+					|| XLogRecPtrIsInvalid(head_cut))
+					undo_savepoint_cursor_fail();
+				complete_cut = undo_savepoint_rollback_finish(owned, deadline);
+			}
+		} else
+			complete_cut = undo_savepoint_rollback_finish(owned, deadline);
+	}
+	PG_CATCH();
+	{
+		/* Original component owners have released their locks/admission.
+		 * Retained controls and APPLIED responsibilities still belong to top. */
+		undo_savepoint_cursor_fail();
+	}
+	PG_END_TRY();
+	*cut_out = complete_cut;
+	return true;
+}
+
 /* Surviving LIVE operations may precede the original completed control.
  * Prove actual retained ancestry, never numeric UBA or sequence order. */
 static void

@@ -216,6 +216,8 @@ XLogFlush(XLogRecPtr cut)
 		head_pipeline_test_flushed = cut;
 	if (complete_test_mode)
 		complete_test_after_flush();
+	else if (rollback_driver_test_mode)
+		rollback_driver_test_after_cursor();
 }
 
 UT_TEST(test_cursor_marks_one_block_before_progress_and_flush)

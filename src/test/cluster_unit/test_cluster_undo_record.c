@@ -145,6 +145,11 @@ static int cursor_test_bad_cut_at, cursor_test_drift_pin, cursor_test_drift_kind
 static bool cursor_test_flush_throw, cursor_test_flush_short;
 static XLogRecPtr cursor_test_last_lsn;
 static bool complete_test_mode;
+static bool rollback_driver_test_mode;
+static int rollback_driver_test_fault;
+static UBA rollback_driver_test_expected;
+static void rollback_driver_test_after_head(void);
+static void rollback_driver_test_after_cursor(void);
 static bool precommit_test_mode, precommit_test_binding_missing, precommit_test_refuse_current;
 static int precommit_test_level = 1;
 static int precommit_test_pins, precommit_test_binding_calls;
@@ -6135,11 +6140,21 @@ UT_TEST(test_exact_zero_abort_keeps_cleanup_after_native_scope_ends)
 #include "test_cluster_undo_savepoint_cursor.inc"
 #include "test_cluster_undo_savepoint_complete.inc"
 #include "test_cluster_undo_savepoint_precommit.inc"
+#include "test_cluster_undo_savepoint_driver.inc"
 
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(244);
+	UT_PLAN(253);
+	UT_RUN(test_rollback_driver_publishes_marks_and_reads_complete);
+	UT_RUN(test_rollback_driver_empty_range_keeps_unused_reservation);
+	UT_RUN(test_rollback_driver_runs_every_physical_block);
+	UT_RUN(test_rollback_driver_repeat_requires_actual_complete_readback);
+	UT_RUN(test_rollback_driver_unknown_handles_clear_output);
+	UT_RUN(test_rollback_driver_never_cancels_unsettled_data);
+	UT_RUN(test_rollback_driver_prepublication_refusal_cannot_resume_parent);
+	UT_RUN(test_rollback_driver_stage_failures_keep_original_responsibility);
+	UT_RUN(test_rollback_driver_post_complete_corruption_is_fatal);
 	UT_RUN(test_precommit_qualifies_complete_after_child_frame_is_gone);
 	UT_RUN(test_precommit_allows_live_prefix_but_requires_control_reachable);
 	UT_RUN(test_precommit_refuses_native_or_canonical_identity_drift);
