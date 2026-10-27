@@ -24,6 +24,20 @@
 #define RESOURCE_X_PROOF_V1_BYTES 312
 #define RESOURCE_X_IMAGE_V2_BYTES 8752
 #define RESOURCE_X_IMAGE_WIRE_VERSION 2
+/* V3 appends an explicit CTRC delegation bundle; V2 bytes stay unchanged.
+ * The wire codec checks framing only. Receiver custody is independent. */
+#define RESOURCE_X_IMAGE_CTRC_WIRE_VERSION 3
+#define RESOURCE_X_CTRC_BUNDLE_VERSION 1
+#define RESOURCE_X_CTRC_RECORD_VERSION 1
+#define RESOURCE_X_CTRC_BUNDLE_HEADER_BYTES 8
+#define RESOURCE_X_CTRC_RECORD_BASE_BYTES 152
+#define RESOURCE_X_CTRC_DELEGATION_HOP_BYTES 72
+#define RESOURCE_X_CTRC_BUNDLE_MAX_BYTES 4096
+#define RESOURCE_X_IMAGE_V3_MIN_BYTES \
+	(RESOURCE_X_IMAGE_V2_BYTES + RESOURCE_X_CTRC_BUNDLE_HEADER_BYTES \
+	 + RESOURCE_X_CTRC_RECORD_BASE_BYTES + RESOURCE_X_CTRC_DELEGATION_HOP_BYTES)
+#define RESOURCE_X_IMAGE_V3_MAX_BYTES \
+	(RESOURCE_X_IMAGE_V2_BYTES + RESOURCE_X_CTRC_BUNDLE_MAX_BYTES)
 #define RESOURCE_X_IMAGE_HAS_WAL UINT16_C(1)
 #define RESOURCE_X_PAGE_BYTES 8192
 #define RESOURCE_X_DEPENDENCY_MAX 16
@@ -310,6 +324,9 @@ typedef struct ResourceXDecodedImageEnvelope {
 	uint16 image_flags;
 	uint8 page_bytes[RESOURCE_X_PAGE_BYTES];
 	ClusterPageWalBindingV1 page_wal;
+	/* Untrusted, versioned bytes: never a receiver-retention certificate. */
+	uint16 ctrc_delegation_bytes;
+	uint8 ctrc_delegation[RESOURCE_X_CTRC_BUNDLE_MAX_BYTES];
 } ResourceXDecodedImageEnvelope;
 
 typedef struct ResourceXDecodedInstallSettlement {

@@ -9284,7 +9284,9 @@ gcs_block_resource_x_payload_candidate(uint8 msg_type, uint32 payload_length)
 	if (msg_type == RESOURCE_X_MSG_IMAGE_OR_GRANT)
 		return payload_length == RESOURCE_X_CONTROL_V1_BYTES
 			   || payload_length == RESOURCE_X_PROOF_V1_BYTES
-			   || payload_length == RESOURCE_X_IMAGE_V2_BYTES;
+			   || payload_length == RESOURCE_X_IMAGE_V2_BYTES
+			   || (payload_length >= RESOURCE_X_IMAGE_V3_MIN_BYTES
+				   && payload_length <= RESOURCE_X_IMAGE_V3_MAX_BYTES);
 	if (msg_type == RESOURCE_X_MSG_BLOCK_TO_N)
 		return payload_length == RESOURCE_X_CONTROL_V1_BYTES
 			   || payload_length == RESOURCE_X_PROOF_V1_BYTES;
@@ -13949,6 +13951,12 @@ gcs_block_try_resource_x_frame(const ClusterICEnvelope *env, const void *payload
 										   &frame, &reject)) {
 		return true;
 	}
+	/* A decoded delegation carrier is not receiver protection. Keep the new
+	 * wire closed before any PCM/join/install side effect until the actual
+	 * local custody registration owns this path. Never fall back to V2. */
+	if (frame.kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE
+		&& frame.body.image_envelope.ctrc_delegation_bytes != 0)
+		return true;
 	cluster_pcm_lock_resource_x_trace_frame(RESOURCE_X_TRACE_RECEIVE, &frame,
 											(int32)env->source_node_id, 0);
 	if (env->epoch != cluster_epoch_get_current()) {
