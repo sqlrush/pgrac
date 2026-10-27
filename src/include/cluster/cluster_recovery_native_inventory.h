@@ -420,6 +420,22 @@ typedef struct ClusterRecoveryRelmapPendingBirthV1 {
 extern bool cluster_recovery_relmap_history_pending_birth_v1(
 	ClusterRecoveryRelmapHistory *history, const ClusterRelmapV2Image *pending,
 	ClusterRecoveryRelmapPendingBirthV1 *out, ClusterRecoveryNativeInventoryDiag *diag);
+/* Joint input only: run both original native-counter/birth and complete
+ * sealed-SIDE terminal visitors during ONE physical reread, bracketed by
+ * the original same-held-fd native CLOG reads. Require the same complete
+ * source/history and map-before-terminal positions before publication.
+ * No caller certificate, new scope or independently qualified lifetime.
+ * Whole expanded-output/caller-lock preconditions preserve custody;
+ * entered false/ERROR fails the original episode, retaining FD/pins/debt.
+ * Era/no-reuse/continuous lifetime/full dual-copy/joint COMPLETE and release
+ * still require their original conjunction. Neither old API is replaced. */
+typedef struct ClusterRecoveryRelmapPendingNativeV1 {
+	ClusterRecoveryRelmapPendingBirthV1 birth;
+	ClusterRecoveryRelmapPendingTerminalV1 terminal;
+} ClusterRecoveryRelmapPendingNativeV1;
+extern bool cluster_recovery_relmap_history_pending_native_v1(
+	ClusterRecoveryRelmapHistory *history, const ClusterRelmapV2Image *pending,
+	ClusterRecoveryRelmapPendingNativeV1 *out, ClusterRecoveryNativeInventoryDiag *diag);
 extern void cluster_recovery_relmap_history_destroy_v1(ClusterRecoveryRelmapHistory **history);
 
 /* Borrow the original startup cold scope for two complete physical passes.
