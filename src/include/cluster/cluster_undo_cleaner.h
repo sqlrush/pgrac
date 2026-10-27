@@ -101,6 +101,10 @@ typedef struct ClusterUndoCleanerActiveSample {
 	pid_t worker_pid;
 } ClusterUndoCleanerActiveSample;
 
+/* Bit positions match ClusterUndoRetainReason; these are observations only. */
+#define CLUSTER_UNDO_CAPACITY_RETAIN_STATS_V1 1
+#define CLUSTER_UNDO_CAPACITY_RETAIN_REASON_COUNT 9
+
 /* Postmaster-lifetime diagnostics for this origin's existing capacity wait.
  * Counts do not prove pool coverage, owner progress, or reusable capacity. */
 typedef struct ClusterUndoCapacityStats {
@@ -111,6 +115,7 @@ typedef struct ClusterUndoCapacityStats {
 	uint64 cancel_count;
 	uint64 refused_context_count;
 	uint64 refused_proof_count;
+	uint64 retain_by_reason[CLUSTER_UNDO_CAPACITY_RETAIN_REASON_COUNT];
 } ClusterUndoCapacityStats;
 
 
@@ -161,6 +166,7 @@ typedef struct UndoCleanerSharedState {
 	uint64 capacity_wait_refused_context;
 	uint64 capacity_wait_refused_proof;
 	pg_atomic_uint64 capacity_wait_cancelled;
+	uint64 retain_by_reason[CLUSTER_UNDO_CAPACITY_RETAIN_REASON_COUNT];
 
 	/*
 	 * D6 pass counters (spec-3.13 step 8 fills; zero-init).  Updated by

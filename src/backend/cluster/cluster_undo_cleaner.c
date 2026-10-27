@@ -241,6 +241,8 @@ cluster_undo_cleaner_capacity_stats_snapshot(ClusterUndoCapacityStats *out)
 	snapshot.refused_context_count = undo_cleaner_state->capacity_wait_refused_context;
 	snapshot.refused_proof_count = undo_cleaner_state->capacity_wait_refused_proof;
 	snapshot.cancel_count = pg_atomic_read_u64(&undo_cleaner_state->capacity_wait_cancelled);
+	memcpy(snapshot.retain_by_reason, undo_cleaner_state->retain_by_reason,
+		   sizeof(snapshot.retain_by_reason));
 	LWLockRelease(&undo_cleaner_state->lwlock);
 	*out = snapshot;
 	return true;
@@ -549,6 +551,16 @@ undo_cleaner_capacity_probe(uint32 segment_id, const ClusterUndoHorizonFloor *fl
 	}
 	reason = cluster_ctrc_capacity_probe_pool_segment_v1(segment_id, floor->scn, floor->epoch,
 														 &prior, &observation);
+	/* Count the qualified observation, not distinct segments or readers.
+	 * A recheck can observe the same cause again. Unknown bits cannot index
+	 * the counters, and none of these diagnostics changes the decision. */
+	if (reason == CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER && observation.retain_reasons != 0) {
+		LWLockAcquire(&undo_cleaner_state->lwlock, LW_EXCLUSIVE);
+		for (unsigned bit = 0; bit < lengthof(undo_cleaner_state->retain_by_reason); bit++)
+			if ((observation.retain_reasons & (UINT32_C(1) << bit)) != 0)
+				undo_cleaner_state->retain_by_reason[bit]++;
+		LWLockRelease(&undo_cleaner_state->lwlock);
+	}
 	if (reason == CLUSTER_CAPACITY_OWNER_PROGRESS_POSSIBLE) {
 		ClusterCtrcTxnKeyV1 empty;
 

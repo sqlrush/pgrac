@@ -67,6 +67,7 @@ static ClusterCtrcCapacityProbeResult test_proof;
 static void (*test_capacity_probe_hook)(void);
 static ClusterCapacityReasonV1 test_pool_reason;
 static unsigned test_pool_calls;
+static uint32 test_pool_retain_reasons;
 static void (*test_pool_probe_hook)(void);
 static bool test_clear_current_continuation;
 static unsigned test_continuation_calls;
@@ -591,6 +592,7 @@ cluster_ctrc_capacity_probe_pool_v1(uint32 segment, SCN horizon, uint64 epoch,
 	test_pool_calls++;
 	MemSet(observation, 0, sizeof(*observation));
 	observation->reason = test_pool_reason;
+	observation->retain_reasons = test_pool_retain_reasons;
 	observation->key.segment_id = 256;
 	observation->key.xid = 9123;
 	observation->key.slot_wrap = 3;
@@ -774,6 +776,7 @@ reset_wait_fixture(void)
 	test_wait_event = last_sleep_event = 0;
 	test_proof = CLUSTER_CTRC_CAPACITY_WAIT;
 	test_capacity_probe_hook = NULL;
+	test_pool_retain_reasons = 0;
 	test_pool_reason = CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER;
 	test_pool_calls = 0;
 	test_segment_owner = false;
@@ -2366,10 +2369,80 @@ UT_TEST(test_zero_key_segment_owner_change_and_cancel_keep_original_cleanup)
 	}
 }
 
+
+static uint64
+capacity_stats_retain_count(const ClusterUndoCapacityStats *stats, unsigned bit)
+{
+#ifdef CLUSTER_UNDO_CAPACITY_RETAIN_STATS_V1
+	return stats->retain_by_reason[bit];
+#else
+	(void)stats;
+	(void)bit;
+	return 0;
+#endif
+}
+
+UT_TEST(test_capacity_retention_snapshot_preserves_zero_unsigned_and_unavailable)
+{
+	static const uint64 expected[]
+		= { UINT64_MAX, UINT64_C(9223372036854775809), 3, 5, 7, 11, 13, 17, 19 };
+	ClusterUndoCapacityStats stats, before;
+	UndoCleanerSharedState *saved;
+
+	reset_wait_fixture();
+	UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&stats));
+	for (unsigned bit = 0; bit < lengthof(expected); bit++)
+		UT_ASSERT_EQ(capacity_stats_retain_count(&stats, bit), 0);
+#ifdef CLUSTER_UNDO_CAPACITY_RETAIN_STATS_V1
+	memcpy(undo_cleaner_state->retain_by_reason, expected, sizeof(expected));
+#endif
+	UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&stats));
+	for (unsigned bit = 0; bit < lengthof(expected); bit++)
+		UT_ASSERT_EQ(capacity_stats_retain_count(&stats, bit), expected[bit]);
+	before = stats;
+	saved = undo_cleaner_state;
+	undo_cleaner_state = NULL;
+	UT_ASSERT(!cluster_undo_cleaner_capacity_stats_snapshot(&stats));
+	UT_ASSERT_EQ(memcmp(&stats, &before, sizeof(stats)), 0);
+	undo_cleaner_state = saved;
+	UT_ASSERT_EQ(test_lock_depth, 0);
+	UT_ASSERT_EQ(slept, 0);
+}
+
+UT_TEST(test_capacity_retention_counts_known_bits_only_on_original_refusal)
+{
+	static const ClusterCapacityReasonV1 reasons[]
+		= { CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER, CLUSTER_CAPACITY_OWNER_PROGRESS_POSSIBLE,
+			CLUSTER_CAPACITY_SUPPLY_RECHECK };
+
+	for (unsigned mode = 0; mode < lengthof(reasons); mode++) {
+		ClusterCtrcTxnKeyV1 continuation = { 0 };
+		ClusterUndoCapacityStats stats;
+
+		reset_wait_fixture();
+		test_proof = CLUSTER_CTRC_CAPACITY_REFUSE;
+		test_pool_reason = reasons[mode];
+		test_pool_retain_reasons = UINT32_C(0x800001ff);
+		UT_ASSERT_EQ(cluster_undo_cleaner_wait_for_capacity(1, &continuation), mode != 0);
+		UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&stats));
+		for (unsigned bit = 0; bit < 9; bit++)
+			UT_ASSERT_EQ(capacity_stats_retain_count(&stats, bit), mode == 0 ? 1 : 0);
+		UT_ASSERT_EQ(stats.refused_proof_count, mode == 0 ? 1 : 0);
+		UT_ASSERT_EQ(stats.pool_wait_count, mode == 1 ? 1 : 0);
+		UT_ASSERT_EQ(stats.wakeup_recheck_count, mode == 1 ? 1 : 0);
+		UT_ASSERT_EQ(slept, mode == 1 ? 1 : 0);
+		UT_ASSERT_EQ(test_lock_depth, 0);
+		UT_ASSERT_EQ(cancelled, 1);
+		UT_ASSERT(!subscribed);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(53);
+	UT_PLAN(55);
+	UT_RUN(test_capacity_retention_snapshot_preserves_zero_unsigned_and_unavailable);
+	UT_RUN(test_capacity_retention_counts_known_bits_only_on_original_refusal);
 	UT_RUN(test_zero_key_segment_wait_uses_exact_worker_and_fresh_probe);
 	UT_RUN(test_zero_key_segment_wait_refuses_malformed_identity);
 	UT_RUN(test_zero_key_segment_owner_change_and_cancel_keep_original_cleanup);

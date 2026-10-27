@@ -9978,11 +9978,12 @@ test_cluster_ctrc_itl_reuse test_cluster_ctrc_successor_fence: test_cluster_ctrc
 
 # Same actual producer-to-consumer path, including the original CV cleanup.
 test_cluster_ctrc_capacity_wait.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_cleaner.c Makefile
-	awk '/^undo_cleaner_capacity_owner_generation_locked\(/ { print "static uint64"; emit=1; found++ } \
+	awk '/^cluster_undo_cleaner_capacity_stats_snapshot\(/ { print "bool"; emit=1; found++ } \
+	     /^undo_cleaner_capacity_owner_generation_locked\(/ { print "static uint64"; emit=1; found++ } \
 	     /^undo_cleaner_capacity_segment_worker\(/ { print "static bool"; emit=1; found++ } \
 	     /^undo_cleaner_capacity_probe\(/ { print "static ClusterCtrcCapacityProbeResult"; emit=1; found++ } \
 	     /^cluster_undo_cleaner_wait_for_capacity\(/ { print "bool"; emit=1; found++ } \
-	     emit { print } /^}$$/ { emit=0 } END { if (found != 4 || emit) exit 1 }' $< > $@.tmp
+	     emit { print } /^}$$/ { emit=0 } END { if (found != 5 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 clean distclean maintainer-clean: clean-ctrc-capacity-wait

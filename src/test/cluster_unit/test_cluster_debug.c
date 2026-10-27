@@ -3458,6 +3458,7 @@ cluster_undo_cleaner_main_loop_iters(void)
 
 /* Cross-module monitoring accessors; no cleaner is started by this fixture. */
 static bool capacity_stats_available = true;
+static uint64 capacity_retention_counts[9];
 
 bool
 cluster_undo_cleaner_capacity_stats_snapshot(ClusterUndoCapacityStats *out)
@@ -3472,6 +3473,9 @@ cluster_undo_cleaner_capacity_stats_snapshot(ClusterUndoCapacityStats *out)
 	out->cancel_count = 17;
 	out->refused_context_count = 19;
 	out->refused_proof_count = 23;
+#ifdef CLUSTER_UNDO_CAPACITY_RETAIN_STATS_V1
+	memcpy(out->retain_by_reason, capacity_retention_counts, sizeof(capacity_retention_counts));
+#endif
 	return true;
 }
 
@@ -5793,6 +5797,44 @@ UT_TEST(test_debug_dump_exposes_capacity_counts_without_fake_zero_or_signed_wrap
 	}
 }
 
+
+UT_TEST(test_debug_dump_retention_observations_preserve_availability_and_unsigned_values)
+{
+	LOCAL_FCINFO(fcinfo, 0);
+	ReturnSetInfo rsinfo;
+	static const char *const keys[]
+		= { "undo_retain_by_reason.active_or_prepared",	 "undo_retain_by_reason.record_writer",
+			"undo_retain_by_reason.seal_or_drain",		 "undo_retain_by_reason.horizon_missing",
+			"undo_retain_by_reason.history_pin",		 "undo_retain_by_reason.reference_pending",
+			"undo_retain_by_reason.release_not_durable", "undo_retain_by_reason.publisher_pending",
+			"undo_retain_by_reason.identity_or_io" };
+	static const uint64 counts[]
+		= { UINT64_MAX, UINT64_C(9223372036854775809), 3, 5, 7, 11, 13, 17, 19 };
+	static const char *const values[]
+		= { "18446744073709551615", "9223372036854775809", "3", "5", "7", "11", "13", "17", "19" };
+
+	for (unsigned mode = 0; mode < 3; mode++) {
+		memset(fcinfo, 0, SizeForFunctionCallInfo(0));
+		memset(&rsinfo, 0, sizeof(rsinfo));
+		captured_dump_row_count = captured_formatted_value_count = 0;
+		fcinfo->resultinfo = (fmNodePtr)&rsinfo;
+		capacity_stats_available = mode != 0;
+		memset(capacity_retention_counts, 0, sizeof(capacity_retention_counts));
+		if (mode == 2)
+			memcpy(capacity_retention_counts, counts, sizeof(counts));
+		(void)cluster_dump_state(fcinfo);
+		UT_ASSERT_EQ(captured_dump_count("undo_cleaner", "tt_capacity_stats_available"), 1);
+		for (unsigned bit = 0; bit < lengthof(keys); bit++) {
+			UT_ASSERT_EQ(captured_dump_count("undo_cleaner", keys[bit]), mode == 0 ? 0 : 1);
+			if (mode != 0 && captured_dump_count("undo_cleaner", keys[bit]) == 1)
+				UT_ASSERT_STR_EQ(captured_dump_value("undo_cleaner", keys[bit]),
+								 mode == 2 ? values[bit] : "0");
+		}
+	}
+	capacity_stats_available = true;
+	memset(capacity_retention_counts, 0, sizeof(capacity_retention_counts));
+}
+
 UT_TEST(test_debug_dump_exposes_retained_rollover_counts_without_fake_zero)
 {
 	LOCAL_FCINFO(fcinfo, 0);
@@ -6458,7 +6500,8 @@ UT_TEST(test_debug_phase_symbol_present)
 int
 main(void)
 {
-	UT_PLAN(27);
+	UT_PLAN(28);
+	UT_RUN(test_debug_dump_retention_observations_preserve_availability_and_unsigned_values);
 	UT_RUN(test_debug_dump_exposes_native_drop_context_and_real_io_observation);
 	UT_RUN(test_debug_dump_exposes_pcm_first_refusal_identity_and_subpredicate);
 	UT_RUN(test_debug_dump_normal_completion_never_fabricates_unready_proof);

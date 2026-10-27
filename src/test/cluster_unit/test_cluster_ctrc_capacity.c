@@ -4892,10 +4892,161 @@ UT_TEST(test_capacity_retention_diagnostics_discard_unproven_sample_identity)
 	test_cluster_epoch = 13;
 }
 
+
+/* Older snapshots have no retained-observation counters. Keep the actual
+ * parent consumer and getter intact so a missing count is a behavioral RED. */
+static uint64
+capacity_retain_count(const ClusterUndoCapacityStats *stats, unsigned bit)
+{
+#ifdef CLUSTER_UNDO_CAPACITY_RETAIN_STATS_V1
+	return stats->retain_by_reason[bit];
+#else
+	(void)stats;
+	(void)bit;
+	return 0;
+#endif
+}
+
+UT_TEST(test_actual_retention_rejections_reach_origin_observation_counts)
+{
+	static const unsigned expected[][9] = { { 0, 0, 0, 0, 0, 0, 1, 0, 0 },
+											{ 0, 0, 0, 0, 0, 1, 0, 0, 0 },
+											{ 0, 0, 0, 0, 1, 0, 0, 0, 0 },
+											{ 1, 0, 0, 0, 0, 0, 0, 0, 0 },
+											{ 0, 0, 1, 0, 0, 0, 0, 0, 0 } };
+
+	for (unsigned fault = 0; fault < lengthof(expected); fault++) {
+		ClusterCtrcTxnKeyV1 continuation = { 0 };
+		ClusterUndoCapacityStats stats;
+		UndoSegmentHeaderData before;
+
+		reset_segment_wait();
+		if (fault == 0)
+			sample_header.tt_slots[46].flags = 0;
+		if (fault == 1)
+			sample_header.tt_slots[46].first_undo_block.raw[0] = 1;
+		if (fault == 2)
+			sample_header.tt_slots[46].commit_scn = 1001;
+		if (fault == 3)
+			sample_header.tt_slots[46].status = TT_SLOT_ACTIVE;
+		if (fault == 4)
+			sample_header.tail_block = 1;
+		before = sample_header;
+		for (unsigned pass = 1; pass <= 20; pass++) {
+			unsigned holds = sample_holds;
+			unsigned observation;
+
+			UT_ASSERT(!cluster_undo_cleaner_wait_for_capacity(1, &continuation));
+			UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&stats));
+			/* The fair physical cursor need not revisit segment2 next pass. */
+			observation = segment_reads[1];
+			UT_ASSERT(observation == 1 || observation == 2);
+			UT_ASSERT_EQ(stats.origin_node_id, 0);
+			for (unsigned bit = 0; bit < 9; bit++)
+				UT_ASSERT_EQ(capacity_retain_count(&stats, bit),
+							 expected[fault][bit] * observation);
+			UT_ASSERT_EQ(stats.refused_proof_count, pass);
+			UT_ASSERT_EQ(stats.pool_wait_count, 0);
+			UT_ASSERT_EQ(stats.wakeup_recheck_count, 0);
+			UT_ASSERT(sample_holds > holds);
+			UT_ASSERT(sample_holds - holds
+					  <= TT_SLOTS_PER_SEGMENT + CTRC_CLEANER_CERTIFICATE_BATCH);
+			UT_ASSERT_EQ(capacity_cancels, pass);
+			UT_ASSERT_EQ(memcmp(&sample_header, &before, sizeof(before)), 0);
+			UT_ASSERT(ctrc_bytes_zero(&continuation, sizeof(continuation)));
+			UT_ASSERT_EQ(capacity_wait_event, 41);
+			UT_ASSERT_EQ(sample_admission_debt, 0);
+			UT_ASSERT_EQ(sample_holds, sample_releases);
+			UT_ASSERT_EQ(sample_enters, sample_leaves);
+			UT_ASSERT_EQ(held_count, 0);
+			UT_ASSERT(!native_cleaner_lock_held);
+			if (observation == 2)
+				break;
+		}
+		UT_ASSERT_EQ(segment_reads[1], 2);
+		UT_ASSERT_EQ(capacity_sleeps, 0);
+		UT_ASSERT(!capacity_subscribed);
+	}
+}
+
+UT_TEST(test_actual_combined_retention_causes_count_each_observed_reason_once)
+{
+	static const unsigned expected[] = { 1, 0, 1, 0, 1, 1, 1, 0, 0 };
+	ClusterCtrcTxnKeyV1 continuation = { 0 };
+	ClusterUndoCapacityStats stats;
+
+	reset_segment_wait();
+	sample_header.tt_slots[46].flags = 0;
+	sample_header.tt_slots[46].first_undo_block.raw[0] = 1;
+	sample_header.tt_slots[46].commit_scn = 1001;
+	sample_header.tt_slots[47].status = TT_SLOT_ACTIVE;
+	sample_header.tail_block = 1;
+	UT_ASSERT(!cluster_undo_cleaner_wait_for_capacity(1, &continuation));
+	UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&stats));
+	for (unsigned bit = 0; bit < lengthof(expected); bit++)
+		UT_ASSERT_EQ(capacity_retain_count(&stats, bit), expected[bit]);
+	UT_ASSERT_EQ(stats.refused_proof_count, 1);
+	UT_ASSERT_EQ(capacity_sleeps, 0);
+	UT_ASSERT_EQ(sample_holds, sample_releases);
+	UT_ASSERT_EQ(sample_enters, sample_leaves);
+	UT_ASSERT_EQ(sample_admission_debt, 0);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_actual_invalid_retention_identity_and_owner_work_do_not_count)
+{
+	for (unsigned fault = 0; fault < 10; fault++) {
+		ClusterCtrcTxnKeyV1 continuation = { 0 };
+		ClusterUndoCapacityStats stats;
+
+		reset_segment_wait();
+		sample_header.tt_slots[46].commit_scn = 1001;
+		if (fault == 0)
+			segment_root_drift = true;
+		if (fault == 1)
+			segment_generation_drift = true;
+		if (fault == 2)
+			sample_release_failure = true;
+		if (fault == 3)
+			sample_admitted = false;
+		if (fault == 4)
+			sample_recheck = false;
+		if (fault >= 5 && fault < 8) {
+			segment_drift = fault == 5 ? 0 : fault == 6 ? 1 : 2;
+			sample_release_hook = unarmed_segment_changes_after_sample;
+		}
+		if (fault >= 8)
+			sample_header.tt_slots[46].commit_scn = 1000;
+		if (fault == 9) {
+			segment_drift = 1;
+			sample_release_hook = unarmed_segment_changes_after_sample;
+		}
+		UT_ASSERT_EQ(cluster_undo_cleaner_wait_for_capacity(1, &continuation),
+					 fault == 6 || fault >= 8);
+		UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&stats));
+		for (unsigned bit = 0; bit < 9; bit++)
+			UT_ASSERT_EQ(capacity_retain_count(&stats, bit), 0);
+		UT_ASSERT_EQ(capacity_sleeps, fault == 8 ? 1 : 0);
+		UT_ASSERT_EQ(stats.pool_wait_count, fault == 8 ? 1 : 0);
+		UT_ASSERT_EQ(stats.refused_proof_count, fault == 6 || fault >= 8 ? 0 : 1);
+		UT_ASSERT_EQ(capacity_cancels, 1);
+		UT_ASSERT(!capacity_subscribed);
+		UT_ASSERT_EQ(sample_holds, sample_releases);
+		UT_ASSERT_EQ(sample_enters, sample_leaves);
+		UT_ASSERT_EQ(sample_admission_debt, 0);
+		UT_ASSERT_EQ(held_count, 0);
+		UT_ASSERT(!native_cleaner_lock_held);
+	}
+	test_cluster_epoch = 13;
+}
+
 int
 main(void)
 {
-	UT_PLAN(94);
+	UT_PLAN(97);
+	UT_RUN(test_actual_retention_rejections_reach_origin_observation_counts);
+	UT_RUN(test_actual_combined_retention_causes_count_each_observed_reason_once);
+	UT_RUN(test_actual_invalid_retention_identity_and_owner_work_do_not_count);
 	UT_RUN(test_retired_admission_observation_reaches_original_cleaner_cv);
 	UT_RUN(test_original_cleaner_rejects_missing_retired_admission_identity);
 	UT_RUN(test_retired_admission_refusal_never_sleeps_or_retains_debt);

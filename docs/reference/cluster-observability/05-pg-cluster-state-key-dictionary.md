@@ -239,6 +239,22 @@
 | `undo_cleaner_last_liveness_tick_at` | 时间戳文本或 `(unset)` | undo / `cleaner` / 最近 / `liveness` / `tick`的时间戳。 | 与同分类其他键组成快照，不单独作为 authority 证明。 |
 | `undo_cleaner_main_loop_iters` | 十进制整数文本 | undo / `cleaner` / `main` / `loop` / `iters`的当前快照值。 | 与同分类其他键组成快照，不单独作为 authority 证明。 |
 
+容量诊断的 `tt_capacity_stats_available` 表示本实例统计快照是否可用。为 `false` 时不输出下面的原因计数；为 `true` 时，`tt_capacity_origin_node_id` 标识来源，计数以无符号十进制文本输出。计数在 postmaster 重启后归零，cleaner worker 重启不清零。
+
+| key | 含义 |
+|---|---|
+| `undo_retain_by_reason.active_or_prepared` | 观察到活动或未解决事务占用的次数。 |
+| `undo_retain_by_reason.record_writer` | 观察到记录写入者保护的次数。 |
+| `undo_retain_by_reason.seal_or_drain` | 观察到记录封存或清偿前置未满足的次数。 |
+| `undo_retain_by_reason.horizon_missing` | 观察到缺少合格保留下界的次数。 |
+| `undo_retain_by_reason.history_pin` | 观察到历史 SCN 仍受保留下界限制的次数。 |
+| `undo_retain_by_reason.reference_pending` | 观察到仍有 undo 引用的次数。 |
+| `undo_retain_by_reason.release_not_durable` | 观察到缺少耐久释放证据的次数。 |
+| `undo_retain_by_reason.publisher_pending` | 观察到释放发表者交接未完成的次数。 |
+| `undo_retain_by_reason.identity_or_io` | 观察到无法确认样本身份或读取结果的次数。 |
+
+这些计数记录容量检查中合格样本的原因观察，不是当前段数、不同段数或全池扫描结果。一次观察可以使多个原因分别增加，重复检查同一原因也会再次增加。没有实际原因样本的类别保持零；零不证明该类保护不存在。`history_pin` 不单独证明有长读者，任何计数均不表示容量已经可复用。分析时比较同一来源在时间窗内的增量，并结合原等待和错误信息。
+
 ## category = `xid_stripe`
 
 | key | 值形态 | 含义 | 运维解释 |

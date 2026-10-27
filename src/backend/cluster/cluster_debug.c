@@ -978,6 +978,17 @@ dump_undo_cleaner(ReturnSetInfo *rsinfo)
 	emit_row(rsinfo, "undo_cleaner", "tt_capacity_stats_available",
 			 capacity_available ? "true" : "false");
 	if (capacity_available) {
+		static const char *const retain_keys[CLUSTER_UNDO_CAPACITY_RETAIN_REASON_COUNT] = {
+			"undo_retain_by_reason.active_or_prepared",	 "undo_retain_by_reason.record_writer",
+			"undo_retain_by_reason.seal_or_drain",		 "undo_retain_by_reason.horizon_missing",
+			"undo_retain_by_reason.history_pin",		 "undo_retain_by_reason.reference_pending",
+			"undo_retain_by_reason.release_not_durable", "undo_retain_by_reason.publisher_pending",
+			"undo_retain_by_reason.identity_or_io"
+		};
+
+		for (unsigned bit = 0; bit < lengthof(retain_keys); bit++)
+			emit_row(rsinfo, "undo_cleaner", retain_keys[bit],
+					 fmt_uint64(capacity.retain_by_reason[bit]));
 		emit_row(rsinfo, "undo_cleaner", "tt_capacity_origin_node_id",
 				 fmt_int32(capacity.origin_node_id));
 		emit_row(rsinfo, "undo_cleaner", "tt_slot_active_full_wait_count",
