@@ -37,6 +37,7 @@
 #include "storage/shmem.h"
 #include "utils/wait_event.h"
 
+#include "cluster/cluster_guc.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_terminal_authority.h"
 #include "cluster/cluster_tt_durable.h"
@@ -75,6 +76,13 @@ typedef struct ClusterTTDurableShared {
 	pg_atomic_uint64 terminal_authority_nonterminal_failclosed;
 	pg_atomic_uint64 terminal_authority_durable_failclosed;
 	pg_atomic_uint64 terminal_authority_retention_failclosed;
+
+	/* Calls and normal results of the any-state locator, not SCN queries. */
+	pg_atomic_uint64 locator_fallback_count;
+	pg_atomic_uint64 locator_found_count;
+	pg_atomic_uint64 locator_missing_count;
+	pg_atomic_uint64 locator_ambiguous_count;
+	pg_atomic_uint64 locator_unavailable_count;
 } ClusterTTDurableShared;
 
 #ifdef USE_PGRAC_CLUSTER
@@ -122,6 +130,11 @@ cluster_tt_durable_shmem_init(void)
 		pg_atomic_init_u64(&TTDurableShared->terminal_authority_nonterminal_failclosed, 0);
 		pg_atomic_init_u64(&TTDurableShared->terminal_authority_durable_failclosed, 0);
 		pg_atomic_init_u64(&TTDurableShared->terminal_authority_retention_failclosed, 0);
+		pg_atomic_init_u64(&TTDurableShared->locator_fallback_count, 0);
+		pg_atomic_init_u64(&TTDurableShared->locator_found_count, 0);
+		pg_atomic_init_u64(&TTDurableShared->locator_missing_count, 0);
+		pg_atomic_init_u64(&TTDurableShared->locator_ambiguous_count, 0);
+		pg_atomic_init_u64(&TTDurableShared->locator_unavailable_count, 0);
 	}
 }
 
@@ -174,6 +187,57 @@ cluster_tt_durable_count_redo_apply(void)
 {
 	if (TTDurableShared != NULL)
 		pg_atomic_fetch_add_u64(&TTDurableShared->redo_apply_count, 1);
+}
+
+void
+cluster_tt_durable_count_locator_call(void)
+{
+	if (TTDurableShared != NULL)
+		pg_atomic_fetch_add_u64(&TTDurableShared->locator_fallback_count, 1);
+}
+
+void
+cluster_tt_durable_count_locator_result(ClusterTTDurableLocate result)
+{
+	pg_atomic_uint64 *counter;
+
+	if (TTDurableShared == NULL)
+		return;
+	switch (result) {
+	case CLUSTER_TT_DURABLE_LOCATE_FOUND:
+		counter = &TTDurableShared->locator_found_count;
+		break;
+	case CLUSTER_TT_DURABLE_LOCATE_MISSING:
+		counter = &TTDurableShared->locator_missing_count;
+		break;
+	case CLUSTER_TT_DURABLE_LOCATE_AMBIGUOUS:
+		counter = &TTDurableShared->locator_ambiguous_count;
+		break;
+	case CLUSTER_TT_DURABLE_LOCATE_SCAN_UNAVAILABLE:
+		counter = &TTDurableShared->locator_unavailable_count;
+		break;
+	default:
+		return;
+	}
+	pg_atomic_fetch_add_u64(counter, 1);
+}
+
+bool
+cluster_tt_durable_locator_stats_snapshot(ClusterTTDurableLocatorStats *out)
+{
+	ClusterTTDurableLocatorStats snapshot;
+
+	if (TTDurableShared == NULL || out == NULL || cluster_node_id < 0)
+		return false;
+	MemSet(&snapshot, 0, sizeof(snapshot));
+	snapshot.origin_node_id = cluster_node_id;
+	snapshot.fallback_count = pg_atomic_read_u64(&TTDurableShared->locator_fallback_count);
+	snapshot.found_count = pg_atomic_read_u64(&TTDurableShared->locator_found_count);
+	snapshot.missing_count = pg_atomic_read_u64(&TTDurableShared->locator_missing_count);
+	snapshot.ambiguous_count = pg_atomic_read_u64(&TTDurableShared->locator_ambiguous_count);
+	snapshot.unavailable_count = pg_atomic_read_u64(&TTDurableShared->locator_unavailable_count);
+	*out = snapshot;
+	return true;
 }
 
 /* ------------------------------------------------------------ */
@@ -303,6 +367,23 @@ TT_DURABLE_ACCESSOR(cluster_terminal_authority_retention_failclosed_count,
 					terminal_authority_retention_failclosed)
 
 #else /* !USE_PGRAC_CLUSTER */
+
+void
+cluster_tt_durable_count_locator_call(void)
+{}
+
+void
+cluster_tt_durable_count_locator_result(ClusterTTDurableLocate result)
+{
+	(void)result;
+}
+
+bool
+cluster_tt_durable_locator_stats_snapshot(ClusterTTDurableLocatorStats *out)
+{
+	(void)out;
+	return false;
+}
 
 Size
 cluster_tt_durable_shmem_size(void)

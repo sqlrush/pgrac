@@ -6233,6 +6233,7 @@ clean distclean maintainer-clean:
 		test_cluster_fresh_boolean.inc test_cluster_fresh_index.inc test_cluster_fresh_utility.inc \
 		test_cluster_fresh_catalog_index.inc test_cluster_shared_utility.inc
 	rm -f $(TESTS) pgrac_fenced_live_rejoin_client probe_pgrac_fenced_cib \
+		test_cluster_tt_locator_stats.inc \
 		test_cluster_heap_inplace_version.inc test_cluster_heap_inplace_legacy_version.inc \
 		test_cluster_heap_confirm_version.inc test_cluster_heap_spec_abort_version.inc \
 		test_cluster_heap_confirm_capture.inc test_cluster_heap_spec_abort_capture.inc \
@@ -8683,6 +8684,27 @@ test_cluster_tt_durable test_cluster_tt_rollback_entry test_cluster_tt_abort_own
 test_cluster_tt_active_owner test_cluster_tt_slot_allocator: \
 		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h \
 		$(top_srcdir)/src/include/cluster/cluster_tt_slot.h
+
+# Exact shmem initialization and locator metrics for the existing TT fixture.
+# The old source has2 functions; the versioned source must supply all5.
+test_cluster_tt_locator_stats.inc: $(top_srcdir)/src/backend/cluster/cluster_tt_durable_stat.c \
+		$(top_srcdir)/src/include/cluster/cluster_tt_durable.h Makefile
+	awk 'FNR == NR { if (/^#define CLUSTER_TT_DURABLE_LOCATOR_STATS_V1 1/) metrics=3; next } \
+	     /^#else \/\* !USE_PGRAC_CLUSTER \*\// { exit } \
+	     /^typedef struct ClusterTTDurableShared/ { fields=1; types++ } \
+	     fields { print; if (/^} ClusterTTDurableShared;/) fields=0; next } \
+	     /^static ClusterTTDurableShared \*TTDurableShared/ { print; pointers++ } \
+	     /^cluster_tt_durable_shmem_size\(/ { print "Size"; emit=1; basic++ } \
+	     /^cluster_tt_durable_shmem_init\(/ { print "void"; emit=1; basic++ } \
+	     /^cluster_tt_durable_count_locator_(call|result)\(/ { print "void"; emit=1; hooks++ } \
+	     /^cluster_tt_durable_locator_stats_snapshot\(/ { print "bool"; emit=1; hooks++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (types != 1 || pointers != 1 || basic != 2 || hooks != metrics || emit) exit 1 }' \
+		$(top_srcdir)/src/include/cluster/cluster_tt_durable.h $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_tt_durable test_cluster_tt_abort_owner test_cluster_tt_active_owner \
+		test_cluster_tt_rollback_entry test_cluster_tt_terminal_trace: test_cluster_tt_locator_stats.inc
 
 # spec-3.11 D2/D9: test_cluster_tt_durable — pure decision predicates
 # (redo wrap table / slot match) + lookup / by-xid scan with a mocked

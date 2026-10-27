@@ -503,6 +503,22 @@ extern void cluster_tt_durable_count_lookup(bool hit);
 extern void cluster_tt_durable_count_by_xid_scan(void);
 extern void cluster_tt_durable_count_redo_apply(void);
 
+/* Local postmaster-lifetime locator diagnostics, independent atomic samples.
+ * A FOUND identity is not terminal authority. False preserves the output. */
+#define CLUSTER_TT_DURABLE_LOCATOR_STATS_V1 1
+typedef struct ClusterTTDurableLocatorStats {
+	int32 origin_node_id;
+	uint64 fallback_count;
+	uint64 found_count;
+	uint64 missing_count;
+	uint64 ambiguous_count;
+	uint64 unavailable_count;
+} ClusterTTDurableLocatorStats;
+
+extern void cluster_tt_durable_count_locator_call(void);
+extern void cluster_tt_durable_count_locator_result(ClusterTTDurableLocate result);
+extern bool cluster_tt_durable_locator_stats_snapshot(ClusterTTDurableLocatorStats *out);
+
 /* wait-event bracket hooks (WAIT_EVENT_UNDO_TT_DURABLE_IO). */
 extern void cluster_tt_durable_io_wait_start(void);
 extern void cluster_tt_durable_io_wait_end(void);

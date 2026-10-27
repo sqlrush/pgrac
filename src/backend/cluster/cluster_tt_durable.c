@@ -2192,8 +2192,11 @@ cluster_tt_slot_durable_locate_any_by_xid_origin(int origin_node, TransactionId 
 	uint16 matched_wrap = 0;
 	uint8 matched_status = TT_SLOT_INVALID;
 
-	if (origin_node < 0 || !TransactionIdIsNormal(xid))
+	cluster_tt_durable_count_locator_call();
+	if (origin_node < 0 || !TransactionIdIsNormal(xid)) {
+		cluster_tt_durable_count_locator_result(CLUSTER_TT_DURABLE_LOCATE_SCAN_UNAVAILABLE);
 		return CLUSTER_TT_DURABLE_LOCATE_SCAN_UNAVAILABLE;
+	}
 	owner = (uint8)(origin_node + 1);
 	seg_lo = (uint32)origin_node * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
 	seg_hi = seg_lo + CLUSTER_UNDO_SEGS_PER_INSTANCE - 1;
@@ -2221,12 +2224,18 @@ cluster_tt_slot_durable_locate_any_by_xid_origin(int origin_node, TransactionId 
 		}
 	}
 	cluster_tt_durable_io_wait_end();
-	if (matches > 1)
+	if (matches > 1) {
+		cluster_tt_durable_count_locator_result(CLUSTER_TT_DURABLE_LOCATE_AMBIGUOUS);
 		return CLUSTER_TT_DURABLE_LOCATE_AMBIGUOUS;
-	if (!scan_complete)
+	}
+	if (!scan_complete) {
+		cluster_tt_durable_count_locator_result(CLUSTER_TT_DURABLE_LOCATE_SCAN_UNAVAILABLE);
 		return CLUSTER_TT_DURABLE_LOCATE_SCAN_UNAVAILABLE;
-	if (matches == 0)
+	}
+	if (matches == 0) {
+		cluster_tt_durable_count_locator_result(CLUSTER_TT_DURABLE_LOCATE_MISSING);
 		return CLUSTER_TT_DURABLE_LOCATE_MISSING;
+	}
 	if (out_seg != NULL)
 		*out_seg = matched_seg;
 	if (out_slot != NULL)
@@ -2235,6 +2244,7 @@ cluster_tt_slot_durable_locate_any_by_xid_origin(int origin_node, TransactionId 
 		*out_wrap = matched_wrap;
 	if (out_status != NULL)
 		*out_status = matched_status;
+	cluster_tt_durable_count_locator_result(CLUSTER_TT_DURABLE_LOCATE_FOUND);
 	return CLUSTER_TT_DURABLE_LOCATE_FOUND;
 }
 

@@ -2989,6 +2989,25 @@ cluster_tt_durable_redo_apply_count(void)
 {
 	return 0;
 }
+static bool locator_stats_available;
+
+#ifdef CLUSTER_TT_DURABLE_LOCATOR_STATS_V1
+bool
+cluster_tt_durable_locator_stats_snapshot(ClusterTTDurableLocatorStats *out)
+{
+	if (!locator_stats_available || out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	out->origin_node_id = 3;
+	out->fallback_count = UINT64_MAX;
+	out->found_count = UINT64_C(9223372036854775809);
+	out->missing_count = 3;
+	out->ambiguous_count = 5;
+	out->unavailable_count = 7;
+	return true;
+}
+#endif
+
 /* spec-6.2: terminal authority counters share the durable-TT stat region in
  * the backend; this standalone dump unit stubs the accessors. */
 uint64
@@ -5758,6 +5777,39 @@ UT_TEST(test_debug_dump_exposes_receipt_lifetime_and_cancel_before_counters)
 	}
 }
 
+UT_TEST(test_debug_locator_stats_preserve_availability_and_unsigned_results)
+{
+	LOCAL_FCINFO(fcinfo, 0);
+	ReturnSetInfo rsinfo;
+	static const char *const keys[] = { "old_tt_locator_origin_node_id",
+										"old_tt_locator_fallback_count",
+										"old_tt_locator_fallback_result.found",
+										"old_tt_locator_fallback_result.missing",
+										"old_tt_locator_fallback_result.ambiguous",
+										"old_tt_locator_fallback_result.scan_unavailable" };
+	static const char *const values[]
+		= { "3", "18446744073709551615", "9223372036854775809", "3", "5", "7" };
+
+	for (int available = 0; available < 2; available++) {
+		memset(fcinfo, 0, SizeForFunctionCallInfo(0));
+		memset(&rsinfo, 0, sizeof(rsinfo));
+		captured_dump_row_count = captured_formatted_value_count = 0;
+		fcinfo->resultinfo = (fmNodePtr)&rsinfo;
+		locator_stats_available = available != 0;
+		(void)cluster_dump_state(fcinfo);
+		UT_ASSERT_EQ(captured_dump_count("undo", "old_tt_locator_stats_available"), 1);
+		if (captured_dump_count("undo", "old_tt_locator_stats_available") == 1)
+			UT_ASSERT_STR_EQ(captured_dump_value("undo", "old_tt_locator_stats_available"),
+							 available ? "true" : "false");
+		for (unsigned i = 0; i < lengthof(keys); i++) {
+			UT_ASSERT_EQ(captured_dump_count("undo", keys[i]), available);
+			if (available && captured_dump_count("undo", keys[i]) == 1)
+				UT_ASSERT_STR_EQ(captured_dump_value("undo", keys[i]), values[i]);
+		}
+	}
+	locator_stats_available = false;
+}
+
 UT_TEST(test_debug_dump_exposes_capacity_counts_without_fake_zero_or_signed_wrap)
 {
 	LOCAL_FCINFO(fcinfo, 0);
@@ -6500,7 +6552,7 @@ UT_TEST(test_debug_phase_symbol_present)
 int
 main(void)
 {
-	UT_PLAN(28);
+	UT_PLAN(29);
 	UT_RUN(test_debug_dump_retention_observations_preserve_availability_and_unsigned_values);
 	UT_RUN(test_debug_dump_exposes_native_drop_context_and_real_io_observation);
 	UT_RUN(test_debug_dump_exposes_pcm_first_refusal_identity_and_subpredicate);
@@ -6529,6 +6581,7 @@ main(void)
 	UT_RUN(test_debug_links_against_pgstat_module);
 	UT_RUN(test_debug_links_against_conf_module);
 	UT_RUN(test_debug_phase_symbol_present);
+	UT_RUN(test_debug_locator_stats_preserve_availability_and_unsigned_results);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

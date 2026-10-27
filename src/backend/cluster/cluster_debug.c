@@ -3340,6 +3340,27 @@ dump_undo(ReturnSetInfo *rsinfo)
 	emit_row(rsinfo, "undo", "tt_durable_redo_apply_count",
 			 fmt_int64((int64)cluster_tt_durable_redo_apply_count()));
 
+	{
+		ClusterTTDurableLocatorStats stats;
+		bool available = cluster_tt_durable_locator_stats_snapshot(&stats);
+
+		emit_row(rsinfo, "undo", "old_tt_locator_stats_available", available ? "true" : "false");
+		if (available) {
+			emit_row(rsinfo, "undo", "old_tt_locator_origin_node_id",
+					 fmt_int64(stats.origin_node_id));
+			emit_row(rsinfo, "undo", "old_tt_locator_fallback_count",
+					 fmt_uint64(stats.fallback_count));
+			emit_row(rsinfo, "undo", "old_tt_locator_fallback_result.found",
+					 fmt_uint64(stats.found_count));
+			emit_row(rsinfo, "undo", "old_tt_locator_fallback_result.missing",
+					 fmt_uint64(stats.missing_count));
+			emit_row(rsinfo, "undo", "old_tt_locator_fallback_result.ambiguous",
+					 fmt_uint64(stats.ambiguous_count));
+			emit_row(rsinfo, "undo", "old_tt_locator_fallback_result.scan_unavailable",
+					 fmt_uint64(stats.unavailable_count));
+		}
+	}
+
 	/* spec-3.12 D5: own-instance retention horizon observability. */
 	emit_row(rsinfo, "undo", "retention_horizon_scn",
 			 fmt_int64((int64)cluster_tt_slot_retention_horizon_scn()));

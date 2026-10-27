@@ -949,6 +949,13 @@
 | `tt_durable_lookup_miss_count` | 十进制整数文本 | `tt` / `durable` / `lookup` / `miss`的累计计数。 | 先做时间窗增量；单个绝对值不能直接判定当前故障。 |
 | `tt_durable_by_xid_scan_count` | 十进制整数文本 | `tt` / `durable` / `by` / `xid` / `scan`的累计计数。 | 先做时间窗增量；单个绝对值不能直接判定当前故障。 |
 | `tt_durable_redo_apply_count` | 十进制整数文本 | `tt` / `durable` / redo / 应用的累计计数。 | 先做时间窗增量；单个绝对值不能直接判定当前故障。 |
+| `old_tt_locator_stats_available` | `true` / `false` | 本实例旧事务位置查询统计是否可用。 | `false` 时省略下列来源与计数键，不把不可用读成 0。 |
+| `old_tt_locator_origin_node_id` | 非负整数文本 | 执行查询的本实例 origin 节点号，从 0 开始。 | 不是被查事务所在的节点；计数在本 postmaster 生命周期内累计。 |
+| `old_tt_locator_fallback_count` | uint64 十进制文本 | 旧事务位置查询的调用次数，含无效参数调用。 | 另一个按 xid 查询 SCN 的接口不计入；ERROR 不伪造正常返回结果。 |
+| `old_tt_locator_fallback_result.found` | uint64 十进制文本 | 查询正常返回唯一位置的次数。 | 位置可为 ACTIVE、COMMITTED 或 ABORTED；不是终态或可回收证明。 |
+| `old_tt_locator_fallback_result.missing` | uint64 十进制文本 | 查询正常返回完整扫描无匹配的次数。 | 诊断值不能代替当前查询和身份复核，不作负缓存。 |
+| `old_tt_locator_fallback_result.ambiguous` | uint64 十进制文本 | 查询正常返回多个匹配的次数。 | 与调用数独立原子采样，不要求并发读取的结果和恰好等于调用数。 |
+| `old_tt_locator_fallback_result.scan_unavailable` | uint64 十进制文本 | 查询正常返回扫描不可用的次数，含原无效参数结果。 | 不同于完整扫描无匹配；与其他计数结合做时间窗增量。 |
 | `retention_horizon_scn` | 十进制整数文本 | 保留 / `horizon`对应的集群 SCN。 | 与同分类其他键组成快照，不单独作为 authority 证明。 |
 | `retention_max_recycle_horizon` | 十进制整数文本 | 保留 / 上限 / `recycle` / `horizon`的当前快照值。 | 与同分类其他键组成快照，不单独作为 authority 证明。 |
 | `tt_slot_retain_skip_count` | 十进制整数文本 | `tt` / 槽位 / `retain` / `skip`的累计计数。 | 先做时间窗增量；单个绝对值不能直接判定当前故障。 |
