@@ -7420,6 +7420,160 @@ ctrc_participant_certificate_batch_apply_shared(const ClusterCtrcCloseDispatch *
 												Size count, ClusterCtrcSealReplyResult *results,
 												uint16 *reasons);
 
+#ifndef CLUSTER_CTRC_UNIT_TEST
+/* Process-local, nonauthoritative copies. No shared/wire layout or protocol
+ * state is added. Capture only at an existing owner; output after unlocking. */
+#define CLUSTER_CTRC_PARTICIPANT_STOP_TRACE_PRESENT 1
+typedef struct CtrcParticipantStopTrace {
+	ClusterCtrcParticipantEntry before;
+	ClusterCtrcParticipantEntry after;
+	ClusterCtrcTxnKeyV1 expected_key;
+	ClusterCtrcParticipantIdentity expected_peer;
+	ClusterCtrcLocalReleaseAckV1 summary;
+	uint64 participant_index;
+	uint64 expected_seal;
+	uint32 expected_grant;
+	const char *phase;
+	const char *first_failed;
+	const char *first_failed_phase;
+	const char *capture_phase;
+	uint8 suboperation;
+	bool suboperation_known;
+	Size failed_found;
+	bool known;
+} CtrcParticipantStopTrace;
+
+static uint64 CtrcParticipantStopSequence;
+static uint64 CtrcParticipantStopSkipped;
+
+static void
+ctrc_participant_stop_capture(CtrcParticipantStopTrace *trace, uint64 index)
+{
+	if (!cluster_trace_normal_stop)
+		return;
+	if (!trace->known)
+		trace->before = ctrc_participant_entries()[index];
+	trace->after = ctrc_participant_entries()[index];
+	trace->summary = ctrc_participant_ack_entries()[index];
+	trace->participant_index = index;
+	trace->capture_phase = trace->phase;
+	trace->known = true;
+}
+
+static void
+ctrc_participant_stop_trace_lock(LWLock *lock, LWLockMode mode, void *context)
+{
+	(void)lock;
+	(void)mode;
+	*(bool *)context = true;
+}
+
+static void
+ctrc_participant_stop_trace(const char *event, const CtrcParticipantStopTrace *trace,
+						   unsigned result, uint16 first_reason, bool result_known,
+						   bool eligible, bool attempted, bool frozen, Size found, Size count)
+{
+	const ClusterCtrcParticipantEntry *before = &trace->before, *after = &trace->after;
+	const ClusterCtrcTxnKeyV1 *key = &after->key;
+	const ClusterCtrcParticipantIdentity *peer = &after->identity;
+	const ClusterCtrcLocalReleaseAckV1 *ack = &trace->summary;
+	bool held = false;
+	bool present;
+	bool matches;
+	bool mono_known = false;
+	struct timespec now;
+	uint64 mono_us = 0;
+
+	if (!cluster_trace_normal_stop || !trace->known)
+		return;
+	if (CritSectionCount == 0)
+		ForEachLWLockHeldByMe(ctrc_participant_stop_trace_lock, &held);
+	if (CritSectionCount != 0 || held) {
+		if (CtrcParticipantStopSkipped != UINT64_MAX)
+			CtrcParticipantStopSkipped++;
+		return;
+	}
+	/* These comparisons consume only private copies, never reload shared state.
+	 * Tuple equality is not the ACK digest/durability validation predicate. */
+	present = !ctrc_bytes_zero(ack, sizeof(*ack));
+	matches = present && memcmp(&ack->transaction_key, key, sizeof(*key)) == 0
+			  && ack->participant_node_id == peer->node_id
+			  && ack->participant_boot_incarnation == peer->boot_incarnation
+			  && ack->capability_record_generation == peer->capability_record_generation
+			  && ack->formation_epoch == peer->formation_epoch
+			  && ack->admission_record_generation == peer->admission_record_generation
+			  && ack->grant_generation == after->grant_generation
+			  && ack->seal_generation == after->seal_generation;
+	if (clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
+		mono_us = (uint64)now.tv_sec * 1000000 + (uint64)now.tv_nsec / 1000;
+		mono_known = true;
+	}
+	if (CtrcParticipantStopSequence != UINT64_MAX)
+		CtrcParticipantStopSequence++;
+	ereport(LOG, (errmsg_internal(
+		"PGRAC_FAMILY=CTRC_PARTICIPANT_STOP event=%s event_seq=" UINT64_FORMAT
+		" sequence_scope=process node_id=%d pid=%d procno=%d backend_type=%d worker_id=%d worker_id_known=%d "
+		"emit_wall_us=" INT64_FORMAT " emit_monotonic_us=" UINT64_FORMAT
+		" emit_monotonic_known=%d capture_clock_known=0 process_incarnation_known=0 proc_generation_known=0 "
+		"request_id_known=0 authoritative=0 shared_atomic_graph=0 "
+		"durability_known=0 snapshot_subpredicate_known=0 sample_known=1 identity_source=participant_locked_after "
+		"participant_index=" UINT64_FORMAT " phase=%s capture_phase=%s first_failed=%s first_failed_phase=%s "
+		"suboperation_known=%d suboperation=%u original_full_xid_known=%d original_full_xid=" UINT64_FORMAT " "
+		"failed_found=%zu result_known=%d result=%u first_reason_known=%d first_reason=%u "
+		"ack_work_known=%d eligible=%d freeze_attempted=%d frozen=%d "
+		"receipt_found=%zu receipt_expected=%zu "
+		"system_identifier=" UINT64_FORMAT " key_format=%u owner_instance=%u origin_node=%u xid=%u "
+		"segment=%u segment_generation=%u slot=%u tt_wrap=%u cluster_epoch=%u "
+		"boot=" UINT64_FORMAT " formation=" UINT64_FORMAT " admission=" UINT64_FORMAT
+		" root_descriptor=" UINT64_FORMAT " root_id=" UINT64_FORMAT " root_generation=" UINT64_FORMAT
+		" peer=%u peer_boot=" UINT64_FORMAT " peer_capability=%u peer_formation=" UINT64_FORMAT
+		" peer_admission=" UINT64_FORMAT " grant=%u seal=" UINT64_FORMAT
+		" before_key_matches_expected=%d after_key_matches_expected=%d "
+		"before_peer_matches_expected=%d after_peer_matches_expected=%d "
+		"expected_grant=%u expected_seal=" UINT64_FORMAT
+		" before_state=%u after_state=%u before_receipts=" UINT64_FORMAT " after_receipts=" UINT64_FORMAT
+		" before_prepared=" UINT64_FORMAT " before_applied=" UINT64_FORMAT
+		" before_cancelled=" UINT64_FORMAT " before_cleaned=" UINT64_FORMAT
+		" before_ack_frozen=" UINT64_FORMAT
+		" after_prepared=" UINT64_FORMAT " after_applied=" UINT64_FORMAT
+		" after_cancelled=" UINT64_FORMAT " after_cleaned=" UINT64_FORMAT " after_ack_frozen=" UINT64_FORMAT
+		" next_key_sequence=" UINT64_FORMAT " last_key_sequence=" UINT64_FORMAT
+		" summary_present=%d summary_tuple_matches=%d summary_crc=%u "
+		"summary_receipts=" UINT64_FORMAT " summary_cancelled=" UINT64_FORMAT
+		" summary_cleaned=" UINT64_FORMAT " summary_ack_frozen=" UINT64_FORMAT
+		" summary_proof_known=0 summary_tuple_known=%d summary_counts_known=%d unsafe_skipped=" UINT64_FORMAT
+		" partial_emit_possible=1 sequence_saturated=%d",
+		event, CtrcParticipantStopSequence, cluster_node_id, (int)getpid(),
+		MyProc != NULL ? MyProc->pgprocno : -1, MyBackendType, CtrcWorkerId, CtrcWorkerId >= 0,
+		GetCurrentTimestamp(), mono_us, mono_known,
+		trace->participant_index, trace->phase != NULL ? trace->phase : "unknown",
+		trace->capture_phase != NULL ? trace->capture_phase : "unknown",
+		trace->first_failed != NULL ? trace->first_failed : "none",
+		trace->first_failed_phase != NULL ? trace->first_failed_phase : "none",
+		trace->suboperation_known, trace->suboperation,
+		FullTransactionIdIsValid(after->original_full_xid), U64FromFullTransactionId(after->original_full_xid),
+		trace->failed_found,
+		result_known, result, result_known, first_reason, !result_known, eligible, attempted, frozen, found, count,
+		key->system_identifier, key->format_version, key->owner_instance, key->origin_node_id, key->xid,
+		key->segment_id, key->segment_generation, key->slot_offset, key->slot_wrap, key->cluster_epoch,
+		key->origin_boot_incarnation, key->formation_epoch, key->admission_record_generation,
+		key->root_descriptor_incarnation, key->root_id, key->root_generation,
+		peer->node_id, peer->boot_incarnation, peer->capability_record_generation,
+		peer->formation_epoch, peer->admission_record_generation, after->grant_generation,
+		after->seal_generation, memcmp(&before->key, &trace->expected_key, sizeof(*key)) == 0,
+		memcmp(key, &trace->expected_key, sizeof(*key)) == 0,
+		memcmp(&before->identity, &trace->expected_peer, sizeof(*peer)) == 0,
+		memcmp(peer, &trace->expected_peer, sizeof(*peer)) == 0,
+		trace->expected_grant, trace->expected_seal, before->state, after->state,
+		before->receipt_count, after->receipt_count, before->prepared_count, before->applied_count,
+		before->cancelled_count, before->cleaned_count, before->ack_frozen_count,
+		after->prepared_count, after->applied_count, after->cancelled_count, after->cleaned_count,
+		after->ack_frozen_count, after->next_key_sequence, after->last_key_sequence,
+		present, matches, ack->crc32c, ack->total_receipt_count, ack->cancelled_count,
+		ack->cleaned_count, ack->ack_frozen_count, present, present, CtrcParticipantStopSkipped,
+		CtrcParticipantStopSequence == UINT64_MAX)));
+}
+#endif
 ClusterCtrcSealReplyResult
 cluster_ctrc_participant_request_shared(const ClusterCtrcTxnKeyV1 *key,
 										const ClusterCtrcParticipantIdentity *identity,
@@ -7435,6 +7589,8 @@ cluster_ctrc_participant_request_shared(const ClusterCtrcTxnKeyV1 *key,
 	ClusterCtrcParticipantState state_before;
 	uint64 participant_index;
 	bool progressed;
+	bool trace_enabled = cluster_trace_normal_stop;
+	CtrcParticipantStopTrace trace;
 
 	if (first_reason != NULL)
 		*first_reason = CTRC_SEAL_REASON_MALFORMED;
@@ -7464,6 +7620,14 @@ cluster_ctrc_participant_request_shared(const ClusterCtrcTxnKeyV1 *key,
 	ack_summary = &ctrc_participant_ack_entries()[participant_index];
 	participant_before = *participant;
 	state_before = (ClusterCtrcParticipantState)participant->state;
+	if (trace_enabled) {
+		MemSet(&trace, 0, sizeof(trace));
+		trace.expected_key = *key; trace.expected_peer = *identity;
+		trace.expected_grant = grant_generation; trace.expected_seal = seal_generation;
+		trace.phase = "request.apply";
+		trace.suboperation = (uint8)suboperation; trace.suboperation_known = true;
+		ctrc_participant_stop_capture(&trace, participant_index);
+	}
 	/* A CLOSE on an empty slot creates a new participant tombstone.  It is
 	 * not an exact completion of the participant previously reclaimed by a
 	 * certificate.  Local foreground/cleaner calls retain their native
@@ -7490,6 +7654,8 @@ cluster_ctrc_participant_request_shared(const ClusterCtrcTxnKeyV1 *key,
 	}
 	progressed = result != CTRC_SEAL_REPLY_BLOCKED_RETAIN && result != CTRC_SEAL_REPLY_DENIED
 				 && memcmp(participant, &participant_before, sizeof(participant_before)) != 0;
+	if (trace_enabled)
+		ctrc_participant_stop_capture(&trace, participant_index);
 	LWLockRelease(&CtrcShared->receipt_lock);
 	ctrc_participant_locks_release(ctrc_participant_lock_mask(participant_index));
 	if (progressed)
@@ -7506,6 +7672,18 @@ cluster_ctrc_participant_request_shared(const ClusterCtrcTxnKeyV1 *key,
 		cluster_ctrc_cleaner_reason_set(CTRC_CLEANER_REASON_NONE);
 	} else if (result == CTRC_SEAL_REPLY_BLOCKED_RETAIN || result == CTRC_SEAL_REPLY_DENIED)
 		cluster_ctrc_cleaner_reason_set(CTRC_CLEANER_REASON_BLOCKED);
+	if (trace_enabled) {
+		if (result == CTRC_SEAL_REPLY_PENDING_DRAIN)
+			trace.first_failed = participant_before.prepared_count != 0 ? "prepared_drain"
+				: trace.after.applied_count != 0 ? "applied_drain"
+				: trace.after.receipt_count != 0 ? "ack_freeze_pending" : "pending_unknown";
+		else if (result == CTRC_SEAL_REPLY_BLOCKED_RETAIN || result == CTRC_SEAL_REPLY_DENIED)
+			trace.first_failed = *first_reason == CTRC_SEAL_REASON_ACK_UNAVAILABLE
+				? "ack_unavailable" : "participant_identity_or_input";
+		trace.first_failed_phase = trace.first_failed != NULL ? trace.phase : NULL;
+		ctrc_participant_stop_trace("request.reply", &trace, result, *first_reason, true,
+			false, false, false, 0, trace.after.receipt_count);
+	}
 	return result;
 #else
 	(void)key;
@@ -10441,6 +10619,55 @@ typedef struct CtrcAckWork {
 	ClusterCtrcLocalReleaseAckV1 second_ack;
 } CtrcAckWork;
 
+/* Separate from CtrcAckWork: diagnostics must not change its allocation
+ * budget. One process-local observation owner; nested passes simply do not
+ * acquire it. The original PG_FINALLY releases it on every exit. */
+static CtrcAckWork *CtrcAckStopWork;
+static Size CtrcAckStopCount;
+static CtrcParticipantStopTrace CtrcAckStopSamples[CTRC_CLEANER_ACK_BATCH];
+
+static CtrcParticipantStopTrace *
+ctrc_ack_stop_sample(const CtrcAckWork *work)
+{
+	if (cluster_trace_normal_stop && CtrcAckStopWork != NULL)
+		for (Size i = 0; i < CtrcAckStopCount; i++)
+			if (&CtrcAckStopWork[i] == work)
+				return &CtrcAckStopSamples[i];
+	return NULL;
+}
+
+static void
+ctrc_ack_stop_phase(CtrcAckWork *work, const char *phase)
+{
+	CtrcParticipantStopTrace *trace = ctrc_ack_stop_sample(work);
+
+	if (trace != NULL)
+		trace->phase = phase;
+}
+
+static void
+ctrc_ack_stop_capture(CtrcAckWork *work)
+{
+	CtrcParticipantStopTrace *trace = ctrc_ack_stop_sample(work);
+
+	if (trace != NULL)
+		ctrc_participant_stop_capture(trace, work->participant_index);
+}
+
+/* Observe the actual original short-circuit operand, never evaluate it again. */
+static bool
+ctrc_ack_stop_predicate(CtrcAckWork *work, const char *predicate, bool value)
+{
+	CtrcParticipantStopTrace *trace = ctrc_ack_stop_sample(work);
+
+	if (trace != NULL && !value && trace->first_failed == NULL) {
+		trace->first_failed = predicate;
+		trace->first_failed_phase = trace->phase;
+		trace->failed_found = work->found;
+	}
+	return value;
+}
+
 static void ctrc_participant_copy_ack_batch(CtrcAckWork *work, Size count);
 static void ctrc_participant_freeze_ack_batch_exact(CtrcAckWork *work, Size count);
 
@@ -10581,9 +10808,13 @@ ctrc_participant_copy_ack_batch(CtrcAckWork *work, Size count)
 		uint64 cursor;
 
 		checked[i] = work[i].eligible;
-		if (work[i].eligible)
-			work[i].eligible = ctrc_ack_participant_exact(&work[i])
-							   && ctrc_receipt_chain_exact_locked(work[i].participant_index, false);
+		if (work[i].eligible) {
+			ctrc_ack_stop_capture(&work[i]);
+			work[i].eligible = ctrc_ack_stop_predicate(&work[i], "copy.participant_exact",
+														ctrc_ack_participant_exact(&work[i]))
+				&& ctrc_ack_stop_predicate(&work[i], "copy.receipt_chain_exact",
+					ctrc_receipt_chain_exact_locked(work[i].participant_index, false));
+		}
 		if (!work[i].eligible)
 			continue;
 		cursor = ctrc_participant_receipt_heads()[work[i].participant_index];
@@ -10595,9 +10826,12 @@ ctrc_participant_copy_ack_batch(CtrcAckWork *work, Size count)
 	}
 	for (Size i = 0; i < count; i++) {
 		if (work[i].eligible)
-			work[i].eligible = work[i].found == work[i].receipt_count;
+			work[i].eligible = ctrc_ack_stop_predicate(&work[i], "copy.receipt_count",
+				work[i].found == work[i].receipt_count);
 		if (checked[i] && !work[i].eligible)
 			ctrc_ack_block_if_same(&work[i]);
+		if (checked[i])
+			ctrc_ack_stop_capture(&work[i]);
 	}
 	LWLockRelease(&CtrcShared->receipt_lock);
 	ctrc_participant_locks_release(lock_mask);
@@ -10619,12 +10853,17 @@ ctrc_participant_freeze_ack_batch_exact(CtrcAckWork *work, Size count)
 	LWLockAcquire(&CtrcShared->receipt_lock, LW_SHARED);
 	for (Size i = 0; i < count; i++) {
 		checked[i] = work[i].eligible;
-		if (work[i].eligible)
+		if (work[i].eligible) {
+			ctrc_ack_stop_capture(&work[i]);
 			work[i].eligible
-				= ctrc_ack_participant_exact(&work[i])
-				  && ctrc_receipt_chain_exact_locked(work[i].participant_index, false)
-				  && ctrc_bytes_zero(&ctrc_participant_ack_entries()[work[i].participant_index],
-									 sizeof(ClusterCtrcLocalReleaseAckV1));
+				= ctrc_ack_stop_predicate(&work[i], "freeze.participant_exact",
+					ctrc_ack_participant_exact(&work[i]))
+				  && ctrc_ack_stop_predicate(&work[i], "freeze.receipt_chain_exact",
+					ctrc_receipt_chain_exact_locked(work[i].participant_index, false))
+				  && ctrc_ack_stop_predicate(&work[i], "freeze.summary_empty",
+					ctrc_bytes_zero(&ctrc_participant_ack_entries()[work[i].participant_index],
+									 sizeof(ClusterCtrcLocalReleaseAckV1)));
+		}
 		any |= work[i].eligible;
 	}
 	for (uint64 i = 0; any && i < CtrcShared->receipt_entries; i++) {
@@ -10639,7 +10878,7 @@ ctrc_participant_freeze_ack_batch_exact(CtrcAckWork *work, Size count)
 		key_sequence = receipt->publication.key_sequence;
 		if (key_sequence == 0 || key_sequence > work[j].receipt_count
 			|| memcmp(receipt, &work[j].sorted_receipts[key_sequence - 1], sizeof(*receipt)) != 0)
-			work[j].eligible = false;
+			work[j].eligible = ctrc_ack_stop_predicate(&work[j], "freeze.receipt_exact", false);
 		else
 			work[j].found++;
 	}
@@ -10647,7 +10886,8 @@ ctrc_participant_freeze_ack_batch_exact(CtrcAckWork *work, Size count)
 	any = false;
 	for (Size i = 0; i < count; i++) {
 		if (work[i].eligible)
-			work[i].eligible = work[i].found == work[i].receipt_count;
+			work[i].eligible = ctrc_ack_stop_predicate(&work[i], "freeze.receipt_count",
+				work[i].found == work[i].receipt_count);
 		if (checked[i] && !work[i].eligible)
 			ctrc_ack_block_if_same(&work[i]);
 		any |= work[i].eligible;
@@ -10677,6 +10917,9 @@ ctrc_participant_freeze_ack_batch_exact(CtrcAckWork *work, Size count)
 			participant->state = CTRC_PARTICIPANT_ACK_FROZEN;
 			work[i].frozen = true;
 		}
+	for (Size i = 0; i < count; i++)
+		if (checked[i])
+			ctrc_ack_stop_capture(&work[i]);
 	LWLockRelease(&CtrcShared->receipt_lock);
 	ctrc_participant_locks_release(lock_mask);
 }
@@ -10692,6 +10935,7 @@ ctrc_participant_freeze_ack_batch_shared(Size maximum)
 {
 	CtrcAckWork *work;
 	volatile Size frozen = 0;
+	bool trace_owner;
 
 	if (maximum == 0 || maximum > CTRC_CLEANER_ACK_BATCH || !cluster_ctrc_shmem_ready())
 		return 0;
@@ -10702,6 +10946,12 @@ ctrc_participant_freeze_ack_batch_shared(Size maximum)
 	work = palloc_extended(maximum * sizeof(*work), MCXT_ALLOC_ZERO | MCXT_ALLOC_NO_OOM);
 	if (work == NULL)
 		return 0;
+	trace_owner = cluster_trace_normal_stop && CtrcAckStopWork == NULL;
+	if (trace_owner) {
+		MemSet(CtrcAckStopSamples, 0, sizeof(CtrcAckStopSamples));
+		CtrcAckStopCount = maximum;
+		CtrcAckStopWork = work;
+	}
 	PG_TRY();
 	{
 		Size count = 0;
@@ -10737,6 +10987,15 @@ ctrc_participant_freeze_ack_batch_shared(Size maximum)
 			allocated_bytes += bytes;
 			item->sorted_receipts = item->receipts;
 			item->eligible = true;
+			if (trace_owner) {
+				CtrcParticipantStopTrace *trace = ctrc_ack_stop_sample(item);
+
+				trace->expected_key = item->participant.key;
+				trace->expected_peer = item->participant.identity;
+				trace->expected_grant = item->participant.grant_generation;
+				trace->expected_seal = item->participant.seal_generation;
+				trace->phase = "first.copy";
+			}
 			count++;
 		}
 
@@ -10756,14 +11015,20 @@ ctrc_participant_freeze_ack_batch_shared(Size maximum)
 				XLogFlush(highest_local_lsn);
 			}
 			ctrc_participant_capture_durability(&durability);
-			item->eligible = cluster_ctrc_participant_ack_from_snapshot(
+			if (cluster_trace_normal_stop)
+				ctrc_ack_stop_phase(item, "first.snapshot");
+			item->eligible = ctrc_ack_stop_predicate(item, "first.snapshot_released",
+				cluster_ctrc_participant_ack_from_snapshot(
 								 &item->participant, item->receipts, item->receipt_count,
 								 &durability, &item->first_ack)
-							 == CLUSTER_CTRC_ACK_RELEASED;
+							 == CLUSTER_CTRC_ACK_RELEASED);
 		}
 
 		/* Independent second range and durability capture, never a reused
 		 * first proof. Sorting changes only each item's private allocation. */
+		if (cluster_trace_normal_stop)
+			for (Size i = 0; i < count; i++)
+				ctrc_ack_stop_phase(&work[i], "second.copy");
 		ctrc_participant_copy_ack_batch(work, count);
 		for (Size i = 0; i < count; i++) {
 			CtrcAckWork *item = &work[i];
@@ -10772,18 +11037,25 @@ ctrc_participant_freeze_ack_batch_shared(Size maximum)
 			if (!item->eligible)
 				continue;
 			ctrc_participant_capture_durability(&durability);
+			if (cluster_trace_normal_stop)
+				ctrc_ack_stop_phase(item, "second.snapshot");
 			item->eligible
-				= cluster_ctrc_participant_ack_from_snapshot(&item->participant, item->receipts,
+				= ctrc_ack_stop_predicate(item, "second.snapshot_released",
+					cluster_ctrc_participant_ack_from_snapshot(&item->participant, item->receipts,
 															 item->receipt_count, &durability,
 															 &item->second_ack)
-					  == CLUSTER_CTRC_ACK_RELEASED
-				  && memcmp(&item->first_ack, &item->second_ack, sizeof(item->first_ack)) == 0;
+					  == CLUSTER_CTRC_ACK_RELEASED)
+				  && ctrc_ack_stop_predicate(item, "second.ack_equal",
+					memcmp(&item->first_ack, &item->second_ack, sizeof(item->first_ack)) == 0);
 			if (item->eligible) {
 				cluster_ctrc_cleaner_reason_set(CTRC_CLEANER_REASON_PARTICIPANT_ACK);
 				cluster_ctrc_test_barrier_wait(CTRC_TEST_BARRIER_ACK_DURABLE);
 				item->freeze_attempted = true;
 			}
 		}
+		if (cluster_trace_normal_stop)
+			for (Size i = 0; i < count; i++)
+				ctrc_ack_stop_phase(&work[i], "freeze.exact");
 		ctrc_participant_freeze_ack_batch_exact(work, count);
 		for (Size i = 0; i < count; i++)
 			if (work[i].frozen) {
@@ -10793,9 +11065,21 @@ ctrc_participant_freeze_ack_batch_shared(Size maximum)
 				cluster_undo_cleaner_wakeup();
 			} else if (work[i].freeze_attempted)
 				cluster_ctrc_cleaner_reason_set(CTRC_CLEANER_REASON_BLOCKED);
+		/* All original publication/statistics/wakeup work precedes output. A
+		 * captured row may predate a failed private snapshot; it is not a
+		 * post-failure atomic view or a new durability proof. */
+		if (trace_owner)
+			for (Size i = 0; i < count; i++)
+				ctrc_participant_stop_trace("ack.freeze", &CtrcAckStopSamples[i], 0, 0, false,
+					work[i].eligible, work[i].freeze_attempted, work[i].frozen,
+					work[i].found, work[i].receipt_count);
 	}
 	PG_FINALLY();
 	{
+		if (trace_owner) {
+			CtrcAckStopWork = NULL;
+			CtrcAckStopCount = 0;
+		}
 		for (Size i = 0; i < maximum; i++)
 			if (work[i].receipts != NULL)
 				pfree(work[i].receipts);

@@ -8447,6 +8447,25 @@ ack_test_barrier(ClusterCtrcTestBarrierPhase barrier)
 	if (ack_barrier_fault == 1) ack_watched->receipt->publication.journal_sequence++;
 	if (ack_barrier_fault == 2) original_certificate_participant_ack_entries()[ack_watched->participant_index].reserved[0] = 1;
 }
+/* These original diagnostic helpers remain compiled with their default-OFF
+ * input. Logging, lock enumeration and clock capture are not qualified here;
+ * an unexpected ON traversal must fail rather than fabricate an observation. */
+static bool original_origin_reply_trace_enabled;
+static PGPROC *original_origin_reply_trace_proc;
+static void
+original_origin_reply_trace_locks(void (*callback)(LWLock *, LWLockMode, void *),
+								void *context)
+{
+	(void) callback;
+	(void) context;
+	UT_ASSERT(false);
+}
+static TimestampTz
+original_origin_reply_trace_clock(void)
+{
+	UT_ASSERT(false);
+	return 0;
+}
 #define CLUSTER_CTRC_TEST_TABLE_VISIT(kind) (ack_visits[(kind)]++)
 #define ctrc_tlv_bytes original_ack_tlv_bytes
 #define ctrc_tlv_u8 original_ack_tlv_u8
@@ -8512,7 +8531,15 @@ ack_test_barrier(ClusterCtrcTestBarrierPhase barrier)
 #define ProcessInterrupts ack_process_interrupts
 static volatile sig_atomic_t ack_interrupt_pending;
 static void ack_process_interrupts(void) { UT_ASSERT(false); }
+#define cluster_trace_normal_stop original_origin_reply_trace_enabled
+#define MyProc original_origin_reply_trace_proc
+#define ForEachLWLockHeldByMe original_origin_reply_trace_locks
+#define GetCurrentTimestamp original_origin_reply_trace_clock
 #include "test_cluster_heap_ctrc_ack.inc"
+#undef GetCurrentTimestamp
+#undef ForEachLWLockHeldByMe
+#undef MyProc
+#undef cluster_trace_normal_stop
 #undef ProcessInterrupts
 #undef InterruptPending
 #undef cluster_ctrc_test_barrier_wait
@@ -8779,25 +8806,6 @@ static uint64 origin_reply_table_visits;
 #define ctrc_semantic_progress original_certificate_semantic_progress
 #define LWLockAcquire participant_publisher_lock_acquire
 #define LWLockRelease participant_publisher_lock_release
-/* These original diagnostic helpers remain compiled with their default-OFF
- * input. Logging, lock enumeration and clock capture are not qualified here;
- * an unexpected ON traversal must fail rather than fabricate an observation. */
-static bool original_origin_reply_trace_enabled;
-static PGPROC *original_origin_reply_trace_proc;
-static void
-original_origin_reply_trace_locks(void (*callback)(LWLock *, LWLockMode, void *),
-								void *context)
-{
-	(void) callback;
-	(void) context;
-	UT_ASSERT(false);
-}
-static TimestampTz
-original_origin_reply_trace_clock(void)
-{
-	UT_ASSERT(false);
-	return 0;
-}
 #define cluster_trace_normal_stop original_origin_reply_trace_enabled
 #define MyProc original_origin_reply_trace_proc
 #define ForEachLWLockHeldByMe original_origin_reply_trace_locks

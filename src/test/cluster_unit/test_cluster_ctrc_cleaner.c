@@ -159,6 +159,8 @@ static unsigned reply_log_count;
 static char reply_last_log[8192];
 static unsigned batch_reply_log_count, batch_reply_log_throw_at;
 static char batch_reply_logs[CLUSTER_CTRC_RECLAIM_BATCH_MAX][8192];
+static unsigned participant_log_count;
+static char participant_logs[32][8192];
 BackendType MyBackendType = B_BACKEND;
 AuxProcType MyAuxProcType = NotAnAuxProcess;
 int MyProcPid = 2901;
@@ -860,6 +862,11 @@ errfinish(const char *file pg_attribute_unused(), int line pg_attribute_unused()
 			batch_reply_log_count++;
 			if (batch_reply_log_throw_at != 0 && batch_reply_log_count == batch_reply_log_throw_at)
 				pg_re_throw();
+		} else if (strstr(origin_last_log, "PGRAC_FAMILY=CTRC_PARTICIPANT_STOP") != NULL) {
+			if (participant_log_count < lengthof(participant_logs))
+				strlcpy(participant_logs[participant_log_count], origin_last_log,
+						sizeof(participant_logs[0]));
+			participant_log_count++;
 		} else {
 			if (origin_require_dispatch_return) UT_ASSERT(origin_dispatch_returned);
 			origin_log_count++;
@@ -893,6 +900,7 @@ reset_fixture(void)
 	origin_driver_pending = origin_require_dispatch_return = origin_dispatch_returned = false;
 	reply_log_count = 0; reply_last_log[0] = '\0';
 	batch_reply_log_count = batch_reply_log_throw_at = 0;
+	participant_log_count = 0; MemSet(participant_logs, 0, sizeof(participant_logs));
 	origin_log_count = origin_dispatch_calls = 0; origin_last_log[0] = '\0';
 #ifdef CLUSTER_CTRC_ORIGIN_DISPATCH_TRACE_PRESENT
 	CtrcOriginTraceCriticalSkipped = CtrcOriginTraceLwlockSkipped = 0;
@@ -7013,6 +7021,235 @@ UT_TEST(test_actual_worker_active_pass_does_not_sample_native_without_source)
 	exercise_worker_active_pass(3);
 }
 
+/* These execute the original shared CLOSE and asynchronous ACK producer.
+ * The logger is only a process boundary; assertions above reject locked output. */
+UT_TEST(test_participant_stop_trace_reports_prepared_and_applied_pending)
+{
+	for (unsigned applied = 0; applied < 2; applied++) {
+		ClusterCtrcOriginEntry *origin;
+		ClusterCtrcReceiptHandle handle;
+		ClusterCtrcLocalReleaseAckV1 ack;
+		ClusterCtrcApplyToken token;
+		ClusterCtrcTargetV1 target;
+		uint16 reason;
+
+		reset_fixture(); origin = seed_origin(0, 1);
+		UT_ASSERT_EQ(prepare_fixture_receipt(origin, 901, &handle), CLUSTER_CTRC_PREPARE_READY);
+		if (applied) {
+			target = handle.receipt->target;
+			target.kind = CTRC_TARGET_EXACT_ITL_SLOT; target.itl_xid = origin->key.xid;
+			target.itl_class = 1; target.itl_slot_wrap = 1; target.uba[0] = 1;
+			target.planned_predecessor_sha256[0] = 1; target.planned_successor_sha256[0] = 2;
+			UT_ASSERT_EQ(cluster_ctrc_receipt_apply_shared(&handle, &target, &token),
+						 CLUSTER_CTRC_APPLY_APPLIED);
+		}
+		origin_log_enabled = cluster_trace_normal_stop = true;
+		UT_ASSERT_EQ(cluster_ctrc_participant_request_shared(&origin->key, &origin->touched[0],
+			origin->grant_generation, origin->seal_generation, CTRC_SEAL_CLOSE_AND_CLEAN,
+			&reason, &ack), CTRC_SEAL_REPLY_PENDING_DRAIN);
+		UT_ASSERT_EQ(reason, applied ? CTRC_SEAL_REASON_CLEANOUT : CTRC_SEAL_REASON_PREPARED);
+		UT_ASSERT_EQ(participant_log_count, 1);
+		UT_ASSERT(strstr(participant_logs[0], "event=request.reply ") != NULL);
+		UT_ASSERT(strstr(participant_logs[0], applied ? "after_prepared=0 after_applied=1 "
+													: "after_prepared=1 after_applied=0 ") != NULL);
+		UT_ASSERT(strstr(participant_logs[0], applied ? "first_failed=applied_drain "
+													: "first_failed=prepared_drain ") != NULL);
+		UT_ASSERT(strstr(participant_logs[0], "request_id_known=0 ") != NULL);
+		UT_ASSERT(strstr(participant_logs[0], "shared_atomic_graph=0 ") != NULL);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
+UT_TEST(test_participant_stop_trace_distinguishes_nonempty_ack_wait_and_frozen_reply)
+{
+	ClusterCtrcParticipantEntry snapshot;
+	ClusterCtrcReceipt receipt;
+	ClusterCtrcLocalReleaseAckV1 expected, ack;
+	uint64 index, receipt_index;
+	uint16 reason;
+
+	reset_fixture(); UT_ASSERT(seed_cancelled_ack(&snapshot, &receipt, &expected, &index, &receipt_index));
+	origin_log_enabled = cluster_trace_normal_stop = true;
+	UT_ASSERT_EQ(cluster_ctrc_participant_request_shared(&snapshot.key, &snapshot.identity,
+		snapshot.grant_generation, snapshot.seal_generation, CTRC_SEAL_CLOSE_AND_CLEAN,
+		&reason, &ack), CTRC_SEAL_REPLY_PENDING_DRAIN);
+	UT_ASSERT_EQ(reason, CTRC_SEAL_REASON_CLEANOUT);
+	UT_ASSERT(strstr(participant_logs[0], "first_failed=ack_freeze_pending ") != NULL);
+	UT_ASSERT(strstr(participant_logs[0], "after_prepared=0 after_applied=0 ") != NULL);
+	UT_ASSERT(strstr(participant_logs[0], "after_cancelled=1 after_cleaned=0 after_ack_frozen=0 ") != NULL);
+	UT_ASSERT(strstr(participant_logs[0], "summary_present=0 ") != NULL);
+	UT_ASSERT_EQ(ctrc_participant_freeze_ack_batch_shared(1), 1);
+	UT_ASSERT_EQ(participant_log_count, 2);
+	UT_ASSERT(strstr(participant_logs[1], "event=ack.freeze ") != NULL);
+	UT_ASSERT(strstr(participant_logs[1], "first_failed=none ") != NULL);
+	UT_ASSERT(strstr(participant_logs[1], "frozen=1 ") != NULL);
+	UT_ASSERT(strstr(participant_logs[1], "summary_present=1 summary_tuple_matches=1 ") != NULL);
+	UT_ASSERT_EQ(cluster_ctrc_participant_request_shared(&snapshot.key, &snapshot.identity,
+		snapshot.grant_generation, snapshot.seal_generation, CTRC_SEAL_CLOSE_AND_CLEAN,
+		&reason, &ack), CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK);
+	UT_ASSERT_EQ(reason, 0);
+	UT_ASSERT_EQ(memcmp(&ack, &expected, sizeof(ack)), 0);
+	UT_ASSERT(strstr(participant_logs[2], "after_ack_frozen=1 ") != NULL);
+}
+
+UT_TEST(test_participant_stop_trace_exposes_frozen_ack_identity_refusal)
+{
+	ClusterCtrcParticipantEntry snapshot, before;
+	ClusterCtrcReceipt receipt;
+	ClusterCtrcLocalReleaseAckV1 expected, ack;
+	uint64 index, receipt_index;
+	uint16 reason;
+
+	reset_fixture(); UT_ASSERT(seed_cancelled_ack(&snapshot, &receipt, &expected, &index, &receipt_index));
+	UT_ASSERT_EQ(ctrc_participant_freeze_ack_batch_shared(1), 1);
+	ctrc_participant_ack_entries()[index].participant_boot_incarnation++;
+	before = ctrc_participant_entries()[index];
+	origin_log_enabled = cluster_trace_normal_stop = true;
+	UT_ASSERT_EQ(cluster_ctrc_participant_request_shared(&snapshot.key, &snapshot.identity,
+		snapshot.grant_generation, snapshot.seal_generation, CTRC_SEAL_CLOSE_AND_CLEAN,
+		&reason, &ack), CTRC_SEAL_REPLY_BLOCKED_RETAIN);
+	UT_ASSERT_EQ(reason, CTRC_SEAL_REASON_ACK_UNAVAILABLE);
+	UT_ASSERT_EQ(memcmp(&before, &ctrc_participant_entries()[index], sizeof(before)), 0);
+	UT_ASSERT(strstr(participant_logs[0], "summary_present=1 summary_tuple_matches=0 ") != NULL);
+	UT_ASSERT(strstr(participant_logs[0], "first_failed=ack_unavailable ") != NULL);
+}
+
+UT_TEST(test_participant_stop_trace_ack_first_failure_is_not_overwritten)
+{
+	const char *failures[] = {"first.snapshot_released", "second.ack_equal", "freeze.receipt_exact"};
+	for (unsigned phase = 0; phase < lengthof(failures); phase++) {
+		ClusterCtrcParticipantEntry snapshot;
+		ClusterCtrcReceipt receipt;
+		ClusterCtrcLocalReleaseAckV1 expected;
+		uint64 index, receipt_index;
+		char field[128];
+
+		reset_fixture(); UT_ASSERT(seed_cancelled_ack(&snapshot, &receipt, &expected, &index, &receipt_index));
+		drift_receipt_index = receipt_index; drift_at_capture = 1;
+		if (phase == 0) ctrc_receipt_entries()[receipt_index].required_lsn[1] = 1;
+		else if (phase == 1) durability_hook = drift_during_capture;
+		else {
+			barrier_hook = drift_during_barrier;
+			UT_ASSERT(cluster_ctrc_test_barrier_control(CTRC_TEST_BARRIER_ACK_DURABLE, true));
+		}
+		origin_log_enabled = cluster_trace_normal_stop = true;
+		UT_ASSERT_EQ(ctrc_participant_freeze_ack_batch_shared(1), 0);
+		UT_ASSERT_EQ(participant_log_count, 1);
+		snprintf(field, sizeof(field), "first_failed=%s ", failures[phase]);
+		UT_ASSERT(strstr(participant_logs[0], field) != NULL);
+		UT_ASSERT(strstr(participant_logs[0], "frozen=0 ") != NULL);
+		UT_ASSERT_EQ(ctrc_receipt_entries()[receipt_index].state, CTRC_RECEIPT_CANCELLED);
+		UT_ASSERT(ctrc_bytes_zero(&ctrc_participant_ack_entries()[index], sizeof(expected)));
+		UT_ASSERT_EQ(allocated, 0); UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
+UT_TEST(test_participant_stop_trace_toggle_preserves_original_shared_effects)
+{
+	ClusterCtrcParticipantEntry participants[2];
+	ClusterCtrcReceipt receipts[2];
+	ClusterCtrcLocalReleaseAckV1 summaries[2];
+	unsigned locks[2];
+	Size visits[2][6];
+
+	for (unsigned enabled = 0; enabled < 2; enabled++) {
+		ClusterCtrcParticipantEntry snapshot;
+		ClusterCtrcReceipt receipt;
+		ClusterCtrcLocalReleaseAckV1 expected, ack;
+		uint64 index, receipt_index;
+		uint16 reason;
+
+		reset_fixture(); UT_ASSERT(seed_cancelled_ack(&snapshot, &receipt, &expected, &index, &receipt_index));
+		origin_log_enabled = true; cluster_trace_normal_stop = enabled;
+		MemSet(table_visits, 0, sizeof(table_visits));
+		UT_ASSERT_EQ(cluster_ctrc_participant_request_shared(&snapshot.key, &snapshot.identity,
+			snapshot.grant_generation, snapshot.seal_generation, CTRC_SEAL_CLOSE_AND_CLEAN,
+			&reason, &ack), CTRC_SEAL_REPLY_PENDING_DRAIN);
+		UT_ASSERT_EQ(ctrc_participant_freeze_ack_batch_shared(1), 1);
+		UT_ASSERT_EQ(participant_log_count, enabled ? 2 : 0);
+		participants[enabled] = ctrc_participant_entries()[index];
+		receipts[enabled] = ctrc_receipt_entries()[receipt_index];
+		summaries[enabled] = ctrc_participant_ack_entries()[index];
+		locks[enabled] = sleepable_acquisitions;
+		memcpy(visits[enabled], table_visits, sizeof(table_visits));
+	}
+	UT_ASSERT_EQ(memcmp(&participants[0], &participants[1], sizeof(participants[0])), 0);
+	UT_ASSERT_EQ(memcmp(&receipts[0], &receipts[1], sizeof(receipts[0])), 0);
+	UT_ASSERT_EQ(memcmp(&summaries[0], &summaries[1], sizeof(summaries[0])), 0);
+	UT_ASSERT_EQ(locks[0], locks[1]);
+	/* ACK-ready scan cursor is process-local and deliberately persists; all
+	 * receipt-copy/final-freeze table visits must nevertheless be identical. */
+	for (unsigned kind = 1; kind < lengthof(table_visits); kind++)
+		UT_ASSERT_EQ(visits[0][kind], visits[1][kind]);
+}
+
+UT_TEST(test_participant_stop_trace_unsafe_context_suppresses_output)
+{
+	for (unsigned kind = 0; kind < 2; kind++) {
+		ClusterCtrcParticipantEntry snapshot;
+		ClusterCtrcReceipt receipt;
+		ClusterCtrcLocalReleaseAckV1 expected, ack;
+		uint64 index, receipt_index;
+		uint16 reason;
+		reset_fixture(); UT_ASSERT(seed_cancelled_ack(&snapshot, &receipt, &expected, &index, &receipt_index));
+		origin_log_enabled = cluster_trace_normal_stop = true;
+		if (kind == 0) CritSectionCount = 1;
+		else LWLockAcquire(&CtrcShared->origin_lock, LW_SHARED);
+		UT_ASSERT_EQ(cluster_ctrc_participant_request_shared(&snapshot.key, &snapshot.identity,
+			snapshot.grant_generation, snapshot.seal_generation, CTRC_SEAL_CLOSE_AND_CLEAN,
+			&reason, &ack), CTRC_SEAL_REPLY_PENDING_DRAIN);
+		if (kind == 0) CritSectionCount = 0;
+		else LWLockRelease(&CtrcShared->origin_lock);
+		UT_ASSERT_EQ(participant_log_count, 0);
+		UT_ASSERT_EQ(ctrc_participant_entries()[index].state, CTRC_PARTICIPANT_ACK_READY);
+	}
+}
+
+UT_TEST(test_participant_stop_trace_exception_releases_only_observation_owner)
+{
+	for (unsigned at_log = 0; at_log < 2; at_log++) {
+		ClusterCtrcParticipantEntry snapshot;
+		ClusterCtrcReceipt receipt;
+		ClusterCtrcLocalReleaseAckV1 expected;
+		uint64 index, receipt_index;
+		volatile bool caught = false;
+
+		reset_fixture(); UT_ASSERT(seed_cancelled_ack(&snapshot, &receipt, &expected, &index, &receipt_index));
+		origin_log_enabled = cluster_trace_normal_stop = true;
+		if (at_log) origin_log_throw = true;
+		else durability_hook = throw_during_capture;
+		PG_TRY();
+		{
+			(void)ctrc_participant_freeze_ack_batch_shared(1);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(allocated, 0); UT_ASSERT_EQ(held_count, 0);
+		UT_ASSERT_EQ(ctrc_participant_entries()[index].state,
+			at_log ? CTRC_PARTICIPANT_ACK_FROZEN : CTRC_PARTICIPANT_ACK_READY);
+		UT_ASSERT_EQ(ctrc_receipt_entries()[receipt_index].state,
+			at_log ? CTRC_RECEIPT_ACK_FROZEN : CTRC_RECEIPT_CANCELLED);
+		if (at_log)
+			UT_ASSERT_EQ(memcmp(&ctrc_participant_ack_entries()[index], &expected, sizeof(expected)), 0);
+		else
+			UT_ASSERT(ctrc_bytes_zero(&ctrc_participant_ack_entries()[index], sizeof(expected)));
+
+		/* A later real pass must acquire a fresh observation owner after either
+		 * native durability error or diagnostic output error, with no retry. */
+		reset_fixture(); UT_ASSERT(seed_cancelled_ack(&snapshot, &receipt, &expected, &index, &receipt_index));
+		origin_log_enabled = cluster_trace_normal_stop = true;
+		UT_ASSERT_EQ(ctrc_participant_freeze_ack_batch_shared(1), 1);
+		UT_ASSERT_EQ(participant_log_count, 1);
+		UT_ASSERT(strstr(participant_logs[0], "first_failed=none ") != NULL);
+		UT_ASSERT(strstr(participant_logs[0], "capture_phase=freeze.exact ") != NULL);
+		UT_ASSERT_EQ(allocated, 0);
+	}
+}
+
 int
 main(void)
 {
@@ -7020,7 +7257,14 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(167);
+	UT_PLAN(174);
+	UT_RUN(test_participant_stop_trace_exception_releases_only_observation_owner);
+	UT_RUN(test_participant_stop_trace_reports_prepared_and_applied_pending);
+	UT_RUN(test_participant_stop_trace_distinguishes_nonempty_ack_wait_and_frozen_reply);
+	UT_RUN(test_participant_stop_trace_exposes_frozen_ack_identity_refusal);
+	UT_RUN(test_participant_stop_trace_ack_first_failure_is_not_overwritten);
+	UT_RUN(test_participant_stop_trace_toggle_preserves_original_shared_effects);
+	UT_RUN(test_participant_stop_trace_unsafe_context_suppresses_output);
 	UT_RUN(test_receipt_observed_identity_refusal_precedes_chain_blocking);
 	UT_RUN(test_receipt_original_identity_refusal_precedes_chain_blocking);
 	UT_RUN(test_prepare_path_namespace_precedes_input_and_resets_output);
