@@ -349,6 +349,10 @@ CreateCommandTag(Node *statement)
 		return CMDTAG_ALTER_USER_MAPPING;
 	if (IsA(statement, DropUserMappingStmt))
 		return CMDTAG_DROP_USER_MAPPING;
+	if (IsA(statement, CreatePublicationStmt))
+		return CMDTAG_CREATE_PUBLICATION;
+	if (IsA(statement, AlterPublicationStmt))
+		return CMDTAG_ALTER_PUBLICATION;
 	if (IsA(statement, AlterSeqStmt))
 		return CMDTAG_ALTER_SEQUENCE;
 	if (IsA(statement, AlterTSDictionaryStmt))
@@ -463,6 +467,10 @@ GetCommandTagName(CommandTag tag)
 		return "ALTER USER MAPPING";
 	if (tag == CMDTAG_DROP_USER_MAPPING)
 		return "DROP USER MAPPING";
+	if (tag == CMDTAG_CREATE_PUBLICATION)
+		return "CREATE PUBLICATION";
+	if (tag == CMDTAG_ALTER_PUBLICATION)
+		return "ALTER PUBLICATION";
 	if (tag == CMDTAG_ALTER_SEQUENCE)
 		return "ALTER SEQUENCE";
 	if (tag == CMDTAG_ALTER_TEXT_SEARCH_DICTIONARY)
@@ -1769,6 +1777,45 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 										   .options = &mapping_options };
 	DropUserMappingStmt drop_mapping
 		= { .type = T_DropUserMappingStmt, .user = &mapping_user, .servername = "target_server" };
+	String publish_value = { .type = T_String, .sval = "insert" };
+	DefElem publish_option
+		= { .type = T_DefElem, .defname = "publish", .arg = (Node *)&publish_value };
+	ListCell publish_option_cell = { .ptr_value = &publish_option };
+	List publish_options
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &publish_option_cell };
+	PublicationTable publication_table
+		= { .type = T_PublicationTable, .relation = &stats_relation };
+	PublicationObjSpec publication_table_spec = { .type = T_PublicationObjSpec,
+												  .pubobjtype = PUBLICATIONOBJ_TABLE,
+												  .pubtable = &publication_table };
+	PublicationObjSpec publication_schema_spec = { .type = T_PublicationObjSpec,
+												   .pubobjtype = PUBLICATIONOBJ_TABLES_IN_SCHEMA,
+												   .name = "target_schema" };
+	ListCell publication_cells[2]
+		= { { .ptr_value = &publication_table_spec }, { .ptr_value = &publication_schema_spec } };
+	List publication_objects
+		= { .type = T_List, .length = 2, .max_length = 2, .elements = publication_cells };
+	CreatePublicationStmt create_publication = { .type = T_CreatePublicationStmt,
+												 .pubname = "target_publication",
+												 .options = &publish_options };
+	CreatePublicationStmt create_publication_objects = { .type = T_CreatePublicationStmt,
+														 .pubname = "target_publication",
+														 .pubobjects = &publication_objects };
+	AlterPublicationStmt alter_publication_options = { .type = T_AlterPublicationStmt,
+													   .pubname = "target_publication",
+													   .options = &publish_options };
+	AlterPublicationStmt publication_add = { .type = T_AlterPublicationStmt,
+											 .pubname = "target_publication",
+											 .pubobjects = &publication_objects,
+											 .action = AP_AddObjects };
+	AlterPublicationStmt publication_drop = { .type = T_AlterPublicationStmt,
+											  .pubname = "target_publication",
+											  .pubobjects = &publication_objects,
+											  .action = AP_DropObjects };
+	AlterPublicationStmt publication_set = { .type = T_AlterPublicationStmt,
+											 .pubname = "target_publication",
+											 .pubobjects = &publication_objects,
+											 .action = AP_SetObjects };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -1826,7 +1873,13 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 						   (Node *)&alter_server,
 						   (Node *)&create_mapping,
 						   (Node *)&alter_mapping,
-						   (Node *)&drop_mapping };
+						   (Node *)&drop_mapping,
+						   (Node *)&create_publication,
+						   (Node *)&create_publication_objects,
+						   (Node *)&alter_publication_options,
+						   (Node *)&publication_add,
+						   (Node *)&publication_drop,
+						   (Node *)&publication_set };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned skip = 0; skip < 2; skip++) {
@@ -1858,6 +1911,8 @@ UT_TEST(test_catalog_writes_bind_before_later_work_and_reuse_top)
 			alter_server.version = skip ? NULL : "preflight";
 			mapping_user.roletype = skip ? ROLESPEC_PUBLIC : ROLESPEC_CURRENT_USER;
 			mapping_option.defaction = skip ? DEFELEM_SET : DEFELEM_ADD;
+			create_publication.for_all_tables = skip != 0;
+			publish_value.sval = skip ? "insert, update" : "insert";
 			create_sql_entry(statements[i]);
 			UT_ASSERT_EQ(utility_unbound, 0);
 			UT_ASSERT_EQ(utility_after_preflight, 1);
@@ -2060,6 +2115,45 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 										   .options = &mapping_options };
 	DropUserMappingStmt drop_mapping
 		= { .type = T_DropUserMappingStmt, .user = &mapping_user, .servername = "target_server" };
+	String publish_value = { .type = T_String, .sval = "insert" };
+	DefElem publish_option
+		= { .type = T_DefElem, .defname = "publish", .arg = (Node *)&publish_value };
+	ListCell publish_option_cell = { .ptr_value = &publish_option };
+	List publish_options
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &publish_option_cell };
+	PublicationTable publication_table
+		= { .type = T_PublicationTable, .relation = &stats_relation };
+	PublicationObjSpec publication_table_spec = { .type = T_PublicationObjSpec,
+												  .pubobjtype = PUBLICATIONOBJ_TABLE,
+												  .pubtable = &publication_table };
+	PublicationObjSpec publication_schema_spec = { .type = T_PublicationObjSpec,
+												   .pubobjtype = PUBLICATIONOBJ_TABLES_IN_SCHEMA,
+												   .name = "target_schema" };
+	ListCell publication_cells[2]
+		= { { .ptr_value = &publication_table_spec }, { .ptr_value = &publication_schema_spec } };
+	List publication_objects
+		= { .type = T_List, .length = 2, .max_length = 2, .elements = publication_cells };
+	CreatePublicationStmt create_publication = { .type = T_CreatePublicationStmt,
+												 .pubname = "target_publication",
+												 .options = &publish_options };
+	CreatePublicationStmt create_publication_objects = { .type = T_CreatePublicationStmt,
+														 .pubname = "target_publication",
+														 .pubobjects = &publication_objects };
+	AlterPublicationStmt alter_publication_options = { .type = T_AlterPublicationStmt,
+													   .pubname = "target_publication",
+													   .options = &publish_options };
+	AlterPublicationStmt publication_add = { .type = T_AlterPublicationStmt,
+											 .pubname = "target_publication",
+											 .pubobjects = &publication_objects,
+											 .action = AP_AddObjects };
+	AlterPublicationStmt publication_drop = { .type = T_AlterPublicationStmt,
+											  .pubname = "target_publication",
+											  .pubobjects = &publication_objects,
+											  .action = AP_DropObjects };
+	AlterPublicationStmt publication_set = { .type = T_AlterPublicationStmt,
+											 .pubname = "target_publication",
+											 .pubobjects = &publication_objects,
+											 .action = AP_SetObjects };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -2117,7 +2211,13 @@ UT_TEST(test_catalog_writes_publication_refusal_precedes_later_work)
 						   (Node *)&alter_server,
 						   (Node *)&create_mapping,
 						   (Node *)&alter_mapping,
-						   (Node *)&drop_mapping };
+						   (Node *)&drop_mapping,
+						   (Node *)&create_publication,
+						   (Node *)&create_publication_objects,
+						   (Node *)&alter_publication_options,
+						   (Node *)&publication_add,
+						   (Node *)&publication_drop,
+						   (Node *)&publication_set };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		int caught;
@@ -2284,6 +2384,45 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 										   .options = &mapping_options };
 	DropUserMappingStmt drop_mapping
 		= { .type = T_DropUserMappingStmt, .user = &mapping_user, .servername = "target_server" };
+	String publish_value = { .type = T_String, .sval = "insert" };
+	DefElem publish_option
+		= { .type = T_DefElem, .defname = "publish", .arg = (Node *)&publish_value };
+	ListCell publish_option_cell = { .ptr_value = &publish_option };
+	List publish_options
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &publish_option_cell };
+	PublicationTable publication_table
+		= { .type = T_PublicationTable, .relation = &stats_relation };
+	PublicationObjSpec publication_table_spec = { .type = T_PublicationObjSpec,
+												  .pubobjtype = PUBLICATIONOBJ_TABLE,
+												  .pubtable = &publication_table };
+	PublicationObjSpec publication_schema_spec = { .type = T_PublicationObjSpec,
+												   .pubobjtype = PUBLICATIONOBJ_TABLES_IN_SCHEMA,
+												   .name = "target_schema" };
+	ListCell publication_cells[2]
+		= { { .ptr_value = &publication_table_spec }, { .ptr_value = &publication_schema_spec } };
+	List publication_objects
+		= { .type = T_List, .length = 2, .max_length = 2, .elements = publication_cells };
+	CreatePublicationStmt create_publication = { .type = T_CreatePublicationStmt,
+												 .pubname = "target_publication",
+												 .options = &publish_options };
+	CreatePublicationStmt create_publication_objects = { .type = T_CreatePublicationStmt,
+														 .pubname = "target_publication",
+														 .pubobjects = &publication_objects };
+	AlterPublicationStmt alter_publication_options = { .type = T_AlterPublicationStmt,
+													   .pubname = "target_publication",
+													   .options = &publish_options };
+	AlterPublicationStmt publication_add = { .type = T_AlterPublicationStmt,
+											 .pubname = "target_publication",
+											 .pubobjects = &publication_objects,
+											 .action = AP_AddObjects };
+	AlterPublicationStmt publication_drop = { .type = T_AlterPublicationStmt,
+											  .pubname = "target_publication",
+											  .pubobjects = &publication_objects,
+											  .action = AP_DropObjects };
+	AlterPublicationStmt publication_set = { .type = T_AlterPublicationStmt,
+											 .pubname = "target_publication",
+											 .pubobjects = &publication_objects,
+											 .action = AP_SetObjects };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -2341,7 +2480,13 @@ UT_TEST(test_catalog_writes_child_or_wrong_top_refuses_before_allocation)
 						   (Node *)&alter_server,
 						   (Node *)&create_mapping,
 						   (Node *)&alter_mapping,
-						   (Node *)&drop_mapping };
+						   (Node *)&drop_mapping,
+						   (Node *)&create_publication,
+						   (Node *)&create_publication_objects,
+						   (Node *)&alter_publication_options,
+						   (Node *)&publication_add,
+						   (Node *)&publication_drop,
+						   (Node *)&publication_set };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned child = 0; child < 2; child++) {
@@ -2514,6 +2659,45 @@ UT_TEST(test_catalog_writes_preflight_requires_shared_catalog_storage)
 										   .options = &mapping_options };
 	DropUserMappingStmt drop_mapping
 		= { .type = T_DropUserMappingStmt, .user = &mapping_user, .servername = "target_server" };
+	String publish_value = { .type = T_String, .sval = "insert" };
+	DefElem publish_option
+		= { .type = T_DefElem, .defname = "publish", .arg = (Node *)&publish_value };
+	ListCell publish_option_cell = { .ptr_value = &publish_option };
+	List publish_options
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &publish_option_cell };
+	PublicationTable publication_table
+		= { .type = T_PublicationTable, .relation = &stats_relation };
+	PublicationObjSpec publication_table_spec = { .type = T_PublicationObjSpec,
+												  .pubobjtype = PUBLICATIONOBJ_TABLE,
+												  .pubtable = &publication_table };
+	PublicationObjSpec publication_schema_spec = { .type = T_PublicationObjSpec,
+												   .pubobjtype = PUBLICATIONOBJ_TABLES_IN_SCHEMA,
+												   .name = "target_schema" };
+	ListCell publication_cells[2]
+		= { { .ptr_value = &publication_table_spec }, { .ptr_value = &publication_schema_spec } };
+	List publication_objects
+		= { .type = T_List, .length = 2, .max_length = 2, .elements = publication_cells };
+	CreatePublicationStmt create_publication = { .type = T_CreatePublicationStmt,
+												 .pubname = "target_publication",
+												 .options = &publish_options };
+	CreatePublicationStmt create_publication_objects = { .type = T_CreatePublicationStmt,
+														 .pubname = "target_publication",
+														 .pubobjects = &publication_objects };
+	AlterPublicationStmt alter_publication_options = { .type = T_AlterPublicationStmt,
+													   .pubname = "target_publication",
+													   .options = &publish_options };
+	AlterPublicationStmt publication_add = { .type = T_AlterPublicationStmt,
+											 .pubname = "target_publication",
+											 .pubobjects = &publication_objects,
+											 .action = AP_AddObjects };
+	AlterPublicationStmt publication_drop = { .type = T_AlterPublicationStmt,
+											  .pubname = "target_publication",
+											  .pubobjects = &publication_objects,
+											  .action = AP_DropObjects };
+	AlterPublicationStmt publication_set = { .type = T_AlterPublicationStmt,
+											 .pubname = "target_publication",
+											 .pubobjects = &publication_objects,
+											 .action = AP_SetObjects };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -2571,7 +2755,13 @@ UT_TEST(test_catalog_writes_preflight_requires_shared_catalog_storage)
 						   (Node *)&alter_server,
 						   (Node *)&create_mapping,
 						   (Node *)&alter_mapping,
-						   (Node *)&drop_mapping };
+						   (Node *)&drop_mapping,
+						   (Node *)&create_publication,
+						   (Node *)&create_publication_objects,
+						   (Node *)&alter_publication_options,
+						   (Node *)&publication_add,
+						   (Node *)&publication_drop,
+						   (Node *)&publication_set };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned mode = 0; mode < 8; mode++) {
@@ -2736,6 +2926,45 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 										   .options = &mapping_options };
 	DropUserMappingStmt drop_mapping
 		= { .type = T_DropUserMappingStmt, .user = &mapping_user, .servername = "target_server" };
+	String publish_value = { .type = T_String, .sval = "insert" };
+	DefElem publish_option
+		= { .type = T_DefElem, .defname = "publish", .arg = (Node *)&publish_value };
+	ListCell publish_option_cell = { .ptr_value = &publish_option };
+	List publish_options
+		= { .type = T_List, .length = 1, .max_length = 1, .elements = &publish_option_cell };
+	PublicationTable publication_table
+		= { .type = T_PublicationTable, .relation = &stats_relation };
+	PublicationObjSpec publication_table_spec = { .type = T_PublicationObjSpec,
+												  .pubobjtype = PUBLICATIONOBJ_TABLE,
+												  .pubtable = &publication_table };
+	PublicationObjSpec publication_schema_spec = { .type = T_PublicationObjSpec,
+												   .pubobjtype = PUBLICATIONOBJ_TABLES_IN_SCHEMA,
+												   .name = "target_schema" };
+	ListCell publication_cells[2]
+		= { { .ptr_value = &publication_table_spec }, { .ptr_value = &publication_schema_spec } };
+	List publication_objects
+		= { .type = T_List, .length = 2, .max_length = 2, .elements = publication_cells };
+	CreatePublicationStmt create_publication = { .type = T_CreatePublicationStmt,
+												 .pubname = "target_publication",
+												 .options = &publish_options };
+	CreatePublicationStmt create_publication_objects = { .type = T_CreatePublicationStmt,
+														 .pubname = "target_publication",
+														 .pubobjects = &publication_objects };
+	AlterPublicationStmt alter_publication_options = { .type = T_AlterPublicationStmt,
+													   .pubname = "target_publication",
+													   .options = &publish_options };
+	AlterPublicationStmt publication_add = { .type = T_AlterPublicationStmt,
+											 .pubname = "target_publication",
+											 .pubobjects = &publication_objects,
+											 .action = AP_AddObjects };
+	AlterPublicationStmt publication_drop = { .type = T_AlterPublicationStmt,
+											  .pubname = "target_publication",
+											  .pubobjects = &publication_objects,
+											  .action = AP_DropObjects };
+	AlterPublicationStmt publication_set = { .type = T_AlterPublicationStmt,
+											 .pubname = "target_publication",
+											 .pubobjects = &publication_objects,
+											 .action = AP_SetObjects };
 	Node *statements[] = { (Node *)&schema,
 						   (Node *)&sequence,
 						   (Node *)&index,
@@ -2793,7 +3022,13 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 						   (Node *)&alter_server,
 						   (Node *)&create_mapping,
 						   (Node *)&alter_mapping,
-						   (Node *)&drop_mapping };
+						   (Node *)&drop_mapping,
+						   (Node *)&create_publication,
+						   (Node *)&create_publication_objects,
+						   (Node *)&alter_publication_options,
+						   (Node *)&publication_add,
+						   (Node *)&publication_drop,
+						   (Node *)&publication_set };
 	const char *tags[] = { "CREATE SCHEMA",
 						   "CREATE SEQUENCE",
 						   "CREATE INDEX",
@@ -2851,7 +3086,13 @@ UT_TEST(test_catalog_writes_readonly_parallel_guards_precede_binding)
 						   "ALTER SERVER",
 						   "CREATE USER MAPPING",
 						   "ALTER USER MAPPING",
-						   "DROP USER MAPPING" };
+						   "DROP USER MAPPING",
+						   "CREATE PUBLICATION",
+						   "CREATE PUBLICATION",
+						   "ALTER PUBLICATION",
+						   "ALTER PUBLICATION",
+						   "ALTER PUBLICATION",
+						   "ALTER PUBLICATION" };
 
 	for (unsigned i = 0; i < lengthof(statements); i++) {
 		for (unsigned parallel = 0; parallel < 2; parallel++) {
