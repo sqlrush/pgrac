@@ -15108,7 +15108,7 @@ cluster_gcs_block_resource_x_bootstrap_tick(const ResourceXBootstrapWork *work)
 				ready = true;
 				/* The existing fused path already created the canonical request;
 				 * ordinary local-proof bootstrap still sends its exact ACK. */
-				if (outbound.kind != RESOURCE_X_WIRE_ASSERT_X
+				if (!work->has_acquire_intent && outbound.kind != RESOURCE_X_WIRE_ASSERT_X
 					&& gcs_block_resource_x_bootstrap_admitted(work, &admission)
 						   == RESOURCE_X_APPLY_APPLIED)
 					(void)gcs_block_resource_x_bootstrap_ack_stage_exact(

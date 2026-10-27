@@ -4616,7 +4616,7 @@ UT_TEST(test_resource_x_acquire_queue_never_uses_legacy_ack_or_assert)
 		return;
 	work = bootstrap_next_work();
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_resume_exact(&work, &out),
-				 RESOURCE_X_APPLY_BAD_STATE);
+				 RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(out.kind, 0);
 	UT_ASSERT(cluster_pcm_lock_resource_x_s_barrier_active_exact(&frame.common.logical_assertion.resource));
 	legacy = make_resource_x_master_frame(RESOURCE_X_WIRE_ASSERT_X,

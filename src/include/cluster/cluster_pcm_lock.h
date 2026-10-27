@@ -1567,7 +1567,10 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_bootstrap_request_exact(
 	uint32 authenticated_ingress_connection_generation, uint64 r4_record_generation,
 	uint64 current_master_session_incarnation, uint32 master_sender_connection_generation,
 	ResourceXDecodedFrame *ack_out);
-/* LMS must revalidate current semantic, peer and session admission first. */
+/* LMS must revalidate current semantic, peer and session admission first.
+ * V3 hands the same FIFO head to the original unsealed canonical queue;
+ * its full identity remains retained and ack_out stays empty. Forget may
+ * retire this pair only while no conditional service responsibility exists. */
 extern ResourceXApplyResult
 cluster_pcm_lock_resource_x_bootstrap_resume_exact(const ResourceXBootstrapWork *work,
 												   ResourceXDecodedFrame *ack_out);
