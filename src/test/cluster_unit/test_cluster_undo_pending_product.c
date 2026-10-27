@@ -49,6 +49,21 @@ undo_pending_test_reserve(ClusterUndoRecordPrepareReceipt *receipt, uint16 segme
 	receipt->payload_capacity = 128;
 	receipt->tt_slot_segment_id = segment;
 	receipt->tt_slot_offset = offset;
+	/* Explicit synthetic top capture for the caller's backend-local boundary.
+	 * The real pending consumer now checks this immutable receipt identity. */
+	receipt->operation.top
+		= (ClusterCanonicalTxnBinding){ .segment_id = segment,
+										.segment_generation = 23,
+										.xid = 797,
+										.slot_offset = offset,
+										.slot_wrap = 7,
+										.origin_instance = 1,
+										.publish_state = CLUSTER_CANONICAL_TXN_PUBLISHED,
+										.active_lsn = 1 };
+	receipt->operation.top_fxid = FullTransactionIdFromU64(797);
+	receipt->operation.operation_fxid = receipt->operation.top_fxid;
+	receipt->operation.operation_sequence = 1;
+	receipt->operation.subid = TopSubTransactionId;
 	receipt->actual_segment_id = 1;
 	receipt->reservation_sequence = 17;
 	receipt->absolute_deadline_us = 1000;

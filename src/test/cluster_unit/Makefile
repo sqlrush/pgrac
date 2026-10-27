@@ -7506,6 +7506,7 @@ test_cluster_retained_remote: test_cluster_retained_remote.c test_cluster_retain
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 CLUSTER_R4_RUNTIME_VIS_TEST_O = test_cluster_r4_runtime_visibility_exact.o
+CLUSTER_SAVEPOINT_READER_O = $(top_builddir)/src/backend/cluster/cluster_savepoint_reader.o
 CLUSTER_R4_RUNTIME_VIS_UBA_O = $(top_builddir)/src/backend/cluster/cluster_uba.o
 CLUSTER_MULTIXACT_CURRENT_O = $(top_builddir)/src/backend/cluster/cluster_multixact_current.o
 CLUSTER_MULTIXACT_CURRENT_WIRE_O = \
@@ -7515,6 +7516,8 @@ CLUSTER_MULTIXACT_CURRENT_WIRE_O = \
 $(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
 		test_cluster_undo_pending_product.o: $(top_srcdir)/src/include/cluster/cluster_tx_resolve.h
 $(CLUSTER_R4_RUNTIME_VIS_TEST_O): $(top_srcdir)/src/backend/cluster/cluster_runtime_visibility.c \
+		$(top_srcdir)/src/include/cluster/cluster_runtime_visibility.h \
+		$(top_srcdir)/src/include/cluster/cluster_savepoint_reader.h \
 		$(top_srcdir)/src/include/cluster/cluster_tx_resolve.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_record.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -ffunction-sections -fdata-sections -c $< -o $@
@@ -7532,6 +7535,9 @@ test_cluster_undo_pending_product.o: test_cluster_undo_pending_product.c \
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_r4_tx_outcome: test_cluster_r4_tx_outcome.c unit_test.h \
+		test_cluster_savepoint_origin_plan.inc $(CLUSTER_SAVEPOINT_READER_O) \
+		$(top_srcdir)/src/include/cluster/cluster_runtime_visibility.h \
+		$(top_srcdir)/src/include/cluster/cluster_savepoint_reader.h \
 		$(top_srcdir)/src/include/cluster/cluster_tx_resolve.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_record.h \
 		test_cluster_current_mx_local_sample.inc \
@@ -7540,6 +7546,7 @@ test_cluster_r4_tx_outcome: test_cluster_r4_tx_outcome.c unit_test.h \
 		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
 		$(CLUSTER_CR_SERVER_POLICY_O) $(CLUSTER_RUNTIME_VIS_POLICY_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_SAVEPOINT_READER_O) \
 		test_cluster_undo_pending_product.o \
 		$(CLUSTER_R4_RUNTIME_VIS_TEST_O) $(CLUSTER_R4_RUNTIME_VIS_UBA_O) \
 		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
@@ -7580,6 +7587,7 @@ test_cluster_sf_dep: test_cluster_sf_dep.c unit_test.h $(top_srcdir)/src/backend
 # handlers; function sections keep the fixture independent of legacy GCS code.
 CLUSTER_R4_GCS_BLOCK_TEST_O = test_cluster_r4_gcs_block_product.o
 $(CLUSTER_R4_GCS_BLOCK_TEST_O): $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c \
+		$(top_srcdir)/src/include/cluster/cluster_runtime_visibility.h \
 		$(top_srcdir)/src/include/cluster/cluster_gcs_block.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT \
 		-DCLUSTER_R4_ROUTE_POLICY_UNIT -ffunction-sections -fdata-sections \
@@ -7609,6 +7617,7 @@ test_cluster_current_mx_reply_builder.inc: $(top_srcdir)/src/backend/cluster/clu
 	mv $@.tmp $@
 
 test_cluster_r4_route_policy: test_cluster_r4_route_policy.c unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_runtime_visibility.h \
 		test_cluster_current_mx_reply_builder.inc \
 		test_cluster_pcm_snapshot_owner.inc test_cluster_gcs_read_rearm_owner.inc \
 		$(CLUSTER_VERSION_O) $(CLUSTER_R4_GCS_BLOCK_TEST_O) $(CLUSTER_PCM_OWN_O) \
@@ -10497,7 +10506,6 @@ test_cluster_undo_lifecycle: test_cluster_undo_lifecycle.c unit_test.h \
 # helpers (cluster_cr_apply.o) on a synthetic ITL page.  Chain walker /
 # tuple remap / visibility / MVCC gate coverage lives in cluster_tap t/215.
 CLUSTER_CR_APPLY_O = $(top_builddir)/src/backend/cluster/cluster_cr_apply.o
-CLUSTER_SAVEPOINT_READER_O = $(top_builddir)/src/backend/cluster/cluster_savepoint_reader.o
 test_cluster_savepoint_reader: test_cluster_savepoint_reader.c unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_cr_history.h \
 		$(top_srcdir)/src/include/cluster/cluster_savepoint_reader.h \

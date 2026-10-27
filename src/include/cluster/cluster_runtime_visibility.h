@@ -51,6 +51,8 @@ typedef enum ClusterTxResolveReason ClusterTxResolveReason;
 typedef enum ClusterTxOutcome ClusterTxOutcome;
 typedef struct ClusterTxLocator ClusterTxLocator;
 typedef struct ClusterTxResolution ClusterTxResolution;
+typedef struct ClusterSavepointOperation ClusterSavepointOperation;
+typedef struct ClusterSavepointReaderRecord ClusterSavepointReaderRecord;
 typedef struct ClusterSemanticAdmissionToken ClusterSemanticAdmissionToken;
 typedef struct ClusterUndoBlock0Generation ClusterUndoBlock0Generation;
 typedef union ClusterUndoBlock0CurrentGuard ClusterUndoBlock0CurrentGuard;
@@ -92,7 +94,7 @@ typedef struct ClusterCurrentMemberProofKey ClusterCurrentMemberProofKey;
 /* Stack/process-local continuation for the exact origin DATA -> canonical TT
  * -> DATA proof.  The representation is private to the provider; it is not a
  * wire or shared-memory ABI and never grants authority by itself. */
-#define CLUSTER_RUNTIME_VISIBILITY_ORIGIN_PLAN_BYTES 8704
+#define CLUSTER_RUNTIME_VISIBILITY_ORIGIN_PLAN_BYTES 8720
 typedef union ClusterRuntimeVisibilityOriginPlan {
 	uint64 align;
 	uint8 opaque[CLUSTER_RUNTIME_VISIBILITY_ORIGIN_PLAN_BYTES];
@@ -189,6 +191,28 @@ extern ClusterRuntimeVisibilityOriginStep cluster_runtime_visibility_origin_plan
 	const ClusterUndoBlock0Generation *expected_generation, ClusterUndoBlock0CurrentGuard *guard,
 	const ClusterUndoBlock0ResolvedRoot *root, ClusterRuntimeVisibilityOriginPlan *plan,
 	ClusterTxResolution *out, ClusterTxResolveReason *reason_out);
+
+/* Process-local continuation, no wire or transaction-parent service. expected
+ * must be independently qualified by the caller's original reader scope.
+ * Discovery never publishes: release DATA, acquire/sample canonical TT through
+ * sample_canonical_held, release TT, reacquire current DATA, then copy_operation.
+ * This order also applies when DATA and TT use the same segment. No guard or
+ * pin is retained by the plan. ACTIVE is never upgraded in this construction.
+ * Ordinary data-copy/recheck entries refuse these plans: disposition must not
+ * be dropped. Missing proof remains UNKNOWN, never an invisible success. */
+extern ClusterRuntimeVisibilityOriginStep
+cluster_runtime_visibility_origin_plan_freeze_operation_held(
+	const ClusterTxLocator *locator, const ClusterSavepointOperation *expected,
+	ClusterTxResolveMode mode, const ClusterSemanticAdmissionToken *admission,
+	const ClusterUndoBlock0Generation *expected_generation, ClusterUndoBlock0CurrentGuard *guard,
+	const ClusterUndoBlock0ResolvedRoot *root, ClusterRuntimeVisibilityOriginPlan *plan,
+	ClusterTxResolveReason *reason_out);
+extern ClusterTxOutcome cluster_runtime_visibility_origin_plan_copy_operation_held(
+	ClusterRuntimeVisibilityOriginPlan *plan, ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission, ClusterUndoBlock0CurrentGuard *guard,
+	const ClusterUndoBlock0ResolvedRoot *root, ClusterTxResolution *top_out,
+	ClusterSavepointReaderRecord *operation_out, char data_out[BLCKSZ],
+	ClusterTxResolveReason *reason_out);
 extern bool cluster_runtime_visibility_origin_plan_canonical_logical(
 	const ClusterRuntimeVisibilityOriginPlan *plan, ClusterUndoBlock0LogicalKey *logical_out);
 extern bool cluster_runtime_visibility_origin_plan_canonical_physical(

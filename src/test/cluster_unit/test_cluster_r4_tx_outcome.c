@@ -34,6 +34,10 @@
 #include "cluster/cluster_uba.h"
 #include "cluster/cluster_undo_record.h"
 #include "cluster/cluster_undo_record_api.h"
+#include "cluster/cluster_savepoint_reader.h"
+#include "cluster/cluster_qvotec.h"
+#include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_membership.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_undo_segment.h"
@@ -198,6 +202,20 @@ static int test_candidate_held_count;
 static int test_candidate_max_held_count;
 static int test_candidate_extract_calls;
 static bool test_candidate_mutate_record_on_recheck;
+static bool test_operation_page_enabled;
+static PGAlignedBlock test_operation_page;
+
+/* Existing pending-receipt tests model the backend-local top capture only;
+ * they do not execute the live frame/capture implementation. */
+bool
+cluster_savepoint_operation_matches_current(const ClusterSavepointOperation *operation)
+{
+	return operation != NULL && operation->top.xid == TEST_ORIGIN_XID
+		   && operation->top.origin_instance == 1 && operation->operation_sequence == 1
+		   && operation->subid == TopSubTransactionId
+		   && U64FromFullTransactionId(operation->top_fxid) == TEST_ORIGIN_XID
+		   && FullTransactionIdEquals(operation->top_fxid, operation->operation_fxid);
+}
 static ClusterUndoBlock0Result test_candidate_sample_result;
 static uint32 test_candidate_data_generation;
 static uint32 test_candidate_tt_generation;
@@ -1143,6 +1161,8 @@ cluster_undo_buf_copy_resident(uint32 segment_id, uint8 owner, uint32 block_no, 
 		&& (test_candidate_cold_copy_mask & (1u << (test_candidate_data_copy_calls - 1))) != 0)
 		return false;
 	memset(dst, 0x5a, BLCKSZ);
+	if (test_operation_page_enabled)
+		memcpy(dst, test_operation_page.data, BLCKSZ);
 	return true;
 }
 
@@ -1187,6 +1207,11 @@ cluster_cr_r4_extract_resident_record(const char resident_undo_page[BLCKSZ] pg_a
 									  ClusterTxLocator *canonical_locator_out)
 {
 	test_candidate_extract_calls++;
+	if (test_operation_page_enabled
+		&& !cluster_undo_record_validate_identity(
+			request_locator, request_locator->uba,
+			(const UndoRecordHeader *)(test_operation_page.data + sizeof(UndoBlockHeader)), NULL))
+		return false;
 	UT_ASSERT_EQ(request_locator->tt_wrap, TT_WRAP_INVALID);
 	if (test_candidate_mutate_record_on_recheck && test_candidate_extract_calls == 2)
 		test_origin_record.payload_length++;
@@ -1426,6 +1451,7 @@ reset_exact_origin_fixture(void)
 	test_candidate_max_held_count = 0;
 	test_candidate_extract_calls = 0;
 	test_candidate_mutate_record_on_recheck = false;
+	test_operation_page_enabled = false;
 	test_candidate_sample_result = CLUSTER_UNDO_BLOCK0_OK;
 	test_candidate_data_generation = 17;
 	test_candidate_tt_generation = 23;
@@ -7149,7 +7175,10 @@ UT_TEST(test_aborted_modification_projection_rejects_malformed_record_image)
 				else ((UndoDeletePayload *)test_origin_payload)->full_tuple_offset = BLCKSZ;
 				break;
 			case 7: test_origin_payload[old_offset + offsetof(HeapTupleHeaderData, t_hoff)] = 0; break;
-			case 8: test_origin_payload[old_offset + offsetof(HeapTupleHeaderData, t_hoff)] = UINT8_MAX; break;
+			case 8:
+				test_origin_payload[old_offset + offsetof(HeapTupleHeaderData, t_hoff)]
+					= (char)UINT8_MAX;
+				break;
 			case 9: test_origin_record.flags = 0; break;
 			}
 			resolve_creation_record(false, 0, &resolution);
@@ -7480,10 +7509,24 @@ UT_TEST(test_retained_slot_identity_does_not_escape_original_final_fences)
 	}
 }
 
+#include "test_cluster_savepoint_origin_plan.inc"
+
 int
 main(void)
 {
-	UT_PLAN(206);
+	UT_PLAN(218);
+	UT_RUN(test_operation_plan_requires_three_phases);
+	UT_RUN(test_operation_plan_consumes_post_top_discard);
+	UT_RUN(test_operation_plan_keeps_sampled_active);
+	UT_RUN(test_operation_plan_keeps_exact_abort);
+	UT_RUN(test_operation_plan_preserves_prepared);
+	UT_RUN(test_operation_plan_rejects_immutable_changes);
+	UT_RUN(test_operation_plan_rejects_discard_reversal);
+	UT_RUN(test_operation_plan_requires_exact_canonical);
+	UT_RUN(test_operation_plan_preserves_final_fences);
+	UT_RUN(test_operation_plan_cannot_escape_ordinary_api);
+	UT_RUN(test_operation_plan_rejects_bad_inputs);
+	UT_RUN(test_operation_plan_rejects_malformed_page);
 	UT_RUN(test_original_full_xid_reaches_same_and_cross_segment_census_result);
 	UT_RUN(test_original_full_xid_missing_or_key_alias_keeps_verdict_without_identity);
 	UT_RUN(test_original_full_xid_not_queried_for_other_roles_or_abort);

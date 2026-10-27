@@ -90,4 +90,52 @@ cluster_savepoint_reader_decode(const ClusterSavepointOperation *expected,
 	return true;
 }
 
+bool
+cluster_savepoint_reader_extract(const ClusterSavepointOperation *expected,
+								 const ClusterTxLocator *locator, const char page[BLCKSZ],
+								 char record_out[BLCKSZ], size_t *record_length_out,
+								 ClusterSavepointReaderRecord *out)
+{
+	UndoBlockHeader header;
+	UndoSlotDirEntry slot;
+	UndoRecordHeader record;
+	ClusterSavepointReaderRecord decoded;
+	uint32 segment, block;
+	uint16 tt_offset, row;
+	uint32 directory;
+
+	if (record_length_out != NULL)
+		*record_length_out = 0;
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (expected == NULL || locator == NULL || page == NULL || record_out == NULL
+		|| record_length_out == NULL || out == NULL
+		|| !uba_decode_record(locator->uba, &segment, &block, &tt_offset, &row))
+		return false;
+	memcpy(&header, page, sizeof(header));
+	if (header.magic != PGRAC_UNDO_BLOCK_MAGIC || header.block_version != UNDO_BLOCK_VERSION_1
+		|| header.slot_count == 0 || header.slot_count > (BLCKSZ - sizeof(header)) / sizeof(slot)
+		|| row >= header.slot_count)
+		return false;
+	directory = BLCKSZ - (uint32)header.slot_count * sizeof(slot);
+	if (header.free_offset < sizeof(header) || header.free_offset > directory)
+		return false;
+	memcpy(&slot, page + BLCKSZ - ((uint32)row + 1) * sizeof(slot), sizeof(slot));
+	if (slot.record_offset < sizeof(header) || slot.record_length < sizeof(record)
+		|| slot.record_offset > header.free_offset
+		|| slot.record_length > header.free_offset - slot.record_offset)
+		return false;
+	memcpy(&record, page + slot.record_offset, sizeof(record));
+	if (slot.record_type != record.record_type || slot.flags != record.flags
+		|| slot.record_length != sizeof(record) + (size_t)record.payload_length
+		|| !cluster_savepoint_reader_decode(expected, locator, locator->uba, &record,
+											page + slot.record_offset + sizeof(record),
+											record.payload_length, &decoded))
+		return false;
+	memmove(record_out, page + slot.record_offset, slot.record_length);
+	*record_length_out = slot.record_length;
+	*out = decoded;
+	return true;
+}
+
 #endif

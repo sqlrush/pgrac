@@ -46,5 +46,14 @@ extern bool cluster_savepoint_reader_decode(const ClusterSavepointOperation *exp
 											size_t payload_length,
 											ClusterSavepointReaderRecord *out);
 
+/* Extract only the addressed operation from an already-qualified resident
+ * DATA copy. Caller owns its block identity/CRC/current guard. Failure clears
+ * length/metadata, leaves record_out intact and never grants visibility. */
+extern bool cluster_savepoint_reader_extract(const ClusterSavepointOperation *expected,
+											 const ClusterTxLocator *locator,
+											 const char page[BLCKSZ], char record_out[BLCKSZ],
+											 size_t *record_length_out,
+											 ClusterSavepointReaderRecord *out);
+
 #endif
 #endif
