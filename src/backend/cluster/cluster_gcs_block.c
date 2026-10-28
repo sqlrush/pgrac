@@ -19723,9 +19723,9 @@ cluster_gcs_ctrc_dispatch_batch(const ClusterCtrcCloseDispatch *dispatches, Size
 	}
 }
 
-/* Explicit delegated-only merge reply: reconstruct the exact retained216B
+/* Explicit delegated-only merge/subtree reply: reconstruct the exact retained216B
  * request, authenticate its original child, and retain the parent's other
- * local/ancestor responsibility. No ACK or certificate is accepted here. */
+ * local/ancestor responsibility. Subtree proofs never grant origin release. */
 static void
 gcs_block_land_delegation_merge_reply(const ClusterICEnvelope *env,
 	const GcsBlockReplyHeader *outer, const uint8 *page)
@@ -19733,6 +19733,8 @@ gcs_block_land_delegation_merge_reply(const ClusterICEnvelope *env,
 	ClusterCtrcDelegationCloseV1 request;
 	ClusterCtrcSealReplyHeaderV1 header;
 	ClusterCtrcLocalReleaseAckV1 ignored_ack;
+	ClusterCtrcDelegatedSubtreeAckV1 subtree_ack;
+	bool subtree = page[4] == CLUSTER_CTRC_SUBTREE_ACK_WIRE_VERSION;
 	ClusterSemanticAdmissionToken admission = { 0 };
 	ClusterUndoBlock0ResolvedRoot root;
 	ClusterUndoBlock0LogicalKey logical;
@@ -19751,9 +19753,11 @@ gcs_block_land_delegation_merge_reply(const ClusterICEnvelope *env,
 		|| request.key.system_identifier != GetSystemIdentifier()
 		|| request.key.cluster_epoch != outer->epoch
 		|| !cluster_ctrc_delegation_close_encode_v1(&request, bytes, sizeof(bytes))
-		|| !cluster_ctrc_seal_reply_decode(page, GCS_BLOCK_DATA_SIZE, bytes, sizeof(bytes),
-			(int32)env->source_node_id, cluster_node_id, &header, &ignored_ack)
-		|| header.result != CTRC_SEAL_REPLY_DELEGATION_MERGED)
+		|| (subtree
+			? !cluster_ctrc_delegated_ack_reply_decode(page, GCS_BLOCK_DATA_SIZE, &request, &subtree_ack)
+			: (!cluster_ctrc_seal_reply_decode(page, GCS_BLOCK_DATA_SIZE, bytes, sizeof(bytes),
+				(int32)env->source_node_id, cluster_node_id, &header, &ignored_ack)
+				|| header.result != CTRC_SEAL_REPLY_DELEGATION_MERGED)))
 		return;
 	self_boot = cluster_qvotec_get_self_incarnation();
 	if (self_boot == 0 || self_boot != request.parent.boot_incarnation
@@ -19784,8 +19788,12 @@ gcs_block_land_delegation_merge_reply(const ClusterICEnvelope *env,
 			&& request.key.root_descriptor_incarnation == root.root_generation
 			&& cluster_semantic_activation_recheck_r4_terminal_census(&admission)
 			&& cluster_sf_peer_capability_generation_matches(request.receiver.node_id, required, connection)
-			&& cluster_semantic_activation_recheck_r4_terminal_census(&admission))
-			(void)cluster_ctrc_participant_delegation_merge_land_shared(&request);
+			&& cluster_semantic_activation_recheck_r4_terminal_census(&admission)) {
+			if (subtree)
+				(void)cluster_ctrc_participant_delegated_ack_land_shared(&request, &subtree_ack);
+			else
+				(void)cluster_ctrc_participant_delegation_merge_land_shared(&request);
+		}
 	}
 	PG_FINALLY();
 	{
@@ -19837,7 +19845,8 @@ gcs_block_try_land_ctrc_reply(const ClusterICEnvelope *env, const void *payload)
 		|| GcsBlockReplyHeaderGetForwardingMasterNode(outer) != GCS_BLOCK_REPLY_NO_FORWARDING_MASTER
 		|| outer->checksum != gcs_block_compute_checksum((const char *)page))
 		return true;
-	if (page[4] == CLUSTER_CTRC_DELEGATION_CLOSE_WIRE_VERSION && page[5] == 0) {
+	if ((page[4] == CLUSTER_CTRC_DELEGATION_CLOSE_WIRE_VERSION
+			|| page[4] == CLUSTER_CTRC_SUBTREE_ACK_WIRE_VERSION) && page[5] == 0) {
 		gcs_block_land_delegation_merge_reply(env, outer, page);
 		return true;
 	}
@@ -20346,6 +20355,7 @@ gcs_block_try_ctrc_forward136(const ClusterICEnvelope *env, const void *payload)
 	ClusterCtrcTxnKeyV1 key;
 	ClusterCtrcParticipantIdentity identity;
 	ClusterCtrcLocalReleaseAckV1 ack;
+	ClusterCtrcDelegatedSubtreeAckV1 subtree_ack;
 	ClusterSemanticAdmissionToken admission;
 	ClusterUndoBlock0LogicalKey logical;
 	ClusterUndoBlock0ResolvedRoot root;
@@ -20377,6 +20387,7 @@ gcs_block_try_ctrc_forward136(const ClusterICEnvelope *env, const void *payload)
 	MemSet(&key, 0, sizeof(key));
 	MemSet(&identity, 0, sizeof(identity));
 	MemSet(&ack, 0, sizeof(ack));
+	MemSet(&subtree_ack, 0, sizeof(subtree_ack));
 	MemSet(&admission, 0, sizeof(admission));
 	MemSet(&logical, 0, sizeof(logical));
 	MemSet(&root, 0, sizeof(root));
@@ -20476,15 +20487,27 @@ gcs_block_try_ctrc_forward136(const ClusterICEnvelope *env, const void *payload)
 							result = CTRC_SEAL_REPLY_DELEGATION_MERGED;
 							first_reason = 0;
 						}
+						if (result == CTRC_SEAL_REPLY_PENDING_DRAIN
+							&& cluster_ctrc_participant_delegated_subtree_ack_shared(&delegated_close, &subtree_ack)) {
+							result = CTRC_SEAL_REPLY_DELEGATION_SUBTREE_ACK;
+							first_reason = 0;
+						}
 					}
 				} else
 					result = cluster_ctrc_participant_request_shared(
 						&key, &identity, request.grant_generation, request.seal_generation,
 						(ClusterCtrcSealSuboperation)request.suboperation, &first_reason, &ack);
 				if ((result == CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK
-						|| result == CTRC_SEAL_REPLY_DELEGATION_MERGED)
-					&& !cluster_semantic_activation_recheck_r4_terminal_census(&admission)) {
+						|| result == CTRC_SEAL_REPLY_DELEGATION_MERGED
+						|| result == CTRC_SEAL_REPLY_DELEGATION_SUBTREE_ACK)
+					&& (!cluster_semantic_activation_recheck_r4_terminal_census(&admission)
+						|| (result == CTRC_SEAL_REPLY_DELEGATION_SUBTREE_ACK
+							&& (!cluster_sf_peer_capability_generation_matches((int32)env->source_node_id,
+								required_capabilities, source_capability_generation)
+								|| cluster_membership_get_last_admitted_incarnation(cluster_node_id) != self_incarnation
+								|| cluster_membership_get_last_admitted_incarnation((int32)env->source_node_id) != source_incarnation)))) {
 					MemSet(&ack, 0, sizeof(ack));
+					MemSet(&subtree_ack, 0, sizeof(subtree_ack));
 					first_reason = CTRC_SEAL_REASON_IDENTITY;
 					result = CTRC_SEAL_REPLY_BLOCKED_RETAIN;
 				}
@@ -20500,7 +20523,9 @@ gcs_block_try_ctrc_forward136(const ClusterICEnvelope *env, const void *payload)
 	reply = (char *)palloc0(reply_total);
 	outer = (GcsBlockReplyHeader *)reply;
 	page = (uint8 *)(reply + sizeof(*outer));
-	if (!cluster_ctrc_seal_reply_encode(
+	if (result == CTRC_SEAL_REPLY_DELEGATION_SUBTREE_ACK
+		? !cluster_ctrc_delegated_ack_reply_encode(&delegated_close, &subtree_ack, page, GCS_BLOCK_DATA_SIZE)
+		: !cluster_ctrc_seal_reply_encode(
 			(const uint8 *)payload, env->payload_length, cluster_node_id,
 			(int32)env->source_node_id, result, first_reason,
 			result == CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK ? &ack : NULL, page, GCS_BLOCK_DATA_SIZE)) {

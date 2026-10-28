@@ -42,6 +42,8 @@
 /* Explicit parent-bound CLOSE extension; wire2 keeps its origin-only meaning. */
 #define CLUSTER_CTRC_DELEGATION_CLOSE_V1_BYTES 216
 #define CLUSTER_CTRC_DELEGATION_CLOSE_WIRE_VERSION UINT16_C(3)
+#define CLUSTER_CTRC_SUBTREE_ACK_WIRE_VERSION UINT16_C(4)
+#define CLUSTER_CTRC_SUBTREE_ACK_BYTES 592
 #define CLUSTER_CTRC_REPLY_HEADER_BYTES 64
 #define CLUSTER_CTRC_LOCAL_ACK_BYTES 416
 #define CLUSTER_CTRC_REPLY_ACK_OFFSET 64
@@ -72,7 +74,9 @@ typedef enum ClusterCtrcSealReplyResult {
 	CTRC_SEAL_REPLY_BLOCKED_RETAIN = 3,
 	CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED = 4,
 	/* Explicit wire3 only: redundant pending custody, never a release ACK. */
-	CTRC_SEAL_REPLY_DELEGATION_MERGED = 5
+	CTRC_SEAL_REPLY_DELEGATION_MERGED = 5,
+	/* Explicit wire4 only. Retained subtree proof, not an origin release. */
+	CTRC_SEAL_REPLY_DELEGATION_SUBTREE_ACK = 6
 } ClusterCtrcSealReplyResult;
 
 typedef enum ClusterCtrcSealReason {
@@ -457,6 +461,12 @@ typedef struct ClusterCtrcParticipantEntry {
 	/* Original request-id domain, armed once per pending child. Neither an
 	 * enqueue nor a negative reply retires the custody it identifies. */
 	uint64 delegation_close_request_id[CLUSTER_CTRC_MAX_PARTICIPANTS];
+	/* Frozen child evidence never removes its custody or request correlation.
+	 * Digests bind the whole original request and explicit subtree proof. */
+	uint64 delegation_ack_bitmap;
+	uint64 delegation_subtree_bitmap[CLUSTER_CTRC_MAX_PARTICIPANTS];
+	uint8 delegation_ack_digest[CLUSTER_CTRC_MAX_PARTICIPANTS][32];
+	XLogRecPtr delegation_required_lsn[CLUSTER_SF_DEP_MAX_ORIGINS];
 } ClusterCtrcParticipantEntry;
 
 typedef struct ClusterCtrcReceipt {
@@ -569,6 +579,15 @@ typedef struct ClusterCtrcLocalReleaseAckV1 {
 	uint8 reserved[20];
 	uint32 crc32c;
 } ClusterCtrcLocalReleaseAckV1;
+
+typedef struct ClusterCtrcDelegatedSubtreeAckV1 {
+	ClusterCtrcLocalReleaseAckV1 local_ack;
+	uint64 subtree_bitmap;
+	uint8 children_digest_sha256[32];
+	XLogRecPtr required_lsn[CLUSTER_SF_DEP_MAX_ORIGINS];
+	uint32 crc32c;
+	uint32 reserved;
+} ClusterCtrcDelegatedSubtreeAckV1;
 
 typedef struct ClusterCtrcSealRequestV1 {
 	uint64 request_id;
@@ -909,6 +928,8 @@ StaticAssertDecl(sizeof(ClusterCtrcSealReplyHeaderV1) == CLUSTER_CTRC_REPLY_HEAD
 				 "CTRC reply header must remain exactly 64 bytes");
 StaticAssertDecl(sizeof(ClusterCtrcLocalReleaseAckV1) == CLUSTER_CTRC_LOCAL_ACK_BYTES,
 				 "CTRC local release ACK must remain exactly 416 bytes");
+StaticAssertDecl(sizeof(ClusterCtrcDelegatedSubtreeAckV1) == CLUSTER_CTRC_SUBTREE_ACK_BYTES,
+				 "CTRC subtree proof must remain exactly 592 bytes");
 StaticAssertDecl(offsetof(ClusterCtrcLocalReleaseAckV1, row_digest_sha256) == 224,
 				 "CTRC ACK digest offset must remain 224");
 StaticAssertDecl(offsetof(ClusterCtrcLocalReleaseAckV1, crc32c) == 412,
@@ -940,6 +961,18 @@ extern ClusterCtrcSealReplyResult cluster_ctrc_participant_delegated_close_share
  * CLOSED_DRAINING state; cannot authorize an ordinary ACK or certificate. */
 extern bool cluster_ctrc_participant_delegated_local_ack_shared(
 	const ClusterCtrcDelegationCloseV1 *request, ClusterCtrcLocalReleaseAckV1 *local_ack_out);
+/* Original non-root parent only: all retained children must have exact
+ * proofs before the original local freeze may contribute to this aggregate.
+ * Neither production nor consumption retires any parent/child or receipt. */
+extern bool cluster_ctrc_participant_delegated_subtree_ack_shared(
+	const ClusterCtrcDelegationCloseV1 *request, ClusterCtrcDelegatedSubtreeAckV1 *out);
+extern bool cluster_ctrc_participant_delegated_ack_land_shared(
+	const ClusterCtrcDelegationCloseV1 *request, const ClusterCtrcDelegatedSubtreeAckV1 *ack);
+extern bool cluster_ctrc_delegated_ack_reply_encode(
+	const ClusterCtrcDelegationCloseV1 *request, const ClusterCtrcDelegatedSubtreeAckV1 *ack,
+	uint8 *page, Size page_length);
+extern bool cluster_ctrc_delegated_ack_reply_decode(const uint8 *page, Size page_length,
+	const ClusterCtrcDelegationCloseV1 *request, ClusterCtrcDelegatedSubtreeAckV1 *out);
 /* Read-only observation of an already-qualified OPEN receiver whose immutable
  * original registration has a different parent (or a direct origin grant). */
 extern bool cluster_ctrc_participant_delegation_merge_observed_shared(

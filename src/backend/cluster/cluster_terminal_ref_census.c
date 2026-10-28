@@ -86,7 +86,7 @@
 #endif
 
 #define CLUSTER_CTRC_SHMEM_MAGIC UINT32_C(0x43545243)
-#define CLUSTER_CTRC_SHMEM_VERSION UINT32_C(18)
+#define CLUSTER_CTRC_SHMEM_VERSION UINT32_C(19)
 #ifndef CLUSTER_CTRC_TEST_TABLE_VISIT
 #define CLUSTER_CTRC_TEST_TABLE_VISIT(kind) ((void)0)
 #endif
@@ -437,6 +437,11 @@ ctrc_participant_delegations_empty(const ClusterCtrcParticipantEntry *participan
 		&& ctrc_bytes_zero(participant->delegations, sizeof(participant->delegations))
 		&& ctrc_bytes_zero(participant->delegation_close_request_id,
 			sizeof(participant->delegation_close_request_id))
+		&& participant->delegation_ack_bitmap == 0
+		&& ctrc_bytes_zero(participant->delegation_subtree_bitmap,
+			sizeof(participant->delegation_subtree_bitmap))
+		&& ctrc_bytes_zero(participant->delegation_ack_digest, sizeof(participant->delegation_ack_digest))
+		&& ctrc_bytes_zero(participant->delegation_required_lsn, sizeof(participant->delegation_required_lsn))
 		&& ctrc_bytes_zero(&participant->delegation_parent, sizeof(participant->delegation_parent))
 		&& ctrc_bytes_zero(&participant->delegation_path, sizeof(participant->delegation_path));
 }
@@ -446,9 +451,17 @@ ctrc_participant_delegations_valid(const ClusterCtrcParticipantEntry *participan
 {
 	uint32 count = 0;
 	uint32 sequences = 0;
+	uint64 descendants = 0;
+	uint64 forbidden;
 	const ClusterCtrcDelegationCustodyV1 *parent = &participant->delegation_parent;
 	FullTransactionId original;
 
+	if (participant->identity.node_id >= CLUSTER_CTRC_MAX_PARTICIPANTS
+		|| participant->key.origin_node_id >= CLUSTER_CTRC_MAX_PARTICIPANTS
+		|| (participant->delegation_ack_bitmap >> CLUSTER_CTRC_MAX_PARTICIPANTS) != 0)
+		return false;
+	forbidden = (UINT64_C(1) << participant->identity.node_id)
+		| (UINT64_C(1) << participant->key.origin_node_id);
 	if (!ctrc_bytes_zero(&participant->delegation_path, sizeof(participant->delegation_path))) {
 		if (!ctrc_delegation_path_valid(&participant->delegation_path, &participant->key,
 			&participant->identity, parent, participant->original_identity_v2,
@@ -473,10 +486,34 @@ ctrc_participant_delegations_valid(const ClusterCtrcParticipantEntry *participan
 		|| (participant->state != CTRC_PARTICIPANT_CLOSED_DRAINING
 			&& participant->last_delegation_sequence != participant->delegation_count))
 		return false;
+	if (parent->sequence != 0)
+		forbidden |= UINT64_C(1) << parent->receiver.node_id;
+	if (participant->delegation_path.version != 0) {
+		forbidden |= UINT64_C(1) << participant->delegation_path.root_receiver.node_id;
+		for (unsigned hop = 0; hop < participant->delegation_path.hop_count; hop++)
+			forbidden |= UINT64_C(1) << participant->delegation_path.hops[hop].receiver.node_id;
+	}
+	if (participant->delegation_ack_bitmap == 0) {
+		if (!ctrc_bytes_zero(participant->delegation_required_lsn, sizeof(participant->delegation_required_lsn)))
+			return false;
+	} else if (participant->state != CTRC_PARTICIPANT_CLOSED_DRAINING)
+		return false;
 	for (uint16 node = 0; node < CLUSTER_CTRC_MAX_PARTICIPANTS; node++) {
 		const ClusterCtrcDelegationCustodyV1 *entry = &participant->delegations[node];
+		uint64 subtree = participant->delegation_subtree_bitmap[node];
+		bool acknowledged = (participant->delegation_ack_bitmap & (UINT64_C(1) << node)) != 0;
 		uint32 bit;
 
+		if (acknowledged) {
+			if (entry->sequence == 0 || participant->delegation_close_request_id[node] == 0
+				|| (subtree & (UINT64_C(1) << node)) == 0
+				|| (subtree >> CLUSTER_CTRC_MAX_PARTICIPANTS) != 0
+				|| (subtree & (forbidden | descendants)) != 0
+				|| ctrc_bytes_zero(participant->delegation_ack_digest[node], 32))
+				return false;
+			descendants |= subtree;
+		} else if (subtree != 0 || !ctrc_bytes_zero(participant->delegation_ack_digest[node], 32))
+			return false;
 		if (ctrc_bytes_zero(entry, sizeof(*entry))) {
 			if (participant->delegation_close_request_id[node] != 0)
 				return false;
@@ -506,30 +543,32 @@ ctrc_participant_delegations_valid(const ClusterCtrcParticipantEntry *participan
 	return count == participant->delegation_count;
 }
 
-/* Only a closed, qualified leaf can freeze its LOCAL receipt inventory.
+/* Only a closed, qualified node with every child proven can freeze its LOCAL receipt inventory.
  * The accepted parent/path remains custody, not evidence of subtree release.
  * Frozen local proofs are deliberately kept out of the ordinary ACK states. */
 static bool pg_attribute_unused()
 ctrc_delegated_local_ack_eligible(const ClusterCtrcParticipantEntry *participant, bool frozen)
 {
-	return participant != NULL && participant->state == CTRC_PARTICIPANT_CLOSED_DRAINING
+	if (!(participant != NULL && participant->state == CTRC_PARTICIPANT_CLOSED_DRAINING
 		&& ctrc_txn_key_valid(&participant->key)
 		&& ctrc_participant_identity_valid(&participant->key, &participant->identity)
 		&& participant->grant_generation != 0 && participant->seal_generation != 0
 		&& ctrc_bytes_zero(participant->reserved8, sizeof(participant->reserved8))
 		&& !ctrc_bytes_zero(&participant->delegation_parent, sizeof(participant->delegation_parent))
 		&& ctrc_participant_delegations_valid(participant)
-		&& participant->delegation_count == 0 && participant->last_delegation_sequence == 0
-		&& ctrc_bytes_zero(participant->delegations, sizeof(participant->delegations))
-		&& ctrc_bytes_zero(participant->delegation_close_request_id,
-			sizeof(participant->delegation_close_request_id))
 		&& participant->receipt_count != UINT64_MAX
 		&& participant->last_key_sequence == participant->receipt_count
 		&& participant->next_key_sequence == participant->receipt_count + 1
 		&& participant->prepared_count == 0 && participant->applied_count == 0
 		&& participant->cancelled_count <= participant->receipt_count
 		&& participant->cleaned_count == participant->receipt_count - participant->cancelled_count
-		&& participant->ack_frozen_count == (frozen ? participant->receipt_count : 0);
+		&& participant->ack_frozen_count == (frozen ? participant->receipt_count : 0)))
+		return false;
+	for (unsigned node = 0; node < CLUSTER_CTRC_MAX_PARTICIPANTS; node++)
+		if (participant->delegations[node].sequence != 0
+			&& (participant->delegation_ack_bitmap & (UINT64_C(1) << node)) == 0)
+			return false;
+	return true;
 }
 
 static void
@@ -1302,6 +1341,157 @@ cluster_ctrc_seal_reply_decode(const uint8 *page, Size page_length, const uint8 
 	header.header_crc32c = ctrc_get_u32_le(page + 60);
 	*header_out = header;
 	return true;
+}
+
+/* Explicit subtree domain. The immutable local416 remains a local receipt
+ * proof; the additional bitmap/digest/vector never becomes an origin ACK. */
+static bool
+ctrc_subtree_ack_shape_valid(const ClusterCtrcDelegationCloseV1 *request,
+	const ClusterCtrcDelegatedSubtreeAckV1 *ack)
+{
+	const ClusterCtrcLocalReleaseAckV1 *local;
+	uint64 own;
+
+	if (!ctrc_delegation_close_valid(request) || ack == NULL || ack->reserved != 0)
+		return false;
+	local = &ack->local_ack;
+	own = UINT64_C(1) << request->receiver.node_id;
+	if (!ctrc_local_ack_shape_valid(local)
+		|| memcmp(&local->transaction_key, &request->key, sizeof(request->key)) != 0
+		|| local->grant_generation != request->grant_generation
+		|| local->seal_generation != request->seal_generation
+		|| local->participant_node_id != request->receiver.node_id
+		|| local->capability_record_generation != request->receiver.capability_record_generation
+		|| local->participant_boot_incarnation != request->receiver.boot_incarnation
+		|| local->formation_epoch != request->receiver.formation_epoch
+		|| local->admission_record_generation != request->receiver.admission_record_generation
+		|| (ack->subtree_bitmap & own) == 0
+		|| (ack->subtree_bitmap >> CLUSTER_CTRC_MAX_PARTICIPANTS) != 0
+		|| (ack->subtree_bitmap & ((UINT64_C(1) << request->parent.node_id)
+			| (UINT64_C(1) << request->key.origin_node_id))) != 0
+		|| ctrc_bytes_zero(ack->children_digest_sha256, sizeof(ack->children_digest_sha256))
+		|| ((ack->subtree_bitmap == own)
+			!= (memcmp(ack->children_digest_sha256, cluster_ctrc_empty_sha256, 32) == 0)))
+		return false;
+	for (unsigned node = 0; node < CLUSTER_SF_DEP_MAX_ORIGINS; node++)
+		if (ack->required_lsn[node] < local->required_lsn_vector[node]
+			|| (node == local->participant_node_id
+				&& ack->required_lsn[node] < local->highest_local_cleanout_lsn))
+			return false;
+	return true;
+}
+
+static bool
+ctrc_subtree_ack_encode_body(const ClusterCtrcDelegationCloseV1 *request,
+	const ClusterCtrcDelegatedSubtreeAckV1 *ack, uint8 bytes[CLUSTER_CTRC_SUBTREE_ACK_BYTES])
+{
+	MemSet(bytes, 0, CLUSTER_CTRC_SUBTREE_ACK_BYTES);
+	if (!ctrc_subtree_ack_shape_valid(request, ack)
+		|| !cluster_ctrc_local_release_ack_encode(&ack->local_ack, bytes)
+		|| ctrc_get_u32_le(bytes + 412) != ack->local_ack.crc32c)
+		return false;
+	ctrc_put_u64_le(bytes + 416, ack->subtree_bitmap);
+	memcpy(bytes + 424, ack->children_digest_sha256, 32);
+	for (unsigned node = 0; node < CLUSTER_SF_DEP_MAX_ORIGINS; node++)
+		ctrc_put_u64_le(bytes + 456 + node * 8, ack->required_lsn[node]);
+	ctrc_put_u32_le(bytes + 584, ctrc_crc32c_exact(bytes, 584));
+	return true;
+}
+
+static bool
+ctrc_subtree_ack_decode_body(const ClusterCtrcDelegationCloseV1 *request,
+	const uint8 bytes[CLUSTER_CTRC_SUBTREE_ACK_BYTES], ClusterCtrcDelegatedSubtreeAckV1 *out)
+{
+	ClusterCtrcDelegatedSubtreeAckV1 candidate = { 0 };
+	uint8 canonical[CLUSTER_CTRC_SUBTREE_ACK_BYTES];
+
+	if (!cluster_ctrc_local_release_ack_decode(bytes, &candidate.local_ack))
+		return false;
+	candidate.subtree_bitmap = ctrc_get_u64_le(bytes + 416);
+	memcpy(candidate.children_digest_sha256, bytes + 424, 32);
+	for (unsigned node = 0; node < CLUSTER_SF_DEP_MAX_ORIGINS; node++)
+		candidate.required_lsn[node] = ctrc_get_u64_le(bytes + 456 + node * 8);
+	candidate.crc32c = ctrc_get_u32_le(bytes + 584);
+	candidate.reserved = ctrc_get_u32_le(bytes + 588);
+	if (!ctrc_subtree_ack_encode_body(request, &candidate, canonical)
+		|| memcmp(canonical, bytes, sizeof(canonical)) != 0)
+		return false;
+	*out = candidate;
+	return true;
+}
+
+static bool
+ctrc_subtree_reply_header(const ClusterCtrcDelegationCloseV1 *request, uint8 header[64])
+{
+	uint8 bytes[CLUSTER_CTRC_DELEGATION_CLOSE_V1_BYTES], digest[32];
+
+	if (!cluster_ctrc_delegation_close_encode_v1(request, bytes, sizeof(bytes))
+		|| !cluster_ctrc_sha256_exact(bytes, sizeof(bytes), digest))
+		return false;
+	MemSet(header, 0, CLUSTER_CTRC_REPLY_HEADER_BYTES);
+	ctrc_put_u32_le(header, CLUSTER_CTRC_WIRE_MAGIC);
+	ctrc_put_u16_le(header + 4, CLUSTER_CTRC_SUBTREE_ACK_WIRE_VERSION);
+	ctrc_put_u16_le(header + 6, CLUSTER_CTRC_REPLY_HEADER_BYTES);
+	ctrc_put_u64_le(header + 8, request->request_id);
+	ctrc_put_u64_le(header + 16, request->key.cluster_epoch);
+	ctrc_put_u64_le(header + 24, request->seal_generation);
+	ctrc_put_u32_le(header + 32, request->receiver.node_id);
+	ctrc_put_u32_le(header + 36, request->parent.node_id);
+	header[40] = CTRC_SEAL_REPLY_DELEGATION_SUBTREE_ACK;
+	header[41] = CTRC_SEAL_CLOSE_AND_CLEAN;
+	ctrc_put_u16_le(header + 46, CLUSTER_CTRC_SUBTREE_ACK_BYTES);
+	memcpy(header + 48, digest, 8);
+	ctrc_put_u32_le(header + 56, BLCKSZ);
+	ctrc_put_u32_le(header + 60, ctrc_crc32c_exact(header, 60));
+	return true;
+}
+
+bool
+cluster_ctrc_delegated_ack_reply_encode(const ClusterCtrcDelegationCloseV1 *request,
+	const ClusterCtrcDelegatedSubtreeAckV1 *ack, uint8 *page, Size page_length)
+{
+	uint8 header[CLUSTER_CTRC_REPLY_HEADER_BYTES], body[CLUSTER_CTRC_SUBTREE_ACK_BYTES];
+
+	if (page != NULL && page_length != 0)
+		MemSet(page, 0, page_length);
+	if (page == NULL || page_length != BLCKSZ || !ctrc_subtree_reply_header(request, header)
+		|| !ctrc_subtree_ack_encode_body(request, ack, body)
+		|| ack->crc32c != ctrc_get_u32_le(body + 584))
+		return false;
+	memcpy(page, header, sizeof(header));
+	memcpy(page + CLUSTER_CTRC_REPLY_ACK_OFFSET, body, sizeof(body));
+	return true;
+}
+
+bool
+cluster_ctrc_delegated_ack_reply_decode(const uint8 *page, Size page_length,
+	const ClusterCtrcDelegationCloseV1 *request, ClusterCtrcDelegatedSubtreeAckV1 *out)
+{
+	uint8 header[CLUSTER_CTRC_REPLY_HEADER_BYTES];
+	ClusterCtrcDelegatedSubtreeAckV1 candidate;
+	Size tail = CLUSTER_CTRC_REPLY_ACK_OFFSET + CLUSTER_CTRC_SUBTREE_ACK_BYTES;
+
+	if (out != NULL)
+		MemSet(out, 0, sizeof(*out));
+	if (page == NULL || page_length != BLCKSZ || out == NULL
+		|| !ctrc_subtree_reply_header(request, header) || memcmp(page, header, sizeof(header)) != 0
+		|| !ctrc_bytes_zero(page + tail, BLCKSZ - tail)
+		|| !ctrc_subtree_ack_decode_body(request, page + CLUSTER_CTRC_REPLY_ACK_OFFSET, &candidate))
+		return false;
+	*out = candidate;
+	return true;
+}
+
+static bool pg_attribute_unused()
+ctrc_subtree_ack_digest(const ClusterCtrcDelegationCloseV1 *request,
+	const ClusterCtrcDelegatedSubtreeAckV1 *ack, uint8 digest[32])
+{
+	uint8 bytes[CLUSTER_CTRC_DELEGATION_CLOSE_V1_BYTES + CLUSTER_CTRC_SUBTREE_ACK_BYTES];
+
+	return cluster_ctrc_delegation_close_encode_v1(request, bytes, CLUSTER_CTRC_DELEGATION_CLOSE_V1_BYTES)
+		&& ctrc_subtree_ack_encode_body(request, ack, bytes + CLUSTER_CTRC_DELEGATION_CLOSE_V1_BYTES)
+		&& ack->crc32c == ctrc_get_u32_le(bytes + CLUSTER_CTRC_DELEGATION_CLOSE_V1_BYTES + 584)
+		&& cluster_ctrc_sha256_exact(bytes, sizeof(bytes), digest);
 }
 
 static bool
@@ -4694,6 +4884,8 @@ cluster_ctrc_participant_next_delegated_close_shared(ClusterCtrcDelegationCloseV
 			for (unsigned i = 0; i < CLUSTER_CTRC_MAX_PARTICIPANTS; i++) {
 				uint16 node = (first_node + i) % CLUSTER_CTRC_MAX_PARTICIPANTS;
 
+				if ((ctrc_participant_entries()[index].delegation_ack_bitmap & (UINT64_C(1) << node)) != 0)
+					continue;
 				if (ctrc_delegated_close_snapshot_locked(index, node, &candidate)) {
 					found = true;
 					break;
@@ -4821,7 +5013,9 @@ cluster_ctrc_participant_delegation_merge_land_shared(const ClusterCtrcDelegatio
 		return false;
 	ctrc_participant_locks_acquire(ctrc_participant_lock_mask(index));
 	landed = ctrc_delegated_close_snapshot_locked(index, request->receiver.node_id, &current)
-		&& memcmp(&current, request, sizeof(current)) == 0;
+		&& memcmp(&current, request, sizeof(current)) == 0
+		&& (ctrc_participant_entries()[index].delegation_ack_bitmap
+			& (UINT64_C(1) << request->receiver.node_id)) == 0;
 	if (landed) {
 		participant = &ctrc_participant_entries()[index];
 		/* The caller authenticated an exact wire3 MERGED observation. This
@@ -4840,6 +5034,59 @@ cluster_ctrc_participant_delegation_merge_land_shared(const ClusterCtrcDelegatio
 	return landed;
 #else
 	(void)request;
+	return false;
+#endif
+}
+
+bool
+cluster_ctrc_participant_delegated_ack_land_shared(const ClusterCtrcDelegationCloseV1 *request,
+	const ClusterCtrcDelegatedSubtreeAckV1 *ack)
+{
+#ifndef CLUSTER_CTRC_UNIT_TEST
+	ClusterCtrcDelegationCloseV1 current;
+	ClusterCtrcParticipantEntry *participant;
+	ClusterCtrcParticipantEntry candidate;
+	uint8 digest[32];
+	uint64 index, bit;
+	uint16 node;
+	bool landed = false, progressed = false;
+
+	if (!ctrc_subtree_ack_digest(request, ack, digest) || !cluster_ctrc_shmem_ready()
+		|| cluster_node_id < 0 || request->parent.node_id != (uint16)cluster_node_id
+		|| !ctrc_participant_index(&request->key, request->parent.node_id, &index))
+		return false;
+	node = request->receiver.node_id;
+	bit = UINT64_C(1) << node;
+	ctrc_participant_locks_acquire(ctrc_participant_lock_mask(index));
+	participant = &ctrc_participant_entries()[index];
+	if (ctrc_delegated_close_snapshot_locked(index, node, &current)
+		&& memcmp(&current, request, sizeof(current)) == 0) {
+		if ((participant->delegation_ack_bitmap & bit) != 0)
+			landed = participant->delegation_subtree_bitmap[node] == ack->subtree_bitmap
+				&& memcmp(participant->delegation_ack_digest[node], digest, sizeof(digest)) == 0;
+		else if (ctrc_bytes_zero(&ctrc_participant_ack_entries()[index], sizeof(ClusterCtrcLocalReleaseAckV1))) {
+			candidate = *participant;
+			candidate.delegation_ack_bitmap |= bit;
+			candidate.delegation_subtree_bitmap[node] = ack->subtree_bitmap;
+			memcpy(candidate.delegation_ack_digest[node], digest, sizeof(digest));
+			for (unsigned origin = 0; origin < CLUSTER_SF_DEP_MAX_ORIGINS; origin++)
+				candidate.delegation_required_lsn[origin]
+					= Max(candidate.delegation_required_lsn[origin], ack->required_lsn[origin]);
+			if (ctrc_participant_delegations_valid(&candidate)) {
+				/* Custody, local counts and the original correlation all survive.
+				 * No retirement or canonical release follows this observation. */
+				*participant = candidate;
+				landed = progressed = true;
+			}
+		}
+	}
+	ctrc_participant_locks_release(ctrc_participant_lock_mask(index));
+	if (progressed)
+		ctrc_semantic_progress(true);
+	return landed;
+#else
+	(void)request;
+	(void)ack;
 	return false;
 #endif
 }
@@ -7805,17 +8052,34 @@ ctrc_delegated_local_ack_summary_exact(const ClusterCtrcParticipantEntry *partic
 		return false;
 	local = *participant;
 	local.state = CTRC_PARTICIPANT_ACK_FROZEN;
-	MemSet(&local.delegation_parent, 0, sizeof(local.delegation_parent));
-	MemSet(&local.delegation_path, 0, sizeof(local.delegation_path));
+	MemSet(&local.delegation_parent, 0,
+		sizeof(local) - offsetof(ClusterCtrcParticipantEntry, delegation_parent));
 	return ctrc_frozen_ack_summary_exact(&local, summary);
 }
+
+#ifndef CLUSTER_CTRC_UNIT_TEST
+static bool
+ctrc_delegated_local_ack_exact_locked(uint64 index, const ClusterCtrcDelegationCloseV1 *request)
+{
+	const ClusterCtrcParticipantEntry *participant = &ctrc_participant_entries()[index];
+
+	return memcmp(&participant->key, &request->key, sizeof(request->key)) == 0
+		&& memcmp(&participant->identity, &request->receiver, sizeof(request->receiver)) == 0
+		&& participant->grant_generation == request->grant_generation
+		&& participant->seal_generation == request->seal_generation
+		&& FullTransactionIdEquals(participant->original_full_xid, request->original_full_xid)
+		&& participant->delegation_parent.sequence == request->delegation_sequence
+		&& memcmp(&participant->delegation_parent.receiver, &request->parent, sizeof(request->parent)) == 0
+		&& ctrc_delegated_local_ack_summary_exact(participant, &ctrc_participant_ack_entries()[index])
+		&& ctrc_receipt_chain_exact_locked(index, true);
+}
+#endif
 
 bool
 cluster_ctrc_participant_delegated_local_ack_shared(const ClusterCtrcDelegationCloseV1 *request,
 	ClusterCtrcLocalReleaseAckV1 *local_ack_out)
 {
 #ifndef CLUSTER_CTRC_UNIT_TEST
-	ClusterCtrcParticipantEntry *participant;
 	uint64 index;
 	bool exact;
 #endif
@@ -7830,22 +8094,84 @@ cluster_ctrc_participant_delegated_local_ack_shared(const ClusterCtrcDelegationC
 		return false;
 	ctrc_participant_locks_acquire(ctrc_participant_lock_mask(index));
 	LWLockAcquire(&CtrcShared->receipt_lock, LW_SHARED);
-	participant = &ctrc_participant_entries()[index];
-	exact = memcmp(&participant->key, &request->key, sizeof(request->key)) == 0
-		&& memcmp(&participant->identity, &request->receiver, sizeof(request->receiver)) == 0
-		&& participant->grant_generation == request->grant_generation
-		&& participant->seal_generation == request->seal_generation
-		&& FullTransactionIdEquals(participant->original_full_xid, request->original_full_xid)
-		&& participant->delegation_parent.sequence == request->delegation_sequence
-		&& memcmp(&participant->delegation_parent.receiver, &request->parent,
-			sizeof(request->parent)) == 0
-		&& ctrc_delegated_local_ack_summary_exact(participant, &ctrc_participant_ack_entries()[index])
-		&& ctrc_receipt_chain_exact_locked(index, true);
+	exact = ctrc_delegated_local_ack_exact_locked(index, request);
 	if (exact)
 		*local_ack_out = ctrc_participant_ack_entries()[index];
 	LWLockRelease(&CtrcShared->receipt_lock);
 	ctrc_participant_locks_release(ctrc_participant_lock_mask(index));
 	return exact;
+#else
+	(void)request;
+	return false;
+#endif
+}
+
+bool
+cluster_ctrc_participant_delegated_subtree_ack_shared(const ClusterCtrcDelegationCloseV1 *request,
+	ClusterCtrcDelegatedSubtreeAckV1 *out)
+{
+	if (out != NULL)
+		MemSet(out, 0, sizeof(*out));
+#ifndef CLUSTER_CTRC_UNIT_TEST
+	{
+		ClusterCtrcParticipantEntry participant;
+		ClusterCtrcDelegatedSubtreeAckV1 candidate = { 0 };
+		uint8 children[CLUSTER_CTRC_MAX_PARTICIPANTS * 58];
+		uint8 body[CLUSTER_CTRC_SUBTREE_ACK_BYTES];
+		Size length = 0;
+		uint64 index;
+		bool exact;
+
+		if (out == NULL || !ctrc_delegation_close_valid(request) || !cluster_ctrc_shmem_ready()
+			|| cluster_node_id < 0 || request->receiver.node_id != (uint16)cluster_node_id
+			|| !ctrc_participant_index(&request->key, request->receiver.node_id, &index))
+			return false;
+		ctrc_participant_locks_acquire(ctrc_participant_lock_mask(index));
+		LWLockAcquire(&CtrcShared->receipt_lock, LW_SHARED);
+		exact = ctrc_delegated_local_ack_exact_locked(index, request);
+		if (exact) {
+			participant = ctrc_participant_entries()[index];
+			candidate.local_ack = ctrc_participant_ack_entries()[index];
+		}
+		LWLockRelease(&CtrcShared->receipt_lock);
+		ctrc_participant_locks_release(ctrc_participant_lock_mask(index));
+		if (!exact)
+			return false;
+		candidate.subtree_bitmap = UINT64_C(1) << request->receiver.node_id;
+		for (unsigned node = 0; node < CLUSTER_CTRC_MAX_PARTICIPANTS; node++) {
+			if ((participant.delegation_ack_bitmap & (UINT64_C(1) << node)) != 0) {
+				ctrc_put_u16_le(children + length, node);
+				ctrc_put_u64_le(children + length + 2, participant.delegations[node].sequence);
+				ctrc_put_u64_le(children + length + 10, participant.delegation_close_request_id[node]);
+				ctrc_put_u64_le(children + length + 18, participant.delegation_subtree_bitmap[node]);
+				memcpy(children + length + 26, participant.delegation_ack_digest[node], 32);
+				length += 58;
+				candidate.subtree_bitmap |= participant.delegation_subtree_bitmap[node];
+			}
+			candidate.required_lsn[node] = Max(participant.delegation_required_lsn[node],
+				candidate.local_ack.required_lsn_vector[node]);
+		}
+		candidate.required_lsn[request->receiver.node_id]
+			= Max(candidate.required_lsn[request->receiver.node_id], candidate.local_ack.highest_local_cleanout_lsn);
+		if (!cluster_ctrc_sha256_exact(length != 0 ? children : (const uint8 *)"", length,
+			candidate.children_digest_sha256)
+			|| !ctrc_subtree_ack_encode_body(request, &candidate, body))
+			return false;
+		candidate.crc32c = ctrc_get_u32_le(body + 584);
+		/* Hash outside the shard, then repeat the complete original row and
+		 * frozen-chain check. A concurrent change cannot publish a mixed cut. */
+		ctrc_participant_locks_acquire(ctrc_participant_lock_mask(index));
+		LWLockAcquire(&CtrcShared->receipt_lock, LW_SHARED);
+		exact = memcmp(&participant, &ctrc_participant_entries()[index], sizeof(participant)) == 0
+			&& memcmp(&candidate.local_ack, &ctrc_participant_ack_entries()[index], sizeof(candidate.local_ack)) == 0
+			&& ctrc_delegated_local_ack_exact_locked(index, request);
+		LWLockRelease(&CtrcShared->receipt_lock);
+		ctrc_participant_locks_release(ctrc_participant_lock_mask(index));
+		if (!exact)
+			return false;
+		*out = candidate;
+		return true;
+	}
 #else
 	(void)request;
 	return false;
@@ -11395,8 +11721,8 @@ ctrc_ack_work_local_snapshot(const CtrcAckWork *work, const ClusterCtrcDurabilit
 		/* The full original row is still compared at each shared copy/freeze.
 		 * This copy feeds only the original LOCAL receipt hash/durability FSM. */
 		local.state = CTRC_PARTICIPANT_ACK_READY;
-		MemSet(&local.delegation_parent, 0, sizeof(local.delegation_parent));
-		MemSet(&local.delegation_path, 0, sizeof(local.delegation_path));
+		MemSet(&local.delegation_parent, 0,
+			sizeof(local) - offsetof(ClusterCtrcParticipantEntry, delegation_parent));
 	}
 	return cluster_ctrc_participant_ack_from_snapshot(&local, work->receipts,
 		work->receipt_count, durability, ack);

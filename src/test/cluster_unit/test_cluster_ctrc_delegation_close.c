@@ -1,7 +1,7 @@
 /*
  * Actual protected GCS CLOSE ingress and shared delegation lifecycle.
  * Socket, HELLO, membership and R4 providers are controlled process boundaries.
- * No native transport, concurrency, disk durability or subtree ACK claim.
+ * No native transport, concurrency or physical disk durability claim.
  */
 #define CTRC_DISPATCH_MAIN ctrc_dispatch_original_main
 #include "test_cluster_ctrc_dispatch.c"
@@ -1681,10 +1681,333 @@ UT_TEST(test_normal_stop_reports_retained_local_proof_pending_and_corruption_inv
 	UT_ASSERT_EQ(held_count, 0);
 }
 
+UT_TEST(test_actual_delegated_close_returns_explicit_subtree_proof_after_local_freeze)
+{
+	ClusterCtrcParticipantEntry *receiver, before;
+	ClusterCtrcDelegationCloseV1 request;
+	ClusterCtrcReceiptHandle receipt;
+	ClusterICEnvelope env = {0};
+	uint8 bytes[CLOSE_TEST_BYTES];
+	const uint8 *page = close_reply + sizeof(GcsBlockReplyHeader);
+
+	UT_ASSERT(close_local_leaf_setup(&receiver, &request, &receipt, true));
+	UT_ASSERT_EQ(ctrc_participant_freeze_ack_batch_shared(1), 1);
+	before = *receiver;
+	UT_ASSERT(cluster_ctrc_delegation_close_encode_v1(&request, bytes, sizeof(bytes)));
+	env.msg_type = PGRAC_IC_MSG_GCS_BLOCK_FORWARD;
+	env.source_node_id = request.parent.node_id;
+	env.dest_node_id = request.receiver.node_id;
+	env.epoch = request.key.cluster_epoch;
+	env.payload_length = sizeof(bytes);
+	close_replies = 0;
+	UT_ASSERT(gcs_block_try_ctrc_forward136(&env, bytes));
+	UT_ASSERT_EQ(close_replies, 1);
+	/* Explicit new reply domain, never old LOCAL_RELEASE_ACK or certificate. */
+	UT_ASSERT_EQ(ctrc_get_u16_le(page + 4), 4);
+	UT_ASSERT_EQ(page[40], 6);
+	UT_ASSERT_EQ(ctrc_get_u16_le(page + 46), 592);
+	UT_ASSERT(memcmp(receiver, &before, sizeof(before)) == 0);
+	UT_ASSERT_EQ(receipt.receipt->state, CTRC_RECEIPT_ACK_FROZEN);
+	UT_ASSERT_EQ(enters, leaves);
+	UT_ASSERT_EQ(held_count, 0);
+	UT_ASSERT_EQ(allocated, 0);
+}
+
+static bool
+subtree_send_close(const ClusterCtrcDelegationCloseV1 *request)
+{
+	uint8 bytes[CLOSE_TEST_BYTES];
+	ClusterICEnvelope env = {0};
+
+	if (!cluster_ctrc_delegation_close_encode_v1(request, bytes, sizeof(bytes)))
+		return false;
+	cluster_node_id = request->receiver.node_id;
+	dispatch_self_boot = request->receiver.boot_incarnation;
+	close_source_generation = dispatch_peer_connection_generation = 29;
+	close_expected_destination = request->parent.node_id;
+	close_replies = 0;
+	env.msg_type = PGRAC_IC_MSG_GCS_BLOCK_FORWARD;
+	env.source_node_id = request->parent.node_id;
+	env.dest_node_id = request->receiver.node_id;
+	env.epoch = request->key.cluster_epoch;
+	env.payload_length = sizeof(bytes);
+	return gcs_block_try_ctrc_forward136(&env, bytes) && close_replies == 1;
+}
+
+/* Independent controlled node pools; only the encoded original carriers
+ * and replies cross between them. Membership, scheduling and durable I/O
+ * remain fixture providers, not native or concurrency evidence. */
+static ClusterCtrcSharedHeader *subtree_leaf_pool;
+
+static bool
+subtree_roundtrip_setup(ClusterCtrcParticipantEntry **parent,
+	ClusterCtrcParticipantEntry **leaf, ClusterCtrcDelegationCloseV1 *upstream,
+	ClusterCtrcDelegationCloseV1 *child_request, uint8 reply[GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE])
+{
+	ClusterCtrcReceiptHandle source, receipt;
+	ClusterCtrcParticipantIdentity original_source, middle, child;
+	ClusterCtrcSharedHeader *parent_pool;
+	ClusterItlSlotData slot;
+	ClusterCtrcTargetV1 pending;
+	uint8 record[224], path[CLUSTER_CTRC_DELEGATION_V2_MAX_BYTES];
+	uint64 index;
+	Size length;
+	uint32 first;
+	bool ready = false;
+
+	free(subtree_leaf_pool);
+	subtree_leaf_pool = NULL;
+	fixture_declared_nodes = 4;
+	reset_dispatch_fixture();
+	if (!seed_delegation_receive(&source, &middle, &slot, record, &index))
+		return false;
+	original_source = source.participant->identity;
+	/* The foreign source inventory must not exist in the receiver pool. */
+	reset_dispatch_fixture();
+	cluster_node_id = middle.node_id;
+	if (!cluster_ctrc_itl_delegate_accept_v1(&slot, &original_source,
+		&middle, record, sizeof(record)))
+		return false;
+	*parent = &ctrc_participant_entries()[index];
+	child = middle;
+	child.node_id = 3;
+	child.boot_incarnation = 1104;
+	if (!close_test_pending_child(*parent, &child, path, &length))
+		return false;
+	MemSet(upstream, 0, sizeof(*upstream));
+	upstream->key = (*parent)->key;
+	upstream->parent = (*parent)->delegation_parent.receiver;
+	upstream->receiver = middle;
+	upstream->original_full_xid = (*parent)->original_full_xid;
+	upstream->grant_generation = (*parent)->grant_generation;
+	upstream->delegation_sequence = (*parent)->delegation_parent.sequence;
+	upstream->seal_generation = 41;
+	upstream->request_id = 17001;
+	if (!subtree_send_close(upstream))
+		return false;
+	first = ((uint32)(*parent)->key.owner_instance - 1) * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+	if (!cluster_ctrc_cleaner_bind_worker(((*parent)->key.segment_id - first)
+		% CLUSTER_CTRC_CLEANER_WORKERS)
+		|| !cluster_ctrc_participant_next_delegated_close_shared(child_request)
+		|| child_request->receiver.node_id != child.node_id)
+		return false;
+	parent_pool = CtrcShared;
+	CtrcShared = NULL;
+	cluster_ctrc_shmem_init();
+	subtree_leaf_pool = CtrcShared;
+	cluster_node_id = child.node_id;
+	image_pending_target(&pending);
+	if (cluster_ctrc_itl_image_prepare_v2(&slot, &middle, &child, path, length,
+		&pending, &receipt) == CLUSTER_CTRC_PREPARE_READY
+		&& cluster_ctrc_receipt_cancel_shared(&receipt)) {
+		*leaf = receipt.participant;
+		ready = subtree_send_close(child_request)
+			&& ctrc_participant_freeze_ack_batch_shared(1) == 1
+			&& subtree_send_close(child_request);
+	}
+	if (ready)
+		memcpy(reply, close_reply, sizeof(close_reply));
+	CtrcShared = parent_pool;
+	cluster_node_id = middle.node_id;
+	dispatch_self_boot = middle.boot_incarnation;
+	return ready && ctrc_get_u16_le(reply + sizeof(GcsBlockReplyHeader) + 4) == 4;
+}
+
+UT_TEST(test_actual_subtree_reply_lands_once_and_parent_aggregates_without_retiring_custody)
+{
+	ClusterCtrcParticipantEntry *parent, *leaf, before, expected, leaf_before;
+	ClusterCtrcDelegationCloseV1 upstream, request, ignored;
+	ClusterCtrcDelegatedSubtreeAckV1 child_ack, aggregate, decoded;
+	ClusterCtrcNormalStopObservation observed;
+	uint8 reply[GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE];
+	uint8 page[BLCKSZ];
+	uint64 progress;
+
+	UT_ASSERT(subtree_roundtrip_setup(&parent, &leaf, &upstream, &request, reply));
+	UT_ASSERT(cluster_ctrc_delegated_ack_reply_decode(reply + sizeof(GcsBlockReplyHeader),
+		BLCKSZ, &request, &child_ack));
+	UT_ASSERT_EQ(child_ack.local_ack.cancelled_count, 1);
+	UT_ASSERT_EQ(child_ack.subtree_bitmap, UINT64_C(1) << 3);
+	UT_ASSERT(!cluster_ctrc_participant_delegated_subtree_ack_shared(&upstream, &aggregate));
+	UT_ASSERT(ctrc_bytes_zero(&aggregate, sizeof(aggregate)));
+	UT_ASSERT_EQ(ctrc_participant_freeze_ack_batch_shared(1), 0);
+	before = *parent;
+	leaf_before = *leaf;
+	UT_ASSERT(close_merge_land(reply));
+	expected = before;
+	expected.delegation_ack_bitmap = UINT64_C(1) << 3;
+	expected.delegation_subtree_bitmap[3] = child_ack.subtree_bitmap;
+	UT_ASSERT(ctrc_subtree_ack_digest(&request, &child_ack, expected.delegation_ack_digest[3]));
+	memcpy(expected.delegation_required_lsn, child_ack.required_lsn, sizeof(child_ack.required_lsn));
+	UT_ASSERT(memcmp(parent, &expected, sizeof(expected)) == 0);
+	UT_ASSERT(memcmp(leaf, &leaf_before, sizeof(leaf_before)) == 0);
+	progress = cluster_ctrc_stat_get(CTRC_STAT_SEMANTIC_PROGRESS);
+	UT_ASSERT(close_merge_land(reply));
+	UT_ASSERT(memcmp(parent, &expected, sizeof(expected)) == 0);
+	UT_ASSERT_EQ(cluster_ctrc_stat_get(CTRC_STAT_SEMANTIC_PROGRESS), progress);
+	UT_ASSERT(!cluster_ctrc_participant_next_delegated_close_shared(&ignored));
+	UT_ASSERT(ctrc_bytes_zero(&ignored, sizeof(ignored)));
+	UT_ASSERT_EQ(ctrc_participant_freeze_ack_batch_shared(1), 1);
+	UT_ASSERT(cluster_ctrc_participant_delegated_subtree_ack_shared(&upstream, &aggregate));
+	UT_ASSERT_EQ(aggregate.subtree_bitmap, (UINT64_C(1) << 2) | (UINT64_C(1) << 3));
+	UT_ASSERT_EQ(aggregate.local_ack.total_receipt_count, 0);
+	UT_ASSERT(memcmp(aggregate.children_digest_sha256, cluster_ctrc_empty_sha256, 32) != 0);
+	for (unsigned node = 0; node < CLUSTER_SF_DEP_MAX_ORIGINS; node++)
+		UT_ASSERT(aggregate.required_lsn[node] >= child_ack.required_lsn[node]);
+	UT_ASSERT(cluster_ctrc_delegated_ack_reply_encode(&upstream, &aggregate, page, sizeof(page)));
+	UT_ASSERT(cluster_ctrc_delegated_ack_reply_decode(page, sizeof(page), &upstream, &decoded));
+	UT_ASSERT(memcmp(&aggregate, &decoded, sizeof(decoded)) == 0);
+	UT_ASSERT(subtree_send_close(&upstream));
+	UT_ASSERT(memcmp(page, close_reply + sizeof(GcsBlockReplyHeader), sizeof(page)) == 0);
+	UT_ASSERT_EQ(parent->delegation_count, 1);
+	UT_ASSERT_EQ(parent->delegation_close_request_id[3], request.request_id);
+	UT_ASSERT(memcmp(parent, &expected, sizeof(expected)) == 0);
+	UT_ASSERT_EQ(cluster_ctrc_normal_stop_poll(&observed), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(enters, leaves);
+	UT_ASSERT_EQ(held_count, 0);
+	UT_ASSERT_EQ(allocated, 0);
+}
+
+UT_TEST(test_subtree_codec_rejects_stale_request_and_malformed_proof_without_partial_output)
+{
+	ClusterCtrcParticipantEntry *parent, *leaf;
+	ClusterCtrcDelegationCloseV1 upstream, request;
+	uint8 reply[GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE];
+	uint8 page[BLCKSZ];
+	ClusterCtrcDelegatedSubtreeAckV1 ack;
+
+	UT_ASSERT(subtree_roundtrip_setup(&parent, &leaf, &upstream, &request, reply));
+	for (unsigned fault = 0; fault < 18; fault++) {
+		ClusterCtrcDelegationCloseV1 stale = request;
+		memcpy(page, reply + sizeof(GcsBlockReplyHeader), sizeof(page));
+		switch (fault) {
+			case 0: page[4] = 3; break;
+			case 1: page[40] = CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK; break;
+			case 2: page[46] = 0; break;
+			case 3: page[48] ^= 1; break;
+			case 4: page[CLUSTER_CTRC_REPLY_ACK_OFFSET + 64] ^= 1; break;
+			case 5: page[CLUSTER_CTRC_REPLY_ACK_OFFSET + 416] = 0; break;
+			case 6: page[CLUSTER_CTRC_REPLY_ACK_OFFSET + 424] ^= 1; break;
+			case 7: page[CLUSTER_CTRC_REPLY_ACK_OFFSET + 456] ^= 1; break;
+			case 8: page[CLUSTER_CTRC_REPLY_ACK_OFFSET + 584] ^= 1; break;
+			case 9: page[CLUSTER_CTRC_REPLY_ACK_OFFSET + 588] = 1; break;
+			case 10: page[CLUSTER_CTRC_REPLY_ACK_OFFSET + CLUSTER_CTRC_SUBTREE_ACK_BYTES] = 1; break;
+			case 11: stale.original_full_xid = FullTransactionIdFromEpochAndXid(8, request.key.xid); break;
+			case 12: stale.request_id++; break;
+			case 13: stale.delegation_sequence++; break;
+			case 14: stale.receiver.boot_incarnation++; break;
+			case 15: stale.parent.admission_record_generation++; break;
+			case 16: stale.seal_generation++; break;
+			case 17: stale.grant_generation++; break;
+		}
+		ctrc_put_u32_le(page + 60, ctrc_crc32c_exact(page, 60));
+		MemSet(&ack, 0x5a, sizeof(ack));
+		UT_ASSERT(!cluster_ctrc_delegated_ack_reply_decode(page, sizeof(page), &stale, &ack));
+		UT_ASSERT(ctrc_bytes_zero(&ack, sizeof(ack)));
+	}
+}
+
+UT_TEST(test_actual_subtree_landing_rejects_old_wire_correlation_and_current_source_failures)
+{
+	for (unsigned fault = 0; fault < 20; fault++) {
+		ClusterCtrcParticipantEntry *parent, *leaf, before;
+		ClusterCtrcDelegationCloseV1 upstream, request;
+		uint8 reply[GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE];
+		GcsBlockReplyHeader *outer = (GcsBlockReplyHeader *)reply;
+		uint8 *page = reply + sizeof(*outer);
+		volatile bool caught = false;
+
+		UT_ASSERT(subtree_roundtrip_setup(&parent, &leaf, &upstream, &request, reply));
+		rechecks = resolves = 0;
+		switch (fault) {
+			case 0: page[4] = 3; break;
+			case 1: page[40] = CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK; break;
+			case 2: page[48] ^= 1; break;
+			case 3: page[CLUSTER_CTRC_REPLY_ACK_OFFSET + 584] ^= 1; break;
+			case 4: outer->request_id++; break;
+			case 5: parent->delegation_close_request_id[3]++; break;
+			case 6: parent->delegations[3].receiver.boot_incarnation++; break;
+			case 7: parent->seal_generation++; break;
+			case 8: parent->original_full_xid = FullTransactionIdFromEpochAndXid(8, request.key.xid); break;
+			case 9: dispatch_excluded_member = 3; break;
+			case 10: dispatch_observed_boot_delta = 1; break;
+			case 11: dispatch_self_boot++; break;
+			case 12: close_source_generation = 0; break;
+			case 13: close_source_generation++; break;
+			case 14: root_exact = false; break;
+			case 15: fail_recheck = 1; break;
+			case 16: fail_recheck = 2; break;
+			case 17: fence_ok = false; break;
+			case 18: data_plane = false; break;
+			case 19: throw_resolve = 1; break;
+		}
+		ctrc_put_u32_le(page + 60, ctrc_crc32c_exact(page, 60));
+		outer->checksum = gcs_block_compute_checksum((const char *)page);
+		before = *parent;
+		PG_TRY();
+		{
+			UT_ASSERT(close_merge_land(reply));
+		}
+		PG_CATCH();
+		{
+			caught = true;
+			UT_ASSERT_EQ(fault, 19);
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, fault == 19);
+		UT_ASSERT(memcmp(parent, &before, sizeof(before)) == 0);
+		UT_ASSERT_EQ(enters, leaves);
+		UT_ASSERT_EQ(held_count, 0);
+		UT_ASSERT_EQ(allocated, 0);
+	}
+}
+
+UT_TEST(test_subtree_proof_cannot_import_ancestors_or_replace_already_retained_evidence)
+{
+	for (unsigned fault = 0; fault < 9; fault++) {
+		ClusterCtrcParticipantEntry *parent, *leaf, before;
+		ClusterCtrcDelegationCloseV1 upstream, request;
+		ClusterCtrcDelegatedSubtreeAckV1 ack;
+		uint8 reply[GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE], body[CLUSTER_CTRC_SUBTREE_ACK_BYTES];
+
+		UT_ASSERT(subtree_roundtrip_setup(&parent, &leaf, &upstream, &request, reply));
+		UT_ASSERT(cluster_ctrc_delegated_ack_reply_decode(reply + sizeof(GcsBlockReplyHeader),
+			BLCKSZ, &request, &ack));
+		if (fault == 6 || fault == 7)
+			UT_ASSERT(close_merge_land(reply));
+		switch (fault) {
+			case 0:
+				/* A framed, checksummed child cannot claim an ancestor as a descendant. */
+				ack.subtree_bitmap |= UINT64_C(1) << upstream.parent.node_id;
+				ack.children_digest_sha256[0] ^= 1;
+				break;
+			case 1: ack.subtree_bitmap |= UINT64_C(1) << request.key.origin_node_id; break;
+			case 2: ack.subtree_bitmap |= UINT64_C(1) << request.parent.node_id; break;
+			case 3: ack.subtree_bitmap |= UINT64_C(1) << CLUSTER_CTRC_MAX_PARTICIPANTS; break;
+			case 4: ack.subtree_bitmap = 0; break;
+			case 5: MemSet(ack.children_digest_sha256, 0, 32); break;
+			case 6: ack.required_lsn[0]++; break;
+			case 7: request.delegation_sequence++; break;
+			case 8: request.original_full_xid = FullTransactionIdFromEpochAndXid(8, request.key.xid); break;
+		}
+		/* Refresh framing where the malformed semantic proof is encodable;
+		 * do not let a checksum failure stand in for the parent/tree guard. */
+		if (ctrc_subtree_ack_encode_body(&request, &ack, body))
+			ack.crc32c = ctrc_get_u32_le(body + 584);
+		before = *parent;
+		UT_ASSERT(!cluster_ctrc_participant_delegated_ack_land_shared(&request, &ack));
+		UT_ASSERT(memcmp(parent, &before, sizeof(before)) == 0);
+		UT_ASSERT_EQ(parent->delegation_count, 1);
+		UT_ASSERT_EQ(enters, leaves);
+		UT_ASSERT_EQ(held_count, 0);
+		UT_ASSERT_EQ(allocated, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(38);
+	UT_PLAN(43);
 	UT_RUN(test_actual_delegated_close_enters_drain_and_retains_parent);
 	UT_RUN(test_actual_delegated_close_malformed_is_consumed_without_mutation);
 	UT_RUN(test_delegated_close_codec_is_explicit_and_roundtrips_all_binding_fields);
@@ -1723,6 +2046,12 @@ main(void)
 	UT_RUN(test_delegated_local_freeze_errors_and_oom_keep_all_original_custody);
 	UT_RUN(test_delegated_local_reader_rejects_stale_parent_fullxid_and_frozen_chain);
 	UT_RUN(test_normal_stop_reports_retained_local_proof_pending_and_corruption_invalid);
+	UT_RUN(test_actual_delegated_close_returns_explicit_subtree_proof_after_local_freeze);
+	UT_RUN(test_actual_subtree_reply_lands_once_and_parent_aggregates_without_retiring_custody);
+	UT_RUN(test_subtree_codec_rejects_stale_request_and_malformed_proof_without_partial_output);
+	UT_RUN(test_actual_subtree_landing_rejects_old_wire_correlation_and_current_source_failures);
+	UT_RUN(test_subtree_proof_cannot_import_ancestors_or_replace_already_retained_evidence);
+	free(subtree_leaf_pool);
 	free(CtrcShared);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

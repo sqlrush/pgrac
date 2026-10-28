@@ -232,7 +232,7 @@ SCAN_RULES: Tuple[ScanRule, ...] = (
             "src/backend/cluster/cluster_gcs_block.c",
             "src/backend/cluster/cluster_terminal_ref_census.c",
         ),
-        r"\bcluster_ctrc_(?:seal_request_(?:encode|decode)|seal_reply_(?:encode|decode)|delegation_close_(?:encode|decode)_v1|participant_(?:request_shared|delegated_close_shared|delegated_local_ack_shared|next_delegated_close_shared|delegated_close_matches_shared|delegated_close_snapshot_shared|delegation_merge_(?:observed|land)_shared)|origin_ack_land_shared)\s*\(",
+        r"\bcluster_ctrc_(?:seal_request_(?:encode|decode)|seal_reply_(?:encode|decode)|delegated_ack_reply_(?:encode|decode)|delegation_close_(?:encode|decode)_v1|participant_(?:request_shared|delegated_close_shared|delegated_local_ack_shared|delegated_subtree_ack_shared|delegated_ack_land_shared|next_delegated_close_shared|delegated_close_matches_shared|delegated_close_snapshot_shared|delegation_merge_(?:observed|land)_shared)|origin_ack_land_shared)\s*\(",
     ),
     ScanRule(
         "CTRC_RELATION_GATE",
@@ -331,7 +331,12 @@ _classify_owners(
 _classify_owners(
     "CTRC_CLOSE_WIRE",
     "src/backend/cluster/cluster_terminal_ref_census.c",
-    ("cluster_ctrc_participant_delegated_local_ack_shared",),
+    ("cluster_ctrc_participant_delegated_local_ack_shared",
+     "cluster_ctrc_participant_delegated_subtree_ack_shared",
+     "cluster_ctrc_participant_delegated_ack_land_shared",
+     "ctrc_subtree_reply_header", "ctrc_subtree_ack_digest",
+     "cluster_ctrc_delegated_ack_reply_encode",
+     "cluster_ctrc_delegated_ack_reply_decode"),
     "REGISTERED_REFERENCE",
     "ALL_CTRC_REFERENCE_KINDS",
     "ALL_CTRC_TARGET_KINDS",
@@ -339,8 +344,9 @@ _classify_owners(
     "RETAIN_PARENT_UNTIL_SUBTREE_CLOSE_ACK",
     "MXA-T24",
 )
-# Wire3 MERGED discharges only redundant outgoing pending custody. The
-# receiver observation and request lookup retain every accepted tree edge.
+# Wire3 MERGED discharges only redundant outgoing pending custody. Explicit
+# wire4 subtree evidence retains every accepted parent, child and receipt.
+# The shared GCS handler can select either protected observation.
 _classify_owners(
     "CTRC_CLOSE_WIRE",
     "src/backend/cluster/cluster_gcs_block.c",
@@ -349,7 +355,7 @@ _classify_owners(
     "ALL_CTRC_REFERENCE_KINDS",
     "ALL_CTRC_TARGET_KINDS",
     "NO_SUCCESSOR_ON_CLOSE",
-    "cluster_ctrc_participant_delegation_merge_land_shared",
+    "cluster_ctrc_participant_delegation_merge_land_shared|cluster_ctrc_participant_delegated_ack_land_shared",
     "MXA-T24",
 )
 _classify_owners(
@@ -739,8 +745,8 @@ for owners, successor, retention in (
         "CTRC_TARGET_PAGE_PENDING_ITL_SLOT|CTRC_TARGET_EXACT_ITL_SLOT",
         successor, retention, "MXA-T40",
     )
-# The new producer retains outgoing custody; receipt discharge cannot close
-# it. The subtree CLOSE/ACK owner remains unimplemented and live use is closed.
+# The producer retains outgoing custody; local receipt discharge and retained
+# subtree ACK evidence do not retire it. Certificate/live use remains closed.
 _classify_owners(
     "CTRC_ORIGIN_PROVENANCE",
     "src/backend/cluster/cluster_terminal_ref_census.c",
