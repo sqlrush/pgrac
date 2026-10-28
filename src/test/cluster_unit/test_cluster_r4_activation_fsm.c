@@ -1329,6 +1329,40 @@ errstart(int elevel, const char *domain pg_attribute_unused())
 	return (test_capture_activation_log || test_capture_stop_log) && elevel == LOG;
 }
 
+/* This fixture does not run the active-sample publisher or shared header
+ * writer. Linux retains their link dependencies; crossing one must fail,
+ * never invent a membership cut, join verdict, or content-lock owner. */
+bool
+cluster_normal_stop_maintenance_cut(void)
+{
+	abort();
+}
+
+ClusterJoinGateVerdict
+cluster_reconfig_self_join_gate_verdict(void)
+{
+	abort();
+}
+
+bool
+cluster_reconfig_lmon_snapshot_r4_membership(
+	ClusterR4MembershipSnapshot *out pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+LWLockHeldByMe(LWLock *lock pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+LWLockHeldByMeInMode(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
+{
+	abort();
+}
+
 void
 ForEachLWLockHeldByMe(void (*callback)(LWLock *, LWLockMode, void *), void *context)
 {
