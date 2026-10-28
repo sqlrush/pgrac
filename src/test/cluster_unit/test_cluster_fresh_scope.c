@@ -21,6 +21,7 @@
 #include "access/genam.h"
 #include "access/heaptoast.h"
 #include "access/reloptions.h"
+#include "access/relation.h"
 #include "access/table.h"
 #include "access/xact.h"
 #include "access/xlog.h"
@@ -88,6 +89,7 @@
 #include "parser/parse_utilcmd.h"
 #include "rewrite/rewriteDefine.h"
 #include "port/pg_crc32c.h"
+#include "statistics/statistics.h"
 #include "storage/fd.h"
 #include "storage/large_object.h"
 #include "storage/lock.h"
@@ -13630,10 +13632,229 @@ UT_TEST(test_native_role_rename_utility_warm_guards_preserve_binding)
 	role_rename_lookup_active = false;
 }
 
+/* Stop at the actual CREATE STATISTICS relation lock, before native queries. */
+static bool statistics_create_lookup_active, statistics_create_expect_binding;
+static unsigned statistics_create_lookups, statistics_create_unbound, statistics_create_bad_lookup;
+static RangeVar statistics_create_relation;
+static ListCell statistics_create_relation_cells[2];
+static List statistics_create_relations;
+static CreateStatsStmt native_statistics_create;
+
+Relation
+relation_openrv(const RangeVar *relation, LOCKMODE lockmode)
+{
+	if (!statistics_create_lookup_active)
+		siglongjmp(boundary, 3);
+	statistics_create_lookups++;
+	if (statistics_create_expect_binding && utility_binds == 0)
+		statistics_create_unbound++;
+	if (relation != &statistics_create_relation || lockmode != ShareUpdateExclusiveLock)
+		statistics_create_bad_lookup++;
+	siglongjmp(boundary, 2); /* Observe before the real relation lock or query. */
+}
+
+#include "test_cluster_fresh_statistics_create.inc"
+
+static void
+reset_native_statistics_create(bool expect_binding)
+{
+	reset_create_preflight();
+	statistics_create_lookup_active = true;
+	statistics_create_expect_binding = expect_binding;
+	statistics_create_lookups = statistics_create_unbound = statistics_create_bad_lookup = 0;
+	statistics_create_relation = (RangeVar){ .type = T_RangeVar, .relname = "statistics_relation" };
+	statistics_create_relation_cells[0] = (ListCell){ .ptr_value = &statistics_create_relation };
+	statistics_create_relation_cells[1] = (ListCell){ .ptr_value = &statistics_create_relation };
+	statistics_create_relations = (List){ .type = T_List,
+										  .length = 1,
+										  .max_length = 2,
+										  .elements = statistics_create_relation_cells };
+	native_statistics_create
+		= (CreateStatsStmt){ .type = T_CreateStatsStmt, .relations = &statistics_create_relations };
+}
+
+UT_TEST(test_native_statistics_create_binds_before_relation_lock_in_all_profiles)
+{
+	for (unsigned rights = 0; rights < 2; rights++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_statistics_create(binds);
+			set_native_operator_mode(mode);
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					(void)CreateStatistics(&native_statistics_create, rights != 0);
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(statistics_create_lookups, repeat + 1);
+				UT_ASSERT_EQ(statistics_create_unbound + statistics_create_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	statistics_create_lookup_active = false;
+}
+
+UT_TEST(test_native_statistics_create_refuses_before_lock_on_publication_child_and_top_errors)
+{
+	for (unsigned rights = 0; rights < 2; rights++) {
+		for (unsigned failure = 0; failure < 5; failure++) {
+			bool allocated = failure == 0 || failure == 2;
+			int caught;
+
+			reset_native_statistics_create(true);
+			if (failure == 0)
+				utility_bind_ok = false;
+			else if (failure == 1 || failure == 2) {
+				if (failure == 2)
+					create_sql_entry((Node *)&native_statistics_create);
+				utility_in_child = true;
+			} else {
+				utility_current_xid = 401;
+				utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				(void)CreateStatistics(&native_statistics_create, rights != 0);
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, failure == 0  ? ERRCODE_DATA_CORRUPTED
+									 : failure < 3 ? ERRCODE_FEATURE_NOT_SUPPORTED
+												   : ERRCODE_INTERNAL_ERROR);
+			UT_ASSERT_STR_EQ(
+				error_message,
+				failure == 0  ? "canonical ACTIVE publication failed before shared catalog creation"
+				: failure < 3 ? "shared catalog creation does not support subtransactions"
+							  : "shared catalog top-level transaction identity mismatch");
+			UT_ASSERT_EQ(statistics_create_lookups, 0);
+			UT_ASSERT_EQ(statistics_create_unbound + statistics_create_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_xids, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, failure == 2 ? 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, allocated || failure == 3 ? 400 : InvalidTransactionId);
+		}
+	}
+	statistics_create_lookup_active = false;
+}
+
+UT_TEST(test_native_statistics_create_context_guards_keep_nonshared_route)
+{
+	for (unsigned rights = 0; rights < 2; rights++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+
+			for (unsigned guard = 0; guard < 3; guard++) {
+				int caught;
+
+				reset_native_statistics_create(binds);
+				set_native_operator_mode(mode);
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					(void)CreateStatistics(&native_statistics_create, rights != 0);
+				UT_ASSERT_EQ(caught, binds ? 1 : 2);
+				UT_ASSERT_EQ(error_code, !binds		  ? 0
+										 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+													  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				if (binds)
+					UT_ASSERT(strstr(error_message, "CREATE STATISTICS") != NULL);
+				UT_ASSERT_EQ(statistics_create_lookups, binds ? 0 : 1);
+				UT_ASSERT_EQ(statistics_create_unbound + statistics_create_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	statistics_create_lookup_active = false;
+}
+
+UT_TEST(test_native_statistics_create_utility_warm_guards_preserve_binding)
+{
+	for (unsigned rights = 0; rights < 2; rights++) {
+		for (unsigned guard = 0; guard < 4; guard++) {
+			int caught;
+
+			reset_native_statistics_create(true);
+			create_sql_entry((Node *)&native_statistics_create);
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			XactReadOnly = guard == 1;
+			utility_parallel = guard == 2;
+			utility_recovery = guard == 3;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				(void)CreateStatistics(&native_statistics_create, rights != 0);
+			UT_ASSERT_EQ(caught, guard ? 1 : 2);
+			UT_ASSERT_EQ(error_code, !guard		  ? 0
+									 : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+												  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT_EQ(statistics_create_lookups, guard ? 0 : 1);
+			UT_ASSERT_EQ(statistics_create_unbound + statistics_create_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_prepares, guard ? 1 : 2);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			UT_ASSERT_EQ(utility_top_xid, 400);
+		}
+	}
+	statistics_create_lookup_active = false;
+}
+
+UT_TEST(test_native_statistics_create_unsupported_from_refuses_before_allocation)
+{
+	JoinExpr join = { .type = T_JoinExpr };
+	RangeSubselect subselect = { .type = T_RangeSubselect };
+
+	for (unsigned rights = 0; rights < 2; rights++) {
+		for (unsigned form = 0; form < 4; form++) {
+			for (unsigned mode = 0; mode < 8; mode++) {
+				for (unsigned guard = 0; guard < 6; guard++) {
+					int caught;
+
+					reset_native_statistics_create(false);
+					set_native_operator_mode(mode);
+					if (form == 0)
+						native_statistics_create.relations = NIL;
+					else if (form == 1)
+						statistics_create_relations.length = 2;
+					else
+						statistics_create_relation_cells[0].ptr_value
+							= form == 2 ? (void *)&join : (void *)&subselect;
+					XactReadOnly = guard == 1 || guard == 5;
+					utility_parallel = guard == 2 || guard == 5;
+					utility_recovery = guard == 3 || guard == 5;
+					utility_in_child = guard == 4 || guard == 5;
+					if (guard == 5) {
+						utility_bind_ok = false;
+						utility_current_xid = 401;
+						utility_top_xid = 400;
+					}
+					caught = sigsetjmp(boundary, 1);
+					if (!caught)
+						(void)CreateStatistics(&native_statistics_create, rights != 0);
+					UT_ASSERT_EQ(caught, 1);
+					UT_ASSERT_EQ(error_code, ERRCODE_FEATURE_NOT_SUPPORTED);
+					UT_ASSERT_STR_EQ(error_message,
+									 "only a single relation is allowed in CREATE STATISTICS");
+					UT_ASSERT_EQ(statistics_create_lookups, 0);
+					UT_ASSERT_EQ(statistics_create_unbound + statistics_create_bad_lookup, 0);
+					UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+				}
+			}
+		}
+	}
+	statistics_create_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(212);
+	UT_PLAN(217);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -13846,6 +14067,11 @@ main(void)
 	UT_RUN(test_native_role_rename_refuses_before_lookup_on_publication_child_and_top_errors);
 	UT_RUN(test_native_role_rename_context_guards_keep_nonshared_route);
 	UT_RUN(test_native_role_rename_utility_warm_guards_preserve_binding);
+	UT_RUN(test_native_statistics_create_binds_before_relation_lock_in_all_profiles);
+	UT_RUN(test_native_statistics_create_refuses_before_lock_on_publication_child_and_top_errors);
+	UT_RUN(test_native_statistics_create_context_guards_keep_nonshared_route);
+	UT_RUN(test_native_statistics_create_utility_warm_guards_preserve_binding);
+	UT_RUN(test_native_statistics_create_unsupported_from_refuses_before_allocation);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
