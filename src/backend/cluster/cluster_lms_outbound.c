@@ -732,7 +732,7 @@ cluster_lms_outbound_enqueue_resource_x_requester(int32 master,
 												  const ResourceXDecodedFrame *control,
 												  const ResourceXDecodedFrame *proof)
 {
-	uint8 payload[2][RESOURCE_X_SHORT_V1_BYTES];
+	uint8 payload[2][RESOURCE_X_ACQUIRE_V3_BYTES];
 	uint16 length[2] = { 0, 0 };
 	ResourceXWireReject reject;
 	ResourceXIntentSlot ticket;
@@ -746,11 +746,12 @@ cluster_lms_outbound_enqueue_resource_x_requester(int32 master,
 		|| (control->kind != RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP
 			&& control->kind != RESOURCE_X_WIRE_ASSERT_X)
 		|| (proof != NULL
-			&& (control->kind != RESOURCE_X_WIRE_ASSERT_X
+			&& (control->has_acquire_intent || control->kind != RESOURCE_X_WIRE_ASSERT_X
 				|| proof->kind != RESOURCE_X_WIRE_LOCAL_PROOF_DECLARATION))
 		|| !cluster_resource_x_wire_encode(RESOURCE_X_MSG_ASSERT_X, control, payload[0],
 										   sizeof(payload[0]), &length[0], &reject)
-		|| length[0] != RESOURCE_X_CONTROL_V1_BYTES
+		|| length[0] != (control->has_acquire_intent
+			? RESOURCE_X_ACQUIRE_V3_BYTES : RESOURCE_X_CONTROL_V1_BYTES)
 		|| (proof != NULL
 			&& (!cluster_resource_x_wire_encode(RESOURCE_X_MSG_ASSERT_X, proof, payload[1],
 												sizeof(payload[1]), &length[1], &reject)
@@ -1151,6 +1152,7 @@ cluster_lms_outbound_drain_send(int worker_id)
 		uint64 now_us;
 		bool resource_x_slot = false;
 		bool requester_slot = false;
+		bool complete_requester_slot = false;
 		bool remote_s_pending_slot = false;
 		bool remote_s_status_slot = false;
 		bool remote_s_cancelled_slot = false;
@@ -1215,6 +1217,8 @@ cluster_lms_outbound_drain_send(int worker_id)
 				cluster_lms_outbound_resource_x_send_complete(&resource_x_intent, false);
 				continue;
 			}
+			complete_requester_slot = resource_x_intent.kind == RESOURCE_X_WIRE_ASSERT_X
+				&& resource_x_intent.payload_bytes == RESOURCE_X_ACQUIRE_V3_BYTES;
 		}
 		/* Wire-version-sensitive slots are valid only for the exact
 		 * connection generation whose HELLO advertised the required bit.
@@ -1347,7 +1351,7 @@ cluster_lms_outbound_drain_send(int worker_id)
 		if (slot.dest_node_id < CLUSTER_MAX_NODES && peer_blocked[slot.dest_node_id]) {
 			if (remote_s_status_slot)
 				break;
-			if (requester_slot) {
+			if (requester_slot && !complete_requester_slot) {
 				cluster_lms_outbound_resource_x_send_complete(&resource_x_intent, false);
 				continue;
 			}
@@ -1436,7 +1440,7 @@ cluster_lms_outbound_drain_send(int worker_id)
 			}
 			if (slot.dest_node_id < CLUSTER_MAX_NODES)
 				peer_blocked[slot.dest_node_id] = true;
-			if (requester_slot)
+			if (requester_slot && !complete_requester_slot)
 				cluster_lms_outbound_resource_x_send_complete(&resource_x_intent, false);
 			else if (resource_x_slot)
 				(void)cluster_pcm_lock_resource_x_outbound_intent_hard_rearm_exact(

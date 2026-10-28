@@ -479,7 +479,7 @@ cluster_lms_wakeup(int worker_id)
 }
 
 #define FAKE_PCM_MAX_ENTRIES 24
-#define FAKE_PCM_ENTRY_BYTES 1456
+#define FAKE_PCM_ENTRY_BYTES 1528
 StaticAssertDecl(sizeof(struct StopPcmEntryLayout) == FAKE_PCM_ENTRY_BYTES,
 				 "negative fixture field offsets must match the generated original entry");
 
@@ -25721,11 +25721,205 @@ UT_TEST(test_resource_x_legacy_holder_rejects_conditional_decision_before_revoke
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_block_to_n_exact(&block, 0), RESOURCE_X_APPLY_APPLIED);
 }
 
+
+/* Complete E binds at the original requester send handoff. No native grant,
+ * image or cancellation quiescence is supplied by these owner tests. */
+static bool
+episode_request(ResourceXDecodedFrame *request, ResourceXDecodedFrame *legacy,
+	PcmState observed, PcmState target, uint8 path)
+{
+	ResourceXAssertion a; ResourceXAcquisitionRef terminal;
+	ResourceXWireReject reject;
+	uint8 bytes[RESOURCE_X_ACQUIRE_V3_BYTES]; uint16 len;
+	BufferTag tag = make_tag(892);
+	reset_fake_pcm_runtime(4); cluster_node_id = 1; fake_pcm_clock_us = 100;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(resource_x_assertion_init(&tag, 1, &a));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_step_exact(&a, 0, 17, 31, 77,
+		51, 61, 9000000, 8900000, 100, 10000, false, 0, legacy, &terminal),
+		RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST);
+	*request = make_resource_x_acquire_request(tag, 1, path, observed, target);
+	request->common = legacy->common; request->common.flags = 0;
+	request->common.observed_mode = observed; request->common.target_mode = target;
+	request->body.acquire_intent.cluster_epoch = 17;
+	return cluster_resource_x_wire_encode(RESOURCE_X_MSG_ASSERT_X, request, bytes, sizeof(bytes), &len, &reject)
+		&& cluster_resource_x_wire_decode(RESOURCE_X_MSG_ASSERT_X, bytes, len, request, &reject);
+}
+
+static bool
+episode_begin(ResourceXDecodedFrame *request, ResourceXDecodedFrame *legacy,
+	ResourceXIntentSlot *ticket, PcmState observed, PcmState target, uint8 path)
+{
+	ResourceXIntentResult result;
+	UT_ASSERT(episode_request(request, legacy, observed, target, path));
+	result = cluster_pcm_lock_resource_x_requester_send_begin_exact(request, 0, 1, 101, ticket);
+	UT_ASSERT_EQ(result, RESOURCE_X_INTENT_STAGED);
+	return result == RESOURCE_X_INTENT_STAGED;
+}
+
+UT_TEST(test_complete_request_original_owner_retains_first_fill_and_resident_modes)
+{
+	for (PcmState target = PCM_STATE_S; target <= PCM_STATE_X; target++)
+		for (PcmState observed = PCM_STATE_N; observed <= PCM_STATE_X; observed++) {
+			ResourceXDecodedFrame request, legacy;
+			ResourceXIntentSlot ticket;
+			if (!episode_begin(&request, &legacy, &ticket, observed, target,
+				observed == PCM_STATE_N ? RESOURCE_X_ACQUIRE_FIRST_FILL : RESOURCE_X_ACQUIRE_RESIDENT)) continue;
+			UT_ASSERT_EQ(ticket.payload_bytes, 160);
+			UT_ASSERT_EQ(ticket.kind, RESOURCE_X_WIRE_ASSERT_X);
+			UT_ASSERT_EQ(ticket.send_episode, 1);
+			UT_ASSERT_EQ(ticket.logical_generation, 1);
+			UT_ASSERT_EQ(ticket.authority_generation, 0);
+			UT_ASSERT(cluster_pcm_lock_resource_x_requester_send_current_exact(&ticket));
+		}
+}
+
+UT_TEST(test_complete_request_successful_callback_does_not_rearm_request)
+{
+	ResourceXDecodedFrame request, legacy;
+	ResourceXIntentSlot ticket, retry;
+	if (!episode_begin(&request, &legacy, &ticket, PCM_STATE_N, PCM_STATE_X, RESOURCE_X_ACQUIRE_FIRST_FILL)) return;
+	UT_ASSERT(cluster_pcm_lock_resource_x_requester_send_complete_exact(&ticket, true, 102));
+	UT_ASSERT(!cluster_pcm_lock_resource_x_requester_send_current_exact(&ticket));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_send_begin_exact(&request, 0, 1, 10000000, &retry), RESOURCE_X_INTENT_NOT_DUE);
+	UT_ASSERT(!cluster_pcm_lock_resource_x_requester_send_complete_exact(&ticket, true, 10000001));
+}
+
+UT_TEST(test_complete_request_failed_callback_does_not_rearm_request)
+{
+	ResourceXDecodedFrame request, legacy;
+	ResourceXIntentSlot ticket, retry;
+	if (!episode_begin(&request, &legacy, &ticket, PCM_STATE_N, PCM_STATE_S, RESOURCE_X_ACQUIRE_FIRST_FILL)) return;
+	UT_ASSERT(cluster_pcm_lock_resource_x_requester_send_complete_exact(&ticket, false, 102));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_send_begin_exact(&request, 0, 1, 10000000, &retry), RESOURCE_X_INTENT_NOT_DUE);
+}
+
+UT_TEST(test_complete_request_changed_native_or_process_identity_cannot_borrow_episode)
+{
+	for (int n = 0; n < 9; n++) {
+		ResourceXDecodedFrame request, legacy, changed;
+		ResourceXIntentSlot ticket, rejected;
+		ResourceXWireReject reject;
+		uint8 bytes[160]; uint16 len;
+		if (!episode_begin(&request, &legacy, &ticket, PCM_STATE_N, PCM_STATE_X, RESOURCE_X_ACQUIRE_FIRST_FILL)) continue;
+		changed = request;
+		switch (n) {
+		case 0: changed.body.acquire_intent.requester_incarnation++; break;
+		case 1: changed.body.acquire_intent.backend_generation++; break;
+		case 2: changed.body.acquire_intent.base_generation++; break;
+		case 3: changed.body.acquire_intent.reservation_token++; break;
+		case 4: changed.body.acquire_intent.cluster_epoch++; break;
+		case 5: changed.body.acquire_intent.r4_generation++; break;
+		case 6: changed.body.acquire_intent.backend_id++; break;
+		case 7: changed.body.acquire_intent.buffer_id++; break;
+		case 8: changed.body.acquire_intent.path = RESOURCE_X_ACQUIRE_RESIDENT; break;
+		}
+		UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_ASSERT_X, &changed, bytes, sizeof(bytes), &len, &reject));
+		UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_ASSERT_X, bytes, len, &changed, &reject));
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_send_begin_exact(&changed, 0, 1, 1000000, &rejected), RESOURCE_X_INTENT_STALE);
+		UT_ASSERT(cluster_pcm_lock_resource_x_requester_send_current_exact(&ticket));
+		UT_ASSERT(cluster_pcm_lock_resource_x_requester_send_complete_exact(&ticket, false, 1000001));
+	}
+}
+
+UT_TEST(test_complete_request_changed_mode_cannot_borrow_episode)
+{
+	ResourceXDecodedFrame request, legacy, changed;
+	ResourceXIntentSlot ticket, rejected;
+	if (!episode_begin(&request, &legacy, &ticket, PCM_STATE_N, PCM_STATE_X, RESOURCE_X_ACQUIRE_FIRST_FILL)) return;
+	changed = request; changed.common.target_mode = PCM_STATE_S;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_send_begin_exact(&changed, 0, 1, 1000000, &rejected), RESOURCE_X_INTENT_STALE);
+	changed = request; changed.common.observed_mode = PCM_STATE_S; changed.body.acquire_intent.path = RESOURCE_X_ACQUIRE_RESIDENT;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_send_begin_exact(&changed, 0, 1, 1000000, &rejected), RESOURCE_X_INTENT_STALE);
+	UT_ASSERT(cluster_pcm_lock_resource_x_requester_send_current_exact(&ticket));
+}
+
+UT_TEST(test_complete_request_cannot_fall_back_to_bootstrap_or_local_proof)
+{
+	ResourceXDecodedFrame request, legacy;
+	ResourceXIntentSlot ticket, rejected;
+	if (!episode_begin(&request, &legacy, &ticket, PCM_STATE_N, PCM_STATE_X, RESOURCE_X_ACQUIRE_FIRST_FILL)) return;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_send_begin_exact(&legacy, 0, 1, 1000000, &rejected), RESOURCE_X_INTENT_STALE);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_send_begin_exact(&request, 0, 2, 1000000, &rejected), RESOURCE_X_INTENT_STALE);
+	UT_ASSERT(cluster_pcm_lock_resource_x_requester_send_current_exact(&ticket));
+}
+
+UT_TEST(test_complete_request_old_ack_does_not_create_assert_or_change_owner)
+{
+	ResourceXDecodedFrame request, legacy, ack, output;
+	ResourceXIntentSlot ticket, retry;
+	if (!episode_begin(&request, &legacy, &ticket, PCM_STATE_N, PCM_STATE_X, RESOURCE_X_ACQUIRE_FIRST_FILL)) return;
+	ack = make_resource_x_bootstrap_ack_values(&legacy, 9, 71);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_accept_ack_exact(&ack, 0, 61, 77, 200, &output), RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED);
+	UT_ASSERT_EQ(output.kind, 0);
+	UT_ASSERT(cluster_pcm_lock_resource_x_requester_send_current_exact(&ticket));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_send_begin_exact(&request, 0, 1, 1000000, &retry), RESOURCE_X_INTENT_NOT_DUE);
+}
+
+UT_TEST(test_complete_request_follower_age_never_dispatches_or_allocates_new_attempt)
+{
+	ResourceXDecodedFrame request, legacy, output;
+	ResourceXIntentSlot ticket, retry;
+	ResourceXAcquisitionRef terminal;
+	if (!episode_begin(&request, &legacy, &ticket, PCM_STATE_N, PCM_STATE_X, RESOURCE_X_ACQUIRE_FIRST_FILL)) return;
+	UT_ASSERT(cluster_pcm_lock_resource_x_requester_send_complete_exact(&ticket, true, 102));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_step_exact(&legacy.common.logical_assertion,
+		0, 17, 31, 77, 51, 61, 20000000, 8900000, 10000000, 10000, false, 0, &output, &terminal), RESOURCE_X_BOOTSTRAP_ROUND_WAIT);
+	UT_ASSERT_EQ(output.kind, 0);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_send_begin_exact(&request, 0, 1, 10000001, &retry), RESOURCE_X_INTENT_NOT_DUE);
+}
+
+UT_TEST(test_complete_request_existing_legacy_physical_owner_cannot_be_replaced)
+{
+	ResourceXDecodedFrame request, legacy;
+	ResourceXIntentSlot old, rejected;
+	UT_ASSERT(episode_request(&request, &legacy, PCM_STATE_N, PCM_STATE_X, RESOURCE_X_ACQUIRE_FIRST_FILL));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_send_begin_exact(&legacy, 0, 1, 101, &old), RESOURCE_X_INTENT_STAGED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_send_begin_exact(&request, 0, 1, 102, &rejected), RESOURCE_X_INTENT_STALE);
+	UT_ASSERT(cluster_pcm_lock_resource_x_requester_send_current_exact(&old));
+}
+
+UT_TEST(test_complete_request_wire_corruption_before_claim_preserves_legacy_owner)
+{
+	ResourceXDecodedFrame request, legacy, changed;
+	ResourceXIntentSlot old, rejected;
+	UT_ASSERT(episode_request(&request, &legacy, PCM_STATE_N, PCM_STATE_X, RESOURCE_X_ACQUIRE_FIRST_FILL));
+	changed = request; changed.body.acquire_intent.reservation_token = 0;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_send_begin_exact(&changed, 0, 1, 101, &rejected), RESOURCE_X_INTENT_STALE);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_send_begin_exact(&legacy, 0, 1, 102, &old), RESOURCE_X_INTENT_STAGED);
+}
+
+UT_TEST(test_complete_request_reconfiguration_preserves_semantic_debt_after_physical_callback)
+{
+	for (int sent = 0; sent <= 1; sent++) {
+		ResourceXDecodedFrame request, legacy;
+		ResourceXIntentSlot ticket;
+		ResourceXReconfigToken token;
+		ResourceXReconfigBatch batch;
+		ResourceXReconfigStats stats;
+		ResourceXZeroResidualProof zero;
+
+		if (!episode_begin(&request, &legacy, &ticket, PCM_STATE_N, PCM_STATE_X,
+				RESOURCE_X_ACQUIRE_FIRST_FILL))
+			continue;
+		UT_ASSERT(cluster_pcm_lock_resource_x_requester_send_complete_exact(&ticket, sent != 0, 102));
+		UT_ASSERT(cluster_resource_x_reconfig_freeze_exact(17, 18, 0, &token));
+		UT_ASSERT_EQ(cluster_resource_x_reconfig_sweep(&token, 4, &batch), RESOURCE_X_RECONFIG_ORPHAN);
+		UT_ASSERT_EQ(batch.orphan_count, 1);
+		UT_ASSERT_EQ(batch.residual_count, 1);
+		UT_ASSERT(!cluster_resource_x_reconfig_zero_proof_exact(&token, &zero));
+		UT_ASSERT(!cluster_resource_x_reconfig_thaw_exact(&token));
+		cluster_resource_x_reconfig_stats_snapshot(&stats);
+		UT_ASSERT_EQ(stats.orphan_count, 1);
+		UT_ASSERT(!cluster_pcm_lock_resource_x_requester_send_complete_exact(&ticket, true, 103));
+	}
+}
+
 int
 main(void)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
-	UT_PLAN(390);
+	UT_PLAN(401);
 	/* Observe the actual startup state before any runtime fixture overrides
 	 * the postmaster GUC or initializes shared PCM state and counters. */
 	UT_RUN(test_pcm_grd_max_entries_default_is_minus_one);
@@ -26120,6 +26314,17 @@ main(void)
 	UT_RUN(test_pcm_wait_graph_local_owner_preserves_holder_and_successor);
 	UT_RUN(test_resource_x_legacy_requester_rejects_conditional_decision_before_join);
 	UT_RUN(test_resource_x_legacy_holder_rejects_conditional_decision_before_revoke);
+	UT_RUN(test_complete_request_original_owner_retains_first_fill_and_resident_modes);
+	UT_RUN(test_complete_request_successful_callback_does_not_rearm_request);
+	UT_RUN(test_complete_request_failed_callback_does_not_rearm_request);
+	UT_RUN(test_complete_request_changed_native_or_process_identity_cannot_borrow_episode);
+	UT_RUN(test_complete_request_changed_mode_cannot_borrow_episode);
+	UT_RUN(test_complete_request_cannot_fall_back_to_bootstrap_or_local_proof);
+	UT_RUN(test_complete_request_old_ack_does_not_create_assert_or_change_owner);
+	UT_RUN(test_complete_request_follower_age_never_dispatches_or_allocates_new_attempt);
+	UT_RUN(test_complete_request_existing_legacy_physical_owner_cannot_be_replaced);
+	UT_RUN(test_complete_request_wire_corruption_before_claim_preserves_legacy_owner);
+	UT_RUN(test_complete_request_reconfiguration_preserves_semantic_debt_after_physical_callback);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

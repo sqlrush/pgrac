@@ -460,10 +460,131 @@ UT_TEST(test_full_transport_colocated_master_roles_use_original_loopback_owner)
 	}
 }
 
+
+/* Actual LMS/codec REQUEST transport. PCM lifetime is an explicit provider
+ * here and is tested separately against the real PCM owner. */
+static ResourceXDecodedFrame
+transport_complete_request(void)
+{
+	ResourceXDecodedFrame frame = {0};
+	ResourceXDecodedAcquireIntent e;
+	ResourceXWireReject reject;
+	uint8 bytes[RESOURCE_X_DECISION_V3_BYTES]; uint16 len;
+	ut_captured_region->init_fn(); ut_reset_log();
+	transport_length = 0; transport_tail_owned = false; cluster_node_id = 0;
+	make_decision_bytes(bytes, false, PCM_STATE_N, 0, PCM_STATE_S, -1, RESOURCE_X_ACQUIRE_SOURCE_DISK);
+	UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes, 736, &frame, &reject));
+	e = frame.body.acquire_decision.episode;
+	frame.kind = RESOURCE_X_WIRE_ASSERT_X; frame.payload_bytes = 160;
+	frame.has_acquire_decision = false; frame.has_acquire_intent = true;
+	frame.common.logical_assertion.requester_node = 0; frame.common.action_node = 0;
+	frame.common.base_authority_generation = frame.common.authority_generation = 0;
+	frame.common.ordered_lane = 0; frame.common.outcome = RESOURCE_X_OUTCOME_NONE;
+	frame.common.flags = frame.common.source_candidate = frame.common.retain_pi_if_dirty = 0;
+	frame.common.observed_mode = PCM_STATE_N; frame.common.target_mode = PCM_STATE_S;
+	frame.common.sender_connection_generation = 77;
+	memset(&frame.body, 0, sizeof(frame.body)); frame.body.acquire_intent = e;
+	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_ASSERT_X, &frame, bytes, sizeof(bytes), &len, &reject));
+	UT_ASSERT_EQ(len, 160);
+	UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_ASSERT_X, bytes, len, &frame, &reject));
+	ut_peer_capabilities[UT_PEER_X] = PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1;
+	ut_peer_cap_generation[UT_PEER_X] = 77;
+	return frame;
+}
+
+static void
+transport_complete_check(const ResourceXDecodedFrame *request)
+{
+	ResourceXDecodedFrame decoded;
+	ResourceXWireReject reject;
+	uint8 bytes[160];
+	uint16 len;
+	UT_ASSERT_EQ(transport_length, 160);
+	UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_ASSERT_X, transport_bytes, transport_length, &decoded, &reject));
+	UT_ASSERT(decoded.has_acquire_intent);
+	UT_ASSERT(!decoded.has_acquire_decision);
+	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_ASSERT_X, request, bytes, sizeof(bytes), &len, &reject));
+	UT_ASSERT(memcmp(bytes, transport_bytes, 160) == 0);
+}
+
+UT_TEST(test_complete_request_transport_encodes_single_full_intent_without_local_proof)
+{
+	ResourceXDecodedFrame request = transport_complete_request();
+	ClusterLmsEnqueueResult rc = cluster_lms_outbound_enqueue_resource_x_requester(UT_PEER_X, &request, NULL);
+	UT_ASSERT_EQ(rc, CLUSTER_LMS_ENQUEUE_ADMITTED);
+	if (rc != CLUSTER_LMS_ENQUEUE_ADMITTED) return;
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(0), 1);
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(0), 1);
+	UT_ASSERT_EQ(ut_requester_pending, 0);
+	UT_ASSERT_EQ(ut_requester_completed, 1);
+	transport_complete_check(&request);
+}
+
+UT_TEST(test_complete_request_transport_not_admitted_retains_original_fifo_and_pending)
+{
+	ResourceXDecodedFrame request = transport_complete_request();
+	ClusterLmsEnqueueResult rc = cluster_lms_outbound_enqueue_resource_x_requester(UT_PEER_X, &request, NULL);
+	UT_ASSERT_EQ(rc, CLUSTER_LMS_ENQUEUE_ADMITTED);
+	if (rc != CLUSTER_LMS_ENQUEUE_ADMITTED) return;
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_NOT_ADMITTED;
+	for (int i = 0; i < 2; i++) {
+		UT_ASSERT_EQ(cluster_lms_outbound_drain_send(0), 0);
+		UT_ASSERT_EQ(cluster_lms_outbound_depth(0), 1);
+		UT_ASSERT_EQ(ut_requester_pending, 1);
+		UT_ASSERT_EQ(ut_requester_completed, 0);
+		transport_complete_check(&request);
+	}
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_DONE;
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(0), 1);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(0), 0);
+	UT_ASSERT_EQ(ut_requester_pending, 0);
+	UT_ASSERT_EQ(ut_requester_completed, 1);
+	transport_complete_check(&request);
+}
+
+UT_TEST(test_complete_request_transport_real_tail_owns_exact_160_bytes_until_callback)
+{
+	ResourceXDecodedFrame request = transport_complete_request();
+	ClusterLmsEnqueueResult rc = cluster_lms_outbound_enqueue_resource_x_requester(UT_PEER_X, &request, NULL);
+	UT_ASSERT_EQ(rc, CLUSTER_LMS_ENQUEUE_ADMITTED);
+	if (rc != CLUSTER_LMS_ENQUEUE_ADMITTED) return;
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_WOULD_BLOCK;
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(0), 1);
+	UT_ASSERT(transport_tail_owned);
+	UT_ASSERT_EQ(transport_tail.payload_bytes, 160);
+	UT_ASSERT_EQ(ut_requester_pending, 1);
+	UT_ASSERT_EQ(ut_requester_completed, 0);
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(0), 0);
+	cluster_lms_outbound_resource_x_send_complete(&transport_tail, true);
+	transport_tail_owned = false;
+	UT_ASSERT_EQ(ut_requester_pending, 0);
+	UT_ASSERT_EQ(ut_requester_completed, 1);
+	transport_complete_check(&request);
+}
+
+UT_TEST(test_complete_request_transport_full_fifo_does_not_publish_episode)
+{
+	ResourceXDecodedFrame request = transport_complete_request();
+	for (int i = 0; i < 256; i++) UT_ASSERT(ut_enqueue_marker(0, UT_PEER_X, 0x72));
+	UT_ASSERT_EQ(cluster_lms_outbound_enqueue_resource_x_requester(UT_PEER_X, &request, NULL), CLUSTER_LMS_ENQUEUE_FULL);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(0), 256);
+	UT_ASSERT_EQ(ut_requester_begins, 0);
+	UT_ASSERT_EQ(ut_requester_pending, 0);
+}
+
+UT_TEST(test_complete_request_transport_rejects_extra_local_proof_before_owner)
+{
+	ResourceXDecodedFrame request = transport_complete_request(), proof = request;
+	proof.has_acquire_intent = false; proof.kind = RESOURCE_X_WIRE_LOCAL_PROOF_DECLARATION;
+	UT_ASSERT_EQ(cluster_lms_outbound_enqueue_resource_x_requester(UT_PEER_X, &request, &proof), CLUSTER_LMS_ENQUEUE_INVALID);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(0), 0);
+	UT_ASSERT_EQ(ut_requester_begins, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(19);
 	UT_RUN(test_ring_shmem_init);
 	UT_RUN(test_full_transport_all_original_owner_profiles_send_exact_bytes);
 	UT_RUN(test_full_transport_not_admitted_preserves_exact_semantic_owner);
@@ -478,6 +599,11 @@ main(void)
 	UT_RUN(test_full_transport_original_pump_carries_the_largest_source_ship);
 	UT_RUN(test_full_transport_late_tail_callback_cannot_retire_next_stage);
 	UT_RUN(test_full_transport_colocated_master_roles_use_original_loopback_owner);
+	UT_RUN(test_complete_request_transport_encodes_single_full_intent_without_local_proof);
+	UT_RUN(test_complete_request_transport_not_admitted_retains_original_fifo_and_pending);
+	UT_RUN(test_complete_request_transport_real_tail_owns_exact_160_bytes_until_callback);
+	UT_RUN(test_complete_request_transport_full_fifo_does_not_publish_episode);
+	UT_RUN(test_complete_request_transport_rejects_extra_local_proof_before_owner);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
