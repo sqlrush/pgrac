@@ -1327,6 +1327,72 @@ cluster_ctrc_recovery_itl_page_image_v1(const ClusterColdTtSlotInputV1 *subjects
 	return result;
 }
 
+/* Shared by the complete census and the final native page check. Historical
+ * ACTIVE flags are identity inputs only; the original owner must qualify
+ * every ITL against its canonical terminal before consuming this result. */
+bool
+cluster_ctrc_recovery_heap_tuple_itl_references_v1(const ClusterItlSlotData *slots,
+	const char *tuple_bytes, Size tuple_length)
+{
+	HeapTupleHeaderData header;
+	HeapTupleHeader tuple = &header;
+	unsigned expected_hoff;
+	TransactionId xmin, xmax;
+
+	if (slots == NULL || tuple_bytes == NULL || tuple_length < SizeofHeapTupleHeader
+		|| tuple_length > BLCKSZ) return false;
+	/* Census tuples are packed private bytes, not necessarily aligned. Only
+	 * the complete fixed header is interpreted; no synthetic page is made. */
+	memcpy(&header, tuple_bytes, SizeofHeapTupleHeader);
+	expected_hoff = MAXALIGN(SizeofHeapTupleHeader
+		+ ((tuple->t_infomask & HEAP_HASNULL) != 0
+			? BITMAPLEN(HeapTupleHeaderGetNatts(tuple)) : 0));
+	if (tuple->t_hoff != expected_hoff || tuple->t_hoff > tuple_length
+		|| (tuple->t_infomask & HEAP_MOVED) != 0) return false;
+	for (unsigned i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
+		const ClusterItlSlotData *slot = &slots[i];
+		uint32 segment, block;
+		uint16 offset, row;
+
+		if (slot->flags == ITL_FLAG_FREE) {
+			if (TransactionIdIsValid(slot->xid) || !UBA_is_invalid(slot->undo_segment_head)
+				|| SCN_VALID(slot->commit_scn) || slot->lock_count != 0) return false;
+			continue;
+		}
+		if ((slot->flags != ITL_FLAG_ACTIVE && slot->flags != ITL_FLAG_COMMITTED
+				&& slot->flags != ITL_FLAG_ABORTED && slot->flags != ITL_FLAG_NEEDS_CLEANOUT
+				&& slot->flags != ITL_FLAG_LOCK_ONLY_ACTIVE
+				&& slot->flags != ITL_FLAG_LOCK_ONLY_COMMITTED
+				&& slot->flags != ITL_FLAG_LOCK_ONLY_ABORTED)
+			|| !TransactionIdIsNormal(slot->xid)
+			|| !uba_decode(slot->undo_segment_head, &segment, &block, &offset, &row)) return false;
+	}
+	xmin = HeapTupleHeaderGetRawXmin(tuple);
+	if (!HeapTupleHeaderXminFrozen(tuple) && xmin != BootstrapTransactionId
+		&& xmin != FrozenTransactionId) {
+		unsigned matches = 0;
+
+		if (!TransactionIdIsNormal(xmin)) return false;
+		for (unsigned i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
+			if (slots[i].xid == xmin && (slots[i].flags == ITL_FLAG_ACTIVE
+				|| slots[i].flags == ITL_FLAG_NEEDS_CLEANOUT
+				|| slots[i].flags == ITL_FLAG_COMMITTED || slots[i].flags == ITL_FLAG_ABORTED))
+				matches++;
+		if (matches != 1) return false;
+	}
+	/* Invalid xmax retains its native meaning even with stale raw MX bits. */
+	if ((tuple->t_infomask & HEAP_XMAX_INVALID) != 0) return true;
+	xmax = HeapTupleHeaderGetRawXmax(tuple);
+	return (tuple->t_infomask & HEAP_XMAX_IS_MULTI) == 0
+		&& !HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask) && TransactionIdIsNormal(xmax)
+		&& tuple->t_itl_slot_idx < CLUSTER_ITL_INITRANS_DEFAULT
+		&& slots[tuple->t_itl_slot_idx].xid == xmax
+		&& (slots[tuple->t_itl_slot_idx].flags == ITL_FLAG_ACTIVE
+			|| slots[tuple->t_itl_slot_idx].flags == ITL_FLAG_NEEDS_CLEANOUT
+			|| slots[tuple->t_itl_slot_idx].flags == ITL_FLAG_COMMITTED
+			|| slots[tuple->t_itl_slot_idx].flags == ITL_FLAG_ABORTED);
+}
+
 /* Binding only: canonical TT/generation/source qualification belongs to the
  * original projector and recovery owner, not a raw tuple xid lookup. */
 bool
@@ -1367,9 +1433,7 @@ cluster_ctrc_recovery_heap_itl_references_v1(const char *page_image)
 	maxoff = PageGetMaxOffsetNumber(page);
 	for (OffsetNumber offset = FirstOffsetNumber; offset <= maxoff; offset++) {
 		ItemId item = PageGetItemId(page, offset);
-		HeapTupleHeader tuple;
-		unsigned start, length, expected_hoff;
-		TransactionId xmin, xmax;
+		unsigned start, length;
 
 		if (ItemIdIsRedirected(item)) {
 			OffsetNumber destination = ItemIdGetRedirect(item);
@@ -1385,33 +1449,8 @@ cluster_ctrc_recovery_heap_itl_references_v1(const char *page_image)
 		start = ItemIdGetOffset(item); length = ItemIdGetLength(item);
 		if (start < header->pd_upper || start > header->pd_special || start != MAXALIGN(start)
 			|| length < SizeofHeapTupleHeader || length > header->pd_special - start) return false;
-		tuple = (HeapTupleHeader)(page_image + start);
-		expected_hoff = MAXALIGN(SizeofHeapTupleHeader
-			+ ((tuple->t_infomask & HEAP_HASNULL) != 0
-				? BITMAPLEN(HeapTupleHeaderGetNatts(tuple)) : 0));
-		if (tuple->t_hoff != expected_hoff || tuple->t_hoff > length
-			|| (tuple->t_infomask & HEAP_MOVED) != 0) return false;
-		xmin = HeapTupleHeaderGetRawXmin(tuple);
-		if (!HeapTupleHeaderXminFrozen(tuple) && xmin != BootstrapTransactionId
-			&& xmin != FrozenTransactionId) {
-			unsigned matches = 0;
-
-			if (!TransactionIdIsNormal(xmin)) return false;
-			for (unsigned i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
-				if (slots[i].xid == xmin && (slots[i].flags == ITL_FLAG_COMMITTED
-					|| slots[i].flags == ITL_FLAG_ABORTED)) matches++;
-			if (matches != 1) return false;
-		}
-		/* Invalid xmax is not an effective reference, even if stale raw bits
-		 * remain. Effective MX/lock-only requires its separate original work. */
-		if ((tuple->t_infomask & HEAP_XMAX_INVALID) != 0) continue;
-		xmax = HeapTupleHeaderGetRawXmax(tuple);
-		if ((tuple->t_infomask & HEAP_XMAX_IS_MULTI) != 0
-			|| HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask) || !TransactionIdIsNormal(xmax)
-			|| tuple->t_itl_slot_idx >= CLUSTER_ITL_INITRANS_DEFAULT
-			|| slots[tuple->t_itl_slot_idx].xid != xmax
-			|| (slots[tuple->t_itl_slot_idx].flags != ITL_FLAG_COMMITTED
-				&& slots[tuple->t_itl_slot_idx].flags != ITL_FLAG_ABORTED)) return false;
+		if (!cluster_ctrc_recovery_heap_tuple_itl_references_v1(slots,
+			page_image + start, length)) return false;
 	}
 	return true;
 }

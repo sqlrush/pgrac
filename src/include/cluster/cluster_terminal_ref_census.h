@@ -1100,6 +1100,13 @@ extern ClusterCtrcItlCleanoutApplyResult cluster_ctrc_recovery_itl_page_image_v1
  * TT/FullXid generation, HOT/history completeness, discharge or completion.
  * No mutation, allocation, locks or I/O; false preserves all input bytes. */
 extern bool cluster_ctrc_recovery_heap_itl_references_v1(const char *page_image);
+/* The same tuple grammar for complete saved census versions. Eight original
+ * same-page/version ITLs are required; historical ACTIVE/NEEDS_CLEANOUT DATA
+ * slots bind identity only. The caller independently qualifies every slot's
+ * exact canonical terminal, source, generation and history. Packed tuple bytes
+ * may be unaligned. No mutation, I/O, allocation, graph seal or release. */
+extern bool cluster_ctrc_recovery_heap_tuple_itl_references_v1(
+	const ClusterItlSlotData *slots, const char *tuple_bytes, Size tuple_length);
 /* Local HOT/redirect topology only, after complete native tuple/ITL grammar.
  * Uses the actual protected target block: effective HOT successors must be
  * local normal heap-only updates with matching native xmin, one predecessor

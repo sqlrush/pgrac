@@ -1728,6 +1728,7 @@ test_native_itl_batch(ClusterColdTtSlotInputV1 *subjects,
 }
 
 #include "test_cluster_ctrc_heap_refs.inc"
+#include "test_cluster_ctrc_census_tuple_refs.inc"
 #include "test_cluster_ctrc_hot_refs.inc"
 
 UT_TEST(test_ctrc_native_itl_page_uses_all_slots_and_original_terminal_projection)
@@ -3989,6 +3990,10 @@ main(void)
 		CTRC_TEST_ENTRY(test_ctrc_hot_refs_keep_aborted_orphans_and_stale_ordinary_ctid_distinct),
 		CTRC_TEST_ENTRY(test_ctrc_hot_refs_refuse_invalid_images_and_unqualified_special_links),
 		CTRC_TEST_ENTRY(test_ctrc_heap_refs_native_header_alignment_and_null_bitmap_are_required),
+		CTRC_TEST_ENTRY(test_ctrc_census_tuple_refs_share_native_grammar_without_alignment_assumptions),
+		CTRC_TEST_ENTRY(test_ctrc_census_tuple_refs_require_unique_data_creator_and_actual_updater),
+		CTRC_TEST_ENTRY(test_ctrc_census_tuple_refs_preserve_frozen_and_invalid_xmax_meanings),
+		CTRC_TEST_ENTRY(test_ctrc_census_tuple_refs_reject_bounds_grammar_and_unqualified_itl_shapes),
 		CTRC_TEST_ENTRY(test_ctrc_heap_refs_bind_distinct_creator_and_actual_deleter_itls),
 		CTRC_TEST_ENTRY(test_ctrc_heap_refs_do_not_use_hints_or_raw_xid_without_unique_data_itl),
 		CTRC_TEST_ENTRY(test_ctrc_heap_refs_reject_wrong_deleter_slot_moved_mx_and_effective_locks),

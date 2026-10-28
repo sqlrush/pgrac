@@ -2343,9 +2343,20 @@ static void startup_local_empty_reset(void);
 
 #include "test_cluster_cold_ctrc_references.inc"
 #include "test_cluster_cold_ctrc_reference_terminals.inc"
+#include "test_cluster_cold_ctrc_reference_tuples.inc"
 
 int main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_REFERENCE_TUPLES") != NULL) {
+		UT_PLAN(6);
+		UT_RUN(test_startup_reference_tuples_consume_untouched_current_and_inverse_versions);
+		UT_RUN(test_startup_reference_tuples_require_all_itls_from_the_same_page_version);
+		UT_RUN(test_startup_reference_tuples_preserve_stored_item_bounds_and_unsupported_storage);
+		UT_RUN(test_startup_reference_tuples_late_native_refusal_drift_and_error_keep_debt);
+		UT_RUN(test_startup_reference_tuples_repeat_rechecks_without_new_page_or_wal);
+		UT_RUN(test_startup_reference_tuples_zero_page_wal_still_checks_complete_view);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_REFERENCE_TERMINALS") != NULL) {
 		UT_PLAN(6);
 		UT_RUN(test_startup_reference_terminals_include_untouched_and_inverse_versions);
@@ -2576,7 +2587,13 @@ int main(void)
 		UT_DONE();
 		return ut_failed_count == 0 ? 0 : 1;
 	}
-	UT_PLAN(254);
+	UT_PLAN(260);
+	UT_RUN(test_startup_reference_tuples_consume_untouched_current_and_inverse_versions);
+	UT_RUN(test_startup_reference_tuples_require_all_itls_from_the_same_page_version);
+	UT_RUN(test_startup_reference_tuples_preserve_stored_item_bounds_and_unsupported_storage);
+	UT_RUN(test_startup_reference_tuples_late_native_refusal_drift_and_error_keep_debt);
+	UT_RUN(test_startup_reference_tuples_repeat_rechecks_without_new_page_or_wal);
+	UT_RUN(test_startup_reference_tuples_zero_page_wal_still_checks_complete_view);
 	UT_RUN(test_startup_reference_terminals_include_untouched_and_inverse_versions);
 	UT_RUN(test_startup_reference_terminals_reject_full_identity_drift_not_raw_xid_match);
 	UT_RUN(test_startup_reference_terminals_require_original_record_and_physical_page);
