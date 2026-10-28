@@ -81,6 +81,9 @@ typedef struct ClusterRelmapClogBaseV1 {
 	/* Raw local retention input, never a FullXid era or foreign horizon. */
 	bool truncation_horizon_observed;
 	TransactionId oldest_clog_xid;
+	/* Actual local next counter, not an issued XID or native era grant. */
+	bool native_next_observed;
+	uint64 next_full_xid;
 } ClusterRelmapClogBaseV1;
 typedef struct ClusterRelmapClogBaseHandleV1 ClusterRelmapClogBaseHandleV1;
 /* Start with *held NULL. Subsequent reads require the exact original source,
@@ -96,6 +99,10 @@ typedef struct ClusterRelmapClogBaseHandleV1 ClusterRelmapClogBaseHandleV1;
  * truncation lock and require it unchanged within the read and held baseline.
  * Foreign horizons stay unobserved/zero; even an observed local raw value
  * does not prove a FullXid era, no-reuse interval or truncation authority.
+ * Own reads also sample the original next FullXid getter before/after native
+ * and whole-ROOT reads, requiring the same actual value and held baseline.
+ * Its XidGenLock is released before all I/O; foreign counters stay unobserved.
+ * A sampled next counter is not an issued receipt or era/lifetime authority.
  * This does not exclude inter-instance writes or certify physical lifetime.
  * Missing/short/aliased files refuse. IN_PROGRESS stays IN_PROGRESS.
  * No caller native/CF lock or critical section; output/held/source are
