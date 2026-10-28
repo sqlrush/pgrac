@@ -1094,6 +1094,7 @@ cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **held)
 #include "test_cluster_recovery_episode_clog_history.inc"
 #include "test_cluster_recovery_episode_clog_birth.inc"
 #include "test_cluster_recovery_episode_birth_match.inc"
+#include "test_cluster_recovery_episode_birth_terminal.inc"
 #include "test_cluster_recovery_episode_generation_xid.inc"
 #include "test_cluster_recovery_clog_full_roots.inc"
 
@@ -1105,6 +1106,14 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_EPISODE_BIRTH_TERMINAL") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_episode_birth_terminal_joins_source_counter_and_both_polarities_in_one_pass);
+		UT_RUN(test_episode_birth_terminal_refuses_old_terminal_without_exact_birth);
+		UT_RUN(test_episode_birth_terminal_keeps_original_side_and_native_status_refusals);
+		UT_RUN(test_episode_birth_terminal_whole_output_and_owner_error_keep_custody);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_EPISODE_BIRTH_MATCH") != NULL) {
 		UT_PLAN(5);
 		UT_RUN(test_episode_birth_match_retains_original_source_counter_and_complete_input);
@@ -1268,7 +1277,11 @@ main(int argc, char **argv)
 		UT_RUN(test_episode_terminal_preconditions_preserve_original_base_and_query);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(194);
+	UT_PLAN(198);
+	UT_RUN(test_episode_birth_terminal_joins_source_counter_and_both_polarities_in_one_pass);
+	UT_RUN(test_episode_birth_terminal_refuses_old_terminal_without_exact_birth);
+	UT_RUN(test_episode_birth_terminal_keeps_original_side_and_native_status_refusals);
+	UT_RUN(test_episode_birth_terminal_whole_output_and_owner_error_keep_custody);
 	UT_RUN(test_clog_full_roots_keep_original_origin_and_page_extent);
 	UT_RUN(test_clog_full_roots_reject_malformed_or_detached_births_stickily);
 	UT_RUN(test_clog_full_roots_read_whole_original_file_and_revoke_on_drift);
