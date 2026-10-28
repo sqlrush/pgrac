@@ -349,11 +349,12 @@ PreflightClusterSharedCatalogWrite(Node *statement, bool isTopLevel)
 			&& !IsA(statement, SecLabelStmt) && !IsA(statement, AlterTableStmt)
 			&& !IsA(statement, ImportForeignSchemaStmt)
 			&& !IsA(statement, AlterExtensionContentsStmt) && !IsA(statement, AlterExtensionStmt)
-			&& !IsA(statement, DropOwnedStmt) && !IsA(statement, TruncateStmt)))
+			&& !IsA(statement, DropOwnedStmt) && !IsA(statement, DropStmt)
+			&& !IsA(statement, TruncateStmt)))
 		return;
 
-	/* Other DROP OWNED scopes retain their earlier storage check. */
-	if (IsA(statement, DropOwnedStmt)
+	/* Other drop scopes retain their earlier storage check. */
+	if ((IsA(statement, DropOwnedStmt) || IsA(statement, DropStmt))
 		&& (cluster_interconnect_tier != CLUSTER_IC_TIER_1 || IsInTransactionBlock(isTopLevel)))
 		return;
 
@@ -408,7 +409,8 @@ PreflightClusterSharedCatalogWrite(Node *statement, bool isTopLevel)
 			 || IsA(statement, AlterOwnerStmt) || IsA(statement, AlterDatabaseStmt)
 			 || IsA(statement, AlterTableSpaceOptionsStmt) || IsA(statement, SecLabelStmt)
 			 || IsA(statement, AlterTableStmt) || IsA(statement, AlterExtensionContentsStmt)
-			 || IsA(statement, AlterExtensionStmt) || IsA(statement, DropOwnedStmt))
+			 || IsA(statement, AlterExtensionStmt) || IsA(statement, DropOwnedStmt)
+			 || IsA(statement, DropStmt))
 		action = "alteration";
 	else
 		action = "creation";
