@@ -9064,6 +9064,21 @@ cluster_control_root_v2_shutdown_checkpoint_publish(const ClusterControlRootIden
  * or permission inferred from a dead bitmap. All borrowed evidence remains
  * owned by the caller until our confirmed lock cleanup.
  * Author: SqlRush <sqlrush@gmail.com> */
+typedef struct FailureInputCfWait {
+	PGPROC *proc;
+	Latch *latch;
+	ResourceOwner owner;
+	ClusterRecoverySerialRequest request;
+	ClusterRecoverySerialGuard serial;
+	ClusterWalSourceRef restart;
+	ClusterWalRootPublishGuard *walr;
+	int pid, node, publisher_node;
+	uint64 epoch, generation, boot, system_identifier;
+	uint64 publisher_incarnation, min_dead_us;
+	uint16 format_version;
+	bool recovery, self, tail, captured, waited;
+} FailureInputCfWait;
+
 typedef struct FailureSelfCfWait {
 	PGPROC *proc;
 	Latch *latch;
@@ -9097,6 +9112,7 @@ typedef struct FailureInputV2Work {
 	uint64 self_min_dead_us;
 	ClusterWalSourceRef self_restart;
 	FailureSelfCfWait self_cf_wait;
+	FailureInputCfWait input_cf_wait;
 } FailureInputV2Work;
 
 /*
@@ -9984,6 +10000,143 @@ failure_v2_current(const ClusterRecoverySerialRequest *request, FailureInputV2Wo
 					  == CLUSTER_RECOVERY_SERIAL_CURRENT);
 }
 
+/* PGRAC: keep each failure-input publisher's original caller and purpose.
+ * A fenced tail retains its original INPUT_SEAL IR; open publication and
+ * self-tail publication do not acquire one here. Ordinary WALR custody stays
+ * on the same ResourceOwner until the original cleanup.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static void
+failure_input_cf_capture(const ClusterRecoverySerialRequest *request, FailureInputV2Work *work,
+						 bool tail)
+{
+	FailureInputCfWait *original = &work->input_cf_wait;
+
+	original->proc = MyProc;
+	original->latch = MyLatch;
+	original->owner = CurrentResourceOwner;
+	memcpy(&original->request, request, sizeof(*request));
+	memcpy(&original->serial, &work->serial, sizeof(work->serial));
+	memcpy(&original->restart, &work->self_restart, sizeof(work->self_restart));
+	original->walr = work->walr;
+	original->pid = MyProcPid;
+	original->node = cluster_node_id;
+	original->epoch = cluster_epoch_get_current();
+	original->generation = cluster_grd_redeclare_generation();
+	original->boot = cluster_qvotec_get_self_incarnation();
+	original->system_identifier = GetSystemIdentifier();
+	original->publisher_node = work->publisher_node;
+	original->publisher_incarnation = work->publisher_incarnation;
+	original->min_dead_us = work->self_min_dead_us;
+	original->format_version = work->format_version;
+	original->recovery = RecoveryInProgress();
+	original->self = work->self;
+	original->tail = tail;
+	original->captured = true;
+}
+
+static bool
+failure_input_cf_current(const ClusterRecoverySerialRequest *request, FailureInputV2Work *work,
+						 bool tail)
+{
+	const FailureInputCfWait *original = &work->input_cf_wait;
+
+	return original->captured && original->proc != NULL && original->latch != NULL
+		   && original->owner != NULL && original->walr != NULL && work->self == original->self
+		   && tail == original->tail && MyProc == original->proc && MyLatch == original->latch
+		   && MyProcPid == original->pid && CurrentResourceOwner == original->owner
+		   && MyBackendType == B_STARTUP && AmStartupProcess() && CritSectionCount == 0
+		   && !LWLockHeldByMe(ControlFileLock) && !ShutdownRequestPending && cluster_enabled
+		   && cluster_shared_config && cluster_controlfile_shared_authority && enableFsync
+		   && cluster_node_id == original->node && original->node >= 0
+		   && original->node < CLUSTER_MAX_NODES && original->epoch != 0
+		   && original->generation != 0 && original->boot != 0
+		   && GetSystemIdentifier() == original->system_identifier
+		   && cluster_epoch_get_current() == original->epoch
+		   && cluster_grd_redeclare_generation() == original->generation
+		   && cluster_qvotec_get_self_incarnation() == original->boot
+		   && RecoveryInProgress() == original->recovery
+		   && cluster_recovery_transport_components_current()
+		   && memcmp(request, &original->request, sizeof(*request)) == 0
+		   && memcmp(&work->serial, &original->serial, sizeof(work->serial)) == 0
+		   && memcmp(&work->self_restart, &original->restart, sizeof(work->self_restart)) == 0
+		   && work->walr == original->walr && work->publisher_node == original->publisher_node
+		   && work->publisher_incarnation == original->publisher_incarnation
+		   && work->self_min_dead_us == original->min_dead_us
+		   && work->format_version == original->format_version
+		   && (tail ? failure_v2_current(request, work) : failure_v2_authorized(request, work));
+}
+
+static void
+failure_input_cf_wait(const ClusterRecoverySerialRequest *request, FailureInputV2Work *work,
+					  bool tail, const ClusterCfAttemptObservation *attempt)
+{
+	ClusterCfRetirementSnapshot retiring;
+	LOCKMODE mode = attempt->mode;
+	LOCKMODE other = mode == ShareLock ? ExclusiveLock : ShareLock;
+	bool empty = attempt->owner_state_at_return == CLUSTER_LOCK_OWNER_EMPTY;
+	bool empty_waited = false;
+	const char *reason = "CONTEXT_CHANGED_AFTER_WAIT_SLICE";
+
+	if (!failure_input_cf_current(request, work, tail) || cluster_cf_held(other))
+		goto refuse;
+	reason = "CF_WAIT_IDENTITY_OR_COMPLETION";
+	if (!empty
+		&& (!cluster_cf_retirement_snapshot(mode, NULL, &retiring)
+			|| retiring.cookie != attempt->control_owner_id
+			|| retiring.registry.message.key.holder.request_id != attempt->request_id
+			|| retiring.registry.message.key.holder.cluster_epoch != attempt->request_epoch))
+		goto refuse;
+	for (;;) {
+		ClusterCfRetirementSnapshot current;
+		bool held;
+
+		HandleStartupProcInterrupts();
+		CHECK_FOR_INTERRUPTS();
+		reason = "CONTEXT_CHANGED_AFTER_WAIT_SLICE";
+		if (!failure_input_cf_current(request, work, tail))
+			goto refuse;
+		ResetLatch(MyLatch);
+		held = cluster_cf_held(mode);
+		if (!held && !cluster_cf_held(other)) {
+			if (!empty && cluster_cf_release_completed(mode, retiring.cookie))
+				return;
+			if (empty) {
+				if (empty_waited)
+					return;
+				empty_waited = true;
+				(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+								WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
+				continue;
+			}
+		}
+		reason = "CF_WAIT_IDENTITY_OR_COMPLETION";
+		if (empty || !held || cluster_cf_held(other)
+			|| !cluster_cf_retirement_snapshot(mode, NULL, &current)
+			|| current.cookie != retiring.cookie
+			|| current.registry.handle.slot != retiring.registry.handle.slot
+			|| current.registry.handle.generation != retiring.registry.handle.generation
+			|| memcmp(&current.registry.owner, &retiring.registry.owner,
+					  sizeof(current.registry.owner))
+				   != 0
+			|| memcmp(&current.registry.message.key, &retiring.registry.message.key,
+					  sizeof(current.registry.message.key))
+				   != 0)
+			goto refuse;
+		cluster_lock_owners_service_poll();
+		cluster_cf_retirement_poll();
+		if (cluster_cf_held(mode))
+			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+							WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
+	}
+refuse:
+	ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+					errmsg("startup failure input cannot continue its control-file wait"),
+					errdetail("PGRAC_FAMILY=STARTUP_CONTROL consumer=%s reason=%s "
+							  "cookie=" UINT64_FORMAT " request=" UINT64_FORMAT,
+							  tail ? "failure_tail" : "failure_open", reason,
+							  attempt->control_owner_id, attempt->request_id)));
+}
+
 /* PGRAC: observe under owned CF, but never keep CF over the WAL scan.
  * The full root token also detects changes to unrelated thread/common state.
  * Author: SqlRush <sqlrush@gmail.com> */
@@ -9995,12 +10148,29 @@ failure_v2_tail_read(const ClusterRecoverySerialRequest *request, FailureInputV2
 	ClusterControlRootFileToken file_token;
 	const ClusterControlRootSnapshot *record;
 	int index = request->duty.origin_thread_id - 1;
+	bool startup = MyBackendType == B_STARTUP;
 
-	if (!cluster_cf_lock(mode))
-		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	if (startup && !work->input_cf_wait.captured)
+		failure_input_cf_capture(request, work, true);
+	if (work->input_cf_wait.waited && !failure_input_cf_current(request, work, true))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	for (;;) {
+		ClusterCfAttemptObservation attempt;
+		uint64 before = startup ? cluster_cf_attempt_sequence() : 0;
+
+		if (cluster_cf_lock(mode))
+			break;
+		if (!startup || !cluster_cf_last_attempt_since(before, &attempt)
+			|| !cluster_cf_attempt_wait_slice(&attempt) || attempt.mode != mode)
+			return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+		failure_input_cf_wait(request, work, true, &attempt);
+		work->input_cf_wait.waited = true;
+	}
 	work->cf_mode = mode;
 	if (!cluster_cf_held_is_clusterwide(mode))
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	if (work->input_cf_wait.waited && !failure_input_cf_current(request, work, true))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	result = read_thread_version(&request->duty, &work->base, &work->control, &file_token,
 								 work->format_version);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
@@ -10142,17 +10312,34 @@ failure_v2_open_work(const ClusterRecoverySerialRequest *request, FailureInputV2
 	ClusterControlRootFileToken file_token;
 	ClusterControlRootSnapshot *record;
 	int index = request->duty.origin_thread_id - 1;
+	bool startup = MyBackendType == B_STARTUP;
 
 	retained = cluster_wal_retention_root_publish_begin_exact(&request->expected_root_token, false,
 															  &work->walr);
 	if (retained != CLUSTER_WAL_PIN_OK)
 		return retained == CLUSTER_WAL_PIN_STALE ? CLUSTER_CONTROL_ROOT_STALE_TOKEN
 												 : CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
-	if (!cluster_cf_lock(ExclusiveLock))
-		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	if (startup && !work->input_cf_wait.captured)
+		failure_input_cf_capture(request, work, false);
+	if (work->input_cf_wait.waited && !failure_input_cf_current(request, work, false))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	for (;;) {
+		ClusterCfAttemptObservation attempt;
+		uint64 before = startup ? cluster_cf_attempt_sequence() : 0;
+
+		if (cluster_cf_lock(ExclusiveLock))
+			break;
+		if (!startup || !cluster_cf_last_attempt_since(before, &attempt)
+			|| !cluster_cf_attempt_wait_slice(&attempt) || attempt.mode != ExclusiveLock)
+			return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+		failure_input_cf_wait(request, work, false, &attempt);
+		work->input_cf_wait.waited = true;
+	}
 	work->cf_mode = ExclusiveLock;
 	if (!cluster_cf_held_is_clusterwide(ExclusiveLock))
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	if (work->input_cf_wait.waited && !failure_input_cf_current(request, work, false))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	result = read_thread_version(&request->duty, &work->base, &work->control, &file_token,
 								 work->format_version);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
