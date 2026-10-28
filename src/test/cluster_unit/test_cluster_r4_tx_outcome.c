@@ -234,6 +234,7 @@ static int test_remote_origin_calls;
 static uint32 test_remote_origin_generation;
 static ClusterTxOutcome test_remote_origin_outcome;
 static bool test_remote_origin_revoke_admission;
+static const uint8 *test_remote_origin_verdict_page;
 static ClusterUndoBlock0CurrentStep test_candidate_acquire_step = CLUSTER_UNDO_BLOCK0_CURRENT_HELD;
 static ClusterUndoBlock0CurrentStep test_candidate_poll_step = CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
 static ClusterUndoBlock0CurrentStep test_candidate_after_wait_step
@@ -974,6 +975,41 @@ cluster_ctrc_receipt_prepare_shared(const ClusterCtrcTxnKeyV1 *key,
 	return CLUSTER_CTRC_PREPARE_READY;
 }
 
+/* Controlled original144 leaf for the already-real pending producer. The
+ * unit observes exact key/receiver/grant continuity; shared locking/encoding
+ * has its own original-source tests. No arbitrary receiver is accepted. */
+bool
+cluster_ctrc_origin_fullxid_capture_v2(const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcParticipantIdentity *receiver, uint32 grant,
+	uint8 bytes[CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES])
+{
+	memset(bytes, 0, CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES);
+	if (grant == 0 || grant != test_ctrc_touch_grant
+		|| memcmp(key, &test_ctrc_touched_key, sizeof(*key)) != 0
+		|| memcmp(receiver, &test_ctrc_touched_participant, sizeof(*receiver)) != 0)
+		return false;
+	memcpy(bytes, key, sizeof(*key));
+	memcpy(bytes + sizeof(*key), receiver, sizeof(*receiver));
+	memcpy(bytes + sizeof(*key) + sizeof(*receiver), &grant, sizeof(grant));
+	return true;
+}
+
+ClusterCtrcPrepareResult
+cluster_ctrc_receipt_prepare_origin_v2(const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcParticipantIdentity *receiver, uint32 grant,
+	const ClusterCtrcPublicationIdV1 *publication, const ClusterCtrcTargetV1 *target,
+	const uint8 *bytes, Size length, ClusterCtrcReceiptHandle *handle)
+{
+	uint8 expected[CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES];
+
+	if (length != sizeof(expected) || bytes == NULL
+		|| !cluster_ctrc_origin_fullxid_capture_v2(key, receiver, grant, expected)
+		|| memcmp(bytes, expected, sizeof(expected)) != 0)
+		return CLUSTER_CTRC_PREPARE_REFUSED;
+	return cluster_ctrc_receipt_prepare_shared(key, receiver, grant, publication,
+		target, handle);
+}
+
 bool
 cluster_ctrc_receipt_cancel_shared(const ClusterCtrcReceiptHandle *handle)
 {
@@ -1251,6 +1287,15 @@ cluster_gcs_block_r4_tx_resolve_fetch_and_wait(int32 origin_node, const ClusterT
 	UT_ASSERT_EQ(memcmp(locator, &test_origin_locator, sizeof(*locator)), 0);
 	test_remote_origin_calls++;
 	test_remote_origin_generation = expected_physical_generation;
+	if (test_remote_origin_verdict_page != NULL) {
+		bool decoded = ClusterR4TxVerdictPageDecode(test_remote_origin_verdict_page, locator, out);
+
+		UT_ASSERT(decoded);
+		*reason_out = decoded ? CLUSTER_TX_RESOLVE_NONE : CLUSTER_TX_RESOLVE_PROTOCOL;
+		if (test_remote_origin_revoke_admission)
+			test_formation_epoch++;
+		return decoded ? out->outcome : CLUSTER_TX_UNKNOWN;
+	}
 	/* Transport/proof validation is covered by the real GCS suite. This seam
 	 * records what the real admitted consumer asks the exact origin to do. */
 	memset(out, 0, sizeof(*out));
@@ -1457,6 +1502,7 @@ reset_exact_origin_fixture(void)
 	test_remote_origin_generation = 0;
 	test_remote_origin_outcome = CLUSTER_TX_IN_PROGRESS;
 	test_remote_origin_revoke_admission = false;
+	test_remote_origin_verdict_page = NULL;
 	test_candidate_acquire_step = CLUSTER_UNDO_BLOCK0_CURRENT_HELD;
 	test_candidate_poll_step = CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
 	test_candidate_after_wait_step = CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
@@ -7401,10 +7447,93 @@ UT_TEST(test_retained_slot_identity_does_not_escape_original_final_fences)
 	}
 }
 
+/* Actual origin DATA/canonical guard path, followed by the existing reply
+ * encoder. The new version must carry identity, never reuse V3's zero tail. */
+UT_TEST(test_original_canonical_creation_selects_explicit_wire_version)
+{
+	for (int same = 0; same < 2; same++) {
+		ClusterTxResolution resolution;
+		uint8 page[BLCKSZ];
+
+		setup_original_full_xid(same);
+		UT_ASSERT_EQ(resolve_original_full_xid(CLUSTER_TX_RESOLVE_TERMINAL_CENSUS,
+			&resolution), CLUSTER_TX_COMMITTED);
+		UT_ASSERT(resolution.local_canonical_valid);
+		UT_ASSERT(resolution.local_creation_target.valid);
+		UT_ASSERT(FullTransactionIdEquals(resolution.local_original_full_xid,
+			test_original_full_xid));
+		UT_ASSERT(ClusterR4TxVerdictPageEncode(page, &resolution));
+		UT_ASSERT_EQ(ClusterR4WireReadU16(page + 4), 4);
+		UT_ASSERT_EQ(ClusterR4WireReadU16(page + 6), 224);
+	}
+}
+
+UT_TEST(test_origin_companion_missing_source_stays_v3_and_fence_drift_clears_candidate)
+{
+	for (int same = 0; same < 2; same++) {
+		ClusterTxResolution resolution, decoded;
+		uint8 page[BLCKSZ];
+
+		setup_original_full_xid(same);
+		test_original_available = false;
+		UT_ASSERT_EQ(resolve_original_full_xid(CLUSTER_TX_RESOLVE_TERMINAL_CENSUS,
+			&resolution), CLUSTER_TX_COMMITTED);
+		UT_ASSERT(!resolution.origin_companion.present);
+		UT_ASSERT(ClusterR4TxVerdictPageEncode(page, &resolution));
+		UT_ASSERT_EQ(ClusterR4WireReadU16(page + 4), 3);
+		UT_ASSERT(ClusterR4TxVerdictPageDecode(page, &resolution.locator_echo, &decoded));
+		UT_ASSERT(!decoded.origin_companion.present);
+		for (int drift = 1; drift <= 4; drift++) {
+			setup_original_full_xid(same);
+			if (drift == 2)
+				test_regular_root_resolve_calls = 2;
+			test_original_drift = drift;
+			resolve_original_full_xid(CLUSTER_TX_RESOLVE_TERMINAL_CENSUS, &resolution);
+			UT_ASSERT(!resolution.origin_companion.present);
+			UT_ASSERT(!resolution.origin_companion.creation_target.valid);
+			UT_ASSERT_EQ(test_candidate_held_count, 0);
+		}
+	}
+}
+
+UT_TEST(test_foreign_v4_remains_separate_and_original_final_admission_clears_all)
+{
+	int saved_node = cluster_node_id;
+
+	for (int revoke = 0; revoke < 2; revoke++) {
+		ClusterTxResolution origin, received, zero = {0};
+		uint8 page[BLCKSZ];
+
+		setup_original_full_xid(false);
+		UT_ASSERT_EQ(resolve_original_full_xid(CLUSTER_TX_RESOLVE_TERMINAL_CENSUS,
+			&origin), CLUSTER_TX_COMMITTED);
+		UT_ASSERT(ClusterR4TxVerdictPageEncode(page, &origin));
+		test_remote_origin_enabled = true;
+		test_remote_origin_verdict_page = page;
+		test_remote_origin_revoke_admission = revoke;
+		cluster_node_id = 1;
+		UT_ASSERT_EQ(resolve_original_full_xid(CLUSTER_TX_RESOLVE_TERMINAL_CENSUS,
+			&received), revoke ? CLUSTER_TX_UNKNOWN : CLUSTER_TX_COMMITTED);
+		cluster_node_id = saved_node;
+		UT_ASSERT_EQ(test_remote_origin_calls, 1);
+		UT_ASSERT(!received.local_canonical_valid);
+		UT_ASSERT(!FullTransactionIdIsValid(received.local_original_full_xid));
+		UT_ASSERT(!received.local_creation_target.valid);
+		if (revoke)
+			UT_ASSERT_EQ(memcmp(&received, &zero, sizeof(zero)), 0);
+		else {
+			UT_ASSERT(received.origin_companion.present);
+			UT_ASSERT_EQ(memcmp(&received.origin_companion, &origin.origin_companion,
+				sizeof(origin.origin_companion)), 0);
+		}
+		test_remote_origin_verdict_page = NULL;
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(205);
+	UT_PLAN(208);
 	UT_RUN(test_original_full_xid_reaches_same_and_cross_segment_census_result);
 	UT_RUN(test_original_full_xid_missing_or_key_alias_keeps_verdict_without_identity);
 	UT_RUN(test_original_full_xid_not_queried_for_other_roles_or_abort);
@@ -7610,6 +7739,9 @@ main(void)
 	UT_RUN(test_update_creation_target_names_replacement_not_old_tuple);
 	UT_RUN(test_noncreation_or_malformed_payload_keeps_verdict_without_target);
 	UT_RUN(test_creation_target_is_not_exported_after_final_data_fence_drift);
+	UT_RUN(test_original_canonical_creation_selects_explicit_wire_version);
+	UT_RUN(test_origin_companion_missing_source_stays_v3_and_fence_drift_clears_candidate);
+	UT_RUN(test_foreign_v4_remains_separate_and_original_final_admission_clears_all);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

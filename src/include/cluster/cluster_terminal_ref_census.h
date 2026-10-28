@@ -36,8 +36,6 @@
 #include "storage/block.h"
 #include "storage/relfilelocator.h"
 
-#define CLUSTER_CTRC_FORMAT_VERSION UINT8_C(1)
-#define CLUSTER_CTRC_TXN_KEY_BYTES 96
 #define CLUSTER_CTRC_SEAL_REQUEST_BYTES 136
 /* Explicit parent-bound CLOSE extension; wire2 keeps its origin-only meaning. */
 #define CLUSTER_CTRC_DELEGATION_CLOSE_V1_BYTES 216
@@ -251,26 +249,6 @@ typedef enum ClusterCtrcOriginState {
 	CTRC_ORIGIN_RELEASE_PROVEN,
 	CTRC_ORIGIN_BLOCKED
 } ClusterCtrcOriginState;
-
-typedef struct ClusterCtrcTxnKeyV1 {
-	uint8 format_version;
-	uint8 owner_instance;
-	uint16 origin_node_id;
-	uint32 segment_id;
-	uint32 segment_generation;
-	uint16 slot_offset;
-	uint16 slot_wrap;
-	TransactionId xid;
-	uint32 cluster_epoch;
-	uint64 system_identifier;
-	uint64 origin_boot_incarnation;
-	uint64 formation_epoch;
-	uint64 admission_record_generation;
-	uint64 root_descriptor_incarnation;
-	uint64 root_id;
-	uint64 root_generation;
-	uint8 reserved[16];
-} ClusterCtrcTxnKeyV1;
 
 typedef struct ClusterCtrcPublicationIdV1 {
 	uint16 requester_node_id;

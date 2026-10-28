@@ -92,7 +92,7 @@ typedef struct ClusterCurrentMemberProofKey ClusterCurrentMemberProofKey;
 /* Stack/process-local continuation for the exact origin DATA -> canonical TT
  * -> DATA proof.  The representation is private to the provider; it is not a
  * wire or shared-memory ABI and never grants authority by itself. */
-#define CLUSTER_RUNTIME_VISIBILITY_ORIGIN_PLAN_BYTES 8704
+#define CLUSTER_RUNTIME_VISIBILITY_ORIGIN_PLAN_BYTES 8960
 typedef union ClusterRuntimeVisibilityOriginPlan {
 	uint64 align;
 	uint8 opaque[CLUSTER_RUNTIME_VISIBILITY_ORIGIN_PLAN_BYTES];

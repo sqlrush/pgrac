@@ -69,6 +69,7 @@
 #define CLUSTER_GCS_BLOCK_H
 
 #include "c.h"
+#include "access/htup_details.h"
 #include "cluster/cluster_gcs_reqid.h"
 #include "cluster/cluster_pcm_lock.h" /* PcmLockTransition */
 #include "cluster/cluster_pcm_x_bufmgr.h"
@@ -2713,24 +2714,163 @@ ClusterR4ForwardExtensionGetLocatorGeneration(const ClusterR4ForwardExtension *e
 #define CLUSTER_R4_TX_VERDICT_VERSION UINT16_C(3)
 #define CLUSTER_R4_TX_VERDICT_HEADER_LEN UINT16_C(80)
 
-/*
- * Exact V3 transaction-verdict payload carried at the head of a BLCKSZ reply
- * page.  The page is encoded bytewise so compiler packing and host endian are
- * never wire authority.  Bytes 80..BLCKSZ-1 are part of the canonical form
- * and must remain zero.
- */
+#define CLUSTER_R4_TX_VERDICT_COMPANION_VERSION UINT16_C(4)
+#define CLUSTER_R4_TX_VERDICT_COMPANION_LEN UINT16_C(224)
+
+/* Pure framing checks only: no receiver retention or source authority. */
+static inline bool
+ClusterR4TxCompanionIsValid(const ClusterTxResolution *resolution)
+{
+	const ClusterTxCanonicalCompanionV1 *companion = &resolution->origin_companion;
+	const ClusterCtrcTxnKeyV1 *key = &companion->key;
+	const ClusterTxCreationTarget *target = &companion->creation_target;
+	static const uint8 zero_reserved[16] = {0};
+	uint32 segment, block;
+	uint16 slot, row;
+
+	return companion->present && target->valid
+		&& resolution->outcome == CLUSTER_TX_COMMITTED
+		&& resolution->proof_kind == CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG
+		&& SCN_VALID(resolution->commit_scn) && SCN_VALID(resolution->authority.authority_scn)
+		&& key->format_version == CLUSTER_CTRC_FORMAT_VERSION
+		&& memcmp(key->reserved, zero_reserved, sizeof(zero_reserved)) == 0
+		&& key->origin_node_id < CLUSTER_MAX_NODES
+		&& key->owner_instance == key->origin_node_id + 1
+		&& key->segment_id > 0 && key->segment_id <= UINT16_MAX
+		&& (key->segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE == key->origin_node_id
+		&& key->segment_generation != 0 && key->segment_generation != UINT32_MAX
+		&& key->slot_offset < TT_SLOTS_PER_SEGMENT && key->slot_wrap <= TT_WRAP_MAX
+		&& key->slot_wrap == resolution->locator_echo.tt_wrap
+		&& TransactionIdIsNormal(key->xid) && key->xid == resolution->locator_echo.xid
+		&& key->xid == resolution->top_xid
+		&& FullTransactionIdIsNormal(companion->original_full_xid)
+		&& U64FromFullTransactionId(companion->original_full_xid) != UINT64_MAX
+		&& XidFromFullTransactionId(companion->original_full_xid) == key->xid
+		&& key->system_identifier != 0 && key->origin_boot_incarnation != 0
+		&& key->formation_epoch <= UINT32_MAX
+		&& key->cluster_epoch == key->formation_epoch
+		&& key->formation_epoch == resolution->authority.origin_epoch
+		&& key->admission_record_generation != 0 && key->root_descriptor_incarnation != 0
+		&& key->root_id != 0 && key->root_generation != 0
+		&& uba_decode_record(resolution->locator_echo.uba, &segment, &block, &slot, &row)
+		&& (segment - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE == key->origin_node_id
+		&& RelFileNumberIsValid(target->locator.relNumber) && target->fork == MAIN_FORKNUM
+		&& target->block != InvalidBlockNumber && OffsetNumberIsValid(target->offset)
+		&& target->offset <= MaxHeapTuplesPerPage
+		&& (target->tuple_length == 0 || (target->tuple_length >= SizeofHeapTupleHeader
+			&& target->tuple_length <= BLCKSZ - SizeOfPageHeaderData));
+}
+
+/* Exact original 96-byte key layout; no reinterpretation of its reserved bytes. */
+static inline void
+ClusterR4TxCompanionEncode(uint8 *bytes, const ClusterTxCanonicalCompanionV1 *companion)
+{
+	const ClusterCtrcTxnKeyV1 *key = &companion->key;
+	const ClusterTxCreationTarget *target = &companion->creation_target;
+
+	bytes[0] = key->format_version;
+	bytes[1] = key->owner_instance;
+	ClusterR4WireWriteU16(bytes + 2, key->origin_node_id);
+	ClusterR4WireWriteU32(bytes + 4, key->segment_id);
+	ClusterR4WireWriteU32(bytes + 8, key->segment_generation);
+	ClusterR4WireWriteU16(bytes + 12, key->slot_offset);
+	ClusterR4WireWriteU16(bytes + 14, key->slot_wrap);
+	ClusterR4WireWriteU32(bytes + 16, key->xid);
+	ClusterR4WireWriteU32(bytes + 20, key->cluster_epoch);
+	ClusterR4WireWriteU64(bytes + 24, key->system_identifier);
+	ClusterR4WireWriteU64(bytes + 32, key->origin_boot_incarnation);
+	ClusterR4WireWriteU64(bytes + 40, key->formation_epoch);
+	ClusterR4WireWriteU64(bytes + 48, key->admission_record_generation);
+	ClusterR4WireWriteU64(bytes + 56, key->root_descriptor_incarnation);
+	ClusterR4WireWriteU64(bytes + 64, key->root_id);
+	ClusterR4WireWriteU64(bytes + 72, key->root_generation);
+	ClusterR4WireWriteU64(bytes + 96, U64FromFullTransactionId(companion->original_full_xid));
+	ClusterR4WireWriteU32(bytes + 104, target->locator.spcOid);
+	ClusterR4WireWriteU32(bytes + 108, target->locator.dbOid);
+	ClusterR4WireWriteU32(bytes + 112, target->locator.relNumber);
+	ClusterR4WireWriteU32(bytes + 116, (uint32) target->fork);
+	ClusterR4WireWriteU32(bytes + 120, target->block);
+	ClusterR4WireWriteU16(bytes + 124, target->offset);
+	ClusterR4WireWriteU16(bytes + 126, target->tuple_length);
+}
+
+static inline void
+ClusterR4TxCompanionDecode(const uint8 *bytes, ClusterTxCanonicalCompanionV1 *companion)
+{
+	ClusterCtrcTxnKeyV1 *key = &companion->key;
+	ClusterTxCreationTarget *target = &companion->creation_target;
+
+	key->format_version = bytes[0];
+	key->owner_instance = bytes[1];
+	key->origin_node_id = ClusterR4WireReadU16(bytes + 2);
+	key->segment_id = ClusterR4WireReadU32(bytes + 4);
+	key->segment_generation = ClusterR4WireReadU32(bytes + 8);
+	key->slot_offset = ClusterR4WireReadU16(bytes + 12);
+	key->slot_wrap = ClusterR4WireReadU16(bytes + 14);
+	key->xid = ClusterR4WireReadU32(bytes + 16);
+	key->cluster_epoch = ClusterR4WireReadU32(bytes + 20);
+	key->system_identifier = ClusterR4WireReadU64(bytes + 24);
+	key->origin_boot_incarnation = ClusterR4WireReadU64(bytes + 32);
+	key->formation_epoch = ClusterR4WireReadU64(bytes + 40);
+	key->admission_record_generation = ClusterR4WireReadU64(bytes + 48);
+	key->root_descriptor_incarnation = ClusterR4WireReadU64(bytes + 56);
+	key->root_id = ClusterR4WireReadU64(bytes + 64);
+	key->root_generation = ClusterR4WireReadU64(bytes + 72);
+	memcpy(key->reserved, bytes + 80, sizeof(key->reserved));
+	companion->original_full_xid = FullTransactionIdFromU64(ClusterR4WireReadU64(bytes + 96));
+	target->locator.spcOid = ClusterR4WireReadU32(bytes + 104);
+	target->locator.dbOid = ClusterR4WireReadU32(bytes + 108);
+	target->locator.relNumber = ClusterR4WireReadU32(bytes + 112);
+	target->fork = (ForkNumber) ClusterR4WireReadU32(bytes + 116);
+	target->block = ClusterR4WireReadU32(bytes + 120);
+	target->offset = ClusterR4WireReadU16(bytes + 124);
+	target->tuple_length = ClusterR4WireReadU16(bytes + 126);
+	target->valid = true;
+	companion->present = true;
+}
+
+/* V3 retains its exact 80-byte header and zero tail. V4 adds a 144-byte
+ * optional original-origin observation on the same BLCKSZ reply. Decoding
+ * the observation never populates local canonical/row authority. */
 static inline bool
 ClusterR4TxVerdictPageEncode(uint8 page_out[BLCKSZ], const ClusterTxResolution *resolution)
 {
+	bool with_companion;
+
 	if (page_out != NULL)
 		memset(page_out, 0, BLCKSZ);
 	if (page_out == NULL || resolution == NULL
 		|| !cluster_tx_outcome_proof_is_valid(resolution->outcome, resolution->proof_kind))
 		return false;
 
+	with_companion = resolution->origin_companion.present
+		&& resolution->origin_companion.creation_target.valid;
+	if (with_companion) {
+		const ClusterCtrcTxnKeyV1 *key = &resolution->origin_companion.key;
+		const ClusterTxCreationTarget *target = &resolution->origin_companion.creation_target;
+		const ClusterTxCreationTarget *local = &resolution->local_creation_target;
+
+		/* A received observation must never be re-exported as local authority. */
+		if (!ClusterR4TxCompanionIsValid(resolution) || !resolution->local_canonical_valid
+			|| resolution->local_canonical.segment_id != key->segment_id
+			|| resolution->local_canonical.slot_offset != key->slot_offset
+			|| resolution->local_canonical.wrap != key->slot_wrap
+			|| resolution->local_canonical.xid != key->xid
+			|| resolution->local_canonical.reserved32 != 0
+			|| resolution->local_canonical_generation != key->segment_generation
+			|| !FullTransactionIdEquals(resolution->local_original_full_xid,
+				resolution->origin_companion.original_full_xid)
+			|| !local->valid || !RelFileLocatorEquals(local->locator, target->locator)
+			|| local->fork != target->fork || local->block != target->block
+			|| local->offset != target->offset || local->tuple_length != target->tuple_length)
+			return false;
+	}
+
 	ClusterR4WireWriteU32(&page_out[0], CLUSTER_R4_TX_VERDICT_MAGIC);
-	ClusterR4WireWriteU16(&page_out[4], CLUSTER_R4_TX_VERDICT_VERSION);
-	ClusterR4WireWriteU16(&page_out[6], CLUSTER_R4_TX_VERDICT_HEADER_LEN);
+	ClusterR4WireWriteU16(&page_out[4], with_companion ? CLUSTER_R4_TX_VERDICT_COMPANION_VERSION
+		: CLUSTER_R4_TX_VERDICT_VERSION);
+	ClusterR4WireWriteU16(&page_out[6], with_companion ? CLUSTER_R4_TX_VERDICT_COMPANION_LEN
+		: CLUSTER_R4_TX_VERDICT_HEADER_LEN);
 	page_out[8] = (uint8)resolution->outcome;
 	page_out[9] = (uint8)resolution->proof_kind;
 	ClusterR4WireWriteU64(&page_out[12], resolution->locator_echo.uba.raw[0]);
@@ -2745,6 +2885,9 @@ ClusterR4TxVerdictPageEncode(uint8 page_out[BLCKSZ], const ClusterTxResolution *
 	ClusterR4WireWriteU64(&page_out[56], resolution->authority.origin_epoch);
 	ClusterR4WireWriteU64(&page_out[64], resolution->authority.tt_generation);
 	ClusterR4WireWriteU64(&page_out[72], (uint64)resolution->authority.authority_scn);
+	if (with_companion)
+		ClusterR4TxCompanionEncode(page_out + CLUSTER_R4_TX_VERDICT_HEADER_LEN,
+			&resolution->origin_companion);
 	return true;
 }
 
@@ -2752,17 +2895,24 @@ static inline bool
 ClusterR4TxVerdictPageDecode(const uint8 page[BLCKSZ], const ClusterTxLocator *expected_locator,
 							 ClusterTxResolution *resolution_out)
 {
-	static const uint8 zero_tail[BLCKSZ - CLUSTER_R4_TX_VERDICT_HEADER_LEN] = { 0 };
+	static const uint8 zero_tail[BLCKSZ] = { 0 };
 	ClusterTxResolution decoded;
+	uint16 version, length;
 
 	if (resolution_out != NULL)
 		memset(resolution_out, 0, sizeof(*resolution_out));
 	if (page == NULL || expected_locator == NULL || resolution_out == NULL
-		|| ClusterR4WireReadU32(&page[0]) != CLUSTER_R4_TX_VERDICT_MAGIC
-		|| ClusterR4WireReadU16(&page[4]) != CLUSTER_R4_TX_VERDICT_VERSION
-		|| ClusterR4WireReadU16(&page[6]) != CLUSTER_R4_TX_VERDICT_HEADER_LEN || page[10] != 0
-		|| page[11] != 0
-		|| memcmp(&page[CLUSTER_R4_TX_VERDICT_HEADER_LEN], zero_tail, sizeof(zero_tail)) != 0)
+		|| ClusterR4WireReadU32(page) != CLUSTER_R4_TX_VERDICT_MAGIC
+		|| page[10] != 0 || page[11] != 0)
+		return false;
+	version = ClusterR4WireReadU16(page + 4);
+	length = ClusterR4WireReadU16(page + 6);
+	if (!((version == CLUSTER_R4_TX_VERDICT_VERSION && length == CLUSTER_R4_TX_VERDICT_HEADER_LEN)
+		|| (version == CLUSTER_R4_TX_VERDICT_COMPANION_VERSION
+			&& length == CLUSTER_R4_TX_VERDICT_COMPANION_LEN))
+		|| memcmp(page + length, zero_tail, BLCKSZ - length) != 0
+		|| (version == CLUSTER_R4_TX_VERDICT_COMPANION_VERSION
+			&& memcmp(page + 208, zero_tail, 16) != 0))
 		return false;
 
 	memset(&decoded, 0, sizeof(decoded));
@@ -2787,6 +2937,12 @@ ClusterR4TxVerdictPageDecode(const uint8 page[BLCKSZ], const ClusterTxLocator *e
 	decoded.authority.live_hwm_lsn = InvalidXLogRecPtr;
 	decoded.authority.tt_generation = ClusterR4WireReadU64(&page[64]);
 	decoded.authority.authority_scn = (SCN)ClusterR4WireReadU64(&page[72]);
+	if (version == CLUSTER_R4_TX_VERDICT_COMPANION_VERSION) {
+		ClusterR4TxCompanionDecode(page + CLUSTER_R4_TX_VERDICT_HEADER_LEN,
+			&decoded.origin_companion);
+		if (!ClusterR4TxCompanionIsValid(&decoded))
+			return false;
+	}
 	*resolution_out = decoded;
 	return true;
 }

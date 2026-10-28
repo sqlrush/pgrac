@@ -995,7 +995,7 @@ cluster_runtime_visibility_ctrc_key_fill(const ClusterTTSlotCurrentOwner *owner,
  * generation/root/admission checks, while its canonical guard remains held. */
 static FullTransactionId
 cluster_runtime_visibility_origin_original_full_xid(
-	const ClusterTxResolution *candidate, ClusterTxResolveMode mode,
+	ClusterTxResolution *candidate, ClusterTxResolveMode mode,
 	const ClusterSemanticAdmissionToken *admission,
 	const ClusterUndoBlock0ResolvedRoot *root)
 {
@@ -1003,6 +1003,9 @@ cluster_runtime_visibility_origin_original_full_xid(
 	ClusterUndoBlock0Generation generation = {false, 0};
 	ClusterCtrcTxnKeyV1 key;
 	FullTransactionId original = InvalidFullTransactionId;
+
+	if (candidate != NULL)
+		memset(&candidate->origin_companion, 0, sizeof(candidate->origin_companion));
 
 	/* Optional local observation only. Its absence must not change the
 	 * transaction verdict or invoke another TT/DATA read or acquisition. */
@@ -1044,6 +1047,11 @@ cluster_runtime_visibility_origin_original_full_xid(
 		|| XidFromFullTransactionId(original) != owner.xid
 		|| cluster_qvotec_get_self_incarnation() != key.origin_boot_incarnation)
 		return InvalidFullTransactionId;
+	/* Same original guard and final fences as the optional local identity.
+	 * This is an observation for a versioned reply, not receiver retention. */
+	candidate->origin_companion.key = key;
+	candidate->origin_companion.original_full_xid = original;
+	candidate->origin_companion.present = true;
 	return original;
 }
 
@@ -2092,6 +2100,8 @@ cluster_runtime_visibility_origin_creation_target(const char *record_bytes, size
 	uint16 body_length;
 
 	memset(&candidate->local_creation_target, 0, sizeof(candidate->local_creation_target));
+	memset(&candidate->origin_companion.creation_target, 0,
+		sizeof(candidate->origin_companion.creation_target));
 	if (candidate->outcome != CLUSTER_TX_COMMITTED || !candidate->local_canonical_valid
 		|| record_bytes == NULL || record_length < sizeof(record) || record_length > BLCKSZ)
 		return;
@@ -2139,6 +2149,8 @@ cluster_runtime_visibility_origin_creation_target(const char *record_bytes, size
 	}
 	target.valid = true;
 	candidate->local_creation_target = target;
+	if (candidate->origin_companion.present)
+		candidate->origin_companion.creation_target = target;
 }
 
 static ClusterRuntimeVisibilityOriginStep
@@ -3111,7 +3123,8 @@ cluster_runtime_visibility_resolve_exact_origin_admitted(
 	if (origin != (NodeId)cluster_node_id) {
 		outcome = cluster_gcs_block_r4_tx_resolve_fetch_and_wait(
 			(int32)origin, locator, UINT32_MAX, admission->formation_epoch, out, &reason);
-		/* This metadata belongs to an in-process origin call, never a peer. */
+		/* Received companion bytes remain explicitly unqualified. Never
+		 * promote them into an in-process origin or row projection. */
 		memset(&out->local_canonical, 0, sizeof(out->local_canonical));
 		out->local_canonical_generation = 0;
 		out->local_canonical_valid = false;
