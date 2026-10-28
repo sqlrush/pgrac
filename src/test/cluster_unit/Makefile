@@ -10522,3 +10522,35 @@ test_cluster_acquire_resowner.inc: $(top_srcdir)/src/backend/utils/resowner/reso
 clean-native-acquire-execution-resowner:
 	rm -f test_cluster_acquire_resowner_types.inc test_cluster_acquire_resowner_types.inc.tmp \
 		test_cluster_acquire_resowner.inc test_cluster_acquire_resowner.inc.tmp
+
+# Original first-fill disk execution and actual page verification.
+TESTS += test_cluster_native_disk_read
+all: test_cluster_native_disk_read
+test_cluster_native_disk_read: test_cluster_native_disk_read.c \
+        test_cluster_native_disk_read.inc test_cluster_native_acquire_execution_fixture.inc \
+        test_cluster_acquire_resowner_types.inc test_cluster_acquire_resowner.inc \
+        test_cluster_native_acquire_execution test_cluster_space_bufpage_product.o $(CLUSTER_PCM_OWN_O) \
+        $(top_srcdir)/src/include/cluster/cluster_pcm_lock.h \
+        $(top_srcdir)/src/include/cluster/cluster_pcm_x_bufmgr.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+test_cluster_native_disk_read.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^\/\* Original first-fill disk execution/ { emit=1; found++ } \
+	     /^\/\* End original first-fill disk execution/ { emit=0; stop=1 } \
+	     emit { print } END { if (found != 1 || !stop) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_native_acquire_execution_fixture.inc: test_cluster_native_acquire_execution.c Makefile
+	awk '/^UT_TEST\(/ { stop=1 } !stop { print; lines++ } \
+	     END { if (!stop || lines < 50) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+clean distclean maintainer-clean: clean-native-disk-read
+.PHONY: clean-native-disk-read
+clean-native-disk-read:
+	rm -f test_cluster_native_disk_read test_cluster_native_disk_read.inc test_cluster_native_disk_read.inc.tmp \
+		test_cluster_native_acquire_execution_fixture.inc test_cluster_native_acquire_execution_fixture.inc.tmp

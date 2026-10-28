@@ -899,6 +899,16 @@ extern ResourceXApplyResult cluster_bufmgr_pcm_own_acquire_claim_exact(
 	const ResourceXInstallClaimJoinObservation *observation, ResourceXDecodedFrame *grant_out,
 	ResourceXDecodedFrame *image_out, ResourceXRequesterJoinSnapshot *out,
 	ResourceXDeliveryClaim *claim_out);
+/* Synchronous first-fill DISK source into private, non-shared staging.
+ * Recheck the executor and original IO owner across storage boundaries.
+ * No buffer bytes, grant or native C are published; a later installer
+ * must revalidate the original execution before touching shared bytes. */
+extern ResourceXApplyResult cluster_bufmgr_pcm_own_acquire_read_disk_exact(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
+	const ResourceXDecodedAcquireIntent *episode,
+	const struct ClusterSemanticAdmissionToken *admission,
+	const ResourceXDeliveryClaim *execution, PGIOAlignedBlock *out_page,
+	XLogRecPtr *out_page_lsn, uint64 *out_page_scn);
 extern ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_delivery_begin_x_reservation(BufferDesc *buf,
 													const ClusterPcmOwnSnapshot *expected,
