@@ -3591,6 +3591,7 @@ test_cluster_recovery_consumed_inputs.o: $(top_srcdir)/src/backend/cluster/clust
 
 test_cluster_recovery_native_inputs: test_cluster_recovery_consumed_inputs.o test_cluster_recovery_episode_consumed_pages.inc
 test_cluster_recovery_native_inputs: test_cluster_recovery_episode_local_bounds.inc
+test_cluster_recovery_native_inputs: test_cluster_recovery_episode_resident_birth.inc
 test_cluster_recovery_native_inputs: test_cluster_recovery_episode_native_bounds.inc
 
 # The original allocator and native CLOG producer lend only test observations.

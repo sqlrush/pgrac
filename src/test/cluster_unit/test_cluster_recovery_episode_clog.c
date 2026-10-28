@@ -212,3 +212,17 @@ test_episode_native_clog_advance_oldest(TransactionId xid)
 	fixture_native_advance_oldest_clog_xid(xid);
 	episode_clog_unlocked();
 }
+
+/* Cache retirement does not mutate the native file or logical generation. */
+void
+test_episode_native_clog_discard_resident(void)
+{
+	uint64 before = 0, after = 0;
+
+	episode_clog_unlocked();
+	UT_ASSERT(clog_relmap_mutation_snapshot(0, &before));
+	clog_recovery_cache_discard(XactCtl);
+	UT_ASSERT(clog_relmap_mutation_snapshot(0, &after));
+	UT_ASSERT_EQ(before, after);
+	episode_clog_unlocked();
+}
