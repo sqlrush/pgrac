@@ -170,6 +170,9 @@ static int c0_did_abort_calls;
 static int c0_retention_calls;
 static int c0_bound_calls;
 static int c0_native_provable_calls;
+static bool c0_log_enabled, c0_expect_serve_authority;
+static unsigned c0_log_count, c0_authority_calls[4], c0_srv_calls[4];
+static char c0_log_message[2048];
 
 static void
 c0_note(C0TestEvent event)
@@ -240,6 +243,11 @@ c0_reset(void)
 	c0_retention_calls = 0;
 	c0_bound_calls = 0;
 	c0_native_provable_calls = 0;
+	c0_log_enabled = c0_expect_serve_authority = false;
+	c0_log_count = 0;
+	c0_log_message[0] = '\0';
+	memset(c0_authority_calls, 0, sizeof(c0_authority_calls));
+	memset(c0_srv_calls, 0, sizeof(c0_srv_calls));
 	InterruptHoldoffCount = 0;
 	memset(&c0_variable_cache, 0, sizeof(c0_variable_cache));
 	c0_variable_cache.oldestClogXid = FirstNormalTransactionId;
@@ -250,6 +258,10 @@ cluster_tt_slot_durable_resolve_by_xid(TransactionId xid pg_attribute_unused(),
 									   uint32 expected_wrap pg_attribute_unused(), SCN *commit_scn,
 									   uint16 *out_seg, uint16 *out_slot, uint16 *out_wrap)
 {
+	if (c0_expect_serve_authority) {
+		for (unsigned i = 0; i < lengthof(c0_authority_calls); i++)
+			UT_ASSERT_EQ(c0_authority_calls[i], 1);
+	}
 	c0_note(C0_EV_SCAN);
 	if (commit_scn != NULL)
 		*commit_scn = c0_resolved_scn;
@@ -349,12 +361,14 @@ cluster_cr_native_origin_epoch0_provable(TransactionId xid pg_attribute_unused()
 uint64
 cluster_epoch_get_current(void)
 {
+	c0_authority_calls[0]++;
 	return 7;
 }
 
 XLogRecPtr
 GetFlushRecPtr(TimeLineID *insertTLI)
 {
+	c0_authority_calls[1]++;
 	if (insertTLI != NULL)
 		*insertTLI = 1;
 	return UINT64CONST(0x1000000);
@@ -363,12 +377,14 @@ GetFlushRecPtr(TimeLineID *insertTLI)
 uint64
 cluster_undo_tt_retention_rollover_count(void)
 {
+	c0_authority_calls[2]++;
 	return 9;
 }
 
 SCN
 cluster_scn_current(void)
 {
+	c0_authority_calls[3]++;
 	return 1000;
 }
 
@@ -398,22 +414,30 @@ cluster_semantic_activation_leave(ClusterSemanticAdmissionToken *token pg_attrib
 
 void
 cluster_vis53r97_note_srv_other(void)
-{}
+{
+	c0_srv_calls[0]++;
+}
 void
 cluster_vis53r97_note_srv_zero_match(void)
-{}
+{
+	c0_srv_calls[1]++;
+}
 void
 cluster_vis53r97_note_srv_invalid_scn(void)
-{}
+{
+	c0_srv_calls[2]++;
+}
 void
 cluster_vis53r97_note_live_upgrade_hit(void)
-{}
+{
+	c0_srv_calls[3]++;
+}
 
 bool
 errstart(int elevel, const char *domain pg_attribute_unused())
 {
 	UT_ASSERT(elevel < ERROR);
-	return false;
+	return c0_log_enabled && elevel == LOG;
 }
 
 bool
@@ -423,15 +447,25 @@ errstart_cold(int elevel, const char *domain)
 }
 
 int
-errmsg_internal(const char *fmt pg_attribute_unused(), ...)
+errmsg_internal(const char *fmt, ...)
 {
+	va_list args;
+	UT_ASSERT_EQ(c0_native_lock_depth, 0);
+	UT_ASSERT_EQ(c0_xact_lock_depth, 0);
+	UT_ASSERT_EQ(c0_slru_lock_depth, 0);
+	va_start(args, fmt);
+	vsnprintf(c0_log_message, sizeof(c0_log_message), fmt, args);
+	va_end(args);
 	return 0;
 }
 
 void
 errfinish(const char *file pg_attribute_unused(), int line pg_attribute_unused(),
 		  const char *func pg_attribute_unused())
-{}
+{
+	if (strstr(c0_log_message, "PGRAC ordinary TT refused:") == c0_log_message)
+		c0_log_count++;
+}
 
 bool
 cluster_mxid_is_mine(MultiXactId mxid pg_attribute_unused())
@@ -2032,10 +2066,181 @@ UT_TEST(test_normal_ordinary_clog_error_releases_the_complete_lock_stack)
 	UT_ASSERT_EQ(InterruptHoldoffCount, 0);
 }
 
+/* Execute the existing actual service seam. This synthetic request address
+ * differs from the complete scan's match; it is not a historical TT slot. */
+static ClusterLmsCrSlot
+c0_service_request(void)
+{
+	ClusterLmsCrSlot slot = { 0 };
+	pg_atomic_init_u32(&slot.state, CLUSTER_LMS_CR_BUSY);
+	slot.tag = GcsBlockUndoFetchTagMake(769, 11);
+	slot.request_id = UINT64CONST(4294971949);
+	slot.requester_node = 2;
+	slot.requester_backend = 17;
+	slot.epoch = 7;
+	slot.req_kind = CLUSTER_LMS_SLOT_KIND_UNDO_VERDICT;
+	slot.undo_owner = -1;
+	slot.undo_xid = 4269296;
+	slot.undo_segment_id = 769;
+	slot.undo_block_no = 11;
+	slot.result_status = GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER;
+	memset(slot.result_page, 0xa5, sizeof(slot.result_page));
+	return slot;
+}
+
+static void
+c0_check_service_key(const ClusterLmsCrSlot *slot, const char *predicate, bool scanned)
+{
+	char expected[256];
+	UT_ASSERT_EQ(c0_log_count, 1);
+	UT_ASSERT(strstr(c0_log_message, "node=0 requester=2 backend=17 request=4294971949") != NULL);
+	snprintf(expected, sizeof(expected), "tag=%u/%u/%u/%u/%u", slot->tag.spcOid, slot->tag.dbOid,
+			 slot->tag.relNumber, (unsigned)slot->tag.forkNum, slot->tag.blockNum);
+	UT_ASSERT(strstr(c0_log_message, expected) != NULL);
+	snprintf(expected, sizeof(expected), "xid=%u segment=769 slot=11 epoch=7", slot->undo_xid);
+	UT_ASSERT(strstr(c0_log_message, expected) != NULL);
+	snprintf(expected, sizeof(expected), "predicate=%s sqlerrcode=0 scan_sampled=%d scan=%d",
+			 predicate, scanned, scanned ? (int)c0_resolve : -1);
+	UT_ASSERT(strstr(c0_log_message, expected) != NULL);
+	snprintf(expected, sizeof(expected), "authority_scn=%u", scanned ? 1000 : 0);
+	UT_ASSERT(strstr(c0_log_message, expected) != NULL);
+}
+
+static void
+c0_check_service_refusal_bytes(const ClusterLmsCrSlot *slot, ClusterLmsCrSlot before, bool scanned)
+{
+	for (unsigned i = 0; i < lengthof(c0_authority_calls); i++)
+		UT_ASSERT_EQ(c0_authority_calls[i], scanned ? 1 : 0);
+	if (scanned) {
+		before.undo_auth.origin_epoch = 7;
+		before.undo_auth.live_hwm_lsn = UINT64CONST(0x1000000);
+		before.undo_auth.tt_generation = 9;
+		before.undo_auth.authority_scn = 1000;
+	}
+	UT_ASSERT_EQ(memcmp(slot, &before, sizeof(before)), 0);
+	UT_ASSERT_EQ(c0_native_lock_depth + c0_xact_lock_depth + c0_slru_lock_depth, 0);
+}
+
+UT_TEST(test_service_scan_refusals_keep_the_full_request_key)
+{
+	const ClusterTTDurableResolve cases[]
+		= { CLUSTER_TT_DURABLE_SCAN_UNAVAILABLE, CLUSTER_TT_DURABLE_AMBIGUOUS_WRAP,
+			CLUSTER_TT_DURABLE_XID_MATCH_INVALID_SCN, CLUSTER_TT_DURABLE_RESOLVED_SCN };
+	const char *reasons[]
+		= { "TT_SCAN_UNAVAILABLE", "TT_AMBIGUOUS", "TT_UNSTAMPED", "CLOG_NOT_TERMINAL" };
+	for (unsigned i = 0; i < lengthof(cases); i++) {
+		ClusterLmsCrSlot slot, before;
+		c0_reset();
+		slot = before = c0_service_request();
+		c0_resolve = cases[i];
+		c0_resolved_scn = i == 3 ? 14780681 : InvalidScn;
+		c0_matched_segment = i >= 2 ? 33 : 0;
+		c0_matched_slot = i >= 2 ? 27 : 0;
+		c0_log_enabled = c0_expect_serve_authority = true;
+		UT_ASSERT(!cluster_cr_server_test_undo_verdict_serve(&slot));
+		c0_check_service_key(&slot, reasons[i], true);
+		c0_check_service_refusal_bytes(&slot, before, true);
+		UT_ASSERT_EQ(c0_event_pos(C0_EV_SCAN), 1);
+		UT_ASSERT_EQ(c0_raw_clog_calls + c0_procarray_calls + c0_bound_calls, 0);
+		UT_ASSERT_EQ(c0_did_commit_calls, i == 3 ? 1 : 0);
+		UT_ASSERT_EQ(c0_did_abort_calls, i == 2 ? 1 : 0);
+		UT_ASSERT_EQ(c0_srv_calls[0], i == 2 ? 0 : 1);
+		UT_ASSERT_EQ(c0_srv_calls[1], 0);
+		UT_ASSERT_EQ(c0_srv_calls[2], i == 2 ? 1 : 0);
+		UT_ASSERT_EQ(c0_srv_calls[3], 0);
+	}
+}
+
+UT_TEST(test_service_entry_refusals_keep_key_without_inventing_scan)
+{
+	for (int origin = 0; origin < 2; origin++) {
+		ClusterLmsCrSlot slot, before;
+		c0_reset();
+		slot = c0_service_request();
+		if (origin)
+			c0_xid_is_mine = false;
+		else
+			slot.undo_xid = InvalidTransactionId;
+		before = slot;
+		c0_log_enabled = true;
+		UT_ASSERT(!cluster_cr_server_test_undo_verdict_serve(&slot));
+		c0_check_service_key(&slot, origin ? "ORIGIN_NOT_OWNED" : "BAD_XID", false);
+		c0_check_service_refusal_bytes(&slot, before, false);
+		UT_ASSERT_EQ(c0_event_pos(C0_EV_SCAN), -1);
+		UT_ASSERT_EQ(c0_raw_clog_calls + c0_did_commit_calls + c0_did_abort_calls, 0);
+		UT_ASSERT_EQ(c0_srv_calls[0], 1);
+	}
+}
+
+UT_TEST(test_service_success_and_other_roles_stay_ordinary_log_silent)
+{
+	for (int role = 0; role < 6; role++) {
+		ClusterLmsCrSlot slot;
+		bool served;
+		c0_reset();
+		slot = c0_service_request();
+		c0_log_enabled = true;
+		if (role == 0) {
+			c0_resolve = CLUSTER_TT_DURABLE_RESOLVED_SCN;
+			c0_resolved_scn = 10001;
+			c0_did_commit = c0_accept_resolved_scn = true;
+		} else if (role == 1)
+			c0_raw_status = TRANSACTION_STATUS_ABORTED;
+		else if (role == 2)
+			slot.undo_authoritative = true;
+		else if (role == 3)
+			slot.undo_owner = 1;
+		else if (role == 4)
+			slot.read_scn = 90;
+		else
+			slot.req_kind = CLUSTER_LMS_SLOT_KIND_UNDO_FETCH;
+		/* Direct service-seam controls, not production dispatch coverage. */
+		served = cluster_cr_server_test_undo_verdict_serve(&slot);
+		UT_ASSERT_EQ(served, role < 2);
+		UT_ASSERT_EQ(c0_log_count, 0);
+		if (served) {
+			ClusterGcsUndoVerdictPage *page = (ClusterGcsUndoVerdictPage *)slot.result_page;
+			UT_ASSERT_EQ(page->xid_echo, UINT64CONST(4269296));
+			UT_ASSERT_EQ(page->verdict, role == 0 ? CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT
+												  : CLUSTER_GCS_UNDO_VERDICT_ABORTED);
+		}
+	}
+}
+
+UT_TEST(test_service_logging_does_not_resample_proof_or_mutate_refusal)
+{
+	ClusterLmsCrSlot results[2];
+	C0TestEvent events[2][lengthof(c0_events)];
+	unsigned authority[2][lengthof(c0_authority_calls)];
+	unsigned counters[2][lengthof(c0_srv_calls)];
+	for (int enabled = 0; enabled < 2; enabled++) {
+		c0_reset();
+		results[enabled] = c0_service_request();
+		c0_log_enabled = enabled != 0;
+		c0_expect_serve_authority = true;
+		c0_resolve = CLUSTER_TT_DURABLE_RESOLVED_SCN;
+		c0_resolved_scn = 14780681;
+		c0_matched_segment = 33;
+		c0_matched_slot = 27;
+		UT_ASSERT(!cluster_cr_server_test_undo_verdict_serve(&results[enabled]));
+		UT_ASSERT_EQ(c0_log_count, enabled);
+		UT_ASSERT_EQ(c0_did_commit_calls, 1);
+		UT_ASSERT_EQ(c0_did_abort_calls + c0_raw_clog_calls + c0_procarray_calls + c0_bound_calls,
+					 0);
+		memcpy(events[enabled], c0_events, sizeof(c0_events));
+		memcpy(authority[enabled], c0_authority_calls, sizeof(c0_authority_calls));
+		memcpy(counters[enabled], c0_srv_calls, sizeof(c0_srv_calls));
+	}
+	UT_ASSERT_EQ(memcmp(&results[0], &results[1], sizeof(results[0])), 0);
+	UT_ASSERT_EQ(memcmp(events[0], events[1], sizeof(events[0])), 0);
+	UT_ASSERT_EQ(memcmp(authority[0], authority[1], sizeof(authority[0])), 0);
+	UT_ASSERT_EQ(memcmp(counters[0], counters[1], sizeof(counters[0])), 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(44);
+	UT_PLAN(48);
 	UT_RUN(test_zero_native_history_preserves_ordinary_committed_bound);
 	UT_RUN(test_normal_ordinary_remote_uses_the_same_terminal_proof);
 	UT_RUN(test_normal_ordinary_permission_does_not_widen_other_roles);
@@ -2080,6 +2285,10 @@ main(void)
 	UT_RUN(test_a143_clean_restart_ordinary_is_bound_not_exact);
 	UT_RUN(test_a143_startup_bound_retains_all_authority_refusals);
 	UT_RUN(test_a143_checkpoint_is_not_exact_and_conflicting_stamp_refuses);
+	UT_RUN(test_service_scan_refusals_keep_the_full_request_key);
+	UT_RUN(test_service_entry_refusals_keep_key_without_inventing_scan);
+	UT_RUN(test_service_success_and_other_roles_stay_ordinary_log_silent);
+	UT_RUN(test_service_logging_does_not_resample_proof_or_mutate_refusal);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

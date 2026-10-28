@@ -3228,7 +3228,8 @@ lms_ordinary_verdict_refusal(const ClusterLmsCrSlot *slot, const char *predicate
 		 " predicate=%s sqlerrcode=%d scan_sampled=%d scan=%d matched_segment=%u "
 		 "matched_slot=%u matched_wrap=%u resolved=" UINT64_FORMAT
 		 " commit_sampled=%d did_commit=%d abort_sampled=%d did_abort=%d "
-		 "horizon=" UINT64_FORMAT " authority_scn=" UINT64_FORMAT " detail_budget_exhausted=%d",
+		 "horizon=" UINT64_FORMAT " authority_scn=" UINT64_FORMAT
+		 " tag=%u/%u/%u/%u/%u detail_budget_exhausted=%d",
 		 cluster_node_id, slot->requester_node, slot->requester_backend, slot->request_id,
 		 slot->undo_xid, slot->undo_segment_id, slot->undo_block_no, slot->epoch, predicate,
 		 sqlerrcode, d != NULL, d == NULL ? -1 : (int)d->resolve,
@@ -3236,7 +3237,8 @@ lms_ordinary_verdict_refusal(const ClusterLmsCrSlot *slot, const char *predicate
 		 d == NULL ? 0 : d->matched_wrap, (uint64)(d == NULL ? 0 : d->resolved_scn),
 		 d != NULL && d->commit_sampled, d != NULL && d->did_commit, d != NULL && d->abort_sampled,
 		 d != NULL && d->did_abort, (uint64)(d == NULL ? 0 : d->horizon_scn),
-		 (uint64)slot->undo_auth.authority_scn, emitted == 64);
+		 (uint64)slot->undo_auth.authority_scn, slot->tag.spcOid, slot->tag.dbOid,
+		 slot->tag.relNumber, (unsigned)slot->tag.forkNum, slot->tag.blockNum, emitted == 64);
 }
 
 static bool
