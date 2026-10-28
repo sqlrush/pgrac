@@ -209,6 +209,12 @@ static bool test_operation_page_enabled;
 static bool test_operation_worker_enabled;
 static bool test_operation_worker_current_busy;
 static PGAlignedBlock test_operation_page;
+static bool test_operation_multidata_enabled;
+static bool test_operation_multidata_cold;
+static unsigned test_operation_multidata_mask;
+static PGAlignedBlock test_operation_multidata_pages[2];
+static uint32 test_operation_multidata_requests[144];
+static unsigned test_operation_multidata_request_count;
 static int test_operation_acquire_failure_call;
 static int test_operation_pin_depth;
 static int test_operation_release_pending_call;
@@ -425,6 +431,25 @@ test_uba_equal(UBA left, UBA right)
 	return left.raw[0] == right.raw[0] && left.raw[1] == right.raw[1];
 }
 
+/* Opt-in storage images; the ordinary fixture still requires DATA block7. */
+static char *
+test_operation_data_page(uint32 block, bool current)
+{
+	if (!test_operation_multidata_enabled) {
+		UT_ASSERT_EQ(block, 7);
+		return test_operation_page.data;
+	}
+	if (current) {
+		UT_ASSERT(test_operation_multidata_request_count
+				  < lengthof(test_operation_multidata_requests));
+		if (test_operation_multidata_request_count < lengthof(test_operation_multidata_requests))
+			test_operation_multidata_requests[test_operation_multidata_request_count++] = block;
+	}
+	if (block < 7 || block > 9 || !(test_operation_multidata_mask & (1U << (block - 7))))
+		return NULL;
+	return block == 7 ? test_operation_page.data : test_operation_multidata_pages[block - 8].data;
+}
+
 size_t
 cluster_undo_get_record(UBA uba, void *out_buffer, size_t buffer_size)
 {
@@ -435,22 +460,27 @@ cluster_undo_get_record(UBA uba, void *out_buffer, size_t buffer_size)
 		UndoBlockHeader header;
 		UndoSlotDirEntry slot;
 		uint32 directory;
+		const char *page = test_operation_page.data;
 
-		memcpy(&header, test_operation_page.data, sizeof(header));
-		if (!uba_decode_record(uba, &segment, &block, &tt, &row) || block != 7
-			|| header.slot_count == 0
-			|| header.slot_count > (BLCKSZ - sizeof(header)) / sizeof(slot)
+		if (!uba_decode_record(uba, &segment, &block, &tt, &row)
+			|| (!test_operation_multidata_enabled && block != 7))
+			return 0;
+		if (test_operation_multidata_enabled)
+			page = test_operation_data_page(block, false);
+		if (page == NULL)
+			return 0;
+		memcpy(&header, page, sizeof(header));
+		if (header.slot_count == 0 || header.slot_count > (BLCKSZ - sizeof(header)) / sizeof(slot)
 			|| row >= header.slot_count)
 			return 0;
 		directory = BLCKSZ - (uint32)header.slot_count * sizeof(slot);
-		memcpy(&slot, test_operation_page.data + BLCKSZ - ((uint32)row + 1) * sizeof(slot),
-			   sizeof(slot));
+		memcpy(&slot, page + BLCKSZ - ((uint32)row + 1) * sizeof(slot), sizeof(slot));
 		if (header.free_offset < sizeof(header) || header.free_offset > directory
 			|| slot.record_offset < sizeof(header) || slot.record_offset > header.free_offset
 			|| slot.record_length > header.free_offset - slot.record_offset
 			|| slot.record_length > buffer_size)
 			return 0;
-		memcpy(out_buffer, test_operation_page.data + slot.record_offset, slot.record_length);
+		memcpy(out_buffer, page + slot.record_offset, slot.record_length);
 		return slot.record_length;
 	}
 	UT_ASSERT(test_uba_equal(uba, test_origin_locator.uba));
@@ -1219,16 +1249,20 @@ LWLockReleaseAll(void)
 bool
 cluster_undo_buf_copy_resident(uint32 segment_id, uint8 owner, uint32 block_no, char dst[BLCKSZ])
 {
+	const char *page;
+
 	test_candidate_data_copy_calls++;
 	UT_ASSERT_EQ(segment_id, TEST_RECORD_SEGMENT);
 	UT_ASSERT_EQ(owner, 1);
-	UT_ASSERT_EQ(block_no, 7);
+	page = test_operation_data_page(block_no, true);
+	if (page == NULL || (test_operation_multidata_enabled && test_operation_multidata_cold))
+		return false;
 	if (test_candidate_data_copy_calls <= 2
 		&& (test_candidate_cold_copy_mask & (1u << (test_candidate_data_copy_calls - 1))) != 0)
 		return false;
 	memset(dst, 0x5a, BLCKSZ);
 	if (test_operation_page_enabled)
-		memcpy(dst, test_operation_page.data, BLCKSZ);
+		memcpy(dst, page, BLCKSZ);
 	return true;
 }
 
@@ -1236,17 +1270,19 @@ char *
 cluster_undo_buf_pin(uint32 segment_id, uint8 owner, uint32 block_no, ClusterUndoBufMode mode,
 					 ClusterUndoBufPin *pin)
 {
+	const char *page;
+
 	test_candidate_data_pin_calls++;
 	UT_ASSERT_EQ(cluster_node_id, 0);
 	UT_ASSERT_EQ(segment_id, TEST_RECORD_SEGMENT);
 	UT_ASSERT_EQ(owner, 1);
-	UT_ASSERT_EQ(block_no, 7);
+	page = test_operation_data_page(block_no, true);
 	UT_ASSERT_EQ(mode, CLUSTER_UNDO_BUF_SHARED);
 	UT_ASSERT_EQ(test_candidate_held_count, 1);
 	pin->slot = -1;
 	if (test_candidate_data_io_throw)
 		pg_re_throw();
-	if (test_candidate_data_pool_disabled)
+	if (test_candidate_data_pool_disabled || page == NULL)
 		return NULL;
 	pin->slot = 0;
 	pin->mode = mode;
@@ -1254,7 +1290,7 @@ cluster_undo_buf_pin(uint32 segment_id, uint8 owner, uint32 block_no, ClusterUnd
 		test_operation_pin_depth++;
 	memset(test_candidate_io_page.data, 0x5a, BLCKSZ);
 	if (test_operation_page_enabled)
-		memcpy(test_candidate_io_page.data, test_operation_page.data, BLCKSZ);
+		memcpy(test_candidate_io_page.data, page, BLCKSZ);
 	if (test_candidate_data_io_generation_drift && test_candidate_data_pin_calls == 2)
 		test_candidate_data_generation++;
 	return test_candidate_io_page.data;
@@ -1539,6 +1575,7 @@ reset_exact_origin_fixture(void)
 	test_candidate_mutate_record_on_recheck = false;
 	test_operation_page_enabled = false;
 	test_operation_worker_enabled = false;
+	test_operation_multidata_enabled = false;
 	test_mixed_top_enabled = false;
 	test_operation_worker_current_busy = false;
 	test_operation_acquire_failure_call = 0;
@@ -7615,7 +7652,7 @@ UT_TEST(test_retained_slot_identity_does_not_escape_original_final_fences)
 int
 main(void)
 {
-	UT_PLAN(364);
+	UT_PLAN(366);
 	UT_RUN(test_operation_worker_real_builder_yields_before_visibility);
 	UT_RUN(test_operation_worker_real_origin_completes_private_inverse);
 	UT_RUN(test_operation_worker_pending_current_is_bounded_and_counts_once);
@@ -7981,6 +8018,8 @@ main(void)
 	UT_RUN(test_update_repack_kept_creation_uses_result_tuple_positions);
 	UT_RUN(test_update_repack_full_result_refuses_without_partial_publish);
 	UT_RUN(test_update_repack_unkept_creation_leaves_restore_capacity);
+	UT_RUN(test_operation_worker_multidata_preserves_literal_survivors);
+	UT_RUN(test_operation_worker_multidata_refuses_broken_middle_page);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
