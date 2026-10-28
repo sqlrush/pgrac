@@ -2336,9 +2336,26 @@ static void startup_local_empty_reset(void);
 #include "test_cluster_cold_ctrc_fpi_retirement.inc"
 #include "test_cluster_cold_ctrc_completed_readback.inc"
 #include "test_cluster_cold_ctrc_unchanged_custody.inc"
+#include "test_cluster_cold_ctrc_page_image.inc"
 
 int main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_STARTUP_PAGE_IMAGE") != NULL) {
+#ifdef PGRAC_TEST_OLD_IMAGE_FORWARDING
+		UT_PLAN(1);
+		UT_RUN(test_startup_page_image_is_from_original_completed_or_unchanged_fd);
+		UT_DONE(); return ut_failed_count != 0;
+#else
+		UT_PLAN(5);
+		UT_RUN(test_startup_page_image_is_from_original_completed_or_unchanged_fd);
+		UT_RUN(test_startup_page_image_rejects_pending_missing_and_nonmember_targets);
+		UT_RUN(test_startup_page_image_discards_bytes_after_page_cleanup_drift);
+		UT_RUN(test_startup_page_image_wait_has_no_cached_success_or_new_wal);
+		UT_RUN(test_startup_page_image_refusal_and_error_keep_original_cleanup_debt);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+#endif
+	}
+
 	if (getenv("PGRAC_PRE2_TEST_UNCHANGED_CUSTODY_STARTUP") != NULL) {
 		UT_PLAN(6);
 		UT_RUN(test_startup_unchanged_targets_keep_fds_and_full_readback_before_service);
@@ -2507,7 +2524,13 @@ int main(void)
 		UT_RUN(test_ctrc_pages_native_error_retires_cursor_before_original_scope);
 		reset(); UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(224);
+	UT_PLAN(229);
+	UT_RUN(test_startup_page_image_is_from_original_completed_or_unchanged_fd);
+	UT_RUN(test_startup_page_image_rejects_pending_missing_and_nonmember_targets);
+	UT_RUN(test_startup_page_image_discards_bytes_after_page_cleanup_drift);
+	UT_RUN(test_startup_page_image_wait_has_no_cached_success_or_new_wal);
+	UT_RUN(test_startup_page_image_refusal_and_error_keep_original_cleanup_debt);
+
 	UT_RUN(test_startup_unchanged_targets_keep_fds_and_full_readback_before_service);
 	UT_RUN(test_startup_unchanged_readback_refusal_or_error_keeps_original_cleanup);
 	UT_RUN(test_startup_unchanged_wait_reuses_same_saved_targets_without_wal);

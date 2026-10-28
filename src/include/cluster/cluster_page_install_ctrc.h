@@ -311,5 +311,27 @@ extern RfPageProofDetailV1 rf_page_recovery_ctrc_replays_completed_readback_v1(
 	const RfPageCtrcFpiInsertV1 *inserted, struct ClusterSharedFsPageV1 *storage,
 	Size subject_count, Size memory_budget);
 
+/* A private by-value full image from the original protected readback. The
+ * detail is OK only for the entire verified native page; every refusal returns
+ * a zero image. Store the returned value apart from every borrowed input and
+ * keep all inputs immutable through return. memory_budget includes one extra
+ * BLCKSZ image. This is observation, not first/pin/companion or completion
+ * authority. */
+typedef struct RfPageCtrcReadbackImageV1 {
+	RfPageProofDetailV1 detail;
+	PGAlignedBlock image;
+} RfPageCtrcReadbackImageV1;
+
+extern RfPageCtrcReadbackImageV1 rf_page_recovery_ctrc_replays_completed_image_v1(
+	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work,
+	const struct ClusterRecoveryCtrcReplaySetSourceV1 *source, RfPageCtrcAuthorityV1 *authority,
+	const RfPageCtrcFpiInsertV1 *inserted, struct ClusterSharedFsPageV1 *storage,
+	Size subject_count, Size memory_budget);
+extern RfPageCtrcReadbackImageV1 rf_page_recovery_ctrc_replays_unchanged_image_v1(
+	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work,
+	const struct ClusterRecoveryCtrcReplaySetSourceV1 *source, RfPageCtrcAuthorityV1 *authority,
+	const RfPageCtrcUnchangedV1 *unchanged, struct ClusterSharedFsPageV1 *storage,
+	Size subject_count, Size memory_budget);
+
 #endif /* USE_PGRAC_CLUSTER */
 #endif /* CLUSTER_PAGE_INSTALL_CTRC_H */

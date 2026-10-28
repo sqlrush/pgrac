@@ -13968,3 +13968,7 @@ test_cluster_ctrc_local_empty: test_cluster_ctrc_local_empty.c test_cluster_ctrc
 
 # PGRAC: original Startup FPI retirement and retained per-target custody.
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_fpi_retirement.inc
+
+# Full protected completed-page images for the original recovery owner.
+test_cluster_ctrc_native_fpi: test_cluster_ctrc_native_image.inc
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_page_image.inc

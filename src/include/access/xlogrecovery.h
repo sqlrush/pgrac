@@ -249,6 +249,15 @@ extern bool ClusterColdRecoveryCtrcPageAdvance(const struct ClusterRecoveryStart
  * or joint service COMPLETE, relmap acceptance or OPEN is granted. */
 extern bool ClusterColdRecoveryCtrcPageDrain(const struct ClusterRecoveryStartV1 *start,
 	Size memory_budget);
+/* Copy one original completed target after the SAME held-FD protected readback
+ * and PAGE/proof cleanup, followed by full Start/work/source/result checks.
+ * Only a fully drained original vector with a saved MAIN heap baseline enters.
+ * No new scan/source round, write, F4 transition, release or service result.
+ * Local contention returns WOULD_BLOCK; entered failure revokes this episode
+ * while retaining its original descriptors and all IR/WALR/pins/debt. */
+struct RfPageCtrcReadbackImageV1;
+extern struct RfPageCtrcReadbackImageV1 ClusterColdRecoveryCtrcPageImage(
+	const struct ClusterRecoveryStartV1 *start, uint32 target_index);
 struct RfPageCtrcFpiInsertV1;
 struct ClusterSharedFsPageV1;
 /* Local immutable membership only: the ORIGINAL retained result address and

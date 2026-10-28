@@ -469,6 +469,7 @@ bool native_install_original_writer_installed(ClusterWalWriterToken *writer,
 #include "test_cluster_ctrc_native_readback.inc"
 #include "test_cluster_ctrc_native_completed.inc"
 #include "test_cluster_ctrc_native_unchanged_custody.inc"
+#include "test_cluster_ctrc_native_image.inc"
 
 int
 main(int argc, char **argv)
@@ -477,6 +478,21 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_NATIVE_IMAGE") != NULL) {
+#ifdef PGRAC_TEST_OLD_IMAGE_FORWARDING
+		UT_PLAN(1);
+		UT_RUN(test_native_completed_image_is_exact_disk_bytes_with_writer_coordinate);
+		UT_DONE(); return ut_failed_count != 0;
+#else
+		UT_PLAN(4);
+		UT_RUN(test_native_completed_image_is_exact_disk_bytes_with_writer_coordinate);
+		UT_RUN(test_native_unchanged_image_preserves_full_baseline_without_wal);
+		UT_RUN(test_native_image_late_binding_or_disk_drift_publishes_no_prefix);
+		UT_RUN(test_native_image_capacity_wait_and_error_keep_original_fd_and_debt);
+		UT_DONE(); return ut_failed_count != 0;
+#endif
+	}
+
 	if (getenv("PGRAC_PRE2_TEST_NATIVE_UNCHANGED_CUSTODY") != NULL) {
 		UT_PLAN(5);
 		UT_RUN(test_native_unchanged_custody_retains_exact_raw_pages_and_same_fd);
@@ -583,7 +599,12 @@ main(int argc, char **argv)
 		UT_RUN(test_native_step_fixed_fd_close_failure_cannot_claim_target_synced);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(103);
+	UT_PLAN(107);
+	UT_RUN(test_native_completed_image_is_exact_disk_bytes_with_writer_coordinate);
+	UT_RUN(test_native_unchanged_image_preserves_full_baseline_without_wal);
+	UT_RUN(test_native_image_late_binding_or_disk_drift_publishes_no_prefix);
+	UT_RUN(test_native_image_capacity_wait_and_error_keep_original_fd_and_debt);
+
 	UT_RUN(test_native_unchanged_custody_retains_exact_raw_pages_and_same_fd);
 	UT_RUN(test_native_unchanged_custody_refuses_copies_and_bad_entry_before_io);
 	UT_RUN(test_native_unchanged_custody_refuses_changed_valid_main_and_space_bytes);
