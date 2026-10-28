@@ -32,6 +32,12 @@ cluster_clog_native_recovery_full_record_apply_v1(
 	int origin, const ClusterSideProjectionOperationV1 *operation,
 	const uint8 *payload, uint32 length)
 {
+#ifdef TEST_CLUSTER_SIDE_NATIVE_CLOG_OWNER
+	if (side_native_clog_test) {
+		cold_clog_applies++;
+		return test_side_native_clog_apply(origin, operation, payload, length);
+	}
+#endif
 	UT_ASSERT_EQ(length, sizeof(side_full_birth));
 	UT_ASSERT(payload != NULL && memcmp(payload, &side_full_birth, length) == 0);
 	UT_ASSERT_EQ(operation->normalized_info, CLOG_ZEROPAGE_FULL);
@@ -43,6 +49,12 @@ cluster_clog_native_recovery_full_record_verify_v1(
 	int origin, const ClusterSideProjectionOperationV1 *operation,
 	const uint8 *payload, uint32 length)
 {
+#ifdef TEST_CLUSTER_SIDE_NATIVE_CLOG_OWNER
+	if (side_native_clog_test) {
+		cold_clog_verifies++;
+		return test_side_native_clog_verify(origin, operation, payload, length);
+	}
+#endif
 	UT_ASSERT_EQ(length, sizeof(side_full_birth));
 	UT_ASSERT(payload != NULL && memcmp(payload, &side_full_birth, length) == 0);
 	UT_ASSERT_EQ(operation->normalized_info, CLOG_ZEROPAGE_FULL);
