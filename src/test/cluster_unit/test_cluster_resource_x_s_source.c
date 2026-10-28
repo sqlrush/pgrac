@@ -1243,10 +1243,81 @@ UT_TEST(test_s_holder_cancellation_cannot_erase_native_or_direct_witness)
 	UT_ASSERT_EQ(sh_direct(&f).kind, RESOURCE_X_WIRE_BLOCKED_TO_N);
 }
 
+/* X-to-S uses the real conditional producer and native tuple input seam. */
+static bool
+xs_start(SSourceFixture *f)
+{
+	if (!ss_start(f) || !publish_start(1, PCM_STATE_S, &f->master)) return false;
+	publish_apply(&f->master);
+	f->block = publish_decode(f->master.state->block_intents[0].payload, true);
+	f->prepared.pcm_state = PCM_STATE_X; f->prepared.buffer_type = BUF_TYPE_XCUR;
+	f->finished = f->prepared; f->finished.generation++;
+	f->finished.pcm_state = PCM_STATE_S; f->finished.buffer_type = BUF_TYPE_SCUR; f->finished.flags = 0;
+	return true;
+}
+UT_TEST(test_x_to_s_pair_retained_before_physical_commit)
+{
+	SSourceFixture f; ResourceXDecodedFrame ack, image;
+	if (!xs_start(&f)) return;
+	UT_ASSERT_EQ(ss_prepare(&f), RESOURCE_X_APPLY_APPLIED);
+	ack = ss_read(&f, false); image = ss_read(&f, true);
+	UT_ASSERT_EQ(ack.body.acquire_witness.original_ack.observed_mode, PCM_STATE_X);
+	UT_ASSERT_EQ(ack.body.acquire_witness.original_ack.target_mode, PCM_STATE_S);
+	UT_ASSERT_EQ(ack.body.acquire_witness.original_ack.flags, RESOURCE_X_COMMON_FLAG_PI_ESTABLISHED);
+	UT_ASSERT_EQ(ack.body.acquire_witness.original_proof.source_carrier_generation, f.prepared.generation + 1);
+	UT_ASSERT_EQ(image.body.acquire_image.original_image.source_fence[28], PCM_STATE_X);
+	UT_ASSERT(memcmp(image.body.acquire_image.original_image.page_bytes, f.page.data, BLCKSZ) == 0);
+	UT_ASSERT_EQ(f.master.state->holder_image_intent.state, RESOURCE_X_INTENT_SLOT_EMPTY);
+}
+UT_TEST(test_x_to_s_pair_publish_and_replay_are_exact)
+{
+	SSourceFixture f; if (!xs_start(&f)) return;
+	UT_ASSERT_EQ(ss_prepare(&f), RESOURCE_X_APPLY_APPLIED);
+	ss_unchanged(&f, false, RESOURCE_X_APPLY_DUPLICATE);
+	UT_ASSERT_EQ(ss_publish(&f), RESOURCE_X_APPLY_APPLIED);
+	ss_unchanged(&f, true, RESOURCE_X_APPLY_DUPLICATE);
+}
+UT_TEST(test_x_to_s_pair_rejects_mode_activation_dirt_or_wrong_native_finish)
+{
+	for (int n = 0; n < 5; n++) {
+		SSourceFixture f; if (!xs_start(&f)) return;
+		if (n == 0) f.prepared.pcm_state = PCM_STATE_S;
+		if (n == 1) f.prepared.writer_activation_token = 19;
+		if (n == 2) f.prepared.resource_x_activation_generation = 19;
+		if (n == 3) f.prepared.semantic_buf_state |= BM_DIRTY;
+		if (n < 4) ss_unchanged(&f, false, RESOURCE_X_APPLY_INVALID);
+		else {
+			UT_ASSERT_EQ(ss_prepare(&f), RESOURCE_X_APPLY_APPLIED);
+			f.finished.generation--; ss_unchanged(&f, true, RESOURCE_X_APPLY_STALE);
+		}
+	}
+}
+UT_TEST(test_x_to_s_original_forward_and_lms_claim_survive_capture)
+{
+	SSourceFixture f; ResourceXSourceDrainWork work; ResourceXDecodedFrame block;
+	if (!xs_start(&f)) return;
+	UT_ASSERT_EQ(ss_forward(&f), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(ss_service_probe(&work));
+	UT_ASSERT_EQ(ss_capture(&f, &work), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_s_source_drain_snapshot_exact(&work, &block), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(block.body.acquire_decision.directory_mode, PCM_STATE_X);
+	UT_ASSERT_EQ(ss_publish(&f), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(&work, RESOURCE_X_APPLY_APPLIED), RESOURCE_X_APPLY_APPLIED);
+}
+UT_TEST(test_x_to_s_original_master_independently_consumes_source_proof)
+{
+	SSourceFixture f; ResourceXDecodedFrame ack; ResourceXMasterSnapshot out;
+	if (!xs_start(&f)) return;
+	UT_ASSERT_EQ(ss_prepare(&f), RESOURCE_X_APPLY_APPLIED); UT_ASSERT_EQ(ss_publish(&f), RESOURCE_X_APPLY_APPLIED);
+	ack = ss_read(&f, false);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_blocked_to_n_exact(&ack, 0, &out), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(f.master.state->requests[1].final_authority_generation, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(73);
+	UT_PLAN(78);
 	UT_RUN(test_s_source_reserves_complete_pair_before_native_finish);
 	UT_RUN(test_s_source_exact_prepare_duplicate_is_not_a_second_native_commit);
 	UT_RUN(test_s_source_changed_token_descriptor_or_page_cannot_replace_pending);
@@ -1320,5 +1391,10 @@ main(void)
 	UT_RUN(test_s_holder_membership_freeze_preserves_pair_as_orphan);
 	UT_RUN(test_s_holder_ack_is_consumed_only_by_original_master_independently);
 	UT_RUN(test_s_holder_cancellation_cannot_erase_native_or_direct_witness);
+	UT_RUN(test_x_to_s_pair_retained_before_physical_commit);
+	UT_RUN(test_x_to_s_pair_publish_and_replay_are_exact);
+	UT_RUN(test_x_to_s_pair_rejects_mode_activation_dirt_or_wrong_native_finish);
+	UT_RUN(test_x_to_s_original_forward_and_lms_claim_survive_capture);
+	UT_RUN(test_x_to_s_original_master_independently_consumes_source_proof);
 	UT_DONE(); return ut_failed_count == 0 ? 0 : 1;
 }

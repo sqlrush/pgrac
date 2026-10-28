@@ -5759,11 +5759,11 @@ test_cluster_pcm_s_capture_consumer.inc: $(top_srcdir)/src/backend/cluster/clust
 
 test_cluster_pcm_s_prepare.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
 	awk '/^typedef enum ClusterPcmOwnSSourceHardFailureReason/ { emit=1; types++ } \
-	     /^cluster_bufmgr_pcm_own_prepare_s_source_image_internal\(/ { print "static ClusterPcmOwnResult"; emit=1 } \
-	     /^cluster_bufmgr_pcm_own_(begin_s_revoke|prepare_s_source_image|abort_s_revoke|finish_s_source)\(/ \
+	     /^cluster_bufmgr_pcm_own_(prepare_s_source_image_internal|prepare_x_source_image_internal|capture_x_source_locked)\(/ { print "static ClusterPcmOwnResult"; emit=1 } \
+	     /^cluster_bufmgr_pcm_own_(begin_s_revoke|prepare_s_source_image|abort_s_revoke|finish_s_source|prepare_x_source_image|finish_x_source)\(/ \
 	       { print "ClusterPcmOwnResult"; emit=1; funcs++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (types != 1 || funcs != 4 || emit) exit 1 }' $< > $@
+	     END { if (types != 1 || funcs != 6 || emit) exit 1 }' $< > $@
 
 test_cluster_pcm_flush_owner.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
 	awk '/^FlushBuffer\(/ { print "static void"; emit=1; flush++ } \

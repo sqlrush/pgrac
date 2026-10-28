@@ -11278,17 +11278,26 @@ gcs_block_resource_x_acquire_s_read_finish_owned(const ResourceXDecodedFrame *bl
 			block, master, &id, &prepared, &image, &pair_state) != RESOURCE_X_APPLY_APPLIED
 		|| id != buf->buf_id || !cluster_pcm_own_snapshot_equal_exact(&prepared, caller)
 		|| (pair_state != RESOURCE_X_ACQUIRE_S_SOURCE_PENDING && pair_state != RESOURCE_X_ACQUIRE_S_SOURCE_PUBLISHED)
-		|| image.body.acquire_image.original_image.source_carrier_generation != prepared.generation)
+		|| image.body.acquire_image.original_image.source_carrier_generation
+			!= prepared.generation + (prepared.pcm_state == PCM_STATE_X ? 1 : 0))
 		goto fail_closed;
 	expected = prepared;
 	expected.flags = 0;
-	own = cluster_bufmgr_pcm_own_finish_s_source(buf, &prepared, &finished);
+	if (prepared.pcm_state == PCM_STATE_X) {
+		expected.generation++; expected.pcm_state = PCM_STATE_S; expected.buffer_type = BUF_TYPE_SCUR;
+	}
+	own = prepared.pcm_state == PCM_STATE_X
+		? cluster_bufmgr_pcm_own_finish_x_source(buf, &prepared,
+			(const char *)image.body.acquire_image.original_image.page_bytes, &finished)
+		: cluster_bufmgr_pcm_own_finish_s_source(buf, &prepared, &finished);
 	if (own == CLUSTER_PCM_OWN_BUSY
 		&& cluster_bufmgr_pcm_own_snapshot_by_tag(&prepared.tag, &live_id, &live) == CLUSTER_PCM_OWN_OK
-		&& live_id == id && live.buffer_type == prepared.buffer_type
-		&& ((cluster_pcm_own_fence_equal_exact(&live, &prepared)
+		&& live_id == id
+		&& ((live.buffer_type == prepared.buffer_type
+			 && cluster_pcm_own_fence_equal_exact(&live, &prepared)
 			 && (live.semantic_buf_state & (BM_VALID | BM_DIRTY | BM_IO_ERROR)) == BM_VALID)
-			|| (cluster_pcm_own_fence_equal_exact(&live, &expected)
+			|| (live.buffer_type == expected.buffer_type
+				&& cluster_pcm_own_fence_equal_exact(&live, &expected)
 				&& (live.semantic_buf_state & (BM_VALID | BM_IO_IN_PROGRESS | BM_IO_ERROR))
 					== (BM_VALID | BM_IO_IN_PROGRESS))))
 		return RESOURCE_X_APPLY_BAD_STATE;
@@ -14512,7 +14521,11 @@ gcs_block_resource_x_acquire_s_source_capture_owned(const ResourceXSourceDrainWo
 	if (work == NULL || block == NULL || admission == NULL || gate == NULL
 		|| !block->has_acquire_decision
 		|| (block->common.target_mode != PCM_STATE_S && block->common.target_mode != PCM_STATE_X)
-		|| block->body.acquire_decision.directory_mode != PCM_STATE_S || (work->attempt_generation & 1) == 0
+		|| (block->body.acquire_decision.directory_mode != PCM_STATE_S
+			&& !(block->body.acquire_decision.directory_mode == PCM_STATE_X
+				&& block->common.target_mode == PCM_STATE_S
+				&& block->body.acquire_decision.source_node == cluster_node_id))
+		|| (work->attempt_generation & 1) == 0
 		|| work->master_node != block->body.acquire_decision.master_node
 		|| (block->body.acquire_decision.source_node != cluster_node_id
 			&& (block->common.target_mode != PCM_STATE_X
@@ -14541,13 +14554,15 @@ gcs_block_resource_x_acquire_s_source_capture_owned(const ResourceXSourceDrainWo
 	if (own == CLUSTER_PCM_OWN_BUSY) return RESOURCE_X_APPLY_BAD_STATE;
 	if (own != CLUSTER_PCM_OWN_OK || buffer_id < 0 || buffer_id >= NBuffers)
 		goto fail_closed;
-	if (current.pcm_state != PCM_STATE_S || current.flags != 0)
+	if (current.pcm_state != block->body.acquire_decision.directory_mode || current.flags != 0)
 		return RESOURCE_X_APPLY_BAD_STATE;
 	buf = GetBufferDescriptor(buffer_id);
 	PG_TRY();
 	{
-		own = cluster_bufmgr_pcm_own_prepare_s_source_image(buf, &current, (SCN)0,
-			&prepared, page.data, &lsn, &scn, &refusal, &wal);
+		own = current.pcm_state == PCM_STATE_X
+			? cluster_bufmgr_pcm_own_prepare_x_source_image(buf, &current, &prepared, page.data, &wal)
+			: cluster_bufmgr_pcm_own_prepare_s_source_image(buf, &current, (SCN)0,
+				&prepared, page.data, &lsn, &scn, &refusal, &wal);
 		if (own == CLUSTER_PCM_OWN_OK) {
 			owned_prepared = prepared;
 			native_prepared = true;
@@ -14579,7 +14594,9 @@ gcs_block_resource_x_acquire_s_source_capture_owned(const ResourceXSourceDrainWo
 		if (native_prepared && !handed_off) {
 			ClusterPcmOwnSnapshot exact = owned_prepared;
 
-			if (cluster_bufmgr_pcm_own_abort_s_revoke(buf, &exact) != CLUSTER_PCM_OWN_OK) {
+			if ((exact.pcm_state == PCM_STATE_X
+				? cluster_bufmgr_pcm_own_abort_x_revoke(buf, &exact)
+				: cluster_bufmgr_pcm_own_abort_s_revoke(buf, &exact)) != CLUSTER_PCM_OWN_OK) {
 				gcs_block_resource_x_fail_closed_current();
 				result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 			}
@@ -15001,8 +15018,11 @@ gcs_block_resource_x_type17_ingress(const ClusterICEnvelope *env,
 		}
 		admission_exact = result == RESOURCE_X_APPLY_APPLIED;
 		if (admission_exact) {
-			if (frame->has_acquire_decision && frame->body.acquire_decision.directory_mode == PCM_STATE_S
-				&& (frame->common.target_mode == PCM_STATE_S || frame->common.target_mode == PCM_STATE_X))
+			if (frame->has_acquire_decision
+				&& ((frame->body.acquire_decision.directory_mode == PCM_STATE_S
+						&& (frame->common.target_mode == PCM_STATE_S || frame->common.target_mode == PCM_STATE_X))
+					|| (frame->body.acquire_decision.directory_mode == PCM_STATE_X
+						&& frame->common.target_mode == PCM_STATE_S)))
 				result = cluster_pcm_lock_resource_x_acquire_s_source_forward_exact(frame,
 					master_node, admission.record_generation, authenticated_connection_generation);
 			else if ((frame->common.observed_mode == (uint8)PCM_STATE_X

@@ -24873,8 +24873,11 @@ pcm_resource_x_s_source_native_valid(const ClusterPcmOwnSnapshot *native, const 
 		&& native->generation != 0 && native->generation < UINT64_MAX - 1
 		&& native->reservation_token != 0 && native->reservation_token != UINT64_MAX
 		&& native->writer_activation_token == 0 && native->resource_x_activation_generation == 0
-		&& native->flags == PCM_OWN_FLAG_REVOKING && native->pcm_state == PCM_STATE_S
-		&& (native->buffer_type == BUF_TYPE_SCUR || native->buffer_type == BUF_TYPE_CURRENT)
+		&& native->flags == PCM_OWN_FLAG_REVOKING
+		&& (native->pcm_state == PCM_STATE_S || native->pcm_state == PCM_STATE_X)
+		&& ((native->pcm_state == PCM_STATE_S
+				&& (native->buffer_type == BUF_TYPE_SCUR || native->buffer_type == BUF_TYPE_CURRENT))
+			|| (native->pcm_state == PCM_STATE_X && native->buffer_type == BUF_TYPE_XCUR))
 		&& (native->semantic_buf_state & BM_VALID) != 0
 		&& (native->semantic_buf_state & (BM_DIRTY | BM_IO_IN_PROGRESS | BM_IO_ERROR)) == 0
 		&& native->_reserved[0] == 0 && native->_reserved[1] == 0;
@@ -24883,7 +24886,7 @@ pcm_resource_x_s_source_native_valid(const ClusterPcmOwnSnapshot *native, const 
 /* This is shared-holder service, not general A admission. A source seals
  * its protected page; another required holder seals a control witness.
  * Compatible S keeps its generation; requester X requires native S->N/PI.
- * X->S still needs its own native producer. */
+ * An exact X source may serve S only after its original native/PI prepare. */
 static bool
 pcm_resource_x_s_source_block_valid(const ResourceXDecodedFrame *block, int32 master,
 	ResourceXDecodedFrame *canonical)
@@ -24907,8 +24910,10 @@ pcm_resource_x_s_source_block_valid(const ResourceXDecodedFrame *block, int32 ma
 			|| (canonical->common.target_mode == PCM_STATE_X
 				&& (a->required_holders_bitmap & (UINT32_C(1) << cluster_node_id)) != 0
 				&& canonical->common.logical_assertion.requester_node != cluster_node_id))
-		&& a->directory_mode == PCM_STATE_S
-		&& (canonical->common.target_mode == PCM_STATE_S || canonical->common.target_mode == PCM_STATE_X)
+		&& ((a->directory_mode == PCM_STATE_S
+				&& (canonical->common.target_mode == PCM_STATE_S || canonical->common.target_mode == PCM_STATE_X))
+			|| (a->directory_mode == PCM_STATE_X && canonical->common.target_mode == PCM_STATE_S
+				&& a->source_node == cluster_node_id))
 		&& canonical->common.action_node == cluster_node_id
 		&& canonical->common.outcome == RESOURCE_X_OUTCOME_NONE;
 }
@@ -25121,9 +25126,10 @@ pcm_resource_x_s_source_pair_valid_inner(const struct GrdEntry *entry,
 		|| (frame.common.target_mode != PCM_STATE_S && frame.common.target_mode != PCM_STATE_X)
 		|| frame.body.acquire_witness.decision.master_node != (int32)status->destination_node
 		|| frame.body.acquire_witness.decision.source_node != cluster_node_id
-		|| frame.body.acquire_witness.decision.directory_mode != PCM_STATE_S
+		|| frame.body.acquire_witness.decision.directory_mode != native->pcm_state
 		|| frame.body.acquire_witness.original_ack.flags
-			!= (frame.common.target_mode == PCM_STATE_S ? 0 : RESOURCE_X_COMMON_FLAG_PI_ESTABLISHED)
+			!= (frame.common.target_mode == PCM_STATE_S && native->pcm_state == PCM_STATE_S
+				? 0 : RESOURCE_X_COMMON_FLAG_PI_ESTABLISHED)
 		|| frame.body.acquire_witness.original_ack.source_candidate != 0
 		|| frame.body.acquire_witness.original_ack.retain_pi_if_dirty != 0
 		|| !pcm_resource_x_acquire_source_proof_valid(&frame.body.acquire_witness.original_proof,
@@ -25133,7 +25139,7 @@ pcm_resource_x_s_source_pair_valid_inner(const struct GrdEntry *entry,
 	common = frame.common;
 	proof = &witness.original_proof;
 	if (pcm_resource_x_source_fence_get_u64(proof->source_fence + 20) != native->generation
-		|| proof->source_carrier_generation != native->generation + (common.target_mode == PCM_STATE_S ? 0 : 1)
+		|| proof->source_carrier_generation != native->generation + (common.target_mode == PCM_STATE_S && native->pcm_state == PCM_STATE_S ? 0 : 1)
 		|| !cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, image->payload,
 			image->payload_bytes, &frame, &reject)
 		|| frame.kind != RESOURCE_X_WIRE_IMAGE_ENVELOPE || !frame.has_acquire_decision
@@ -25217,6 +25223,7 @@ pcm_resource_x_s_holder_pair_valid(const struct GrdEntry *entry,
 	if (state->holder_acquire_s_buffer_id < 0
 		|| state->holder_acquire_s_forward_connection == 0
 		|| state->holder_acquire_s_forward_connection == UINT32_MAX
+		|| state->holder_acquire_s_native.pcm_state != PCM_STATE_S
 		|| !pcm_resource_x_s_source_native_valid(&state->holder_acquire_s_native, &entry->tag)
 		|| (state->holder_status.valid != RESOURCE_X_HOLDER_PAIR_PENDING
 			&& state->holder_status.valid != RESOURCE_X_HOLDER_PAIR_PUBLISHED)
@@ -25325,8 +25332,10 @@ pcm_resource_x_s_source_domain_locked(struct GrdEntry *entry,
 		|| len != sizeof(bytes) || memcmp(bytes, state->grant_intent.payload, len) != 0)
 		return RESOURCE_X_APPLY_STALE;
 	holder = &state->holder_grants[cluster_node_id];
-	if ((PcmState)pg_atomic_read_u32(&entry->master_state) != PCM_STATE_S
-		|| (pg_atomic_read_u32(&entry->s_holders_bitmap) & (UINT32_C(1) << cluster_node_id)) == 0
+	if ((PcmState)pg_atomic_read_u32(&entry->master_state) != a->directory_mode
+		|| (a->directory_mode == PCM_STATE_S
+			? (pg_atomic_read_u32(&entry->s_holders_bitmap) & (UINT32_C(1) << cluster_node_id)) == 0
+			: entry->x_holder_node != cluster_node_id)
 		|| holder->boot_incarnation != a->holders[cluster_node_id].boot_incarnation
 		|| holder->grant_generation != a->holders[cluster_node_id].grant_generation
 		|| holder->resource_formation != block->common.resource_formation
@@ -25433,7 +25442,7 @@ pcm_resource_x_s_source_records(const ResourceXDecodedFrame *block, int32 master
 	frame.kind = RESOURCE_X_WIRE_IMAGE_ENVELOPE;
 	frame.common = block->common;
 	frame.common.action_node = block->common.logical_assertion.requester_node;
-	frame.common.observed_mode = PCM_STATE_S;
+	frame.common.observed_mode = native->pcm_state;
 	frame.common.outcome = RESOURCE_X_OUTCOME_OK;
 	frame.common.flags = RESOURCE_X_COMMON_FLAG_AUTHORITY_WITH_IMAGE;
 	frame.common.sender_connection_generation = requester_connection;
@@ -25446,8 +25455,8 @@ pcm_resource_x_s_source_records(const ResourceXDecodedFrame *block, int32 master
 		block->body.acquire_decision.holders[cluster_node_id].boot_incarnation);
 	pcm_resource_x_s_source_put_u64(i->source_fence + 12, requester_connection);
 	pcm_resource_x_s_source_put_u64(i->source_fence + 20, native->generation);
-	i->source_fence[28] = PCM_STATE_S; i->source_fence[29] = 1;
-	i->source_carrier_generation = native->generation + (block->common.target_mode == PCM_STATE_S ? 0 : 1);
+	i->source_fence[28] = native->pcm_state; i->source_fence[29] = 1;
+	i->source_carrier_generation = native->generation + (block->common.target_mode == PCM_STATE_S && native->pcm_state == PCM_STATE_S ? 0 : 1);
 	i->requester_target_generation = block->common.assertion_sequence;
 	memcpy(&page_header, page_bytes, SizeOfPageHeaderData);
 	i->page_scn_lsn = page_header.pd_block_scn;
@@ -25470,10 +25479,11 @@ pcm_resource_x_s_source_records(const ResourceXDecodedFrame *block, int32 master
 	w->decision = block->body.acquire_decision;
 	w->has_source_proof = true;
 	w->original_ack = block->common;
-	w->original_ack.observed_mode = PCM_STATE_S;
+	w->original_ack.observed_mode = native->pcm_state;
 	w->original_ack.target_mode = block->common.target_mode == PCM_STATE_S ? PCM_STATE_S : PCM_STATE_N;
 	w->original_ack.outcome = RESOURCE_X_OUTCOME_OK;
-	w->original_ack.flags = block->common.target_mode == PCM_STATE_S ? 0 : RESOURCE_X_COMMON_FLAG_PI_ESTABLISHED;
+	w->original_ack.flags = block->common.target_mode == PCM_STATE_S && native->pcm_state == PCM_STATE_S
+		? 0 : RESOURCE_X_COMMON_FLAG_PI_ESTABLISHED;
 	w->original_ack.authority_generation = block->common.base_authority_generation;
 	w->original_ack.sender_connection_generation = master_connection;
 	memcpy(proof->source_fence, i->source_fence, sizeof(proof->source_fence));
@@ -25543,6 +25553,7 @@ pcm_resource_x_acquire_s_source_prepare_internal(const ResourceXDecodedFrame *bl
 		|| master_connection == 0 || master_connection == UINT32_MAX
 		|| !pcm_resource_x_s_source_block_valid(block, master, &canonical)
 		|| !pcm_resource_x_s_source_native_valid(prepared, &canonical.common.logical_assertion.resource)
+		|| prepared->pcm_state != canonical.body.acquire_decision.directory_mode
 		|| !pcm_resource_x_s_source_records(&canonical, master, prepared, page_bytes, page_wal,
 			requester_connection, master_connection, &status, &image))
 		return RESOURCE_X_APPLY_INVALID;
@@ -25811,6 +25822,11 @@ cluster_pcm_lock_resource_x_acquire_s_source_publish_exact(const ResourceXDecode
 	if (result != RESOURCE_X_APPLY_APPLIED) goto done;
 	expected = *prepared;
 	if (canonical.common.target_mode == PCM_STATE_S) {
+		if (prepared->pcm_state == PCM_STATE_X) {
+			expected.generation++;
+			expected.pcm_state = PCM_STATE_S;
+			expected.buffer_type = BUF_TYPE_SCUR;
+		}
 		expected.flags = 0;
 		/* The immutable image precedes release. Later local read hints
 		 * retain their dirt; they neither change native lineage nor ACK it. */

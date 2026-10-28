@@ -21508,6 +21508,233 @@ cluster_bufmgr_pcm_own_prepare_s_source_image(
 	return result;
 }
 
+/* The original X reservation and content-X cover every byte and source
+ * observation. PI registration drops content before taking its own lock.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_capture_x_source_locked(BufferDesc *buf,
+	const ClusterPcmOwnSnapshot *prepared, ClusterPcmOwnSnapshot *out_revoking,
+	char block_data[BLCKSZ], ClusterPageWalBindingV1 *out_wal,
+	volatile bool *content_locked, volatile bool *io_started)
+{
+	ClusterPcmOwnResult result = CLUSTER_PCM_OWN_OK;
+	uint32 state = LockBufHdr(buf);
+
+	UnlockBufHdr(buf, state);
+	if ((state & BM_DIRTY) != 0) {
+		ClusterPageWalBindingV1 data_wal;
+		bool known = cluster_shared_config
+			&& cluster_page_wal_output_snapshot_v1(BufferDescriptorGetBuffer(buf), &data_wal);
+		FlushBufferWithRecovery(buf, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL,
+			NULL, io_started, known ? &data_wal : NULL, NULL);
+	}
+	/* Only the original DATA or PI owner may retire a first record. */
+	if (cluster_shared_config && !cluster_page_wal_snapshot_v1(BufferDescriptorGetBuffer(buf), out_wal)) {
+		ClusterPageWalRefV1 first;
+		state = LockBufHdr(buf);
+		if (cluster_page_wal_first_observe_locked_v1(buf, &first) != CLUSTER_PAGE_WAL_FIRST_ABSENT)
+			result = CLUSTER_PCM_OWN_CORRUPT;
+		UnlockBufHdr(buf, state);
+	}
+	if (result == CLUSTER_PCM_OWN_OK && !cluster_bufmgr_downgrade_record_pi(buf, content_locked))
+		return CLUSTER_PCM_OWN_BUSY;
+	if (result != CLUSTER_PCM_OWN_OK) return result;
+	state = LockBufHdr(buf);
+	if (!cluster_pcm_own_fence_matches_locked(buf, prepared)) result = CLUSTER_PCM_OWN_STALE;
+	else if ((state & BM_IO_ERROR) != 0 || !cluster_bufmgr_pcm_current_image_locked(buf, state)) result = CLUSTER_PCM_OWN_CORRUPT;
+	else if ((state & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED | BM_IO_IN_PROGRESS)) != 0)
+		result = CLUSTER_PCM_OWN_BUSY;
+	else {
+		cluster_pcm_own_snapshot_post_state_locked(buf, state, out_revoking);
+		memcpy(block_data, BufHdrGetBlock(buf), BLCKSZ);
+	}
+	UnlockBufHdr(buf, state);
+	if (result == CLUSTER_PCM_OWN_OK && cluster_shared_config)
+		(void)cluster_page_wal_snapshot_v1(BufferDescriptorGetBuffer(buf), out_wal);
+	return result;
+}
+
+/* Capture an exact X source without notifying or changing the directory.
+ * The original WAL/first-record PI owner precedes the immutable handoff and
+ * physical downgrade. Conservative DATA flushing is retained here.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_prepare_x_source_image_internal(BufferDesc *buf,
+	const ClusterPcmOwnSnapshot *expected_x, ClusterPcmOwnSnapshot *out_revoking,
+	char block_data[BLCKSZ], ClusterPageWalBindingV1 *out_wal)
+{
+	ClusterPcmOwnSnapshot prepared = {0};
+	volatile ClusterPcmOwnSnapshot unwind_prepared;
+	volatile ClusterPcmOwnResult result = CLUSTER_PCM_OWN_BUSY;
+	volatile bool content_locked = false, prepared_here = false, io_started = false;
+	LWLock *content_lock, *mapping_lock;
+	BufferTag tag;
+	uint32 hash, state;
+
+	if (out_revoking != NULL) memset(out_revoking, 0, sizeof(*out_revoking));
+	if (out_wal != NULL) memset(out_wal, 0, sizeof(*out_wal));
+	if (buf == NULL || expected_x == NULL || out_revoking == NULL || block_data == NULL || out_wal == NULL
+		|| expected_x->pcm_state != PCM_STATE_X || expected_x->flags != 0
+		|| expected_x->writer_activation_token != 0 || expected_x->resource_x_activation_generation != 0)
+		return CLUSTER_PCM_OWN_INVALID;
+	if (ClusterPcmOwnArray == NULL) return CLUSTER_PCM_OWN_NOT_READY;
+	tag = expected_x->tag; hash = BufTableHashCode(&tag);
+	mapping_lock = BufMappingPartitionLock(hash);
+	LWLockAcquire(mapping_lock, LW_SHARED);
+	state = LockBufHdr(buf);
+	if (BufTableLookup(&tag, hash) != buf->buf_id
+		|| !cluster_pcm_own_fence_matches_locked(buf, expected_x) || (state & BM_VALID) == 0)
+		result = CLUSTER_PCM_OWN_STALE;
+	else if ((state & BM_IO_ERROR) != 0 || !cluster_bufmgr_pcm_current_image_locked(buf, state))
+		result = CLUSTER_PCM_OWN_CORRUPT;
+	else if ((state & BM_IO_IN_PROGRESS) == 0)
+		result = CLUSTER_PCM_OWN_OK;
+	if (result != CLUSTER_PCM_OWN_OK) {
+		UnlockBufHdr(buf, state); LWLockRelease(mapping_lock); return result;
+	}
+	cluster_bufmgr_pin_for_gcs_locked(buf, state);
+	LWLockRelease(mapping_lock);
+	content_lock = BufferDescriptorGetContentLock(buf);
+	PG_TRY();
+	{
+		if (LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE)) {
+			content_locked = true;
+			if (!cluster_itl_page_has_active_slot((Page)BufHdrGetBlock(buf))) {
+				result = cluster_bufmgr_pcm_own_begin_x_revoke(buf, expected_x, &prepared);
+				if (result == CLUSTER_PCM_OWN_OK) {
+					unwind_prepared = prepared; prepared_here = true;
+					result = cluster_bufmgr_pcm_own_capture_x_source_locked(buf, &prepared, out_revoking,
+						block_data, out_wal, &content_locked, &io_started);
+				}
+			} else result = CLUSTER_PCM_OWN_BUSY;
+		} else result = CLUSTER_PCM_OWN_BUSY;
+		if (content_locked) { LWLockRelease(content_lock); content_locked = false; }
+		if (result == CLUSTER_PCM_OWN_OK && out_wal->record_start != InvalidXLogRecPtr
+			&& !cluster_page_wal_flush_source_v1(out_wal, out_wal)) result = CLUSTER_PCM_OWN_STALE;
+	}
+	PG_CATCH();
+	{
+		if (content_locked && LWLockHeldByMe(content_lock)) HOLD_INTERRUPTS();
+		if (content_locked) LWLockRelease(content_lock);
+		if (io_started) {
+			io_started = false;
+			AbortBufferIO(BufferDescriptorGetBuffer(buf));
+		}
+		if (prepared_here) {
+			ClusterPcmOwnSnapshot exact = unwind_prepared;
+			if (cluster_bufmgr_pcm_own_abort_x_revoke(buf, &exact) != CLUSTER_PCM_OWN_OK)
+				cluster_bufmgr_resource_x_fail_closed_current();
+		}
+		cluster_bufmgr_unpin_for_gcs(buf);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (result != CLUSTER_PCM_OWN_OK) {
+		if (prepared_here && cluster_bufmgr_pcm_own_abort_x_revoke(buf, &prepared) != CLUSTER_PCM_OWN_OK)
+			result = CLUSTER_PCM_OWN_CORRUPT;
+		memset(out_revoking, 0, sizeof(*out_revoking));
+	}
+	cluster_bufmgr_unpin_for_gcs(buf);
+	return result;
+}
+
+/* Keep the same KO source-I/O lifetime as the other native image owners.
+ * Author: SqlRush <sqlrush@gmail.com> */
+ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_prepare_x_source_image(BufferDesc *buf,
+	const ClusterPcmOwnSnapshot *expected_x, ClusterPcmOwnSnapshot *out_revoking,
+	char block_data[BLCKSZ], ClusterPageWalBindingV1 *out_wal)
+{
+	ClusterKoDirectoryIoV3 io = {0};
+	ClusterPcmOwnResult result;
+
+	if (buf == NULL || expected_x == NULL || out_revoking == NULL || block_data == NULL || out_wal == NULL
+		|| expected_x->pcm_state != PCM_STATE_X || expected_x->flags != 0 || ClusterPcmOwnArray == NULL)
+		return cluster_bufmgr_pcm_own_prepare_x_source_image_internal(buf, expected_x, out_revoking, block_data, out_wal);
+	if (!cluster_ko_directory_io_begin_v3(BufTagGetRelFileLocator(&expected_x->tag), &io)) {
+		memset(out_revoking, 0, sizeof(*out_revoking)); memset(out_wal, 0, sizeof(*out_wal));
+		return CLUSTER_PCM_OWN_BUSY;
+	}
+	PG_TRY();
+	{
+		result = cluster_bufmgr_pcm_own_prepare_x_source_image_internal(buf, expected_x, out_revoking, block_data, out_wal);
+	}
+	PG_FINALLY();
+	{
+		(void)cluster_ko_directory_io_end_v3(&io);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+/* The caller owns the original immutable full-A pair. Native completion
+ * changes only that exact X reservation, once; no legacy notify round trip.
+ * Author: SqlRush <sqlrush@gmail.com> */
+ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_finish_x_source(BufferDesc *buf,
+	const ClusterPcmOwnSnapshot *prepared, const char image[BLCKSZ], ClusterPcmOwnSnapshot *out_s)
+{
+	ClusterPcmOwnSnapshot live, expected, comparable;
+	volatile ClusterPcmOwnResult result;
+	volatile bool content_locked = false;
+	LWLock *content_lock, *mapping_lock;
+	BufferTag tag;
+	uint32 hash, state;
+
+	if (out_s != NULL) memset(out_s, 0, sizeof(*out_s));
+	if (buf == NULL || prepared == NULL || image == NULL || out_s == NULL
+		|| prepared->pcm_state != PCM_STATE_X || prepared->flags != PCM_OWN_FLAG_REVOKING
+		|| prepared->generation == 0 || prepared->generation >= UINT64_MAX - 1
+		|| prepared->reservation_token == 0 || prepared->reservation_token == UINT64_MAX
+		|| prepared->writer_activation_token != 0 || prepared->resource_x_activation_generation != 0)
+		return CLUSTER_PCM_OWN_INVALID;
+	if (ClusterPcmOwnArray == NULL) return CLUSTER_PCM_OWN_NOT_READY;
+	expected = *prepared; expected.generation++; expected.flags = 0;
+	expected.pcm_state = PCM_STATE_S; expected.buffer_type = BUF_TYPE_SCUR;
+	tag = prepared->tag; hash = BufTableHashCode(&tag);
+	mapping_lock = BufMappingPartitionLock(hash); LWLockAcquire(mapping_lock, LW_SHARED);
+	state = LockBufHdr(buf);
+	if (BufTableLookup(&tag, hash) != buf->buf_id || !BufferTagsEqual(&buf->tag, &tag)) {
+		UnlockBufHdr(buf, state); LWLockRelease(mapping_lock); return CLUSTER_PCM_OWN_STALE;
+	}
+	cluster_pcm_own_snapshot_post_state_locked(buf, state, &live);
+	comparable = live; comparable.semantic_buf_state &= ~BM_IO_IN_PROGRESS;
+	if (live.flags == 0)
+		comparable.semantic_buf_state &= ~(BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED);
+	if (cluster_pcm_own_snapshot_equal_exact(&comparable, &expected)) {
+		result = (state & BM_IO_IN_PROGRESS) != 0 ? CLUSTER_PCM_OWN_BUSY : CLUSTER_PCM_OWN_OK;
+		if (result == CLUSTER_PCM_OWN_OK) *out_s = live;
+		UnlockBufHdr(buf, state); LWLockRelease(mapping_lock); return result;
+	}
+	if (!cluster_pcm_own_snapshot_equal_exact(&comparable, prepared)) result = CLUSTER_PCM_OWN_STALE;
+	else if ((state & BM_IO_ERROR) != 0 || !cluster_bufmgr_pcm_current_image_locked(buf, state)) result = CLUSTER_PCM_OWN_CORRUPT;
+	else result = (state & BM_IO_IN_PROGRESS) != 0 ? CLUSTER_PCM_OWN_BUSY : CLUSTER_PCM_OWN_OK;
+	if (result != CLUSTER_PCM_OWN_OK) { UnlockBufHdr(buf, state); LWLockRelease(mapping_lock); return result; }
+	cluster_bufmgr_pin_for_gcs_locked(buf, state);
+	LWLockRelease(mapping_lock);
+	content_lock = BufferDescriptorGetContentLock(buf);
+	PG_TRY();
+	{
+		if (!LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE)) result = CLUSTER_PCM_OWN_BUSY;
+		else {
+			content_locked = true;
+			if (memcmp(BufHdrGetBlock(buf), image, BLCKSZ) != 0) result = CLUSTER_PCM_OWN_CORRUPT;
+			else result = cluster_bufmgr_pcm_own_finish_x_to_s_downgrade(buf, prepared, out_s);
+			LWLockRelease(content_lock); content_locked = false;
+		}
+	}
+	PG_CATCH();
+	{
+		if (content_locked && LWLockHeldByMe(content_lock)) HOLD_INTERRUPTS();
+		if (content_locked) LWLockRelease(content_lock);
+		cluster_bufmgr_unpin_for_gcs(buf);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	cluster_bufmgr_unpin_for_gcs(buf);
+	return result;
+}
+
 /* Release a compatible S-source capture after its immutable pair is owned.
  * This operation preserves current/S, generation and token. Its caller must
  * retain the full source pair; the native tuple alone supplies no authority.

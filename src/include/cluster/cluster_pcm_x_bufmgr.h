@@ -961,6 +961,12 @@ extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_prepare_s_source_image(
 	ClusterPcmOwnSnapshot *out_revoking, char block_data[BLCKSZ], XLogRecPtr *out_page_lsn,
 	uint64 *out_page_scn, ClusterPcmOwnSourcePrepareRefusal *out_refusal,
 	ClusterPageWalBindingV1 *out_wal);
+/* Prepare X source WAL/PI responsibility before the retained full-A handoff. */
+extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_prepare_x_source_image(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_x, ClusterPcmOwnSnapshot *out_revoking,
+	char block_data[BLCKSZ], ClusterPageWalBindingV1 *out_wal);
+extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_finish_x_source(BufferDesc *buf,
+	const ClusterPcmOwnSnapshot *prepared, const char image[BLCKSZ], ClusterPcmOwnSnapshot *out_s);
 /* Complete only the temporary capture fence; retain current/S identity. */
 extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_finish_s_source(BufferDesc *buf,
 	const ClusterPcmOwnSnapshot *expected_revoking, ClusterPcmOwnSnapshot *out_s);
