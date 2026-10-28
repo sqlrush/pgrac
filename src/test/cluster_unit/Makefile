@@ -1221,6 +1221,19 @@ test_cluster_fresh_role_drop.inc: $(top_srcdir)/src/backend/commands/user.c Make
 	     { print "}"; emit=0; permission=0; cuts++ } \
 	     END { if (entries != 1 || cuts != 1 || emit || permission) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
+test_cluster_fresh_role_grant.inc: $(top_srcdir)/src/backend/commands/user.c Makefile
+	awk '/^#define GRANT_ROLE_SPECIFIED_/ { defs=defs $$0 ORS; macros++ } \
+	     /^InitGrantRoleOptions\(/ { helper="static void" ORS; h_emit=1; helpers++ } \
+	     h_emit { helper=helper $$0 ORS } \
+	     h_emit && /^}/ { h_emit=0; h_cuts++ } \
+	     /^GrantRole\(/ { prefix="void" ORS; emit=1; entries++ } \
+	     emit { prefix=prefix $$0 ORS } \
+	     emit && /grantee_ids = roleSpecsToIds\(stmt->grantee_roles\);/ \
+	     { prefix=prefix "}" ORS; emit=0; cuts++ } \
+	     END { if (macros != 3 || helpers != 1 || h_cuts != 1 || h_emit \
+	               || entries != 1 || cuts != 1 || emit) exit 1; \
+	           printf "%s%s%s", defs, helper, prefix }' $< > $@.tmp
+	mv $@.tmp $@
 test_cluster_fresh_scope: test_cluster_fresh_scope.c unit_test.h \
 		test_cluster_fresh_control.inc test_cluster_fresh_startup.inc test_cluster_fresh_read.inc \
 		test_cluster_fresh_boolean.inc test_cluster_fresh_index.inc test_cluster_fresh_utility.inc \
@@ -1235,7 +1248,7 @@ test_cluster_fresh_scope: test_cluster_fresh_scope.c unit_test.h \
 		test_cluster_fresh_statistics_alter.inc test_cluster_fresh_operator.inc \
 		test_cluster_fresh_opclass.inc test_cluster_fresh_aggregate.inc test_cluster_fresh_tsearch.inc \
 		test_cluster_fresh_publication.inc test_cluster_fresh_database_settings.inc \
-		test_cluster_fresh_view.inc test_cluster_fresh_rule.inc test_cluster_fresh_sequence_alter.inc test_cluster_fresh_role_alter.inc test_cluster_fresh_role_settings.inc test_cluster_fresh_role_drop.inc
+		test_cluster_fresh_view.inc test_cluster_fresh_rule.inc test_cluster_fresh_sequence_alter.inc test_cluster_fresh_role_alter.inc test_cluster_fresh_role_settings.inc test_cluster_fresh_role_drop.inc test_cluster_fresh_role_grant.inc
 	$(CC) $(CFLAGS) -Wno-unused-variable -Wno-unused-but-set-variable $(CPPFLAGS) $< \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 # PGRAC: link the real durable-prefix codec/reader, not a test copy.
@@ -6550,7 +6563,7 @@ clean distclean maintainer-clean:
 		test_cluster_fresh_statistics_alter.inc test_cluster_fresh_operator.inc \
 		test_cluster_fresh_opclass.inc test_cluster_fresh_aggregate.inc test_cluster_fresh_tsearch.inc \
 		test_cluster_fresh_publication.inc test_cluster_fresh_database_settings.inc \
-		test_cluster_fresh_view.inc test_cluster_fresh_rule.inc test_cluster_fresh_sequence_alter.inc test_cluster_fresh_role_alter.inc test_cluster_fresh_role_settings.inc test_cluster_fresh_role_drop.inc
+		test_cluster_fresh_view.inc test_cluster_fresh_rule.inc test_cluster_fresh_sequence_alter.inc test_cluster_fresh_role_alter.inc test_cluster_fresh_role_settings.inc test_cluster_fresh_role_drop.inc test_cluster_fresh_role_grant.inc
 	rm -f $(TESTS) pgrac_fenced_live_rejoin_client probe_pgrac_fenced_cib \
 		test_cluster_tt_locator_stats.inc \
 		test_cluster_heap_inplace_version.inc test_cluster_heap_inplace_legacy_version.inc \
