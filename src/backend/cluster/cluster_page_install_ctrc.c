@@ -1065,11 +1065,32 @@ ctrc_native_step_execute(CtrcNativeStepV1 *context, RfPageCtrcAuthorityV1 *autho
 		(void)cluster_recovery_stamp_fail_v1(&result->inserted.window);
 }
 
+/* Only the retained raw handle uses the original Start's longer lifetime.
+ * Snapshot and executor allocations remain in the caller's context. */
+static void
+ctrc_native_step_open(CtrcNativeStepV1 *context, BlockNumber blockno,
+	Size memory_budget, bool retain)
+{
+	MemoryContext caller = CurrentMemoryContext;
+
+	PG_TRY();
+	{
+		if (retain) MemoryContextSwitchTo(TopMemoryContext);
+		context->storage = cluster_shared_fs_page_open_v1(context->space.key.locator,
+			blockno, memory_budget);
+	}
+	PG_FINALLY();
+	{
+		MemoryContextSwitchTo(caller);
+	}
+	PG_END_TRY();
+}
+
 /* Binding/result belong to the caller's frame, outside this setjmp. */
 static void
 ctrc_native_step_attempt(CtrcNativeStepV1 *context, const ClusterColdCtrcWorkV1 *header,
 	RfPageCtrcAuthorityV1 *authority, BlockNumber blockno, Size count, Size bytes,
-	Size memory_budget, RfPageCtrcStepResultV1 *result)
+	Size memory_budget, RfPageCtrcStepResultV1 *result, ClusterSharedFsPageV1 **retained)
 {
 	void *volatile snapshot = NULL;
 
@@ -1086,8 +1107,7 @@ ctrc_native_step_attempt(CtrcNativeStepV1 *context, const ClusterColdCtrcWorkV1 
 			/* Fix namespace/inode/extent and raw descriptors before the first
 			 * PAGE. No VFD reopen is permitted in the subsequent WAL window. */
 			if (ctrc_native_step_current(context)) {
-				context->storage = cluster_shared_fs_page_open_v1(context->space.key.locator,
-					blockno, memory_budget - bytes);
+				ctrc_native_step_open(context, blockno, memory_budget - bytes, retained != NULL);
 				if (context->storage != NULL && ctrc_native_step_current(context))
 					ctrc_native_step_execute(context, authority, blockno, count,
 						memory_budget - bytes - cluster_shared_fs_page_bytes_v1(), result);
@@ -1103,7 +1123,9 @@ ctrc_native_step_attempt(CtrcNativeStepV1 *context, const ClusterColdCtrcWorkV1 
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-	if (!cluster_shared_fs_page_close_v1(context->storage)) {
+	if (retained != NULL && result->phase == RF_PAGE_CTRC_STEP_FPI_DURABLE)
+		*retained = context->storage;
+	else if (!cluster_shared_fs_page_close_v1(context->storage)) {
 		result->phase = RF_PAGE_CTRC_STEP_REFUSED;
 		if (result->inserted.window.key.window_seq != 0)
 			(void)cluster_recovery_stamp_fail_v1(&result->inserted.window);
@@ -1118,7 +1140,7 @@ ctrc_native_itl_step(const struct ClusterRecoveryStartV1 *start,
 	RfPageCtrcAuthorityV1 *authority, const ClusterSpaceIdentity *space,
 	BlockNumber blockno, const RfPageVersionV1 *expected_before, const char *canonical,
 	const ClusterRecoveryUndoEntry *physical, Size physical_count, Size memory_budget,
-	bool publish_durable, bool sync_unchanged)
+	bool publish_durable, bool sync_unchanged, ClusterSharedFsPageV1 **retained)
 {
 	RfPageCtrcStepResultV1 result = {0};
 	CtrcNativeStepV1 context = {0};
@@ -1165,7 +1187,8 @@ ctrc_native_itl_step(const struct ClusterRecoveryStartV1 *start,
 	context.original_canonical = canonical;
 	if (canonical != NULL) memcpy(context.canonical.data, canonical, BLCKSZ);
 	if (!cluster_recovery_ctrc_terminal_result_v1(start, work, &context.accepted)) return result;
-	ctrc_native_step_attempt(&context, &header, authority, blockno, physical_count, bytes, memory_budget, &result);
+	ctrc_native_step_attempt(&context, &header, authority, blockno, physical_count, bytes,
+		memory_budget, &result, retained);
 	return result;
 }
 
@@ -1177,7 +1200,7 @@ rf_page_recovery_ctrc_replays_itl_step_smgr_v1(const struct ClusterRecoveryStart
 	const ClusterRecoveryUndoEntry *physical, Size physical_count, Size memory_budget)
 {
 	return ctrc_native_itl_step(start, work, source, authority, space, blockno,
-		expected_before, NULL, physical, physical_count, memory_budget, false, false);
+		expected_before, NULL, physical, physical_count, memory_budget, false, false, NULL);
 }
 
 RfPageCtrcStepResultV1
@@ -1189,7 +1212,7 @@ rf_page_recovery_ctrc_replays_itl_graph_step_smgr_v1(const struct ClusterRecover
 {
 	if (canonical == NULL) return (RfPageCtrcStepResultV1){0};
 	return ctrc_native_itl_step(start, work, source, authority, space, blockno,
-		expected_before, canonical, physical, physical_count, memory_budget, false, false);
+		expected_before, canonical, physical, physical_count, memory_budget, false, false, NULL);
 }
 
 RfPageCtrcStepResultV1
@@ -1201,7 +1224,7 @@ rf_page_recovery_ctrc_replays_itl_graph_durable_smgr_v1(const struct ClusterReco
 {
 	if (canonical == NULL) return (RfPageCtrcStepResultV1){0};
 	return ctrc_native_itl_step(start, work, source, authority, space, blockno,
-		expected_before, canonical, physical, physical_count, memory_budget, true, false);
+		expected_before, canonical, physical, physical_count, memory_budget, true, false, NULL);
 }
 
 RfPageCtrcStepResultV1
@@ -1213,6 +1236,21 @@ rf_page_recovery_ctrc_replays_itl_graph_sync_smgr_v1(const struct ClusterRecover
 {
 	if (canonical == NULL) return (RfPageCtrcStepResultV1){0};
 	return ctrc_native_itl_step(start, work, source, authority, space, blockno,
-		expected_before, canonical, physical, physical_count, memory_budget, true, true);
+		expected_before, canonical, physical, physical_count, memory_budget, true, true, NULL);
+}
+
+RfPageCtrcHeldStepV1
+rf_page_recovery_ctrc_replays_itl_graph_hold_smgr_v1(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, const ClusterRecoveryCtrcReplaySetSourceV1 *source,
+	RfPageCtrcAuthorityV1 *authority, const ClusterSpaceIdentity *space,
+	BlockNumber blockno, const RfPageVersionV1 *expected_before, const char canonical[BLCKSZ],
+	const ClusterRecoveryUndoEntry *physical, Size physical_count, Size memory_budget)
+{
+	RfPageCtrcHeldStepV1 held = {0};
+
+	if (canonical != NULL)
+		held.result = ctrc_native_itl_step(start, work, source, authority, space, blockno,
+			expected_before, canonical, physical, physical_count, memory_budget, true, true, &held.storage);
+	return held;
 }
 #endif /* USE_PGRAC_CLUSTER */

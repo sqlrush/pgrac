@@ -206,6 +206,7 @@
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_recovery_census.h"
 #include "cluster/cluster_page_install_ctrc.h"
+#include "cluster/storage/cluster_shared_fs_page.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_wal_writer.h"
 #include "cluster/storage/cluster_undo_block0.h"
@@ -705,6 +706,7 @@ typedef struct ClusterColdCtrcPageProgressV1 {
 	uint32 next_target;
 	bool pending;
 	RfPageCtrcStepResultV1 result;
+	struct ClusterSharedFsPageV1 *storage;
 } ClusterColdCtrcPageProgressV1;
 
 struct ClusterRecoveryStartV1 {
@@ -759,8 +761,16 @@ cluster_recovery_cold_observation_close(struct ClusterRecoveryStartV1 *start)
 	start->ctrc_page_source_count = 0;
 	/* Private image storage is not the original failed/INSERTED window. */
 	if (start->ctrc_page_progress != NULL) {
-		pfree(start->ctrc_page_progress);
+		ClusterColdCtrcPageProgressV1 *progress = start->ctrc_page_progress;
+		struct ClusterSharedFsPageV1 *storage = progress->storage;
+
 		start->ctrc_page_progress = NULL;
+		progress->storage = NULL;
+		/* Abandon local custody, never erase the unfinished shared duty. */
+		if (progress->pending && progress->result.inserted.window.key.window_seq != 0)
+			(void)cluster_recovery_stamp_fail_v1(&progress->result.inserted.window);
+		(void)cluster_shared_fs_page_close_v1(storage);
+		pfree(progress);
 	}
 	rf_page_online_plan_destroy_v1(&start->ctrc_page_plan);
 	if (page_sources != NULL) pfree(page_sources);
@@ -863,7 +873,8 @@ cluster_recovery_cold_pending_page_current(const struct ClusterRecoveryStartV1 *
 	return result->phase == RF_PAGE_CTRC_STEP_FPI_DURABLE
 		&& result->inserted.wal_flushed
 		&& cluster_recovery_stamp_fpi_durable_current_v1(&result->inserted.window,
-			result->inserted.record_start, result->inserted.record_end);
+			result->inserted.record_start, result->inserted.record_end)
+		&& progress->storage != NULL && cluster_shared_fs_page_current_v1(progress->storage);
 }
 
 bool
@@ -1771,22 +1782,24 @@ cluster_recovery_cold_page_attempt(const struct ClusterRecoveryStartV1 *start,
 			detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
 			if (page.verdict == RF_PAGE_AUTHORITY_OK && authority != NULL
 				&& cluster_recovery_cold_page_advance_current(start, work, scope, progress)) {
-				RfPageCtrcStepResultV1 step = rf_page_recovery_ctrc_replays_itl_graph_sync_smgr_v1(
+				RfPageCtrcHeldStepV1 held = rf_page_recovery_ctrc_replays_itl_graph_hold_smgr_v1(
 					start, work, &start->ctrc_page_sources[source_index], authority,
 					&physical_page->reservation.identity, view->page_identity.blockno,
 					&view->expected_result, view->canonical_page, start->ctrc_physical->entries,
 					start->ctrc_physical->count, available - 2 * part);
 				RfPageCtrcAuthorityV1 *release = authority;
+				const RfPageCtrcStepResultV1 *step = &held.result;
 
-				if (cluster_recovery_cold_page_step_has_operation(&step)) {
-					progress->result = step;
+				if (cluster_recovery_cold_page_step_has_operation(step)) {
+					progress->result = *step;
+					progress->storage = held.storage;
 					progress->pending = true;
 				}
 				authority = NULL;
 				rf_page_authority_ctrc_replays_destroy_v1(&release);
 				/* PAGE is gone before any original ROOT/current snapshot. */
 				if (cluster_recovery_cold_page_advance_current(start, work, scope, progress))
-					detail = cluster_recovery_cold_page_step_result(progress, &step);
+					detail = cluster_recovery_cold_page_step_result(progress, step);
 			}
 		}
 		if (detail == RF_PAGE_PROOF_DETAIL_OK && proof == NULL)
