@@ -4247,3 +4247,163 @@ UT_TEST(test_operation_worker_multitop_data_refuses_old_owner_alias)
 			UT_ASSERT_EQ(operation_worker_allocations, allocations);
 		}
 }
+
+static ClusterR4CrBuildStepResult
+operation_worker_generation_poll(OperationWorkerFixture *f, uint32 index)
+{
+	int before = test_candidate_acquire_calls + test_candidate_poll_calls
+				 + test_candidate_release_calls + test_operation_release_poll_count;
+	ClusterR4CrBuildStepResult step = operation_worker_step_at(f, index);
+
+	UT_ASSERT(test_candidate_acquire_calls + test_candidate_poll_calls
+				  + test_candidate_release_calls + test_operation_release_poll_count - before
+			  <= 1);
+	UT_ASSERT_EQ(test_candidate_wait_calls, 0);
+	UT_ASSERT_EQ(test_operation_release_wait_count, 0);
+	return step;
+}
+
+/* Twelve retained creations already span DATA9/8; pause the old owner's read. */
+static void
+operation_worker_generation_arm(OperationWorkerFixture *f, unsigned phase, int base)
+{
+	for (unsigned tick = 0; tick < 512 && f->extension.build_steps < 13; tick++)
+		UT_ASSERT_EQ(operation_worker_generation_poll(f, 0), CLUSTER_R4_CR_STEP_PENDING);
+	UT_ASSERT_EQ(f->extension.build_steps, 13);
+	UT_ASSERT_EQ(test_candidate_acquire_calls, base + 36);
+	UT_ASSERT_EQ(test_candidate_held_count, 0);
+	for (unsigned tick = 0; tick < 32 && test_candidate_acquire_calls < base + 37 + phase; tick++)
+		UT_ASSERT_EQ(operation_worker_generation_poll(f, 0), CLUSTER_R4_CR_STEP_PENDING);
+	UT_ASSERT_EQ(test_candidate_acquire_calls, base + 37 + phase);
+	UT_ASSERT_EQ(test_candidate_release_calls,
+				 test_candidate_acquire_calls - test_candidate_cancel_calls - 1);
+	UT_ASSERT_EQ(test_candidate_held_count, 1);
+	UT_ASSERT_EQ(test_operation_pin_depth, 0);
+}
+
+static void
+operation_worker_generation_finish(OperationWorkerFixture *f)
+{
+	ClusterR4CrBuildStepResult step = CLUSTER_R4_CR_STEP_PENDING;
+
+	for (unsigned tick = 0; tick < 512 && step == CLUSTER_R4_CR_STEP_PENDING; tick++)
+		step = operation_worker_generation_poll(f, 0);
+	UT_ASSERT_EQ(step, CLUSTER_R4_CR_STEP_FULL);
+	UT_ASSERT_EQ(f->reason, CLUSTER_CR_BUILD_NONE);
+	UT_ASSERT_EQ(f->extension.build_steps, 24);
+}
+
+static void
+operation_worker_generation_stale(OperationWorkerFixture *old, OperationWorkerFixture *current)
+{
+	OperationWorkerFixture wrong = *current;
+	PGAlignedBlock before;
+	int allocations = operation_worker_allocations;
+	int acquisitions = test_candidate_acquire_calls;
+	int releases = test_candidate_release_calls;
+
+	memcpy(before.data, current->cr.source.data, BLCKSZ);
+	cluster_cr_build_on_holder_forget(0, old->extension.slot_generation);
+	UT_ASSERT_EQ(operation_worker_generation_poll(old, 0), CLUSTER_R4_CR_STEP_FAIL);
+	UT_ASSERT_EQ(old->reason, CLUSTER_CR_BUILD_PROTOCOL);
+	wrong.extension.owner.builder_incarnation = old->extension.owner.builder_incarnation;
+	UT_ASSERT_EQ(operation_worker_generation_poll(&wrong, 0), CLUSTER_R4_CR_STEP_FAIL);
+	UT_ASSERT_EQ(wrong.reason, CLUSTER_CR_BUILD_PROTOCOL);
+	UT_ASSERT_EQ(test_candidate_cancel_calls, 1);
+	UT_ASSERT_EQ(test_candidate_held_count, 1);
+	UT_ASSERT_EQ(test_candidate_acquire_calls, acquisitions);
+	UT_ASSERT_EQ(test_candidate_release_calls, releases);
+	UT_ASSERT_EQ(operation_worker_allocations, allocations);
+	UT_ASSERT_EQ(memcmp(before.data, current->cr.source.data, BLCKSZ), 0);
+}
+
+UT_TEST(test_operation_worker_retained_generation_rejects_stale_cleanup)
+{
+	for (unsigned phase = 0; phase < 3; phase++)
+		for (unsigned layout = 0; layout < 4; layout++) {
+			OperationWorkerFixture f[2];
+			PGAlignedBlock original, expected;
+			int allocations = operation_worker_allocations;
+			int cancelled_acquisitions;
+
+			operation_worker_multitop_data(&f[0], 2, layout);
+			f[1] = f[0];
+			f[1].extension.slot_generation++;
+			f[1].extension.owner.builder_incarnation++;
+			memcpy(original.data, f[0].cr.source.data, BLCKSZ);
+			operation_worker_multitop_expected(expected.data, original.data, 2, layout & 2);
+			operation_worker_generation_arm(&f[0], phase, 0);
+			UT_ASSERT(operation_worker_allocations > allocations);
+			cancelled_acquisitions = test_candidate_acquire_calls;
+			cluster_cr_build_on_holder_forget(0, 1000);
+			UT_ASSERT_EQ(test_candidate_cancel_calls, 1);
+			UT_ASSERT_EQ(test_candidate_held_count, 0);
+			UT_ASSERT_EQ(operation_worker_allocations, allocations);
+			UT_ASSERT_EQ(memcmp(original.data, f[0].cr.source.data, BLCKSZ), 0);
+			operation_worker_generation_arm(&f[1], phase, cancelled_acquisitions);
+			UT_ASSERT(operation_worker_allocations > allocations);
+			operation_worker_generation_stale(&f[0], &f[1]);
+			operation_worker_generation_finish(&f[1]);
+			UT_ASSERT_EQ(memcmp(expected.data, f[1].cr.source.data, BLCKSZ), 0);
+			UT_ASSERT_EQ(memcmp(original.data, f[0].cr.source.data, BLCKSZ), 0);
+			UT_ASSERT_EQ(test_candidate_acquire_calls, cancelled_acquisitions + 72);
+			UT_ASSERT_EQ(test_candidate_release_calls, test_candidate_acquire_calls - 1);
+			UT_ASSERT_EQ(test_candidate_max_held_count, 1);
+			UT_ASSERT_EQ(test_candidate_held_count, 0);
+			UT_ASSERT_EQ(test_candidate_cancel_calls, 1);
+			UT_ASSERT_EQ(test_candidate_data_pin_calls, 0);
+			UT_ASSERT_EQ(test_operation_multidata_request_count, 72 + (phase != 0));
+			cluster_cr_build_on_holder_forget(0, 1001);
+			cluster_cr_build_on_holder_forget(0, 1000);
+			cluster_cr_build_on_holder_forget(0, 1001);
+			UT_ASSERT_EQ(test_candidate_cancel_calls, 1);
+			UT_ASSERT_EQ(operation_worker_allocations, allocations);
+		}
+}
+
+UT_TEST(test_operation_worker_waiter_forget_preserves_retained_holder)
+{
+	for (unsigned phase = 0; phase < 3; phase++)
+		for (unsigned layout = 0; layout < 4; layout++) {
+			OperationWorkerFixture f[2];
+			PGAlignedBlock original, expected;
+			int allocations = operation_worker_allocations;
+			int retained_allocations, held_acquisitions;
+
+			operation_worker_multitop_data(&f[0], 2, layout);
+			f[1] = f[0];
+			f[1].extension.slot_generation++;
+			f[1].extension.owner.builder_incarnation++;
+			memcpy(original.data, f[0].cr.source.data, BLCKSZ);
+			operation_worker_multitop_expected(expected.data, original.data, 2, layout & 2);
+			operation_worker_generation_arm(&f[0], phase, 0);
+			retained_allocations = operation_worker_allocations;
+			held_acquisitions = test_candidate_acquire_calls;
+			test_operation_worker_current_busy = true;
+			for (unsigned tick = 0; tick < 20; tick++)
+				UT_ASSERT_EQ(operation_worker_generation_poll(&f[1], 1),
+							 CLUSTER_R4_CR_STEP_PENDING);
+			UT_ASSERT_EQ(f[1].extension.build_steps, 1);
+			UT_ASSERT_EQ(test_candidate_acquire_calls, held_acquisitions);
+			cluster_cr_build_on_holder_forget(1, 1001);
+			cluster_cr_build_on_holder_forget(1, 1001);
+			cluster_cr_build_on_holder_forget(0, 1001);
+			UT_ASSERT_EQ(test_candidate_cancel_calls, 0);
+			UT_ASSERT_EQ(test_candidate_held_count, 1);
+			UT_ASSERT_EQ(operation_worker_allocations, retained_allocations);
+			UT_ASSERT_EQ(memcmp(original.data, f[1].cr.source.data, BLCKSZ), 0);
+			operation_worker_generation_finish(&f[0]);
+			UT_ASSERT_EQ(memcmp(expected.data, f[0].cr.source.data, BLCKSZ), 0);
+			UT_ASSERT_EQ(test_candidate_acquire_calls, 72);
+			UT_ASSERT_EQ(test_candidate_release_calls, 72);
+			UT_ASSERT_EQ(test_candidate_max_held_count, 1);
+			UT_ASSERT_EQ(test_candidate_held_count, 0);
+			UT_ASSERT_EQ(test_candidate_cancel_calls, 0);
+			UT_ASSERT_EQ(test_undo_read_calls, 25);
+			UT_ASSERT_EQ(test_operation_multidata_request_count, 48);
+			UT_ASSERT_EQ(test_candidate_data_pin_calls, 0);
+			cluster_cr_build_on_holder_forget(0, 1000);
+			cluster_cr_build_on_holder_forget(1, 1001);
+			UT_ASSERT_EQ(operation_worker_allocations, allocations);
+		}
+}
