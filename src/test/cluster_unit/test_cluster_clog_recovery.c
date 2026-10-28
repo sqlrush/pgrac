@@ -1351,6 +1351,8 @@ fixture_cleanup(void)
 #include "test_cluster_clog_relmap_horizon.inc"
 #include "test_cluster_clog_native_counter.inc"
 #include "test_cluster_clog_relmap_counter.inc"
+#include "test_cluster_clog_native_advance_next.inc"
+#include "test_cluster_clog_relmap_native_counter.inc"
 #include "test_cluster_clog_native_truncate.inc"
 
 int
@@ -1450,7 +1452,17 @@ main(void)
 		UT_RUN(relmap_counter_change_during_first_or_final_root_refuses);
 		goto mutation_done;
 	}
-	UT_PLAN(77);
+	if (getenv("PGRAC_NATIVE_COUNTER_ONLY") != NULL) {
+		UT_PLAN(3);
+		UT_RUN(relmap_native_advance_refuses_old_counter_without_page_mutation);
+		UT_RUN(relmap_native_advance_noop_and_foreign_keep_original_observation);
+		UT_RUN(relmap_native_advance_during_root_keeps_failure_and_custody);
+		goto mutation_done;
+	}
+	UT_PLAN(80);
+	UT_RUN(relmap_native_advance_refuses_old_counter_without_page_mutation);
+	UT_RUN(relmap_native_advance_noop_and_foreign_keep_original_observation);
+	UT_RUN(relmap_native_advance_during_root_keeps_failure_and_custody);
 	UT_RUN(relmap_own_actual_next_counter_is_only_an_observation);
 	UT_RUN(relmap_foreign_counter_never_borrows_local_next);
 	UT_RUN(relmap_own_counter_drift_keeps_original_baseline_and_fd);
