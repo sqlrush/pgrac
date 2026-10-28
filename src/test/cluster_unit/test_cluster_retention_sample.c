@@ -73,6 +73,8 @@ VariableCache ShmemVariableCache = &variable_cache;
 Oid MyDatabaseId = 1;
 MemoryContext CurrentMemoryContext;
 static bool xidgen_held, fail_safe_xmin;
+static bool native_recovery;
+static unsigned recovery_checks;
 static unsigned safe_xmin_calls, slot_saves, logical_starts;
 static TransactionId logical_start_xmin;
 static LogicalDecodingContext logical_context;
@@ -259,12 +261,22 @@ void namestrcpy(Name name, const char *str) { strlcpy(NameStr(*name), str, NAMED
 bool
 RecoveryInProgress(void)
 {
-	UT_ASSERT(held && proc_exclusive && control_exclusive);
-	safe_xmin_calls++;
-	if (fail_safe_xmin)
-		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-						errmsg("injected safe-xmin source failure")));
-	return false;
+	/* Safe-xmin calls under its original slot/ProcArray cut. H readiness
+	 * observes the same native state before acquiring either lock. */
+	if (held)
+	{
+		UT_ASSERT(proc_exclusive && control_exclusive);
+		safe_xmin_calls++;
+		if (fail_safe_xmin)
+			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							errmsg("injected safe-xmin source failure")));
+	}
+	else
+	{
+		UT_ASSERT(!xidgen_held);
+		recovery_checks++;
+	}
+	return native_recovery;
 }
 void ReplicationSlotReserveWal(void) { abort(); } /* Tests supply an explicit LSN. */
 void
@@ -477,7 +489,8 @@ reset_fixture(void)
 	memset(feedback_fields, 0, sizeof(feedback_fields));
 	expecting_error = false;
 	feedback_error_code = 0;
-	xidgen_held = fail_safe_xmin = false;
+	xidgen_held = fail_safe_xmin = native_recovery = false;
+	recovery_checks = 0;
 	safe_xmin_calls = slot_saves = logical_starts = 0;
 	logical_start_xmin = InvalidTransactionId;
 	memset(&logical_context, 0, sizeof(logical_context));
@@ -1659,10 +1672,92 @@ UT_TEST(test_noncluster_copy_keeps_original_raw_pin_values)
 	UT_ASSERT(!held && !control_held && lock_errors == 0);
 }
 
+/* An incomplete native recovery cannot establish a new H promise even when
+ * the local census/clock or the separate MRP scalar is already finite. */
+UT_TEST(test_native_recovery_refuses_every_finite_h_source_without_observation)
+{
+	for (unsigned source = 0; source < 3; source++)
+	{
+		ClusterUndoRetentionSample sample;
+
+		reset_fixture();
+		native_recovery = true;
+		if (source == 1)
+		{
+			procArray->numProcs = 1;
+			entries[0].xmin = 50;
+			pg_atomic_write_u64(&entries[0].cluster_read_scn_atomic, 400);
+		}
+		if (source == 2)
+		{
+			sample_mrp = true;
+			sample_mrp_bound = 300;
+		}
+		memset(&sample, 0xa5, sizeof(sample));
+		UT_ASSERT(!cluster_undo_retention_horizon_sample(&sample));
+		UT_ASSERT(empty_sample(&sample));
+		UT_ASSERT_EQ(cluster_undo_retention_horizon(), InvalidScn);
+		UT_ASSERT_EQ(procArray->cluster_read_scn_floor, InvalidScn);
+		UT_ASSERT_EQ(recovery_checks, 2);
+		UT_ASSERT_EQ(acquires, 0);
+		UT_ASSERT_EQ(clock_reads, 0);
+		UT_ASSERT(!held && !control_held && lock_errors == 0);
+	}
+}
+
+UT_TEST(test_native_recovery_cannot_borrow_or_erase_an_existing_h_promise)
+{
+	ClusterUndoRetentionSample sample;
+
+	reset_fixture();
+	UT_ASSERT(cluster_undo_retention_horizon_sample(&sample));
+	UT_ASSERT_EQ(procArray->cluster_read_scn_floor, 700);
+	native_recovery = true;
+	sample_clock = 900;
+	acquires = releases = clock_reads = recovery_checks = 0;
+	memset(&sample, 0xa5, sizeof(sample));
+	UT_ASSERT(!cluster_undo_retention_horizon_sample(&sample));
+	UT_ASSERT(empty_sample(&sample));
+	UT_ASSERT(!cluster_undo_retention_horizon_covers(700));
+	UT_ASSERT_EQ(procArray->cluster_read_scn_floor, 700);
+	UT_ASSERT_EQ(recovery_checks, 2);
+	UT_ASSERT_EQ(acquires, 0);
+	UT_ASSERT_EQ(clock_reads, 0);
+	UT_ASSERT(!held && !control_held && lock_errors == 0);
+}
+
+UT_TEST(test_completed_recovery_retains_original_slot_reader_and_mrp_checks)
+{
+	ClusterUndoRetentionSample sample;
+
+	reset_fixture();
+	native_recovery = true;
+	procArray->replication_slot_catalog_xmin = 100;
+	UT_ASSERT(!cluster_undo_retention_horizon_sample(&sample));
+	UT_ASSERT_EQ(clock_reads, 0);
+	native_recovery = false;
+	UT_ASSERT(!cluster_undo_retention_horizon_sample(&sample));
+	UT_ASSERT(empty_sample(&sample));
+	UT_ASSERT_EQ(procArray->cluster_read_scn_floor, InvalidScn);
+	procArray->replication_slot_catalog_xmin = InvalidTransactionId;
+	procArray->numProcs = 1;
+	entries[0].xmin = 50;
+	pg_atomic_write_u64(&entries[0].cluster_read_scn_atomic, 400);
+	sample_mrp = true;
+	sample_mrp_bound = 300;
+	UT_ASSERT(cluster_undo_retention_horizon_sample(&sample));
+	UT_ASSERT_EQ(sample.horizon_scn, 300);
+	UT_ASSERT_EQ(sample.contributor_kind, CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_REPLICATION);
+	UT_ASSERT_EQ(procArray->cluster_read_scn_floor, 300);
+	UT_ASSERT(cluster_undo_retention_horizon_covers(300));
+	UT_ASSERT(!cluster_undo_retention_horizon_covers(301));
+	UT_ASSERT(!held && !control_held && lock_errors == 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(53);
+	UT_PLAN(56);
 	UT_RUN(test_empty_array_has_one_prescan_clock);
 	UT_RUN(test_all_database_and_vacuum_snapshot_minima_are_included);
 	UT_RUN(test_equal_time_prefers_snapshot_without_changing_scalar_bits);
@@ -1716,6 +1811,9 @@ main(void)
 	UT_RUN(test_logical_copy_keeps_original_initial_catalog_protection);
 	UT_RUN(test_copy_original_source_error_releases_the_new_lock_cut);
 	UT_RUN(test_noncluster_copy_keeps_original_raw_pin_values);
+	UT_RUN(test_native_recovery_refuses_every_finite_h_source_without_observation);
+	UT_RUN(test_native_recovery_cannot_borrow_or_erase_an_existing_h_promise);
+	UT_RUN(test_completed_recovery_retains_original_slot_reader_and_mrp_checks);
 	free(copy_storage);
 	free(procArray);
 	UT_DONE();

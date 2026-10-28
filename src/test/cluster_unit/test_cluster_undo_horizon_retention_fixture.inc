@@ -25,6 +25,15 @@ cluster_scn_current(void)
 	return native_history_clock;
 }
 
+/* Native recovery is complete in this original LMON composition. */
+static bool
+native_history_in_recovery(void)
+{
+	return false;
+}
+
+#define RecoveryInProgress native_history_in_recovery
+
 /* Retain the pre-existing controlled sampler for its original tests. Only
  * the explicit composition cases select these unmodified native bodies. */
 #define cluster_undo_retention_horizon_sample native_history_sample
@@ -35,6 +44,7 @@ cluster_scn_current(void)
 #define cluster_undo_retention_horizon_covers native_history_covers
 #include "test_cluster_retention_promise.inc"
 #undef cluster_undo_retention_horizon_covers
+#undef RecoveryInProgress
 
 static void
 native_history_reset(void)

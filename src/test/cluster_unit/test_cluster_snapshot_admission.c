@@ -61,6 +61,13 @@ int cluster_injection_armed_count;
 bool cluster_enable_adg;
 int cluster_adg_lag_threshold_sec;
 
+/* This snapshot-manager composition starts after native recovery. */
+bool
+RecoveryInProgress(void)
+{
+	return false;
+}
+
 bool
 cluster_mrp_should_start(void)
 {

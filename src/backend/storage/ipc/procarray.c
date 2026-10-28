@@ -2318,6 +2318,10 @@ cluster_undo_retention_horizon_sample(ClusterUndoRetentionSample *out)
 	memset(out, 0, sizeof(*out));
 	if (cluster_node_id < 0 || arrayP == NULL || allProcs == NULL)
 		return false;
+	/* Recovery must establish its native history before an empty local
+	 * census or the clock can become a promise to other nodes. */
+	if (RecoveryInProgress())
+		return false;
 
 	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
 	/* Snapshot xmin is published under this lock before read_scn is chosen.
@@ -2430,6 +2434,10 @@ cluster_undo_retention_horizon_covers(SCN horizon)
 
 	if (cluster_node_id < 0 || arrayP == NULL || !SCN_VALID(horizon) ||
 		horizon == (SCN) UINT64_MAX)
+		return false;
+	/* Keep an earlier promise, but do not borrow it while recovery is still
+	 * establishing the native history protected by this boot. */
+	if (RecoveryInProgress())
 		return false;
 	LWLockAcquire(ProcArrayLock, LW_SHARED);
 	covered = SCN_VALID(arrayP->cluster_read_scn_floor) &&

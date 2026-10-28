@@ -432,7 +432,9 @@ static SCN cohort_unavailable_mrp_bound(void);
 #define MainLWLockArray native_locks
 #define allProcs (native_procs.allProcs)
 #define cluster_scn_current sender_history_clock
+#define RecoveryInProgress native_recovery_in_progress
 #include "test_cluster_retention_sample.inc"
+#undef RecoveryInProgress
 #undef cluster_mrp_standby_consistent_scn
 #undef cluster_mrp_should_start
 #undef cluster_scn_current
