@@ -36,6 +36,8 @@
 #include "catalog/pg_foreign_server_d.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_type_d.h"
+#include "commands/comment.h"
+#include "commands/dbcommands.h"
 #include "commands/defrem.h"
 #include "commands/extension.h"
 #include "commands/schemacmds.h"
@@ -6118,6 +6120,25 @@ static AlterExtensionStmt extension_update;
 static AlterExtensionContentsStmt extension_contents;
 static bool schema_lookup_active, schema_expect_binding;
 static unsigned schema_lookups, schema_unbound, schema_bad_lookup;
+static bool comment_lookup_active, comment_expect_binding, comment_database_exists;
+static unsigned comment_database_lookups, comment_object_lookups, comment_unbound,
+	comment_bad_lookup;
+static String comment_database_name, comment_table_name;
+static ListCell comment_table_cell;
+static List comment_table_names;
+static CommentStmt native_comment_stmt;
+
+Oid
+get_database_oid(const char *dbname, bool missing_ok)
+{
+	comment_database_lookups++;
+	if (comment_expect_binding && utility_binds == 0)
+		comment_unbound++;
+	if (!comment_lookup_active || strcmp(dbname, "comment_database") != 0 || !missing_ok
+		|| (comment_database_exists && comment_object_lookups + 1 != comment_database_lookups))
+		comment_bad_lookup++;
+	return comment_database_exists ? 500 : InvalidOid;
+}
 
 Relation
 table_open(Oid relationId, LOCKMODE lockmode)
@@ -6151,6 +6172,16 @@ ObjectAddress
 get_object_address(ObjectType objtype, Node *object, Relation *relp, LOCKMODE lockmode,
 				   bool missing_ok)
 {
+	if (comment_lookup_active) {
+		comment_object_lookups++;
+		if (comment_expect_binding && utility_binds == 0)
+			comment_unbound++;
+		if (objtype != native_comment_stmt.objtype || object != native_comment_stmt.object
+			|| relp == NULL || lockmode != ShareUpdateExclusiveLock || missing_ok
+			|| (objtype == OBJECT_DATABASE && comment_database_lookups != comment_object_lookups))
+			comment_bad_lookup++;
+		siglongjmp(boundary, 2);
+	}
 	extension_lookups++;
 	extension_lookup_kind = 2;
 	if (extension_expect_binding && utility_binds == 0)
@@ -6758,10 +6789,208 @@ UT_TEST(test_native_schema_utility_prebinding_reuses_same_top_before_lookup)
 	schema_lookup_active = false;
 }
 
+/* Run the actual COMMENT prologue through its first object-lock lookup.
+ * Missing databases take the real earlier return, without any catalog write. */
+#include "test_cluster_fresh_comment.inc"
+
+static void
+reset_native_comment(bool expect_binding, bool database)
+{
+	reset_create_preflight();
+	comment_lookup_active = true;
+	comment_expect_binding = expect_binding;
+	comment_database_exists = true;
+	comment_database_lookups = comment_object_lookups = comment_unbound = comment_bad_lookup = 0;
+	comment_database_name = (String){ .type = T_String, .sval = "comment_database" };
+	comment_table_name = (String){ .type = T_String, .sval = "comment_table" };
+	comment_table_cell = (ListCell){ .ptr_value = &comment_table_name };
+	comment_table_names
+		= (List){ .type = T_List, .length = 1, .max_length = 1, .elements = &comment_table_cell };
+	native_comment_stmt = (CommentStmt){ .type = T_CommentStmt,
+										 .objtype = database ? OBJECT_DATABASE : OBJECT_TABLE,
+										 .object = database ? (Node *)&comment_database_name
+															: (Node *)&comment_table_names,
+										 .comment = "comment body" };
+}
+
+UT_TEST(test_native_comment_binds_before_database_and_object_lookup_in_all_profiles)
+{
+	for (unsigned database = 0; database < 2; database++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_comment(binds, database != 0);
+			cluster_shared_catalog = (mode & 1) != 0;
+			utility_storage_mode = (mode & 2) != 0;
+			cluster_shared_config = (mode & 4) != 0;
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					(void)CommentObject(&native_comment_stmt);
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(comment_database_lookups, database ? repeat + 1 : 0);
+				UT_ASSERT_EQ(comment_object_lookups, repeat + 1);
+				UT_ASSERT_EQ(comment_unbound, 0);
+				UT_ASSERT_EQ(comment_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	comment_lookup_active = false;
+}
+
+UT_TEST(test_native_comment_refusal_child_and_wrong_top_precede_all_lookups)
+{
+	for (unsigned database = 0; database < 2; database++) {
+		for (unsigned config = 0; config < 2; config++) {
+			for (unsigned failure = 0; failure < 5; failure++) {
+				bool allocated = failure == 0 || failure == 2;
+				int caught;
+
+				reset_native_comment(true, database != 0);
+				cluster_shared_config = config != 0;
+				if (failure == 0)
+					utility_bind_ok = false;
+				else if (failure == 1 || failure == 2) {
+					if (failure == 2)
+						create_sql_entry((Node *)&native_comment_stmt);
+					utility_in_child = true;
+				} else {
+					utility_current_xid = 401;
+					utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+				}
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					(void)CommentObject(&native_comment_stmt);
+				UT_ASSERT_EQ(caught, 1);
+				UT_ASSERT_EQ(error_code, failure == 0 ? ERRCODE_DATA_CORRUPTED
+										 : failure == 1 || failure == 2
+											 ? ERRCODE_FEATURE_NOT_SUPPORTED
+											 : ERRCODE_INTERNAL_ERROR);
+				UT_ASSERT_EQ(comment_database_lookups, 0);
+				UT_ASSERT_EQ(comment_object_lookups, 0);
+				UT_ASSERT_EQ(utility_xids, allocated ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, allocated ? 1 : 0);
+				UT_ASSERT_EQ(utility_binds, failure == 2 ? 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid,
+							 allocated || failure == 3 ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	comment_lookup_active = false;
+}
+
+UT_TEST(test_native_comment_context_guards_keep_nonshared_native_route)
+{
+	for (unsigned database = 0; database < 2; database++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+
+			for (unsigned guard = 0; guard < 3; guard++) {
+				int caught;
+
+				reset_native_comment(binds, database != 0);
+				cluster_shared_catalog = (mode & 1) != 0;
+				utility_storage_mode = (mode & 2) != 0;
+				cluster_shared_config = (mode & 4) != 0;
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					(void)CommentObject(&native_comment_stmt);
+				UT_ASSERT_EQ(caught, binds ? 1 : 2);
+				UT_ASSERT_EQ(error_code, !binds		  ? 0
+										 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+													  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				UT_ASSERT_EQ(comment_database_lookups, binds ? 0 : database);
+				UT_ASSERT_EQ(comment_object_lookups, binds ? 0 : 1);
+				UT_ASSERT_EQ(comment_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids, 0);
+				UT_ASSERT_EQ(utility_prepares, 0);
+				UT_ASSERT_EQ(utility_binds, 0);
+			}
+		}
+	}
+	comment_lookup_active = false;
+}
+
+UT_TEST(test_native_comment_utility_warm_binding_and_context_rejection_preserve_top)
+{
+	for (unsigned database = 0; database < 2; database++) {
+		for (unsigned guard = 0; guard < 4; guard++) {
+			int caught;
+
+			reset_native_comment(true, database != 0);
+			create_sql_entry((Node *)&native_comment_stmt);
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			XactReadOnly = guard == 1;
+			utility_parallel = guard == 2;
+			utility_recovery = guard == 3;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				(void)CommentObject(&native_comment_stmt);
+			UT_ASSERT_EQ(caught, guard ? 1 : 2);
+			UT_ASSERT_EQ(error_code, !guard		  ? 0
+									 : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+												  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT_EQ(comment_database_lookups, guard ? 0 : database);
+			UT_ASSERT_EQ(comment_object_lookups, guard ? 0 : 1);
+			UT_ASSERT_EQ(comment_unbound, 0);
+			UT_ASSERT_EQ(comment_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_prepares, guard ? 1 : 2);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			UT_ASSERT_EQ(utility_top_xid, 400);
+		}
+	}
+	comment_lookup_active = false;
+}
+
+UT_TEST(test_native_comment_missing_database_retains_early_return_and_binding_cost)
+{
+	for (unsigned mode = 0; mode < 8; mode++) {
+		bool binds = mode == 3 || mode == 7;
+
+		reset_native_comment(binds, true);
+		cluster_shared_catalog = (mode & 1) != 0;
+		utility_storage_mode = (mode & 2) != 0;
+		cluster_shared_config = (mode & 4) != 0;
+		comment_database_exists = false;
+		for (unsigned repeat = 0; repeat < 2; repeat++) {
+			ObjectAddress address = { 1, 2, 3 };
+			int caught = sigsetjmp(boundary, 1);
+
+			if (!caught)
+				address = CommentObject(&native_comment_stmt);
+			UT_ASSERT_EQ(caught, 0);
+			UT_ASSERT_EQ(error_code, 0);
+			UT_ASSERT_EQ(address.classId, InvalidObjectAddress.classId);
+			UT_ASSERT_EQ(address.objectId, InvalidObjectAddress.objectId);
+			UT_ASSERT_EQ(address.objectSubId, InvalidObjectAddress.objectSubId);
+			UT_ASSERT_EQ(comment_database_lookups, repeat + 1);
+			UT_ASSERT_EQ(comment_object_lookups, 0);
+			UT_ASSERT_EQ(comment_unbound, 0);
+			UT_ASSERT_EQ(comment_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+			UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+			UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+		}
+	}
+	comment_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(80);
+	UT_PLAN(85);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -6842,6 +7071,11 @@ main(void)
 	UT_RUN(test_native_schema_refusal_child_or_wrong_top_precedes_catalog_lock);
 	UT_RUN(test_native_schema_context_guards_precede_binding_and_preserve_nonshared_route);
 	UT_RUN(test_native_schema_utility_prebinding_reuses_same_top_before_lookup);
+	UT_RUN(test_native_comment_binds_before_database_and_object_lookup_in_all_profiles);
+	UT_RUN(test_native_comment_refusal_child_and_wrong_top_precede_all_lookups);
+	UT_RUN(test_native_comment_context_guards_keep_nonshared_native_route);
+	UT_RUN(test_native_comment_utility_warm_binding_and_context_rejection_preserve_top);
+	UT_RUN(test_native_comment_missing_database_retains_early_return_and_binding_cost);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
