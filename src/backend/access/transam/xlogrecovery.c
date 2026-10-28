@@ -1697,7 +1697,7 @@ cluster_recovery_cold_page_step_result(ClusterColdCtrcPageProgressV1 *progress,
 		|| step->inserted.record_end != 0 || step->inserted.wal_flushed) {
 		progress->result = *step;
 		progress->pending = true;
-		if (step->phase == RF_PAGE_CTRC_STEP_TARGET_SYNCED
+		if (step->phase == RF_PAGE_CTRC_STEP_FPI_DURABLE
 			&& step->inserted.window.key.window_seq != 0 && step->inserted.wal_flushed
 			&& step->inserted.record_start < step->inserted.record_end)
 			return RF_PAGE_PROOF_DETAIL_OK;
@@ -1747,7 +1747,7 @@ cluster_recovery_cold_page_attempt(const struct ClusterRecoveryStartV1 *start,
 			detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
 			if (page.verdict == RF_PAGE_AUTHORITY_OK && authority != NULL
 				&& cluster_recovery_cold_page_advance_current(start, work, scope, progress)) {
-				RfPageCtrcStepResultV1 step = rf_page_recovery_ctrc_replays_itl_graph_step_smgr_v1(
+				RfPageCtrcStepResultV1 step = rf_page_recovery_ctrc_replays_itl_graph_durable_smgr_v1(
 					start, work, &start->ctrc_page_sources[source_index], authority,
 					&physical_page->reservation.identity, view->page_identity.blockno,
 					&view->expected_result, view->canonical_page, start->ctrc_physical->entries,

@@ -75,11 +75,14 @@ ClusterControlRootResult cluster_wal_writer_check(const ClusterWalWriterToken *w
 void XLogFlush(XLogRecPtr end);
 static void *native_stamp_alloc(Size size);
 static void native_stamp_free(void *pointer);
+bool native_stamp_original_durable(const ClusterRecoveryStampHandleV1 *handle);
+#define cluster_recovery_stamp_durable_v1 native_stamp_original_durable
 #define palloc native_stamp_alloc
 #define pfree native_stamp_free
 #include "../../backend/cluster/cluster_recovery_plan.c"
 #undef palloc
 #undef pfree
+#undef cluster_recovery_stamp_durable_v1
 
 static ClusterRecoveryPlanShmem native_fpi_region;
 static PGAlignedBlock native_fpi_top_storage;
@@ -451,6 +454,7 @@ bool native_install_original_writer_installed(ClusterWalWriterToken *writer,
 #include "test_cluster_ctrc_native_step.inc"
 #include "test_cluster_ctrc_native_graph_step.inc"
 #include "test_cluster_ctrc_native_page_fd.inc"
+#include "test_cluster_ctrc_native_durable.inc"
 
 int
 main(int argc, char **argv)
@@ -459,6 +463,18 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_NATIVE_FPI_DURABLE") != NULL) {
+		UT_PLAN(8);
+		UT_RUN(test_native_durable_marks_under_original_page_and_fd);
+		UT_RUN(test_native_durable_snapshot_is_exact_and_read_only);
+		UT_RUN(test_native_durable_transition_refusal_keeps_inserted_debt);
+		UT_RUN(test_native_durable_post_transition_drift_fails_exact_window);
+		UT_RUN(test_native_durable_error_keeps_original_phase_and_debt);
+		UT_RUN(test_native_durable_close_failure_retains_durable_failed_debt);
+		UT_RUN(test_native_durable_requires_successful_sync_and_postread);
+		UT_RUN(test_native_durable_preserves_old_entry_and_noop_contracts);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_NATIVE_GRAPH_STEP") != NULL) {
 		UT_PLAN(4);
 		UT_RUN(test_native_graph_step_accepts_only_storage_checksum_normalization);
@@ -477,7 +493,15 @@ main(int argc, char **argv)
 		UT_RUN(test_native_step_fixed_fd_close_failure_cannot_claim_target_synced);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(52);
+	UT_PLAN(60);
+	UT_RUN(test_native_durable_marks_under_original_page_and_fd);
+	UT_RUN(test_native_durable_snapshot_is_exact_and_read_only);
+	UT_RUN(test_native_durable_transition_refusal_keeps_inserted_debt);
+	UT_RUN(test_native_durable_post_transition_drift_fails_exact_window);
+	UT_RUN(test_native_durable_error_keeps_original_phase_and_debt);
+	UT_RUN(test_native_durable_close_failure_retains_durable_failed_debt);
+	UT_RUN(test_native_durable_requires_successful_sync_and_postread);
+	UT_RUN(test_native_durable_preserves_old_entry_and_noop_contracts);
 	UT_RUN(test_native_step_fixed_fd_precedes_page_and_covers_all_io);
 	UT_RUN(test_native_step_fixed_fd_open_failure_precedes_page_and_wal);
 	UT_RUN(test_native_step_fixed_fd_gap_loss_cannot_insert);

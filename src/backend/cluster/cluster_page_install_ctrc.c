@@ -60,6 +60,7 @@ typedef struct CtrcNativeStepV1 {
 	const char *original_canonical;
 	PGAlignedBlock canonical;
 	ClusterSharedFsPageV1 *storage;
+	bool publish_durable;
 } CtrcNativeStepV1;
 
 typedef struct CtrcNativeReadV1 {
@@ -553,6 +554,7 @@ typedef struct CtrcNativeInstallV1 {
 	const RfPageCtrcFpiInsertV1 *original;
 	RfPageCtrcFpiInsertV1 fixed;
 	PGAlignedBlock space0, space1;
+	bool publish_durable;
 } CtrcNativeInstallV1;
 
 static bool
@@ -630,6 +632,34 @@ ctrc_native_install_storage_current(const CtrcNativeInstallV1 *context, SMgrRela
 	return ctrc_native_install_current(context)
 		&& ctrc_native_read_target_current(&context->binding.read, relation)
 		&& ctrc_native_install_current(context);
+}
+
+/* Called only inside the original successful install attempt: both full-work
+ * snapshots, exact PAGE and pre-WAL raw descriptors are still alive. A later
+ * saved target_synced value cannot enter this path. Keep the DURABLE window
+ * pending so late loss or descriptor-close failure retains exact failed debt. */
+static bool
+ctrc_native_install_publish_durable(const CtrcNativeInstallV1 *context)
+{
+	const RfPageCtrcFpiInsertV1 *fixed = &context->fixed;
+	TimeLineID timeline;
+
+	if (context->binding.read.step == NULL || context->binding.read.step->storage == NULL
+		|| !ctrc_native_install_storage_current(context, NULL)
+		|| !cluster_recovery_stamp_durable_v1(&fixed->window))
+		return false;
+	return memcmp(context->original, fixed, sizeof(*fixed)) == 0 && fixed->wal_flushed
+		&& ctrc_native_insert_current(&context->binding, fixed)
+		&& cluster_recovery_stamp_fpi_durable_current_v1(&fixed->window,
+			fixed->record_start, fixed->record_end)
+		&& cluster_wal_writer_check(&fixed->window.owner.writer) == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& GetFlushRecPtr(&timeline) >= fixed->record_end
+		&& timeline == fixed->window.owner.writer.ref.timeline
+		&& ctrc_native_read_target_current(&context->binding.read, NULL)
+		&& memcmp(context->original, fixed, sizeof(*fixed)) == 0
+		&& ctrc_native_insert_current(&context->binding, fixed)
+		&& cluster_recovery_stamp_fpi_durable_current_v1(&fixed->window,
+			fixed->record_start, fixed->record_end);
 }
 
 static bool
@@ -745,6 +775,8 @@ ctrc_native_install_attempt(CtrcNativeInstallV1 *context,
 				memcpy((void *)snapshot, work, context->binding.work_bytes);
 				context->binding.snapshot = (const ClusterColdCtrcWorkV1 *)snapshot;
 				completed = ctrc_native_install_image(context, authority);
+				if (completed && context->publish_durable)
+					completed = ctrc_native_install_publish_durable(context);
 			}
 		}
 		if (!completed) (void)cluster_recovery_stamp_fail_v1(&context->fixed.window);
@@ -971,10 +1003,14 @@ ctrc_native_step_execute(CtrcNativeStepV1 *context, RfPageCtrcAuthorityV1 *autho
 	memcpy(&install.fixed, &result->inserted, sizeof(install.fixed));
 	install.binding.read.step = context;
 	install.binding.read.step_current = ctrc_native_step_current;
+	install.publish_durable = context->publish_durable;
 	if (ctrc_native_install_attempt(&install, context->start, context->work,
 			context->original_source, authority, count, memory_budget)
 		&& ctrc_native_step_current(context))
-		result->phase = RF_PAGE_CTRC_STEP_TARGET_SYNCED;
+		result->phase = context->publish_durable ? RF_PAGE_CTRC_STEP_FPI_DURABLE
+			: RF_PAGE_CTRC_STEP_TARGET_SYNCED;
+	else if (context->publish_durable)
+		(void)cluster_recovery_stamp_fail_v1(&result->inserted.window);
 }
 
 /* Binding/result belong to the caller's frame, outside this setjmp. */
@@ -1029,7 +1065,7 @@ ctrc_native_itl_step(const struct ClusterRecoveryStartV1 *start,
 	const ClusterColdCtrcWorkV1 *work, const ClusterRecoveryCtrcReplaySetSourceV1 *source,
 	RfPageCtrcAuthorityV1 *authority, const ClusterSpaceIdentity *space,
 	BlockNumber blockno, const RfPageVersionV1 *expected_before, const char *canonical,
-	const ClusterRecoveryUndoEntry *physical, Size physical_count, Size memory_budget)
+	const ClusterRecoveryUndoEntry *physical, Size physical_count, Size memory_budget, bool publish_durable)
 {
 	RfPageCtrcStepResultV1 result = {0};
 	CtrcNativeStepV1 context = {0};
@@ -1064,6 +1100,7 @@ ctrc_native_itl_step(const struct ClusterRecoveryStartV1 *start,
 		return result;
 	memcpy(&header, work, offsetof(ClusterColdCtrcWorkV1, entries));
 	context.start = start; context.work = work;
+	context.publish_durable = publish_durable;
 	context.original_source = source; memcpy(&context.source, source, sizeof(context.source));
 	context.original_space = space; memcpy(&context.space, space, sizeof(context.space));
 	if (space->state != CLUSTER_SPACE_IDENTITY_LIVE
@@ -1086,7 +1123,7 @@ rf_page_recovery_ctrc_replays_itl_step_smgr_v1(const struct ClusterRecoveryStart
 	const ClusterRecoveryUndoEntry *physical, Size physical_count, Size memory_budget)
 {
 	return ctrc_native_itl_step(start, work, source, authority, space, blockno,
-		expected_before, NULL, physical, physical_count, memory_budget);
+		expected_before, NULL, physical, physical_count, memory_budget, false);
 }
 
 RfPageCtrcStepResultV1
@@ -1098,6 +1135,18 @@ rf_page_recovery_ctrc_replays_itl_graph_step_smgr_v1(const struct ClusterRecover
 {
 	if (canonical == NULL) return (RfPageCtrcStepResultV1){0};
 	return ctrc_native_itl_step(start, work, source, authority, space, blockno,
-		expected_before, canonical, physical, physical_count, memory_budget);
+		expected_before, canonical, physical, physical_count, memory_budget, false);
+}
+
+RfPageCtrcStepResultV1
+rf_page_recovery_ctrc_replays_itl_graph_durable_smgr_v1(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, const ClusterRecoveryCtrcReplaySetSourceV1 *source,
+	RfPageCtrcAuthorityV1 *authority, const ClusterSpaceIdentity *space,
+	BlockNumber blockno, const RfPageVersionV1 *expected_before, const char canonical[BLCKSZ],
+	const ClusterRecoveryUndoEntry *physical, Size physical_count, Size memory_budget)
+{
+	if (canonical == NULL) return (RfPageCtrcStepResultV1){0};
+	return ctrc_native_itl_step(start, work, source, authority, space, blockno,
+		expected_before, canonical, physical, physical_count, memory_budget, true);
 }
 #endif /* USE_PGRAC_CLUSTER */

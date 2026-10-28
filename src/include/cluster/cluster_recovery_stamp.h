@@ -271,6 +271,10 @@ extern bool cluster_recovery_stamp_ctrc_execute_reference_v2(
  * authority, transition or completion is supplied by this observation. */
 extern bool cluster_recovery_stamp_fpi_inserted_current_v1(
 	const ClusterRecoveryStampHandleV1 *handle, XLogRecPtr start, XLogRecPtr end);
+/* Same read-only exact observation, requiring original nonfailed DURABLE.
+ * This snapshot supplies no FD lifetime, discharge or service authority. */
+extern bool cluster_recovery_stamp_fpi_durable_current_v1(
+	const ClusterRecoveryStampHandleV1 *handle, XLogRecPtr start, XLogRecPtr end);
 /* Only the original executor calls durable after real WAL flush and exact
  * target sync/postread. These APIs record completion, never prove it. */
 extern bool cluster_recovery_stamp_durable_v1(const ClusterRecoveryStampHandleV1 *handle);
