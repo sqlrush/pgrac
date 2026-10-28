@@ -7595,7 +7595,7 @@ UT_TEST(test_retained_slot_identity_does_not_escape_original_final_fences)
 int
 main(void)
 {
-	UT_PLAN(292);
+	UT_PLAN(297);
 	UT_RUN(test_operation_worker_real_builder_yields_before_visibility);
 	UT_RUN(test_operation_worker_real_origin_completes_private_inverse);
 	UT_RUN(test_operation_worker_pending_current_is_bounded_and_counts_once);
@@ -7610,6 +7610,11 @@ main(void)
 	UT_RUN(test_operation_worker_chain_limit_never_counts_pending_ticks);
 	UT_RUN(test_operation_worker_unadmitted_operation_has_no_authority);
 	UT_RUN(test_operation_worker_active_sample_survives_later_commit);
+	UT_RUN(test_operation_worker_changed_commit_scn_refuses_older_inverse);
+	UT_RUN(test_operation_worker_committed_regression_refuses_older_inverse);
+	UT_RUN(test_operation_worker_aborted_to_commit_refuses_older_inverse);
+	UT_RUN(test_operation_worker_stable_abort_allows_older_inverse);
+	UT_RUN(test_operation_worker_active_to_abort_remains_conservative);
 	UT_RUN(test_operation_worker_error_then_original_forget_is_idempotent);
 	UT_RUN(test_operation_worker_surviving_live_refuses_full);
 	UT_RUN(test_operation_worker_same_segment_cohort_waits_and_cancel_hands_off);

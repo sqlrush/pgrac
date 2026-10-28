@@ -493,6 +493,133 @@ UT_TEST(test_operation_worker_active_sample_survives_later_commit)
 	cluster_cr_build_on_holder_forget(0, 1000);
 }
 
+/* Stop after the actual newer inverse, before the next TT observation. */
+static void
+operation_worker_first_inverse(OperationWorkerFixture *f)
+{
+	for (int tick = 0; tick < 32 && operation_cr_has_child(f->cr.source.data); tick++)
+		UT_ASSERT_EQ(operation_worker_step(f), CLUSTER_R4_CR_STEP_PENDING);
+	UT_ASSERT(!operation_cr_has_child(f->cr.source.data));
+	UT_ASSERT(ItemIdIsNormal(PageGetItemId((Page)f->cr.source.data, 2)));
+	UT_ASSERT_EQ(f->extension.build_steps, 1);
+	UT_ASSERT_EQ(test_candidate_acquire_calls, 3);
+	UT_ASSERT_EQ(test_candidate_held_count, 0);
+}
+
+UT_TEST(test_operation_worker_changed_commit_scn_refuses_older_inverse)
+{
+	OperationWorkerFixture f;
+	PGAlignedBlock remaining;
+	ClusterR4CrBuildStepResult step;
+
+	operation_worker_init(&f, false);
+	operation_worker_two_records(&f);
+	operation_worker_first_inverse(&f);
+	memcpy(remaining.data, f.cr.source.data, BLCKSZ);
+	test_tt_slot.commit_scn++;
+	step = operation_worker_finish(&f);
+	cluster_cr_build_on_holder_forget(0, 1000);
+	UT_ASSERT_EQ(step, CLUSTER_R4_CR_STEP_FAIL);
+	UT_ASSERT_EQ(f.reason, CLUSTER_CR_BUILD_BAD_UNDO);
+	UT_ASSERT_EQ(memcmp(remaining.data, f.cr.source.data, BLCKSZ), 0);
+	UT_ASSERT_EQ(test_candidate_acquire_calls, 6);
+	UT_ASSERT_EQ(test_candidate_held_count, 0);
+}
+
+UT_TEST(test_operation_worker_committed_regression_refuses_older_inverse)
+{
+	for (int aborted = 0; aborted < 2; aborted++) {
+		OperationWorkerFixture f;
+		PGAlignedBlock remaining;
+		ClusterR4CrBuildStepResult step;
+
+		operation_worker_init(&f, false);
+		operation_worker_two_records(&f);
+		operation_worker_first_inverse(&f);
+		memcpy(remaining.data, f.cr.source.data, BLCKSZ);
+		test_tt_slot.status = aborted ? TT_SLOT_ABORTED : TT_SLOT_ACTIVE;
+		test_tt_slot.commit_scn = InvalidScn;
+		test_native_status = aborted ? TRANSACTION_STATUS_ABORTED : TRANSACTION_STATUS_IN_PROGRESS;
+		test_twophase_xid = TEST_ORIGIN_XID;
+		test_current_owner_available = true;
+		step = operation_worker_finish(&f);
+		cluster_cr_build_on_holder_forget(0, 1000);
+		UT_ASSERT_EQ(step, CLUSTER_R4_CR_STEP_FAIL);
+		UT_ASSERT_EQ(f.reason, CLUSTER_CR_BUILD_BAD_UNDO);
+		UT_ASSERT_EQ(memcmp(remaining.data, f.cr.source.data, BLCKSZ), 0);
+		UT_ASSERT_EQ(test_candidate_acquire_calls, 6);
+		UT_ASSERT_EQ(test_candidate_held_count, 0);
+	}
+}
+
+UT_TEST(test_operation_worker_aborted_to_commit_refuses_older_inverse)
+{
+	OperationWorkerFixture f;
+	PGAlignedBlock remaining;
+	ClusterR4CrBuildStepResult step;
+
+	operation_worker_init(&f, false);
+	operation_worker_two_records(&f);
+	test_tt_slot.status = TT_SLOT_ABORTED;
+	test_tt_slot.commit_scn = InvalidScn;
+	test_native_status = TRANSACTION_STATUS_ABORTED;
+	operation_worker_first_inverse(&f);
+	memcpy(remaining.data, f.cr.source.data, BLCKSZ);
+	test_tt_slot.status = TT_SLOT_COMMITTED;
+	test_tt_slot.commit_scn = 80;
+	test_native_status = TRANSACTION_STATUS_COMMITTED;
+	step = operation_worker_finish(&f);
+	cluster_cr_build_on_holder_forget(0, 1000);
+	UT_ASSERT_EQ(step, CLUSTER_R4_CR_STEP_FAIL);
+	UT_ASSERT_EQ(f.reason, CLUSTER_CR_BUILD_BAD_UNDO);
+	UT_ASSERT_EQ(memcmp(remaining.data, f.cr.source.data, BLCKSZ), 0);
+	UT_ASSERT_EQ(test_candidate_acquire_calls, 6);
+	UT_ASSERT_EQ(test_candidate_held_count, 0);
+}
+
+UT_TEST(test_operation_worker_stable_abort_allows_older_inverse)
+{
+	OperationWorkerFixture f;
+
+	operation_worker_init(&f, false);
+	operation_worker_two_records(&f);
+	test_tt_slot.status = TT_SLOT_ABORTED;
+	test_tt_slot.commit_scn = InvalidScn;
+	test_native_status = TRANSACTION_STATUS_ABORTED;
+	UT_ASSERT_EQ(operation_worker_finish(&f), CLUSTER_R4_CR_STEP_FULL);
+	UT_ASSERT(!ItemIdIsUsed(PageGetItemId((Page)f.cr.source.data, 2)));
+	UT_ASSERT(!ItemIdIsUsed(PageGetItemId((Page)f.cr.source.data, 3)));
+	UT_ASSERT_EQ(test_candidate_acquire_calls, 6);
+	UT_ASSERT_EQ(test_candidate_held_count, 0);
+	cluster_cr_build_on_holder_forget(0, 1000);
+}
+
+UT_TEST(test_operation_worker_active_to_abort_remains_conservative)
+{
+	OperationWorkerFixture f;
+	UndoRecordHeader *older;
+	char *tail;
+
+	operation_worker_init(&f, false);
+	operation_worker_two_records(&f);
+	older = (UndoRecordHeader *)(test_operation_page.data + sizeof(UndoBlockHeader));
+	tail = (char *)(older + 1) + older->payload_length - sizeof(UndoOperationTrailer);
+	tail[offsetof(UndoOperationTrailer, effect_state)] = CLUSTER_SAVEPOINT_EFFECT_LIVE;
+	test_tt_slot.status = TT_SLOT_ACTIVE;
+	test_tt_slot.commit_scn = InvalidScn;
+	test_native_status = TRANSACTION_STATUS_IN_PROGRESS;
+	test_twophase_xid = TEST_ORIGIN_XID;
+	test_current_owner_available = true;
+	operation_worker_first_inverse(&f);
+	test_tt_slot.status = TT_SLOT_ABORTED;
+	test_native_status = TRANSACTION_STATUS_ABORTED;
+	UT_ASSERT_EQ(operation_worker_finish(&f), CLUSTER_R4_CR_STEP_FULL);
+	UT_ASSERT(!ItemIdIsUsed(PageGetItemId((Page)f.cr.source.data, 2)));
+	UT_ASSERT_EQ(test_candidate_acquire_calls, 6);
+	UT_ASSERT_EQ(test_candidate_held_count, 0);
+	cluster_cr_build_on_holder_forget(0, 1000);
+}
+
 static int operation_worker_error_release;
 
 static void

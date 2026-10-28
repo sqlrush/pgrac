@@ -777,8 +777,10 @@ typedef struct CrR4OperationTop {
 	struct CrR4OperationTop *next;
 	ClusterTTSlotPhysicalLocator canonical;
 	uint32 generation;
+	ClusterTxOutcome terminal_outcome;
 	FullTransactionId top_fxid;
 	uint64 last_sequence;
+	SCN terminal_commit_scn;
 	bool conservative;
 } CrR4OperationTop;
 
@@ -850,7 +852,8 @@ cluster_cr_build_on_holder_origin_active(void)
 
 /* A repeated canonical slot must keep the same complete transaction identity
  * and visit older operation sequences. ACTIVE remains conservative even if a
- * later original TT sample observes COMMITTED for this construction. */
+ * later original TT sample observes COMMITTED for this construction. A
+ * terminal sample cannot change under that same complete identity. */
 static bool
 cr_r4_operation_top(CrR4OperationContext *operation, uint32 limit, bool *conservative)
 {
@@ -879,6 +882,15 @@ cr_r4_operation_top(CrR4OperationContext *operation, uint32 limit, bool *conserv
 		top->next = operation->tops;
 		operation->tops = top;
 		operation->top_count++;
+	}
+	if (top->terminal_outcome != CLUSTER_TX_UNKNOWN
+		&& (top->terminal_outcome != operation->top.outcome
+			|| (top->terminal_outcome == CLUSTER_TX_COMMITTED
+				&& top->terminal_commit_scn != operation->top.commit_scn)))
+		return false;
+	if (operation->top.outcome != CLUSTER_TX_IN_PROGRESS) {
+		top->terminal_outcome = operation->top.outcome;
+		top->terminal_commit_scn = operation->top.commit_scn;
 	}
 	top->last_sequence = identity->operation_sequence;
 	top->conservative |= operation->top.outcome == CLUSTER_TX_IN_PROGRESS;
