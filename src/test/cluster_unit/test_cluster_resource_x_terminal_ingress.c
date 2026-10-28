@@ -362,10 +362,12 @@ gcs_block_resource_x_gate_session_recheck(const BufferTag *tag, const ResourceXG
 static ResourceXApplyResult
 gcs_block_pcm_x_resource_x_join_terminal_owned_try(const ResourceXAcquisitionRef *input,
 												   bool scheduled_retry,
+	const ClusterSemanticAdmissionToken *admission,
 												   ResourceXAcquisitionRef *ref, uint64 *ownership,
 												   uint64 *authority)
 {
 	(void)scheduled_retry;
+	UT_ASSERT(admission != NULL && admission->entered);
 	installs++;
 	ref->assertion = input->assertion;
 	ref->formation = 17;
@@ -543,10 +545,12 @@ cluster_pcm_lock_resource_x_delivery_complete_exact(const ResourceXDeliveryClaim
 static ResourceXApplyResult
 gcs_block_pcm_x_resource_x_join_terminal_try(const ResourceXAssertion *assertion, bool retry,
 											 const ResourceXDeliveryClaim *claim,
+	const ClusterSemanticAdmissionToken *admission,
 											 ResourceXAcquisitionRef *out, uint64 *generation,
 											 uint64 *authority)
 {
 	UT_ASSERT(retry && delivery_active);
+	UT_ASSERT(admission != NULL && admission->entered);
 	UT_ASSERT_EQ(claim->executor_sequence, delivery_sequence);
 	UT_ASSERT(resource_x_assertion_equal(assertion, &delivery_ref.assertion));
 	installs++;

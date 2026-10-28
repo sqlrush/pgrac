@@ -7898,6 +7898,163 @@ UT_TEST(test_image_publication_cannot_be_forged_through_ordinary_publication_api
 	}
 }
 
+/* Actual GCS receipt preparation/apply/cancel uses the complete shared engine
+ * above. Only original HELLO/admission sampling and physical copy scheduling
+ * remain controlled here; these cases do not run native transport or PCM. */
+static ClusterCtrcParticipantIdentity install_test_sender, install_test_receiver;
+static bool install_test_peer_current;
+static unsigned install_test_fail_closed;
+static uint64
+install_test_self_boot(void)
+{
+	return install_test_receiver.boot_incarnation;
+}
+static bool
+gcs_block_pcm_x_resource_x_peer_ready_exact(int32 source, uint32 *connection)
+{
+	*connection = 11;
+	return source == install_test_sender.node_id && install_test_peer_current;
+}
+static bool
+gcs_block_resource_x_ctrc_source_identities(const ClusterSemanticAdmissionToken *admission,
+	int32 source, uint32 connection, uint64 boot, ClusterCtrcParticipantIdentity *receiver,
+	ClusterCtrcParticipantIdentity *sender)
+{
+	*sender = install_test_sender;
+	*receiver = install_test_receiver;
+	return install_test_peer_current && admission != NULL && admission->entered
+		&& source == sender->node_id && connection == 11 && boot == receiver->boot_incarnation;
+}
+#define cluster_qvotec_get_self_incarnation install_test_self_boot
+#include "test_cluster_gcs_image_receive.inc"
+#define gcs_block_resource_x_fail_closed_current() (install_test_fail_closed++)
+#include "test_cluster_gcs_image_receipts.inc"
+#undef gcs_block_resource_x_fail_closed_current
+#undef cluster_qvotec_get_self_incarnation
+
+static bool
+install_test_setup(ResourceXDecodedFrame *frame, ResourceXAcquisitionRef *ref,
+	ClusterPcmOwnSnapshot *base, ClusterSemanticAdmissionToken *admission,
+	ClusterCtrcReceiptHandle *source)
+{
+	ClusterCtrcParticipantIdentity receiver;
+	ClusterItlSlotData slot;
+	uint8 record[224];
+	uint64 index;
+	Page page;
+
+	if (!seed_delegation_receive(source, &receiver, &slot, record, &index))
+		return false;
+	install_test_sender = source->participant->identity;
+	install_test_receiver = receiver;
+	install_test_peer_current = true;
+	install_test_fail_closed = 0;
+	memset(frame, 0, sizeof(*frame));
+	memset(ref, 0, sizeof(*ref));
+	memset(base, 0, sizeof(*base));
+	memset(admission, 0, sizeof(*admission));
+	admission->entered = true;
+	base->tag.spcOid = 1663;
+	base->tag.dbOid = 5;
+	base->tag.relNumber = 9001;
+	base->tag.forkNum = MAIN_FORKNUM;
+	base->tag.blockNum = 44;
+	base->pcm_state = PCM_STATE_N;
+	base->generation = 16;
+	ref->assertion.resource = base->tag;
+	ref->assertion.requester_node = receiver.node_id;
+	ref->formation = 7;
+	ref->acquisition_generation = 19;
+	frame->kind = RESOURCE_X_WIRE_IMAGE_ENVELOPE;
+	frame->common.logical_assertion = ref->assertion;
+	frame->common.resource_formation = ref->formation;
+	frame->common.assertion_sequence = ref->acquisition_generation;
+	frame->common.sender_connection_generation = 12345;
+	frame->body.image_envelope.image_length = BLCKSZ;
+	gcs_block_resource_x_put_u32(frame->body.image_envelope.source_fence, install_test_sender.node_id);
+	gcs_block_resource_x_put_u64(frame->body.image_envelope.source_fence + 4,
+		install_test_sender.boot_incarnation);
+	page = (Page)frame->body.image_envelope.page_bytes;
+	((PageHeader)page)->pd_flags = PD_HAS_ITL;
+	((PageHeader)page)->pd_lower = SizeOfPageHeaderData;
+	((PageHeader)page)->pd_upper = BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE;
+	((PageHeader)page)->pd_special = BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE;
+	PageSetPageSizeAndVersion(page, BLCKSZ, PG_PAGE_LAYOUT_VERSION);
+	PageSetLSNPreserveOrigin(page, 100);
+	PageSetLSNOrigin(page, 1);
+	((PageHeader)page)->pd_block_scn = 80;
+	ClusterPageGetItlSlots(page)[0] = slot;
+	frame->body.image_envelope.ctrc_delegation_bytes = 8 + 224;
+	frame->body.image_envelope.ctrc_delegation[1] = RESOURCE_X_CTRC_BUNDLE_VERSION;
+	frame->body.image_envelope.ctrc_delegation[3] = 8 + 224;
+	frame->body.image_envelope.ctrc_delegation[5] = 1;
+	memcpy(frame->body.image_envelope.ctrc_delegation + 8, record, sizeof(record));
+	return true;
+}
+
+UT_TEST(test_actual_gcs_install_receipt_binds_original_fullxid_and_cancels_only_before_copy)
+{
+	for (unsigned applied = 0; applied < 2; applied++) {
+		ResourceXDecodedFrame frame;
+		ResourceXAcquisitionRef ref;
+		ClusterPcmOwnSnapshot base;
+		ClusterSemanticAdmissionToken admission;
+		ClusterCtrcReceiptHandle source;
+		GcsBlockCtrcImageInstall install = { 0 };
+		PGAlignedBlock resident;
+		ClusterCtrcReceiptHandle *image = &install.receipts[0];
+
+		UT_ASSERT(install_test_setup(&frame, &ref, &base, &admission, &source));
+		UT_ASSERT(gcs_block_resource_x_ctrc_image_prepare(&install, &frame, &admission, &ref, &base, 9));
+		UT_ASSERT(install.ready && image->valid);
+		if (!image->valid)
+			return;
+		UT_ASSERT_EQ(image->receipt->state, CTRC_RECEIPT_PREPARED);
+		UT_ASSERT(FullTransactionIdEquals(source.original_full_xid, image->original_full_xid));
+		UT_ASSERT_EQ(image->participant->delegation_parent.sequence, 1);
+		UT_ASSERT_EQ(source.participant->delegation_count, 1);
+		if (applied) {
+			install.copy_started = true; /* Same edge as original physical-copy owner. */
+			memcpy(resident.data, frame.body.image_envelope.page_bytes, BLCKSZ);
+			UT_ASSERT(gcs_block_resource_x_ctrc_image_apply(&install, resident.data));
+			UT_ASSERT_EQ(image->receipt->state, CTRC_RECEIPT_APPLIED);
+			UT_ASSERT_EQ(image->receipt->target.itl_slot_index, 0);
+			UT_ASSERT_EQ(image->receipt->target.publication_own_generation, 17);
+		}
+		gcs_block_resource_x_ctrc_image_cancel(&install);
+		UT_ASSERT_EQ(image->receipt->state, applied ? CTRC_RECEIPT_APPLIED : CTRC_RECEIPT_CANCELLED);
+		UT_ASSERT_EQ(image->participant->delegation_parent.sequence, 1);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
+UT_TEST(test_actual_gcs_install_refused_after_copy_keeps_prepared_receipt_and_parent)
+{
+	ResourceXDecodedFrame frame;
+	ResourceXAcquisitionRef ref;
+	ClusterPcmOwnSnapshot base;
+	ClusterSemanticAdmissionToken admission;
+	ClusterCtrcReceiptHandle source;
+	GcsBlockCtrcImageInstall install = { 0 };
+	PGAlignedBlock resident;
+	ClusterCtrcReceiptHandle *image = &install.receipts[0];
+
+	UT_ASSERT(install_test_setup(&frame, &ref, &base, &admission, &source));
+	UT_ASSERT(gcs_block_resource_x_ctrc_image_prepare(&install, &frame, &admission, &ref, &base, 9));
+	if (!image->valid)
+		return;
+	install.copy_started = true;
+	memcpy(resident.data, frame.body.image_envelope.page_bytes, BLCKSZ);
+	ClusterPageGetItlSlots(resident.data)[0].wrap++;
+	UT_ASSERT(!gcs_block_resource_x_ctrc_image_apply(&install, resident.data));
+	gcs_block_resource_x_ctrc_image_cancel(&install);
+	UT_ASSERT_EQ(image->receipt->state, CTRC_RECEIPT_PREPARED);
+	UT_ASSERT_EQ(image->participant->prepared_count, 1);
+	UT_ASSERT_EQ(image->participant->delegation_parent.sequence, 1);
+	UT_ASSERT_EQ(source.participant->delegation_count, 1);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
 int
 main(void)
 {
@@ -7905,7 +8062,7 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(179);
+	UT_PLAN(181);
 	UT_RUN(test_prepare_path_namespace_precedes_input_and_resets_output);
 	UT_RUN(test_prepare_path_input_precedes_journal_exhaustion);
 	UT_RUN(test_prepare_path_chain_precedes_locator_and_keeps_blocked_state);
@@ -8088,6 +8245,8 @@ main(void)
 	UT_RUN(test_image_publication_refuses_invalid_target_before_custody_or_sequence);
 	UT_RUN(test_image_publication_keeps_parent_when_journal_is_exhausted);
 	UT_RUN(test_image_publication_cannot_be_forged_through_ordinary_publication_api);
+	UT_RUN(test_actual_gcs_install_receipt_binds_original_fullxid_and_cancels_only_before_copy);
+	UT_RUN(test_actual_gcs_install_refused_after_copy_keeps_prepared_receipt_and_parent);
 	free(CtrcShared);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

@@ -2932,12 +2932,32 @@ test_cluster_page_wal_image.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_b
 	     emit { print } emit && /^}/ { emit=0 } END { if (n != 7 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Exact private IMAGE intent owner; no alternate unit implementation.
+test_cluster_gcs_image_receive.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^gcs_block_resource_x_put_u32\(/ || /^gcs_block_resource_x_put_u64\(/ \
+	       { print "static void"; emit=1; n++ } \
+	     /^gcs_block_resource_x_ctrc_receive_image\(/ { print "static bool"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (n != 3 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_gcs_image_receipts.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^typedef struct GcsBlockCtrcImageInstall / { types=1; n++ } \
+	     types { print } /^} GcsBlockCtrcImageInstall;/ { types=0 } \
+	     /^gcs_block_resource_x_ctrc_image_slots\(/ \
+	       || /^gcs_block_resource_x_ctrc_image_prepare\(/ \
+	       || /^gcs_block_resource_x_ctrc_image_apply\(/ { print "static bool"; emit=1; n++ } \
+	     /^gcs_block_resource_x_ctrc_image_cancel\(/ { print "static void"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (n != 5 || types || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_page_wal_pregrant.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
 	awk '/^[[:space:]]gcs_block_pcm_x_resource_x_install_target_image_exact\(/ { print "static ClusterPcmOwnResult"; emit=1; n++ } \
 	     emit { print } emit && /^}/ { emit=0 } END { if (n != 1) exit 1 }' $< > $@
 
 test_cluster_page_wal: test_cluster_page_wal.c unit_test.h test_cluster_page_wal_insert.inc \
-		test_cluster_page_wal_pregrant.inc test_cluster_page_data_scn.inc \
+		test_cluster_page_wal_pregrant.inc test_cluster_gcs_image_receipts.inc test_cluster_page_data_scn.inc \
 		test_cluster_page_wal_image.inc test_cluster_pcm_checksum_owner.inc \
 		$(top_builddir)/src/backend/storage/lmgr/s_lock.o \
 		test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
@@ -5372,6 +5392,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_page_wal_insert.inc
 	rm -f test_cluster_hw_remaster_native.inc
 	rm -f test_cluster_hw_authority_gate.inc
+	rm -f test_cluster_gcs_image_receipts.inc test_cluster_gcs_image_receive.inc
 	rm -f test_cluster_page_wal_pregrant.inc
 	rm -f test_cluster_page_wal_image.inc
 	rm -f test_cluster_page_flush.inc
@@ -9023,13 +9044,13 @@ test_cluster_ctrc_cleaner test_cluster_ctrc_horizon test_cluster_ctrc_capacity t
 		test_cluster_ctrc_itl_reuse test_cluster_ctrc_successor_fence: \
 		$(top_srcdir)/src/include/storage/proc.h
 
-test_cluster_ctrc_cleaner: test_cluster_ctrc_cleaner.c test_cluster_ctrc_run_pass.inc unit_test.h $(CLUSTER_SCN_O) $(top_builddir)/src/backend/cluster/cluster_xid_stripe.o \
-		$(CLUSTER_UBA_O) \
+test_cluster_ctrc_cleaner: test_cluster_ctrc_cleaner.c test_cluster_ctrc_run_pass.inc test_cluster_gcs_image_receipts.inc test_cluster_gcs_image_receive.inc unit_test.h $(CLUSTER_SCN_O) $(top_builddir)/src/backend/cluster/cluster_xid_stripe.o \
+		$(CLUSTER_UBA_O) $(CLUSTER_RESOURCE_X_IDENTITY_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
 		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< $(CLUSTER_SCN_O) \
 		$(top_builddir)/src/backend/cluster/cluster_xid_stripe.o \
-		$(CLUSTER_UBA_O) \
+		$(CLUSTER_UBA_O) $(CLUSTER_RESOURCE_X_IDENTITY_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) \
 		$(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@

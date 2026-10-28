@@ -219,11 +219,12 @@ SCAN_RULES: Tuple[ScanRule, ...] = (
         "CTRC_RECEIPT_LIFECYCLE",
         (
             "src/backend/access/heap/heapam.c",
+            "src/backend/cluster/cluster_gcs_block.c",
             "src/backend/cluster/cluster_itl_touch.c",
             "src/backend/cluster/cluster_terminal_ref_census.c",
             "src/backend/cluster/cluster_undo_record.c",
         ),
-        r"\b(?:cluster_ctrc_receipt_(?:prepare_shared|prepare_origin_v2|apply_shared|retarget_itl_shared|cancel_shared|discharge_itl_shared)|ctrc_receipt_prepare_shared_internal)\s*\(",
+        r"\b(?:cluster_ctrc_receipt_(?:prepare_shared|prepare_origin_v2|apply_shared|retarget_itl_shared|cancel_shared|discharge_itl_shared)|cluster_ctrc_itl_image_prepare_v1|ctrc_receipt_prepare_shared_internal)\s*\(",
     ),
     ScanRule(
         "CTRC_CLOSE_WIRE",
@@ -576,6 +577,22 @@ for category in ("CTRC_ORIGIN_PROVENANCE", "CTRC_RECEIPT_LIFECYCLE"):
         "CTRC_TARGET_PAGE_PENDING_ITL_SLOT|CTRC_TARGET_EXACT_ITL_SLOT",
         "cluster_ctrc_receipt_apply_shared",
         "cluster_ctrc_receipt_cancel_shared|cluster_ctrc_receipt_discharge_itl_shared|RETAIN_PENDING_PARENT_CLOSE_ACK",
+        "MXA-T40",
+    )
+# Original GCS physical install owns a bounded set of journaled IMAGE intents.
+# Only premutation cleanup may cancel; after copy the receipt/parent survives.
+for category, owners in (
+    ("CTRC_ORIGIN_PROVENANCE", ("gcs_block_resource_x_ctrc_image_prepare",)),
+    ("CTRC_RECEIPT_LIFECYCLE", ("gcs_block_resource_x_ctrc_image_prepare",
+                             "gcs_block_resource_x_ctrc_image_apply",
+                             "gcs_block_resource_x_ctrc_image_cancel")),
+):
+    _classify_owners(
+        category, "src/backend/cluster/cluster_gcs_block.c", owners,
+        "REGISTERED_REFERENCE", "CTRC_REF_IMAGE_ITL_V1",
+        "CTRC_TARGET_PAGE_PENDING_ITL_SLOT|CTRC_TARGET_EXACT_ITL_SLOT",
+        "gcs_block_resource_x_ctrc_image_apply",
+        "PREMUTATION_ONLY:gcs_block_resource_x_ctrc_image_cancel|RETAIN_POSTCOPY_RECEIPT_AND_PARENT",
         "MXA-T40",
     )
 # Ordinary DATA/PI source preparation registers the existing exact ITL
