@@ -798,6 +798,11 @@ typedef struct CrR4KeptTuple {
 
 StaticAssertDecl(sizeof(CrR4KeptTuple) <= 128, "R4 kept tuple exceeds its local node budget");
 
+typedef struct CrR4OperationCoverage {
+	bool target;
+	bool creation;
+} CrR4OperationCoverage;
+
 typedef struct CrR4OperationContext {
 	bool enabled, reading, operation_mode, pending;
 	bool current_owner;
@@ -994,7 +999,7 @@ cr_r4_operation_same_creation(char walk_bytes[BLCKSZ], char result_bytes[BLCKSZ]
  * It cannot cover an older creation or an overlapping replacement TID. */
 static bool
 cr_r4_operation_covers_target(const CrR4OperationContext *operation, const UndoRecordHeader *record,
-							  const BufferTag *tag, const OffsetNumber offsets[2], unsigned count)
+							  const BufferTag *tag)
 {
 	unsigned target_bit = record->target_offset - FirstOffsetNumber;
 
@@ -1002,15 +1007,23 @@ cr_r4_operation_covers_target(const CrR4OperationContext *operation, const UndoR
 		|| record->record_type == UNDO_RECORD_INSERT
 		|| (operation->kept_modified_offsets[target_bit / 8] & (1U << (target_bit % 8))) == 0)
 		return false;
-	for (unsigned i = 0; i < count; i++) {
-		unsigned bit = offsets[i] - FirstOffsetNumber;
-
-		if (offsets[i] != record->target_offset
-			&& (operation->kept_offsets[bit / 8] & (1U << (bit % 8))) != 0)
-			return false;
-	}
 	return cr_r4_operation_same_creation(operation->walk->data, operation->result_page,
 										 record->target_offset);
+}
+
+static OffsetNumber
+cr_r4_operation_creation_offset(const UndoRecordHeader *record, const BufferTag *tag)
+{
+	if (record->record_type == UNDO_RECORD_INSERT && record->target_block == tag->blockNum)
+		return record->target_offset;
+	if (record->record_type == UNDO_RECORD_UPDATE) {
+		UndoUpdatePayload update;
+
+		memcpy(&update, record + 1, sizeof(update));
+		if (update.new_block == tag->blockNum)
+			return update.new_offset;
+	}
+	return InvalidOffsetNumber;
 }
 
 static CrR4KeptTuple *
@@ -1083,22 +1096,14 @@ cr_r4_operation_stage_kept(const CrR4OperationContext *operation, char walk[BLCK
 						   const UndoRecordHeader *record, const BufferTag *tag,
 						   const OffsetNumber offsets[2], unsigned count, CrR4KeptTuple staged[2])
 {
-	OffsetNumber creation_offset = InvalidOffsetNumber;
+	OffsetNumber creation_offset = cr_r4_operation_creation_offset(record, tag);
 	uint16 expected_length = 0;
 
 	if (record->record_type == UNDO_RECORD_INSERT) {
 		UndoInsertPayload insert;
 
 		memcpy(&insert, record + 1, sizeof(insert));
-		if (record->target_block == tag->blockNum)
-			creation_offset = record->target_offset;
 		expected_length = insert.inserted_tuple_len;
-	} else if (record->record_type == UNDO_RECORD_UPDATE) {
-		UndoUpdatePayload update;
-
-		memcpy(&update, record + 1, sizeof(update));
-		if (update.new_block == tag->blockNum)
-			creation_offset = update.new_offset;
 	}
 	for (unsigned i = 0; i < count; i++) {
 		if (!cr_r4_operation_stage_tuple(operation, offsets[i], offsets[i] == creation_offset,
@@ -1145,19 +1150,16 @@ cr_r4_operation_publish_kept(CrR4OperationContext *operation, const CrR4KeptTupl
 /* An absent walk TID is useful only with an explicit distinct kept creator. */
 static bool
 cr_r4_operation_covers_creation(const CrR4OperationContext *operation,
-								const UndoRecordHeader *record, const BufferTag *tag)
+								const UndoRecordHeader *record, OffsetNumber offset)
 {
 	Page walk = operation->walk != NULL ? (Page)operation->walk->data : NULL;
 
-	if (walk == NULL || record->record_type != UNDO_RECORD_INSERT
-		|| record->target_block != tag->blockNum || record->target_offset < FirstOffsetNumber
-		|| record->target_offset > PageGetMaxOffsetNumber(walk)
-		|| ItemIdIsUsed(PageGetItemId(walk, record->target_offset)))
+	if (walk == NULL || offset < FirstOffsetNumber || offset > PageGetMaxOffsetNumber(walk)
+		|| ItemIdIsUsed(PageGetItemId(walk, offset)))
 		return false;
 	for (const CrR4KeptTuple *creation = operation->kept_tuples; creation != NULL;
 		 creation = creation->next)
-		if (creation->creation_bound && creation->offset == record->target_offset
-			&& creation->xid != record->xid
+		if (creation->creation_bound && creation->offset == offset && creation->xid != record->xid
 			&& !FullTransactionIdEquals(creation->creator.operation_fxid,
 										operation->identity.operation_fxid)
 			&& !cluster_undo_record_uba_equal(creation->creator_uba, operation->locator.uba))
@@ -1173,33 +1175,32 @@ static bool
 cr_r4_operation_projection_safe(const CrR4OperationContext *operation, char page_bytes[BLCKSZ],
 								const UndoRecordHeader *record, const BufferTag *tag,
 								const OffsetNumber offsets[2], unsigned count, bool keep,
-								bool *covered_target)
+								CrR4OperationCoverage *coverage)
 {
 	Page page = (Page)(operation->walk != NULL ? operation->walk->data : page_bytes);
 	PageHeader header = (PageHeader)page;
-	bool overlap = false;
-	bool covered_creation = false;
+	OffsetNumber creation_offset = cr_r4_operation_creation_offset(record, tag);
 
-	*covered_target = false;
+	memset(coverage, 0, sizeof(*coverage));
 	for (unsigned i = 0; i < count; i++) {
 		unsigned bit = offsets[i] - FirstOffsetNumber;
-
-		overlap |= (operation->kept_offsets[bit / 8] & (1U << (bit % 8))) != 0;
-	}
-	if (overlap) {
-		covered_creation = cr_r4_operation_covers_creation(operation, record, tag);
-		if (!keep && !covered_creation
-			&& !cr_r4_operation_covers_target(operation, record, tag, offsets, count))
-			return false;
-		*covered_target = !keep || covered_creation;
-	}
-	for (unsigned i = 0; i < count; i++) {
+		bool overlap = (operation->kept_offsets[bit / 8] & (1U << (bit % 8))) != 0;
+		bool covered = false;
 		ItemId item;
 		HeapTupleHeader tuple;
 
+		if (overlap) {
+			if (offsets[i] == creation_offset)
+				covered = coverage->creation
+					= cr_r4_operation_covers_creation(operation, record, creation_offset);
+			else if (!keep)
+				covered = coverage->target = cr_r4_operation_covers_target(operation, record, tag);
+			if (!keep && !covered)
+				return false;
+		}
 		if (offsets[i] > PageGetMaxOffsetNumber(page)
 			|| !ItemIdIsNormal(PageGetItemId(page, offsets[i]))) {
-			if (overlap && !covered_creation)
+			if (overlap && !covered)
 				return false;
 			continue;
 		}
@@ -1216,20 +1217,33 @@ cr_r4_operation_projection_safe(const CrR4OperationContext *operation, char page
 	return true;
 }
 
-/* The whole record has already passed its original inverse on the walk.
- * Project only a disjoint replacement removal; leave the kept root intact. */
+/* The complete WALK inverse has passed. Apply each uncovered RESULT role
+ * through its original primitive, without changing a covered counterpart. */
 static bool
 cr_r4_operation_project_covered(const CrR4OperationContext *operation,
 								const UndoRecordHeader *record, const BufferTag *tag,
-								const ClusterTxLocator *locator, char candidate[BLCKSZ])
+								const ClusterTxLocator *locator,
+								const CrR4OperationCoverage *coverage, char candidate[BLCKSZ])
 {
 	if (record->record_type == UNDO_RECORD_UPDATE) {
 		UndoUpdatePayload update;
+		const char *body = (const char *)(record + 1);
 
-		memcpy(&update, record + 1, sizeof(update));
-		if (update.new_block == tag->blockNum
+		memcpy(&update, body, sizeof(update));
+		if (!coverage->target
+			&& !cluster_cr_history_operation_modify_identity(candidate, tag, record, body))
+			return false;
+		if (update.new_block == tag->blockNum && !coverage->creation
 			&& !cluster_cr_history_remove_creation(candidate, update.new_offset, record->xid, 0))
 			return false;
+		if (record->target_block == tag->blockNum && !coverage->target) {
+			cluster_cr_history_make_restore_space((Page)candidate, record->target_offset,
+												  update.old_tuple_length);
+			if (!cluster_cr_apply_update_inverse(candidate, record, &update,
+												 body + update.old_tuple_offset,
+												 update.old_tuple_length))
+				return false;
+		}
 	}
 	if ((operation->kept_slots & (1U << locator->itl_slot_index)) == 0)
 		ClusterPageGetItlSlots((Page)candidate)[locator->itl_slot_index]
@@ -1249,7 +1263,7 @@ cr_r4_operation_project(CrR4OperationContext *operation, ClusterR4CrSlotExtensio
 	const char *body = (const char *)(record + 1);
 	OffsetNumber offsets[2];
 	unsigned count;
-	bool covered_target;
+	CrR4OperationCoverage coverage;
 	ClusterItlSlotData after;
 	PGAlignedBlock candidate;
 	CrR4KeptTuple staged[2];
@@ -1257,7 +1271,7 @@ cr_r4_operation_project(CrR4OperationContext *operation, ClusterR4CrSlotExtensio
 	count = cr_r4_operation_offsets(record, tag, body, offsets);
 	if (count == 0
 		|| !cr_r4_operation_projection_safe(operation, page, record, tag, offsets, count, keep,
-											&covered_target))
+											&coverage))
 		return false;
 	if (keep
 		&& !cr_r4_operation_stage_kept(operation,
@@ -1299,8 +1313,9 @@ cr_r4_operation_project(CrR4OperationContext *operation, ClusterR4CrSlotExtensio
 		return true;
 	}
 	memcpy(candidate.data, operation->result_page, BLCKSZ);
-	if (covered_target) {
-		if (!cr_r4_operation_project_covered(operation, record, tag, locator, candidate.data))
+	if (coverage.target || coverage.creation) {
+		if (!cr_r4_operation_project_covered(operation, record, tag, locator, &coverage,
+											 candidate.data))
 			return false;
 	} else {
 		ClusterPageGetItlSlots((Page)candidate.data)[locator->itl_slot_index] = after;

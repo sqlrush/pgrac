@@ -7615,7 +7615,7 @@ UT_TEST(test_retained_slot_identity_does_not_escape_original_final_fences)
 int
 main(void)
 {
-	UT_PLAN(350);
+	UT_PLAN(354);
 	UT_RUN(test_operation_worker_real_builder_yields_before_visibility);
 	UT_RUN(test_operation_worker_real_origin_completes_private_inverse);
 	UT_RUN(test_operation_worker_pending_current_is_bounded_and_counts_once);
@@ -7967,6 +7967,10 @@ main(void)
 	UT_RUN(test_creation_challenge_latest_live_lock_keeps_creator);
 	UT_RUN(test_creation_challenge_discarded_lock_does_not_hide_creator);
 	UT_RUN(test_operation_worker_kept_missing_old_target_uses_original_inverse);
+	UT_RUN(test_update_role_kept_creation_preserves_only_new_role);
+	UT_RUN(test_update_role_unkept_creation_runs_whole_inverse);
+	UT_RUN(test_update_role_kept_target_and_creation_are_independent);
+	UT_RUN(test_update_role_kept_lock_is_not_full_target_coverage);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
