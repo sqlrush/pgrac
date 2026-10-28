@@ -2010,6 +2010,19 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_block_to_n_prepared_x_so
 	const ResourceXDecodedFrame *blocked_status, const ResourceXDecodedFrame *image_envelope,
 	const struct ClusterPcmOwnSnapshot *revoking, const ResourceXLocalOwnerHandle *owner,
 	struct ClusterPageWalRefV1 *holder_first);
+/* Complete-A S source. Caller owns the exact native REVOKING tuple and
+ * protected page bytes continuously through reservation. A retained PENDING
+ * pair is a no-cancel-through responsibility of the original source worker;
+ * requester cancellation/exit cannot discard it. This boundary does not
+ * grant requester authority or retire PI/source settlement. */
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_s_source_prepare_exact(
+	const ResourceXDecodedFrame *block, int32 authenticated_master_node, int32 buffer_id,
+	const struct ClusterPcmOwnSnapshot *prepared, const char page_bytes[BLCKSZ],
+	const ClusterPageWalBindingV1 *page_wal, uint32 requester_connection_generation,
+	uint32 master_connection_generation);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_s_source_publish_exact(
+	const ResourceXDecodedFrame *block, int32 authenticated_master_node, int32 buffer_id,
+	const struct ClusterPcmOwnSnapshot *prepared, const struct ClusterPcmOwnSnapshot *finished);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_block_to_n_prepared_s_source_exact(
 	const ResourceXDecodedFrame *block, int32 authenticated_master_node,
 	const ResourceXDecodedFrame *blocked_status, const ResourceXDecodedFrame *image_envelope,
