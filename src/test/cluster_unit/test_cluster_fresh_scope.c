@@ -38,6 +38,7 @@
 #include "catalog/pg_policy.h"
 #include "catalog/pg_type_d.h"
 #include "commands/comment.h"
+#include "commands/conversioncmds.h"
 #include "commands/dbcommands.h"
 #include "commands/defrem.h"
 #include "commands/extension.h"
@@ -7595,10 +7596,172 @@ UT_TEST(test_native_policy_create_retains_syntax_errors_before_allocation_and_va
 	}
 }
 
+/* The actual conversion prefix stops before namespace catalog lookup. The
+ * conversion function and catalog write remain beyond this boundary. */
+static bool conversion_expect_binding;
+static unsigned conversion_lookups, conversion_unbound, conversion_bad_lookup;
+static String conversion_name_node;
+static ListCell conversion_name_cell;
+static List conversion_names;
+static CreateConversionStmt native_conversion_stmt;
+
+Oid
+QualifiedNameGetCreationNamespace(List *names, char **objname)
+{
+	conversion_lookups++;
+	if (conversion_expect_binding && utility_binds == 0)
+		conversion_unbound++;
+	if (names != &conversion_names || objname == NULL)
+		conversion_bad_lookup++;
+	siglongjmp(boundary, 2);
+}
+
+#include "test_cluster_fresh_conversion.inc"
+
+static void
+reset_native_conversion(bool expect_binding)
+{
+	reset_create_preflight();
+	conversion_expect_binding = expect_binding;
+	conversion_lookups = conversion_unbound = conversion_bad_lookup = 0;
+	conversion_name_node = (String){ .type = T_String, .sval = "conversion" };
+	conversion_name_cell = (ListCell){ .ptr_value = &conversion_name_node };
+	conversion_names
+		= (List){ .type = T_List, .length = 1, .max_length = 1, .elements = &conversion_name_cell };
+	native_conversion_stmt = (CreateConversionStmt){ .type = T_CreateConversionStmt,
+													 .conversion_name = &conversion_names,
+													 .for_encoding_name = "UTF8",
+													 .to_encoding_name = "LATIN1",
+													 .func_name = &conversion_names };
+}
+
+UT_TEST(test_native_conversion_binds_before_namespace_lookup_in_all_profiles)
+{
+	for (unsigned mode = 0; mode < 8; mode++) {
+		bool binds = mode == 3 || mode == 7;
+		int caught;
+
+		reset_native_conversion(binds);
+		cluster_shared_catalog = (mode & 1) != 0;
+		utility_storage_mode = (mode & 2) != 0;
+		cluster_shared_config = (mode & 4) != 0;
+		for (unsigned repeat = 0; repeat < 2; repeat++) {
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				(void)CreateConversionCommand(&native_conversion_stmt);
+			UT_ASSERT_EQ(caught, 2);
+			UT_ASSERT_EQ(error_code, 0);
+			UT_ASSERT_EQ(conversion_lookups, repeat + 1);
+			UT_ASSERT_EQ(conversion_unbound, 0);
+			UT_ASSERT_EQ(conversion_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+		}
+	}
+}
+
+UT_TEST(test_native_conversion_refusals_precede_namespace_lookup)
+{
+	for (unsigned failure = 0; failure < 5; failure++) {
+		bool allocated = failure == 0 || failure == 2;
+		int caught;
+
+		reset_native_conversion(true);
+		if (failure == 0)
+			utility_bind_ok = false;
+		else if (failure == 1 || failure == 2) {
+			if (failure == 2)
+				create_sql_entry((Node *)&native_conversion_stmt);
+			utility_in_child = true;
+		} else {
+			utility_current_xid = 401;
+			utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+		}
+		caught = sigsetjmp(boundary, 1);
+		if (!caught)
+			(void)CreateConversionCommand(&native_conversion_stmt);
+		UT_ASSERT_EQ(caught, 1);
+		UT_ASSERT_EQ(error_code, failure == 0					? ERRCODE_DATA_CORRUPTED
+								 : failure == 1 || failure == 2 ? ERRCODE_FEATURE_NOT_SUPPORTED
+																: ERRCODE_INTERNAL_ERROR);
+		UT_ASSERT_STR_EQ(error_message,
+						 failure == 0
+							 ? "canonical ACTIVE publication failed before shared catalog creation"
+						 : failure == 1 || failure == 2
+							 ? "shared catalog creation does not support subtransactions"
+							 : "shared catalog top-level transaction identity mismatch");
+		UT_ASSERT_EQ(conversion_lookups, 0);
+		UT_ASSERT_EQ(utility_xids, allocated ? 1 : 0);
+		UT_ASSERT_EQ(utility_prepares, allocated ? 1 : 0);
+		UT_ASSERT_EQ(utility_binds, failure == 2 ? 1 : 0);
+		UT_ASSERT_EQ(utility_top_xid, allocated || failure == 3 ? 400 : InvalidTransactionId);
+	}
+}
+
+UT_TEST(test_native_conversion_context_guards_keep_nonshared_route)
+{
+	for (unsigned mode = 0; mode < 8; mode++) {
+		bool binds = mode == 3 || mode == 7;
+
+		for (unsigned guard = 0; guard < 3; guard++) {
+			int caught;
+
+			reset_native_conversion(binds);
+			cluster_shared_catalog = (mode & 1) != 0;
+			utility_storage_mode = (mode & 2) != 0;
+			cluster_shared_config = (mode & 4) != 0;
+			XactReadOnly = guard == 0;
+			utility_parallel = guard == 1;
+			utility_recovery = guard == 2;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				(void)CreateConversionCommand(&native_conversion_stmt);
+			UT_ASSERT_EQ(caught, binds ? 1 : 2);
+			UT_ASSERT_EQ(error_code, !binds		  ? 0
+									 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+												  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT_EQ(conversion_lookups, binds ? 0 : 1);
+			UT_ASSERT_EQ(conversion_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+		}
+	}
+}
+
+UT_TEST(test_native_conversion_utility_warm_context_guards_preserve_binding)
+{
+	for (unsigned guard = 0; guard < 4; guard++) {
+		int caught;
+
+		reset_native_conversion(true);
+		create_sql_entry((Node *)&native_conversion_stmt);
+		UT_ASSERT_EQ(utility_prepares, 1);
+		UT_ASSERT_EQ(utility_binds, 1);
+		XactReadOnly = guard == 1;
+		utility_parallel = guard == 2;
+		utility_recovery = guard == 3;
+		caught = sigsetjmp(boundary, 1);
+		if (!caught)
+			(void)CreateConversionCommand(&native_conversion_stmt);
+		UT_ASSERT_EQ(caught, guard ? 1 : 2);
+		UT_ASSERT_EQ(error_code, !guard		  ? 0
+								 : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+											  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+		UT_ASSERT_EQ(conversion_lookups, guard ? 0 : 1);
+		UT_ASSERT_EQ(conversion_unbound, 0);
+		UT_ASSERT_EQ(conversion_bad_lookup, 0);
+		UT_ASSERT_EQ(utility_prepares, guard ? 1 : 2);
+		UT_ASSERT_EQ(utility_xids, 1);
+		UT_ASSERT_EQ(utility_binds, 1);
+		UT_ASSERT_EQ(utility_top_xid, 400);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(97);
+	UT_PLAN(101);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -7696,6 +7859,10 @@ main(void)
 	UT_RUN(test_native_policy_context_guards_keep_nonshared_route);
 	UT_RUN(test_native_policy_utility_warm_context_guards_preserve_binding);
 	UT_RUN(test_native_policy_create_retains_syntax_errors_before_allocation_and_valid_commands);
+	UT_RUN(test_native_conversion_binds_before_namespace_lookup_in_all_profiles);
+	UT_RUN(test_native_conversion_refusals_precede_namespace_lookup);
+	UT_RUN(test_native_conversion_context_guards_keep_nonshared_route);
+	UT_RUN(test_native_conversion_utility_warm_context_guards_preserve_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

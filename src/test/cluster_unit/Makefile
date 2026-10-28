@@ -988,6 +988,14 @@ test_cluster_fresh_policy.inc: $(top_srcdir)/src/backend/commands/policy.c Makef
 	     /^}/ { emit=0 } \
 	     END { if (commands != 1 || roles != 1 || helpers > 1 || entries != 3 || cuts != 3 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
+test_cluster_fresh_conversion.inc: $(top_srcdir)/src/backend/commands/conversioncmds.c Makefile
+	awk '/^CreateConversionCommand\(/ { print "ObjectAddress"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /&conversion_name\);/ \
+	     { print "return InvalidObjectAddress; }"; emit=0; cuts++ } \
+	     /^}/ { emit=0 } \
+	     END { if (entries != 1 || cuts != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
 test_cluster_fresh_scope: test_cluster_fresh_scope.c unit_test.h \
 		test_cluster_fresh_control.inc test_cluster_fresh_startup.inc test_cluster_fresh_read.inc \
 		test_cluster_fresh_boolean.inc test_cluster_fresh_index.inc test_cluster_fresh_utility.inc \
@@ -995,7 +1003,7 @@ test_cluster_fresh_scope: test_cluster_fresh_scope.c unit_test.h \
 		test_cluster_create_utility_entry.inc test_cluster_fresh_import.inc \
 		test_cluster_fresh_import_filter.inc test_cluster_fresh_extension.inc \
 		test_cluster_fresh_schema.inc test_cluster_fresh_comment.inc test_cluster_fresh_seclabel.inc \
-		test_cluster_fresh_policy.inc
+		test_cluster_fresh_policy.inc test_cluster_fresh_conversion.inc
 	$(CC) $(CFLAGS) -Wno-unused-variable -Wno-unused-but-set-variable $(CPPFLAGS) $< \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 # PGRAC: link the real durable-prefix codec/reader, not a test copy.
@@ -6303,7 +6311,7 @@ clean distclean maintainer-clean:
 		test_cluster_fresh_boolean.inc test_cluster_fresh_index.inc test_cluster_fresh_utility.inc \
 		test_cluster_fresh_catalog_index.inc test_cluster_shared_utility.inc \
 		test_cluster_fresh_schema.inc test_cluster_fresh_comment.inc test_cluster_fresh_seclabel.inc \
-		test_cluster_fresh_policy.inc
+		test_cluster_fresh_policy.inc test_cluster_fresh_conversion.inc
 	rm -f $(TESTS) pgrac_fenced_live_rejoin_client probe_pgrac_fenced_cib \
 		test_cluster_tt_locator_stats.inc \
 		test_cluster_heap_inplace_version.inc test_cluster_heap_inplace_legacy_version.inc \
