@@ -27,6 +27,11 @@
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "catalog/pg_user_mapping.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_mode.h"
+#include "cluster/cluster_tt_local.h"
+#endif
 #include "commands/defrem.h"
 #include "foreign/fdwapi.h"
 #include "foreign/foreign.h"
@@ -1500,6 +1505,32 @@ ImportForeignSchema(ImportForeignSchemaStmt *stmt)
 	AclResult	aclresult;
 	List	   *cmd_list;
 	ListCell   *lc;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* Direct callers also need the original full top binding before catalog
+	 * lookups or the external FDW callback. Utility callers reuse that binding.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if (cluster_shared_catalog && cluster_storage_mode_enabled()) {
+		ClusterCanonicalTxnBinding binding;
+		TransactionId current_xid;
+
+		PreventCommandIfReadOnly("IMPORT FOREIGN SCHEMA");
+		PreventCommandIfParallelMode("IMPORT FOREIGN SCHEMA");
+		PreventCommandDuringRecovery("IMPORT FOREIGN SCHEMA");
+		if (IsSubTransaction())
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("shared catalog creation does not support subtransactions")));
+		current_xid = GetCurrentTransactionIdIfAny();
+		if (TransactionIdIsValid(current_xid)
+			&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("shared catalog top-level transaction identity mismatch")));
+		if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("canonical ACTIVE publication failed before shared catalog creation")));
+	}
+#endif
 
 	/* Check that the foreign server exists and that we have USAGE on it */
 	server = GetForeignServerByName(stmt->server_name, false);

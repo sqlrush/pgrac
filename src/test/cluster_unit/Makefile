@@ -921,11 +921,20 @@ test_cluster_fresh_catalog_index.inc: $(top_srcdir)/src/backend/catalog/index.c 
 	     emit && /\/\* constraint flags can only be set/ { print "return InvalidOid; }"; emit=0 } \
 	     emit { print } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
+test_cluster_fresh_import.inc: $(top_srcdir)/src/backend/commands/foreigncmds.c Makefile
+	awk '/^ImportForeignSchema\(/ { print "void"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_import_filter.inc: $(top_srcdir)/src/backend/foreign/foreign.c Makefile
+	awk '/^IsImportableForeignTable\(/ { print "bool"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
 test_cluster_fresh_scope: test_cluster_fresh_scope.c unit_test.h \
 		test_cluster_fresh_control.inc test_cluster_fresh_startup.inc test_cluster_fresh_read.inc \
 		test_cluster_fresh_boolean.inc test_cluster_fresh_index.inc test_cluster_fresh_utility.inc \
 		test_cluster_fresh_catalog_index.inc test_cluster_shared_utility.inc \
-		test_cluster_create_utility_entry.inc
+		test_cluster_create_utility_entry.inc test_cluster_fresh_import.inc \
+		test_cluster_fresh_import_filter.inc
 	$(CC) $(CFLAGS) -Wno-unused-variable -Wno-unused-but-set-variable $(CPPFLAGS) $< \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 # PGRAC: link the real durable-prefix codec/reader, not a test copy.

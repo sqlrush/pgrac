@@ -25,8 +25,10 @@
 #include "access/xlog_internal.h"
 #include "catalog/catversion.h"
 #include "catalog/index.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_control.h"
+#include "catalog/pg_foreign_server_d.h"
 #include "catalog/pg_type_d.h"
 #include "commands/defrem.h"
 #include "commands/user.h"
@@ -34,6 +36,8 @@
 #include "cluster/cluster_tt_local.h"
 #include "commands/tablecmds.h"
 #include "common/controldata_utils.h"
+#include "foreign/fdwapi.h"
+#include "foreign/foreign.h"
 #include "miscadmin.h"
 #include "nodes/value.h"
 #include "port/pg_crc32c.h"
@@ -41,6 +45,8 @@
 #include "storage/large_object.h"
 #include "storage/lock.h"
 #include "tcop/utility.h"
+#include "tcop/tcopprot.h"
+#include "utils/acl.h"
 #include "utils/rel.h"
 #include "../../backend/cluster/cluster_control_bootstrap_private.h"
 #include "unit_test.h"
@@ -209,6 +215,7 @@ PreventInTransactionBlock(bool top, const char *stmt)
 }
 static bool utility_in_transaction;
 static bool utility_storage_mode = true;
+static bool utility_recovery;
 bool XactReadOnly;
 static bool utility_in_child, utility_parallel, utility_bind_ok = true;
 static bool utility_expect_binding;
@@ -230,7 +237,7 @@ IsInParallelMode(void)
 bool
 RecoveryInProgress(void)
 {
-	return false;
+	return utility_recovery;
 }
 
 TransactionId
@@ -1406,6 +1413,7 @@ reset_create_preflight(void)
 	cluster_shared_config = true;
 	utility_storage_mode = true;
 	utility_in_child = utility_parallel = XactReadOnly = utility_expect_binding = false;
+	utility_recovery = false;
 	utility_bind_ok = true;
 	utility_top_xid = utility_current_xid = InvalidTransactionId;
 	utility_xids = utility_binds = utility_prepares = utility_unbound = 0;
@@ -5686,10 +5694,408 @@ UT_TEST(test_drop_unsupported_objects_refuse_before_binding)
 	}
 }
 
+/* Execute the whole native import and its real filter. Catalog/ACL/FDW/parser
+ * services and the post-prologue DDL executor are controlled boundaries; the
+ * original utility prologue runs again for each returned child statement. */
+static ForeignServer import_server;
+static ForeignDataWrapper import_fdw;
+static FdwRoutine import_routine;
+static unsigned import_lookups, import_callbacks, import_parses, import_children, import_ccis;
+static unsigned import_unbound, import_bad_context;
+static bool import_expect_binding;
+static List *import_commands, *import_trees;
+static ErrorContextCallback import_outer_context;
+ErrorContextCallback *error_context_stack;
+DestReceiver *None_Receiver;
+MemoryContext CurrentMemoryContext;
+static enum {
+	IMPORT_OK,
+	IMPORT_NO_SERVER,
+	IMPORT_ACL_DENIED,
+	IMPORT_NO_NAMESPACE,
+	IMPORT_NO_HANDLER,
+	IMPORT_NO_CALLBACK,
+	IMPORT_CALLBACK_ERROR
+} import_failure;
+
+/* The diagnostic callback itself is outside this entry-order fixture. */
+typedef struct {
+	char *tablename;
+	char *cmd;
+} import_error_callback_arg;
+static void
+import_error_callback(void *arg)
+{
+	(void)arg;
+}
+
+int
+errmsg_internal(const char *fmt, ...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	vsnprintf(error_message, sizeof(error_message), fmt, ap);
+	va_end(ap);
+	return 0;
+}
+
+void *
+MemoryContextAllocZeroAligned(MemoryContext context, Size size)
+{
+	(void)context;
+	return calloc(1, size);
+}
+
+char *
+pstrdup(const char *str)
+{
+	return strdup(str);
+}
+
+static void
+import_observe_binding(void)
+{
+	if (import_expect_binding && utility_binds == 0)
+		import_unbound++;
+}
+
+ForeignServer *
+GetForeignServerByName(const char *name, bool missing_ok)
+{
+	import_lookups++;
+	import_observe_binding();
+	if (missing_ok || strcmp(name, "server") != 0)
+		import_bad_context++;
+	if (import_failure == IMPORT_NO_SERVER)
+		ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("missing foreign server")));
+	return &import_server;
+}
+
+Oid
+GetUserId(void)
+{
+	return 10;
+}
+
+AclResult
+object_aclcheck(Oid classid, Oid objectid, Oid roleid, AclMode mode)
+{
+	if (classid != ForeignServerRelationId || objectid != 20 || roleid != 10 || mode != ACL_USAGE)
+		import_bad_context++;
+	return import_failure == IMPORT_ACL_DENIED ? ACLCHECK_NO_PRIV : ACLCHECK_OK;
+}
+
+void
+aclcheck_error(AclResult result, ObjectType type, const char *name)
+{
+	(void)result;
+	(void)type;
+	(void)name;
+	ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("foreign server ACL denied")));
+}
+
+Oid
+LookupCreationNamespace(const char *name)
+{
+	if (strcmp(name, "local") != 0)
+		import_bad_context++;
+	if (import_failure == IMPORT_NO_NAMESPACE)
+		ereport(ERROR, (errcode(ERRCODE_UNDEFINED_SCHEMA), errmsg("missing local schema")));
+	return 30;
+}
+
+ForeignDataWrapper *
+GetForeignDataWrapper(Oid fdwid)
+{
+	if (fdwid != 40)
+		import_bad_context++;
+	return &import_fdw;
+}
+
+FdwRoutine *
+GetFdwRoutine(Oid handler)
+{
+	if (handler != 50)
+		import_bad_context++;
+	return &import_routine;
+}
+
+static List *
+import_callback(ImportForeignSchemaStmt *stmt, Oid server)
+{
+	import_callbacks++;
+	import_observe_binding();
+	if (server != 20 || strcmp(stmt->remote_schema, "remote") != 0)
+		import_bad_context++;
+	if (import_failure == IMPORT_CALLBACK_ERROR)
+		ereport(ERROR, (errcode(ERRCODE_FDW_ERROR), errmsg("foreign import callback failed")));
+	return import_commands;
+}
+
+List *
+pg_parse_query(const char *query)
+{
+	import_error_callback_arg *arg;
+
+	import_parses++;
+	import_observe_binding();
+	if (error_context_stack == &import_outer_context || error_context_stack == NULL) {
+		import_bad_context++;
+		return import_trees;
+	}
+	arg = error_context_stack->arg;
+	if (error_context_stack->previous != &import_outer_context
+		|| error_context_stack->callback != import_error_callback || arg->cmd != query
+		|| arg->tablename != NULL)
+		import_bad_context++;
+	return import_trees;
+}
+
+void
+ProcessUtility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree,
+			   ProcessUtilityContext context, ParamListInfo params, QueryEnvironment *queryEnv,
+			   DestReceiver *dest, QueryCompletion *qc)
+{
+	Node *parsetree;
+	bool isTopLevel = context == PROCESS_UTILITY_TOPLEVEL;
+	int readonly_flags;
+	CreateForeignTableStmt *child = (CreateForeignTableStmt *)pstmt->utilityStmt;
+	import_error_callback_arg *arg = error_context_stack->arg;
+
+	import_children++;
+	import_observe_binding();
+	if (readOnlyTree || context != PROCESS_UTILITY_SUBCOMMAND || params != NULL || queryEnv != NULL
+		|| dest != None_Receiver || qc != NULL || pstmt->commandType != CMD_UTILITY
+		|| pstmt->canSetTag || strcmp(child->base.relation->schemaname, "local") != 0
+		|| arg->tablename != child->base.relation->relname)
+		import_bad_context++;
+#include "test_cluster_create_utility_entry.inc"
+	pfree(pstmt);
+}
+
+void
+CommandCounterIncrement(void)
+{
+	import_ccis++;
+}
+
+#include "test_cluster_fresh_import_filter.inc"
+#include "test_cluster_fresh_import.inc"
+
+static ImportForeignSchemaStmt
+reset_native_import(bool expect_binding)
+{
+	ImportForeignSchemaStmt stmt = { .type = T_ImportForeignSchemaStmt,
+									 .server_name = "server",
+									 .remote_schema = "remote",
+									 .local_schema = "local",
+									 .list_type = FDW_IMPORT_SCHEMA_ALL };
+
+	reset_create_preflight();
+	import_expect_binding = expect_binding;
+	import_lookups = import_callbacks = import_parses = import_children = import_ccis = 0;
+	import_unbound = import_bad_context = 0;
+	import_failure = IMPORT_OK;
+	import_commands = import_trees = NIL;
+	import_server = (ForeignServer){ .serverid = 20, .fdwid = 40, .servername = "server" };
+	import_fdw = (ForeignDataWrapper){ .fdwid = 40, .fdwname = "wrapper", .fdwhandler = 50 };
+	import_routine.ImportForeignSchema = import_callback;
+	error_context_stack = &import_outer_context;
+	return stmt;
+}
+
+UT_TEST(test_native_import_binds_before_lookup_and_callback_in_all_profiles)
+{
+	for (unsigned mode = 0; mode < 8; mode++) {
+		bool binds = mode == 3 || mode == 7;
+		ImportForeignSchemaStmt stmt = reset_native_import(binds);
+		int caught;
+
+		cluster_shared_catalog = (mode & 1) != 0;
+		utility_storage_mode = (mode & 2) != 0;
+		cluster_shared_config = (mode & 4) != 0;
+		caught = sigsetjmp(boundary, 1);
+		if (!caught) {
+			ImportForeignSchema(&stmt);
+			ImportForeignSchema(&stmt);
+		}
+		UT_ASSERT_EQ(caught, 0);
+		UT_ASSERT_EQ(import_lookups, 2);
+		UT_ASSERT_EQ(import_callbacks, 2);
+		UT_ASSERT_EQ(import_unbound, 0);
+		UT_ASSERT_EQ(import_bad_context, 0);
+		UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+		UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+		UT_ASSERT_EQ(utility_prepares, binds ? 2 : 0);
+		UT_ASSERT(error_context_stack == &import_outer_context);
+	}
+}
+
+UT_TEST(test_native_import_refusal_and_invalid_scope_precede_catalogs)
+{
+	for (unsigned failure = 0; failure < 4; failure++) {
+		ImportForeignSchemaStmt stmt = reset_native_import(true);
+		int caught;
+
+		if (failure == 0)
+			utility_bind_ok = false;
+		else if (failure == 1)
+			utility_in_child = true;
+		else {
+			utility_current_xid = 401;
+			utility_top_xid = failure == 2 ? 400 : InvalidTransactionId;
+		}
+		caught = sigsetjmp(boundary, 1);
+		if (!caught)
+			ImportForeignSchema(&stmt);
+		UT_ASSERT(caught != 0);
+		UT_ASSERT_EQ(error_code, failure == 0	? ERRCODE_DATA_CORRUPTED
+								 : failure == 1 ? ERRCODE_FEATURE_NOT_SUPPORTED
+												: ERRCODE_INTERNAL_ERROR);
+		UT_ASSERT_EQ(import_lookups, 0);
+		UT_ASSERT_EQ(import_callbacks, 0);
+		UT_ASSERT_EQ(utility_xids, failure == 0 ? 1 : 0);
+		UT_ASSERT_EQ(utility_prepares, failure == 0 ? 1 : 0);
+		UT_ASSERT_EQ(utility_binds, 0);
+	}
+}
+
+UT_TEST(test_native_import_original_readonly_parallel_recovery_guards_precede_binding)
+{
+	for (unsigned guard = 0; guard < 3; guard++) {
+		ImportForeignSchemaStmt stmt = reset_native_import(true);
+		int caught;
+
+		XactReadOnly = guard == 0;
+		utility_parallel = guard == 1;
+		utility_recovery = guard == 2;
+		caught = sigsetjmp(boundary, 1);
+		if (!caught)
+			ImportForeignSchema(&stmt);
+		UT_ASSERT(caught != 0);
+		UT_ASSERT_EQ(error_code, guard == 0	  ? ERRCODE_READ_ONLY_SQL_TRANSACTION
+								 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+											  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+		UT_ASSERT_EQ(import_lookups, 0);
+		UT_ASSERT_EQ(import_callbacks, 0);
+		UT_ASSERT_EQ(utility_xids, 0);
+		UT_ASSERT_EQ(utility_prepares, 0);
+	}
+	/* The nonshared direct native route retains its original behavior. */
+	{
+		ImportForeignSchemaStmt stmt = reset_native_import(false);
+
+		cluster_shared_catalog = false;
+		XactReadOnly = utility_parallel = utility_recovery = true;
+		ImportForeignSchema(&stmt);
+		UT_ASSERT_EQ(import_callbacks, 1);
+		UT_ASSERT_EQ(utility_prepares, 0);
+	}
+}
+
+UT_TEST(test_native_import_original_errors_and_empty_callback_keep_top_binding)
+{
+	const int errors[] = { 0,
+						   ERRCODE_UNDEFINED_OBJECT,
+						   ERRCODE_INSUFFICIENT_PRIVILEGE,
+						   ERRCODE_UNDEFINED_SCHEMA,
+						   ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE,
+						   ERRCODE_FDW_NO_SCHEMAS,
+						   ERRCODE_FDW_ERROR };
+
+	for (unsigned failure = 0; failure < lengthof(errors); failure++) {
+		ImportForeignSchemaStmt stmt = reset_native_import(true);
+		int caught;
+
+		import_failure = failure;
+		if (failure == IMPORT_NO_HANDLER)
+			import_fdw.fdwhandler = InvalidOid;
+		if (failure == IMPORT_NO_CALLBACK)
+			import_routine.ImportForeignSchema = NULL;
+		caught = sigsetjmp(boundary, 1);
+		if (!caught)
+			ImportForeignSchema(&stmt);
+		UT_ASSERT_EQ(caught != 0, failure != IMPORT_OK);
+		UT_ASSERT_EQ(error_code, errors[failure]);
+		UT_ASSERT_EQ(import_lookups, 1);
+		UT_ASSERT_EQ(import_callbacks,
+					 failure == IMPORT_OK || failure == IMPORT_CALLBACK_ERROR ? 1 : 0);
+		UT_ASSERT_EQ(import_parses, 0);
+		UT_ASSERT_EQ(import_children, 0);
+		UT_ASSERT_EQ(import_unbound, 0);
+		UT_ASSERT_EQ(import_bad_context, 0);
+		UT_ASSERT_EQ(utility_xids, 1);
+		UT_ASSERT_EQ(utility_binds, 1);
+	}
+}
+
+UT_TEST(test_native_import_filters_and_child_utility_reuse_original_top)
+{
+	for (unsigned filter = 0; filter < 4; filter++) {
+		ImportForeignSchemaStmt stmt = reset_native_import(true);
+		CreateForeignTableStmt children[3] = { 0 };
+		RangeVar relations[3] = { 0 }, selected = { .type = T_RangeVar, .relname = "b" };
+		RawStmt raw[3] = { 0 };
+		TruncateStmt malformed = { .type = T_TruncateStmt };
+		ListCell raw_cells[3], command_cell = { .ptr_value = "foreign commands" };
+		ListCell selected_cell = { .ptr_value = &selected };
+		List trees = { .type = T_List, .length = 3, .max_length = 3, .elements = raw_cells };
+		List commands = { .type = T_List, .length = 1, .max_length = 1, .elements = &command_cell };
+		List names = { .type = T_List, .length = 1, .max_length = 1, .elements = &selected_cell };
+		const char *table_names[] = { "a", "b", "c" };
+		unsigned expected = filter == 0 ? 3 : filter == 1 ? 1 : filter == 2 ? 2 : 0;
+		int caught;
+
+		for (unsigned i = 0; i < 3; i++) {
+			relations[i].type = T_RangeVar;
+			relations[i].relname = (char *)table_names[i];
+			relations[i].schemaname = "remote";
+			children[i].base.type = T_CreateForeignTableStmt;
+			children[i].base.relation = &relations[i];
+			raw[i].type = T_RawStmt;
+			raw[i].stmt = (Node *)&children[i];
+			raw_cells[i].ptr_value = &raw[i];
+		}
+		if (filter == 1)
+			stmt.list_type = FDW_IMPORT_SCHEMA_LIMIT_TO;
+		else if (filter == 2)
+			stmt.list_type = FDW_IMPORT_SCHEMA_EXCEPT;
+		if (filter == 3)
+			raw[0].stmt = (Node *)&malformed;
+		stmt.table_list = &names;
+		import_commands = &commands;
+		import_trees = &trees;
+		caught = sigsetjmp(boundary, 1);
+		if (!caught) {
+			/* Ordinary utility has already published the same top binding. */
+			create_sql_entry((Node *)&stmt);
+			ImportForeignSchema(&stmt);
+		}
+		UT_ASSERT_EQ(caught != 0, filter == 3);
+		if (caught)
+			UT_ASSERT(strstr(error_message, "returned incorrect statement type") != NULL);
+		else
+			UT_ASSERT(error_context_stack == &import_outer_context);
+		UT_ASSERT_EQ(import_callbacks, 1);
+		UT_ASSERT_EQ(import_parses, 1);
+		UT_ASSERT_EQ(import_children, expected);
+		UT_ASSERT_EQ(import_ccis, expected);
+		UT_ASSERT_EQ(import_unbound, 0);
+		UT_ASSERT_EQ(import_bad_context, 0);
+		UT_ASSERT_EQ(utility_xids, 1);
+		UT_ASSERT_EQ(utility_binds, 1);
+		UT_ASSERT_EQ(utility_prepares, 2 + expected);
+		for (unsigned i = 0; i < 3; i++)
+			if (strcmp(relations[i].schemaname, "local") == 0)
+				pfree(relations[i].schemaname);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(62);
+	UT_PLAN(67);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -5752,6 +6158,11 @@ main(void)
 	UT_RUN(test_drop_autocommit_readonly_parallel_precede_binding);
 	UT_RUN(test_drop_locked_or_concurrent_paths_keep_original_checks_without_binding);
 	UT_RUN(test_drop_unsupported_objects_refuse_before_binding);
+	UT_RUN(test_native_import_binds_before_lookup_and_callback_in_all_profiles);
+	UT_RUN(test_native_import_refusal_and_invalid_scope_precede_catalogs);
+	UT_RUN(test_native_import_original_readonly_parallel_recovery_guards_precede_binding);
+	UT_RUN(test_native_import_original_errors_and_empty_callback_keep_top_binding);
+	UT_RUN(test_native_import_filters_and_child_utility_reuse_original_top);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
