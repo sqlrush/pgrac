@@ -6203,6 +6203,96 @@ CheckRequiredParameterValues(void)
 }
 
 #ifdef USE_PGRAC_CLUSTER
+/* Finish only the failed synchronous Startup request before another ROOT
+ * attempt. The original registry/LMON remains its cleanup owner.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static void
+ClusterStartupCfAwaitAttempt(const ClusterCfAttemptObservation *attempt, const char *consumer,
+							 const char *operation)
+{
+	ClusterCfRetirementSnapshot original;
+	ClusterWalStartupImage writer = clusterStartupWriter;
+	bool selected = clusterStartupWriterSelected;
+	bool bound = clusterStartupWriterBound, installed = clusterStartupWriterInstalled;
+	bool recovery = InRecovery;
+	uint64 epoch = cluster_epoch_get_current();
+	uint64 generation = cluster_grd_redeclare_generation();
+	XLogRecPtr checkpoint = ControlFile != NULL ? ControlFile->checkPoint : InvalidXLogRecPtr;
+	TimeLineID timeline = ControlFile != NULL ? ControlFile->checkPointCopy.ThisTimeLineID : 0;
+	DBState state = ControlFile != NULL ? ControlFile->state : DB_STARTUP;
+	LOCKMODE other = attempt->mode == ShareLock ? ExclusiveLock : ShareLock;
+
+	if (ControlFile == NULL || CritSectionCount != 0 || MyProc == NULL || MyLatch == NULL
+		|| LWLockHeldByMe(ControlFileLock) || cluster_cf_held(other)
+		|| (attempt->mode != ShareLock && attempt->mode != ExclusiveLock))
+		ereport(FATAL,
+				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+				 errmsg("native startup cannot wait in its control-file context"),
+				 errdetail(
+					 "PGRAC_FAMILY=STARTUP_CONTROL consumer=%s operation=%s reason=UNSAFE_CF_WAIT",
+					 consumer, operation)));
+	if (attempt->owner_state_at_return == CLUSTER_LOCK_OWNER_EMPTY) {
+		if (!cluster_cf_held(attempt->mode))
+			return;
+	} else if (cluster_cf_retirement_snapshot(attempt->mode, NULL, &original)
+			   && original.cookie == attempt->control_owner_id
+			   && original.registry.message.key.holder.request_id == attempt->request_id
+			   && original.registry.message.key.holder.cluster_epoch == attempt->request_epoch) {
+		for (;;) {
+			ClusterCfRetirementSnapshot current;
+			bool held;
+
+			HandleStartupProcInterrupts();
+			CHECK_FOR_INTERRUPTS();
+			if (MyBackendType != B_STARTUP || !cluster_shared_config || !cluster_enabled
+				|| !cluster_controlfile_shared_authority || CritSectionCount != 0
+				|| ShutdownRequestPending || LWLockHeldByMe(ControlFileLock)
+				|| InRecovery != recovery || ControlFile->state != state
+				|| ControlFile->checkPoint != checkpoint
+				|| ControlFile->checkPointCopy.ThisTimeLineID != timeline
+				|| selected != clusterStartupWriterSelected || bound != clusterStartupWriterBound
+				|| installed != clusterStartupWriterInstalled
+				|| memcmp(&writer, &clusterStartupWriter, sizeof(writer)) != 0 || epoch == 0
+				|| cluster_epoch_get_current() != epoch
+				|| cluster_grd_redeclare_generation() != generation
+				|| !cluster_recovery_transport_components_current())
+				ereport(FATAL,
+						(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						 errmsg("native startup context changed during control-file wait"),
+						 errdetail("PGRAC_FAMILY=STARTUP_CONTROL consumer=%s operation=%s "
+								   "reason=CONTEXT_CHANGED_AFTER_WAIT_SLICE epoch=" UINT64_FORMAT,
+								   consumer, operation, epoch)));
+			ResetLatch(MyLatch);
+			held = cluster_cf_held(attempt->mode);
+			if (!held && cluster_cf_release_completed(attempt->mode, original.cookie))
+				return;
+			if (!held || cluster_cf_held(other)
+				|| !cluster_cf_retirement_snapshot(attempt->mode, NULL, &current)
+				|| current.cookie != original.cookie
+				|| current.registry.handle.slot != original.registry.handle.slot
+				|| current.registry.handle.generation != original.registry.handle.generation
+				|| memcmp(&current.registry.owner, &original.registry.owner,
+						  sizeof(current.registry.owner))
+					   != 0
+				|| memcmp(&current.registry.message.key, &original.registry.message.key,
+						  sizeof(current.registry.message.key))
+					   != 0)
+				break;
+			cluster_lock_owners_service_poll();
+			cluster_cf_retirement_poll();
+			if (cluster_cf_held(attempt->mode))
+				(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+								WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
+		}
+	}
+	/* Missing or changed identity/completion is never another wait class. */
+	ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+					errmsg("native startup has no exact control-file wait completion"),
+					errdetail("PGRAC_FAMILY=STARTUP_CONTROL consumer=%s operation=%s "
+							  "reason=CF_WAIT_IDENTITY_OR_COMPLETION mode=%d cookie=" UINT64_FORMAT,
+							  consumer, operation, (int)attempt->mode, attempt->control_owner_id)));
+}
+
 /* PGRAC: consume only the immediately preceding acquire observation. The
  * copied cookie tracks retirement, never permission for another ROOT call.
  * Author: SqlRush <sqlrush@gmail.com> */
@@ -6233,6 +6323,8 @@ ClusterCfConsumerWaitSlice(uint64 before, const char *consumer, const char *oper
 								(int)observed.source, remaining != UINT64_MAX,
 								remaining == UINT64_MAX ? (uint64)0 : remaining)));
 	}
+	if (MyBackendType == B_STARTUP)
+		ClusterStartupCfAwaitAttempt(&observed, consumer, operation);
 	return true;
 }
 
@@ -6325,6 +6417,7 @@ ClusterStartupWriterSelect(void)
 	ClusterControlRootResult result;
 	bool native_recovery = InRecovery;
 	bool wait_reported = false;
+	bool cf_wait_logged = false;
 	TimestampTz last_wait_report = 0;
 
 	if (MyBackendType != B_STARTUP || !cluster_shared_config || !cluster_enabled
@@ -6339,11 +6432,18 @@ ClusterStartupWriterSelect(void)
 						errmsg("native startup has no exact immutable input")));
 	for (;;) {
 		TimestampTz now;
+		uint64 before;
+		ClusterCfAttemptObservation waiting = { 0 };
 
 		HandleStartupProcInterrupts();
 		CHECK_FOR_INTERRUPTS();
 		ClusterStartupConfigurationRequire();
+		before = cluster_cf_attempt_sequence();
 		result = cluster_control_root_v3_startup_advance_clean(&restart, &selected);
+		if (result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE
+			&& ClusterCfConsumerWaitSlice(before, "startup_select", "advance", 0, &cf_wait_logged,
+										  &waiting))
+			continue;
 		if (result != CLUSTER_CONTROL_ROOT_RECONFIG_WAIT
 			&& result != CLUSTER_CONTROL_ROOT_CAS_CONFLICT
 			&& result != CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE)
@@ -6406,8 +6506,11 @@ ClusterControlRootResult
 cluster_wal_startup_clean_input_v1(ClusterWalStartupCleanInputV1 *out)
 {
 	ClusterWalStartupImage observed;
+	ClusterWalStartupImage selected = clusterStartupWriter;
 	ClusterWalStartupCleanInputV1 image = { 0 };
 	ClusterControlRootResult result;
+	bool wait_logged = false;
+	ClusterCfAttemptObservation waiting = { 0 };
 
 	if (out == NULL)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
@@ -6421,8 +6524,37 @@ cluster_wal_startup_clean_input_v1(ClusterWalStartupCleanInputV1 *out)
 		|| clusterStartupWriter.input_kind != CLUSTER_WAL_STARTUP_CLEAN
 		|| clusterStartupWriter.phase != CLUSTER_WAL_STARTUP_INITIALIZING)
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
-	result = cluster_control_root_v3_startup_read_writer(
-		&clusterStartupWriter.claim.identity, clusterStartupWriter.operation_uuid, &observed);
+	for (;;) {
+		uint64 before;
+
+		HandleStartupProcInterrupts();
+		CHECK_FOR_INTERRUPTS();
+		ResetLatch(MyLatch);
+		if (ClusterCfRetirementPending(&waiting))
+			goto wait_for_owner;
+		/* No selected operation or native context may be adopted by a retry. */
+		if (!clusterStartupWriterSelected || clusterStartupWriterBound
+			|| clusterStartupWriterInstalled
+			|| memcmp(&selected, &clusterStartupWriter, sizeof(selected)) != 0
+			|| MyBackendType != B_STARTUP || !cluster_shared_config || !cluster_enabled
+			|| !cluster_controlfile_shared_authority || ShutdownRequestPending || InRecovery
+			|| ArchiveRecoveryRequested || CritSectionCount != 0 || LWLockHeldByMe(ControlFileLock)
+			|| ControlFile->state != DB_SHUTDOWNED)
+			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		before = cluster_cf_attempt_sequence();
+		result = cluster_control_root_v3_startup_read_writer(&selected.claim.identity,
+															 selected.operation_uuid, &observed);
+		if (result != CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE
+			|| !ClusterCfConsumerWaitSlice(before, "startup_clean_input", "read", 0, &wait_logged,
+										   &waiting))
+			break;
+		if (memcmp(&selected, &clusterStartupWriter, sizeof(selected)) != 0)
+			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		continue;
+	wait_for_owner:
+		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+						WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
+	}
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (memcmp(&observed, &clusterStartupWriter, sizeof(observed)) != 0
@@ -6464,6 +6596,7 @@ ClusterStartupCrashSeal(void)
 	ClusterControlRootSnapshot sealed;
 	ClusterControlRootReadToken token;
 	ClusterControlRootResult result;
+	bool cf_wait_logged = false;
 	uint64		min_dead_us = (uint64) cluster_cssd_dead_deadband_factor *
 		(uint64) cluster_cssd_heartbeat_interval_ms * 1000;
 	TimestampTz last_report = 0;
@@ -6477,10 +6610,18 @@ ClusterStartupCrashSeal(void)
 		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
 						errmsg("crashed shared startup has no exact immutable input")));
 	for (;;) {
+		uint64 before;
+		ClusterCfAttemptObservation waiting = { 0 };
+
 		HandleStartupProcInterrupts();
 		CHECK_FOR_INTERRUPTS();
 		ClusterStartupConfigurationRequire();
+		before = cluster_cf_attempt_sequence();
 		result = cluster_control_root_v3_self_seal_v1(&restart, min_dead_us, &sealed, &token);
+		if (result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE
+			&& ClusterCfConsumerWaitSlice(before, "startup_self_seal", "seal", 0, &cf_wait_logged,
+										  &waiting))
+			continue;
 		if (result != CLUSTER_CONTROL_ROOT_STALE_TOKEN
 			&& result != CLUSTER_CONTROL_ROOT_CAS_CONFLICT
 			&& result != CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE
@@ -6791,7 +6932,7 @@ ClusterStartupWriterBegin(const EndOfWalRecoveryInfo *input)
 		if (result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE
 			&& ClusterCfConsumerWaitSlice(before, "startup_writer", operation, 0, &wait_logged,
 										  &waiting))
-			goto wait_for_owner;
+			continue;
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			break;
 		if (step < 2 && memcmp(&routed, &selected, sizeof(selected)) != 0) {
@@ -9241,18 +9382,27 @@ ClusterStartupCheckpointPublish(const ControlFileData *candidate, XLogRecPtr end
 	for (;;) {
 		uint64 before;
 		const char *operation = !durable_selected ? "durable" : !install_selected ? "install" : "readback";
+		const char *first_failed;
 
 		HandleStartupProcInterrupts();
 		CHECK_FOR_INTERRUPTS();
 		ResetLatch(MyLatch);
 		if (ClusterCfRetirementPending(&waiting))
 			goto wait_for_owner;
-		if (ShutdownRequestPending
-			|| !cluster_wal_writer_startup_matches(&clusterStartupWriter.claim.identity,
+		if ((first_failed = "shutdown", ShutdownRequestPending)
+			|| (first_failed = "writer_token",
+				!cluster_wal_writer_startup_matches(&clusterStartupWriter.claim.identity,
 													clusterStartupWriter.operation_uuid,
-													clusterStartupWriter.first_segment_lsn))
-			ereport(ERROR, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
-							errmsg("native successor publication lost its initialization owner")));
+													clusterStartupWriter.first_segment_lsn)))
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+					 errmsg("native successor publication lost its initialization owner"),
+					 cluster_trace_control_config
+						 ? errdetail("PGRAC_FAMILY=STARTUP_CONTROL consumer=startup_checkpoint "
+									 "operation=%s failure=TOKEN_OR_OWNER_INVALID first_failed=%s "
+									 "cf_wait_seen=%d",
+									 operation, first_failed, wait_logged)
+						 : 0));
 		before = cluster_cf_attempt_sequence();
 		if (!durable_selected) {
 			result = cluster_control_root_v3_startup_checkpoint(
@@ -9276,19 +9426,29 @@ ClusterStartupCheckpointPublish(const ControlFileData *candidate, XLogRecPtr end
 			pfree(root);
 			if (ClusterCfConsumerWaitSlice(before, "startup_checkpoint", operation, 0, &wait_logged,
 										   &waiting))
-				goto wait_for_owner;
+				continue;
 			ereport(ERROR, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
 							errmsg("could not read the installed native successor")));
 		}
-		if (result != CLUSTER_CONTROL_ROOT_CAS_CONFLICT
-			&& !(result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE
-				 && ClusterCfConsumerWaitSlice(before, "startup_checkpoint", operation, 0,
-											   &wait_logged, &waiting)))
+		if (result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE
+			&& ClusterCfConsumerWaitSlice(before, "startup_checkpoint", operation, 0, &wait_logged,
+										  &waiting))
+			continue;
+		if (result != CLUSTER_CONTROL_ROOT_CAS_CONFLICT)
 			ereport(ERROR,
-				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
-				 errmsg("could not install the native successor checkpoint"),
-				 errdetail("PGRAC_FAMILY=CONTROL_ROOT PGRAC_REASON=STARTUP_CHECKPOINT_UNPROVEN result=%d",
-						   (int)result)));
+					(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+					 errmsg("could not install the native successor checkpoint"),
+					 cluster_trace_control_config
+						 ? errdetail(
+							   "PGRAC_FAMILY=CONTROL_ROOT PGRAC_REASON=STARTUP_CHECKPOINT_UNPROVEN "
+							   "result=%d operation=%s failure=%s cf_wait_seen=%d",
+							   (int)result, operation,
+							   result == CLUSTER_CONTROL_ROOT_STALE_TOKEN ? "TOKEN_INVALID"
+																		  : "HARD_REFUSAL",
+							   wait_logged)
+						 : errdetail("PGRAC_FAMILY=CONTROL_ROOT "
+									 "PGRAC_REASON=STARTUP_CHECKPOINT_UNPROVEN result=%d",
+									 (int)result)));
 wait_for_owner:
 		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
 						WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);

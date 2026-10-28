@@ -118,6 +118,7 @@ static int native_sqlstate;
 static int native_report_level;
 static char wait_detail[768];
 static char precondition_detail[2048];
+static char startup_failure_detail[2048];
 static unsigned precondition_details;
 static LOCKMODE retiring_mode;
 
@@ -168,6 +169,33 @@ bool
 cluster_cf_release_completed(LOCKMODE mode, uint64 cookie)
 {
 	return cookie != 0 && mode != retiring_mode && cookie == cf_attempt.control_owner_id;
+}
+
+/* The registry itself is covered by the actual CF producer suite. */
+bool
+cluster_cf_retirement_snapshot(LOCKMODE mode, const void *caller, ClusterCfRetirementSnapshot *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (caller != NULL || retiring_mode != mode)
+		return false;
+	out->cookie = cf_attempt.control_owner_id;
+	out->registry.handle.slot = 1;
+	out->registry.handle.generation = cf_attempt.sequence;
+	out->registry.message.key.holder.request_id = cf_attempt.request_id;
+	out->registry.message.key.holder.cluster_epoch = cf_attempt.request_epoch;
+	return true;
+}
+
+uint64
+cluster_grd_redeclare_generation(void)
+{
+	return 1;
+}
+
+bool
+cluster_recovery_transport_components_current(void)
+{
+	return provider_ok;
 }
 
 bool
@@ -327,6 +355,12 @@ errmsg(const char *f pg_attribute_unused(), ...)
 int
 errdetail(const char *f, ...)
 {
+	if (native_report_level >= ERROR) {
+		va_list args;
+		va_start(args, f);
+		vsnprintf(startup_failure_detail, sizeof(startup_failure_detail), f, args);
+		va_end(args);
+	}
 	if (native_report_level == LOG) {
 		va_list args;
 		va_start(args, f);
@@ -965,6 +999,7 @@ reset_fixture(void)
 	change_ref_on_release = false;
 	native_writes = shutdown_calls = 0;
 	native_error_level = 0;
+	startup_failure_detail[0] = '\0';
 	cluster_shared_config = cluster_enabled = cluster_controlfile_shared_authority = true;
 	memset(returns, 0, sizeof(returns));
 	memset(install_returns, 0, sizeof(install_returns));
@@ -2800,6 +2835,27 @@ UT_TEST(writer_prepare_nonok_with_binding_is_not_retried_or_cleared)
 	UT_ASSERT(!clusterStartupWriterBound);
 }
 
+UT_TEST(startup_checkpoint_token_refusal_is_distinct_from_a_wait_slice)
+{
+	for (unsigned trace = 0; trace < 2; trace++) {
+		startup_fixture();
+		cluster_trace_control_config = trace != 0;
+		install_returns[0] = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		UT_ASSERT(!startup_publish());
+		UT_ASSERT_EQ(startup_calls, 1);
+		UT_ASSERT_EQ(install_calls, 1);
+		UT_ASSERT_EQ(waits | local_updates | native_writes, 0);
+		UT_ASSERT(!clusterStartupWriterInstalled);
+		UT_ASSERT_EQ(native_sqlstate, ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE);
+		UT_ASSERT(strstr(startup_failure_detail, "result=20") != NULL);
+		UT_ASSERT_EQ(strstr(startup_failure_detail, "failure=TOKEN_INVALID") != NULL, trace);
+		if (trace) {
+			UT_ASSERT(strstr(startup_failure_detail, "operation=install") != NULL);
+			UT_ASSERT(strstr(startup_failure_detail, "cf_wait_seen=0") != NULL);
+		}
+	}
+}
+
 UT_TEST(startup_checkpoint_retries_durable_install_and_readback_separately)
 {
 	for (unsigned step = 0; step < 3; ++step) {
@@ -3302,7 +3358,7 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(88);
+	UT_PLAN(89);
 	UT_RUN(recovery_checkpoint_selects_scope_only_for_closed_online_owner);
 	UT_RUN(recovery_checkpoint_closed_admission_uses_only_original_scope);
 	UT_RUN(recovery_checkpoint_window_and_scope_reach_the_same_publisher);
@@ -3323,6 +3379,7 @@ main(void)
 	UT_RUN(checkpoint_hard_results_and_untyped_lock_never_consume_wait_observation);
 	UT_RUN(startup_configuration_and_selection_retire_before_reobserving);
 	UT_RUN(writer_begin_retries_only_its_unfinished_step);
+	UT_RUN(startup_checkpoint_token_refusal_is_distinct_from_a_wait_slice);
 	UT_RUN(startup_checkpoint_retries_durable_install_and_readback_separately);
 	UT_RUN(checkpoint_prepare_publish_retire_before_new_attempt);
 	UT_RUN(online_checkpoint_wait_yields_to_normal_shutdown);

@@ -1394,23 +1394,26 @@ test_cluster_checkpoint_native.inc: $(top_srcdir)/src/backend/access/transam/xlo
 
 test_cluster_startup_writer_native.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
 	awk '/^ClusterStartupConfigurationRequire\(/ || /^ClusterStartupWriterSelect\(/ || /^ClusterStartupCrashSeal\(/ { print "static void"; emit=1; count++ } \
+	     /^ClusterStartupCfAwaitAttempt\(/ { print "static void"; emit=1; attempts++ } \
 	     /^ClusterCf(ConsumerWaitSlice|RetirementPending)\(/ { print "static bool"; emit=1 } \
 	     /^ClusterStartupWriterBeginPreconditionDetail\(/ { print "static int"; emit=1; details++ } \
 	     /^ClusterStartupWriterBegin\(/ { print "static XLogRecPtr"; emit=1; count++ } \
 	     /^cluster_wal_startup_clean_input_v1\(/ { print "ClusterControlRootResult"; emit=1; count++ } \
 	     /^ClusterXLogNativeEmptyMultiXactInputMatches\(/ { print "static bool"; emit=1; count++ } \
 	     /^ClusterXLogStartupNativeEmptyMultiXactInput\(/ { print "bool"; emit=1; count++ } \
-	     emit { print } /^}/ { emit=0 } END { if (count != 7 || details != 1) exit 1 }' $< > $@.tmp
+	     emit { print } /^}/ { emit=0 } END { if (count != 7 || details != 1 || attempts != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Join the actual CF timeout/retirement producer to the native caller boundary.
 test_cluster_startup_cf_entry.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
-	awk '/^ClusterCf(ConsumerWaitSlice|RetirementPending)\(/ { print "static bool"; emit=1; consumers++ } \
+	awk '/^ClusterStartupCfAwaitAttempt\(/ { print "static void"; emit=1; attempts++ } \
+	     /^ClusterCf(ConsumerWaitSlice|RetirementPending)\(/ { print "static bool"; emit=1; consumers++ } \
 	     /^ClusterStartupWriterBeginPreconditionDetail\(/ { print "static int"; emit=1; details++ } \
 	     /^ClusterStartupWriterAwaitCfRetirement\(/ { print "static void"; emit=1; waiters++ } \
+	     /^cluster_wal_startup_clean_input_v1\(/ { print "ClusterControlRootResult"; emit=1; readers++ } \
 	     /^ClusterStartupWriterBegin\(/ { print "static XLogRecPtr"; emit=1; begins++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (consumers != 2 || details != 1 || begins != 1 || waiters != 1 || emit) exit 1 }' $< > $@.tmp
+	     END { if (consumers != 2 || attempts != 1 || details != 1 || begins != 1 || waiters != 1 || readers != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_startup_cf_callsite.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile

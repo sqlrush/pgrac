@@ -70,6 +70,10 @@ static bool entry_ack_on_service, entry_service_consumed;
 static int entry_level, entry_code;
 static XLogRecPtr entry_output;
 static void (*entry_on_wait)(void);
+static bool entry_clean_consumer;
+static unsigned entry_read_timeouts, entry_read_result;
+static uint64 entry_read_cookie;
+static uint64 entry_timeout(LOCKMODE mode);
 
 void
 cluster_lock_owners_service_poll(void)
@@ -149,7 +153,10 @@ WaitLatch(Latch *latch, int events, long timeout, uint32 event)
 	UT_ASSERT_EQ(timeout, 20);
 	UT_ASSERT_EQ(event, WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
 	UT_ASSERT(!entry_native_lock && CritSectionCount == 0 && control_locked == NULL);
-	UT_ASSERT_EQ(entry_root_calls | entry_config_calls | entry_select_calls, 0);
+	if (entry_clean_consumer)
+		UT_ASSERT_EQ(entry_root_calls, 1);
+	else
+		UT_ASSERT_EQ(entry_root_calls | entry_config_calls | entry_select_calls, 0);
 	UT_ASSERT(entry_resets > entry_waits);
 	if (++entry_waits > 8)
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR), errmsg("fixture exceeded eight wakes")));
@@ -204,6 +211,13 @@ cluster_control_root_v3_startup_read_writer(const ClusterControlRootIdentity *id
 											const uint8 uuid[16], ClusterWalStartupImage *out)
 {
 	entry_assert_root_context(identity, uuid);
+	if (entry_read_timeouts != 0) {
+		--entry_read_timeouts;
+		entry_read_cookie = entry_timeout(ExclusiveLock);
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	}
+	if (entry_read_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return entry_read_result;
 	*out = entry_selected;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
@@ -282,6 +296,10 @@ entry_fixture(bool recovery)
 	entry_authority = true;
 	entry_ack_at = 3;
 	entry_on_wait = NULL;
+	entry_clean_consumer = false;
+	entry_read_timeouts = 0;
+	entry_read_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	entry_read_cookie = 0;
 	InRecovery = recovery;
 	ArchiveRecoveryRequested = false;
 	ShutdownRequestPending = false;
@@ -789,6 +807,127 @@ UT_TEST(startup_cf_owner_service_ack_finishes_original_cf_receipt)
 	entry_cleanup(ShareLock, cookie);
 }
 
+/* The semantic CLEAN reader is a separate pre-bind consumer. Its actual
+ * ROOT read boundary produces the original failed CF request and registry. */
+UT_TEST(startup_cf_clean_input_waits_for_its_original_request_before_reread)
+{
+	ClusterWalStartupCleanInputV1 observed;
+	ClusterControlRootResult result;
+	unsigned waits, reads;
+
+	entry_fixture(false);
+	clusterStartupWriter.phase = entry_selected.phase = CLUSTER_WAL_STARTUP_INITIALIZING;
+	entry_clean_consumer = true;
+	entry_read_timeouts = 1;
+	result = cluster_wal_startup_clean_input_v1(&observed);
+	waits = entry_waits;
+	reads = entry_root_calls;
+	entry_cleanup(ExclusiveLock, entry_read_cookie);
+	UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(waits, 3);
+	UT_ASSERT_EQ(reads, 2);
+	UT_ASSERT_EQ(observed.successor.identity.system_identifier, 1234);
+	UT_ASSERT_EQ(observed.checkpoint_lsn, 100);
+	UT_ASSERT(!clusterStartupWriterBound && !clusterStartupWriterInstalled);
+}
+
+static void
+entry_change_clean_context(void)
+{
+	if (entry_drift < 15)
+		entry_change_context();
+	else if (entry_drift == 15)
+		cf_hold_x.owner.request.control_owner_id++;
+	else if (entry_drift == 16)
+		cf_hold_x.owner.attempt.generation++;
+	else if (entry_drift == 17)
+		control_requests->records[cf_hold_x.owner.attempt.slot].owner.incarnation++;
+	else
+		control_requests->records[cf_hold_x.owner.attempt.slot].state
+			= CLUSTER_CONTROL_REQUEST_INVALID;
+}
+
+static bool
+entry_clean_call(ClusterWalStartupCleanInputV1 *out, ClusterControlRootResult *result)
+{
+	volatile bool completed = false;
+
+	PG_TRY();
+	{
+		*result = cluster_wal_startup_clean_input_v1(out);
+		completed = true;
+	}
+	PG_CATCH();
+	{
+		FlushErrorState();
+	}
+	PG_END_TRY();
+	return completed;
+}
+
+UT_TEST(startup_cf_clean_wait_rejects_changed_owner_or_retirement_identity)
+{
+	for (entry_drift = 3; entry_drift < 19; entry_drift++) {
+		ClusterWalStartupCleanInputV1 observed = { 0 }, zero = { 0 };
+		ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_ABSENT;
+		uint64 old_epoch = owner_epoch, old_generation = owner_generation;
+		bool completed;
+
+		entry_fixture(false);
+		clusterStartupWriter.phase = entry_selected.phase = CLUSTER_WAL_STARTUP_INITIALIZING;
+		entry_clean_consumer = true;
+		entry_read_timeouts = 1;
+		entry_on_wait = entry_change_clean_context;
+		/* The second real request is the consumer's, not the saved setup. */
+		completed = entry_clean_call(&observed, &result);
+		UT_ASSERT(!completed);
+		UT_ASSERT_EQ(entry_waits, 1);
+		UT_ASSERT_EQ(entry_root_calls, 1);
+		UT_ASSERT_EQ(entry_code, ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE);
+		UT_ASSERT_EQ(memcmp(&observed, &zero, sizeof(zero)), 0);
+		entry_on_wait = NULL;
+		owner_epoch = old_epoch;
+		owner_generation = old_generation;
+		ShutdownRequestPending = false;
+		/* Restore only the corruption introduced by the test. */
+		if (entry_drift == 15)
+			cf_hold_x.owner.request.control_owner_id--;
+		if (entry_drift == 16)
+			cf_hold_x.owner.attempt.generation--;
+		if (entry_drift == 17)
+			control_requests->records[cf_hold_x.owner.attempt.slot].owner.incarnation--;
+		if (entry_drift == 18)
+			control_requests->records[cf_hold_x.owner.attempt.slot].state
+				= CLUSTER_CONTROL_REQUEST_ABANDONED;
+		entry_cleanup(ExclusiveLock, entry_read_cookie);
+	}
+}
+
+UT_TEST(startup_cf_clean_input_does_not_retry_real_root_refusal)
+{
+	const ClusterControlRootResult failures[]
+		= { CLUSTER_CONTROL_ROOT_IO_ERROR, CLUSTER_CONTROL_ROOT_STALE_TOKEN,
+			CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE };
+
+	for (unsigned i = 0; i < lengthof(failures); i++) {
+		ClusterWalStartupCleanInputV1 observed;
+		ClusterWalStartupCleanInputV1 zero = { 0 };
+		ClusterControlRootResult result;
+
+		entry_fixture(false);
+		clusterStartupWriter.phase = entry_selected.phase = CLUSTER_WAL_STARTUP_INITIALIZING;
+		entry_clean_consumer = true;
+		entry_read_result = failures[i];
+		memset(&observed, 0xA5, sizeof(observed));
+		result = cluster_wal_startup_clean_input_v1(&observed);
+		UT_ASSERT_EQ(result, failures[i]);
+		UT_ASSERT_EQ(entry_waits, 0);
+		UT_ASSERT_EQ(entry_root_calls, 1);
+		UT_ASSERT_EQ(memcmp(&observed, &zero, sizeof(zero)), 0);
+		UT_ASSERT(!clusterStartupWriterBound && !clusterStartupWriterInstalled);
+	}
+}
+
 int
 main(void)
 {
@@ -799,7 +938,7 @@ main(void)
 	pg_atomic_init_u64(&owner_proc.cluster_grd_redeclare_acked_epoch, 0);
 	cluster_control_request_shmem_init();
 	retire_driver = cluster_control_request_driver_start();
-	UT_PLAN(12);
+	UT_PLAN(15);
 	UT_RUN(startup_cf_timeout_waits_for_exact_completion_before_begin);
 	UT_RUN(startup_cf_completion_does_not_preserve_changed_native_input);
 	UT_RUN(startup_cf_unsafe_native_context_never_takes_a_registry_lock);
@@ -812,6 +951,9 @@ main(void)
 	UT_RUN(startup_cf_hard_error_keeps_original_cleanup_and_error);
 	UT_RUN(startup_cf_original_startup_termination_retains_shared_responsibility);
 	UT_RUN(startup_cf_owner_service_ack_finishes_original_cf_receipt);
+	UT_RUN(startup_cf_clean_input_waits_for_its_original_request_before_reread);
+	UT_RUN(startup_cf_clean_input_does_not_retry_real_root_refusal);
+	UT_RUN(startup_cf_clean_wait_rejects_changed_owner_or_retirement_identity);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
