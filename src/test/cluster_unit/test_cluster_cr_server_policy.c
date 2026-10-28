@@ -35,15 +35,19 @@
 #include "cluster/cluster_xid_stripe.h"
 #include "cluster/cluster_cr.h"
 #include "cluster/cluster_epoch.h"
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_inject.h"
 #include "cluster/cluster_mxid_stripe.h"
 #include "cluster/cluster_runtime_visibility.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_undo_record_api.h"
+#include "cluster/cluster_update_trace.h"
 #include "miscadmin.h"
 #include "storage/lwlock.h"
 #include "storage/procarray.h"
 #include "utils/elog.h"
+#include "utils/memutils.h"
 
 #include "unit_test.h"
 
@@ -173,6 +177,63 @@ static int c0_native_provable_calls;
 static bool c0_log_enabled, c0_expect_serve_authority;
 static unsigned c0_log_count, c0_authority_calls[4], c0_srv_calls[4];
 static char c0_log_message[2048];
+
+/* Exception-envelope boundaries. Proof and lock cleanup still run in the
+ * original C0 product object; these leaves observe the outer catch only. */
+MemoryContext CurrentMemoryContext, TopMemoryContext;
+bool cluster_update_trace_enabled, cluster_crossnode_cr_data_plane;
+int cluster_injection_armed_count;
+static char c0_caller_context, c0_top_context;
+static int c0_error_code, c0_geterrcode_calls, c0_flush_calls;
+static bool c0_expect_envelope_cleanup, c0_envelope_skip;
+static unsigned c0_envelope_stats[10], c0_trace_count;
+static ClusterUpdateTraceEvent c0_trace_events[2];
+
+int
+geterrcode(void)
+{
+	c0_geterrcode_calls++;
+	UT_ASSERT_EQ(c0_flush_calls, 0);
+	return c0_error_code;
+}
+
+void
+FlushErrorState(void)
+{
+	UT_ASSERT(CurrentMemoryContext == TopMemoryContext);
+	UT_ASSERT_EQ(c0_geterrcode_calls, 1);
+	c0_flush_calls++;
+	c0_error_code = 0;
+}
+
+void
+cluster_cr_server_stat_bump(ClusterCrServerStat which)
+{
+	UT_ASSERT((unsigned)which < lengthof(c0_envelope_stats));
+	if ((unsigned)which < lengthof(c0_envelope_stats))
+		c0_envelope_stats[which]++;
+}
+
+void
+cluster_update_trace_event_at(const ClusterUpdateTraceEvent *event, uint64 now)
+{
+	UT_ASSERT(c0_trace_count < lengthof(c0_trace_events));
+	if (c0_trace_count < lengthof(c0_trace_events))
+		c0_trace_events[c0_trace_count++] = *event;
+}
+
+void
+cluster_injection_run(const char *name)
+{
+	UT_ASSERT(false); /* No armed injection action in this fixture. */
+}
+
+bool
+cluster_injection_should_skip(const char *name)
+{
+	UT_ASSERT(strcmp(name, "cluster-lms-undo-fetch") == 0);
+	return c0_envelope_skip;
+}
 
 static void
 c0_note(C0TestEvent event)
@@ -450,6 +511,12 @@ int
 errmsg_internal(const char *fmt, ...)
 {
 	va_list args;
+	if (c0_expect_envelope_cleanup) {
+		UT_ASSERT(CurrentMemoryContext == TopMemoryContext);
+		UT_ASSERT_EQ(c0_geterrcode_calls, 1);
+		UT_ASSERT_EQ(c0_flush_calls, 1);
+		UT_ASSERT_EQ(c0_error_code, 0);
+	}
 	UT_ASSERT_EQ(c0_native_lock_depth, 0);
 	UT_ASSERT_EQ(c0_xact_lock_depth, 0);
 	UT_ASSERT_EQ(c0_slru_lock_depth, 0);
@@ -2237,10 +2304,219 @@ UT_TEST(test_service_logging_does_not_resample_proof_or_mutate_refusal)
 	UT_ASSERT_EQ(memcmp(counters[0], counters[1], sizeof(counters[0])), 0);
 }
 
+/* Unrelated serve families must not accidentally satisfy an ordinary test. */
+static bool
+c0_envelope_unexpected_undo(ClusterLmsCrSlot *slot)
+{
+	UT_ASSERT(false);
+	return false;
+}
+
+static bool
+c0_envelope_unexpected_copy(BufferTag tag, XLogRecPtr *lsn, char *dst,
+							ClusterBufmgrGcsCopyRefusal *refusal, ClusterPageWalBindingV1 *wal,
+							ClusterPageWalRefV1 *first, uint32 peer_capabilities)
+{
+	UT_ASSERT(false);
+	return false;
+}
+
+static void
+c0_envelope_unexpected_construct(const char *cur_page, SCN read_scn, BufferTag tag, char *dst_page,
+								 bool *out_partial)
+{
+	UT_ASSERT(false);
+}
+
+static void cr_serve_slot_impl(ClusterLmsCrSlot *slot);
+#define lms_undo_verdict_serve cluster_cr_server_test_undo_verdict_serve
+#define lms_undo_multi_verdict_serve cluster_cr_server_test_multi_verdict_serve
+#define lms_undo_authority_verdict_serve c0_envelope_unexpected_undo
+#define lms_undo_fetch_serve c0_envelope_unexpected_undo
+#define cluster_bufmgr_copy_block_for_gcs c0_envelope_unexpected_copy
+#define cluster_cr_construct_page_for_server c0_envelope_unexpected_construct
+#include "test_cluster_cr_server_envelope.inc"
+#undef lms_undo_verdict_serve
+#undef lms_undo_multi_verdict_serve
+#undef lms_undo_authority_verdict_serve
+#undef lms_undo_fetch_serve
+#undef cluster_bufmgr_copy_block_for_gcs
+#undef cluster_cr_construct_page_for_server
+
+/* The exact outer body calls the actual static ordinary service through the
+ * existing test seam; no new production API or copied resolver. */
+static void
+c0_envelope_serve(ClusterLmsCrSlot *slot)
+{
+	cr_serve_slot(slot);
+}
+
+static void
+c0_envelope_reset(bool trace)
+{
+	c0_reset();
+	CurrentMemoryContext = (MemoryContext)&c0_caller_context;
+	TopMemoryContext = (MemoryContext)&c0_top_context;
+	c0_error_code = c0_geterrcode_calls = c0_flush_calls = 0;
+	c0_expect_envelope_cleanup = c0_envelope_skip = false;
+	c0_trace_count = 0;
+	cluster_update_trace_enabled = trace;
+	cluster_crossnode_cr_data_plane = false;
+	cluster_injection_armed_count = 0;
+	memset(c0_envelope_stats, 0, sizeof(c0_envelope_stats));
+	memset(c0_trace_events, 0, sizeof(c0_trace_events));
+	c0_log_enabled = c0_expect_serve_authority = true;
+}
+
+static bool
+c0_envelope_try(ClusterLmsCrSlot *slot)
+{
+	volatile bool escaped = false;
+	sigjmp_buf *saved_stack = PG_exception_stack;
+	ErrorContextCallback callback = { 0 };
+	ErrorContextCallback *saved_callback = error_context_stack;
+
+	error_context_stack = &callback;
+	PG_TRY();
+	{
+		c0_envelope_serve(slot);
+	}
+	PG_CATCH();
+	{
+		escaped = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(PG_exception_stack == saved_stack);
+	UT_ASSERT(error_context_stack == &callback);
+	error_context_stack = saved_callback;
+	return escaped;
+}
+
+static void
+c0_check_envelope_trace(const ClusterLmsCrSlot *slot, bool trace)
+{
+	UT_ASSERT_EQ(c0_trace_count, trace ? 2 : 0);
+	for (unsigned i = 0; i < c0_trace_count; i++) {
+		UT_ASSERT_EQ(c0_trace_events[i].kind,
+					 i == 0 ? CLUTRACE_LEGACY_SERVE_BEGIN : CLUTRACE_LEGACY_SERVE_END);
+		UT_ASSERT_EQ(c0_trace_events[i].request_id, slot->request_id);
+		UT_ASSERT_EQ(c0_trace_events[i].requester_node, 2);
+		UT_ASSERT_EQ(c0_trace_events[i].requester_backend, 17);
+		UT_ASSERT_EQ(c0_trace_events[i].value, CLUSTER_LMS_SLOT_KIND_UNDO_VERDICT);
+	}
+}
+
+UT_TEST(test_envelope_clog_errors_are_denied_with_original_sqlstate)
+{
+	static const int codes[] = { ERRCODE_QUERY_CANCELED, ERRCODE_DATA_CORRUPTED, ERRCODE_IO_ERROR,
+								 ERRCODE_INTERNAL_ERROR };
+	for (unsigned i = 0; i < lengthof(codes); i++) {
+		for (int trace = 0; trace < 2; trace++) {
+			ClusterLmsCrSlot slot, expected;
+			char key[256];
+			c0_envelope_reset(trace != 0);
+			slot = expected = c0_service_request();
+			/* Poison the old status: an error must actively replace it. */
+			slot.result_status = GCS_BLOCK_REPLY_UNDO_VERDICT_RESULT;
+			c0_throw_on_clog = c0_expect_envelope_cleanup = true;
+			c0_error_code = codes[i];
+			UT_ASSERT(!c0_envelope_try(&slot));
+			UT_ASSERT_EQ(slot.result_status, GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER);
+			UT_ASSERT_EQ(c0_raw_clog_calls, 1);
+			UT_ASSERT_EQ(c0_release_all_calls, 1);
+			UT_ASSERT_EQ(c0_native_lock_depth + c0_xact_lock_depth + c0_slru_lock_depth, 0);
+			UT_ASSERT_EQ(InterruptHoldoffCount, 0);
+			UT_ASSERT_EQ(c0_geterrcode_calls, 1);
+			UT_ASSERT_EQ(c0_flush_calls, 1);
+			UT_ASSERT(CurrentMemoryContext == TopMemoryContext);
+			UT_ASSERT_EQ(c0_envelope_stats[CLUSTER_CR_SERVER_STAT_VERDICT_DENIED], 1);
+			UT_ASSERT_EQ(c0_envelope_stats[CLUSTER_CR_SERVER_STAT_VERDICT_SERVED], 0);
+			UT_ASSERT_EQ(c0_log_count, 1);
+			snprintf(key, sizeof(key),
+					 "predicate=CORE_EXCEPTION sqlerrcode=%d scan_sampled=0 scan=-1", codes[i]);
+			UT_ASSERT(strstr(c0_log_message, key) != NULL);
+			UT_ASSERT(strstr(c0_log_message, "node=0 requester=2 backend=17 request=4294971949")
+					  != NULL);
+			UT_ASSERT(strstr(c0_log_message, "xid=4269296 segment=769 slot=11 epoch=7") != NULL);
+			snprintf(key, sizeof(key), "tag=%u/%u/%u/%u/%u", slot.tag.spcOid, slot.tag.dbOid,
+					 slot.tag.relNumber, (unsigned)slot.tag.forkNum, slot.tag.blockNum);
+			UT_ASSERT(strstr(c0_log_message, key) != NULL);
+			UT_ASSERT(
+				strstr(c0_log_message, "commit_sampled=0 did_commit=0 abort_sampled=0 did_abort=0")
+				!= NULL);
+			UT_ASSERT(strstr(c0_log_message, "authority_scn=1000") != NULL);
+			for (unsigned a = 0; a < lengthof(c0_authority_calls); a++)
+				UT_ASSERT_EQ(c0_authority_calls[a], 1);
+			expected.undo_auth = slot.undo_auth; /* Original pre-scan co-sample only. */
+			UT_ASSERT_EQ(memcmp(&slot, &expected, sizeof(slot)), 0);
+			c0_check_envelope_trace(&slot, trace != 0);
+		}
+	}
+}
+
+UT_TEST(test_envelope_can_serve_after_catching_an_error)
+{
+	for (int trace = 0; trace < 2; trace++) {
+		ClusterLmsCrSlot refused, next;
+		ClusterGcsUndoVerdictPage *page;
+		c0_envelope_reset(trace != 0);
+		refused = c0_service_request();
+		c0_throw_on_clog = c0_expect_envelope_cleanup = true;
+		c0_error_code = ERRCODE_IO_ERROR;
+		UT_ASSERT(!c0_envelope_try(&refused));
+		c0_check_envelope_trace(&refused, trace != 0);
+		/* Continue in the post-catch context, without a global fixture reset. */
+		c0_throw_on_clog = c0_expect_envelope_cleanup = false;
+		c0_expect_serve_authority = false;
+		c0_trace_count = 0;
+		c0_resolve = CLUSTER_TT_DURABLE_RESOLVED_SCN;
+		c0_resolved_scn = 10001;
+		c0_did_commit = c0_accept_resolved_scn = true;
+		next = c0_service_request();
+		next.request_id++;
+		UT_ASSERT(!c0_envelope_try(&next));
+		UT_ASSERT_EQ(refused.result_status, GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER);
+		UT_ASSERT_EQ(next.result_status, GCS_BLOCK_REPLY_UNDO_VERDICT_RESULT);
+		UT_ASSERT_EQ(c0_envelope_stats[CLUSTER_CR_SERVER_STAT_VERDICT_DENIED], 1);
+		UT_ASSERT_EQ(c0_envelope_stats[CLUSTER_CR_SERVER_STAT_VERDICT_SERVED], 1);
+		UT_ASSERT_EQ(c0_geterrcode_calls, 1);
+		UT_ASSERT_EQ(c0_flush_calls, 1);
+		UT_ASSERT_EQ(c0_log_count, 1); /* Success does not fabricate another refusal. */
+		UT_ASSERT_EQ(c0_release_all_calls, 1);
+		UT_ASSERT_EQ(c0_native_lock_depth + c0_xact_lock_depth + c0_slru_lock_depth, 0);
+		page = (ClusterGcsUndoVerdictPage *)next.result_page;
+		UT_ASSERT_EQ(page->xid_echo, UINT64CONST(4269296));
+		UT_ASSERT_EQ(page->verdict, CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT);
+		UT_ASSERT_EQ(page->commit_scn, UINT64CONST(10001));
+		c0_check_envelope_trace(&next, trace != 0);
+	}
+}
+
+UT_TEST(test_envelope_skip_does_not_invent_exception_or_scan_proof)
+{
+	for (int trace = 0; trace < 2; trace++) {
+		ClusterLmsCrSlot slot, expected;
+		c0_envelope_reset(trace != 0);
+		slot = expected = c0_service_request();
+		slot.result_status = GCS_BLOCK_REPLY_UNDO_VERDICT_RESULT;
+		c0_envelope_skip = true;
+		UT_ASSERT(!c0_envelope_try(&slot));
+		UT_ASSERT_EQ(c0_envelope_stats[CLUSTER_CR_SERVER_STAT_VERDICT_DENIED], 1);
+		UT_ASSERT_EQ(c0_envelope_stats[CLUSTER_CR_SERVER_STAT_VERDICT_SERVED], 0);
+		UT_ASSERT_EQ(c0_geterrcode_calls + c0_flush_calls + c0_log_count + c0_event_count, 0);
+		for (unsigned a = 0; a < lengthof(c0_authority_calls); a++)
+			UT_ASSERT_EQ(c0_authority_calls[a], 0);
+		UT_ASSERT(CurrentMemoryContext == (MemoryContext)&c0_caller_context);
+		UT_ASSERT_EQ(memcmp(&slot, &expected, sizeof(slot)), 0);
+		c0_check_envelope_trace(&slot, trace != 0);
+	}
+	c0_envelope_reset(false);
+}
+
 int
 main(void)
 {
-	UT_PLAN(48);
+	UT_PLAN(51);
 	UT_RUN(test_zero_native_history_preserves_ordinary_committed_bound);
 	UT_RUN(test_normal_ordinary_remote_uses_the_same_terminal_proof);
 	UT_RUN(test_normal_ordinary_permission_does_not_widen_other_roles);
@@ -2289,6 +2565,9 @@ main(void)
 	UT_RUN(test_service_entry_refusals_keep_key_without_inventing_scan);
 	UT_RUN(test_service_success_and_other_roles_stay_ordinary_log_silent);
 	UT_RUN(test_service_logging_does_not_resample_proof_or_mutate_refusal);
+	UT_RUN(test_envelope_clog_errors_are_denied_with_original_sqlstate);
+	UT_RUN(test_envelope_can_serve_after_catching_an_error);
+	UT_RUN(test_envelope_skip_does_not_invent_exception_or_scan_proof);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

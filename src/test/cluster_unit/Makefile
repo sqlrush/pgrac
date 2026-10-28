@@ -1219,7 +1219,16 @@ $(CLUSTER_CR_SERVER_C0_TEST_O): $(top_srcdir)/src/backend/cluster/cluster_cr_ser
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -ffunction-sections -fdata-sections \
 		-c $< -o $@
 
-test_cluster_cr_server_policy: test_cluster_cr_server_policy.c unit_test.h $(CLUSTER_VERSION_O) \
+# Keep the complete original serve envelope and its diagnostics; service
+# leaves bind to the existing C0 product seam in the test translation unit.
+test_cluster_cr_server_envelope.inc: $(top_srcdir)/src/backend/cluster/cluster_cr_server.c Makefile
+	awk '/^typedef struct (LmsFreshrefPairDiagnostic|LmsOrdinaryVerdictDiagnostic) / { emit=1; types++ } \
+	     /^(lms_freshref_pair_detail_admit|lms_freshref_pair_log_refusal|lms_ordinary_verdict_refusal|cr_serve_slot|cr_serve_slot_impl)\(/ \
+	     { print previous; emit=1; count++ } emit { print } /^}/ { emit=0 } \
+	     { previous=$$0 } END { if (count != 5 || types != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_cr_server_policy: test_cluster_cr_server_policy.c test_cluster_cr_server_envelope.inc unit_test.h $(CLUSTER_VERSION_O) \
 		$(CLUSTER_CR_SERVER_POLICY_O) $(CLUSTER_CR_SERVER_C0_TEST_O) \
 		$(top_builddir)/src/backend/cluster/cluster_undo_retention.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
@@ -6387,6 +6396,7 @@ check_r11_source_removal_census:
 # Standard PG targets
 # ----------
 clean distclean maintainer-clean:
+	rm -f test_cluster_cr_server_envelope.inc test_cluster_cr_server_envelope.inc.tmp
 	rm -f test_cluster_tx_exit_dispatch.inc test_cluster_tx_exit_dispatch.inc.tmp \
 		test_cluster_tx_exit_registration.inc test_cluster_tx_exit_registration.inc.tmp
 	rm -f test_cluster_external_fence_duty.inc
