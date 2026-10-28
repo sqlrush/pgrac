@@ -26832,6 +26832,22 @@ main(int argc, char **argv)
 		return ut_failed_count ? 1 : 0;
 	}
 
+	if (getenv("PGRAC_PRE2_TEST_FAILURE_INPUT") != NULL) {
+		UT_PLAN(11);
+		UT_RUN(test_v2_failure_open_invalidates_old_tail_and_keeps_other_threads);
+		UT_RUN(test_v2_failure_tail_publishes_real_input_not_terminal);
+		UT_RUN(test_v2_failure_input_preserves_fpw_was_off_history);
+		UT_RUN(test_v2_failure_open_refuses_unproven_owners);
+		UT_RUN(test_v2_failure_tail_refuses_unproven_or_borrowed_owners);
+		UT_RUN(test_v2_failure_tail_rechecks_root_fence_serial_and_wal);
+		UT_RUN(test_v2_failure_tail_requires_real_selected_input);
+		UT_RUN(test_v2_failure_tail_cancellation_and_uncertain_cleanup);
+		UT_RUN(test_v2_failure_sealed_tail_release_uncertainty_never_returns_authority);
+		UT_RUN(test_v3_failure_publishers_preserve_pending_and_authenticate_native_input);
+		UT_RUN(test_v3_failure_publication_retains_old_authority_and_no_fallback);
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_SELF_SEAL") != NULL) {
 		UT_PLAN(5);
 		UT_RUN(test_v3_self_seal_seals_own_crashed_generation);

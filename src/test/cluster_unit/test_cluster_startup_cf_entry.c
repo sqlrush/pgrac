@@ -4593,6 +4593,903 @@ UT_TEST(ordinary_self_open_read_keeps_the_original_wait_policy)
 		}
 }
 
+
+/* The actual CF/owner/CONTROL producer joins the original failure publishers.
+ * Formation/fence/IR/WALR and physical ROOT/WAL are explicit fixture leaves. */
+static unsigned failure_kind, failure_phase, failure_attempts, failure_reads;
+static unsigned failure_wal_reads, failure_publishes, failure_ir_acquires, failure_ir_releases;
+static unsigned failure_walr_begins, failure_walr_ends, failure_need_count;
+static bool failure_formation, failure_needs, failure_admissions, failure_ir_current;
+static bool failure_digest_valid, failure_null_need, failure_direct, failure_throw_read;
+static bool failure_tail_divergent, failure_receipt_before_reapply;
+static ClusterRecoverySerialRequest failure_request;
+static ClusterRecoverySerialGuard failure_serial;
+static PgracExternalFenceNeedV1 failure_need;
+static ClusterControlRootResult failure_root_result, failure_wal_result;
+static ClusterLockAcquireResult failure_acquire_result;
+static ClusterRecoverySerialAcquireResult failure_ir_result;
+static void (*failure_wal_hook)(void);
+static int failure_walr_identity;
+static LOCKMODE
+failure_wait_mode(void)
+{
+	return failure_kind == 0 || failure_phase == 1 ? ExclusiveLock : ShareLock;
+}
+static unsigned
+failure_first_attempt(void)
+{
+	return failure_direct || failure_kind == 0 || failure_phase == 0 ? 1 : 2;
+}
+static bool
+failure_digest(const ClusterRecoveryDutyKey *key, bool v2, ClusterRecoveryDutyDigest *out)
+{
+	UT_ASSERT(key != NULL && v2 && out != NULL);
+	memset(out, 0x2a, sizeof(*out));
+	return failure_digest_valid;
+}
+static ClusterFormationWitnessResult
+failure_formation_current(const ClusterFormationWitnessV1 *witness)
+{
+	UT_ASSERT(witness == (const ClusterFormationWitnessV1 *)1);
+	return failure_formation ? CLUSTER_FORMATION_WITNESS_READY : CLUSTER_FORMATION_WITNESS_UNSTABLE;
+}
+static bool
+failure_needs_current(const PgracExternalFenceNeedSetV1 *needs,
+					  const ClusterFormationWitnessV1 *formation,
+					  PgracExternalFenceDenyReason *reason)
+{
+	UT_ASSERT(needs == (const PgracExternalFenceNeedSetV1 *)2);
+	UT_ASSERT(formation == (const ClusterFormationWitnessV1 *)1);
+	*reason = PGRAC_EXTERNAL_FENCE_DENY_NONE;
+	return failure_needs;
+}
+static bool
+failure_admissions_current(const PgracExternalFenceAdmissionSetV1 *admissions,
+						   const PgracExternalFenceNeedSetV1 *needs,
+						   const ClusterFormationWitnessV1 *formation,
+						   PgracExternalFenceDenyReason *reason)
+{
+	UT_ASSERT(admissions == (const PgracExternalFenceAdmissionSetV1 *)3);
+	UT_ASSERT(needs == (const PgracExternalFenceNeedSetV1 *)2);
+	UT_ASSERT(formation == (const ClusterFormationWitnessV1 *)1);
+	*reason = PGRAC_EXTERNAL_FENCE_DENY_NONE;
+	return failure_admissions;
+}
+static uint32
+failure_count(const PgracExternalFenceNeedSetV1 *needs)
+{
+	UT_ASSERT(needs == (const PgracExternalFenceNeedSetV1 *)2);
+	return failure_need_count;
+}
+static const PgracExternalFenceNeedV1 *
+failure_at(const PgracExternalFenceNeedSetV1 *needs, uint32 index)
+{
+	UT_ASSERT(needs == (const PgracExternalFenceNeedSetV1 *)2 && index == 0);
+	return failure_null_need ? NULL : &failure_need;
+}
+static ClusterRecoverySerialAcquireResult
+failure_ir_acquire(const ClusterRecoverySerialRequest *request, ClusterRecoverySerialGuard *guard)
+{
+	UT_ASSERT_EQ(failure_kind, 1);
+	UT_ASSERT_EQ(memcmp(request, &failure_request, sizeof(*request)), 0);
+	UT_ASSERT(!cluster_cf_held(ShareLock) && !cluster_cf_held(ExclusiveLock));
+	++failure_ir_acquires;
+	if (failure_ir_result == CLUSTER_RECOVERY_SERIAL_GRANTED)
+		*guard = failure_serial;
+	return failure_ir_result;
+}
+static ClusterRecoverySerialRevalidateResult
+failure_ir_revalidate(ClusterRecoverySerialGuard *guard)
+{
+	UT_ASSERT_EQ(failure_kind, 1);
+	return failure_ir_current && guard->held && !guard->release_uncertain
+				   && memcmp(guard, &failure_serial, sizeof(*guard)) == 0
+			   ? CLUSTER_RECOVERY_SERIAL_CURRENT
+			   : CLUSTER_RECOVERY_SERIAL_FENCE_STALE;
+}
+static ClusterRecoverySerialReleaseResult
+failure_ir_release(ClusterRecoverySerialGuard *guard)
+{
+	UT_ASSERT_EQ(failure_kind, 1);
+	UT_ASSERT_EQ(memcmp(guard, &failure_serial, sizeof(*guard)), 0);
+	++failure_ir_releases;
+	memset(guard, 0, sizeof(*guard));
+	return CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED;
+}
+static ClusterWalPinResult
+failure_walr_begin(const ClusterControlRootReadToken *token, bool sealed,
+				   ClusterWalRootPublishGuard **guard)
+{
+	UT_ASSERT_EQ(memcmp(token, &failure_request.expected_root_token, sizeof(*token)), 0);
+	UT_ASSERT(!sealed && *guard == NULL);
+	++failure_walr_begins;
+	*guard = (ClusterWalRootPublishGuard *)&failure_walr_identity;
+	return CLUSTER_WAL_PIN_OK;
+}
+static ClusterWalrReleaseResult
+failure_walr_end(ClusterWalRootPublishGuard **guard)
+{
+	UT_ASSERT(*guard == (ClusterWalRootPublishGuard *)&failure_walr_identity);
+	UT_ASSERT(!cluster_cf_held_is_usable(ShareLock) && !cluster_cf_held_is_usable(ExclusiveLock));
+	++failure_walr_ends;
+	*guard = NULL;
+	return CLUSTER_WALR_RELEASE_CONFIRMED;
+}
+static ClusterControlRootResult
+failure_read(const ClusterControlRootIdentity *expected, ControlRootImage *root,
+			 ControlFileData *native, ClusterControlRootFileToken *file, uint16 version)
+{
+	LOCKMODE mode = failure_direct							  ? failure_wait_mode()
+					: failure_kind == 0 || failure_reads != 0 ? ExclusiveLock
+															  : ShareLock;
+
+	UT_ASSERT(cluster_cf_held_is_clusterwide(mode));
+	UT_ASSERT_EQ(version, 3);
+	UT_ASSERT_EQ(memcmp(expected, &failure_request.duty, sizeof(*expected)), 0);
+	++failure_reads;
+	if (failure_throw_read)
+		ereport(ERROR, (errcode(ERRCODE_IO_ERROR), errmsg("failure input ROOT read failed")));
+	*root = retention_image;
+	memset(native, 0, sizeof(*native));
+	native->checkPoint = 100;
+	memset(file, 0, sizeof(*file));
+	return failure_root_result;
+}
+static ClusterControlRootResult
+failure_tail(const char *dir, const ClusterWalSourceRef *ref, int segment_size, XLogRecPtr lower,
+			 XLogRecPtr upper, XLogRecPtr checkpoint, pg_crc32c crc, ClusterWalTailObservation *out)
+{
+	UT_ASSERT(failure_kind != 0);
+	UT_ASSERT(dir == cluster_wal_threads_dir && segment_size == wal_segment_size);
+	UT_ASSERT_EQ(memcmp(ref, &cold_restart, sizeof(*ref)), 0);
+	UT_ASSERT_EQ(lower, 80);
+	UT_ASSERT_EQ(upper, failure_wal_reads == 0 ? 101 : 340);
+	UT_ASSERT_EQ(checkpoint, 100);
+	UT_ASSERT_EQ(crc, 21);
+	UT_ASSERT_EQ(cluster_cf_held(ExclusiveLock), failure_wal_reads != 0);
+	if (failure_wal_reads == 0)
+		UT_ASSERT(!cluster_cf_held(ShareLock));
+	++failure_wal_reads;
+	memset(out, 0, sizeof(*out));
+	out->complete_end = 340;
+	out->last_record_start = 300;
+	out->last_record_crc = 23 + (failure_tail_divergent && failure_wal_reads == 2);
+	if (failure_wal_hook != NULL && failure_wal_reads == 1)
+		failure_wal_hook();
+	return failure_wal_result;
+}
+static bool
+failure_publish(const ControlRootImage *base, const ControlRootImage *next)
+{
+	UT_ASSERT(cluster_cf_held_is_clusterwide(ExclusiveLock));
+	UT_ASSERT_EQ(base->header.file_txn_seq, retention_image.header.file_txn_seq);
+	++failure_publishes;
+	retention_image = *next;
+	return true;
+}
+static bool
+failure_actual_cf_lock(LOCKMODE mode)
+{
+	++failure_attempts;
+	if (claim_retiring_cookie != 0 && mode == failure_wait_mode()) {
+		UT_ASSERT(!cluster_cf_held(ShareLock) && !cluster_cf_held(ExclusiveLock));
+		UT_ASSERT(cluster_cf_release_completed(mode, claim_retiring_cookie));
+		UT_ASSERT(cluster_control_request_empty());
+		failure_receipt_before_reapply = true;
+	}
+	++g_next_request_id;
+	if (failure_attempts == failure_first_attempt())
+		g_seven_result = failure_acquire_result;
+	return claim_actual_cf_lock(mode);
+}
+/* Compile the original authorizer again against explicit fenced/IR leaves;
+ * the earlier self-only copy still has unavailable foreign/IR authority. */
+#define failure_v2_authorized failure_authorized
+#define failure_v2_current failure_current
+#define failure_v2_cleanup failure_cleanup
+#define cluster_recovery_duty_digest_for_claim failure_digest
+#define cluster_formation_witness_revalidate_nowait failure_formation_current
+#define cluster_external_fence_need_set_revalidate_nowait failure_needs_current
+#define cluster_external_fence_revalidate_set_nowait failure_admissions_current
+#define cluster_external_fence_need_set_count failure_count
+#define cluster_external_fence_need_set_at failure_at
+#define cluster_recovery_serial_acquire failure_ir_acquire
+#define cluster_recovery_serial_input_revalidate failure_ir_revalidate
+#define cluster_recovery_serial_release failure_ir_release
+#define cluster_wal_retention_root_publish_begin_exact failure_walr_begin
+#define cluster_wal_retention_root_publish_end failure_walr_end
+#define cluster_cf_lock failure_actual_cf_lock
+#define read_thread_version failure_read
+#define encode_extended_image self_encode
+#define publish_updated_image failure_publish
+#define cluster_wal_tail_observe_checkpoint failure_tail
+#include "test_cluster_failure_input_cf.inc"
+#undef cluster_wal_tail_observe_checkpoint
+#undef publish_updated_image
+#undef encode_extended_image
+#undef read_thread_version
+#undef cluster_cf_lock
+#undef cluster_wal_retention_root_publish_end
+#undef cluster_wal_retention_root_publish_begin_exact
+#undef cluster_recovery_serial_release
+#undef cluster_recovery_serial_input_revalidate
+#undef cluster_recovery_serial_acquire
+#undef cluster_external_fence_need_set_at
+#undef cluster_external_fence_need_set_count
+#undef cluster_external_fence_revalidate_set_nowait
+#undef cluster_external_fence_need_set_revalidate_nowait
+#undef cluster_formation_witness_revalidate_nowait
+#undef cluster_recovery_duty_digest_for_claim
+#undef failure_v2_cleanup
+#undef failure_v2_current
+#undef failure_v2_authorized
+static FailureInputV2Work failure_work;
+static void
+failure_ready_after_ack(void)
+{
+	UT_ASSERT_EQ(failure_attempts, failure_first_attempt());
+	UT_ASSERT_EQ(failure_reads, failure_kind != 0 ? failure_phase : 0);
+	UT_ASSERT_EQ(failure_wal_reads, failure_kind != 0 ? failure_phase : 0);
+	UT_ASSERT(cluster_cf_held(failure_wait_mode())
+			  && !cluster_cf_held_is_usable(failure_wait_mode()));
+	if (claim_retiring_cookie == 0)
+		claim_retiring_cookie = cluster_cf_owner_cookie(failure_wait_mode());
+	if (entry_waits == entry_ack_at) {
+		g_seven_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+		++g_next_request_id;
+	}
+}
+static void
+failure_fixture(unsigned kind, unsigned phase)
+{
+	self_fixture(phase);
+	failure_kind = kind;
+	failure_phase = phase;
+	failure_attempts = failure_reads = failure_wal_reads = failure_publishes = 0;
+	failure_ir_acquires = failure_ir_releases = failure_walr_begins = failure_walr_ends = 0;
+	failure_formation = failure_needs = failure_admissions = failure_ir_current = true;
+	failure_digest_valid = true;
+	failure_null_need = failure_direct = failure_throw_read = false;
+	failure_tail_divergent = failure_receipt_before_reapply = false;
+	failure_need_count = 1;
+	failure_root_result = failure_wal_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	failure_acquire_result = CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
+	failure_ir_result = CLUSTER_RECOVERY_SERIAL_GRANTED;
+	failure_wal_hook = NULL;
+	retention_image.records[0].root_flags
+		|= CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID | CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID;
+	if (kind != 0) {
+		retention_image.records[0].lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
+		retention_image.header.v2.serving[0] = 0;
+	}
+	failure_request = self_request;
+	if (kind != 2) {
+		failure_request.formation = (const ClusterFormationWitnessV1 *)1;
+		failure_request.fence_need_set = (const PgracExternalFenceNeedSetV1 *)2;
+		failure_request.fence_admission_set = (const PgracExternalFenceAdmissionSetV1 *)3;
+		failure_request.acquire_timeout_ms = failure_request.release_timeout_ms = 1000;
+	}
+	make_read_token(&retention_image, 1, CONTROL_ROOT_SOURCE_PRIMARY,
+					&failure_request.expected_root_token);
+	memset(&failure_need, 0, sizeof(failure_need));
+	failure_need.system_identifier = failure_request.duty.system_identifier;
+	failure_need.victim_node_id = failure_request.duty.origin_node_id;
+	failure_need.victim_incarnation = failure_request.duty.origin_owner_incarnation;
+	memset(&failure_need.canonical_duty_digest, 0x2a, sizeof(failure_need.canonical_duty_digest));
+	memset(&failure_serial, 0, sizeof(failure_serial));
+	failure_serial.held = true;
+	failure_serial.mode = CLUSTER_RECOVERY_SERIAL_INPUT_SEAL;
+	failure_serial.duty = failure_request.duty;
+	failure_serial.root_read_token = failure_request.expected_root_token;
+	failure_serial.formation = failure_request.formation;
+	failure_serial.fence_need_set = failure_request.fence_need_set;
+	failure_serial.fence_admission_set = failure_request.fence_admission_set;
+	failure_serial.release_timeout_ms = 1000;
+	failure_serial.lock_request.request_id = 123456;
+	memset(&failure_work, 0, sizeof(failure_work));
+	failure_work.format_version = 3;
+	failure_work.publisher_node = cluster_node_id;
+	failure_work.publisher_incarnation = control_creator.incarnation;
+	failure_work.self = kind == 2;
+	failure_work.self_restart = cold_restart;
+	failure_work.self_min_dead_us = 3000000;
+	if (kind == 0)
+		g_seven_result = CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
+	entry_on_wait = failure_ready_after_ack;
+}
+static bool
+failure_call(ClusterControlRootResult *result)
+{
+	volatile bool completed = false;
+
+	PG_TRY();
+	{
+		*result = failure_kind == 0 ? failure_v2_open_work(&failure_request, &failure_work)
+				  : failure_direct
+					  ? failure_v2_tail_read(&failure_request, &failure_work, failure_wait_mode())
+					  : failure_v2_tail_work(&failure_request, &failure_work);
+		completed = true;
+	}
+	PG_CATCH();
+	{
+		FlushErrorState();
+	}
+	PG_END_TRY();
+	return completed;
+}
+static void
+failure_finish(void)
+{
+	entry_on_wait = NULL;
+	claim_after_acquire = claim_on_reset = NULL;
+	claim_teardown = owner_ack_on_wait = true;
+	/* Test-only foreign holds are not owned by the publisher's cleanup. */
+	for (unsigned i = 0; i < 2; i++) {
+		LOCKMODE mode = i == 0 ? ShareLock : ExclusiveLock;
+
+		if (mode != failure_work.cf_mode && cluster_cf_held_is_usable(mode))
+			UT_ASSERT_EQ(cluster_cf_unlock_confirmed(mode), CLUSTER_CF_RELEASE_CONFIRMED);
+	}
+	UT_ASSERT_EQ(failure_cleanup(&failure_work, CLUSTER_CONTROL_ROOT_OK_PRIMARY),
+				 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	for (unsigned i = 0; i < 2; i++) {
+		LOCKMODE mode = i == 0 ? ShareLock : ExclusiveLock;
+
+		if (cluster_cf_held_is_usable(mode))
+			UT_ASSERT_EQ(cluster_cf_unlock_confirmed(mode), CLUSTER_CF_RELEASE_CONFIRMED);
+	}
+	(void)acknowledge_retirements();
+	cluster_cf_retirement_poll();
+	UT_ASSERT(!cluster_cf_held(ShareLock) && !cluster_cf_held(ExclusiveLock));
+	UT_ASSERT(cluster_control_request_empty());
+	UT_ASSERT_EQ(pg_atomic_read_u32(&MyProc->cluster_grd_registered_count), 0);
+	claim_teardown = owner_ack_on_wait = false;
+	cold_consumer = false;
+}
+UT_TEST(startup_failure_input_cf_slice_waits_with_original_authority)
+{
+	for (unsigned kind = 0; kind < 3; kind++)
+		for (unsigned phase = 0; phase < (kind == 0 ? 1 : 2); phase++) {
+			ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+
+			failure_fixture(kind, phase);
+			UT_ASSERT(failure_call(&result));
+			UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+			UT_ASSERT_EQ(entry_waits, 3);
+			UT_ASSERT_EQ(failure_attempts, kind == 0 ? 2 : 3);
+			UT_ASSERT_EQ(failure_reads, kind == 0 ? 2 : 3);
+			UT_ASSERT_EQ(failure_wal_reads, kind == 0 ? 0 : 2);
+			UT_ASSERT_EQ(failure_publishes, 1);
+			UT_ASSERT(failure_receipt_before_reapply);
+			UT_ASSERT_EQ(retention_image.records[0].lifecycle,
+						 CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED);
+			UT_ASSERT(retention_image.records[0].root_flags
+					  & CLUSTER_CONTROL_ROOT_FLAG_FPW_WAS_OFF);
+			UT_ASSERT_EQ(retention_image.header.v2.serving[0], 0);
+			failure_finish();
+			UT_ASSERT_EQ(failure_ir_acquires, kind == 1);
+			UT_ASSERT_EQ(failure_ir_releases, kind == 1);
+			UT_ASSERT_EQ(failure_walr_begins, 1);
+			UT_ASSERT_EQ(failure_walr_ends, 1);
+		}
+}
+
+
+static unsigned failure_fault;
+static CfHoldState failure_saved_slot;
+static ClusterControlRequestView failure_saved_record;
+static bool
+failure_fault_applies(unsigned fault)
+{
+	if (fault == 26 || (fault >= 45 && fault <= 48))
+		return failure_kind == 2;
+	if ((fault >= 29 && fault <= 31) || (fault >= 39 && fault <= 44))
+		return failure_kind != 2;
+	if (fault == 32 || fault == 33)
+		return failure_kind == 1;
+	return true;
+}
+static void
+failure_change_context(void)
+{
+	CfHoldState *slot = cf_slot(failure_wait_mode());
+
+	switch (failure_fault) {
+	case 0:
+		MyProcPid++;
+		break;
+	case 1:
+		MyProc = NULL;
+		break;
+	case 2:
+		MyLatch = NULL;
+		break;
+	case 3:
+		CurrentResourceOwner = (ResourceOwner)2;
+		break;
+	case 4:
+		MyBackendType = B_BG_WORKER;
+		break;
+	case 5:
+		MyAuxProcType = BgWriterProcess;
+		break;
+	case 6:
+		cluster_node_id = 1;
+		break;
+	case 7:
+		owner_epoch++;
+		break;
+	case 8:
+		owner_generation++;
+		break;
+	case 9:
+		control_creator.incarnation++;
+		break;
+	case 10:
+		InRecovery = !InRecovery;
+		break;
+	case 11:
+		entry_authority = false;
+		break;
+	case 12:
+		cluster_shared_config = false;
+		break;
+	case 13:
+		cluster_controlfile_shared_authority = false;
+		break;
+	case 14:
+		cluster_enabled = false;
+		break;
+	case 15:
+		ShutdownRequestPending = true;
+		break;
+	case 16:
+		entry_native_lock = true;
+		break;
+	case 17:
+		CritSectionCount = 1;
+		break;
+	case 18:
+		failure_work.self = !failure_work.self;
+		break;
+	case 19:
+		failure_request.mode++;
+		break;
+	case 20:
+		failure_request.duty.thread_claim_crc32c++;
+		break;
+	case 21:
+		failure_request.expected_root_token.file_txn_seq++;
+		break;
+	case 22:
+		failure_work.self_min_dead_us++;
+		break;
+	case 23:
+		failure_work.publisher_node++;
+		break;
+	case 24:
+		failure_work.publisher_incarnation++;
+		break;
+	case 25:
+		failure_work.self_restart.claim.claim_sha256[0]++;
+		break;
+	case 26:
+		cold_restart.claim.claim_sha256[0]++;
+		break;
+	case 27:
+		failure_work.walr = NULL;
+		break;
+	case 28:
+		failure_work.format_version++;
+		break;
+	case 29:
+		failure_formation = false;
+		break;
+	case 30:
+		failure_needs = false;
+		break;
+	case 31:
+		failure_admissions = false;
+		break;
+	case 32:
+		failure_ir_current = false;
+		break;
+	case 33:
+		failure_work.serial.held = false;
+		break;
+	case 34:
+		failure_work.serial.release_uncertain = true;
+		break;
+	case 35:
+		failure_work.serial.lock_request.request_id++;
+		break;
+	case 36:
+		failure_work.serial.duty.thread_claim_crc32c++;
+		break;
+	case 37:
+		failure_work.serial.root_read_token.file_txn_seq++;
+		break;
+	case 38:
+		failure_work.serial.mode++;
+		break;
+	case 39:
+		failure_digest_valid = false;
+		break;
+	case 40:
+		failure_need.victim_incarnation++;
+		break;
+	case 41:
+		failure_need.canonical_duty_digest.bytes[0] ^= 1;
+		break;
+	case 42:
+		failure_need.system_identifier++;
+		break;
+	case 43:
+		failure_need_count = 0;
+		break;
+	case 44:
+		failure_null_need = true;
+		break;
+	case 45:
+		self_quorum = false;
+		break;
+	case 46:
+		retention_member = false;
+		break;
+	case 47:
+		retention_admitted++;
+		break;
+	case 48:
+		self_death = false;
+		break;
+	case 49:
+		enableFsync = false;
+		break;
+	case 50:
+		slot->owner.request.control_owner_id++;
+		break;
+	case 51:
+		slot->owner.attempt.generation++;
+		break;
+	case 52:
+		control_requests->records[slot->owner.attempt.slot].owner.incarnation++;
+		break;
+	case 53:
+		control_requests->records[slot->owner.attempt.slot].message.key.holder.request_id++;
+		break;
+	case 54:
+		control_requests->records[slot->owner.attempt.slot].message.key.holder.cluster_epoch++;
+		break;
+	case 55:
+		control_requests->records[slot->owner.attempt.slot].state = CLUSTER_CONTROL_REQUEST_INVALID;
+		break;
+	case 56:
+		slot->release_pending = false;
+		break;
+	case 57:
+		slot->owner.state = CLUSTER_LOCK_OWNER_ACQUIRING;
+		break;
+	case 58:
+		slot->owner.cooperative_acquire = true;
+		break;
+	case 59:
+		cf_slot(failure_wait_mode() == ShareLock ? ExclusiveLock : ShareLock)->held = true;
+		break;
+	}
+}
+static void
+failure_change_while_waiting(void)
+{
+	failure_ready_after_ack();
+	failure_saved_slot = *cf_slot(failure_wait_mode());
+	failure_saved_record = control_requests->records[failure_saved_slot.owner.attempt.slot];
+	failure_change_context();
+}
+static void
+failure_restore_guards(void)
+{
+	if (failure_kind == 1)
+		failure_work.serial = failure_serial;
+	else
+		memset(&failure_work.serial, 0, sizeof(failure_work.serial));
+	failure_work.walr = (ClusterWalRootPublishGuard *)&failure_walr_identity;
+}
+UT_TEST(startup_failure_input_wait_rechecks_original_actor_purpose_guard_and_request)
+{
+	for (unsigned kind = 0; kind < 3; kind++)
+		for (unsigned phase = 0; phase < (kind == 0 ? 1 : 2); phase++)
+			for (failure_fault = 0; failure_fault < 60; failure_fault++) {
+				ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+				int pid = MyProcPid;
+				uint64 epoch = owner_epoch, generation = owner_generation;
+				uint64 boot = control_creator.incarnation;
+
+				failure_fixture(kind, phase);
+				if (!failure_fault_applies(failure_fault))
+					continue;
+				entry_on_wait = failure_change_while_waiting;
+				UT_ASSERT(!failure_call(&result));
+				UT_ASSERT_EQ(entry_code, ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED);
+				UT_ASSERT_EQ(entry_level, FATAL);
+				UT_ASSERT_EQ(entry_waits, 1);
+				UT_ASSERT_EQ(failure_reads, kind == 0 ? 0 : phase);
+				UT_ASSERT_EQ(failure_wal_reads, kind == 0 ? 0 : phase);
+				UT_ASSERT_EQ(failure_publishes, 0);
+				recovery_restore_actor(pid, epoch, generation, boot);
+				*cf_slot(failure_wait_mode()) = failure_saved_slot;
+				control_requests->records[failure_saved_slot.owner.attempt.slot]
+					= failure_saved_record;
+				memset(cf_slot(failure_wait_mode() == ShareLock ? ExclusiveLock : ShareLock), 0,
+					   sizeof(CfHoldState));
+				failure_restore_guards();
+				failure_finish();
+			}
+}
+static void
+failure_change_after_grant(void)
+{
+	if (entry_waits != 0)
+		failure_change_context();
+}
+UT_TEST(startup_failure_input_new_grant_requalifies_before_root_io)
+{
+	const unsigned faults[] = { 3, 7, 18, 21, 27, 29, 31, 32, 35, 45 };
+
+	for (unsigned kind = 0; kind < 3; kind++)
+		for (unsigned phase = 0; phase < (kind == 0 ? 1 : 2); phase++)
+			for (unsigned i = 0; i < lengthof(faults); i++) {
+				ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+				uint64 epoch = owner_epoch;
+
+				failure_fixture(kind, phase);
+				failure_fault = faults[i];
+				if (!failure_fault_applies(failure_fault))
+					continue;
+				claim_after_acquire = failure_change_after_grant;
+				UT_ASSERT(failure_call(&result));
+				UT_ASSERT_EQ(result, failure_fault == 7 ? CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE
+														: CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+				UT_ASSERT_EQ(entry_waits, 3);
+				UT_ASSERT_EQ(failure_reads, kind == 0 ? 0 : phase);
+				UT_ASSERT_EQ(failure_wal_reads, kind == 0 ? 0 : phase);
+				UT_ASSERT_EQ(failure_publishes, 0);
+				CurrentResourceOwner = (ResourceOwner)1;
+				owner_epoch = epoch;
+				failure_restore_guards();
+				failure_finish();
+			}
+}
+static void
+failure_remove_receipt(void)
+{
+	failure_ready_after_ack();
+	UT_ASSERT(acknowledge_retirements());
+	cluster_cf_retirement_poll();
+	UT_ASSERT(cluster_cf_release_completed(failure_wait_mode(), claim_retiring_cookie));
+	if (failure_wait_mode() == ShareLock)
+		cf_retired_s = 0;
+	else
+		cf_retired_x = 0;
+}
+static void
+failure_ack_during_reset(void)
+{
+	if (failure_attempts != failure_first_attempt() || !cluster_cf_held(failure_wait_mode()))
+		return;
+	claim_retiring_cookie = cluster_cf_owner_cookie(failure_wait_mode());
+	UT_ASSERT(acknowledge_retirements());
+	g_seven_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	++g_next_request_id;
+}
+static void
+failure_empty_grant(void)
+{
+	UT_ASSERT(!cluster_cf_held(ShareLock) && !cluster_cf_held(ExclusiveLock));
+	UT_ASSERT(cluster_control_request_empty());
+	UT_ASSERT_EQ(failure_reads, failure_kind == 0 ? 0 : failure_phase);
+	g_seven_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	++g_next_request_id;
+}
+UT_TEST(startup_failure_input_receipt_and_wake_rules_preserve_progress)
+{
+	for (unsigned kind = 0; kind < 3; kind++)
+		for (unsigned phase = 0; phase < (kind == 0 ? 1 : 2); phase++)
+			for (unsigned fault = 0; fault < 4; fault++) {
+				ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+
+				failure_fixture(kind, phase);
+				entry_lost_latch = true;
+				if (fault == 0)
+					entry_on_wait = failure_remove_receipt;
+				else if (fault == 1)
+					claim_on_reset = failure_ack_during_reset;
+				else if (fault == 2) {
+					fail_after_publication = false;
+					entry_on_wait = failure_empty_grant;
+				}
+				UT_ASSERT_EQ(failure_call(&result), fault != 0);
+				UT_ASSERT_EQ(entry_waits, fault == 1 ? 0 : fault == 3 ? 3 : 1);
+				if (fault == 0) {
+					UT_ASSERT_EQ(entry_code, ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED);
+					UT_ASSERT_EQ(failure_publishes, 0);
+				} else {
+					UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+					UT_ASSERT_EQ(failure_publishes, 1);
+				}
+				failure_finish();
+			}
+}
+UT_TEST(startup_failure_input_hard_untyped_and_preexisting_requests_do_not_retry)
+{
+	for (unsigned kind = 0; kind < 3; kind++)
+		for (unsigned phase = 0; phase < (kind == 0 ? 1 : 2); phase++)
+			for (unsigned fault = 0; fault < 7; fault++) {
+				ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+				LOCKMODE preexisting = fault == 3 || fault == 5 ? ShareLock : ExclusiveLock;
+				bool foreign;
+				unsigned before;
+
+				failure_fixture(kind, phase);
+				foreign = fault >= 3 && preexisting != failure_wait_mode();
+				if (fault == 0)
+					failure_acquire_result = CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+				else if (fault == 1)
+					g_timeout_detail.source = CLUSTER_GES_TSRC_NONE;
+				else if (fault == 2)
+					entry_on_wait = entry_hard_error;
+				else {
+					g_seven_result = fault >= 5 ? CLUSTER_LOCK_ACQUIRE_OK_GRANTED
+												: CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
+					UT_ASSERT_EQ(cluster_cf_lock(preexisting), fault >= 5);
+					failure_direct = true;
+					if (kind != 0)
+						failure_work.walr = (ClusterWalRootPublishGuard *)&failure_walr_identity;
+					if (kind == 1)
+						failure_work.serial = failure_serial;
+				}
+				before = g_seven_count;
+				if (fault == 2 || foreign) {
+					UT_ASSERT(!failure_call(&result));
+					UT_ASSERT_EQ(entry_code, foreign ? ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED
+													 : ERRCODE_IO_ERROR);
+				} else {
+					UT_ASSERT(failure_call(&result));
+					UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+				}
+				UT_ASSERT_EQ(entry_waits, fault == 2 ? 1 : 0);
+				UT_ASSERT_EQ(g_seven_count, before
+												+ (foreign	   ? 1
+												   : fault < 3 ? failure_first_attempt()
+															   : 0));
+				UT_ASSERT_EQ(failure_reads, fault < 3 && kind != 0 ? phase : 0);
+				UT_ASSERT_EQ(failure_publishes, 0);
+				failure_finish();
+			}
+}
+static void
+failure_change_root(void)
+{
+	failure_ready_after_ack();
+	switch (failure_fault) {
+	case 0:
+		retention_image.records[0].root_publish_seq++;
+		break;
+	case 1:
+		failure_root_result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+		break;
+	case 2:
+		failure_throw_read = true;
+		break;
+	case 3:
+		failure_wal_result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+		break;
+	case 4:
+		failure_tail_divergent = true;
+		break;
+	}
+}
+UT_TEST(startup_failure_input_real_root_and_wal_refusals_remain_errors)
+{
+	const ClusterControlRootResult expected[]
+		= { CLUSTER_CONTROL_ROOT_CAS_CONFLICT, CLUSTER_CONTROL_ROOT_IO_ERROR,
+			CLUSTER_CONTROL_ROOT_IO_ERROR, CLUSTER_CONTROL_ROOT_IO_ERROR,
+			CLUSTER_CONTROL_ROOT_COPY_DIVERGENT };
+
+	for (unsigned kind = 0; kind < 3; kind++)
+		for (unsigned phase = 0; phase < (kind == 0 ? 1 : 2); phase++)
+			for (failure_fault = 0; failure_fault < (kind == 0 ? 3 : 5); failure_fault++) {
+				ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+
+				failure_fixture(kind, phase);
+				entry_on_wait = failure_change_root;
+				UT_ASSERT_EQ(failure_call(&result), failure_fault != 2);
+				if (failure_fault == 2)
+					UT_ASSERT_EQ(entry_code, ERRCODE_IO_ERROR);
+				else
+					UT_ASSERT_EQ(result, expected[failure_fault]);
+				UT_ASSERT_EQ(entry_waits, 3);
+				UT_ASSERT_EQ(failure_publishes, 0);
+				failure_finish();
+			}
+}
+static void
+failure_change_owner_outside_cf(void)
+{
+	UT_ASSERT(!cluster_cf_held(ShareLock) && !cluster_cf_held(ExclusiveLock));
+	CurrentResourceOwner = (ResourceOwner)2;
+}
+UT_TEST(startup_failure_tail_second_interval_keeps_the_original_owner)
+{
+	for (unsigned kind = 1; kind < 3; kind++) {
+		ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+
+		failure_fixture(kind, 1);
+		failure_wal_hook = failure_change_owner_outside_cf;
+		UT_ASSERT(!failure_call(&result));
+		UT_ASSERT_EQ(entry_code, ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED);
+		UT_ASSERT_EQ(entry_waits, 0);
+		UT_ASSERT_EQ(failure_reads, 1);
+		UT_ASSERT_EQ(failure_wal_reads, 1);
+		UT_ASSERT_EQ(failure_publishes, 0);
+		CurrentResourceOwner = (ResourceOwner)1;
+		failure_finish();
+	}
+}
+UT_TEST(startup_failure_input_original_cancel_keeps_shared_cleanup_responsibility)
+{
+	for (unsigned kind = 0; kind < 3; kind++)
+		for (unsigned phase = 0; phase < (kind == 0 ? 1 : 2); phase++) {
+			ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+			volatile bool exited = false;
+
+			failure_fixture(kind, phase);
+			entry_on_wait = entry_shutdown;
+			startup_fixture_exit_hook = entry_owner_exit;
+			startup_fixture_armed = true;
+			if (sigsetjmp(startup_fixture_exit, 1) == 0)
+				UT_ASSERT(!failure_call(&result));
+			else
+				exited = true;
+			UT_ASSERT(exited);
+			UT_ASSERT_EQ(startup_fixture_exit_code, 1);
+			UT_ASSERT_EQ(entry_waits, 1);
+			UT_ASSERT_EQ(failure_reads, kind == 0 ? 0 : phase);
+			UT_ASSERT_EQ(failure_publishes, 0);
+			UT_ASSERT(control_requests->records[cf_slot(failure_wait_mode())->owner.attempt.slot]
+						  .owner_exited);
+			PG_exception_stack = NULL;
+			error_context_stack = NULL;
+			proc_exit_inprogress = shutdown_requested = false;
+			startup_fixture_armed = false;
+			startup_fixture_exit_hook = NULL;
+			failure_finish();
+		}
+}
+UT_TEST(ordinary_failure_input_roles_keep_the_original_wait_policy)
+{
+	const BackendType roles[] = { B_BG_WORKER, B_BG_WRITER, B_CHECKPOINTER, B_LMON };
+
+	for (unsigned kind = 0; kind < 3; kind++)
+		for (unsigned phase = 0; phase < (kind == 0 ? 1 : 2); phase++)
+			for (unsigned role = 0; role < lengthof(roles); role++) {
+				ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+
+				failure_fixture(kind, phase);
+				failure_direct = true;
+				if (kind != 0)
+					failure_work.walr = (ClusterWalRootPublishGuard *)&failure_walr_identity;
+				if (kind == 1)
+					failure_work.serial = failure_serial;
+				MyBackendType = roles[role];
+				UT_ASSERT(failure_call(&result));
+				UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+				UT_ASSERT_EQ(entry_waits, 0);
+				UT_ASSERT_EQ(failure_reads | failure_publishes, 0);
+				MyBackendType = B_STARTUP;
+				failure_finish();
+			}
+}
+
 int
 main(void)
 {
@@ -4609,7 +5506,13 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(65);
+	if (getenv("PGRAC_PRE2_TEST_FAILURE_CF_LIVENESS") != NULL) {
+		UT_PLAN(1);
+		UT_RUN(startup_failure_input_cf_slice_waits_with_original_authority);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
+	UT_PLAN(74);
 	UT_RUN(startup_cf_timeout_waits_for_exact_completion_before_begin);
 	UT_RUN(startup_cf_completion_does_not_preserve_changed_native_input);
 	UT_RUN(startup_cf_unsafe_native_context_never_takes_a_registry_lock);
@@ -4675,6 +5578,15 @@ main(void)
 	UT_RUN(startup_self_seal_second_interval_keeps_the_original_owner);
 	UT_RUN(startup_self_seal_original_cancel_keeps_shared_cleanup_responsibility);
 	UT_RUN(ordinary_self_open_read_keeps_the_original_wait_policy);
+	UT_RUN(startup_failure_input_cf_slice_waits_with_original_authority);
+	UT_RUN(startup_failure_input_wait_rechecks_original_actor_purpose_guard_and_request);
+	UT_RUN(startup_failure_input_new_grant_requalifies_before_root_io);
+	UT_RUN(startup_failure_input_receipt_and_wake_rules_preserve_progress);
+	UT_RUN(startup_failure_input_hard_untyped_and_preexisting_requests_do_not_retry);
+	UT_RUN(startup_failure_input_real_root_and_wal_refusals_remain_errors);
+	UT_RUN(startup_failure_tail_second_interval_keeps_the_original_owner);
+	UT_RUN(startup_failure_input_original_cancel_keeps_shared_cleanup_responsibility);
+	UT_RUN(ordinary_failure_input_roles_keep_the_original_wait_policy);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

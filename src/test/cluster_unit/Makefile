@@ -1466,6 +1466,7 @@ test_cluster_startup_cf_entry: test_cluster_startup_cf_entry.c test_cluster_cf_e
 		test_cluster_inputs_cf.inc test_cluster_inputs_cf_checkpoint.inc \
 		test_cluster_retention_cf_types.inc test_cluster_retention_cf.inc \
 		test_cluster_recovery_wal_cf.inc test_cluster_self_seal_cf.inc \
+		test_cluster_failure_input_cf.inc \
 		test_cluster_cf_blocker_trace.inc test_cluster_startup_interrupt.inc unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_cf_enqueue.c \
 		$(top_srcdir)/src/backend/cluster/cluster_lock_owner.c \
@@ -1553,14 +1554,25 @@ test_cluster_recovery_wal_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_cont
 # Optional wait helpers keep the same target usable for the tests-first RED.
 test_cluster_self_seal_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_control_root.c Makefile
 	awk '/^typedef struct FailureInputV2Work / { types=1; work++ } \
-	     /^typedef struct FailureSelfCfWait / { types=1; helpers++ } \
+	     /^typedef struct (FailureSelfCfWait|FailureInputCfWait) / { types=1; helpers++ } \
 	     types { print; if (/^}/) types=0; next } \
 	     /^(self_predecessor_authorized|failure_v2_authorized|failure_v2_current)\(/ { print "static bool"; emit=1; predicates++ } \
 	     /^failure_self_cf_current\(/ { print "static bool"; emit=1; checks++ } \
 	     /^failure_self_cf_(capture|wait)\(/ { print "static void"; emit=1; waiters++ } \
 	     /^(failure_v2_cleanup|failure_v2_self_open_read|failure_v2_self_seal_work)\(/ { print "static ClusterControlRootResult"; emit=1; consumers++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (work != 1 || helpers > 1 || predicates != 3 || checks > 1 || waiters > 2 || consumers != 3 || types || emit) exit 1 }' $< > $@.tmp
+	     END { if (work != 1 || helpers > 2 || predicates != 3 || checks > 1 || waiters > 2 || consumers != 3 || types || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Failure input keeps its original fenced or self authority and IR purpose.
+# Work declarations are shared with the original self-seal extraction above.
+test_cluster_failure_input_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_control_root.c Makefile
+	awk '/^(failure_v2_authorized|failure_v2_current)\(/ { print "static bool"; emit=1; predicates++ } \
+	     /^failure_input_cf_current\(/ { print "static bool"; emit=1; checks++ } \
+	     /^failure_input_cf_(capture|wait)\(/ { print "static void"; emit=1; waiters++ } \
+	     /^(failure_v2_cleanup|failure_v2_tail_read|failure_v2_tail_commit|failure_v2_tail_work|failure_v2_open_work)\(/ { print "static ClusterControlRootResult"; emit=1; consumers++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (predicates != 2 || checks > 1 || waiters > 2 || consumers != 5 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # PGRAC: execute the real earliest startup-directory mutation call site.
