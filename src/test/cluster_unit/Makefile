@@ -9256,6 +9256,60 @@ test_cluster_normal_cold_postjobs.inc: $(top_srcdir)/src/backend/access/transam/
 	@awk '/^StartupXLOG\(/ { fn=1 } fn && /PGRAC MODIFICATIONS \(spec-4.8 D1\): resolve crash-left/ { print "/*"; emit=1; starts++ } \
 		emit && /^#endif/ { done=1; exit } emit { print } END { if (!done || starts != 1) exit 1 }' $< > $@
 
+# Preserve the native absent-input/owner guards, then abort at the unmodelled
+# retained-cold boundary. Count every source anchor so source drift fails build.
+test_cluster_normal_cold_memory.inc: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_startup.c Makefile
+	@awk '/^int cluster_cold_recovery_plan_memory = CLUSTER_COLD_PLAN_MEMORY_DEFAULT_KB;/ { print; count++ } \
+		END { if (count != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_normal_cold_observe_guard.inc: $(top_srcdir)/src/backend/access/transam/xlogrecovery.c Makefile
+	@awk '/^static struct ClusterRecoveryStartV1 \*cluster_recovery_cold_start;/ { print; owners++ } \
+		/^ClusterColdRecoveryCtrcObserve\(/ { print previous; emit=1; starts++ } \
+		emit && /^\tstate = cluster_recovery_cold_start;/ { emit=0; stops++ } \
+		emit { print } { previous=$$0 } \
+		END { if (owners != 1 || starts != 1 || stops != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_normal_cold_wait_guard.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_plan.c Makefile
+	@awk '/^static ClusterRecoveryPlanShmem \*cluster_recovery_plan_shmem = NULL;/ { print; shared++ } \
+		/^static const struct ClusterRecoveryStartV1 \*checkpoint_registered_start;/ { print; owners++ } \
+		/^typedef struct RecoveryCtrcHandoffV1 \{/ { type=1; types++ } \
+		/^cluster_recovery_ctrc_result_wait_v1\(/ { print previous; emit=1; starts++ } \
+		emit && /^\tfixed.start = start;/ { emit=0; stops++ } \
+		type || emit { print } /^} RecoveryCtrcHandoffV1;/ { type=0 } { previous=$$0 } \
+		END { if (shared != 1 || owners != 1 || types != 1 || starts != 1 || stops != 1 || type || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_normal_cold_claim_guard.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_merge.c Makefile
+	@awk '/^static bool merge_claim_held = false;/ { print; held++ } \
+		/^typedef struct MergeClaimCustody \{/ { type=1; types++ } \
+		/^static MergeClaimCustody merge_claim_custody = / { print; owners++ } \
+		/^cluster_recovery_merge_claim_release_if_held\(/ { print previous; emit=1; starts++ } \
+		emit && /^\tcookie = merge_claim_cf_enter\(\);/ { emit=0; stops++ } \
+		type || emit { print } /^} MergeClaimCustody;/ { type=0 } { previous=$$0 } \
+		END { if (held != 1 || types != 1 || owners != 1 || starts != 1 || stops != 1 || type || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+CLUSTER_NORMAL_COLD_GUARDS_O = test_cluster_normal_cold_guards.o
+$(CLUSTER_NORMAL_COLD_GUARDS_O): test_cluster_normal_cold_guards.c \
+		test_cluster_normal_cold_memory.inc test_cluster_normal_cold_observe_guard.inc \
+		test_cluster_normal_cold_wait_guard.inc test_cluster_normal_cold_claim_guard.inc \
+		$(top_srcdir)/src/include/access/xlogrecovery.h \
+		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_census.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_merge.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_plan.h \
+		$(top_srcdir)/src/include/utils/resowner.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
+.PHONY: clean-normal-cold-guards
+clean-normal-cold-guards:
+	rm -f $(CLUSTER_NORMAL_COLD_GUARDS_O) test_cluster_normal_cold_*guard.inc \
+		test_cluster_normal_cold_*guard.inc.tmp test_cluster_normal_cold_memory.inc \
+		test_cluster_normal_cold_memory.inc.tmp
+clean distclean maintainer-clean: clean-normal-cold-guards
+
 # PGRAC: compile the actual observation predicate behind the semantic caller;
 # fixture values are external inputs, never a hand-copied liveness decision.
 test_cluster_stop_membership_observation.inc: $(top_srcdir)/src/backend/cluster/cluster_reconfig.c Makefile
@@ -9269,6 +9323,7 @@ test_cluster_r4_activation_fsm: test_cluster_r4_activation_fsm.c unit_test.h tes
 		test_cluster_normal_cold_startup.h test_cluster_normal_cold_capture.inc \
 		test_cluster_normal_cold_prepare.inc test_cluster_normal_cold_postjobs.inc test_cluster_hw_complete_tail.inc \
 		test_cluster_normal_cold_runtime.h $(CLUSTER_UNDO_BLOCK0_RESIDENT_O) \
+		$(CLUSTER_NORMAL_COLD_GUARDS_O) \
 		cluster_r4_open_route_test_stubs.h $(CLUSTER_R4_OPEN_ROUTE_TEST_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_control_rebind.inc \
 		$(CLUSTER_SEMANTIC_ACTIVATION_C) $(CLUSTER_SEMANTIC_ACTIVATION_H) \
@@ -9281,6 +9336,7 @@ test_cluster_r4_activation_fsm: test_cluster_r4_activation_fsm.c unit_test.h tes
 		$(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) $(CLUSTER_R4_OPEN_ROUTE_TEST_O) \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
 		$(CLUSTER_UNDO_BLOCK0_RESIDENT_O) \
+		$(CLUSTER_NORMAL_COLD_GUARDS_O) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -lssl -lcrypto -o $@
@@ -9298,6 +9354,7 @@ test_cluster_control_rebind: test_cluster_control_rebind.c test_cluster_r4_activ
 		test_cluster_normal_cold_capture.inc test_cluster_normal_cold_prepare.inc \
 		test_cluster_normal_cold_postjobs.inc test_cluster_hw_complete_tail.inc \
 		test_cluster_normal_cold_runtime.h cluster_r4_open_route_test_stubs.h \
+		$(CLUSTER_NORMAL_COLD_GUARDS_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_control_rebind.inc \
 		$(CLUSTER_SEMANTIC_ACTIVATION_C) $(CLUSTER_SEMANTIC_ACTIVATION_H) \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_BLOCK0_O) $(CLUSTER_REPLACEMENT_EPISODE_O) \
@@ -9311,6 +9368,7 @@ test_cluster_control_rebind: test_cluster_control_rebind.c test_cluster_r4_activ
 		$(CLUSTER_REPLACEMENT_WIRE_O) $(CLUSTER_EPOCH_BALLOT_O) \
 		$(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) $(CLUSTER_R4_OPEN_ROUTE_TEST_O) \
 		$(CLUSTER_UNDO_BLOCK0_RESIDENT_O) $(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
+		$(CLUSTER_NORMAL_COLD_GUARDS_O) \
 		$(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) -lssl -lcrypto -o $@
 

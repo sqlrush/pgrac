@@ -12275,7 +12275,7 @@ UT_TEST(test_stop_trace_recovered_equal_epoch_refuses_before_owner)
 int
 main(void)
 {
-	UT_PLAN(417);
+	UT_PLAN(418);
 	UT_RUN(test_stop_trace_preserves_recovered_record_acceptance);
 	UT_RUN(test_stop_trace_preserves_recovered_service_owner_guards);
 	UT_RUN(test_stop_trace_recovered_equal_epoch_refuses_before_owner);
@@ -12334,6 +12334,7 @@ main(void)
 	UT_RUN(test_normal_actual_postjobs_exclude_shared_legacy_page_rollback);
 	UT_RUN(test_normal_actual_finish_requires_cf_and_hw_and_keeps_disk_history);
 	UT_RUN(test_normal_actual_finish_failure_is_fatal_not_ready);
+	UT_RUN(test_normal_actual_cold_guards_require_the_original_owner);
 	UT_RUN(test_01_feature_bit_is_one);
 	UT_RUN(test_02_required_hello_caps_are_frozen);
 	UT_RUN(test_03_action_values_are_frozen);
