@@ -3069,6 +3069,21 @@ test_cluster_side_xact_budget_product.o: $(top_srcdir)/src/backend/cluster/clust
 test_cluster_side_xact test_cluster_pi_contribution test_cluster_recovery_c0_plan test_cluster_cold_tt_redo: test_cluster_side_relmap_terminal.inc test_cluster_side_clog_applied.inc
 test_cluster_side_xact: $(top_builddir)/src/backend/cluster/cluster_wal_claim.o
 test_cluster_side_xact: test_cluster_side_clog_full.inc test_cluster_side_clog_witness.inc
+ifeq ($(enable_pgrac_cluster),yes)
+test_cluster_side_xact: test_cluster_side_native_clog.o \
+		test_cluster_side_native_clog.inc test_cluster_side_native_clog.h
+test_cluster_side_native_clog.o: test_cluster_side_native_clog.c \
+		test_cluster_side_native_clog.h test_cluster_side_native_clog_namespace.h \
+		test_cluster_clog_recovery.c test_cluster_clog_relmap_participant.inc \
+		test_cluster_clog_relmap_mutation.inc test_cluster_clog_relmap_shared_mutation.inc \
+		test_cluster_clog_page_birth.inc test_cluster_clog_full_consumer.inc \
+		test_cluster_clog_own_full.inc unit_test.h \
+		$(top_srcdir)/src/backend/access/transam/clog.c \
+		$(top_srcdir)/src/backend/access/transam/slru.c \
+		$(top_srcdir)/src/include/access/clog.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -Werror -c $< -o $@
+endif
 
 CLUSTER_SIDE_ONLINE_PLAN_TEST_O = test_cluster_side_online_plan.o
 $(CLUSTER_SIDE_ONLINE_PLAN_TEST_O): \
@@ -3143,13 +3158,14 @@ test_cluster_side_xact test_cluster_pi_contribution test_cluster_recovery_c0_pla
 		$(CLUSTER_REMOTE_XACT_IDENTITY_O) \
 		$(SIDE_XACT_XACTDESC_O) $(SIDE_XACT_TT_2PC_RECORD_O) \
 		test_cluster_side_xact_undo_product.o $(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_side_xact_budget_product.o \
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(if $(and $(filter yes,$(enable_pgrac_cluster)),$(filter test_cluster_side_xact,$@)),-DTEST_CLUSTER_SIDE_NATIVE_CLOG_OWNER) $< test_cluster_side_xact_budget_product.o \
 		test_cluster_side_online_owner_product.o $(CLUSTER_SIDE_HEAD_READER_O) \
 		$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) $(SIDE_XACT_XACTDESC_O) \
 		$(CLUSTER_REMOTE_XACT_IDENTITY_O) \
 		$(SIDE_XACT_TT_2PC_RECORD_O) test_cluster_side_xact_undo_product.o \
 		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) \
 		$(CLUSTER_COLD_EXTRA_O) \
+		$(if $(and $(filter yes,$(enable_pgrac_cluster)),$(filter test_cluster_side_xact,$@)),test_cluster_side_native_clog.o) \
 		$(filter test_cluster_page_data_stable.o test_cluster_cold_tt_redo_product.o test_cluster_cold_recovery_%.o $(CLUSTER_WAL_CLAIM_O) $(top_builddir)/src/backend/cluster/cluster_recovery_reference_graph.o,$^) \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) \
@@ -5114,6 +5130,7 @@ check_r11_source_removal_census:
 # ----------
 clean distclean maintainer-clean:
 	rm -f test_cluster_recovery_episode_clog.o
+	rm -f test_cluster_side_native_clog.o
 	rm -f test_cluster_external_fence_duty.inc
 	rm -f test_cluster_data_sync_policy.inc test_cluster_sync_providers.inc \
 		test_cluster_sync_dispatch.inc test_cluster_sync_smgr.inc

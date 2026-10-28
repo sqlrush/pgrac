@@ -43,6 +43,10 @@
 #include "utils/syscache.h"
 
 #include "unit_test.h"
+#ifdef TEST_CLUSTER_SIDE_NATIVE_CLOG_OWNER
+#include "test_cluster_side_native_clog.h"
+static bool side_native_clog_test;
+#endif
 
 UT_DEFINE_GLOBALS();
 
@@ -12553,10 +12557,24 @@ UT_TEST(test_cold_terminal_frame_refusal_preserves_pi_inspection)
 #include "test_cluster_side_clog_full.inc"
 #include "test_cluster_side_clog_witness.inc"
 #include "test_cluster_side_clog_applied.inc"
+#ifdef TEST_CLUSTER_SIDE_NATIVE_CLOG_OWNER
+#include "test_cluster_side_native_clog.inc"
+#endif
 
 int
 main(void)
 {
+#ifdef TEST_CLUSTER_SIDE_NATIVE_CLOG_OWNER
+	if (getenv("PGRAC_PRE2_TEST_SIDE_NATIVE_CLOG") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_side_native_clog_original_record_success);
+		UT_RUN(test_side_native_clog_native_failure_keeps_attempt);
+		UT_RUN(test_side_native_clog_postwrite_drift_blocks_projection);
+		UT_RUN(test_side_native_clog_final_owner_blocks_applied);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
+#endif
 	if (getenv("PGRAC_PRE2_TEST_CLOG_APPLIED") != NULL) {
 		UT_PLAN(4);
 		UT_RUN(test_clog_applied_requires_original_cold_record_success);
@@ -12584,7 +12602,11 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
+#ifdef TEST_CLUSTER_SIDE_NATIVE_CLOG_OWNER
+	UT_PLAN(205);
+#else
 	UT_PLAN(201);
+#endif
 	UT_RUN(test_clog_witness_keeps_complete_native_bytes_after_reader_reuse);
 	UT_RUN(test_clog_witness_refuses_changed_full_header_payload_and_source);
 	UT_RUN(test_clog_witness_requires_original_physical_recovery_binding);
@@ -12787,6 +12809,12 @@ main(void)
 	UT_RUN(test_clog_applied_failed_attempt_and_error_keep_no_reusable_success);
 	UT_RUN(test_clog_applied_cannot_borrow_other_plan_or_whole_source_apply);
 	UT_RUN(test_clog_applied_requires_exact_identity_and_final_owner_after_cleanup);
+#ifdef TEST_CLUSTER_SIDE_NATIVE_CLOG_OWNER
+	UT_RUN(test_side_native_clog_original_record_success);
+	UT_RUN(test_side_native_clog_native_failure_keeps_attempt);
+	UT_RUN(test_side_native_clog_postwrite_drift_blocks_projection);
+	UT_RUN(test_side_native_clog_final_owner_blocks_applied);
+#endif
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
