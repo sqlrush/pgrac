@@ -35,6 +35,7 @@
 #include "catalog/pg_collation.h"
 #include "catalog/pg_control.h"
 #include "catalog/pg_database.h"
+#include "catalog/pg_db_role_setting.h"
 #include "catalog/pg_extension.h"
 #include "catalog/pg_foreign_data_wrapper.h"
 #include "catalog/pg_foreign_server.h"
@@ -6275,6 +6276,27 @@ static bool event_trigger_lookup_active, event_trigger_expect_binding,
 static unsigned event_trigger_lookups, event_trigger_unbound, event_trigger_bad_lookup;
 static unsigned event_trigger_lookup_kind, event_trigger_entry_kind;
 
+/* Role settings boundaries stop before validation, database or role-cache work. */
+static bool role_settings_lookup_active, role_settings_expect_binding;
+static bool role_settings_superuser_denied;
+static unsigned role_settings_lookups, role_settings_unbound, role_settings_bad_lookup;
+static unsigned role_settings_expected_boundary, role_settings_lookup_kind;
+static unsigned role_settings_unexpected_dependencies;
+static RoleSpec role_settings_role;
+static AlterRoleSetStmt native_role_settings_statement;
+static const char *role_settings_expected_database;
+
+static void
+record_role_settings_lookup(unsigned kind)
+{
+	role_settings_lookups++;
+	role_settings_lookup_kind = kind;
+	if (role_settings_expect_binding && utility_binds == 0)
+		role_settings_unbound++;
+	if (kind != role_settings_expected_boundary)
+		role_settings_bad_lookup++;
+}
+
 static bool database_settings_lookup_active, database_settings_expect_binding;
 static unsigned database_settings_entry_kind, database_settings_lookups;
 static unsigned database_settings_lookup_kind, database_settings_unbound;
@@ -6284,6 +6306,13 @@ static const char *database_settings_expected_name;
 Oid
 get_database_oid(const char *dbname, bool missing_ok)
 {
+	if (role_settings_lookup_active) {
+		record_role_settings_lookup(2);
+		if (native_role_settings_statement.role != NULL || dbname == NULL
+			|| dbname != role_settings_expected_database || missing_ok)
+			role_settings_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before the real database lookup. */
+	}
 	if (database_settings_lookup_active) {
 		database_settings_lookups++;
 		database_settings_lookup_kind = 1;
@@ -8286,6 +8315,15 @@ static unsigned language_lookups, language_unbound;
 bool
 superuser(void)
 {
+	if (role_settings_lookup_active) {
+		record_role_settings_lookup(3);
+		if (native_role_settings_statement.role != NULL
+			|| native_role_settings_statement.database != NULL)
+			role_settings_bad_lookup++;
+		if (role_settings_superuser_denied)
+			return false;
+		siglongjmp(boundary, 2); /* Stop before the real superuser/role-cache query. */
+	}
 	if (tsearch_lookup_active) {
 		record_tsearch_lookup(1);
 		if (tsearch_entry_kind != 0 && tsearch_entry_kind != 2)
@@ -12095,6 +12133,13 @@ static Node *role_alter_expected_statement;
 void
 check_rolespec_name(const RoleSpec *role, const char *detail_msg)
 {
+	if (role_settings_lookup_active) {
+		record_role_settings_lookup(1);
+		if (role != &role_settings_role || detail_msg == NULL
+			|| strcmp(detail_msg, "Cannot alter reserved roles.") != 0)
+			role_settings_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before real validation or later role queries/locks. */
+	}
 	role_alter_lookups++;
 	if (role_alter_expect_binding && utility_binds == 0)
 		role_alter_unbound++;
@@ -12275,10 +12320,282 @@ UT_TEST(test_native_role_alter_utility_warm_guards_preserve_binding)
 	role_alter_lookup_active = false;
 }
 
+/* These dependencies must never be reached beyond the first boundary. No role,
+ * permission, lock or setting operation is stubbed as a successful native call. */
+HeapTuple
+get_rolespec_tuple(const RoleSpec *role)
+{
+	(void)role;
+	role_settings_unexpected_dependencies++;
+	siglongjmp(boundary, 3);
+}
+
+void
+shdepLockAndCheckObject(Oid classId, Oid objectId)
+{
+	(void)classId;
+	(void)objectId;
+	role_settings_unexpected_dependencies++;
+	siglongjmp(boundary, 3);
+}
+
+bool
+has_createrole_privilege(Oid roleid)
+{
+	(void)roleid;
+	role_settings_unexpected_dependencies++;
+	siglongjmp(boundary, 3);
+}
+
+bool
+is_admin_of_role(Oid member, Oid role)
+{
+	(void)member;
+	(void)role;
+	role_settings_unexpected_dependencies++;
+	siglongjmp(boundary, 3);
+}
+
+void
+ReleaseSysCache(HeapTuple tuple)
+{
+	(void)tuple;
+	role_settings_unexpected_dependencies++;
+	siglongjmp(boundary, 3);
+}
+
+bool
+object_ownercheck(Oid classid, Oid objectid, Oid roleid)
+{
+	(void)classid;
+	(void)objectid;
+	(void)roleid;
+	role_settings_unexpected_dependencies++;
+	siglongjmp(boundary, 3);
+}
+
+void
+AlterSetting(Oid databaseid, Oid roleid, VariableSetStmt *setstmt)
+{
+	(void)databaseid;
+	(void)roleid;
+	(void)setstmt;
+	role_settings_unexpected_dependencies++;
+	siglongjmp(boundary, 3);
+}
+
+#include "test_cluster_fresh_role_settings.inc"
+static VariableSetStmt role_settings_variable;
+static Node *role_settings_expected_statement;
+
+static void
+reset_native_role_settings(bool expect_binding, unsigned form)
+{
+	static const RoleSpecType types[]
+		= { ROLESPEC_CSTRING, ROLESPEC_CURRENT_ROLE, ROLESPEC_CURRENT_USER, ROLESPEC_SESSION_USER };
+	static const VariableSetKind kinds[]
+		= { VAR_SET_VALUE, VAR_SET_DEFAULT, VAR_SET_CURRENT, VAR_RESET, VAR_RESET_ALL };
+
+	reset_create_preflight();
+	role_settings_lookup_active = true;
+	role_settings_expect_binding = expect_binding;
+	role_settings_superuser_denied = false;
+	role_settings_lookups = role_settings_unbound = role_settings_bad_lookup = 0;
+	role_settings_lookup_kind = role_settings_unexpected_dependencies = 0;
+	role_settings_expected_boundary = form < 8 ? 1 : form == 8 ? 2 : 3;
+	role_settings_role = (RoleSpec){ .type = T_RoleSpec,
+									 .roletype = types[form % 4],
+									 .rolename = form % 4 == 0 ? "settings_role" : NULL,
+									 .location = -1 };
+	role_settings_variable = (VariableSetStmt){ .type = T_VariableSetStmt,
+												.kind = kinds[form % 5],
+												.name = form % 5 == 4 ? NULL : "application_name" };
+	role_settings_expected_database = form >= 4 && form < 9 ? "role_database" : NULL;
+	native_role_settings_statement
+		= (AlterRoleSetStmt){ .type = T_AlterRoleSetStmt,
+							  .role = form < 8 ? &role_settings_role : NULL,
+							  .database = (char *)role_settings_expected_database,
+							  .setstmt = &role_settings_variable };
+	role_settings_expected_statement = (Node *)&native_role_settings_statement;
+}
+
+static void
+native_role_settings_entry(void)
+{
+	(void)AlterRoleSet(&native_role_settings_statement);
+}
+
+UT_TEST(test_native_role_settings_binds_before_first_query_in_all_profiles)
+{
+	for (unsigned form = 0; form < 10; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_role_settings(binds, form);
+			set_native_operator_mode(mode);
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_role_settings_entry();
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(role_settings_lookups, repeat + 1);
+				UT_ASSERT_EQ(role_settings_unbound, 0);
+				UT_ASSERT_EQ(role_settings_bad_lookup + role_settings_unexpected_dependencies, 0);
+				UT_ASSERT_EQ(role_settings_lookup_kind, role_settings_expected_boundary);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	role_settings_lookup_active = false;
+}
+
+UT_TEST(test_native_role_settings_refuses_before_lookup_on_publication_child_and_top_errors)
+{
+	for (unsigned form = 0; form < 10; form++) {
+		for (unsigned failure = 0; failure < 5; failure++) {
+			bool allocated = failure == 0 || failure == 2;
+			int caught;
+
+			reset_native_role_settings(true, form);
+			if (failure == 0)
+				utility_bind_ok = false;
+			else if (failure == 1 || failure == 2) {
+				if (failure == 2)
+					create_sql_entry(role_settings_expected_statement);
+				utility_in_child = true;
+			} else {
+				utility_current_xid = 401;
+				utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_role_settings_entry();
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, failure == 0  ? ERRCODE_DATA_CORRUPTED
+									 : failure < 3 ? ERRCODE_FEATURE_NOT_SUPPORTED
+												   : ERRCODE_INTERNAL_ERROR);
+			UT_ASSERT_STR_EQ(
+				error_message,
+				failure == 0
+					? "canonical ACTIVE publication failed before shared catalog alteration"
+				: failure < 3 ? "shared catalog alteration does not support subtransactions"
+							  : "shared catalog top-level transaction identity mismatch");
+			UT_ASSERT_EQ(role_settings_lookups, 0);
+			UT_ASSERT_EQ(role_settings_unbound + role_settings_bad_lookup
+							 + role_settings_unexpected_dependencies,
+						 0);
+			UT_ASSERT_EQ(utility_xids, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, failure == 2 ? 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, allocated || failure == 3 ? 400 : InvalidTransactionId);
+		}
+	}
+	role_settings_lookup_active = false;
+}
+
+UT_TEST(test_native_role_settings_context_guards_keep_nonshared_route)
+{
+	for (unsigned form = 0; form < 10; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+
+			for (unsigned guard = 0; guard < 3; guard++) {
+				int caught;
+
+				reset_native_role_settings(binds, form);
+				set_native_operator_mode(mode);
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_role_settings_entry();
+				UT_ASSERT_EQ(caught, binds ? 1 : 2);
+				UT_ASSERT_EQ(error_code, !binds		  ? 0
+										 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+													  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				UT_ASSERT_EQ(role_settings_lookups, binds ? 0 : 1);
+				UT_ASSERT_EQ(role_settings_unbound + role_settings_bad_lookup
+								 + role_settings_unexpected_dependencies,
+							 0);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	role_settings_lookup_active = false;
+}
+
+UT_TEST(test_native_role_settings_utility_warm_guards_preserve_binding)
+{
+	for (unsigned form = 0; form < 10; form++) {
+		for (unsigned guard = 0; guard < 4; guard++) {
+			int caught;
+
+			reset_native_role_settings(true, form);
+			create_sql_entry(role_settings_expected_statement);
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			XactReadOnly = guard == 1;
+			utility_parallel = guard == 2;
+			utility_recovery = guard == 3;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_role_settings_entry();
+			UT_ASSERT_EQ(caught, guard ? 1 : 2);
+			UT_ASSERT_EQ(error_code, !guard		  ? 0
+									 : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+												  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT_EQ(role_settings_lookups, guard ? 0 : 1);
+			UT_ASSERT_EQ(role_settings_unbound + role_settings_bad_lookup
+							 + role_settings_unexpected_dependencies,
+						 0);
+			UT_ASSERT_EQ(utility_prepares, guard ? 1 : 2);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			UT_ASSERT_EQ(utility_top_xid, 400);
+		}
+	}
+	role_settings_lookup_active = false;
+}
+
+UT_TEST(test_native_role_settings_keeps_global_permission_refusal_after_binding)
+{
+	for (unsigned mode = 0; mode < 8; mode++) {
+		bool binds = mode == 3 || mode == 7;
+		int caught;
+
+		reset_native_role_settings(binds, 9);
+		set_native_operator_mode(mode);
+		role_settings_superuser_denied = true;
+		caught = sigsetjmp(boundary, 1);
+		if (!caught)
+			native_role_settings_entry();
+		UT_ASSERT_EQ(caught, 1);
+		UT_ASSERT_EQ(error_code, ERRCODE_INSUFFICIENT_PRIVILEGE);
+		UT_ASSERT_STR_EQ(error_message, "permission denied to alter setting");
+		UT_ASSERT_EQ(role_settings_lookups, 1);
+		UT_ASSERT_EQ(role_settings_lookup_kind, 3);
+		UT_ASSERT_EQ(role_settings_unbound + role_settings_bad_lookup
+						 + role_settings_unexpected_dependencies,
+					 0);
+		UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+		UT_ASSERT_EQ(utility_prepares, binds ? 1 : 0);
+		UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+		UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+	}
+	role_settings_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(185);
+	UT_PLAN(190);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -12464,6 +12781,11 @@ main(void)
 	UT_RUN(test_native_role_alter_refuses_before_lookup_on_publication_child_and_top_errors);
 	UT_RUN(test_native_role_alter_context_guards_keep_nonshared_route);
 	UT_RUN(test_native_role_alter_utility_warm_guards_preserve_binding);
+	UT_RUN(test_native_role_settings_binds_before_first_query_in_all_profiles);
+	UT_RUN(test_native_role_settings_refuses_before_lookup_on_publication_child_and_top_errors);
+	UT_RUN(test_native_role_settings_context_guards_keep_nonshared_route);
+	UT_RUN(test_native_role_settings_utility_warm_guards_preserve_binding);
+	UT_RUN(test_native_role_settings_keeps_global_permission_refusal_after_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
