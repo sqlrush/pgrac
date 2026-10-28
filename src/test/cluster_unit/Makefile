@@ -1433,6 +1433,7 @@ test_cluster_startup_cf_entry: test_cluster_startup_cf_entry.c test_cluster_cf_e
 		test_cluster_retention_cf_types.inc test_cluster_retention_cf.inc \
 		test_cluster_recovery_wal_cf.inc test_cluster_self_seal_cf.inc \
 		test_cluster_failure_input_cf.inc \
+		test_cluster_recovery_complete_cf.inc test_cluster_complete_authority.inc \
 		test_cluster_cf_blocker_trace.inc test_cluster_startup_interrupt.inc unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_cf_enqueue.c \
 		$(top_srcdir)/src/backend/cluster/cluster_lock_owner.c \
@@ -1539,6 +1540,34 @@ test_cluster_failure_input_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_con
 	     /^(failure_v2_cleanup|failure_v2_tail_read|failure_v2_tail_commit|failure_v2_tail_work|failure_v2_open_work)\(/ { print "static ClusterControlRootResult"; emit=1; consumers++ } \
 	     emit { print } /^}/ { emit=0 } \
 	     END { if (predicates != 2 || checks > 1 || waiters > 2 || consumers != 5 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Post-IR completion stays within the original one-shot publication call.
+test_cluster_recovery_complete_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_control_root.c Makefile
+	awk '/^typedef struct RecoveryCompleteV3Work / { types=1; work++ } \
+	     /^typedef struct RecoveryCompleteCfWait / { types=1; helpers++ } \
+	     types { print; if (/^}/) types=0; next } \
+	     /^(acquire_clusterwide_cf|apply_patch|recovery_complete_v3_owner_current)\(/ { print "static bool"; emit=1; predicates++ } \
+	     /^merge_flag_group\(/ { print "static void"; emit=1; flags++ } \
+	     /^recovery_complete_cf_current\(/ { print "static bool"; emit=1; checks++ } \
+	     /^recovery_complete_cf_(capture|wait)\(/ { print "static void"; emit=1; waiters++ } \
+	     /^(recovery_complete_v3_cleanup|recovery_complete_v3_work|recovery_complete_v3_publish)\(/ { print "static ClusterControlRootResult"; emit=1; consumers++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (work != 1 || helpers > 1 || predicates != 3 || flags != 1 || checks > 1 || waiters > 2 || consumers != 3 || types || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Original bind/consume/clear and typed caller, without the generic ROOT API.
+test_cluster_complete_authority.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_duty.c Makefile
+	awk '/^typedef struct ClusterControlRootPublishAuthorityV1 / { types=1; declarations++ } \
+	     types { print; if (/^}/) types=0; next } \
+	     /^static ClusterControlRootPublishAuthorityV1 root_publish_authority;/ { print; globals++ } \
+	     /^static void cluster_control_root_publish_authority_clear_v1\(void\);/ { print; forwards++ } \
+	     /^cluster_control_root_publish_authority_bind_v1\(/ { print "static bool"; emit=1; binds++ } \
+	     /^cluster_control_root_publish_authority_current_v1\(/ { print "bool"; emit=1; checks++ } \
+	     /^cluster_control_root_publish_authority_clear_v1\(/ { print "static void"; emit=1; clears++ } \
+	     /^cluster_control_root_recovery_complete_publish_v1\(/ { print "ClusterControlRootResult"; emit=1; callers++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (declarations != 1 || globals != 1 || forwards != 1 || binds != 1 || checks != 1 || clears != 1 || callers != 1 || types || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # PGRAC: execute the real earliest startup-directory mutation call site.

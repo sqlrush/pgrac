@@ -5490,6 +5490,833 @@ UT_TEST(ordinary_failure_input_roles_keep_the_original_wait_policy)
 			}
 }
 
+/* Actual CF/owner/CONTROL and original post-IR completion call/cleanup.
+ * Converted WALR, physical ROOT/WAL and upstream proof are explicit leaves. */
+static unsigned complete_attempts, complete_reads, complete_wal_reads, complete_publications;
+static unsigned complete_pin_begins, complete_pin_ends, complete_dispatches, complete_consumptions;
+static unsigned complete_pin_checks;
+static bool complete_receipt_before_reapply, complete_pin_active, complete_throw_read;
+static bool complete_pin_flags[9];
+static bool complete_publish_ok, complete_postread_bad, complete_uuid_ok;
+static ClusterWalPinResult complete_pin_result;
+static ClusterWalrReleaseResult complete_end_result;
+static ClusterControlRootResult complete_read_result, complete_wal_result, complete_storage_result;
+static ClusterLockAcquireResult complete_acquire_result;
+static ClusterControlRootReadToken complete_expected, complete_pin_token;
+static ClusterControlRootPatch complete_patch;
+static ClusterControlRootSnapshot complete_original;
+static ResourceOwner complete_pin_owner;
+static int complete_pin_pid, complete_pin_identity;
+static void *complete_work;
+static void (*complete_after_publish)(void);
+static ClusterControlRootResult complete_dispatch(const ClusterControlRootReadToken *expected,
+												  const ClusterControlRootPatch *patch,
+												  ClusterControlRootPublishReason reason,
+												  ClusterControlRootSnapshot *out,
+												  ClusterControlRootReadToken *token);
+
+/* The bounded dispatch below consumes the original authority once. The
+ * generic ROOT API's alias/reason branches remain separate full-ROOT tests. */
+#define cluster_control_root_compare_and_publish complete_dispatch
+#include "test_cluster_complete_authority.inc"
+#undef cluster_control_root_compare_and_publish
+
+static void *
+complete_alloc(Size size)
+{
+	UT_ASSERT(complete_work == NULL);
+	complete_work = palloc0(size);
+	return complete_work;
+}
+static void
+complete_free(void *ptr)
+{
+	UT_ASSERT(ptr == complete_work);
+	complete_work = NULL;
+	pfree(ptr);
+}
+static ClusterWalPinResult
+complete_pin_begin(const ClusterControlRootReadToken *expected, bool sealed,
+				   ClusterWalRootPublishGuard **guard)
+{
+	UT_ASSERT(sealed && *guard == NULL && expected != NULL);
+	UT_ASSERT(!cluster_cf_held_is_usable(ShareLock) && !cluster_cf_held_is_usable(ExclusiveLock));
+	UT_ASSERT_EQ(memcmp(expected, &complete_pin_token, sizeof(*expected)), 0);
+	++complete_pin_begins;
+	if (complete_pin_result == CLUSTER_WAL_PIN_OK) {
+		complete_pin_active = true;
+		*guard = (ClusterWalRootPublishGuard *)&complete_pin_identity;
+	}
+	return complete_pin_result;
+}
+static bool
+complete_pin_current(const ClusterWalRootPublishGuard *guard,
+					 const ClusterControlRootReadToken *expected)
+{
+	++complete_pin_checks;
+	if (guard != (ClusterWalRootPublishGuard *)&complete_pin_identity || !complete_pin_active
+		|| MyProcPid != complete_pin_pid || CurrentResourceOwner != complete_pin_owner
+		|| memcmp(expected, &complete_pin_token, sizeof(*expected)) != 0)
+		return false;
+	for (unsigned i = 0; i < lengthof(complete_pin_flags); i++)
+		if (!complete_pin_flags[i])
+			return false;
+	return true;
+}
+static ClusterWalrReleaseResult
+complete_pin_end(ClusterWalRootPublishGuard **guard)
+{
+	if (cluster_cf_held_is_usable(ShareLock) || cluster_cf_held_is_usable(ExclusiveLock))
+		return CLUSTER_WALR_RELEASE_UNCONFIRMED;
+	++complete_pin_ends;
+	if (*guard != (ClusterWalRootPublishGuard *)&complete_pin_identity
+		|| MyProcPid != complete_pin_pid || CurrentResourceOwner != complete_pin_owner)
+		return CLUSTER_WALR_RELEASE_UNCONFIRMED;
+	if (complete_end_result == CLUSTER_WALR_RELEASE_CONFIRMED) {
+		complete_pin_active = false;
+		*guard = NULL;
+	}
+	return complete_end_result;
+}
+static ClusterControlRootResult
+complete_storage(const uint8 *uuid, bool probe)
+{
+	UT_ASSERT(uuid == NULL && probe);
+	return complete_storage_result;
+}
+static bool
+complete_uuid(uint8 uuid[16])
+{
+	memset(uuid, 0, 16);
+	uuid[0] = 31;
+	return complete_uuid_ok;
+}
+static ClusterControlRootResult
+complete_read(ControlRootImage *root, ControlFileData *native, ClusterControlRootFileToken *file)
+{
+	UT_ASSERT(cluster_cf_held_is_clusterwide(ExclusiveLock));
+	++complete_reads;
+	if (complete_throw_read)
+		ereport(ERROR, (errcode(ERRCODE_IO_ERROR), errmsg("completion ROOT read failed")));
+	*root = retention_image;
+	if (complete_postread_bad && complete_reads == 3)
+		root->bytes[0] ^= 1;
+	memset(native, 0, sizeof(*native));
+	native->checkPoint = 100;
+	memset(file, 0, sizeof(*file));
+	return complete_read_result;
+}
+static ClusterControlRootResult
+complete_read_control(const uint8 uuid[16], uint64 sysid, ControlRootImage *root,
+					  ControlFileData *native, ClusterControlRootFileToken *file, uint16 version)
+{
+	UT_ASSERT(uuid[0] == 31 && sysid == 1234 && version == 3);
+	return complete_read(root, native, file);
+}
+static ClusterControlRootResult
+complete_read_thread(const ClusterControlRootIdentity *expected, ControlRootImage *root,
+					 ControlFileData *native, ClusterControlRootFileToken *file, uint16 version)
+{
+	UT_ASSERT_EQ(version, 3);
+	UT_ASSERT_EQ(memcmp(expected, &complete_original.identity, sizeof(*expected)), 0);
+	return complete_read(root, native, file);
+}
+static ClusterControlRootResult
+complete_wal(const char *dir, const ClusterWalSourceRef *source, int segment_size,
+			 const ClusterControlRootSnapshot *record, XLogRecPtr checkpoint,
+			 ClusterWalRecordVisitor visitor, void *arg, ClusterWalTailObservation *out)
+{
+	UT_ASSERT(cluster_cf_held_is_clusterwide(ExclusiveLock));
+	UT_ASSERT(dir == cluster_wal_threads_dir && segment_size == wal_segment_size);
+	UT_ASSERT(visitor == NULL && arg == NULL);
+	UT_ASSERT_EQ(checkpoint, 100);
+	UT_ASSERT_EQ(memcmp(record, &complete_original, sizeof(*record)), 0);
+	UT_ASSERT_EQ(memcmp(&source->claim.identity, &record->identity, sizeof(record->identity)), 0);
+	UT_ASSERT_EQ(source->claim.database_incarnation, 7);
+	UT_ASSERT_EQ(source->claim.max_config_generation, 9);
+	UT_ASSERT_EQ(source->claim.claim_sha256[0], 3);
+	UT_ASSERT_EQ(source->timeline, 1);
+	++complete_wal_reads;
+	memset(out, 0, sizeof(*out));
+	out->complete_end = 340;
+	out->last_record_start = 300;
+	out->last_record_crc = 23;
+	return complete_wal_result;
+}
+static bool
+complete_publish(const ControlRootImage *base, const ControlRootImage *next)
+{
+	UT_ASSERT(cluster_cf_held_is_clusterwide(ExclusiveLock));
+	UT_ASSERT_EQ(base->header.file_txn_seq, 7);
+	UT_ASSERT_EQ(next->header.file_txn_seq, 8);
+	UT_ASSERT_EQ(memcmp(&base->startup[127], &next->startup[127], sizeof(base->startup[127])), 0);
+	++complete_publications;
+	if (!complete_publish_ok)
+		return false;
+	retention_image = *next;
+	if (complete_after_publish != NULL)
+		complete_after_publish();
+	return true;
+}
+static bool
+complete_actual_cf_lock(LOCKMODE mode)
+{
+	UT_ASSERT_EQ(mode, ExclusiveLock);
+	++complete_attempts;
+	UT_ASSERT(!root_publish_authority.active);
+	UT_ASSERT_EQ(complete_consumptions, 1);
+	if (claim_retiring_cookie != 0) {
+		UT_ASSERT(!cluster_cf_held(ShareLock) && !cluster_cf_held(ExclusiveLock));
+		UT_ASSERT(cluster_cf_release_completed(mode, claim_retiring_cookie));
+		UT_ASSERT(cluster_control_request_empty());
+		complete_receipt_before_reapply = true;
+	}
+	++g_next_request_id;
+	if (complete_attempts == 1)
+		g_seven_result = complete_acquire_result;
+	return claim_actual_cf_lock(mode);
+}
+#define palloc0 complete_alloc
+#define pfree complete_free
+#define acquire_clusterwide_cf complete_acquire
+#define cluster_cf_lock complete_actual_cf_lock
+#define cluster_wal_retention_root_publish_begin_exact complete_pin_begin
+#define cluster_wal_retention_root_publish_sealed_current complete_pin_current
+#define cluster_wal_retention_root_publish_end complete_pin_end
+#define storage_contract_check complete_storage
+#define current_storage_uuid complete_uuid
+#define read_control_version complete_read_control
+#define read_thread_version complete_read_thread
+#define cluster_wal_tail_visit_sealed complete_wal
+#define cluster_control_root_v3_encode(root) self_encode((root), 3)
+#define publish_updated_image complete_publish
+#include "test_cluster_recovery_complete_cf.inc"
+#undef publish_updated_image
+#undef cluster_control_root_v3_encode
+#undef cluster_wal_tail_visit_sealed
+#undef read_thread_version
+#undef read_control_version
+#undef current_storage_uuid
+#undef storage_contract_check
+#undef cluster_wal_retention_root_publish_end
+#undef cluster_wal_retention_root_publish_sealed_current
+#undef cluster_wal_retention_root_publish_begin_exact
+#undef cluster_cf_lock
+#undef acquire_clusterwide_cf
+#undef pfree
+#undef palloc0
+
+static ClusterControlRootResult
+complete_dispatch(const ClusterControlRootReadToken *expected, const ClusterControlRootPatch *patch,
+				  ClusterControlRootPublishReason reason, ClusterControlRootSnapshot *out,
+				  ClusterControlRootReadToken *token)
+{
+	++complete_dispatches;
+	UT_ASSERT_EQ(reason, CLUSTER_CONTROL_ROOT_PUBLISH_RECOVERY_COMPLETE);
+	if (!cluster_control_root_publish_authority_current_v1(expected, patch, reason))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	++complete_consumptions;
+	return recovery_complete_v3_publish(expected, patch, out, token);
+}
+static void
+complete_ready_after_ack(void)
+{
+	UT_ASSERT_EQ(complete_attempts, 1);
+	UT_ASSERT_EQ(complete_reads | complete_wal_reads | complete_publications, 0);
+	UT_ASSERT(!root_publish_authority.active);
+	UT_ASSERT_EQ(complete_consumptions, 1);
+	UT_ASSERT(cluster_cf_held(ExclusiveLock) && !cluster_cf_held_is_usable(ExclusiveLock));
+	if (claim_retiring_cookie == 0)
+		claim_retiring_cookie = cluster_cf_owner_cookie(ExclusiveLock);
+	if (entry_waits == entry_ack_at) {
+		g_seven_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+		++g_next_request_id;
+	}
+}
+static void
+complete_fixture(void)
+{
+	/* Use the real creator initialization before reading its fixture boot. */
+	UT_ASSERT(lock_owner_creator());
+	self_fixture(0);
+	complete_attempts = complete_reads = complete_wal_reads = complete_publications = 0;
+	complete_pin_begins = complete_pin_ends = complete_pin_checks = 0;
+	complete_dispatches = complete_consumptions = 0;
+	complete_work = NULL;
+	complete_pin_owner = CurrentResourceOwner;
+	complete_pin_pid = MyProcPid;
+	complete_receipt_before_reapply = complete_pin_active = complete_throw_read = false;
+	complete_publish_ok = complete_uuid_ok = true;
+	complete_postread_bad = false;
+	for (unsigned i = 0; i < lengthof(complete_pin_flags); i++)
+		complete_pin_flags[i] = true;
+	complete_pin_result = CLUSTER_WAL_PIN_OK;
+	complete_end_result = CLUSTER_WALR_RELEASE_CONFIRMED;
+	complete_read_result = complete_wal_result = complete_storage_result
+		= CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	complete_acquire_result = CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
+	complete_after_publish = NULL;
+	retention_image.header.v2.serving[0] = 0;
+	retention_image.records[0].lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
+	retention_image.records[0].root_flags |= CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID
+											 | CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID
+											 | CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID
+											 | CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID;
+	retention_image.records[0].tail_tli = 1;
+	retention_image.records[0].validated_tail_lsn_exclusive = 340;
+	retention_image.records[0].tail_last_record_lsn = 300;
+	retention_image.records[0].tail_last_record_crc32c = 23;
+	retention_image.startup[127].generation = 99;
+	complete_original = retention_image.records[0];
+	make_read_token(&retention_image, 1, CONTROL_ROOT_SOURCE_PRIMARY, &complete_expected);
+	complete_pin_token = complete_expected;
+	memset(&complete_patch, 0, sizeof(complete_patch));
+	complete_patch.mask
+		= CLUSTER_CONTROL_ROOT_PATCH_LIFECYCLE | CLUSTER_CONTROL_ROOT_PATCH_RECOVERY_PROGRESS;
+	complete_patch.expected_lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
+	complete_patch.expected_flags_mask = complete_patch.expected_flags_value
+		= complete_original.root_flags;
+	complete_patch.desired.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE;
+	complete_patch.desired.root_flags = complete_original.root_flags
+										| CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID
+										| CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_LAST_RECORD_VALID;
+	complete_patch.desired.recovered_tli = 1;
+	complete_patch.desired.recovered_through_lsn_exclusive = 340;
+	complete_patch.desired.recovered_last_record_lsn = 300;
+	complete_patch.desired.recovered_last_record_crc32c = 23;
+	cluster_control_root_publish_authority_clear_v1();
+	entry_on_wait = complete_ready_after_ack;
+}
+static bool
+complete_call(ClusterControlRootResult *result, ClusterControlRootSnapshot *out,
+			  ClusterControlRootReadToken *token)
+{
+	volatile bool returned = false;
+	memset(out, 0xa5, sizeof(*out));
+	memset(token, 0xa5, sizeof(*token));
+	PG_TRY();
+	{
+		*result = cluster_control_root_recovery_complete_publish_v1(&complete_expected,
+																	&complete_patch, out, token);
+		returned = true;
+	}
+	PG_CATCH();
+	{
+		FlushErrorState();
+	}
+	PG_END_TRY();
+	return returned;
+}
+static void
+complete_finish(void)
+{
+	entry_on_wait = NULL;
+	claim_on_reset = claim_after_acquire = NULL;
+	claim_teardown = owner_ack_on_wait = true;
+	for (unsigned i = 0; i < 2; i++) {
+		LOCKMODE mode = i == 0 ? ShareLock : ExclusiveLock;
+		if (cluster_cf_held_is_usable(mode))
+			UT_ASSERT_EQ(cluster_cf_unlock_confirmed(mode), CLUSTER_CF_RELEASE_CONFIRMED);
+	}
+	(void)acknowledge_retirements();
+	cluster_cf_retirement_poll();
+	UT_ASSERT(!cluster_cf_held(ShareLock) && !cluster_cf_held(ExclusiveLock));
+	UT_ASSERT(cluster_control_request_empty());
+	UT_ASSERT_EQ(pg_atomic_read_u32(&MyProc->cluster_grd_registered_count), 0);
+	UT_ASSERT(complete_work == NULL && !root_publish_authority.active);
+	/* Retained pin cleanup is an explicit leaf, not a native exit proof. */
+	complete_pin_active = false;
+	claim_teardown = owner_ack_on_wait = cold_consumer = false;
+}
+static void
+complete_no_output(const ClusterControlRootSnapshot *out, const ClusterControlRootReadToken *token)
+{
+	const ClusterControlRootSnapshot empty = { 0 };
+	const ClusterControlRootReadToken empty_token = { 0 };
+	UT_ASSERT_EQ(memcmp(out, &empty, sizeof(*out)), 0);
+	UT_ASSERT_EQ(memcmp(token, &empty_token, sizeof(*token)), 0);
+}
+UT_TEST(startup_recovery_complete_cf_wait_stays_with_one_consumed_publication)
+{
+	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	ClusterControlRootSnapshot out;
+	ClusterControlRootReadToken token;
+	complete_fixture();
+	UT_ASSERT(complete_call(&result, &out, &token));
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		complete_no_output(&out, &token);
+	UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(entry_waits, 3);
+	UT_ASSERT_EQ(complete_attempts, 2);
+	UT_ASSERT_EQ(complete_reads, 3);
+	UT_ASSERT_EQ(complete_wal_reads, 1);
+	UT_ASSERT_EQ(complete_publications, 1);
+	UT_ASSERT(complete_receipt_before_reapply);
+	UT_ASSERT_EQ(complete_dispatches, 1);
+	UT_ASSERT_EQ(complete_consumptions, 1);
+	UT_ASSERT_EQ(complete_pin_begins, 1);
+	UT_ASSERT_EQ(complete_pin_ends, 1);
+	UT_ASSERT_EQ(out.lifecycle, CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE);
+	UT_ASSERT_EQ(out.root_publish_seq, 14);
+	UT_ASSERT_EQ(out.recovered_through_lsn_exclusive, 340);
+	UT_ASSERT_EQ(out.recovered_last_record_crc32c, 23);
+	UT_ASSERT_EQ(memcmp(&out.identity, &complete_original.identity, sizeof(out.identity)), 0);
+	UT_ASSERT_EQ(token.file_txn_seq, 8);
+	UT_ASSERT_EQ(retention_image.header.v2.serving[0], 0);
+	UT_ASSERT_EQ(retention_image.startup[127].generation, 99);
+	UT_ASSERT(out.root_flags & CLUSTER_CONTROL_ROOT_FLAG_FPW_WAS_OFF);
+	complete_finish();
+}
+
+static unsigned complete_fault;
+static CfHoldState complete_saved_slot;
+static ClusterControlRequestView complete_saved_record;
+static void
+complete_change_context(void)
+{
+	RecoveryCompleteV3Work *work = complete_work;
+	switch (complete_fault) {
+	case 0:
+		MyProc = NULL;
+		break;
+	case 1:
+		MyLatch = NULL;
+		break;
+	case 2:
+		MyProcPid++;
+		break;
+	case 3:
+		CurrentResourceOwner = (ResourceOwner)2;
+		break;
+	case 4:
+		MyBackendType = B_BG_WORKER;
+		break;
+	case 5:
+		MyAuxProcType = BgWriterProcess;
+		break;
+	case 6:
+		cluster_node_id = 1;
+		break;
+	case 7:
+		owner_epoch++;
+		break;
+	case 8:
+		owner_generation++;
+		break;
+	case 9:
+		control_creator.incarnation++;
+		break;
+	case 10:
+		InRecovery = !InRecovery;
+		break;
+	case 11:
+		entry_authority = false;
+		break;
+	case 12:
+		cluster_shared_config = false;
+		break;
+	case 13:
+		cluster_controlfile_shared_authority = false;
+		break;
+	case 14:
+		cluster_enabled = false;
+		break;
+	case 15:
+		ShutdownRequestPending = true;
+		break;
+	case 16:
+		CritSectionCount = 1;
+		break;
+	case 17:
+		entry_native_lock = true;
+		break;
+	case 18:
+		complete_expected.file_txn_seq++;
+		break;
+	case 19:
+		complete_patch.mask ^= CLUSTER_CONTROL_ROOT_PATCH_FPW_STICKY;
+		break;
+	case 20:
+		complete_patch.desired.recovered_through_lsn_exclusive--;
+		break;
+	case 21:
+		complete_patch.expected_flags_value ^= CLUSTER_CONTROL_ROOT_FLAG_FPW_WAS_OFF;
+		break;
+	case 22:
+		work->publisher_node++;
+		break;
+	case 23:
+		work->publisher_incarnation++;
+		break;
+	case 24:
+		work->walr = NULL;
+		break;
+	case 25:
+		enableFsync = false;
+		break;
+	case 35:
+		work->walr = (ClusterWalRootPublishGuard *)&failure_walr_identity;
+		break;
+	case 36:
+		cf_hold_x.owner.request.control_owner_id++;
+		break;
+	case 37:
+		cf_hold_x.owner.attempt.generation++;
+		break;
+	case 38:
+		control_requests->records[cf_hold_x.owner.attempt.slot].owner.incarnation++;
+		break;
+	case 39:
+		control_requests->records[cf_hold_x.owner.attempt.slot].message.key.holder.request_id++;
+		break;
+	case 40:
+		control_requests->records[cf_hold_x.owner.attempt.slot].message.key.holder.cluster_epoch++;
+		break;
+	case 41:
+		control_requests->records[cf_hold_x.owner.attempt.slot].state
+			= CLUSTER_CONTROL_REQUEST_INVALID;
+		break;
+	case 42:
+		cf_hold_x.release_pending = false;
+		break;
+	case 43:
+		cf_hold_x.owner.state = CLUSTER_LOCK_OWNER_ACQUIRING;
+		break;
+	case 44:
+		cf_hold_x.owner.cooperative_acquire = true;
+		break;
+	case 45:
+		cf_hold_s.held = true;
+		break;
+	case 46:
+		complete_patch.reserved24++;
+		break;
+	case 47:
+		complete_expected.authority_uuid[0] ^= 1;
+		break;
+	default:
+		UT_ASSERT(complete_fault >= 26 && complete_fault <= 34);
+		/* Native-held/converted/sealed/IR-released/token/formation/needs/
+		 * admissions/pin-valid facts are explicit getter leaf boundaries. */
+		complete_pin_flags[complete_fault - 26] = false;
+		break;
+	}
+}
+static void
+complete_change_while_waiting(void)
+{
+	complete_ready_after_ack();
+	complete_saved_slot = cf_hold_x;
+	complete_saved_record = control_requests->records[cf_hold_x.owner.attempt.slot];
+	complete_change_context();
+}
+UT_TEST(startup_recovery_complete_wait_rechecks_actor_patch_sealed_guard_and_exact_request)
+{
+	for (complete_fault = 0; complete_fault < 48; complete_fault++) {
+		ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+		ClusterControlRootSnapshot out;
+		ClusterControlRootReadToken token;
+		int pid = MyProcPid;
+		uint64 epoch = owner_epoch, generation = owner_generation,
+			   boot = control_creator.incarnation;
+		complete_fixture();
+		entry_on_wait = complete_change_while_waiting;
+		UT_ASSERT(!complete_call(&result, &out, &token));
+		UT_ASSERT_EQ(entry_code, ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED);
+		UT_ASSERT_EQ(entry_level, FATAL);
+		UT_ASSERT_EQ(entry_waits, 1);
+		UT_ASSERT_EQ(complete_attempts, 1);
+		UT_ASSERT_EQ(complete_reads | complete_wal_reads | complete_publications, 0);
+		UT_ASSERT_EQ(complete_consumptions, 1);
+		complete_no_output(&out, &token);
+		recovery_restore_actor(pid, epoch, generation, boot);
+		cf_hold_x = complete_saved_slot;
+		control_requests->records[cf_hold_x.owner.attempt.slot] = complete_saved_record;
+		memset(&cf_hold_s, 0, sizeof(cf_hold_s));
+		complete_finish();
+	}
+}
+static void
+complete_change_after_grant(void)
+{
+	if (entry_waits != 0)
+		complete_change_context();
+}
+UT_TEST(startup_recovery_complete_new_grant_requalifies_before_root_io)
+{
+	const unsigned faults[] = { 3, 7, 18, 20, 22, 24, 26, 34, 35 };
+	for (unsigned i = 0; i < lengthof(faults); i++) {
+		ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+		ClusterControlRootSnapshot out;
+		ClusterControlRootReadToken token;
+		uint64 epoch = owner_epoch;
+		complete_fixture();
+		complete_fault = faults[i];
+		claim_after_acquire = complete_change_after_grant;
+		UT_ASSERT(complete_call(&result, &out, &token));
+		UT_ASSERT_EQ(result, complete_fault == 7 ? CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE
+							 : complete_fault == 3 || complete_fault == 35
+								 ? CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN
+								 : CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+		UT_ASSERT_EQ(entry_waits, 3);
+		UT_ASSERT_EQ(complete_attempts, 2);
+		UT_ASSERT_EQ(complete_reads | complete_wal_reads | complete_publications, 0);
+		complete_no_output(&out, &token);
+		CurrentResourceOwner = (ResourceOwner)1;
+		owner_epoch = epoch;
+		complete_finish();
+	}
+}
+static void
+complete_missing_receipt(void)
+{
+	complete_ready_after_ack();
+	UT_ASSERT(acknowledge_retirements());
+	cluster_cf_retirement_poll();
+	UT_ASSERT(cluster_cf_release_completed(ExclusiveLock, claim_retiring_cookie));
+	cf_retired_x = 0;
+}
+static void
+complete_ack_during_reset(void)
+{
+	if (complete_attempts != 1 || !cluster_cf_held(ExclusiveLock))
+		return;
+	claim_retiring_cookie = cluster_cf_owner_cookie(ExclusiveLock);
+	UT_ASSERT(acknowledge_retirements());
+	g_seven_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	++g_next_request_id;
+}
+static void
+complete_empty_grant(void)
+{
+	UT_ASSERT(!cluster_cf_held(ShareLock) && !cluster_cf_held(ExclusiveLock));
+	UT_ASSERT(cluster_control_request_empty());
+	UT_ASSERT_EQ(complete_reads | complete_publications, 0);
+	g_seven_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	++g_next_request_id;
+}
+UT_TEST(startup_recovery_complete_receipt_wake_and_empty_preserve_progress)
+{
+	for (unsigned fault = 0; fault < 4; fault++) {
+		ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+		ClusterControlRootSnapshot out;
+		ClusterControlRootReadToken token;
+		complete_fixture();
+		entry_lost_latch = true;
+		if (fault == 0)
+			entry_on_wait = complete_missing_receipt;
+		else if (fault == 1)
+			claim_on_reset = complete_ack_during_reset;
+		else if (fault == 2) {
+			fail_after_publication = false;
+			entry_on_wait = complete_empty_grant;
+		}
+		UT_ASSERT_EQ(complete_call(&result, &out, &token), fault != 0);
+		UT_ASSERT_EQ(entry_waits, fault == 1 ? 0 : fault == 3 ? 3 : 1);
+		if (fault == 0) {
+			UT_ASSERT_EQ(entry_code, ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED);
+			UT_ASSERT_EQ(complete_publications, 0);
+			complete_no_output(&out, &token);
+		} else {
+			UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+			UT_ASSERT_EQ(complete_publications, 1);
+		}
+		UT_ASSERT_EQ(complete_consumptions, 1);
+		UT_ASSERT_EQ(complete_pin_begins, 1);
+		complete_finish();
+	}
+}
+UT_TEST(startup_recovery_complete_hard_untyped_and_preexisting_are_not_retried)
+{
+	for (unsigned fault = 0; fault < 7; fault++) {
+		ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+		ClusterControlRootSnapshot out;
+		ClusterControlRootReadToken token;
+		unsigned before;
+		complete_fixture();
+		if (fault == 0)
+			complete_acquire_result = CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+		else if (fault == 1)
+			g_timeout_detail.source = CLUSTER_GES_TSRC_NONE;
+		else if (fault == 2)
+			entry_on_wait = entry_hard_error;
+		else {
+			LOCKMODE mode = fault == 3 || fault == 5 ? ShareLock : ExclusiveLock;
+			g_seven_result
+				= fault >= 5 ? CLUSTER_LOCK_ACQUIRE_OK_GRANTED : CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
+			UT_ASSERT_EQ(cluster_cf_lock(mode), fault >= 5);
+		}
+		before = g_seven_count;
+		if (fault == 2 || fault == 3) {
+			UT_ASSERT(!complete_call(&result, &out, &token));
+			UT_ASSERT_EQ(entry_code,
+						 fault == 2 ? ERRCODE_IO_ERROR : ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED);
+		} else {
+			UT_ASSERT(complete_call(&result, &out, &token));
+			UT_ASSERT_EQ(result, fault >= 5 ? CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT
+											: CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+		}
+		UT_ASSERT_EQ(entry_waits, fault == 2 ? 1 : 0);
+		UT_ASSERT_EQ(g_seven_count, before + (fault < 4 ? 1 : 0));
+		UT_ASSERT_EQ(complete_reads | complete_wal_reads | complete_publications, 0);
+		UT_ASSERT_EQ(complete_consumptions, 1);
+		complete_no_output(&out, &token);
+		complete_finish();
+	}
+}
+static void
+complete_lose_pin_after_publish(void)
+{
+	complete_pin_flags[0] = false;
+}
+static void
+complete_change_owner_after_publish(void)
+{
+	CurrentResourceOwner = (ResourceOwner)2;
+}
+static void
+complete_change_root_or_io(void)
+{
+	complete_ready_after_ack();
+	switch (complete_fault) {
+	case 0:
+		retention_image.header.file_txn_seq++;
+		break;
+	case 1:
+		retention_image.startup[0].generation = 1;
+		break;
+	case 2:
+		complete_read_result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+		break;
+	case 3:
+		complete_throw_read = true;
+		break;
+	case 4:
+		complete_wal_result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+		break;
+	case 5:
+		complete_publish_ok = false;
+		break;
+	case 6:
+		complete_postread_bad = true;
+		break;
+	case 7:
+		complete_after_publish = complete_lose_pin_after_publish;
+		break;
+	case 8:
+		complete_after_publish = complete_change_owner_after_publish;
+		break;
+	}
+}
+UT_TEST(startup_recovery_complete_real_errors_never_export_provisional_or_persisted_permission)
+{
+	const ClusterControlRootResult expected[]
+		= { CLUSTER_CONTROL_ROOT_STALE_TOKEN,	   CLUSTER_CONTROL_ROOT_CAS_CONFLICT,
+			CLUSTER_CONTROL_ROOT_IO_ERROR,		   CLUSTER_CONTROL_ROOT_IO_ERROR,
+			CLUSTER_CONTROL_ROOT_IO_ERROR,		   CLUSTER_CONTROL_ROOT_IO_ERROR,
+			CLUSTER_CONTROL_ROOT_POSTREAD_FAILED,  CLUSTER_CONTROL_ROOT_STALE_TOKEN,
+			CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN };
+	for (complete_fault = 0; complete_fault < lengthof(expected); complete_fault++) {
+		ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+		ClusterControlRootSnapshot out;
+		ClusterControlRootReadToken token;
+		complete_fixture();
+		entry_on_wait = complete_change_root_or_io;
+		UT_ASSERT_EQ(complete_call(&result, &out, &token), complete_fault != 3);
+		if (complete_fault == 3)
+			UT_ASSERT_EQ(entry_code, ERRCODE_IO_ERROR);
+		else
+			UT_ASSERT_EQ(result, expected[complete_fault]);
+		UT_ASSERT_EQ(entry_waits, 3);
+		UT_ASSERT_EQ(complete_publications, complete_fault >= 5);
+		UT_ASSERT_EQ(retention_image.records[0].lifecycle,
+					 complete_fault >= 6 ? CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE
+										 : CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED);
+		UT_ASSERT_EQ(complete_consumptions, 1);
+		complete_no_output(&out, &token);
+		CurrentResourceOwner = (ResourceOwner)1;
+		complete_finish();
+	}
+}
+UT_TEST(startup_recovery_complete_original_preconditions_do_not_become_cf_waits)
+{
+	const ClusterWalPinResult pins[] = { CLUSTER_WAL_PIN_INVALID, CLUSTER_WAL_PIN_STALE,
+										 CLUSTER_WAL_PIN_CAPACITY, CLUSTER_WAL_PIN_OK };
+	const ClusterControlRootResult expected[]
+		= { CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT, CLUSTER_CONTROL_ROOT_STALE_TOKEN,
+			CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE, CLUSTER_CONTROL_ROOT_IO_ERROR };
+	for (unsigned fault = 0; fault < lengthof(pins); fault++) {
+		ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+		ClusterControlRootSnapshot out;
+		ClusterControlRootReadToken token;
+		complete_fixture();
+		complete_pin_result = pins[fault];
+		if (fault == 3)
+			complete_storage_result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+		UT_ASSERT(complete_call(&result, &out, &token));
+		UT_ASSERT_EQ(result, expected[fault]);
+		UT_ASSERT_EQ(entry_waits | complete_attempts | complete_reads | complete_publications, 0);
+		UT_ASSERT_EQ(complete_consumptions, 1);
+		UT_ASSERT_EQ(complete_pin_begins, 1);
+		complete_no_output(&out, &token);
+		complete_finish();
+	}
+}
+UT_TEST(startup_recovery_complete_original_cancel_keeps_shared_cleanup_responsibility)
+{
+	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	ClusterControlRootSnapshot out;
+	ClusterControlRootReadToken token;
+	volatile bool exited = false;
+	complete_fixture();
+	entry_on_wait = entry_shutdown;
+	startup_fixture_exit_hook = entry_owner_exit;
+	startup_fixture_armed = true;
+	if (sigsetjmp(startup_fixture_exit, 1) == 0)
+		UT_ASSERT(!complete_call(&result, &out, &token));
+	else
+		exited = true;
+	UT_ASSERT(exited);
+	UT_ASSERT_EQ(startup_fixture_exit_code, 1);
+	UT_ASSERT_EQ(entry_waits, 1);
+	UT_ASSERT_EQ(complete_reads | complete_wal_reads | complete_publications, 0);
+	UT_ASSERT(control_requests->records[cf_hold_x.owner.attempt.slot].owner_exited);
+	UT_ASSERT_EQ(complete_consumptions, 1);
+	complete_no_output(&out, &token);
+	PG_exception_stack = NULL;
+	error_context_stack = NULL;
+	proc_exit_inprogress = shutdown_requested = false;
+	startup_fixture_armed = false;
+	startup_fixture_exit_hook = NULL;
+	/* Simulated process exit bypasses C cleanup frames. Only this leaf pin
+	 * is unwound here; the real owner/registry has already recorded exit. */
+	UT_ASSERT(complete_work != NULL);
+	UT_ASSERT_EQ(recovery_complete_v3_cleanup(complete_work, CLUSTER_CONTROL_ROOT_IO_ERROR),
+				 CLUSTER_CONTROL_ROOT_IO_ERROR);
+	complete_free(complete_work);
+	complete_finish();
+}
+UT_TEST(ordinary_recovery_complete_roles_keep_the_original_cf_wait_policy)
+{
+	const BackendType roles[] = { B_BG_WORKER, B_BG_WRITER, B_CHECKPOINTER, B_LMON };
+	for (unsigned role = 0; role < lengthof(roles); role++) {
+		ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+		ClusterControlRootSnapshot out;
+		ClusterControlRootReadToken token;
+		complete_fixture();
+		MyBackendType = roles[role];
+		UT_ASSERT(complete_call(&result, &out, &token));
+		UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+		UT_ASSERT_EQ(entry_waits, 0);
+		UT_ASSERT_EQ(complete_attempts, 1);
+		UT_ASSERT_EQ(complete_reads | complete_publications, 0);
+		UT_ASSERT_EQ(complete_consumptions, 1);
+		complete_no_output(&out, &token);
+		MyBackendType = B_STARTUP;
+		complete_finish();
+	}
+}
+
 int
 main(void)
 {
@@ -5512,7 +6339,13 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(74);
+	if (getenv("PGRAC_PRE2_TEST_COMPLETE_CF_LIVENESS") != NULL) {
+		UT_PLAN(1);
+		UT_RUN(startup_recovery_complete_cf_wait_stays_with_one_consumed_publication);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
+	UT_PLAN(83);
 	UT_RUN(startup_cf_timeout_waits_for_exact_completion_before_begin);
 	UT_RUN(startup_cf_completion_does_not_preserve_changed_native_input);
 	UT_RUN(startup_cf_unsafe_native_context_never_takes_a_registry_lock);
@@ -5587,6 +6420,15 @@ main(void)
 	UT_RUN(startup_failure_tail_second_interval_keeps_the_original_owner);
 	UT_RUN(startup_failure_input_original_cancel_keeps_shared_cleanup_responsibility);
 	UT_RUN(ordinary_failure_input_roles_keep_the_original_wait_policy);
+	UT_RUN(startup_recovery_complete_cf_wait_stays_with_one_consumed_publication);
+	UT_RUN(startup_recovery_complete_wait_rechecks_actor_patch_sealed_guard_and_exact_request);
+	UT_RUN(startup_recovery_complete_new_grant_requalifies_before_root_io);
+	UT_RUN(startup_recovery_complete_receipt_wake_and_empty_preserve_progress);
+	UT_RUN(startup_recovery_complete_hard_untyped_and_preexisting_are_not_retried);
+	UT_RUN(startup_recovery_complete_real_errors_never_export_provisional_or_persisted_permission);
+	UT_RUN(startup_recovery_complete_original_preconditions_do_not_become_cf_waits);
+	UT_RUN(startup_recovery_complete_original_cancel_keeps_shared_cleanup_responsibility);
+	UT_RUN(ordinary_recovery_complete_roles_keep_the_original_cf_wait_policy);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
