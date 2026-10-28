@@ -52,12 +52,17 @@ native_step_hash_gap(void)
 	case 10: native_fpi_region.checkpoint_owner.tx_result.processed_count++; break;
 	case 11: cluster_wal_inputs_release_v1(&native_insert_live->page.replay.inputs); break;
 	case 12: native_graph_changed_input->data[BLCKSZ - 1]++; break;
+	case 13: ctrc_page_fd_invalid = true; break;
 	}
 }
 
 static void
 native_step_fixture(CtrcReadNativeFixture *f, unsigned source)
 {
+	UT_ASSERT(!ctrc_page_fd_live);
+	ctrc_page_fd_enabled = true; ctrc_page_fd_invalid = false;
+	ctrc_page_fd_read_transport = smgrread;
+	ctrc_page_fd_fault = ctrc_page_fd_opens = ctrc_page_fd_closes = 0;
 	native_step_active = native_step_foreign_blocker = false;
 	native_step_null_physical = false;
 	native_install_active = false; native_install_setup = true;
@@ -81,6 +86,7 @@ native_step(CtrcReadNativeFixture *f, Size count, Size budget)
 static void
 native_step_finish(CtrcReadNativeFixture *f)
 {
+	UT_ASSERT(!ctrc_page_fd_live); ctrc_page_fd_enabled = false;
 	UT_ASSERT(native_fpi_allocation == NULL); UT_ASSERT_EQ(native_step_allocation_depth, 0);
 	UT_ASSERT_EQ(native_fpi_allocs, native_fpi_frees);
 	native_step_active = native_step_foreign_blocker = false;

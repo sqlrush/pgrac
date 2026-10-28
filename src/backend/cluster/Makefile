@@ -412,6 +412,7 @@ OBJS = \
 	storage/cluster_shared_fs_stub.o \
 	storage/cluster_shared_fs_local.o \
 	storage/cluster_shared_fs_sharedfs.o \
+	storage/cluster_shared_fs_page.o \
 	storage/cluster_shared_fs_block_device.o \
 	storage/cluster_pr_scsi.o \
 	storage/cluster_smgr.o \

@@ -392,3 +392,5 @@ UT_TEST(test_ctrc_native_page_scope_match_requires_exact_live_promoted_scope)
 	test_ctrc_set_acquire_hook = NULL; test_ctrc_set_release_hook = NULL;
 	ctrc_replay_current_override = NULL; test_inputs_startup_cf = false;
 }
+
+#include "test_cluster_control_ctrc_page_fd.inc"

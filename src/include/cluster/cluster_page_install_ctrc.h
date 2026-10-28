@@ -137,7 +137,13 @@ typedef struct RfPageCtrcStepResultV1 {
  * Preparation's PAGE is dropped only for hash/WAL capacity preparation; after
  * exact re-promotion, reread and compare every original MAIN/SPACE byte before
  * PRE_INSERT. Keep every borrowed input and backing object alive/immutable.
- * memory_budget covers simultaneous private snapshots, including original F4.
+ * Before the first PAGE, pin existing cluster_fs MAIN/SPACE raw descriptors,
+ * namespace/inode/extent and current process/ResourceOwner. All five reads,
+ * WAL-gap reread, write/sync/postread use those same descriptors; no VFD is
+ * opened in that window. Other storage backends refuse. Close the private
+ * descriptors on every return/ERROR without releasing any original grant.
+ * memory_budget covers simultaneous private snapshots, original F4 and the
+ * complete bounded storage preparation allocation.
  * WAIT is only an actual conditional PAGE collision. UNCHANGED is a protected
  * observation, TARGET_SYNCED only local installation; neither clears debt nor
  * publishes DURABLE/COMPLETE/OPEN. PAGE remains held after successful promotion
