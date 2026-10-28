@@ -301,8 +301,8 @@ cluster_pcm_own_grant_commit_exact(int buf_id, uint64 expected_generation, uint6
 		return CLUSTER_PCM_OWN_BUSY;
 	if (live_token != reservation_token)
 		return CLUSTER_PCM_OWN_STALE;
-	/* An adopted delivery grant is consumed only by the exact writer T2,
-	 * never by the generic read/shared grant path. */
+	/* An adopted delivery grant requires its exact read executor or writer
+	 * T2, never this generic read/shared grant path. */
 	if (pg_atomic_read_u64(&entry->delivery_attempt) != 0)
 		return CLUSTER_PCM_OWN_BUSY;
 	if (generation == UINT64_MAX)
@@ -312,6 +312,56 @@ cluster_pcm_own_grant_commit_exact(int buf_id, uint64 expected_generation, uint6
 	pg_atomic_write_u64(&entry->generation, generation);
 	pg_atomic_write_u32(&entry->flags, 0);
 	*out_committed_generation = generation;
+	return CLUSTER_PCM_OWN_OK;
+}
+
+/* Raw read-executor commit. The matching BufHdr owner proves the usable
+ * S image and full acquisition before this call, and publishes descriptor
+ * mode under that same lock. Keep delivery residency across the generation
+ * change until the original IO/shared completion owner hands it off. */
+ClusterPcmOwnResult
+cluster_pcm_own_delivery_read_commit_exact(int buf_id, uint64 expected_generation,
+	uint64 reservation_token, uint64 delivery_attempt, uint64 expected_write_io_generation,
+	uint64 *out_committed_generation)
+{
+	ClusterPcmOwnEntry *entry;
+	uint64 live_token, write_io_generation;
+	uint32 flags;
+
+	if (out_committed_generation == NULL)
+		return CLUSTER_PCM_OWN_INVALID;
+	*out_committed_generation = 0;
+	if (reservation_token == 0 || delivery_attempt == 0 || delivery_attempt == UINT64_MAX
+		|| (expected_write_io_generation & 1) != 0)
+		return CLUSTER_PCM_OWN_INVALID;
+	if (expected_generation == UINT64_MAX || reservation_token == UINT64_MAX)
+		return CLUSTER_PCM_OWN_EXHAUSTED;
+	if (!cluster_pcm_own_entry_for_buf(buf_id, &entry))
+		return CLUSTER_PCM_OWN_NOT_READY;
+	live_token = pg_atomic_read_u64(&entry->reservation_token);
+	flags = pg_atomic_read_u32(&entry->flags);
+	if (cluster_pcm_own_classify_live_flags(flags, live_token) == CLUSTER_PCM_OWN_CORRUPT
+		|| pg_atomic_read_u64(&entry->writer_activation_token) != 0
+		|| pg_atomic_read_u64(&entry->resource_x_activation_generation) != 0)
+		return CLUSTER_PCM_OWN_CORRUPT;
+	if (pg_atomic_read_u64(&entry->generation) != expected_generation
+		|| live_token != reservation_token
+		|| pg_atomic_read_u64(&entry->delivery_attempt) != delivery_attempt)
+		return CLUSTER_PCM_OWN_STALE;
+	if (flags == 0)
+		return CLUSTER_PCM_OWN_STALE;
+	if (flags != PCM_OWN_FLAG_GRANT_PENDING)
+		return CLUSTER_PCM_OWN_BUSY;
+	write_io_generation = pg_atomic_read_u64(&entry->write_io_generation);
+	if ((write_io_generation & 1) != 0)
+		return CLUSTER_PCM_OWN_BUSY;
+	if (write_io_generation != expected_write_io_generation)
+		return CLUSTER_PCM_OWN_STALE;
+	/* No ERROR-capable work or IO occurs between these stores. The caller's
+	 * existing header lock makes this one coherent native transition. */
+	pg_atomic_write_u64(&entry->generation, expected_generation + 1);
+	pg_atomic_write_u32(&entry->flags, 0);
+	*out_committed_generation = expected_generation + 1;
 	return CLUSTER_PCM_OWN_OK;
 }
 

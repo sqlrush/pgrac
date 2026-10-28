@@ -10554,3 +10554,14 @@ clean distclean maintainer-clean: clean-native-disk-read
 clean-native-disk-read:
 	rm -f test_cluster_native_disk_read test_cluster_native_disk_read.inc test_cluster_native_disk_read.inc.tmp \
 		test_cluster_native_acquire_execution_fixture.inc test_cluster_native_acquire_execution_fixture.inc.tmp
+
+# Exact native read-executor transition; generic commits remain fenced.
+TESTS += test_cluster_native_read_commit
+all: test_cluster_native_read_commit
+test_cluster_native_read_commit: test_cluster_native_read_commit.c unit_test.h \
+        $(CLUSTER_PCM_OWN_O) $(top_srcdir)/src/include/cluster/cluster_pcm_own.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_PCM_OWN_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+clean distclean maintainer-clean: clean-native-read-commit
+.PHONY: clean-native-read-commit
+clean-native-read-commit:
+	rm -f test_cluster_native_read_commit

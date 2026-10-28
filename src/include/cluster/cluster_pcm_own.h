@@ -139,6 +139,14 @@ extern ClusterPcmOwnResult cluster_pcm_own_grant_commit_exact(int buf_id,
 															  uint64 expected_generation,
 															  uint64 reservation_token,
 															  uint64 *out_committed_generation);
+/* Read-executor-only singleton GP consumption. Caller proves full E/usable
+ * S bytes and descriptor mode under the original BufHdr/content owners.
+ * Preserves the exact delivery hold for later IO/shared completion. It is
+ * neither an installer nor replay/semantic completion; old-base replay is
+ * STALE. Output IO must still match the original quiet generation. */
+extern ClusterPcmOwnResult cluster_pcm_own_delivery_read_commit_exact(int buf_id,
+	uint64 expected_generation, uint64 reservation_token, uint64 delivery_attempt,
+	uint64 expected_write_io_generation, uint64 *out_committed_generation);
 extern ClusterPcmOwnResult cluster_pcm_own_revoke_commit_exact(int buf_id,
 															   uint64 expected_generation,
 															   uint64 reservation_token,
