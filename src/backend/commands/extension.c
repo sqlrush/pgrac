@@ -1914,6 +1914,15 @@ CreateExtension(ParseState *pstate, CreateExtensionStmt *stmt)
 	bool		cascade = false;
 	ListCell   *lc;
 
+#ifdef USE_PGRAC_CLUSTER
+	/* Direct callers share the original utility refusal before any work.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if (cluster_shared_config || cluster_shared_catalog)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("CREATE EXTENSION is not supported in shared mode"),
+						errdetail("PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED")));
+#endif
+
 	/* Check extension name validity before any filesystem access */
 	check_valid_extension_name(stmt->extname);
 
@@ -2924,6 +2933,14 @@ AlterExtensionNamespace(const char *extensionName, const char *newschema, Oid *o
 	HeapTuple	depTup;
 	ObjectAddresses *objsMoved;
 	ObjectAddress extAddr;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* Preserve the utility scope refusal before native catalog access. */
+	if (cluster_shared_config || cluster_shared_catalog)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("CREATE/DROP EXTENSION is not supported in shared mode"),
+						errdetail("PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED")));
+#endif
 
 	extensionOid = get_extension_oid(extensionName, false);
 

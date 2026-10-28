@@ -883,7 +883,8 @@ test_cluster_fresh_read.inc: $(top_srcdir)/src/common/controldata_utils.c Makefi
 	mv $@.tmp $@
 test_cluster_fresh_boolean.inc: $(top_srcdir)/src/backend/commands/define.c Makefile
 	awk '/^defGetBoolean\(/ { print "bool"; emit=1; count++ } \
-	     emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
+	     /^errorConflictingDefElem\(/ { print "void"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 2 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 test_cluster_fresh_index.inc: $(top_srcdir)/src/backend/commands/indexcmds.c Makefile
 	awk '/^CheckClusterIndexAccessMethodName\(/ { print "static void"; emit=1 } \
@@ -930,16 +931,21 @@ test_cluster_fresh_import_filter.inc: $(top_srcdir)/src/backend/foreign/foreign.
 	     emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 test_cluster_fresh_extension.inc: $(top_srcdir)/src/backend/commands/extension.c Makefile
-	awk '/^PreflightClusterSharedExtensionWrite\(/ { print "static void"; emit=1; helper++ } \
+	awk '/^check_valid_extension_name\(/ { print "static void"; emit=1; validator++ } \
+	     /^CreateExtension\(/ { print "ObjectAddress"; emit=1; create++ } \
+	     /^AlterExtensionNamespace\(/ { print "ObjectAddress"; emit=1; namespace=1; entries++ } \
+	     /^PreflightClusterSharedExtensionWrite\(/ { print "static void"; emit=1; helper++ } \
 	     /^ExecAlterExtensionStmt\(/ { print "ObjectAddress"; emit=1; update=1; entries++ } \
 	     /^ExecAlterExtensionContentsStmt\(/ { print "ObjectAddress"; emit=1; contents=1; entries++ } \
 	     emit { print } \
+	     namespace && /extensionOid = get_extension_oid\(extensionName, false\);/ \
+	     { print "return InvalidObjectAddress; }"; emit=0; namespace=0; cuts++ } \
 	     update && /extRel = table_open\(ExtensionRelationId, AccessShareLock\);/ \
 	     { print "return InvalidObjectAddress; }"; emit=0; update=0; cuts++ } \
 	     contents && /&relation, AccessShareLock, false\);/ \
 	     { print "return InvalidObjectAddress; }"; emit=0; contents=0; cuts++ } \
 	     /^}/ { emit=0 } \
-	     END { if (entries != 2 || cuts != 2 || helper > 1 || emit) exit 1 }' $< > $@.tmp
+	     END { if (entries != 3 || cuts != 3 || helper != 1 || validator != 1 || create != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 test_cluster_fresh_scope: test_cluster_fresh_scope.c unit_test.h \
 		test_cluster_fresh_control.inc test_cluster_fresh_startup.inc test_cluster_fresh_read.inc \

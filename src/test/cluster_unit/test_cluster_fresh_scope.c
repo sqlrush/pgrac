@@ -26,6 +26,7 @@
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "catalog/catversion.h"
+#include "catalog/dependency.h"
 #include "catalog/index.h"
 #include "catalog/namespace.h"
 #include "catalog/objectaddress.h"
@@ -70,6 +71,7 @@ static ControlFileData *ControlFile;
 static sigjmp_buf boundary;
 static int error_code;
 static char error_message[256], error_hint[256];
+static char error_detail[160];
 static unsigned prepare_calls, legacy_calls, open_calls, write_opens;
 static PgracControlBindingResult binding_result = PGRAC_CONTROL_BINDING_MISSING;
 
@@ -168,7 +170,11 @@ errhint(const char *fmt, ...)
 int
 errdetail(const char *fmt, ...)
 {
-	(void)fmt;
+	va_list ap;
+
+	va_start(ap, fmt);
+	vsnprintf(error_detail, sizeof(error_detail), fmt, ap);
+	va_end(ap);
 	return 0;
 }
 int
@@ -712,6 +718,7 @@ reset_error(void)
 {
 	error_code = 0;
 	error_message[0] = error_hint[0] = '\0';
+	error_detail[0] = '\0';
 }
 
 UT_TEST(test_pre1_startup_refuses_before_root_and_without_writes)
@@ -6143,6 +6150,38 @@ get_object_address(ObjectType objtype, Node *object, Relation *relp, LOCKMODE lo
 	siglongjmp(boundary, 2);
 }
 
+/* Full CREATE runs validation/options; its internal install is a boundary.
+ * Namespace stops at the original first catalog lookup, before real locks. */
+static bool scope_extension_exists;
+static unsigned scope_extension_oid_calls, scope_extension_inner_calls,
+	scope_extension_bad_boundary;
+static const char *scope_extension_schema, *scope_extension_version;
+static bool scope_extension_cascade;
+
+Oid
+get_extension_oid(const char *name, bool missing_ok)
+{
+	scope_extension_oid_calls++;
+	if (strcmp(name, "extension") != 0)
+		scope_extension_bad_boundary++;
+	if (!missing_ok)
+		siglongjmp(boundary, 2);
+	return scope_extension_exists ? 60 : InvalidOid;
+}
+
+static ObjectAddress
+CreateExtensionInternal(char *name, char *schema, const char *version, bool cascade, List *parents,
+						bool is_create)
+{
+	scope_extension_inner_calls++;
+	scope_extension_schema = schema;
+	scope_extension_version = version;
+	scope_extension_cascade = cascade;
+	if (strcmp(name, "extension") != 0 || parents != NIL || !is_create)
+		scope_extension_bad_boundary++;
+	siglongjmp(boundary, 2);
+}
+
 #include "test_cluster_fresh_extension.inc"
 
 static void
@@ -6333,10 +6372,227 @@ UT_TEST(test_native_extension_utility_prebinding_reuses_same_top_before_lookup)
 	}
 }
 
+static void
+reset_native_extension_scope(void)
+{
+	reset_native_extension(false);
+	scope_extension_exists = false;
+	scope_extension_oid_calls = scope_extension_inner_calls = scope_extension_bad_boundary = 0;
+	scope_extension_schema = scope_extension_version = NULL;
+	scope_extension_cascade = false;
+}
+
+static void
+unsupported_extension_entry(bool create, const char *name, bool if_not_exists, Oid *oldschema)
+{
+	if (create) {
+		CreateExtensionStmt stmt = { .type = T_CreateExtensionStmt,
+									 .extname = (char *)name,
+									 .if_not_exists = if_not_exists };
+
+		(void)CreateExtension(NULL, &stmt);
+	} else
+		(void)AlterExtensionNamespace(name, "target", oldschema);
+}
+
+UT_TEST(test_native_unsupported_extension_commands_refuse_in_original_shared_profiles)
+{
+	for (unsigned kind = 0; kind < 2; kind++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			for (unsigned skip = 0; skip < 2; skip++) {
+				bool shared = mode != 0 && mode != 2;
+				Oid oldschema = 91;
+				int caught;
+
+				reset_native_extension_scope();
+				cluster_shared_catalog = (mode & 1) != 0;
+				utility_storage_mode = (mode & 2) != 0;
+				cluster_shared_config = (mode & 4) != 0;
+				scope_extension_exists = skip != 0;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					unsupported_extension_entry(kind == 0, "extension", skip != 0, &oldschema);
+				UT_ASSERT_EQ(caught, shared ? 1 : kind == 0 && skip ? 0 : 2);
+				if (shared) {
+					UT_ASSERT_EQ(error_code, ERRCODE_FEATURE_NOT_SUPPORTED);
+					UT_ASSERT_STR_EQ(error_message,
+									 kind == 0
+										 ? "CREATE EXTENSION is not supported in shared mode"
+										 : "CREATE/DROP EXTENSION is not supported in shared mode");
+					UT_ASSERT_STR_EQ(
+						error_detail,
+						"PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+				}
+				UT_ASSERT_EQ(scope_extension_oid_calls, shared ? 0 : 1);
+				UT_ASSERT_EQ(scope_extension_inner_calls, !shared && kind == 0 && !skip ? 1 : 0);
+				UT_ASSERT_EQ(scope_extension_bad_boundary, 0);
+				UT_ASSERT_EQ(oldschema, 91);
+				UT_ASSERT_EQ(utility_xids, 0);
+				UT_ASSERT_EQ(utility_binds, 0);
+				UT_ASSERT_EQ(utility_prepares, 0);
+			}
+		}
+	}
+}
+
+UT_TEST(test_native_unsupported_extension_refusal_precedes_invalid_context_and_allocation)
+{
+	for (unsigned kind = 0; kind < 2; kind++) {
+		for (unsigned context = 0; context < 7; context++) {
+			Oid oldschema = 91;
+			int caught;
+
+			reset_native_extension_scope();
+			cluster_shared_catalog = (context & 1) != 0;
+			cluster_shared_config = !cluster_shared_catalog;
+			utility_storage_mode = false;
+			XactReadOnly = context == 0;
+			utility_parallel = context == 1;
+			utility_recovery = context == 2;
+			utility_in_child = context == 3;
+			utility_bind_ok = false;
+			if (context == 4) {
+				utility_current_xid = 401;
+				utility_top_xid = 400;
+			}
+			if (context == 5) {
+				utility_current_xid = utility_top_xid = 400;
+				utility_binds = 1;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				unsupported_extension_entry(kind == 0, context == 6 ? "" : "extension", false,
+											&oldschema);
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, ERRCODE_FEATURE_NOT_SUPPORTED);
+			UT_ASSERT_STR_EQ(error_detail,
+							 "PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+			UT_ASSERT_EQ(scope_extension_oid_calls, 0);
+			UT_ASSERT_EQ(scope_extension_inner_calls, 0);
+			UT_ASSERT_EQ(utility_xids, 0);
+			UT_ASSERT_EQ(utility_prepares, 0);
+			UT_ASSERT_EQ(utility_binds, context == 5 ? 1 : 0);
+			UT_ASSERT_EQ(oldschema, 91);
+		}
+	}
+}
+
+UT_TEST(test_nonshared_extension_create_retains_native_validation_skip_nested_and_options)
+{
+	const char *invalid[] = { "", "-x", "x-", "x--y", "x/y" };
+
+	for (unsigned i = 0; i < lengthof(invalid); i++) {
+		int caught;
+
+		reset_native_extension_scope();
+		cluster_shared_catalog = cluster_shared_config = false;
+		caught = sigsetjmp(boundary, 1);
+		if (!caught)
+			unsupported_extension_entry(true, invalid[i], false, NULL);
+		UT_ASSERT_EQ(caught, 1);
+		UT_ASSERT_EQ(error_code, ERRCODE_INVALID_PARAMETER_VALUE);
+		UT_ASSERT_EQ(scope_extension_oid_calls, 0);
+		UT_ASSERT_EQ(scope_extension_inner_calls, 0);
+		UT_ASSERT_EQ(utility_prepares, 0);
+	}
+	for (unsigned variant = 0; variant < 5; variant++) {
+		CreateExtensionStmt stmt = { .type = T_CreateExtensionStmt, .extname = "extension" };
+		String schema = { .type = T_String, .sval = "chosen" };
+		String version = { .type = T_String, .sval = "v2" };
+		DefElem options[]
+			= { { .type = T_DefElem, .defname = "schema", .arg = (Node *)&schema },
+				{ .type = T_DefElem, .defname = "new_version", .arg = (Node *)&version },
+				{ .type = T_DefElem, .defname = "cascade" } };
+		ListCell cells[3];
+		List list = { .type = T_List, .length = 3, .max_length = 3, .elements = cells };
+		ObjectAddress result = { 0 };
+		int caught;
+
+		reset_native_extension_scope();
+		cluster_shared_catalog = cluster_shared_config = false;
+		for (unsigned i = 0; i < 3; i++)
+			cells[i].ptr_value = &options[i];
+		if (variant <= 1) {
+			scope_extension_exists = true;
+			stmt.if_not_exists = variant == 1;
+		} else if (variant == 2)
+			creating_extension = true;
+		else {
+			stmt.options = &list;
+			if (variant == 4) {
+				list.length = 2;
+				cells[1].ptr_value = &options[0];
+			}
+		}
+		caught = sigsetjmp(boundary, 1);
+		if (!caught)
+			result = CreateExtension(NULL, &stmt);
+		UT_ASSERT_EQ(caught, variant == 1 ? 0 : variant == 3 ? 2 : 1);
+		if (variant == 0)
+			UT_ASSERT_EQ(error_code, ERRCODE_DUPLICATE_OBJECT);
+		else if (variant == 1)
+			UT_ASSERT_EQ(result.objectId, InvalidOid);
+		else if (variant == 2)
+			UT_ASSERT(strstr(error_message, "nested CREATE EXTENSION") != NULL);
+		else if (variant == 4)
+			UT_ASSERT_EQ(error_code, ERRCODE_SYNTAX_ERROR);
+		if (variant == 3) {
+			UT_ASSERT_STR_EQ(scope_extension_schema, "chosen");
+			UT_ASSERT_STR_EQ(scope_extension_version, "v2");
+			UT_ASSERT(scope_extension_cascade);
+		}
+		UT_ASSERT_EQ(scope_extension_oid_calls, 1);
+		UT_ASSERT_EQ(scope_extension_inner_calls, variant == 3 ? 1 : 0);
+		UT_ASSERT_EQ(scope_extension_bad_boundary, 0);
+		UT_ASSERT_EQ(utility_prepares, 0);
+	}
+}
+
+UT_TEST(test_utility_and_native_unsupported_extension_code_message_detail_match)
+{
+	for (unsigned kind = 0; kind < 2; kind++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			CreateExtensionStmt create = { .type = T_CreateExtensionStmt, .extname = "extension" };
+			String name = { .type = T_String, .sval = "extension" };
+			AlterObjectSchemaStmt move = { .type = T_AlterObjectSchemaStmt,
+										   .objectType = OBJECT_EXTENSION,
+										   .object = (Node *)&name,
+										   .newschema = "target" };
+			bool shared = mode != 0 && mode != 2;
+			char message[256], detail[160];
+			int caught;
+
+			reset_native_extension_scope();
+			cluster_shared_catalog = (mode & 1) != 0;
+			utility_storage_mode = (mode & 2) != 0;
+			cluster_shared_config = (mode & 4) != 0;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				create_sql_entry(kind == 0 ? (Node *)&create : (Node *)&move);
+			UT_ASSERT_EQ(caught, shared ? 1 : 0);
+			strlcpy(message, error_message, sizeof(message));
+			strlcpy(detail, error_detail, sizeof(detail));
+			reset_error();
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				unsupported_extension_entry(kind == 0, "extension", false, NULL);
+			UT_ASSERT_EQ(caught, shared ? 1 : 2);
+			if (shared) {
+				UT_ASSERT_EQ(error_code, ERRCODE_FEATURE_NOT_SUPPORTED);
+				UT_ASSERT_STR_EQ(error_message, message);
+				UT_ASSERT_STR_EQ(error_detail, detail);
+			}
+			UT_ASSERT_EQ(utility_xids, 0);
+			UT_ASSERT_EQ(utility_binds, 0);
+			UT_ASSERT_EQ(utility_prepares, 0);
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(72);
+	UT_PLAN(76);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -6409,6 +6665,10 @@ main(void)
 	UT_RUN(test_native_extension_original_readonly_parallel_recovery_guards_precede_binding);
 	UT_RUN(test_native_extension_nested_and_forbidden_objects_refuse_before_binding);
 	UT_RUN(test_native_extension_utility_prebinding_reuses_same_top_before_lookup);
+	UT_RUN(test_native_unsupported_extension_commands_refuse_in_original_shared_profiles);
+	UT_RUN(test_native_unsupported_extension_refusal_precedes_invalid_context_and_allocation);
+	UT_RUN(test_nonshared_extension_create_retains_native_validation_skip_nested_and_options);
+	UT_RUN(test_utility_and_native_unsupported_extension_code_message_detail_match);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
