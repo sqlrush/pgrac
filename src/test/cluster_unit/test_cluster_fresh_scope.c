@@ -81,6 +81,8 @@
 #include "parser/analyze.h"
 #include "parser/parse_oper.h"
 #include "parser/parse_type.h"
+#include "parser/parse_utilcmd.h"
+#include "rewrite/rewriteDefine.h"
 #include "port/pg_crc32c.h"
 #include "storage/fd.h"
 #include "storage/large_object.h"
@@ -11647,10 +11649,219 @@ UT_TEST(test_native_view_utility_warm_guards_preserve_binding)
 	view_lookup_active = false;
 }
 
+/* Actual rule prefix stops before parse analysis takes the target-table lock.
+ * Rule validity, actions, permissions and rewrite remain beyond this boundary. */
+static bool rule_lookup_active, rule_expect_binding;
+static unsigned rule_lookups, rule_unbound, rule_bad_lookup;
+static const char *rule_source_text;
+static RuleStmt native_rule_statement;
+static Node *rule_expected_statement;
+static RangeVar rule_relation;
+static SelectStmt rule_select;
+static A_Const rule_constant, rule_qualification;
+static ResTarget rule_target;
+static ListCell rule_target_cell, rule_action_cell;
+static List rule_targets, rule_actions;
+
+void
+transformRuleStmt(RuleStmt *stmt, const char *queryString, List **actions, Node **whereClause)
+{
+	rule_lookups++;
+	if (rule_expect_binding && utility_binds == 0)
+		rule_unbound++;
+	if (!rule_lookup_active || stmt != &native_rule_statement || queryString != rule_source_text
+		|| !actions || !whereClause || (void *)actions == (void *)whereClause)
+		rule_bad_lookup++;
+	/* Output addresses are borrowed; do not read uninitialized locals or write them. */
+	siglongjmp(boundary, 2); /* Stop before real analysis, writes or source locks. */
+}
+
+#include "test_cluster_fresh_rule.inc"
+
+static void
+reset_native_rule(bool expect_binding, unsigned form)
+{
+	static const char *sources[]
+		= { "CREATE RULE target_rule AS ON INSERT TO target_table DO INSTEAD NOTHING",
+			"CREATE OR REPLACE RULE target_rule AS ON UPDATE TO target_table WHERE true DO ALSO "
+			"SELECT 1",
+			"CREATE RULE target_rule AS ON DELETE TO target_table DO INSTEAD SELECT 1",
+			"CREATE RULE _RETURN AS ON SELECT TO target_table DO INSTEAD SELECT 1" };
+	static const CmdType events[] = { CMD_INSERT, CMD_UPDATE, CMD_DELETE, CMD_SELECT };
+
+	reset_create_preflight();
+	rule_lookup_active = true;
+	rule_expect_binding = expect_binding;
+	rule_lookups = rule_unbound = rule_bad_lookup = 0;
+	rule_source_text = sources[form];
+	rule_relation = (RangeVar){ .type = T_RangeVar,
+								.relname = "target_table",
+								.relpersistence = RELPERSISTENCE_PERMANENT };
+	rule_constant = (A_Const){ .type = T_A_Const, .location = -1 };
+	rule_constant.val.ival = (Integer){ .type = T_Integer, .ival = 1 };
+	rule_target = (ResTarget){ .type = T_ResTarget, .val = (Node *)&rule_constant, .location = -1 };
+	rule_target_cell.ptr_value = &rule_target;
+	rule_targets
+		= (List){ .type = T_List, .length = 1, .max_length = 1, .elements = &rule_target_cell };
+	rule_select = (SelectStmt){ .type = T_SelectStmt, .targetList = &rule_targets };
+	rule_action_cell.ptr_value = &rule_select;
+	rule_actions
+		= (List){ .type = T_List, .length = 1, .max_length = 1, .elements = &rule_action_cell };
+	rule_qualification = (A_Const){ .type = T_A_Const, .location = -1 };
+	rule_qualification.val.boolval = (Boolean){ .type = T_Boolean, .boolval = true };
+	native_rule_statement
+		= (RuleStmt){ .type = T_RuleStmt,
+					  .relation = &rule_relation,
+					  .rulename = form == 3 ? "_RETURN" : "target_rule",
+					  .whereClause = form == 1 ? (Node *)&rule_qualification : NULL,
+					  .event = events[form],
+					  .instead = form != 1,
+					  .actions = form ? &rule_actions : NIL,
+					  .replace = form == 1 };
+	rule_expected_statement = (Node *)&native_rule_statement;
+}
+
+static void
+native_rule_entry(void)
+{
+	(void)DefineRule(&native_rule_statement, rule_source_text);
+}
+
+UT_TEST(test_native_rule_binds_before_first_query_in_all_profiles)
+{
+	for (unsigned form = 0; form < 4; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_rule(binds, form);
+			set_native_operator_mode(mode);
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_rule_entry();
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(rule_lookups, repeat + 1);
+				UT_ASSERT_EQ(rule_unbound, 0);
+				UT_ASSERT_EQ(rule_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	rule_lookup_active = false;
+}
+
+UT_TEST(test_native_rule_refuses_before_lookup_on_publication_child_and_top_errors)
+{
+	for (unsigned form = 0; form < 4; form++) {
+		for (unsigned failure = 0; failure < 5; failure++) {
+			bool allocated = failure == 0 || failure == 2;
+			int caught;
+
+			reset_native_rule(true, form);
+			if (failure == 0)
+				utility_bind_ok = false;
+			else if (failure == 1 || failure == 2) {
+				if (failure == 2)
+					create_sql_entry(rule_expected_statement);
+				utility_in_child = true;
+			} else {
+				utility_current_xid = 401;
+				utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_rule_entry();
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, failure == 0  ? ERRCODE_DATA_CORRUPTED
+									 : failure < 3 ? ERRCODE_FEATURE_NOT_SUPPORTED
+												   : ERRCODE_INTERNAL_ERROR);
+			UT_ASSERT_STR_EQ(
+				error_message,
+				failure == 0  ? "canonical ACTIVE publication failed before shared catalog creation"
+				: failure < 3 ? "shared catalog creation does not support subtransactions"
+							  : "shared catalog top-level transaction identity mismatch");
+			UT_ASSERT_EQ(rule_lookups, 0);
+			UT_ASSERT_EQ(rule_unbound + rule_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_xids, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, failure == 2 ? 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, allocated || failure == 3 ? 400 : InvalidTransactionId);
+		}
+	}
+	rule_lookup_active = false;
+}
+
+UT_TEST(test_native_rule_context_guards_keep_nonshared_route)
+{
+	for (unsigned form = 0; form < 4; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+
+			for (unsigned guard = 0; guard < 3; guard++) {
+				int caught;
+
+				reset_native_rule(binds, form);
+				set_native_operator_mode(mode);
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_rule_entry();
+				UT_ASSERT_EQ(caught, binds ? 1 : 2);
+				UT_ASSERT_EQ(error_code, !binds		  ? 0
+										 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+													  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				UT_ASSERT_EQ(rule_lookups, binds ? 0 : 1);
+				UT_ASSERT_EQ(rule_unbound + rule_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	rule_lookup_active = false;
+}
+
+UT_TEST(test_native_rule_utility_warm_guards_preserve_binding)
+{
+	for (unsigned form = 0; form < 4; form++) {
+		for (unsigned guard = 0; guard < 4; guard++) {
+			int caught;
+
+			reset_native_rule(true, form);
+			create_sql_entry(rule_expected_statement);
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			XactReadOnly = guard == 1;
+			utility_parallel = guard == 2;
+			utility_recovery = guard == 3;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_rule_entry();
+			UT_ASSERT_EQ(caught, guard ? 1 : 2);
+			UT_ASSERT_EQ(error_code, !guard		  ? 0
+									 : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+												  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT_EQ(rule_lookups, guard ? 0 : 1);
+			UT_ASSERT_EQ(rule_unbound + rule_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_prepares, guard ? 1 : 2);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			UT_ASSERT_EQ(utility_top_xid, 400);
+		}
+	}
+	rule_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(173);
+	UT_PLAN(177);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -11824,6 +12035,10 @@ main(void)
 	UT_RUN(test_native_view_refuses_before_lookup_on_publication_child_and_top_errors);
 	UT_RUN(test_native_view_context_guards_keep_nonshared_route);
 	UT_RUN(test_native_view_utility_warm_guards_preserve_binding);
+	UT_RUN(test_native_rule_binds_before_first_query_in_all_profiles);
+	UT_RUN(test_native_rule_refuses_before_lookup_on_publication_child_and_top_errors);
+	UT_RUN(test_native_rule_context_guards_keep_nonshared_route);
+	UT_RUN(test_native_rule_utility_warm_guards_preserve_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
