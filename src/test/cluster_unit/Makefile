@@ -1428,6 +1428,7 @@ test_cluster_startup_cf_callsite.inc: $(top_srcdir)/src/backend/access/transam/x
 test_cluster_startup_cf_entry: test_cluster_startup_cf_entry.c test_cluster_cf_enqueue.c \
 		test_cluster_prepared_cf.h test_cluster_prepared_cf.inc \
 		test_cluster_generic_cf.h test_cluster_generic_cf.inc \
+		test_cluster_rejoin_cf.h test_cluster_rejoin_cf.inc test_cluster_rejoin_cf_types.inc \
 		test_cluster_startup_cf_entry.inc test_cluster_startup_cf_callsite.inc \
 		test_cluster_merge_cf_entry.inc \
 		test_cluster_merge_cold_cf.inc \
@@ -1468,6 +1469,25 @@ test_cluster_generic_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_control_r
 	     /^cluster_control_root_compare_and_publish\(/ { print "ClusterControlRootResult"; emit=1; consumers++ } \
 	     emit { print } /^}/ { emit=0 } \
 	     END { if (reserved != 1 || masks != 1 || shapes != 1 || selectors != 1 || consumers != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Original retained coordinator stage layout.
+test_cluster_rejoin_cf_types.inc: $(top_srcdir)/src/backend/cluster/cluster_reconfig.c Makefile
+	awk '/^typedef struct ClusterReconfigJoinCommitStage \{/ { emit=1; types++ } \
+	     emit { print } /^} ClusterReconfigJoinCommitStage;/ { emit=0 } \
+	     END { if (types != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Join the original coordinator stage to its ROOT publisher and CF refusal.
+test_cluster_rejoin_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_duty.c \
+		$(top_srcdir)/src/backend/cluster/cluster_reconfig.c Makefile
+	awk 'FNR == NR && /^(cluster_recovery_duty_key_encode_for_claim|cluster_recovery_owner_rejoin_v1)\(/ { print "static bool"; emit=1; publishers++ } \
+	     FNR == NR && /^(cluster_recovery_duty_key_compare_for_claim|cluster_recovery_duty_key_compare)\(/ { print "static ClusterRecoveryDutyCompare"; emit=1; compares++ } \
+	     FNR != NR && /^cluster_reconfig_release_join_commit_stage\(/ { print "static void"; emit=1; releases++ } \
+	     FNR != NR && /^cluster_reconfig_poll_join_commit_stage\(/ { print "static bool"; emit=1; polls++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (publishers != 2 || compares != 2 || releases != 1 || polls != 1 || emit) exit 1 }' \
+	     $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 
 # Original claim custody declaration and CF consumer, with the real CF producer.
