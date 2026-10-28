@@ -13879,3 +13879,5 @@ test_cluster_ctrc_native_fpi_product.o cluster_page_install_ctrc_test.o: $(top_s
 
 # The original ROOT fixture is shared by both native recovery consumers.
 test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_ctrc_native_fpi: test_cluster_control_ctrc_writer_retention.inc
+
+test_cluster_ctrc_native_fpi: test_cluster_ctrc_native_unchanged_cache.inc
