@@ -933,6 +933,14 @@ extern ResourceXApplyResult cluster_bufmgr_pcm_own_acquire_stage_disk_exact(
 	const ResourceXDecodedAcquireIntent *episode,
 	const struct ClusterSemanticAdmissionToken *admission,
 	const ResourceXDeliveryClaim *execution, ResourceXDiskStageObservation *out);
+/* Complete only the original first-fill S DISK execution. An interrupted
+ * armed owner retains responsibility; only a completed same-E replay may
+ * finish its exact native hold release, without another read or IO finish. */
+extern ResourceXApplyResult cluster_bufmgr_pcm_own_acquire_complete_disk_exact(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
+	const ResourceXDecodedAcquireIntent *episode,
+	const struct ClusterSemanticAdmissionToken *admission,
+	const ResourceXDeliveryClaim *execution);
 extern ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_delivery_begin_x_reservation(BufferDesc *buf,
 													const ClusterPcmOwnSnapshot *expected,

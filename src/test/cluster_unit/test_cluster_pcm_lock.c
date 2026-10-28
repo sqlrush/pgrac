@@ -479,7 +479,7 @@ cluster_lms_wakeup(int worker_id)
 }
 
 #define FAKE_PCM_MAX_ENTRIES 24
-#define FAKE_PCM_ENTRY_BYTES 1528
+#define FAKE_PCM_ENTRY_BYTES 1568
 StaticAssertDecl(sizeof(struct StopPcmEntryLayout) == FAKE_PCM_ENTRY_BYTES,
 				 "negative fixture field offsets must match the generated original entry");
 

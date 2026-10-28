@@ -1713,6 +1713,20 @@ typedef struct ResourceXDeliveryTarget {
 #define RESOURCE_X_DELIVERY_CLEANUP UINT8_C(2)
 #define RESOURCE_X_DELIVERY_ACQUIRE_PREPARED UINT8_C(3)
 #define RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING UINT8_C(4)
+#define RESOURCE_X_DELIVERY_ACQUIRE_READ_ARMED UINT8_C(5)
+#define RESOURCE_X_DELIVERY_ACQUIRE_READ_COMPLETE UINT8_C(6)
+/* Immutable evidence retained by the original full-E executor. This is not
+ * caller authority or a PAGE/WAL memory-source proof for disk bytes. */
+typedef struct ResourceXAcquireReadReceipt {
+	uint64 authority_generation;
+	uint64 write_io_generation;
+	XLogRecPtr page_lsn;
+	uint64 page_scn;
+	uint32 page_crc32c;
+	uint32 decision_crc32c;
+} ResourceXAcquireReadReceipt;
+StaticAssertDecl(sizeof(ResourceXAcquireReadReceipt) == 40,
+				 "Resource-X disk completion evidence has no implicit padding");
 typedef struct ResourceXDeliveryClaim {
 	ResourceXInstallClaimJoinObservation observation;
 	ResourceXDeliveryTarget target;
@@ -2829,6 +2843,18 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_execut
 	const ResourceXDeliveryClaim *execution, const ResourceXDecodedAcquireIntent *episode,
 	ResourceXDecodedFrame *grant_out, ResourceXDecodedFrame *image_out,
 	ResourceXRequesterJoinSnapshot *out);
+
+/* Original first-fill S disk executor only. Full E/A/H/domain are decoded
+ * under the original entry lock. No old join/install receipt is rewritten. */
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_read_owner_exact(
+	const ResourceXDeliveryClaim *execution, const ResourceXDecodedAcquireIntent *episode,
+	ResourceXDeliveryClaim *current_out, ResourceXAcquireReadReceipt *receipt_out);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_read_arm_exact(
+	const ResourceXDeliveryClaim *execution, const ResourceXDecodedAcquireIntent *episode,
+	const ResourceXAcquireReadReceipt *receipt);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_read_complete_exact(
+	const ResourceXDeliveryClaim *execution, const ResourceXDecodedAcquireIntent *episode,
+	const ResourceXAcquireReadReceipt *receipt, const struct ClusterPcmOwnSnapshot *terminal);
 
 #endif /* USE_PGRAC_CLUSTER */
 
