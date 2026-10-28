@@ -1112,6 +1112,7 @@ cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **held)
 #include "test_cluster_recovery_episode_consumed_pages.inc"
 #include "test_cluster_recovery_episode_local_bounds.inc"
 #include "test_cluster_recovery_episode_native_bounds.inc"
+#include "test_cluster_recovery_episode_issued_clog.inc"
 #include "test_cluster_recovery_episode_page_history.inc"
 #include "test_cluster_recovery_episode_page_sources.inc"
 #include "test_cluster_recovery_consumed_native_redo.inc"
@@ -1126,6 +1127,13 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_ISSUED_CLOG") != NULL) {
+		UT_PLAN(3);
+		UT_RUN(test_episode_issued_clog_bytes_reach_original_strict_reader);
+		UT_RUN(test_episode_issued_clog_raw_route_cannot_supply_full_record);
+		UT_RUN(test_episode_issued_clog_wal_error_never_publishes_candidate);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_NATIVE_LOCAL_BOUNDS") != NULL) {
 		UT_PLAN(3);
 		UT_RUN(test_episode_native_bounds_advance_before_observation);
@@ -1399,7 +1407,11 @@ main(int argc, char **argv)
 		UT_RUN(test_census_references_bound_metadata_and_tuple_storage_before_publication);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(242);
+	UT_PLAN(245);
+	UT_RUN(test_episode_issued_clog_bytes_reach_original_strict_reader);
+	UT_RUN(test_episode_issued_clog_raw_route_cannot_supply_full_record);
+	UT_RUN(test_episode_issued_clog_wal_error_never_publishes_candidate);
+
 	UT_RUN(test_episode_native_bounds_advance_before_observation);
 	UT_RUN(test_episode_native_bounds_counter_drift_keeps_custody);
 	UT_RUN(test_episode_native_bounds_horizon_equality_and_crossing);

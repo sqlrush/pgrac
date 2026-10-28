@@ -1,0 +1,72 @@
+/*-------------------------------------------------------------------------
+ * test_cluster_recovery_episode_allocator_namespace.h
+ *     Isolate the complete native allocation fixture and pure stripe body.
+ *
+ * Copyright (c) 2026, pgrac contributors
+ * Author: SqlRush <sqlrush@gmail.com>
+ * IDENTIFICATION
+ *     src/test/cluster_unit/test_cluster_recovery_episode_allocator_namespace.h
+ * NOTES
+ *     Private fixture names only; all original providers and bodies remain.
+ *-------------------------------------------------------------------------
+ */
+#ifndef TEST_CLUSTER_RECOVERY_EPISODE_ALLOCATOR_NAMESPACE_H
+#define TEST_CLUSTER_RECOVERY_EPISODE_ALLOCATOR_NAMESPACE_H
+#include "pg_config.h"
+#define cluster_enabled d3_episode_allocator_cluster_enabled
+#define cluster_shared_catalog d3_episode_allocator_cluster_shared_catalog
+#define cluster_xid_striping d3_episode_allocator_cluster_xid_striping
+#define cluster_node_id d3_episode_allocator_cluster_node_id
+#define cluster_xid_herding_slack d3_episode_allocator_cluster_xid_herding_slack
+#define IsUnderPostmaster d3_episode_allocator_IsUnderPostmaster
+#define Mode d3_episode_allocator_Mode
+#define ShmemVariableCache d3_episode_allocator_ShmemVariableCache
+#define MyProc d3_episode_allocator_MyProc
+#define ProcGlobal d3_episode_allocator_ProcGlobal
+#define MainLWLockArray d3_episode_allocator_MainLWLockArray
+#define cluster_injection_armed_count d3_episode_allocator_cluster_injection_armed_count
+#define IsInParallelMode d3_episode_allocator_IsInParallelMode
+#define RecoveryInProgress d3_episode_allocator_RecoveryInProgress
+#define LWLockAcquire d3_episode_allocator_LWLockAcquire
+#define LWLockRelease d3_episode_allocator_LWLockRelease
+#define ReadNextFullTransactionId d3_episode_allocator_ReadNextFullTransactionId
+#define cluster_xid_stripe_lazy_latch d3_episode_allocator_cluster_xid_stripe_lazy_latch
+#define cluster_xid_stripe_my_slot_floor d3_episode_allocator_cluster_xid_stripe_my_slot_floor
+#define cluster_xid_stripe_herding_floor d3_episode_allocator_cluster_xid_stripe_herding_floor
+#define cluster_xid_stripe_window_exceeded d3_episode_allocator_cluster_xid_stripe_window_exceeded
+#define cluster_xid_wrap_barrier_passed d3_episode_allocator_cluster_xid_wrap_barrier_passed
+#define cluster_xid_stripe_lease_ready d3_episode_allocator_cluster_xid_stripe_lease_ready
+#define cluster_xid_stripe_wait_lease d3_episode_allocator_cluster_xid_stripe_wait_lease
+#define ExtendCLOG d3_episode_allocator_ExtendCLOG
+#define ExtendCLOGFull d3_episode_allocator_ExtendCLOGFull
+#define ExtendCommitTs d3_episode_allocator_ExtendCommitTs
+#define ExtendSUBTRANS d3_episode_allocator_ExtendSUBTRANS
+#define SendPostmasterSignal d3_episode_allocator_SendPostmasterSignal
+#define get_database_name d3_episode_allocator_get_database_name
+#define ExceptionalCondition d3_episode_allocator_ExceptionalCondition
+#define errstart d3_episode_allocator_errstart
+#define errstart_cold d3_episode_allocator_errstart_cold
+#define errfinish d3_episode_allocator_errfinish
+#define TransactionIdPrecedes d3_episode_allocator_TransactionIdPrecedes
+#define TransactionIdFollowsOrEquals d3_episode_allocator_TransactionIdFollowsOrEquals
+#define GetNewTransactionId d3_episode_allocator_GetNewTransactionId
+#define GetNewTransactionIdFullCLOG d3_episode_allocator_GetNewTransactionIdFullCLOG
+#define xid_fixture_extend_full d3_episode_allocator_xid_fixture_extend_full
+#define main d3_episode_allocator_main
+#define PG_exception_stack d3_episode_allocator_PG_exception_stack
+#define error_context_stack d3_episode_allocator_error_context_stack
+#define cluster_xid_widen d3_episode_allocator_cluster_xid_widen
+#define cluster_xid_origin_slot_full d3_episode_allocator_cluster_xid_origin_slot_full
+#define cluster_xid_next_striped_full d3_episode_allocator_cluster_xid_next_striped_full
+#define cluster_xid_lag_exceeds d3_episode_allocator_cluster_xid_lag_exceeds
+#define cluster_xid_allocation_slot d3_episode_allocator_cluster_xid_allocation_slot
+#define cluster_xid_origin_slot d3_episode_allocator_cluster_xid_origin_slot
+#define cluster_xid_is_mine d3_episode_allocator_cluster_xid_is_mine
+#define cluster_xid_provably_foreign d3_episode_allocator_cluster_xid_provably_foreign
+#define cluster_xid_foreign_class_cheap d3_episode_allocator_cluster_xid_foreign_class_cheap
+#define cluster_xid_stripe_latch_runtime d3_episode_allocator_cluster_xid_stripe_latch_runtime
+#define cluster_xid_stripe_slot_record_compute_crc d3_episode_allocator_cluster_xid_stripe_slot_record_compute_crc
+#define cluster_xid_stripe_slot_record_valid d3_episode_allocator_cluster_xid_stripe_slot_record_valid
+#define cluster_xid_stripe_activation_record_compute_crc d3_episode_allocator_cluster_xid_stripe_activation_record_compute_crc
+#define cluster_xid_stripe_activation_record_valid d3_episode_allocator_cluster_xid_stripe_activation_record_valid
+#endif

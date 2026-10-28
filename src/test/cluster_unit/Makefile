@@ -3591,6 +3591,24 @@ test_cluster_recovery_consumed_inputs.o: $(top_srcdir)/src/backend/cluster/clust
 test_cluster_recovery_native_inputs: test_cluster_recovery_consumed_inputs.o test_cluster_recovery_episode_consumed_pages.inc
 test_cluster_recovery_native_inputs: test_cluster_recovery_episode_local_bounds.inc
 test_cluster_recovery_native_inputs: test_cluster_recovery_episode_native_bounds.inc
+
+# The original allocator and native CLOG producer lend only test observations.
+test_cluster_recovery_episode_allocator.o: test_cluster_recovery_episode_allocator.c \
+        test_cluster_recovery_episode_allocator.h test_cluster_recovery_episode_allocator_namespace.h \
+        test_cluster_xid_allocation.c test_cluster_xid_allocation.inc \
+        test_cluster_xid_full_clog.inc test_cluster_xid_native_clog.inc \
+        test_cluster_xid_native_clog.h unit_test.h Makefile \
+        $(top_srcdir)/src/backend/cluster/cluster_xid_stripe.c \
+        $(top_srcdir)/src/include/cluster/cluster_xid_stripe.h \
+        $(top_srcdir)/src/include/cluster/cluster_xid_stripe_boot.h \
+        $(top_srcdir)/src/include/access/transam.h $(top_srcdir)/src/include/access/clog.h \
+        $(top_builddir)/src/include/pg_config.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -Werror -c $< -o $@
+
+test_cluster_recovery_native_inputs: test_cluster_recovery_episode_issued_clog.inc \
+        test_cluster_recovery_episode_allocator.h test_cluster_recovery_episode_allocator.o \
+        test_cluster_xid_native_clog.o
+
 test_cluster_recovery_native_inputs: test_cluster_recovery_episode_page_history.inc
 test_cluster_recovery_native_inputs: test_cluster_recovery_episode_page_sources.inc
 test_cluster_recovery_native_inputs: test_cluster_recovery_consumed_native_redo.inc
@@ -3648,7 +3666,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_ctrc_
 		$(top_builddir)/src/backend/cluster/cluster_recovery_native_scan.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_multixact_join.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_xact_join.o \
-		$(if $(filter test_cluster_recovery_native_inputs,$@),test_cluster_recovery_episode_clog.o test_cluster_recovery_episode_side_owner.o $(CLUSTER_COLD_DECODE_O) test_cluster_cold_recovery_xid_core.o $(top_builddir)/src/backend/cluster/cluster_recovery_reference_graph.o $(top_builddir)/src/backend/cluster/cluster_recovery_undo_store.o $(top_builddir)/src/backend/cluster/cluster_recovery_undo_scan.o $(RECOVERY_CENSUS_TEST_OBJS)) \
+		$(if $(filter test_cluster_recovery_native_inputs,$@),test_cluster_recovery_episode_clog.o test_cluster_recovery_episode_side_owner.o test_cluster_recovery_episode_allocator.o test_cluster_xid_native_clog.o $(CLUSTER_COLD_DECODE_O) test_cluster_cold_recovery_xid_core.o $(top_builddir)/src/backend/cluster/cluster_recovery_reference_graph.o $(top_builddir)/src/backend/cluster/cluster_recovery_undo_store.o $(top_builddir)/src/backend/cluster/cluster_recovery_undo_scan.o $(RECOVERY_CENSUS_TEST_OBJS)) \
 		$(top_builddir)/src/backend/cluster/cluster_thread_recovery_finalize.o \
 		$(WAL_INPUT_CONTRIBUTION_TEST_OBJS) \
 		test_cluster_page_stable_ctrc.o \
@@ -5209,7 +5227,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_clog_native_horizon.inc test_cluster_clog_native_horizon.inc.tmp
 	rm -f test_cluster_clog_native_counter.inc test_cluster_clog_native_counter.inc.tmp
 	rm -f test_cluster_clog_native_advance_next.inc test_cluster_clog_native_advance_next.inc.tmp
-	rm -f test_cluster_recovery_episode_clog.o test_cluster_recovery_episode_side_owner.o test_cluster_recovery_consumed_inputs.o
+	rm -f test_cluster_recovery_episode_clog.o test_cluster_recovery_episode_side_owner.o test_cluster_recovery_consumed_inputs.o test_cluster_recovery_episode_allocator.o
 	rm -f test_cluster_side_native_clog.o
 	rm -f test_cluster_external_fence_duty.inc
 	rm -f test_cluster_data_sync_policy.inc test_cluster_sync_providers.inc \

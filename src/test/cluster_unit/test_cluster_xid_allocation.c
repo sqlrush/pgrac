@@ -58,12 +58,18 @@ static uint64 floor_full, limit_full;
 int cluster_injection_armed_count;
 
 #ifdef TEST_CLUSTER_XID_NATIVE_CLOG
+#ifdef TEST_CLUSTER_EPISODE_ALLOCATOR
+#undef ExtendCLOGFull
+#endif
 #define ExtendCLOGFull xid_fixture_extend_full
 void xid_fixture_extend_full(FullTransactionId candidate);
 #endif
 #include "test_cluster_xid_full_clog.inc"
 #ifdef TEST_CLUSTER_XID_NATIVE_CLOG
 #undef ExtendCLOGFull
+#ifdef TEST_CLUSTER_EPISODE_ALLOCATOR
+#define ExtendCLOGFull d3_episode_allocator_ExtendCLOGFull
+#endif
 #include "test_cluster_xid_native_clog.inc"
 #endif
 
@@ -180,6 +186,10 @@ ExceptionalCondition(const char *condition, const char *file, int line)
 }
 #undef errstart
 #undef errstart_cold
+#ifdef TEST_CLUSTER_EPISODE_ALLOCATOR
+#define errstart d3_episode_allocator_errstart
+#define errstart_cold d3_episode_allocator_errstart_cold
+#endif
 bool
 errstart(int level, const char *domain)
 {
