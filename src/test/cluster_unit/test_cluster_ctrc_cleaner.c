@@ -8820,6 +8820,222 @@ UT_TEST(test_actual_gcs_compact_inventory_is_atomic_before_first_registration)
 	}
 }
 
+static ClusterTxLocator
+receiver_companion_locator(const ClusterCtrcReceiptHandle *handle, const ClusterItlSlotData *slot)
+{
+	ClusterTxLocator locator = {0};
+
+	locator.uba = slot->undo_segment_head;
+	locator.xid = slot->xid;
+	locator.tt_wrap = handle->key.slot_wrap;
+	locator.itl_kind = slot->flags;
+	locator.itl_slot_index = handle->receipt->target.itl_slot_index;
+	return locator;
+}
+
+static void
+check_receiver_companion_readonly(const ClusterCtrcReceiptHandle *handle,
+	const ClusterCtrcTxnKeyV1 *key, FullTransactionId original,
+	const ClusterTxLocator *locator, const ClusterCtrcParticipantIdentity *identity, bool expected)
+{
+	ClusterCtrcParticipantEntry participant = *handle->participant;
+	ClusterCtrcReceipt receipt = *handle->receipt;
+	CtrcReceiptLink link = ctrc_receipt_links()[handle->receipt_index];
+	uint64 head = ctrc_participant_receipt_heads()[handle->participant_index];
+	uint64 generation = pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation);
+	uint64 journal = CtrcShared->global_journal_generation;
+	uint64 progress = CtrcLocalProgress;
+	unsigned wakes = wake_count, allocations = allocation_attempts;
+
+	UT_ASSERT_EQ(cluster_ctrc_itl_original_full_xid_matches_shared(key, original, locator, identity), expected);
+	UT_ASSERT_EQ(memcmp(handle->participant, &participant, sizeof(participant)), 0);
+	UT_ASSERT_EQ(memcmp(handle->receipt, &receipt, sizeof(receipt)), 0);
+	UT_ASSERT_EQ(memcmp(&ctrc_receipt_links()[handle->receipt_index], &link, sizeof(link)), 0);
+	UT_ASSERT_EQ(ctrc_participant_receipt_heads()[handle->participant_index], head);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation), generation);
+	UT_ASSERT_EQ(CtrcShared->global_journal_generation, journal);
+	UT_ASSERT_EQ(CtrcLocalProgress, progress);
+	UT_ASSERT_EQ(wake_count, wakes);
+	UT_ASSERT_EQ(allocation_attempts, allocations);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_receiver_companion_requires_exact_retained_origin_and_applied_itl)
+{
+	for (unsigned fault = 0; fault <= 36; fault++) {
+		ClusterCtrcReceiptHandle handle;
+		ClusterCtrcParticipantIdentity destination, identity;
+		ClusterCtrcItlTargetIdentity target;
+		ClusterCtrcTxnKeyV1 key;
+		ClusterItlSlotData slot;
+		ClusterTxLocator locator;
+		FullTransactionId original;
+
+		UT_ASSERT(seed_delegation_itl_source(&handle, &destination, &target, &slot));
+		key = handle.key;
+		identity = handle.participant->identity;
+		original = handle.original_full_xid;
+		locator = receiver_companion_locator(&handle, &slot);
+		/* Canonical wrap1 and copied ITL wrap3 are deliberately different. */
+		UT_ASSERT(key.slot_wrap != handle.receipt->target.itl_slot_wrap);
+		switch (fault) {
+		case 1: key.reserved[0] = 1; break;
+		case 2: key.segment_generation++; break;
+		case 3: original = FullTransactionIdFromEpochAndXid(8, key.xid); break;
+		case 4: identity.boot_incarnation++; break;
+		case 5: identity.capability_record_generation++; break;
+		case 6: identity.admission_record_generation++; break;
+		case 7: handle.receipt->state = CTRC_RECEIPT_PREPARED; break;
+		case 8: handle.receipt->state = CTRC_RECEIPT_CLEANED; break;
+		case 9: handle.receipt->state = CTRC_RECEIPT_CANCELLED; break;
+		case 10: handle.participant->state = CTRC_PARTICIPANT_CLOSED_DRAINING; break;
+		case 11: handle.participant->state = CTRC_PARTICIPANT_BLOCKED; break;
+		case 12: handle.participant->seal_generation = 41; break;
+		case 13: handle.participant->original_full_xid = FullTransactionIdFromEpochAndXid(8, key.xid); break;
+		case 14: handle.participant->original_identity_v2[143]++; break;
+		case 15: handle.participant->grant_generation++; break;
+		case 16: handle.participant->delegation_parent.sequence = 1; break;
+		case 17: handle.receipt->target.uba[3]++; break;
+		case 18: handle.receipt->target.itl_class = ITL_FLAG_FREE; break;
+		case 19: handle.receipt->target.itl_slot_index++; break;
+		case 20: locator.tt_wrap++; break;
+		case 21: locator.xid++; break;
+		case 22: ctrc_receipt_links()[handle.receipt_index].next_plus_one = handle.receipt_index + 1; break;
+		case 23: ctrc_receipt_links()[handle.receipt_index].journal_generation++; break;
+		case 24: ctrc_participant_receipt_heads()[handle.participant_index] = 0; break;
+		case 25: handle.receipt->key.slot_wrap++; break;
+		case 26: handle.receipt->publication.reference_kind = CTRC_REF_CURRENT_MX_LOCKER; break;
+		case 27: handle.receipt->target.needs_wal = 0; break;
+		case 28: handle.receipt->publication.requester_boot_incarnation++; break;
+		case 29: handle.receipt->publication.capability_record_generation++; break;
+		case 30: handle.receipt->publication.target_kind = CTRC_TARGET_PAGE_PENDING_OFFNUM; break;
+		case 31: handle.receipt->target.kind = CTRC_TARGET_PAGE_PENDING_ITL_SLOT; break;
+		case 32: handle.receipt->reserved8[0] = 1; break;
+		case 33: handle.participant->receipt_count++; break;
+		case 34: original = InvalidFullTransactionId; break;
+		case 35: original = FullTransactionIdFromU64(UINT64_MAX); break;
+		case 36: locator.tt_wrap = TT_WRAP_INVALID; break;
+		}
+		check_receiver_companion_readonly(&handle, &key, original, &locator, &identity, fault == 0);
+	}
+}
+
+UT_TEST(test_receiver_companion_accepts_direct_parent_and_full_path_only_after_apply)
+{
+	ClusterCtrcReceiptHandle first, middle, next;
+	ClusterCtrcParticipantIdentity receiver;
+	ClusterCtrcItlTargetIdentity target;
+	ClusterCtrcTargetV1 pending;
+	ClusterItlSlotData slot;
+	ClusterTxLocator locator;
+	uint8 record[784];
+	Size length = 0;
+
+	UT_ASSERT(seed_multihop_source(&first, &middle, &receiver, &slot, &target));
+	locator = receiver_companion_locator(&middle, &slot);
+	UT_ASSERT_EQ(middle.participant->delegation_parent.sequence, 1);
+	check_receiver_companion_readonly(&middle, &middle.key, middle.original_full_xid,
+		&locator, &middle.participant->identity, true);
+	UT_ASSERT(cluster_ctrc_itl_delegate_prepare_v2(&target, &slot, &middle.participant->identity,
+		&receiver, record, sizeof(record), &length));
+	cluster_node_id = receiver.node_id;
+	image_pending_target(&pending);
+	UT_ASSERT_EQ(cluster_ctrc_itl_image_prepare_v2(&slot, &middle.participant->identity,
+		&receiver, record, length, &pending, &next), CLUSTER_CTRC_PREPARE_READY);
+	UT_ASSERT(next.valid);
+	if (!next.valid)
+		return;
+	locator = receiver_companion_locator(&next, &slot);
+	check_receiver_companion_readonly(&next, &next.key, next.original_full_xid, &locator, &receiver, false);
+	UT_ASSERT(multihop_apply_image(&next, &slot, &target));
+	UT_ASSERT_EQ(next.participant->delegation_path.version, 2);
+	check_receiver_companion_readonly(&next, &next.key, next.original_full_xid, &locator, &receiver, true);
+	next.participant->delegation_path.hops[0].receiver.boot_incarnation++;
+	check_receiver_companion_readonly(&next, &next.key, next.original_full_xid, &locator, &receiver, false);
+}
+
+UT_TEST(test_receiver_companion_multiple_pages_share_identity_but_entire_chain_must_match)
+{
+	ClusterCtrcReceiptHandle first, second;
+	ClusterCtrcParticipantIdentity destination;
+	ClusterCtrcItlTargetIdentity target;
+	ClusterCtrcPublicationIdV1 publication;
+	ClusterCtrcTargetV1 pending, exact;
+	ClusterCtrcApplyToken token;
+	ClusterItlSlotData slot;
+	ClusterTxLocator locator;
+
+	UT_ASSERT(seed_delegation_itl_source(&first, &destination, &target, &slot));
+	locator = receiver_companion_locator(&first, &slot);
+	fixture_receipt_inputs(&ctrc_origin_entries()[0], 2001, &publication, &pending);
+	publication.requester_node_id = first.participant->identity.node_id;
+	publication.requester_boot_incarnation = first.participant->identity.boot_incarnation;
+	publication.capability_record_generation = first.participant->identity.capability_record_generation;
+	pending.block_number++;
+	UT_ASSERT_EQ(cluster_ctrc_receipt_prepare_origin_v2(&first.key, &first.participant->identity,
+		first.participant->grant_generation, &publication, &pending,
+		first.participant->original_identity_v2, 144, &second), CLUSTER_CTRC_PREPARE_READY);
+	UT_ASSERT(second.valid);
+	if (!second.valid)
+		return;
+	exact = first.receipt->target;
+	exact.block_number = pending.block_number;
+	UT_ASSERT_EQ(cluster_ctrc_receipt_apply_shared(&second, &exact, &token), CLUSTER_CTRC_APPLY_APPLIED);
+	UT_ASSERT_EQ(first.participant->applied_count, 2);
+	check_receiver_companion_readonly(&first, &first.key, first.original_full_xid,
+		&locator, &first.participant->identity, true);
+	/* The second/newest receipt is a hit; a corrupt older tail still refuses. */
+	ctrc_receipt_links()[first.receipt_index].journal_generation++;
+	check_receiver_companion_readonly(&second, &second.key, second.original_full_xid,
+		&locator, &second.participant->identity, false);
+}
+
+UT_TEST(test_receiver_companion_data_segment_does_not_replace_canonical_key)
+{
+	ClusterCtrcReceiptHandle handle;
+	ClusterCtrcParticipantIdentity destination;
+	ClusterCtrcTxnKeyV1 guessed;
+	ClusterCtrcTargetV1 exact;
+	ClusterCtrcApplyToken token;
+	ClusterItlSlotData slot = {0};
+	ClusterTxLocator locator;
+	uint8 original[144];
+
+	UT_ASSERT(seed_delegation_sender(&handle, &destination, original));
+	UT_ASSERT(handle.valid);
+	if (!handle.valid)
+		return;
+	slot.xid = handle.key.xid;
+	slot.wrap = 3;
+	slot.flags = ITL_FLAG_ACTIVE;
+	slot.write_scn = 91;
+	slot.first_change_lsn = 0x100;
+	slot.undo_segment_head = uba_encode(handle.key.segment_id + 1, 9, handle.key.slot_offset, 8);
+	exact = handle.receipt->target;
+	exact.kind = CTRC_TARGET_EXACT_ITL_SLOT;
+	exact.itl_slot_index = 2;
+	exact.itl_slot_wrap = slot.wrap;
+	exact.itl_xid = slot.xid;
+	exact.itl_class = slot.flags;
+	memcpy(exact.uba, &slot.undo_segment_head, sizeof(exact.uba));
+	exact.planned_predecessor_sha256[0] = 1;
+	UT_ASSERT(cluster_ctrc_sha256_exact(&slot, sizeof(slot), exact.planned_successor_sha256));
+	UT_ASSERT_EQ(cluster_ctrc_receipt_apply_shared(&handle, &exact, &token), CLUSTER_CTRC_APPLY_APPLIED);
+	locator = receiver_companion_locator(&handle, &slot);
+	check_receiver_companion_readonly(&handle, &handle.key, handle.original_full_xid,
+		&locator, &handle.participant->identity, true);
+	guessed = handle.key;
+	guessed.segment_id++;
+	check_receiver_companion_readonly(&handle, &guessed, handle.original_full_xid,
+		&locator, &handle.participant->identity, false);
+	check_receiver_companion_readonly(&handle, NULL, handle.original_full_xid,
+		&locator, &handle.participant->identity, false);
+	check_receiver_companion_readonly(&handle, &handle.key, handle.original_full_xid,
+		NULL, &handle.participant->identity, false);
+	check_receiver_companion_readonly(&handle, &handle.key, handle.original_full_xid,
+		&locator, NULL, false);
+}
+
 int
 main(void)
 {
@@ -8827,7 +9043,7 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(194);
+	UT_PLAN(198);
 	UT_RUN(test_prepare_path_namespace_precedes_input_and_resets_output);
 	UT_RUN(test_prepare_path_input_precedes_journal_exhaustion);
 	UT_RUN(test_prepare_path_chain_precedes_locator_and_keeps_blocked_state);
@@ -9025,6 +9241,10 @@ main(void)
 	UT_RUN(test_multihop_registered_path_merges_first_hop_without_replacing_its_parent);
 	UT_RUN(test_actual_gcs_multihop_image_registers_original_path_before_apply);
 	UT_RUN(test_actual_gcs_compact_inventory_is_atomic_before_first_registration);
+	UT_RUN(test_receiver_companion_requires_exact_retained_origin_and_applied_itl);
+	UT_RUN(test_receiver_companion_accepts_direct_parent_and_full_path_only_after_apply);
+	UT_RUN(test_receiver_companion_multiple_pages_share_identity_but_entire_chain_must_match);
+	UT_RUN(test_receiver_companion_data_segment_does_not_replace_canonical_key);
 	free(CtrcShared);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

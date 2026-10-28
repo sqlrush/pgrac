@@ -7290,6 +7290,94 @@ cluster_ctrc_participant_delegate_prepare_v1(const ClusterCtrcTxnKeyV1 *key,
 	return prepared;
 }
 
+bool
+cluster_ctrc_itl_original_full_xid_matches_shared(
+	const ClusterCtrcTxnKeyV1 *key, FullTransactionId original,
+	const ClusterTxLocator *locator, const ClusterCtrcParticipantIdentity *receiver)
+{
+	const ClusterCtrcParticipantEntry *participant;
+	const ClusterCtrcParticipantIdentity *original_receiver;
+	FullTransactionId retained;
+	uint32 segment, block;
+	uint16 tt_offset, row_offset;
+	uint64 index, cursor;
+	uint32 lock_mask;
+	bool matched = false;
+
+	if (!cluster_ctrc_shmem_ready() || !ctrc_txn_key_valid(key)
+		|| key->segment_generation == 0 || key->segment_generation == UINT32_MAX
+		|| key->slot_wrap > TT_WRAP_MAX
+		|| !ctrc_participant_identity_valid(key, receiver) || cluster_node_id < 0
+		|| receiver->node_id != (uint16)cluster_node_id
+		|| receiver->node_id == key->origin_node_id
+		|| !FullTransactionIdIsNormal(original) || U64FromFullTransactionId(original) == UINT64_MAX
+		|| XidFromFullTransactionId(original) != key->xid || locator == NULL
+		|| locator->xid != key->xid || locator->tt_wrap != key->slot_wrap
+		|| locator->itl_slot_index >= CLUSTER_ITL_INITRANS_DEFAULT
+		|| locator->itl_kind < ITL_FLAG_ACTIVE || locator->itl_kind > ITL_FLAG_NEEDS_CLEANOUT
+		|| !uba_decode_record(locator->uba, &segment, &block, &tt_offset, &row_offset)
+		|| uba_origin_node_id(locator->uba) != key->origin_node_id
+		|| !ctrc_participant_index(key, receiver->node_id, &index))
+		return false;
+
+	/* Index only by the received complete canonical key, not by the DATA
+	 * segment/slot. DATA and canonical TT can occupy different segments. */
+	lock_mask = ctrc_participant_lock_mask(index);
+	ctrc_participant_locks_acquire(lock_mask);
+	LWLockAcquire(&CtrcShared->receipt_lock, LW_SHARED);
+	participant = &ctrc_participant_entries()[index];
+	if (participant->state != CTRC_PARTICIPANT_OPEN || participant->seal_generation != 0
+		|| participant->grant_generation == 0
+		|| memcmp(&participant->key, key, sizeof(*key)) != 0
+		|| memcmp(&participant->identity, receiver, sizeof(*receiver)) != 0
+		|| !FullTransactionIdEquals(participant->original_full_xid, original)
+		|| !ctrc_participant_delegations_valid(participant)
+		|| !ctrc_receipt_chain_exact_locked(index, false))
+		goto done;
+	original_receiver = participant->delegation_path.version != 0
+		? &participant->delegation_path.root_receiver
+		: (participant->delegation_parent.sequence != 0
+			? &participant->delegation_parent.receiver : &participant->identity);
+	if (!cluster_ctrc_origin_fullxid_match_v2(participant->original_identity_v2,
+		sizeof(participant->original_identity_v2), key, original_receiver,
+		participant->grant_generation, &retained) || !FullTransactionIdEquals(retained, original))
+		goto done;
+
+	/* The complete chain is bounded and validated before accepting a hit.
+	 * Several pages may retain this same DATA locator; none is selected as
+	 * page authority here. Do not confuse ITL wrap with canonical TT wrap. */
+	for (cursor = ctrc_participant_receipt_heads()[index]; cursor != 0;
+		 cursor = ctrc_receipt_links()[cursor - 1].next_plus_one) {
+		const ClusterCtrcReceipt *receipt = &ctrc_receipt_entries()[cursor - 1];
+		const ClusterCtrcPublicationIdV1 *publication = &receipt->publication;
+		const ClusterCtrcTargetV1 *target = &receipt->target;
+
+		if (pg_atomic_read_u32((pg_atomic_uint32 *)&receipt->state) == CTRC_RECEIPT_APPLIED
+			&& publication->grant_generation == participant->grant_generation
+			&& publication->requester_node_id == receiver->node_id
+			&& publication->requester_boot_incarnation == receiver->boot_incarnation
+			&& publication->capability_record_generation == receiver->capability_record_generation
+			&& ctrc_publication_owner_valid(publication) && publication->wire_request_id != 0
+			&& publication->operation_id != 0 && publication->attempt_generation != 0
+			&& publication->journal_sequence != 0 && publication->key_sequence != 0
+			&& publication->reserved8 == 0 && ctrc_bytes_zero(receipt->reserved8, sizeof(receipt->reserved8))
+			&& ctrc_itl_reference_kind(publication->reference_kind)
+			&& publication->target_kind == CTRC_TARGET_PAGE_PENDING_ITL_SLOT
+			&& publication->descriptor_hash == 0 && publication->member_ordinal == UINT16_MAX
+			&& publication->member_role == 0 && receipt->disposition == CTRC_RELEASE_NONE
+			&& target->relation_persistence == RELPERSISTENCE_PERMANENT && target->needs_wal == 1
+			&& ctrc_target_exact_itl_valid(key, target)
+			&& (publication->reference_kind != CTRC_REF_IMAGE_ITL_V1 || ctrc_image_target_domain_valid(target))
+			&& target->itl_slot_index == locator->itl_slot_index && target->itl_class == locator->itl_kind
+			&& memcmp(target->uba, &locator->uba, sizeof(target->uba)) == 0)
+			matched = true;
+	}
+done:
+	LWLockRelease(&CtrcShared->receipt_lock);
+	ctrc_participant_locks_release(lock_mask);
+	return matched;
+}
+
 static bool
 ctrc_itl_delegate_prepare(
 	const ClusterCtrcItlTargetIdentity *target, const ClusterItlSlotData *slot,

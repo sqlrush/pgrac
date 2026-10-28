@@ -1137,6 +1137,14 @@ extern ClusterCtrcTouchResult cluster_ctrc_origin_grant_fullxid_v2(
 extern bool cluster_ctrc_origin_fullxid_match_v2(const uint8 *bytes, Size length,
 	const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcParticipantIdentity *receiver,
 	uint32 grant, FullTransactionId *out);
+/* Read-only receiver provenance prerequisite for a foreign canonical
+ * companion. Caller supplies its original current admission identity and
+ * rechecks it after return. Require an already retained original144/path
+ * and APPLIED ordinary/IMAGE ITL reference for this exact DATA locator.
+ * This is neither a page selector nor a lifetime/freeze authority token. */
+extern bool cluster_ctrc_itl_original_full_xid_matches_shared(
+	const ClusterCtrcTxnKeyV1 *key, FullTransactionId original,
+	const ClusterTxLocator *locator, const ClusterCtrcParticipantIdentity *receiver);
 /* New receivers only; an old raw-only participant is never backfilled.
  * Local producers recheck the envelope's FullXid under origin_lock and retain
  * that lock through receiver publication; foreign producers use the original

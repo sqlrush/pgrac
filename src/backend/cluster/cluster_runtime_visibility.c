@@ -3073,6 +3073,59 @@ done:
 	return CLUSTER_TX_UNKNOWN;
 }
 
+/* A decoded origin observation is useful only while this receiver already
+ * retains that exact identity. All source/current checks stay outside the
+ * original CTRC locks; no foreign current image or new grant is acquired. */
+static bool
+cluster_runtime_visibility_foreign_companion_retained(
+	const ClusterTxResolution *resolution, const ClusterSemanticAdmissionToken *admission)
+{
+	const ClusterCtrcTxnKeyV1 *key = &resolution->origin_companion.key;
+	ClusterCtrcParticipantIdentity receiver = {0};
+	ClusterUndoBlock0ResolvedRoot root = {0}, final_root = {0};
+	uint64 peer_boot = 0, peer_generation = 0, final_boot = 0, final_generation = 0;
+
+	if (!ClusterR4TxCompanionIsValid(resolution) || admission->record_generation == 0
+		|| admission->record_generation > UINT32_MAX || cluster_node_id < 0
+		|| cluster_node_id >= CLUSTER_CTRC_MAX_PARTICIPANTS
+		|| key->origin_node_id == (uint16)cluster_node_id
+		|| key->admission_record_generation != admission->record_generation
+		|| key->formation_epoch != admission->formation_epoch
+		|| key->system_identifier != GetSystemIdentifier()
+		|| key->cluster_epoch != cluster_epoch_get_current())
+		return false;
+	receiver.node_id = (uint16)cluster_node_id;
+	receiver.boot_incarnation = cluster_qvotec_get_self_incarnation();
+	receiver.capability_record_generation = (uint32)admission->record_generation;
+	receiver.formation_epoch = admission->formation_epoch;
+	receiver.admission_record_generation = admission->record_generation;
+	if (receiver.boot_incarnation == 0
+		|| cluster_membership_get_last_admitted_incarnation(receiver.node_id) != receiver.boot_incarnation
+		|| !cluster_reconfig_get_observed_slot(key->origin_node_id, &peer_boot, &peer_generation)
+		|| peer_generation == 0 || peer_boot != key->origin_boot_incarnation
+		|| cluster_reconfig_get_observed_epoch(key->origin_node_id) != key->formation_epoch
+		|| cluster_membership_get_last_admitted_incarnation(key->origin_node_id) != peer_boot
+		|| !cluster_runtime_visibility_resolve_root_admitted(CLUSTER_TX_RESOLVE_TERMINAL_CENSUS,
+			admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, key->owner_instance, key->segment_id, &root)
+		|| root.root_id != key->root_id || root.root_generation != key->root_generation
+		|| key->root_descriptor_incarnation != root.root_generation
+		|| !cluster_ctrc_itl_original_full_xid_matches_shared(key,
+			resolution->origin_companion.original_full_xid, &resolution->locator_echo, &receiver))
+		return false;
+	return cluster_runtime_visibility_resolve_root_admitted(CLUSTER_TX_RESOLVE_TERMINAL_CENSUS,
+			admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, key->owner_instance, key->segment_id, &final_root)
+		&& cluster_runtime_visibility_candidate_root_matches(&root, &final_root)
+		&& key->system_identifier == GetSystemIdentifier()
+		&& key->cluster_epoch == cluster_epoch_get_current()
+		&& cluster_node_id == receiver.node_id
+		&& cluster_qvotec_get_self_incarnation() == receiver.boot_incarnation
+		&& cluster_membership_get_last_admitted_incarnation(receiver.node_id) == receiver.boot_incarnation
+		&& cluster_reconfig_get_observed_slot(key->origin_node_id, &final_boot, &final_generation)
+		&& final_boot == peer_boot && final_generation == peer_generation
+		&& cluster_reconfig_get_observed_epoch(key->origin_node_id) == key->formation_epoch
+		&& cluster_membership_get_last_admitted_incarnation(key->origin_node_id) == peer_boot;
+}
+
 ClusterTxOutcome
 cluster_runtime_visibility_resolve_exact_origin_admitted(
 	const ClusterTxLocator *locator, ClusterTxResolveMode mode,
@@ -3131,6 +3184,10 @@ cluster_runtime_visibility_resolve_exact_origin_admitted(
 		out->local_original_full_xid = InvalidFullTransactionId;
 		memset(&out->local_creation_target, 0, sizeof(out->local_creation_target));
 		memset(&out->local_aborted_xmax_target, 0, sizeof(out->local_aborted_xmax_target));
+		if (out->origin_companion.present
+			&& (mode != CLUSTER_TX_RESOLVE_TERMINAL_CENSUS
+				|| !cluster_runtime_visibility_foreign_companion_retained(out, admission)))
+			memset(&out->origin_companion, 0, sizeof(out->origin_companion));
 		goto recheck;
 	}
 	logical.owner_instance = (uint8)((uint32)origin + 1);
