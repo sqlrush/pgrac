@@ -360,6 +360,9 @@ static bool tablespace_options_lookup_active, tablespace_options_expect_binding;
 static unsigned tablespace_options_lookups, tablespace_options_unbound;
 static unsigned tablespace_options_bad_lookup;
 
+static bool enum_scope_lookup_active;
+static unsigned enum_scope_route, enum_scope_lookups, enum_scope_lookup_kind, enum_scope_bad_lookup;
+static List *enum_scope_expected_names;
 static bool type_mutation_scope_lookup_active;
 static unsigned type_mutation_scope_route, type_mutation_scope_lookups;
 static unsigned type_mutation_scope_lookup_kind, type_mutation_scope_bad_lookup;
@@ -8406,6 +8409,13 @@ static ObjectWithArgs native_operator_args;
 Oid
 QualifiedNameGetCreationNamespace(List *names, char **objname)
 {
+	if (enum_scope_lookup_active) {
+		enum_scope_lookups++;
+		enum_scope_lookup_kind = 1;
+		if (enum_scope_route != 1 || names != enum_scope_expected_names || objname == NULL)
+			enum_scope_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before namespace resolution or temp-schema work. */
+	}
 	if (tsearch_lookup_active) {
 		record_tsearch_lookup(2);
 		if ((tsearch_entry_kind != 1 && tsearch_entry_kind != 3) || names != &tsearch_names
@@ -18193,6 +18203,13 @@ UT_TEST(test_native_relation_rename_scope_refusal_precedes_context_and_binding)
 TypeName *
 makeTypeNameFromNameList(List *names)
 {
+	if (enum_scope_lookup_active) {
+		enum_scope_lookups++;
+		enum_scope_lookup_kind = 2;
+		if (enum_scope_route != 2 || names != enum_scope_expected_names)
+			enum_scope_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before TypeName allocation and the type query. */
+	}
 	if (type_mutation_scope_lookup_active) {
 		type_mutation_scope_lookups++;
 		type_mutation_scope_lookup_kind = 1;
@@ -19101,10 +19118,189 @@ UT_TEST(test_native_type_mutation_scope_preserves_existing_supported_top_binding
 	type_mutation_scope_lookup_active = false;
 }
 
+/* Actual enum creation and alteration prefixes stop before namespace work
+ * or name allocation. No native enum success is substituted. */
+#include "test_cluster_fresh_enum_scope.inc"
+static String enum_scope_parts[2], enum_scope_labels[2];
+static ListCell enum_scope_cells[2], enum_scope_label_cells[2];
+static List enum_scope_names, enum_scope_values;
+static CreateEnumStmt native_enum_scope_create;
+static AlterEnumStmt native_enum_scope_alter;
+static RangeVar enum_scope_warm_relation;
+static AlterObjectSchemaStmt enum_scope_warm_statement;
+
+static void
+reset_native_enum_scope(unsigned form)
+{
+	unsigned count = form % 2 ? 2 : 1;
+	unsigned kind = form < 4 ? 0 : (form - 4) / 2;
+
+	reset_create_preflight();
+	error_detail[0] = '\0';
+	enum_scope_lookup_active = true;
+	enum_scope_route = form < 4 ? 1 : 2;
+	enum_scope_lookups = enum_scope_lookup_kind = enum_scope_bad_lookup = 0;
+	enum_scope_parts[0]
+		= (String){ .type = T_String, .sval = count == 1 ? "native_enum" : "native_enum_schema" };
+	enum_scope_parts[1] = (String){ .type = T_String, .sval = "qualified_enum" };
+	enum_scope_labels[0] = (String){ .type = T_String, .sval = "first_label" };
+	enum_scope_labels[1] = (String){ .type = T_String, .sval = "second_label" };
+	for (unsigned i = 0; i < 2; i++) {
+		enum_scope_cells[i] = (ListCell){ .ptr_value = &enum_scope_parts[i] };
+		enum_scope_label_cells[i] = (ListCell){ .ptr_value = &enum_scope_labels[i] };
+	}
+	enum_scope_names
+		= (List){ .type = T_List, .length = count, .max_length = 2, .elements = enum_scope_cells };
+	enum_scope_expected_names = &enum_scope_names;
+	enum_scope_values = (List){ .type = T_List,
+								.length = 2,
+								.max_length = 2,
+								.elements = enum_scope_label_cells };
+	native_enum_scope_create = (CreateEnumStmt){ .type = T_CreateEnumStmt,
+												 .typeName = &enum_scope_names,
+												 .vals = form < 2 ? NIL : &enum_scope_values };
+	native_enum_scope_alter
+		= (AlterEnumStmt){ .type = T_AlterEnumStmt,
+						   .typeName = &enum_scope_names,
+						   .oldVal = kind == 4 ? "first_label" : NULL,
+						   .newVal = "new_label",
+						   .newValNeighbor = kind == 2 || kind == 3 ? "second_label" : NULL,
+						   .newValIsAfter = kind == 0 || kind == 1 || kind == 3,
+						   .skipIfNewValExists = kind == 1 };
+	enum_scope_warm_relation = (RangeVar){ .type = T_RangeVar, .relname = "supported_warm_table" };
+	enum_scope_warm_statement = (AlterObjectSchemaStmt){ .type = T_AlterObjectSchemaStmt,
+														 .objectType = OBJECT_TABLE,
+														 .relation = &enum_scope_warm_relation,
+														 .newschema = "supported_warm_destination",
+														 .missing_ok = false };
+}
+
+static void
+native_enum_scope_entry(unsigned form)
+{
+	if (form < 4)
+		(void)DefineEnum(&native_enum_scope_create);
+	else
+		(void)AlterEnum(&native_enum_scope_alter);
+}
+
+static void
+assert_native_enum_scope_result(bool blocked, int caught)
+{
+	UT_ASSERT_EQ(caught, blocked ? 1 : 2);
+	UT_ASSERT_EQ(error_code, blocked ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+	if (blocked) {
+		UT_ASSERT_STR_EQ(error_message, "custom types is not supported in shared mode");
+		UT_ASSERT_STR_EQ(error_detail,
+						 "PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+	}
+	UT_ASSERT_EQ(enum_scope_lookups, blocked ? 0 : 1);
+	UT_ASSERT_EQ(enum_scope_lookup_kind, blocked ? 0 : enum_scope_route);
+	UT_ASSERT_EQ(enum_scope_bad_lookup, 0);
+}
+
+UT_TEST(test_native_enum_scope_matches_utility_before_catalog_or_name_processing)
+{
+	for (unsigned form = 0; form < 14; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool blocked = (mode & 5) != 0;
+			int caught;
+
+			reset_native_enum_scope(form);
+			set_native_operator_mode(mode);
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				create_sql_entry(form < 4 ? (Node *)&native_enum_scope_create
+										  : (Node *)&native_enum_scope_alter);
+			UT_ASSERT_EQ(caught, blocked ? 1 : 0);
+			UT_ASSERT_EQ(error_code, blocked ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+			if (blocked) {
+				UT_ASSERT_STR_EQ(error_message, "custom types is not supported in shared mode");
+				UT_ASSERT_STR_EQ(error_detail,
+								 "PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+			}
+			UT_ASSERT_EQ(enum_scope_lookups + utility_xids + utility_prepares + utility_binds, 0);
+			reset_error();
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_enum_scope_entry(form);
+			assert_native_enum_scope_result(blocked, caught);
+			UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			UT_ASSERT_EQ(utility_top_xid, InvalidTransactionId);
+		}
+	}
+	enum_scope_lookup_active = false;
+}
+
+UT_TEST(test_native_enum_scope_precedes_context_child_top_and_publication)
+{
+	for (unsigned form = 0; form < 14; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			for (unsigned fault = 0; fault < 7; fault++) {
+				int caught;
+
+				reset_native_enum_scope(form);
+				set_native_operator_mode(mode);
+				XactReadOnly = fault == 0;
+				utility_parallel = fault == 1;
+				utility_recovery = fault == 2;
+				utility_in_child = fault == 3;
+				if (fault == 4 || fault == 5) {
+					utility_current_xid = 401;
+					utility_top_xid = fault == 4 ? 400 : InvalidTransactionId;
+				}
+				utility_bind_ok = fault != 6;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_enum_scope_entry(form);
+				assert_native_enum_scope_result((mode & 5) != 0, caught);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+				UT_ASSERT_EQ(utility_top_xid, fault == 4 ? 400 : InvalidTransactionId);
+				UT_ASSERT_EQ(utility_current_xid,
+							 fault == 4 || fault == 5 ? 401 : InvalidTransactionId);
+			}
+		}
+	}
+	enum_scope_lookup_active = false;
+}
+
+UT_TEST(test_native_enum_scope_preserves_existing_supported_top_binding)
+{
+	for (unsigned form = 0; form < 14; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			for (unsigned fault = 0; fault < 5; fault++) {
+				int caught;
+
+				reset_native_enum_scope(form);
+				create_sql_entry((Node *)&enum_scope_warm_statement);
+				UT_ASSERT_EQ(utility_xids, 1);
+				UT_ASSERT_EQ(utility_prepares, 1);
+				UT_ASSERT_EQ(utility_binds, 1);
+				set_native_operator_mode(mode);
+				XactReadOnly = fault == 0;
+				utility_parallel = fault == 1;
+				utility_recovery = fault == 2;
+				utility_in_child = fault == 3;
+				utility_bind_ok = fault != 4;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_enum_scope_entry(form);
+				assert_native_enum_scope_result((mode & 5) != 0, caught);
+				UT_ASSERT_EQ(utility_xids, 1);
+				UT_ASSERT_EQ(utility_prepares, 1);
+				UT_ASSERT_EQ(utility_binds, 1);
+				UT_ASSERT_EQ(utility_top_xid, 400);
+				UT_ASSERT_EQ(utility_current_xid, 400);
+			}
+		}
+	}
+	enum_scope_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(306);
+	UT_PLAN(309);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -19413,6 +19609,9 @@ main(void)
 	UT_RUN(test_native_type_mutation_scope_matches_utility_before_catalog_or_name_processing);
 	UT_RUN(test_native_type_mutation_scope_precedes_context_child_top_and_publication);
 	UT_RUN(test_native_type_mutation_scope_preserves_existing_supported_top_binding);
+	UT_RUN(test_native_enum_scope_matches_utility_before_catalog_or_name_processing);
+	UT_RUN(test_native_enum_scope_precedes_context_child_top_and_publication);
+	UT_RUN(test_native_enum_scope_preserves_existing_supported_top_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

@@ -1162,6 +1162,10 @@ DefineEnum(CreateEnumStmt *stmt)
 	Oid			enumArrayOid;
 	ObjectAddress enumTypeAddr;
 
+#ifdef USE_PGRAC_CLUSTER
+	CheckClusterSharedTypeSupport();
+#endif
+
 	/* Convert list of names to a name and namespace */
 	enumNamespace = QualifiedNameGetCreationNamespace(stmt->typeName,
 													  &enumName);
@@ -1282,6 +1286,10 @@ AlterEnum(AlterEnumStmt *stmt)
 	TypeName   *typename;
 	HeapTuple	tup;
 	ObjectAddress address;
+
+#ifdef USE_PGRAC_CLUSTER
+	CheckClusterSharedTypeSupport();
+#endif
 
 	/* Make a TypeName so we can use standard type lookup machinery */
 	typename = makeTypeNameFromNameList(stmt->typeName);
