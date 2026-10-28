@@ -31,6 +31,7 @@
 #include "access/twophase.h"
 #include "access/xlog.h"
 #include "storage/procarray.h"
+#include "storage/ipc.h"
 #include "utils/wait_event.h"
 #include "storage/lwlock.h"
 #include "storage/proc.h"
@@ -87,6 +88,15 @@ static void test_pool_upgrade(void);
 
 UT_DEFINE_GLOBALS();
 #include "cluster/cluster_undo_cleaner.h"
+
+static pg_on_exit_callback reader_exit_callback;
+static Datum reader_exit_arg;
+void
+before_shmem_exit(pg_on_exit_callback callback, Datum arg)
+{
+	UT_ASSERT(reader_exit_callback == NULL || reader_exit_callback == callback);
+	reader_exit_callback = callback; reader_exit_arg = arg;
+}
 
 int NBuffers = 16;
 int MaxBackends = 8;
@@ -9293,6 +9303,104 @@ UT_TEST(test_receiver_companion_target_requires_its_own_page_and_itl)
 	}
 }
 
+UT_TEST(test_retained_reader_blocks_key_ack_after_receipt_cleanup)
+{
+	ClusterCtrcReceiptHandle handle;
+	ClusterCtrcParticipantIdentity destination;
+	ClusterCtrcItlTargetIdentity target;
+	ClusterItlSlotData slot;
+	ClusterTxLocator locator;
+	ClusterCtrcItlReadGuardV1 first = {0}, second = {0};
+	ClusterCtrcDurability durability = {0};
+	ClusterCtrcLocalReleaseAckV1 ack;
+	ClusterCtrcParticipantEntry snapshot;
+	UT_ASSERT(seed_delegation_itl_source(&handle, &destination, &target, &slot));
+	locator = receiver_companion_locator(&handle, &slot);
+	UT_ASSERT(cluster_ctrc_itl_original_full_xid_target_hold_shared(&handle.key,
+		handle.original_full_xid, &locator, &handle.participant->identity, &target, &first));
+	UT_ASSERT(cluster_ctrc_itl_original_full_xid_target_hold_shared(&handle.key,
+		handle.original_full_xid, &locator, &handle.participant->identity, &target, &second));
+	UT_ASSERT_EQ(handle.participant->retained_reader_count, 2);
+	durability.highest_local_lsn = durability.local_flush_lsn = 99;
+	UT_ASSERT_EQ(cluster_ctrc_receipt_discharge_itl_shared(&handle, &target,
+		CTRC_ITL_TARGET_ABSENT, &durability), CLUSTER_CTRC_DISCHARGE_CLEANED);
+	UT_ASSERT_EQ(handle.participant->applied_count, 0);
+	UT_ASSERT_EQ(cluster_ctrc_participant_close(handle.participant, &handle.participant->identity,
+		handle.participant->grant_generation, 91), CLUSTER_CTRC_CLOSE_PENDING_DRAIN);
+	snapshot = *handle.participant; snapshot.state = CTRC_PARTICIPANT_ACK_READY;
+	UT_ASSERT_EQ(cluster_ctrc_participant_ack_from_snapshot(&snapshot, handle.receipt, 1,
+		&durability, &ack), CLUSTER_CTRC_ACK_DENIED);
+	UT_ASSERT(cluster_ctrc_itl_read_guard_release_shared(&first));
+	UT_ASSERT_EQ(handle.participant->retained_reader_count, 1);
+	UT_ASSERT_EQ(cluster_ctrc_participant_close(handle.participant, &handle.participant->identity,
+		handle.participant->grant_generation, 91), CLUSTER_CTRC_CLOSE_PENDING_DRAIN);
+	UT_ASSERT(cluster_ctrc_itl_read_guard_release_shared(&second));
+	UT_ASSERT_EQ(handle.participant->retained_reader_count, 0);
+	UT_ASSERT_EQ(cluster_ctrc_participant_close(handle.participant, &handle.participant->identity,
+		handle.participant->grant_generation, 91), CLUSTER_CTRC_CLOSE_ACK_READY);
+	snapshot = *handle.participant;
+	UT_ASSERT_EQ(cluster_ctrc_participant_ack_from_snapshot(&snapshot, handle.receipt, 1,
+		&durability, &ack), CLUSTER_CTRC_ACK_RELEASED);
+	snapshot.state = CTRC_PARTICIPANT_ACK_FROZEN;
+	UT_ASSERT(ctrc_frozen_ack_summary_exact(&snapshot, &ack));
+	snapshot.retained_reader_count = 1;
+	UT_ASSERT(!ctrc_frozen_ack_summary_exact(&snapshot, &ack));
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_retained_reader_rejects_stale_tokens_and_exit_releases_only_its_own)
+{
+	ClusterCtrcReceiptHandle handle;
+	ClusterCtrcParticipantIdentity destination;
+	ClusterCtrcItlTargetIdentity target;
+	ClusterItlSlotData slot;
+	ClusterTxLocator locator;
+	ClusterCtrcItlReadGuardV1 guard = {0}, stale, wrong;
+	UT_ASSERT(seed_delegation_itl_source(&handle, &destination, &target, &slot));
+	locator = receiver_companion_locator(&handle, &slot);
+	UT_ASSERT(cluster_ctrc_itl_original_full_xid_target_hold_shared(&handle.key,
+		handle.original_full_xid, &locator, &handle.participant->identity, &target, &guard));
+	stale = guard; wrong = guard; wrong.pid++;
+	UT_ASSERT(!cluster_ctrc_itl_read_guard_release_shared(&wrong));
+	UT_ASSERT_EQ(handle.participant->retained_reader_count, 1);
+	UT_ASSERT(cluster_ctrc_itl_read_guard_release_shared(&guard));
+	UT_ASSERT(!cluster_ctrc_itl_read_guard_release_shared(&stale));
+	UT_ASSERT(cluster_ctrc_itl_original_full_xid_target_hold_shared(&handle.key,
+		handle.original_full_xid, &locator, &handle.participant->identity, &target, &guard));
+	UT_ASSERT(!cluster_ctrc_itl_read_guard_release_shared(&stale));
+	UT_ASSERT_EQ(handle.participant->retained_reader_count, 1);
+	UT_ASSERT(reader_exit_callback != NULL);
+	if (reader_exit_callback != NULL) reader_exit_callback(0, reader_exit_arg);
+	UT_ASSERT_EQ(handle.participant->retained_reader_count, 0);
+	UT_ASSERT(!cluster_ctrc_itl_read_guard_release_shared(&guard));
+	{
+		ClusterCtrcItlReadGuardV1 guards[CLUSTER_CTRC_ITL_READ_GUARDS] = {{0}};
+		ClusterCtrcItlReadGuardV1 excess = {0}, zero = {0};
+		FullTransactionId saved = handle.participant->original_full_xid;
+
+		for (unsigned i = 0; i < CLUSTER_CTRC_ITL_READ_GUARDS; i++)
+			UT_ASSERT(cluster_ctrc_itl_original_full_xid_target_hold_shared(&handle.key,
+				handle.original_full_xid, &locator, &handle.participant->identity, &target, &guards[i]));
+		UT_ASSERT_EQ(handle.participant->retained_reader_count, CLUSTER_CTRC_ITL_READ_GUARDS);
+		UT_ASSERT(!cluster_ctrc_itl_original_full_xid_target_hold_shared(&handle.key,
+			handle.original_full_xid, &locator, &handle.participant->identity, &target, &excess));
+		UT_ASSERT_EQ(memcmp(&excess, &zero, sizeof(zero)), 0);
+		handle.participant->original_full_xid = FullTransactionIdFromU64(U64FromFullTransactionId(saved) + 1);
+		UT_ASSERT(!cluster_ctrc_itl_read_guard_release_shared(&guards[0]));
+		UT_ASSERT_EQ(handle.participant->retained_reader_count, CLUSTER_CTRC_ITL_READ_GUARDS);
+		handle.participant->original_full_xid = saved;
+		for (unsigned i = 0; i < CLUSTER_CTRC_ITL_READ_GUARDS; i++)
+			UT_ASSERT(cluster_ctrc_itl_read_guard_release_shared(&guards[i]));
+		handle.participant->retained_reader_count = UINT64_MAX;
+		UT_ASSERT(!cluster_ctrc_itl_original_full_xid_target_hold_shared(&handle.key,
+			handle.original_full_xid, &locator, &handle.participant->identity, &target, &excess));
+		UT_ASSERT_EQ(handle.participant->retained_reader_count, UINT64_MAX);
+		UT_ASSERT_EQ(memcmp(&excess, &zero, sizeof(zero)), 0);
+		handle.participant->retained_reader_count = 0;
+	}
+	UT_ASSERT_EQ(held_count, 0);
+}
+
 int
 main(void)
 {
@@ -9300,7 +9408,7 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(202);
+	UT_PLAN(204);
 	UT_RUN(test_prepare_path_namespace_precedes_input_and_resets_output);
 	UT_RUN(test_prepare_path_input_precedes_journal_exhaustion);
 	UT_RUN(test_prepare_path_chain_precedes_locator_and_keeps_blocked_state);
@@ -9317,6 +9425,8 @@ main(void)
 
 	printf("# CTRC header_bytes=%zu total_bytes=%zu\n", sizeof(ClusterCtrcSharedHeader),
 		   capacity.total_bytes);
+	printf("# participant_bytes=%zu read_guard_bytes=%zu reader_registry_bytes=%zu\n",
+		sizeof(ClusterCtrcParticipantEntry), sizeof(ClusterCtrcItlReadGuardV1), sizeof(CtrcItlReaders));
 	UT_RUN(test_origin_reserve_requires_published_local_top_protection);
 	UT_RUN(test_origin_reserve_requires_same_published_original_fullxid);
 	UT_RUN(test_origin_reserve_protected_pending_can_cancel);
@@ -9506,6 +9616,8 @@ main(void)
 	UT_RUN(test_qualified_foreign_refusal_and_exact_duplicate_keep_registration_cut);
 	UT_RUN(test_qualified_foreign_registration_saturates_without_losing_custody);
 	UT_RUN(test_receiver_companion_target_requires_its_own_page_and_itl);
+	UT_RUN(test_retained_reader_blocks_key_ack_after_receipt_cleanup);
+	UT_RUN(test_retained_reader_rejects_stale_tokens_and_exit_releases_only_its_own);
 	free(CtrcShared);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

@@ -738,7 +738,9 @@
 /* Later protected original grants can replace completed physical receiver
  * slots only within the same boot and scope. Fresh homogeneous clusters only. */
 /* Explicit canonical-companion verdict V4; fresh homogeneous clusters only. */
-#define CATALOG_VERSION_NO 202610291
+/* Temporary exact receiver readers retain the original participant until
+ * its source-check scope ends. Fresh homogeneous clusters only. */
+#define CATALOG_VERSION_NO 202610292
 
 /* spec-5.13 (2026-06-27): clean-leave catalog surface — cluster_get_clean_leave_state
  * SRF (oid 8960) + pg_cluster_clean_leave_state view + pg_cluster_clean_leave_request

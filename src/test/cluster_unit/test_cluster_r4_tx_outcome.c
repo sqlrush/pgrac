@@ -567,6 +567,8 @@ cluster_membership_get_last_admitted_incarnation(int32 node_id)
 
 static ClusterCtrcItlTargetIdentity test_receiver_target;
 static unsigned test_receiver_target_checks;
+static unsigned test_reader_holds, test_reader_releases, test_reader_live;
+static bool test_reader_throw;
 
 /* The shared owner is exercised in test_cluster_ctrc_cleaner. This boundary
  * is an explicitly installed exact receiver record, never codec success. */
@@ -609,6 +611,29 @@ cluster_ctrc_itl_original_full_xid_target_matches_shared(
 	test_receiver_target_checks++;
 	return target != NULL && memcmp(target, &test_receiver_target, sizeof(*target)) == 0
 		&& cluster_ctrc_itl_original_full_xid_matches_shared(key, original, locator, receiver);
+}
+
+bool
+cluster_ctrc_itl_original_full_xid_target_hold_shared(
+	const ClusterCtrcTxnKeyV1 *key, FullTransactionId original,
+	const ClusterTxLocator *locator, const ClusterCtrcParticipantIdentity *receiver,
+	const ClusterCtrcItlTargetIdentity *target, ClusterCtrcItlReadGuardV1 *guard)
+{
+	if (!cluster_ctrc_itl_original_full_xid_target_matches_shared(key, original, locator, receiver, target)) return false;
+	test_reader_holds++; test_reader_live++;
+	guard->serial = test_reader_holds; guard->pid = 2901; guard->slot = 0;
+	if (test_reader_throw) pg_re_throw();
+	return true;
+}
+
+bool
+cluster_ctrc_itl_read_guard_release_shared(ClusterCtrcItlReadGuardV1 *guard)
+{
+	if (guard->serial != 0) {
+		UT_ASSERT(test_reader_live > 0); test_reader_live--; test_reader_releases++;
+		memset(guard, 0, sizeof(*guard));
+	}
+	return true;
 }
 
 ClusterSemanticAdmissionResult
@@ -7747,10 +7772,56 @@ UT_TEST(test_foreign_target_current_preserves_source_and_admission_checks)
 	}
 }
 
+UT_TEST(test_foreign_target_validation_releases_its_held_source_on_refusal)
+{
+	int saved_node = cluster_node_id;
+	for (unsigned fault = 0; fault <= 3; fault++) {
+		ClusterTxResolution origin, received;
+		ClusterSemanticAdmissionToken admission = {
+			.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+			.record_generation = 5, .formation_epoch = 42,
+			.side = CLUSTER_SEMANTIC_TARGET_SIDE, .entered = true};
+		setup_original_full_xid(false);
+		UT_ASSERT_EQ(resolve_original_full_xid(CLUSTER_TX_RESOLVE_TERMINAL_CENSUS,
+			&origin), CLUSTER_TX_COMMITTED);
+		test_receiver_registered = true; test_receiver_retained = origin;
+		test_receiver_peer_boot = origin.origin_companion.key.origin_boot_incarnation;
+		test_receiver_peer_generation = 3; test_receiver_peer_epoch = origin.origin_companion.key.formation_epoch;
+		test_receiver_self_admitted = test_boot_incarnation;
+		received = origin; memset(&received.local_canonical, 0, sizeof(received.local_canonical));
+		received.local_canonical_generation = 0; received.local_canonical_valid = false;
+		received.local_original_full_xid = InvalidFullTransactionId;
+		memset(&received.local_creation_target, 0, sizeof(received.local_creation_target));
+		memset(&test_receiver_target, 0, sizeof(test_receiver_target));
+		test_reader_holds = test_reader_releases = test_reader_live = 0;
+		if (fault == 1) test_receiver_drift = 8;
+		if (fault == 2) test_receiver_drift = 7;
+		cluster_node_id = 1;
+		{
+			volatile bool caught = false;
+			volatile bool current = false;
+			test_reader_throw = fault == 3;
+			PG_TRY();
+			{
+				current = cluster_runtime_visibility_foreign_companion_target_current_admitted(
+					&received, &test_receiver_target, &admission);
+			}
+			PG_CATCH(); { caught = true; }
+			PG_END_TRY();
+			test_reader_throw = false;
+			UT_ASSERT_EQ(current, fault == 0);
+			UT_ASSERT_EQ(caught, fault == 3);
+		}
+		cluster_node_id = saved_node;
+		UT_ASSERT_EQ(test_reader_holds, 1); UT_ASSERT_EQ(test_reader_releases, 1);
+		UT_ASSERT_EQ(test_reader_live, 0); UT_ASSERT_EQ(test_remote_origin_calls, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(212);
+	UT_PLAN(213);
 	UT_RUN(test_original_full_xid_reaches_same_and_cross_segment_census_result);
 	UT_RUN(test_original_full_xid_missing_or_key_alias_keeps_verdict_without_identity);
 	UT_RUN(test_original_full_xid_not_queried_for_other_roles_or_abort);
@@ -7963,6 +8034,7 @@ main(void)
 	UT_RUN(test_foreign_retained_companion_cannot_escape_source_or_root_drift);
 	UT_RUN(test_foreign_current_observation_uses_original_entered_receiver_retention);
 	UT_RUN(test_foreign_target_current_preserves_source_and_admission_checks);
+	UT_RUN(test_foreign_target_validation_releases_its_held_source_on_refusal);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

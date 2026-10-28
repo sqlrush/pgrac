@@ -456,6 +456,9 @@ typedef struct ClusterCtrcParticipantEntry {
 	uint64 cancelled_count;
 	uint64 cleaned_count;
 	uint64 ack_frozen_count;
+	/* Original local reader responsibility; no receipt or authority grant.
+	 * Serialized by the original participant lock, never persisted/wired. */
+	uint64 retained_reader_count;
 	/* Immediate parent is retained independently of local receipts. The
 	 * immutable original names the path root, never a re-signed local grant. */
 	ClusterCtrcDelegationCustodyV1 delegation_parent;
@@ -567,6 +570,15 @@ typedef struct ClusterCtrcItlTargetIdentity {
 	uint8 reserved8[2];
 	uint8 uba[16];
 } ClusterCtrcItlTargetIdentity;
+
+/* Process-local issuer/PID/serial token. A copied/stale handle cannot
+ * release a different scope. Caller must release in PG_FINALLY. */
+typedef struct ClusterCtrcItlReadGuardV1 {
+	uint64 serial;
+	uint32 slot;
+	int32 pid;
+} ClusterCtrcItlReadGuardV1;
+#define CLUSTER_CTRC_ITL_READ_GUARDS 8
 
 typedef struct ClusterCtrcLocalReleaseAckV1 {
 	ClusterCtrcTxnKeyV1 transaction_key;
@@ -1151,6 +1163,15 @@ extern bool cluster_ctrc_itl_original_full_xid_target_matches_shared(
 	const ClusterCtrcTxnKeyV1 *key, FullTransactionId original,
 	const ClusterTxLocator *locator, const ClusterCtrcParticipantIdentity *receiver,
 	const ClusterCtrcItlTargetIdentity *target);
+/* Hold this existing original participant across source validation. Only
+ * the exact OPEN/APPLIED target may acquire. Receipt cleanup may progress;
+ * original key ACK/retirement waits for this local responsibility to leave.
+ * No CTRC lock crosses return; no page/writer/remote authority is acquired. */
+extern bool cluster_ctrc_itl_original_full_xid_target_hold_shared(
+	const ClusterCtrcTxnKeyV1 *key, FullTransactionId original,
+	const ClusterTxLocator *locator, const ClusterCtrcParticipantIdentity *receiver,
+	const ClusterCtrcItlTargetIdentity *target, ClusterCtrcItlReadGuardV1 *guard);
+extern bool cluster_ctrc_itl_read_guard_release_shared(ClusterCtrcItlReadGuardV1 *guard);
 /* New receivers only; an old raw-only participant is never backfilled.
  * Local producers recheck the envelope's FullXid under origin_lock and retain
  * that lock through receiver publication; foreign producers use the original

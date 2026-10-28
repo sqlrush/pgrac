@@ -77,6 +77,7 @@
 #include "storage/bufpage.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
+#include "storage/ipc.h"
 #include "storage/smgr.h"
 #include "storage/shmem.h"
 #include "portability/instr_time.h"
@@ -86,7 +87,7 @@
 #endif
 
 #define CLUSTER_CTRC_SHMEM_MAGIC UINT32_C(0x43545243)
-#define CLUSTER_CTRC_SHMEM_VERSION UINT32_C(27)
+#define CLUSTER_CTRC_SHMEM_VERSION UINT32_C(28)
 #ifndef CLUSTER_CTRC_TEST_TABLE_VISIT
 #define CLUSTER_CTRC_TEST_TABLE_VISIT(kind) ((void)0)
 #endif
@@ -604,6 +605,7 @@ ctrc_delegated_local_ack_eligible(const ClusterCtrcParticipantEntry *participant
 		&& participant->last_key_sequence == participant->receipt_count
 		&& participant->next_key_sequence == participant->receipt_count + 1
 		&& participant->prepared_count == 0 && participant->applied_count == 0
+		&& participant->retained_reader_count == 0
 		&& participant->cancelled_count <= participant->receipt_count
 		&& participant->cleaned_count == participant->receipt_count - participant->cancelled_count
 		&& participant->ack_frozen_count == (frozen ? participant->receipt_count : 0)))
@@ -7290,13 +7292,42 @@ cluster_ctrc_participant_delegate_prepare_v1(const ClusterCtrcTxnKeyV1 *key,
 	return prepared;
 }
 
+/* Backend-local ownership of temporary readers. The original participant
+ * lock protects the shared count; no CTRC lock crosses source/page/IO work.
+ * A stale handle can never release a later scope or another backend's count. */
+typedef struct CtrcItlRetainedReader {
+	ClusterCtrcTxnKeyV1 key;
+	ClusterCtrcParticipantIdentity identity;
+	FullTransactionId original;
+	uint64 participant_index;
+	uint64 grant_generation;
+	ClusterCtrcItlReadGuardV1 guard;
+} CtrcItlRetainedReader;
+
+static CtrcItlRetainedReader CtrcItlReaders[CLUSTER_CTRC_ITL_READ_GUARDS];
+static uint64 CtrcItlReaderSerial;
+static bool CtrcItlReaderExitRegistered;
+
+static void
+ctrc_itl_reader_exit(int code, Datum arg)
+{
+	(void)code;
+	(void)arg;
+	for (unsigned i = 0; i < CLUSTER_CTRC_ITL_READ_GUARDS; i++) {
+		ClusterCtrcItlReadGuardV1 guard = CtrcItlReaders[i].guard;
+
+		if (guard.serial != 0)
+			(void)cluster_ctrc_itl_read_guard_release_shared(&guard);
+	}
+}
+
 static bool
 ctrc_itl_original_full_xid_matches_shared(
 	const ClusterCtrcTxnKeyV1 *key, FullTransactionId original,
 	const ClusterTxLocator *locator, const ClusterCtrcParticipantIdentity *receiver,
-	const ClusterCtrcItlTargetIdentity *expected_target)
+	const ClusterCtrcItlTargetIdentity *expected_target, CtrcItlRetainedReader *reader)
 {
-	const ClusterCtrcParticipantEntry *participant;
+	ClusterCtrcParticipantEntry *participant;
 	const ClusterCtrcParticipantIdentity *original_receiver;
 	FullTransactionId retained;
 	uint32 segment, block;
@@ -7376,6 +7407,21 @@ ctrc_itl_original_full_xid_matches_shared(
 				|| cluster_ctrc_itl_target_identity_matches(target, expected_target)))
 			matched = true;
 	}
+	if (matched && reader != NULL) {
+		if (participant->retained_reader_count == UINT64_MAX)
+			matched = false;
+		else {
+			reader->key = participant->key;
+			reader->identity = participant->identity;
+			reader->original = participant->original_full_xid;
+			reader->participant_index = index;
+			reader->grant_generation = participant->grant_generation;
+			/* Publish local ownership with the count, only after every check.
+			 * An ERROR while waiting for locks leaves no active local slot. */
+			CtrcItlReaders[reader->guard.slot] = *reader;
+			participant->retained_reader_count++;
+		}
+	}
 done:
 	LWLockRelease(&CtrcShared->receipt_lock);
 	ctrc_participant_locks_release(lock_mask);
@@ -7387,7 +7433,7 @@ cluster_ctrc_itl_original_full_xid_matches_shared(
 	const ClusterCtrcTxnKeyV1 *key, FullTransactionId original,
 	const ClusterTxLocator *locator, const ClusterCtrcParticipantIdentity *receiver)
 {
-	return ctrc_itl_original_full_xid_matches_shared(key, original, locator, receiver, NULL);
+	return ctrc_itl_original_full_xid_matches_shared(key, original, locator, receiver, NULL, NULL);
 }
 
 bool
@@ -7397,7 +7443,79 @@ cluster_ctrc_itl_original_full_xid_target_matches_shared(
 	const ClusterCtrcItlTargetIdentity *target)
 {
 	return target != NULL
-		&& ctrc_itl_original_full_xid_matches_shared(key, original, locator, receiver, target);
+		&& ctrc_itl_original_full_xid_matches_shared(key, original, locator, receiver, target, NULL);
+}
+
+bool
+cluster_ctrc_itl_original_full_xid_target_hold_shared(
+	const ClusterCtrcTxnKeyV1 *key, FullTransactionId original,
+	const ClusterTxLocator *locator, const ClusterCtrcParticipantIdentity *receiver,
+	const ClusterCtrcItlTargetIdentity *target, ClusterCtrcItlReadGuardV1 *guard)
+{
+	CtrcItlRetainedReader reader = {0};
+	unsigned slot;
+
+	if (target == NULL || guard == NULL || !ctrc_bytes_zero(guard, sizeof(*guard))
+		|| MyProcPid <= 0 || CtrcItlReaderSerial == UINT64_MAX)
+		return false;
+	for (slot = 0; slot < CLUSTER_CTRC_ITL_READ_GUARDS; slot++)
+		if (CtrcItlReaders[slot].guard.serial == 0)
+			break;
+	if (slot == CLUSTER_CTRC_ITL_READ_GUARDS)
+		return false;
+	/* Registration can ERROR on callback exhaustion; do it before acquiring
+	 * any shared responsibility, outside the original table locks. */
+	if (!CtrcItlReaderExitRegistered) {
+		before_shmem_exit(ctrc_itl_reader_exit, (Datum)0);
+		CtrcItlReaderExitRegistered = true;
+	}
+	reader.guard.serial = ++CtrcItlReaderSerial;
+	reader.guard.slot = slot;
+	reader.guard.pid = MyProcPid;
+	if (!ctrc_itl_original_full_xid_matches_shared(key, original, locator, receiver, target, &reader))
+		return false;
+	*guard = reader.guard;
+	return true;
+}
+
+bool
+cluster_ctrc_itl_read_guard_release_shared(ClusterCtrcItlReadGuardV1 *guard)
+{
+	CtrcItlRetainedReader *reader;
+	ClusterCtrcParticipantEntry *participant;
+	uint32 lock_mask;
+	bool released = false;
+
+	if (guard == NULL)
+		return false;
+	if (ctrc_bytes_zero(guard, sizeof(*guard)))
+		return true;
+	if (guard->serial == 0 || guard->slot >= CLUSTER_CTRC_ITL_READ_GUARDS
+		|| guard->pid != MyProcPid || !cluster_ctrc_shmem_ready())
+		return false;
+	reader = &CtrcItlReaders[guard->slot];
+	if (memcmp(&reader->guard, guard, sizeof(*guard)) != 0
+		|| reader->participant_index >= CtrcShared->participant_key_entries)
+		return false;
+	lock_mask = ctrc_participant_lock_mask(reader->participant_index);
+	ctrc_participant_locks_acquire(lock_mask);
+	participant = &ctrc_participant_entries()[reader->participant_index];
+	/* CLOSE may already be DRAINING or BLOCKED. Release only this exact
+	 * original row; an unknown/replaced identity keeps protection. */
+	if (memcmp(&participant->key, &reader->key, sizeof(reader->key)) == 0
+		&& memcmp(&participant->identity, &reader->identity, sizeof(reader->identity)) == 0
+		&& FullTransactionIdEquals(participant->original_full_xid, reader->original)
+		&& participant->grant_generation == reader->grant_generation
+		&& participant->retained_reader_count != 0) {
+		participant->retained_reader_count--;
+		MemSet(reader, 0, sizeof(*reader));
+		MemSet(guard, 0, sizeof(*guard));
+		released = true;
+	}
+	ctrc_participant_locks_release(lock_mask);
+	if (released)
+		cluster_undo_cleaner_wakeup();
+	return released;
 }
 
 static bool
@@ -8735,6 +8853,7 @@ ctrc_frozen_ack_summary_exact(const ClusterCtrcParticipantEntry *participant,
 {
 	return participant != NULL && summary != NULL
 		   && participant->state == CTRC_PARTICIPANT_ACK_FROZEN
+		   && participant->retained_reader_count == 0
 		   && ctrc_participant_delegations_empty(participant) && ctrc_ack_bytes_exact(summary)
 		   && memcmp(&summary->transaction_key, &participant->key, sizeof(participant->key)) == 0
 		   && summary->grant_generation == participant->grant_generation
@@ -9767,6 +9886,7 @@ cluster_ctrc_participant_close(ClusterCtrcParticipantEntry *participant,
 		return CLUSTER_CTRC_CLOSE_BLOCKED_RETAIN;
 	}
 	if (participant->prepared_count != 0 || participant->applied_count != 0
+		|| participant->retained_reader_count != 0
 		|| !ctrc_participant_delegations_empty(participant))
 		return CLUSTER_CTRC_CLOSE_PENDING_DRAIN;
 
@@ -10311,6 +10431,7 @@ cluster_ctrc_participant_ack_from_snapshot(const ClusterCtrcParticipantEntry *pa
 		|| !ctrc_bytes_zero(participant->reserved8, sizeof(participant->reserved8))
 		|| participant->receipt_count != receipt_count || participant->prepared_count != 0
 		|| participant->applied_count != 0 || participant->ack_frozen_count != 0
+		|| participant->retained_reader_count != 0
 		|| (receipt_count == 0 ? receipts != NULL : receipts == NULL) || receipt_count > UINT64_MAX)
 		return CLUSTER_CTRC_ACK_DENIED;
 
