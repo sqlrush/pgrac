@@ -849,6 +849,23 @@ cluster_recovery_cold_inputs_handoff(EndOfWalRecoveryInfo *info)
 	info->cluster_tx_start = NULL;
 }
 
+/* A saved PAGE result cannot outlive its original unfinished F4 operation.
+ * This is only a readonly window check, never PAGE/FD or discharge authority. */
+static bool
+cluster_recovery_cold_pending_page_current(const struct ClusterRecoveryStartV1 *start)
+{
+	const ClusterColdCtrcPageProgressV1 *progress = start->ctrc_page_progress;
+	const RfPageCtrcStepResultV1 *result;
+
+	if (progress == NULL || !progress->pending)
+		return true;
+	result = &progress->result;
+	return result->phase == RF_PAGE_CTRC_STEP_FPI_DURABLE
+		&& result->inserted.wal_flushed
+		&& cluster_recovery_stamp_fpi_durable_current_v1(&result->inserted.window,
+			result->inserted.record_start, result->inserted.record_end);
+}
+
 bool
 ClusterColdRecoveryTxCurrent(const struct ClusterRecoveryStartV1 *start)
 {
@@ -871,7 +888,8 @@ ClusterColdRecoveryTxCurrent(const struct ClusterRecoveryStartV1 *start)
 		return false;
 	return start->install_generation == install_generation
 		&& cluster_recovery_cold_writer_same(&start->writer, &writer)
-		&& memcmp(start->operation_uuid, operation_uuid, 16) == 0;
+		&& memcmp(start->operation_uuid, operation_uuid, 16) == 0
+		&& cluster_recovery_cold_pending_page_current(start);
 }
 
 bool

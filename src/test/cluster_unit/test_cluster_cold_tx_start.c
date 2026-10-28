@@ -2324,9 +2324,19 @@ UT_TEST(test_relmap_failure_revokes_original_episode_without_free_or_release)
 #include "test_cluster_cold_ctrc_page_sources.inc"
 #include "test_cluster_cold_ctrc_page_prefix.inc"
 #include "test_cluster_cold_ctrc_unchanged_sync.inc"
+#include "test_cluster_cold_ctrc_pending_window.inc"
 
 int main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_STARTUP_PENDING_WINDOW") != NULL) {
+		UT_PLAN(5);
+		UT_RUN(test_startup_pending_fpi_uses_original_shared_window_without_advancing);
+		UT_RUN(test_startup_pending_fpi_refuses_original_failed_window);
+		UT_RUN(test_startup_pending_fpi_cannot_rebind_a_later_original_window);
+		UT_RUN(test_startup_pending_fpi_requires_complete_saved_operation);
+		UT_RUN(test_actual_startup_pending_fpi_failure_interrupts_service_wait);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_STARTUP_UNCHANGED_SYNC") != NULL) {
 		UT_PLAN(2);
 		UT_RUN(test_startup_unchanged_sync_advances_without_service_completion);
@@ -2413,7 +2423,12 @@ int main(void)
 		UT_RUN(test_ctrc_pages_native_error_retires_cursor_before_original_scope);
 		reset(); UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(174);
+	UT_PLAN(179);
+	UT_RUN(test_startup_pending_fpi_uses_original_shared_window_without_advancing);
+	UT_RUN(test_startup_pending_fpi_refuses_original_failed_window);
+	UT_RUN(test_startup_pending_fpi_cannot_rebind_a_later_original_window);
+	UT_RUN(test_startup_pending_fpi_requires_complete_saved_operation);
+	UT_RUN(test_actual_startup_pending_fpi_failure_interrupts_service_wait);
 	UT_RUN(test_startup_unchanged_sync_advances_without_service_completion);
 	UT_RUN(test_startup_legacy_unchanged_cannot_advance_or_complete);
 	UT_RUN(test_startup_page_prefix_durable_retains_window_and_service_debt);

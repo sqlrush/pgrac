@@ -10436,6 +10436,7 @@ test_cluster_cold_tx_start: test_cluster_cold_ctrc_page_sources.inc
 
 # Original Startup fixed-graph PAGE prefix ownership.
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_page_prefix.inc
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_pending_window.inc
 test_cluster_ctrc_native_fpi: test_cluster_ctrc_native_graph_step.inc
 
 # Original PAGE executor pins raw MAIN/SPACE descriptors before PRE_INSERT.
