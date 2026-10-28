@@ -7615,7 +7615,7 @@ UT_TEST(test_retained_slot_identity_does_not_escape_original_final_fences)
 int
 main(void)
 {
-	UT_PLAN(358);
+	UT_PLAN(361);
 	UT_RUN(test_operation_worker_real_builder_yields_before_visibility);
 	UT_RUN(test_operation_worker_real_origin_completes_private_inverse);
 	UT_RUN(test_operation_worker_pending_current_is_bounded_and_counts_once);
@@ -7975,6 +7975,9 @@ main(void)
 	UT_RUN(test_update_creation_discarded_lock_does_not_hide_creator);
 	UT_RUN(test_update_creation_late_lock_and_creator_run_whole_inverse);
 	UT_RUN(test_update_creation_locked_old_page_does_not_bind_new_role);
+	UT_RUN(test_update_creation_active_lock_and_creator_remain_invisible);
+	UT_RUN(test_update_creation_active_sample_survives_visible_commit);
+	UT_RUN(test_update_creation_active_canonical_drift_preserves_last_inverse);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

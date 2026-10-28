@@ -3587,3 +3587,138 @@ UT_TEST(test_update_creation_locked_old_page_does_not_bind_new_role)
 				update_lock_assert_full(&f, expected.data, allocations);
 			}
 }
+
+/* ACTIVE is sampled through the original exact canonical TT/CLOG path.
+ * These SCN/native boundaries are a model, not a native commit race. */
+static void
+update_creation_active_lock(OperationWorkerFixture *f, unsigned role, bool reuse, bool same,
+							bool discarded, char before_lock[BLCKSZ], char expected[BLCKSZ])
+{
+	UndoSlotDirEntry directory;
+	UndoItlHistoryTrailer history;
+	UndoItlPayload lock;
+	ClusterItlSlotData *slot;
+	char *bytes;
+
+	update_creation_latest_lock(f, role, reuse, same, discarded, before_lock);
+	test_mixed_top_slot.status = TT_SLOT_ACTIVE;
+	test_mixed_top_slot.commit_scn = InvalidScn;
+	test_mixed_top_native_status = TRANSACTION_STATUS_IN_PROGRESS;
+	test_twophase_xid = TEST_ORIGIN_XID + 2;
+	slot = &ClusterPageGetItlSlots((Page)f->cr.source.data)[reuse ? 2 : 4];
+	slot->flags = ITL_FLAG_LOCK_ONLY_ACTIVE;
+	slot->commit_scn = InvalidScn;
+	slot = &ClusterPageGetItlSlots((Page)before_lock)[reuse ? 2 : 4];
+	slot->flags = ITL_FLAG_ACTIVE;
+	slot->commit_scn = InvalidScn;
+	memcpy(&directory, test_operation_page.data + BLCKSZ - 3 * sizeof(directory),
+		   sizeof(directory));
+	bytes = test_operation_page.data + directory.record_offset + sizeof(UndoRecordHeader);
+	memcpy(&lock, bytes, sizeof(lock));
+	lock.prev_flags = ITL_FLAG_ACTIVE;
+	memcpy(bytes, &lock, sizeof(lock));
+	bytes += sizeof(lock);
+	memcpy(&history, bytes, sizeof(history));
+	history.entries[0].prior.flags = ITL_FLAG_ACTIVE;
+	history.entries[0].prior.commit_scn = InvalidScn;
+	memcpy(bytes, &history, sizeof(history));
+	memcpy(expected, before_lock, BLCKSZ);
+	ItemIdSetUnused(PageGetItemId((Page)expected, 2));
+	memcpy(&directory, test_operation_page.data + BLCKSZ - 2 * sizeof(directory),
+		   sizeof(directory));
+	if (role != 2)
+		memcpy(PageGetItem((Page)expected, PageGetItemId((Page)expected, 1)),
+			   test_operation_page.data + directory.record_offset + sizeof(UndoRecordHeader)
+				   + sizeof(UndoUpdatePayload),
+			   60);
+	ClusterPageGetItlSlots((Page)expected)[2] = (ClusterItlSlotData){ .wrap = 8 };
+	if (!reuse)
+		ClusterPageGetItlSlots((Page)expected)[4] = (ClusterItlSlotData){ .wrap = 14 };
+}
+
+/* Release completes before apply; wait for the actual full first inverse. */
+static void
+update_creation_active_first_inverse(OperationWorkerFixture *f, const char before_lock[BLCKSZ])
+{
+	for (unsigned tick = 0; tick < 128 && memcmp(before_lock, f->cr.source.data, BLCKSZ) != 0;
+		 tick++)
+		UT_ASSERT_EQ(operation_worker_step(f), CLUSTER_R4_CR_STEP_PENDING);
+	UT_ASSERT_EQ(memcmp(before_lock, f->cr.source.data, BLCKSZ), 0);
+	UT_ASSERT_EQ(f->extension.build_steps, 1);
+	UT_ASSERT_EQ(test_candidate_acquire_calls, 3);
+	UT_ASSERT_EQ(test_candidate_release_calls, 3);
+	UT_ASSERT_EQ(test_candidate_held_count, 0);
+	UT_ASSERT_EQ(test_twophase_calls, 1);
+	UT_ASSERT_EQ(test_current_owner_calls, 0);
+	UT_ASSERT_EQ(test_local_binding_calls, 0);
+}
+
+UT_TEST(test_update_creation_active_lock_and_creator_remain_invisible)
+{
+	for (unsigned role = 0; role < 4; role++)
+		for (unsigned layout = 0; layout < 4; layout++)
+			for (int discarded = 0; discarded < 2; discarded++) {
+				OperationWorkerFixture f;
+				PGAlignedBlock before_lock, expected;
+				int allocations = operation_worker_allocations;
+
+				update_creation_active_lock(&f, role, layout & 1, layout & 2, discarded,
+											before_lock.data, expected.data);
+				update_creation_active_first_inverse(&f, before_lock.data);
+				update_lock_assert_full(&f, expected.data, allocations);
+				UT_ASSERT_EQ(test_twophase_calls, 2);
+			}
+}
+
+UT_TEST(test_update_creation_active_sample_survives_visible_commit)
+{
+	for (unsigned role = 0; role < 4; role++)
+		for (unsigned layout = 0; layout < 4; layout++)
+			for (int discarded = 0; discarded < 2; discarded++) {
+				OperationWorkerFixture f;
+				PGAlignedBlock before_lock, expected;
+				int allocations = operation_worker_allocations;
+
+				update_creation_active_lock(&f, role, layout & 1, layout & 2, discarded,
+											before_lock.data, expected.data);
+				update_creation_active_first_inverse(&f, before_lock.data);
+				test_mixed_top_slot.status = TT_SLOT_COMMITTED;
+				test_mixed_top_slot.commit_scn = 65;
+				test_mixed_top_native_status = TRANSACTION_STATUS_COMMITTED;
+				update_lock_assert_full(&f, expected.data, allocations);
+				UT_ASSERT_EQ(test_twophase_calls, 1);
+			}
+}
+
+UT_TEST(test_update_creation_active_canonical_drift_preserves_last_inverse)
+{
+	for (unsigned layout = 0; layout < 4; layout++)
+		for (unsigned fault = 0; fault < 4; fault++) {
+			OperationWorkerFixture f;
+			PGAlignedBlock before_lock, expected;
+			ClusterR4CrBuildStepResult step;
+			int allocations = operation_worker_allocations;
+
+			update_creation_active_lock(&f, 2, layout & 1, layout & 2, false, before_lock.data,
+										expected.data);
+			update_creation_active_first_inverse(&f, before_lock.data);
+			if (fault == 0)
+				test_mixed_top_slot.wrap++;
+			else if (fault == 1)
+				test_mixed_top_slot.xid++;
+			else if (fault == 2)
+				test_mixed_top_slot.status = TT_SLOT_UNUSED;
+			else
+				operation_worker_row_effect(1, 0); /* No valid disposition. */
+			step = operation_worker_finish(&f);
+			cluster_cr_build_on_holder_forget(0, 1000);
+			UT_ASSERT_EQ(step, CLUSTER_R4_CR_STEP_FAIL);
+			UT_ASSERT_EQ(f.reason, CLUSTER_CR_BUILD_BAD_UNDO);
+			UT_ASSERT_EQ(memcmp(before_lock.data, f.cr.source.data, BLCKSZ), 0);
+			UT_ASSERT_EQ(f.extension.build_steps, 2);
+			UT_ASSERT_EQ(test_candidate_acquire_calls, fault == 3 ? 4 : 5);
+			UT_ASSERT_EQ(test_candidate_release_calls, test_candidate_acquire_calls);
+			UT_ASSERT_EQ(test_candidate_held_count, 0);
+			UT_ASSERT_EQ(operation_worker_allocations, allocations);
+		}
+}
