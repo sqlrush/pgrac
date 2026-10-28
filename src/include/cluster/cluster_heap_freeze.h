@@ -137,7 +137,10 @@ typedef struct ClusterHeapFreezePageBatchV1
 /*
  * A proof result is deliberately narrower than a freeze or retention
  * certificate.  It binds one exact row carrier to the origin's canonical
- * TT projection and to one final holder/master/admission fence.  The VACUUM
+ * TT projection (local or separate origin companion) and to one final
+ * holder/master/admission fence. A foreign companion additionally requires
+ * the collector's current receiver-retention check; these copied gates do
+ * not extend that observation into a lifetime token. The VACUUM
  * caller still has to perform the final current check, WAL and conditional
  * apply while holding the appropriate ownership; this predicate never does
  * I/O, acquires locks, mutates a page, or grants authority on its own.

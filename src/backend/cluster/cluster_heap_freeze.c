@@ -10,6 +10,7 @@
 
 #include "access/heapam.h"
 #include "access/htup_details.h"
+#include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_heap_freeze.h"
 
 /* Shared validation keeps both public outputs untouched on any failure. */
@@ -383,9 +384,24 @@ freeze_canonical_locator_shape_valid(const ClusterTxLocator *request,
 		|| segment_id == 0 || block_no == 0
 		|| !cluster_tx_locator_reply_matches(request, &resolution->locator_echo)
 		|| resolution->locator_echo.tt_wrap == TT_WRAP_INVALID
-		|| resolution->locator_echo.tt_wrap > TT_WRAP_MAX
-		|| !resolution->local_canonical_valid
-		|| resolution->local_canonical_generation == 0
+		|| resolution->locator_echo.tt_wrap > TT_WRAP_MAX)
+		return false;
+
+	/* A retained foreign observation is a separate projection. Never copy it
+	 * into local origin fields or derive its epoch from the echoed raw XID.
+	 * This only validates shape; the collector must recheck receiver custody
+	 * outside the page lock and cannot treat it as continuous protection. */
+	if (!resolution->local_canonical_valid)
+	{
+		const ClusterTTSlotPhysicalLocator empty = {0};
+
+		return resolution->local_canonical_generation == 0
+			&& memcmp(&resolution->local_canonical, &empty, sizeof(empty)) == 0
+			&& !FullTransactionIdIsValid(resolution->local_original_full_xid)
+			&& !resolution->local_creation_target.valid
+			&& ClusterR4TxCompanionIsValid(resolution);
+	}
+	if (resolution->local_canonical_generation == 0
 		|| resolution->local_canonical_generation == UINT32_MAX
 		|| resolution->local_canonical.reserved32 != 0
 		|| resolution->local_canonical.segment_id == 0
@@ -400,6 +416,21 @@ freeze_canonical_locator_shape_valid(const ClusterTxLocator *request,
 		return false;
 
 	return true;
+}
+
+/* Caller has validated the canonical shape and original carrier. These are
+ * source fields, not a replacement for page/row authority or retention. */
+static const ClusterTxCreationTarget *
+freeze_creation_projection(const ClusterTxResolution *resolution,
+	FullTransactionId *original)
+{
+	if (resolution->local_canonical_valid)
+	{
+		*original = resolution->local_original_full_xid;
+		return &resolution->local_creation_target;
+	}
+	*original = resolution->origin_companion.original_full_xid;
+	return &resolution->origin_companion.creation_target;
 }
 
 bool
@@ -774,7 +805,9 @@ cluster_heap_freeze_bind_creation_targets_v1(
 		for (uint8 proof_index = 0; proof_index < proofs->proof_count; proof_index++)
 		{
 			const ClusterHeapFreezeCanonicalProofV1 *proof = &proofs->proofs[proof_index];
-			const ClusterTxCreationTarget *target = &proof->resolution.local_creation_target;
+			FullTransactionId original;
+			const ClusterTxCreationTarget *target =
+				freeze_creation_projection(&proof->resolution, &original);
 
 			if (!freeze_locator_equal_exact(&request->locator, &proof->requested_locator)
 				|| proof->resolution.outcome != CLUSTER_TX_COMMITTED
@@ -785,10 +818,9 @@ cluster_heap_freeze_bind_creation_targets_v1(
 				|| (target->tuple_length != 0 && target->tuple_length != tuple->tuple_length))
 				continue;
 			tuple->creation_target_proof_index = proof_index;
-			if (FullTransactionIdIsNormal(proof->resolution.local_original_full_xid)
-				&& XidFromFullTransactionId(proof->resolution.local_original_full_xid)
-					== tuple->raw_xmin)
-				tuple->original_creator_full_xid = proof->resolution.local_original_full_xid;
+			if (FullTransactionIdIsNormal(original)
+				&& XidFromFullTransactionId(original) == tuple->raw_xmin)
+				tuple->original_creator_full_xid = original;
 			matched++;
 			break;
 		}
@@ -847,12 +879,13 @@ freeze_xmin_row_matches(
 	for (uint8 index = 0; index < proofs->proof_count; index++)
 	{
 		const ClusterHeapFreezeCanonicalProofV1 *proof = &proofs->proofs[index];
-		const ClusterTxCreationTarget *target = &proof->resolution.local_creation_target;
+		FullTransactionId original;
+		const ClusterTxCreationTarget *target =
+			freeze_creation_projection(&proof->resolution, &original);
 
 		if (!freeze_locator_equal_exact(&request->locator, &proof->requested_locator)
 			|| proof->resolution.outcome != CLUSTER_TX_COMMITTED
-			|| !FullTransactionIdEquals(proof->resolution.local_original_full_xid,
-				original_creator_full_xid)
+			|| !FullTransactionIdEquals(original, original_creator_full_xid)
 			|| !SCN_VALID(proof->resolution.commit_scn)
 			|| scn_time_cmp(proof->resolution.commit_scn, horizon_scn) >= 0
 			|| tuple->raw_xmin != proof->resolution.locator_echo.xid || !target->valid

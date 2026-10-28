@@ -7652,10 +7652,51 @@ UT_TEST(test_foreign_retained_companion_cannot_escape_source_or_root_drift)
 	}
 }
 
+UT_TEST(test_foreign_current_observation_uses_original_entered_receiver_retention)
+{
+	int saved_node = cluster_node_id;
+	for (unsigned fault = 0; fault <= 9; fault++) {
+		ClusterTxResolution origin, received, before;
+		ClusterSemanticAdmissionToken admission = {
+			.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+			.record_generation = 5, .formation_epoch = 42,
+			.side = CLUSTER_SEMANTIC_TARGET_SIDE, .entered = true};
+		setup_original_full_xid(false);
+		UT_ASSERT_EQ(resolve_original_full_xid(CLUSTER_TX_RESOLVE_TERMINAL_CENSUS,
+			&origin), CLUSTER_TX_COMMITTED);
+		test_receiver_registered = true; test_receiver_retained = origin;
+		test_receiver_peer_boot = origin.origin_companion.key.origin_boot_incarnation;
+		test_receiver_peer_generation = 3;
+		test_receiver_peer_epoch = origin.origin_companion.key.formation_epoch;
+		test_receiver_self_admitted = test_boot_incarnation;
+		received = origin;
+		memset(&received.local_canonical, 0, sizeof(received.local_canonical));
+		received.local_canonical_generation = 0; received.local_canonical_valid = false;
+		received.local_original_full_xid = InvalidFullTransactionId;
+		memset(&received.local_creation_target, 0, sizeof(received.local_creation_target));
+		switch (fault) {
+		case 3: admission.entered = false; break;
+		case 4: test_admission_revoked = true; break;
+		case 5: test_receiver_registered = false; break;
+		case 6: test_receiver_drift = 1; break;
+		case 7: admission.record_generation++; break;
+		case 8: test_receiver_drift = 8; break;
+		case 9: received.local_canonical_valid = true; break;
+		}
+		before = received; cluster_node_id = 1;
+		UT_ASSERT_EQ(cluster_runtime_visibility_foreign_companion_current_admitted(
+			fault == 1 ? NULL : &received, fault == 2 ? NULL : &admission), fault == 0);
+		cluster_node_id = saved_node;
+		UT_ASSERT_EQ(memcmp(&received, &before, sizeof(before)), 0);
+		UT_ASSERT_EQ(test_remote_origin_calls, 0);
+		UT_ASSERT_EQ(test_candidate_held_count, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(210);
+	UT_PLAN(211);
 	UT_RUN(test_original_full_xid_reaches_same_and_cross_segment_census_result);
 	UT_RUN(test_original_full_xid_missing_or_key_alias_keeps_verdict_without_identity);
 	UT_RUN(test_original_full_xid_not_queried_for_other_roles_or_abort);
@@ -7866,6 +7907,7 @@ main(void)
 	UT_RUN(test_foreign_v4_remains_separate_and_original_final_admission_clears_all);
 	UT_RUN(test_foreign_v4_without_receiver_retention_discards_only_companion);
 	UT_RUN(test_foreign_retained_companion_cannot_escape_source_or_root_drift);
+	UT_RUN(test_foreign_current_observation_uses_original_entered_receiver_retention);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

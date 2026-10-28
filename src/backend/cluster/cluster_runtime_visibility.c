@@ -3126,6 +3126,17 @@ cluster_runtime_visibility_foreign_companion_retained(
 		&& cluster_membership_get_last_admitted_incarnation(key->origin_node_id) == peer_boot;
 }
 
+bool
+cluster_runtime_visibility_foreign_companion_current_admitted(
+	const ClusterTxResolution *resolution, const ClusterSemanticAdmissionToken *admission)
+{
+	return resolution != NULL && !resolution->local_canonical_valid
+		&& admission != NULL && admission->entered
+		&& cluster_semantic_activation_recheck_r4_terminal_census(admission)
+		&& cluster_runtime_visibility_foreign_companion_retained(resolution, admission)
+		&& cluster_semantic_activation_recheck_r4_terminal_census(admission);
+}
+
 ClusterTxOutcome
 cluster_runtime_visibility_resolve_exact_origin_admitted(
 	const ClusterTxLocator *locator, ClusterTxResolveMode mode,

@@ -1051,6 +1051,13 @@ cluster_heap_freeze_cohort_current(const ClusterHeapFreezeCohortObservation *exp
 
 #include "test_cluster_vacuum_observed_bounds.inc"
 
+bool
+cluster_runtime_visibility_foreign_companion_current_admitted(
+	const ClusterTxResolution *resolution, const ClusterSemanticAdmissionToken *token)
+{
+	(void)resolution; (void)token; UT_ASSERT(false); return false;
+}
+
 #include "test_cluster_vacuum_proof_cleanup.inc"
 
 static void

@@ -47,6 +47,7 @@
 #include "storage/lock.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_gcs_block.h"
+#include "cluster/cluster_runtime_visibility.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_pcm_own.h"
 #include "cluster/cluster_ko.h"
@@ -1466,7 +1467,54 @@ census_step_unlock(LWLock *lock)
 #define cluster_xid_widen original_census_xid_widen
 #define ctrc_active_scan_step original_census_step_internal
 #define cluster_ctrc_active_scan_step_source original_census_step_source
+/* Original later-defined helpers used by the current census/reclaim bodies. */
+static bool
+ctrc_delegated_certificate_retired_exact_locked(uint64 index);
+static bool
+ctrc_origin_root_metadata_valid(const ClusterCtrcOriginEntry *origin);
+static bool
+ctrc_participant_successor_exact_locked(uint64 index,
+	const ClusterCtrcParticipantEntry *successor);
+static ClusterCtrcPrepareResult
+ctrc_receipt_prepare_successor_locked(uint64 index, const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcParticipantIdentity *identity, uint32 grant,
+	const ClusterCtrcPublicationIdV1 *publication, const ClusterCtrcTargetV1 *target,
+	FullTransactionId original, const uint8 *original_v2,
+	const ClusterCtrcDelegationCustodyV1 *parent, const ClusterCtrcDelegationPathV2 *path,
+	uint64 journal_sequence, uint64 *receipt_index, ClusterCtrcPreparePath *path_out);
+static bool
+ctrc_root_ack_bytes_exact(const ClusterCtrcRootSubtreeAckV1 *ack);
+static bool
+ctrc_root_ack_encode_body(const ClusterCtrcRootSubtreeAckV1 *ack,
+	uint8 bytes[CLUSTER_CTRC_ROOT_ACK_BYTES]);
+static bool
+ctrc_root_ack_shape_valid(const ClusterCtrcRootSubtreeAckV1 *ack);
+static bool
+ctrc_root_certificate_notice_locked(uint64 index, const ClusterCtrcCloseDispatch *dispatch,
+	bool *progressed);
+static bool
+ctrc_root_local_ack_exact_locked(uint64 index, const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcParticipantIdentity *identity, uint32 grant, uint64 seal);
+static bool
+original_participant_participant_index(const ClusterCtrcTxnKeyV1 *key, uint16 participant_node_id,
+					   uint64 *index_out);
+static bool pg_attribute_unused()
+original_ack_delegated_local_ack_summary_exact(const ClusterCtrcParticipantEntry *participant,
+	const ClusterCtrcLocalReleaseAckV1 *summary);
+static ClusterCtrcLocalReleaseAckV1 *
+original_certificate_participant_ack_entries(void);
+static uint64 *
+original_participant_participant_receipt_heads(void);
+#define ctrc_participant_index original_participant_participant_index
+#define ctrc_delegated_local_ack_summary_exact original_ack_delegated_local_ack_summary_exact
+#define ctrc_participant_ack_entries original_certificate_participant_ack_entries
+#define ctrc_participant_receipt_heads original_participant_participant_receipt_heads
 #include "test_cluster_heap_ctrc_step.inc"
+#undef ctrc_participant_index
+#undef ctrc_delegated_local_ack_summary_exact
+#undef ctrc_participant_ack_entries
+#undef ctrc_participant_receipt_heads
+
 #undef cluster_ctrc_active_scan_step_source
 #undef ctrc_active_scan_step
 #undef cluster_xid_widen
@@ -8859,7 +8907,10 @@ static void ack_process_interrupts(void) { UT_ASSERT(false); }
 #define ctrc_ack_work_local_snapshot original_ack_work_local_snapshot
 #define ctrc_participant_delegations_valid original_certificate_participant_delegations_valid
 #define ctrc_frozen_ack_summary_exact original_certificate_frozen_ack_summary_exact
+#define cluster_ctrc_origin_fullxid_match_v2 original_participant_origin_fullxid_match_v2
 #include "test_cluster_heap_ctrc_ack.inc"
+#undef cluster_ctrc_origin_fullxid_match_v2
+
 #undef ctrc_frozen_ack_summary_exact
 #undef ctrc_participant_delegations_valid
 #undef ctrc_ack_work_local_snapshot
@@ -12076,6 +12127,23 @@ static unsigned phase_finally_pins;
 static bool phase_finally_owned_writer;
 static bool phase_mixed_proof_subset;
 static uint8 phase_unknown_proof_mask;
+static unsigned phase_foreign_checks, phase_foreign_refuse_at, phase_foreign_error_at;
+
+/* Actual runtime current checks are covered in outcome tests; this collector
+ * fixture controls source retirement and asserts that no page lock is held. */
+bool
+cluster_runtime_visibility_foreign_companion_current_admitted(
+	const ClusterTxResolution *resolution, const ClusterSemanticAdmissionToken *token)
+{
+	UT_ASSERT(token == bounds_expected_admission() && token->entered);
+	UT_ASSERT(!local_x && !local_share && backend_pin_count == 0);
+	phase_foreign_checks++;
+	if (phase_foreign_error_at == phase_foreign_checks)
+		elog(ERROR, "injected foreign receiver retention ERROR");
+	return phase_foreign_refuse_at != phase_foreign_checks
+		&& !resolution->local_canonical_valid && ClusterR4TxCompanionIsValid(resolution);
+}
+
 
 static void
 phase_preflight(void)
@@ -12196,6 +12264,7 @@ phase_setup(QualifiedXminFixture *f, LVRelState *v,
 {
 	bounds_lifecycle_setup(f, v, targets, batch);
 	phase_source = f; phase_preflights = phase_resolves = phase_rechecks = 0;
+	phase_foreign_checks = phase_foreign_refuse_at = phase_foreign_error_at = 0;
 	phase_error_stage = phase_finally_calls = phase_finally_debt = phase_finally_pins = 0;
 	phase_finally_owned_writer = false;
 	v->shared_freeze_batch = f->page;
@@ -16344,10 +16413,229 @@ UT_TEST(test_mixed_aborted_modifier_stays_unchanged_through_recent_xmin_wal)
 	phase_recent_native_finish(&f, &v, true);
 }
 
+#define ctrc_local_ack_shape_valid original_certificate_local_ack_shape_valid
+#define ctrc_get_u32_le original_certificate_get_u32_le
+#define ctrc_put_u64_le original_certificate_put_u64_le
+#define ctrc_put_u32_le original_certificate_put_u32_le
+#define ctrc_crc32c_exact original_certificate_crc32c_exact
+#define ctrc_participant_delegations_valid original_certificate_participant_delegations_valid
+#define ctrc_receipts_reclaim_validate original_certificate_receipts_reclaim_validate
+#define ctrc_receipt_entries original_participant_receipt_entries
+#define ctrc_receipt_probe_states original_participant_receipt_probe_states
+#define ctrc_receipt_links original_participant_receipt_links
+#define ctrc_participant_index original_participant_participant_index
+#define ctrc_participant_ack_entries original_certificate_participant_ack_entries
+#define ctrc_participant_receipt_heads original_participant_participant_receipt_heads
+#define ctrc_delegated_local_ack_summary_exact original_ack_delegated_local_ack_summary_exact
+#define ctrc_receipt_chain_exact_locked original_participant_receipt_chain_exact_locked
+#define ctrc_receipt_prepare_table_observed original_participant_receipt_prepare_table_observed
+#define cluster_ctrc_local_release_ack_encode original_certificate_local_release_ack_encode
+#define cluster_ctrc_empty_sha256 certificate_empty_sha256
+#define cluster_ctrc_origin_fullxid_match_v2 original_participant_origin_fullxid_match_v2
+#define cluster_ctrc_participant_open original_participant_participant_open
+#include "test_cluster_heap_ctrc_creator_dependencies.inc"
+#undef cluster_ctrc_origin_fullxid_match_v2
+#undef cluster_ctrc_participant_open
+
+#undef ctrc_local_ack_shape_valid
+#undef ctrc_get_u32_le
+#undef ctrc_put_u64_le
+#undef ctrc_put_u32_le
+#undef ctrc_crc32c_exact
+#undef ctrc_participant_delegations_valid
+#undef ctrc_receipts_reclaim_validate
+#undef ctrc_receipt_entries
+#undef ctrc_receipt_probe_states
+#undef ctrc_receipt_links
+#undef ctrc_participant_index
+#undef ctrc_participant_ack_entries
+#undef ctrc_participant_receipt_heads
+#undef ctrc_delegated_local_ack_summary_exact
+#undef ctrc_receipt_chain_exact_locked
+#undef ctrc_receipt_prepare_table_observed
+#undef cluster_ctrc_local_release_ack_encode
+#undef cluster_ctrc_empty_sha256
+
+
+/* Foreign observations keep their origin projection separate from local-only
+ * fields. Storage/authentication are inputs here; no receiver lifetime is
+ * certified by this pure creation-row test. */
+static void
+foreign_creation_project(QualifiedXminFixture *f)
+{
+	ClusterHeapFreezeCanonicalProofV1 *proof;
+	ClusterTxResolution *r;
+	ClusterItlSlotData *slot;
+	ClusterTxCreationTarget target;
+	FullTransactionId original;
+
+	proof = &f->proofs.proofs[0]; r = &proof->resolution;
+	target = r->local_creation_target; original = r->local_original_full_xid;
+	slot = ClusterPageGetItlSlot((Page)current_page.data, 0);
+	slot->undo_segment_head = uba_encode(CLUSTER_UNDO_SEGS_PER_INSTANCE + 1, 1, 0, 128);
+	memcpy(f->input.image.data, current_page.data, BLCKSZ);
+	memcpy(before_page.data, current_page.data, BLCKSZ);
+	UT_ASSERT(cluster_heap_freeze_prepare_page_v1(&f->input, &f->page));
+	proof->requested_locator = f->page.carrier_requests[0].locator;
+	r->locator_echo = proof->requested_locator; r->locator_echo.tt_wrap = 2;
+	r->top_xid = r->locator_echo.xid;
+	r->authority.origin_epoch = f->admission.formation_epoch;
+	r->local_canonical_valid = false; r->local_canonical_generation = 0;
+	memset(&r->local_canonical, 0, sizeof(r->local_canonical));
+	memset(&r->local_creation_target, 0, sizeof(r->local_creation_target));
+	r->local_original_full_xid = InvalidFullTransactionId;
+	r->origin_companion = (ClusterTxCanonicalCompanionV1){
+		.key = {.format_version = CLUSTER_CTRC_FORMAT_VERSION, .owner_instance = 2,
+			.origin_node_id = 1, .segment_id = CLUSTER_UNDO_SEGS_PER_INSTANCE + 1,
+			.segment_generation = 1, .slot_wrap = 2, .xid = r->top_xid,
+			.cluster_epoch = f->admission.formation_epoch, .system_identifier = 42,
+			.origin_boot_incarnation = 43, .formation_epoch = f->admission.formation_epoch,
+			.admission_record_generation = f->admission.record_generation,
+			.root_descriptor_incarnation = 1, .root_id = 1, .root_generation = 1},
+		.original_full_xid = original, .creation_target = target, .present = true};
+	UT_ASSERT(ClusterR4TxCompanionIsValid(r));
+}
+
+static void
+foreign_creation_setup(QualifiedXminFixture *f)
+{
+	qualified_xmin_setup(f, HEAP_XMAX_IS_MULTI);
+	foreign_creation_project(f);
+}
+
+UT_TEST(test_foreign_companion_binds_only_its_exact_creation_row)
+{
+	QualifiedXminFixture f;
+	ClusterHeapFreezeXminCandidateBatchV1 candidates = {0};
+	foreign_creation_setup(&f);
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_canonical_proof_v1(&f.proofs.proofs[0]),
+		CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&f.page, &f.proofs, &f.fence), 1);
+	UT_ASSERT(FullTransactionIdEquals(f.page.tuples[0].original_creator_full_xid,
+		f.proofs.proofs[0].resolution.origin_companion.original_full_xid));
+	UT_ASSERT(cluster_heap_freeze_select_xmin_candidates_v1(&f.page, &f.proofs,
+		&f.fence, f.policy.freeze_limit, 10, &candidates));
+	UT_ASSERT_EQ(candidates.target_count, 1);
+	UT_ASSERT(!f.proofs.proofs[0].resolution.local_canonical_valid);
+	UT_ASSERT(!FullTransactionIdIsValid(f.proofs.proofs[0].resolution.local_original_full_xid));
+}
+
+UT_TEST(test_foreign_creation_rejects_mixed_identity_carrier_row_and_final_fence)
+{
+	for (unsigned fault = 0; fault < 24; fault++) {
+		QualifiedXminFixture f;
+		ClusterTxResolution *r;
+		foreign_creation_setup(&f); r = &f.proofs.proofs[0].resolution;
+		UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&f.page, &f.proofs, &f.fence), 1);
+		switch (fault) {
+		case 0: r->origin_companion.present = false; break;
+		case 1: r->origin_companion.key.format_version = 0; break;
+		case 2: r->origin_companion.key.reserved[0] = 1; break;
+		case 3: r->origin_companion.key.slot_wrap++; break;
+		case 4: r->origin_companion.key.segment_generation = 0; break;
+		case 5: r->origin_companion.original_full_xid = FullTransactionIdFromU64(UINT64_MAX); break;
+		case 6: r->origin_companion.original_full_xid = FullTransactionIdFromEpochAndXid(1, 78); break;
+		case 7: r->origin_companion.key.origin_node_id++; break;
+		case 8: r->origin_companion.key.owner_instance++; break;
+		case 9: r->top_xid++; break;
+		case 10: r->local_canonical.segment_id = 1; break;
+		case 11: r->local_canonical_generation = 1; break;
+		case 12: r->local_original_full_xid = r->origin_companion.original_full_xid; break;
+		case 13: r->local_creation_target.valid = true; break;
+		case 14: r->origin_companion.creation_target.offset = 4; break;
+		case 15: r->origin_companion.creation_target.tuple_length--; break;
+		case 16: r->origin_companion.creation_target.locator.relNumber++; break;
+		case 17: r->origin_companion.creation_target.fork++; break;
+		case 18: f.page.tuples[0].raw_xmin++; break;
+		case 19: f.fence.page_lsn++; break;
+		case 20: f.proofs.proofs[0].admission_current = false; break;
+		case 21: f.proofs.proofs[0].c1b_finalized = false; break;
+		case 22: f.proofs.proofs[0].authority_current = false; break;
+		case 23: f.proofs.proofs[0].requested_locator.uba = uba_encode(CLUSTER_UNDO_SEGS_PER_INSTANCE + 1, 2, 0, 128); break;
+		}
+		UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&f.page, &f.proofs, &f.fence), 0);
+		UT_ASSERT_EQ(f.page.tuples[0].creation_target_proof_index, CLUSTER_HEAP_FREEZE_NO_CREATION_TARGET);
+		UT_ASSERT(!FullTransactionIdIsValid(f.page.tuples[0].original_creator_full_xid));
+		UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+	}
+}
+
+UT_TEST(test_foreign_candidate_never_enters_unqualified_native_writer)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f;
+		ClusterHeapFreezeXminTargetV1 targets[3];
+		if (batch) {
+			qualified_xmin_batch_setup(&f, targets);
+			foreign_creation_project(&f);
+		} else foreign_creation_setup(&f);
+		UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&f.page, &f.proofs, &f.fence), batch ? 3 : 1);
+		UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0)));
+		UT_ASSERT_EQ(conditional_resumes + inserts + edges + dirties + flushes, 0);
+		UT_ASSERT_EQ(memcmp(current_page.data, before_page.data, BLCKSZ), 0);
+		UT_ASSERT_EQ(backend_pin_count, 1); UT_ASSERT(f.admission.entered);
+	}
+}
+
+UT_TEST(test_actual_collector_binds_current_foreign_creation_without_hint_or_wal)
+{
+	QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+	bool rows = false;
+	phase_setup(&f, &v, targets, false); foreign_creation_project(&f);
+	v.shared_freeze_input = f.input; v.shared_freeze_batch = f.page;
+	phase_use_original_resident = true; phase_resident_completed = false;
+	phase_resident_expected_resumes = 0; phase_resident_hint_error = false;
+	phase_resident_hint_calls = 0; memset(phase_resident_releases, 0, sizeof(phase_resident_releases));
+	v.rel = &relation_data; v.identity = space_identity;
+	v.shared_freeze_input.writer_context_valid = false;
+	relation_data.rd_isvalid = resume_allowed = true;
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs_admitted(&v, 1, &f.authority,
+		f.fence.master_sequence, &f.admission, &rows), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT(rows); UT_ASSERT_EQ(phase_foreign_checks, 2);
+	UT_ASSERT_EQ(v.shared_freeze_proofs.proof_count, 1);
+	UT_ASSERT_EQ(v.shared_freeze_xmin_candidates.target_count, 1);
+	UT_ASSERT(FullTransactionIdEquals(v.shared_freeze_batch.tuples[0].original_creator_full_xid,
+		f.proofs.proofs[0].resolution.origin_companion.original_full_xid));
+	UT_ASSERT(!v.shared_freeze_proofs.proofs[0].resolution.local_canonical_valid);
+	UT_ASSERT_EQ(hints + inserts + edges + dirties + flushes, 0);
+	UT_ASSERT_EQ(memcmp(current_page.data, before_page.data, BLCKSZ), 0);
+	UT_ASSERT_EQ(backend_pin_count, 1); UT_ASSERT(!local_x && f.admission.entered);
+	bounds_original_census_leave(&f.admission); bounds_lifecycle_assert_empty(&f.admission);
+}
+
+UT_TEST(test_actual_collector_foreign_retention_refusal_retires_only_candidate)
+{
+	for (unsigned stage = 1; stage <= 2; stage++) {
+		QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+		bool rows = false;
+		phase_setup(&f, &v, targets, false); foreign_creation_project(&f);
+		v.shared_freeze_input = f.input; v.shared_freeze_batch = f.page;
+		phase_use_original_resident = true; phase_foreign_refuse_at = stage;
+		phase_resident_completed = false; phase_resident_expected_resumes = 0;
+		phase_resident_hint_error = false; phase_resident_hint_calls = 0;
+		memset(phase_resident_releases, 0, sizeof(phase_resident_releases));
+		v.rel = &relation_data; v.identity = space_identity;
+		v.shared_freeze_input.writer_context_valid = false;
+		relation_data.rd_isvalid = resume_allowed = true;
+		UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs_admitted(&v, 1, &f.authority,
+			f.fence.master_sequence, &f.admission, &rows), CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+		UT_ASSERT(!rows); UT_ASSERT_EQ(phase_foreign_checks, stage);
+		UT_ASSERT_EQ(v.shared_freeze_proofs.proof_count, 0);
+		UT_ASSERT_EQ(v.shared_freeze_xmin_candidates.target_count, 0);
+		UT_ASSERT(!v.shared_freeze_cohort_observed && !v.shared_freeze_fence_valid);
+		UT_ASSERT(v.shared_freeze_input.freeze_policy == NULL && v.shared_freeze_input.freeze_cohort == NULL);
+		UT_ASSERT(!FullTransactionIdIsValid(v.shared_freeze_candidate_limit_full));
+		UT_ASSERT_EQ(hints + inserts + edges + dirties + flushes, 0);
+		UT_ASSERT_EQ(memcmp(current_page.data, before_page.data, BLCKSZ), 0);
+		UT_ASSERT_EQ(backend_pin_count, 1); UT_ASSERT(!local_x && f.admission.entered);
+		bounds_original_census_leave(&f.admission); bounds_lifecycle_assert_empty(&f.admission);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(347);
+	UT_PLAN(352);
 
 	UT_RUN(test_pin_free_admitted_phase_reaches_recent_native_wal_before_owner_leave);
 	UT_RUN(test_pin_free_phase_recent_refusal_retires_only_its_original_owner);
@@ -16706,6 +16994,11 @@ main(void)
 	UT_RUN(test_all_unknown_admitted_carriers_skip_resident_and_native_work);
 	UT_RUN(test_mixed_aborted_modifier_stays_unchanged_through_recent_xmin_wal);
 
+	UT_RUN(test_foreign_companion_binds_only_its_exact_creation_row);
+	UT_RUN(test_foreign_creation_rejects_mixed_identity_carrier_row_and_final_fence);
+	UT_RUN(test_foreign_candidate_never_enters_unqualified_native_writer);
+	UT_RUN(test_actual_collector_binds_current_foreign_creation_without_hint_or_wal);
+	UT_RUN(test_actual_collector_foreign_retention_refusal_retires_only_candidate);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

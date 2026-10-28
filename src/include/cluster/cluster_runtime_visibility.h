@@ -169,6 +169,11 @@ extern ClusterTxOutcome cluster_runtime_visibility_resolve_exact_origin_admitted
 	const ClusterTxLocator *locator, ClusterTxResolveMode mode,
 	const ClusterSemanticAdmissionToken *admission, ClusterTxResolution *out,
 	ClusterTxResolveReason *reason_out);
+/* Readonly current observation of already-retained foreign identity under
+ * the original entered census admission. No lookup/grant RPC, mutation or
+ * lifetime token; callers must keep final page and authority checks. */
+extern bool cluster_runtime_visibility_foreign_companion_current_admitted(
+	const ClusterTxResolution *resolution, const ClusterSemanticAdmissionToken *admission);
 extern ClusterTxOutcome cluster_runtime_visibility_resolve_terminal_census_retained_exact(
 	const ClusterTxLocator *locator, SCN retained_commit_scn,
 	const ClusterSemanticAdmissionToken *admission, ClusterTxResolution *out,

@@ -83,6 +83,7 @@
 #include "cluster/cluster_itl_cleanout.h"
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_pcm_lock.h"
+#include "cluster/cluster_runtime_visibility.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_space_storage.h"
@@ -1727,6 +1728,10 @@ lazy_cleanout_shared_freeze_page(LVRelState *vacrel, Buffer buffer,
 		}
 		else
 			continue;
+		/* Foreign identity supplies row candidates only; stamping requires
+		 * a continuous receiver-retention contract. */
+		if (!resolution->local_canonical_valid && resolution->origin_companion.present)
+			continue;
 		if (resolution->outcome == CLUSTER_TX_COMMITTED
 			&& cluster_itl_cleanout_can_stamp(&slots[slot_index], request->carrier.xid,
 										 resolution->commit_scn))
@@ -2117,7 +2122,7 @@ lazy_collect_shared_freeze_proofs_admitted(LVRelState *vacrel, Buffer recent_buf
 		if ((outcome != CLUSTER_TX_COMMITTED && outcome != CLUSTER_TX_ABORTED)
 			|| reason != CLUSTER_TX_RESOLVE_NONE)
 			continue;
-		if (!resolution.local_canonical_valid
+		if ((!resolution.local_canonical_valid && !resolution.origin_companion.present)
 			|| resolution.locator_echo.tt_wrap == TT_WRAP_INVALID)
 		{
 			/* The retained fallback deliberately supplies no canonical TT
@@ -2142,6 +2147,13 @@ lazy_collect_shared_freeze_proofs_admitted(LVRelState *vacrel, Buffer recent_buf
 			}
 			continue;
 		}
+		/* The remote resolver's earlier observation is not a lifetime token.
+		 * Recheck the original receiver outside page/content locks; never
+		 * manufacture a local canonical projection from peer bytes. */
+		if (!resolution.local_canonical_valid
+			&& !cluster_runtime_visibility_foreign_companion_current_admitted(
+				&resolution, admission))
+			continue;
 		if (cluster_heap_freeze_build_canonical_proof_v1(&request->locator,
 				&resolution, &expected_fence, &expected_fence, true, true, true,
 				&proofs.proofs[proofs.proof_count]))
@@ -2161,6 +2173,25 @@ lazy_collect_shared_freeze_proofs_admitted(LVRelState *vacrel, Buffer recent_buf
 	if (row_inputs_current && !cleaned)
 		status = lazy_observe_shared_freeze_bounds(vacrel, admission, status,
 												&observed_bounds);
+	/* The resident check released its local X/pin, and the original bounds
+	 * callbacks may have retired a source. Recheck every foreign observation
+	 * before exporting any creation association, still outside page locks.
+	 * Refusal retires this attempt's borrowed observations, not any owner. */
+	if (row_inputs_current && !cleaned)
+		for (uint8 index = 0; index < proofs.proof_count; index++)
+			if (!proofs.proofs[index].resolution.local_canonical_valid
+				&& !cluster_runtime_visibility_foreign_companion_current_admitted(
+					&proofs.proofs[index].resolution, admission))
+			{
+				row_inputs_current = false;
+				status = CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN;
+				vacrel->shared_freeze_cohort_observed = false;
+				vacrel->shared_freeze_candidate_limit_full = InvalidFullTransactionId;
+				vacrel->shared_freeze_input.freeze_policy = NULL;
+				vacrel->shared_freeze_input.freeze_cohort = NULL;
+				memset(&vacrel->shared_freeze_cohort, 0, sizeof(vacrel->shared_freeze_cohort));
+				goto admitted_done;
+			}
 	/* This remains only a physical association, never row-freeze permission. */
 	if (row_inputs_current && !cleaned
 		&& (status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN

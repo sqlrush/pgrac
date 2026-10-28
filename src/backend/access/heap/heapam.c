@@ -20951,6 +20951,14 @@ cluster_heap_freeze_apply_xmin_batch_v1(
 	/* Plan only from the caller's immutable captured inputs. Finish the
 	 * whole batch before restoring a writer or taking its local content X;
 	 * the locked kernel still rechecks every physical row and final fence. */
+	/* Foreign canonical observations may now identify candidates, but this
+	 * native writer has no continuous receiver-retention contract yet. A
+	 * copied proof/current observation cannot authorize mutation or WAL. */
+	if (proofs == NULL || proofs->proof_count > CLUSTER_HEAP_FREEZE_MAX_PROOF_BATCH)
+		return false;
+	for (uint8 index = 0; index < proofs->proof_count; index++)
+		if (!proofs->proofs[index].resolution.local_canonical_valid)
+			return false;
 	if (!cluster_heap_freeze_prepare_xmin_batch_v1(page, proofs, fence,
 		targets, target_count, freeze_limit_full, horizon_scn,
 		plans, lengthof(plans), &conflict_horizon))
