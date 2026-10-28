@@ -7229,6 +7229,11 @@ typedef struct GcsFreshrefPairExchangeDiagnostic {
 	int status;
 	bool trailer;
 	int checksum_ok;
+	int32 requester_backend;
+	bool stage_started;
+	/* -1 means the original stage call did not return; 0/1 are its bool
+	 * result, not evidence of a wire send or service-side acceptance. */
+	int stage_result;
 } GcsFreshrefPairExchangeDiagnostic;
 
 static void
@@ -7246,12 +7251,14 @@ gcs_ordinary_verdict_refusal(const char *phase, int32 origin, BufferTag tag, Tra
 		 "PGRAC ordinary TT exchange refused: node=%d origin=%d "
 		 "request=" UINT64_FORMAT " xid=%u epoch=" UINT64_FORMAT
 		 " tag=%u/%u/%u/%u/%u phase=%s received=%d status=%d trailer=%d "
-		 "checksum_ok=%d page_sampled=%d xid_echo=" UINT64_FORMAT
-		 " verdict=%u commit_scn=" UINT64_FORMAT " horizon=" UINT64_FORMAT
-		 " detail_budget_exhausted=%d",
+		 "checksum_ok=%d backend=%d stage_started=%d stage_result=%d "
+		 "page_sampled=%d xid_echo=" UINT64_FORMAT " verdict=%u commit_scn=" UINT64_FORMAT
+		 " horizon=" UINT64_FORMAT " detail_budget_exhausted=%d",
 		 cluster_node_id, origin, request_id, xid, epoch, tag.spcOid, tag.dbOid, tag.relNumber,
 		 tag.forkNum, tag.blockNum, phase, d != NULL && d->received, d == NULL ? -1 : d->status,
-		 d != NULL && d->trailer, d == NULL ? -1 : d->checksum_ok, page != NULL,
+		 d != NULL && d->trailer, d == NULL ? -1 : d->checksum_ok,
+		 d == NULL ? -1 : d->requester_backend, d == NULL ? -1 : (int)d->stage_started,
+		 d == NULL ? -1 : d->stage_result, page != NULL,
 		 page == NULL ? UINT64CONST(0) : page->xid_echo, page == NULL ? 0 : (unsigned)page->verdict,
 		 (uint64)(page == NULL ? 0 : page->commit_scn),
 		 (uint64)(page == NULL ? 0 : page->horizon_scn), emitted == 64);
@@ -7327,7 +7334,11 @@ gcs_block_undo_verdict_wire_exchange_trace_impl(
 	bool fetched = false;
 	bool freshref_pair = SCN_VALID(freshref_pair_scn);
 	bool ordinary_diagnostic = !freshref_pair && !authoritative && !authority_kind;
-	volatile GcsFreshrefPairExchangeDiagnostic diagnostic = { false, -1, false, -1 };
+	volatile GcsFreshrefPairExchangeDiagnostic diagnostic
+		= { .status = -1,
+			.checksum_ok = -1,
+			.requester_backend = (int32)MyBackendId,
+			.stage_result = -1 };
 
 	if (freshref_pair && (!authoritative || authority_kind))
 		return false;
@@ -7338,12 +7349,14 @@ gcs_block_undo_verdict_wire_exchange_trace_impl(
 	counters->calls++;
 
 	cluster_gcs_block_dedup_register_backend_exit_hook();
-	slot = gcs_block_reserve_slot(tag, (uint8)PCM_TRANS_N_TO_S, cluster_node_id, &request_id, false);
+	slot
+		= gcs_block_reserve_slot(tag, (uint8)PCM_TRANS_N_TO_S, cluster_node_id, &request_id, false);
 
 	PG_TRY();
 	{
 		ClusterGcsBlockBackendBlock *blk = gcs_block_my_block();
 		TimestampTz deadline;
+		bool stage_admitted;
 
 		LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
 		slot->reply_received = false;
@@ -7380,7 +7393,10 @@ gcs_block_undo_verdict_wire_exchange_trace_impl(
 		GcsBlockForwardPayloadSetExpectedPiWatermarkScn(&fwd, freshref_pair ? freshref_pair_scn
 																			: (SCN)(uint64)xid);
 
-		if (!gcs_block_stage_forward_wait(slot, dest_node, &fwd, NULL, NULL)) {
+		diagnostic.stage_started = true;
+		stage_admitted = gcs_block_stage_forward_wait(slot, dest_node, &fwd, NULL, NULL);
+		diagnostic.stage_result = stage_admitted;
+		if (!stage_admitted) {
 			if (authority_kind)
 				ereport(
 					ERROR,

@@ -53,7 +53,7 @@ CLUSTER_UNIT_CRYPTOHASH_O = $(top_builddir)/src/common/cryptohash.o \
 endif
 
 # Test source files (each becomes a standalone executable)
-TESTS = test_cluster_relmap_lock test_cluster_vm_read_visibility test_cluster_heap_maintenance test_cluster_vacuum_shared_mx test_cluster_heap_cr_reuse test_cluster_buffer_cr test_cluster_buffer_mapping test_cluster_pi_contribution_stream test_cluster_drop_work test_cluster_smgr_drop test_cluster_shared_fs_drop test_cluster_shared_fs_cold_drop test_cluster_formation_restart test_cluster_basic test_cluster_version test_cluster_backend_types test_cluster_port_runtime test_cluster_relation_size test_cluster_vacuum_proof_cleanup test_cluster_heap_hot_full_trace test_cluster_gcs_read_image_hops test_cluster_r4_tx_rpc_slots test_cluster_gcs_read_image_trace \
+TESTS = test_cluster_relmap_lock test_cluster_vm_read_visibility test_cluster_heap_maintenance test_cluster_vacuum_shared_mx test_cluster_heap_cr_reuse test_cluster_buffer_cr test_cluster_buffer_mapping test_cluster_pi_contribution_stream test_cluster_drop_work test_cluster_smgr_drop test_cluster_shared_fs_drop test_cluster_shared_fs_cold_drop test_cluster_formation_restart test_cluster_basic test_cluster_version test_cluster_backend_types test_cluster_port_runtime test_cluster_relation_size test_cluster_vacuum_proof_cleanup test_cluster_heap_hot_full_trace test_cluster_gcs_read_image_hops test_cluster_r4_tx_rpc_slots test_cluster_ordinary_tt_diagnostic test_cluster_gcs_read_image_trace \
         test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_relmap test_cluster_initdb_config test_cluster_initdb_origin test_cluster_initdb_common test_cluster_catalog_manifest test_cluster_catalog_init test_cluster_catalog_startup test_cluster_initdb_tree test_cluster_initdb_cohort \
         test_pgrac_control_binding test_pgrac_protected_set test_pgrac_fenced_drain test_pgrac_fenced_pacemaker test_pgrac_fenced_cib \
         test_pgrac_fenced_map_filter test_pgrac_fenced_drain_sign_filter \
@@ -553,7 +553,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_side_xact test_cluster_pi_contribution
 SIMPLE_TESTS := $(filter-out test_cluster_side_online_owner test_cluster_remote_xact_writer,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_r4_tx_enqueue,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_tx_exit_dispatch,$(SIMPLE_TESTS))
-SIMPLE_TESTS := $(filter-out test_cluster_r4_tx_rpc_slots,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_r4_tx_rpc_slots test_cluster_ordinary_tt_diagnostic,$(SIMPLE_TESTS))
 # PGRAC: real configuration object tests have their own link rule.
 # Author: SqlRush <sqlrush@gmail.com>
 SIMPLE_TESTS := $(filter-out test_cluster_shared_config,$(SIMPLE_TESTS))
@@ -13215,6 +13215,31 @@ test_cluster_r4_tx_rpc_slots: test_cluster_r4_tx_rpc_slots.c \
 		$(top_builddir)/src/port/libpgport_srv.a
 	$(CC) $(CFLAGS) $(PTHREAD_CFLAGS) $(CPPFLAGS) -DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
 		$< $(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# Ordinary TT requester diagnostics: original private types and exchange bodies.
+test_cluster_ordinary_tt_types.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c $(srcdir)/Makefile
+	awk '/^typedef struct (GcsFirstFillReceipt|ClusterGcsBlockOutstandingSlot|ClusterGcsBlockBackendBlock|GcsFreshrefPairExchangeDiagnostic) / { emit=1; types++ } \
+	     emit { print } emit && /^} (GcsFirstFillReceipt|ClusterGcsBlockOutstandingSlot|ClusterGcsBlockBackendBlock|GcsFreshrefPairExchangeDiagnostic);$$/ { emit=0 } \
+	     END { if (types != 4 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_ordinary_tt_diagnostic.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c $(srcdir)/Makefile
+	awk '/^gcs_block_slot_clear_current_mx_expectation\(/ { print "static void"; emit=1; mx++ } \
+	     /^gcs_block_reserve_slot\(/ { print "static ClusterGcsBlockOutstandingSlot *"; emit=1; reserves++ } \
+	     /^gcs_block_clear_slot_locked\(/ { print "static void"; emit=1; clears++ } \
+	     /^gcs_block_release_slot\(/ { print "static void"; emit=1; releases++ } \
+	     /^gcs_block_compute_checksum\(/ { print "static uint32"; emit=1; checksums++ } \
+	     /^gcs_ordinary_verdict_refusal\(/ { print "static void"; emit=1; ordinary++ } \
+	     /^gcs_freshref_pair_log_refusal\(/ { print "static void"; emit=1; freshrefs++ } \
+	     /^gcs_block_undo_verdict_wire_exchange_trace_impl\(/ { print "static bool"; emit=1; exchanges++ } \
+	     emit { print } emit && /^}$$/ { emit=0 } \
+	     END { if (mx != 1 || reserves != 1 || clears != 1 || releases != 1 || checksums != 1 || ordinary != 1 || freshrefs != 1 || exchanges != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_ordinary_tt_diagnostic: test_cluster_ordinary_tt_diagnostic.c unit_test.h \
+		test_cluster_ordinary_tt_types.inc test_cluster_ordinary_tt_diagnostic.inc \
+		$(top_builddir)/src/port/libpgport_srv.a
+	$(CC) $(CFLAGS) $(PTHREAD_CFLAGS) $(CPPFLAGS) $< $(top_builddir)/src/port/libpgport_srv.a -o $@
 
 # Exact original HOT FULL-cycle/validated readers; same fixture also builds parent.
 test_cluster_heap_hot_full_trace.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
