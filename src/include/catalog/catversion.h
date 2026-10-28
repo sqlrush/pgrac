@@ -729,7 +729,7 @@
 /* Explicit root subtree ACKs change volatile origin stride; fresh clusters only. */
 /* Retained root and parent certificate notices/per-child phase IDs change
  * participant stride. Explicit wire6; fresh homogeneous clusters only. */
-#define CATALOG_VERSION_NO 202610285
+#define CATALOG_VERSION_NO 202610286
 
 /* spec-5.13 (2026-06-27): clean-leave catalog surface — cluster_get_clean_leave_state
  * SRF (oid 8960) + pg_cluster_clean_leave_state view + pg_cluster_clean_leave_request

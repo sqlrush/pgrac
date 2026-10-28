@@ -19775,6 +19775,7 @@ gcs_block_land_delegation_merge_reply(const ClusterICEnvelope *env,
 	ClusterCtrcLocalReleaseAckV1 ignored_ack;
 	ClusterCtrcDelegatedSubtreeAckV1 subtree_ack;
 	bool subtree = page[4] == CLUSTER_CTRC_SUBTREE_ACK_WIRE_VERSION;
+	bool certificate = page[4] == CLUSTER_CTRC_DELEGATION_CERTIFICATE_WIRE_VERSION;
 	ClusterSemanticAdmissionToken admission = { 0 };
 	ClusterUndoBlock0ResolvedRoot root;
 	ClusterUndoBlock0LogicalKey logical;
@@ -19788,16 +19789,21 @@ gcs_block_land_delegation_merge_reply(const ClusterICEnvelope *env,
 		|| !cluster_membership_is_member(cluster_node_id)
 		|| !cluster_membership_is_member((int32)env->source_node_id)
 		|| (cluster_write_fence_enforcing() && !cluster_write_fence_allowed())
-		|| !cluster_ctrc_participant_delegated_close_snapshot_shared(outer->request_id,
-			(uint16)env->source_node_id, &request)
+		|| !(certificate
+			? cluster_ctrc_participant_delegated_certificate_snapshot_shared(outer->request_id,
+				(uint16)env->source_node_id, &request)
+			: cluster_ctrc_participant_delegated_close_snapshot_shared(outer->request_id,
+				(uint16)env->source_node_id, &request))
 		|| request.key.system_identifier != GetSystemIdentifier()
 		|| request.key.cluster_epoch != outer->epoch
-		|| !cluster_ctrc_delegation_close_encode_v1(&request, bytes, sizeof(bytes))
+		|| !(certificate ? cluster_ctrc_delegation_certificate_encode_v1(&request, bytes, sizeof(bytes))
+			: cluster_ctrc_delegation_close_encode_v1(&request, bytes, sizeof(bytes)))
 		|| (subtree
 			? !cluster_ctrc_delegated_ack_reply_decode(page, GCS_BLOCK_DATA_SIZE, &request, &subtree_ack)
 			: (!cluster_ctrc_seal_reply_decode(page, GCS_BLOCK_DATA_SIZE, bytes, sizeof(bytes),
 				(int32)env->source_node_id, cluster_node_id, &header, &ignored_ack)
-				|| header.result != CTRC_SEAL_REPLY_DELEGATION_MERGED)))
+				|| header.result != (certificate ? CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED
+					: CTRC_SEAL_REPLY_DELEGATION_MERGED))))
 		return;
 	self_boot = cluster_qvotec_get_self_incarnation();
 	if (self_boot == 0 || self_boot != request.parent.boot_incarnation
@@ -19829,7 +19835,9 @@ gcs_block_land_delegation_merge_reply(const ClusterICEnvelope *env,
 			&& cluster_semantic_activation_recheck_r4_terminal_census(&admission)
 			&& cluster_sf_peer_capability_generation_matches(request.receiver.node_id, required, connection)
 			&& cluster_semantic_activation_recheck_r4_terminal_census(&admission)) {
-			if (subtree)
+			if (certificate)
+				(void)cluster_ctrc_participant_delegated_certificate_land_shared(&request);
+			else if (subtree)
 				(void)cluster_ctrc_participant_delegated_ack_land_shared(&request, &subtree_ack);
 			else
 				(void)cluster_ctrc_participant_delegation_merge_land_shared(&request);
@@ -19969,10 +19977,12 @@ gcs_block_try_land_ctrc_reply(const ClusterICEnvelope *env, const void *payload)
 		return true;
 	}
 
-	/* Wire6 is notification custody only. Consume its negative replies here;
-	 * no origin correlation, child completion or retirement is inferred. */
-	if (page[4] == CLUSTER_CTRC_DELEGATION_CERTIFICATE_WIRE_VERSION && page[5] == 0)
+	/* Wire6 completion belongs only to the retained immediate parent, never
+	 * to the origin's original136 request correlation. */
+	if (page[4] == CLUSTER_CTRC_DELEGATION_CERTIFICATE_WIRE_VERSION && page[5] == 0) {
+		gcs_block_land_delegation_merge_reply(env, outer, page);
 		return true;
+	}
 
 	MemSet(&key, 0, sizeof(key));
 	MemSet(&identity, 0, sizeof(identity));
@@ -20652,10 +20662,12 @@ gcs_block_try_ctrc_forward136(const ClusterICEnvelope *env, const void *payload)
 				if ((result == CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK
 						|| result == CTRC_SEAL_REPLY_DELEGATION_MERGED
 						|| result == CTRC_SEAL_REPLY_DELEGATION_SUBTREE_ACK
-						|| result == CTRC_SEAL_REPLY_ROOT_SUBTREE_ACK)
+						|| result == CTRC_SEAL_REPLY_ROOT_SUBTREE_ACK
+						|| (certificate && result == CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED))
 					&& (!cluster_semantic_activation_recheck_r4_terminal_census(&admission)
 						|| ((result == CTRC_SEAL_REPLY_DELEGATION_SUBTREE_ACK
-							|| result == CTRC_SEAL_REPLY_ROOT_SUBTREE_ACK)
+							|| result == CTRC_SEAL_REPLY_ROOT_SUBTREE_ACK
+							|| (certificate && result == CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED))
 							&& (((int32)env->source_node_id == cluster_node_id
 									? (cluster_ic_local_capability_word() & required_capabilities) != required_capabilities
 									: !cluster_sf_peer_capability_generation_matches((int32)env->source_node_id,

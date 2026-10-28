@@ -223,6 +223,12 @@ typedef enum ClusterCtrcReleaseDisposition {
 	CTRC_RELEASE_CLEANED_SUCCESSOR_REPLACED = 4
 } ClusterCtrcReleaseDisposition;
 
+/* Receipt retirement is separate from accepted-parent/tree custody. */
+typedef enum ClusterCtrcDelegationCertificateState {
+	CTRC_DELEGATION_CERTIFICATE_NONE = 0,
+	CTRC_DELEGATION_RECEIPTS_RECLAIMED = 1
+} ClusterCtrcDelegationCertificateState;
+
 typedef enum ClusterCtrcParticipantState {
 	CTRC_PARTICIPANT_EMPTY = 0,
 	CTRC_PARTICIPANT_OPEN,
@@ -494,6 +500,10 @@ typedef struct ClusterCtrcParticipantEntry {
 	 * Neither is a child completion or permission to retire custody. */
 	uint64 parent_certificate_request_id;
 	uint64 delegation_certificate_request_id[CLUSTER_CTRC_MAX_PARTICIPANTS];
+	/* Counts/ACK remain immutable historical proof after receipt reclamation.
+	 * Parent/path/children remain occupied until the original owner retires them. */
+	uint32 delegation_certificate_state;
+	uint32 delegation_certificate_confirmed_bitmap;
 } ClusterCtrcParticipantEntry;
 
 typedef struct ClusterCtrcReceipt {
@@ -1273,6 +1283,11 @@ extern bool cluster_ctrc_participant_next_delegated_close_shared(
  * CERTIFICATE after notice. The output phase is never inferred from an ID. */
 extern bool cluster_ctrc_participant_next_delegated_dispatch_shared(
 	ClusterCtrcDelegationCloseV1 *request_out, bool *certificate_out);
+extern bool cluster_ctrc_participant_delegated_certificate_snapshot_shared(uint64 request_id,
+	uint16 source_node, ClusterCtrcDelegationCloseV1 *request_out);
+/* Protected original wire6 completion only; no edge or origin retirement. */
+extern bool cluster_ctrc_participant_delegated_certificate_land_shared(
+	const ClusterCtrcDelegationCloseV1 *request);
 extern bool cluster_ctrc_participant_delegated_certificate_matches_shared(
 	const ClusterCtrcDelegationCloseV1 *request);
 extern bool cluster_ctrc_participant_delegated_close_matches_shared(

@@ -9204,11 +9204,11 @@ test_cluster_ctrc_delegation_reply.inc: $(top_srcdir)/src/backend/cluster/cluste
 test_cluster_ctrc_delegation_close: test_cluster_ctrc_delegation_close.c test_cluster_ctrc_dispatch.c \
 		test_cluster_ctrc_cleaner.c test_cluster_ctrc_dispatch.inc test_cluster_ctrc_delegation_close.inc \
 		test_cluster_ctrc_run_pass.inc test_cluster_ctrc_delegation_forward.inc \
-		test_cluster_ctrc_delegation_reply.inc unit_test.h $(CLUSTER_SCN_O) $(CLUSTER_UBA_O) \
+		test_cluster_ctrc_delegation_reply.inc unit_test.h $(CLUSTER_SCN_O) $(CLUSTER_UBA_O) $(top_builddir)/src/backend/cluster/cluster_xid_stripe.o \
 		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
 		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
-		$(CLUSTER_SCN_O) $(CLUSTER_UBA_O) $(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(CLUSTER_SCN_O) $(CLUSTER_UBA_O) $(top_builddir)/src/backend/cluster/cluster_xid_stripe.o $(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
 		$(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
 
 test_cluster_ctrc_dispatch.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
