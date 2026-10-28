@@ -23,7 +23,7 @@ static RfPageStableGraphRequestV1 prefix_graph[2];
 static RfContributorVectorV1 prefix_contributors[2];
 static RfPageStableEdgeInputV1 prefix_edges[2];
 static PGAlignedBlock prefix_images[2];
-static unsigned prefix_steps, prefix_proofs, prefix_pages, prefix_destroyed;
+static unsigned prefix_steps, prefix_proofs, prefix_pages, prefix_destroyed, prefix_records;
 static unsigned pending_readback_calls;
 static unsigned prefix_proof_token, prefix_page_token;
 static uint32 prefix_source_ordinal;
@@ -38,7 +38,7 @@ static void
 page_prefix_fixture_reset(void)
 {
  pending_storage_fixture_reset();
- prefix_count = prefix_steps = prefix_proofs = prefix_pages = prefix_destroyed = 0;
+ prefix_count = prefix_steps = prefix_proofs = prefix_pages = prefix_destroyed = prefix_records = 0;
  prefix_source_ordinal = 0;
  prefix_error = prefix_wait = prefix_unchanged = prefix_bad_physical = prefix_insert_refuse = false;
  prefix_legacy_synced = false; prefix_durable_steps = 0;
@@ -144,7 +144,7 @@ prefix_publish_window(const struct ClusterRecoveryStartV1 *start,
  UT_ASSERT(stamp_fpi_image_matches(&owner, &fpi));
  UT_ASSERT(stamp_prepare(&owner, CLUSTER_RECOVERY_STAMP_FPI,
   (const uint8 *)&fpi, sizeof(fpi), &out->window));
- out->record_start = owner.writer.startup_first_lsn + 40000;
+ out->record_start = owner.writer.startup_first_lsn + 40000 + 128 * prefix_records++;
  out->record_end = out->record_start + 128;
  CritSectionCount++;
  inserted = cluster_recovery_stamp_inserting_v1(&out->window)
@@ -248,7 +248,8 @@ prefix_service_wait(void)
 UT_TEST(test_actual_startup_retains_first_inserted_page_before_service)
 {
  volatile bool caught = false;
- ctrc_handoff_fixture(false, false); prefix_setup_targets(); ctrc_wait_step = prefix_service_wait;
+ ctrc_handoff_fixture(false, false); prefix_setup_targets(); prefix_count = 1;
+ ctrc_wait_step = prefix_service_wait;
  PG_TRY(); { actual_startup_finish_tx(&info); } PG_CATCH(); { caught = true; } PG_END_TRY();
  UT_ASSERT(caught); UT_ASSERT_EQ(prefix_steps, 1);
  UT_ASSERT_EQ(observation_scope_releases + observation_census_destroys, 0);

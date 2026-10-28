@@ -13897,3 +13897,6 @@ test_cluster_ctrc_local_empty: test_cluster_ctrc_local_empty.c test_cluster_ctrc
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) \
 		$(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
+
+# PGRAC: original Startup FPI retirement and retained per-target custody.
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_fpi_retirement.inc

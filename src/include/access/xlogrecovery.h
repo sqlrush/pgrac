@@ -241,6 +241,14 @@ extern bool ClusterColdRecoveryCtrcPagePlanPrepare(const struct ClusterRecoveryS
  * A true result is only a retained prefix, never discharge or service COMPLETE. */
 extern bool ClusterColdRecoveryCtrcPageAdvance(const struct ClusterRecoveryStartV1 *start,
 	Size memory_budget);
+/* Retire exact durable FPI operations only after original protected readback
+ * and complete owner/source/current/local-debt checks. Retain each full result
+ * and its original raw FD on the same Start until original cleanup. All result
+ * slots count against memory_budget before the first PAGE/FPI; zero budget
+ * only continues existing progress. No replay pin/history release, independent
+ * or joint service COMPLETE, relmap acceptance or OPEN is granted. */
+extern bool ClusterColdRecoveryCtrcPageDrain(const struct ClusterRecoveryStartV1 *start,
+	Size memory_budget);
 extern const struct RfPageOnlinePlanV1 *ClusterColdRecoveryCtrcPagePlan(
 	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work);
 /* Original complete generation vector in the SAME sealed graph's participant
