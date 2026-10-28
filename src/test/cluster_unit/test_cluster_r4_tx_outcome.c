@@ -208,6 +208,7 @@ static int test_operation_acquire_failure_call;
 static int test_operation_pin_depth;
 static int test_operation_release_pending_call;
 static int test_operation_release_poll_count;
+static bool test_operation_release_poll_failed;
 static int test_operation_release_wait_count;
 static void (*test_operation_release_observer)(void);
 static bool test_operation_cr_revoke_on_decision;
@@ -1339,6 +1340,8 @@ cluster_undo_block0_current_release_poll(ClusterUndoBlock0CurrentGuard *guard pg
 {
 	if (test_operation_release_pending_call != 0) {
 		test_operation_release_poll_count++;
+		if (test_operation_release_poll_failed)
+			return CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
 		return test_operation_release_poll_count == 1 ? CLUSTER_UNDO_BLOCK0_CURRENT_PENDING
 													  : CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED;
 	}
@@ -1499,6 +1502,7 @@ reset_exact_origin_fixture(void)
 	test_operation_pin_depth = 0;
 	test_operation_release_pending_call = 0;
 	test_operation_release_poll_count = 0;
+	test_operation_release_poll_failed = false;
 	test_operation_release_wait_count = 0;
 	test_operation_release_observer = NULL;
 	test_operation_cr_revoke_on_decision = false;
@@ -7562,11 +7566,31 @@ UT_TEST(test_retained_slot_identity_does_not_escape_original_final_fences)
 #include "test_cluster_savepoint_origin_plan.inc"
 #include "test_cluster_savepoint_origin_driver.inc"
 #include "test_cluster_savepoint_cr_consumer.inc"
+#include "test_cluster_savepoint_origin_poll.inc"
 
 int
 main(void)
 {
-	UT_PLAN(256);
+	UT_PLAN(275);
+	UT_RUN(test_operation_poll_does_not_complete_inline);
+	UT_RUN(test_operation_poll_stages_outputs);
+	UT_RUN(test_operation_poll_same_and_cross_segment_complete);
+	UT_RUN(test_operation_poll_pending_acquire_never_waits);
+	UT_RUN(test_operation_poll_pending_release_is_not_complete);
+	UT_RUN(test_operation_poll_preserves_active_and_post_top_discard);
+	UT_RUN(test_operation_poll_copies_begin_inputs);
+	UT_RUN(test_operation_poll_cancel_every_phase);
+	UT_RUN(test_operation_poll_cancel_pending_guard);
+	UT_RUN(test_operation_poll_cold_data_is_resident_only);
+	UT_RUN(test_operation_poll_release_and_final_fences);
+	UT_RUN(test_operation_poll_stale_data_and_malformed_record);
+	UT_RUN(test_operation_poll_current_failures);
+	UT_RUN(test_operation_poll_error_cleanup_is_terminal);
+	UT_RUN(test_operation_poll_rebegin_does_not_lose_guard);
+	UT_RUN(test_operation_poll_duplicate_completion_cannot_publish);
+	UT_RUN(test_operation_poll_release_poll_failure_detaches);
+	UT_RUN(test_operation_poll_invalid_inputs_do_not_acquire);
+	UT_RUN(test_operation_poll_invalid_output_cancels_active);
 	UT_RUN(test_operation_head_without_backend_binding);
 	UT_RUN(test_operation_head_unknown_tt_wrap);
 	UT_RUN(test_operation_head_prior_owner_and_role_wrap);

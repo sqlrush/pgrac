@@ -228,13 +228,48 @@ extern ClusterTxOutcome cluster_runtime_visibility_origin_plan_copy_operation_he
 	ClusterSavepointReaderRecord *operation_out, char data_out[BLCKSZ],
 	ClusterTxResolveReason *reason_out);
 
+/* Process-local, address-stable continuation. Zero-initialize before begin;
+ * never copy/move it while active. The caller retains its original admission
+ * and reader/retention scope until completion or cancellation. Inputs are
+ * copied at begin; a NULL expected selects the immutable head/tag challenge.
+ * Poll advances one bounded current step, never waits/sleeps or fills cold
+ * DATA. Pending/refusal clear metadata and leave data_out unchanged. Complete
+ * consumes the state and publishes only after final release/admission.
+ * Cancel is idempotent, detaches an active guard through original no-wait
+ * cleanup, and grants no physical-retirement proof. ERROR cancels/rethrows.
+ * This is an origin lifecycle, not a whole-page or tuple visibility verdict. */
+#define CLUSTER_RUNTIME_VISIBILITY_OPERATION_READ_BYTES 18432
+typedef union ClusterRuntimeVisibilityOperationRead {
+	uint64 align;
+	uint8 opaque[CLUSTER_RUNTIME_VISIBILITY_OPERATION_READ_BYTES];
+} ClusterRuntimeVisibilityOperationRead;
+
+typedef enum ClusterRuntimeVisibilityOperationStep {
+	CLUSTER_RUNTIME_VISIBILITY_OPERATION_FAILED = 0,
+	CLUSTER_RUNTIME_VISIBILITY_OPERATION_PENDING,
+	CLUSTER_RUNTIME_VISIBILITY_OPERATION_COMPLETE
+} ClusterRuntimeVisibilityOperationStep;
+
+extern bool cluster_runtime_visibility_operation_origin_read_begin(
+	ClusterRuntimeVisibilityOperationRead *read, const ClusterTxLocator *locator,
+	const ClusterSavepointOperation *expected, const ClusterItlSlotData *head, const BufferTag *tag,
+	ClusterTxResolveMode mode, const ClusterSemanticAdmissionToken *admission,
+	ClusterTxResolveReason *reason_out);
+extern ClusterRuntimeVisibilityOperationStep cluster_runtime_visibility_operation_origin_read_poll(
+	ClusterRuntimeVisibilityOperationRead *read, ClusterSavepointReaderIdentity *identity_out,
+	ClusterTxResolution *top_out, ClusterSavepointReaderRecord *operation_out,
+	char data_out[BLCKSZ], ClusterTxResolveReason *reason_out);
+extern void cluster_runtime_visibility_operation_origin_read_cancel(
+	ClusterRuntimeVisibilityOperationRead *read);
+
 /* Synchronous local-origin owner for the explicit operation plan. It performs
  * three original SCUR acquisitions, releases every phase and stages outputs
  * through final release/admission. Cold DATA uses the original pool only in
  * DATA phases; no pin/guard spans the TT sample. Caller owns independent
  * expected identity and reader/retention scope. Foreign requests remain
  * UNKNOWN until an operation-aware peer consumer exists; no ordinary RPC
- * fallback may discard disposition. LMS uses the split held entries above. */
+ * fallback may discard disposition. It drives the same continuation with
+ * original event waits and synchronous-only cold DATA read-through. */
 extern ClusterTxOutcome cluster_runtime_visibility_resolve_operation_origin_admitted(
 	const ClusterTxLocator *locator, const ClusterSavepointOperation *expected,
 	ClusterTxResolveMode mode, const ClusterSemanticAdmissionToken *admission,

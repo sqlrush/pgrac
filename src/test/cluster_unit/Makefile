@@ -7545,7 +7545,7 @@ test_cluster_operation_cr_entry.inc: $(top_srcdir)/src/backend/cluster/cluster_c
 test_cluster_r4_tx_outcome: test_cluster_r4_tx_outcome.c unit_test.h \
 		test_cluster_savepoint_origin_plan.inc $(CLUSTER_SAVEPOINT_READER_O) \
 		test_cluster_savepoint_origin_driver.inc \
-		test_cluster_savepoint_cr_consumer.inc \
+		test_cluster_savepoint_cr_consumer.inc test_cluster_savepoint_origin_poll.inc \
 		test_cluster_hot_bufpage_product.o test_cluster_operation_cr_entry.inc \
 		$(top_builddir)/src/backend/cluster/cluster_cr_apply.o \
 		$(top_srcdir)/src/include/cluster/cluster_cr.h \
