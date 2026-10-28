@@ -2,13 +2,17 @@
  * S4, ROOT I/O, scheduling and authority freshness are fixture boundaries.
  * Author: SqlRush <sqlrush@gmail.com> */
 #include "postgres.h"
+#include <sys/stat.h>
+#include <unistd.h>
 #include "unit_test.h"
 #include "access/xlogrecovery.h"
 #include "catalog/pg_control.h"
 #include "cluster/cluster_wal_writer.h"
 #include "cluster/cluster_config_members.h"
+#include "cluster/cluster_recovery_merge.h"
 #include "storage/latch.h"
 #include "storage/lwlock.h"
+#include "utils/resowner.h"
 #include "../../backend/cluster/cluster_control_root_private.h"
 
 /* Reuse leaf fixtures without replacing the CF owner or shared registry. */
@@ -73,6 +77,8 @@ static void (*entry_on_wait)(void);
 static bool entry_clean_consumer;
 static unsigned entry_read_timeouts, entry_read_result;
 static uint64 entry_read_cookie;
+static bool claim_teardown;
+static void (*claim_on_reset)(void);
 static uint64 entry_timeout(LOCKMODE mode);
 
 void
@@ -140,6 +146,8 @@ ResetLatch(Latch *latch)
 {
 	UT_ASSERT(latch == MyLatch);
 	++entry_resets;
+	if (claim_on_reset != NULL)
+		claim_on_reset();
 	if (entry_ack_on_reset) {
 		entry_ack_on_reset = false;
 		UT_ASSERT(acknowledge_retirements());
@@ -148,6 +156,8 @@ ResetLatch(Latch *latch)
 int
 WaitLatch(Latch *latch, int events, long timeout, uint32 event)
 {
+	if (claim_teardown)
+		return entry_inherited_wait(latch, events, timeout, event);
 	UT_ASSERT(latch == MyLatch);
 	UT_ASSERT_EQ(events, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH);
 	UT_ASSERT_EQ(timeout, 20);
@@ -928,6 +938,471 @@ UT_TEST(startup_cf_clean_input_does_not_retry_real_root_refusal)
 	}
 }
 
+/* The CF owner, registry, consumer and custody declaration are production
+ * bodies. File/claim validation is the leaf here; test_cluster_merge_claim
+ * separately exercises the original validators against real private files. */
+ResourceOwner CurrentResourceOwner = (ResourceOwner)1;
+static bool claim_files_current = true;
+static bool pg_attribute_unused() merge_claim_waiter_current(void);
+static bool pg_attribute_unused() merge_claim_custody_current(void);
+static void (*claim_after_acquire)(void);
+static bool
+claim_actual_cf_lock(LOCKMODE mode)
+{
+	bool granted = cluster_cf_lock(mode);
+
+	if (granted && claim_after_acquire != NULL)
+		claim_after_acquire();
+	return granted;
+}
+#define cluster_cf_lock claim_actual_cf_lock
+#include "test_cluster_merge_cf_entry.inc"
+#undef cluster_cf_lock
+static bool
+merge_claim_waiter_current(void)
+{
+	return claim_files_current && merge_claim_custody.owner == CurrentResourceOwner
+		   && merge_claim_custody.pid == getpid()
+		   && merge_claim_custody.boot == control_creator.incarnation
+		   && merge_claim_custody.serial == merge_claim_serial;
+}
+static bool
+merge_claim_custody_current(void)
+{
+	return merge_claim_waiter_current();
+}
+
+static unsigned claim_acquires;
+static uint64 claim_retiring_cookie;
+static void
+claim_ready_after_original_ack(void)
+{
+	UT_ASSERT_EQ(g_seven_count, claim_acquires + 1);
+	UT_ASSERT(!cluster_cf_held_is_usable(ExclusiveLock));
+	UT_ASSERT_EQ(cf_hold_x.owner.state, CLUSTER_LOCK_OWNER_RETIRING);
+	if (claim_retiring_cookie == 0)
+		claim_retiring_cookie = cluster_cf_owner_cookie(ExclusiveLock);
+	UT_ASSERT_EQ(cluster_cf_owner_cookie(ExclusiveLock), claim_retiring_cookie);
+	UT_ASSERT(!cluster_cf_release_completed(ExclusiveLock, claim_retiring_cookie));
+	if (entry_waits == entry_ack_at) {
+		g_next_request_id++;
+		g_seven_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	}
+}
+static void
+claim_fixture(bool held)
+{
+	entry_fixture(true);
+	claim_on_reset = NULL;
+	claim_after_acquire = NULL;
+	merge_claim_held = held;
+	memset(&merge_claim_custody, 0, sizeof(merge_claim_custody));
+	merge_claim_custody.owner = CurrentResourceOwner;
+	merge_claim_custody.pid = getpid();
+	merge_claim_custody.boot = control_creator.incarnation;
+	merge_claim_custody.serial = ++merge_claim_serial;
+	merge_claim_custody.fd = 100;
+	merge_claim_custody.directory_fd = 101;
+	claim_files_current = true;
+	claim_acquires = g_seven_count;
+	claim_retiring_cookie = 0;
+	g_next_request_id++;
+	entry_on_wait = claim_ready_after_original_ack;
+}
+static bool
+claim_call(uint64 *cookie)
+{
+	volatile bool completed = false;
+
+	PG_TRY();
+	{
+		*cookie = merge_claim_cf_enter();
+		completed = true;
+	}
+	PG_CATCH();
+	{
+		FlushErrorState();
+	}
+	PG_END_TRY();
+	return completed;
+}
+static void
+claim_cleanup(uint64 cookie)
+{
+	bool ack_on_wait = owner_ack_on_wait;
+
+	if (cookie == 0)
+		cookie = cluster_cf_owner_cookie(ExclusiveLock);
+	entry_on_wait = NULL;
+	claim_on_reset = NULL;
+	if (cookie == 0) {
+		UT_ASSERT(!cluster_cf_held(ExclusiveLock) && cluster_control_request_empty());
+		return;
+	}
+	claim_teardown = owner_ack_on_wait = true;
+	if (cluster_cf_held_is_usable(ExclusiveLock))
+		(void)cluster_cf_unlock_confirmed(ExclusiveLock);
+	entry_cleanup(ExclusiveLock, cookie);
+	claim_teardown = false;
+	owner_ack_on_wait = ack_on_wait;
+}
+UT_TEST(startup_claim_cf_wait_retires_before_reacquiring)
+{
+	for (unsigned held = 0; held < 2; held++) {
+		uint64 cookie = 0;
+		bool completed;
+
+		claim_fixture(held);
+		completed = claim_call(&cookie);
+		UT_ASSERT(completed);
+		UT_ASSERT_EQ(entry_waits, 3);
+		UT_ASSERT_EQ(g_seven_count, claim_acquires + 2);
+		UT_ASSERT_EQ(merge_claim_held, held);
+		if (completed) {
+			UT_ASSERT(cookie != 0 && cookie != claim_retiring_cookie);
+			UT_ASSERT(cluster_cf_held_is_clusterwide(ExclusiveLock));
+			UT_ASSERT(cluster_cf_release_completed(ExclusiveLock, claim_retiring_cookie));
+		}
+		claim_cleanup(cookie);
+	}
+}
+
+static void
+claim_empty_grant(void)
+{
+	UT_ASSERT(!cluster_cf_held(ExclusiveLock) && cluster_control_request_empty());
+	UT_ASSERT_EQ(g_seven_count, claim_acquires + 1);
+	g_seven_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	g_next_request_id++;
+}
+UT_TEST(startup_claim_cf_prepublication_wait_has_no_cleanup_authority)
+{
+	uint64 cookie = 0;
+
+	claim_fixture(false);
+	fail_after_publication = false;
+	entry_on_wait = claim_empty_grant;
+	UT_ASSERT(claim_call(&cookie));
+	UT_ASSERT_EQ(entry_waits, 1);
+	UT_ASSERT_EQ(g_seven_count, claim_acquires + 2);
+	UT_ASSERT(cookie != 0 && cluster_cf_held_is_clusterwide(ExclusiveLock));
+	claim_cleanup(cookie);
+}
+
+UT_TEST(startup_claim_cf_hard_native_and_stale_observations_do_not_retry)
+{
+	for (unsigned fault = 0; fault < 5; fault++) {
+		uint64 cookie = 0;
+
+		claim_fixture(false);
+		switch (fault) {
+		case 0:
+			g_seven_result = CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+			break;
+		case 1:
+			g_timeout_detail.source = CLUSTER_GES_TSRC_NONE;
+			break;
+		case 2:
+			g_seven_result = CLUSTER_LOCK_ACQUIRE_OK_NATIVE;
+			cluster_shared_config = false;
+			break;
+		case 3: {
+			uint64 old = entry_timeout(ExclusiveLock);
+			entry_cleanup(ExclusiveLock, old);
+			claim_acquires = g_seven_count;
+			g_next_request_id++;
+			g_seven_result = CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+			break;
+		}
+		case 4:
+			fail_after_publication = false;
+			g_seven_result = CLUSTER_LOCK_ACQUIRE_NOT_AVAIL;
+			break;
+		}
+		UT_ASSERT(!claim_call(&cookie));
+		UT_ASSERT_EQ(entry_code, ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED);
+		UT_ASSERT_EQ(entry_waits, 0);
+		UT_ASSERT_EQ(g_seven_count, claim_acquires + 1);
+		UT_ASSERT_EQ(cookie, 0);
+		claim_cleanup(cookie);
+	}
+}
+
+UT_TEST(startup_claim_cf_preexisting_slot_is_never_adopted)
+{
+	for (unsigned fault = 0; fault < 5; fault++) {
+		uint64 cookie = 0, retiring;
+		CfHoldState saved;
+
+		claim_fixture(false);
+		retiring = entry_timeout(ExclusiveLock);
+		saved = cf_hold_x;
+		switch (fault) {
+		case 0: /* Even a valid old cleanup slot is not this acquire's wait. */
+			break;
+		case 1:
+			cf_hold_x.release_pending = false;
+			cf_hold_x.owner.state = CLUSTER_LOCK_OWNER_HELD;
+			break;
+		case 2:
+			cf_hold_x.owner.state = CLUSTER_LOCK_OWNER_ACQUIRING;
+			break;
+		case 3:
+			cf_hold_x.caller = &cookie;
+			break;
+		case 4:
+			cf_hold_x.owner.request.control_owner_id = 0;
+			break;
+		}
+		UT_ASSERT(!claim_call(&cookie));
+		UT_ASSERT_EQ(entry_code, ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED);
+		UT_ASSERT_EQ(entry_waits | cookie, 0);
+		UT_ASSERT_EQ(g_seven_count, claim_acquires + 1);
+		cf_hold_x = saved; /* Undo fixture corruption, not product retirement. */
+		claim_cleanup(retiring);
+	}
+}
+
+static unsigned claim_fault;
+static CfHoldState claim_original_slot;
+static ClusterControlRequestView claim_original_record;
+static void
+claim_change_context(void)
+{
+	claim_ready_after_original_ack();
+	claim_original_slot = cf_hold_x;
+	claim_original_record = control_requests->records[cf_hold_x.owner.attempt.slot];
+	switch (claim_fault) {
+	case 0:
+		CurrentResourceOwner = (ResourceOwner)2;
+		break;
+	case 1:
+		merge_claim_custody.pid++;
+		break;
+	case 2:
+		merge_claim_custody.boot++;
+		break;
+	case 3:
+		merge_claim_custody.serial++;
+		break;
+	case 4:
+		merge_claim_serial++;
+		break;
+	case 5:
+		merge_claim_custody.fd++;
+		break;
+	case 6:
+		merge_claim_custody.directory_fd++;
+		break;
+	case 7:
+		merge_claim_custody.image.node++;
+		break;
+	case 8:
+		merge_claim_custody.path[0]++;
+		break;
+	case 9:
+		claim_files_current = false;
+		break;
+	case 10:
+		merge_claim_custody.revoked = true;
+		break;
+	case 11:
+		merge_claim_held = !merge_claim_held;
+		break;
+	case 12:
+		owner_epoch++;
+		break;
+	case 13:
+		owner_generation++;
+		break;
+	case 14:
+		entry_authority = false;
+		break;
+	case 15:
+		InRecovery = !InRecovery;
+		break;
+	case 16:
+		ShutdownRequestPending = true;
+		break;
+	case 17:
+		entry_native_lock = true;
+		break;
+	case 18:
+		CritSectionCount = 1;
+		break;
+	case 19:
+		cf_hold_x.owner.request.control_owner_id++;
+		break;
+	case 20:
+		cf_hold_x.owner.attempt.generation++;
+		break;
+	case 21:
+		control_requests->records[cf_hold_x.owner.attempt.slot].owner.incarnation++;
+		break;
+	case 22:
+		control_requests->records[cf_hold_x.owner.attempt.slot].message.key.holder.request_id++;
+		break;
+	case 23:
+		control_requests->records[cf_hold_x.owner.attempt.slot].state
+			= CLUSTER_CONTROL_REQUEST_INVALID;
+		break;
+	case 24:
+		MyProc = NULL;
+		break;
+	case 25:
+		MyLatch = NULL;
+		break;
+	case 26:
+		MyBackendType = B_LMON;
+		break;
+	case 27:
+		MyAuxProcType = CheckpointerProcess;
+		break;
+	case 28:
+		cf_hold_x.owner.cooperative_acquire = true;
+		break;
+	case 29:
+		cf_hold_x.release_pending = false;
+		break;
+	case 30:
+		cf_hold_x.owner.state = CLUSTER_LOCK_OWNER_ACQUIRING;
+		break;
+	}
+}
+UT_TEST(startup_claim_cf_wait_requalifies_actor_custody_and_exact_request)
+{
+	for (unsigned held = 0; held < 2; held++)
+		for (claim_fault = 0; claim_fault < 31; claim_fault++) {
+			uint64 cookie = 0, epoch = owner_epoch, generation = owner_generation;
+
+			claim_fixture(held);
+			entry_on_wait = claim_change_context;
+			UT_ASSERT(!claim_call(&cookie));
+			UT_ASSERT_EQ(entry_code, ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED);
+			UT_ASSERT_EQ(entry_waits, 1);
+			UT_ASSERT_EQ(g_seven_count, claim_acquires + 1);
+			UT_ASSERT_EQ(cookie, 0);
+			/* Restore only injected state before retiring the actual original. */
+			MyProc = &owner_proc;
+			MyLatch = &owner_proc.procLatch;
+			MyBackendType = B_STARTUP;
+			MyAuxProcType = StartupProcess;
+			CurrentResourceOwner = (ResourceOwner)1;
+			CritSectionCount = 0;
+			entry_native_lock = false;
+			owner_epoch = epoch;
+			owner_generation = generation;
+			cf_hold_x = claim_original_slot;
+			control_requests->records[cf_hold_x.owner.attempt.slot] = claim_original_record;
+			claim_cleanup(claim_retiring_cookie);
+		}
+}
+
+static void
+claim_remove_completion(void)
+{
+	claim_ready_after_original_ack();
+	UT_ASSERT(acknowledge_retirements());
+	cluster_cf_retirement_poll();
+	UT_ASSERT(!cluster_cf_held(ExclusiveLock));
+	UT_ASSERT(cluster_cf_release_completed(ExclusiveLock, claim_retiring_cookie));
+	cf_retired_x = 0; /* Fault injection: slot disappearance is not a receipt. */
+}
+UT_TEST(startup_claim_cf_missing_receipt_and_hard_cleanup_remain_errors)
+{
+	for (unsigned hard = 0; hard < 2; hard++) {
+		uint64 cookie = 0;
+
+		claim_fixture(false);
+		entry_on_wait = hard ? entry_hard_error : claim_remove_completion;
+		UT_ASSERT(!claim_call(&cookie));
+		UT_ASSERT_EQ(entry_waits, 1);
+		UT_ASSERT_EQ(g_seven_count, claim_acquires + 1);
+		UT_ASSERT_EQ(entry_code, hard ? ERRCODE_IO_ERROR : ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED);
+		UT_ASSERT_EQ(entry_level, hard ? ERROR : FATAL);
+		UT_ASSERT_EQ(cookie, 0);
+		if (!hard)
+			cf_retired_x = claim_retiring_cookie;
+		claim_cleanup(hard ? cluster_cf_owner_cookie(ExclusiveLock) : claim_retiring_cookie);
+	}
+}
+
+static void
+claim_ack_during_reset(void)
+{
+	claim_retiring_cookie = cluster_cf_owner_cookie(ExclusiveLock);
+	UT_ASSERT(acknowledge_retirements());
+	g_seven_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	g_next_request_id++;
+	claim_on_reset = NULL;
+}
+UT_TEST(startup_claim_cf_ack_race_and_lost_latch_still_make_progress)
+{
+	for (unsigned race = 0; race < 2; race++) {
+		uint64 cookie = 0;
+
+		claim_fixture(false);
+		entry_lost_latch = true;
+		if (race)
+			claim_on_reset = claim_ack_during_reset;
+		UT_ASSERT(claim_call(&cookie));
+		UT_ASSERT_EQ(entry_waits, race ? 0 : 3);
+		UT_ASSERT_EQ(g_seven_count, claim_acquires + 2);
+		UT_ASSERT(cluster_cf_held_is_clusterwide(ExclusiveLock));
+		UT_ASSERT(cookie != 0 && cookie != claim_retiring_cookie);
+		claim_cleanup(cookie);
+	}
+}
+
+static void
+claim_change_during_reacquire(void)
+{
+	UT_ASSERT(cluster_cf_held_is_clusterwide(ExclusiveLock));
+	merge_claim_custody.fd++;
+}
+UT_TEST(startup_claim_cf_reacquire_cannot_return_changed_custody)
+{
+	uint64 cookie = 0;
+
+	claim_fixture(false);
+	claim_after_acquire = claim_change_during_reacquire;
+	UT_ASSERT(!claim_call(&cookie));
+	UT_ASSERT_EQ(entry_code, ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED);
+	UT_ASSERT_EQ(entry_waits, 3);
+	UT_ASSERT_EQ(g_seven_count, claim_acquires + 2);
+	UT_ASSERT_EQ(cookie, 0);
+	UT_ASSERT(cluster_cf_held_is_clusterwide(ExclusiveLock));
+	claim_cleanup(0);
+}
+
+UT_TEST(startup_claim_cf_original_startup_cancel_retains_cleanup)
+{
+	uint64 cookie = 0;
+	volatile bool exited = false;
+
+	claim_fixture(false);
+	entry_on_wait = entry_shutdown;
+	startup_fixture_exit_hook = entry_owner_exit;
+	startup_fixture_armed = true;
+	if (sigsetjmp(startup_fixture_exit, 1) == 0)
+		UT_ASSERT(!claim_call(&cookie));
+	else
+		exited = true;
+	UT_ASSERT(exited);
+	UT_ASSERT_EQ(startup_fixture_exit_code, 1);
+	UT_ASSERT_EQ(entry_waits, 1);
+	UT_ASSERT_EQ(g_seven_count, claim_acquires + 1);
+	UT_ASSERT_EQ(cookie, 0);
+	UT_ASSERT(cluster_cf_held(ExclusiveLock) && !cluster_cf_held_is_usable(ExclusiveLock));
+	UT_ASSERT(control_requests->records[cf_hold_x.owner.attempt.slot].owner_exited);
+	PG_exception_stack = NULL;
+	error_context_stack = NULL;
+	proc_exit_inprogress = shutdown_requested = false;
+	startup_fixture_armed = false;
+	startup_fixture_exit_hook = NULL;
+	claim_cleanup(0);
+}
+
 int
 main(void)
 {
@@ -938,7 +1413,7 @@ main(void)
 	pg_atomic_init_u64(&owner_proc.cluster_grd_redeclare_acked_epoch, 0);
 	cluster_control_request_shmem_init();
 	retire_driver = cluster_control_request_driver_start();
-	UT_PLAN(15);
+	UT_PLAN(24);
 	UT_RUN(startup_cf_timeout_waits_for_exact_completion_before_begin);
 	UT_RUN(startup_cf_completion_does_not_preserve_changed_native_input);
 	UT_RUN(startup_cf_unsafe_native_context_never_takes_a_registry_lock);
@@ -954,6 +1429,15 @@ main(void)
 	UT_RUN(startup_cf_clean_input_waits_for_its_original_request_before_reread);
 	UT_RUN(startup_cf_clean_input_does_not_retry_real_root_refusal);
 	UT_RUN(startup_cf_clean_wait_rejects_changed_owner_or_retirement_identity);
+	UT_RUN(startup_claim_cf_wait_retires_before_reacquiring);
+	UT_RUN(startup_claim_cf_prepublication_wait_has_no_cleanup_authority);
+	UT_RUN(startup_claim_cf_hard_native_and_stale_observations_do_not_retry);
+	UT_RUN(startup_claim_cf_preexisting_slot_is_never_adopted);
+	UT_RUN(startup_claim_cf_wait_requalifies_actor_custody_and_exact_request);
+	UT_RUN(startup_claim_cf_missing_receipt_and_hard_cleanup_remain_errors);
+	UT_RUN(startup_claim_cf_ack_race_and_lost_latch_still_make_progress);
+	UT_RUN(startup_claim_cf_reacquire_cannot_return_changed_custody);
+	UT_RUN(startup_claim_cf_original_startup_cancel_retains_cleanup);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

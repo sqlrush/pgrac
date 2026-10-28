@@ -1427,11 +1427,22 @@ test_cluster_startup_cf_callsite.inc: $(top_srcdir)/src/backend/access/transam/x
 
 test_cluster_startup_cf_entry: test_cluster_startup_cf_entry.c test_cluster_cf_enqueue.c \
 		test_cluster_startup_cf_entry.inc test_cluster_startup_cf_callsite.inc \
+		test_cluster_merge_cf_entry.inc \
 		test_cluster_cf_blocker_trace.inc test_cluster_startup_interrupt.inc unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_cf_enqueue.c \
 		$(top_srcdir)/src/backend/cluster/cluster_lock_owner.c \
 		$(top_srcdir)/src/backend/cluster/cluster_control_request.c $(CLUSTER_LMD_WAIT_STATE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# Original claim custody declaration and CF consumer, with the real CF producer.
+test_cluster_merge_cf_entry.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_merge.c Makefile
+	awk '/^static bool merge_claim_held/ { types=1; declarations++ } \
+	     types { print; if (/^static uint64 merge_claim_serial;/) types=0 } \
+	     /^\/\* Use the original CF serialization/ { emit=1; begin++ } \
+	     /^merge_claim_cf_exit\(/ { emit=0; end++; previous="" } \
+	     emit { if (have_line) print previous; previous=$$0; have_line=1 } \
+	     END { if (declarations != 1 || types || begin != 1 || end != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
 
 # PGRAC: execute the real earliest startup-directory mutation call site.
 # Selecting initialization later than this boundary cannot close a killed
