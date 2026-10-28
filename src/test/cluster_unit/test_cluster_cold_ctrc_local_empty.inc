@@ -2,12 +2,14 @@
  * Author: SqlRush <sqlrush@gmail.com> */
 static unsigned local_empty_calls, local_empty_mode;
 static unsigned final_local_empty_calls, final_local_empty_mode;
+static ClusterCtrcLocalEmptyV1 (*startup_native_directory)(void);
 
 static void
 startup_local_empty_reset(void)
 {
 	local_empty_calls = local_empty_mode = 0;
 	final_local_empty_calls = final_local_empty_mode = 0;
+	startup_native_directory = NULL;
 }
 
 ClusterCtrcLocalEmptyV1
@@ -18,6 +20,7 @@ cluster_ctrc_recovery_local_empty_v1(void)
 		UT_ASSERT_EQ(ctrc_driver_lwlocks, 0);
 		UT_ASSERT_EQ(prefix_destroyed, 2 * prefix_pages);
 		UT_ASSERT(progress == NULL || progress->next_target == progress->target_count);
+		if (startup_native_directory != NULL) return startup_native_directory();
 		final_local_empty_calls++;
 		if (final_local_empty_mode == 1 && final_local_empty_calls < 3) {
 			ctrc_driver_waiting = true;

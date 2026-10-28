@@ -75,7 +75,9 @@ static void test_pool_upgrade(void);
 #undef fprintf
 #include "unit_test.h"
 
+#ifndef TEST_CLUSTER_STARTUP_CTRC
 UT_DEFINE_GLOBALS();
+#endif
 
 int NBuffers = 16;
 int MaxBackends = 8;
@@ -87,8 +89,10 @@ static unsigned wake_count;
 static uint64 test_now_us = UINT64_C(1000000);
 static uint32 test_capability_generation = 19;
 static uint64 test_cluster_epoch = 13;
+#ifndef TEST_CLUSTER_STARTUP_CTRC
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
+#endif
 volatile sig_atomic_t InterruptPending;
 volatile uint32 InterruptHoldoffCount;
 static unsigned allocated;
@@ -1894,6 +1898,7 @@ driver_dispatch_boundary(const ClusterCtrcCloseDispatch *dispatches pg_attribute
 }
 
 bool ctrc_fixture_run_pass(void);
+#undef cluster_ctrc_cleaner_run_pass
 #define cluster_ctrc_cleaner_run_pass ctrc_fixture_run_pass
 #define ctrc_cleaner_clean_next_receipt driver_no_receipt
 #define ctrc_cleaner_publish_certificate driver_no_certificate
