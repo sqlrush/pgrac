@@ -1730,6 +1730,7 @@ test_native_itl_batch(ClusterColdTtSlotInputV1 *subjects,
 #include "test_cluster_ctrc_heap_refs.inc"
 #include "test_cluster_ctrc_census_tuple_refs.inc"
 #include "test_cluster_ctrc_hot_refs.inc"
+#include "test_cluster_ctrc_census_hot.inc"
 
 UT_TEST(test_ctrc_native_itl_page_uses_all_slots_and_original_terminal_projection)
 {
@@ -3983,6 +3984,10 @@ main(void)
 		CTRC_TEST_ENTRY(test_ctrc_itl_image_calculation_preserves_input_and_replays_exactly),
 		CTRC_TEST_ENTRY(test_ctrc_itl_image_partial_overlap_is_retained),
 		CTRC_TEST_ENTRY(test_ctrc_native_tt_image_matches_original_terminal_rules),
+		CTRC_TEST_ENTRY(test_ctrc_census_hot_shares_complete_native_chain_and_redirect_rule),
+		CTRC_TEST_ENTRY(test_ctrc_census_hot_rejects_complete_view_bounds_and_malformed_items),
+		CTRC_TEST_ENTRY(test_ctrc_census_hot_rejects_native_cycles_collisions_and_wrong_successors),
+		CTRC_TEST_ENTRY(test_ctrc_census_hot_preserves_history_active_and_actual_aborted_orphans),
 		CTRC_TEST_ENTRY(test_ctrc_hot_refs_accept_native_chain_redirect_and_bounded_maximum),
 		CTRC_TEST_ENTRY(test_ctrc_hot_refs_reject_effective_hot_wrong_block_offset_or_successor),
 		CTRC_TEST_ENTRY(test_ctrc_hot_refs_reject_intersections_redirect_collisions_and_cycles),

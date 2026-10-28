@@ -1118,6 +1118,19 @@ extern bool cluster_ctrc_recovery_heap_tuple_itl_references_v1(
  * true does not establish complete G_ref, discharge or completion. */
 extern bool cluster_ctrc_recovery_heap_hot_references_v1(
 	const char *page_image, BlockNumber block_number);
+/* Process-local complete line-pointer view, in native offset order. Tuple
+ * bytes may be packed/unaligned and remain owned by the original census.
+ * The same local HOT rule accepts historical ACTIVE ITLs as identity inputs;
+ * an orphan still needs an actual ABORTED DATA slot, never an inferred loser.
+ * The caller proves complete page/version enumeration and canonical identity.
+ * No synthetic physical page, terminal transition, graph seal or release. */
+typedef struct ClusterCtrcRecoveryHeapItemV1 {
+	ItemIdData item;
+	const char *tuple_bytes;
+	uint16 tuple_length;
+} ClusterCtrcRecoveryHeapItemV1;
+extern bool cluster_ctrc_recovery_heap_hot_items_v1(const ClusterItlSlotData *slots,
+	const ClusterCtrcRecoveryHeapItemV1 *items, Size count, BlockNumber block_number);
 /* Process-local image observations, never receipt or terminal authority. */
 typedef struct ClusterCtrcItlCarrierImageV1 {
 	uint8 mask;

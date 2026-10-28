@@ -2334,6 +2334,51 @@ cluster_recovery_cold_page_reference_tuple(const ClusterRecoveryCensusReferences
 			entry->tuple_bytes, entry->tuple_length);
 }
 
+/* Group only the original census page/version. Every line pointer, including
+ * no-storage items, is present in native offset order. This is a private
+ * reference view, not a reconstructed physical image or a history proof. */
+static bool
+cluster_recovery_cold_page_reference_hot(const ClusterRecoveryCensusReferencesV1 *references,
+	const ClusterRecoveryCensusReferenceV1 *reference, BlockNumber block_number)
+{
+	ClusterCtrcRecoveryHeapItemV1 items[MaxHeapTuplesPerPage];
+	uint8 item_seen[MaxHeapTuplesPerPage] = {0};
+	ClusterItlSlotData slots[CLUSTER_ITL_INITRANS_DEFAULT];
+	uint32 slot_seen = 0;
+	Size count = 0;
+
+	for (uint32 i = 0; i < references->count; i++) {
+		const ClusterRecoveryCensusReferenceV1 *candidate = &references->entries[i];
+		const ClusterRecoveryHeapEntry *entry = &candidate->entry;
+
+		if (candidate->page_index != reference->page_index
+			|| candidate->version != reference->version) continue;
+		if (entry->kind == CLUSTER_RECOVERY_HEAP_ITL) {
+			uint32 bit;
+
+			if (entry->index >= CLUSTER_ITL_INITRANS_DEFAULT) return false;
+			bit = UINT32_C(1) << entry->index;
+			if ((slot_seen & bit) != 0) return false;
+			slot_seen |= bit; slots[entry->index] = entry->itl;
+		} else if (entry->kind == CLUSTER_RECOVERY_HEAP_ITEM) {
+			Size index;
+
+			if (entry->index < FirstOffsetNumber || entry->index > MaxHeapTuplesPerPage) return false;
+			index = entry->index - FirstOffsetNumber;
+			if (item_seen[index] != 0) return false;
+			item_seen[index] = 1;
+			items[index].item = entry->item;
+			items[index].tuple_bytes = entry->tuple_bytes;
+			items[index].tuple_length = entry->tuple_length;
+			if (index >= count) count = index + 1;
+		} else return false;
+	}
+	if (slot_seen != (UINT32_C(1) << CLUSTER_ITL_INITRANS_DEFAULT) - 1) return false;
+	for (Size i = 0; i < count; i++)
+		if (item_seen[i] == 0) return false;
+	return cluster_ctrc_recovery_heap_hot_items_v1(slots, items, count, block_number);
+}
+
 /* PGRAC: consume the complete original relation/history view, including
  * pages absent from PAGE WAL. Match the graph's full canonical identity,
  * never a raw xid or a current slot chosen for an older generation. The
@@ -2364,7 +2409,17 @@ cluster_recovery_cold_page_reference_terminals(const struct ClusterRecoveryStart
 			|| !pages->entries[reference->page_index].heap
 			|| pages->entries[reference->page_index].forknum != MAIN_FORKNUM) return false;
 		if (entry->kind == CLUSTER_RECOVERY_HEAP_ITEM) {
+			bool first = true;
+
 			if (!cluster_recovery_cold_page_reference_tuple(references, reference)) return false;
+			for (uint32 j = 0; j < i; j++) {
+				const ClusterRecoveryCensusReferenceV1 *previous = &references->entries[j];
+
+				if (previous->page_index == reference->page_index && previous->version == reference->version
+					&& previous->entry.kind == CLUSTER_RECOVERY_HEAP_ITEM) { first = false; break; }
+			}
+			if (first && !cluster_recovery_cold_page_reference_hot(references, reference,
+				pages->entries[reference->page_index].blockno)) return false;
 			continue;
 		}
 		if (entry->kind != CLUSTER_RECOVERY_HEAP_ITL

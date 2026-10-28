@@ -2344,9 +2344,19 @@ static void startup_local_empty_reset(void);
 #include "test_cluster_cold_ctrc_references.inc"
 #include "test_cluster_cold_ctrc_reference_terminals.inc"
 #include "test_cluster_cold_ctrc_reference_tuples.inc"
+#include "test_cluster_cold_ctrc_census_hot.inc"
 
 int main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_CENSUS_HOT") != NULL) {
+		UT_PLAN(5);
+		UT_RUN(test_startup_census_hot_checks_untouched_current_and_inverse_without_mutation);
+		UT_RUN(test_startup_census_hot_late_refusal_current_drift_and_error_keep_debt);
+		UT_RUN(test_startup_census_hot_rejects_missing_duplicate_and_gapped_items);
+		UT_RUN(test_startup_census_hot_repeat_does_not_cache_topology_success);
+		UT_RUN(test_startup_census_hot_zero_page_wal_still_checks_saved_topology);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_REFERENCE_TUPLES") != NULL) {
 		UT_PLAN(6);
 		UT_RUN(test_startup_reference_tuples_consume_untouched_current_and_inverse_versions);
@@ -2587,7 +2597,13 @@ int main(void)
 		UT_DONE();
 		return ut_failed_count == 0 ? 0 : 1;
 	}
-	UT_PLAN(260);
+	UT_PLAN(265);
+	UT_RUN(test_startup_census_hot_checks_untouched_current_and_inverse_without_mutation);
+	UT_RUN(test_startup_census_hot_late_refusal_current_drift_and_error_keep_debt);
+	UT_RUN(test_startup_census_hot_rejects_missing_duplicate_and_gapped_items);
+	UT_RUN(test_startup_census_hot_repeat_does_not_cache_topology_success);
+	UT_RUN(test_startup_census_hot_zero_page_wal_still_checks_saved_topology);
+
 	UT_RUN(test_startup_reference_tuples_consume_untouched_current_and_inverse_versions);
 	UT_RUN(test_startup_reference_tuples_require_all_itls_from_the_same_page_version);
 	UT_RUN(test_startup_reference_tuples_preserve_stored_item_bounds_and_unsupported_storage);

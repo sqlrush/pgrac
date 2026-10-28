@@ -1456,35 +1456,67 @@ cluster_ctrc_recovery_heap_itl_references_v1(const char *page_image)
 }
 
 
+/* Complete item views are validated before any destination is read. Saved
+ * tuples are packed bytes; never cast them to an aligned native header. */
+static void
+ctrc_recovery_hot_header(const ClusterCtrcRecoveryHeapItemV1 *items,
+	OffsetNumber offset, HeapTupleHeaderData *out)
+{
+	memcpy(out, items[offset - 1].tuple_bytes, SizeofHeapTupleHeader);
+}
+
 /* Read only the local native update graph. A stale ordinary ctid can name a
  * reused item; it is not an edge unless the native updater/xmin match holds. */
 bool
-cluster_ctrc_recovery_heap_hot_references_v1(const char *page_image, BlockNumber block_number)
+cluster_ctrc_recovery_heap_hot_items_v1(const ClusterItlSlotData *slots,
+	const ClusterCtrcRecoveryHeapItemV1 *items, Size count, BlockNumber block_number)
 {
-	Page page = (Page)page_image;
 	OffsetNumber successor[MaxHeapTuplesPerPage + 1] = {0};
 	OffsetNumber predecessor[MaxHeapTuplesPerPage + 1] = {0};
 	uint8 color[MaxHeapTuplesPerPage + 1] = {0};
 	OffsetNumber maxoff;
 
-	if (block_number == InvalidBlockNumber
-		|| !cluster_ctrc_recovery_heap_itl_references_v1(page_image)) return false;
-	maxoff = PageGetMaxOffsetNumber(page);
-	if (maxoff > MaxHeapTuplesPerPage) return false;
+	if (slots == NULL || (count != 0 && items == NULL) || count > MaxHeapTuplesPerPage
+		|| block_number == InvalidBlockNumber) return false;
+	maxoff = (OffsetNumber)count;
+	for (Size i = 0; i < count; i++) {
+		const ClusterCtrcRecoveryHeapItemV1 *value = &items[i];
+		const ItemIdData *item = &value->item;
+
+		if (ItemIdIsNormal(item)) {
+			if (value->tuple_length != ItemIdGetLength(item)
+				|| !cluster_ctrc_recovery_heap_tuple_itl_references_v1(slots,
+					value->tuple_bytes, value->tuple_length)) return false;
+		} else {
+			if (ItemIdHasStorage(item) || value->tuple_bytes != NULL || value->tuple_length != 0
+				|| (!ItemIdIsRedirected(item) && !ItemIdIsDead(item) && ItemIdIsUsed(item)))
+				return false;
+			if (ItemIdIsRedirected(item)) {
+				OffsetNumber destination = ItemIdGetRedirect(item);
+
+				if (destination < FirstOffsetNumber || destination > maxoff
+					|| !ItemIdIsNormal(&items[destination - 1].item)) return false;
+			}
+		}
+	}
 	for (OffsetNumber offset = FirstOffsetNumber; offset <= maxoff; offset++) {
-		ItemId item = PageGetItemId(page, offset);
+		const ItemIdData *item = &items[offset - 1].item;
 		OffsetNumber destination;
-		HeapTupleHeader next;
+		HeapTupleHeaderData next_header;
+		HeapTupleHeader next = &next_header;
 
 		if (ItemIdIsRedirected(item)) {
 			destination = ItemIdGetRedirect(item);
-			next = (HeapTupleHeader)PageGetItem(page, PageGetItemId(page, destination));
+			ctrc_recovery_hot_header(items, destination, next);
 			if (!HeapTupleHeaderIsHeapOnly(next)) return false;
 		} else if (ItemIdIsNormal(item)) {
-			HeapTupleHeader tuple = (HeapTupleHeader)PageGetItem(page, item);
-			bool hot = HeapTupleHeaderIsHotUpdated(tuple);
-			ItemId target;
+			HeapTupleHeaderData tuple_header;
+			HeapTupleHeader tuple = &tuple_header;
+			bool hot;
+			const ItemIdData *target;
 
+			ctrc_recovery_hot_header(items, offset, tuple);
+			hot = HeapTupleHeaderIsHotUpdated(tuple);
 			if (HeapTupleHeaderIsSpeculative(tuple)
 				|| (ItemPointerIsValid(&tuple->t_ctid) && HeapTupleHeaderIndicatesMovedPartitions(tuple))
 				|| (HeapTupleHeaderIsHeapOnly(tuple) && (tuple->t_infomask & HEAP_UPDATED) == 0))
@@ -1496,12 +1528,12 @@ cluster_ctrc_recovery_heap_hot_references_v1(const char *page_image, BlockNumber
 				if (hot) return false;
 				continue;
 			}
-			target = PageGetItemId(page, destination);
+			target = &items[destination - 1].item;
 			if (!ItemIdIsNormal(target)) {
 				if (hot) return false;
 				continue;
 			}
-			next = (HeapTupleHeader)PageGetItem(page, target);
+			ctrc_recovery_hot_header(items, destination, next);
 			if (!TransactionIdEquals(HeapTupleHeaderGetRawXmax(tuple), HeapTupleHeaderGetXmin(next))) {
 				if (hot) return false;
 				continue;
@@ -1516,16 +1548,17 @@ cluster_ctrc_recovery_heap_hot_references_v1(const char *page_image, BlockNumber
 		successor[offset] = destination;
 	}
 	for (OffsetNumber offset = FirstOffsetNumber; offset <= maxoff; offset++) {
-		ItemId item = PageGetItemId(page, offset);
+		const ItemIdData *item = &items[offset - 1].item;
 		OffsetNumber cursor = offset;
 
 		/* Only aborted heap-only tuples may have no predecessor. Status
 		 * comes from the already qualified native DATA ITL, not a hint. */
 		if (ItemIdIsNormal(item) && predecessor[offset] == InvalidOffsetNumber) {
-			HeapTupleHeader tuple = (HeapTupleHeader)PageGetItem(page, item);
+			HeapTupleHeaderData tuple_header;
+			HeapTupleHeader tuple = &tuple_header;
 
+			ctrc_recovery_hot_header(items, offset, tuple);
 			if (HeapTupleHeaderIsHeapOnly(tuple)) {
-				const ClusterItlSlotData *slots = ClusterPageGetItlSlots(page);
 				bool aborted = false;
 
 				if (!HeapTupleHeaderXminFrozen(tuple))
@@ -1547,6 +1580,31 @@ cluster_ctrc_recovery_heap_hot_references_v1(const char *page_image, BlockNumber
 		}
 	}
 	return true;
+}
+
+bool
+cluster_ctrc_recovery_heap_hot_references_v1(const char *page_image, BlockNumber block_number)
+{
+	ClusterCtrcRecoveryHeapItemV1 items[MaxHeapTuplesPerPage];
+	Page page = (Page)page_image;
+	OffsetNumber maxoff;
+
+	/* Preserve the original physical-layout and terminal-slot grammar. The
+	 * saved-version entry point above does not grant these premises. */
+	if (block_number == InvalidBlockNumber
+		|| !cluster_ctrc_recovery_heap_itl_references_v1(page_image)) return false;
+	maxoff = PageGetMaxOffsetNumber(page);
+	if (maxoff > MaxHeapTuplesPerPage) return false;
+	for (OffsetNumber offset = FirstOffsetNumber; offset <= maxoff; offset++) {
+		ItemId item = PageGetItemId(page, offset);
+		ClusterCtrcRecoveryHeapItemV1 *value = &items[offset - 1];
+
+		value->item = *item;
+		value->tuple_bytes = ItemIdHasStorage(item) ? (const char *)PageGetItem(page, item) : NULL;
+		value->tuple_length = ItemIdHasStorage(item) ? ItemIdGetLength(item) : 0;
+	}
+	return cluster_ctrc_recovery_heap_hot_items_v1(ClusterPageGetItlSlots(page),
+		items, maxoff, block_number);
 }
 
 static bool
