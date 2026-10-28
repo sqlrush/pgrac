@@ -26470,6 +26470,98 @@ UT_TEST(test_runtime_pending_cf_refusal_keeps_original_cleanup_policy)
 	}
 }
 
+/* Both CF reads belong to the same selected terminal proof. Refusing either
+ * read must withhold validation/consumption without a retry or ROOT mutation.
+ * CF is an explicit grant leaf here; terminal files and ROOT consumers are real. */
+static void
+rejoin_refuse_selected_share(void)
+{
+	test_cf_grant = false;
+}
+
+UT_TEST(test_runtime_terminal_rejoin_cf_refusal_withholds_proof_and_consumption)
+{
+	BackendType role = MyBackendType;
+
+	for (unsigned consume = 0; consume < 2; consume++) {
+		for (unsigned cut = 0; cut < 2; cut++) {
+			ClusterRecoverySerialGuard serial;
+			ClusterThreadRecLaunchEligibility eligibility;
+			ClusterWalStartupImage op = pending_worker_fixture(&serial, &eligibility);
+			ClusterControlRootSnapshot snapshot;
+			ClusterControlRootReadToken token;
+			ClusterControlRootRejoinTerminalProofV1 selected, out;
+			ClusterControlRootResult result;
+			uint8 before[2][CLUSTER_CONTROL_ROOT_FILE_BYTES];
+			uint8 after[CLUSTER_CONTROL_ROOT_FILE_BYTES];
+			const char *paths[]
+				= { CLUSTER_CONTROL_ROOT_REL_PATH, CLUSTER_CONTROL_ROOT_BAK_REL_PATH };
+			char path[MAXPGPATH];
+			bool consumed = true;
+			int cf_calls, renames, walr_begin, walr_end;
+
+			if (ut_current_failed)
+				return;
+			test_worker_pin_held = false;
+			UT_ASSERT_EQ(thread_recovery_worker_run(&eligibility), CLUSTER_THREADREC_DONE);
+			MyBackendType = B_BACKEND;
+			UT_ASSERT_EQ(cluster_control_root_v3_read_canonical(
+							 1, &op.predecessor.snapshot.identity, &snapshot, &token),
+						 0);
+			UT_ASSERT_EQ(cluster_control_root_v3_validate_rejoin_terminal(
+							 &op.predecessor.snapshot.identity,
+							 op.claim.identity.origin_owner_incarnation, &snapshot, &token,
+							 &selected),
+						 0);
+			if (ut_current_failed)
+				return;
+			for (unsigned i = 0; i < lengthof(paths); i++) {
+				path_for(path, sizeof(path), paths[i]);
+				read_all_or_abort(path, before[i], sizeof(before[i]));
+			}
+			cf_calls = test_cf_lock_calls;
+			renames = test_durable_rename_calls;
+			walr_begin = test_walr_begin_calls;
+			walr_end = test_walr_end_calls;
+			if (cut == 0)
+				test_cf_grant = false;
+			else {
+				test_stop_share_hook = rejoin_refuse_selected_share;
+				test_stop_share_call = cf_calls + 2;
+			}
+			memset(&out, 0xa5, sizeof(out));
+			if (consume)
+				result = cluster_control_root_v3_consume_rejoin_terminal(
+					&op.predecessor.snapshot.identity, selected.failed_incarnation + 1, &snapshot,
+					&token, &selected, &consumed);
+			else
+				result = cluster_control_root_v3_validate_rejoin_terminal(
+					&op.predecessor.snapshot.identity, selected.failed_incarnation, &snapshot,
+					&token, &out);
+			UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+			if (consume)
+				UT_ASSERT(!consumed);
+			else
+				UT_ASSERT(v2_zero(&out, sizeof(out)));
+			UT_ASSERT_EQ(test_cf_lock_calls, cf_calls + cut + 1);
+			UT_ASSERT_EQ(test_actual_cf, NoLock);
+			UT_ASSERT_EQ(test_durable_rename_calls, renames);
+			UT_ASSERT_EQ(test_walr_begin_calls, walr_begin);
+			UT_ASSERT_EQ(test_walr_end_calls, walr_end);
+			UT_ASSERT(!test_worker_pin_held);
+			for (unsigned i = 0; i < lengthof(paths); i++) {
+				path_for(path, sizeof(path), paths[i]);
+				read_all_or_abort(path, after, sizeof(after));
+				UT_ASSERT_EQ(memcmp(before[i], after, sizeof(after)), 0);
+			}
+			test_stop_share_hook = NULL;
+			test_cf_grant = true;
+			MyBackendType = role;
+			cluster_shared_config = false;
+		}
+	}
+}
+
 int
 main(int argc, char **argv)
 {
@@ -26959,6 +27051,19 @@ main(int argc, char **argv)
 		return ut_failed_count ? 1 : 0;
 	}
 
+	if (getenv("PGRAC_PRE2_TEST_REJOIN_CF_POLICY") != NULL) {
+		UT_PLAN(8);
+		UT_RUN(test_runtime_terminal_rejoin_cf_refusal_withholds_proof_and_consumption);
+		UT_RUN(test_runtime_pending_worker_publishes_checkpointless_terminal);
+		UT_RUN(test_runtime_terminal_rejoin_rejects_second_read_race);
+		UT_RUN(test_runtime_terminal_retention_rejects_second_read_race);
+		UT_RUN(test_runtime_terminal_rejoin_accepts_nonzero_uuid_with_zero_first_byte);
+		UT_RUN(test_runtime_terminal_isolation_full_needset);
+		UT_RUN(test_runtime_pending_worker_uncertain_root_publish_retains_terminal);
+		UT_RUN(test_runtime_pending_worker_cancellation_keeps_pending_subject);
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_INITIALIZER_LIFECYCLE") != NULL) {
 		UT_PLAN(15);
 		UT_RUN(test_runtime_pending_worker_entry_requires_launch_carrier);
@@ -27053,7 +27158,7 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(587);
+	UT_PLAN(588);
 	UT_RUN(test_ctrc_replay_stable_two_actual_origins_without_tt);
 	UT_RUN(test_ctrc_replay_stable_refuses_omitted_or_duplicated_set_origin);
 	UT_RUN(test_ctrc_replay_stable_refuses_changed_native_source_or_uncovered_cut);
@@ -27648,6 +27753,7 @@ main(int argc, char **argv)
 	UT_RUN(test_runtime_pending_worker_entry_requires_launch_carrier);
 	UT_RUN(test_runtime_pending_bgworker_entry_reaches_initializer);
 	UT_RUN(test_runtime_pending_cf_refusal_keeps_original_cleanup_policy);
+	UT_RUN(test_runtime_terminal_rejoin_cf_refusal_withholds_proof_and_consumption);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;
