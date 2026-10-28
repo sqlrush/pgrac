@@ -58,6 +58,8 @@
 #include "cluster/cluster_tt_status.h" /* ClusterVisibilityDecision */
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_cr_server.h" /* R4 holder-step ABI types */
+#include "cluster/cluster_savepoint_reader.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_undo_record.h"
 #endif
 #include "storage/bufmgr.h"
@@ -132,6 +134,20 @@ extern bool cluster_cr_r4_extract_resident_record(const char resident_undo_page[
 extern bool cluster_cr_build_on_holder_pending_locator(uint32 slot_index, uint64 slot_generation,
 													   ClusterTxLocator *locator_out);
 extern void cluster_cr_build_on_holder_forget(uint32 slot_index, uint64 slot_generation);
+
+/* One exact head operation on a private historical image, not a whole-page
+ * FULL verdict or current/own-command visibility. The blocking local-origin
+ * read requires caller-qualified expected identity and original retention;
+ * caller holds no buffer/content locks. Return the independent top/disposition
+ * after final release, inverse validation and admission recheck. PREPARED/UNKNOWN refuse.
+ * false clears top/operation, preserves result; source/result may alias.
+ * A larger walk must retain sampled ACTIVE and validate every predecessor. */
+extern bool cluster_cr_apply_operation_origin_admitted(
+	const char source_page[BLCKSZ], const BufferTag *tag, SCN read_scn,
+	const ClusterTxLocator *locator, const ClusterSavepointOperation *expected,
+	const ClusterSemanticAdmissionToken *admission, char result_page[BLCKSZ],
+	ClusterTxResolution *top_out, ClusterSavepointReaderRecord *operation_out,
+	ClusterTxResolveReason *reason_out);
 #endif
 
 

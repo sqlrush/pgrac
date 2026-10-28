@@ -7534,9 +7534,22 @@ test_cluster_undo_pending_product.o: test_cluster_undo_pending_product.c \
 		$(top_srcdir)/src/include/cluster/cluster_undo_record_api.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
+# The exact consumer body shares the origin fixture's existing external
+# boundaries without importing unrelated CR globals or replacing predicates.
+test_cluster_operation_cr_entry.inc: $(top_srcdir)/src/backend/cluster/cluster_cr.c Makefile
+	awk '/^cluster_cr_apply_operation_origin_admitted\(/ { print "bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_r4_tx_outcome: test_cluster_r4_tx_outcome.c unit_test.h \
 		test_cluster_savepoint_origin_plan.inc $(CLUSTER_SAVEPOINT_READER_O) \
 		test_cluster_savepoint_origin_driver.inc \
+		test_cluster_savepoint_cr_consumer.inc \
+		test_cluster_hot_bufpage_product.o test_cluster_operation_cr_entry.inc \
+		$(top_builddir)/src/backend/cluster/cluster_cr_apply.o \
+		$(top_srcdir)/src/include/cluster/cluster_cr.h \
+		$(top_srcdir)/src/include/cluster/cluster_cr_history.h \
 		$(top_srcdir)/src/include/cluster/cluster_runtime_visibility.h \
 		$(top_srcdir)/src/include/cluster/cluster_savepoint_reader.h \
 		$(top_srcdir)/src/include/cluster/cluster_tx_resolve.h \
@@ -7548,6 +7561,8 @@ test_cluster_r4_tx_outcome: test_cluster_r4_tx_outcome.c unit_test.h \
 		$(CLUSTER_CR_SERVER_POLICY_O) $(CLUSTER_RUNTIME_VIS_POLICY_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_SAVEPOINT_READER_O) \
+		test_cluster_hot_bufpage_product.o \
+		$(top_builddir)/src/backend/cluster/cluster_cr_apply.o \
 		test_cluster_undo_pending_product.o \
 		$(CLUSTER_R4_RUNTIME_VIS_TEST_O) $(CLUSTER_R4_RUNTIME_VIS_UBA_O) \
 		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \

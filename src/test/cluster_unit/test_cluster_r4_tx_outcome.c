@@ -210,6 +210,7 @@ static int test_operation_release_pending_call;
 static int test_operation_release_poll_count;
 static int test_operation_release_wait_count;
 static void (*test_operation_release_observer)(void);
+static bool test_operation_cr_revoke_on_decision;
 
 /* Existing pending-receipt tests model the backend-local top capture only;
  * they do not execute the live frame/capture implementation. */
@@ -362,6 +363,12 @@ cluster_scn_observe(SCN remote_scn pg_attribute_unused())
 int
 scn_time_cmp(SCN a, SCN b)
 {
+	/* Model an external admission change after origin has released, while
+	 * the new CR consumer makes its local publication decision. */
+	if (test_operation_cr_revoke_on_decision && test_candidate_release_calls == 3) {
+		test_admission_revoked = true;
+		test_operation_cr_revoke_on_decision = false;
+	}
 	return scn_local(a) == scn_local(b) ? 0 : (scn_local(a) > scn_local(b) ? 1 : -1);
 }
 
@@ -1494,6 +1501,7 @@ reset_exact_origin_fixture(void)
 	test_operation_release_poll_count = 0;
 	test_operation_release_wait_count = 0;
 	test_operation_release_observer = NULL;
+	test_operation_cr_revoke_on_decision = false;
 	test_candidate_sample_result = CLUSTER_UNDO_BLOCK0_OK;
 	test_candidate_data_generation = 17;
 	test_candidate_tt_generation = 23;
@@ -7553,11 +7561,23 @@ UT_TEST(test_retained_slot_identity_does_not_escape_original_final_fences)
 
 #include "test_cluster_savepoint_origin_plan.inc"
 #include "test_cluster_savepoint_origin_driver.inc"
+#include "test_cluster_savepoint_cr_consumer.inc"
 
 int
 main(void)
 {
-	UT_PLAN(230);
+	UT_PLAN(241);
+	UT_RUN(test_operation_cr_final_admission_fence);
+	UT_RUN(test_operation_cr_discarded_before_snapshot_is_inverse);
+	UT_RUN(test_operation_cr_live_uses_top_commit_boundary);
+	UT_RUN(test_operation_cr_active_stays_conservative);
+	UT_RUN(test_operation_cr_exact_top_abort_is_inverse);
+	UT_RUN(test_operation_cr_prepared_never_publishes_image);
+	UT_RUN(test_operation_cr_unknown_retains_input_and_output);
+	UT_RUN(test_operation_cr_keep_still_validates_exact_head);
+	UT_RUN(test_operation_cr_source_result_alias);
+	UT_RUN(test_operation_cr_uses_post_top_discard);
+	UT_RUN(test_operation_cr_error_does_not_publish);
 	UT_RUN(test_operation_driver_three_current_phases);
 	UT_RUN(test_operation_driver_post_top_discard);
 	UT_RUN(test_operation_driver_preserves_sampled_active);

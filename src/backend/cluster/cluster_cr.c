@@ -52,6 +52,7 @@
 #include "cluster/cluster_cr_admit.h" /* spec-5.52 D2: insert-side admission gate */
 #include "cluster/cluster_cr_apply.h"
 #include "cluster/cluster_cr_history.h"
+#include "cluster/cluster_runtime_visibility.h"
 #include "cluster/cluster_cr_cache.h"
 #include "cluster/cluster_cr_coordinator_stat.h" /* spec-5.57 D2/D3: coordinator boundary */
 #include "cluster/cluster_cr_pool.h"			 /* spec-5.51 D4: shared L2 CR pool */
@@ -2567,6 +2568,86 @@ cr_construct_retained_history(char *page, SCN read_scn, const BufferTag *tag, bo
 	}
 	PG_END_TRY();
 	return handled;
+}
+
+/* Validate the exact head through the original inverse even when LIVE survives
+ * the snapshot. All mutations remain private until the complete result exists. */
+bool
+cluster_cr_apply_operation_origin_admitted(const char source_page[BLCKSZ], const BufferTag *tag,
+										   SCN read_scn, const ClusterTxLocator *locator,
+										   const ClusterSavepointOperation *expected,
+										   const ClusterSemanticAdmissionToken *admission,
+										   char result_page[BLCKSZ], ClusterTxResolution *top_out,
+										   ClusterSavepointReaderRecord *operation_out,
+										   ClusterTxResolveReason *reason_out)
+{
+	PGAlignedBlock data, scratch;
+	ClusterTxResolution top;
+	ClusterSavepointReaderRecord operation;
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+	const PageHeaderData *header = (const PageHeaderData *)source_page;
+	const UndoRecordHeader *record;
+	size_t length;
+	bool inverse;
+
+	if (top_out != NULL)
+		memset(top_out, 0, sizeof(*top_out));
+	if (operation_out != NULL)
+		memset(operation_out, 0, sizeof(*operation_out));
+	if (reason_out != NULL)
+		*reason_out = reason;
+	if (source_page == NULL || tag == NULL || locator == NULL || expected == NULL
+		|| admission == NULL || result_page == NULL || top_out == NULL || operation_out == NULL
+		|| !SCN_VALID(read_scn)) {
+		reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+		goto failed;
+	}
+	reason = CLUSTER_TX_RESOLVE_BAD_COMPOSITION;
+	if (!PageHasItl((Page)source_page) || header->pd_lower < SizeOfPageHeaderData
+		|| header->pd_lower > header->pd_upper || header->pd_upper > header->pd_special
+		|| header->pd_special < SizeOfPageHeaderData || header->pd_special > BLCKSZ
+		|| BLCKSZ - header->pd_special < CLUSTER_ITL_SPECIAL_SIZE)
+		goto failed;
+	if (cluster_runtime_visibility_resolve_operation_origin_admitted(
+			locator, expected, CLUSTER_TX_RESOLVE_VISIBILITY, admission, &top, &operation,
+			data.data, &reason)
+		== CLUSTER_TX_UNKNOWN)
+		goto failed;
+	if (top.outcome == CLUSTER_TX_PREPARED) {
+		reason = CLUSTER_TX_RESOLVE_TWOPHASE_CONFLICT;
+		goto failed;
+	}
+	reason = CLUSTER_TX_RESOLVE_BAD_COMPOSITION;
+	/* The extractor supports overlap and leaves an aligned record at DATA's
+	 * front, avoiding another block-sized buffer or any new acquisition. */
+	if (!cluster_savepoint_reader_extract(expected, locator, data.data, data.data, &length,
+										  &operation))
+		goto failed;
+	record = (const UndoRecordHeader *)data.data;
+	memcpy(scratch.data, source_page, BLCKSZ);
+	if (!cluster_cr_history_inverse_operation(scratch.data, tag, locator, locator->uba, record,
+											  data.data + sizeof(*record), record->payload_length,
+											  expected))
+		goto failed;
+	inverse = operation.operation.effect_state == CLUSTER_SAVEPOINT_EFFECT_DISCARDED
+			  || top.outcome != CLUSTER_TX_COMMITTED || scn_time_cmp(top.commit_scn, read_scn) > 0;
+	if (!inverse)
+		memcpy(scratch.data, source_page, BLCKSZ);
+	if (!cluster_semantic_activation_recheck(admission)) {
+		reason = CLUSTER_TX_RESOLVE_AUTHORITY_STALE;
+		goto failed;
+	}
+	memcpy(result_page, scratch.data, BLCKSZ);
+	*top_out = top;
+	*operation_out = operation;
+	if (reason_out != NULL)
+		*reason_out = CLUSTER_TX_RESOLVE_NONE;
+	return true;
+
+failed:
+	if (reason_out != NULL)
+		*reason_out = reason;
+	return false;
 }
 
 static void
