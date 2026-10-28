@@ -6268,9 +6268,25 @@ static bool event_trigger_lookup_active, event_trigger_expect_binding,
 static unsigned event_trigger_lookups, event_trigger_unbound, event_trigger_bad_lookup;
 static unsigned event_trigger_lookup_kind, event_trigger_entry_kind;
 
+static bool database_settings_lookup_active, database_settings_expect_binding;
+static unsigned database_settings_entry_kind, database_settings_lookups;
+static unsigned database_settings_lookup_kind, database_settings_unbound;
+static unsigned database_settings_bad_lookup;
+static const char *database_settings_expected_name;
+
 Oid
 get_database_oid(const char *dbname, bool missing_ok)
 {
+	if (database_settings_lookup_active) {
+		database_settings_lookups++;
+		database_settings_lookup_kind = 1;
+		if (database_settings_expect_binding && utility_binds == 0)
+			database_settings_unbound++;
+		if (database_settings_entry_kind != 0 || missing_ok
+			|| strcmp(dbname, database_settings_expected_name) != 0)
+			database_settings_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before the real database query. */
+	}
 	comment_database_lookups++;
 	if (comment_expect_binding && utility_binds == 0)
 		comment_unbound++;
@@ -6283,6 +6299,16 @@ get_database_oid(const char *dbname, bool missing_ok)
 Relation
 table_open(Oid relationId, LOCKMODE lockmode)
 {
+	if (database_settings_lookup_active) {
+		database_settings_lookups++;
+		database_settings_lookup_kind = 2;
+		if (database_settings_expect_binding && utility_binds == 0)
+			database_settings_unbound++;
+		if (database_settings_entry_kind != 1 || relationId != DatabaseRelationId
+			|| lockmode != RowExclusiveLock)
+			database_settings_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before the real database catalog lock. */
+	}
 	if (publication_lookup_active) {
 		publication_lookups++;
 		publication_lookup_kind = 2;
@@ -11205,10 +11231,199 @@ UT_TEST(test_native_publication_utility_warm_guards_preserve_binding)
 	publication_lookup_active = false;
 }
 
+/* Actual database prefixes stop before lookup or pg_database locking.
+ * Settings, ownership, version checks and writes remain beyond these boundaries. */
+#include "test_cluster_fresh_database_settings.inc"
+static A_Const database_settings_value;
+static ListCell database_settings_value_cell;
+static List database_settings_values;
+static VariableSetStmt database_settings_variable;
+static AlterDatabaseSetStmt native_database_settings_set;
+static AlterDatabaseRefreshCollStmt native_database_settings_refresh;
+static Node *database_settings_expected_statement;
+
+static void
+reset_native_database_settings(bool expect_binding, unsigned form)
+{
+	static const VariableSetKind kinds[]
+		= { VAR_SET_VALUE, VAR_SET_DEFAULT, VAR_SET_CURRENT, VAR_RESET, VAR_RESET_ALL };
+
+	reset_create_preflight();
+	database_settings_lookup_active = true;
+	database_settings_expect_binding = expect_binding;
+	database_settings_entry_kind = form < 5 ? 0 : 1;
+	database_settings_lookups = database_settings_lookup_kind = database_settings_unbound
+		= database_settings_bad_lookup = 0;
+	database_settings_expected_name = form % 2 ? "second_database" : "settings_database";
+	database_settings_value = (A_Const){ .type = T_A_Const, .location = -1 };
+	database_settings_value.val.sval = (String){ .type = T_String, .sval = "g_preflight" };
+	database_settings_value_cell.ptr_value = &database_settings_value;
+	database_settings_values = (List){ .type = T_List,
+									   .length = 1,
+									   .max_length = 1,
+									   .elements = &database_settings_value_cell };
+	database_settings_variable
+		= (VariableSetStmt){ .type = T_VariableSetStmt,
+							 .kind = form < 5 ? kinds[form] : VAR_RESET,
+							 .name = form == 4 ? NULL : "application_name",
+							 .args = form == 0 ? &database_settings_values : NIL };
+	native_database_settings_set
+		= (AlterDatabaseSetStmt){ .type = T_AlterDatabaseSetStmt,
+								  .dbname = (char *)database_settings_expected_name,
+								  .setstmt = &database_settings_variable };
+	native_database_settings_refresh
+		= (AlterDatabaseRefreshCollStmt){ .type = T_AlterDatabaseRefreshCollStmt,
+										  .dbname = (char *)database_settings_expected_name };
+	database_settings_expected_statement = form < 5 ? (Node *)&native_database_settings_set
+													: (Node *)&native_database_settings_refresh;
+}
+
+static void
+native_database_settings_entry(unsigned form)
+{
+	if (form < 5)
+		(void)AlterDatabaseSet(&native_database_settings_set);
+	else
+		(void)AlterDatabaseRefreshColl(&native_database_settings_refresh);
+}
+
+UT_TEST(test_native_database_settings_binds_before_first_query_in_all_profiles)
+{
+	for (unsigned form = 0; form < 6; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_database_settings(binds, form);
+			set_native_operator_mode(mode);
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_database_settings_entry(form);
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(database_settings_lookups, repeat + 1);
+				UT_ASSERT_EQ(database_settings_lookup_kind, database_settings_entry_kind + 1);
+				UT_ASSERT_EQ(database_settings_unbound, 0);
+				UT_ASSERT_EQ(database_settings_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	database_settings_lookup_active = false;
+}
+
+UT_TEST(test_native_database_settings_refuses_before_lookup_on_publication_child_and_top_errors)
+{
+	for (unsigned form = 0; form < 6; form++) {
+		for (unsigned failure = 0; failure < 5; failure++) {
+			bool allocated = failure == 0 || failure == 2;
+			int caught;
+
+			reset_native_database_settings(true, form);
+			if (failure == 0)
+				utility_bind_ok = false;
+			else if (failure == 1 || failure == 2) {
+				if (failure == 2)
+					create_sql_entry(database_settings_expected_statement);
+				utility_in_child = true;
+			} else {
+				utility_current_xid = 401;
+				utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_database_settings_entry(form);
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, failure == 0  ? ERRCODE_DATA_CORRUPTED
+									 : failure < 3 ? ERRCODE_FEATURE_NOT_SUPPORTED
+												   : ERRCODE_INTERNAL_ERROR);
+			UT_ASSERT_STR_EQ(
+				error_message,
+				failure == 0
+					? "canonical ACTIVE publication failed before shared catalog alteration"
+				: failure < 3 ? "shared catalog alteration does not support subtransactions"
+							  : "shared catalog top-level transaction identity mismatch");
+			UT_ASSERT_EQ(database_settings_lookups, 0);
+			UT_ASSERT_EQ(database_settings_unbound + database_settings_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_xids, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, failure == 2 ? 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, allocated || failure == 3 ? 400 : InvalidTransactionId);
+		}
+	}
+	database_settings_lookup_active = false;
+}
+
+UT_TEST(test_native_database_settings_context_guards_keep_nonshared_route)
+{
+	for (unsigned form = 0; form < 6; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+
+			for (unsigned guard = 0; guard < 3; guard++) {
+				int caught;
+
+				reset_native_database_settings(binds, form);
+				set_native_operator_mode(mode);
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_database_settings_entry(form);
+				UT_ASSERT_EQ(caught, binds ? 1 : 2);
+				UT_ASSERT_EQ(error_code, !binds		  ? 0
+										 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+													  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				UT_ASSERT_EQ(database_settings_lookups, binds ? 0 : 1);
+				UT_ASSERT_EQ(database_settings_unbound + database_settings_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	database_settings_lookup_active = false;
+}
+
+UT_TEST(test_native_database_settings_utility_warm_guards_preserve_binding)
+{
+	for (unsigned form = 0; form < 6; form++) {
+		for (unsigned guard = 0; guard < 4; guard++) {
+			int caught;
+
+			reset_native_database_settings(true, form);
+			create_sql_entry(database_settings_expected_statement);
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			XactReadOnly = guard == 1;
+			utility_parallel = guard == 2;
+			utility_recovery = guard == 3;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_database_settings_entry(form);
+			UT_ASSERT_EQ(caught, guard ? 1 : 2);
+			UT_ASSERT_EQ(error_code, !guard		  ? 0
+									 : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+												  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT_EQ(database_settings_lookups, guard ? 0 : 1);
+			UT_ASSERT_EQ(database_settings_unbound + database_settings_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_prepares, guard ? 1 : 2);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			UT_ASSERT_EQ(utility_top_xid, 400);
+		}
+	}
+	database_settings_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(165);
+	UT_PLAN(169);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -11374,6 +11589,10 @@ main(void)
 	UT_RUN(test_native_publication_refuses_before_lookup_on_publication_child_and_top_errors);
 	UT_RUN(test_native_publication_context_guards_keep_nonshared_route);
 	UT_RUN(test_native_publication_utility_warm_guards_preserve_binding);
+	UT_RUN(test_native_database_settings_binds_before_first_query_in_all_profiles);
+	UT_RUN(test_native_database_settings_refuses_before_lookup_on_publication_child_and_top_errors);
+	UT_RUN(test_native_database_settings_context_guards_keep_nonshared_route);
+	UT_RUN(test_native_database_settings_utility_warm_guards_preserve_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
