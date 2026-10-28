@@ -798,6 +798,140 @@ cluster_ctrc_seal_request_decode(const uint8 *bytes, Size length,
 }
 
 static bool
+ctrc_delegation_close_valid(const ClusterCtrcDelegationCloseV1 *request)
+{
+	return request != NULL && ctrc_txn_key_valid(&request->key)
+		&& ctrc_participant_identity_valid(&request->key, &request->parent)
+		&& ctrc_participant_identity_valid(&request->key, &request->receiver)
+		&& request->parent.node_id != request->receiver.node_id
+		&& request->receiver.node_id != request->key.origin_node_id
+		&& FullTransactionIdIsNormal(request->original_full_xid)
+		&& U64FromFullTransactionId(request->original_full_xid) != UINT64_MAX
+		&& XidFromFullTransactionId(request->original_full_xid) == request->key.xid
+		&& request->request_id != 0 && request->seal_generation != 0
+		&& request->grant_generation != 0 && request->delegation_sequence != 0
+		&& request->delegation_sequence < CLUSTER_CTRC_MAX_PARTICIPANTS
+		&& request->reserved == 0;
+}
+
+static void
+ctrc_seal_identity_encode(const ClusterCtrcParticipantIdentity *identity, uint8 *bytes)
+{
+	ctrc_put_u16_le(bytes, identity->node_id);
+	ctrc_put_u16_le(bytes + 2, identity->reserved16);
+	ctrc_put_u32_le(bytes + 4, identity->capability_record_generation);
+	ctrc_put_u64_le(bytes + 8, identity->boot_incarnation);
+	ctrc_put_u64_le(bytes + 16, identity->formation_epoch);
+	ctrc_put_u64_le(bytes + 24, identity->admission_record_generation);
+}
+
+static void
+ctrc_seal_identity_decode(const uint8 *bytes, ClusterCtrcParticipantIdentity *identity)
+{
+	identity->node_id = ctrc_get_u16_le(bytes);
+	identity->reserved16 = ctrc_get_u16_le(bytes + 2);
+	identity->capability_record_generation = ctrc_get_u32_le(bytes + 4);
+	identity->boot_incarnation = ctrc_get_u64_le(bytes + 8);
+	identity->formation_epoch = ctrc_get_u64_le(bytes + 16);
+	identity->admission_record_generation = ctrc_get_u64_le(bytes + 24);
+}
+
+bool
+cluster_ctrc_delegation_close_encode_v1(const ClusterCtrcDelegationCloseV1 *request,
+	uint8 *bytes, Size length)
+{
+	if (bytes != NULL && length != 0)
+		MemSet(bytes, 0, length);
+	if (bytes == NULL || length != CLUSTER_CTRC_DELEGATION_CLOSE_V1_BYTES
+		|| !ctrc_delegation_close_valid(request)
+		|| !cluster_ctrc_seal_request_encode(&request->key, request->request_id,
+			request->grant_generation, request->seal_generation,
+			request->receiver.capability_record_generation, CTRC_SEAL_CLOSE_AND_CLEAN,
+			bytes, CLUSTER_CTRC_SEAL_REQUEST_BYTES))
+		return false;
+	ctrc_put_u32_le(bytes + 36, request->parent.node_id);
+	ctrc_put_u16_le(bytes + 68, CLUSTER_CTRC_DELEGATION_CLOSE_WIRE_VERSION);
+	ctrc_put_u16_le(bytes + 70, CLUSTER_CTRC_DELEGATION_CLOSE_V1_BYTES);
+	ctrc_seal_identity_encode(&request->parent, bytes + 136);
+	ctrc_seal_identity_encode(&request->receiver, bytes + 168);
+	ctrc_put_u64_le(bytes + 200, request->delegation_sequence);
+	ctrc_put_u64_le(bytes + 208, U64FromFullTransactionId(request->original_full_xid));
+	return true;
+}
+
+bool
+cluster_ctrc_delegation_close_decode_v1(const uint8 *bytes, Size length,
+	uint64 authenticated_system_identifier, int32 envelope_source_node, int32 local_node,
+	uint64 current_epoch, ClusterCtrcDelegationCloseV1 *request_out)
+{
+	uint8 prefix[CLUSTER_CTRC_SEAL_REQUEST_BYTES];
+	ClusterCtrcSealRequestV1 original;
+	ClusterCtrcDelegationCloseV1 request = { 0 };
+
+	if (request_out != NULL)
+		MemSet(request_out, 0, sizeof(*request_out));
+	if (bytes == NULL || request_out == NULL
+		|| length != CLUSTER_CTRC_DELEGATION_CLOSE_V1_BYTES
+		|| envelope_source_node < 0 || envelope_source_node >= CLUSTER_CTRC_MAX_PARTICIPANTS
+		|| local_node < 0 || local_node >= CLUSTER_CTRC_MAX_PARTICIPANTS
+		|| ctrc_get_u16_le(bytes + 68) != CLUSTER_CTRC_DELEGATION_CLOSE_WIRE_VERSION
+		|| ctrc_get_u16_le(bytes + 70) != CLUSTER_CTRC_DELEGATION_CLOSE_V1_BYTES
+		|| bytes[55] != CTRC_SEAL_CLOSE_AND_CLEAN
+		|| ctrc_get_u32_le(bytes + 36) != (uint32)envelope_source_node)
+		return false;
+
+	/* Only the explicit new domain normalizes its private copy for the old
+	 * key parser. No wire2 field or reserved byte acquires a new meaning. */
+	memcpy(prefix, bytes, sizeof(prefix));
+	ctrc_put_u32_le(prefix + 36, ctrc_get_u16_le(bytes + 16));
+	ctrc_put_u16_le(prefix + 68, CLUSTER_CTRC_WIRE_VERSION);
+	ctrc_put_u16_le(prefix + 70, CLUSTER_CTRC_SEAL_REQUEST_BYTES);
+	if (!cluster_ctrc_seal_request_decode(prefix, sizeof(prefix), authenticated_system_identifier,
+		ctrc_get_u16_le(bytes + 16), local_node, current_epoch, &original, &request.key))
+		return false;
+	ctrc_seal_identity_decode(bytes + 136, &request.parent);
+	ctrc_seal_identity_decode(bytes + 168, &request.receiver);
+	request.request_id = original.request_id;
+	request.grant_generation = original.grant_generation;
+	request.seal_generation = original.seal_generation;
+	request.delegation_sequence = ctrc_get_u64_le(bytes + 200);
+	request.original_full_xid = FullTransactionIdFromU64(ctrc_get_u64_le(bytes + 208));
+	if (!ctrc_delegation_close_valid(&request)
+		|| request.parent.node_id != (uint16)envelope_source_node
+		|| request.receiver.node_id != (uint16)local_node
+		|| request.receiver.capability_record_generation
+			!= original.participant_capability_record_generation)
+		return false;
+	*request_out = request;
+	return true;
+}
+
+/* Common reply envelope only. Delegated requests cannot carry positive ACK
+ * or certificate replies until the original subtree protocol is complete. */
+static bool
+ctrc_seal_reply_request_decode(const uint8 *bytes, Size length, uint64 system_identifier,
+	int32 source, int32 receiver, uint64 epoch, ClusterCtrcSealRequestV1 *request,
+	ClusterCtrcTxnKeyV1 *key)
+{
+	ClusterCtrcDelegationCloseV1 delegated;
+
+	if (length == CLUSTER_CTRC_SEAL_REQUEST_BYTES)
+		return cluster_ctrc_seal_request_decode(bytes, length, system_identifier,
+			source, receiver, epoch, request, key);
+	if (!cluster_ctrc_delegation_close_decode_v1(bytes, length, system_identifier,
+		source, receiver, epoch, &delegated))
+		return false;
+	MemSet(request, 0, sizeof(*request));
+	request->request_id = delegated.request_id;
+	request->cluster_epoch = delegated.key.cluster_epoch;
+	request->seal_generation = delegated.seal_generation;
+	request->suboperation = CTRC_SEAL_CLOSE_AND_CLEAN;
+	request->wire_version = CLUSTER_CTRC_DELEGATION_CLOSE_WIRE_VERSION;
+	*key = delegated.key;
+	return true;
+}
+
+static bool
 ctrc_local_ack_shape_valid(const ClusterCtrcLocalReleaseAckV1 *ack)
 {
 	bool zero_range;
@@ -988,23 +1122,27 @@ cluster_ctrc_seal_reply_encode(const uint8 *request_bytes, Size request_length, 
 
 	if (page != NULL && page_length > 0)
 		MemSet(page, 0, page_length);
-	if (request_bytes == NULL || request_length != CLUSTER_CTRC_SEAL_REQUEST_BYTES || page == NULL
+	if (request_bytes == NULL || (request_length != CLUSTER_CTRC_SEAL_REQUEST_BYTES
+			&& request_length != CLUSTER_CTRC_DELEGATION_CLOSE_V1_BYTES) || page == NULL
 		|| page_length != BLCKSZ || source_node < 0 || source_node >= CLUSTER_CTRC_MAX_PARTICIPANTS
 		|| destination_node < 0 || destination_node >= CLUSTER_CTRC_MAX_PARTICIPANTS)
 		return false;
 	current_epoch = ctrc_get_u64_le(request_bytes + 8);
-	if (!cluster_ctrc_seal_request_decode(
+	if (!ctrc_seal_reply_request_decode(
 			request_bytes, request_length,
 			ack != NULL ? ack->transaction_key.system_identifier : UINT64_C(1), destination_node,
 			source_node, current_epoch, &request, &ignored_key)
 		|| !ctrc_reply_result_valid(result, request.suboperation, first_reason, ack)
+		|| (request.wire_version == CLUSTER_CTRC_DELEGATION_CLOSE_WIRE_VERSION
+			&& (ack != NULL || result == CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK
+				|| result == CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED))
 		|| (ack != NULL
 			&& (!ctrc_local_ack_shape_valid(ack)
 				|| !ctrc_ack_matches_request(ack, request_bytes, source_node, destination_node))))
 		return false;
 
 	ctrc_put_u32_le(page + 0, CLUSTER_CTRC_WIRE_MAGIC);
-	ctrc_put_u16_le(page + 4, CLUSTER_CTRC_WIRE_VERSION);
+	ctrc_put_u16_le(page + 4, request.wire_version);
 	ctrc_put_u16_le(page + 6, CLUSTER_CTRC_REPLY_HEADER_BYTES);
 	ctrc_put_u64_le(page + 8, request.request_id);
 	ctrc_put_u64_le(page + 16, request.cluster_epoch);
@@ -1049,18 +1187,19 @@ cluster_ctrc_seal_reply_decode(const uint8 *page, Size page_length, const uint8 
 	if (ack_out != NULL)
 		MemSet(ack_out, 0, sizeof(*ack_out));
 	if (page == NULL || request_bytes == NULL || header_out == NULL || ack_out == NULL
-		|| page_length != BLCKSZ || request_length != CLUSTER_CTRC_SEAL_REQUEST_BYTES
+		|| page_length != BLCKSZ || (request_length != CLUSTER_CTRC_SEAL_REQUEST_BYTES
+			&& request_length != CLUSTER_CTRC_DELEGATION_CLOSE_V1_BYTES)
 		|| expected_source_node < 0 || expected_source_node >= CLUSTER_CTRC_MAX_PARTICIPANTS
 		|| expected_destination_node < 0
 		|| expected_destination_node >= CLUSTER_CTRC_MAX_PARTICIPANTS)
 		return false;
 	current_epoch = ctrc_get_u64_le(request_bytes + 8);
-	if (!cluster_ctrc_seal_request_decode(request_bytes, request_length, UINT64_C(1),
+	if (!ctrc_seal_reply_request_decode(request_bytes, request_length, UINT64_C(1),
 										  expected_destination_node, expected_source_node,
 										  current_epoch, &request, &ignored_key)
 		|| !cluster_ctrc_sha256_exact(request_bytes, request_length, request_digest)
 		|| ctrc_get_u32_le(page + 0) != CLUSTER_CTRC_WIRE_MAGIC
-		|| ctrc_get_u16_le(page + 4) != CLUSTER_CTRC_WIRE_VERSION
+		|| ctrc_get_u16_le(page + 4) != request.wire_version
 		|| ctrc_get_u16_le(page + 6) != CLUSTER_CTRC_REPLY_HEADER_BYTES
 		|| ctrc_get_u64_le(page + 8) != request.request_id
 		|| ctrc_get_u64_le(page + 16) != request.cluster_epoch
@@ -1073,6 +1212,9 @@ cluster_ctrc_seal_reply_decode(const uint8 *page, Size page_length, const uint8 
 		return false;
 
 	carries_ack = page[40] == CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK;
+	if (request.wire_version == CLUSTER_CTRC_DELEGATION_CLOSE_WIRE_VERSION
+		&& (carries_ack || page[40] == CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED))
+		return false;
 	if (!ctrc_reply_result_valid((ClusterCtrcSealReplyResult)page[40], page[41],
 								 ctrc_get_u16_le(page + 42), carries_ack ? &ack : NULL)
 		|| ctrc_get_u16_le(page + 46) != (carries_ack ? CLUSTER_CTRC_LOCAL_ACK_BYTES : 0))
@@ -7541,6 +7683,62 @@ cluster_ctrc_participant_request_apply(ClusterCtrcParticipantEntry *participant,
 	*ack_summary = *ack_out;
 	*first_reason = 0;
 	return CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK;
+}
+
+ClusterCtrcSealReplyResult
+cluster_ctrc_participant_delegated_close_shared(const ClusterCtrcDelegationCloseV1 *request,
+	uint16 *first_reason)
+{
+#ifndef CLUSTER_CTRC_UNIT_TEST
+	ClusterCtrcParticipantEntry *participant;
+	ClusterCtrcLocalReleaseAckV1 ignored_ack;
+	ClusterCtrcSealReplyResult result = CTRC_SEAL_REPLY_BLOCKED_RETAIN;
+	uint64 index;
+	uint8 state_before;
+	bool progressed = false;
+
+	if (first_reason != NULL)
+		*first_reason = CTRC_SEAL_REASON_IDENTITY;
+	if (first_reason == NULL || !ctrc_delegation_close_valid(request)
+		|| cluster_node_id < 0 || request->receiver.node_id != (uint16)cluster_node_id
+		|| !cluster_ctrc_shmem_ready()
+		|| !ctrc_participant_index(&request->key, request->receiver.node_id, &index))
+		return result;
+	ctrc_participant_locks_acquire(ctrc_participant_lock_mask(index));
+	LWLockAcquire(&CtrcShared->receipt_lock, LW_SHARED);
+	participant = &ctrc_participant_entries()[index];
+	state_before = participant->state;
+	/* Never create a tombstone, adopt an incoming merge parent, or backfill
+	 * original identity. The existing accepted path remains authoritative. */
+	if ((state_before == CTRC_PARTICIPANT_OPEN
+			|| state_before == CTRC_PARTICIPANT_CLOSED_DRAINING)
+		&& memcmp(&participant->key, &request->key, sizeof(request->key)) == 0
+		&& memcmp(&participant->identity, &request->receiver, sizeof(request->receiver)) == 0
+		&& participant->grant_generation == request->grant_generation
+		&& FullTransactionIdEquals(participant->original_full_xid, request->original_full_xid)
+		&& participant->delegation_parent.sequence == request->delegation_sequence
+		&& memcmp(&participant->delegation_parent.receiver, &request->parent,
+			sizeof(request->parent)) == 0
+		&& ctrc_participant_delegations_valid(participant)) {
+		result = cluster_ctrc_participant_request_apply(participant,
+			&ctrc_participant_ack_entries()[index], &request->key, &request->receiver,
+			request->grant_generation, request->seal_generation, CTRC_SEAL_CLOSE_AND_CLEAN,
+			first_reason, &ignored_ack);
+		progressed = result == CTRC_SEAL_REPLY_PENDING_DRAIN
+			&& state_before == CTRC_PARTICIPANT_OPEN
+			&& participant->state == CTRC_PARTICIPANT_CLOSED_DRAINING;
+	}
+	LWLockRelease(&CtrcShared->receipt_lock);
+	ctrc_participant_locks_release(ctrc_participant_lock_mask(index));
+	if (progressed)
+		ctrc_semantic_progress(true);
+	return result;
+#else
+	(void)request;
+	if (first_reason != NULL)
+		*first_reason = CTRC_SEAL_REASON_IDENTITY;
+	return CTRC_SEAL_REPLY_BLOCKED_RETAIN;
+#endif
 }
 
 static bool

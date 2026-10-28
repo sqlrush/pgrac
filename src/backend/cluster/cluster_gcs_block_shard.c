@@ -100,9 +100,19 @@ cluster_ctrc_route_get_u64_le(const uint8 *bytes)
 		   | ((uint64)cluster_ctrc_route_get_u32_le(bytes + 4) << 32);
 }
 
+/* Length-only demultiplexing must never steal another existing family. */
+StaticAssertDecl(CLUSTER_CTRC_DELEGATION_CLOSE_V1_BYTES != sizeof(GcsBlockForwardPayload),
+	"delegated CLOSE must not alias legacy forwards");
+StaticAssertDecl(CLUSTER_CTRC_DELEGATION_CLOSE_V1_BYTES != sizeof(ClusterR4CrForwardPayload),
+	"delegated CLOSE must not alias R4 forwards");
+StaticAssertDecl(CLUSTER_CTRC_DELEGATION_CLOSE_V1_BYTES != CLUSTER_CURRENT_MX_DESCRIBE_FORWARD_SIZE,
+	"delegated CLOSE must not alias current-MX forwards");
+StaticAssertDecl(CLUSTER_CTRC_DELEGATION_CLOSE_V1_BYTES != CLUSTER_CURRENT_MX_PROOF_FORWARD_SIZE,
+	"delegated CLOSE must not alias current-MX proof forwards");
+
 /* The full authenticated selector is checked by the receiving handler.  The
  * staging router validates the closed wire domain and the exact fields used
- * to derive affinity, so a 136-byte collision cannot fall through to a
+ * to derive affinity, so a CTRC-length collision cannot fall through to a
  * BufferTag route or split one request between workers. */
 static bool
 cluster_ctrc_payload_route_tag(const void *payload, uint16 payload_len, BufferTag *tag)
@@ -112,14 +122,17 @@ cluster_ctrc_payload_route_tag(const void *payload, uint16 payload_len, BufferTa
 	uint64 epoch;
 	uint32 requester_node;
 	uint32 requester_backend;
+	bool delegated = payload_len == CLUSTER_CTRC_DELEGATION_CLOSE_V1_BYTES;
 
-	if (payload == NULL || tag == NULL || payload_len != CLUSTER_CTRC_SEAL_REQUEST_BYTES
+	if (payload == NULL || tag == NULL || (payload_len != CLUSTER_CTRC_SEAL_REQUEST_BYTES && !delegated)
 		|| cluster_ctrc_route_get_u16_le(bytes + 60) != 0
 		|| bytes[62] != CLUSTER_CTRC_SELECTOR_VERSION || bytes[63] != CLUSTER_CTRC_FORWARD_KIND
 		|| cluster_ctrc_route_get_u32_le(bytes + 64) != CLUSTER_CTRC_WIRE_MAGIC
-		|| cluster_ctrc_route_get_u16_le(bytes + 68) != CLUSTER_CTRC_WIRE_VERSION
-		|| cluster_ctrc_route_get_u16_le(bytes + 70) != CLUSTER_CTRC_SEAL_REQUEST_BYTES
-		|| (bytes[55] != CTRC_SEAL_CLOSE_AND_CLEAN && bytes[55] != CTRC_SEAL_CERTIFICATE_COMMITTED)
+		|| cluster_ctrc_route_get_u16_le(bytes + 68)
+			!= (delegated ? CLUSTER_CTRC_DELEGATION_CLOSE_WIRE_VERSION : CLUSTER_CTRC_WIRE_VERSION)
+		|| cluster_ctrc_route_get_u16_le(bytes + 70) != payload_len
+		|| (bytes[55] != CTRC_SEAL_CLOSE_AND_CLEAN
+			&& (delegated || bytes[55] != CTRC_SEAL_CERTIFICATE_COMMITTED))
 		|| cluster_ctrc_route_get_u32_le(bytes + 128) == 0
 		|| cluster_ctrc_route_get_u32_le(bytes + 132) != 0)
 		return false;
@@ -172,7 +185,8 @@ cluster_gcs_block_payload_shard(uint8 msg_type, const void *payload, uint16 payl
 		tag = &resource_x_tag;
 		break;
 	case PGRAC_IC_MSG_GCS_BLOCK_FORWARD:
-		if (payload_len == CLUSTER_CTRC_SEAL_REQUEST_BYTES) {
+		if (payload_len == CLUSTER_CTRC_SEAL_REQUEST_BYTES
+			|| payload_len == CLUSTER_CTRC_DELEGATION_CLOSE_V1_BYTES) {
 			if (!cluster_ctrc_payload_route_tag(payload, payload_len, &route_tag))
 				return -1;
 			tag = &route_tag;

@@ -914,10 +914,52 @@ UT_TEST(test_resource_x_v3_image_routes_complete_validated_frame)
 		payload, bytes, CLUSTER_LMS_MAX_WORKERS), -1);
 }
 
+UT_TEST(test_ctrc_forward216_routes_explicit_parent_only_close)
+{
+	uint8 bytes[CLUSTER_CTRC_DELEGATION_CLOSE_V1_BYTES + 1] = { 0 };
+	ClusterCtrcSealRequestV1 prefix = { 0 };
+	BufferTag tag;
+	int expected;
+
+	prefix.request_id = UINT64CONST(0x7788990011223344);
+	prefix.cluster_epoch = 23;
+	prefix.original_requester_node = 1;
+	prefix.requester_backend_id = CLUSTER_CTRC_INTERNAL_ENDPOINT;
+	prefix.suboperation = CTRC_SEAL_CLOSE_AND_CLEAN;
+	prefix.selector_version = CLUSTER_CTRC_SELECTOR_VERSION;
+	prefix.forward_kind = CLUSTER_CTRC_FORWARD_KIND;
+	prefix.magic = CLUSTER_CTRC_WIRE_MAGIC;
+	prefix.wire_version = CLUSTER_CTRC_DELEGATION_CLOSE_WIRE_VERSION;
+	prefix.wire_length = CLUSTER_CTRC_DELEGATION_CLOSE_V1_BYTES;
+	prefix.participant_capability_record_generation = 29;
+	memcpy(bytes, &prefix, sizeof(prefix));
+	tag = GcsBlockCurrentMxRouteTagMake(prefix.request_id, prefix.cluster_epoch,
+		prefix.original_requester_node, prefix.requester_backend_id);
+	expected = cluster_lms_shard_for_tag(&tag, CLUSTER_LMS_MAX_WORKERS);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
+		bytes, CLUSTER_CTRC_DELEGATION_CLOSE_V1_BYTES, CLUSTER_LMS_MAX_WORKERS), expected);
+	for (unsigned fault = 0; fault < 7; fault++) {
+		Size length = CLUSTER_CTRC_DELEGATION_CLOSE_V1_BYTES;
+
+		memcpy(bytes, &prefix, sizeof(prefix));
+		switch (fault) {
+			case 0: bytes[68] = CLUSTER_CTRC_WIRE_VERSION; break;
+			case 1: bytes[55] = CTRC_SEAL_CERTIFICATE_COMMITTED; break;
+			case 2: bytes[70]--; break;
+			case 3: bytes[132] = 1; break;
+			case 4: length--; break;
+			case 5: length++; break;
+			case 6: length = CLUSTER_CTRC_SEAL_REQUEST_BYTES; break;
+		}
+		UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
+			bytes, length, CLUSTER_LMS_MAX_WORKERS), -1);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(18);
 	UT_RUN(test_route_matches_shard_for_tag);
 	UT_RUN(test_route_ack_request_interleave_affinity);
 	UT_RUN(test_route_registry_partition);
@@ -935,6 +977,7 @@ main(void)
 	UT_RUN(test_resource_x_reused_types_route_only_after_strict_domain_decode);
 	UT_RUN(test_resource_x_length_collisions_preserve_legacy_domains);
 	UT_RUN(test_resource_x_v3_image_routes_complete_validated_frame);
+	UT_RUN(test_ctrc_forward216_routes_explicit_parent_only_close);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

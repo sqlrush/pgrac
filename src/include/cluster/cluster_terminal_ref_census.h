@@ -39,6 +39,9 @@
 #define CLUSTER_CTRC_FORMAT_VERSION UINT8_C(1)
 #define CLUSTER_CTRC_TXN_KEY_BYTES 96
 #define CLUSTER_CTRC_SEAL_REQUEST_BYTES 136
+/* Explicit parent-bound CLOSE extension; wire2 keeps its origin-only meaning. */
+#define CLUSTER_CTRC_DELEGATION_CLOSE_V1_BYTES 216
+#define CLUSTER_CTRC_DELEGATION_CLOSE_WIRE_VERSION UINT16_C(3)
 #define CLUSTER_CTRC_REPLY_HEADER_BYTES 64
 #define CLUSTER_CTRC_LOCAL_ACK_BYTES 416
 #define CLUSTER_CTRC_REPLY_ACK_OFFSET 64
@@ -404,6 +407,20 @@ typedef struct ClusterCtrcDelegationPathV2 {
 } ClusterCtrcDelegationPathV2;
 StaticAssertDecl(sizeof(ClusterCtrcDelegationPathV2) == 640,
 	"CTRC complete path must remain bounded at 640 bytes");
+
+/* Decoded, process-local request, not a shared or persistent record. A copy
+ * of FullXid is compared with existing custody; it never creates provenance. */
+typedef struct ClusterCtrcDelegationCloseV1 {
+	ClusterCtrcTxnKeyV1 key;
+	ClusterCtrcParticipantIdentity parent;
+	ClusterCtrcParticipantIdentity receiver;
+	FullTransactionId original_full_xid;
+	uint64 request_id;
+	uint64 seal_generation;
+	uint64 delegation_sequence;
+	uint32 grant_generation;
+	uint32 reserved;
+} ClusterCtrcDelegationCloseV1;
 
 typedef struct ClusterCtrcParticipantEntry {
 	ClusterCtrcTxnKeyV1 key;
@@ -905,6 +922,15 @@ extern bool cluster_ctrc_seal_request_decode(const uint8 *bytes, Size length,
 											 uint64 current_epoch,
 											 ClusterCtrcSealRequestV1 *request_out,
 											 ClusterCtrcTxnKeyV1 *key_out);
+extern bool cluster_ctrc_delegation_close_encode_v1(const ClusterCtrcDelegationCloseV1 *request,
+	uint8 *bytes, Size length);
+extern bool cluster_ctrc_delegation_close_decode_v1(const uint8 *bytes, Size length,
+	uint64 authenticated_system_identifier, int32 envelope_source_node, int32 local_node,
+	uint64 current_epoch, ClusterCtrcDelegationCloseV1 *request_out);
+/* Only an existing exact accepted parent can close local admission. Pending
+ * parent/children remain registered; this entry cannot return a release ACK. */
+extern ClusterCtrcSealReplyResult cluster_ctrc_participant_delegated_close_shared(
+	const ClusterCtrcDelegationCloseV1 *request, uint16 *first_reason);
 extern bool cluster_ctrc_local_release_ack_encode(const ClusterCtrcLocalReleaseAckV1 *ack,
 												  uint8 bytes[CLUSTER_CTRC_LOCAL_ACK_BYTES]);
 extern bool cluster_ctrc_local_release_ack_decode(const uint8 bytes[CLUSTER_CTRC_LOCAL_ACK_BYTES],

@@ -20182,7 +20182,7 @@ gcs_block_forward_reply_immediate_deny(const GcsBlockForwardPayload *fwd)
 	pfree(deny_buf);
 }
 
-/* The 136-byte CTRC family is disjoint from every BufferTag forward.  It is
+/* The explicit 136/216-byte CTRC family is disjoint from every BufferTag forward.  It is
  * consumed here even when malformed, so no byte collision can reach legacy
  * holder logic.  A positive ACK is built only while the exact target R4
  * formation/root and both endpoint identities remain current. */
@@ -20190,6 +20190,8 @@ static bool
 gcs_block_try_ctrc_forward136(const ClusterICEnvelope *env, const void *payload)
 {
 	ClusterCtrcSealRequestV1 request;
+	ClusterCtrcDelegationCloseV1 delegated_close;
+	bool delegated;
 	ClusterCtrcTxnKeyV1 key;
 	ClusterCtrcParticipantIdentity identity;
 	ClusterCtrcLocalReleaseAckV1 ack;
@@ -20214,8 +20216,12 @@ gcs_block_try_ctrc_forward136(const ClusterICEnvelope *env, const void *payload)
 	bool source_capability_current;
 	bool bracket_current = false;
 
-	if (env == NULL || payload == NULL || env->payload_length != CLUSTER_CTRC_SEAL_REQUEST_BYTES)
+	if (env == NULL || payload == NULL
+		|| (env->payload_length != CLUSTER_CTRC_SEAL_REQUEST_BYTES
+			&& env->payload_length != CLUSTER_CTRC_DELEGATION_CLOSE_V1_BYTES))
 		return false;
+	delegated = env->payload_length == CLUSTER_CTRC_DELEGATION_CLOSE_V1_BYTES;
+	MemSet(&delegated_close, 0, sizeof(delegated_close));
 	MemSet(&request, 0, sizeof(request));
 	MemSet(&key, 0, sizeof(key));
 	MemSet(&identity, 0, sizeof(identity));
@@ -20225,11 +20231,26 @@ gcs_block_try_ctrc_forward136(const ClusterICEnvelope *env, const void *payload)
 	MemSet(&root, 0, sizeof(root));
 	if (env->msg_type != PGRAC_IC_MSG_GCS_BLOCK_FORWARD
 		|| env->dest_node_id != (uint32)cluster_node_id || env->epoch != cluster_epoch_get_current()
-		|| !cluster_gcs_block_family_on_data_plane()
-		|| !cluster_ctrc_seal_request_decode((const uint8 *)payload, env->payload_length,
-											 GetSystemIdentifier(), (int32)env->source_node_id,
-											 cluster_node_id, cluster_epoch_get_current(), &request,
-											 &key))
+		|| !cluster_gcs_block_family_on_data_plane())
+		return true;
+	if (delegated) {
+		if (!cluster_ctrc_delegation_close_decode_v1((const uint8 *)payload, env->payload_length,
+			GetSystemIdentifier(), (int32)env->source_node_id, cluster_node_id,
+			cluster_epoch_get_current(), &delegated_close))
+			return true;
+		key = delegated_close.key;
+		request.request_id = delegated_close.request_id;
+		request.cluster_epoch = key.cluster_epoch;
+		request.original_requester_node = delegated_close.parent.node_id;
+		request.requester_backend_id = CLUSTER_CTRC_INTERNAL_ENDPOINT;
+		request.grant_generation = delegated_close.grant_generation;
+		request.seal_generation = delegated_close.seal_generation;
+		request.suboperation = CTRC_SEAL_CLOSE_AND_CLEAN;
+		request.participant_capability_record_generation
+			= delegated_close.receiver.capability_record_generation;
+	} else if (!cluster_ctrc_seal_request_decode((const uint8 *)payload, env->payload_length,
+		GetSystemIdentifier(), (int32)env->source_node_id, cluster_node_id,
+		cluster_epoch_get_current(), &request, &key))
 		return true;
 
 	route_tag = GcsBlockCurrentMxRouteTagMake(request.request_id, request.cluster_epoch,
@@ -20262,41 +20283,60 @@ gcs_block_try_ctrc_forward136(const ClusterICEnvelope *env, const void *payload)
 		&& cluster_membership_get_last_admitted_incarnation((int32)env->source_node_id)
 			   == source_incarnation
 		&& cluster_membership_get_last_admitted_incarnation(cluster_node_id) == self_incarnation
-		&& source_incarnation == key.origin_boot_incarnation
+		&& source_incarnation == (delegated ? delegated_close.parent.boot_incarnation
+			: key.origin_boot_incarnation)
 		&& cluster_reconfig_get_observed_epoch((int32)env->source_node_id) == key.formation_epoch
 		&& (!cluster_write_fence_enforcing() || cluster_write_fence_allowed())
 		&& cluster_semantic_activation_enter_r4_terminal_census(&admission)
 			   == CLUSTER_SEMANTIC_ADMISSION_OK) {
-		logical.owner_instance = key.owner_instance;
-		logical.segment_id = key.segment_id;
-		bracket_current
-			= admission.formation_epoch == key.formation_epoch
-			  && admission.record_generation == key.admission_record_generation
-			  && cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
-				  &admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, logical.owner_instance,
-				  logical.segment_id, &root)
-			  && root.intent == CLUSTER_UNDO_PATH_RUNTIME_SHARED && root.root_id == key.root_id
-			  && root.root_generation == key.root_generation
-			  && key.root_descriptor_incarnation == root.root_generation
-			  && cluster_semantic_activation_recheck_r4_terminal_census(&admission);
-		if (bracket_current) {
-			identity.node_id = (uint16)cluster_node_id;
-			identity.capability_record_generation
-				= request.participant_capability_record_generation;
-			identity.boot_incarnation = self_incarnation;
-			identity.formation_epoch = admission.formation_epoch;
-			identity.admission_record_generation = admission.record_generation;
-			result = cluster_ctrc_participant_request_shared(
-				&key, &identity, request.grant_generation, request.seal_generation,
-				(ClusterCtrcSealSuboperation)request.suboperation, &first_reason, &ack);
-			if (result == CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK
-				&& !cluster_semantic_activation_recheck_r4_terminal_census(&admission)) {
-				MemSet(&ack, 0, sizeof(ack));
-				first_reason = CTRC_SEAL_REASON_IDENTITY;
-				result = CTRC_SEAL_REPLY_BLOCKED_RETAIN;
+		PG_TRY();
+		{
+			logical.owner_instance = key.owner_instance;
+			logical.segment_id = key.segment_id;
+			bracket_current
+				= admission.formation_epoch == key.formation_epoch
+				  && admission.record_generation == key.admission_record_generation
+				  && cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
+					  &admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, logical.owner_instance,
+					  logical.segment_id, &root)
+				  && root.intent == CLUSTER_UNDO_PATH_RUNTIME_SHARED && root.root_id == key.root_id
+				  && root.root_generation == key.root_generation
+				  && key.root_descriptor_incarnation == root.root_generation
+				  && cluster_semantic_activation_recheck_r4_terminal_census(&admission);
+			if (bracket_current) {
+				identity.node_id = (uint16)cluster_node_id;
+				identity.capability_record_generation
+					= request.participant_capability_record_generation;
+				identity.boot_incarnation = self_incarnation;
+				identity.formation_epoch = admission.formation_epoch;
+				identity.admission_record_generation = admission.record_generation;
+				if (delegated) {
+					if (memcmp(&identity, &delegated_close.receiver, sizeof(identity)) == 0
+						&& admission.record_generation <= UINT32_MAX
+						&& identity.capability_record_generation == (uint32)admission.record_generation
+						/* Custody uses the OPEN record domain, independently
+						 * of the HELLO connection generation checked above. */
+						&& delegated_close.parent.capability_record_generation
+							== (uint32)admission.record_generation)
+						result = cluster_ctrc_participant_delegated_close_shared(&delegated_close,
+							&first_reason);
+				} else
+					result = cluster_ctrc_participant_request_shared(
+						&key, &identity, request.grant_generation, request.seal_generation,
+						(ClusterCtrcSealSuboperation)request.suboperation, &first_reason, &ack);
+				if (result == CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK
+					&& !cluster_semantic_activation_recheck_r4_terminal_census(&admission)) {
+					MemSet(&ack, 0, sizeof(ack));
+					first_reason = CTRC_SEAL_REASON_IDENTITY;
+					result = CTRC_SEAL_REPLY_BLOCKED_RETAIN;
+				}
 			}
 		}
-		cluster_semantic_activation_leave(&admission);
+		PG_FINALLY();
+		{
+			cluster_semantic_activation_leave(&admission);
+		}
+		PG_END_TRY();
 	}
 
 	reply = (char *)palloc0(reply_total);

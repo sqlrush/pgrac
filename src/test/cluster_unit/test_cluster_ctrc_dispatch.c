@@ -31,6 +31,8 @@ int ctrc_cleaner_original_main(void);
 #include "cluster/cluster_write_fence.h"
 
 int cluster_lms_workers = 1;
+static uint64 dispatch_self_boot = 1101;
+static uint32 dispatch_peer_connection_generation = 29;
 static unsigned enters, leaves, enqueues, rechecks;
 static bool data_plane = true, root_exact = true, fence_ok = true;
 static unsigned fail_recheck;
@@ -71,7 +73,7 @@ GetSystemIdentifier(void)
 uint64
 cluster_qvotec_get_self_incarnation(void)
 {
-	return 1101;
+	return dispatch_self_boot;
 }
 uint64
 cluster_membership_get_last_admitted_incarnation(int node)
@@ -100,7 +102,7 @@ cluster_sf_peer_capability_generation_matches(int node pg_attribute_unused(),
 											  uint32 required pg_attribute_unused(),
 											  uint32 generation)
 {
-	return generation == 29;
+	return generation == dispatch_peer_connection_generation;
 }
 ClusterSemanticAdmissionResult
 cluster_semantic_activation_enter_r4_terminal_census(ClusterSemanticAdmissionToken *token)
@@ -175,6 +177,8 @@ static void
 reset_dispatch_fixture(void)
 {
 	reset_fixture();
+	dispatch_self_boot = 1101;
+	dispatch_peer_connection_generation = 29;
 	test_capability_generation = 29;
 	test_cluster_epoch = 23;
 	enters = leaves = enqueues = rechecks = fail_recheck = 0;
@@ -788,8 +792,12 @@ UT_TEST(test_actual_gcs_mixed_operations_preserve_order_and_remote_enqueue)
 	UT_ASSERT_EQ(allocated, 0);
 }
 
+#ifndef CTRC_DISPATCH_MAIN
+#define CTRC_DISPATCH_MAIN main
+#endif
+int CTRC_DISPATCH_MAIN(void);
 int
-main(void)
+CTRC_DISPATCH_MAIN(void)
 {
 	UT_PLAN(15);
 	UT_RUN(test_actual_gcs_close_replies_share_full_census);
