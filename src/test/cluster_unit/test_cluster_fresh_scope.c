@@ -96,6 +96,7 @@
 #include "tcop/utility.h"
 #include "tcop/tcopprot.h"
 #include "utils/acl.h"
+#include "utils/aclchk_internal.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/rel.h"
@@ -7603,9 +7604,28 @@ static bool owner_lookup_active, owner_expect_binding;
 static unsigned owner_lookups, owner_unbound, owner_bad_lookup;
 static RoleSpec owner_role;
 
+/* Object privilege changes stop before native grantor or target resolution. */
+static bool acl_grant_lookup_active, acl_grant_expect_binding, acl_grant_mismatched_grantor;
+static unsigned acl_grant_lookups, acl_grant_lookup_kind, acl_grant_expected_boundary;
+static unsigned acl_grant_unbound, acl_grant_bad_lookup;
+static GrantStmt native_acl_grant_statement;
+static RoleSpec acl_grant_grantor;
+static List acl_grant_objects;
+
 Oid
 get_rolespec_oid(const RoleSpec *role, bool missing_ok)
 {
+	if (acl_grant_lookup_active) {
+		acl_grant_lookups++;
+		acl_grant_lookup_kind = 1;
+		if (acl_grant_expect_binding && utility_binds == 0)
+			acl_grant_unbound++;
+		if (acl_grant_expected_boundary != 1 || role != &acl_grant_grantor || missing_ok)
+			acl_grant_bad_lookup++;
+		if (acl_grant_mismatched_grantor)
+			return 11;			 /* Controlled mismatch exercises the original refusal. */
+		siglongjmp(boundary, 2); /* Before the actual grantor query. */
+	}
 	if (role_grant_lookup_active) {
 		role_grant_lookups++;
 		role_grant_lookup_kind = 1;
@@ -14133,10 +14153,287 @@ UT_TEST(test_native_depends_scope_refusals_match_utility_before_binding)
 	depends_lookup_active = false;
 }
 
+static void
+observe_native_acl_grant_target(ObjectType type, List *objects, unsigned kind)
+{
+	if (!acl_grant_lookup_active)
+		siglongjmp(boundary, 3);
+	acl_grant_lookups++;
+	acl_grant_lookup_kind = kind;
+	if (acl_grant_expect_binding && utility_binds == 0)
+		acl_grant_unbound++;
+	if (acl_grant_expected_boundary != kind || type != native_acl_grant_statement.objtype
+		|| objects != &acl_grant_objects)
+		acl_grant_bad_lookup++;
+}
+
+static List *
+objectNamesToOids(ObjectType objtype, List *objnames, bool is_grant)
+{
+	observe_native_acl_grant_target(objtype, objnames, 2);
+	if (is_grant != native_acl_grant_statement.is_grant)
+		acl_grant_bad_lookup++;
+	siglongjmp(boundary, 2); /* Before actual object resolution. */
+}
+
+static List *
+objectsInSchemaToOids(ObjectType objtype, List *nspnames)
+{
+	observe_native_acl_grant_target(objtype, nspnames, 3);
+	siglongjmp(boundary, 2); /* Before actual schema resolution. */
+}
+
+#include "test_cluster_fresh_acl_grant.inc"
+static Node *acl_grant_expected_statement;
+static RangeVar acl_grant_relation;
+static String acl_grant_name;
+static Integer acl_grant_large_object;
+static ListCell acl_grant_name_cell, acl_grant_object_cell;
+static List acl_grant_names;
+static ObjectWithArgs acl_grant_routine;
+static const ObjectType acl_grant_targets[]
+	= { OBJECT_TABLE,	 OBJECT_SEQUENCE,	OBJECT_FDW,			OBJECT_FOREIGN_SERVER,
+		OBJECT_FUNCTION, OBJECT_PROCEDURE,	OBJECT_ROUTINE,		OBJECT_DATABASE,
+		OBJECT_DOMAIN,	 OBJECT_LANGUAGE,	OBJECT_LARGEOBJECT, OBJECT_PARAMETER_ACL,
+		OBJECT_SCHEMA,	 OBJECT_TABLESPACE, OBJECT_TYPE,		OBJECT_TABLE,
+		OBJECT_SEQUENCE, OBJECT_FUNCTION,	OBJECT_PROCEDURE,	OBJECT_ROUTINE };
+
+static void
+reset_native_acl_grant(bool expect_binding, unsigned form)
+{
+	unsigned target = form % 20;
+	unsigned action = (form / 20) % 4;
+	bool explicit_grantor = form >= 80;
+	ObjectType type = acl_grant_targets[target];
+	Node *object;
+
+	reset_create_preflight();
+	acl_grant_lookup_active = true;
+	acl_grant_expect_binding = expect_binding;
+	acl_grant_mismatched_grantor = false;
+	acl_grant_lookups = acl_grant_lookup_kind = acl_grant_unbound = acl_grant_bad_lookup = 0;
+	acl_grant_expected_boundary = explicit_grantor ? 1 : target < 15 ? 2 : 3;
+	acl_grant_grantor = (RoleSpec){ .type = T_RoleSpec,
+									.roletype = ROLESPEC_CSTRING,
+									.rolename = "grant_current_user" };
+	acl_grant_relation = (RangeVar){ .type = T_RangeVar, .relname = "grant_relation" };
+	acl_grant_name = (String){ .type = T_String, .sval = "grant_object" };
+	acl_grant_large_object = (Integer){ .type = T_Integer, .ival = 701 };
+	acl_grant_name_cell = (ListCell){ .ptr_value = &acl_grant_name };
+	acl_grant_names
+		= (List){ .type = T_List, .length = 1, .max_length = 1, .elements = &acl_grant_name_cell };
+	acl_grant_routine = (ObjectWithArgs){ .type = T_ObjectWithArgs, .objname = &acl_grant_names };
+	if (target >= 15)
+		object = (Node *)&acl_grant_name;
+	else if (type == OBJECT_TABLE || type == OBJECT_SEQUENCE)
+		object = (Node *)&acl_grant_relation;
+	else if (type == OBJECT_FUNCTION || type == OBJECT_PROCEDURE || type == OBJECT_ROUTINE)
+		object = (Node *)&acl_grant_routine;
+	else if (type == OBJECT_DOMAIN || type == OBJECT_TYPE)
+		object = (Node *)&acl_grant_names;
+	else if (type == OBJECT_LARGEOBJECT)
+		object = (Node *)&acl_grant_large_object;
+	else
+		object = (Node *)&acl_grant_name;
+	acl_grant_object_cell = (ListCell){ .ptr_value = object };
+	acl_grant_objects = (List){ .type = T_List,
+								.length = 1,
+								.max_length = 1,
+								.elements = &acl_grant_object_cell };
+	native_acl_grant_statement
+		= (GrantStmt){ .type = T_GrantStmt,
+					   .is_grant = action < 2,
+					   .targtype = target < 15 ? ACL_TARGET_OBJECT : ACL_TARGET_ALL_IN_SCHEMA,
+					   .objtype = type,
+					   .objects = &acl_grant_objects,
+					   .grant_option = action == 1 || action == 3,
+					   .grantor = explicit_grantor ? &acl_grant_grantor : NULL,
+					   .behavior = action == 3 ? DROP_CASCADE : DROP_RESTRICT };
+	acl_grant_expected_statement = (Node *)&native_acl_grant_statement;
+}
+
+static void
+native_acl_grant_entry(void)
+{
+	ExecuteGrantStmt(&native_acl_grant_statement);
+}
+
+UT_TEST(test_native_acl_grant_binds_before_first_query_in_all_profiles)
+{
+	for (unsigned form = 0; form < 160; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_acl_grant(binds, form);
+			set_native_operator_mode(mode);
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_acl_grant_entry();
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(acl_grant_lookups, repeat + 1);
+				UT_ASSERT_EQ(acl_grant_lookup_kind,
+							 acl_grant_lookups ? acl_grant_expected_boundary : 0);
+				UT_ASSERT_EQ(acl_grant_unbound, 0);
+				UT_ASSERT_EQ(acl_grant_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	acl_grant_lookup_active = false;
+}
+
+UT_TEST(test_native_acl_grant_refuses_before_lookup_on_publication_child_and_top_errors)
+{
+	for (unsigned form = 0; form < 160; form++) {
+		for (unsigned failure = 0; failure < 5; failure++) {
+			bool allocated = failure == 0 || failure == 2;
+			int caught;
+
+			reset_native_acl_grant(true, form);
+			if (failure == 0)
+				utility_bind_ok = false;
+			else if (failure == 1 || failure == 2) {
+				if (failure == 2)
+					create_sql_entry(acl_grant_expected_statement);
+				utility_in_child = true;
+			} else {
+				utility_current_xid = 401;
+				utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_acl_grant_entry();
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, failure == 0  ? ERRCODE_DATA_CORRUPTED
+									 : failure < 3 ? ERRCODE_FEATURE_NOT_SUPPORTED
+												   : ERRCODE_INTERNAL_ERROR);
+			UT_ASSERT_STR_EQ(
+				error_message,
+				failure == 0
+					? "canonical ACTIVE publication failed before shared catalog alteration"
+				: failure < 3 ? "shared catalog alteration does not support subtransactions"
+							  : "shared catalog top-level transaction identity mismatch");
+			UT_ASSERT_EQ(acl_grant_lookups, 0);
+			UT_ASSERT_EQ(acl_grant_lookup_kind,
+						 acl_grant_lookups ? acl_grant_expected_boundary : 0);
+			UT_ASSERT_EQ(acl_grant_unbound + acl_grant_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_xids, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, failure == 2 ? 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, allocated || failure == 3 ? 400 : InvalidTransactionId);
+		}
+	}
+	acl_grant_lookup_active = false;
+}
+
+UT_TEST(test_native_acl_grant_context_guards_keep_nonshared_route)
+{
+	for (unsigned form = 0; form < 160; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+
+			for (unsigned guard = 0; guard < 3; guard++) {
+				int caught;
+
+				reset_native_acl_grant(binds, form);
+				set_native_operator_mode(mode);
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_acl_grant_entry();
+				UT_ASSERT_EQ(caught, binds ? 1 : 2);
+				UT_ASSERT_EQ(error_code, !binds		  ? 0
+										 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+													  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				if (binds)
+					UT_ASSERT(strstr(error_message,
+									 native_acl_grant_statement.is_grant ? "GRANT" : "REVOKE")
+							  != NULL);
+				UT_ASSERT_EQ(acl_grant_lookups, binds ? 0 : 1);
+				UT_ASSERT_EQ(acl_grant_lookup_kind,
+							 acl_grant_lookups ? acl_grant_expected_boundary : 0);
+				UT_ASSERT_EQ(acl_grant_unbound + acl_grant_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	acl_grant_lookup_active = false;
+}
+
+UT_TEST(test_native_acl_grant_utility_warm_guards_preserve_binding)
+{
+	for (unsigned form = 0; form < 160; form++) {
+		for (unsigned guard = 0; guard < 4; guard++) {
+			int caught;
+
+			reset_native_acl_grant(true, form);
+			create_sql_entry(acl_grant_expected_statement);
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			XactReadOnly = guard == 1;
+			utility_parallel = guard == 2;
+			utility_recovery = guard == 3;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_acl_grant_entry();
+			UT_ASSERT_EQ(caught, guard ? 1 : 2);
+			UT_ASSERT_EQ(error_code, !guard		  ? 0
+									 : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+												  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT_EQ(acl_grant_lookups, guard ? 0 : 1);
+			UT_ASSERT_EQ(acl_grant_lookup_kind,
+						 acl_grant_lookups ? acl_grant_expected_boundary : 0);
+			UT_ASSERT_EQ(acl_grant_unbound + acl_grant_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_prepares, guard ? 1 : 2);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			UT_ASSERT_EQ(utility_top_xid, 400);
+		}
+	}
+	acl_grant_lookup_active = false;
+}
+
+UT_TEST(test_native_acl_grant_keeps_original_grantor_mismatch_refusal)
+{
+	for (unsigned form = 80; form < 160; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_acl_grant(binds, form);
+			set_native_operator_mode(mode);
+			acl_grant_mismatched_grantor = true;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_acl_grant_entry();
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, ERRCODE_FEATURE_NOT_SUPPORTED);
+			UT_ASSERT_STR_EQ(error_message, "grantor must be current user");
+			UT_ASSERT_EQ(acl_grant_lookups, 1);
+			UT_ASSERT_EQ(acl_grant_lookup_kind, 1);
+			UT_ASSERT_EQ(acl_grant_unbound + acl_grant_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_prepares, binds ? 1 : 0);
+			UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+		}
+	}
+	acl_grant_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(222);
+	UT_PLAN(227);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -14359,6 +14656,11 @@ main(void)
 	UT_RUN(test_native_depends_context_guards_keep_nonshared_route);
 	UT_RUN(test_native_depends_utility_warm_guards_preserve_binding);
 	UT_RUN(test_native_depends_scope_refusals_match_utility_before_binding);
+	UT_RUN(test_native_acl_grant_binds_before_first_query_in_all_profiles);
+	UT_RUN(test_native_acl_grant_refuses_before_lookup_on_publication_child_and_top_errors);
+	UT_RUN(test_native_acl_grant_context_guards_keep_nonshared_route);
+	UT_RUN(test_native_acl_grant_utility_warm_guards_preserve_binding);
+	UT_RUN(test_native_acl_grant_keeps_original_grantor_mismatch_refusal);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
