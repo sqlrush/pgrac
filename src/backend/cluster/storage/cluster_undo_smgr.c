@@ -971,6 +971,80 @@ cluster_undo_smgr_recovery_ctrc_write_bound_v2(ClusterUndoSmgrRecoveryStampV1 st
 }
 
 bool
+cluster_undo_smgr_recovery_ctrc_readback_v2(ClusterUndoSmgrRecoveryStampV1 stamp,
+	const uint8 *payload, size_t length)
+{
+	RecoveryHeaderStamp *stage = &recovery_header_stamp;
+	PGAlignedBlock expected, observed;
+	const UndoSegmentHeaderData *header = (const UndoSegmentHeaderData *)expected.data;
+	uint8 fixed_payload[CLUSTER_RECOVERY_CTRC_BYTES];
+	volatile uint32 acquired_slot = UINT32_MAX;
+	volatile bool valid = false;
+	ResourceOwner owner;
+	int fd;
+
+	/* Foreign/preparation-only observations neither enter native I/O nor
+	 * poison an otherwise valid, still caller-owned operation. */
+	if (CritSectionCount != 0
+		|| !cluster_undo_smgr_recovery_ctrc_matches_v2(stamp, payload, length)
+		|| !stage->durable)
+		return false;
+	fd = stage->fd;
+	owner = stage->owner;
+	memcpy(fixed_payload, payload, sizeof(fixed_payload));
+	memcpy(expected.data, stage->after.data, BLCKSZ);
+	PG_TRY();
+	{
+		uint32 acquired = UINT32_MAX;
+		struct stat file;
+
+		if (cluster_undo_block0_header_write_lock(header->segment_id,
+				header->owner_instance, &acquired)) {
+			acquired_slot = acquired;
+			/* The lock may have waited. Recheck the complete stage before
+			 * using its saved descriptor, never a newly resolved pathname. */
+			valid = stage->fd == fd && stage->owner == owner && stage->durable
+				&& cluster_undo_smgr_recovery_ctrc_matches_v2(stamp, payload, length)
+				&& memcmp(payload, fixed_payload, sizeof(fixed_payload)) == 0
+				&& memcmp(stage->after.data, expected.data, BLCKSZ) == 0
+				&& fstat(fd, &file) == 0 && recovery_header_stamp_file_matches(&file);
+			if (valid) {
+				ssize_t size = pg_pread(fd, observed.data, BLCKSZ, 0);
+
+				cluster_undo_record_note_smgr_pread();
+				valid = size == BLCKSZ && memcmp(observed.data, expected.data, BLCKSZ) == 0
+					&& fstat(fd, &file) == 0 && recovery_header_stamp_file_matches(&file);
+			}
+		}
+	}
+	PG_CATCH();
+	{
+		/* Never invalidate a replacement stage or release a borrowed lock.
+		 * The original raw FD and recovery protections remain outstanding. */
+		if (stage->fd == fd && stage->owner == owner && stage->token == stamp.token
+			&& stage->kind == RECOVERY_HEADER_CTRC_D0)
+			stage->failed = true;
+		/* ERROR cleared the lock's original holdoff. Restore exactly the
+		 * one consumed by our unlock; a borrowed lock is the caller's duty. */
+		if (acquired_slot != UINT32_MAX) {
+			HOLD_INTERRUPTS();
+			cluster_undo_block0_header_write_unlock(acquired_slot);
+		}
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	cluster_undo_block0_header_write_unlock(acquired_slot);
+	valid = valid && stage->fd == fd && stage->owner == owner && stage->durable
+		&& cluster_undo_smgr_recovery_ctrc_matches_v2(stamp, payload, length)
+		&& memcmp(payload, fixed_payload, sizeof(fixed_payload)) == 0
+		&& memcmp(stage->after.data, expected.data, BLCKSZ) == 0;
+	if (!valid && stage->fd == fd && stage->owner == owner && stage->token == stamp.token
+		&& stage->kind == RECOVERY_HEADER_CTRC_D0)
+		stage->failed = true;
+	return valid;
+}
+
+bool
 cluster_undo_smgr_recovery_ctrc_close_v2(ClusterUndoSmgrRecoveryStampV1 stamp)
 {
 	return recovery_header_stamp_close(stamp, RECOVERY_HEADER_CTRC_D0);
