@@ -48,7 +48,9 @@
 static bool side_native_clog_test;
 #endif
 
+#ifndef TEST_CLUSTER_EPISODE_SIDE_OWNER
 UT_DEFINE_GLOBALS();
+#endif
 
 /* Track the real payload allocator without replacing the production owner,
  * parser or its nested preflight calls. Other targets keep the ordinary object. */
@@ -94,8 +96,10 @@ side_xact_fixture_free(void *ptr)
 #include "test_cluster_undo_header_identity.inc"
 #include "test_cluster_heap_small_scn.inc"
 
+#ifndef TEST_CLUSTER_EPISODE_SIDE_OWNER
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
+#endif
 
 void
 pg_re_throw(void)
