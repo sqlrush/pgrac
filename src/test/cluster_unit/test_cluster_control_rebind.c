@@ -2,13 +2,28 @@
 #include "postgres.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_relmap_arb.h"
+#include "common/cryptohash.h"
+
+static unsigned rebind_owned_hash_calls;
+static pg_cryptohash_ctx *rebind_counted_hash_create(pg_cryptohash_type type);
 
 /* Reuse the actual semantic engine and existing external-input fixture.
  * The cold-start driver's dependencies are not used by this binary. */
 int control_rebind_original_fixture_main(void);
 #define main control_rebind_original_fixture_main
+#define pg_cryptohash_create rebind_counted_hash_create
 #include "test_cluster_r4_activation_fsm.c"
+#undef pg_cryptohash_create
 #undef main
+
+/* Count the real ResourceOwner-dependent provider boundary; retain the
+ * actual configured hash provider and its real output. */
+static pg_cryptohash_ctx *
+rebind_counted_hash_create(pg_cryptohash_type type)
+{
+	rebind_owned_hash_calls++;
+	return pg_cryptohash_create(type);
+}
 
 static ClusterSemanticControlRebindWireV3
 rebind_message(bool ack)
@@ -137,10 +152,15 @@ UT_TEST(rebind_decoder_rejects_wrong_version_reserved_and_identity)
 static void
 rebind_setup(void)
 {
+	ClusterSemanticActivationAckTableV1 ordinary;
 	test_terminal_peer_record_enabled = false;
 	test_terminal_peer_eligible = false;
 	test_source_close_found = false;
 	test_serving_setup(false);
+	/* The original stop helper initializes a table in place (seq0). Real
+	 * ordinary OPEN is published; retain that actual publication domain. */
+	ordinary = *SemanticActivationAckTable;
+	UT_ASSERT(semantic_activation_ack_table_publish(&ordinary));
 	memset(&semantic_control_rebind, 0, sizeof(semantic_control_rebind));
 }
 
@@ -219,11 +239,13 @@ UT_TEST(rebind_baseline_does_not_refresh_the_original_ack_or_admit_reconnect)
 	UT_ASSERT(memcmp(&table, SemanticActivationAckTable, sizeof(table)) == 0);
 	UT_ASSERT(memcmp(&saved, &SemanticControlRebindState->baseline, sizeof(saved)) == 0);
 	printf(
-		"# rebind resident shared=%zu owner=%zu pointer=%zu raw-read=%zu total=%zu budget=65536\n",
+		"# rebind resident shared=%zu owner=%zu pointer=%zu raw-read=%zu serving-proof=%zu total=%zu budget=65536\n",
 		MAXALIGN(sizeof(SemanticControlRebindShmem)), sizeof(SemanticControlRebindRuntime),
 		sizeof(SemanticControlRebindState), sizeof(semantic_serving.pgsa),
+		2 * sizeof(ClusterSemanticOpenProofIdentity),
 		MAXALIGN(sizeof(SemanticControlRebindShmem)) + sizeof(SemanticControlRebindRuntime)
-			+ sizeof(SemanticControlRebindState) + sizeof(semantic_serving.pgsa));
+			+ sizeof(SemanticControlRebindState) + sizeof(semantic_serving.pgsa)
+			+ 2 * sizeof(ClusterSemanticOpenProofIdentity));
 	test_first_open_finish();
 }
 
@@ -689,10 +711,333 @@ UT_TEST(rebind_completion_sequence_exhaustion_is_closed)
 	}
 }
 
+static void
+rebind_finish_current_round(void)
+{
+	rebind_complete_read();
+	rebind_tick(1000001);
+	for (unsigned peer = 1; peer < 4; peer++) {
+		ClusterSemanticControlRebindWireV3 ack = rebind_ack(peer);
+		UT_ASSERT(rebind_receive(&ack, peer, 0));
+		rebind_tick(1000002 + peer);
+	}
+	UT_ASSERT_EQ(semantic_control_rebind.phase, SEMANTIC_CONTROL_REBIND_COMPLETE);
+}
+
+static void
+rebind_finish_proof(void)
+{
+	rebind_start();
+	rebind_finish_current_round();
+}
+
+static ClusterSemanticAdmissionToken
+rebind_resource_x_token(void)
+{
+	ClusterSemanticAdmissionToken token = {
+		.feature_bit = CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1,
+		.record_generation = 6,
+		.formation_epoch = 7,
+		.side = CLUSTER_SEMANTIC_TARGET_SIDE,
+		.entered = true
+	};
+	return token;
+}
+
+UT_TEST(rebind_reply_only_preserves_the_unchanged_ordinary_proof)
+{
+	ClusterSemanticControlRebindWireV3 request;
+	ClusterSemanticAdmissionToken token = rebind_resource_x_token();
+	const ClusterSemanticActivationAckTableV1 *base;
+
+	rebind_setup();
+	test_serving_finish_root();
+	base = &SemanticControlRebindState->baseline.table;
+	request = rebind_message(false);
+	request.coordinator_node = 3;
+	request.member_node = 0;
+	request.round_nonce = 999;
+	request.boot_id = request.admitted_incarnation = base->expected[3].boot_id;
+	request.transition_epoch = base->transition_epoch;
+	request.record_generation = base->record_generation;
+	request.source_feature_bitmap = base->source_feature_bitmap;
+	request.target_feature_bitmap = base->target_feature_bitmap;
+	request.capability_sample_digest = base->capability_sample_digest;
+	request.capability_word = base->expected[3].capability_word;
+	UT_ASSERT(semantic_control_rebind_binding(3, 999, request.proof_binding));
+	UT_ASSERT(rebind_receive(&request, 3, 0));
+	rebind_tick(1000000);
+	IsUnderPostmaster = true;
+	UT_ASSERT_EQ(cluster_semantic_activation_resource_x_peer_open_check(&token, 3, 19),
+		CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH);
+	rebind_complete_read();
+	rebind_tick(1000001);
+	UT_ASSERT_EQ(test_send_calls[3], 1);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&SemanticControlRebindState->completion_seq), 0);
+	IsUnderPostmaster = true;
+	UT_ASSERT_EQ(cluster_semantic_activation_resource_x_peer_open_check(&token, 3, 19),
+		CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH);
+	test_first_open_finish();
+}
+
+/* A completed real collector must become the common consumer proof. Local
+ * capability sampling alone is deliberately insufficient in earlier tests. */
+UT_TEST(rebind_current_completion_authorizes_r4_and_resource_x_consumers)
+{
+	ClusterSemanticAdmissionToken token = {
+		.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+		.record_generation = 6,
+		.formation_epoch = 7,
+		.side = CLUSTER_SEMANTIC_TARGET_SIDE,
+		.entered = true
+	};
+	ClusterSemanticActivationAckTableV1 ordinary;
+	rebind_finish_proof();
+	ordinary = *SemanticActivationAckTable;
+	UT_ASSERT_EQ(ordinary.expected[3].capability_generation, 19);
+	IsUnderPostmaster = true;
+	UT_ASSERT(cluster_semantic_activation_peer_open_matches(
+		&token, 3, CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS, 20));
+	UT_ASSERT(!cluster_semantic_activation_peer_open_matches(
+		&token, 3, CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS, 19));
+	token.feature_bit = CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1;
+	UT_ASSERT_EQ(cluster_semantic_activation_resource_x_peer_open_check(&token, 3, 20),
+		CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH);
+	UT_ASSERT_EQ(cluster_semantic_activation_resource_x_peer_open_check(&token, 3, 19),
+		CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_CAPABILITY_DRIFT);
+	UT_ASSERT(memcmp(&ordinary, SemanticActivationAckTable, sizeof(ordinary)) == 0);
+	test_first_open_finish();
+}
+
+UT_TEST(rebind_partial_proof_waits_only_for_same_key_live_owner)
+{
+	for (unsigned fault = 0; fault < 9; fault++) {
+		ClusterSemanticAdmissionToken token = rebind_resource_x_token();
+		ClusterSemanticResourceXPeerOpenResult result;
+		rebind_start();
+		rebind_complete_read();
+		rebind_tick(1000001);
+		switch (fault) {
+		case 1: test_remote_admitted_incarnations[2]++; break;
+		case 2: test_peer_capability_word ^= 1; break;
+		case 3: test_current_epoch++; break;
+		case 4: test_rebind_proc.cluster_grd_generation++; break;
+		case 5: test_rebind_proc.pid = 0; break;
+		case 6: test_serving_formation++; break;
+		case 7: test_resource_x_gate_snapshot.freeze_generation++; break;
+		case 8: pg_atomic_fetch_add_u64(&SemanticActivationShmem->admission_seq, 2); break;
+		}
+		IsUnderPostmaster = true;
+		result = cluster_semantic_activation_resource_x_peer_open_check(&token, 3, 20);
+		if (fault == 0)
+			UT_ASSERT_EQ(result, CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_REBIND_PENDING);
+		else {
+			UT_ASSERT(result != CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_REBIND_PENDING);
+			UT_ASSERT(result != CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH);
+		}
+		test_first_open_finish();
+	}
+}
+
+UT_TEST(rebind_completion_requires_exact_provenance_and_current_owner)
+{
+	for (unsigned fault = 0; fault < 11; fault++) {
+		ClusterSemanticAdmissionToken token = rebind_resource_x_token();
+		SemanticControlRebindCompletion *proof;
+		rebind_finish_proof();
+		proof = &SemanticControlRebindState->completion;
+		switch (fault) {
+		case 0: proof->proof_binding[0] ^= 1; break;
+		case 1: proof->live_digest[0] ^= 1; break;
+		case 2: proof->nonce++; break;
+		case 3: proof->cut.owner_generation++; break;
+		case 4: proof->cut.base_seq += 2; break;
+		case 5: proof->table.flags |= CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_OPEN_PROOF; break;
+		case 6: proof->table.observed_members_lo &= ~UINT64_C(4); break;
+		case 7: proof->table.observed[2].boot_id++; break;
+		case 8: pg_atomic_fetch_add_u64(&SemanticControlRebindState->completion_seq, 1); break;
+		case 9: test_rebind_proc.pid = 0; break;
+		case 10: test_peer_capability_generation++; break;
+		}
+		IsUnderPostmaster = true;
+		UT_ASSERT(cluster_semantic_activation_resource_x_peer_open_check(&token, 3, 20)
+			!= CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH);
+		test_first_open_finish();
+	}
+}
+
+UT_TEST(rebind_proof_survives_only_original_carrier_invalidation_shape)
+{
+	ClusterSemanticAdmissionToken token = rebind_resource_x_token();
+	ClusterSemanticActivationAckTableV1 retired;
+	rebind_finish_proof();
+	retired = *SemanticActivationAckTable;
+	UT_ASSERT(semantic_activation_ack_image_invalidate(&retired));
+	retired = *SemanticActivationAckTable;
+	IsUnderPostmaster = true;
+	UT_ASSERT_EQ(cluster_semantic_activation_resource_x_peer_open_check(&token, 3, 20),
+		CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH);
+	UT_ASSERT(memcmp(&retired, SemanticActivationAckTable, sizeof(retired)) == 0);
+	SemanticActivationAckTable->capability_sample_digest++;
+	UT_ASSERT(cluster_semantic_activation_resource_x_peer_open_check(&token, 3, 20)
+		!= CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH);
+	test_first_open_finish();
+}
+
+UT_TEST(rebind_terminal_reference_binds_completion_and_all_data_lifetimes)
+{
+	ClusterSemanticAdmissionToken token;
+	ClusterSemanticTerminalPeerSnapshot before, after;
+	ClusterSemanticActivationAckTableV1 ordinary;
+	rebind_setup();
+	test_serving_finish_root();
+	ut_terminal_members_and_sessions();
+	test_terminal_sessions.control_stream_generation = 19;
+	IsUnderPostmaster = true;
+	UT_ASSERT_EQ(cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+		CLUSTER_SEMANTIC_TARGET_SIDE, &token), CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(cluster_semantic_activation_terminal_peer_capture(&token, 3,
+		CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS, &before));
+	ordinary = *SemanticActivationAckTable;
+	test_peer_capability_generation = 20;
+	for (unsigned peer = 0; peer < 4; peer++)
+		test_rebind_stream_serial[peer] += 100;
+	rebind_tick(1000000);
+	rebind_finish_current_round();
+	test_terminal_sessions.control_stream_generation = 20;
+	IsUnderPostmaster = true;
+	UT_ASSERT(!cluster_semantic_activation_terminal_peer_current(&token, &before));
+	UT_ASSERT(cluster_semantic_activation_terminal_peer_capture(&token, 3,
+		CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS, &after));
+	UT_ASSERT_EQ(after.open_proof.source, CLUSTER_SEMANTIC_OPEN_PROOF_REBOUND);
+	UT_ASSERT_EQ(after.open_proof.base_publication_seq, before.ack_publication_seq);
+	UT_ASSERT_EQ(after.open_proof.completion_seq, 2);
+	UT_ASSERT_EQ(after.ack_publication_seq, before.ack_publication_seq);
+	UT_ASSERT(cluster_semantic_activation_terminal_peer_current(&token, &after));
+	test_terminal_sessions.data_stream_generation[0]++;
+	UT_ASSERT(!cluster_semantic_activation_terminal_peer_current(&token, &after));
+	test_terminal_sessions.data_stream_generation[0]--;
+	semantic_control_rebind_clear_completion();
+	UT_ASSERT(!cluster_semantic_activation_terminal_peer_current(&token, &after));
+	UT_ASSERT(memcmp(&ordinary, SemanticActivationAckTable, sizeof(ordinary)) == 0);
+	cluster_semantic_activation_leave(&token);
+	test_first_open_finish();
+}
+
+UT_TEST(rebind_serving_requires_new_original_owner_root_publication)
+{
+	ClusterSemanticActivationRefusal refusal;
+	SemanticServingCut cut;
+	rebind_finish_proof();
+	IsUnderPostmaster = true;
+	UT_ASSERT(semantic_serving_cut_read(&cut));
+	UT_ASSERT_EQ(cut.open_proof.source, CLUSTER_SEMANTIC_OPEN_PROOF_REBOUND);
+	UT_ASSERT_EQ(cut.open_proof.completion_seq, 2);
+	UT_ASSERT(!semantic_serving_ready(&cut));
+	IsUnderPostmaster = false;
+	UT_ASSERT(!cluster_semantic_activation_startup_poll(&refusal));
+	test_serving_tick();
+	UT_ASSERT(semantic_serving.read_seq != 0);
+	test_serving_complete_read();
+	test_serving_tick();
+	UT_ASSERT_EQ(test_serving_calls, 2);
+	MyProc = NULL;
+	UT_ASSERT(cluster_semantic_activation_startup_poll(&refusal));
+	test_open_proof_caps_busy = true;
+	UT_ASSERT(!cluster_semantic_activation_startup_poll(&refusal));
+	test_open_proof_caps_busy = false;
+	test_peer_capability_generation++;
+	UT_ASSERT(!cluster_semantic_activation_startup_poll(&refusal));
+	MyProc = &test_rebind_proc;
+	test_first_open_finish();
+}
+
+UT_TEST(rebind_postmaster_view_never_calls_the_owned_hash_provider)
+{
+	SemanticServingCut cut;
+
+	rebind_finish_proof();
+	IsUnderPostmaster = false;
+	MyProc = NULL;
+	rebind_owned_hash_calls = 0;
+	UT_ASSERT(semantic_serving_cut_read(&cut));
+	UT_ASSERT_EQ(cut.open_proof.source, CLUSTER_SEMANTIC_OPEN_PROOF_REBOUND);
+	UT_ASSERT_EQ(rebind_owned_hash_calls, 0);
+	MyProc = &test_rebind_proc;
+	test_first_open_finish();
+}
+
+UT_TEST(rebind_capability_contention_waits_without_hiding_known_contradictions)
+{
+	for (unsigned complete = 0; complete < 2; complete++) {
+		for (unsigned fault = 0; fault < 5; fault++) {
+			ClusterSemanticAdmissionToken token = rebind_resource_x_token();
+			rebind_start();
+			if (complete)
+				rebind_finish_current_round();
+			test_open_proof_caps_busy = fault != 4;
+			if (fault == 4)
+				test_capability_missing_peer = 2;
+			if (fault == 1)
+				test_remote_admitted_incarnations[2]++;
+			if (fault == 2)
+				test_serving_formation++;
+			if (fault == 3) {
+				if (complete)
+					SemanticControlRebindState->completion.proof_binding[0] ^= 1;
+				else
+					test_resource_x_gate_snapshot.freeze_generation++;
+			}
+			IsUnderPostmaster = true;
+			UT_ASSERT_EQ(cluster_semantic_activation_resource_x_peer_open_check(&token, 3, 20),
+				fault == 0 || fault == 4 ? CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_IMAGE_OBSERVATION_PENDING
+				: CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_IMAGE_NOT_CURRENT);
+			test_first_open_finish();
+		}
+	}
+}
+
+UT_TEST(rebind_stack_hash_keeps_the_same_sha256_bytes)
+{
+	const unsigned lengths[] = { 0, 1, 55, 56, 64, 96, 1236, 1280 };
+	const uint8 abc[32] = {
+		0xba,0x78,0x16,0xbf,0x8f,0x01,0xcf,0xea,0x41,0x41,0x40,0xde,0x5d,0xae,0x22,0x23,
+		0xb0,0x03,0x61,0xa3,0x96,0x17,0x7a,0x9c,0xb4,0x10,0xff,0x61,0xf2,0x00,0x15,0xad
+	};
+	uint8 bytes[1280], actual[32], configured[32];
+
+	for (unsigned at = 0; at < sizeof(bytes); at++)
+		bytes[at] = (uint8)(at * 31 + 7);
+	for (unsigned item = 0; item < lengthof(lengths); item++) {
+		UT_ASSERT(normal_start_sha256(bytes, lengths[item], configured));
+		UT_ASSERT(semantic_control_rebind_sha256(bytes, lengths[item], actual));
+		UT_ASSERT(memcmp(configured, actual, sizeof(actual)) == 0);
+	}
+	UT_ASSERT(semantic_control_rebind_sha256((const uint8 *)"abc", 3, actual));
+	UT_ASSERT(memcmp(abc, actual, sizeof(actual)) == 0);
+}
+
+UT_TEST(rebind_final_observation_contention_is_not_identity_drift)
+{
+	for (unsigned sample = 3; sample <= 4; sample++) {
+		ClusterSemanticAdmissionToken token = rebind_resource_x_token();
+		rebind_finish_proof();
+		test_open_proof_caps_samples = 0;
+		test_open_proof_caps_busy_at = sample;
+		IsUnderPostmaster = true;
+		UT_ASSERT_EQ(cluster_semantic_activation_resource_x_peer_open_check(&token, 3, 20),
+			CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_IMAGE_OBSERVATION_PENDING);
+		test_open_proof_caps_busy_at = 0;
+		UT_ASSERT_EQ(cluster_semantic_activation_resource_x_peer_open_check(&token, 3, 20),
+			CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH);
+		test_first_open_finish();
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(26);
+	UT_PLAN(54);
 	UT_RUN(rebind_codec_has_independent_exact_request_and_ack_bytes);
 	UT_RUN(rebind_codec_rejects_invalid_identity_without_mutating_output);
 	UT_RUN(rebind_decoder_rejects_wrong_version_reserved_and_identity);
@@ -719,6 +1064,34 @@ main(void)
  UT_RUN(rebind_shared_publication_survives_attaching_without_reset);
  UT_RUN(rebind_invalid_durable_read_never_sends_or_completes);
  UT_RUN(rebind_completion_sequence_exhaustion_is_closed);
+	UT_RUN(rebind_current_completion_authorizes_r4_and_resource_x_consumers);
+	UT_RUN(rebind_reply_only_preserves_the_unchanged_ordinary_proof);
+	UT_RUN(rebind_partial_proof_waits_only_for_same_key_live_owner);
+	UT_RUN(rebind_completion_requires_exact_provenance_and_current_owner);
+	UT_RUN(rebind_proof_survives_only_original_carrier_invalidation_shape);
+	UT_RUN(rebind_terminal_reference_binds_completion_and_all_data_lifetimes);
+	UT_RUN(rebind_serving_requires_new_original_owner_root_publication);
+	UT_RUN(rebind_postmaster_view_never_calls_the_owned_hash_provider);
+	UT_RUN(rebind_capability_contention_waits_without_hiding_known_contradictions);
+	UT_RUN(rebind_stack_hash_keeps_the_same_sha256_bytes);
+	UT_RUN(rebind_final_observation_contention_is_not_identity_drift);
+	UT_RUN(test_145a_restore_open_proof_reconstructs_table);
+	UT_RUN(test_145b_restore_open_proof_fail_closed_on_missing_open);
+	UT_RUN(test_145c_restore_open_proof_fail_closed_on_root_refusal);
+	UT_RUN(test_145d_restore_open_proof_fail_closed_on_membership_drift);
+	UT_RUN(test_145e_restore_open_proof_is_idempotent);
+	UT_RUN(test_145f_restore_open_proof_requires_active_latch);
+	UT_RUN(test_145g_peer_open_matches_consumes_open_proof);
+	UT_RUN(test_145h_resource_x_open_carrier_survives_unavailable_snapshot);
+	UT_RUN(test_145i_resource_x_open_carrier_invalidates_formation_drift);
+	UT_RUN(test_145j_resource_x_peer_match_reports_first_failed_predicate);
+	UT_RUN(test_145l_epoch_zero_resource_x_open_carrier_survives_unavailable_snapshot);
+	UT_RUN(test_145m_resource_x_prepare_carrier_survives_unavailable_snapshot);
+	UT_RUN(test_terminal_peer_stale_origin_has_only_inquiry_qualification);
+	UT_RUN(test_terminal_peer_missing_authority_clears_output);
+	UT_RUN(test_terminal_peer_aba_invalidates_original_snapshot);
+	UT_RUN(test_terminal_peer_mid_sample_drift_is_refused);
+	UT_RUN(test_terminal_peer_uses_actual_recovered_open_carrier);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

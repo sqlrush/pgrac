@@ -156,8 +156,31 @@ typedef enum ClusterSemanticResourceXPeerOpenResult {
 	CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_IMAGE_NOT_CURRENT = 14,
 	CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_CAPABILITY_NOT_READY = 15,
 	CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_TABLE_TORN = 16,
-	CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_IMAGE_OBSERVATION_PENDING = 17
+	CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_IMAGE_OBSERVATION_PENDING = 17,
+	CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_REBIND_PENDING = 18
 } ClusterSemanticResourceXPeerOpenResult;
+
+/* Volatile proof domains: an ordinary ACK sequence is never a rebind
+ * completion sequence. This value is neither a wire nor persistent format. */
+typedef enum ClusterSemanticOpenProofSource {
+	CLUSTER_SEMANTIC_OPEN_PROOF_NONE = 0,
+	CLUSTER_SEMANTIC_OPEN_PROOF_ORDINARY = 1,
+	CLUSTER_SEMANTIC_OPEN_PROOF_REBOUND = 2
+} ClusterSemanticOpenProofSource;
+typedef struct ClusterSemanticOpenProofIdentity {
+	uint64 base_publication_seq, baseline_seq, completion_seq, round_nonce;
+	uint32 source, reserved;
+} ClusterSemanticOpenProofIdentity;
+
+static inline bool
+cluster_semantic_resource_x_peer_open_pending(ClusterSemanticResourceXPeerOpenResult result)
+{
+	return result == CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_AUTHORITY_UNAVAILABLE
+		|| result == CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_CAPABILITY_NOT_READY
+		|| result == CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_TABLE_TORN
+		|| result == CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_IMAGE_OBSERVATION_PENDING
+		|| result == CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_REBIND_PENDING;
+}
 
 /* One read-only R4 gate decision for the tracked buffer-writer choke point. */
 typedef enum ResourceXWriterPath {
@@ -429,6 +452,7 @@ typedef struct ClusterSemanticTerminalPeerSnapshot {
 	uint32 peer_data_channels;
 	int32 peer_node_id;
 	uint32 required_hello_caps;
+	ClusterSemanticOpenProofIdentity open_proof;
 } ClusterSemanticTerminalPeerSnapshot;
 
 /* Caller holds the same entered R4 TARGET token across the original C1b

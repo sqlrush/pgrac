@@ -118,8 +118,16 @@ static union {
 	uint8 bytes[CLUSTER_SEMANTIC_CONTROL_REBIND_STATE_BUDGET];
 } test_rebind_shmem;
 static bool test_rebind_found;
-static PGPROC test_rebind_proc;
+static PGPROC test_rebind_procs[8];
+#define test_rebind_proc test_rebind_procs[7]
 PGPROC *MyProc = &test_rebind_proc;
+static PROC_HDR test_open_proof_proc_header = {
+	.allProcs = test_rebind_procs,
+	.allProcCount = 8
+};
+PROC_HDR *ProcGlobal = &test_open_proof_proc_header;
+static bool test_open_proof_caps_busy;
+static unsigned test_open_proof_caps_samples, test_open_proof_caps_busy_at;
 int cluster_interconnect_heartbeat_interval_ms = 1000;
 static uint64 test_rebind_stream_serial[4];
 static const ClusterICEnvelope *test_rebind_dispatch_envelope;
@@ -810,6 +818,24 @@ cluster_sf_peer_capability_record_snapshot(int32 peer_id, ClusterSfPeerCap *out)
 	return true;
 }
 
+/* Same external cap inputs as the blocking accessor, with explicit original
+ * conditional-lock backpressure; it does not produce a semantic verdict. */
+bool
+cluster_sf_peer_capability_table_try_snapshot(ClusterSfPeerCap *out, uint32 capacity, bool *busy)
+{
+	bool contended = test_open_proof_caps_busy
+		|| ++test_open_proof_caps_samples == test_open_proof_caps_busy_at;
+
+	if (busy != NULL)
+		*busy = contended;
+	if (out == NULL || capacity != CLUSTER_MAX_NODES || contended)
+		return false;
+	for (unsigned node = 0; node < capacity; node++)
+		if (!cluster_sf_peer_capability_record_snapshot(node, &out[node]))
+			return false;
+	return true;
+}
+
 /* The actual leave controller proves this predicate in its own suite. No
  * semantic verdict is stubbed: this suite executes its full real matcher. */
 bool
@@ -1433,6 +1459,10 @@ test_gate_reset(void)
 	memset(&test_rebind_proc, 0, sizeof(test_rebind_proc));
 	test_rebind_proc.cluster_grd_generation = 41;
 	test_rebind_proc.pgprocno = 7;
+	test_rebind_proc.pid = 101;
+	test_open_proof_caps_busy = false;
+	test_open_proof_caps_samples = test_open_proof_caps_busy_at = 0;
+	ProcGlobal = &test_open_proof_proc_header;
 	MyProc = &test_rebind_proc;
 	test_rebind_dispatch_envelope = NULL;
 	memset(&test_rebind_dispatch_ingress, 0, sizeof(test_rebind_dispatch_ingress));

@@ -6307,6 +6307,7 @@ clean distclean maintainer-clean:
 		test_cluster_resource_x_retained_wait_gate.inc \
 		test_cluster_resource_x_predecessor_wait_gate.inc \
 		test_cluster_resource_x_dispatch_observation.inc \
+		test_cluster_resource_x_preflight_peer.inc \
 		test_cluster_pcm_source_finish_tick.inc \
 		test_cluster_pcm_eviction_owner.inc test_cluster_pcm_clock_sweep.inc \
 		test_cluster_resource_x_eviction_owner.inc \
@@ -8386,6 +8387,13 @@ test_cluster_resource_x_dispatch_observation.inc: $(top_srcdir)/src/backend/clus
 	     END { if (begin != 1 || end != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_resource_x_preflight_peer.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/if \(requester_ready && master_ready\)/ { emit=1; begin++ } \
+	     emit && /preflight_membership_wait:/ { emit=0; end++ } \
+	     emit { print } \
+	     END { if (begin != 1 || end != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_resource_x_terminal_ingress: test_cluster_resource_x_terminal_ingress.c \
 		unit_test.h test_cluster_resource_x_terminal_owner.inc \
 		test_cluster_resource_x_eviction_owner.inc \
@@ -8401,6 +8409,7 @@ test_cluster_resource_x_terminal_ingress: test_cluster_resource_x_terminal_ingre
 		test_cluster_resource_x_retained_wait_gate.inc \
 		test_cluster_resource_x_predecessor_wait_gate.inc \
 		test_cluster_resource_x_dispatch_observation.inc \
+		test_cluster_resource_x_preflight_peer.inc \
 		$(CLUSTER_RESOURCE_X_IDENTITY_O) \
 		$(top_srcdir)/src/include/cluster/cluster_pcm_lock.h \
 		$(top_srcdir)/src/include/cluster/cluster_ic.h \

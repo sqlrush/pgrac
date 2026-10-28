@@ -14630,14 +14630,11 @@ gcs_block_resource_x_target_peer_result_exact(const ClusterSemanticAdmissionToke
 		admission, peer_node, authenticated_connection_generation);
 	if (!cluster_semantic_activation_recheck(admission))
 		return RESOURCE_X_APPLY_STALE;
+	if (cluster_semantic_resource_x_peer_open_pending(peer_result))
+		return RESOURCE_X_APPLY_BAD_STATE;
 	switch (peer_result) {
 	case CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH:
 		return RESOURCE_X_APPLY_APPLIED;
-	case CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_AUTHORITY_UNAVAILABLE:
-	case CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_CAPABILITY_NOT_READY:
-	case CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_TABLE_TORN:
-	case CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_IMAGE_OBSERVATION_PENDING:
-		return RESOURCE_X_APPLY_BAD_STATE;
 	case CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_ADMISSION_DRIFT:
 	case CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_CAPABILITY_DRIFT:
 	case CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_STAGE_MISMATCH:
@@ -16605,6 +16602,10 @@ gcs_block_resource_x_target_acquire_internal_trace_impl(
 						preflight_current = true;
 						break;
 					}
+					if (!cluster_semantic_resource_x_peer_open_pending(peer_open_result)) {
+						result = RESOURCE_X_APPLY_STALE;
+						break;
+					}
 				}
 
 			preflight_membership_wait:
@@ -17573,12 +17574,15 @@ gcs_block_resource_x_target_acquire_internal_trace_impl(
 										rebound_master_node, &rebound_master_connection_generation);
 								if (!rebound_requester_sampled || !rebound_master_sampled)
 									goto dispatch_recheck_wait;
-								if (rebound_master_node == cluster_node_id)
+								if (rebound_master_node == cluster_node_id) {
 									rebound_peer_matches
 										= gcs_block_resource_x_target_peer_matches_exact(
 											&admission, rebound_master_node,
 											rebound_master_connection_generation);
-								else {
+									peer_open_result = rebound_peer_matches
+										? CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH
+										: CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_INVALID_INPUT;
+								} else {
 									peer_open_result
 										= cluster_semantic_activation_resource_x_peer_open_check(
 											&admission, rebound_master_node,
@@ -17587,8 +17591,12 @@ gcs_block_resource_x_target_acquire_internal_trace_impl(
 										= peer_open_result
 										  == CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH;
 								}
-								if (!rebound_peer_matches)
-									goto dispatch_recheck_wait;
+								if (!rebound_peer_matches) {
+									if (cluster_semantic_resource_x_peer_open_pending(peer_open_result))
+										goto dispatch_recheck_wait;
+									result = RESOURCE_X_APPLY_STALE;
+									break;
+								}
 								if (!cluster_semantic_activation_recheck(&admission)) {
 									result = RESOURCE_X_APPLY_STALE;
 									break;
