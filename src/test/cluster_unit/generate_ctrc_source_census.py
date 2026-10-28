@@ -628,7 +628,8 @@ for path, owners in (
         "REGISTERED_REFERENCE",
         "CTRC_REF_HEAP_ITL_UBA|CTRC_REF_IMAGE_ITL_V1",
         "CTRC_TARGET_PAGE_PENDING_ITL_SLOT|CTRC_TARGET_EXACT_ITL_SLOT",
-        "cluster_ctrc_itl_delegate_prepare_v1",
+        "cluster_ctrc_itl_delegate_prepare_v2" if path.endswith("cluster_gcs_block.c")
+        else "cluster_ctrc_itl_delegate_prepare_v1",
         "RETAIN_PENDING_SUBTREE_CLOSE_ACK",
         "MXA-T40",
     )
@@ -645,7 +646,8 @@ for path, owners in (
         "REGISTERED_REFERENCE",
         "CTRC_REF_HEAP_ITL_UBA",
         "CTRC_TARGET_PAGE_PENDING_ITL_SLOT|CTRC_TARGET_EXACT_ITL_SLOT",
-        "cluster_ctrc_itl_delegate_accept_v1",
+        "cluster_ctrc_itl_delegate_accept_v1|cluster_ctrc_itl_delegate_accept_v2"
+        if path.endswith("cluster_gcs_block.c") else "cluster_ctrc_itl_delegate_accept_v1",
         "RETAIN_PENDING_PARENT_CLOSE_ACK",
         "MXA-T40",
     )

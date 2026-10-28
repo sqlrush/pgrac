@@ -8688,6 +8688,120 @@ UT_TEST(test_multihop_registered_path_merges_first_hop_without_replacing_its_par
 	UT_ASSERT_EQ(held_count, 0);
 }
 
+/* Actual complete-path shared custody, actual GCS receive and IMAGE owner.
+ * Protected peer sampling/copy scheduling remain the existing controlled leaf. */
+static bool
+install_test_multihop_setup(ResourceXDecodedFrame *frame, ResourceXAcquisitionRef *ref,
+	ClusterPcmOwnSnapshot *base, ClusterSemanticAdmissionToken *admission,
+	ClusterCtrcReceiptHandle *middle)
+{
+	ClusterCtrcReceiptHandle first, unused;
+	ClusterCtrcParticipantIdentity receiver;
+	ClusterCtrcItlTargetIdentity target;
+	ClusterItlSlotData slot;
+	uint8 record[CLUSTER_CTRC_DELEGATION_V2_MAX_BYTES];
+	Size length = 0;
+	uint8 *bundle;
+
+	if (!install_test_setup(frame, ref, base, admission, &unused)
+		|| !seed_multihop_source(&first, middle, &receiver, &slot, &target)
+		|| !cluster_ctrc_itl_delegate_prepare_v2(&target, &slot,
+			&middle->participant->identity, &receiver, record, sizeof(record), &length))
+		return false;
+	install_test_sender = middle->participant->identity;
+	install_test_receiver = receiver;
+	cluster_node_id = receiver.node_id;
+	ref->assertion.requester_node = receiver.node_id;
+	frame->common.logical_assertion = ref->assertion;
+	gcs_block_resource_x_put_u32(frame->body.image_envelope.source_fence, install_test_sender.node_id);
+	gcs_block_resource_x_put_u64(frame->body.image_envelope.source_fence + 4,
+		install_test_sender.boot_incarnation);
+	ClusterPageGetItlSlots((Page)frame->body.image_envelope.page_bytes)[0] = slot;
+	bundle = frame->body.image_envelope.ctrc_delegation;
+	memset(bundle, 0, sizeof(frame->body.image_envelope.ctrc_delegation));
+	frame->body.image_envelope.ctrc_delegation_bytes = 8 + length;
+	bundle[1] = 2; bundle[2] = (8 + length) >> 8; bundle[3] = 8 + length; bundle[5] = 1;
+	memcpy(bundle + 8, record, length);
+	return true;
+}
+
+UT_TEST(test_actual_gcs_multihop_image_registers_original_path_before_apply)
+{
+	for (unsigned apply = 0; apply < 2; apply++) {
+		ResourceXDecodedFrame frame;
+		ResourceXAcquisitionRef ref;
+		ClusterPcmOwnSnapshot base;
+		ClusterSemanticAdmissionToken admission;
+		ClusterCtrcReceiptHandle middle;
+		GcsBlockCtrcImageInstall install = { 0 };
+
+		bool prepared;
+
+		UT_ASSERT(install_test_multihop_setup(&frame, &ref, &base, &admission, &middle));
+		prepared = gcs_block_resource_x_ctrc_image_prepare(&install, &frame, &admission, &ref, &base, 9);
+		UT_ASSERT(prepared);
+		if (!prepared) return;
+		UT_ASSERT_EQ(install.prepared_mask, 1);
+		UT_ASSERT_EQ(install.receipts[0].participant->delegation_path.hop_count, 2);
+		UT_ASSERT(FullTransactionIdEquals(install.receipts[0].participant->original_full_xid,
+			middle.participant->original_full_xid));
+		UT_ASSERT_EQ(install.receipts[0].participant->delegation_parent.receiver.node_id,
+			middle.participant->identity.node_id);
+		UT_ASSERT(memcmp(install.receipts[0].participant->original_identity_v2,
+			middle.participant->original_identity_v2, 144) == 0);
+		if (apply) {
+			install.copy_started = true;
+			UT_ASSERT(gcs_block_resource_x_ctrc_image_apply(&install, (Page)frame.body.image_envelope.page_bytes));
+		}
+		gcs_block_resource_x_ctrc_image_cancel(&install);
+		UT_ASSERT_EQ(install.receipts[0].receipt->state, apply ? CTRC_RECEIPT_APPLIED : CTRC_RECEIPT_CANCELLED);
+		UT_ASSERT_EQ(install.receipts[0].participant->delegation_path.hop_count, 2);
+		UT_ASSERT_EQ(middle.participant->delegation_count, 1);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
+UT_TEST(test_actual_gcs_compact_inventory_is_atomic_before_first_registration)
+{
+	for (unsigned fault = 0; fault < 4; fault++) {
+		ResourceXDecodedFrame frame;
+		ResourceXAcquisitionRef ref;
+		ClusterPcmOwnSnapshot base;
+		ClusterSemanticAdmissionToken admission;
+		ClusterCtrcReceiptHandle middle;
+		ClusterCtrcParticipantEntry before;
+		GcsBlockCtrcImageInstall install = { 0 };
+		uint64 index, registration, journal;
+		uint8 *bundle, *second;
+
+		UT_ASSERT(install_test_multihop_setup(&frame, &ref, &base, &admission, &middle));
+		bundle = frame.body.image_envelope.ctrc_delegation;
+		second = bundle + 8 + 264;
+		memcpy(second, bundle + 8, 264);
+		frame.body.image_envelope.ctrc_delegation_bytes = 8 + 2 * 264;
+		bundle[2] = (8 + 2 * 264) >> 8; bundle[3] = (8 + 2 * 264) & 255; bundle[5] = 2;
+		ClusterPageGetItlSlots((Page)frame.body.image_envelope.page_bytes)[1]
+			= ClusterPageGetItlSlots((Page)frame.body.image_envelope.page_bytes)[0];
+		if (fault == 0) second[1] = 1;
+		if (fault == 1) second[5] = 16;
+		if (fault == 2) second[3]--;
+		if (fault == 3) bundle[frame.body.image_envelope.ctrc_delegation_bytes] = 1;
+		UT_ASSERT(ctrc_participant_index(&middle.key, install_test_receiver.node_id, &index));
+		before = ctrc_participant_entries()[index];
+		registration = pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation);
+		journal = CtrcShared->global_journal_generation;
+		UT_ASSERT(!gcs_block_resource_x_ctrc_receive_image(&frame, &admission,
+			install_test_sender.node_id, 11));
+		UT_ASSERT(!gcs_block_resource_x_ctrc_image_prepare(&install, &frame, &admission, &ref, &base, 9));
+		UT_ASSERT_EQ(install.prepared_mask, 0);
+		UT_ASSERT(memcmp(&before, &ctrc_participant_entries()[index], sizeof(before)) == 0);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation), registration);
+		UT_ASSERT_EQ(CtrcShared->global_journal_generation, journal);
+		UT_ASSERT_EQ(middle.participant->delegation_count, 1);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
 int
 main(void)
 {
@@ -8695,7 +8809,7 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(192);
+	UT_PLAN(194);
 	UT_RUN(test_prepare_path_namespace_precedes_input_and_resets_output);
 	UT_RUN(test_prepare_path_input_precedes_journal_exhaustion);
 	UT_RUN(test_prepare_path_chain_precedes_locator_and_keeps_blocked_state);
@@ -8891,6 +9005,8 @@ main(void)
 	UT_RUN(test_multihop_actual_path_visits_each_nonorigin_node_once);
 	UT_RUN(test_multihop_maximum_record_bound_and_stored_path_validation);
 	UT_RUN(test_multihop_registered_path_merges_first_hop_without_replacing_its_parent);
+	UT_RUN(test_actual_gcs_multihop_image_registers_original_path_before_apply);
+	UT_RUN(test_actual_gcs_compact_inventory_is_atomic_before_first_registration);
 	free(CtrcShared);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

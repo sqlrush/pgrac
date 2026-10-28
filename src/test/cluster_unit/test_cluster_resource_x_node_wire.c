@@ -1399,20 +1399,20 @@ UT_TEST(test_image_ctrc_bundle_capacity_and_multiple_records_are_exact)
 		record[2] = (uint8)(record_bytes >> 8); record[3] = (uint8)record_bytes; record[5] = 6;
 		memset(record + sizeof(first), 0x38 + i, record_bytes - sizeof(first));
 	}
-	frame.body.image_envelope.ctrc_delegation_bytes = RESOURCE_X_CTRC_BUNDLE_MAX_BYTES;
-	bundle[2] = RESOURCE_X_CTRC_BUNDLE_MAX_BYTES >> 8;
-	bundle[3] = RESOURCE_X_CTRC_BUNDLE_MAX_BYTES & 255; bundle[5] = 7;
-	UT_ASSERT_EQ(8 + 7 * record_bytes, RESOURCE_X_CTRC_BUNDLE_MAX_BYTES);
+	frame.body.image_envelope.ctrc_delegation_bytes = RESOURCE_X_CTRC_BUNDLE_V1_MAX_BYTES;
+	bundle[2] = RESOURCE_X_CTRC_BUNDLE_V1_MAX_BYTES >> 8;
+	bundle[3] = RESOURCE_X_CTRC_BUNDLE_V1_MAX_BYTES & 255; bundle[5] = 7;
+	UT_ASSERT_EQ(8 + 7 * record_bytes, RESOURCE_X_CTRC_BUNDLE_V1_MAX_BYTES);
 	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT,
 		&frame, bytes, sizeof(bytes), &len, &reject));
-	UT_ASSERT_EQ(len, RESOURCE_X_IMAGE_V3_MAX_BYTES);
+	UT_ASSERT_EQ(len, RESOURCE_X_IMAGE_V2_BYTES + RESOURCE_X_CTRC_BUNDLE_V1_MAX_BYTES);
 	UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT,
 		bytes, len, &decoded, &reject));
 	UT_ASSERT(memcmp(decoded.body.image_envelope.ctrc_delegation,
-		bundle, RESOURCE_X_CTRC_BUNDLE_MAX_BYTES) == 0);
+		bundle, RESOURCE_X_CTRC_BUNDLE_V1_MAX_BYTES) == 0);
 	len = 99; memset(bytes, 0xa5, sizeof(bytes));
 	UT_ASSERT(!cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT,
-		&frame, bytes, sizeof(bytes) - 1, &len, &reject));
+		&frame, bytes, RESOURCE_X_IMAGE_V2_BYTES + RESOURCE_X_CTRC_BUNDLE_V1_MAX_BYTES - 1, &len, &reject));
 	UT_ASSERT_EQ(len, 99); UT_ASSERT_EQ(bytes[0], 0xa5);
 	frame.body.image_envelope.ctrc_delegation_bytes++;
 	UT_ASSERT(!cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT,
@@ -1420,10 +1420,127 @@ UT_TEST(test_image_ctrc_bundle_capacity_and_multiple_records_are_exact)
 	UT_ASSERT_EQ(len, 99); UT_ASSERT_EQ(bytes[0], 0xa5);
 }
 
+/* Explicit V2 compact paths retain the original144, even at one hop. */
+static void
+image_ctrc_path_fixture(ResourceXDecodedFrame *frame, unsigned count, unsigned hops)
+{
+	uint8 *bundle = frame->body.image_envelope.ctrc_delegation;
+	uint16 record_bytes = 184 + 40 * hops;
+	uint16 total = 8 + count * record_bytes;
+
+	memset(bundle, 0, sizeof(frame->body.image_envelope.ctrc_delegation));
+	frame->body.image_envelope.ctrc_delegation_bytes = total;
+	bundle[1] = 2; bundle[2] = total >> 8; bundle[3] = total; bundle[5] = count;
+	for (unsigned i = 0; i < count; i++) {
+		uint8 *record = bundle + 8 + i * record_bytes;
+		record[1] = 2; record[2] = record_bytes >> 8; record[3] = record_bytes;
+		record[5] = hops; record[8] = 2; record[10] = 144;
+		for (unsigned j = 12; j < record_bytes; j++) record[j] = (uint8)(i + j);
+	}
+}
+
+UT_TEST(test_image_ctrc_explicit_compact_paths_round_trip)
+{
+	for (unsigned hops = 1; hops <= 3; hops++) {
+		ResourceXDecodedFrame frame = make_typed_frame(RESOURCE_X_WIRE_IMAGE_ENVELOPE), decoded;
+		ResourceXWireReject reject;
+		uint8 bytes[RESOURCE_X_IMAGE_V3_MAX_BYTES];
+		uint16 len = 0;
+
+		image_ctrc_path_fixture(&frame, 2, hops);
+		UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT,
+			&frame, bytes, sizeof(bytes), &len, &reject));
+		UT_ASSERT_EQ(len, RESOURCE_X_IMAGE_V2_BYTES + 8 + 2 * (184 + 40 * hops));
+		UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT,
+			bytes, len, &decoded, &reject));
+		UT_ASSERT(memcmp(&decoded.body.image_envelope, &frame.body.image_envelope,
+			sizeof(frame.body.image_envelope)) == 0);
+	}
+}
+
+UT_TEST(test_image_ctrc_compact_maximum_and_versioned_layout_are_bounded)
+{
+	ResourceXDecodedFrame frame = make_typed_frame(RESOURCE_X_WIRE_IMAGE_ENVELOPE), decoded;
+	ResourceXCtrcBundleLayout layout;
+	ResourceXWireReject reject;
+	uint8 bytes[RESOURCE_X_IMAGE_V3_MAX_BYTES];
+	uint16 len = 0;
+
+	image_ctrc_path_fixture(&frame, 8, 15);
+	UT_ASSERT_EQ(frame.body.image_envelope.ctrc_delegation_bytes, 6280);
+	UT_ASSERT(cluster_resource_x_ctrc_bundle_layout(&frame.body.image_envelope, &layout));
+	UT_ASSERT_EQ(layout.version, 2); UT_ASSERT_EQ(layout.count, 8);
+	for (unsigned i = 0; i < 8; i++) {
+		UT_ASSERT_EQ(layout.offsets[i], 8 + i * 784); UT_ASSERT_EQ(layout.lengths[i], 784);
+	}
+	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT,
+		&frame, bytes, sizeof(bytes), &len, &reject));
+	UT_ASSERT_EQ(len, 15032);
+	UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT,
+		bytes, len, &decoded, &reject));
+	UT_ASSERT(memcmp(frame.body.image_envelope.ctrc_delegation,
+		decoded.body.image_envelope.ctrc_delegation, 6280) == 0);
+	len = 91; memset(bytes, 0xa5, sizeof(bytes));
+	UT_ASSERT(!cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT,
+		&frame, bytes, sizeof(bytes) - 1, &len, &reject));
+	UT_ASSERT_EQ(len, 91); UT_ASSERT_EQ(bytes[0], 0xa5);
+	/* V1's historical eighteen-record framing domain is independent of the
+	 * new ordinary-page V2 limit of eight; do not silently tighten it. */
+	frame = make_typed_frame(RESOURCE_X_WIRE_IMAGE_ENVELOPE);
+	image_ctrc_bundle_fixture(&frame);
+	for (unsigned i = 1; i < 18; i++)
+		memcpy(frame.body.image_envelope.ctrc_delegation + 8 + i * 224,
+			frame.body.image_envelope.ctrc_delegation + 8, 224);
+	frame.body.image_envelope.ctrc_delegation_bytes = 8 + 18 * 224;
+	frame.body.image_envelope.ctrc_delegation[2] = (8 + 18 * 224) >> 8;
+	frame.body.image_envelope.ctrc_delegation[3] = (8 + 18 * 224) & 255;
+	frame.body.image_envelope.ctrc_delegation[5] = 18;
+	UT_ASSERT(cluster_resource_x_ctrc_bundle_layout(&frame.body.image_envelope, &layout));
+	UT_ASSERT_EQ(layout.version, 1); UT_ASSERT_EQ(layout.count, 18);
+	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT,
+		&frame, bytes, sizeof(bytes), &len, &reject));
+}
+
+UT_TEST(test_image_ctrc_compact_bad_later_record_never_exposes_partial_layout)
+{
+	for (unsigned fault = 0; fault < 13; fault++) {
+		ResourceXDecodedFrame frame = make_typed_frame(RESOURCE_X_WIRE_IMAGE_ENVELOPE);
+		ResourceXCtrcBundleLayout layout, empty = { 0 };
+		ResourceXWireReject reject;
+		uint8 bytes[RESOURCE_X_IMAGE_V3_MAX_BYTES];
+		uint8 *bundle = frame.body.image_envelope.ctrc_delegation;
+		uint8 *last = bundle + 8 + 264;
+		uint16 len = 91;
+
+		image_ctrc_path_fixture(&frame, 2, 2);
+		switch (fault) {
+		case 0: bundle[1] = 3; break;
+		case 1: last[1] = 1; break;
+		case 2: last[5] = 0; break;
+		case 3: last[5] = 16; break;
+		case 4: last[3]--; break;
+		case 5: last[6] = 1; break;
+		case 6: last[8] = 1; break;
+		case 7: bundle[5] = 9; break;
+		case 8: bundle[5] = 1; break;
+		case 9: bundle[6] = 1; break;
+		case 10: bundle[frame.body.image_envelope.ctrc_delegation_bytes] = 1; break;
+		case 11: frame.body.image_envelope.ctrc_delegation_bytes--; break;
+		case 12: last[2] = 255; last[3] = 255; break;
+		}
+		memset(&layout, 0xa5, sizeof(layout)); memset(bytes, 0xa5, sizeof(bytes));
+		UT_ASSERT(!cluster_resource_x_ctrc_bundle_layout(&frame.body.image_envelope, &layout));
+		UT_ASSERT(memcmp(&layout, &empty, sizeof(layout)) == 0);
+		UT_ASSERT(!cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT,
+			&frame, bytes, sizeof(bytes), &len, &reject));
+		UT_ASSERT_EQ(len, 91); UT_ASSERT_EQ(bytes[0], 0xa5);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(38);
+	UT_PLAN(41);
 	UT_RUN(test_wire_kind_and_proof_domains_are_closed);
 	UT_RUN(test_reused_message_numbers_remain_exact);
 	UT_RUN(test_common_wire_layout_is_exact);
@@ -1462,6 +1579,9 @@ main(void)
 	UT_RUN(test_image_v2_never_silently_discards_unframed_delegation);
 	UT_RUN(test_image_ctrc_ingress_rejects_resealed_malformed_carriers);
 	UT_RUN(test_image_ctrc_bundle_capacity_and_multiple_records_are_exact);
+	UT_RUN(test_image_ctrc_explicit_compact_paths_round_trip);
+	UT_RUN(test_image_ctrc_compact_maximum_and_versioned_layout_are_bounded);
+	UT_RUN(test_image_ctrc_compact_bad_later_record_never_exposes_partial_layout);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

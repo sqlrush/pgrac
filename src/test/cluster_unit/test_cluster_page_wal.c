@@ -88,7 +88,9 @@ static uint64 source_peer_boot = 42;
 static ClusterCtrcParticipantIdentity delegated_sender, delegated_receiver;
 static ClusterCtrcItlTargetIdentity delegated_targets[CLUSTER_ITL_INITRANS_DEFAULT];
 static ClusterItlSlotData delegated_slots[CLUSTER_ITL_INITRANS_DEFAULT];
-static uint8 delegated_records[CLUSTER_ITL_INITRANS_DEFAULT][CLUSTER_CTRC_DELEGATION_V1_BYTES];
+static uint8 delegated_records[CLUSTER_ITL_INITRANS_DEFAULT][CLUSTER_CTRC_DELEGATION_V2_MAX_BYTES];
+static uint16 delegated_lengths[CLUSTER_ITL_INITRANS_DEFAULT];
+static uint16 delegation_hops[CLUSTER_ITL_INITRANS_DEFAULT];
 static uint64
 source_epoch(void)
 {
@@ -148,11 +150,13 @@ source_peer_open(const ClusterSemanticAdmissionToken *token, int node, uint32 ge
 static bool
 source_delegate_prepare(const ClusterCtrcItlTargetIdentity *target,
 	const ClusterItlSlotData *slot, const ClusterCtrcParticipantIdentity *sender,
-	const ClusterCtrcParticipantIdentity *receiver, uint8 *record, Size bytes)
+	const ClusterCtrcParticipantIdentity *receiver, uint8 *record, Size capacity, Size *length)
 {
 	unsigned index = delegation_calls++;
+	Size bytes = index < CLUSTER_ITL_INITRANS_DEFAULT
+		? 184 + 40 * (delegation_hops[index] ? delegation_hops[index] : 1) : 0;
 
-	if (index >= CLUSTER_ITL_INITRANS_DEFAULT || bytes != CLUSTER_CTRC_DELEGATION_V1_BYTES
+	if (index >= CLUSTER_ITL_INITRANS_DEFAULT || bytes > capacity
 		|| delegation_calls == refuse_delegation)
 		return false;
 	delegated_sender = *sender;
@@ -162,14 +166,17 @@ source_delegate_prepare(const ClusterCtrcItlTargetIdentity *target,
 	/* Produce valid existing record framing with distinctive immutable bytes;
 	 * this leaf does not authenticate or implement receipt custody. */
 	memset(record, 0, bytes);
-	record[1] = 1;
+	record[1] = 2;
+	record[2] = (uint8)(bytes >> 8);
 	record[3] = (uint8)bytes;
-	record[5] = 1;
+	record[5] = delegation_hops[index] ? delegation_hops[index] : 1;
 	record[8] = 2;
 	record[10] = 144;
 	record[20] = (uint8)(index + 71);
 	record[151] = (uint8)target->itl_slot_index;
 	memcpy(delegated_records[index], record, bytes);
+	delegated_lengths[index] = bytes;
+	*length = bytes;
 	if (drift_after_delegation == delegation_calls)
 		source_peer_boot++;
 	return true;
@@ -187,7 +194,7 @@ receive_accept(const ClusterItlSlotData *slot,
 	UT_ASSERT_EQ(receiver->node_id, 0);
 	UT_ASSERT_EQ(receiver->boot_incarnation, 12);
 	UT_ASSERT_EQ(receiver->admission_record_generation, 77);
-	UT_ASSERT_EQ(bytes, CLUSTER_CTRC_DELEGATION_V1_BYTES);
+	UT_ASSERT_EQ(bytes, delegated_lengths[index]);
 	UT_ASSERT_EQ(slot->xid, 100 + index);
 	UT_ASSERT(memcmp(record, delegated_records[index], bytes) == 0);
 	if (receive_calls == receive_refuse_at)
@@ -198,6 +205,7 @@ receive_accept(const ClusterItlSlotData *slot,
 	return true;
 }
 #define cluster_ctrc_itl_delegate_accept_v1 receive_accept
+#define cluster_ctrc_itl_delegate_accept_v2 receive_accept
 #define cluster_epoch_get_current source_epoch
 #define cluster_qvotec_get_self_incarnation source_self_boot
 #define cluster_semantic_activation_recheck source_admission_current
@@ -208,7 +216,7 @@ receive_accept(const ClusterItlSlotData *slot,
 #define cluster_membership_get_last_admitted_incarnation source_admitted_boot
 #define cluster_sf_peer_capability_generation_matches source_peer_generation
 #define cluster_semantic_activation_resource_x_peer_open_check source_peer_open
-#define cluster_ctrc_itl_delegate_prepare_v1 source_delegate_prepare
+#define cluster_ctrc_itl_delegate_prepare_v2 source_delegate_prepare
 #include "test_cluster_page_wal_image.inc"
 #undef cluster_epoch_get_current
 #undef cluster_qvotec_get_self_incarnation
@@ -220,8 +228,9 @@ receive_accept(const ClusterItlSlotData *slot,
 #undef cluster_membership_get_last_admitted_incarnation
 #undef cluster_sf_peer_capability_generation_matches
 #undef cluster_semantic_activation_resource_x_peer_open_check
-#undef cluster_ctrc_itl_delegate_prepare_v1
+#undef cluster_ctrc_itl_delegate_prepare_v2
 #undef cluster_ctrc_itl_delegate_accept_v1
+#undef cluster_ctrc_itl_delegate_accept_v2
 #include "test_cluster_page_data_scn.inc"
 
 /* Real pre-grant caller; ownership checks are controlled boundaries so all
@@ -252,7 +261,7 @@ image_prepare_receipt(const ClusterItlSlotData *slot,
 	unsigned i = image_prepares++;
 	UT_ASSERT_EQ(sender->node_id, 1);
 	UT_ASSERT_EQ(receiver->node_id, 0);
-	UT_ASSERT_EQ(length, 224);
+	UT_ASSERT_EQ(length, delegated_lengths[i]);
 	UT_ASSERT_EQ(slot->xid, 100 + i);
 	UT_ASSERT(record != NULL);
 	if (image_prepares == image_prepare_refuse)
@@ -311,6 +320,7 @@ image_publish(void)
 	return pregrant_variant == 3 ? CLUSTER_PCM_OWN_CORRUPT : CLUSTER_PCM_OWN_OK;
 }
 #define cluster_ctrc_itl_image_prepare_v1 image_prepare_receipt
+#define cluster_ctrc_itl_image_prepare_v2 image_prepare_receipt
 #define cluster_ctrc_receipt_apply_shared image_apply_receipt
 #define cluster_ctrc_receipt_cancel_shared image_cancel_receipt
 #define cluster_ctrc_sha256_exact image_slot_digest
@@ -319,6 +329,7 @@ image_publish(void)
 #define gcs_block_resource_x_fail_closed_current() (pregrant_failclosed++)
 #include "test_cluster_gcs_image_receipts.inc"
 #undef cluster_ctrc_itl_image_prepare_v1
+#undef cluster_ctrc_itl_image_prepare_v2
 #undef cluster_ctrc_receipt_apply_shared
 #undef cluster_ctrc_receipt_cancel_shared
 #undef cluster_ctrc_sha256_exact
@@ -2119,6 +2130,7 @@ source_delegate_setup(ResourceXDecodedFrame *block, ResourceXDecodedFrame *statu
 	ClusterSemanticAdmissionToken admission = { 0 };
 	ClusterItlSlotData *slots;
 
+	memset(delegation_hops, 0, sizeof(delegation_hops));
 	reset();
 	delegation_calls = source_checks = peer_checks = 0;
 	refuse_delegation = drift_after_delegation = 0;
@@ -2188,7 +2200,7 @@ UT_TEST(source_image_delegation_preserves_original_bytes_and_proof_crc)
 	UT_ASSERT_EQ(delegation_calls, 2);
 	UT_ASSERT_EQ(image.payload_bytes, RESOURCE_X_IMAGE_V2_BYTES + 8 + 2 * 224);
 	UT_ASSERT_EQ(image.body.image_envelope.ctrc_delegation_bytes, 456);
-	UT_ASSERT_EQ(image.body.image_envelope.ctrc_delegation[1], 1);
+	UT_ASSERT_EQ(image.body.image_envelope.ctrc_delegation[1], 2);
 	UT_ASSERT_EQ(image.body.image_envelope.ctrc_delegation[2], 1);
 	UT_ASSERT_EQ(image.body.image_envelope.ctrc_delegation[3], 200);
 	UT_ASSERT_EQ(image.body.image_envelope.ctrc_delegation[5], 2);
@@ -2549,10 +2561,53 @@ UT_TEST(image_apply_error_releases_native_preparation_without_canceling_responsi
 	UT_ASSERT_EQ(capture_many(256, 900), CLUSTER_PAGE_WAL_CAPTURED);
 }
 
+UT_TEST(source_image_compact_paths_use_variable_slices_and_full_eight_slot_capacity)
+{
+	for (unsigned maximum = 0; maximum < 2; maximum++) {
+		ResourceXDecodedFrame block, status, image;
+		ResourceXCtrcBundleLayout layout;
+		ClusterSemanticAdmissionToken admission = source_delegate_setup(&block, &status, &image, 8);
+		uint16 offset = 8;
+
+		for (unsigned i = 0; i < 8; i++) delegation_hops[i] = maximum ? 15 : i + 1;
+		UT_ASSERT(source_delegate_run(&block, &admission, &status, &image));
+		UT_ASSERT(cluster_resource_x_ctrc_bundle_layout(&image.body.image_envelope, &layout));
+		UT_ASSERT_EQ(layout.version, 2); UT_ASSERT_EQ(layout.count, 8);
+		for (unsigned i = 0; i < 8; i++) {
+			UT_ASSERT_EQ(layout.offsets[i], offset);
+			UT_ASSERT_EQ(layout.lengths[i], 184 + 40 * delegation_hops[i]);
+			UT_ASSERT(memcmp(image.body.image_envelope.ctrc_delegation + offset,
+				delegated_records[i], delegated_lengths[i]) == 0);
+			offset += delegated_lengths[i];
+		}
+		UT_ASSERT_EQ(image.body.image_envelope.ctrc_delegation_bytes, offset);
+		if (maximum) UT_ASSERT_EQ(image.payload_bytes, RESOURCE_X_IMAGE_V3_MAX_BYTES);
+	}
+}
+
+UT_TEST(received_compact_image_rejects_bad_last_framing_before_any_custody)
+{
+	for (unsigned fault = 0; fault < 6; fault++) {
+		ResourceXDecodedFrame frame;
+		ClusterSemanticAdmissionToken admission = receive_setup(&frame, 2);
+		uint8 *bundle = frame.body.image_envelope.ctrc_delegation;
+		uint8 *last = bundle + 8 + 224;
+
+		if (fault == 0) last[1] = 1;
+		if (fault == 1) last[5] = 16;
+		if (fault == 2) last[3]--;
+		if (fault == 3) last[6] = 1;
+		if (fault == 4) bundle[frame.body.image_envelope.ctrc_delegation_bytes] = 1;
+		if (fault == 5) bundle[1] = 3;
+		UT_ASSERT(!gcs_block_resource_x_ctrc_receive_image(&frame, &admission, 1, 11));
+		UT_ASSERT_EQ(receive_calls, 0); UT_ASSERT_EQ(receive_accepted, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(58);
+	UT_PLAN(60);
 	UT_RUN(installed_carrier_matches_explicit_absence_not_snapshot_failure);
 	UT_RUN(output_snapshot_retains_exact_failed_output_binding);
 	UT_RUN(failed_output_distinguishes_empty_latest_from_invalid_binding);
@@ -2614,6 +2669,8 @@ main(void)
 	UT_RUN(image_install_applies_all_receipts_after_copy_before_publication);
 	UT_RUN(image_install_pre_copy_drift_cancels_but_post_copy_failure_retains);
 	UT_RUN(image_apply_error_releases_native_preparation_without_canceling_responsibility);
+	UT_RUN(source_image_compact_paths_use_variable_slices_and_full_eight_slot_capacity);
+	UT_RUN(received_compact_image_rejects_bad_last_framing_before_any_custody);
 	free(shared_memory);
 	UT_DONE();
 	return ut_failed_count != 0;

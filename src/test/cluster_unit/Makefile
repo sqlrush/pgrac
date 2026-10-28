@@ -9062,12 +9062,12 @@ test_cluster_ctrc_cleaner test_cluster_ctrc_horizon test_cluster_ctrc_capacity t
 		$(top_srcdir)/src/include/storage/proc.h
 
 test_cluster_ctrc_cleaner: test_cluster_ctrc_cleaner.c test_cluster_ctrc_run_pass.inc test_cluster_gcs_image_receipts.inc test_cluster_gcs_image_receive.inc unit_test.h $(CLUSTER_SCN_O) $(top_builddir)/src/backend/cluster/cluster_xid_stripe.o \
-		$(CLUSTER_UBA_O) $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_UBA_O) $(CLUSTER_RESOURCE_X_IDENTITY_O) $(CLUSTER_RESOURCE_X_NODE_WIRE_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
 		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< $(CLUSTER_SCN_O) \
 		$(top_builddir)/src/backend/cluster/cluster_xid_stripe.o \
-		$(CLUSTER_UBA_O) $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_UBA_O) $(CLUSTER_RESOURCE_X_IDENTITY_O) $(CLUSTER_RESOURCE_X_NODE_WIRE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) \
 		$(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@

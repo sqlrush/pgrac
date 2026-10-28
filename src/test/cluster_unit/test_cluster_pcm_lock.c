@@ -430,8 +430,11 @@ static union {
 	uint64 force_align;
 	/* Sized above sizeof(ClusterPcmShared) plus the 17-entry Resource-X
 	 * reconfiguration fixture.  The retained holder image adds one full
-	 * page per Resource-X master state; fake ShmemInitStruct asserts fit. */
-	char data[2097152];
+	 * page per Resource-X master state; fake ShmemInitStruct asserts fit.
+	 * The compact-path carrier adds two bounded arrays per entry; keep
+	 * that exact additional capacity. */
+	char data[2097152 + FAKE_PCM_MAX_ENTRIES * 2
+		* (RESOURCE_X_CTRC_BUNDLE_MAX_BYTES - RESOURCE_X_CTRC_BUNDLE_V1_MAX_BYTES)];
 } fake_pcm_header;
 
 static union {
@@ -13115,26 +13118,27 @@ static void
 attach_resource_x_test_delegation(ResourceXDecodedFrame *image, bool maximum)
 {
 	uint8 *bundle = image->body.image_envelope.ctrc_delegation;
-	uint16 records = maximum ? 7 : 1;
-	uint16 hops = maximum ? 6 : 1;
-	uint16 record_bytes = RESOURCE_X_CTRC_RECORD_BASE_BYTES
-		+ hops * RESOURCE_X_CTRC_DELEGATION_HOP_BYTES;
+	uint16 records = maximum ? RESOURCE_X_CTRC_BUNDLE_V2_MAX_RECORDS : 1;
+	uint16 hops = maximum ? CLUSTER_CTRC_DELEGATION_V2_MAX_HOPS : 1;
+	uint16 base_bytes = maximum ? CLUSTER_CTRC_DELEGATION_V2_BASE_BYTES : RESOURCE_X_CTRC_RECORD_BASE_BYTES;
+	uint16 record_bytes = base_bytes + hops * (maximum
+		? CLUSTER_CTRC_DELEGATION_V2_HOP_BYTES : RESOURCE_X_CTRC_DELEGATION_HOP_BYTES);
 	uint16 total = RESOURCE_X_CTRC_BUNDLE_HEADER_BYTES + records * record_bytes;
 
 	memset(bundle, 0, RESOURCE_X_CTRC_BUNDLE_MAX_BYTES);
 	image->body.image_envelope.ctrc_delegation_bytes = total;
-	bundle[1] = RESOURCE_X_CTRC_BUNDLE_VERSION;
+	bundle[1] = maximum ? RESOURCE_X_CTRC_BUNDLE_V2_VERSION : RESOURCE_X_CTRC_BUNDLE_VERSION;
 	bundle[2] = (uint8)(total >> 8); bundle[3] = (uint8)total;
 	bundle[5] = (uint8)records;
 	for (uint16 n = 0; n < records; n++) {
 		uint8 *record = bundle + RESOURCE_X_CTRC_BUNDLE_HEADER_BYTES + n * record_bytes;
 
-		record[1] = RESOURCE_X_CTRC_RECORD_VERSION;
+		record[1] = maximum ? CLUSTER_CTRC_DELEGATION_V2_VERSION : RESOURCE_X_CTRC_RECORD_VERSION;
 		record[2] = (uint8)(record_bytes >> 8); record[3] = (uint8)record_bytes;
 		record[5] = (uint8)hops;
 		for (unsigned i = 0; i < 144; i++) record[8 + i] = (uint8)(i ^ (n + 17));
 		record[8] = 2; record[9] = 0; record[10] = 144; record[11] = 0;
-		for (unsigned i = RESOURCE_X_CTRC_RECORD_BASE_BYTES; i < record_bytes; i++)
+		for (unsigned i = 152; i < record_bytes; i++)
 			record[i] = (uint8)(i + n + 1);
 	}
 }

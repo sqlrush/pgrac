@@ -219,52 +219,86 @@ resource_x_assertion_decode(const uint8 in[24], ResourceXAssertion *assertion)
 }
 
 
-/* Bundle and record headers are network order. Each record contains the
- * unchanged little-endian origin V2, then complete sender/receiver/sequence
- * hops. This is framing, not authentication, custody or a freeze grant. */
-static bool
-resource_x_image_ctrc_framing_valid(const ResourceXDecodedImageEnvelope *body)
+/* Bundle and record headers are network order; original144 stays immutable
+ * little-endian V2. Validate the complete inventory before exposing slices,
+ * so a later malformed record cannot cause an earlier custody registration.
+ * This is framing only, never peer authentication or a retention grant. */
+bool
+cluster_resource_x_ctrc_bundle_layout(const ResourceXDecodedImageEnvelope *body,
+	ResourceXCtrcBundleLayout *out)
 {
-	const uint8 *bundle = body->ctrc_delegation;
-	uint32 length = body->ctrc_delegation_bytes;
-	uint32 offset = RESOURCE_X_CTRC_BUNDLE_HEADER_BYTES;
-	uint16 count;
+	ResourceXCtrcBundleLayout layout = { 0 };
+	const uint8 *bundle;
+	uint32 length, offset = RESOURCE_X_CTRC_BUNDLE_HEADER_BYTES;
+	uint16 version, count;
 
-	if (length > RESOURCE_X_CTRC_BUNDLE_MAX_BYTES)
+	if (out == NULL)
 		return false;
-	if (!resource_x_bytes_zero(bundle + length, RESOURCE_X_CTRC_BUNDLE_MAX_BYTES - length))
+	memset(out, 0, sizeof(*out));
+	if (body == NULL)
+		return false;
+	bundle = body->ctrc_delegation;
+	length = body->ctrc_delegation_bytes;
+	if (length > RESOURCE_X_CTRC_BUNDLE_MAX_BYTES
+		|| !resource_x_bytes_zero(bundle + length, RESOURCE_X_CTRC_BUNDLE_MAX_BYTES - length))
 		return false;
 	if (length == 0)
 		return true;
 	if (length < RESOURCE_X_CTRC_BUNDLE_HEADER_BYTES
-		|| resource_x_get_u16(bundle) != RESOURCE_X_CTRC_BUNDLE_VERSION
 		|| resource_x_get_u16(bundle + 2) != length
 		|| !resource_x_bytes_zero(bundle + 6, 2))
 		return false;
+	version = resource_x_get_u16(bundle);
 	count = resource_x_get_u16(bundle + 4);
-	if (count == 0)
+	if (count == 0 || count > RESOURCE_X_CTRC_BUNDLE_LAYOUT_MAX_RECORDS
+		|| (version != RESOURCE_X_CTRC_BUNDLE_VERSION && version != RESOURCE_X_CTRC_BUNDLE_V2_VERSION)
+		|| (version == RESOURCE_X_CTRC_BUNDLE_VERSION && length > RESOURCE_X_CTRC_BUNDLE_V1_MAX_BYTES)
+		|| (version == RESOURCE_X_CTRC_BUNDLE_V2_VERSION && count > RESOURCE_X_CTRC_BUNDLE_V2_MAX_RECORDS))
 		return false;
 	for (uint16 i = 0; i < count; i++) {
 		const uint8 *record;
-		uint32 record_length;
-		uint32 hops;
+		uint32 record_length, hops, expected_length;
 
 		if (offset > length || length - offset < RESOURCE_X_CTRC_RECORD_BASE_BYTES)
 			return false;
 		record = bundle + offset;
 		record_length = resource_x_get_u16(record + 2);
 		hops = resource_x_get_u16(record + 4);
-		if (resource_x_get_u16(record) != RESOURCE_X_CTRC_RECORD_VERSION
-			|| !resource_x_bytes_zero(record + 6, 2) || hops == 0
-			|| record_length != RESOURCE_X_CTRC_RECORD_BASE_BYTES
-				+ hops * RESOURCE_X_CTRC_DELEGATION_HOP_BYTES
-			|| record_length > length - offset
-			/* Do not reinterpret or rewrite the original V2 prefix. */
+		if (!resource_x_bytes_zero(record + 6, 2) || hops == 0)
+			return false;
+		if (version == RESOURCE_X_CTRC_BUNDLE_VERSION) {
+			if (resource_x_get_u16(record) != RESOURCE_X_CTRC_RECORD_VERSION)
+				return false;
+			expected_length = RESOURCE_X_CTRC_RECORD_BASE_BYTES
+				+ hops * RESOURCE_X_CTRC_DELEGATION_HOP_BYTES;
+		} else {
+			if (resource_x_get_u16(record) != CLUSTER_CTRC_DELEGATION_V2_VERSION
+				|| hops > CLUSTER_CTRC_DELEGATION_V2_MAX_HOPS)
+				return false;
+			expected_length = CLUSTER_CTRC_DELEGATION_V2_BASE_BYTES
+				+ hops * CLUSTER_CTRC_DELEGATION_V2_HOP_BYTES;
+		}
+		if (record_length != expected_length || record_length > length - offset
 			|| record[8] != 2 || record[9] != 0 || record[10] != 144 || record[11] != 0)
 			return false;
+		layout.offsets[i] = (uint16)offset;
+		layout.lengths[i] = (uint16)record_length;
 		offset += record_length;
 	}
-	return offset == length;
+	if (offset != length)
+		return false;
+	layout.version = version;
+	layout.count = count;
+	*out = layout;
+	return true;
+}
+
+static bool
+resource_x_image_ctrc_framing_valid(const ResourceXDecodedImageEnvelope *body)
+{
+	ResourceXCtrcBundleLayout layout;
+
+	return cluster_resource_x_ctrc_bundle_layout(body, &layout);
 }
 
 static bool

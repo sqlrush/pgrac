@@ -10044,7 +10044,7 @@ gcs_block_pcm_x_resource_x_delegate_source_frames(
 	const BufferTag *tag;
 
 	StaticAssertStmt(RESOURCE_X_CTRC_BUNDLE_HEADER_BYTES
-		+ CLUSTER_ITL_INITRANS_DEFAULT * CLUSTER_CTRC_DELEGATION_V1_BYTES
+		+ CLUSTER_ITL_INITRANS_DEFAULT * CLUSTER_CTRC_DELEGATION_V2_MAX_BYTES
 		<= RESOURCE_X_CTRC_BUNDLE_MAX_BYTES, "ordinary ITL bundle must fit retained IMAGE");
 	if (block == NULL || status == NULL || image == NULL
 		|| block->kind != RESOURCE_X_WIRE_BLOCK_TO_N
@@ -10107,6 +10107,9 @@ gcs_block_pcm_x_resource_x_delegate_source_frames(
 	target.block_number = tag->blockNum;
 	target.needs_wal = true;
 	for (uint16 i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
+		Size record_bytes = 0;
+		Size capacity = Min(sizeof(bundle) - used, CLUSTER_CTRC_DELEGATION_V2_MAX_BYTES);
+
 		if (slots[i].flags == ITL_FLAG_FREE)
 			continue;
 		target.itl_xid = slots[i].xid;
@@ -10114,10 +10117,11 @@ gcs_block_pcm_x_resource_x_delegate_source_frames(
 		target.itl_slot_wrap = slots[i].wrap;
 		target.itl_class = slots[i].flags;
 		memcpy(target.uba, &slots[i].undo_segment_head, sizeof(target.uba));
-		if (!cluster_ctrc_itl_delegate_prepare_v1(&target, &slots[i], &sender, &receiver,
-			bundle + used, CLUSTER_CTRC_DELEGATION_V1_BYTES))
+		if (!cluster_ctrc_itl_delegate_prepare_v2(&target, &slots[i], &sender, &receiver,
+			bundle + used, capacity, &record_bytes)
+			|| record_bytes == 0 || record_bytes > capacity)
 			goto refused;
-		used += CLUSTER_CTRC_DELEGATION_V1_BYTES;
+		used += (uint16)record_bytes;
 	}
 	if (!gcs_block_resource_x_ctrc_source_identities(admission,
 		block->common.logical_assertion.requester_node, connection, source_boot,
@@ -10125,7 +10129,7 @@ gcs_block_pcm_x_resource_x_delegate_source_frames(
 		|| memcmp(&sender, &final_sender, sizeof(sender)) != 0
 		|| memcmp(&receiver, &final_receiver, sizeof(receiver)) != 0)
 		goto refused;
-	bundle[1] = 1;
+	bundle[1] = RESOURCE_X_CTRC_BUNDLE_V2_VERSION;
 	bundle[2] = (uint8)(used >> 8);
 	bundle[3] = (uint8)used;
 	bundle[5] = (uint8)count;
@@ -10149,7 +10153,7 @@ refused:
 	return false;
 }
 
-/* First-hop protective receive, not image authority. The Tier1 caller has
+/* Versioned protective receive, not image authority. The Tier1 caller has
  * already authenticated the DATA source; R11's original admission and OPEN
  * table independently supply both expected identities. Preserve every local
  * parent on later refusal/ERROR. No page or PCM join is published here. */
@@ -10163,7 +10167,8 @@ gcs_block_resource_x_ctrc_receive_image(const ResourceXDecodedFrame *frame,
 	const uint8 *bundle;
 	PageHeader page;
 	uint8 expected_source[12];
-	uint16 bytes, count = 0, used;
+	ResourceXCtrcBundleLayout layout;
+	uint16 bytes, count = 0, record_index = 0;
 	uint64 self_boot = cluster_qvotec_get_self_incarnation();
 
 	if (frame == NULL || frame->kind != RESOURCE_X_WIRE_IMAGE_ENVELOPE
@@ -10198,26 +10203,34 @@ gcs_block_resource_x_ctrc_receive_image(const ResourceXDecodedFrame *frame,
 		else
 			count++;
 	}
-	if (count == 0 || bytes != RESOURCE_X_CTRC_BUNDLE_HEADER_BYTES
-			+ count * CLUSTER_CTRC_DELEGATION_V1_BYTES
-		|| bundle[0] != 0 || bundle[1] != RESOURCE_X_CTRC_BUNDLE_VERSION
-		|| bundle[2] != (uint8)(bytes >> 8) || bundle[3] != (uint8)bytes
-		|| bundle[4] != 0 || bundle[5] != count || bundle[6] != 0 || bundle[7] != 0
-		|| !gcs_block_resource_x_ctrc_source_identities(admission, source, connection,
-			self_boot, &receiver, &sender))
+	if (count == 0 || !cluster_resource_x_ctrc_bundle_layout(image, &layout)
+		|| layout.count != count)
+		return false;
+	/* Legacy V1 custody supports only complete first-hop records. Validate
+	 * every length before the first registration, preserving its meaning. */
+	if (layout.version == RESOURCE_X_CTRC_BUNDLE_VERSION) {
+		for (uint16 i = 0; i < layout.count; i++)
+			if (layout.lengths[i] != CLUSTER_CTRC_DELEGATION_V1_BYTES)
+				return false;
+	}
+	if (!gcs_block_resource_x_ctrc_source_identities(admission, source, connection,
+		self_boot, &receiver, &sender))
 		return false;
 	gcs_block_resource_x_put_u32(expected_source, sender.node_id);
 	gcs_block_resource_x_put_u64(expected_source + 4, sender.boot_incarnation);
 	if (memcmp(expected_source, image->source_fence, sizeof(expected_source)) != 0)
 		return false;
-	used = RESOURCE_X_CTRC_BUNDLE_HEADER_BYTES;
 	for (uint16 i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
 		if (slots[i].flags == ITL_FLAG_FREE)
 			continue;
-		if (!cluster_ctrc_itl_delegate_accept_v1(&slots[i], &sender, &receiver,
-			bundle + used, CLUSTER_CTRC_DELEGATION_V1_BYTES))
+		if (layout.version == RESOURCE_X_CTRC_BUNDLE_V2_VERSION) {
+			if (!cluster_ctrc_itl_delegate_accept_v2(&slots[i], &sender, &receiver,
+				bundle + layout.offsets[record_index], layout.lengths[record_index]))
+				return false;
+		} else if (!cluster_ctrc_itl_delegate_accept_v1(&slots[i], &sender, &receiver,
+			bundle + layout.offsets[record_index], layout.lengths[record_index]))
 			return false;
-		used += CLUSTER_CTRC_DELEGATION_V1_BYTES;
+		record_index++;
 	}
 	return gcs_block_resource_x_ctrc_source_identities(admission, source, connection,
 			self_boot, &final_receiver, &final_sender)
@@ -11173,7 +11186,8 @@ gcs_block_resource_x_ctrc_image_prepare(GcsBlockCtrcImageInstall *install,
 	ClusterCtrcTargetV1 pending = { 0 };
 	const ResourceXDecodedImageEnvelope *image;
 	const ClusterItlSlotData *slots;
-	uint16 mask, used = RESOURCE_X_CTRC_BUNDLE_HEADER_BYTES;
+	ResourceXCtrcBundleLayout layout;
+	uint16 mask, record_index = 0;
 	uint32 source, connection = 0, final_connection = 0;
 	uint8 expected_source[12];
 	int origin = -1;
@@ -11196,7 +11210,8 @@ gcs_block_resource_x_ctrc_image_prepare(GcsBlockCtrcImageInstall *install,
 	if (mask == 0)
 		return image->ctrc_delegation_bytes == 0;
 	if (ref->assertion.resource.forkNum != MAIN_FORKNUM
-		|| ref->acquisition_generation == 0 || ref->acquisition_generation == UINT64_MAX)
+		|| ref->acquisition_generation == 0 || ref->acquisition_generation == UINT64_MAX
+		|| !cluster_resource_x_ctrc_bundle_layout(image, &layout))
 		return false;
 	source = ((uint32)image->source_fence[0] << 24) | ((uint32)image->source_fence[1] << 16)
 		| ((uint32)image->source_fence[2] << 8) | image->source_fence[3];
@@ -11231,6 +11246,7 @@ gcs_block_resource_x_ctrc_image_prepare(GcsBlockCtrcImageInstall *install,
 	slots = ClusterPageGetItlSlots((Page)image->page_bytes);
 	for (uint16 i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
 		ClusterCtrcTargetV1 *exact = &install->targets[i];
+		ClusterCtrcPrepareResult result;
 
 		if ((mask & (1U << i)) == 0)
 			continue;
@@ -11246,12 +11262,18 @@ gcs_block_resource_x_ctrc_image_prepare(GcsBlockCtrcImageInstall *install,
 		if (!cluster_ctrc_sha256_exact(&slots[i], sizeof(slots[i]), exact->planned_successor_sha256))
 			return false;
 		memcpy(exact->planned_predecessor_sha256, exact->planned_successor_sha256, 32);
-		if (cluster_ctrc_itl_image_prepare_v1(&slots[i], &sender, &receiver,
-			image->ctrc_delegation + used, CLUSTER_CTRC_DELEGATION_V1_BYTES,
-			&pending, &install->receipts[i]) != CLUSTER_CTRC_PREPARE_READY)
+		if (layout.version == RESOURCE_X_CTRC_BUNDLE_V2_VERSION)
+			result = cluster_ctrc_itl_image_prepare_v2(&slots[i], &sender, &receiver,
+				image->ctrc_delegation + layout.offsets[record_index], layout.lengths[record_index],
+				&pending, &install->receipts[i]);
+		else
+			result = cluster_ctrc_itl_image_prepare_v1(&slots[i], &sender, &receiver,
+				image->ctrc_delegation + layout.offsets[record_index], layout.lengths[record_index],
+				&pending, &install->receipts[i]);
+		if (result != CLUSTER_CTRC_PREPARE_READY)
 			return false;
 		install->prepared_mask |= (uint16)(1U << i);
-		used += CLUSTER_CTRC_DELEGATION_V1_BYTES;
+		record_index++;
 	}
 	install->ready = gcs_block_pcm_x_resource_x_peer_ready_exact((int32)source, &final_connection)
 		&& connection == final_connection

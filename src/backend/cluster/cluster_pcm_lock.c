@@ -736,13 +736,13 @@ StaticAssertDecl(sizeof(ClusterPcmResourceXBlockIntent) == 192,
 				 "Resource-X block intent layout must remain 192 bytes");
 StaticAssertDecl(sizeof(ClusterPcmResourceXHolderStatus) == 384,
 				 "Resource-X holder status layout must remain 384 bytes");
-StaticAssertDecl(sizeof(ClusterPcmResourceXHolderImage) == 12920,
-				 "Resource-X holder image layout must remain 12920 bytes");
-StaticAssertDecl(sizeof(ClusterPcmResourceXRequesterJoin) == 13216,
-				 "Resource-X requester join layout must remain 13216 bytes");
+StaticAssertDecl(sizeof(ClusterPcmResourceXHolderImage) == 15104,
+				 "Resource-X holder image layout must remain 15104 bytes");
+StaticAssertDecl(sizeof(ClusterPcmResourceXRequesterJoin) == 15400,
+				 "Resource-X requester join layout must remain 15400 bytes");
 StaticAssertDecl(sizeof(ClusterPcmResourceXDeferredSettlement) == 160,
 				 "Resource-X deferred settlement must remain bounded");
-StaticAssertDecl(sizeof(ClusterPcmResourceXMasterState) == 54176,
+StaticAssertDecl(sizeof(ClusterPcmResourceXMasterState) == 58544,
 				 "D4 Resource-X master state must bind object generation");
 
 typedef struct ClusterPcmShared {
