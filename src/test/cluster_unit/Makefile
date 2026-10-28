@@ -10293,3 +10293,23 @@ clean-requester-ingress:
 	rm -f test_cluster_resource_x_requester_ingress \
 		test_cluster_resource_x_requester_evidence_fixture.inc test_cluster_resource_x_requester_evidence_fixture.inc.tmp \
 		test_cluster_resource_x_requester_ingress.inc test_cluster_resource_x_requester_ingress.inc.tmp
+
+# Original GCS canonical handoff through conditional A and send scheduling.
+TESTS += test_cluster_resource_x_master_publish_tick
+all: test_cluster_resource_x_master_publish_tick
+test_cluster_resource_x_master_publish_tick: test_cluster_resource_x_master_publish_tick.c \
+		test_cluster_resource_x_master_ack_fixture.inc \
+		test_cluster_resource_x_acquire_fixture.inc test_cluster_resource_x_acquire_candidate.inc \
+		test_cluster_resource_x_decision_owner_layout.inc test_cluster_pcm_lock
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+clean distclean maintainer-clean: clean-master-publish-tick
+.PHONY: clean-master-publish-tick
+clean-master-publish-tick:
+	rm -f test_cluster_resource_x_master_publish_tick

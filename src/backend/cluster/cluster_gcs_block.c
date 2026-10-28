@@ -15442,14 +15442,26 @@ cluster_gcs_block_resource_x_bootstrap_tick(const ResourceXBootstrapWork *work)
 		else if (result == RESOURCE_X_APPLY_APPLIED) {
 			result = cluster_pcm_lock_resource_x_bootstrap_resume_exact(work, &outbound);
 			if (result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE) {
-				ready = true;
-				/* The existing fused path already created the canonical request;
-				 * ordinary local-proof bootstrap still sends its exact ACK. */
-				if (!work->has_acquire_intent && outbound.kind != RESOURCE_X_WIRE_ASSERT_X
-					&& gcs_block_resource_x_bootstrap_admitted(work, &admission)
-						   == RESOURCE_X_APPLY_APPLIED)
-					(void)gcs_block_resource_x_bootstrap_ack_stage_exact(
-						work->request.logical_assertion.requester_node, &outbound);
+				if (work->has_acquire_intent) {
+					/* Resume only binds E to its canonical owner. Recheck the
+					 * independent domains before that owner builds and commits A.
+					 * Publication retains the same E and original send slots. */
+					result = gcs_block_resource_x_bootstrap_admitted(work, &admission);
+					if (result == RESOURCE_X_APPLY_APPLIED)
+						result = cluster_pcm_lock_resource_x_acquire_decision_publish_exact(work, NULL);
+					if (result == RESOURCE_X_APPLY_STALE)
+						cluster_pcm_lock_resource_x_bootstrap_forget_exact(work);
+					ready = result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE;
+				} else {
+					ready = true;
+					/* The fused legacy path already created its canonical request;
+					 * local-proof bootstrap still sends its exact ACK. */
+					if (outbound.kind != RESOURCE_X_WIRE_ASSERT_X
+						&& gcs_block_resource_x_bootstrap_admitted(work, &admission)
+							   == RESOURCE_X_APPLY_APPLIED)
+						(void)gcs_block_resource_x_bootstrap_ack_stage_exact(
+							work->request.logical_assertion.requester_node, &outbound);
+				}
 			}
 		}
 	}

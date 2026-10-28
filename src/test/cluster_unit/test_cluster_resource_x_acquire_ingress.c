@@ -433,6 +433,18 @@ UT_TEST(test_acquire_queued_error_returns_admission_without_losing_original_work
 	UT_ASSERT(memcmp(&work, &after, sizeof(work)) == 0);
 }
 
+/* Snapshot/plan fixtures deliberately stop at the real canonical owner.
+ * The complete GCS tick now also publishes A and has its own actual fixture. */
+static ResourceXApplyResult
+acquire_canonical_resume(const ResourceXBootstrapWork *work)
+{
+	ResourceXDecodedFrame outbound;
+	ResourceXApplyResult result = cluster_pcm_lock_resource_x_bootstrap_resume_exact(work, &outbound);
+	UT_ASSERT_EQ(outbound.kind, 0);
+	UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	return result;
+}
+
 static bool
 acquire_canonical_start(ResourceXDecodedFrame *frame, ResourceXBootstrapWork *work)
 {
@@ -441,7 +453,7 @@ acquire_canonical_start(ResourceXDecodedFrame *frame, ResourceXBootstrapWork *wo
 	if (result != RESOURCE_X_APPLY_APPLIED)
 		return false;
 	*work = bootstrap_next_work();
-	result = cluster_gcs_block_resource_x_bootstrap_tick(work);
+	result = acquire_canonical_resume(work);
 	UT_ASSERT_EQ(result, RESOURCE_X_APPLY_APPLIED);
 	return result == RESOURCE_X_APPLY_APPLIED;
 }
@@ -506,7 +518,7 @@ UT_TEST(test_acquire_canonical_duplicate_does_not_allocate_another_order)
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_master_snapshot_exact(
 		&frame.common.logical_assertion, &before), RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(acquire_deliver(&frame), RESOURCE_X_APPLY_DUPLICATE);
-	UT_ASSERT_EQ(cluster_gcs_block_resource_x_bootstrap_tick(&work), RESOURCE_X_APPLY_DUPLICATE);
+	UT_ASSERT_EQ(acquire_canonical_resume(&work), RESOURCE_X_APPLY_DUPLICATE);
 	memset(&out, 0x5a, sizeof(out));
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_resume_exact(&work, &out),
 		RESOURCE_X_APPLY_DUPLICATE);
@@ -541,14 +553,14 @@ UT_TEST(test_acquire_canonical_head_cannot_be_overtaken_by_later_work)
 		RESOURCE_X_APPLY_BAD_STATE);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_master_snapshot_exact(
 		&b.common.logical_assertion, &snapshot), RESOURCE_X_APPLY_NOT_FOUND);
-	UT_ASSERT_EQ(cluster_gcs_block_resource_x_bootstrap_tick(&first), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(acquire_canonical_resume(&first), RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_resume_exact(&forged, &out),
 		RESOURCE_X_APPLY_BAD_STATE);
 	acquire_canonical_check(&a);
 	cluster_pcm_lock_resource_x_bootstrap_forget_exact(&first);
 	next = bootstrap_next_work();
 	UT_ASSERT(memcmp(&forged, &next, sizeof(next)) == 0);
-	UT_ASSERT_EQ(cluster_gcs_block_resource_x_bootstrap_tick(&next), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(acquire_canonical_resume(&next), RESOURCE_X_APPLY_APPLIED);
 	acquire_canonical_check(&b);
 }
 
@@ -637,14 +649,14 @@ UT_TEST(test_acquire_canonical_cancel_preserves_floor_and_late_work_cannot_touch
 	successor.body.acquire_intent.reservation_token++;
 	UT_ASSERT_EQ(acquire_deliver(&successor), RESOURCE_X_APPLY_APPLIED);
 	next = bootstrap_next_work();
-	UT_ASSERT_EQ(cluster_gcs_block_resource_x_bootstrap_tick(&next), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(acquire_canonical_resume(&next), RESOURCE_X_APPLY_APPLIED);
 	cluster_pcm_lock_resource_x_bootstrap_forget_exact(&work);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_resume_exact(&work, &out), RESOURCE_X_APPLY_STALE);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_master_snapshot_exact(
 		&successor.common.logical_assertion, &snapshot), RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(snapshot.assertion_sequence, successor.common.assertion_sequence);
 	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_QUEUED);
-	UT_ASSERT_EQ(cluster_gcs_block_resource_x_bootstrap_tick(&next), RESOURCE_X_APPLY_DUPLICATE);
+	UT_ASSERT_EQ(acquire_canonical_resume(&next), RESOURCE_X_APPLY_DUPLICATE);
 }
 
 UT_TEST(test_acquire_canonical_unknown_observation_keeps_pair_but_boot_change_retires_it)
@@ -707,7 +719,7 @@ UT_TEST(test_acquire_canonical_stop_seal_allows_existing_handoff_and_cancel)
 	stop_new_work_allowed = false;
 	newcomer = acquire_frame(2, RESOURCE_X_ACQUIRE_FIRST_FILL, PCM_STATE_N, PCM_STATE_S);
 	UT_ASSERT_EQ(acquire_deliver(&newcomer), RESOURCE_X_APPLY_BAD_STATE);
-	UT_ASSERT_EQ(cluster_gcs_block_resource_x_bootstrap_tick(&work), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(acquire_canonical_resume(&work), RESOURCE_X_APPLY_APPLIED);
 	acquire_canonical_check(&frame);
 	cluster_pcm_lock_resource_x_bootstrap_forget_exact(&work);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_master_snapshot_exact(
@@ -857,7 +869,7 @@ UT_TEST(test_acquire_canonical_waits_for_original_pending_s_without_reserving_a_
 	UT_ASSERT(cluster_pcm_lock_read_grant_done(&grant.key, 3, true));
 	actual = bootstrap_next_work();
 	UT_ASSERT(memcmp(&work, &actual, sizeof(work)) == 0);
-	UT_ASSERT_EQ(cluster_gcs_block_resource_x_bootstrap_tick(&actual), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(acquire_canonical_resume(&actual), RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_master_snapshot_exact(
 		&frame.common.logical_assertion, &snapshot), RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_QUEUED);
@@ -1102,7 +1114,7 @@ UT_TEST(test_service_snapshot_requires_canonical_head_and_preserves_fifo)
 	UT_ASSERT_EQ(acquire_deliver(&first), RESOURCE_X_APPLY_APPLIED);
 	work = bootstrap_next_work();
 	service_snapshot_refused(&work, NULL, RESOURCE_X_APPLY_BAD_STATE);
-	UT_ASSERT_EQ(cluster_gcs_block_resource_x_bootstrap_tick(&work), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(acquire_canonical_resume(&work), RESOURCE_X_APPLY_APPLIED);
 	second = acquire_frame(2, RESOURCE_X_ACQUIRE_FIRST_FILL, PCM_STATE_N, PCM_STATE_S);
 	UT_ASSERT_EQ(acquire_deliver(&second), RESOURCE_X_APPLY_APPLIED);
 	/* Only the serviceable head is exported by the bounded scanner. Build
@@ -2190,7 +2202,7 @@ UT_TEST(test_decision_plan_cannot_skip_uncanonical_or_successor_fifo_work)
 	UT_ASSERT_EQ(acquire_deliver(&first), RESOURCE_X_APPLY_APPLIED);
 	work = bootstrap_next_work();
 	decision_plan_refused(&work, NULL, RESOURCE_X_APPLY_BAD_STATE);
-	UT_ASSERT_EQ(cluster_gcs_block_resource_x_bootstrap_tick(&work), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(acquire_canonical_resume(&work), RESOURCE_X_APPLY_APPLIED);
 	second = acquire_frame(2, RESOURCE_X_ACQUIRE_FIRST_FILL, PCM_STATE_N, PCM_STATE_S);
 	UT_ASSERT_EQ(acquire_deliver(&second), RESOURCE_X_APPLY_APPLIED);
 	later = work;
