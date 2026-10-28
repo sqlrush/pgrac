@@ -218,6 +218,10 @@ DefineType(ParseState *pstate, List *names, List *parameters)
 	ListCell   *pl;
 	ObjectAddress address;
 
+#ifdef USE_PGRAC_CLUSTER
+	CheckClusterSharedTypeSupport();
+#endif
+
 	/*
 	 * As of Postgres 8.4, we require superuser privilege to create a base
 	 * type.  This is simple paranoia: there are too many ways to mess up the
@@ -2541,10 +2545,16 @@ AssignTypeMultirangeArrayOid(void)
 ObjectAddress
 DefineCompositeType(RangeVar *typevar, List *coldeflist)
 {
-	CreateStmt *createStmt = makeNode(CreateStmt);
+	CreateStmt *createStmt;
 	Oid			old_type_oid;
 	Oid			typeNamespace;
 	ObjectAddress address;
+
+#ifdef USE_PGRAC_CLUSTER
+	CheckClusterSharedTypeSupport();
+#endif
+
+	createStmt = makeNode(CreateStmt);
 
 	/*
 	 * now set the parameters for keys/inheritance etc. All of these are

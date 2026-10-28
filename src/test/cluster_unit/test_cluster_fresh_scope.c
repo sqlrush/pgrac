@@ -360,6 +360,10 @@ static bool tablespace_options_lookup_active, tablespace_options_expect_binding;
 static unsigned tablespace_options_lookups, tablespace_options_unbound;
 static unsigned tablespace_options_bad_lookup;
 
+static bool type_factory_scope_lookup_active;
+static unsigned type_factory_scope_route, type_factory_scope_lookups;
+static unsigned type_factory_scope_lookup_kind, type_factory_scope_bad_lookup;
+static MemoryContext type_factory_scope_expected_context;
 static bool type_creation_scope_lookup_active;
 static unsigned type_creation_scope_route, type_creation_scope_lookups;
 static unsigned type_creation_scope_lookup_kind, type_creation_scope_bad_lookup;
@@ -6033,6 +6037,14 @@ errmsg_internal(const char *fmt, ...)
 void *
 MemoryContextAllocZeroAligned(MemoryContext context, Size size)
 {
+	if (type_factory_scope_lookup_active) {
+		type_factory_scope_lookups++;
+		type_factory_scope_lookup_kind = 2;
+		if (type_factory_scope_route != 2 || size != sizeof(CreateStmt)
+			|| context != type_factory_scope_expected_context)
+			type_factory_scope_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before the original allocation. */
+	}
 	(void)context;
 	return calloc(1, size);
 }
@@ -8806,6 +8818,13 @@ static unsigned language_lookups, language_unbound;
 bool
 superuser(void)
 {
+	if (type_factory_scope_lookup_active) {
+		type_factory_scope_lookups++;
+		type_factory_scope_lookup_kind = 1;
+		if (type_factory_scope_route != 1)
+			type_factory_scope_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before the real superuser/role-cache query. */
+	}
 	if (role_settings_lookup_active) {
 		record_role_settings_lookup(3);
 		if (native_role_settings_statement.role != NULL
@@ -19539,10 +19558,237 @@ UT_TEST(test_native_type_creation_scope_preserves_existing_supported_top_binding
 	type_creation_scope_lookup_active = false;
 }
 
+/* Actual base and composite creation prefixes stop before permission or
+ * allocation work. The original makeNode macro and refusal bodies remain. */
+#include "test_cluster_fresh_type_factory_scope.inc"
+static String type_factory_scope_parts[2], type_factory_scope_column_parts[2];
+static ListCell type_factory_scope_cells[2], type_factory_scope_column_cells[2];
+static List type_factory_scope_names, type_factory_scope_column_names;
+static Integer type_factory_scope_length;
+static DefElem type_factory_scope_length_param;
+static ListCell type_factory_scope_param_cell, type_factory_scope_column_cell;
+static List type_factory_scope_params, type_factory_scope_columns;
+static TypeName type_factory_scope_column_type;
+static ColumnDef type_factory_scope_column;
+static ParseState type_factory_scope_parse_state;
+static DefineStmt native_type_factory_scope_base;
+static RangeVar type_factory_scope_relation;
+static CompositeTypeStmt native_type_factory_scope_composite;
+static RangeVar type_factory_scope_warm_relation;
+static AlterObjectSchemaStmt type_factory_scope_warm_statement;
+
+static void
+reset_native_type_factory_scope(unsigned form)
+{
+	unsigned count = form % 2 ? 2 : 1;
+
+	reset_create_preflight();
+	error_detail[0] = '\0';
+	type_factory_scope_lookup_active = true;
+	type_factory_scope_route = form < 8 ? 1 : 2;
+	type_factory_scope_lookups = type_factory_scope_lookup_kind = type_factory_scope_bad_lookup = 0;
+	type_factory_scope_expected_context = CurrentMemoryContext;
+	type_factory_scope_parts[0]
+		= (String){ .type = T_String, .sval = count == 1 ? "native_base" : "base_schema" };
+	type_factory_scope_parts[1] = (String){ .type = T_String, .sval = "qualified_base" };
+	for (unsigned i = 0; i < 2; i++)
+		type_factory_scope_cells[i] = (ListCell){ .ptr_value = &type_factory_scope_parts[i] };
+	type_factory_scope_names = (List){ .type = T_List,
+									   .length = count,
+									   .max_length = 2,
+									   .elements = type_factory_scope_cells };
+	type_factory_scope_length = (Integer){ .type = T_Integer, .ival = 4 };
+	type_factory_scope_length_param = (DefElem){ .type = T_DefElem,
+												 .defname = "internallength",
+												 .arg = (Node *)&type_factory_scope_length,
+												 .defaction = DEFELEM_UNSPEC,
+												 .location = -1 };
+	type_factory_scope_param_cell = (ListCell){ .ptr_value = &type_factory_scope_length_param };
+	type_factory_scope_params = (List){ .type = T_List,
+										.length = 1,
+										.max_length = 1,
+										.elements = &type_factory_scope_param_cell };
+	native_type_factory_scope_base
+		= (DefineStmt){ .type = T_DefineStmt,
+						.kind = OBJECT_TYPE,
+						.oldstyle = false,
+						.defnames = &type_factory_scope_names,
+						.args = NIL,
+						.definition = form % 4 >= 2 ? &type_factory_scope_params : NIL };
+	type_factory_scope_column_parts[0] = (String){ .type = T_String, .sval = "pg_catalog" };
+	type_factory_scope_column_parts[1] = (String){ .type = T_String, .sval = "int4" };
+	for (unsigned i = 0; i < 2; i++)
+		type_factory_scope_column_cells[i]
+			= (ListCell){ .ptr_value = &type_factory_scope_column_parts[i] };
+	type_factory_scope_column_names = (List){ .type = T_List,
+											  .length = 2,
+											  .max_length = 2,
+											  .elements = type_factory_scope_column_cells };
+	type_factory_scope_column_type = (TypeName){ .type = T_TypeName,
+												 .names = &type_factory_scope_column_names,
+												 .typemod = -1,
+												 .location = -1 };
+	type_factory_scope_column = (ColumnDef){ .type = T_ColumnDef,
+											 .colname = "c",
+											 .typeName = &type_factory_scope_column_type,
+											 .is_local = true,
+											 .location = -1 };
+	type_factory_scope_column_cell = (ListCell){ .ptr_value = &type_factory_scope_column };
+	type_factory_scope_columns = (List){ .type = T_List,
+										 .length = 1,
+										 .max_length = 1,
+										 .elements = &type_factory_scope_column_cell };
+	type_factory_scope_relation = (RangeVar){ .type = T_RangeVar,
+											  .schemaname = count == 2 ? "composite_schema" : NULL,
+											  .relname = "native_composite",
+											  .inh = true,
+											  .relpersistence = RELPERSISTENCE_PERMANENT,
+											  .location = -1 };
+	native_type_factory_scope_composite
+		= (CompositeTypeStmt){ .type = T_CompositeTypeStmt,
+							   .typevar = &type_factory_scope_relation,
+							   .coldeflist = form >= 10 ? &type_factory_scope_columns : NIL };
+	type_factory_scope_parse_state = (ParseState){ .p_sourcetext = "CREATE TYPE native_base" };
+	type_factory_scope_warm_relation
+		= (RangeVar){ .type = T_RangeVar, .relname = "supported_warm_table" };
+	type_factory_scope_warm_statement
+		= (AlterObjectSchemaStmt){ .type = T_AlterObjectSchemaStmt,
+								   .objectType = OBJECT_TABLE,
+								   .relation = &type_factory_scope_warm_relation,
+								   .newschema = "supported_warm_destination",
+								   .missing_ok = false };
+}
+
+static void
+native_type_factory_scope_entry(unsigned form)
+{
+	if (form < 8)
+		(void)DefineType(form >= 4 ? &type_factory_scope_parse_state : NULL,
+						 native_type_factory_scope_base.defnames,
+						 native_type_factory_scope_base.definition);
+	else
+		(void)DefineCompositeType(native_type_factory_scope_composite.typevar,
+								  native_type_factory_scope_composite.coldeflist);
+}
+
+static void
+assert_native_type_factory_scope_result(bool blocked, int caught)
+{
+	UT_ASSERT_EQ(caught, blocked ? 1 : 2);
+	UT_ASSERT_EQ(error_code, blocked ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+	if (blocked) {
+		UT_ASSERT_STR_EQ(error_message, "custom types is not supported in shared mode");
+		UT_ASSERT_STR_EQ(error_detail,
+						 "PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+	}
+	UT_ASSERT_EQ(type_factory_scope_lookups, blocked ? 0 : 1);
+	UT_ASSERT_EQ(type_factory_scope_lookup_kind, blocked ? 0 : type_factory_scope_route);
+	UT_ASSERT_EQ(type_factory_scope_bad_lookup, 0);
+}
+
+UT_TEST(test_native_type_factory_scope_matches_utility_before_permission_or_allocation)
+{
+	for (unsigned form = 0; form < 12; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool blocked = (mode & 5) != 0;
+			int caught;
+
+			reset_native_type_factory_scope(form);
+			set_native_operator_mode(mode);
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				create_sql_entry(form < 8 ? (Node *)&native_type_factory_scope_base
+										  : (Node *)&native_type_factory_scope_composite);
+			UT_ASSERT_EQ(caught, blocked ? 1 : 0);
+			UT_ASSERT_EQ(error_code, blocked ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+			if (blocked) {
+				UT_ASSERT_STR_EQ(error_message, "custom types is not supported in shared mode");
+				UT_ASSERT_STR_EQ(error_detail,
+								 "PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+			}
+			UT_ASSERT_EQ(
+				type_factory_scope_lookups + utility_xids + utility_prepares + utility_binds, 0);
+			reset_error();
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_type_factory_scope_entry(form);
+			assert_native_type_factory_scope_result(blocked, caught);
+			UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			UT_ASSERT_EQ(utility_top_xid, InvalidTransactionId);
+		}
+	}
+	type_factory_scope_lookup_active = false;
+}
+
+UT_TEST(test_native_type_factory_scope_precedes_context_child_top_and_publication)
+{
+	for (unsigned form = 0; form < 12; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			for (unsigned fault = 0; fault < 7; fault++) {
+				int caught;
+
+				reset_native_type_factory_scope(form);
+				set_native_operator_mode(mode);
+				XactReadOnly = fault == 0;
+				utility_parallel = fault == 1;
+				utility_recovery = fault == 2;
+				utility_in_child = fault == 3;
+				if (fault == 4 || fault == 5) {
+					utility_current_xid = 401;
+					utility_top_xid = fault == 4 ? 400 : InvalidTransactionId;
+				}
+				utility_bind_ok = fault != 6;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_type_factory_scope_entry(form);
+				assert_native_type_factory_scope_result((mode & 5) != 0, caught);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+				UT_ASSERT_EQ(utility_top_xid, fault == 4 ? 400 : InvalidTransactionId);
+				UT_ASSERT_EQ(utility_current_xid,
+							 fault == 4 || fault == 5 ? 401 : InvalidTransactionId);
+			}
+		}
+	}
+	type_factory_scope_lookup_active = false;
+}
+
+UT_TEST(test_native_type_factory_scope_preserves_existing_supported_top_binding)
+{
+	for (unsigned form = 0; form < 12; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			for (unsigned fault = 0; fault < 5; fault++) {
+				int caught;
+
+				reset_native_type_factory_scope(form);
+				create_sql_entry((Node *)&type_factory_scope_warm_statement);
+				UT_ASSERT_EQ(utility_xids, 1);
+				UT_ASSERT_EQ(utility_prepares, 1);
+				UT_ASSERT_EQ(utility_binds, 1);
+				set_native_operator_mode(mode);
+				XactReadOnly = fault == 0;
+				utility_parallel = fault == 1;
+				utility_recovery = fault == 2;
+				utility_in_child = fault == 3;
+				utility_bind_ok = fault != 4;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_type_factory_scope_entry(form);
+				assert_native_type_factory_scope_result((mode & 5) != 0, caught);
+				UT_ASSERT_EQ(utility_xids, 1);
+				UT_ASSERT_EQ(utility_prepares, 1);
+				UT_ASSERT_EQ(utility_binds, 1);
+				UT_ASSERT_EQ(utility_top_xid, 400);
+				UT_ASSERT_EQ(utility_current_xid, 400);
+			}
+		}
+	}
+	type_factory_scope_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(312);
+	UT_PLAN(315);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -19857,6 +20103,9 @@ main(void)
 	UT_RUN(test_native_type_creation_scope_matches_utility_before_namespace_query);
 	UT_RUN(test_native_type_creation_scope_precedes_context_child_top_and_publication);
 	UT_RUN(test_native_type_creation_scope_preserves_existing_supported_top_binding);
+	UT_RUN(test_native_type_factory_scope_matches_utility_before_permission_or_allocation);
+	UT_RUN(test_native_type_factory_scope_precedes_context_child_top_and_publication);
+	UT_RUN(test_native_type_factory_scope_preserves_existing_supported_top_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
