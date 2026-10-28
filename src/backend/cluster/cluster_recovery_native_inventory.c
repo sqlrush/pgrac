@@ -3139,10 +3139,80 @@ history_pending_xid_generations(ClusterRecoveryRelmapHistory *history,
 	return true;
 }
 
-bool
-cluster_recovery_relmap_history_pending_xid_v1(ClusterRecoveryRelmapHistory *history,
+/* This correspondence is deliberately narrower than native lifetime proof.
+ * Never order distinct physical generations, infer an era from raw ZERO, or
+ * treat a matching page birth as an issued/terminal transaction. */
+static bool
+history_pending_birth_match(const ClusterRecoveryRelmapPendingXidV1 *inputs,
+	const ClusterRelmapV2Image *pending, uint32 *birth_index)
+{
+	uint64 query = pending->pending_owner.top_full_xid;
+	uint32 raw = (uint32)query, page = raw / CLUSTER_NATIVE_CLOG_PER_PAGE;
+	uint64 first = query - raw + (page == 0 ? FirstNormalTransactionId
+		: page * (uint64)CLUSTER_NATIVE_CLOG_PER_PAGE);
+	uint32 source = inputs->history.observation.source_index;
+	uint32 found = UINT32_MAX, origins = 0;
+	const ClusterRecoveryRelmapClogEventV1 *birth;
+
+	if (inputs->generation_count == 0 || inputs->generation_count > CLUSTER_WAL_INPUTS_MAX
+		|| source >= inputs->generation_count
+		|| inputs->clog_count > CLUSTER_RECOVERY_RELMAP_CLOG_HISTORY_MAX)
+		return false;
+	for (uint32 i = 0; i < inputs->generation_count; i++) {
+		const ClusterRecoveryRelmapXidGenerationV1 *generation = &inputs->generations[i];
+		if (generation->observation.source.claim.identity.origin_node_id != pending->pending_owner.node)
+			continue;
+		/* Other generations of this physical namespace have no proven order. */
+		if (i != source || !generation->counter_observed
+			|| memcmp(&generation->observation, &inputs->history.observation,
+				sizeof(generation->observation)) != 0)
+			return false;
+		origins++;
+	}
+	if (origins != 1)
+		return false;
+	for (uint32 i = 0; i < inputs->clog_count; i++) {
+		const ClusterRecoveryRelmapClogEventV1 *event = &inputs->clog[i];
+		if (event->source_index != source)
+			return false;
+		if (event->kind == CLUSTER_RECOVERY_NATIVE_CLOG_ZERO && event->page == page
+			&& event->full_birth_observed) {
+			if (found != UINT32_MAX)
+				return false;
+			found = i;
+		}
+	}
+	if (found == UINT32_MAX)
+		return false;
+	birth = &inputs->clog[found];
+	if (birth->full_birth.first_full_xid != first || birth->full_birth.reserved_zero != 0
+		|| birth->full_birth.pageno != page || !birth->counter_observed
+		|| birth->read_lsn < inputs->generations[source].native_redo
+		|| birth->read_lsn >= birth->end_lsn || birth->end_lsn > inputs->map_start
+		|| birth->record_ordinal >= inputs->map_ordinal
+		|| birth->counter_before < inputs->checkpoint_next
+		|| birth->counter_before > birth->counter_after || birth->counter_after > inputs->before_map)
+		return false;
+	for (uint32 i = 0; i < inputs->clog_count; i++) {
+		const ClusterRecoveryRelmapClogEventV1 *event = &inputs->clog[i];
+		if (i == found)
+			continue;
+		/* A raw truncate has no independently ordered FullXid horizon. Keep
+		 * it unresolved unless it is wholly before the observed new birth. */
+		if (event->kind == CLUSTER_RECOVERY_NATIVE_CLOG_TRUNCATE
+			|| (event->kind == CLUSTER_RECOVERY_NATIVE_CLOG_ZERO && event->page == page)) {
+			if (event->record_ordinal >= birth->record_ordinal || event->end_lsn > birth->read_lsn)
+				return false;
+		}
+	}
+	*birth_index = found;
+	return true;
+}
+
+static bool
+history_pending_xid_read(ClusterRecoveryRelmapHistory *history,
 	const ClusterRelmapV2Image *pending, ClusterRecoveryRelmapPendingXidV1 *out,
-	ClusterRecoveryNativeInventoryDiag *diag)
+	ClusterRecoveryNativeInventoryDiag *diag, uint32 *birth_index)
 {
 	ClusterRecoveryRelmapPendingXidV1 result = {0};
 	NativeInventoryRelmapXid xid = {0};
@@ -3222,6 +3292,8 @@ cluster_recovery_relmap_history_pending_xid_v1(ClusterRecoveryRelmapHistory *his
 			result.map_ordinal = xid.map_ordinal;
 			result.map_start = xid.map_start;
 			result.map_end = xid.map_end;
+			if (birth_index != NULL)
+				ok = history_pending_birth_match(&result, pending, birth_index);
 		}
 	}
 	PG_CATCH();
@@ -3239,6 +3311,35 @@ cluster_recovery_relmap_history_pending_xid_v1(ClusterRecoveryRelmapHistory *his
 	} else
 		history_fail(history);
 	return ok;
+}
+
+bool
+cluster_recovery_relmap_history_pending_xid_v1(ClusterRecoveryRelmapHistory *history,
+	const ClusterRelmapV2Image *pending, ClusterRecoveryRelmapPendingXidV1 *out,
+	ClusterRecoveryNativeInventoryDiag *diag)
+{
+	return history_pending_xid_read(history, pending, out, diag, NULL);
+}
+
+bool
+cluster_recovery_relmap_history_pending_birth_v1(ClusterRecoveryRelmapHistory *history,
+	const ClusterRelmapV2Image *pending, ClusterRecoveryRelmapPendingBirthV1 *out,
+	ClusterRecoveryNativeInventoryDiag *diag)
+{
+	uint32 birth_index;
+
+	if (pending == NULL || out == NULL || diag == NULL
+		|| history_overlap(out, sizeof(*out), pending, sizeof(*pending))
+		|| history_overlap(diag, sizeof(*diag), pending, sizeof(*pending))
+		|| history_overlap(out, sizeof(*out), diag, sizeof(*diag))
+		|| history_storage_overlap(history, out, sizeof(*out))
+		|| history_storage_overlap(history, diag, sizeof(*diag)))
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (!history_pending_xid_read(history, pending, &out->inputs, diag, &birth_index))
+		return false;
+	out->birth_index = birth_index;
+	return true;
 }
 
 void

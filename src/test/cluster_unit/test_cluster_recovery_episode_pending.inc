@@ -15,6 +15,8 @@
  *     distributed GES remain controlled leaves. No terminal authority.
  *-------------------------------------------------------------------------
  */
+static WalTestRecord (*episode_pending_prefix_hook)(const ClusterWalSourceRef *, WalTestRecord);
+
 static ClusterWalInputsV1 *
 relmap_history_fixture(uint32 era, unsigned window_version, bool barriers)
 {
@@ -76,6 +78,8 @@ relmap_history_fixture(uint32 era, unsigned window_version, bool barriers)
 			next = inventory_write_record(&source, next.exclusive_end, next.record_start,
 										  RM_CLOG_ID, CLOG_TRUNCATE, &truncate, sizeof(truncate));
 		}
+		if (episode_pending_prefix_hook != NULL)
+			next = episode_pending_prefix_hook(&source, next);
 		test_relmap_payload(map, i == 0, 2);
 		next = inventory_write_record(&source, next.exclusive_end, next.record_start, RM_RELMAP_ID,
 									  XLOG_RELMAP_UPDATE, map, sizeof(map));
