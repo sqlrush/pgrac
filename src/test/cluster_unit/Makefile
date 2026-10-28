@@ -9226,11 +9226,11 @@ test_cluster_r4_activation_record: test_cluster_r4_activation_record.c unit_test
 		cluster_r4_activation_test_stubs.h \
 		$(CLUSTER_SEMANTIC_ACTIVATION_C) $(CLUSTER_SEMANTIC_ACTIVATION_H) \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_BLOCK0_O) \
-		$(CLUSTER_UNDO_ROOT_DESCRIPTOR_O)
+		$(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) $(top_builddir)/src/common/sha2_srv.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_BLOCK0_O) \
 		$(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) \
-		$(top_builddir)/src/common/libpgcommon.a \
+		$(top_builddir)/src/common/sha2_srv.o $(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) -lssl -lcrypto -o $@
 
 CLUSTER_R4_OPEN_ROUTE_TEST_O = test_cluster_r4_open_route_product.o

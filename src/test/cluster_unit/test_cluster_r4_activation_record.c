@@ -16,6 +16,7 @@
 #include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "port/pg_crc32c.h"
+#include "storage/proc.h"
 #include "storage/shmem.h"
 
 #include "cluster_r4_activation_test_stubs.h"
@@ -36,6 +37,38 @@ GetCurrentTimestamp(void)
  * Linux retains the whole LMON call graph; reaching one of these is a bug. */
 bool IsUnderPostmaster = false;
 AuxProcType MyAuxProcType = NotAnAuxProcess;
+PGPROC *MyProc = NULL;
+int cluster_interconnect_heartbeat_interval_ms = 1000;
+
+/* The live handler/tick also retain CONTROL rebind dependencies. This
+ * fixture has no stream, dispatch frame, stop owner, or successful OPEN
+ * baseline. Crossing any of those boundaries must fail the fixture. */
+bool
+cluster_ic_dispatch_control_ingress(const ClusterICEnvelope *env pg_attribute_unused(),
+								   ClusterICControlIngress *out pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+cluster_ic_tier1_stream_capture(int32 peer pg_attribute_unused(),
+							   ClusterICTier1Stream *out pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+cluster_ic_tier1_stream_current(const ClusterICTier1Stream *stream pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+cluster_normal_stop_service_control_sealed(void)
+{
+	abort();
+}
+
 /* The sample-request tests tick LMON with no recovery result owner. */
 bool
 cluster_recovery_tx_result_accept_v1(void)
