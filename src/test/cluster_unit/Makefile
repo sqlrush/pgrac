@@ -11163,13 +11163,13 @@ test_cluster_xid_allocation.inc: $(top_srcdir)/src/backend/access/transam/varsup
 	awk '/^typedef struct RelmapXidAllocationV2 / { emit=1; types++ } \
 	     /^(publish_new_transaction_id|relmap_xid_publication|relmap_xid_candidate_check)\(/ { print "static void"; emit=1; found++ } \
 	     /^get_new_transaction_id\(/ { print "static FullTransactionId"; emit=1; found++ } \
-	     /^(GetNewTransactionId|cluster_relmap_retention_allocate_xid_v2)\(/ { print "FullTransactionId"; emit=1; found++ } \
+	     /^(GetNewTransactionId(FullCLOG)?|cluster_relmap_retention_allocate_xid_v2)\(/ { print "FullTransactionId"; emit=1; found++ } \
 	     /^TransactionId(Precedes|FollowsOrEquals)\(/ { print "bool"; emit=1; found++ } \
 	     /^ProcArrayGetActiveFullXidSample\(/ { print "bool"; emit=1; found++ } \
 	     /^MarkAsPreparingGuts\(/ { print "static void"; emit=1; found++ } \
 	     /^ProcArrayClearTransaction\(/ { print "void"; emit=1; found++ } \
 	     /^ProcArrayEndTransactionInternal\(/ { print "static void"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (types != 1 || found != 12) exit 1 }' $(filter %.c,$^) > $@.tmp
+	     emit { print } /^}/ { emit=0 } END { if (types != 1 || found != 13) exit 1 }' $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_xid_allocation_stripe.inc: $(top_srcdir)/src/backend/cluster/cluster_xid_stripe_boot.c Makefile
@@ -11197,7 +11197,9 @@ test_cluster_xid_allocation: test_cluster_xid_allocation.c unit_test.h \
 		$(top_srcdir)/src/include/storage/condition_variable.h \
 		$(top_srcdir)/src/include/access/twophase.h \
 		$(top_srcdir)/src/include/storage/proc.h \
-		$(top_srcdir)/src/include/storage/procarray.h
+		$(top_srcdir)/src/include/storage/procarray.h \
+		test_cluster_xid_full_clog.inc \
+		$(top_srcdir)/src/include/access/clog.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_XID_STRIPE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # Compose the original native allocator with its actual runtime guard and core.
@@ -11285,7 +11287,9 @@ test_cluster_xid_retention: test_cluster_xid_retention.c test_cluster_xid_alloca
 		$(top_srcdir)/src/include/cluster/cluster_reconfig.h \
 		$(top_srcdir)/src/include/access/xloginsert.h \
 		$(top_srcdir)/src/include/utils/resowner.h \
-		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h \
+		test_cluster_xid_full_clog.inc \
+		$(top_srcdir)/src/include/access/clog.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_XID_STRIPE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # Exercise the original recovery -> seed -> claim -> WAL gate. Dependency

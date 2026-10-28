@@ -116,6 +116,10 @@ static LWLock *stripe_lock;
 static uint64 stripe_incarnation;
 static FullTransactionId real_reserved_candidate;
 
+#define proc entries[0]
+#include "test_cluster_xid_full_clog.inc"
+#undef proc
+
 static bool allocation_real_future(FullTransactionId, FullTransactionId *, ClusterXidStripeSampleFence *);
 static bool allocation_real_fence_current(const ClusterXidStripeSampleFence *);
 static bool allocation_real_lease_ready(FullTransactionId);
@@ -356,6 +360,8 @@ extended(void)
 void
 ExtendCLOG(TransactionId xid)
 {
+	if (full_clog_fixture.active)
+		full_clog_fixture.raw_calls++;
 	extended();
 }
 void
@@ -391,6 +397,8 @@ ExceptionalCondition(const char *condition, const char *file, int line)
 bool
 errstart(int level, const char *domain)
 {
+	if (full_clog_fixture.expect_error)
+		longjmp(full_clog_fixture.error, 1);
 	if (!allocation_error_expected || level != ERROR)
 		abort();
 	return true;
@@ -1032,7 +1040,7 @@ UT_TEST(actual_stripe_future_keeps_prepared_fullxid_until_original_retirement)
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(23);
 	UT_RUN(native_subxid_publication_preserves_the_final_cache_slot);
 	UT_RUN(native_publication_keeps_the_full_era_across_raw_rollover);
 	UT_RUN(no_storage_or_procarray_mutation_before_reservation);
@@ -1050,6 +1058,12 @@ main(void)
 	UT_RUN(actual_stripe_sample_keeps_assigned_top_through_children_and_raw_wrap);
 	UT_RUN(actual_stripe_source_refusal_cannot_erase_the_original_allocation);
 	UT_RUN(actual_stripe_future_keeps_prepared_fullxid_until_original_retirement);
+	UT_RUN(full_clog_allocator_uses_original_candidate_and_gap);
+	UT_RUN(full_clog_allocator_keeps_epoch_across_native_wrap);
+	UT_RUN(full_clog_allocator_rederives_after_original_lease_wait);
+	UT_RUN(full_clog_extension_error_precedes_native_publication);
+	UT_RUN(full_clog_entry_refuses_non_normal_processing);
+	UT_RUN(ordinary_allocator_keeps_raw_clog_route);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

@@ -16,6 +16,8 @@
  *	Spec: spec-6.15-xid-space-segmentation.md
  *
  *	What changed:
+ *	  - Add an explicit dormant FullXid CLOG entry while keeping the ordinary
+ *	    allocator on its raw path. No production caller is activated.
  *	  - GetNewTransactionId(): when cluster.xid_striping is enabled the
  *	    issued xid is the striped candidate -- the smallest value at or
  *	    above nextXid whose 32-bit form lies in this node's congruence
@@ -239,7 +241,7 @@ relmap_xid_candidate_check(const RelmapXidAllocationV2 *allocation,
  * issue a warning about XID wrap.
  */
 static FullTransactionId
-get_new_transaction_id(bool isSubXact, RelmapXidAllocationV2 *allocation)
+get_new_transaction_id(bool isSubXact, RelmapXidAllocationV2 *allocation, bool full_clog)
 {
 	FullTransactionId full_xid;
 	TransactionId xid;
@@ -542,7 +544,24 @@ retry_cluster_xid_reservation:
 	 * page-first forever and PANICs on the missing page at first status
 	 * lookup.  The ordinary-step cost is at most STRIDE-1 no-op Extend*
 	 * probes under XidGenLock. */
-	if (U64FromFullTransactionId(full_xid) > U64FromFullTransactionId(ShmemVariableCache->nextXid))
+	/* PGRAC: the explicit dormant entry preserves the original epoch of
+	 * skipped positions. Page initialization does not issue those values.
+	 * The ordinary entry retains the original raw gap walk below. */
+	if (full_clog && FullTransactionIdPrecedes(ShmemVariableCache->nextXid, full_xid))
+	{
+		FullTransactionId gap_full_xid = ShmemVariableCache->nextXid;
+
+		while (FullTransactionIdPrecedes(gap_full_xid, full_xid))
+		{
+			TransactionId gap_xid = XidFromFullTransactionId(gap_full_xid);
+
+			ExtendCLOGFull(gap_full_xid);
+			ExtendCommitTs(gap_xid);
+			ExtendSUBTRANS(gap_xid);
+			FullTransactionIdAdvance(&gap_full_xid);
+		}
+	}
+	else if (U64FromFullTransactionId(full_xid) > U64FromFullTransactionId(ShmemVariableCache->nextXid))
 	{
 		TransactionId gap_xid = XidFromFullTransactionId(ShmemVariableCache->nextXid);
 
@@ -555,7 +574,10 @@ retry_cluster_xid_reservation:
 		}
 	}
 #endif
-	ExtendCLOG(xid);
+	if (full_clog)
+		ExtendCLOGFull(full_xid);
+	else
+		ExtendCLOG(xid);
 	ExtendCommitTs(xid);
 	ExtendSUBTRANS(xid);
 
@@ -588,7 +610,22 @@ retry_cluster_xid_reservation:
 FullTransactionId
 GetNewTransactionId(bool isSubXact)
 {
-	return get_new_transaction_id(isSubXact, NULL);
+	return get_new_transaction_id(isSubXact, NULL, false);
+}
+
+/* PGRAC: dormant native page-generation producer input. All candidate,
+ * lease, extension and publication work remains in the original allocator.
+ * No caller supplies a numeric era, and skipped FullXids are never issued.
+ * Author: SqlRush <sqlrush@gmail.com>
+ * Spec: 2026-10-14-pre2-m5-e1-format-closure-v1.md */
+FullTransactionId
+GetNewTransactionIdFullCLOG(bool isSubXact)
+{
+	if (!IsNormalProcessingMode())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("full CLOG allocation requires normal processing")));
+	return get_new_transaction_id(isSubXact, NULL, true);
 }
 
 #ifdef USE_PGRAC_CLUSTER
@@ -608,7 +645,7 @@ cluster_relmap_retention_allocate_xid_v2(bool isSubXact, uint64 system_identifie
 	allocation.system_identifier = system_identifier;
 	allocation.database_incarnation = database_incarnation;
 	allocation.origin = origin;
-	return get_new_transaction_id(isSubXact, &allocation);
+	return get_new_transaction_id(isSubXact, &allocation, false);
 }
 
 /* Original Startup has finished every native/SIDE fold, still excludes new
