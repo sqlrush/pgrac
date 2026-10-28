@@ -48,6 +48,11 @@
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_mode.h"
+#include "cluster/cluster_tt_local.h"
+#endif
 #include "commands/alter.h"
 #include "commands/comment.h"
 #include "commands/defrem.h"
@@ -3112,6 +3117,35 @@ AlterExtensionNamespace(const char *extensionName, const char *newschema, Oid *o
 	return extAddr;
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* Native ALTER callers must bind before catalog/object lookup; utility callers
+ * reuse their original top binding. Author: SqlRush <sqlrush@gmail.com> */
+static void
+PreflightClusterSharedExtensionWrite(void)
+{
+	ClusterCanonicalTxnBinding binding;
+	TransactionId current_xid;
+
+	if (!cluster_shared_catalog || !cluster_storage_mode_enabled())
+		return;
+	PreventCommandIfReadOnly("ALTER EXTENSION");
+	PreventCommandIfParallelMode("ALTER EXTENSION");
+	PreventCommandDuringRecovery("ALTER EXTENSION");
+	if (IsSubTransaction())
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("shared catalog alteration does not support subtransactions")));
+	current_xid = GetCurrentTransactionIdIfAny();
+	if (TransactionIdIsValid(current_xid)
+		&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("shared catalog top-level transaction identity mismatch")));
+	if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("canonical ACTIVE publication failed before shared catalog alteration")));
+}
+#endif
+
 /*
  * Execute ALTER EXTENSION UPDATE
  */
@@ -3141,6 +3175,10 @@ ExecAlterExtensionStmt(ParseState *pstate, AlterExtensionStmt *stmt)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("nested ALTER EXTENSION is not supported")));
+
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedExtensionWrite();
+#endif
 
 	/*
 	 * Look up the extension --- it must already exist in pg_extension
@@ -3447,6 +3485,10 @@ ExecAlterExtensionContentsStmt(AlterExtensionContentsStmt *stmt,
 			/* OK */
 			break;
 	}
+
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedExtensionWrite();
+#endif
 
 	/*
 	 * Find the extension and acquire a lock on it, to ensure it doesn't get

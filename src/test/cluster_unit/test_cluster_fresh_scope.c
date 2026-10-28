@@ -18,19 +18,24 @@
 #include <unistd.h>
 
 #include "access/amapi.h"
+#include "access/genam.h"
 #include "access/heaptoast.h"
 #include "access/reloptions.h"
+#include "access/table.h"
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "catalog/catversion.h"
 #include "catalog/index.h"
 #include "catalog/namespace.h"
+#include "catalog/objectaddress.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_control.h"
+#include "catalog/pg_extension.h"
 #include "catalog/pg_foreign_server_d.h"
 #include "catalog/pg_type_d.h"
 #include "commands/defrem.h"
+#include "commands/extension.h"
 #include "commands/user.h"
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_tt_local.h"
@@ -6092,10 +6097,246 @@ UT_TEST(test_native_import_filters_and_child_utility_reuse_original_top)
 	}
 }
 
+/* These native prefixes include their original first catalog lookup. Stop
+ * there with a distinct non-error jump; no lock, metadata or script executes.
+ * The private control-file type is opaque because only a pointer is declared. */
+typedef struct ExtensionControlFile ExtensionControlFile;
+bool creating_extension;
+static bool extension_expect_binding;
+static unsigned extension_lookups, extension_unbound, extension_bad_lookup, extension_lookup_kind;
+static String extension_name;
+static AlterExtensionStmt extension_update;
+static AlterExtensionContentsStmt extension_contents;
+
+Relation
+table_open(Oid relationId, LOCKMODE lockmode)
+{
+	extension_lookups++;
+	extension_lookup_kind = 1;
+	if (extension_expect_binding && utility_binds == 0)
+		extension_unbound++;
+	if (relationId != ExtensionRelationId || lockmode != AccessShareLock)
+		extension_bad_lookup++;
+	siglongjmp(boundary, 2);
+}
+
+String *
+makeString(char *str)
+{
+	extension_name.type = T_String;
+	extension_name.sval = str;
+	return &extension_name;
+}
+
+ObjectAddress
+get_object_address(ObjectType objtype, Node *object, Relation *relp, LOCKMODE lockmode,
+				   bool missing_ok)
+{
+	extension_lookups++;
+	extension_lookup_kind = 2;
+	if (extension_expect_binding && utility_binds == 0)
+		extension_unbound++;
+	if (objtype != OBJECT_EXTENSION || !IsA(object, String)
+		|| strcmp(strVal(object), "extension") != 0 || relp == NULL || lockmode != AccessShareLock
+		|| missing_ok)
+		extension_bad_lookup++;
+	siglongjmp(boundary, 2);
+}
+
+#include "test_cluster_fresh_extension.inc"
+
+static void
+reset_native_extension(bool expect_binding)
+{
+	reset_create_preflight();
+	creating_extension = false;
+	extension_expect_binding = expect_binding;
+	extension_lookups = extension_unbound = extension_bad_lookup = extension_lookup_kind = 0;
+	extension_update = (AlterExtensionStmt){ .type = T_AlterExtensionStmt, .extname = "extension" };
+	extension_contents = (AlterExtensionContentsStmt){ .type = T_AlterExtensionContentsStmt,
+													   .extname = "extension",
+													   .objtype = OBJECT_TABLE };
+}
+
+static Node *
+native_extension_statement(unsigned kind)
+{
+	if (kind == 0)
+		return (Node *)&extension_update;
+	extension_contents.action = kind == 1 ? 1 : -1;
+	return (Node *)&extension_contents;
+}
+
+static void
+native_extension_entry(unsigned kind)
+{
+	Node *stmt = native_extension_statement(kind);
+
+	if (kind == 0)
+		(void)ExecAlterExtensionStmt(NULL, (AlterExtensionStmt *)stmt);
+	else
+		(void)ExecAlterExtensionContentsStmt((AlterExtensionContentsStmt *)stmt, NULL);
+}
+
+UT_TEST(test_native_extension_binds_before_catalog_lock_in_all_profiles)
+{
+	for (unsigned kind = 0; kind < 3; kind++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_extension(binds);
+			cluster_shared_catalog = (mode & 1) != 0;
+			utility_storage_mode = (mode & 2) != 0;
+			cluster_shared_config = (mode & 4) != 0;
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_extension_entry(kind);
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(extension_lookups, repeat + 1);
+				UT_ASSERT_EQ(extension_lookup_kind, kind == 0 ? 1 : 2);
+				UT_ASSERT_EQ(extension_unbound, 0);
+				UT_ASSERT_EQ(extension_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+			}
+		}
+	}
+}
+
+UT_TEST(test_native_extension_refusal_child_and_wrong_top_precede_catalog_lock)
+{
+	for (unsigned kind = 0; kind < 3; kind++) {
+		for (unsigned failure = 0; failure < 4; failure++) {
+			int caught;
+
+			reset_native_extension(true);
+			if (failure == 0)
+				utility_bind_ok = false;
+			else if (failure == 1)
+				utility_in_child = true;
+			else {
+				utility_current_xid = 401;
+				utility_top_xid = failure == 2 ? 400 : InvalidTransactionId;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_extension_entry(kind);
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, failure == 0	? ERRCODE_DATA_CORRUPTED
+									 : failure == 1 ? ERRCODE_FEATURE_NOT_SUPPORTED
+													: ERRCODE_INTERNAL_ERROR);
+			UT_ASSERT_EQ(extension_lookups, 0);
+			UT_ASSERT_EQ(utility_xids, failure == 0 ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, failure == 0 ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, 0);
+		}
+	}
+}
+
+UT_TEST(test_native_extension_original_readonly_parallel_recovery_guards_precede_binding)
+{
+	for (unsigned kind = 0; kind < 3; kind++) {
+		for (unsigned guard = 0; guard < 3; guard++) {
+			int caught;
+
+			reset_native_extension(true);
+			XactReadOnly = guard == 0;
+			utility_parallel = guard == 1;
+			utility_recovery = guard == 2;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_extension_entry(kind);
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+												: ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT_EQ(extension_lookups, 0);
+			UT_ASSERT_EQ(utility_xids, 0);
+			UT_ASSERT_EQ(utility_prepares, 0);
+		}
+		/* No new context restrictions on the original nonshared native route. */
+		{
+			int caught;
+
+			reset_native_extension(false);
+			cluster_shared_catalog = false;
+			XactReadOnly = utility_parallel = utility_recovery = true;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_extension_entry(kind);
+			UT_ASSERT_EQ(caught, 2);
+			UT_ASSERT_EQ(extension_lookups, 1);
+			UT_ASSERT_EQ(utility_prepares, 0);
+		}
+	}
+}
+
+UT_TEST(test_native_extension_nested_and_forbidden_objects_refuse_before_binding)
+{
+	ObjectType forbidden[]
+		= { OBJECT_DATABASE, OBJECT_EXTENSION,	   OBJECT_INDEX,		OBJECT_PUBLICATION,
+			OBJECT_ROLE,	 OBJECT_STATISTIC_EXT, OBJECT_SUBSCRIPTION, OBJECT_TABLESPACE };
+
+	for (unsigned kind = 0; kind < 3; kind++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			for (unsigned object = 0; object < (kind == 0 ? 1 : lengthof(forbidden)); object++) {
+				int caught;
+
+				reset_native_extension(false);
+				cluster_shared_catalog = (mode & 1) != 0;
+				utility_storage_mode = (mode & 2) != 0;
+				cluster_shared_config = (mode & 4) != 0;
+				creating_extension = kind == 0;
+				extension_contents.objtype = forbidden[object];
+				XactReadOnly = utility_parallel = utility_recovery = utility_in_child = true;
+				utility_bind_ok = false;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_extension_entry(kind);
+				UT_ASSERT_EQ(caught, 1);
+				UT_ASSERT_EQ(error_code, kind == 0 ? ERRCODE_FEATURE_NOT_SUPPORTED
+												   : ERRCODE_INVALID_OBJECT_DEFINITION);
+				UT_ASSERT(strstr(error_message, kind == 0 ? "nested ALTER EXTENSION"
+														  : "cannot add an object of this type")
+						  != NULL);
+				UT_ASSERT_EQ(extension_lookups, 0);
+				UT_ASSERT_EQ(utility_xids, 0);
+				UT_ASSERT_EQ(utility_prepares, 0);
+			}
+		}
+	}
+}
+
+UT_TEST(test_native_extension_utility_prebinding_reuses_same_top_before_lookup)
+{
+	for (unsigned kind = 0; kind < 3; kind++) {
+		int caught;
+
+		reset_native_extension(true);
+		create_sql_entry(native_extension_statement(kind));
+		UT_ASSERT_EQ(utility_prepares, 1);
+		UT_ASSERT_EQ(utility_xids, 1);
+		UT_ASSERT_EQ(utility_binds, 1);
+		caught = sigsetjmp(boundary, 1);
+		if (!caught)
+			native_extension_entry(kind);
+		UT_ASSERT_EQ(caught, 2);
+		UT_ASSERT_EQ(extension_lookups, 1);
+		UT_ASSERT_EQ(extension_unbound, 0);
+		UT_ASSERT_EQ(extension_bad_lookup, 0);
+		UT_ASSERT_EQ(utility_prepares, 2);
+		UT_ASSERT_EQ(utility_xids, 1);
+		UT_ASSERT_EQ(utility_binds, 1);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(67);
+	UT_PLAN(72);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -6163,6 +6404,11 @@ main(void)
 	UT_RUN(test_native_import_original_readonly_parallel_recovery_guards_precede_binding);
 	UT_RUN(test_native_import_original_errors_and_empty_callback_keep_top_binding);
 	UT_RUN(test_native_import_filters_and_child_utility_reuse_original_top);
+	UT_RUN(test_native_extension_binds_before_catalog_lock_in_all_profiles);
+	UT_RUN(test_native_extension_refusal_child_and_wrong_top_precede_catalog_lock);
+	UT_RUN(test_native_extension_original_readonly_parallel_recovery_guards_precede_binding);
+	UT_RUN(test_native_extension_nested_and_forbidden_objects_refuse_before_binding);
+	UT_RUN(test_native_extension_utility_prebinding_reuses_same_top_before_lookup);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
