@@ -424,19 +424,35 @@ CreateInitDecodingContext(const char *plugin,
 	LWLockAcquire(ReplicationSlotControlLock, LW_EXCLUSIVE);
 	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
 
-	xmin_horizon = GetOldestSafeDecodingTransactionId(!need_full_snapshot);
+	PG_TRY();
+	{
+		xmin_horizon = GetOldestSafeDecodingTransactionId(!need_full_snapshot);
 
-	SpinLockAcquire(&slot->mutex);
-	slot->effective_catalog_xmin = xmin_horizon;
-	slot->data.catalog_xmin = xmin_horizon;
-	if (need_full_snapshot)
-		slot->effective_xmin = xmin_horizon;
-	SpinLockRelease(&slot->mutex);
+#ifdef USE_PGRAC_CLUSTER
+		/* A raw decoding horizon cannot establish an SCN interval after H
+		 * has been exported. Keep this check, first pin and aggregation in
+		 * the original lock cut; a later unknown sample cannot retract H. */
+		if (!ProcArrayReplicationFeedbackAllowed(
+				need_full_snapshot ? xmin_horizon : InvalidTransactionId, xmin_horizon))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("logical decoding history is not covered by the retained cluster read horizon")));
+#endif
+		SpinLockAcquire(&slot->mutex);
+		slot->effective_catalog_xmin = xmin_horizon;
+		slot->data.catalog_xmin = xmin_horizon;
+		if (need_full_snapshot)
+			slot->effective_xmin = xmin_horizon;
+		SpinLockRelease(&slot->mutex);
 
-	ReplicationSlotsComputeRequiredXmin(true);
-
-	LWLockRelease(ProcArrayLock);
-	LWLockRelease(ReplicationSlotControlLock);
+		ReplicationSlotsComputeRequiredXmin(true);
+	}
+	PG_FINALLY();
+	{
+		LWLockRelease(ProcArrayLock);
+		LWLockRelease(ReplicationSlotControlLock);
+	}
+	PG_END_TRY();
 
 	ReplicationSlotMarkDirty();
 	ReplicationSlotSave();

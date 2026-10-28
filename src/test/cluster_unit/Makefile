@@ -8950,11 +8950,22 @@ test_cluster_retention_slot.inc: $(top_srcdir)/src/backend/replication/slot.c \
 	     END { if (count != 6 || emit) exit 1 }' $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_retention_logical.inc: $(top_srcdir)/src/backend/replication/logical/logical.c \
+		$(top_srcdir)/src/backend/storage/ipc/procarray.c Makefile
+	awk '/^CreateInitDecodingContext\(/ { print "LogicalDecodingContext *"; emit=1; count++ } \
+	     /^GetOldestSafeDecodingTransactionId\(/ { print "TransactionId"; emit=1; count++ } \
+	     emit { print } /^}$$/ { emit=0 } \
+	     END { if (count != 2 || emit) exit 1 }' $(filter %.c,$^) > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_retention_sample: test_cluster_retention_sample.c unit_test.h \
 		test_cluster_retention_publish.inc test_cluster_retention_promise.inc \
 		test_cluster_retention_feedback.inc test_cluster_retention_slot.inc \
+		test_cluster_retention_logical.inc \
 		test_cluster_pgproc_active_types.inc test_cluster_retention_sample.inc \
 		$(top_srcdir)/src/include/access/twophase.h \
+		$(top_srcdir)/src/include/replication/logical.h \
+		$(top_srcdir)/src/include/replication/reorderbuffer.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_retention.h \
 		$(top_srcdir)/src/include/cluster/cluster_heap_horizon.h $(CLUSTER_UNDO_RETENTION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
@@ -11018,6 +11029,7 @@ clean-retention-sample:
 	rm -f test_cluster_retention_promise.inc test_cluster_retention_promise.inc.tmp
 	rm -f test_cluster_retention_feedback.inc test_cluster_retention_feedback.inc.tmp
 	rm -f test_cluster_retention_slot.inc test_cluster_retention_slot.inc.tmp
+	rm -f test_cluster_retention_logical.inc test_cluster_retention_logical.inc.tmp
 	rm -f test_cluster_retention_sample.inc test_cluster_retention_sample.inc.tmp
 
 # Original backend-local writer, with controlled ownership/object/pin leaves.

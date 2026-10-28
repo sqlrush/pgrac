@@ -13,14 +13,20 @@
  */
 #include "postgres.h"
 #include "access/twophase.h"
+#include "access/transam.h"
+#include "access/xact.h"
 #include "cluster/cluster_undo_retention.h"
 #include "cluster/cluster_mrp.h"
 #include "libpq/pqformat.h"
+#include "miscadmin.h"
+#include "replication/logical.h"
+#include "replication/reorderbuffer.h"
 #include "replication/slot.h"
 #include "replication/walsender_private.h"
 #include "storage/lwlock.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
+#include "utils/builtins.h"
 #include "test_cluster_pgproc_active_types.inc"
 
 #undef printf
@@ -55,6 +61,18 @@ static bool expecting_error;
 static int feedback_error_code;
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
+static PROC_HDR proc_global;
+PROC_HDR *ProcGlobal = &proc_global;
+static TransactionId safe_xids[8];
+static VariableCacheData variable_cache;
+VariableCache ShmemVariableCache = &variable_cache;
+Oid MyDatabaseId = 1;
+MemoryContext CurrentMemoryContext;
+static bool xidgen_held, fail_safe_xmin;
+static unsigned safe_xmin_calls, slot_saves, logical_starts;
+static TransactionId logical_start_xmin;
+static LogicalDecodingContext logical_context;
+static ReorderBuffer logical_reorder;
 
 int
 s_lock(volatile slock_t *lock, const char *file, int line, const char *func)
@@ -114,6 +132,12 @@ cluster_mrp_standby_consistent_scn(void)
 bool
 LWLockAcquire(LWLock *lock, LWLockMode mode)
 {
+	if (lock == XidGenLock) {
+		if (!held || !proc_exclusive || xidgen_held || mode != LW_SHARED)
+			lock_errors++;
+		xidgen_held = true;
+		return true;
+	}
 	if (lock == ReplicationSlotControlLock) {
 		if (control_held || held || (mode != LW_EXCLUSIVE && mode != LW_SHARED))
 			lock_errors++;
@@ -143,6 +167,11 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 void
 LWLockRelease(LWLock *lock)
 {
+	if (lock == XidGenLock) {
+		if (!xidgen_held || !held || !proc_exclusive) lock_errors++;
+		xidgen_held = false;
+		return;
+	}
 	if (lock == ReplicationSlotControlLock) {
 		if (!control_held || held) lock_errors++;
 		control_held = control_exclusive = false;
@@ -167,6 +196,8 @@ LWLockHeldByMeInMode(LWLock *lock, LWLockMode mode)
 		return held && (mode == LW_SHARED || proc_exclusive);
 	if (lock == ReplicationSlotControlLock)
 		return control_held && (mode == LW_SHARED || control_exclusive);
+	if (lock == XidGenLock)
+		return xidgen_held && mode == LW_SHARED;
 	return false;
 }
 bool LWLockHeldByMe(LWLock *lock) { return LWLockHeldByMeInMode(lock, LW_SHARED); }
@@ -194,11 +225,65 @@ ExceptionalCondition(const char *condition, const char *file, int line)
 	abort();
 }
 
+/* Context/plugin/WAL persistence are boundary providers. The complete native
+ * create entry, safe-xmin resolver, pin writes and aggregation execute below. */
+void CheckLogicalDecodingRequirements(void) {}
+bool IsTransactionState(void) { return false; }
+TransactionId GetTopTransactionIdIfAny(void) { return InvalidTransactionId; }
+void namestrcpy(Name name, const char *str) { strlcpy(NameStr(*name), str, NAMEDATALEN); }
+bool
+RecoveryInProgress(void)
+{
+	UT_ASSERT(held && proc_exclusive && control_exclusive);
+	safe_xmin_calls++;
+	if (fail_safe_xmin)
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("injected safe-xmin source failure")));
+	return false;
+}
+void ReplicationSlotReserveWal(void) { abort(); } /* Tests supply an explicit LSN. */
+void
+ReplicationSlotSave(void)
+{
+	UT_ASSERT(!held && !control_held && !xidgen_held);
+	UT_ASSERT(MyReplicationSlot->dirty);
+	slot_saves++;
+}
+static LogicalDecodingContext *
+StartupDecodingContext(List *options, XLogRecPtr start_lsn, TransactionId xmin,
+					   bool need_full_snapshot, bool fast_forward, bool in_create,
+					   XLogReaderRoutine *routine,
+					   LogicalOutputPluginWriterPrepareWrite prepare,
+					   LogicalOutputPluginWriterWrite write,
+					   LogicalOutputPluginWriterUpdateProgress progress)
+{
+	UT_ASSERT(options == NIL && start_lsn == 4096 && in_create && !fast_forward);
+	UT_ASSERT(routine == NULL && prepare == NULL && write == NULL && progress == NULL);
+	UT_ASSERT(!held && !control_held && !xidgen_held && slot_saves == 1);
+	UT_ASSERT_EQ(MyReplicationSlot->effective_catalog_xmin, xmin);
+	UT_ASSERT_EQ(procArray->replication_slot_catalog_xmin, xmin);
+	if (need_full_snapshot) {
+		UT_ASSERT_EQ(MyReplicationSlot->effective_xmin, xmin);
+		UT_ASSERT_EQ(procArray->replication_slot_xmin, xmin);
+	}
+	logical_start_xmin = xmin;
+	logical_starts++;
+	logical_context.reorder = &logical_reorder;
+	return &logical_context;
+}
+static void
+startup_cb_wrapper(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool init)
+{
+	(void)ctx; (void)opt; (void)init;
+	abort(); /* No plugin callback is installed by this boundary fixture. */
+}
+
 #include "test_cluster_retention_sample.inc"
 #include "test_cluster_retention_publish.inc"
 #include "test_cluster_retention_promise.inc"
 #include "test_cluster_retention_slot.inc"
 #include "test_cluster_retention_feedback.inc"
+#include "test_cluster_retention_logical.inc"
 
 static void
 reset_fixture(void)
@@ -232,6 +317,16 @@ reset_fixture(void)
 	memset(feedback_fields, 0, sizeof(feedback_fields));
 	expecting_error = false;
 	feedback_error_code = 0;
+	xidgen_held = fail_safe_xmin = false;
+	safe_xmin_calls = slot_saves = logical_starts = 0;
+	logical_start_xmin = InvalidTransactionId;
+	memset(&logical_context, 0, sizeof(logical_context));
+	memset(&logical_reorder, 0, sizeof(logical_reorder));
+	memset(&proc_global, 0, sizeof(proc_global));
+	memset(safe_xids, 0, sizeof(safe_xids));
+	proc_global.xids = safe_xids;
+	memset(&variable_cache, 0, sizeof(variable_cache));
+	variable_cache.nextXid = FullTransactionIdFromU64(1000);
 }
 
 static bool
@@ -1057,10 +1152,157 @@ UT_TEST(test_catalog_only_no_slot_feedback_is_an_unknown_history_owner)
 	}
 }
 
+static void
+use_logical_slot(void)
+{
+	MyReplicationSlot = &slot_storage.replication_slots[0];
+	MyReplicationSlot->data.database = MyDatabaseId;
+}
+
+static bool
+create_logical_context(bool need_full_snapshot)
+{
+	volatile bool accepted = false;
+
+	expecting_error = true;
+	PG_TRY();
+	{
+		UT_ASSERT(CreateInitDecodingContext("test_output", NIL, need_full_snapshot,
+										   4096, NULL, NULL, NULL, NULL) == &logical_context);
+		accepted = true;
+	}
+	PG_CATCH();
+	{
+		UT_ASSERT_EQ(feedback_error_code, ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE);
+	}
+	PG_END_TRY();
+	expecting_error = false;
+	return accepted;
+}
+
+UT_TEST(test_logical_initial_slot_after_h_refuses_before_pin_or_decode)
+{
+	for (int full = 0; full < 2; full++) {
+		ClusterUndoRetentionSample sample;
+
+		reset_fixture();
+		UT_ASSERT(cluster_undo_retention_horizon_sample(&sample));
+		UT_ASSERT_EQ(sample.horizon_scn, 700);
+		use_logical_slot();
+		UT_ASSERT(!create_logical_context(full));
+		UT_ASSERT_EQ(MyReplicationSlot->effective_xmin, InvalidTransactionId);
+		UT_ASSERT_EQ(MyReplicationSlot->effective_catalog_xmin, InvalidTransactionId);
+		UT_ASSERT_EQ(MyReplicationSlot->data.catalog_xmin, InvalidTransactionId);
+		UT_ASSERT_EQ(procArray->replication_slot_xmin, InvalidTransactionId);
+		UT_ASSERT_EQ(procArray->replication_slot_catalog_xmin, InvalidTransactionId);
+		UT_ASSERT_EQ(procArray->cluster_read_scn_floor, 700);
+		UT_ASSERT_EQ(slot_saves, 0);
+		UT_ASSERT_EQ(logical_starts, 0);
+		UT_ASSERT(!MyReplicationSlot->dirty);
+		UT_ASSERT(!held && !control_held && !xidgen_held && lock_errors == 0);
+	}
+}
+
+UT_TEST(test_h_winning_original_logical_slot_lock_blocks_history_resurrection)
+{
+	for (int full = 0; full < 2; full++) {
+		reset_fixture();
+		use_logical_slot();
+		sample_before_feedback_lock = true;
+		UT_ASSERT(!create_logical_context(full));
+		UT_ASSERT_EQ(procArray->cluster_read_scn_floor, 700);
+		UT_ASSERT_EQ(MyReplicationSlot->effective_catalog_xmin, InvalidTransactionId);
+		UT_ASSERT_EQ(procArray->replication_slot_catalog_xmin, InvalidTransactionId);
+		UT_ASSERT_EQ(slot_saves, 0);
+		UT_ASSERT_EQ(logical_starts, 0);
+		UT_ASSERT(!held && !control_held && !xidgen_held && lock_errors == 0);
+	}
+}
+
+UT_TEST(test_logical_slot_first_installs_original_safe_pins_before_h)
+{
+	for (int full = 0; full < 2; full++) {
+		ClusterUndoRetentionSample sample;
+
+		reset_fixture();
+		use_logical_slot();
+		procArray->numProcs = 2;
+		safe_xids[0] = 130;
+		safe_xids[1] = 120;
+		pg_atomic_write_u64(&entries[0].cluster_read_scn_atomic, 400);
+		pg_atomic_write_u64(&entries[1].cluster_read_scn_atomic, 500);
+		UT_ASSERT(create_logical_context(full));
+		UT_ASSERT_EQ(safe_xmin_calls, 1);
+		UT_ASSERT_EQ(logical_start_xmin, 120);
+		UT_ASSERT_EQ(MyReplicationSlot->data.catalog_xmin, 120);
+		UT_ASSERT_EQ(MyReplicationSlot->effective_xmin, full ? 120 : InvalidTransactionId);
+		UT_ASSERT_EQ(procArray->replication_slot_xmin, full ? 120 : InvalidTransactionId);
+		UT_ASSERT_EQ(procArray->replication_slot_catalog_xmin, 120);
+		UT_ASSERT_EQ(slot_saves, 1);
+		UT_ASSERT_EQ(logical_starts, 1);
+		UT_ASSERT(!cluster_undo_retention_horizon_sample(&sample));
+		UT_ASSERT(empty_sample(&sample));
+		UT_ASSERT_EQ(procArray->cluster_read_scn_floor, InvalidScn);
+		UT_ASSERT(!held && !control_held && !xidgen_held && lock_errors == 0);
+	}
+}
+
+UT_TEST(test_catalog_only_logical_slot_cannot_borrow_pgproc_scn)
+{
+	ClusterUndoRetentionSample sample;
+
+	reset_fixture();
+	use_logical_slot();
+	procArray->numProcs = 1;
+	MyProc->xmin = 90;
+	pg_atomic_write_u64(&MyProc->cluster_read_scn_atomic, 400);
+	UT_ASSERT(create_logical_context(false));
+	UT_ASSERT_EQ(MyProc->xmin, 90);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&MyProc->cluster_read_scn_atomic), 400);
+	UT_ASSERT_EQ(MyReplicationSlot->effective_xmin, InvalidTransactionId);
+	UT_ASSERT_EQ(MyReplicationSlot->effective_catalog_xmin, 1000);
+	UT_ASSERT(!cluster_undo_retention_horizon_sample(&sample));
+	UT_ASSERT(empty_sample(&sample));
+	UT_ASSERT_EQ(procArray->cluster_read_scn_floor, InvalidScn);
+}
+
+UT_TEST(test_logical_safe_xmin_error_releases_owned_locks_without_pin)
+{
+	reset_fixture();
+	use_logical_slot();
+	fail_safe_xmin = true;
+	UT_ASSERT(!create_logical_context(true));
+	UT_ASSERT_EQ(safe_xmin_calls, 1);
+	UT_ASSERT_EQ(MyReplicationSlot->effective_xmin, InvalidTransactionId);
+	UT_ASSERT_EQ(MyReplicationSlot->effective_catalog_xmin, InvalidTransactionId);
+	UT_ASSERT_EQ(procArray->replication_slot_catalog_xmin, InvalidTransactionId);
+	UT_ASSERT_EQ(slot_saves, 0);
+	UT_ASSERT_EQ(logical_starts, 0);
+	UT_ASSERT(!held && !control_held && !xidgen_held && lock_errors == 0);
+}
+
+UT_TEST(test_noncluster_logical_initial_slot_keeps_original_publication)
+{
+	ClusterUndoRetentionSample sample;
+
+	reset_fixture();
+	UT_ASSERT(cluster_undo_retention_horizon_sample(&sample));
+	cluster_node_id = -1;
+	use_logical_slot();
+	UT_ASSERT(create_logical_context(true));
+	UT_ASSERT_EQ(logical_start_xmin, 1000);
+	UT_ASSERT_EQ(MyReplicationSlot->effective_xmin, 1000);
+	UT_ASSERT_EQ(procArray->replication_slot_xmin, 1000);
+	UT_ASSERT_EQ(procArray->cluster_read_scn_floor, 700);
+	UT_ASSERT_EQ(slot_saves, 1);
+	UT_ASSERT_EQ(logical_starts, 1);
+	UT_ASSERT(!held && !control_held && !xidgen_held && lock_errors == 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(40);
+	UT_PLAN(46);
 	UT_RUN(test_empty_array_has_one_prescan_clock);
 	UT_RUN(test_all_database_and_vacuum_snapshot_minima_are_included);
 	UT_RUN(test_equal_time_prefers_snapshot_without_changing_scalar_bits);
@@ -1101,6 +1343,12 @@ main(void)
 	UT_RUN(test_noncluster_feedback_keeps_native_pin_and_scn_semantics);
 	UT_RUN(test_nonfinite_promise_and_slot_special_raw_pins_stay_closed);
 	UT_RUN(test_catalog_only_no_slot_feedback_is_an_unknown_history_owner);
+	UT_RUN(test_logical_initial_slot_after_h_refuses_before_pin_or_decode);
+	UT_RUN(test_h_winning_original_logical_slot_lock_blocks_history_resurrection);
+	UT_RUN(test_logical_slot_first_installs_original_safe_pins_before_h);
+	UT_RUN(test_catalog_only_logical_slot_cannot_borrow_pgproc_scn);
+	UT_RUN(test_logical_safe_xmin_error_releases_owned_locks_without_pin);
+	UT_RUN(test_noncluster_logical_initial_slot_keeps_original_publication);
 	free(procArray);
 	UT_DONE();
 	return ut_failed_count != 0;
