@@ -28,6 +28,26 @@ static union {
 		+ 2 * sizeof(ClusterRecoveryCensusPageV1)];
 } observation_pages_storage[2];
 #define observation_pages (*(ClusterRecoveryCensusPagesV1 *)observation_pages_storage[0].bytes)
+static union {
+	uint64 align;
+	uint8 bytes[offsetof(ClusterRecoveryCensusReferencesV1, entries)
+		+ 2 * sizeof(ClusterRecoveryCensusReferenceV1)];
+} observation_references_storage[2];
+static unsigned observation_reference_fault, observation_reference_calls;
+
+const ClusterRecoveryCensusReferencesV1 *
+cluster_recovery_census_references_v1(ClusterRecoveryCensus *cursor)
+{
+	if (cursor != (ClusterRecoveryCensus *)&observation_cursor_object
+		|| !observation_cursor_live || !observation_scope_live || observation_steps < 3) abort();
+	observation_reference_calls++;
+	if (observation_reference_fault == 1) return NULL;
+	if (observation_reference_fault == 3) pg_re_throw();
+	if (observation_reference_fault == 4) owner_boot++;
+	return (const ClusterRecoveryCensusReferencesV1 *)observation_references_storage[
+		observation_reference_fault == 2 ? 1 : 0].bytes;
+}
+
 static unsigned observation_page_fault;
 static unsigned observation_page_wal_fault;
 static uint32 observation_page_wal_count;
@@ -109,6 +129,8 @@ observation_fixture_reset(void)
 	observation_fault = observation_fault_at = observation_event_count = 0;
 	observation_physical_count = observation_fail_allocation = 0;
 	observation_release_error = observation_early_read = false;
+	observation_reference_fault = observation_reference_calls = 0;
+	memset(observation_references_storage, 0, sizeof(observation_references_storage));
 	observation_page_fault = 0;
 	observation_page_wal_fault = 0;
 	observation_page_wal_count = 2;

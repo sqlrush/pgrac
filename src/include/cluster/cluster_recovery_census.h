@@ -216,6 +216,32 @@ typedef struct ClusterRecoveryCensusPagesV1 {
 extern const ClusterRecoveryCensusPagesV1 *cluster_recovery_census_pages_v1(
 	ClusterRecoveryCensus *census);
 
+/* Complete original heap/history emissions. page_index addresses the original
+ * physical PAGE view above; version is the original inverse-step ordinal, not
+ * an SCN/LSN or a coverage claim. ITL transaction records borrow the original
+ * fully observed forest; tuple bytes are private copies, never scanner buffers.
+ * FREE ITLs and every line pointer remain present, including no-storage items.
+ * Native MX/HOT interpretation, retention transfers and all owner proofs are
+ * separate obligations. This view is not the D0 graph transcript or authority. */
+typedef struct ClusterRecoveryCensusReferenceV1 {
+	uint32 page_index;
+	uint64 version;
+	ClusterRecoveryHeapEntry entry;
+	ClusterRecoveryGraphRecord transaction;
+} ClusterRecoveryCensusReferenceV1;
+
+typedef struct ClusterRecoveryCensusReferencesV1 {
+	uint32 count;
+	ClusterRecoveryCensusReferenceV1 entries[FLEXIBLE_ARRAY_MEMBER];
+} ClusterRecoveryCensusReferencesV1;
+
+/* Original complete DONE/manifest/namespace revalidation. No prefix or failed
+ * observation is exposed; a complete empty set is distinct from NULL. Borrow
+ * only until original census invalidation/destruction. May do original
+ * revalidation I/O; no cursor progress, graph seal or release is added. */
+extern const ClusterRecoveryCensusReferencesV1 *cluster_recovery_census_references_v1(
+	ClusterRecoveryCensus *census);
+
 /* Borrow the original live cold inputs and their ROOT-selected isolated
  * namespace fd. The caller holds isolation, retention and these owners for
  * the entire cursor lifetime; this API establishes none of those premises.

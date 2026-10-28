@@ -28,6 +28,11 @@ struct ClusterRecoveryCensus {
 	uint32 page_count, page_capacity;
 	uint8 pages_sha256[32];
 	bool pages_complete;
+	ClusterRecoveryCensusReferencesV1 *references;
+	uint32 reference_count, reference_capacity;
+	char *reference_tuples; /* trailing storage in the same reserved allocation */
+	size_t reference_tuple_bytes, reference_tuple_capacity;
+	uint8 references_sha256[32];
 	ClusterRecoveryCensusDiag diag;
 	ClusterRecoveryCensusManifest manifest;
 	ClusterRecoveryCensusResult status;
@@ -44,6 +49,12 @@ census_release(ClusterRecoveryCensus *census)
 {
 	/* Dependents precede their owners. Inventory destruction revokes its
 	 * borrowed graph/roots, so both must still be alive here. */
+	free(census->references);
+	census->references = NULL;
+	census->reference_tuples = NULL;
+	census->reference_count = census->reference_capacity = 0;
+	census->reference_tuple_bytes = census->reference_tuple_capacity = 0;
+	memset(census->references_sha256, 0, sizeof(census->references_sha256));
 	free(census->pages);
 	census->pages = NULL;
 	census->page_count = census->page_capacity = 0;
@@ -94,13 +105,14 @@ cluster_recovery_census_begin(ClusterWalInputsV1 *inputs, int root_fd, size_t me
 	first = cluster_wal_inputs_at_v1(inputs, 0);
 	if (count == 0 || count > CLUSTER_WAL_INPUTS_MAX || first == NULL)
 		return CLUSTER_RECOVERY_CENSUS_INVALID;
-	/* Six concurrent reservations: roots, inventory, undo, TX graph,
-	 * sequential relation/SLRU/MX scratch, and retained PAGE metadata.
+	/* Seven concurrent reservations: roots, inventory, undo, TX graph,
+	 * sequential relation/SLRU/MX scratch, retained PAGE metadata, and
+	 * complete relation/history reference metadata with private tuple bytes.
 	 * Original consumers enforce each cap.
 	 * Divide only after subtraction; never overflow a sum of allocations. */
 	if (memory_budget <= sizeof(*census))
 		return CLUSTER_RECOVERY_CENSUS_CAPACITY;
-	budget = (memory_budget - sizeof(*census)) / 6;
+	budget = (memory_budget - sizeof(*census)) / 7;
 	if (budget < 32 * BLCKSZ)
 		return CLUSTER_RECOVERY_CENSUS_CAPACITY;
 	census = calloc(1, sizeof(*census));
@@ -116,6 +128,21 @@ cluster_recovery_census_begin(ClusterWalInputsV1 *inputs, int root_fd, size_t me
 		cluster_recovery_census_destroy(census);
 		return CLUSTER_RECOVERY_CENSUS_CAPACITY;
 	}
+	/* One fixed cap for both reference metadata and tuple copies. Keep the
+	 * original scanner's whole output, never grow outside the caller budget. */
+	census->reference_capacity = (uint32)Min(
+		(budget - offsetof(ClusterRecoveryCensusReferencesV1, entries))
+			/ 2 / sizeof(ClusterRecoveryCensusReferenceV1), (size_t)UINT32_MAX);
+	census->references = calloc(1, budget);
+	if (census->references == NULL) {
+		cluster_recovery_census_destroy(census);
+		return CLUSTER_RECOVERY_CENSUS_CAPACITY;
+	}
+	census->reference_tuple_capacity = budget
+		- offsetof(ClusterRecoveryCensusReferencesV1, entries)
+		- (size_t)census->reference_capacity * sizeof(ClusterRecoveryCensusReferenceV1);
+	census->reference_tuples = (char *)census->references + budget
+		- census->reference_tuple_capacity;
 	census->inputs = inputs;
 	census->source_count = count;
 	census->system_identifier = first->source.claim.identity.system_identifier;
@@ -284,6 +311,83 @@ census_remember_page(ClusterRecoveryCensus *census,
 		return CLUSTER_RECOVERY_CENSUS_REFUSED;
 	census->pages->count = ++census->page_count;
 	return CLUSTER_RECOVERY_CENSUS_MORE;
+}
+
+/* Consume every original relation/history emission in its original order.
+ * The page index binds the original physical baseline, including versions
+ * reconstructed by the existing inverse reader. No current/old xid filtering. */
+static ClusterRecoveryCensusResult
+census_remember_reference(ClusterRecoveryCensus *census,
+	const ClusterRecoveryRelationCensusEntry *entry)
+{
+	const ClusterRecoveryHeapEntry *heap = &entry->reference.entry;
+	const ClusterRecoveryCensusPageV1 *page;
+	ClusterRecoveryCensusReferenceV1 *value;
+
+	if (entry->kind != CLUSTER_RECOVERY_RELATIONS_REFERENCE)
+		return CLUSTER_RECOVERY_CENSUS_MORE;
+	if (census->references == NULL || census->pages_complete || census->page_count == 0)
+		return CLUSTER_RECOVERY_CENSUS_REFUSED;
+	page = &census->pages->entries[census->page_count - 1];
+	if (!page->heap || !entry->heap || page->root_index != entry->root_index
+		|| page->forknum != entry->page.forknum || page->blockno != entry->page.block
+		|| page->identity_token != entry->page.identity_token
+		|| page->reservation_token != entry->page.reservation_token
+		|| memcmp(&page->reservation, &entry->page.reservation, sizeof(page->reservation)) != 0
+		|| (heap->kind != CLUSTER_RECOVERY_HEAP_ITL && heap->kind != CLUSTER_RECOVERY_HEAP_ITEM)
+		|| heap->tuple_length > BLCKSZ
+		|| (heap->tuple_length == 0) != (heap->tuple_bytes == NULL))
+		return CLUSTER_RECOVERY_CENSUS_REFUSED;
+	if (census->reference_count == census->reference_capacity
+		|| census->reference_tuple_bytes > census->reference_tuple_capacity
+		|| heap->tuple_length > census->reference_tuple_capacity - census->reference_tuple_bytes)
+		return CLUSTER_RECOVERY_CENSUS_CAPACITY;
+	value = &census->references->entries[census->reference_count];
+	value->page_index = census->page_count - 1;
+	value->version = entry->reference.version;
+	value->entry = *heap;
+	value->transaction = entry->reference.transaction;
+	if (heap->tuple_length != 0) {
+		char *tuple = census->reference_tuples + census->reference_tuple_bytes;
+
+		memcpy(tuple, heap->tuple_bytes, heap->tuple_length);
+		value->entry.tuple_bytes = tuple;
+		census->reference_tuple_bytes += heap->tuple_length;
+	}
+	census->references->count = ++census->reference_count;
+	return CLUSTER_RECOVERY_CENSUS_MORE;
+}
+
+/* Private observation integrity only, not the portable D0 graph transcript.
+ * Check pointer/length layout before hashing any borrowed view's raw bytes;
+ * no modified tuple pointer is followed. The TX graph retains record custody. */
+static bool
+census_references_digest(ClusterRecoveryCensus *census, uint8 digest[32])
+{
+	uint8 parts[64];
+	size_t bytes = 0;
+
+	if (census->references == NULL || census->reference_count > census->reference_capacity
+		|| census->references->count != census->reference_count
+		|| census->reference_tuple_bytes > census->reference_tuple_capacity)
+		return false;
+	for (uint32 i = 0; i < census->reference_count; i++) {
+		const ClusterRecoveryCensusReferenceV1 *value = &census->references->entries[i];
+		const ClusterRecoveryHeapEntry *heap = &value->entry;
+
+		if (value->page_index >= census->page_count || heap->tuple_length > BLCKSZ
+			|| heap->tuple_length > census->reference_tuple_bytes - bytes
+			|| (heap->tuple_length == 0 ? heap->tuple_bytes != NULL
+				: heap->tuple_bytes != census->reference_tuples + bytes))
+			return false;
+		bytes += heap->tuple_length;
+	}
+	return bytes == census->reference_tuple_bytes
+		&& census_hash_bytes(census->references,
+			offsetof(ClusterRecoveryCensusReferencesV1, entries)
+				+ (size_t)census->reference_count * sizeof(ClusterRecoveryCensusReferenceV1), parts)
+		&& census_hash_bytes(census->reference_tuples, bytes, parts + 32)
+		&& census_hash_bytes(parts, sizeof(parts), digest);
 }
 
 /* Native private storage, not a wire encoding or a completion witness. The
@@ -499,6 +603,8 @@ census_step(ClusterRecoveryCensus *census, ClusterRecoveryCensusEntry *out)
 				= cluster_recovery_relation_census_next(census->relations, &out->value.relation);
 		if (d->relation_result == CLUSTER_RECOVERY_RELATIONS_ENTRY) {
 			ClusterRecoveryCensusResult result = census_remember_page(census, &out->value.relation);
+			if (result == CLUSTER_RECOVERY_CENSUS_MORE)
+				result = census_remember_reference(census, &out->value.relation);
 			if (result != CLUSTER_RECOVERY_CENSUS_MORE)
 				return census_fail(census, result);
 			d->relation_entries++;
@@ -688,14 +794,15 @@ census_step(ClusterRecoveryCensus *census, ClusterRecoveryCensusEntry *out)
 			census->inputs, census->inventory, &d->inventory);
 		if (d->inventory_result != CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED
 			|| !census_build_manifest(census)
-			|| !census_pages_digest(census, census->pages_sha256))
+			|| !census_pages_digest(census, census->pages_sha256)
+			|| !census_references_digest(census, census->references_sha256))
 			break;
 		census->pages_complete = true;
 		d->phase = CLUSTER_RECOVERY_CENSUS_DONE;
 		census->status = CLUSTER_RECOVERY_CENSUS_DRAINED;
 		return census->status;
 	case CLUSTER_RECOVERY_CENSUS_DONE: {
-		uint8 digest[32], inputs_digest[32], pages_digest[32];
+		uint8 digest[32], inputs_digest[32], pages_digest[32], references_digest[32];
 		d->input_result = cluster_wal_inputs_revalidate_v1(census->inputs);
 		if (d->input_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 			|| !cluster_recovery_root_set_digest(census->roots, digest)
@@ -703,6 +810,8 @@ census_step(ClusterRecoveryCensus *census, ClusterRecoveryCensusEntry *out)
 			|| !cluster_recovery_native_inventory_digest(census->inventory, inputs_digest)
 			|| !census->pages_complete || !census_pages_digest(census, pages_digest)
 			|| memcmp(pages_digest, census->pages_sha256, 32) != 0
+			|| !census_references_digest(census, references_digest)
+			|| memcmp(references_digest, census->references_sha256, 32) != 0
 			|| census->manifest.encoding_version != 1
 			|| census->manifest.source_count != census->source_count
 			|| census->manifest.root_count != cluster_recovery_root_set_count(census->roots)
@@ -837,6 +946,14 @@ cluster_recovery_census_pages_v1(ClusterRecoveryCensus *census)
 	/* The original manifest path owns DONE and ERROR revalidation. Never
 	 * advance a partial census or export a prefix after capacity refusal. */
 	return cluster_recovery_census_manifest(census, &manifest) ? census->pages : NULL;
+}
+
+const ClusterRecoveryCensusReferencesV1 *
+cluster_recovery_census_references_v1(ClusterRecoveryCensus *census)
+{
+	ClusterRecoveryCensusManifest manifest;
+
+	return cluster_recovery_census_manifest(census, &manifest) ? census->references : NULL;
 }
 
 bool

@@ -313,6 +313,11 @@ extern const struct ClusterColdCtrcPhysicalV1 *ClusterColdRecoveryCtrcPhysical(
 struct ClusterRecoveryCensusPagesV1;
 extern const struct ClusterRecoveryCensusPagesV1 *ClusterColdRecoveryCtrcPages(
 	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work);
+/* Same original immutable relation/history references and private tuple bytes;
+ * no complete graph, retention transfer or service permission is implied. */
+struct ClusterRecoveryCensusReferencesV1;
+extern const struct ClusterRecoveryCensusReferencesV1 *ClusterColdRecoveryCtrcReferences(
+	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work);
 
 /* Same original complete observation and accepted TX; raw, immutable decoded
  * PAGE WAL inputs of every selected generation. Zero count is complete-empty.
