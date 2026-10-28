@@ -20663,11 +20663,13 @@ gcs_block_try_ctrc_forward136(const ClusterICEnvelope *env, const void *payload)
 						|| result == CTRC_SEAL_REPLY_DELEGATION_MERGED
 						|| result == CTRC_SEAL_REPLY_DELEGATION_SUBTREE_ACK
 						|| result == CTRC_SEAL_REPLY_ROOT_SUBTREE_ACK
-						|| (certificate && result == CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED))
+						|| (request.suboperation == CTRC_SEAL_CERTIFICATE_COMMITTED
+							&& result == CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED))
 					&& (!cluster_semantic_activation_recheck_r4_terminal_census(&admission)
 						|| ((result == CTRC_SEAL_REPLY_DELEGATION_SUBTREE_ACK
 							|| result == CTRC_SEAL_REPLY_ROOT_SUBTREE_ACK
-							|| (certificate && result == CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED))
+							|| (request.suboperation == CTRC_SEAL_CERTIFICATE_COMMITTED
+								&& result == CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED))
 							&& (((int32)env->source_node_id == cluster_node_id
 									? (cluster_ic_local_capability_word() & required_capabilities) != required_capabilities
 									: !cluster_sf_peer_capability_generation_matches((int32)env->source_node_id,

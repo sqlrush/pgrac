@@ -86,7 +86,7 @@
 #endif
 
 #define CLUSTER_CTRC_SHMEM_MAGIC UINT32_C(0x43545243)
-#define CLUSTER_CTRC_SHMEM_VERSION UINT32_C(24)
+#define CLUSTER_CTRC_SHMEM_VERSION UINT32_C(25)
 #ifndef CLUSTER_CTRC_TEST_TABLE_VISIT
 #define CLUSTER_CTRC_TEST_TABLE_VISIT(kind) ((void)0)
 #endif
@@ -9331,6 +9331,7 @@ ctrc_participant_certificate_batch_apply_shared(const ClusterCtrcCloseDispatch *
 	Size work_to_request[CLUSTER_CTRC_RECLAIM_BATCH_MAX];
 	bool block[CLUSTER_CTRC_RECLAIM_BATCH_MAX] = { false };
 	bool root_progress[CLUSTER_CTRC_RECLAIM_BATCH_MAX] = { false };
+	bool root_completed[CLUSTER_CTRC_RECLAIM_BATCH_MAX] = { false };
 	Size work_count = 0;
 	uint32 lock_mask = 0;
 
@@ -9377,12 +9378,18 @@ ctrc_participant_certificate_batch_apply_shared(const ClusterCtrcCloseDispatch *
 			CTRC_SEAL_CERTIFICATE_COMMITTED, &reason, &ack);
 		if (results[i] == CTRC_SEAL_REPLY_BLOCKED_RETAIN
 			&& ctrc_root_certificate_notice_locked(indices[i], &dispatches[i], &root_progress[i])) {
-			results[i] = CTRC_SEAL_REPLY_PENDING_DRAIN;
-			reason = CTRC_SEAL_REASON_CLEANOUT;
+			/* The original exact notice check also validates the immutable
+			 * completed proof and zero-live pool. Report receipt completion to
+			 * its original origin consumer; retain the root/child retry custody. */
+			root_completed[i] = participant->delegation_certificate_state
+				== CTRC_DELEGATION_RECEIPTS_RECLAIMED;
+			results[i] = root_completed[i] ? CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED
+				: CTRC_SEAL_REPLY_PENDING_DRAIN;
+			reason = root_completed[i] ? 0 : CTRC_SEAL_REASON_CLEANOUT;
 		}
 		if (reasons != NULL)
 			reasons[i] = reason;
-		if (results[i] != CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED)
+		if (root_completed[i] || results[i] != CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED)
 			continue;
 		if (participant->receipt_count != summary->total_receipt_count
 			|| participant->ack_frozen_count != summary->ack_frozen_count) {
@@ -9419,7 +9426,8 @@ ctrc_participant_certificate_batch_apply_shared(const ClusterCtrcCloseDispatch *
 	LWLockRelease(&CtrcShared->receipt_lock);
 	ctrc_participant_locks_release(lock_mask);
 	for (Size i = 0; i < count; i++) {
-		if (results[i] == CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED || root_progress[i])
+		if ((results[i] == CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED && !root_completed[i])
+			|| root_progress[i])
 			ctrc_semantic_progress(true);
 		if (results[i] == CTRC_SEAL_REPLY_PENDING_DRAIN)
 			cluster_ctrc_cleaner_reason_set(CTRC_CLEANER_REASON_PAGE_REVALIDATE);

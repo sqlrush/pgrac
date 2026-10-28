@@ -731,7 +731,9 @@
  * participant stride. Explicit wire6; fresh homogeneous clusters only. */
 /* Certified direct roots may reclaim local receipts while retaining tree
  * custody and immutable completion proof; fresh homogeneous clusters only. */
-#define CATALOG_VERSION_NO 202610287
+/* Certified root receipt completion reaches the original origin consumer;
+ * retry custody remains retained. Fresh homogeneous clusters only. */
+#define CATALOG_VERSION_NO 202610288
 
 /* spec-5.13 (2026-06-27): clean-leave catalog surface — cluster_get_clean_leave_state
  * SRF (oid 8960) + pg_cluster_clean_leave_state view + pg_cluster_clean_leave_request
