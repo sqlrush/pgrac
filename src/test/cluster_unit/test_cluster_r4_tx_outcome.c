@@ -166,6 +166,9 @@ static bool test_twophase_prepared;
 static TransactionId test_twophase_xid;
 static int test_twophase_calls;
 static TTSlot test_tt_slot;
+static bool test_mixed_top_enabled;
+static TTSlot test_mixed_top_slot;
+static XidStatus test_mixed_top_native_status;
 static SCN test_commit_scn;
 static uint64 test_formation_epoch;
 static ClusterNormalStartState test_normal_start_state;
@@ -688,7 +691,9 @@ TransactionIdGetStatus(TransactionId xid, XLogRecPtr *lsn)
 		pg_re_throw();
 	if (lsn != NULL)
 		*lsn = test_flush_lsn;
-	if (test_native_script_pos < test_native_script_count) {
+	if (test_mixed_top_enabled && xid == TEST_ORIGIN_XID + 2)
+		status = test_mixed_top_native_status;
+	else if (test_native_script_pos < test_native_script_count) {
 		UT_ASSERT_EQ((int)xid, (int)test_native_script_xids[test_native_script_pos]);
 		status = test_native_script_statuses[test_native_script_pos++];
 	} else {
@@ -923,6 +928,8 @@ cluster_undo_block0_current_copy_resident(
 	memset(private_page, 0, BLCKSZ);
 	if (test_candidate_copy_physical_slot)
 		header->tt_slots[TEST_TT_OFFSET] = test_tt_slot;
+	if (test_candidate_copy_physical_slot && test_mixed_top_enabled)
+		header->tt_slots[TEST_TT_OFFSET + 1] = test_mixed_top_slot;
 	if (test_candidate_copy_generation_drift)
 		test_candidate_tt_generation++;
 	return CLUSTER_UNDO_BLOCK0_OK;
@@ -1522,6 +1529,7 @@ reset_exact_origin_fixture(void)
 	test_candidate_mutate_record_on_recheck = false;
 	test_operation_page_enabled = false;
 	test_operation_worker_enabled = false;
+	test_mixed_top_enabled = false;
 	test_operation_worker_current_busy = false;
 	test_operation_acquire_failure_call = 0;
 	test_operation_pin_depth = 0;
@@ -7597,7 +7605,7 @@ UT_TEST(test_retained_slot_identity_does_not_escape_original_final_fences)
 int
 main(void)
 {
-	UT_PLAN(322);
+	UT_PLAN(328);
 	UT_RUN(test_operation_worker_real_builder_yields_before_visibility);
 	UT_RUN(test_operation_worker_real_origin_completes_private_inverse);
 	UT_RUN(test_operation_worker_pending_current_is_bounded_and_counts_once);
@@ -7645,6 +7653,12 @@ main(void)
 	UT_RUN(test_operation_worker_cross_page_late_live_inverses_both_roles);
 	UT_RUN(test_operation_worker_cross_page_role_and_tuple_mismatches_refuse);
 	UT_RUN(test_operation_worker_cross_page_cohort_keeps_role_proofs_separate);
+	UT_RUN(test_operation_worker_mixed_top_prior_restores_previous_owner);
+	UT_RUN(test_operation_worker_mixed_top_preserves_old_live_owner);
+	UT_RUN(test_operation_worker_mixed_top_late_live_keeps_discard_independent);
+	UT_RUN(test_operation_worker_mixed_top_old_active_is_conservative);
+	UT_RUN(test_operation_worker_mixed_top_exact_identity_refusals);
+	UT_RUN(test_operation_worker_mixed_top_cohort_has_private_observations);
 
 	UT_RUN(test_operation_poll_does_not_complete_inline);
 	UT_RUN(test_operation_poll_stages_outputs);

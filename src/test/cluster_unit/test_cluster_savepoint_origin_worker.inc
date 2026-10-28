@@ -1812,3 +1812,269 @@ UT_TEST(test_operation_worker_cross_page_cohort_keeps_role_proofs_separate)
 	UT_ASSERT_EQ(test_candidate_held_count, 0);
 	UT_ASSERT_EQ(operation_worker_allocations, allocations);
 }
+
+/* Transaction ancestry terminates here; the page prior names another top. */
+static void
+operation_worker_mixed_top(OperationWorkerFixture *f, bool reuse, bool same_segment)
+{
+	UndoSlotDirEntry directory;
+	UndoRecordHeader record;
+	UndoItlHistoryTrailer history;
+	UndoOperationTrailer tail;
+	ClusterItlSlotData *slots;
+	ClusterItlSlotData previous, newest;
+	char *bytes;
+
+	operation_worker_init(f, same_segment);
+	operation_worker_two_records(f);
+	slots = ClusterPageGetItlSlots((Page)f->cr.source.data);
+	memcpy(&directory, test_operation_page.data + BLCKSZ - 2 * sizeof(directory),
+		   sizeof(directory));
+	bytes = test_operation_page.data + directory.record_offset;
+	memcpy(&record, bytes, sizeof(record));
+	memcpy(&history, bytes + sizeof(record) + sizeof(UndoInsertPayload), sizeof(history));
+	previous = history.entries[0].prior;
+	previous.flags = ITL_FLAG_COMMITTED;
+	previous.commit_scn = 65;
+	newest = slots[2];
+	newest.xid = TEST_ORIGIN_XID + 2;
+	newest.wrap = reuse ? 9 : 14;
+	newest.undo_segment_head = uba_encode(TEST_RECORD_SEGMENT, 7, TEST_TT_OFFSET + 1, 1);
+	slots[reuse ? 2 : 4] = newest;
+	if (!reuse)
+		slots[2] = previous;
+	history.entries[0].slot_index = reuse ? 2 : 4;
+	if (reuse)
+		history.entries[0].prior = previous;
+	else {
+		memset(&history.entries[0].prior, 0, sizeof(previous));
+		history.entries[0].prior.wrap = 14;
+	}
+	record.flags |= UNDO_REC_FLAG_FIRST_IN_TX;
+	record.prev_uba = (UBA)InvalidUba_init;
+	record.xid = TEST_ORIGIN_XID + 3;
+	record.tt_slot_id = cluster_tt_slot_offset_to_id(TEST_TT_OFFSET + 1);
+	record.tt_wrap_plus1 = 12;
+	directory.flags = record.flags;
+	memcpy(&tail, bytes + directory.record_length - sizeof(tail), sizeof(tail));
+	tail.canonical_top_fxid
+		= U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(9, TEST_ORIGIN_XID + 2));
+	tail.operation_fxid
+		= U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(9, TEST_ORIGIN_XID + 3));
+	memcpy(bytes, &record, sizeof(record));
+	memcpy(bytes + sizeof(record) + sizeof(UndoInsertPayload), &history, sizeof(history));
+	memcpy(bytes + directory.record_length - sizeof(tail), &tail, sizeof(tail));
+	memcpy(test_operation_page.data + BLCKSZ - 2 * sizeof(directory), &directory,
+		   sizeof(directory));
+	HeapTupleHeaderSetXmin((HeapTupleHeader)PageGetItem((Page)f->cr.source.data,
+														PageGetItemId((Page)f->cr.source.data, 3)),
+						   TEST_ORIGIN_XID + 3);
+	memcpy(&directory, test_operation_page.data + BLCKSZ - sizeof(directory), sizeof(directory));
+	bytes = test_operation_page.data + directory.record_offset;
+	memcpy(&tail, bytes + directory.record_length - sizeof(tail), sizeof(tail));
+	tail.operation_sequence = 500; /* A different top has its own sequence. */
+	memcpy(bytes + directory.record_length - sizeof(tail), &tail, sizeof(tail));
+	test_mixed_top_enabled = true;
+	test_mixed_top_slot = test_tt_slot;
+	test_mixed_top_slot.xid = TEST_ORIGIN_XID + 2;
+	test_mixed_top_slot.wrap = 11;
+	test_tt_slot.commit_scn = 65;
+	test_mixed_top_native_status = TRANSACTION_STATUS_COMMITTED;
+}
+
+static void
+operation_worker_assert_mixed_top(OperationWorkerFixture *f, const char original[BLCKSZ],
+								  bool reuse, bool keep_old, unsigned acquires)
+{
+	Page page = (Page)f->cr.source.data;
+	Page source = (Page)original;
+	ClusterItlSlotData *slots = ClusterPageGetItlSlots(page);
+	ClusterItlSlotData expected = { .wrap = 8 };
+
+	UT_ASSERT_EQ(ItemIdIsNormal(PageGetItemId(page, 2)), keep_old);
+	UT_ASSERT(!ItemIdIsUsed(PageGetItemId(page, 3)));
+	UT_ASSERT_EQ(memcmp(PageGetItem(page, PageGetItemId(page, 1)),
+						PageGetItem(source, PageGetItemId(source, 1)), 60),
+				 0);
+	if (keep_old) {
+		UT_ASSERT_EQ(memcmp(PageGetItem(page, PageGetItemId(page, 2)),
+							PageGetItem(source, PageGetItemId(source, 2)), 60),
+					 0);
+		UT_ASSERT_EQ(slots[2].xid, TEST_ORIGIN_XID);
+		UT_ASSERT_EQ(slots[2].flags, ITL_FLAG_COMMITTED);
+		UT_ASSERT_EQ(slots[2].commit_scn, 65);
+		expected = (ClusterItlSlotData){ .xid = TEST_ORIGIN_XID,
+										 .wrap = 8,
+										 .flags = ITL_FLAG_COMMITTED,
+										 .write_scn = 60,
+										 .commit_scn = 65,
+										 .undo_segment_head
+										 = uba_encode(TEST_RECORD_SEGMENT, 7, TEST_TT_OFFSET, 0) };
+	} else
+		UT_ASSERT_EQ(slots[2].flags, ITL_FLAG_FREE);
+	UT_ASSERT_EQ(slots[2].wrap, 8);
+	UT_ASSERT_EQ(memcmp(&slots[2], &expected, sizeof(expected)), 0);
+	if (!reuse) {
+		UT_ASSERT_EQ(slots[4].flags, ITL_FLAG_FREE);
+		UT_ASSERT_EQ(slots[4].wrap, 14);
+		memset(&expected, 0, sizeof(expected));
+		expected.wrap = 14;
+		UT_ASSERT_EQ(memcmp(&slots[4], &expected, sizeof(expected)), 0);
+	}
+	UT_ASSERT_EQ(f->extension.build_steps, 2);
+	UT_ASSERT_EQ(test_candidate_acquire_calls, acquires);
+	UT_ASSERT_EQ(test_candidate_held_count, 0);
+}
+
+UT_TEST(test_operation_worker_mixed_top_prior_restores_previous_owner)
+{
+	for (int reuse = 0; reuse < 2; reuse++)
+		for (int same = 0; same < 2; same++) {
+			OperationWorkerFixture f;
+			PGAlignedBlock original;
+			ClusterR4CrBuildStepResult step;
+
+			operation_worker_mixed_top(&f, reuse, same);
+			memcpy(original.data, f.cr.source.data, BLCKSZ);
+			step = operation_worker_finish(&f);
+			cluster_cr_build_on_holder_forget(0, 1000);
+			UT_ASSERT_EQ(step, CLUSTER_R4_CR_STEP_FULL);
+			UT_ASSERT_EQ(f.reason, CLUSTER_CR_BUILD_NONE);
+			operation_worker_assert_mixed_top(&f, original.data, reuse, false, 6);
+		}
+}
+
+UT_TEST(test_operation_worker_mixed_top_preserves_old_live_owner)
+{
+	for (int aborted = 0; aborted < 2; aborted++)
+		for (int reuse = 0; reuse < 2; reuse++) {
+			OperationWorkerFixture f;
+			PGAlignedBlock original;
+			ClusterR4CrBuildStepResult step;
+
+			operation_worker_mixed_top(&f, reuse, false);
+			operation_worker_row_effect(0, CLUSTER_SAVEPOINT_EFFECT_LIVE);
+			operation_worker_row_effect(1, CLUSTER_SAVEPOINT_EFFECT_LIVE);
+			if (aborted) {
+				test_mixed_top_slot.status = TT_SLOT_ABORTED;
+				test_mixed_top_slot.commit_scn = InvalidScn;
+				test_mixed_top_native_status = TRANSACTION_STATUS_ABORTED;
+			}
+			memcpy(original.data, f.cr.source.data, BLCKSZ);
+			step = operation_worker_finish(&f);
+			cluster_cr_build_on_holder_forget(0, 1000);
+			UT_ASSERT_EQ(step, CLUSTER_R4_CR_STEP_FULL);
+			UT_ASSERT_EQ(f.reason, CLUSTER_CR_BUILD_NONE);
+			operation_worker_assert_mixed_top(&f, original.data, reuse, true, 6);
+		}
+}
+
+UT_TEST(test_operation_worker_mixed_top_late_live_keeps_discard_independent)
+{
+	for (int reuse = 0; reuse < 2; reuse++)
+		for (int same = 0; same < 2; same++) {
+			OperationWorkerFixture f;
+			PGAlignedBlock original;
+			ClusterR4CrBuildStepResult step;
+
+			operation_worker_mixed_top(&f, reuse, same);
+			operation_worker_row_effect(1, CLUSTER_SAVEPOINT_EFFECT_LIVE);
+			memcpy(original.data, f.cr.source.data, BLCKSZ);
+			step = operation_worker_finish(&f);
+			cluster_cr_build_on_holder_forget(0, 1000);
+			UT_ASSERT_EQ(step, CLUSTER_R4_CR_STEP_FULL);
+			operation_worker_assert_mixed_top(&f, original.data, reuse, false, 6);
+		}
+}
+
+UT_TEST(test_operation_worker_mixed_top_old_active_is_conservative)
+{
+	for (int same = 0; same < 2; same++) {
+		OperationWorkerFixture f;
+		PGAlignedBlock original;
+		ClusterR4CrBuildStepResult step;
+
+		operation_worker_mixed_top(&f, false, same);
+		operation_worker_row_effect(0, CLUSTER_SAVEPOINT_EFFECT_LIVE);
+		ClusterPageGetItlSlots((Page)f.cr.source.data)[2].flags = ITL_FLAG_ACTIVE;
+		ClusterPageGetItlSlots((Page)f.cr.source.data)[2].commit_scn = InvalidScn;
+		test_tt_slot.status = TT_SLOT_ACTIVE;
+		test_tt_slot.commit_scn = InvalidScn;
+		test_native_status = TRANSACTION_STATUS_IN_PROGRESS;
+		test_twophase_xid = TEST_ORIGIN_XID;
+		test_current_owner_available = true;
+		memcpy(original.data, f.cr.source.data, BLCKSZ);
+		step = operation_worker_finish(&f);
+		cluster_cr_build_on_holder_forget(0, 1000);
+		UT_ASSERT_EQ(step, CLUSTER_R4_CR_STEP_FULL);
+		operation_worker_assert_mixed_top(&f, original.data, false, false, 6);
+	}
+}
+
+UT_TEST(test_operation_worker_mixed_top_exact_identity_refusals)
+{
+	for (int fault = 0; fault < 6; fault++) {
+		OperationWorkerFixture f;
+		PGAlignedBlock intermediate;
+		UndoRecordHeader *older;
+		UndoOperationTrailer tail;
+		char *bytes;
+		ClusterR4CrBuildStepResult step;
+
+		operation_worker_mixed_top(&f, true, false);
+		operation_worker_first_inverse(&f);
+		older = (UndoRecordHeader *)(test_operation_page.data + sizeof(UndoBlockHeader));
+		bytes = (char *)(older + 1) + older->payload_length - sizeof(tail);
+		memcpy(&tail, bytes, sizeof(tail));
+		if (fault == 0)
+			test_tt_slot.xid++;
+		else if (fault == 1)
+			test_tt_slot.wrap++;
+		else if (fault == 2)
+			tail.operation_fxid++;
+		else if (fault == 3)
+			tail.canonical_segment_generation++;
+		else if (fault == 4)
+			ClusterPageGetItlSlots((Page)f.cr.source.data)[2].wrap++;
+		else
+			HeapTupleHeaderSetXmin(
+				(HeapTupleHeader)PageGetItem((Page)f.cr.source.data,
+											 PageGetItemId((Page)f.cr.source.data, 2)),
+				TEST_ORIGIN_XID + 3);
+		memcpy(bytes, &tail, sizeof(tail));
+		memcpy(intermediate.data, f.cr.source.data, BLCKSZ);
+		step = operation_worker_finish(&f);
+		cluster_cr_build_on_holder_forget(0, 1000);
+		UT_ASSERT_EQ(step, CLUSTER_R4_CR_STEP_FAIL);
+		UT_ASSERT_EQ(f.reason, CLUSTER_CR_BUILD_BAD_UNDO);
+		UT_ASSERT_EQ(memcmp(intermediate.data, f.cr.source.data, BLCKSZ), 0);
+		UT_ASSERT_EQ(test_candidate_held_count, 0);
+	}
+}
+
+UT_TEST(test_operation_worker_mixed_top_cohort_has_private_observations)
+{
+	OperationWorkerFixture f[2];
+	PGAlignedBlock original;
+	ClusterR4CrBuildStepResult step[2] = { CLUSTER_R4_CR_STEP_PENDING, CLUSTER_R4_CR_STEP_PENDING };
+	int allocations = operation_worker_allocations;
+
+	operation_worker_mixed_top(&f[0], true, false);
+	operation_worker_row_effect(0, CLUSTER_SAVEPOINT_EFFECT_LIVE);
+	f[1] = f[0];
+	f[1].extension.slot_generation++;
+	f[1].extension.owner.builder_incarnation++;
+	memcpy(original.data, f[0].cr.source.data, BLCKSZ);
+	test_operation_worker_current_busy = true;
+	for (int tick = 0; tick < 100; tick++)
+		for (unsigned i = 0; i < 2; i++)
+			if (step[i] == CLUSTER_R4_CR_STEP_PENDING)
+				step[i] = operation_worker_step_at(&f[i], i);
+	for (unsigned i = 0; i < 2; i++) {
+		cluster_cr_build_on_holder_forget(i, 1000 + i);
+		UT_ASSERT_EQ(step[i], CLUSTER_R4_CR_STEP_FULL);
+		operation_worker_assert_mixed_top(&f[i], original.data, true, true, 12);
+	}
+	UT_ASSERT_EQ(test_candidate_max_held_count, 1);
+	UT_ASSERT_EQ(operation_worker_allocations, allocations);
+}
