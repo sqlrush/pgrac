@@ -2150,10 +2150,401 @@ UT_TEST(test_decision_sender_rebind_preserves_master_episode_and_holder_bytes)
 	}
 }
 
+/* A and the original ACK are built independently of the witness encoder. */
+static ResourceXDecodedFrame
+witness_attach(uint8 *bytes, int holder, bool source_proof)
+{
+	ResourceXDecodedFrame decision, ack, witness = {0};
+	ResourceXWireReject reject;
+	uint16 inner_len = 0;
+	uint16 len = source_proof ? RESOURCE_X_SOURCE_WITNESS_V3_BYTES : RESOURCE_X_WITNESS_V3_BYTES;
+	test_put_u32_be(bytes + 68, holder);
+	test_reseal(bytes, RESOURCE_X_DECISION_V3_BYTES);
+	UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_BLOCK_TO_N, bytes,
+		RESOURCE_X_DECISION_V3_BYTES, &decision, &reject));
+	ack = make_typed_frame(RESOURCE_X_WIRE_BLOCKED_TO_N);
+	ack.common = decision.common;
+	ack.kind = RESOURCE_X_WIRE_BLOCKED_TO_N;
+	ack.has_acquire_decision = ack.has_acquire_intent = false;
+	ack.blocked_has_remote_proof = source_proof;
+	ack.common.authority_generation = ack.common.base_authority_generation;
+	ack.common.observed_mode = decision.body.acquire_decision.directory_mode;
+	ack.common.target_mode = decision.common.target_mode == PCM_STATE_S ? PCM_STATE_S : PCM_STATE_N;
+	ack.common.outcome = RESOURCE_X_OUTCOME_OK;
+	ack.common.flags = source_proof ? RESOURCE_X_COMMON_FLAG_PI_ESTABLISHED : 0;
+	ack.common.sender_connection_generation = 83;
+	if (source_proof) {
+		ResourceXDecodedBlockedToN *proof = &ack.body.blocked_to_n;
+		memset(proof->source_fence, 0, sizeof(proof->source_fence));
+		test_put_u32_be(proof->source_fence, holder);
+		test_put_u64_be(proof->source_fence + 4, decision.body.acquire_decision.holders[holder].boot_incarnation);
+		test_put_u64_be(proof->source_fence + 12, 71);
+		test_put_u64_be(proof->source_fence + 20, 77);
+		proof->source_fence[28] = ack.common.observed_mode;
+		proof->source_fence[29] = 1;
+		proof->source_carrier_generation = 78;
+		proof->requester_target_generation = ack.common.assertion_sequence;
+		proof->acting_formation = ack.common.resource_formation;
+	}
+	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_BLOCKED_TO_N, &ack,
+		bytes + RESOURCE_X_DECISION_V3_BYTES, RESOURCE_X_PROOF_V1_BYTES, &inner_len, &reject));
+	UT_ASSERT_EQ(inner_len, len - RESOURCE_X_DECISION_V3_BYTES);
+	witness.kind = RESOURCE_X_WIRE_BLOCKED_TO_N;
+	witness.payload_bytes = len;
+	witness.has_acquire_decision = true;
+	witness.common = decision.common;
+	witness.common.outcome = RESOURCE_X_OUTCOME_OK;
+	witness.body.acquire_witness.decision = decision.body.acquire_decision;
+	witness.body.acquire_witness.original_ack = ack.common;
+	if (source_proof) witness.body.acquire_witness.original_proof = ack.body.blocked_to_n;
+	witness.body.acquire_witness.has_source_proof = source_proof;
+	bytes[1] = RESOURCE_X_WIRE_BLOCKED_TO_N;
+	bytes[2] = len >> 8; bytes[3] = len;
+	bytes[80] = RESOURCE_X_OUTCOME_OK;
+	test_reseal(bytes, len);
+	return witness;
+}
+
+static ResourceXDecodedFrame
+make_witness_bytes(uint8 *bytes, bool source, PcmState directory, PcmState target)
+{
+	make_decision_bytes(bytes, true, directory, directory == PCM_STATE_X ? 2 : 6,
+		target, 1, RESOURCE_X_ACQUIRE_SOURCE_REMOTE_CURRENT);
+	return witness_attach(bytes, source ? 1 : 2, source);
+}
+
+static bool
+witness_round_trip(const uint8 *bytes, uint16 len, ResourceXDecodedFrame *frame)
+{
+	ResourceXWireReject reject;
+	uint8 encoded[RESOURCE_X_SOURCE_WITNESS_V3_BYTES];
+	uint16 actual = 0;
+	bool ok = cluster_resource_x_wire_decode(RESOURCE_X_MSG_BLOCKED_TO_N, bytes, len, frame, &reject);
+	UT_ASSERT(ok);
+	if (!ok) return false;
+	UT_ASSERT(frame->has_acquire_decision && !frame->has_acquire_intent && !frame->blocked_has_remote_proof);
+	UT_ASSERT_EQ(frame->kind, RESOURCE_X_WIRE_BLOCKED_TO_N);
+	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_BLOCKED_TO_N, frame,
+		encoded, sizeof(encoded), &actual, &reject));
+	UT_ASSERT_EQ(actual, len);
+	UT_ASSERT(memcmp(encoded, bytes, len) == 0);
+	return true;
+}
+
+static void
+witness_reject(uint8 *bytes, uint16 len, bool reseal_inner)
+{
+	if (reseal_inner) test_reseal(bytes + RESOURCE_X_DECISION_V3_BYTES, len - RESOURCE_X_DECISION_V3_BYTES);
+	test_reseal(bytes, len);
+	test_acquire_rejected(RESOURCE_X_MSG_BLOCKED_TO_N, bytes, len);
+}
+
+static void
+witness_encode_rejected(ResourceXDecodedFrame *frame, uint16 capacity)
+{
+	uint8 output[RESOURCE_X_SOURCE_WITNESS_V3_BYTES], original[RESOURCE_X_SOURCE_WITNESS_V3_BYTES];
+	uint16 len = 77;
+	ResourceXWireReject reject;
+	memset(output, 0xa5, sizeof(output)); memcpy(original, output, sizeof(output));
+	UT_ASSERT(!cluster_resource_x_wire_encode(RESOURCE_X_MSG_BLOCKED_TO_N, frame,
+		output, capacity, &len, &reject));
+	UT_ASSERT_EQ(len, 77);
+	UT_ASSERT(memcmp(output, original, sizeof(output)) == 0);
+}
+
+UT_TEST(test_witness_layout_retains_complete_a_and_original_ack)
+{
+	UT_ASSERT_EQ(RESOURCE_X_WITNESS_V3_BYTES, 832);
+	UT_ASSERT_EQ(RESOURCE_X_SOURCE_WITNESS_V3_BYTES, 1048);
+	UT_ASSERT_EQ(sizeof(ResourceXAcquireWitnessV3), 832);
+	UT_ASSERT_EQ(sizeof(ResourceXAcquireSourceWitnessV3), 1048);
+	UT_ASSERT_EQ(offsetof(ResourceXAcquireSourceWitnessV3, original_ack), 736);
+	UT_ASSERT(sizeof(ResourceXDecodedAcquireWitness) <= sizeof(ResourceXDecodedImageEnvelope));
+	printf("# decoded_frame_bytes=%zu witness_body_bytes=%zu\n", sizeof(ResourceXDecodedFrame), sizeof(ResourceXDecodedAcquireWitness));
+}
+
+UT_TEST(test_witness_plain_required_holder_round_trips_original_ack)
+{
+	uint8 bytes[1048]; ResourceXDecodedFrame frame;
+	(void)make_witness_bytes(bytes, false, PCM_STATE_S, PCM_STATE_X);
+	if (witness_round_trip(bytes, 832, &frame)) {
+		UT_ASSERT(!frame.body.acquire_witness.has_source_proof);
+		UT_ASSERT_EQ(frame.body.acquire_witness.original_ack.action_node, 2);
+		UT_ASSERT_EQ(frame.body.acquire_witness.original_ack.target_mode, PCM_STATE_N);
+	}
+}
+
+UT_TEST(test_witness_shared_source_retains_original_proof)
+{
+	uint8 bytes[1048]; ResourceXDecodedFrame frame;
+	for (int target = PCM_STATE_S; target <= PCM_STATE_X; target++) {
+		(void)make_witness_bytes(bytes, true, PCM_STATE_S, target);
+		if (witness_round_trip(bytes, 1048, &frame)) {
+			UT_ASSERT(frame.body.acquire_witness.has_source_proof);
+			UT_ASSERT_EQ(frame.body.acquire_witness.original_proof.source_carrier_generation, 78);
+			UT_ASSERT_EQ(frame.body.acquire_witness.decision.holders[1].grant_generation, 51);
+			UT_ASSERT_EQ(frame.body.acquire_witness.original_ack.target_mode,
+				target == PCM_STATE_S ? PCM_STATE_S : PCM_STATE_N);
+		}
+	}
+}
+
+UT_TEST(test_witness_x_source_keeps_downgrade_and_revoke_distinct)
+{
+	uint8 bytes[1048]; ResourceXDecodedFrame frame;
+	for (int target = PCM_STATE_S; target <= PCM_STATE_X; target++) {
+		(void)make_witness_bytes(bytes, true, PCM_STATE_X, target);
+		if (witness_round_trip(bytes, 1048, &frame)) {
+			UT_ASSERT_EQ(frame.body.acquire_witness.original_ack.observed_mode, PCM_STATE_X);
+			UT_ASSERT_EQ(frame.body.acquire_witness.original_ack.target_mode, target == PCM_STATE_S ? PCM_STATE_S : PCM_STATE_N);
+		}
+	}
+}
+
+UT_TEST(test_witness_local_source_self_downgrade_is_a_plain_native_ack)
+{
+	uint8 bytes[1048]; ResourceXDecodedFrame frame;
+	make_decision_bytes(bytes, true, PCM_STATE_X, 8, PCM_STATE_S, 3, RESOURCE_X_ACQUIRE_SOURCE_LOCAL_CURRENT);
+	(void)witness_attach(bytes, 3, false);
+	if (witness_round_trip(bytes, 832, &frame)) UT_ASSERT_EQ(frame.body.acquire_witness.original_ack.target_mode, PCM_STATE_S);
+}
+
+UT_TEST(test_witness_required_holder_bit31_is_not_lost)
+{
+	uint8 bytes[1048]; ResourceXDecodedFrame frame;
+	make_decision_bytes(bytes, true, PCM_STATE_S, UINT32_C(0x80000002), PCM_STATE_X, 1, RESOURCE_X_ACQUIRE_SOURCE_REMOTE_CURRENT);
+	(void)witness_attach(bytes, 31, false);
+	if (witness_round_trip(bytes, 832, &frame)) UT_ASSERT_EQ(frame.common.action_node, 31);
+}
+
+UT_TEST(test_witness_every_prefix_and_extra_byte_is_rejected)
+{
+	uint8 bytes[1049];
+	for (int source = 0; source <= 1; source++) {
+		uint16 len = source ? 1048 : 832;
+		(void)make_witness_bytes(bytes, source, PCM_STATE_S, PCM_STATE_X);
+		for (uint16 n = 0; n < len; n++) test_acquire_rejected(RESOURCE_X_MSG_BLOCKED_TO_N, bytes, n);
+		bytes[len] = 0; test_acquire_rejected(RESOURCE_X_MSG_BLOCKED_TO_N, bytes, len + 1);
+	}
+}
+
+UT_TEST(test_witness_other_message_types_and_kinds_are_rejected)
+{
+	uint8 bytes[1048];
+	for (int source = 0; source <= 1; source++) {
+		uint16 len = source ? 1048 : 832;
+		(void)make_witness_bytes(bytes, source, PCM_STATE_S, PCM_STATE_X);
+		for (int type = 0; type < 256; type++)
+			if (type != RESOURCE_X_MSG_BLOCKED_TO_N) test_acquire_rejected(type, bytes, len);
+		for (int kind = 0; kind <= 12; kind++) {
+			(void)make_witness_bytes(bytes, source, PCM_STATE_S, PCM_STATE_X);
+			if (kind == RESOURCE_X_WIRE_BLOCKED_TO_N) continue;
+			bytes[1] = kind; witness_reject(bytes, len, false);
+		}
+	}
+}
+
+UT_TEST(test_witness_version_declared_length_and_crc_are_strict)
+{
+	uint8 bytes[1048];
+	for (int variant = 0; variant < 4; variant++) {
+		(void)make_witness_bytes(bytes, true, PCM_STATE_S, PCM_STATE_X);
+		if (variant == 0) bytes[0] = 1;
+		if (variant == 1) bytes[0] = 2;
+		if (variant == 2) bytes[3]--;
+		if (variant == 3) {bytes[744] ^= 1; test_acquire_rejected(RESOURCE_X_MSG_BLOCKED_TO_N, bytes, 1048);continue;}
+		witness_reject(bytes, 1048, false);
+	}
+}
+
+UT_TEST(test_witness_both_reserved_domains_are_zero)
+{
+	uint8 bytes[1048];
+	const int offsets[] = {82,83,87,153,159,214,223,736+82,736+87};
+	for (unsigned n = 0; n < lengthof(offsets); n++) {
+		(void)make_witness_bytes(bytes, true, PCM_STATE_S, PCM_STATE_X);
+		bytes[offsets[n]] = 1; witness_reject(bytes, 1048, true);
+	}
+}
+
+UT_TEST(test_witness_inner_crc_cannot_be_repaired_by_outer_reseal)
+{
+	uint8 bytes[1048];
+	(void)make_witness_bytes(bytes, true, PCM_STATE_S, PCM_STATE_X);
+	bytes[736+284] ^= 1;
+	witness_reject(bytes, 1048, false);
+}
+
+UT_TEST(test_witness_original_ack_key_must_match_complete_a)
+{
+	uint8 bytes[1048];
+	const int offsets[] = {8,32,40,48,56,64,68,72,73,88};
+	for (unsigned n = 0; n < lengthof(offsets); n++) {
+		(void)make_witness_bytes(bytes, true, PCM_STATE_S, PCM_STATE_X);
+		bytes[736+offsets[n]] ^= 1; witness_reject(bytes, 1048, true);
+	}
+}
+
+UT_TEST(test_witness_only_completed_ok_is_accepted)
+{
+	uint8 bytes[1048];
+	for (int outcome = RESOURCE_X_OUTCOME_NONE; outcome <= RESOURCE_X_OUTCOME_CORRUPT; outcome++) {
+		if (outcome == RESOURCE_X_OUTCOME_OK) continue;
+		(void)make_witness_bytes(bytes, true, PCM_STATE_S, PCM_STATE_X);
+		bytes[80] = outcome; witness_reject(bytes, 1048, false);
+		(void)make_witness_bytes(bytes, true, PCM_STATE_S, PCM_STATE_X);
+		bytes[736+80] = outcome; witness_reject(bytes, 1048, true);
+	}
+}
+
+UT_TEST(test_witness_source_proof_cannot_be_omitted_or_substituted)
+{
+	uint8 bytes[1048]; ResourceXDecodedFrame frame;
+	frame = make_witness_bytes(bytes, true, PCM_STATE_S, PCM_STATE_X);
+	frame.body.acquire_witness.has_source_proof = false;
+	memset(&frame.body.acquire_witness.original_proof, 0, sizeof(frame.body.acquire_witness.original_proof));
+	witness_encode_rejected(&frame, 1048);
+	frame = make_witness_bytes(bytes, false, PCM_STATE_S, PCM_STATE_X);
+	frame.body.acquire_witness.has_source_proof = true;
+	witness_encode_rejected(&frame, 1048);
+}
+
+UT_TEST(test_witness_original_proof_dependencies_remain_strict)
+{
+	uint8 bytes[1048];
+	for (int variant = 0; variant < 3; variant++) {
+		(void)make_witness_bytes(bytes, true, PCM_STATE_S, PCM_STATE_X);
+		if (variant == 0) {bytes[736+154] = 0;bytes[736+155] = 17;}
+		if (variant == 1) test_put_u64_be(bytes+736+156+15*8, 1);
+		if (variant == 2) bytes[736+294] = 1;
+		witness_reject(bytes, 1048, true);
+	}
+}
+
+UT_TEST(test_witness_source_fence_binds_original_holder_boot_node_and_mode)
+{
+	uint8 bytes[1048];
+	const int offsets[] = {736+96+3,736+96+4,736+96+28};
+	for (unsigned n = 0; n < lengthof(offsets); n++) {
+		(void)make_witness_bytes(bytes, true, PCM_STATE_S, PCM_STATE_X);
+		bytes[offsets[n]] ^= 1; witness_reject(bytes, 1048, true);
+	}
+}
+
+UT_TEST(test_witness_native_carrier_is_not_master_grant_generation)
+{
+	uint8 bytes[1048]; ResourceXDecodedFrame frame;
+	(void)make_witness_bytes(bytes, true, PCM_STATE_S, PCM_STATE_X);
+	if (!witness_round_trip(bytes, 1048, &frame)) return;
+	UT_ASSERT_NE(frame.body.acquire_witness.original_proof.source_carrier_generation,
+		frame.body.acquire_witness.decision.holders[1].grant_generation);
+	for (int variant = 0; variant < 4; variant++) {
+		frame = make_witness_bytes(bytes, true, PCM_STATE_S, PCM_STATE_X);
+		if (variant == 0) frame.body.acquire_witness.original_proof.source_carrier_generation = 0;
+		if (variant == 1) frame.body.acquire_witness.original_proof.source_carrier_generation = UINT64_MAX;
+		if (variant == 2) test_put_u64_be(frame.body.acquire_witness.original_proof.source_fence + 20, 0);
+		if (variant == 3) test_put_u64_be(frame.body.acquire_witness.original_proof.source_fence + 20, UINT64_MAX);
+		witness_encode_rejected(&frame, 1048);
+	}
+}
+
+UT_TEST(test_witness_required_set_cannot_omit_or_add_an_incumbent)
+{
+	uint8 bytes[1048];
+	for (int variant = 0; variant < 3; variant++) {
+		(void)make_witness_bytes(bytes, false, PCM_STATE_S, PCM_STATE_X);
+		if (variant == 0) test_put_u32_be(bytes+196, 2);
+		if (variant == 1) test_put_u32_be(bytes+196, 14);
+		if (variant == 2) test_put_u64_be(bytes+224+2*16+8, 0);
+		witness_reject(bytes, 832, false);
+	}
+}
+
+UT_TEST(test_witness_complete_episode_and_receiving_holder_remain_bound)
+{
+	uint8 bytes[1048];
+	const int offsets[] = {96,104,120,136,144,148,152,160,184,204,208};
+	for (unsigned n = 0; n < lengthof(offsets); n++) {
+		(void)make_witness_bytes(bytes, true, PCM_STATE_S, PCM_STATE_X);
+		/* Invalid/exhausted fields, not arbitrary valid A choices. Full expected
+			* A equality is the receiver's duty, not inferred by a stateless codec. */
+		if (offsets[n] == 152) bytes[152] = 9;
+		else if (offsets[n] == 144 || offsets[n] == 148 || offsets[n] == 184)
+			test_put_u32_be(bytes+offsets[n], UINT32_MAX);
+		else if (offsets[n] == 204 || offsets[n] == 208) test_put_u32_be(bytes+offsets[n], 0);
+		else test_put_u64_be(bytes+offsets[n], 0);
+		witness_reject(bytes, 1048, false);
+	}
+}
+
+UT_TEST(test_witness_encoder_preserves_every_insufficient_output)
+{
+	uint8 bytes[1048]; ResourceXDecodedFrame frame;
+	for (int source = 0; source <= 1; source++) {
+		uint16 len = source ? 1048 : 832;
+		frame = make_witness_bytes(bytes, source, PCM_STATE_S, PCM_STATE_X);
+		for (uint16 capacity = 0; capacity < len; capacity++) witness_encode_rejected(&frame, capacity);
+	}
+}
+
+UT_TEST(test_witness_typed_discriminators_and_unused_proof_are_closed)
+{
+	uint8 bytes[1048]; ResourceXDecodedFrame frame;
+	for (int variant = 0; variant < 4; variant++) {
+		frame = make_witness_bytes(bytes, false, PCM_STATE_S, PCM_STATE_X);
+		if (variant == 0) frame.has_acquire_intent = true;
+		if (variant == 1) frame.blocked_has_remote_proof = true;
+		if (variant == 2) frame.body.acquire_witness.original_proof.source_carrier_generation = 1;
+		if (variant == 3) frame.body.acquire_witness.original_ack.sender_connection_generation = UINT32_MAX;
+		witness_encode_rejected(&frame, 1048);
+	}
+}
+
+UT_TEST(test_witness_sender_rebind_changes_only_outer_transport_and_crc)
+{
+	uint8 bytes[1048], original[1048]; ResourceXDecodedFrame frame; ResourceXWireReject reject;
+	for (int source = 0; source <= 1; source++) {
+		uint16 len = source ? 1048 : 832;
+		(void)make_witness_bytes(bytes, source, PCM_STATE_S, PCM_STATE_X); memcpy(original, bytes, len);
+		UT_ASSERT(cluster_resource_x_wire_rebind_sender_generation(RESOURCE_X_MSG_BLOCKED_TO_N, bytes, len, 99, &reject));
+		for (int offset = 0; offset < len; offset++)
+			if ((offset < 4 || offset >= 8) && (offset < 76 || offset >= 80)) UT_ASSERT_EQ(bytes[offset], original[offset]);
+		if (witness_round_trip(bytes, len, &frame)) {
+			UT_ASSERT_EQ(frame.common.sender_connection_generation, 99);
+			UT_ASSERT_EQ(frame.body.acquire_witness.original_ack.sender_connection_generation, 83);
+		}
+	}
+}
+
+UT_TEST(test_witness_rebind_refuses_malformed_nested_or_exhausted_sender)
+{
+	uint8 bytes[1048], original[1048]; ResourceXWireReject reject;
+	for (int variant = 0; variant < 3; variant++) {
+		(void)make_witness_bytes(bytes, true, PCM_STATE_S, PCM_STATE_X);
+		if (variant == 0) {bytes[736+68] ^= 1;test_reseal(bytes+736,312);test_reseal(bytes,1048);}
+		memcpy(original, bytes, 1048);
+		UT_ASSERT(!cluster_resource_x_wire_rebind_sender_generation(RESOURCE_X_MSG_BLOCKED_TO_N,
+			bytes, 1048, variant == 1 ? 0 : variant == 2 ? UINT32_MAX : 99, &reject));
+		UT_ASSERT(memcmp(bytes, original, 1048) == 0);
+	}
+}
+
+UT_TEST(test_witness_original_pi_proof_and_native_bytes_are_never_synthesized)
+{
+	uint8 bytes[1048], encoded[1048]; ResourceXDecodedFrame frame; ResourceXWireReject reject; uint16 len;
+	(void)make_witness_bytes(bytes, true, PCM_STATE_S, PCM_STATE_X);
+	if (!witness_round_trip(bytes, 1048, &frame)) return;
+	UT_ASSERT_EQ(frame.body.acquire_witness.original_ack.flags, RESOURCE_X_COMMON_FLAG_PI_ESTABLISHED);
+	UT_ASSERT_EQ(frame.body.acquire_witness.original_proof.dependencies[1], 85);
+	UT_ASSERT_EQ(frame.body.acquire_witness.original_proof.holder_connection_generation, 86);
+	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_BLOCKED_TO_N, &frame, encoded, sizeof(encoded), &len, &reject));
+	UT_ASSERT(memcmp(bytes+736, encoded+736, 312) == 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(67);
+	UT_PLAN(91);
 	UT_RUN(test_wire_kind_and_proof_domains_are_closed);
 	UT_RUN(test_reused_message_numbers_remain_exact);
 	UT_RUN(test_common_wire_layout_is_exact);
@@ -2221,6 +2612,30 @@ main(void)
 	UT_RUN(test_decision_encoder_checks_typed_body_and_discriminator_before_output);
 	UT_RUN(test_decision_every_insufficient_capacity_is_atomic);
 	UT_RUN(test_decision_sender_rebind_preserves_master_episode_and_holder_bytes);
+	UT_RUN(test_witness_layout_retains_complete_a_and_original_ack);
+	UT_RUN(test_witness_plain_required_holder_round_trips_original_ack);
+	UT_RUN(test_witness_shared_source_retains_original_proof);
+	UT_RUN(test_witness_x_source_keeps_downgrade_and_revoke_distinct);
+	UT_RUN(test_witness_local_source_self_downgrade_is_a_plain_native_ack);
+	UT_RUN(test_witness_required_holder_bit31_is_not_lost);
+	UT_RUN(test_witness_every_prefix_and_extra_byte_is_rejected);
+	UT_RUN(test_witness_other_message_types_and_kinds_are_rejected);
+	UT_RUN(test_witness_version_declared_length_and_crc_are_strict);
+	UT_RUN(test_witness_both_reserved_domains_are_zero);
+	UT_RUN(test_witness_inner_crc_cannot_be_repaired_by_outer_reseal);
+	UT_RUN(test_witness_original_ack_key_must_match_complete_a);
+	UT_RUN(test_witness_only_completed_ok_is_accepted);
+	UT_RUN(test_witness_source_proof_cannot_be_omitted_or_substituted);
+	UT_RUN(test_witness_original_proof_dependencies_remain_strict);
+	UT_RUN(test_witness_source_fence_binds_original_holder_boot_node_and_mode);
+	UT_RUN(test_witness_native_carrier_is_not_master_grant_generation);
+	UT_RUN(test_witness_required_set_cannot_omit_or_add_an_incumbent);
+	UT_RUN(test_witness_complete_episode_and_receiving_holder_remain_bound);
+	UT_RUN(test_witness_encoder_preserves_every_insufficient_output);
+	UT_RUN(test_witness_typed_discriminators_and_unused_proof_are_closed);
+	UT_RUN(test_witness_sender_rebind_changes_only_outer_transport_and_crc);
+	UT_RUN(test_witness_rebind_refuses_malformed_nested_or_exhausted_sender);
+	UT_RUN(test_witness_original_pi_proof_and_native_bytes_are_never_synthesized);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

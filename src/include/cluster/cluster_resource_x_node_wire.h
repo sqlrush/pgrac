@@ -48,6 +48,10 @@ typedef enum ResourceXAcquireSource {
 #define RESOURCE_X_SOURCE_FENCE_BYTES 34
 #define RESOURCE_X_REQUEST_TAIL_BYTES 20
 
+/* One ACK-family frame retains A and the original holder completion. */
+#define RESOURCE_X_WITNESS_V3_BYTES (RESOURCE_X_DECISION_V3_BYTES + RESOURCE_X_CONTROL_V1_BYTES)
+#define RESOURCE_X_SOURCE_WITNESS_V3_BYTES (RESOURCE_X_DECISION_V3_BYTES + RESOURCE_X_PROOF_V1_BYTES)
+
 #define RESOURCE_X_MSG_ASSERT_X PGRAC_IC_MSG_GCS_BLOCK_REQUEST
 #define RESOURCE_X_MSG_IMAGE_OR_GRANT PGRAC_IC_MSG_GCS_BLOCK_REPLY
 #define RESOURCE_X_MSG_BLOCK_TO_N PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE
@@ -228,6 +232,16 @@ typedef struct ResourceXBlockedToNProofV1 {
 	uint8 holder_connection_generation[8];
 	uint8 acting_formation[8];
 } ResourceXBlockedToNProofV1;
+
+typedef struct ResourceXAcquireWitnessV3 {
+	ResourceXAcquireDecisionV3 decision;
+	ResourceXControlV1 original_ack;
+} ResourceXAcquireWitnessV3;
+
+typedef struct ResourceXAcquireSourceWitnessV3 {
+	ResourceXAcquireDecisionV3 decision;
+	ResourceXBlockedToNProofV1 original_ack;
+} ResourceXAcquireSourceWitnessV3;
 
 typedef struct ResourceXAuthorityGrantV1 {
 	ResourceXWireCommonV1 common;
@@ -416,6 +430,15 @@ typedef struct ResourceXDecodedAcquireDecision {
 	ResourceXDecodedAcquireHolder holders[RESOURCE_X_PROTOCOL_NODE_LIMIT];
 } ResourceXDecodedAcquireDecision;
 
+/* Original ACK sender identity belongs to the retained receipt. Only the
+ * enclosing common header is rebound for this physical delivery/session. */
+typedef struct ResourceXDecodedAcquireWitness {
+	ResourceXDecodedAcquireDecision decision;
+	ResourceXDecodedCommon original_ack;
+	ResourceXDecodedBlockedToN original_proof;
+	bool has_source_proof;
+} ResourceXDecodedAcquireWitness;
+
 typedef struct ResourceXDecodedFrame {
 	ResourceXWireKind kind;
 	uint16 payload_bytes;
@@ -430,9 +453,17 @@ typedef struct ResourceXDecodedFrame {
 		ResourceXDecodedInstallSettlement install_settlement;
 		ResourceXDecodedAcquireIntent acquire_intent;
 		ResourceXDecodedAcquireDecision acquire_decision;
+		ResourceXDecodedAcquireWitness acquire_witness;
 	} body;
-	bool has_acquire_decision; /* Conditional V3 GRANT/BLOCK, never legacy grant. */
+	bool has_acquire_decision; /* V3 A or A+original ACK, never legacy completion. */
 } ResourceXDecodedFrame;
+
+StaticAssertDecl(sizeof(ResourceXAcquireWitnessV3) == RESOURCE_X_WITNESS_V3_BYTES
+				 && sizeof(ResourceXAcquireSourceWitnessV3) == RESOURCE_X_SOURCE_WITNESS_V3_BYTES,
+				 "complete acquisition witnesses must retain the original ACK bytes");
+StaticAssertDecl(offsetof(ResourceXAcquireWitnessV3, original_ack) == RESOURCE_X_DECISION_V3_BYTES
+				 && offsetof(ResourceXAcquireSourceWitnessV3, original_ack) == RESOURCE_X_DECISION_V3_BYTES,
+				 "acquisition witnesses must preserve the complete A prefix");
 
 StaticAssertDecl(BLCKSZ == RESOURCE_X_PAGE_BYTES,
 				 "Resource-X V1 requires the current 8192-byte page ABI");
