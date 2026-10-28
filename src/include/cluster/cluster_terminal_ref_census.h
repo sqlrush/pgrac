@@ -486,6 +486,9 @@ typedef struct ClusterCtrcParticipantEntry {
 	uint64 delegation_subtree_bitmap[CLUSTER_CTRC_MAX_PARTICIPANTS];
 	uint8 delegation_ack_digest[CLUSTER_CTRC_MAX_PARTICIPANTS][32];
 	XLogRecPtr delegation_required_lsn[CLUSTER_SF_DEP_MAX_ORIGINS];
+	/* Authenticated origin certificate notice retained while child custody
+	 * still exists. It is not a child completion or a release certificate. */
+	uint64 root_certificate_request_id;
 } ClusterCtrcParticipantEntry;
 
 typedef struct ClusterCtrcReceipt {
@@ -1348,6 +1351,10 @@ extern bool cluster_ctrc_receipts_reclaim_batch_locked(ClusterCtrcReclaimWork *w
 													   Size work_count,
 													   ClusterCtrcReceipt *receipts,
 													   uint8 *probe_states, Size receipt_count);
+/* Caller has authenticated the original origin request and owns its admission.
+ * A retained root notice returns PENDING, never a successful retirement. */
+extern ClusterCtrcSealReplyResult cluster_ctrc_participant_certificate_request_shared(
+	const ClusterCtrcCloseDispatch *dispatch, uint16 *first_reason);
 /* Caller has authenticated each local certificate request separately. */
 extern bool
 cluster_ctrc_participant_certificate_batch_shared(const ClusterCtrcCloseDispatch *dispatches,

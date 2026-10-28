@@ -2739,10 +2739,393 @@ UT_TEST(test_original_local_root_single_and_batch_dispatch_bind_the_complete_sub
 	}
 }
 
+static bool
+root_send_certificate(const ClusterCtrcReceiptHandle *root, uint64 request_id)
+{
+	uint8 bytes[CLUSTER_CTRC_SEAL_REQUEST_BYTES];
+	ClusterICEnvelope env = {0};
+
+	if (!cluster_ctrc_seal_request_encode(&root->key, request_id,
+		root->participant->grant_generation, 41,
+		root->participant->identity.capability_record_generation,
+		CTRC_SEAL_CERTIFICATE_COMMITTED, bytes, sizeof(bytes)))
+		return false;
+	cluster_node_id = root->participant->identity.node_id;
+	dispatch_self_boot = root->participant->identity.boot_incarnation;
+	close_source_generation = dispatch_peer_connection_generation = 29;
+	close_expected_destination = root->key.origin_node_id;
+	close_replies = 0;
+	env.msg_type = PGRAC_IC_MSG_GCS_BLOCK_FORWARD;
+	env.source_node_id = root->key.origin_node_id;
+	env.dest_node_id = root->participant->identity.node_id;
+	env.epoch = root->key.cluster_epoch;
+	env.payload_length = sizeof(bytes);
+	return gcs_block_try_ctrc_forward136(&env, bytes) && close_replies == 1;
+}
+
+UT_TEST(test_original_certificate_notice_waits_for_retained_root_children)
+{
+	ClusterCtrcReceiptHandle root;
+	ClusterCtrcRootSubtreeAckV1 proof;
+	ClusterCtrcOriginCertificateSnapshot snapshot;
+	ClusterCtrcSharedHeader *origin_pool;
+	uint8 reply[GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE];
+	const uint8 *page = close_reply + sizeof(GcsBlockReplyHeader);
+
+	UT_ASSERT(root_certificate_setup(&root, &proof, reply));
+	UT_ASSERT(close_merge_land(reply));
+	UT_ASSERT(!ctrc_origin_dispatchable_locked(&ctrc_origin_entries()[0]));
+	UT_ASSERT(ctrc_origin_certificate_snapshot_index_locked(0, &snapshot));
+	/* The existing volatile commit entry is a separately owned durability
+	 * boundary; this fixture makes no physical publication claim. */
+	UT_ASSERT(cluster_ctrc_origin_certificate_commit_entry(&ctrc_origin_entries()[0], &snapshot));
+	origin_pool = CtrcShared;
+	CtrcShared = root_certificate_source_pool;
+	UT_ASSERT(root_send_certificate(&root, 18009));
+	UT_ASSERT_EQ(ctrc_get_u16_le(page + 4), 2);
+	UT_ASSERT_EQ(page[40], CTRC_SEAL_REPLY_PENDING_DRAIN);
+	UT_ASSERT_EQ(ctrc_get_u16_le(page + 46), 0);
+	UT_ASSERT_EQ(root.participant->state, CTRC_PARTICIPANT_CLOSED_DRAINING);
+	UT_ASSERT_EQ(root.participant->delegation_count, 1);
+	UT_ASSERT_EQ(root.receipt->state, CTRC_RECEIPT_ACK_FROZEN);
+	UT_ASSERT_EQ(enters, leaves);
+	UT_ASSERT_EQ(held_count, 0);
+	UT_ASSERT_EQ(allocated, 0);
+	/* Restore the independently owned origin pool for fixture cleanup. */
+	CtrcShared = origin_pool;
+}
+
+/* Consume the same origin post-publication edge as the behavioral RED.
+ * The root remains in its independent local pool with every child retained. */
+static bool
+root_notice_setup(ClusterCtrcReceiptHandle *root, ClusterCtrcSharedHeader **origin_pool)
+{
+	ClusterCtrcRootSubtreeAckV1 proof;
+	ClusterCtrcOriginCertificateSnapshot snapshot;
+	uint8 reply[GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE];
+
+	if (!root_certificate_setup(root, &proof, reply) || !close_merge_land(reply)
+		|| ctrc_origin_dispatchable_locked(&ctrc_origin_entries()[0])
+		|| !ctrc_origin_certificate_snapshot_index_locked(0, &snapshot)
+		|| !cluster_ctrc_origin_certificate_commit_entry(&ctrc_origin_entries()[0], &snapshot))
+		return false;
+	*origin_pool = CtrcShared;
+	CtrcShared = root_certificate_source_pool;
+	cluster_node_id = root->participant->identity.node_id;
+	dispatch_self_boot = root->participant->identity.boot_incarnation;
+	return true;
+}
+
+UT_TEST(test_root_certificate_notice_retry_is_immutable_and_not_retirement)
+{
+	ClusterCtrcReceiptHandle root;
+	ClusterCtrcParticipantEntry before, expected;
+	ClusterCtrcReceipt receipt;
+	ClusterCtrcSharedHeader *origin_pool;
+	ClusterCtrcLocalReleaseAckV1 denied;
+	uint64 progress;
+	uint16 reason;
+	ClusterCtrcNormalStopObservation stop;
+
+	UT_ASSERT(root_notice_setup(&root, &origin_pool));
+	before = *root.participant; receipt = *root.receipt;
+	progress = cluster_ctrc_stat_get(CTRC_STAT_SEMANTIC_PROGRESS);
+	UT_ASSERT(root_send_certificate(&root, 18009));
+	expected = before; expected.root_certificate_request_id = 18009;
+	UT_ASSERT(memcmp(root.participant, &expected, sizeof(expected)) == 0);
+	UT_ASSERT(memcmp(root.receipt, &receipt, sizeof(receipt)) == 0);
+	UT_ASSERT_EQ(cluster_ctrc_stat_get(CTRC_STAT_SEMANTIC_PROGRESS), progress + 1);
+	UT_ASSERT(root_send_certificate(&root, 18009));
+	UT_ASSERT(memcmp(root.participant, &expected, sizeof(expected)) == 0);
+	UT_ASSERT_EQ(cluster_ctrc_stat_get(CTRC_STAT_SEMANTIC_PROGRESS), progress + 1);
+	UT_ASSERT(root_send_certificate(&root, 18010));
+	UT_ASSERT_EQ(close_reply[sizeof(GcsBlockReplyHeader) + 40], CTRC_SEAL_REPLY_BLOCKED_RETAIN);
+	UT_ASSERT(memcmp(root.participant, &expected, sizeof(expected)) == 0);
+	UT_ASSERT_EQ(cluster_ctrc_stat_get(CTRC_STAT_SEMANTIC_PROGRESS), progress + 1);
+	/* The old API has no authenticated request identity to retain. */
+	UT_ASSERT_EQ(cluster_ctrc_participant_request_shared(&root.key, &root.participant->identity,
+		root.participant->grant_generation, 41, CTRC_SEAL_CERTIFICATE_COMMITTED, &reason, &denied),
+		CTRC_SEAL_REPLY_BLOCKED_RETAIN);
+	UT_ASSERT(memcmp(root.participant, &expected, sizeof(expected)) == 0);
+	UT_ASSERT(ctrc_bytes_zero(&denied, sizeof(denied)));
+	UT_ASSERT_EQ(cluster_ctrc_normal_stop_poll(&stop), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(root.participant->delegation_count, 1);
+	UT_ASSERT(memcmp(root.receipt, &receipt, sizeof(receipt)) == 0);
+	UT_ASSERT_EQ(enters, leaves); UT_ASSERT_EQ(held_count, 0); UT_ASSERT_EQ(allocated, 0);
+	CtrcShared = origin_pool;
+}
+
+UT_TEST(test_root_certificate_notice_rejects_incomplete_or_conflicting_custody_without_mutation)
+{
+	ClusterCtrcReceiptHandle root;
+	ClusterCtrcParticipantEntry original, before;
+	ClusterCtrcReceipt receipt, receipt_before;
+	ClusterCtrcSharedHeader *origin_pool;
+	ClusterCtrcLocalReleaseAckV1 summary, summary_before;
+	ClusterCtrcCloseDispatch valid = {0};
+	uint64 index;
+
+	UT_ASSERT(root_notice_setup(&root, &origin_pool));
+	UT_ASSERT(ctrc_participant_index(&root.key, root.participant->identity.node_id, &index));
+	original = *root.participant; receipt = *root.receipt;
+	summary = ctrc_participant_ack_entries()[index];
+	valid.key = root.key; valid.participant = root.participant->identity;
+	valid.request_id = 18009; valid.grant_generation = root.participant->grant_generation;
+	valid.seal_generation = 41; valid.suboperation = CTRC_SEAL_CERTIFICATE_COMMITTED;
+	for (unsigned fault = 0; fault < 24; fault++) {
+		ClusterCtrcCloseDispatch request = valid;
+		ClusterCtrcSealReplyResult result;
+		uint64 progress;
+		uint16 reason;
+
+		*root.participant = original; *root.receipt = receipt;
+		ctrc_participant_ack_entries()[index] = summary;
+		switch (fault) {
+			case 0: request.request_id = 0; break;
+			case 1: request.request_id = UINT64_MAX; break;
+			case 2: request.key.root_generation++; break;
+			case 3: request.participant.boot_incarnation++; break;
+			case 4: request.participant.admission_record_generation++; break;
+			case 5: request.grant_generation++; break;
+			case 6: request.seal_generation++; break;
+			case 7: request.reserved8[0] = 1; break;
+			case 8: request.reserved32 = 1; break;
+			case 9: root.participant->original_full_xid = InvalidFullTransactionId; break;
+			case 10: root.participant->original_full_xid =
+				FullTransactionIdFromEpochAndXid(8, root.key.xid); break;
+			case 11: MemSet(root.participant->original_identity_v2, 0, 144); break;
+			case 12: root.participant->delegation_ack_bitmap = 0; break;
+			case 13: MemSet(root.participant->delegation_ack_digest[2], 0, 32); break;
+			case 14: root.participant->delegation_close_request_id[2] = 0; break;
+			case 15: root.participant->delegation_parent.sequence = 1; break;
+			case 16: root.participant->delegation_path.hop_count = 1; break;
+			case 17: root.participant->root_certificate_request_id = 18010; break;
+			case 18: root.participant->root_certificate_request_id = UINT64_MAX; break;
+			case 19: root.receipt->state = CTRC_RECEIPT_CANCELLED; break;
+			case 20: root.receipt->key.root_generation++; break;
+			case 21: ctrc_participant_ack_entries()[index].row_digest_sha256[0] ^= 1; break;
+			case 22: root.participant->state = CTRC_PARTICIPANT_OPEN; break;
+			case 23: root.participant->delegation_count = 0; break;
+		}
+		before = *root.participant; receipt_before = *root.receipt;
+		summary_before = ctrc_participant_ack_entries()[index];
+		progress = cluster_ctrc_stat_get(CTRC_STAT_SEMANTIC_PROGRESS);
+		result = cluster_ctrc_participant_certificate_request_shared(&request, &reason);
+		UT_ASSERT_EQ(result, CTRC_SEAL_REPLY_BLOCKED_RETAIN);
+		UT_ASSERT(reason != 0);
+		UT_ASSERT(memcmp(root.participant, &before, sizeof(before)) == 0);
+		UT_ASSERT(memcmp(root.receipt, &receipt_before, sizeof(receipt_before)) == 0);
+		UT_ASSERT(memcmp(&ctrc_participant_ack_entries()[index], &summary_before, sizeof(summary_before)) == 0);
+		UT_ASSERT_EQ(cluster_ctrc_stat_get(CTRC_STAT_SEMANTIC_PROGRESS), progress);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+	*root.participant = original; *root.receipt = receipt;
+	ctrc_participant_ack_entries()[index] = summary;
+	UT_ASSERT_EQ(enters, leaves); UT_ASSERT_EQ(allocated, 0);
+	CtrcShared = origin_pool;
+}
+
+UT_TEST(test_root_certificate_pending_reply_preserves_original_negative_and_positive_domains)
+{
+	ClusterCtrcReceiptHandle root;
+	ClusterCtrcSharedHeader *origin_pool;
+	ClusterCtrcSealReplyHeaderV1 header;
+	ClusterCtrcLocalReleaseAckV1 ack;
+	uint8 request[CLUSTER_CTRC_SEAL_REQUEST_BYTES], page[BLCKSZ], valid[BLCKSZ];
+
+	UT_ASSERT(root_notice_setup(&root, &origin_pool));
+	UT_ASSERT(cluster_ctrc_seal_request_encode(&root.key, 18009,
+		root.participant->grant_generation, 41, root.participant->identity.capability_record_generation,
+		CTRC_SEAL_CERTIFICATE_COMMITTED, request, sizeof(request)));
+	UT_ASSERT(cluster_ctrc_seal_reply_encode(request, sizeof(request), 1, 0,
+		CTRC_SEAL_REPLY_PENDING_DRAIN, CTRC_SEAL_REASON_CLEANOUT, NULL, valid, sizeof(valid)));
+	UT_ASSERT(cluster_ctrc_seal_reply_decode(valid, sizeof(valid), request, sizeof(request), 1, 0, &header, &ack));
+	UT_ASSERT_EQ(header.result, CTRC_SEAL_REPLY_PENDING_DRAIN);
+	UT_ASSERT_EQ(header.ack_length, 0); UT_ASSERT(ctrc_bytes_zero(&ack, sizeof(ack)));
+	CtrcShared = origin_pool;
+	UT_ASSERT(cluster_ctrc_origin_arm_certificate_entry(&ctrc_origin_entries()[0], 1, 18009));
+	{
+		ClusterCtrcOriginEntry before = ctrc_origin_entries()[0];
+
+		UT_ASSERT(!cluster_ctrc_origin_note_certificate_reply_entry(&ctrc_origin_entries()[0],
+			1, 18009, CTRC_SEAL_REPLY_PENDING_DRAIN));
+		UT_ASSERT(memcmp(&ctrc_origin_entries()[0], &before, sizeof(before)) == 0);
+	}
+	CtrcShared = root_certificate_source_pool;
+	for (unsigned fault = 0; fault < 4; fault++) {
+		memcpy(page, valid, sizeof(page));
+		switch (fault) {
+			case 0: ctrc_put_u16_le(page + 42, 0); break;
+			case 1: ctrc_put_u16_le(page + 46, CLUSTER_CTRC_LOCAL_ACK_BYTES); break;
+			case 2: page[CLUSTER_CTRC_REPLY_ACK_OFFSET] = 1; break;
+			case 3: page[40] = CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK; break;
+		}
+		ctrc_put_u32_le(page + 60, ctrc_crc32c_exact(page, 60));
+		MemSet(&header, 0x5a, sizeof(header)); MemSet(&ack, 0x5a, sizeof(ack));
+		UT_ASSERT(!cluster_ctrc_seal_reply_decode(page, sizeof(page), request, sizeof(request), 1, 0, &header, &ack));
+		UT_ASSERT(ctrc_bytes_zero(&header, sizeof(header)));
+		UT_ASSERT(ctrc_bytes_zero(&ack, sizeof(ack)));
+	}
+	UT_ASSERT(!cluster_ctrc_seal_reply_encode(request, sizeof(request), 1, 0,
+		CTRC_SEAL_REPLY_PENDING_DRAIN, 0, NULL, page, sizeof(page)));
+	UT_ASSERT(ctrc_bytes_zero(page, sizeof(page)));
+	UT_ASSERT(!cluster_ctrc_seal_reply_encode(request, sizeof(request), 1, 0,
+		CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK, 0, &ack, page, sizeof(page)));
+	UT_ASSERT(ctrc_bytes_zero(page, sizeof(page)));
+	CtrcShared = origin_pool;
+}
+
+UT_TEST(test_root_certificate_notice_current_refusal_and_error_keep_original_custody_and_cleanup)
+{
+	for (unsigned fault = 0; fault < 10; fault++) {
+		ClusterCtrcReceiptHandle root;
+		ClusterCtrcSharedHeader *origin_pool;
+		ClusterCtrcParticipantEntry before, expected;
+		ClusterCtrcReceipt receipt;
+		ClusterICEnvelope env = {0};
+		uint8 request[CLUSTER_CTRC_SEAL_REQUEST_BYTES];
+		volatile bool caught = false;
+
+		UT_ASSERT(root_notice_setup(&root, &origin_pool));
+		before = *root.participant; receipt = *root.receipt;
+		UT_ASSERT(cluster_ctrc_seal_request_encode(&root.key, 18009,
+			root.participant->grant_generation, 41, root.participant->identity.capability_record_generation,
+			CTRC_SEAL_CERTIFICATE_COMMITTED, request, sizeof(request)));
+		close_source_generation = dispatch_peer_connection_generation = 29;
+		close_expected_destination = root.key.origin_node_id;
+		env.msg_type = PGRAC_IC_MSG_GCS_BLOCK_FORWARD;
+		env.source_node_id = root.key.origin_node_id;
+		env.dest_node_id = root.participant->identity.node_id;
+		env.epoch = root.key.cluster_epoch; env.payload_length = sizeof(request);
+		switch (fault) {
+			case 0: data_plane = false; break;
+			case 1: dispatch_excluded_member = 0; break;
+			case 2: dispatch_observed_boot_delta = 1; break;
+			case 3: dispatch_self_boot++; break;
+			case 4: fence_ok = false; break;
+			case 5: root_exact = false; break;
+			case 6: fail_recheck = rechecks + 1; break;
+			case 7: dispatch_peer_connection_generation = 31; break;
+			case 8: throw_resolve = resolves + 1; break;
+			case 9: wakeup_hook = throw_from_participant_wakeup; break;
+		}
+		PG_TRY();
+		{
+			(void)gcs_block_try_ctrc_forward136(&env, request);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		wakeup_hook = NULL;
+		UT_ASSERT_EQ(caught, fault >= 8);
+		expected = before;
+		if (fault == 9) expected.root_certificate_request_id = 18009;
+		UT_ASSERT(memcmp(root.participant, &expected, sizeof(expected)) == 0);
+		UT_ASSERT(memcmp(root.receipt, &receipt, sizeof(receipt)) == 0);
+		UT_ASSERT_EQ(enters, leaves); UT_ASSERT_EQ(held_count, 0); UT_ASSERT_EQ(allocated, 0);
+		CtrcShared = origin_pool;
+	}
+}
+
+UT_TEST(test_original_local_certificate_single_and_batch_retain_root_notice)
+{
+	for (unsigned batch = 0; batch < 2; batch++) {
+		ClusterCtrcOriginEntry *origin;
+		ClusterCtrcReceiptHandle root, receipt;
+		ClusterCtrcParticipantIdentity child;
+		ClusterCtrcPublicationIdV1 publication;
+		ClusterCtrcTargetV1 target, pending;
+		ClusterCtrcDelegationCloseV1 request;
+		ClusterCtrcCloseDispatch dispatch = {0};
+		ClusterCtrcLocalReleaseAckV1 ignored;
+		ClusterCtrcParticipantEntry before;
+		ClusterCtrcOriginCertificateSnapshot snapshot;
+		ClusterCtrcSharedHeader *root_pool;
+		ClusterItlSlotData slot = {0};
+		uint8 original[144], path[CLUSTER_CTRC_DELEGATION_V2_MAX_BYTES];
+		uint8 reply[GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE];
+		Size length;
+		uint16 reason;
+
+		free(root_certificate_source_pool);
+		root_certificate_source_pool = NULL;
+		free(subtree_leaf_pool); subtree_leaf_pool = NULL;
+		fixture_declared_nodes = 4;
+		reset_dispatch_fixture();
+		origin = seed_origin(0, 1);
+		cluster_node_id = 0;
+		UT_ASSERT(cluster_ctrc_origin_fullxid_capture_v2(&origin->key, &origin->touched[0],
+			origin->grant_generation, original));
+		fixture_receipt_inputs(origin, 1001, &publication, &target);
+		UT_ASSERT_EQ(cluster_ctrc_receipt_prepare_origin_v2(&origin->key, &origin->touched[0],
+			origin->grant_generation, &publication, &target, original, sizeof(original), &root),
+			CLUSTER_CTRC_PREPARE_READY);
+		child = origin->touched[0]; child.node_id = 2; child.boot_incarnation = 1103;
+		UT_ASSERT(close_test_pending_child(root.participant, &child, path, &length));
+		UT_ASSERT(cluster_ctrc_receipt_cancel_shared(&root));
+		UT_ASSERT(cluster_ctrc_origin_arm_close_entry(origin, 0, 17009));
+		UT_ASSERT_EQ(cluster_ctrc_participant_request_shared(&root.key, &root.participant->identity,
+			root.participant->grant_generation, 41, CTRC_SEAL_CLOSE_AND_CLEAN, &reason, &ignored),
+			CTRC_SEAL_REPLY_PENDING_DRAIN);
+		UT_ASSERT(cluster_ctrc_cleaner_bind_worker(0));
+		UT_ASSERT(cluster_ctrc_participant_next_delegated_close_shared(&request));
+		root_pool = CtrcShared;
+		CtrcShared = NULL;
+		cluster_ctrc_shmem_init(); subtree_leaf_pool = CtrcShared;
+		cluster_node_id = 2;
+		slot.xid = root.key.xid; slot.wrap = 3; slot.flags = ITL_FLAG_ACTIVE;
+		slot.undo_segment_head = uba_encode(root.key.segment_id, 9, root.key.slot_offset, 8);
+		image_pending_target(&pending);
+		UT_ASSERT_EQ(cluster_ctrc_itl_image_prepare_v2(&slot, &root.participant->identity, &child,
+			path, length, &pending, &receipt), CLUSTER_CTRC_PREPARE_READY);
+		UT_ASSERT(cluster_ctrc_receipt_cancel_shared(&receipt));
+		UT_ASSERT(subtree_send_close(&request));
+		UT_ASSERT_EQ(ctrc_participant_freeze_ack_batch_shared(1), 1);
+		UT_ASSERT(subtree_send_close(&request));
+		memcpy(reply, close_reply, sizeof(reply));
+		CtrcShared = root_pool; cluster_node_id = 0; dispatch_self_boot = 1101;
+		UT_ASSERT(close_merge_land(reply));
+		UT_ASSERT_EQ(ctrc_participant_freeze_ack_batch_shared(1), 1);
+		before = *root.participant;
+		dispatch.key = root.key; dispatch.participant = root.participant->identity;
+		dispatch.request_id = 17009; dispatch.grant_generation = root.participant->grant_generation;
+		dispatch.seal_generation = 41; dispatch.suboperation = CTRC_SEAL_CLOSE_AND_CLEAN;
+		if (batch)
+			cluster_gcs_ctrc_dispatch_batch(&dispatch, 1);
+		else
+			UT_ASSERT(cluster_gcs_ctrc_dispatch_close(&dispatch));
+		UT_ASSERT_EQ(origin->ack_bitmap, 1);
+		UT_ASSERT_EQ(origin->root_subtree_ack_bitmap, 1);
+		UT_ASSERT_EQ(origin->root_subtree_acks[0].subtree_bitmap, 5);
+		UT_ASSERT(memcmp(root.participant, &before, sizeof(before)) == 0);
+		UT_ASSERT(!ctrc_origin_dispatchable_locked(origin));
+		UT_ASSERT(ctrc_origin_certificate_snapshot_index_locked(0, &snapshot));
+		UT_ASSERT(cluster_ctrc_origin_certificate_commit_entry(origin, &snapshot));
+		UT_ASSERT(cluster_ctrc_origin_arm_certificate_entry(origin, 0, 18009));
+		dispatch.request_id = 18009;
+		dispatch.suboperation = CTRC_SEAL_CERTIFICATE_COMMITTED;
+		before = *root.participant;
+		if (batch)
+			cluster_gcs_ctrc_dispatch_batch(&dispatch, 1);
+		else
+			UT_ASSERT(!cluster_gcs_ctrc_dispatch_close(&dispatch));
+		before.root_certificate_request_id = 18009;
+		UT_ASSERT(memcmp(root.participant, &before, sizeof(before)) == 0);
+		UT_ASSERT_EQ(root.receipt->state, CTRC_RECEIPT_ACK_FROZEN);
+		UT_ASSERT_EQ(origin->state, CTRC_ORIGIN_RELEASE_PROVEN);
+		UT_ASSERT_EQ(origin->close_confirmed_bitmap, 0);
+		UT_ASSERT_EQ(enters, leaves);
+		UT_ASSERT_EQ(held_count, 0);
+		UT_ASSERT_EQ(allocated, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(56);
+	UT_PLAN(62);
 	UT_RUN(test_actual_delegated_close_enters_drain_and_retains_parent);
 	UT_RUN(test_actual_delegated_close_malformed_is_consumed_without_mutation);
 	UT_RUN(test_delegated_close_codec_is_explicit_and_roundtrips_all_binding_fields);
@@ -2799,6 +3182,12 @@ main(void)
 	UT_RUN(test_root_proof_connection_generation_is_not_the_original_open_identity);
 	UT_RUN(test_normal_stop_retains_root_proof_and_rejects_corrupt_suffix);
 	UT_RUN(test_original_local_root_single_and_batch_dispatch_bind_the_complete_subtree);
+	UT_RUN(test_original_certificate_notice_waits_for_retained_root_children);
+	UT_RUN(test_root_certificate_notice_retry_is_immutable_and_not_retirement);
+	UT_RUN(test_root_certificate_notice_rejects_incomplete_or_conflicting_custody_without_mutation);
+	UT_RUN(test_root_certificate_pending_reply_preserves_original_negative_and_positive_domains);
+	UT_RUN(test_root_certificate_notice_current_refusal_and_error_keep_original_custody_and_cleanup);
+	UT_RUN(test_original_local_certificate_single_and_batch_retain_root_notice);
 	free(root_certificate_source_pool);
 	free(subtree_leaf_pool);
 	free(CtrcShared);

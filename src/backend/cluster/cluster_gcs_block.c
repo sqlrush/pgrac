@@ -19407,10 +19407,13 @@ cluster_gcs_ctrc_dispatch_close(const ClusterCtrcCloseDispatch *dispatch)
 				uint16 first_reason = CTRC_SEAL_REASON_IDENTITY;
 
 				MemSet(&ack, 0, sizeof(ack));
-				result = cluster_ctrc_participant_request_shared(
-					&dispatch->key, &dispatch->participant, dispatch->grant_generation,
-					dispatch->seal_generation, (ClusterCtrcSealSuboperation)dispatch->suboperation,
-					&first_reason, &ack);
+				if (dispatch->suboperation == CTRC_SEAL_CERTIFICATE_COMMITTED)
+					result = cluster_ctrc_participant_certificate_request_shared(dispatch, &first_reason);
+				else
+					result = cluster_ctrc_participant_request_shared(
+						&dispatch->key, &dispatch->participant, dispatch->grant_generation,
+						dispatch->seal_generation, (ClusterCtrcSealSuboperation)dispatch->suboperation,
+						&first_reason, &ack);
 				if (cluster_semantic_activation_recheck_r4_terminal_census(&admission)) {
 					if (dispatch->suboperation == CTRC_SEAL_CERTIFICATE_COMMITTED)
 						dispatched = cluster_ctrc_origin_note_certificate_reply_shared(
@@ -20596,9 +20599,20 @@ gcs_block_try_ctrc_forward136(const ClusterICEnvelope *env, const void *payload)
 						}
 					}
 				} else {
-					result = cluster_ctrc_participant_request_shared(
-						&key, &identity, request.grant_generation, request.seal_generation,
-						(ClusterCtrcSealSuboperation)request.suboperation, &first_reason, &ack);
+					if (request.suboperation == CTRC_SEAL_CERTIFICATE_COMMITTED) {
+						ClusterCtrcCloseDispatch notice = { 0 };
+
+						notice.key = key;
+						notice.participant = identity;
+						notice.request_id = request.request_id;
+						notice.grant_generation = request.grant_generation;
+						notice.seal_generation = request.seal_generation;
+						notice.suboperation = CTRC_SEAL_CERTIFICATE_COMMITTED;
+						result = cluster_ctrc_participant_certificate_request_shared(&notice, &first_reason);
+					} else
+						result = cluster_ctrc_participant_request_shared(
+							&key, &identity, request.grant_generation, request.seal_generation,
+							(ClusterCtrcSealSuboperation)request.suboperation, &first_reason, &ack);
 					if (result == CTRC_SEAL_REPLY_PENDING_DRAIN
 						&& request.suboperation == CTRC_SEAL_CLOSE_AND_CLEAN
 						&& cluster_ctrc_participant_root_subtree_ack_shared(&key, &identity,

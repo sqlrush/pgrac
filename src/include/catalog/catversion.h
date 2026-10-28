@@ -727,7 +727,8 @@
 /* Parent-retained local delegated ACK proofs; fresh homogeneous clusters only. */
 /* Retained child subtree proofs change participant stride; fresh clusters only. */
 /* Explicit root subtree ACKs change volatile origin stride; fresh clusters only. */
-#define CATALOG_VERSION_NO 202610283
+/* Retained root certificate notice changes participant stride; fresh only. */
+#define CATALOG_VERSION_NO 202610284
 
 /* spec-5.13 (2026-06-27): clean-leave catalog surface — cluster_get_clean_leave_state
  * SRF (oid 8960) + pg_cluster_clean_leave_state view + pg_cluster_clean_leave_request

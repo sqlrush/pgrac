@@ -86,7 +86,7 @@
 #endif
 
 #define CLUSTER_CTRC_SHMEM_MAGIC UINT32_C(0x43545243)
-#define CLUSTER_CTRC_SHMEM_VERSION UINT32_C(20)
+#define CLUSTER_CTRC_SHMEM_VERSION UINT32_C(21)
 #ifndef CLUSTER_CTRC_TEST_TABLE_VISIT
 #define CLUSTER_CTRC_TEST_TABLE_VISIT(kind) ((void)0)
 #endif
@@ -456,7 +456,13 @@ ctrc_participant_delegations_valid(const ClusterCtrcParticipantEntry *participan
 	const ClusterCtrcDelegationCustodyV1 *parent = &participant->delegation_parent;
 	FullTransactionId original;
 
-	if (participant->identity.node_id >= CLUSTER_CTRC_MAX_PARTICIPANTS
+	if (participant->root_certificate_request_id == UINT64_MAX
+		|| (participant->root_certificate_request_id != 0
+			&& (participant->state != CTRC_PARTICIPANT_CLOSED_DRAINING
+				|| participant->delegation_count == 0
+				|| !ctrc_bytes_zero(parent, sizeof(*parent))
+				|| !ctrc_bytes_zero(&participant->delegation_path, sizeof(participant->delegation_path))))
+		|| participant->identity.node_id >= CLUSTER_CTRC_MAX_PARTICIPANTS
 		|| participant->key.origin_node_id >= CLUSTER_CTRC_MAX_PARTICIPANTS
 		|| (participant->delegation_ack_bitmap >> CLUSTER_CTRC_MAX_PARTICIPANTS) != 0)
 		return false;
@@ -528,7 +534,8 @@ ctrc_participant_delegations_valid(const ClusterCtrcParticipantEntry *participan
 				&& participant->delegation_close_request_id[node]
 					== participant->delegation_close_request_id[prior])
 				return false;
-		if (!ctrc_participant_identity_valid(&participant->key, &entry->receiver)
+		if ((participant->root_certificate_request_id != 0 && !acknowledged)
+			|| !ctrc_participant_identity_valid(&participant->key, &entry->receiver)
 			|| entry->receiver.node_id != node || node == participant->identity.node_id
 			|| node == participant->key.origin_node_id || entry->sequence == 0
 			|| entry->sequence > participant->last_delegation_sequence)
@@ -1171,8 +1178,8 @@ ctrc_reply_result_valid(ClusterCtrcSealReplyResult result, uint8 suboperation, u
 		return suboperation == CTRC_SEAL_CLOSE_AND_CLEAN && first_reason == 0 && ack != NULL;
 	if (result == CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED)
 		return suboperation == CTRC_SEAL_CERTIFICATE_COMMITTED && first_reason == 0 && ack == NULL;
-	if (result == CTRC_SEAL_REPLY_PENDING_DRAIN && suboperation != CTRC_SEAL_CLOSE_AND_CLEAN)
-		return false;
+	/* An origin certificate can be retained pending child propagation.
+	 * This negative reply never carries an ACK or confirms retirement. */
 	return first_reason != 0 && ack == NULL;
 }
 
@@ -8460,6 +8467,31 @@ cluster_ctrc_participant_root_subtree_ack_shared(const ClusterCtrcTxnKeyV1 *key,
 #endif
 }
 
+#ifndef CLUSTER_CTRC_UNIT_TEST
+/* Caller holds the original participant shard and receipt lock. A notice
+ * records custody for later downward propagation, without reclaiming anything. */
+static bool
+ctrc_root_certificate_notice_locked(uint64 index, const ClusterCtrcCloseDispatch *dispatch,
+	bool *progressed)
+{
+	ClusterCtrcParticipantEntry *participant = &ctrc_participant_entries()[index];
+
+	*progressed = false;
+	if (dispatch->suboperation != CTRC_SEAL_CERTIFICATE_COMMITTED
+		|| dispatch->request_id == 0 || dispatch->request_id == UINT64_MAX
+		|| dispatch->reserved32 != 0
+		|| !ctrc_bytes_zero(dispatch->reserved8, sizeof(dispatch->reserved8))
+		|| !ctrc_root_local_ack_exact_locked(index, &dispatch->key, &dispatch->participant,
+			dispatch->grant_generation, dispatch->seal_generation)
+		|| (participant->root_certificate_request_id != 0
+			&& participant->root_certificate_request_id != dispatch->request_id))
+		return false;
+	*progressed = participant->root_certificate_request_id == 0;
+	participant->root_certificate_request_id = dispatch->request_id;
+	return true;
+}
+#endif
+
 bool
 cluster_ctrc_origin_ack_land_entry(ClusterCtrcOriginEntry *origin, uint64 request_id,
 								   const ClusterCtrcLocalReleaseAckV1 *ack,
@@ -8898,6 +8930,7 @@ ctrc_participant_certificate_batch_apply_shared(const ClusterCtrcCloseDispatch *
 	uint64 work_indices[CLUSTER_CTRC_RECLAIM_BATCH_MAX];
 	Size work_to_request[CLUSTER_CTRC_RECLAIM_BATCH_MAX];
 	bool block[CLUSTER_CTRC_RECLAIM_BATCH_MAX] = { false };
+	bool root_progress[CLUSTER_CTRC_RECLAIM_BATCH_MAX] = { false };
 	Size work_count = 0;
 	uint32 lock_mask = 0;
 
@@ -8942,6 +8975,11 @@ ctrc_participant_certificate_batch_apply_shared(const ClusterCtrcCloseDispatch *
 			&after, &summary_after, &dispatches[i].key, &dispatches[i].participant,
 			dispatches[i].grant_generation, dispatches[i].seal_generation,
 			CTRC_SEAL_CERTIFICATE_COMMITTED, &reason, &ack);
+		if (results[i] == CTRC_SEAL_REPLY_BLOCKED_RETAIN
+			&& ctrc_root_certificate_notice_locked(indices[i], &dispatches[i], &root_progress[i])) {
+			results[i] = CTRC_SEAL_REPLY_PENDING_DRAIN;
+			reason = CTRC_SEAL_REASON_CLEANOUT;
+		}
 		if (reasons != NULL)
 			reasons[i] = reason;
 		if (results[i] != CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED)
@@ -8980,11 +9018,14 @@ ctrc_participant_certificate_batch_apply_shared(const ClusterCtrcCloseDispatch *
 		}
 	LWLockRelease(&CtrcShared->receipt_lock);
 	ctrc_participant_locks_release(lock_mask);
-	for (Size i = 0; i < count; i++)
-		if (results[i] == CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED)
+	for (Size i = 0; i < count; i++) {
+		if (results[i] == CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED || root_progress[i])
 			ctrc_semantic_progress(true);
-		else
+		if (results[i] == CTRC_SEAL_REPLY_PENDING_DRAIN)
+			cluster_ctrc_cleaner_reason_set(CTRC_CLEANER_REASON_PAGE_REVALIDATE);
+		else if (results[i] != CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED)
 			cluster_ctrc_cleaner_reason_set(CTRC_CLEANER_REASON_BLOCKED);
+	}
 	return true;
 #else
 	(void)dispatches;
@@ -8993,6 +9034,20 @@ ctrc_participant_certificate_batch_apply_shared(const ClusterCtrcCloseDispatch *
 	(void)reasons;
 	return false;
 #endif
+}
+
+ClusterCtrcSealReplyResult
+cluster_ctrc_participant_certificate_request_shared(const ClusterCtrcCloseDispatch *dispatch,
+	uint16 *first_reason)
+{
+	ClusterCtrcSealReplyResult result = CTRC_SEAL_REPLY_DENIED;
+
+	if (first_reason != NULL)
+		*first_reason = CTRC_SEAL_REASON_MALFORMED;
+	if (first_reason == NULL
+		|| !ctrc_participant_certificate_batch_apply_shared(dispatch, 1, &result, first_reason))
+		return CTRC_SEAL_REPLY_DENIED;
+	return result;
 }
 
 bool

@@ -232,7 +232,7 @@ SCAN_RULES: Tuple[ScanRule, ...] = (
             "src/backend/cluster/cluster_gcs_block.c",
             "src/backend/cluster/cluster_terminal_ref_census.c",
         ),
-        r"\bcluster_ctrc_(?:seal_request_(?:encode|decode)|seal_reply_(?:encode|decode)|root_ack_reply_(?:encode|decode)|delegated_ack_reply_(?:encode|decode)|delegation_close_(?:encode|decode)_v1|participant_(?:request_shared|delegated_close_shared|delegated_local_ack_shared|delegated_subtree_ack_shared|root_subtree_ack_shared|delegated_ack_land_shared|next_delegated_close_shared|delegated_close_matches_shared|delegated_close_snapshot_shared|delegation_merge_(?:observed|land)_shared)|origin_(?:ack_land_shared|root_ack_land_shared))\s*\(",
+        r"\b(?:cluster_ctrc_(?:seal_request_(?:encode|decode)|seal_reply_(?:encode|decode)|root_ack_reply_(?:encode|decode)|delegated_ack_reply_(?:encode|decode)|delegation_close_(?:encode|decode)_v1|participant_(?:request_shared|certificate_request_shared|certificate_batch_shared|delegated_close_shared|delegated_local_ack_shared|delegated_subtree_ack_shared|root_subtree_ack_shared|delegated_ack_land_shared|next_delegated_close_shared|delegated_close_matches_shared|delegated_close_snapshot_shared|delegation_merge_(?:observed|land)_shared)|origin_(?:ack_land_shared|root_ack_land_shared))|ctrc_root_certificate_notice_locked|ctrc_participant_certificate_batch_apply_shared|ctrc_root_local_ack_exact_locked)\s*\(",
     ),
     ScanRule(
         "CTRC_RELATION_GATE",
@@ -405,6 +405,35 @@ _classify_owners(
     "ALL_CTRC_TARGET_KINDS",
     "NO_SUCCESSOR_ON_CLOSE",
     "cluster_ctrc_origin_root_ack_land_shared|RETAIN_CUSTODY_UNTIL_CERTIFICATE",
+    "MXA-T24",
+)
+
+
+# A retained certificate notice is negative custody, not child retirement.
+# The original shared batch still owns ordinary flat receipt reclamation.
+_classify_owners(
+    "CTRC_CLOSE_WIRE",
+    "src/backend/cluster/cluster_terminal_ref_census.c",
+    ("cluster_ctrc_participant_certificate_request_shared",
+     "cluster_ctrc_participant_certificate_batch_shared",
+     "ctrc_participant_certificate_batch_apply_shared",
+     "ctrc_root_certificate_notice_locked", "ctrc_root_local_ack_exact_locked"),
+    "REGISTERED_REFERENCE",
+    "ALL_CTRC_REFERENCE_KINDS",
+    "ALL_CTRC_TARGET_KINDS",
+    "NO_REFERENCE_TRANSFER_REQUIRED",
+    "RETAIN_CUSTODY_UNTIL_DESCENDANT_CERTIFICATE_COMPLETION",
+    "MXA-T24",
+)
+_classify_owners(
+    "CTRC_CLOSE_WIRE",
+    "src/backend/cluster/cluster_gcs_block.c",
+    ("gcs_ctrc_dispatch_local_certificates",),
+    "TERMINAL_PROJECTION_DISCHARGE",
+    "ALL_CTRC_REFERENCE_KINDS",
+    "ALL_CTRC_TARGET_KINDS",
+    "NO_SUCCESSOR_ON_CLOSE",
+    "ctrc_participant_certificate_batch_apply_shared|RETAIN_SUBTREE_NOTICE_PENDING",
     "MXA-T24",
 )
 
