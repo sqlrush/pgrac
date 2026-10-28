@@ -1024,12 +1024,8 @@ ctrc_native_step_execute(CtrcNativeStepV1 *context, RfPageCtrcAuthorityV1 *autho
 		context->original_space, blockno, context->original_before,
 		context->original_physical, count, memory_budget, context, &context->images);
 	if (!prepared.ready || !ctrc_native_step_current(context)) return;
-	if (!prepared.rewritten) {
-		if (!context->sync_unchanged) result->phase = RF_PAGE_CTRC_STEP_UNCHANGED;
-		else if (ctrc_native_step_sync_unchanged(context, authority, blockno))
-			result->phase = RF_PAGE_CTRC_STEP_UNCHANGED_SYNCED;
-		return;
-	}
+	/* Unchanged sync also precedes Startup progress. Resolve the same native
+	 * cache duties first and keep absence under the original current gates. */
 	if (context->sync_unchanged) {
 		ClusterCtrcPageCacheResultV1 cache = cluster_bufmgr_ctrc_page_cache_v1(context->start,
 			context->work, authority, context->original_space, blockno, context->original_before,
@@ -1038,6 +1034,12 @@ ctrc_native_step_execute(CtrcNativeStepV1 *context, RfPageCtrcAuthorityV1 *autho
 		if (cache != CLUSTER_CTRC_PAGE_CACHE_ABSENT) return;
 		context->cache_authority = authority; context->cache_block = blockno;
 		context->cache_retired = true;
+	}
+	if (!prepared.rewritten) {
+		if (!context->sync_unchanged) result->phase = RF_PAGE_CTRC_STEP_UNCHANGED;
+		else if (ctrc_native_step_sync_unchanged(context, authority, blockno))
+			result->phase = RF_PAGE_CTRC_STEP_UNCHANGED_SYNCED;
+		return;
 	}
 	if (!rf_page_authority_ctrc_replays_unpromote_v1(authority)
 		|| !ctrc_native_step_current(context))

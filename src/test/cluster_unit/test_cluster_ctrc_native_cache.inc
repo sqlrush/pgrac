@@ -32,7 +32,8 @@ cluster_bufmgr_ctrc_page_cache_v1(const struct ClusterRecoveryStartV1 *start,
 	} else {
 		native_cache_observations++;
 		if ((native_cache_reappear == 1 && native_insert_records != 0)
-			|| (native_cache_reappear == 2 && native_install_syncs != 0))
+			|| (native_cache_reappear == 2 && native_install_syncs != 0)
+			|| (native_cache_reappear == 3 && ctrc_read_native_reads >= 10))
 			native_cache_present = true;
 	}
 	return native_cache_present ? CLUSTER_CTRC_PAGE_CACHE_WAIT : CLUSTER_CTRC_PAGE_CACHE_ABSENT;
@@ -114,8 +115,8 @@ UT_TEST(test_native_cache_noop_keeps_matching_cache_and_old_components)
 	native_unchanged_fixture(&f, 0, &terminal);
 	native_cache_active = native_cache_present = true;
 	native_cache_retire_calls = native_cache_observations = 0;
-	result = native_unchanged_step(&f, &terminal, 1024 * 1024);
-	UT_ASSERT_EQ(result.phase, RF_PAGE_CTRC_STEP_UNCHANGED_SYNCED);
+	result = native_graph_step(&f, &terminal);
+	UT_ASSERT_EQ(result.phase, RF_PAGE_CTRC_STEP_UNCHANGED);
 	UT_ASSERT(native_cache_present); UT_ASSERT_EQ(native_cache_retire_calls + native_cache_observations, 0);
 	native_cache_finish(&f);
 	native_cache_fixture(&f, 0);

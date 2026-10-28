@@ -194,8 +194,9 @@ extern RfPageCtrcStepResultV1 rf_page_recovery_ctrc_replays_itl_graph_durable_sm
  * compare every byte with preparation. Only UNCHANGED_SYNCED reports this
  * local completion; the older entries still return observation-only UNCHANGED.
  * No FPI, WAL or write is produced for an unchanged page. Rewritten pages use
- * the original FPI_DURABLE branch. Before dropping preparation PAGE, rewritten
- * pages retire only an exact clean, unpinned native CURRENT/N predecessor via
+ * the original FPI_DURABLE branch. Both unchanged and rewritten pages check
+ * original native cache responsibilities under preparation PAGE. Retire only
+ * an exact clean, unpinned native CURRENT/N predecessor via
  * the original bufmgr invalidation; dirty/first/PCM/PI/CR/CF owners are retained.
  * Native cache contention also returns WAIT before insertion. Once absent,
  * check that local observation at the existing current gates, including the

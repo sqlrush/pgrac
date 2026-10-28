@@ -461,6 +461,7 @@ bool native_install_original_writer_installed(ClusterWalWriterToken *writer,
 #include "test_cluster_ctrc_native_writer_retention.inc"
 #include "test_cluster_ctrc_native_unchanged_sync.inc"
 #include "test_cluster_ctrc_native_cache.inc"
+#include "test_cluster_ctrc_native_unchanged_cache.inc"
 
 int
 main(int argc, char **argv)
@@ -469,6 +470,17 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_NATIVE_UNCHANGED_CACHE") != NULL) {
+		UT_PLAN(6);
+		UT_RUN(test_native_unchanged_cache_retires_only_through_original_page_gate);
+		UT_RUN(test_native_unchanged_cache_busy_waits_before_sync_without_retiring_duties);
+		UT_RUN(test_native_unchanged_cache_refusal_never_reports_synced);
+		UT_RUN(test_native_unchanged_cache_error_closes_only_private_storage);
+		UT_RUN(test_native_unchanged_cache_reappearance_refuses_after_sync_or_full_postread);
+		UT_RUN(test_native_unchanged_cache_preserves_all_observation_only_entries);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+
 	if (getenv("PGRAC_PRE2_TEST_NATIVE_CACHE") != NULL) {
 		UT_PLAN(6);
 		UT_RUN(test_native_cache_retires_exact_predecessor_before_bufferless_fpi);
@@ -524,7 +536,14 @@ main(int argc, char **argv)
 		UT_RUN(test_native_step_fixed_fd_close_failure_cannot_claim_target_synced);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(73);
+	UT_PLAN(79);
+	UT_RUN(test_native_unchanged_cache_retires_only_through_original_page_gate);
+	UT_RUN(test_native_unchanged_cache_busy_waits_before_sync_without_retiring_duties);
+	UT_RUN(test_native_unchanged_cache_refusal_never_reports_synced);
+	UT_RUN(test_native_unchanged_cache_error_closes_only_private_storage);
+	UT_RUN(test_native_unchanged_cache_reappearance_refuses_after_sync_or_full_postread);
+	UT_RUN(test_native_unchanged_cache_preserves_all_observation_only_entries);
+
 	UT_RUN(test_native_cache_retires_exact_predecessor_before_bufferless_fpi);
 	UT_RUN(test_native_cache_busy_waits_without_wal_or_duty_retirement);
 	UT_RUN(test_native_cache_refusal_and_error_keep_original_owners);
