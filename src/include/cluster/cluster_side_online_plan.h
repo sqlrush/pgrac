@@ -207,6 +207,11 @@ extern bool rf_side_online_plan_clog_matches_v1(const RfSideOnlinePlanV1 *plan,
  * No I/O or current-page/birth-era/lifetime/COMPLETE/release authority. */
 extern bool rf_side_online_plan_clog_applied_v1(const RfSideOnlinePlanV1 *plan,
 	const ClusterWalSourceRef *source, const XLogReaderState *reader);
+/* Exact original native redo returned under its source-current bracket.
+ * This is consumption only, not the cold durable-applied observation above,
+ * native file durability, page generation lifetime or completion authority. */
+extern bool rf_side_online_plan_clog_native_consumed_v1(const RfSideOnlinePlanV1 *plan,
+	const ClusterWalSourceRef *source, const XLogReaderState *reader);
 /* UINT32_MAX for an invalid or unsealed plan. */
 extern uint32 rf_side_online_plan_participant_count_v1(const RfSideOnlinePlanV1 *plan);
 /* The physical lower alone must not authorize replay of retained history. */

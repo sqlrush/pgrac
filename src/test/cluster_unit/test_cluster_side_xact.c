@@ -12561,6 +12561,7 @@ UT_TEST(test_cold_terminal_frame_refusal_preserves_pi_inspection)
 #include "test_cluster_side_clog_full.inc"
 #include "test_cluster_side_clog_witness.inc"
 #include "test_cluster_side_clog_applied.inc"
+#include "test_cluster_side_clog_native_consumed.inc"
 #ifdef TEST_CLUSTER_SIDE_NATIVE_CLOG_OWNER
 #include "test_cluster_side_native_clog.inc"
 #endif
@@ -12568,6 +12569,16 @@ UT_TEST(test_cold_terminal_frame_refusal_preserves_pi_inspection)
 int
 main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_NATIVE_CLOG_CONSUMED") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_native_clog_consumed_runs_original_callback_once_without_cold_applied);
+		UT_RUN(test_native_clog_consumed_refuses_wrong_bytes_source_and_missing_callback);
+		UT_RUN(test_native_clog_consumed_false_error_and_postcallback_drift_do_not_retry);
+		UT_RUN(test_native_clog_consumed_cannot_borrow_another_plan_or_cold_success);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
+
 #ifdef TEST_CLUSTER_SIDE_NATIVE_CLOG_OWNER
 	if (getenv("PGRAC_PRE2_TEST_SIDE_NATIVE_CLOG") != NULL) {
 		UT_PLAN(4);
@@ -12607,9 +12618,9 @@ main(void)
 		return ut_failed_count != 0;
 	}
 #ifdef TEST_CLUSTER_SIDE_NATIVE_CLOG_OWNER
-	UT_PLAN(205);
+	UT_PLAN(209);
 #else
-	UT_PLAN(201);
+	UT_PLAN(205);
 #endif
 	UT_RUN(test_clog_witness_keeps_complete_native_bytes_after_reader_reuse);
 	UT_RUN(test_clog_witness_refuses_changed_full_header_payload_and_source);
@@ -12819,6 +12830,10 @@ main(void)
 	UT_RUN(test_side_native_clog_postwrite_drift_blocks_projection);
 	UT_RUN(test_side_native_clog_final_owner_blocks_applied);
 #endif
+	UT_RUN(test_native_clog_consumed_runs_original_callback_once_without_cold_applied);
+	UT_RUN(test_native_clog_consumed_refuses_wrong_bytes_source_and_missing_callback);
+	UT_RUN(test_native_clog_consumed_false_error_and_postcallback_drift_do_not_retry);
+	UT_RUN(test_native_clog_consumed_cannot_borrow_another_plan_or_cold_success);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
