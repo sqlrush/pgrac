@@ -49,7 +49,7 @@ returned_fpi_retained(bool refused)
 {
  const ClusterColdCtrcPageProgressV1 *progress = cluster_recovery_cold_start->ctrc_page_progress;
  ClusterThreadReplaySlot *slot = cluster_thread_recovery_replay_slot(prefix_window.key.target_thread);
- UT_ASSERT_EQ(returned_fpi_cleanup_calls, 1);
+ UT_ASSERT_EQ(returned_fpi_cleanup_calls, 1 + pending_readback_calls);
  UT_ASSERT(returned_fpi_cleanup_pending);
  UT_ASSERT(progress->pending && prefix_window.key.window_seq != 0);
  UT_ASSERT(memcmp(&progress->result, &returned_fpi_cleanup_result, sizeof(progress->result)) == 0);

@@ -236,5 +236,25 @@ extern RfPageCtrcHeldStepV1 rf_page_recovery_ctrc_replays_itl_graph_hold_smgr_v1
 	BlockNumber blockno, const RfPageVersionV1 *expected_before, const char canonical[BLCKSZ],
 	const struct ClusterRecoveryUndoEntry *physical, Size physical_count, Size memory_budget);
 
+/* Read back an original pending DURABLE operation using its SAME held raw
+ * MAIN/SPACE descriptors. Enter with its unpromoted one-target PAGE object
+ * and zero caller LWLocks. Freeze the full work/source/operation and describe
+ * the frame before PAGE promotion; memory_budget bounds the work snapshot.
+ * Recheck original accepted TX, installed writer, complete F4/protection and
+ * actual flush/timeline, then five-read SPACE/MAIN and require every canonical
+ * result byte, including actual writer LSN/origin/checksum. Before/third
+ * versions refuse; no WAL, write, sync, reopen or buffer invalidation occurs.
+ * PAGE/cache collision returns WOULD_BLOCK without failing the window. Late
+ * refusal/ERROR retains original storage and owners; an entered read failure
+ * marks only the exact still-owned window failed. Caller destroys PAGE on
+ * every exit, and retains original storage cleanup on normal/ERROR paths.
+ * OK is a protected readback only, never first/pin/companion discharge,
+ * window clear, retention release or independent/joint COMPLETE/OPEN. */
+extern RfPageProofDetailV1 rf_page_recovery_ctrc_replays_fpi_readback_v1(
+	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work,
+	const struct ClusterRecoveryCtrcReplaySetSourceV1 *source, RfPageCtrcAuthorityV1 *authority,
+	const RfPageCtrcFpiInsertV1 *inserted, struct ClusterSharedFsPageV1 *storage,
+	Size subject_count, Size memory_budget);
+
 #endif /* USE_PGRAC_CLUSTER */
 #endif /* CLUSTER_PAGE_INSTALL_CTRC_H */

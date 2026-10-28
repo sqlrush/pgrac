@@ -35,7 +35,11 @@ pending_window_debt_unchanged(const RfPageCtrcStepResultV1 *saved)
  UT_ASSERT(progress != NULL && progress->pending);
  UT_ASSERT(memcmp(saved, &progress->result, sizeof(*saved)) == 0);
  UT_ASSERT_EQ(progress->next_target, 0); UT_ASSERT_EQ(prefix_steps, 1);
- UT_ASSERT_EQ(prefix_destroyed, 2);
+ /* Every repeat may prepare another local readback PAGE/proof, but all of
+  * them are destroyed without releasing the borrowed recovery protections. */
+ UT_ASSERT_EQ(prefix_proofs, 1 + pending_readback_calls);
+ UT_ASSERT_EQ(prefix_pages, 1 + pending_readback_calls);
+ UT_ASSERT_EQ(prefix_destroyed, prefix_proofs + prefix_pages);
  UT_ASSERT_EQ(observation_scope_releases + observation_census_destroys, 0);
  UT_ASSERT_EQ(window_region.checkpoint_owner.ctrc_accepted_generation, 0);
  UT_ASSERT(info.cluster_cold_inputs != NULL && info.cluster_tx_start != NULL);

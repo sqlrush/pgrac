@@ -91,6 +91,14 @@ failed:
 }
 
 bool
+cluster_shared_fs_page_matches_v1(ClusterSharedFsPageV1 *target,
+	RelFileLocator locator, BlockNumber block)
+{
+	return target != NULL && RelFileLocatorEquals(target->locator, locator)
+		&& target->block == block && cluster_shared_fs_page_current_v1(target);
+}
+
+bool
 cluster_shared_fs_page_close_v1(ClusterSharedFsPageV1 *target)
 {
 	int saved_errno = errno;

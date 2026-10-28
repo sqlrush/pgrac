@@ -2328,9 +2328,20 @@ UT_TEST(test_relmap_failure_revokes_original_episode_without_free_or_release)
 #include "test_cluster_cold_ctrc_pending_window.inc"
 #include "test_cluster_cold_ctrc_returned_fpi.inc"
 #include "test_cluster_cold_ctrc_pending_storage.inc"
+#include "test_cluster_cold_ctrc_pending_readback.inc"
 
 int main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_STARTUP_PENDING_READBACK") != NULL) {
+		UT_PLAN(6);
+		UT_RUN(test_startup_pending_readback_uses_saved_operation_before_service);
+		UT_RUN(test_startup_pending_readback_refusal_retains_fd_window_and_graph);
+		UT_RUN(test_startup_pending_readback_collision_retries_without_reinserting);
+		UT_RUN(test_startup_pending_readback_error_retains_original_cleanup_duty);
+		UT_RUN(test_startup_pending_readback_cleanup_cannot_change_saved_operation);
+		UT_RUN(test_startup_pending_readback_repeats_protection_without_new_operation);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_STARTUP_PENDING_STORAGE") != NULL) {
 		UT_PLAN(7);
 		UT_RUN(test_startup_pending_storage_is_saved_before_page_cleanup);
@@ -2448,7 +2459,14 @@ int main(void)
 		UT_RUN(test_ctrc_pages_native_error_retires_cursor_before_original_scope);
 		reset(); UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(193);
+	UT_PLAN(199);
+	UT_RUN(test_startup_pending_readback_uses_saved_operation_before_service);
+	UT_RUN(test_startup_pending_readback_refusal_retains_fd_window_and_graph);
+	UT_RUN(test_startup_pending_readback_collision_retries_without_reinserting);
+	UT_RUN(test_startup_pending_readback_error_retains_original_cleanup_duty);
+	UT_RUN(test_startup_pending_readback_cleanup_cannot_change_saved_operation);
+	UT_RUN(test_startup_pending_readback_repeats_protection_without_new_operation);
+
 	UT_RUN(test_startup_pending_storage_is_saved_before_page_cleanup);
 	UT_RUN(test_startup_pending_storage_loss_refuses_without_reopening);
 	UT_RUN(test_startup_pending_storage_late_owner_loss_retains_cleanup);
