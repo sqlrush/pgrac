@@ -724,7 +724,8 @@
 /* Per-child stable background CLOSE correlation changes participant stride.
  * Fresh homogeneous clusters only; no in-place upgrade. */
 /* Explicit wire3 MERGED result5 retains the accepted parent/tree; fresh only. */
-#define CATALOG_VERSION_NO 202610280
+/* Parent-retained local delegated ACK proofs; fresh homogeneous clusters only. */
+#define CATALOG_VERSION_NO 202610281
 
 /* spec-5.13 (2026-06-27): clean-leave catalog surface — cluster_get_clean_leave_state
  * SRF (oid 8960) + pg_cluster_clean_leave_state view + pg_cluster_clean_leave_request

@@ -936,6 +936,10 @@ extern bool cluster_ctrc_delegation_close_decode_v1(const uint8 *bytes, Size len
  * parent/children remain registered; this entry cannot return a release ACK. */
 extern ClusterCtrcSealReplyResult cluster_ctrc_participant_delegated_close_shared(
 	const ClusterCtrcDelegationCloseV1 *request, uint16 *first_reason);
+/* Local durable receipt inventory only. Keeps the accepted parent/path and
+ * CLOSED_DRAINING state; cannot authorize an ordinary ACK or certificate. */
+extern bool cluster_ctrc_participant_delegated_local_ack_shared(
+	const ClusterCtrcDelegationCloseV1 *request, ClusterCtrcLocalReleaseAckV1 *local_ack_out);
 /* Read-only observation of an already-qualified OPEN receiver whose immutable
  * original registration has a different parent (or a direct origin grant). */
 extern bool cluster_ctrc_participant_delegation_merge_observed_shared(

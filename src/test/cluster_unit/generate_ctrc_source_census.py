@@ -232,7 +232,7 @@ SCAN_RULES: Tuple[ScanRule, ...] = (
             "src/backend/cluster/cluster_gcs_block.c",
             "src/backend/cluster/cluster_terminal_ref_census.c",
         ),
-        r"\bcluster_ctrc_(?:seal_request_(?:encode|decode)|seal_reply_(?:encode|decode)|delegation_close_(?:encode|decode)_v1|participant_(?:request_shared|delegated_close_shared|next_delegated_close_shared|delegated_close_matches_shared|delegated_close_snapshot_shared|delegation_merge_(?:observed|land)_shared)|origin_ack_land_shared)\s*\(",
+        r"\bcluster_ctrc_(?:seal_request_(?:encode|decode)|seal_reply_(?:encode|decode)|delegation_close_(?:encode|decode)_v1|participant_(?:request_shared|delegated_close_shared|delegated_local_ack_shared|next_delegated_close_shared|delegated_close_matches_shared|delegated_close_snapshot_shared|delegation_merge_(?:observed|land)_shared)|origin_ack_land_shared)\s*\(",
     ),
     ScanRule(
         "CTRC_RELATION_GATE",
@@ -324,6 +324,19 @@ _classify_owners(
     "ALL_CTRC_TARGET_KINDS",
     "NO_SUCCESSOR_ON_CLOSE",
     "cluster_ctrc_participant_request_apply",
+    "MXA-T24",
+)
+# A delegated local receipt proof retains the accepted parent and cannot
+# enter the ordinary ACK/certificate domain or close any subtree edge.
+_classify_owners(
+    "CTRC_CLOSE_WIRE",
+    "src/backend/cluster/cluster_terminal_ref_census.c",
+    ("cluster_ctrc_participant_delegated_local_ack_shared",),
+    "REGISTERED_REFERENCE",
+    "ALL_CTRC_REFERENCE_KINDS",
+    "ALL_CTRC_TARGET_KINDS",
+    "NO_REFERENCE_TRANSFER_REQUIRED",
+    "RETAIN_PARENT_UNTIL_SUBTREE_CLOSE_ACK",
     "MXA-T24",
 )
 # Wire3 MERGED discharges only redundant outgoing pending custody. The

@@ -506,6 +506,32 @@ ctrc_participant_delegations_valid(const ClusterCtrcParticipantEntry *participan
 	return count == participant->delegation_count;
 }
 
+/* Only a closed, qualified leaf can freeze its LOCAL receipt inventory.
+ * The accepted parent/path remains custody, not evidence of subtree release.
+ * Frozen local proofs are deliberately kept out of the ordinary ACK states. */
+static bool pg_attribute_unused()
+ctrc_delegated_local_ack_eligible(const ClusterCtrcParticipantEntry *participant, bool frozen)
+{
+	return participant != NULL && participant->state == CTRC_PARTICIPANT_CLOSED_DRAINING
+		&& ctrc_txn_key_valid(&participant->key)
+		&& ctrc_participant_identity_valid(&participant->key, &participant->identity)
+		&& participant->grant_generation != 0 && participant->seal_generation != 0
+		&& ctrc_bytes_zero(participant->reserved8, sizeof(participant->reserved8))
+		&& !ctrc_bytes_zero(&participant->delegation_parent, sizeof(participant->delegation_parent))
+		&& ctrc_participant_delegations_valid(participant)
+		&& participant->delegation_count == 0 && participant->last_delegation_sequence == 0
+		&& ctrc_bytes_zero(participant->delegations, sizeof(participant->delegations))
+		&& ctrc_bytes_zero(participant->delegation_close_request_id,
+			sizeof(participant->delegation_close_request_id))
+		&& participant->receipt_count != UINT64_MAX
+		&& participant->last_key_sequence == participant->receipt_count
+		&& participant->next_key_sequence == participant->receipt_count + 1
+		&& participant->prepared_count == 0 && participant->applied_count == 0
+		&& participant->cancelled_count <= participant->receipt_count
+		&& participant->cleaned_count == participant->receipt_count - participant->cancelled_count
+		&& participant->ack_frozen_count == (frozen ? participant->receipt_count : 0);
+}
+
 static void
 ctrc_delegation_put_be(uint8 *bytes, uint64 value, unsigned length)
 {
@@ -7763,6 +7789,69 @@ ctrc_frozen_ack_summary_exact(const ClusterCtrcParticipantEntry *participant,
 				  == participant->identity.admission_record_generation;
 }
 
+/* Reuse the local receipt encoding only in a PRIVATE projection. Never
+ * change the shared state or erase its accepted parent to obtain an ACK. */
+static bool pg_attribute_unused()
+ctrc_delegated_local_ack_summary_exact(const ClusterCtrcParticipantEntry *participant,
+	const ClusterCtrcLocalReleaseAckV1 *summary)
+{
+	ClusterCtrcParticipantEntry local;
+
+	if (!ctrc_delegated_local_ack_eligible(participant, true) || summary == NULL
+		|| summary->total_receipt_count != participant->receipt_count
+		|| summary->ack_frozen_count != participant->receipt_count
+		|| summary->cancelled_count != participant->cancelled_count
+		|| summary->cleaned_count != participant->cleaned_count)
+		return false;
+	local = *participant;
+	local.state = CTRC_PARTICIPANT_ACK_FROZEN;
+	MemSet(&local.delegation_parent, 0, sizeof(local.delegation_parent));
+	MemSet(&local.delegation_path, 0, sizeof(local.delegation_path));
+	return ctrc_frozen_ack_summary_exact(&local, summary);
+}
+
+bool
+cluster_ctrc_participant_delegated_local_ack_shared(const ClusterCtrcDelegationCloseV1 *request,
+	ClusterCtrcLocalReleaseAckV1 *local_ack_out)
+{
+#ifndef CLUSTER_CTRC_UNIT_TEST
+	ClusterCtrcParticipantEntry *participant;
+	uint64 index;
+	bool exact;
+#endif
+
+	if (local_ack_out != NULL)
+		MemSet(local_ack_out, 0, sizeof(*local_ack_out));
+#ifndef CLUSTER_CTRC_UNIT_TEST
+	if (local_ack_out == NULL || !ctrc_delegation_close_valid(request)
+		|| cluster_node_id < 0 || request->receiver.node_id != (uint16)cluster_node_id
+		|| !cluster_ctrc_shmem_ready()
+		|| !ctrc_participant_index(&request->key, request->receiver.node_id, &index))
+		return false;
+	ctrc_participant_locks_acquire(ctrc_participant_lock_mask(index));
+	LWLockAcquire(&CtrcShared->receipt_lock, LW_SHARED);
+	participant = &ctrc_participant_entries()[index];
+	exact = memcmp(&participant->key, &request->key, sizeof(request->key)) == 0
+		&& memcmp(&participant->identity, &request->receiver, sizeof(request->receiver)) == 0
+		&& participant->grant_generation == request->grant_generation
+		&& participant->seal_generation == request->seal_generation
+		&& FullTransactionIdEquals(participant->original_full_xid, request->original_full_xid)
+		&& participant->delegation_parent.sequence == request->delegation_sequence
+		&& memcmp(&participant->delegation_parent.receiver, &request->parent,
+			sizeof(request->parent)) == 0
+		&& ctrc_delegated_local_ack_summary_exact(participant, &ctrc_participant_ack_entries()[index])
+		&& ctrc_receipt_chain_exact_locked(index, true);
+	if (exact)
+		*local_ack_out = ctrc_participant_ack_entries()[index];
+	LWLockRelease(&CtrcShared->receipt_lock);
+	ctrc_participant_locks_release(ctrc_participant_lock_mask(index));
+	return exact;
+#else
+	(void)request;
+	return false;
+#endif
+}
+
 bool
 cluster_ctrc_origin_ack_land_entry(ClusterCtrcOriginEntry *origin, uint64 request_id,
 								   const ClusterCtrcLocalReleaseAckV1 *ack,
@@ -11005,12 +11094,16 @@ ctrc_participant_find_ack_ready(ClusterCtrcParticipantEntry *snapshot,
 			(void)cluster_ctrc_participant_close(participant, &participant->identity,
 												 participant->grant_generation,
 												 participant->seal_generation);
-		if (participant->state != CTRC_PARTICIPANT_ACK_READY
+		if ((participant->state != CTRC_PARTICIPANT_ACK_READY
+			 && !ctrc_delegated_local_ack_eligible(participant, false))
 			|| participant->identity.node_id != (uint16)cluster_node_id)
 			continue;
 		if (!ctrc_bytes_zero(&ctrc_participant_ack_entries()[index],
 							 sizeof(ClusterCtrcLocalReleaseAckV1))) {
-			participant->state = CTRC_PARTICIPANT_BLOCKED;
+			if (!ctrc_delegated_local_ack_summary_exact(participant,
+					&ctrc_participant_ack_entries()[index])
+				|| !ctrc_receipt_chain_exact_locked(index, true))
+				participant->state = CTRC_PARTICIPANT_BLOCKED;
 			continue;
 		}
 		*snapshot = *participant;
@@ -11135,8 +11228,9 @@ ctrc_ack_participant_exact(const CtrcAckWork *work)
 		= &ctrc_participant_entries()[work->participant_index];
 
 	return memcmp(participant, &work->participant, sizeof(*participant)) == 0
-		   && participant->state == CTRC_PARTICIPANT_ACK_READY
-		   && ctrc_participant_delegations_empty(participant)
+		   && ((participant->state == CTRC_PARTICIPANT_ACK_READY
+				&& ctrc_participant_delegations_empty(participant))
+			   || ctrc_delegated_local_ack_eligible(participant, false))
 		   && participant->receipt_count == work->receipt_count;
 }
 
@@ -11149,7 +11243,11 @@ ctrc_ack_block_if_same(const CtrcAckWork *work)
 	if (memcmp(&participant->key, &expected->key, sizeof(expected->key)) == 0
 		&& participant->grant_generation == expected->grant_generation
 		&& participant->seal_generation == expected->seal_generation
-		&& participant->state == CTRC_PARTICIPANT_ACK_READY)
+		&& (participant->state == CTRC_PARTICIPANT_ACK_READY
+			|| (ctrc_delegated_local_ack_eligible(expected, false)
+				&& participant->state == CTRC_PARTICIPANT_CLOSED_DRAINING
+				&& ctrc_bytes_zero(&ctrc_participant_ack_entries()[work->participant_index],
+					sizeof(ClusterCtrcLocalReleaseAckV1)))))
 		participant->state = CTRC_PARTICIPANT_BLOCKED;
 }
 
@@ -11273,7 +11371,8 @@ ctrc_participant_freeze_ack_batch_exact(CtrcAckWork *work, Size count)
 
 			participant->ack_frozen_count = work[i].receipt_count;
 			pg_write_barrier();
-			participant->state = CTRC_PARTICIPANT_ACK_FROZEN;
+			if (work[i].participant.state == CTRC_PARTICIPANT_ACK_READY)
+				participant->state = CTRC_PARTICIPANT_ACK_FROZEN;
 			work[i].frozen = true;
 		}
 	LWLockRelease(&CtrcShared->receipt_lock);
@@ -11284,6 +11383,23 @@ static bool
 pg_attribute_unused() ctrc_participant_freeze_next_ack_shared(void)
 {
 	return ctrc_participant_freeze_ack_batch_shared(1) == 1;
+}
+
+static ClusterCtrcAckResult
+ctrc_ack_work_local_snapshot(const CtrcAckWork *work, const ClusterCtrcDurability *durability,
+	ClusterCtrcLocalReleaseAckV1 *ack)
+{
+	ClusterCtrcParticipantEntry local = work->participant;
+
+	if (ctrc_delegated_local_ack_eligible(&local, false)) {
+		/* The full original row is still compared at each shared copy/freeze.
+		 * This copy feeds only the original LOCAL receipt hash/durability FSM. */
+		local.state = CTRC_PARTICIPANT_ACK_READY;
+		MemSet(&local.delegation_parent, 0, sizeof(local.delegation_parent));
+		MemSet(&local.delegation_path, 0, sizeof(local.delegation_path));
+	}
+	return cluster_ctrc_participant_ack_from_snapshot(&local, work->receipts,
+		work->receipt_count, durability, ack);
 }
 
 static Size
@@ -11355,9 +11471,7 @@ ctrc_participant_freeze_ack_batch_shared(Size maximum)
 				XLogFlush(highest_local_lsn);
 			}
 			ctrc_participant_capture_durability(&durability);
-			item->eligible = cluster_ctrc_participant_ack_from_snapshot(
-								 &item->participant, item->receipts, item->receipt_count,
-								 &durability, &item->first_ack)
+			item->eligible = ctrc_ack_work_local_snapshot(item, &durability, &item->first_ack)
 							 == CLUSTER_CTRC_ACK_RELEASED;
 		}
 
@@ -11372,9 +11486,7 @@ ctrc_participant_freeze_ack_batch_shared(Size maximum)
 				continue;
 			ctrc_participant_capture_durability(&durability);
 			item->eligible
-				= cluster_ctrc_participant_ack_from_snapshot(&item->participant, item->receipts,
-															 item->receipt_count, &durability,
-															 &item->second_ack)
+				= ctrc_ack_work_local_snapshot(item, &durability, &item->second_ack)
 					  == CLUSTER_CTRC_ACK_RELEASED
 				  && memcmp(&item->first_ack, &item->second_ack, sizeof(item->first_ack)) == 0;
 			if (item->eligible) {
@@ -11766,7 +11878,9 @@ ctrc_normal_stop_participants_locked(ClusterCtrcNormalStopObservation *out)
 		}
 		if (!ctrc_bytes_zero(ack, sizeof(*ack))
 			|| participant->state == CTRC_PARTICIPANT_ACK_FROZEN) {
-			bool ack_exact = exact && ctrc_frozen_ack_summary_exact(participant, ack);
+			bool ack_exact = exact && (ctrc_frozen_ack_summary_exact(participant, ack)
+				|| (ctrc_delegated_local_ack_summary_exact(participant, ack)
+					&& ctrc_receipt_chain_exact_locked(i, true)));
 
 			ctrc_normal_stop_note(
 				out, ack_exact ? CLUSTER_NORMAL_STOP_PENDING : CLUSTER_NORMAL_STOP_INVALID,

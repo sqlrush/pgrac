@@ -2386,14 +2386,14 @@ test_cluster_heap_ctrc_g_required_ack_body.inc: $(top_srcdir)/src/backend/cluste
 	mv $@.tmp $@
 
 test_cluster_heap_ctrc_ack.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
-	@awk 'BEGIN { pattern = "^(ctrc_tlv_bytes|ctrc_tlv_u8|ctrc_tlv_u16|ctrc_tlv_u32|ctrc_tlv_u64|ctrc_publication_id_encode|ctrc_target_encode|ctrc_cleaner_owns_key|ctrc_scan_limit|ctrc_scan_charge|ctrc_participant_scan_lock_mask|ctrc_receipt_snapshot_valid|ctrc_receipt_row_encode|ctrc_receipt_key_sequence_cmp|ctrc_receipt_durability_covered|cluster_ctrc_participant_ack_from_snapshot|ctrc_participant_find_ack_ready|ctrc_participant_capture_durability|ctrc_ack_batch_inputs|ctrc_ack_participant_exact|ctrc_ack_block_if_same|ctrc_ack_work_find|ctrc_participant_copy_ack_batch|ctrc_participant_freeze_ack_batch_exact|ctrc_participant_freeze_ack_batch_shared)\\(" } \
+	@awk 'BEGIN { pattern = "^(ctrc_delegated_local_ack_eligible|ctrc_delegated_local_ack_summary_exact|ctrc_ack_work_local_snapshot|ctrc_tlv_bytes|ctrc_tlv_u8|ctrc_tlv_u16|ctrc_tlv_u32|ctrc_tlv_u64|ctrc_publication_id_encode|ctrc_target_encode|ctrc_cleaner_owns_key|ctrc_scan_limit|ctrc_scan_charge|ctrc_participant_scan_lock_mask|ctrc_receipt_snapshot_valid|ctrc_receipt_row_encode|ctrc_receipt_key_sequence_cmp|ctrc_receipt_durability_covered|cluster_ctrc_participant_ack_from_snapshot|ctrc_participant_find_ack_ready|ctrc_participant_capture_durability|ctrc_ack_batch_inputs|ctrc_ack_participant_exact|ctrc_ack_block_if_same|ctrc_ack_work_find|ctrc_participant_copy_ack_batch|ctrc_participant_freeze_ack_batch_exact|ctrc_participant_freeze_ack_batch_shared)\\(" } \
 	     /^#define (CTRC_CLEANER_ACK_BATCH|CTRC_PARTICIPANT_ALL_SHARDS) / { print; constants++ } \
 	     /^typedef struct CtrcAckWork \{/ { structure=1; structures++ } \
 	     structure { print; if (/^} CtrcAckWork;/) structure=0; next } \
 	     $$0 ~ pattern { name=$$0; sub(/\(.*/, "", name); ret=prev; sub(/^static[ \t]+/, "", ret); candidate=1; head=1; text=""; decl="" } \
 	     candidate { text=text $$0 "\n"; if (/^\{/) { head=0; if (seen[name]++) exit 1; order[++found]=name; returns[name]="static " ret } else if (head) { decl=decl $$0 "\n"; if (/;[ \t]*$$/) candidate=0 } } \
 	     candidate && /^}/ { candidate=0; body[name]=text; declaration[name]=decl; done++ } { prev=$$0 } \
-	     END { if (found != 25 || done != 25 || candidate || structure || structures != 1 || constants != 2) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $< > $@.tmp
+	     END { if (found != 28 || done != 28 || candidate || structure || structures != 1 || constants != 2) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Original volatile origin/inbox terminal edge; canonical block0 publisher is separate.
