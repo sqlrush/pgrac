@@ -784,7 +784,7 @@ typedef struct CrR4OperationTop {
 	bool conservative;
 } CrR4OperationTop;
 
-/* Private evidence of a qualified kept INSERT, not a TID reuse grant. */
+/* Private evidence of a qualified kept tuple creation, not a TID reuse grant. */
 typedef struct CrR4KeptCreation {
 	struct CrR4KeptCreation *next;
 	TransactionId xid;
@@ -1032,23 +1032,42 @@ cr_r4_operation_creation_matches(const CrR4OperationContext *operation,
 /* Record only the first kept operation at this offset, after its original
  * inverse and admission recheck. Later versions cannot replace this witness. */
 static bool
-cr_r4_operation_remember_creation(CrR4OperationContext *operation, const UndoRecordHeader *record)
+cr_r4_operation_remember_creation(CrR4OperationContext *operation, const UndoRecordHeader *record,
+								  const BufferTag *tag)
 {
-	CrR4KeptCreation creation = { .xid = record->xid, .offset = record->target_offset };
+	CrR4KeptCreation creation = { .xid = record->xid };
 	CrR4KeptCreation *stored;
 	Page page = (Page)operation->result_page;
-	UndoInsertPayload insert;
-	unsigned bit = record->target_offset - FirstOffsetNumber;
+	uint16 expected_length = 0;
+	unsigned bit;
 
-	if (record->record_type != UNDO_RECORD_INSERT
-		|| (operation->kept_offsets[bit / 8] & (1U << (bit % 8))) != 0)
+	if (record->record_type == UNDO_RECORD_INSERT) {
+		UndoInsertPayload insert;
+
+		if (record->target_block != tag->blockNum)
+			return true;
+		memcpy(&insert, record + 1, sizeof(insert));
+		creation.offset = record->target_offset;
+		expected_length = insert.inserted_tuple_len;
+	} else if (record->record_type == UNDO_RECORD_UPDATE) {
+		UndoUpdatePayload update;
+
+		memcpy(&update, record + 1, sizeof(update));
+		if (update.new_block != tag->blockNum)
+			return true;
+		creation.offset = update.new_offset;
+	} else
 		return true;
-	if (record->target_offset > PageGetMaxOffsetNumber(page))
+	if (creation.offset < FirstOffsetNumber || creation.offset > MaxHeapTuplesPerPage)
 		return false;
-	creation.length = ItemIdGetLength(PageGetItemId(page, record->target_offset));
-	memcpy(&insert, record + 1, sizeof(insert));
+	bit = creation.offset - FirstOffsetNumber;
+	if ((operation->kept_offsets[bit / 8] & (1U << (bit % 8))) != 0)
+		return true;
+	if (creation.offset > PageGetMaxOffsetNumber(page))
+		return false;
+	creation.length = ItemIdGetLength(PageGetItemId(page, creation.offset));
 	if (!cr_r4_operation_creation_matches(operation, &creation)
-		|| (insert.inserted_tuple_len != 0 && insert.inserted_tuple_len != creation.length))
+		|| (expected_length != 0 && expected_length != creation.length))
 		return false;
 	stored = MemoryContextAllocZero(TopMemoryContext, sizeof(*stored));
 	*stored = creation;
@@ -1186,7 +1205,7 @@ cr_r4_operation_project(CrR4OperationContext *operation, ClusterR4CrSlotExtensio
 		return false;
 	if (keep) {
 		if (!cluster_semantic_activation_recheck(&operation->admission)
-			|| !cr_r4_operation_remember_creation(operation, record))
+			|| !cr_r4_operation_remember_creation(operation, record, tag))
 			return false;
 		if ((operation->kept_slots & (1U << locator->itl_slot_index)) == 0)
 			ClusterPageGetItlSlots((Page)operation->result_page)[locator->itl_slot_index] = after;
