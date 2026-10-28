@@ -4407,3 +4407,117 @@ UT_TEST(test_operation_worker_waiter_forget_preserves_retained_holder)
 			UT_ASSERT_EQ(operation_worker_allocations, allocations);
 		}
 }
+
+static void
+operation_worker_error_finish_at(OperationWorkerFixture *f, uint32 index)
+{
+	ClusterR4CrBuildStepResult step = CLUSTER_R4_CR_STEP_PENDING;
+
+	for (unsigned tick = 0; tick < 512 && step == CLUSTER_R4_CR_STEP_PENDING; tick++)
+		step = operation_worker_generation_poll(f, index);
+	UT_ASSERT_EQ(step, CLUSTER_R4_CR_STEP_FULL);
+	UT_ASSERT_EQ(f->reason, CLUSTER_CR_BUILD_NONE);
+	UT_ASSERT_EQ(f->extension.build_steps, 24);
+}
+
+static bool
+operation_worker_retained_error_catch(OperationWorkerFixture *f)
+{
+	volatile bool caught = false;
+
+	PG_TRY();
+	{
+		operation_worker_error_finish_at(f, 0);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+		UT_ASSERT_EQ(test_candidate_held_count, 0);
+		UT_ASSERT_EQ(test_candidate_cancel_calls, 1);
+		UT_ASSERT_EQ(test_native_fence_depth, 0);
+		UT_ASSERT_EQ(test_xact_lock_depth, 0);
+		cluster_cr_build_on_holder_forget(0, 1000);
+	}
+	PG_END_TRY();
+	return caught;
+}
+
+static void
+operation_worker_retained_error_handoff(unsigned phase, unsigned layout, bool native_error)
+{
+	OperationWorkerFixture f[2];
+	PGAlignedBlock original, expected;
+	int allocations = operation_worker_allocations;
+	int retained_allocations, waiter_allocations, native_calls, held_acquisitions;
+
+	operation_worker_multitop_data(&f[0], 2, layout);
+	f[1] = f[0];
+	f[1].extension.slot_generation++;
+	f[1].extension.owner.builder_incarnation++;
+	memcpy(original.data, f[0].cr.source.data, BLCKSZ);
+	operation_worker_multitop_expected(expected.data, original.data, 2, layout & 2);
+	operation_worker_generation_arm(&f[0], phase, 0);
+	retained_allocations = operation_worker_allocations;
+	held_acquisitions = test_candidate_acquire_calls;
+	UT_ASSERT(retained_allocations > allocations);
+	test_operation_worker_current_busy = true;
+	UT_ASSERT_EQ(operation_worker_generation_poll(&f[1], 1), CLUSTER_R4_CR_STEP_PENDING);
+	UT_ASSERT_EQ(f[1].extension.build_steps, 1);
+	UT_ASSERT_EQ(test_candidate_acquire_calls, held_acquisitions);
+	UT_ASSERT_EQ(test_candidate_held_count, 1);
+	waiter_allocations = operation_worker_allocations - retained_allocations;
+	UT_ASSERT(waiter_allocations > 0);
+	native_calls = test_native_status_calls;
+	if (native_error)
+		test_native_throw = true;
+	else {
+		operation_worker_error_release = 37 + phase;
+		test_operation_release_observer = operation_worker_error;
+	}
+	UT_ASSERT(operation_worker_retained_error_catch(&f[0]));
+	test_native_throw = false;
+	test_operation_release_observer = NULL;
+	operation_worker_error_release = 0;
+	if (native_error)
+		UT_ASSERT_EQ(test_native_status_calls, native_calls + 1);
+	UT_ASSERT_EQ(memcmp(original.data, f[0].cr.source.data, BLCKSZ), 0);
+	UT_ASSERT_EQ(memcmp(original.data, f[1].cr.source.data, BLCKSZ), 0);
+	UT_ASSERT_EQ(operation_worker_allocations, allocations + waiter_allocations);
+	cluster_cr_build_on_holder_forget(0, 1000);
+	cluster_cr_build_on_holder_forget(0, 1001);
+	UT_ASSERT_EQ(operation_worker_allocations, allocations + waiter_allocations);
+	UT_ASSERT_EQ(test_candidate_cancel_calls, 1);
+	operation_worker_error_finish_at(&f[1], 1);
+	UT_ASSERT_EQ(memcmp(expected.data, f[1].cr.source.data, BLCKSZ), 0);
+	UT_ASSERT_EQ(memcmp(original.data, f[0].cr.source.data, BLCKSZ), 0);
+	UT_ASSERT_EQ(test_candidate_acquire_calls, native_error ? 110 : 109 + phase);
+	UT_ASSERT_EQ(test_candidate_release_calls, native_error ? 109 : 109 + phase);
+	UT_ASSERT_EQ(test_candidate_cancel_calls, 1);
+	UT_ASSERT_EQ(test_candidate_max_held_count, 1);
+	UT_ASSERT_EQ(test_candidate_held_count, 0);
+	UT_ASSERT_EQ(test_undo_read_calls, 37);
+	UT_ASSERT_EQ(test_operation_multidata_request_count, 73 + (phase == 2));
+	UT_ASSERT_EQ(test_candidate_data_pin_calls, 0);
+	UT_ASSERT_EQ(test_candidate_data_unpin_calls, 0);
+	UT_ASSERT_EQ(test_operation_pin_depth, 0);
+	UT_ASSERT_EQ(test_native_fence_depth, 0);
+	UT_ASSERT_EQ(test_xact_lock_depth, 0);
+	cluster_cr_build_on_holder_forget(1, 1001);
+	cluster_cr_build_on_holder_forget(1, 1001);
+	cluster_cr_build_on_holder_forget(0, 1000);
+	UT_ASSERT_EQ(test_candidate_cancel_calls, 1);
+	UT_ASSERT_EQ(operation_worker_allocations, allocations);
+}
+
+UT_TEST(test_operation_worker_retained_release_error_hands_off_waiter)
+{
+	for (unsigned phase = 0; phase < 3; phase++)
+		for (unsigned layout = 0; layout < 4; layout++)
+			operation_worker_retained_error_handoff(phase, layout, false);
+}
+
+UT_TEST(test_operation_worker_retained_native_error_hands_off_waiter)
+{
+	for (unsigned layout = 0; layout < 4; layout++)
+		operation_worker_retained_error_handoff(1, layout, true);
+}
