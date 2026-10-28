@@ -1091,10 +1091,12 @@ extern ClusterCtrcItlCleanoutApplyResult cluster_ctrc_recovery_itl_page_image_v1
 	const struct ClusterColdTtSlotInputV1 *subjects, Size subject_count,
 	const char *before_image, char *after_image);
 /* Read-only tuple-to-ITL binding on one aligned immutable native heap image.
- * Every effective normal xmin must select one terminal DATA ITL; xmax must
- * match its actual stored DATA slot. Native frozen/special xmin and invalid
- * xmax keep their meanings; MOVED/effective MX/lock-only and malformed or
- * ambiguous bindings refuse. The caller separately qualifies ALL ITLs/UBA
+ * Every effective normal xmin must select one terminal DATA ITL; updating
+ * xmax must match its actual stored DATA slot. A plain-lock xmax instead
+ * requires exactly one valid LOCK_ONLY carrier, independent of the DATA
+ * slot; raw-xid ambiguity refuses even with different wraps. Native frozen/
+ * special xmin and invalid xmax keep their meanings; MOVED/effective MX and
+ * malformed bindings refuse. The caller separately qualifies ALL ITLs/UBA
  * through the original complete canonical terminal projection and retains
  * original PAGE/source/namespace/history custody. This predicate supplies no
  * TT/FullXid generation, HOT/history completeness, discharge or completion.
@@ -1112,7 +1114,8 @@ extern bool cluster_ctrc_recovery_heap_tuple_itl_references_v1(
  * local normal heap-only updates with matching native xmin, one predecessor
  * and no cycle. Non-aborted heap-only tuples need a predecessor; aborted
  * orphan tuples retain their native meaning. Ordinary stale/cross-page ctid
- * does not assert a local edge. Speculative/partition-move links refuse.
+ * does not assert a local edge; a plain locker never asserts an update
+ * edge. Speculative/partition-move links refuse.
  * No mutation, allocation, locks or I/O. The caller retains full canonical
  * TT/source/PAGE/history custody and proves every nonlocal/retained edge;
  * true does not establish complete G_ref, discharge or completion. */
