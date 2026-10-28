@@ -2623,6 +2623,10 @@ AlterDomainDefault(List *names, Node *defaultRaw)
 	Form_pg_type typTup;
 	ObjectAddress address;
 
+#ifdef USE_PGRAC_CLUSTER
+	CheckClusterSharedTypeSupport();
+#endif
+
 	/* Make a TypeName so we can use standard type lookup machinery */
 	typename = makeTypeNameFromNameList(names);
 	domainoid = typenameTypeId(NULL, typename);
@@ -2744,6 +2748,10 @@ AlterDomainNotNull(List *names, bool notNull)
 	HeapTuple	tup;
 	Form_pg_type typTup;
 	ObjectAddress address = InvalidObjectAddress;
+
+#ifdef USE_PGRAC_CLUSTER
+	CheckClusterSharedTypeSupport();
+#endif
 
 	/* Make a TypeName so we can use standard type lookup machinery */
 	typename = makeTypeNameFromNameList(names);
@@ -2869,6 +2877,10 @@ AlterDomainDropConstraint(List *names, const char *constrName,
 	HeapTuple	contup;
 	bool		found = false;
 	ObjectAddress address;
+
+#ifdef USE_PGRAC_CLUSTER
+	CheckClusterSharedTypeSupport();
+#endif
 
 	/* Make a TypeName so we can use standard type lookup machinery */
 	typename = makeTypeNameFromNameList(names);
@@ -3087,6 +3099,10 @@ AlterDomainValidateConstraint(List *names, const char *constrName)
 	HeapTuple	copyTuple;
 	ScanKeyData skey[3];
 	ObjectAddress address;
+
+#ifdef USE_PGRAC_CLUSTER
+	CheckClusterSharedTypeSupport();
+#endif
 
 	/* Make a TypeName so we can use standard type lookup machinery */
 	typename = makeTypeNameFromNameList(names);

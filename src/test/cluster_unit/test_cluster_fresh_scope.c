@@ -34,6 +34,7 @@
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_collation.h"
+#include "catalog/pg_constraint.h"
 #include "catalog/pg_control.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_db_role_setting.h"
@@ -360,6 +361,10 @@ static bool tablespace_options_lookup_active, tablespace_options_expect_binding;
 static unsigned tablespace_options_lookups, tablespace_options_unbound;
 static unsigned tablespace_options_bad_lookup;
 
+static bool domain_alter_scope_lookup_active;
+static unsigned domain_alter_scope_route, domain_alter_scope_lookups;
+static unsigned domain_alter_scope_lookup_kind, domain_alter_scope_bad_lookup;
+static List *domain_alter_scope_names_by_route[4], *domain_alter_scope_expected_names;
 static bool type_factory_scope_lookup_active;
 static unsigned type_factory_scope_route, type_factory_scope_lookups;
 static unsigned type_factory_scope_lookup_kind, type_factory_scope_bad_lookup;
@@ -18236,6 +18241,17 @@ UT_TEST(test_native_relation_rename_scope_refusal_precedes_context_and_binding)
 TypeName *
 makeTypeNameFromNameList(List *names)
 {
+	if (domain_alter_scope_lookup_active) {
+		domain_alter_scope_lookups++;
+		domain_alter_scope_lookup_kind = 0;
+		for (unsigned i = 0; i < lengthof(domain_alter_scope_names_by_route); i++)
+			if (names == domain_alter_scope_names_by_route[i])
+				domain_alter_scope_lookup_kind = i + 1;
+		if (domain_alter_scope_lookup_kind != domain_alter_scope_route
+			|| names != domain_alter_scope_expected_names)
+			domain_alter_scope_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before TypeName allocation and the type query. */
+	}
 	if (enum_scope_lookup_active) {
 		enum_scope_lookups++;
 		enum_scope_lookup_kind = 2;
@@ -19785,10 +19801,208 @@ UT_TEST(test_native_type_factory_scope_preserves_existing_supported_top_binding)
 	type_factory_scope_lookup_active = false;
 }
 
+/* Actual domain alteration prefixes stop before TypeName allocation.
+ * Internal domain constraint rebuilding retains its original entry path. */
+#include "test_cluster_fresh_domain_alter_scope.inc"
+static String domain_alter_scope_parts[4][2];
+static ListCell domain_alter_scope_cells[4][2];
+static List domain_alter_scope_names[4];
+static A_Const domain_alter_scope_default;
+static AlterDomainStmt native_domain_alter_scope_statement;
+static RangeVar domain_alter_scope_warm_relation;
+static AlterObjectSchemaStmt domain_alter_scope_warm_statement;
+
+static void
+reset_native_domain_alter_scope(unsigned form)
+{
+	static const char *const unqualified[]
+		= { "default_domain", "notnull_domain", "drop_constraint_domain", "validate_domain" };
+	static const char *const schemas[]
+		= { "default_schema", "notnull_schema", "drop_schema", "validate_schema" };
+	unsigned count = form % 2 ? 2 : 1;
+
+	reset_create_preflight();
+	error_detail[0] = '\0';
+	domain_alter_scope_lookup_active = true;
+	domain_alter_scope_route = form < 4 ? 1 : form < 8 ? 2 : form < 16 ? 3 : 4;
+	domain_alter_scope_lookups = domain_alter_scope_lookup_kind = domain_alter_scope_bad_lookup = 0;
+	for (unsigned kind = 0; kind < lengthof(domain_alter_scope_names); kind++) {
+		domain_alter_scope_parts[kind][0]
+			= (String){ .type = T_String,
+						.sval = (char *)(count == 1 ? unqualified[kind] : schemas[kind]) };
+		domain_alter_scope_parts[kind][1]
+			= (String){ .type = T_String, .sval = (char *)unqualified[kind] };
+		for (unsigned i = 0; i < 2; i++)
+			domain_alter_scope_cells[kind][i]
+				= (ListCell){ .ptr_value = &domain_alter_scope_parts[kind][i] };
+		domain_alter_scope_names[kind] = (List){ .type = T_List,
+												 .length = count,
+												 .max_length = 2,
+												 .elements = domain_alter_scope_cells[kind] };
+		domain_alter_scope_names_by_route[kind] = &domain_alter_scope_names[kind];
+	}
+	domain_alter_scope_expected_names = &domain_alter_scope_names[domain_alter_scope_route - 1];
+	domain_alter_scope_default = (A_Const){ .type = T_A_Const,
+											.val.ival = { .type = T_Integer, .ival = 7 },
+											.isnull = false,
+											.location = -1 };
+	native_domain_alter_scope_statement
+		= (AlterDomainStmt){ .type = T_AlterDomainStmt,
+							 .subtype = form < 4	? 'T'
+										: form < 8	? (form < 6 ? 'N' : 'O')
+										: form < 16 ? 'X'
+													: 'V',
+							 .typeName = domain_alter_scope_expected_names,
+							 .name = form < 8	  ? NULL
+									 : form >= 18 ? "other_constraint"
+												  : "domain_constraint",
+							 .def
+							 = form >= 2 && form < 4 ? (Node *)&domain_alter_scope_default : NULL,
+							 .behavior = form >= 12 && form < 16 ? DROP_CASCADE : DROP_RESTRICT,
+							 .missing_ok = form >= 8 && form < 16 && form % 4 >= 2 };
+	domain_alter_scope_warm_relation
+		= (RangeVar){ .type = T_RangeVar, .relname = "supported_warm_table" };
+	domain_alter_scope_warm_statement
+		= (AlterObjectSchemaStmt){ .type = T_AlterObjectSchemaStmt,
+								   .objectType = OBJECT_TABLE,
+								   .relation = &domain_alter_scope_warm_relation,
+								   .newschema = "supported_warm_destination",
+								   .missing_ok = false };
+}
+
+static void
+native_domain_alter_scope_entry(unsigned form)
+{
+	AlterDomainStmt *stmt = &native_domain_alter_scope_statement;
+
+	if (form < 4)
+		(void)AlterDomainDefault(stmt->typeName, stmt->def);
+	else if (form < 8)
+		(void)AlterDomainNotNull(stmt->typeName, stmt->subtype == 'O');
+	else if (form < 16)
+		(void)AlterDomainDropConstraint(stmt->typeName, stmt->name, stmt->behavior,
+										stmt->missing_ok);
+	else
+		(void)AlterDomainValidateConstraint(stmt->typeName, stmt->name);
+}
+
+static void
+assert_native_domain_alter_scope_result(bool blocked, int caught)
+{
+	UT_ASSERT_EQ(caught, blocked ? 1 : 2);
+	UT_ASSERT_EQ(error_code, blocked ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+	if (blocked) {
+		UT_ASSERT_STR_EQ(error_message, "custom types is not supported in shared mode");
+		UT_ASSERT_STR_EQ(error_detail,
+						 "PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+	}
+	UT_ASSERT_EQ(domain_alter_scope_lookups, blocked ? 0 : 1);
+	UT_ASSERT_EQ(domain_alter_scope_lookup_kind, blocked ? 0 : domain_alter_scope_route);
+	UT_ASSERT_EQ(domain_alter_scope_bad_lookup, 0);
+}
+
+UT_TEST(test_native_domain_alter_scope_matches_utility_before_type_name_allocation)
+{
+	for (unsigned form = 0; form < 20; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool blocked = (mode & 5) != 0;
+			int caught;
+
+			reset_native_domain_alter_scope(form);
+			set_native_operator_mode(mode);
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				create_sql_entry((Node *)&native_domain_alter_scope_statement);
+			UT_ASSERT_EQ(caught, blocked ? 1 : 0);
+			UT_ASSERT_EQ(error_code, blocked ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+			if (blocked) {
+				UT_ASSERT_STR_EQ(error_message, "custom types is not supported in shared mode");
+				UT_ASSERT_STR_EQ(error_detail,
+								 "PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+			}
+			UT_ASSERT_EQ(
+				domain_alter_scope_lookups + utility_xids + utility_prepares + utility_binds, 0);
+			reset_error();
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_domain_alter_scope_entry(form);
+			assert_native_domain_alter_scope_result(blocked, caught);
+			UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			UT_ASSERT_EQ(utility_top_xid, InvalidTransactionId);
+		}
+	}
+	domain_alter_scope_lookup_active = false;
+}
+
+UT_TEST(test_native_domain_alter_scope_precedes_context_child_top_and_publication)
+{
+	for (unsigned form = 0; form < 20; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			for (unsigned fault = 0; fault < 7; fault++) {
+				int caught;
+
+				reset_native_domain_alter_scope(form);
+				set_native_operator_mode(mode);
+				XactReadOnly = fault == 0;
+				utility_parallel = fault == 1;
+				utility_recovery = fault == 2;
+				utility_in_child = fault == 3;
+				if (fault == 4 || fault == 5) {
+					utility_current_xid = 401;
+					utility_top_xid = fault == 4 ? 400 : InvalidTransactionId;
+				}
+				utility_bind_ok = fault != 6;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_domain_alter_scope_entry(form);
+				assert_native_domain_alter_scope_result((mode & 5) != 0, caught);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+				UT_ASSERT_EQ(utility_top_xid, fault == 4 ? 400 : InvalidTransactionId);
+				UT_ASSERT_EQ(utility_current_xid,
+							 fault == 4 || fault == 5 ? 401 : InvalidTransactionId);
+			}
+		}
+	}
+	domain_alter_scope_lookup_active = false;
+}
+
+UT_TEST(test_native_domain_alter_scope_preserves_existing_supported_top_binding)
+{
+	for (unsigned form = 0; form < 20; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			for (unsigned fault = 0; fault < 5; fault++) {
+				int caught;
+
+				reset_native_domain_alter_scope(form);
+				create_sql_entry((Node *)&domain_alter_scope_warm_statement);
+				UT_ASSERT_EQ(utility_xids, 1);
+				UT_ASSERT_EQ(utility_prepares, 1);
+				UT_ASSERT_EQ(utility_binds, 1);
+				set_native_operator_mode(mode);
+				XactReadOnly = fault == 0;
+				utility_parallel = fault == 1;
+				utility_recovery = fault == 2;
+				utility_in_child = fault == 3;
+				utility_bind_ok = fault != 4;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_domain_alter_scope_entry(form);
+				assert_native_domain_alter_scope_result((mode & 5) != 0, caught);
+				UT_ASSERT_EQ(utility_xids, 1);
+				UT_ASSERT_EQ(utility_prepares, 1);
+				UT_ASSERT_EQ(utility_binds, 1);
+				UT_ASSERT_EQ(utility_top_xid, 400);
+				UT_ASSERT_EQ(utility_current_xid, 400);
+			}
+		}
+	}
+	domain_alter_scope_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(315);
+	UT_PLAN(318);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -20106,6 +20320,9 @@ main(void)
 	UT_RUN(test_native_type_factory_scope_matches_utility_before_permission_or_allocation);
 	UT_RUN(test_native_type_factory_scope_precedes_context_child_top_and_publication);
 	UT_RUN(test_native_type_factory_scope_preserves_existing_supported_top_binding);
+	UT_RUN(test_native_domain_alter_scope_matches_utility_before_type_name_allocation);
+	UT_RUN(test_native_domain_alter_scope_precedes_context_child_top_and_publication);
+	UT_RUN(test_native_domain_alter_scope_preserves_existing_supported_top_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
