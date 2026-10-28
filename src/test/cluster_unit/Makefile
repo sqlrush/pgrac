@@ -8926,8 +8926,33 @@ test_cluster_retention_publish.inc: $(top_srcdir)/src/backend/storage/ipc/procar
 	     END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Original feedback publication and its native slot aggregation dependencies.
+test_cluster_retention_feedback.inc: $(top_srcdir)/src/backend/replication/walsender.c Makefile
+	awk '/^PhysicalReplicationSlotNewXminGuts\(/ { print "static void"; emit=1; count++ } \
+	     /^PhysicalReplicationSlotNewXmin\(/ { print "static void"; emit=1; count++ } \
+	     /^PhysicalReplicationFeedbackNewXmin\(/ { print "static void"; emit=1; count++ } \
+	     /^TransactionIdInRecentPast\(/ { print "static bool"; emit=1; count++ } \
+	     /^ProcessStandbyHSFeedbackMessage\(/ { print "static void"; emit=1; count++ } \
+	     emit { print } /^}$$/ { emit=0 } \
+	     END { if (count != 5 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_retention_slot.inc: $(top_srcdir)/src/backend/replication/slot.c \
+		$(top_srcdir)/src/backend/storage/ipc/procarray.c \
+		$(top_srcdir)/src/backend/access/transam/transam.c Makefile
+	awk '/^ReplicationSlotMarkDirty\(/ { print "void"; emit=1; count++ } \
+	     /^ReplicationSlotsComputeRequiredXmin\(/ { print "void"; emit=1; count++ } \
+	     /^ProcArraySetReplicationSlotXmin\(/ { print "void"; emit=1; count++ } \
+	     /^ProcArrayReplicationFeedbackAllowed\(/ { print "bool"; emit=1; count++ } \
+	     /^TransactionIdPrecedes\(/ { print "bool"; emit=1; count++ } \
+	     /^TransactionIdPrecedesOrEquals\(/ { print "bool"; emit=1; count++ } \
+	     emit { print } /^}$$/ { emit=0 } \
+	     END { if (count != 6 || emit) exit 1 }' $(filter %.c,$^) > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_retention_sample: test_cluster_retention_sample.c unit_test.h \
 		test_cluster_retention_publish.inc test_cluster_retention_promise.inc \
+		test_cluster_retention_feedback.inc test_cluster_retention_slot.inc \
 		test_cluster_pgproc_active_types.inc test_cluster_retention_sample.inc \
 		$(top_srcdir)/src/include/access/twophase.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_retention.h \
@@ -10991,6 +11016,8 @@ clean distclean maintainer-clean: clean-retention-sample
 clean-retention-sample:
 	rm -f test_cluster_retention_publish.inc test_cluster_retention_publish.inc.tmp
 	rm -f test_cluster_retention_promise.inc test_cluster_retention_promise.inc.tmp
+	rm -f test_cluster_retention_feedback.inc test_cluster_retention_feedback.inc.tmp
+	rm -f test_cluster_retention_slot.inc test_cluster_retention_slot.inc.tmp
 	rm -f test_cluster_retention_sample.inc test_cluster_retention_sample.inc.tmp
 
 # Original backend-local writer, with controlled ownership/object/pin leaves.

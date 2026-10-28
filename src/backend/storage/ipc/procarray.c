@@ -2264,6 +2264,21 @@ ProcArrayPublishReadScn(SCN read_scn, SCN added_read_scn)
 	return accepted;
 }
 
+/* A raw replication-feedback pin has no read-SCN proof. Serialize its first
+ * publication with H before the slot/PGPROC owner changes any pin fields.
+ * Empty feedback may retire a pin, but cannot reset an exported promise. */
+bool
+ProcArrayReplicationFeedbackAllowed(TransactionId xmin, TransactionId catalog_xmin)
+{
+	if (cluster_node_id < 0)
+		return true;
+	if (procArray == NULL || !LWLockHeldByMeInMode(ProcArrayLock, LW_EXCLUSIVE))
+		return false;
+	if (!TransactionIdIsValid(xmin) && !TransactionIdIsValid(catalog_xmin))
+		return true;
+	return !SCN_VALID(procArray->cluster_read_scn_floor);
+}
+
 /*
  * cluster_undo_retention_horizon_sample -- spec-3.12 D1, typed H observation.
  *
