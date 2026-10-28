@@ -802,6 +802,7 @@ typedef struct CrR4OperationContext {
 	char *result_page; /* Borrowed only during the admitted call. */
 	uint8 kept_slots;
 	uint8 kept_offsets[(MaxHeapTuplesPerPage + 7) / 8];
+	uint8 kept_modified_offsets[(MaxHeapTuplesPerPage + 7) / 8];
 } CrR4OperationContext;
 
 static CrR4OperationContext CrR4OperationContexts[CLUSTER_LMS_CR_SLOTS];
@@ -931,25 +932,91 @@ cr_r4_operation_offsets(const UndoRecordHeader *record, const BufferTag *tag, co
 	return count;
 }
 
+/* Two modifiers may share a TID only for the same immutable creation. Their
+ * xmax/command/HOT headers differ, but the creator and stored value cannot. */
+static bool
+cr_r4_operation_same_creation(char walk_bytes[BLCKSZ], char result_bytes[BLCKSZ],
+							  OffsetNumber offset)
+{
+	Page pages[2] = { (Page)walk_bytes, (Page)result_bytes };
+	HeapTupleHeader tuples[2];
+	uint16 lengths[2];
+	const uint16 attributes = HEAP_HASNULL | HEAP_HASVARWIDTH | HEAP_HASEXTERNAL | HEAP_HASOID_OLD;
+
+	for (unsigned i = 0; i < lengthof(pages); i++) {
+		PageHeader header = (PageHeader)pages[i];
+		ItemId item;
+
+		if (offset > PageGetMaxOffsetNumber(pages[i]))
+			return false;
+		item = PageGetItemId(pages[i], offset);
+		if (!ItemIdIsNormal(item) || ItemIdGetLength(item) < SizeofHeapTupleHeader
+			|| ItemIdGetOffset(item) < header->pd_upper
+			|| (size_t)ItemIdGetOffset(item) + ItemIdGetLength(item) > header->pd_special)
+			return false;
+		lengths[i] = ItemIdGetLength(item);
+		tuples[i] = (HeapTupleHeader)PageGetItem(pages[i], item);
+		if (tuples[i]->t_hoff < SizeofHeapTupleHeader || tuples[i]->t_hoff > lengths[i]
+			|| (tuples[i]->t_infomask & HEAP_XMAX_IS_MULTI) != 0)
+			return false;
+	}
+	return lengths[0] == lengths[1] && tuples[0]->t_hoff == tuples[1]->t_hoff
+		   && HeapTupleHeaderGetRawXmin(tuples[0]) == HeapTupleHeaderGetRawXmin(tuples[1])
+		   && ((tuples[0]->t_infomask ^ tuples[1]->t_infomask) & attributes) == 0
+		   && ((tuples[0]->t_infomask2 ^ tuples[1]->t_infomask2) & HEAP_NATTS_MASK) == 0
+		   && memcmp((char *)tuples[0] + SizeofHeapTupleHeader,
+					 (char *)tuples[1] + SizeofHeapTupleHeader, lengths[0] - SizeofHeapTupleHeader)
+				  == 0;
+}
+
+/* A newer kept UPDATE/DELETE covers the prior xmax of this same version.
+ * It cannot cover an older creation or an overlapping replacement TID. */
+static bool
+cr_r4_operation_covers_target(const CrR4OperationContext *operation, const UndoRecordHeader *record,
+							  const BufferTag *tag, const OffsetNumber offsets[2], unsigned count)
+{
+	unsigned target_bit = record->target_offset - FirstOffsetNumber;
+
+	if (operation->walk == NULL || record->target_block != tag->blockNum
+		|| record->record_type == UNDO_RECORD_INSERT
+		|| (operation->kept_modified_offsets[target_bit / 8] & (1U << (target_bit % 8))) == 0)
+		return false;
+	for (unsigned i = 0; i < count; i++) {
+		unsigned bit = offsets[i] - FirstOffsetNumber;
+
+		if (offsets[i] != record->target_offset
+			&& (operation->kept_offsets[bit / 8] & (1U << (bit % 8))) != 0)
+			return false;
+	}
+	return cr_r4_operation_same_creation(operation->walk->data, operation->result_page,
+										 record->target_offset);
+}
+
 /* A LIVE overlap must expose a real predecessor in the private walk. The
  * inverse's idempotent absent-creation success cannot establish lineage.
  * Reject unqualified MX before an inverse can clear its flag; raw numeric
  * equality is not a member proof. The inverse still checks raw identities. */
 static bool
 cr_r4_operation_projection_safe(const CrR4OperationContext *operation, char page_bytes[BLCKSZ],
-								const OffsetNumber offsets[2], unsigned count, bool keep)
+								const UndoRecordHeader *record, const BufferTag *tag,
+								const OffsetNumber offsets[2], unsigned count, bool keep,
+								bool *covered_target)
 {
 	Page page = (Page)(operation->walk != NULL ? operation->walk->data : page_bytes);
 	PageHeader header = (PageHeader)page;
 	bool overlap = false;
 
+	*covered_target = false;
 	for (unsigned i = 0; i < count; i++) {
 		unsigned bit = offsets[i] - FirstOffsetNumber;
 
 		overlap |= (operation->kept_offsets[bit / 8] & (1U << (bit % 8))) != 0;
 	}
-	if (overlap && (!keep || operation->walk == NULL))
-		return false;
+	if (overlap && !keep) {
+		if (!cr_r4_operation_covers_target(operation, record, tag, offsets, count))
+			return false;
+		*covered_target = true;
+	}
 	for (unsigned i = 0; i < count; i++) {
 		ItemId item;
 		HeapTupleHeader tuple;
@@ -973,8 +1040,29 @@ cr_r4_operation_projection_safe(const CrR4OperationContext *operation, char page
 	return true;
 }
 
+/* The whole record has already passed its original inverse on the walk.
+ * Project only a disjoint replacement removal; leave the kept root intact. */
+static bool
+cr_r4_operation_project_covered(const CrR4OperationContext *operation,
+								const UndoRecordHeader *record, const BufferTag *tag,
+								const ClusterTxLocator *locator, char candidate[BLCKSZ])
+{
+	if (record->record_type == UNDO_RECORD_UPDATE) {
+		UndoUpdatePayload update;
+
+		memcpy(&update, record + 1, sizeof(update));
+		if (update.new_block == tag->blockNum
+			&& !cluster_cr_history_remove_creation(candidate, update.new_offset, record->xid, 0))
+			return false;
+	}
+	if ((operation->kept_slots & (1U << locator->itl_slot_index)) == 0)
+		ClusterPageGetItlSlots((Page)candidate)[locator->itl_slot_index]
+			= ClusterPageGetItlSlots((Page)operation->walk->data)[locator->itl_slot_index];
+	return true;
+}
+
 /* Walk every qualified record, but keep visible LIVE effects in the result.
- * A discarded overlap still requires survivor reconstruction and is refused.
+ * A newer full modification may cover an older mutation of the same root.
  * The result's newest kept ITL is independent of the older walk cursor. */
 static bool
 cr_r4_operation_project(CrR4OperationContext *operation, ClusterR4CrSlotExtension *extension,
@@ -985,11 +1073,14 @@ cr_r4_operation_project(CrR4OperationContext *operation, ClusterR4CrSlotExtensio
 	const char *body = (const char *)(record + 1);
 	OffsetNumber offsets[2];
 	unsigned count;
+	bool covered_target;
 	ClusterItlSlotData after;
 	PGAlignedBlock candidate;
 
 	count = cr_r4_operation_offsets(record, tag, body, offsets);
-	if (count == 0 || !cr_r4_operation_projection_safe(operation, page, offsets, count, keep))
+	if (count == 0
+		|| !cr_r4_operation_projection_safe(operation, page, record, tag, offsets, count, keep,
+											&covered_target))
 		return false;
 	if (operation->walk == NULL && !keep)
 		return cluster_cr_history_inverse_operation_identity(page, tag, locator, locator->uba,
@@ -1015,16 +1106,27 @@ cr_r4_operation_project(CrR4OperationContext *operation, ClusterR4CrSlotExtensio
 		for (unsigned i = 0; i < count; i++) {
 			unsigned bit = offsets[i] - FirstOffsetNumber;
 
+			if ((operation->kept_offsets[bit / 8] & (1U << (bit % 8))) == 0
+				&& offsets[i] == record->target_offset && record->target_block == tag->blockNum
+				&& (record->record_type == UNDO_RECORD_UPDATE
+					|| record->record_type == UNDO_RECORD_DELETE))
+				operation->kept_modified_offsets[bit / 8] |= 1U << (bit % 8);
 			operation->kept_offsets[bit / 8] |= 1U << (bit % 8);
 		}
 		return true;
 	}
 	memcpy(candidate.data, operation->result_page, BLCKSZ);
-	ClusterPageGetItlSlots((Page)candidate.data)[locator->itl_slot_index] = after;
-	if (!cluster_cr_history_inverse_operation_identity(candidate.data, tag, locator, locator->uba,
-													   record, body, record->payload_length,
-													   &operation->identity)
-		|| !cluster_semantic_activation_recheck(&operation->admission))
+	if (covered_target) {
+		if (!cr_r4_operation_project_covered(operation, record, tag, locator, candidate.data))
+			return false;
+	} else {
+		ClusterPageGetItlSlots((Page)candidate.data)[locator->itl_slot_index] = after;
+		if (!cluster_cr_history_inverse_operation_identity(
+				candidate.data, tag, locator, locator->uba, record, body, record->payload_length,
+				&operation->identity))
+			return false;
+	}
+	if (!cluster_semantic_activation_recheck(&operation->admission))
 		return false;
 	if ((operation->kept_slots & (1U << locator->itl_slot_index)) != 0)
 		ClusterPageGetItlSlots((Page)candidate.data)[locator->itl_slot_index]

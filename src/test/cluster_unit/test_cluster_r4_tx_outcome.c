@@ -7597,7 +7597,7 @@ UT_TEST(test_retained_slot_identity_does_not_escape_original_final_fences)
 int
 main(void)
 {
-	UT_PLAN(311);
+	UT_PLAN(317);
 	UT_RUN(test_operation_worker_real_builder_yields_before_visibility);
 	UT_RUN(test_operation_worker_real_origin_completes_private_inverse);
 	UT_RUN(test_operation_worker_pending_current_is_bounded_and_counts_once);
@@ -7634,6 +7634,12 @@ main(void)
 	UT_RUN(test_operation_worker_overlapping_live_validates_raw_predecessor_and_length);
 	UT_RUN(test_operation_worker_discarded_overlap_does_not_erase_live_successor);
 	UT_RUN(test_operation_worker_unqualified_multi_lock_never_publishes_survivor);
+	UT_RUN(test_operation_worker_live_update_preserves_root_over_discarded_update);
+	UT_RUN(test_operation_worker_live_delete_preserves_root_over_discarded_mutations);
+	UT_RUN(test_operation_worker_live_update_covers_discarded_delete_and_lock);
+	UT_RUN(test_operation_worker_live_root_projection_requires_identical_creation_bytes);
+	UT_RUN(test_operation_worker_kept_lock_does_not_grant_full_modify_coverage);
+	UT_RUN(test_operation_worker_root_overlap_never_bypasses_unknown_older_top);
 
 	UT_RUN(test_operation_poll_does_not_complete_inline);
 	UT_RUN(test_operation_poll_stages_outputs);
