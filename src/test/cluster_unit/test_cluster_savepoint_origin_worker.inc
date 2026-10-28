@@ -2078,3 +2078,41 @@ UT_TEST(test_operation_worker_mixed_top_cohort_has_private_observations)
 	UT_ASSERT_EQ(test_candidate_max_held_count, 1);
 	UT_ASSERT_EQ(operation_worker_allocations, allocations);
 }
+
+UT_TEST(test_operation_worker_malformed_transaction_prev_preserves_output)
+{
+	UBA malformed[] = { uba_encode(TEST_RECORD_SEGMENT, 0, TEST_TT_OFFSET, 0),
+						uba_encode(TEST_RECORD_SEGMENT, UNDO_BLOCKS_PER_SEGMENT, TEST_TT_OFFSET, 0),
+						uba_encode(TEST_RECORD_SEGMENT, 6, TEST_TT_OFFSET + 1, 0),
+						uba_encode(CLUSTER_UNDO_SEGS_PER_INSTANCE + 1, 6, TEST_TT_OFFSET, 0),
+						uba_encode(TEST_RECORD_SEGMENT, 6, TEST_TT_OFFSET,
+								   (BLCKSZ - sizeof(UndoBlockHeader)) / sizeof(UndoSlotDirEntry)),
+						uba_encode(TEST_RECORD_SEGMENT, 8, TEST_TT_OFFSET, 0),
+						uba_encode(TEST_RECORD_SEGMENT, 7, TEST_TT_OFFSET, 2) };
+
+	for (int same = 0; same < 2; same++)
+		for (unsigned i = 0; i < lengthof(malformed); i++) {
+			OperationWorkerFixture f;
+			PGAlignedBlock before;
+			UndoSlotDirEntry directory;
+			UndoRecordHeader record;
+			ClusterR4CrBuildStepResult step;
+			char *bytes;
+
+			operation_worker_init(&f, same);
+			operation_worker_two_records(&f);
+			memcpy(&directory, test_operation_page.data + BLCKSZ - 2 * sizeof(directory),
+				   sizeof(directory));
+			bytes = test_operation_page.data + directory.record_offset;
+			memcpy(&record, bytes, sizeof(record));
+			record.prev_uba = malformed[i];
+			memcpy(bytes, &record, sizeof(record));
+			memcpy(before.data, f.cr.source.data, BLCKSZ);
+			step = operation_worker_finish(&f);
+			cluster_cr_build_on_holder_forget(0, 1000);
+			UT_ASSERT_EQ(step, CLUSTER_R4_CR_STEP_FAIL);
+			UT_ASSERT_EQ(f.reason, CLUSTER_CR_BUILD_BAD_UNDO);
+			UT_ASSERT_EQ(memcmp(before.data, f.cr.source.data, BLCKSZ), 0);
+			UT_ASSERT_EQ(test_candidate_held_count, 0);
+		}
+}

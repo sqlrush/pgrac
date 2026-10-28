@@ -90,6 +90,26 @@ savepoint_reader_identity_valid(const ClusterSavepointReaderIdentity *expected,
 		   && expected->subid > TopSubTransactionId;
 }
 
+/* A transaction predecessor need not be this page's ITL prior. Retain the
+ * original owner/slot envelope and same-segment append order nevertheless. */
+static bool
+savepoint_reader_prev_address_valid(UBA current_uba, const UndoRecordHeader *record)
+{
+	uint32 current_segment, current_block, previous_segment, previous_block;
+	uint16 current_tt, current_row, previous_tt, previous_row;
+
+	if (UBA_is_invalid(record->prev_uba))
+		return true;
+	if (!cluster_undo_rollback_address_valid(record, record->prev_uba, false)
+		|| !uba_decode_record(current_uba, &current_segment, &current_block, &current_tt,
+							  &current_row)
+		|| !uba_decode_record(record->prev_uba, &previous_segment, &previous_block, &previous_tt,
+							  &previous_row))
+		return false;
+	return previous_segment != current_segment || previous_block < current_block
+		   || (previous_block == current_block && previous_row < current_row);
+}
+
 bool
 cluster_savepoint_reader_decode_identity(const ClusterSavepointReaderIdentity *expected,
 										 const ClusterTxLocator *locator, UBA current_uba,
@@ -131,7 +151,8 @@ cluster_savepoint_reader_decode_identity(const ClusterSavepointReaderIdentity *e
 	 * private header input; tuple and operation validation keep the raw child. */
 	canonical = *record;
 	canonical.xid = expected->canonical.xid;
-	if (!cluster_undo_record_validate_identity(locator, current_uba, &canonical, NULL))
+	if (!cluster_undo_record_validate_identity(locator, current_uba, &canonical, NULL)
+		|| !savepoint_reader_prev_address_valid(current_uba, record))
 		return false;
 	*out = decoded;
 	return true;

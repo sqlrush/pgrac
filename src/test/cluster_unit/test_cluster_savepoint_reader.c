@@ -670,10 +670,81 @@ UT_TEST(test_original_top_only_inverse_unchanged)
 	UT_ASSERT(ItemIdIsNormal(PageGetItemId((Page)f.page.data, 2)));
 }
 
+UT_TEST(test_operation_transaction_prev_address_envelope_refused)
+{
+	UBA malformed[]
+		= { uba_encode(2, 0, 2, 0),
+			uba_encode(2, UNDO_BLOCKS_PER_SEGMENT, 2, 0),
+			uba_encode(2, 6, 3, 0),
+			uba_encode(CLUSTER_UNDO_SEGS_PER_INSTANCE + 1, 6, 2, 0),
+			uba_encode(2, 6, 2, (BLCKSZ - sizeof(UndoBlockHeader)) / sizeof(UndoSlotDirEntry)),
+			uba_encode(2, 8, 2, 0),
+			uba_encode(2, 7, 2, 1) };
+	ClusterSavepointReaderRecord empty = { 0 };
+
+	for (unsigned i = 0; i < lengthof(malformed); i++) {
+		ReaderFixture f;
+		ClusterSavepointReaderRecord decoded;
+		PGAlignedBlock before;
+
+		init_fixture(&f);
+		f.record.prev_uba = malformed[i];
+		before = f.page;
+		memset(&decoded, 0xa5, sizeof(decoded));
+		UT_ASSERT(!decode_fixture(&f, &decoded));
+		UT_ASSERT_EQ(memcmp(&decoded, &empty, sizeof(empty)), 0);
+		UT_ASSERT(!inverse_fixture(&f));
+		UT_ASSERT_EQ(memcmp(before.data, f.page.data, BLCKSZ), 0);
+	}
+}
+
+/* This pure decoder checks addresses, not the existence of predecessor bytes. */
+UT_TEST(test_operation_transaction_prev_and_page_prior_are_independent)
+{
+	UBA previous[] = { uba_encode(2, 6, 2, 0), uba_encode(1, 8, 2, 9), uba_encode(3, 8, 2, 9) };
+
+	for (unsigned i = 0; i < lengthof(previous); i++) {
+		ReaderFixture f;
+		ClusterSavepointReaderRecord decoded;
+		ClusterItlSlotData prior;
+
+		init_fixture(&f);
+		f.record.prev_uba = previous[i];
+		prior = f.history.entries[0].prior;
+		UT_ASSERT(decode_fixture(&f, &decoded));
+		UT_ASSERT(inverse_fixture(&f));
+		UT_ASSERT_EQ(memcmp(ClusterPageGetItlSlots((Page)f.page.data), &prior, sizeof(prior)), 0);
+		UT_ASSERT(!ItemIdIsUsed(PageGetItemId((Page)f.page.data, 1)));
+		UT_ASSERT(ItemIdIsNormal(PageGetItemId((Page)f.page.data, 2)));
+	}
+}
+
+UT_TEST(test_first_operation_preserves_another_top_page_prior)
+{
+	ReaderFixture f;
+	ClusterSavepointReaderRecord decoded;
+	ClusterItlSlotData prior;
+
+	init_fixture(&f);
+	f.record.flags |= UNDO_REC_FLAG_FIRST_IN_TX;
+	f.record.prev_uba = (UBA)InvalidUba_init;
+	f.history.entries[0].prior.xid = 99;
+	f.history.entries[0].prior.flags = ITL_FLAG_COMMITTED;
+	f.history.entries[0].prior.commit_scn = scn_encode(0, 900);
+	ClusterPageGetItlSlots((Page)f.page.data)->wrap = 9;
+	seal_fixture(&f);
+	prior = f.history.entries[0].prior;
+	UT_ASSERT(decode_fixture(&f, &decoded));
+	UT_ASSERT(inverse_fixture(&f));
+	UT_ASSERT_EQ(memcmp(ClusterPageGetItlSlots((Page)f.page.data), &prior, sizeof(prior)), 0);
+	UT_ASSERT(!ItemIdIsUsed(PageGetItemId((Page)f.page.data, 1)));
+	UT_ASSERT(ItemIdIsNormal(PageGetItemId((Page)f.page.data, 2)));
+}
+
 int
 main(void)
 {
-	UT_PLAN(18);
+	UT_PLAN(21);
 	UT_RUN(test_exact_decode_and_unaligned_body);
 	UT_RUN(test_expected_identity_mismatch_clears_output);
 	UT_RUN(test_unknown_or_malformed_record_refused);
@@ -692,6 +763,9 @@ main(void)
 	UT_RUN(test_lock_canonical_top_cannot_replace_raw_xmax);
 	UT_RUN(test_original_readers_still_reject_operation);
 	UT_RUN(test_original_top_only_inverse_unchanged);
+	UT_RUN(test_operation_transaction_prev_address_envelope_refused);
+	UT_RUN(test_operation_transaction_prev_and_page_prior_are_independent);
+	UT_RUN(test_first_operation_preserves_another_top_page_prior);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
