@@ -543,9 +543,15 @@ inventory_relmap_clog_record(ClusterRecoveryNativeInventory *work,
 	event->end_lsn = effect.record->end_lsn;
 	event->record_crc = (uint32)effect.record->header.xl_crc;
 	event->kind = effect.kind;
-	if (effect.kind == CLUSTER_RECOVERY_NATIVE_CLOG_ZERO)
+	if (effect.kind == CLUSTER_RECOVERY_NATIVE_CLOG_ZERO) {
 		memcpy(&event->page, effect.record->payload, sizeof(event->page));
-	else {
+		if ((effect.record->header.xl_info & ~XLR_INFO_MASK) == CLOG_ZEROPAGE_FULL) {
+			/* The original scanner validated all native birth bytes. Keep
+			 * them independently of the counter candidate and pending xid. */
+			memcpy(&event->full_birth, effect.record->payload, sizeof(event->full_birth));
+			event->full_birth_observed = true;
+		}
+	} else {
 		xl_clog_truncate truncate;
 		memcpy(&truncate, effect.record->payload, sizeof(truncate));
 		event->page = truncate.pageno;
