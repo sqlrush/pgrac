@@ -1427,6 +1427,7 @@ test_cluster_startup_cf_callsite.inc: $(top_srcdir)/src/backend/access/transam/x
 
 test_cluster_startup_cf_entry: test_cluster_startup_cf_entry.c test_cluster_cf_enqueue.c \
 		test_cluster_prepared_cf.h test_cluster_prepared_cf.inc \
+		test_cluster_generic_cf.h test_cluster_generic_cf.inc \
 		test_cluster_startup_cf_entry.inc test_cluster_startup_cf_callsite.inc \
 		test_cluster_merge_cf_entry.inc \
 		test_cluster_merge_cold_cf.inc \
@@ -1456,6 +1457,17 @@ test_cluster_prepared_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_control_
 	     emit { print } /^}/ { emit=0 } \
 	     END { if (codecs != 4 || predicates != 5 || acquires != 1 || releases != 1 || authorities != 2 || consumers != 2 || emit) exit 1 }' \
 	     $(filter %.c,$^) > $@.tmp
+	mv $@.tmp $@
+
+# Original generic consumer; an exact failed attempt consumes its authority.
+test_cluster_generic_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_control_root.c Makefile
+	awk '/^snapshot_reserved_zero\(/ { print "static bool"; emit=1; reserved++ } \
+	     /^reason_mask\(/ { print "static uint64"; emit=1; masks++ } \
+	     /^patch_shape_valid\(/ { print "static bool"; emit=1; shapes++ } \
+	     /^root_publish_requires_walr\(/ { print "static bool"; emit=1; selectors++ } \
+	     /^cluster_control_root_compare_and_publish\(/ { print "ClusterControlRootResult"; emit=1; consumers++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (reserved != 1 || masks != 1 || shapes != 1 || selectors != 1 || consumers != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Original claim custody declaration and CF consumer, with the real CF producer.
