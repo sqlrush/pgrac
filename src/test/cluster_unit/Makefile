@@ -3534,6 +3534,7 @@ test_cluster_recovery_episode_side_owner.o: test_cluster_recovery_episode_side_o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -Werror -c $< -o $@
 
 test_cluster_recovery_episode_clog.o: test_cluster_recovery_episode_clog.c \
+        test_cluster_clog_native_horizon.inc \
         test_cluster_recovery_episode_clog.h test_cluster_recovery_episode_clog_namespace.h \
         test_cluster_clog_recovery.c test_cluster_clog_relmap_participant.inc \
         test_cluster_clog_relmap_mutation.inc \
@@ -3589,6 +3590,7 @@ test_cluster_recovery_consumed_inputs.o: $(top_srcdir)/src/backend/cluster/clust
 
 test_cluster_recovery_native_inputs: test_cluster_recovery_consumed_inputs.o test_cluster_recovery_episode_consumed_pages.inc
 test_cluster_recovery_native_inputs: test_cluster_recovery_episode_local_bounds.inc
+test_cluster_recovery_native_inputs: test_cluster_recovery_episode_native_bounds.inc
 test_cluster_recovery_native_inputs: test_cluster_recovery_episode_page_history.inc
 test_cluster_recovery_native_inputs: test_cluster_recovery_episode_page_sources.inc
 test_cluster_recovery_native_inputs: test_cluster_recovery_consumed_native_redo.inc
@@ -4621,6 +4623,10 @@ test_cluster_multixact_recovery test_cluster_multixact_limits_io: %: %.c unit_te
 # PGRAC: original-origin CLOG against real disposable native SLRU files.
 # Author: SqlRush <sqlrush@gmail.com>
 # Keep the native recovery counter producer private to the CLOG fixture.
+test_cluster_clog_native_horizon.inc: $(top_srcdir)/src/backend/access/transam/varsup.c Makefile
+	@awk '/^AdvanceOldestClogXid\(/ { print "static void"; sub(/^AdvanceOldestClogXid/, "fixture_native_advance_oldest_clog_xid"); emit = 1; count++ } emit { print } emit && /^}/ { emit = 0 } END { if (count != 1) exit 1 }' $< > $@.tmp
+	@mv $@.tmp $@
+
 test_cluster_clog_native_advance_next.inc: $(top_srcdir)/src/backend/access/transam/varsup.c Makefile
 	@awk '/^AdvanceNextFullTransactionIdPastXid\(/ { print "static void"; sub(/^AdvanceNextFullTransactionIdPastXid/, "fixture_native_advance_next_full_xid"); emit = 1; count++ } emit { print } emit && /^}/ { emit = 0 } END { if (count != 1) exit 1 }' $< > $@.tmp
 	@mv $@.tmp $@
@@ -5200,6 +5206,7 @@ check_r11_source_removal_census:
 # Standard PG targets
 # ----------
 clean distclean maintainer-clean:
+	rm -f test_cluster_clog_native_horizon.inc test_cluster_clog_native_horizon.inc.tmp
 	rm -f test_cluster_clog_native_counter.inc test_cluster_clog_native_counter.inc.tmp
 	rm -f test_cluster_clog_native_advance_next.inc test_cluster_clog_native_advance_next.inc.tmp
 	rm -f test_cluster_recovery_episode_clog.o test_cluster_recovery_episode_side_owner.o test_cluster_recovery_consumed_inputs.o

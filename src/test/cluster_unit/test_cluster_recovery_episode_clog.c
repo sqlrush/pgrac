@@ -15,6 +15,7 @@
 int d3_episode_clog_main(void);
 #define TEST_CLUSTER_EPISODE_CLOG
 #include "test_cluster_clog_recovery.c"
+#include "test_cluster_clog_native_horizon.inc"
 #include "test_cluster_recovery_episode_clog.h"
 
 /* A complete private PGPROC keeps the original status setter's group-update
@@ -191,5 +192,24 @@ test_episode_native_clog_local_bounds(bool on, uint64 next, TransactionId oldest
 	LWLockRelease(XactTruncationLock);
 	if (!on)
 		saved = false;
+	episode_clog_unlocked();
+}
+
+/* Complete native producer bodies keep their original locks and no-op rules. */
+void
+test_episode_native_clog_advance_next(TransactionId xid)
+{
+	bool was_postmaster = IsUnderPostmaster;
+	IsUnderPostmaster = true;
+	UT_ASSERT(AmStartupProcess());
+	fixture_native_advance_next_full_xid(xid);
+	IsUnderPostmaster = was_postmaster;
+	episode_clog_unlocked();
+}
+
+void
+test_episode_native_clog_advance_oldest(TransactionId xid)
+{
+	fixture_native_advance_oldest_clog_xid(xid);
 	episode_clog_unlocked();
 }
