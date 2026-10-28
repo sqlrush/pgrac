@@ -56,6 +56,10 @@
 #include "miscadmin.h"
 #include "port/pg_crc32c.h"
 #include "postmaster/interrupt.h"
+#include "postmaster/startup.h"
+#include "storage/lwlock.h"
+#include "storage/proc.h"
+#include "utils/resowner.h"
 #include "storage/fd.h"
 #include "storage/latch.h"
 #include "utils/timestamp.h"
@@ -2812,6 +2816,125 @@ release_cf(LOCKMODE mode, ClusterControlRootResult result)
 	return result;
 }
 
+/* The original startup caller keeps this snapshot on its own stack. It is
+ * neither a ROOT observation nor authority for a new CF request. */
+typedef struct RootRetentionCfWait {
+	PGPROC *proc;
+	Latch *latch;
+	ResourceOwner owner;
+	const ClusterControlRootIdentity *input;
+	ClusterControlRootIdentity expected;
+	int pid, node;
+	uint64 epoch, generation, boot, system_identifier;
+	bool recovery;
+} RootRetentionCfWait;
+
+static void
+retention_startup_cf_capture(RootRetentionCfWait *original, const ClusterControlRootIdentity *input)
+{
+	memset(original, 0, sizeof(*original));
+	original->proc = MyProc;
+	original->latch = MyLatch;
+	original->owner = CurrentResourceOwner;
+	original->input = input;
+	original->expected = *input;
+	original->pid = MyProcPid;
+	original->node = cluster_node_id;
+	original->epoch = cluster_epoch_get_current();
+	original->generation = cluster_grd_redeclare_generation();
+	original->boot = cluster_qvotec_get_self_incarnation();
+	original->system_identifier = GetSystemIdentifier();
+	original->recovery = RecoveryInProgress();
+}
+
+static bool
+retention_startup_cf_current(const RootRetentionCfWait *original)
+{
+	return original->proc != NULL && original->latch != NULL && original->owner != NULL
+		   && original->input != NULL && MyProc == original->proc && MyLatch == original->latch
+		   && MyProcPid == original->pid && CurrentResourceOwner == original->owner
+		   && MyBackendType == B_STARTUP && AmStartupProcess() && CritSectionCount == 0
+		   && !LWLockHeldByMe(ControlFileLock) && !ShutdownRequestPending
+		   && cluster_node_id == original->node && original->epoch != 0 && original->generation != 0
+		   && original->boot != 0 && GetSystemIdentifier() == original->system_identifier
+		   && cluster_epoch_get_current() == original->epoch
+		   && cluster_grd_redeclare_generation() == original->generation
+		   && cluster_qvotec_get_self_incarnation() == original->boot
+		   && RecoveryInProgress() == original->recovery
+		   && cluster_recovery_transport_components_current()
+		   && cluster_control_root_identity_equal(original->input, &original->expected)
+		   && runtime_v2_owner_check(original->epoch, original->boot, false)
+				  == CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+static void
+retention_startup_cf_wait(const RootRetentionCfWait *original,
+						  const ClusterCfAttemptObservation *attempt)
+{
+	ClusterCfRetirementSnapshot retiring;
+	bool empty = attempt->owner_state_at_return == CLUSTER_LOCK_OWNER_EMPTY;
+	bool empty_waited = false;
+	const char *reason = "CONTEXT_CHANGED_AFTER_WAIT_SLICE";
+
+	if (!retention_startup_cf_current(original) || cluster_cf_held(ExclusiveLock))
+		goto refuse;
+	reason = "CF_WAIT_IDENTITY_OR_COMPLETION";
+	if (!empty
+		&& (!cluster_cf_retirement_snapshot(ShareLock, NULL, &retiring)
+			|| retiring.cookie != attempt->control_owner_id
+			|| retiring.registry.message.key.holder.request_id != attempt->request_id
+			|| retiring.registry.message.key.holder.cluster_epoch != attempt->request_epoch))
+		goto refuse;
+	for (;;) {
+		ClusterCfRetirementSnapshot current;
+		bool held;
+
+		HandleStartupProcInterrupts();
+		CHECK_FOR_INTERRUPTS();
+		reason = "CONTEXT_CHANGED_AFTER_WAIT_SLICE";
+		if (!retention_startup_cf_current(original))
+			goto refuse;
+		ResetLatch(MyLatch);
+		held = cluster_cf_held(ShareLock);
+		if (!held && !cluster_cf_held(ExclusiveLock)) {
+			if (!empty && cluster_cf_release_completed(ShareLock, retiring.cookie))
+				return;
+			if (empty) {
+				if (empty_waited)
+					return;
+				empty_waited = true;
+				(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+								WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
+				continue;
+			}
+		}
+		reason = "CF_WAIT_IDENTITY_OR_COMPLETION";
+		if (empty || !held || cluster_cf_held(ExclusiveLock)
+			|| !cluster_cf_retirement_snapshot(ShareLock, NULL, &current)
+			|| current.cookie != retiring.cookie
+			|| current.registry.handle.slot != retiring.registry.handle.slot
+			|| current.registry.handle.generation != retiring.registry.handle.generation
+			|| memcmp(&current.registry.owner, &retiring.registry.owner,
+					  sizeof(current.registry.owner))
+				   != 0
+			|| memcmp(&current.registry.message.key, &retiring.registry.message.key,
+					  sizeof(current.registry.message.key))
+				   != 0)
+			goto refuse;
+		cluster_lock_owners_service_poll();
+		cluster_cf_retirement_poll();
+		if (cluster_cf_held(ShareLock))
+			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+							WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
+	}
+refuse:
+	ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+					errmsg("startup WAL retention cannot continue its control-file wait"),
+					errdetail("PGRAC_FAMILY=STARTUP_CONTROL consumer=wal_retention reason=%s "
+							  "cookie=" UINT64_FORMAT " request=" UINT64_FORMAT,
+							  reason, attempt->control_owner_id, attempt->request_id)));
+}
+
 /* PGRAC: a normal checkpoint may reclaim only its exact live writer's
  * generation. Never upgrade this purpose into a recovery/history read.
  * Author: SqlRush <sqlrush@gmail.com>
@@ -2830,6 +2953,9 @@ read_retention_version(const ClusterControlRootIdentity *self, ClusterControlRoo
 	volatile bool held = false;
 	uint64 epoch, incarnation;
 	uint32 index;
+	RootRetentionCfWait original;
+	bool startup = MyBackendType == B_STARTUP;
+	bool waited = false;
 
 	if (self != NULL)
 		expected = *self;
@@ -2852,14 +2978,30 @@ read_retention_version(const ClusterControlRootIdentity *self, ClusterControlRoo
 	result = runtime_v2_owner_check(epoch, incarnation, false);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
+	if (startup)
+		retention_startup_cf_capture(&original, self);
 	index = expected.origin_thread_id - 1;
 	root = palloc(sizeof(*root));
 	result = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	PG_TRY();
 	{
-		if (cluster_cf_lock(ShareLock)) {
+		for (;;) {
+			ClusterCfAttemptObservation attempt;
+			uint64 before = startup ? cluster_cf_attempt_sequence() : 0;
+
+			if (cluster_cf_lock(ShareLock))
+				break;
+			if (!startup || !cluster_cf_last_attempt_since(before, &attempt)
+				|| !cluster_cf_attempt_wait_slice(&attempt) || attempt.mode != ShareLock)
+				goto retention_read_done;
+			retention_startup_cf_wait(&original, &attempt);
+			waited = true;
+		}
+		{
 			held = true;
-			if (cluster_cf_held_is_clusterwide(ShareLock)) {
+			if (waited && !retention_startup_cf_current(&original))
+				result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+			else if (cluster_cf_held_is_clusterwide(ShareLock)) {
 				result = read_thread_version(&expected, root, &thread, &file_token, version);
 				if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 					|| result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
@@ -2882,6 +3024,7 @@ read_retention_version(const ClusterControlRootIdentity *self, ClusterControlRoo
 			result = release_cf(ShareLock, result);
 			held = false;
 		}
+	retention_read_done:;
 	}
 	PG_CATCH();
 	{
@@ -3251,7 +3394,8 @@ static ClusterControlRootResult
 read_canonical_version(uint16 thread_id, const ClusterControlRootIdentity *expected_identity,
 					   ClusterControlRootSnapshot *out, ClusterControlRootReadToken *token,
 					   uint64 admitted_incarnation, ClusterControlRootStopObservation *stop,
-					   uint16 version, ClusterControlRecoverySubject *recovery)
+					   uint16 version, ClusterControlRecoverySubject *recovery,
+					   const RootRetentionCfWait *retention)
 {
 	ControlRootImage *root;
 	ControlRootImage *peer_root;
@@ -3311,8 +3455,10 @@ read_canonical_version(uint16 thread_id, const ClusterControlRootIdentity *expec
 	{
 		if (auxiliary ? cluster_cf_lock_poll(ShareLock) : cluster_cf_lock(ShareLock)) {
 			held = true;
-			if (cluster_cf_held_is_clusterwide(ShareLock)
-				&& (!auxiliary || canonical_aux_capture_cut(&continuation))) {
+			if (retention != NULL && !retention_startup_cf_current(retention))
+				result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+			else if (cluster_cf_held_is_clusterwide(ShareLock)
+					 && (!auxiliary || canonical_aux_capture_cut(&continuation))) {
 				if (recovery != NULL)
 					result
 						= read_recovery_subject_locked(thread_id, storage_uuid, system_identifier,
@@ -3485,7 +3631,7 @@ read_canonical_v2(uint16 thread, const ClusterControlRootIdentity *expected,
 				  uint64 admitted_incarnation, ClusterControlRootStopObservation *stop)
 {
 	return read_canonical_version(thread, expected, out, token, admitted_incarnation, stop,
-								  CONTROL_ROOT_HEADER_VERSION_V2, NULL);
+								  CONTROL_ROOT_HEADER_VERSION_V2, NULL, NULL);
 }
 
 ClusterControlRootResult
@@ -3537,7 +3683,7 @@ cluster_control_root_v3_read_canonical(uint16 thread, const ClusterControlRootId
 									   ClusterControlRootReadToken *token)
 {
 	return read_canonical_version(thread, expected, out, token, 0, NULL,
-								  CONTROL_ROOT_HEADER_VERSION_V3, NULL);
+								  CONTROL_ROOT_HEADER_VERSION_V3, NULL, NULL);
 }
 
 ClusterControlRootResult
@@ -3547,7 +3693,7 @@ cluster_control_root_v3_stop_phase_read(uint16 thread, uint64 admitted_incarnati
 	if (out == NULL)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	return read_canonical_version(thread, NULL, NULL, NULL, admitted_incarnation, out,
-								  CONTROL_ROOT_HEADER_VERSION_V3, NULL);
+								  CONTROL_ROOT_HEADER_VERSION_V3, NULL, NULL);
 }
 
 ClusterControlRootResult
@@ -3558,7 +3704,7 @@ cluster_control_root_read_recovery_subject(uint16 origin_thread,
 	if (out == NULL || history_ranges_overlap(expected, sizeof(*expected), out, sizeof(*out)))
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	return read_canonical_version(origin_thread, expected, NULL, NULL, 0, NULL,
-								  CONTROL_ROOT_HEADER_VERSION_V3, out);
+								  CONTROL_ROOT_HEADER_VERSION_V3, out, NULL);
 }
 
 ClusterControlRootResult
@@ -3975,15 +4121,34 @@ cluster_control_root_v3_terminal_history_blocked(
 	ClusterWalHistoryImage history;
 	ClusterControlRootResult result;
 	volatile bool held = false;
+	ClusterControlRootIdentity expected;
+	RootRetentionCfWait original;
+	bool startup = MyBackendType == B_STARTUP;
+	bool waited = false;
 
 	if (out_blocked != NULL)
 		*out_blocked = true;
 	if (expected_identity == NULL || out_blocked == NULL)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	expected = *expected_identity;
+	if (startup)
+		retention_startup_cf_capture(&original, expected_identity);
 	memset(&snapshot, 0, sizeof(snapshot));
 	memset(&token, 0, sizeof(token));
-	result = cluster_control_root_v3_read_canonical(expected_identity->origin_thread_id,
-													expected_identity, &snapshot, &token);
+	for (;;) {
+		ClusterCfAttemptObservation attempt;
+		uint64 before = startup ? cluster_cf_attempt_sequence() : 0;
+
+		result = read_canonical_version(expected.origin_thread_id, &expected, &snapshot, &token, 0,
+										NULL, CONTROL_ROOT_HEADER_VERSION_V3, NULL,
+										waited ? &original : NULL);
+		if (result != CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE || !startup
+			|| !cluster_cf_last_attempt_since(before, &attempt)
+			|| !cluster_cf_attempt_wait_slice(&attempt) || attempt.mode != ShareLock)
+			break;
+		retention_startup_cf_wait(&original, &attempt);
+		waited = true;
+	}
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 		return result;
@@ -3992,17 +4157,29 @@ cluster_control_root_v3_terminal_history_blocked(
 	root = palloc0(sizeof(*root));
 	PG_TRY();
 	{
-		if (!cluster_cf_lock(ShareLock)) {
+		for (;;) {
+			ClusterCfAttemptObservation attempt;
+			uint64 before = startup ? cluster_cf_attempt_sequence() : 0;
+
+			if (cluster_cf_lock(ShareLock))
+				break;
 			result = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
-			goto retention_done;
+			if (!startup || !cluster_cf_last_attempt_since(before, &attempt)
+				|| !cluster_cf_attempt_wait_slice(&attempt) || attempt.mode != ShareLock)
+				goto retention_done;
+			retention_startup_cf_wait(&original, &attempt);
+			waited = true;
 		}
 		held = true;
-		result = read_control_version(expected_identity->storage_uuid,
-									  expected_identity->system_identifier, root, &common,
-									  &file_token, CONTROL_ROOT_HEADER_VERSION_V3);
+		if (waited && !retention_startup_cf_current(&original)) {
+			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+			goto retention_done;
+		}
+		result = read_control_version(expected.storage_uuid, expected.system_identifier, root,
+									  &common, &file_token, CONTROL_ROOT_HEADER_VERSION_V3);
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 			|| result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
-			make_read_token(root, expected_identity->origin_thread_id, CONTROL_ROOT_SOURCE_PRIMARY,
+			make_read_token(root, expected.origin_thread_id, CONTROL_ROOT_SOURCE_PRIMARY,
 							&current_token);
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 			&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
@@ -4011,8 +4188,7 @@ cluster_control_root_v3_terminal_history_blocked(
 			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 			goto retention_done;
 		}
-		result = cluster_wal_history_read_locked(root, expected_identity->origin_thread_id - 1,
-												 &history);
+		result = cluster_wal_history_read_locked(root, expected.origin_thread_id - 1, &history);
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			*out_blocked = history.terminal_count != 0;
 	retention_done:

@@ -1464,6 +1464,7 @@ test_cluster_startup_cf_entry: test_cluster_startup_cf_entry.c test_cluster_cf_e
 		test_cluster_merge_cf_entry.inc \
 		test_cluster_merge_cold_cf.inc \
 		test_cluster_inputs_cf.inc test_cluster_inputs_cf_checkpoint.inc \
+		test_cluster_retention_cf_types.inc test_cluster_retention_cf.inc \
 		test_cluster_cf_blocker_trace.inc test_cluster_startup_interrupt.inc unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_cf_enqueue.c \
 		$(top_srcdir)/src/backend/cluster/cluster_lock_owner.c \
@@ -1512,6 +1513,26 @@ test_cluster_inputs_cf_checkpoint.inc: $(top_srcdir)/src/backend/cluster/cluster
 	     /^cluster_wal_inputs_cold_checkpoint_v1\(/ { print "ClusterControlRootResult"; emit=1; callers++ } \
 	     emit { print } /^}/ { emit=0 } \
 	     END { if (overlaps != 1 || callers != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Original retention consumers and their shared canonical observation, joined
+# to the actual failed CF request and CONTROL retirement producer.
+test_cluster_retention_cf_types.inc: $(top_srcdir)/src/backend/cluster/cluster_control_root.c Makefile
+	awk '/^typedef struct CanonicalAuxRead / { types=1; auxiliary++ } \
+	     /^typedef struct RootRetentionCfWait / { types=1; helpers++ } \
+	     types { print; if (/^}/) types=0; next } \
+	     /^static CanonicalAuxRead canonical_aux_read;/ { print; globals++ } \
+	     END { if (auxiliary != 1 || globals != 1 || helpers > 1 || types) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_retention_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_control_root.c Makefile
+	awk '/^(cluster_control_root_identity_equal|read_token_equal|canonical_aux_actor|canonical_aux_capture_cut|canonical_aux_finish)\(/ { print ($$0 ~ /^cluster_control_root_identity_equal/ ? "bool" : "static bool"); emit=1; predicates++ } \
+	     /^(runtime_v2_owner_check|release_cf|read_retention_version|read_canonical_version|cluster_control_root_v3_read_canonical|cluster_control_root_v3_terminal_history_blocked)\(/ { print ($$0 ~ /^cluster_control_root_v3_/ ? "ClusterControlRootResult" : "static ClusterControlRootResult"); emit=1; consumers++ } \
+	     /^make_read_token\(/ { print "static void"; emit=1; tokens++ } \
+	     /^retention_startup_cf_current\(/ { print "static bool"; emit=1; checks++ } \
+	     /^retention_startup_cf_(capture|wait)\(/ { print "static void"; emit=1; waiters++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (predicates != 5 || consumers != 6 || tokens != 1 || checks > 1 || waiters > 2 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # PGRAC: execute the real earliest startup-directory mutation call site.

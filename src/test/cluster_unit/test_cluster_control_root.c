@@ -14991,7 +14991,7 @@ UT_TEST(test_v2_retention_exception_releases_owned_cf)
 	volatile bool caught = false;
 
 	v2_retention_fixture(bytes, &self, &candidate);
-	test_throw_epoch_read = 3; /* Post-read revalidation, with CF-S owned. */
+	test_throw_epoch_read = 4; /* Post-read revalidation, with CF-S owned. */
 	memset(&out, 0x5a, sizeof(out));
 	memset(&token, 0x5a, sizeof(token));
 	PG_TRY();
@@ -15022,7 +15022,7 @@ UT_TEST(test_v2_retention_exception_unconfirmed_release_is_fatal)
 	volatile bool caught = false;
 
 	v2_retention_fixture(bytes, &self, &candidate);
-	test_throw_epoch_read = 3;
+	test_throw_epoch_read = 4;
 	test_cf_release_confirmed = false;
 	test_capture_error_level = true;
 	test_last_error_level = 0;
@@ -26832,6 +26832,23 @@ main(int argc, char **argv)
 		return ut_failed_count ? 1 : 0;
 	}
 
+	if (getenv("PGRAC_PRE2_TEST_RETENTION") != NULL) {
+		UT_PLAN(12);
+		UT_RUN(test_v2_retention_reader_owns_exact_live_thread_and_cf);
+		UT_RUN(test_v2_retention_refusals_clear_all_outputs);
+		UT_RUN(test_v2_retention_exception_releases_owned_cf);
+		UT_RUN(test_v2_retention_exception_unconfirmed_release_is_fatal);
+		UT_RUN(test_runtime_v3_canonical_foreign_absent_and_cf_refusals);
+		UT_RUN(test_runtime_v3_canonical_error_releases_owned_lock);
+		UT_RUN(test_runtime_v3_canonical_error_unconfirmed_cleanup_is_fatal);
+		UT_RUN(test_v3_runtime_retention_and_canonical_use_exact_new_root);
+		UT_RUN(test_v3_runtime_pending_cannot_be_clean_or_retention_authority);
+		UT_RUN(test_runtime_pending_worker_publishes_checkpointless_terminal);
+		UT_RUN(test_runtime_terminal_retention_rejects_second_read_race);
+		UT_RUN(test_runtime_pending_worker_uncertain_root_publish_retains_terminal);
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_ROOT_POLL_RED") != NULL) {
 		UT_PLAN(1);
 		UT_RUN(test_runtime_v3_service_read_waits_for_exact_retirement_before_output);
