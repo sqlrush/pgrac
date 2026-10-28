@@ -1076,6 +1076,18 @@ test_cluster_fresh_foreign_server.inc: $(top_srcdir)/src/backend/commands/foreig
 	     /^}/ { emit=0 } \
 	     END { if (entries != 2 || cuts != 2 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
+test_cluster_fresh_user_mapping.inc: $(top_srcdir)/src/backend/commands/foreigncmds.c Makefile
+	awk '/^CreateUserMapping\(/ || /^AlterUserMapping\(/ \
+	     { print "ObjectAddress"; emit=1; entries++ } \
+	     /^RemoveUserMapping\(/ { print "Oid"; emit=1; removing=1; entries++ } \
+	     emit { print } \
+	     emit && !removing && /rel = table_open\(UserMappingRelationId, RowExclusiveLock\);/ \
+	     { print "return InvalidObjectAddress; }"; emit=0; cuts++ } \
+	     emit && removing && /srv = GetForeignServerByName\(stmt->servername, true\);/ \
+	     { print "return InvalidOid; }"; emit=0; removing=0; cuts++ } \
+	     /^}/ { emit=0 } \
+	     END { if (entries != 3 || cuts != 3 || emit || removing) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
 test_cluster_fresh_scope: test_cluster_fresh_scope.c unit_test.h \
 		test_cluster_fresh_control.inc test_cluster_fresh_startup.inc test_cluster_fresh_read.inc \
 		test_cluster_fresh_boolean.inc test_cluster_fresh_index.inc test_cluster_fresh_utility.inc \
@@ -1086,7 +1098,7 @@ test_cluster_fresh_scope: test_cluster_fresh_scope.c unit_test.h \
 		test_cluster_fresh_policy.inc test_cluster_fresh_conversion.inc test_cluster_fresh_collation.inc \
 		test_cluster_fresh_event_trigger.inc test_cluster_fresh_owner.inc test_cluster_fresh_language.inc \
 		test_cluster_fresh_access_method.inc test_cluster_fresh_function.inc test_cluster_fresh_fdw.inc \
-		test_cluster_fresh_foreign_server.inc
+		test_cluster_fresh_foreign_server.inc test_cluster_fresh_user_mapping.inc
 	$(CC) $(CFLAGS) -Wno-unused-variable -Wno-unused-but-set-variable $(CPPFLAGS) $< \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 # PGRAC: link the real durable-prefix codec/reader, not a test copy.
@@ -6397,7 +6409,7 @@ clean distclean maintainer-clean:
 		test_cluster_fresh_policy.inc test_cluster_fresh_conversion.inc test_cluster_fresh_collation.inc \
 		test_cluster_fresh_event_trigger.inc test_cluster_fresh_owner.inc test_cluster_fresh_language.inc \
 		test_cluster_fresh_access_method.inc test_cluster_fresh_function.inc test_cluster_fresh_fdw.inc \
-		test_cluster_fresh_foreign_server.inc
+		test_cluster_fresh_foreign_server.inc test_cluster_fresh_user_mapping.inc
 	rm -f $(TESTS) pgrac_fenced_live_rejoin_client probe_pgrac_fenced_cib \
 		test_cluster_tt_locator_stats.inc \
 		test_cluster_heap_inplace_version.inc test_cluster_heap_inplace_legacy_version.inc \

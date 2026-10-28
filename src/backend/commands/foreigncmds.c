@@ -1180,6 +1180,10 @@ CreateUserMapping(CreateUserMappingStmt *stmt)
 	ForeignDataWrapper *fdw;
 	RoleSpec   *role = (RoleSpec *) stmt->user;
 
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedFdwWrite((Node *)stmt, false);
+#endif
+
 	rel = table_open(UserMappingRelationId, RowExclusiveLock);
 
 	if (role->roletype == ROLESPEC_PUBLIC)
@@ -1304,6 +1308,10 @@ AlterUserMapping(AlterUserMappingStmt *stmt)
 	ObjectAddress address;
 	RoleSpec   *role = (RoleSpec *) stmt->user;
 
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedFdwWrite((Node *)stmt, true);
+#endif
+
 	rel = table_open(UserMappingRelationId, RowExclusiveLock);
 
 	if (role->roletype == ROLESPEC_PUBLIC)
@@ -1396,6 +1404,10 @@ RemoveUserMapping(DropUserMappingStmt *stmt)
 	Oid			umId;
 	ForeignServer *srv;
 	RoleSpec   *role = (RoleSpec *) stmt->user;
+
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedFdwWrite((Node *)stmt, true);
+#endif
 
 	if (role->roletype == ROLESPEC_PUBLIC)
 		useId = ACL_ID_PUBLIC;

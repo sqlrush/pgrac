@@ -42,6 +42,7 @@
 #include "catalog/pg_proc.h"
 #include "catalog/pg_transform.h"
 #include "catalog/pg_type_d.h"
+#include "catalog/pg_user_mapping.h"
 #include "commands/alter.h"
 #include "commands/collationcmds.h"
 #include "commands/comment.h"
@@ -5767,6 +5768,11 @@ UT_TEST(test_drop_unsupported_objects_refuse_before_binding)
 /* Execute the whole native import and its real filter. Catalog/ACL/FDW/parser
  * services and the post-prologue DDL executor are controlled boundaries; the
  * original utility prologue runs again for each returned child statement. */
+static bool user_mapping_lookup_active, user_mapping_expect_binding;
+static bool user_mapping_expected_missing_ok;
+static unsigned user_mapping_lookups, user_mapping_unbound, user_mapping_bad_lookup;
+static unsigned user_mapping_lookup_kind, user_mapping_expected_boundary;
+static const RoleSpec *user_mapping_expected_role;
 static ForeignServer import_server;
 static ForeignDataWrapper import_fdw;
 static FdwRoutine import_routine;
@@ -5833,6 +5839,16 @@ import_observe_binding(void)
 ForeignServer *
 GetForeignServerByName(const char *name, bool missing_ok)
 {
+	if (user_mapping_lookup_active) {
+		user_mapping_lookups++;
+		user_mapping_lookup_kind = 3;
+		if (user_mapping_expect_binding && utility_binds == 0)
+			user_mapping_unbound++;
+		if (user_mapping_expected_boundary != 3 || !missing_ok
+			|| strcmp(name, "mapping_server") != 0)
+			user_mapping_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before the real server query. */
+	}
 	import_lookups++;
 	import_observe_binding();
 	if (missing_ok || strcmp(name, "server") != 0)
@@ -6222,6 +6238,16 @@ get_database_oid(const char *dbname, bool missing_ok)
 Relation
 table_open(Oid relationId, LOCKMODE lockmode)
 {
+	if (user_mapping_lookup_active) {
+		user_mapping_lookups++;
+		user_mapping_lookup_kind = 1;
+		if (user_mapping_expect_binding && utility_binds == 0)
+			user_mapping_unbound++;
+		if (user_mapping_expected_boundary != 1 || relationId != UserMappingRelationId
+			|| lockmode != RowExclusiveLock)
+			user_mapping_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before the real mapping catalog lock. */
+	}
 	if (foreign_server_lookup_active) {
 		foreign_server_lookups++;
 		if (foreign_server_expect_binding && utility_binds == 0)
@@ -7441,6 +7467,16 @@ static RoleSpec owner_role;
 Oid
 get_rolespec_oid(const RoleSpec *role, bool missing_ok)
 {
+	if (user_mapping_lookup_active) {
+		user_mapping_lookups++;
+		user_mapping_lookup_kind = 2;
+		if (user_mapping_expect_binding && utility_binds == 0)
+			user_mapping_unbound++;
+		if (user_mapping_expected_boundary != 2 || role != user_mapping_expected_role
+			|| role->roletype == ROLESPEC_PUBLIC || missing_ok != user_mapping_expected_missing_ok)
+			user_mapping_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before the real role query. */
+	}
 	if (owner_lookup_active) {
 		owner_lookups++;
 		if (owner_expect_binding && utility_binds == 0)
@@ -9561,10 +9597,226 @@ UT_TEST(test_native_foreign_server_utility_warm_context_guards_preserve_binding)
 	foreign_server_lookup_active = false;
 }
 
+/* Actual mapping prefixes share the original helper from fdw.inc. CREATE
+ * and ALTER stop before table_open; DROP stops before role or server lookup. */
+#include "test_cluster_fresh_user_mapping.inc"
+static RoleSpec native_user_mapping_role;
+static CreateUserMappingStmt native_user_mapping_create;
+static AlterUserMappingStmt native_user_mapping_alter;
+static DropUserMappingStmt native_user_mapping_drop;
+static const char *user_mapping_commands[]
+	= { "CREATE USER MAPPING", "CREATE USER MAPPING", "ALTER USER MAPPING", "DROP USER MAPPING",
+		"DROP USER MAPPING" };
+
+static void
+reset_native_user_mapping(bool expect_binding, unsigned kind)
+{
+	static const RoleSpecType roles[] = { ROLESPEC_CSTRING, ROLESPEC_PUBLIC, ROLESPEC_CURRENT_ROLE,
+										  ROLESPEC_CURRENT_USER, ROLESPEC_SESSION_USER };
+	unsigned op = kind / 5;
+
+	reset_create_preflight();
+	user_mapping_lookup_active = true;
+	user_mapping_expect_binding = expect_binding;
+	user_mapping_lookups = user_mapping_unbound = user_mapping_bad_lookup = user_mapping_lookup_kind
+		= 0;
+	native_user_mapping_role = (RoleSpec){ .type = T_RoleSpec,
+										   .roletype = roles[kind % 5],
+										   .rolename = kind % 5 == 0 ? "mapping_user" : NULL,
+										   .location = -1 };
+	user_mapping_expected_role = &native_user_mapping_role;
+	user_mapping_expected_missing_ok = op == 4;
+	user_mapping_expected_boundary = op < 3 ? 1 : kind % 5 == 1 ? 3 : 2;
+	native_user_mapping_create = (CreateUserMappingStmt){ .type = T_CreateUserMappingStmt,
+														  .user = &native_user_mapping_role,
+														  .servername = "mapping_server",
+														  .if_not_exists = op == 1 };
+	native_user_mapping_alter = (AlterUserMappingStmt){ .type = T_AlterUserMappingStmt,
+														.user = &native_user_mapping_role,
+														.servername = "mapping_server" };
+	native_user_mapping_drop = (DropUserMappingStmt){ .type = T_DropUserMappingStmt,
+													  .user = &native_user_mapping_role,
+													  .servername = "mapping_server",
+													  .missing_ok = op == 4 };
+}
+
+static Node *
+native_user_mapping_statement(unsigned kind)
+{
+	return kind < 10   ? (Node *)&native_user_mapping_create
+		   : kind < 15 ? (Node *)&native_user_mapping_alter
+					   : (Node *)&native_user_mapping_drop;
+}
+
+static void
+native_user_mapping_entry(unsigned kind)
+{
+	if (kind < 10)
+		(void)CreateUserMapping(&native_user_mapping_create);
+	else if (kind < 15)
+		(void)AlterUserMapping(&native_user_mapping_alter);
+	else
+		(void)RemoveUserMapping(&native_user_mapping_drop);
+}
+
+UT_TEST(test_native_user_mapping_binds_before_catalog_access_in_all_profiles)
+{
+	for (unsigned kind = 0; kind < 25; kind++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_user_mapping(binds, kind);
+			cluster_shared_catalog = (mode & 1) != 0;
+			utility_storage_mode = (mode & 2) != 0;
+			cluster_shared_config = (mode & 4) != 0;
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_user_mapping_entry(kind);
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(user_mapping_lookups, repeat + 1);
+				UT_ASSERT_EQ(user_mapping_bad_lookup, 0);
+				UT_ASSERT_EQ(user_mapping_lookup_kind,
+							 user_mapping_lookups ? user_mapping_expected_boundary : 0);
+				UT_ASSERT_EQ(user_mapping_unbound, 0);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	user_mapping_lookup_active = false;
+}
+
+UT_TEST(test_native_user_mapping_publication_child_and_wrong_top_precede_catalog_access)
+{
+	for (unsigned kind = 0; kind < 25; kind++) {
+		for (unsigned failure = 0; failure < 5; failure++) {
+			bool allocated = failure == 0 || failure == 2;
+			int caught;
+
+			reset_native_user_mapping(true, kind);
+			if (failure == 0)
+				utility_bind_ok = false;
+			else if (failure == 1 || failure == 2) {
+				if (failure == 2)
+					create_sql_entry(native_user_mapping_statement(kind));
+				utility_in_child = true;
+			} else {
+				utility_current_xid = 401;
+				utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_user_mapping_entry(kind);
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, failure == 0  ? ERRCODE_DATA_CORRUPTED
+									 : failure < 3 ? ERRCODE_FEATURE_NOT_SUPPORTED
+												   : ERRCODE_INTERNAL_ERROR);
+			if (failure == 0)
+				UT_ASSERT_STR_EQ(
+					error_message,
+					kind >= 10
+						? "canonical ACTIVE publication failed before shared catalog alteration"
+						: "canonical ACTIVE publication failed before shared catalog creation");
+			else if (failure < 3)
+				UT_ASSERT_STR_EQ(error_message,
+								 kind >= 10
+									 ? "shared catalog alteration does not support subtransactions"
+									 : "shared catalog creation does not support subtransactions");
+			else
+				UT_ASSERT_STR_EQ(error_message,
+								 "shared catalog top-level transaction identity mismatch");
+			UT_ASSERT_EQ(user_mapping_lookups, 0);
+			UT_ASSERT_EQ(user_mapping_bad_lookup, 0);
+			UT_ASSERT_EQ(user_mapping_lookup_kind,
+						 user_mapping_lookups ? user_mapping_expected_boundary : 0);
+			UT_ASSERT_EQ(utility_xids, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, failure == 2 ? 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, allocated || failure == 3 ? 400 : InvalidTransactionId);
+		}
+	}
+	user_mapping_lookup_active = false;
+}
+
+UT_TEST(test_native_user_mapping_context_guards_keep_nonshared_route)
+{
+	for (unsigned kind = 0; kind < 25; kind++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+
+			for (unsigned guard = 0; guard < 3; guard++) {
+				int caught;
+
+				reset_native_user_mapping(binds, kind);
+				cluster_shared_catalog = (mode & 1) != 0;
+				utility_storage_mode = (mode & 2) != 0;
+				cluster_shared_config = (mode & 4) != 0;
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_user_mapping_entry(kind);
+				UT_ASSERT_EQ(caught, binds ? 1 : 2);
+				UT_ASSERT_EQ(error_code, !binds		  ? 0
+										 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+													  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				if (binds)
+					UT_ASSERT(strstr(error_message, user_mapping_commands[kind / 5]) != NULL);
+				UT_ASSERT_EQ(user_mapping_lookups, binds ? 0 : 1);
+				UT_ASSERT_EQ(user_mapping_bad_lookup, 0);
+				UT_ASSERT_EQ(user_mapping_lookup_kind,
+							 user_mapping_lookups ? user_mapping_expected_boundary : 0);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	user_mapping_lookup_active = false;
+}
+
+UT_TEST(test_native_user_mapping_utility_warm_context_guards_preserve_binding)
+{
+	for (unsigned kind = 0; kind < 25; kind++) {
+		for (unsigned guard = 0; guard < 4; guard++) {
+			int caught;
+
+			reset_native_user_mapping(true, kind);
+			create_sql_entry(native_user_mapping_statement(kind));
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			XactReadOnly = guard == 1;
+			utility_parallel = guard == 2;
+			utility_recovery = guard == 3;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_user_mapping_entry(kind);
+			UT_ASSERT_EQ(caught, guard ? 1 : 2);
+			UT_ASSERT_EQ(error_code, !guard		  ? 0
+									 : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+												  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT_EQ(user_mapping_lookups, guard ? 0 : 1);
+			UT_ASSERT_EQ(user_mapping_bad_lookup, 0);
+			UT_ASSERT_EQ(user_mapping_lookup_kind,
+						 user_mapping_lookups ? user_mapping_expected_boundary : 0);
+			UT_ASSERT_EQ(user_mapping_unbound, 0);
+			UT_ASSERT_EQ(utility_prepares, guard ? 1 : 2);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			UT_ASSERT_EQ(utility_top_xid, 400);
+		}
+	}
+	user_mapping_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(137);
+	UT_PLAN(141);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -9702,6 +9954,10 @@ main(void)
 	UT_RUN(test_native_foreign_server_publication_child_and_wrong_top_precede_catalog_lock);
 	UT_RUN(test_native_foreign_server_context_guards_keep_nonshared_route);
 	UT_RUN(test_native_foreign_server_utility_warm_context_guards_preserve_binding);
+	UT_RUN(test_native_user_mapping_binds_before_catalog_access_in_all_profiles);
+	UT_RUN(test_native_user_mapping_publication_child_and_wrong_top_precede_catalog_access);
+	UT_RUN(test_native_user_mapping_context_guards_keep_nonshared_route);
+	UT_RUN(test_native_user_mapping_utility_warm_context_guards_preserve_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
