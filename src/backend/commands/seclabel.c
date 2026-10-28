@@ -6,6 +6,13 @@
  * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
+ * IDENTIFICATION
+ *    src/backend/commands/seclabel.c
+ *
+ * PGRAC MODIFICATIONS
+ *    Preserve shared scope and preflight native labels before object locks.
+ *    Author: SqlRush <sqlrush@gmail.com>
+ *
  * -------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -14,12 +21,18 @@
 #include "access/htup_details.h"
 #include "access/relation.h"
 #include "access/table.h"
+#include "access/xact.h"
 #include "catalog/catalog.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_seclabel.h"
 #include "catalog/pg_shseclabel.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_mode.h"
+#include "cluster/cluster_tt_local.h"
+#endif
 #include "commands/seclabel.h"
 #include "miscadmin.h"
+#include "tcop/utility.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/memutils.h"
@@ -119,6 +132,39 @@ ExecSecLabelStmt(SecLabelStmt *stmt)
 	Relation	relation;
 	ListCell   *lc;
 
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: direct entry retains the original utility scope refusal.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if (cluster_shared_config || cluster_shared_catalog) {
+		const char *unsupported = NULL;
+
+		switch (stmt->objtype) {
+		case OBJECT_MATVIEW:
+			unsupported = "materialized views";
+			break;
+		case OBJECT_TYPE:
+		case OBJECT_DOMAIN:
+			unsupported = "custom types";
+			break;
+		case OBJECT_OPERATOR:
+		case OBJECT_OPCLASS:
+		case OBJECT_OPFAMILY:
+			unsupported = "custom operators";
+			break;
+		case OBJECT_EXTENSION:
+			unsupported = "CREATE/DROP EXTENSION";
+			break;
+		default:
+			break;
+		}
+		if (unsupported != NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("%s is not supported in shared mode", unsupported),
+					 errdetail("PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED")));
+	}
+#endif
+
 	/*
 	 * Find the named label provider, or if none specified, check whether
 	 * there's exactly one, and if so use it.
@@ -158,6 +204,32 @@ ExecSecLabelStmt(SecLabelStmt *stmt)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("security labels are not supported for this type of object")));
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: preserve native validation, then bind before object locks.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if (cluster_shared_catalog && cluster_storage_mode_enabled()) {
+		ClusterCanonicalTxnBinding binding;
+		TransactionId current_xid;
+
+		PreventCommandIfReadOnly("SECURITY LABEL");
+		PreventCommandIfParallelMode("SECURITY LABEL");
+		PreventCommandDuringRecovery("SECURITY LABEL");
+		if (IsSubTransaction())
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("shared catalog alteration does not support subtransactions")));
+		current_xid = GetCurrentTransactionIdIfAny();
+		if (TransactionIdIsValid(current_xid)
+			&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("shared catalog top-level transaction identity mismatch")));
+		if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+			ereport(
+				ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("canonical ACTIVE publication failed before shared catalog alteration")));
+	}
+#endif
 
 	/*
 	 * Translate the parser representation which identifies this object into

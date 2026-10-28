@@ -41,6 +41,7 @@
 #include "commands/defrem.h"
 #include "commands/extension.h"
 #include "commands/schemacmds.h"
+#include "commands/seclabel.h"
 #include "commands/user.h"
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_tt_local.h"
@@ -6127,6 +6128,9 @@ static String comment_database_name, comment_table_name;
 static ListCell comment_table_cell;
 static List comment_table_names;
 static CommentStmt native_comment_stmt;
+static bool label_lookup_active, label_expect_binding;
+static unsigned label_lookups, label_unbound, label_bad_lookup;
+static SecLabelStmt native_label_stmt;
 
 Oid
 get_database_oid(const char *dbname, bool missing_ok)
@@ -6172,6 +6176,15 @@ ObjectAddress
 get_object_address(ObjectType objtype, Node *object, Relation *relp, LOCKMODE lockmode,
 				   bool missing_ok)
 {
+	if (label_lookup_active) {
+		label_lookups++;
+		if (label_expect_binding && utility_binds == 0)
+			label_unbound++;
+		if (objtype != native_label_stmt.objtype || object != native_label_stmt.object
+			|| relp == NULL || lockmode != ShareUpdateExclusiveLock || missing_ok)
+			label_bad_lookup++;
+		siglongjmp(boundary, 2);
+	}
 	if (comment_lookup_active) {
 		comment_object_lookups++;
 		if (comment_expect_binding && utility_binds == 0)
@@ -6987,10 +7000,289 @@ UT_TEST(test_native_comment_missing_database_retains_early_return_and_binding_co
 	comment_lookup_active = false;
 }
 
+/* Actual provider representation, type validation and native prefix run here.
+ * Provider hooks and object locks never execute past the jump2 boundary. */
+#include "test_cluster_fresh_seclabel.inc"
+static LabelProvider label_providers[2];
+static ListCell label_provider_cells[2], label_object_cell;
+static List label_providers_list, label_object_names;
+static String label_object_name;
+
+static void
+reset_native_label(bool expect_binding, bool named)
+{
+	reset_create_preflight();
+	label_lookup_active = true;
+	label_expect_binding = expect_binding;
+	label_lookups = label_unbound = label_bad_lookup = 0;
+	label_providers[0] = (LabelProvider){ .provider_name = "label_one" };
+	label_providers[1] = (LabelProvider){ .provider_name = "label_two" };
+	label_provider_cells[0] = (ListCell){ .ptr_value = &label_providers[0] };
+	label_provider_cells[1] = (ListCell){ .ptr_value = &label_providers[1] };
+	label_providers_list = (List){ .type = T_List,
+								   .length = named ? 2 : 1,
+								   .max_length = 2,
+								   .elements = label_provider_cells };
+	label_provider_list = &label_providers_list;
+	label_object_name = (String){ .type = T_String, .sval = "label_table" };
+	label_object_cell = (ListCell){ .ptr_value = &label_object_name };
+	label_object_names
+		= (List){ .type = T_List, .length = 1, .max_length = 1, .elements = &label_object_cell };
+	native_label_stmt = (SecLabelStmt){ .type = T_SecLabelStmt,
+										.objtype = OBJECT_TABLE,
+										.object = (Node *)&label_object_names,
+										.provider = named ? "label_two" : NULL,
+										.label = "label value" };
+}
+
+UT_TEST(test_native_security_labels_bind_before_object_lock_in_all_profiles)
+{
+	for (unsigned named = 0; named < 2; named++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_label(binds, named != 0);
+			cluster_shared_catalog = (mode & 1) != 0;
+			utility_storage_mode = (mode & 2) != 0;
+			cluster_shared_config = (mode & 4) != 0;
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					(void)ExecSecLabelStmt(&native_label_stmt);
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(label_lookups, repeat + 1);
+				UT_ASSERT_EQ(label_unbound, 0);
+				UT_ASSERT_EQ(label_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	label_lookup_active = false;
+}
+
+UT_TEST(test_native_security_label_refusals_precede_object_lock)
+{
+	for (unsigned named = 0; named < 2; named++) {
+		for (unsigned failure = 0; failure < 5; failure++) {
+			bool allocated = failure == 0 || failure == 2;
+			int caught;
+
+			reset_native_label(true, named != 0);
+			if (failure == 0)
+				utility_bind_ok = false;
+			else if (failure == 1 || failure == 2) {
+				if (failure == 2)
+					create_sql_entry((Node *)&native_label_stmt);
+				utility_in_child = true;
+			} else {
+				utility_current_xid = 401;
+				utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				(void)ExecSecLabelStmt(&native_label_stmt);
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, failure == 0					? ERRCODE_DATA_CORRUPTED
+									 : failure == 1 || failure == 2 ? ERRCODE_FEATURE_NOT_SUPPORTED
+																	: ERRCODE_INTERNAL_ERROR);
+			UT_ASSERT_EQ(label_lookups, 0);
+			UT_ASSERT_EQ(utility_xids, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, failure == 2 ? 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, allocated || failure == 3 ? 400 : InvalidTransactionId);
+		}
+	}
+	label_lookup_active = false;
+}
+
+UT_TEST(test_native_security_label_context_guards_keep_nonshared_route)
+{
+	for (unsigned named = 0; named < 2; named++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+
+			for (unsigned guard = 0; guard < 3; guard++) {
+				int caught;
+
+				reset_native_label(binds, named != 0);
+				cluster_shared_catalog = (mode & 1) != 0;
+				utility_storage_mode = (mode & 2) != 0;
+				cluster_shared_config = (mode & 4) != 0;
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					(void)ExecSecLabelStmt(&native_label_stmt);
+				UT_ASSERT_EQ(caught, binds ? 1 : 2);
+				UT_ASSERT_EQ(error_code, !binds		  ? 0
+										 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+													  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				UT_ASSERT_EQ(label_lookups, binds ? 0 : 1);
+				UT_ASSERT_EQ(label_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids, 0);
+				UT_ASSERT_EQ(utility_prepares, 0);
+				UT_ASSERT_EQ(utility_binds, 0);
+			}
+		}
+	}
+	label_lookup_active = false;
+}
+
+UT_TEST(test_native_security_label_original_provider_and_type_errors_precede_allocation)
+{
+	const char *messages[] = { "no security label providers", "must specify provider",
+							   "is not loaded", "not supported for this type of object" };
+
+	for (unsigned mode = 0; mode < 8; mode++) {
+		for (unsigned failure = 0; failure < 4; failure++) {
+			int caught;
+
+			reset_native_label(false, failure == 1 || failure == 2);
+			cluster_shared_catalog = (mode & 1) != 0;
+			utility_storage_mode = (mode & 2) != 0;
+			cluster_shared_config = (mode & 4) != 0;
+			if (failure == 0)
+				label_provider_list = NIL;
+			else if (failure == 1)
+				native_label_stmt.provider = NULL;
+			else if (failure == 2)
+				native_label_stmt.provider = "missing";
+			else
+				native_label_stmt.objtype = OBJECT_INDEX;
+			XactReadOnly = utility_parallel = utility_recovery = utility_in_child = true;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				(void)ExecSecLabelStmt(&native_label_stmt);
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, failure == 3 ? ERRCODE_WRONG_OBJECT_TYPE
+												  : ERRCODE_INVALID_PARAMETER_VALUE);
+			UT_ASSERT(strstr(error_message, messages[failure]) != NULL);
+			UT_ASSERT_EQ(label_lookups, 0);
+			UT_ASSERT_EQ(utility_xids, 0);
+			UT_ASSERT_EQ(utility_prepares, 0);
+			UT_ASSERT_EQ(utility_binds, 0);
+		}
+	}
+	label_lookup_active = false;
+}
+
+UT_TEST(test_native_security_label_utility_warm_context_guards_preserve_binding)
+{
+	for (unsigned named = 0; named < 2; named++) {
+		for (unsigned guard = 0; guard < 4; guard++) {
+			int caught;
+
+			reset_native_label(true, named != 0);
+			create_sql_entry((Node *)&native_label_stmt);
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			XactReadOnly = guard == 1;
+			utility_parallel = guard == 2;
+			utility_recovery = guard == 3;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				(void)ExecSecLabelStmt(&native_label_stmt);
+			UT_ASSERT_EQ(caught, guard ? 1 : 2);
+			UT_ASSERT_EQ(error_code, !guard		  ? 0
+									 : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+												  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT_EQ(label_lookups, guard ? 0 : 1);
+			UT_ASSERT_EQ(label_unbound, 0);
+			UT_ASSERT_EQ(label_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_prepares, guard ? 1 : 2);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			UT_ASSERT_EQ(utility_top_xid, 400);
+		}
+	}
+	label_lookup_active = false;
+}
+
+UT_TEST(test_native_security_label_original_shared_scope_matches_utility_refusal)
+{
+	ObjectType forbidden[] = { OBJECT_MATVIEW, OBJECT_TYPE,		OBJECT_DOMAIN,	 OBJECT_OPERATOR,
+							   OBJECT_OPCLASS, OBJECT_OPFAMILY, OBJECT_EXTENSION };
+
+	for (unsigned mode = 0; mode < 8; mode++) {
+		if (mode == 0 || mode == 2)
+			continue;
+		for (unsigned type = 0; type < lengthof(forbidden); type++) {
+			char message[sizeof(error_message)], detail[sizeof(error_detail)];
+			int caught, code;
+
+			reset_native_label(false, false);
+			cluster_shared_catalog = (mode & 1) != 0;
+			utility_storage_mode = (mode & 2) != 0;
+			cluster_shared_config = (mode & 4) != 0;
+			native_label_stmt.objtype = forbidden[type];
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				create_sql_entry((Node *)&native_label_stmt);
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, ERRCODE_FEATURE_NOT_SUPPORTED);
+			code = error_code;
+			memcpy(message, error_message, sizeof(message));
+			memcpy(detail, error_detail, sizeof(detail));
+			UT_ASSERT_EQ(utility_xids, 0);
+			UT_ASSERT_EQ(utility_prepares, 0);
+			reset_error();
+			label_provider_list = NIL;
+			XactReadOnly = utility_parallel = utility_recovery = utility_in_child = true;
+			utility_bind_ok = false;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				(void)ExecSecLabelStmt(&native_label_stmt);
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, code);
+			UT_ASSERT_STR_EQ(error_message, message);
+			UT_ASSERT_STR_EQ(error_detail, detail);
+			UT_ASSERT_EQ(label_lookups, 0);
+			UT_ASSERT_EQ(utility_xids, 0);
+			UT_ASSERT_EQ(utility_prepares, 0);
+			UT_ASSERT_EQ(utility_binds, 0);
+		}
+	}
+	label_lookup_active = false;
+}
+
+UT_TEST(test_native_security_label_nonshared_object_type_routes_unchanged)
+{
+	ObjectType types[] = { OBJECT_MATVIEW, OBJECT_TYPE,		OBJECT_DOMAIN,	 OBJECT_OPERATOR,
+						   OBJECT_OPCLASS, OBJECT_OPFAMILY, OBJECT_EXTENSION };
+
+	for (unsigned storage = 0; storage < 2; storage++) {
+		for (unsigned type = 0; type < lengthof(types); type++) {
+			int caught;
+
+			reset_native_label(false, false);
+			cluster_shared_catalog = cluster_shared_config = false;
+			utility_storage_mode = storage != 0;
+			native_label_stmt.objtype = types[type];
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				(void)ExecSecLabelStmt(&native_label_stmt);
+			UT_ASSERT_EQ(caught, type < 3 ? 2 : 1);
+			UT_ASSERT_EQ(error_code, type < 3 ? 0 : ERRCODE_WRONG_OBJECT_TYPE);
+			UT_ASSERT_EQ(label_lookups, type < 3 ? 1 : 0);
+			UT_ASSERT_EQ(label_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_xids, 0);
+			UT_ASSERT_EQ(utility_prepares, 0);
+			UT_ASSERT_EQ(utility_binds, 0);
+		}
+	}
+	label_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(85);
+	UT_PLAN(92);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -7076,6 +7368,13 @@ main(void)
 	UT_RUN(test_native_comment_context_guards_keep_nonshared_native_route);
 	UT_RUN(test_native_comment_utility_warm_binding_and_context_rejection_preserve_top);
 	UT_RUN(test_native_comment_missing_database_retains_early_return_and_binding_cost);
+	UT_RUN(test_native_security_labels_bind_before_object_lock_in_all_profiles);
+	UT_RUN(test_native_security_label_refusals_precede_object_lock);
+	UT_RUN(test_native_security_label_context_guards_keep_nonshared_route);
+	UT_RUN(test_native_security_label_original_provider_and_type_errors_precede_allocation);
+	UT_RUN(test_native_security_label_utility_warm_context_guards_preserve_binding);
+	UT_RUN(test_native_security_label_original_shared_scope_matches_utility_refusal);
+	UT_RUN(test_native_security_label_nonshared_object_type_routes_unchanged);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
