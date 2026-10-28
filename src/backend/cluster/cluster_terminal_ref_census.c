@@ -2397,6 +2397,60 @@ cluster_ctrc_shmem_ready(void)
 		   && ctrc_shared_header_exact(CtrcShared, &capacity);
 }
 
+static void
+ctrc_recovery_local_lock_held(LWLock *lock pg_attribute_unused(),
+	LWLockMode mode pg_attribute_unused(), void *context)
+{
+	*(bool *)context = true;
+}
+
+ClusterCtrcLocalEmptyV1
+cluster_ctrc_recovery_local_empty_v1(void)
+{
+	LWLock *locks[CLUSTER_CTRC_CLEANER_WORKERS + 2];
+	ClusterCtrcCapacity capacity;
+	ClusterCtrcSharedHeader *shared = CtrcShared;
+	ClusterCtrcLocalEmptyV1 result = CLUSTER_CTRC_LOCAL_WAIT;
+	volatile unsigned held = 0;
+	bool caller_held = false;
+
+	/* No borrowed PAGE/CF/ROOT lock may enter this whole-directory probe.
+	 * Conditional acquisition also needs space in the native held list. */
+	ForEachLWLockHeldByMe(ctrc_recovery_local_lock_held, &caller_held);
+	if (caller_held || lengthof(locks) > LWLOCK_MAX_HELD_BY_PROC
+		|| shared == NULL || !ctrc_runtime_capacity(&capacity)
+		|| CtrcShared != shared || !ctrc_shared_header_exact(shared, &capacity))
+		return CLUSTER_CTRC_LOCAL_REFUSED;
+	locks[0] = &shared->origin_lock;
+	for (unsigned i = 0; i < CLUSTER_CTRC_CLEANER_WORKERS; i++)
+		locks[i + 1] = &shared->participant_locks[i].lock;
+	locks[lengthof(locks) - 1] = &shared->receipt_lock;
+	PG_TRY();
+	{
+		/* Never wait while combining the original writer domains. Contention
+		 * drops this partial set; no blocking writer lock order is changed. */
+		while (held < lengthof(locks)) {
+			if (!LWLockConditionalAcquire(locks[held], LW_SHARED)) break;
+			held++;
+		}
+		if (held == lengthof(locks)) {
+			if (CtrcShared != shared || !ctrc_shared_header_exact(shared, &capacity))
+				result = CLUSTER_CTRC_LOCAL_REFUSED;
+			else if (ctrc_bytes_zero((uint8 *)shared + shared->origin_offset,
+				shared->total_bytes - shared->origin_offset))
+				result = CLUSTER_CTRC_LOCAL_EMPTY;
+			/* Unknown, cancelled, or otherwise nonzero bytes retain the
+			 * obligation too. Diagnostic active counts are not sufficient. */
+		}
+	}
+	PG_FINALLY();
+	{
+		while (held > 0) LWLockRelease(locks[--held]);
+	}
+	PG_END_TRY();
+	return result;
+}
+
 uint64
 cluster_ctrc_stat_get(ClusterCtrcStatId stat)
 {

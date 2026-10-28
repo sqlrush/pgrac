@@ -2,6 +2,7 @@
  * binding/fence, WAL, storage and ResourceOwner services remain fixture leaves. */
 #define USE_PGRAC_CLUSTER 1
 #include "postgres.h"
+#include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/storage/cluster_shared_fs_page.h"
 #include <setjmp.h>
 #include "access/xlog.h"
@@ -2328,10 +2329,22 @@ UT_TEST(test_relmap_failure_revokes_original_episode_without_free_or_release)
 #include "test_cluster_cold_ctrc_pending_window.inc"
 #include "test_cluster_cold_ctrc_returned_fpi.inc"
 #include "test_cluster_cold_ctrc_pending_storage.inc"
+static void startup_local_empty_reset(void);
 #include "test_cluster_cold_ctrc_pending_readback.inc"
+#include "test_cluster_cold_ctrc_local_empty.inc"
 
 int main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_STARTUP_LOCAL_EMPTY") != NULL) {
+		UT_PLAN(6);
+		UT_RUN(test_startup_local_empty_is_after_page_cleanup_without_discharging);
+		UT_RUN(test_startup_local_empty_wait_retains_operation_and_rechecks_readback);
+		UT_RUN(test_startup_local_empty_refusal_keeps_original_cleanup_debt);
+		UT_RUN(test_startup_local_empty_error_keeps_original_cleanup_debt);
+		UT_RUN(test_startup_local_empty_cannot_change_saved_operation_or_target);
+		UT_RUN(test_startup_local_empty_does_not_hide_readback_refusal);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_STARTUP_PENDING_READBACK") != NULL) {
 		UT_PLAN(6);
 		UT_RUN(test_startup_pending_readback_uses_saved_operation_before_service);
@@ -2459,7 +2472,14 @@ int main(void)
 		UT_RUN(test_ctrc_pages_native_error_retires_cursor_before_original_scope);
 		reset(); UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(199);
+	UT_PLAN(205);
+	UT_RUN(test_startup_local_empty_is_after_page_cleanup_without_discharging);
+	UT_RUN(test_startup_local_empty_wait_retains_operation_and_rechecks_readback);
+	UT_RUN(test_startup_local_empty_refusal_keeps_original_cleanup_debt);
+	UT_RUN(test_startup_local_empty_error_keeps_original_cleanup_debt);
+	UT_RUN(test_startup_local_empty_cannot_change_saved_operation_or_target);
+	UT_RUN(test_startup_local_empty_does_not_hide_readback_refusal);
+
 	UT_RUN(test_startup_pending_readback_uses_saved_operation_before_service);
 	UT_RUN(test_startup_pending_readback_refusal_retains_fd_window_and_graph);
 	UT_RUN(test_startup_pending_readback_collision_retries_without_reinserting);

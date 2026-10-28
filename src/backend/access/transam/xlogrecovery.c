@@ -205,6 +205,7 @@
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_recovery_census.h"
+#include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_page_install_ctrc.h"
 #include "cluster/storage/cluster_shared_fs_page.h"
 #include "cluster/cluster_qvotec.h"
@@ -1824,6 +1825,21 @@ cluster_recovery_cold_page_attempt(const struct ClusterRecoveryStartV1 *start,
 						|| progress->storage != pending_storage
 						|| memcmp(&progress->result, &pending_result, sizeof(pending_result)) != 0)
 						detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+					else if (detail == RF_PAGE_PROOF_DETAIL_OK) {
+						ClusterCtrcLocalEmptyV1 empty = cluster_ctrc_recovery_local_empty_v1();
+
+						/* Observe only after PAGE cleanup; then revalidate the whole
+						 * original owner and saved operation before using the result.
+						 * Even EMPTY does not clear a window or release a reference. */
+						if (!cluster_recovery_cold_page_advance_current(start, work, scope, progress)
+							|| !progress->pending || progress->next_target != pending_target
+							|| progress->storage != pending_storage
+							|| memcmp(&progress->result, &pending_result, sizeof(pending_result)) != 0)
+							detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+						else if (empty != CLUSTER_CTRC_LOCAL_EMPTY)
+							detail = empty == CLUSTER_CTRC_LOCAL_WAIT
+								? RF_PAGE_PROOF_DETAIL_WOULD_BLOCK : RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+					}
 				} else
 					detail = cluster_recovery_cold_page_step_result(progress, step);
 			}
