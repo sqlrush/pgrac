@@ -361,9 +361,19 @@ static Node *schema_dispatch_expected_statement;
 static ObjectAddress schema_dispatch_old_schema_address;
 static bool schema_dispatch_wants_old_schema;
 
+/* Native database identity entries reuse the actual tag/name dependencies. */
+static bool database_identity_lookup_active, database_identity_expect_binding;
+static unsigned database_identity_lookups, database_identity_unbound, database_identity_bad_lookup;
+
 CommandTag
 CreateCommandTag(Node *statement)
 {
+	if (database_identity_lookup_active
+		&& (IsA(statement, RenameStmt) || IsA(statement, AlterOwnerStmt))) {
+		ObjectType type = IsA(statement, RenameStmt) ? ((RenameStmt *)statement)->renameType
+													 : ((AlterOwnerStmt *)statement)->objectType;
+		return AlterObjectTypeCommandTag(type);
+	}
 	if (schema_dispatch_lookup_active && IsA(statement, AlterObjectSchemaStmt))
 		return AlterObjectTypeCommandTag(((AlterObjectSchemaStmt *)statement)->objectType);
 	if (rename_dispatch_lookup_active && IsA(statement, RenameStmt)) {
@@ -590,6 +600,11 @@ CreateCommandTag(Node *statement)
 const char *
 GetCommandTagName(CommandTag tag)
 {
+	if (database_identity_lookup_active) {
+		if ((unsigned)tag >= lengthof(rename_dispatch_command_names))
+			siglongjmp(boundary, 3);
+		return rename_dispatch_command_names[tag];
+	}
 	if (schema_dispatch_lookup_active) {
 		if ((unsigned)tag >= lengthof(rename_dispatch_command_names))
 			siglongjmp(boundary, 3);
@@ -6386,6 +6401,14 @@ static unsigned role_rename_lookups, role_rename_unbound, role_rename_bad_lookup
 Relation
 table_open(Oid relationId, LOCKMODE lockmode)
 {
+	if (database_identity_lookup_active) {
+		database_identity_lookups++;
+		if (database_identity_expect_binding && utility_binds == 0)
+			database_identity_unbound++;
+		if (relationId != DatabaseRelationId || lockmode != RowExclusiveLock)
+			database_identity_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before the real database catalog lock/query. */
+	}
 	if (role_rename_lookup_active) {
 		role_rename_lookups++;
 		if (role_rename_expect_binding && utility_binds == 0)
@@ -15706,10 +15729,198 @@ UT_TEST(test_native_schema_dispatch_keeps_original_unrecognized_target_error)
 	schema_dispatch_lookup_active = false;
 }
 
+/* Actual database identity prefixes stop at the first pg_database lock.
+ * Resolution, parameters, permissions, ACL and mutation remain beyond this boundary. */
+#include "test_cluster_fresh_database_identity.inc"
+static RenameStmt native_database_identity_rename;
+static AlterOwnerStmt native_database_identity_owner;
+static String database_identity_name;
+static RoleSpec database_identity_role;
+static Node *database_identity_expected_statement;
+static const char *database_identity_oldname, *database_identity_newname;
+static Oid database_identity_newowner;
+
+static void
+reset_native_database_identity(bool expect_binding, unsigned form)
+{
+	static const char *const oldnames[] = { "identity_database", "other_identity_database",
+											"identity_database", "other_identity_database" };
+	static const char *const newnames[]
+		= { "renamed_identity_database", "second_renamed_database" };
+	static const Oid owners[] = { 901, 902 };
+
+	reset_create_preflight();
+	database_identity_lookup_active = true;
+	database_identity_expect_binding = expect_binding;
+	database_identity_lookups = database_identity_unbound = database_identity_bad_lookup = 0;
+	database_identity_oldname = oldnames[form];
+	database_identity_newname = form < 2 ? newnames[form] : NULL;
+	database_identity_newowner = form < 2 ? InvalidOid : owners[form - 2];
+	database_identity_name
+		= (String){ .type = T_String, .sval = (char *)database_identity_oldname };
+	database_identity_role = (RoleSpec){ .type = T_RoleSpec,
+										 .roletype = ROLESPEC_CSTRING,
+										 .rolename = "identity_new_owner",
+										 .location = -1 };
+	native_database_identity_rename = (RenameStmt){ .type = T_RenameStmt,
+													.renameType = OBJECT_DATABASE,
+													.subname = (char *)database_identity_oldname,
+													.newname = (char *)database_identity_newname };
+	native_database_identity_owner = (AlterOwnerStmt){ .type = T_AlterOwnerStmt,
+													   .objectType = OBJECT_DATABASE,
+													   .object = (Node *)&database_identity_name,
+													   .newowner = &database_identity_role };
+	database_identity_expected_statement = form < 2 ? (Node *)&native_database_identity_rename
+													: (Node *)&native_database_identity_owner;
+}
+
+static void
+native_database_identity_entry(unsigned form)
+{
+	if (form < 2)
+		(void)RenameDatabase(database_identity_oldname, database_identity_newname);
+	else
+		(void)AlterDatabaseOwner(database_identity_oldname, database_identity_newowner);
+}
+
+UT_TEST(test_native_database_identity_binds_before_first_query_in_all_profiles)
+{
+	for (unsigned form = 0; form < 4; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_database_identity(binds, form);
+			set_native_operator_mode(mode);
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_database_identity_entry(form);
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(database_identity_lookups, repeat + 1);
+				UT_ASSERT_EQ(database_identity_unbound, 0);
+				UT_ASSERT_EQ(database_identity_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	database_identity_lookup_active = false;
+}
+
+UT_TEST(test_native_database_identity_refuses_before_lookup_on_publication_child_and_top_errors)
+{
+	for (unsigned form = 0; form < 4; form++) {
+		for (unsigned failure = 0; failure < 5; failure++) {
+			bool allocated = failure == 0 || failure == 2;
+			int caught;
+
+			reset_native_database_identity(true, form);
+			if (failure == 0)
+				utility_bind_ok = false;
+			else if (failure == 1 || failure == 2) {
+				if (failure == 2)
+					create_sql_entry(database_identity_expected_statement);
+				utility_in_child = true;
+			} else {
+				utility_current_xid = 401;
+				utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_database_identity_entry(form);
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, failure == 0  ? ERRCODE_DATA_CORRUPTED
+									 : failure < 3 ? ERRCODE_FEATURE_NOT_SUPPORTED
+												   : ERRCODE_INTERNAL_ERROR);
+			UT_ASSERT_STR_EQ(
+				error_message,
+				failure == 0
+					? "canonical ACTIVE publication failed before shared catalog alteration"
+				: failure < 3 ? "shared catalog alteration does not support subtransactions"
+							  : "shared catalog top-level transaction identity mismatch");
+			UT_ASSERT_EQ(database_identity_lookups, 0);
+			UT_ASSERT_EQ(database_identity_unbound + database_identity_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_xids, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, failure == 2 ? 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, allocated || failure == 3 ? 400 : InvalidTransactionId);
+		}
+	}
+	database_identity_lookup_active = false;
+}
+
+UT_TEST(test_native_database_identity_context_guards_keep_nonshared_route)
+{
+	for (unsigned form = 0; form < 4; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+
+			for (unsigned guard = 0; guard < 3; guard++) {
+				int caught;
+
+				reset_native_database_identity(binds, form);
+				set_native_operator_mode(mode);
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_database_identity_entry(form);
+				UT_ASSERT_EQ(caught, binds ? 1 : 2);
+				UT_ASSERT_EQ(error_code, !binds		  ? 0
+										 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+													  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				if (binds)
+					UT_ASSERT(strstr(error_message, "ALTER DATABASE") != NULL);
+				UT_ASSERT_EQ(database_identity_lookups, binds ? 0 : 1);
+				UT_ASSERT_EQ(database_identity_unbound + database_identity_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	database_identity_lookup_active = false;
+}
+
+UT_TEST(test_native_database_identity_utility_warm_guards_preserve_binding)
+{
+	for (unsigned form = 0; form < 4; form++) {
+		for (unsigned guard = 0; guard < 4; guard++) {
+			int caught;
+
+			reset_native_database_identity(true, form);
+			create_sql_entry(database_identity_expected_statement);
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			XactReadOnly = guard == 1;
+			utility_parallel = guard == 2;
+			utility_recovery = guard == 3;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_database_identity_entry(form);
+			UT_ASSERT_EQ(caught, guard ? 1 : 2);
+			UT_ASSERT_EQ(error_code, !guard		  ? 0
+									 : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+												  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT_EQ(database_identity_lookups, guard ? 0 : 1);
+			UT_ASSERT_EQ(database_identity_unbound + database_identity_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_prepares, guard ? 1 : 2);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			UT_ASSERT_EQ(utility_top_xid, 400);
+		}
+	}
+	database_identity_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(245);
+	UT_PLAN(249);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -15955,6 +16166,10 @@ main(void)
 	UT_RUN(test_native_schema_dispatch_utility_warm_guards_preserve_binding);
 	UT_RUN(test_native_schema_dispatch_scope_refusals_match_utility_before_binding);
 	UT_RUN(test_native_schema_dispatch_keeps_original_unrecognized_target_error);
+	UT_RUN(test_native_database_identity_binds_before_first_query_in_all_profiles);
+	UT_RUN(test_native_database_identity_refuses_before_lookup_on_publication_child_and_top_errors);
+	UT_RUN(test_native_database_identity_context_guards_keep_nonshared_route);
+	UT_RUN(test_native_database_identity_utility_warm_guards_preserve_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

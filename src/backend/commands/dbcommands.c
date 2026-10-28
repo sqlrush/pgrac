@@ -122,6 +122,9 @@ typedef struct CreateDBRelInfo
 
 
 /* non-export function prototypes */
+#ifdef USE_PGRAC_CLUSTER
+static void PreflightClusterSharedDatabaseWrite(const char *command);
+#endif
 static void createdb_failure_callback(int code, Datum arg);
 static void movedb(const char *dbname, const char *tblspcname);
 static void movedb_failure_callback(int code, Datum arg);
@@ -1856,6 +1859,10 @@ RenameDatabase(const char *oldname, const char *newname)
 	int			npreparedxacts;
 	ObjectAddress address;
 
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedDatabaseWrite("ALTER DATABASE");
+#endif
+
 	/*
 	 * Look up the target database's OID, and get exclusive lock on it. We
 	 * need this for the same reasons as DROP DATABASE.
@@ -2644,6 +2651,10 @@ AlterDatabaseOwner(const char *dbname, Oid newOwnerId)
 	SysScanDesc scan;
 	Form_pg_database datForm;
 	ObjectAddress address;
+
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedDatabaseWrite("ALTER DATABASE");
+#endif
 
 	/*
 	 * Get the old tuple.  We don't need a lock on the database per se,
