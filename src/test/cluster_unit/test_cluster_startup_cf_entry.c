@@ -6320,6 +6320,7 @@ UT_TEST(ordinary_recovery_complete_roles_keep_the_original_cf_wait_policy)
 #include "test_cluster_prepared_cf.h"
 #include "test_cluster_generic_cf.h"
 #include "test_cluster_rejoin_cf.h"
+#include "test_cluster_cold_own_root_cf.h"
 
 int
 main(void)
@@ -6331,6 +6332,25 @@ main(void)
 	pg_atomic_init_u64(&owner_proc.cluster_grd_redeclare_acked_epoch, 0);
 	cluster_control_request_shmem_init();
 	retire_driver = cluster_control_request_driver_start();
+	if (getenv("PGRAC_PRE2_TEST_COLD_OWN_ROOT_CF_LIVENESS") != NULL) {
+		UT_PLAN(1);
+		UT_RUN(cold_own_root_wait_retires_before_accepting_fresh_canonical_input);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_COLD_OWN_ROOT_CF") != NULL) {
+		UT_PLAN(8);
+		UT_RUN(cold_own_root_wait_retires_before_accepting_fresh_canonical_input);
+		UT_RUN(cold_own_root_wait_rechecks_context_and_exact_request);
+		UT_RUN(cold_own_root_fresh_read_cannot_escape_a_changed_context);
+		UT_RUN(cold_own_root_receipt_and_wake_rules_preserve_progress);
+		UT_RUN(cold_own_root_hard_untyped_and_preexisting_requests_are_not_retried);
+		UT_RUN(cold_own_root_real_root_refusals_preserve_original_diagnostics);
+		UT_RUN(cold_own_root_original_cancel_keeps_shared_cleanup_responsibility);
+		UT_RUN(ordinary_cold_and_observational_canonical_keep_their_wait_policy);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_REJOIN_CF_LIVENESS") != NULL) {
 		UT_PLAN(1);
 		UT_RUN(rejoin_cf_wait_keeps_original_staged_publication);
@@ -6369,7 +6389,7 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(97);
+	UT_PLAN(105);
 	UT_RUN(startup_cf_timeout_waits_for_exact_completion_before_begin);
 	UT_RUN(startup_cf_completion_does_not_preserve_changed_native_input);
 	UT_RUN(startup_cf_unsafe_native_context_never_takes_a_registry_lock);
@@ -6467,6 +6487,14 @@ main(void)
 	UT_RUN(rejoin_fresh_proof_drift_never_reuses_consumed_publication);
 	UT_RUN(rejoin_staged_marker_wait_is_not_a_root_wait);
 	UT_RUN(rejoin_open_exact_owner_still_requires_fresh_import);
+	UT_RUN(cold_own_root_wait_retires_before_accepting_fresh_canonical_input);
+	UT_RUN(cold_own_root_wait_rechecks_context_and_exact_request);
+	UT_RUN(cold_own_root_fresh_read_cannot_escape_a_changed_context);
+	UT_RUN(cold_own_root_receipt_and_wake_rules_preserve_progress);
+	UT_RUN(cold_own_root_hard_untyped_and_preexisting_requests_are_not_retried);
+	UT_RUN(cold_own_root_real_root_refusals_preserve_original_diagnostics);
+	UT_RUN(cold_own_root_original_cancel_keeps_shared_cleanup_responsibility);
+	UT_RUN(ordinary_cold_and_observational_canonical_keep_their_wait_policy);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

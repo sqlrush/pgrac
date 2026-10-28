@@ -1429,6 +1429,7 @@ test_cluster_startup_cf_entry: test_cluster_startup_cf_entry.c test_cluster_cf_e
 		test_cluster_prepared_cf.h test_cluster_prepared_cf.inc \
 		test_cluster_generic_cf.h test_cluster_generic_cf.inc \
 		test_cluster_rejoin_cf.h test_cluster_rejoin_cf.inc test_cluster_rejoin_cf_types.inc \
+		test_cluster_cold_own_root_cf.h test_cluster_cold_own_root_cf.inc \
 		test_cluster_startup_cf_entry.inc test_cluster_startup_cf_callsite.inc \
 		test_cluster_merge_cf_entry.inc \
 		test_cluster_merge_cold_cf.inc \
@@ -1487,6 +1488,22 @@ test_cluster_rejoin_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_d
 	     FNR != NR && /^cluster_reconfig_poll_join_commit_stage\(/ { print "static bool"; emit=1; polls++ } \
 	     emit { print } /^}/ { emit=0 } \
 	     END { if (publishers != 2 || compares != 2 || releases != 1 || polls != 1 || emit) exit 1 }' \
+	     $(filter %.c,$^) > $@.tmp
+	mv $@.tmp $@
+
+# Original cold own-root caller and runtime canonical lookup, joined to CF.
+test_cluster_cold_own_root_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_startup.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root.c Makefile
+	awk 'FNR == NR && /^#define COLD_REQUIRED_ROOT_FLAGS/ { print; getline; print; getline; print; flags++ } \
+	     FNR == NR && /^typedef struct (ClusterColdReplayRootV1|ColdOwnRootCfWait) / { types=1; declarations++ } \
+	     types { print; if (/^}/) types=0; next } \
+	     FNR == NR && /^(cold_refuse|cold_own_key_refuse|cold_identity_uuid_hex|cold_own_identity_refuse)\(/ { print "static void"; emit=1; diagnostics++ } \
+	     FNR == NR && /^cold_own_root_cf_(capture|wait)\(/ { print "static void"; emit=1; helpers++ } \
+	     FNR == NR && /^cold_own_root_cf_current\(/ { print "static bool"; emit=1; checks++ } \
+	     FNR == NR && /^cold_own_root\(/ { print "static bool"; emit=1; callers++ } \
+	     FNR != NR && /^cluster_control_root_lookup_owner_by_node_runtime\(/ { print "ClusterControlRootResult"; emit=1; readers++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (flags != 1 || declarations < 1 || declarations > 2 || diagnostics != 4 || helpers > 2 || checks > 1 || callers != 1 || readers != 1 || emit || types) exit 1 }' \
 	     $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 
