@@ -17,6 +17,11 @@ int d3_episode_clog_main(void);
 #include "test_cluster_clog_recovery.c"
 #include "test_cluster_recovery_episode_clog.h"
 
+/* A complete private PGPROC keeps the original status setter's group-update
+ * test valid; its invalid xid selects the ordinary native lock path. */
+static PGPROC episode_native_proc;
+PGPROC *MyProc = &episode_native_proc;
+
 #undef cluster_wal_inputs_relmap_source_current_v1
 #undef cluster_wal_inputs_relmap_source_fail_v1
 #undef cluster_wal_inputs_relmap_source_revalidate_v1
@@ -134,4 +139,31 @@ test_episode_native_clog_fd(void *custody)
 	D3EpisodeClogHandleV1 *held = custody;
 	episode_clog_unlocked();
 	return held == NULL ? -1 : held->fd;
+}
+
+/* Execute the original rmgr body, including its original SLRU write. */
+void
+test_episode_native_clog_redo(XLogReaderState *reader)
+{
+	clog_redo(reader);
+	episode_clog_unlocked();
+}
+
+/* The outcome is controlled, but its native page/cache mutation is real.
+ * This is not the XACT redo path or a transaction durability certificate. */
+void
+test_episode_native_clog_set_committed(TransactionId xid)
+{
+	UT_ASSERT_EQ(episode_native_proc.xid, InvalidTransactionId);
+	TransactionIdSetTreeStatus(xid, 0, NULL, TRANSACTION_STATUS_COMMITTED, InvalidXLogRecPtr);
+	episode_clog_unlocked();
+}
+
+/* The original held-fd reader does not flush the possibly dirty native cache.
+ * Write it through the original checkpoint callback before observing disk. */
+void
+test_episode_native_clog_write_all(void)
+{
+	CheckPointCLOG();
+	episode_clog_unlocked();
 }

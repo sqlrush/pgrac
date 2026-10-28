@@ -47,6 +47,7 @@
 #define MainLWLockArray d3_episode_clog_MainLWLockArray
 #define MyAuxProcType d3_episode_clog_MyAuxProcType
 #define MyBackendType d3_episode_clog_MyBackendType
+#define MyProc d3_episode_clog_MyProc
 #define OpenTransientFile d3_episode_clog_OpenTransientFile
 #define ProcessInterrupts d3_episode_clog_ProcessInterrupts
 #define ReadDir d3_episode_clog_ReadDir
