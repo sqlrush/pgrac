@@ -448,7 +448,7 @@ UT_TEST(test_s_source_snapshot_corrupt_pair_is_not_adopted)
 		UT_ASSERT_EQ(ss_prepare(&f), RESOURCE_X_APPLY_APPLIED);
 		if (n == 0) f.master.state->holder_image.payload[700] ^= 1;
 		else if (n == 1) f.master.state->holder_acquire_s_native.reservation_token = 0;
-		else f.master.state->holder_acquire_s_reserved = 1;
+		else f.master.state->holder_acquire_s_forward_connection = 1;
 		UT_ASSERT_EQ(ss_snapshot(&f, &id, &native, &image, &state), RESOURCE_X_APPLY_RECOVERY_BLOCKED);
 		UT_ASSERT_EQ(id, -1); UT_ASSERT_EQ(state, 0);
 		UT_ASSERT_EQ(f.master.state->holder_status.valid, RESOURCE_X_HOLDER_PAIR_PENDING);
@@ -1087,10 +1087,166 @@ UT_TEST(test_compatible_s_completion_preserves_later_hints_but_not_io_error)
 	ss_unchanged(&f, true, RESOURCE_X_APPLY_STALE);
 }
 
+
+/* The native capture input is the same declared seam as the source cases.
+ * Full A is produced by the real master, then delivered to its other holder. */
+static bool
+sh_start(SSourceFixture *f)
+{
+	if (!ss_start(f)) return false;
+	f->block = publish_decode(f->master.state->block_intents[2].payload, true);
+	/* A different instance has its own original GRD/owner, not M's slots. */
+	acquire_reset();
+	cluster_node_id = 2; fake_gcs_master_node = 0;
+	ut_master_session = f->block.body.acquire_decision.holders[2].boot_incarnation;
+	return true;
+}
+
+static ResourceXDecodedFrame
+sh_direct(SSourceFixture *f)
+{
+	int32 id = -1; ClusterPcmOwnSnapshot native; ResourceXAcquireSSourceState state;
+	ResourceXDecodedFrame direct = {0};
+	UT_ASSERT_EQ(ss_snapshot(f, &id, &native, &direct, &state), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(id, 7); UT_ASSERT_EQ(direct.kind, RESOURCE_X_WIRE_BLOCKED_TO_N);
+	return direct;
+}
+
+UT_TEST(test_s_holder_retains_original_forward_and_no_source_image)
+{
+	SSourceFixture f; ResourceXSourceDrainWork work; ResourceXDecodedFrame frame;
+	if (!sh_start(&f)) return;
+	UT_ASSERT_EQ(ss_forward(&f), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(ss_service_probe(&work));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_s_source_drain_snapshot_exact(&work, &frame), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(frame.body.acquire_decision.source_node, 0);
+	UT_ASSERT_EQ(frame.common.action_node, 2);
+	UT_ASSERT_EQ(f.master.state->holder_image.valid, 0);
+}
+
+UT_TEST(test_s_holder_reserves_two_control_witnesses_before_native_finish)
+{
+	SSourceFixture f; ResourceXSourceDrainWork work; ResourceXDecodedFrame ack, direct;
+	if (!sh_start(&f)) return;
+	UT_ASSERT_EQ(ss_forward(&f), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(ss_service_probe(&work));
+	UT_ASSERT_EQ(ss_capture(&f, &work), RESOURCE_X_APPLY_APPLIED);
+	ack = ss_read(&f, false); direct = sh_direct(&f);
+	UT_ASSERT_EQ(f.master.state->holder_status.payload_bytes, RESOURCE_X_WITNESS_V3_BYTES);
+	UT_ASSERT_EQ(f.master.state->holder_image.payload_bytes, RESOURCE_X_WITNESS_V3_BYTES);
+	UT_ASSERT_EQ(direct.kind, RESOURCE_X_WIRE_BLOCKED_TO_N);
+	UT_ASSERT(!ack.body.acquire_witness.has_source_proof);
+	UT_ASSERT_EQ(ack.body.acquire_witness.original_ack.target_mode, PCM_STATE_N);
+	UT_ASSERT_EQ(ack.body.acquire_witness.original_ack.flags, 0);
+	UT_ASSERT(memcmp(&ack.body.acquire_witness, &direct.body.acquire_witness, sizeof(ack.body.acquire_witness)) == 0);
+	UT_ASSERT_EQ(f.master.state->holder_status_intent.slot.state, RESOURCE_X_INTENT_SLOT_EMPTY);
+	UT_ASSERT_EQ(f.master.state->holder_image_intent.state, RESOURCE_X_INTENT_SLOT_EMPTY);
+}
+
+UT_TEST(test_s_holder_publish_requires_exact_n_pi_and_never_a_source_proof)
+{
+	SSourceFixture f; if (!sh_start(&f)) return;
+	UT_ASSERT_EQ(ss_prepare(&f), RESOURCE_X_APPLY_APPLIED);
+	f.finished = f.prepared; ss_unchanged(&f, true, RESOURCE_X_APPLY_STALE);
+	f.finished.generation++; f.finished.pcm_state = PCM_STATE_N; f.finished.buffer_type = BUF_TYPE_PI;
+	UT_ASSERT_EQ(ss_publish(&f), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(f.master.state->holder_status_intent.slot.payload_bytes, RESOURCE_X_WITNESS_V3_BYTES);
+	UT_ASSERT_EQ(f.master.state->holder_image_intent.payload_bytes, RESOURCE_X_WITNESS_V3_BYTES);
+	ss_unchanged(&f, true, RESOURCE_X_APPLY_DUPLICATE);
+}
+
+UT_TEST(test_s_holder_snapshot_rejects_original_forward_connection_drift)
+{
+	SSourceFixture f; int32 id; ClusterPcmOwnSnapshot native;
+	ResourceXDecodedFrame frame; ResourceXAcquireSSourceState state;
+	if (!sh_start(&f)) return; UT_ASSERT_EQ(ss_prepare(&f), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(ss_snapshot(&f, &id, &native, &frame, &state), RESOURCE_X_APPLY_APPLIED);
+	f.block.common.sender_connection_generation++; f.block = ss_forward_reencode(f.block);
+	UT_ASSERT_EQ(ss_snapshot(&f, &id, &native, &frame, &state), RESOURCE_X_APPLY_STALE);
+	ss_unchanged(&f, false, RESOURCE_X_APPLY_STALE);
+}
+
+UT_TEST(test_s_holder_transport_callbacks_leave_original_native_and_pair_debt)
+{
+	SSourceFixture f; int32 id; ClusterPcmOwnSnapshot native;
+	ResourceXDecodedFrame frame; ResourceXAcquireSSourceState state;
+	if (!sh_start(&f)) return; UT_ASSERT_EQ(ss_prepare(&f), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(ss_publish(&f), RESOURCE_X_APPLY_APPLIED);
+	for (int half = 0; half < 2; half++) {
+		ResourceXIntentSlot sent = half ? f.master.state->holder_image_intent : f.master.state->holder_status_intent.slot;
+		ResourceXIntentSlot staged;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_capture_exact(&sent, 100001, &staged), RESOURCE_X_INTENT_STAGED);
+		UT_ASSERT(cluster_pcm_lock_resource_x_outbound_intent_complete_exact(&staged));
+	}
+	UT_ASSERT_EQ(ss_snapshot(&f, &id, &native, &frame, &state), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(state, RESOURCE_X_HOLDER_PAIR_PUBLISHED);
+	UT_ASSERT_EQ(native.flags, PCM_OWN_FLAG_REVOKING);
+}
+
+UT_TEST(test_s_holder_busy_service_keeps_same_work_until_actual_event)
+{
+	SSourceFixture f; ResourceXSourceDrainWork work, next;
+	if (!sh_start(&f)) return; UT_ASSERT_EQ(ss_forward(&f), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(ss_service_probe(&work)); UT_ASSERT_EQ(ss_capture(&f, &work), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(&work, RESOURCE_X_APPLY_BAD_STATE), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(!ss_service_probe(&next));
+	cluster_pcm_lock_resource_x_source_drain_content_released();
+	UT_ASSERT(ss_service_probe(&next)); UT_ASSERT_EQ(ss_publish(&f), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(&next, RESOURCE_X_APPLY_APPLIED), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(sh_direct(&f).kind, RESOURCE_X_WIRE_BLOCKED_TO_N);
+}
+
+UT_TEST(test_s_holder_wrong_role_or_native_identity_cannot_reserve)
+{
+	SSourceFixture f;
+	if (!sh_start(&f)) return;
+	f.prepared.flags = 0; ss_unchanged(&f, false, RESOURCE_X_APPLY_INVALID);
+	if (!sh_start(&f)) return;
+	f.block.common.action_node = 3; f.block = ss_forward_reencode(f.block);
+	ss_unchanged(&f, false, RESOURCE_X_APPLY_INVALID);
+}
+
+UT_TEST(test_s_holder_membership_freeze_preserves_pair_as_orphan)
+{
+	SSourceFixture f; ResourceXReconfigToken token; ResourceXReconfigBatch batch;
+	ResourceXReconfigResult result = RESOURCE_X_RECONFIG_MORE;
+	if (!sh_start(&f)) return; UT_ASSERT_EQ(ss_prepare(&f), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(cluster_resource_x_reconfig_freeze(17, 18, &token));
+	for (int n = 0; n < 8 && (result == RESOURCE_X_RECONFIG_MORE || result == RESOURCE_X_RECONFIG_RETRY); n++)
+		result = cluster_resource_x_reconfig_sweep(&token, 4, &batch);
+	UT_ASSERT_EQ(result, RESOURCE_X_RECONFIG_ORPHAN);
+	UT_ASSERT_EQ(f.master.state->holder_status.valid, RESOURCE_X_HOLDER_PAIR_PENDING);
+}
+
+
+UT_TEST(test_s_holder_ack_is_consumed_only_by_original_master_independently)
+{
+	SSourceFixture holder, master; ResourceXDecodedFrame ack; ResourceXMasterSnapshot out;
+	if (!sh_start(&holder)) return;
+	UT_ASSERT_EQ(ss_prepare(&holder), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(ss_publish(&holder), RESOURCE_X_APPLY_APPLIED); ack = ss_read(&holder, false);
+	/* Recreate the deterministic original M fixture, not its H local GRD. */
+	if (!ss_start(&master)) return;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_blocked_to_n_exact(&ack, 2, &out), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(master.master.state->requests[1].blocked_holders_bitmap, UINT32_C(1) << 2);
+	UT_ASSERT_EQ(master.master.state->requests[1].proof_kind, 0);
+	UT_ASSERT_EQ(master.master.state->requests[1].final_authority_generation, 0);
+}
+
+UT_TEST(test_s_holder_cancellation_cannot_erase_native_or_direct_witness)
+{
+	SSourceFixture f; ClusterPcmResourceXMasterState *before;
+	if (!sh_start(&f)) return; UT_ASSERT_EQ(ss_prepare(&f), RESOURCE_X_APPLY_APPLIED);
+	before = malloc(sizeof(*before)); UT_ASSERT(before != NULL); if (!before) return;
+	*before = *f.master.state; cluster_pcm_lock_resource_x_bootstrap_forget_exact(&f.master.work);
+	UT_ASSERT(memcmp(before, f.master.state, sizeof(*before)) == 0); free(before);
+	UT_ASSERT_EQ(sh_direct(&f).kind, RESOURCE_X_WIRE_BLOCKED_TO_N);
+}
+
 int
 main(void)
 {
-	UT_PLAN(63);
+	UT_PLAN(73);
 	UT_RUN(test_s_source_reserves_complete_pair_before_native_finish);
 	UT_RUN(test_s_source_exact_prepare_duplicate_is_not_a_second_native_commit);
 	UT_RUN(test_s_source_changed_token_descriptor_or_page_cannot_replace_pending);
@@ -1154,5 +1310,15 @@ main(void)
 	UT_RUN(test_compatible_s_source_reconfiguration_retains_original_pair_and_work);
 	UT_RUN(test_compatible_s_component_crc_does_not_enable_standalone_v2_s);
 	UT_RUN(test_compatible_s_completion_preserves_later_hints_but_not_io_error);
+	UT_RUN(test_s_holder_retains_original_forward_and_no_source_image);
+	UT_RUN(test_s_holder_reserves_two_control_witnesses_before_native_finish);
+	UT_RUN(test_s_holder_publish_requires_exact_n_pi_and_never_a_source_proof);
+	UT_RUN(test_s_holder_snapshot_rejects_original_forward_connection_drift);
+	UT_RUN(test_s_holder_transport_callbacks_leave_original_native_and_pair_debt);
+	UT_RUN(test_s_holder_busy_service_keeps_same_work_until_actual_event);
+	UT_RUN(test_s_holder_wrong_role_or_native_identity_cannot_reserve);
+	UT_RUN(test_s_holder_membership_freeze_preserves_pair_as_orphan);
+	UT_RUN(test_s_holder_ack_is_consumed_only_by_original_master_independently);
+	UT_RUN(test_s_holder_cancellation_cannot_erase_native_or_direct_witness);
 	UT_DONE(); return ut_failed_count == 0 ? 0 : 1;
 }

@@ -22211,12 +22211,12 @@ cluster_bufmgr_pcm_own_finish_revoke_drop_unpinned(BufferDesc *buf,
  * refcount, and bytes, while PI+N marks those bytes non-current and the exact
  * REVOKING token prevents reuse until DRAIN.
  */
-ClusterPcmOwnResult
-cluster_bufmgr_pcm_own_finish_revoke_retain(
+static ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_finish_revoke_retain_internal(
 	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_revoking,
 	XLogRecPtr expected_lsn, ClusterPcmOwnSnapshot *out_retained,
 	ClusterPcmOwnFinishRefusal *out_refusal,
-	const ResourceXSourceWalRetainedV1 *retained_wal)
+	const ResourceXSourceWalRetainedV1 *retained_wal, bool capture_s_holder_lsn)
 {
 	ClusterPcmOwnResult live_result;
 	ClusterPcmOwnResult result = CLUSTER_PCM_OWN_OK;
@@ -22256,7 +22256,8 @@ cluster_bufmgr_pcm_own_finish_revoke_retain(
 		return CLUSTER_PCM_OWN_INVALID;
 	source_is_s = expected_revoking->pcm_state == (uint8) PCM_STATE_S;
 	source_is_x = expected_revoking->pcm_state == (uint8) PCM_STATE_X;
-	if ((!source_is_s && !source_is_x)
+	if ((capture_s_holder_lsn && !source_is_s)
+		|| (!source_is_s && !source_is_x)
 		|| expected_revoking->flags != PCM_OWN_FLAG_REVOKING
 		|| expected_revoking->reservation_token == 0)
 		return CLUSTER_PCM_OWN_INVALID;
@@ -22265,7 +22266,8 @@ cluster_bufmgr_pcm_own_finish_revoke_retain(
 
 	tag = expected_revoking->tag;
 	finish_mode = cluster_pcm_x_revoke_finish_mode(&tag, 0);
-	if (finish_mode == CLUSTER_PCM_X_REVOKE_FINISH_INVALID)
+	if (finish_mode == CLUSTER_PCM_X_REVOKE_FINISH_INVALID
+		|| (capture_s_holder_lsn && finish_mode != CLUSTER_PCM_X_REVOKE_FINISH_RETAIN))
 		return CLUSTER_PCM_OWN_INVALID;
 	retry_output = cluster_shared_config
 		&& (cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) != 0
@@ -22345,6 +22347,11 @@ cluster_bufmgr_pcm_own_finish_revoke_retain(
 	}
 	content_locked = true;
 
+	/* Bind a non-source holder's own version under pin/content-X before
+	 * setjmp: the unchanged LSN is also read by the IO-error catch. Both
+	 * subsequent exact LSN checks remain mandatory for either entry. */
+	if (capture_s_holder_lsn)
+		expected_lsn = PageGetLSN((Page)BufHdrGetBlock(buf));
 	PG_TRY();
 	{
 		buf_state = LockBufHdr(buf);
@@ -22563,6 +22570,29 @@ cluster_bufmgr_pcm_own_finish_revoke_retain(
 #endif
 	return result;
 }
+
+ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_finish_revoke_retain(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_revoking,
+	XLogRecPtr expected_lsn, ClusterPcmOwnSnapshot *out_retained,
+	ClusterPcmOwnFinishRefusal *out_refusal,
+	const ResourceXSourceWalRetainedV1 *retained_wal)
+{
+	return cluster_bufmgr_pcm_own_finish_revoke_retain_internal(buf, expected_revoking,
+		expected_lsn, out_retained, out_refusal, retained_wal, false);
+}
+
+/* Only an exact native S holder can use the protected resident-version leg.
+ * It grants nothing, releases no PI, and retains REVOKING after physical N. */
+ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_finish_s_holder_revoke(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_revoking,
+	ClusterPcmOwnSnapshot *out_retained, ClusterPcmOwnFinishRefusal *out_refusal)
+{
+	return cluster_bufmgr_pcm_own_finish_revoke_retain_internal(buf, expected_revoking,
+		InvalidXLogRecPtr, out_retained, out_refusal, NULL, true);
+}
+
 /* SourceSettlementV2 proves only that the exact immutable transfer carrier no
  * longer needs its REVOKING fence.  It is not durable-current coverage and
  * therefore must preserve the established N+PI/BM_VALID recovery image even

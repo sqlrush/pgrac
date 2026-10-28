@@ -11319,7 +11319,8 @@ gcs_block_resource_x_acquire_s_source_finish_owned(
 	MemoryContext error_context = CurrentMemoryContext;
 	int32 buffer_id = -1;
 	int live_id = -1;
-	XLogRecPtr page_lsn;
+	XLogRecPtr page_lsn = InvalidXLogRecPtr;
+	bool source = block->body.acquire_decision.source_node == cluster_node_id;
 
 	if (block->common.target_mode == PCM_STATE_S)
 		return gcs_block_resource_x_acquire_s_read_finish_owned(block, master, r4_generation, buf, caller_prepared);
@@ -11337,9 +11338,14 @@ gcs_block_resource_x_acquire_s_source_finish_owned(
 	expected.generation++;
 	expected.pcm_state = PCM_STATE_N;
 	expected.buffer_type = BUF_TYPE_PI;
-	if (image.body.acquire_image.original_image.source_carrier_generation != expected.generation)
+	if (source) {
+		if (image.kind != RESOURCE_X_WIRE_IMAGE_ENVELOPE
+			|| image.body.acquire_image.original_image.source_carrier_generation != expected.generation)
+			goto fail_closed;
+		page_lsn = PageGetLSN((Page)image.body.acquire_image.original_image.page_bytes);
+	} else if (image.kind != RESOURCE_X_WIRE_BLOCKED_TO_N || !image.has_acquire_decision
+		|| image.body.acquire_witness.has_source_proof)
 		goto fail_closed;
-	page_lsn = PageGetLSN((Page)image.body.acquire_image.original_image.page_bytes);
 	if (cluster_pcm_own_snapshot_equal_exact(&live, &expected)) {
 		/* A worker may have left after the irreversible native commit but
 		 * before publication. Adopt exactly that N+PI, never commit again. */
@@ -11353,8 +11359,9 @@ gcs_block_resource_x_acquire_s_source_finish_owned(
 		{
 			/* The clean S source owns no first-dirty reference to move. The
 			 * original native function retains its WAL/DATA and IO checks. */
-			own = cluster_bufmgr_pcm_own_finish_revoke_retain(
-				buf, &prepared, page_lsn, &finished, &refusal, NULL);
+			own = source
+				? cluster_bufmgr_pcm_own_finish_revoke_retain(buf, &prepared, page_lsn, &finished, &refusal, NULL)
+				: cluster_bufmgr_pcm_own_finish_s_holder_revoke(buf, &prepared, &finished, &refusal);
 		}
 		PG_CATCH();
 		{
@@ -14505,9 +14512,12 @@ gcs_block_resource_x_acquire_s_source_capture_owned(const ResourceXSourceDrainWo
 	if (work == NULL || block == NULL || admission == NULL || gate == NULL
 		|| !block->has_acquire_decision
 		|| (block->common.target_mode != PCM_STATE_S && block->common.target_mode != PCM_STATE_X)
-		|| block->common.observed_mode != PCM_STATE_S || (work->attempt_generation & 1) == 0
+		|| block->body.acquire_decision.directory_mode != PCM_STATE_S || (work->attempt_generation & 1) == 0
 		|| work->master_node != block->body.acquire_decision.master_node
-		|| block->body.acquire_decision.source_node != cluster_node_id
+		|| (block->body.acquire_decision.source_node != cluster_node_id
+			&& (block->common.target_mode != PCM_STATE_X
+				|| cluster_node_id < 0 || cluster_node_id >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+				|| (block->body.acquire_decision.required_holders_bitmap & (UINT32_C(1) << cluster_node_id)) == 0))
 		|| work->r4_record_generation == 0 || work->r4_record_generation == UINT64_MAX
 		|| work->r4_record_generation != admission->record_generation
 		|| gate->formation != work->request.resource_formation
@@ -14991,19 +15001,18 @@ gcs_block_resource_x_type17_ingress(const ClusterICEnvelope *env,
 		}
 		admission_exact = result == RESOURCE_X_APPLY_APPLIED;
 		if (admission_exact) {
-			if ((frame->common.observed_mode == (uint8)PCM_STATE_X
+			if (frame->has_acquire_decision && frame->body.acquire_decision.directory_mode == PCM_STATE_S
+				&& (frame->common.target_mode == PCM_STATE_S || frame->common.target_mode == PCM_STATE_X))
+				result = cluster_pcm_lock_resource_x_acquire_s_source_forward_exact(frame,
+					master_node, admission.record_generation, authenticated_connection_generation);
+			else if ((frame->common.observed_mode == (uint8)PCM_STATE_X
 				 || frame->common.observed_mode == (uint8)PCM_STATE_S)
 				&& frame->common.source_candidate == 1 && frame->common.retain_pi_if_dirty == 1) {
 				ClusterWaitPcmAdmission observation;
 				gcs_block_pcm_service_admission(&observation, &admission, &gate,
 					CLWAIT_PCM_SERVICE_INGRESS, master_node, master_session,
 					authenticated_connection_generation);
-				if (frame->has_acquire_decision && frame->common.observed_mode == PCM_STATE_S
-					&& (frame->common.target_mode == PCM_STATE_S || frame->common.target_mode == PCM_STATE_X))
-					result = cluster_pcm_lock_resource_x_acquire_s_source_forward_exact(frame,
-						master_node, admission.record_generation, authenticated_connection_generation);
-				else
-					result = gcs_block_pcm_x_resource_x_source_block_to_n_observed(frame, master_node,
+				result = gcs_block_pcm_x_resource_x_source_block_to_n_observed(frame, master_node,
 																	  admission.record_generation, &observation);
 				if (result == RESOURCE_X_APPLY_BAD_STATE && frame->common.observed_mode == PCM_STATE_X)
 					(void)cluster_pcm_lock_resource_x_source_drain_defer_exact(

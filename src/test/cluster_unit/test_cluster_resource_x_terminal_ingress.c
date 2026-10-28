@@ -2735,6 +2735,7 @@ acquire_drain_fixture(void)
 	work.authenticated_connection_generation = 61; work.attempt_generation = 3;
 	acquire_drain_block.kind = RESOURCE_X_WIRE_BLOCK_TO_N;
 	acquire_drain_block.has_acquire_decision = true;
+	acquire_drain_block.body.acquire_decision.directory_mode = PCM_STATE_S;
 	acquire_drain_block.common = work.request;
 	acquire_drain_image.kind = RESOURCE_X_WIRE_IMAGE_ENVELOPE;
 	acquire_drain_image.has_acquire_decision = true;
@@ -2925,10 +2926,30 @@ UT_TEST(test_actual_compatible_s_lms_busy_keeps_claim_and_never_falls_back)
 	UT_ASSERT(memcmp(&acquire_drain_completed, &work, sizeof(work)) == 0);
 }
 
+
+UT_TEST(test_actual_non_source_s_ingress_retains_full_forward_without_legacy_service)
+{
+	ClusterICEnvelope env = {.source_node_id = 1}; ResourceXSourceDrainWork work = acquire_drain_fixture();
+	(void)work; acquire_drain_block.common.observed_mode = PCM_STATE_N;
+	acquire_drain_block.common.source_candidate = acquire_drain_block.common.retain_pi_if_dirty = 0;
+	UT_ASSERT_EQ(gcs_block_resource_x_type17_ingress(&env, &acquire_drain_block, 61), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(acquire_forward_reserves, 1); UT_ASSERT_EQ(source_observations + acquire_drain_finishes, 0);
+}
+
+UT_TEST(test_actual_non_source_s_forward_refusal_does_not_fall_back)
+{
+	ClusterICEnvelope env = {.source_node_id = 1}; ResourceXSourceDrainWork work = acquire_drain_fixture();
+	(void)work; acquire_drain_block.common.observed_mode = PCM_STATE_N;
+	acquire_drain_block.common.source_candidate = acquire_drain_block.common.retain_pi_if_dirty = 0;
+	acquire_forward_result = RESOURCE_X_APPLY_BAD_STATE;
+	UT_ASSERT_EQ(gcs_block_resource_x_type17_ingress(&env, &acquire_drain_block, 61), RESOURCE_X_APPLY_BAD_STATE);
+	UT_ASSERT_EQ(acquire_forward_reserves, 1); UT_ASSERT_EQ(source_observations + acquire_drain_finishes, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(44);
+	UT_PLAN(46);
 	UT_RUN(test_actual_terminal_ingress_keeps_master_and_physical_source_distinct);
 	UT_RUN(test_actual_kind9_ingress_does_not_send_ack_for_fused_admission);
 	UT_RUN(test_actual_fused_admission_notifies_ready_resource_without_registry_tick);
@@ -2973,6 +2994,8 @@ main(void)
 	UT_RUN(test_actual_compatible_s_ingress_reserves_original_forward_not_legacy_revoke);
 	UT_RUN(test_actual_compatible_s_lms_captures_same_claim_then_finishes_same_pair);
 	UT_RUN(test_actual_compatible_s_lms_busy_keeps_claim_and_never_falls_back);
+	UT_RUN(test_actual_non_source_s_ingress_retains_full_forward_without_legacy_service);
+	UT_RUN(test_actual_non_source_s_forward_refusal_does_not_fall_back);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
