@@ -3942,10 +3942,20 @@ UT_TEST(test_full_clog_dispatch_uses_only_original_projection_identity)
 	}
 }
 
+#include "test_cluster_cold_native_clog_consumed.inc"
+
 int
 main(void)
 {
-	UT_PLAN(149);
+	if (getenv("PGRAC_PRE2_TEST_NATIVE_CLOG_SOURCE") != NULL) {
+		UT_PLAN(3);
+		UT_RUN(test_native_clog_source_wraps_original_founder_callback);
+		UT_RUN(test_native_clog_source_refuses_changed_inputs_before_callback);
+		UT_RUN(test_native_clog_source_late_failure_and_error_stay_refused);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
+	UT_PLAN(152);
 	UT_RUN(test_full_clog_dispatch_uses_only_original_projection_identity);
 	UT_RUN(test_execution_refusal_preserves_the_first_census_failure);
 	UT_RUN(test_own_root_lookup_diagnostic_does_not_read_failed_outputs);
@@ -4096,6 +4106,9 @@ main(void)
 	UT_RUN(test_source_barrier_requires_cold_window_and_original_scope);
 	UT_RUN(test_source_barrier_error_does_not_leave_success);
 	UT_RUN(test_original_typed_owner_retires_fence_after_dependent_read_scope);
+	UT_RUN(test_native_clog_source_wraps_original_founder_callback);
+	UT_RUN(test_native_clog_source_refuses_changed_inputs_before_callback);
+	UT_RUN(test_native_clog_source_late_failure_and_error_stay_refused);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

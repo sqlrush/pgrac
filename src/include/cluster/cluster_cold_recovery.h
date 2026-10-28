@@ -957,6 +957,13 @@ extern ClusterColdTypedV1 *cluster_cold_typed_prepare_v1(struct ClusterRecoveryF
 														 uint16 own_thread, XLogRecPtr own_redo);
 extern void cluster_cold_typed_destroy_v1(ClusterColdTypedV1 **typed);
 
+/* Original Startup native CLOG dispatch only: invoke the original redo once
+ * under the founder's full source/plan bracket. This saves native consumption,
+ * not cold durable apply, physical lifetime or participant completion. */
+extern bool cluster_cold_typed_clog_native_v1(ClusterColdTypedV1 *typed,
+	struct ClusterRecoveryFencePlan *fence, XLogReaderState *reader,
+	void (*redo)(XLogReaderState *, void *), void *arg);
+
 /* Capture actual pass-2 coverage before its adapter is released. A failed
  * completion clears the previous output; consumers recheck the same plan. */
 extern bool cluster_cold_typed_effects_complete_v1(ClusterColdTypedV1 *typed,

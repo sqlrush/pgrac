@@ -1804,7 +1804,7 @@ rf_side_online_plan_clog_matches_v1(const RfSideOnlinePlanV1 *plan,
 
 /* The original production owner resolves its own immutable operation, not a
  * caller's source/count or success boolean. Existing witness allocation and
- * destruction own these two bytes, including on partial execution/ERROR. */
+ * destruction own this state, including on partial execution/ERROR. */
 SideNativeClogReplay *
 side_plan_clog_replay_state(const RfSideOnlinePlanV1 *plan, uint32 index,
 	const RfPageOnlineRecordIdentityV1 *identity)
@@ -1857,6 +1857,75 @@ rf_side_online_plan_clog_applied_v1(const RfSideOnlinePlanV1 *plan,
 		if (side_clog_witness_source(plan, operation, source)
 			&& operation->identity.record.read_rec_ptr == reader->ReadRecPtr)
 			found = !operation->history_only && witness->replay.attempted && witness->replay.applied;
+	}
+	return found;
+}
+
+bool
+side_plan_clog_native_replay(const RfSideOnlinePlanV1 *plan,
+	const ClusterWalSourceRef *source, XLogReaderState *reader,
+	void (*redo)(XLogReaderState *, void *), bool (*current)(void *), void *arg)
+{
+	SideNativeClogReplay *replay = NULL;
+	ClusterWalSourceRef original;
+	XLogRecPtr read_lsn, end_lsn;
+
+	if (redo == NULL || current == NULL
+		|| !rf_side_online_plan_clog_matches_v1(plan, source, reader))
+		return false;
+	memcpy(&original, source, sizeof(original));
+	read_lsn = reader->ReadRecPtr;
+	end_lsn = reader->EndRecPtr;
+	for (const SideNativeClogWitness *witness = plan->native_clog; witness != NULL;
+		 witness = witness->next) {
+		const RfSideOnlineOperationV1 *operation = side_clog_witness_operation(plan, witness);
+
+		if (operation == NULL)
+			return false;
+		if (side_clog_witness_source(plan, operation, source)
+			&& operation->identity.record.read_rec_ptr == reader->ReadRecPtr) {
+			replay = side_plan_clog_replay_state(plan, witness->operation_index,
+				&operation->identity);
+			break;
+		}
+	}
+	if (replay == NULL || replay->attempted)
+		return false;
+	/* Native redo and owner checks may ERROR. Never make an interrupted or
+	 * late-refused initialization retryable, even if its bytes are now zero. */
+	replay->attempted = true;
+	if (!current(arg) || memcmp(source, &original, sizeof(original)) != 0
+		|| reader->ReadRecPtr != read_lsn || reader->EndRecPtr != end_lsn
+		|| !rf_side_online_plan_clog_matches_v1(plan, &original, reader))
+		return false;
+	redo(reader, arg);
+	if (!current(arg) || memcmp(source, &original, sizeof(original)) != 0
+		|| reader->ReadRecPtr != read_lsn || reader->EndRecPtr != end_lsn
+		|| !rf_side_online_plan_clog_matches_v1(plan, &original, reader))
+		return false;
+	replay->native_consumed = true;
+	return true;
+}
+
+bool
+rf_side_online_plan_clog_native_consumed_v1(const RfSideOnlinePlanV1 *plan,
+	const ClusterWalSourceRef *source, const XLogReaderState *reader)
+{
+	bool found = false;
+
+	if (!rf_side_online_plan_clog_matches_v1(plan, source, reader))
+		return false;
+	for (const SideNativeClogWitness *witness = plan->native_clog; witness != NULL;
+		 witness = witness->next) {
+		const RfSideOnlineOperationV1 *operation = side_clog_witness_operation(plan, witness);
+
+		if (operation == NULL || (witness->replay.attempted
+			&& !witness->replay.applied && !witness->replay.native_consumed))
+			return false;
+		if (side_clog_witness_source(plan, operation, source)
+			&& operation->identity.record.read_rec_ptr == reader->ReadRecPtr)
+			found = !operation->history_only && witness->replay.attempted
+				&& witness->replay.native_consumed;
 	}
 	return found;
 }

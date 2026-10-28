@@ -45,6 +45,7 @@
 #include "cluster/cluster_cold_recovery_census.h"
 #include "cluster/cluster_side_online_plan.h"
 #include "cluster/cluster_side_online_owner.h"
+#include "cluster_side_online_plan_internal.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_undo_recovery.h"
 #include "cluster/storage/cluster_undo_xlog.h"
@@ -1954,6 +1955,84 @@ cold_c0_source_authority(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fe
 		&& cluster_wal_thread_restart_v2_ref(&restart)
 		&& cold_source_ref_matches(&restart, &typed->sources[participant])
 		&& cold_replay_sources_current(typed, fence);
+}
+
+typedef struct ColdNativeClogReplay {
+	ClusterColdTypedV1 *typed;
+	ClusterRecoveryFencePlan *fence;
+	const RfSideOnlinePlanV1 *plan;
+	ClusterWalSourceRef source;
+	ClusterColdParticipantV1 participant;
+	void (*redo)(XLogReaderState *, void *);
+	void *arg;
+} ColdNativeClogReplay;
+
+/* This is the founder's existing native path, not foreign SIDE/C0 authority.
+ * Its original restart generation and complete held source set must survive
+ * the native call unchanged. No independent recovery scope is acquired. */
+static bool
+cold_native_clog_current(void *arg)
+{
+	ColdNativeClogReplay *replay = arg;
+	ClusterColdTypedV1 *typed = replay->typed;
+	ClusterWalSourceRef restart;
+
+	return typed->refusal == CLUSTER_COLD_SIDE_OWNER_MISSING
+		&& replay->fence != NULL && cluster_cold_replay_window_active_v1()
+		&& typed->plan != NULL && typed->replay_roots != NULL
+		&& typed->own_participant == 0 && typed->replay_count != 0
+		&& typed->replay_count <= typed->participant_count
+		&& typed->participant_count <= CLUSTER_COLD_MAX_PARTICIPANTS
+		&& typed->replay_root_count == typed->replay_count
+		&& typed->side_plans[0] == replay->plan && replay->plan != NULL
+		&& typed->side_capture_detail[0] == 0 && cluster_node_id >= 0
+		&& cluster_node_id <= SCN_MAX_VALID_NODE_ID
+		&& replay->source.claim.identity.origin_node_id == cluster_node_id
+		&& replay->source.claim.identity.origin_thread_id == cluster_node_id + 1
+		&& memcmp(&typed->sources[0], &replay->source, sizeof(replay->source)) == 0
+		&& memcmp(&typed->participants[0], &replay->participant, sizeof(replay->participant)) == 0
+		&& cold_replay_sources_current(typed, replay->fence)
+		&& cold_side_source_matches(typed, 0)
+		&& cluster_wal_thread_restart_v2_ref(&restart)
+		&& cold_source_ref_matches(&restart, &replay->source)
+		&& cold_replay_sources_current(typed, replay->fence);
+}
+
+static void
+cold_native_clog_redo(XLogReaderState *reader, void *arg)
+{
+	ColdNativeClogReplay *replay = arg;
+
+	replay->redo(reader, replay->arg);
+}
+
+bool
+cluster_cold_typed_clog_native_v1(ClusterColdTypedV1 *typed,
+	ClusterRecoveryFencePlan *fence, XLogReaderState *reader,
+	void (*redo)(XLogReaderState *, void *), void *arg)
+{
+	ColdNativeClogReplay replay = { .typed = typed, .fence = fence, .redo = redo, .arg = arg };
+
+	if (typed == NULL || typed->refusal != CLUSTER_COLD_OK)
+		return false;
+	/* Preserve the whole episode on ERROR or a late false, just as the
+	 * original foreign record owner does. This is never COMPLETE. */
+	cold_refuse(typed, CLUSTER_COLD_SIDE_OWNER_MISSING,
+		"pass-2 native CLOG record consumption is incomplete");
+	if (typed->own_participant != 0 || typed->participant_count == 0
+		|| typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
+		|| reader == NULL || reader->record == NULL || redo == NULL
+		|| XLogRecGetRmid(reader) != RM_CLOG_ID)
+		return false;
+	replay.plan = typed->side_plans[0];
+	memcpy(&replay.source, &typed->sources[0], sizeof(replay.source));
+	memcpy(&replay.participant, &typed->participants[0], sizeof(replay.participant));
+	if (!side_plan_clog_native_replay(replay.plan, &replay.source, reader,
+			cold_native_clog_redo, cold_native_clog_current, &replay))
+		return false;
+	typed->refusal = CLUSTER_COLD_OK;
+	typed->refusal_detail[0] = '\0';
+	return true;
 }
 
 /* Resolve the original bound identities, never source-array proximity. */
