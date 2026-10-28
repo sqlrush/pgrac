@@ -5596,7 +5596,7 @@ test_cluster_pcm_settlement_ingress.inc: $(top_srcdir)/src/backend/cluster/clust
 	     END { if (count != 4 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_pcm_lock test_cluster_pcm_object_retire test_cluster_pcm_stop_cv test_cluster_pcm_read_grant test_cluster_resource_x_acquire_ingress test_cluster_resource_x_decision_send: %: %.c test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
+test_cluster_pcm_lock test_cluster_pcm_object_retire test_cluster_pcm_stop_cv test_cluster_pcm_read_grant test_cluster_resource_x_acquire_ingress test_cluster_resource_x_decision_send test_cluster_resource_x_decision_publish: %: %.c test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
 		test_cluster_pcm_master_durable.inc \
 		test_cluster_pcm_bootstrap_tick.inc \
 		test_cluster_pcm_settlement_ingress.inc \
@@ -10115,3 +10115,19 @@ clean distclean maintainer-clean: clean-decision-send
 .PHONY: clean-decision-send
 clean-decision-send:
 	rm -f test_cluster_resource_x_decision_send test_cluster_resource_x_decision_owner_layout.inc test_cluster_resource_x_decision_owner_layout.inc.tmp
+
+TESTS += test_cluster_resource_x_decision_publish
+all: test_cluster_resource_x_decision_publish
+test_cluster_resource_x_decision_publish: test_cluster_resource_x_acquire_ingress.c \
+		test_cluster_resource_x_acquire_fixture.inc \
+		test_cluster_resource_x_acquire_candidate.inc test_cluster_resource_x_decision_owner_layout.inc \
+		cluster_unit_port_stubs.o cluster_catalog_trace_test.o
+test_cluster_resource_x_acquire_fixture.inc: test_cluster_resource_x_acquire_ingress.c Makefile
+	awk '/^int$$/ { end++; exit } /^UT_TEST\(/ { skip=1; tests++; next } \
+	     skip && /^}/ { skip=0; next } !skip { print } \
+	     END { if (end != 1 || tests != 89 || skip) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+clean distclean maintainer-clean: clean-decision-publish
+.PHONY: clean-decision-publish
+clean-decision-publish:
+	rm -f test_cluster_resource_x_decision_publish test_cluster_resource_x_acquire_fixture.inc test_cluster_resource_x_acquire_fixture.inc.tmp

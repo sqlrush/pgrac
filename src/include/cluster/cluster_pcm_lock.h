@@ -1643,6 +1643,15 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_service_snapshot
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_decision_plan_exact(
 	const ResourceXBootstrapWork *work, const ResourceXAcquireServiceSnapshot *expected,
 	ResourceXAcquireDecisionPlan *out);
+/* Same authenticated caller contract as the input snapshot. Rebuild the
+ * same canonical head under its original entry owner, reserve A
+ * once and retain its immutable parallel sends. expected, when supplied,
+ * applies to first publication; an exact duplicate retains the original A
+ * without resampling or rearming. No authority is returned to a caller here:
+ * only the original staged transport owners may deliver the retained bytes.
+ * Not yet used by ordinary callers; conditional completion remains separate. */
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_decision_publish_exact(
+	const ResourceXBootstrapWork *work, const ResourceXAcquireServiceSnapshot *expected);
 extern void cluster_pcm_lock_resource_x_bootstrap_forget_exact(const ResourceXBootstrapWork *work);
 extern bool cluster_pcm_lock_resource_x_s_barrier_active(const BufferTag *tag);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_assert_bootstrapped_exact(
