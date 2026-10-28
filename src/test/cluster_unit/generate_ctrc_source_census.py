@@ -720,6 +720,19 @@ _classify_owners(
     "RETAIN_PENDING_SUBTREE_CLOSE_ACK",
     "MXA-T40",
 )
+# A completed physical receiver can be replaced only by a later protected
+# original grant in the same boot/scope, never by absence or a raw xid.
+_classify_owners(
+    "CTRC_ORIGIN_PROVENANCE",
+    "src/backend/cluster/cluster_terminal_ref_census.c",
+    ("ctrc_participant_successor_exact_locked",),
+    "REGISTERED_REFERENCE",
+    "ALL_CTRC_REFERENCE_KINDS",
+    "ALL_CTRC_TARGET_KINDS",
+    "ctrc_receipt_prepare_successor_locked|ctrc_itl_delegate_accept",
+    "RETAIN_RETRY_CUSTODY_UNTIL_LATER_PROTECTED_ORIGINAL_GRANT",
+    "MXA-T40",
+)
 # First-hop matching checks the original sender binding; receiving a local
 # receipt does not authorize retiring its incoming parent responsibility.
 _classify_owners(

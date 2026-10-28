@@ -86,7 +86,7 @@
 #endif
 
 #define CLUSTER_CTRC_SHMEM_MAGIC UINT32_C(0x43545243)
-#define CLUSTER_CTRC_SHMEM_VERSION UINT32_C(26)
+#define CLUSTER_CTRC_SHMEM_VERSION UINT32_C(27)
 #ifndef CLUSTER_CTRC_TEST_TABLE_VISIT
 #define CLUSTER_CTRC_TEST_TABLE_VISIT(kind) ((void)0)
 #endif
@@ -7415,6 +7415,104 @@ cluster_ctrc_itl_delegate_prepare_v2(
 	return ctrc_itl_delegate_prepare(target, slot, sender, receiver, record, capacity, true, length_out);
 }
 
+/* Original participant and receipt locks are held. A later protected
+ * original grant for this same physical slot can only be issued after the
+ * origin consumed all previous completion replies. A changed boot/scope,
+ * raw xid, or receipt-only retirement is not that ordering witness. */
+static bool
+ctrc_participant_successor_exact_locked(uint64 index,
+	const ClusterCtrcParticipantEntry *successor)
+{
+	const ClusterCtrcParticipantEntry *old = &ctrc_participant_entries()[index];
+	const ClusterCtrcParticipantIdentity *original_receiver;
+	ClusterCtrcTxnKeyV1 physical;
+	ClusterCtrcReclaimWork work[2] = {0};
+	FullTransactionId original;
+	uint64 checked_index;
+
+	if (old->delegation_certificate_state != CTRC_DELEGATION_PROTECTION_RETIRED
+		|| !ctrc_delegated_local_ack_summary_exact(old, &ctrc_participant_ack_entries()[index])
+		|| ctrc_participant_receipt_heads()[index] != 0
+		|| !ctrc_participant_index(&old->key, old->identity.node_id, &checked_index)
+		|| checked_index != index || successor->state != CTRC_PARTICIPANT_OPEN
+		|| successor->seal_generation != 0 || !ctrc_participant_delegations_valid(successor)
+		|| memcmp(&old->identity, &successor->identity, sizeof(old->identity)) != 0
+		|| successor->grant_generation <= old->grant_generation
+		|| !FullTransactionIdIsNormal(successor->original_full_xid)
+		|| U64FromFullTransactionId(successor->original_full_xid) == UINT64_MAX
+		|| U64FromFullTransactionId(successor->original_full_xid)
+			<= U64FromFullTransactionId(old->original_full_xid)
+		|| (successor->key.segment_generation < old->key.segment_generation
+			|| (successor->key.segment_generation == old->key.segment_generation
+				&& successor->key.slot_wrap <= old->key.slot_wrap)))
+		return false;
+	physical = successor->key;
+	physical.segment_generation = old->key.segment_generation;
+	physical.slot_wrap = old->key.slot_wrap;
+	physical.xid = old->key.xid;
+	if (memcmp(&physical, &old->key, sizeof(physical)) != 0)
+		return false;
+	original_receiver = !ctrc_bytes_zero(&successor->delegation_path,
+		sizeof(successor->delegation_path)) ? &successor->delegation_path.root_receiver
+		: (successor->delegation_parent.sequence != 0
+			? &successor->delegation_parent.receiver : &successor->identity);
+	if (!cluster_ctrc_origin_fullxid_match_v2(successor->original_identity_v2,
+		sizeof(successor->original_identity_v2), &successor->key, original_receiver,
+		successor->grant_generation, &original)
+		|| !FullTransactionIdEquals(original, successor->original_full_xid))
+		return false;
+	work[0].key = old->key;
+	work[1].key = successor->key;
+	/* Both keys must have zero live inventory, including unlinked orphans.
+	 * The original complete-table validator also checks empty locators. */
+	if (!ctrc_receipts_reclaim_validate(work, lengthof(work), ctrc_receipt_entries(),
+		ctrc_receipt_probe_states(), CtrcShared->receipt_entries, ctrc_receipt_links(),
+		CtrcShared->participant_key_entries, NULL) || !work[0].reclaimed || !work[1].reclaimed)
+		return false;
+	/* No other key may hide an unlinked reference to this physical owner. */
+	for (uint64 i = 0; i < CtrcShared->receipt_entries; i++)
+		if (ctrc_receipt_links()[i].participant_plus_one == index + 1)
+			return false;
+	return true;
+}
+
+static ClusterCtrcPrepareResult
+ctrc_receipt_prepare_successor_locked(uint64 index, const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcParticipantIdentity *identity, uint32 grant,
+	const ClusterCtrcPublicationIdV1 *publication, const ClusterCtrcTargetV1 *target,
+	FullTransactionId original, const uint8 *original_v2,
+	const ClusterCtrcDelegationCustodyV1 *parent, const ClusterCtrcDelegationPathV2 *path,
+	uint64 journal_sequence, uint64 *receipt_index, ClusterCtrcPreparePath *path_out)
+{
+	ClusterCtrcParticipantEntry fresh = {0};
+	ClusterCtrcPrepareResult result;
+
+	if (path_out != NULL)
+		*path_out = CLUSTER_CTRC_PREPARE_PATH_ORIGINAL_FULL_XID;
+	if (original_v2 == NULL || cluster_ctrc_participant_open(&fresh, key, grant, identity)
+		!= CLUSTER_CTRC_PARTICIPANT_OPENED)
+		return CLUSTER_CTRC_PREPARE_REFUSED;
+	fresh.original_full_xid = original;
+	memcpy(fresh.original_identity_v2, original_v2, sizeof(fresh.original_identity_v2));
+	if (parent != NULL)
+		fresh.delegation_parent = *parent;
+	if (path != NULL)
+		fresh.delegation_path = *path;
+	if (!ctrc_participant_successor_exact_locked(index, &fresh))
+		return CLUSTER_CTRC_PREPARE_REFUSED;
+	/* Refusal/capacity mutates only this private candidate. After READY no
+	 * throwing operation separates its receipt, cut revocation and row. */
+	result = ctrc_receipt_prepare_table_observed(&fresh, key, identity, grant, publication,
+		target, ctrc_receipt_entries(), ctrc_receipt_probe_states(), CtrcShared->receipt_entries,
+		journal_sequence, receipt_index, NULL, path_out);
+	if (result == CLUSTER_CTRC_PREPARE_READY) {
+		ctrc_note_unqualified_registration();
+		ctrc_participant_entries()[index] = fresh;
+		MemSet(&ctrc_participant_ack_entries()[index], 0, sizeof(ClusterCtrcLocalReleaseAckV1));
+	}
+	return result;
+}
+
 static ClusterCtrcPrepareResult
 ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 									 const ClusterCtrcParticipantIdentity *identity,
@@ -7558,7 +7656,23 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 	participant_was_empty = ctrc_bytes_zero(participant, sizeof(*participant));
 	/* Only scalar call-local stores accompany the original predicates under
 	 * these locks. Do not log, call an observer, or repeat a table probe here. */
-	if (received_origin_v2 != NULL && !participant_was_empty
+	if (!participant_was_empty
+		&& participant->delegation_certificate_state == CTRC_DELEGATION_PROTECTION_RETIRED
+		&& memcmp(&participant->key, key, sizeof(*key)) != 0) {
+		/* A replacement is a new publication, never a fenced duplicate.
+		 * Reuse the original current-object predicate before staging it. */
+		if (check_object && (!sampled || (continuation != NULL
+			? admission.extension_serial != 0 || !cluster_ko_peer_read_current_v3(
+				&admission, locator, (ForkNumber)target->fork_number, target->block_number)
+			: !cluster_ko_peer_admission_current_v3(&admission, locator)))) {
+			if (path_out != NULL)
+				*path_out = CLUSTER_CTRC_PREPARE_PATH_OBJECT_EXISTING;
+			result = CLUSTER_CTRC_PREPARE_REFUSED;
+		} else
+			result = ctrc_receipt_prepare_successor_locked(participant_index, key, identity,
+				grant_generation, publication, target, original_full_xid, original_v2,
+				received_parent, received_path, journal_sequence, &receipt_index, path_out);
+	} else if (received_origin_v2 != NULL && !participant_was_empty
 		&& (!FullTransactionIdIsValid(participant->original_full_xid)
 			|| ((memcmp(participant->original_identity_v2, received_origin_v2,
 					  CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES) != 0
@@ -7613,16 +7727,16 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 			participant, key, identity, grant_generation, publication, target, receipts,
 			ctrc_receipt_probe_states(), CtrcShared->receipt_entries, journal_sequence,
 			&receipt_index, NULL, path_out);
-		if (result == CLUSTER_CTRC_PREPARE_READY) {
-			CtrcReceiptLink *link = &ctrc_receipt_links()[receipt_index];
+	}
+	if (result == CLUSTER_CTRC_PREPARE_READY) {
+		CtrcReceiptLink *link = &ctrc_receipt_links()[receipt_index];
 
-			/* No throwing operation separates receipt placement, the locator
-			 * and handle publication. Duplicate requests never add a link. */
-			link->participant_plus_one = participant_index + 1;
-			link->next_plus_one = ctrc_participant_receipt_heads()[participant_index];
-			link->journal_generation = receipts[receipt_index].publication.journal_slot_generation;
-			ctrc_participant_receipt_heads()[participant_index] = receipt_index + 1;
-		}
+		/* No throwing operation separates receipt placement, the locator
+		 * and handle publication. Duplicate requests never add a link. */
+		link->participant_plus_one = participant_index + 1;
+		link->next_plus_one = ctrc_participant_receipt_heads()[participant_index];
+		link->journal_generation = receipts[receipt_index].publication.journal_slot_generation;
+		ctrc_participant_receipt_heads()[participant_index] = receipt_index + 1;
 	}
 	if (result == CLUSTER_CTRC_PREPARE_CAPACITY) {
 		(void)pg_atomic_fetch_add_u64((pg_atomic_uint64 *)&CtrcShared->full_refusal_count, 1);
@@ -7723,6 +7837,13 @@ ctrc_itl_delegate_accept(const ClusterItlSlotData *slot,
 	ctrc_participant_locks_acquire(lock_mask);
 	LWLockAcquire(&CtrcShared->receipt_lock, LW_SHARED);
 	participant = &ctrc_participant_entries()[index];
+	if (ctrc_participant_successor_exact_locked(index, &fresh)) {
+		ctrc_note_unqualified_registration();
+		*participant = fresh;
+		MemSet(&ctrc_participant_ack_entries()[index], 0, sizeof(ClusterCtrcLocalReleaseAckV1));
+		accepted = true;
+		goto done;
+	}
 	if (!ctrc_receipt_chain_exact_locked(index, false))
 		goto done;
 	if (ctrc_bytes_zero(participant, sizeof(*participant))) {

@@ -4524,10 +4524,339 @@ UT_TEST(test_retired_source_busy_shard_retries_the_original_cursor_without_mutat
 	CtrcShared = origin_pool;
 }
 
+/* Produce the next original grant through the existing origin completion,
+ * reservation and protected grant owners. Disk and peer scheduling remain
+ * the same controlled boundaries as the certificate fixtures above. */
+static bool
+completed_slot_successor(ClusterCtrcReceiptHandle *old,
+	ClusterCtrcSharedHeader **origin_pool, ClusterCtrcTxnKeyV1 *next,
+	uint8 original[CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES], uint32 *grant, unsigned mode)
+{
+	ClusterCtrcOriginReservation reservation;
+	ClusterCtrcOriginEntry *origin;
+	ClusterCtrcCloseDispatch local = {0};
+	uint8 reply[GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE];
+	uint64 index;
+	uint16 node;
+
+	if (!certified_root_completed_child(old, origin_pool, &index)
+		|| !ctrc_fixture_run_pass() || !root_send_certificate(old, 18009))
+		return false;
+	memcpy(reply, close_reply, sizeof(reply));
+	node = old->participant->identity.node_id;
+	*next = old->key;
+	next->xid += 100;
+	next->slot_wrap++;
+	if (mode == 1) {
+		next->segment_generation++;
+		next->slot_wrap = old->key.slot_wrap;
+	} else if (mode == 2)
+		next->xid = old->key.xid;
+	CtrcShared = *origin_pool;
+	cluster_node_id = next->origin_node_id;
+	dispatch_self_boot = next->origin_boot_incarnation;
+	test_my_proc.xid = next->xid;
+	test_top_full = FullTransactionIdFromEpochAndXid(
+		EpochFromFullTransactionId(old->participant->original_full_xid) + (mode == 2), next->xid);
+	pg_atomic_write_u64(&test_my_proc.cluster_top_full_xid_atomic,
+		U64FromFullTransactionId(test_top_full));
+	origin = &ctrc_origin_entries()[0];
+	/* seed_origin installs grant7 without advancing the production issuer. */
+	CtrcShared->global_grant_generation = old->participant->grant_generation + 1;
+	/* Even canonical release cannot bypass an unconsumed root completion. */
+	if (cluster_ctrc_origin_reserve_active(next, &reservation)
+		!= CLUSTER_CTRC_ORIGIN_RESERVE_RETRY_RELEASED
+		|| !cluster_ctrc_origin_arm_certificate_entry(origin, node, 18009)
+		|| !cluster_ctrc_origin_arm_certificate_entry(origin, 0, 18008))
+		return false;
+	local.key = old->key;
+	local.participant = origin->touched[0];
+	local.request_id = 18008;
+	local.grant_generation = origin->grant_generation;
+	local.seal_generation = 41;
+	local.suboperation = CTRC_SEAL_CERTIFICATE_COMMITTED;
+	if (!close_merge_land(reply) || origin->state != CTRC_ORIGIN_RELEASE_PROVEN
+		|| origin->close_confirmed_bitmap != 2
+		|| cluster_ctrc_origin_reserve_active(next, &reservation)
+			!= CLUSTER_CTRC_ORIGIN_RESERVE_RETRY_RELEASED
+		|| !cluster_gcs_ctrc_dispatch_close(&local)
+		|| !ctrc_bytes_zero(origin, sizeof(*origin))
+		|| cluster_ctrc_origin_reserve_active(next, &reservation)
+			!= CLUSTER_CTRC_ORIGIN_RESERVED_PENDING
+		|| !cluster_ctrc_origin_open_reserved(&reservation, grant)
+		|| cluster_ctrc_origin_grant_fullxid_v2(next, &old->participant->identity,
+			CTRC_PROOF_ACTIVE, grant, original) != CLUSTER_CTRC_TOUCH_RECORDED)
+		return false;
+	CtrcShared = root_certificate_source_pool;
+	cluster_node_id = node;
+	dispatch_self_boot = old->participant->identity.boot_incarnation;
+	return true;
+}
+
+UT_TEST(test_later_original_grant_reuses_only_the_completed_physical_receiver_slot)
+{
+	ClusterCtrcReceiptHandle old, successor, duplicate;
+	ClusterCtrcParticipantEntry retired, current;
+	ClusterCtrcCloseDispatch delayed = {0};
+	ClusterCtrcSharedHeader *origin_pool;
+	ClusterCtrcTxnKeyV1 next;
+	ClusterCtrcPublicationIdV1 publication;
+	ClusterCtrcTargetV1 target;
+	ClusterCtrcOriginEntry inputs = {0};
+	ClusterCtrcActiveScan scan;
+	ClusterCtrcPrepareResult result;
+	uint8 original[CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES];
+	uint32 grant;
+	uint16 reason;
+	uint64 index, generation;
+
+	UT_ASSERT(completed_slot_successor(&old, &origin_pool, &next, original, &grant, 0));
+	retired = *old.participant;
+	UT_ASSERT_EQ(old.participant->delegation_certificate_state, CTRC_DELEGATION_PROTECTION_RETIRED);
+	UT_ASSERT(ctrc_participant_index(&old.key, old.participant->identity.node_id, &index));
+	UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, test_top_full));
+	inputs.touched[0] = old.participant->identity;
+	inputs.grant_generation = grant;
+	fixture_receipt_inputs(&inputs, 20001, &publication, &target);
+	publication.requester_node_id = old.participant->identity.node_id;
+	result = cluster_ctrc_receipt_prepare_origin_v2(&next, &old.participant->identity,
+		grant, &publication, &target, original, sizeof(original), &successor);
+	UT_ASSERT_EQ(result, CLUSTER_CTRC_PREPARE_READY);
+	if (result != CLUSTER_CTRC_PREPARE_READY) {
+		CtrcShared = origin_pool;
+		return;
+	}
+	UT_ASSERT(!cluster_ctrc_active_scan_registration_current(&scan));
+	UT_ASSERT_EQ(successor.participant_index, index);
+	UT_ASSERT_EQ(successor.participant->state, CTRC_PARTICIPANT_OPEN);
+	UT_ASSERT(memcmp(&successor.participant->key, &next, sizeof(next)) == 0);
+	UT_ASSERT(FullTransactionIdEquals(successor.participant->original_full_xid, test_top_full));
+	UT_ASSERT(memcmp(successor.participant->original_identity_v2, original, sizeof(original)) == 0);
+	UT_ASSERT(ctrc_bytes_zero(&ctrc_participant_ack_entries()[index], sizeof(ClusterCtrcLocalReleaseAckV1)));
+	UT_ASSERT_EQ(successor.participant->delegation_count, 0);
+	generation = pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation);
+	UT_ASSERT_EQ(cluster_ctrc_receipt_prepare_origin_v2(&next, &successor.participant->identity,
+		grant, &publication, &target, original, sizeof(original), &duplicate),
+		CLUSTER_CTRC_PREPARE_DUPLICATE);
+	UT_ASSERT_EQ(duplicate.receipt_index, successor.receipt_index);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation), generation);
+	current = *successor.participant;
+	delayed.key = old.key; delayed.participant = retired.identity;
+	delayed.grant_generation = retired.grant_generation;
+	delayed.seal_generation = retired.seal_generation;
+	delayed.request_id = retired.root_certificate_request_id;
+	delayed.suboperation = CTRC_SEAL_CERTIFICATE_COMMITTED;
+	UT_ASSERT_EQ(cluster_ctrc_participant_certificate_request_shared(&delayed, &reason),
+		CTRC_SEAL_REPLY_BLOCKED_RETAIN);
+	UT_ASSERT(!cluster_ctrc_receipt_cancel_shared(&old));
+	UT_ASSERT(memcmp(&current, successor.participant, sizeof(current)) == 0);
+	UT_ASSERT_EQ(held_count, 0);
+	UT_ASSERT_EQ(enters, leaves);
+	UT_ASSERT_EQ(allocated, 0);
+	CtrcShared = origin_pool;
+}
+
+UT_TEST(test_successor_refusals_preserve_the_entire_completed_retry_proof_and_pool)
+{
+	for (unsigned fault = 0; fault < 23; fault++) {
+		ClusterCtrcReceiptHandle old, refused;
+		ClusterCtrcSharedHeader *origin_pool;
+		ClusterCtrcTxnKeyV1 next;
+		ClusterCtrcParticipantIdentity receiver;
+		ClusterCtrcParticipantEntry before;
+		ClusterCtrcLocalReleaseAckV1 ack;
+		ClusterCtrcOriginEntry inputs = {0};
+		ClusterCtrcPublicationIdV1 publication;
+		ClusterCtrcTargetV1 target;
+		ClusterCtrcPrepareResult result;
+		FullTransactionId full;
+		uint8 original[CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES];
+		uint8 *receipt_bytes, *probes, *links;
+		uint32 grant;
+		uint64 index, head, generation;
+		Size bytes, link_bytes;
+
+		UT_ASSERT(completed_slot_successor(&old, &origin_pool, &next, original, &grant, 0));
+		receiver = old.participant->identity;
+		full = test_top_full;
+		UT_ASSERT(ctrc_participant_index(&old.key, receiver.node_id, &index));
+		inputs.touched[0] = receiver; inputs.grant_generation = grant;
+		fixture_receipt_inputs(&inputs, 20002, &publication, &target);
+		publication.requester_node_id = receiver.node_id;
+		switch (fault) {
+			case 0: next.origin_boot_incarnation++; break;
+			case 1: next.root_generation++; break;
+			case 2: receiver.boot_incarnation++; break;
+			case 3: next.admission_record_generation++; break;
+			case 4: next.slot_wrap = old.key.slot_wrap; break;
+			case 5: next.segment_generation = 0; break;
+			case 6: next.xid = old.key.xid; full = old.participant->original_full_xid; break;
+			case 7: grant = old.participant->grant_generation; publication.grant_generation = grant; break;
+			case 8: old.participant->delegation_certificate_state = CTRC_DELEGATION_RECEIPTS_RECLAIMED; break;
+			case 9: ctrc_participant_ack_entries()[index].crc32c++; break;
+			case 10: old.participant->delegation_certificate_confirmed_bitmap = 0; break;
+			case 11: ctrc_participant_receipt_heads()[index] = 1; break;
+			case 12: old.participant->original_identity_v2[24] ^= 1; break;
+			case 13: old.participant->original_full_xid = test_top_full; break;
+			case 14: ctrc_receipt_links()[0].journal_generation = 1; break;
+			case 15:
+			case 16:
+				ctrc_receipt_probe_states()[0] = CTRC_RECEIPT_PROBE_OCCUPIED;
+				ctrc_receipt_entries()[0].key = fault == 15 ? next : old.key;
+				ctrc_receipt_entries()[0].state = CTRC_RECEIPT_PREPARED;
+				ctrc_receipt_links()[0].participant_plus_one = index + 1;
+				ctrc_receipt_links()[0].journal_generation = 1;
+				break;
+			case 17: publication.operation_id = 0; break;
+			case 18: target.publication_own_generation = 0; break;
+			case 19: cluster_shared_config = true; publication_fenced = true; break;
+			case 20:
+				for (uint64 i = 0; i < CtrcShared->receipt_entries; i++) {
+					ctrc_receipt_probe_states()[i] = CTRC_RECEIPT_PROBE_OCCUPIED;
+					ctrc_receipt_entries()[i].key = next;
+					ctrc_receipt_entries()[i].key.slot_offset++;
+					ctrc_receipt_entries()[i].state = CTRC_RECEIPT_PREPARED;
+					ctrc_receipt_links()[i].participant_plus_one = index + 2;
+					ctrc_receipt_links()[i].journal_generation = 1;
+				}
+				break;
+			case 21: break; /* Foreign raw-only caller has no new original envelope. */
+			case 22:
+				ctrc_receipt_probe_states()[0] = CTRC_RECEIPT_PROBE_OCCUPIED;
+				ctrc_receipt_entries()[0].key = next;
+				ctrc_receipt_entries()[0].key.slot_offset++;
+				ctrc_receipt_entries()[0].state = CTRC_RECEIPT_PREPARED;
+				ctrc_receipt_links()[0].participant_plus_one = index + 1;
+				ctrc_receipt_links()[0].journal_generation = 1;
+				break;
+		}
+		/* Corruption inputs may carry individually valid wire bindings; they
+		 * still cannot replace a different boot/scope/incarnation or old proof. */
+		if (fault < 8 && fault != 5)
+			UT_ASSERT(ctrc_origin_fullxid_encode_v2(&next, &receiver, grant, full, original));
+		before = *old.participant; ack = ctrc_participant_ack_entries()[index];
+		head = ctrc_participant_receipt_heads()[index];
+		generation = pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation);
+		bytes = CtrcShared->receipt_entries * sizeof(ClusterCtrcReceipt);
+		link_bytes = CtrcShared->receipt_entries * sizeof(CtrcReceiptLink);
+		receipt_bytes = malloc(bytes); probes = malloc(CtrcShared->receipt_entries); links = malloc(link_bytes);
+		UT_ASSERT(receipt_bytes != NULL && probes != NULL && links != NULL);
+		memcpy(receipt_bytes, ctrc_receipt_entries(), bytes);
+		memcpy(probes, ctrc_receipt_probe_states(), CtrcShared->receipt_entries);
+		memcpy(links, ctrc_receipt_links(), link_bytes);
+		if (fault == 21)
+			result = cluster_ctrc_receipt_prepare_shared(&next, &receiver, grant, &publication, &target, &refused);
+		else
+			result = cluster_ctrc_receipt_prepare_origin_v2(&next, &receiver, grant,
+				&publication, &target, original, sizeof(original), &refused);
+		UT_ASSERT_EQ(result, fault == 20 ? CLUSTER_CTRC_PREPARE_CAPACITY : CLUSTER_CTRC_PREPARE_REFUSED);
+		UT_ASSERT(!refused.valid);
+		UT_ASSERT(memcmp(old.participant, &before, sizeof(before)) == 0);
+		UT_ASSERT(memcmp(&ctrc_participant_ack_entries()[index], &ack, sizeof(ack)) == 0);
+		UT_ASSERT_EQ(ctrc_participant_receipt_heads()[index], head);
+		UT_ASSERT(memcmp(receipt_bytes, ctrc_receipt_entries(), bytes) == 0);
+		UT_ASSERT(memcmp(probes, ctrc_receipt_probe_states(), CtrcShared->receipt_entries) == 0);
+		UT_ASSERT(memcmp(links, ctrc_receipt_links(), link_bytes) == 0);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation), generation);
+		UT_ASSERT_EQ(held_count, 0); UT_ASSERT_EQ(enters, leaves); UT_ASSERT_EQ(allocated, 0);
+		free(receipt_bytes); free(probes); free(links);
+		CtrcShared = origin_pool;
+	}
+}
+
+UT_TEST(test_successor_explicit_generation_and_original_epoch_are_not_raw_xid_guesses)
+{
+	for (unsigned mode = 1; mode <= 2; mode++) {
+		ClusterCtrcReceiptHandle old, next_receipt;
+		ClusterCtrcSharedHeader *origin_pool;
+		ClusterCtrcTxnKeyV1 next;
+		ClusterCtrcOriginEntry inputs = {0};
+		ClusterCtrcPublicationIdV1 publication;
+		ClusterCtrcTargetV1 target;
+		uint8 original[CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES];
+		uint32 grant;
+
+		UT_ASSERT(completed_slot_successor(&old, &origin_pool, &next, original, &grant, mode));
+		inputs.touched[0] = old.participant->identity; inputs.grant_generation = grant;
+		fixture_receipt_inputs(&inputs, 20003, &publication, &target);
+		publication.requester_node_id = old.participant->identity.node_id;
+		UT_ASSERT(mode == 1 ? next.segment_generation > old.key.segment_generation : next.xid == old.key.xid);
+		UT_ASSERT_EQ(cluster_ctrc_receipt_prepare_origin_v2(&next, &old.participant->identity,
+			grant, &publication, &target, original, sizeof(original), &next_receipt), CLUSTER_CTRC_PREPARE_READY);
+		UT_ASSERT(FullTransactionIdEquals(old.participant->original_full_xid, test_top_full));
+		UT_ASSERT_EQ(old.participant->state, CTRC_PARTICIPANT_OPEN);
+		UT_ASSERT_EQ(held_count, 0); UT_ASSERT_EQ(enters, leaves);
+		CtrcShared = origin_pool;
+	}
+}
+
+UT_TEST(test_later_delegated_custody_reuses_completed_receiver_before_image_receipt)
+{
+	ClusterCtrcReceiptHandle old, next_receipt, image;
+	ClusterCtrcSharedHeader *origin_pool;
+	ClusterCtrcTxnKeyV1 next;
+	ClusterCtrcParticipantIdentity sender, receiver;
+	ClusterCtrcParticipantEntry accepted;
+	ClusterCtrcOriginEntry inputs = {0};
+	ClusterCtrcPublicationIdV1 publication;
+	ClusterCtrcTargetV1 target;
+	ClusterCtrcActiveScan scan;
+	ClusterCtrcPrepareResult result;
+	ClusterItlSlotData slot = {0};
+	uint8 original[CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES], record[CLUSTER_CTRC_DELEGATION_V1_BYTES];
+	uint32 grant;
+	uint64 index, generation;
+
+	UT_ASSERT(completed_slot_successor(&old, &origin_pool, &next, original, &grant, 0));
+	sender = old.participant->identity;
+	inputs.touched[0] = sender; inputs.grant_generation = grant;
+	fixture_receipt_inputs(&inputs, 20004, &publication, &target);
+	publication.requester_node_id = sender.node_id;
+	result = cluster_ctrc_receipt_prepare_origin_v2(&next, &sender, grant,
+		&publication, &target, original, sizeof(original), &next_receipt);
+	UT_ASSERT_EQ(result, CLUSTER_CTRC_PREPARE_READY);
+	if (result != CLUSTER_CTRC_PREPARE_READY) {
+		CtrcShared = origin_pool;
+		return;
+	}
+	UT_ASSERT(ctrc_participant_index(&next, 2, &index));
+	CtrcShared = subtree_leaf_pool;
+	receiver = ctrc_participant_entries()[index].identity;
+	UT_ASSERT_EQ(ctrc_participant_entries()[index].delegation_certificate_state, CTRC_DELEGATION_PROTECTION_RETIRED);
+	CtrcShared = root_certificate_source_pool;
+	UT_ASSERT(cluster_ctrc_participant_delegate_prepare_v1(&next, &sender, grant, &receiver, record, sizeof(record)));
+	CtrcShared = subtree_leaf_pool;
+	cluster_node_id = receiver.node_id; dispatch_self_boot = receiver.boot_incarnation;
+	slot.xid = next.xid; slot.flags = ITL_FLAG_ACTIVE;
+	slot.undo_segment_head = uba_encode(next.segment_id, 9, next.slot_offset, 8);
+	UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, test_top_full));
+	UT_ASSERT(cluster_ctrc_itl_delegate_accept_v1(&slot, &sender, &receiver, record, sizeof(record)));
+	UT_ASSERT(!cluster_ctrc_active_scan_registration_current(&scan));
+	accepted = ctrc_participant_entries()[index];
+	UT_ASSERT_EQ(accepted.state, CTRC_PARTICIPANT_OPEN);
+	UT_ASSERT_EQ(accepted.receipt_count, 0);
+	UT_ASSERT(memcmp(&accepted.key, &next, sizeof(next)) == 0);
+	UT_ASSERT(memcmp(&accepted.delegation_parent.receiver, &sender, sizeof(sender)) == 0);
+	UT_ASSERT(memcmp(accepted.original_identity_v2, original, sizeof(original)) == 0);
+	generation = pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation);
+	UT_ASSERT(cluster_ctrc_itl_delegate_accept_v1(&slot, &sender, &receiver, record, sizeof(record)));
+	UT_ASSERT(memcmp(&accepted, &ctrc_participant_entries()[index], sizeof(accepted)) == 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation), generation);
+	image_pending_target(&target);
+	UT_ASSERT_EQ(cluster_ctrc_itl_image_prepare_v1(&slot, &sender, &receiver, record, sizeof(record),
+		&target, &image), CLUSTER_CTRC_PREPARE_READY);
+	UT_ASSERT_EQ(image.participant_index, index);
+	UT_ASSERT(image.valid);
+	if (image.valid)
+		UT_ASSERT(FullTransactionIdEquals(image.participant->original_full_xid, test_top_full));
+	UT_ASSERT_EQ(held_count, 0); UT_ASSERT_EQ(enters, leaves); UT_ASSERT_EQ(allocated, 0);
+	CtrcShared = origin_pool;
+}
+
 int
 main(void)
 {
-	UT_PLAN(92);
+	UT_PLAN(96);
 	UT_RUN(test_actual_delegated_close_enters_drain_and_retains_parent);
 	UT_RUN(test_actual_delegated_close_malformed_is_consumed_without_mutation);
 	UT_RUN(test_delegated_close_codec_is_explicit_and_roundtrips_all_binding_fields);
@@ -4620,6 +4949,10 @@ main(void)
 	UT_RUN(test_retired_active_source_requires_exact_immutable_proof_and_zero_head);
 	UT_RUN(test_retired_source_cannot_reopen_custody_or_publish_a_new_receipt);
 	UT_RUN(test_retired_source_busy_shard_retries_the_original_cursor_without_mutation);
+	UT_RUN(test_later_original_grant_reuses_only_the_completed_physical_receiver_slot);
+	UT_RUN(test_successor_refusals_preserve_the_entire_completed_retry_proof_and_pool);
+	UT_RUN(test_successor_explicit_generation_and_original_epoch_are_not_raw_xid_guesses);
+	UT_RUN(test_later_delegated_custody_reuses_completed_receiver_before_image_receipt);
 	free(root_certificate_source_pool);
 	free(subtree_leaf_pool);
 	free(CtrcShared);
