@@ -38,7 +38,9 @@
 #include "catalog/pg_foreign_server.h"
 #include "catalog/pg_language.h"
 #include "catalog/pg_namespace.h"
+#include "catalog/pg_opclass.h"
 #include "catalog/pg_operator.h"
+#include "catalog/pg_opfamily.h"
 #include "catalog/pg_policy.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_statistic_ext.h"
@@ -78,6 +80,7 @@
 #include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/rel.h"
+#include "utils/syscache.h"
 #include "../../backend/cluster/cluster_control_bootstrap_private.h"
 #include "unit_test.h"
 
@@ -7780,6 +7783,11 @@ static ListCell conversion_name_cell;
 static List conversion_names;
 static CreateConversionStmt native_conversion_stmt;
 
+static bool opclass_lookup_active;
+static unsigned opclass_entry_kind, opclass_lookups, opclass_bad_lookup, opclass_lookup_kind;
+static List opclass_names;
+static char *opclass_amname;
+
 static bool operator_lookup_active;
 static unsigned operator_entry_kind, operator_lookups, operator_bad_lookup, operator_lookup_kind;
 static List operator_names;
@@ -7788,6 +7796,13 @@ static ObjectWithArgs native_operator_args;
 Oid
 QualifiedNameGetCreationNamespace(List *names, char **objname)
 {
+	if (opclass_lookup_active) {
+		opclass_lookups++;
+		opclass_lookup_kind = 1;
+		if (opclass_entry_kind >= 4 || names != &opclass_names || objname == NULL)
+			opclass_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before the real class/family namespace lookup. */
+	}
 	if (operator_lookup_active) {
 		operator_lookups++;
 		operator_lookup_kind = 1;
@@ -10240,10 +10255,199 @@ UT_TEST(test_native_operator_scope_refusal_preserves_existing_top_binding)
 	operator_lookup_active = false;
 }
 
+/* Actual class/family prefixes stop before namespace or AM cache access. */
+HeapTuple
+SearchSysCache1(int cacheId, Datum key1)
+{
+	opclass_lookups++;
+	opclass_lookup_kind = 2;
+	if (!opclass_lookup_active || opclass_entry_kind < 4 || cacheId != AMNAME || key1 == (Datum)0
+		|| strcmp(DatumGetCString(key1), opclass_amname) != 0)
+		opclass_bad_lookup++;
+	siglongjmp(boundary, 2); /* Stop before the real AM cache lookup. */
+}
+
+#include "test_cluster_fresh_opclass.inc"
+
+static String opclass_name_nodes[2];
+static ListCell opclass_name_cells[2];
+static TypeName opclass_datatype;
+static CreateOpClassStmt native_opclass_create;
+static CreateOpFamilyStmt native_opfamily_create;
+static AlterOpFamilyStmt native_opfamily_alter;
+
+static void
+reset_native_opclass(unsigned kind)
+{
+	reset_create_preflight();
+	opclass_lookup_active = true;
+	opclass_entry_kind = kind;
+	opclass_lookups = opclass_bad_lookup = opclass_lookup_kind = 0;
+	opclass_amname = kind % 2 ? "hash" : "btree";
+	opclass_name_nodes[0] = (String){ .type = T_String, .sval = "native_schema" };
+	opclass_name_nodes[1] = (String){ .type = T_String, .sval = "native_index_operators" };
+	opclass_name_cells[0] = (ListCell){ .ptr_value = &opclass_name_nodes[kind % 2 ? 0 : 1] };
+	opclass_name_cells[1] = (ListCell){ .ptr_value = &opclass_name_nodes[1] };
+	opclass_names = (List){ .type = T_List,
+							.length = kind % 2 ? 2 : 1,
+							.max_length = 2,
+							.elements = opclass_name_cells };
+	opclass_datatype = (TypeName){ .type = T_TypeName, .typeOid = INT4OID };
+	native_opclass_create = (CreateOpClassStmt){ .type = T_CreateOpClassStmt,
+												 .opclassname = &opclass_names,
+												 .amname = opclass_amname,
+												 .datatype = &opclass_datatype,
+												 .isDefault = kind % 2 != 0 };
+	native_opfamily_create = (CreateOpFamilyStmt){ .type = T_CreateOpFamilyStmt,
+												   .opfamilyname = &opclass_names,
+												   .amname = opclass_amname };
+	native_opfamily_alter = (AlterOpFamilyStmt){ .type = T_AlterOpFamilyStmt,
+												 .opfamilyname = &opclass_names,
+												 .amname = opclass_amname,
+												 .isDrop = kind == 5 };
+}
+
+static Node *
+native_opclass_statement(unsigned kind)
+{
+	return kind < 2	  ? (Node *)&native_opclass_create
+		   : kind < 4 ? (Node *)&native_opfamily_create
+					  : (Node *)&native_opfamily_alter;
+}
+
+static void
+native_opclass_entry(unsigned kind)
+{
+	if (kind < 2)
+		(void)DefineOpClass(&native_opclass_create);
+	else if (kind < 4)
+		(void)DefineOpFamily(&native_opfamily_create);
+	else
+		(void)AlterOpFamily(&native_opfamily_alter);
+}
+
+UT_TEST(test_native_opclass_scope_matches_utility_before_lookup_or_binding)
+{
+	for (unsigned kind = 0; kind < 6; kind++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			int caught;
+
+			reset_native_opclass(kind);
+			set_native_operator_mode(mode);
+			if (operator_shared_modes[mode]) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					create_sql_entry(native_opclass_statement(kind));
+				UT_ASSERT_EQ(caught, 1);
+				UT_ASSERT_EQ(error_code, ERRCODE_FEATURE_NOT_SUPPORTED);
+				UT_ASSERT_STR_EQ(error_message, "custom operators is not supported in shared mode");
+				UT_ASSERT_STR_EQ(error_detail,
+								 "PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+				reset_error();
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_opclass_entry(kind);
+			UT_ASSERT_EQ(caught, operator_shared_modes[mode] ? 1 : 2);
+			UT_ASSERT_EQ(error_code,
+						 operator_shared_modes[mode] ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+			if (operator_shared_modes[mode]) {
+				UT_ASSERT_STR_EQ(error_message, "custom operators is not supported in shared mode");
+				UT_ASSERT_STR_EQ(error_detail,
+								 "PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+			}
+			UT_ASSERT_EQ(opclass_lookups, operator_shared_modes[mode] ? 0 : 1);
+			UT_ASSERT_EQ(opclass_lookup_kind, operator_shared_modes[mode] ? 0 : kind < 4 ? 1 : 2);
+			UT_ASSERT_EQ(opclass_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			UT_ASSERT_EQ(utility_top_xid, InvalidTransactionId);
+		}
+	}
+	opclass_lookup_active = false;
+}
+
+UT_TEST(test_native_opclass_scope_refusal_precedes_context_child_top_and_publication)
+{
+	for (unsigned kind = 0; kind < 6; kind++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			for (unsigned guard = 0; guard < 6; guard++) {
+				int caught;
+
+				reset_native_opclass(kind);
+				set_native_operator_mode(mode);
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				utility_in_child = guard == 3;
+				if (guard == 4) {
+					utility_current_xid = 401;
+					utility_top_xid = 400;
+				}
+				utility_bind_ok = guard != 5;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_opclass_entry(kind);
+				UT_ASSERT_EQ(caught, operator_shared_modes[mode] ? 1 : 2);
+				UT_ASSERT_EQ(error_code,
+							 operator_shared_modes[mode] ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+				if (operator_shared_modes[mode]) {
+					UT_ASSERT_STR_EQ(error_message,
+									 "custom operators is not supported in shared mode");
+					UT_ASSERT_STR_EQ(
+						error_detail,
+						"PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+				}
+				UT_ASSERT_EQ(opclass_lookups, operator_shared_modes[mode] ? 0 : 1);
+				UT_ASSERT_EQ(opclass_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+				UT_ASSERT_EQ(utility_top_xid, guard == 4 ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	opclass_lookup_active = false;
+}
+
+UT_TEST(test_native_opclass_scope_refusal_preserves_existing_top_binding)
+{
+	for (unsigned kind = 0; kind < 6; kind++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			AlterStatsStmt supported = { .type = T_AlterStatsStmt, .stxstattarget = 100 };
+			int caught;
+
+			reset_native_opclass(kind);
+			create_sql_entry((Node *)&supported);
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			set_native_operator_mode(mode);
+			XactReadOnly = utility_parallel = utility_recovery = utility_in_child = true;
+			utility_bind_ok = false;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_opclass_entry(kind);
+			UT_ASSERT_EQ(caught, operator_shared_modes[mode] ? 1 : 2);
+			UT_ASSERT_EQ(error_code,
+						 operator_shared_modes[mode] ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+			if (operator_shared_modes[mode]) {
+				UT_ASSERT_STR_EQ(error_message, "custom operators is not supported in shared mode");
+				UT_ASSERT_STR_EQ(error_detail,
+								 "PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+			}
+			UT_ASSERT_EQ(opclass_lookups, operator_shared_modes[mode] ? 0 : 1);
+			UT_ASSERT_EQ(opclass_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			UT_ASSERT_EQ(utility_top_xid, 400);
+		}
+	}
+	opclass_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(149);
+	UT_PLAN(152);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -10393,6 +10597,9 @@ main(void)
 	UT_RUN(test_native_operator_scope_matches_utility_before_lookup_or_binding);
 	UT_RUN(test_native_operator_scope_refusal_precedes_context_child_top_and_publication);
 	UT_RUN(test_native_operator_scope_refusal_preserves_existing_top_binding);
+	UT_RUN(test_native_opclass_scope_matches_utility_before_lookup_or_binding);
+	UT_RUN(test_native_opclass_scope_refusal_precedes_context_child_top_and_publication);
+	UT_RUN(test_native_opclass_scope_refusal_preserves_existing_top_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
