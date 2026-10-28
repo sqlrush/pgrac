@@ -1041,4 +1041,13 @@ extern ResourceXApplyResult cluster_bufmgr_pcm_own_acquire_stage_release_exact(
 	BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
 	const ResourceXDecodedAcquireIntent *episode, const ResourceXDeliveryClaim *claim);
 
+/* Original full-E execution handoff. No native C, installed bytes or direct
+ * IO permission is implied; post-handoff failure retains execution debt. */
+extern ResourceXApplyResult cluster_bufmgr_pcm_own_acquire_execute_begin_exact(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
+	const ResourceXDecodedAcquireIntent *episode,
+	const struct ClusterSemanticAdmissionToken *admission, const ResourceXDeliveryClaim *prepared,
+	ResourceXDecodedFrame *grant_out, ResourceXDecodedFrame *image_out,
+	ResourceXRequesterJoinSnapshot *out, ResourceXDeliveryClaim *execution_out);
+
 #endif /* CLUSTER_PCM_X_BUFMGR_H */

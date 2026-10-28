@@ -13,6 +13,11 @@
  *
  *-------------------------------------------------------------------------
  */
+/* PGRAC MODIFICATIONS
+ * Modified by: SqlRush <sqlrush@gmail.com>
+ * Exact read-only BufferIO inspection for native acquisition execution.
+ * Spec: spec-pre2-first-read-source-grant.md
+ */
 #ifndef RESOWNER_PRIVATE_H
 #define RESOWNER_PRIVATE_H
 
@@ -34,6 +39,8 @@ extern void ResourceOwnerForgetBuffer(ResourceOwner owner, Buffer buffer);
 extern void ResourceOwnerEnlargeBufferIOs(ResourceOwner owner);
 extern void ResourceOwnerRememberBufferIO(ResourceOwner owner, Buffer buffer);
 extern void ResourceOwnerForgetBufferIO(ResourceOwner owner, Buffer buffer);
+/* PGRAC: exact read-only membership, never inferred from BM_IO_IN_PROGRESS. */
+extern bool ResourceOwnerHasBufferIO(ResourceOwner owner, Buffer buffer);
 
 /* support for local lock management */
 extern void ResourceOwnerRememberLock(ResourceOwner owner, LOCALLOCK *locallock);

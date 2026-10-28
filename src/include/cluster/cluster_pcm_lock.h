@@ -1712,6 +1712,7 @@ typedef struct ResourceXDeliveryTarget {
 #define RESOURCE_X_DELIVERY_NORMAL UINT8_C(1)
 #define RESOURCE_X_DELIVERY_CLEANUP UINT8_C(2)
 #define RESOURCE_X_DELIVERY_ACQUIRE_PREPARED UINT8_C(3)
+#define RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING UINT8_C(4)
 typedef struct ResourceXDeliveryClaim {
 	ResourceXInstallClaimJoinObservation observation;
 	ResourceXDeliveryTarget target;
@@ -2817,6 +2818,17 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_stage_
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_stage_revert_exact(
 	const ResourceXDeliveryClaim *claim, const ResourceXDecodedAcquireIntent *episode,
 	const struct ClusterPcmOwnSnapshot *quiet);
+
+/* Original full-E execution: PREPARED rollback is closed before physical
+ * work. Materials do not prove installed bytes or native completion. */
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_execute_begin_exact(
+	const ResourceXDeliveryClaim *prepared, const ResourceXDecodedAcquireIntent *episode,
+	ResourceXDecodedFrame *grant_out, ResourceXDecodedFrame *image_out,
+	ResourceXRequesterJoinSnapshot *out, ResourceXDeliveryClaim *execution_out);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_execute_frames_exact(
+	const ResourceXDeliveryClaim *execution, const ResourceXDecodedAcquireIntent *episode,
+	ResourceXDecodedFrame *grant_out, ResourceXDecodedFrame *image_out,
+	ResourceXRequesterJoinSnapshot *out);
 
 #endif /* USE_PGRAC_CLUSTER */
 

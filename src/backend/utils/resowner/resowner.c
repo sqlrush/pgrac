@@ -18,6 +18,12 @@
  *
  *-------------------------------------------------------------------------
  */
+/*
+ * PGRAC MODIFICATIONS
+ * Modified by: SqlRush <sqlrush@gmail.com>
+ * Inspect exact native BufferIO ownership without consuming a resource.
+ * Spec: spec-pre2-first-read-source-grant.md
+ */
 #include "postgres.h"
 
 #include "common/cryptohash.h"
@@ -1023,6 +1029,29 @@ void
 ResourceOwnerRememberBufferIO(ResourceOwner owner, Buffer buffer)
 {
 	ResourceArrayAdd(&(owner->bufferioarr), BufferGetDatum(buffer));
+}
+
+/* Read-only inspection of this exact owner's native IO registrations.
+ * A buffer's IO bit, a pin, or an ancestor's registration is not ownership.
+ * Hash deletion leaves holes, so inspect all allocated hash slots rather
+ * than stopping at the first empty one. Never change lastidx or counts. */
+bool
+ResourceOwnerHasBufferIO(ResourceOwner owner, Buffer buffer)
+{
+	const ResourceArray *array;
+	Datum value = BufferGetDatum(buffer);
+	uint32 limit;
+
+	if (owner == NULL || buffer == InvalidBuffer)
+		return false;
+	array = &owner->bufferioarr;
+	if (array->nitems == 0)
+		return false;
+	limit = RESARRAY_IS_ARRAY(array) ? array->nitems : array->capacity;
+	for (uint32 i = 0; i < limit; i++)
+		if (array->itemsarr[i] == value)
+			return true;
+	return false;
 }
 
 /*

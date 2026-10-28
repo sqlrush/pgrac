@@ -3272,7 +3272,8 @@ typedef enum ClusterAcquirePreparationAction
 {
 	CLUSTER_ACQUIRE_PREPARATION_QUIET,
 	CLUSTER_ACQUIRE_PREPARATION_ADOPT,
-	CLUSTER_ACQUIRE_PREPARATION_WITHDRAW
+	CLUSTER_ACQUIRE_PREPARATION_WITHDRAW,
+	CLUSTER_ACQUIRE_PREPARATION_VERIFY
 } ClusterAcquirePreparationAction;
 
 static bool
@@ -3308,7 +3309,10 @@ cluster_bufmgr_acquire_prepared_native(BufferDesc *buf, const ClusterPcmOwnSnaps
 		else if (action == CLUSTER_ACQUIRE_PREPARATION_WITHDRAW && attempt == executor_sequence)
 			result = cluster_pcm_own_delivery_hold_unadopt_grant_exact(buf->buf_id,
 				episode->base_generation, episode->reservation_token, executor_sequence);
-		else if (action != CLUSTER_ACQUIRE_PREPARATION_ADOPT && attempt == 0)
+		else if (action == CLUSTER_ACQUIRE_PREPARATION_VERIFY && attempt == executor_sequence)
+			result = CLUSTER_PCM_OWN_OK;
+		else if ((action == CLUSTER_ACQUIRE_PREPARATION_QUIET
+				|| action == CLUSTER_ACQUIRE_PREPARATION_WITHDRAW) && attempt == 0)
 			result = CLUSTER_PCM_OWN_OK;
 	}
 	if (result == CLUSTER_PCM_OWN_OK)
@@ -3493,6 +3497,93 @@ cluster_bufmgr_resource_x_wait_retry(LWLock *content_lock, int32 buffer_id,
 	CHECK_FOR_INTERRUPTS();
 	return true;
 }
+
+/* Original acquisition execution ownership. Preparation cannot be reopened
+ * after this handoff. Actual bytes/IO/C still require the physical owner. */
+static bool
+cluster_bufmgr_acquire_execution_context(BufferDesc *buf,
+	const ResourceXDecodedAcquireIntent *episode,
+	const ClusterSemanticAdmissionToken *admission, ResourceOwner io_owner)
+{
+	if (buf == NULL || episode == NULL || admission == NULL || io_owner == NULL
+		|| !admission->entered || admission->side != CLUSTER_SEMANTIC_TARGET_SIDE
+		|| admission->feature_bit != CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1
+		|| admission->formation_epoch != episode->cluster_epoch
+		|| admission->record_generation != episode->r4_generation
+		|| !cluster_semantic_activation_recheck(admission)
+		|| cluster_epoch_get_current() != episode->cluster_epoch
+		|| cluster_qvotec_get_self_incarnation() != episode->requester_incarnation)
+		return false;
+	if (MyProc == NULL || MyProcPid <= 0 || MyProc->pid != MyProcPid
+		|| MyProc->pgprocno < 0 || MyBackendId != episode->backend_id
+		|| MyProc->backendId != episode->backend_id
+		|| MyProc->cluster_grd_generation != episode->backend_generation
+		|| buf->buf_id != episode->buffer_id || buf->buf_id < 0 || buf->buf_id >= NBuffers
+		|| GetPrivateRefCount(BufferDescriptorGetBuffer(buf)) <= 0
+		|| CurrentResourceOwner != io_owner
+		|| !admission->entered || admission->side != CLUSTER_SEMANTIC_TARGET_SIDE
+		|| admission->feature_bit != CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1
+		|| admission->formation_epoch != episode->cluster_epoch
+		|| admission->record_generation != episode->r4_generation
+		|| (episode->path == RESOURCE_X_ACQUIRE_FIRST_FILL
+			&& !ResourceOwnerHasBufferIO(io_owner, BufferDescriptorGetBuffer(buf))))
+		return false;
+	return true;
+}
+
+/* Repeated checks are process-local. Once entry ownership changes, an ERROR
+ * or failed postcheck retains the original shared execution/native/IO debt;
+ * it never routes through PREPARED rollback or generic AbortBufferIO. */
+ResourceXApplyResult
+cluster_bufmgr_pcm_own_acquire_execute_begin_exact(BufferDesc *buf,
+	const ClusterPcmOwnSnapshot *base, const ResourceXDecodedAcquireIntent *episode,
+	const ClusterSemanticAdmissionToken *admission, const ResourceXDeliveryClaim *prepared,
+	ResourceXDecodedFrame *grant_out, ResourceXDecodedFrame *image_out,
+	ResourceXRequesterJoinSnapshot *out, ResourceXDeliveryClaim *execution_out)
+{
+	ClusterPcmOwnSnapshot original, live;
+	ResourceXDecodedAcquireIntent entered;
+	ResourceXDeliveryClaim owned, execution;
+	ResourceXDecodedFrame grant, image;
+	ResourceXRequesterJoinSnapshot join;
+	ResourceOwner io_owner = CurrentResourceOwner;
+	ResourceXApplyResult result;
+
+	if (buf == NULL || base == NULL || episode == NULL || prepared == NULL || grant_out == NULL
+		|| image_out == NULL || out == NULL || execution_out == NULL || grant_out == image_out)
+		return RESOURCE_X_APPLY_INVALID;
+	if (LWLockHeldByMe(BufferDescriptorGetContentLock(buf)))
+		return RESOURCE_X_APPLY_BAD_STATE;
+	original = *base;
+	entered = *episode;
+	owned = *prepared;
+	if (!cluster_bufmgr_acquire_execution_context(buf, &entered, admission, io_owner)
+		|| !BufferTagsEqual(&original.tag, &owned.observation.request.logical_assertion.resource)
+		|| cluster_gcs_lookup_master(original.tag) != owned.observation.master_node
+		|| !cluster_bufmgr_acquire_prepared_native(buf, &original, &entered,
+			owned.executor_sequence, CLUSTER_ACQUIRE_PREPARATION_VERIFY, &live))
+		return RESOURCE_X_APPLY_BAD_STATE;
+	result = cluster_pcm_lock_resource_x_requester_acquire_execute_begin_exact(
+		&owned, &entered, &grant, &image, &join, &execution);
+	if (result != RESOURCE_X_APPLY_APPLIED)
+		return result;
+	/* No local action can roll this execution back to preparation. The
+	 * original round retained the complete owner before any provider call. */
+	if (!cluster_bufmgr_acquire_execution_context(buf, &entered, admission, io_owner)
+		|| cluster_gcs_lookup_master(original.tag) != owned.observation.master_node
+		|| !cluster_bufmgr_acquire_prepared_native(buf, &original, &entered,
+			execution.executor_sequence, CLUSTER_ACQUIRE_PREPARATION_VERIFY, &live)
+		|| cluster_pcm_lock_resource_x_requester_acquire_execute_frames_exact(
+			&execution, &entered, &grant, &image, &join) != RESOURCE_X_APPLY_APPLIED)
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	*grant_out = grant;
+	*image_out = image;
+	*out = join;
+	*execution_out = execution;
+	return RESOURCE_X_APPLY_APPLIED;
+}
+/* End original acquisition execution ownership. */
+
 
 /*
  * PGRAC (t/400 L3 review R2 P0-2): a legacy grant reservation that observes
