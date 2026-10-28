@@ -11311,8 +11311,8 @@ fail_closed:
 	return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 }
 
-/* Resume only an already-retained complete-A S source. The immutable pair
- * precedes native S->N; neither a transport callback nor a stale caller's
+/* Resume only an already-retained complete-A source. The immutable pair
+ * precedes native S/X->N; neither a transport callback nor a stale caller's
  * image can supply this proof. No pin/owner handle moves into this branch. */
 static ResourceXApplyResult
 gcs_block_resource_x_acquire_s_source_finish_owned(
@@ -11366,8 +11366,9 @@ gcs_block_resource_x_acquire_s_source_finish_owned(
 		memset(&finished, 0, sizeof(finished));
 		PG_TRY();
 		{
-			/* The clean S source owns no first-dirty reference to move. The
-			 * original native function retains its WAL/DATA and IO checks. */
+			/* S capture owns no first-dirty reference. X capture already
+			 * handed its first record to the original local PI owner before
+			 * this immutable pair. Native WAL/DATA and IO checks stay exact. */
 			own = source
 				? cluster_bufmgr_pcm_own_finish_revoke_retain(buf, &prepared, page_lsn, &finished, &refusal, NULL)
 				: cluster_bufmgr_pcm_own_finish_s_holder_revoke(buf, &prepared, &finished, &refusal);
@@ -14523,7 +14524,6 @@ gcs_block_resource_x_acquire_s_source_capture_owned(const ResourceXSourceDrainWo
 		|| (block->common.target_mode != PCM_STATE_S && block->common.target_mode != PCM_STATE_X)
 		|| (block->body.acquire_decision.directory_mode != PCM_STATE_S
 			&& !(block->body.acquire_decision.directory_mode == PCM_STATE_X
-				&& block->common.target_mode == PCM_STATE_S
 				&& block->body.acquire_decision.source_node == cluster_node_id))
 		|| (work->attempt_generation & 1) == 0
 		|| work->master_node != block->body.acquire_decision.master_node
@@ -15022,7 +15022,7 @@ gcs_block_resource_x_type17_ingress(const ClusterICEnvelope *env,
 				&& ((frame->body.acquire_decision.directory_mode == PCM_STATE_S
 						&& (frame->common.target_mode == PCM_STATE_S || frame->common.target_mode == PCM_STATE_X))
 					|| (frame->body.acquire_decision.directory_mode == PCM_STATE_X
-						&& frame->common.target_mode == PCM_STATE_S)))
+						&& (frame->common.target_mode == PCM_STATE_S || frame->common.target_mode == PCM_STATE_X))))
 				result = cluster_pcm_lock_resource_x_acquire_s_source_forward_exact(frame,
 					master_node, admission.record_generation, authenticated_connection_generation);
 			else if ((frame->common.observed_mode == (uint8)PCM_STATE_X

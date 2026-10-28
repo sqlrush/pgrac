@@ -2946,10 +2946,46 @@ UT_TEST(test_actual_non_source_s_forward_refusal_does_not_fall_back)
 	UT_ASSERT_EQ(acquire_forward_reserves, 1); UT_ASSERT_EQ(source_observations + acquire_drain_finishes, 0);
 }
 
+
+UT_TEST(test_actual_x_current_ingress_uses_directory_mode_and_retains_forward)
+{
+	ClusterICEnvelope env = {.source_node_id = 1}; ResourceXSourceDrainWork work = acquire_drain_fixture();
+	(void)work; acquire_drain_block.body.acquire_decision.directory_mode = PCM_STATE_X;
+	acquire_drain_block.body.acquire_decision.source_node = cluster_node_id;
+	acquire_drain_block.common.observed_mode = PCM_STATE_N;
+	acquire_drain_block.common.source_candidate = acquire_drain_block.common.retain_pi_if_dirty = 0;
+	UT_ASSERT_EQ(gcs_block_resource_x_type17_ingress(&env, &acquire_drain_block, 61), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(acquire_forward_reserves, 1); UT_ASSERT_EQ(source_observations + acquire_drain_finishes, 0);
+}
+
+UT_TEST(test_actual_x_current_ingress_busy_does_not_use_legacy_fallback)
+{
+	ClusterICEnvelope env = {.source_node_id = 1}; ResourceXSourceDrainWork work = acquire_drain_fixture();
+	(void)work; acquire_drain_block.body.acquire_decision.directory_mode = PCM_STATE_X;
+	acquire_drain_block.body.acquire_decision.source_node = cluster_node_id;
+	acquire_drain_block.common.observed_mode = PCM_STATE_X;
+	acquire_drain_block.common.source_candidate = acquire_drain_block.common.retain_pi_if_dirty = 1;
+	acquire_forward_result = RESOURCE_X_APPLY_BAD_STATE;
+	UT_ASSERT_EQ(gcs_block_resource_x_type17_ingress(&env, &acquire_drain_block, 61), RESOURCE_X_APPLY_BAD_STATE);
+	UT_ASSERT_EQ(acquire_forward_reserves, 1); UT_ASSERT_EQ(source_observations + acquire_drain_finishes, 0);
+}
+
+UT_TEST(test_actual_x_current_lms_preserves_same_claim_through_capture_and_finish)
+{
+	ResourceXSourceDrainWork work = acquire_drain_fixture();
+	acquire_drain_block.body.acquire_decision.directory_mode = PCM_STATE_X;
+	acquire_drain_block.body.acquire_decision.source_node = cluster_node_id;
+	acquire_drain_forward_phase = true;
+	UT_ASSERT_EQ(cluster_gcs_block_resource_x_source_drain_tick(&work), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(acquire_forward_captures, 1); UT_ASSERT_EQ(acquire_drain_finishes, 1);
+	UT_ASSERT_EQ(source_observations, 0);
+	UT_ASSERT(memcmp(&acquire_drain_completed, &work, sizeof(work)) == 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(46);
+	UT_PLAN(49);
 	UT_RUN(test_actual_terminal_ingress_keeps_master_and_physical_source_distinct);
 	UT_RUN(test_actual_kind9_ingress_does_not_send_ack_for_fused_admission);
 	UT_RUN(test_actual_fused_admission_notifies_ready_resource_without_registry_tick);
@@ -2996,6 +3032,9 @@ main(void)
 	UT_RUN(test_actual_compatible_s_lms_busy_keeps_claim_and_never_falls_back);
 	UT_RUN(test_actual_non_source_s_ingress_retains_full_forward_without_legacy_service);
 	UT_RUN(test_actual_non_source_s_forward_refusal_does_not_fall_back);
+	UT_RUN(test_actual_x_current_ingress_uses_directory_mode_and_retains_forward);
+	UT_RUN(test_actual_x_current_ingress_busy_does_not_use_legacy_fallback);
+	UT_RUN(test_actual_x_current_lms_preserves_same_claim_through_capture_and_finish);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

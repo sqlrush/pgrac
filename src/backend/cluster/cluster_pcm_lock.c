@@ -24886,7 +24886,8 @@ pcm_resource_x_s_source_native_valid(const ClusterPcmOwnSnapshot *native, const 
 /* This is shared-holder service, not general A admission. A source seals
  * its protected page; another required holder seals a control witness.
  * Compatible S keeps its generation; requester X requires native S->N/PI.
- * An exact X source may serve S only after its original native/PI prepare. */
+ * An exact X source serves S or X only after its original native/PI prepare.
+ * Target X retains the same pair before native X->N+PI completion. */
 static bool
 pcm_resource_x_s_source_block_valid(const ResourceXDecodedFrame *block, int32 master,
 	ResourceXDecodedFrame *canonical)
@@ -24912,8 +24913,8 @@ pcm_resource_x_s_source_block_valid(const ResourceXDecodedFrame *block, int32 ma
 				&& canonical->common.logical_assertion.requester_node != cluster_node_id))
 		&& ((a->directory_mode == PCM_STATE_S
 				&& (canonical->common.target_mode == PCM_STATE_S || canonical->common.target_mode == PCM_STATE_X))
-			|| (a->directory_mode == PCM_STATE_X && canonical->common.target_mode == PCM_STATE_S
-				&& a->source_node == cluster_node_id))
+			|| (a->directory_mode == PCM_STATE_X && a->source_node == cluster_node_id
+				&& (canonical->common.target_mode == PCM_STATE_S || canonical->common.target_mode == PCM_STATE_X)))
 		&& canonical->common.action_node == cluster_node_id
 		&& canonical->common.outcome == RESOURCE_X_OUTCOME_NONE;
 }

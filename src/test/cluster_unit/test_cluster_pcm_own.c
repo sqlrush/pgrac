@@ -12109,10 +12109,106 @@ UT_TEST(test_x_to_s_capture_error_after_prepare_preserves_x_and_no_pin)
 	cluster_shared_config = false; ClusterPcmOwnArray = saved;
 }
 
+
+/* Run the same actual X capture and native retain for a target-X service.
+ * Only entry/pair ownership and authenticated peer/domain samples are seams. */
+static void
+xx_capture_fixture(BufferDesc *buf, ClusterPcmOwnEntry *entry)
+{
+	xs_capture_fixture(buf, entry);
+	capture_work.request.target_mode = capture_block.common.target_mode = PCM_STATE_X;
+	acquire_source_mode = PCM_STATE_X;
+}
+
+UT_TEST(test_x_current_real_capture_finishes_n_pi_once)
+{
+	BufferDesc buf; ClusterPcmOwnEntry entry; ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	xx_capture_fixture(&buf, &entry);
+	UT_ASSERT_EQ(capture_consume(), RESOURCE_X_APPLY_APPLIED); UT_ASSERT_EQ(capture_handoffs, 1);
+	UT_ASSERT_EQ(buf.pcm_state, PCM_STATE_X); UT_ASSERT_EQ(acquire_source_publishes, 0);
+	UT_ASSERT_EQ(acquire_source_consume(), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(buf.pcm_state, PCM_STATE_N); UT_ASSERT_EQ(buf.buffer_type, BUF_TYPE_PI);
+	UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), PCM_OWN_FLAG_REVOKING);
+	UT_ASSERT_EQ(acquire_source_consume(), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_own_gen_get(0), acquire_source_prepared.generation + 1);
+	UT_ASSERT_EQ(transition_pin_count, 0); cluster_shared_config = false; ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_x_current_capture_busy_resumes_original_forward_without_handoff)
+{
+	for (int n = 0; n < 2; n++) {
+		BufferDesc buf; ClusterPcmOwnEntry entry; ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+		xx_capture_fixture(&buf, &entry);
+		if (n) pg_atomic_fetch_or_u32(&buf.state, BM_IO_IN_PROGRESS); else transition_content_busy = true;
+		UT_ASSERT_EQ(capture_consume(), RESOURCE_X_APPLY_BAD_STATE); UT_ASSERT_EQ(capture_handoffs, 0);
+		UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0); UT_ASSERT_EQ(buf.pcm_state, PCM_STATE_X);
+		pg_atomic_fetch_and_u32(&buf.state, ~BM_IO_IN_PROGRESS); transition_content_busy = false;
+		UT_ASSERT_EQ(capture_consume(), RESOURCE_X_APPLY_APPLIED); UT_ASSERT_EQ(capture_handoffs, 1);
+		UT_ASSERT_EQ(transition_pin_count, 0); cluster_shared_config = false; ClusterPcmOwnArray = saved;
+	}
+}
+
+UT_TEST(test_x_current_retained_finish_busy_waits_actual_content_or_io)
+{
+	for (int n = 0; n < 2; n++) {
+		BufferDesc buf; ClusterPcmOwnEntry entry; ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+		xx_capture_fixture(&buf, &entry); UT_ASSERT_EQ(capture_consume(), RESOURCE_X_APPLY_APPLIED);
+		if (n) pg_atomic_fetch_or_u32(&buf.state, BM_IO_IN_PROGRESS); else transition_content_busy = true;
+		UT_ASSERT_EQ(acquire_source_consume(), RESOURCE_X_APPLY_BAD_STATE);
+		UT_ASSERT_EQ(source_finish_fuses + acquire_source_publishes, 0);
+		UT_ASSERT_EQ(buf.pcm_state, PCM_STATE_X); UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), PCM_OWN_FLAG_REVOKING);
+		pg_atomic_fetch_and_u32(&buf.state, ~BM_IO_IN_PROGRESS); transition_content_busy = false;
+		UT_ASSERT_EQ(acquire_source_consume(), RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(buf.pcm_state, PCM_STATE_N); UT_ASSERT_EQ(transition_pin_count, 0);
+		cluster_shared_config = false; ClusterPcmOwnArray = saved;
+	}
+}
+
+UT_TEST(test_x_current_native_commit_before_publication_is_adopted_not_repeated)
+{
+	BufferDesc buf; ClusterPcmOwnEntry entry; ClusterPcmOwnSnapshot done; ClusterPcmOwnFinishRefusal refusal;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	xx_capture_fixture(&buf, &entry); UT_ASSERT_EQ(capture_consume(), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_bufmgr_pcm_own_finish_revoke_retain(&buf, &acquire_source_prepared,
+		PageGetLSN((Page)acquire_source_image.body.acquire_image.original_image.page_bytes), &done, &refusal, NULL), CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(acquire_source_publishes, 0); UT_ASSERT_EQ(buf.pcm_state, PCM_STATE_N);
+	UT_ASSERT_EQ(acquire_source_consume(), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(acquire_source_publishes, 1);
+	UT_ASSERT_EQ(cluster_pcm_own_gen_get(0), acquire_source_prepared.generation + 1);
+	UT_ASSERT_EQ(transition_pin_count, 0); cluster_shared_config = false; ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_x_current_changed_protected_lsn_keeps_exact_fence_fail_closed)
+{
+	BufferDesc buf; ClusterPcmOwnEntry entry; ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	xx_capture_fixture(&buf, &entry); UT_ASSERT_EQ(capture_consume(), RESOURCE_X_APPLY_APPLIED);
+	PageSetLSNPreserveOrigin((Page)transition_page.data, UINT64_C(0x77540));
+	UT_ASSERT_EQ(acquire_source_consume(), RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+	UT_ASSERT_EQ(acquire_source_publishes, 0); UT_ASSERT_EQ(buf.pcm_state, PCM_STATE_X);
+	UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), PCM_OWN_FLAG_REVOKING);
+	UT_ASSERT_EQ(transition_pin_count, 0); cluster_shared_config = false; ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_x_current_pi_first_precedes_capture_and_survives_n_commit)
+{
+	BufferDesc buf; ClusterPcmOwnEntry entry; ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	xx_capture_fixture(&buf, &entry);
+	transition_page_wal.record_start = 0x12300; transition_page_wal.record_end = 0x12400;
+	transition_first_binding = transition_page_wal; transition_first_binding.record_start = 0x11000;
+	transition_first_state = CLUSTER_PAGE_WAL_FIRST_PRESENT;
+	UT_ASSERT_EQ(capture_consume(), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(transition_pi_records, 1); UT_ASSERT(transition_pi_first_present);
+	UT_ASSERT_EQ(transition_first_handovers, 1); UT_ASSERT_EQ(buf.pcm_state, PCM_STATE_X);
+	UT_ASSERT_EQ(acquire_source_consume(), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(buf.pcm_state, PCM_STATE_N); UT_ASSERT(transition_pi_first_present);
+	UT_ASSERT_EQ(transition_pi_first.record_start, 0x11000);
+	UT_ASSERT_EQ(transition_pin_count, 0); cluster_shared_config = false; ClusterPcmOwnArray = saved;
+}
+
 int
 main(void)
 {
-	UT_PLAN(228);
+	UT_PLAN(234);
 	UT_RUN(test_native_flush_refuses_cr_before_starting_io);
 	UT_RUN(test_shared_leave_releases_dirty_and_clean_x_through_exact_owner);
 	UT_RUN(test_shared_leave_write_and_sync_error_keep_x_and_mapping);
@@ -12341,6 +12437,12 @@ main(void)
 	UT_RUN(test_x_to_s_wal_or_pi_error_keeps_original_x_and_unwinds_prepare);
 	UT_RUN(test_x_to_s_committed_scur_io_busy_keeps_original_publication);
 	UT_RUN(test_x_to_s_capture_error_after_prepare_preserves_x_and_no_pin);
+	UT_RUN(test_x_current_real_capture_finishes_n_pi_once);
+	UT_RUN(test_x_current_capture_busy_resumes_original_forward_without_handoff);
+	UT_RUN(test_x_current_retained_finish_busy_waits_actual_content_or_io);
+	UT_RUN(test_x_current_native_commit_before_publication_is_adopted_not_repeated);
+	UT_RUN(test_x_current_changed_protected_lsn_keeps_exact_fence_fail_closed);
+	UT_RUN(test_x_current_pi_first_precedes_capture_and_survives_n_commit);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
