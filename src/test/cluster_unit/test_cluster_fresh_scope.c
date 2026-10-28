@@ -371,6 +371,8 @@ CreateCommandTag(Node *statement)
 		return CMDTAG_ALTER_TABLESPACE;
 	if (IsA(statement, ReassignOwnedStmt))
 		return CMDTAG_REASSIGN_OWNED;
+	if (IsA(statement, DropOwnedStmt))
+		return CMDTAG_DROP_OWNED;
 	if (IsA(statement, AlterDatabaseSetStmt) || IsA(statement, AlterDatabaseRefreshCollStmt)
 		|| IsA(statement, AlterDatabaseStmt))
 		return CMDTAG_ALTER_DATABASE;
@@ -510,6 +512,8 @@ GetCommandTagName(CommandTag tag)
 		return "DROP ROLE";
 	if (tag == CMDTAG_REASSIGN_OWNED)
 		return "REASSIGN OWNED";
+	if (tag == CMDTAG_DROP_OWNED)
+		return "DROP OWNED";
 	if (tag == CMDTAG_ALTER_DATABASE)
 		return "ALTER DATABASE";
 	if (tag == CMDTAG_CREATE_LANGUAGE)
@@ -5233,10 +5237,179 @@ UT_TEST(test_unsupported_alter_table_refuses_before_binding)
 	}
 }
 
+typedef struct DropOwnedFixture {
+	RoleSpec roles[2];
+	ListCell cells[2];
+	DropOwnedStmt statements[2];
+	List role_list;
+} DropOwnedFixture;
+
+static void
+init_drop_owned_fixture(DropOwnedFixture *fixture)
+{
+	MemSet(fixture, 0, sizeof(*fixture));
+	fixture->roles[0]
+		= (RoleSpec){ .type = T_RoleSpec, .roletype = ROLESPEC_CSTRING, .rolename = "owned_role" };
+	fixture->roles[1] = (RoleSpec){ .type = T_RoleSpec, .roletype = ROLESPEC_CURRENT_USER };
+	fixture->cells[0].ptr_value = &fixture->roles[0];
+	fixture->cells[1].ptr_value = &fixture->roles[1];
+	fixture->role_list
+		= (List){ .type = T_List, .length = 2, .max_length = 2, .elements = fixture->cells };
+	fixture->statements[0] = (DropOwnedStmt){ .type = T_DropOwnedStmt,
+											  .roles = &fixture->role_list,
+											  .behavior = DROP_RESTRICT };
+	fixture->statements[1] = (DropOwnedStmt){ .type = T_DropOwnedStmt,
+											  .roles = &fixture->role_list,
+											  .behavior = DROP_CASCADE };
+}
+
+/* The original utility prologue is real; native role privileges, dependency
+ * scans and deletion, like physical BIND durability, are later boundaries. */
+UT_TEST(test_drop_owned_autocommit_binds_before_later_work_and_reuses_top)
+{
+	DropOwnedFixture fixture;
+
+	init_drop_owned_fixture(&fixture);
+	for (unsigned mode = 0; mode < 8; mode++) {
+		for (unsigned i = 0; i < lengthof(fixture.statements); i++) {
+			bool target = (mode & 3) == 3;
+
+			reset_create_preflight();
+			cluster_shared_catalog = (mode & 1) != 0;
+			utility_storage_mode = (mode & 2) != 0;
+			cluster_shared_config = (mode & 4) != 0;
+			cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+			utility_in_transaction = drop_target_shared = false;
+			storage_drop_preflights = 0;
+			utility_expect_binding = target;
+			create_sql_entry((Node *)&fixture.statements[i]);
+			UT_ASSERT_EQ(utility_after_preflight, 1);
+			UT_ASSERT_EQ(utility_unbound, 0);
+			UT_ASSERT_EQ(utility_xids, target ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, target ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, target ? 1 : 0);
+			create_sql_entry((Node *)&fixture.statements[i]);
+			UT_ASSERT_EQ(utility_after_preflight, 2);
+			UT_ASSERT_EQ(utility_unbound, 0);
+			UT_ASSERT_EQ(utility_xids, target ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, target ? 2 : 0);
+			UT_ASSERT_EQ(utility_binds, target ? 1 : 0);
+			UT_ASSERT_EQ(storage_drop_preflights, 0);
+		}
+	}
+}
+
+UT_TEST(test_drop_owned_autocommit_refusal_child_and_wrong_top_precede_later_work)
+{
+	DropOwnedFixture fixture;
+
+	init_drop_owned_fixture(&fixture);
+	for (unsigned cause = 0; cause < 3; cause++) {
+		for (unsigned i = 0; i < lengthof(fixture.statements); i++) {
+			int caught;
+
+			reset_create_preflight();
+			cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+			utility_in_transaction = drop_target_shared = false;
+			utility_bind_ok = cause != 0;
+			utility_in_child = cause == 1;
+			if (cause == 2) {
+				utility_top_xid = 400;
+				utility_current_xid = 401;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				create_sql_entry((Node *)&fixture.statements[i]);
+			UT_ASSERT(caught);
+			UT_ASSERT_EQ(error_code, cause == 0	  ? ERRCODE_DATA_CORRUPTED
+									 : cause == 1 ? ERRCODE_FEATURE_NOT_SUPPORTED
+												  : ERRCODE_INTERNAL_ERROR);
+			if (cause != 2)
+				UT_ASSERT(strstr(error_message, "shared catalog alteration") != NULL);
+			UT_ASSERT_EQ(utility_xids, cause == 0 ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, cause == 0 ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, 0);
+			UT_ASSERT_EQ(utility_after_preflight, 0);
+		}
+	}
+}
+
+UT_TEST(test_drop_owned_autocommit_readonly_parallel_precede_binding)
+{
+	DropOwnedFixture fixture;
+
+	init_drop_owned_fixture(&fixture);
+	for (unsigned parallel = 0; parallel < 2; parallel++) {
+		for (unsigned i = 0; i < lengthof(fixture.statements); i++) {
+			int caught;
+
+			reset_create_preflight();
+			cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+			utility_in_transaction = drop_target_shared = false;
+			XactReadOnly = parallel == 0;
+			utility_parallel = parallel != 0;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				create_sql_entry((Node *)&fixture.statements[i]);
+			UT_ASSERT(caught);
+			UT_ASSERT_EQ(error_code, parallel ? ERRCODE_INVALID_TRANSACTION_STATE
+											  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT_EQ(utility_xids, 0);
+			UT_ASSERT_EQ(utility_prepares, 0);
+			UT_ASSERT_EQ(utility_binds, 0);
+			UT_ASSERT_EQ(utility_after_preflight, 0);
+		}
+	}
+}
+
+UT_TEST(test_drop_owned_locked_storage_precheck_keeps_original_path_without_binding)
+{
+	DropOwnedFixture fixture;
+
+	init_drop_owned_fixture(&fixture);
+	for (int tier = CLUSTER_IC_TIER_1; tier <= CLUSTER_IC_TIER_3; tier++) {
+		for (unsigned transaction = 0; transaction < 2; transaction++) {
+			if (tier == CLUSTER_IC_TIER_1 && transaction == 0)
+				continue;
+			for (unsigned mode = 0; mode < 8; mode++) {
+				for (unsigned shared = 0; shared < 2; shared++) {
+					for (unsigned i = 0; i < lengthof(fixture.statements); i++) {
+						int caught;
+						bool prechecked = (mode & 2) != 0;
+
+						reset_create_preflight();
+						cluster_shared_catalog = (mode & 1) != 0;
+						utility_storage_mode = prechecked;
+						cluster_shared_config = (mode & 4) != 0;
+						cluster_interconnect_tier = tier;
+						utility_in_transaction = transaction != 0;
+						drop_target_shared = shared != 0;
+						storage_drop_preflights = 0;
+						caught = sigsetjmp(boundary, 1);
+						if (!caught)
+							create_sql_entry((Node *)&fixture.statements[i]);
+						UT_ASSERT_EQ(caught != 0, prechecked && shared != 0);
+						if (caught)
+							UT_ASSERT_EQ(error_code, transaction ? ERRCODE_ACTIVE_SQL_TRANSACTION
+																 : ERRCODE_FEATURE_NOT_SUPPORTED);
+						UT_ASSERT_EQ(storage_drop_preflights, prechecked ? 1 : 0);
+						UT_ASSERT_EQ(utility_xids, 0);
+						UT_ASSERT_EQ(utility_prepares, 0);
+						UT_ASSERT_EQ(utility_binds, 0);
+						UT_ASSERT_EQ(utility_after_preflight, caught ? 0 : 1);
+					}
+				}
+			}
+		}
+	}
+	cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+	utility_in_transaction = drop_target_shared = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(53);
+	UT_PLAN(57);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -5290,6 +5463,10 @@ main(void)
 	UT_RUN(test_unsupported_security_labels_refuse_before_binding);
 	UT_RUN(test_alter_rewrite_candidates_keep_native_path_without_binding);
 	UT_RUN(test_unsupported_alter_table_refuses_before_binding);
+	UT_RUN(test_drop_owned_autocommit_binds_before_later_work_and_reuses_top);
+	UT_RUN(test_drop_owned_autocommit_refusal_child_and_wrong_top_precede_later_work);
+	UT_RUN(test_drop_owned_autocommit_readonly_parallel_precede_binding);
+	UT_RUN(test_drop_owned_locked_storage_precheck_keeps_original_path_without_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

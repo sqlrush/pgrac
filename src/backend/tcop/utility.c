@@ -312,7 +312,7 @@ storage_preflight:
  * triggers, catalog relations or DDL locks. Other utility callers keep their
  * existing paths. Author: SqlRush <sqlrush@gmail.com> */
 static void
-PreflightClusterSharedCatalogWrite(Node *statement)
+PreflightClusterSharedCatalogWrite(Node *statement, bool isTopLevel)
 {
 	ClusterCanonicalTxnBinding binding;
 	TransactionId current_xid;
@@ -349,7 +349,12 @@ PreflightClusterSharedCatalogWrite(Node *statement)
 			&& !IsA(statement, SecLabelStmt) && !IsA(statement, AlterTableStmt)
 			&& !IsA(statement, ImportForeignSchemaStmt)
 			&& !IsA(statement, AlterExtensionContentsStmt) && !IsA(statement, AlterExtensionStmt)
-			&& !IsA(statement, TruncateStmt)))
+			&& !IsA(statement, DropOwnedStmt) && !IsA(statement, TruncateStmt)))
+		return;
+
+	/* Other DROP OWNED scopes retain their earlier storage check. */
+	if (IsA(statement, DropOwnedStmt)
+		&& (cluster_interconnect_tier != CLUSTER_IC_TIER_1 || IsInTransactionBlock(isTopLevel)))
 		return;
 
 	if (IsA(statement, AlterTableStmt)) {
@@ -403,7 +408,7 @@ PreflightClusterSharedCatalogWrite(Node *statement)
 			 || IsA(statement, AlterOwnerStmt) || IsA(statement, AlterDatabaseStmt)
 			 || IsA(statement, AlterTableSpaceOptionsStmt) || IsA(statement, SecLabelStmt)
 			 || IsA(statement, AlterTableStmt) || IsA(statement, AlterExtensionContentsStmt)
-			 || IsA(statement, AlterExtensionStmt))
+			 || IsA(statement, AlterExtensionStmt) || IsA(statement, DropOwnedStmt))
 		action = "alteration";
 	else
 		action = "creation";
@@ -973,7 +978,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 	}
 
 #ifdef USE_PGRAC_CLUSTER
-	PreflightClusterSharedCatalogWrite(parsetree);
+	PreflightClusterSharedCatalogWrite(parsetree, isTopLevel);
 #endif
 
 	pstate = make_parsestate(NULL);
