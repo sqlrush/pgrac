@@ -657,7 +657,9 @@ cluster_relmap_retention_allocate_full_clog_xid_v2(bool isSubXact,
 	RelmapXidAllocationV2 allocation = { 0 };
 
 	if (!cluster_enabled || !cluster_shared_config || !IsNormalProcessingMode()
-		|| system_identifier == 0 || database_incarnation == 0 || origin >= CLUSTER_MAX_NODES)
+		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES
+		|| origin != cluster_node_id || system_identifier == 0 || database_incarnation == 0
+		|| system_identifier != GetSystemIdentifier())
 		ereport(ERROR,
 			(errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
 			 errmsg("refusing to assign a new transaction ID: relmap allocator context is not qualified")));

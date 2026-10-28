@@ -238,7 +238,9 @@ extern FullTransactionId cluster_relmap_retention_allocate_xid_v2(bool isSubXact
  * retention check and stores. No caller-supplied FullXid, live caller or
  * activation: complete native era/history/lifetime qualification is still the
  * original caller's duty, and neither initialization nor these routing numbers
- * provides it. The ordinary and existing raw retained entries are unchanged. */
+ * provides it. The origin and system must match this native allocator's actual
+ * node and control identity before any candidate read or extension. The
+ * ordinary and existing raw retained entries are unchanged. */
 extern FullTransactionId cluster_relmap_retention_allocate_full_clog_xid_v2(bool isSubXact,
 	uint64 system_identifier, uint64 database_incarnation, uint16 origin);
 

@@ -115,6 +115,14 @@ static bool real_stripe, stripe_lock_held, stripe_quorum;
 static LWLock *stripe_lock;
 static uint64 stripe_incarnation;
 static FullTransactionId real_reserved_candidate;
+static uint64 allocation_system_identifier = 11;
+
+static uint64
+allocation_get_system_identifier(void)
+{
+	return allocation_system_identifier;
+}
+#define GetSystemIdentifier allocation_get_system_identifier
 
 #define proc entries[0]
 #include "test_cluster_xid_full_clog.inc"
@@ -502,6 +510,7 @@ native_publication_checked(FullTransactionId issued)
 static void
 reset_allocator(void)
 {
+	allocation_system_identifier = 11;
 	real_stripe = stripe_lock_held = false;
 	real_reserved_candidate = InvalidFullTransactionId;
 	stripe_lock = NULL;

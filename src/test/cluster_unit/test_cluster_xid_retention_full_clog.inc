@@ -22,6 +22,8 @@ static void
 retention_full_fixture(uint64 candidate, unsigned origin)
 {
 	retention_fixture(candidate, origin);
+	cluster_node_id = origin;
+	UT_ASSERT_EQ(GetSystemIdentifier(), retention_sysid);
 	memset(&full_clog_fixture, 0, sizeof(full_clog_fixture));
 	full_clog_fixture.active = true;
 }
@@ -95,7 +97,7 @@ UT_TEST(retained_full_clog_gap_preserves_page_and_epoch_candidates)
 	for (unsigned variant = 0; variant < lengthof(starts); variant++) {
 		FullTransactionId next = FullTransactionIdFromU64(starts[variant]);
 
-		retention_full_fixture(starts[variant], 0);
+		retention_full_fixture(starts[variant], 4);
 		cluster_shared_catalog = cluster_xid_striping = true;
 		reservation = true;
 		limit_full = UINT64_MAX;
@@ -108,8 +110,57 @@ UT_TEST(retained_full_clog_gap_preserves_page_and_epoch_candidates)
 		UT_ASSERT_EQ(full_clog_fixture.raw_calls | full_clog_fixture.early_publication, 0);
 		UT_ASSERT_EQ(extensions, counts[variant] * 3);
 		UT_ASSERT_EQ(U64FromFullTransactionId(variables.nextXid), issued[variant] + 1);
-		UT_ASSERT_EQ(relmap_runtime_shmem->directories[0].last_issued, issued[variant]);
+		UT_ASSERT_EQ(relmap_runtime_shmem->directories[4].last_issued, issued[variant]);
 		UT_ASSERT_EQ(retention_final_observations, 1);
+	}
+	full_clog_fixture.active = false;
+}
+
+UT_TEST(retained_full_clog_rejects_another_native_origin_before_extension)
+{
+	for (unsigned origin = 0; origin < CLUSTER_MAX_NODES; origin += CLUSTER_MAX_NODES - 1)
+		for (unsigned variant = 0; variant < 3; variant++) {
+			uint64 first = (UINT64CONST(7) << 32) + 2052;
+			ClusterRelmapRetentionDirectory before;
+
+			retention_full_fixture(first, origin);
+			relmap_runtime_shmem->directories[origin].pins[0].occupied = true;
+			relmap_runtime_shmem->directories[origin].pins[0].key.top_full_xid = first - 1;
+			before = relmap_runtime_shmem->directories[origin];
+			cluster_node_id = variant == 0 ? -1 : variant == 1 ? CLUSTER_MAX_NODES
+				: (origin + 1) % CLUSTER_MAX_NODES;
+			(void)retention_full_call(false, ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE);
+			UT_ASSERT_EQ(retention_acquires | extensions | full_clog_fixture.count
+				| native_publish_count | proc.xid | visible_xids[0], 0);
+			UT_ASSERT_EQ(U64FromFullTransactionId(variables.nextXid), first);
+			UT_ASSERT_EQ(U64FromFullTransactionId(variables.clusterLastIssuedXid), 0);
+			UT_ASSERT_EQ(memcmp(&relmap_runtime_shmem->directories[origin], &before, sizeof(before)), 0);
+		}
+	full_clog_fixture.active = false;
+}
+
+UT_TEST(retained_full_clog_rejects_another_native_system_before_extension)
+{
+	for (unsigned variant = 0; variant < 3; variant++) {
+		uint64 first = (UINT64CONST(7) << 32) + 2052;
+		ClusterRelmapRetentionDirectory before;
+
+		retention_full_fixture(first, 0);
+		if (variant == 0) allocation_system_identifier = 0;
+		if (variant == 1) allocation_system_identifier++;
+		if (variant == 2) {
+			retention_sysid++;
+			relmap_runtime_shmem->directories[0].system_identifier = retention_sysid;
+		}
+		relmap_runtime_shmem->directories[0].pins[0].occupied = true;
+		relmap_runtime_shmem->directories[0].pins[0].key.top_full_xid = first - 1;
+		before = relmap_runtime_shmem->directories[0];
+		(void)retention_full_call(false, ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE);
+		UT_ASSERT_EQ(retention_acquires | extensions | full_clog_fixture.count
+			| native_publish_count | proc.xid | visible_xids[0], 0);
+		UT_ASSERT_EQ(U64FromFullTransactionId(variables.nextXid), first);
+		UT_ASSERT_EQ(U64FromFullTransactionId(variables.clusterLastIssuedXid), 0);
+		UT_ASSERT_EQ(memcmp(&relmap_runtime_shmem->directories[0], &before, sizeof(before)), 0);
 	}
 	full_clog_fixture.active = false;
 }

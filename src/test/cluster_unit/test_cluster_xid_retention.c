@@ -462,7 +462,7 @@ UT_TEST(retention_guard_valid_entry_observes_under_both_locks_and_returns_only_i
 int
 main(void)
 {
-	UT_PLAN(25);
+	UT_PLAN(27);
 	UT_RUN(native_subxid_publication_preserves_the_final_cache_slot);
 	UT_RUN(native_publication_keeps_the_full_era_across_raw_rollover);
 	UT_RUN(no_storage_or_procarray_mutation_before_reservation);
@@ -488,6 +488,8 @@ main(void)
 	UT_RUN(retained_full_clog_gap_preserves_page_and_epoch_candidates);
 	UT_RUN(retained_full_clog_refuses_before_native_extension_and_keeps_pins);
 	UT_RUN(retained_full_clog_late_refusal_and_slru_error_never_publish);
+	UT_RUN(retained_full_clog_rejects_another_native_origin_before_extension);
+	UT_RUN(retained_full_clog_rejects_another_native_system_before_extension);
 	free(relmap_runtime_shmem);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
