@@ -1454,6 +1454,72 @@ source_tick_run(const ResourceXAcquisitionRef *ref, const ClusterSemanticAdmissi
 #undef cluster_semantic_activation_enter
 #undef MyBackendType
 
+/* The native capture/abort functions above are production. Only original
+ * PCM record handoff, peer samples and semantic admission are seams here. */
+static ResourceXApplyResult capture_handoff_result, capture_domain_result;
+static unsigned capture_handoffs, capture_domain_checks;
+static bool capture_throw, capture_domain_after_prepare, capture_peer_missing;
+static ResourceXSourceDrainWork capture_work;
+static ResourceXDecodedFrame capture_block;
+static ClusterSemanticAdmissionToken capture_admission;
+static ResourceXGateSnapshot capture_gate;
+
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_acquire_s_source_capture_exact(const ResourceXSourceDrainWork *work,
+	int32 id, const ClusterPcmOwnSnapshot *prepared, const char page[BLCKSZ],
+	const ClusterPageWalBindingV1 *wal pg_attribute_unused(), uint32 requester, uint32 master)
+{
+	UT_ASSERT_EQ(transition_pin_count, 0); UT_ASSERT(!transition_content_held && !transition_mapping_held);
+	UT_ASSERT(memcmp(work, &capture_work, sizeof(*work)) == 0);
+	UT_ASSERT_EQ(id, transition_buf->buf_id); UT_ASSERT_EQ(requester, 83); UT_ASSERT_EQ(master, 61);
+	UT_ASSERT_EQ(prepared->flags, PCM_OWN_FLAG_REVOKING);
+	UT_ASSERT_EQ(memcmp(page, transition_page.data, BLCKSZ), 0);
+	capture_handoffs++;
+	if (capture_throw) pg_re_throw();
+	if (capture_handoff_result == RESOURCE_X_APPLY_APPLIED) {
+		acquire_source_prepared = *prepared;
+		memcpy(acquire_source_image.body.acquire_image.original_image.page_bytes, page, BLCKSZ);
+		acquire_source_image.body.acquire_image.original_image.source_carrier_generation = prepared->generation + 1;
+	}
+	return capture_handoff_result;
+}
+
+static ResourceXApplyResult
+capture_domain_check(void)
+{
+	UT_ASSERT_EQ(transition_pin_count, 0); UT_ASSERT(!transition_content_held && !transition_mapping_held);
+	capture_domain_checks++;
+	return capture_domain_after_prepare && capture_domain_checks == 1 ? RESOURCE_X_APPLY_APPLIED : capture_domain_result;
+}
+
+static bool
+capture_peer_sample(uint64 *capability, uint32 *connection)
+{
+	*capability = 0; *connection = 83; return !capture_peer_missing;
+}
+
+static bool
+capture_master_sample(uint32 *connection)
+{
+	*connection = 61; return true;
+}
+
+#define cluster_semantic_activation_recheck(token) ((token)->entered)
+#define gcs_block_resource_x_gate_session_recheck_result(...) capture_domain_check()
+#define gcs_block_resource_x_target_peer_result_exact(...) RESOURCE_X_APPLY_APPLIED
+#define cluster_sf_peer_capability_word_sample(node, cap, word, connection) capture_peer_sample(word, connection)
+#define gcs_block_pcm_x_resource_x_peer_ready_exact(node, connection) capture_master_sample(connection)
+#define gcs_block_resource_x_fail_closed_current() (source_finish_fuses++)
+#define GetBufferDescriptor(id) ((void)(id), transition_buf)
+#include "test_cluster_pcm_s_capture_consumer.inc"
+#undef GetBufferDescriptor
+#undef gcs_block_resource_x_fail_closed_current
+#undef gcs_block_pcm_x_resource_x_peer_ready_exact
+#undef cluster_sf_peer_capability_word_sample
+#undef gcs_block_resource_x_target_peer_result_exact
+#undef gcs_block_resource_x_gate_session_recheck_result
+#undef cluster_semantic_activation_recheck
+
 /* Entry/clock/logging dependencies for the actual ordinary pre-assert
  * consumer. Physical snapshots, candidate validation, coherent B-E-B and
  * the rejection/retry block are compiled verbatim from production. */
@@ -11405,11 +11471,133 @@ UT_TEST(test_resource_x_target_writer_context_is_post_t3_and_local_cleanup_only)
 		UT_ASSERT_NULL(strstr(source, cleanup_forbidden[i]));
 	free(source);
 }
+static void
+capture_fixture(BufferDesc *buf, ClusterPcmOwnEntry *entry)
+{
+	acquire_source_fixture(buf, entry); pg_atomic_write_u32(&entry->flags, 0);
+	capture_handoffs = capture_domain_checks = 0;
+	capture_throw = capture_domain_after_prepare = capture_peer_missing = false;
+	capture_handoff_result = capture_domain_result = RESOURCE_X_APPLY_APPLIED;
+	memset(&capture_work, 0, sizeof(capture_work)); memset(&capture_block, 0, sizeof(capture_block));
+	memset(&capture_admission, 0, sizeof(capture_admission)); memset(&capture_gate, 0, sizeof(capture_gate));
+	capture_work.request.logical_assertion.resource = buf->tag;
+	capture_work.request.logical_assertion.requester_node = 2;
+	capture_work.request.target_mode = PCM_STATE_X; capture_work.request.observed_mode = PCM_STATE_S;
+	capture_work.request.resource_formation = 17; capture_work.request.master_session_incarnation = 31;
+	capture_work.r4_record_generation = 77; capture_work.authenticated_connection_generation = 61;
+	capture_work.attempt_generation = 3; capture_work.master_node = 0;
+	capture_block.kind = RESOURCE_X_WIRE_BLOCK_TO_N; capture_block.has_acquire_decision = true;
+	capture_block.common = capture_work.request;
+	capture_admission.entered = true; capture_admission.record_generation = 77; capture_gate.formation = 17;
+	transition_s_prepare = transition_copy_active = cluster_shared_config = true;
+}
+
+static ResourceXApplyResult
+capture_consume(void)
+{
+	return gcs_block_resource_x_acquire_s_source_capture_owned(&capture_work,
+		&capture_block, &capture_admission, &capture_gate);
+}
+
+UT_TEST(test_full_a_s_forward_real_capture_hands_off_before_native_finish)
+{
+	BufferDesc buf; ClusterPcmOwnEntry entry; ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	capture_fixture(&buf, &entry);
+	UT_ASSERT_EQ(capture_consume(), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(capture_handoffs, 1); UT_ASSERT_EQ(capture_domain_checks, 2);
+	UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), PCM_OWN_FLAG_REVOKING);
+	UT_ASSERT_EQ(acquire_source_publishes, 0); UT_ASSERT_EQ(transition_pin_count, 0);
+	UT_ASSERT_EQ(acquire_source_consume(), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(acquire_source_publishes, 1); UT_ASSERT_EQ(buf.pcm_state, PCM_STATE_N);
+	UT_ASSERT_EQ(cluster_pcm_own_gen_get(0), acquire_source_prepared.generation + 1);
+	cluster_shared_config = false; ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_full_a_s_forward_real_capture_busy_has_no_native_handoff)
+{
+	for (int io = 0; io < 2; io++) {
+		BufferDesc buf; ClusterPcmOwnEntry entry; ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+		capture_fixture(&buf, &entry); if (io) pg_atomic_fetch_or_u32(&buf.state, BM_IO_IN_PROGRESS);
+		else transition_content_busy = true;
+		UT_ASSERT_EQ(capture_consume(), RESOURCE_X_APPLY_BAD_STATE); UT_ASSERT_EQ(capture_handoffs, 0);
+		UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0); UT_ASSERT_EQ(transition_pin_count, 0);
+		UT_ASSERT(!transition_content_held && !transition_mapping_held);
+		cluster_shared_config = false; ClusterPcmOwnArray = saved;
+	}
+}
+
+UT_TEST(test_full_a_s_forward_real_capture_refused_handoff_aborts_only_native)
+{
+	BufferDesc buf; ClusterPcmOwnEntry entry; ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	capture_fixture(&buf, &entry); capture_handoff_result = RESOURCE_X_APPLY_STALE;
+	UT_ASSERT_EQ(capture_consume(), RESOURCE_X_APPLY_STALE); UT_ASSERT_EQ(capture_handoffs, 1);
+	UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0); UT_ASSERT_EQ(transition_pin_count, 0);
+	UT_ASSERT_EQ(cluster_pcm_own_gen_get(0), acquire_source_prepared.generation);
+	UT_ASSERT_EQ(acquire_source_publishes, 0);
+	cluster_shared_config = false; ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_full_a_s_forward_real_capture_domain_change_aborts_before_handoff)
+{
+	BufferDesc buf; ClusterPcmOwnEntry entry; ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	capture_fixture(&buf, &entry); capture_domain_result = RESOURCE_X_APPLY_STALE; capture_domain_after_prepare = true;
+	UT_ASSERT_EQ(capture_consume(), RESOURCE_X_APPLY_STALE); UT_ASSERT_EQ(capture_handoffs, 0);
+	UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0); UT_ASSERT_EQ(transition_pin_count, 0);
+	UT_ASSERT_EQ(cluster_pcm_own_gen_get(0), acquire_source_prepared.generation);
+	cluster_shared_config = false; ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_full_a_s_forward_real_capture_error_aborts_reversible_reservation)
+{
+	BufferDesc buf; ClusterPcmOwnEntry entry; ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	volatile bool caught = false;
+	capture_fixture(&buf, &entry); capture_throw = true;
+	PG_TRY(); { (void)capture_consume(); } PG_CATCH(); { caught = true; } PG_END_TRY();
+	UT_ASSERT(caught); UT_ASSERT_EQ(capture_handoffs, 1); UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0);
+	UT_ASSERT_EQ(transition_pin_count, 0); UT_ASSERT(!transition_content_held && !transition_mapping_held);
+	UT_ASSERT_EQ(acquire_source_publishes, 0);
+	cluster_shared_config = false; ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_full_a_s_forward_real_capture_preparation_error_has_own_unwind)
+{
+	BufferDesc buf; ClusterPcmOwnEntry entry; ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	volatile bool caught = false;
+	capture_fixture(&buf, &entry); transition_wal_error = true; transition_page_wal.record_start = 0x120;
+	PG_TRY(); { (void)capture_consume(); } PG_CATCH(); { caught = true; } PG_END_TRY();
+	UT_ASSERT(caught); UT_ASSERT_EQ(capture_handoffs, 0); UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0);
+	UT_ASSERT_EQ(transition_pin_count, 0); UT_ASSERT(!transition_content_held && !transition_mapping_held);
+	cluster_shared_config = false; ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_full_a_s_forward_real_capture_missing_domain_or_peer_never_mutates)
+{
+	for (int n = 0; n < 3; n++) {
+		BufferDesc buf; ClusterPcmOwnEntry entry; ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+		capture_fixture(&buf, &entry);
+		if (n == 0) capture_domain_result = RESOURCE_X_APPLY_STALE;
+		else if (n == 1) capture_peer_missing = true;
+		else capture_admission.entered = false;
+		UT_ASSERT(capture_consume() != RESOURCE_X_APPLY_APPLIED); UT_ASSERT_EQ(capture_handoffs, 0);
+		UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0); UT_ASSERT_EQ(transition_pin_count, 0);
+		cluster_shared_config = false; ClusterPcmOwnArray = saved;
+	}
+}
+
+UT_TEST(test_full_a_s_forward_real_capture_io_error_cannot_be_busy_or_clear)
+{
+	BufferDesc buf; ClusterPcmOwnEntry entry; ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	capture_fixture(&buf, &entry); pg_atomic_fetch_or_u32(&buf.state, BM_IO_ERROR);
+	UT_ASSERT_EQ(capture_consume(), RESOURCE_X_APPLY_RECOVERY_BLOCKED); UT_ASSERT_EQ(capture_handoffs, 0);
+	UT_ASSERT((pg_atomic_read_u32(&buf.state) & BM_IO_ERROR) != 0); UT_ASSERT(source_finish_fuses > 0);
+	UT_ASSERT_EQ(transition_pin_count, 0);
+	cluster_shared_config = false; ClusterPcmOwnArray = saved;
+}
 
 int
 main(void)
 {
-	UT_PLAN(188);
+	UT_PLAN(196);
 	UT_RUN(test_native_flush_refuses_cr_before_starting_io);
 	UT_RUN(test_shared_leave_releases_dirty_and_clean_x_through_exact_owner);
 	UT_RUN(test_shared_leave_write_and_sync_error_keep_x_and_mapping);
@@ -11598,6 +11786,14 @@ main(void)
 	UT_RUN(test_full_a_s_source_io_error_is_not_a_reversible_busy);
 	UT_RUN(test_full_a_s_source_flush_error_unwinds_pin_without_aborting_source);
 	UT_RUN(test_full_a_s_source_missing_or_changed_shared_owner_never_finishes_native);
+	UT_RUN(test_full_a_s_forward_real_capture_hands_off_before_native_finish);
+	UT_RUN(test_full_a_s_forward_real_capture_busy_has_no_native_handoff);
+	UT_RUN(test_full_a_s_forward_real_capture_refused_handoff_aborts_only_native);
+	UT_RUN(test_full_a_s_forward_real_capture_domain_change_aborts_before_handoff);
+	UT_RUN(test_full_a_s_forward_real_capture_error_aborts_reversible_reservation);
+	UT_RUN(test_full_a_s_forward_real_capture_preparation_error_has_own_unwind);
+	UT_RUN(test_full_a_s_forward_real_capture_missing_domain_or_peer_never_mutates);
+	UT_RUN(test_full_a_s_forward_real_capture_io_error_cannot_be_busy_or_clear);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -72,6 +72,9 @@ static ResourceXApplyResult acquire_drain_native_result, acquire_drain_complete_
 static unsigned acquire_drain_snapshots, acquire_drain_pairs, acquire_drain_finishes;
 static int32 acquire_drain_buffer_id;
 static int acquire_drain_throw_stage;
+static bool acquire_drain_forward_phase;
+static unsigned acquire_forward_reserves, acquire_forward_captures;
+static ResourceXApplyResult acquire_forward_result;
 static ClusterWaitPcmAdmission acquire_drain_admission;
 static PGPROC recycle_proc;
 PGPROC *MyProc = &recycle_proc;
@@ -734,9 +737,43 @@ cluster_pcm_lock_resource_x_acquire_s_source_snapshot_exact(
 	if (acquire_drain_throw_stage == 2) siglongjmp(*PG_exception_stack, 1);
 	if (acquire_drain_pair_result == RESOURCE_X_APPLY_APPLIED) {
 		*buffer_id = acquire_drain_buffer_id; *prepared = acquire_drain_prepared;
-		*image = acquire_drain_image; *pair_state = RESOURCE_X_ACQUIRE_S_SOURCE_PENDING;
+		*image = acquire_drain_image; *pair_state = acquire_drain_forward_phase
+			? RESOURCE_X_ACQUIRE_S_SOURCE_FORWARD : RESOURCE_X_ACQUIRE_S_SOURCE_PENDING;
 	}
 	return acquire_drain_pair_result;
+}
+
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_source_drain_defer_exact(const ResourceXDecodedFrame *block,
+	int32 node pg_attribute_unused(), uint64 r4 pg_attribute_unused(),
+	uint32 connection pg_attribute_unused())
+{
+	UT_ASSERT(!block->has_acquire_decision); return RESOURCE_X_APPLY_APPLIED;
+}
+
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_acquire_s_source_forward_exact(const ResourceXDecodedFrame *block,
+	int32 node, uint64 r4, uint32 ingress)
+{
+	UT_ASSERT(block->has_acquire_decision); UT_ASSERT_EQ(node, 1);
+	UT_ASSERT_EQ(r4, 77); UT_ASSERT_EQ(ingress, 61);
+	acquire_forward_reserves++; return acquire_forward_result;
+}
+
+/* Capture/pin/page/abort are real in test_cluster_pcm_own; this fixture
+ * isolates actual ingress and LMS dispatch from that native provider. */
+static ResourceXApplyResult
+gcs_block_resource_x_acquire_s_source_capture_owned(const ResourceXSourceDrainWork *work,
+	const ResourceXDecodedFrame *block, const ClusterSemanticAdmissionToken *admission,
+	const ResourceXGateSnapshot *gate)
+{
+	UT_ASSERT_EQ(work->attempt_generation & 1, 1); UT_ASSERT(admission->entered);
+	UT_ASSERT_EQ(gate->formation, 17);
+	UT_ASSERT(memcmp(block, &acquire_drain_block, sizeof(*block)) == 0);
+	acquire_forward_captures++;
+	if (acquire_drain_throw_stage == 4) siglongjmp(*PG_exception_stack, 1);
+	if (acquire_forward_result == RESOURCE_X_APPLY_APPLIED) acquire_drain_forward_phase = false;
+	return acquire_forward_result;
 }
 
 static ResourceXApplyResult
@@ -1233,6 +1270,8 @@ reset_delivery_fixture(void)
 	memset(&source_admission, 0, sizeof(source_admission));
 	acquire_drain_snapshots = acquire_drain_pairs = acquire_drain_finishes = 0;
 	acquire_drain_throw_stage = 0; acquire_drain_buffer_id = 0;
+	acquire_drain_forward_phase = false; acquire_forward_reserves = acquire_forward_captures = 0;
+	acquire_forward_result = RESOURCE_X_APPLY_APPLIED;
 	acquire_drain_snapshot_result = acquire_drain_pair_result = acquire_drain_native_result
 		= RESOURCE_X_APPLY_APPLIED;
 	acquire_drain_complete_result = RESOURCE_X_APPLY_INVALID;
@@ -2802,10 +2841,64 @@ UT_TEST(test_actual_s_source_drain_checks_descriptor_bounds_before_native)
 	}
 }
 
+UT_TEST(test_actual_type17_full_s_forward_moves_to_original_owner_before_native)
+{
+	ClusterICEnvelope env = {.source_node_id = 1};
+	ResourceXSourceDrainWork work = acquire_drain_fixture();
+	acquire_drain_block.common.source_candidate = acquire_drain_block.common.retain_pi_if_dirty = 1;
+	(void)work;
+	UT_ASSERT_EQ(gcs_block_resource_x_type17_ingress(&env, &acquire_drain_block, 61), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(acquire_forward_reserves, 1); UT_ASSERT_EQ(acquire_forward_captures, 0);
+	UT_ASSERT_EQ(source_observations + acquire_drain_finishes, 0);
+	UT_ASSERT_EQ(leaves, 1);
+}
+
+UT_TEST(test_actual_type17_full_s_refusal_never_falls_back_to_legacy)
+{
+	ClusterICEnvelope env = {.source_node_id = 1};
+	ResourceXSourceDrainWork work = acquire_drain_fixture();
+	acquire_drain_block.common.source_candidate = acquire_drain_block.common.retain_pi_if_dirty = 1;
+	acquire_forward_result = RESOURCE_X_APPLY_BAD_STATE; (void)work;
+	UT_ASSERT_EQ(gcs_block_resource_x_type17_ingress(&env, &acquire_drain_block, 61), RESOURCE_X_APPLY_BAD_STATE);
+	UT_ASSERT_EQ(acquire_forward_reserves, 1); UT_ASSERT_EQ(source_observations, 0);
+}
+
+UT_TEST(test_actual_s_source_lms_captures_forward_then_reads_real_pair)
+{
+	ResourceXSourceDrainWork work = acquire_drain_fixture(); acquire_drain_forward_phase = true;
+	UT_ASSERT_EQ(cluster_gcs_block_resource_x_source_drain_tick(&work), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(acquire_forward_captures, 1); UT_ASSERT_EQ(acquire_drain_pairs, 2);
+	UT_ASSERT_EQ(acquire_drain_finishes, 1); UT_ASSERT_EQ(source_observations, 0);
+	UT_ASSERT_EQ(drain_completions, 1); UT_ASSERT_EQ(ready_tag_notifications, 1);
+}
+
+UT_TEST(test_actual_s_source_lms_capture_busy_keeps_original_work_without_finish)
+{
+	ResourceXSourceDrainWork work = acquire_drain_fixture(); acquire_drain_forward_phase = true;
+	acquire_forward_result = RESOURCE_X_APPLY_BAD_STATE;
+	UT_ASSERT_EQ(cluster_gcs_block_resource_x_source_drain_tick(&work), RESOURCE_X_APPLY_BAD_STATE);
+	UT_ASSERT_EQ(acquire_forward_captures, 1); UT_ASSERT_EQ(acquire_drain_pairs, 1);
+	UT_ASSERT_EQ(acquire_drain_finishes, 0); UT_ASSERT_EQ(ready_tag_notifications, 0);
+	UT_ASSERT_EQ(acquire_drain_complete_result, RESOURCE_X_APPLY_BAD_STATE);
+	UT_ASSERT(memcmp(&acquire_drain_completed, &work, sizeof(work)) == 0);
+}
+
+UT_TEST(test_actual_s_source_lms_capture_error_returns_exact_claim_once)
+{
+	volatile bool caught = false; ResourceXSourceDrainWork work = acquire_drain_fixture();
+	acquire_drain_forward_phase = true; acquire_drain_throw_stage = 4;
+	PG_TRY(); { (void)cluster_gcs_block_resource_x_source_drain_tick(&work); }
+	PG_CATCH(); { caught = true; } PG_END_TRY();
+	UT_ASSERT(caught); UT_ASSERT_EQ(acquire_forward_captures, 1);
+	UT_ASSERT_EQ(acquire_drain_finishes, 0); UT_ASSERT_EQ(drain_completions, 1);
+	UT_ASSERT_EQ(acquire_drain_complete_result, RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+	UT_ASSERT(memcmp(&acquire_drain_completed, &work, sizeof(work)) == 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(36);
+	UT_PLAN(41);
 	UT_RUN(test_actual_terminal_ingress_keeps_master_and_physical_source_distinct);
 	UT_RUN(test_actual_kind9_ingress_does_not_send_ack_for_fused_admission);
 	UT_RUN(test_actual_fused_admission_notifies_ready_resource_without_registry_tick);
@@ -2842,6 +2935,11 @@ main(void)
 	UT_RUN(test_actual_s_source_drain_busy_returns_same_work_without_ingress_or_send);
 	UT_RUN(test_actual_s_source_drain_error_releases_admission_and_exact_attempt);
 	UT_RUN(test_actual_s_source_drain_checks_descriptor_bounds_before_native);
+	UT_RUN(test_actual_type17_full_s_forward_moves_to_original_owner_before_native);
+	UT_RUN(test_actual_type17_full_s_refusal_never_falls_back_to_legacy);
+	UT_RUN(test_actual_s_source_lms_captures_forward_then_reads_real_pair);
+	UT_RUN(test_actual_s_source_lms_capture_busy_keeps_original_work_without_finish);
+	UT_RUN(test_actual_s_source_lms_capture_error_returns_exact_claim_once);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

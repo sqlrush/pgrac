@@ -2028,6 +2028,18 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_s_source_service
 	const ClusterPageWalBindingV1 *page_wal, uint32 requester_connection_generation,
 	uint32 master_connection_generation, uint64 r4_record_generation,
 	uint32 authenticated_connection_generation);
+/* Before native capture, retain the full authenticated FORWARD in the
+ * original holder capacity. BUSY returns to its same background claim. */
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_s_source_forward_exact(
+	const ResourceXDecodedFrame *block, int32 authenticated_master_node,
+	uint64 r4_record_generation, uint32 authenticated_connection_generation);
+/* A claimed original FORWARD is atomically replaced by its real native
+ * pair. APPLIED/DUPLICATE transfers native completion: never abort after it. */
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_s_source_capture_exact(
+	const ResourceXSourceDrainWork *work, int32 buffer_id,
+	const struct ClusterPcmOwnSnapshot *prepared, const char page_bytes[BLCKSZ],
+	const ClusterPageWalBindingV1 *page_wal, uint32 requester_connection_generation,
+	uint32 master_connection_generation);
 /* Only a claimed original source-drain attempt may recover its complete
  * forward from the original immutable pair. All outputs survive refusal. */
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_s_source_drain_snapshot_exact(
@@ -2040,7 +2052,9 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_s_source_publish
  * descriptor before finish, then publish the same retained reservation. */
 typedef enum ResourceXAcquireSSourceState {
 	RESOURCE_X_ACQUIRE_S_SOURCE_PENDING = 1,
-	RESOURCE_X_ACQUIRE_S_SOURCE_PUBLISHED = 2
+	RESOURCE_X_ACQUIRE_S_SOURCE_PUBLISHED = 2,
+	/* No native/image yet: snapshot returns buffer_id=-1 and zero tuples. */
+	RESOURCE_X_ACQUIRE_S_SOURCE_FORWARD = 3
 } ResourceXAcquireSSourceState;
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_s_source_snapshot_exact(
 	const ResourceXDecodedFrame *block, int32 authenticated_master_node, int32 *buffer_id,

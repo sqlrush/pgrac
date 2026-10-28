@@ -14433,6 +14433,108 @@ cluster_gcs_block_resource_x_source_finish_tick(const ResourceXAcquisitionRef *r
  * current admission, master/session and authenticated peer checks as ingress
  * before re-entering the ordinary source path, which claims a fresh exact
  * BufferDesc/terminal owner. No service pin survives a pre-image BUSY. */
+/* The original LMS claim owns this complete FORWARD before capture. Native
+ * prepare remains reversible until the exact PCM transaction takes the pair.
+ * No retry request, duplicate capture queue, or pin crosses that handoff. */
+static ResourceXApplyResult
+gcs_block_resource_x_acquire_s_source_capture_owned(const ResourceXSourceDrainWork *work,
+	const ResourceXDecodedFrame *block, const ClusterSemanticAdmissionToken *admission,
+	const ResourceXGateSnapshot *gate)
+{
+	ClusterPcmOwnSnapshot current, prepared;
+	volatile ClusterPcmOwnSnapshot owned_prepared;
+	ClusterPcmOwnSourcePrepareRefusal refusal;
+	ClusterPcmOwnResult own;
+	volatile ResourceXApplyResult result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	volatile bool native_prepared = false, handed_off = false;
+	PGIOAlignedBlock page;
+	ClusterPageWalBindingV1 wal = {0};
+	XLogRecPtr lsn = InvalidXLogRecPtr;
+	uint64 scn = 0, capabilities = 0;
+	uint32 requester_connection = 0, master_connection = 0;
+	int buffer_id = -1;
+	BufferDesc *buf;
+
+	if (work == NULL || block == NULL || admission == NULL || gate == NULL
+		|| !block->has_acquire_decision || block->common.target_mode != PCM_STATE_X
+		|| block->common.observed_mode != PCM_STATE_S || (work->attempt_generation & 1) == 0
+		|| work->master_node != block->body.acquire_decision.master_node
+		|| block->body.acquire_decision.source_node != cluster_node_id
+		|| work->r4_record_generation == 0 || work->r4_record_generation == UINT64_MAX
+		|| work->r4_record_generation != admission->record_generation
+		|| gate->formation != work->request.resource_formation
+		|| !cluster_semantic_activation_recheck(admission))
+		return RESOURCE_X_APPLY_STALE;
+	result = gcs_block_resource_x_gate_session_recheck_result(
+		&work->request.logical_assertion.resource, gate, work->master_node,
+		work->request.master_session_incarnation);
+	if (result != RESOURCE_X_APPLY_APPLIED) return result;
+	if (!gcs_block_pcm_x_resource_x_peer_ready_exact(work->master_node, &master_connection))
+		return RESOURCE_X_APPLY_BAD_STATE;
+	if (master_connection != work->authenticated_connection_generation)
+		return RESOURCE_X_APPLY_STALE;
+	if (!cluster_sf_peer_capability_word_sample(block->common.logical_assertion.requester_node,
+		PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1, &capabilities, &requester_connection))
+		return RESOURCE_X_APPLY_BAD_STATE;
+	result = gcs_block_resource_x_target_peer_result_exact(admission,
+		block->common.logical_assertion.requester_node, requester_connection);
+	if (result != RESOURCE_X_APPLY_APPLIED) return result;
+	own = cluster_bufmgr_pcm_own_snapshot_by_tag(&work->request.logical_assertion.resource, &buffer_id, &current);
+	if (own == CLUSTER_PCM_OWN_BUSY) return RESOURCE_X_APPLY_BAD_STATE;
+	if (own != CLUSTER_PCM_OWN_OK || buffer_id < 0 || buffer_id >= NBuffers)
+		goto fail_closed;
+	if (current.pcm_state != PCM_STATE_S || current.flags != 0)
+		return RESOURCE_X_APPLY_BAD_STATE;
+	buf = GetBufferDescriptor(buffer_id);
+	PG_TRY();
+	{
+		own = cluster_bufmgr_pcm_own_prepare_s_source_image(buf, &current, (SCN)0,
+			&prepared, page.data, &lsn, &scn, &refusal, &wal);
+		if (own == CLUSTER_PCM_OWN_OK) {
+			owned_prepared = prepared;
+			native_prepared = true;
+			result = gcs_block_resource_x_gate_session_recheck_result(
+				&work->request.logical_assertion.resource, gate, work->master_node,
+				work->request.master_session_incarnation);
+			if (!cluster_semantic_activation_recheck(admission))
+				result = RESOURCE_X_APPLY_STALE;
+			if (result == RESOURCE_X_APPLY_APPLIED)
+				result = gcs_block_resource_x_target_peer_result_exact(admission,
+					work->master_node, master_connection);
+			if (result == RESOURCE_X_APPLY_APPLIED)
+				result = gcs_block_resource_x_target_peer_result_exact(admission,
+					block->common.logical_assertion.requester_node, requester_connection);
+			if (result == RESOURCE_X_APPLY_APPLIED) {
+				result = cluster_pcm_lock_resource_x_acquire_s_source_capture_exact(work,
+					buffer_id, &prepared, page.data, &wal, requester_connection, master_connection);
+				/* This nonthrowing assignment must precede any notification or
+				 * further observation after shared ownership was transferred. */
+				if (result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE)
+					handed_off = true;
+			}
+		} else
+			result = own == CLUSTER_PCM_OWN_BUSY || own == CLUSTER_PCM_OWN_STALE
+				? RESOURCE_X_APPLY_BAD_STATE : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	}
+	PG_FINALLY();
+	{
+		if (native_prepared && !handed_off) {
+			ClusterPcmOwnSnapshot exact = owned_prepared;
+
+			if (cluster_bufmgr_pcm_own_abort_s_revoke(buf, &exact) != CLUSTER_PCM_OWN_OK) {
+				gcs_block_resource_x_fail_closed_current();
+				result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+			}
+		}
+	}
+	PG_END_TRY();
+	if (result != RESOURCE_X_APPLY_RECOVERY_BLOCKED) return result;
+fail_closed:
+	gcs_block_resource_x_fail_closed_current();
+	return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+}
+
+
 ResourceXApplyResult
 cluster_gcs_block_resource_x_source_drain_tick(const ResourceXSourceDrainWork *work)
 {
@@ -14493,8 +14595,18 @@ cluster_gcs_block_resource_x_source_drain_tick(const ResourceXSourceDrainWork *w
 					if (result == RESOURCE_X_APPLY_APPLIED)
 						result = cluster_pcm_lock_resource_x_acquire_s_source_snapshot_exact(
 							&block, master, &buffer_id, &prepared, &image, &pair_state);
+					if (result == RESOURCE_X_APPLY_APPLIED
+						&& pair_state == RESOURCE_X_ACQUIRE_S_SOURCE_FORWARD) {
+						result = gcs_block_resource_x_acquire_s_source_capture_owned(
+							work, &block, &admission, &gate);
+						if (result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE)
+							result = cluster_pcm_lock_resource_x_acquire_s_source_snapshot_exact(
+								&block, master, &buffer_id, &prepared, &image, &pair_state);
+					}
 					if (result == RESOURCE_X_APPLY_APPLIED) {
-						if (buffer_id < 0 || buffer_id >= NBuffers)
+						if ((pair_state != RESOURCE_X_ACQUIRE_S_SOURCE_PENDING
+							 && pair_state != RESOURCE_X_ACQUIRE_S_SOURCE_PUBLISHED)
+							|| buffer_id < 0 || buffer_id >= NBuffers)
 							result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 						else {
 							result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
@@ -14838,7 +14950,12 @@ gcs_block_resource_x_type17_ingress(const ClusterICEnvelope *env,
 				gcs_block_pcm_service_admission(&observation, &admission, &gate,
 					CLWAIT_PCM_SERVICE_INGRESS, master_node, master_session,
 					authenticated_connection_generation);
-				result = gcs_block_pcm_x_resource_x_source_block_to_n_observed(frame, master_node,
+				if (frame->has_acquire_decision && frame->common.observed_mode == PCM_STATE_S
+					&& frame->common.target_mode == PCM_STATE_X)
+					result = cluster_pcm_lock_resource_x_acquire_s_source_forward_exact(frame,
+						master_node, admission.record_generation, authenticated_connection_generation);
+				else
+					result = gcs_block_pcm_x_resource_x_source_block_to_n_observed(frame, master_node,
 																	  admission.record_generation, &observation);
 				if (result == RESOURCE_X_APPLY_BAD_STATE && frame->common.observed_mode == PCM_STATE_X)
 					(void)cluster_pcm_lock_resource_x_source_drain_defer_exact(

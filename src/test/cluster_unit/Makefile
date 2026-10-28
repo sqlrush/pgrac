@@ -4894,6 +4894,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_abort_writer_flush.inc
 	rm -f test_cluster_page_identity_equal.c test_cluster_page_identity_equal.o
 	rm -f test_cluster_pcm_s_prepare.inc
+	rm -f test_cluster_pcm_s_capture_consumer.inc
 	rm -f test_cluster_ko_source_io.inc
 	rm -f test_cluster_pcm_page_identity.inc test_cluster_pcm_page_identity.inc.tmp
 	rm -f test_cluster_space_commit.inc test_cluster_space_commit_redo.inc test_cluster_space_commit_emit.inc
@@ -5747,6 +5748,12 @@ test_cluster_pcm_source_finish_consumer.inc: $(top_srcdir)/src/backend/cluster/c
 
 # PGRAC: real bounded discard/PI owners, not copies of their decisions.
 # Author: SqlRush <sqlrush@gmail.com>
+test_cluster_pcm_s_capture_consumer.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^gcs_block_resource_x_acquire_s_source_capture_owned\(/ { print "static ResourceXApplyResult"; emit=1; capture++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (capture != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_pcm_s_prepare.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
 	awk '/^typedef enum ClusterPcmOwnSSourceHardFailureReason/ { emit=1; types++ } \
 	     /^cluster_bufmgr_pcm_own_prepare_s_source_image_internal\(/ { print "static ClusterPcmOwnResult"; emit=1 } \
@@ -5918,7 +5925,7 @@ test_cluster_pcm_own: test_cluster_pcm_own.c unit_test.h \
 		test_cluster_pcm_barrier_proof.inc \
 		test_cluster_pcm_eviction_owner.inc test_cluster_pcm_clock_sweep.inc \
 		test_cluster_pcm_leave_owner.inc \
-		test_cluster_pcm_source_finish_consumer.inc \
+		test_cluster_pcm_source_finish_consumer.inc test_cluster_pcm_s_capture_consumer.inc \
 		test_cluster_pcm_retained_drain_consumer.inc test_cluster_pcm_pre_retained_cleanup.inc \
 		test_cluster_pcm_target_prepare.inc \
 		test_cluster_pcm_s_prepare.inc \
