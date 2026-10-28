@@ -1505,11 +1505,29 @@ static ClusterCtrcLocalReleaseAckV1 *
 original_certificate_participant_ack_entries(void);
 static uint64 *
 original_participant_participant_receipt_heads(void);
+static bool
+original_participant_participant_identity_valid(const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcParticipantIdentity *identity);
+static bool
+original_participant_origin_fullxid_match_v2(const uint8 *bytes, Size length,
+	const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcParticipantIdentity *identity,
+	uint32 grant, FullTransactionId *original);
+static bool
+original_certificate_delegation_path_valid(const ClusterCtrcDelegationPathV2 *path,
+	const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcParticipantIdentity *receiver,
+	const ClusterCtrcDelegationCustodyV1 *parent, const uint8 *origin_v2,
+	uint32 grant, FullTransactionId full);
+#define ctrc_participant_identity_valid original_participant_participant_identity_valid
+#define cluster_ctrc_origin_fullxid_match_v2 original_participant_origin_fullxid_match_v2
+#define ctrc_delegation_path_valid original_certificate_delegation_path_valid
 #define ctrc_participant_index original_participant_participant_index
 #define ctrc_delegated_local_ack_summary_exact original_ack_delegated_local_ack_summary_exact
 #define ctrc_participant_ack_entries original_certificate_participant_ack_entries
 #define ctrc_participant_receipt_heads original_participant_participant_receipt_heads
 #include "test_cluster_heap_ctrc_step.inc"
+#undef ctrc_delegation_path_valid
+#undef cluster_ctrc_origin_fullxid_match_v2
+#undef ctrc_participant_identity_valid
 #undef ctrc_participant_index
 #undef ctrc_delegated_local_ack_summary_exact
 #undef ctrc_participant_ack_entries
@@ -1627,7 +1645,7 @@ static bool
 cohort_peer_generation_current(int32 peer, uint32 capability, uint32 generation)
 {
 	UT_ASSERT(peer >= 0 && peer < CLUSTER_MAX_NODES);
-	UT_ASSERT_EQ(capability, PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2);
+	UT_ASSERT_EQ(capability, PGRAC_IC_HELLO_HEAP_FREEZE_SOURCE_MASK);
 	UT_ASSERT(!local_x && !local_share && backend_pin_count == fixture_expected_backend_pins());
 	cohort_peer_current_checks++;
 	if (cohort_peer_revoke_worker) cohort_worker_live = false;
@@ -10178,7 +10196,11 @@ static SCN bounds_original_retention_horizon(void);
 #define cluster_undo_retention_sample_min bounds_original_retention_min
 #define cluster_undo_retention_horizon_sample bounds_original_retention_sample
 #define cluster_undo_retention_horizon bounds_original_retention_horizon
+#define cluster_mrp_should_start bounds_original_mrp_should_start
+#define cluster_mrp_standby_consistent_scn bounds_original_mrp_consistent_scn
 #include "test_cluster_retention_sample.inc"
+#undef cluster_mrp_standby_consistent_scn
+#undef cluster_mrp_should_start
 #undef cluster_undo_retention_horizon
 #undef cluster_undo_retention_horizon_sample
 #undef cluster_undo_retention_sample_min
@@ -10920,6 +10942,9 @@ UT_TEST(test_collector_original_history_same_cut_clock_and_compact_snapshot)
 	UT_ASSERT_EQ(history.contributor_kind, CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK);
 	UT_ASSERT_EQ(history.contributor_token, 0);
 	UT_ASSERT_EQ(bounds_original_retention_horizon(), 10);
+	/* Independent typed-source cut: establish the older original protection
+	 * in a fresh boot before sampling. Never lower an already exported H. */
+	sampler_proc_array->cluster_read_scn_floor = InvalidScn;
 	/* Visit an unknown entry first, then the equal-time known compact member.
 	 * The diagnostic token is its physical slot, not the compact ordinal. */
 	sampler_proc_array->numProcs = 2;

@@ -118,6 +118,11 @@ typedef struct ProcArrayStruct
 	/* oldest catalog xmin of any replication slot */
 	TransactionId replication_slot_catalog_xmin;
 
+#ifdef USE_PGRAC_CLUSTER
+	/* Successful local H cuts and later reader publications share this lock. */
+	SCN			cluster_read_scn_floor;
+#endif
+
 	/* indexes into allProcs[], has PROCARRAY_MAXPROCS entries */
 	int			pgprocnos[FLEXIBLE_ARRAY_MEMBER];
 } ProcArrayStruct;
@@ -465,6 +470,9 @@ CreateSharedProcArray(void)
 		procArray->lastOverflowedXid = InvalidTransactionId;
 		procArray->replication_slot_xmin = InvalidTransactionId;
 		procArray->replication_slot_catalog_xmin = InvalidTransactionId;
+#ifdef USE_PGRAC_CLUSTER
+		procArray->cluster_read_scn_floor = InvalidScn;
+#endif
 		ShmemVariableCache->xactCompletionCount = 1;
 	}
 
@@ -2230,6 +2238,32 @@ ClusterSnapshotRefreshFields(Snapshot snapshot)
 	memset(snapshot->_pad, 0, sizeof(snapshot->_pad));
 }
 
+/* Publish only from the original snapmgr fold, outside page/lifecycle locks. */
+bool
+ProcArrayPublishReadScn(SCN read_scn, SCN added_read_scn)
+{
+	ProcArrayStruct *arrayP = procArray;
+	bool		accepted = true;
+	const SCN	checked[] = {read_scn, added_read_scn};
+
+	if (cluster_node_id < 0 || arrayP == NULL || MyProc == NULL)
+		return false;
+
+	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
+	/* Unknown publications retain their original refusal semantics. A finite
+	 * new reader cannot invalidate an H cut already exported by this boot. */
+	for (unsigned i = 0; i < lengthof(checked); i++)
+		if (SCN_VALID(checked[i]) && checked[i] != (SCN) UINT64_MAX &&
+			(arrayP->cluster_read_scn_floor == (SCN) UINT64_MAX ||
+			 (SCN_VALID(arrayP->cluster_read_scn_floor) &&
+			  scn_time_cmp(checked[i], arrayP->cluster_read_scn_floor) < 0)))
+			accepted = false;
+	if (accepted)
+		pg_atomic_write_u64(&MyProc->cluster_read_scn_atomic, (uint64) read_scn);
+	LWLockRelease(ProcArrayLock);
+	return accepted;
+}
+
 /*
  * cluster_undo_retention_horizon_sample -- spec-3.12 D1, typed H observation.
  *
@@ -2326,6 +2360,39 @@ cluster_undo_retention_horizon_sample(ClusterUndoRetentionSample *out)
 					? (uint64) pgprocno + 1 : 0;
 			}
 		}
+	}
+	/* Include the actual origin of future ADG reads before retaining the
+	 * promise. These are configuration/atomic reads, with no lock or I/O. */
+	if (SCN_VALID(sample.horizon_scn) && cluster_mrp_should_start())
+	{
+		SCN			bound = cluster_mrp_standby_consistent_scn();
+
+		if (!SCN_VALID(bound) || bound == (SCN) UINT64_MAX)
+			sample.horizon_scn = InvalidScn;
+		else
+		{
+			int			cmp = scn_time_cmp(bound, sample.horizon_scn);
+
+			if (cmp < 0)
+				sample.horizon_scn = bound;
+			if (cmp < 0 ||
+				(cmp == 0 &&
+				 (sample.contributor_kind == CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK ||
+				  sample.contributor_kind == CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_UNKNOWN)))
+			{
+				sample.contributor_kind = CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_REPLICATION;
+				sample.contributor_token = 0;
+			}
+		}
+	}
+	if (SCN_VALID(sample.horizon_scn))
+	{
+		if (arrayP->cluster_read_scn_floor == (SCN) UINT64_MAX ||
+			(SCN_VALID(arrayP->cluster_read_scn_floor) &&
+			 scn_time_cmp(sample.horizon_scn, arrayP->cluster_read_scn_floor) < 0))
+			sample.horizon_scn = InvalidScn;
+		else
+			arrayP->cluster_read_scn_floor = sample.horizon_scn;
 	}
 	LWLockRelease(ProcArrayLock);
 

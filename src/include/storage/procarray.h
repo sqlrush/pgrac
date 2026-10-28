@@ -50,6 +50,11 @@ extern bool ProcArrayInstallImportedXmin(TransactionId xmin,
 										 VirtualTransactionId *sourcevxid);
 extern bool ProcArrayInstallRestoredXmin(TransactionId xmin, PGPROC *proc);
 #ifdef USE_PGRAC_CLUSTER
+/* Serialize the original reader publication with local H promises.
+ * Guard the added snapshot separately, even when the fold is unknown; use
+ * InvalidScn when only retiring a reader. Refusal preserves the previous
+ * marker and releases ProcArrayLock. */
+extern bool ProcArrayPublishReadScn(SCN read_scn, SCN added_read_scn);
 /* Finite history handoff: source xmin AND its published read-SCN protection
  * must cover the requested point under the original install lock. Refusal
  * preserves receiver xmin/status/SCN; success clears its old SCN until original

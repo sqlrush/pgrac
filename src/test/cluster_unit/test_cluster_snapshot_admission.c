@@ -775,6 +775,7 @@ UT_TEST(cr_identity_restore_and_snapshot_refresh_start_new_lifetimes)
 #include "test_cluster_snapshot_vacuum_fixture.inc"
 #undef proc
 #include "test_cluster_retention_sample.inc"
+#include "test_cluster_retention_publish.inc"
 #include "test_cluster_snapshot_import_xmin.inc"
 #define proc snapshot_procs[0]
 
@@ -987,6 +988,8 @@ UT_TEST(mixed_registered_sources_cannot_hide_unqualified_h)
 			SCN published;
 			bool refused;
 
+			/* Independent permutation, before any source is registered. */
+			procArray->cluster_read_scn_floor = InvalidScn;
 			/* The original native xmin remains installed throughout this cut. */
 			proc.xmin = 10;
 			finite = reverse ? NULL : registered(40);
@@ -1023,6 +1026,8 @@ UT_TEST(mixed_active_sources_cannot_hide_unqualified_h)
 			SCN published;
 			bool refused, remaining_known;
 
+			/* Independent permutation, before any source is pushed. */
+			procArray->cluster_read_scn_floor = InvalidScn;
 			finite.snapshot_type = SNAPSHOT_MVCC;
 			finite.xmin = 10;
 			finite.xmax = 20;
@@ -1067,9 +1072,225 @@ UT_TEST(original_registered_nonfinite_reader_keeps_h_unqualified_until_retiremen
 	UT_ASSERT_EQ(sample.contributor_kind, CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK);
 }
 
+/* H must remain a lower bound after the lock used for its cut is released.
+ * Run the original registration/publication and original abort cleanup. */
+UT_TEST(sampled_h_refuses_a_later_unprotected_older_registration)
+{
+	ClusterUndoRetentionSample sample;
+	Snapshot rejected = NULL;
+	bool caught = false;
+
+	UT_ASSERT(pairingheap_is_empty(&RegisteredSnapshots));
+	UT_ASSERT(!ActiveSnapshotSet());
+	UT_ASSERT(catalog_history_sample(&sample));
+	UT_ASSERT_EQ(sample.horizon_scn, 100);
+	PG_TRY();
+	{
+		rejected = registered(40);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	if (caught)
+		UT_ASSERT_EQ(error_code, ERRCODE_CLUSTER_SNAPSHOT_TOO_OLD);
+	UT_ASSERT(!retention_lock);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_read_scn_atomic), InvalidScn);
+	/* RED cleanup handles an old implementation that registered before
+	 * refusing; the production guard now precedes private ownership. */
+	if (rejected == NULL && !pairingheap_is_empty(&RegisteredSnapshots))
+		rejected = pairingheap_container(SnapshotData, ph_node,
+									pairingheap_first(&RegisteredSnapshots));
+	UnregisterSnapshot(rejected);
+	UT_ASSERT(pairingheap_is_empty(&RegisteredSnapshots));
+	UT_ASSERT(!retention_lock);
+}
+
+UT_TEST(older_registration_error_preserves_original_published_snapshot)
+{
+	ClusterUndoRetentionSample sample;
+	Snapshot original = registered(120);
+	bool caught = false, cleanup_error = false;
+	unsigned original_remembered = remembered;
+
+	UT_ASSERT(catalog_history_sample(&sample));
+	UT_ASSERT_EQ(sample.horizon_scn, 100);
+	PG_TRY();
+	{
+		(void) registered(40);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(error_code, ERRCODE_CLUSTER_SNAPSHOT_TOO_OLD);
+	UT_ASSERT(!retention_lock);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_read_scn_atomic), 120);
+	UT_ASSERT(pairingheap_is_singular(&RegisteredSnapshots));
+	UT_ASSERT_EQ(remembered, original_remembered);
+	UT_ASSERT_EQ(original->regd_count, 1);
+	/* ResourceOwner may release the older registration first on abort. */
+	PG_TRY();
+	{
+		UnregisterSnapshot(original);
+	}
+	PG_CATCH();
+	{
+		cleanup_error = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(!cleanup_error);
+	/* RED cleanup only: do not hide the original-first release above. */
+	if (!pairingheap_is_empty(&RegisteredSnapshots))
+		UnregisterSnapshot(pairingheap_container(SnapshotData, ph_node,
+										pairingheap_first(&RegisteredSnapshots)));
+	UT_ASSERT(pairingheap_is_empty(&RegisteredSnapshots));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_read_scn_atomic), InvalidScn);
+	UT_ASSERT(!retention_lock);
+}
+
+UT_TEST(unknown_live_marker_cannot_hide_a_rejected_new_finite_reader)
+{
+	ClusterUndoRetentionSample sample;
+	Snapshot unknown, added = NULL;
+	bool caught = false;
+	unsigned original_remembered;
+
+	UT_ASSERT(catalog_history_sample(&sample));
+	UT_ASSERT_EQ(sample.horizon_scn, 100);
+	unknown = registered(InvalidScn);
+	original_remembered = remembered;
+	PG_TRY();
+	{
+		added = registered(40);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(error_code, ERRCODE_CLUSTER_SNAPSHOT_TOO_OLD);
+	UT_ASSERT_EQ(remembered, original_remembered);
+	UT_ASSERT(pairingheap_is_singular(&RegisteredSnapshots));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_read_scn_atomic), InvalidScn);
+	UnregisterSnapshot(added);
+	UnregisterSnapshot(unknown);
+	UT_ASSERT(pairingheap_is_empty(&RegisteredSnapshots));
+	UT_ASSERT(!retention_lock);
+}
+
+UT_TEST(older_active_snapshot_refusal_keeps_original_stack_ownership)
+{
+	ClusterUndoRetentionSample sample;
+	Snapshot original = registered(120);
+	SnapshotData added = *original;
+	bool caught = false;
+
+	added.copied = false;
+	added.active_count = added.regd_count = 0;
+	added.read_scn = 40;
+	PushActiveSnapshot(original);
+	UT_ASSERT(catalog_history_sample(&sample));
+	UT_ASSERT_EQ(sample.horizon_scn, 100);
+	PG_TRY();
+	{
+		PushActiveSnapshot(&added);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(error_code, ERRCODE_CLUSTER_SNAPSHOT_TOO_OLD);
+	UT_ASSERT(GetActiveSnapshot() == original);
+	UT_ASSERT_EQ(original->active_count, 1);
+	UT_ASSERT_EQ(original->regd_count, 1);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_read_scn_atomic), 120);
+	PopActiveSnapshot();
+	UnregisterSnapshot(original);
+	UT_ASSERT(!ActiveSnapshotSet());
+	UT_ASSERT(pairingheap_is_empty(&RegisteredSnapshots));
+	UT_ASSERT(!retention_lock);
+}
+
+UT_TEST(older_catalog_snapshot_refusal_leaves_no_cached_or_heap_reference)
+{
+	ClusterUndoRetentionSample sample;
+	Snapshot original = registered(120);
+	bool caught = false;
+
+	UT_ASSERT(CatalogSnapshot == NULL);
+	UT_ASSERT(catalog_history_sample(&sample));
+	UT_ASSERT_EQ(sample.horizon_scn, 100);
+	snapshot_clock = 40;
+	PG_TRY();
+	{
+		(void) GetNonHistoricCatalogSnapshot(RelationRelationId);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	snapshot_clock = 100;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(error_code, ERRCODE_CLUSTER_SNAPSHOT_TOO_OLD);
+	UT_ASSERT(CatalogSnapshot == NULL);
+	UT_ASSERT(pairingheap_is_singular(&RegisteredSnapshots));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_read_scn_atomic), 120);
+	InvalidateCatalogSnapshot();
+	UnregisterSnapshot(original);
+	UT_ASSERT(pairingheap_is_empty(&RegisteredSnapshots));
+	UT_ASSERT(!retention_lock);
+}
+
+UT_TEST(older_export_refusal_precedes_list_heap_and_file_ownership)
+{
+	Snapshot original = registered(120);
+	SnapshotData source = snapshot_export_source();
+	ClusterUndoRetentionSample sample;
+	bool caught = false;
+
+	UT_ASSERT(catalog_history_sample(&sample));
+	UT_ASSERT_EQ(sample.horizon_scn, 100);
+	PG_TRY();
+	{
+		(void) ExportSnapshot(&source);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(error_code, ERRCODE_CLUSTER_SNAPSHOT_TOO_OLD);
+	UT_ASSERT(exportedSnapshots == NIL);
+	UT_ASSERT(pairingheap_is_singular(&RegisteredSnapshots));
+	UT_ASSERT_EQ(export_file_opens, 0);
+	UT_ASSERT_EQ(export_renames, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_read_scn_atomic), 120);
+	UnregisterSnapshot(original);
+	UT_ASSERT(pairingheap_is_empty(&RegisteredSnapshots));
+	UT_ASSERT(!retention_lock);
+}
+
+/* Each standalone case starts a distinct shared ProcArray boot. Within a
+ * case the actual product promise persists across all cuts and publications. */
+#define SNAPSHOT_RUN(name) do { \
+	procArray->cluster_read_scn_floor = InvalidScn; \
+	UT_RUN(name); \
+} while (0)
+
 int
 main(void)
 {
+	setvbuf(stdout, NULL, _IONBF, 0);
 	MyProc = &proc;
 	proc.pid = 1234;
 	procArray = calloc(1, sizeof(ProcArrayStruct) + 2 * sizeof(int));
@@ -1087,96 +1308,102 @@ main(void)
 	pg_atomic_init_u64(&horizon.admission_refuse_count, 0);
 	oldSnapshotControl = &snapshot_control;
 	pg_atomic_init_u64(&snapshot_control.cr_identity_generation, 0);
-	UT_PLAN(88);
-	UT_RUN(export_original_registration_publishes_h_before_file_visibility);
-	UT_RUN(export_original_registration_preserves_other_older_snapshot);
-	UT_RUN(export_errors_retain_original_h_until_transaction_cleanup);
-	UT_RUN(imported_snapshot_original_xmin_handoff_survives_source_exit);
-	UT_RUN(imported_xmin_does_not_borrow_the_receivers_previous_scn);
-	UT_RUN(restored_xmin_does_not_borrow_the_receivers_previous_scn);
-	UT_RUN(refused_xmin_install_preserves_the_receivers_original_scn);
-	UT_RUN(restored_snapshot_original_xmin_handoff_survives_source_exit);
-	UT_RUN(imported_finite_history_requires_original_source_scn_coverage);
-	UT_RUN(restored_finite_history_requires_original_source_scn_coverage);
-	UT_RUN(original_native_xmin_contract_and_older_source_protection_remain);
-	UT_RUN(parallel_serialized_snapshot_retains_original_handoff);
-	UT_RUN(parallel_serialized_unknown_history_cannot_borrow_clock);
-	UT_RUN(parallel_serialized_copy_cannot_replace_original_source_admission);
-	UT_RUN(imported_snapshot_rejects_missing_or_unprotected_original_source);
-	UT_RUN(restored_snapshot_rejects_unprotected_original_source);
-	UT_RUN(original_catalog_pin_cannot_supply_a_missing_finite_clock);
-	UT_RUN(original_registered_nonfinite_reader_keeps_h_unqualified_until_retirement);
-	UT_RUN(mixed_registered_sources_cannot_hide_unqualified_h);
-	UT_RUN(mixed_active_sources_cannot_hide_unqualified_h);
-	UT_RUN(catalog_original_publication_completes_the_real_h_sample);
-	UT_RUN(catalog_h_sample_preserves_other_original_snapshot_protection);
-	UT_RUN(catalog_actual_retirement_releases_only_its_original_h_pin);
-	UT_RUN(catalog_local_source_cannot_borrow_the_clock_as_h_evidence);
-	UT_RUN(catalog_scn_does_not_supply_independent_replication_history);
-	UT_RUN(catalog_getter_publishes_its_original_snapshot_before_return);
-	UT_RUN(catalog_publication_keeps_an_older_original_registered_protection);
-	UT_RUN(catalog_service_posture_rebuild_publishes_only_the_original_cluster_snapshot);
-	UT_RUN(catalog_cache_keeps_its_original_h_until_actual_invalidation);
-	UT_RUN(registered_catalog_is_live_without_becoming_active);
-	UT_RUN(evaluated_registered_snapshot_overrides_an_unrelated_active_snapshot);
-	UT_RUN(forged_reference_counts_do_not_establish_liveness);
-	UT_RUN(released_snapshot_cannot_be_dereferenced_or_reused_as_a_proof);
-	UT_RUN(snapshot_identity_and_retention_cannot_drift_during_evaluation);
-	UT_RUN(nested_evaluations_restore_the_actual_outer_snapshot);
-	UT_RUN(error_cleanup_restores_the_outer_evaluation);
-	UT_RUN(original_active_lifetime_remains_valid_after_unregister);
-	UT_RUN(actual_registered_admission_preserves_epoch_and_member_gates);
-	UT_RUN(actual_registered_admission_preserves_current_peer_capability_gate);
-	UT_RUN(catalog_invalidation_ends_static_snapshot_evidence);
-	UT_RUN(terminal_consumption_retains_only_original_active_boundary);
-	UT_RUN(cr_identity_is_stable_only_for_the_same_live_snapshot);
-	UT_RUN(cr_identity_copy_and_catalog_address_reuse_do_not_alias);
-	UT_RUN(cr_identity_command_changes_retire_the_old_identity);
-	UT_RUN(cr_identity_requires_the_actual_live_evaluator);
-	UT_RUN(cr_identity_preserves_snapshot_and_retention_refusals);
-	UT_RUN(cr_identity_exhaustion_does_not_wrap_or_erase_existing_identity);
-	UT_RUN(cr_identity_shmem_attach_preserves_the_allocator);
-	UT_RUN(cr_identity_restore_and_snapshot_refresh_start_new_lifetimes);
-	UT_RUN(vacuum_foreign_terminal_read_has_owned_snapshot);
-	UT_RUN(vacuum_registered_only_is_not_terminal_admission);
-	UT_RUN(vacuum_early_and_clean_returns_balance_ownership);
-	UT_RUN(vacuum_borrowed_snapshot_keeps_identity);
-	UT_RUN(vacuum_errors_use_original_abort_cleanup);
-	UT_RUN(vacuum_misplaced_owned_snapshot_is_runtime_error);
-	UT_RUN(vacuum_nontarget_modes_keep_original_body);
-	UT_RUN(vacuum_direct_worker_entry_needs_no_table_snapshot);
-	UT_RUN(vacuum_stale_borrowed_snapshot_is_not_refreshed);
-	UT_RUN(vacuum_shared_relstats_keeps_newer_locked_frozen_xid);
-	UT_RUN(vacuum_shared_database_keeps_newer_locked_frozen_xid);
-	UT_RUN(vacuum_shared_relstats_keeps_invalid_and_equal_candidates);
-	UT_RUN(vacuum_shared_relstats_retains_native_wrap_order);
-	UT_RUN(vacuum_shared_frozen_merge_keeps_independent_mx_path);
-	UT_RUN(vacuum_nontarget_frozen_merge_keeps_native_repair);
-	UT_RUN(vacuum_relstats_rejects_future_candidate);
-	UT_RUN(vacuum_relstats_rejects_future_locked_current);
-	UT_RUN(vacuum_relstats_rejects_half_space_current);
-	UT_RUN(vacuum_relstats_missing_promise_preserves_xid);
-	UT_RUN(vacuum_relstats_revoked_promise_preserves_xid);
-	UT_RUN(vacuum_relstats_invalid_reference_and_current_preserve_xid);
-	UT_RUN(vacuum_relstats_uses_durable_legal_bound);
-	UT_RUN(vacuum_relstats_unknown_window_keeps_stats_and_mx);
-	UT_RUN(vacuum_relstats_accepts_legal_next_boundary);
-	UT_RUN(vacuum_database_rejects_future_values);
-	UT_RUN(vacuum_database_rejects_half_space_current);
-	UT_RUN(vacuum_database_unavailable_promise_preserves_xid);
-	UT_RUN(vacuum_database_invalid_window_preserves_xid);
-	UT_RUN(vacuum_database_accepts_durable_bound_and_next_boundary);
-	UT_RUN(vacuum_database_retains_full_xid_wrap_order);
-	UT_RUN(vacuum_database_unknown_window_keeps_independent_mx);
-	UT_RUN(vacuum_database_scan_accepts_foreign_xid_and_keeps_seed);
-	UT_RUN(vacuum_database_scan_uses_full_xid_minimum_across_wrap);
-	UT_RUN(vacuum_database_scan_rejects_invalid_later_xid);
-	UT_RUN(vacuum_database_scan_unknown_window_keeps_independent_mx);
-	UT_RUN(vacuum_database_scan_rechecks_fence_after_catalog_read);
-	UT_RUN(vacuum_database_scan_rejects_invalid_seed_before_fold);
-	UT_RUN(vacuum_database_scan_nontarget_keeps_native_future_refusal);
-	UT_RUN(vacuum_database_scan_keeps_mx_future_refusal);
+	UT_PLAN(94);
+	SNAPSHOT_RUN(export_original_registration_publishes_h_before_file_visibility);
+	SNAPSHOT_RUN(export_original_registration_preserves_other_older_snapshot);
+	SNAPSHOT_RUN(export_errors_retain_original_h_until_transaction_cleanup);
+	SNAPSHOT_RUN(imported_snapshot_original_xmin_handoff_survives_source_exit);
+	SNAPSHOT_RUN(imported_xmin_does_not_borrow_the_receivers_previous_scn);
+	SNAPSHOT_RUN(restored_xmin_does_not_borrow_the_receivers_previous_scn);
+	SNAPSHOT_RUN(refused_xmin_install_preserves_the_receivers_original_scn);
+	SNAPSHOT_RUN(restored_snapshot_original_xmin_handoff_survives_source_exit);
+	SNAPSHOT_RUN(imported_finite_history_requires_original_source_scn_coverage);
+	SNAPSHOT_RUN(restored_finite_history_requires_original_source_scn_coverage);
+	SNAPSHOT_RUN(original_native_xmin_contract_and_older_source_protection_remain);
+	SNAPSHOT_RUN(parallel_serialized_snapshot_retains_original_handoff);
+	SNAPSHOT_RUN(parallel_serialized_unknown_history_cannot_borrow_clock);
+	SNAPSHOT_RUN(parallel_serialized_copy_cannot_replace_original_source_admission);
+	SNAPSHOT_RUN(imported_snapshot_rejects_missing_or_unprotected_original_source);
+	SNAPSHOT_RUN(restored_snapshot_rejects_unprotected_original_source);
+	SNAPSHOT_RUN(original_catalog_pin_cannot_supply_a_missing_finite_clock);
+	SNAPSHOT_RUN(original_registered_nonfinite_reader_keeps_h_unqualified_until_retirement);
+	SNAPSHOT_RUN(mixed_registered_sources_cannot_hide_unqualified_h);
+	SNAPSHOT_RUN(mixed_active_sources_cannot_hide_unqualified_h);
+	SNAPSHOT_RUN(catalog_original_publication_completes_the_real_h_sample);
+	SNAPSHOT_RUN(catalog_h_sample_preserves_other_original_snapshot_protection);
+	SNAPSHOT_RUN(catalog_actual_retirement_releases_only_its_original_h_pin);
+	SNAPSHOT_RUN(catalog_local_source_cannot_borrow_the_clock_as_h_evidence);
+	SNAPSHOT_RUN(catalog_scn_does_not_supply_independent_replication_history);
+	SNAPSHOT_RUN(catalog_getter_publishes_its_original_snapshot_before_return);
+	SNAPSHOT_RUN(catalog_publication_keeps_an_older_original_registered_protection);
+	SNAPSHOT_RUN(catalog_service_posture_rebuild_publishes_only_the_original_cluster_snapshot);
+	SNAPSHOT_RUN(catalog_cache_keeps_its_original_h_until_actual_invalidation);
+	SNAPSHOT_RUN(registered_catalog_is_live_without_becoming_active);
+	SNAPSHOT_RUN(evaluated_registered_snapshot_overrides_an_unrelated_active_snapshot);
+	SNAPSHOT_RUN(forged_reference_counts_do_not_establish_liveness);
+	SNAPSHOT_RUN(released_snapshot_cannot_be_dereferenced_or_reused_as_a_proof);
+	SNAPSHOT_RUN(snapshot_identity_and_retention_cannot_drift_during_evaluation);
+	SNAPSHOT_RUN(nested_evaluations_restore_the_actual_outer_snapshot);
+	SNAPSHOT_RUN(error_cleanup_restores_the_outer_evaluation);
+	SNAPSHOT_RUN(original_active_lifetime_remains_valid_after_unregister);
+	SNAPSHOT_RUN(actual_registered_admission_preserves_epoch_and_member_gates);
+	SNAPSHOT_RUN(actual_registered_admission_preserves_current_peer_capability_gate);
+	SNAPSHOT_RUN(catalog_invalidation_ends_static_snapshot_evidence);
+	SNAPSHOT_RUN(terminal_consumption_retains_only_original_active_boundary);
+	SNAPSHOT_RUN(cr_identity_is_stable_only_for_the_same_live_snapshot);
+	SNAPSHOT_RUN(cr_identity_copy_and_catalog_address_reuse_do_not_alias);
+	SNAPSHOT_RUN(cr_identity_command_changes_retire_the_old_identity);
+	SNAPSHOT_RUN(cr_identity_requires_the_actual_live_evaluator);
+	SNAPSHOT_RUN(cr_identity_preserves_snapshot_and_retention_refusals);
+	SNAPSHOT_RUN(cr_identity_exhaustion_does_not_wrap_or_erase_existing_identity);
+	SNAPSHOT_RUN(cr_identity_shmem_attach_preserves_the_allocator);
+	SNAPSHOT_RUN(cr_identity_restore_and_snapshot_refresh_start_new_lifetimes);
+	SNAPSHOT_RUN(vacuum_foreign_terminal_read_has_owned_snapshot);
+	SNAPSHOT_RUN(vacuum_registered_only_is_not_terminal_admission);
+	SNAPSHOT_RUN(vacuum_early_and_clean_returns_balance_ownership);
+	SNAPSHOT_RUN(vacuum_borrowed_snapshot_keeps_identity);
+	SNAPSHOT_RUN(vacuum_errors_use_original_abort_cleanup);
+	SNAPSHOT_RUN(vacuum_misplaced_owned_snapshot_is_runtime_error);
+	SNAPSHOT_RUN(vacuum_nontarget_modes_keep_original_body);
+	SNAPSHOT_RUN(vacuum_direct_worker_entry_needs_no_table_snapshot);
+	SNAPSHOT_RUN(vacuum_stale_borrowed_snapshot_is_not_refreshed);
+	SNAPSHOT_RUN(vacuum_shared_relstats_keeps_newer_locked_frozen_xid);
+	SNAPSHOT_RUN(vacuum_shared_database_keeps_newer_locked_frozen_xid);
+	SNAPSHOT_RUN(vacuum_shared_relstats_keeps_invalid_and_equal_candidates);
+	SNAPSHOT_RUN(vacuum_shared_relstats_retains_native_wrap_order);
+	SNAPSHOT_RUN(vacuum_shared_frozen_merge_keeps_independent_mx_path);
+	SNAPSHOT_RUN(vacuum_nontarget_frozen_merge_keeps_native_repair);
+	SNAPSHOT_RUN(vacuum_relstats_rejects_future_candidate);
+	SNAPSHOT_RUN(vacuum_relstats_rejects_future_locked_current);
+	SNAPSHOT_RUN(vacuum_relstats_rejects_half_space_current);
+	SNAPSHOT_RUN(vacuum_relstats_missing_promise_preserves_xid);
+	SNAPSHOT_RUN(vacuum_relstats_revoked_promise_preserves_xid);
+	SNAPSHOT_RUN(vacuum_relstats_invalid_reference_and_current_preserve_xid);
+	SNAPSHOT_RUN(vacuum_relstats_uses_durable_legal_bound);
+	SNAPSHOT_RUN(vacuum_relstats_unknown_window_keeps_stats_and_mx);
+	SNAPSHOT_RUN(vacuum_relstats_accepts_legal_next_boundary);
+	SNAPSHOT_RUN(vacuum_database_rejects_future_values);
+	SNAPSHOT_RUN(vacuum_database_rejects_half_space_current);
+	SNAPSHOT_RUN(vacuum_database_unavailable_promise_preserves_xid);
+	SNAPSHOT_RUN(vacuum_database_invalid_window_preserves_xid);
+	SNAPSHOT_RUN(vacuum_database_accepts_durable_bound_and_next_boundary);
+	SNAPSHOT_RUN(vacuum_database_retains_full_xid_wrap_order);
+	SNAPSHOT_RUN(vacuum_database_unknown_window_keeps_independent_mx);
+	SNAPSHOT_RUN(vacuum_database_scan_accepts_foreign_xid_and_keeps_seed);
+	SNAPSHOT_RUN(vacuum_database_scan_uses_full_xid_minimum_across_wrap);
+	SNAPSHOT_RUN(vacuum_database_scan_rejects_invalid_later_xid);
+	SNAPSHOT_RUN(vacuum_database_scan_unknown_window_keeps_independent_mx);
+	SNAPSHOT_RUN(vacuum_database_scan_rechecks_fence_after_catalog_read);
+	SNAPSHOT_RUN(vacuum_database_scan_rejects_invalid_seed_before_fold);
+	SNAPSHOT_RUN(vacuum_database_scan_nontarget_keeps_native_future_refusal);
+	SNAPSHOT_RUN(vacuum_database_scan_keeps_mx_future_refusal);
 	UT_ASSERT_EQ(remembered, 0);
+	SNAPSHOT_RUN(sampled_h_refuses_a_later_unprotected_older_registration);
+	SNAPSHOT_RUN(older_registration_error_preserves_original_published_snapshot);
+	SNAPSHOT_RUN(unknown_live_marker_cannot_hide_a_rejected_new_finite_reader);
+	SNAPSHOT_RUN(older_active_snapshot_refusal_keeps_original_stack_ownership);
+	SNAPSHOT_RUN(older_catalog_snapshot_refusal_leaves_no_cached_or_heap_reference);
+	SNAPSHOT_RUN(older_export_refusal_precedes_list_heap_and_file_ownership);
 	UT_ASSERT(pairingheap_is_empty(&RegisteredSnapshots));
 	UT_ASSERT(!ActiveSnapshotSet());
 	free(procArray);

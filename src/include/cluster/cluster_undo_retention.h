@@ -51,16 +51,20 @@ typedef struct ClusterUndoRetentionSample {
 } ClusterUndoRetentionSample;
 
 /* Same locking/ordering as the scalar wrapper below; refusal clears out.
- * Clock and any published reader SCN must be finite, never idle-report MAX. */
+ * Clock and any published reader SCN must be finite, never idle-report MAX.
+ * A successful cut retains a local read-publication promise under that lock;
+ * it is not a global F/H or producer-lifetime certificate. */
 extern bool cluster_undo_retention_horizon_sample(ClusterUndoRetentionSample *out);
 
 /*
  * cluster_undo_retention_horizon -- own-instance retention lower bound:
- *	min(pre-scan local clock, live read_scn over backends). InvalidScn when
+ *	min(pre-scan local clock, live read_scn, actual ADG future-read SCN).
+ *	InvalidScn when
  *	disabled, an xmin-bearing backend has not published its read_scn, or
  *	the clock/reader publication is the reserved nonfinite idle sentinel.
  *	Scans under EXCLUSIVE ProcArrayLock, serializing against snapshot xmin
- *	publication; no I/O, remote wait or clock resample inside. spec-3.12
+ *	and read-SCN publication. A regressing cut refuses without lowering the
+ *	retained promise; no I/O, remote wait or clock resample inside. spec-3.12
  *	C17: do NOT hold seg->lock / undo lifecycle_lock when calling.
  */
 extern SCN cluster_undo_retention_horizon(void);

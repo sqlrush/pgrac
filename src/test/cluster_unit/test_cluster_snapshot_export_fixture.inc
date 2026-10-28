@@ -224,9 +224,13 @@ UT_TEST(export_errors_retain_original_h_until_transaction_cleanup)
 {
 	for (unsigned fault = 1; fault <= 4; fault++)
 	{
-		SnapshotData source = snapshot_export_source();
+		SnapshotData source;
 		ClusterUndoRetentionSample sample;
 		volatile bool caught = false;
+
+		/* Independent fault case, with a fresh shared ProcArray promise. */
+		procArray->cluster_read_scn_floor = InvalidScn;
+		source = snapshot_export_source();
 
 		export_fault = fault;
 		export_expected_h = 40;

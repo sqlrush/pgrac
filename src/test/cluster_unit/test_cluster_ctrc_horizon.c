@@ -415,10 +415,16 @@ sender_history_clock(void)
 	return sender_sample_clock;
 }
 
+static bool cohort_no_mrp(void);
+static SCN cohort_unavailable_mrp_bound(void);
+#define cluster_mrp_should_start cohort_no_mrp
+#define cluster_mrp_standby_consistent_scn cohort_unavailable_mrp_bound
 #define MainLWLockArray native_locks
 #define allProcs (native_procs.allProcs)
 #define cluster_scn_current sender_history_clock
 #include "test_cluster_retention_sample.inc"
+#undef cluster_mrp_standby_consistent_scn
+#undef cluster_mrp_should_start
 #undef cluster_scn_current
 #undef allProcs
 #undef MainLWLockArray

@@ -2446,13 +2446,13 @@ test_cluster_heap_ctrc_begin.inc: $(top_srcdir)/src/backend/cluster/cluster_term
 # Original census entry traversal, physical lock selection and widening.
 test_cluster_heap_ctrc_step.inc: $(top_srcdir)/src/backend/cluster/cluster_xid_stripe.c $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
 	@awk '/^cluster_xid_widen\(/ { print "static FullTransactionId"; emit=1; found++ } \
-	     /^(ctrc_bytes_zero|ctrc_txn_key_valid)\(/ { print "static bool"; emit=1; found++ } \
+	     /^(ctrc_bytes_zero|ctrc_txn_key_valid|ctrc_participant_identity_matches_source|ctrc_participant_active_source_matches)\(/ { print "static bool"; emit=1; found++ } \
 	     /^ctrc_origin_entries\(/ { print "static ClusterCtrcOriginEntry *"; emit=1; found++ } \
 	     /^ctrc_participant_entries\(/ { print "static ClusterCtrcParticipantEntry *"; emit=1; found++ } \
 	     /^ctrc_participant_lock_mask\(/ { print "static uint32"; emit=1; found++ } \
 	     /^(ctrc_active_scan_step|cluster_ctrc_active_scan_step_source)\(/ { print "static void"; emit=1; found++ } \
 	     emit { print } emit && /^}/ { emit=0; done++ } \
-	     END { if (found != 8 || done != 8 || emit) exit 1 }' $(filter %.c,$^) > $@.tmp
+	     END { if (found != 10 || done != 10 || emit) exit 1 }' $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_heap_ctrc_registration.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
@@ -8912,7 +8912,15 @@ test_cluster_retention_sample.inc: $(top_srcdir)/src/backend/storage/ipc/procarr
 	     END { if (count != 2 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Original finite read publication, serialized with successful native H cuts.
+test_cluster_retention_publish.inc: $(top_srcdir)/src/backend/storage/ipc/procarray.c Makefile
+	awk '/^ProcArrayPublishReadScn\(/ { print "bool"; emit=1; count++ } \
+	     emit { print } /^}$$/ { emit=0 } \
+	     END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_retention_sample: test_cluster_retention_sample.c unit_test.h \
+		test_cluster_retention_publish.inc \
 		test_cluster_pgproc_active_types.inc test_cluster_retention_sample.inc \
 		$(top_srcdir)/src/include/access/twophase.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_retention.h \
@@ -9950,6 +9958,7 @@ test_cluster_snapshot_import_compare.inc: $(top_srcdir)/src/backend/access/trans
 		END { if (emit || starts != 1) exit 1 }' $< > $@
 
 test_cluster_snapshot_admission: test_cluster_snapshot_admission.c unit_test.h \
+		test_cluster_retention_publish.inc \
 		test_cluster_snapshot_import_xmin.inc test_cluster_snapshot_import_compare.inc \
 		$(srcdir)/test_cluster_snapshot_import_fixture.inc \
 		$(srcdir)/test_cluster_snapshot_export_fixture.inc \
@@ -10973,6 +10982,7 @@ clean-active-sample-fence:
 clean distclean maintainer-clean: clean-retention-sample
 .PHONY: clean-retention-sample
 clean-retention-sample:
+	rm -f test_cluster_retention_publish.inc test_cluster_retention_publish.inc.tmp
 	rm -f test_cluster_retention_sample.inc test_cluster_retention_sample.inc.tmp
 
 # Original backend-local writer, with controlled ownership/object/pin leaves.

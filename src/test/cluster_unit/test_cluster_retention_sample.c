@@ -14,8 +14,10 @@
 #include "postgres.h"
 #include "access/twophase.h"
 #include "cluster/cluster_undo_retention.h"
+#include "cluster/cluster_mrp.h"
 #include "storage/lwlock.h"
 #include "storage/proc.h"
+#include "storage/procarray.h"
 #include "test_cluster_pgproc_active_types.inc"
 
 #undef printf
@@ -27,11 +29,29 @@ int cluster_node_id = 0;
 static ProcArrayStruct *procArray;
 static PGPROC entries[8];
 static PGPROC *allProcs = entries;
+PGPROC *MyProc = &entries[0];
 static LWLockPadded locks[NUM_INDIVIDUAL_LWLOCKS];
 LWLockPadded *MainLWLockArray = locks;
 static SCN sample_clock;
 static unsigned acquires, releases, clock_reads, lock_errors;
 static bool held, change_after_unlock, corrupt_count_after_lock;
+static bool sample_mrp, clock_sampled;
+static SCN sample_mrp_bound;
+
+bool
+cluster_mrp_should_start(void)
+{
+	UT_ASSERT(held);
+	return sample_mrp;
+}
+
+SCN
+cluster_mrp_standby_consistent_scn(void)
+{
+	UT_ASSERT(held && sample_mrp);
+	return sample_mrp_bound;
+}
+
 
 bool
 LWLockAcquire(LWLock *lock, LWLockMode mode)
@@ -39,6 +59,7 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 	if (held || lock != ProcArrayLock || mode != LW_EXCLUSIVE)
 		lock_errors++;
 	held = true;
+	clock_sampled = false;
 	acquires++;
 	if (corrupt_count_after_lock)
 		procArray->numProcs = -1;
@@ -62,8 +83,9 @@ LWLockRelease(LWLock *lock)
 SCN
 cluster_scn_current(void)
 {
-	if (!held || clock_reads != acquires - 1)
+	if (!held || clock_sampled)
 		lock_errors++;
+	clock_sampled = true;
 	clock_reads++;
 	return sample_clock;
 }
@@ -82,6 +104,7 @@ ExceptionalCondition(const char *condition, const char *file, int line)
 }
 
 #include "test_cluster_retention_sample.inc"
+#include "test_cluster_retention_publish.inc"
 
 static void
 reset_fixture(void)
@@ -99,6 +122,9 @@ reset_fixture(void)
 	}
 	cluster_node_id = 0;
 	sample_clock = 700;
+	sample_mrp = false;
+	sample_mrp_bound = InvalidScn;
+	MyProc = &entries[0];
 	acquires = releases = clock_reads = lock_errors = 0;
 	held = change_after_unlock = corrupt_count_after_lock = false;
 }
@@ -503,10 +529,156 @@ UT_TEST(test_null_output_and_disabled_cluster_do_not_scan)
 	UT_ASSERT_EQ(clock_reads, 0);
 }
 
+UT_TEST(test_sampled_promise_refuses_later_older_publication_without_mutation)
+{
+	ClusterUndoRetentionSample sample;
+	unsigned before;
+
+	reset_fixture();
+	UT_ASSERT(cluster_undo_retention_horizon_sample(&sample));
+	before = clock_reads;
+	UT_ASSERT(!ProcArrayPublishReadScn(400, InvalidScn));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&entries[0].cluster_read_scn_atomic), InvalidScn);
+	UT_ASSERT(ProcArrayPublishReadScn(700, InvalidScn));
+	UT_ASSERT(!ProcArrayPublishReadScn(699, InvalidScn));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&entries[0].cluster_read_scn_atomic), 700);
+	UT_ASSERT(ProcArrayPublishReadScn((UINT64CONST(3) << SCN_NODE_ID_SHIFT) | 700, InvalidScn));
+	UT_ASSERT_EQ(clock_reads, before);
+	UT_ASSERT_EQ(acquires, releases);
+	UT_ASSERT_EQ(lock_errors, 0);
+	UT_ASSERT(!held);
+}
+
+UT_TEST(test_publication_before_cut_preserves_its_original_history)
+{
+	ClusterUndoRetentionSample sample;
+
+	reset_fixture();
+	procArray->numProcs = 1;
+	UT_ASSERT(ProcArrayPublishReadScn(400, InvalidScn));
+	UT_ASSERT(cluster_undo_retention_horizon_sample(&sample));
+	UT_ASSERT_EQ(sample.horizon_scn, 400);
+	UT_ASSERT_EQ(sample.contributor_kind, CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT);
+	UT_ASSERT(ProcArrayPublishReadScn(400, InvalidScn));
+	UT_ASSERT(!ProcArrayPublishReadScn(399, InvalidScn));
+	UT_ASSERT(ProcArrayPublishReadScn(InvalidScn, InvalidScn));
+	UT_ASSERT(cluster_undo_retention_horizon_sample(&sample));
+	UT_ASSERT_EQ(sample.horizon_scn, 700);
+	/* A reader's retirement does not revoke the already exported promise. */
+	UT_ASSERT(!ProcArrayPublishReadScn(400, InvalidScn));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&entries[0].cluster_read_scn_atomic), InvalidScn);
+	UT_ASSERT_EQ(acquires, releases);
+	UT_ASSERT_EQ(lock_errors, 0);
+}
+
+UT_TEST(test_unknown_publication_keeps_refusal_and_never_erases_promise)
+{
+	ClusterUndoRetentionSample sample, zero = {0};
+	const SCN unknown[] = { InvalidScn, (SCN) UINT64_MAX };
+
+	for (unsigned i = 0; i < lengthof(unknown); i++)
+	{
+		reset_fixture();
+		UT_ASSERT(cluster_undo_retention_horizon_sample(&sample));
+		procArray->numProcs = 1;
+		entries[0].xmin = 10;
+		UT_ASSERT(ProcArrayPublishReadScn(unknown[i], InvalidScn));
+		memset(&sample, 0xa5, sizeof(sample));
+		UT_ASSERT(!cluster_undo_retention_horizon_sample(&sample));
+		UT_ASSERT_EQ(memcmp(&sample, &zero, sizeof(sample)), 0);
+		UT_ASSERT(!ProcArrayPublishReadScn(699, InvalidScn));
+		UT_ASSERT_EQ(pg_atomic_read_u64(&entries[0].cluster_read_scn_atomic), unknown[i]);
+		UT_ASSERT_EQ(acquires, releases);
+		UT_ASSERT_EQ(lock_errors, 0);
+	}
+}
+
+UT_TEST(test_adg_origin_bounds_the_promise_inside_the_original_cut)
+{
+	ClusterUndoRetentionSample sample, zero = {0};
+
+	reset_fixture();
+	sample_mrp = true;
+	sample_mrp_bound = 400;
+	UT_ASSERT(cluster_undo_retention_horizon_sample(&sample));
+	UT_ASSERT_EQ(sample.horizon_scn, 400);
+	UT_ASSERT_EQ(sample.clock_scn, 700);
+	UT_ASSERT_EQ(sample.contributor_kind, CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_REPLICATION);
+	UT_ASSERT_EQ(sample.contributor_token, 0);
+	UT_ASSERT(ProcArrayPublishReadScn(400, InvalidScn));
+	UT_ASSERT(!ProcArrayPublishReadScn(399, InvalidScn));
+	/* An invalid or regressing source cannot lower a previous promise. */
+	for (unsigned i = 0; i < 3; i++)
+	{
+		sample_mrp_bound = i == 0 ? InvalidScn : i == 1 ? (SCN) UINT64_MAX : 399;
+		memset(&sample, 0xa5, sizeof(sample));
+		UT_ASSERT(!cluster_undo_retention_horizon_sample(&sample));
+		UT_ASSERT_EQ(memcmp(&sample, &zero, sizeof(sample)), 0);
+		UT_ASSERT(!ProcArrayPublishReadScn(399, InvalidScn));
+	}
+	UT_ASSERT_EQ(acquires, releases);
+	UT_ASSERT_EQ(lock_errors, 0);
+}
+
+UT_TEST(test_regressing_clock_or_snapshot_cut_cannot_lower_an_old_promise)
+{
+	ClusterUndoRetentionSample sample, zero = {0};
+
+	reset_fixture();
+	UT_ASSERT(cluster_undo_retention_horizon_sample(&sample));
+	sample_clock = 699;
+	UT_ASSERT(!cluster_undo_retention_horizon_sample(&sample));
+	UT_ASSERT_EQ(memcmp(&sample, &zero, sizeof(sample)), 0);
+	sample_clock = 700;
+	procArray->numProcs = 1;
+	/* Controlled corrupt legacy publication bypasses the original owner. */
+	pg_atomic_write_u64(&entries[0].cluster_read_scn_atomic, 400);
+	UT_ASSERT(!cluster_undo_retention_horizon_sample(&sample));
+	UT_ASSERT_EQ(memcmp(&sample, &zero, sizeof(sample)), 0);
+	UT_ASSERT(!ProcArrayPublishReadScn(400, InvalidScn));
+	UT_ASSERT(ProcArrayPublishReadScn(700, InvalidScn));
+	UT_ASSERT(cluster_undo_retention_horizon_sample(&sample));
+	UT_ASSERT_EQ(sample.horizon_scn, 700);
+	UT_ASSERT_EQ(acquires, releases);
+	UT_ASSERT_EQ(lock_errors, 0);
+}
+
+UT_TEST(test_publication_without_an_original_owner_refuses_before_locking)
+{
+	reset_fixture();
+	MyProc = NULL;
+	UT_ASSERT(!ProcArrayPublishReadScn(700, InvalidScn));
+	MyProc = &entries[0];
+	cluster_node_id = -1;
+	UT_ASSERT(!ProcArrayPublishReadScn(700, InvalidScn));
+	cluster_node_id = 0;
+	free(procArray);
+	procArray = NULL;
+	UT_ASSERT(!ProcArrayPublishReadScn(700, InvalidScn));
+	UT_ASSERT_EQ(acquires, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&entries[0].cluster_read_scn_atomic), InvalidScn);
+}
+
+UT_TEST(test_unknown_fold_cannot_hide_a_new_finite_reader)
+{
+	ClusterUndoRetentionSample sample;
+
+	reset_fixture();
+	UT_ASSERT(cluster_undo_retention_horizon_sample(&sample));
+	UT_ASSERT(!ProcArrayPublishReadScn(InvalidScn, 699));
+	UT_ASSERT(!ProcArrayPublishReadScn((SCN) UINT64_MAX, 699));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&entries[0].cluster_read_scn_atomic), InvalidScn);
+	UT_ASSERT(ProcArrayPublishReadScn(InvalidScn, 700));
+	UT_ASSERT(ProcArrayPublishReadScn((SCN) UINT64_MAX, 700));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&entries[0].cluster_read_scn_atomic), (SCN) UINT64_MAX);
+	UT_ASSERT_EQ(acquires, releases);
+	UT_ASSERT_EQ(lock_errors, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(21);
+	UT_PLAN(28);
 	UT_RUN(test_empty_array_has_one_prescan_clock);
 	UT_RUN(test_all_database_and_vacuum_snapshot_minima_are_included);
 	UT_RUN(test_equal_time_prefers_snapshot_without_changing_scalar_bits);
@@ -528,6 +700,13 @@ main(void)
 	UT_RUN(test_full_capacity_census_preserves_its_actual_snapshot_minimum);
 	UT_RUN(test_valid_census_can_be_sampled_after_a_rejected_count);
 	UT_RUN(test_null_output_and_disabled_cluster_do_not_scan);
+	UT_RUN(test_sampled_promise_refuses_later_older_publication_without_mutation);
+	UT_RUN(test_publication_before_cut_preserves_its_original_history);
+	UT_RUN(test_unknown_publication_keeps_refusal_and_never_erases_promise);
+	UT_RUN(test_adg_origin_bounds_the_promise_inside_the_original_cut);
+	UT_RUN(test_regressing_clock_or_snapshot_cut_cannot_lower_an_old_promise);
+	UT_RUN(test_publication_without_an_original_owner_refuses_before_locking);
+	UT_RUN(test_unknown_fold_cannot_hide_a_new_finite_reader);
 	free(procArray);
 	UT_DONE();
 	return ut_failed_count != 0;

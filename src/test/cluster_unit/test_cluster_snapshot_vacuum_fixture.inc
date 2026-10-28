@@ -386,6 +386,8 @@ vacuum_reset(void)
 	UT_ASSERT(!ActiveSnapshotSet());
 	UT_ASSERT(pairingheap_is_empty(&RegisteredSnapshots));
 	AtEOXact_Snapshot(false, true);
+	/* The following independent maintenance setup starts a fresh boot. */
+	procArray->cluster_read_scn_floor = InvalidScn;
 	cluster_enabled = cluster_shared_catalog = cluster_xid_striping = true;
 	vacuum_fault = VAC_FAULT_NONE;
 	vacuum_injected_code = ERRCODE_QUERY_CANCELED;
@@ -462,6 +464,9 @@ vacuum_call(void)
 static void
 vacuum_abort(void)
 {
+	/* AbortTransaction releases LWLocks/UnlockBuffers before the original
+	 * CleanupTransaction invokes AtEOXact_Snapshot. Model only that boundary. */
+	vacuum_xid_lock = vacuum_inplace_lock = false;
 	AtEOXact_Snapshot(false, true);
 	UT_ASSERT(!ActiveSnapshotSet());
 	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_read_scn_atomic), 0);

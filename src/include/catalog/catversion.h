@@ -740,7 +740,9 @@
 /* Explicit canonical-companion verdict V4; fresh homogeneous clusters only. */
 /* Temporary exact receiver readers retain the original participant until
  * its source-check scope ends. Fresh homogeneous clusters only. */
-#define CATALOG_VERSION_NO 202610292
+/* Shared ProcArray retains local read-SCN publication promises.
+ * Fresh homogeneous clusters only. */
+#define CATALOG_VERSION_NO 202610293
 
 /* spec-5.13 (2026-06-27): clean-leave catalog surface — cluster_get_clean_leave_state
  * SRF (oid 8960) + pg_cluster_clean_leave_state view + pg_cluster_clean_leave_request
