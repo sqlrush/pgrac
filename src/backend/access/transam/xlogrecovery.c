@@ -208,6 +208,7 @@
 #include "cluster/cluster_recovery_census.h"
 #include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_page_install_ctrc.h"
+#include "cluster/cluster_page_wal.h"
 #include "cluster/storage/cluster_shared_fs_page.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_wal_writer.h"
@@ -2598,6 +2599,26 @@ cluster_recovery_cold_page_reference_terminals(const struct ClusterRecoveryStart
 		&& start->ctrc_pages == pages;
 }
 
+/* The native scan counts first records in EVERY buffer, including foreign
+ * and unattributed sources. No dirty first may be retired from raw FD/page
+ * equality. Empty is only this observation, never future custody or release. */
+static bool
+cluster_recovery_cold_page_first_empty(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, ClusterWalInputsV1 *scope,
+	const ClusterColdCtrcPageProgressV1 *progress)
+{
+	ClusterWalSourceRef source;
+	ClusterPageWalDirtyFloorV1 observed;
+
+	if (!cluster_recovery_cold_page_advance_current(start, work, scope, progress)) return false;
+	source = start->ctrc_page_sources[0].generation.source;
+	if (!cluster_page_wal_dirty_floor_v1(&source, &observed)
+		|| observed.floor != InvalidXLogRecPtr || observed.dirty != 0
+		|| observed.foreign != 0 || observed.unattributed != 0) return false;
+	return cluster_recovery_cold_page_advance_current(start, work, scope, progress)
+		&& memcmp(&source, &start->ctrc_page_sources[0].generation.source, sizeof(source)) == 0;
+}
+
 static bool
 cluster_recovery_cold_page_completed_recheck(const struct ClusterRecoveryStartV1 *start)
 {
@@ -2609,10 +2630,11 @@ cluster_recovery_cold_page_completed_recheck(const struct ClusterRecoveryStartV1
 	volatile bool ready = false;
 	Size bytes;
 
-	if (!cluster_recovery_cold_page_advance_current(start, work, scope, progress)) return false;
+	if (!cluster_recovery_cold_page_first_empty(start, work, scope, progress)) return false;
 	if (progress == NULL)
 		return rf_page_online_plan_target_count_v1(start->ctrc_page_plan) == 0
-			&& cluster_recovery_cold_page_reference_terminals(start, work, scope, progress);
+			&& cluster_recovery_cold_page_reference_terminals(start, work, scope, progress)
+			&& cluster_recovery_cold_page_first_empty(start, work, scope, progress);
 	if (work->counts.subject_count > MaxAllocSize / sizeof(*subjects)
 		|| !cluster_recovery_ctrc_terminal_result_v1(start, work, &accepted)) return false;
 	bytes = (Size)work->counts.subject_count * sizeof(*subjects);
@@ -2664,7 +2686,8 @@ cluster_recovery_cold_page_completed_recheck(const struct ClusterRecoveryStartV1
 			if (ready)
 				ready = cluster_recovery_cold_page_reference_terminals(start, work, scope, progress)
 					&& cluster_recovery_cold_page_projection_subjects(start, work, scope,
-						progress, subjects, &accepted, false);
+						progress, subjects, &accepted, false)
+					&& cluster_recovery_cold_page_first_empty(start, work, scope, progress);
 		}
 	}
 	PG_FINALLY();

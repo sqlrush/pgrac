@@ -3,6 +3,7 @@
 #define USE_PGRAC_CLUSTER 1
 #include "postgres.h"
 #include "cluster/cluster_terminal_ref_census.h"
+#include "cluster/cluster_page_wal.h"
 #include "cluster/storage/cluster_shared_fs_page.h"
 #include <setjmp.h>
 #include "access/xlog.h"
@@ -59,6 +60,24 @@ static bool clusterStartupWriterInstalled;
 static ClusterWalWriterToken observed_writer;
 static bool native_recovery, binding_ok, writer_ok, allocation_ok;
 static bool effects_ready;
+/* Native buffer first-record scan is a controlled leaf; all original
+ * Startup/source/accepted-result/PAGE and cleanup code remains real. */
+static ClusterPageWalDirtyFloorV1 startup_first_floor;
+static unsigned startup_first_calls;
+static bool startup_first_available = true;
+static void (*startup_first_step)(void);
+
+bool
+cluster_page_wal_dirty_floor_v1(const ClusterWalSourceRef *source,
+	ClusterPageWalDirtyFloorV1 *out)
+{
+	UT_ASSERT(source != NULL && out != NULL);
+	startup_first_calls++;
+	if (startup_first_step != NULL) startup_first_step();
+	*out = startup_first_floor;
+	return startup_first_available;
+}
+
 static bool tx_fence_current, tx_fence_subject_current;
 static unsigned tx_fence_checks;
 static void (*ctrc_request_step)(void);
@@ -595,6 +614,8 @@ bool cluster_undo_smgr_recovery_abort_write_v1(ClusterUndoSmgrRecoveryStampV1 st
 
 static void reset(void)
 {
+	memset(&startup_first_floor, 0, sizeof(startup_first_floor));
+	startup_first_calls = 0; startup_first_available = true; startup_first_step = NULL;
 	ctrc_driver_acquires = ctrc_driver_authorizations = ctrc_driver_waits = 0;
 	ctrc_driver_busy_until = ctrc_driver_lwlocks = 0;
 	ctrc_driver_waiting = ctrc_driver_false_authorization = ctrc_driver_error = false;
@@ -2348,9 +2369,18 @@ static void startup_local_empty_reset(void);
 #include "test_cluster_cold_ctrc_cross_page.inc"
 #include "test_cluster_cold_ctrc_plain_lock_refs.inc"
 #include "test_cluster_cold_ctrc_update_predecessors.inc"
+#include "test_cluster_cold_ctrc_first_wal.inc"
 
 int main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_FIRST_WAL") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_startup_first_wal_empty_rechecks_all_native_buffers);
+		UT_RUN(test_startup_first_wal_missing_or_nonempty_keeps_original_debt);
+		UT_RUN(test_startup_first_wal_late_failure_revalidates_original_owner);
+		UT_RUN(test_startup_first_wal_repeat_cannot_reuse_empty_observation);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_UPDATE_PREDECESSORS") != NULL) {
 		UT_PLAN(4);
 		UT_RUN(test_startup_update_predecessors_reject_two_cross_page_sources);
@@ -2626,7 +2656,11 @@ int main(void)
 		UT_DONE();
 		return ut_failed_count == 0 ? 0 : 1;
 	}
-	UT_PLAN(279);
+	UT_PLAN(283);
+	UT_RUN(test_startup_first_wal_empty_rechecks_all_native_buffers);
+	UT_RUN(test_startup_first_wal_missing_or_nonempty_keeps_original_debt);
+	UT_RUN(test_startup_first_wal_late_failure_revalidates_original_owner);
+	UT_RUN(test_startup_first_wal_repeat_cannot_reuse_empty_observation);
 	UT_RUN(test_startup_update_predecessors_reject_two_cross_page_sources);
 	UT_RUN(test_startup_update_predecessors_join_local_and_cross_page_without_page_wal);
 	UT_RUN(test_startup_update_predecessors_keep_native_nonedge_and_inverse_meaning);
