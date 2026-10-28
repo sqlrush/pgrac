@@ -8055,6 +8055,214 @@ UT_TEST(test_actual_gcs_install_refused_after_copy_keeps_prepared_receipt_and_pa
 	UT_ASSERT_EQ(held_count, 0);
 }
 
+/* Establish C through an earlier real origin grant, optionally through D.
+ * B's incoming attempt is separate pending custody; it must not replace
+ * either C's direct registration or its first accepted parent D. */
+static bool
+seed_merge_receiver(bool delegated, ClusterCtrcReceiptHandle *source,
+	ClusterCtrcParticipantIdentity *receiver, ClusterItlSlotData *slot,
+	uint8 incoming[224], uint64 *index)
+{
+	ClusterCtrcOriginEntry *origin;
+	ClusterCtrcParticipantIdentity prior;
+	ClusterCtrcReceiptHandle retained;
+	ClusterCtrcPublicationIdV1 publication;
+	ClusterCtrcTargetV1 target;
+	uint8 original[144], record[224];
+	uint32 grant;
+
+	if (!seed_delegation_receive(source, receiver, slot, incoming, index))
+		return false;
+	origin = &ctrc_origin_entries()[0];
+	origin->state = CTRC_ORIGIN_OPEN;
+	prior = *receiver;
+	if (delegated) {
+		prior.node_id = 3;
+		prior.boot_incarnation = 1104;
+	}
+	cluster_node_id = origin->key.origin_node_id;
+	if (cluster_ctrc_origin_grant_fullxid_v2(&source->key, &prior,
+		CTRC_PROOF_ACTIVE, &grant, original) != CLUSTER_CTRC_TOUCH_RECORDED)
+		return false;
+	fixture_receipt_inputs(origin, 1100, &publication, &target);
+	publication.requester_node_id = prior.node_id;
+	publication.requester_boot_incarnation = prior.boot_incarnation;
+	publication.capability_record_generation = prior.capability_record_generation;
+	cluster_node_id = prior.node_id;
+	if (cluster_ctrc_receipt_prepare_origin_v2(&source->key, &prior, grant,
+		&publication, &target, original, sizeof(original), &retained)
+		!= CLUSTER_CTRC_PREPARE_READY)
+		return false;
+	if (delegated && !cluster_ctrc_participant_delegate_prepare_v1(&source->key,
+		&prior, grant, receiver, record, sizeof(record)))
+		return false;
+	cluster_node_id = receiver->node_id;
+	return !delegated || cluster_ctrc_itl_delegate_accept_v1(slot, &prior,
+		receiver, record, sizeof(record));
+}
+
+UT_TEST(test_registered_image_receiver_merges_without_new_parent_or_source_retirement)
+{
+	for (unsigned delegated = 0; delegated < 2; delegated++) {
+		ClusterCtrcReceiptHandle source, image;
+		ClusterCtrcParticipantIdentity receiver;
+		ClusterItlSlotData slot;
+		ClusterCtrcParticipantEntry before, sender_before, *participant;
+		ClusterCtrcTargetV1 pending;
+		uint8 record[224];
+		uint64 index, registration;
+
+		UT_ASSERT(seed_merge_receiver(delegated, &source, &receiver, &slot, record, &index));
+		participant = &ctrc_participant_entries()[index];
+		before = *participant;
+		sender_before = *source.participant;
+		registration = pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation);
+		UT_ASSERT(cluster_ctrc_itl_delegate_accept_v1(&slot, &source.participant->identity,
+			&receiver, record, sizeof(record)));
+		UT_ASSERT(memcmp(participant, &before, sizeof(before)) == 0);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation), registration);
+		image_pending_target(&pending);
+		UT_ASSERT_EQ(cluster_ctrc_itl_image_prepare_v1(&slot, &source.participant->identity,
+			&receiver, record, sizeof(record), &pending, &image), CLUSTER_CTRC_PREPARE_READY);
+		UT_ASSERT(image.valid);
+		if (!image.valid)
+			continue;
+		UT_ASSERT_EQ(image.participant, participant);
+		UT_ASSERT_EQ(participant->receipt_count, before.receipt_count + 1);
+		UT_ASSERT(memcmp(participant->original_identity_v2, before.original_identity_v2, 144) == 0);
+		UT_ASSERT(memcmp(&participant->delegation_parent, &before.delegation_parent,
+			sizeof(before.delegation_parent)) == 0);
+		UT_ASSERT_EQ(participant->delegation_count, before.delegation_count);
+		UT_ASSERT(cluster_ctrc_receipt_cancel_shared(&image));
+		UT_ASSERT_EQ(image.receipt->state, CTRC_RECEIPT_CANCELLED);
+		UT_ASSERT(memcmp(source.participant, &sender_before, sizeof(sender_before)) == 0);
+		UT_ASSERT_EQ(source.participant->delegation_count, 1);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
+UT_TEST(test_registered_ordinary_receiver_merges_into_original_receipt_owner)
+{
+	for (unsigned delegated = 0; delegated < 2; delegated++) {
+		ClusterCtrcReceiptHandle source, added, duplicate;
+		ClusterCtrcParticipantIdentity receiver;
+		ClusterItlSlotData slot;
+		ClusterCtrcParticipantEntry before, *participant;
+		ClusterCtrcPublicationIdV1 publication;
+		ClusterCtrcTargetV1 target;
+		uint8 record[224];
+		uint64 index;
+
+		UT_ASSERT(seed_merge_receiver(delegated, &source, &receiver, &slot, record, &index));
+		participant = &ctrc_participant_entries()[index];
+		before = *participant;
+		fixture_receipt_inputs(&ctrc_origin_entries()[0], 1101, &publication, &target);
+		publication.requester_node_id = receiver.node_id;
+		publication.requester_boot_incarnation = receiver.boot_incarnation;
+		publication.capability_record_generation = receiver.capability_record_generation;
+		UT_ASSERT_EQ(cluster_ctrc_receipt_prepare_delegation_v1(&source.key,
+			&source.participant->identity, &receiver, source.participant->grant_generation,
+			&publication, &target, record, sizeof(record), &added), CLUSTER_CTRC_PREPARE_READY);
+		UT_ASSERT(added.valid);
+		if (!added.valid)
+			continue;
+		UT_ASSERT_EQ(added.participant, participant);
+		UT_ASSERT_EQ(participant->receipt_count, before.receipt_count + 1);
+		UT_ASSERT(memcmp(participant->original_identity_v2, before.original_identity_v2, 144) == 0);
+		UT_ASSERT(memcmp(&participant->delegation_parent, &before.delegation_parent,
+			sizeof(before.delegation_parent)) == 0);
+		UT_ASSERT_EQ(cluster_ctrc_receipt_prepare_delegation_v1(&source.key,
+			&source.participant->identity, &receiver, source.participant->grant_generation,
+			&publication, &target, record, sizeof(record), &duplicate), CLUSTER_CTRC_PREPARE_DUPLICATE);
+		UT_ASSERT_EQ(source.participant->delegation_count, 1);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
+UT_TEST(test_registered_receiver_merge_refuses_unknown_conflicting_or_closed_owner)
+{
+	for (unsigned delegated = 0; delegated < 2; delegated++) {
+		for (unsigned fault = 0; fault < 7; fault++) {
+			ClusterCtrcReceiptHandle source, image;
+			ClusterCtrcParticipantIdentity receiver;
+			ClusterItlSlotData slot;
+			ClusterCtrcParticipantEntry before, *participant;
+			ClusterCtrcTargetV1 pending;
+			uint8 record[224];
+			uint64 index, next;
+
+			UT_ASSERT(seed_merge_receiver(delegated, &source, &receiver, &slot, record, &index));
+			participant = &ctrc_participant_entries()[index];
+			switch (fault) {
+			case 0: participant->original_full_xid = InvalidFullTransactionId; break;
+			case 1: MemSet(participant->original_identity_v2, 0, 144); break;
+			case 2:
+				participant->original_full_xid = FullTransactionIdFromEpochAndXid(8, slot.xid);
+				UT_ASSERT(ctrc_origin_fullxid_encode_v2(&source.key,
+					delegated ? &participant->delegation_parent.receiver : &receiver,
+					participant->grant_generation, participant->original_full_xid,
+					participant->original_identity_v2));
+				break;
+			case 3: participant->state = CTRC_PARTICIPANT_CLOSED_DRAINING; break;
+			case 4: participant->identity.boot_incarnation++; break;
+			case 5: participant->grant_generation++; break;
+			case 6: participant->delegation_count = 1; break;
+			}
+			before = *participant;
+			next = CtrcShared->global_journal_generation;
+			UT_ASSERT(!cluster_ctrc_itl_delegate_accept_v1(&slot, &source.participant->identity,
+				&receiver, record, sizeof(record)));
+			image_pending_target(&pending);
+			UT_ASSERT_EQ(cluster_ctrc_itl_image_prepare_v1(&slot, &source.participant->identity,
+				&receiver, record, sizeof(record), &pending, &image), CLUSTER_CTRC_PREPARE_REFUSED);
+			UT_ASSERT(ctrc_bytes_zero(&image, sizeof(image)));
+			UT_ASSERT(memcmp(participant, &before, sizeof(before)) == 0);
+			UT_ASSERT_EQ(CtrcShared->global_journal_generation, next);
+			UT_ASSERT_EQ(source.participant->delegation_count, 1);
+			UT_ASSERT_EQ(held_count, 0);
+		}
+	}
+}
+
+UT_TEST(test_registered_receiver_merge_does_not_extend_foreign_mx_domain)
+{
+	for (unsigned delegated = 0; delegated < 2; delegated++) {
+		for (unsigned kind = CTRC_REF_CURRENT_MX_LOCKER; kind <= CTRC_REF_HOT_FOLLOW_EDGE; kind++) {
+			ClusterCtrcReceiptHandle source, refused;
+			ClusterCtrcParticipantIdentity receiver;
+			ClusterItlSlotData slot;
+			ClusterCtrcParticipantEntry before, *participant;
+			ClusterCtrcPublicationIdV1 publication;
+			ClusterCtrcTargetV1 target;
+			uint8 record[224];
+			uint64 index;
+
+			UT_ASSERT(seed_merge_receiver(delegated, &source, &receiver, &slot, record, &index));
+			participant = &ctrc_participant_entries()[index];
+			before = *participant;
+			fixture_receipt_inputs(&ctrc_origin_entries()[0], 1102, &publication, &target);
+			publication.requester_node_id = receiver.node_id;
+			publication.requester_boot_incarnation = receiver.boot_incarnation;
+			publication.capability_record_generation = receiver.capability_record_generation;
+			publication.reference_kind = kind;
+			publication.target_kind = CTRC_TARGET_PAGE_PENDING_OFFNUM;
+			publication.member_ordinal = 0;
+			publication.member_role = 1;
+			publication.descriptor_hash = 17;
+			target.kind = CTRC_TARGET_PAGE_PENDING_OFFNUM;
+			target.page_operation_kind = 0;
+			target.intended_descriptor_hash = 17;
+			UT_ASSERT_EQ(cluster_ctrc_receipt_prepare_delegation_v1(&source.key,
+				&source.participant->identity, &receiver, source.participant->grant_generation,
+				&publication, &target, record, sizeof(record), &refused), CLUSTER_CTRC_PREPARE_REFUSED);
+			UT_ASSERT(ctrc_bytes_zero(&refused, sizeof(refused)));
+			UT_ASSERT(memcmp(participant, &before, sizeof(before)) == 0);
+			UT_ASSERT_EQ(source.participant->delegation_count, 1);
+			UT_ASSERT_EQ(held_count, 0);
+		}
+	}
+}
+
 int
 main(void)
 {
@@ -8062,7 +8270,7 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(181);
+	UT_PLAN(185);
 	UT_RUN(test_prepare_path_namespace_precedes_input_and_resets_output);
 	UT_RUN(test_prepare_path_input_precedes_journal_exhaustion);
 	UT_RUN(test_prepare_path_chain_precedes_locator_and_keeps_blocked_state);
@@ -8247,6 +8455,10 @@ main(void)
 	UT_RUN(test_image_publication_cannot_be_forged_through_ordinary_publication_api);
 	UT_RUN(test_actual_gcs_install_receipt_binds_original_fullxid_and_cancels_only_before_copy);
 	UT_RUN(test_actual_gcs_install_refused_after_copy_keeps_prepared_receipt_and_parent);
+	UT_RUN(test_registered_image_receiver_merges_without_new_parent_or_source_retirement);
+	UT_RUN(test_registered_ordinary_receiver_merges_into_original_receipt_owner);
+	UT_RUN(test_registered_receiver_merge_refuses_unknown_conflicting_or_closed_owner);
+	UT_RUN(test_registered_receiver_merge_does_not_extend_foreign_mx_domain);
 	free(CtrcShared);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

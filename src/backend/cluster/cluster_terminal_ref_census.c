@@ -455,6 +455,38 @@ ctrc_delegation_identity_encode(const ClusterCtrcParticipantIdentity *identity, 
 	ctrc_delegation_put_be(bytes + 24, identity->admission_record_generation, 8);
 }
 
+/* The caller has already authenticated the incoming first-hop carrier.
+ * A previously qualified receiver keeps its one original parent (or direct
+ * origin registration). The incoming sender's pending custody is not a new
+ * accepted edge and is never retired by this read-only merge decision. */
+static bool pg_attribute_unused()
+ctrc_participant_delegation_merge_matches(const ClusterCtrcParticipantEntry *participant,
+	const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcParticipantIdentity *receiver,
+	uint32 grant, const ClusterCtrcDelegationCustodyV1 *incoming_parent,
+	FullTransactionId incoming_full)
+{
+	const ClusterCtrcDelegationCustodyV1 *parent = &participant->delegation_parent;
+	bool direct = ctrc_bytes_zero(parent, sizeof(*parent));
+	FullTransactionId retained;
+
+	if (incoming_parent == NULL || incoming_parent->sequence == 0
+		|| participant->state != CTRC_PARTICIPANT_OPEN || participant->seal_generation != 0
+		|| participant->grant_generation != grant
+		|| memcmp(&participant->key, key, sizeof(*key)) != 0
+		|| memcmp(&participant->identity, receiver, sizeof(*receiver)) != 0
+		|| !ctrc_bytes_zero(participant->reserved8, sizeof(participant->reserved8))
+		|| !ctrc_participant_delegations_valid(participant)
+		|| !FullTransactionIdEquals(participant->original_full_xid, incoming_full)
+		/* An existing edge permits only its exact retry, handled by the
+		 * caller. A new boot/sequence cannot silently replace that edge. */
+		|| (!direct && parent->receiver.node_id == incoming_parent->receiver.node_id)
+		|| !cluster_ctrc_origin_fullxid_match_v2(participant->original_identity_v2,
+			sizeof(participant->original_identity_v2), key,
+			direct ? receiver : &parent->receiver, grant, &retained))
+		return false;
+	return FullTransactionIdEquals(retained, incoming_full);
+}
+
 
 static uint64
 ctrc_delegation_get_be(const uint8 *bytes, unsigned length)
@@ -6134,13 +6166,18 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 	 * these locks. Do not log, call an observer, or repeat a table probe here. */
 	if (received_origin_v2 != NULL && !participant_was_empty
 		&& (!FullTransactionIdIsValid(participant->original_full_xid)
-			|| memcmp(participant->original_identity_v2, received_origin_v2,
+			|| ((memcmp(participant->original_identity_v2, received_origin_v2,
 					  CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES) != 0
-			|| (received_parent != NULL
-				&& memcmp(&participant->delegation_parent, received_parent,
-					sizeof(*received_parent)) != 0))) {
+				 || (received_parent != NULL
+					 && memcmp(&participant->delegation_parent, received_parent,
+						 sizeof(*received_parent)) != 0))
+				&& (!ctrc_itl_reference_kind(publication->reference_kind)
+					|| !ctrc_participant_delegation_merge_matches(participant, key, identity,
+						grant_generation, received_parent, received_full))))) {
 		/* Numeric identity alone cannot retroactively establish original
-		 * custody. Exact duplicates preserve their first immutable bytes. */
+		 * custody. A merge must prove both original bindings; neither an
+		 * exact duplicate nor an ordinary ITL merge replaces the first
+		 * immutable bytes. Current-MX domains keep their original refusal. */
 		if (path_out != NULL)
 			*path_out = CLUSTER_CTRC_PREPARE_PATH_ORIGINAL_FULL_XID;
 		result = CLUSTER_CTRC_PREPARE_REFUSED;
@@ -6288,16 +6325,18 @@ cluster_ctrc_itl_delegate_accept_v1(const ClusterItlSlotData *slot,
 		*participant = fresh;
 		accepted = true;
 	} else {
-		/* No raw-only qualification or alternate-parent merge. Even a fully
-		 * drained local row keeps this original parent until subtree CLOSE. */
+		/* Merge only into an already qualified exact receiver. Even a fully
+		 * drained local row keeps its first parent until subtree CLOSE. */
 		accepted = participant->state == CTRC_PARTICIPANT_OPEN
 			&& participant->seal_generation == 0 && participant->grant_generation == grant
 			&& memcmp(&participant->key, &key, sizeof(key)) == 0
 			&& memcmp(&participant->identity, receiver, sizeof(*receiver)) == 0
 			&& FullTransactionIdEquals(participant->original_full_xid, original)
-			&& memcmp(participant->original_identity_v2, record + 8,
-				sizeof(participant->original_identity_v2)) == 0
-			&& memcmp(&participant->delegation_parent, &parent, sizeof(parent)) == 0
+			&& ((memcmp(participant->original_identity_v2, record + 8,
+					sizeof(participant->original_identity_v2)) == 0
+				 && memcmp(&participant->delegation_parent, &parent, sizeof(parent)) == 0)
+				|| ctrc_participant_delegation_merge_matches(participant, &key, receiver,
+					grant, &parent, original))
 			&& ctrc_participant_delegations_valid(participant);
 	}
 done:

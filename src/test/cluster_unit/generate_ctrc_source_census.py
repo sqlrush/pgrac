@@ -546,7 +546,8 @@ _classify_owners(
 _classify_owners(
     "CTRC_ORIGIN_PROVENANCE",
     "src/backend/cluster/cluster_terminal_ref_census.c",
-    ("ctrc_delegation_first_hop_match", "ctrc_participant_delegations_valid"),
+    ("ctrc_delegation_first_hop_match", "ctrc_participant_delegations_valid",
+     "ctrc_participant_delegation_merge_matches"),
     "REGISTERED_REFERENCE",
     "ALL_CTRC_REFERENCE_KINDS",
     "ALL_CTRC_TARGET_KINDS",
