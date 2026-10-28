@@ -6,6 +6,10 @@
  * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
+ * PGRAC MODIFICATIONS
+ *    Preflight native publication commands before ACL or catalog lookup.
+ *    Author: SqlRush <sqlrush@gmail.com>
+ *
  * IDENTIFICATION
  *		src/backend/commands/publicationcmds.c
  *
@@ -32,6 +36,11 @@
 #include "catalog/pg_publication_namespace.h"
 #include "catalog/pg_publication_rel.h"
 #include "catalog/pg_type.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_mode.h"
+#include "cluster/cluster_tt_local.h"
+#endif
 #include "commands/dbcommands.h"
 #include "commands/defrem.h"
 #include "commands/event_trigger.h"
@@ -43,6 +52,9 @@
 #include "parser/parse_collate.h"
 #include "parser/parse_relation.h"
 #include "storage/lmgr.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "tcop/utility.h"
+#endif
 #include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
@@ -78,6 +90,36 @@ static void PublicationAddSchemas(Oid pubid, List *schemas, bool if_not_exists,
 								  AlterPublicationStmt *stmt);
 static void PublicationDropSchemas(Oid pubid, List *schemas, bool missing_ok);
 
+
+#ifdef USE_PGRAC_CLUSTER
+/* Direct callers must bind before their first ACL query or catalog lock. */
+static void
+PreflightClusterSharedPublicationWrite(const char *command, bool alter)
+{
+	ClusterCanonicalTxnBinding binding;
+	TransactionId current_xid;
+	const char *action = alter ? "alteration" : "creation";
+
+	if (!cluster_shared_catalog || !cluster_storage_mode_enabled())
+		return;
+
+	PreventCommandIfReadOnly(command);
+	PreventCommandIfParallelMode(command);
+	PreventCommandDuringRecovery(command);
+	if (IsSubTransaction())
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("shared catalog %s does not support subtransactions", action)));
+	current_xid = GetCurrentTransactionIdIfAny();
+	if (TransactionIdIsValid(current_xid)
+		&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("shared catalog top-level transaction identity mismatch")));
+	if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("canonical ACTIVE publication failed before shared catalog %s", action)));
+}
+#endif
 
 static void
 parse_publication_options(ParseState *pstate,
@@ -753,6 +795,10 @@ CreatePublication(ParseState *pstate, CreatePublicationStmt *stmt)
 	List	   *relations = NIL;
 	List	   *schemaidlist = NIL;
 
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedPublicationWrite("CREATE PUBLICATION", false);
+#endif
+
 	/* must have CREATE privilege on database */
 	aclresult = object_aclcheck(DatabaseRelationId, MyDatabaseId, GetUserId(), ACL_CREATE);
 	if (aclresult != ACLCHECK_OK)
@@ -1385,6 +1431,10 @@ AlterPublication(ParseState *pstate, AlterPublicationStmt *stmt)
 	Relation	rel;
 	HeapTuple	tup;
 	Form_pg_publication pubform;
+
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedPublicationWrite("ALTER PUBLICATION", true);
+#endif
 
 	rel = table_open(PublicationRelationId, RowExclusiveLock);
 

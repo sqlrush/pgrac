@@ -1142,6 +1142,19 @@ test_cluster_fresh_tsearch.inc: $(top_srcdir)/src/backend/commands/tsearchcmds.c
 	     /^}/ { emit=0; entry=0 } \
 	     END { if (helpers > 1 || entries != 6 || cuts != 6 || emit || entry) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
+test_cluster_fresh_publication.inc: $(top_srcdir)/src/backend/commands/publicationcmds.c Makefile
+	awk '/^PreflightClusterSharedPublicationWrite\(/ \
+	     { print "static void"; emit=1; helpers++ } \
+	     /^CreatePublication\(/ { print "ObjectAddress"; emit=1; creating=1; entries++ } \
+	     /^AlterPublication\(/ { print "void"; emit=1; creating=0; entries++ } \
+	     emit { print } \
+	     emit && creating && /aclresult = object_aclcheck\(DatabaseRelationId, MyDatabaseId, GetUserId\(\), ACL_CREATE\);/ \
+	     { print "return InvalidObjectAddress; }"; emit=0; cuts++ } \
+	     emit && !creating && /rel = table_open\(PublicationRelationId, RowExclusiveLock\);/ \
+	     { print "return; }"; emit=0; cuts++ } \
+	     /^}/ { emit=0 } \
+	     END { if (helpers > 1 || entries != 2 || cuts != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
 test_cluster_fresh_scope: test_cluster_fresh_scope.c unit_test.h \
 		test_cluster_fresh_control.inc test_cluster_fresh_startup.inc test_cluster_fresh_read.inc \
 		test_cluster_fresh_boolean.inc test_cluster_fresh_index.inc test_cluster_fresh_utility.inc \
@@ -1154,7 +1167,8 @@ test_cluster_fresh_scope: test_cluster_fresh_scope.c unit_test.h \
 		test_cluster_fresh_access_method.inc test_cluster_fresh_function.inc test_cluster_fresh_fdw.inc \
 		test_cluster_fresh_foreign_server.inc test_cluster_fresh_user_mapping.inc \
 		test_cluster_fresh_statistics_alter.inc test_cluster_fresh_operator.inc \
-		test_cluster_fresh_opclass.inc test_cluster_fresh_aggregate.inc test_cluster_fresh_tsearch.inc
+		test_cluster_fresh_opclass.inc test_cluster_fresh_aggregate.inc test_cluster_fresh_tsearch.inc \
+		test_cluster_fresh_publication.inc
 	$(CC) $(CFLAGS) -Wno-unused-variable -Wno-unused-but-set-variable $(CPPFLAGS) $< \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 # PGRAC: link the real durable-prefix codec/reader, not a test copy.
@@ -6467,7 +6481,8 @@ clean distclean maintainer-clean:
 		test_cluster_fresh_access_method.inc test_cluster_fresh_function.inc test_cluster_fresh_fdw.inc \
 		test_cluster_fresh_foreign_server.inc test_cluster_fresh_user_mapping.inc \
 		test_cluster_fresh_statistics_alter.inc test_cluster_fresh_operator.inc \
-		test_cluster_fresh_opclass.inc test_cluster_fresh_aggregate.inc test_cluster_fresh_tsearch.inc
+		test_cluster_fresh_opclass.inc test_cluster_fresh_aggregate.inc test_cluster_fresh_tsearch.inc \
+		test_cluster_fresh_publication.inc
 	rm -f $(TESTS) pgrac_fenced_live_rejoin_client probe_pgrac_fenced_cib \
 		test_cluster_tt_locator_stats.inc \
 		test_cluster_heap_inplace_version.inc test_cluster_heap_inplace_legacy_version.inc \
