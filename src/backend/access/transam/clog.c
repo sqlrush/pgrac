@@ -1240,6 +1240,11 @@ clog_relmap_base_read(const ClusterRecoveryRelmapSourceV1 *source,
 
 	PG_TRY();
 	{
+		/* The original getter releases XidGenLock before native or ROOT I/O.
+		 * Only this instance owns the corresponding native next counter. */
+		base.native_next_observed = origin == cluster_node_id;
+		if (base.native_next_observed)
+			base.next_full_xid = U64FromFullTransactionId(ReadNextFullTransactionId());
 		ok = clog_relmap_mutation_snapshot(origin, &mutation_generation)
 			&& (!existing || held->mutation_generation == mutation_generation)
 			&& cluster_wal_inputs_relmap_source_revalidate_v1(&original);
@@ -1254,6 +1259,8 @@ clog_relmap_base_read(const ClusterRecoveryRelmapSourceV1 *source,
 			ok = !held->invalidated && clog_relmap_mutation_matches(origin, mutation_generation)
 				&& (!existing || (base.truncation_horizon_observed == held->base.truncation_horizon_observed
 					&& base.oldest_clog_xid == held->base.oldest_clog_xid))
+				&& (!existing || (base.native_next_observed == held->base.native_next_observed
+					&& base.next_full_xid == held->base.next_full_xid))
 				&& clog_relmap_source_current(&original, origin)
 				&& clog_native_directory_ready(origin)
 				&& clog_recovery_page_identity(&disk, page, &before);
@@ -1292,6 +1299,8 @@ clog_relmap_base_read(const ClusterRecoveryRelmapSourceV1 *source,
 		/* There is no native lock or borrowed-output publication over ROOT I/O. */
 		ok = ok && cluster_wal_inputs_relmap_source_revalidate_v1(&original)
 			&& memcmp(source, &original, sizeof(original)) == 0 && !held->invalidated
+			&& (!base.native_next_observed
+				|| base.next_full_xid == U64FromFullTransactionId(ReadNextFullTransactionId()))
 			&& clog_relmap_mutation_matches(origin, mutation_generation);
 		if (!ok)
 			cluster_wal_inputs_relmap_source_fail_v1(&original);

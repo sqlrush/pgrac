@@ -1349,6 +1349,8 @@ fixture_cleanup(void)
 #include "test_cluster_clog_relmap_physical_mutation.inc"
 #include "test_cluster_clog_relmap_native_init.inc"
 #include "test_cluster_clog_relmap_horizon.inc"
+#include "test_cluster_clog_native_counter.inc"
+#include "test_cluster_clog_relmap_counter.inc"
 #include "test_cluster_clog_native_truncate.inc"
 
 int
@@ -1440,7 +1442,19 @@ main(void)
 		UT_RUN(native_clog_truncate_flush_error_retains_files_and_custody);
 		goto mutation_done;
 	}
-	UT_PLAN(73);
+	if (getenv("PGRAC_RELMAP_COUNTER_ONLY") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(relmap_own_actual_next_counter_is_only_an_observation);
+		UT_RUN(relmap_foreign_counter_never_borrows_local_next);
+		UT_RUN(relmap_own_counter_drift_keeps_original_baseline_and_fd);
+		UT_RUN(relmap_counter_change_during_first_or_final_root_refuses);
+		goto mutation_done;
+	}
+	UT_PLAN(77);
+	UT_RUN(relmap_own_actual_next_counter_is_only_an_observation);
+	UT_RUN(relmap_foreign_counter_never_borrows_local_next);
+	UT_RUN(relmap_own_counter_drift_keeps_original_baseline_and_fd);
+	UT_RUN(relmap_counter_change_during_first_or_final_root_refuses);
 	UT_RUN(native_clog_truncate_advances_before_wal_flush_and_delete);
 	UT_RUN(native_clog_truncate_without_old_segment_preserves_observation);
 	UT_RUN(native_clog_truncate_redo_uses_original_horizon_and_delete);
