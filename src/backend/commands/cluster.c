@@ -3,6 +3,10 @@
  * cluster.c
  *	  CLUSTER a table on an index.  This is now also used for VACUUM FULL.
  *
+ * PGRAC:
+ *    Preserve the shared CLUSTER scope before option or relation access.
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
  * There is hardly anything left of Paul Brown's original implementation...
  *
  *
@@ -37,6 +41,9 @@
 #include "catalog/pg_database.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/toasting.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h"
+#endif
 #include "commands/cluster.h"
 #include "commands/defrem.h"
 #include "commands/progress.h"
@@ -116,6 +123,13 @@ cluster(ParseState *pstate, ClusterStmt *stmt, bool isTopLevel)
 	Oid			indexOid = InvalidOid;
 	MemoryContext cluster_context;
 	List	   *rtcs;
+
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_config || cluster_shared_catalog)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("CLUSTER is not supported in shared mode"),
+						errdetail("PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED")));
+#endif
 
 	/* Parse option list */
 	foreach(lc, stmt->params)

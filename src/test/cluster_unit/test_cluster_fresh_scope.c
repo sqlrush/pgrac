@@ -65,6 +65,7 @@
 #include "catalog/pg_user_mapping.h"
 #include "commands/alter.h"
 #include "commands/collationcmds.h"
+#include "commands/cluster.h"
 #include "commands/comment.h"
 #include "commands/conversioncmds.h"
 #include "commands/dbcommands.h"
@@ -281,9 +282,18 @@ ReadControlFile(void)
 {
 	legacy_calls++; /* Non-shared native route is not replaced. */
 }
+static bool cluster_scope_lookup_active, cluster_scope_expected_top;
+static unsigned cluster_scope_lookups, cluster_scope_restrictions, cluster_scope_bad_lookup;
+static const RangeVar *cluster_scope_expected_relation;
 void
 PreventInTransactionBlock(bool top, const char *stmt)
 {
+	if (cluster_scope_lookup_active) {
+		cluster_scope_restrictions++;
+		if (top != cluster_scope_expected_top || strcmp(stmt, "CLUSTER") != 0)
+			cluster_scope_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before the original restriction or transaction work. */
+	}
 	if (database_options_lookup_active) {
 		database_options_restrictions++;
 		if (top != database_options_expected_top
@@ -8103,6 +8113,13 @@ Oid
 RangeVarGetRelidExtended(const RangeVar *relation, LOCKMODE lockmode, uint32 flags,
 						 RangeVarGetRelidCallback callback, void *callback_arg)
 {
+	if (cluster_scope_lookup_active) {
+		cluster_scope_lookups++;
+		if (relation != cluster_scope_expected_relation || lockmode != AccessExclusiveLock
+			|| flags != 0 || callback != RangeVarCallbackOwnsTable || callback_arg != NULL)
+			cluster_scope_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before the real query, lock or permission callback. */
+	}
 	if (matview_scope_lookup_active) {
 		matview_scope_lookups++;
 		if (relation != matview_scope_expected_relation
@@ -20181,10 +20198,249 @@ UT_TEST(test_native_matview_scope_preserves_existing_supported_top_binding)
 	matview_scope_lookup_active = false;
 }
 
+/* Two original entry fragments retain the option loop and first-dependency routing.
+ * Both boundaries stop before native relation or transaction work; downstream
+ * single/partitioned-table processing is not part of this ordering fixture. */
+#include "test_cluster_fresh_cluster_scope.inc"
+static RangeVar cluster_scope_relation;
+static ClusterStmt native_cluster_scope_statement;
+static bool native_cluster_scope_top;
+static DefElem cluster_scope_option;
+static Integer cluster_scope_integer;
+static String cluster_scope_string;
+static ListCell cluster_scope_option_cell;
+static List cluster_scope_options;
+static RangeVar cluster_scope_warm_relation;
+static AlterObjectSchemaStmt cluster_scope_warm_statement;
+
+static void
+reset_native_cluster_scope(unsigned form, bool top)
+{
+	unsigned target = form / 8, option = form % 8;
+	const char *strings[] = { "true", "false", "on", "off" };
+
+	reset_create_preflight();
+	cluster_scope_lookup_active = true;
+	cluster_scope_lookups = cluster_scope_restrictions = cluster_scope_bad_lookup = 0;
+	native_cluster_scope_top = cluster_scope_expected_top = top;
+	cluster_scope_relation
+		= (RangeVar){ .type = T_RangeVar,
+					  .schemaname = target == 2 || target == 4 ? "cluster_schema" : NULL,
+					  .relname = "native_cluster_table",
+					  .inh = true,
+					  .relpersistence = RELPERSISTENCE_PERMANENT,
+					  .location = -1 };
+	cluster_scope_expected_relation = target == 0 ? NULL : &cluster_scope_relation;
+	cluster_scope_integer = (Integer){ .type = T_Integer, .ival = option == 3 ? 1 : 0 };
+	cluster_scope_string
+		= (String){ .type = T_String,
+					.sval = (char *)(option >= 4 ? strings[option - 4] : "unused") };
+	cluster_scope_option = (DefElem){ .type = T_DefElem,
+									  .defnamespace = NULL,
+									  .defname = "verbose",
+									  .arg = option < 2	  ? NULL
+											 : option < 4 ? (Node *)&cluster_scope_integer
+														  : (Node *)&cluster_scope_string,
+									  .defaction = DEFELEM_UNSPEC,
+									  .location = -1 };
+	cluster_scope_option_cell = (ListCell){ .ptr_value = &cluster_scope_option };
+	cluster_scope_options = (List){ .type = T_List,
+									.length = 1,
+									.max_length = 1,
+									.elements = &cluster_scope_option_cell };
+	native_cluster_scope_statement
+		= (ClusterStmt){ .type = T_ClusterStmt,
+						 .relation = target == 0 ? NULL : &cluster_scope_relation,
+						 .indexname = target >= 3 ? "native_cluster_index" : NULL,
+						 .params = option == 0 ? NIL : &cluster_scope_options };
+	cluster_scope_warm_relation
+		= (RangeVar){ .type = T_RangeVar, .relname = "supported_warm_table" };
+	cluster_scope_warm_statement
+		= (AlterObjectSchemaStmt){ .type = T_AlterObjectSchemaStmt,
+								   .objectType = OBJECT_TABLE,
+								   .relation = &cluster_scope_warm_relation,
+								   .newschema = "supported_warm_destination",
+								   .missing_ok = false };
+}
+
+static void
+native_cluster_scope_entry(void)
+{
+	cluster(NULL, &native_cluster_scope_statement, native_cluster_scope_top);
+}
+
+static void
+assert_native_cluster_scope_result(unsigned form, bool blocked, int caught)
+{
+	UT_ASSERT_EQ(caught, blocked ? 1 : 2);
+	UT_ASSERT_EQ(error_code, blocked ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+	if (blocked) {
+		UT_ASSERT_STR_EQ(error_message, "CLUSTER is not supported in shared mode");
+		UT_ASSERT_STR_EQ(error_detail,
+						 "PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+	}
+	UT_ASSERT_EQ(cluster_scope_lookups, !blocked && form >= 8 ? 1 : 0);
+	UT_ASSERT_EQ(cluster_scope_restrictions, !blocked && form < 8 ? 1 : 0);
+	UT_ASSERT_EQ(cluster_scope_bad_lookup, 0);
+}
+
+UT_TEST(test_native_cluster_scope_matches_utility_before_first_dependency)
+{
+	for (unsigned form = 0; form < 40; form++) {
+		for (unsigned top = 0; top < 2; top++) {
+			for (unsigned mode = 0; mode < 8; mode++) {
+				bool blocked = (mode & 5) != 0;
+				int caught;
+
+				reset_native_cluster_scope(form, top != 0);
+				set_native_operator_mode(mode);
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					create_sql_entry((Node *)&native_cluster_scope_statement);
+				UT_ASSERT_EQ(caught, blocked ? 1 : 0);
+				UT_ASSERT_EQ(error_code, blocked ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+				if (blocked) {
+					UT_ASSERT_STR_EQ(error_message, "CLUSTER is not supported in shared mode");
+					UT_ASSERT_STR_EQ(
+						error_detail,
+						"PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+				}
+				UT_ASSERT_EQ(cluster_scope_lookups + cluster_scope_restrictions + utility_xids
+								 + utility_prepares + utility_binds,
+							 0);
+				reset_error();
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_cluster_scope_entry();
+				assert_native_cluster_scope_result(form, blocked, caught);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+				UT_ASSERT_EQ(utility_top_xid, InvalidTransactionId);
+			}
+		}
+	}
+	cluster_scope_lookup_active = false;
+}
+
+UT_TEST(test_native_cluster_scope_precedes_context_child_top_and_publication)
+{
+	for (unsigned form = 0; form < 40; form++) {
+		for (unsigned top = 0; top < 2; top++) {
+			for (unsigned mode = 0; mode < 8; mode++) {
+				for (unsigned fault = 0; fault < 7; fault++) {
+					int caught;
+
+					reset_native_cluster_scope(form, top != 0);
+					set_native_operator_mode(mode);
+					XactReadOnly = fault == 0;
+					utility_parallel = fault == 1;
+					utility_recovery = fault == 2;
+					utility_in_child = fault == 3;
+					if (fault == 4 || fault == 5) {
+						utility_current_xid = 401;
+						utility_top_xid = fault == 4 ? 400 : InvalidTransactionId;
+					}
+					utility_bind_ok = fault != 6;
+					caught = sigsetjmp(boundary, 1);
+					if (!caught)
+						native_cluster_scope_entry();
+					assert_native_cluster_scope_result(form, (mode & 5) != 0, caught);
+					UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+					UT_ASSERT_EQ(utility_top_xid, fault == 4 ? 400 : InvalidTransactionId);
+					UT_ASSERT_EQ(utility_current_xid,
+								 fault == 4 || fault == 5 ? 401 : InvalidTransactionId);
+				}
+			}
+		}
+	}
+	cluster_scope_lookup_active = false;
+}
+
+UT_TEST(test_native_cluster_scope_preserves_existing_supported_top_binding)
+{
+	for (unsigned form = 0; form < 40; form++) {
+		for (unsigned top = 0; top < 2; top++) {
+			for (unsigned mode = 0; mode < 8; mode++) {
+				for (unsigned fault = 0; fault < 5; fault++) {
+					int caught;
+
+					reset_native_cluster_scope(form, top != 0);
+					create_sql_entry((Node *)&cluster_scope_warm_statement);
+					UT_ASSERT_EQ(utility_xids, 1);
+					UT_ASSERT_EQ(utility_prepares, 1);
+					UT_ASSERT_EQ(utility_binds, 1);
+					set_native_operator_mode(mode);
+					XactReadOnly = fault == 0;
+					utility_parallel = fault == 1;
+					utility_recovery = fault == 2;
+					utility_in_child = fault == 3;
+					utility_bind_ok = fault != 4;
+					caught = sigsetjmp(boundary, 1);
+					if (!caught)
+						native_cluster_scope_entry();
+					assert_native_cluster_scope_result(form, (mode & 5) != 0, caught);
+					UT_ASSERT_EQ(utility_xids, 1);
+					UT_ASSERT_EQ(utility_prepares, 1);
+					UT_ASSERT_EQ(utility_binds, 1);
+					UT_ASSERT_EQ(utility_top_xid, 400);
+					UT_ASSERT_EQ(utility_current_xid, 400);
+				}
+			}
+		}
+	}
+	cluster_scope_lookup_active = false;
+}
+
+UT_TEST(test_native_cluster_scope_preserves_original_option_error_precedence)
+{
+	for (unsigned target = 0; target < 5; target++) {
+		for (unsigned top = 0; top < 2; top++) {
+			for (unsigned mode = 0; mode < 8; mode++) {
+				for (unsigned bad = 0; bad < 3; bad++) {
+					bool blocked = (mode & 5) != 0;
+					int caught;
+
+					reset_native_cluster_scope(target * 8 + 1, top != 0);
+					set_native_operator_mode(mode);
+					if (bad == 0)
+						cluster_scope_option.defname = "unknown_cluster_option";
+					else if (bad == 1) {
+						cluster_scope_string.sval = "not_a_boolean";
+						cluster_scope_option.arg = (Node *)&cluster_scope_string;
+					} else {
+						cluster_scope_integer.ival = 2;
+						cluster_scope_option.arg = (Node *)&cluster_scope_integer;
+					}
+					caught = sigsetjmp(boundary, 1);
+					if (!caught)
+						native_cluster_scope_entry();
+					UT_ASSERT_EQ(caught, 1);
+					UT_ASSERT_EQ(error_code,
+								 blocked ? ERRCODE_FEATURE_NOT_SUPPORTED : ERRCODE_SYNTAX_ERROR);
+					UT_ASSERT_STR_EQ(error_message,
+									 blocked ? "CLUSTER is not supported in shared mode"
+									 : bad == 0
+										 ? "unrecognized CLUSTER option \"unknown_cluster_option\""
+										 : "verbose requires a Boolean value");
+					UT_ASSERT_STR_EQ(
+						error_detail,
+						blocked ? "PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED"
+								: "");
+					UT_ASSERT_EQ(cluster_scope_lookups + cluster_scope_restrictions + utility_xids
+									 + utility_prepares + utility_binds,
+								 0);
+					UT_ASSERT_EQ(cluster_scope_bad_lookup, 0);
+					UT_ASSERT_EQ(utility_top_xid, InvalidTransactionId);
+				}
+			}
+		}
+	}
+	cluster_scope_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(321);
+	UT_PLAN(325);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -20508,6 +20764,10 @@ main(void)
 	UT_RUN(test_native_matview_scope_matches_utility_before_relation_lock);
 	UT_RUN(test_native_matview_scope_precedes_context_child_top_and_publication);
 	UT_RUN(test_native_matview_scope_preserves_existing_supported_top_binding);
+	UT_RUN(test_native_cluster_scope_matches_utility_before_first_dependency);
+	UT_RUN(test_native_cluster_scope_precedes_context_child_top_and_publication);
+	UT_RUN(test_native_cluster_scope_preserves_existing_supported_top_binding);
+	UT_RUN(test_native_cluster_scope_preserves_original_option_error_precedence);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
