@@ -53,6 +53,7 @@
 #include "catalog/pg_ts_parser.h"
 #include "catalog/pg_ts_template.h"
 #include "catalog/pg_sequence.h"
+#include "catalog/pg_authid.h"
 #include "catalog/pg_type_d.h"
 #include "catalog/pg_user_mapping.h"
 #include "commands/alter.h"
@@ -12078,10 +12079,206 @@ UT_TEST(test_native_sequence_alter_utility_warm_guards_preserve_binding)
 	sequence_alter_lookup_active = false;
 }
 
+/* Native role alteration stops before local name validation and later catalogs.
+ * Role permissions, options, passwords and membership remain beyond this boundary. */
+static bool role_alter_lookup_active, role_alter_expect_binding;
+static unsigned role_alter_lookups, role_alter_unbound, role_alter_bad_lookup;
+static ParseState role_alter_parse_state;
+static RoleSpec role_alter_role;
+static Boolean role_alter_option_value;
+static DefElem role_alter_option;
+static ListCell role_alter_option_cell;
+static List role_alter_options;
+static AlterRoleStmt native_role_alter_statement;
+static Node *role_alter_expected_statement;
+
+void
+check_rolespec_name(const RoleSpec *role, const char *detail_msg)
+{
+	role_alter_lookups++;
+	if (role_alter_expect_binding && utility_binds == 0)
+		role_alter_unbound++;
+	if (!role_alter_lookup_active || role != &role_alter_role || detail_msg == NULL
+		|| strcmp(detail_msg, "Cannot alter reserved roles.") != 0)
+		role_alter_bad_lookup++;
+	siglongjmp(boundary, 2); /* Stop before real validation or later role queries/locks. */
+}
+
+#include "test_cluster_fresh_role_alter.inc"
+
+static void
+reset_native_role_alter(bool expect_binding, unsigned form)
+{
+	static const RoleSpecType types[]
+		= { ROLESPEC_CSTRING, ROLESPEC_CURRENT_ROLE, ROLESPEC_CURRENT_USER, ROLESPEC_SESSION_USER };
+
+	reset_create_preflight();
+	role_alter_lookup_active = true;
+	role_alter_expect_binding = expect_binding;
+	role_alter_lookups = role_alter_unbound = role_alter_bad_lookup = 0;
+	role_alter_parse_state = (ParseState){ 0 };
+	role_alter_role = (RoleSpec){ .type = T_RoleSpec,
+								  .roletype = types[form],
+								  .rolename = form == 0 ? "target_role" : NULL,
+								  .location = -1 };
+	role_alter_option_value = (Boolean){ .type = T_Boolean, .boolval = true };
+	role_alter_option = (DefElem){ .type = T_DefElem,
+								   .defname = "inherit",
+								   .arg = (Node *)&role_alter_option_value };
+	role_alter_option_cell.ptr_value = &role_alter_option;
+	role_alter_options = (List){ .type = T_List,
+								 .length = 1,
+								 .max_length = 1,
+								 .elements = &role_alter_option_cell };
+	native_role_alter_statement = (AlterRoleStmt){ .type = T_AlterRoleStmt,
+												   .role = &role_alter_role,
+												   .options = &role_alter_options,
+												   .action = 0 };
+	role_alter_expected_statement = (Node *)&native_role_alter_statement;
+}
+
+static void
+native_role_alter_entry(void)
+{
+	(void)AlterRole(&role_alter_parse_state, &native_role_alter_statement);
+}
+
+UT_TEST(test_native_role_alter_binds_before_first_query_in_all_profiles)
+{
+	for (unsigned form = 0; form < 4; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_role_alter(binds, form);
+			set_native_operator_mode(mode);
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_role_alter_entry();
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(role_alter_lookups, repeat + 1);
+				UT_ASSERT_EQ(role_alter_unbound, 0);
+				UT_ASSERT_EQ(role_alter_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	role_alter_lookup_active = false;
+}
+
+UT_TEST(test_native_role_alter_refuses_before_lookup_on_publication_child_and_top_errors)
+{
+	for (unsigned form = 0; form < 4; form++) {
+		for (unsigned failure = 0; failure < 5; failure++) {
+			bool allocated = failure == 0 || failure == 2;
+			int caught;
+
+			reset_native_role_alter(true, form);
+			if (failure == 0)
+				utility_bind_ok = false;
+			else if (failure == 1 || failure == 2) {
+				if (failure == 2)
+					create_sql_entry(role_alter_expected_statement);
+				utility_in_child = true;
+			} else {
+				utility_current_xid = 401;
+				utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_role_alter_entry();
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, failure == 0  ? ERRCODE_DATA_CORRUPTED
+									 : failure < 3 ? ERRCODE_FEATURE_NOT_SUPPORTED
+												   : ERRCODE_INTERNAL_ERROR);
+			UT_ASSERT_STR_EQ(
+				error_message,
+				failure == 0
+					? "canonical ACTIVE publication failed before shared catalog alteration"
+				: failure < 3 ? "shared catalog alteration does not support subtransactions"
+							  : "shared catalog top-level transaction identity mismatch");
+			UT_ASSERT_EQ(role_alter_lookups, 0);
+			UT_ASSERT_EQ(role_alter_unbound + role_alter_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_xids, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, failure == 2 ? 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, allocated || failure == 3 ? 400 : InvalidTransactionId);
+		}
+	}
+	role_alter_lookup_active = false;
+}
+
+UT_TEST(test_native_role_alter_context_guards_keep_nonshared_route)
+{
+	for (unsigned form = 0; form < 4; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+
+			for (unsigned guard = 0; guard < 3; guard++) {
+				int caught;
+
+				reset_native_role_alter(binds, form);
+				set_native_operator_mode(mode);
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_role_alter_entry();
+				UT_ASSERT_EQ(caught, binds ? 1 : 2);
+				UT_ASSERT_EQ(error_code, !binds		  ? 0
+										 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+													  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				UT_ASSERT_EQ(role_alter_lookups, binds ? 0 : 1);
+				UT_ASSERT_EQ(role_alter_unbound + role_alter_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	role_alter_lookup_active = false;
+}
+
+UT_TEST(test_native_role_alter_utility_warm_guards_preserve_binding)
+{
+	for (unsigned form = 0; form < 4; form++) {
+		for (unsigned guard = 0; guard < 4; guard++) {
+			int caught;
+
+			reset_native_role_alter(true, form);
+			create_sql_entry(role_alter_expected_statement);
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			XactReadOnly = guard == 1;
+			utility_parallel = guard == 2;
+			utility_recovery = guard == 3;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_role_alter_entry();
+			UT_ASSERT_EQ(caught, guard ? 1 : 2);
+			UT_ASSERT_EQ(error_code, !guard		  ? 0
+									 : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+												  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT_EQ(role_alter_lookups, guard ? 0 : 1);
+			UT_ASSERT_EQ(role_alter_unbound + role_alter_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_prepares, guard ? 1 : 2);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			UT_ASSERT_EQ(utility_top_xid, 400);
+		}
+	}
+	role_alter_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(181);
+	UT_PLAN(185);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -12263,6 +12460,10 @@ main(void)
 	UT_RUN(test_native_sequence_alter_refuses_before_lookup_on_publication_child_and_top_errors);
 	UT_RUN(test_native_sequence_alter_context_guards_keep_nonshared_route);
 	UT_RUN(test_native_sequence_alter_utility_warm_guards_preserve_binding);
+	UT_RUN(test_native_role_alter_binds_before_first_query_in_all_profiles);
+	UT_RUN(test_native_role_alter_refuses_before_lookup_on_publication_child_and_top_errors);
+	UT_RUN(test_native_role_alter_context_guards_keep_nonshared_route);
+	UT_RUN(test_native_role_alter_utility_warm_guards_preserve_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

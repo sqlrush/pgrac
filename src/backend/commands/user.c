@@ -3,6 +3,9 @@
  * user.c
  *	  Commands for manipulating roles (formerly called users).
  *
+ * PGRAC modifications:
+ *    Preflight native role alteration before role validation or catalog work.
+ *
  * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -25,6 +28,11 @@
 #include "catalog/pg_authid.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_db_role_setting.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_mode.h"
+#include "cluster/cluster_tt_local.h"
+#endif
 #include "commands/comment.h"
 #include "commands/dbcommands.h"
 #include "commands/defrem.h"
@@ -33,6 +41,9 @@
 #include "libpq/crypt.h"
 #include "miscadmin.h"
 #include "storage/lmgr.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "tcop/utility.h"
+#endif
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/catcache.h"
@@ -648,6 +659,30 @@ AlterRole(ParseState *pstate, AlterRoleStmt *stmt)
 	Oid			roleid;
 	Oid			currentUserId = GetUserId();
 	GrantRoleOptions popt;
+
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_catalog && cluster_storage_mode_enabled()) {
+		ClusterCanonicalTxnBinding binding;
+		TransactionId current_xid;
+
+		PreventCommandIfReadOnly("ALTER ROLE");
+		PreventCommandIfParallelMode("ALTER ROLE");
+		PreventCommandDuringRecovery("ALTER ROLE");
+		if (IsSubTransaction())
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("shared catalog alteration does not support subtransactions")));
+		current_xid = GetCurrentTransactionIdIfAny();
+		if (TransactionIdIsValid(current_xid)
+			&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("shared catalog top-level transaction identity mismatch")));
+		if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+			ereport(
+				ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("canonical ACTIVE publication failed before shared catalog alteration")));
+	}
+#endif
 
 	check_rolespec_name(stmt->role,
 						_("Cannot alter reserved roles."));
