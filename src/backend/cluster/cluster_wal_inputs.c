@@ -15,6 +15,7 @@
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_epoch.h"
+#include "cluster/cluster_grd.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ir.h"
 #include "cluster/cluster_qvotec.h"
@@ -22,6 +23,7 @@
 #include "cluster/cluster_recovery_tt_record.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_side_online_plan.h"
+#include "cluster/cluster_startup_phase.h"
 #include "cluster/cluster_wal_inputs.h"
 #include "cluster/cluster_wal_retention.h"
 #include "cluster/cluster_wal_thread.h"
@@ -32,6 +34,11 @@
 #include "miscadmin.h"
 #include "postmaster/bgwriter.h"
 #include "postmaster/interrupt.h"
+#include "postmaster/startup.h"
+#include "storage/latch.h"
+#include "storage/lwlock.h"
+#include "storage/proc.h"
+#include "utils/wait_event.h"
 #include "utils/resowner.h"
 
 #include "cluster_control_root_private.h"
@@ -490,17 +497,195 @@ cluster_wal_inputs_release_v1(ClusterWalInputsV1 **inputs)
 	*inputs = NULL;
 }
 
+/* Preserve only this invocation's input identity across its own failed CF
+ * request. These local snapshots grant neither retention nor ROOT authority.
+ * Initial selection and the scratch checkpoint have no pin to borrow.
+ * Author: SqlRush <sqlrush@gmail.com> */
+typedef struct WalInputsCfWait {
+	PGPROC *proc;
+	Latch *latch;
+	ResourceOwner owner;
+	int pid;
+	uint64 epoch, generation, boot;
+	bool recovery, first, pin_current;
+	uint64 system_identifier;
+	uint8 storage_uuid[16];
+	ClusterControlRootFileToken token;
+	ClusterWalReadPinV1 *pin;
+	ClusterWalReadPinOwnerV1 pin_owner;
+	WalInputsPurpose purpose;
+	ClusterRecoveryTxIoScopeV1 tx;
+	ClusterRecoveryCtrcIoScopeV1 ctrc;
+	uint16 thread_count;
+	uint16 threads[CLUSTER_WAL_RETENTION_MAX_THREADS];
+} WalInputsCfWait;
+
+static void
+inputs_cf_wait_capture(WalInputsCfWait *original, ClusterWalInputsV1 *inputs, bool first)
+{
+	memset(original, 0, sizeof(*original));
+	original->proc = MyProc;
+	original->latch = MyLatch;
+	original->owner = CurrentResourceOwner;
+	original->pid = MyProcPid;
+	original->epoch = cluster_epoch_get_current();
+	original->generation = cluster_grd_redeclare_generation();
+	original->boot = cluster_qvotec_get_self_incarnation();
+	original->recovery = RecoveryInProgress();
+	original->first = first;
+	original->system_identifier = inputs->system_identifier;
+	memcpy(original->storage_uuid, inputs->storage_uuid, sizeof(original->storage_uuid));
+	original->token = inputs->token;
+	original->pin = inputs->pin;
+	original->purpose = inputs->purpose;
+	original->tx = inputs->tx;
+	original->ctrc = inputs->ctrc;
+	original->thread_count = inputs->thread_count;
+	if (inputs->thread_count <= CLUSTER_WAL_RETENTION_MAX_THREADS)
+		memcpy(original->threads, inputs->threads,
+			   (Size)inputs->thread_count * sizeof(inputs->threads[0]));
+	if (inputs->pin != NULL && CritSectionCount == 0 && !LWLockHeldByMe(ControlFileLock))
+		original->pin_current = cluster_wal_read_pin_owner_v1(inputs->pin, &original->pin_owner);
+}
+
+static bool
+inputs_cf_wait_current(const WalInputsCfWait *original, ClusterWalInputsV1 *inputs)
+{
+	if (original->proc == NULL || original->latch == NULL || original->owner == NULL
+		|| MyProc != original->proc || MyLatch != original->latch || MyProcPid != original->pid
+		|| CurrentResourceOwner != original->owner || !AmStartupProcess()
+		|| MyBackendType != B_STARTUP || !cluster_enabled || !cluster_shared_config
+		|| !cluster_controlfile_shared_authority || CritSectionCount != 0
+		|| LWLockHeldByMe(ControlFileLock) || ShutdownRequestPending || original->epoch == 0
+		|| original->generation == 0 || original->boot == 0
+		|| cluster_epoch_get_current() != original->epoch
+		|| cluster_grd_redeclare_generation() != original->generation
+		|| cluster_qvotec_get_self_incarnation() != original->boot
+		|| RecoveryInProgress() != original->recovery
+		|| !cluster_recovery_transport_components_current()
+		|| inputs->system_identifier != original->system_identifier
+		|| memcmp(inputs->storage_uuid, original->storage_uuid, sizeof(original->storage_uuid)) != 0
+		|| memcmp(&inputs->token, &original->token, sizeof(original->token)) != 0
+		|| inputs->pin != original->pin || inputs->purpose != original->purpose
+		|| original->purpose == WAL_INPUTS_ONLINE || inputs->stale || inputs->suspended
+		|| inputs->thread_count != original->thread_count
+		|| original->thread_count > CLUSTER_WAL_RETENTION_MAX_THREADS
+		|| memcmp(inputs->threads, original->threads,
+				  (Size)original->thread_count * sizeof(inputs->threads[0]))
+			   != 0
+		|| memcmp(&inputs->tx, &original->tx, sizeof(original->tx)) != 0
+		|| memcmp(&inputs->ctrc, &original->ctrc, sizeof(original->ctrc)) != 0
+		|| !inputs_owned(inputs) || !inputs_scope_role(inputs))
+		return false;
+	if (original->pin != NULL)
+		return !original->first && original->pin_current && original->pin_owner.pin == original->pin
+			   && cluster_wal_read_pin_owner_current_v1(&original->pin_owner)
+			   && inputs_current(inputs);
+	return original->thread_count == 0
+		   && (original->first || original->purpose == WAL_INPUTS_COLD_REPLAY);
+}
+
+static void
+inputs_cf_wait(const WalInputsCfWait *original, ClusterWalInputsV1 *inputs,
+			   const ClusterCfAttemptObservation *attempt)
+{
+	ClusterCfRetirementSnapshot retiring;
+	bool empty = attempt->owner_state_at_return == CLUSTER_LOCK_OWNER_EMPTY;
+	bool empty_waited = false;
+	const char *reason = "CONTEXT_CHANGED_AFTER_WAIT_SLICE";
+
+	if (!inputs_cf_wait_current(original, inputs) || cluster_cf_held(ExclusiveLock))
+		goto refuse;
+	reason = "CF_WAIT_IDENTITY_OR_COMPLETION";
+	if (!empty
+		&& (!cluster_cf_retirement_snapshot(ShareLock, NULL, &retiring)
+			|| retiring.cookie != attempt->control_owner_id
+			|| retiring.registry.message.key.holder.request_id != attempt->request_id
+			|| retiring.registry.message.key.holder.cluster_epoch != attempt->request_epoch))
+		goto refuse;
+	for (;;) {
+		ClusterCfRetirementSnapshot current;
+		bool held;
+
+		HandleStartupProcInterrupts();
+		CHECK_FOR_INTERRUPTS();
+		reason = "CONTEXT_CHANGED_AFTER_WAIT_SLICE";
+		if (!inputs_cf_wait_current(original, inputs))
+			goto refuse;
+		ResetLatch(MyLatch);
+		held = cluster_cf_held(ShareLock);
+		if (!held && !cluster_cf_held(ExclusiveLock)) {
+			if (!empty && cluster_cf_release_completed(ShareLock, retiring.cookie))
+				return;
+			if (empty) {
+				if (empty_waited)
+					return;
+				empty_waited = true;
+				(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+								WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
+				continue;
+			}
+		}
+		reason = "CF_WAIT_IDENTITY_OR_COMPLETION";
+		if (empty || !held || cluster_cf_held(ExclusiveLock)
+			|| !cluster_cf_retirement_snapshot(ShareLock, NULL, &current)
+			|| current.cookie != retiring.cookie
+			|| current.registry.handle.slot != retiring.registry.handle.slot
+			|| current.registry.handle.generation != retiring.registry.handle.generation
+			|| memcmp(&current.registry.owner, &retiring.registry.owner,
+					  sizeof(current.registry.owner))
+				   != 0
+			|| memcmp(&current.registry.message.key, &retiring.registry.message.key,
+					  sizeof(current.registry.message.key))
+				   != 0)
+			goto refuse;
+		cluster_lock_owners_service_poll();
+		cluster_cf_retirement_poll();
+		if (cluster_cf_held(ShareLock))
+			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+							WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
+	}
+refuse:
+	ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+					errmsg("WAL input selection cannot continue its control-file wait"),
+					errdetail("PGRAC_FAMILY=STARTUP_CONTROL consumer=wal_inputs reason=%s "
+							  "cookie=" UINT64_FORMAT " request=" UINT64_FORMAT,
+							  reason, attempt->control_owner_id, attempt->request_id)));
+}
+
 static ClusterControlRootResult
 inputs_root(ClusterWalInputsV1 *inputs, WalInputsWork *work, bool first)
 {
 	ClusterControlRootFileToken token;
 	ClusterControlRootResult result;
+	WalInputsCfWait original;
+	bool startup = MyBackendType == B_STARTUP && inputs->purpose != WAL_INPUTS_ONLINE;
+	bool waited = false;
 
 	if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
-	work->cf_attempted = true;
-	if (!cluster_cf_lock(ShareLock))
-		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	if (startup)
+		inputs_cf_wait_capture(&original, inputs, first);
+	for (;;) {
+		ClusterCfAttemptObservation attempt;
+		uint64 before = startup ? cluster_cf_attempt_sequence() : 0;
+
+		work->cf_attempted = true;
+		if (cluster_cf_lock(ShareLock))
+			break;
+		if (!startup || !cluster_cf_last_attempt_since(before, &attempt)
+			|| !cluster_cf_attempt_wait_slice(&attempt) || attempt.mode != ShareLock)
+			return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+		/* The failed request is already abandoned. Only its original
+		 * registry owner may finish cleanup; do not re-release it as a hold. */
+		work->cf_attempted = false;
+		inputs_cf_wait(&original, inputs, &attempt);
+		waited = true;
+	}
+	if (waited
+		&& (!inputs_cf_wait_current(&original, inputs)
+			|| !cluster_cf_held_is_clusterwide(ShareLock)))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	result = cluster_control_root_v3_read_control_locked(
 		inputs->storage_uuid, inputs->system_identifier, &work->root, &work->common, &token);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
@@ -3400,6 +3585,7 @@ cluster_wal_inputs_cold_checkpoint_v1(const ClusterControlRootSnapshot *expected
 	ClusterWalInputsV1 *scratch;
 	WalInputsWork *work;
 	ClusterControlRootResult result;
+	ClusterControlRootSnapshot original;
 
 	if (inputs_overlap(expected, sizeof(*expected), out, sizeof(*out))
 		|| inputs_overlap(root_token, sizeof(*root_token), out, sizeof(*out)))
@@ -3420,9 +3606,13 @@ cluster_wal_inputs_cold_checkpoint_v1(const ClusterControlRootSnapshot *expected
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	original = *expected;
 	scratch = palloc0(sizeof(*scratch));
-	scratch->system_identifier = expected->identity.system_identifier;
-	memcpy(scratch->storage_uuid, expected->identity.storage_uuid, 16);
+	scratch->pid = getpid();
+	scratch->owner = CurrentResourceOwner;
+	scratch->purpose = WAL_INPUTS_COLD_REPLAY;
+	scratch->system_identifier = original.identity.system_identifier;
+	memcpy(scratch->storage_uuid, original.identity.storage_uuid, 16);
 	scratch->token = *root_token;
 	work = palloc0(sizeof(*work));
 	PG_TRY();
@@ -3431,7 +3621,7 @@ cluster_wal_inputs_cold_checkpoint_v1(const ClusterControlRootSnapshot *expected
 
 		result = inputs_root(scratch, work, false);
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-			result = inputs_cold_checkpoint_select(scratch, work, expected);
+			result = inputs_cold_checkpoint_select(scratch, work, &original);
 		inputs_unlock(work);
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			result = cluster_wal_claim_v2_read(cluster_wal_threads_dir,
