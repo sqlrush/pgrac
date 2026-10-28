@@ -557,8 +557,9 @@ cluster_test_pcm_clock_gettime(clockid_t clock_id, struct timespec *time_out)
 static union {
 	uint64 force_align;
 	/* Cover the original 24-entry pump cohort including bounded per-holder
-	 * grant provenance. Keep the exact ShmemInitStruct fit assertion below. */
-	char data[2162688];
+	 * grant provenance and full conditional send bodies. Keep the exact
+	 * ShmemInitStruct fit assertion below. */
+	char data[2752512];
 } fake_pcm_header;
 
 static union {

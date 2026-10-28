@@ -5596,7 +5596,7 @@ test_cluster_pcm_settlement_ingress.inc: $(top_srcdir)/src/backend/cluster/clust
 	     END { if (count != 4 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_pcm_lock test_cluster_pcm_object_retire test_cluster_pcm_stop_cv test_cluster_pcm_read_grant test_cluster_resource_x_acquire_ingress: %: %.c test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
+test_cluster_pcm_lock test_cluster_pcm_object_retire test_cluster_pcm_stop_cv test_cluster_pcm_read_grant test_cluster_resource_x_acquire_ingress test_cluster_resource_x_decision_send: %: %.c test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
 		test_cluster_pcm_master_durable.inc \
 		test_cluster_pcm_bootstrap_tick.inc \
 		test_cluster_pcm_settlement_ingress.inc \
@@ -10094,3 +10094,24 @@ clean distclean maintainer-clean: clean-acquire-ingress
 .PHONY: clean-acquire-ingress
 clean-acquire-ingress:
 	rm -f test_cluster_resource_x_acquire_candidate.inc test_cluster_resource_x_acquire_candidate.inc.tmp
+
+# Actual original master payload containers; no copied test layout.
+TESTS += test_cluster_resource_x_decision_send
+all: test_cluster_resource_x_decision_send
+
+test_cluster_resource_x_decision_send: test_cluster_resource_x_decision_owner_layout.inc \
+		cluster_unit_port_stubs.o cluster_catalog_trace_test.o
+
+test_cluster_resource_x_decision_owner_layout.inc: $(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c Makefile
+	awk '/^#define PGRAC_RESOURCE_X_RETAINED_SENDER_GENERATION / { print; n++ } \
+	     /^typedef struct ClusterPcmResourceXMasterRequest {/ { emit=1; n++ } \
+	     /^typedef struct ClusterPcmResourceX(MasterRequest|BootstrapReceipt) / { skip=1 } \
+	     emit && !skip { print } /^}/ { skip=0 } \
+	     /^} ClusterPcmResourceXMasterState;/ { emit=0; n++ } \
+	     END { if (n != 3 || emit || skip) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+clean distclean maintainer-clean: clean-decision-send
+.PHONY: clean-decision-send
+clean-decision-send:
+	rm -f test_cluster_resource_x_decision_send test_cluster_resource_x_decision_owner_layout.inc test_cluster_resource_x_decision_owner_layout.inc.tmp
