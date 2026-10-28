@@ -75,6 +75,7 @@ typedef struct NativeInventoryRelmapXid {
 	ClusterRecoveryRelmapPendingAllNativeV1 *all_native; /* optional private whole-set output */
 	ClusterColdXidProgressV1 generations[CLUSTER_WAL_INPUTS_MAX]; /* other original sources */
 	bool side_clog; /* opt-in exact carriers during this same private reread */
+	bool hold_native_pages; /* original history owns the complete derived group */
 	uint32 clog_expected[CLUSTER_WAL_INPUTS_MAX], clog_matched[CLUSTER_WAL_INPUTS_MAX];
 } NativeInventoryRelmapXid;
 
@@ -2492,12 +2493,27 @@ cluster_recovery_native_inventory_destroy(ClusterRecoveryNativeInventory *invent
 
 /* Local input custody only. The original Start, simultaneous IR/WALR and
  * whole ROOT remain the sole episode owner; this handle releases none. */
+typedef struct NativeRelmapPage {
+	const NativeInventoryRecord *record; /* borrowed from this same inventory */
+	ClusterRecoveryRelmapNativePageV1 observed;
+	ClusterRelmapClogBaseHandleV1 *held; /* query entry reuses history.native_base */
+	bool query, read;
+} NativeRelmapPage;
+
 struct ClusterRecoveryRelmapHistory {
 	ClusterRecoveryRelmapSourceV1 original;
 	ClusterRecoveryNativeInventory *inventory;
 	ClusterRelmapClogBaseHandleV1 *native_base;
+	NativeRelmapPage *native_pages;
+	uint32 native_page_count;
+	size_t budget;
+	bool native_pages_complete;
 	bool failed;
 };
+
+static bool history_native_pages_prepare(ClusterRecoveryRelmapHistory *history);
+static bool history_native_pages_read(ClusterRecoveryRelmapHistory *history,
+	const ClusterRelmapClogBaseV1 *query);
 
 static bool
 history_overlap(const void *a, size_t an, const void *b, size_t bn)
@@ -2509,8 +2525,13 @@ history_overlap(const void *a, size_t an, const void *b, size_t bn)
 static size_t
 history_owned_bytes(const ClusterRecoveryRelmapHistory *history)
 {
-	return sizeof(*history) + (history->native_base == NULL ? 0
+	size_t bytes = sizeof(*history) + (history->native_base == NULL ? 0
 		: cluster_clog_relmap_base_custody_bytes_v1());
+	bytes += history->native_page_count * sizeof(*history->native_pages);
+	for (uint32 i = 0; i < history->native_page_count; ++i)
+		if (history->native_pages[i].held != NULL)
+			bytes += cluster_clog_relmap_base_custody_bytes_v1();
+	return bytes;
 }
 
 /* Copied history/base accessors must not clear borrowed records/payloads or
@@ -2528,6 +2549,13 @@ history_storage_overlap(const ClusterRecoveryRelmapHistory *history, const void 
 		|| history_overlap(p, n, history->native_base,
 			cluster_clog_relmap_base_custody_bytes_v1()))
 		return true;
+	if (history_overlap(p, n, history->native_pages,
+		history->native_page_count * sizeof(*history->native_pages)))
+		return true;
+	for (uint32 i = 0; i < history->native_page_count; ++i)
+		if (history_overlap(p, n, history->native_pages[i].held,
+			cluster_clog_relmap_base_custody_bytes_v1()))
+			return true;
 	inventory = history->inventory;
 	if (inventory == NULL)
 		return false;
@@ -2618,6 +2646,7 @@ cluster_recovery_relmap_history_build_v1(const ClusterRecoveryRelmapSourceV1 *so
 				result = CLUSTER_RECOVERY_NATIVE_INVENTORY_CAPACITY;
 			else {
 				memcpy(&history->original, &original, sizeof(original));
+				history->budget = memory_budget;
 				result = inventory_build(original.scope, NULL, memory_budget - reserved,
 					&history->inventory, diag, &history->original);
 				diag->owned_bytes += history_owned_bytes(history);
@@ -2759,7 +2788,7 @@ cluster_recovery_relmap_history_recheck_v1(ClusterRecoveryRelmapHistory *history
 {
 	volatile ClusterRecoveryNativeInventoryResult result = CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED;
 
-	if (diag == NULL || history_overlap(diag, sizeof(*diag), history, sizeof(*history)))
+	if (diag == NULL || history_storage_overlap(history, diag, sizeof(*diag)))
 		return CLUSTER_RECOVERY_NATIVE_INVENTORY_INVALID;
 	memset(diag, 0, sizeof(*diag));
 	if (history == NULL || history->failed || history->inventory == NULL)
@@ -2770,12 +2799,14 @@ cluster_recovery_relmap_history_recheck_v1(ClusterRecoveryRelmapHistory *history
 	history->failed = true;
 	PG_TRY();
 	{
-		if (cluster_wal_inputs_relmap_source_current_v1(&history->original)) {
+		if (cluster_wal_inputs_relmap_source_current_v1(&history->original)
+			&& history_native_pages_read(history, NULL)) {
 			result = cluster_recovery_native_inventory_recheck(history->original.scope,
 				history->inventory, diag);
 			if (result == CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED && history->native_base != NULL) {
 				ClusterRecoveryRelmapPendingBaseV1 base = {0};
-				if (!history_pending_base_read(history, &base))
+				if (!history_pending_base_read(history, &base)
+					|| !history_native_pages_read(history, &base.native))
 					result = CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED;
 			}
 			if (result == CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED
@@ -3080,7 +3111,10 @@ history_pending_terminal_read(ClusterRecoveryRelmapHistory *history,
 		ok = saved != NULL
 			&& (birth == NULL || history_pending_xid_begin(history, pending, xid, &birth->inputs))
 			&& history_pending_clog_side_counts(history, xid, false)
-			&& history_pending_base_read(history, &result.base);
+			&& (((xid == NULL || !xid->hold_native_pages) && history->native_pages == NULL)
+				|| history_native_pages_prepare(history))
+			&& history_pending_base_read(history, &result.base)
+			&& history_native_pages_read(history, &result.base.native);
 		if (ok) {
 			ok = cluster_recovery_native_scan_primary(saved->scan, &effect)
 				== CLUSTER_RECOVERY_NATIVE_EFFECT
@@ -3106,6 +3140,7 @@ history_pending_terminal_read(ClusterRecoveryRelmapHistory *history,
 				&& cluster_wal_inputs_relmap_terminal_count_v1(&terminal.source) == terminal.expected
 				&& history_pending_clog_side_counts(history, xid, true)
 				&& history_pending_base_read(history, &result.base)
+				&& history_native_pages_read(history, &result.base.native)
 				&& cluster_wal_inputs_relmap_terminal_count_v1(&terminal.source) == terminal.expected
 				&& history_pending_clog_side_counts(history, xid, true)
 				&& inventory_history_inputs(history->inventory, history->original.scope, false);
@@ -3199,6 +3234,157 @@ history_pending_xid_source(ClusterRecoveryRelmapHistory *history, uint32 index,
 	return cluster_wal_inputs_relmap_source_current_v1(&history->original)
 		&& cluster_wal_inputs_relmap_source_current_v1(&out->source)
 		&& inventory_history_inputs(inventory, history->original.scope, false);
+}
+
+/* Derive the whole group before its first native operation. These original
+ * FULL bytes name files to observe, not applied births or certified eras.
+ * Distinct generations of one physical page cannot be ordered by a list. */
+static bool
+history_native_pages_prepare(ClusterRecoveryRelmapHistory *history)
+{
+	struct {
+		const NativeInventoryRecord *record;
+		xl_clog_zeropage_full birth;
+		int origin;
+		bool query;
+	} keys[CLUSTER_RECOVERY_RELMAP_CLOG_HISTORY_MAX];
+	ClusterRecoveryNativeInventory *inventory = history->inventory;
+	const NativeInventoryRecord *record;
+	uint32 count = 0, lifecycle = 0, queries = 0;
+	size_t native = cluster_clog_relmap_base_custody_bytes_v1(), fixed, bytes, entries;
+
+	if (!inventory_history_inputs(inventory, history->original.scope, false)
+		|| !inventory_pages_current(inventory))
+		return false;
+	for (record = inventory->head; record != NULL; record = record->next) {
+		ClusterRecoveryNativeEffect effect;
+		xl_clog_zeropage_full birth;
+		uint32 raw;
+		int origin;
+
+		if (cluster_recovery_native_scan_primary(record->scan, &effect)
+			!= CLUSTER_RECOVERY_NATIVE_EFFECT)
+			return false;
+		if (effect.kind != CLUSTER_RECOVERY_NATIVE_CLOG_ZERO
+			&& effect.kind != CLUSTER_RECOVERY_NATIVE_CLOG_TRUNCATE)
+			continue;
+		if (++lifecycle > CLUSTER_RECOVERY_RELMAP_CLOG_HISTORY_MAX)
+			return false;
+		if (effect.kind != CLUSTER_RECOVERY_NATIVE_CLOG_ZERO
+			|| (effect.record->header.xl_info & ~XLR_INFO_MASK) != CLOG_ZEROPAGE_FULL)
+			continue; /* Keep legacy/unknown obligations in the complete input. */
+		if (record->source_index >= inventory->source_count
+			|| !inventory_source_equal(&effect.record->source,
+				&inventory->sources[record->source_index].source)
+			|| effect.record->payload == NULL || effect.record->payload_length != sizeof(birth))
+			return false;
+		memcpy(&birth, effect.record->payload, sizeof(birth));
+		raw = (uint32)birth.first_full_xid;
+		origin = effect.record->source.claim.identity.origin_node_id;
+		if (birth.reserved_zero != 0 || birth.pageno < 0 || !TransactionIdIsNormal(raw)
+			|| (raw % CLUSTER_NATIVE_CLOG_PER_PAGE != 0 && raw != FirstNormalTransactionId)
+			|| raw / CLUSTER_NATIVE_CLOG_PER_PAGE != (uint32)birth.pageno)
+			return false;
+		for (uint32 i = 0; i < count; ++i)
+			if (keys[i].origin == origin && keys[i].birth.pageno == birth.pageno)
+				return false;
+		keys[count].record = record;
+		keys[count].birth = birth;
+		keys[count].origin = origin;
+		keys[count].query = record->source_index == inventory->relmap_wal_source
+			&& (uint32)birth.pageno == (uint32)inventory->relmap_query.pending_owner.top_full_xid
+				/ CLUSTER_NATIVE_CLOG_PER_PAGE;
+		queries += keys[count].query;
+		count++;
+	}
+	if (count == 0 || queries != 1)
+		return false;
+	if (history->native_pages != NULL) {
+		if (count != history->native_page_count)
+			return false;
+		for (uint32 i = 0; i < count; ++i)
+			if (history->native_pages[i].record != keys[i].record
+				|| history->native_pages[i].query != keys[i].query
+				|| memcmp(&history->native_pages[i].observed.birth, &keys[i].birth,
+					sizeof(keys[i].birth)) != 0)
+				return false;
+		return true; /* Never refresh an attached key or native baseline. */
+	}
+	/* Reserve the fixed query handle once, even before it is allocated. */
+	if (native > SIZE_MAX - sizeof(*history))
+		return false;
+	fixed = sizeof(*history) + native;
+	entries = count;
+	if (entries > SIZE_MAX / sizeof(*history->native_pages)
+		|| (count > 1 && native > (SIZE_MAX - entries * sizeof(*history->native_pages)) / (count - 1)))
+		return false;
+	bytes = entries * sizeof(*history->native_pages) + (count - 1) * native;
+	if (fixed > history->budget || inventory->diag.owned_bytes > history->budget - fixed
+		|| bytes > history->budget - fixed - inventory->diag.owned_bytes)
+		return false;
+	history->native_pages = calloc(count, sizeof(*history->native_pages));
+	if (history->native_pages == NULL)
+		return false;
+	history->native_page_count = count; /* Attach before any operation can ERROR. */
+	for (uint32 i = 0; i < count; ++i) {
+		NativeRelmapPage *page = &history->native_pages[i];
+		ClusterRecoveryNativeEffect effect;
+		page->record = keys[i].record;
+		page->query = keys[i].query;
+		page->observed.birth = keys[i].birth;
+		page->observed.record_ordinal = page->record->ordinal;
+		if (!history_pending_xid_source(history, page->record->source_index,
+			&page->observed.history)
+			|| cluster_recovery_native_scan_primary(page->record->scan, &effect)
+				!= CLUSTER_RECOVERY_NATIVE_EFFECT)
+			return false;
+		page->observed.read_lsn = effect.record->read_lsn;
+		page->observed.end_lsn = effect.record->end_lsn;
+		page->observed.record_crc = (uint32)effect.record->header.xl_crc;
+	}
+	return true;
+}
+
+/* Every successful first read keeps its original descriptor. Later false or
+ * ERROR retains all earlier custody for the original explicit destroy. */
+static bool
+history_native_pages_read(ClusterRecoveryRelmapHistory *history,
+	const ClusterRelmapClogBaseV1 *query)
+{
+	ClusterRecoveryRelmapPendingBaseV1 query_base = {0};
+
+	if (history->native_pages == NULL)
+		return true;
+	if (query == NULL) {
+		if (!history_pending_base_read(history, &query_base))
+			return false;
+		query = &query_base.native;
+	}
+	for (uint32 i = 0; i < history->native_page_count; ++i) {
+		NativeRelmapPage *page = &history->native_pages[i];
+		ClusterRecoveryRelmapHistoryEntryV1 current = {0};
+		ClusterRelmapClogBaseV1 base = {0};
+		if (!history_pending_xid_source(history, page->record->source_index, &current)
+			|| memcmp(&current, &page->observed.history, sizeof(current)) != 0)
+			return false;
+		if (page->query)
+			base = *query;
+		else if (!cluster_clog_relmap_base_read_v1(&page->observed.history.source,
+			page->observed.birth.first_full_xid, &base, &page->held) || page->held == NULL)
+			return false;
+		if (base.origin != current.source.selected.source.claim.identity.origin_node_id
+			|| base.page_number != (uint32)page->observed.birth.pageno
+			|| (page->read && memcmp(&base, &page->observed.native, sizeof(base)) != 0)
+			|| !history_pending_xid_source(history, page->record->source_index, &current)
+			|| memcmp(&current, &page->observed.history, sizeof(current)) != 0)
+			return false;
+		if (!page->read) {
+			page->observed.native = base;
+			page->read = true;
+		}
+	}
+	return inventory_pages_current(history->inventory)
+		&& inventory_history_inputs(history->inventory, history->original.scope, false);
 }
 
 /* Bind every original physical generation before the one full reread.
@@ -3492,13 +3678,14 @@ static bool
 history_pending_native_read(ClusterRecoveryRelmapHistory *history,
 	const ClusterRelmapV2Image *pending, ClusterRecoveryRelmapPendingNativeV1 *out,
 	ClusterRecoveryNativeInventoryDiag *diag, bool side_clog,
-	ClusterRecoveryRelmapPendingAllNativeV1 *all_native)
+	ClusterRecoveryRelmapPendingAllNativeV1 *all_native, bool hold_native_pages)
 {
 	ClusterRecoveryRelmapPendingNativeV1 result = {0};
 	NativeInventoryRelmapXid xid = {0};
 
 	xid.side_clog = side_clog;
 	xid.all_native = all_native;
+	xid.hold_native_pages = hold_native_pages;
 	if (pending == NULL || out == NULL || diag == NULL
 		|| history_overlap(out, sizeof(*out), pending, sizeof(*pending))
 		|| history_overlap(diag, sizeof(*diag), pending, sizeof(*pending))
@@ -3519,7 +3706,7 @@ cluster_recovery_relmap_history_pending_native_v1(ClusterRecoveryRelmapHistory *
 	const ClusterRelmapV2Image *pending, ClusterRecoveryRelmapPendingNativeV1 *out,
 	ClusterRecoveryNativeInventoryDiag *diag)
 {
-	return history_pending_native_read(history, pending, out, diag, false, NULL);
+	return history_pending_native_read(history, pending, out, diag, false, NULL, false);
 }
 
 bool
@@ -3527,7 +3714,7 @@ cluster_recovery_relmap_history_pending_native_side_v1(ClusterRecoveryRelmapHist
 	const ClusterRelmapV2Image *pending, ClusterRecoveryRelmapPendingNativeV1 *out,
 	ClusterRecoveryNativeInventoryDiag *diag)
 {
-	return history_pending_native_read(history, pending, out, diag, true, NULL);
+	return history_pending_native_read(history, pending, out, diag, true, NULL, false);
 }
 
 bool
@@ -3545,10 +3732,76 @@ cluster_recovery_relmap_history_pending_all_native_v1(ClusterRecoveryRelmapHisto
 		|| history_storage_overlap(history, diag, sizeof(*diag)))
 		return false;
 	memset(out, 0, sizeof(*out));
-	if (!history_pending_native_read(history, pending, &result.query, diag, true, &result))
+	if (!history_pending_native_read(history, pending, &result.query, diag, true, &result, false))
 		return false;
 	memcpy(out, &result, sizeof(result));
 	return true;
+}
+
+bool
+cluster_recovery_relmap_history_pending_native_pages_v1(ClusterRecoveryRelmapHistory *history,
+	const ClusterRelmapV2Image *pending, ClusterRecoveryRelmapPendingNativePagesV1 *out,
+	ClusterRecoveryNativeInventoryDiag *diag)
+{
+	ClusterRecoveryRelmapPendingNativePagesV1 result = {0};
+
+	if (pending == NULL || out == NULL || diag == NULL
+		|| history_overlap(out, sizeof(*out), pending, sizeof(*pending))
+		|| history_overlap(diag, sizeof(*diag), pending, sizeof(*pending))
+		|| history_overlap(out, sizeof(*out), diag, sizeof(*diag))
+		|| history_storage_overlap(history, out, sizeof(*out))
+		|| history_storage_overlap(history, diag, sizeof(*diag)))
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (!history_pending_native_read(history, pending, &result.inputs.query, diag,
+		true, &result.inputs, true))
+		return false;
+	result.page_count = history->native_page_count;
+	history->native_pages_complete = true;
+	memcpy(out, &result, sizeof(result));
+	return true;
+}
+
+bool
+cluster_recovery_relmap_history_native_page_v1(ClusterRecoveryRelmapHistory *history,
+	uint32 ordinal, ClusterRecoveryRelmapNativePageV1 *out)
+{
+	ClusterRecoveryRelmapHistoryEntryV1 current = {0};
+	ClusterRecoveryRelmapNativePageV1 result = {0};
+	volatile bool ok = false;
+
+	if (out == NULL || history_storage_overlap(history, out, sizeof(*out)))
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (history == NULL || history->failed || history->inventory == NULL
+		|| !history->native_pages_complete || ordinal >= history->native_page_count
+		|| CritSectionCount != 0 || cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
+		return false;
+	history->failed = true;
+	PG_TRY();
+	{
+		const NativeRelmapPage *page = &history->native_pages[ordinal];
+		ok = page->read
+			&& history_pending_xid_source(history, page->record->source_index, &current)
+			&& memcmp(&current, &page->observed.history, sizeof(current)) == 0;
+		if (ok) {
+			result = page->observed;
+			ok = history_pending_xid_source(history, page->record->source_index, &current)
+				&& memcmp(&current, &result.history, sizeof(current)) == 0;
+		}
+	}
+	PG_CATCH();
+	{
+		history_fail(history);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (ok) {
+		history->failed = false;
+		memcpy(out, &result, sizeof(result));
+	} else
+		history_fail(history);
+	return ok;
 }
 
 void
@@ -3560,6 +3813,9 @@ cluster_recovery_relmap_history_destroy_v1(ClusterRecoveryRelmapHistory **custod
 		return;
 	history = *custody;
 	*custody = NULL;
+	for (uint32 i = 0; i < history->native_page_count; ++i)
+		cluster_clog_relmap_base_release_v1(&history->native_pages[i].held);
+	free(history->native_pages);
 	cluster_clog_relmap_base_release_v1(&history->native_base);
 	cluster_recovery_native_inventory_destroy(history->inventory);
 	free(history);
