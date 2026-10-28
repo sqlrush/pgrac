@@ -2375,9 +2375,21 @@ static void startup_local_empty_reset(void);
 #include "test_cluster_cold_ctrc_native_directory.inc"
 #endif
 
+#include "test_cluster_cold_ctrc_untouched_pages.inc"
+
 int main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_UNTOUCHED_PAGES") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_startup_untouched_pages_complete_saved_set_including_zero_page_wal);
+		UT_RUN(test_startup_untouched_last_page_drift_or_absence_keeps_original_debt);
+		UT_RUN(test_startup_untouched_late_owner_loss_or_error_preserves_same_fd);
+		UT_RUN(test_startup_untouched_repeat_and_local_wait_reread_original_complete_set);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
+
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
+
 	if (getenv("PGRAC_PRE2_TEST_NATIVE_DIRECTORY") != NULL) {
 		UT_PLAN(4);
 		UT_RUN(test_startup_native_directory_empty_preserves_fpi_unchanged_and_zero_page);
@@ -2680,14 +2692,18 @@ int main(void)
 		return ut_failed_count == 0 ? 0 : 1;
 	}
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
-	UT_PLAN(292);
+	UT_PLAN(296);
 	UT_RUN(test_startup_native_directory_empty_preserves_fpi_unchanged_and_zero_page);
 	UT_RUN(test_startup_native_directory_partial_lock_wait_repeats_same_fd_readback);
 	UT_RUN(test_startup_native_directory_real_origin_cannot_be_discharged_by_wait);
 	UT_RUN(test_startup_native_directory_invalid_layout_and_partial_error_keep_debt);
 #else
-	UT_PLAN(288);
+	UT_PLAN(292);
 #endif
+	UT_RUN(test_startup_untouched_pages_complete_saved_set_including_zero_page_wal);
+	UT_RUN(test_startup_untouched_last_page_drift_or_absence_keeps_original_debt);
+	UT_RUN(test_startup_untouched_late_owner_loss_or_error_preserves_same_fd);
+	UT_RUN(test_startup_untouched_repeat_and_local_wait_reread_original_complete_set);
 	UT_RUN(test_startup_final_local_empty_covers_fpi_unchanged_and_zero_page_wal);
 	UT_RUN(test_startup_final_local_wait_rechecks_complete_pages_on_same_fds);
 	UT_RUN(test_startup_final_local_refusal_error_and_late_owner_loss_keep_debt);

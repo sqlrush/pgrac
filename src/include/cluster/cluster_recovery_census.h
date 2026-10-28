@@ -216,6 +216,23 @@ typedef struct ClusterRecoveryCensusPagesV1 {
 extern const ClusterRecoveryCensusPagesV1 *cluster_recovery_census_pages_v1(
 	ClusterRecoveryCensus *census);
 
+/* Current bytes from the same original physical relation object. This is
+ * only a by-value observation; the initial page/root baselines never change. */
+typedef struct ClusterRecoveryCensusPageDigestV1 {
+	bool observed;
+	uint8 sha256[32];
+} ClusterRecoveryCensusPageDigestV1;
+
+/* DONE only, outside caller LWLocks/critical sections. Read one complete
+ * saved relation page through the original namespace and revalidate the
+ * original input/manifest before and after. File timestamps may reflect
+ * owner writes; object identity/extent and within-read stability may not.
+ * Caller compares untouched bytes with the original full-page digest and
+ * uses its original PAGE owner for known changed pages. No rebase, history
+ * discharge, authority or completion follows from this observation. */
+extern ClusterRecoveryCensusPageDigestV1
+cluster_recovery_census_page_digest_v1(ClusterRecoveryCensus *census, uint32 index);
+
 /* Complete original heap/history emissions. page_index addresses the original
  * physical PAGE view above; version is the original inverse-step ordinal, not
  * an SCN/LSN or a coverage claim. ITL transaction records borrow the original

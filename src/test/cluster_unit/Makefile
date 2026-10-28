@@ -10749,3 +10749,7 @@ test_cluster_startup_native_ctrc.o: test_cluster_startup_native_ctrc.c \
 		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 test_cluster_cold_tx_start: test_cluster_startup_native_ctrc.h test_cluster_cold_ctrc_native_directory.inc
+
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_untouched_pages.inc
+
+test_cluster_recovery_native_inputs: test_cluster_recovery_census_current_pages.inc
