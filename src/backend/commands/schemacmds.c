@@ -10,6 +10,10 @@
  * IDENTIFICATION
  *	  src/backend/commands/schemacmds.c
  *
+ * PGRAC MODIFICATIONS
+ *    Preflight native schema changes before catalog locks.
+ *    Author: SqlRush <sqlrush@gmail.com>
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -25,6 +29,10 @@
 #include "catalog/pg_authid.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_namespace.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_mode.h"
+#include "cluster/cluster_tt_local.h"
+#endif
 #include "commands/dbcommands.h"
 #include "commands/event_trigger.h"
 #include "commands/schemacmds.h"
@@ -242,6 +250,35 @@ CreateSchemaCommand(CreateSchemaStmt *stmt, const char *queryString,
 }
 
 
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: native callers bind before catalog locks; utility callers reuse
+ * their original top binding. Author: SqlRush <sqlrush@gmail.com> */
+static void
+PreflightClusterSharedSchemaWrite(void)
+{
+	ClusterCanonicalTxnBinding binding;
+	TransactionId current_xid;
+
+	if (!cluster_shared_catalog || !cluster_storage_mode_enabled())
+		return;
+	PreventCommandIfReadOnly("ALTER SCHEMA");
+	PreventCommandIfParallelMode("ALTER SCHEMA");
+	PreventCommandDuringRecovery("ALTER SCHEMA");
+	if (IsSubTransaction())
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("shared catalog alteration does not support subtransactions")));
+	current_xid = GetCurrentTransactionIdIfAny();
+	if (TransactionIdIsValid(current_xid)
+		&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("shared catalog top-level transaction identity mismatch")));
+	if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("canonical ACTIVE publication failed before shared catalog alteration")));
+}
+#endif
+
 /*
  * Rename schema
  */
@@ -255,6 +292,9 @@ RenameSchema(const char *oldname, const char *newname)
 	ObjectAddress address;
 	Form_pg_namespace nspform;
 
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedSchemaWrite();
+#endif
 	rel = table_open(NamespaceRelationId, RowExclusiveLock);
 
 	tup = SearchSysCacheCopy1(NAMESPACENAME, CStringGetDatum(oldname));
@@ -335,6 +375,9 @@ AlterSchemaOwner(const char *name, Oid newOwnerId)
 	ObjectAddress address;
 	Form_pg_namespace nspform;
 
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedSchemaWrite();
+#endif
 	rel = table_open(NamespaceRelationId, RowExclusiveLock);
 
 	tup = SearchSysCache1(NAMESPACENAME, CStringGetDatum(name));

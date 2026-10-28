@@ -34,9 +34,11 @@
 #include "catalog/pg_control.h"
 #include "catalog/pg_extension.h"
 #include "catalog/pg_foreign_server_d.h"
+#include "catalog/pg_namespace.h"
 #include "catalog/pg_type_d.h"
 #include "commands/defrem.h"
 #include "commands/extension.h"
+#include "commands/schemacmds.h"
 #include "commands/user.h"
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_tt_local.h"
@@ -6114,10 +6116,20 @@ static unsigned extension_lookups, extension_unbound, extension_bad_lookup, exte
 static String extension_name;
 static AlterExtensionStmt extension_update;
 static AlterExtensionContentsStmt extension_contents;
+static bool schema_lookup_active, schema_expect_binding;
+static unsigned schema_lookups, schema_unbound, schema_bad_lookup;
 
 Relation
 table_open(Oid relationId, LOCKMODE lockmode)
 {
+	if (schema_lookup_active) {
+		schema_lookups++;
+		if (schema_expect_binding && utility_binds == 0)
+			schema_unbound++;
+		if (relationId != NamespaceRelationId || lockmode != RowExclusiveLock)
+			schema_bad_lookup++;
+		siglongjmp(boundary, 2);
+	}
 	extension_lookups++;
 	extension_lookup_kind = 1;
 	if (extension_expect_binding && utility_binds == 0)
@@ -6589,10 +6601,167 @@ UT_TEST(test_utility_and_native_unsupported_extension_code_message_detail_match)
 	}
 }
 
+/* These actual native prefixes stop at their first table_open before a real
+ * lock. The helper is complete; later namespace ACL/hook work is not run. */
+#include "test_cluster_fresh_schema.inc"
+
+static void
+reset_native_schema(bool expect_binding)
+{
+	reset_create_preflight();
+	schema_lookup_active = true;
+	schema_expect_binding = expect_binding;
+	schema_lookups = schema_unbound = schema_bad_lookup = 0;
+}
+
+static void
+native_schema_entry(unsigned kind)
+{
+	if (kind == 0)
+		(void)RenameSchema("original", "renamed");
+	else
+		(void)AlterSchemaOwner("original", 700);
+}
+
+UT_TEST(test_native_schema_changes_bind_before_catalog_lock_in_all_profiles)
+{
+	for (unsigned kind = 0; kind < 2; kind++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_schema(binds);
+			cluster_shared_catalog = (mode & 1) != 0;
+			utility_storage_mode = (mode & 2) != 0;
+			cluster_shared_config = (mode & 4) != 0;
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_schema_entry(kind);
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(schema_lookups, repeat + 1);
+				UT_ASSERT_EQ(schema_unbound, 0);
+				UT_ASSERT_EQ(schema_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	schema_lookup_active = false;
+}
+
+UT_TEST(test_native_schema_refusal_child_or_wrong_top_precedes_catalog_lock)
+{
+	for (unsigned kind = 0; kind < 2; kind++) {
+		for (unsigned config = 0; config < 2; config++) {
+			for (unsigned failure = 0; failure < 5; failure++) {
+				int caught;
+
+				reset_native_schema(true);
+				cluster_shared_config = config != 0;
+				if (failure == 0)
+					utility_bind_ok = false;
+				else if (failure == 1 || failure == 4) {
+					if (failure == 4)
+						create_sql_entry((Node *)&(AlterOwnerStmt){ .type = T_AlterOwnerStmt,
+																	.objectType = OBJECT_SCHEMA });
+					utility_in_child = true;
+				} else {
+					utility_current_xid = 401;
+					utility_top_xid = failure == 2 ? 400 : InvalidTransactionId;
+				}
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_schema_entry(kind);
+				UT_ASSERT_EQ(caught, 1);
+				UT_ASSERT_EQ(error_code, failure == 0 ? ERRCODE_DATA_CORRUPTED
+										 : failure == 1 || failure == 4
+											 ? ERRCODE_FEATURE_NOT_SUPPORTED
+											 : ERRCODE_INTERNAL_ERROR);
+				UT_ASSERT_EQ(schema_lookups, 0);
+				UT_ASSERT_EQ(utility_xids, failure == 0 || failure == 4 ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, failure == 0 || failure == 4 ? 1 : 0);
+				UT_ASSERT_EQ(utility_binds, failure == 4 ? 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid, failure == 0 || failure == 2 || failure == 4
+												  ? 400
+												  : InvalidTransactionId);
+			}
+		}
+	}
+	schema_lookup_active = false;
+}
+
+UT_TEST(test_native_schema_context_guards_precede_binding_and_preserve_nonshared_route)
+{
+	for (unsigned kind = 0; kind < 2; kind++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+
+			for (unsigned guard = 0; guard < 3; guard++) {
+				int caught;
+
+				reset_native_schema(binds);
+				cluster_shared_catalog = (mode & 1) != 0;
+				utility_storage_mode = (mode & 2) != 0;
+				cluster_shared_config = (mode & 4) != 0;
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_schema_entry(kind);
+				UT_ASSERT_EQ(caught, binds ? 1 : 2);
+				UT_ASSERT_EQ(error_code, !binds		  ? 0
+										 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+													  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				UT_ASSERT_EQ(schema_lookups, binds ? 0 : 1);
+				UT_ASSERT_EQ(schema_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids, 0);
+				UT_ASSERT_EQ(utility_prepares, 0);
+				UT_ASSERT_EQ(utility_binds, 0);
+			}
+		}
+	}
+	schema_lookup_active = false;
+}
+
+UT_TEST(test_native_schema_utility_prebinding_reuses_same_top_before_lookup)
+{
+	RenameStmt rename = { .type = T_RenameStmt, .renameType = OBJECT_SCHEMA };
+	AlterOwnerStmt owner = { .type = T_AlterOwnerStmt, .objectType = OBJECT_SCHEMA };
+	Node *statements[] = { (Node *)&rename, (Node *)&owner };
+
+	for (unsigned kind = 0; kind < 2; kind++) {
+		int caught;
+
+		reset_native_schema(true);
+		create_sql_entry(statements[kind]);
+		UT_ASSERT_EQ(utility_prepares, 1);
+		UT_ASSERT_EQ(utility_xids, 1);
+		UT_ASSERT_EQ(utility_binds, 1);
+		caught = sigsetjmp(boundary, 1);
+		if (!caught)
+			native_schema_entry(kind);
+		UT_ASSERT_EQ(caught, 2);
+		UT_ASSERT_EQ(error_code, 0);
+		UT_ASSERT_EQ(schema_lookups, 1);
+		UT_ASSERT_EQ(schema_unbound, 0);
+		UT_ASSERT_EQ(schema_bad_lookup, 0);
+		UT_ASSERT_EQ(utility_prepares, 2);
+		UT_ASSERT_EQ(utility_xids, 1);
+		UT_ASSERT_EQ(utility_binds, 1);
+		UT_ASSERT_EQ(utility_top_xid, 400);
+	}
+	schema_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(76);
+	UT_PLAN(80);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -6669,6 +6838,10 @@ main(void)
 	UT_RUN(test_native_unsupported_extension_refusal_precedes_invalid_context_and_allocation);
 	UT_RUN(test_nonshared_extension_create_retains_native_validation_skip_nested_and_options);
 	UT_RUN(test_utility_and_native_unsupported_extension_code_message_detail_match);
+	UT_RUN(test_native_schema_changes_bind_before_catalog_lock_in_all_profiles);
+	UT_RUN(test_native_schema_refusal_child_or_wrong_top_precedes_catalog_lock);
+	UT_RUN(test_native_schema_context_guards_precede_binding_and_preserve_nonshared_route);
+	UT_RUN(test_native_schema_utility_prebinding_reuses_same_top_before_lookup);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
