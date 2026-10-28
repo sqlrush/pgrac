@@ -26757,6 +26757,16 @@ main(int argc, char **argv)
 		return ut_failed_count ? 1 : 0;
 	}
 
+	if (getenv("PGRAC_PRE2_TEST_SELF_SEAL") != NULL) {
+		UT_PLAN(5);
+		UT_RUN(test_v3_self_seal_seals_own_crashed_generation);
+		UT_RUN(test_v3_self_seal_resumes_a_sealed_generation_without_tail);
+		UT_RUN(test_v3_self_seal_refuses_without_each_evidence);
+		UT_RUN(test_v3_self_seal_keeps_dual_range_until_tail_is_sealed);
+		UT_RUN(test_v3_self_seal_rechecks_evidence_wal_and_root_under_cf_x);
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_RECOVERY_WAL") != NULL) {
 		UT_PLAN(4);
 		UT_RUN(test_recovery_checkpoint_selects_native_not_common_counters);
