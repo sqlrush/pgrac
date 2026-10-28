@@ -1179,6 +1179,13 @@ test_cluster_fresh_tablespace_options.inc: $(top_srcdir)/src/backend/commands/ta
 	     /^}/ { emit=0 } \
 	     END { if (entries != 1 || cuts != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
+test_cluster_fresh_matview_scope.inc: $(top_srcdir)/src/backend/commands/matview.c Makefile
+	awk '/^ExecRefreshMatView\(/ { print "ObjectAddress"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /^[[:space:]]*RangeVarCallbackOwnsTable, NULL\);/ { print "return InvalidObjectAddress; }"; emit=0; cuts++ } \
+	     /^}/ { if (emit) bad++; emit=0 } \
+	     END { if (entries != 1 || cuts != 1 || emit || bad) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
 test_cluster_fresh_domain_alter_scope.inc: $(top_srcdir)/src/backend/commands/typecmds.c Makefile
 	awk '/^AlterDomainDefault\(/ { print "ObjectAddress"; emit=1; entries++; defaults++ } \
 	     /^AlterDomainNotNull\(/ { print "ObjectAddress"; emit=1; entries++; notnulls++ } \
@@ -1486,7 +1493,7 @@ test_cluster_fresh_scope: test_cluster_fresh_scope.c unit_test.h \
 		test_cluster_fresh_foreign_server.inc test_cluster_fresh_user_mapping.inc \
 		test_cluster_fresh_statistics_alter.inc test_cluster_fresh_statistics_create.inc test_cluster_fresh_operator.inc \
 		test_cluster_fresh_opclass.inc test_cluster_fresh_aggregate.inc test_cluster_fresh_tsearch.inc \
-		test_cluster_fresh_publication.inc test_cluster_fresh_publication_owner.inc test_cluster_fresh_foreign_owner.inc test_cluster_fresh_subscription_owner.inc test_cluster_fresh_rule_rename.inc test_cluster_fresh_trigger_rename.inc test_cluster_fresh_tablespace_options.inc test_cluster_fresh_column_rename.inc test_cluster_fresh_relation_rename.inc test_cluster_fresh_constraint_rename.inc test_cluster_fresh_table_namespace.inc test_cluster_fresh_domain_alter_scope.inc test_cluster_fresh_type_factory_scope.inc test_cluster_fresh_type_creation_scope.inc test_cluster_fresh_enum_scope.inc test_cluster_fresh_type_mutation_scope.inc test_cluster_fresh_type_scope.inc test_cluster_fresh_database_settings.inc test_cluster_fresh_database_identity.inc test_cluster_fresh_database_options.inc \
+		test_cluster_fresh_publication.inc test_cluster_fresh_publication_owner.inc test_cluster_fresh_foreign_owner.inc test_cluster_fresh_subscription_owner.inc test_cluster_fresh_rule_rename.inc test_cluster_fresh_trigger_rename.inc test_cluster_fresh_tablespace_options.inc test_cluster_fresh_column_rename.inc test_cluster_fresh_relation_rename.inc test_cluster_fresh_constraint_rename.inc test_cluster_fresh_table_namespace.inc test_cluster_fresh_matview_scope.inc test_cluster_fresh_domain_alter_scope.inc test_cluster_fresh_type_factory_scope.inc test_cluster_fresh_type_creation_scope.inc test_cluster_fresh_enum_scope.inc test_cluster_fresh_type_mutation_scope.inc test_cluster_fresh_type_scope.inc test_cluster_fresh_database_settings.inc test_cluster_fresh_database_identity.inc test_cluster_fresh_database_options.inc \
 		test_cluster_fresh_view.inc test_cluster_fresh_rule.inc test_cluster_fresh_sequence_alter.inc test_cluster_fresh_role_alter.inc test_cluster_fresh_role_settings.inc test_cluster_fresh_role_drop.inc test_cluster_fresh_role_grant.inc test_cluster_fresh_role_create.inc test_cluster_fresh_reassign_owned.inc test_cluster_fresh_role_rename.inc
 	$(CC) $(CFLAGS) -Wno-unused-variable -Wno-unused-but-set-variable $(CPPFLAGS) $< \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
@@ -6801,7 +6808,7 @@ clean distclean maintainer-clean:
 		test_cluster_fresh_foreign_server.inc test_cluster_fresh_user_mapping.inc \
 		test_cluster_fresh_statistics_alter.inc test_cluster_fresh_statistics_create.inc test_cluster_fresh_operator.inc \
 		test_cluster_fresh_opclass.inc test_cluster_fresh_aggregate.inc test_cluster_fresh_tsearch.inc \
-		test_cluster_fresh_publication.inc test_cluster_fresh_publication_owner.inc test_cluster_fresh_foreign_owner.inc test_cluster_fresh_subscription_owner.inc test_cluster_fresh_rule_rename.inc test_cluster_fresh_trigger_rename.inc test_cluster_fresh_tablespace_options.inc test_cluster_fresh_column_rename.inc test_cluster_fresh_relation_rename.inc test_cluster_fresh_constraint_rename.inc test_cluster_fresh_table_namespace.inc test_cluster_fresh_domain_alter_scope.inc test_cluster_fresh_type_factory_scope.inc test_cluster_fresh_type_creation_scope.inc test_cluster_fresh_enum_scope.inc test_cluster_fresh_type_mutation_scope.inc test_cluster_fresh_type_scope.inc test_cluster_fresh_database_settings.inc test_cluster_fresh_database_identity.inc test_cluster_fresh_database_options.inc \
+		test_cluster_fresh_publication.inc test_cluster_fresh_publication_owner.inc test_cluster_fresh_foreign_owner.inc test_cluster_fresh_subscription_owner.inc test_cluster_fresh_rule_rename.inc test_cluster_fresh_trigger_rename.inc test_cluster_fresh_tablespace_options.inc test_cluster_fresh_column_rename.inc test_cluster_fresh_relation_rename.inc test_cluster_fresh_constraint_rename.inc test_cluster_fresh_table_namespace.inc test_cluster_fresh_matview_scope.inc test_cluster_fresh_domain_alter_scope.inc test_cluster_fresh_type_factory_scope.inc test_cluster_fresh_type_creation_scope.inc test_cluster_fresh_enum_scope.inc test_cluster_fresh_type_mutation_scope.inc test_cluster_fresh_type_scope.inc test_cluster_fresh_database_settings.inc test_cluster_fresh_database_identity.inc test_cluster_fresh_database_options.inc \
 		test_cluster_fresh_view.inc test_cluster_fresh_rule.inc test_cluster_fresh_sequence_alter.inc test_cluster_fresh_role_alter.inc test_cluster_fresh_role_settings.inc test_cluster_fresh_role_drop.inc test_cluster_fresh_role_grant.inc test_cluster_fresh_role_create.inc test_cluster_fresh_reassign_owned.inc test_cluster_fresh_role_rename.inc
 	rm -f $(TESTS) pgrac_fenced_live_rejoin_client probe_pgrac_fenced_cib \
 		test_cluster_tt_locator_stats.inc \

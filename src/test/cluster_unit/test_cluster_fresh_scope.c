@@ -71,6 +71,7 @@
 #include "commands/defrem.h"
 #include "commands/extension.h"
 #include "commands/event_trigger.h"
+#include "commands/matview.h"
 #include "commands/policy.h"
 #include "commands/proclang.h"
 #include "commands/publicationcmds.h"
@@ -361,6 +362,10 @@ static bool tablespace_options_lookup_active, tablespace_options_expect_binding;
 static unsigned tablespace_options_lookups, tablespace_options_unbound;
 static unsigned tablespace_options_bad_lookup;
 
+static bool matview_scope_lookup_active;
+static unsigned matview_scope_lookups, matview_scope_bad_lookup, matview_scope_unexpected_callbacks;
+static const RangeVar *matview_scope_expected_relation;
+static LOCKMODE matview_scope_expected_lockmode;
 static bool domain_alter_scope_lookup_active;
 static unsigned domain_alter_scope_route, domain_alter_scope_lookups;
 static unsigned domain_alter_scope_lookup_kind, domain_alter_scope_bad_lookup;
@@ -8083,10 +8088,29 @@ RangeVarCallbackForRenameRule(const RangeVar *relation, Oid relid, Oid oldrelid,
 			   3); /* The query boundary must not invoke the native permission callback. */
 }
 
+void
+RangeVarCallbackOwnsTable(const RangeVar *relation, Oid relid, Oid oldrelid, void *arg)
+{
+	(void)relation;
+	(void)relid;
+	(void)oldrelid;
+	(void)arg;
+	matview_scope_unexpected_callbacks++;
+	siglongjmp(boundary, 3); /* The first lookup boundary must not invoke permission work. */
+}
+
 Oid
 RangeVarGetRelidExtended(const RangeVar *relation, LOCKMODE lockmode, uint32 flags,
 						 RangeVarGetRelidCallback callback, void *callback_arg)
 {
+	if (matview_scope_lookup_active) {
+		matview_scope_lookups++;
+		if (relation != matview_scope_expected_relation
+			|| lockmode != matview_scope_expected_lockmode || flags != 0
+			|| callback != RangeVarCallbackOwnsTable || callback_arg != NULL)
+			matview_scope_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before the real query, lock or permission callback. */
+	}
 	if (table_namespace_lookup_active) {
 		table_namespace_lookups++;
 		if (table_namespace_expect_binding && utility_binds == 0)
@@ -19999,10 +20023,168 @@ UT_TEST(test_native_domain_alter_scope_preserves_existing_supported_top_binding)
 	domain_alter_scope_lookup_active = false;
 }
 
+/* Actual refresh entry stops before its first relation lookup and lock.
+ * Concurrent and nonconcurrent lock choices remain in the extracted prefix. */
+#include "test_cluster_fresh_matview_scope.inc"
+static RangeVar matview_scope_relation;
+static RefreshMatViewStmt native_matview_scope_statement;
+static RangeVar matview_scope_warm_relation;
+static AlterObjectSchemaStmt matview_scope_warm_statement;
+
+static void
+reset_native_matview_scope(unsigned form)
+{
+	reset_create_preflight();
+	error_detail[0] = '\0';
+	matview_scope_lookup_active = true;
+	matview_scope_lookups = matview_scope_bad_lookup = matview_scope_unexpected_callbacks = 0;
+	matview_scope_expected_lockmode = form & 2 ? ExclusiveLock : AccessExclusiveLock;
+	matview_scope_relation = (RangeVar){ .type = T_RangeVar,
+										 .schemaname = form & 1 ? "matview_schema" : NULL,
+										 .relname = "native_matview",
+										 .inh = true,
+										 .relpersistence = RELPERSISTENCE_PERMANENT,
+										 .location = -1 };
+	matview_scope_expected_relation = &matview_scope_relation;
+	native_matview_scope_statement = (RefreshMatViewStmt){ .type = T_RefreshMatViewStmt,
+														   .concurrent = (form & 2) != 0,
+														   .skipData = (form & 4) != 0,
+														   .relation = &matview_scope_relation };
+	matview_scope_warm_relation
+		= (RangeVar){ .type = T_RangeVar, .relname = "supported_warm_table" };
+	matview_scope_warm_statement
+		= (AlterObjectSchemaStmt){ .type = T_AlterObjectSchemaStmt,
+								   .objectType = OBJECT_TABLE,
+								   .relation = &matview_scope_warm_relation,
+								   .newschema = "supported_warm_destination",
+								   .missing_ok = false };
+}
+
+static void
+native_matview_scope_entry(void)
+{
+	(void)ExecRefreshMatView(&native_matview_scope_statement,
+							 "REFRESH MATERIALIZED VIEW native_matview", NULL, NULL);
+}
+
+static void
+assert_native_matview_scope_result(bool blocked, int caught)
+{
+	UT_ASSERT_EQ(caught, blocked ? 1 : 2);
+	UT_ASSERT_EQ(error_code, blocked ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+	if (blocked) {
+		UT_ASSERT_STR_EQ(error_message, "materialized views is not supported in shared mode");
+		UT_ASSERT_STR_EQ(error_detail,
+						 "PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+	}
+	UT_ASSERT_EQ(matview_scope_lookups, blocked ? 0 : 1);
+	UT_ASSERT_EQ(matview_scope_bad_lookup, 0);
+	UT_ASSERT_EQ(matview_scope_unexpected_callbacks, 0);
+}
+
+UT_TEST(test_native_matview_scope_matches_utility_before_relation_lock)
+{
+	for (unsigned form = 0; form < 8; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool blocked = (mode & 5) != 0;
+			int caught;
+
+			reset_native_matview_scope(form);
+			set_native_operator_mode(mode);
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				create_sql_entry((Node *)&native_matview_scope_statement);
+			UT_ASSERT_EQ(caught, blocked ? 1 : 0);
+			UT_ASSERT_EQ(error_code, blocked ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+			if (blocked) {
+				UT_ASSERT_STR_EQ(error_message,
+								 "materialized views is not supported in shared mode");
+				UT_ASSERT_STR_EQ(error_detail,
+								 "PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+			}
+			UT_ASSERT_EQ(matview_scope_lookups + utility_xids + utility_prepares + utility_binds,
+						 0);
+			reset_error();
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_matview_scope_entry();
+			assert_native_matview_scope_result(blocked, caught);
+			UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			UT_ASSERT_EQ(utility_top_xid, InvalidTransactionId);
+		}
+	}
+	matview_scope_lookup_active = false;
+}
+
+UT_TEST(test_native_matview_scope_precedes_context_child_top_and_publication)
+{
+	for (unsigned form = 0; form < 8; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			for (unsigned fault = 0; fault < 7; fault++) {
+				int caught;
+
+				reset_native_matview_scope(form);
+				set_native_operator_mode(mode);
+				XactReadOnly = fault == 0;
+				utility_parallel = fault == 1;
+				utility_recovery = fault == 2;
+				utility_in_child = fault == 3;
+				if (fault == 4 || fault == 5) {
+					utility_current_xid = 401;
+					utility_top_xid = fault == 4 ? 400 : InvalidTransactionId;
+				}
+				utility_bind_ok = fault != 6;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_matview_scope_entry();
+				assert_native_matview_scope_result((mode & 5) != 0, caught);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+				UT_ASSERT_EQ(utility_top_xid, fault == 4 ? 400 : InvalidTransactionId);
+				UT_ASSERT_EQ(utility_current_xid,
+							 fault == 4 || fault == 5 ? 401 : InvalidTransactionId);
+			}
+		}
+	}
+	matview_scope_lookup_active = false;
+}
+
+UT_TEST(test_native_matview_scope_preserves_existing_supported_top_binding)
+{
+	for (unsigned form = 0; form < 8; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			for (unsigned fault = 0; fault < 5; fault++) {
+				int caught;
+
+				reset_native_matview_scope(form);
+				create_sql_entry((Node *)&matview_scope_warm_statement);
+				UT_ASSERT_EQ(utility_xids, 1);
+				UT_ASSERT_EQ(utility_prepares, 1);
+				UT_ASSERT_EQ(utility_binds, 1);
+				set_native_operator_mode(mode);
+				XactReadOnly = fault == 0;
+				utility_parallel = fault == 1;
+				utility_recovery = fault == 2;
+				utility_in_child = fault == 3;
+				utility_bind_ok = fault != 4;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_matview_scope_entry();
+				assert_native_matview_scope_result((mode & 5) != 0, caught);
+				UT_ASSERT_EQ(utility_xids, 1);
+				UT_ASSERT_EQ(utility_prepares, 1);
+				UT_ASSERT_EQ(utility_binds, 1);
+				UT_ASSERT_EQ(utility_top_xid, 400);
+				UT_ASSERT_EQ(utility_current_xid, 400);
+			}
+		}
+	}
+	matview_scope_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(318);
+	UT_PLAN(321);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -20323,6 +20505,9 @@ main(void)
 	UT_RUN(test_native_domain_alter_scope_matches_utility_before_type_name_allocation);
 	UT_RUN(test_native_domain_alter_scope_precedes_context_child_top_and_publication);
 	UT_RUN(test_native_domain_alter_scope_preserves_existing_supported_top_binding);
+	UT_RUN(test_native_matview_scope_matches_utility_before_relation_lock);
+	UT_RUN(test_native_matview_scope_precedes_context_child_top_and_publication);
+	UT_RUN(test_native_matview_scope_preserves_existing_supported_top_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
