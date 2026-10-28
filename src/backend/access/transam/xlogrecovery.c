@@ -184,6 +184,7 @@
 #include "access/xlog_internal.h"
 #include "catalog/catversion.h"
 #ifdef USE_PGRAC_CLUSTER
+#include "access/htup_details.h"
 /* PGRAC: spec-4.1 own-stream strict thread-id for crash recovery. */
 #include "cluster/cluster_apply_master_election.h"
 #include "cluster/cluster_backup.h" /* PGRAC: spec-6.5 restore/PITR manifest */
@@ -2379,6 +2380,112 @@ cluster_recovery_cold_page_reference_hot(const ClusterRecoveryCensusReferencesV1
 	return cluster_ctrc_recovery_heap_hot_items_v1(slots, items, count, block_number);
 }
 
+/* Compare fields, never native structure padding. A ctid is relative to this
+ * exact physical SPACE, not another relation or a reused incarnation. */
+static bool
+cluster_recovery_cold_reference_same_space(const ClusterSpaceIdentity *a,
+	const ClusterSpaceIdentity *b)
+{
+	return a->key.system_identifier == b->key.system_identifier
+		&& a->key.database_incarnation == b->key.database_incarnation
+		&& memcmp(a->key.storage_uuid, b->key.storage_uuid, 16) == 0
+		&& a->key.locator.spcOid == b->key.locator.spcOid
+		&& a->key.locator.dbOid == b->key.locator.dbOid
+		&& a->key.locator.relNumber == b->key.locator.relNumber
+		&& memcmp(a->incarnation, b->incarnation, 16) == 0
+		&& a->sequence == b->sequence && a->operation == b->operation && a->state == b->state;
+}
+
+/* The complete tuple/terminal checks precede this lookup. Keep their original
+ * DATA identity for this page/version; neither a raw xid nor a lock-only slot
+ * can supply the other half of a cross-page update. */
+static const ClusterRecoveryTxnKey *
+cluster_recovery_cold_reference_transaction(const ClusterRecoveryCensusReferencesV1 *references,
+	const ClusterRecoveryCensusReferenceV1 *item, TransactionId xid)
+{
+	const ClusterRecoveryTxnKey *found = NULL;
+
+	for (uint32 i = 0; i < references->count; i++) {
+		const ClusterRecoveryCensusReferenceV1 *candidate = &references->entries[i];
+		const ClusterItlSlotData *slot = &candidate->entry.itl;
+
+		if (candidate->page_index != item->page_index || candidate->version != item->version
+			|| candidate->entry.kind != CLUSTER_RECOVERY_HEAP_ITL || slot->xid != xid
+			|| (slot->flags != ITL_FLAG_ACTIVE && slot->flags != ITL_FLAG_COMMITTED
+				&& slot->flags != ITL_FLAG_ABORTED && slot->flags != ITL_FLAG_NEEDS_CLEANOUT)) continue;
+		if (found != NULL) return NULL;
+		found = &candidate->transaction.transaction;
+	}
+	return found;
+}
+
+/* Only ordinal zero describes the simultaneous current physical pages.
+ * Inverse ordinals are local undo steps, never a cross-page chronology.
+ * Native ordinary stale ctids remain non-edges; a matching current pair must
+ * also match the complete canonical transaction, not just a recycled xid.
+ * This is a reference consistency check, not a full graph or history proof. */
+static bool
+cluster_recovery_cold_page_reference_cross_page(const ClusterRecoveryCensusPagesV1 *pages,
+	const ClusterRecoveryCensusReferencesV1 *references)
+{
+	for (uint32 i = 0; i < references->count; i++) {
+		const ClusterRecoveryCensusReferenceV1 *item = &references->entries[i];
+		const ClusterRecoveryCensusReferenceV1 *target = NULL;
+		const ClusterRecoveryCensusPageV1 *page;
+		const ClusterRecoveryTxnKey *from, *to;
+		HeapTupleHeaderData tuple, next;
+		TransactionId xmax;
+		BlockNumber block;
+		OffsetNumber offset;
+
+		if (item->version != 0 || item->entry.kind != CLUSTER_RECOVERY_HEAP_ITEM
+			|| !ItemIdIsNormal(&item->entry.item)) continue;
+		if (item->page_index >= pages->count || item->entry.tuple_bytes == NULL
+			|| item->entry.tuple_length < SizeofHeapTupleHeader) return false;
+		page = &pages->entries[item->page_index];
+		memcpy(&tuple, item->entry.tuple_bytes, SizeofHeapTupleHeader);
+		if ((tuple.t_infomask & HEAP_XMAX_INVALID) != 0) continue;
+		if ((tuple.t_infomask & HEAP_XMAX_IS_MULTI) != 0
+			|| HEAP_XMAX_IS_LOCKED_ONLY(tuple.t_infomask)) return false;
+		xmax = HeapTupleHeaderGetRawXmax(&tuple);
+		if (!TransactionIdIsNormal(xmax) || !ItemPointerIsValid(&tuple.t_ctid)) continue;
+		block = ItemPointerGetBlockNumber(&tuple.t_ctid);
+		offset = ItemPointerGetOffsetNumber(&tuple.t_ctid);
+		if (block == page->blockno || offset > MaxHeapTuplesPerPage) continue;
+		for (uint32 j = 0; j < references->count; j++) {
+			const ClusterRecoveryCensusReferenceV1 *candidate = &references->entries[j];
+			const ClusterRecoveryCensusPageV1 *candidate_page;
+
+			if (candidate->version != 0 || candidate->page_index == item->page_index
+				|| candidate->entry.kind != CLUSTER_RECOVERY_HEAP_ITEM
+				|| candidate->entry.index != offset || !ItemIdIsNormal(&candidate->entry.item)) continue;
+			if (candidate->page_index >= pages->count) return false;
+			candidate_page = &pages->entries[candidate->page_index];
+			if (candidate_page->blockno != block || candidate_page->forknum != page->forknum
+				|| !cluster_recovery_cold_reference_same_space(&page->reservation.identity,
+					&candidate_page->reservation.identity)) continue;
+			if (target != NULL) return false;
+			target = candidate;
+		}
+		if (target == NULL) continue;
+		if (target->entry.tuple_bytes == NULL || target->entry.tuple_length < SizeofHeapTupleHeader)
+			return false;
+		memcpy(&next, target->entry.tuple_bytes, SizeofHeapTupleHeader);
+		if (HeapTupleHeaderGetXmin(&next) != xmax) continue;
+		from = cluster_recovery_cold_reference_transaction(references, item, xmax);
+		to = cluster_recovery_cold_reference_transaction(references, target, xmax);
+		if ((tuple.t_infomask2 & HEAP_HOT_UPDATED) != 0 || HeapTupleHeaderIsHeapOnly(&next)
+			|| from == NULL || to == NULL
+			|| from->system_identifier != to->system_identifier
+			|| from->database_incarnation != to->database_incarnation
+			|| from->origin_node_id != to->origin_node_id || from->segment_id != to->segment_id
+			|| from->segment_generation != to->segment_generation
+			|| from->slot_offset != to->slot_offset || from->slot_wrap != to->slot_wrap
+			|| from->xid != to->xid) return false;
+	}
+	return true;
+}
+
 /* PGRAC: consume the complete original relation/history view, including
  * pages absent from PAGE WAL. Match the graph's full canonical identity,
  * never a raw xid or a current slot chosen for an older generation. The
@@ -2448,6 +2555,7 @@ cluster_recovery_cold_page_reference_terminals(const struct ClusterRecoveryStart
 		}
 		if (matches != 1) return false;
 	}
+	if (!cluster_recovery_cold_page_reference_cross_page(pages, references)) return false;
 	/* Original complete getter checks every retained byte/record lifetime and
 	 * canonical terminal again. A callback cannot replace the saved views. */
 	return references == ClusterColdRecoveryCtrcReferences(start, work)
