@@ -9275,6 +9275,32 @@ test_cluster_r4_activation_fsm: test_cluster_r4_activation_fsm.c unit_test.h tes
 		$(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -lssl -lcrypto -o $@
 
+TESTS += test_cluster_control_rebind
+all: test_cluster_control_rebind
+
+test_cluster_control_rebind: test_cluster_control_rebind.c test_cluster_r4_activation_fsm.c \
+		test_cluster_first_open.h test_cluster_serving_admission.h test_cluster_sample_ack_handoff.h \
+		test_cluster_clean_restart_formation.h test_cluster_commit_carrier.h unit_test.h \
+		test_cluster_normal_cold_scn.inc test_cluster_terminal_peer.inc \
+		test_cluster_stop_membership_observation.inc test_cluster_normal_cold_startup.h \
+		test_cluster_normal_cold_capture.inc test_cluster_normal_cold_prepare.inc \
+		test_cluster_normal_cold_postjobs.inc test_cluster_hw_complete_tail.inc \
+		test_cluster_normal_cold_runtime.h cluster_r4_open_route_test_stubs.h \
+		$(CLUSTER_SEMANTIC_ACTIVATION_C) $(CLUSTER_SEMANTIC_ACTIVATION_H) \
+		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_BLOCK0_O) $(CLUSTER_REPLACEMENT_EPISODE_O) \
+		$(CLUSTER_REPLACEMENT_WIRE_O) $(CLUSTER_EPOCH_BALLOT_O) \
+		$(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) $(CLUSTER_R4_OPEN_ROUTE_TEST_O) \
+		$(CLUSTER_UNDO_BLOCK0_RESIDENT_O) $(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_BLOCK0_O) $(CLUSTER_REPLACEMENT_EPISODE_O) \
+		$(CLUSTER_REPLACEMENT_WIRE_O) $(CLUSTER_EPOCH_BALLOT_O) \
+		$(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) $(CLUSTER_R4_OPEN_ROUTE_TEST_O) \
+		$(CLUSTER_UNDO_BLOCK0_RESIDENT_O) $(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) -lssl -lcrypto -o $@
+
 # Stage 8 R4 D6 lifecycle/store RED tranche: link the real heap HOT lifecycle,
 # index-handler ownership switch, executor buffer-slot implementation and heap
 # tuple copy.  Function sections keep this intermediate tranche independent of

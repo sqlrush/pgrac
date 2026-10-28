@@ -91,6 +91,38 @@ typedef struct ClusterSemanticActivationAckWireV1 {
 	uint8 restart_binding[PG_SHA256_DIGEST_LENGTH];
 } ClusterSemanticActivationAckWireV1;
 
+#define CLUSTER_SEMANTIC_CONTROL_REBIND_WIRE_VERSION UINT16_C(3)
+#define CLUSTER_SEMANTIC_CONTROL_REBIND_STATE_BUDGET 65536
+
+typedef struct ClusterSemanticControlRebindWireV3 {
+	uint8 kind;
+	uint8 stage;
+	uint32 result;
+	uint32 reason;
+	uint32 coordinator_node;
+	uint32 member_node;
+	uint64 transition_epoch;
+	uint64 record_generation;
+	uint64 round_nonce;
+	uint64 source_feature_bitmap;
+	uint64 target_feature_bitmap;
+	uint64 rollback_feature_bitmap;
+	uint64 admitted_members_lo;
+	uint64 admitted_members_hi;
+	uint64 capability_sample_digest;
+	uint64 boot_id;
+	uint64 admitted_incarnation;
+	uint32 capability_word;
+	uint8 proof_binding[PG_SHA256_DIGEST_LENGTH];
+} ClusterSemanticControlRebindWireV3;
+
+extern bool cluster_semantic_control_rebind_wire_encode(
+	const ClusterSemanticControlRebindWireV3 *message,
+	uint8 bytes[CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES]);
+extern bool cluster_semantic_control_rebind_wire_decode(
+	const uint8 bytes[CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES],
+	ClusterSemanticControlRebindWireV3 *message);
+
 typedef enum ClusterSemanticAdmissionSide {
 	CLUSTER_SEMANTIC_SOURCE_SIDE = 0,
 	CLUSTER_SEMANTIC_TARGET_SIDE = 1
