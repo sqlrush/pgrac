@@ -44,8 +44,10 @@
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "access/xlogreader.h"
+#include "access/xlogutils.h"
 #include "cluster/cluster_control_root.h"
 #include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_epoch.h"
 #include "cluster/cluster_external_fence.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic_tier1.h" /* spec-6.14 D9 amend: claim-holder liveness poll */
@@ -60,6 +62,7 @@
 #include "cluster/cluster_thread_recovery_authority.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_wal_tail.h"
+#include "postmaster/interrupt.h"
 #include "postmaster/startup.h"				   /* spec-6.14 D9 amend: HandleStartupProcInterrupts */
 #include "cluster/storage/cluster_shared_fs.h" /* spec-4.5a D4: capability gate */
 #include "cluster_control_root_private.h"	   /* failed-writer input seal (S9P2-05) */
@@ -69,6 +72,8 @@
 #include "portability/instr_time.h"
 #include "storage/fd.h"
 #include "storage/latch.h"
+#include "storage/lwlock.h"
+#include "storage/proc.h"
 #include "utils/errcodes.h"
 #include "utils/resowner.h"
 #include "utils/wait_event.h"
@@ -538,21 +543,155 @@ merge_claim_custody_current(void)
 /* Use the original CF serialization domain only for claim metadata. Never
  * hold it while waiting on another claimant, scanning WAL or acquiring IR.
  * Startup uses the existing blocking CF owner, not LMON/LMS poll APIs. */
+static bool merge_claim_waiter_current(void);
+
+static bool
+merge_claim_cf_context_current(const MergeClaimCustody *custody, bool owned, uint64 epoch,
+							   uint64 generation, bool recovery)
+{
+	return MyProc != NULL && MyLatch != NULL && AmStartupProcess() && MyBackendType == B_STARTUP
+		   && cluster_shared_config && cluster_enabled && cluster_controlfile_shared_authority
+		   && !ShutdownRequestPending && CritSectionCount == 0 && !LWLockHeldByMe(ControlFileLock)
+		   && InRecovery == recovery && epoch != 0 && generation != 0
+		   && cluster_epoch_get_current() == epoch
+		   && cluster_grd_redeclare_generation() == generation
+		   && cluster_recovery_transport_components_current() && merge_claim_held == owned
+		   && merge_claim_serial == custody->serial
+		   && memcmp(custody, &merge_claim_custody, sizeof(*custody)) == 0
+		   && (owned ? merge_claim_custody_current() : merge_claim_waiter_current());
+}
+
+/* A failed request retains cleanup, never claim authority. Finish only its
+ * original registry obligation, outside native CF and claim mutation. The
+ * original file custody must still qualify before another CF acquisition.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static void
+merge_claim_cf_wait(const ClusterCfAttemptObservation *attempt, const MergeClaimCustody *custody,
+					bool owned, uint64 epoch, uint64 generation, bool recovery)
+{
+	ClusterCfRetirementSnapshot original;
+	const char *reason = "UNSAFE_CF_WAIT";
+	bool empty = attempt->owner_state_at_return == CLUSTER_LOCK_OWNER_EMPTY;
+	bool empty_waited = false;
+	PGPROC *proc = MyProc;
+	Latch *latch = MyLatch;
+
+	if (MyProc == NULL || MyLatch == NULL || CritSectionCount != 0
+		|| LWLockHeldByMe(ControlFileLock) || cluster_cf_held(ShareLock))
+		goto refuse;
+	if (!empty
+		&& (!cluster_cf_retirement_snapshot(ExclusiveLock, NULL, &original)
+			|| original.cookie != attempt->control_owner_id
+			|| original.registry.message.key.holder.request_id != attempt->request_id
+			|| original.registry.message.key.holder.cluster_epoch != attempt->request_epoch)) {
+		reason = "CF_WAIT_IDENTITY_OR_COMPLETION";
+		goto refuse;
+	}
+	for (;;) {
+		ClusterCfRetirementSnapshot current;
+		bool held;
+
+		HandleStartupProcInterrupts();
+		CHECK_FOR_INTERRUPTS();
+		reason = "CONTEXT_CHANGED_AFTER_WAIT_SLICE";
+		if (MyProc != proc || MyLatch != latch
+			|| !merge_claim_cf_context_current(custody, owned, epoch, generation, recovery))
+			goto refuse;
+		ResetLatch(MyLatch);
+		held = cluster_cf_held(ExclusiveLock);
+		if (!held && !cluster_cf_held(ShareLock)) {
+			if (!empty && cluster_cf_release_completed(ExclusiveLock, original.cookie))
+				return;
+			if (empty) {
+				if (empty_waited)
+					return;
+				/* No request was published. A wake only schedules requalification. */
+				empty_waited = true;
+				(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+								WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
+				continue;
+			}
+		}
+		reason = "CF_WAIT_IDENTITY_OR_COMPLETION";
+		if (empty || !held || cluster_cf_held(ShareLock)
+			|| !cluster_cf_retirement_snapshot(ExclusiveLock, NULL, &current)
+			|| current.cookie != original.cookie
+			|| current.registry.handle.slot != original.registry.handle.slot
+			|| current.registry.handle.generation != original.registry.handle.generation
+			|| memcmp(&current.registry.owner, &original.registry.owner,
+					  sizeof(current.registry.owner))
+				   != 0
+			|| memcmp(&current.registry.message.key, &original.registry.message.key,
+					  sizeof(current.registry.message.key))
+				   != 0)
+			goto refuse;
+		cluster_lock_owners_service_poll();
+		cluster_cf_retirement_poll();
+		if (cluster_cf_held(ExclusiveLock))
+			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+							WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
+	}
+
+refuse:
+	ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+					errmsg("recovery claim cannot continue its control-file wait"),
+					errdetail("PGRAC_FAMILY=STARTUP_CONTROL consumer=merge_claim operation=%s "
+							  "reason=%s cookie=" UINT64_FORMAT " request=" UINT64_FORMAT,
+							  owned ? "release" : "publish", reason, attempt->control_owner_id,
+							  attempt->request_id)));
+}
+
 static uint64
 merge_claim_cf_enter(void)
 {
+	MergeClaimCustody custody;
+	bool owned = merge_claim_held, recovery = InRecovery;
+	uint64 epoch = cluster_epoch_get_current();
+	uint64 generation = cluster_grd_redeclare_generation();
 	uint64 cookie;
+	bool logged = false;
 
-	if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock)
-		|| !cluster_cf_lock(ExclusiveLock))
-		ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
-					errmsg("recovery claim CF serialization is unavailable")));
+	memcpy(&custody, &merge_claim_custody, sizeof(custody));
+	for (;;) {
+		ClusterCfAttemptObservation attempt;
+		uint64 before = cluster_cf_attempt_sequence();
+
+		if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
+			ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+							errmsg("recovery claim CF serialization is unavailable")));
+		if (cluster_cf_lock(ExclusiveLock))
+			break;
+		if (!cluster_cf_last_attempt_since(before, &attempt)
+			|| !cluster_cf_attempt_wait_slice(&attempt) || attempt.mode != ExclusiveLock)
+			ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+							errmsg("recovery claim CF serialization is unavailable"),
+							errdetail("PGRAC_FAMILY=STARTUP_CONTROL consumer=merge_claim "
+									  "reason=CF_ACQUIRE_REFUSAL")));
+		if (!logged) {
+			logged = true;
+			ereport(LOG,
+					(errmsg("recovery claim is waiting for control-file serialization"),
+					 errdetail("PGRAC_FAMILY=CF_OWNER_WAIT consumer=merge_claim operation=%s "
+							   "reason=WAIT_SLICE cookie=" UINT64_FORMAT " request=" UINT64_FORMAT,
+							   owned ? "release" : "publish", attempt.control_owner_id,
+							   attempt.request_id)));
+		}
+		merge_claim_cf_wait(&attempt, &custody, owned, epoch, generation, recovery);
+	}
 	cookie = cluster_cf_owner_cookie(ExclusiveLock);
 	if (cookie == 0 || !cluster_cf_held_is_clusterwide(ExclusiveLock)) {
 		(void)cluster_cf_unlock_confirmed(ExclusiveLock);
 		ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
 					errmsg("recovery claim requires clusterwide CF ownership")));
 	}
+	/* The new acquisition can itself yield. The old completion did not
+	 * preserve file custody or authorize any mutation under this new cookie. */
+	if (logged && !merge_claim_cf_context_current(&custody, owned, epoch, generation, recovery))
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+						errmsg("recovery claim context changed during control-file reacquisition"),
+						errdetail("PGRAC_FAMILY=STARTUP_CONTROL consumer=merge_claim operation=%s "
+								  "reason=CONTEXT_CHANGED_AFTER_REACQUIRE cookie=" UINT64_FORMAT,
+								  owned ? "release" : "publish", cookie)));
 	return cookie;
 }
 

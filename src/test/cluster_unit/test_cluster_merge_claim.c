@@ -8,16 +8,23 @@
 #include <unistd.h>
 #include "access/xlog.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_epoch.h"
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_recovery_merge.h"
+#include "cluster/cluster_startup_phase.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/storage/cluster_shared_fs.h"
+#include "miscadmin.h"
 #include "storage/fd.h"
+#include "storage/latch.h"
+#include "storage/lwlock.h"
+#include "storage/proc.h"
 #include "postmaster/startup.h"
 #include "utils/errcodes.h"
 #include "utils/resowner.h"
+#include "utils/wait_event.h"
 
 #undef printf
 #undef fprintf
@@ -47,6 +54,94 @@ static uint64 cf_cookie=1;
 static void (*read_hook)(void);
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
+/* CF is intentionally a hard-refusal/grant leaf in this filesystem suite.
+ * The actual wait producer and consumer run in test_cluster_startup_cf_entry. */
+bool InRecovery, cluster_enabled = true;
+bool cluster_shared_config = true, cluster_controlfile_shared_authority = true;
+volatile sig_atomic_t ShutdownRequestPending, InterruptPending;
+volatile uint32 InterruptHoldoffCount, CritSectionCount;
+BackendType MyBackendType = B_STARTUP;
+AuxProcType MyAuxProcType = StartupProcess;
+PGPROC *MyProc = (PGPROC *)1;
+Latch *MyLatch;
+LWLockPadded *MainLWLockArray;
+uint64
+cluster_epoch_get_current(void)
+{
+	return 1;
+}
+uint64
+cluster_grd_redeclare_generation(void)
+{
+	return 1;
+}
+uint64
+cluster_cf_attempt_sequence(void)
+{
+	return 0;
+}
+bool
+cluster_cf_last_attempt_since(uint64 before, ClusterCfAttemptObservation *out)
+{
+	TEST_REQUIRE(before == 0 && out != NULL);
+	return false;
+}
+bool
+cluster_cf_attempt_wait_slice(const ClusterCfAttemptObservation *out)
+{
+	TEST_REQUIRE(false);
+	return false;
+}
+bool
+cluster_cf_retirement_snapshot(LOCKMODE mode, const void *caller, ClusterCfRetirementSnapshot *out)
+{
+	TEST_REQUIRE(false);
+	return false;
+}
+bool
+cluster_cf_release_completed(LOCKMODE mode, uint64 cookie)
+{
+	TEST_REQUIRE(false);
+	return false;
+}
+bool
+cluster_recovery_transport_components_current(void)
+{
+	TEST_REQUIRE(false);
+	return false;
+}
+bool
+LWLockHeldByMe(LWLock *lock)
+{
+	TEST_REQUIRE(false);
+	return false;
+}
+void
+ResetLatch(Latch *latch)
+{
+	TEST_REQUIRE(false);
+}
+int
+WaitLatch(Latch *latch, int events, long timeout, uint32 event)
+{
+	TEST_REQUIRE(false);
+	return 0;
+}
+void
+cluster_lock_owners_service_poll(void)
+{
+	TEST_REQUIRE(false);
+}
+void
+cluster_cf_retirement_poll(void)
+{
+	TEST_REQUIRE(false);
+}
+void
+ProcessInterrupts(void)
+{
+	TEST_REQUIRE(false);
+}
 void pg_re_throw(void)
 { if (PG_exception_stack!=NULL) siglongjmp(*PG_exception_stack,1); longjmp(failure,1); }
 bool cluster_cf_lock(LOCKMODE mode)
