@@ -127,6 +127,7 @@ static SlruCtlData ClogRecoveryCtl[CLOG_RECOVERY_ORIGINS];
 static LWLockPadded *ClogRecoveryLocks;
 
 static void clog_recovery_shmem_init(void);
+static void clog_relmap_native_mutation(int origin);
 #endif
 
 
@@ -689,6 +690,9 @@ TransactionIdSetStatusBit(TransactionId xid, XidStatus status, XLogRecPtr lsn, i
 			status != TRANSACTION_STATUS_IN_PROGRESS) ||
 		   curval == status);
 
+#ifdef USE_PGRAC_CLUSTER
+	clog_relmap_native_mutation(cluster_node_id);
+#endif
 	/* note this assumes exclusive access to the clog page */
 	byteval = *byteptr;
 	byteval &= ~(((1 << CLOG_BITS_PER_XACT) - 1) << bshift);
@@ -1261,9 +1265,42 @@ struct ClusterRelmapClogBaseHandleV1 {
 	pid_t pid;
 	int fd;
 	bool failed;
+	bool invalidated;
+	struct ClusterRelmapClogBaseHandleV1 *next;
 	ClusterRecoveryRelmapSourceV1 source;
 	ClusterRelmapClogBaseV1 base;
 };
+
+/* Nonowning process-local bookkeeping for the original handles. A native
+ * write can restore identical bytes, so inode/image equality cannot revive
+ * an observation across that write. This is not cross-process exclusion or
+ * an era/history/lifetime proof. The original destructor still owns the fd. */
+static ClusterRelmapClogBaseHandleV1 *ClogRelmapBases;
+
+static void
+clog_relmap_native_mutation(int origin)
+{
+	ClusterRelmapClogBaseHandleV1 *held;
+
+	if (!cluster_shared_config)
+		return;
+	for (held = ClogRelmapBases; held != NULL; held = held->next)
+		if (held->pid == getpid()
+			&& held->source.selected.source.claim.identity.origin_thread_id == origin + 1)
+			held->invalidated = true;
+}
+
+static void
+clog_relmap_base_unlink(ClusterRelmapClogBaseHandleV1 *held)
+{
+	ClusterRelmapClogBaseHandleV1 **link;
+
+	for (link = &ClogRelmapBases; *link != NULL; link = &(*link)->next)
+		if (*link == held) {
+			*link = held->next;
+			return;
+		}
+}
 
 size_t
 cluster_clog_relmap_base_custody_bytes_v1(void)
@@ -1345,7 +1382,7 @@ clog_relmap_base_read(const ClusterRecoveryRelmapSourceV1 *source,
 		if (held->pid != getpid() || held->failed)
 			return false;
 		held->failed = true;
-		if (held->fd < 0 || held->base.queried_full_xid != requested_full_xid
+		if (held->invalidated || held->fd < 0 || held->base.queried_full_xid != requested_full_xid
 			|| memcmp(&held->source, &original, sizeof(original)) != 0) {
 			cluster_wal_inputs_relmap_source_fail_v1(&held->source);
 			return false;
@@ -1379,6 +1416,8 @@ clog_relmap_base_read(const ClusterRecoveryRelmapSourceV1 *source,
 		}
 		held->pid = getpid(); held->fd = -1; held->failed = true;
 		memcpy(&held->source, &original, sizeof(original));
+		held->next = ClogRelmapBases;
+		ClogRelmapBases = held;
 	}
 
 	PG_TRY();
@@ -1387,7 +1426,7 @@ clog_relmap_base_read(const ClusterRecoveryRelmapSourceV1 *source,
 		if (ok) {
 			LWLockAcquire(lock, LW_EXCLUSIVE);
 			locked = true;
-			ok = clog_relmap_source_current(&original, origin)
+			ok = !held->invalidated && clog_relmap_source_current(&original, origin)
 				&& clog_native_directory_ready(origin)
 				&& clog_recovery_page_identity(&disk, page, &before);
 			if (ok) {
@@ -1421,7 +1460,7 @@ clog_relmap_base_read(const ClusterRecoveryRelmapSourceV1 *source,
 		}
 		/* There is no native lock or borrowed-output publication over ROOT I/O. */
 		ok = ok && cluster_wal_inputs_relmap_source_revalidate_v1(&original)
-			&& memcmp(source, &original, sizeof(original)) == 0;
+			&& memcmp(source, &original, sizeof(original)) == 0 && !held->invalidated;
 		if (!ok)
 			cluster_wal_inputs_relmap_source_fail_v1(&original);
 	}
@@ -1435,8 +1474,10 @@ clog_relmap_base_read(const ClusterRecoveryRelmapSourceV1 *source,
 		}
 		if (fd >= 0 && !existing)
 			(void)CloseTransientFile(fd);
-		if (!existing)
+		if (!existing) {
+			clog_relmap_base_unlink(held);
 			free(held);
+		}
 		cluster_wal_inputs_relmap_source_fail_v1(&original);
 		PG_RE_THROW();
 	}
@@ -1444,8 +1485,10 @@ clog_relmap_base_read(const ClusterRecoveryRelmapSourceV1 *source,
 	if (!ok) {
 		if (fd >= 0 && !existing)
 			(void)CloseTransientFile(fd);
-		if (!existing)
+		if (!existing) {
+			clog_relmap_base_unlink(held);
 			free(held);
+		}
 		return false;
 	}
 	base.queried_full_xid = requested_full_xid;
@@ -1493,6 +1536,7 @@ cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **custody)
 		return;
 	held = *custody;
 	*custody = NULL;
+	clog_relmap_base_unlink(held);
 	if (held->fd >= 0)
 		(void)CloseTransientFile(held->fd);
 	free(held);
@@ -1751,6 +1795,8 @@ clog_recovery_access(int origin, TransactionId xid, int nsubxids, const Transact
 			return false;
 		previous = subxids[i];
 	}
+	if (!verify)
+		clog_relmap_native_mutation(origin);
 	if (origin == cluster_node_id)
 		return clog_recovery_own_abort(origin, xid, verify);
 	lock = &ClogRecoveryLocks[origin * 2 + 1].lock;
@@ -1949,6 +1995,8 @@ clog_recovery_record(int origin, const ClusterSideProjectionOperationV1 *op, boo
 			return false;
 	} else
 		return false;
+	if (!verify)
+		clog_relmap_native_mutation(origin);
 	lock = &ClogRecoveryLocks[origin * 2 + 1].lock;
 	PG_TRY();
 	{
@@ -2105,6 +2153,9 @@ ZeroCLOGPage(int pageno, bool writeXlog)
 {
 	int			slotno;
 
+#ifdef USE_PGRAC_CLUSTER
+	clog_relmap_native_mutation(cluster_node_id);
+#endif
 	slotno = SimpleLruZeroPage(XactCtl, pageno);
 
 	if (writeXlog)
@@ -2315,6 +2366,9 @@ TruncateCLOG(TransactionId oldestXact, Oid oldestxid_datoid)
 	if (!SlruScanDirectory(XactCtl, SlruScanDirCbReportPresence, &cutoffPage))
 		return;					/* nothing to remove */
 
+#ifdef USE_PGRAC_CLUSTER
+	clog_relmap_native_mutation(cluster_node_id);
+#endif
 	/*
 	 * Advance oldestClogXid before truncating clog, so concurrent xact status
 	 * lookups can ensure they don't attempt to access truncated-away clog.
@@ -2516,6 +2570,9 @@ clog_redo(XLogReaderState *record)
 
 		memcpy(&xlrec, XLogRecGetData(record), sizeof(xl_clog_truncate));
 
+#ifdef USE_PGRAC_CLUSTER
+		clog_relmap_native_mutation(cluster_node_id);
+#endif
 		AdvanceOldestClogXid(xlrec.oldestXact);
 
 		SimpleLruTruncate(XactCtl, xlrec.pageno);
