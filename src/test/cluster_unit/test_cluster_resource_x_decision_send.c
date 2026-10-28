@@ -158,7 +158,8 @@ UT_TEST(test_decision_send_exact_container_capacity)
 	/* Unrelated completion/control owners retain their original capacity. */
 	UT_ASSERT_EQ(sizeof(ClusterPcmResourceXControlIntent), 408);
 	UT_ASSERT_EQ(sizeof(ClusterPcmResourceXSourceSettlement), 432);
-	UT_ASSERT_EQ(sizeof(ClusterPcmResourceXMasterState), 78456);
+	UT_ASSERT_EQ(sizeof(ClusterPcmResourceXRequesterJoin), 13680);
+	UT_ASSERT_EQ(sizeof(ClusterPcmResourceXMasterState), 83016);
 	reset_fake_pcm_runtime(24);
 	printf("# master_state_bytes=%zu header24_requested=%zu fixture_capacity=%zu\n",
 		sizeof(ClusterPcmResourceXMasterState), fake_pcm_header_requested_size, sizeof(fake_pcm_header.data));

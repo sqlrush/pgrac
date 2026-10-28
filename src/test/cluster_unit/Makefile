@@ -10233,3 +10233,21 @@ clean distclean maintainer-clean: clean-resource-x-s-source
 .PHONY: clean-resource-x-s-source
 clean-resource-x-s-source:
 	rm -f test_cluster_resource_x_s_source
+
+# Same original PCM requester owner and independent complete-wire builders.
+TESTS += test_cluster_resource_x_requester_evidence
+all: test_cluster_resource_x_requester_evidence
+test_cluster_resource_x_requester_evidence: test_cluster_resource_x_requester_evidence.c \
+		test_cluster_pcm_lock test_cluster_resource_x_transport_frames.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+clean distclean maintainer-clean: clean-requester-evidence
+.PHONY: clean-requester-evidence
+clean-requester-evidence:
+	rm -f test_cluster_resource_x_requester_evidence

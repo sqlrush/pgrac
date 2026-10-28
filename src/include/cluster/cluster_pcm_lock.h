@@ -954,9 +954,13 @@ StaticAssertDecl(sizeof(ResourceXBootstrapWork) <= RESOURCE_X_PROOF_V1_BYTES,
 #define RESOURCE_X_REQUESTER_JOIN_READY UINT32_C(0x00000004)
 #define RESOURCE_X_REQUESTER_JOIN_TERMINAL UINT32_C(0x00000008)
 #define RESOURCE_X_REQUESTER_JOIN_AUTHORITY_WITH_IMAGE UINT32_C(0x00000010)
-#define RESOURCE_X_REQUESTER_JOIN_KNOWN_MASK UINT32_C(0x0000001f)
+/* Wire evidence is not native installation, permission to read disk, or C. */
+#define RESOURCE_X_REQUESTER_JOIN_ACQUIRE UINT32_C(0x00000020)
+#define RESOURCE_X_REQUESTER_JOIN_EVIDENCE_COMPLETE UINT32_C(0x00000040)
+#define RESOURCE_X_REQUESTER_JOIN_KNOWN_MASK UINT32_C(0x0000007f)
 
-/* Requester-local retained view of the two independent type-15 halves.
+/* Requester-local retained view of grant/image material. ACQUIRE evidence
+ * additionally includes all required holder witnesses, separately from READY.
  * Connection-generation freshness is validated by ingress but is not part
  * of this logical equality snapshot. */
 typedef struct ResourceXRequesterJoinSnapshot {

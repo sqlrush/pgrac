@@ -559,7 +559,7 @@ static union {
 	/* Cover the original 24-entry pump cohort including bounded per-holder
 	 * grant provenance and full conditional send bodies. Keep the exact
 	 * ShmemInitStruct fit assertion below. */
-	char data[2752512];
+	char data[2883584];
 } fake_pcm_header;
 
 static union {

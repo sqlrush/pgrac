@@ -57,6 +57,7 @@
 #include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_qvotec.h"
+#include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_pi_rebuild.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
@@ -711,8 +712,14 @@ typedef struct ClusterPcmResourceXRequesterJoin {
 	uint8 reserved;
 	uint32 image_semantic_crc32c;
 	uint32 crc_reserved;
-	uint8 grant_payload[RESOURCE_X_PROOF_V1_BYTES];
-	uint8 image_payload[RESOURCE_X_IMAGE_V2_BYTES];
+	uint8 grant_payload[RESOURCE_X_DECISION_V3_BYTES];
+	uint8 image_payload[RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES];
+	/* Original non-source ACKs, bound to the single immutable A above.
+	 * Source evidence is already contained in the retained image. */
+	uint8 acquire_acks[RESOURCE_X_PROTOCOL_NODE_LIMIT][RESOURCE_X_CONTROL_V1_BYTES];
+	uint32 acquire_ack_bitmap;
+	uint32 acquire_format;
+	uint64 acquire_authority_us;
 } ClusterPcmResourceXRequesterJoin;
 
 /* Unverified requester bookkeeping, never a grant or reusable authority. */
@@ -809,11 +816,11 @@ StaticAssertDecl(sizeof(ClusterPcmResourceXHolderStatus) == 1120,
 				 "Resource-X holder status must retain the full witness");
 StaticAssertDecl(sizeof(ClusterPcmResourceXHolderImage) == 9872,
 				 "Resource-X holder image must retain the complete source envelope");
-StaticAssertDecl(sizeof(ClusterPcmResourceXRequesterJoin) == 9120,
-				 "Resource-X requester join layout must remain 9120 bytes");
+StaticAssertDecl(sizeof(ClusterPcmResourceXRequesterJoin) == 13680,
+				 "Resource-X requester join must bound A, image and original ACKs");
 StaticAssertDecl(sizeof(ClusterPcmResourceXDeferredSettlement) == 160,
 				 "Resource-X deferred settlement must remain bounded");
-StaticAssertDecl(sizeof(ClusterPcmResourceXMasterState) == 78456,
+StaticAssertDecl(sizeof(ClusterPcmResourceXMasterState) == 83016,
 				 "D4 Resource-X master state must bind object generation");
 
 typedef struct ClusterPcmShared {
@@ -3048,6 +3055,19 @@ pcm_resource_x_reconfig_proof_slot_locked(struct GrdEntry *entry,
 			*old_residual_out = true;
 		else
 			(*successor_count_io)++;
+		if (state->requester_join.acquire_format) {
+			const ClusterPcmResourceXRequesterJoin *retained = &state->requester_join;
+
+			digest = pcm_resource_x_proof_digest_u64(digest, retained->acquire_ack_bitmap);
+			for (Size n = 0; n < retained->grant_payload_bytes; n++)
+				digest = pcm_resource_x_proof_digest_u64(digest, retained->grant_payload[n]);
+			for (Size n = 0; n < retained->image_payload_bytes; n++)
+				digest = pcm_resource_x_proof_digest_u64(digest, retained->image_payload[n]);
+			for (int node = 0; node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++)
+				if (retained->acquire_ack_bitmap & (UINT32_C(1) << node))
+					for (Size n = 0; n < RESOURCE_X_CONTROL_V1_BYTES; n++)
+						digest = pcm_resource_x_proof_digest_u64(digest, retained->acquire_acks[node][n]);
+		}
 	}
 	if (state->grant_intent.slot.state != RESOURCE_X_INTENT_SLOT_EMPTY
 		|| state->requester_settlement_intent.slot.state != RESOURCE_X_INTENT_SLOT_EMPTY) {
@@ -27447,6 +27467,131 @@ pcm_resource_x_requester_join_empty_locked(const ClusterPcmResourceXRequesterJoi
 	return memcmp(join, &empty_join, sizeof(*join)) == 0;
 }
 
+static const ResourceXDecodedAcquireDecision *
+pcm_resource_x_requester_acquire_decision(const ResourceXDecodedFrame *frame)
+{
+	if (!frame->has_acquire_decision)
+		return NULL;
+	if (frame->kind == RESOURCE_X_WIRE_AUTHORITY_GRANT)
+		return &frame->body.acquire_decision;
+	if (frame->kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE)
+		return &frame->body.acquire_image.source.decision;
+	if (frame->kind == RESOURCE_X_WIRE_BLOCKED_TO_N)
+		return &frame->body.acquire_witness.decision;
+	return NULL;
+}
+
+/* A delegated through H is the same immutable decision as M's original
+ * grant. Only the outer carrier/sender changes; the nested ACK and image
+ * identities must not be rebound with it. No extra M->R packet is required.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static bool
+pcm_resource_x_requester_acquire_anchor(const ResourceXDecodedFrame *frame, uint8 *payload)
+{
+	const ResourceXDecodedAcquireDecision *decision = pcm_resource_x_requester_acquire_decision(frame);
+	ResourceXDecodedFrame grant;
+	ResourceXWireReject reject;
+	uint16 bytes;
+
+	if (decision == NULL)
+		return false;
+	memset(&grant, 0, sizeof(grant));
+	grant.kind = RESOURCE_X_WIRE_AUTHORITY_GRANT;
+	grant.has_acquire_decision = true;
+	grant.common = frame->common;
+	grant.common.action_node = frame->common.logical_assertion.requester_node;
+	grant.common.outcome = RESOURCE_X_OUTCOME_NONE;
+	grant.common.sender_connection_generation = PGRAC_RESOURCE_X_RETAINED_SENDER_GENERATION;
+	grant.common.semantic_crc32c = 0;
+	grant.body.acquire_decision = *decision;
+	return cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, &grant,
+		payload, RESOURCE_X_DECISION_V3_BYTES, &bytes, &reject)
+		&& bytes == RESOURCE_X_DECISION_V3_BYTES;
+}
+
+/* Validate retained wire material without projecting it into legacy native
+ * grant/ref fields. Compact ACKs are reconstructed against exactly one A;
+ * they cannot replace any holder's independent H->M acknowledgment. */
+static bool
+pcm_resource_x_requester_acquire_decode_locked(const ClusterPcmResourceXRequesterJoin *join,
+	ResourceXDecodedFrame *grant, ResourceXDecodedFrame *image)
+{
+	static const uint8 empty_image[RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES];
+	static const uint8 empty_ack[RESOURCE_X_CONTROL_V1_BYTES];
+	const ResourceXDecodedAcquireDecision *a;
+	ResourceXWireReject reject;
+	uint8 anchor[RESOURCE_X_DECISION_V3_BYTES];
+	uint32 source_bit = 0;
+
+	if (grant == NULL || image == NULL || join->acquire_format != 1
+		|| join->grant_valid != 1 || join->image_valid > 1
+		|| join->grant_payload_bytes != RESOURCE_X_DECISION_V3_BYTES
+		|| join->acquire_authority_us == 0 || join->acquire_authority_us == UINT64_MAX
+		|| join->t_grant_us == UINT64_MAX || join->t_install_us != 0
+		|| join->proof_kind != 0 || join->install_succeeded != 0 || join->settled != 0
+		|| join->requester_loss_seen != 0 || join->authority_with_image != 0
+		|| join->reserved != 0 || join->crc_reserved != 0
+		|| !cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, join->grant_payload,
+			join->grant_payload_bytes, grant, &reject)
+		|| grant->kind != RESOURCE_X_WIRE_AUTHORITY_GRANT || !grant->has_acquire_decision
+		|| grant->common.sender_connection_generation != PGRAC_RESOURCE_X_RETAINED_SENDER_GENERATION)
+		return false;
+	a = &grant->body.acquire_decision;
+	if (join->grant_source_node != a->master_node)
+		return false;
+	if (a->source_kind == RESOURCE_X_ACQUIRE_SOURCE_REMOTE_CURRENT)
+		source_bit = UINT32_C(1) << a->source_node;
+	if ((join->acquire_ack_bitmap & ~(a->required_holders_bitmap & ~source_bit)) != 0)
+		return false;
+	if (join->image_valid) {
+		if (source_bit == 0 || join->image_source_node != a->source_node
+			|| join->t_image_us == 0 || join->t_image_us == UINT64_MAX
+			|| join->image_payload_bytes != RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES
+			|| !cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, join->image_payload,
+				join->image_payload_bytes, image, &reject)
+			|| image->kind != RESOURCE_X_WIRE_IMAGE_ENVELOPE || !image->has_acquire_decision
+			|| image->common.sender_connection_generation != PGRAC_RESOURCE_X_RETAINED_SENDER_GENERATION
+			|| image->common.semantic_crc32c != join->image_semantic_crc32c
+			|| !pcm_resource_x_requester_acquire_anchor(image, anchor)
+			|| memcmp(anchor, join->grant_payload, sizeof(anchor)) != 0
+			|| !pcm_resource_x_acquire_source_proof_valid(&image->body.acquire_image.source.original_proof,
+				a, &image->common))
+			return false;
+	} else if (join->image_source_node != -1 || join->image_payload_bytes != 0
+		|| join->t_image_us != 0 || join->image_semantic_crc32c != 0
+		|| memcmp(join->image_payload, empty_image, sizeof(empty_image)) != 0)
+		return false;
+	for (int node = 0; node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++) {
+		ResourceXDecodedFrame ack;
+		ResourceXDecodedFrame witness;
+		uint8 payload[RESOURCE_X_WITNESS_V3_BYTES];
+		uint16 bytes;
+
+		if ((join->acquire_ack_bitmap & (UINT32_C(1) << node)) == 0) {
+			if (memcmp(join->acquire_acks[node], empty_ack, sizeof(empty_ack)) != 0)
+				return false;
+			continue;
+		}
+		if (!cluster_resource_x_wire_decode(RESOURCE_X_MSG_BLOCKED_TO_N, join->acquire_acks[node],
+			RESOURCE_X_CONTROL_V1_BYTES, &ack, &reject)
+			|| ack.kind != RESOURCE_X_WIRE_BLOCKED_TO_N || ack.has_acquire_decision
+			|| ack.blocked_has_remote_proof || ack.common.action_node != node)
+			return false;
+		memset(&witness, 0, sizeof(witness));
+		witness.kind = RESOURCE_X_WIRE_BLOCKED_TO_N;
+		witness.has_acquire_decision = true;
+		witness.common = grant->common;
+		witness.common.action_node = node;
+		witness.common.outcome = RESOURCE_X_OUTCOME_OK;
+		witness.body.acquire_witness.decision = *a;
+		witness.body.acquire_witness.original_ack = ack.common;
+		if (!cluster_resource_x_wire_encode(RESOURCE_X_MSG_BLOCKED_TO_N, &witness,
+			payload, sizeof(payload), &bytes, &reject) || bytes != sizeof(payload))
+			return false;
+	}
+	return true;
+}
+
 static bool
 pcm_resource_x_requester_join_decode_locked(const ClusterPcmResourceXRequesterJoin *join,
 											ResourceXDecodedFrame *grant_out,
@@ -27459,6 +27604,15 @@ pcm_resource_x_requester_join_decode_locked(const ClusterPcmResourceXRequesterJo
 		memset(grant_out, 0, sizeof(*grant_out));
 	if (image_out != NULL)
 		memset(image_out, 0, sizeof(*image_out));
+	if (join->acquire_format != 0)
+		return pcm_resource_x_requester_acquire_decode_locked(join, grant_out, image_out);
+	{
+		static const uint8 empty_acks[sizeof(join->acquire_acks)];
+
+		if (join->acquire_ack_bitmap != 0 || join->acquire_authority_us != 0
+			|| memcmp(join->acquire_acks, empty_acks, sizeof(empty_acks)) != 0)
+			return false;
+	}
 	if (join->authority_with_image > 1 || join->reserved != 0
 		|| (join->authority_with_image
 			&& (join->grant_valid != 1 || join->image_valid != 1 || join->t_grant_us != 0
@@ -27569,6 +27723,24 @@ pcm_resource_x_requester_join_snapshot_locked(const ClusterPcmResourceXRequester
 		out->flags |= RESOURCE_X_REQUESTER_JOIN_AUTHORITY_WITH_IMAGE;
 	out->grant_source_node = join->grant_source_node;
 	out->image_source_node = join->image_source_node;
+	if (join->acquire_format) {
+		const ResourceXDecodedAcquireDecision *a = &grant.body.acquire_decision;
+		uint32 received = join->acquire_ack_bitmap;
+		bool source_ready = a->source_kind != RESOURCE_X_ACQUIRE_SOURCE_REMOTE_CURRENT;
+
+		out->flags = RESOURCE_X_REQUESTER_JOIN_ACQUIRE | RESOURCE_X_REQUESTER_JOIN_HAS_GRANT;
+		out->t_authority_us = join->acquire_authority_us;
+		if (join->image_valid) {
+			out->flags |= RESOURCE_X_REQUESTER_JOIN_HAS_IMAGE;
+			out->source_carrier_generation = image.body.acquire_image.original_image.source_carrier_generation;
+			received |= UINT32_C(1) << a->source_node;
+			source_ready = true;
+		}
+		if (source_ready && (received & a->required_holders_bitmap) == a->required_holders_bitmap)
+			out->flags |= RESOURCE_X_REQUESTER_JOIN_EVIDENCE_COMPLETE;
+		/* Wire completeness cannot authorize disk IO, T1/T2/T3, or C. */
+		return true;
+	}
 	if (join->grant_valid != 0) {
 		out->source_carrier_generation = grant.body.authority_grant.source_carrier_generation;
 		out->requester_target_generation = grant.body.authority_grant.requester_target_generation;
@@ -27609,6 +27781,8 @@ pcm_resource_x_requester_join_bindable_locked(struct GrdEntry *entry,
 	join = &state->requester_join;
 	if (!pcm_resource_x_requester_join_decode_locked(join, &grant, &image))
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (join->acquire_format)
+		return RESOURCE_X_APPLY_STALE;
 	if (join->grant_valid == 0 && join->image_valid == 0)
 		return RESOURCE_X_APPLY_APPLIED;
 	if (!pcm_resource_x_requester_join_snapshot_locked(join, &snapshot))
@@ -28354,6 +28528,206 @@ cluster_pcm_lock_resource_x_requester_join_exact(const ResourceXDecodedFrame *fr
 												  NULL, out);
 }
 
+/* Sample outside entry_lock, in the original observed-slot domain. This
+ * authenticates a material's producer; it does not validate native C or
+ * turn an observation of a boot into a grant. */
+static bool
+pcm_resource_x_requester_acquire_peer(int32 node, uint64 boot, uint64 epoch)
+{
+	uint64 before, after, generation, after_generation;
+
+	if (node == cluster_node_id)
+		return boot != 0 && cluster_qvotec_get_self_incarnation() == boot;
+	return cluster_reconfig_get_observed_slot(node, &before, &generation)
+		&& before == boot && generation != 0 && generation != UINT64_MAX
+		&& cluster_reconfig_get_observed_epoch(node) == epoch
+		&& cluster_reconfig_get_observed_fresh_alive(node)
+		&& cluster_reconfig_get_observed_slot(node, &after, &after_generation)
+		&& before == after && generation == after_generation
+		&& cluster_reconfig_get_observed_epoch(node) == epoch
+		&& cluster_reconfig_get_observed_fresh_alive(node);
+}
+
+/* Collect exact A/I/all-H material in the original bounded join. The
+ * original E remains live, with no authority bump, buffer IO or native
+ * completion. Original ACK bytes and H->M responsibility remain independent.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static ResourceXApplyResult
+pcm_resource_x_requester_acquire_join(const ResourceXDecodedFrame *frame, int32 source,
+	uint32 source_ingress, int32 master, uint32 master_ingress, uint64 r4,
+	ResourceXRequesterJoinSnapshot *out)
+{
+	ResourceXDecodedFrame decoded, canonical, grant, image;
+	ResourceXWireReject reject;
+	const ResourceXDecodedAcquireDecision *a;
+	ClusterPcmResourceXRequesterJoin candidate;
+	ClusterPcmResourceXRequesterJoin *join;
+	ClusterPcmResourceXMasterState *state;
+	ClusterPcmResourceXBootstrapRound *round;
+	const ResourceXDecodedCommon *request;
+	PcmEntryRef ref;
+	PcmEntryAcquireResult acquired;
+	ResourceXApplyResult result = RESOURCE_X_APPLY_STALE;
+	uint8 payload[RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES];
+	uint8 anchor[RESOURCE_X_DECISION_V3_BYTES];
+	uint8 ack_payload[RESOURCE_X_CONTROL_V1_BYTES];
+	uint16 bytes, canonical_bytes, ack_bytes;
+	uint8 type;
+	uint64 boot, now;
+	bool is_grant, is_image, duplicate = false;
+
+	if (out != NULL) memset(out, 0, sizeof(*out));
+	if (out == NULL || frame == NULL || source < 0 || source >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+		|| cluster_node_id < 0 || cluster_node_id >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+		|| frame->common.logical_assertion.requester_node != cluster_node_id
+		|| frame->common.semantic_crc32c == 0 || ClusterPcm == NULL)
+		return RESOURCE_X_APPLY_INVALID;
+	is_grant = frame->kind == RESOURCE_X_WIRE_AUTHORITY_GRANT;
+	is_image = frame->kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE;
+	if ((!is_grant && !is_image && frame->kind != RESOURCE_X_WIRE_BLOCKED_TO_N)
+		|| frame->payload_bytes != (is_grant ? RESOURCE_X_DECISION_V3_BYTES
+			: is_image ? RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES : RESOURCE_X_WITNESS_V3_BYTES))
+		return RESOURCE_X_APPLY_INVALID;
+	type = is_grant || is_image ? RESOURCE_X_MSG_IMAGE_OR_GRANT : RESOURCE_X_MSG_BLOCKED_TO_N;
+	if (!cluster_resource_x_wire_encode(type, frame, payload, sizeof(payload), &bytes, &reject)
+		|| !cluster_resource_x_wire_decode(type, payload, bytes, &decoded, &reject)
+		|| decoded.common.semantic_crc32c != frame->common.semantic_crc32c
+		|| !pcm_resource_x_requester_acquire_anchor(&decoded, anchor))
+		return RESOURCE_X_APPLY_INVALID;
+	a = pcm_resource_x_requester_acquire_decision(&decoded);
+	if (a == NULL || a->master_node != master || a->requester_ingress_generation != master_ingress
+		|| decoded.common.sender_connection_generation != source_ingress
+		|| a->episode.r4_generation != r4
+		|| cluster_qvotec_get_self_incarnation() != a->episode.requester_incarnation
+		|| (is_grant ? source != master : source != decoded.common.action_node)
+		|| (is_image && (a->source_kind != RESOURCE_X_ACQUIRE_SOURCE_REMOTE_CURRENT
+			|| source != a->source_node))
+		|| (!is_grant && !is_image && decoded.body.acquire_witness.has_source_proof))
+		return RESOURCE_X_APPLY_STALE;
+	boot = is_grant ? decoded.common.master_session_incarnation : a->holders[source].boot_incarnation;
+	if (!pcm_resource_x_requester_acquire_peer(source, boot, a->episode.cluster_epoch))
+		return RESOURCE_X_APPLY_STALE;
+	canonical = decoded;
+	canonical.common.sender_connection_generation = PGRAC_RESOURCE_X_RETAINED_SENDER_GENERATION;
+	canonical.common.semantic_crc32c = 0;
+	if (!cluster_resource_x_wire_encode(type, &canonical, payload, sizeof(payload), &canonical_bytes, &reject))
+		return RESOURCE_X_APPLY_INVALID;
+	if (!is_grant && !is_image) {
+		ResourceXDecodedFrame ack;
+
+		memset(&ack, 0, sizeof(ack));
+		ack.kind = RESOURCE_X_WIRE_BLOCKED_TO_N;
+		ack.common = decoded.body.acquire_witness.original_ack;
+		if (!cluster_resource_x_wire_encode(RESOURCE_X_MSG_BLOCKED_TO_N, &ack, ack_payload,
+			sizeof(ack_payload), &ack_bytes, &reject) || ack_bytes != sizeof(ack_payload))
+			return RESOURCE_X_APPLY_INVALID;
+	}
+	if (!cluster_pcm_lock_resource_x_gate_open_exact(decoded.common.resource_formation))
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (!pcm_entry_ref_acquire(&decoded.common.logical_assertion.resource, false, &ref, &acquired))
+		return RESOURCE_X_APPLY_NOT_FOUND;
+	pcm_entry_lock_exclusive(ref.entry);
+	round = &ref.entry->resource_x_bootstrap_round;
+	state = pcm_resource_x_master_state_for_entry(ref.entry);
+	request = &round->request;
+	if (state == NULL || !pcm_resource_x_requester_acquire_valid_locked(round)) {
+		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		goto done;
+	}
+	if (!round->has_acquire_intent || round->phase != RESOURCE_X_BOOTSTRAP_ROUND_REQUEST_DISPATCHED
+		|| round->head_failure_reason != 0 || round->failed_attempt_floor >= request->assertion_sequence
+		|| round->cancelled_attempt_floor >= request->assertion_sequence
+		|| !pcm_resource_x_acquire_identity_equal(&round->acquire_intent, &a->episode)
+		|| !resource_x_assertion_equal(&request->logical_assertion, &decoded.common.logical_assertion)
+		|| request->assertion_sequence != decoded.common.assertion_sequence
+		|| request->observed_mode != decoded.common.observed_mode
+		|| request->target_mode != decoded.common.target_mode
+		|| round->resource_formation != decoded.common.resource_formation
+		|| round->master_session_incarnation != decoded.common.master_session_incarnation
+		|| round->r4_record_generation != r4 || round->current_master_node != master
+		|| round->master_ingress_connection_generation != master_ingress
+		|| request->sender_connection_generation != a->master_ingress_generation
+		|| !pcm_resource_x_active_empty_locked(ref.entry))
+		goto done;
+	join = &state->requester_join;
+	if (!pcm_resource_x_requester_join_empty_locked(join)) {
+		if (!pcm_resource_x_requester_join_decode_locked(join, &grant, &image)) {
+			result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+			goto done;
+		}
+		if (join->acquire_format != 1 || memcmp(join->grant_payload, anchor, sizeof(anchor)) != 0)
+			goto done;
+	}
+	now = pcm_resource_x_monotonic_us();
+	if (now == 0 || now == UINT64_MAX || now < round->last_dispatch_us) {
+		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		goto done;
+	}
+	candidate = *join;
+	if (!candidate.acquire_format) {
+		memcpy(candidate.grant_payload, anchor, sizeof(anchor));
+		candidate.grant_payload_bytes = sizeof(anchor);
+		candidate.grant_valid = 1;
+		candidate.grant_source_node = master;
+		candidate.image_source_node = -1;
+		candidate.acquire_format = 1;
+		candidate.acquire_authority_us = now;
+		if (is_grant) candidate.t_grant_us = now;
+	} else if (is_grant)
+		duplicate = true;
+	if (is_image) {
+		if (candidate.image_valid) {
+			if (candidate.image_payload_bytes != canonical_bytes
+				|| memcmp(candidate.image_payload, payload, canonical_bytes) != 0)
+				goto done;
+			duplicate = true;
+		} else {
+			memcpy(candidate.image_payload, payload, canonical_bytes);
+			candidate.image_payload_bytes = canonical_bytes;
+			candidate.image_valid = 1;
+			candidate.image_source_node = source;
+			candidate.t_image_us = now;
+			if (!cluster_resource_x_wire_decode(type, payload, canonical_bytes, &canonical, &reject)) {
+				result = RESOURCE_X_APPLY_INVALID;
+				goto done;
+			}
+			candidate.image_semantic_crc32c = canonical.common.semantic_crc32c;
+		}
+	} else if (!is_grant) {
+		uint32 bit = UINT32_C(1) << source;
+
+		if (candidate.acquire_ack_bitmap & bit) {
+			if (memcmp(candidate.acquire_acks[source], ack_payload, sizeof(ack_payload)) != 0)
+				goto done;
+			duplicate = true;
+		} else {
+			memcpy(candidate.acquire_acks[source], ack_payload, sizeof(ack_payload));
+			candidate.acquire_ack_bitmap |= bit;
+		}
+	}
+	if (!pcm_resource_x_requester_join_snapshot_locked(&candidate, out)) {
+		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		goto done;
+	}
+	if (duplicate) {
+		result = RESOURCE_X_APPLY_DUPLICATE;
+		goto done;
+	}
+	if (!cluster_pcm_lock_resource_x_gate_open_exact(decoded.common.resource_formation)
+		|| !pcm_resource_x_intent_mark_pending(false)) {
+		memset(out, 0, sizeof(*out));
+		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		goto done;
+	}
+	*join = candidate;
+	ConditionVariableBroadcast(&ref.entry->wait_cv);
+	result = RESOURCE_X_APPLY_APPLIED;
+done:
+	LWLockRelease(&ref.entry->entry_lock.lock);
+	pcm_entry_ref_release(&ref);
+	return result;
+}
+
 ResourceXApplyResult
 cluster_pcm_lock_resource_x_requester_join_current_exact(
 	const ResourceXDecodedFrame *frame, int32 authenticated_source_node,
@@ -28372,6 +28746,10 @@ cluster_pcm_lock_resource_x_requester_join_current_exact(
 			memset(out, 0, sizeof(*out));
 		return RESOURCE_X_APPLY_STALE;
 	}
+	if (frame->has_acquire_decision)
+		return pcm_resource_x_requester_acquire_join(frame, authenticated_source_node,
+			authenticated_source_ingress_generation, current_master_node,
+			current_master_ingress_generation, r4_record_generation, out);
 	return pcm_resource_x_requester_join_internal(
 		frame, authenticated_source_node, authenticated_source_ingress_generation,
 		current_master_node, current_master_ingress_generation, r4_record_generation, NULL, out);
