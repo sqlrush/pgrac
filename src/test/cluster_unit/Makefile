@@ -3079,6 +3079,7 @@ test_cluster_side_native_clog.o: test_cluster_side_native_clog.c \
 		test_cluster_clog_page_birth.inc test_cluster_clog_full_consumer.inc \
 		test_cluster_clog_own_full.inc unit_test.h \
 		test_cluster_clog_relmap_physical_mutation.inc \
+		test_cluster_clog_relmap_native_init.inc \
 		$(top_srcdir)/src/backend/access/transam/clog.c \
 		$(top_srcdir)/src/backend/access/transam/slru.c \
 		$(top_srcdir)/src/include/access/clog.h \
@@ -3537,6 +3538,7 @@ test_cluster_recovery_episode_clog.o: test_cluster_recovery_episode_clog.c \
         test_cluster_clog_page_birth.inc test_cluster_clog_full_consumer.inc unit_test.h \
         test_cluster_clog_own_full.inc \
 		test_cluster_clog_relmap_physical_mutation.inc \
+		test_cluster_clog_relmap_native_init.inc \
         $(top_srcdir)/src/backend/access/transam/clog.c \
         $(top_srcdir)/src/backend/access/transam/slru.c \
         $(top_srcdir)/src/include/access/clog.h \
@@ -4618,6 +4620,7 @@ test_cluster_clog_recovery: test_cluster_clog_recovery.c unit_test.h \
 		test_cluster_clog_full_consumer.inc \
 		test_cluster_clog_own_full.inc \
 		test_cluster_clog_relmap_physical_mutation.inc \
+		test_cluster_clog_relmap_native_init.inc \
 		$(top_srcdir)/src/backend/access/transam/clog.c \
 		$(top_srcdir)/src/include/access/clog.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h \
@@ -9169,6 +9172,7 @@ test_cluster_xid_native_clog.o: test_cluster_xid_native_clog.c \
         test_cluster_clog_relmap_shared_mutation.inc test_cluster_clog_full_consumer.inc \
         test_cluster_clog_own_full.inc unit_test.h Makefile \
 		test_cluster_clog_relmap_physical_mutation.inc \
+		test_cluster_clog_relmap_native_init.inc \
         $(top_builddir)/src/include/pg_config.h $(top_srcdir)/src/include/access/clog.h \
         $(top_srcdir)/src/backend/access/transam/clog.c \
         $(top_srcdir)/src/backend/access/transam/slru.c
