@@ -3722,3 +3722,156 @@ UT_TEST(test_update_creation_active_canonical_drift_preserves_last_inverse)
 			UT_ASSERT_EQ(operation_worker_allocations, allocations);
 		}
 }
+
+/* Controlled page geometry, without granting native pruning or TID reuse.
+ * Compact inputs have room for the root only after removing replacement2. */
+static void
+update_repack_fixture(OperationWorkerFixture *f, unsigned role, unsigned layout, bool compact,
+					  bool keep, bool dead, char old_root[60])
+{
+	PGAlignedBlock filler;
+	HeapTupleHeader tuple = (HeapTupleHeader)filler.data;
+	Page page;
+	PageHeader header;
+	Size length;
+
+	update_role_challenge(f, role, layout & 1, layout & 2, keep, old_root);
+	page = (Page)f->cr.source.data;
+	if (dead)
+		ItemIdSetDead(PageGetItemId(page, 1));
+	else
+		ItemIdSetUnused(PageGetItemId(page, 1));
+	header = (PageHeader)page;
+	if (compact) {
+		PageRepairFragmentation(page);
+		UT_ASSERT_EQ(PageGetMaxOffsetNumber(page), 2);
+		ItemIdSetUnused((ItemId)((char *)page + header->pd_lower));
+		header->pd_lower += sizeof(ItemIdData); /* Restore explicit placeholder3. */
+	}
+	length = MAXALIGN_DOWN(header->pd_upper - header->pd_lower - sizeof(ItemIdData) - 16);
+	memset(filler.data, 0x5a, BLCKSZ);
+	memset(tuple, 0, SizeofHeapTupleHeader);
+	tuple->t_hoff = MAXALIGN(SizeofHeapTupleHeader);
+	tuple->t_infomask = HEAP_XMAX_INVALID;
+	HeapTupleHeaderSetXmin(tuple, TEST_ORIGIN_XID - 10);
+	ItemPointerSet(&tuple->t_ctid, 23, 4);
+	UT_ASSERT_EQ(PageAddItem(page, filler.data, length, 4, false, true), 4);
+	UT_ASSERT_EQ(header->pd_upper - header->pd_lower, 16);
+	UT_ASSERT_EQ(ItemIdGetLength(PageGetItemId(page, 2)), 60);
+}
+
+/* Fixed fixture layout: live replacement2, filler4, then restored root1.
+ * Derive no expected bytes through an inverse or the compaction routine. */
+static void
+update_repack_expected(char expected[BLCKSZ], const char source[BLCKSZ], const char old_root[60],
+					   bool reuse, bool keep)
+{
+	Page original = (Page)source;
+	Page page = (Page)expected;
+	ItemId filler = PageGetItemId(original, 4);
+	PageHeader header;
+	Offset upper;
+
+	memcpy(expected, source, BLCKSZ);
+	header = (PageHeader)page;
+	upper = header->pd_special;
+	if (keep) {
+		upper -= MAXALIGN(60);
+		memcpy(expected + upper, PageGetItem(original, PageGetItemId(original, 2)), MAXALIGN(60));
+		ItemIdSetNormal(PageGetItemId(page, 2), upper, 60);
+	} else
+		ItemIdSetUnused(PageGetItemId(page, 2));
+	upper -= ItemIdGetLength(filler);
+	memcpy(expected + upper, PageGetItem(original, filler), ItemIdGetLength(filler));
+	ItemIdSetNormal(PageGetItemId(page, 4), upper, ItemIdGetLength(filler));
+	upper -= MAXALIGN(60);
+	memcpy(expected + upper, old_root, 60);
+	ItemIdSetNormal(PageGetItemId(page, 1), upper, 60);
+	header->pd_upper = upper;
+	PageSetHasFreeLinePointers(page);
+	if (!keep || !reuse)
+		ClusterPageGetItlSlots(page)[2] = (ClusterItlSlotData){ .wrap = 8 };
+	if (!keep && !reuse)
+		ClusterPageGetItlSlots(page)[4] = (ClusterItlSlotData){ .wrap = 14 };
+}
+
+static void
+update_repack_assert_full(OperationWorkerFixture *f, const char expected[BLCKSZ], int allocations)
+{
+	ClusterR4CrBuildStepResult step = operation_worker_finish(f);
+
+	cluster_cr_build_on_holder_forget(0, 1000);
+	UT_ASSERT_EQ(step, CLUSTER_R4_CR_STEP_FULL);
+	UT_ASSERT_EQ(f->reason, CLUSTER_CR_BUILD_NONE);
+	UT_ASSERT_EQ(memcmp(expected, f->cr.source.data, BLCKSZ), 0);
+	UT_ASSERT_EQ(f->extension.build_steps, 2);
+	UT_ASSERT_EQ(test_candidate_acquire_calls, 6);
+	UT_ASSERT_EQ(test_candidate_release_calls, 6);
+	UT_ASSERT_EQ(test_candidate_held_count, 0);
+	UT_ASSERT_EQ(operation_worker_allocations, allocations);
+}
+
+UT_TEST(test_update_repack_kept_creation_uses_result_tuple_positions)
+{
+	for (unsigned role = 0; role < 2; role++)
+		for (unsigned layout = 0; layout < 4; layout++)
+			for (int dead = 0; dead < 2; dead++) {
+				OperationWorkerFixture f;
+				PGAlignedBlock expected;
+				char old_root[60];
+				Offset before;
+				int allocations = operation_worker_allocations;
+
+				update_repack_fixture(&f, role, layout, false, true, dead, old_root);
+				before = ItemIdGetOffset(PageGetItemId((Page)f.cr.source.data, 2));
+				update_repack_expected(expected.data, f.cr.source.data, old_root, layout & 1, true);
+				operation_worker_creation_first(&f);
+				update_repack_assert_full(&f, expected.data, allocations);
+				UT_ASSERT_NE(ItemIdGetOffset(PageGetItemId((Page)f.cr.source.data, 2)), before);
+			}
+}
+
+UT_TEST(test_update_repack_full_result_refuses_without_partial_publish)
+{
+	for (unsigned role = 0; role < 2; role++)
+		for (unsigned layout = 0; layout < 4; layout++)
+			for (int dead = 0; dead < 2; dead++) {
+				OperationWorkerFixture f;
+				PGAlignedBlock before;
+				char old_root[60];
+				ClusterR4CrBuildStepResult step;
+				int allocations = operation_worker_allocations;
+
+				update_repack_fixture(&f, role, layout, true, true, dead, old_root);
+				memcpy(before.data, f.cr.source.data, BLCKSZ);
+				operation_worker_creation_first(&f);
+				step = operation_worker_finish(&f);
+				cluster_cr_build_on_holder_forget(0, 1000);
+				UT_ASSERT_EQ(step, CLUSTER_R4_CR_STEP_FAIL);
+				UT_ASSERT_EQ(f.reason, CLUSTER_CR_BUILD_BAD_UNDO);
+				UT_ASSERT_EQ(memcmp(before.data, f.cr.source.data, BLCKSZ), 0);
+				UT_ASSERT_EQ(f.extension.build_steps, 2);
+				UT_ASSERT_EQ(test_candidate_acquire_calls, 6);
+				UT_ASSERT_EQ(test_candidate_release_calls, 6);
+				UT_ASSERT_EQ(test_candidate_held_count, 0);
+				UT_ASSERT_EQ(operation_worker_allocations, allocations);
+			}
+}
+
+UT_TEST(test_update_repack_unkept_creation_leaves_restore_capacity)
+{
+	for (unsigned role = 0; role < 2; role++)
+		for (unsigned layout = 0; layout < 4; layout++)
+			for (int dead = 0; dead < 2; dead++) {
+				OperationWorkerFixture f;
+				PGAlignedBlock expected;
+				char old_root[60];
+				int allocations = operation_worker_allocations;
+
+				update_repack_fixture(&f, role, layout, true, false, dead, old_root);
+				update_repack_expected(expected.data, f.cr.source.data, old_root, layout & 1,
+									   false);
+				update_repack_assert_full(&f, expected.data, allocations);
+				UT_ASSERT(!ItemIdIsUsed(PageGetItemId((Page)f.cr.source.data, 2)));
+			}
+}
