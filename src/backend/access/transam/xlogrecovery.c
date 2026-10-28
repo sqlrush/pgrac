@@ -701,6 +701,7 @@ static ClusterColdTypedV1 *cluster_recovery_cold_inputs;
 typedef struct ClusterColdCtrcPageCompletedV1 {
 	RfPageCtrcStepResultV1 result;
 	struct ClusterSharedFsPageV1 *storage;
+	RfPageCtrcUnchangedV1 unchanged;
 } ClusterColdCtrcPageCompletedV1;
 
 typedef struct ClusterColdCtrcPageProgressV1 {
@@ -896,11 +897,15 @@ cluster_recovery_cold_pending_page_current(const struct ClusterRecoveryStartV1 *
 		return false;
 	for (uint32 i = 0; i < progress->next_target; i++) {
 		const ClusterColdCtrcPageCompletedV1 *completed = &progress->completed[i];
+		static const RfPageCtrcFpiInsertV1 empty = {0};
 
 		if (completed->storage != NULL
-			&& (completed->result.phase != RF_PAGE_CTRC_STEP_FPI_DURABLE
-				|| !completed->result.inserted.wal_flushed
-				|| !cluster_shared_fs_page_current_v1(completed->storage)))
+			&& (!cluster_shared_fs_page_current_v1(completed->storage)
+				|| (completed->result.phase == RF_PAGE_CTRC_STEP_FPI_DURABLE
+					? !completed->result.inserted.wal_flushed
+					: completed->result.phase != RF_PAGE_CTRC_STEP_UNCHANGED_SYNCED
+						|| !completed->unchanged.ready
+						|| memcmp(&completed->result.inserted, &empty, sizeof(empty)) != 0)))
 			return false;
 	}
 	if (!progress->pending) return true;
@@ -1821,9 +1826,9 @@ cluster_recovery_cold_page_attempt(const struct ClusterRecoveryStartV1 *start,
 			detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
 			if (page.verdict == RF_PAGE_AUTHORITY_OK && authority != NULL
 				&& cluster_recovery_cold_page_advance_current(start, work, scope, progress)) {
-				RfPageCtrcHeldStepV1 held = {0};
+				RfPageCtrcHeldTargetV1 held = {0};
 				RfPageCtrcAuthorityV1 *release = authority;
-				const RfPageCtrcStepResultV1 *step = &held.result;
+				const RfPageCtrcStepResultV1 *step = &held.step.result;
 
 				if (pending) {
 					const GenericXLogRecoveryImageV1 *image = &pending_result.inserted.image;
@@ -1838,15 +1843,21 @@ cluster_recovery_cold_page_attempt(const struct ClusterRecoveryStartV1 *start,
 							&progress->result.inserted, pending_storage,
 							work->counts.subject_count, available - 2 * part);
 				} else {
-					held = rf_page_recovery_ctrc_replays_itl_graph_hold_smgr_v1(
+					held = rf_page_recovery_ctrc_replays_itl_graph_hold_target_smgr_v1(
 						start, work, &start->ctrc_page_sources[source_index], authority,
 						&physical_page->reservation.identity, view->page_identity.blockno,
 						&view->expected_result, view->canonical_page, start->ctrc_physical->entries,
 						start->ctrc_physical->count, available - 2 * part);
 					if (cluster_recovery_cold_page_step_has_operation(step)) {
 						progress->result = *step;
-						progress->storage = held.storage;
+						progress->storage = held.step.storage;
 						progress->pending = true;
+					} else if (step->phase == RF_PAGE_CTRC_STEP_UNCHANGED_SYNCED) {
+						/* No callback between return and transfer to original
+						 * cleanup, even if PAGE destruction subsequently ERRORs. */
+						progress->completed[pending_target].result = *step;
+						progress->completed[pending_target].storage = held.step.storage;
+						progress->completed[pending_target].unchanged = held.unchanged;
 					}
 				}
 				authority = NULL;
@@ -1874,8 +1885,18 @@ cluster_recovery_cold_page_attempt(const struct ClusterRecoveryStartV1 *start,
 							detail = empty == CLUSTER_CTRC_LOCAL_WAIT
 								? RF_PAGE_PROOF_DETAIL_WOULD_BLOCK : RF_PAGE_PROOF_DETAIL_ROOT_STALE;
 					}
-				} else
-					detail = cluster_recovery_cold_page_step_result(progress, step);
+				} else if (step->phase == RF_PAGE_CTRC_STEP_UNCHANGED_SYNCED) {
+					const ClusterColdCtrcPageCompletedV1 *completed = &progress->completed[pending_target];
+
+					if (progress->pending || progress->next_target != pending_target
+						|| held.step.storage == NULL || !held.unchanged.ready
+						|| completed->storage != held.step.storage
+						|| memcmp(&completed->result, step, sizeof(*step)) != 0
+						|| memcmp(&completed->unchanged, &held.unchanged, sizeof(held.unchanged)) != 0
+						|| !cluster_shared_fs_page_current_v1(held.step.storage))
+						detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+					else detail = cluster_recovery_cold_page_step_result(progress, step);
+				} else detail = cluster_recovery_cold_page_step_result(progress, step);
 			}
 		}
 		if (detail == RF_PAGE_PROOF_DETAIL_OK && proof == NULL)
@@ -2035,6 +2056,31 @@ ClusterColdRecoveryCtrcPageCompletedCurrent(const struct ClusterRecoveryStartV1 
 	return false;
 }
 
+bool
+ClusterColdRecoveryCtrcPageUnchangedCurrent(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, const RfPageCtrcUnchangedV1 *unchanged,
+	struct ClusterSharedFsPageV1 *storage)
+{
+	const ClusterColdCtrcPageProgressV1 *progress;
+
+	if (unchanged == NULL || storage == NULL || CritSectionCount != 0
+		|| !ClusterColdRecoveryCtrcWorkCurrent(start, work)
+		|| !start->ctrc_observation_complete || work != start->ctrc_observation_work)
+		return false;
+	progress = start->ctrc_page_progress;
+	if (progress == NULL || progress->pending || progress->next_target != progress->target_count
+		|| progress->plan != start->ctrc_page_plan || progress->sources != start->ctrc_page_sources
+		|| progress->source_count != start->ctrc_page_source_count) return false;
+	for (uint32 i = 0; i < progress->next_target; i++) {
+		const ClusterColdCtrcPageCompletedV1 *completed = &progress->completed[i];
+
+		if (unchanged == &completed->unchanged)
+			return storage == completed->storage && completed->unchanged.ready
+				&& completed->result.phase == RF_PAGE_CTRC_STEP_UNCHANGED_SYNCED;
+	}
+	return false;
+}
+
 /* The original result/FD vector remains owned by Start after F4 clear. Build
  * only a temporary original PAGE/proof, then compare the entire retained
  * operation again after both destructors, outside PAGE and before service. */
@@ -2048,15 +2094,20 @@ cluster_recovery_cold_page_completed_attempt(const struct ClusterRecoveryStartV1
 	RfPageStableBaseProofV1 *volatile proof = NULL;
 	RfPageCtrcAuthorityV1 *volatile authority = NULL;
 	RfPageCtrcStepResultV1 saved = progress->completed[index].result;
+	RfPageCtrcUnchangedV1 unchanged = progress->completed[index].unchanged;
 	struct ClusterSharedFsPageV1 *storage = progress->completed[index].storage;
 	const GenericXLogRecoveryImageV1 *image = &saved.inserted.image;
 	RfPageProofDetailV1 detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
 	Size available = progress->budget - progress->reserved_bytes;
 	Size part = available / 3;
 
-	if (image->block_number != view->page_identity.blockno
-		|| memcmp(&image->identity, &physical_page->reservation.identity, sizeof(image->identity)) != 0
-		|| memcmp(&image->version.before, &view->expected_result, sizeof(view->expected_result)) != 0)
+	if (saved.phase == RF_PAGE_CTRC_STEP_UNCHANGED_SYNCED
+		? !unchanged.ready || unchanged.blockno != view->page_identity.blockno
+			|| memcmp(&unchanged.space, &physical_page->reservation.identity, sizeof(unchanged.space)) != 0
+			|| memcmp(&unchanged.before, &view->expected_result, sizeof(unchanged.before)) != 0
+		: saved.phase != RF_PAGE_CTRC_STEP_FPI_DURABLE || image->block_number != view->page_identity.blockno
+			|| memcmp(&image->identity, &physical_page->reservation.identity, sizeof(image->identity)) != 0
+			|| memcmp(&image->version.before, &view->expected_result, sizeof(view->expected_result)) != 0)
 		return RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
 	PG_TRY();
 	{
@@ -2079,12 +2130,22 @@ cluster_recovery_cold_page_completed_attempt(const struct ClusterRecoveryStartV1
 				&& cluster_recovery_cold_page_advance_current(start, work, scope, progress)
 				&& index < progress->next_target && progress->completed[index].storage == storage
 				&& memcmp(&progress->completed[index].result, &saved, sizeof(saved)) == 0
-				&& ClusterColdRecoveryCtrcPageCompletedCurrent(start, work,
-					&progress->completed[index].result.inserted, storage))
-				detail = rf_page_recovery_ctrc_replays_completed_readback_v1(start, work,
-					&start->ctrc_page_sources[source_index], authority,
-					&progress->completed[index].result.inserted, storage,
-					work->counts.subject_count, available - 2 * part);
+				&& memcmp(&progress->completed[index].unchanged, &unchanged, sizeof(unchanged)) == 0) {
+				if (saved.phase == RF_PAGE_CTRC_STEP_UNCHANGED_SYNCED
+					&& ClusterColdRecoveryCtrcPageUnchangedCurrent(start, work,
+						&progress->completed[index].unchanged, storage))
+					detail = rf_page_recovery_ctrc_replays_unchanged_readback_v1(start, work,
+						&start->ctrc_page_sources[source_index], authority,
+						&progress->completed[index].unchanged, storage,
+						work->counts.subject_count, available - 2 * part);
+				else if (saved.phase == RF_PAGE_CTRC_STEP_FPI_DURABLE
+					&& ClusterColdRecoveryCtrcPageCompletedCurrent(start, work,
+						&progress->completed[index].result.inserted, storage))
+					detail = rf_page_recovery_ctrc_replays_completed_readback_v1(start, work,
+						&start->ctrc_page_sources[source_index], authority,
+						&progress->completed[index].result.inserted, storage,
+						work->counts.subject_count, available - 2 * part);
+			}
 		}
 		if (detail == RF_PAGE_PROOF_DETAIL_OK && proof == NULL)
 			detail = RF_PAGE_PROOF_DETAIL_INTERNAL;
@@ -2100,7 +2161,8 @@ cluster_recovery_cold_page_completed_attempt(const struct ClusterRecoveryStartV1
 	PG_END_TRY();
 	if (!cluster_recovery_cold_page_advance_current(start, work, scope, progress)
 		|| index >= progress->next_target || progress->completed[index].storage != storage
-		|| memcmp(&progress->completed[index].result, &saved, sizeof(saved)) != 0)
+		|| memcmp(&progress->completed[index].result, &saved, sizeof(saved)) != 0
+		|| memcmp(&progress->completed[index].unchanged, &unchanged, sizeof(unchanged)) != 0)
 		return RF_PAGE_PROOF_DETAIL_ROOT_STALE;
 	return detail;
 }
@@ -2126,8 +2188,8 @@ cluster_recovery_cold_page_completed_recheck(const struct ClusterRecoveryStartV1
 		if (!cluster_recovery_cold_page_advance_current(start, work, scope, progress)
 			|| progress->pending || progress->next_target != progress->target_count) return false;
 		if (index == progress->target_count) return true;
-		/* Unchanged/history/non-heap targets retain their independent duties;
-		 * absence of a saved FPI never qualifies those targets here. */
+		/* History/non-heap targets retain their independent duties; absence
+		 * of a saved baseline never qualifies those targets here. */
 		if (progress->completed[index].storage == NULL) { index++; continue; }
 		if (!rf_page_online_plan_target_v1(start->ctrc_page_plan, index, &view)
 			|| view.history_only || view.page_identity.forknum != MAIN_FORKNUM

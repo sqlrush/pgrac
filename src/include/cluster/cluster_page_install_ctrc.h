@@ -236,6 +236,46 @@ extern RfPageCtrcHeldStepV1 rf_page_recovery_ctrc_replays_itl_graph_hold_smgr_v1
 	BlockNumber blockno, const RfPageVersionV1 *expected_before, const char canonical[BLCKSZ],
 	const struct ClusterRecoveryUndoEntry *physical, Size physical_count, Size memory_budget);
 
+typedef struct RfPageCtrcUnchangedV1 {
+	bool ready;
+	ClusterSpaceIdentity space;
+	RfPageVersionV1 before;
+	BlockNumber blockno;
+	PGAlignedBlock page, space0, space1;
+} RfPageCtrcUnchangedV1;
+
+typedef struct RfPageCtrcHeldTargetV1 {
+	RfPageCtrcHeldStepV1 step;
+	RfPageCtrcUnchangedV1 unchanged;
+} RfPageCtrcHeldTargetV1;
+
+/* Separate opt-in: also retain the same descriptors on UNCHANGED_SYNCED,
+ * together with all three original raw pages. The original held entry above
+ * still retains only FPI_DURABLE. Save the entire value and FD before any
+ * callback; the caller's fixed budget must cover the retained baseline as
+ * well as every raw-handle preparation peak. No new FPI/window or mutation
+ * is produced for an unchanged target. The baseline is an observation only,
+ * never a first/pin/history/companion discharge or completion grant. */
+extern RfPageCtrcHeldTargetV1 rf_page_recovery_ctrc_replays_itl_graph_hold_target_smgr_v1(
+	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work,
+	const struct ClusterRecoveryCtrcReplaySetSourceV1 *source,
+	RfPageCtrcAuthorityV1 *authority, const struct ClusterSpaceIdentity *space,
+	BlockNumber blockno, const RfPageVersionV1 *expected_before, const char canonical[BLCKSZ],
+	const struct ClusterRecoveryUndoEntry *physical, Size physical_count, Size memory_budget);
+
+/* Final read of an original Start-owned unchanged baseline and SAME raw FD.
+ * Zero caller LWLocks, full original work/source/accepted TX and exact PAGE
+ * are mandatory. Freeze inputs before promotion, five-read and compare every
+ * MAIN/SPACE byte, including header/checksum bytes. No sync/write/WAL/reopen
+ * or window access. WOULD_BLOCK keeps original custody; refusal/ERROR leaves
+ * caller cleanup and every original obligation intact. Original Start must
+ * revalidate the complete saved value after PAGE/proof destruction. */
+extern RfPageProofDetailV1 rf_page_recovery_ctrc_replays_unchanged_readback_v1(
+	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work,
+	const struct ClusterRecoveryCtrcReplaySetSourceV1 *source, RfPageCtrcAuthorityV1 *authority,
+	const RfPageCtrcUnchangedV1 *unchanged, struct ClusterSharedFsPageV1 *storage,
+	Size subject_count, Size memory_budget);
+
 /* Read back an original pending DURABLE operation using its SAME held raw
  * MAIN/SPACE descriptors. Enter with its unpromoted one-target PAGE object
  * and zero caller LWLocks. Freeze the full work/source/operation and describe

@@ -465,6 +465,7 @@ bool native_install_original_writer_installed(ClusterWalWriterToken *writer,
 #include "test_cluster_ctrc_native_held_fd.inc"
 #include "test_cluster_ctrc_native_readback.inc"
 #include "test_cluster_ctrc_native_completed.inc"
+#include "test_cluster_ctrc_native_unchanged_custody.inc"
 
 int
 main(int argc, char **argv)
@@ -473,6 +474,15 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_NATIVE_UNCHANGED_CUSTODY") != NULL) {
+		UT_PLAN(5);
+		UT_RUN(test_native_unchanged_custody_retains_exact_raw_pages_and_same_fd);
+		UT_RUN(test_native_unchanged_custody_refuses_copies_and_bad_entry_before_io);
+		UT_RUN(test_native_unchanged_custody_refuses_changed_valid_main_and_space_bytes);
+		UT_RUN(test_native_unchanged_custody_rechecks_binding_after_each_read);
+		UT_RUN(test_native_unchanged_custody_wait_and_error_keep_fd_and_original_debt);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_NATIVE_COMPLETED") != NULL) {
 		UT_PLAN(5);
 		UT_RUN(test_native_completed_readback_uses_original_page_and_same_fds_after_f4_clear);
@@ -570,7 +580,12 @@ main(int argc, char **argv)
 		UT_RUN(test_native_step_fixed_fd_close_failure_cannot_claim_target_synced);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(98);
+	UT_PLAN(103);
+	UT_RUN(test_native_unchanged_custody_retains_exact_raw_pages_and_same_fd);
+	UT_RUN(test_native_unchanged_custody_refuses_copies_and_bad_entry_before_io);
+	UT_RUN(test_native_unchanged_custody_refuses_changed_valid_main_and_space_bytes);
+	UT_RUN(test_native_unchanged_custody_rechecks_binding_after_each_read);
+	UT_RUN(test_native_unchanged_custody_wait_and_error_keep_fd_and_original_debt);
 	UT_RUN(test_native_completed_readback_uses_original_page_and_same_fds_after_f4_clear);
 	UT_RUN(test_native_completed_readback_refuses_clones_lost_binding_and_pending_api);
 	UT_RUN(test_native_completed_readback_refuses_changed_main_or_space_without_reinstall);

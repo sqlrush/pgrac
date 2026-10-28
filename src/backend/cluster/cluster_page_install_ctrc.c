@@ -1270,7 +1270,8 @@ ctrc_native_step_open(CtrcNativeStepV1 *context, BlockNumber blockno,
 static void
 ctrc_native_step_attempt(CtrcNativeStepV1 *context, const ClusterColdCtrcWorkV1 *header,
 	RfPageCtrcAuthorityV1 *authority, BlockNumber blockno, Size count, Size bytes,
-	Size memory_budget, RfPageCtrcStepResultV1 *result, ClusterSharedFsPageV1 **retained)
+	Size memory_budget, RfPageCtrcStepResultV1 *result, ClusterSharedFsPageV1 **retained,
+	RfPageCtrcUnchangedV1 *unchanged)
 {
 	void *volatile snapshot = NULL;
 
@@ -1291,6 +1292,16 @@ ctrc_native_step_attempt(CtrcNativeStepV1 *context, const ClusterColdCtrcWorkV1 
 				if (context->storage != NULL && ctrc_native_step_current(context))
 					ctrc_native_step_execute(context, authority, blockno, count,
 						memory_budget - bytes - cluster_shared_fs_page_bytes_v1(), result);
+				if (unchanged != NULL && result->phase == RF_PAGE_CTRC_STEP_UNCHANGED_SYNCED) {
+					if (context->images.ready && ctrc_native_step_current(context)) {
+						unchanged->space = context->space; unchanged->before = context->before;
+						unchanged->blockno = blockno;
+						unchanged->page = context->images.page;
+						unchanged->space0 = context->images.space0;
+						unchanged->space1 = context->images.space1;
+						unchanged->ready = true;
+					} else result->phase = RF_PAGE_CTRC_STEP_REFUSED;
+				}
 			}
 		}
 	}
@@ -1303,7 +1314,8 @@ ctrc_native_step_attempt(CtrcNativeStepV1 *context, const ClusterColdCtrcWorkV1 
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-	if (retained != NULL && result->phase == RF_PAGE_CTRC_STEP_FPI_DURABLE)
+	if (retained != NULL && (result->phase == RF_PAGE_CTRC_STEP_FPI_DURABLE
+		|| (result->phase == RF_PAGE_CTRC_STEP_UNCHANGED_SYNCED && unchanged != NULL && unchanged->ready)))
 		*retained = context->storage;
 	else if (!cluster_shared_fs_page_close_v1(context->storage)) {
 		result->phase = RF_PAGE_CTRC_STEP_REFUSED;
@@ -1320,7 +1332,8 @@ ctrc_native_itl_step(const struct ClusterRecoveryStartV1 *start,
 	RfPageCtrcAuthorityV1 *authority, const ClusterSpaceIdentity *space,
 	BlockNumber blockno, const RfPageVersionV1 *expected_before, const char *canonical,
 	const ClusterRecoveryUndoEntry *physical, Size physical_count, Size memory_budget,
-	bool publish_durable, bool sync_unchanged, ClusterSharedFsPageV1 **retained)
+	bool publish_durable, bool sync_unchanged, ClusterSharedFsPageV1 **retained,
+	RfPageCtrcUnchangedV1 *unchanged)
 {
 	RfPageCtrcStepResultV1 result = {0};
 	CtrcNativeStepV1 context = {0};
@@ -1368,7 +1381,7 @@ ctrc_native_itl_step(const struct ClusterRecoveryStartV1 *start,
 	if (canonical != NULL) memcpy(context.canonical.data, canonical, BLCKSZ);
 	if (!cluster_recovery_ctrc_terminal_result_v1(start, work, &context.accepted)) return result;
 	ctrc_native_step_attempt(&context, &header, authority, blockno, physical_count, bytes,
-		memory_budget, &result, retained);
+		memory_budget, &result, retained, unchanged);
 	return result;
 }
 
@@ -1380,7 +1393,7 @@ rf_page_recovery_ctrc_replays_itl_step_smgr_v1(const struct ClusterRecoveryStart
 	const ClusterRecoveryUndoEntry *physical, Size physical_count, Size memory_budget)
 {
 	return ctrc_native_itl_step(start, work, source, authority, space, blockno,
-		expected_before, NULL, physical, physical_count, memory_budget, false, false, NULL);
+		expected_before, NULL, physical, physical_count, memory_budget, false, false, NULL, NULL);
 }
 
 RfPageCtrcStepResultV1
@@ -1392,7 +1405,7 @@ rf_page_recovery_ctrc_replays_itl_graph_step_smgr_v1(const struct ClusterRecover
 {
 	if (canonical == NULL) return (RfPageCtrcStepResultV1){0};
 	return ctrc_native_itl_step(start, work, source, authority, space, blockno,
-		expected_before, canonical, physical, physical_count, memory_budget, false, false, NULL);
+		expected_before, canonical, physical, physical_count, memory_budget, false, false, NULL, NULL);
 }
 
 RfPageCtrcStepResultV1
@@ -1404,7 +1417,7 @@ rf_page_recovery_ctrc_replays_itl_graph_durable_smgr_v1(const struct ClusterReco
 {
 	if (canonical == NULL) return (RfPageCtrcStepResultV1){0};
 	return ctrc_native_itl_step(start, work, source, authority, space, blockno,
-		expected_before, canonical, physical, physical_count, memory_budget, true, false, NULL);
+		expected_before, canonical, physical, physical_count, memory_budget, true, false, NULL, NULL);
 }
 
 RfPageCtrcStepResultV1
@@ -1416,7 +1429,7 @@ rf_page_recovery_ctrc_replays_itl_graph_sync_smgr_v1(const struct ClusterRecover
 {
 	if (canonical == NULL) return (RfPageCtrcStepResultV1){0};
 	return ctrc_native_itl_step(start, work, source, authority, space, blockno,
-		expected_before, canonical, physical, physical_count, memory_budget, true, true, NULL);
+		expected_before, canonical, physical, physical_count, memory_budget, true, true, NULL, NULL);
 }
 
 RfPageCtrcHeldStepV1
@@ -1430,7 +1443,138 @@ rf_page_recovery_ctrc_replays_itl_graph_hold_smgr_v1(const struct ClusterRecover
 
 	if (canonical != NULL)
 		held.result = ctrc_native_itl_step(start, work, source, authority, space, blockno,
-			expected_before, canonical, physical, physical_count, memory_budget, true, true, &held.storage);
+			expected_before, canonical, physical, physical_count, memory_budget, true, true, &held.storage, NULL);
 	return held;
+}
+
+RfPageCtrcHeldTargetV1
+rf_page_recovery_ctrc_replays_itl_graph_hold_target_smgr_v1(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, const ClusterRecoveryCtrcReplaySetSourceV1 *source,
+	RfPageCtrcAuthorityV1 *authority, const ClusterSpaceIdentity *space,
+	BlockNumber blockno, const RfPageVersionV1 *expected_before, const char canonical[BLCKSZ],
+	const ClusterRecoveryUndoEntry *physical, Size physical_count, Size memory_budget)
+{
+	RfPageCtrcHeldTargetV1 held = {0};
+
+	if (canonical != NULL && memory_budget > sizeof(held.unchanged))
+		held.step.result = ctrc_native_itl_step(start, work, source, authority, space, blockno,
+			expected_before, canonical, physical, physical_count, memory_budget - sizeof(held.unchanged),
+			true, true, &held.step.storage, &held.unchanged);
+	return held;
+}
+
+typedef struct CtrcNativeUnchangedReadV1 {
+	CtrcNativeStepV1 step;
+	const RfPageCtrcUnchangedV1 *original;
+	RfPageCtrcUnchangedV1 fixed;
+} CtrcNativeUnchangedReadV1;
+
+static bool
+ctrc_native_unchanged_current(const CtrcNativeStepV1 *step)
+{
+	const CtrcNativeUnchangedReadV1 *context = (const void *)step;
+
+	return ctrc_native_step_current(step)
+		&& ClusterColdRecoveryCtrcPageUnchangedCurrent(step->start, step->work,
+			context->original, step->storage)
+		&& memcmp(context->original, &context->fixed, sizeof(context->fixed)) == 0;
+}
+
+static RfPageProofDetailV1
+ctrc_native_unchanged_read_attempt(CtrcNativeUnchangedReadV1 *context,
+	RfPageCtrcAuthorityV1 *authority, const ClusterColdCtrcWorkV1 *header)
+{
+	CtrcNativeStepV1 *step = &context->step;
+	void *volatile snapshot = NULL;
+	volatile RfPageProofDetailV1 detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+
+	PG_TRY();
+	{
+		snapshot = MemoryContextAllocZero(CurrentMemoryContext, step->work_bytes);
+		if (ClusterColdRecoveryCtrcWorkCurrent(step->start, step->work)
+			&& memcmp(step->work, header, offsetof(ClusterColdCtrcWorkV1, entries)) == 0) {
+			RfPageIdentityV1 target = {0};
+
+			memcpy((void *)snapshot, step->work, step->work_bytes); step->snapshot = snapshot;
+			target.system_identifier = step->space.key.system_identifier;
+			memcpy(target.storage_uuid, step->space.key.storage_uuid, 16);
+			target.locator = step->space.key.locator;
+			target.forknum = MAIN_FORKNUM; target.blockno = context->fixed.blockno;
+			if (ctrc_native_unchanged_current(step)) {
+				RfPageAuthorityVerdictV1 promoted = rf_page_authority_ctrc_replays_promote_fpi_nowait_v1(
+					authority, &target, &step->before);
+
+				if (promoted == RF_PAGE_AUTHORITY_WOULD_BLOCK) detail = RF_PAGE_PROOF_DETAIL_WOULD_BLOCK;
+				else if (promoted == RF_PAGE_AUTHORITY_OK && ctrc_native_unchanged_current(step)) {
+					ClusterCtrcPageCacheResultV1 cache = cluster_bufmgr_ctrc_page_cache_v1(step->start,
+						step->work, authority, step->original_space, step->cache_block, step->original_before, NULL);
+
+					if (cache == CLUSTER_CTRC_PAGE_CACHE_WAIT) detail = RF_PAGE_PROOF_DETAIL_WOULD_BLOCK;
+					else if (cache == CLUSTER_CTRC_PAGE_CACHE_ABSENT) {
+						CtrcNativeReadV1 read = {0};
+						CtrcNativeStepImagesV1 observed = {0};
+
+						step->cache_retired = true;
+						read.step = step; read.step_current = ctrc_native_unchanged_current;
+						read.capture = &observed;
+						if (ctrc_native_read_bind(&read, step->start, step->work, authority,
+							step->original_space, step->cache_block, step->original_before)
+							&& memcmp(&read.owner, &step->accepted.checkpoint.owner, sizeof(read.owner)) == 0
+							&& ctrc_native_read_target_current(&read, NULL)
+							&& ctrc_native_read_image(&read, &observed.page) && observed.ready
+							&& memcmp(&observed.page, &context->fixed.page, sizeof(observed.page)) == 0
+							&& memcmp(&observed.space0, &context->fixed.space0, sizeof(observed.space0)) == 0
+							&& memcmp(&observed.space1, &context->fixed.space1, sizeof(observed.space1)) == 0
+							&& ctrc_native_read_current(&read) && ctrc_native_read_target_current(&read, NULL)
+							&& ctrc_native_unchanged_current(step)) detail = RF_PAGE_PROOF_DETAIL_OK;
+					}
+				}
+			}
+		}
+	}
+	PG_FINALLY();
+	{
+		if (snapshot != NULL) pfree((void *)snapshot);
+	}
+	PG_END_TRY();
+	return detail;
+}
+
+RfPageProofDetailV1
+rf_page_recovery_ctrc_replays_unchanged_readback_v1(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, const ClusterRecoveryCtrcReplaySetSourceV1 *source,
+	RfPageCtrcAuthorityV1 *authority, const RfPageCtrcUnchangedV1 *unchanged,
+	ClusterSharedFsPageV1 *storage, Size subject_count, Size memory_budget)
+{
+	CtrcNativeUnchangedReadV1 context = {0};
+	CtrcNativeStepV1 *step = &context.step;
+	ClusterColdCtrcWorkV1 header;
+	uint32 held = 0;
+
+	if (!ctrc_native_read_actor() || start == NULL || work == NULL || source == NULL
+		|| authority == NULL || unchanged == NULL || storage == NULL)
+		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	ForEachLWLockHeldByMe(ctrc_native_insert_count_lock, &held);
+	if (held != 0 || !ClusterColdRecoveryCtrcWorkCurrent(start, work)
+		|| subject_count != work->counts.subject_count || work->counts.unqualified_count != 0
+		|| subject_count > (MaxAllocSize - offsetof(ClusterColdCtrcWorkV1, entries)) / sizeof(work->entries[0])
+		|| source->scope == NULL || ClusterColdRecoveryCtrcScope(start, work) != source->scope
+		|| !ClusterColdRecoveryCtrcPageUnchangedCurrent(start, work, unchanged, storage))
+		return RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+	step->work_bytes = offsetof(ClusterColdCtrcWorkV1, entries) + subject_count * sizeof(work->entries[0]);
+	if (sizeof(context.fixed) > memory_budget || step->work_bytes > memory_budget - sizeof(context.fixed))
+		return RF_PAGE_PROOF_DETAIL_CAPACITY;
+	context.original = unchanged; context.fixed = *unchanged;
+	if (!context.fixed.ready || !rf_page_version_present_v1(&context.fixed.before))
+		return RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+	memcpy(&header, work, offsetof(ClusterColdCtrcWorkV1, entries));
+	step->start = start; step->work = work; step->original_source = source; step->source = *source;
+	step->original_space = &unchanged->space; step->space = unchanged->space;
+	step->original_before = &unchanged->before; step->before = unchanged->before;
+	step->storage = storage; step->cache_authority = authority; step->cache_block = unchanged->blockno;
+	if (!cluster_space_identity_encode(&step->space, step->space_identity, sizeof(step->space_identity))
+		|| !cluster_recovery_ctrc_terminal_result_v1(start, work, &step->accepted))
+		return RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+	return ctrc_native_unchanged_read_attempt(&context, authority, &header);
 }
 #endif /* USE_PGRAC_CLUSTER */
