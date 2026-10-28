@@ -89,6 +89,10 @@ UT_TEST(relmap_native_record_mutations_invalidate_even_unchanged_bytes)
 		else
 			UT_ASSERT(cluster_clog_native_recovery_record_apply_v1(1, &op));
 		UT_ASSERT_EQ(fixture_status(100), TRANSACTION_STATUS_IN_PROGRESS);
+		/* Drop the new clean FULL input before checking equal-byte mutation:
+		 * the original held observation must still remain invalidated. */
+		if (kind == 1)
+			clog_recovery_cache_discard(&ClogRecoveryCtl[1]);
 		relmap_mutation_refuses(&base, &held);
 	}
 }
