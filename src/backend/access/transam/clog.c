@@ -1073,6 +1073,33 @@ clog_relmap_mutation_snapshot(int origin, uint64 *generation)
 	return true;
 }
 
+/* Delayed SLRU writeback can follow the logical mutation reservation.
+ * Observe the actual native write interval using only the original ctl
+ * identity, never a caller-provided origin or directory spelling. This
+ * reuses attempt accounting; it is not continuous physical exclusion. */
+static void
+clog_relmap_slru_write_observe(SlruCtl ctl, bool begin)
+{
+	int origin = -1;
+
+	if (!cluster_shared_config)
+		return;
+	if (ctl == XactCtl)
+		origin = cluster_node_id;
+	else
+		for (int i = 0; i < CLOG_RECOVERY_ORIGINS; ++i)
+			if (ctl == &ClogRecoveryCtl[i]) {
+				origin = i;
+				break;
+			}
+	if (origin < 0 || origin >= CLOG_RECOVERY_ORIGINS)
+		return;
+	if (begin)
+		clog_relmap_native_mutation(origin);
+	else
+		clog_relmap_native_mutation_end(origin);
+}
+
 static bool
 clog_relmap_mutation_matches(int origin, uint64 generation)
 {
@@ -2054,6 +2081,7 @@ clog_recovery_shmem_init(void)
 		ctl->PagePrecedes = CLOGPagePrecedes;
 		SimpleLruInit(ctl, name, CLOG_RECOVERY_BUFFERS, 0, lock, path, LWTRANCHE_XACT_BUFFER,
 					  SYNC_HANDLER_NONE);
+		ctl->WritePageObserve = clog_relmap_slru_write_observe;
 	}
 }
 #endif
@@ -2086,8 +2114,10 @@ CLOGShmemInit(void)
 				  SYNC_HANDLER_CLOG);
 	SlruPagePrecedesUnitTests(XactCtl, CLOG_XACTS_PER_PAGE);
 #ifdef USE_PGRAC_CLUSTER
-	if (cluster_shared_config)
+	if (cluster_shared_config) {
 		clog_recovery_shmem_init();
+		XactCtl->WritePageObserve = clog_relmap_slru_write_observe;
+	}
 #endif
 }
 
