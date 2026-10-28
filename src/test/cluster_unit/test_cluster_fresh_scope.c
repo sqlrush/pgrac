@@ -38,6 +38,7 @@
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_policy.h"
 #include "catalog/pg_type_d.h"
+#include "commands/alter.h"
 #include "commands/collationcmds.h"
 #include "commands/comment.h"
 #include "commands/conversioncmds.h"
@@ -360,6 +361,32 @@ CreateCommandTag(Node *statement)
 			return CMDTAG_ALTER_EVENT_TRIGGER;
 		case OBJECT_TABLESPACE:
 			return CMDTAG_ALTER_TABLESPACE;
+		case OBJECT_AGGREGATE:
+			return CMDTAG_ALTER_AGGREGATE;
+		case OBJECT_CONVERSION:
+			return CMDTAG_ALTER_CONVERSION;
+		case OBJECT_FDW:
+			return CMDTAG_ALTER_FOREIGN_DATA_WRAPPER;
+		case OBJECT_FOREIGN_SERVER:
+			return CMDTAG_ALTER_SERVER;
+		case OBJECT_LANGUAGE:
+			return CMDTAG_ALTER_LANGUAGE;
+		case OBJECT_LARGEOBJECT:
+			return CMDTAG_ALTER_LARGE_OBJECT;
+		case OBJECT_PROCEDURE:
+			return CMDTAG_ALTER_PROCEDURE;
+		case OBJECT_PUBLICATION:
+			return CMDTAG_ALTER_PUBLICATION;
+		case OBJECT_ROUTINE:
+			return CMDTAG_ALTER_ROUTINE;
+		case OBJECT_STATISTIC_EXT:
+			return CMDTAG_ALTER_STATISTICS;
+		case OBJECT_SUBSCRIPTION:
+			return CMDTAG_ALTER_SUBSCRIPTION;
+		case OBJECT_TSCONFIGURATION:
+			return CMDTAG_ALTER_TEXT_SEARCH_CONFIGURATION;
+		case OBJECT_TSDICTIONARY:
+			return CMDTAG_ALTER_TEXT_SEARCH_DICTIONARY;
 		default:
 			return CMDTAG_UNKNOWN;
 		}
@@ -497,6 +524,16 @@ CreateCommandTag(Node *statement)
 const char *
 GetCommandTagName(CommandTag tag)
 {
+	if (tag == CMDTAG_ALTER_AGGREGATE)
+		return "ALTER AGGREGATE";
+	if (tag == CMDTAG_ALTER_CONVERSION)
+		return "ALTER CONVERSION";
+	if (tag == CMDTAG_ALTER_LANGUAGE)
+		return "ALTER LANGUAGE";
+	if (tag == CMDTAG_ALTER_LARGE_OBJECT)
+		return "ALTER LARGE OBJECT";
+	if (tag == CMDTAG_ALTER_SUBSCRIPTION)
+		return "ALTER SUBSCRIPTION";
 	switch (tag) {
 	case CMDTAG_DROP_TABLE:
 		return "DROP TABLE";
@@ -7344,9 +7381,22 @@ RangeVarCallbackForPolicy(const RangeVar *rv, Oid relid, Oid oldrelid, void *arg
 	abort(); /* This callback must remain beyond the real lookup boundary. */
 }
 
+static bool owner_lookup_active, owner_expect_binding;
+static unsigned owner_lookups, owner_unbound, owner_bad_lookup;
+static RoleSpec owner_role;
+
 Oid
 get_rolespec_oid(const RoleSpec *role, bool missing_ok)
 {
+	if (owner_lookup_active) {
+		owner_lookups++;
+		if (owner_expect_binding && utility_binds == 0)
+			owner_unbound++;
+		if (role != &owner_role || role->roletype != ROLESPEC_CSTRING
+			|| strcmp(role->rolename, "owner_role") != 0 || missing_ok)
+			owner_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before the real role lookup. */
+	}
 	policy_role_lookups++;
 	if (policy_expect_binding && utility_binds == 0)
 		policy_unbound++;
@@ -8199,10 +8249,281 @@ UT_TEST(test_native_event_trigger_original_permission_refusal_survives_early_bin
 	event_trigger_lookup_active = false;
 }
 
+/* The actual dispatcher prefix stops at its original get_rolespec_oid call.
+ * Later native dispatch/ACL/catalog work is deliberately outside this fixture. */
+#include "test_cluster_fresh_owner.inc"
+static AlterOwnerStmt native_owner_stmt;
+static String native_owner_name;
+static const struct {
+	ObjectType type;
+	const char *command;
+} owner_supported[] = { { OBJECT_AGGREGATE, "ALTER AGGREGATE" },
+						{ OBJECT_COLLATION, "ALTER COLLATION" },
+						{ OBJECT_CONVERSION, "ALTER CONVERSION" },
+						{ OBJECT_DATABASE, "ALTER DATABASE" },
+						{ OBJECT_EVENT_TRIGGER, "ALTER EVENT TRIGGER" },
+						{ OBJECT_FDW, "ALTER FOREIGN DATA WRAPPER" },
+						{ OBJECT_FOREIGN_SERVER, "ALTER SERVER" },
+						{ OBJECT_FUNCTION, "ALTER FUNCTION" },
+						{ OBJECT_LANGUAGE, "ALTER LANGUAGE" },
+						{ OBJECT_LARGEOBJECT, "ALTER LARGE OBJECT" },
+						{ OBJECT_PROCEDURE, "ALTER PROCEDURE" },
+						{ OBJECT_PUBLICATION, "ALTER PUBLICATION" },
+						{ OBJECT_ROUTINE, "ALTER ROUTINE" },
+						{ OBJECT_SCHEMA, "ALTER SCHEMA" },
+						{ OBJECT_STATISTIC_EXT, "ALTER STATISTICS" },
+						{ OBJECT_SUBSCRIPTION, "ALTER SUBSCRIPTION" },
+						{ OBJECT_TABLESPACE, "ALTER TABLESPACE" },
+						{ OBJECT_TSCONFIGURATION, "ALTER TEXT SEARCH CONFIGURATION" },
+						{ OBJECT_TSDICTIONARY, "ALTER TEXT SEARCH DICTIONARY" } };
+
+static void
+reset_native_owner(ObjectType type, unsigned mode, bool expect_binding)
+{
+	reset_create_preflight();
+	cluster_shared_catalog = (mode & 1) != 0;
+	utility_storage_mode = (mode & 2) != 0;
+	cluster_shared_config = (mode & 4) != 0;
+	owner_lookup_active = true;
+	owner_expect_binding = expect_binding;
+	owner_lookups = owner_unbound = owner_bad_lookup = 0;
+	owner_role
+		= (RoleSpec){ .type = T_RoleSpec, .roletype = ROLESPEC_CSTRING, .rolename = "owner_role" };
+	native_owner_name = (String){ .type = T_String, .sval = "owner_object" };
+	native_owner_stmt = (AlterOwnerStmt){ .type = T_AlterOwnerStmt,
+										  .objectType = type,
+										  .object = (Node *)&native_owner_name,
+										  .newowner = &owner_role };
+}
+
+UT_TEST(test_native_owner_dispatch_binds_before_role_lookup_in_all_profiles)
+{
+	for (unsigned type = 0; type < lengthof(owner_supported); type++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_owner(owner_supported[type].type, mode, binds);
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					(void)ExecAlterOwnerStmt(&native_owner_stmt);
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(owner_lookups, repeat + 1);
+				UT_ASSERT_EQ(owner_unbound, 0);
+				UT_ASSERT_EQ(owner_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	owner_lookup_active = false;
+}
+
+UT_TEST(test_native_owner_dispatch_publication_child_and_wrong_top_precede_role_lookup)
+{
+	for (unsigned type = 0; type < lengthof(owner_supported); type++) {
+		for (unsigned failure = 0; failure < 5; failure++) {
+			bool allocated = failure == 0 || failure == 2;
+			int caught;
+
+			reset_native_owner(owner_supported[type].type, 7, true);
+			if (failure == 0)
+				utility_bind_ok = false;
+			else if (failure == 1 || failure == 2) {
+				if (failure == 2)
+					create_sql_entry((Node *)&native_owner_stmt);
+				utility_in_child = true;
+			} else {
+				utility_current_xid = 401;
+				utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				(void)ExecAlterOwnerStmt(&native_owner_stmt);
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, failure == 0  ? ERRCODE_DATA_CORRUPTED
+									 : failure < 3 ? ERRCODE_FEATURE_NOT_SUPPORTED
+												   : ERRCODE_INTERNAL_ERROR);
+			UT_ASSERT_STR_EQ(
+				error_message,
+				failure == 0
+					? "canonical ACTIVE publication failed before shared catalog alteration"
+				: failure < 3 ? "shared catalog alteration does not support subtransactions"
+							  : "shared catalog top-level transaction identity mismatch");
+			UT_ASSERT_EQ(owner_lookups, 0);
+			UT_ASSERT_EQ(utility_xids, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, failure == 2 ? 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, allocated || failure == 3 ? 400 : InvalidTransactionId);
+		}
+	}
+	owner_lookup_active = false;
+}
+
+UT_TEST(test_native_owner_dispatch_context_guards_keep_original_names_and_nonshared_route)
+{
+	for (unsigned type = 0; type < lengthof(owner_supported); type++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+
+			for (unsigned guard = 0; guard < 3; guard++) {
+				int caught;
+
+				reset_native_owner(owner_supported[type].type, mode, binds);
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					(void)ExecAlterOwnerStmt(&native_owner_stmt);
+				UT_ASSERT_EQ(caught, binds ? 1 : 2);
+				UT_ASSERT_EQ(error_code, !binds		  ? 0
+										 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+													  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				if (binds)
+					UT_ASSERT(strstr(error_message, owner_supported[type].command) != NULL);
+				UT_ASSERT_EQ(owner_lookups, binds ? 0 : 1);
+				UT_ASSERT_EQ(owner_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	owner_lookup_active = false;
+}
+
+UT_TEST(test_native_owner_dispatch_utility_warm_and_context_guards_preserve_binding)
+{
+	for (unsigned type = 0; type < lengthof(owner_supported); type++) {
+		for (unsigned guard = 0; guard < 4; guard++) {
+			int caught;
+
+			reset_native_owner(owner_supported[type].type, 7, true);
+			create_sql_entry((Node *)&native_owner_stmt);
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			XactReadOnly = guard == 1;
+			utility_parallel = guard == 2;
+			utility_recovery = guard == 3;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				(void)ExecAlterOwnerStmt(&native_owner_stmt);
+			UT_ASSERT_EQ(caught, guard ? 1 : 2);
+			UT_ASSERT_EQ(error_code, !guard		  ? 0
+									 : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+												  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT_EQ(owner_lookups, guard ? 0 : 1);
+			UT_ASSERT_EQ(owner_unbound, 0);
+			UT_ASSERT_EQ(owner_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_prepares, guard ? 1 : 2);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			UT_ASSERT_EQ(utility_top_xid, 400);
+		}
+	}
+	owner_lookup_active = false;
+}
+
+UT_TEST(test_native_owner_dispatch_original_type_refusal_matches_utility_scope_and_precedence)
+{
+	const struct {
+		ObjectType type;
+		const char *message;
+	} forbidden[]
+		= { { OBJECT_MATVIEW, "materialized views is not supported in shared mode" },
+			{ OBJECT_TYPE, "custom types is not supported in shared mode" },
+			{ OBJECT_DOMAIN, "custom types is not supported in shared mode" },
+			{ OBJECT_OPERATOR, "custom operators is not supported in shared mode" },
+			{ OBJECT_OPCLASS, "custom operators is not supported in shared mode" },
+			{ OBJECT_OPFAMILY, "custom operators is not supported in shared mode" },
+			{ OBJECT_EXTENSION, "CREATE/DROP EXTENSION is not supported in shared mode" } };
+
+	for (unsigned type = 0; type < lengthof(forbidden); type++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool shared = mode != 0 && mode != 2;
+			int caught;
+
+			reset_native_owner(forbidden[type].type, mode, false);
+			XactReadOnly = utility_parallel = utility_recovery = utility_in_child = true;
+			utility_bind_ok = false;
+			if (shared) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					create_sql_entry((Node *)&native_owner_stmt);
+				UT_ASSERT_EQ(caught, 1);
+				UT_ASSERT_EQ(error_code, ERRCODE_FEATURE_NOT_SUPPORTED);
+				UT_ASSERT_STR_EQ(error_message, forbidden[type].message);
+				UT_ASSERT_STR_EQ(error_detail,
+								 "PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+				reset_error();
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				(void)ExecAlterOwnerStmt(&native_owner_stmt);
+			UT_ASSERT_EQ(caught, shared ? 1 : 2);
+			UT_ASSERT_EQ(error_code, shared ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+			if (shared) {
+				UT_ASSERT_STR_EQ(error_message, forbidden[type].message);
+				UT_ASSERT_STR_EQ(error_detail,
+								 "PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+			}
+			UT_ASSERT_EQ(owner_lookups, shared ? 0 : 1);
+			UT_ASSERT_EQ(owner_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+		}
+	}
+	owner_lookup_active = false;
+}
+
+UT_TEST(test_native_owner_dispatch_pg_undo_name_refusal_matches_utility_before_binding)
+{
+	for (unsigned mode = 0; mode < 8; mode++) {
+		bool shared = mode != 0 && mode != 2;
+		int caught;
+
+		reset_native_owner(OBJECT_TABLESPACE, mode, false);
+		native_owner_name.sval = "pg_undo";
+		XactReadOnly = utility_parallel = utility_recovery = utility_in_child = true;
+		utility_bind_ok = false;
+		if (shared) {
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				create_sql_entry((Node *)&native_owner_stmt);
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, ERRCODE_FEATURE_NOT_SUPPORTED);
+			UT_ASSERT_STR_EQ(error_message, "pg_undo cannot be altered");
+			UT_ASSERT_STR_EQ(
+				error_hint,
+				"pg_undo is a hard-coded system tablespace; owner changes are not supported.");
+			UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			reset_error();
+		}
+		caught = sigsetjmp(boundary, 1);
+		if (!caught)
+			(void)ExecAlterOwnerStmt(&native_owner_stmt);
+		UT_ASSERT_EQ(caught, shared ? 1 : 2);
+		UT_ASSERT_EQ(error_code, shared ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+		if (shared) {
+			UT_ASSERT_STR_EQ(error_message, "pg_undo cannot be altered");
+			UT_ASSERT_STR_EQ(
+				error_hint,
+				"pg_undo is a hard-coded system tablespace; owner changes are not supported.");
+		}
+		UT_ASSERT_EQ(owner_lookups, shared ? 0 : 1);
+		UT_ASSERT_EQ(owner_bad_lookup, 0);
+		UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+	}
+	owner_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(110);
+	UT_PLAN(116);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -8313,6 +8634,12 @@ main(void)
 	UT_RUN(test_native_event_trigger_context_guards_keep_nonshared_route);
 	UT_RUN(test_native_event_trigger_utility_warm_context_guards_preserve_binding);
 	UT_RUN(test_native_event_trigger_original_permission_refusal_survives_early_binding);
+	UT_RUN(test_native_owner_dispatch_binds_before_role_lookup_in_all_profiles);
+	UT_RUN(test_native_owner_dispatch_publication_child_and_wrong_top_precede_role_lookup);
+	UT_RUN(test_native_owner_dispatch_context_guards_keep_original_names_and_nonshared_route);
+	UT_RUN(test_native_owner_dispatch_utility_warm_and_context_guards_preserve_binding);
+	UT_RUN(test_native_owner_dispatch_original_type_refusal_matches_utility_scope_and_precedence);
+	UT_RUN(test_native_owner_dispatch_pg_undo_name_refusal_matches_utility_before_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

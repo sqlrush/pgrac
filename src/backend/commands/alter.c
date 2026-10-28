@@ -10,6 +10,10 @@
  * IDENTIFICATION
  *	  src/backend/commands/alter.c
  *
+ * PGRAC MODIFICATIONS
+ *    Preflight owner changes before role lookup or native catalog locks.
+ *    Author: SqlRush <sqlrush@gmail.com>
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -18,6 +22,9 @@
 #include "access/relation.h"
 #include "access/sysattr.h"
 #include "access/table.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "access/xact.h"
+#endif
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
@@ -44,6 +51,10 @@
 #include "catalog/pg_ts_dict.h"
 #include "catalog/pg_ts_parser.h"
 #include "catalog/pg_ts_template.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_mode.h"
+#include "cluster/cluster_tt_local.h"
+#endif
 #include "commands/alter.h"
 #include "commands/collationcmds.h"
 #include "commands/conversioncmds.h"
@@ -860,6 +871,71 @@ AlterObjectNamespace_internal(Relation rel, Oid objid, Oid nspOid)
 	return oldNspOid;
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* Direct owner dispatch must bind before its first role query. */
+static void
+PreflightClusterSharedOwnerWrite(AlterOwnerStmt *stmt)
+{
+	ClusterCanonicalTxnBinding binding;
+	TransactionId current_xid;
+	const char *command;
+	const char *unsupported = NULL;
+
+	/* Keep the original shared-scope refusals ahead of publication. */
+	if (cluster_shared_config || cluster_shared_catalog) {
+		if (stmt->objectType == OBJECT_TABLESPACE && stmt->object != NULL
+			&& IsA(stmt->object, String) && strcmp(strVal(stmt->object), "pg_undo") == 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("pg_undo cannot be altered"),
+					 errhint("pg_undo is a hard-coded system tablespace; "
+							 "owner changes are not supported.")));
+		switch (stmt->objectType) {
+		case OBJECT_MATVIEW:
+			unsupported = "materialized views";
+			break;
+		case OBJECT_TYPE:
+		case OBJECT_DOMAIN:
+			unsupported = "custom types";
+			break;
+		case OBJECT_OPERATOR:
+		case OBJECT_OPCLASS:
+		case OBJECT_OPFAMILY:
+			unsupported = "custom operators";
+			break;
+		case OBJECT_EXTENSION:
+			unsupported = "CREATE/DROP EXTENSION";
+			break;
+		default:
+			break;
+		}
+		if (unsupported != NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("%s is not supported in shared mode", unsupported),
+					 errdetail("PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED")));
+	}
+	if (!cluster_shared_catalog || !cluster_storage_mode_enabled())
+		return;
+
+	command = CreateCommandName((Node *)stmt);
+	PreventCommandIfReadOnly(command);
+	PreventCommandIfParallelMode(command);
+	PreventCommandDuringRecovery(command);
+	if (IsSubTransaction())
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("shared catalog alteration does not support subtransactions")));
+	current_xid = GetCurrentTransactionIdIfAny();
+	if (TransactionIdIsValid(current_xid)
+		&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("shared catalog top-level transaction identity mismatch")));
+	if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("canonical ACTIVE publication failed before shared catalog alteration")));
+}
+#endif
+
 /*
  * Executes an ALTER OBJECT / OWNER TO statement.  Based on the object
  * type, the function appropriate to that type is executed.
@@ -867,7 +943,12 @@ AlterObjectNamespace_internal(Relation rel, Oid objid, Oid nspOid)
 ObjectAddress
 ExecAlterOwnerStmt(AlterOwnerStmt *stmt)
 {
-	Oid			newowner = get_rolespec_oid(stmt->newowner, false);
+	Oid newowner;
+
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedOwnerWrite(stmt);
+#endif
+	newowner = get_rolespec_oid(stmt->newowner, false);
 
 	switch (stmt->objectType)
 	{

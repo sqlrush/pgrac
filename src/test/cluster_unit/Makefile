@@ -1020,6 +1020,15 @@ test_cluster_fresh_event_trigger.inc: $(top_srcdir)/src/backend/commands/event_t
 	     /^}/ { emit=0 } \
 	     END { if (helpers > 1 || entries != 3 || cuts != 3 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
+test_cluster_fresh_owner.inc: $(top_srcdir)/src/backend/commands/alter.c Makefile
+	awk '/^PreflightClusterSharedOwnerWrite\(/ { print "static void"; emit=1; helpers++ } \
+	     /^ExecAlterOwnerStmt\(/ { print "ObjectAddress"; emit=1; entry=1; entries++ } \
+	     emit { print } \
+	     entry && /newowner = get_rolespec_oid\(stmt->newowner, false\);/ \
+	     { print "return InvalidObjectAddress; }"; emit=0; entry=0; cuts++ } \
+	     /^}/ { emit=0 } \
+	     END { if (helpers > 1 || entries != 1 || cuts != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
 test_cluster_fresh_scope: test_cluster_fresh_scope.c unit_test.h \
 		test_cluster_fresh_control.inc test_cluster_fresh_startup.inc test_cluster_fresh_read.inc \
 		test_cluster_fresh_boolean.inc test_cluster_fresh_index.inc test_cluster_fresh_utility.inc \
@@ -1028,7 +1037,7 @@ test_cluster_fresh_scope: test_cluster_fresh_scope.c unit_test.h \
 		test_cluster_fresh_import_filter.inc test_cluster_fresh_extension.inc \
 		test_cluster_fresh_schema.inc test_cluster_fresh_comment.inc test_cluster_fresh_seclabel.inc \
 		test_cluster_fresh_policy.inc test_cluster_fresh_conversion.inc test_cluster_fresh_collation.inc \
-		test_cluster_fresh_event_trigger.inc
+		test_cluster_fresh_event_trigger.inc test_cluster_fresh_owner.inc
 	$(CC) $(CFLAGS) -Wno-unused-variable -Wno-unused-but-set-variable $(CPPFLAGS) $< \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 # PGRAC: link the real durable-prefix codec/reader, not a test copy.
@@ -6337,7 +6346,7 @@ clean distclean maintainer-clean:
 		test_cluster_fresh_catalog_index.inc test_cluster_shared_utility.inc \
 		test_cluster_fresh_schema.inc test_cluster_fresh_comment.inc test_cluster_fresh_seclabel.inc \
 		test_cluster_fresh_policy.inc test_cluster_fresh_conversion.inc test_cluster_fresh_collation.inc \
-		test_cluster_fresh_event_trigger.inc
+		test_cluster_fresh_event_trigger.inc test_cluster_fresh_owner.inc
 	rm -f $(TESTS) pgrac_fenced_live_rejoin_client probe_pgrac_fenced_cib \
 		test_cluster_tt_locator_stats.inc \
 		test_cluster_heap_inplace_version.inc test_cluster_heap_inplace_legacy_version.inc \
