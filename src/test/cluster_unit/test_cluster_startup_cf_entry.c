@@ -68,6 +68,7 @@ void entry_actual_owner_service_poll(void);
 #include "../../backend/cluster/cluster_cf_enqueue.c"
 
 bool cluster_enabled = true;
+bool enableFsync = true;
 bool InRecovery, ArchiveRecoveryRequested;
 volatile sig_atomic_t ShutdownRequestPending;
 static ControlFileData control;
@@ -151,6 +152,11 @@ errmsg_internal(const char *format pg_attribute_unused(), ...)
 }
 int
 errdetail(const char *format pg_attribute_unused(), ...)
+{
+	return 0;
+}
+int
+errhint(const char *format pg_attribute_unused(), ...)
 {
 	return 0;
 }
@@ -3861,6 +3867,732 @@ UT_TEST(ordinary_recovery_wal_roles_keep_the_original_wait_policy)
 		}
 }
 
+
+/* Actual CF/CONTROL plus the original self-seal S/X caller and authorizer.
+ * Quorum/death, physical ROOT/WAL and WALR are explicit leaf facts. */
+static unsigned self_phase, self_attempts, self_reads, self_tail_reads, self_publications;
+static unsigned self_walr_begins, self_walr_ends, self_death_calls;
+static bool self_quorum, self_death, self_throw_read, self_direct, self_tail_divergent;
+static bool self_receipt_before_reapply;
+static ClusterControlRootResult self_root_result, self_tail_result;
+static ClusterLockAcquireResult self_acquire_result;
+static ClusterRecoverySerialRequest self_request;
+static void (*self_wal_hook)(void);
+static int self_walr_identity;
+static LOCKMODE
+self_wait_mode(void)
+{
+	return self_phase == 0 ? ShareLock : ExclusiveLock;
+}
+bool
+cluster_qvotec_in_quorum(void)
+{
+	return self_quorum;
+}
+bool
+cluster_qvotec_prior_death_observe(uint32 node, uint64 prior, uint64 observing, uint64 now,
+								   uint64 min_dead, ClusterQvotecPriorExitObservation *out)
+{
+	UT_ASSERT_EQ(node, 0);
+	UT_ASSERT_EQ(prior, self_request.duty.origin_owner_incarnation);
+	UT_ASSERT_EQ(observing, control_creator.incarnation);
+	UT_ASSERT(now != 0);
+	UT_ASSERT(min_dead != 0 && out != NULL);
+	memset(out, 0, sizeof(*out));
+	++self_death_calls;
+	return self_death;
+}
+static bool
+self_unreachable_authority(void)
+{
+	/* No foreign/IR authority is available in this self-only fixture. */
+	UT_ASSERT(false);
+	return false;
+}
+ClusterWalPinResult
+cluster_wal_retention_root_publish_begin_exact(const ClusterControlRootReadToken *root,
+											   bool require_sealed,
+											   ClusterWalRootPublishGuard **out)
+{
+	UT_ASSERT_EQ(memcmp(root, &self_request.expected_root_token, sizeof(*root)), 0);
+	UT_ASSERT(!require_sealed && *out == NULL);
+	UT_ASSERT(!cluster_cf_held(ShareLock) && !cluster_cf_held(ExclusiveLock));
+	++self_walr_begins;
+	*out = (ClusterWalRootPublishGuard *)&self_walr_identity;
+	return CLUSTER_WAL_PIN_OK;
+}
+ClusterWalrReleaseResult
+cluster_wal_retention_root_publish_end(ClusterWalRootPublishGuard **guard)
+{
+	UT_ASSERT(*guard == (ClusterWalRootPublishGuard *)&self_walr_identity);
+	UT_ASSERT(!cluster_cf_held(ShareLock) && !cluster_cf_held(ExclusiveLock));
+	++self_walr_ends;
+	*guard = NULL;
+	return CLUSTER_WALR_RELEASE_CONFIRMED;
+}
+static ClusterControlRootResult
+self_read_thread(const ClusterControlRootIdentity *expected, ControlRootImage *root,
+				 ControlFileData *native, ClusterControlRootFileToken *file, uint16 version)
+{
+	UT_ASSERT(cluster_cf_held_is_clusterwide(self_direct	   ? self_wait_mode()
+											 : self_reads == 0 ? ShareLock
+															   : ExclusiveLock));
+	UT_ASSERT_EQ(version, 3);
+	UT_ASSERT_EQ(memcmp(expected, &self_request.duty, sizeof(*expected)), 0);
+	++self_reads;
+	if (self_throw_read)
+		ereport(ERROR, (errcode(ERRCODE_IO_ERROR), errmsg("self-seal ROOT read failed")));
+	*root = retention_image;
+	memset(native, 0, sizeof(*native));
+	native->checkPoint = 100;
+	native->checkPointCopy.redo = 80;
+	memset(file, 0, sizeof(*file));
+	return self_root_result;
+}
+ClusterControlRootResult
+cluster_wal_tail_observe_checkpoint(const char *dir, const ClusterWalSourceRef *ref,
+									int segment_size, XLogRecPtr lower, XLogRecPtr upper,
+									XLogRecPtr checkpoint, pg_crc32c crc,
+									ClusterWalTailObservation *out)
+{
+	UT_ASSERT(dir == cluster_wal_threads_dir && segment_size == wal_segment_size);
+	UT_ASSERT_EQ(memcmp(ref, &cold_restart, sizeof(*ref)), 0);
+	UT_ASSERT_EQ(checkpoint, 100);
+	UT_ASSERT_EQ(lower, 80);
+	UT_ASSERT_EQ(upper, self_tail_reads == 0 ? 101 : 340);
+	UT_ASSERT_EQ(crc, 21);
+	UT_ASSERT_EQ(cluster_cf_held(ExclusiveLock), self_tail_reads != 0);
+	if (self_tail_reads == 0)
+		UT_ASSERT(!cluster_cf_held(ShareLock));
+	++self_tail_reads;
+	memset(out, 0, sizeof(*out));
+	out->complete_end = 340;
+	out->last_record_start = 300;
+	out->last_record_crc = 23 + (self_tail_divergent && self_tail_reads == 2);
+	if (self_wal_hook != NULL && self_tail_reads == 1)
+		self_wal_hook();
+	return self_tail_result;
+}
+static ClusterControlRootResult
+self_encode(ControlRootImage *root, uint16 version)
+{
+	UT_ASSERT_EQ(version, 3);
+	memset(root->bytes, (uint8)root->header.file_txn_seq, sizeof(root->bytes));
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+static bool
+self_publish(const ControlRootImage *base, const ControlRootImage *next)
+{
+	UT_ASSERT(cluster_cf_held_is_clusterwide(ExclusiveLock));
+	UT_ASSERT_EQ(base->header.file_txn_seq, retention_image.header.file_txn_seq);
+	++self_publications;
+	retention_image = *next;
+	return true;
+}
+static bool
+self_actual_cf_lock(LOCKMODE mode)
+{
+	++self_attempts;
+	if (claim_retiring_cookie != 0 && mode == self_wait_mode()) {
+		UT_ASSERT(!cluster_cf_held(ShareLock) && !cluster_cf_held(ExclusiveLock));
+		UT_ASSERT(cluster_cf_release_completed(mode, claim_retiring_cookie));
+		UT_ASSERT(cluster_control_request_empty());
+		self_receipt_before_reapply = true;
+	}
+	++g_next_request_id;
+	if (self_attempts == (self_direct || self_phase == 0 ? 1 : 2))
+		g_seven_result = self_acquire_result;
+	return claim_actual_cf_lock(mode);
+}
+/* The foreign/fenced branch remains the exact product body but has no
+ * authority fixture. Reaching it is a test failure, never fabricated proof. */
+static bool
+self_unavailable_digest(const ClusterRecoveryDutyKey *key, bool v2, ClusterRecoveryDutyDigest *out)
+{
+	(void)key;
+	(void)v2;
+	memset(out, 0, sizeof(*out));
+	return self_unreachable_authority();
+}
+#define cluster_recovery_duty_digest_for_claim self_unavailable_digest
+#define cluster_formation_witness_revalidate_nowait(...) self_unreachable_authority()
+#define cluster_external_fence_need_set_revalidate_nowait(needs, formation, reason)                \
+	((void)(reason), self_unreachable_authority())
+#define cluster_external_fence_revalidate_set_nowait(...) self_unreachable_authority()
+#define cluster_external_fence_need_set_count(...) ((uint32)self_unreachable_authority())
+#define cluster_external_fence_need_set_at(...) ((const PgracExternalFenceNeedV1 *)NULL)
+#define cluster_recovery_serial_input_revalidate(...) self_unreachable_authority()
+#define cluster_recovery_serial_release(...) self_unreachable_authority()
+#define cluster_cf_lock self_actual_cf_lock
+#define read_thread_version self_read_thread
+#define encode_extended_image self_encode
+#define publish_updated_image self_publish
+#include "test_cluster_self_seal_cf.inc"
+#undef publish_updated_image
+#undef encode_extended_image
+#undef read_thread_version
+#undef cluster_cf_lock
+#undef cluster_recovery_serial_release
+#undef cluster_recovery_serial_input_revalidate
+#undef cluster_external_fence_need_set_at
+#undef cluster_external_fence_need_set_count
+#undef cluster_external_fence_revalidate_set_nowait
+#undef cluster_external_fence_need_set_revalidate_nowait
+#undef cluster_formation_witness_revalidate_nowait
+#undef cluster_recovery_duty_digest_for_claim
+
+static FailureInputV2Work self_work;
+static void
+self_ready_after_ack(void)
+{
+	LOCKMODE mode = self_wait_mode();
+
+	UT_ASSERT_EQ(self_attempts, self_phase == 0 ? 1 : 2);
+	UT_ASSERT_EQ(self_reads, self_phase);
+	UT_ASSERT_EQ(self_tail_reads, self_phase);
+	UT_ASSERT(cluster_cf_held(mode) && !cluster_cf_held_is_usable(mode));
+	if (claim_retiring_cookie == 0)
+		claim_retiring_cookie = cluster_cf_owner_cookie(mode);
+	if (entry_waits == entry_ack_at) {
+		g_seven_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+		++g_next_request_id;
+	}
+}
+static void
+self_fixture(unsigned phase)
+{
+	retention_fixture(0);
+	self_phase = phase;
+	self_attempts = self_reads = self_tail_reads = self_publications = 0;
+	self_walr_begins = self_walr_ends = self_death_calls = 0;
+	self_quorum = self_death = enableFsync = true;
+	self_throw_read = self_direct = self_tail_divergent = false;
+	self_receipt_before_reapply = false;
+	self_root_result = self_tail_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	self_acquire_result = CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
+	self_wal_hook = NULL;
+	retention_image.header.file_txn_seq = 7;
+	retention_image.header.v2.database_incarnation = 7;
+	retention_image.header.v2.config_generation = 9;
+	retention_image.refs[0].claim_sha256[0] = 3;
+	retention_image.records[0].identity.origin_owner_incarnation--;
+	retention_image.records[0].checkpoint_tli = 1;
+	retention_image.records[0].checkpoint_lower_lsn = 80;
+	retention_image.records[0].checkpoint_record_crc32c = 21;
+	retention_image.records[0].root_flags = CLUSTER_CONTROL_ROOT_FLAG_FPW_WAS_OFF;
+	memset(&cold_restart, 0, sizeof(cold_restart));
+	cold_restart.claim.identity = retention_image.records[0].identity;
+	cold_restart.claim.database_incarnation = 7;
+	cold_restart.claim.max_config_generation = 9;
+	cold_restart.claim.claim_sha256[0] = 3;
+	cold_restart.timeline = 1;
+	memset(&self_request, 0, sizeof(self_request));
+	self_request.mode = CLUSTER_RECOVERY_SERIAL_INPUT_SEAL;
+	self_request.duty = cold_restart.claim.identity;
+	make_read_token(&retention_image, 1, CONTROL_ROOT_SOURCE_PRIMARY,
+					&self_request.expected_root_token);
+	memset(&self_work, 0, sizeof(self_work));
+	self_work.format_version = 3;
+	self_work.publisher_node = cluster_node_id;
+	self_work.publisher_incarnation = control_creator.incarnation;
+	self_work.self = true;
+	self_work.self_min_dead_us = 3000000;
+	self_work.self_restart = cold_restart;
+	if (phase == 1)
+		g_seven_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	entry_on_wait = self_ready_after_ack;
+}
+static bool
+self_call(ClusterControlRootResult *result)
+{
+	volatile bool completed = false;
+
+	PG_TRY();
+	{
+		*result = self_direct
+					  ? failure_v2_self_open_read(&self_request, &self_work, self_wait_mode())
+					  : failure_v2_self_seal_work(&self_request, &self_work);
+		completed = true;
+	}
+	PG_CATCH();
+	{
+		FlushErrorState();
+	}
+	PG_END_TRY();
+	return completed;
+}
+static void
+self_cleanup(void)
+{
+	entry_on_wait = NULL;
+	claim_after_acquire = NULL;
+	claim_on_reset = NULL;
+	claim_teardown = owner_ack_on_wait = true;
+	for (unsigned i = 0; i < 2; i++) {
+		LOCKMODE mode = i == 0 ? ShareLock : ExclusiveLock;
+
+		if (cluster_cf_held_is_usable(mode))
+			UT_ASSERT_EQ(cluster_cf_unlock_confirmed(mode), CLUSTER_CF_RELEASE_CONFIRMED);
+	}
+	(void)acknowledge_retirements();
+	cluster_cf_retirement_poll();
+	UT_ASSERT(!cluster_cf_held(ShareLock) && !cluster_cf_held(ExclusiveLock));
+	UT_ASSERT_EQ(pg_atomic_read_u32(&MyProc->cluster_grd_registered_count), 0);
+	self_work.cf_mode = NoLock;
+	UT_ASSERT_EQ(failure_v2_cleanup(&self_work, CLUSTER_CONTROL_ROOT_OK_PRIMARY),
+				 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	claim_teardown = owner_ack_on_wait = false;
+	cold_consumer = false;
+	UT_ASSERT(cluster_control_request_empty());
+}
+UT_TEST(startup_self_seal_cf_slice_waits_for_exact_completion_in_both_intervals)
+{
+	for (unsigned phase = 0; phase < 2; phase++) {
+		ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+
+		self_fixture(phase);
+		UT_ASSERT(self_call(&result));
+		UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT_EQ(entry_waits, 3);
+		UT_ASSERT_EQ(self_attempts, 3);
+		UT_ASSERT_EQ(self_reads, 3);
+		UT_ASSERT_EQ(self_tail_reads, 2);
+		UT_ASSERT_EQ(self_publications, 1);
+		UT_ASSERT(self_death_calls > 0);
+		UT_ASSERT(self_receipt_before_reapply);
+		UT_ASSERT_EQ(retention_image.records[0].lifecycle,
+					 CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED);
+		UT_ASSERT(retention_image.records[0].root_flags & CLUSTER_CONTROL_ROOT_FLAG_FPW_WAS_OFF);
+		UT_ASSERT_EQ(retention_image.header.v2.serving[0], 0);
+		self_cleanup();
+		UT_ASSERT_EQ(self_walr_begins, 1);
+		UT_ASSERT_EQ(self_walr_ends, 1);
+	}
+}
+
+
+static unsigned self_fault;
+static CfHoldState self_saved_slot;
+static ClusterControlRequestView self_saved_record;
+static void
+self_change_context(void)
+{
+	CfHoldState *slot = cf_slot(self_wait_mode());
+
+	switch (self_fault) {
+	case 0:
+		MyProcPid++;
+		break;
+	case 1:
+		MyProc = NULL;
+		break;
+	case 2:
+		MyLatch = NULL;
+		break;
+	case 3:
+		CurrentResourceOwner = (ResourceOwner)2;
+		break;
+	case 4:
+		MyBackendType = B_BG_WORKER;
+		break;
+	case 5:
+		MyAuxProcType = BgWriterProcess;
+		break;
+	case 6:
+		cluster_node_id = 1;
+		break;
+	case 7:
+		owner_epoch++;
+		break;
+	case 8:
+		owner_generation++;
+		break;
+	case 9:
+		control_creator.incarnation++;
+		break;
+	case 10:
+		InRecovery = !InRecovery;
+		break;
+	case 11:
+		entry_authority = false;
+		break;
+	case 12:
+		cluster_shared_config = false;
+		break;
+	case 13:
+		cluster_controlfile_shared_authority = false;
+		break;
+	case 14:
+		cluster_enabled = false;
+		break;
+	case 15:
+		ShutdownRequestPending = true;
+		break;
+	case 16:
+		entry_native_lock = true;
+		break;
+	case 17:
+		CritSectionCount = 1;
+		break;
+	case 18:
+		self_work.self = false;
+		break;
+	case 19:
+		self_request.mode++;
+		break;
+	case 20:
+		self_request.duty.thread_claim_crc32c++;
+		break;
+	case 21:
+		self_request.expected_root_token.file_txn_seq++;
+		break;
+	case 22:
+		self_work.self_min_dead_us++;
+		break;
+	case 23:
+		self_work.publisher_node++;
+		break;
+	case 24:
+		self_work.publisher_incarnation++;
+		break;
+	case 25:
+		self_work.self_restart.claim.claim_sha256[0]++;
+		break;
+	case 26:
+		cold_restart.claim.claim_sha256[0]++;
+		break;
+	case 27:
+		self_work.walr = NULL;
+		break;
+	case 28:
+		self_work.format_version++;
+		break;
+	case 29:
+		self_quorum = false;
+		break;
+	case 30:
+		retention_member = false;
+		break;
+	case 31:
+		retention_admitted++;
+		break;
+	case 32:
+		self_death = false;
+		break;
+	case 33:
+		self_work.self_restart.timeline++;
+		break;
+	case 34:
+		slot->owner.request.control_owner_id++;
+		break;
+	case 35:
+		slot->owner.attempt.generation++;
+		break;
+	case 36:
+		control_requests->records[slot->owner.attempt.slot].owner.incarnation++;
+		break;
+	case 37:
+		control_requests->records[slot->owner.attempt.slot].message.key.holder.request_id++;
+		break;
+	case 38:
+		control_requests->records[slot->owner.attempt.slot].message.key.holder.cluster_epoch++;
+		break;
+	case 39:
+		control_requests->records[slot->owner.attempt.slot].state = CLUSTER_CONTROL_REQUEST_INVALID;
+		break;
+	case 40:
+		slot->release_pending = false;
+		break;
+	case 41:
+		slot->owner.state = CLUSTER_LOCK_OWNER_ACQUIRING;
+		break;
+	case 42:
+		slot->owner.cooperative_acquire = true;
+		break;
+	case 43:
+		cf_slot(self_wait_mode() == ShareLock ? ExclusiveLock : ShareLock)->held = true;
+		break;
+	case 44:
+		enableFsync = false;
+		break;
+	}
+}
+static void
+self_change_while_waiting(void)
+{
+	self_ready_after_ack();
+	self_saved_slot = *cf_slot(self_wait_mode());
+	self_saved_record = control_requests->records[self_saved_slot.owner.attempt.slot];
+	self_change_context();
+}
+UT_TEST(startup_self_seal_wait_rechecks_original_actor_purpose_and_request)
+{
+	for (unsigned phase = 0; phase < 2; phase++)
+		for (self_fault = 0; self_fault < 45; self_fault++) {
+			ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+			int pid = MyProcPid;
+			uint64 epoch = owner_epoch, generation = owner_generation;
+			uint64 boot = control_creator.incarnation;
+
+			self_fixture(phase);
+			entry_on_wait = self_change_while_waiting;
+			UT_ASSERT(!self_call(&result));
+			UT_ASSERT_EQ(entry_code, ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED);
+			UT_ASSERT_EQ(entry_level, FATAL);
+			UT_ASSERT_EQ(entry_waits, 1);
+			UT_ASSERT_EQ(self_reads, phase);
+			UT_ASSERT_EQ(self_tail_reads, phase);
+			UT_ASSERT_EQ(self_publications, 0);
+			recovery_restore_actor(pid, epoch, generation, boot);
+			*cf_slot(self_wait_mode()) = self_saved_slot;
+			control_requests->records[self_saved_slot.owner.attempt.slot] = self_saved_record;
+			memset(cf_slot(self_wait_mode() == ShareLock ? ExclusiveLock : ShareLock), 0,
+				   sizeof(CfHoldState));
+			self_work.walr = (ClusterWalRootPublishGuard *)&self_walr_identity;
+			self_cleanup();
+		}
+}
+static void
+self_change_after_grant(void)
+{
+	if (entry_waits != 0)
+		self_change_context();
+}
+UT_TEST(startup_self_seal_new_grant_requalifies_before_root_io)
+{
+	const unsigned faults[] = { 3, 7, 21, 25, 27, 29, 32 };
+
+	for (unsigned phase = 0; phase < 2; phase++)
+		for (unsigned i = 0; i < lengthof(faults); i++) {
+			ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+			uint64 epoch = owner_epoch;
+
+			self_fixture(phase);
+			self_fault = faults[i];
+			claim_after_acquire = self_change_after_grant;
+			UT_ASSERT(self_call(&result));
+			UT_ASSERT_EQ(result, self_fault == 7 ? CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE
+												 : CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+			UT_ASSERT_EQ(entry_waits, 3);
+			UT_ASSERT_EQ(self_reads, phase);
+			UT_ASSERT_EQ(self_tail_reads, phase);
+			UT_ASSERT_EQ(self_publications, 0);
+			CurrentResourceOwner = (ResourceOwner)1;
+			owner_epoch = epoch;
+			self_work.walr = (ClusterWalRootPublishGuard *)&self_walr_identity;
+			self_cleanup();
+		}
+}
+static void
+self_remove_receipt(void)
+{
+	self_ready_after_ack();
+	UT_ASSERT(acknowledge_retirements());
+	cluster_cf_retirement_poll();
+	UT_ASSERT(cluster_cf_release_completed(self_wait_mode(), claim_retiring_cookie));
+	if (self_wait_mode() == ShareLock)
+		cf_retired_s = 0;
+	else
+		cf_retired_x = 0;
+}
+static void
+self_ack_during_reset(void)
+{
+	if (self_attempts != (self_phase == 0 ? 1 : 2) || !cluster_cf_held(self_wait_mode()))
+		return;
+	claim_retiring_cookie = cluster_cf_owner_cookie(self_wait_mode());
+	UT_ASSERT(acknowledge_retirements());
+	g_seven_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	++g_next_request_id;
+}
+static void
+self_empty_grant(void)
+{
+	UT_ASSERT(!cluster_cf_held(ShareLock) && !cluster_cf_held(ExclusiveLock));
+	UT_ASSERT(cluster_control_request_empty());
+	UT_ASSERT_EQ(self_reads, self_phase);
+	g_seven_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	++g_next_request_id;
+}
+UT_TEST(startup_self_seal_receipt_and_wake_rules_preserve_progress)
+{
+	for (unsigned phase = 0; phase < 2; phase++)
+		for (unsigned fault = 0; fault < 4; fault++) {
+			ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+
+			self_fixture(phase);
+			entry_lost_latch = true;
+			if (fault == 0)
+				entry_on_wait = self_remove_receipt;
+			else if (fault == 1)
+				claim_on_reset = self_ack_during_reset;
+			else if (fault == 2) {
+				fail_after_publication = false;
+				entry_on_wait = self_empty_grant;
+			}
+			UT_ASSERT_EQ(self_call(&result), fault != 0);
+			UT_ASSERT_EQ(entry_waits, fault == 1 ? 0 : fault == 3 ? 3 : 1);
+			if (fault == 0) {
+				UT_ASSERT_EQ(entry_code, ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED);
+				UT_ASSERT_EQ(self_reads, phase);
+				UT_ASSERT_EQ(self_publications, 0);
+			} else {
+				UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+				UT_ASSERT_EQ(self_publications, 1);
+			}
+			self_cleanup();
+		}
+}
+UT_TEST(startup_self_seal_hard_untyped_and_preexisting_requests_do_not_retry)
+{
+	for (unsigned phase = 0; phase < 2; phase++)
+		for (unsigned fault = 0; fault < 7; fault++) {
+			ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+			unsigned before;
+			LOCKMODE preexisting = fault == 3 || fault == 5 ? ShareLock : ExclusiveLock;
+			bool foreign = fault >= 3 && preexisting != (phase == 0 ? ShareLock : ExclusiveLock);
+
+			self_fixture(phase);
+			if (fault == 0)
+				self_acquire_result = CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+			else if (fault == 1)
+				g_timeout_detail.source = CLUSTER_GES_TSRC_NONE;
+			else if (fault == 2)
+				entry_on_wait = entry_hard_error;
+			else {
+				g_seven_result = fault >= 5 ? CLUSTER_LOCK_ACQUIRE_OK_GRANTED
+											: CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
+				UT_ASSERT_EQ(cluster_cf_lock(preexisting), fault >= 5);
+				self_direct = true;
+				self_work.walr = (ClusterWalRootPublishGuard *)&self_walr_identity;
+			}
+			before = g_seven_count;
+			if (fault == 2 || foreign) {
+				UT_ASSERT(!self_call(&result));
+				UT_ASSERT_EQ(entry_code,
+							 foreign ? ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED : ERRCODE_IO_ERROR);
+			} else {
+				UT_ASSERT(self_call(&result));
+				UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+			}
+			UT_ASSERT_EQ(entry_waits, fault == 2 ? 1 : 0);
+			UT_ASSERT_EQ(g_seven_count, before
+											+ (foreign	   ? 1
+											   : fault < 3 ? (phase == 0 ? 1 : 2)
+														   : 0));
+			UT_ASSERT_EQ(self_reads, fault < 3 ? phase : 0);
+			UT_ASSERT_EQ(self_publications, 0);
+			self_cleanup();
+		}
+}
+static void
+self_change_root(void)
+{
+	self_ready_after_ack();
+	if (self_fault == 0)
+		retention_image.records[0].root_publish_seq++;
+	else if (self_fault == 1)
+		self_root_result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+	else if (self_fault == 2)
+		self_throw_read = true;
+	else if (self_fault == 3)
+		self_tail_result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+	else
+		self_tail_divergent = true;
+}
+UT_TEST(startup_self_seal_real_root_and_wal_refusals_remain_errors)
+{
+	for (unsigned phase = 0; phase < 2; phase++)
+		for (self_fault = 0; self_fault < 5; self_fault++) {
+			ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+			const ClusterControlRootResult expected[]
+				= { CLUSTER_CONTROL_ROOT_CAS_CONFLICT, CLUSTER_CONTROL_ROOT_IO_ERROR,
+					CLUSTER_CONTROL_ROOT_IO_ERROR, CLUSTER_CONTROL_ROOT_IO_ERROR,
+					CLUSTER_CONTROL_ROOT_COPY_DIVERGENT };
+
+			self_fixture(phase);
+			entry_on_wait = self_change_root;
+			UT_ASSERT_EQ(self_call(&result), self_fault != 2);
+			if (self_fault != 2)
+				UT_ASSERT_EQ(result, expected[self_fault]);
+			else
+				UT_ASSERT_EQ(entry_code, ERRCODE_IO_ERROR);
+			UT_ASSERT_EQ(entry_waits, 3);
+			UT_ASSERT_EQ(self_publications, 0);
+			self_cleanup();
+		}
+}
+static void
+self_change_owner_outside_cf(void)
+{
+	UT_ASSERT(!cluster_cf_held(ShareLock) && !cluster_cf_held(ExclusiveLock));
+	CurrentResourceOwner = (ResourceOwner)2;
+}
+UT_TEST(startup_self_seal_second_interval_keeps_the_original_owner)
+{
+	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+
+	self_fixture(1);
+	self_wal_hook = self_change_owner_outside_cf;
+	UT_ASSERT(!self_call(&result));
+	UT_ASSERT_EQ(entry_code, ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED);
+	UT_ASSERT_EQ(entry_waits, 0);
+	UT_ASSERT_EQ(self_reads, 1);
+	UT_ASSERT_EQ(self_tail_reads, 1);
+	UT_ASSERT_EQ(self_publications, 0);
+	CurrentResourceOwner = (ResourceOwner)1;
+	self_cleanup();
+}
+UT_TEST(startup_self_seal_original_cancel_keeps_shared_cleanup_responsibility)
+{
+	for (unsigned phase = 0; phase < 2; phase++) {
+		ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+		volatile bool exited = false;
+
+		self_fixture(phase);
+		entry_on_wait = entry_shutdown;
+		startup_fixture_exit_hook = entry_owner_exit;
+		startup_fixture_armed = true;
+		if (sigsetjmp(startup_fixture_exit, 1) == 0)
+			UT_ASSERT(!self_call(&result));
+		else
+			exited = true;
+		UT_ASSERT(exited);
+		UT_ASSERT_EQ(startup_fixture_exit_code, 1);
+		UT_ASSERT_EQ(entry_waits, 1);
+		UT_ASSERT_EQ(self_reads, phase);
+		UT_ASSERT_EQ(self_publications, 0);
+		UT_ASSERT(
+			control_requests->records[cf_slot(self_wait_mode())->owner.attempt.slot].owner_exited);
+		PG_exception_stack = NULL;
+		error_context_stack = NULL;
+		proc_exit_inprogress = shutdown_requested = false;
+		startup_fixture_armed = false;
+		startup_fixture_exit_hook = NULL;
+		self_cleanup();
+	}
+}
+UT_TEST(ordinary_self_open_read_keeps_the_original_wait_policy)
+{
+	const BackendType roles[] = { B_BG_WORKER, B_BG_WRITER, B_CHECKPOINTER, B_LMON };
+
+	for (unsigned phase = 0; phase < 2; phase++)
+		for (unsigned role = 0; role < lengthof(roles); role++) {
+			ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+
+			self_fixture(phase);
+			self_direct = true;
+			self_work.walr = (ClusterWalRootPublishGuard *)&self_walr_identity;
+			MyBackendType = roles[role];
+			UT_ASSERT(self_call(&result));
+			UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+			UT_ASSERT_EQ(entry_waits, 0);
+			UT_ASSERT_EQ(self_reads | self_publications, 0);
+			MyBackendType = B_STARTUP;
+			self_cleanup();
+		}
+}
+
 int
 main(void)
 {
@@ -3871,7 +4603,13 @@ main(void)
 	pg_atomic_init_u64(&owner_proc.cluster_grd_redeclare_acked_epoch, 0);
 	cluster_control_request_shmem_init();
 	retire_driver = cluster_control_request_driver_start();
-	UT_PLAN(56);
+	if (getenv("PGRAC_PRE2_TEST_SELF_CF_LIVENESS") != NULL) {
+		UT_PLAN(1);
+		UT_RUN(startup_self_seal_cf_slice_waits_for_exact_completion_in_both_intervals);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
+	UT_PLAN(65);
 	UT_RUN(startup_cf_timeout_waits_for_exact_completion_before_begin);
 	UT_RUN(startup_cf_completion_does_not_preserve_changed_native_input);
 	UT_RUN(startup_cf_unsafe_native_context_never_takes_a_registry_lock);
@@ -3928,6 +4666,15 @@ main(void)
 	UT_RUN(startup_recovery_wal_second_interval_keeps_original_owner_and_failure);
 	UT_RUN(startup_recovery_wal_original_cancel_keeps_shared_cleanup_responsibility);
 	UT_RUN(ordinary_recovery_wal_roles_keep_the_original_wait_policy);
+	UT_RUN(startup_self_seal_cf_slice_waits_for_exact_completion_in_both_intervals);
+	UT_RUN(startup_self_seal_wait_rechecks_original_actor_purpose_and_request);
+	UT_RUN(startup_self_seal_new_grant_requalifies_before_root_io);
+	UT_RUN(startup_self_seal_receipt_and_wake_rules_preserve_progress);
+	UT_RUN(startup_self_seal_hard_untyped_and_preexisting_requests_do_not_retry);
+	UT_RUN(startup_self_seal_real_root_and_wal_refusals_remain_errors);
+	UT_RUN(startup_self_seal_second_interval_keeps_the_original_owner);
+	UT_RUN(startup_self_seal_original_cancel_keeps_shared_cleanup_responsibility);
+	UT_RUN(ordinary_self_open_read_keeps_the_original_wait_policy);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
