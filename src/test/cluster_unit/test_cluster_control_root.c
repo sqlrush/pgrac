@@ -51,9 +51,12 @@
 #include "common/sha2.h"
 #include "miscadmin.h"
 #include "postmaster/bgworker.h"
+#include "postmaster/startup.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
+#include "storage/lwlock.h"
+#include "storage/proc.h"
 #include "utils/resowner.h"
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
@@ -420,6 +423,8 @@ ProcessInterrupts(void)
 uint64
 cluster_epoch_get_current(void)
 {
+	if (test_inputs_startup_cf && !test_checkpoint_mode)
+		return test_epoch;
 	if (!test_checkpoint_mode)
 		abort();
 	if (++test_epoch_reads == test_throw_epoch_read)
@@ -559,7 +564,7 @@ cluster_qvotec_prior_death_observe(uint32 node, uint64 prior, uint64 observer, u
 uint64
 cluster_qvotec_get_self_incarnation(void)
 {
-	if (test_checkpoint_mode)
+	if (test_checkpoint_mode || test_inputs_startup_cf)
 		return test_self_incarnation;
 	abort();
 }
@@ -724,6 +729,54 @@ static bool test_worker_window_consumer;
 static unsigned test_legacy_projection_reads;
 static Latch test_root_latch;
 Latch *MyLatch = &test_root_latch;
+PGPROC *MyProc;
+static LWLockPadded test_root_lwlocks[NUM_INDIVIDUAL_LWLOCKS];
+LWLockPadded *MainLWLockArray = test_root_lwlocks;
+
+/* This ROOT/WAL fixture has no native startup CF wait producer. Its existing
+ * failed requests stay unclassified; the joined producer fixture tests waits. */
+void
+HandleStartupProcInterrupts(void)
+{
+	UT_ASSERT(false);
+}
+
+bool
+LWLockHeldByMe(LWLock *lock)
+{
+	UT_ASSERT(lock == ControlFileLock);
+	return false;
+}
+
+bool
+cluster_recovery_transport_components_current(void)
+{
+	UT_ASSERT(false);
+	return false;
+}
+
+bool
+cluster_cf_attempt_wait_slice(const ClusterCfAttemptObservation *observation)
+{
+	UT_ASSERT(observation != NULL);
+	UT_ASSERT(false);
+	return false;
+}
+
+bool
+cluster_cf_retirement_snapshot(LOCKMODE mode, const void *caller, ClusterCfRetirementSnapshot *out)
+{
+	UT_ASSERT(mode == ShareLock && caller == NULL && out != NULL);
+	UT_ASSERT(false);
+	memset(out, 0, sizeof(*out));
+	return false;
+}
+
+void
+cluster_lock_owners_service_poll(void)
+{
+	UT_ASSERT(false);
+}
 
 void
 ResetLatch(Latch *latch)

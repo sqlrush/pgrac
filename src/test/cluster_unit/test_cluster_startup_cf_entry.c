@@ -5,6 +5,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "unit_test.h"
+#include "access/xlog.h"
 #include "access/xlogrecovery.h"
 #include "catalog/pg_control.h"
 #include "cluster/cluster_wal_writer.h"
@@ -13,6 +14,9 @@
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_wal_inputs.h"
+#include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_recovery_plan.h"
+#include "cluster/cluster_wal_cut.h"
 #include "cluster/cluster_qvotec.h"
 #include "storage/latch.h"
 #include "storage/lwlock.h"
@@ -133,6 +137,11 @@ errcode(int code)
 }
 int
 errmsg(const char *format pg_attribute_unused(), ...)
+{
+	return 0;
+}
+int
+errmsg_internal(const char *format pg_attribute_unused(), ...)
 {
 	return 0;
 }
@@ -1763,6 +1772,672 @@ UT_TEST(startup_cold_cf_original_cancel_leaves_the_original_cleanup_owner)
 	cold_cleanup();
 }
 
+/* Exact input consumer/cleanup and scope predicates join the actual CF owner.
+ * Native Start/work and WALR qualification plus ROOT bytes are leaf boundaries;
+ * no root observation can run until a fresh usable CF grant is established. */
+#define cluster_cf_lock claim_actual_cf_lock
+#include "test_cluster_inputs_cf.inc"
+#undef cluster_cf_lock
+
+static ClusterWalInputsV1 input_scope;
+static WalInputsWork input_work;
+static ClusterColdTypedV1 input_typed;
+static ClusterColdTopTxCensusEntryV1 input_subject;
+static ClusterRecoveryCtrcSourcePlanV1 input_sources;
+static struct {
+	uint64 align;
+	char bytes[offsetof(ClusterColdCtrcWorkV1, entries)];
+} input_ctrc_storage;
+#define INPUT_CTRC_WORK ((ClusterColdCtrcWorkV1 *)input_ctrc_storage.bytes)
+static char input_start_object, input_pin_object;
+#define INPUT_START ((const struct ClusterRecoveryStartV1 *)&input_start_object)
+#define INPUT_PIN ((ClusterWalReadPinV1 *)&input_pin_object)
+static ClusterControlRootFileToken input_token;
+static ClusterRecoveryCheckpointOwnerV1 input_checkpoint_owner;
+static uint64 input_generation, input_serial, input_pin_generation;
+static unsigned input_reads;
+static bool input_start_current, input_pin_current, input_first;
+
+bool
+RecoveryInProgress(void)
+{
+	return InRecovery;
+}
+const struct ClusterColdTypedV1 *
+ClusterColdRecoveryTxInputs(const struct ClusterRecoveryStartV1 *start)
+{
+	return input_start_current && start == INPUT_START ? &input_typed : NULL;
+}
+bool
+ClusterColdRecoveryTxSubjectCurrent(const struct ClusterRecoveryStartV1 *start,
+									const struct ClusterColdTopTxCensusEntryV1 *subject,
+									uint64 *generation, uint64 *serial)
+{
+	*generation = *serial = 0;
+	if (!input_start_current || start != INPUT_START || subject != &input_subject)
+		return false;
+	*generation = input_generation;
+	*serial = input_serial;
+	return true;
+}
+bool
+ClusterColdRecoveryCtrcWorkCurrent(const struct ClusterRecoveryStartV1 *start,
+								   const struct ClusterColdCtrcWorkV1 *work)
+{
+	return input_start_current && start == INPUT_START && work == INPUT_CTRC_WORK
+		   && input_typed.ctrc_work == work && work->generation != 0
+		   && work->generation == input_typed.ctrc_work_generation;
+}
+bool
+ClusterColdRecoveryTxCheckpointOwnerV1(const struct ClusterRecoveryStartV1 *start,
+									   struct ClusterRecoveryCheckpointOwnerV1 *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (!input_start_current || start != INPUT_START)
+		return false;
+	*out = input_checkpoint_owner;
+	return true;
+}
+bool
+cluster_wal_read_pin_covers_v1(ClusterWalReadPinV1 *pin, uint16 thread)
+{
+	return input_pin_current && pin == INPUT_PIN && (thread == 1 || thread == 3);
+}
+bool
+cluster_wal_read_pin_owner_v1(ClusterWalReadPinV1 *pin, ClusterWalReadPinOwnerV1 *out)
+{
+	if (!cluster_wal_read_pin_covers_v1(pin, 1))
+		return false;
+	memset(out, 0, sizeof(*out));
+	out->pin = pin;
+	out->generation = input_pin_generation;
+	return true;
+}
+bool
+cluster_wal_read_pin_owner_current_v1(const ClusterWalReadPinOwnerV1 *owner)
+{
+	return owner->generation == input_pin_generation
+		   && cluster_wal_read_pin_covers_v1(owner->pin, 1);
+}
+ClusterControlRootResult
+cluster_control_root_v3_read_control_locked(const uint8 uuid[16], uint64 system_id,
+											ControlRootImage *root, ControlFileData *common,
+											ClusterControlRootFileToken *token)
+{
+	UT_ASSERT(cluster_cf_held_is_clusterwide(ShareLock));
+	UT_ASSERT_EQ(system_id, 1234);
+	UT_ASSERT_EQ(uuid[0], 31);
+	++input_reads;
+	g_next_request_id++;
+	memset(root, 0, sizeof(*root));
+	memset(common, 0, sizeof(*common));
+	root->header.activation_state = CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE;
+	root->header.v2.database_state = CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED;
+	*token = input_token;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+static void
+input_ready_after_ack(void)
+{
+	UT_ASSERT_EQ(input_reads, 0);
+	cold_ready_after_ack();
+}
+static void
+input_fixture(unsigned phase)
+{
+	cold_fixture();
+	memset(&input_scope, 0, sizeof(input_scope));
+	memset(&input_work, 0, sizeof(input_work));
+	memset(&input_typed, 0, sizeof(input_typed));
+	memset(&input_subject, 0, sizeof(input_subject));
+	memset(&input_sources, 0, sizeof(input_sources));
+	memset(&input_ctrc_storage, 0, sizeof(input_ctrc_storage));
+	memset(&input_checkpoint_owner, 0, sizeof(input_checkpoint_owner));
+	memset(&input_token, 0, sizeof(input_token));
+	input_token.file_txn_seq = 7;
+	input_generation = 17;
+	input_serial = 19;
+	input_pin_generation = 23;
+	input_reads = 0;
+	input_start_current = input_pin_current = true;
+	input_scope.system_identifier = 1234;
+	input_scope.storage_uuid[0] = 31;
+	input_scope.pid = getpid();
+	input_scope.owner = CurrentResourceOwner;
+	input_first = phase == 0 || phase == 3 || phase == 5;
+	if (!input_first)
+		input_scope.token = input_token;
+	if (phase == 2 || phase == 4 || phase == 6) {
+		input_scope.pin = INPUT_PIN;
+		input_scope.thread_count = 2;
+		input_scope.threads[0] = 1;
+		input_scope.threads[1] = 3;
+	}
+	input_scope.purpose = phase < 3	  ? WAL_INPUTS_COLD_REPLAY
+						  : phase < 5 ? WAL_INPUTS_TX_CLOSURE
+									  : WAL_INPUTS_CTRC_CENSUS;
+	InRecovery = phase < 3;
+	input_typed.census_root_captured = true;
+	input_typed.census_root = input_token;
+	if (phase == 3 || phase == 4) {
+		input_scope.tx.start = INPUT_START;
+		input_scope.tx.inputs = &input_typed;
+		input_scope.tx.subject = &input_subject;
+		input_scope.tx.generation = input_generation;
+		input_scope.tx.serial = input_serial;
+		input_scope.tx.version = input_subject;
+		input_scope.tx.root = input_token;
+	} else if (phase >= 5) {
+		INPUT_CTRC_WORK->generation = 29;
+		input_typed.ctrc_work = INPUT_CTRC_WORK;
+		input_typed.ctrc_work_generation = 29;
+		input_checkpoint_owner.start_generation = input_generation;
+		input_checkpoint_owner.start_serial = input_serial;
+		input_checkpoint_owner.owner_boot = control_creator.incarnation;
+		input_scope.ctrc.start = INPUT_START;
+		input_scope.ctrc.inputs = &input_typed;
+		input_scope.ctrc.work = INPUT_CTRC_WORK;
+		input_scope.ctrc.work_generation = 29;
+		input_scope.ctrc.owner = input_checkpoint_owner;
+		input_scope.ctrc.root = input_token;
+		input_scope.ctrc.source_plan = &input_sources;
+		input_typed.participant_count = input_sources.participant_count = 1;
+		input_typed.replay_count = input_sources.replay_count = 1;
+	}
+	entry_on_wait = input_ready_after_ack;
+}
+static bool
+input_call(ClusterControlRootResult *result)
+{
+	volatile bool completed = false;
+
+	PG_TRY();
+	{
+		*result = inputs_root(&input_scope, &input_work, input_first);
+		inputs_unlock(&input_work);
+		completed = true;
+	}
+	PG_CATCH();
+	{
+		FlushErrorState();
+	}
+	PG_END_TRY();
+	return completed;
+}
+UT_TEST(startup_input_cf_wait_keeps_initial_scratch_and_retained_scopes)
+{
+	for (unsigned phase = 0; phase < 7; phase++) {
+		ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+		bool completed;
+
+		input_fixture(phase);
+		completed = input_call(&result);
+		UT_ASSERT(completed);
+		UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT_EQ(input_reads, 1);
+		UT_ASSERT_EQ(entry_waits, 3);
+		UT_ASSERT_EQ(g_seven_count, claim_acquires + 2);
+		UT_ASSERT(!input_work.cf_attempted);
+		cold_cleanup();
+	}
+}
+
+static unsigned input_fault;
+static CfHoldState input_saved_slot;
+static ClusterControlRequestView input_saved_record;
+static void
+input_change_context(void)
+{
+	input_ready_after_ack();
+	input_saved_slot = cf_hold_s;
+	input_saved_record = control_requests->records[cf_hold_s.owner.attempt.slot];
+	switch (input_fault) {
+	case 0:
+		MyProc = NULL;
+		break;
+	case 1:
+		MyLatch = NULL;
+		break;
+	case 2:
+		MyProcPid++;
+		break;
+	case 3:
+		CurrentResourceOwner = (ResourceOwner)2;
+		break;
+	case 4:
+		owner_epoch++;
+		break;
+	case 5:
+		owner_generation++;
+		break;
+	case 6:
+		control_creator.incarnation++;
+		break;
+	case 7:
+		entry_authority = false;
+		break;
+	case 8:
+		ShutdownRequestPending = true;
+		break;
+	case 9:
+		CritSectionCount = 1;
+		break;
+	case 10:
+		entry_native_lock = true;
+		break;
+	case 11:
+		MyBackendType = B_LMON;
+		break;
+	case 12:
+		InRecovery = !InRecovery;
+		break;
+	case 13:
+		cluster_enabled = false;
+		break;
+	case 14:
+		cluster_shared_config = false;
+		break;
+	case 15:
+		cluster_controlfile_shared_authority = false;
+		break;
+	case 16:
+		input_scope.system_identifier++;
+		break;
+	case 17:
+		input_scope.storage_uuid[0]++;
+		break;
+	case 18:
+		input_scope.token.file_txn_seq++;
+		break;
+	case 19:
+		input_scope.pid++;
+		break;
+	case 20:
+		input_scope.owner = (ResourceOwner)2;
+		break;
+	case 21:
+		input_scope.purpose = WAL_INPUTS_ONLINE;
+		break;
+	case 22:
+		input_scope.stale = true;
+		break;
+	case 23:
+		input_scope.suspended = true;
+		break;
+	case 24:
+		input_scope.thread_count = CLUSTER_WAL_RETENTION_MAX_THREADS + 1;
+		break;
+	case 25:
+		input_scope.threads[0]++;
+		break;
+	case 26:
+		input_scope.pin = (ClusterWalReadPinV1 *)2;
+		break;
+	case 27:
+		input_pin_generation++;
+		break;
+	case 28:
+		input_pin_current = false;
+		break;
+	case 29:
+		cf_hold_s.owner.attempt.generation++;
+		break;
+	case 30:
+		control_requests->records[cf_hold_s.owner.attempt.slot].owner.incarnation++;
+		break;
+	case 31:
+		cf_hold_s.owner.request.control_owner_id++;
+		break;
+	case 32:
+		cf_hold_s.release_pending = false;
+		break;
+	case 33:
+		control_requests->records[cf_hold_s.owner.attempt.slot].state
+			= CLUSTER_CONTROL_REQUEST_INVALID;
+		break;
+	case 34:
+		cf_hold_x.held = true;
+		break;
+	}
+}
+UT_TEST(startup_input_cf_wait_rejects_changed_actor_scope_pin_and_request)
+{
+	for (unsigned phase = 0; phase < 7; phase++) {
+		for (input_fault = 0; input_fault < 35; input_fault++) {
+			ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+			uint64 epoch = owner_epoch, generation = owner_generation;
+			uint64 boot = control_creator.incarnation;
+			int pid = MyProcPid;
+
+			input_fixture(phase);
+			if ((input_fault == 25 || input_fault == 27 || input_fault == 28)
+				&& input_scope.pin == NULL) {
+				cold_cleanup();
+				continue;
+			}
+			entry_on_wait = input_change_context;
+			UT_ASSERT(!input_call(&result));
+			UT_ASSERT_EQ(entry_code, ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED);
+			UT_ASSERT_EQ(entry_waits, 1);
+			UT_ASSERT_EQ(input_reads, 0);
+			UT_ASSERT_EQ(g_seven_count, claim_acquires + 1);
+			UT_ASSERT(!input_work.cf_attempted);
+			/* Undo only the injected corruption, then use real ACK/poll. */
+			MyProc = &owner_proc;
+			MyLatch = &owner_proc.procLatch;
+			MyProcPid = pid;
+			CurrentResourceOwner = (ResourceOwner)1;
+			MyBackendType = B_STARTUP;
+			CritSectionCount = 0;
+			entry_native_lock = false;
+			cluster_enabled = cluster_shared_config = cluster_controlfile_shared_authority = true;
+			owner_epoch = epoch;
+			owner_generation = generation;
+			control_creator.incarnation = boot;
+			cf_hold_s = input_saved_slot;
+			memset(&cf_hold_x, 0, sizeof(cf_hold_x));
+			control_requests->records[cf_hold_s.owner.attempt.slot] = input_saved_record;
+			cold_cleanup();
+		}
+	}
+}
+
+static void
+input_change_original_start(void)
+{
+	input_ready_after_ack();
+	switch (input_fault) {
+	case 0:
+		input_start_current = false;
+		break;
+	case 1:
+		input_typed.census_root_captured = false;
+		break;
+	case 2:
+		input_typed.census_root.file_txn_seq++;
+		break;
+	case 3:
+		if (input_scope.purpose == WAL_INPUTS_TX_CLOSURE)
+			input_scope.tx.inputs = NULL;
+		else
+			input_scope.ctrc.inputs = NULL;
+		break;
+	case 4:
+		if (input_scope.purpose == WAL_INPUTS_TX_CLOSURE)
+			input_subject.input.key.slot_offset++;
+		else
+			INPUT_CTRC_WORK->generation++;
+		break;
+	case 5:
+		if (input_scope.purpose == WAL_INPUTS_TX_CLOSURE) {
+			input_generation++;
+			input_scope.tx.generation = input_generation; /* cannot adopt a new Start */
+		} else
+			input_checkpoint_owner.start_serial++;
+		break;
+	case 6:
+		if (input_scope.purpose == WAL_INPUTS_TX_CLOSURE) {
+			input_serial++;
+			input_scope.tx.serial = input_serial;
+		} else
+			input_typed.participant_count++;
+		break;
+	case 7:
+		if (input_scope.purpose == WAL_INPUTS_TX_CLOSURE)
+			input_scope.tx.start = NULL;
+		else
+			input_typed.sources[0].timeline++;
+		break;
+	case 8:
+		if (input_scope.purpose == WAL_INPUTS_TX_CLOSURE)
+			input_scope.tx.version.input.key.slot_offset++;
+		else
+			input_scope.ctrc.source_plan = NULL;
+		break;
+	case 9:
+		if (input_scope.purpose == WAL_INPUTS_TX_CLOSURE)
+			input_scope.tx.ir_revoked = true;
+		else
+			input_scope.ctrc.source_plan->sources[0].timeline++;
+		break;
+	}
+}
+UT_TEST(startup_input_cf_wait_cannot_adopt_changed_tx_or_ctrc_start)
+{
+	for (unsigned phase = 3; phase < 7; phase++) {
+		for (input_fault = 0; input_fault < 10; input_fault++) {
+			ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+
+			input_fixture(phase);
+			entry_on_wait = input_change_original_start;
+			UT_ASSERT(!input_call(&result));
+			UT_ASSERT_EQ(entry_code, ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED);
+			UT_ASSERT_EQ(entry_waits, 1);
+			UT_ASSERT_EQ(input_reads, 0);
+			UT_ASSERT_EQ(g_seven_count, claim_acquires + 1);
+			cold_cleanup();
+		}
+	}
+}
+
+static void
+input_change_after_grant(void)
+{
+	input_scope.storage_uuid[0]++;
+}
+UT_TEST(startup_input_cf_new_grant_rechecks_scope_before_root_io)
+{
+	for (unsigned phase = 0; phase < 7; phase++) {
+		ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+
+		input_fixture(phase);
+		claim_after_acquire = input_change_after_grant;
+		UT_ASSERT(input_call(&result));
+		UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+		UT_ASSERT_EQ(input_reads, 0);
+		UT_ASSERT_EQ(entry_waits, 3);
+		UT_ASSERT_EQ(g_seven_count, claim_acquires + 2);
+		UT_ASSERT(!cluster_cf_held(ShareLock));
+		cold_cleanup();
+	}
+}
+
+UT_TEST(startup_input_cf_receipt_and_wake_rules_preserve_progress)
+{
+	for (unsigned phase = 0; phase < 7; phase++) {
+		for (unsigned fault = 0; fault < 4; fault++) {
+			ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+
+			input_fixture(phase);
+			entry_lost_latch = true;
+			if (fault == 0)
+				entry_on_wait = cold_missing_receipt;
+			else if (fault == 1)
+				claim_on_reset = cold_ack_during_reset;
+			else if (fault == 2) {
+				fail_after_publication = false;
+				entry_on_wait = claim_empty_grant;
+			}
+			UT_ASSERT_EQ(input_call(&result), fault != 0);
+			UT_ASSERT_EQ(input_reads, fault != 0);
+			UT_ASSERT_EQ(entry_waits, fault == 1 ? 0 : fault == 3 ? 3 : 1);
+			if (fault == 0) {
+				UT_ASSERT_EQ(entry_code, ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED);
+				UT_ASSERT(!cluster_cf_held(ShareLock));
+				cf_retired_s = claim_retiring_cookie;
+			} else
+				UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+			cold_cleanup();
+		}
+	}
+}
+
+UT_TEST(startup_input_cf_untyped_hard_and_preexisting_owners_are_not_retried)
+{
+	for (unsigned fault = 0; fault < 4; fault++) {
+		ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+
+		input_fixture(2);
+		if (fault == 0)
+			g_seven_result = CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+		else if (fault == 1)
+			g_timeout_detail.source = CLUSTER_GES_TSRC_NONE;
+		else if (fault == 2)
+			entry_on_wait = entry_hard_error;
+		else {
+			(void)entry_timeout(ShareLock);
+			claim_acquires = g_seven_count;
+		}
+		if (fault == 3) {
+			UT_ASSERT(input_call(&result));
+			UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+			UT_ASSERT_EQ(g_seven_count, claim_acquires);
+		} else {
+			UT_ASSERT(!input_call(&result));
+			UT_ASSERT_EQ(g_seven_count, claim_acquires + 1);
+		}
+		UT_ASSERT_EQ(entry_waits, fault == 2 ? 1 : 0);
+		UT_ASSERT_EQ(input_reads, 0);
+		if (fault == 2)
+			UT_ASSERT_EQ(entry_code, ERRCODE_IO_ERROR);
+		cold_cleanup();
+	}
+}
+
+UT_TEST(startup_input_cf_original_cancel_keeps_the_original_cleanup_owner)
+{
+	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	volatile bool exited = false;
+
+	input_fixture(6);
+	entry_on_wait = entry_shutdown;
+	startup_fixture_exit_hook = entry_owner_exit;
+	startup_fixture_armed = true;
+	if (sigsetjmp(startup_fixture_exit, 1) == 0)
+		UT_ASSERT(!input_call(&result));
+	else
+		exited = true;
+	UT_ASSERT(exited);
+	UT_ASSERT_EQ(startup_fixture_exit_code, 1);
+	UT_ASSERT_EQ(entry_waits, 1);
+	UT_ASSERT_EQ(input_reads, 0);
+	UT_ASSERT_EQ(g_seven_count, claim_acquires + 1);
+	UT_ASSERT(control_requests->records[cf_hold_s.owner.attempt.slot].owner_exited);
+	PG_exception_stack = NULL;
+	error_context_stack = NULL;
+	proc_exit_inprogress = shutdown_requested = false;
+	startup_fixture_armed = false;
+	startup_fixture_exit_hook = NULL;
+	cold_cleanup();
+}
+
+UT_TEST(ordinary_input_cf_timeout_keeps_its_original_release_behavior)
+{
+	const BackendType roles[] = { B_STARTUP, B_BG_WORKER, B_BG_WRITER, B_CHECKPOINTER };
+
+	for (unsigned role = 0; role < lengthof(roles); role++) {
+		ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+
+		input_fixture(2);
+		input_scope.purpose = WAL_INPUTS_ONLINE;
+		MyBackendType = roles[role];
+		UT_ASSERT(!input_call(&result));
+		UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+		UT_ASSERT_EQ(entry_level, FATAL);
+		UT_ASSERT_EQ(entry_waits, 0);
+		UT_ASSERT_EQ(input_reads, 0);
+		UT_ASSERT_EQ(g_seven_count, claim_acquires + 1);
+		UT_ASSERT(input_work.cf_attempted);
+		MyBackendType = B_STARTUP;
+		cold_cleanup();
+	}
+}
+
+static ClusterControlRootSnapshot input_expected, input_expected_original;
+static unsigned input_selections, input_claim_reads;
+char *cluster_wal_threads_dir = "startup-input-fixture";
+void *
+palloc0(Size size)
+{
+	void *out = calloc(1, size);
+
+	UT_ASSERT(out != NULL);
+	return out;
+}
+uint64
+GetSystemIdentifier(void)
+{
+	return 1234;
+}
+static ClusterControlRootResult
+inputs_cold_checkpoint_select(ClusterWalInputsV1 *scratch, WalInputsWork *work,
+							  const ClusterControlRootSnapshot *expected)
+{
+	UT_ASSERT(work != NULL && cluster_cf_held_is_clusterwide(ShareLock));
+	++input_selections;
+	if (memcmp(expected, &input_expected_original, sizeof(*expected)) != 0)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	scratch->items[0].checkpoint_start = 100;
+	scratch->items[0].source.timeline = 1;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+ClusterControlRootResult
+cluster_wal_claim_v2_read(const char *dir, const ClusterWalThreadClaimRefV2 *expected,
+						  ClusterWalThreadClaimV2 *out)
+{
+	UT_ASSERT(dir != NULL && expected != NULL && out != NULL);
+	UT_ASSERT(!cluster_cf_held(ShareLock));
+	++input_claim_reads;
+	memset(out, 0, sizeof(*out));
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+#include "test_cluster_inputs_cf_checkpoint.inc"
+
+static void
+input_checkpoint_change_external_argument(void)
+{
+	input_expected.root_publish_seq++;
+}
+UT_TEST(startup_checkpoint_scratch_cf_wait_keeps_its_original_selection)
+{
+	for (unsigned fault = 0; fault < 2; fault++) {
+		ClusterWalRecoveryCheckpointV1 out;
+		volatile bool completed = false;
+		ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+
+		input_fixture(1);
+		memset(&input_expected, 0, sizeof(input_expected));
+		input_expected.identity.system_identifier = 1234;
+		input_expected.identity.storage_uuid[0] = 31;
+		input_expected.identity.origin_node_id = 0;
+		input_expected.identity.origin_thread_id = 1;
+		input_expected.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED;
+		input_expected_original = input_expected;
+		input_claim_reads = input_selections = 0;
+		if (fault)
+			claim_after_acquire = input_checkpoint_change_external_argument;
+		PG_TRY();
+		{
+			result = cluster_wal_inputs_cold_checkpoint_v1(&input_expected, &input_token, &out);
+			completed = true;
+		}
+		PG_CATCH();
+		{
+			FlushErrorState();
+		}
+		PG_END_TRY();
+		UT_ASSERT(completed);
+		UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT_EQ(entry_waits, 3);
+		UT_ASSERT_EQ(input_reads, 2);
+		UT_ASSERT_EQ(g_seven_count, claim_acquires + 3);
+		UT_ASSERT_EQ(input_selections, 1);
+		UT_ASSERT_EQ(input_claim_reads, 1);
+		UT_ASSERT_EQ(out.checkpoint_start, 100);
+		cold_cleanup();
+	}
+}
+
 int
 main(void)
 {
@@ -1773,7 +2448,7 @@ main(void)
 	pg_atomic_init_u64(&owner_proc.cluster_grd_redeclare_acked_epoch, 0);
 	cluster_control_request_shmem_init();
 	retire_driver = cluster_control_request_driver_start();
-	UT_PLAN(30);
+	UT_PLAN(39);
 	UT_RUN(startup_cf_timeout_waits_for_exact_completion_before_begin);
 	UT_RUN(startup_cf_completion_does_not_preserve_changed_native_input);
 	UT_RUN(startup_cf_unsafe_native_context_never_takes_a_registry_lock);
@@ -1804,6 +2479,15 @@ main(void)
 	UT_RUN(startup_cold_cf_receipt_is_required_and_wakes_are_only_scheduling);
 	UT_RUN(startup_cold_cf_untyped_and_hard_cleanup_are_not_wait_slices);
 	UT_RUN(startup_cold_cf_original_cancel_leaves_the_original_cleanup_owner);
+	UT_RUN(startup_input_cf_wait_keeps_initial_scratch_and_retained_scopes);
+	UT_RUN(startup_input_cf_wait_rejects_changed_actor_scope_pin_and_request);
+	UT_RUN(startup_input_cf_wait_cannot_adopt_changed_tx_or_ctrc_start);
+	UT_RUN(startup_input_cf_new_grant_rechecks_scope_before_root_io);
+	UT_RUN(startup_input_cf_receipt_and_wake_rules_preserve_progress);
+	UT_RUN(startup_input_cf_untyped_hard_and_preexisting_owners_are_not_retried);
+	UT_RUN(startup_input_cf_original_cancel_keeps_the_original_cleanup_owner);
+	UT_RUN(ordinary_input_cf_timeout_keeps_its_original_release_behavior);
+	UT_RUN(startup_checkpoint_scratch_cf_wait_keeps_its_original_selection);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

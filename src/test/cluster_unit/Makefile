@@ -1429,6 +1429,7 @@ test_cluster_startup_cf_entry: test_cluster_startup_cf_entry.c test_cluster_cf_e
 		test_cluster_startup_cf_entry.inc test_cluster_startup_cf_callsite.inc \
 		test_cluster_merge_cf_entry.inc \
 		test_cluster_merge_cold_cf.inc \
+		test_cluster_inputs_cf.inc test_cluster_inputs_cf_checkpoint.inc \
 		test_cluster_cf_blocker_trace.inc test_cluster_startup_interrupt.inc unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_cf_enqueue.c \
 		$(top_srcdir)/src/backend/cluster/cluster_lock_owner.c \
@@ -1454,6 +1455,29 @@ test_cluster_merge_cold_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_recove
 	     emit { print } /^}/ { emit=0 } \
 	     END { if (consumers != 1 || helpers > 1 || matches != 1 || emit) exit 1 }' \
 	     $(filter %.c,$^) > $@.tmp
+	mv $@.tmp $@
+
+# The complete input-scope declarations and exact CF consumer/cleanup bodies.
+test_cluster_inputs_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_inputs.c Makefile
+	awk '/^typedef (enum WalInputsPurpose|struct ClusterRecoveryTxIoScopeV1|struct ClusterRecoveryCtrcReplayOwnerV1|struct ClusterRecoveryCtrcSourcePlanV1|struct ClusterRecoveryCtrcIoScopeV1|struct WalInputsWork) / { types=1; declarations++ } \
+	     /^struct ClusterWalInputsV1 / { types=1; declarations++ } \
+	     /^typedef struct WalInputsCfWait / { types=1; helpers++ } \
+	     types { print; if (/^}/) types=0; next } \
+	     /^inputs_(io_role|owned|scope_role|current)\(/ { print "static bool"; emit=1; predicates++ } \
+	     /^inputs_unlock\(/ { print "static void"; emit=1; cleanup++ } \
+	     /^inputs_root\(/ { print "static ClusterControlRootResult"; emit=1; consumers++ } \
+	     /^inputs_cf_wait_current\(/ { print "static bool"; emit=1; checks++ } \
+	     /^inputs_cf_wait(_capture)?\(/ { print "static void"; emit=1; waiters++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (declarations != 7 || helpers > 1 || checks > 1 || waiters > 2 || predicates != 4 || cleanup != 1 || consumers != 1 || types || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# The actual no-pin checkpoint caller, including its original cleanup paths.
+test_cluster_inputs_cf_checkpoint.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_inputs.c Makefile
+	awk '/^inputs_overlap\(/ { print "static bool"; emit=1; overlaps++ } \
+	     /^cluster_wal_inputs_cold_checkpoint_v1\(/ { print "ClusterControlRootResult"; emit=1; callers++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (overlaps != 1 || callers != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # PGRAC: execute the real earliest startup-directory mutation call site.
