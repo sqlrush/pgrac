@@ -7597,7 +7597,7 @@ UT_TEST(test_retained_slot_identity_does_not_escape_original_final_fences)
 int
 main(void)
 {
-	UT_PLAN(305);
+	UT_PLAN(311);
 	UT_RUN(test_operation_worker_real_builder_yields_before_visibility);
 	UT_RUN(test_operation_worker_real_origin_completes_private_inverse);
 	UT_RUN(test_operation_worker_pending_current_is_bounded_and_counts_once);
@@ -7628,6 +7628,12 @@ main(void)
 	UT_RUN(test_operation_worker_surviving_result_mutation_refuses_publication);
 	UT_RUN(test_operation_worker_exact_forget_frees_survivor_walk_and_original_guard);
 	UT_RUN(test_operation_worker_cohort_keeps_separate_survivor_pages);
+	UT_RUN(test_operation_worker_live_insert_update_preserves_same_tid_and_hot_chain);
+	UT_RUN(test_operation_worker_live_insert_delete_and_lock_keep_same_tid);
+	UT_RUN(test_operation_worker_overlapping_live_missing_creation_is_not_lineage);
+	UT_RUN(test_operation_worker_overlapping_live_validates_raw_predecessor_and_length);
+	UT_RUN(test_operation_worker_discarded_overlap_does_not_erase_live_successor);
+	UT_RUN(test_operation_worker_unqualified_multi_lock_never_publishes_survivor);
 
 	UT_RUN(test_operation_poll_does_not_complete_inline);
 	UT_RUN(test_operation_poll_stages_outputs);

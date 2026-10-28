@@ -931,8 +931,50 @@ cr_r4_operation_offsets(const UndoRecordHeader *record, const BufferTag *tag, co
 	return count;
 }
 
+/* A LIVE overlap must expose a real predecessor in the private walk. The
+ * inverse's idempotent absent-creation success cannot establish lineage.
+ * Reject unqualified MX before an inverse can clear its flag; raw numeric
+ * equality is not a member proof. The inverse still checks raw identities. */
+static bool
+cr_r4_operation_projection_safe(const CrR4OperationContext *operation, char page_bytes[BLCKSZ],
+								const OffsetNumber offsets[2], unsigned count, bool keep)
+{
+	Page page = (Page)(operation->walk != NULL ? operation->walk->data : page_bytes);
+	PageHeader header = (PageHeader)page;
+	bool overlap = false;
+
+	for (unsigned i = 0; i < count; i++) {
+		unsigned bit = offsets[i] - FirstOffsetNumber;
+
+		overlap |= (operation->kept_offsets[bit / 8] & (1U << (bit % 8))) != 0;
+	}
+	if (overlap && (!keep || operation->walk == NULL))
+		return false;
+	for (unsigned i = 0; i < count; i++) {
+		ItemId item;
+		HeapTupleHeader tuple;
+
+		if (offsets[i] > PageGetMaxOffsetNumber(page)
+			|| !ItemIdIsNormal(PageGetItemId(page, offsets[i]))) {
+			if (overlap)
+				return false;
+			continue;
+		}
+		item = PageGetItemId(page, offsets[i]);
+		if (ItemIdGetLength(item) < SizeofHeapTupleHeader
+			|| ItemIdGetOffset(item) < header->pd_upper
+			|| (size_t)ItemIdGetOffset(item) + ItemIdGetLength(item) > header->pd_special)
+			return false;
+		tuple = (HeapTupleHeader)PageGetItem(page, item);
+		if (tuple->t_hoff < SizeofHeapTupleHeader || tuple->t_hoff > ItemIdGetLength(item)
+			|| (tuple->t_infomask & HEAP_XMAX_IS_MULTI) != 0)
+			return false;
+	}
+	return true;
+}
+
 /* Walk every qualified record, but keep visible LIVE effects in the result.
- * Overlapping TIDs require the complete version lineage and are refused.
+ * A discarded overlap still requires survivor reconstruction and is refused.
  * The result's newest kept ITL is independent of the older walk cursor. */
 static bool
 cr_r4_operation_project(CrR4OperationContext *operation, ClusterR4CrSlotExtension *extension,
@@ -946,20 +988,14 @@ cr_r4_operation_project(CrR4OperationContext *operation, ClusterR4CrSlotExtensio
 	ClusterItlSlotData after;
 	PGAlignedBlock candidate;
 
+	count = cr_r4_operation_offsets(record, tag, body, offsets);
+	if (count == 0 || !cr_r4_operation_projection_safe(operation, page, offsets, count, keep))
+		return false;
 	if (operation->walk == NULL && !keep)
 		return cluster_cr_history_inverse_operation_identity(page, tag, locator, locator->uba,
 															 record, body, record->payload_length,
 															 &operation->identity)
 			   && cluster_semantic_activation_recheck(&operation->admission);
-	count = cr_r4_operation_offsets(record, tag, body, offsets);
-	if (count == 0)
-		return false;
-	for (unsigned i = 0; i < count; i++) {
-		unsigned bit = offsets[i] - FirstOffsetNumber;
-
-		if ((operation->kept_offsets[bit / 8] & (1U << (bit % 8))) != 0)
-			return false;
-	}
 	if (operation->walk == NULL) {
 		operation->walk = MemoryContextAllocZero(TopMemoryContext, sizeof(*operation->walk));
 		memcpy(operation->walk->data, page, BLCKSZ);
