@@ -3189,8 +3189,8 @@ inputs_relmap_terminal_plan(const ClusterRecoveryRelmapSourceV1 *source)
  * precondition refuses without poisoning an unrelated/stale value; after entry,
  * any missing plan/carrier or ERROR revokes the whole original episode. */
 static uint32
-inputs_relmap_terminal_observe(const ClusterRecoveryRelmapSourceV1 *source,
-	const XLogReaderState *reader, bool match)
+inputs_relmap_side_observe(const ClusterRecoveryRelmapSourceV1 *source,
+	const XLogReaderState *reader, bool match, bool clog)
 {
 	ClusterRecoveryRelmapSourceV1 original;
 	const RfSideOnlinePlanV1 *plan;
@@ -3208,9 +3208,12 @@ inputs_relmap_terminal_observe(const ClusterRecoveryRelmapSourceV1 *source,
 		entered = cluster_wal_inputs_relmap_source_current_v1(&original);
 		plan = entered ? inputs_relmap_terminal_plan(&original) : NULL;
 		if (plan != NULL) {
-			count = rf_side_online_plan_native_terminal_count_v1(plan, &original.selected.source);
+			count = clog ? rf_side_online_plan_native_clog_count_v1(plan, &original.selected.source)
+				: rf_side_online_plan_native_terminal_count_v1(plan, &original.selected.source);
 			ok = count != UINT32_MAX
-				&& (!match || rf_side_online_plan_terminal_matches_v1(plan, &original.selected.source, reader))
+				&& (!match || (clog
+					? rf_side_online_plan_clog_matches_v1(plan, &original.selected.source, reader)
+					: rf_side_online_plan_terminal_matches_v1(plan, &original.selected.source, reader)))
 				&& inputs_relmap_terminal_plan(&original) == plan
 				&& memcmp(source, &original, sizeof(original)) == 0;
 		}
@@ -3233,14 +3236,29 @@ inputs_relmap_terminal_observe(const ClusterRecoveryRelmapSourceV1 *source,
 uint32
 cluster_wal_inputs_relmap_terminal_count_v1(const ClusterRecoveryRelmapSourceV1 *source)
 {
-	return inputs_relmap_terminal_observe(source, NULL, false);
+	return inputs_relmap_side_observe(source, NULL, false, false);
 }
 
 bool
 cluster_wal_inputs_relmap_terminal_matches_v1(const ClusterRecoveryRelmapSourceV1 *source,
 	const XLogReaderState *reader)
 {
-	return inputs_relmap_terminal_observe(source, reader, true) != UINT32_MAX;
+	return inputs_relmap_side_observe(source, reader, true, false) != UINT32_MAX;
+}
+
+/* Exact CLOG carriers in the same original sealed physical SIDE plan. These
+ * observations grant no page-generation lifetime or completion authority. */
+uint32
+cluster_wal_inputs_relmap_clog_count_v1(const ClusterRecoveryRelmapSourceV1 *source)
+{
+	return inputs_relmap_side_observe(source, NULL, false, true);
+}
+
+bool
+cluster_wal_inputs_relmap_clog_matches_v1(const ClusterRecoveryRelmapSourceV1 *source,
+	const XLogReaderState *reader)
+{
+	return inputs_relmap_side_observe(source, reader, true, true) != UINT32_MAX;
 }
 
 typedef struct RelmapNativeInputRead {
