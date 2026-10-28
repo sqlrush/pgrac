@@ -57,7 +57,15 @@ static unsigned waits, extensions, early_extensions, lock_errors;
 static uint64 floor_full, limit_full;
 int cluster_injection_armed_count;
 
+#ifdef TEST_CLUSTER_XID_NATIVE_CLOG
+#define ExtendCLOGFull xid_fixture_extend_full
+void xid_fixture_extend_full(FullTransactionId candidate);
+#endif
 #include "test_cluster_xid_full_clog.inc"
+#ifdef TEST_CLUSTER_XID_NATIVE_CLOG
+#undef ExtendCLOGFull
+#include "test_cluster_xid_native_clog.inc"
+#endif
 
 bool
 IsInParallelMode(void)
@@ -251,7 +259,23 @@ UT_TEST(native_allocation_preserves_ordinary_counter)
 int
 main(void)
 {
+#ifdef TEST_CLUSTER_XID_NATIVE_CLOG
+	if (getenv("PGRAC_XID_NATIVE_CLOG_ONLY") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(native_allocator_full_birth_uses_gap_page_and_original_candidate);
+		UT_RUN(native_allocator_full_birth_keeps_epoch_through_subxact_wrap);
+		UT_RUN(native_allocator_full_birth_rederives_before_any_native_call);
+		UT_RUN(native_allocator_full_birth_wal_error_keeps_native_duty_unpublished);
+		UT_DONE(); return ut_failed_count ? 1 : 0;
+	}
+	UT_PLAN(13);
+	UT_RUN(native_allocator_full_birth_uses_gap_page_and_original_candidate);
+	UT_RUN(native_allocator_full_birth_keeps_epoch_through_subxact_wrap);
+	UT_RUN(native_allocator_full_birth_rederives_before_any_native_call);
+	UT_RUN(native_allocator_full_birth_wal_error_keeps_native_duty_unpublished);
+#else
 	UT_PLAN(9);
+#endif
 	UT_RUN(no_storage_or_procarray_mutation_before_reservation);
 	UT_RUN(wait_rederives_native_counter_and_new_boot_floor);
 	UT_RUN(native_allocation_preserves_ordinary_counter);
