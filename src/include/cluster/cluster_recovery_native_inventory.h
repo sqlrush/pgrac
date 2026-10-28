@@ -496,7 +496,11 @@ extern bool cluster_recovery_relmap_history_pending_applied_pages_v1(
 	ClusterRecoveryRelmapPendingNativePagesV1 *out, ClusterRecoveryNativeInventoryDiag *diag);
 /* Same original full reread and held-page reads, requiring each record's
  * original execution route: exact founder-native consumption versus other
- * generations' cold apply. Does not replace pending_applied_pages or promote
+ * generations' cold apply. Every FULL page must also lie in its own observed
+ * native counter half-space, without a later same-page ZERO, any later
+ * TRUNCATE or an unordered same-origin lifecycle. Pre-birth legacy input stays explicit.
+ * These are necessary consistency checks, not native era/lifetime authority.
+ * Does not replace pending_applied_pages or promote
  * native consumption into durability/era/lifetime/COMPLETE/release authority. */
 extern bool cluster_recovery_relmap_history_pending_consumed_pages_v1(
 	ClusterRecoveryRelmapHistory *history, const ClusterRelmapV2Image *pending,
