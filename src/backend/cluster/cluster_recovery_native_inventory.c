@@ -3072,6 +3072,65 @@ history_pending_birth_halfspace(const ClusterRecoveryRelmapPendingBirthV1 *birth
 		&& inputs->tail_next - first < UINT64_C(0x80000000);
 }
 
+/* Screen every attached FULL page against its OWN complete generation.
+ * This is observed WAL order/counter consistency, not physical lifetime.
+ * A distinct same-origin generation supplies no comparable LSN ordering. */
+static bool
+history_pending_page_history(ClusterRecoveryRelmapHistory *history,
+	const ClusterRecoveryRelmapPendingXidV1 *inputs,
+	const ClusterRecoveryRelmapPendingAllNativeV1 *all)
+{
+	uint32 full = 0;
+
+	if (all == NULL || history->native_pages == NULL || inputs->generation_count == 0
+		|| inputs->generation_count > CLUSTER_WAL_INPUTS_MAX || all->clog_count == 0
+		|| all->clog_count > CLUSTER_RECOVERY_RELMAP_CLOG_HISTORY_MAX)
+		return false;
+	for (uint32 i = 0; i < all->clog_count; ++i) {
+		const ClusterRecoveryRelmapClogEventV1 *birth = &all->clog[i];
+		const ClusterRecoveryRelmapXidGenerationV1 *generation;
+		uint64 first;
+		int origin;
+
+		if (birth->kind != CLUSTER_RECOVERY_NATIVE_CLOG_ZERO || !birth->full_birth_observed)
+			continue;
+		if (birth->source_index >= inputs->generation_count)
+			return false;
+		generation = &inputs->generations[birth->source_index];
+		first = birth->full_birth.first_full_xid;
+		origin = generation->observation.source.claim.identity.origin_node_id;
+		if (generation->observation.source_index != birth->source_index
+			|| !generation->counter_observed || !birth->counter_observed
+			|| birth->record_ordinal == 0 || birth->read_lsn < generation->native_redo
+			|| birth->read_lsn >= birth->end_lsn
+			|| birth->counter_before < generation->checkpoint_next
+			|| birth->counter_before > birth->counter_after
+			|| birth->counter_after > generation->tail_next
+			|| first > generation->tail_next
+			|| generation->tail_next - first >= UINT64_C(0x80000000))
+			return false;
+		for (uint32 j = 0; j < all->clog_count; ++j) {
+			const ClusterRecoveryRelmapClogEventV1 *other = &all->clog[j];
+
+			if (i == j)
+				continue;
+			if (other->source_index >= inputs->generation_count)
+				return false;
+			if (inputs->generations[other->source_index].observation.source.claim.identity.origin_node_id
+				!= origin)
+				continue;
+			if (other->source_index != birth->source_index)
+				return false;
+			if ((other->kind == CLUSTER_RECOVERY_NATIVE_CLOG_TRUNCATE
+					|| (other->kind == CLUSTER_RECOVERY_NATIVE_CLOG_ZERO && other->page == birth->page))
+				&& (other->record_ordinal >= birth->record_ordinal || other->end_lsn > birth->read_lsn))
+				return false;
+		}
+		full++;
+	}
+	return full != 0 && full == history->native_page_count;
+}
+
 static bool
 history_pending_terminal_read(ClusterRecoveryRelmapHistory *history,
 	const ClusterRelmapV2Image *pending, ClusterRecoveryRelmapPendingTerminalV1 *out,
@@ -3154,6 +3213,8 @@ history_pending_terminal_read(ClusterRecoveryRelmapHistory *history,
 			ok = history_pending_xid_finish(history, pending, xid, &birth->inputs)
 				&& history_pending_birth_match(&birth->inputs, pending, &birth->birth_index)
 				&& (!xid->side_clog || history_pending_birth_halfspace(birth))
+				&& (!xid->consumed_clog || history_pending_page_history(history, &birth->inputs,
+					xid->all_native))
 				&& memcmp(&birth->inputs.history, &result.base.history,
 					sizeof(result.base.history)) == 0
 				&& saved->source_index == birth->inputs.history.observation.source_index
