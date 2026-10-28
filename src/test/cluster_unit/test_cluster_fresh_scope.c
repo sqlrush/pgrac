@@ -350,9 +350,22 @@ static const char *const rename_dispatch_command_names[] = {
 #undef PG_CMDTAG
 };
 
+/* Native SET SCHEMA reuses the real object-tag helper and name table. */
+static bool schema_dispatch_lookup_active, schema_dispatch_expect_binding;
+static unsigned schema_dispatch_lookups, schema_dispatch_lookup_kind,
+	schema_dispatch_expected_boundary;
+static unsigned schema_dispatch_unbound, schema_dispatch_bad_lookup,
+	schema_dispatch_unexpected_dependencies;
+static AlterObjectSchemaStmt native_schema_dispatch_statement;
+static Node *schema_dispatch_expected_statement;
+static ObjectAddress schema_dispatch_old_schema_address;
+static bool schema_dispatch_wants_old_schema;
+
 CommandTag
 CreateCommandTag(Node *statement)
 {
+	if (schema_dispatch_lookup_active && IsA(statement, AlterObjectSchemaStmt))
+		return AlterObjectTypeCommandTag(((AlterObjectSchemaStmt *)statement)->objectType);
 	if (rename_dispatch_lookup_active && IsA(statement, RenameStmt)) {
 		RenameStmt *stmt = (RenameStmt *)statement;
 		return AlterObjectTypeCommandTag(stmt->renameType == OBJECT_COLUMN ? stmt->relationType
@@ -577,6 +590,11 @@ CreateCommandTag(Node *statement)
 const char *
 GetCommandTagName(CommandTag tag)
 {
+	if (schema_dispatch_lookup_active) {
+		if ((unsigned)tag >= lengthof(rename_dispatch_command_names))
+			siglongjmp(boundary, 3);
+		return rename_dispatch_command_names[tag];
+	}
 	if (rename_dispatch_lookup_active) {
 		if ((unsigned)tag >= lengthof(rename_dispatch_command_names))
 			siglongjmp(boundary, 3);
@@ -6488,6 +6506,18 @@ ObjectAddress
 get_object_address(ObjectType objtype, Node *object, Relation *relp, LOCKMODE lockmode,
 				   bool missing_ok)
 {
+	if (schema_dispatch_lookup_active) {
+		schema_dispatch_lookups++;
+		schema_dispatch_lookup_kind = 4;
+		if (schema_dispatch_expect_binding && utility_binds == 0)
+			schema_dispatch_unbound++;
+		if (schema_dispatch_expected_boundary != 4
+			|| objtype != native_schema_dispatch_statement.objectType
+			|| object != native_schema_dispatch_statement.object || relp == NULL
+			|| lockmode != AccessExclusiveLock || missing_ok)
+			schema_dispatch_bad_lookup++;
+		siglongjmp(boundary, 2); /* Before actual object resolution or lock. */
+	}
 	if (rename_dispatch_lookup_active) {
 		rename_dispatch_lookups++;
 		rename_dispatch_lookup_kind = 12;
@@ -15264,10 +15294,422 @@ UT_TEST(test_native_rename_dispatch_keeps_original_unrecognized_target_error)
 	rename_dispatch_lookup_active = false;
 }
 
+/* Observe before the original namespace callee, never read its local oldOid. */
+static ObjectAddress
+observe_native_schema_dispatch(unsigned route, Oid *oldschema)
+{
+	if (!schema_dispatch_lookup_active)
+		siglongjmp(boundary, 3);
+	schema_dispatch_lookups++;
+	schema_dispatch_lookup_kind = route;
+	if (schema_dispatch_expect_binding && utility_binds == 0)
+		schema_dispatch_unbound++;
+	if (route != schema_dispatch_expected_boundary
+		|| (oldschema != NULL) != schema_dispatch_wants_old_schema)
+		schema_dispatch_bad_lookup++;
+	siglongjmp(boundary, 2); /* Before the real callee/query; no output is written. */
+}
+
+static ObjectAddress
+observe_native_schema_table(AlterObjectSchemaStmt *stmt, Oid *oldschema)
+{
+	if (stmt != &native_schema_dispatch_statement)
+		schema_dispatch_bad_lookup++;
+	return observe_native_schema_dispatch(1, oldschema);
+}
+
+static ObjectAddress
+observe_native_schema_type(List *names, const char *newschema, ObjectType type, Oid *oldschema)
+{
+	if (names != (List *)native_schema_dispatch_statement.object
+		|| newschema != native_schema_dispatch_statement.newschema
+		|| type != native_schema_dispatch_statement.objectType)
+		schema_dispatch_bad_lookup++;
+	return observe_native_schema_dispatch(2, oldschema);
+}
+
+static ObjectAddress
+observe_native_schema_extension(const char *name, const char *newschema, Oid *oldschema)
+{
+	if (name != strVal(native_schema_dispatch_statement.object)
+		|| newschema != native_schema_dispatch_statement.newschema)
+		schema_dispatch_bad_lookup++;
+	return observe_native_schema_dispatch(3, oldschema);
+}
+
+static Relation
+native_schema_dispatch_unexpected_relation(void)
+{
+	schema_dispatch_unexpected_dependencies++;
+	siglongjmp(boundary, 3);
+}
+
+static Oid
+native_schema_dispatch_unexpected_oid(void)
+{
+	schema_dispatch_unexpected_dependencies++;
+	siglongjmp(boundary, 3);
+}
+
+static void
+native_schema_dispatch_unexpected_void(void)
+{
+	schema_dispatch_unexpected_dependencies++;
+	siglongjmp(boundary, 3);
+}
+
+#define AlterTableNamespace(s, o) observe_native_schema_table((s), (o))
+#define AlterTypeNamespace(n, s, t, o) observe_native_schema_type((n), (s), (t), (o))
+#define AlterExtensionNamespace(n, s, o) observe_native_schema_extension((n), (s), (o))
+#define table_open(...) native_schema_dispatch_unexpected_relation()
+#define table_close(...) native_schema_dispatch_unexpected_void()
+#define LookupCreationNamespace(...) native_schema_dispatch_unexpected_oid()
+#define AlterObjectNamespace_internal(...) native_schema_dispatch_unexpected_oid()
+#include "test_cluster_fresh_schema_dispatch.inc"
+#undef AlterTableNamespace
+#undef AlterTypeNamespace
+#undef AlterExtensionNamespace
+#undef table_open
+#undef table_close
+#undef LookupCreationNamespace
+#undef AlterObjectNamespace_internal
+
+static RangeVar schema_dispatch_relation;
+static String schema_dispatch_name;
+static ListCell schema_dispatch_name_cell;
+static List schema_dispatch_names;
+static ObjectWithArgs schema_dispatch_routine;
+static const struct {
+	ObjectType type;
+	unsigned route;
+	const char *command;
+} schema_dispatch_targets[] = { { OBJECT_TABLE, 1, "ALTER TABLE" },
+								{ OBJECT_FOREIGN_TABLE, 1, "ALTER FOREIGN TABLE" },
+								{ OBJECT_SEQUENCE, 1, "ALTER SEQUENCE" },
+								{ OBJECT_VIEW, 1, "ALTER VIEW" },
+								{ OBJECT_AGGREGATE, 4, "ALTER AGGREGATE" },
+								{ OBJECT_COLLATION, 4, "ALTER COLLATION" },
+								{ OBJECT_CONVERSION, 4, "ALTER CONVERSION" },
+								{ OBJECT_FUNCTION, 4, "ALTER FUNCTION" },
+								{ OBJECT_PROCEDURE, 4, "ALTER PROCEDURE" },
+								{ OBJECT_ROUTINE, 4, "ALTER ROUTINE" },
+								{ OBJECT_STATISTIC_EXT, 4, "ALTER STATISTICS" },
+								{ OBJECT_TSCONFIGURATION, 4, "ALTER TEXT SEARCH CONFIGURATION" },
+								{ OBJECT_TSDICTIONARY, 4, "ALTER TEXT SEARCH DICTIONARY" },
+								{ OBJECT_TSPARSER, 4, "ALTER TEXT SEARCH PARSER" },
+								{ OBJECT_TSTEMPLATE, 4, "ALTER TEXT SEARCH TEMPLATE" } };
+
+static void
+reset_native_schema_dispatch(bool expect_binding, unsigned form)
+{
+	ObjectType type = schema_dispatch_targets[form % 15].type;
+
+	reset_create_preflight();
+	schema_dispatch_lookup_active = true;
+	schema_dispatch_expect_binding = expect_binding;
+	schema_dispatch_lookups = schema_dispatch_lookup_kind = schema_dispatch_unbound
+		= schema_dispatch_bad_lookup = 0;
+	schema_dispatch_unexpected_dependencies = 0;
+	schema_dispatch_expected_boundary = schema_dispatch_targets[form % 15].route;
+	schema_dispatch_wants_old_schema = (form / 15) % 2;
+	schema_dispatch_old_schema_address
+		= (ObjectAddress){ .classId = 901, .objectId = 902, .objectSubId = 903 };
+	schema_dispatch_relation = (RangeVar){ .type = T_RangeVar, .relname = "schema_relation" };
+	schema_dispatch_name = (String){ .type = T_String, .sval = "schema_source_object" };
+	schema_dispatch_name_cell = (ListCell){ .ptr_value = &schema_dispatch_name };
+	schema_dispatch_names = (List){ .type = T_List,
+									.length = 1,
+									.max_length = 1,
+									.elements = &schema_dispatch_name_cell };
+	schema_dispatch_routine
+		= (ObjectWithArgs){ .type = T_ObjectWithArgs, .objname = &schema_dispatch_names };
+	native_schema_dispatch_statement
+		= (AlterObjectSchemaStmt){ .type = T_AlterObjectSchemaStmt,
+								   .objectType = type,
+								   .relation = &schema_dispatch_relation,
+								   .object = type == OBJECT_AGGREGATE || type == OBJECT_FUNCTION
+													 || type == OBJECT_PROCEDURE
+													 || type == OBJECT_ROUTINE
+												 ? (Node *)&schema_dispatch_routine
+												 : (Node *)&schema_dispatch_names,
+								   .newschema = "schema_destination",
+								   .missing_ok = form >= 30 };
+	schema_dispatch_expected_statement = (Node *)&native_schema_dispatch_statement;
+}
+
+static void
+assert_native_schema_dispatch_output_untouched(void)
+{
+	UT_ASSERT_EQ(schema_dispatch_old_schema_address.classId, 901);
+	UT_ASSERT_EQ(schema_dispatch_old_schema_address.objectId, 902);
+	UT_ASSERT_EQ(schema_dispatch_old_schema_address.objectSubId, 903);
+}
+
+static void
+native_schema_dispatch_entry(void)
+{
+	(void)ExecAlterObjectSchemaStmt(
+		&native_schema_dispatch_statement,
+		schema_dispatch_wants_old_schema ? &schema_dispatch_old_schema_address : NULL);
+}
+
+UT_TEST(test_native_schema_dispatch_binds_before_first_query_in_all_profiles)
+{
+	for (unsigned form = 0; form < 60; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_schema_dispatch(binds, form);
+			set_native_operator_mode(mode);
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_schema_dispatch_entry();
+				UT_ASSERT_EQ(caught, 2);
+				assert_native_schema_dispatch_output_untouched();
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(schema_dispatch_lookups, repeat + 1);
+				UT_ASSERT_EQ(schema_dispatch_lookup_kind,
+							 schema_dispatch_lookups ? schema_dispatch_expected_boundary : 0);
+				UT_ASSERT_EQ(schema_dispatch_unbound, 0);
+				UT_ASSERT_EQ(schema_dispatch_bad_lookup + schema_dispatch_unexpected_dependencies,
+							 0);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	schema_dispatch_lookup_active = false;
+}
+
+UT_TEST(test_native_schema_dispatch_refuses_before_lookup_on_publication_child_and_top_errors)
+{
+	for (unsigned form = 0; form < 60; form++) {
+		for (unsigned failure = 0; failure < 5; failure++) {
+			bool allocated = failure == 0 || failure == 2;
+			int caught;
+
+			reset_native_schema_dispatch(true, form);
+			if (failure == 0)
+				utility_bind_ok = false;
+			else if (failure == 1 || failure == 2) {
+				if (failure == 2)
+					create_sql_entry(schema_dispatch_expected_statement);
+				utility_in_child = true;
+			} else {
+				utility_current_xid = 401;
+				utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_schema_dispatch_entry();
+			UT_ASSERT_EQ(caught, 1);
+			assert_native_schema_dispatch_output_untouched();
+			UT_ASSERT_EQ(error_code, failure == 0  ? ERRCODE_DATA_CORRUPTED
+									 : failure < 3 ? ERRCODE_FEATURE_NOT_SUPPORTED
+												   : ERRCODE_INTERNAL_ERROR);
+			UT_ASSERT_STR_EQ(
+				error_message,
+				failure == 0
+					? "canonical ACTIVE publication failed before shared catalog alteration"
+				: failure < 3 ? "shared catalog alteration does not support subtransactions"
+							  : "shared catalog top-level transaction identity mismatch");
+			UT_ASSERT_EQ(schema_dispatch_lookups, 0);
+			UT_ASSERT_EQ(schema_dispatch_lookup_kind,
+						 schema_dispatch_lookups ? schema_dispatch_expected_boundary : 0);
+			UT_ASSERT_EQ(schema_dispatch_unbound + schema_dispatch_bad_lookup
+							 + schema_dispatch_unexpected_dependencies,
+						 0);
+			UT_ASSERT_EQ(utility_xids, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, failure == 2 ? 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, allocated || failure == 3 ? 400 : InvalidTransactionId);
+		}
+	}
+	schema_dispatch_lookup_active = false;
+}
+
+UT_TEST(test_native_schema_dispatch_context_guards_keep_nonshared_route)
+{
+	for (unsigned form = 0; form < 60; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+
+			for (unsigned guard = 0; guard < 3; guard++) {
+				int caught;
+
+				reset_native_schema_dispatch(binds, form);
+				set_native_operator_mode(mode);
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_schema_dispatch_entry();
+				UT_ASSERT_EQ(caught, binds ? 1 : 2);
+				assert_native_schema_dispatch_output_untouched();
+				UT_ASSERT_EQ(error_code, !binds		  ? 0
+										 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+													  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				if (binds)
+					UT_ASSERT(strstr(error_message, schema_dispatch_targets[form % 15].command)
+							  != NULL);
+				UT_ASSERT_EQ(schema_dispatch_lookups, binds ? 0 : 1);
+				UT_ASSERT_EQ(schema_dispatch_lookup_kind,
+							 schema_dispatch_lookups ? schema_dispatch_expected_boundary : 0);
+				UT_ASSERT_EQ(schema_dispatch_unbound + schema_dispatch_bad_lookup
+								 + schema_dispatch_unexpected_dependencies,
+							 0);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	schema_dispatch_lookup_active = false;
+}
+
+UT_TEST(test_native_schema_dispatch_utility_warm_guards_preserve_binding)
+{
+	for (unsigned form = 0; form < 60; form++) {
+		for (unsigned guard = 0; guard < 4; guard++) {
+			int caught;
+
+			reset_native_schema_dispatch(true, form);
+			create_sql_entry(schema_dispatch_expected_statement);
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			XactReadOnly = guard == 1;
+			utility_parallel = guard == 2;
+			utility_recovery = guard == 3;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_schema_dispatch_entry();
+			UT_ASSERT_EQ(caught, guard ? 1 : 2);
+			assert_native_schema_dispatch_output_untouched();
+			UT_ASSERT_EQ(error_code, !guard		  ? 0
+									 : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+												  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT_EQ(schema_dispatch_lookups, guard ? 0 : 1);
+			UT_ASSERT_EQ(schema_dispatch_lookup_kind,
+						 schema_dispatch_lookups ? schema_dispatch_expected_boundary : 0);
+			UT_ASSERT_EQ(schema_dispatch_unbound + schema_dispatch_bad_lookup
+							 + schema_dispatch_unexpected_dependencies,
+						 0);
+			UT_ASSERT_EQ(utility_prepares, guard ? 1 : 2);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			UT_ASSERT_EQ(utility_top_xid, 400);
+		}
+	}
+	schema_dispatch_lookup_active = false;
+}
+
+UT_TEST(test_native_schema_dispatch_scope_refusals_match_utility_before_binding)
+{
+	static const struct {
+		ObjectType type;
+		unsigned route;
+		const char *message;
+	} forbidden[]
+		= { { OBJECT_MATVIEW, 1, "materialized views is not supported in shared mode" },
+			{ OBJECT_TYPE, 2, "custom types is not supported in shared mode" },
+			{ OBJECT_DOMAIN, 2, "custom types is not supported in shared mode" },
+			{ OBJECT_OPERATOR, 4, "custom operators is not supported in shared mode" },
+			{ OBJECT_OPCLASS, 4, "custom operators is not supported in shared mode" },
+			{ OBJECT_OPFAMILY, 4, "custom operators is not supported in shared mode" },
+			{ OBJECT_EXTENSION, 3, "CREATE/DROP EXTENSION is not supported in shared mode" } };
+
+	for (unsigned type = 0; type < lengthof(forbidden); type++) {
+		for (unsigned output = 0; output < 2; output++) {
+			for (unsigned mode = 0; mode < 8; mode++) {
+				bool shared = mode != 0 && mode != 2;
+				int caught;
+
+				reset_native_schema_dispatch(false, output * 15);
+				set_native_operator_mode(mode);
+				native_schema_dispatch_statement.objectType = forbidden[type].type;
+				native_schema_dispatch_statement.object = forbidden[type].type == OBJECT_EXTENSION
+															  ? (Node *)&schema_dispatch_name
+															  : (Node *)&schema_dispatch_names;
+				schema_dispatch_expected_boundary = forbidden[type].route;
+				XactReadOnly = utility_parallel = utility_recovery = utility_in_child = true;
+				utility_bind_ok = false;
+				if (shared) {
+					caught = sigsetjmp(boundary, 1);
+					if (!caught)
+						create_sql_entry(schema_dispatch_expected_statement);
+					UT_ASSERT_EQ(caught, 1);
+					UT_ASSERT_EQ(error_code, ERRCODE_FEATURE_NOT_SUPPORTED);
+					UT_ASSERT_STR_EQ(error_message, forbidden[type].message);
+					UT_ASSERT_STR_EQ(
+						error_detail,
+						"PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+					UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+					assert_native_schema_dispatch_output_untouched();
+					reset_error();
+				}
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_schema_dispatch_entry();
+				UT_ASSERT_EQ(caught, shared ? 1 : 2);
+				UT_ASSERT_EQ(error_code, shared ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+				if (shared) {
+					UT_ASSERT_STR_EQ(error_message, forbidden[type].message);
+					UT_ASSERT_STR_EQ(
+						error_detail,
+						"PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+				}
+				UT_ASSERT_EQ(schema_dispatch_lookups, shared ? 0 : 1);
+				UT_ASSERT_EQ(schema_dispatch_lookup_kind,
+							 shared ? 0 : schema_dispatch_expected_boundary);
+				UT_ASSERT_EQ(schema_dispatch_unbound + schema_dispatch_bad_lookup
+								 + schema_dispatch_unexpected_dependencies,
+							 0);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+				assert_native_schema_dispatch_output_untouched();
+			}
+		}
+	}
+	schema_dispatch_lookup_active = false;
+}
+
+UT_TEST(test_native_schema_dispatch_keeps_original_unrecognized_target_error)
+{
+	for (unsigned output = 0; output < 2; output++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			char expected[100];
+			int caught;
+
+			reset_native_schema_dispatch(binds, output * 15);
+			set_native_operator_mode(mode);
+			native_schema_dispatch_statement.objectType = OBJECT_LARGEOBJECT;
+			snprintf(expected, sizeof(expected), "unrecognized AlterObjectSchemaStmt type: %d",
+					 (int)OBJECT_LARGEOBJECT);
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_schema_dispatch_entry();
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_STR_EQ(error_message, expected);
+			UT_ASSERT_EQ(schema_dispatch_lookups + schema_dispatch_unbound
+							 + schema_dispatch_bad_lookup + schema_dispatch_unexpected_dependencies,
+						 0);
+			UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, binds ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+			assert_native_schema_dispatch_output_untouched();
+		}
+	}
+	schema_dispatch_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(239);
+	UT_PLAN(245);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -15507,6 +15949,12 @@ main(void)
 	UT_RUN(test_native_rename_dispatch_utility_warm_guards_preserve_binding);
 	UT_RUN(test_native_rename_dispatch_scope_refusals_match_utility_before_binding);
 	UT_RUN(test_native_rename_dispatch_keeps_original_unrecognized_target_error);
+	UT_RUN(test_native_schema_dispatch_binds_before_first_query_in_all_profiles);
+	UT_RUN(test_native_schema_dispatch_refuses_before_lookup_on_publication_child_and_top_errors);
+	UT_RUN(test_native_schema_dispatch_context_guards_keep_nonshared_route);
+	UT_RUN(test_native_schema_dispatch_utility_warm_guards_preserve_binding);
+	UT_RUN(test_native_schema_dispatch_scope_refusals_match_utility_before_binding);
+	UT_RUN(test_native_schema_dispatch_keeps_original_unrecognized_target_error);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
