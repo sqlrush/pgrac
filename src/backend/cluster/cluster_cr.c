@@ -784,13 +784,19 @@ typedef struct CrR4OperationTop {
 	bool conservative;
 } CrR4OperationTop;
 
-/* Private evidence of a qualified kept tuple creation, not a TID reuse grant. */
-typedef struct CrR4KeptCreation {
-	struct CrR4KeptCreation *next;
+/* Kept effects may precede their qualified creator in the retained walk. */
+typedef struct CrR4KeptTuple {
+	struct CrR4KeptTuple *next;
+	ClusterSavepointReaderIdentity creator;
+	UBA creator_uba;
 	TransactionId xid;
 	OffsetNumber offset;
 	uint16 length;
-} CrR4KeptCreation;
+	uint16 creator_type;
+	bool creation_bound;
+} CrR4KeptTuple;
+
+StaticAssertDecl(sizeof(CrR4KeptTuple) <= 128, "R4 kept tuple exceeds its local node budget");
 
 typedef struct CrR4OperationContext {
 	bool enabled, reading, operation_mode, pending;
@@ -805,7 +811,7 @@ typedef struct CrR4OperationContext {
 	ClusterTxResolution top;
 	ClusterSavepointReaderRecord operation;
 	CrR4OperationTop *tops;
-	CrR4KeptCreation *creations;
+	CrR4KeptTuple *kept_tuples;
 	uint32 top_count;
 	PGAlignedBlock *walk;
 	char *result_page; /* Borrowed only during the admitted call. */
@@ -840,11 +846,11 @@ cr_r4_operation_forget(uint32 index, uint64 generation)
 		pfree(operation->tops);
 		operation->tops = next;
 	}
-	while (operation->creations != NULL) {
-		CrR4KeptCreation *next = operation->creations->next;
+	while (operation->kept_tuples != NULL) {
+		CrR4KeptTuple *next = operation->kept_tuples->next;
 
-		pfree(operation->creations);
-		operation->creations = next;
+		pfree(operation->kept_tuples);
+		operation->kept_tuples = next;
 	}
 	if (operation->walk != NULL)
 		pfree(operation->walk);
@@ -1007,9 +1013,18 @@ cr_r4_operation_covers_target(const CrR4OperationContext *operation, const UndoR
 										 record->target_offset);
 }
 
+static CrR4KeptTuple *
+cr_r4_operation_kept_tuple(const CrR4OperationContext *operation, OffsetNumber offset)
+{
+	for (CrR4KeptTuple *kept = operation->kept_tuples; kept != NULL; kept = kept->next)
+		if (kept->offset == offset)
+			return kept;
+	return NULL;
+}
+
 static bool
 cr_r4_operation_creation_matches(const CrR4OperationContext *operation,
-								 const CrR4KeptCreation *creation)
+								 const CrR4KeptTuple *creation)
 {
 	Page page = (Page)operation->result_page;
 	PageHeader header = (PageHeader)page;
@@ -1029,51 +1044,102 @@ cr_r4_operation_creation_matches(const CrR4OperationContext *operation,
 		   && HeapTupleHeaderGetRawXmin(tuple) == creation->xid;
 }
 
-/* Record only the first kept operation at this offset, after its original
- * inverse and admission recheck. Later versions cannot replace this witness. */
 static bool
-cr_r4_operation_remember_creation(CrR4OperationContext *operation, const UndoRecordHeader *record,
-								  const BufferTag *tag)
+cr_r4_operation_stage_tuple(const CrR4OperationContext *operation, OffsetNumber offset,
+							bool is_creation, CrR4KeptTuple *staged)
 {
-	CrR4KeptCreation creation = { .xid = record->xid };
-	CrR4KeptCreation *stored;
 	Page page = (Page)operation->result_page;
+	PageHeader header = (PageHeader)page;
+	CrR4KeptTuple *stored = cr_r4_operation_kept_tuple(operation, offset);
+	ItemId item;
+
+	if (stored != NULL) {
+		*staged = *stored;
+		return cr_r4_operation_creation_matches(operation, staged);
+	}
+	if (offset < FirstOffsetNumber)
+		return false;
+	memset(staged, 0, sizeof(*staged));
+	/* A missing old target still needs the full inverse, but supplies no
+	 * tuple identity. A retained creation must have a resident version. */
+	if (offset > PageGetMaxOffsetNumber(page))
+		return !is_creation;
+	item = PageGetItemId(page, offset);
+	if (!ItemIdIsNormal(item))
+		return !is_creation;
+	if (ItemIdGetLength(item) < SizeofHeapTupleHeader || ItemIdGetOffset(item) < header->pd_upper
+		|| (size_t)ItemIdGetOffset(item) + ItemIdGetLength(item) > header->pd_special)
+		return false;
+	staged->offset = offset;
+	staged->length = ItemIdGetLength(item);
+	staged->xid = HeapTupleHeaderGetRawXmin((HeapTupleHeader)PageGetItem(page, item));
+	return cr_r4_operation_creation_matches(operation, staged);
+}
+
+/* Capture before the inverse. A touched TID is not yet a creator proof;
+ * only its first qualified retained creation may bind that kept version. */
+static bool
+cr_r4_operation_stage_kept(const CrR4OperationContext *operation, char walk[BLCKSZ],
+						   const UndoRecordHeader *record, const BufferTag *tag,
+						   const OffsetNumber offsets[2], unsigned count, CrR4KeptTuple staged[2])
+{
+	OffsetNumber creation_offset = InvalidOffsetNumber;
 	uint16 expected_length = 0;
-	unsigned bit;
 
 	if (record->record_type == UNDO_RECORD_INSERT) {
 		UndoInsertPayload insert;
 
-		if (record->target_block != tag->blockNum)
-			return true;
 		memcpy(&insert, record + 1, sizeof(insert));
-		creation.offset = record->target_offset;
+		if (record->target_block == tag->blockNum)
+			creation_offset = record->target_offset;
 		expected_length = insert.inserted_tuple_len;
 	} else if (record->record_type == UNDO_RECORD_UPDATE) {
 		UndoUpdatePayload update;
 
 		memcpy(&update, record + 1, sizeof(update));
-		if (update.new_block != tag->blockNum)
-			return true;
-		creation.offset = update.new_offset;
-	} else
-		return true;
-	if (creation.offset < FirstOffsetNumber || creation.offset > MaxHeapTuplesPerPage)
-		return false;
-	bit = creation.offset - FirstOffsetNumber;
-	if ((operation->kept_offsets[bit / 8] & (1U << (bit % 8))) != 0)
-		return true;
-	if (creation.offset > PageGetMaxOffsetNumber(page))
-		return false;
-	creation.length = ItemIdGetLength(PageGetItemId(page, creation.offset));
-	if (!cr_r4_operation_creation_matches(operation, &creation)
-		|| (expected_length != 0 && expected_length != creation.length))
-		return false;
-	stored = MemoryContextAllocZero(TopMemoryContext, sizeof(*stored));
-	*stored = creation;
-	stored->next = operation->creations;
-	operation->creations = stored;
+		if (update.new_block == tag->blockNum)
+			creation_offset = update.new_offset;
+	}
+	for (unsigned i = 0; i < count; i++) {
+		if (!cr_r4_operation_stage_tuple(operation, offsets[i], offsets[i] == creation_offset,
+										 &staged[i]))
+			return false;
+		if (offsets[i] != creation_offset || staged[i].creation_bound)
+			continue;
+		if (staged[i].xid != record->xid
+			|| (expected_length != 0 && expected_length != staged[i].length)
+			|| !cr_r4_operation_same_creation(walk, operation->result_page, creation_offset))
+			return false;
+		staged[i].creator = operation->identity;
+		staged[i].creator_uba = operation->locator.uba;
+		staged[i].creator_type = record->record_type;
+		staged[i].creation_bound = true;
+	}
 	return true;
+}
+
+/* All staged bindings have passed the complete original inverse and admission
+ * recheck. Preserve the per-context list, including for duplicate offsets. */
+static void
+cr_r4_operation_publish_kept(CrR4OperationContext *operation, const CrR4KeptTuple staged[2],
+							 unsigned count)
+{
+	for (unsigned i = 0; i < count; i++) {
+		CrR4KeptTuple *stored;
+		CrR4KeptTuple *next;
+
+		if (staged[i].offset == InvalidOffsetNumber)
+			continue;
+		stored = cr_r4_operation_kept_tuple(operation, staged[i].offset);
+		if (stored == NULL) {
+			stored = MemoryContextAllocZero(TopMemoryContext, sizeof(*stored));
+			stored->next = operation->kept_tuples;
+			operation->kept_tuples = stored;
+		}
+		next = stored->next;
+		*stored = staged[i];
+		stored->next = next;
+	}
 }
 
 /* An absent walk TID is useful only with an explicit distinct kept creator. */
@@ -1088,9 +1154,13 @@ cr_r4_operation_covers_creation(const CrR4OperationContext *operation,
 		|| record->target_offset > PageGetMaxOffsetNumber(walk)
 		|| ItemIdIsUsed(PageGetItemId(walk, record->target_offset)))
 		return false;
-	for (const CrR4KeptCreation *creation = operation->creations; creation != NULL;
+	for (const CrR4KeptTuple *creation = operation->kept_tuples; creation != NULL;
 		 creation = creation->next)
-		if (creation->offset == record->target_offset && creation->xid != record->xid)
+		if (creation->creation_bound && creation->offset == record->target_offset
+			&& creation->xid != record->xid
+			&& !FullTransactionIdEquals(creation->creator.operation_fxid,
+										operation->identity.operation_fxid)
+			&& !cluster_undo_record_uba_equal(creation->creator_uba, operation->locator.uba))
 			return cr_r4_operation_creation_matches(operation, creation);
 	return false;
 }
@@ -1182,11 +1252,17 @@ cr_r4_operation_project(CrR4OperationContext *operation, ClusterR4CrSlotExtensio
 	bool covered_target;
 	ClusterItlSlotData after;
 	PGAlignedBlock candidate;
+	CrR4KeptTuple staged[2];
 
 	count = cr_r4_operation_offsets(record, tag, body, offsets);
 	if (count == 0
 		|| !cr_r4_operation_projection_safe(operation, page, record, tag, offsets, count, keep,
 											&covered_target))
+		return false;
+	if (keep
+		&& !cr_r4_operation_stage_kept(operation,
+									   operation->walk != NULL ? operation->walk->data : page,
+									   record, tag, offsets, count, staged))
 		return false;
 	if (operation->walk == NULL && !keep)
 		return cluster_cr_history_inverse_operation_identity(page, tag, locator, locator->uba,
@@ -1204,9 +1280,9 @@ cr_r4_operation_project(CrR4OperationContext *operation, ClusterR4CrSlotExtensio
 													   &operation->identity))
 		return false;
 	if (keep) {
-		if (!cluster_semantic_activation_recheck(&operation->admission)
-			|| !cr_r4_operation_remember_creation(operation, record, tag))
+		if (!cluster_semantic_activation_recheck(&operation->admission))
 			return false;
+		cr_r4_operation_publish_kept(operation, staged, count);
 		if ((operation->kept_slots & (1U << locator->itl_slot_index)) == 0)
 			ClusterPageGetItlSlots((Page)operation->result_page)[locator->itl_slot_index] = after;
 		operation->kept_slots |= 1U << locator->itl_slot_index;

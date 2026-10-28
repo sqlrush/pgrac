@@ -2896,3 +2896,217 @@ UT_TEST(test_operation_worker_long_cohort_has_private_progress)
 	UT_ASSERT_EQ(test_candidate_held_count, 0);
 	UT_ASSERT_EQ(operation_worker_allocations, allocations);
 }
+
+/* Kept lock effects and retained tuple creation are separate observations. */
+static void
+creation_challenge_lock(OperationWorkerFixture *f, bool same, bool discarded,
+						char before_lock[BLCKSZ])
+{
+	UndoSlotDirEntry directory;
+	UndoRecordHeader record;
+	UndoOperationTrailer tail;
+	UndoItlHistoryTrailer history;
+	UndoItlPayload lock;
+	ClusterItlSlotData *head;
+	HeapTupleHeader tuple;
+	UndoBlockHeader *block;
+	char *bytes;
+	uint16 offset;
+
+	operation_worker_reused_creation(f, true, same);
+	memcpy(before_lock, f->cr.source.data, BLCKSZ);
+	memcpy(&directory, test_operation_page.data + BLCKSZ - 2 * sizeof(directory),
+		   sizeof(directory));
+	bytes = test_operation_page.data + directory.record_offset;
+	memcpy(&record, bytes, sizeof(record));
+	memcpy(&tail, bytes + directory.record_length - sizeof(tail), sizeof(tail));
+	head = &ClusterPageGetItlSlots((Page)f->cr.source.data)[2];
+	tuple = (HeapTupleHeader)PageGetItem((Page)f->cr.source.data,
+										 PageGetItemId((Page)f->cr.source.data, 2));
+	lock = (UndoItlPayload){ .itl_slot_idx = 2,
+							 .prev_flags = head->flags,
+							 .new_flags = ITL_FLAG_LOCK_ONLY_ACTIVE,
+							 .lock_xid = record.xid,
+							 .prev_xmax = HeapTupleHeaderGetRawXmax(tuple),
+							 .prev_infomask = tuple->t_infomask };
+	memset(&history, 0, sizeof(history));
+	history.magic = UNDO_ITL_HISTORY_MAGIC;
+	history.version = UNDO_ITL_HISTORY_VERSION;
+	history.count = 1;
+	history.entries[0].block = 23;
+	history.entries[0].slot_index = 2;
+	history.entries[0].after_kind = ITL_FLAG_LOCK_ONLY_ACTIVE;
+	history.entries[0].after_write_scn = 71;
+	history.entries[0].prior = *head;
+	record.record_type = UNDO_RECORD_ITL;
+	record.flags &= ~UNDO_REC_FLAG_FIRST_IN_TX;
+	record.prev_uba = head->undo_segment_head;
+	record.write_scn = 71;
+	record.payload_length = sizeof(lock) + sizeof(history) + sizeof(tail);
+	tail.operation_sequence++;
+	tail.effect_state
+		= discarded ? CLUSTER_SAVEPOINT_EFFECT_DISCARDED : CLUSTER_SAVEPOINT_EFFECT_LIVE;
+	block = (UndoBlockHeader *)test_operation_page.data;
+	offset = block->free_offset;
+	bytes = test_operation_page.data + offset;
+	memcpy(bytes, &record, sizeof(record));
+	memcpy(bytes + sizeof(record), &lock, sizeof(lock));
+	memcpy(bytes + sizeof(record) + sizeof(lock), &history, sizeof(history));
+	memcpy(bytes + sizeof(record) + sizeof(lock) + sizeof(history), &tail, sizeof(tail));
+	directory.record_offset = offset;
+	directory.record_length = sizeof(record) + record.payload_length;
+	directory.record_type = record.record_type;
+	directory.flags = record.flags;
+	memcpy(test_operation_page.data + BLCKSZ - 3 * sizeof(directory), &directory,
+		   sizeof(directory));
+	block->slot_count = 3;
+	block->free_offset = offset + directory.record_length;
+	head->flags = ITL_FLAG_LOCK_ONLY_COMMITTED;
+	head->wrap++;
+	head->write_scn = 71;
+	head->undo_segment_head = uba_encode(TEST_RECORD_SEGMENT, 7, TEST_TT_OFFSET + 1, 2);
+	HeapTupleHeaderSetXmax(tuple, record.xid);
+	tuple->t_infomask = HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_EXCL_LOCK;
+}
+
+UT_TEST(test_creation_challenge_latest_live_lock_keeps_creator)
+{
+	for (int same = 0; same < 2; same++) {
+		OperationWorkerFixture f;
+		PGAlignedBlock original, before_lock;
+		ClusterR4CrBuildStepResult step = CLUSTER_R4_CR_STEP_PENDING;
+		int allocations = operation_worker_allocations;
+
+		creation_challenge_lock(&f, same, false, before_lock.data);
+		memcpy(original.data, f.cr.source.data, BLCKSZ);
+		for (unsigned tick = 0; tick < 128 && f.extension.build_steps < 3; tick++) {
+			step = operation_worker_step(&f);
+			UT_ASSERT_EQ(step, CLUSTER_R4_CR_STEP_PENDING);
+		}
+		UT_ASSERT_EQ(f.extension.build_steps, 3);
+		UT_ASSERT_EQ(test_candidate_acquire_calls, 6);
+		UT_ASSERT_EQ(test_candidate_release_calls, 6);
+		step = operation_worker_finish(&f);
+		cluster_cr_build_on_holder_forget(0, 1000);
+		UT_ASSERT_EQ(step, CLUSTER_R4_CR_STEP_FULL);
+		UT_ASSERT_EQ(memcmp(original.data, f.cr.source.data, BLCKSZ), 0);
+		UT_ASSERT_EQ(test_candidate_held_count, 0);
+		UT_ASSERT_EQ(operation_worker_allocations, allocations);
+	}
+}
+
+UT_TEST(test_creation_challenge_discarded_lock_does_not_hide_creator)
+{
+	for (int same = 0; same < 2; same++) {
+		OperationWorkerFixture f;
+		PGAlignedBlock expected;
+		ClusterR4CrBuildStepResult step;
+		int allocations = operation_worker_allocations;
+
+		creation_challenge_lock(&f, same, true, expected.data);
+		step = operation_worker_finish(&f);
+		cluster_cr_build_on_holder_forget(0, 1000);
+		UT_ASSERT_EQ(step, CLUSTER_R4_CR_STEP_FULL);
+		UT_ASSERT_EQ(memcmp(expected.data, f.cr.source.data, BLCKSZ), 0);
+		UT_ASSERT_EQ(f.extension.build_steps, 3);
+		UT_ASSERT_EQ(test_candidate_acquire_calls, 9);
+		UT_ASSERT_EQ(test_candidate_release_calls, 9);
+		UT_ASSERT_EQ(test_candidate_held_count, 0);
+		UT_ASSERT_EQ(operation_worker_allocations, allocations);
+	}
+}
+
+/* Missing old targets may be restored on WALK without qualifying a creator. */
+static void
+operation_worker_missing_old_target(OperationWorkerFixture *f, unsigned role, unsigned state,
+									bool same_segment)
+{
+	UndoSlotDirEntry directory;
+	UndoRecordHeader record;
+	UndoItlHistoryTrailer history;
+	UndoOperationTrailer operation;
+	UndoUpdatePayload update;
+	char old_tuple[60];
+	char *bytes;
+	char *body;
+	uint16 body_length;
+	Page page;
+
+	operation_worker_cross_page_update(f, false, same_segment);
+	page = (Page)f->cr.source.data;
+	memcpy(&directory, test_operation_page.data + BLCKSZ - sizeof(directory), sizeof(directory));
+	bytes = test_operation_page.data + directory.record_offset;
+	body = bytes + sizeof(record);
+	memcpy(&record, bytes, sizeof(record));
+	memcpy(&update, body, sizeof(update));
+	memcpy(old_tuple, body + sizeof(update), sizeof(old_tuple));
+	memcpy(&history, body + sizeof(update) + sizeof(old_tuple), sizeof(history));
+	memcpy(&operation, bytes + directory.record_length - sizeof(operation), sizeof(operation));
+	if (role == 0) {
+		UndoDeletePayload deleted
+			= { .full_tuple_length = sizeof(old_tuple), .full_tuple_offset = sizeof(deleted) };
+
+		record.record_type = UNDO_RECORD_DELETE;
+		history.count = 1;
+		memcpy(body, &deleted, sizeof(deleted));
+		body_length = sizeof(deleted);
+	} else {
+		if (role == 2) {
+			HeapTupleHeader replacement
+				= (HeapTupleHeader)PageGetItem(page, PageGetItemId(page, 1));
+
+			update.new_block = 23;
+			update.new_offset = 1;
+			history.count = 1;
+			HeapTupleHeaderSetXmin(replacement, record.xid);
+		}
+		memcpy(body, &update, sizeof(update));
+		body_length = sizeof(update);
+	}
+	if (history.count == 1)
+		memset(&history.entries[1], 0, sizeof(history.entries[1]));
+	memcpy(body + body_length, old_tuple, sizeof(old_tuple));
+	body_length += sizeof(old_tuple);
+	memcpy(body + body_length, &history, sizeof(history));
+	memcpy(body + body_length + sizeof(history), &operation, sizeof(operation));
+	record.payload_length = body_length + sizeof(history) + sizeof(operation);
+	memcpy(bytes, &record, sizeof(record));
+	directory.record_type = record.record_type;
+	directory.record_length = sizeof(record) + record.payload_length;
+	memcpy(test_operation_page.data + BLCKSZ - sizeof(directory), &directory, sizeof(directory));
+	((UndoBlockHeader *)test_operation_page.data)->free_offset
+		= directory.record_offset + directory.record_length;
+	if (state == 0)
+		ItemIdSetUnused(PageGetItemId(page, 2));
+	else if (state == 1)
+		ItemIdSetDead(PageGetItemId(page, 2));
+	else
+		((PageHeader)page)->pd_lower = SizeOfPageHeaderData + sizeof(ItemIdData);
+	operation_worker_row_effect(0, CLUSTER_SAVEPOINT_EFFECT_LIVE);
+	test_tt_slot.commit_scn = 65; /* Synthetic visibility, not native pruning permission. */
+}
+
+UT_TEST(test_operation_worker_kept_missing_old_target_uses_original_inverse)
+{
+	for (unsigned role = 0; role < 3; role++)
+		for (unsigned state = 0; state < 3; state++)
+			for (int same = 0; same < 2; same++) {
+				OperationWorkerFixture f;
+				PGAlignedBlock original;
+				ClusterR4CrBuildStepResult step;
+				int allocations = operation_worker_allocations;
+
+				operation_worker_missing_old_target(&f, role, state, same);
+				memcpy(original.data, f.cr.source.data, BLCKSZ);
+				step = operation_worker_finish(&f);
+				cluster_cr_build_on_holder_forget(0, 1000);
+				UT_ASSERT_EQ(step, CLUSTER_R4_CR_STEP_FULL);
+				UT_ASSERT_EQ(f.reason, CLUSTER_CR_BUILD_NONE);
+				UT_ASSERT_EQ(memcmp(original.data, f.cr.source.data, BLCKSZ), 0);
+				UT_ASSERT_EQ(f.extension.build_steps, 1);
+				UT_ASSERT_EQ(test_candidate_acquire_calls, 3);
+				UT_ASSERT_EQ(test_candidate_release_calls, 3);
+				UT_ASSERT_EQ(test_candidate_held_count, 0);
+				UT_ASSERT_EQ(operation_worker_allocations, allocations);
+			}
+}
