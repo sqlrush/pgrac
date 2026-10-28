@@ -937,6 +937,22 @@ resource_x_image_component_encode(uint8 *bytes, const ResourceXDecodedAcquireIma
 	return true;
 }
 
+/* Use the same component encoder as the full-A envelope. Standalone V2
+ * image admission remains X-only; a nested S component is never a grant.
+ * Author: SqlRush <sqlrush@gmail.com> */
+bool
+cluster_resource_x_wire_acquire_image_crc(const ResourceXDecodedAcquireImage *body,
+	uint32 *crc_out, ResourceXWireReject *reject)
+{
+	uint8 bytes[RESOURCE_X_IMAGE_V2_BYTES];
+
+	if (crc_out != NULL) *crc_out = 0;
+	if (body == NULL || crc_out == NULL || !resource_x_image_component_encode(bytes, body, reject))
+		return false;
+	*crc_out = resource_x_get_u32(bytes + 4);
+	return true;
+}
+
 static uint32
 resource_x_data_crc(const uint8 *bytes, Size len)
 {

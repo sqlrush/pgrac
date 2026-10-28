@@ -5740,10 +5740,11 @@ test_cluster_pcm_source_finish_consumer.inc: $(top_srcdir)/src/backend/cluster/c
 	awk '/^gcs_block_pcm_trace_guard_capture\(/ { print "static void"; emit=1; capture++ } \
 	     /^gcs_block_pcm_trace_guard\(/ { print "static void"; emit=1; guard++ } \
 	     /^gcs_block_pcm_trace_refusal\(/ { print "static ClusterWaitTraceGuard"; emit=1; refusal++ } \
+	     /^gcs_block_resource_x_acquire_s_read_finish_owned\(/ { print "static ResourceXApplyResult"; emit=1; read_source++ } \
 	     /^gcs_block_resource_x_acquire_s_source_finish_owned\(/ { print "static ResourceXApplyResult"; emit=1; acquire++ } \
 	     /^gcs_block_resource_x_source_finish_owned\(/ { print "static ResourceXApplyResult"; emit=1; found++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (found != 1 || acquire != 1 || capture != 1 || guard != 1 || refusal != 1 || emit) exit 1 }' $< > $@.tmp
+	     END { if (found != 1 || acquire != 1 || read_source != 1 || capture != 1 || guard != 1 || refusal != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # PGRAC: real bounded discard/PI owners, not copies of their decisions.
@@ -5757,10 +5758,10 @@ test_cluster_pcm_s_capture_consumer.inc: $(top_srcdir)/src/backend/cluster/clust
 test_cluster_pcm_s_prepare.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
 	awk '/^typedef enum ClusterPcmOwnSSourceHardFailureReason/ { emit=1; types++ } \
 	     /^cluster_bufmgr_pcm_own_prepare_s_source_image_internal\(/ { print "static ClusterPcmOwnResult"; emit=1 } \
-	     /^cluster_bufmgr_pcm_own_(begin_s_revoke|prepare_s_source_image|abort_s_revoke)\(/ \
+	     /^cluster_bufmgr_pcm_own_(begin_s_revoke|prepare_s_source_image|abort_s_revoke|finish_s_source)\(/ \
 	       { print "ClusterPcmOwnResult"; emit=1; funcs++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (types != 1 || funcs != 3 || emit) exit 1 }' $< > $@
+	     END { if (types != 1 || funcs != 4 || emit) exit 1 }' $< > $@
 
 test_cluster_pcm_flush_owner.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
 	awk '/^FlushBuffer\(/ { print "static void"; emit=1; flush++ } \

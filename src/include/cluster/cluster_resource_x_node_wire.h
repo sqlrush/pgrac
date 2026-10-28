@@ -533,6 +533,10 @@ StaticAssertDecl(offsetof(ResourceXInstallSettlementV1, conversion_base_generati
 					 && offsetof(ResourceXInstallSettlementV1, settlement_flags) == 148,
 				 "Resource-X install-settlement V1 offsets changed");
 
+/* CRC of the original image component embedded in a complete acquisition.
+ * This is not standalone image admission or complete-A/native authority. */
+extern bool cluster_resource_x_wire_acquire_image_crc(const ResourceXDecodedAcquireImage *body,
+	uint32 *crc_out, ResourceXWireReject *reject);
 extern bool cluster_resource_x_wire_encode(uint8 msg_type, const ResourceXDecodedFrame *frame,
 										   void *payload, uint16 payload_capacity,
 										   uint16 *payload_len_out, ResourceXWireReject *reject);

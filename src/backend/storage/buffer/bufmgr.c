@@ -21508,6 +21508,62 @@ cluster_bufmgr_pcm_own_prepare_s_source_image(
 	return result;
 }
 
+/* Release a compatible S-source capture after its immutable pair is owned.
+ * This operation preserves current/S, generation and token. Its caller must
+ * retain the full source pair; the native tuple alone supplies no authority.
+ * Exact post-state replay covers an interrupted publication, never a new
+ * reservation with the same tag.
+ * Author: SqlRush <sqlrush@gmail.com> */
+ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_finish_s_source(BufferDesc *buf,
+	const ClusterPcmOwnSnapshot *expected_revoking, ClusterPcmOwnSnapshot *out_s)
+{
+	ClusterPcmOwnSnapshot live, comparable, expected;
+	ClusterPcmOwnResult result;
+	uint32 state;
+
+	if (out_s != NULL) memset(out_s, 0, sizeof(*out_s));
+	if (buf == NULL || expected_revoking == NULL || out_s == NULL
+		|| expected_revoking->pcm_state != PCM_STATE_S
+		|| expected_revoking->flags != PCM_OWN_FLAG_REVOKING
+		|| expected_revoking->reservation_token == 0
+		|| expected_revoking->reservation_token == UINT64_MAX
+		|| expected_revoking->generation == 0 || expected_revoking->generation == UINT64_MAX
+		|| expected_revoking->writer_activation_token != 0
+		|| expected_revoking->resource_x_activation_generation != 0
+		|| (expected_revoking->buffer_type != BUF_TYPE_SCUR && expected_revoking->buffer_type != BUF_TYPE_CURRENT)
+		|| (expected_revoking->semantic_buf_state & (BM_VALID | BM_DIRTY | BM_JUST_DIRTIED
+			| BM_CHECKPOINT_NEEDED | BM_IO_IN_PROGRESS | BM_IO_ERROR)) != BM_VALID)
+		return CLUSTER_PCM_OWN_INVALID;
+	if (ClusterPcmOwnArray == NULL) return CLUSTER_PCM_OWN_NOT_READY;
+	state = LockBufHdr(buf);
+	cluster_pcm_own_snapshot_post_state_locked(buf, state, &live);
+	expected = *expected_revoking;
+	comparable = live;
+	comparable.semantic_buf_state &= ~BM_IO_IN_PROGRESS;
+	if (live.flags == 0) {
+		/* Readers may add hints after this exact fence was completed. Do
+		 * not flush, clear or misreport that later dirt as part of capture. */
+		comparable.flags = PCM_OWN_FLAG_REVOKING;
+		comparable.semantic_buf_state &= ~(BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED);
+	}
+	if (!cluster_pcm_own_snapshot_equal_exact(&comparable, &expected))
+		result = CLUSTER_PCM_OWN_STALE;
+	else if (!cluster_bufmgr_pcm_current_image_locked(buf, state))
+		result = CLUSTER_PCM_OWN_CORRUPT;
+	else if ((state & BM_IO_IN_PROGRESS) != 0)
+		result = CLUSTER_PCM_OWN_BUSY;
+	else {
+		result = live.flags == 0 ? CLUSTER_PCM_OWN_OK
+			: cluster_pcm_own_reservation_abort_exact(buf->buf_id, expected.generation,
+				expected.reservation_token, PCM_OWN_FLAG_REVOKING);
+		if (result == CLUSTER_PCM_OWN_OK)
+			cluster_pcm_own_snapshot_post_state_locked(buf, state, out_s);
+	}
+	UnlockBufHdr(buf, state);
+	return result;
+}
+
 /* Abort only the matching S-source staging reservation. */
 ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_abort_s_revoke(BufferDesc *buf,

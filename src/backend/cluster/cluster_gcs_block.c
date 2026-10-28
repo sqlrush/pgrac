@@ -11257,6 +11257,51 @@ gcs_block_pcm_service_begin(ClusterContentTraceServiceScope *scope,
 	cluster_content_trace_service_begin(scope, &service);
 }
 
+/* Complete a compatible S source without creating a PI or changing native
+ * generation. The immutable pair owns capture before the temporary fence is
+ * released; a lost worker can adopt only the same full token/post-state.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static ResourceXApplyResult
+gcs_block_resource_x_acquire_s_read_finish_owned(const ResourceXDecodedFrame *block,
+	int32 master, uint64 r4, BufferDesc *buf, const ClusterPcmOwnSnapshot *caller)
+{
+	ClusterPcmOwnSnapshot prepared, finished, expected, live;
+	ResourceXDecodedFrame image;
+	ResourceXAcquireSSourceState pair_state;
+	ResourceXApplyResult result;
+	ClusterPcmOwnResult own;
+	int32 id = -1;
+	int live_id = -1;
+
+	if (buf == NULL || r4 == 0 || r4 == UINT64_MAX
+		|| cluster_pcm_lock_resource_x_acquire_s_source_snapshot_exact(
+			block, master, &id, &prepared, &image, &pair_state) != RESOURCE_X_APPLY_APPLIED
+		|| id != buf->buf_id || !cluster_pcm_own_snapshot_equal_exact(&prepared, caller)
+		|| (pair_state != RESOURCE_X_ACQUIRE_S_SOURCE_PENDING && pair_state != RESOURCE_X_ACQUIRE_S_SOURCE_PUBLISHED)
+		|| image.body.acquire_image.original_image.source_carrier_generation != prepared.generation)
+		goto fail_closed;
+	expected = prepared;
+	expected.flags = 0;
+	own = cluster_bufmgr_pcm_own_finish_s_source(buf, &prepared, &finished);
+	if (own == CLUSTER_PCM_OWN_BUSY
+		&& cluster_bufmgr_pcm_own_snapshot_by_tag(&prepared.tag, &live_id, &live) == CLUSTER_PCM_OWN_OK
+		&& live_id == id && live.buffer_type == prepared.buffer_type
+		&& ((cluster_pcm_own_fence_equal_exact(&live, &prepared)
+			 && (live.semantic_buf_state & (BM_VALID | BM_DIRTY | BM_IO_ERROR)) == BM_VALID)
+			|| (cluster_pcm_own_fence_equal_exact(&live, &expected)
+				&& (live.semantic_buf_state & (BM_VALID | BM_IO_IN_PROGRESS | BM_IO_ERROR))
+					== (BM_VALID | BM_IO_IN_PROGRESS))))
+		return RESOURCE_X_APPLY_BAD_STATE;
+	expected.semantic_buf_state |= finished.semantic_buf_state & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED);
+	if (own != CLUSTER_PCM_OWN_OK || !cluster_pcm_own_snapshot_equal_exact(&finished, &expected))
+		goto fail_closed;
+	result = cluster_pcm_lock_resource_x_acquire_s_source_publish_exact(block, master, id, &prepared, &finished);
+	if (result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE) return result;
+fail_closed:
+	gcs_block_resource_x_fail_closed_current();
+	return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+}
+
 /* Resume only an already-retained complete-A S source. The immutable pair
  * precedes native S->N; neither a transport callback nor a stale caller's
  * image can supply this proof. No pin/owner handle moves into this branch. */
@@ -11276,6 +11321,8 @@ gcs_block_resource_x_acquire_s_source_finish_owned(
 	int live_id = -1;
 	XLogRecPtr page_lsn;
 
+	if (block->common.target_mode == PCM_STATE_S)
+		return gcs_block_resource_x_acquire_s_read_finish_owned(block, master, r4_generation, buf, caller_prepared);
 	if (buf == NULL || r4_generation == 0 || r4_generation == UINT64_MAX
 		|| cluster_pcm_x_revoke_finish_mode(&block->common.logical_assertion.resource, 0)
 			!= CLUSTER_PCM_X_REVOKE_FINISH_RETAIN
@@ -14456,7 +14503,8 @@ gcs_block_resource_x_acquire_s_source_capture_owned(const ResourceXSourceDrainWo
 	BufferDesc *buf;
 
 	if (work == NULL || block == NULL || admission == NULL || gate == NULL
-		|| !block->has_acquire_decision || block->common.target_mode != PCM_STATE_X
+		|| !block->has_acquire_decision
+		|| (block->common.target_mode != PCM_STATE_S && block->common.target_mode != PCM_STATE_X)
 		|| block->common.observed_mode != PCM_STATE_S || (work->attempt_generation & 1) == 0
 		|| work->master_node != block->body.acquire_decision.master_node
 		|| block->body.acquire_decision.source_node != cluster_node_id
@@ -14580,7 +14628,7 @@ cluster_gcs_block_resource_x_source_drain_tick(const ResourceXSourceDrainWork *w
 				ClusterWaitPcmAdmission observation;
 				gcs_block_pcm_service_admission(&observation, &admission, &gate,
 					CLWAIT_PCM_SERVICE_DRAIN, master, session, connection);
-				if (work->request.target_mode == PCM_STATE_X) {
+				if (work->request.target_mode == PCM_STATE_S || work->request.target_mode == PCM_STATE_X) {
 					ClusterPcmOwnSnapshot prepared;
 					ResourceXDecodedFrame image;
 					ResourceXAcquireSSourceState pair_state;
@@ -14631,7 +14679,7 @@ cluster_gcs_block_resource_x_source_drain_tick(const ResourceXSourceDrainWork *w
 	{
 		ResourceXApplyResult completed_result = result;
 
-		if (work->request.target_mode == PCM_STATE_X && !attempt_returned)
+		if ((work->request.target_mode == PCM_STATE_S || work->request.target_mode == PCM_STATE_X) && !attempt_returned)
 			completed_result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 		cluster_semantic_activation_leave(&admission);
 		(void)cluster_pcm_lock_resource_x_source_drain_complete_exact(work, completed_result);
@@ -14951,7 +14999,7 @@ gcs_block_resource_x_type17_ingress(const ClusterICEnvelope *env,
 					CLWAIT_PCM_SERVICE_INGRESS, master_node, master_session,
 					authenticated_connection_generation);
 				if (frame->has_acquire_decision && frame->common.observed_mode == PCM_STATE_S
-					&& frame->common.target_mode == PCM_STATE_X)
+					&& (frame->common.target_mode == PCM_STATE_S || frame->common.target_mode == PCM_STATE_X))
 					result = cluster_pcm_lock_resource_x_acquire_s_source_forward_exact(frame,
 						master_node, admission.record_generation, authenticated_connection_generation);
 				else

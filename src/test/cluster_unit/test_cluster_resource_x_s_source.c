@@ -130,9 +130,9 @@ UT_TEST(test_s_source_bad_native_shape_is_refused_before_capacity_changes)
 	}
 }
 
-UT_TEST(test_s_source_does_not_relabel_compatible_s_or_x_downgrade)
+UT_TEST(test_s_source_does_not_relabel_x_downgrade)
 {
-	for (int scenario = 1; scenario <= 2; scenario++) {
+	for (int scenario = 1; scenario <= 1; scenario++) {
 		SSourceFixture f; if (!ss_start(&f)) return;
 		if (!publish_start(scenario, PCM_STATE_S, &f.master)) return;
 		publish_apply(&f.master);
@@ -963,15 +963,139 @@ UT_TEST(test_s_source_forward_capture_bad_native_or_descriptor_preserves_origina
 	}
 }
 
+/* Full-A/native inputs are explicit seams; actual original record, claim,
+ * codec, pair and independent send owners run for this compatible mode. */
+static bool
+ss_compatible_start(SSourceFixture *f)
+{
+	if (!ss_start(f) || !publish_start(2, PCM_STATE_S, &f->master)) return false;
+	publish_apply(&f->master);
+	f->block = publish_decode(f->master.state->block_intents[0].payload, true);
+	f->finished = f->prepared; f->finished.flags = 0;
+	return true;
+}
+
+UT_TEST(test_compatible_s_source_keeps_s_generation_and_seals_real_pair)
+{
+	SSourceFixture f; ResourceXSourceDrainWork work; ResourceXDecodedFrame ack, image;
+	if (!ss_compatible_start(&f)) return;
+	UT_ASSERT_EQ(ss_forward(&f), RESOURCE_X_APPLY_APPLIED); UT_ASSERT(ss_service_probe(&work));
+	UT_ASSERT_EQ(work.request.target_mode, PCM_STATE_S);
+	UT_ASSERT_EQ(ss_capture(&f, &work), RESOURCE_X_APPLY_APPLIED);
+	ack = ss_read(&f, false); image = ss_read(&f, true);
+	UT_ASSERT_EQ(ack.body.acquire_witness.original_ack.target_mode, PCM_STATE_S);
+	UT_ASSERT_EQ(ack.body.acquire_witness.original_ack.flags, 0);
+	UT_ASSERT_EQ(ack.body.acquire_witness.original_proof.source_carrier_generation, f.prepared.generation);
+	UT_ASSERT_EQ(image.body.acquire_image.original_image.source_carrier_generation, f.prepared.generation);
+	UT_ASSERT(memcmp(image.body.acquire_image.original_image.page_bytes, f.page.data, BLCKSZ) == 0);
+	UT_ASSERT_EQ(ss_publish(&f), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(f.master.state->holder_status_intent.slot.state, RESOURCE_X_INTENT_SLOT_ARMED);
+	UT_ASSERT_EQ(f.master.state->holder_image_intent.state, RESOURCE_X_INTENT_SLOT_ARMED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(&work, RESOURCE_X_APPLY_APPLIED), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(f.master.state->holder_acquire_s_native.generation, f.prepared.generation);
+	UT_ASSERT_EQ(f.master.state->holder_acquire_s_native.pcm_state, PCM_STATE_S);
+}
+
+UT_TEST(test_compatible_s_source_rejects_wrong_native_completion_without_mutation)
+{
+	for (int n = 0; n < 7; n++) {
+		SSourceFixture f; if (!ss_compatible_start(&f)) return;
+		UT_ASSERT_EQ(ss_prepare(&f), RESOURCE_X_APPLY_APPLIED);
+		if (n == 0) f.finished = f.prepared;
+		else if (n == 1) f.finished.generation++;
+		else if (n == 2) f.finished.reservation_token++;
+		else if (n == 3) f.finished.pcm_state = PCM_STATE_N;
+		else if (n == 4) f.finished.buffer_type = BUF_TYPE_PI;
+		else if (n == 5) f.finished.semantic_buf_state |= BM_IO_ERROR;
+		else f.finished.writer_activation_token = 1;
+		ss_unchanged(&f, true, RESOURCE_X_APPLY_STALE);
+	}
+}
+
+UT_TEST(test_compatible_s_source_exact_replay_never_rearms_or_demotes)
+{
+	SSourceFixture f; if (!ss_compatible_start(&f)) return;
+	UT_ASSERT_EQ(ss_prepare(&f), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(ss_publish(&f), RESOURCE_X_APPLY_APPLIED);
+	ss_unchanged(&f, false, RESOURCE_X_APPLY_DUPLICATE);
+	ss_unchanged(&f, true, RESOURCE_X_APPLY_DUPLICATE);
+	UT_ASSERT_EQ(f.master.state->requests[1].final_authority_generation, 0);
+}
+
+UT_TEST(test_compatible_s_source_busy_preserves_same_forward_until_real_event)
+{
+	SSourceFixture f; ResourceXSourceDrainWork work, next; ResourceXDecodedFrame block;
+	if (!ss_compatible_start(&f)) return;
+	UT_ASSERT_EQ(ss_forward(&f), RESOURCE_X_APPLY_APPLIED); UT_ASSERT(ss_service_probe(&work));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(&work, RESOURCE_X_APPLY_BAD_STATE), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(!ss_service_probe(&next)); cluster_pcm_lock_resource_x_source_drain_content_released();
+	UT_ASSERT(ss_service_probe(&next)); UT_ASSERT(next.attempt_generation > work.attempt_generation);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_s_source_drain_snapshot_exact(&next, &block), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(memcmp(&block, &f.block, sizeof(block)) == 0);
+	UT_ASSERT_EQ(ss_capture(&f, &work), RESOURCE_X_APPLY_STALE);
+	UT_ASSERT_EQ(ss_capture(&f, &next), RESOURCE_X_APPLY_APPLIED);
+}
+
+UT_TEST(test_compatible_s_source_bad_native_shape_and_holder_capacity_stay_closed)
+{
+	SSourceFixture f; if (!ss_compatible_start(&f)) return;
+	f.prepared.semantic_buf_state |= BM_IO_ERROR; ss_unchanged(&f, false, RESOURCE_X_APPLY_INVALID);
+	if (!ss_compatible_start(&f)) return;
+	f.master.state->holder_image.valid = 1; ss_unchanged(&f, false, RESOURCE_X_APPLY_BAD_STATE);
+}
+
+UT_TEST(test_compatible_s_source_reconfiguration_retains_original_pair_and_work)
+{
+	SSourceFixture f; ResourceXSourceDrainWork work; ResourceXReconfigToken token;
+	ResourceXReconfigBatch batch; ResourceXReconfigResult result = RESOURCE_X_RECONFIG_MORE;
+	if (!ss_compatible_start(&f)) return;
+	UT_ASSERT_EQ(ss_service_prepare(&f, 77), RESOURCE_X_APPLY_APPLIED); UT_ASSERT(ss_service_probe(&work));
+	UT_ASSERT(cluster_resource_x_reconfig_freeze(17, 18, &token));
+	for (int n = 0; n < 8 && (result == RESOURCE_X_RECONFIG_MORE || result == RESOURCE_X_RECONFIG_RETRY); n++)
+		result = cluster_resource_x_reconfig_sweep(&token, 4, &batch);
+	UT_ASSERT_EQ(result, RESOURCE_X_RECONFIG_ORPHAN);
+	UT_ASSERT_EQ(f.master.state->holder_status.valid, RESOURCE_X_HOLDER_PAIR_PENDING);
+	UT_ASSERT(cluster_pcm_own_snapshot_equal_exact(&f.master.state->holder_acquire_s_native, &f.prepared));
+}
+
+UT_TEST(test_compatible_s_component_crc_does_not_enable_standalone_v2_s)
+{
+	SSourceFixture f; ResourceXDecodedFrame full, legacy = {0}; ResourceXWireReject reject;
+	uint8 bytes[RESOURCE_X_IMAGE_V2_BYTES]; uint16 len = 0; uint32 crc = 0;
+	if (!ss_compatible_start(&f)) return;
+	UT_ASSERT_EQ(ss_prepare(&f), RESOURCE_X_APPLY_APPLIED); full = ss_read(&f, true);
+	UT_ASSERT(cluster_resource_x_wire_acquire_image_crc(&full.body.acquire_image, &crc, &reject));
+	UT_ASSERT_EQ(crc, full.body.acquire_image.original_common.semantic_crc32c);
+	legacy.kind = RESOURCE_X_WIRE_IMAGE_ENVELOPE;
+	legacy.common = full.body.acquire_image.original_common;
+	legacy.body.image_envelope = full.body.acquire_image.original_image;
+	UT_ASSERT(!cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, &legacy,
+		bytes, sizeof(bytes), &len, &reject));
+	full.body.acquire_image.original_common.target_mode = PCM_STATE_N; crc = 123;
+	UT_ASSERT(!cluster_resource_x_wire_acquire_image_crc(&full.body.acquire_image, &crc, &reject));
+	UT_ASSERT_EQ(crc, 0);
+}
+
+UT_TEST(test_compatible_s_completion_preserves_later_hints_but_not_io_error)
+{
+	SSourceFixture f; if (!ss_compatible_start(&f)) return;
+	UT_ASSERT_EQ(ss_prepare(&f), RESOURCE_X_APPLY_APPLIED);
+	f.finished.semantic_buf_state |= BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED;
+	UT_ASSERT_EQ(ss_publish(&f), RESOURCE_X_APPLY_APPLIED);
+	ss_unchanged(&f, true, RESOURCE_X_APPLY_DUPLICATE);
+	f.finished.semantic_buf_state |= BM_IO_ERROR;
+	ss_unchanged(&f, true, RESOURCE_X_APPLY_STALE);
+}
+
 int
 main(void)
 {
-	UT_PLAN(55);
+	UT_PLAN(63);
 	UT_RUN(test_s_source_reserves_complete_pair_before_native_finish);
 	UT_RUN(test_s_source_exact_prepare_duplicate_is_not_a_second_native_commit);
 	UT_RUN(test_s_source_changed_token_descriptor_or_page_cannot_replace_pending);
 	UT_RUN(test_s_source_bad_native_shape_is_refused_before_capacity_changes);
-	UT_RUN(test_s_source_does_not_relabel_compatible_s_or_x_downgrade);
+	UT_RUN(test_s_source_does_not_relabel_x_downgrade);
 	UT_RUN(test_s_source_full_a_and_native_tag_are_bound);
 	UT_RUN(test_s_source_crc_and_original_master_authentication_are_not_optional);
 	UT_RUN(test_s_source_full_original_holder_capacity_refusal_preserves_it);
@@ -1022,5 +1146,13 @@ main(void)
 	UT_RUN(test_s_source_forward_corruption_is_not_a_pair_or_claim);
 	UT_RUN(test_s_source_forward_remote_master_r8_keeps_full_frame_orphan);
 	UT_RUN(test_s_source_forward_capture_bad_native_or_descriptor_preserves_original);
+	UT_RUN(test_compatible_s_source_keeps_s_generation_and_seals_real_pair);
+	UT_RUN(test_compatible_s_source_rejects_wrong_native_completion_without_mutation);
+	UT_RUN(test_compatible_s_source_exact_replay_never_rearms_or_demotes);
+	UT_RUN(test_compatible_s_source_busy_preserves_same_forward_until_real_event);
+	UT_RUN(test_compatible_s_source_bad_native_shape_and_holder_capacity_stay_closed);
+	UT_RUN(test_compatible_s_source_reconfiguration_retains_original_pair_and_work);
+	UT_RUN(test_compatible_s_component_crc_does_not_enable_standalone_v2_s);
+	UT_RUN(test_compatible_s_completion_preserves_later_hints_but_not_io_error);
 	UT_DONE(); return ut_failed_count == 0 ? 0 : 1;
 }

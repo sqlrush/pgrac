@@ -961,6 +961,10 @@ extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_prepare_s_source_image(
 	ClusterPcmOwnSnapshot *out_revoking, char block_data[BLCKSZ], XLogRecPtr *out_page_lsn,
 	uint64 *out_page_scn, ClusterPcmOwnSourcePrepareRefusal *out_refusal,
 	ClusterPageWalBindingV1 *out_wal);
+/* Complete only the temporary capture fence; retain current/S identity. */
+extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_finish_s_source(BufferDesc *buf,
+	const ClusterPcmOwnSnapshot *expected_revoking, ClusterPcmOwnSnapshot *out_s);
+
 extern ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_abort_s_revoke(BufferDesc *buf,
 									  const ClusterPcmOwnSnapshot *expected_revoking);

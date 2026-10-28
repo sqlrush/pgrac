@@ -717,7 +717,7 @@ ResourceXApplyResult
 cluster_pcm_lock_resource_x_acquire_s_source_drain_snapshot_exact(
 	const ResourceXSourceDrainWork *work, ResourceXDecodedFrame *block)
 {
-	UT_ASSERT_EQ(work->request.target_mode, PCM_STATE_X);
+	UT_ASSERT(work->request.target_mode == PCM_STATE_S || work->request.target_mode == PCM_STATE_X);
 	UT_ASSERT_EQ(work->attempt_generation & 1, 1);
 	acquire_drain_snapshots++;
 	if (acquire_drain_throw_stage == 1) siglongjmp(*PG_exception_stack, 1);
@@ -2895,10 +2895,40 @@ UT_TEST(test_actual_s_source_lms_capture_error_returns_exact_claim_once)
 	UT_ASSERT(memcmp(&acquire_drain_completed, &work, sizeof(work)) == 0);
 }
 
+UT_TEST(test_actual_compatible_s_ingress_reserves_original_forward_not_legacy_revoke)
+{
+	ClusterICEnvelope env = {.source_node_id = 1}; ResourceXSourceDrainWork work = acquire_drain_fixture();
+	(void)work; acquire_drain_block.common.target_mode = PCM_STATE_S;
+	acquire_drain_block.common.source_candidate = acquire_drain_block.common.retain_pi_if_dirty = 1;
+	UT_ASSERT_EQ(gcs_block_resource_x_type17_ingress(&env, &acquire_drain_block, 61), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(acquire_forward_reserves, 1); UT_ASSERT_EQ(source_observations + acquire_drain_finishes, 0);
+}
+
+UT_TEST(test_actual_compatible_s_lms_captures_same_claim_then_finishes_same_pair)
+{
+	ResourceXSourceDrainWork work = acquire_drain_fixture(); work.request.target_mode = PCM_STATE_S;
+	acquire_drain_block.common = work.request; acquire_drain_forward_phase = true;
+	UT_ASSERT_EQ(cluster_gcs_block_resource_x_source_drain_tick(&work), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(acquire_forward_captures, 1); UT_ASSERT_EQ(acquire_drain_pairs, 2);
+	UT_ASSERT_EQ(acquire_drain_finishes, 1); UT_ASSERT_EQ(source_observations, 0);
+	UT_ASSERT(memcmp(&acquire_drain_completed, &work, sizeof(work)) == 0);
+}
+
+UT_TEST(test_actual_compatible_s_lms_busy_keeps_claim_and_never_falls_back)
+{
+	ResourceXSourceDrainWork work = acquire_drain_fixture(); work.request.target_mode = PCM_STATE_S;
+	acquire_drain_block.common = work.request; acquire_drain_forward_phase = true;
+	acquire_forward_result = RESOURCE_X_APPLY_BAD_STATE;
+	UT_ASSERT_EQ(cluster_gcs_block_resource_x_source_drain_tick(&work), RESOURCE_X_APPLY_BAD_STATE);
+	UT_ASSERT_EQ(acquire_forward_captures, 1); UT_ASSERT_EQ(acquire_drain_finishes + source_observations, 0);
+	UT_ASSERT_EQ(acquire_drain_complete_result, RESOURCE_X_APPLY_BAD_STATE);
+	UT_ASSERT(memcmp(&acquire_drain_completed, &work, sizeof(work)) == 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(41);
+	UT_PLAN(44);
 	UT_RUN(test_actual_terminal_ingress_keeps_master_and_physical_source_distinct);
 	UT_RUN(test_actual_kind9_ingress_does_not_send_ack_for_fused_admission);
 	UT_RUN(test_actual_fused_admission_notifies_ready_resource_without_registry_tick);
@@ -2940,6 +2970,9 @@ main(void)
 	UT_RUN(test_actual_s_source_lms_captures_forward_then_reads_real_pair);
 	UT_RUN(test_actual_s_source_lms_capture_busy_keeps_original_work_without_finish);
 	UT_RUN(test_actual_s_source_lms_capture_error_returns_exact_claim_once);
+	UT_RUN(test_actual_compatible_s_ingress_reserves_original_forward_not_legacy_revoke);
+	UT_RUN(test_actual_compatible_s_lms_captures_same_claim_then_finishes_same_pair);
+	UT_RUN(test_actual_compatible_s_lms_busy_keeps_claim_and_never_falls_back);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
