@@ -9,6 +9,10 @@
  * IDENTIFICATION
  *		src/backend/commands/subscriptioncmds.c
  *
+ * PGRAC MODIFICATIONS
+ *    Preflight native subscription ownership before catalog locks.
+ *    Author: SqlRush <sqlrush@gmail.com>
+ *
  *-------------------------------------------------------------------------
  */
 
@@ -28,6 +32,11 @@
 #include "catalog/pg_subscription.h"
 #include "catalog/pg_subscription_rel.h"
 #include "catalog/pg_type.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_mode.h"
+#include "cluster/cluster_tt_local.h"
+#endif
 #include "commands/dbcommands.h"
 #include "commands/defrem.h"
 #include "commands/event_trigger.h"
@@ -1882,6 +1891,30 @@ AlterSubscriptionOwner(const char *name, Oid newOwnerId)
 	Relation	rel;
 	ObjectAddress address;
 	Form_pg_subscription form;
+
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_catalog && cluster_storage_mode_enabled()) {
+		ClusterCanonicalTxnBinding binding;
+		TransactionId current_xid;
+
+		PreventCommandIfReadOnly("ALTER SUBSCRIPTION");
+		PreventCommandIfParallelMode("ALTER SUBSCRIPTION");
+		PreventCommandDuringRecovery("ALTER SUBSCRIPTION");
+		if (IsSubTransaction())
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("shared catalog alteration does not support subtransactions")));
+		current_xid = GetCurrentTransactionIdIfAny();
+		if (TransactionIdIsValid(current_xid)
+			&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("shared catalog top-level transaction identity mismatch")));
+		if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+			ereport(
+				ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("canonical ACTIVE publication failed before shared catalog alteration")));
+	}
+#endif
 
 	rel = table_open(SubscriptionRelationId, RowExclusiveLock);
 
