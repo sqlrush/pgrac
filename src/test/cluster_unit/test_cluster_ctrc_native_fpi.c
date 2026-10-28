@@ -95,6 +95,7 @@ static unsigned native_fpi_allocs, native_fpi_frees;
 static void *native_fpi_allocation;
 static bool native_fpi_alloc_error;
 static bool native_fpi_complete_writer;
+static bool native_fpi_unretained_writer;
 static bool native_install_setup;
 static bool native_step_active;
 static bool native_step_foreign_blocker;
@@ -226,6 +227,10 @@ native_fpi_fixture(CtrcReadNativeFixture *f, unsigned itls, bool checksums)
 		/* Installation needs a representable local WAL writer, separately
 		 * from the selected failed replay origins (including thread 128). */
 		if (native_install_setup) ctrc_inputs_owner.writer.ref = tx_inputs_typed.sources[1];
+		if (native_fpi_unretained_writer) {
+			ctrc_inputs_owner.writer.ref.claim.identity.origin_node_id = 1;
+			ctrc_inputs_owner.writer.ref.claim.identity.origin_thread_id = 2;
+		}
 		ctrc_inputs_owner.owner_boot = ctrc_inputs_owner.writer.ref.claim.identity.origin_owner_incarnation;
 		ctrc_inputs_owner.writer.startup_first_lsn = 0x100;
 	}
@@ -455,6 +460,7 @@ bool native_install_original_writer_installed(ClusterWalWriterToken *writer,
 #include "test_cluster_ctrc_native_graph_step.inc"
 #include "test_cluster_ctrc_native_page_fd.inc"
 #include "test_cluster_ctrc_native_durable.inc"
+#include "test_cluster_ctrc_native_writer_retention.inc"
 
 int
 main(int argc, char **argv)
@@ -463,6 +469,11 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_NATIVE_WRITER_RETENTION") != NULL) {
+		UT_PLAN(1);
+		UT_RUN(test_native_fpi_refuses_writer_outside_original_retention);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_NATIVE_FPI_DURABLE") != NULL) {
 		UT_PLAN(8);
 		UT_RUN(test_native_durable_marks_under_original_page_and_fd);
@@ -493,7 +504,8 @@ main(int argc, char **argv)
 		UT_RUN(test_native_step_fixed_fd_close_failure_cannot_claim_target_synced);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(60);
+	UT_PLAN(61);
+	UT_RUN(test_native_fpi_refuses_writer_outside_original_retention);
 	UT_RUN(test_native_durable_marks_under_original_page_and_fd);
 	UT_RUN(test_native_durable_snapshot_is_exact_and_read_only);
 	UT_RUN(test_native_durable_transition_refusal_keeps_inserted_debt);

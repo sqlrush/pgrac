@@ -2963,6 +2963,38 @@ cluster_wal_inputs_ctrc_replays_source_covers_window_v1(
 		&& memcmp(source, &original, sizeof(original)) == 0;
 }
 
+bool
+cluster_wal_inputs_ctrc_writer_retained_v1(
+	const ClusterRecoveryCtrcReplaySetSourceV1 *source, const ClusterWalWriterToken *writer)
+{
+	ClusterRecoveryCtrcReplaySetSourceV1 original;
+	ClusterWalWriterToken fixed;
+	uint16 thread;
+
+	if (source == NULL || writer == NULL || CritSectionCount != 0 || ShutdownRequestPending)
+		return false;
+	memcpy(&original, source, sizeof(original));
+	memcpy(&fixed, writer, sizeof(fixed));
+	if (!cluster_wal_claim_v2_ref_valid(&fixed.ref.claim) || fixed.epoch == 0
+		|| fixed.ref.timeline == 0 || fixed.startup_first_lsn == InvalidXLogRecPtr
+		|| !inputs_ctrc_replays_locator_current(&original)
+		|| cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock)
+		|| !cluster_wal_inputs_ctrc_replays_source_current_v1(&original)
+		|| !inputs_ctrc_replays_locator_current(&original))
+		return false;
+	/* Only after locating the original incarnation may its captured owner be
+	 * read. The original source/holder callback may have retired the scope. */
+	if (memcmp(&fixed, &original.scope->ctrc.owner.writer, sizeof(fixed)) != 0)
+		return false;
+	thread = fixed.ref.claim.identity.origin_thread_id;
+	return cluster_wal_read_pin_covers_v1(original.input_owner.pin, thread)
+		&& cluster_wal_inputs_ctrc_replays_source_current_v1(&original)
+		&& inputs_ctrc_replays_locator_current(&original)
+		&& cluster_wal_read_pin_covers_v1(original.input_owner.pin, thread)
+		&& memcmp(source, &original, sizeof(original)) == 0
+		&& memcmp(writer, &fixed, sizeof(fixed)) == 0;
+}
+
 /* The fixed relmap participant borrows the ORIGINAL episode owner, without
  * retyping a CTRC/PAGE source value or issuing another native IR request. */
 static bool
