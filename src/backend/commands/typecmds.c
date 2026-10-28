@@ -7,6 +7,10 @@
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
+ * PGRAC MODIFICATIONS
+ * Portions Copyright (c) 2026, pgrac contributors
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
  * IDENTIFICATION
  *	  src/backend/commands/typecmds.c
  *
@@ -52,6 +56,9 @@
 #include "catalog/pg_proc.h"
 #include "catalog/pg_range.h"
 #include "catalog/pg_type.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h"
+#endif
 #include "commands/defrem.h"
 #include "commands/tablecmds.h"
 #include "commands/typecmds.h"
@@ -139,6 +146,17 @@ static void AlterTypeRecurse(Oid typeOid, bool isImplicitArray,
 							 HeapTuple tup, Relation catalog,
 							 AlterTypeRecurseParams *atparams);
 
+
+#ifdef USE_PGRAC_CLUSTER
+static void
+CheckClusterSharedTypeSupport(void)
+{
+	if (cluster_shared_config || cluster_shared_catalog)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("custom types is not supported in shared mode"),
+						errdetail("PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED")));
+}
+#endif
 
 /*
  * DefineType
@@ -3678,6 +3696,9 @@ AlterTypeOwner(List *names, Oid newOwnerId, ObjectType objecttype)
 	AclResult	aclresult;
 	ObjectAddress address;
 
+#ifdef USE_PGRAC_CLUSTER
+	CheckClusterSharedTypeSupport();
+#endif
 	rel = table_open(TypeRelationId, RowExclusiveLock);
 
 	/* Make a TypeName so we can use standard type lookup machinery */
@@ -3882,6 +3903,9 @@ AlterTypeNamespace(List *names, const char *newschema, ObjectType objecttype,
 	ObjectAddresses *objsMoved;
 	ObjectAddress myself;
 
+#ifdef USE_PGRAC_CLUSTER
+	CheckClusterSharedTypeSupport();
+#endif
 	/* Make a TypeName so we can use standard type lookup machinery */
 	typename = makeTypeNameFromNameList(names);
 	typeOid = typenameTypeId(NULL, typename);

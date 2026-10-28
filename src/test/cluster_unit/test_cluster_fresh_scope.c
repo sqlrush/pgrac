@@ -59,6 +59,7 @@
 #include "catalog/pg_ts_template.h"
 #include "catalog/pg_sequence.h"
 #include "catalog/pg_authid.h"
+#include "catalog/pg_type.h"
 #include "catalog/pg_type_d.h"
 #include "catalog/pg_user_mapping.h"
 #include "commands/alter.h"
@@ -78,6 +79,7 @@
 #include "commands/subscriptioncmds.h"
 #include "commands/tablespace.h"
 #include "commands/trigger.h"
+#include "commands/typecmds.h"
 #include "commands/user.h"
 #include "commands/view.h"
 #include "cluster/cluster_ic.h"
@@ -357,6 +359,10 @@ cluster_tt_local_prepare_canonical_active(TransactionId xid, ClusterCanonicalTxn
 static bool tablespace_options_lookup_active, tablespace_options_expect_binding;
 static unsigned tablespace_options_lookups, tablespace_options_unbound;
 static unsigned tablespace_options_bad_lookup;
+
+static bool type_scope_lookup_active;
+static unsigned type_scope_route, type_scope_lookups, type_scope_lookup_kind, type_scope_bad_lookup;
+static List *type_scope_expected_names;
 
 static bool table_namespace_lookup_active, table_namespace_expect_binding;
 static unsigned table_namespace_lookups, table_namespace_unbound, table_namespace_bad_lookup;
@@ -6522,6 +6528,13 @@ static unsigned role_rename_lookups, role_rename_unbound, role_rename_bad_lookup
 Relation
 table_open(Oid relationId, LOCKMODE lockmode)
 {
+	if (type_scope_lookup_active) {
+		type_scope_lookups++;
+		type_scope_lookup_kind = 1;
+		if (type_scope_route != 1 || relationId != TypeRelationId || lockmode != RowExclusiveLock)
+			type_scope_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before the real type catalog lock/query. */
+	}
 	if (tablespace_options_lookup_active) {
 		tablespace_options_lookups++;
 		if (tablespace_options_expect_binding && utility_binds == 0)
@@ -18168,6 +18181,13 @@ UT_TEST(test_native_relation_rename_scope_refusal_precedes_context_and_binding)
 TypeName *
 makeTypeNameFromNameList(List *names)
 {
+	if (type_scope_lookup_active) {
+		type_scope_lookups++;
+		type_scope_lookup_kind = 2;
+		if (type_scope_route != 2 || names != type_scope_expected_names)
+			type_scope_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before TypeName allocation and the type query. */
+	}
 	if (!constraint_rename_lookup_active)
 		siglongjmp(boundary, 3);
 	constraint_rename_name_builds++;
@@ -18684,10 +18704,192 @@ UT_TEST(test_native_table_namespace_scope_refusal_precedes_context_and_binding)
 }
 
 
+/* The actual TYPE/DOMAIN owner and namespace prefixes stop before their
+ * first catalog lock or type-name allocation. No native success is substituted. */
+#include "test_cluster_fresh_type_scope.inc"
+static String type_scope_parts[2];
+static ListCell type_scope_cells[2];
+static List type_scope_names;
+static AlterOwnerStmt native_type_scope_owner;
+static AlterObjectSchemaStmt native_type_scope_namespace;
+static RoleSpec type_scope_newowner;
+static RangeVar type_scope_warm_relation;
+static AlterObjectSchemaStmt type_scope_warm_statement;
+static Oid type_scope_old_schema;
+static bool type_scope_wants_old_schema;
+
+static void
+reset_native_type_scope(unsigned form)
+{
+	ObjectType objecttype = form % 4 < 2 ? OBJECT_TYPE : OBJECT_DOMAIN;
+	unsigned count = form % 2 ? 2 : 1;
+
+	reset_create_preflight();
+	error_detail[0] = '\0';
+	type_scope_lookup_active = true;
+	type_scope_route = form < 4 ? 1 : 2;
+	type_scope_lookups = type_scope_lookup_kind = type_scope_bad_lookup = 0;
+	type_scope_old_schema = 987;
+	type_scope_wants_old_schema = form >= 8;
+	type_scope_parts[0]
+		= (String){ .type = T_String,
+					.sval = count == 1 ? "native_type_object" : "native_type_schema" };
+	type_scope_parts[1] = (String){ .type = T_String, .sval = "qualified_type_object" };
+	for (unsigned i = 0; i < 2; i++)
+		type_scope_cells[i] = (ListCell){ .ptr_value = &type_scope_parts[i] };
+	type_scope_names
+		= (List){ .type = T_List, .length = count, .max_length = 2, .elements = type_scope_cells };
+	type_scope_expected_names = &type_scope_names;
+	type_scope_newowner = (RoleSpec){ .type = T_RoleSpec,
+									  .roletype = ROLESPEC_CSTRING,
+									  .rolename = "native_type_new_owner",
+									  .location = -1 };
+	native_type_scope_owner = (AlterOwnerStmt){ .type = T_AlterOwnerStmt,
+												.objectType = objecttype,
+												.object = (Node *)&type_scope_names,
+												.newowner = &type_scope_newowner };
+	native_type_scope_namespace = (AlterObjectSchemaStmt){ .type = T_AlterObjectSchemaStmt,
+														   .objectType = objecttype,
+														   .object = (Node *)&type_scope_names,
+														   .newschema = "native_type_destination",
+														   .missing_ok = false };
+	type_scope_warm_relation = (RangeVar){ .type = T_RangeVar, .relname = "supported_warm_table" };
+	type_scope_warm_statement = (AlterObjectSchemaStmt){ .type = T_AlterObjectSchemaStmt,
+														 .objectType = OBJECT_TABLE,
+														 .relation = &type_scope_warm_relation,
+														 .newschema = "supported_warm_destination",
+														 .missing_ok = false };
+}
+
+static void
+native_type_scope_entry(unsigned form)
+{
+	if (type_scope_route == 1)
+		(void)AlterTypeOwner(&type_scope_names, 901 + form / 2, native_type_scope_owner.objectType);
+	else
+		(void)AlterTypeNamespace(&type_scope_names, native_type_scope_namespace.newschema,
+								 native_type_scope_namespace.objectType,
+								 type_scope_wants_old_schema ? &type_scope_old_schema : NULL);
+}
+
+static void
+assert_native_type_scope_result(bool blocked, int caught)
+{
+	UT_ASSERT_EQ(caught, blocked ? 1 : 2);
+	UT_ASSERT_EQ(error_code, blocked ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+	if (blocked) {
+		UT_ASSERT_STR_EQ(error_message, "custom types is not supported in shared mode");
+		UT_ASSERT_STR_EQ(error_detail,
+						 "PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+	}
+	UT_ASSERT_EQ(type_scope_lookups, blocked ? 0 : 1);
+	UT_ASSERT_EQ(type_scope_lookup_kind, blocked ? 0 : type_scope_route);
+	UT_ASSERT_EQ(type_scope_bad_lookup, 0);
+	UT_ASSERT_EQ(type_scope_old_schema, 987);
+}
+
+UT_TEST(test_native_type_scope_matches_utility_before_catalog_or_name_processing)
+{
+	for (unsigned form = 0; form < 12; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool blocked = (mode & 5) != 0;
+			int caught;
+
+			reset_native_type_scope(form);
+			set_native_operator_mode(mode);
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				create_sql_entry(form < 4 ? (Node *)&native_type_scope_owner
+										  : (Node *)&native_type_scope_namespace);
+			UT_ASSERT_EQ(caught, blocked ? 1 : 0);
+			UT_ASSERT_EQ(error_code, blocked ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+			if (blocked) {
+				UT_ASSERT_STR_EQ(error_message, "custom types is not supported in shared mode");
+				UT_ASSERT_STR_EQ(error_detail,
+								 "PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+			}
+			UT_ASSERT_EQ(type_scope_lookups + utility_xids + utility_prepares + utility_binds, 0);
+			reset_error();
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_type_scope_entry(form);
+			assert_native_type_scope_result(blocked, caught);
+			UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			UT_ASSERT_EQ(utility_top_xid, InvalidTransactionId);
+		}
+	}
+	type_scope_lookup_active = false;
+}
+
+UT_TEST(test_native_type_scope_precedes_context_child_top_and_publication)
+{
+	for (unsigned form = 0; form < 12; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			for (unsigned fault = 0; fault < 7; fault++) {
+				int caught;
+
+				reset_native_type_scope(form);
+				set_native_operator_mode(mode);
+				XactReadOnly = fault == 0;
+				utility_parallel = fault == 1;
+				utility_recovery = fault == 2;
+				utility_in_child = fault == 3;
+				if (fault == 4 || fault == 5) {
+					utility_current_xid = 401;
+					utility_top_xid = fault == 4 ? 400 : InvalidTransactionId;
+				}
+				utility_bind_ok = fault != 6;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_type_scope_entry(form);
+				assert_native_type_scope_result((mode & 5) != 0, caught);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+				UT_ASSERT_EQ(utility_top_xid, fault == 4 ? 400 : InvalidTransactionId);
+				UT_ASSERT_EQ(utility_current_xid,
+							 fault == 4 || fault == 5 ? 401 : InvalidTransactionId);
+			}
+		}
+	}
+	type_scope_lookup_active = false;
+}
+
+UT_TEST(test_native_type_scope_preserves_existing_supported_top_binding)
+{
+	for (unsigned form = 0; form < 12; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			for (unsigned fault = 0; fault < 5; fault++) {
+				int caught;
+
+				reset_native_type_scope(form);
+				create_sql_entry((Node *)&type_scope_warm_statement);
+				UT_ASSERT_EQ(utility_xids, 1);
+				UT_ASSERT_EQ(utility_prepares, 1);
+				UT_ASSERT_EQ(utility_binds, 1);
+				set_native_operator_mode(mode);
+				XactReadOnly = fault == 0;
+				utility_parallel = fault == 1;
+				utility_recovery = fault == 2;
+				utility_in_child = fault == 3;
+				utility_bind_ok = fault != 4;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_type_scope_entry(form);
+				assert_native_type_scope_result((mode & 5) != 0, caught);
+				UT_ASSERT_EQ(utility_xids, 1);
+				UT_ASSERT_EQ(utility_prepares, 1);
+				UT_ASSERT_EQ(utility_binds, 1);
+				UT_ASSERT_EQ(utility_top_xid, 400);
+				UT_ASSERT_EQ(utility_current_xid, 400);
+			}
+		}
+	}
+	type_scope_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(300);
+	UT_PLAN(303);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -18990,6 +19192,9 @@ main(void)
 	UT_RUN(test_native_table_namespace_context_guards_keep_nonshared_route);
 	UT_RUN(test_native_table_namespace_utility_warm_guards_preserve_binding);
 	UT_RUN(test_native_table_namespace_scope_refusal_precedes_context_and_binding);
+	UT_RUN(test_native_type_scope_matches_utility_before_catalog_or_name_processing);
+	UT_RUN(test_native_type_scope_precedes_context_child_top_and_publication);
+	UT_RUN(test_native_type_scope_preserves_existing_supported_top_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
