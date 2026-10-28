@@ -62,6 +62,17 @@ static unsigned source_observations;
 static bool service_real_formation;
 static unsigned drain_completions, finish_observations;
 static ClusterWaitPcmAdmission finish_admission;
+/* Full-A drain routing keeps the native finish and original PCM record
+ * as explicit dependency seams; their implementations run in other units. */
+static ResourceXDecodedFrame acquire_drain_block, acquire_drain_image;
+static ClusterPcmOwnSnapshot acquire_drain_prepared;
+static ResourceXSourceDrainWork acquire_drain_completed;
+static ResourceXApplyResult acquire_drain_snapshot_result, acquire_drain_pair_result;
+static ResourceXApplyResult acquire_drain_native_result, acquire_drain_complete_result;
+static unsigned acquire_drain_snapshots, acquire_drain_pairs, acquire_drain_finishes;
+static int32 acquire_drain_buffer_id;
+static int acquire_drain_throw_stage;
+static ClusterWaitPcmAdmission acquire_drain_admission;
 static PGPROC recycle_proc;
 PGPROC *MyProc = &recycle_proc;
 static bool recycle_gap_after_arm, recycle_gap_after_context;
@@ -695,7 +706,59 @@ cluster_pcm_lock_resource_x_source_drain_complete_exact(
 	const ResourceXSourceDrainWork *work, ResourceXApplyResult result)
 {
 	UT_ASSERT_NOT_NULL(work); drain_completions++;
+	acquire_drain_completed = *work; acquire_drain_complete_result = result;
 	return result;
+}
+
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_acquire_s_source_drain_snapshot_exact(
+	const ResourceXSourceDrainWork *work, ResourceXDecodedFrame *block)
+{
+	UT_ASSERT_EQ(work->request.target_mode, PCM_STATE_X);
+	UT_ASSERT_EQ(work->attempt_generation & 1, 1);
+	acquire_drain_snapshots++;
+	if (acquire_drain_throw_stage == 1) siglongjmp(*PG_exception_stack, 1);
+	if (acquire_drain_snapshot_result == RESOURCE_X_APPLY_APPLIED)
+		*block = acquire_drain_block;
+	return acquire_drain_snapshot_result;
+}
+
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_acquire_s_source_snapshot_exact(
+	const ResourceXDecodedFrame *block, int32 node, int32 *buffer_id,
+	ClusterPcmOwnSnapshot *prepared, ResourceXDecodedFrame *image,
+	ResourceXAcquireSSourceState *pair_state)
+{
+	UT_ASSERT(memcmp(block, &acquire_drain_block, sizeof(*block)) == 0);
+	UT_ASSERT_EQ(node, 1); acquire_drain_pairs++;
+	if (acquire_drain_throw_stage == 2) siglongjmp(*PG_exception_stack, 1);
+	if (acquire_drain_pair_result == RESOURCE_X_APPLY_APPLIED) {
+		*buffer_id = acquire_drain_buffer_id; *prepared = acquire_drain_prepared;
+		*image = acquire_drain_image; *pair_state = RESOURCE_X_ACQUIRE_S_SOURCE_PENDING;
+	}
+	return acquire_drain_pair_result;
+}
+
+static ResourceXApplyResult
+gcs_block_resource_x_source_finish_owned_observed(
+	const ResourceXDecodedFrame *block, int32 node, uint64 r4, BufferDesc *buf,
+	ClusterPcmOwnSnapshot prepared, const ResourceXDecodedFrame *image,
+	ClusterPcmOwnHeldXRevoke held_x, ResourceXLocalOwnerHandle owner,
+	volatile bool held_x_active, bool owner_held, bool tagless, bool drop,
+	ResourceXApplyResult result, const ClusterWaitPcmAdmission *admission)
+{
+	ClusterPcmOwnHeldXRevoke empty_x = {0}; ResourceXLocalOwnerHandle empty_owner = {0};
+	UT_ASSERT(memcmp(block, &acquire_drain_block, sizeof(*block)) == 0);
+	UT_ASSERT(memcmp(image, &acquire_drain_image, sizeof(*image)) == 0);
+	UT_ASSERT(memcmp(&prepared, &acquire_drain_prepared, sizeof(prepared)) == 0);
+	UT_ASSERT(buf == GetBufferDescriptor(0)); UT_ASSERT_EQ(node, 1); UT_ASSERT_EQ(r4, 77);
+	UT_ASSERT(memcmp(&held_x, &empty_x, sizeof(held_x)) == 0);
+	UT_ASSERT(memcmp(&owner, &empty_owner, sizeof(owner)) == 0);
+	UT_ASSERT(!held_x_active && !owner_held && !tagless && !drop);
+	UT_ASSERT_EQ(result, RESOURCE_X_APPLY_APPLIED);
+	acquire_drain_admission = *admission; acquire_drain_finishes++;
+	if (acquire_drain_throw_stage == 3) siglongjmp(*PG_exception_stack, 1);
+	return acquire_drain_native_result;
 }
 
 bool cluster_content_trace_pair_active(Buffer target pg_attribute_unused()) { return false; }
@@ -1168,6 +1231,16 @@ reset_delivery_fixture(void)
 	drain_completions = finish_observations = 0;
 	memset(&finish_admission, 0, sizeof(finish_admission));
 	memset(&source_admission, 0, sizeof(source_admission));
+	acquire_drain_snapshots = acquire_drain_pairs = acquire_drain_finishes = 0;
+	acquire_drain_throw_stage = 0; acquire_drain_buffer_id = 0;
+	acquire_drain_snapshot_result = acquire_drain_pair_result = acquire_drain_native_result
+		= RESOURCE_X_APPLY_APPLIED;
+	acquire_drain_complete_result = RESOURCE_X_APPLY_INVALID;
+	memset(&acquire_drain_block, 0, sizeof(acquire_drain_block));
+	memset(&acquire_drain_image, 0, sizeof(acquire_drain_image));
+	memset(&acquire_drain_prepared, 0, sizeof(acquire_drain_prepared));
+	memset(&acquire_drain_completed, 0, sizeof(acquire_drain_completed));
+	memset(&acquire_drain_admission, 0, sizeof(acquire_drain_admission));
 	recycle_gap_after_arm = recycle_gap_after_context = false;
 	recycle_arms = recycle_cancels = recycle_finishes = 0;
 	recycle_cancel_result = RESOURCE_X_APPLY_APPLIED;
@@ -2610,10 +2683,129 @@ UT_TEST(test_actual_failed_round_observation_retries_only_exact_predecessor_shap
 	scenario = 0;
 }
 
+static ResourceXSourceDrainWork
+acquire_drain_fixture(void)
+{
+	ResourceXSourceDrainWork work = {0};
+	reset_delivery_fixture(); master = 1; service_real_formation = true;
+	work.request.logical_assertion = delivery_ref.assertion;
+	work.request.resource_formation = 17; work.request.master_session_incarnation = 31;
+	work.request.sender_connection_generation = 1;
+	work.request.observed_mode = PCM_STATE_S; work.request.target_mode = PCM_STATE_X;
+	work.master_node = 1; work.r4_record_generation = 77;
+	work.authenticated_connection_generation = 61; work.attempt_generation = 3;
+	acquire_drain_block.kind = RESOURCE_X_WIRE_BLOCK_TO_N;
+	acquire_drain_block.has_acquire_decision = true;
+	acquire_drain_block.common = work.request;
+	acquire_drain_image.kind = RESOURCE_X_WIRE_IMAGE_ENVELOPE;
+	acquire_drain_image.has_acquire_decision = true;
+	acquire_drain_prepared.tag = delivery_ref.assertion.resource;
+	acquire_drain_prepared.generation = 29;
+	acquire_drain_prepared.reservation_token = 103;
+	return work;
+}
+
+UT_TEST(test_actual_s_source_drain_restores_complete_a_then_native_finish)
+{
+	ResourceXSourceDrainWork work = acquire_drain_fixture();
+	UT_ASSERT_EQ(cluster_gcs_block_resource_x_source_drain_tick(&work), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(acquire_drain_snapshots, 1); UT_ASSERT_EQ(acquire_drain_pairs, 1);
+	UT_ASSERT_EQ(acquire_drain_finishes, 1); UT_ASSERT_EQ(source_observations, 0);
+	UT_ASSERT_EQ(acquire_drain_complete_result, RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(memcmp(&acquire_drain_completed, &work, sizeof(work)) == 0);
+	UT_ASSERT_EQ(drain_completions, 1); UT_ASSERT_EQ(leaves, 1);
+	UT_ASSERT_EQ(ready_tag_notifications, 1); UT_ASSERT(acquire_drain_admission.known);
+	UT_ASSERT_EQ(acquire_drain_admission.origin, CLWAIT_PCM_SERVICE_DRAIN);
+	UT_ASSERT_EQ(acquire_drain_admission.record_generation, 77);
+	UT_ASSERT_EQ(acquire_drain_admission.peer_capability_generation, 61);
+	UT_ASSERT_EQ(work.request.sender_connection_generation, 1);
+}
+
+UT_TEST(test_actual_s_source_drain_refuses_stale_pair_before_native)
+{
+	for (int leg = 0; leg < 2; leg++) {
+		ResourceXSourceDrainWork work = acquire_drain_fixture();
+		ResourceXApplyResult expected = leg == 0 ? RESOURCE_X_APPLY_STALE : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		if (leg == 0) acquire_drain_snapshot_result = RESOURCE_X_APPLY_STALE;
+		else acquire_drain_pair_result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		UT_ASSERT_EQ(cluster_gcs_block_resource_x_source_drain_tick(&work), expected);
+		UT_ASSERT_EQ(acquire_drain_snapshots, 1); UT_ASSERT_EQ(acquire_drain_pairs, leg);
+		UT_ASSERT_EQ(acquire_drain_finishes + source_observations, 0);
+		UT_ASSERT_EQ(acquire_drain_complete_result, expected); UT_ASSERT_EQ(drain_completions, 1);
+		UT_ASSERT_EQ(leaves, 1); UT_ASSERT_EQ(ready_tag_notifications, 0);
+	}
+}
+
+UT_TEST(test_actual_s_source_drain_rechecks_current_domain_before_claim_snapshot)
+{
+	for (int leg = 0; leg < 4; leg++) {
+		ResourceXSourceDrainWork work = acquire_drain_fixture();
+		ResourceXApplyResult expected = leg == 0 || leg == 3 ? RESOURCE_X_APPLY_BAD_STATE : RESOURCE_X_APPLY_STALE;
+		if (leg == 0) session_gap = true;
+		if (leg == 1) work.r4_record_generation++;
+		if (leg == 2) work.authenticated_connection_generation++;
+		if (leg == 3) peer_observation_gap = CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_CAPABILITY_NOT_READY;
+		UT_ASSERT_EQ(cluster_gcs_block_resource_x_source_drain_tick(&work), expected);
+		UT_ASSERT_EQ(acquire_drain_snapshots + acquire_drain_pairs + acquire_drain_finishes, 0);
+		UT_ASSERT_EQ(acquire_drain_complete_result, expected); UT_ASSERT_EQ(drain_completions, 1);
+		UT_ASSERT_EQ(leaves, 1); UT_ASSERT_EQ(ready_tag_notifications, 0);
+	}
+}
+
+UT_TEST(test_actual_s_source_drain_busy_returns_same_work_without_ingress_or_send)
+{
+	ResourceXSourceDrainWork work = acquire_drain_fixture();
+	ResourceXSourceDrainWork before = work;
+	acquire_drain_native_result = RESOURCE_X_APPLY_BAD_STATE;
+	UT_ASSERT_EQ(cluster_gcs_block_resource_x_source_drain_tick(&work), RESOURCE_X_APPLY_BAD_STATE);
+	UT_ASSERT_EQ(acquire_drain_finishes, 1);
+	UT_ASSERT(memcmp(&acquire_drain_completed, &before, sizeof(before)) == 0);
+	UT_ASSERT(memcmp(&work, &before, sizeof(work)) == 0);
+	UT_ASSERT_EQ(acquire_drain_complete_result, RESOURCE_X_APPLY_BAD_STATE);
+	UT_ASSERT_EQ(source_observations + authority_mutations + ready_tag_notifications, 0);
+	UT_ASSERT_EQ(drain_completions, 1); UT_ASSERT_EQ(leaves, 1);
+}
+
+UT_TEST(test_actual_s_source_drain_error_releases_admission_and_exact_attempt)
+{
+	for (volatile int stage = 1; stage <= 3; stage++) {
+		ResourceXSourceDrainWork work = acquire_drain_fixture();
+		volatile bool caught = false;
+		acquire_drain_throw_stage = stage;
+		PG_TRY();
+		{
+			(void)cluster_gcs_block_resource_x_source_drain_tick(&work);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(caught); UT_ASSERT_EQ(acquire_drain_finishes, stage == 3 ? 1 : 0);
+		UT_ASSERT_EQ(acquire_drain_complete_result, RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+		UT_ASSERT(memcmp(&acquire_drain_completed, &work, sizeof(work)) == 0);
+		UT_ASSERT_EQ(drain_completions, 1); UT_ASSERT_EQ(leaves, 1);
+		UT_ASSERT_EQ(ready_tag_notifications + source_observations, 0);
+	}
+}
+
+UT_TEST(test_actual_s_source_drain_checks_descriptor_bounds_before_native)
+{
+	for (int leg = 0; leg < 2; leg++) {
+		ResourceXSourceDrainWork work = acquire_drain_fixture();
+		acquire_drain_buffer_id = leg == 0 ? -1 : NBuffers;
+		UT_ASSERT_EQ(cluster_gcs_block_resource_x_source_drain_tick(&work), RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+		UT_ASSERT_EQ(acquire_drain_pairs, 1); UT_ASSERT_EQ(acquire_drain_finishes, 0);
+		UT_ASSERT_EQ(acquire_drain_complete_result, RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+		UT_ASSERT_EQ(drain_completions, 1); UT_ASSERT_EQ(leaves, 1);
+		UT_ASSERT_EQ(ready_tag_notifications + source_observations, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(30);
+	UT_PLAN(36);
 	UT_RUN(test_actual_terminal_ingress_keeps_master_and_physical_source_distinct);
 	UT_RUN(test_actual_kind9_ingress_does_not_send_ack_for_fused_admission);
 	UT_RUN(test_actual_fused_admission_notifies_ready_resource_without_registry_tick);
@@ -2644,6 +2836,12 @@ main(void)
 	UT_RUN(test_actual_failed_round_observation_retries_only_exact_predecessor_shape);
 	UT_RUN(actual_type17_exports_only_native_accepted_service_context);
 	UT_RUN(actual_retained_service_ticks_capture_fresh_admission_without_ingress);
+	UT_RUN(test_actual_s_source_drain_restores_complete_a_then_native_finish);
+	UT_RUN(test_actual_s_source_drain_refuses_stale_pair_before_native);
+	UT_RUN(test_actual_s_source_drain_rechecks_current_domain_before_claim_snapshot);
+	UT_RUN(test_actual_s_source_drain_busy_returns_same_work_without_ingress_or_send);
+	UT_RUN(test_actual_s_source_drain_error_releases_admission_and_exact_attempt);
+	UT_RUN(test_actual_s_source_drain_checks_descriptor_bounds_before_native);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -468,10 +468,289 @@ UT_TEST(test_s_source_snapshot_requires_every_output_and_original_reservation)
 	UT_ASSERT_EQ(id, -1); UT_ASSERT_EQ(state, 0);
 }
 
+static ResourceXApplyResult
+ss_service_prepare(SSourceFixture *f, uint64 r4)
+{
+	return cluster_pcm_lock_resource_x_acquire_s_source_service_prepare_exact(
+		&f->block, f->source_master, 7, &f->prepared, f->page.data, NULL, 83, 61, r4, 61);
+}
+
+static bool
+ss_service_probe(ResourceXSourceDrainWork *work)
+{
+	BackendType saved = MyBackendType;
+	ResourceXIntentSlot slot;
+	ResourceXAcquisitionRef delivery;
+	uint8 payload[RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES];
+	uint32 examined;
+	bool found = false;
+
+	MyBackendType = B_LMS;
+	for (int calls = 0; calls < 256; calls++) {
+		ResourceXIntentProbeResult r = cluster_pcm_lock_resource_x_outbound_work_probe_exact(
+			4, &slot, payload, sizeof(payload), &examined, &delivery);
+		UT_ASSERT(r != RESOURCE_X_INTENT_PROBE_CORRUPT);
+		if (r == RESOURCE_X_INTENT_PROBE_SOURCE_DRAIN) {
+			memcpy(work, payload, sizeof(*work)); found = true; break;
+		}
+		if (r == RESOURCE_X_INTENT_PROBE_COMPLETE
+			&& cluster_pcm_lock_resource_x_outbound_wait_timeout(1000L) == 0) continue;
+		if (r == RESOURCE_X_INTENT_PROBE_IDLE || r == RESOURCE_X_INTENT_PROBE_COMPLETE) break;
+	}
+	MyBackendType = saved; UT_ASSERT_EQ(fake_lwlock_depth, 0); return found;
+}
+
+static ResourceXSourceDrainWork *
+ss_service_live(const ResourceXSourceDrainWork *work)
+{
+	ResourceXSourceDrainWork *found = NULL;
+	unsigned matches = 0;
+
+	for (long entry = 0; entry < fake_pcm_entry_count; entry++)
+		for (Size n = 0; n + sizeof(*work) <= fake_pcm_entrysize; n += 8)
+			if (memcmp(fake_pcm_entries.data[entry] + n, work, sizeof(*work)) == 0) {
+				found = (ResourceXSourceDrainWork *)(fake_pcm_entries.data[entry] + n); matches++;
+			}
+	UT_ASSERT_EQ(matches, 1); return matches == 1 ? found : NULL;
+}
+
+UT_TEST(test_s_source_service_atomically_queues_same_full_forward)
+{
+	SSourceFixture f; ResourceXSourceDrainWork work; ResourceXDecodedFrame block;
+	if (!ss_start(&f)) return;
+	UT_ASSERT_EQ(ss_service_prepare(&f, 77), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(f.master.state->holder_status.valid, RESOURCE_X_HOLDER_PAIR_PENDING);
+	UT_ASSERT_EQ(f.master.state->holder_status_intent.slot.state, RESOURCE_X_INTENT_SLOT_EMPTY);
+	UT_ASSERT(ss_service_probe(&work));
+	UT_ASSERT_EQ(work.r4_record_generation, 77); UT_ASSERT_EQ(work.master_node, 0);
+	UT_ASSERT_EQ(work.authenticated_connection_generation, 61);
+	UT_ASSERT_EQ(work.request.sender_connection_generation, f.block.common.sender_connection_generation);
+	UT_ASSERT_EQ(work.attempt_generation & 1, 1);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_s_source_drain_snapshot_exact(&work, &block), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(block.has_acquire_decision);
+	UT_ASSERT(memcmp(&block, &f.block, sizeof(block)) == 0);
+}
+
+UT_TEST(test_s_source_service_excludes_parallel_claim_and_busy_self_requeue)
+{
+	SSourceFixture f; ResourceXSourceDrainWork work, next;
+	if (!ss_start(&f)) return;
+	UT_ASSERT_EQ(ss_service_prepare(&f, 77), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(ss_service_probe(&work));
+	cluster_pcm_lock_resource_x_source_drain_content_released();
+	UT_ASSERT(!ss_service_probe(&next)); /* An event cannot steal a running claim. */
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(&work, RESOURCE_X_APPLY_BAD_STATE), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(ss_service_probe(&next)); /* The release during the attempt survives. */
+	UT_ASSERT(next.attempt_generation > work.attempt_generation);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(&next, RESOURCE_X_APPLY_BAD_STATE), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(!ss_service_probe(&work)); /* No new release, no busy loop. */
+}
+
+UT_TEST(test_s_source_service_release_after_busy_resumes_without_wire)
+{
+	SSourceFixture f; ResourceXSourceDrainWork work, next;
+	if (!ss_start(&f)) return;
+	UT_ASSERT_EQ(ss_service_prepare(&f, 77), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(ss_service_probe(&work));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(&work, RESOURCE_X_APPLY_BAD_STATE), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(!ss_service_probe(&next));
+	cluster_pcm_lock_resource_x_source_drain_content_released();
+	UT_ASSERT(ss_service_probe(&next));
+	UT_ASSERT(next.attempt_generation > work.attempt_generation);
+	UT_ASSERT_EQ(f.master.state->holder_status_intent.slot.state, RESOURCE_X_INTENT_SLOT_EMPTY);
+	UT_ASSERT_EQ(f.master.state->holder_image_intent.state, RESOURCE_X_INTENT_SLOT_EMPTY);
+}
+
+UT_TEST(test_s_source_service_success_needs_real_pair_publication)
+{
+	SSourceFixture f; ResourceXSourceDrainWork work; ResourceXSourceDrainWork *live;
+	if (!ss_start(&f)) return;
+	UT_ASSERT_EQ(ss_service_prepare(&f, 77), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(ss_service_probe(&work)); live = ss_service_live(&work); if (!live) return;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(&work, RESOURCE_X_APPLY_APPLIED), RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+	UT_ASSERT_EQ(live->r4_record_generation, 77);
+	UT_ASSERT_EQ(f.master.state->holder_status.valid, RESOURCE_X_HOLDER_PAIR_PENDING);
+}
+
+UT_TEST(test_s_source_service_success_retires_work_not_source_native_or_pi)
+{
+	SSourceFixture f; ResourceXSourceDrainWork work, next; ResourceXSourceDrainWork *live;
+	if (!ss_start(&f)) return;
+	UT_ASSERT_EQ(ss_service_prepare(&f, 77), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(ss_service_probe(&work)); live = ss_service_live(&work); if (!live) return;
+	UT_ASSERT_EQ(ss_publish(&f), RESOURCE_X_APPLY_APPLIED); /* Native tuple is the declared seam. */
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(&work, RESOURCE_X_APPLY_APPLIED), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(live->r4_record_generation, 0); UT_ASSERT_EQ(live->attempt_generation & 1, 0);
+	UT_ASSERT_EQ(f.master.state->holder_status.valid, RESOURCE_X_HOLDER_PAIR_PUBLISHED);
+	UT_ASSERT_EQ(f.master.state->holder_acquire_s_native.reservation_token, f.prepared.reservation_token);
+	UT_ASSERT_EQ(f.master.state->holder_status_intent.slot.state, RESOURCE_X_INTENT_SLOT_ARMED);
+	cluster_pcm_lock_resource_x_source_drain_content_released(); UT_ASSERT(!ss_service_probe(&next));
+}
+
+UT_TEST(test_s_source_service_caller_cancel_does_not_discard_lms_work)
+{
+	SSourceFixture f; ResourceXSourceDrainWork work; ResourceXDecodedFrame block;
+	if (!ss_start(&f)) return;
+	UT_ASSERT_EQ(ss_service_prepare(&f, 77), RESOURCE_X_APPLY_APPLIED);
+	cluster_pcm_lock_resource_x_bootstrap_forget_exact(&f.master.work);
+	UT_ASSERT(ss_service_probe(&work));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_s_source_drain_snapshot_exact(&work, &block), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(memcmp(&block, &f.block, sizeof(block)) == 0);
+}
+
+UT_TEST(test_s_source_service_membership_refusal_keeps_original_work)
+{
+	SSourceFixture f; ResourceXSourceDrainWork work; ResourceXSourceDrainWork *live;
+	ResourceXDecodedFrame block; ResourceXReconfigToken token;
+	if (!ss_start(&f)) return;
+	UT_ASSERT_EQ(ss_service_prepare(&f, 77), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(ss_service_probe(&work)); live = ss_service_live(&work); if (!live) return;
+	UT_ASSERT(cluster_resource_x_reconfig_freeze(17, 18, &token));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(&work, RESOURCE_X_APPLY_STALE), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(live->r4_record_generation, 77);
+	UT_ASSERT_EQ(f.master.state->holder_status.valid, RESOURCE_X_HOLDER_PAIR_PENDING);
+	work = *live; work.attempt_generation++;
+	memset(&block, 0x35, sizeof(block));
+	UT_ASSERT(cluster_pcm_lock_resource_x_acquire_s_source_drain_snapshot_exact(&work, &block) != RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(((uint8 *)&block)[0], 0x35);
+}
+
+UT_TEST(test_s_source_service_old_claim_cannot_complete_successor_attempt)
+{
+	SSourceFixture f; ResourceXSourceDrainWork work, next; ResourceXSourceDrainWork *live;
+	if (!ss_start(&f)) return;
+	UT_ASSERT_EQ(ss_service_prepare(&f, 77), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(ss_service_probe(&work));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(&work, RESOURCE_X_APPLY_BAD_STATE), RESOURCE_X_APPLY_APPLIED);
+	cluster_pcm_lock_resource_x_source_drain_content_released(); UT_ASSERT(ss_service_probe(&next));
+	live = ss_service_live(&next); if (!live) return;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(&work, RESOURCE_X_APPLY_APPLIED), RESOURCE_X_APPLY_STALE);
+	UT_ASSERT(memcmp(live, &next, sizeof(next)) == 0);
+}
+
+UT_TEST(test_s_source_service_snapshot_requires_exact_claim_and_full_common)
+{
+	SSourceFixture f; ResourceXSourceDrainWork work, bad; ResourceXDecodedFrame block;
+	if (!ss_start(&f)) return;
+	UT_ASSERT_EQ(ss_service_prepare(&f, 77), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(ss_service_probe(&work));
+	for (int n = 0; n < 3; n++) {
+		bad = work;
+		if (n == 0) bad.attempt_generation++;
+		else if (n == 1) bad.request.sender_connection_generation++;
+		else bad.request.ordered_lane++;
+		memset(&block, 0x35, sizeof(block));
+		UT_ASSERT(cluster_pcm_lock_resource_x_acquire_s_source_drain_snapshot_exact(&bad, &block) != RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(((uint8 *)&block)[0], 0x35);
+	}
+}
+
+UT_TEST(test_s_source_service_r4_and_duplicate_registration_are_exact)
+{
+	SSourceFixture f; ResourceXSourceDrainWork work;
+	if (!ss_start(&f)) return;
+	UT_ASSERT_EQ(ss_service_prepare(&f, 0), RESOURCE_X_APPLY_INVALID);
+	UT_ASSERT_EQ(ss_service_prepare(&f, UINT64_MAX), RESOURCE_X_APPLY_INVALID);
+	UT_ASSERT_EQ(f.master.state->holder_status.valid, 0);
+	UT_ASSERT_EQ(ss_service_prepare(&f, 77), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(ss_service_prepare(&f, 77), RESOURCE_X_APPLY_DUPLICATE);
+	UT_ASSERT_EQ(ss_service_prepare(&f, 78), RESOURCE_X_APPLY_STALE);
+	UT_ASSERT(ss_service_probe(&work)); UT_ASSERT_EQ(work.r4_record_generation, 77);
+}
+
+UT_TEST(test_s_source_service_does_not_silently_adopt_unowned_component_pair)
+{
+	SSourceFixture f; ResourceXSourceDrainWork work;
+	if (!ss_start(&f)) return;
+	UT_ASSERT_EQ(ss_prepare(&f), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(ss_service_prepare(&f, 77), RESOURCE_X_APPLY_BAD_STATE);
+	UT_ASSERT(!ss_service_probe(&work));
+	UT_ASSERT_EQ(f.master.state->holder_status.valid, RESOURCE_X_HOLDER_PAIR_PENDING);
+}
+
+UT_TEST(test_s_source_service_release_before_registration_cannot_strand_first_attempt)
+{
+	SSourceFixture f; ResourceXSourceDrainWork work;
+	if (!ss_start(&f)) return;
+	UT_ASSERT(!ss_service_probe(&work)); /* Finish an older empty scan. */
+	cluster_pcm_lock_resource_x_source_drain_content_released();
+	UT_ASSERT_EQ(ss_service_prepare(&f, 77), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(ss_service_probe(&work));
+	UT_ASSERT_EQ(work.r4_record_generation, 77);
+}
+
+UT_TEST(test_s_source_service_error_returns_only_claim_and_preserves_native_debt)
+{
+	SSourceFixture f; ResourceXSourceDrainWork work, next; ResourceXSourceDrainWork *live;
+	if (!ss_start(&f)) return;
+	UT_ASSERT_EQ(ss_service_prepare(&f, 77), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(ss_service_probe(&work)); live = ss_service_live(&work); if (!live) return;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(&work, RESOURCE_X_APPLY_RECOVERY_BLOCKED), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(live->r4_record_generation, 77); UT_ASSERT_EQ(live->attempt_generation & 1, 0);
+	UT_ASSERT_EQ(f.master.state->holder_status.valid, RESOURCE_X_HOLDER_PAIR_PENDING);
+	UT_ASSERT(cluster_pcm_own_snapshot_equal_exact(&f.master.state->holder_acquire_s_native, &f.prepared));
+	UT_ASSERT(!ss_service_probe(&next));
+	cluster_pcm_lock_resource_x_source_drain_content_released();
+	UT_ASSERT(ss_service_probe(&next)); UT_ASSERT(next.attempt_generation > work.attempt_generation);
+}
+
+UT_TEST(test_s_source_service_reconfiguration_preserves_claimed_and_parked_work)
+{
+	for (int claimed = 0; claimed < 2; claimed++) {
+		SSourceFixture f; ResourceXSourceDrainWork work; ResourceXSourceDrainWork *live;
+		ResourceXReconfigToken token; ResourceXReconfigBatch batch;
+		ResourceXReconfigResult result = RESOURCE_X_RECONFIG_MORE;
+		if (!ss_start(&f)) return;
+		UT_ASSERT_EQ(ss_service_prepare(&f, 77), RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT(ss_service_probe(&work)); live = ss_service_live(&work); if (!live) return;
+		if (!claimed) {
+			UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(&work, RESOURCE_X_APPLY_BAD_STATE), RESOURCE_X_APPLY_APPLIED);
+			work = *live;
+		}
+		UT_ASSERT(cluster_resource_x_reconfig_freeze(17, 18, &token));
+		for (int scan = 0; scan < 8 && (result == RESOURCE_X_RECONFIG_MORE || result == RESOURCE_X_RECONFIG_RETRY); scan++)
+			result = cluster_resource_x_reconfig_sweep(&token, 4, &batch);
+		UT_ASSERT_EQ(result, RESOURCE_X_RECONFIG_ORPHAN);
+		UT_ASSERT(memcmp(live, &work, sizeof(work)) == 0);
+		UT_ASSERT_EQ(f.master.state->holder_status.valid, RESOURCE_X_HOLDER_PAIR_PENDING);
+		UT_ASSERT(cluster_pcm_own_snapshot_equal_exact(&f.master.state->holder_acquire_s_native, &f.prepared));
+	}
+}
+
+UT_TEST(test_s_source_service_two_busy_claims_cannot_manufacture_release_events)
+{
+	SSourceFixture f, other;
+	ResourceXSourceDrainWork a, b, a_next, b_next, extra;
+	if (!ss_start(&f)) return;
+	/* Authenticated remote-M inputs are explicit seams. Two actual original
+	 * entries/pairs/claims run below; no synthetic completion owner. */
+	f.source_master = 1; f.block.body.acquire_decision.master_node = 1;
+	f.block.common.master_session_incarnation = 777;
+	f.block = ss_forward_reencode(f.block);
+	other = f; other.block.common.logical_assertion.resource.blockNum++;
+	other.prepared.tag = other.block.common.logical_assertion.resource;
+	other.block = ss_forward_reencode(other.block);
+	acquire_reset(); fake_gcs_master_node = 1;
+	UT_ASSERT_EQ(ss_service_prepare(&f, 77), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(ss_service_prepare(&other, 77), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(ss_service_probe(&a)); UT_ASSERT(ss_service_probe(&b));
+	UT_ASSERT(!BufferTagsEqual(&a.request.logical_assertion.resource, &b.request.logical_assertion.resource));
+	cluster_pcm_lock_resource_x_source_drain_content_released(); /* Only real event. */
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(&a, RESOURCE_X_APPLY_BAD_STATE), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(ss_service_probe(&a_next));
+	UT_ASSERT(BufferTagsEqual(&a.request.logical_assertion.resource, &a_next.request.logical_assertion.resource));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(&b, RESOURCE_X_APPLY_BAD_STATE), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(ss_service_probe(&b_next));
+	UT_ASSERT(BufferTagsEqual(&b.request.logical_assertion.resource, &b_next.request.logical_assertion.resource));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(&a_next, RESOURCE_X_APPLY_BAD_STATE), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(&b_next, RESOURCE_X_APPLY_BAD_STATE), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(!ss_service_probe(&extra)); /* Neither completion is a new release. */
+}
+
 int
 main(void)
 {
-	UT_PLAN(26);
+	UT_PLAN(41);
 	UT_RUN(test_s_source_reserves_complete_pair_before_native_finish);
 	UT_RUN(test_s_source_exact_prepare_duplicate_is_not_a_second_native_commit);
 	UT_RUN(test_s_source_changed_token_descriptor_or_page_cannot_replace_pending);
@@ -498,5 +777,20 @@ main(void)
 	UT_RUN(test_s_source_snapshot_gate_freeze_does_not_forget_native_debt);
 	UT_RUN(test_s_source_snapshot_corrupt_pair_is_not_adopted);
 	UT_RUN(test_s_source_snapshot_requires_every_output_and_original_reservation);
+	UT_RUN(test_s_source_service_atomically_queues_same_full_forward);
+	UT_RUN(test_s_source_service_excludes_parallel_claim_and_busy_self_requeue);
+	UT_RUN(test_s_source_service_release_after_busy_resumes_without_wire);
+	UT_RUN(test_s_source_service_success_needs_real_pair_publication);
+	UT_RUN(test_s_source_service_success_retires_work_not_source_native_or_pi);
+	UT_RUN(test_s_source_service_caller_cancel_does_not_discard_lms_work);
+	UT_RUN(test_s_source_service_membership_refusal_keeps_original_work);
+	UT_RUN(test_s_source_service_old_claim_cannot_complete_successor_attempt);
+	UT_RUN(test_s_source_service_snapshot_requires_exact_claim_and_full_common);
+	UT_RUN(test_s_source_service_r4_and_duplicate_registration_are_exact);
+	UT_RUN(test_s_source_service_does_not_silently_adopt_unowned_component_pair);
+	UT_RUN(test_s_source_service_release_before_registration_cannot_strand_first_attempt);
+	UT_RUN(test_s_source_service_error_returns_only_claim_and_preserves_native_debt);
+	UT_RUN(test_s_source_service_reconfiguration_preserves_claimed_and_parked_work);
+	UT_RUN(test_s_source_service_two_busy_claims_cannot_manufacture_release_events);
 	UT_DONE(); return ut_failed_count == 0 ? 0 : 1;
 }

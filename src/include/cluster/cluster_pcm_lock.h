@@ -2020,6 +2020,18 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_s_source_prepare
 	const struct ClusterPcmOwnSnapshot *prepared, const char page_bytes[BLCKSZ],
 	const ClusterPageWalBindingV1 *page_wal, uint32 requester_connection_generation,
 	uint32 master_connection_generation);
+/* Production handoff: reserve the same pair and its original LMS work in
+ * one entry-lock transaction. The caller must not abort after APPLIED. */
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_s_source_service_prepare_exact(
+	const ResourceXDecodedFrame *block, int32 authenticated_master_node, int32 buffer_id,
+	const struct ClusterPcmOwnSnapshot *prepared, const char page_bytes[BLCKSZ],
+	const ClusterPageWalBindingV1 *page_wal, uint32 requester_connection_generation,
+	uint32 master_connection_generation, uint64 r4_record_generation,
+	uint32 authenticated_connection_generation);
+/* Only a claimed original source-drain attempt may recover its complete
+ * forward from the original immutable pair. All outputs survive refusal. */
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_s_source_drain_snapshot_exact(
+	const ResourceXSourceDrainWork *work, ResourceXDecodedFrame *block);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_s_source_publish_exact(
 	const ResourceXDecodedFrame *block, int32 authenticated_master_node, int32 buffer_id,
 	const struct ClusterPcmOwnSnapshot *prepared, const struct ClusterPcmOwnSnapshot *finished);

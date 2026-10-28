@@ -14441,6 +14441,7 @@ cluster_gcs_block_resource_x_source_drain_tick(const ResourceXSourceDrainWork *w
 	ResourceXDecodedFrame block = { 0 };
 	PcmXSessionAuthResult sample;
 	volatile ResourceXApplyResult result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	volatile bool attempt_returned = false;
 	uint64 session = 0;
 	uint32 connection = 0;
 	int32 master = -1;
@@ -14477,18 +14478,51 @@ cluster_gcs_block_resource_x_source_drain_tick(const ResourceXSourceDrainWork *w
 				ClusterWaitPcmAdmission observation;
 				gcs_block_pcm_service_admission(&observation, &admission, &gate,
 					CLWAIT_PCM_SERVICE_DRAIN, master, session, connection);
-				block.kind = RESOURCE_X_WIRE_BLOCK_TO_N;
-				block.payload_bytes = RESOURCE_X_CONTROL_V1_BYTES;
-				block.common = work->request;
-				result = gcs_block_pcm_x_resource_x_source_block_to_n_observed(
-					&block, master, admission.record_generation, &observation);
+				if (work->request.target_mode == PCM_STATE_X) {
+					ClusterPcmOwnSnapshot prepared;
+					ResourceXDecodedFrame image;
+					ResourceXAcquireSSourceState pair_state;
+					ClusterPcmOwnHeldXRevoke held_x = {0};
+					ResourceXLocalOwnerHandle owner = {0};
+					int32 buffer_id = -1;
+
+					/* Recover the complete immutable forward from the original
+					 * pair, not a second admission/capture of the same request.
+					 * The claim survives caller exit and owns native completion. */
+					result = cluster_pcm_lock_resource_x_acquire_s_source_drain_snapshot_exact(work, &block);
+					if (result == RESOURCE_X_APPLY_APPLIED)
+						result = cluster_pcm_lock_resource_x_acquire_s_source_snapshot_exact(
+							&block, master, &buffer_id, &prepared, &image, &pair_state);
+					if (result == RESOURCE_X_APPLY_APPLIED) {
+						if (buffer_id < 0 || buffer_id >= NBuffers)
+							result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+						else {
+							result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+							result = gcs_block_resource_x_source_finish_owned_observed(
+								&block, master, admission.record_generation, GetBufferDescriptor(buffer_id),
+								prepared, &image, held_x, owner, false, false, false, false,
+								RESOURCE_X_APPLY_APPLIED, &observation);
+						}
+					}
+				} else {
+					block.kind = RESOURCE_X_WIRE_BLOCK_TO_N;
+					block.payload_bytes = RESOURCE_X_CONTROL_V1_BYTES;
+					block.common = work->request;
+					result = gcs_block_pcm_x_resource_x_source_block_to_n_observed(
+						&block, master, admission.record_generation, &observation);
+				}
 			}
 		}
+		attempt_returned = true;
 	}
 	PG_FINALLY();
 	{
+		ResourceXApplyResult completed_result = result;
+
+		if (work->request.target_mode == PCM_STATE_X && !attempt_returned)
+			completed_result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 		cluster_semantic_activation_leave(&admission);
-		(void)cluster_pcm_lock_resource_x_source_drain_complete_exact(work, result);
+		(void)cluster_pcm_lock_resource_x_source_drain_complete_exact(work, completed_result);
 	}
 	PG_END_TRY();
 	if (result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE)
