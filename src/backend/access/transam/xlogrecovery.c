@@ -2341,6 +2341,7 @@ cluster_recovery_cold_page_completed_recheck(const struct ClusterRecoveryStartV1
 					|| cluster_ctrc_recovery_itl_page_image_v1(subjects, work->counts.subject_count,
 						observed.image.data, projected.data) != CLUSTER_CTRC_ITL_CLEANOUT_ALREADY_TERMINAL
 					|| memcmp(&observed.image, &projected, sizeof(projected)) != 0
+					|| !cluster_ctrc_recovery_heap_itl_references_v1(observed.image.data)
 					|| !cluster_recovery_cold_page_projection_subjects(start, work, scope,
 						progress, subjects, &accepted, false)) break;
 				index++;

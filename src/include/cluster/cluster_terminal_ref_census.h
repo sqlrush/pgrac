@@ -1090,6 +1090,16 @@ extern ClusterCtrcItlCleanoutApplyResult cluster_ctrc_recovery_itl_batch_image_v
 extern ClusterCtrcItlCleanoutApplyResult cluster_ctrc_recovery_itl_page_image_v1(
 	const struct ClusterColdTtSlotInputV1 *subjects, Size subject_count,
 	const char *before_image, char *after_image);
+/* Read-only tuple-to-ITL binding on one aligned immutable native heap image.
+ * Every effective normal xmin must select one terminal DATA ITL; xmax must
+ * match its actual stored DATA slot. Native frozen/special xmin and invalid
+ * xmax keep their meanings; MOVED/effective MX/lock-only and malformed or
+ * ambiguous bindings refuse. The caller separately qualifies ALL ITLs/UBA
+ * through the original complete canonical terminal projection and retains
+ * original PAGE/source/namespace/history custody. This predicate supplies no
+ * TT/FullXid generation, HOT/history completeness, discharge or completion.
+ * No mutation, allocation, locks or I/O; false preserves all input bytes. */
+extern bool cluster_ctrc_recovery_heap_itl_references_v1(const char *page_image);
 /* Process-local image observations, never receipt or terminal authority. */
 typedef struct ClusterCtrcItlCarrierImageV1 {
 	uint8 mask;

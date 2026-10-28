@@ -1327,6 +1327,95 @@ cluster_ctrc_recovery_itl_page_image_v1(const ClusterColdTtSlotInputV1 *subjects
 	return result;
 }
 
+/* Binding only: canonical TT/generation/source qualification belongs to the
+ * original projector and recovery owner, not a raw tuple xid lookup. */
+bool
+cluster_ctrc_recovery_heap_itl_references_v1(const char *page_image)
+{
+	Page page = (Page)page_image;
+	PageHeader header = (PageHeader)page;
+	const ClusterItlSlotData *slots;
+	OffsetNumber maxoff;
+
+	if (page_image == NULL || ((uintptr_t)page_image & (MAXIMUM_ALIGNOF - 1)) != 0
+		|| PageIsNew(page) || !PageHasItl(page) || PageGetPageSize(page) != BLCKSZ
+		|| PageGetPageLayoutVersion(page) != PG_PAGE_LAYOUT_VERSION
+		|| header->pd_lower < SizeOfPageHeaderData || header->pd_lower > header->pd_upper
+		|| header->pd_upper > header->pd_special
+		|| header->pd_special != BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE
+		|| (header->pd_lower - SizeOfPageHeaderData) % sizeof(ItemIdData) != 0)
+		return false;
+	slots = ClusterPageGetItlSlots(page);
+	for (unsigned i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
+		const ClusterItlSlotData *slot = &slots[i];
+		uint32 segment, block;
+		uint16 offset, row;
+		bool committed = slot->flags == ITL_FLAG_COMMITTED
+			|| slot->flags == ITL_FLAG_LOCK_ONLY_COMMITTED;
+
+		if (slot->flags == ITL_FLAG_FREE) {
+			if (TransactionIdIsValid(slot->xid) || !UBA_is_invalid(slot->undo_segment_head)
+				|| SCN_VALID(slot->commit_scn) || slot->lock_count != 0) return false;
+			continue;
+		}
+		if ((!committed && slot->flags != ITL_FLAG_ABORTED
+				&& slot->flags != ITL_FLAG_LOCK_ONLY_ABORTED)
+			|| !TransactionIdIsNormal(slot->xid) || SCN_VALID(slot->commit_scn) != committed
+			|| !uba_decode(slot->undo_segment_head, &segment, &block, &offset, &row))
+			return false;
+	}
+	maxoff = PageGetMaxOffsetNumber(page);
+	for (OffsetNumber offset = FirstOffsetNumber; offset <= maxoff; offset++) {
+		ItemId item = PageGetItemId(page, offset);
+		HeapTupleHeader tuple;
+		unsigned start, length, expected_hoff;
+		TransactionId xmin, xmax;
+
+		if (ItemIdIsRedirected(item)) {
+			OffsetNumber destination = ItemIdGetRedirect(item);
+
+			if (ItemIdHasStorage(item) || destination < FirstOffsetNumber || destination > maxoff
+				|| !ItemIdIsNormal(PageGetItemId(page, destination))) return false;
+			continue;
+		}
+		if (!ItemIdIsNormal(item)) {
+			if ((!ItemIdIsDead(item) && ItemIdIsUsed(item)) || ItemIdHasStorage(item)) return false;
+			continue;
+		}
+		start = ItemIdGetOffset(item); length = ItemIdGetLength(item);
+		if (start < header->pd_upper || start > header->pd_special || start != MAXALIGN(start)
+			|| length < SizeofHeapTupleHeader || length > header->pd_special - start) return false;
+		tuple = (HeapTupleHeader)(page_image + start);
+		expected_hoff = MAXALIGN(SizeofHeapTupleHeader
+			+ ((tuple->t_infomask & HEAP_HASNULL) != 0
+				? BITMAPLEN(HeapTupleHeaderGetNatts(tuple)) : 0));
+		if (tuple->t_hoff != expected_hoff || tuple->t_hoff > length
+			|| (tuple->t_infomask & HEAP_MOVED) != 0) return false;
+		xmin = HeapTupleHeaderGetRawXmin(tuple);
+		if (!HeapTupleHeaderXminFrozen(tuple) && xmin != BootstrapTransactionId
+			&& xmin != FrozenTransactionId) {
+			unsigned matches = 0;
+
+			if (!TransactionIdIsNormal(xmin)) return false;
+			for (unsigned i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
+				if (slots[i].xid == xmin && (slots[i].flags == ITL_FLAG_COMMITTED
+					|| slots[i].flags == ITL_FLAG_ABORTED)) matches++;
+			if (matches != 1) return false;
+		}
+		/* Invalid xmax is not an effective reference, even if stale raw bits
+		 * remain. Effective MX/lock-only requires its separate original work. */
+		if ((tuple->t_infomask & HEAP_XMAX_INVALID) != 0) continue;
+		xmax = HeapTupleHeaderGetRawXmax(tuple);
+		if ((tuple->t_infomask & HEAP_XMAX_IS_MULTI) != 0
+			|| HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask) || !TransactionIdIsNormal(xmax)
+			|| tuple->t_itl_slot_idx >= CLUSTER_ITL_INITRANS_DEFAULT
+			|| slots[tuple->t_itl_slot_idx].xid != xmax
+			|| (slots[tuple->t_itl_slot_idx].flags != ITL_FLAG_COMMITTED
+				&& slots[tuple->t_itl_slot_idx].flags != ITL_FLAG_ABORTED)) return false;
+	}
+	return true;
+}
+
 static bool
 ctrc_target_pending_offnum_valid(const ClusterCtrcPublicationIdV1 *publication,
 								 const ClusterCtrcTargetV1 *target)

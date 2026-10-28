@@ -1727,6 +1727,8 @@ test_native_itl_batch(ClusterColdTtSlotInputV1 *subjects,
 	}
 }
 
+#include "test_cluster_ctrc_heap_refs.inc"
+
 UT_TEST(test_ctrc_native_itl_page_uses_all_slots_and_original_terminal_projection)
 {
 	for (unsigned count = 1; count <= CLUSTER_ITL_INITRANS_DEFAULT; count++) {
@@ -3979,6 +3981,13 @@ main(void)
 		CTRC_TEST_ENTRY(test_ctrc_itl_image_calculation_preserves_input_and_replays_exactly),
 		CTRC_TEST_ENTRY(test_ctrc_itl_image_partial_overlap_is_retained),
 		CTRC_TEST_ENTRY(test_ctrc_native_tt_image_matches_original_terminal_rules),
+		CTRC_TEST_ENTRY(test_ctrc_heap_refs_native_header_alignment_and_null_bitmap_are_required),
+		CTRC_TEST_ENTRY(test_ctrc_heap_refs_bind_distinct_creator_and_actual_deleter_itls),
+		CTRC_TEST_ENTRY(test_ctrc_heap_refs_do_not_use_hints_or_raw_xid_without_unique_data_itl),
+		CTRC_TEST_ENTRY(test_ctrc_heap_refs_reject_wrong_deleter_slot_moved_mx_and_effective_locks),
+		CTRC_TEST_ENTRY(test_ctrc_heap_refs_reject_incomplete_itl_or_tuple_grammar),
+		CTRC_TEST_ENTRY(test_ctrc_heap_refs_invalid_xmax_is_not_an_effective_reference),
+		CTRC_TEST_ENTRY(test_ctrc_heap_refs_reject_null_unaligned_and_new_images),
 		CTRC_TEST_ENTRY(test_ctrc_native_itl_page_uses_all_slots_and_original_terminal_projection),
 		CTRC_TEST_ENTRY(test_ctrc_native_itl_page_missing_late_or_ambiguous_input_is_atomic),
 		CTRC_TEST_ENTRY(test_ctrc_native_itl_page_derives_classes_without_raw_xid_cross_binding),

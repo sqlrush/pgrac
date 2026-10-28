@@ -247,7 +247,9 @@ extern bool ClusterColdRecoveryCtrcPageAdvance(const struct ClusterRecoveryStart
  * slots count against memory_budget before the first PAGE/FPI; zero budget
  * only continues existing progress. Final same-FD images must remain byte-exact
  * under the original all-ITL projector and a frozen complete canonical terminal
- * vector, revalidated after PAGE cleanup. The vector and image scratch peak are
+ * vector, then every effective tuple xmin/xmax must bind its actual terminal
+ * DATA ITL in that same whole image. Full current checks follow both predicates.
+ * This does not prove HOT/history coverage. The vector and image scratch peak are
  * reserved before the first PAGE. No replay pin/history release, independent
  * or joint service COMPLETE, relmap acceptance or OPEN is granted. */
 extern bool ClusterColdRecoveryCtrcPageDrain(const struct ClusterRecoveryStartV1 *start,
