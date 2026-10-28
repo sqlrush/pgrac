@@ -544,17 +544,19 @@ ctrc_participant_delegations_valid(const ClusterCtrcParticipantEntry *participan
 }
 
 /* Only a closed, qualified node with every child proven can freeze its LOCAL receipt inventory.
- * The accepted parent/path remains custody, not evidence of subtree release.
- * Frozen local proofs are deliberately kept out of the ordinary ACK states. */
+ * A direct root must reproduce its own original grant; a delegated node
+ * retains its accepted parent/path. Neither proof retires child custody or
+ * enters the ordinary ACK states before origin certificate composition. */
 static bool pg_attribute_unused()
 ctrc_delegated_local_ack_eligible(const ClusterCtrcParticipantEntry *participant, bool frozen)
 {
+	FullTransactionId original;
+
 	if (!(participant != NULL && participant->state == CTRC_PARTICIPANT_CLOSED_DRAINING
 		&& ctrc_txn_key_valid(&participant->key)
 		&& ctrc_participant_identity_valid(&participant->key, &participant->identity)
 		&& participant->grant_generation != 0 && participant->seal_generation != 0
 		&& ctrc_bytes_zero(participant->reserved8, sizeof(participant->reserved8))
-		&& !ctrc_bytes_zero(&participant->delegation_parent, sizeof(participant->delegation_parent))
 		&& ctrc_participant_delegations_valid(participant)
 		&& participant->receipt_count != UINT64_MAX
 		&& participant->last_key_sequence == participant->receipt_count
@@ -563,6 +565,13 @@ ctrc_delegated_local_ack_eligible(const ClusterCtrcParticipantEntry *participant
 		&& participant->cancelled_count <= participant->receipt_count
 		&& participant->cleaned_count == participant->receipt_count - participant->cancelled_count
 		&& participant->ack_frozen_count == (frozen ? participant->receipt_count : 0)))
+		return false;
+	if (ctrc_bytes_zero(&participant->delegation_parent, sizeof(participant->delegation_parent))
+		&& (participant->delegation_count == 0
+			|| !cluster_ctrc_origin_fullxid_match_v2(participant->original_identity_v2,
+				sizeof(participant->original_identity_v2), &participant->key,
+				&participant->identity, participant->grant_generation, &original)
+			|| !FullTransactionIdEquals(original, participant->original_full_xid)))
 		return false;
 	for (unsigned node = 0; node < CLUSTER_CTRC_MAX_PARTICIPANTS; node++)
 		if (participant->delegations[node].sequence != 0

@@ -2004,10 +2004,244 @@ UT_TEST(test_subtree_proof_cannot_import_ancestors_or_replace_already_retained_e
 	}
 }
 
+/* The original144 is granted directly by origin0 to root1. Root and child
+ * use independent local pools; only the original path and protected reply
+ * cross between them. This does not manufacture an accepted parent. */
+static bool
+direct_root_roundtrip_setup(ClusterCtrcReceiptHandle *root,
+	ClusterCtrcDelegationCloseV1 *child_request,
+	uint8 reply[GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE], bool cancel_local)
+{
+	ClusterCtrcParticipantIdentity child;
+	ClusterCtrcReceiptHandle receipt;
+	ClusterCtrcSharedHeader *root_pool;
+	ClusterCtrcLocalReleaseAckV1 denied;
+	ClusterCtrcTargetV1 pending;
+	ClusterItlSlotData slot = {0};
+	uint8 original[144], path[CLUSTER_CTRC_DELEGATION_V2_MAX_BYTES];
+	Size length;
+	uint16 reason;
+	uint32 first;
+	bool ready;
+
+	free(subtree_leaf_pool);
+	subtree_leaf_pool = NULL;
+	fixture_declared_nodes = 4;
+	reset_dispatch_fixture();
+	if (!seed_delegation_sender(root, &child, original)
+		|| !close_test_pending_child(root->participant, &child, path, &length)
+		|| (cancel_local && !cluster_ctrc_receipt_cancel_shared(root)))
+		return false;
+	cluster_node_id = root->participant->identity.node_id;
+	dispatch_self_boot = root->participant->identity.boot_incarnation;
+	if (cluster_ctrc_participant_request_shared(&root->key, &root->participant->identity,
+		root->participant->grant_generation, 41, CTRC_SEAL_CLOSE_AND_CLEAN,
+		&reason, &denied) != CTRC_SEAL_REPLY_PENDING_DRAIN)
+		return false;
+	first = ((uint32)root->key.owner_instance - 1) * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+	if (!cluster_ctrc_cleaner_bind_worker((root->key.segment_id - first)
+		% CLUSTER_CTRC_CLEANER_WORKERS)
+		|| !cluster_ctrc_participant_next_delegated_close_shared(child_request))
+		return false;
+	root_pool = CtrcShared;
+	CtrcShared = NULL;
+	cluster_ctrc_shmem_init();
+	subtree_leaf_pool = CtrcShared;
+	cluster_node_id = child.node_id;
+	slot.xid = root->key.xid;
+	slot.wrap = 3;
+	slot.flags = ITL_FLAG_ACTIVE;
+	slot.undo_segment_head = uba_encode(root->key.segment_id, 9, root->key.slot_offset, 8);
+	image_pending_target(&pending);
+	ready = cluster_ctrc_itl_image_prepare_v2(&slot, &root->participant->identity,
+		&child, path, length, &pending, &receipt) == CLUSTER_CTRC_PREPARE_READY
+		&& cluster_ctrc_receipt_cancel_shared(&receipt)
+		&& subtree_send_close(child_request)
+		&& ctrc_participant_freeze_ack_batch_shared(1) == 1
+		&& subtree_send_close(child_request);
+	if (ready)
+		memcpy(reply, close_reply, GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE);
+	CtrcShared = root_pool;
+	cluster_node_id = root->participant->identity.node_id;
+	dispatch_self_boot = root->participant->identity.boot_incarnation;
+	return ready;
+}
+
+UT_TEST(test_direct_root_consumes_child_proof_before_freezing_local_inventory)
+{
+	ClusterCtrcReceiptHandle root;
+	ClusterCtrcParticipantEntry before, expected;
+	ClusterCtrcDelegationCloseV1 child, ignored;
+	ClusterCtrcLocalReleaseAckV1 denied, ack;
+	ClusterCtrcNormalStopObservation observed;
+	uint8 reply[GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE];
+	uint64 index;
+	uint16 reason;
+
+	UT_ASSERT(direct_root_roundtrip_setup(&root, &child, reply, true));
+	UT_ASSERT(ctrc_bytes_zero(&root.participant->delegation_parent,
+		sizeof(root.participant->delegation_parent)));
+	UT_ASSERT(ctrc_bytes_zero(&root.participant->delegation_path,
+		sizeof(root.participant->delegation_path)));
+	UT_ASSERT_EQ(root.receipt->state, CTRC_RECEIPT_CANCELLED);
+	UT_ASSERT_EQ(ctrc_participant_freeze_ack_batch_shared(1), 0);
+	UT_ASSERT(close_merge_land(reply));
+	UT_ASSERT(!cluster_ctrc_participant_next_delegated_close_shared(&ignored));
+	before = *root.participant;
+	UT_ASSERT(ctrc_participant_index(&root.key, root.participant->identity.node_id, &index));
+	/* The original cleaner must now consume the completed child inventory. */
+	UT_ASSERT_EQ(ctrc_participant_freeze_ack_batch_shared(1), 1);
+	expected = before;
+	expected.ack_frozen_count = 1;
+	UT_ASSERT(memcmp(root.participant, &expected, sizeof(expected)) == 0);
+	UT_ASSERT_EQ(root.receipt->state, CTRC_RECEIPT_ACK_FROZEN);
+	ack = ctrc_participant_ack_entries()[index];
+	UT_ASSERT(ctrc_ack_bytes_exact(&ack));
+	UT_ASSERT_EQ(ack.total_receipt_count, 1);
+	UT_ASSERT_EQ(ack.cancelled_count, 1);
+	UT_ASSERT(ctrc_delegated_local_ack_summary_exact(root.participant, &ack));
+	UT_ASSERT(!ctrc_frozen_ack_summary_exact(root.participant, &ack));
+	UT_ASSERT_EQ(cluster_ctrc_participant_request_shared(&root.key, &root.participant->identity,
+		root.participant->grant_generation, 41, CTRC_SEAL_CLOSE_AND_CLEAN, &reason, &denied),
+		CTRC_SEAL_REPLY_PENDING_DRAIN);
+	UT_ASSERT(ctrc_bytes_zero(&denied, sizeof(denied)));
+	UT_ASSERT_EQ(cluster_ctrc_participant_request_shared(&root.key, &root.participant->identity,
+		root.participant->grant_generation, 41, CTRC_SEAL_CERTIFICATE_COMMITTED, &reason, &denied),
+		CTRC_SEAL_REPLY_BLOCKED_RETAIN);
+	UT_ASSERT(memcmp(root.participant, &expected, sizeof(expected)) == 0);
+	UT_ASSERT_EQ(ctrc_participant_freeze_ack_batch_shared(1), 0);
+	UT_ASSERT_EQ(cluster_ctrc_normal_stop_poll(&observed), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(enters, leaves);
+	UT_ASSERT_EQ(held_count, 0);
+	UT_ASSERT_EQ(allocated, 0);
+}
+
+UT_TEST(test_direct_root_local_proof_requires_its_original_full_identity)
+{
+	for (unsigned fault = 0; fault < 7; fault++) {
+		ClusterCtrcReceiptHandle root;
+		ClusterCtrcParticipantEntry before;
+		ClusterCtrcReceipt before_receipt;
+		ClusterCtrcDelegationCloseV1 child;
+		uint8 reply[GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE];
+		uint64 index;
+		unsigned captures;
+
+		UT_ASSERT(direct_root_roundtrip_setup(&root, &child, reply, true));
+		UT_ASSERT(close_merge_land(reply));
+		UT_ASSERT(ctrc_participant_index(&root.key, root.participant->identity.node_id, &index));
+		switch (fault) {
+			case 0: MemSet(root.participant->original_identity_v2, 0,
+				sizeof(root.participant->original_identity_v2)); break;
+			case 1: root.participant->original_full_xid = InvalidFullTransactionId; break;
+			case 2: root.participant->original_full_xid = FullTransactionIdFromU64(
+				U64FromFullTransactionId(root.original_full_xid) + (UINT64_C(1) << 32)); break;
+			case 3: root.participant->original_identity_v2[64] ^= 1; break;
+			case 4: root.participant->identity.boot_incarnation++; break;
+			case 5: root.participant->original_identity_v2[6] = 1; break;
+			case 6: root.participant->grant_generation++; break;
+		}
+		before = *root.participant;
+		before_receipt = *root.receipt;
+		captures = durability_calls;
+		UT_ASSERT_EQ(ctrc_participant_freeze_ack_batch_shared(1), 0);
+		UT_ASSERT_EQ(durability_calls, captures);
+		UT_ASSERT(memcmp(root.participant, &before, sizeof(before)) == 0);
+		UT_ASSERT(memcmp(root.receipt, &before_receipt, sizeof(before_receipt)) == 0);
+		UT_ASSERT(ctrc_bytes_zero(&ctrc_participant_ack_entries()[index], sizeof(ClusterCtrcLocalReleaseAckV1)));
+		UT_ASSERT_EQ(held_count, 0);
+		UT_ASSERT_EQ(allocated, 0);
+	}
+}
+
+UT_TEST(test_direct_root_local_proof_waits_for_original_local_drain_and_durability)
+{
+	for (unsigned phase = 0; phase < 2; phase++) {
+		ClusterCtrcReceiptHandle root;
+		ClusterCtrcParticipantEntry before;
+		ClusterCtrcReceipt before_receipt;
+		ClusterCtrcDelegationCloseV1 child;
+		uint8 reply[GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE];
+		uint64 index;
+
+		UT_ASSERT(direct_root_roundtrip_setup(&root, &child, reply, phase != 0));
+		UT_ASSERT(close_merge_land(reply));
+		UT_ASSERT(ctrc_participant_index(&root.key, root.participant->identity.node_id, &index));
+		/* Count the root's original local captures separately from the child. */
+		durability_calls = 0;
+		if (phase != 0) {
+			root.receipt->highest_local_wal_lsn = 64;
+			root.receipt->required_lsn[0] = 80;
+			test_flush_lsn = 100;
+			origin_durability_hook = close_local_remote_durable;
+		}
+		before = *root.participant;
+		before_receipt = *root.receipt;
+		UT_ASSERT_EQ(ctrc_participant_freeze_ack_batch_shared(1), 0);
+		UT_ASSERT(memcmp(root.participant, &before, sizeof(before)) == 0);
+		UT_ASSERT(memcmp(root.receipt, &before_receipt, sizeof(before_receipt)) == 0);
+		UT_ASSERT(ctrc_bytes_zero(&ctrc_participant_ack_entries()[index], sizeof(ClusterCtrcLocalReleaseAckV1)));
+		if (phase == 0) {
+			UT_ASSERT_EQ(root.receipt->state, CTRC_RECEIPT_PREPARED);
+			UT_ASSERT_EQ(durability_calls, 0);
+		} else {
+			UT_ASSERT_EQ(durability_calls, 2);
+			origin_durability_hook = NULL;
+			UT_ASSERT_EQ(ctrc_participant_freeze_ack_batch_shared(1), 1);
+			UT_ASSERT_EQ(root.receipt->state, CTRC_RECEIPT_ACK_FROZEN);
+			UT_ASSERT_EQ(ctrc_participant_ack_entries()[index].required_lsn_vector[0], 80);
+			UT_ASSERT_EQ(ctrc_participant_ack_entries()[index].highest_local_cleanout_lsn, 64);
+		}
+		UT_ASSERT_EQ(held_count, 0);
+		UT_ASSERT_EQ(allocated, 0);
+	}
+}
+
+static void
+direct_root_child_proof_drift(void)
+{
+	local_drift_participant->delegation_ack_digest[2][0] ^= 1;
+}
+
+UT_TEST(test_direct_root_local_freeze_rechecks_original_and_child_evidence)
+{
+	for (unsigned phase = 0; phase < 3; phase++) {
+		ClusterCtrcReceiptHandle root;
+		ClusterCtrcReceipt before_receipt;
+		ClusterCtrcDelegationCloseV1 child;
+		ClusterCtrcDelegationCustodyV1 custody;
+		uint8 reply[GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE];
+		uint64 index;
+
+		UT_ASSERT(direct_root_roundtrip_setup(&root, &child, reply, true));
+		UT_ASSERT(close_merge_land(reply));
+		UT_ASSERT(ctrc_participant_index(&root.key, root.participant->identity.node_id, &index));
+		before_receipt = *root.receipt;
+		custody = root.participant->delegations[child.receiver.node_id];
+		local_drift_participant = root.participant;
+		local_drift_capture = durability_calls + phase + 1;
+		if (phase < 2)
+			durability_hook = close_local_drift_capture;
+		else {
+			UT_ASSERT_EQ(child.receiver.node_id, 2);
+			barrier_hook = direct_root_child_proof_drift;
+			UT_ASSERT(cluster_ctrc_test_barrier_control(CTRC_TEST_BARRIER_ACK_DURABLE, true));
+		}
+		UT_ASSERT_EQ(ctrc_participant_freeze_ack_batch_shared(1), 0);
+		UT_ASSERT_EQ(root.participant->state, CTRC_PARTICIPANT_BLOCKED);
+		UT_ASSERT(memcmp(root.receipt, &before_receipt, sizeof(before_receipt)) == 0);
+		UT_ASSERT(memcmp(&root.participant->delegations[child.receiver.node_id], &custody, sizeof(custody)) == 0);
+		UT_ASSERT_EQ(root.participant->delegation_close_request_id[child.receiver.node_id], child.request_id);
+		UT_ASSERT(ctrc_bytes_zero(&ctrc_participant_ack_entries()[index], sizeof(ClusterCtrcLocalReleaseAckV1)));
+		UT_ASSERT_EQ(held_count, 0);
+		UT_ASSERT_EQ(allocated, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(43);
+	UT_PLAN(47);
 	UT_RUN(test_actual_delegated_close_enters_drain_and_retains_parent);
 	UT_RUN(test_actual_delegated_close_malformed_is_consumed_without_mutation);
 	UT_RUN(test_delegated_close_codec_is_explicit_and_roundtrips_all_binding_fields);
@@ -2051,6 +2285,10 @@ main(void)
 	UT_RUN(test_subtree_codec_rejects_stale_request_and_malformed_proof_without_partial_output);
 	UT_RUN(test_actual_subtree_landing_rejects_old_wire_correlation_and_current_source_failures);
 	UT_RUN(test_subtree_proof_cannot_import_ancestors_or_replace_already_retained_evidence);
+	UT_RUN(test_direct_root_consumes_child_proof_before_freezing_local_inventory);
+	UT_RUN(test_direct_root_local_proof_requires_its_original_full_identity);
+	UT_RUN(test_direct_root_local_proof_waits_for_original_local_drain_and_durability);
+	UT_RUN(test_direct_root_local_freeze_rechecks_original_and_child_evidence);
 	free(subtree_leaf_pool);
 	free(CtrcShared);
 	UT_DONE();

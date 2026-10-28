@@ -750,6 +750,17 @@ for owners, successor, retention in (
 _classify_owners(
     "CTRC_ORIGIN_PROVENANCE",
     "src/backend/cluster/cluster_terminal_ref_census.c",
+    ("ctrc_delegated_local_ack_eligible",),
+    "REGISTERED_REFERENCE",
+    "ALL_CTRC_REFERENCE_KINDS",
+    "ALL_CTRC_TARGET_KINDS",
+    "NO_REFERENCE_TRANSFER_REQUIRED",
+    "RETAIN_PENDING_SUBTREE_CLOSE_ACK",
+    "MXA-T40",
+)
+_classify_owners(
+    "CTRC_ORIGIN_PROVENANCE",
+    "src/backend/cluster/cluster_terminal_ref_census.c",
     ("ctrc_participant_delegate_prepare_locked",),
     "REGISTERED_REFERENCE",
     "ALL_CTRC_REFERENCE_KINDS",
