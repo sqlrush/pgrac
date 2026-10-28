@@ -117,6 +117,13 @@ typedef struct SlruCtlData
 	 */
 	bool		(*PagePrecedes) (int, int);
 
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: optional native write-attempt observation, not I/O authority.
+	 * begin precedes I/O; end follows native state restoration. An ERROR
+	 * that skips restoration must not retire the outstanding attempt. */
+	void		(*WritePageObserve) (struct SlruCtlData *ctl, bool begin);
+#endif
+
 	/*
 	 * Dir is set during SimpleLruInit and does not change thereafter. Since
 	 * it's always the same, it doesn't need to be in shared memory.

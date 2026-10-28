@@ -279,6 +279,9 @@ SimpleLruInit(SlruCtl ctl, const char *name, int nslots, int nlsns,
 	 */
 	ctl->shared = shared;
 	ctl->sync_handler = sync_handler;
+#ifdef USE_PGRAC_CLUSTER
+	ctl->WritePageObserve = NULL;
+#endif
 	strlcpy(ctl->Dir, subdir, sizeof(ctl->Dir));
 }
 
@@ -584,6 +587,11 @@ SlruInternalWritePage(SlruCtl ctl, int slotno, SlruWriteAll fdata)
 	/* Acquire per-buffer lock (cannot deadlock, see notes at top) */
 	LWLockAcquire(&shared->buffer_locks[slotno].lock, LW_EXCLUSIVE);
 
+#ifdef USE_PGRAC_CLUSTER
+	if (ctl->WritePageObserve != NULL)
+		ctl->WritePageObserve(ctl, true);
+#endif
+
 	/* Release control lock while doing I/O */
 	LWLockRelease(shared->ControlLock);
 
@@ -612,6 +620,11 @@ SlruInternalWritePage(SlruCtl ctl, int slotno, SlruWriteAll fdata)
 	shared->page_status[slotno] = SLRU_PAGE_VALID;
 
 	LWLockRelease(&shared->buffer_locks[slotno].lock);
+
+#ifdef USE_PGRAC_CLUSTER
+	if (ctl->WritePageObserve != NULL)
+		ctl->WritePageObserve(ctl, false);
+#endif
 
 	/* Now it's okay to ereport if we failed */
 	if (!ok)
