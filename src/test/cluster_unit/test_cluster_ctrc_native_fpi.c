@@ -464,6 +464,7 @@ bool native_install_original_writer_installed(ClusterWalWriterToken *writer,
 #include "test_cluster_ctrc_native_unchanged_cache.inc"
 #include "test_cluster_ctrc_native_held_fd.inc"
 #include "test_cluster_ctrc_native_readback.inc"
+#include "test_cluster_ctrc_native_completed.inc"
 
 int
 main(int argc, char **argv)
@@ -472,6 +473,15 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_NATIVE_COMPLETED") != NULL) {
+		UT_PLAN(5);
+		UT_RUN(test_native_completed_readback_uses_original_page_and_same_fds_after_f4_clear);
+		UT_RUN(test_native_completed_readback_refuses_clones_lost_binding_and_pending_api);
+		UT_RUN(test_native_completed_readback_refuses_changed_main_or_space_without_reinstall);
+		UT_RUN(test_native_completed_readback_rechecks_binding_after_each_protected_read);
+		UT_RUN(test_native_completed_readback_collision_and_error_keep_original_storage);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_NATIVE_READBACK") != NULL) {
 		UT_PLAN(7);
 		UT_RUN(test_native_readback_repromotes_same_page_and_reads_original_fds_only);
@@ -560,7 +570,12 @@ main(int argc, char **argv)
 		UT_RUN(test_native_step_fixed_fd_close_failure_cannot_claim_target_synced);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(93);
+	UT_PLAN(98);
+	UT_RUN(test_native_completed_readback_uses_original_page_and_same_fds_after_f4_clear);
+	UT_RUN(test_native_completed_readback_refuses_clones_lost_binding_and_pending_api);
+	UT_RUN(test_native_completed_readback_refuses_changed_main_or_space_without_reinstall);
+	UT_RUN(test_native_completed_readback_rechecks_binding_after_each_protected_read);
+	UT_RUN(test_native_completed_readback_collision_and_error_keep_original_storage);
 	UT_RUN(test_native_readback_repromotes_same_page_and_reads_original_fds_only);
 	UT_RUN(test_native_readback_never_reinstalls_before_or_changed_result_bytes);
 	UT_RUN(test_native_readback_rechecks_immutable_inputs_after_every_read);

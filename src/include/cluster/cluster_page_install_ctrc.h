@@ -256,5 +256,20 @@ extern RfPageProofDetailV1 rf_page_recovery_ctrc_replays_fpi_readback_v1(
 	const RfPageCtrcFpiInsertV1 *inserted, struct ClusterSharedFsPageV1 *storage,
 	Size subject_count, Size memory_budget);
 
+/* Final readback of an original Start-owned completed operation after its
+ * exact F4 was cleared. Require the ORIGINAL saved result address and SAME
+ * retained raw FD on every current check; an equivalent caller copy cannot
+ * enter. All pending-reader PAGE/source/accepted-TX/descriptor/installed-writer/
+ * actual-flush/cache/five-read/canonical-byte checks remain mandatory. The
+ * pending API above still requires a nonfailed DURABLE F4. No WAL/write/sync,
+ * reopen, window mutation, cleanup transfer, lifetime, discharge or service
+ * grant. False/ERROR leaves original Start cleanup and all shared debt intact;
+ * caller destroys PAGE and revokes its original episode on late failure. */
+extern RfPageProofDetailV1 rf_page_recovery_ctrc_replays_completed_readback_v1(
+	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work,
+	const struct ClusterRecoveryCtrcReplaySetSourceV1 *source, RfPageCtrcAuthorityV1 *authority,
+	const RfPageCtrcFpiInsertV1 *inserted, struct ClusterSharedFsPageV1 *storage,
+	Size subject_count, Size memory_budget);
+
 #endif /* USE_PGRAC_CLUSTER */
 #endif /* CLUSTER_PAGE_INSTALL_CTRC_H */

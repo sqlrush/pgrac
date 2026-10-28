@@ -565,7 +565,20 @@ typedef struct CtrcNativeInstallV1 {
 	PGAlignedBlock space0, space1;
 	bool publish_durable;
 	bool durable_readback;
+	bool completed_readback;
 } CtrcNativeInstallV1;
+
+static bool
+ctrc_native_readback_operation_current(const CtrcNativeInstallV1 *context)
+{
+	const RfPageCtrcFpiInsertV1 *fixed = &context->fixed;
+
+	return context->completed_readback
+		? ClusterColdRecoveryCtrcPageCompletedCurrent(context->binding.start,
+			context->binding.work, context->original, context->binding.read.step->storage)
+		: cluster_recovery_stamp_fpi_durable_current_v1(&fixed->window,
+			fixed->record_start, fixed->record_end);
+}
 
 static bool
 ctrc_native_install_current(const CtrcNativeInstallV1 *context)
@@ -576,8 +589,7 @@ ctrc_native_install_current(const CtrcNativeInstallV1 *context)
 	if (memcmp(context->original, fixed, sizeof(*fixed)) != 0 || !fixed->wal_flushed
 		|| !ctrc_native_insert_current(&context->binding, fixed)
 		|| !(context->durable_readback
-			? cluster_recovery_stamp_fpi_durable_current_v1(&fixed->window,
-				fixed->record_start, fixed->record_end)
+			? ctrc_native_readback_operation_current(context)
 			: cluster_recovery_stamp_fpi_inserted_current_v1(&fixed->window,
 				fixed->record_start, fixed->record_end))
 		|| cluster_wal_writer_check(&fixed->window.owner.writer) != CLUSTER_CONTROL_ROOT_OK_PRIMARY
@@ -688,8 +700,7 @@ ctrc_native_readback_attempt(CtrcNativeInstallV1 *context, CtrcNativeStepV1 *ste
 				&& memcmp(context->original, fixed, sizeof(*fixed)) == 0
 				&& ctrc_native_readback_step_current(step)
 				&& fixed->wal_flushed
-				&& cluster_recovery_stamp_fpi_durable_current_v1(&fixed->window,
-					fixed->record_start, fixed->record_end)) {
+				&& ctrc_native_readback_operation_current(context)) {
 				RfPageAuthorityVerdictV1 promoted = rf_page_authority_ctrc_replays_promote_fpi_nowait_v1(
 					authority, &target, &fixed->image.version.before);
 
@@ -735,22 +746,23 @@ ctrc_native_readback_attempt(CtrcNativeInstallV1 *context, CtrcNativeStepV1 *ste
 	}
 	PG_CATCH();
 	{
-		if (entered) (void)cluster_recovery_stamp_fail_v1(&fixed->window);
+		if (entered && !context->completed_readback)
+			(void)cluster_recovery_stamp_fail_v1(&fixed->window);
 		if (snapshot != NULL) pfree((void *)snapshot);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-	if (entered && detail != RF_PAGE_PROOF_DETAIL_OK)
+	if (entered && detail != RF_PAGE_PROOF_DETAIL_OK && !context->completed_readback)
 		(void)cluster_recovery_stamp_fail_v1(&fixed->window);
 	if (snapshot != NULL) pfree((void *)snapshot);
 	return detail;
 }
 
-RfPageProofDetailV1
-rf_page_recovery_ctrc_replays_fpi_readback_v1(const struct ClusterRecoveryStartV1 *start,
+static RfPageProofDetailV1
+ctrc_native_fpi_readback(const struct ClusterRecoveryStartV1 *start,
 	const ClusterColdCtrcWorkV1 *work, const ClusterRecoveryCtrcReplaySetSourceV1 *source,
 	RfPageCtrcAuthorityV1 *authority, const RfPageCtrcFpiInsertV1 *inserted,
-	ClusterSharedFsPageV1 *storage, Size subject_count, Size memory_budget)
+	ClusterSharedFsPageV1 *storage, Size subject_count, Size memory_budget, bool completed)
 {
 	CtrcNativeInstallV1 context = {0};
 	CtrcNativeStepV1 step = {0};
@@ -772,6 +784,7 @@ rf_page_recovery_ctrc_replays_fpi_readback_v1(const struct ClusterRecoveryStartV
 	if (binding->work_bytes > memory_budget) return RF_PAGE_PROOF_DETAIL_CAPACITY;
 	memcpy(&header, work, offsetof(ClusterColdCtrcWorkV1, entries));
 	context.original = inserted; context.fixed = *inserted; context.durable_readback = true;
+	context.completed_readback = completed;
 	binding->start = start; binding->work = work;
 	binding->original_source = source; binding->source = *source;
 	binding->original_image = &inserted->image;
@@ -785,7 +798,29 @@ rf_page_recovery_ctrc_replays_fpi_readback_v1(const struct ClusterRecoveryStartV
 	if (!cluster_space_identity_encode(&step.space, step.space_identity, sizeof(step.space_identity)))
 		return RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
 	binding->read.step = &step; binding->read.step_current = ctrc_native_readback_step_current;
+	if (completed && !ctrc_native_readback_operation_current(&context))
+		return RF_PAGE_PROOF_DETAIL_ROOT_STALE;
 	return ctrc_native_readback_attempt(&context, &step, authority, &header);
+}
+
+RfPageProofDetailV1
+rf_page_recovery_ctrc_replays_fpi_readback_v1(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, const ClusterRecoveryCtrcReplaySetSourceV1 *source,
+	RfPageCtrcAuthorityV1 *authority, const RfPageCtrcFpiInsertV1 *inserted,
+	ClusterSharedFsPageV1 *storage, Size subject_count, Size memory_budget)
+{
+	return ctrc_native_fpi_readback(start, work, source, authority, inserted,
+		storage, subject_count, memory_budget, false);
+}
+
+RfPageProofDetailV1
+rf_page_recovery_ctrc_replays_completed_readback_v1(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, const ClusterRecoveryCtrcReplaySetSourceV1 *source,
+	RfPageCtrcAuthorityV1 *authority, const RfPageCtrcFpiInsertV1 *inserted,
+	ClusterSharedFsPageV1 *storage, Size subject_count, Size memory_budget)
+{
+	return ctrc_native_fpi_readback(start, work, source, authority, inserted,
+		storage, subject_count, memory_budget, true);
 }
 
 /* Called only inside the original successful install attempt: both full-work

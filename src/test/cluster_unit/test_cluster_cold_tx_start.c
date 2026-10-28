@@ -2334,9 +2334,20 @@ static void startup_local_empty_reset(void);
 #include "test_cluster_cold_ctrc_local_empty.inc"
 
 #include "test_cluster_cold_ctrc_fpi_retirement.inc"
+#include "test_cluster_cold_ctrc_completed_readback.inc"
 
 int main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_COMPLETED_PAGE_STARTUP") != NULL) {
+		UT_PLAN(6);
+		UT_RUN(test_startup_completed_pages_are_reread_before_independent_service);
+		UT_RUN(test_startup_completed_page_refusal_keeps_all_fds_and_shared_debt);
+		UT_RUN(test_startup_completed_page_error_preserves_original_cleanup);
+		UT_RUN(test_startup_completed_page_wait_reuses_original_result_and_fds);
+		UT_RUN(test_startup_completed_result_drift_after_page_cleanup_prevents_service);
+		UT_RUN(test_startup_completed_binding_refuses_copies_other_fds_and_retired_observation);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_STARTUP_FPI_RETIREMENT") != NULL) {
 		UT_PLAN(7);
 		UT_RUN(test_startup_retires_exact_fpi_windows_before_next_target_and_service);
@@ -2485,7 +2496,13 @@ int main(void)
 		UT_RUN(test_ctrc_pages_native_error_retires_cursor_before_original_scope);
 		reset(); UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(212);
+	UT_PLAN(218);
+	UT_RUN(test_startup_completed_pages_are_reread_before_independent_service);
+	UT_RUN(test_startup_completed_page_refusal_keeps_all_fds_and_shared_debt);
+	UT_RUN(test_startup_completed_page_error_preserves_original_cleanup);
+	UT_RUN(test_startup_completed_page_wait_reuses_original_result_and_fds);
+	UT_RUN(test_startup_completed_result_drift_after_page_cleanup_prevents_service);
+	UT_RUN(test_startup_completed_binding_refuses_copies_other_fds_and_retired_observation);
 	UT_RUN(test_startup_retires_exact_fpi_windows_before_next_target_and_service);
 	UT_RUN(test_startup_retired_fpi_progress_does_not_repeat_wal_or_readback);
 	UT_RUN(test_startup_retired_fpi_fd_loss_refuses_without_reopening_or_releasing_scope);
