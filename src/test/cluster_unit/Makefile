@@ -9261,6 +9261,7 @@ test_cluster_r4_activation_fsm: test_cluster_r4_activation_fsm.c unit_test.h tes
 		test_cluster_normal_cold_prepare.inc test_cluster_normal_cold_postjobs.inc test_cluster_hw_complete_tail.inc \
 		test_cluster_normal_cold_runtime.h $(CLUSTER_UNDO_BLOCK0_RESIDENT_O) \
 		cluster_r4_open_route_test_stubs.h $(CLUSTER_R4_OPEN_ROUTE_TEST_O) \
+		$(top_srcdir)/src/backend/cluster/cluster_control_rebind.inc \
 		$(CLUSTER_SEMANTIC_ACTIVATION_C) $(CLUSTER_SEMANTIC_ACTIVATION_H) \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_BLOCK0_O) $(CLUSTER_REPLACEMENT_EPISODE_O) \
 		$(CLUSTER_REPLACEMENT_WIRE_O) $(CLUSTER_EPOCH_BALLOT_O) \
@@ -9278,6 +9279,8 @@ test_cluster_r4_activation_fsm: test_cluster_r4_activation_fsm.c unit_test.h tes
 TESTS += test_cluster_control_rebind
 all: test_cluster_control_rebind
 
+test_cluster_r4_activation_record: $(top_srcdir)/src/backend/cluster/cluster_control_rebind.inc
+
 test_cluster_control_rebind: test_cluster_control_rebind.c test_cluster_r4_activation_fsm.c \
 		test_cluster_first_open.h test_cluster_serving_admission.h test_cluster_sample_ack_handoff.h \
 		test_cluster_clean_restart_formation.h test_cluster_commit_carrier.h unit_test.h \
@@ -9286,6 +9289,7 @@ test_cluster_control_rebind: test_cluster_control_rebind.c test_cluster_r4_activ
 		test_cluster_normal_cold_capture.inc test_cluster_normal_cold_prepare.inc \
 		test_cluster_normal_cold_postjobs.inc test_cluster_hw_complete_tail.inc \
 		test_cluster_normal_cold_runtime.h cluster_r4_open_route_test_stubs.h \
+		$(top_srcdir)/src/backend/cluster/cluster_control_rebind.inc \
 		$(CLUSTER_SEMANTIC_ACTIVATION_C) $(CLUSTER_SEMANTIC_ACTIVATION_H) \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_BLOCK0_O) $(CLUSTER_REPLACEMENT_EPISODE_O) \
 		$(CLUSTER_REPLACEMENT_WIRE_O) $(CLUSTER_EPOCH_BALLOT_O) \

@@ -1541,7 +1541,8 @@ UT_TEST(test_64_shmem_size_includes_exact_ack_table)
 					+ MAXALIGN(sizeof(ClusterR4Bit22SourceCloseShmem))
 					+ MAXALIGN(sizeof(pg_atomic_uint32)) /* local clean-start observation */
 					+ MAXALIGN(sizeof(ClusterNormalStartCompletion))
-					+ MAXALIGN(sizeof(SemanticServingCompletion));
+					+ MAXALIGN(sizeof(SemanticServingCompletion))
+					+ MAXALIGN(sizeof(SemanticControlRebindShmem));
 
 	UT_ASSERT_EQ(cluster_semantic_activation_shmem_size(), expected);
 }

@@ -10,6 +10,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_conf.h"
+#include "storage/proc.h"
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_cr_server.h"
 #include "cluster/cluster_epoch.h"
@@ -19,6 +20,7 @@
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_ic_tier1.h"
+#include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_write_fence.h"
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_qvotec.h"
@@ -98,7 +100,8 @@ static TestSemanticUtilityMailboxStorage test_semantic_utility_mailbox;
 static TestSemanticAckTableStorage test_semantic_ack_table;
 static TestSemanticPgrdSnapshotStorage test_semantic_pgrd_snapshot;
 static TestSemanticBit22LatchStorage test_semantic_bit22_latch;
-typedef struct TestSemanticSourceCloseStorage {
+typedef union TestSemanticSourceCloseStorage {
+	pg_atomic_uint64 align;
 	uint8 bytes[TEST_SEMANTIC_BIT22_SOURCE_CLOSE_BYTES];
 } TestSemanticSourceCloseStorage;
 static TestSemanticSourceCloseStorage test_semantic_source_close;
@@ -110,6 +113,18 @@ static union {
 } test_normal_start_completion;
 static TestSemanticShmemStorage test_serving_completion;
 static bool test_serving_found;
+static union {
+	pg_atomic_uint64 align;
+	uint8 bytes[CLUSTER_SEMANTIC_CONTROL_REBIND_STATE_BUDGET];
+} test_rebind_shmem;
+static bool test_rebind_found;
+static PGPROC test_rebind_proc;
+PGPROC *MyProc = &test_rebind_proc;
+int cluster_interconnect_heartbeat_interval_ms = 1000;
+static uint64 test_rebind_stream_serial[4];
+static const ClusterICEnvelope *test_rebind_dispatch_envelope;
+static ClusterICControlIngress test_rebind_dispatch_ingress;
+
 static bool test_serving_formation_valid;
 static uint64 test_serving_formation;
 static ClusterControlRootResult test_serving_result;
@@ -189,6 +204,39 @@ static unsigned test_recovery_ctrc_accept_calls;
 static bool test_recovered_checkpoint_fail_after_first;
 static int test_first_live_checks;
 static ClusterControlRootResult test_first_live_result;
+
+bool
+cluster_ic_dispatch_control_ingress(const ClusterICEnvelope *env, ClusterICControlIngress *out)
+{
+	if (env != test_rebind_dispatch_envelope || out == NULL)
+		return false;
+	*out = test_rebind_dispatch_ingress;
+	return true;
+}
+
+bool
+cluster_ic_tier1_stream_capture(int32 peer, ClusterICTier1Stream *out)
+{
+	if (peer < 0 || peer >= 4 || out == NULL || test_rebind_stream_serial[peer] == 0)
+		return false;
+	memset(out, 0, sizeof(*out));
+	out->serial = test_rebind_stream_serial[peer];
+	out->epoch = test_current_epoch;
+	out->owner_pid = MyProcPid;
+	out->peer = peer;
+	out->plane = CLUSTER_IC_PLANE_CONTROL;
+	out->channel = -1;
+	return true;
+}
+
+bool
+cluster_ic_tier1_stream_current(const ClusterICTier1Stream *stream)
+{
+	ClusterICTier1Stream current;
+	return stream != NULL && cluster_ic_tier1_stream_capture(stream->peer, &current)
+		   && memcmp(stream, &current, sizeof(current)) == 0;
+}
+
 
 bool
 cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out)
@@ -428,6 +476,12 @@ cluster_pcm_lock_resource_x_cutover_current_proof_digest_exact(bool thawed,
 void *
 ShmemInitStruct(const char *name, Size size, bool *foundPtr)
 {
+	if (strcmp(name, "pgrac CONTROL rebind proof") == 0) {
+		if (size > sizeof(test_rebind_shmem))
+			abort();
+		*foundPtr = test_rebind_found;
+		return test_rebind_shmem.bytes;
+	}
 	if (strcmp(name, "pgrac semantic ROOT serving completion") == 0) {
 		if (size > sizeof(test_serving_completion))
 			abort();
@@ -1374,6 +1428,16 @@ test_gate_reset(void)
 	test_recovered_checkpoint_fail_after_first = false;
 	memset(&test_recovered_checkpoint, 0, sizeof(test_recovered_checkpoint));
 	test_serving_found = false;
+	test_rebind_found = false;
+	memset(&test_rebind_shmem, 0, sizeof(test_rebind_shmem));
+	memset(&test_rebind_proc, 0, sizeof(test_rebind_proc));
+	test_rebind_proc.cluster_grd_generation = 41;
+	test_rebind_proc.pgprocno = 7;
+	MyProc = &test_rebind_proc;
+	test_rebind_dispatch_envelope = NULL;
+	memset(&test_rebind_dispatch_ingress, 0, sizeof(test_rebind_dispatch_ingress));
+	for (unsigned node = 0; node < 4; node++)
+		test_rebind_stream_serial[node] = 100 + node;
 	test_serving_formation_valid = false;
 	test_serving_formation = 2;
 	test_serving_result = CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
@@ -5745,6 +5809,7 @@ UT_TEST(test_99_shared_gate_layout_and_bootstrap_are_fail_closed)
 					 + MAXALIGN(TEST_SEMANTIC_BIT22_SEAM_BYTES)
 					 + MAXALIGN(TEST_SEMANTIC_BIT22_SOURCE_CLOSE_BYTES)
 					 + MAXALIGN(sizeof(SemanticServingCompletion))
+					 + MAXALIGN(sizeof(SemanticControlRebindShmem))
 					 + MAXALIGN(sizeof(pg_atomic_uint32)) + MAXALIGN(1568));
 	UT_ASSERT(!cluster_r4_bit22_cutover_active());
 	UT_ASSERT(SemanticActivationAckTable

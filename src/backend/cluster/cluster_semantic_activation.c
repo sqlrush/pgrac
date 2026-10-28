@@ -56,6 +56,7 @@
 #include "storage/lwlock.h"
 #include "storage/fd.h"
 #include "storage/shmem.h"
+#include "storage/proc.h"
 #include <dirent.h>
 #include <sys/stat.h>
 
@@ -768,7 +769,76 @@ typedef struct SemanticControlRebindBaseline {
 	ClusterSemanticActivationAckTableV1 table;
 } SemanticControlRebindBaseline;
 
-static SemanticControlRebindBaseline semantic_control_rebind_baseline;
+typedef struct SemanticControlRebindCut {
+	SemanticServingCut identity;
+	ClusterICTier1Stream streams[4];
+	uint64 owner_generation;
+	int32 owner_pid;
+	int32 owner_procno;
+	uint64 base_seq;
+} SemanticControlRebindCut;
+
+typedef struct SemanticControlRebindCompletion {
+	SemanticControlRebindCut cut;
+	uint64 nonce;
+	uint8 proof_binding[32];
+	uint8 live_digest[32];
+	ClusterSemanticActivationAckTableV1 table;
+} SemanticControlRebindCompletion;
+
+typedef struct SemanticControlRebindShmem {
+	pg_atomic_uint64 baseline_seq;
+	pg_atomic_uint64 nonce;
+	pg_atomic_uint64 read_seq;
+	uint64 read_nonce;
+	uint64 read_owner_generation;
+	int32 read_owner_pid;
+	int32 read_owner_procno;
+	SemanticControlRebindBaseline baseline;
+	SemanticControlRebindCut original_cut;
+	pg_atomic_uint64 completion_seq;
+	SemanticControlRebindCompletion completion;
+} SemanticControlRebindShmem;
+
+static SemanticControlRebindShmem *SemanticControlRebindState;
+
+typedef enum SemanticControlRebindPhase {
+	SEMANTIC_CONTROL_REBIND_IDLE,
+	SEMANTIC_CONTROL_REBIND_READING,
+	SEMANTIC_CONTROL_REBIND_COLLECTING,
+	SEMANTIC_CONTROL_REBIND_COMPLETE,
+	SEMANTIC_CONTROL_REBIND_INVALID
+} SemanticControlRebindPhase;
+
+typedef struct SemanticControlRebindIngress {
+	bool valid;
+	ClusterSemanticControlRebindWireV3 message;
+	ClusterICTier1Stream stream;
+	ClusterSfPeerCap capability;
+} SemanticControlRebindIngress;
+
+typedef struct SemanticControlRebindRuntime {
+	SemanticControlRebindPhase phase;
+	SemanticControlRebindCut cut;
+	uint64 nonce;
+	uint64 read_seq;
+	uint64 read_nonce;
+	bool read_verified;
+	uint8 proof_binding[32];
+	ClusterSemanticActivationAckTableV1 table;
+	TimestampTz last_send[4];
+	SemanticControlRebindIngress requests[4];
+	SemanticControlRebindIngress acks[4];
+} SemanticControlRebindRuntime;
+
+static SemanticControlRebindRuntime semantic_control_rebind;
+static bool semantic_control_rebind_tick(TimestampTz now) pg_attribute_unused();
+static bool semantic_control_rebind_ingress(const ClusterICEnvelope *env, const void *payload)
+	pg_attribute_unused();
+static bool normal_start_service_binding_current(const ClusterSemanticActivationRecord *open,
+												 const uint8 *root,
+												 const ClusterSemanticActivationAckTableV1 *table);
+
 
 static struct {
 	uint64 read_seq;
@@ -781,12 +851,12 @@ static struct {
 	uint8 root[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
 } semantic_serving;
 
-/* Includes the raw read retained above and reserves both later full tables.
- * Any subsequent collector metadata must also fit this aggregate budget. */
-StaticAssertDecl(sizeof(SemanticControlRebindBaseline) + sizeof(semantic_serving.pgsa)
-					+ 2 * sizeof(ClusterSemanticActivationAckTableV1)
-					<= CLUSTER_SEMANTIC_CONTROL_REBIND_STATE_BUDGET,
-				 "CONTROL rebind state exceeds its per-instance budget");
+/* One shared baseline and completion, one owner candidate, and all slots.
+ * The raw serving read is included; stack-only snapshots are accounted separately. */
+StaticAssertDecl(MAXALIGN(sizeof(SemanticControlRebindShmem)) + sizeof(SemanticControlRebindRuntime)
+						 + sizeof(SemanticControlRebindState) + sizeof(semantic_serving.pgsa)
+					 <= CLUSTER_SEMANTIC_CONTROL_REBIND_STATE_BUDGET,
+				 "CONTROL rebind shared and owner state exceeds its per-instance budget");
 static bool
 semantic_activation_restart_collecting(const ClusterSemanticActivationAckTableV1 *table);
 static bool semantic_activation_restart_ingress(const SemanticActivationAckIngressItem *item);
@@ -10453,7 +10523,8 @@ cluster_semantic_activation_shmem_size(void)
 		   + MAXALIGN(sizeof(ClusterR4Bit22CutoverSeamShmem))
 		   + MAXALIGN(sizeof(ClusterR4Bit22SourceCloseShmem)) + MAXALIGN(sizeof(pg_atomic_uint32))
 		   + MAXALIGN(sizeof(ClusterNormalStartCompletion))
-		   + MAXALIGN(sizeof(SemanticServingCompletion));
+		   + MAXALIGN(sizeof(SemanticServingCompletion))
+		   + MAXALIGN(sizeof(SemanticControlRebindShmem));
 }
 
 void
@@ -10469,6 +10540,7 @@ cluster_semantic_activation_shmem_init(void)
 	bool clean_start_found;
 	bool normal_start_found;
 	bool serving_found;
+	bool rebind_found;
 	int side;
 	int feature_index;
 
@@ -10503,11 +10575,22 @@ cluster_semantic_activation_shmem_init(void)
 	SemanticServingReady
 		= ShmemInitStruct("pgrac semantic ROOT serving completion",
 						  MAXALIGN(sizeof(SemanticServingCompletion)), &serving_found);
+	SemanticControlRebindState = ShmemInitStruct(
+		"pgrac CONTROL rebind proof", MAXALIGN(sizeof(SemanticControlRebindShmem)), &rebind_found);
+	if (SemanticControlRebindState != NULL && !rebind_found) {
+		memset(SemanticControlRebindState, 0, sizeof(*SemanticControlRebindState));
+		pg_atomic_init_u64(&SemanticControlRebindState->baseline_seq, 0);
+		pg_atomic_init_u64(&SemanticControlRebindState->nonce, 0);
+		pg_atomic_init_u64(&SemanticControlRebindState->read_seq, 0);
+		pg_atomic_init_u64(&SemanticControlRebindState->completion_seq, 0);
+		memset(&semantic_control_rebind, 0, sizeof(semantic_control_rebind));
+	}
 	if (SemanticActivationShmem == NULL || SemanticActivationUtilityMailbox == NULL
-		|| SemanticActivationAckTable == NULL || SemanticActivationPgrdSnapshot == NULL
-		|| SemanticActivationBit22Latch == NULL || SemanticActivationBit22Seam == NULL
-		|| SemanticActivationBit22SourceClose == NULL || SemanticActivationCleanStart == NULL
-		|| NormalStartCompletion == NULL || SemanticServingReady == NULL)
+		|| SemanticControlRebindState == NULL || SemanticActivationAckTable == NULL
+		|| SemanticActivationPgrdSnapshot == NULL || SemanticActivationBit22Latch == NULL
+		|| SemanticActivationBit22Seam == NULL || SemanticActivationBit22SourceClose == NULL
+		|| SemanticActivationCleanStart == NULL || NormalStartCompletion == NULL
+		|| SemanticServingReady == NULL)
 		return;
 	if (!serving_found) {
 		memset(SemanticServingReady, 0, sizeof(*SemanticServingReady));
@@ -14494,6 +14577,8 @@ semantic_activation_restart_tick(void)
 	return true;
 }
 
+#include "cluster_control_rebind.inc"
+
 /* Memory-only observation, also usable by the no-PGPROC postmaster. The
  * formation accessor uses conditional locking there. Never read voting/ROOT
  * files or infer readiness from another member's SQL admission. */
@@ -14620,24 +14705,51 @@ semantic_control_rebind_capture_baseline(const SemanticServingCut *cut)
 	SemanticControlRebindBaseline copy = { 0 };
 	SemanticServingCut after;
 	ClusterSemanticActivationRecord open;
+	SemanticControlRebindCut original = { 0 };
 
 	if (!IsUnderPostmaster || !AmLmonProcess() || cut == NULL || !semantic_serving.have_open
+		|| SemanticControlRebindState == NULL || MyProc == NULL || MyProcPid <= 0
+		|| MyProc->pgprocno < 0 || MyProc->cluster_grd_generation == 0
+		|| MyProc->cluster_grd_generation == UINT64_MAX
+		|| pg_atomic_read_u64(&SemanticControlRebindState->baseline_seq) != 0
 		|| !cluster_semantic_activation_record_decode(semantic_serving.pgsa, &open, NULL)
 		|| memcmp(&open, &semantic_serving.open, sizeof(open)) != 0
 		|| !semantic_activation_ack_table_snapshot(&copy.table)
 		|| pg_atomic_read_u64(&copy.table.publication_seq) != cut->ack_seq
-		|| copy.table.flags != (CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID
-			| CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_COMPLETE)
+		|| copy.table.flags
+			   != (CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID
+				   | CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_COMPLETE)
 		|| copy.table.expected_members_lo != 15 || copy.table.expected_members_hi != 0)
 		return;
 	copy.cut = *cut;
 	memcpy(copy.pgsa, semantic_serving.pgsa, sizeof(copy.pgsa));
 	memcpy(copy.root, semantic_serving.root, sizeof(copy.root));
-	if (cluster_semantic_normal_stop_match(&open, copy.root, NULL, NULL) != CLUSTER_NORMAL_STOP_READY
+	if (cluster_semantic_normal_stop_match(&open, copy.root, NULL, NULL)
+			!= CLUSTER_NORMAL_STOP_READY
 		|| !semantic_serving_cut_read(&after) || memcmp(cut, &after, sizeof(after)) != 0)
 		return;
+	original.identity = *cut;
+	original.owner_pid = MyProcPid;
+	original.owner_procno = MyProc->pgprocno;
+	original.owner_generation = MyProc->cluster_grd_generation;
+	original.base_seq = 2;
+	for (unsigned peer = 0; peer < 4; peer++)
+		if (peer != (unsigned)cluster_node_id
+			&& !cluster_ic_tier1_stream_capture(peer, &original.streams[peer]))
+			return;
+	if (!semantic_serving_cut_read(&after) || memcmp(cut, &after, sizeof(after)) != 0)
+		return;
+	for (unsigned peer = 0; peer < 4; peer++)
+		if (peer != (unsigned)cluster_node_id
+			&& !cluster_ic_tier1_stream_current(&original.streams[peer]))
+			return;
 	copy.valid = true;
-	memcpy(&semantic_control_rebind_baseline, &copy, sizeof(copy));
+	pg_atomic_write_u64(&SemanticControlRebindState->baseline_seq, 1);
+	pg_write_barrier();
+	memcpy(&SemanticControlRebindState->baseline, &copy, sizeof(copy));
+	SemanticControlRebindState->original_cut = original;
+	pg_write_barrier();
+	pg_atomic_write_u64(&SemanticControlRebindState->baseline_seq, 2);
 }
 
 static void
@@ -15916,6 +16028,9 @@ semantic_activation_authority_mailbox_owner(bool include_stop)
 							  semantic_activation_restart.read_seq,
 							  semantic_activation_restart.pgrd_seq,
 							  semantic_serving.read_seq,
+							  SemanticControlRebindState != NULL
+								  ? pg_atomic_read_u64(&SemanticControlRebindState->read_seq)
+								  : 0,
 							  include_stop ? semantic_activation_lmon_stop_read_seq : 0 };
 	unsigned i;
 	for (i = 0; i < lengthof(owners); i++)
