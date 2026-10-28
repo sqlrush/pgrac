@@ -52,6 +52,7 @@
 #include "catalog/pg_ts_dict.h"
 #include "catalog/pg_ts_parser.h"
 #include "catalog/pg_ts_template.h"
+#include "catalog/pg_sequence.h"
 #include "catalog/pg_type_d.h"
 #include "catalog/pg_user_mapping.h"
 #include "commands/alter.h"
@@ -67,6 +68,7 @@
 #include "commands/publicationcmds.h"
 #include "commands/schemacmds.h"
 #include "commands/seclabel.h"
+#include "commands/sequence.h"
 #include "commands/user.h"
 #include "commands/view.h"
 #include "cluster/cluster_ic.h"
@@ -7603,10 +7605,38 @@ make_parsestate(ParseState *parent)
 	return &policy_parse_states[(policy_parses - 1) % 2];
 }
 
+/* Sequence alteration stops at its first target lookup, before locking or callbacks. */
+static bool sequence_alter_lookup_active, sequence_alter_expect_binding;
+static unsigned sequence_alter_lookups, sequence_alter_unbound, sequence_alter_bad_lookup;
+static unsigned sequence_alter_unexpected_callbacks;
+static uint32 sequence_alter_expected_flags;
+static AlterSeqStmt native_sequence_alter_statement;
+
+void
+RangeVarCallbackOwnsRelation(const RangeVar *relation, Oid relid, Oid oldrelid, void *arg)
+{
+	(void)relation;
+	(void)relid;
+	(void)oldrelid;
+	(void)arg;
+	sequence_alter_unexpected_callbacks++;
+	siglongjmp(boundary, 3); /* This lookup boundary must not invoke the owner callback. */
+}
+
 Oid
 RangeVarGetRelidExtended(const RangeVar *relation, LOCKMODE lockmode, uint32 flags,
 						 RangeVarGetRelidCallback callback, void *callback_arg)
 {
+	if (sequence_alter_lookup_active) {
+		sequence_alter_lookups++;
+		if (sequence_alter_expect_binding && utility_binds == 0)
+			sequence_alter_unbound++;
+		if (relation != native_sequence_alter_statement.sequence
+			|| lockmode != ShareRowExclusiveLock || flags != sequence_alter_expected_flags
+			|| callback != RangeVarCallbackOwnsRelation || callback_arg != NULL)
+			sequence_alter_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before the real lookup, lock or owner callback. */
+	}
 	policy_lookups++;
 	if (policy_expect_binding && utility_binds == 0)
 		policy_unbound++;
@@ -11858,10 +11888,200 @@ UT_TEST(test_native_rule_utility_warm_guards_preserve_binding)
 	rule_lookup_active = false;
 }
 
+/* Real private sequence types and one native prefix; all rewrite/options/SQ work
+ * remain beyond the first lookup boundary. Identity forms are input shapes only. */
+#include "test_cluster_fresh_sequence_alter.inc"
+
+static ParseState sequence_alter_parse_state;
+static RangeVar sequence_alter_target;
+static Integer sequence_alter_option_value;
+static DefElem sequence_alter_option;
+static ListCell sequence_alter_option_cell;
+static List sequence_alter_options;
+static Node *sequence_alter_expected_statement;
+
+static void
+reset_native_sequence_alter(bool expect_binding, unsigned form)
+{
+	static const uint32 flags[] = { 0, RVR_MISSING_OK, 0, RVR_MISSING_OK };
+	static const char *option_names[] = { "cache", "restart", "increment", "maxvalue" };
+
+	reset_create_preflight();
+	sequence_alter_lookup_active = true;
+	sequence_alter_expect_binding = expect_binding;
+	sequence_alter_lookups = sequence_alter_unbound = sequence_alter_bad_lookup = 0;
+	sequence_alter_unexpected_callbacks = 0;
+	sequence_alter_expected_flags = flags[form];
+	sequence_alter_parse_state = (ParseState){ 0 };
+	sequence_alter_target = (RangeVar){ .type = T_RangeVar,
+										.schemaname = form < 2 ? NULL : "public",
+										.relname = "target_sequence",
+										.relpersistence = RELPERSISTENCE_PERMANENT };
+	sequence_alter_option_value = (Integer){ .type = T_Integer, .ival = 64 };
+	sequence_alter_option = (DefElem){ .type = T_DefElem,
+									   .defname = (char *)option_names[form],
+									   .arg = (Node *)&sequence_alter_option_value };
+	sequence_alter_option_cell.ptr_value = &sequence_alter_option;
+	sequence_alter_options = (List){ .type = T_List,
+									 .length = 1,
+									 .max_length = 1,
+									 .elements = &sequence_alter_option_cell };
+	native_sequence_alter_statement = (AlterSeqStmt){ .type = T_AlterSeqStmt,
+													  .sequence = &sequence_alter_target,
+													  .options = &sequence_alter_options,
+													  .for_identity = form >= 2,
+													  .missing_ok = form % 2 != 0 };
+	sequence_alter_expected_statement = (Node *)&native_sequence_alter_statement;
+}
+
+static void
+native_sequence_alter_entry(void)
+{
+	(void)AlterSequence(&sequence_alter_parse_state, &native_sequence_alter_statement);
+}
+
+UT_TEST(test_native_sequence_alter_binds_before_first_query_in_all_profiles)
+{
+	for (unsigned form = 0; form < 4; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_sequence_alter(binds, form);
+			set_native_operator_mode(mode);
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_sequence_alter_entry();
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(sequence_alter_lookups, repeat + 1);
+				UT_ASSERT_EQ(sequence_alter_unbound, 0);
+				UT_ASSERT_EQ(sequence_alter_bad_lookup + sequence_alter_unexpected_callbacks, 0);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	sequence_alter_lookup_active = false;
+}
+
+UT_TEST(test_native_sequence_alter_refuses_before_lookup_on_publication_child_and_top_errors)
+{
+	for (unsigned form = 0; form < 4; form++) {
+		for (unsigned failure = 0; failure < 5; failure++) {
+			bool allocated = failure == 0 || failure == 2;
+			int caught;
+
+			reset_native_sequence_alter(true, form);
+			if (failure == 0)
+				utility_bind_ok = false;
+			else if (failure == 1 || failure == 2) {
+				if (failure == 2)
+					create_sql_entry(sequence_alter_expected_statement);
+				utility_in_child = true;
+			} else {
+				utility_current_xid = 401;
+				utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_sequence_alter_entry();
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, failure == 0  ? ERRCODE_DATA_CORRUPTED
+									 : failure < 3 ? ERRCODE_FEATURE_NOT_SUPPORTED
+												   : ERRCODE_INTERNAL_ERROR);
+			UT_ASSERT_STR_EQ(
+				error_message,
+				failure == 0
+					? "canonical ACTIVE publication failed before shared catalog alteration"
+				: failure < 3 ? "shared catalog alteration does not support subtransactions"
+							  : "shared catalog top-level transaction identity mismatch");
+			UT_ASSERT_EQ(sequence_alter_lookups, 0);
+			UT_ASSERT_EQ(sequence_alter_unbound + sequence_alter_bad_lookup
+							 + sequence_alter_unexpected_callbacks,
+						 0);
+			UT_ASSERT_EQ(utility_xids, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, failure == 2 ? 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, allocated || failure == 3 ? 400 : InvalidTransactionId);
+		}
+	}
+	sequence_alter_lookup_active = false;
+}
+
+UT_TEST(test_native_sequence_alter_context_guards_keep_nonshared_route)
+{
+	for (unsigned form = 0; form < 4; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+
+			for (unsigned guard = 0; guard < 3; guard++) {
+				int caught;
+
+				reset_native_sequence_alter(binds, form);
+				set_native_operator_mode(mode);
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_sequence_alter_entry();
+				UT_ASSERT_EQ(caught, binds ? 1 : 2);
+				UT_ASSERT_EQ(error_code, !binds		  ? 0
+										 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+													  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				UT_ASSERT_EQ(sequence_alter_lookups, binds ? 0 : 1);
+				UT_ASSERT_EQ(sequence_alter_unbound + sequence_alter_bad_lookup
+								 + sequence_alter_unexpected_callbacks,
+							 0);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	sequence_alter_lookup_active = false;
+}
+
+UT_TEST(test_native_sequence_alter_utility_warm_guards_preserve_binding)
+{
+	for (unsigned form = 0; form < 4; form++) {
+		for (unsigned guard = 0; guard < 4; guard++) {
+			int caught;
+
+			reset_native_sequence_alter(true, form);
+			create_sql_entry(sequence_alter_expected_statement);
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			XactReadOnly = guard == 1;
+			utility_parallel = guard == 2;
+			utility_recovery = guard == 3;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_sequence_alter_entry();
+			UT_ASSERT_EQ(caught, guard ? 1 : 2);
+			UT_ASSERT_EQ(error_code, !guard		  ? 0
+									 : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+												  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT_EQ(sequence_alter_lookups, guard ? 0 : 1);
+			UT_ASSERT_EQ(sequence_alter_unbound + sequence_alter_bad_lookup
+							 + sequence_alter_unexpected_callbacks,
+						 0);
+			UT_ASSERT_EQ(utility_prepares, guard ? 1 : 2);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			UT_ASSERT_EQ(utility_top_xid, 400);
+		}
+	}
+	sequence_alter_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(177);
+	UT_PLAN(181);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -12039,6 +12259,10 @@ main(void)
 	UT_RUN(test_native_rule_refuses_before_lookup_on_publication_child_and_top_errors);
 	UT_RUN(test_native_rule_context_guards_keep_nonshared_route);
 	UT_RUN(test_native_rule_utility_warm_guards_preserve_binding);
+	UT_RUN(test_native_sequence_alter_binds_before_first_query_in_all_profiles);
+	UT_RUN(test_native_sequence_alter_refuses_before_lookup_on_publication_child_and_top_errors);
+	UT_RUN(test_native_sequence_alter_context_guards_keep_nonshared_route);
+	UT_RUN(test_native_sequence_alter_utility_warm_guards_preserve_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
