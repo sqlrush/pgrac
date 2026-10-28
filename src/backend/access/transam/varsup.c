@@ -648,6 +648,25 @@ cluster_relmap_retention_allocate_xid_v2(bool isSubXact, uint64 system_identifie
 	return get_new_transaction_id(isSubXact, &allocation, false);
 }
 
+/* PGRAC: preserve the original retention guard while selecting native FULL
+ * CLOG initialization. This entry grants no recovery or lifetime authority. */
+FullTransactionId
+cluster_relmap_retention_allocate_full_clog_xid_v2(bool isSubXact,
+	uint64 system_identifier, uint64 database_incarnation, uint16 origin)
+{
+	RelmapXidAllocationV2 allocation = { 0 };
+
+	if (!cluster_enabled || !cluster_shared_config || !IsNormalProcessingMode()
+		|| system_identifier == 0 || database_incarnation == 0 || origin >= CLUSTER_MAX_NODES)
+		ereport(ERROR,
+			(errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
+			 errmsg("refusing to assign a new transaction ID: relmap allocator context is not qualified")));
+	allocation.system_identifier = system_identifier;
+	allocation.database_incarnation = database_incarnation;
+	allocation.origin = origin;
+	return get_new_transaction_id(isSubXact, &allocation, true);
+}
+
 /* Original Startup has finished every native/SIDE fold, still excludes new
  * transactions and holds XidGenLock. Inspect the imported counter itself;
  * a successful snapshot is neither issuance nor an admission certificate.

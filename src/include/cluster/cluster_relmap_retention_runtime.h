@@ -232,6 +232,16 @@ extern ClusterRelmapRetentionResult cluster_relmap_retention_runtime_allocation_
 extern FullTransactionId cluster_relmap_retention_allocate_xid_v2(bool isSubXact,
 	uint64 system_identifier, uint64 database_incarnation, uint16 origin);
 
+/* Same original admission, lock order, candidate rechecks and nofail
+ * publication, using ExtendCLOGFull for the actual candidate and every skipped
+ * FullXid. Native initialization remains fallible and precedes the final
+ * retention check and stores. No caller-supplied FullXid, live caller or
+ * activation: complete native era/history/lifetime qualification is still the
+ * original caller's duty, and neither initialization nor these routing numbers
+ * provides it. The ordinary and existing raw retained entries are unchanged. */
+extern FullTransactionId cluster_relmap_retention_allocate_full_clog_xid_v2(bool isSubXact,
+	uint64 system_identifier, uint64 database_incarnation, uint16 origin);
+
 /* Dormant original Startup check AFTER all native/SIDE recovery/import and
  * BEFORE opening allocation. The original owner authenticates DB incarnation,
  * complete native/source/base/era/history/lifetime inputs and COMPLETE; numbers

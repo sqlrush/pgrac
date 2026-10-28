@@ -461,6 +461,7 @@ cluster_relmap_owner_terminal_matches_v2(const ClusterRelmapOwnerSampleV2 *owner
 	return false;
 } /* No original-owner authority in this fixture. */
 #define LWLockHeldByMe c_allocator_relmap_LWLockHeldByMe
+bool LWLockHeldByMe(LWLock *lock);
 bool
 LWLockHeldByMe(LWLock *lock)
 {
