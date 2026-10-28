@@ -1114,6 +1114,8 @@ cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **held)
 #include "test_cluster_recovery_episode_all_clog.inc"
 #include "test_cluster_recovery_episode_native_pages.inc"
 #include "test_cluster_recovery_episode_applied_pages.inc"
+#include "test_cluster_recovery_episode_side_owner.h"
+#include "test_cluster_recovery_episode_applied_owner.inc"
 #include "test_cluster_recovery_episode_generation_xid.inc"
 #include "test_cluster_recovery_clog_full_roots.inc"
 
@@ -1125,6 +1127,14 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_APPLIED_OWNER") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_episode_applied_owner_whole_source_preflight_precedes_native_mutation);
+		UT_RUN(test_episode_applied_owner_equivalent_plan_does_not_replace_original_attempt);
+		UT_RUN(test_episode_applied_owner_scope_false_and_error_do_not_retry);
+		UT_RUN(test_episode_applied_owner_stale_source_refuses_before_original_attempt);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_APPLIED_PAGES") != NULL) {
 		UT_PLAN(4);
 		UT_RUN(test_episode_applied_pages_fresh_carriers_cannot_supply_execution);
@@ -1335,7 +1345,12 @@ main(int argc, char **argv)
 		UT_RUN(test_episode_all_clog_whole_output_and_late_error_preserve_custody);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(217);
+	UT_PLAN(221);
+	UT_RUN(test_episode_applied_owner_whole_source_preflight_precedes_native_mutation);
+	UT_RUN(test_episode_applied_owner_equivalent_plan_does_not_replace_original_attempt);
+	UT_RUN(test_episode_applied_owner_scope_false_and_error_do_not_retry);
+	UT_RUN(test_episode_applied_owner_stale_source_refuses_before_original_attempt);
+
 	UT_RUN(test_episode_native_pages_holds_all_origins_on_original_descriptors);
 	UT_RUN(test_episode_native_pages_partial_failure_keeps_all_open_custody);
 	UT_RUN(test_episode_native_pages_whole_capacity_budget_and_duplicate_preflight);
