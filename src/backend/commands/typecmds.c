@@ -746,6 +746,10 @@ DefineDomain(CreateDomainStmt *stmt)
 	Oid			baseColl;
 	ObjectAddress address;
 
+#ifdef USE_PGRAC_CLUSTER
+	CheckClusterSharedTypeSupport();
+#endif
+
 	/* Convert list of names to a name and namespace */
 	domainNamespace = QualifiedNameGetCreationNamespace(stmt->domainname,
 														&domainName);
@@ -1389,6 +1393,10 @@ DefineRange(ParseState *pstate, CreateRangeStmt *stmt)
 	ObjectAddress address;
 	ObjectAddress mltrngaddress PG_USED_FOR_ASSERTS_ONLY;
 	Oid			castFuncOid;
+
+#ifdef USE_PGRAC_CLUSTER
+	CheckClusterSharedTypeSupport();
+#endif
 
 	/* Convert list of names to a name and namespace */
 	typeNamespace = QualifiedNameGetCreationNamespace(stmt->typeName,

@@ -360,6 +360,10 @@ static bool tablespace_options_lookup_active, tablespace_options_expect_binding;
 static unsigned tablespace_options_lookups, tablespace_options_unbound;
 static unsigned tablespace_options_bad_lookup;
 
+static bool type_creation_scope_lookup_active;
+static unsigned type_creation_scope_route, type_creation_scope_lookups;
+static unsigned type_creation_scope_lookup_kind, type_creation_scope_bad_lookup;
+static List *type_creation_scope_names_by_route[2], *type_creation_scope_expected_names;
 static bool enum_scope_lookup_active;
 static unsigned enum_scope_route, enum_scope_lookups, enum_scope_lookup_kind, enum_scope_bad_lookup;
 static List *enum_scope_expected_names;
@@ -8409,6 +8413,16 @@ static ObjectWithArgs native_operator_args;
 Oid
 QualifiedNameGetCreationNamespace(List *names, char **objname)
 {
+	if (type_creation_scope_lookup_active) {
+		type_creation_scope_lookups++;
+		type_creation_scope_lookup_kind = names == type_creation_scope_names_by_route[0]   ? 1
+										  : names == type_creation_scope_names_by_route[1] ? 2
+																						   : 3;
+		if (type_creation_scope_lookup_kind != type_creation_scope_route
+			|| names != type_creation_scope_expected_names || objname == NULL)
+			type_creation_scope_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before namespace resolution or temp-schema work. */
+	}
 	if (enum_scope_lookup_active) {
 		enum_scope_lookups++;
 		enum_scope_lookup_kind = 1;
@@ -19297,10 +19311,238 @@ UT_TEST(test_native_enum_scope_preserves_existing_supported_top_binding)
 	enum_scope_lookup_active = false;
 }
 
+/* Actual domain and range creation prefixes stop before namespace work.
+ * Original declarations execute; no native type success is substituted. */
+#include "test_cluster_fresh_type_creation_scope.inc"
+static String type_creation_scope_parts[2][2], type_creation_scope_base_parts[2];
+static ListCell type_creation_scope_cells[2][2], type_creation_scope_base_cells[2];
+static List type_creation_scope_names[2], type_creation_scope_base_names;
+static Integer type_creation_scope_array_bound;
+static ListCell type_creation_scope_bound_cell;
+static List type_creation_scope_bounds;
+static TypeName type_creation_scope_domain_base, type_creation_scope_range_subtype;
+static DefElem type_creation_scope_subtype_param;
+static ListCell type_creation_scope_param_cell;
+static List type_creation_scope_params;
+static ParseState type_creation_scope_parse_state;
+static CreateDomainStmt native_type_creation_scope_domain;
+static CreateRangeStmt native_type_creation_scope_range;
+static RangeVar type_creation_scope_warm_relation;
+static AlterObjectSchemaStmt type_creation_scope_warm_statement;
+
+static void
+reset_native_type_creation_scope(unsigned form)
+{
+	unsigned count = form % 2 ? 2 : 1;
+
+	reset_create_preflight();
+	error_detail[0] = '\0';
+	type_creation_scope_lookup_active = true;
+	type_creation_scope_route = form < 4 ? 1 : 2;
+	type_creation_scope_lookups = type_creation_scope_lookup_kind = type_creation_scope_bad_lookup
+		= 0;
+	for (unsigned kind = 0; kind < 2; kind++) {
+		type_creation_scope_parts[kind][0]
+			= (String){ .type = T_String,
+						.sval = count == 1 ? (kind ? "native_range" : "native_domain")
+										   : (kind ? "range_schema" : "domain_schema") };
+		type_creation_scope_parts[kind][1]
+			= (String){ .type = T_String, .sval = kind ? "qualified_range" : "qualified_domain" };
+		for (unsigned i = 0; i < 2; i++)
+			type_creation_scope_cells[kind][i]
+				= (ListCell){ .ptr_value = &type_creation_scope_parts[kind][i] };
+		type_creation_scope_names[kind] = (List){ .type = T_List,
+												  .length = count,
+												  .max_length = 2,
+												  .elements = type_creation_scope_cells[kind] };
+		type_creation_scope_names_by_route[kind] = &type_creation_scope_names[kind];
+	}
+	type_creation_scope_expected_names = &type_creation_scope_names[type_creation_scope_route - 1];
+	type_creation_scope_base_parts[0] = (String){ .type = T_String, .sval = "pg_catalog" };
+	type_creation_scope_base_parts[1] = (String){ .type = T_String, .sval = "int4" };
+	for (unsigned i = 0; i < 2; i++)
+		type_creation_scope_base_cells[i]
+			= (ListCell){ .ptr_value = &type_creation_scope_base_parts[i] };
+	type_creation_scope_base_names = (List){ .type = T_List,
+											 .length = 2,
+											 .max_length = 2,
+											 .elements = type_creation_scope_base_cells };
+	type_creation_scope_array_bound = (Integer){ .type = T_Integer, .ival = -1 };
+	type_creation_scope_bound_cell = (ListCell){ .ptr_value = &type_creation_scope_array_bound };
+	type_creation_scope_bounds = (List){ .type = T_List,
+										 .length = 1,
+										 .max_length = 1,
+										 .elements = &type_creation_scope_bound_cell };
+	type_creation_scope_domain_base
+		= (TypeName){ .type = T_TypeName,
+					  .names = &type_creation_scope_base_names,
+					  .typemod = -1,
+					  .arrayBounds = form % 4 >= 2 ? &type_creation_scope_bounds : NIL,
+					  .location = -1 };
+	type_creation_scope_range_subtype = (TypeName){ .type = T_TypeName,
+													.names = &type_creation_scope_base_names,
+													.typemod = -1,
+													.location = -1 };
+	native_type_creation_scope_domain
+		= (CreateDomainStmt){ .type = T_CreateDomainStmt,
+							  .domainname = &type_creation_scope_names[0],
+							  .typeName = &type_creation_scope_domain_base,
+							  .constraints = NIL };
+	type_creation_scope_subtype_param
+		= (DefElem){ .type = T_DefElem,
+					 .defname = "subtype",
+					 .arg = (Node *)&type_creation_scope_range_subtype,
+					 .defaction = DEFELEM_UNSPEC,
+					 .location = -1 };
+	type_creation_scope_param_cell = (ListCell){ .ptr_value = &type_creation_scope_subtype_param };
+	type_creation_scope_params = (List){ .type = T_List,
+										 .length = 1,
+										 .max_length = 1,
+										 .elements = &type_creation_scope_param_cell };
+	native_type_creation_scope_range
+		= (CreateRangeStmt){ .type = T_CreateRangeStmt,
+							 .typeName = &type_creation_scope_names[1],
+							 .params = form % 4 >= 2 ? &type_creation_scope_params : NIL };
+	type_creation_scope_parse_state
+		= (ParseState){ .p_sourcetext = "CREATE TYPE native_range AS RANGE" };
+	type_creation_scope_warm_relation
+		= (RangeVar){ .type = T_RangeVar, .relname = "supported_warm_table" };
+	type_creation_scope_warm_statement
+		= (AlterObjectSchemaStmt){ .type = T_AlterObjectSchemaStmt,
+								   .objectType = OBJECT_TABLE,
+								   .relation = &type_creation_scope_warm_relation,
+								   .newschema = "supported_warm_destination",
+								   .missing_ok = false };
+}
+
+static void
+native_type_creation_scope_entry(unsigned form)
+{
+	if (form < 4)
+		(void)DefineDomain(&native_type_creation_scope_domain);
+	else
+		(void)DefineRange(form >= 8 ? &type_creation_scope_parse_state : NULL,
+						  &native_type_creation_scope_range);
+}
+
+static void
+assert_native_type_creation_scope_result(bool blocked, int caught)
+{
+	UT_ASSERT_EQ(caught, blocked ? 1 : 2);
+	UT_ASSERT_EQ(error_code, blocked ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+	if (blocked) {
+		UT_ASSERT_STR_EQ(error_message, "custom types is not supported in shared mode");
+		UT_ASSERT_STR_EQ(error_detail,
+						 "PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+	}
+	UT_ASSERT_EQ(type_creation_scope_lookups, blocked ? 0 : 1);
+	UT_ASSERT_EQ(type_creation_scope_lookup_kind, blocked ? 0 : type_creation_scope_route);
+	UT_ASSERT_EQ(type_creation_scope_bad_lookup, 0);
+}
+
+UT_TEST(test_native_type_creation_scope_matches_utility_before_namespace_query)
+{
+	for (unsigned form = 0; form < 12; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool blocked = (mode & 5) != 0;
+			int caught;
+
+			reset_native_type_creation_scope(form);
+			set_native_operator_mode(mode);
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				create_sql_entry(form < 4 ? (Node *)&native_type_creation_scope_domain
+										  : (Node *)&native_type_creation_scope_range);
+			UT_ASSERT_EQ(caught, blocked ? 1 : 0);
+			UT_ASSERT_EQ(error_code, blocked ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+			if (blocked) {
+				UT_ASSERT_STR_EQ(error_message, "custom types is not supported in shared mode");
+				UT_ASSERT_STR_EQ(error_detail,
+								 "PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+			}
+			UT_ASSERT_EQ(
+				type_creation_scope_lookups + utility_xids + utility_prepares + utility_binds, 0);
+			reset_error();
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_type_creation_scope_entry(form);
+			assert_native_type_creation_scope_result(blocked, caught);
+			UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			UT_ASSERT_EQ(utility_top_xid, InvalidTransactionId);
+		}
+	}
+	type_creation_scope_lookup_active = false;
+}
+
+UT_TEST(test_native_type_creation_scope_precedes_context_child_top_and_publication)
+{
+	for (unsigned form = 0; form < 12; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			for (unsigned fault = 0; fault < 7; fault++) {
+				int caught;
+
+				reset_native_type_creation_scope(form);
+				set_native_operator_mode(mode);
+				XactReadOnly = fault == 0;
+				utility_parallel = fault == 1;
+				utility_recovery = fault == 2;
+				utility_in_child = fault == 3;
+				if (fault == 4 || fault == 5) {
+					utility_current_xid = 401;
+					utility_top_xid = fault == 4 ? 400 : InvalidTransactionId;
+				}
+				utility_bind_ok = fault != 6;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_type_creation_scope_entry(form);
+				assert_native_type_creation_scope_result((mode & 5) != 0, caught);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+				UT_ASSERT_EQ(utility_top_xid, fault == 4 ? 400 : InvalidTransactionId);
+				UT_ASSERT_EQ(utility_current_xid,
+							 fault == 4 || fault == 5 ? 401 : InvalidTransactionId);
+			}
+		}
+	}
+	type_creation_scope_lookup_active = false;
+}
+
+UT_TEST(test_native_type_creation_scope_preserves_existing_supported_top_binding)
+{
+	for (unsigned form = 0; form < 12; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			for (unsigned fault = 0; fault < 5; fault++) {
+				int caught;
+
+				reset_native_type_creation_scope(form);
+				create_sql_entry((Node *)&type_creation_scope_warm_statement);
+				UT_ASSERT_EQ(utility_xids, 1);
+				UT_ASSERT_EQ(utility_prepares, 1);
+				UT_ASSERT_EQ(utility_binds, 1);
+				set_native_operator_mode(mode);
+				XactReadOnly = fault == 0;
+				utility_parallel = fault == 1;
+				utility_recovery = fault == 2;
+				utility_in_child = fault == 3;
+				utility_bind_ok = fault != 4;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_type_creation_scope_entry(form);
+				assert_native_type_creation_scope_result((mode & 5) != 0, caught);
+				UT_ASSERT_EQ(utility_xids, 1);
+				UT_ASSERT_EQ(utility_prepares, 1);
+				UT_ASSERT_EQ(utility_binds, 1);
+				UT_ASSERT_EQ(utility_top_xid, 400);
+				UT_ASSERT_EQ(utility_current_xid, 400);
+			}
+		}
+	}
+	type_creation_scope_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(309);
+	UT_PLAN(312);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -19612,6 +19854,9 @@ main(void)
 	UT_RUN(test_native_enum_scope_matches_utility_before_catalog_or_name_processing);
 	UT_RUN(test_native_enum_scope_precedes_context_child_top_and_publication);
 	UT_RUN(test_native_enum_scope_preserves_existing_supported_top_binding);
+	UT_RUN(test_native_type_creation_scope_matches_utility_before_namespace_query);
+	UT_RUN(test_native_type_creation_scope_precedes_context_child_top_and_publication);
+	UT_RUN(test_native_type_creation_scope_preserves_existing_supported_top_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
