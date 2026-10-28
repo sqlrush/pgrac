@@ -1915,6 +1915,98 @@ recovery_merge_cold_inputs_observe(const ClusterWalSourceRef *restart,
  * changed cohort, unavailable source or live current-boot writer refuses;
  * elapsed time never supplies missing evidence. The independent fence and
  * full retained-source/graph gates remain in the original preflight below. */
+/* Finish only this observation's failed CF request. The old cohort and
+ * restart input remain immutable; neither a wake nor retirement proves a
+ * usable input seal. The caller re-enters its original proof/read loop.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static void
+recovery_merge_cold_cf_wait(const ClusterCfAttemptObservation *attempt,
+							const ClusterFormationSnapshotV1 *cohort,
+							const ClusterWalSourceRef *restart, uint16 own_thread, uint64 epoch,
+							uint64 generation, ResourceOwner owner, uint64 boot, bool recovery)
+{
+	ClusterCfRetirementSnapshot original;
+	PGPROC *proc = MyProc;
+	Latch *latch = MyLatch;
+	bool empty = attempt->owner_state_at_return == CLUSTER_LOCK_OWNER_EMPTY;
+	bool empty_waited = false;
+	const char *reason = "UNSAFE_CF_WAIT";
+
+	if (proc == NULL || latch == NULL || owner == NULL || CritSectionCount != 0
+		|| LWLockHeldByMe(ControlFileLock) || cluster_cf_held(ExclusiveLock))
+		goto refuse;
+	if (!empty
+		&& (!cluster_cf_retirement_snapshot(ShareLock, NULL, &original)
+			|| original.cookie != attempt->control_owner_id
+			|| original.registry.message.key.holder.request_id != attempt->request_id
+			|| original.registry.message.key.holder.cluster_epoch != attempt->request_epoch)) {
+		reason = "CF_WAIT_IDENTITY_OR_COMPLETION";
+		goto refuse;
+	}
+	for (;;) {
+		ClusterCfRetirementSnapshot current;
+		ClusterFormationSnapshotV1 observed;
+		ClusterWalSourceRef input;
+		bool held;
+
+		HandleStartupProcInterrupts();
+		CHECK_FOR_INTERRUPTS();
+		reason = "CONTEXT_CHANGED_AFTER_WAIT_SLICE";
+		if (MyProc != proc || MyLatch != latch || !AmStartupProcess() || MyBackendType != B_STARTUP
+			|| CurrentResourceOwner != owner || !cluster_enabled || !cluster_shared_config
+			|| !cluster_controlfile_shared_authority || ShutdownRequestPending
+			|| CritSectionCount != 0 || LWLockHeldByMe(ControlFileLock) || boot == 0
+			|| boot != cluster_qvotec_get_self_incarnation() || InRecovery != recovery || epoch == 0
+			|| generation == 0 || epoch != cluster_epoch_get_current()
+			|| generation != cluster_grd_redeclare_generation()
+			|| !cluster_recovery_transport_components_current())
+			goto refuse;
+		ResetLatch(MyLatch);
+		if (!cluster_reconfig_capture_formation_snapshot_v1(own_thread, &observed)
+			|| !cluster_formation_snapshot_matches_v1(cohort, &observed)
+			|| !cluster_wal_thread_restart_v2_ref(&input)
+			|| memcmp(restart, &input, sizeof(input)) != 0)
+			goto refuse;
+		held = cluster_cf_held(ShareLock);
+		if (!held && !cluster_cf_held(ExclusiveLock)) {
+			if (!empty && cluster_cf_release_completed(ShareLock, original.cookie))
+				return;
+			if (empty) {
+				if (empty_waited)
+					return;
+				empty_waited = true;
+				(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+								WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
+				continue;
+			}
+		}
+		reason = "CF_WAIT_IDENTITY_OR_COMPLETION";
+		if (empty || !held || cluster_cf_held(ExclusiveLock)
+			|| !cluster_cf_retirement_snapshot(ShareLock, NULL, &current)
+			|| current.cookie != original.cookie
+			|| current.registry.handle.slot != original.registry.handle.slot
+			|| current.registry.handle.generation != original.registry.handle.generation
+			|| memcmp(&current.registry.owner, &original.registry.owner,
+					  sizeof(current.registry.owner))
+				   != 0
+			|| memcmp(&current.registry.message.key, &original.registry.message.key,
+					  sizeof(current.registry.message.key))
+				   != 0)
+			goto refuse;
+		cluster_lock_owners_service_poll();
+		cluster_cf_retirement_poll();
+		if (cluster_cf_held(ShareLock))
+			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+							WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
+	}
+refuse:
+	ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+					errmsg("cold input observation cannot continue its control-file wait"),
+					errdetail("PGRAC_FAMILY=STARTUP_CONTROL consumer=cold_inputs reason=%s "
+							  "cookie=" UINT64_FORMAT " request=" UINT64_FORMAT,
+							  reason, attempt->control_owner_id, attempt->request_id)));
+}
+
 static bool
 recovery_merge_wait_cold_inputs(uint16 own_thread)
 {
@@ -1925,6 +2017,12 @@ recovery_merge_wait_cold_inputs(uint16 own_thread)
 	volatile bool cf_attempted = false;
 	bool ready = false;
 	bool reported = false;
+	bool waited = false;
+	uint64 epoch = cluster_epoch_get_current();
+	uint64 generation = cluster_grd_redeclare_generation();
+	uint64 boot = cluster_qvotec_get_self_incarnation();
+	ResourceOwner owner = CurrentResourceOwner;
+	bool recovery = InRecovery;
 
 	if (!cluster_wal_thread_restart_v2_ref(&restart)
 		|| !cluster_reconfig_capture_formation_snapshot_v1(own_thread, &cohort)
@@ -1947,11 +2045,44 @@ recovery_merge_wait_cold_inputs(uint16 own_thread)
 				break;
 			if (proof == CLUSTER_FORMATION_WITNESS_READY) {
 				ClusterCfReleaseResult released = CLUSTER_CF_RELEASE_NOT_HELD;
+				ClusterCfAttemptObservation attempt;
+				uint64 before = cluster_cf_attempt_sequence();
 
 				cf_attempted = true;
-				if (cluster_cf_lock(ShareLock) && cluster_cf_held_is_clusterwide(ShareLock))
-					result = recovery_merge_cold_inputs_observe(&restart, &cohort, root,
-						inputs, &pending);
+				if (cluster_cf_lock(ShareLock) && cluster_cf_held_is_clusterwide(ShareLock)) {
+					ClusterWalSourceRef input;
+
+					/* A new acquire can yield too. Reprove the original read
+					 * context before any input observation under its new grant. */
+					if (waited
+						&& (CurrentResourceOwner != owner || MyBackendType != B_STARTUP
+							|| !AmStartupProcess() || InRecovery != recovery
+							|| ShutdownRequestPending || !cluster_enabled || !cluster_shared_config
+							|| !cluster_controlfile_shared_authority || CritSectionCount != 0
+							|| LWLockHeldByMe(ControlFileLock)
+							|| boot != cluster_qvotec_get_self_incarnation()
+							|| epoch != cluster_epoch_get_current()
+							|| generation != cluster_grd_redeclare_generation()
+							|| !cluster_recovery_transport_components_current()
+							|| !cluster_reconfig_capture_formation_snapshot_v1(own_thread, &current)
+							|| !cluster_formation_snapshot_matches_v1(&cohort, &current)
+							|| !cluster_wal_thread_restart_v2_ref(&input)
+							|| memcmp(&restart, &input, sizeof(input)) != 0))
+						result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+					else
+						result = recovery_merge_cold_inputs_observe(&restart, &cohort, root, inputs,
+																	&pending);
+				} else if (cluster_cf_last_attempt_since(before, &attempt)
+						   && cluster_cf_attempt_wait_slice(&attempt)
+						   && attempt.mode == ShareLock) {
+					/* Already abandoned by the original acquire. Do not turn
+					 * its still-pending release into another blocking failure. */
+					cf_attempted = false;
+					waited = true;
+					recovery_merge_cold_cf_wait(&attempt, &cohort, &restart, own_thread, epoch,
+												generation, owner, boot, recovery);
+					continue;
+				}
 				if (cluster_cf_held(ShareLock))
 					released = cluster_cf_unlock_confirmed(ShareLock);
 				cf_attempted = false;

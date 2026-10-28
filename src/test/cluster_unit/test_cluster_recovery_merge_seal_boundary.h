@@ -94,6 +94,23 @@ static int cold_bad_origin;
 static bool cold_pending_initializer;
 static bool cold_metadata_error;
 static ClusterCfReleaseResult cold_release_result;
+/* This metadata-only fixture always grants CF immediately. The actual
+ * timeout/retirement consumer is exercised by test_cluster_startup_cf_entry. */
+uint64
+cluster_cf_attempt_sequence(void)
+{
+	return 0;
+}
+uint64
+cluster_epoch_get_current(void)
+{
+	return cold_cohort.local_epoch;
+}
+uint64
+cluster_grd_redeclare_generation(void)
+{
+	return 1;
+}
 /* Faults: flags missing from a read-back root; a generation another
  * founder recovers while this one seals thread `tid`. */
 static uint32 readback_cleared[NODES + 1];

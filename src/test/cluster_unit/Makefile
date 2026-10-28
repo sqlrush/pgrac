@@ -1428,6 +1428,7 @@ test_cluster_startup_cf_callsite.inc: $(top_srcdir)/src/backend/access/transam/x
 test_cluster_startup_cf_entry: test_cluster_startup_cf_entry.c test_cluster_cf_enqueue.c \
 		test_cluster_startup_cf_entry.inc test_cluster_startup_cf_callsite.inc \
 		test_cluster_merge_cf_entry.inc \
+		test_cluster_merge_cold_cf.inc \
 		test_cluster_cf_blocker_trace.inc test_cluster_startup_interrupt.inc unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_cf_enqueue.c \
 		$(top_srcdir)/src/backend/cluster/cluster_lock_owner.c \
@@ -1442,6 +1443,17 @@ test_cluster_merge_cf_entry.inc: $(top_srcdir)/src/backend/cluster/cluster_recov
 	     /^merge_claim_cf_exit\(/ { emit=0; end++; previous="" } \
 	     emit { if (have_line) print previous; previous=$$0; have_line=1 } \
 	     END { if (declarations != 1 || types || begin != 1 || end != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# The cold-cohort consumer shares the real CF/CONTROL producer fixture.
+test_cluster_merge_cold_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_merge.c \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_duty.c Makefile
+	awk '/^recovery_merge_cold_cf_wait\(/ { print "static void"; emit=1; helpers++ } \
+	     /^recovery_merge_wait_cold_inputs\(/ { print "static bool"; emit=1; consumers++ } \
+	     /^cluster_formation_snapshot_matches_v1\(/ { print "bool"; emit=1; matches++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (consumers != 1 || helpers > 1 || matches != 1 || emit) exit 1 }' \
+	     $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 
 # PGRAC: execute the real earliest startup-directory mutation call site.
