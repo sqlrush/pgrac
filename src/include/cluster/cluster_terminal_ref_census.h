@@ -226,7 +226,10 @@ typedef enum ClusterCtrcReleaseDisposition {
 /* Receipt retirement is separate from accepted-parent/tree custody. */
 typedef enum ClusterCtrcDelegationCertificateState {
 	CTRC_DELEGATION_CERTIFICATE_NONE = 0,
-	CTRC_DELEGATION_RECEIPTS_RECLAIMED = 1
+	CTRC_DELEGATION_RECEIPTS_RECLAIMED = 1,
+	/* Published only by successful protected whole-pool reclamation.
+	 * Active references are retired; immutable retry custody remains. */
+	CTRC_DELEGATION_PROTECTION_RETIRED = 2
 } ClusterCtrcDelegationCertificateState;
 
 typedef enum ClusterCtrcParticipantState {

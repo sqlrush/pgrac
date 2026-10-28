@@ -733,7 +733,9 @@
  * custody and immutable completion proof; fresh homogeneous clusters only. */
 /* Certified root receipt completion reaches the original origin consumer;
  * retry custody remains retained. Fresh homogeneous clusters only. */
-#define CATALOG_VERSION_NO 202610288
+/* Protected whole-pool reclamation retires active reference census input;
+ * immutable retry custody remains. Fresh homogeneous clusters only. */
+#define CATALOG_VERSION_NO 202610289
 
 /* spec-5.13 (2026-06-27): clean-leave catalog surface — cluster_get_clean_leave_state
  * SRF (oid 8960) + pg_cluster_clean_leave_state view + pg_cluster_clean_leave_request

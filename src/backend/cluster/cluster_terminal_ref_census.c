@@ -86,7 +86,7 @@
 #endif
 
 #define CLUSTER_CTRC_SHMEM_MAGIC UINT32_C(0x43545243)
-#define CLUSTER_CTRC_SHMEM_VERSION UINT32_C(25)
+#define CLUSTER_CTRC_SHMEM_VERSION UINT32_C(26)
 #ifndef CLUSTER_CTRC_TEST_TABLE_VISIT
 #define CLUSTER_CTRC_TEST_TABLE_VISIT(kind) ((void)0)
 #endif
@@ -461,8 +461,8 @@ ctrc_participant_delegations_valid(const ClusterCtrcParticipantEntry *participan
 	const ClusterCtrcDelegationCustodyV1 *parent = &participant->delegation_parent;
 	FullTransactionId original;
 
-	if (participant->delegation_certificate_state > CTRC_DELEGATION_RECEIPTS_RECLAIMED
-		|| (participant->delegation_certificate_state == CTRC_DELEGATION_RECEIPTS_RECLAIMED
+	if (participant->delegation_certificate_state > CTRC_DELEGATION_PROTECTION_RETIRED
+		|| (participant->delegation_certificate_state != CTRC_DELEGATION_CERTIFICATE_NONE
 			&& ((participant->parent_certificate_request_id == 0
 					&& participant->root_certificate_request_id == 0)
 				|| participant->delegation_certificate_confirmed_bitmap != participant->delegation_ack_bitmap))
@@ -2676,6 +2676,11 @@ static bool ctrc_cleaner_clean_current_mx_receipt(const ClusterCtrcParticipantEn
 												  uint64 participant_index, uint64 receipt_index);
 static bool ctrc_participant_freeze_next_ack_shared(void);
 static Size ctrc_participant_freeze_ack_batch_shared(Size maximum);
+static ClusterCtrcLocalReleaseAckV1 *ctrc_participant_ack_entries(void);
+static bool ctrc_participant_index(const ClusterCtrcTxnKeyV1 *key, uint16 participant_node_id,
+	uint64 *index);
+static bool ctrc_delegated_local_ack_summary_exact(const ClusterCtrcParticipantEntry *participant,
+	const ClusterCtrcLocalReleaseAckV1 *summary);
 #ifndef CLUSTER_CTRC_UNIT_TEST
 static Size ctrc_participant_reclaim_delegated_batch_shared(void);
 static bool ctrc_delegated_certificate_retired_exact_locked(uint64 index);
@@ -2895,7 +2900,23 @@ ctrc_active_scan_step(ClusterCtrcActiveScan *scan,
 			occupied = !ctrc_bytes_zero(entry, sizeof(*entry));
 			key = entry->key;
 			full = entry->original_full_xid;
-			valid = entry->state <= CTRC_PARTICIPANT_BLOCKED;
+			valid = entry->state <= CTRC_PARTICIPANT_BLOCKED
+				&& entry->delegation_certificate_state <= CTRC_DELEGATION_PROTECTION_RETIRED;
+			if (entry->delegation_certificate_state == CTRC_DELEGATION_PROTECTION_RETIRED) {
+				uint64 protected_index;
+
+				/* The original whole-pool deletion owner publishes this fact
+				 * only after the original certificate and every child complete.
+				 * The closed immutable row cannot admit a new reference. Keep
+				 * retry custody, but do not fold historical references into F.
+				 * All evidence and the zero head share this original shard. */
+				valid = valid && ctrc_participant_index(&entry->key, entry->identity.node_id,
+					&protected_index) && protected_index == index
+					&& ctrc_delegated_local_ack_summary_exact(entry, &ctrc_participant_ack_entries()[index])
+					&& ctrc_participant_receipt_heads()[index] == 0;
+				if (valid)
+					occupied = false;
+			}
 		}
 		LWLockRelease(lock);
 		if (occupied) {
@@ -5145,9 +5166,6 @@ ctrc_delegated_close_snapshot_locked(uint64 index, uint16 node,
 #endif
 
 #ifndef CLUSTER_CTRC_UNIT_TEST
-static bool ctrc_delegated_local_ack_summary_exact(const ClusterCtrcParticipantEntry *participant,
-	const ClusterCtrcLocalReleaseAckV1 *summary);
-
 /* Participant shard is already held. The exact original local summary and
  * full frozen locator chain are checked under the original receipt lock. */
 static bool
@@ -8651,7 +8669,7 @@ ctrc_root_local_ack_exact_locked(uint64 index, const ClusterCtrcTxnKeyV1 *key,
 		&& ctrc_bytes_zero(&participant->delegation_path, sizeof(participant->delegation_path))
 		&& participant->delegation_count != 0
 		&& ctrc_delegated_local_ack_summary_exact(participant, &ctrc_participant_ack_entries()[index])
-		&& (participant->delegation_certificate_state == CTRC_DELEGATION_RECEIPTS_RECLAIMED
+		&& (participant->delegation_certificate_state != CTRC_DELEGATION_CERTIFICATE_NONE
 			? ctrc_delegated_certificate_retired_exact_locked(index)
 			: ctrc_receipt_chain_exact_locked(index, true));
 }
@@ -9059,7 +9077,8 @@ ctrc_delegated_certificate_retired_exact_locked(uint64 index)
 	const ClusterCtrcParticipantEntry *participant = &ctrc_participant_entries()[index];
 	ClusterCtrcReclaimWork work = { 0 };
 
-	if (participant->delegation_certificate_state != CTRC_DELEGATION_RECEIPTS_RECLAIMED
+	if ((participant->delegation_certificate_state != CTRC_DELEGATION_RECEIPTS_RECLAIMED
+			&& participant->delegation_certificate_state != CTRC_DELEGATION_PROTECTION_RETIRED)
 		|| !ctrc_delegated_local_ack_summary_exact(participant, &ctrc_participant_ack_entries()[index])
 		|| ctrc_participant_receipt_heads()[index] != 0)
 		return false;
@@ -9112,7 +9131,7 @@ ctrc_participant_reclaim_delegated_batch_shared(void)
 		for (Size i = 0; i < count; i++)
 			if (work[i].reclaimed) {
 				ctrc_participant_entries()[indices[i]].delegation_certificate_state
-					= CTRC_DELEGATION_RECEIPTS_RECLAIMED;
+					= CTRC_DELEGATION_PROTECTION_RETIRED;
 				reclaimed++;
 			}
 	}
@@ -9382,7 +9401,7 @@ ctrc_participant_certificate_batch_apply_shared(const ClusterCtrcCloseDispatch *
 			 * completed proof and zero-live pool. Report receipt completion to
 			 * its original origin consumer; retain the root/child retry custody. */
 			root_completed[i] = participant->delegation_certificate_state
-				== CTRC_DELEGATION_RECEIPTS_RECLAIMED;
+				!= CTRC_DELEGATION_CERTIFICATE_NONE;
 			results[i] = root_completed[i] ? CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED
 				: CTRC_SEAL_REPLY_PENDING_DRAIN;
 			reason = root_completed[i] ? 0 : CTRC_SEAL_REASON_CLEANOUT;
@@ -13029,10 +13048,10 @@ ctrc_normal_stop_participants_locked(ClusterCtrcNormalStopObservation *out)
 													participant->identity.node_id, &actual_index)
 						  && actual_index == i && participant->grant_generation != 0
 						  && ctrc_bytes_zero(participant->reserved8, sizeof(participant->reserved8))
-						  && (participant->delegation_certificate_state == CTRC_DELEGATION_RECEIPTS_RECLAIMED
+						  && (participant->delegation_certificate_state != CTRC_DELEGATION_CERTIFICATE_NONE
 								? ctrc_delegated_certificate_retired_exact_locked(i)
 								: ctrc_receipt_chain_exact_locked(i, participant->state == CTRC_PARTICIPANT_ACK_FROZEN))
-						  && (participant->delegation_certificate_state == CTRC_DELEGATION_RECEIPTS_RECLAIMED
+						  && (participant->delegation_certificate_state != CTRC_DELEGATION_CERTIFICATE_NONE
 							  || participant->receipt_count
 								 <= CtrcShared->receipt_entries - expected_receipts);
 
