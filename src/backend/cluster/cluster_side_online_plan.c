@@ -22,6 +22,7 @@
 #include "replication/origin.h"
 #include "storage/standbydefs.h"
 #include "cluster/cluster_side_online_plan.h"
+#include "cluster_side_online_plan_internal.h"
 #include "cluster/cluster_uba.h"
 #include "cluster/cluster_undo_segment_init.h"
 #include "cluster/cluster_native_startup.h"
@@ -60,6 +61,7 @@ typedef struct SideNativeClogWitness {
 	uint32 operation_index;
 	uint32 payload_length;
 	XLogRecord header;
+	SideNativeClogReplay replay;
 	uint8 payload[FLEXIBLE_ARRAY_MEMBER];
 } SideNativeClogWitness;
 
@@ -1798,6 +1800,65 @@ rf_side_online_plan_clog_matches_v1(const RfSideOnlinePlanV1 *plan,
 		&& selected->payload_length == XLogRecGetDataLen(reader)
 		&& memcmp(&selected->header, &reader->record->header, SizeOfXLogRecord) == 0
 		&& memcmp(selected->payload, XLogRecGetData(reader), selected->payload_length) == 0;
+}
+
+/* The original production owner resolves its own immutable operation, not a
+ * caller's source/count or success boolean. Existing witness allocation and
+ * destruction own these two bytes, including on partial execution/ERROR. */
+SideNativeClogReplay *
+side_plan_clog_replay_state(const RfSideOnlinePlanV1 *plan, uint32 index,
+	const RfPageOnlineRecordIdentityV1 *identity)
+{
+	SideNativeClogWitness *selected = NULL;
+	const RfSideOnlineOperationV1 *operation;
+	uint32 sources = 0;
+
+	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed
+		|| plan->failed || plan->purpose != RF_SIDE_PLAN_RECOVERY || identity == NULL
+		|| index >= plan->operation_count)
+		return NULL;
+	operation = &plan->operations[index];
+	if (operation->history_only
+		|| memcmp(identity, &operation->identity, sizeof(*identity)) != 0)
+		return NULL;
+	for (SideNativeClogWitness *witness = plan->native_clog; witness != NULL;
+		 witness = witness->next) {
+		if (witness->operation_index != index)
+			continue;
+		if (selected != NULL || side_clog_witness_operation(plan, witness) != operation)
+			return NULL;
+		selected = witness;
+	}
+	if (selected == NULL)
+		return NULL;
+	for (uint32 i = 0; i < plan->source_count; ++i)
+		if (rf_side_online_plan_recovery_claim_matches_v1(plan, &plan->sources[i])
+			&& side_clog_witness_source(plan, operation, &plan->sources[i]))
+			sources++;
+	return sources == 1 ? &selected->replay : NULL;
+}
+
+bool
+rf_side_online_plan_clog_applied_v1(const RfSideOnlinePlanV1 *plan,
+	const ClusterWalSourceRef *source, const XLogReaderState *reader)
+{
+	bool found = false;
+
+	if (!rf_side_online_plan_clog_matches_v1(plan, source, reader))
+		return false;
+	for (const SideNativeClogWitness *witness = plan->native_clog; witness != NULL;
+		 witness = witness->next) {
+		const RfSideOnlineOperationV1 *operation = side_clog_witness_operation(plan, witness);
+
+		/* An unfinished attempt invalidates this plan's execution observation
+		 * as a group, even if an earlier record completed its local effect. */
+		if (operation == NULL || (witness->replay.attempted && !witness->replay.applied))
+			return false;
+		if (side_clog_witness_source(plan, operation, source)
+			&& operation->identity.record.read_rec_ptr == reader->ReadRecPtr)
+			found = !operation->history_only && witness->replay.attempted && witness->replay.applied;
+	}
+	return found;
 }
 
 bool

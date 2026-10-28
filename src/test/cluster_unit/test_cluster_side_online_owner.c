@@ -12,6 +12,7 @@
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_xid_stripe_boot.h"
 #include "cluster/cluster_side_online_owner.h"
+#include "../../../src/backend/cluster/cluster_side_online_plan_internal.h"
 #include "cluster/cluster_undo_segment_init.h"
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/storage/cluster_undo_xlog.h"
@@ -259,6 +260,14 @@ void
 cluster_scn_recovery_replay_observe(SCN scn pg_attribute_unused())
 {
 	UT_ASSERT(false);
+}
+
+/* This fixture has a deliberate fake plan, not native CLOG witnesses. */
+SideNativeClogReplay *
+side_plan_clog_replay_state(const RfSideOnlinePlanV1 *plan pg_attribute_unused(),
+	uint32 index pg_attribute_unused(), const RfPageOnlineRecordIdentityV1 *identity pg_attribute_unused())
+{
+	return NULL;
 }
 
 RfPageProofDetailV1

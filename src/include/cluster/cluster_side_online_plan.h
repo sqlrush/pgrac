@@ -209,6 +209,12 @@ extern uint32 rf_side_online_plan_native_clog_count_v1(const RfSideOnlinePlanV1 
 	const ClusterWalSourceRef *source);
 extern bool rf_side_online_plan_clog_matches_v1(const RfSideOnlinePlanV1 *plan,
 	const ClusterWalSourceRef *source, const XLogReaderState *reader);
+/* Exact carrier plus the original cold production record executor's saved
+ * success, after native sync/readback, projection, cleanup and final owner
+ * check. Generic callbacks/whole-source apply do not supply this observation.
+ * No I/O or current-page/birth-era/lifetime/COMPLETE/release authority. */
+extern bool rf_side_online_plan_clog_applied_v1(const RfSideOnlinePlanV1 *plan,
+	const ClusterWalSourceRef *source, const XLogReaderState *reader);
 /* UINT32_MAX for an invalid or unsealed plan. */
 extern uint32 rf_side_online_plan_participant_count_v1(const RfSideOnlinePlanV1 *plan);
 /* The physical lower alone must not authorize replay of retained history. */

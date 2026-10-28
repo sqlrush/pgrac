@@ -20,6 +20,7 @@
 #include "cluster/cluster_remote_xact.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_side_online_owner.h"
+#include "cluster_side_online_plan_internal.h"
 #include "cluster/cluster_undo_format.h"
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/cluster_undo_segment_init.h"
@@ -1360,12 +1361,21 @@ rf_side_online_production_apply_record_v1(const RfSideOnlinePlanV1 *plan, uint32
 {
 	RfSideOnlineApplyOpsV1 ops;
 	RfPageProofDetailV1 detail;
+	SideNativeClogReplay *replay;
 
 	if (owner == NULL || owner->protected_set_active)
 		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
 	owner->protected_set_complete = false;
 	if (plan == NULL || identity == NULL || !side_owner_cold_formed(owner))
 		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	replay = side_plan_clog_replay_state(plan, index, identity);
+	if (replay != NULL) {
+		if (replay->attempted)
+			return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+		/* Latch before any original preflight/native work. ERROR/late false
+		 * leaves this attempted state with all original ownership intact. */
+		replay->attempted = true;
+	}
 	owner->protected_plan = plan;
 	side_owner_apply_ops(owner, &ops);
 	ops.preflight_xact = side_owner_preflight_xact_record;
@@ -1382,9 +1392,11 @@ rf_side_online_production_apply_record_v1(const RfSideOnlinePlanV1 *plan, uint32
 		return detail;
 	/* This is a record result, never protected_set_complete. Recheck the
 	 * original owner after scope cleanup just as the full-source path does. */
-	return side_owner_cold_formed(owner) && side_owner_authority_fresh(owner)
-			   ? RF_PAGE_PROOF_DETAIL_OK
-			   : RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	if (!side_owner_cold_formed(owner) || !side_owner_authority_fresh(owner))
+		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	if (replay != NULL)
+		replay->applied = true;
+	return RF_PAGE_PROOF_DETAIL_OK;
 }
 
 #endif
