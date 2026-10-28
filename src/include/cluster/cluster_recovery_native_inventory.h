@@ -444,6 +444,19 @@ extern bool cluster_recovery_relmap_history_pending_native_v1(
 extern bool cluster_recovery_relmap_history_pending_native_side_v1(
 	ClusterRecoveryRelmapHistory *history, const ClusterRelmapV2Image *pending,
 	ClusterRecoveryRelmapPendingNativeV1 *out, ClusterRecoveryNativeInventoryDiag *diag);
+/* Same strict query input and SAME physical reread, additionally retaining
+ * every original physical generation's CLOG lifecycle carriers. Each source
+ * index resolves through query.birth.inputs.generations, not replay-set
+ * order. UNKNOWN counter/legacy birth fields stay UNKNOWN. Whole-capacity
+ * overflow refuses; no partial history, era/lifetime or completion grant. */
+typedef struct ClusterRecoveryRelmapPendingAllNativeV1 {
+	ClusterRecoveryRelmapPendingNativeV1 query;
+	uint32 clog_count;
+	ClusterRecoveryRelmapClogEventV1 clog[CLUSTER_RECOVERY_RELMAP_CLOG_HISTORY_MAX];
+} ClusterRecoveryRelmapPendingAllNativeV1;
+extern bool cluster_recovery_relmap_history_pending_all_native_v1(
+	ClusterRecoveryRelmapHistory *history, const ClusterRelmapV2Image *pending,
+	ClusterRecoveryRelmapPendingAllNativeV1 *out, ClusterRecoveryNativeInventoryDiag *diag);
 extern void cluster_recovery_relmap_history_destroy_v1(ClusterRecoveryRelmapHistory **history);
 
 /* Borrow the original startup cold scope for two complete physical passes.
