@@ -24,6 +24,13 @@ int control_fixture_main(int argc, char **argv);
 
 static unsigned inventory_census_calls;
 static void (*inventory_between_passes)(void);
+extern bool cluster_wal_inputs_relmap_clog_applied_v1(
+	const ClusterRecoveryRelmapSourceV1 *source, const XLogReaderState *reader);
+extern bool cluster_recovery_relmap_history_pending_applied_pages_v1(
+	ClusterRecoveryRelmapHistory *history, const ClusterRelmapV2Image *pending,
+	ClusterRecoveryRelmapPendingNativePagesV1 *out, ClusterRecoveryNativeInventoryDiag *diag);
+static bool episode_applied_match(const ClusterRecoveryRelmapSourceV1 *source,
+	const XLogReaderState *reader);
 
 static ClusterControlRootResult
 inventory_test_census(ClusterWalInputsV1 *inputs, ClusterWalCensusVisitorV1 visitor,
@@ -42,7 +49,9 @@ inventory_test_census(ClusterWalInputsV1 *inputs, ClusterWalCensusVisitorV1 visi
 }
 
 #define cluster_wal_inputs_cold_census_v1 inventory_test_census
+#define cluster_wal_inputs_relmap_clog_applied_v1 episode_applied_match
 #include "../../backend/cluster/cluster_recovery_native_inventory.c"
+#undef cluster_wal_inputs_relmap_clog_applied_v1
 #undef cluster_wal_inputs_cold_census_v1
 #include "../../backend/cluster/cluster_recovery_census.c"
 
@@ -1096,6 +1105,7 @@ cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **held)
 #include "test_cluster_recovery_episode_birth_halfspace.inc"
 #include "test_cluster_recovery_episode_all_clog.inc"
 #include "test_cluster_recovery_episode_native_pages.inc"
+#include "test_cluster_recovery_episode_applied_pages.inc"
 #include "test_cluster_recovery_episode_generation_xid.inc"
 #include "test_cluster_recovery_clog_full_roots.inc"
 
@@ -1107,6 +1117,14 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_APPLIED_PAGES") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_episode_applied_pages_fresh_carriers_cannot_supply_execution);
+		UT_RUN(test_episode_applied_pages_joins_all_sources_in_original_pass);
+		UT_RUN(test_episode_applied_pages_foreign_failure_keeps_whole_custody);
+		UT_RUN(test_episode_applied_pages_opt_out_and_alias_keep_original_inputs);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_NATIVE_PAGES") != NULL) {
 		UT_PLAN(4);
 		UT_RUN(test_episode_native_pages_holds_all_origins_on_original_descriptors);
@@ -1309,11 +1327,15 @@ main(int argc, char **argv)
 		UT_RUN(test_episode_all_clog_whole_output_and_late_error_preserve_custody);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(207);
+	UT_PLAN(211);
 	UT_RUN(test_episode_native_pages_holds_all_origins_on_original_descriptors);
 	UT_RUN(test_episode_native_pages_partial_failure_keeps_all_open_custody);
 	UT_RUN(test_episode_native_pages_whole_capacity_budget_and_duplicate_preflight);
 	UT_RUN(test_episode_native_pages_alias_error_and_final_recheck_keep_debt);
+	UT_RUN(test_episode_applied_pages_fresh_carriers_cannot_supply_execution);
+	UT_RUN(test_episode_applied_pages_joins_all_sources_in_original_pass);
+	UT_RUN(test_episode_applied_pages_foreign_failure_keeps_whole_custody);
+	UT_RUN(test_episode_applied_pages_opt_out_and_alias_keep_original_inputs);
 	UT_RUN(test_episode_all_clog_retains_every_source_without_changing_query_input);
 	UT_RUN(test_episode_all_clog_keeps_foreign_full_birth_and_its_own_counter);
 	UT_RUN(test_episode_all_clog_capacity_is_for_whole_set_not_query_origin);

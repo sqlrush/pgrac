@@ -485,6 +485,15 @@ typedef struct ClusterRecoveryRelmapPendingNativePagesV1 {
 extern bool cluster_recovery_relmap_history_pending_native_pages_v1(
 	ClusterRecoveryRelmapHistory *history, const ClusterRelmapV2Image *pending,
 	ClusterRecoveryRelmapPendingNativePagesV1 *out, ClusterRecoveryNativeInventoryDiag *diag);
+/* Opt in to the original sealed SIDE plan's historical applied input for
+ * EVERY physical CLOG frame in the same original reread. Same whole-output,
+ * held-fd, budget and sticky-failure contract as pending_native_pages; no
+ * additional pass/read or mutation. Equal present bytes plus historical apply
+ * remain observations, not birth-era/no-reuse/truncation/continuous lifetime,
+ * native qualification or joint COMPLETE/release authority. */
+extern bool cluster_recovery_relmap_history_pending_applied_pages_v1(
+	ClusterRecoveryRelmapHistory *history, const ClusterRelmapV2Image *pending,
+	ClusterRecoveryRelmapPendingNativePagesV1 *out, ClusterRecoveryNativeInventoryDiag *diag);
 /* Copy an attached snapshot without I/O or rebasing. Original metadata and
  * PAGE-current guards bracket the copy; final physical/native recheck remains
  * mandatory. A bad ordinal/overlap is an ordinary precondition refusal. */
