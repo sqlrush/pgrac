@@ -139,7 +139,10 @@ typedef struct ClusterRelmapClogBaseHandleV1 ClusterRelmapClogBaseHandleV1;
  * Native locks cover only each read; no lock is retained between calls.
  * Native logical mutation in this process invalidates its origin's held
  * observations before the attempt, even if the same bytes are restored.
- * This does not exclude mutations by other processes or prove lifetime.
+ * Shared mutation sequences also reject writes by other backends of this
+ * postmaster and refuse observations while a native attempt is in progress.
+ * Saturation refuses; normal/ERROR completion never restores an old sequence.
+ * This does not exclude inter-instance writes or certify physical lifetime.
  * Missing/short/aliased files refuse. IN_PROGRESS stays IN_PROGRESS.
  * No caller native/CF lock or critical section; output/held/source are
  * exclusive and disjoint. Precondition refusal performs no I/O/revocation.

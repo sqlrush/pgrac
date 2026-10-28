@@ -4707,6 +4707,7 @@ test_cluster_recovery_episode_clog.o: test_cluster_recovery_episode_clog.c \
         test_cluster_recovery_episode_clog.h test_cluster_recovery_episode_clog_namespace.h \
         test_cluster_clog_recovery.c test_cluster_clog_relmap_participant.inc \
         test_cluster_clog_relmap_mutation.inc \
+        test_cluster_clog_relmap_shared_mutation.inc \
         test_cluster_clog_page_birth.inc test_cluster_clog_full_consumer.inc unit_test.h \
         $(top_srcdir)/src/backend/access/transam/clog.c \
         $(top_srcdir)/src/backend/access/transam/slru.c \
@@ -5910,6 +5911,7 @@ test_cluster_multixact_recovery test_cluster_multixact_limits_io: %: %.c unit_te
 test_cluster_clog_recovery: test_cluster_clog_recovery.c unit_test.h \
 		test_cluster_clog_relmap_participant.inc test_cluster_clog_page_birth.inc \
 		test_cluster_clog_relmap_mutation.inc \
+		test_cluster_clog_relmap_shared_mutation.inc \
 		test_cluster_clog_full_consumer.inc \
 		$(top_srcdir)/src/backend/access/transam/clog.c \
 		$(top_srcdir)/src/include/access/clog.h \
