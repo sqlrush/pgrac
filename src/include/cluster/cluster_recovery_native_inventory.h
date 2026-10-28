@@ -518,6 +518,18 @@ extern bool cluster_recovery_relmap_history_pending_consumed_pages_v1(
 extern bool cluster_recovery_relmap_history_pending_local_bounds_pages_v1(
 	ClusterRecoveryRelmapHistory *history, const ClusterRelmapV2Image *pending,
 	ClusterRecoveryRelmapPendingNativePagesV1 *out, ClusterRecoveryNativeInventoryDiag *diag);
+/* Opt in to consumed_pages plus an actually observed matching-controller
+ * native FULL initialization equal to EVERY attached page's original FULL
+ * birth. Unknown/legacy/cache-loss or equal-byte different birth refuses;
+ * never infer or restore input from WAL, query/counter or another origin.
+ * Uses the SAME original physical reread and TWO original held-page reads,
+ * with whole-output/sticky-failure/FD/pins-debt unchanged. Older endpoints,
+ * including local_bounds_pages, remain unqualified observation modes.
+ * This necessary correspondence is NOT era/history/no-reuse/truncation or
+ * continuous lifetime authority, qualification, COMPLETE or release. */
+extern bool cluster_recovery_relmap_history_pending_initialized_pages_v1(
+	ClusterRecoveryRelmapHistory *history, const ClusterRelmapV2Image *pending,
+	ClusterRecoveryRelmapPendingNativePagesV1 *out, ClusterRecoveryNativeInventoryDiag *diag);
 /* Copy an attached snapshot without I/O or rebasing. Original metadata and
  * PAGE-current guards bracket the copy; final physical/native recheck remains
  * mandatory. A bad ordinal/overlap is an ordinary precondition refusal. */
