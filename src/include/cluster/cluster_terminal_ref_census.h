@@ -393,6 +393,18 @@ typedef struct ClusterCtrcDelegationCustodyV1 {
 StaticAssertDecl(sizeof(ClusterCtrcDelegationCustodyV1) == 40,
 	"CTRC custody entry must remain 40 bytes");
 
+/* Original accepted path only. Outgoing pending custody is separate: a
+ * sender must not interpret a copied path as subtree closure or page authority. */
+typedef struct ClusterCtrcDelegationPathV2 {
+	uint16 version;
+	uint16 hop_count;
+	uint32 reserved;
+	ClusterCtrcParticipantIdentity root_receiver;
+	ClusterCtrcDelegationCustodyV1 hops[CLUSTER_CTRC_DELEGATION_V2_MAX_HOPS];
+} ClusterCtrcDelegationPathV2;
+StaticAssertDecl(sizeof(ClusterCtrcDelegationPathV2) == 640,
+	"CTRC complete path must remain bounded at 640 bytes");
+
 typedef struct ClusterCtrcParticipantEntry {
 	ClusterCtrcTxnKeyV1 key;
 	ClusterCtrcParticipantIdentity identity;
@@ -414,9 +426,11 @@ typedef struct ClusterCtrcParticipantEntry {
 	uint64 cancelled_count;
 	uint64 cleaned_count;
 	uint64 ack_frozen_count;
-	/* First-hop parent remains retained independently of local receipts.
-	 * The immutable original above stays bound to this parent, not to us. */
+	/* Immediate parent is retained independently of local receipts. The
+	 * immutable original names the path root, never a re-signed local grant. */
 	ClusterCtrcDelegationCustodyV1 delegation_parent;
+	/* Zero for direct/V1 rows. Explicit V2 never backfills an old row. */
+	ClusterCtrcDelegationPathV2 delegation_path;
 	uint32 delegation_count;
 	uint32 delegation_reserved;
 	uint64 last_delegation_sequence;
@@ -1043,6 +1057,26 @@ extern bool cluster_ctrc_itl_delegate_accept_v1(const ClusterItlSlotData *slot,
  * a new intent; retain the returned handle through apply or premutation cancel.
  * This does not prove an image was installed or authorize page visibility. */
 extern ClusterCtrcPrepareResult cluster_ctrc_itl_image_prepare_v1(
+	const ClusterItlSlotData *slot,
+	const ClusterCtrcParticipantIdentity *authenticated_sender,
+	const ClusterCtrcParticipantIdentity *receiver, const uint8 *record, Size length,
+	const ClusterCtrcTargetV1 *pending_target, ClusterCtrcReceiptHandle *handle);
+
+/* Explicit complete-path V2. The source must own the exact APPLIED ordinary
+ * ITL under its existing current/PI protection. capacity <= MAX_BYTES; failures
+ * clear that buffer and length_out. Original V2 is copied, never re-signed.
+ * Receiver identities are protected transport inputs. Each accepted path is
+ * simple and bounded by N-1; global pending/tree CLOSE remains independent.
+ * These APIs do not activate live IMAGE V3, freeze, release or subtree ACK. */
+extern bool cluster_ctrc_itl_delegate_prepare_v2(
+	const ClusterCtrcItlTargetIdentity *target, const ClusterItlSlotData *slot,
+	const ClusterCtrcParticipantIdentity *sender,
+	const ClusterCtrcParticipantIdentity *receiver, uint8 *record, Size capacity,
+	Size *length_out);
+extern bool cluster_ctrc_itl_delegate_accept_v2(const ClusterItlSlotData *slot,
+	const ClusterCtrcParticipantIdentity *authenticated_sender,
+	const ClusterCtrcParticipantIdentity *receiver, const uint8 *record, Size length);
+extern ClusterCtrcPrepareResult cluster_ctrc_itl_image_prepare_v2(
 	const ClusterItlSlotData *slot,
 	const ClusterCtrcParticipantIdentity *authenticated_sender,
 	const ClusterCtrcParticipantIdentity *receiver, const uint8 *record, Size length,

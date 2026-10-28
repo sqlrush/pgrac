@@ -702,10 +702,12 @@ s_lock(volatile slock_t *lock pg_attribute_unused(), const char *file pg_attribu
 	abort();
 }
 
+static int fixture_declared_nodes = 4;
+
 int
 cluster_conf_declared_node_count_early(void)
 {
-	return 4;
+	return fixture_declared_nodes;
 }
 
 void *
@@ -8263,6 +8265,429 @@ UT_TEST(test_registered_receiver_merge_does_not_extend_foreign_mx_domain)
 	}
 }
 
+/* Explicit V2 is a complete protected path, never a replacement origin grant. */
+static bool
+multihop_apply_image(ClusterCtrcReceiptHandle *image, const ClusterItlSlotData *slot,
+	ClusterCtrcItlTargetIdentity *target)
+{
+	ClusterCtrcTargetV1 exact = image->receipt->target;
+	ClusterCtrcApplyToken token;
+
+	exact.kind = CTRC_TARGET_EXACT_ITL_SLOT;
+	exact.itl_slot_wrap = slot->wrap;
+	exact.itl_xid = slot->xid;
+	exact.itl_class = slot->flags;
+	memcpy(exact.uba, &slot->undo_segment_head, sizeof(exact.uba));
+	exact.planned_predecessor_sha256[0] = 1;
+	if (!cluster_ctrc_sha256_exact(slot, sizeof(*slot), exact.planned_successor_sha256)
+		|| cluster_ctrc_receipt_apply_shared(image, &exact, &token) != CLUSTER_CTRC_APPLY_APPLIED)
+		return false;
+	MemSet(target, 0, sizeof(*target));
+	target->spc_oid = exact.spc_oid;
+	target->db_oid = exact.db_oid;
+	target->rel_number = exact.rel_number;
+	target->fork_number = exact.fork_number;
+	target->block_number = exact.block_number;
+	target->itl_xid = slot->xid;
+	target->itl_slot_index = exact.itl_slot_index;
+	target->itl_slot_wrap = slot->wrap;
+	target->itl_class = slot->flags;
+	target->needs_wal = exact.needs_wal;
+	memcpy(target->uba, exact.uba, sizeof(target->uba));
+	return true;
+}
+
+static bool
+seed_multihop_source(ClusterCtrcReceiptHandle *first, ClusterCtrcReceiptHandle *middle,
+	ClusterCtrcParticipantIdentity *receiver, ClusterItlSlotData *slot,
+	ClusterCtrcItlTargetIdentity *target)
+{
+	ClusterCtrcParticipantIdentity sender;
+	ClusterCtrcTargetV1 pending;
+	uint8 record[224];
+	uint64 index;
+
+	fixture_declared_nodes = 16;
+	if (!seed_delegation_receive(first, &sender, slot, record, &index))
+		return false;
+	image_pending_target(&pending);
+	if (cluster_ctrc_itl_image_prepare_v1(slot, &first->participant->identity,
+		&sender, record, sizeof(record), &pending, middle) != CLUSTER_CTRC_PREPARE_READY
+		|| !multihop_apply_image(middle, slot, target))
+		return false;
+	*receiver = sender;
+	receiver->node_id = 3;
+	receiver->boot_incarnation = 1104;
+	return true;
+}
+
+UT_TEST(test_multihop_original_identity_reaches_actual_image_receipts)
+{
+	ClusterCtrcReceiptHandle first, middle, next, last;
+	ClusterCtrcParticipantIdentity receiver, receiver4;
+	ClusterCtrcItlTargetIdentity target;
+	ClusterCtrcTargetV1 pending;
+	ClusterItlSlotData slot;
+	ClusterCtrcParticipantEntry before;
+	uint8 record[784], retry[784], record3[784], original[144];
+	Size length = 0, retry_length = 0, length3 = 0;
+
+	UT_ASSERT(seed_multihop_source(&first, &middle, &receiver, &slot, &target));
+	memcpy(original, first.participant->original_identity_v2, sizeof(original));
+	UT_ASSERT(cluster_ctrc_itl_delegate_prepare_v2(&target, &slot,
+		&middle.participant->identity, &receiver, record, sizeof(record), &length));
+	if (length == 0)
+		return;
+	UT_ASSERT_EQ(length, 264);
+	UT_ASSERT_EQ(ctrc_delegation_get_be(record, 2), 2);
+	UT_ASSERT_EQ(ctrc_delegation_get_be(record + 4, 2), 2);
+	UT_ASSERT(memcmp(record + 8, original, sizeof(original)) == 0);
+	UT_ASSERT_EQ(middle.participant->delegation_count, 1);
+	before = *middle.participant;
+	UT_ASSERT(cluster_ctrc_itl_delegate_prepare_v2(&target, &slot,
+		&middle.participant->identity, &receiver, retry, sizeof(retry), &retry_length));
+	UT_ASSERT_EQ(retry_length, length);
+	UT_ASSERT(memcmp(record, retry, length) == 0);
+	UT_ASSERT(memcmp(middle.participant, &before, sizeof(before)) == 0);
+	cluster_node_id = receiver.node_id;
+	UT_ASSERT(!cluster_ctrc_itl_delegate_accept_v1(&slot, &middle.participant->identity,
+		&receiver, record, length));
+	UT_ASSERT(cluster_ctrc_itl_delegate_accept_v2(&slot, &middle.participant->identity,
+		&receiver, record, length));
+	image_pending_target(&pending);
+	UT_ASSERT_EQ(cluster_ctrc_itl_image_prepare_v2(&slot, &middle.participant->identity,
+		&receiver, record, length, &pending, &next), CLUSTER_CTRC_PREPARE_READY);
+	if (!next.valid)
+		return;
+	UT_ASSERT(memcmp(next.participant->original_identity_v2, original, sizeof(original)) == 0);
+	UT_ASSERT_EQ(next.participant->delegation_parent.receiver.node_id, middle.participant->identity.node_id);
+	UT_ASSERT(FullTransactionIdEquals(next.original_full_xid, first.original_full_xid));
+	UT_ASSERT(multihop_apply_image(&next, &slot, &target));
+	receiver4 = receiver;
+	receiver4.node_id = 4;
+	receiver4.boot_incarnation++;
+	UT_ASSERT(cluster_ctrc_itl_delegate_prepare_v2(&target, &slot, &receiver,
+		&receiver4, record3, sizeof(record3), &length3));
+	UT_ASSERT_EQ(length3, 304);
+	UT_ASSERT(memcmp(record3 + 8, original, sizeof(original)) == 0);
+	UT_ASSERT(memcmp(record3 + 152, record + 152, length - 152) == 0);
+	cluster_node_id = receiver4.node_id;
+	UT_ASSERT_EQ(cluster_ctrc_itl_image_prepare_v2(&slot, &receiver, &receiver4,
+		record3, length3, &pending, &last), CLUSTER_CTRC_PREPARE_READY);
+	UT_ASSERT(last.valid);
+	if (!last.valid)
+		return;
+	UT_ASSERT(FullTransactionIdEquals(last.original_full_xid, first.original_full_xid));
+	UT_ASSERT(ctrc_participant_delegations_valid(last.participant));
+	UT_ASSERT(cluster_ctrc_receipt_cancel_shared(&last));
+	UT_ASSERT(!ctrc_participant_delegations_empty(last.participant));
+	UT_ASSERT_EQ(first.participant->delegation_count, 1);
+	UT_ASSERT_EQ(middle.participant->delegation_count, 1);
+	UT_ASSERT_EQ(next.participant->delegation_count, 1);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_multihop_receiver_refuses_malformed_chain_before_registration)
+{
+	for (unsigned fault = 0; fault < 17; fault++) {
+		ClusterCtrcReceiptHandle first, middle, refused;
+		ClusterCtrcParticipantIdentity receiver, sender;
+		ClusterCtrcItlTargetIdentity target;
+		ClusterCtrcTargetV1 pending;
+		ClusterItlSlotData slot;
+		ClusterCtrcParticipantEntry before;
+		uint8 record[784];
+		Size length = 0;
+		uint64 index, registration, journal;
+
+		UT_ASSERT(seed_multihop_source(&first, &middle, &receiver, &slot, &target));
+		UT_ASSERT(cluster_ctrc_itl_delegate_prepare_v2(&target, &slot,
+			&middle.participant->identity, &receiver, record, sizeof(record), &length));
+		if (length == 0)
+			return;
+		sender = middle.participant->identity;
+		UT_ASSERT(ctrc_participant_index(&first.key, receiver.node_id, &index));
+		switch (fault) {
+		case 0: record[1] = 1; break; /* no V1 reinterpretation */
+		case 1: record[1] = 3; break;
+		case 2: record[3]--; break;
+		case 3: record[5] = 0; break;
+		case 4: record[5] = 16; break;
+		case 5: record[6] = 1; break;
+		case 6: record[8] = 1; break;
+		case 7: record[16] ^= 1; break; /* complete original FullXid */
+		case 8: record[152 + 15] ^= 1; break; /* origin-bound root boot */
+		case 9: record[184 + 15] ^= 1; break; /* authenticated penultimate boot */
+		case 10: record[224 + 15] ^= 1; break;
+		case 11: MemSet(record + 216, 0, 8); break;
+		case 12: record[263] = 16; break;
+		case 13: memcpy(record + 224, record + 152, 32); break; /* cycle */
+		case 14: record[225] = first.key.origin_node_id; break;
+		case 15: length--; break;
+		case 16: sender.admission_record_generation++; break;
+		}
+		before = ctrc_participant_entries()[index];
+		registration = pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation);
+		journal = CtrcShared->global_journal_generation;
+		cluster_node_id = receiver.node_id;
+		UT_ASSERT(!cluster_ctrc_itl_delegate_accept_v2(&slot, &sender, &receiver, record, length));
+		image_pending_target(&pending);
+		UT_ASSERT_EQ(cluster_ctrc_itl_image_prepare_v2(&slot, &sender, &receiver,
+			record, length, &pending, &refused), CLUSTER_CTRC_PREPARE_REFUSED);
+		UT_ASSERT(ctrc_bytes_zero(&refused, sizeof(refused)));
+		UT_ASSERT(memcmp(&before, &ctrc_participant_entries()[index], sizeof(before)) == 0);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation), registration);
+		UT_ASSERT_EQ(CtrcShared->global_journal_generation, journal);
+		UT_ASSERT_EQ(middle.participant->delegation_count, 1);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
+UT_TEST(test_multihop_source_refuses_cycle_capacity_and_changed_applied_slot)
+{
+	for (unsigned fault = 0; fault < 7; fault++) {
+		ClusterCtrcReceiptHandle first, middle;
+		ClusterCtrcParticipantIdentity receiver;
+		ClusterCtrcItlTargetIdentity target;
+		ClusterItlSlotData slot;
+		ClusterCtrcParticipantEntry before;
+		uint8 record[784];
+		Size length = 99, capacity = sizeof(record);
+
+		UT_ASSERT(seed_multihop_source(&first, &middle, &receiver, &slot, &target));
+		switch (fault) {
+		case 0: receiver = first.participant->identity; break; /* path root */
+		case 1: receiver.node_id = first.key.origin_node_id; break;
+		case 2: receiver = middle.participant->identity; break;
+		case 3: capacity = 263; break;
+		case 4: ((uint8 *)&slot)[sizeof(slot) - 1] ^= 1; break;
+		case 5: middle.participant->original_identity_v2[8] ^= 1; break;
+		case 6: middle.participant->state = CTRC_PARTICIPANT_CLOSED_DRAINING; break;
+		}
+		before = *middle.participant;
+		MemSet(record, 0xa5, sizeof(record));
+		UT_ASSERT(!cluster_ctrc_itl_delegate_prepare_v2(&target, &slot,
+			&middle.participant->identity, &receiver, record, capacity, &length));
+		UT_ASSERT_EQ(length, 0);
+		UT_ASSERT(ctrc_bytes_zero(record, capacity));
+		UT_ASSERT(memcmp(middle.participant, &before, sizeof(before)) == 0);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
+UT_TEST(test_multihop_receiver_merge_keeps_first_path_and_rejects_raw_only)
+{
+	for (unsigned unknown = 0; unknown < 2; unknown++) {
+		ClusterCtrcReceiptHandle first, middle, direct;
+		ClusterCtrcParticipantIdentity receiver;
+		ClusterCtrcItlTargetIdentity target;
+		ClusterItlSlotData slot;
+		ClusterCtrcParticipantEntry before;
+		ClusterCtrcOriginEntry *origin;
+		ClusterCtrcPublicationIdV1 publication;
+		ClusterCtrcTargetV1 pending;
+		uint8 record[784], original[144];
+		Size length = 0;
+		uint32 grant;
+
+		UT_ASSERT(seed_multihop_source(&first, &middle, &receiver, &slot, &target));
+		UT_ASSERT(cluster_ctrc_itl_delegate_prepare_v2(&target, &slot,
+			&middle.participant->identity, &receiver, record, sizeof(record), &length));
+		if (length == 0)
+			return;
+		origin = &ctrc_origin_entries()[0];
+		origin->state = CTRC_ORIGIN_OPEN;
+		cluster_node_id = origin->key.origin_node_id;
+		UT_ASSERT_EQ(cluster_ctrc_origin_grant_fullxid_v2(&first.key, &receiver,
+			CTRC_PROOF_ACTIVE, &grant, original), CLUSTER_CTRC_TOUCH_RECORDED);
+		fixture_receipt_inputs(origin, 1191, &publication, &pending);
+		publication.requester_node_id = receiver.node_id;
+		publication.requester_boot_incarnation = receiver.boot_incarnation;
+		publication.capability_record_generation = receiver.capability_record_generation;
+		cluster_node_id = receiver.node_id;
+		UT_ASSERT_EQ(cluster_ctrc_receipt_prepare_origin_v2(&first.key, &receiver,
+			grant, &publication, &pending, original, sizeof(original), &direct), CLUSTER_CTRC_PREPARE_READY);
+		if (!direct.valid)
+			return;
+		if (unknown) {
+			direct.participant->original_full_xid = InvalidFullTransactionId;
+			MemSet(direct.participant->original_identity_v2, 0, 144);
+		}
+		before = *direct.participant;
+		UT_ASSERT_EQ(cluster_ctrc_itl_delegate_accept_v2(&slot, &middle.participant->identity,
+			&receiver, record, length), !unknown);
+		UT_ASSERT(memcmp(direct.participant, &before, sizeof(before)) == 0);
+		UT_ASSERT_EQ(middle.participant->delegation_count, 1);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
+UT_TEST(test_multihop_actual_path_visits_each_nonorigin_node_once)
+{
+	ClusterCtrcReceiptHandle current, next;
+	ClusterCtrcParticipantIdentity receiver;
+	ClusterCtrcItlTargetIdentity target;
+	ClusterCtrcTargetV1 pending;
+	ClusterItlSlotData slot;
+	ClusterCtrcParticipantEntry before;
+	uint8 record[784], original[144];
+	Size length = 0;
+
+	fixture_declared_nodes = 16;
+	UT_ASSERT(seed_delegation_itl_source(&current, &receiver, &target, &slot));
+	memcpy(original, current.participant->original_identity_v2, sizeof(original));
+	for (unsigned node = 2; node < CLUSTER_CTRC_MAX_PARTICIPANTS; node++) {
+		receiver.node_id = node;
+		receiver.boot_incarnation = 1200 + node;
+		UT_ASSERT(cluster_ctrc_itl_delegate_prepare_v2(&target, &slot,
+			&current.participant->identity, &receiver, record, sizeof(record), &length));
+		if (length == 0)
+			return;
+		UT_ASSERT_EQ(length, 184 + (node - 1) * 40);
+		UT_ASSERT(memcmp(record + 8, original, sizeof(original)) == 0);
+		UT_ASSERT_EQ(current.participant->delegation_count, 1);
+		cluster_node_id = node;
+		image_pending_target(&pending);
+		UT_ASSERT_EQ(cluster_ctrc_itl_image_prepare_v2(&slot, &current.participant->identity,
+			&receiver, record, length, &pending, &next), CLUSTER_CTRC_PREPARE_READY);
+		if (!next.valid)
+			return;
+		UT_ASSERT(multihop_apply_image(&next, &slot, &target));
+		UT_ASSERT(ctrc_participant_delegations_valid(next.participant));
+		current = next;
+	}
+	before = *current.participant;
+	for (unsigned node = 0; node < CLUSTER_CTRC_MAX_PARTICIPANTS; node++) {
+		receiver.node_id = node;
+		length = 99;
+		UT_ASSERT(!cluster_ctrc_itl_delegate_prepare_v2(&target, &slot,
+			&current.participant->identity, &receiver, record, sizeof(record), &length));
+		UT_ASSERT_EQ(length, 0);
+		UT_ASSERT(ctrc_bytes_zero(record, sizeof(record)));
+		UT_ASSERT(memcmp(current.participant, &before, sizeof(before)) == 0);
+	}
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_multihop_maximum_record_bound_and_stored_path_validation)
+{
+	/* Controlled authenticated predecessor histories isolate the receiver's
+	 * maximum-length parser. Actual hop-by-hop publication is exercised above. */
+	for (unsigned fault = 0; fault < 6; fault++) {
+		ClusterCtrcReceiptHandle first, image;
+		ClusterCtrcParticipantIdentity unused, root, sender, receiver;
+		ClusterCtrcItlTargetIdentity target;
+		ClusterCtrcTargetV1 pending;
+		ClusterItlSlotData slot;
+		uint8 record[785] = { 0 }, original[144];
+		Size length = 784;
+		uint64 index;
+		ClusterCtrcParticipantEntry before;
+
+		fixture_declared_nodes = 16;
+		UT_ASSERT(seed_delegation_itl_source(&first, &unused, &target, &slot));
+		root = ctrc_origin_entries()[0].touched[0];
+		cluster_node_id = first.key.origin_node_id;
+		UT_ASSERT(cluster_ctrc_origin_fullxid_capture_v2(&first.key, &root,
+			first.participant->grant_generation, original));
+		ctrc_delegation_put_be(record, 2, 2);
+		ctrc_delegation_put_be(record + 2, length, 2);
+		ctrc_delegation_put_be(record + 4, 15, 2);
+		memcpy(record + 8, original, sizeof(original));
+		ctrc_delegation_identity_encode(&root, record + 152);
+		for (unsigned node = 1; node < 16; node++) {
+			receiver = root;
+			receiver.node_id = node;
+			receiver.boot_incarnation = 1300 + node;
+			ctrc_delegation_identity_encode(&receiver, record + 184 + (node - 1) * 40);
+			ctrc_delegation_put_be(record + 216 + (node - 1) * 40, 15, 8);
+			if (node == 14)
+				sender = receiver;
+		}
+		UT_ASSERT(ctrc_participant_index(&first.key, receiver.node_id, &index));
+		before = ctrc_participant_entries()[index];
+		switch (fault) {
+		case 0: break;
+		case 1: length = 783; break;
+		case 2: length = 785; break;
+		case 3: record[5] = 16; break;
+		case 4: record[183] = 1; break; /* root admission differs */
+		case 5: record[784 - 1] = 16; break;
+		}
+		cluster_node_id = receiver.node_id;
+		UT_ASSERT_EQ(cluster_ctrc_itl_delegate_accept_v2(&slot, &sender,
+			&receiver, record, length), fault == 0);
+		if (fault == 0) {
+			ClusterCtrcParticipantEntry *participant = &ctrc_participant_entries()[index];
+			ClusterCtrcDelegationPathV2 saved = participant->delegation_path;
+			UT_ASSERT_EQ(saved.hop_count, 15);
+			UT_ASSERT(ctrc_participant_delegations_valid(participant));
+			image_pending_target(&pending);
+			UT_ASSERT_EQ(cluster_ctrc_itl_image_prepare_v2(&slot, &sender, &receiver,
+				record, length, &pending, &image), CLUSTER_CTRC_PREPARE_READY);
+			UT_ASSERT(image.valid);
+			for (unsigned corrupt = 0; corrupt < 6; corrupt++) {
+				participant->delegation_path = saved;
+				switch (corrupt) {
+				case 0: participant->delegation_path.version++; break;
+				case 1: participant->delegation_path.hop_count = 16; break;
+				case 2: participant->delegation_path.reserved = 1; break;
+				case 3: participant->delegation_path.root_receiver.boot_incarnation++; break;
+				case 4: participant->delegation_path.hops[14].sequence++; break;
+				case 5: participant->delegation_path.hops[5].receiver = saved.hops[4].receiver; break;
+				}
+				UT_ASSERT(!ctrc_participant_delegations_valid(participant));
+				before = *participant;
+				UT_ASSERT(!cluster_ctrc_itl_delegate_accept_v2(&slot, &sender,
+					&receiver, record, length));
+				UT_ASSERT(memcmp(participant, &before, sizeof(before)) == 0);
+			}
+			participant->delegation_path = saved;
+		} else
+			UT_ASSERT(memcmp(&before, &ctrc_participant_entries()[index], sizeof(before)) == 0);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
+UT_TEST(test_multihop_registered_path_merges_first_hop_without_replacing_its_parent)
+{
+	ClusterCtrcReceiptHandle first, middle, image;
+	ClusterCtrcParticipantIdentity receiver;
+	ClusterCtrcItlTargetIdentity target;
+	ClusterCtrcTargetV1 pending;
+	ClusterItlSlotData slot;
+	ClusterCtrcParticipantEntry before;
+	uint8 record[784], first_hop[224];
+	Size length = 0;
+
+	UT_ASSERT(seed_multihop_source(&first, &middle, &receiver, &slot, &target));
+	UT_ASSERT(cluster_ctrc_itl_delegate_prepare_v2(&target, &slot,
+		&middle.participant->identity, &receiver, record, sizeof(record), &length));
+	if (length == 0)
+		return;
+	cluster_node_id = receiver.node_id;
+	image_pending_target(&pending);
+	UT_ASSERT_EQ(cluster_ctrc_itl_image_prepare_v2(&slot, &middle.participant->identity,
+		&receiver, record, length, &pending, &image), CLUSTER_CTRC_PREPARE_READY);
+	if (!image.valid)
+		return;
+	before = *image.participant;
+	cluster_node_id = first.participant->identity.node_id;
+	/* The first source owns slot2; IMAGE intents above use their own slot0. */
+	target.itl_slot_index = first.receipt->target.itl_slot_index;
+	UT_ASSERT(cluster_ctrc_itl_delegate_prepare_v1(&target, &slot,
+		&first.participant->identity, &receiver, first_hop, sizeof(first_hop)));
+	cluster_node_id = receiver.node_id;
+	UT_ASSERT(cluster_ctrc_itl_delegate_accept_v1(&slot, &first.participant->identity,
+		&receiver, first_hop, sizeof(first_hop)));
+	UT_ASSERT(memcmp(image.participant, &before, sizeof(before)) == 0);
+	UT_ASSERT_EQ(before.delegation_path.hop_count, 2);
+	UT_ASSERT_EQ(image.participant->delegation_parent.receiver.node_id, middle.participant->identity.node_id);
+	UT_ASSERT_EQ(first.participant->delegation_count, 2); /* pending, not two accepted edges */
+	UT_ASSERT_EQ(middle.participant->delegation_count, 1);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
 int
 main(void)
 {
@@ -8270,7 +8695,7 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(185);
+	UT_PLAN(192);
 	UT_RUN(test_prepare_path_namespace_precedes_input_and_resets_output);
 	UT_RUN(test_prepare_path_input_precedes_journal_exhaustion);
 	UT_RUN(test_prepare_path_chain_precedes_locator_and_keeps_blocked_state);
@@ -8459,6 +8884,13 @@ main(void)
 	UT_RUN(test_registered_ordinary_receiver_merges_into_original_receipt_owner);
 	UT_RUN(test_registered_receiver_merge_refuses_unknown_conflicting_or_closed_owner);
 	UT_RUN(test_registered_receiver_merge_does_not_extend_foreign_mx_domain);
+	UT_RUN(test_multihop_original_identity_reaches_actual_image_receipts);
+	UT_RUN(test_multihop_receiver_refuses_malformed_chain_before_registration);
+	UT_RUN(test_multihop_source_refuses_cycle_capacity_and_changed_applied_slot);
+	UT_RUN(test_multihop_receiver_merge_keeps_first_path_and_rejects_raw_only);
+	UT_RUN(test_multihop_actual_path_visits_each_nonorigin_node_once);
+	UT_RUN(test_multihop_maximum_record_bound_and_stored_path_validation);
+	UT_RUN(test_multihop_registered_path_merges_first_hop_without_replacing_its_parent);
 	free(CtrcShared);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

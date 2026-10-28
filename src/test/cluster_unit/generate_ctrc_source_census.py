@@ -213,7 +213,7 @@ SCAN_RULES: Tuple[ScanRule, ...] = (
             "src/backend/cluster/cluster_tt_slot.c",
             "src/backend/cluster/cluster_tt_durable.c",
         ),
-        r"\b(?:cluster_ctrc_origin_original_full_xid_(?:exact|shared)|cluster_ctrc_origin_fullxid_(?:capture_v2|match_v2)|cluster_ctrc_origin_grant_fullxid_v2|cluster_ctrc_itl_delegate_(?:prepare|accept)_v1|gcs_block_resource_x_ctrc_receive_image|ctrc_origin_fullxid_encode_v2|cluster_multixact_current_member_proof_bind_origin_v2|cluster_tt_slot_origin_identity_(?:retain|read))\s*\(",
+        r"\b(?:cluster_ctrc_origin_original_full_xid_(?:exact|shared)|cluster_ctrc_origin_fullxid_(?:capture_v2|match_v2)|cluster_ctrc_origin_grant_fullxid_v2|cluster_ctrc_itl_delegate_(?:prepare|accept)_v[12]|ctrc_itl_delegate_(?:prepare|accept)|gcs_block_resource_x_ctrc_receive_image|ctrc_origin_fullxid_encode_v2|cluster_multixact_current_member_proof_bind_origin_v2|cluster_tt_slot_origin_identity_(?:retain|read))\s*\(",
     ),
     ScanRule(
         "CTRC_RECEIPT_LIFECYCLE",
@@ -224,7 +224,7 @@ SCAN_RULES: Tuple[ScanRule, ...] = (
             "src/backend/cluster/cluster_terminal_ref_census.c",
             "src/backend/cluster/cluster_undo_record.c",
         ),
-        r"\b(?:cluster_ctrc_receipt_(?:prepare_shared|prepare_origin_v2|apply_shared|retarget_itl_shared|cancel_shared|discharge_itl_shared)|cluster_ctrc_itl_image_prepare_v1|ctrc_receipt_prepare_shared_internal)\s*\(",
+        r"\b(?:cluster_ctrc_receipt_(?:prepare_shared|prepare_origin_v2|apply_shared|retarget_itl_shared|cancel_shared|discharge_itl_shared)|cluster_ctrc_itl_image_prepare_v[12]|ctrc_receipt_prepare_shared_internal)\s*\(",
     ),
     ScanRule(
         "CTRC_CLOSE_WIRE",
@@ -566,13 +566,31 @@ _classify_owners(
     "LOCAL_RECEIPT_DISCHARGE_ONLY|RETAIN_PENDING_PARENT_CLOSE_ACK",
     "MXA-T21",
 )
+# Explicit V2 complete paths retain the original root and immediate parent;
+# the separate pending outgoing stub has no implicit subtree ACK.
+_classify_owners(
+    "CTRC_ORIGIN_PROVENANCE",
+    "src/backend/cluster/cluster_terminal_ref_census.c",
+    ("ctrc_delegation_path_valid", "ctrc_delegation_path_match"),
+    "REGISTERED_REFERENCE", "CTRC_REF_HEAP_ITL_UBA|CTRC_REF_IMAGE_ITL_V1",
+    "CTRC_TARGET_PAGE_PENDING_ITL_SLOT|CTRC_TARGET_EXACT_ITL_SLOT",
+    "cluster_ctrc_itl_image_prepare_v2", "RETAIN_PENDING_PARENT_CLOSE_ACK", "MXA-T40",
+)
+_classify_owners(
+    "CTRC_ORIGIN_PROVENANCE",
+    "src/backend/cluster/cluster_terminal_ref_census.c",
+    ("ctrc_participant_delegate_path_prepare_locked",),
+    "REGISTERED_REFERENCE", "CTRC_REF_HEAP_ITL_UBA|CTRC_REF_IMAGE_ITL_V1",
+    "CTRC_TARGET_PAGE_PENDING_ITL_SLOT|CTRC_TARGET_EXACT_ITL_SLOT",
+    "cluster_ctrc_itl_delegate_prepare_v2", "RETAIN_PENDING_SUBTREE_CLOSE_ACK", "MXA-T40",
+)
 # Typed IMAGE copy intents retain the authenticated immutable parent first.
 # The original shared journal owns the new publication domain; no caller ID
 # or epoch inference can qualify it, and no page visibility is implied.
 for category in ("CTRC_ORIGIN_PROVENANCE", "CTRC_RECEIPT_LIFECYCLE"):
     _classify_owners(
         category, "src/backend/cluster/cluster_terminal_ref_census.c",
-        ("cluster_ctrc_itl_image_prepare_v1",),
+        ("cluster_ctrc_itl_image_prepare_v1", "cluster_ctrc_itl_image_prepare_v2"),
         "REGISTERED_REFERENCE",
         "CTRC_REF_IMAGE_ITL_V1",
         "CTRC_TARGET_PAGE_PENDING_ITL_SLOT|CTRC_TARGET_EXACT_ITL_SLOT",
@@ -630,6 +648,24 @@ for path, owners in (
         "cluster_ctrc_itl_delegate_accept_v1",
         "RETAIN_PENDING_PARENT_CLOSE_ACK",
         "MXA-T40",
+    )
+# Complete-path dispatchers own the same ordinary ITL domains, with their
+# explicit V2 or shared V1/V2 successor. The original V1 rows remain unchanged.
+for owners, successor, retention in (
+    (("cluster_ctrc_itl_delegate_prepare_v2",), "cluster_ctrc_itl_delegate_prepare_v2",
+     "RETAIN_PENDING_SUBTREE_CLOSE_ACK"),
+    (("ctrc_itl_delegate_prepare",), "cluster_ctrc_itl_delegate_prepare_v1|cluster_ctrc_itl_delegate_prepare_v2",
+     "RETAIN_PENDING_SUBTREE_CLOSE_ACK"),
+    (("cluster_ctrc_itl_delegate_accept_v2",), "cluster_ctrc_itl_image_prepare_v2",
+     "RETAIN_PENDING_PARENT_CLOSE_ACK"),
+    (("ctrc_itl_delegate_accept",), "cluster_ctrc_itl_image_prepare_v1|cluster_ctrc_itl_image_prepare_v2",
+     "RETAIN_PENDING_PARENT_CLOSE_ACK"),
+):
+    _classify_owners(
+        "CTRC_ORIGIN_PROVENANCE", "src/backend/cluster/cluster_terminal_ref_census.c", owners,
+        "REGISTERED_REFERENCE", "CTRC_REF_HEAP_ITL_UBA|CTRC_REF_IMAGE_ITL_V1",
+        "CTRC_TARGET_PAGE_PENDING_ITL_SLOT|CTRC_TARGET_EXACT_ITL_SLOT",
+        successor, retention, "MXA-T40",
     )
 # The new producer retains outgoing custody; receipt discharge cannot close
 # it. The subtree CLOSE/ACK owner remains unimplemented and live use is closed.

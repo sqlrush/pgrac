@@ -2332,6 +2332,13 @@ test_cluster_heap_ctrc_delegation.inc: $(top_srcdir)/src/backend/cluster/cluster
 	     END { if (found != 2 || done != 2 || emit) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Complete path predicate, separate from original participant/delegation counts.
+test_cluster_heap_ctrc_delegation_path.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
+	@awk '/^ctrc_delegation_path_valid\(/ { print "static bool"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 # New merge predicate; keep the original participant32/delegation2 gates.
 test_cluster_heap_ctrc_delegation_merge.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
 	@awk '/^ctrc_participant_delegation_merge_matches\(/ { print "static bool"; emit=1; found++ } \
@@ -2474,6 +2481,7 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		$(top_srcdir)/src/include/access/generic_xlog.h \
 		$(top_srcdir)/src/include/cluster/cluster_itl.h \
 		test_cluster_heap_ctrc_delegation.inc test_cluster_heap_ctrc_delegation_merge.inc \
+		test_cluster_heap_ctrc_delegation_path.inc \
 		test_cluster_heap_ctrc_certificate.inc $(top_srcdir)/src/include/port/pg_crc32c.h \
 		test_cluster_heap_ctrc_g_scan_relock.inc \
 		test_cluster_heap_ctrc_ack.inc $(top_srcdir)/src/common/sha2_int.h \
@@ -5477,6 +5485,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_heap_private_ref.inc test_cluster_heap_private_ref.inc.tmp
 	rm -f test_cluster_heap_resource_owner.inc test_cluster_heap_resource_owner.inc.tmp
 	rm -f test_cluster_heap_ctrc_delegation.inc test_cluster_heap_ctrc_delegation.inc.tmp
+	rm -f test_cluster_heap_ctrc_delegation_path.inc test_cluster_heap_ctrc_delegation_path.inc.tmp
 	rm -f test_cluster_heap_ctrc_delegation_merge.inc test_cluster_heap_ctrc_delegation_merge.inc.tmp
 	rm -f test_cluster_heap_ctrc_certificate.inc test_cluster_heap_ctrc_certificate.inc.tmp
 	rm -f test_cluster_heap_ctrc_g_scan_relock.inc test_cluster_heap_ctrc_g_scan_relock.inc.tmp
