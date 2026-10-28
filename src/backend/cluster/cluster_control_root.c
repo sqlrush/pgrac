@@ -12231,6 +12231,18 @@ root_publish_requires_walr(ClusterControlRootPublishReason reason, bool *require
 /* PGRAC: only the existing post-IR terminal owner uses this v3 adapter.
  * It preserves immutable input references and never installs a pending writer
  * or grants serving. Author: SqlRush <sqlrush@gmail.com> */
+typedef struct RecoveryCompleteCfWait {
+	PGPROC *proc;
+	Latch *latch;
+	ResourceOwner owner;
+	ClusterControlRootReadToken expected;
+	ClusterControlRootPatch patch;
+	ClusterWalRootPublishGuard *walr;
+	int pid, node, publisher_node;
+	uint64 epoch, generation, boot, system_identifier, publisher_incarnation;
+	bool recovery, captured, waited;
+} RecoveryCompleteCfWait;
+
 typedef struct RecoveryCompleteV3Work {
 	ControlRootImage base, next, observed;
 	ClusterControlRootSnapshot snapshot;
@@ -12239,6 +12251,7 @@ typedef struct RecoveryCompleteV3Work {
 	bool cf_held;
 	int32 publisher_node;
 	uint64 publisher_incarnation;
+	RecoveryCompleteCfWait cf_wait;
 } RecoveryCompleteV3Work;
 
 static ClusterControlRootResult
@@ -12264,6 +12277,134 @@ recovery_complete_v3_owner_current(const RecoveryCompleteV3Work *work,
 		   && cluster_wal_retention_root_publish_sealed_current(work->walr, expected);
 }
 
+/* PGRAC: continue the original post-IR publication, never re-enter its
+ * consumed one-shot authority. Its converted sealed WALR owner revalidates
+ * released IR and borrowed formation/fence evidence without CF/ROOT I/O.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static void
+recovery_complete_cf_capture(RecoveryCompleteV3Work *work,
+							 const ClusterControlRootReadToken *expected,
+							 const ClusterControlRootPatch *patch)
+{
+	RecoveryCompleteCfWait *original = &work->cf_wait;
+
+	original->proc = MyProc;
+	original->latch = MyLatch;
+	original->owner = CurrentResourceOwner;
+	memcpy(&original->expected, expected, sizeof(*expected));
+	memcpy(&original->patch, patch, sizeof(*patch));
+	original->walr = work->walr;
+	original->pid = MyProcPid;
+	original->node = cluster_node_id;
+	original->epoch = cluster_epoch_get_current();
+	original->generation = cluster_grd_redeclare_generation();
+	original->boot = cluster_qvotec_get_self_incarnation();
+	original->system_identifier = GetSystemIdentifier();
+	original->publisher_node = work->publisher_node;
+	original->publisher_incarnation = work->publisher_incarnation;
+	original->recovery = RecoveryInProgress();
+	original->captured = true;
+}
+
+static bool
+recovery_complete_cf_current(const RecoveryCompleteV3Work *work,
+							 const ClusterControlRootReadToken *expected,
+							 const ClusterControlRootPatch *patch)
+{
+	const RecoveryCompleteCfWait *original = &work->cf_wait;
+
+	return original->captured && original->proc != NULL && original->latch != NULL
+		   && original->owner != NULL && original->walr != NULL && MyProc == original->proc
+		   && MyLatch == original->latch && MyProcPid == original->pid
+		   && CurrentResourceOwner == original->owner && MyBackendType == B_STARTUP
+		   && AmStartupProcess() && CritSectionCount == 0 && !LWLockHeldByMe(ControlFileLock)
+		   && !ShutdownRequestPending && cluster_enabled && cluster_shared_config
+		   && cluster_controlfile_shared_authority && enableFsync
+		   && cluster_node_id == original->node && original->node >= 0
+		   && original->node < CLUSTER_MAX_NODES && original->epoch != 0
+		   && original->generation != 0 && original->boot != 0
+		   && GetSystemIdentifier() == original->system_identifier
+		   && cluster_epoch_get_current() == original->epoch
+		   && cluster_grd_redeclare_generation() == original->generation
+		   && cluster_qvotec_get_self_incarnation() == original->boot
+		   && RecoveryInProgress() == original->recovery
+		   && cluster_recovery_transport_components_current()
+		   && memcmp(expected, &original->expected, sizeof(*expected)) == 0
+		   && memcmp(patch, &original->patch, sizeof(*patch)) == 0 && work->walr == original->walr
+		   && work->publisher_node == original->publisher_node
+		   && work->publisher_incarnation == original->publisher_incarnation
+		   && recovery_complete_v3_owner_current(work, expected);
+}
+
+static void
+recovery_complete_cf_wait(RecoveryCompleteV3Work *work, const ClusterControlRootReadToken *expected,
+						  const ClusterControlRootPatch *patch,
+						  const ClusterCfAttemptObservation *attempt)
+{
+	ClusterCfRetirementSnapshot retiring;
+	bool empty = attempt->owner_state_at_return == CLUSTER_LOCK_OWNER_EMPTY;
+	bool empty_waited = false;
+	const char *reason = "CONTEXT_CHANGED_AFTER_WAIT_SLICE";
+
+	if (!recovery_complete_cf_current(work, expected, patch) || cluster_cf_held(ShareLock))
+		goto refuse;
+	reason = "CF_WAIT_IDENTITY_OR_COMPLETION";
+	if (!empty
+		&& (!cluster_cf_retirement_snapshot(ExclusiveLock, NULL, &retiring)
+			|| retiring.cookie != attempt->control_owner_id
+			|| retiring.registry.message.key.holder.request_id != attempt->request_id
+			|| retiring.registry.message.key.holder.cluster_epoch != attempt->request_epoch))
+		goto refuse;
+	for (;;) {
+		ClusterCfRetirementSnapshot current;
+		bool held;
+
+		HandleStartupProcInterrupts();
+		CHECK_FOR_INTERRUPTS();
+		reason = "CONTEXT_CHANGED_AFTER_WAIT_SLICE";
+		if (!recovery_complete_cf_current(work, expected, patch))
+			goto refuse;
+		ResetLatch(MyLatch);
+		held = cluster_cf_held(ExclusiveLock);
+		if (!held && !cluster_cf_held(ShareLock)) {
+			if (!empty && cluster_cf_release_completed(ExclusiveLock, retiring.cookie))
+				return;
+			if (empty) {
+				if (empty_waited)
+					return;
+				empty_waited = true;
+				(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+								WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
+				continue;
+			}
+		}
+		reason = "CF_WAIT_IDENTITY_OR_COMPLETION";
+		if (empty || !held || cluster_cf_held(ShareLock)
+			|| !cluster_cf_retirement_snapshot(ExclusiveLock, NULL, &current)
+			|| current.cookie != retiring.cookie
+			|| current.registry.handle.slot != retiring.registry.handle.slot
+			|| current.registry.handle.generation != retiring.registry.handle.generation
+			|| memcmp(&current.registry.owner, &retiring.registry.owner,
+					  sizeof(current.registry.owner))
+				   != 0
+			|| memcmp(&current.registry.message.key, &retiring.registry.message.key,
+					  sizeof(current.registry.message.key))
+				   != 0)
+			goto refuse;
+		cluster_lock_owners_service_poll();
+		cluster_cf_retirement_poll();
+		if (cluster_cf_held(ExclusiveLock))
+			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+							WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
+	}
+refuse:
+	ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+					errmsg("startup recovery completion cannot continue its control-file wait"),
+					errdetail("PGRAC_FAMILY=STARTUP_CONTROL consumer=recovery_complete reason=%s "
+							  "cookie=" UINT64_FORMAT " request=" UINT64_FORMAT,
+							  reason, attempt->control_owner_id, attempt->request_id)));
+}
+
 static ClusterControlRootResult
 recovery_complete_v3_work(RecoveryCompleteV3Work *work, const ClusterControlRootReadToken *expected,
 						  const ClusterControlRootPatch *patch)
@@ -12284,6 +12425,7 @@ recovery_complete_v3_work(RecoveryCompleteV3Work *work, const ClusterControlRoot
 	ClusterControlRootSnapshot *record;
 	uint8 storage_uuid[16];
 	uint32 node = expected->origin_thread_id - 1;
+	bool startup = MyBackendType == B_STARTUP;
 
 	/* Keep this recovery's sealed S through short reader conflicts. Each
 	 * attempt rechecks the original owner and confirmed IR release; no CF
@@ -12308,9 +12450,23 @@ recovery_complete_v3_work(RecoveryCompleteV3Work *work, const ClusterControlRoot
 	result = storage_contract_check(NULL, true);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
-	if (!acquire_clusterwide_cf(ExclusiveLock))
-		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	if (startup)
+		recovery_complete_cf_capture(work, expected, patch);
+	for (;;) {
+		ClusterCfAttemptObservation attempt;
+		uint64 before = startup ? cluster_cf_attempt_sequence() : 0;
+
+		if (acquire_clusterwide_cf(ExclusiveLock))
+			break;
+		if (!startup || !cluster_cf_last_attempt_since(before, &attempt)
+			|| !cluster_cf_attempt_wait_slice(&attempt) || attempt.mode != ExclusiveLock)
+			return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+		recovery_complete_cf_wait(work, expected, patch, &attempt);
+		work->cf_wait.waited = true;
+	}
 	work->cf_held = true;
+	if (work->cf_wait.waited && !recovery_complete_cf_current(work, expected, patch))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	if (!current_storage_uuid(storage_uuid))
 		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 	result = read_control_version(storage_uuid, GetSystemIdentifier(), &work->base, &control,
