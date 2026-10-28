@@ -2459,6 +2459,8 @@ static ClusterControlRootIdentity retention_expected;
 static ControlRootImage retention_image;
 static unsigned retention_phase, retention_attempts, retention_threads, retention_controls;
 static unsigned retention_histories;
+static const ClusterControlRecoverySubject *retention_subject;
+static void (*retention_after_read)(void);
 static bool retention_member, retention_serving, retention_pending, retention_fence;
 static bool retention_directory, retention_prebump;
 static uint64 retention_admitted;
@@ -2531,6 +2533,8 @@ read_thread_version(const ClusterControlRootIdentity *expected, ControlRootImage
 	memset(native, 0, sizeof(*native));
 	memset(token, 0, sizeof(*token));
 	token->file_txn_seq = 7;
+	if (retention_after_read != NULL)
+		retention_after_read();
 	return retention_root_result;
 }
 static ClusterControlRootResult
@@ -2552,12 +2556,18 @@ read_recovery_subject_locked(uint16 thread, const uint8 uuid[16], uint64 sysid,
 							 const ClusterControlRootIdentity *expected, ControlRootImage *root,
 							 ClusterControlRecoverySubject *out)
 {
-	(void)thread;
-	(void)uuid;
-	(void)sysid;
-	(void)expected;
-	(void)root;
-	(void)out;
+	if (retention_subject != NULL) {
+		UT_ASSERT(cluster_cf_held_is_clusterwide(ShareLock));
+		UT_ASSERT(thread == 1 && uuid[0] == 31 && sysid == 1234);
+		UT_ASSERT_EQ(memcmp(expected, &retention_expected, sizeof(*expected)), 0);
+		++retention_threads;
+		g_next_request_id++;
+		*root = retention_image;
+		*out = *retention_subject;
+		if (retention_after_read != NULL)
+			retention_after_read();
+		return retention_root_result;
+	}
 	UT_ASSERT(false);
 	return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 }
@@ -2613,6 +2623,8 @@ retention_fixture(unsigned phase)
 {
 	cold_fixture();
 	retention_phase = phase;
+	retention_subject = NULL;
+	retention_after_read = NULL;
 	retention_attempts = retention_threads = retention_controls = retention_histories = 0;
 	retention_member = retention_serving = retention_fence = retention_directory = true;
 	retention_pending = retention_prebump = false;
@@ -6321,6 +6333,7 @@ UT_TEST(ordinary_recovery_complete_roles_keep_the_original_cf_wait_policy)
 #include "test_cluster_generic_cf.h"
 #include "test_cluster_rejoin_cf.h"
 #include "test_cluster_cold_own_root_cf.h"
+#include "test_cluster_wal_pin_cf.h"
 
 int
 main(void)
@@ -6332,6 +6345,25 @@ main(void)
 	pg_atomic_init_u64(&owner_proc.cluster_grd_redeclare_acked_epoch, 0);
 	cluster_control_request_shmem_init();
 	retire_driver = cluster_control_request_driver_start();
+	if (getenv("PGRAC_PRE2_TEST_WAL_PIN_CF") != NULL) {
+		UT_PLAN(8);
+		UT_RUN(startup_unbound_pin_retires_cf_before_revalidating_original_input);
+		UT_RUN(startup_unbound_pin_wait_rechecks_all_inputs_and_exact_cleanup);
+		UT_RUN(startup_unbound_pin_read_output_cannot_escape_changed_inputs);
+		UT_RUN(startup_unbound_pin_receipt_and_wake_rules_preserve_liveness);
+		UT_RUN(startup_unbound_pin_keeps_real_token_and_subject_refusals);
+		UT_RUN(startup_unbound_pin_hard_untyped_and_preexisting_cf_are_not_retried);
+		UT_RUN(startup_unbound_pin_cancel_retains_original_cleanup_responsibility);
+		UT_RUN(ordinary_and_bound_pin_wait_policies_remain_unchanged);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_WAL_PIN_CF_LIVENESS") != NULL) {
+		UT_PLAN(1);
+		UT_RUN(startup_unbound_pin_retires_cf_before_revalidating_original_input);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_COLD_OWN_ROOT_CF_LIVENESS") != NULL) {
 		UT_PLAN(1);
 		UT_RUN(cold_own_root_wait_retires_before_accepting_fresh_canonical_input);
@@ -6389,7 +6421,7 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(105);
+	UT_PLAN(113);
 	UT_RUN(startup_cf_timeout_waits_for_exact_completion_before_begin);
 	UT_RUN(startup_cf_completion_does_not_preserve_changed_native_input);
 	UT_RUN(startup_cf_unsafe_native_context_never_takes_a_registry_lock);
@@ -6495,6 +6527,14 @@ main(void)
 	UT_RUN(cold_own_root_real_root_refusals_preserve_original_diagnostics);
 	UT_RUN(cold_own_root_original_cancel_keeps_shared_cleanup_responsibility);
 	UT_RUN(ordinary_cold_and_observational_canonical_keep_their_wait_policy);
+	UT_RUN(startup_unbound_pin_retires_cf_before_revalidating_original_input);
+	UT_RUN(startup_unbound_pin_wait_rechecks_all_inputs_and_exact_cleanup);
+	UT_RUN(startup_unbound_pin_read_output_cannot_escape_changed_inputs);
+	UT_RUN(startup_unbound_pin_receipt_and_wake_rules_preserve_liveness);
+	UT_RUN(startup_unbound_pin_keeps_real_token_and_subject_refusals);
+	UT_RUN(startup_unbound_pin_hard_untyped_and_preexisting_cf_are_not_retried);
+	UT_RUN(startup_unbound_pin_cancel_retains_original_cleanup_responsibility);
+	UT_RUN(ordinary_and_bound_pin_wait_policies_remain_unchanged);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

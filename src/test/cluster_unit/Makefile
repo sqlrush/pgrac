@@ -1430,6 +1430,7 @@ test_cluster_startup_cf_entry: test_cluster_startup_cf_entry.c test_cluster_cf_e
 		test_cluster_generic_cf.h test_cluster_generic_cf.inc \
 		test_cluster_rejoin_cf.h test_cluster_rejoin_cf.inc test_cluster_rejoin_cf_types.inc \
 		test_cluster_cold_own_root_cf.h test_cluster_cold_own_root_cf.inc \
+		test_cluster_wal_pin_cf.h test_cluster_wal_pin_cf.inc test_cluster_wal_pin_cf_types.inc \
 		test_cluster_startup_cf_entry.inc test_cluster_startup_cf_callsite.inc \
 		test_cluster_merge_cf_entry.inc \
 		test_cluster_merge_cold_cf.inc \
@@ -1504,6 +1505,30 @@ test_cluster_cold_own_root_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_col
 	     FNR != NR && /^cluster_control_root_lookup_owner_by_node_runtime\(/ { print "ClusterControlRootResult"; emit=1; readers++ } \
 	     emit { print } /^}/ { emit=0 } \
 	     END { if (flags != 1 || declarations < 1 || declarations > 2 || diagnostics != 4 || helpers > 2 || checks > 1 || callers != 1 || readers != 1 || emit || types) exit 1 }' \
+	     $(filter %.c,$^) > $@.tmp
+	mv $@.tmp $@
+
+# Original unbound pin consumers and strong ROOT wrappers, joined to CF.
+test_cluster_wal_pin_cf_types.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_retention.c Makefile
+	awk '/^(typedef enum ClusterWalPinState|typedef struct ClusterWalPin(Lock|Thread|StartupCfWait)|struct ClusterWal(RetentionPin|RootPublishGuard)) / { emit=1; types++ } \
+	     emit { print; if (/^}/) emit=0 } \
+	     END { if (types < 5 || types > 6 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_wal_pin_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_retention.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root.c Makefile
+	awk 'FNR == NR && /^(control_root_read_ready|pin_valid|walr_request_current|pin_readers_current|pin_thread_walr_current)\(/ { print "static bool"; emit=1; predicates++ } \
+	     FNR == NR && /^pin_free\(/ { print "static void"; emit=1; frees++ } \
+	     FNR == NR && /^pin_walr_for_thread\(/ { print "static ClusterWalPinLock *"; emit=1; selectors++ } \
+	     FNR == NR && /^root_publish_member\(/ { print "static const ClusterWalRootPublishGuard *"; emit=1; selectors++ } \
+	     FNR == NR && /^pin_release_locks\(/ { print "static ClusterWalrReleaseResult"; emit=1; releases++ } \
+	     FNR == NR && /^(pin_fail_after_locks|pin_current_after_grants|pin_acquire_inputs)\(/ { print "static ClusterWalPinResult"; emit=1; callers++ } \
+	     FNR == NR && /^(cluster_wal_retention_pin_acquire|cluster_wal_retention_pin_preflight_revalidate_wait_v1)\(/ { print "ClusterWalPinResult"; emit=1; callers++ } \
+	     FNR == NR && /^pin_startup_cf_(capture|free)\(/ { print "static void"; emit=1; helpers++ } \
+	     FNR == NR && /^pin_startup_cf_(current|wait)\(/ { print "static bool"; emit=1; helpers++ } \
+	     FNR != NR && /^(cluster_control_root_read_canonical|cluster_control_root_read_recovery_subject|cluster_control_root_revalidate)\(/ { print "ClusterControlRootResult"; emit=1; readers++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (predicates != 5 || frees != 1 || selectors != 2 || releases != 1 || callers != 5 || helpers > 4 || readers != 3 || emit) exit 1 }' \
 	     $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 
@@ -4819,6 +4844,7 @@ test_cluster_wal_retained_cut_records: test_cluster_wal_retained_cut_records.c u
 # PGRAC: real exact-generation claim validation for physical WAL reuse tests.
 # Author: SqlRush <sqlrush@gmail.com>
 test_cluster_wal_retention: test_cluster_wal_retention.c unit_test.h \
+		test_cluster_wal_retention_startup_boundary.h \
 		$(CLUSTER_WAL_RETENTION_O) $(top_builddir)/src/backend/cluster/cluster_wal_claim.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_WAL_RETENTION_O) \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \

@@ -34,6 +34,7 @@
 
 #include "unit_test.h"
 #include "../../backend/cluster/cluster_control_root_private.h"
+#include "test_cluster_wal_retention_startup_boundary.h"
 
 UT_DEFINE_GLOBALS();
 
