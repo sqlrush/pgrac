@@ -84,6 +84,9 @@ typedef struct ClusterRelmapClogBaseHandleV1 ClusterRelmapClogBaseHandleV1;
  * query and full disk image on the same tracked fd. Entered refusal/ERROR
  * poisons custody and the original episode, retaining original protection.
  * Native locks cover only each read; no lock is retained between calls.
+ * Native logical mutation in this process invalidates its origin's held
+ * observations before the attempt, even if the same bytes are restored.
+ * This does not exclude mutations by other processes or prove lifetime.
  * Missing/short/aliased files refuse. IN_PROGRESS stays IN_PROGRESS.
  * No caller native/CF lock or critical section; output/held/source are
  * exclusive and disjoint. Precondition refusal performs no I/O/revocation.

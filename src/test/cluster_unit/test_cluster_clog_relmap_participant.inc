@@ -32,6 +32,7 @@ static ClusterRecoveryRelmapSourceV1 relmap_base_source;
 static bool relmap_base_declared, relmap_base_all_held;
 static bool relmap_base_root_ok;
 static unsigned relmap_base_failures, relmap_base_rechecks;
+static void (*relmap_base_recheck_hook)(void);
 
 #ifndef TEST_CLUSTER_EPISODE_CLOG
 bool
@@ -60,6 +61,8 @@ cluster_wal_inputs_relmap_source_revalidate_v1(const ClusterRecoveryRelmapSource
 	for (unsigned i = 0; i < fixture_lock_count; i++)
 		UT_ASSERT(!fixture_locks[i].held);
 	relmap_base_rechecks++;
+	if (relmap_base_recheck_hook != NULL)
+		relmap_base_recheck_hook();
 	ok = cluster_wal_inputs_relmap_source_current_v1(source) && relmap_base_root_ok;
 	if (!ok)
 		cluster_wal_inputs_relmap_source_fail_v1(source);

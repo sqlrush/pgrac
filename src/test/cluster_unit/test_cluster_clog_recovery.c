@@ -1258,6 +1258,7 @@ UT_TEST(own_c0_native_error_and_revocation_preserve_cache_ownership)
 
 #include "test_cluster_clog_relmap_participant.inc"
 #include "test_cluster_clog_page_birth.inc"
+#include "test_cluster_clog_relmap_mutation.inc"
 
 static void
 fixture_cleanup(void)
@@ -1320,7 +1321,17 @@ main(void)
 	snprintf(path, sizeof(path), "%s/native_side/origin_0/pg_xact", fixture_root);
 	if (symlink(path, "pg_xact") != 0)
 		return 2;
-	UT_PLAN(41);
+	if (getenv("PGRAC_RELMAP_MUTATION_ONLY") != NULL) {
+		UT_PLAN(6);
+		UT_RUN(relmap_native_terminal_aba_does_not_revive_held_observation);
+		UT_RUN(relmap_native_record_mutations_invalidate_even_unchanged_bytes);
+		UT_RUN(relmap_local_native_status_zero_and_redo_invalidate);
+		UT_RUN(relmap_verify_refusal_other_origin_and_release_preserve_custody);
+		UT_RUN(relmap_failed_native_mutation_cannot_revalidate_old_bytes);
+		UT_RUN(relmap_native_mutation_during_first_or_final_root_refuses);
+		goto mutation_done;
+	}
+	UT_PLAN(47);
 	UT_RUN(separate_original_origin_controls);
 	UT_RUN(commit_and_abort_persist_full_tree_without_local_pollution);
 	UT_RUN(conflicting_late_child_refuses_before_any_tree_write);
@@ -1362,6 +1373,13 @@ main(void)
 	UT_RUN(native_full_clog_consumer_preserves_original_page_and_neighbors);
 	UT_RUN(native_full_clog_consumer_refuses_shape_and_scope_before_io);
 	UT_RUN(native_full_clog_consumer_keeps_late_failure_incomplete);
+	UT_RUN(relmap_native_terminal_aba_does_not_revive_held_observation);
+	UT_RUN(relmap_native_record_mutations_invalidate_even_unchanged_bytes);
+	UT_RUN(relmap_local_native_status_zero_and_redo_invalidate);
+	UT_RUN(relmap_verify_refusal_other_origin_and_release_preserve_custody);
+	UT_RUN(relmap_failed_native_mutation_cannot_revalidate_old_bytes);
+	UT_RUN(relmap_native_mutation_during_first_or_final_root_refuses);
+mutation_done:
 	fixture_cleanup();
 	UT_DONE();
 	return ut_failed_count != 0;
