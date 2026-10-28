@@ -17,6 +17,7 @@
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_wal_cut.h"
+#include "cluster/cluster_wal_tail.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_startup_phase.h"
@@ -3117,6 +3118,749 @@ UT_TEST(ordinary_retention_and_observational_canonical_keep_original_wait_policy
 	cold_cleanup();
 }
 
+/* ROOT, claim and physical WAL are explicit leaf boundaries. The original
+ * four recovery callers share the actual CF/CONTROL retirement producer. */
+static unsigned recovery_phase, recovery_attempts, recovery_reads, recovery_wal_reads;
+static ClusterLockAcquireResult recovery_acquire_result;
+static ClusterControlRootResult recovery_root_result, recovery_wal_result;
+static bool recovery_claim_valid;
+static bool recovery_throw_read;
+static void *recovery_work;
+static void (*recovery_wal_hook)(void);
+static ClusterControlRootSnapshot recovery_expected;
+static ClusterControlRootSnapshot recovery_selected;
+static ClusterControlRootReadToken recovery_token;
+int wal_segment_size = 16777216;
+
+static bool
+recovery_second_read(void)
+{
+	return recovery_phase == 3 || recovery_phase == 5;
+}
+static unsigned
+recovery_api(void)
+{
+	return recovery_phase < 2 ? recovery_phase : recovery_phase < 4 ? 2 : 3;
+}
+static bool
+recovery_actual_cf_lock(LOCKMODE mode)
+{
+	++recovery_attempts;
+	++g_next_request_id;
+	if (recovery_attempts == (recovery_second_read() ? 2 : 1))
+		g_seven_result = recovery_acquire_result;
+	return claim_actual_cf_lock(mode);
+}
+static void *
+recovery_alloc(Size size)
+{
+	recovery_work = palloc0(size);
+	return recovery_work;
+}
+static ClusterControlRootResult
+recovery_storage_check(const uint8 *uuid, bool probe)
+{
+	UT_ASSERT(uuid != NULL && uuid[0] == 31 && !probe);
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+static ClusterControlRootResult
+read_thread_input_window(const ClusterControlRootIdentity *expected, ControlRootImage *root,
+						 ControlFileData *native, ClusterControlRootFileToken *file, uint16 version,
+						 bool native_checkpoint, uint8 *window)
+{
+	UT_ASSERT(cluster_cf_held_is_clusterwide(ShareLock));
+	UT_ASSERT_EQ(version, 3);
+	UT_ASSERT_EQ(memcmp(expected, &recovery_selected.identity, sizeof(*expected)), 0);
+	UT_ASSERT_EQ(native_checkpoint, recovery_api() == 1);
+	++recovery_reads;
+	if (recovery_throw_read)
+		ereport(ERROR, (errcode(ERRCODE_IO_ERROR), errmsg("recovery ROOT read failed")));
+	*root = retention_image;
+	memset(native, 0, sizeof(*native));
+	native->checkPoint = 100;
+	native->checkPointCopy.redo = 80;
+	native->checkPointCopy.ThisTimeLineID = 1;
+	native->checkPointCopy.nextXid = FullTransactionIdFromU64(103);
+	memset(file, 0, sizeof(*file));
+	if (native_checkpoint) {
+		UT_ASSERT(window != NULL);
+		memset(window, 0x5a, 160);
+	} else
+		UT_ASSERT(window == NULL);
+	return recovery_root_result;
+}
+bool
+cluster_wal_claim_v2_ref_valid(const ClusterWalThreadClaimRefV2 *ref)
+{
+	UT_ASSERT_EQ(ref->database_incarnation, 7);
+	UT_ASSERT_EQ(ref->max_config_generation, 9);
+	UT_ASSERT_EQ(ref->claim_sha256[0], 3);
+	return recovery_claim_valid;
+}
+static ClusterControlRootResult
+recovery_physical_wal(const char *dir, const ClusterWalSourceRef *ref, int segment_size,
+					  const ClusterControlRootSnapshot *sealed, XLogRecPtr checkpoint,
+					  ClusterWalTailObservation *out)
+{
+	UT_ASSERT(!cluster_cf_held(ShareLock) && !cluster_cf_held(ExclusiveLock));
+	UT_ASSERT(dir == cluster_wal_threads_dir && segment_size == wal_segment_size);
+	UT_ASSERT_EQ(ref->timeline, 1);
+	UT_ASSERT_EQ(checkpoint, 100);
+	UT_ASSERT_EQ(memcmp(sealed, &recovery_selected, sizeof(*sealed)), 0);
+	++recovery_wal_reads;
+	memset(out, 0, sizeof(*out));
+	out->complete_end = sealed->validated_tail_lsn_exclusive;
+	out->last_record_start = sealed->tail_last_record_lsn;
+	out->last_record_crc = sealed->tail_last_record_crc32c;
+	out->records = 2;
+	out->database_incarnation = 7;
+	if (recovery_wal_hook != NULL)
+		recovery_wal_hook();
+	return recovery_wal_result;
+}
+ClusterControlRootResult
+cluster_wal_tail_visit_sealed(const char *dir, const ClusterWalSourceRef *ref, int segment_size,
+							  const ClusterControlRootSnapshot *sealed, XLogRecPtr checkpoint,
+							  ClusterWalRecordVisitor visitor, void *arg,
+							  ClusterWalTailObservation *out)
+{
+	UT_ASSERT(recovery_api() == 2 && visitor == NULL && arg == NULL);
+	return recovery_physical_wal(dir, ref, segment_size, sealed, checkpoint, out);
+}
+ClusterControlRootResult
+cluster_wal_tail_sync_sealed_v1(const char *dir, const ClusterWalSourceRef *ref, int segment_size,
+								const ClusterControlRootSnapshot *sealed, XLogRecPtr checkpoint,
+								ClusterWalTailObservation *out)
+{
+	UT_ASSERT_EQ(recovery_api(), 3);
+	return recovery_physical_wal(dir, ref, segment_size, sealed, checkpoint, out);
+}
+#define cluster_cf_lock recovery_actual_cf_lock
+#define palloc0 recovery_alloc
+#define storage_contract_check recovery_storage_check
+#include "test_cluster_recovery_wal_cf.inc"
+#undef storage_contract_check
+#undef palloc0
+#undef cluster_cf_lock
+
+typedef struct RecoveryTestOutput {
+	ClusterWalSourceRef source;
+	XLogRecPtr redo;
+	ClusterWalRecoveryCheckpointV1 checkpoint;
+	ClusterWalTailObservation tail;
+} RecoveryTestOutput;
+
+static void
+recovery_ready_after_ack(void)
+{
+	UT_ASSERT_EQ(recovery_attempts, recovery_second_read() ? 2 : 1);
+	UT_ASSERT_EQ(recovery_reads, recovery_second_read());
+	UT_ASSERT_EQ(recovery_wal_reads, recovery_second_read());
+	UT_ASSERT(cluster_cf_held(ShareLock) && !cluster_cf_held_is_usable(ShareLock));
+	if (claim_retiring_cookie == 0)
+		claim_retiring_cookie = cluster_cf_owner_cookie(ShareLock);
+	if (entry_waits == entry_ack_at) {
+		g_seven_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+		++g_next_request_id;
+	}
+}
+static void
+recovery_fixture(unsigned phase)
+{
+	retention_fixture(0);
+	recovery_phase = phase;
+	recovery_attempts = recovery_reads = recovery_wal_reads = 0;
+	recovery_acquire_result = CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
+	recovery_root_result = recovery_wal_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	recovery_claim_valid = true;
+	recovery_throw_read = false;
+	recovery_work = NULL;
+	recovery_wal_hook = NULL;
+	retention_image.header.v2.database_incarnation = 7;
+	retention_image.header.v2.config_generation = 9;
+	retention_image.refs[0].claim_sha256[0] = 3;
+	retention_image.records[0].lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
+	retention_image.records[0].checkpoint_tli = 1;
+	retention_image.records[0].checkpoint_lower_lsn = 80;
+	retention_image.records[0].validated_tail_lsn_exclusive = 340;
+	retention_image.records[0].tail_last_record_lsn = 300;
+	retention_image.records[0].tail_last_record_crc32c = 21;
+	recovery_expected = retention_image.records[0];
+	recovery_selected = recovery_expected;
+	make_read_token(&retention_image, 1, CONTROL_ROOT_SOURCE_PRIMARY, &recovery_token);
+	if (recovery_second_read())
+		g_seven_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	entry_on_wait = recovery_ready_after_ack;
+}
+static bool
+recovery_call(ClusterControlRootResult *result, RecoveryTestOutput *out)
+{
+	volatile bool completed = false;
+
+	memset(out, 0xa5, sizeof(*out));
+	PG_TRY();
+	{
+		switch (recovery_api()) {
+		case 0:
+			*result = cluster_control_root_recovery_source_v1(&recovery_expected, &recovery_token,
+															  &out->source, &out->redo);
+			break;
+		case 1:
+			*result = cluster_control_root_recovery_checkpoint_v1(
+				&recovery_expected, &recovery_token, &out->checkpoint);
+			break;
+		case 2:
+			*result = cluster_control_root_recovery_visit(&recovery_expected, &recovery_token, NULL,
+														  NULL, &out->tail);
+			break;
+		default:
+			*result = cluster_control_root_recovery_sync_v1(&recovery_expected, &recovery_token,
+															&out->tail);
+		}
+		completed = true;
+	}
+	PG_CATCH();
+	{
+		FlushErrorState();
+	}
+	PG_END_TRY();
+	return completed;
+}
+static void
+recovery_no_output(const RecoveryTestOutput *out)
+{
+	RecoveryTestOutput zero = { 0 };
+
+	if (recovery_api() == 0) {
+		UT_ASSERT_EQ(memcmp(&out->source, &zero.source, sizeof(out->source)), 0);
+		UT_ASSERT_EQ(out->redo, InvalidXLogRecPtr);
+	} else if (recovery_api() == 1)
+		UT_ASSERT_EQ(memcmp(&out->checkpoint, &zero.checkpoint, sizeof(out->checkpoint)), 0);
+	else
+		UT_ASSERT_EQ(memcmp(&out->tail, &zero.tail, sizeof(out->tail)), 0);
+}
+UT_TEST(startup_recovery_wal_cf_slice_waits_without_exporting_provisional_input)
+{
+	for (unsigned phase = 0; phase < 6; phase++) {
+		ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+		RecoveryTestOutput out;
+
+		recovery_fixture(phase);
+		UT_ASSERT(recovery_call(&result, &out));
+		UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT_EQ(entry_waits, 3);
+		UT_ASSERT_EQ(recovery_attempts, recovery_api() < 2 ? 2 : 3);
+		UT_ASSERT_EQ(recovery_reads, recovery_api() < 2 ? 1 : 2);
+		UT_ASSERT_EQ(recovery_wal_reads, recovery_api() < 2 ? 0 : 1);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+			if (recovery_api() == 0) {
+				UT_ASSERT_EQ(out.redo, 80);
+				UT_ASSERT_EQ(out.source.claim.database_incarnation, 7);
+			} else if (recovery_api() == 1) {
+				UT_ASSERT_EQ(out.checkpoint.checkpoint_start, 100);
+				UT_ASSERT_EQ(U64FromFullTransactionId(out.checkpoint.checkpoint.nextXid), 103);
+				UT_ASSERT_EQ(out.checkpoint.native_window[0], 0x5a);
+				UT_ASSERT_EQ(out.checkpoint.native_window[159], 0x5a);
+			} else {
+				UT_ASSERT_EQ(out.tail.complete_end, 340);
+				UT_ASSERT_EQ(out.tail.database_incarnation, 7);
+			}
+		} else
+			recovery_no_output(&out);
+		cold_cleanup();
+	}
+}
+
+static unsigned recovery_fault;
+static CfHoldState recovery_saved_slot;
+static ClusterControlRequestView recovery_saved_record;
+static void
+recovery_change_context(void)
+{
+	RecoveryWalVisitWork *work = recovery_work;
+
+	switch (recovery_fault) {
+	case 0:
+		MyProc = NULL;
+		break;
+	case 1:
+		MyLatch = NULL;
+		break;
+	case 2:
+		MyProcPid++;
+		break;
+	case 3:
+		CurrentResourceOwner = (ResourceOwner)2;
+		break;
+	case 4:
+		MyBackendType = B_BG_WRITER;
+		break;
+	case 5:
+		MyAuxProcType = CheckpointerProcess;
+		break;
+	case 6:
+		cluster_node_id++;
+		break;
+	case 7:
+		owner_epoch++;
+		break;
+	case 8:
+		owner_generation++;
+		break;
+	case 9:
+		control_creator.incarnation++;
+		break;
+	case 10:
+		entry_authority = false;
+		break;
+	case 11:
+		InRecovery = !InRecovery;
+		break;
+	case 12:
+		ShutdownRequestPending = true;
+		break;
+	case 13:
+		CritSectionCount = 1;
+		break;
+	case 14:
+		entry_native_lock = true;
+		break;
+	case 15:
+		cluster_enabled = false;
+		break;
+	case 16:
+		cluster_shared_config = false;
+		break;
+	case 17:
+		cluster_controlfile_shared_authority = false;
+		break;
+	case 18:
+		work->expected.identity.system_identifier++;
+		break;
+	case 19:
+		work->expected.identity.storage_uuid[0]++;
+		break;
+	case 20:
+		work->expected.identity.authority_uuid[0]++;
+		break;
+	case 21:
+		work->expected.identity.origin_node_id++;
+		break;
+	case 22:
+		work->expected.identity.origin_thread_id++;
+		break;
+	case 23:
+		work->expected.identity.origin_owner_incarnation++;
+		break;
+	case 24:
+		work->expected.identity.thread_claim_created_at++;
+		break;
+	case 25:
+		work->expected.identity.thread_claim_crc32c++;
+		break;
+	case 26:
+		work->expected.identity.root_lineage_seq++;
+		break;
+	case 27:
+		work->expected.root_publish_seq++;
+		break;
+	case 28:
+		work->expected.checkpoint_tli++;
+		break;
+	case 29:
+		work->expected.checkpoint_lower_lsn++;
+		break;
+	case 30:
+		work->expected.validated_tail_lsn_exclusive++;
+		break;
+	case 31:
+		work->expected.lifecycle++;
+		break;
+	case 32:
+		work->token.file_txn_seq++;
+		break;
+	case 33:
+		work->token.record_crc32c++;
+		break;
+	case 34:
+		work->native_checkpoint = !work->native_checkpoint;
+		break;
+	case 35:
+		cf_hold_s.owner.request.control_owner_id++;
+		break;
+	case 36:
+		cf_hold_s.owner.attempt.generation++;
+		break;
+	case 37:
+		control_requests->records[cf_hold_s.owner.attempt.slot].owner.incarnation++;
+		break;
+	case 38:
+		control_requests->records[cf_hold_s.owner.attempt.slot].message.key.holder.request_id++;
+		break;
+	case 39:
+		control_requests->records[cf_hold_s.owner.attempt.slot].message.key.holder.cluster_epoch++;
+		break;
+	case 40:
+		control_requests->records[cf_hold_s.owner.attempt.slot].state
+			= CLUSTER_CONTROL_REQUEST_INVALID;
+		break;
+	case 41:
+		cf_hold_s.release_pending = false;
+		break;
+	case 42:
+		cf_hold_s.owner.state = CLUSTER_LOCK_OWNER_ACQUIRING;
+		break;
+	case 43:
+		cf_hold_s.owner.cooperative_acquire = true;
+		break;
+	case 44:
+		cf_hold_x.held = true;
+		break;
+	}
+}
+static void
+recovery_change_while_waiting(void)
+{
+	recovery_ready_after_ack();
+	recovery_saved_slot = cf_hold_s;
+	recovery_saved_record = control_requests->records[cf_hold_s.owner.attempt.slot];
+	recovery_change_context();
+}
+static void
+recovery_restore_actor(int pid, uint64 epoch, uint64 generation, uint64 boot)
+{
+	MyProc = &owner_proc;
+	MyLatch = &owner_proc.procLatch;
+	MyProcPid = pid;
+	CurrentResourceOwner = (ResourceOwner)1;
+	MyBackendType = B_STARTUP;
+	MyAuxProcType = StartupProcess;
+	cluster_node_id = 0;
+	owner_epoch = epoch;
+	owner_generation = generation;
+	control_creator.incarnation = boot;
+	entry_native_lock = false;
+	CritSectionCount = 0;
+	ShutdownRequestPending = false;
+	cluster_enabled = cluster_shared_config = cluster_controlfile_shared_authority = true;
+}
+UT_TEST(startup_recovery_wal_wait_rechecks_original_actor_input_and_request)
+{
+	for (unsigned phase = 0; phase < 6; phase++)
+		for (recovery_fault = 0; recovery_fault < 45; recovery_fault++) {
+			ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+			RecoveryTestOutput out;
+			int pid = MyProcPid;
+			uint64 epoch = owner_epoch, generation = owner_generation;
+			uint64 boot = control_creator.incarnation;
+
+			recovery_fixture(phase);
+			entry_on_wait = recovery_change_while_waiting;
+			UT_ASSERT(!recovery_call(&result, &out));
+			UT_ASSERT_EQ(entry_code, ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED);
+			UT_ASSERT_EQ(entry_level, FATAL);
+			UT_ASSERT_EQ(entry_waits, 1);
+			UT_ASSERT_EQ(recovery_attempts, recovery_second_read() ? 2 : 1);
+			UT_ASSERT_EQ(recovery_reads, recovery_second_read());
+			UT_ASSERT_EQ(recovery_wal_reads, recovery_second_read());
+			recovery_no_output(&out);
+			recovery_restore_actor(pid, epoch, generation, boot);
+			/* Restore the injected corruption; only the real ACK/poll retires. */
+			cf_hold_s = recovery_saved_slot;
+			control_requests->records[cf_hold_s.owner.attempt.slot] = recovery_saved_record;
+			memset(&cf_hold_x, 0, sizeof(cf_hold_x));
+			cold_cleanup();
+		}
+}
+static void
+recovery_change_after_grant(void)
+{
+	if (entry_waits != 0)
+		recovery_change_context();
+}
+UT_TEST(startup_recovery_wal_new_grant_rechecks_before_root_io)
+{
+	const unsigned faults[] = { 7, 27, 32, 34 };
+
+	for (unsigned phase = 0; phase < 6; phase++)
+		for (unsigned i = 0; i < lengthof(faults); i++) {
+			ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+			RecoveryTestOutput out;
+			uint64 epoch = owner_epoch;
+
+			recovery_fixture(phase);
+			recovery_fault = faults[i];
+			claim_after_acquire = recovery_change_after_grant;
+			UT_ASSERT(recovery_call(&result, &out));
+			/* CF itself rejects a grant from an already changed epoch. */
+			UT_ASSERT_EQ(result, recovery_fault == 7 ? CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE
+													 : CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+			UT_ASSERT_EQ(entry_waits, 3);
+			UT_ASSERT_EQ(recovery_reads, recovery_second_read());
+			UT_ASSERT_EQ(recovery_wal_reads, recovery_second_read());
+			recovery_no_output(&out);
+			owner_epoch = epoch;
+			cold_cleanup();
+		}
+}
+static void
+recovery_remove_receipt(void)
+{
+	recovery_ready_after_ack();
+	UT_ASSERT(acknowledge_retirements());
+	cluster_cf_retirement_poll();
+	UT_ASSERT(cluster_cf_release_completed(ShareLock, claim_retiring_cookie));
+	cf_retired_s = 0;
+}
+static void
+recovery_ack_during_reset(void)
+{
+	if (recovery_attempts >= (recovery_second_read() ? 2 : 1))
+		cold_ack_during_reset();
+}
+static void
+recovery_empty_grant(void)
+{
+	UT_ASSERT(!cluster_cf_held(ShareLock) && cluster_control_request_empty());
+	UT_ASSERT_EQ(recovery_reads, recovery_second_read());
+	g_seven_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	++g_next_request_id;
+}
+UT_TEST(startup_recovery_wal_receipt_and_wake_rules_preserve_progress)
+{
+	for (unsigned phase = 0; phase < 6; phase++)
+		for (unsigned fault = 0; fault < 4; fault++) {
+			ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+			RecoveryTestOutput out;
+
+			recovery_fixture(phase);
+			entry_lost_latch = true;
+			if (fault == 0)
+				entry_on_wait = recovery_remove_receipt;
+			else if (fault == 1)
+				claim_on_reset = recovery_ack_during_reset;
+			else if (fault == 2) {
+				fail_after_publication = false;
+				entry_on_wait = recovery_empty_grant;
+			}
+			UT_ASSERT_EQ(recovery_call(&result, &out), fault != 0);
+			UT_ASSERT_EQ(entry_waits, fault == 1 ? 0 : fault == 3 ? 3 : 1);
+			if (fault == 0) {
+				UT_ASSERT_EQ(entry_code, ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED);
+				UT_ASSERT_EQ(recovery_reads, recovery_second_read());
+				recovery_no_output(&out);
+				cf_retired_s = claim_retiring_cookie;
+			} else {
+				UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+				UT_ASSERT_EQ(recovery_reads, recovery_api() < 2 ? 1 : 2);
+			}
+			cold_cleanup();
+		}
+}
+UT_TEST(startup_recovery_wal_hard_untyped_and_preexisting_requests_do_not_retry)
+{
+	for (unsigned phase = 0; phase < 6; phase++)
+		for (unsigned fault = 0; fault < 6; fault++) {
+			ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+			RecoveryTestOutput out;
+			unsigned before;
+
+			recovery_fixture(phase);
+			if (fault == 0)
+				recovery_acquire_result = CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+			else if (fault == 1)
+				g_timeout_detail.source = CLUSTER_GES_TSRC_NONE;
+			else if (fault == 2)
+				entry_on_wait = entry_hard_error;
+			else {
+				g_seven_result = fault == 4 ? CLUSTER_LOCK_ACQUIRE_OK_GRANTED
+											: CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
+				UT_ASSERT_EQ(cluster_cf_lock(fault == 5 ? ExclusiveLock : ShareLock), fault == 4);
+			}
+			before = g_seven_count;
+			if (fault == 2) {
+				UT_ASSERT(!recovery_call(&result, &out));
+				UT_ASSERT_EQ(entry_code, ERRCODE_IO_ERROR);
+			} else {
+				UT_ASSERT(recovery_call(&result, &out));
+				UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+			}
+			UT_ASSERT_EQ(entry_waits, fault == 2 ? 1 : 0);
+			UT_ASSERT_EQ(g_seven_count,
+						 before + (fault < 3 ? (recovery_second_read() ? 2 : 1) : 0));
+			UT_ASSERT_EQ(recovery_reads, fault < 3 && recovery_second_read());
+			recovery_no_output(&out);
+			if (fault == 4) {
+				bool saved = owner_ack_on_wait;
+
+				claim_teardown = owner_ack_on_wait = true;
+				UT_ASSERT_EQ(cluster_cf_unlock_confirmed(ShareLock), CLUSTER_CF_RELEASE_CONFIRMED);
+				claim_teardown = false;
+				owner_ack_on_wait = saved;
+			}
+			if (fault == 5) {
+				cold_consumer = false;
+				entry_cleanup(ExclusiveLock, cluster_cf_owner_cookie(ExclusiveLock));
+			}
+			cold_cleanup();
+		}
+}
+static void
+recovery_change_root(void)
+{
+	recovery_ready_after_ack();
+	switch (recovery_fault) {
+	case 0:
+		retention_image.records[0].root_publish_seq++;
+		break;
+	case 1:
+		retention_image.records[0].validated_tail_lsn_exclusive++;
+		break;
+	case 2:
+		retention_image.startup[0].generation = 1;
+		break;
+	case 3:
+		recovery_root_result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+		break;
+	case 4:
+		recovery_claim_valid = false;
+		break;
+	case 5:
+		recovery_throw_read = true;
+		break;
+	}
+}
+UT_TEST(startup_recovery_wal_real_root_refusals_and_errors_never_export_input)
+{
+	for (unsigned phase = 0; phase < 6; phase++)
+		for (recovery_fault = 0; recovery_fault < 6; recovery_fault++) {
+			ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+			RecoveryTestOutput out;
+
+			recovery_fixture(phase);
+			entry_on_wait = recovery_change_root;
+			UT_ASSERT_EQ(recovery_call(&result, &out), recovery_fault != 5);
+			if (recovery_fault == 5)
+				UT_ASSERT_EQ(entry_code, ERRCODE_IO_ERROR);
+			else
+				UT_ASSERT_EQ(result, recovery_fault == 3   ? CLUSTER_CONTROL_ROOT_IO_ERROR
+									 : recovery_fault == 4 ? CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH
+														   : CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+			UT_ASSERT_EQ(entry_waits, 3);
+			UT_ASSERT_EQ(recovery_reads, recovery_second_read() ? 2 : 1);
+			UT_ASSERT_EQ(recovery_wal_reads, recovery_second_read());
+			UT_ASSERT(!cluster_cf_held(ShareLock));
+			recovery_no_output(&out);
+			cold_cleanup();
+		}
+}
+static void
+recovery_change_wal_owner(void)
+{
+	recovery_change_context();
+}
+UT_TEST(startup_recovery_wal_second_interval_keeps_original_owner_and_failure)
+{
+	const unsigned faults[] = { 3, 7, 8 };
+
+	for (unsigned phase = 2; phase < 6; phase++) {
+		for (unsigned i = 0; i < lengthof(faults); i++) {
+			ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+			RecoveryTestOutput out;
+			uint64 epoch = owner_epoch, generation = owner_generation;
+
+			recovery_fixture(phase);
+			recovery_fault = faults[i];
+			recovery_wal_hook = recovery_change_wal_owner;
+			UT_ASSERT_EQ(recovery_call(&result, &out), !recovery_second_read());
+			if (recovery_second_read()) {
+				UT_ASSERT_EQ(entry_code, ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED);
+				UT_ASSERT_EQ(entry_waits, 0);
+			} else {
+				UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+				UT_ASSERT_EQ(entry_waits, 3);
+			}
+			UT_ASSERT_EQ(recovery_attempts, 2);
+			UT_ASSERT_EQ(recovery_reads, 1);
+			UT_ASSERT_EQ(recovery_wal_reads, 1);
+			recovery_no_output(&out);
+			CurrentResourceOwner = (ResourceOwner)1;
+			owner_generation = generation;
+			/* The second request may have been created in the injected epoch.
+			 * Retire it under its actual cut before restoring the fixture. */
+			cold_cleanup();
+			owner_epoch = epoch;
+		}
+		{
+			ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+			RecoveryTestOutput out;
+
+			recovery_fixture(phase);
+			recovery_wal_result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+			UT_ASSERT(recovery_call(&result, &out));
+			UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_IO_ERROR);
+			UT_ASSERT_EQ(recovery_reads, 1);
+			UT_ASSERT_EQ(recovery_attempts, recovery_second_read() ? 1 : 2);
+			UT_ASSERT_EQ(entry_waits, recovery_second_read() ? 0 : 3);
+			recovery_no_output(&out);
+			cold_cleanup();
+		}
+	}
+}
+UT_TEST(startup_recovery_wal_original_cancel_keeps_shared_cleanup_responsibility)
+{
+	for (unsigned phase = 0; phase < 6; phase++) {
+		ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+		RecoveryTestOutput out;
+		volatile bool exited = false;
+
+		recovery_fixture(phase);
+		entry_on_wait = entry_shutdown;
+		startup_fixture_exit_hook = entry_owner_exit;
+		startup_fixture_armed = true;
+		if (sigsetjmp(startup_fixture_exit, 1) == 0)
+			UT_ASSERT(!recovery_call(&result, &out));
+		else
+			exited = true;
+		UT_ASSERT(exited);
+		UT_ASSERT_EQ(startup_fixture_exit_code, 1);
+		UT_ASSERT_EQ(entry_waits, 1);
+		UT_ASSERT_EQ(recovery_reads, recovery_second_read());
+		UT_ASSERT(control_requests->records[cf_hold_s.owner.attempt.slot].owner_exited);
+		recovery_no_output(&out);
+		PG_exception_stack = NULL;
+		error_context_stack = NULL;
+		proc_exit_inprogress = shutdown_requested = false;
+		startup_fixture_armed = false;
+		startup_fixture_exit_hook = NULL;
+		cold_cleanup();
+	}
+}
+UT_TEST(ordinary_recovery_wal_roles_keep_the_original_wait_policy)
+{
+	const BackendType roles[] = { B_BG_WORKER, B_BG_WRITER, B_CHECKPOINTER, B_LMON };
+
+	for (unsigned phase = 0; phase < 6; phase++)
+		for (unsigned role = 0; role < lengthof(roles); role++) {
+			ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+			RecoveryTestOutput out;
+			bool release_refused = roles[role] == B_LMON && (phase == 3 || phase == 5);
+
+			recovery_fixture(phase);
+			MyBackendType = roles[role];
+			UT_ASSERT(recovery_call(&result, &out));
+			/* LMON cannot block even for the original confirmed release. */
+			UT_ASSERT_EQ(result, release_refused ? CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN
+												 : CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+			UT_ASSERT_EQ(entry_waits, 0);
+			UT_ASSERT_EQ(recovery_attempts, recovery_second_read() && !release_refused ? 2 : 1);
+			UT_ASSERT_EQ(recovery_reads, recovery_second_read());
+			recovery_no_output(&out);
+			MyBackendType = B_STARTUP;
+			cold_cleanup();
+		}
+}
+
 int
 main(void)
 {
@@ -3127,7 +3871,7 @@ main(void)
 	pg_atomic_init_u64(&owner_proc.cluster_grd_redeclare_acked_epoch, 0);
 	cluster_control_request_shmem_init();
 	retire_driver = cluster_control_request_driver_start();
-	UT_PLAN(47);
+	UT_PLAN(56);
 	UT_RUN(startup_cf_timeout_waits_for_exact_completion_before_begin);
 	UT_RUN(startup_cf_completion_does_not_preserve_changed_native_input);
 	UT_RUN(startup_cf_unsafe_native_context_never_takes_a_registry_lock);
@@ -3175,6 +3919,15 @@ main(void)
 	UT_RUN(startup_retention_preserves_real_root_and_token_refusals);
 	UT_RUN(startup_retention_original_cancel_keeps_shared_cleanup_responsibility);
 	UT_RUN(ordinary_retention_and_observational_canonical_keep_original_wait_policy);
+	UT_RUN(startup_recovery_wal_cf_slice_waits_without_exporting_provisional_input);
+	UT_RUN(startup_recovery_wal_wait_rechecks_original_actor_input_and_request);
+	UT_RUN(startup_recovery_wal_new_grant_rechecks_before_root_io);
+	UT_RUN(startup_recovery_wal_receipt_and_wake_rules_preserve_progress);
+	UT_RUN(startup_recovery_wal_hard_untyped_and_preexisting_requests_do_not_retry);
+	UT_RUN(startup_recovery_wal_real_root_refusals_and_errors_never_export_input);
+	UT_RUN(startup_recovery_wal_second_interval_keeps_original_owner_and_failure);
+	UT_RUN(startup_recovery_wal_original_cancel_keeps_shared_cleanup_responsibility);
+	UT_RUN(ordinary_recovery_wal_roles_keep_the_original_wait_policy);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

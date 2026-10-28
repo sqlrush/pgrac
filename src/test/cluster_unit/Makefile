@@ -1431,6 +1431,7 @@ test_cluster_startup_cf_entry: test_cluster_startup_cf_entry.c test_cluster_cf_e
 		test_cluster_merge_cold_cf.inc \
 		test_cluster_inputs_cf.inc test_cluster_inputs_cf_checkpoint.inc \
 		test_cluster_retention_cf_types.inc test_cluster_retention_cf.inc \
+		test_cluster_recovery_wal_cf.inc \
 		test_cluster_cf_blocker_trace.inc test_cluster_startup_interrupt.inc unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_cf_enqueue.c \
 		$(top_srcdir)/src/backend/cluster/cluster_lock_owner.c \
@@ -1499,6 +1500,19 @@ test_cluster_retention_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_control
 	     /^retention_startup_cf_(capture|wait)\(/ { print "static void"; emit=1; waiters++ } \
 	     emit { print } /^}/ { emit=0 } \
 	     END { if (predicates != 5 || consumers != 6 || tokens != 1 || checks > 1 || waiters > 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Exact recovery WAL consumers and their original CF/alias boundaries.
+test_cluster_recovery_wal_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_control_root.c Makefile
+	awk '/^typedef struct RecoveryWalVisitWork / { types=1; work++ } \
+	     /^typedef struct RecoveryWalCfWait / { types=1; helpers++ } \
+	     types { print; if (/^}/) types=0; next } \
+	     /^(history_ranges_overlap|acquire_clusterwide_cf)\(/ { print "static bool"; emit=1; predicates++ } \
+	     /^recovery_wal_cf_current\(/ { print "static bool"; emit=1; checks++ } \
+	     /^recovery_wal_cf_(capture|wait)\(/ { print "static void"; emit=1; waiters++ } \
+	     /^(recovery_wal_visit_root|recovery_wal_visit|cluster_control_root_recovery_(source_v1|checkpoint_v1|visit|sync_v1))\(/ { print ($$0 ~ /^cluster_control_root_/ ? "ClusterControlRootResult" : "static ClusterControlRootResult"); emit=1; consumers++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (work != 1 || helpers > 1 || predicates != 2 || checks > 1 || waiters > 2 || consumers != 6 || types || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # PGRAC: execute the real earliest startup-directory mutation call site.
