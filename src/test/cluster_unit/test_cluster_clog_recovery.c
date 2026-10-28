@@ -170,12 +170,14 @@ AbsorbSyncRequests(void)
 	abort();
 }
 
+#ifndef TEST_CLUSTER_SIDE_NATIVE_CLOG
 bool
 cluster_undo_recovery_cold_origin_authorized_v1(int origin)
 {
 	return authority && origin == fixture_origin
 		&& (fixture_cold_origin == NULL || fixture_cold_origin(origin));
 }
+#endif
 bool
 cluster_undo_recovery_abort_clog_authorized_v1(int origin, TransactionId xid)
 {
