@@ -11513,6 +11513,59 @@ test_cluster_xid_retention: test_cluster_xid_retention.c test_cluster_xid_alloca
 		$(top_srcdir)/src/include/access/clog.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_XID_STRIPE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
+# Current C allocator families retain their original generated/header inputs.
+test_cluster_xid_native_clog_main.o: test_cluster_xid_allocation.c unit_test.h \
+		test_cluster_xid_publication.inc \
+		test_cluster_xid_allocation.inc \
+		$(CLUSTER_XID_STRIPE_O) \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_recovery.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h \
+		$(top_srcdir)/src/include/access/transam.h \
+		test_cluster_pgproc_active_types.inc \
+		test_cluster_xid_allocation_stripe.inc \
+		$(top_srcdir)/src/include/cluster/cluster_xid_stripe_boot.h \
+		$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h \
+		$(top_srcdir)/src/include/cluster/cluster_qvotec.h \
+		$(top_srcdir)/src/include/storage/condition_variable.h \
+		$(top_srcdir)/src/include/access/twophase.h \
+		$(top_srcdir)/src/include/storage/proc.h \
+		$(top_srcdir)/src/include/storage/procarray.h \
+		test_cluster_xid_full_clog.inc \
+		$(top_srcdir)/src/include/access/clog.h
+
+# Target-local composition of the original allocator and native FULL CLOG.
+TESTS += test_cluster_xid_native_clog
+all: test_cluster_xid_native_clog
+test_cluster_xid_native_clog_main.o: test_cluster_xid_allocation.c unit_test.h \
+        test_cluster_xid_allocation.inc test_cluster_xid_full_clog.inc \
+        test_cluster_xid_native_clog.inc test_cluster_xid_native_clog.h Makefile \
+        $(top_builddir)/src/include/pg_config.h $(top_srcdir)/src/include/access/transam.h \
+        $(top_srcdir)/src/include/access/clog.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DTEST_CLUSTER_XID_NATIVE_CLOG -c $< -o $@
+
+test_cluster_xid_native_clog.o: test_cluster_xid_native_clog.c \
+        test_cluster_xid_native_clog.h test_cluster_xid_native_clog_namespace.h \
+        test_cluster_clog_recovery.c test_cluster_clog_relmap_participant.inc \
+        test_cluster_clog_page_birth.inc test_cluster_clog_relmap_mutation.inc \
+        test_cluster_clog_relmap_shared_mutation.inc test_cluster_clog_full_consumer.inc \
+        test_cluster_clog_own_full.inc unit_test.h Makefile \
+        $(top_builddir)/src/include/pg_config.h $(top_srcdir)/src/include/access/clog.h \
+        $(top_srcdir)/src/backend/access/transam/clog.c \
+        $(top_srcdir)/src/backend/access/transam/slru.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
+test_cluster_xid_native_clog: test_cluster_xid_native_clog_main.o \
+        test_cluster_xid_native_clog.o $(CLUSTER_XID_STRIPE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) test_cluster_xid_native_clog_main.o \
+		test_cluster_xid_native_clog.o $(CLUSTER_XID_STRIPE_O) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+
+clean: clean-xid-native-clog
+.PHONY: clean-xid-native-clog
+clean-xid-native-clog:
+	rm -f test_cluster_xid_native_clog_main.o test_cluster_xid_native_clog.o
+
 # Exercise the original recovery -> seed -> claim -> WAL gate. Dependency
 # boundaries are controlled by the test; the admission predicates are not.
 test_cluster_xid_stripe_boot.inc: $(top_srcdir)/src/backend/cluster/cluster_xid_stripe_boot.c $(top_srcdir)/src/backend/cluster/cluster_xid_stripe_xlog.c Makefile

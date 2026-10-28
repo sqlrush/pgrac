@@ -117,7 +117,15 @@ static uint64 stripe_incarnation;
 static FullTransactionId real_reserved_candidate;
 
 #define proc entries[0]
+#ifdef TEST_CLUSTER_XID_NATIVE_CLOG
+#define ExtendCLOGFull xid_fixture_extend_full
+void xid_fixture_extend_full(FullTransactionId candidate);
+#endif
 #include "test_cluster_xid_full_clog.inc"
+#ifdef TEST_CLUSTER_XID_NATIVE_CLOG
+#undef ExtendCLOGFull
+#include "test_cluster_xid_native_clog.inc"
+#endif
 #undef proc
 
 static bool allocation_real_future(FullTransactionId, FullTransactionId *, ClusterXidStripeSampleFence *);
@@ -460,6 +468,7 @@ cluster_relmap_owner_terminal_matches_v2(const ClusterRelmapOwnerSampleV2 *owner
 	(void)owner;
 	return false;
 } /* No original-owner authority in this fixture. */
+bool c_allocator_relmap_LWLockHeldByMe(LWLock *lock);
 #define LWLockHeldByMe c_allocator_relmap_LWLockHeldByMe
 bool
 LWLockHeldByMe(LWLock *lock)
@@ -1040,7 +1049,23 @@ UT_TEST(actual_stripe_future_keeps_prepared_fullxid_until_original_retirement)
 int
 main(void)
 {
+#ifdef TEST_CLUSTER_XID_NATIVE_CLOG
+	if (getenv("PGRAC_XID_NATIVE_CLOG_ONLY") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(native_allocator_full_birth_uses_gap_page_and_original_candidate);
+		UT_RUN(native_allocator_full_birth_keeps_epoch_through_subxact_wrap);
+		UT_RUN(native_allocator_full_birth_rederives_before_any_native_call);
+		UT_RUN(native_allocator_full_birth_wal_error_keeps_native_duty_unpublished);
+		UT_DONE(); return ut_failed_count ? 1 : 0;
+	}
+	UT_PLAN(27);
+	UT_RUN(native_allocator_full_birth_uses_gap_page_and_original_candidate);
+	UT_RUN(native_allocator_full_birth_keeps_epoch_through_subxact_wrap);
+	UT_RUN(native_allocator_full_birth_rederives_before_any_native_call);
+	UT_RUN(native_allocator_full_birth_wal_error_keeps_native_duty_unpublished);
+#else
 	UT_PLAN(23);
+#endif
 	UT_RUN(native_subxid_publication_preserves_the_final_cache_slot);
 	UT_RUN(native_publication_keeps_the_full_era_across_raw_rollover);
 	UT_RUN(no_storage_or_procarray_mutation_before_reservation);
