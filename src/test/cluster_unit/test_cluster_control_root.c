@@ -26268,6 +26268,208 @@ control_root_test_reset_state(void)
 		}                                                                                         \
 	} while (0)
 
+/* A pending subject alone is not a worker launch. This exercises the actual
+ * entry point with Startup's absent bgworker carrier before any stamp, owner,
+ * IR, pin or CF acquisition. It does not assert a MyBackendType admission gate. */
+UT_TEST(test_runtime_pending_worker_entry_requires_launch_carrier)
+{
+	ClusterRecoverySerialGuard serial;
+	ClusterThreadRecLaunchEligibility eligibility;
+	uint8 before[2][CLUSTER_CONTROL_ROOT_FILE_BYTES];
+	uint8 after[CLUSTER_CONTROL_ROOT_FILE_BYTES];
+	const char *paths[] = { CLUSTER_CONTROL_ROOT_REL_PATH, CLUSTER_CONTROL_ROOT_BAK_REL_PATH };
+	char path[MAXPGPATH];
+	BackendType role = MyBackendType;
+	int cf_calls, renames, walr_begin, walr_end;
+
+	(void)pending_worker_fixture(&serial, &eligibility);
+	if (ut_current_failed)
+		return;
+	for (unsigned i = 0; i < lengthof(paths); i++) {
+		path_for(path, sizeof(path), paths[i]);
+		read_all_or_abort(path, before[i], sizeof(before[i]));
+	}
+	MyBackendType = B_STARTUP;
+	MyBgworkerEntry = NULL;
+	CurrentResourceOwner = NULL;
+	test_worker_pin_held = false;
+	test_stamp_worker_begin_calls = 0;
+	test_stamp_worker_begin_allowed = true;
+	test_initializer_result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	cf_calls = test_cf_lock_calls;
+	renames = test_durable_rename_calls;
+	walr_begin = test_walr_begin_calls;
+	walr_end = test_walr_end_calls;
+	cluster_thread_recovery_worker_main(Int32GetDatum(eligibility.origin_thread));
+	UT_ASSERT_NULL(CurrentResourceOwner);
+	UT_ASSERT_EQ(test_stamp_worker_begin_calls, 0);
+	UT_ASSERT_EQ(test_worker_formations, 0);
+	UT_ASSERT_EQ(test_worker_initializer_ir, 0);
+	UT_ASSERT_EQ(test_worker_pins, 0);
+	UT_ASSERT_EQ(test_worker_replays, 0);
+	UT_ASSERT_EQ(test_initializer_result, CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT_EQ(test_cf_lock_calls, cf_calls);
+	UT_ASSERT_EQ(test_durable_rename_calls, renames);
+	UT_ASSERT_EQ(test_walr_begin_calls, walr_begin);
+	UT_ASSERT_EQ(test_walr_end_calls, walr_end);
+	UT_ASSERT(!test_worker_pin_held);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	for (unsigned i = 0; i < lengthof(paths); i++) {
+		path_for(path, sizeof(path), paths[i]);
+		read_all_or_abort(path, after, sizeof(after));
+		UT_ASSERT_EQ(memcmp(before[i], after, sizeof(after)), 0);
+	}
+	CurrentResourceOwner = (ResourceOwner)(uintptr_t)1;
+	MyBackendType = role;
+	cluster_shared_config = false;
+}
+
+/* Registration/dispatch is separately source-bound; this supplies its real
+ * carrier to the original entry and worker. Provider, IR and WALR stay the
+ * fixture's explicit leaves, while ROOT/WAL files and terminal execution are real. */
+UT_TEST(test_runtime_pending_bgworker_entry_reaches_initializer)
+{
+	ClusterRecoverySerialGuard serial;
+	ClusterThreadRecLaunchEligibility eligibility;
+	BackgroundWorker worker = { 0 };
+	BackendType role = MyBackendType;
+
+	(void)pending_worker_fixture(&serial, &eligibility);
+	if (ut_current_failed)
+		return;
+	memcpy(worker.bgw_extra, &eligibility, sizeof(eligibility));
+	MyBackendType = B_BG_WORKER;
+	MyBgworkerEntry = &worker;
+	CurrentResourceOwner = NULL;
+	test_worker_pin_held = false;
+	test_stamp_worker_begin_calls = 0;
+	test_stamp_worker_begin_allowed = true;
+	test_initializer_result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	cluster_thread_recovery_worker_main(Int32GetDatum(eligibility.origin_thread));
+	UT_ASSERT_NOT_NULL(CurrentResourceOwner);
+	UT_ASSERT_EQ(test_stamp_worker_begin_calls, 1);
+	UT_ASSERT_EQ(test_initializer_result, CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(test_worker_formations, 1);
+	UT_ASSERT_EQ(test_worker_initializer_ir, 1);
+	UT_ASSERT_EQ(test_worker_pins, 1);
+	UT_ASSERT_EQ(test_worker_replays, 0);
+	UT_ASSERT(!test_worker_pin_held);
+	UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	MyBgworkerEntry = NULL;
+	CurrentResourceOwner = (ResourceOwner)(uintptr_t)1;
+	MyBackendType = role;
+	cluster_shared_config = false;
+}
+
+/* Refuse only the selected X cut after the actual worker has acquired and
+ * bound its original IR/pin. The leaf records whether terminal publication has
+ * converted that same pin; it grants no ROOT, IR or retirement authority. */
+static unsigned initializer_refuse_x_at, initializer_x_calls;
+static int initializer_refused_cf_calls;
+static void
+initializer_refuse_selected_x(void)
+{
+	if (++initializer_x_calls != initializer_refuse_x_at)
+		return;
+	UT_ASSERT_NOT_NULL(test_worker_bound_serial);
+	if (test_worker_bound_serial == NULL)
+		return;
+	UT_ASSERT_EQ(test_worker_bound_serial->mode, CLUSTER_RECOVERY_SERIAL_INITIALIZER);
+	UT_ASSERT_EQ(test_worker_bound_serial->held, initializer_refuse_x_at == 1);
+	UT_ASSERT_EQ(test_worker_pin_sealed, initializer_refuse_x_at == 2);
+	UT_ASSERT(test_worker_pin_held);
+	UT_ASSERT(!test_worker_bound_serial->release_uncertain);
+	initializer_refused_cf_calls = test_cf_lock_calls;
+	test_cf_grant = false;
+}
+
+/* Real initializer observation and worker terminal execution, with the CF
+ * grant and IR/WALR as explicit fixture leaves. A refusal is not actual native
+ * timeout/retirement proof. Original worker deferral/cleanup must not acquire a
+ * Startup retry policy, discard the selected ROOT, or run transaction replay. */
+UT_TEST(test_runtime_pending_cf_refusal_keeps_original_cleanup_policy)
+{
+	BackendType role = MyBackendType;
+
+	for (unsigned phase = 0; phase < 3; phase++) {
+		ClusterRecoverySerialGuard serial, original;
+		ClusterThreadRecLaunchEligibility eligibility;
+		ClusterWalInitializerInput out;
+		uint8 before[2][CLUSTER_CONTROL_ROOT_FILE_BYTES];
+		uint8 after[CLUSTER_CONTROL_ROOT_FILE_BYTES];
+		const char *paths[] = { CLUSTER_CONTROL_ROOT_REL_PATH, CLUSTER_CONTROL_ROOT_BAK_REL_PATH };
+		char path[MAXPGPATH];
+		int cf_calls, walr_begin, walr_end;
+
+		(void)pending_worker_fixture(&serial, &eligibility);
+		if (ut_current_failed)
+			return;
+		MyBackendType = B_BG_WORKER;
+		memcpy(&original, &serial, sizeof(original));
+		for (unsigned i = 0; i < lengthof(paths); i++) {
+			path_for(path, sizeof(path), paths[i]);
+			read_all_or_abort(path, before[i], sizeof(before[i]));
+		}
+		cf_calls = test_cf_lock_calls;
+		walr_begin = test_walr_begin_calls;
+		walr_end = test_walr_end_calls;
+		if (phase == 0) {
+			test_cf_grant = false;
+			memset(&out, 0xa5, sizeof(out));
+			UT_ASSERT_EQ(cluster_control_root_v3_initializer_observe(
+							 &serial, (ClusterWalRetentionPin *)(uintptr_t)4, &out),
+						 CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+			UT_ASSERT(v2_zero(&out, sizeof(out)));
+			UT_ASSERT_EQ(test_cf_lock_calls, cf_calls + 1);
+			UT_ASSERT_EQ(memcmp(&serial, &original, sizeof(serial)), 0);
+			UT_ASSERT(test_worker_pin_held);
+			UT_ASSERT_EQ(test_input_acquires, 0);
+			UT_ASSERT_EQ(test_input_releases, 0);
+		} else {
+			test_worker_pin_held = false;
+			test_worker_pin_sealed = false;
+			initializer_refuse_x_at = phase;
+			initializer_x_calls = 0;
+			initializer_refused_cf_calls = 0;
+			test_checkpoint_x_hook = initializer_refuse_selected_x;
+			test_initializer_result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+			UT_ASSERT_EQ(thread_recovery_worker_run(&eligibility), CLUSTER_THREADREC_DEFERRED);
+			UT_ASSERT_EQ(test_initializer_result, CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+			UT_ASSERT_EQ(initializer_x_calls, phase);
+			UT_ASSERT(initializer_refused_cf_calls > cf_calls);
+			UT_ASSERT_EQ(test_cf_lock_calls, initializer_refused_cf_calls);
+			UT_ASSERT_EQ(test_worker_initializer_ir, 1);
+			UT_ASSERT_EQ(test_worker_pins, 1);
+			/* The legacy counter counts INPUT_SEAL, not INITIALIZER. The
+			 * original release-order leaf covers both modes. */
+			UT_ASSERT_EQ(test_input_releases, 0);
+			UT_ASSERT(test_input_release_order > 0);
+			UT_ASSERT_EQ(test_input_release_order > test_cf_acquire_order, phase == 1);
+			UT_ASSERT(!test_worker_pin_held);
+			UT_ASSERT_EQ(test_walr_begin_calls, walr_begin + (phase == 2));
+			UT_ASSERT_EQ(test_walr_end_calls, walr_end + (phase == 2));
+		}
+		test_checkpoint_x_hook = NULL;
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		UT_ASSERT_EQ(test_worker_replays, 0);
+		if (phase == 0) {
+			UT_ASSERT_EQ(test_walr_begin_calls, walr_begin);
+			UT_ASSERT_EQ(test_walr_end_calls, walr_end);
+		}
+		for (unsigned i = 0; i < lengthof(paths); i++) {
+			path_for(path, sizeof(path), paths[i]);
+			read_all_or_abort(path, after, sizeof(after));
+			UT_ASSERT_EQ(memcmp(before[i], after, sizeof(after)), 0);
+		}
+		test_cf_grant = true;
+		test_worker_pin_held = test_worker_pin_sealed = false;
+		test_worker_bound_serial = NULL;
+		MyBackendType = role;
+		cluster_shared_config = false;
+	}
+}
+
 int
 main(int argc, char **argv)
 {
@@ -26757,6 +26959,26 @@ main(int argc, char **argv)
 		return ut_failed_count ? 1 : 0;
 	}
 
+	if (getenv("PGRAC_PRE2_TEST_INITIALIZER_LIFECYCLE") != NULL) {
+		UT_PLAN(15);
+		UT_RUN(test_runtime_pending_worker_entry_requires_launch_carrier);
+		UT_RUN(test_runtime_pending_bgworker_entry_reaches_initializer);
+		UT_RUN(test_runtime_pending_cf_refusal_keeps_original_cleanup_policy);
+		UT_RUN(test_runtime_pending_observation_is_separate_and_requires_actual_inputs);
+		UT_RUN(test_runtime_pending_worker_owns_exact_subject_before_inspection);
+		UT_RUN(test_runtime_pending_owner_reads_actual_empty_and_checkpoint_wal);
+		UT_RUN(test_runtime_pending_checkpoint_promotes_without_claiming_recovery_done);
+		UT_RUN(test_runtime_pending_checkpoint_sync_cuts_preserve_recoverable_input);
+		UT_RUN(test_runtime_pending_native_inspection_uses_selected_origin_and_sealed_horizon);
+		UT_RUN(test_runtime_pending_worker_publishes_checkpointless_terminal);
+		UT_RUN(test_runtime_pending_worker_cancellation_keeps_pending_subject);
+		UT_RUN(test_runtime_pending_worker_uncertain_root_publish_retains_terminal);
+		UT_RUN(test_runtime_pending_inspection_refuses_stale_or_unowned_input);
+		UT_RUN(test_runtime_terminal_isolation_full_needset);
+		UT_RUN(test_runtime_v3_failure_worker_entry_establishes_resource_owner);
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_RECOVERY_COMPLETE") != NULL) {
 		UT_PLAN(5);
 		UT_RUN(test_v3_recovery_complete_preserves_exact_selected_inputs);
@@ -26831,7 +27053,7 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(584);
+	UT_PLAN(587);
 	UT_RUN(test_ctrc_replay_stable_two_actual_origins_without_tt);
 	UT_RUN(test_ctrc_replay_stable_refuses_omitted_or_duplicated_set_origin);
 	UT_RUN(test_ctrc_replay_stable_refuses_changed_native_source_or_uncovered_cut);
@@ -27423,6 +27645,9 @@ main(int argc, char **argv)
 	UT_RUN(test_bootstrap_capacity_reobserves_after_collection);
 	UT_RUN(test_bootstrap_capacity_checks_nonlocal_content_not_just_file_presence);
 	UT_RUN(test_bootstrap_capacity_final_directory_replacement_is_not_pinned_success);
+	UT_RUN(test_runtime_pending_worker_entry_requires_launch_carrier);
+	UT_RUN(test_runtime_pending_bgworker_entry_reaches_initializer);
+	UT_RUN(test_runtime_pending_cf_refusal_keeps_original_cleanup_policy);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;
