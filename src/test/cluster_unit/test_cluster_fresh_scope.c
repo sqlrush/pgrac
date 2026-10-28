@@ -7612,9 +7612,32 @@ static GrantStmt native_acl_grant_statement;
 static RoleSpec acl_grant_grantor;
 static List acl_grant_objects;
 
+/* Default privileges stop before their first role or default-ACL query. */
+static bool default_acl_lookup_active, default_acl_expect_binding;
+static unsigned default_acl_lookups, default_acl_lookup_kind, default_acl_expected_boundary;
+static unsigned default_acl_unbound, default_acl_bad_lookup, default_acl_local_appends;
+static unsigned default_acl_unexpected_dependencies;
+static RoleSpec default_acl_grantee, default_acl_owner;
+static List default_acl_public_oids;
+static ListCell default_acl_public_oid_cell;
+
 Oid
 get_rolespec_oid(const RoleSpec *role, bool missing_ok)
 {
+	if (default_acl_lookup_active) {
+		default_acl_lookups++;
+		default_acl_lookup_kind = default_acl_expected_boundary == 1 ? 1 : 2;
+		if (default_acl_expect_binding && utility_binds == 0)
+			default_acl_unbound++;
+		if (default_acl_expected_boundary == 3 || missing_ok
+			|| role
+				   != (default_acl_expected_boundary == 1 ? &default_acl_grantee
+														  : &default_acl_owner)
+			|| role->roletype != ROLESPEC_CSTRING
+			|| default_acl_local_appends != (default_acl_expected_boundary == 2 ? 1U : 0U))
+			default_acl_bad_lookup++;
+		siglongjmp(boundary, 2); /* Before the actual grantee or owner query. */
+	}
 	if (acl_grant_lookup_active) {
 		acl_grant_lookups++;
 		acl_grant_lookup_kind = 1;
@@ -14430,10 +14453,390 @@ UT_TEST(test_native_acl_grant_keeps_original_grantor_mismatch_refusal)
 	acl_grant_lookup_active = false;
 }
 
+/* A local one-cell PUBLIC list model; no role/catalog/ACL lookup succeeds. */
+List *
+lappend_oid(List *list, Oid datum)
+{
+	if (!default_acl_lookup_active || default_acl_expected_boundary == 1 || list != NIL
+		|| datum != ACL_ID_PUBLIC || default_acl_local_appends != 0)
+		siglongjmp(boundary, 3);
+	default_acl_local_appends++;
+	default_acl_public_oid_cell = (ListCell){ .oid_value = datum };
+	default_acl_public_oids = (List){ .type = T_OidList,
+									  .length = 1,
+									  .max_length = 1,
+									  .elements = &default_acl_public_oid_cell };
+	return &default_acl_public_oids;
+}
+
+bool
+has_privs_of_role(Oid member, Oid role)
+{
+	(void)member;
+	(void)role;
+	default_acl_unexpected_dependencies++;
+	siglongjmp(boundary, 3); /* No role lookup is allowed to return successfully. */
+}
+
+#include "test_cluster_fresh_default_privileges.inc"
+static AlterDefaultPrivilegesStmt native_default_acl_statement;
+static GrantStmt default_acl_action;
+static Node *default_acl_expected_statement;
+static List default_acl_grantees, default_acl_roles, default_acl_schemas, default_acl_options;
+static List default_acl_privileges;
+static ListCell default_acl_grantee_cell, default_acl_role_cell, default_acl_schema_cell;
+static ListCell default_acl_option_cells[2], default_acl_privilege_cell;
+static String default_acl_schema;
+static DefElem default_acl_role_option, default_acl_schema_option;
+static AccessPriv default_acl_privilege;
+static const ObjectType default_acl_targets[]
+	= { OBJECT_TABLE, OBJECT_SEQUENCE, OBJECT_FUNCTION, OBJECT_TYPE, OBJECT_SCHEMA };
+static const char *const default_acl_privilege_names[]
+	= { "select", "usage", "execute", "usage", "create" };
+static const AclMode default_acl_privilege_bits[]
+	= { ACL_SELECT, ACL_USAGE, ACL_EXECUTE, ACL_USAGE, ACL_CREATE };
+static bool default_acl_named_privilege;
+static unsigned default_acl_target;
+
+static void
+SetDefaultACLsInSchemas(InternalDefaultACL *iacls, List *nspnames)
+{
+	if (!default_acl_lookup_active)
+		siglongjmp(boundary, 3);
+	default_acl_lookups++;
+	default_acl_lookup_kind = 3;
+	if (default_acl_expect_binding && utility_binds == 0)
+		default_acl_unbound++;
+	if (default_acl_expected_boundary != 3 || default_acl_local_appends != 1 || iacls->roleid != 10
+		|| iacls->objtype != default_acl_action.objtype
+		|| iacls->is_grant != default_acl_action.is_grant
+		|| iacls->grant_option != default_acl_action.grant_option
+		|| iacls->behavior != default_acl_action.behavior
+		|| iacls->all_privs == default_acl_named_privilege
+		|| iacls->privileges
+			   != (default_acl_named_privilege ? default_acl_privilege_bits[default_acl_target]
+											   : ACL_NO_RIGHTS)
+		|| iacls->grantees != &default_acl_public_oids || list_length(iacls->grantees) != 1
+		|| linitial_oid(iacls->grantees) != ACL_ID_PUBLIC
+		|| nspnames != (native_default_acl_statement.options != NIL ? &default_acl_schemas : NIL))
+		default_acl_bad_lookup++;
+	siglongjmp(boundary, 2); /* Before actual schema/default-ACL queries or mutation. */
+}
+
+static void
+reset_native_default_acl(bool expect_binding, unsigned form)
+{
+	unsigned action = (form / 5) % 4;
+	unsigned route = (form / 20) % 3;
+	bool schema = (form / 60) % 2;
+
+	reset_create_preflight();
+	default_acl_lookup_active = true;
+	default_acl_expect_binding = expect_binding;
+	default_acl_lookups = default_acl_lookup_kind = default_acl_unbound = default_acl_bad_lookup
+		= 0;
+	default_acl_local_appends = default_acl_unexpected_dependencies = 0;
+	default_acl_expected_boundary = route + 1;
+	default_acl_named_privilege = form >= 120;
+	default_acl_target = form % 5;
+	default_acl_grantee = (RoleSpec){ .type = T_RoleSpec,
+									  .roletype = route == 0 ? ROLESPEC_CSTRING : ROLESPEC_PUBLIC,
+									  .rolename = "default_grantee" };
+	default_acl_owner = (RoleSpec){ .type = T_RoleSpec,
+									.roletype = ROLESPEC_CSTRING,
+									.rolename = "default_owner" };
+	default_acl_grantee_cell = (ListCell){ .ptr_value = &default_acl_grantee };
+	default_acl_grantees = (List){ .type = T_List,
+								   .length = 1,
+								   .max_length = 1,
+								   .elements = &default_acl_grantee_cell };
+	default_acl_role_cell = (ListCell){ .ptr_value = &default_acl_owner };
+	default_acl_roles = (List){ .type = T_List,
+								.length = 1,
+								.max_length = 1,
+								.elements = &default_acl_role_cell };
+	default_acl_schema = (String){ .type = T_String, .sval = "default_schema" };
+	default_acl_schema_cell = (ListCell){ .ptr_value = &default_acl_schema };
+	default_acl_schemas = (List){ .type = T_List,
+								  .length = 1,
+								  .max_length = 1,
+								  .elements = &default_acl_schema_cell };
+	default_acl_role_option
+		= (DefElem){ .type = T_DefElem, .defname = "roles", .arg = (Node *)&default_acl_roles };
+	default_acl_schema_option
+		= (DefElem){ .type = T_DefElem, .defname = "schemas", .arg = (Node *)&default_acl_schemas };
+	default_acl_option_cells[0]
+		= (ListCell){ .ptr_value
+					  = route == 1 ? &default_acl_role_option : &default_acl_schema_option };
+	default_acl_option_cells[1] = (ListCell){ .ptr_value = &default_acl_schema_option };
+	default_acl_options = (List){ .type = T_List,
+								  .length = (route == 1) + schema,
+								  .max_length = 2,
+								  .elements = default_acl_option_cells };
+	default_acl_privilege
+		= (AccessPriv){ .type = T_AccessPriv,
+						.priv_name = (char *)default_acl_privilege_names[default_acl_target] };
+	default_acl_privilege_cell = (ListCell){ .ptr_value = &default_acl_privilege };
+	default_acl_privileges = (List){ .type = T_List,
+									 .length = 1,
+									 .max_length = 1,
+									 .elements = &default_acl_privilege_cell };
+	default_acl_action
+		= (GrantStmt){ .type = T_GrantStmt,
+					   .is_grant = action < 2,
+					   .targtype = ACL_TARGET_DEFAULTS,
+					   .objtype = default_acl_targets[default_acl_target],
+					   .grantees = &default_acl_grantees,
+					   .grant_option = action == 1 || action == 3,
+					   .behavior = action == 3 ? DROP_CASCADE : DROP_RESTRICT,
+					   .privileges = default_acl_named_privilege ? &default_acl_privileges : NIL };
+	native_default_acl_statement
+		= (AlterDefaultPrivilegesStmt){ .type = T_AlterDefaultPrivilegesStmt,
+										.action = &default_acl_action,
+										.options
+										= default_acl_options.length ? &default_acl_options : NIL };
+	default_acl_expected_statement = (Node *)&native_default_acl_statement;
+}
+
+static void
+native_default_acl_entry(void)
+{
+	default_acl_local_appends = 0; /* One local list per native invocation. */
+	ExecAlterDefaultPrivilegesStmt(NULL, &native_default_acl_statement);
+}
+
+UT_TEST(test_native_default_acl_binds_before_first_query_in_all_profiles)
+{
+	for (unsigned form = 0; form < 240; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_default_acl(binds, form);
+			set_native_operator_mode(mode);
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_default_acl_entry();
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(default_acl_lookups, repeat + 1);
+				UT_ASSERT_EQ(default_acl_lookup_kind,
+							 default_acl_lookups ? default_acl_expected_boundary : 0);
+				UT_ASSERT_EQ(default_acl_unbound, 0);
+				UT_ASSERT_EQ(default_acl_bad_lookup + default_acl_unexpected_dependencies, 0);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	default_acl_lookup_active = false;
+}
+
+UT_TEST(test_native_default_acl_refuses_before_lookup_on_publication_child_and_top_errors)
+{
+	for (unsigned form = 0; form < 240; form++) {
+		for (unsigned failure = 0; failure < 5; failure++) {
+			bool allocated = failure == 0 || failure == 2;
+			int caught;
+
+			reset_native_default_acl(true, form);
+			if (failure == 0)
+				utility_bind_ok = false;
+			else if (failure == 1 || failure == 2) {
+				if (failure == 2)
+					create_sql_entry(default_acl_expected_statement);
+				utility_in_child = true;
+			} else {
+				utility_current_xid = 401;
+				utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_default_acl_entry();
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, failure == 0  ? ERRCODE_DATA_CORRUPTED
+									 : failure < 3 ? ERRCODE_FEATURE_NOT_SUPPORTED
+												   : ERRCODE_INTERNAL_ERROR);
+			UT_ASSERT_STR_EQ(
+				error_message,
+				failure == 0
+					? "canonical ACTIVE publication failed before shared catalog alteration"
+				: failure < 3 ? "shared catalog alteration does not support subtransactions"
+							  : "shared catalog top-level transaction identity mismatch");
+			UT_ASSERT_EQ(default_acl_lookups, 0);
+			UT_ASSERT_EQ(default_acl_lookup_kind,
+						 default_acl_lookups ? default_acl_expected_boundary : 0);
+			UT_ASSERT_EQ(default_acl_unbound + default_acl_bad_lookup
+							 + default_acl_unexpected_dependencies,
+						 0);
+			UT_ASSERT_EQ(utility_xids, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, failure == 2 ? 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, allocated || failure == 3 ? 400 : InvalidTransactionId);
+		}
+	}
+	default_acl_lookup_active = false;
+}
+
+UT_TEST(test_native_default_acl_context_guards_keep_nonshared_route)
+{
+	for (unsigned form = 0; form < 240; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+
+			for (unsigned guard = 0; guard < 3; guard++) {
+				int caught;
+
+				reset_native_default_acl(binds, form);
+				set_native_operator_mode(mode);
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_default_acl_entry();
+				UT_ASSERT_EQ(caught, binds ? 1 : 2);
+				UT_ASSERT_EQ(error_code, !binds		  ? 0
+										 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+													  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				if (binds)
+					UT_ASSERT(strstr(error_message, "ALTER DEFAULT PRIVILEGES") != NULL);
+				UT_ASSERT_EQ(default_acl_lookups, binds ? 0 : 1);
+				UT_ASSERT_EQ(default_acl_lookup_kind,
+							 default_acl_lookups ? default_acl_expected_boundary : 0);
+				UT_ASSERT_EQ(default_acl_unbound + default_acl_bad_lookup
+								 + default_acl_unexpected_dependencies,
+							 0);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	default_acl_lookup_active = false;
+}
+
+UT_TEST(test_native_default_acl_utility_warm_guards_preserve_binding)
+{
+	for (unsigned form = 0; form < 240; form++) {
+		for (unsigned guard = 0; guard < 4; guard++) {
+			int caught;
+
+			reset_native_default_acl(true, form);
+			create_sql_entry(default_acl_expected_statement);
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			XactReadOnly = guard == 1;
+			utility_parallel = guard == 2;
+			utility_recovery = guard == 3;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_default_acl_entry();
+			UT_ASSERT_EQ(caught, guard ? 1 : 2);
+			UT_ASSERT_EQ(error_code, !guard		  ? 0
+									 : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+												  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT_EQ(default_acl_lookups, guard ? 0 : 1);
+			UT_ASSERT_EQ(default_acl_lookup_kind,
+						 default_acl_lookups ? default_acl_expected_boundary : 0);
+			UT_ASSERT_EQ(default_acl_unbound + default_acl_bad_lookup
+							 + default_acl_unexpected_dependencies,
+						 0);
+			UT_ASSERT_EQ(utility_prepares, guard ? 1 : 2);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			UT_ASSERT_EQ(utility_top_xid, 400);
+		}
+	}
+	default_acl_lookup_active = false;
+}
+
+UT_TEST(test_native_default_acl_keeps_original_option_errors)
+{
+	for (unsigned failure = 0; failure < 3; failure++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_default_acl(binds, 0);
+			set_native_operator_mode(mode);
+			default_acl_option_cells[0].ptr_value
+				= failure == 0 ? &default_acl_schema_option : &default_acl_role_option;
+			default_acl_option_cells[1] = default_acl_option_cells[0];
+			default_acl_options.length = failure == 2 ? 1 : 2;
+			if (failure == 2)
+				default_acl_role_option.defname = "unknown_default_acl_option";
+			native_default_acl_statement.options = &default_acl_options;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_default_acl_entry();
+			UT_ASSERT_EQ(caught, 1);
+			if (failure < 2) {
+				UT_ASSERT_EQ(error_code, ERRCODE_SYNTAX_ERROR);
+				UT_ASSERT_STR_EQ(error_message, "conflicting or redundant options");
+			} else
+				UT_ASSERT_STR_EQ(error_message,
+								 "option \"unknown_default_acl_option\" not recognized");
+			UT_ASSERT_EQ(default_acl_lookups + default_acl_local_appends, 0);
+			UT_ASSERT_EQ(default_acl_unbound + default_acl_bad_lookup
+							 + default_acl_unexpected_dependencies,
+						 0);
+			UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, binds ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+		}
+	}
+	default_acl_lookup_active = false;
+}
+
+UT_TEST(test_native_default_acl_keeps_original_privilege_errors)
+{
+	for (unsigned failure = 0; failure < 4; failure++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_default_acl(binds,
+									 160); /* PUBLIC, current role, TABLE, named privilege. */
+			set_native_operator_mode(mode);
+			if (failure == 0)
+				default_acl_privilege.cols = &default_acl_schemas;
+			else if (failure == 1)
+				default_acl_privilege.priv_name = NULL;
+			else
+				default_acl_privilege.priv_name = failure == 2 ? "unknown_privilege" : "execute";
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_default_acl_entry();
+			UT_ASSERT_EQ(caught, 1);
+			if (failure == 0 || failure == 3)
+				UT_ASSERT_EQ(error_code, ERRCODE_INVALID_GRANT_OPERATION);
+			else if (failure == 2)
+				UT_ASSERT_EQ(error_code, ERRCODE_SYNTAX_ERROR);
+			UT_ASSERT_STR_EQ(error_message,
+							 failure == 0	? "default privileges cannot be set for columns"
+							 : failure == 1 ? "AccessPriv node must specify privilege"
+							 : failure == 2 ? "unrecognized privilege type \"unknown_privilege\""
+											: "invalid privilege type EXECUTE for relation");
+			UT_ASSERT_EQ(default_acl_lookups, 0);
+			UT_ASSERT_EQ(default_acl_local_appends, 1);
+			UT_ASSERT_EQ(default_acl_unbound + default_acl_bad_lookup
+							 + default_acl_unexpected_dependencies,
+						 0);
+			UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, binds ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+		}
+	}
+	default_acl_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(227);
+	UT_PLAN(233);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -14661,6 +15064,12 @@ main(void)
 	UT_RUN(test_native_acl_grant_context_guards_keep_nonshared_route);
 	UT_RUN(test_native_acl_grant_utility_warm_guards_preserve_binding);
 	UT_RUN(test_native_acl_grant_keeps_original_grantor_mismatch_refusal);
+	UT_RUN(test_native_default_acl_binds_before_first_query_in_all_profiles);
+	UT_RUN(test_native_default_acl_refuses_before_lookup_on_publication_child_and_top_errors);
+	UT_RUN(test_native_default_acl_context_guards_keep_nonshared_route);
+	UT_RUN(test_native_default_acl_utility_warm_guards_preserve_binding);
+	UT_RUN(test_native_default_acl_keeps_original_option_errors);
+	UT_RUN(test_native_default_acl_keeps_original_privilege_errors);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

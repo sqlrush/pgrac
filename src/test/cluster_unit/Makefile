@@ -1278,6 +1278,23 @@ test_cluster_fresh_acl_grant.inc: $(top_srcdir)/src/backend/catalog/aclchk.c Mak
 	     { print "}"; emit=0; targets=0; cuts++ } \
 	     END { if (entries != 1 || cuts != 1 || emit || targets) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
+test_cluster_fresh_default_privileges.inc: $(top_srcdir)/src/backend/catalog/aclchk.c Makefile
+	awk '/^ \* Internal format used by ALTER DEFAULT PRIVILEGES\./ { pending=1 } \
+	     pending && /^typedef struct/ { t=1; types++; pending=0 } \
+	     t { defs=defs $$0 ORS } \
+	     t && /^} InternalDefaultACL;/ { t=0; type_cuts++ } \
+	     /^ExecAlterDefaultPrivilegesStmt\(/ { entry="void" ORS; e=1; entries++ } \
+	     e { entry=entry $$0 ORS } \
+	     e && /^}/ { e=0; cuts++ } \
+	     /^string_to_privilege\(/ { helpers=helpers "static AclMode" ORS; h=1; strings++ } \
+	     /^privilege_to_string\(/ { helpers=helpers "static const char *" ORS; h=1; names++ } \
+	     h { helpers=helpers $$0 ORS } \
+	     h && /^}/ { h=0; helper_cuts++ } \
+	     END { if (types != 1 || type_cuts != 1 || pending || t || entries != 1 \
+	               || cuts != 1 || e || strings != 1 || names != 1 || helper_cuts != 2 || h) exit 1; \
+	           printf "%sstatic void SetDefaultACLsInSchemas(InternalDefaultACL *, List *);\n%s%s", \
+	                  defs, helpers, entry }' $< > $@.tmp
+	mv $@.tmp $@
 test_cluster_fresh_scope: test_cluster_fresh_scope.c unit_test.h \
 		test_cluster_fresh_control.inc test_cluster_fresh_startup.inc test_cluster_fresh_read.inc \
 		test_cluster_fresh_boolean.inc test_cluster_fresh_index.inc test_cluster_fresh_utility.inc \
@@ -1286,7 +1303,7 @@ test_cluster_fresh_scope: test_cluster_fresh_scope.c unit_test.h \
 		test_cluster_fresh_import_filter.inc test_cluster_fresh_extension.inc \
 		test_cluster_fresh_schema.inc test_cluster_fresh_comment.inc test_cluster_fresh_seclabel.inc \
 		test_cluster_fresh_policy.inc test_cluster_fresh_conversion.inc test_cluster_fresh_collation.inc \
-		test_cluster_fresh_event_trigger.inc test_cluster_fresh_owner.inc test_cluster_fresh_object_depends.inc test_cluster_fresh_acl_grant.inc test_cluster_fresh_language.inc \
+		test_cluster_fresh_event_trigger.inc test_cluster_fresh_owner.inc test_cluster_fresh_object_depends.inc test_cluster_fresh_acl_grant.inc test_cluster_fresh_default_privileges.inc test_cluster_fresh_language.inc \
 		test_cluster_fresh_access_method.inc test_cluster_fresh_function.inc test_cluster_fresh_fdw.inc \
 		test_cluster_fresh_foreign_server.inc test_cluster_fresh_user_mapping.inc \
 		test_cluster_fresh_statistics_alter.inc test_cluster_fresh_statistics_create.inc test_cluster_fresh_operator.inc \
@@ -6601,7 +6618,7 @@ clean distclean maintainer-clean:
 		test_cluster_fresh_catalog_index.inc test_cluster_shared_utility.inc \
 		test_cluster_fresh_schema.inc test_cluster_fresh_comment.inc test_cluster_fresh_seclabel.inc \
 		test_cluster_fresh_policy.inc test_cluster_fresh_conversion.inc test_cluster_fresh_collation.inc \
-		test_cluster_fresh_event_trigger.inc test_cluster_fresh_owner.inc test_cluster_fresh_object_depends.inc test_cluster_fresh_acl_grant.inc test_cluster_fresh_language.inc \
+		test_cluster_fresh_event_trigger.inc test_cluster_fresh_owner.inc test_cluster_fresh_object_depends.inc test_cluster_fresh_acl_grant.inc test_cluster_fresh_default_privileges.inc test_cluster_fresh_language.inc \
 		test_cluster_fresh_access_method.inc test_cluster_fresh_function.inc test_cluster_fresh_fdw.inc \
 		test_cluster_fresh_foreign_server.inc test_cluster_fresh_user_mapping.inc \
 		test_cluster_fresh_statistics_alter.inc test_cluster_fresh_statistics_create.inc test_cluster_fresh_operator.inc \
