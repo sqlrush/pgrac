@@ -301,6 +301,8 @@ CLUSTER_RESOURCE_X_IDENTITY_O = \
 	$(top_builddir)/src/backend/cluster/cluster_resource_x_identity.o
 CLUSTER_RESOURCE_X_NODE_WIRE_O = \
 	$(top_builddir)/src/backend/cluster/cluster_resource_x_node_wire.o
+$(CLUSTER_RESOURCE_X_NODE_WIRE_O) test_cluster_pcm_lock_clock_product.o: \
+		$(top_srcdir)/src/include/cluster/cluster_resource_x_node_wire.h
 CLUSTER_RESOURCE_X_RETRY_O = \
 	$(top_builddir)/src/backend/cluster/cluster_resource_x_retry.o
 CLUSTER_IC_TIER1_O = $(top_builddir)/src/backend/cluster/cluster_ic_tier1.o
@@ -314,6 +316,7 @@ test_cluster_resource_x_identity: test_cluster_resource_x_identity.c \
 
 test_cluster_resource_x_node_wire: test_cluster_resource_x_node_wire.c unit_test.h \
 		$(CLUSTER_RESOURCE_X_IDENTITY_O) $(CLUSTER_RESOURCE_X_NODE_WIRE_O) \
+		$(top_srcdir)/src/include/cluster/cluster_resource_x_node_wire.h \
 		$(top_srcdir)/src/include/cluster/cluster_ic.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_RESOURCE_X_IDENTITY_O) $(CLUSTER_RESOURCE_X_NODE_WIRE_O) \

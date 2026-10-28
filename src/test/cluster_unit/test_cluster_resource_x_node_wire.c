@@ -2541,10 +2541,368 @@ UT_TEST(test_witness_original_pi_proof_and_native_bytes_are_never_synthesized)
 	UT_ASSERT(memcmp(bytes+736, encoded+736, 312) == 0);
 }
 
+/* The original image is constructed by the old codec independently of SHIP.
+	* S is a new encapsulated component mode; a bare S image still rejects. */
+static uint32
+ship_crc(const void *data, Size len)
+{
+	pg_crc32c crc;
+	INIT_CRC32C(crc); COMP_CRC32C(crc, data, len); FIN_CRC32C(crc);
+	return (uint32)crc;
+}
+static uint32
+ship_get_u32(const uint8 *b)
+{
+	return ((uint32)b[0] << 24) | ((uint32)b[1] << 16) | ((uint32)b[2] << 8) | b[3];
+}
+static ResourceXDecodedFrame
+make_ship_bytes(uint8 *bytes, PcmState directory, PcmState target, bool wal)
+{
+	ResourceXDecodedFrame source = make_witness_bytes(bytes, true, directory, target);
+	ResourceXDecodedFrame original = wal ? make_wal_image() : make_typed_frame(RESOURCE_X_WIRE_IMAGE_ENVELOPE);
+	ResourceXDecodedFrame ship = {0};
+	ResourceXDecodedImageEnvelope *image = &original.body.image_envelope;
+	ResourceXDecodedBlockedToN *proof = &source.body.acquire_witness.original_proof;
+	ResourceXWireReject reject;
+	uint8 deps[128]; uint16 len = 0;
+	original.common = source.common;
+	original.common.action_node = original.common.logical_assertion.requester_node;
+	original.common.observed_mode = directory;
+	original.common.target_mode = PCM_STATE_X;
+	original.common.sender_connection_generation = 71;
+	original.common.flags = RESOURCE_X_COMMON_FLAG_AUTHORITY_WITH_IMAGE;
+	memset(image->request_tail, 0, sizeof(image->request_tail));
+	test_put_u64_be(image->request_tail, 71);
+	test_put_u64_be(image->request_tail + 8, original.common.assertion_sequence);
+	image->conversion_base_generation = original.common.base_authority_generation;
+	memcpy(image->source_fence, proof->source_fence, sizeof(image->source_fence));
+	image->source_carrier_generation = proof->source_carrier_generation;
+	image->requester_target_generation = original.common.assertion_sequence;
+	for (int i = 0; i < 16; i++) test_put_u64_be(deps + i * 8, image->dependencies[i]);
+	image->dependency_vector_crc32c = ship_crc(deps, sizeof(deps));
+	image->page_checksum = ship_crc(image->page_bytes, sizeof(image->page_bytes));
+	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, &original,
+		bytes + 1048, RESOURCE_X_IMAGE_V2_BYTES, &len, &reject));
+	UT_ASSERT_EQ(len, RESOURCE_X_IMAGE_V2_BYTES);
+	bytes[1048 + 73] = target;
+	test_reseal(bytes + 1048, RESOURCE_X_IMAGE_V2_BYTES);
+	original.common.target_mode = target;
+	original.common.semantic_crc32c = ship_get_u32(bytes + 1048 + 4);
+	proof->page_scn_lsn = image->page_scn_lsn;
+	proof->dependency_count = image->dependency_count;
+	memcpy(proof->dependencies, image->dependencies, sizeof(proof->dependencies));
+	proof->page_checksum = image->page_checksum;
+	proof->source_proof_crc32c = original.common.semantic_crc32c;
+	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_BLOCKED_TO_N, &source,
+		bytes, RESOURCE_X_SOURCE_WITNESS_V3_BYTES, &len, &reject));
+	UT_ASSERT_EQ(len, 1048);
+	ship.kind = RESOURCE_X_WIRE_IMAGE_ENVELOPE;
+	ship.payload_bytes = RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES;
+	ship.has_acquire_decision = true;
+	ship.common = source.common;
+	ship.body.acquire_image.source = source.body.acquire_witness;
+	ship.body.acquire_image.original_common = original.common;
+	ship.body.acquire_image.original_image = *image;
+	bytes[1] = RESOURCE_X_WIRE_IMAGE_ENVELOPE;
+	bytes[2] = RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES >> 8;
+	bytes[3] = RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES & 255;
+	test_reseal(bytes, RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES);
+	return ship;
+}
+static bool
+ship_round_trip(const uint8 *bytes, ResourceXDecodedFrame *decoded)
+{
+	uint8 encoded[RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES]; uint16 len = 0;
+	ResourceXWireReject reject;
+	bool ok = cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes,
+		RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES, decoded, &reject);
+	UT_ASSERT(ok); if (!ok) return false;
+	UT_ASSERT(decoded->has_acquire_decision && !decoded->has_acquire_intent && !decoded->blocked_has_remote_proof);
+	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, decoded,
+		encoded, sizeof(encoded), &len, &reject));
+	UT_ASSERT_EQ(len, sizeof(encoded)); UT_ASSERT(memcmp(bytes, encoded, sizeof(encoded)) == 0);
+	return true;
+}
+static void
+ship_encode_rejected(const ResourceXDecodedFrame *frame, uint16 capacity)
+{
+	uint8 encoded[RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES], original[RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES];
+	ResourceXWireReject reject; uint16 len = 77;
+	memset(encoded, 0xa6, sizeof(encoded)); memcpy(original, encoded, sizeof(original));
+	UT_ASSERT(!cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, frame, encoded,
+		capacity, &len, &reject));
+	UT_ASSERT_EQ(len, 77); UT_ASSERT(memcmp(encoded, original, sizeof(encoded)) == 0);
+}
+static void
+ship_reject(uint8 *bytes)
+{
+	test_reseal(bytes, RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES);
+	test_acquire_rejected(RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes, RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES);
+}
+UT_TEST(test_ship_layout_has_one_complete_a_source_ack_and_image)
+{
+	UT_ASSERT_EQ(RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES, 9800);
+	UT_ASSERT_EQ(sizeof(ResourceXAcquireImageV3), 9800);
+	UT_ASSERT_EQ(offsetof(ResourceXAcquireImageV3, original_image), 1048);
+	printf("# ship_frame_bytes=%zu ship_body_bytes=%zu\n", sizeof(ResourceXDecodedFrame), sizeof(ResourceXDecodedAcquireImage));
+}
+UT_TEST(test_ship_s_and_x_sources_support_both_target_modes)
+{
+	uint8 bytes[9800]; ResourceXDecodedFrame decoded;
+	for (int source = PCM_STATE_S; source <= PCM_STATE_X; source++)
+		for (int target = PCM_STATE_S; target <= PCM_STATE_X; target++) {
+			(void)make_ship_bytes(bytes, source, target, false);
+			if (ship_round_trip(bytes, &decoded)) {
+				UT_ASSERT_EQ(decoded.body.acquire_image.original_common.target_mode, target);
+				UT_ASSERT_EQ(decoded.body.acquire_image.source.original_ack.target_mode, target == PCM_STATE_S ? PCM_STATE_S : PCM_STATE_N);
+				UT_ASSERT(memcmp(bytes + 1048 + 328, decoded.body.acquire_image.original_image.page_bytes, 8192) == 0);
+				if (target == PCM_STATE_S)
+					test_acquire_rejected(RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes + 1048, 8752);
+			}
+		}
+}
+UT_TEST(test_ship_full_wal_proof_is_preserved)
+{
+	uint8 bytes[9800]; ResourceXDecodedFrame decoded;
+	(void)make_ship_bytes(bytes, PCM_STATE_X, PCM_STATE_X, true);
+	if (ship_round_trip(bytes, &decoded)) {
+		UT_ASSERT_EQ(decoded.body.acquire_image.original_image.image_flags, RESOURCE_X_IMAGE_HAS_WAL);
+		UT_ASSERT_EQ(decoded.body.acquire_image.original_image.page_wal.flags, CLUSTER_PAGE_WAL_NATIVE_FLUSHED);
+	}
+}
+UT_TEST(test_ship_every_prefix_and_extra_byte_is_rejected)
+{
+	uint8 bytes[9801]; (void)make_ship_bytes(bytes, PCM_STATE_X, PCM_STATE_X, false);
+	for (uint16 n = 0; n < 9800; n++) test_acquire_rejected(RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes, n);
+	test_acquire_rejected(RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes, 9801);
+}
+UT_TEST(test_ship_only_image_family_and_kind_are_accepted)
+{
+	uint8 bytes[9800]; (void)make_ship_bytes(bytes, PCM_STATE_X, PCM_STATE_X, false);
+	for (int type = 14; type <= 18; type++) if (type != RESOURCE_X_MSG_IMAGE_OR_GRANT)
+		test_acquire_rejected(type, bytes, sizeof(bytes));
+	for (int kind = 1; kind <= 11; kind++) if (kind != RESOURCE_X_WIRE_IMAGE_ENVELOPE) {
+		bytes[1] = kind; ship_reject(bytes);
+	}
+}
+UT_TEST(test_ship_version_length_and_outer_crc_are_exact)
+{
+	uint8 bytes[9800]; const int offsets[] = {0,2,4,8000};
+	for (unsigned n = 0; n < lengthof(offsets); n++) {
+		(void)make_ship_bytes(bytes, PCM_STATE_X, PCM_STATE_X, false);
+		bytes[offsets[n]] ^= 1;
+		test_acquire_rejected(RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes, sizeof(bytes));
+	}
+}
+UT_TEST(test_ship_reserved_bytes_at_all_three_layers_reject)
+{
+	uint8 bytes[9800]; const int offsets[] = {82,153,214,736+82,1048+82,1048+8520+132};
+	for (unsigned n = 0; n < lengthof(offsets); n++) {
+		(void)make_ship_bytes(bytes, PCM_STATE_X, PCM_STATE_X, false); bytes[offsets[n]] = 1;
+		test_reseal(bytes+736,312); test_reseal(bytes+1048,8752); ship_reject(bytes);
+	}
+}
+UT_TEST(test_ship_inner_image_crc_is_independent_of_outer_reseal)
+{
+	uint8 bytes[9800]; (void)make_ship_bytes(bytes, PCM_STATE_X, PCM_STATE_X, false);
+	bytes[1048+400] ^= 1; ship_reject(bytes);
+}
+UT_TEST(test_ship_original_ack_crc_is_independent_of_outer_reseal)
+{
+	uint8 bytes[9800]; (void)make_ship_bytes(bytes, PCM_STATE_X, PCM_STATE_X, false);
+	bytes[736+296] ^= 1; ship_reject(bytes);
+}
+UT_TEST(test_ship_ack_must_name_the_original_image_crc)
+{
+	uint8 bytes[9800]; ResourceXDecodedFrame frame = make_ship_bytes(bytes, PCM_STATE_X, PCM_STATE_X, false);
+	frame.body.acquire_image.source.original_proof.source_proof_crc32c ^= 1; ship_encode_rejected(&frame, 9800);
+}
+UT_TEST(test_ship_original_image_key_and_domains_match_a)
+{
+	uint8 bytes[9800];
+	for (int n = 0; n < 8; n++) {
+		ResourceXDecodedFrame frame = make_ship_bytes(bytes, PCM_STATE_X, PCM_STATE_X, false);
+		ResourceXDecodedCommon *c = &frame.body.acquire_image.original_common;
+		if (n==0) c->logical_assertion.resource.blockNum++;
+		if (n==1) c->logical_assertion.requester_node++;
+		if (n==2) c->base_authority_generation++;
+		if (n==3) c->authority_generation++;
+		if (n==4) c->resource_formation++;
+		if (n==5) c->master_session_incarnation++;
+		if (n==6) c->assertion_sequence++;
+		if (n==7) c->ordered_lane++;
+		ship_encode_rejected(&frame,9800);
+	}
+}
+UT_TEST(test_ship_original_image_target_source_and_requester_are_exact)
+{
+	uint8 bytes[9800];
+	for (int n = 0; n < 6; n++) {
+		ResourceXDecodedFrame frame = make_ship_bytes(bytes, PCM_STATE_X, PCM_STATE_S, false);
+		ResourceXDecodedCommon *c = &frame.body.acquire_image.original_common;
+		if(n==0)c->target_mode=PCM_STATE_X; if(n==1)c->observed_mode=PCM_STATE_S;
+		if(n==2)c->action_node=1; if(n==3)c->outcome=RESOURCE_X_OUTCOME_RETRY;
+		if(n==4)c->source_candidate=1; if(n==5)c->retain_pi_if_dirty=1;
+		ship_encode_rejected(&frame,9800);
+	}
+}
+UT_TEST(test_ship_image_request_tail_and_source_connection_remain_bound)
+{
+	uint8 bytes[9800];
+	for(int n=0;n<4;n++) {
+		ResourceXDecodedFrame frame=make_ship_bytes(bytes,PCM_STATE_X,PCM_STATE_X,false);
+		ResourceXDecodedImageEnvelope *i=&frame.body.acquire_image.original_image;
+		if(n==0)i->request_tail[7]^=1; if(n==1)i->request_tail[15]^=1;
+		if(n==2)i->request_tail[19]=1; if(n==3)i->source_fence[19]^=1;
+		ship_encode_rejected(&frame,9800);
+	}
+}
+UT_TEST(test_ship_source_proof_and_image_scalars_must_agree)
+{
+	uint8 bytes[9800];
+	for(int n=0;n<8;n++) {
+		ResourceXDecodedFrame frame=make_ship_bytes(bytes,PCM_STATE_X,PCM_STATE_X,false);
+		ResourceXDecodedBlockedToN *p=&frame.body.acquire_image.source.original_proof;
+		if(n==0)p->source_carrier_generation++; if(n==1)p->page_scn_lsn++;
+		if(n==2)p->page_checksum++; if(n==3)p->dependency_count=0;
+		if(n==4)p->dependencies[0]++; if(n==5)p->source_fence[12]^=1;
+		if(n==6)p->source_disposition++; if(n==7)p->proof_kind++;
+		ship_encode_rejected(&frame,9800);
+	}
+}
+UT_TEST(test_ship_page_checksum_cannot_be_hidden_by_wire_crc)
+{
+	uint8 bytes[9800]; ResourceXDecodedFrame frame=make_ship_bytes(bytes,PCM_STATE_X,PCM_STATE_X,false);
+	frame.body.acquire_image.original_image.page_bytes[511]^=1; ship_encode_rejected(&frame,9800);
+	/* All three wire CRCs can be valid while the source page checksum is
+	 * stale. The image remains unusable, even with a matching ACK reference. */
+	bytes[1048+328+511]^=1;
+	test_reseal(bytes+1048,8752);
+	test_put_u32_be(bytes+736+284,ship_get_u32(bytes+1048+4));
+	test_reseal(bytes+736,312);
+	ship_reject(bytes);
+}
+UT_TEST(test_ship_dependency_vector_crc_is_canonical)
+{
+	uint8 bytes[9800]; ResourceXDecodedFrame frame=make_ship_bytes(bytes,PCM_STATE_X,PCM_STATE_X,false);
+	frame.body.acquire_image.original_image.dependency_vector_crc32c^=1; ship_encode_rejected(&frame,9800);
+}
+UT_TEST(test_ship_wal_binding_shape_and_page_stay_strict)
+{
+	uint8 bytes[9800];
+	for(int n=0;n<4;n++) {
+		ResourceXDecodedFrame frame=make_ship_bytes(bytes,PCM_STATE_X,PCM_STATE_X,true);
+		ResourceXDecodedImageEnvelope *i=&frame.body.acquire_image.original_image;
+		if(n==0)i->page_wal.identity.blockno++; if(n==1)i->page_wal.version.mutation_token++;
+		if(n==2)i->page_wal.flags=0; if(n==3)i->image_flags=0;
+		ship_encode_rejected(&frame,9800);
+	}
+}
+UT_TEST(test_ship_unused_wal_body_must_be_empty)
+{
+	uint8 bytes[9800]; ResourceXDecodedFrame frame=make_ship_bytes(bytes,PCM_STATE_X,PCM_STATE_X,false);
+	frame.body.acquire_image.original_image.page_wal.record_end=42; ship_encode_rejected(&frame,9800);
+}
+UT_TEST(test_ship_source_is_remote_and_selected_by_master)
+{
+	uint8 bytes[9800];
+	for(int n=0;n<4;n++) {
+		ResourceXDecodedFrame frame=make_ship_bytes(bytes,PCM_STATE_S,PCM_STATE_X,false);
+		ResourceXDecodedAcquireWitness *w=&frame.body.acquire_image.source;
+		if(n==0)w->decision.source_kind=RESOURCE_X_ACQUIRE_SOURCE_LOCAL_CURRENT;
+		if(n==1)w->decision.source_kind=RESOURCE_X_ACQUIRE_SOURCE_DISK;
+		if(n==2)frame.common.action_node=2; if(n==3)w->has_source_proof=false;
+		ship_encode_rejected(&frame,9800);
+	}
+}
+UT_TEST(test_ship_wrong_discriminators_and_legacy_flags_reject)
+{
+	uint8 bytes[9800];
+	for(int n=0;n<5;n++) {
+		ResourceXDecodedFrame frame=make_ship_bytes(bytes,PCM_STATE_X,PCM_STATE_X,false);
+		if(n==0)frame.has_acquire_decision=false; if(n==1)frame.has_acquire_intent=true;
+		if(n==2)frame.blocked_has_remote_proof=true; if(n==3)frame.common.flags=4;
+		if(n==4)frame.body.acquire_image.original_common.flags=RESOURCE_X_COMMON_FLAG_PI_ESTABLISHED;
+		ship_encode_rejected(&frame,9800);
+	}
+}
+UT_TEST(test_ship_zero_exhausted_and_mismatched_generations_reject)
+{
+	uint8 bytes[9800];
+	for(int n=0;n<5;n++) {
+		ResourceXDecodedFrame frame=make_ship_bytes(bytes,PCM_STATE_X,PCM_STATE_X,false);
+		if(n==0)frame.common.sender_connection_generation=UINT32_MAX;
+		if(n==1)frame.body.acquire_image.original_common.sender_connection_generation=UINT32_MAX;
+		if(n==2)frame.body.acquire_image.original_common.sender_connection_generation=0;
+		if(n==3)frame.body.acquire_image.source.decision.holders[1].boot_incarnation++;
+		if(n==4)frame.body.acquire_image.source.decision.episode.reservation_token=0;
+		ship_encode_rejected(&frame,9800);
+	}
+}
+UT_TEST(test_ship_only_ok_terminal_results_are_valid)
+{
+	uint8 bytes[9800];
+	for(int outcome=0;outcome<=RESOURCE_X_OUTCOME_CORRUPT;outcome++) if(outcome!=RESOURCE_X_OUTCOME_OK) {
+		ResourceXDecodedFrame frame=make_ship_bytes(bytes,PCM_STATE_X,PCM_STATE_X,false);
+		frame.common.outcome=outcome; ship_encode_rejected(&frame,9800);
+	}
+}
+UT_TEST(test_ship_every_insufficient_capacity_preserves_output)
+{
+	uint8 bytes[9800]; ResourceXDecodedFrame frame=make_ship_bytes(bytes,PCM_STATE_X,PCM_STATE_X,false);
+	for(uint16 n=0;n<9800;n++)ship_encode_rejected(&frame,n);
+}
+UT_TEST(test_ship_sender_rebind_only_changes_outer_header)
+{
+	uint8 bytes[9800],before[9800]; ResourceXDecodedFrame decoded; ResourceXWireReject reject;
+	(void)make_ship_bytes(bytes,PCM_STATE_X,PCM_STATE_X,false); memcpy(before,bytes,sizeof(bytes));
+	UT_ASSERT(cluster_resource_x_wire_rebind_sender_generation(RESOURCE_X_MSG_IMAGE_OR_GRANT,bytes,9800,999,&reject));
+	if(ship_round_trip(bytes,&decoded))UT_ASSERT_EQ(decoded.common.sender_connection_generation,999);
+	UT_ASSERT(memcmp(before+96,bytes+96,9800-96)==0);
+	for(int i=0;i<96;i++) if((i<4||i>7)&&(i<76||i>79))UT_ASSERT_EQ(before[i],bytes[i]);
+}
+UT_TEST(test_ship_bad_inner_frame_or_exhausted_rebind_is_atomic)
+{
+	uint8 bytes[9800],before[9800]; ResourceXWireReject reject;
+	for(int n=0;n<2;n++) {
+		(void)make_ship_bytes(bytes,PCM_STATE_X,PCM_STATE_X,false);
+		if(n==0){bytes[1048+200]^=1;test_reseal(bytes,9800);} memcpy(before,bytes,sizeof(bytes));
+		UT_ASSERT(!cluster_resource_x_wire_rebind_sender_generation(RESOURCE_X_MSG_IMAGE_OR_GRANT,bytes,9800,n?UINT32_MAX:999,&reject));
+		UT_ASSERT(memcmp(before,bytes,sizeof(bytes))==0);
+	}
+}
+UT_TEST(test_ship_original_image_version_length_and_kind_are_strict)
+{
+	uint8 bytes[9800]; const int offsets[]={1048,1049,1050};
+	for(unsigned n=0;n<lengthof(offsets);n++) {
+		(void)make_ship_bytes(bytes,PCM_STATE_X,PCM_STATE_X,false);bytes[offsets[n]]^=1;
+		test_reseal(bytes+1048,8752);ship_reject(bytes);
+	}
+}
+UT_TEST(test_ship_native_and_master_generation_axes_remain_independent)
+{
+	uint8 bytes[9800]; ResourceXDecodedFrame decoded;
+	(void)make_ship_bytes(bytes,PCM_STATE_S,PCM_STATE_S,false);
+	if(ship_round_trip(bytes,&decoded)) {
+		UT_ASSERT_EQ(decoded.body.acquire_image.source.decision.holders[1].grant_generation,51);
+		UT_ASSERT_EQ(decoded.body.acquire_image.original_image.source_carrier_generation,78);
+	}
+}
+UT_TEST(test_ship_source_ack_and_image_are_byte_exact_after_round_trip)
+{
+	uint8 bytes[9800],before[9800]; ResourceXDecodedFrame decoded;
+	(void)make_ship_bytes(bytes,PCM_STATE_X,PCM_STATE_X,true);memcpy(before,bytes,sizeof(bytes));
+	if(ship_round_trip(bytes,&decoded)) {
+		UT_ASSERT_EQ(decoded.body.acquire_image.source.original_proof.source_proof_crc32c,ship_get_u32(before+1052));
+		UT_ASSERT_EQ(decoded.body.acquire_image.source.original_ack.sender_connection_generation,83);
+		UT_ASSERT_EQ(decoded.body.acquire_image.original_common.sender_connection_generation,71);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(91);
+	UT_PLAN(119);
 	UT_RUN(test_wire_kind_and_proof_domains_are_closed);
 	UT_RUN(test_reused_message_numbers_remain_exact);
 	UT_RUN(test_common_wire_layout_is_exact);
@@ -2636,6 +2994,34 @@ main(void)
 	UT_RUN(test_witness_sender_rebind_changes_only_outer_transport_and_crc);
 	UT_RUN(test_witness_rebind_refuses_malformed_nested_or_exhausted_sender);
 	UT_RUN(test_witness_original_pi_proof_and_native_bytes_are_never_synthesized);
+	UT_RUN(test_ship_layout_has_one_complete_a_source_ack_and_image);
+	UT_RUN(test_ship_s_and_x_sources_support_both_target_modes);
+	UT_RUN(test_ship_full_wal_proof_is_preserved);
+	UT_RUN(test_ship_every_prefix_and_extra_byte_is_rejected);
+	UT_RUN(test_ship_only_image_family_and_kind_are_accepted);
+	UT_RUN(test_ship_version_length_and_outer_crc_are_exact);
+	UT_RUN(test_ship_reserved_bytes_at_all_three_layers_reject);
+	UT_RUN(test_ship_inner_image_crc_is_independent_of_outer_reseal);
+	UT_RUN(test_ship_original_ack_crc_is_independent_of_outer_reseal);
+	UT_RUN(test_ship_ack_must_name_the_original_image_crc);
+	UT_RUN(test_ship_original_image_key_and_domains_match_a);
+	UT_RUN(test_ship_original_image_target_source_and_requester_are_exact);
+	UT_RUN(test_ship_image_request_tail_and_source_connection_remain_bound);
+	UT_RUN(test_ship_source_proof_and_image_scalars_must_agree);
+	UT_RUN(test_ship_page_checksum_cannot_be_hidden_by_wire_crc);
+	UT_RUN(test_ship_dependency_vector_crc_is_canonical);
+	UT_RUN(test_ship_wal_binding_shape_and_page_stay_strict);
+	UT_RUN(test_ship_unused_wal_body_must_be_empty);
+	UT_RUN(test_ship_source_is_remote_and_selected_by_master);
+	UT_RUN(test_ship_wrong_discriminators_and_legacy_flags_reject);
+	UT_RUN(test_ship_zero_exhausted_and_mismatched_generations_reject);
+	UT_RUN(test_ship_only_ok_terminal_results_are_valid);
+	UT_RUN(test_ship_every_insufficient_capacity_preserves_output);
+	UT_RUN(test_ship_sender_rebind_only_changes_outer_header);
+	UT_RUN(test_ship_bad_inner_frame_or_exhausted_rebind_is_atomic);
+	UT_RUN(test_ship_original_image_version_length_and_kind_are_strict);
+	UT_RUN(test_ship_native_and_master_generation_axes_remain_independent);
+	UT_RUN(test_ship_source_ack_and_image_are_byte_exact_after_round_trip);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

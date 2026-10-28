@@ -51,6 +51,7 @@ typedef enum ResourceXAcquireSource {
 /* One ACK-family frame retains A and the original holder completion. */
 #define RESOURCE_X_WITNESS_V3_BYTES (RESOURCE_X_DECISION_V3_BYTES + RESOURCE_X_CONTROL_V1_BYTES)
 #define RESOURCE_X_SOURCE_WITNESS_V3_BYTES (RESOURCE_X_DECISION_V3_BYTES + RESOURCE_X_PROOF_V1_BYTES)
+#define RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES (RESOURCE_X_SOURCE_WITNESS_V3_BYTES + RESOURCE_X_IMAGE_V2_BYTES)
 
 #define RESOURCE_X_MSG_ASSERT_X PGRAC_IC_MSG_GCS_BLOCK_REQUEST
 #define RESOURCE_X_MSG_IMAGE_OR_GRANT PGRAC_IC_MSG_GCS_BLOCK_REPLY
@@ -280,6 +281,11 @@ typedef struct ResourceXImageEnvelopeV2 {
 	uint8 page_wal[232];
 } ResourceXImageEnvelopeV2;
 
+typedef struct ResourceXAcquireImageV3 {
+	ResourceXAcquireSourceWitnessV3 source;
+	ResourceXImageEnvelopeV2 original_image;
+} ResourceXAcquireImageV3;
+
 typedef struct ResourceXInstallSettlementV1 {
 	ResourceXWireCommonV1 common;
 	uint8 conversion_base_generation[8];
@@ -439,6 +445,12 @@ typedef struct ResourceXDecodedAcquireWitness {
 	bool has_source_proof;
 } ResourceXDecodedAcquireWitness;
 
+typedef struct ResourceXDecodedAcquireImage {
+	ResourceXDecodedAcquireWitness source;
+	ResourceXDecodedCommon original_common;
+	ResourceXDecodedImageEnvelope original_image;
+} ResourceXDecodedAcquireImage;
+
 typedef struct ResourceXDecodedFrame {
 	ResourceXWireKind kind;
 	uint16 payload_bytes;
@@ -454,9 +466,14 @@ typedef struct ResourceXDecodedFrame {
 		ResourceXDecodedAcquireIntent acquire_intent;
 		ResourceXDecodedAcquireDecision acquire_decision;
 		ResourceXDecodedAcquireWitness acquire_witness;
+		ResourceXDecodedAcquireImage acquire_image;
 	} body;
 	bool has_acquire_decision; /* V3 A or A+original ACK, never legacy completion. */
 } ResourceXDecodedFrame;
+
+StaticAssertDecl(sizeof(ResourceXAcquireImageV3) == RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES
+				 && offsetof(ResourceXAcquireImageV3, original_image) == RESOURCE_X_SOURCE_WITNESS_V3_BYTES,
+				 "combined acquisition image retains its complete source witness and image");
 
 StaticAssertDecl(sizeof(ResourceXAcquireWitnessV3) == RESOURCE_X_WITNESS_V3_BYTES
 				 && sizeof(ResourceXAcquireSourceWitnessV3) == RESOURCE_X_SOURCE_WITNESS_V3_BYTES,
