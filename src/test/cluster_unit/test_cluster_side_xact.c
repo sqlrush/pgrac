@@ -12552,10 +12552,21 @@ UT_TEST(test_cold_terminal_frame_refusal_preserves_pi_inspection)
 #include "test_cluster_side_relmap_terminal.inc"
 #include "test_cluster_side_clog_full.inc"
 #include "test_cluster_side_clog_witness.inc"
+#include "test_cluster_side_clog_applied.inc"
 
 int
 main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_CLOG_APPLIED") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_clog_applied_requires_original_cold_record_success);
+		UT_RUN(test_clog_applied_failed_attempt_and_error_keep_no_reusable_success);
+		UT_RUN(test_clog_applied_cannot_borrow_other_plan_or_whole_source_apply);
+		UT_RUN(test_clog_applied_requires_exact_identity_and_final_owner_after_cleanup);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
+
 	if (getenv("PGRAC_PRE2_TEST_CLOG_WITNESS") != NULL) {
 		UT_PLAN(4);
 	UT_RUN(test_clog_witness_keeps_complete_native_bytes_after_reader_reuse);
@@ -12573,7 +12584,7 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(197);
+	UT_PLAN(201);
 	UT_RUN(test_clog_witness_keeps_complete_native_bytes_after_reader_reuse);
 	UT_RUN(test_clog_witness_refuses_changed_full_header_payload_and_source);
 	UT_RUN(test_clog_witness_requires_original_physical_recovery_binding);
@@ -12772,6 +12783,10 @@ main(void)
 	UT_RUN(test_cold_history_abort_identity_does_not_authorize_replay);
 	UT_RUN(test_cold_owner_abort_requires_durable_tt_and_native_clog_before_projection);
 	UT_RUN(test_cold_whole_source_barrier_precedes_every_native_effect);
+	UT_RUN(test_clog_applied_requires_original_cold_record_success);
+	UT_RUN(test_clog_applied_failed_attempt_and_error_keep_no_reusable_success);
+	UT_RUN(test_clog_applied_cannot_borrow_other_plan_or_whole_source_apply);
+	UT_RUN(test_clog_applied_requires_exact_identity_and_final_owner_after_cleanup);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
