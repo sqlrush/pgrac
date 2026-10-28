@@ -1284,3 +1284,21 @@
 | `vis_unknown_count` | 十进制整数文本 | `vis` / 未知的累计计数。 | 非零或异常枚举需要与同类成功计数、epoch 和日志关联分析。 |
 | `buf_hit_count` | 十进制整数文本 | `buf` / `hit`的累计计数。 | 先做时间窗增量；单个绝对值不能直接判定当前故障。 |
 | `buf_miss_count` | 十进制整数文本 | `buf` / `miss`的累计计数。 | 先做时间窗增量；单个绝对值不能直接判定当前故障。 |
+
+
+## Cleaner 无进展原因计数（分类 `ctrc`）
+
+这些 uint64 十进制计数在本 postmaster 生命周期内跨 cleaner worker 累计。每次正常完成的 pass 若该 worker 没有真实生命周期进展，只按其最终观察到的一个原因加一；不表示该 pass 的全部原因。未执行的 pass 与 ERROR 不计，其他 worker 的全局进展和重复发送不算本 worker 的进展。各键独立采样，宜比较时间窗增量；无进展不证明 idle、停机完成、槽可复用或 undo 可释放。
+
+| 键 | 值 | 读法 |
+|---|---|---|
+| `ctrc_phase_no_progress_stats_available` | `true` / `false` | `false` 时省略以下 origin 和全部原因计数，不将不可用展示成 0。 |
+| `ctrc_phase_no_progress_origin_node_id` | 非负整数文本 | 执行 cleaner 的本实例节点号，从 0 开始；不是被处理事务的节点号或集群总数。 |
+| `ctrc_phase_no_progress_by_reason.NONE` | uint64 十进制文本 | 最终未记录阻塞原因的无进展 pass，包括完成的空扫描。 |
+| `ctrc_phase_no_progress_by_reason.PREPARED_DRAIN` | uint64 十进制文本 | 最终原因是 prepared drain 的无进展 pass。 |
+| `ctrc_phase_no_progress_by_reason.RESOURCE_X` | uint64 十进制文本 | 最终原因是资源 X 获取的无进展 pass。 |
+| `ctrc_phase_no_progress_by_reason.PAGE_REVALIDATE` | uint64 十进制文本 | 最终原因是页重新验证的无进展 pass。 |
+| `ctrc_phase_no_progress_by_reason.WAL_DURABILITY` | uint64 十进制文本 | 最终原因是 WAL 持久性的无进展 pass。 |
+| `ctrc_phase_no_progress_by_reason.PARTICIPANT_ACK` | uint64 十进制文本 | 最终原因是参与者 ACK 的无进展 pass。 |
+| `ctrc_phase_no_progress_by_reason.BLOCK0_CERTIFICATE` | uint64 十进制文本 | 最终原因是 block0 certificate 的无进展 pass。 |
+| `ctrc_phase_no_progress_by_reason.BLOCKED` | uint64 十进制文本 | 最终原因是 BLOCKED 的无进展 pass；结合原阶段与日志定位。 |

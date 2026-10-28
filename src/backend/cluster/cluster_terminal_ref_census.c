@@ -1731,6 +1731,7 @@ typedef struct ClusterCtrcSharedHeader {
 	pg_atomic_uint32 test_barrier_phase;
 	CtrcCleanerWorkerObservationShared workers[CLUSTER_CTRC_CLEANER_WORKERS];
 	uint8 reserved[24];
+	pg_atomic_uint64 cleaner_no_progress[CTRC_CLEANER_REASON_COUNT];
 } ClusterCtrcSharedHeader;
 
 static bool
@@ -2673,6 +2674,8 @@ cluster_ctrc_shmem_init(void)
 		CtrcShared->global_request_generation = 1;
 		for (int i = 0; i < CTRC_STAT_COUNT; i++)
 			pg_atomic_init_u64(&CtrcShared->stats[i], 0);
+		for (int i = 0; i < CTRC_CLEANER_REASON_COUNT; i++)
+			pg_atomic_init_u64(&CtrcShared->cleaner_no_progress[i], 0);
 		pg_atomic_init_u64(&CtrcShared->unqualified_registration_generation, 1);
 		pg_atomic_init_u64(&CtrcShared->test_barrier_hit_count, 0);
 		pg_atomic_init_u32(&CtrcShared->test_barrier_phase, CTRC_TEST_BARRIER_NONE);
@@ -2763,6 +2766,18 @@ cluster_ctrc_cleaner_worker_observation(unsigned worker_id,
 	out->pending_observed_age_ms = pg_atomic_read_u64(&row->pending_observed_age_ms);
 	out->observed_at_us = pg_atomic_read_u64(&row->observed_at_us);
 	out->reason = (uint32)cluster_ctrc_cleaner_worker_reason(worker_id);
+	return true;
+}
+
+bool
+cluster_ctrc_no_progress_stats_snapshot(ClusterCtrcNoProgressStats *out)
+{
+	if (out == NULL || !ctrc_runtime_attached() || cluster_node_id < 0
+		|| cluster_node_id >= CLUSTER_CTRC_MAX_PARTICIPANTS)
+		return false;
+	out->origin_node_id = cluster_node_id;
+	for (int i = 0; i < CTRC_CLEANER_REASON_COUNT; i++)
+		out->by_reason[i] = pg_atomic_read_u64(&CtrcShared->cleaner_no_progress[i]);
 	return true;
 }
 
@@ -2969,6 +2984,12 @@ cluster_ctrc_cleaner_reason_get(void)
 void
 cluster_ctrc_cleaner_reason_set(ClusterCtrcCleanerReason reason pg_attribute_unused())
 {}
+
+bool
+cluster_ctrc_no_progress_stats_snapshot(ClusterCtrcNoProgressStats *out pg_attribute_unused())
+{
+	return false;
+}
 
 bool
 cluster_ctrc_debug_snapshot(ClusterCtrcDebugSnapshot *snapshot)
@@ -6615,6 +6636,13 @@ cluster_ctrc_cleaner_run_pass(void)
 		MemSet(&CtrcBatch, 0, sizeof(CtrcBatch));
 	}
 	PG_END_TRY();
+	/* One final observed reason, not an idle or release proof. Only this
+	 * worker's real lifecycle progress can exclude a completed pass. */
+	if (CtrcLocalProgress == progress_before) {
+		ClusterCtrcCleanerReason reason = cluster_ctrc_cleaner_worker_reason(CtrcWorkerId);
+
+		pg_atomic_fetch_add_u64(&CtrcShared->cleaner_no_progress[reason], 1);
+	}
 	CtrcLocalPasses++;
 	return CtrcLocalProgress != progress_before;
 #else

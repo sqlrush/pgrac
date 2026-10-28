@@ -4606,6 +4606,25 @@ dump_multixact_current(ReturnSetInfo *rsinfo)
 }
 
 static void
+dump_ctrc_no_progress(ReturnSetInfo *rsinfo)
+{
+	ClusterCtrcNoProgressStats stats;
+	bool available = cluster_ctrc_no_progress_stats_snapshot(&stats);
+
+	emit_row(rsinfo, "ctrc", "ctrc_phase_no_progress_stats_available",
+			 available ? "true" : "false");
+	if (!available)
+		return;
+	emit_row(rsinfo, "ctrc", "ctrc_phase_no_progress_origin_node_id",
+			 fmt_int64(stats.origin_node_id));
+	for (int i = 0; i < CTRC_CLEANER_REASON_COUNT; i++)
+		emit_row(rsinfo, "ctrc",
+				 psprintf("ctrc_phase_no_progress_by_reason.%s",
+						  cluster_ctrc_cleaner_reason_name((ClusterCtrcCleanerReason)i)),
+				 fmt_uint64(stats.by_reason[i]));
+}
+
+static void
 dump_ctrc(ReturnSetInfo *rsinfo)
 {
 	ClusterCtrcDebugSnapshot snapshot;
@@ -4617,6 +4636,7 @@ dump_ctrc(ReturnSetInfo *rsinfo)
 		emit_row(rsinfo, "ctrc", cluster_ctrc_stat_name((ClusterCtrcStatId)i),
 				 fmt_int64((int64)cluster_ctrc_stat_get((ClusterCtrcStatId)i)));
 
+	dump_ctrc_no_progress(rsinfo);
 	MemSet(&snapshot, 0, sizeof(snapshot));
 	if (!cluster_ctrc_debug_snapshot(&snapshot))
 		return;

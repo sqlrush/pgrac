@@ -90,6 +90,19 @@ static void test_pool_upgrade(void);
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+
+#ifndef CLUSTER_CTRC_NO_PROGRESS_STATS_V1
+typedef struct ClusterCtrcNoProgressStats {
+	int32 origin_node_id;
+	uint64 by_reason[CTRC_CLEANER_REASON_COUNT];
+} ClusterCtrcNoProgressStats;
+
+static bool
+cluster_ctrc_no_progress_stats_snapshot(ClusterCtrcNoProgressStats *out pg_attribute_unused())
+{
+	return false;
+}
+#endif
 #include "cluster/cluster_undo_cleaner.h"
 
 /* The parent still executes its real shared body, returning no path rather
@@ -796,11 +809,13 @@ cluster_conf_declared_node_count_early(void)
 	return 4;
 }
 
+static bool test_shmem_attach;
+
 void *
 ShmemInitStruct(const char *name pg_attribute_unused(), Size size, bool *found)
 {
-	*found = false;
-	return calloc(1, size);
+	*found = test_shmem_attach;
+	return *found ? CtrcShared : calloc(1, size);
 }
 
 void
@@ -909,6 +924,7 @@ reset_fixture(void)
 	external_lock_hook = NULL;
 	if (held_count != 0 || allocated != 0)
 		abort();
+	test_shmem_attach = false;
 	free(CtrcShared);
 	CtrcShared = NULL;
 	cluster_ctrc_shmem_init();
@@ -4015,6 +4031,7 @@ UT_TEST(test_ack_batch_final_count_summary_and_identity_faults_are_isolated)
  * and finally cleanup. Only physical I/O/network leaves are fixture inputs. */
 static bool driver_other_progress;
 static bool driver_interrupt;
+static int driver_final_reason = -1;
 
 static bool
 driver_no_receipt(void)
@@ -4049,6 +4066,8 @@ driver_dispatch_boundary(const ClusterCtrcCloseDispatch *dispatches pg_attribute
 		cluster_ctrc_stat_bump(CTRC_STAT_SEMANTIC_PROGRESS);
 	if (driver_interrupt)
 		pg_re_throw();
+	if (driver_final_reason >= 0)
+		cluster_ctrc_cleaner_reason_set((ClusterCtrcCleanerReason)driver_final_reason);
 	origin_dispatch_returned = true;
 }
 
@@ -7218,6 +7237,120 @@ UT_TEST(test_actual_worker_active_pass_does_not_sample_native_without_source)
 	exercise_worker_active_pass(3);
 }
 
+/* Missing counters, global-progress confusion, ERROR counting and reading
+ * worker0 instead of the executing worker must all fail these tests. */
+UT_TEST(test_no_progress_counts_only_normally_completed_local_passes)
+{
+	ClusterCtrcNoProgressStats stats = { 0 };
+	bool caught = false;
+
+	reset_fixture();
+	driver_other_progress = true;
+	driver_interrupt = false;
+	driver_final_reason = -1;
+	UT_ASSERT(!ctrc_fixture_run_pass());
+	UT_ASSERT(cluster_ctrc_no_progress_stats_snapshot(&stats));
+	UT_ASSERT_EQ(stats.by_reason[CTRC_CLEANER_REASON_NONE], 0);
+	UT_ASSERT(bind_test_worker(0));
+	UT_ASSERT(!ctrc_fixture_run_pass());
+	UT_ASSERT(cluster_ctrc_no_progress_stats_snapshot(&stats));
+	UT_ASSERT_EQ(stats.by_reason[CTRC_CLEANER_REASON_NONE], 1);
+	UT_ASSERT_EQ(CtrcLocalProgress, 0);
+	UT_ASSERT_EQ(cluster_ctrc_stat_get(CTRC_STAT_SEMANTIC_PROGRESS), 1);
+	seed_origin(0, 0);
+	UT_ASSERT(ctrc_fixture_run_pass());
+	UT_ASSERT(cluster_ctrc_no_progress_stats_snapshot(&stats));
+	UT_ASSERT_EQ(stats.by_reason[CTRC_CLEANER_REASON_NONE], 1);
+	driver_interrupt = true;
+	PG_TRY();
+	{
+		(void)ctrc_fixture_run_pass();
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(CtrcLocalProgress, 1);
+	UT_ASSERT(cluster_ctrc_no_progress_stats_snapshot(&stats));
+	UT_ASSERT_EQ(stats.by_reason[CTRC_CLEANER_REASON_NONE], 1);
+	UT_ASSERT_EQ(CtrcLocalPasses, 2);
+	UT_ASSERT_EQ(CtrcBatch.active, false);
+	UT_ASSERT_EQ(held_count, 0);
+	driver_interrupt = driver_other_progress = false;
+}
+
+UT_TEST(test_no_progress_uses_executing_workers_original_final_reason)
+{
+	ClusterCtrcNoProgressStats stats = { 0 };
+
+	reset_fixture();
+	cluster_ctrc_cleaner_reason_set(CTRC_CLEANER_REASON_RESOURCE_X);
+	UT_ASSERT(bind_test_worker(1));
+	for (int reason = 0; reason < CTRC_CLEANER_REASON_COUNT; reason++) {
+		driver_final_reason = reason;
+		UT_ASSERT(!ctrc_fixture_run_pass());
+		UT_ASSERT(cluster_ctrc_no_progress_stats_snapshot(&stats));
+		for (int i = 0; i < CTRC_CLEANER_REASON_COUNT; i++)
+			UT_ASSERT_EQ(stats.by_reason[i], i <= reason ? 1 : 0);
+		UT_ASSERT_EQ(cluster_ctrc_cleaner_reason_get(), CTRC_CLEANER_REASON_RESOURCE_X);
+	}
+	driver_final_reason = CTRC_CLEANER_REASON_PARTICIPANT_ACK;
+	UT_ASSERT(!ctrc_fixture_run_pass());
+	UT_ASSERT(cluster_ctrc_no_progress_stats_snapshot(&stats));
+	UT_ASSERT_EQ(stats.by_reason[CTRC_CLEANER_REASON_PARTICIPANT_ACK], 2);
+	driver_final_reason = -1;
+}
+
+UT_TEST(test_no_progress_snapshot_preserves_unavailable_zero_and_attach_lifetime)
+{
+	ClusterCtrcNoProgressStats stats, before;
+	ClusterCtrcSharedHeader *saved;
+	int saved_node = cluster_node_id;
+
+	reset_fixture();
+	cluster_node_id = 3;
+	memset(&stats, 0xa5, sizeof(stats));
+	UT_ASSERT(cluster_ctrc_no_progress_stats_snapshot(&stats));
+	UT_ASSERT_EQ(stats.origin_node_id, 3);
+	for (int i = 0; i < CTRC_CLEANER_REASON_COUNT; i++)
+		UT_ASSERT_EQ(stats.by_reason[i], 0);
+#ifdef CLUSTER_CTRC_NO_PROGRESS_STATS_V1
+	pg_atomic_write_u64(&CtrcShared->cleaner_no_progress[CTRC_CLEANER_REASON_NONE], UINT64_MAX);
+	pg_atomic_write_u64(&CtrcShared->cleaner_no_progress[CTRC_CLEANER_REASON_BLOCKED],
+						UINT64_C(9223372036854775809));
+#endif
+	test_shmem_attach = true;
+	cluster_ctrc_shmem_init();
+	test_shmem_attach = false;
+	UT_ASSERT(cluster_ctrc_no_progress_stats_snapshot(&stats));
+	UT_ASSERT_EQ(stats.by_reason[CTRC_CLEANER_REASON_NONE], UINT64_MAX);
+	UT_ASSERT_EQ(stats.by_reason[CTRC_CLEANER_REASON_BLOCKED], UINT64_C(9223372036854775809));
+	memset(&stats, 0xa5, sizeof(stats));
+	memcpy(&before, &stats, sizeof(before));
+	UT_ASSERT(!cluster_ctrc_no_progress_stats_snapshot(NULL));
+	cluster_node_id = -1;
+	UT_ASSERT(!cluster_ctrc_no_progress_stats_snapshot(&stats));
+	UT_ASSERT(memcmp(&stats, &before, sizeof(stats)) == 0);
+	cluster_node_id = CLUSTER_CTRC_MAX_PARTICIPANTS;
+	UT_ASSERT(!cluster_ctrc_no_progress_stats_snapshot(&stats));
+	UT_ASSERT(memcmp(&stats, &before, sizeof(stats)) == 0);
+	cluster_node_id = 0;
+	UT_ASSERT(bind_test_worker(0));
+	saved = CtrcShared;
+	CtrcShared = NULL;
+	UT_ASSERT(!ctrc_fixture_run_pass());
+	UT_ASSERT(!cluster_ctrc_no_progress_stats_snapshot(&stats));
+	UT_ASSERT(memcmp(&stats, &before, sizeof(stats)) == 0);
+	CtrcShared = saved;
+	CtrcShared->magic = 0;
+	UT_ASSERT(!cluster_ctrc_no_progress_stats_snapshot(&stats));
+	UT_ASSERT(memcmp(&stats, &before, sizeof(stats)) == 0);
+	CtrcShared->magic = CLUSTER_CTRC_SHMEM_MAGIC;
+	cluster_node_id = saved_node;
+}
+
 int
 main(void)
 {
@@ -7225,7 +7358,7 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(171);
+	UT_PLAN(174);
 	UT_RUN(test_bounded_pool_selectors_observe_work_after_intervening_unlock);
 	UT_RUN(test_empty_bounded_pool_scan_keeps_round_robin_position);
 	UT_RUN(test_empty_pool_selectors_cancel_without_retaining_shared_locks);
@@ -7402,6 +7535,9 @@ main(void)
 	UT_RUN(test_actual_worker_active_pass_restarts_after_original_lease_refusal);
 	UT_RUN(test_actual_worker_active_pass_restarts_after_original_source_refusal);
 	UT_RUN(test_actual_worker_active_pass_does_not_sample_native_without_source);
+	UT_RUN(test_no_progress_counts_only_normally_completed_local_passes);
+	UT_RUN(test_no_progress_uses_executing_workers_original_final_reason);
+	UT_RUN(test_no_progress_snapshot_preserves_unavailable_zero_and_attach_lifetime);
 	free(CtrcShared);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

@@ -126,6 +126,15 @@ typedef enum ClusterCtrcCleanerReason {
 	CTRC_CLEANER_REASON_COUNT
 } ClusterCtrcCleanerReason;
 
+#define CLUSTER_CTRC_NO_PROGRESS_STATS_V1 1
+
+/* Independent diagnostic counters for completed passes without local progress.
+ * The origin identifies the executing instance, not a transaction or release. */
+typedef struct ClusterCtrcNoProgressStats {
+	int32 origin_node_id;
+	uint64 by_reason[CTRC_CLEANER_REASON_COUNT];
+} ClusterCtrcNoProgressStats;
+
 #define CLUSTER_CTRC_CLEANER_WORKERS 8
 
 /* Scheduling observations only; neither a coherent authority snapshot nor
@@ -928,6 +937,8 @@ extern uint64 cluster_ctrc_cleaner_local_passes(void);
 extern ClusterCtrcCleanerReason cluster_ctrc_cleaner_worker_reason(unsigned worker_id);
 extern bool cluster_ctrc_cleaner_worker_observation(unsigned worker_id,
 													ClusterCtrcCleanerWorkerObservation *out);
+/* False preserves output, including when the local origin is unavailable. */
+extern bool cluster_ctrc_no_progress_stats_snapshot(ClusterCtrcNoProgressStats *out);
 extern bool cluster_ctrc_debug_snapshot(ClusterCtrcDebugSnapshot *snapshot);
 extern bool cluster_ctrc_test_barrier_control(ClusterCtrcTestBarrierPhase phase, bool armed);
 extern void cluster_ctrc_test_barrier_wait(ClusterCtrcTestBarrierPhase phase);

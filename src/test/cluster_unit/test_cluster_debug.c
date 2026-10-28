@@ -586,7 +586,11 @@ cluster_ctrc_stat_get(ClusterCtrcStatId stat pg_attribute_unused())
 const char *
 cluster_ctrc_cleaner_reason_name(ClusterCtrcCleanerReason reason)
 {
-	return reason == CTRC_CLEANER_REASON_NONE ? "NONE" : "BLOCKED";
+	static const char *const names[]
+		= { "NONE",			  "PREPARED_DRAIN",	 "RESOURCE_X",		   "PAGE_REVALIDATE",
+			"WAL_DURABILITY", "PARTICIPANT_ACK", "BLOCK0_CERTIFICATE", "BLOCKED" };
+
+	return reason >= 0 && reason < CTRC_CLEANER_REASON_COUNT ? names[reason] : NULL;
 }
 
 ClusterCtrcCleanerReason
@@ -595,9 +599,29 @@ cluster_ctrc_cleaner_reason_get(void)
 	return CTRC_CLEANER_REASON_NONE;
 }
 
+static bool no_progress_stats_available;
+static bool ctrc_debug_snapshot_available = true;
+
+#ifdef CLUSTER_CTRC_NO_PROGRESS_STATS_V1
+bool
+cluster_ctrc_no_progress_stats_snapshot(ClusterCtrcNoProgressStats *out)
+{
+	static const uint64 counts[]
+		= { 0, UINT64_MAX, UINT64_C(9223372036854775809), 3, 5, 7, 11, 13 };
+
+	if (!no_progress_stats_available || out == NULL)
+		return false;
+	out->origin_node_id = 3;
+	memcpy(out->by_reason, counts, sizeof(counts));
+	return true;
+}
+#endif
+
 bool
 cluster_ctrc_debug_snapshot(ClusterCtrcDebugSnapshot *snapshot)
 {
+	if (!ctrc_debug_snapshot_available)
+		return false;
 	MemSet(snapshot, 0, sizeof(*snapshot));
 	return true;
 }
@@ -6549,10 +6573,50 @@ UT_TEST(test_debug_phase_symbol_present)
 }
 
 
+UT_TEST(test_debug_no_progress_counts_keep_availability_reason_and_unsigned_origin)
+{
+	LOCAL_FCINFO(fcinfo, 0);
+	ReturnSetInfo rsinfo;
+	static const char *const keys[] = { "ctrc_phase_no_progress_origin_node_id",
+										"ctrc_phase_no_progress_by_reason.NONE",
+										"ctrc_phase_no_progress_by_reason.PREPARED_DRAIN",
+										"ctrc_phase_no_progress_by_reason.RESOURCE_X",
+										"ctrc_phase_no_progress_by_reason.PAGE_REVALIDATE",
+										"ctrc_phase_no_progress_by_reason.WAL_DURABILITY",
+										"ctrc_phase_no_progress_by_reason.PARTICIPANT_ACK",
+										"ctrc_phase_no_progress_by_reason.BLOCK0_CERTIFICATE",
+										"ctrc_phase_no_progress_by_reason.BLOCKED" };
+	static const char *const values[]
+		= { "3", "0", "18446744073709551615", "9223372036854775809", "3", "5", "7", "11", "13" };
+
+	for (int mode = 0; mode < 3; mode++) {
+		bool available = mode != 0;
+
+		memset(fcinfo, 0, SizeForFunctionCallInfo(0));
+		memset(&rsinfo, 0, sizeof(rsinfo));
+		captured_dump_row_count = captured_formatted_value_count = 0;
+		fcinfo->resultinfo = (fmNodePtr)&rsinfo;
+		no_progress_stats_available = available;
+		ctrc_debug_snapshot_available = mode != 2;
+		(void)cluster_dump_state(fcinfo);
+		UT_ASSERT_EQ(captured_dump_count("ctrc", "ctrc_phase_no_progress_stats_available"), 1);
+		if (captured_dump_count("ctrc", "ctrc_phase_no_progress_stats_available") == 1)
+			UT_ASSERT_STR_EQ(captured_dump_value("ctrc", "ctrc_phase_no_progress_stats_available"),
+							 available ? "true" : "false");
+		for (unsigned i = 0; i < lengthof(keys); i++) {
+			UT_ASSERT_EQ(captured_dump_count("ctrc", keys[i]), available);
+			if (available && captured_dump_count("ctrc", keys[i]) == 1)
+				UT_ASSERT_STR_EQ(captured_dump_value("ctrc", keys[i]), values[i]);
+		}
+	}
+	no_progress_stats_available = false;
+	ctrc_debug_snapshot_available = true;
+}
+
 int
 main(void)
 {
-	UT_PLAN(29);
+	UT_PLAN(30);
 	UT_RUN(test_debug_dump_retention_observations_preserve_availability_and_unsigned_values);
 	UT_RUN(test_debug_dump_exposes_native_drop_context_and_real_io_observation);
 	UT_RUN(test_debug_dump_exposes_pcm_first_refusal_identity_and_subpredicate);
@@ -6582,6 +6646,7 @@ main(void)
 	UT_RUN(test_debug_links_against_conf_module);
 	UT_RUN(test_debug_phase_symbol_present);
 	UT_RUN(test_debug_locator_stats_preserve_availability_and_unsigned_results);
+	UT_RUN(test_debug_no_progress_counts_keep_availability_reason_and_unsigned_origin);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
