@@ -12339,9 +12339,23 @@ shdepLockAndCheckObject(Oid classId, Oid objectId)
 	siglongjmp(boundary, 3);
 }
 
+/* Native role deletion stops at its first privilege query. */
+static bool role_drop_lookup_active, role_drop_expect_binding, role_drop_privilege_denied;
+static unsigned role_drop_lookups, role_drop_unbound, role_drop_bad_lookup;
+
 bool
 has_createrole_privilege(Oid roleid)
 {
+	if (role_drop_lookup_active) {
+		role_drop_lookups++;
+		if (role_drop_expect_binding && utility_binds == 0)
+			role_drop_unbound++;
+		if (roleid != 10)
+			role_drop_bad_lookup++;
+		if (role_drop_privilege_denied)
+			return false;
+		siglongjmp(boundary, 2); /* Stop before the real role-cache privilege query. */
+	}
 	(void)roleid;
 	role_settings_unexpected_dependencies++;
 	siglongjmp(boundary, 3);
@@ -12592,10 +12606,213 @@ UT_TEST(test_native_role_settings_keeps_global_permission_refusal_after_binding)
 	role_settings_lookup_active = false;
 }
 
+/* The real private helper is already extracted with role settings. This
+ * actual prefix includes the full original first permission refusal. */
+#include "test_cluster_fresh_role_drop.inc"
+static RoleSpec role_drop_roles[2];
+static ListCell role_drop_role_cells[2];
+static List role_drop_role_list;
+static DropRoleStmt native_role_drop_statement;
+static Node *role_drop_expected_statement;
+
+static void
+reset_native_role_drop(bool expect_binding, unsigned form)
+{
+	reset_create_preflight();
+	role_drop_lookup_active = true;
+	role_drop_expect_binding = expect_binding;
+	role_drop_privilege_denied = false;
+	role_drop_lookups = role_drop_unbound = role_drop_bad_lookup = 0;
+	role_drop_roles[0] = (RoleSpec){ .type = T_RoleSpec,
+									 .roletype = ROLESPEC_CSTRING,
+									 .rolename = "drop_role_a",
+									 .location = -1 };
+	role_drop_roles[1] = (RoleSpec){ .type = T_RoleSpec,
+									 .roletype = ROLESPEC_CSTRING,
+									 .rolename = "drop_role_b",
+									 .location = -1 };
+	role_drop_role_cells[0].ptr_value = &role_drop_roles[0];
+	role_drop_role_cells[1].ptr_value = &role_drop_roles[1];
+	role_drop_role_list = (List){ .type = T_List,
+								  .length = form < 2 ? 1 : 2,
+								  .max_length = 2,
+								  .elements = role_drop_role_cells };
+	native_role_drop_statement = (DropRoleStmt){ .type = T_DropRoleStmt,
+												 .roles = &role_drop_role_list,
+												 .missing_ok = form % 2 != 0 };
+	role_drop_expected_statement = (Node *)&native_role_drop_statement;
+}
+
+static void
+native_role_drop_entry(void)
+{
+	DropRole(&native_role_drop_statement);
+}
+
+UT_TEST(test_native_role_drop_binds_before_first_query_in_all_profiles)
+{
+	for (unsigned form = 0; form < 4; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_role_drop(binds, form);
+			set_native_operator_mode(mode);
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_role_drop_entry();
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(role_drop_lookups, repeat + 1);
+				UT_ASSERT_EQ(role_drop_unbound, 0);
+				UT_ASSERT_EQ(role_drop_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	role_drop_lookup_active = false;
+}
+
+UT_TEST(test_native_role_drop_refuses_before_lookup_on_publication_child_and_top_errors)
+{
+	for (unsigned form = 0; form < 4; form++) {
+		for (unsigned failure = 0; failure < 5; failure++) {
+			bool allocated = failure == 0 || failure == 2;
+			int caught;
+
+			reset_native_role_drop(true, form);
+			if (failure == 0)
+				utility_bind_ok = false;
+			else if (failure == 1 || failure == 2) {
+				if (failure == 2)
+					create_sql_entry(role_drop_expected_statement);
+				utility_in_child = true;
+			} else {
+				utility_current_xid = 401;
+				utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_role_drop_entry();
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, failure == 0  ? ERRCODE_DATA_CORRUPTED
+									 : failure < 3 ? ERRCODE_FEATURE_NOT_SUPPORTED
+												   : ERRCODE_INTERNAL_ERROR);
+			UT_ASSERT_STR_EQ(
+				error_message,
+				failure == 0
+					? "canonical ACTIVE publication failed before shared catalog alteration"
+				: failure < 3 ? "shared catalog alteration does not support subtransactions"
+							  : "shared catalog top-level transaction identity mismatch");
+			UT_ASSERT_EQ(role_drop_lookups, 0);
+			UT_ASSERT_EQ(role_drop_unbound + role_drop_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_xids, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, failure == 2 ? 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, allocated || failure == 3 ? 400 : InvalidTransactionId);
+		}
+	}
+	role_drop_lookup_active = false;
+}
+
+UT_TEST(test_native_role_drop_context_guards_keep_nonshared_route)
+{
+	for (unsigned form = 0; form < 4; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+
+			for (unsigned guard = 0; guard < 3; guard++) {
+				int caught;
+
+				reset_native_role_drop(binds, form);
+				set_native_operator_mode(mode);
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_role_drop_entry();
+				UT_ASSERT_EQ(caught, binds ? 1 : 2);
+				UT_ASSERT_EQ(error_code, !binds		  ? 0
+										 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+													  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				UT_ASSERT_EQ(role_drop_lookups, binds ? 0 : 1);
+				UT_ASSERT_EQ(role_drop_unbound + role_drop_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	role_drop_lookup_active = false;
+}
+
+UT_TEST(test_native_role_drop_utility_warm_guards_preserve_binding)
+{
+	for (unsigned form = 0; form < 4; form++) {
+		for (unsigned guard = 0; guard < 4; guard++) {
+			int caught;
+
+			reset_native_role_drop(true, form);
+			create_sql_entry(role_drop_expected_statement);
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			XactReadOnly = guard == 1;
+			utility_parallel = guard == 2;
+			utility_recovery = guard == 3;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_role_drop_entry();
+			UT_ASSERT_EQ(caught, guard ? 1 : 2);
+			UT_ASSERT_EQ(error_code, !guard		  ? 0
+									 : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+												  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT_EQ(role_drop_lookups, guard ? 0 : 1);
+			UT_ASSERT_EQ(role_drop_unbound + role_drop_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_prepares, guard ? 1 : 2);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			UT_ASSERT_EQ(utility_top_xid, 400);
+		}
+	}
+	role_drop_lookup_active = false;
+}
+
+UT_TEST(test_native_role_drop_keeps_permission_refusal_after_binding)
+{
+	for (unsigned form = 0; form < 4; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_role_drop(binds, form);
+			set_native_operator_mode(mode);
+			role_drop_privilege_denied = true;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_role_drop_entry();
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, ERRCODE_INSUFFICIENT_PRIVILEGE);
+			UT_ASSERT_STR_EQ(error_message, "permission denied to drop role");
+			UT_ASSERT_EQ(role_drop_lookups, 1);
+			UT_ASSERT_EQ(role_drop_unbound + role_drop_bad_lookup, 0);
+			UT_ASSERT_EQ(role_settings_unexpected_dependencies, 0);
+			UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, binds ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+		}
+	}
+	role_drop_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(190);
+	UT_PLAN(195);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -12786,6 +13003,11 @@ main(void)
 	UT_RUN(test_native_role_settings_context_guards_keep_nonshared_route);
 	UT_RUN(test_native_role_settings_utility_warm_guards_preserve_binding);
 	UT_RUN(test_native_role_settings_keeps_global_permission_refusal_after_binding);
+	UT_RUN(test_native_role_drop_binds_before_first_query_in_all_profiles);
+	UT_RUN(test_native_role_drop_refuses_before_lookup_on_publication_child_and_top_errors);
+	UT_RUN(test_native_role_drop_context_guards_keep_nonshared_route);
+	UT_RUN(test_native_role_drop_utility_warm_guards_preserve_binding);
+	UT_RUN(test_native_role_drop_keeps_permission_refusal_after_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
