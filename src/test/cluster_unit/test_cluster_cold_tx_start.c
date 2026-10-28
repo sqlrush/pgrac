@@ -2370,9 +2370,19 @@ static void startup_local_empty_reset(void);
 #include "test_cluster_cold_ctrc_plain_lock_refs.inc"
 #include "test_cluster_cold_ctrc_update_predecessors.inc"
 #include "test_cluster_cold_ctrc_first_wal.inc"
+#include "test_cluster_cold_ctrc_final_local_empty.inc"
 
 int main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_FINAL_LOCAL_EMPTY") != NULL) {
+		UT_PLAN(5);
+		UT_RUN(test_startup_final_local_empty_covers_fpi_unchanged_and_zero_page_wal);
+		UT_RUN(test_startup_final_local_wait_rechecks_complete_pages_on_same_fds);
+		UT_RUN(test_startup_final_local_refusal_error_and_late_owner_loss_keep_debt);
+		UT_RUN(test_startup_final_local_wait_cannot_cache_readback_first_or_owner);
+		UT_RUN(test_startup_final_local_repeat_cannot_reuse_empty_directory);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_FIRST_WAL") != NULL) {
 		UT_PLAN(4);
 		UT_RUN(test_startup_first_wal_empty_rechecks_all_native_buffers);
@@ -2656,7 +2666,12 @@ int main(void)
 		UT_DONE();
 		return ut_failed_count == 0 ? 0 : 1;
 	}
-	UT_PLAN(283);
+	UT_PLAN(288);
+	UT_RUN(test_startup_final_local_empty_covers_fpi_unchanged_and_zero_page_wal);
+	UT_RUN(test_startup_final_local_wait_rechecks_complete_pages_on_same_fds);
+	UT_RUN(test_startup_final_local_refusal_error_and_late_owner_loss_keep_debt);
+	UT_RUN(test_startup_final_local_wait_cannot_cache_readback_first_or_owner);
+	UT_RUN(test_startup_final_local_repeat_cannot_reuse_empty_directory);
 	UT_RUN(test_startup_first_wal_empty_rechecks_all_native_buffers);
 	UT_RUN(test_startup_first_wal_missing_or_nonempty_keeps_original_debt);
 	UT_RUN(test_startup_first_wal_late_failure_revalidates_original_owner);

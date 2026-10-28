@@ -2758,7 +2758,36 @@ ClusterColdRecoveryCtrcPageDrain(const struct ClusterRecoveryStartV1 *start,
 			progress->pending = false;
 			progress->next_target++;
 		}
-		if (ready) ready = cluster_recovery_cold_page_completed_recheck(start);
+		while (ready) {
+			const ClusterColdCtrcWorkV1 *work;
+			ClusterWalInputsV1 *scope;
+			ClusterColdCtrcPageProgressV1 *progress;
+			ClusterCtrcLocalEmptyV1 empty;
+
+			if (start != cluster_recovery_cold_start) { ready = false; break; }
+			work = state->ctrc_observation_work;
+			scope = state->ctrc_observation_inputs;
+			progress = state->ctrc_page_progress;
+			ResetLatch(MyLatch);
+			ready = cluster_recovery_cold_page_completed_recheck(start);
+			if (!ready) break;
+			/* F4-cleared, unchanged and zero-PAGE paths still owe the
+			 * original whole local directory check. EMPTY is an instant
+			 * observation, not first/pin/history discharge or completion. */
+			empty = cluster_ctrc_recovery_local_empty_v1();
+			ready = cluster_recovery_cold_page_advance_current(start, work, scope, progress)
+				&& (progress == NULL
+					? rf_page_online_plan_target_count_v1(start->ctrc_page_plan) == 0
+					: !progress->pending && progress->next_target == progress->target_count);
+			if (!ready || empty == CLUSTER_CTRC_LOCAL_EMPTY) break;
+			if (empty != CLUSTER_CTRC_LOCAL_WAIT) { ready = false; break; }
+			/* No partial directory locks survive the native probe. Keep
+			 * the same FDs/IR/WALR and redo the entire original readback
+			 * after each local wait; elapsed time is not a refusal. */
+			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+				100L, WAIT_EVENT_CLUSTER_THREAD_RECOVERY);
+			HandleStartupProcInterrupts();
+		}
 	}
 	PG_CATCH();
 	{

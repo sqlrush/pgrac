@@ -1,17 +1,34 @@
 /* Original Startup branch; the local native directory is an independent leaf.
  * Author: SqlRush <sqlrush@gmail.com> */
 static unsigned local_empty_calls, local_empty_mode;
+static unsigned final_local_empty_calls, final_local_empty_mode;
 
 static void
 startup_local_empty_reset(void)
 {
 	local_empty_calls = local_empty_mode = 0;
+	final_local_empty_calls = final_local_empty_mode = 0;
 }
 
 ClusterCtrcLocalEmptyV1
 cluster_ctrc_recovery_local_empty_v1(void)
 {
 	ClusterColdCtrcPageProgressV1 *progress = cluster_recovery_cold_start->ctrc_page_progress;
+	if (progress == NULL || !progress->pending) {
+		UT_ASSERT_EQ(ctrc_driver_lwlocks, 0);
+		UT_ASSERT_EQ(prefix_destroyed, 2 * prefix_pages);
+		UT_ASSERT(progress == NULL || progress->next_target == progress->target_count);
+		final_local_empty_calls++;
+		if (final_local_empty_mode == 1 && final_local_empty_calls < 3) {
+			ctrc_driver_waiting = true;
+			return CLUSTER_CTRC_LOCAL_WAIT;
+		}
+		if (final_local_empty_mode == 2) return CLUSTER_CTRC_LOCAL_REFUSED;
+		if (final_local_empty_mode == 3) pg_re_throw();
+		if (final_local_empty_mode == 4) owner_boot++;
+		if (final_local_empty_mode == 5) return (ClusterCtrcLocalEmptyV1)99;
+		return CLUSTER_CTRC_LOCAL_EMPTY;
+	}
 	UT_ASSERT(progress->pending && pending_storage_live);
 	UT_ASSERT_EQ(prefix_destroyed + 1, 2 * prefix_pages);
 	UT_ASSERT_EQ(ctrc_driver_lwlocks, 0);
