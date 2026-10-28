@@ -7,6 +7,10 @@
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
+ * PGRAC MODIFICATIONS
+ *    Preflight native statistics alteration before catalog lookups.
+ *    Author: SqlRush <sqlrush@gmail.com>
+ *
  * IDENTIFICATION
  *	  src/backend/commands/statscmds.c
  *
@@ -18,6 +22,9 @@
 #include "access/relation.h"
 #include "access/relscan.h"
 #include "access/table.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "access/xact.h"
+#endif
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
@@ -26,12 +33,19 @@
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_statistic_ext.h"
 #include "catalog/pg_statistic_ext_data.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_mode.h"
+#include "cluster/cluster_tt_local.h"
+#endif
 #include "commands/comment.h"
 #include "commands/defrem.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
 #include "statistics/statistics.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "tcop/utility.h"
+#endif
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/fmgroids.h"
@@ -631,6 +645,31 @@ AlterStatistics(AlterStatsStmt *stmt)
 	bool		repl_repl[Natts_pg_statistic_ext];
 	ObjectAddress address;
 	int			newtarget = stmt->stxstattarget;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* Direct callers must bind before looking up the statistics object. */
+	if (cluster_shared_catalog && cluster_storage_mode_enabled()) {
+		ClusterCanonicalTxnBinding binding;
+		TransactionId current_xid;
+
+		PreventCommandIfReadOnly("ALTER STATISTICS");
+		PreventCommandIfParallelMode("ALTER STATISTICS");
+		PreventCommandDuringRecovery("ALTER STATISTICS");
+		if (IsSubTransaction())
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("shared catalog alteration does not support subtransactions")));
+		current_xid = GetCurrentTransactionIdIfAny();
+		if (TransactionIdIsValid(current_xid)
+			&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("shared catalog top-level transaction identity mismatch")));
+		if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+			ereport(
+				ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("canonical ACTIVE publication failed before shared catalog alteration")));
+	}
+#endif
 
 	/* Limit statistics target to a sane range */
 	if (newtarget < -1)

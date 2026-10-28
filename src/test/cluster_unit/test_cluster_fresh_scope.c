@@ -40,6 +40,7 @@
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_policy.h"
 #include "catalog/pg_proc.h"
+#include "catalog/pg_statistic_ext.h"
 #include "catalog/pg_transform.h"
 #include "catalog/pg_type_d.h"
 #include "catalog/pg_user_mapping.h"
@@ -9813,10 +9814,216 @@ UT_TEST(test_native_user_mapping_utility_warm_context_guards_preserve_binding)
 	user_mapping_lookup_active = false;
 }
 
+/* Exercise the actual ALTER prefix up to, but not through, its first lookup. */
+static bool statistics_lookup_active, statistics_expect_binding;
+static bool statistics_expected_missing_ok;
+static unsigned statistics_lookups, statistics_unbound, statistics_bad_lookup;
+static String statistics_name_node;
+static ListCell statistics_name_cell;
+static List statistics_names;
+static AlterStatsStmt native_statistics_alter;
+
+Oid
+get_statistics_object_oid(List *names, bool missing_ok)
+{
+	statistics_lookups++;
+	if (statistics_expect_binding && utility_binds == 0)
+		statistics_unbound++;
+	if (!statistics_lookup_active || names != &statistics_names
+		|| missing_ok != statistics_expected_missing_ok)
+		statistics_bad_lookup++;
+	siglongjmp(boundary, 2); /* Stop before the real statistics object lookup. */
+}
+
+#include "test_cluster_fresh_statistics_alter.inc"
+
+static void
+reset_native_statistics_alter(bool expect_binding, unsigned kind)
+{
+	static const int targets[] = { -1, 0, 100, 10000, 10001 };
+
+	reset_create_preflight();
+	statistics_lookup_active = true;
+	statistics_expect_binding = expect_binding;
+	statistics_expected_missing_ok = kind >= 5;
+	statistics_lookups = statistics_unbound = statistics_bad_lookup = 0;
+	statistics_name_node = (String){ .type = T_String, .sval = "native_statistics" };
+	statistics_name_cell = (ListCell){ .ptr_value = &statistics_name_node };
+	statistics_names
+		= (List){ .type = T_List, .length = 1, .max_length = 1, .elements = &statistics_name_cell };
+	native_statistics_alter = (AlterStatsStmt){ .type = T_AlterStatsStmt,
+												.defnames = &statistics_names,
+												.stxstattarget = targets[kind % 5],
+												.missing_ok = kind >= 5 };
+}
+
+UT_TEST(test_native_statistics_alter_binds_before_lookup_in_all_profiles)
+{
+	for (unsigned kind = 0; kind < 10; kind++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_statistics_alter(binds, kind);
+			cluster_shared_catalog = (mode & 1) != 0;
+			utility_storage_mode = (mode & 2) != 0;
+			cluster_shared_config = (mode & 4) != 0;
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					(void)AlterStatistics(&native_statistics_alter);
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(statistics_lookups, repeat + 1);
+				UT_ASSERT_EQ(statistics_bad_lookup, 0);
+				UT_ASSERT_EQ(statistics_unbound, 0);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	statistics_lookup_active = false;
+}
+
+UT_TEST(test_native_statistics_alter_refuses_before_lookup_on_publication_child_and_top_errors)
+{
+	for (unsigned kind = 0; kind < 10; kind++) {
+		for (unsigned failure = 0; failure < 5; failure++) {
+			bool allocated = failure == 0 || failure == 2;
+			int caught;
+
+			reset_native_statistics_alter(true, kind);
+			if (failure == 0)
+				utility_bind_ok = false;
+			else if (failure == 1 || failure == 2) {
+				if (failure == 2)
+					create_sql_entry((Node *)&native_statistics_alter);
+				utility_in_child = true;
+			} else {
+				utility_current_xid = 401;
+				utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				(void)AlterStatistics(&native_statistics_alter);
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, failure == 0  ? ERRCODE_DATA_CORRUPTED
+									 : failure < 3 ? ERRCODE_FEATURE_NOT_SUPPORTED
+												   : ERRCODE_INTERNAL_ERROR);
+			UT_ASSERT(strstr(error_message, failure == 0  ? "publication failed"
+											: failure < 3 ? "does not support subtransactions"
+														  : "identity mismatch")
+					  != NULL);
+			UT_ASSERT_EQ(statistics_lookups, 0);
+			UT_ASSERT_EQ(statistics_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_xids, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, failure == 2 ? 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, allocated || failure == 3 ? 400 : InvalidTransactionId);
+		}
+	}
+	statistics_lookup_active = false;
+}
+
+UT_TEST(test_native_statistics_alter_context_guards_keep_nonshared_route)
+{
+	for (unsigned kind = 0; kind < 10; kind++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+
+			for (unsigned guard = 0; guard < 3; guard++) {
+				int caught;
+
+				reset_native_statistics_alter(binds, kind);
+				cluster_shared_catalog = (mode & 1) != 0;
+				utility_storage_mode = (mode & 2) != 0;
+				cluster_shared_config = (mode & 4) != 0;
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					(void)AlterStatistics(&native_statistics_alter);
+				UT_ASSERT_EQ(caught, binds ? 1 : 2);
+				UT_ASSERT_EQ(error_code, !binds		  ? 0
+										 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+													  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				if (binds)
+					UT_ASSERT(strstr(error_message, "ALTER STATISTICS") != NULL);
+				UT_ASSERT_EQ(statistics_lookups, binds ? 0 : 1);
+				UT_ASSERT_EQ(statistics_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	statistics_lookup_active = false;
+}
+
+UT_TEST(test_native_statistics_alter_utility_warm_guards_preserve_binding)
+{
+	for (unsigned kind = 0; kind < 10; kind++) {
+		for (unsigned guard = 0; guard < 4; guard++) {
+			int caught;
+
+			reset_native_statistics_alter(true, kind);
+			create_sql_entry((Node *)&native_statistics_alter);
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			XactReadOnly = guard == 1;
+			utility_parallel = guard == 2;
+			utility_recovery = guard == 3;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				(void)AlterStatistics(&native_statistics_alter);
+			UT_ASSERT_EQ(caught, guard ? 1 : 2);
+			UT_ASSERT_EQ(error_code, !guard		  ? 0
+									 : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+												  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT_EQ(statistics_lookups, guard ? 0 : 1);
+			UT_ASSERT_EQ(statistics_bad_lookup, 0);
+			UT_ASSERT_EQ(statistics_unbound, 0);
+			UT_ASSERT_EQ(utility_prepares, guard ? 1 : 2);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			UT_ASSERT_EQ(utility_top_xid, 400);
+		}
+	}
+	statistics_lookup_active = false;
+}
+
+UT_TEST(test_native_statistics_alter_target_error_keeps_early_binding)
+{
+	for (unsigned missing = 0; missing < 2; missing++) {
+		for (unsigned mode = 0; mode < 3; mode++) {
+			int caught;
+
+			reset_native_statistics_alter(mode != 0, missing * 5);
+			cluster_shared_catalog = mode != 0;
+			native_statistics_alter.stxstattarget = -2;
+			if (mode == 2)
+				create_sql_entry((Node *)&native_statistics_alter);
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				(void)AlterStatistics(&native_statistics_alter);
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, ERRCODE_INVALID_PARAMETER_VALUE);
+			UT_ASSERT(strstr(error_message, "statistics target -2 is too low") != NULL);
+			UT_ASSERT_EQ(statistics_lookups, 0);
+			UT_ASSERT_EQ(utility_xids, mode ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, mode ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, mode);
+			UT_ASSERT_EQ(utility_top_xid, mode ? 400 : InvalidTransactionId);
+		}
+	}
+	statistics_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(141);
+	UT_PLAN(146);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -9958,6 +10165,11 @@ main(void)
 	UT_RUN(test_native_user_mapping_publication_child_and_wrong_top_precede_catalog_access);
 	UT_RUN(test_native_user_mapping_context_guards_keep_nonshared_route);
 	UT_RUN(test_native_user_mapping_utility_warm_context_guards_preserve_binding);
+	UT_RUN(test_native_statistics_alter_binds_before_lookup_in_all_profiles);
+	UT_RUN(test_native_statistics_alter_refuses_before_lookup_on_publication_child_and_top_errors);
+	UT_RUN(test_native_statistics_alter_context_guards_keep_nonshared_route);
+	UT_RUN(test_native_statistics_alter_utility_warm_guards_preserve_binding);
+	UT_RUN(test_native_statistics_alter_target_error_keeps_early_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
