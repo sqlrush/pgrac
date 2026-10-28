@@ -10654,3 +10654,4 @@ test_cluster_clog_recovery test_cluster_side_native_clog.o \
 # Complete original relation/history references stay with the original census.
 test_cluster_recovery_native_inputs: test_cluster_recovery_reference_inputs.inc
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_references.inc
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_reference_terminals.inc

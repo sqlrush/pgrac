@@ -2297,6 +2297,69 @@ cluster_recovery_cold_page_projection_subjects(const struct ClusterRecoveryStart
 		&& cluster_recovery_cold_page_advance_current(start, work, scope, progress);
 }
 
+/* PGRAC: consume the complete original relation/history view, including
+ * pages absent from PAGE WAL. Match the graph's full canonical identity,
+ * never a raw xid or a current slot chosen for an older generation. The
+ * original terminal factory brackets this check; tuple/MX/HOT/history and
+ * owner-completion obligations are not discharged by this identity join. */
+static bool
+cluster_recovery_cold_page_reference_terminals(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, ClusterWalInputsV1 *scope,
+	ClusterColdCtrcPageProgressV1 *progress)
+{
+	const ClusterRecoveryCensusReferencesV1 *references;
+	const ClusterRecoveryCensusPagesV1 *pages;
+
+	if (!cluster_recovery_cold_page_advance_current(start, work, scope, progress)) return false;
+	references = ClusterColdRecoveryCtrcReferences(start, work);
+	if (references == NULL
+		|| !cluster_recovery_cold_page_advance_current(start, work, scope, progress)) return false;
+	pages = start->ctrc_pages;
+	if (pages == NULL) return false;
+	for (uint32 i = 0; i < references->count; i++) {
+		const ClusterRecoveryCensusReferenceV1 *reference = &references->entries[i];
+		const ClusterRecoveryHeapEntry *entry = &reference->entry;
+		const ClusterRecoveryTxnKey *transaction = &reference->transaction.transaction;
+		const ClusterSpaceIdentityKey *space;
+		unsigned matches = 0;
+
+		if (reference->page_index >= pages->count
+			|| !pages->entries[reference->page_index].heap
+			|| pages->entries[reference->page_index].forknum != MAIN_FORKNUM) return false;
+		if (entry->kind == CLUSTER_RECOVERY_HEAP_ITEM) continue;
+		if (entry->kind != CLUSTER_RECOVERY_HEAP_ITL
+			|| entry->index >= CLUSTER_ITL_INITRANS_DEFAULT) return false;
+		if (entry->itl.flags == ITL_FLAG_FREE) continue;
+		space = &pages->entries[reference->page_index].reservation.identity.key;
+		if (reference->transaction.record == NULL
+			|| UBA_is_invalid(entry->itl.undo_segment_head)
+			|| memcmp(&entry->itl.undo_segment_head, &reference->transaction.record->address,
+				sizeof(UBA)) != 0
+			|| transaction->system_identifier != space->system_identifier
+			|| transaction->database_incarnation != space->database_incarnation
+			|| transaction->xid != entry->itl.xid) return false;
+		for (uint32 j = 0; j < work->counts.subject_count; j++) {
+			const ClusterColdTtSlotKeyV1 *key = &work->entries[j].key;
+
+			/* The original graph converts native one-based undo owners
+			 * into zero-based NodeIds; retain that exact mapping. */
+			if (key->owner_instance != 0
+				&& transaction->origin_node_id == key->owner_instance - 1
+				&& transaction->segment_id == key->segment_id
+				&& transaction->segment_generation == key->segment_generation
+				&& transaction->slot_offset == key->slot_offset
+				&& transaction->slot_wrap == key->slot_wrap && transaction->xid == key->xid)
+				matches++;
+		}
+		if (matches != 1) return false;
+	}
+	/* Original complete getter checks every retained byte/record lifetime and
+	 * canonical terminal again. A callback cannot replace the saved views. */
+	return references == ClusterColdRecoveryCtrcReferences(start, work)
+		&& cluster_recovery_cold_page_advance_current(start, work, scope, progress)
+		&& start->ctrc_pages == pages;
+}
+
 static bool
 cluster_recovery_cold_page_completed_recheck(const struct ClusterRecoveryStartV1 *start)
 {
@@ -2309,7 +2372,9 @@ cluster_recovery_cold_page_completed_recheck(const struct ClusterRecoveryStartV1
 	Size bytes;
 
 	if (!cluster_recovery_cold_page_advance_current(start, work, scope, progress)) return false;
-	if (progress == NULL) return rf_page_online_plan_target_count_v1(start->ctrc_page_plan) == 0;
+	if (progress == NULL)
+		return rf_page_online_plan_target_count_v1(start->ctrc_page_plan) == 0
+			&& cluster_recovery_cold_page_reference_terminals(start, work, scope, progress);
 	if (work->counts.subject_count > MaxAllocSize / sizeof(*subjects)
 		|| !cluster_recovery_ctrc_terminal_result_v1(start, work, &accepted)) return false;
 	bytes = (Size)work->counts.subject_count * sizeof(*subjects);
@@ -2358,6 +2423,10 @@ cluster_recovery_cold_page_completed_recheck(const struct ClusterRecoveryStartV1
 						progress, subjects, &accepted, false)) break;
 				index++;
 			}
+			if (ready)
+				ready = cluster_recovery_cold_page_reference_terminals(start, work, scope, progress)
+					&& cluster_recovery_cold_page_projection_subjects(start, work, scope,
+						progress, subjects, &accepted, false);
 		}
 	}
 	PG_FINALLY();
