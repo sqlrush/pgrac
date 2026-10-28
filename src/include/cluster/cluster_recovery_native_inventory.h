@@ -494,6 +494,13 @@ extern bool cluster_recovery_relmap_history_pending_native_pages_v1(
 extern bool cluster_recovery_relmap_history_pending_applied_pages_v1(
 	ClusterRecoveryRelmapHistory *history, const ClusterRelmapV2Image *pending,
 	ClusterRecoveryRelmapPendingNativePagesV1 *out, ClusterRecoveryNativeInventoryDiag *diag);
+/* Same original full reread and held-page reads, requiring each record's
+ * original execution route: exact founder-native consumption versus other
+ * generations' cold apply. Does not replace pending_applied_pages or promote
+ * native consumption into durability/era/lifetime/COMPLETE/release authority. */
+extern bool cluster_recovery_relmap_history_pending_consumed_pages_v1(
+	ClusterRecoveryRelmapHistory *history, const ClusterRelmapV2Image *pending,
+	ClusterRecoveryRelmapPendingNativePagesV1 *out, ClusterRecoveryNativeInventoryDiag *diag);
 /* Copy an attached snapshot without I/O or rebasing. Original metadata and
  * PAGE-current guards bracket the copy; final physical/native recheck remains
  * mandatory. A bad ordinal/overlap is an ordinary precondition refusal. */
