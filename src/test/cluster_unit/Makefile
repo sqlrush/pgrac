@@ -4802,6 +4802,23 @@ test_cluster_recovery_native_inputs: test_cluster_recovery_episode_clog_history.
 		test_cluster_recovery_episode_birth_match.inc \
 		test_cluster_recovery_episode_birth_terminal.inc test_cluster_recovery_episode_clog_side.inc \
 		test_cluster_recovery_episode_birth_halfspace.inc
+# Redirect one observation leaf only for this program; sibling providers stay original.
+test_cluster_recovery_consumed_inputs.o: $(top_srcdir)/src/backend/cluster/cluster_wal_inputs.c \
+		$(top_srcdir)/src/include/cluster/cluster_wal_retention.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_plan.h \
+		$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_tt_record.h \
+		$(top_srcdir)/src/include/cluster/storage/cluster_shared_fs.h \
+		$(top_srcdir)/src/include/access/xlogrecovery.h \
+		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h \
+		$(top_srcdir)/src/include/cluster/cluster_side_online_plan.h \
+		$(top_builddir)/src/include/pg_config.h $(srcdir)/Makefile
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-Dcluster_wal_claim_v2_read=test_wal_inputs_claim_read \
+		-Drf_side_online_plan_clog_applied_v1=test_episode_consumed_cold_applied -c $< -o $@
+
+test_cluster_recovery_native_inputs: test_cluster_recovery_consumed_inputs.o test_cluster_recovery_episode_consumed_pages.inc
 test_cluster_recovery_native_inputs: test_cluster_recovery_episode_all_clog.inc test_cluster_recovery_episode_native_pages.inc
 test_cluster_recovery_native_inputs: test_cluster_recovery_episode_applied_pages.inc \
         test_cluster_recovery_episode_applied_owner.inc test_cluster_recovery_episode_side_owner.h \
@@ -4997,7 +5014,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_relma
 		$(WAL_INPUT_CONTRIBUTION_TEST_OBJS) \
 		test_cluster_page_stable_ctrc.o \
 		cluster_page_authority_ctrc_test.o $(if $(filter test_cluster_ctrc_native_fpi,$@),$(CTRC_NATIVE_FPI_TEST_OBJS),cluster_page_install_ctrc_test.o) $(CLUSTER_PAGE_GUARD_O) \
-		test_cluster_wal_inputs_product.o \
+		$(if $(filter test_cluster_recovery_native_inputs,$@),test_cluster_recovery_consumed_inputs.o,test_cluster_wal_inputs_product.o) \
 		$(top_builddir)/src/backend/cluster/cluster_wal_history.o \
 		$(top_builddir)/src/backend/cluster/cluster_control_bootstrap.o \
 		cluster_control_bootstrap_read_test.o \
@@ -6580,7 +6597,7 @@ check_r11_source_removal_census:
 # Standard PG targets
 # ----------
 clean distclean maintainer-clean:
-	rm -f test_cluster_recovery_episode_clog.o test_cluster_recovery_episode_side_owner.o
+	rm -f test_cluster_recovery_episode_clog.o test_cluster_recovery_episode_side_owner.o test_cluster_recovery_consumed_inputs.o
 	rm -f test_cluster_side_native_clog.o
 	rm -f test_cluster_external_fence_duty.inc
 	rm -f test_cluster_resolver_cache_caller.inc test_cluster_resolver_cache_caller.inc.tmp
