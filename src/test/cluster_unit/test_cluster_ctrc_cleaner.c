@@ -7496,6 +7496,116 @@ UT_TEST(test_completion_snapshot_preserves_unavailable_zero_origin_and_attach_co
 	cluster_node_id = saved_node;
 }
 
+/* On the parent, still execute the original real snapshot; absent new
+ * diagnostic fields mean unavailable rather than a fabricated count. */
+static bool
+publisher_read_actual_snapshot(uint64 *count, int32 *origin)
+{
+	ClusterCtrcDebugSnapshot snapshot;
+
+	if (!cluster_ctrc_debug_snapshot(&snapshot))
+		return false;
+#ifdef CLUSTER_CTRC_PUBLISHER_STATS_V1
+	if (snapshot.publisher_stats_available) {
+		*count = snapshot.publisher_pending_count;
+		*origin = snapshot.publisher_origin_node_id;
+		return true;
+	}
+#endif
+	return false;
+}
+
+UT_TEST(test_publisher_gauge_observes_original_certifying_until_shared_handoff)
+{
+	ClusterCtrcOriginEntry *first, *second;
+	ClusterCtrcOriginEntry before;
+	ClusterCtrcOriginCertificateSnapshot certificate;
+	ClusterCtrcCloseDispatch dispatch;
+	ClusterCtrcDebugSnapshot old;
+	uint64 count = UINT64_MAX;
+	int32 origin = -1;
+
+	reset_fixture();
+	UT_ASSERT(publisher_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, 0);
+	UT_ASSERT_EQ(origin, 0);
+	first = seed_origin(0, 0);
+	UT_ASSERT(publisher_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, 0);
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+	(void)ctrc_origin_dispatchable_locked(first);
+	LWLockRelease(&CtrcShared->origin_lock);
+	UT_ASSERT(publisher_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, 1);
+	/* RELEASE_PROVEN still awaits notifications, but its original shared
+	 * publication handoff has completed. Disk durability is a boundary. */
+	completion_prepare_original_origin(1, &dispatch);
+	UT_ASSERT(publisher_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, 1);
+	UT_ASSERT(cluster_ctrc_debug_snapshot(&old));
+	UT_ASSERT_EQ(old.origin_release_proven, 1);
+	second = seed_origin(2, 0);
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+	(void)ctrc_origin_dispatchable_locked(second);
+	LWLockRelease(&CtrcShared->origin_lock);
+	before = *second;
+	UT_ASSERT(publisher_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, 2);
+	UT_ASSERT(memcmp(second, &before, sizeof(before)) == 0);
+	first->state = CTRC_ORIGIN_BLOCKED;
+	UT_ASSERT(publisher_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, 1);
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+	UT_ASSERT(ctrc_origin_certificate_snapshot_index_locked(2, &certificate));
+	LWLockRelease(&CtrcShared->origin_lock);
+	UT_ASSERT(ctrc_origin_certificate_commit_shared(&certificate));
+	UT_ASSERT(publisher_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, 0);
+	UT_ASSERT(cluster_ctrc_debug_snapshot(&old));
+	UT_ASSERT_EQ(old.origin_release_proven, 1);
+	UT_ASSERT_EQ(old.origin_blocked, 1);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_publisher_gauge_availability_preserves_original_snapshot_contract)
+{
+	ClusterCtrcDebugSnapshot snapshot;
+	ClusterCtrcSharedHeader *saved;
+	uint64 count = UINT64_MAX;
+	int32 origin = -1;
+	int saved_node = cluster_node_id;
+
+	reset_fixture();
+	printf("# publisher_snapshot_bytes=%zu\n", sizeof(ClusterCtrcDebugSnapshot));
+	cluster_node_id = 3;
+	UT_ASSERT(publisher_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, 0);
+	UT_ASSERT_EQ(origin, 3);
+	for (int i = 0; i < 2; i++) {
+		cluster_node_id = i == 0 ? -1 : CLUSTER_CTRC_MAX_PARTICIPANTS;
+		count = UINT64_MAX;
+		origin = -1;
+		UT_ASSERT(cluster_ctrc_debug_snapshot(&snapshot));
+		UT_ASSERT(!publisher_read_actual_snapshot(&count, &origin));
+		UT_ASSERT_EQ(count, UINT64_MAX);
+		UT_ASSERT_EQ(origin, -1);
+	}
+	cluster_node_id = 0;
+	pg_atomic_write_u32(&CtrcShared->test_barrier_phase, CTRC_TEST_BARRIER_COUNT);
+	UT_ASSERT(!publisher_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, UINT64_MAX);
+	UT_ASSERT_EQ(origin, -1);
+	pg_atomic_write_u32(&CtrcShared->test_barrier_phase, CTRC_TEST_BARRIER_NONE);
+	saved = CtrcShared;
+	CtrcShared = NULL;
+	UT_ASSERT(!publisher_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, UINT64_MAX);
+	UT_ASSERT_EQ(origin, -1);
+	CtrcShared = saved;
+	cluster_node_id = saved_node;
+	UT_ASSERT_EQ(held_count, 0);
+}
+
 int
 main(void)
 {
@@ -7503,7 +7613,7 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(177);
+	UT_PLAN(179);
 	UT_RUN(test_bounded_pool_selectors_observe_work_after_intervening_unlock);
 	UT_RUN(test_empty_bounded_pool_scan_keeps_round_robin_position);
 	UT_RUN(test_empty_pool_selectors_cancel_without_retaining_shared_locks);
@@ -7686,6 +7796,8 @@ main(void)
 	UT_RUN(test_completion_count_requires_final_origin_notification_and_is_not_progress);
 	UT_RUN(test_completion_count_covers_original_batch_and_zero_touch_retirement_once);
 	UT_RUN(test_completion_snapshot_preserves_unavailable_zero_origin_and_attach_counts);
+	UT_RUN(test_publisher_gauge_observes_original_certifying_until_shared_handoff);
+	UT_RUN(test_publisher_gauge_availability_preserves_original_snapshot_contract);
 	free(CtrcShared);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

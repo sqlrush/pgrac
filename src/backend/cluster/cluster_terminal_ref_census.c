@@ -2803,6 +2803,10 @@ cluster_ctrc_debug_snapshot(ClusterCtrcDebugSnapshot *snapshot)
 	if (snapshot == NULL || !cluster_ctrc_shmem_ready())
 		return false;
 	MemSet(snapshot, 0, sizeof(*snapshot));
+	snapshot->publisher_stats_available
+		= cluster_node_id >= 0 && cluster_node_id < CLUSTER_CTRC_MAX_PARTICIPANTS;
+	if (snapshot->publisher_stats_available)
+		snapshot->publisher_origin_node_id = cluster_node_id;
 	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
 	for (i = 0; i < CtrcShared->origin_key_entries; i++) {
 		switch ((ClusterCtrcOriginState)ctrc_origin_entries()[i].state) {
@@ -2814,6 +2818,9 @@ cluster_ctrc_debug_snapshot(ClusterCtrcDebugSnapshot *snapshot)
 		case CTRC_ORIGIN_CLEANING:
 		case CTRC_ORIGIN_CERTIFYING:
 			snapshot->origin_sealing++;
+			if (snapshot->publisher_stats_available
+				&& ctrc_origin_entries()[i].state == CTRC_ORIGIN_CERTIFYING)
+				snapshot->publisher_pending_count++;
 			break;
 		case CTRC_ORIGIN_RELEASE_PROVEN:
 			snapshot->origin_release_proven++;

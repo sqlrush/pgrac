@@ -1313,3 +1313,14 @@
 | `ctrc_real_completion_count` | uint64 十进制文本 | 本 postmaster 生命周期内，原 origin 清偿责任实际退休的次数；原证书和全部必要通知完成后，每次成功退休恰好加一。零参与者的成功退休也计入。 |
 
 receipt 清理、参与者 ACK、证书发表、一般状态推进、重复回复或失败重试都不单独增加完成计数。计数表示原清偿责任完成，不表示 allocator 已复用事务槽或已回收 undo 块。统计跨 worker 累计，attach 不清零；可用的真实 0 与不可用不同，比较时间窗增量时同时保留 origin 和实例生命周期。
+
+
+## Cleaner 待发表条目（分类 `ctrc`）
+
+| 键 | 值 | 读法 |
+|---|---|---|
+| `ctrc_publisher_stats_available` | `true` / `false` | 原诊断快照成功且本实例 origin 有效时为 `true`；否则省略以下 origin 和计数，不把不可用展示成 0。 |
+| `ctrc_publisher_origin_node_id` | 非负整数文本 | 执行观察的本实例节点号，从 0 开始；不是远端事务节点号或集群合计。 |
+| `ctrc_publisher_pending_count` | uint64 十进制文本 | 原本地 origin 表处于 `CERTIFYING` 的条目数；反映共享发表 handoff 尚未完成，可包括写入前或已耐久但尚未 handoff 的条目。 |
+
+这是查询时的阶段快照，退回 `BLOCKED` 或进入 `RELEASE_PROVEN` 后不再计入。`RELEASE_PROVEN` 仍可能等待通知或最终责任退休，不能据该计数为 0 推断所有清偿已完成。阶段观察也不证明磁盘耐久、owner 可运行、槽可复用或 undo 可回收；原身份和释放检查仍由实际使用路径完成。该值不是自 postmaster 启动累计的完成数。

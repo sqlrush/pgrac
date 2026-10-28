@@ -4638,9 +4638,24 @@ dump_ctrc_no_progress(ReturnSetInfo *rsinfo)
 }
 
 static void
+dump_ctrc_publisher(ReturnSetInfo *rsinfo, const ClusterCtrcDebugSnapshot *snapshot)
+{
+	bool available = snapshot != NULL && snapshot->publisher_stats_available;
+
+	emit_row(rsinfo, "ctrc", "ctrc_publisher_stats_available", available ? "true" : "false");
+	if (!available)
+		return;
+	emit_row(rsinfo, "ctrc", "ctrc_publisher_origin_node_id",
+			 fmt_int64(snapshot->publisher_origin_node_id));
+	emit_row(rsinfo, "ctrc", "ctrc_publisher_pending_count",
+			 fmt_uint64(snapshot->publisher_pending_count));
+}
+
+static void
 dump_ctrc(ReturnSetInfo *rsinfo)
 {
 	ClusterCtrcDebugSnapshot snapshot;
+	bool snapshot_available;
 	ClusterCtrcCleanerReason reason;
 	const char *reason_name;
 	int i;
@@ -4652,7 +4667,9 @@ dump_ctrc(ReturnSetInfo *rsinfo)
 	dump_ctrc_completion(rsinfo);
 	dump_ctrc_no_progress(rsinfo);
 	MemSet(&snapshot, 0, sizeof(snapshot));
-	if (!cluster_ctrc_debug_snapshot(&snapshot))
+	snapshot_available = cluster_ctrc_debug_snapshot(&snapshot);
+	dump_ctrc_publisher(rsinfo, snapshot_available ? &snapshot : NULL);
+	if (!snapshot_available)
 		return;
 	reason = cluster_ctrc_cleaner_reason_get();
 	reason_name = cluster_ctrc_cleaner_reason_name(reason);

@@ -855,6 +855,8 @@ extern void cluster_ctrc_active_scan_step_source(
 	ClusterCtrcActiveScan *scan, const struct ClusterSemanticActiveSampleFence *source);
 
 
+#define CLUSTER_CTRC_PUBLISHER_STATS_V1 1
+
 typedef struct ClusterCtrcDebugSnapshot {
 	uint64 origin_open;
 	uint64 origin_sealing;
@@ -875,6 +877,11 @@ typedef struct ClusterCtrcDebugSnapshot {
 	uint64 test_barrier_hit_count;
 	uint32 test_barrier_phase;
 	uint32 cleaner_reason;
+	/* Require snapshot success and field availability; phase only, not
+	 * durable release, owner liveness, notifications or allocator proof. */
+	uint64 publisher_pending_count;
+	int32 publisher_origin_node_id;
+	bool publisher_stats_available;
 } ClusterCtrcDebugSnapshot;
 
 typedef enum ClusterCtrcCapacityDisposition {
