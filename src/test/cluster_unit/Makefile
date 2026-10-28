@@ -7969,12 +7969,14 @@ test_cluster_r4_lms_controls: test_cluster_r4_lms_controls.c unit_test.h \
 # function-sectioned CR-server object and source-check all four legacy callers.
 CLUSTER_R4_SLOT_RESERVATION_TEST_O = test_cluster_r4_slot_reservation_product.o
 
-# Execute the exact inline entry, with constructor/I/O/reply and memory-context
-# boundaries supplied by the test. No copied policy or product test branch.
+# Execute the exact inline entry and reply construction/shipping. The test
+# supplies the constructor, transport and memory-context boundaries.
 test_cluster_cr_inline_stop.inc: $(top_srcdir)/src/backend/cluster/cluster_cr_server.c Makefile
-	awk '/^cluster_gcs_block_forward_serve_inline\(/ { print "void"; emit=1; count++ } \
-	     emit { print } /^}/ { emit=0 } \
-	     END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	awk '/^typedef struct (ClusterCrServerShared|LmsOrdinaryReplyObservation) / { emit=1; types++ } \
+	     /^static ClusterCrServerShared \*CrServerShared/ { print; globals++ } \
+	     /^(cr_ordinary_reply_capture|cr_ordinary_reply_emit|cr_ordinary_reply_note|cr_build_and_send_reply|cluster_lms_cr_ship_ready|cluster_gcs_block_forward_serve_inline)\(/ \
+	     { print previous; emit=1; count++ } emit { print } /^}/ { emit=0 } \
+	     { previous=$$0 } END { if (count != 6 || types != 2 || globals != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_cr_inline_stop: test_cluster_cr_inline_stop.c test_cluster_cr_inline_stop.inc unit_test.h
