@@ -193,3 +193,22 @@ test_episode_native_clog_local_bounds(bool on, uint64 next, TransactionId oldest
 		saved = false;
 	episode_clog_unlocked();
 }
+
+/* Complete native producer bodies keep their original locks and no-op rules. */
+void
+test_episode_native_clog_advance_next(TransactionId xid)
+{
+	bool was_postmaster = IsUnderPostmaster;
+	IsUnderPostmaster = true;
+	UT_ASSERT(AmStartupProcess());
+	fixture_native_advance_next_full_xid(xid);
+	IsUnderPostmaster = was_postmaster;
+	episode_clog_unlocked();
+}
+
+void
+test_episode_native_clog_advance_oldest(TransactionId xid)
+{
+	fixture_native_advance_oldest_clog_xid(xid);
+	episode_clog_unlocked();
+}
