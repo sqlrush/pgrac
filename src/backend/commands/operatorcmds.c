@@ -8,6 +8,10 @@
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
+ * PGRAC MODIFICATIONS
+ *    Enforce the shared operator scope at native command entry points.
+ *    Author: SqlRush <sqlrush@gmail.com>
+ *
  * IDENTIFICATION
  *	  src/backend/commands/operatorcmds.c
  *
@@ -40,6 +44,9 @@
 #include "catalog/pg_operator.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h"
+#endif
 #include "commands/alter.h"
 #include "commands/defrem.h"
 #include "miscadmin.h"
@@ -54,6 +61,18 @@
 
 static Oid	ValidateRestrictionEstimator(List *restrictionName);
 static Oid	ValidateJoinEstimator(List *joinName);
+
+#ifdef USE_PGRAC_CLUSTER
+/* Direct callers share the original utility refusal before catalog work. */
+static void
+CheckClusterSharedOperatorSupport(void)
+{
+	if (cluster_shared_config || cluster_shared_catalog)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("custom operators is not supported in shared mode"),
+						errdetail("PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED")));
+}
+#endif
 
 /*
  * DefineOperator
@@ -89,6 +108,10 @@ DefineOperator(List *names, List *parameters)
 	ListCell   *pl;
 
 	/* Convert list of names to a name and namespace */
+#ifdef USE_PGRAC_CLUSTER
+	CheckClusterSharedOperatorSupport();
+#endif
+
 	oprNamespace = QualifiedNameGetCreationNamespace(names, &oprName);
 
 	/* Check we have creation rights in target namespace */
@@ -461,6 +484,10 @@ AlterOperator(AlterOperatorStmt *stmt)
 	Oid			joinOid;
 
 	/* Look up the operator */
+#ifdef USE_PGRAC_CLUSTER
+	CheckClusterSharedOperatorSupport();
+#endif
+
 	oprId = LookupOperWithArgs(stmt->opername, false);
 	catalog = table_open(OperatorRelationId, RowExclusiveLock);
 	tup = SearchSysCacheCopy1(OPEROID, ObjectIdGetDatum(oprId));

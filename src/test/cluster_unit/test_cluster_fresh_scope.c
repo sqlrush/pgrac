@@ -38,6 +38,7 @@
 #include "catalog/pg_foreign_server.h"
 #include "catalog/pg_language.h"
 #include "catalog/pg_namespace.h"
+#include "catalog/pg_operator.h"
 #include "catalog/pg_policy.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_statistic_ext.h"
@@ -66,6 +67,7 @@
 #include "miscadmin.h"
 #include "nodes/value.h"
 #include "parser/parse_node.h"
+#include "parser/parse_oper.h"
 #include "parser/parse_type.h"
 #include "port/pg_crc32c.h"
 #include "storage/fd.h"
@@ -7778,9 +7780,21 @@ static ListCell conversion_name_cell;
 static List conversion_names;
 static CreateConversionStmt native_conversion_stmt;
 
+static bool operator_lookup_active;
+static unsigned operator_entry_kind, operator_lookups, operator_bad_lookup, operator_lookup_kind;
+static List operator_names;
+static ObjectWithArgs native_operator_args;
+
 Oid
 QualifiedNameGetCreationNamespace(List *names, char **objname)
 {
+	if (operator_lookup_active) {
+		operator_lookups++;
+		operator_lookup_kind = 1;
+		if (operator_entry_kind >= 2 || names != &operator_names || objname == NULL)
+			operator_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before the real operator namespace lookup. */
+	}
 	if (function_lookup_active) {
 		function_lookups++;
 		function_lookup_kind = 1;
@@ -10020,10 +10034,216 @@ UT_TEST(test_native_statistics_alter_target_error_keeps_early_binding)
 	statistics_lookup_active = false;
 }
 
+/* Actual unsupported-operator entries stop before their first real lookup. */
+Oid
+LookupOperWithArgs(ObjectWithArgs *oper, bool noError)
+{
+	operator_lookups++;
+	operator_lookup_kind = 2;
+	if (!operator_lookup_active || operator_entry_kind < 2 || oper != &native_operator_args
+		|| noError)
+		operator_bad_lookup++;
+	siglongjmp(boundary, 2);
+}
+
+#include "test_cluster_fresh_operator.inc"
+
+static String operator_name_nodes[2], operator_function_name;
+static ListCell operator_name_cells[2], operator_arg_cells[2], operator_parameter_cell,
+	operator_function_cell;
+static List operator_arg_types, operator_parameters, operator_function_names;
+static TypeName operator_arg_type;
+static DefElem operator_parameter;
+static DefineStmt native_operator_define;
+static AlterOperatorStmt native_operator_alter;
+static const bool operator_shared_modes[] = { false, true, false, true, true, true, true, true };
+
+static void
+reset_native_operator(unsigned kind)
+{
+	reset_create_preflight();
+	operator_lookup_active = true;
+	operator_entry_kind = kind;
+	operator_lookups = operator_bad_lookup = operator_lookup_kind = 0;
+	operator_name_nodes[0] = (String){ .type = T_String, .sval = "native_schema" };
+	operator_name_nodes[1] = (String){ .type = T_String, .sval = "===" };
+	operator_name_cells[0] = (ListCell){ .ptr_value = &operator_name_nodes[kind % 2 ? 0 : 1] };
+	operator_name_cells[1] = (ListCell){ .ptr_value = &operator_name_nodes[1] };
+	operator_names = (List){ .type = T_List,
+							 .length = kind % 2 ? 2 : 1,
+							 .max_length = 2,
+							 .elements = operator_name_cells };
+	operator_arg_type = (TypeName){ .type = T_TypeName, .typeOid = INT4OID };
+	operator_arg_cells[0] = (ListCell){ .ptr_value = kind == 3 ? NULL : &operator_arg_type };
+	operator_arg_cells[1] = (ListCell){ .ptr_value = &operator_arg_type };
+	operator_arg_types
+		= (List){ .type = T_List, .length = 2, .max_length = 2, .elements = operator_arg_cells };
+	native_operator_args = (ObjectWithArgs){ .type = T_ObjectWithArgs,
+											 .objname = &operator_names,
+											 .objargs = &operator_arg_types };
+	operator_function_name = (String){ .type = T_String, .sval = "operator_function" };
+	operator_function_cell = (ListCell){ .ptr_value = &operator_function_name };
+	operator_function_names = (List){ .type = T_List,
+									  .length = 1,
+									  .max_length = 1,
+									  .elements = &operator_function_cell };
+	operator_parameter = (DefElem){ .type = T_DefElem,
+									.defname = kind < 2 ? "function" : "restrict",
+									.arg = kind < 2 ? (Node *)&operator_function_names : NULL };
+	operator_parameter_cell = (ListCell){ .ptr_value = &operator_parameter };
+	operator_parameters = (List){ .type = T_List,
+								  .length = 1,
+								  .max_length = 1,
+								  .elements = &operator_parameter_cell };
+	native_operator_define = (DefineStmt){ .type = T_DefineStmt,
+										   .kind = OBJECT_OPERATOR,
+										   .defnames = &operator_names,
+										   .definition = kind % 2 ? &operator_parameters : NIL };
+	native_operator_alter = (AlterOperatorStmt){ .type = T_AlterOperatorStmt,
+												 .opername = &native_operator_args,
+												 .options = kind % 2 ? &operator_parameters : NIL };
+}
+
+static void
+native_operator_entry(unsigned kind)
+{
+	if (kind < 2)
+		(void)DefineOperator(native_operator_define.defnames, native_operator_define.definition);
+	else
+		(void)AlterOperator(&native_operator_alter);
+}
+
+static void
+set_native_operator_mode(unsigned mode)
+{
+	cluster_shared_catalog = (mode & 1) != 0;
+	utility_storage_mode = (mode & 2) != 0;
+	cluster_shared_config = (mode & 4) != 0;
+}
+
+UT_TEST(test_native_operator_scope_matches_utility_before_lookup_or_binding)
+{
+	for (unsigned kind = 0; kind < 4; kind++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			int caught;
+
+			reset_native_operator(kind);
+			set_native_operator_mode(mode);
+			if (operator_shared_modes[mode]) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					create_sql_entry(kind < 2 ? (Node *)&native_operator_define
+											  : (Node *)&native_operator_alter);
+				UT_ASSERT_EQ(caught, 1);
+				UT_ASSERT_EQ(error_code, ERRCODE_FEATURE_NOT_SUPPORTED);
+				UT_ASSERT_STR_EQ(error_message, "custom operators is not supported in shared mode");
+				UT_ASSERT_STR_EQ(error_detail,
+								 "PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+				reset_error();
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_operator_entry(kind);
+			UT_ASSERT_EQ(caught, operator_shared_modes[mode] ? 1 : 2);
+			UT_ASSERT_EQ(error_code,
+						 operator_shared_modes[mode] ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+			if (operator_shared_modes[mode]) {
+				UT_ASSERT_STR_EQ(error_message, "custom operators is not supported in shared mode");
+				UT_ASSERT_STR_EQ(error_detail,
+								 "PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+			}
+			UT_ASSERT_EQ(operator_lookups, operator_shared_modes[mode] ? 0 : 1);
+			UT_ASSERT_EQ(operator_lookup_kind, operator_shared_modes[mode] ? 0 : kind < 2 ? 1 : 2);
+			UT_ASSERT_EQ(operator_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			UT_ASSERT_EQ(utility_top_xid, InvalidTransactionId);
+		}
+	}
+	operator_lookup_active = false;
+}
+
+UT_TEST(test_native_operator_scope_refusal_precedes_context_child_top_and_publication)
+{
+	for (unsigned kind = 0; kind < 4; kind++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			for (unsigned guard = 0; guard < 6; guard++) {
+				int caught;
+
+				reset_native_operator(kind);
+				set_native_operator_mode(mode);
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				utility_in_child = guard == 3;
+				if (guard == 4) {
+					utility_current_xid = 401;
+					utility_top_xid = 400;
+				}
+				utility_bind_ok = guard != 5;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_operator_entry(kind);
+				UT_ASSERT_EQ(caught, operator_shared_modes[mode] ? 1 : 2);
+				UT_ASSERT_EQ(error_code,
+							 operator_shared_modes[mode] ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+				if (operator_shared_modes[mode]) {
+					UT_ASSERT_STR_EQ(error_message,
+									 "custom operators is not supported in shared mode");
+					UT_ASSERT_STR_EQ(
+						error_detail,
+						"PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+				}
+				UT_ASSERT_EQ(operator_lookups, operator_shared_modes[mode] ? 0 : 1);
+				UT_ASSERT_EQ(operator_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+				UT_ASSERT_EQ(utility_top_xid, guard == 4 ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	operator_lookup_active = false;
+}
+
+UT_TEST(test_native_operator_scope_refusal_preserves_existing_top_binding)
+{
+	for (unsigned kind = 0; kind < 4; kind++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			AlterStatsStmt supported = { .type = T_AlterStatsStmt, .stxstattarget = 100 };
+			int caught;
+
+			reset_native_operator(kind);
+			create_sql_entry((Node *)&supported);
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			set_native_operator_mode(mode);
+			XactReadOnly = utility_parallel = utility_recovery = utility_in_child = true;
+			utility_bind_ok = false;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_operator_entry(kind);
+			UT_ASSERT_EQ(caught, operator_shared_modes[mode] ? 1 : 2);
+			UT_ASSERT_EQ(error_code,
+						 operator_shared_modes[mode] ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+			if (operator_shared_modes[mode]) {
+				UT_ASSERT_STR_EQ(error_message, "custom operators is not supported in shared mode");
+				UT_ASSERT_STR_EQ(error_detail,
+								 "PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+			}
+			UT_ASSERT_EQ(operator_lookups, operator_shared_modes[mode] ? 0 : 1);
+			UT_ASSERT_EQ(operator_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			UT_ASSERT_EQ(utility_top_xid, 400);
+		}
+	}
+	operator_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(146);
+	UT_PLAN(149);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -10170,6 +10390,9 @@ main(void)
 	UT_RUN(test_native_statistics_alter_context_guards_keep_nonshared_route);
 	UT_RUN(test_native_statistics_alter_utility_warm_guards_preserve_binding);
 	UT_RUN(test_native_statistics_alter_target_error_keeps_early_binding);
+	UT_RUN(test_native_operator_scope_matches_utility_before_lookup_or_binding);
+	UT_RUN(test_native_operator_scope_refusal_precedes_context_child_top_and_publication);
+	UT_RUN(test_native_operator_scope_refusal_preserves_existing_top_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
