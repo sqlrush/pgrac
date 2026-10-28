@@ -192,6 +192,15 @@ extern bool cluster_undo_smgr_recovery_ctrc_matches_v2(ClusterUndoSmgrRecoverySt
 extern bool cluster_undo_smgr_recovery_ctrc_write_v2(ClusterUndoSmgrRecoveryStampV1 stamp);
 extern bool cluster_undo_smgr_recovery_ctrc_write_bound_v2(ClusterUndoSmgrRecoveryStampV1 stamp,
 	const uint8 *payload, size_t length);
+/* Re-read the completed stage's entire expected-after block0 through its
+ * same held descriptor and original header lock. Requires the exact D0
+ * payload, live ResourceOwner and successful write/sync/postread first.
+ * No reopen, mutation, flush, allocation or release. Entered refusal/ERROR
+ * stays failed and keeps the FD until original cleanup. This is a storage
+ * observation only; original graph/source/current authority, retention,
+ * window and joint completion proofs remain the caller's obligations. */
+extern bool cluster_undo_smgr_recovery_ctrc_readback_v2(ClusterUndoSmgrRecoveryStampV1 stamp,
+	const uint8 *payload, size_t length);
 extern bool cluster_undo_smgr_recovery_ctrc_close_v2(ClusterUndoSmgrRecoveryStampV1 stamp);
 #endif
 
