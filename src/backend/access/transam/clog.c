@@ -1986,11 +1986,15 @@ static bool
 clog_recovery_own_full_record(int origin, const ClusterSideProjectionOperationV1 *op,
 	bool verify, const uint8 *payload, uint32 length)
 {
-	volatile bool locked = false, ok = false, finished = false;
+	volatile bool locked = false, native_locked = false, ok = false, finished = false;
+	xl_clog_zeropage_full birth;
 	LWLock *lock;
 
 	/* Own legacy ZERO/TRUNCATE and C0 terminal permissions remain separate. */
-	if (!clog_recovery_full_record_shape(op, payload, length)
+	if (payload == NULL || length != sizeof(birth))
+		return false;
+	memcpy(&birth, payload, sizeof(birth));
+	if (!clog_recovery_full_record_shape(op, (const uint8 *)&birth, sizeof(birth))
 		|| !clog_recovery_own_full_directory_ready(origin))
 		return false;
 	if (!verify)
@@ -2001,10 +2005,45 @@ clog_recovery_own_full_record(int origin, const ClusterSideProjectionOperationV1
 		LWLockAcquire(lock, LW_EXCLUSIVE);
 		locked = true;
 		ok = clog_recovery_own_full_zero(origin, op->page_number, verify);
+		if (ok && !verify) {
+			SlruShared shared = XactCtl->shared;
+
+			/* Only this successful apply supplies initialization input. The
+			 * original sync and independent disk read have already completed;
+			 * verification alone must never restore birth from historical WAL.
+			 * Keep the original cold lock and recheck the resident native page. */
+			native_locked = true;
+			LWLockAcquire(shared->ControlLock, LW_EXCLUSIVE);
+			ok = false;
+			if (clog_recovery_own_full_permitted(origin)) {
+				for (int slot = 0; slot < shared->num_slots; slot++) {
+					bool zero = true;
+
+					if (shared->page_status[slot] != SLRU_PAGE_VALID
+						|| shared->page_number[slot] != birth.pageno || shared->page_dirty[slot])
+						continue;
+					for (int i = 0; i < BLCKSZ && zero; i++)
+						zero = shared->page_buffer[slot][i] == 0;
+					if (zero) {
+						shared->page_initial_full_xid[slot] = birth.first_full_xid;
+						ok = true;
+					}
+					break;
+				}
+			}
+			LWLockRelease(shared->ControlLock);
+			native_locked = false;
+		}
 		finished = true;
 	}
 	PG_FINALLY();
 	{
+		if (native_locked && LWLockHeldByMe(XactCtl->shared->ControlLock)) {
+			/* ERROR clears holdoffs for both original native and cold locks. */
+			if (!finished)
+				HOLD_INTERRUPTS();
+			LWLockRelease(XactCtl->shared->ControlLock);
+		}
 		if (locked) {
 			if (!finished)
 				HOLD_INTERRUPTS();
