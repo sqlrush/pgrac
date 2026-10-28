@@ -21,6 +21,7 @@
 #include "replication/decode.h"
 #include "replication/logical.h"
 #include "replication/slot.h"
+#include "storage/procarray.h"
 #include "utils/builtins.h"
 #include "utils/inval.h"
 #include "utils/pg_lsn.h"
@@ -807,76 +808,107 @@ copy_replication_slot(FunctionCallInfo fcinfo, bool logical_slot)
 		bool		copy_islogical;
 		char	   *copy_name;
 
-		/* Copy data of source slot again */
-		SpinLockAcquire(&src->mutex);
-		second_slot_contents = *src;
-		SpinLockRelease(&src->mutex);
+		/* Keep the original aggregation lock pair across the second source
+		 * view and destination publication, so retirement cannot open a gap. */
+		LWLockAcquire(ReplicationSlotControlLock, LW_EXCLUSIVE);
+		LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
+		PG_TRY();
+		{
+			if (!src->in_use)
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("source replication slot \"%s\" is no longer available for copying",
+								NameStr(*src_name))));
 
-		copy_effective_xmin = second_slot_contents.effective_xmin;
-		copy_effective_catalog_xmin = second_slot_contents.effective_catalog_xmin;
+			/* Copy data of source slot again */
+			SpinLockAcquire(&src->mutex);
+			second_slot_contents = *src;
+			SpinLockRelease(&src->mutex);
 
-		copy_xmin = second_slot_contents.data.xmin;
-		copy_catalog_xmin = second_slot_contents.data.catalog_xmin;
-		copy_restart_lsn = second_slot_contents.data.restart_lsn;
-		copy_confirmed_flush = second_slot_contents.data.confirmed_flush;
+			copy_effective_xmin = second_slot_contents.effective_xmin;
+			copy_effective_catalog_xmin = second_slot_contents.effective_catalog_xmin;
 
-		/* for existence check */
-		copy_name = NameStr(second_slot_contents.data.name);
-		copy_islogical = SlotIsLogical(&second_slot_contents);
+			copy_xmin = second_slot_contents.data.xmin;
+			copy_catalog_xmin = second_slot_contents.data.catalog_xmin;
+			copy_restart_lsn = second_slot_contents.data.restart_lsn;
+			copy_confirmed_flush = second_slot_contents.data.confirmed_flush;
 
-		/*
-		 * Check if the source slot still exists and is valid. We regard it as
-		 * invalid if the type of replication slot or name has been changed,
-		 * or the restart_lsn either is invalid or has gone backward. (The
-		 * restart_lsn could go backwards if the source slot is dropped and
-		 * copied from an older slot during installation.)
-		 *
-		 * Since erroring out will release and drop the destination slot we
-		 * don't need to release it here.
-		 */
-		if (copy_restart_lsn < src_restart_lsn ||
-			src_islogical != copy_islogical ||
-			strcmp(copy_name, NameStr(*src_name)) != 0)
-			ereport(ERROR,
-					(errmsg("could not copy replication slot \"%s\"",
-							NameStr(*src_name)),
-					 errdetail("The source replication slot was modified incompatibly during the copy operation.")));
+			/* for existence check */
+			copy_name = NameStr(second_slot_contents.data.name);
+			copy_islogical = SlotIsLogical(&second_slot_contents);
 
-		/* The source slot must have a consistent snapshot */
-		if (src_islogical && XLogRecPtrIsInvalid(copy_confirmed_flush))
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("cannot copy unfinished logical replication slot \"%s\"",
-							NameStr(*src_name)),
-					 errhint("Retry when the source replication slot's confirmed_flush_lsn is valid.")));
+			/*
+			 * Check if the source slot still exists and is valid. We regard it as
+			 * invalid if the type of replication slot or name has been changed,
+			 * or the restart_lsn either is invalid or has gone backward. (The
+			 * restart_lsn could go backwards if the source slot is dropped and
+			 * copied from an older slot during installation.)
+			 *
+			 * Since erroring out will release and drop the destination slot we
+			 * don't need to release it here.
+			 */
+			if (copy_restart_lsn < src_restart_lsn ||
+				src_islogical != copy_islogical ||
+				strcmp(copy_name, NameStr(*src_name)) != 0)
+				ereport(ERROR,
+						(errmsg("could not copy replication slot \"%s\"",
+								NameStr(*src_name)),
+						 errdetail("The source replication slot was modified incompatibly during the copy operation.")));
 
-		/*
-		 * Copying an invalid slot doesn't make sense. Note that the source
-		 * slot can become invalid after we creat the new slot and copy the
-		 * data of source slot. This is possible because the operations in
-		 * InvalidateObsoleteReplicationSlots() are not serialized with this
-		 * function. Even though we can't detect such a case here, the copied
-		 * slot will become invalid in the next checkpoint cycle.
-		 */
-		if (second_slot_contents.data.invalidated != RS_INVAL_NONE)
-			ereport(ERROR,
-					errmsg("cannot copy replication slot \"%s\"",
-						   NameStr(*src_name)),
-					errdetail("The source replication slot was invalidated during the copy operation."));
+			/* The source slot must have a consistent snapshot */
+			if (src_islogical && XLogRecPtrIsInvalid(copy_confirmed_flush))
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("cannot copy unfinished logical replication slot \"%s\"",
+								NameStr(*src_name)),
+						 errhint("Retry when the source replication slot's confirmed_flush_lsn is valid.")));
 
-		/* Install copied values again */
-		SpinLockAcquire(&MyReplicationSlot->mutex);
-		MyReplicationSlot->effective_xmin = copy_effective_xmin;
-		MyReplicationSlot->effective_catalog_xmin = copy_effective_catalog_xmin;
+			/*
+			 * Copying an invalid slot doesn't make sense. Note that the source
+			 * slot can become invalid after we creat the new slot and copy the
+			 * data of source slot. This is possible because the operations in
+			 * InvalidateObsoleteReplicationSlots() are not serialized with this
+			 * function. Even though we can't detect such a case here, the copied
+			 * slot will become invalid in the next checkpoint cycle.
+			 */
+			if (second_slot_contents.data.invalidated != RS_INVAL_NONE)
+				ereport(ERROR,
+						errmsg("cannot copy replication slot \"%s\"",
+							   NameStr(*src_name)),
+						errdetail("The source replication slot was invalidated during the copy operation."));
 
-		MyReplicationSlot->data.xmin = copy_xmin;
-		MyReplicationSlot->data.catalog_xmin = copy_catalog_xmin;
-		MyReplicationSlot->data.restart_lsn = copy_restart_lsn;
-		MyReplicationSlot->data.confirmed_flush = copy_confirmed_flush;
-		SpinLockRelease(&MyReplicationSlot->mutex);
+#ifdef USE_PGRAC_CLUSTER
+			/* Neither stored nor effective raw history may resurrect a pin
+			 * after H was exported without a matching SCN interval. */
+			if (!ProcArrayReplicationFeedbackAllowed(
+						copy_effective_xmin, copy_effective_catalog_xmin) ||
+				!ProcArrayReplicationFeedbackAllowed(copy_xmin, copy_catalog_xmin))
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("copied replication history is not covered by the retained cluster read horizon")));
+#endif
 
-		ReplicationSlotMarkDirty();
-		ReplicationSlotsComputeRequiredXmin(false);
+			/* Install copied values again */
+			SpinLockAcquire(&MyReplicationSlot->mutex);
+			MyReplicationSlot->effective_xmin = copy_effective_xmin;
+			MyReplicationSlot->effective_catalog_xmin = copy_effective_catalog_xmin;
+
+			MyReplicationSlot->data.xmin = copy_xmin;
+			MyReplicationSlot->data.catalog_xmin = copy_catalog_xmin;
+			MyReplicationSlot->data.restart_lsn = copy_restart_lsn;
+			MyReplicationSlot->data.confirmed_flush = copy_confirmed_flush;
+			SpinLockRelease(&MyReplicationSlot->mutex);
+
+			ReplicationSlotMarkDirty();
+			ReplicationSlotsComputeRequiredXmin(true);
+		}
+		PG_FINALLY();
+		{
+			LWLockRelease(ProcArrayLock);
+			LWLockRelease(ReplicationSlotControlLock);
+		}
+		PG_END_TRY();
+
 		ReplicationSlotsComputeRequiredLSN();
 		ReplicationSlotSave();
 

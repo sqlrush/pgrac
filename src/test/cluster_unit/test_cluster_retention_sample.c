@@ -15,9 +15,12 @@
 #include "access/twophase.h"
 #include "access/transam.h"
 #include "access/xact.h"
+#include "access/htup_details.h"
+#include "access/xlog_internal.h"
 #include "cluster/cluster_undo_retention.h"
 #include "cluster/cluster_mrp.h"
 #include "libpq/pqformat.h"
+#include "funcapi.h"
 #include "miscadmin.h"
 #include "replication/logical.h"
 #include "replication/reorderbuffer.h"
@@ -27,6 +30,7 @@
 #include "storage/proc.h"
 #include "storage/procarray.h"
 #include "utils/builtins.h"
+#include "utils/pg_lsn.h"
 #include "test_cluster_pgproc_active_types.inc"
 
 #undef printf
@@ -73,6 +77,25 @@ static unsigned safe_xmin_calls, slot_saves, logical_starts;
 static TransactionId logical_start_xmin;
 static LogicalDecodingContext logical_context;
 static ReorderBuffer logical_reorder;
+static ReplicationSlotCtlData *copy_storage;
+static bool copy_active;
+static unsigned copy_creations, copy_releases, copy_persists, copy_lsn_computes;
+static unsigned copy_race_seen, copy_race_deferred;
+static NameData copy_result_name;
+static HeapTupleData copy_result_tuple;
+static HeapTupleHeaderData copy_result_header;
+static const XLogRecPtr copy_restart = UINT64CONST(33554432);
+int wal_segment_size = 16 * 1024 * 1024;
+typedef enum CopySchedule
+{
+	COPY_NO_INTERLEAVE,
+	COPY_FINAL_CHECK_RETIRE,
+	COPY_RETIRE_BEFORE_SECOND_READ,
+	COPY_DROP_BEFORE_SECOND_READ,
+	COPY_BAD_RESTART_BEFORE_SECOND_READ
+} CopySchedule;
+static CopySchedule copy_schedule;
+static void copy_retire_source_and_sample(void);
 
 int
 s_lock(volatile slock_t *lock, const char *file, int line, const char *func)
@@ -94,6 +117,8 @@ bool errstart(int level, const char *domain) { (void)domain; return level >= ERR
 bool errstart_cold(int level, const char *domain) { return errstart(level, domain); }
 int errmsg(const char *format, ...) { (void)format; return 0; }
 int errmsg_internal(const char *format, ...) { (void)format; return 0; }
+int errdetail(const char *format, ...) { (void)format; return 0; }
+int errhint(const char *format, ...) { (void)format; return 0; }
 int errcode(int code) { feedback_error_code = code; return 0; }
 void
 errfinish(const char *file, int line, const char *function)
@@ -257,7 +282,8 @@ StartupDecodingContext(List *options, XLogRecPtr start_lsn, TransactionId xmin,
 					   LogicalOutputPluginWriterWrite write,
 					   LogicalOutputPluginWriterUpdateProgress progress)
 {
-	UT_ASSERT(options == NIL && start_lsn == 4096 && in_create && !fast_forward);
+	UT_ASSERT(options == NIL && start_lsn == (copy_active ? copy_restart : 4096)
+			  && in_create && !fast_forward);
 	UT_ASSERT(routine == NULL && prepare == NULL && write == NULL && progress == NULL);
 	UT_ASSERT(!held && !control_held && !xidgen_held && slot_saves == 1);
 	UT_ASSERT_EQ(MyReplicationSlot->effective_catalog_xmin, xmin);
@@ -285,9 +311,143 @@ startup_cb_wrapper(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool i
 #include "test_cluster_retention_feedback.inc"
 #include "test_cluster_retention_logical.inc"
 
+/* Allocation/disk, SQL result construction and WAL-LSN aggregation are
+ * boundaries. The complete native copy entry and physical creator execute. */
+void CheckSlotPermissions(void) {}
+void CheckSlotRequirements(void) {}
+TypeFuncClass
+get_call_result_type(FunctionCallInfo fcinfo, Oid *result_type, TupleDesc *desc)
+{
+	(void)result_type;
+	UT_ASSERT(copy_active && fcinfo->nargs == 2);
+	*desc = NULL;
+	return TYPEFUNC_COMPOSITE;
+}
+HeapTuple
+heap_form_tuple(TupleDesc desc, Datum *values, bool *nulls)
+{
+	UT_ASSERT(desc == NULL && !nulls[0] && copy_active);
+	copy_result_name = *(Name)DatumGetPointer(values[0]);
+	copy_result_tuple.t_data = &copy_result_header;
+	return &copy_result_tuple;
+}
+Datum
+HeapTupleHeaderGetDatum(HeapTupleHeader tuple)
+{
+	UT_ASSERT(tuple == &copy_result_header && !HeapTupleHeaderHasExternal(tuple));
+	return PointerGetDatum(tuple);
+}
+void
+ReplicationSlotsComputeRequiredLSN(void)
+{
+	UT_ASSERT(copy_active && !held && !control_held);
+	copy_lsn_computes++;
+}
+void
+ReplicationSlotPersist(void)
+{
+	UT_ASSERT(copy_active && MyReplicationSlot != NULL);
+	UT_ASSERT(!held && !control_held && slot_saves == 2);
+	copy_persists++;
+}
+void
+ReplicationSlotRelease(void)
+{
+	UT_ASSERT(copy_active && MyReplicationSlot != NULL);
+	UT_ASSERT(!held && !control_held && copy_lsn_computes == 1);
+	MyReplicationSlot = NULL;
+	copy_releases++;
+}
+XLogSegNo XLogGetLastRemovedSegno(void) { return 0; }
+void
+ReplicationSlotCreate(const char *name, bool db_specific,
+					  ReplicationSlotPersistency persistency, bool two_phase)
+{
+	ReplicationSlot *src = &ReplicationSlotCtl->replication_slots[0];
+	ReplicationSlot *dst = &ReplicationSlotCtl->replication_slots[1];
+
+	UT_ASSERT(copy_active && !held && !control_held && MyReplicationSlot == NULL);
+	UT_ASSERT(strcmp(name, "destination") == 0 && !dst->in_use);
+	memset(dst, 0, sizeof(*dst));
+	SpinLockInit(&dst->mutex);
+	namestrcpy(&dst->data.name, name);
+	dst->in_use = true;
+	dst->data.database = db_specific ? MyDatabaseId : InvalidOid;
+	dst->data.persistency = persistency;
+	dst->data.two_phase = two_phase;
+	MyReplicationSlot = dst;
+	copy_creations++;
+	if (copy_schedule == COPY_RETIRE_BEFORE_SECOND_READ)
+		copy_retire_source_and_sample();
+	else if (copy_schedule == COPY_DROP_BEFORE_SECOND_READ) {
+		ClusterUndoRetentionSample sample;
+
+		src->in_use = false; /* Dropped slots retain their old data bytes. */
+		ReplicationSlotsComputeRequiredXmin(false);
+		UT_ASSERT(cluster_undo_retention_horizon_sample(&sample));
+		UT_ASSERT_EQ(sample.horizon_scn, 700);
+	}
+	else if (copy_schedule == COPY_BAD_RESTART_BEFORE_SECOND_READ)
+		src->data.restart_lsn = copy_restart - 1;
+}
+static void
+create_logical_replication_slot(char *name, char *plugin, bool temporary,
+								bool two_phase, XLogRecPtr restart, bool find_startpoint)
+{
+	/* The logical creator's allocation/plugin boundaries are controlled; its
+	 * actual first-pin entry is shared with the original logical tests. */
+	UT_ASSERT(!two_phase && !find_startpoint);
+	ReplicationSlotCreate(name, true, temporary ? RS_TEMPORARY : RS_EPHEMERAL, false);
+	(void)CreateInitDecodingContext(plugin, NIL, false, restart, NULL, NULL, NULL, NULL);
+}
+static void
+copy_retire_source_and_sample(void)
+{
+	ReplicationSlot *dst = MyReplicationSlot;
+	ClusterUndoRetentionSample sample;
+
+	UT_ASSERT(!held && !control_held);
+	MyReplicationSlot = &ReplicationSlotCtl->replication_slots[0];
+	PhysicalReplicationSlotNewXmin(InvalidTransactionId, InvalidTransactionId);
+	MyReplicationSlot = dst;
+	UT_ASSERT(cluster_undo_retention_horizon_sample(&sample));
+	UT_ASSERT_EQ(sample.horizon_scn, 700);
+}
+static int
+copy_name_compare(const char *left, const char *right)
+{
+	int result = strcmp(left, right);
+
+	/* This is the final original name check, after its private second view.
+	 * A competing native retirement/H cut runs only without an owned cut. */
+	if (copy_schedule == COPY_FINAL_CHECK_RETIRE && copy_creations != 0 &&
+		copy_race_seen == 0 && copy_race_deferred == 0) {
+		if (held || control_held) {
+			UT_ASSERT(held && proc_exclusive && control_exclusive);
+			copy_race_deferred++;
+		}
+		else {
+			copy_race_seen++;
+			copy_retire_source_and_sample();
+		}
+	}
+	return result;
+}
+#define strcmp copy_name_compare
+#include "test_cluster_retention_copy.inc"
+#undef strcmp
+
 static void
 reset_fixture(void)
 {
+	free(copy_storage);
+	copy_storage = NULL;
+	ReplicationSlotCtl = &slot_storage;
+	max_replication_slots = 1;
+	copy_active = false;
+	copy_creations = copy_releases = copy_persists = copy_lsn_computes = 0;
+	copy_race_seen = copy_race_deferred = 0;
+	copy_schedule = COPY_NO_INTERLEAVE;
 	free(procArray);
 	procArray = calloc(1, sizeof(ProcArrayStruct) + lengthof(entries) * sizeof(int));
 	if (procArray == NULL)
@@ -1299,10 +1459,210 @@ UT_TEST(test_noncluster_logical_initial_slot_keeps_original_publication)
 	UT_ASSERT(!held && !control_held && !xidgen_held && lock_errors == 0);
 }
 
+static void
+prepare_slot_copy(bool logical)
+{
+	ReplicationSlot *src;
+
+	reset_fixture();
+	copy_storage = calloc(1, sizeof(ReplicationSlotCtlData) + sizeof(ReplicationSlot));
+	if (copy_storage == NULL) abort();
+	ReplicationSlotCtl = copy_storage;
+	max_replication_slots = 2;
+	copy_active = true;
+	src = &ReplicationSlotCtl->replication_slots[0];
+	SpinLockInit(&src->mutex);
+	src->in_use = true;
+	namestrcpy(&src->data.name, "source");
+	namestrcpy(&src->data.plugin, "test_output");
+	src->data.database = logical ? MyDatabaseId : InvalidOid;
+	src->data.persistency = RS_PERSISTENT;
+	src->data.restart_lsn = copy_restart;
+	src->data.confirmed_flush = logical ? copy_restart + 4096 : InvalidXLogRecPtr;
+	src->data.xmin = src->effective_xmin = logical ? InvalidTransactionId : 100;
+	src->data.catalog_xmin = src->effective_catalog_xmin = logical ? 100 : 110;
+	ReplicationSlotsComputeRequiredXmin(false);
+}
+
+static bool
+run_slot_copy(bool logical)
+{
+	LOCAL_FCINFO(fcinfo, 2);
+	NameData src_name, dst_name;
+	volatile bool accepted = false;
+
+	namestrcpy(&src_name, "source");
+	namestrcpy(&dst_name, "destination");
+	InitFunctionCallInfoData(*fcinfo, NULL, 2, InvalidOid, NULL, NULL);
+	fcinfo->args[0].value = NameGetDatum(&src_name);
+	fcinfo->args[0].isnull = false;
+	fcinfo->args[1].value = NameGetDatum(&dst_name);
+	fcinfo->args[1].isnull = false;
+	expecting_error = true;
+	PG_TRY();
+	{
+		UT_ASSERT_EQ(copy_replication_slot(fcinfo, logical), PointerGetDatum(&copy_result_header));
+		accepted = true;
+	}
+	PG_CATCH();
+	{
+		/* Each case checks the original or new error polarity separately. */
+	}
+	PG_END_TRY();
+	expecting_error = false;
+	return accepted;
+}
+
+UT_TEST(test_copy_second_snapshot_cannot_resurrect_retired_history_after_h)
+{
+	ReplicationSlot *dst;
+
+	prepare_slot_copy(false);
+	copy_schedule = COPY_FINAL_CHECK_RETIRE;
+	UT_ASSERT(run_slot_copy(false));
+	dst = &ReplicationSlotCtl->replication_slots[1];
+	UT_ASSERT_EQ(copy_race_deferred, 1);
+	UT_ASSERT_EQ(copy_race_seen, 0);
+	UT_ASSERT_EQ(procArray->cluster_read_scn_floor, InvalidScn);
+	UT_ASSERT_EQ(dst->effective_xmin, 100);
+	UT_ASSERT_EQ(dst->effective_catalog_xmin, 110);
+	UT_ASSERT_EQ(procArray->replication_slot_xmin, 100);
+	UT_ASSERT_EQ(procArray->replication_slot_catalog_xmin, 110);
+	UT_ASSERT_EQ(slot_saves, 2);
+	UT_ASSERT_EQ(copy_releases, 1);
+	UT_ASSERT(!held && !control_held && lock_errors == 0);
+}
+
+UT_TEST(test_copy_noncovered_raw_source_refuses_all_four_pin_fields)
+{
+	for (unsigned field = 0; field < 4; field++) {
+		ReplicationSlot *src, *dst;
+
+		prepare_slot_copy(false);
+		copy_retire_source_and_sample();
+		src = &ReplicationSlotCtl->replication_slots[0];
+		/* Unsupported source snapshots deliberately have no aggregate SCN
+		 * protection. Test refusal; this is not a qualified publisher. */
+		if (field == 0) src->effective_xmin = 100;
+		if (field == 1) src->effective_catalog_xmin = 110;
+		if (field == 2) src->data.xmin = 100;
+		if (field == 3) src->data.catalog_xmin = 110;
+		UT_ASSERT(!run_slot_copy(false));
+		dst = &ReplicationSlotCtl->replication_slots[1];
+		UT_ASSERT_EQ(feedback_error_code, ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE);
+		UT_ASSERT_EQ(dst->effective_xmin, InvalidTransactionId);
+		UT_ASSERT_EQ(dst->effective_catalog_xmin, InvalidTransactionId);
+		UT_ASSERT_EQ(dst->data.xmin, InvalidTransactionId);
+		UT_ASSERT_EQ(dst->data.catalog_xmin, InvalidTransactionId);
+		UT_ASSERT_EQ(procArray->replication_slot_xmin, InvalidTransactionId);
+		UT_ASSERT_EQ(procArray->replication_slot_catalog_xmin, InvalidTransactionId);
+		UT_ASSERT_EQ(procArray->cluster_read_scn_floor, 700);
+		UT_ASSERT_EQ(slot_saves, 1); /* Original destination WAL reservation only. */
+		UT_ASSERT_EQ(copy_lsn_computes, 0);
+		UT_ASSERT_EQ(copy_releases, 0);
+		UT_ASSERT(!held && !control_held && lock_errors == 0);
+	}
+}
+
+UT_TEST(test_copy_dropped_source_cannot_republish_its_residual_pin_bytes)
+{
+	ReplicationSlot *dst;
+
+	prepare_slot_copy(false);
+	copy_schedule = COPY_DROP_BEFORE_SECOND_READ;
+	UT_ASSERT(!run_slot_copy(false));
+	dst = &ReplicationSlotCtl->replication_slots[1];
+	UT_ASSERT_EQ(feedback_error_code, ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE);
+	UT_ASSERT_EQ(dst->effective_xmin, InvalidTransactionId);
+	UT_ASSERT_EQ(dst->data.catalog_xmin, InvalidTransactionId);
+	UT_ASSERT_EQ(procArray->replication_slot_xmin, InvalidTransactionId);
+	UT_ASSERT_EQ(procArray->cluster_read_scn_floor, 700);
+	UT_ASSERT_EQ(slot_saves, 1);
+	UT_ASSERT_EQ(copy_lsn_computes, 0);
+	UT_ASSERT(!held && !control_held && lock_errors == 0);
+}
+
+UT_TEST(test_copy_retired_empty_second_view_preserves_existing_h)
+{
+	ReplicationSlot *dst;
+
+	prepare_slot_copy(false);
+	copy_schedule = COPY_RETIRE_BEFORE_SECOND_READ;
+	UT_ASSERT(run_slot_copy(false));
+	dst = &ReplicationSlotCtl->replication_slots[1];
+	UT_ASSERT_EQ(dst->effective_xmin, InvalidTransactionId);
+	UT_ASSERT_EQ(dst->effective_catalog_xmin, InvalidTransactionId);
+	UT_ASSERT_EQ(dst->data.xmin, InvalidTransactionId);
+	UT_ASSERT_EQ(dst->data.catalog_xmin, InvalidTransactionId);
+	UT_ASSERT_EQ(procArray->replication_slot_xmin, InvalidTransactionId);
+	UT_ASSERT_EQ(procArray->cluster_read_scn_floor, 700);
+	UT_ASSERT_EQ(copy_lsn_computes, 1);
+	UT_ASSERT_EQ(slot_saves, 2);
+	UT_ASSERT_EQ(copy_releases, 1);
+	UT_ASSERT(!held && !control_held && lock_errors == 0);
+}
+
+UT_TEST(test_logical_copy_keeps_original_initial_catalog_protection)
+{
+	ClusterUndoRetentionSample sample;
+	ReplicationSlot *dst;
+
+	prepare_slot_copy(true);
+	UT_ASSERT(run_slot_copy(true));
+	dst = &ReplicationSlotCtl->replication_slots[1];
+	UT_ASSERT_EQ(logical_start_xmin, 100);
+	UT_ASSERT_EQ(dst->effective_xmin, InvalidTransactionId);
+	UT_ASSERT_EQ(dst->data.catalog_xmin, 100);
+	UT_ASSERT_EQ(dst->effective_catalog_xmin, 100);
+	UT_ASSERT_EQ(dst->data.confirmed_flush, copy_restart + 4096);
+	UT_ASSERT_EQ(logical_starts, 1);
+	UT_ASSERT_EQ(slot_saves, 2);
+	UT_ASSERT_EQ(copy_persists, 1);
+	UT_ASSERT_EQ(copy_releases, 1);
+	UT_ASSERT(strcmp(NameStr(copy_result_name), "destination") == 0);
+	UT_ASSERT(!cluster_undo_retention_horizon_sample(&sample));
+	UT_ASSERT(empty_sample(&sample));
+	UT_ASSERT_EQ(procArray->cluster_read_scn_floor, InvalidScn);
+	UT_ASSERT(!held && !control_held && lock_errors == 0);
+}
+
+UT_TEST(test_copy_original_source_error_releases_the_new_lock_cut)
+{
+	prepare_slot_copy(false);
+	copy_schedule = COPY_BAD_RESTART_BEFORE_SECOND_READ;
+	UT_ASSERT(!run_slot_copy(false));
+	UT_ASSERT_EQ(feedback_error_code, 0); /* Original native error has no explicit code. */
+	UT_ASSERT_EQ(slot_saves, 1);
+	UT_ASSERT_EQ(copy_lsn_computes, 0);
+	UT_ASSERT_EQ(copy_releases, 0);
+	UT_ASSERT(!held && !control_held && lock_errors == 0);
+}
+
+UT_TEST(test_noncluster_copy_keeps_original_raw_pin_values)
+{
+	ReplicationSlot *src, *dst;
+
+	prepare_slot_copy(false);
+	copy_retire_source_and_sample();
+	cluster_node_id = -1;
+	src = &ReplicationSlotCtl->replication_slots[0];
+	src->data.xmin = src->effective_xmin = 100;
+	src->data.catalog_xmin = src->effective_catalog_xmin = 110;
+	UT_ASSERT(run_slot_copy(false));
+	dst = &ReplicationSlotCtl->replication_slots[1];
+	UT_ASSERT_EQ(dst->data.xmin, 100);
+	UT_ASSERT_EQ(dst->data.catalog_xmin, 110);
+	UT_ASSERT_EQ(dst->effective_xmin, 100);
+	UT_ASSERT_EQ(dst->effective_catalog_xmin, 110);
+	UT_ASSERT_EQ(procArray->cluster_read_scn_floor, 700);
+	UT_ASSERT_EQ(copy_releases, 1);
+	UT_ASSERT(!held && !control_held && lock_errors == 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(46);
+	UT_PLAN(53);
 	UT_RUN(test_empty_array_has_one_prescan_clock);
 	UT_RUN(test_all_database_and_vacuum_snapshot_minima_are_included);
 	UT_RUN(test_equal_time_prefers_snapshot_without_changing_scalar_bits);
@@ -1349,6 +1709,14 @@ main(void)
 	UT_RUN(test_catalog_only_logical_slot_cannot_borrow_pgproc_scn);
 	UT_RUN(test_logical_safe_xmin_error_releases_owned_locks_without_pin);
 	UT_RUN(test_noncluster_logical_initial_slot_keeps_original_publication);
+	UT_RUN(test_copy_second_snapshot_cannot_resurrect_retired_history_after_h);
+	UT_RUN(test_copy_noncovered_raw_source_refuses_all_four_pin_fields);
+	UT_RUN(test_copy_dropped_source_cannot_republish_its_residual_pin_bytes);
+	UT_RUN(test_copy_retired_empty_second_view_preserves_existing_h);
+	UT_RUN(test_logical_copy_keeps_original_initial_catalog_protection);
+	UT_RUN(test_copy_original_source_error_releases_the_new_lock_cut);
+	UT_RUN(test_noncluster_copy_keeps_original_raw_pin_values);
+	free(copy_storage);
 	free(procArray);
 	UT_DONE();
 	return ut_failed_count != 0;

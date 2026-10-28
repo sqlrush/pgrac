@@ -55,7 +55,7 @@ extern bool ProcArrayInstallRestoredXmin(TransactionId xmin, PGPROC *proc);
  * InvalidScn when only retiring a reader. Refusal preserves the previous
  * marker and releases ProcArrayLock. */
 extern bool ProcArrayPublishReadScn(SCN read_scn, SCN added_read_scn);
-/* Raw feedback/initial logical-slot history has no SCN interval. Caller holds
+/* Raw feedback/initial or copied slot history has no SCN interval. Caller holds
  * ProcArrayLock EX from this check through original slot/PGPROC publication
  * and slot aggregation. After this boot exports H, only empty feedback can
  * pass; refusal changes no pins. This does not qualify an SCN interval or

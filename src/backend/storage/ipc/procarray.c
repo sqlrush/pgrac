@@ -2266,7 +2266,7 @@ ProcArrayPublishReadScn(SCN read_scn, SCN added_read_scn)
 
 /* A raw replication pin has no read-SCN proof. Serialize its first
  * publication with H before the slot/PGPROC owner changes any pin fields.
- * Feedback and initial logical slots share this cut. Empty feedback may
+ * Feedback and initial or copied slots share this cut. Empty feedback may
  * retire a pin, but cannot reset an exported promise. */
 bool
 ProcArrayReplicationFeedbackAllowed(TransactionId xmin, TransactionId catalog_xmin)
