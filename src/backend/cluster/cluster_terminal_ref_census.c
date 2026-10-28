@@ -2834,6 +2834,48 @@ cluster_ctrc_active_scan_begin(ClusterCtrcActiveScan *scan, FullTransactionId re
 	return true;
 }
 
+/* Qualification belongs to the original local receiver, not merely to a
+ * known raw/full transaction pair. Caller holds this participant's SH lock.
+ * A failed match only removes positive coverage; its retained minimum stays. */
+static bool
+ctrc_participant_active_source_matches(const ClusterCtrcParticipantEntry *entry,
+	uint64 index, const ClusterSemanticActiveSampleFence *source)
+{
+	const ClusterCtrcParticipantIdentity *receiver = &entry->identity;
+	const ClusterCtrcDelegationCustodyV1 *parent = &entry->delegation_parent;
+	const ClusterCtrcParticipantIdentity *original_receiver = receiver;
+	FullTransactionId original;
+	uint64 protected_index;
+
+	if (!ctrc_participant_identity_valid(&entry->key, receiver)
+		|| receiver->node_id != source->local_node_id
+		|| receiver->boot_incarnation != source->local_boot_incarnation
+		|| receiver->formation_epoch != source->formation_epoch
+		|| receiver->admission_record_generation != source->record_generation
+		|| !ctrc_participant_index(&entry->key, receiver->node_id, &protected_index)
+		|| protected_index != index)
+		return false;
+	/* Local origin FullXid already arrived under its original authority lock.
+	 * Foreign copies additionally require the immutable protected handoff. */
+	if (entry->key.origin_node_id == source->local_node_id)
+		return true;
+	if (!ctrc_bytes_zero(&entry->delegation_path, sizeof(entry->delegation_path)))
+		return ctrc_delegation_path_valid(&entry->delegation_path, &entry->key,
+			receiver, parent, entry->original_identity_v2, entry->grant_generation,
+			entry->original_full_xid);
+	if (!ctrc_bytes_zero(parent, sizeof(*parent))) {
+		if (parent->sequence == 0 || parent->sequence >= CLUSTER_CTRC_MAX_PARTICIPANTS
+			|| !ctrc_participant_identity_valid(&entry->key, &parent->receiver)
+			|| parent->receiver.node_id == receiver->node_id)
+			return false;
+		original_receiver = &parent->receiver;
+	}
+	return cluster_ctrc_origin_fullxid_match_v2(entry->original_identity_v2,
+		sizeof(entry->original_identity_v2), &entry->key, original_receiver,
+		entry->grant_generation, &original)
+		&& FullTransactionIdEquals(original, entry->original_full_xid);
+}
+
 static void
 ctrc_active_scan_step(ClusterCtrcActiveScan *scan,
 					  const ClusterSemanticActiveSampleFence *source)
@@ -2871,6 +2913,7 @@ ctrc_active_scan_step(ClusterCtrcActiveScan *scan,
 		LWLock *lock;
 		uint64 index = scan->next_index;
 		bool occupied, valid, is_origin = index < CtrcShared->origin_key_entries;
+		bool receiver_qualified = true;
 
 		if (is_origin) {
 			ClusterCtrcOriginEntry *entry = &ctrc_origin_entries()[index];
@@ -2919,10 +2962,12 @@ ctrc_active_scan_step(ClusterCtrcActiveScan *scan,
 				if (valid)
 					occupied = false;
 			}
+			if (source != NULL && occupied && valid)
+				receiver_qualified = ctrc_participant_active_source_matches(entry, index, source);
 		}
 		LWLockRelease(lock);
 		if (occupied) {
-			bool unqualified = false;
+			bool unqualified = !receiver_qualified;
 
 			if (!valid || !ctrc_txn_key_valid(&key) || !TransactionIdIsNormal(key.xid)
 				|| ((is_origin || FullTransactionIdIsValid(full))

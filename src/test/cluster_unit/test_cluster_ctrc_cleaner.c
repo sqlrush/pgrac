@@ -5862,7 +5862,9 @@ UT_TEST(test_active_scan_foreign_origin_uses_original_cohort_member)
 	UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(9, 10000)));
 	finish_source_active_scan(&scan, &source);
 	UT_ASSERT_EQ(scan.status, CTRC_ACTIVE_SCAN_COMPLETE);
-	UT_ASSERT_EQ(scan.unqualified_entries, 0);
+	/* Knowing the original FullXid without a receiver handoff remains
+	 * unqualified, even when the origin is an admitted cohort member. */
+	UT_ASSERT_EQ(scan.unqualified_entries, 1);
 	UT_ASSERT(FullTransactionIdEquals(scan.min_full, entry->original_full_xid));
 	source.admitted_incarnation[1]++;
 	UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(9, 10000)));
@@ -9475,6 +9477,254 @@ UT_TEST(test_retained_native_reader_matches_original_admission_after_close)
 	UT_ASSERT_EQ(held_count, 0);
 }
 
+/* Establish the receiver with the actual origin-envelope and receipt owners.
+ * Only the process/lock scheduling and separate-node storage are controlled. */
+static bool
+source_bound_foreign_receiver_fixture(ClusterCtrcReceiptHandle *handle,
+	ClusterSemanticActiveSampleFence *source)
+{
+	QualifiedForeignRegistrationFixture fixture;
+	uint64 saved_epoch = test_cluster_epoch;
+	bool ready;
+
+	test_cluster_epoch = 23;
+	ready = qualified_foreign_registration_fixture(&fixture)
+		&& cluster_ctrc_receipt_prepare_origin_v2(&fixture.source.key, &fixture.receiver,
+			fixture.source.grant_generation, &fixture.publication, &fixture.target,
+			fixture.original, sizeof(fixture.original), handle) == CLUSTER_CTRC_PREPARE_READY;
+	test_cluster_epoch = saved_epoch;
+	if (!ready)
+		return false;
+	*source = active_source_for_key(&fixture.source.key);
+	source->local_node_id = fixture.receiver.node_id;
+	source->local_boot_incarnation = fixture.receiver.boot_incarnation;
+	source->admitted_members_lo |= UINT64_C(1) << fixture.receiver.node_id;
+	source->admitted_incarnation[fixture.receiver.node_id] = fixture.receiver.boot_incarnation;
+	return true;
+}
+
+static void
+finish_source_receiver_scan(ClusterCtrcActiveScan *scan,
+	const ClusterSemanticActiveSampleFence *source)
+{
+	uint64 slices = 0;
+
+	while (scan->status == CTRC_ACTIVE_SCAN_INCOMPLETE
+		&& slices++ < scan->total_entries / CLUSTER_CTRC_ACTIVE_SCAN_SLICE + 1)
+		cluster_ctrc_active_scan_step_source(scan, source);
+	UT_ASSERT_EQ(scan->status, CTRC_ACTIVE_SCAN_COMPLETE);
+}
+
+UT_TEST(test_source_scan_stale_receiver_keeps_fullxid_but_cannot_qualify)
+{
+	ClusterCtrcReceiptHandle handle;
+	ClusterSemanticActiveSampleFence source;
+	ClusterCtrcActiveScan scan;
+	ClusterCtrcParticipantEntry before;
+	ClusterCtrcReceipt receipt_before;
+
+	UT_ASSERT(source_bound_foreign_receiver_fixture(&handle, &source));
+	UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(9, 10000)));
+	finish_source_receiver_scan(&scan, &source);
+	UT_ASSERT_EQ(scan.unqualified_entries, 0);
+	UT_ASSERT(FullTransactionIdEquals(scan.min_full, handle.original_full_xid));
+	/* An old receiver boot remains retained, even though the origin still
+	 * belongs to exactly the current source cut. */
+	handle.participant->identity.boot_incarnation++;
+	before = *handle.participant;
+	receipt_before = *handle.receipt;
+	UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(9, 10000)));
+	finish_source_receiver_scan(&scan, &source);
+	UT_ASSERT_EQ(scan.unqualified_entries, 1);
+	UT_ASSERT(FullTransactionIdEquals(scan.min_full, handle.original_full_xid));
+	UT_ASSERT(memcmp(&before, handle.participant, sizeof(before)) == 0);
+	UT_ASSERT(memcmp(&receipt_before, handle.receipt, sizeof(receipt_before)) == 0);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_source_scan_requires_exact_receiver_and_original_foreign_envelope)
+{
+	for (unsigned fault = 0; fault < 20; fault++) {
+		ClusterCtrcReceiptHandle handle;
+		ClusterSemanticActiveSampleFence source;
+		ClusterCtrcActiveScan scan;
+		ClusterCtrcParticipantEntry before;
+		ClusterCtrcReceipt receipt_before;
+		uint64 head;
+
+		UT_ASSERT(source_bound_foreign_receiver_fixture(&handle, &source));
+		switch (fault) {
+		case 0: break;
+		case 1: handle.participant->identity.node_id++; break;
+		case 2: handle.participant->identity.boot_incarnation++; break;
+		case 3: handle.participant->identity.formation_epoch++; break;
+		case 4: handle.participant->identity.admission_record_generation++; break;
+		case 5: handle.participant->identity.reserved16 = 1; break;
+		case 6: handle.participant->identity.capability_record_generation = 0; break;
+		case 7: handle.participant->identity.capability_record_generation++; break;
+		case 8: handle.participant->grant_generation++; break;
+		case 9: handle.participant->original_identity_v2[0] = 0; break;
+		case 10: handle.participant->original_identity_v2[8] ^= 1; break;
+		case 11: handle.participant->original_identity_v2[143] ^= 1; break;
+		case 12: MemSet(handle.participant->original_identity_v2, 0, 144); break;
+		case 13:
+			handle.participant->original_full_xid = FullTransactionIdFromU64(
+				U64FromFullTransactionId(handle.original_full_xid) + (UINT64CONST(1) << 32));
+			break;
+		case 14: handle.participant->delegation_parent.sequence = 1; break;
+		case 15: handle.participant->delegation_path.version = 1; break;
+		case 16: handle.participant->key.origin_boot_incarnation++; break;
+		case 17: source.record_generation++; break;
+		case 18:
+			/* Both identities match, but the row is still in the original
+			 * receiver's physical slot, never the local origin's slot. */
+			handle.participant->identity.node_id = handle.key.origin_node_id;
+			handle.participant->identity.boot_incarnation = handle.key.origin_boot_incarnation;
+			source.local_node_id = handle.key.origin_node_id;
+			source.local_boot_incarnation = handle.key.origin_boot_incarnation;
+			break;
+		case 19: handle.participant->key.formation_epoch++; break;
+		}
+		before = *handle.participant;
+		receipt_before = *handle.receipt;
+		head = ctrc_participant_receipt_heads()[handle.participant_index];
+		UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(9, 10000)));
+		finish_source_receiver_scan(&scan, &source);
+		UT_ASSERT_EQ(scan.unqualified_entries, fault == 0 ? 0 : 1);
+		UT_ASSERT(FullTransactionIdEquals(scan.min_full, before.original_full_xid));
+		UT_ASSERT(memcmp(&before, handle.participant, sizeof(before)) == 0);
+		UT_ASSERT(memcmp(&receipt_before, handle.receipt, sizeof(receipt_before)) == 0);
+		UT_ASSERT_EQ(ctrc_participant_receipt_heads()[handle.participant_index], head);
+		/* The public source-less entry still reports a retained observation;
+		 * it does not acquire this worker cut's positive qualification. */
+		UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(9, 10000)));
+		finish_qualified_foreign_registration_scan(&scan);
+		UT_ASSERT_EQ(scan.status, CTRC_ACTIVE_SCAN_COMPLETE);
+		UT_ASSERT_EQ(scan.unqualified_entries, 0);
+		UT_ASSERT(FullTransactionIdEquals(scan.min_full, before.original_full_xid));
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
+UT_TEST(test_source_scan_accepts_only_exact_protected_parent_and_multihop_path)
+{
+	for (unsigned multihop = 0; multihop < 2; multihop++) {
+		ClusterCtrcReceiptHandle first, middle, received;
+		ClusterCtrcParticipantIdentity receiver;
+		ClusterCtrcPublicationIdV1 publication;
+		ClusterCtrcTargetV1 pending;
+		ClusterCtrcItlTargetIdentity target;
+		ClusterItlSlotData slot;
+		ClusterSemanticActiveSampleFence source;
+		ClusterCtrcParticipantEntry pristine;
+		ClusterCtrcReceipt receipt_before;
+		uint8 record[CLUSTER_CTRC_DELEGATION_V2_MAX_BYTES];
+		Size length = 0;
+		uint64 saved_epoch = test_cluster_epoch;
+
+		test_cluster_epoch = 23;
+		if (!multihop) {
+			UT_ASSERT(seed_delegation_record(&first, &receiver, &publication, &pending, record));
+			UT_ASSERT_EQ(cluster_ctrc_receipt_prepare_delegation_v1(&first.key,
+				&first.participant->identity, &receiver, first.participant->grant_generation,
+				&publication, &pending, record, 224, &received), CLUSTER_CTRC_PREPARE_READY);
+		} else {
+			UT_ASSERT(seed_multihop_source(&first, &middle, &receiver, &slot, &target));
+			UT_ASSERT(cluster_ctrc_itl_delegate_prepare_v2(&target, &slot,
+				&middle.participant->identity, &receiver, record, sizeof(record), &length));
+			image_pending_target(&pending);
+			cluster_node_id = receiver.node_id;
+			UT_ASSERT_EQ(cluster_ctrc_itl_image_prepare_v2(&slot, &middle.participant->identity,
+				&receiver, record, length, &pending, &received), CLUSTER_CTRC_PREPARE_READY);
+		}
+		test_cluster_epoch = saved_epoch;
+		UT_ASSERT(received.valid);
+		if (!received.valid) return;
+		source = active_source_for_key(&received.key);
+		source.local_node_id = receiver.node_id;
+		source.local_boot_incarnation = receiver.boot_incarnation;
+		source.admitted_members_lo |= UINT64_C(1) << receiver.node_id;
+		source.admitted_incarnation[receiver.node_id] = receiver.boot_incarnation;
+		/* The fixture uses one allocation to model different nodes. Remove
+		 * peer table copies from the receiver's scan, not peer responsibility. */
+		MemSet(ctrc_origin_entries(), 0, sizeof(*ctrc_origin_entries()) * CtrcShared->origin_key_entries);
+		MemSet(first.participant, 0, sizeof(*first.participant));
+		if (multihop) MemSet(middle.participant, 0, sizeof(*middle.participant));
+		pristine = *received.participant;
+		receipt_before = *received.receipt;
+		for (unsigned fault = 0; fault < 5; fault++) {
+			ClusterCtrcActiveScan scan;
+			ClusterCtrcParticipantEntry before;
+
+			*received.participant = pristine;
+			switch (fault) {
+			case 0: break;
+			case 1: received.participant->delegation_parent.sequence++; break;
+			case 2: received.participant->delegation_parent.receiver.boot_incarnation++; break;
+			case 3: received.participant->original_identity_v2[143] ^= 1; break;
+			case 4:
+				if (multihop) received.participant->delegation_path.hops[0].sequence = 0;
+				else received.participant->delegation_parent.sequence = CLUSTER_CTRC_MAX_PARTICIPANTS;
+				break;
+			}
+			/* A first-parent sequence has no second copy in its V1 record;
+			 * any in-range sequence remains the retained parent identity. */
+			before = *received.participant;
+			UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(9, 10000)));
+			finish_source_receiver_scan(&scan, &source);
+			UT_ASSERT_EQ(scan.unqualified_entries, fault == 0 || (!multihop && fault == 1) ? 0 : 1);
+			UT_ASSERT(FullTransactionIdEquals(scan.min_full, pristine.original_full_xid));
+			UT_ASSERT(memcmp(&before, received.participant, sizeof(before)) == 0);
+			UT_ASSERT(memcmp(&receipt_before, received.receipt, sizeof(receipt_before)) == 0);
+			UT_ASSERT_EQ(held_count, 0);
+		}
+	}
+}
+
+UT_TEST(test_source_scan_local_origin_keeps_original_locked_fullxid_handoff)
+{
+	ClusterCtrcOriginEntry *origin;
+	ClusterCtrcParticipantIdentity receiver;
+	ClusterCtrcPublicationIdV1 publication;
+	ClusterCtrcTargetV1 target;
+	ClusterCtrcReceiptHandle handle;
+	ClusterSemanticActiveSampleFence source;
+	uint64 saved_epoch = test_cluster_epoch;
+
+	reset_fixture();
+	cluster_node_id = 0;
+	test_cluster_epoch = 23;
+	origin = seed_origin(0, 1);
+	receiver = origin->touched[0];
+	fixture_receipt_inputs(origin, 2401, &publication, &target);
+	UT_ASSERT_EQ(cluster_ctrc_receipt_prepare_shared(&origin->key, &receiver,
+		origin->grant_generation, &publication, &target, &handle), CLUSTER_CTRC_PREPARE_READY);
+	test_cluster_epoch = saved_epoch;
+	source = active_source_for_key(&origin->key);
+	UT_ASSERT(FullTransactionIdEquals(handle.original_full_xid, origin->original_full_xid));
+	/* The actual current producer also saves the envelope. A legacy local
+	 * row can lack this optional companion while retaining the original
+	 * FullXid handed off under the same origin lock, never widened from raw. */
+	UT_ASSERT(!ctrc_bytes_zero(handle.participant->original_identity_v2, 144));
+	for (unsigned legacy = 0; legacy < 2; legacy++) {
+		if (legacy) MemSet(handle.participant->original_identity_v2, 0, 144);
+		for (unsigned stale = 0; stale < 2; stale++) {
+			ClusterCtrcActiveScan scan;
+			ClusterCtrcParticipantEntry before;
+
+			handle.participant->identity = receiver;
+			if (stale) handle.participant->identity.boot_incarnation++;
+			before = *handle.participant;
+			UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(9, 10000)));
+			finish_source_receiver_scan(&scan, &source);
+			UT_ASSERT_EQ(scan.unqualified_entries, stale);
+			UT_ASSERT(FullTransactionIdEquals(scan.min_full, handle.original_full_xid));
+			UT_ASSERT(memcmp(&before, handle.participant, sizeof(before)) == 0);
+			UT_ASSERT_EQ(held_count, 0);
+		}
+	}
+}
+
 int
 main(void)
 {
@@ -9482,7 +9732,7 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(206);
+	UT_PLAN(210);
 	UT_RUN(test_prepare_path_namespace_precedes_input_and_resets_output);
 	UT_RUN(test_prepare_path_input_precedes_journal_exhaustion);
 	UT_RUN(test_prepare_path_chain_precedes_locator_and_keeps_blocked_state);
@@ -9694,6 +9944,10 @@ main(void)
 	UT_RUN(test_retained_reader_rejects_stale_tokens_and_exit_releases_only_its_own);
 	UT_RUN(test_retained_reader_binds_exact_source_after_close_without_new_receipt);
 	UT_RUN(test_retained_native_reader_matches_original_admission_after_close);
+	UT_RUN(test_source_scan_stale_receiver_keeps_fullxid_but_cannot_qualify);
+	UT_RUN(test_source_scan_requires_exact_receiver_and_original_foreign_envelope);
+	UT_RUN(test_source_scan_accepts_only_exact_protected_parent_and_multihop_path);
+	UT_RUN(test_source_scan_local_origin_keeps_original_locked_fullxid_handoff);
 	free(CtrcShared);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

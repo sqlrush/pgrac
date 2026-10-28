@@ -688,6 +688,7 @@ _classify_owners(
     (
         "cluster_ctrc_origin_original_full_xid_exact",
         "cluster_ctrc_origin_original_full_xid_shared",
+        "ctrc_participant_active_source_matches",
     ),
     "REGISTERED_REFERENCE",
     "ALL_CTRC_REFERENCE_KINDS",
