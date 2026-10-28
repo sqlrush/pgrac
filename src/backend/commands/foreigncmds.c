@@ -909,6 +909,10 @@ CreateForeignServer(CreateForeignServerStmt *stmt)
 	ObjectAddress referenced;
 	ForeignDataWrapper *fdw;
 
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedFdwWrite((Node *)stmt, false);
+#endif
+
 	rel = table_open(ForeignServerRelationId, RowExclusiveLock);
 
 	/* For now the owner cannot be specified on create. Use effective user ID. */
@@ -1041,6 +1045,10 @@ AlterForeignServer(AlterForeignServerStmt *stmt)
 	Oid			srvId;
 	Form_pg_foreign_server srvForm;
 	ObjectAddress address;
+
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedFdwWrite((Node *)stmt, true);
+#endif
 
 	rel = table_open(ForeignServerRelationId, RowExclusiveLock);
 

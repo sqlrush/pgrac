@@ -35,7 +35,7 @@
 #include "catalog/pg_control.h"
 #include "catalog/pg_extension.h"
 #include "catalog/pg_foreign_data_wrapper.h"
-#include "catalog/pg_foreign_server_d.h"
+#include "catalog/pg_foreign_server.h"
 #include "catalog/pg_language.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_policy.h"
@@ -6189,6 +6189,8 @@ static unsigned collation_lookups, collation_unbound, collation_bad_lookup, coll
 static String collation_name_node;
 static ListCell collation_name_cell;
 static List collation_names;
+static bool foreign_server_lookup_active, foreign_server_expect_binding;
+static unsigned foreign_server_lookups, foreign_server_unbound, foreign_server_bad_lookup;
 static bool fdw_lookup_active, fdw_expect_binding;
 static unsigned fdw_lookups, fdw_unbound, fdw_bad_lookup;
 static bool function_lookup_active, function_expect_binding;
@@ -6220,6 +6222,14 @@ get_database_oid(const char *dbname, bool missing_ok)
 Relation
 table_open(Oid relationId, LOCKMODE lockmode)
 {
+	if (foreign_server_lookup_active) {
+		foreign_server_lookups++;
+		if (foreign_server_expect_binding && utility_binds == 0)
+			foreign_server_unbound++;
+		if (relationId != ForeignServerRelationId || lockmode != RowExclusiveLock)
+			foreign_server_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before the real server catalog lock. */
+	}
 	if (fdw_lookup_active) {
 		fdw_lookups++;
 		if (fdw_expect_binding && utility_binds == 0)
@@ -9366,10 +9376,195 @@ UT_TEST(test_native_fdw_utility_warm_context_guards_preserve_binding)
 	fdw_lookup_active = false;
 }
 
+/* Actual server creation/alteration prefixes share the helper extracted in
+ * test_cluster_fresh_fdw.inc and stop before their first catalog lock. */
+#include "test_cluster_fresh_foreign_server.inc"
+static CreateForeignServerStmt native_foreign_server_create;
+static AlterForeignServerStmt native_foreign_server_alter;
+
+static void
+reset_native_foreign_server(bool expect_binding, unsigned kind)
+{
+	reset_create_preflight();
+	foreign_server_lookup_active = true;
+	foreign_server_expect_binding = expect_binding;
+	foreign_server_lookups = foreign_server_unbound = foreign_server_bad_lookup = 0;
+	native_foreign_server_create = (CreateForeignServerStmt){ .type = T_CreateForeignServerStmt,
+															  .servername = "preflight_server",
+															  .fdwname = "preflight_fdw",
+															  .if_not_exists = kind == 1 };
+	native_foreign_server_alter = (AlterForeignServerStmt){ .type = T_AlterForeignServerStmt,
+															.servername = "preflight_server",
+															.has_version = true,
+															.version = kind == 3 ? NULL : "2" };
+}
+
+static Node *
+native_foreign_server_statement(unsigned kind)
+{
+	return kind >= 2 ? (Node *)&native_foreign_server_alter : (Node *)&native_foreign_server_create;
+}
+
+static void
+native_foreign_server_entry(unsigned kind)
+{
+	if (kind >= 2)
+		(void)AlterForeignServer(&native_foreign_server_alter);
+	else
+		(void)CreateForeignServer(&native_foreign_server_create);
+}
+
+UT_TEST(test_native_foreign_server_binds_before_catalog_lock_in_all_profiles)
+{
+	for (unsigned kind = 0; kind < 4; kind++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_foreign_server(binds, kind);
+			cluster_shared_catalog = (mode & 1) != 0;
+			utility_storage_mode = (mode & 2) != 0;
+			cluster_shared_config = (mode & 4) != 0;
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_foreign_server_entry(kind);
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(foreign_server_lookups, repeat + 1);
+				UT_ASSERT_EQ(foreign_server_bad_lookup, 0);
+				UT_ASSERT_EQ(foreign_server_unbound, 0);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	foreign_server_lookup_active = false;
+}
+
+UT_TEST(test_native_foreign_server_publication_child_and_wrong_top_precede_catalog_lock)
+{
+	for (unsigned kind = 0; kind < 4; kind++) {
+		for (unsigned failure = 0; failure < 5; failure++) {
+			bool allocated = failure == 0 || failure == 2;
+			int caught;
+
+			reset_native_foreign_server(true, kind);
+			if (failure == 0)
+				utility_bind_ok = false;
+			else if (failure == 1 || failure == 2) {
+				if (failure == 2)
+					create_sql_entry(native_foreign_server_statement(kind));
+				utility_in_child = true;
+			} else {
+				utility_current_xid = 401;
+				utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_foreign_server_entry(kind);
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, failure == 0  ? ERRCODE_DATA_CORRUPTED
+									 : failure < 3 ? ERRCODE_FEATURE_NOT_SUPPORTED
+												   : ERRCODE_INTERNAL_ERROR);
+			if (failure == 0)
+				UT_ASSERT_STR_EQ(
+					error_message,
+					kind >= 2
+						? "canonical ACTIVE publication failed before shared catalog alteration"
+						: "canonical ACTIVE publication failed before shared catalog creation");
+			else if (failure < 3)
+				UT_ASSERT_STR_EQ(error_message,
+								 kind >= 2
+									 ? "shared catalog alteration does not support subtransactions"
+									 : "shared catalog creation does not support subtransactions");
+			else
+				UT_ASSERT_STR_EQ(error_message,
+								 "shared catalog top-level transaction identity mismatch");
+			UT_ASSERT_EQ(foreign_server_lookups, 0);
+			UT_ASSERT_EQ(foreign_server_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_xids, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, failure == 2 ? 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, allocated || failure == 3 ? 400 : InvalidTransactionId);
+		}
+	}
+	foreign_server_lookup_active = false;
+}
+
+UT_TEST(test_native_foreign_server_context_guards_keep_nonshared_route)
+{
+	for (unsigned kind = 0; kind < 4; kind++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+
+			for (unsigned guard = 0; guard < 3; guard++) {
+				int caught;
+
+				reset_native_foreign_server(binds, kind);
+				cluster_shared_catalog = (mode & 1) != 0;
+				utility_storage_mode = (mode & 2) != 0;
+				cluster_shared_config = (mode & 4) != 0;
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_foreign_server_entry(kind);
+				UT_ASSERT_EQ(caught, binds ? 1 : 2);
+				UT_ASSERT_EQ(error_code, !binds		  ? 0
+										 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+													  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				if (binds)
+					UT_ASSERT(strstr(error_message, kind >= 2 ? "ALTER SERVER" : "CREATE SERVER")
+							  != NULL);
+				UT_ASSERT_EQ(foreign_server_lookups, binds ? 0 : 1);
+				UT_ASSERT_EQ(foreign_server_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	foreign_server_lookup_active = false;
+}
+
+UT_TEST(test_native_foreign_server_utility_warm_context_guards_preserve_binding)
+{
+	for (unsigned kind = 0; kind < 4; kind++) {
+		for (unsigned guard = 0; guard < 4; guard++) {
+			int caught;
+
+			reset_native_foreign_server(true, kind);
+			create_sql_entry(native_foreign_server_statement(kind));
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			XactReadOnly = guard == 1;
+			utility_parallel = guard == 2;
+			utility_recovery = guard == 3;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_foreign_server_entry(kind);
+			UT_ASSERT_EQ(caught, guard ? 1 : 2);
+			UT_ASSERT_EQ(error_code, !guard		  ? 0
+									 : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+												  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT_EQ(foreign_server_lookups, guard ? 0 : 1);
+			UT_ASSERT_EQ(foreign_server_bad_lookup, 0);
+			UT_ASSERT_EQ(foreign_server_unbound, 0);
+			UT_ASSERT_EQ(utility_prepares, guard ? 1 : 2);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			UT_ASSERT_EQ(utility_top_xid, 400);
+		}
+	}
+	foreign_server_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(133);
+	UT_PLAN(137);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -9503,6 +9698,10 @@ main(void)
 	UT_RUN(test_native_fdw_publication_child_and_wrong_top_precede_catalog_lock);
 	UT_RUN(test_native_fdw_context_guards_keep_nonshared_route);
 	UT_RUN(test_native_fdw_utility_warm_context_guards_preserve_binding);
+	UT_RUN(test_native_foreign_server_binds_before_catalog_lock_in_all_profiles);
+	UT_RUN(test_native_foreign_server_publication_child_and_wrong_top_precede_catalog_lock);
+	UT_RUN(test_native_foreign_server_context_guards_keep_nonshared_route);
+	UT_RUN(test_native_foreign_server_utility_warm_context_guards_preserve_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
