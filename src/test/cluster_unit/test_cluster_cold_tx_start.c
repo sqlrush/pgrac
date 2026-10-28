@@ -2337,9 +2337,21 @@ static void startup_local_empty_reset(void);
 #include "test_cluster_cold_ctrc_completed_readback.inc"
 #include "test_cluster_cold_ctrc_unchanged_custody.inc"
 #include "test_cluster_cold_ctrc_page_image.inc"
+#include "test_cluster_cold_ctrc_final_projection.inc"
 
 int main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_STARTUP_FINAL_PROJECTION") != NULL) {
+		UT_PLAN(7);
+		UT_RUN(test_startup_final_projection_consumes_all_pages_after_page_cleanup);
+		UT_RUN(test_startup_final_projection_refuses_unresolved_rewritten_and_byte_drift);
+		UT_RUN(test_startup_final_projection_rechecks_original_owner_and_full_work);
+		UT_RUN(test_startup_final_projection_error_keeps_original_fds_and_debt);
+		UT_RUN(test_startup_final_projection_wait_reuses_same_fd_without_new_wal);
+		UT_RUN(test_startup_final_projection_repeat_does_not_cache_success);
+		UT_RUN(test_startup_final_projection_budget_is_reserved_before_first_page);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_STARTUP_PAGE_IMAGE") != NULL) {
 #ifdef PGRAC_TEST_OLD_IMAGE_FORWARDING
 		UT_PLAN(1);
@@ -2524,7 +2536,14 @@ int main(void)
 		UT_RUN(test_ctrc_pages_native_error_retires_cursor_before_original_scope);
 		reset(); UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(229);
+	UT_PLAN(236);
+	UT_RUN(test_startup_final_projection_consumes_all_pages_after_page_cleanup);
+	UT_RUN(test_startup_final_projection_refuses_unresolved_rewritten_and_byte_drift);
+	UT_RUN(test_startup_final_projection_rechecks_original_owner_and_full_work);
+	UT_RUN(test_startup_final_projection_error_keeps_original_fds_and_debt);
+	UT_RUN(test_startup_final_projection_wait_reuses_same_fd_without_new_wal);
+	UT_RUN(test_startup_final_projection_repeat_does_not_cache_success);
+	UT_RUN(test_startup_final_projection_budget_is_reserved_before_first_page);
 	UT_RUN(test_startup_page_image_is_from_original_completed_or_unchanged_fd);
 	UT_RUN(test_startup_page_image_rejects_pending_missing_and_nonmember_targets);
 	UT_RUN(test_startup_page_image_discards_bytes_after_page_cleanup_drift);

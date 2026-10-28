@@ -1940,6 +1940,7 @@ ClusterColdRecoveryCtrcPageAdvance(const struct ClusterRecoveryStartV1 *start,
 		Size budget = Min(memory_budget, (Size)RF_PAGE_ONLINE_PLAN_MAX_BYTES);
 		Size bytes;
 		Size storage_bytes = cluster_shared_fs_page_bytes_v1();
+		Size projection_bytes;
 
 		/* Reserve every result/FD slot before the first operation, never
 		 * allocate while an INSERTED window waits for its continuation. */
@@ -1952,9 +1953,16 @@ ClusterColdRecoveryCtrcPageAdvance(const struct ClusterRecoveryStartV1 *start,
 		/* Completed raw handles outlive each native step. Reserve the full
 		 * preparation peak for every fixed target as well, before PAGE;
 		 * the active step keeps its existing independent peak check. */
-		if (budget <= bytes || storage_bytes == 0
-			|| storage_bytes > (budget - bytes) / count
-			|| budget - bytes <= (Size)count * storage_bytes) {
+		if (work->counts.subject_count > (MaxAllocSize - 2 * sizeof(PGAlignedBlock))
+				/ sizeof(ClusterColdTtSlotInputV1)) {
+			cluster_recovery_cold_page_plan_refuse(state, RF_PAGE_PROOF_DETAIL_CAPACITY);
+			return false;
+		}
+		projection_bytes = (Size)work->counts.subject_count * sizeof(ClusterColdTtSlotInputV1)
+			+ 2 * sizeof(PGAlignedBlock);
+		if (budget <= bytes || projection_bytes >= budget - bytes || storage_bytes == 0
+			|| storage_bytes > (budget - bytes - projection_bytes) / count
+			|| budget - bytes - projection_bytes <= (Size)count * storage_bytes) {
 			cluster_recovery_cold_page_plan_refuse(state, RF_PAGE_PROOF_DETAIL_CAPACITY);
 			return false;
 		}
@@ -1966,7 +1974,9 @@ ClusterColdRecoveryCtrcPageAdvance(const struct ClusterRecoveryStartV1 *start,
 		}
 		progress->budget = budget;
 		progress->allocation_bytes = bytes;
-		progress->reserved_bytes = bytes + (Size)count * storage_bytes;
+		/* The final original-subject snapshot and both whole-page images
+		 * share this budget, reserved before the first PAGE/FPI as well. */
+		progress->reserved_bytes = bytes + (Size)count * storage_bytes + projection_bytes;
 		progress->plan = state->ctrc_page_plan;
 		progress->sources = state->ctrc_page_sources;
 		progress->source_count = state->ctrc_page_source_count;
@@ -2240,42 +2250,109 @@ ClusterColdRecoveryCtrcPageImage(const struct ClusterRecoveryStartV1 *start, uin
 	return result;
 }
 
+/* Native physical TT is input only. Re-run every original canonical terminal
+ * factory against the accepted TX result; never derive one from a page xid,
+ * slot wrap, count, empty receipt directory or already-projected bytes. */
+static bool
+cluster_recovery_cold_page_projection_subjects(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, ClusterWalInputsV1 *scope,
+	ClusterColdCtrcPageProgressV1 *progress, ClusterColdTtSlotInputV1 *subjects,
+	const ClusterRecoveryTxResultObservationV1 *accepted, bool initialize)
+{
+	ClusterRecoveryTxResultObservationV1 current;
+	const ClusterColdCtrcPhysicalV1 *physical;
+
+	if (!cluster_recovery_cold_page_advance_current(start, work, scope, progress)) return false;
+	physical = start->ctrc_physical;
+	if (physical == NULL || physical->count != work->counts.subject_count
+		|| (physical->count != 0 && subjects == NULL)
+		|| !cluster_recovery_ctrc_terminal_result_v1(start, work, &current)
+		|| memcmp(&current, accepted, sizeof(current)) != 0) return false;
+	for (uint32 i = 0; i < work->counts.subject_count; i++) {
+		ClusterRecoveryUndoEntry observed;
+		ClusterColdTtSlotInputV1 terminal;
+
+		if (!cluster_recovery_cold_page_advance_current(start, work, scope, progress)
+			|| start->ctrc_physical != physical || physical->count != work->counts.subject_count)
+			return false;
+		observed = physical->entries[i];
+		if (!cluster_recovery_ctrc_terminal_subject_v1(start, work, i, &observed, &terminal)
+			|| !cluster_recovery_cold_page_advance_current(start, work, scope, progress)
+			|| start->ctrc_physical != physical
+			|| physical->count != work->counts.subject_count
+			|| memcmp(&physical->entries[i], &observed, sizeof(observed)) != 0)
+			return false;
+		if (initialize) subjects[i] = terminal;
+		else if (memcmp(&subjects[i], &terminal, sizeof(terminal)) != 0) return false;
+	}
+	return cluster_recovery_ctrc_terminal_result_v1(start, work, &current)
+		&& memcmp(&current, accepted, sizeof(current)) == 0
+		&& cluster_recovery_cold_page_advance_current(start, work, scope, progress);
+}
+
 static bool
 cluster_recovery_cold_page_completed_recheck(const struct ClusterRecoveryStartV1 *start)
 {
 	const ClusterColdCtrcWorkV1 *work = start->ctrc_observation_work;
 	ClusterWalInputsV1 *scope = start->ctrc_observation_inputs;
 	ClusterColdCtrcPageProgressV1 *progress = start->ctrc_page_progress;
-	uint32 index = 0;
+	ClusterRecoveryTxResultObservationV1 accepted;
+	ClusterColdTtSlotInputV1 *volatile subjects = NULL;
+	volatile bool ready = false;
+	Size bytes;
 
 	if (!cluster_recovery_cold_page_advance_current(start, work, scope, progress)) return false;
 	if (progress == NULL) return rf_page_online_plan_target_count_v1(start->ctrc_page_plan) == 0;
-	for (;;) {
-		RfPageOnlineTargetViewV1 view;
-		ClusterRecoveryCensusPageV1 physical_page;
-		RfPageProofDetailV1 detail;
-		uint32 source_index;
+	if (work->counts.subject_count > MaxAllocSize / sizeof(*subjects)
+		|| !cluster_recovery_ctrc_terminal_result_v1(start, work, &accepted)) return false;
+	bytes = (Size)work->counts.subject_count * sizeof(*subjects);
+	PG_TRY();
+	{
+		uint32 index = 0;
 
-		ResetLatch(MyLatch);
-		HandleStartupProcInterrupts();
-		if (!cluster_recovery_cold_page_advance_current(start, work, scope, progress)
-			|| progress->pending || progress->next_target != progress->target_count) return false;
-		if (index == progress->target_count) return true;
-		/* History/non-heap targets retain their independent duties; absence
-		 * of a saved baseline never qualifies those targets here. */
-		if (progress->completed[index].storage == NULL) { index++; continue; }
-		if (!rf_page_online_plan_target_v1(start->ctrc_page_plan, index, &view)
-			|| view.history_only || view.page_identity.forknum != MAIN_FORKNUM
-			|| !cluster_recovery_cold_page_target(start, &view, &physical_page) || !physical_page.heap
-			|| !cluster_recovery_cold_page_tail(start, &view, &source_index)) return false;
-		detail = cluster_recovery_cold_page_completed_attempt(start, work, scope,
-			progress, index, &view, &physical_page, source_index, NULL);
-		if (detail == RF_PAGE_PROOF_DETAIL_OK) { index++; continue; }
-		if (detail != RF_PAGE_PROOF_DETAIL_WOULD_BLOCK) return false;
-		/* Same original owner and result; duration alone is not a refusal. */
-		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-			100L, WAIT_EVENT_CLUSTER_THREAD_RECOVERY);
+		if (bytes != 0)
+			subjects = MemoryContextAllocExtended(TopMemoryContext, bytes,
+				MCXT_ALLOC_ZERO | MCXT_ALLOC_NO_OOM);
+		if ((bytes == 0 || subjects != NULL)
+			&& cluster_recovery_cold_page_projection_subjects(start, work, scope,
+				progress, subjects, &accepted, true)) {
+			for (;;) {
+				RfPageCtrcReadbackImageV1 observed;
+				PGAlignedBlock projected;
+
+				ResetLatch(MyLatch);
+				HandleStartupProcInterrupts();
+				if (!cluster_recovery_cold_page_projection_subjects(start, work, scope,
+						progress, subjects, &accepted, false)
+					|| progress->pending || progress->next_target != progress->target_count) break;
+				if (index == progress->target_count) { ready = true; break; }
+				/* No saved baseline qualifies history/non-heap duties. Their
+				 * independent graph/owner obligations remain unchanged. */
+				if (progress->completed[index].storage == NULL) { index++; continue; }
+				observed = ClusterColdRecoveryCtrcPageImage(start, index);
+				if (observed.detail == RF_PAGE_PROOF_DETAIL_WOULD_BLOCK) {
+					(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						100L, WAIT_EVENT_CLUSTER_THREAD_RECOVERY);
+					continue;
+				}
+				/* PAGE/proof are already destroyed. Projection is a read-only
+				 * assertion of the final native result, never another write. */
+				if (observed.detail != RF_PAGE_PROOF_DETAIL_OK
+					|| cluster_ctrc_recovery_itl_page_image_v1(subjects, work->counts.subject_count,
+						observed.image.data, projected.data) != CLUSTER_CTRC_ITL_CLEANOUT_ALREADY_TERMINAL
+					|| memcmp(&observed.image, &projected, sizeof(projected)) != 0
+					|| !cluster_recovery_cold_page_projection_subjects(start, work, scope,
+						progress, subjects, &accepted, false)) break;
+				index++;
+			}
+		}
 	}
+	PG_FINALLY();
+	{
+		if (subjects != NULL) pfree((void *)subjects);
+	}
+	PG_END_TRY();
+	return ready;
 }
 
 /* Finish each exact bufferless FPI operation through the original protected
