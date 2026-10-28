@@ -2347,9 +2347,18 @@ static void startup_local_empty_reset(void);
 #include "test_cluster_cold_ctrc_census_hot.inc"
 #include "test_cluster_cold_ctrc_cross_page.inc"
 #include "test_cluster_cold_ctrc_plain_lock_refs.inc"
+#include "test_cluster_cold_ctrc_update_predecessors.inc"
 
 int main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_UPDATE_PREDECESSORS") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_startup_update_predecessors_reject_two_cross_page_sources);
+		UT_RUN(test_startup_update_predecessors_join_local_and_cross_page_without_page_wal);
+		UT_RUN(test_startup_update_predecessors_keep_native_nonedge_and_inverse_meaning);
+		UT_RUN(test_startup_update_predecessors_repeat_refuses_without_replacing_custody);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_PLAIN_LOCK_REFS") != NULL) {
 		UT_PLAN(4);
 		UT_RUN(test_startup_plain_lock_refs_keep_distinct_terminals_without_cross_page_update);
@@ -2617,7 +2626,11 @@ int main(void)
 		UT_DONE();
 		return ut_failed_count == 0 ? 0 : 1;
 	}
-	UT_PLAN(275);
+	UT_PLAN(279);
+	UT_RUN(test_startup_update_predecessors_reject_two_cross_page_sources);
+	UT_RUN(test_startup_update_predecessors_join_local_and_cross_page_without_page_wal);
+	UT_RUN(test_startup_update_predecessors_keep_native_nonedge_and_inverse_meaning);
+	UT_RUN(test_startup_update_predecessors_repeat_refuses_without_replacing_custody);
 	UT_RUN(test_startup_plain_lock_refs_keep_distinct_terminals_without_cross_page_update);
 	UT_RUN(test_startup_plain_lock_refs_still_require_the_complete_canonical_terminal);
 	UT_RUN(test_startup_plain_lock_refs_preserve_multi_refusal_and_inverse_version);
