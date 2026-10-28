@@ -3590,7 +3590,7 @@ cluster_bufmgr_pcm_own_acquire_execute_begin_exact(BufferDesc *buf,
 static bool
 cluster_bufmgr_acquire_disk_owned(BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
 	const ResourceXDecodedAcquireIntent *episode, const ClusterSemanticAdmissionToken *admission,
-	const ResourceXDeliveryClaim *execution, ResourceOwner io_owner)
+	const ResourceXDeliveryClaim *execution, ResourceOwner io_owner, uint64 *out_watermark)
 {
 	ResourceXDecodedFrame grant, image;
 	ResourceXRequesterJoinSnapshot join;
@@ -3608,11 +3608,14 @@ cluster_bufmgr_acquire_disk_owned(BufferDesc *buf, const ClusterPcmOwnSnapshot *
 			execution->executor_sequence, CLUSTER_ACQUIRE_PREPARATION_VERIFY, &live))
 		return false;
 	decision = &grant.body.acquire_decision;
-	return grant.kind == RESOURCE_X_WIRE_AUTHORITY_GRANT && grant.has_acquire_decision
-		&& decision->source_kind == RESOURCE_X_ACQUIRE_SOURCE_DISK
-		&& decision->source_node == -1 && decision->source_service_generation == 0
-		&& decision->directory_mode == PCM_STATE_N && decision->holders_bitmap == 0
-		&& decision->required_holders_bitmap == 0 && decision->pi_holders_bitmap == 0;
+	if (grant.kind != RESOURCE_X_WIRE_AUTHORITY_GRANT || !grant.has_acquire_decision
+		|| decision->source_kind != RESOURCE_X_ACQUIRE_SOURCE_DISK
+		|| decision->source_node != -1 || decision->source_service_generation != 0
+		|| decision->directory_mode != PCM_STATE_N || decision->holders_bitmap != 0
+		|| decision->required_holders_bitmap != 0 || decision->pi_holders_bitmap != 0)
+		return false;
+	*out_watermark = decision->disk_watermark_scn;
+	return true;
 }
 
 /* Outputs are private and disjoint. No physical permission can be turned
@@ -3639,39 +3642,34 @@ cluster_bufmgr_acquire_disk_outputs_private(
 	return true;
 }
 
-ResourceXApplyResult
-cluster_bufmgr_pcm_own_acquire_read_disk_exact(BufferDesc *buf,
+/* Each physical read keeps the original E, IO owner and master watermark.
+ * A storage refresh is not another acquisition or another native completion. */
+static ResourceXApplyResult
+cluster_bufmgr_acquire_disk_read_once(BufferDesc *buf,
 	const ClusterPcmOwnSnapshot *base, const ResourceXDecodedAcquireIntent *episode,
 	const ClusterSemanticAdmissionToken *admission, const ResourceXDeliveryClaim *execution,
-	PGIOAlignedBlock *out_page, XLogRecPtr *out_page_lsn, uint64 *out_page_scn)
+	ResourceOwner io_owner, uint64 watermark, PGIOAlignedBlock *scratch)
 {
-	PGIOAlignedBlock scratch;
-	ClusterPcmOwnSnapshot original;
-	ResourceXDecodedAcquireIntent entered;
-	ResourceXDeliveryClaim owned;
-	ResourceOwner io_owner = CurrentResourceOwner;
 	ClusterKoDirectoryIoV3 io;
 	volatile bool read = false, ended = false;
-	Page page = (Page)scratch.data;
+	uint64 observed;
+	Page page = (Page)scratch->data;
 
-	if (buf == NULL || base == NULL || episode == NULL || admission == NULL || execution == NULL
-		|| !cluster_bufmgr_acquire_disk_outputs_private(out_page, out_page_lsn, out_page_scn))
-		return RESOURCE_X_APPLY_INVALID;
-	original = *base;
-	entered = *episode;
-	owned = *execution;
-	if (!cluster_bufmgr_acquire_disk_owned(buf, &original, &entered, admission, &owned, io_owner))
+	if (!cluster_bufmgr_acquire_disk_owned(buf, base, episode, admission, execution,
+			io_owner, &observed) || observed != watermark)
 		return RESOURCE_X_APPLY_BAD_STATE;
-	if (!cluster_ko_directory_io_begin_v3(BufTagGetRelFileLocator(&original.tag), &io))
+	if (!cluster_ko_directory_io_begin_v3(BufTagGetRelFileLocator(&base->tag), &io))
 		return RESOURCE_X_APPLY_BAD_STATE;
 	PG_TRY();
 	{
 		/* KO admission and opening storage can yield or ERROR. Revalidate
 		 * after each boundary, with no entry/header/content lock held by IO. */
-		if (cluster_bufmgr_acquire_disk_owned(buf, &original, &entered, admission, &owned, io_owner)) {
-			SMgrRelation reln = smgropen(BufTagGetRelFileLocator(&original.tag), InvalidBackendId);
-			if (cluster_bufmgr_acquire_disk_owned(buf, &original, &entered, admission, &owned, io_owner)) {
-				smgrread(reln, BufTagGetForkNum(&original.tag), original.tag.blockNum, scratch.data);
+		if (cluster_bufmgr_acquire_disk_owned(buf, base, episode, admission, execution,
+				io_owner, &observed) && observed == watermark) {
+			SMgrRelation reln = smgropen(BufTagGetRelFileLocator(&base->tag), InvalidBackendId);
+			if (cluster_bufmgr_acquire_disk_owned(buf, base, episode, admission, execution,
+					io_owner, &observed) && observed == watermark) {
+				smgrread(reln, BufTagGetForkNum(&base->tag), base->tag.blockNum, scratch->data);
 				read = true;
 			}
 		}
@@ -3683,19 +3681,76 @@ cluster_bufmgr_pcm_own_acquire_read_disk_exact(BufferDesc *buf,
 	PG_END_TRY();
 	if (!read || !ended)
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
-	if (!PageIsVerifiedForFork(page, BufTagGetForkNum(&original.tag), original.tag.blockNum,
+	if (!PageIsVerifiedForFork(page, BufTagGetForkNum(&base->tag), base->tag.blockNum,
 			PIV_LOG_WARNING | PIV_REPORT_STAT)) {
-		cluster_block_io_trace_failed(original.tag, scratch.data, "DISK_ACQUIRE",
+		cluster_block_io_trace_failed(base->tag, scratch->data, "DISK_ACQUIRE",
 			((PageHeader)page)->pd_checksum, DataChecksumsEnabled() && !PageIsNew(page)
-				? pg_checksum_page(scratch.data, original.tag.blockNum) : 0);
+				? pg_checksum_page(scratch->data, base->tag.blockNum) : 0);
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	}
-	if (!cluster_bufmgr_acquire_disk_owned(buf, &original, &entered, admission, &owned, io_owner))
-		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
-	*out_page = scratch;
-	*out_page_lsn = PageGetLSN(page);
-	*out_page_scn = (uint64)((PageHeader)page)->pd_block_scn;
 	return RESOURCE_X_APPLY_APPLIED;
+}
+
+static bool
+cluster_bufmgr_acquire_disk_cold_ok(BufferTag tag, uint64 watermark)
+{
+	bool self_fence = !cluster_online_join
+		&& cluster_gcs_lookup_master_static(tag) == cluster_node_id
+		&& cluster_conf_node_count() > 1 && !cluster_grd_offpath_boot_decided();
+	bool extension = !SCN_VALID(watermark) && self_fence
+		&& cluster_bufmgr_block_is_extension_for_gcs(tag);
+
+	return cluster_gcs_cold_grd_watermark_verdict(SCN_VALID(watermark), self_fence, extension)
+		!= CLUSTER_COLD_GRD_FAIL_CLOSED;
+}
+
+ResourceXApplyResult
+cluster_bufmgr_pcm_own_acquire_read_disk_exact(BufferDesc *buf,
+	const ClusterPcmOwnSnapshot *base, const ResourceXDecodedAcquireIntent *episode,
+	const ClusterSemanticAdmissionToken *admission, const ResourceXDeliveryClaim *execution,
+	PGIOAlignedBlock *out_page, XLogRecPtr *out_page_lsn, uint64 *out_page_scn)
+{
+	PGIOAlignedBlock scratch;
+	ClusterPcmOwnSnapshot original;
+	ResourceXDecodedAcquireIntent entered;
+	ResourceXDeliveryClaim owned;
+	ResourceOwner io_owner = CurrentResourceOwner;
+	uint64 watermark, observed;
+	Page page = (Page)scratch.data;
+
+	if (buf == NULL || base == NULL || episode == NULL || admission == NULL || execution == NULL
+		|| !cluster_bufmgr_acquire_disk_outputs_private(out_page, out_page_lsn, out_page_scn))
+		return RESOURCE_X_APPLY_INVALID;
+	original = *base;
+	entered = *episode;
+	owned = *execution;
+	if (!cluster_bufmgr_acquire_disk_owned(buf, &original, &entered, admission, &owned,
+			io_owner, &watermark))
+		return RESOURCE_X_APPLY_BAD_STATE;
+	/* Preserve the original lost-write detector's single storage refresh.
+	 * Both reads remain under this one immutable master decision. */
+	for (unsigned attempt = 0; attempt < 2; attempt++) {
+		ResourceXApplyResult result = cluster_bufmgr_acquire_disk_read_once(buf, &original,
+			&entered, admission, &owned, io_owner, watermark, &scratch);
+		GcsLostWriteVerdict verdict;
+
+		if (result != RESOURCE_X_APPLY_APPLIED)
+			return result;
+		if (!cluster_bufmgr_acquire_disk_owned(buf, &original, &entered, admission, &owned,
+				io_owner, &observed) || observed != watermark
+			|| !cluster_bufmgr_acquire_disk_cold_ok(original.tag, watermark)
+			|| !cluster_bufmgr_acquire_disk_owned(buf, &original, &entered, admission, &owned,
+				io_owner, &observed) || observed != watermark)
+			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		verdict = gcs_block_lost_write_verdict(watermark, ((PageHeader)page)->pd_block_scn);
+		if (verdict == GCS_LOST_WRITE_PASS || verdict == GCS_LOST_WRITE_SKIP) {
+			*out_page = scratch;
+			*out_page_lsn = PageGetLSN(page);
+			*out_page_scn = (uint64)((PageHeader)page)->pd_block_scn;
+			return RESOURCE_X_APPLY_APPLIED;
+		}
+	}
+	return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 }
 /* End original first-fill disk execution. */
 

@@ -1822,12 +1822,12 @@ decision_plan_codec_frame(const ResourceXAcquireDecisionPlan *plan, bool block, 
 {
 	ResourceXDecodedFrame frame = {0}, decoded = {0};
 	ResourceXWireReject reject;
-	uint8 bytes[RESOURCE_X_DECISION_V3_BYTES];
+	uint8 bytes[RESOURCE_X_DECISION_V4_BYTES];
 	uint16 len = 0;
 	uint8 type = block ? RESOURCE_X_MSG_BLOCK_TO_N : RESOURCE_X_MSG_IMAGE_OR_GRANT;
 
 	frame.kind = block ? RESOURCE_X_WIRE_BLOCK_TO_N : RESOURCE_X_WIRE_AUTHORITY_GRANT;
-	frame.payload_bytes = RESOURCE_X_DECISION_V3_BYTES;
+	frame.payload_bytes = RESOURCE_X_DECISION_V4_BYTES;
 	frame.has_acquire_decision = true;
 	frame.common = plan->input.work.request;
 	frame.common.base_authority_generation = plan->input.authority_generation;
@@ -1900,7 +1900,7 @@ UT_TEST(test_decision_plan_never_reserves_or_arms_original_owner)
 	ResourceXAcquireDecisionPlan first, second;
 	ResourceXMasterSnapshot before, after;
 	ResourceXIntentSlot intent;
-	uint8 payload[RESOURCE_X_DECISION_V3_BYTES];
+	uint8 payload[RESOURCE_X_DECISION_V4_BYTES];
 	unsigned char *bytes;
 	if (!service_snapshot_start(PCM_STATE_N, PCM_STATE_X, &frame, &work)) return;
 	bytes = malloc(fake_pcm_header_requested_size);

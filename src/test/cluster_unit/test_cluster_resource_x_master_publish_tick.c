@@ -45,7 +45,7 @@ UT_TEST(test_tick_queued_disk_s_and_x_publish_without_another_request)
 		PcmAuthoritySnapshot before, after;
 		ResourceXIntentSlot slot, captured;
 		ResourceXWireReject reject;
-		uint8 bytes[RESOURCE_X_DECISION_V3_BYTES];
+		uint8 bytes[RESOURCE_X_DECISION_V4_BYTES];
 		uint32 cursor = 0;
 		acquire_reset(); ready_ring_full = true;
 		fake_pcm_clock_us = 100000;

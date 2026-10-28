@@ -32,6 +32,9 @@ static void (*disk_on_enter)(void), (*disk_on_open)(void), (*disk_on_read)(void)
 	(*disk_on_end)(void);
 static XLogRecPtr disk_lsn;
 static uint64 disk_scn;
+static bool disk_online_join, disk_boot_decided, disk_extension;
+static unsigned disk_extension_probes;
+static void (*disk_on_extension)(void);
 
 bool
 DataChecksumsEnabled(void)
@@ -111,6 +114,33 @@ disk_trace(BufferTag tag, const char *page, const char *stage, uint16 expected, 
 	UT_ASSERT(strcmp(stage, "DISK_ACQUIRE") == 0);
 	disk_traces++;
 }
+/* Cold-GRD environment/size probes are explicit provider leaves. */
+static bool
+disk_boot(void)
+{
+	disk_idle();
+	return disk_boot_decided;
+}
+static int
+disk_nodes(void)
+{
+	disk_idle();
+	return 4;
+}
+static bool
+disk_is_extension(BufferTag tag)
+{
+	disk_idle();
+	UT_ASSERT(BufferTagsEqual(&tag, &request_base.tag));
+	disk_extension_probes++;
+	if (disk_on_extension != NULL)
+		disk_on_extension();
+	return disk_extension;
+}
+#define cluster_online_join disk_online_join
+#define cluster_grd_offpath_boot_decided disk_boot
+#define cluster_conf_node_count disk_nodes
+#define cluster_bufmgr_block_is_extension_for_gcs disk_is_extension
 #define cluster_ko_directory_io_begin_v3 disk_enter
 #define cluster_ko_directory_io_end_v3 disk_end
 #define smgropen disk_open
@@ -120,6 +150,10 @@ disk_trace(BufferTag tag, const char *page, const char *stage, uint16 expected, 
 #define GetPrivateRefCount(buffer) request_private_pin(buffer)
 #include "test_cluster_native_disk_read.inc"
 #undef GetPrivateRefCount
+#undef cluster_bufmgr_block_is_extension_for_gcs
+#undef cluster_conf_node_count
+#undef cluster_grd_offpath_boot_decided
+#undef cluster_online_join
 #undef LockBufHdr
 #undef cluster_block_io_trace_failed
 #undef smgrread
@@ -138,10 +172,19 @@ disk_store(void)
 	UT_ASSERT_EQ(fflush(disk_file), 0);
 }
 static bool
-disk_start(EvidenceFixture *f, int profile)
+disk_start_watermark(EvidenceFixture *f, int profile, uint64 watermark)
 {
-	if (!execution_start(f, profile, -1) || execution_enter() != RESOURCE_X_APPLY_APPLIED)
+	bool entered;
+	evidence_disk_watermark_scn = watermark;
+	entered = execution_start(f, profile, -1) && execution_enter() == RESOURCE_X_APPLY_APPLIED;
+	evidence_disk_watermark_scn = 0;
+	if (!entered)
 		return false;
+	disk_online_join = false;
+	disk_boot_decided = true;
+	disk_extension = false;
+	disk_extension_probes = 0;
+	disk_on_extension = NULL;
 	disk_enters = disk_ends = disk_opens = disk_reads = disk_bad_pages = disk_traces = 0;
 	disk_enter_ok = disk_end_ok = true;
 	disk_open_error = disk_read_error = false;
@@ -163,6 +206,11 @@ disk_start(EvidenceFixture *f, int profile)
 	request_rechecks = 0;
 	request_hook = NULL;
 	return true;
+}
+static bool
+disk_start(EvidenceFixture *f, int profile)
+{
+	return disk_start_watermark(f, profile, 0);
 }
 static ResourceXApplyResult
 disk_run(void)
@@ -462,10 +510,180 @@ UT_TEST(test_disk_wrong_typed_fork_with_valid_checksum_is_rejected)
 	UT_ASSERT_EQ(disk_bad_pages, 0);
 	UT_ASSERT_EQ(disk_traces, 1);
 }
+
+static void
+disk_rewrite_scn(uint64 scn)
+{
+	((PageHeader)disk_bytes.data)->pd_block_scn = scn;
+	((PageHeader)disk_bytes.data)->pd_checksum
+		= pg_checksum_page(disk_bytes.data, request_base.tag.blockNum);
+	disk_store();
+}
+static void
+disk_catch_up(void)
+{
+	if (disk_reads == 1)
+		disk_rewrite_scn(101);
+}
+static void
+disk_corrupt_refresh(void)
+{
+	if (disk_reads == 1) {
+		disk_bytes.data[700] ^= 1;
+		disk_store();
+	}
+}
+static void
+disk_fail_refresh(void)
+{
+	if (disk_reads == 1)
+		disk_read_error = true;
+}
+static void
+disk_decline_refresh(void)
+{
+	if (disk_reads == 1)
+		disk_enter_ok = false;
+}
+UT_TEST(test_disk_master_watermark_covers_verified_S_and_known_X)
+{
+	for (int profile = 0; profile < 2; profile++) {
+		EvidenceFixture f;
+		UT_ASSERT(disk_start_watermark(&f, profile, 90));
+		UT_ASSERT_EQ(input_grant.body.acquire_decision.disk_watermark_scn, 90);
+		UT_ASSERT_EQ(disk_run(), RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(disk_scn, 93);
+		UT_ASSERT_EQ(disk_reads, 1);
+	}
+}
+UT_TEST(test_disk_watermark_uses_Lamport_time_not_node_bits)
+{
+	EvidenceFixture f;
+	UT_ASSERT(disk_start_watermark(&f, 0, UINT64_C(0x070000000000005a)));
+	UT_ASSERT_EQ(disk_run(), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(disk_scn, 93);
+	UT_ASSERT_EQ(disk_reads, 1);
+}
+UT_TEST(test_disk_stale_version_is_reread_once_then_refused_without_export)
+{
+	EvidenceFixture f;
+	UT_ASSERT(disk_start_watermark(&f, 0, 100));
+	UT_ASSERT(disk_run() != RESOURCE_X_APPLY_APPLIED);
+	disk_preserved();
+	UT_ASSERT_EQ(disk_reads, 2);
+	UT_ASSERT_EQ(disk_enters, 2);
+	UT_ASSERT_EQ(disk_ends, 2);
+}
+UT_TEST(test_disk_tracked_unstamped_page_never_becomes_current_proof)
+{
+	EvidenceFixture f;
+	UT_ASSERT(disk_start_watermark(&f, 0, 100));
+	disk_rewrite_scn(0);
+	UT_ASSERT(disk_run() != RESOURCE_X_APPLY_APPLIED);
+	disk_preserved();
+	UT_ASSERT_EQ(disk_reads, 2);
+	UT_ASSERT_EQ(disk_bad_pages, 0);
+}
+UT_TEST(test_disk_same_episode_refresh_can_observe_covering_storage)
+{
+	EvidenceFixture f;
+	UT_ASSERT(disk_start_watermark(&f, 0, 100));
+	disk_on_read = disk_catch_up;
+	UT_ASSERT_EQ(disk_run(), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(disk_reads, 2);
+	UT_ASSERT_EQ(disk_scn, 101);
+	UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), PCM_OWN_FLAG_GRANT_PENDING);
+	UT_ASSERT_EQ(request_shared.rings[1].count, 1);
+}
+UT_TEST(test_disk_refresh_keeps_original_checksum_rejection)
+{
+	EvidenceFixture f;
+	UT_ASSERT(disk_start_watermark(&f, 0, 100));
+	disk_on_read = disk_corrupt_refresh;
+	UT_ASSERT(disk_run() != RESOURCE_X_APPLY_APPLIED);
+	disk_preserved();
+	UT_ASSERT_EQ(disk_reads, 2);
+	UT_ASSERT_EQ(disk_bad_pages, 1);
+	UT_ASSERT_EQ(disk_traces, 1);
+}
+UT_TEST(test_disk_refresh_ERROR_ends_only_entered_KO_and_keeps_IO)
+{
+	EvidenceFixture f;
+	volatile bool caught = false;
+	UT_ASSERT(disk_start_watermark(&f, 0, 100));
+	disk_on_read = disk_fail_refresh;
+	PG_TRY();
+	{
+		(void)disk_run();
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	disk_preserved();
+	UT_ASSERT_EQ(disk_reads, 2);
+	UT_ASSERT_EQ(disk_ends, 2);
+	UT_ASSERT(ResourceOwnerHasBufferIO(original_io_owner, 1));
+}
+UT_TEST(test_disk_refresh_KO_refusal_never_creates_another_request)
+{
+	EvidenceFixture f;
+	UT_ASSERT(disk_start_watermark(&f, 0, 100));
+	disk_on_read = disk_decline_refresh;
+	UT_ASSERT(disk_run() != RESOURCE_X_APPLY_APPLIED);
+	disk_preserved();
+	UT_ASSERT_EQ(disk_reads, 1);
+	UT_ASSERT_EQ(disk_enters, 2);
+	UT_ASSERT_EQ(disk_ends, 1);
+	UT_ASSERT_EQ(request_shared.rings[1].count, 1);
+}
+UT_TEST(test_disk_unknown_cold_GRD_on_existing_block_cannot_skip)
+{
+	EvidenceFixture f;
+	UT_ASSERT(disk_start_watermark(&f, 0, 0));
+	disk_boot_decided = false;
+	UT_ASSERT(disk_run() != RESOURCE_X_APPLY_APPLIED);
+	disk_preserved();
+	UT_ASSERT_EQ(disk_reads, 1);
+	UT_ASSERT_EQ(disk_extension_probes, 1);
+}
+UT_TEST(test_disk_original_cold_extension_proof_still_allows_untracked_page)
+{
+	EvidenceFixture f;
+	UT_ASSERT(disk_start_watermark(&f, 0, 0));
+	disk_boot_decided = false;
+	disk_extension = true;
+	UT_ASSERT_EQ(disk_run(), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(disk_reads, 1);
+	UT_ASSERT_EQ(disk_extension_probes, 1);
+}
+UT_TEST(test_disk_cold_metadata_provider_cannot_export_after_IO_owner_loss)
+{
+	EvidenceFixture f;
+	UT_ASSERT(disk_start_watermark(&f, 0, 0));
+	disk_boot_decided = false;
+	disk_extension = true;
+	disk_on_extension = disk_lose_io;
+	UT_ASSERT(disk_run() != RESOURCE_X_APPLY_APPLIED);
+	disk_preserved();
+	UT_ASSERT_EQ(disk_extension_probes, 1);
+}
+UT_TEST(test_disk_valid_watermark_needs_no_extension_metadata_probe)
+{
+	EvidenceFixture f;
+	UT_ASSERT(disk_start_watermark(&f, 0, 90));
+	disk_boot_decided = false;
+	UT_ASSERT_EQ(disk_run(), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(disk_extension_probes, 0);
+	UT_ASSERT_EQ(disk_reads, 1);
+}
+
 int
 main(void)
 {
-	UT_PLAN(20);
+	UT_PLAN(32);
 	UT_RUN(test_disk_only_original_full_disk_S_and_known_X_can_read);
 	UT_RUN(test_disk_remote_local_current_or_resident_never_reads_disk);
 	UT_RUN(test_disk_stale_execution_or_episode_cannot_read);
@@ -486,6 +704,18 @@ main(void)
 	UT_RUN(test_disk_overlapping_outputs_cannot_rewrite_staged_bytes);
 	UT_RUN(test_disk_original_all_zero_page_semantics_are_preserved);
 	UT_RUN(test_disk_wrong_typed_fork_with_valid_checksum_is_rejected);
+	UT_RUN(test_disk_master_watermark_covers_verified_S_and_known_X);
+	UT_RUN(test_disk_watermark_uses_Lamport_time_not_node_bits);
+	UT_RUN(test_disk_stale_version_is_reread_once_then_refused_without_export);
+	UT_RUN(test_disk_tracked_unstamped_page_never_becomes_current_proof);
+	UT_RUN(test_disk_same_episode_refresh_can_observe_covering_storage);
+	UT_RUN(test_disk_refresh_keeps_original_checksum_rejection);
+	UT_RUN(test_disk_refresh_ERROR_ends_only_entered_KO_and_keeps_IO);
+	UT_RUN(test_disk_refresh_KO_refusal_never_creates_another_request);
+	UT_RUN(test_disk_unknown_cold_GRD_on_existing_block_cannot_skip);
+	UT_RUN(test_disk_original_cold_extension_proof_still_allows_untracked_page);
+	UT_RUN(test_disk_cold_metadata_provider_cannot_export_after_IO_owner_loss);
+	UT_RUN(test_disk_valid_watermark_needs_no_extension_metadata_probe);
 	if (disk_file != NULL)
 		fclose(disk_file);
 	UT_DONE();

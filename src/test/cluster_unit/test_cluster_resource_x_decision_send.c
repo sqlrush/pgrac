@@ -20,7 +20,7 @@ typedef struct DecisionSendFixture {
 	uint8 *payload;
 	ResourceXDecodedFrame frame;
 	ResourceXIntentSlot expected;
-	uint8 bytes[RESOURCE_X_DECISION_V3_BYTES];
+	uint8 bytes[RESOURCE_X_DECISION_V4_BYTES];
 	uint32 owner_index;
 } DecisionSendFixture;
 
@@ -33,8 +33,8 @@ decision_send_encode(DecisionSendFixture *f)
 		? RESOURCE_X_MSG_BLOCK_TO_N : RESOURCE_X_MSG_IMAGE_OR_GRANT, &f->frame,
 		f->bytes, sizeof(f->bytes), &len, &reject);
 	UT_ASSERT(ok);
-	UT_ASSERT_EQ(len, RESOURCE_X_DECISION_V3_BYTES);
-	return ok && len == RESOURCE_X_DECISION_V3_BYTES;
+	UT_ASSERT_EQ(len, RESOURCE_X_DECISION_V4_BYTES);
+	return ok && len == RESOURCE_X_DECISION_V4_BYTES;
 }
 
 static bool
@@ -99,14 +99,14 @@ decision_send_start(bool block, DecisionSendFixture *f)
 	f->slot = block ? &f->state->block_intents[3].slot : &f->state->grant_intent.slot;
 	f->payload = block ? f->state->block_intents[3].payload : f->state->grant_intent.payload;
 	UT_ASSERT((block ? sizeof(f->state->block_intents[3].payload)
-		: sizeof(f->state->grant_intent.payload)) >= RESOURCE_X_DECISION_V3_BYTES);
+		: sizeof(f->state->grant_intent.payload)) >= RESOURCE_X_DECISION_V4_BYTES);
 	if ((block ? sizeof(f->state->block_intents[3].payload)
-		: sizeof(f->state->grant_intent.payload)) < RESOURCE_X_DECISION_V3_BYTES) return false;
+		: sizeof(f->state->grant_intent.payload)) < RESOURCE_X_DECISION_V4_BYTES) return false;
 
 	request = make_resource_x_acquire_request(tag, 2, RESOURCE_X_ACQUIRE_FIRST_FILL,
 		PCM_STATE_N, PCM_STATE_X);
 	f->frame.kind = block ? RESOURCE_X_WIRE_BLOCK_TO_N : RESOURCE_X_WIRE_AUTHORITY_GRANT;
-	f->frame.payload_bytes = RESOURCE_X_DECISION_V3_BYTES;
+	f->frame.payload_bytes = RESOURCE_X_DECISION_V4_BYTES;
 	f->frame.has_acquire_decision = true;
 	f->frame.common = assertion.common;
 	f->frame.common.authority_generation = 2;
@@ -133,7 +133,7 @@ decision_send_start(bool block, DecisionSendFixture *f)
 	memset(f->slot, 0, sizeof(*f->slot));
 	memcpy(f->payload, f->bytes, sizeof(f->bytes));
 	UT_ASSERT(cluster_pcm_lock_resource_x_intent_arm_exact(f->slot, &body, 41, 2,
-		100000, block ? 3 : 2, RESOURCE_X_DECISION_V3_BYTES, f->frame.kind));
+		100000, block ? 3 : 2, RESOURCE_X_DECISION_V4_BYTES, f->frame.kind));
 	f->expected = *f->slot;
 	fake_pcm_clock_us = 100001;
 	return f->slot->state == RESOURCE_X_INTENT_SLOT_ARMED;
@@ -143,7 +143,7 @@ static void
 decision_send_snapshot(DecisionSendFixture *f)
 {
 	ResourceXIntentSlot slot;
-	uint8 bytes[RESOURCE_X_DECISION_V3_BYTES];
+	uint8 bytes[RESOURCE_X_DECISION_V4_BYTES];
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_snapshot_exact(&f->expected,
 		&slot, bytes, sizeof(bytes)), RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT(memcmp(&slot, f->slot, sizeof(slot)) == 0);
@@ -183,7 +183,7 @@ UT_TEST(test_decision_send_arm_accepts_only_the_two_existing_families)
 		body.owner_generation = grant ? 2 : 41;
 		memset(&slot, 0, sizeof(slot));
 		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_intent_arm_exact(&slot, &body, 41, 2, 100000,
-			grant ? 2 : 3, RESOURCE_X_DECISION_V3_BYTES, kind), allowed);
+			grant ? 2 : 3, RESOURCE_X_DECISION_V4_BYTES, kind), allowed);
 	}
 	for (int bad = 0; bad < 4; bad++) {
 		body.owner_kind = RESOURCE_X_INTENT_OWNER_MASTER_GRANT;

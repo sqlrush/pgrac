@@ -11,10 +11,13 @@ typedef struct EvidenceFixture {
 	ResourceXIntentSlot ticket;
 } EvidenceFixture;
 
+/* Explicit master-message input, before the real codec/join takes ownership. */
+static uint64 evidence_disk_watermark_scn;
+
 static bool
 evidence_wire(ResourceXDecodedFrame *frame)
 {
-	uint8 bytes[RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES];
+	uint8 bytes[RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES];
 	uint16 len;
 	ResourceXWireReject reject;
 	uint8 type = frame->kind == RESOURCE_X_WIRE_BLOCKED_TO_N
@@ -29,7 +32,7 @@ evidence_witness(const ResourceXDecodedFrame *a, int node)
 {
 	ResourceXDecodedFrame frame = {0};
 	frame.kind = RESOURCE_X_WIRE_BLOCKED_TO_N;
-	frame.payload_bytes = RESOURCE_X_WITNESS_V3_BYTES;
+	frame.payload_bytes = RESOURCE_X_WITNESS_V4_BYTES;
 	frame.has_acquire_decision = true;
 	frame.common = a->common;
 	frame.common.action_node = node;
@@ -61,7 +64,7 @@ evidence_begin(EvidenceFixture *f, int profile)
 	ut_master_session = 101; /* requester boot; its remote master session stays31 */
 	fake_pcm_clock_us = 200;
 	f->decision.kind = RESOURCE_X_WIRE_AUTHORITY_GRANT;
-	f->decision.payload_bytes = RESOURCE_X_DECISION_V3_BYTES;
+	f->decision.payload_bytes = RESOURCE_X_DECISION_V4_BYTES;
 	f->decision.has_acquire_decision = true;
 	f->decision.common = f->request.common;
 	f->decision.common.base_authority_generation = 10000;
@@ -74,6 +77,7 @@ evidence_begin(EvidenceFixture *f, int profile)
 	a->master_node = 0;
 	a->source_kind = remote ? RESOURCE_X_ACQUIRE_SOURCE_REMOTE_CURRENT
 		: profile >= 6 ? RESOURCE_X_ACQUIRE_SOURCE_LOCAL_CURRENT : RESOURCE_X_ACQUIRE_SOURCE_DISK;
+	a->disk_watermark_scn = profile < 2 ? evidence_disk_watermark_scn : 0;
 	a->source_node = remote ? 2 : profile >= 6 ? 1 : -1;
 	a->source_service_generation = profile < 2 ? 0 : 55;
 	a->directory_mode = profile == 3 || profile == 5 || profile == 7 ? PCM_STATE_X
@@ -96,7 +100,7 @@ evidence_begin(EvidenceFixture *f, int profile)
 	if (profile == 4 || profile == 6)
 		f->witness = evidence_witness(&f->decision, 3);
 	if (remote) {
-		uint8 bytes[RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES];
+		uint8 bytes[RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES];
 		uint16 len;
 		ResourceXWireReject reject;
 		ResourceXDecodedFrame original = {0};

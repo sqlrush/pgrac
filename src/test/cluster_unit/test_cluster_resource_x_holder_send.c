@@ -16,7 +16,7 @@ typedef struct HolderSendFixture {
 	ClusterPcmResourceXMasterState *state;
 	ResourceXDecodedFrame status, image;
 	ResourceXIntentSlot expected[2];
-	uint8 bytes[2][RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES];
+	uint8 bytes[2][RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES];
 	uint16 lengths[2];
 } HolderSendFixture;
 
@@ -54,7 +54,7 @@ holder_send_start(int profile, HolderSendFixture *f)
 	ResourceXIntentSlot original;
 	ResourceXIntentBodyHandle body = {0};
 	uint8 old[RESOURCE_X_PROOF_V1_BYTES];
-	uint8 raw[RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES];
+	uint8 raw[RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES];
 	unsigned char *memory = (unsigned char *)fake_pcm_header.data;
 	Size matches = 0, location = 0;
 	BufferTag tag;
@@ -157,7 +157,7 @@ holder_send_start(int profile, HolderSendFixture *f)
 static void
 holder_send_snapshot(HolderSendFixture *f, int half)
 {
-	uint8 output[RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES];
+	uint8 output[RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES];
 	ResourceXIntentSlot slot;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_snapshot_exact(&f->expected[half],
 		&slot, output, sizeof(output)), RESOURCE_X_APPLY_APPLIED);
@@ -169,7 +169,7 @@ holder_send_snapshot(HolderSendFixture *f, int half)
 static void
 holder_send_refused(HolderSendFixture *f)
 {
-	uint8 output[RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES], before[sizeof(output)];
+	uint8 output[RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES], before[sizeof(output)];
 	ResourceXIntentSlot slot, live[2];
 	for (int half = 0; half < 2; half++) live[half] = *holder_send_slot(f, half);
 	memset(output, 0xa5, sizeof(output)); memcpy(before, output, sizeof(before));

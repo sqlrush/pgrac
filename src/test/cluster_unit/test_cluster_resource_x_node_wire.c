@@ -1658,8 +1658,9 @@ make_decision_bytes(uint8 *bytes, bool forward, uint8 directory_mode,
 {
 	uint32 required;
 
-	memset(bytes, 0, RESOURCE_X_DECISION_V3_BYTES);
+	memset(bytes, 0, RESOURCE_X_DECISION_V4_BYTES);
 	make_acquire_bytes(bytes);
+	bytes[0] = RESOURCE_X_DECISION_WIRE_VERSION;
 	bytes[1] = forward ? RESOURCE_X_WIRE_BLOCK_TO_N : RESOURCE_X_WIRE_AUTHORITY_GRANT;
 	bytes[2] = 2;
 	bytes[3] = 224;
@@ -1688,20 +1689,20 @@ make_decision_bytes(uint8 *bytes, bool forward, uint8 directory_mode,
 	}
 	if (forward)
 		test_put_u32_be(bytes + 68, (uint32)source_node);
-	test_reseal(bytes, RESOURCE_X_DECISION_V3_BYTES);
+	test_reseal(bytes, RESOURCE_X_DECISION_V4_BYTES);
 }
 
 static bool
 decision_round_trip(uint8 *bytes, bool forward, ResourceXDecodedFrame *decoded)
 {
-	uint8 encoded[RESOURCE_X_DECISION_V3_BYTES];
+	uint8 encoded[RESOURCE_X_DECISION_V4_BYTES];
 	uint8 msg = forward ? RESOURCE_X_MSG_BLOCK_TO_N : RESOURCE_X_MSG_IMAGE_OR_GRANT;
 	ResourceXWireReject reject;
 	uint16 len = 0;
 	bool ok;
 
-	test_reseal(bytes, RESOURCE_X_DECISION_V3_BYTES);
-	ok = cluster_resource_x_wire_decode(msg, bytes, RESOURCE_X_DECISION_V3_BYTES,
+	test_reseal(bytes, RESOURCE_X_DECISION_V4_BYTES);
+	ok = cluster_resource_x_wire_decode(msg, bytes, RESOURCE_X_DECISION_V4_BYTES,
 		decoded, &reject);
 	UT_ASSERT(ok);
 	if (!ok)
@@ -1719,24 +1720,24 @@ decision_round_trip(uint8 *bytes, bool forward, ResourceXDecodedFrame *decoded)
 static void
 decision_reject_bytes(uint8 *bytes, bool forward)
 {
-	test_reseal(bytes, RESOURCE_X_DECISION_V3_BYTES);
+	test_reseal(bytes, RESOURCE_X_DECISION_V4_BYTES);
 	test_acquire_rejected(forward ? RESOURCE_X_MSG_BLOCK_TO_N : RESOURCE_X_MSG_IMAGE_OR_GRANT,
-		bytes, RESOURCE_X_DECISION_V3_BYTES);
+		bytes, RESOURCE_X_DECISION_V4_BYTES);
 }
 
 UT_TEST(test_decision_layout_and_existing_families_are_exact)
 {
-	UT_ASSERT_EQ(RESOURCE_X_DECISION_V3_BYTES, 736);
-	UT_ASSERT_EQ(sizeof(ResourceXAcquireDecisionV3), 736);
+	UT_ASSERT_EQ(RESOURCE_X_DECISION_V4_BYTES, 736);
+	UT_ASSERT_EQ(sizeof(ResourceXAcquireDecisionV4), 736);
 	UT_ASSERT_EQ(sizeof(ResourceXAcquireHolderV3), 16);
-	UT_ASSERT_EQ(offsetof(ResourceXAcquireDecisionV3, resource_binding), 160);
-	UT_ASSERT_EQ(offsetof(ResourceXAcquireDecisionV3, source_service_generation), 176);
-	UT_ASSERT_EQ(offsetof(ResourceXAcquireDecisionV3, master_node), 184);
-	UT_ASSERT_EQ(offsetof(ResourceXAcquireDecisionV3, holders_bitmap), 192);
-	UT_ASSERT_EQ(offsetof(ResourceXAcquireDecisionV3, requester_ingress_generation), 204);
-	UT_ASSERT_EQ(offsetof(ResourceXAcquireDecisionV3, directory_mode), 212);
-	UT_ASSERT_EQ(offsetof(ResourceXAcquireDecisionV3, zero_reserved), 214);
-	UT_ASSERT_EQ(offsetof(ResourceXAcquireDecisionV3, holders), 224);
+	UT_ASSERT_EQ(offsetof(ResourceXAcquireDecisionV4, resource_binding), 160);
+	UT_ASSERT_EQ(offsetof(ResourceXAcquireDecisionV4, source_service_generation), 176);
+	UT_ASSERT_EQ(offsetof(ResourceXAcquireDecisionV4, master_node), 184);
+	UT_ASSERT_EQ(offsetof(ResourceXAcquireDecisionV4, holders_bitmap), 192);
+	UT_ASSERT_EQ(offsetof(ResourceXAcquireDecisionV4, requester_ingress_generation), 204);
+	UT_ASSERT_EQ(offsetof(ResourceXAcquireDecisionV4, directory_mode), 212);
+	UT_ASSERT_EQ(offsetof(ResourceXAcquireDecisionV4, zero_reserved), 214);
+	UT_ASSERT_EQ(offsetof(ResourceXAcquireDecisionV4, holders), 224);
 	UT_ASSERT_EQ(RESOURCE_X_WIRE_KIND_MAX, 11);
 	UT_ASSERT_EQ(RESOURCE_X_MSG_IMAGE_OR_GRANT, PGRAC_IC_MSG_GCS_BLOCK_REPLY);
 	UT_ASSERT_EQ(RESOURCE_X_MSG_BLOCK_TO_N, PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE);
@@ -1744,7 +1745,7 @@ UT_TEST(test_decision_layout_and_existing_families_are_exact)
 
 UT_TEST(test_decision_disk_s_and_x_preserve_complete_episode)
 {
-	uint8 bytes[RESOURCE_X_DECISION_V3_BYTES];
+	uint8 bytes[RESOURCE_X_DECISION_V4_BYTES];
 	ResourceXDecodedFrame decoded;
 
 	for (int mode = PCM_STATE_S; mode <= PCM_STATE_X; mode++) {
@@ -1766,7 +1767,7 @@ UT_TEST(test_decision_disk_s_and_x_preserve_complete_episode)
 
 UT_TEST(test_decision_remote_x_source_and_downgrade_require_exact_holder)
 {
-	uint8 bytes[RESOURCE_X_DECISION_V3_BYTES];
+	uint8 bytes[RESOURCE_X_DECISION_V4_BYTES];
 	ResourceXDecodedFrame decoded;
 
 	for (int forward = 0; forward <= 1; forward++)
@@ -1786,7 +1787,7 @@ UT_TEST(test_decision_remote_x_source_and_downgrade_require_exact_holder)
 
 UT_TEST(test_decision_shared_holders_keep_every_required_identity)
 {
-	uint8 bytes[RESOURCE_X_DECISION_V3_BYTES];
+	uint8 bytes[RESOURCE_X_DECISION_V4_BYTES];
 	ResourceXDecodedFrame decoded;
 
 	for (int mode = PCM_STATE_S; mode <= PCM_STATE_X; mode++) {
@@ -1803,7 +1804,7 @@ UT_TEST(test_decision_shared_holders_keep_every_required_identity)
 
 UT_TEST(test_decision_local_current_is_bound_to_requester_boot)
 {
-	uint8 bytes[RESOURCE_X_DECISION_V3_BYTES];
+	uint8 bytes[RESOURCE_X_DECISION_V4_BYTES];
 	ResourceXDecodedFrame decoded;
 
 	for (int dir = PCM_STATE_S; dir <= PCM_STATE_X; dir++)
@@ -1820,7 +1821,7 @@ UT_TEST(test_decision_local_current_is_bound_to_requester_boot)
 
 UT_TEST(test_decision_forward_may_address_required_nonsource_only)
 {
-	uint8 bytes[RESOURCE_X_DECISION_V3_BYTES];
+	uint8 bytes[RESOURCE_X_DECISION_V4_BYTES];
 	ResourceXDecodedFrame decoded;
 
 	make_decision_bytes(bytes, true, PCM_STATE_S, 6, PCM_STATE_X, 1,
@@ -1836,30 +1837,30 @@ UT_TEST(test_decision_forward_may_address_required_nonsource_only)
 
 UT_TEST(test_decision_every_prefix_extra_length_and_wrong_pair_is_rejected)
 {
-	uint8 bytes[RESOURCE_X_DECISION_V3_BYTES + 1];
+	uint8 bytes[RESOURCE_X_DECISION_V4_BYTES + 1];
 
 	for (int forward = 0; forward <= 1; forward++) {
 		uint8 msg = forward ? RESOURCE_X_MSG_BLOCK_TO_N : RESOURCE_X_MSG_IMAGE_OR_GRANT;
 		make_decision_bytes(bytes, forward, PCM_STATE_X, 2, PCM_STATE_X, 1,
 			RESOURCE_X_ACQUIRE_SOURCE_REMOTE_CURRENT);
-		for (int len = 0; len < RESOURCE_X_DECISION_V3_BYTES; len++)
+		for (int len = 0; len < RESOURCE_X_DECISION_V4_BYTES; len++)
 			test_acquire_rejected(msg, bytes, len);
-		bytes[RESOURCE_X_DECISION_V3_BYTES] = 0;
+		bytes[RESOURCE_X_DECISION_V4_BYTES] = 0;
 		test_acquire_rejected(msg, bytes, sizeof(bytes));
 		for (int type = 0; type < 256; type++)
 			if (type != msg)
-				test_acquire_rejected(type, bytes, RESOURCE_X_DECISION_V3_BYTES);
+				test_acquire_rejected(type, bytes, RESOURCE_X_DECISION_V4_BYTES);
 	}
 }
 
 UT_TEST(test_decision_version_declared_length_kind_and_crc_are_strict)
 {
-	uint8 bytes[RESOURCE_X_DECISION_V3_BYTES], before[RESOURCE_X_DECISION_V3_BYTES];
+	uint8 bytes[RESOURCE_X_DECISION_V4_BYTES], before[RESOURCE_X_DECISION_V4_BYTES];
 
 	make_decision_bytes(before, false, PCM_STATE_X, 2, PCM_STATE_X, 1,
 		RESOURCE_X_ACQUIRE_SOURCE_REMOTE_CURRENT);
 	for (int version = 0; version < 256; version++) {
-		if (version == 3)
+		if (version == RESOURCE_X_DECISION_WIRE_VERSION)
 			continue;
 		memcpy(bytes, before, sizeof(bytes)); bytes[0] = version;
 		decision_reject_bytes(bytes, false);
@@ -1878,7 +1879,7 @@ UT_TEST(test_decision_version_declared_length_kind_and_crc_are_strict)
 
 UT_TEST(test_decision_reserved_ranges_are_zero_even_with_valid_crc)
 {
-	uint8 bytes[RESOURCE_X_DECISION_V3_BYTES];
+	uint8 bytes[RESOURCE_X_DECISION_V4_BYTES];
 	const int starts[] = {82, 153, 214}, lengths[] = {6, 7, 10};
 
 	for (int range = 0; range < 3; range++)
@@ -1892,7 +1893,7 @@ UT_TEST(test_decision_reserved_ranges_are_zero_even_with_valid_crc)
 
 UT_TEST(test_decision_full_generations_reject_zero_and_exhaustion)
 {
-	uint8 bytes[RESOURCE_X_DECISION_V3_BYTES];
+	uint8 bytes[RESOURCE_X_DECISION_V4_BYTES];
 	const int offsets[] = {32, 40, 48, 56, 88, 96, 104, 120, 128, 136, 160, 168, 176, 240, 248};
 
 	for (unsigned i = 0; i < lengthof(offsets); i++)
@@ -1912,7 +1913,7 @@ UT_TEST(test_decision_full_generations_reject_zero_and_exhaustion)
 
 UT_TEST(test_decision_native_base_zero_is_valid_but_bad_slots_or_path_are_not)
 {
-	uint8 bytes[RESOURCE_X_DECISION_V3_BYTES];
+	uint8 bytes[RESOURCE_X_DECISION_V4_BYTES];
 	ResourceXDecodedFrame decoded;
 	const int offsets[] = {144, 148};
 
@@ -1942,7 +1943,7 @@ UT_TEST(test_decision_native_base_zero_is_valid_but_bad_slots_or_path_are_not)
 
 UT_TEST(test_decision_connection_domains_and_master_roles_are_bounded)
 {
-	uint8 bytes[RESOURCE_X_DECISION_V3_BYTES];
+	uint8 bytes[RESOURCE_X_DECISION_V4_BYTES];
 	const int connections[] = {76, 204, 208};
 
 	for (unsigned i = 0; i < lengthof(connections); i++)
@@ -1962,7 +1963,7 @@ UT_TEST(test_decision_connection_domains_and_master_roles_are_bounded)
 
 UT_TEST(test_decision_holder_set_has_no_missing_stray_or_future_grant)
 {
-	uint8 bytes[RESOURCE_X_DECISION_V3_BYTES];
+	uint8 bytes[RESOURCE_X_DECISION_V4_BYTES];
 	const int offsets[] = {224, 232, 256, 264};
 
 	for (unsigned i = 0; i < lengthof(offsets); i++) {
@@ -1979,7 +1980,7 @@ UT_TEST(test_decision_holder_set_has_no_missing_stray_or_future_grant)
 
 UT_TEST(test_decision_directory_and_required_set_cannot_omit_blockers)
 {
-	uint8 bytes[RESOURCE_X_DECISION_V3_BYTES];
+	uint8 bytes[RESOURCE_X_DECISION_V4_BYTES];
 	const uint32 required[] = {0, 1, 4, 8, UINT32_MAX};
 
 	for (unsigned i = 0; i < lengthof(required); i++) {
@@ -2004,7 +2005,7 @@ UT_TEST(test_decision_directory_and_required_set_cannot_omit_blockers)
 
 UT_TEST(test_decision_disk_never_covers_current_pi_or_service_debt)
 {
-	uint8 bytes[RESOURCE_X_DECISION_V3_BYTES];
+	uint8 bytes[RESOURCE_X_DECISION_V4_BYTES];
 
 	for (int mutation = 0; mutation < 4; mutation++) {
 		make_decision_bytes(bytes, false, PCM_STATE_N, 0, PCM_STATE_S, -1, RESOURCE_X_ACQUIRE_SOURCE_DISK);
@@ -2020,7 +2021,7 @@ UT_TEST(test_decision_disk_never_covers_current_pi_or_service_debt)
 
 UT_TEST(test_decision_remote_local_source_identity_cannot_be_substituted)
 {
-	uint8 bytes[RESOURCE_X_DECISION_V3_BYTES];
+	uint8 bytes[RESOURCE_X_DECISION_V4_BYTES];
 
 	for (int mutation = 0; mutation < 5; mutation++) {
 		make_decision_bytes(bytes, false, PCM_STATE_X, 2, PCM_STATE_X, 1,
@@ -2046,7 +2047,7 @@ UT_TEST(test_decision_remote_local_source_identity_cannot_be_substituted)
 
 UT_TEST(test_decision_never_encodes_terminal_outcome_or_legacy_source_flags)
 {
-	uint8 bytes[RESOURCE_X_DECISION_V3_BYTES];
+	uint8 bytes[RESOURCE_X_DECISION_V4_BYTES];
 	const int offsets[] = {64, 74, 75, 80, 81};
 
 	for (unsigned i = 0; i < lengthof(offsets); i++) {
@@ -2073,7 +2074,7 @@ UT_TEST(test_decision_never_encodes_terminal_outcome_or_legacy_source_flags)
 static void
 decision_encode_rejected(ResourceXDecodedFrame *decoded, uint16 capacity)
 {
-	uint8 output[RESOURCE_X_DECISION_V3_BYTES], original[RESOURCE_X_DECISION_V3_BYTES];
+	uint8 output[RESOURCE_X_DECISION_V4_BYTES], original[RESOURCE_X_DECISION_V4_BYTES];
 	uint16 len = 77;
 	ResourceXWireReject reject;
 
@@ -2088,7 +2089,7 @@ decision_encode_rejected(ResourceXDecodedFrame *decoded, uint16 capacity)
 
 UT_TEST(test_decision_encoder_checks_typed_body_and_discriminator_before_output)
 {
-	uint8 bytes[RESOURCE_X_DECISION_V3_BYTES];
+	uint8 bytes[RESOURCE_X_DECISION_V4_BYTES];
 	ResourceXDecodedFrame decoded, invalid;
 
 	make_decision_bytes(bytes, false, PCM_STATE_X, 2, PCM_STATE_X, 1,
@@ -2111,19 +2112,19 @@ UT_TEST(test_decision_encoder_checks_typed_body_and_discriminator_before_output)
 
 UT_TEST(test_decision_every_insufficient_capacity_is_atomic)
 {
-	uint8 bytes[RESOURCE_X_DECISION_V3_BYTES];
+	uint8 bytes[RESOURCE_X_DECISION_V4_BYTES];
 	ResourceXDecodedFrame decoded;
 
 	make_decision_bytes(bytes, false, PCM_STATE_N, 0, PCM_STATE_S, -1, RESOURCE_X_ACQUIRE_SOURCE_DISK);
 	if (!decision_round_trip(bytes, false, &decoded))
 		return;
-	for (uint16 cap = 0; cap < RESOURCE_X_DECISION_V3_BYTES; cap++)
+	for (uint16 cap = 0; cap < RESOURCE_X_DECISION_V4_BYTES; cap++)
 		decision_encode_rejected(&decoded, cap);
 }
 
 UT_TEST(test_decision_sender_rebind_preserves_master_episode_and_holder_bytes)
 {
-	uint8 bytes[RESOURCE_X_DECISION_V3_BYTES], before[RESOURCE_X_DECISION_V3_BYTES];
+	uint8 bytes[RESOURCE_X_DECISION_V4_BYTES], before[RESOURCE_X_DECISION_V4_BYTES];
 	ResourceXDecodedFrame decoded;
 	ResourceXWireReject reject;
 
@@ -2133,7 +2134,7 @@ UT_TEST(test_decision_sender_rebind_preserves_master_episode_and_holder_bytes)
 			RESOURCE_X_ACQUIRE_SOURCE_REMOTE_CURRENT);
 		memcpy(before, bytes, sizeof(bytes));
 		UT_ASSERT(cluster_resource_x_wire_rebind_sender_generation(msg, bytes, sizeof(bytes), 7, &reject));
-		for (int offset = 0; offset < RESOURCE_X_DECISION_V3_BYTES; offset++)
+		for (int offset = 0; offset < RESOURCE_X_DECISION_V4_BYTES; offset++)
 			if ((offset < 4 || offset >= 8) && (offset < 76 || offset >= 80))
 				UT_ASSERT_EQ(bytes[offset], before[offset]);
 		if (!decision_round_trip(bytes, forward, &decoded))
@@ -2157,11 +2158,11 @@ witness_attach(uint8 *bytes, int holder, bool source_proof)
 	ResourceXDecodedFrame decision, ack, witness = {0};
 	ResourceXWireReject reject;
 	uint16 inner_len = 0;
-	uint16 len = source_proof ? RESOURCE_X_SOURCE_WITNESS_V3_BYTES : RESOURCE_X_WITNESS_V3_BYTES;
+	uint16 len = source_proof ? RESOURCE_X_SOURCE_WITNESS_V4_BYTES : RESOURCE_X_WITNESS_V4_BYTES;
 	test_put_u32_be(bytes + 68, holder);
-	test_reseal(bytes, RESOURCE_X_DECISION_V3_BYTES);
+	test_reseal(bytes, RESOURCE_X_DECISION_V4_BYTES);
 	UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_BLOCK_TO_N, bytes,
-		RESOURCE_X_DECISION_V3_BYTES, &decision, &reject));
+		RESOURCE_X_DECISION_V4_BYTES, &decision, &reject));
 	ack = make_typed_frame(RESOURCE_X_WIRE_BLOCKED_TO_N);
 	ack.common = decision.common;
 	ack.kind = RESOURCE_X_WIRE_BLOCKED_TO_N;
@@ -2187,8 +2188,8 @@ witness_attach(uint8 *bytes, int holder, bool source_proof)
 		proof->acting_formation = ack.common.resource_formation;
 	}
 	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_BLOCKED_TO_N, &ack,
-		bytes + RESOURCE_X_DECISION_V3_BYTES, RESOURCE_X_PROOF_V1_BYTES, &inner_len, &reject));
-	UT_ASSERT_EQ(inner_len, len - RESOURCE_X_DECISION_V3_BYTES);
+		bytes + RESOURCE_X_DECISION_V4_BYTES, RESOURCE_X_PROOF_V1_BYTES, &inner_len, &reject));
+	UT_ASSERT_EQ(inner_len, len - RESOURCE_X_DECISION_V4_BYTES);
 	witness.kind = RESOURCE_X_WIRE_BLOCKED_TO_N;
 	witness.payload_bytes = len;
 	witness.has_acquire_decision = true;
@@ -2217,7 +2218,7 @@ static bool
 witness_round_trip(const uint8 *bytes, uint16 len, ResourceXDecodedFrame *frame)
 {
 	ResourceXWireReject reject;
-	uint8 encoded[RESOURCE_X_SOURCE_WITNESS_V3_BYTES];
+	uint8 encoded[RESOURCE_X_SOURCE_WITNESS_V4_BYTES];
 	uint16 actual = 0;
 	bool ok = cluster_resource_x_wire_decode(RESOURCE_X_MSG_BLOCKED_TO_N, bytes, len, frame, &reject);
 	UT_ASSERT(ok);
@@ -2234,7 +2235,7 @@ witness_round_trip(const uint8 *bytes, uint16 len, ResourceXDecodedFrame *frame)
 static void
 witness_reject(uint8 *bytes, uint16 len, bool reseal_inner)
 {
-	if (reseal_inner) test_reseal(bytes + RESOURCE_X_DECISION_V3_BYTES, len - RESOURCE_X_DECISION_V3_BYTES);
+	if (reseal_inner) test_reseal(bytes + RESOURCE_X_DECISION_V4_BYTES, len - RESOURCE_X_DECISION_V4_BYTES);
 	test_reseal(bytes, len);
 	test_acquire_rejected(RESOURCE_X_MSG_BLOCKED_TO_N, bytes, len);
 }
@@ -2242,7 +2243,7 @@ witness_reject(uint8 *bytes, uint16 len, bool reseal_inner)
 static void
 witness_encode_rejected(ResourceXDecodedFrame *frame, uint16 capacity)
 {
-	uint8 output[RESOURCE_X_SOURCE_WITNESS_V3_BYTES], original[RESOURCE_X_SOURCE_WITNESS_V3_BYTES];
+	uint8 output[RESOURCE_X_SOURCE_WITNESS_V4_BYTES], original[RESOURCE_X_SOURCE_WITNESS_V4_BYTES];
 	uint16 len = 77;
 	ResourceXWireReject reject;
 	memset(output, 0xa5, sizeof(output)); memcpy(original, output, sizeof(output));
@@ -2254,11 +2255,11 @@ witness_encode_rejected(ResourceXDecodedFrame *frame, uint16 capacity)
 
 UT_TEST(test_witness_layout_retains_complete_a_and_original_ack)
 {
-	UT_ASSERT_EQ(RESOURCE_X_WITNESS_V3_BYTES, 832);
-	UT_ASSERT_EQ(RESOURCE_X_SOURCE_WITNESS_V3_BYTES, 1048);
-	UT_ASSERT_EQ(sizeof(ResourceXAcquireWitnessV3), 832);
-	UT_ASSERT_EQ(sizeof(ResourceXAcquireSourceWitnessV3), 1048);
-	UT_ASSERT_EQ(offsetof(ResourceXAcquireSourceWitnessV3, original_ack), 736);
+	UT_ASSERT_EQ(RESOURCE_X_WITNESS_V4_BYTES, 832);
+	UT_ASSERT_EQ(RESOURCE_X_SOURCE_WITNESS_V4_BYTES, 1048);
+	UT_ASSERT_EQ(sizeof(ResourceXAcquireWitnessV4), 832);
+	UT_ASSERT_EQ(sizeof(ResourceXAcquireSourceWitnessV4), 1048);
+	UT_ASSERT_EQ(offsetof(ResourceXAcquireSourceWitnessV4, original_ack), 736);
 	UT_ASSERT(sizeof(ResourceXDecodedAcquireWitness) <= sizeof(ResourceXDecodedImageEnvelope));
 	printf("# decoded_frame_bytes=%zu witness_body_bytes=%zu\n", sizeof(ResourceXDecodedFrame), sizeof(ResourceXDecodedAcquireWitness));
 }
@@ -2594,28 +2595,28 @@ make_ship_bytes(uint8 *bytes, PcmState directory, PcmState target, bool wal)
 	proof->page_checksum = image->page_checksum;
 	proof->source_proof_crc32c = original.common.semantic_crc32c;
 	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_BLOCKED_TO_N, &source,
-		bytes, RESOURCE_X_SOURCE_WITNESS_V3_BYTES, &len, &reject));
+		bytes, RESOURCE_X_SOURCE_WITNESS_V4_BYTES, &len, &reject));
 	UT_ASSERT_EQ(len, 1048);
 	ship.kind = RESOURCE_X_WIRE_IMAGE_ENVELOPE;
-	ship.payload_bytes = RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES;
+	ship.payload_bytes = RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES;
 	ship.has_acquire_decision = true;
 	ship.common = source.common;
 	ship.body.acquire_image.source = source.body.acquire_witness;
 	ship.body.acquire_image.original_common = original.common;
 	ship.body.acquire_image.original_image = *image;
 	bytes[1] = RESOURCE_X_WIRE_IMAGE_ENVELOPE;
-	bytes[2] = RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES >> 8;
-	bytes[3] = RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES & 255;
-	test_reseal(bytes, RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES);
+	bytes[2] = RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES >> 8;
+	bytes[3] = RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES & 255;
+	test_reseal(bytes, RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES);
 	return ship;
 }
 static bool
 ship_round_trip(const uint8 *bytes, ResourceXDecodedFrame *decoded)
 {
-	uint8 encoded[RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES]; uint16 len = 0;
+	uint8 encoded[RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES]; uint16 len = 0;
 	ResourceXWireReject reject;
 	bool ok = cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes,
-		RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES, decoded, &reject);
+		RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES, decoded, &reject);
 	UT_ASSERT(ok); if (!ok) return false;
 	UT_ASSERT(decoded->has_acquire_decision && !decoded->has_acquire_intent && !decoded->blocked_has_remote_proof);
 	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, decoded,
@@ -2626,7 +2627,7 @@ ship_round_trip(const uint8 *bytes, ResourceXDecodedFrame *decoded)
 static void
 ship_encode_rejected(const ResourceXDecodedFrame *frame, uint16 capacity)
 {
-	uint8 encoded[RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES], original[RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES];
+	uint8 encoded[RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES], original[RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES];
 	ResourceXWireReject reject; uint16 len = 77;
 	memset(encoded, 0xa6, sizeof(encoded)); memcpy(original, encoded, sizeof(original));
 	UT_ASSERT(!cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, frame, encoded,
@@ -2636,14 +2637,14 @@ ship_encode_rejected(const ResourceXDecodedFrame *frame, uint16 capacity)
 static void
 ship_reject(uint8 *bytes)
 {
-	test_reseal(bytes, RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES);
-	test_acquire_rejected(RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes, RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES);
+	test_reseal(bytes, RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES);
+	test_acquire_rejected(RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes, RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES);
 }
 UT_TEST(test_ship_layout_has_one_complete_a_source_ack_and_image)
 {
-	UT_ASSERT_EQ(RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES, 9800);
-	UT_ASSERT_EQ(sizeof(ResourceXAcquireImageV3), 9800);
-	UT_ASSERT_EQ(offsetof(ResourceXAcquireImageV3, original_image), 1048);
+	UT_ASSERT_EQ(RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES, 9800);
+	UT_ASSERT_EQ(sizeof(ResourceXAcquireImageV4), 9800);
+	UT_ASSERT_EQ(offsetof(ResourceXAcquireImageV4, original_image), 1048);
 	printf("# ship_frame_bytes=%zu ship_body_bytes=%zu\n", sizeof(ResourceXDecodedFrame), sizeof(ResourceXDecodedAcquireImage));
 }
 UT_TEST(test_ship_s_and_x_sources_support_both_target_modes)
@@ -2899,10 +2900,130 @@ UT_TEST(test_ship_source_ack_and_image_are_byte_exact_after_round_trip)
 	}
 }
 
+
+UT_TEST(test_decision_watermark_layout_is_fixed_and_network_ordered)
+{
+	uint8 bytes[RESOURCE_X_DECISION_V4_BYTES];
+	ResourceXDecodedFrame decoded;
+	const uint64 wm = UINT64_C(0x0102030405060708);
+	UT_ASSERT_EQ(RESOURCE_X_DECISION_WIRE_VERSION, 4);
+	UT_ASSERT_EQ(offsetof(ResourceXAcquireDecisionV4, disk_watermark_scn), 216);
+	UT_ASSERT_EQ(sizeof(((ResourceXAcquireDecisionV4 *)0)->zero_reserved), 2);
+	make_decision_bytes(bytes, false, PCM_STATE_N, 0, PCM_STATE_S, -1,
+						RESOURCE_X_ACQUIRE_SOURCE_DISK);
+	test_put_u64_be(bytes + 216, wm);
+	if (!decision_round_trip(bytes, false, &decoded))
+		return;
+	UT_ASSERT_EQ(decoded.body.acquire_decision.disk_watermark_scn, wm);
+	UT_ASSERT_EQ(bytes[0], 4);
+	for (unsigned n = 0; n < 8; n++)
+		UT_ASSERT_EQ(bytes[216 + n], (wm >> ((7 - n) * 8)) & 255);
+}
+UT_TEST(test_decision_old_conditional_version_is_not_an_untracked_disk_grant)
+{
+	uint8 bytes[RESOURCE_X_DECISION_V4_BYTES];
+	make_decision_bytes(bytes, false, PCM_STATE_N, 0, PCM_STATE_S, -1,
+						RESOURCE_X_ACQUIRE_SOURCE_DISK);
+	bytes[0] = 3;
+	decision_reject_bytes(bytes, false);
+}
+UT_TEST(test_decision_current_source_cannot_smuggle_a_disk_watermark)
+{
+	uint8 bytes[RESOURCE_X_DECISION_V4_BYTES];
+	ResourceXDecodedFrame decoded;
+	make_decision_bytes(bytes, false, PCM_STATE_S, 2, PCM_STATE_S, 1,
+						RESOURCE_X_ACQUIRE_SOURCE_REMOTE_CURRENT);
+	if (!decision_round_trip(bytes, false, &decoded))
+		return;
+	decoded.body.acquire_decision.disk_watermark_scn = 91;
+	decision_encode_rejected(&decoded, sizeof(bytes));
+	test_put_u64_be(bytes + 216, 91);
+	decision_reject_bytes(bytes, false);
+}
+UT_TEST(test_decision_disk_watermark_is_covered_by_original_crc)
+{
+	uint8 bytes[RESOURCE_X_DECISION_V4_BYTES];
+	ResourceXDecodedFrame decoded;
+	make_decision_bytes(bytes, false, PCM_STATE_N, 0, PCM_STATE_X, -1,
+						RESOURCE_X_ACQUIRE_SOURCE_DISK);
+	test_put_u64_be(bytes + 216, 93);
+	if (!decision_round_trip(bytes, false, &decoded))
+		return;
+	for (unsigned n = 216; n < 224; n++) {
+		bytes[n] ^= 1;
+		test_acquire_rejected(RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes, sizeof(bytes));
+		bytes[n] ^= 1;
+	}
+}
+UT_TEST(test_decision_sender_rebind_preserves_the_original_disk_watermark)
+{
+	uint8 bytes[RESOURCE_X_DECISION_V4_BYTES], before[RESOURCE_X_DECISION_V4_BYTES];
+	ResourceXDecodedFrame decoded;
+	ResourceXWireReject reject;
+	make_decision_bytes(bytes, false, PCM_STATE_N, 0, PCM_STATE_S, -1,
+						RESOURCE_X_ACQUIRE_SOURCE_DISK);
+	test_put_u64_be(bytes + 216, UINT64_C(0x070000000000005d));
+	if (!decision_round_trip(bytes, false, &decoded))
+		return;
+	memcpy(before, bytes, sizeof(bytes));
+	UT_ASSERT(cluster_resource_x_wire_rebind_sender_generation(RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes,
+															   sizeof(bytes), 89, &reject));
+	for (unsigned n = 0; n < sizeof(bytes); n++)
+		if ((n < 4 || n >= 8) && (n < 76 || n >= 80))
+			UT_ASSERT_EQ(bytes[n], before[n]);
+	UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes, sizeof(bytes),
+											 &decoded, &reject));
+	UT_ASSERT_EQ(decoded.body.acquire_decision.disk_watermark_scn, UINT64_C(0x070000000000005d));
+}
+UT_TEST(test_decision_disk_reserved_bytes_and_short_frames_remain_rejected)
+{
+	uint8 bytes[RESOURCE_X_DECISION_V4_BYTES];
+	ResourceXDecodedFrame decoded;
+	make_decision_bytes(bytes, false, PCM_STATE_N, 0, PCM_STATE_S, -1,
+						RESOURCE_X_ACQUIRE_SOURCE_DISK);
+	test_put_u64_be(bytes + 216, 93);
+	if (!decision_round_trip(bytes, false, &decoded))
+		return;
+	for (unsigned n = 214; n < 216; n++) {
+		bytes[n] = 1;
+		decision_reject_bytes(bytes, false);
+		bytes[n] = 0;
+	}
+	test_reseal(bytes, sizeof(bytes));
+	for (unsigned n = 0; n < sizeof(bytes); n++)
+		test_acquire_rejected(RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes, n);
+}
+UT_TEST(test_decision_witness_and_ship_upgrade_without_changing_inner_proofs)
+{
+	uint8 bytes[RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES];
+	ResourceXWireReject reject;
+	ResourceXDecodedFrame frame, decoded;
+	uint16 len;
+	for (unsigned profile = 0; profile < 3; profile++) {
+		uint8 type = profile == 2 ? RESOURCE_X_MSG_IMAGE_OR_GRANT : RESOURCE_X_MSG_BLOCKED_TO_N;
+		frame = profile == 2
+					? make_ship_bytes(bytes, PCM_STATE_X, PCM_STATE_X, false)
+					: make_witness_bytes(bytes, profile == 1,
+										 profile == 0 ? PCM_STATE_S : PCM_STATE_X, PCM_STATE_X);
+		len = frame.payload_bytes;
+		UT_ASSERT_EQ(bytes[0], 4);
+		UT_ASSERT_EQ(bytes[736], RESOURCE_X_WIRE_VERSION);
+		if (profile == 2)
+			UT_ASSERT_EQ(bytes[1048], RESOURCE_X_IMAGE_WIRE_VERSION);
+		bytes[0] = 3;
+		test_reseal(bytes, len);
+		test_acquire_rejected(type, bytes, len);
+		UT_ASSERT(!cluster_resource_x_wire_rebind_sender_generation(type, bytes, len, 91, &reject));
+		bytes[0] = 4;
+		test_reseal(bytes, len);
+		UT_ASSERT(cluster_resource_x_wire_decode(type, bytes, len, &decoded, &reject));
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(119);
+	UT_PLAN(126);
 	UT_RUN(test_wire_kind_and_proof_domains_are_closed);
 	UT_RUN(test_reused_message_numbers_remain_exact);
 	UT_RUN(test_common_wire_layout_is_exact);
@@ -3022,6 +3143,13 @@ main(void)
 	UT_RUN(test_ship_original_image_version_length_and_kind_are_strict);
 	UT_RUN(test_ship_native_and_master_generation_axes_remain_independent);
 	UT_RUN(test_ship_source_ack_and_image_are_byte_exact_after_round_trip);
+	UT_RUN(test_decision_watermark_layout_is_fixed_and_network_ordered);
+	UT_RUN(test_decision_old_conditional_version_is_not_an_untracked_disk_grant);
+	UT_RUN(test_decision_current_source_cannot_smuggle_a_disk_watermark);
+	UT_RUN(test_decision_disk_watermark_is_covered_by_original_crc);
+	UT_RUN(test_decision_sender_rebind_preserves_the_original_disk_watermark);
+	UT_RUN(test_decision_disk_reserved_bytes_and_short_frames_remain_rejected);
+	UT_RUN(test_decision_witness_and_ship_upgrade_without_changing_inner_proofs);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

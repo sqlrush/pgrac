@@ -10205,7 +10205,7 @@ test_cluster_resource_x_master_ack_fixture.inc: test_cluster_resource_x_decision
 	awk '/^main\(void\)/ { end++; exit } /^int$$/ { pending=1; next } \
 	     pending { print "int"; pending=0 } /^UT_TEST\(/ { skip=1; tests++; next } \
 	     skip && /^}/ { skip=0; next } !skip { print } \
-	     END { if (end != 1 || tests != 24 || skip) exit 1 }' $< > $@.tmp
+	     END { if (end != 1 || tests != 29 || skip) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 clean distclean maintainer-clean: clean-resource-x-master-ack
 .PHONY: clean-resource-x-master-ack

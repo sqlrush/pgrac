@@ -232,17 +232,17 @@ resource_x_pair_length(uint8 msg_type, ResourceXWireKind kind, uint16 len)
 		return msg_type == RESOURCE_X_MSG_ASSERT_X && len == RESOURCE_X_SHORT_V1_BYTES;
 	if (kind == RESOURCE_X_WIRE_BLOCK_TO_N)
 		return msg_type == RESOURCE_X_MSG_BLOCK_TO_N
-			&& (len == RESOURCE_X_CONTROL_V1_BYTES || len == RESOURCE_X_DECISION_V3_BYTES);
+			&& (len == RESOURCE_X_CONTROL_V1_BYTES || len == RESOURCE_X_DECISION_V4_BYTES);
 	if (kind == RESOURCE_X_WIRE_BLOCKED_TO_N)
 		return msg_type == RESOURCE_X_MSG_BLOCKED_TO_N
 			   && (len == RESOURCE_X_CONTROL_V1_BYTES || len == RESOURCE_X_PROOF_V1_BYTES
-				   || len == RESOURCE_X_WITNESS_V3_BYTES || len == RESOURCE_X_SOURCE_WITNESS_V3_BYTES);
+				   || len == RESOURCE_X_WITNESS_V4_BYTES || len == RESOURCE_X_SOURCE_WITNESS_V4_BYTES);
 	if (kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE)
 		return msg_type == RESOURCE_X_MSG_IMAGE_OR_GRANT
-			&& (len == RESOURCE_X_IMAGE_V2_BYTES || len == RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES);
+			&& (len == RESOURCE_X_IMAGE_V2_BYTES || len == RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES);
 	if (kind == RESOURCE_X_WIRE_AUTHORITY_GRANT)
 		return msg_type == RESOURCE_X_MSG_IMAGE_OR_GRANT
-			&& (len == RESOURCE_X_PROOF_V1_BYTES || len == RESOURCE_X_DECISION_V3_BYTES);
+			&& (len == RESOURCE_X_PROOF_V1_BYTES || len == RESOURCE_X_DECISION_V4_BYTES);
 	if (kind == RESOURCE_X_WIRE_RELEASE_X)
 		return msg_type == RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE
 			   && len == RESOURCE_X_CONTROL_V1_BYTES;
@@ -263,21 +263,21 @@ resource_x_frame_length(const ResourceXDecodedFrame *frame, uint16 *len)
 		if (frame->kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE) {
 			if (frame->has_acquire_intent || frame->blocked_has_remote_proof)
 				return false;
-			*len = RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES;
+			*len = RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES;
 			return true;
 		}
 		if (frame->kind == RESOURCE_X_WIRE_BLOCKED_TO_N) {
 			if (frame->has_acquire_intent || frame->blocked_has_remote_proof)
 				return false;
 			*len = frame->body.acquire_witness.has_source_proof
-				? RESOURCE_X_SOURCE_WITNESS_V3_BYTES : RESOURCE_X_WITNESS_V3_BYTES;
+				? RESOURCE_X_SOURCE_WITNESS_V4_BYTES : RESOURCE_X_WITNESS_V4_BYTES;
 			return true;
 		}
 		if (frame->has_acquire_intent
 			|| (frame->kind != RESOURCE_X_WIRE_AUTHORITY_GRANT
 				&& frame->kind != RESOURCE_X_WIRE_BLOCK_TO_N))
 			return false;
-		*len = RESOURCE_X_DECISION_V3_BYTES;
+		*len = RESOURCE_X_DECISION_V4_BYTES;
 		return true;
 	}
 	if (frame->has_acquire_intent) {
@@ -642,16 +642,25 @@ resource_x_pair_common_valid(uint8 msg_type, ResourceXWireKind kind,
 }
 
 
+/* REQUEST keeps its independent format; conditional A and its envelopes
+ * require their current complete format, including the disk watermark. */
+static uint8
+resource_x_frame_version(ResourceXWireKind kind, uint16 len)
+{
+	if (len == RESOURCE_X_ACQUIRE_V3_BYTES)
+		return RESOURCE_X_ACQUIRE_WIRE_VERSION;
+	if (len == RESOURCE_X_DECISION_V4_BYTES || len == RESOURCE_X_WITNESS_V4_BYTES
+		|| len == RESOURCE_X_SOURCE_WITNESS_V4_BYTES || len == RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES)
+		return RESOURCE_X_DECISION_WIRE_VERSION;
+	return kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE ? RESOURCE_X_IMAGE_WIRE_VERSION
+		: RESOURCE_X_WIRE_VERSION;
+}
+
 static void
 resource_x_common_encode(uint8 *bytes, ResourceXWireKind kind, const ResourceXDecodedCommon *common,
 						 uint16 len)
 {
-	bytes[0] = (len == RESOURCE_X_ACQUIRE_V3_BYTES || len == RESOURCE_X_DECISION_V3_BYTES
-		|| len == RESOURCE_X_WITNESS_V3_BYTES || len == RESOURCE_X_SOURCE_WITNESS_V3_BYTES
-		|| len == RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES)
-		? RESOURCE_X_ACQUIRE_WIRE_VERSION
-		: kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE ? RESOURCE_X_IMAGE_WIRE_VERSION
-													  : RESOURCE_X_WIRE_VERSION;
+	bytes[0] = resource_x_frame_version(kind, len);
 	bytes[1] = (uint8)kind;
 	resource_x_put_u16(bytes + 2, len);
 	resource_x_assertion_encode(bytes + 8, &common->logical_assertion);
@@ -793,7 +802,8 @@ resource_x_decision_body_valid(const ResourceXDecodedFrame *frame)
 			|| body->directory_mode != (uint8)PCM_STATE_N || body->pi_holders_bitmap != 0)
 			return false;
 	} else {
-		if (body->source_node < 0 || body->source_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+		if (body->disk_watermark_scn != 0
+			|| body->source_node < 0 || body->source_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
 			|| body->source_service_generation == 0 || body->source_service_generation == UINT64_MAX)
 			return false;
 		source_bit = UINT32_C(1) << body->source_node;
@@ -1175,6 +1185,7 @@ resource_x_body_encode(uint8 *bytes, const ResourceXDecodedFrame *frame, Resourc
 			resource_x_put_u32(bytes + 208, decision->master_ingress_generation);
 			bytes[212] = decision->directory_mode;
 			bytes[213] = decision->source_kind;
+			resource_x_put_u64(bytes + 216, decision->disk_watermark_scn);
 			for (int node = 0; node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++) {
 				resource_x_put_u64(bytes + 224 + node * 16, decision->holders[node].boot_incarnation);
 				resource_x_put_u64(bytes + 232 + node * 16, decision->holders[node].grant_generation);
@@ -1190,10 +1201,10 @@ resource_x_body_encode(uint8 *bytes, const ResourceXDecodedFrame *frame, Resourc
 			/* This bounded inner call accepts only the original V1 ACK, with
 			 * its own full key and CRC. It cannot encode another witness. */
 			if (!cluster_resource_x_wire_encode(RESOURCE_X_MSG_BLOCKED_TO_N, &ack,
-				bytes + RESOURCE_X_DECISION_V3_BYTES, expected, &len, reject) || len != expected)
+				bytes + RESOURCE_X_DECISION_V4_BYTES, expected, &len, reject) || len != expected)
 				return false;
 		}
-		if (image && !resource_x_image_component_encode(bytes + RESOURCE_X_SOURCE_WITNESS_V3_BYTES,
+		if (image && !resource_x_image_component_encode(bytes + RESOURCE_X_SOURCE_WITNESS_V4_BYTES,
 				&frame->body.acquire_image, reject))
 			return false;
 		return true;
@@ -1306,7 +1317,7 @@ resource_x_body_decode(const uint8 *bytes, ResourceXDecodedFrame *frame,
 			? &decision->episode : &frame->body.acquire_intent;
 
 		if (!resource_x_bytes_zero(bytes + 153, 7)
-			|| (frame->has_acquire_decision && !resource_x_bytes_zero(bytes + 214, 10))) {
+			|| (frame->has_acquire_decision && !resource_x_bytes_zero(bytes + 214, 2))) {
 			resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_RESERVED);
 			return false;
 		}
@@ -1332,6 +1343,7 @@ resource_x_body_decode(const uint8 *bytes, ResourceXDecodedFrame *frame,
 			decision->master_ingress_generation = resource_x_get_u32(bytes + 208);
 			decision->directory_mode = bytes[212];
 			decision->source_kind = bytes[213];
+			decision->disk_watermark_scn = resource_x_get_u64(bytes + 216);
 			for (int node = 0; node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++) {
 				decision->holders[node].boot_incarnation = resource_x_get_u64(bytes + 224 + node * 16);
 				decision->holders[node].grant_generation = resource_x_get_u64(bytes + 232 + node * 16);
@@ -1339,10 +1351,10 @@ resource_x_body_decode(const uint8 *bytes, ResourceXDecodedFrame *frame,
 		}
 		if (witness) {
 			ResourceXDecodedFrame ack;
-			const uint8 *original = bytes + RESOURCE_X_DECISION_V3_BYTES;
-			uint16 len = image ? RESOURCE_X_PROOF_V1_BYTES : frame->payload_bytes - RESOURCE_X_DECISION_V3_BYTES;
+			const uint8 *original = bytes + RESOURCE_X_DECISION_V4_BYTES;
+			uint16 len = image ? RESOURCE_X_PROOF_V1_BYTES : frame->payload_bytes - RESOURCE_X_DECISION_V4_BYTES;
 
-			/* Reject nested V3 envelopes before the bounded original ACK
+			/* Reject nested conditional envelopes before the bounded original ACK
 			 * decoder, rather than treating a copied A as native completion. */
 			if (original[0] != RESOURCE_X_WIRE_VERSION
 				|| original[1] != RESOURCE_X_WIRE_BLOCKED_TO_N
@@ -1359,7 +1371,7 @@ resource_x_body_decode(const uint8 *bytes, ResourceXDecodedFrame *frame,
 		}
 		if (image) {
 			ResourceXDecodedFrame original;
-			const uint8 *component = bytes + RESOURCE_X_SOURCE_WITNESS_V3_BYTES;
+			const uint8 *component = bytes + RESOURCE_X_SOURCE_WITNESS_V4_BYTES;
 
 			if (component[0] != RESOURCE_X_IMAGE_WIRE_VERSION
 				|| component[1] != RESOURCE_X_WIRE_IMAGE_ENVELOPE
@@ -1485,7 +1497,7 @@ cluster_resource_x_wire_encode(uint8 msg_type, const ResourceXDecodedFrame *fram
 							   uint16 payload_capacity, uint16 *payload_len_out,
 							   ResourceXWireReject *reject)
 {
-	uint8 encoded[RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES];
+	uint8 encoded[RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES];
 	uint32 crc;
 	uint16 len;
 
@@ -1533,9 +1545,9 @@ cluster_resource_x_wire_decode(uint8 msg_type, const void *payload, uint16 paylo
 		return false;
 	if (payload_len != RESOURCE_X_CONTROL_V1_BYTES && payload_len != RESOURCE_X_SHORT_V1_BYTES
 		&& payload_len != RESOURCE_X_PROOF_V1_BYTES && payload_len != RESOURCE_X_IMAGE_V2_BYTES
-		&& payload_len != RESOURCE_X_ACQUIRE_V3_BYTES && payload_len != RESOURCE_X_DECISION_V3_BYTES
-		&& payload_len != RESOURCE_X_WITNESS_V3_BYTES && payload_len != RESOURCE_X_SOURCE_WITNESS_V3_BYTES
-		&& payload_len != RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES) {
+		&& payload_len != RESOURCE_X_ACQUIRE_V3_BYTES && payload_len != RESOURCE_X_DECISION_V4_BYTES
+		&& payload_len != RESOURCE_X_WITNESS_V4_BYTES && payload_len != RESOURCE_X_SOURCE_WITNESS_V4_BYTES
+		&& payload_len != RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES) {
 		resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_LEGACY_LENGTH);
 		return false;
 	}
@@ -1544,13 +1556,7 @@ cluster_resource_x_wire_decode(uint8 msg_type, const void *payload, uint16 paylo
 		resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_TYPE_KIND);
 		return false;
 	}
-	if (bytes[0]
-		!= ((payload_len == RESOURCE_X_ACQUIRE_V3_BYTES || payload_len == RESOURCE_X_DECISION_V3_BYTES
-			 || payload_len == RESOURCE_X_WITNESS_V3_BYTES || payload_len == RESOURCE_X_SOURCE_WITNESS_V3_BYTES
-			 || payload_len == RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES)
-			? RESOURCE_X_ACQUIRE_WIRE_VERSION
-			: kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE ? RESOURCE_X_IMAGE_WIRE_VERSION
-												   : RESOURCE_X_WIRE_VERSION)) {
+	if (bytes[0] != resource_x_frame_version(kind, payload_len)) {
 		resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_VERSION);
 		return false;
 	}
@@ -1566,9 +1572,9 @@ cluster_resource_x_wire_decode(uint8 msg_type, const void *payload, uint16 paylo
 	decoded.kind = kind;
 	decoded.payload_bytes = payload_len;
 	decoded.has_acquire_intent = payload_len == RESOURCE_X_ACQUIRE_V3_BYTES;
-	decoded.has_acquire_decision = payload_len == RESOURCE_X_DECISION_V3_BYTES
-		|| payload_len == RESOURCE_X_WITNESS_V3_BYTES || payload_len == RESOURCE_X_SOURCE_WITNESS_V3_BYTES
-		|| payload_len == RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES;
+	decoded.has_acquire_decision = payload_len == RESOURCE_X_DECISION_V4_BYTES
+		|| payload_len == RESOURCE_X_WITNESS_V4_BYTES || payload_len == RESOURCE_X_SOURCE_WITNESS_V4_BYTES
+		|| payload_len == RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES;
 	decoded.blocked_has_remote_proof
 		= (kind == RESOURCE_X_WIRE_BLOCKED_TO_N || kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2
 		   || kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2)

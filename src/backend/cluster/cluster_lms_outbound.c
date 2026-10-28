@@ -532,34 +532,34 @@ lms_outbound_resource_x_intent_valid(const ResourceXIntentSlot *intent)
 	switch ((ResourceXIntentOwnerKind)intent->body.owner_kind) {
 	case RESOURCE_X_INTENT_OWNER_MASTER_BLOCK:
 		return (intent->payload_bytes == RESOURCE_X_CONTROL_V1_BYTES
-				|| intent->payload_bytes == RESOURCE_X_DECISION_V3_BYTES)
+				|| intent->payload_bytes == RESOURCE_X_DECISION_V4_BYTES)
 			   && intent->kind == RESOURCE_X_WIRE_BLOCK_TO_N
 			   && intent->body.owner_generation == intent->logical_generation
 			   && intent->body.owner_index == intent->destination_node
-			   && (intent->payload_bytes == RESOURCE_X_DECISION_V3_BYTES
+			   && (intent->payload_bytes == RESOURCE_X_DECISION_V4_BYTES
 				   || intent->body.assertion.requester_node != (int32)intent->destination_node);
 	case RESOURCE_X_INTENT_OWNER_HOLDER_STATUS:
 		return (((intent->payload_bytes == RESOURCE_X_CONTROL_V1_BYTES
 				 || intent->payload_bytes == RESOURCE_X_PROOF_V1_BYTES)
 				&& (intent->kind == RESOURCE_X_WIRE_BLOCKED_TO_N
 					|| intent->kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2))
-				|| ((intent->payload_bytes == RESOURCE_X_WITNESS_V3_BYTES
-					 || intent->payload_bytes == RESOURCE_X_SOURCE_WITNESS_V3_BYTES)
+				|| ((intent->payload_bytes == RESOURCE_X_WITNESS_V4_BYTES
+					 || intent->payload_bytes == RESOURCE_X_SOURCE_WITNESS_V4_BYTES)
 					&& intent->kind == RESOURCE_X_WIRE_BLOCKED_TO_N))
 			   && intent->body.owner_generation == intent->logical_generation
 			   && intent->body.owner_index == 0;
 	case RESOURCE_X_INTENT_OWNER_HOLDER_IMAGE:
 		return (((intent->payload_bytes == RESOURCE_X_IMAGE_V2_BYTES
-				  || intent->payload_bytes == RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES)
+				  || intent->payload_bytes == RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES)
 				 && intent->kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE)
-				|| (intent->payload_bytes == RESOURCE_X_WITNESS_V3_BYTES
+				|| (intent->payload_bytes == RESOURCE_X_WITNESS_V4_BYTES
 					&& intent->kind == RESOURCE_X_WIRE_BLOCKED_TO_N))
 			   && intent->body.assertion.requester_node == (int32)intent->destination_node
 			   && intent->body.owner_generation == intent->logical_generation
 			   && intent->body.owner_index == 0;
 	case RESOURCE_X_INTENT_OWNER_MASTER_GRANT:
 		return (intent->payload_bytes == RESOURCE_X_PROOF_V1_BYTES
-				|| intent->payload_bytes == RESOURCE_X_DECISION_V3_BYTES)
+				|| intent->payload_bytes == RESOURCE_X_DECISION_V4_BYTES)
 			   && intent->kind == RESOURCE_X_WIRE_AUTHORITY_GRANT
 			   && intent->body.assertion.requester_node == (int32)intent->destination_node
 			   && intent->body.owner_generation == intent->authority_generation
@@ -616,10 +616,10 @@ lms_outbound_resource_x_intent_payload_valid(const ResourceXIntentSlot *intent,
 	const ResourceXDecodedAcquireDecision *decision;
 	const ResourceXDecodedCommon *common;
 
-	if (intent->payload_bytes != RESOURCE_X_DECISION_V3_BYTES
-		&& intent->payload_bytes != RESOURCE_X_WITNESS_V3_BYTES
-		&& intent->payload_bytes != RESOURCE_X_SOURCE_WITNESS_V3_BYTES
-		&& intent->payload_bytes != RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES)
+	if (intent->payload_bytes != RESOURCE_X_DECISION_V4_BYTES
+		&& intent->payload_bytes != RESOURCE_X_WITNESS_V4_BYTES
+		&& intent->payload_bytes != RESOURCE_X_SOURCE_WITNESS_V4_BYTES
+		&& intent->payload_bytes != RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES)
 		return true; /* Original non-conditional producers keep their gates. */
 	if (intent->body.owner_node != (uint32)cluster_node_id
 		|| !cluster_resource_x_wire_decode(lms_outbound_resource_x_intent_msg_type(intent),
@@ -876,7 +876,7 @@ int
 cluster_lms_outbound_resource_x_intent_pump(void)
 {
 	ResourceXIntentSlot intent;
-	uint8 payload[RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES];
+	uint8 payload[RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES];
 	int staged = 0;
 	int call;
 
@@ -1194,7 +1194,7 @@ cluster_lms_outbound_drain_send(int worker_id)
 		ResourceXIntentSlot resource_x_intent;
 		ResourceXIntentSlot resource_x_current;
 		ResourceXWireReject resource_x_reject = RESOURCE_X_WIRE_REJECT_NONE;
-		uint8 resource_x_payload[RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES];
+		uint8 resource_x_payload[RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES];
 		const void *send_payload;
 		uint32 send_payload_len;
 		ClusterICSendResult rc;

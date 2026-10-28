@@ -102,7 +102,7 @@ publish_decode(const uint8 *bytes, bool block)
 	ResourceXDecodedFrame frame = {0};
 	ResourceXWireReject reject;
 	UT_ASSERT(cluster_resource_x_wire_decode(block ? RESOURCE_X_MSG_BLOCK_TO_N
-		: RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes, RESOURCE_X_DECISION_V3_BYTES, &frame, &reject));
+		: RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes, RESOURCE_X_DECISION_V4_BYTES, &frame, &reject));
 	UT_ASSERT(frame.has_acquire_decision);
 	return frame;
 }
@@ -367,7 +367,7 @@ UT_TEST(test_publish_preserves_fifo_and_never_replans_sealed_source)
 	ResourceXAcquisitionRef delivery;
 	ResourceXIntentProbeResult probe = RESOURCE_X_INTENT_PROBE_IDLE;
 	uint32 examined;
-	uint8 payload[RESOURCE_X_DECISION_V3_BYTES];
+	uint8 payload[RESOURCE_X_DECISION_V4_BYTES];
 	ClusterPcmResourceXMasterState before;
 	if (!publish_start(1, PCM_STATE_X, &f)) return;
 	publish_apply(&f);
@@ -532,10 +532,83 @@ UT_TEST(test_publish_r8_classifies_sealed_a_as_residual_not_malformed_or_empty)
 	UT_ASSERT_EQ(f.state->grant_intent.slot.state, RESOURCE_X_INTENT_SLOT_ARMED);
 }
 
+
+static void
+publish_watermark(PublishFixture *f, uint64 scn)
+{
+	cluster_pcm_lock_pi_watermark_scn_advance(f->work.request.logical_assertion.resource, scn,
+											  CLUSTER_PCM_WM_SRC_REDECLARE, 0, 31, 17);
+}
+UT_TEST(test_publish_disk_carries_the_original_master_watermark)
+{
+	for (PcmState mode = PCM_STATE_S; mode <= PCM_STATE_X; mode++) {
+		PublishFixture f;
+		UT_ASSERT(publish_start(0, mode, &f));
+		publish_watermark(&f, UINT64_C(0x070000000000005a));
+		f.plan = decision_plan_read(&f.work);
+		UT_ASSERT_EQ(f.plan.input.pi_watermark_scn, UINT64_C(0x070000000000005a));
+		UT_ASSERT_EQ(f.plan.decision.disk_watermark_scn, f.plan.input.pi_watermark_scn);
+		publish_apply(&f);
+		publish_check(&f);
+		UT_ASSERT_EQ(publish_decode(f.state->grant_intent.payload, false)
+						 .body.acquire_decision.disk_watermark_scn,
+					 UINT64_C(0x070000000000005a));
+	}
+}
+UT_TEST(test_publish_watermark_change_refuses_a_stale_original_input)
+{
+	PublishFixture f;
+	ClusterPcmResourceXMasterState before;
+	UT_ASSERT(publish_start(0, PCM_STATE_S, &f));
+	before = *f.state;
+	publish_watermark(&f, 90);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_decision_publish_exact(&f.work, &f.plan.input),
+				 RESOURCE_X_APPLY_STALE);
+	UT_ASSERT(memcmp(&before, f.state, sizeof(before)) == 0);
+}
+UT_TEST(test_publish_sealed_disk_replay_keeps_its_original_watermark)
+{
+	PublishFixture f;
+	uint8 before[RESOURCE_X_DECISION_V4_BYTES];
+	UT_ASSERT(publish_start(0, PCM_STATE_S, &f));
+	publish_watermark(&f, 90);
+	f.plan = decision_plan_read(&f.work);
+	publish_apply(&f);
+	memcpy(before, f.state->grant_intent.payload, sizeof(before));
+	publish_watermark(&f, 100);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_decision_publish_exact(&f.work, &f.plan.input),
+				 RESOURCE_X_APPLY_DUPLICATE);
+	UT_ASSERT(memcmp(before, f.state->grant_intent.payload, sizeof(before)) == 0);
+	UT_ASSERT_EQ(publish_decode(before, false).body.acquire_decision.disk_watermark_scn, 90);
+}
+UT_TEST(test_publish_current_source_does_not_reinterpret_a_disk_watermark)
+{
+	PublishFixture f;
+	UT_ASSERT(publish_start(1, PCM_STATE_S, &f));
+	publish_watermark(&f, 90);
+	f.plan = decision_plan_read(&f.work);
+	UT_ASSERT_EQ(f.plan.input.pi_watermark_scn, 90);
+	UT_ASSERT_EQ(f.plan.decision.disk_watermark_scn, 0);
+	publish_apply(&f);
+	publish_check(&f);
+}
+UT_TEST(test_publish_WAL_position_is_not_the_cross_node_disk_version)
+{
+	PublishFixture f;
+	UT_ASSERT(publish_start(0, PCM_STATE_S, &f));
+	cluster_pcm_lock_pi_watermark_lsn_advance(f.work.request.logical_assertion.resource, 99999);
+	publish_watermark(&f, 90);
+	f.plan = decision_plan_read(&f.work);
+	UT_ASSERT_EQ(f.plan.input.pi_watermark_lsn, 99999);
+	UT_ASSERT_EQ(f.plan.decision.disk_watermark_scn, 90);
+	publish_apply(&f);
+	publish_check(&f);
+}
+
 int
 main(void)
 {
-	UT_PLAN(24);
+	UT_PLAN(29);
 	UT_RUN(test_publish_disk_s_and_x_are_conditional_not_native_grants);
 	UT_RUN(test_publish_remote_x_to_s_retains_one_a_without_fourth_hop_grant);
 	UT_RUN(test_publish_all_shared_blockers_are_armed_in_parallel);
@@ -560,6 +633,11 @@ main(void)
 	UT_RUN(test_publish_old_blocked_and_local_proof_do_not_consume_a);
 	UT_RUN(test_publish_original_transport_rechecks_forward_against_same_canonical_a);
 	UT_RUN(test_publish_r8_classifies_sealed_a_as_residual_not_malformed_or_empty);
+	UT_RUN(test_publish_disk_carries_the_original_master_watermark);
+	UT_RUN(test_publish_watermark_change_refuses_a_stale_original_input);
+	UT_RUN(test_publish_sealed_disk_replay_keeps_its_original_watermark);
+	UT_RUN(test_publish_current_source_does_not_reinterpret_a_disk_watermark);
+	UT_RUN(test_publish_WAL_position_is_not_the_cross_node_disk_version);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

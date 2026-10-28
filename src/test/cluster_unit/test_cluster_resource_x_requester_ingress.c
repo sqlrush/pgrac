@@ -136,7 +136,7 @@ ingress_envelope(const ResourceXDecodedFrame *frame)
 static bool
 ingress_deliver_as(const ResourceXDecodedFrame *frame, ClusterICEnvelope env)
 {
-	uint8 bytes[RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES];
+	uint8 bytes[RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES];
 	uint16 len;
 	ResourceXWireReject reject;
 	bool consumed;
@@ -171,12 +171,12 @@ ingress_connection_changes_during_observation(int32 node, unsigned read)
 
 UT_TEST(test_ingress_classifier_recognizes_all_complete_carriers)
 {
-	UT_ASSERT(gcs_block_resource_x_payload_candidate(RESOURCE_X_MSG_IMAGE_OR_GRANT, RESOURCE_X_DECISION_V3_BYTES));
-	UT_ASSERT(gcs_block_resource_x_payload_candidate(RESOURCE_X_MSG_IMAGE_OR_GRANT, RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES));
-	UT_ASSERT(gcs_block_resource_x_payload_candidate(RESOURCE_X_MSG_BLOCK_TO_N, RESOURCE_X_DECISION_V3_BYTES));
-	UT_ASSERT(gcs_block_resource_x_payload_candidate(RESOURCE_X_MSG_BLOCKED_TO_N, RESOURCE_X_WITNESS_V3_BYTES));
-	UT_ASSERT(gcs_block_resource_x_payload_candidate(RESOURCE_X_MSG_BLOCKED_TO_N, RESOURCE_X_SOURCE_WITNESS_V3_BYTES));
-	UT_ASSERT(!gcs_block_resource_x_payload_candidate(RESOURCE_X_MSG_ASSERT_X, RESOURCE_X_DECISION_V3_BYTES));
+	UT_ASSERT(gcs_block_resource_x_payload_candidate(RESOURCE_X_MSG_IMAGE_OR_GRANT, RESOURCE_X_DECISION_V4_BYTES));
+	UT_ASSERT(gcs_block_resource_x_payload_candidate(RESOURCE_X_MSG_IMAGE_OR_GRANT, RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES));
+	UT_ASSERT(gcs_block_resource_x_payload_candidate(RESOURCE_X_MSG_BLOCK_TO_N, RESOURCE_X_DECISION_V4_BYTES));
+	UT_ASSERT(gcs_block_resource_x_payload_candidate(RESOURCE_X_MSG_BLOCKED_TO_N, RESOURCE_X_WITNESS_V4_BYTES));
+	UT_ASSERT(gcs_block_resource_x_payload_candidate(RESOURCE_X_MSG_BLOCKED_TO_N, RESOURCE_X_SOURCE_WITNESS_V4_BYTES));
+	UT_ASSERT(!gcs_block_resource_x_payload_candidate(RESOURCE_X_MSG_ASSERT_X, RESOURCE_X_DECISION_V4_BYTES));
 }
 
 UT_TEST(test_ingress_disk_grant_retains_decision_without_native_c)
@@ -406,7 +406,7 @@ UT_TEST(test_ingress_coincident_roles_do_not_silently_discard_either_consumer)
 UT_TEST(test_ingress_malformed_complete_candidate_never_falls_back)
 {
 	EvidenceFixture f; ClusterICEnvelope env;
-	uint8 bytes[RESOURCE_X_WITNESS_V3_BYTES]; uint16 len; ResourceXWireReject reject;
+	uint8 bytes[RESOURCE_X_WITNESS_V4_BYTES]; uint16 len; ResourceXWireReject reject;
 	if (!ingress_begin(&f, 4)) return;
 	env = ingress_envelope(&f.witness);
 	UT_ASSERT(cluster_resource_x_wire_encode(env.msg_type, &f.witness, bytes, sizeof(bytes), &len, &reject));

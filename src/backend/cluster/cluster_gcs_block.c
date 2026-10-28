@@ -10355,17 +10355,17 @@ gcs_block_resource_x_payload_candidate(uint8 msg_type, uint32 payload_length)
 		return payload_length == RESOURCE_X_CONTROL_V1_BYTES
 			   || payload_length == RESOURCE_X_PROOF_V1_BYTES
 			   || payload_length == RESOURCE_X_IMAGE_V2_BYTES
-			   || payload_length == RESOURCE_X_DECISION_V3_BYTES
-			   || payload_length == RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES;
+			   || payload_length == RESOURCE_X_DECISION_V4_BYTES
+			   || payload_length == RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES;
 	if (msg_type == RESOURCE_X_MSG_BLOCK_TO_N)
 		return payload_length == RESOURCE_X_CONTROL_V1_BYTES
 			   || payload_length == RESOURCE_X_PROOF_V1_BYTES
-			   || payload_length == RESOURCE_X_DECISION_V3_BYTES;
+			   || payload_length == RESOURCE_X_DECISION_V4_BYTES;
 	if (msg_type == RESOURCE_X_MSG_BLOCKED_TO_N)
 		return payload_length == RESOURCE_X_CONTROL_V1_BYTES
 			   || payload_length == RESOURCE_X_PROOF_V1_BYTES
-			   || payload_length == RESOURCE_X_WITNESS_V3_BYTES
-			   || payload_length == RESOURCE_X_SOURCE_WITNESS_V3_BYTES;
+			   || payload_length == RESOURCE_X_WITNESS_V4_BYTES
+			   || payload_length == RESOURCE_X_SOURCE_WITNESS_V4_BYTES;
 	if (msg_type == RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE)
 		return payload_length == RESOURCE_X_CONTROL_V1_BYTES
 			   || payload_length == RESOURCE_X_SHORT_V1_BYTES;

@@ -22,8 +22,9 @@
 /* Complete ordinary acquisition intent, on the existing REQUEST/ASSERT pair.
  * This is a request identity, never a master grant or native completion. */
 #define RESOURCE_X_ACQUIRE_WIRE_VERSION 3
+#define RESOURCE_X_DECISION_WIRE_VERSION 4
 #define RESOURCE_X_ACQUIRE_V3_BYTES 160
-#define RESOURCE_X_DECISION_V3_BYTES 736
+#define RESOURCE_X_DECISION_V4_BYTES 736
 
 typedef enum ResourceXAcquirePath {
 	RESOURCE_X_ACQUIRE_FIRST_FILL = 1,
@@ -49,9 +50,9 @@ typedef enum ResourceXAcquireSource {
 #define RESOURCE_X_REQUEST_TAIL_BYTES 20
 
 /* One ACK-family frame retains A and the original holder completion. */
-#define RESOURCE_X_WITNESS_V3_BYTES (RESOURCE_X_DECISION_V3_BYTES + RESOURCE_X_CONTROL_V1_BYTES)
-#define RESOURCE_X_SOURCE_WITNESS_V3_BYTES (RESOURCE_X_DECISION_V3_BYTES + RESOURCE_X_PROOF_V1_BYTES)
-#define RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES (RESOURCE_X_SOURCE_WITNESS_V3_BYTES + RESOURCE_X_IMAGE_V2_BYTES)
+#define RESOURCE_X_WITNESS_V4_BYTES (RESOURCE_X_DECISION_V4_BYTES + RESOURCE_X_CONTROL_V1_BYTES)
+#define RESOURCE_X_SOURCE_WITNESS_V4_BYTES (RESOURCE_X_DECISION_V4_BYTES + RESOURCE_X_PROOF_V1_BYTES)
+#define RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES (RESOURCE_X_SOURCE_WITNESS_V4_BYTES + RESOURCE_X_IMAGE_V2_BYTES)
 
 #define RESOURCE_X_MSG_ASSERT_X PGRAC_IC_MSG_GCS_BLOCK_REQUEST
 #define RESOURCE_X_MSG_IMAGE_OR_GRANT PGRAC_IC_MSG_GCS_BLOCK_REPLY
@@ -185,7 +186,7 @@ typedef struct ResourceXAcquireHolderV3 {
 } ResourceXAcquireHolderV3;
 
 /* Conditional master decision, not a completed native grant. */
-typedef struct ResourceXAcquireDecisionV3 {
+typedef struct ResourceXAcquireDecisionV4 {
 	ResourceXAcquireRequestV3 episode;
 	uint8 resource_binding[8];
 	uint8 enqueue_order[8];
@@ -199,9 +200,10 @@ typedef struct ResourceXAcquireDecisionV3 {
 	uint8 master_ingress_generation[4];
 	uint8 directory_mode;
 	uint8 source_kind;
-	uint8 zero_reserved[10];
+	uint8 zero_reserved[2];
+	uint8 disk_watermark_scn[8];
 	ResourceXAcquireHolderV3 holders[RESOURCE_X_PROTOCOL_NODE_LIMIT];
-} ResourceXAcquireDecisionV3;
+} ResourceXAcquireDecisionV4;
 
 typedef struct ResourceXLocalProofDeclarationV1 {
 	ResourceXWireCommonV1 common;
@@ -234,15 +236,15 @@ typedef struct ResourceXBlockedToNProofV1 {
 	uint8 acting_formation[8];
 } ResourceXBlockedToNProofV1;
 
-typedef struct ResourceXAcquireWitnessV3 {
-	ResourceXAcquireDecisionV3 decision;
+typedef struct ResourceXAcquireWitnessV4 {
+	ResourceXAcquireDecisionV4 decision;
 	ResourceXControlV1 original_ack;
-} ResourceXAcquireWitnessV3;
+} ResourceXAcquireWitnessV4;
 
-typedef struct ResourceXAcquireSourceWitnessV3 {
-	ResourceXAcquireDecisionV3 decision;
+typedef struct ResourceXAcquireSourceWitnessV4 {
+	ResourceXAcquireDecisionV4 decision;
 	ResourceXBlockedToNProofV1 original_ack;
-} ResourceXAcquireSourceWitnessV3;
+} ResourceXAcquireSourceWitnessV4;
 
 typedef struct ResourceXAuthorityGrantV1 {
 	ResourceXWireCommonV1 common;
@@ -281,10 +283,10 @@ typedef struct ResourceXImageEnvelopeV2 {
 	uint8 page_wal[232];
 } ResourceXImageEnvelopeV2;
 
-typedef struct ResourceXAcquireImageV3 {
-	ResourceXAcquireSourceWitnessV3 source;
+typedef struct ResourceXAcquireImageV4 {
+	ResourceXAcquireSourceWitnessV4 source;
 	ResourceXImageEnvelopeV2 original_image;
-} ResourceXAcquireImageV3;
+} ResourceXAcquireImageV4;
 
 typedef struct ResourceXInstallSettlementV1 {
 	ResourceXWireCommonV1 common;
@@ -424,6 +426,7 @@ typedef struct ResourceXDecodedAcquireDecision {
 	uint64 resource_binding;
 	uint64 enqueue_order;
 	uint64 source_service_generation;
+	uint64 disk_watermark_scn;
 	int32 master_node;
 	int32 source_node;
 	uint32 holders_bitmap;
@@ -471,15 +474,15 @@ typedef struct ResourceXDecodedFrame {
 	bool has_acquire_decision; /* V3 A or A+original ACK, never legacy completion. */
 } ResourceXDecodedFrame;
 
-StaticAssertDecl(sizeof(ResourceXAcquireImageV3) == RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES
-				 && offsetof(ResourceXAcquireImageV3, original_image) == RESOURCE_X_SOURCE_WITNESS_V3_BYTES,
+StaticAssertDecl(sizeof(ResourceXAcquireImageV4) == RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES
+				 && offsetof(ResourceXAcquireImageV4, original_image) == RESOURCE_X_SOURCE_WITNESS_V4_BYTES,
 				 "combined acquisition image retains its complete source witness and image");
 
-StaticAssertDecl(sizeof(ResourceXAcquireWitnessV3) == RESOURCE_X_WITNESS_V3_BYTES
-				 && sizeof(ResourceXAcquireSourceWitnessV3) == RESOURCE_X_SOURCE_WITNESS_V3_BYTES,
+StaticAssertDecl(sizeof(ResourceXAcquireWitnessV4) == RESOURCE_X_WITNESS_V4_BYTES
+				 && sizeof(ResourceXAcquireSourceWitnessV4) == RESOURCE_X_SOURCE_WITNESS_V4_BYTES,
 				 "complete acquisition witnesses must retain the original ACK bytes");
-StaticAssertDecl(offsetof(ResourceXAcquireWitnessV3, original_ack) == RESOURCE_X_DECISION_V3_BYTES
-				 && offsetof(ResourceXAcquireSourceWitnessV3, original_ack) == RESOURCE_X_DECISION_V3_BYTES,
+StaticAssertDecl(offsetof(ResourceXAcquireWitnessV4, original_ack) == RESOURCE_X_DECISION_V4_BYTES
+				 && offsetof(ResourceXAcquireSourceWitnessV4, original_ack) == RESOURCE_X_DECISION_V4_BYTES,
 				 "acquisition witnesses must preserve the complete A prefix");
 
 StaticAssertDecl(BLCKSZ == RESOURCE_X_PAGE_BYTES,
@@ -495,15 +498,16 @@ StaticAssertDecl(offsetof(ResourceXAcquireRequestV3, requester_incarnation) == 9
 					 && offsetof(ResourceXAcquireRequestV3, zero_reserved) == 153,
 				 "Resource-X acquisition V3 offsets changed");
 StaticAssertDecl(sizeof(ResourceXAcquireHolderV3) == 16
-					 && sizeof(ResourceXAcquireDecisionV3) == RESOURCE_X_DECISION_V3_BYTES,
-				 "Resource-X decision V3 wire size changed");
-StaticAssertDecl(offsetof(ResourceXAcquireDecisionV3, resource_binding) == 160
-					 && offsetof(ResourceXAcquireDecisionV3, master_node) == 184
-					 && offsetof(ResourceXAcquireDecisionV3, holders_bitmap) == 192
-					 && offsetof(ResourceXAcquireDecisionV3, directory_mode) == 212
-					 && offsetof(ResourceXAcquireDecisionV3, zero_reserved) == 214
-					 && offsetof(ResourceXAcquireDecisionV3, holders) == 224,
-				 "Resource-X decision V3 offsets changed");
+					 && sizeof(ResourceXAcquireDecisionV4) == RESOURCE_X_DECISION_V4_BYTES,
+				 "Resource-X decision V4 wire size changed");
+StaticAssertDecl(offsetof(ResourceXAcquireDecisionV4, resource_binding) == 160
+					 && offsetof(ResourceXAcquireDecisionV4, master_node) == 184
+					 && offsetof(ResourceXAcquireDecisionV4, holders_bitmap) == 192
+					 && offsetof(ResourceXAcquireDecisionV4, directory_mode) == 212
+					 && offsetof(ResourceXAcquireDecisionV4, zero_reserved) == 214
+					 && offsetof(ResourceXAcquireDecisionV4, disk_watermark_scn) == 216
+					 && offsetof(ResourceXAcquireDecisionV4, holders) == 224,
+				 "Resource-X decision V4 offsets changed");
 StaticAssertDecl(offsetof(ResourceXWireCommonV1, logical_assertion) == 8
 					 && offsetof(ResourceXWireCommonV1, authority_generation) == 88,
 				 "Resource-X common V1 offsets changed");

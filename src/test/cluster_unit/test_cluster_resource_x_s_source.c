@@ -77,8 +77,8 @@ UT_TEST(test_s_source_reserves_complete_pair_before_native_finish)
 	if (!ss_start(&f)) return;
 	UT_ASSERT_EQ(ss_prepare(&f), RESOURCE_X_APPLY_APPLIED); s = f.master.state;
 	UT_ASSERT_EQ(s->holder_status.valid, 1); UT_ASSERT_EQ(s->holder_image.valid, 1);
-	UT_ASSERT_EQ(s->holder_status.payload_bytes, RESOURCE_X_SOURCE_WITNESS_V3_BYTES);
-	UT_ASSERT_EQ(s->holder_image.payload_bytes, RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES);
+	UT_ASSERT_EQ(s->holder_status.payload_bytes, RESOURCE_X_SOURCE_WITNESS_V4_BYTES);
+	UT_ASSERT_EQ(s->holder_image.payload_bytes, RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES);
 	UT_ASSERT_EQ(s->holder_status_intent.slot.state, RESOURCE_X_INTENT_SLOT_EMPTY);
 	UT_ASSERT_EQ(s->holder_image_intent.state, RESOURCE_X_INTENT_SLOT_EMPTY);
 	ack = ss_read(&f, false); image = ss_read(&f, true);
@@ -260,7 +260,7 @@ UT_TEST(test_s_source_membership_freeze_retains_exact_native_debt)
 		ResourceXReconfigResult result = RESOURCE_X_RECONFIG_MORE;
 		if (!ss_start(&f)) return;
 		if (remote) {
-			ResourceXWireReject reject; uint16 len = 0; uint8 bytes[RESOURCE_X_DECISION_V3_BYTES];
+			ResourceXWireReject reject; uint16 len = 0; uint8 bytes[RESOURCE_X_DECISION_V4_BYTES];
 			/* Authenticated remote-M forward is the input seam. Remove the
 			 * colocated canonical entirely: R8 must inspect this source debt. */
 			f.source_master = 1; f.block.body.acquire_decision.master_node = 1;
@@ -272,7 +272,7 @@ UT_TEST(test_s_source_membership_freeze_retains_exact_native_debt)
 		UT_ASSERT_EQ(ss_prepare(&f), RESOURCE_X_APPLY_APPLIED);
 		if (remote) {
 			ResourceXDecodedFrame ack = ss_read(&f, false); ResourceXWireReject reject;
-			uint16 len = 0; uint8 bytes[RESOURCE_X_SOURCE_WITNESS_V3_BYTES]; unsigned matches = 0;
+			uint16 len = 0; uint8 bytes[RESOURCE_X_SOURCE_WITNESS_V4_BYTES]; unsigned matches = 0;
 			unsigned char *memory = (unsigned char *)fake_pcm_header.data;
 			Size offset = offsetof(ClusterPcmResourceXMasterState, holder_status) + offsetof(ClusterPcmResourceXHolderStatus, payload);
 			UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_BLOCKED_TO_N, &ack, bytes, sizeof(bytes), &len, &reject));
@@ -355,7 +355,7 @@ UT_TEST(test_s_source_invalid_wal_projection_cannot_produce_a_pair)
 static ResourceXDecodedFrame
 ss_forward_reencode(ResourceXDecodedFrame frame)
 {
-	uint8 bytes[RESOURCE_X_DECISION_V3_BYTES]; uint16 len = 0; ResourceXWireReject reject;
+	uint8 bytes[RESOURCE_X_DECISION_V4_BYTES]; uint16 len = 0; ResourceXWireReject reject;
 	ResourceXDecodedFrame out = {0};
 	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_BLOCK_TO_N, &frame, bytes, sizeof(bytes), &len, &reject));
 	UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_BLOCK_TO_N, bytes, len, &out, &reject));
@@ -481,7 +481,7 @@ ss_service_probe(ResourceXSourceDrainWork *work)
 	BackendType saved = MyBackendType;
 	ResourceXIntentSlot slot;
 	ResourceXAcquisitionRef delivery;
-	uint8 payload[RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES];
+	uint8 payload[RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES];
 	uint32 examined;
 	bool found = false;
 
@@ -770,7 +770,7 @@ UT_TEST(test_s_source_forward_reserves_full_a_before_any_native_tuple)
 	UT_ASSERT_EQ(ss_forward(&f), RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(f.master.state->holder_status.valid, 3);
 	UT_ASSERT_EQ(f.master.state->holder_status.kind, RESOURCE_X_WIRE_BLOCK_TO_N);
-	UT_ASSERT_EQ(f.master.state->holder_status.payload_bytes, RESOURCE_X_DECISION_V3_BYTES);
+	UT_ASSERT_EQ(f.master.state->holder_status.payload_bytes, RESOURCE_X_DECISION_V4_BYTES);
 	UT_ASSERT_EQ(f.master.state->holder_image.valid, 0);
 	UT_ASSERT_EQ(f.master.state->holder_status_intent.slot.state, RESOURCE_X_INTENT_SLOT_EMPTY);
 	UT_ASSERT_EQ(f.master.state->holder_image_intent.state, RESOURCE_X_INTENT_SLOT_EMPTY);
@@ -1132,8 +1132,8 @@ UT_TEST(test_s_holder_reserves_two_control_witnesses_before_native_finish)
 	UT_ASSERT(ss_service_probe(&work));
 	UT_ASSERT_EQ(ss_capture(&f, &work), RESOURCE_X_APPLY_APPLIED);
 	ack = ss_read(&f, false); direct = sh_direct(&f);
-	UT_ASSERT_EQ(f.master.state->holder_status.payload_bytes, RESOURCE_X_WITNESS_V3_BYTES);
-	UT_ASSERT_EQ(f.master.state->holder_image.payload_bytes, RESOURCE_X_WITNESS_V3_BYTES);
+	UT_ASSERT_EQ(f.master.state->holder_status.payload_bytes, RESOURCE_X_WITNESS_V4_BYTES);
+	UT_ASSERT_EQ(f.master.state->holder_image.payload_bytes, RESOURCE_X_WITNESS_V4_BYTES);
 	UT_ASSERT_EQ(direct.kind, RESOURCE_X_WIRE_BLOCKED_TO_N);
 	UT_ASSERT(!ack.body.acquire_witness.has_source_proof);
 	UT_ASSERT_EQ(ack.body.acquire_witness.original_ack.target_mode, PCM_STATE_N);
@@ -1150,8 +1150,8 @@ UT_TEST(test_s_holder_publish_requires_exact_n_pi_and_never_a_source_proof)
 	f.finished = f.prepared; ss_unchanged(&f, true, RESOURCE_X_APPLY_STALE);
 	f.finished.generation++; f.finished.pcm_state = PCM_STATE_N; f.finished.buffer_type = BUF_TYPE_PI;
 	UT_ASSERT_EQ(ss_publish(&f), RESOURCE_X_APPLY_APPLIED);
-	UT_ASSERT_EQ(f.master.state->holder_status_intent.slot.payload_bytes, RESOURCE_X_WITNESS_V3_BYTES);
-	UT_ASSERT_EQ(f.master.state->holder_image_intent.payload_bytes, RESOURCE_X_WITNESS_V3_BYTES);
+	UT_ASSERT_EQ(f.master.state->holder_status_intent.slot.payload_bytes, RESOURCE_X_WITNESS_V4_BYTES);
+	UT_ASSERT_EQ(f.master.state->holder_image_intent.payload_bytes, RESOURCE_X_WITNESS_V4_BYTES);
 	ss_unchanged(&f, true, RESOURCE_X_APPLY_DUPLICATE);
 }
 

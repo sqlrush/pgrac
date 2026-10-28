@@ -6,7 +6,7 @@
 static bool
 master_ack_round_trip(ResourceXDecodedFrame *frame)
 {
-	uint8 bytes[RESOURCE_X_SOURCE_WITNESS_V3_BYTES];
+	uint8 bytes[RESOURCE_X_SOURCE_WITNESS_V4_BYTES];
 	uint16 len = 0;
 	ResourceXWireReject reject;
 	bool ok = cluster_resource_x_wire_encode(RESOURCE_X_MSG_BLOCKED_TO_N, frame,

@@ -37,7 +37,7 @@ int transport_legacy_fixture_main(void);
 #include "storage/bufpage.h"
 #include "test_cluster_resource_x_transport_frames.inc"
 
-static uint8 transport_bytes[RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES];
+static uint8 transport_bytes[RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES];
 static uint32 transport_length;
 static ResourceXIntentSlot transport_tail;
 static bool transport_tail_owned;
@@ -91,7 +91,7 @@ transport_start(int profile)
 	ResourceXDecodedAcquireDecision *a;
 	ResourceXWireReject reject;
 	ResourceXIntentSlot intent = {0};
-	uint8 scratch[RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES];
+	uint8 scratch[RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES];
 	uint16 len = 0;
 	uint8 type;
 
@@ -195,7 +195,7 @@ UT_TEST(test_full_transport_not_admitted_preserves_exact_semantic_owner)
 {
 	for (int p = 0; p < 6; p++) {
 		ResourceXIntentSlot intent = transport_start(p);
-		uint8 before[RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES];
+		uint8 before[RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES];
 		memcpy(before, ut_resource_x_owner_payload, sizeof(before));
 		if (!transport_enqueue(&intent)) continue;
 		ut_peer_rc[intent.destination_node] = CLUSTER_IC_SEND_NOT_ADMITTED;
@@ -469,7 +469,7 @@ transport_complete_request(void)
 	ResourceXDecodedFrame frame = {0};
 	ResourceXDecodedAcquireIntent e;
 	ResourceXWireReject reject;
-	uint8 bytes[RESOURCE_X_DECISION_V3_BYTES]; uint16 len;
+	uint8 bytes[RESOURCE_X_DECISION_V4_BYTES]; uint16 len;
 	ut_captured_region->init_fn(); ut_reset_log();
 	transport_length = 0; transport_tail_owned = false; cluster_node_id = 0;
 	make_decision_bytes(bytes, false, PCM_STATE_N, 0, PCM_STATE_S, -1, RESOURCE_X_ACQUIRE_SOURCE_DISK);

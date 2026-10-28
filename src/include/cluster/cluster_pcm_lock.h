@@ -1300,7 +1300,7 @@ typedef struct ResourceXAcquireDecisionPlan {
 	uint32 reserved;
 } ResourceXAcquireDecisionPlan;
 
-StaticAssertDecl(sizeof(ResourceXAcquireDecisionPlan) == 1480,
+StaticAssertDecl(sizeof(ResourceXAcquireDecisionPlan) == 1488,
 				 "unpublished acquisition plan must remain bounded and local");
 
 typedef enum PcmXTransferCommitResult {
