@@ -3079,7 +3079,8 @@ done:
 static bool
 cluster_runtime_visibility_foreign_companion_retained(
 	const ClusterTxResolution *resolution, const ClusterSemanticAdmissionToken *admission,
-	const ClusterCtrcItlTargetIdentity *target, ClusterCtrcItlReadGuardV1 *guard)
+	const ClusterCtrcItlTargetIdentity *target, ClusterCtrcItlReadGuardV1 *guard,
+	const ClusterCtrcItlReadGuardV1 *held_guard)
 {
 	const ClusterCtrcTxnKeyV1 *key = &resolution->origin_companion.key;
 	ClusterCtrcParticipantIdentity receiver = {0};
@@ -3111,8 +3112,11 @@ cluster_runtime_visibility_foreign_companion_retained(
 		|| root.root_id != key->root_id || root.root_generation != key->root_generation
 		|| key->root_descriptor_incarnation != root.root_generation
 		|| !(target != NULL
-			? cluster_ctrc_itl_original_full_xid_target_hold_shared(key,
-				resolution->origin_companion.original_full_xid, &resolution->locator_echo, &receiver, target, guard)
+			? (held_guard != NULL
+				? cluster_ctrc_itl_read_guard_matches_v1(held_guard, key,
+					resolution->origin_companion.original_full_xid, &receiver, target)
+				: cluster_ctrc_itl_original_full_xid_target_hold_shared(key,
+					resolution->origin_companion.original_full_xid, &resolution->locator_echo, &receiver, target, guard))
 			: cluster_ctrc_itl_original_full_xid_matches_shared(key,
 				resolution->origin_companion.original_full_xid, &resolution->locator_echo, &receiver)))
 		return false;
@@ -3137,7 +3141,7 @@ cluster_runtime_visibility_foreign_companion_current_admitted(
 	return resolution != NULL && !resolution->local_canonical_valid
 		&& admission != NULL && admission->entered
 		&& cluster_semantic_activation_recheck_r4_terminal_census(admission)
-		&& cluster_runtime_visibility_foreign_companion_retained(resolution, admission, NULL, NULL)
+		&& cluster_runtime_visibility_foreign_companion_retained(resolution, admission, NULL, NULL, NULL)
 		&& cluster_semantic_activation_recheck_r4_terminal_census(admission);
 }
 
@@ -3149,15 +3153,10 @@ cluster_runtime_visibility_foreign_companion_target_current_admitted(
 	volatile ClusterCtrcItlReadGuardV1 guard = {0};
 	volatile bool current = false;
 
-	if (resolution == NULL || resolution->local_canonical_valid || target == NULL
-		|| admission == NULL || !admission->entered
-		|| !cluster_semantic_activation_recheck_r4_terminal_census(admission))
-		return false;
 	PG_TRY();
 	{
-		current = cluster_runtime_visibility_foreign_companion_retained(resolution, admission,
-			target, (ClusterCtrcItlReadGuardV1 *)&guard)
-			&& cluster_semantic_activation_recheck_r4_terminal_census(admission);
+		current = cluster_runtime_visibility_foreign_companion_target_hold_admitted(
+			resolution, target, admission, (ClusterCtrcItlReadGuardV1 *)&guard);
 	}
 	PG_FINALLY();
 	{
@@ -3166,6 +3165,48 @@ cluster_runtime_visibility_foreign_companion_target_current_admitted(
 	}
 	PG_END_TRY();
 	return current;
+}
+
+bool
+cluster_runtime_visibility_foreign_companion_target_hold_admitted(
+	const ClusterTxResolution *resolution, const ClusterCtrcItlTargetIdentity *target,
+	const ClusterSemanticAdmissionToken *admission, ClusterCtrcItlReadGuardV1 *guard)
+{
+	const ClusterCtrcItlReadGuardV1 empty = {0};
+	volatile bool current = false;
+
+	/* Never overwrite or retire an unrelated scope supplied by the caller. */
+	if (guard == NULL || memcmp(guard, &empty, sizeof(empty)) != 0
+		|| resolution == NULL || resolution->local_canonical_valid || target == NULL
+		|| admission == NULL || !admission->entered
+		|| !cluster_semantic_activation_recheck_r4_terminal_census(admission))
+		return false;
+	PG_TRY();
+	{
+		current = cluster_runtime_visibility_foreign_companion_retained(resolution, admission,
+			target, guard, NULL)
+			&& cluster_semantic_activation_recheck_r4_terminal_census(admission);
+	}
+	PG_FINALLY();
+	{
+		if (!current)
+			(void)cluster_ctrc_itl_read_guard_release_shared(guard);
+	}
+	PG_END_TRY();
+	return current;
+}
+
+bool
+cluster_runtime_visibility_foreign_companion_target_guard_current_admitted(
+	const ClusterTxResolution *resolution, const ClusterCtrcItlTargetIdentity *target,
+	const ClusterSemanticAdmissionToken *admission, const ClusterCtrcItlReadGuardV1 *guard)
+{
+	return resolution != NULL && !resolution->local_canonical_valid && target != NULL
+		&& guard != NULL && admission != NULL && admission->entered
+		&& cluster_semantic_activation_recheck_r4_terminal_census(admission)
+		&& cluster_runtime_visibility_foreign_companion_retained(resolution, admission,
+			target, NULL, guard)
+		&& cluster_semantic_activation_recheck_r4_terminal_census(admission);
 }
 
 ClusterTxOutcome
@@ -3228,7 +3269,7 @@ cluster_runtime_visibility_resolve_exact_origin_admitted(
 		memset(&out->local_aborted_xmax_target, 0, sizeof(out->local_aborted_xmax_target));
 		if (out->origin_companion.present
 			&& (mode != CLUSTER_TX_RESOLVE_TERMINAL_CENSUS
-				|| !cluster_runtime_visibility_foreign_companion_retained(out, admission, NULL, NULL)))
+				|| !cluster_runtime_visibility_foreign_companion_retained(out, admission, NULL, NULL, NULL)))
 			memset(&out->origin_companion, 0, sizeof(out->origin_companion));
 		goto recheck;
 	}

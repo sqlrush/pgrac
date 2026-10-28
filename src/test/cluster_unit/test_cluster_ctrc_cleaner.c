@@ -9401,6 +9401,37 @@ UT_TEST(test_retained_reader_rejects_stale_tokens_and_exit_releases_only_its_own
 	UT_ASSERT_EQ(held_count, 0);
 }
 
+UT_TEST(test_retained_reader_binds_exact_source_after_close_without_new_receipt)
+{
+	ClusterCtrcReceiptHandle h; ClusterCtrcParticipantIdentity destination;
+	ClusterCtrcItlTargetIdentity target, changed; ClusterItlSlotData slot;
+	ClusterTxLocator locator; ClusterCtrcItlReadGuardV1 guard = {0}, stale;
+	UT_ASSERT(seed_delegation_itl_source(&h, &destination, &target, &slot));
+	locator = receiver_companion_locator(&h, &slot);
+	UT_ASSERT(cluster_ctrc_itl_original_full_xid_target_hold_shared(&h.key,
+		h.original_full_xid, &locator, &h.participant->identity, &target, &guard));
+	UT_ASSERT(cluster_ctrc_itl_read_guard_matches_v1(&guard, &h.key,
+		h.original_full_xid, &h.participant->identity, &target));
+	UT_ASSERT_EQ(cluster_ctrc_participant_close(h.participant, &h.participant->identity,
+		h.participant->grant_generation, 91), CLUSTER_CTRC_CLOSE_PENDING_DRAIN);
+	UT_ASSERT(cluster_ctrc_itl_read_guard_matches_v1(&guard, &h.key,
+		h.original_full_xid, &h.participant->identity, &target));
+	changed = target; changed.block_number++;
+	UT_ASSERT(!cluster_ctrc_itl_read_guard_matches_v1(&guard, &h.key,
+		h.original_full_xid, &h.participant->identity, &changed));
+	UT_ASSERT(!cluster_ctrc_itl_read_guard_matches_v1(&guard, &h.key,
+		FullTransactionIdFromU64(U64FromFullTransactionId(h.original_full_xid)+1), &h.participant->identity, &target));
+	stale = guard; stale.pid++;
+	UT_ASSERT(!cluster_ctrc_itl_read_guard_matches_v1(&stale, &h.key,
+		h.original_full_xid, &h.participant->identity, &target));
+	stale = guard;
+	UT_ASSERT_EQ(h.participant->retained_reader_count, 1);
+	UT_ASSERT(cluster_ctrc_itl_read_guard_release_shared(&guard));
+	UT_ASSERT(!cluster_ctrc_itl_read_guard_matches_v1(&stale, &h.key,
+		h.original_full_xid, &h.participant->identity, &target));
+	UT_ASSERT_EQ(held_count, 0);
+}
+
 int
 main(void)
 {
@@ -9408,7 +9439,7 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(204);
+	UT_PLAN(205);
 	UT_RUN(test_prepare_path_namespace_precedes_input_and_resets_output);
 	UT_RUN(test_prepare_path_input_precedes_journal_exhaustion);
 	UT_RUN(test_prepare_path_chain_precedes_locator_and_keeps_blocked_state);
@@ -9618,6 +9649,7 @@ main(void)
 	UT_RUN(test_receiver_companion_target_requires_its_own_page_and_itl);
 	UT_RUN(test_retained_reader_blocks_key_ack_after_receipt_cleanup);
 	UT_RUN(test_retained_reader_rejects_stale_tokens_and_exit_releases_only_its_own);
+	UT_RUN(test_retained_reader_binds_exact_source_after_close_without_new_receipt);
 	free(CtrcShared);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

@@ -213,7 +213,7 @@ SCAN_RULES: Tuple[ScanRule, ...] = (
             "src/backend/cluster/cluster_tt_slot.c",
             "src/backend/cluster/cluster_tt_durable.c",
         ),
-        r"\b(?:cluster_ctrc_origin_original_full_xid_(?:exact|shared)|cluster_ctrc_itl_original_full_xid_(?:(?:target_)?matches|target_hold)_shared|cluster_ctrc_itl_read_guard_release_shared|cluster_ctrc_origin_fullxid_(?:capture_v2|match_v2)|cluster_ctrc_origin_grant_fullxid_v2|cluster_ctrc_itl_delegate_(?:prepare|accept)_v[12]|ctrc_itl_delegate_(?:prepare|accept)|gcs_block_resource_x_ctrc_receive_image|ctrc_origin_fullxid_encode_v2|cluster_multixact_current_member_proof_bind_origin_v2|cluster_tt_slot_origin_identity_(?:retain|read))\s*\(",
+        r"\b(?:cluster_ctrc_origin_original_full_xid_(?:exact|shared)|cluster_ctrc_itl_original_full_xid_(?:(?:target_)?matches|target_hold)_shared|cluster_ctrc_itl_read_guard_(?:release_shared|matches_v1)|cluster_runtime_visibility_foreign_companion_target_(?:hold|guard_current)_admitted|cluster_ctrc_origin_fullxid_(?:capture_v2|match_v2)|cluster_ctrc_origin_grant_fullxid_v2|cluster_ctrc_itl_delegate_(?:prepare|accept)_v[12]|ctrc_itl_delegate_(?:prepare|accept)|gcs_block_resource_x_ctrc_receive_image|ctrc_origin_fullxid_encode_v2|cluster_multixact_current_member_proof_bind_origin_v2|cluster_tt_slot_origin_identity_(?:retain|read))\s*\(",
     ),
     ScanRule(
         "CTRC_RECEIPT_LIFECYCLE",
@@ -729,10 +729,12 @@ for path, owners in (
     ("src/backend/cluster/cluster_terminal_ref_census.c",
      ("ctrc_itl_original_full_xid_matches_shared",
       "cluster_ctrc_itl_original_full_xid_target_hold_shared",
-      "cluster_ctrc_itl_read_guard_release_shared", "ctrc_itl_reader_exit",)),
+      "cluster_ctrc_itl_read_guard_release_shared", "cluster_ctrc_itl_read_guard_matches_v1", "ctrc_itl_reader_exit",)),
     ("src/backend/cluster/cluster_runtime_visibility.c",
      ("cluster_runtime_visibility_foreign_companion_retained",
-      "cluster_runtime_visibility_foreign_companion_target_current_admitted",)),
+      "cluster_runtime_visibility_foreign_companion_target_current_admitted",
+      "cluster_runtime_visibility_foreign_companion_target_hold_admitted",
+      "cluster_runtime_visibility_foreign_companion_target_guard_current_admitted",)),
 ):
     _classify_owners(
         "CTRC_ORIGIN_PROVENANCE", path, owners,

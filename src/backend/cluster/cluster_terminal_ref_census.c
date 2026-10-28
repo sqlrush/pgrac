@@ -7299,6 +7299,7 @@ typedef struct CtrcItlRetainedReader {
 	ClusterCtrcTxnKeyV1 key;
 	ClusterCtrcParticipantIdentity identity;
 	FullTransactionId original;
+	ClusterCtrcItlTargetIdentity target;
 	uint64 participant_index;
 	uint64 grant_generation;
 	ClusterCtrcItlReadGuardV1 guard;
@@ -7414,6 +7415,7 @@ ctrc_itl_original_full_xid_matches_shared(
 			reader->key = participant->key;
 			reader->identity = participant->identity;
 			reader->original = participant->original_full_xid;
+			reader->target = *expected_target;
 			reader->participant_index = index;
 			reader->grant_generation = participant->grant_generation;
 			/* Publish local ownership with the count, only after every check.
@@ -7476,6 +7478,29 @@ cluster_ctrc_itl_original_full_xid_target_hold_shared(
 		return false;
 	*guard = reader.guard;
 	return true;
+}
+
+/* Backend-local binding only. The original owner keeps its shared count
+ * even after CLOSE starts; source/admission and page authority are checked
+ * separately. A released or reused slot never revives an old handle. */
+bool
+cluster_ctrc_itl_read_guard_matches_v1(
+	const ClusterCtrcItlReadGuardV1 *guard, const ClusterCtrcTxnKeyV1 *key,
+	FullTransactionId original, const ClusterCtrcParticipantIdentity *receiver,
+	const ClusterCtrcItlTargetIdentity *target)
+{
+	const CtrcItlRetainedReader *reader;
+
+	if (guard == NULL || key == NULL || receiver == NULL || target == NULL
+		|| guard->serial == 0 || guard->slot >= CLUSTER_CTRC_ITL_READ_GUARDS
+		|| guard->pid != MyProcPid)
+		return false;
+	reader = &CtrcItlReaders[guard->slot];
+	return memcmp(&reader->guard, guard, sizeof(*guard)) == 0
+		&& memcmp(&reader->key, key, sizeof(*key)) == 0
+		&& memcmp(&reader->identity, receiver, sizeof(*receiver)) == 0
+		&& FullTransactionIdEquals(reader->original, original)
+		&& memcmp(&reader->target, target, sizeof(*target)) == 0;
 }
 
 bool

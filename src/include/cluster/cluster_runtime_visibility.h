@@ -52,6 +52,7 @@ typedef enum ClusterTxOutcome ClusterTxOutcome;
 typedef struct ClusterTxLocator ClusterTxLocator;
 typedef struct ClusterTxResolution ClusterTxResolution;
 typedef struct ClusterCtrcItlTargetIdentity ClusterCtrcItlTargetIdentity;
+typedef struct ClusterCtrcItlReadGuardV1 ClusterCtrcItlReadGuardV1;
 typedef struct ClusterSemanticAdmissionToken ClusterSemanticAdmissionToken;
 typedef struct ClusterUndoBlock0Generation ClusterUndoBlock0Generation;
 typedef union ClusterUndoBlock0CurrentGuard ClusterUndoBlock0CurrentGuard;
@@ -180,6 +181,17 @@ extern bool cluster_runtime_visibility_foreign_companion_current_admitted(
 extern bool cluster_runtime_visibility_foreign_companion_target_current_admitted(
 	const ClusterTxResolution *resolution, const ClusterCtrcItlTargetIdentity *target,
 	const ClusterSemanticAdmissionToken *admission);
+/* Transfer a validated exact source scope to the original caller. On success
+ * caller must release before its admission leaves; refusal/ERROR releases.
+ * This is neither F/H qualification nor a page/writer grant. */
+extern bool cluster_runtime_visibility_foreign_companion_target_hold_admitted(
+	const ClusterTxResolution *resolution, const ClusterCtrcItlTargetIdentity *target,
+	const ClusterSemanticAdmissionToken *admission, ClusterCtrcItlReadGuardV1 *guard);
+/* Validate the same held key/FullXid/page source, without reacquiring OPEN.
+ * Refusal does not release caller ownership; its original finally does. */
+extern bool cluster_runtime_visibility_foreign_companion_target_guard_current_admitted(
+	const ClusterTxResolution *resolution, const ClusterCtrcItlTargetIdentity *target,
+	const ClusterSemanticAdmissionToken *admission, const ClusterCtrcItlReadGuardV1 *guard);
 extern ClusterTxOutcome cluster_runtime_visibility_resolve_terminal_census_retained_exact(
 	const ClusterTxLocator *locator, SCN retained_commit_scn,
 	const ClusterSemanticAdmissionToken *admission, ClusterTxResolution *out,

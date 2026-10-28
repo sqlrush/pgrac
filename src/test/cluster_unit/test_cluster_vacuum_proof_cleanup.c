@@ -54,6 +54,7 @@ typedef struct LVRelState
 	ClusterHeapFreezePageInputV1 shared_freeze_input;
 	ClusterHeapFreezePageBatchV1 shared_freeze_batch;
 	ClusterHeapFreezeProofBatchV1 shared_freeze_proofs;
+	ClusterCtrcItlReadGuardV1 shared_freeze_source_guards[CLUSTER_HEAP_FREEZE_MAX_PROOF_BATCH];
 	ClusterHeapFreezeFinalFenceV1 shared_freeze_fence;
 	ClusterHeapFreezeCohortObservation shared_freeze_cohort;
 	FullTransactionId shared_freeze_candidate_limit_full;
@@ -1057,6 +1058,31 @@ cluster_runtime_visibility_foreign_companion_target_current_admitted(
 	const ClusterSemanticAdmissionToken *token)
 {
 	(void)resolution; (void)target; (void)token; UT_ASSERT(false); return false;
+}
+
+bool
+cluster_runtime_visibility_foreign_companion_target_hold_admitted(
+	const ClusterTxResolution *resolution, const ClusterCtrcItlTargetIdentity *target,
+	const ClusterSemanticAdmissionToken *token, ClusterCtrcItlReadGuardV1 *guard)
+{
+	(void)guard;
+	return cluster_runtime_visibility_foreign_companion_target_current_admitted(resolution, target, token);
+}
+
+bool
+cluster_runtime_visibility_foreign_companion_target_guard_current_admitted(
+	const ClusterTxResolution *resolution, const ClusterCtrcItlTargetIdentity *target,
+	const ClusterSemanticAdmissionToken *token, const ClusterCtrcItlReadGuardV1 *guard)
+{
+	(void)guard;
+	return cluster_runtime_visibility_foreign_companion_target_current_admitted(resolution, target, token);
+}
+
+bool
+cluster_ctrc_itl_read_guard_release_shared(ClusterCtrcItlReadGuardV1 *guard)
+{
+	UT_ASSERT_EQ(guard->serial, 0);
+	return guard->serial == 0;
 }
 
 #include "test_cluster_vacuum_proof_cleanup.inc"
