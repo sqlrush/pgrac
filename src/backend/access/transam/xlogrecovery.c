@@ -696,11 +696,17 @@ static XLogRecPtr cluster_recovery_typed_replay(ClusterColdTypedV1 **typed,
 												ClusterRecoveryFencePlan **fence_plan);
 static ClusterColdTypedV1 *cluster_recovery_cold_inputs;
 
-/* Input identity for the original post-EOR attempt. Old subject identities
- * stay in inputs; writer is a separate, actual installed successor. No child
- * read/flush/write scope can be obtained from this resource yet. */
+/* Completed operation values and their original raw descriptors remain on
+ * the same Start. Clearing a durable F4 does not release replay/history debt. */
+typedef struct ClusterColdCtrcPageCompletedV1 {
+	RfPageCtrcStepResultV1 result;
+	struct ClusterSharedFsPageV1 *storage;
+} ClusterColdCtrcPageCompletedV1;
+
 typedef struct ClusterColdCtrcPageProgressV1 {
 	Size budget;
+	Size allocation_bytes;
+	Size reserved_bytes;
 	const RfPageOnlinePlanV1 *plan;
 	const ClusterRecoveryCtrcReplaySetSourceV1 *sources;
 	uint32 source_count, target_count;
@@ -708,8 +714,11 @@ typedef struct ClusterColdCtrcPageProgressV1 {
 	bool pending;
 	RfPageCtrcStepResultV1 result;
 	struct ClusterSharedFsPageV1 *storage;
+	ClusterColdCtrcPageCompletedV1 completed[FLEXIBLE_ARRAY_MEMBER];
 } ClusterColdCtrcPageProgressV1;
 
+/* Input identity for the original post-EOR attempt. Old subject identities
+ * stay in inputs; writer is a separate, actual installed successor. */
 struct ClusterRecoveryStartV1 {
 	const ClusterColdTypedV1 *inputs;
 	const ClusterColdTopTxCensusV1 *census;
@@ -771,6 +780,11 @@ cluster_recovery_cold_observation_close(struct ClusterRecoveryStartV1 *start)
 		if (progress->pending && progress->result.inserted.window.key.window_seq != 0)
 			(void)cluster_recovery_stamp_fail_v1(&progress->result.inserted.window);
 		(void)cluster_shared_fs_page_close_v1(storage);
+		for (uint32 i = 0; i < progress->target_count; i++) {
+			storage = progress->completed[i].storage;
+			progress->completed[i].storage = NULL;
+			(void)cluster_shared_fs_page_close_v1(storage);
+		}
 		pfree(progress);
 	}
 	rf_page_online_plan_destroy_v1(&start->ctrc_page_plan);
@@ -860,16 +874,36 @@ cluster_recovery_cold_inputs_handoff(EndOfWalRecoveryInfo *info)
 	info->cluster_tx_start = NULL;
 }
 
-/* A saved PAGE result cannot outlive its original unfinished F4 operation.
- * This is only a readonly window check, never PAGE/FD or discharge authority. */
+/* A pending result requires its original unfinished F4. Completed operations
+ * retain their exact raw descriptors after that window has been cleared.
+ * These checks never grant a fresh PAGE operation or release replay debt. */
 static bool
 cluster_recovery_cold_pending_page_current(const struct ClusterRecoveryStartV1 *start)
 {
 	const ClusterColdCtrcPageProgressV1 *progress = start->ctrc_page_progress;
 	const RfPageCtrcStepResultV1 *result;
 
-	if (progress == NULL || !progress->pending)
+	if (progress == NULL)
 		return true;
+	if (progress->target_count > (MaxAllocSize - sizeof(*progress))
+			/ sizeof(ClusterColdCtrcPageCompletedV1)
+		|| progress->allocation_bytes != sizeof(*progress)
+			+ (Size)progress->target_count * sizeof(ClusterColdCtrcPageCompletedV1)
+		|| progress->reserved_bytes < progress->allocation_bytes
+		|| progress->budget <= progress->reserved_bytes
+		|| progress->next_target > progress->target_count
+		|| (progress->pending && progress->next_target == progress->target_count))
+		return false;
+	for (uint32 i = 0; i < progress->next_target; i++) {
+		const ClusterColdCtrcPageCompletedV1 *completed = &progress->completed[i];
+
+		if (completed->storage != NULL
+			&& (completed->result.phase != RF_PAGE_CTRC_STEP_FPI_DURABLE
+				|| !completed->result.inserted.wal_flushed
+				|| !cluster_shared_fs_page_current_v1(completed->storage)))
+			return false;
+	}
+	if (!progress->pending) return true;
 	result = &progress->result;
 	return result->phase == RF_PAGE_CTRC_STEP_FPI_DURABLE
 		&& result->inserted.wal_flushed
@@ -1759,7 +1793,7 @@ cluster_recovery_cold_page_attempt(const struct ClusterRecoveryStartV1 *start,
 	RfPageCtrcAuthorityV1 *volatile authority = NULL;
 	RfPageAuthorityTargetV1 target = {0};
 	RfPageProofDetailV1 detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
-	Size available = progress->budget - sizeof(*progress);
+	Size available = progress->budget - progress->reserved_bytes;
 	Size part = available / 3;
 	bool pending = progress->pending;
 	RfPageCtrcStepResultV1 pending_result = progress->result;
@@ -1883,18 +1917,35 @@ ClusterColdRecoveryCtrcPageAdvance(const struct ClusterRecoveryStartV1 *start,
 	if (count == 0) return true;
 	if (progress == NULL) {
 		Size budget = Min(memory_budget, (Size)RF_PAGE_ONLINE_PLAN_MAX_BYTES);
+		Size bytes;
+		Size storage_bytes = cluster_shared_fs_page_bytes_v1();
 
-		if (budget <= sizeof(*progress)) {
+		/* Reserve every result/FD slot before the first operation, never
+		 * allocate while an INSERTED window waits for its continuation. */
+		if (count > (MaxAllocSize - sizeof(*progress))
+				/ sizeof(ClusterColdCtrcPageCompletedV1)) {
 			cluster_recovery_cold_page_plan_refuse(state, RF_PAGE_PROOF_DETAIL_CAPACITY);
 			return false;
 		}
-		progress = MemoryContextAllocExtended(TopMemoryContext, sizeof(*progress),
+		bytes = sizeof(*progress) + (Size)count * sizeof(ClusterColdCtrcPageCompletedV1);
+		/* Completed raw handles outlive each native step. Reserve the full
+		 * preparation peak for every fixed target as well, before PAGE;
+		 * the active step keeps its existing independent peak check. */
+		if (budget <= bytes || storage_bytes == 0
+			|| storage_bytes > (budget - bytes) / count
+			|| budget - bytes <= (Size)count * storage_bytes) {
+			cluster_recovery_cold_page_plan_refuse(state, RF_PAGE_PROOF_DETAIL_CAPACITY);
+			return false;
+		}
+		progress = MemoryContextAllocExtended(TopMemoryContext, bytes,
 			MCXT_ALLOC_ZERO | MCXT_ALLOC_NO_OOM);
 		if (progress == NULL) {
 			cluster_recovery_cold_page_plan_refuse(state, RF_PAGE_PROOF_DETAIL_OOM);
 			return false;
 		}
 		progress->budget = budget;
+		progress->allocation_bytes = bytes;
+		progress->reserved_bytes = bytes + (Size)count * storage_bytes;
 		progress->plan = state->ctrc_page_plan;
 		progress->sources = state->ctrc_page_sources;
 		progress->source_count = state->ctrc_page_source_count;
@@ -1944,6 +1995,77 @@ ClusterColdRecoveryCtrcPageAdvance(const struct ClusterRecoveryStartV1 *start,
 			}
 			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
 				100L, WAIT_EVENT_CLUSTER_THREAD_RECOVERY);
+		}
+	}
+	PG_CATCH();
+	{
+		cluster_recovery_cold_page_plan_refuse(state, RF_PAGE_PROOF_DETAIL_INTERNAL);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (!ready) cluster_recovery_cold_page_plan_refuse(state, RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH);
+	return ready;
+}
+
+/* Finish each exact bufferless FPI operation through the original protected
+ * readback/current/local-debt path. Keep its full value and same raw FD for
+ * the remaining fixed graph and independent joint service, not a new owner. */
+bool
+ClusterColdRecoveryCtrcPageDrain(const struct ClusterRecoveryStartV1 *start,
+	Size memory_budget)
+{
+	struct ClusterRecoveryStartV1 *state;
+	bool ready = false;
+
+	if (start == NULL) return true;
+	if (!cluster_recovery_cold_ctrc_replays_actor() || start != cluster_recovery_cold_start)
+		return false;
+	state = cluster_recovery_cold_start;
+	PG_TRY();
+	{
+		for (;;) {
+			const ClusterColdCtrcWorkV1 *work;
+			ClusterWalInputsV1 *scope;
+			ClusterColdCtrcPageProgressV1 *progress;
+			RfPageCtrcStepResultV1 result;
+			struct ClusterSharedFsPageV1 *storage;
+			uint32 index;
+
+			if (!ClusterColdRecoveryCtrcPageAdvance(start, memory_budget)
+				|| start != cluster_recovery_cold_start) break;
+			memory_budget = 0;
+			work = state->ctrc_observation_work;
+			scope = state->ctrc_observation_inputs;
+			progress = state->ctrc_page_progress;
+			if (!cluster_recovery_cold_page_advance_current(start, work, scope, progress)) break;
+			if (progress == NULL) {
+				ready = rf_page_online_plan_target_count_v1(start->ctrc_page_plan) == 0;
+				break;
+			}
+			if (!progress->pending) {
+				ready = progress->next_target == progress->target_count;
+				break;
+			}
+			result = progress->result;
+			storage = progress->storage;
+			index = progress->next_target;
+			/* Full original owner/source validation may yield. Re-locate and
+			 * compare every saved value before the exact F4 transition. */
+			if (!cluster_recovery_cold_page_advance_current(start, work, scope, progress)
+				|| start != cluster_recovery_cold_start || state->ctrc_page_progress != progress
+				|| !progress->pending || progress->next_target != index
+				|| index >= progress->target_count || progress->completed[index].storage != NULL
+				|| storage == NULL || progress->storage != storage
+				|| memcmp(&progress->result, &result, sizeof(result)) != 0
+				|| !cluster_recovery_stamp_clear_v1(&result.inserted.window)) break;
+			/* No callback, I/O or allocation between clearing this operation
+			 * and retaining its immutable result/FD in the preallocated slot. */
+			progress->completed[index].result = result;
+			progress->completed[index].storage = storage;
+			progress->storage = NULL;
+			memset(&progress->result, 0, sizeof(progress->result));
+			progress->pending = false;
+			progress->next_target++;
 		}
 	}
 	PG_CATCH();

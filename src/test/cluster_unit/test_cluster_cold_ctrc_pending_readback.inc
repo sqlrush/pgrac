@@ -22,7 +22,7 @@ rf_page_recovery_ctrc_replays_fpi_readback_v1(const struct ClusterRecoveryStartV
 	UT_ASSERT(progress->pending && inserted == &progress->result.inserted);
 	UT_ASSERT(storage == progress->storage && pending_storage_live);
 	UT_ASSERT_EQ(count, work->counts.subject_count); UT_ASSERT(budget > 0);
-	UT_ASSERT_EQ(prefix_steps, prefix_wait ? 2 : 1); UT_ASSERT_EQ(progress->next_target, 0);
+	UT_ASSERT_EQ(prefix_steps, (prefix_wait ? 2 : 1) + progress->next_target);
 	pending_readback_calls++;
 	if (pending_readback_mode == 1) return RF_PAGE_PROOF_DETAIL_ROOT_STALE;
 	if (pending_readback_mode == 2) pg_re_throw();

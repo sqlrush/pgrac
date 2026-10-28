@@ -118,20 +118,23 @@ UT_TEST(test_startup_pending_fpi_requires_complete_saved_operation)
 }
 
 static void
-pending_window_fail_on_first_wait(void)
+pending_window_fail_on_readback(void)
 {
- if (tx_waits == 1) UT_ASSERT(cluster_recovery_stamp_fail_v1(&prefix_window));
- else owner_boot++; /* Bound the unchanged-parent regression without a deadline. */
+ /* The production drain now retires a proven operation before service.
+  * Fail the same original window after readback and before its final current
+  * check instead; it must never reach independent service or clear the debt. */
+ if (pending_readback_calls == 1)
+  UT_ASSERT(cluster_recovery_stamp_fail_v1(&prefix_window));
 }
 
 UT_TEST(test_actual_startup_pending_fpi_failure_interrupts_service_wait)
 {
  ctrc_handoff_fixture(false, false); prefix_setup_targets();
- ctrc_wait_step = pending_window_fail_on_first_wait;
+ prefix_destroy_callback = pending_window_fail_on_readback;
  fatal_armed = true;
  if (setjmp(fatal_jump) == 0) { actual_startup_finish_tx(&info); UT_ASSERT(false); }
  fatal_armed = false;
- UT_ASSERT_EQ(tx_waits, 1);
+ UT_ASSERT_EQ(tx_waits, 0);
  UT_ASSERT(!ClusterColdRecoveryTxCurrent(info.cluster_tx_start));
  pending_window_debt_unchanged(&cluster_recovery_cold_start->ctrc_page_progress->result);
  UT_ASSERT(cluster_thread_recovery_replay_slot(prefix_window.key.target_thread)->stamp.failed);

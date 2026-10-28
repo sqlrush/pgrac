@@ -5,7 +5,8 @@
 static bool pending_storage_live, pending_storage_invalid, pending_storage_missing;
 static bool pending_storage_check_close, pending_storage_cleanup_seen;
 static unsigned pending_storage_created, pending_storage_checks, pending_storage_closes;
-static unsigned pending_storage_token;
+static unsigned pending_storage_token, pending_storage_token_second, pending_storage_mask;
+static Size pending_storage_bytes;
 static void pending_readback_reset(void);
 
 static void
@@ -14,8 +15,15 @@ pending_storage_fixture_reset(void)
 	UT_ASSERT(!pending_storage_live);
 	pending_storage_invalid = pending_storage_missing = false;
 	pending_storage_check_close = pending_storage_cleanup_seen = false;
-	pending_storage_created = pending_storage_checks = pending_storage_closes = 0;
+	pending_storage_created = pending_storage_checks = pending_storage_closes = pending_storage_mask = 0;
+	pending_storage_bytes = 8192;
 	pending_readback_reset();
+}
+
+Size
+cluster_shared_fs_page_bytes_v1(void)
+{
+	return pending_storage_bytes;
 }
 
 RfPageCtrcHeldStepV1
@@ -41,8 +49,11 @@ rf_page_recovery_ctrc_replays_itl_graph_hold_smgr_v1(const struct ClusterRecover
 		held.result.inserted.image.version = envelope.image.version;
 	}
 	if (held.result.phase == RF_PAGE_CTRC_STEP_FPI_DURABLE && !pending_storage_missing) {
-		UT_ASSERT(!pending_storage_live); pending_storage_live = true; pending_storage_created++;
-		held.storage = (void *)&pending_storage_token;
+		UT_ASSERT(pending_storage_created < 2);
+		pending_storage_mask |= 1U << pending_storage_created;
+		held.storage = pending_storage_created == 0 ? (void *)&pending_storage_token
+			: (void *)&pending_storage_token_second;
+		pending_storage_live = true; pending_storage_created++;
 	}
 	return held;
 }
@@ -51,20 +62,27 @@ bool
 cluster_shared_fs_page_current_v1(ClusterSharedFsPageV1 *storage)
 {
 	pending_storage_checks++;
-	return storage == (void *)&pending_storage_token && pending_storage_live && !pending_storage_invalid;
+	return !pending_storage_invalid
+		&& ((storage == (void *)&pending_storage_token && (pending_storage_mask & 1) != 0)
+			|| (storage == (void *)&pending_storage_token_second && (pending_storage_mask & 2) != 0));
 }
 
 bool
 cluster_shared_fs_page_close_v1(ClusterSharedFsPageV1 *storage)
 {
+	unsigned mask;
+
 	if (storage == NULL) return true;
-	UT_ASSERT(storage == (void *)&pending_storage_token && pending_storage_live);
+	mask = storage == (void *)&pending_storage_token ? 1
+		: storage == (void *)&pending_storage_token_second ? 2 : 0;
+	UT_ASSERT(mask != 0 && (pending_storage_mask & mask) != 0);
 	if (pending_storage_check_close) {
 		UT_ASSERT(cluster_recovery_cold_start->ctrc_page_progress == NULL);
 		UT_ASSERT(page_graph_live && observation_scope_live && observation_cursor_live);
 		UT_ASSERT_EQ(page_graph_destroys + observation_census_destroys + observation_scope_releases, 0);
 	}
-	pending_storage_live = false; pending_storage_closes++;
+	pending_storage_mask &= ~mask; pending_storage_live = pending_storage_mask != 0;
+	pending_storage_closes++;
 	return !pending_storage_invalid;
 }
 

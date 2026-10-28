@@ -8290,9 +8290,9 @@ StartupXLOG(void)
 			(Size)cluster_cold_recovery_plan_memory * 1024 / 4))
 		ereport(FATAL, (errmsg("could not prepare original Startup CTRC PAGE graph"),
 			errdetail("%s", ClusterColdRecoveryCtrcObservationRefusal(endOfRecoveryInfo->cluster_tx_start))));
-	/* Retain the first pending PAGE operation in this original episode.
-	 * Its installation is separate from complete debt/service acceptance. */
-	if (!ClusterColdRecoveryCtrcPageAdvance(endOfRecoveryInfo->cluster_tx_start,
+	/* Complete exact PAGE operations while retaining their results/raw FDs
+	 * in this episode; original replay/history and service duties remain. */
+	if (!ClusterColdRecoveryCtrcPageDrain(endOfRecoveryInfo->cluster_tx_start,
 			(Size)cluster_cold_recovery_plan_memory * 1024 / 4))
 		ereport(FATAL, (errmsg("could not advance original Startup CTRC PAGE graph"),
 			errdetail("%s", ClusterColdRecoveryCtrcObservationRefusal(endOfRecoveryInfo->cluster_tx_start))));
