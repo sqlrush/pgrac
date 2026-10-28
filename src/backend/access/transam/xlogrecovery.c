@@ -1705,16 +1705,22 @@ cluster_recovery_cold_page_tail(const struct ClusterRecoveryStartV1 *start,
 	return found;
 }
 
-/* Preserve a returned INSERTED/failed operation before classifying the
- * result. Failed installation never turns that operation into a new attempt. */
+/* A refused return can still carry an outstanding operation. Preserve it
+ * before PAGE cleanup or original currentness checks can fail. */
+static bool
+cluster_recovery_cold_page_step_has_operation(const RfPageCtrcStepResultV1 *step)
+{
+	return step->inserted.window.key.window_seq != 0 || step->inserted.record_start != 0
+		|| step->inserted.record_end != 0 || step->inserted.wal_flushed;
+}
+
+/* Classify only after PAGE cleanup and original currentness checks. Failed
+ * installation never turns the retained operation into a new attempt. */
 static RfPageProofDetailV1
 cluster_recovery_cold_page_step_result(ClusterColdCtrcPageProgressV1 *progress,
 	const RfPageCtrcStepResultV1 *step)
 {
-	if (step->inserted.window.key.window_seq != 0 || step->inserted.record_start != 0
-		|| step->inserted.record_end != 0 || step->inserted.wal_flushed) {
-		progress->result = *step;
-		progress->pending = true;
+	if (cluster_recovery_cold_page_step_has_operation(step)) {
 		if (step->phase == RF_PAGE_CTRC_STEP_FPI_DURABLE
 			&& step->inserted.window.key.window_seq != 0 && step->inserted.wal_flushed
 			&& step->inserted.record_start < step->inserted.record_end)
@@ -1772,6 +1778,10 @@ cluster_recovery_cold_page_attempt(const struct ClusterRecoveryStartV1 *start,
 					start->ctrc_physical->count, available - 2 * part);
 				RfPageCtrcAuthorityV1 *release = authority;
 
+				if (cluster_recovery_cold_page_step_has_operation(&step)) {
+					progress->result = step;
+					progress->pending = true;
+				}
 				authority = NULL;
 				rf_page_authority_ctrc_replays_destroy_v1(&release);
 				/* PAGE is gone before any original ROOT/current snapshot. */

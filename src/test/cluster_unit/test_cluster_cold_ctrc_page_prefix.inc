@@ -29,6 +29,7 @@ static bool prefix_error, prefix_wait, prefix_unchanged, prefix_bad_physical, pr
 static bool prefix_legacy_synced;
 static unsigned prefix_durable_steps;
 static void (*prefix_callback)(void);
+static void (*prefix_destroy_callback)(void);
 static ClusterRecoveryStampHandleV1 prefix_window;
 
 static void
@@ -39,6 +40,7 @@ page_prefix_fixture_reset(void)
  prefix_error = prefix_wait = prefix_unchanged = prefix_bad_physical = prefix_insert_refuse = false;
  prefix_legacy_synced = false; prefix_durable_steps = 0;
  prefix_callback = NULL;
+ prefix_destroy_callback = NULL;
  memset(&prefix_window, 0, sizeof(prefix_window));
  memset(prefix_targets, 0, sizeof(prefix_targets));
  memset(prefix_graph, 0, sizeof(prefix_graph));
@@ -99,7 +101,11 @@ rf_page_authority_ctrc_replays_preflight_v1(const RfPageAuthorityTargetV1 *targe
 void
 rf_page_authority_ctrc_replays_destroy_v1(RfPageCtrcAuthorityV1 **authority)
 {
- if (authority && *authority) { UT_ASSERT(*authority == (RfPageCtrcAuthorityV1 *)&prefix_page_token); *authority = NULL; prefix_destroyed++; }
+ if (authority && *authority) {
+  UT_ASSERT(*authority == (RfPageCtrcAuthorityV1 *)&prefix_page_token);
+  *authority = NULL; prefix_destroyed++;
+  if (prefix_destroy_callback) prefix_destroy_callback();
+ }
 }
 
 /* The native PAGE/WAL leaf is controlled here. Publish its descriptor through
