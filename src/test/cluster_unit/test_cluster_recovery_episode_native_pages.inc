@@ -11,6 +11,7 @@
  *    shared memory, locks and fault delivery remain controlled.
  *-------------------------------------------------------------------------
  */
+static WalTestRecord (*episode_native_pages_own_prefix)(const ClusterWalSourceRef *, WalTestRecord);
 static unsigned episode_native_pages_foreign;
 static bool episode_native_pages_duplicate;
 static char episode_native_pages_cwd[MAXPGPATH], episode_native_pages_work[MAXPGPATH];
@@ -18,8 +19,11 @@ static char episode_native_pages_cwd[MAXPGPATH], episode_native_pages_work[MAXPG
 static WalTestRecord
 episode_native_pages_prefix(const ClusterWalSourceRef *source, WalTestRecord previous)
 {
-	if (source->claim.identity.origin_node_id == 0)
+	if (source->claim.identity.origin_node_id == 0) {
+		if (episode_native_pages_own_prefix != NULL)
+			return episode_native_pages_own_prefix(source, previous);
 		return episode_birth_match_prefix(source, previous);
+	}
 	for (unsigned i = 0; i < episode_native_pages_foreign; ++i) {
 		xl_clog_zeropage_full birth = {0};
 		birth.pageno = 17 + (episode_native_pages_duplicate ? 0 : i);
