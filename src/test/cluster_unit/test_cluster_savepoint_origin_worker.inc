@@ -2116,3 +2116,207 @@ UT_TEST(test_operation_worker_malformed_transaction_prev_preserves_output)
 			UT_ASSERT_EQ(test_candidate_held_count, 0);
 		}
 }
+
+/* Two different retained creations name one physical TID. This fixture does
+ * not model native pruning or provide permission to recycle that TID. */
+static void
+operation_worker_reused_creation(OperationWorkerFixture *f, bool reuse, bool same)
+{
+	UndoSlotDirEntry directory;
+	UndoRecordHeader record;
+	char *bytes;
+	Page page;
+
+	operation_worker_mixed_top(f, reuse, same);
+	operation_worker_row_effect(1, CLUSTER_SAVEPOINT_EFFECT_LIVE);
+	test_mixed_top_slot.commit_scn = 65; /* Isolate the visibility branch. */
+	memcpy(&directory, test_operation_page.data + BLCKSZ - 2 * sizeof(directory),
+		   sizeof(directory));
+	bytes = test_operation_page.data + directory.record_offset;
+	memcpy(&record, bytes, sizeof(record));
+	record.target_offset = 2;
+	memcpy(bytes, &record, sizeof(record));
+	page = (Page)f->cr.source.data;
+	HeapTupleHeaderSetXmin((HeapTupleHeader)PageGetItem(page, PageGetItemId(page, 2)),
+						   TEST_ORIGIN_XID + 3);
+	ItemIdSetUnused(PageGetItemId(page, 3));
+}
+
+static void
+operation_worker_creation_first(OperationWorkerFixture *f)
+{
+	for (int tick = 0; tick < 64 && test_candidate_release_calls < 3; tick++)
+		UT_ASSERT_EQ(operation_worker_step(f), CLUSTER_R4_CR_STEP_PENDING);
+	UT_ASSERT_EQ(f->extension.build_steps, 1);
+	UT_ASSERT_EQ(test_candidate_acquire_calls, 3);
+	UT_ASSERT_EQ(test_candidate_release_calls, 3);
+	UT_ASSERT_EQ(test_candidate_held_count, 0);
+}
+
+static void
+operation_worker_assert_reused_creation(OperationWorkerFixture *f, const char original[BLCKSZ],
+										bool reuse, bool old_live)
+{
+	PGAlignedBlock expected;
+	ClusterItlSlotData *slot;
+
+	memcpy(expected.data, original, BLCKSZ);
+	if (!reuse && !old_live) {
+		slot = &ClusterPageGetItlSlots((Page)expected.data)[2];
+		memset(slot, 0, sizeof(*slot));
+		slot->wrap = 8;
+	}
+	UT_ASSERT_EQ(memcmp(f->cr.source.data, expected.data, BLCKSZ), 0);
+	UT_ASSERT_EQ(f->extension.build_steps, 2);
+	UT_ASSERT_EQ(test_candidate_held_count, 0);
+}
+
+UT_TEST(test_operation_worker_kept_insert_covers_discarded_reused_creation)
+{
+	for (int reuse = 0; reuse < 2; reuse++)
+		for (int same = 0; same < 2; same++) {
+			OperationWorkerFixture f;
+			PGAlignedBlock original;
+			ClusterR4CrBuildStepResult step;
+			int allocations = operation_worker_allocations;
+
+			operation_worker_reused_creation(&f, reuse, same);
+			memcpy(original.data, f.cr.source.data, BLCKSZ);
+			step = operation_worker_finish(&f);
+			cluster_cr_build_on_holder_forget(0, 1000);
+			UT_ASSERT_EQ(step, CLUSTER_R4_CR_STEP_FULL);
+			operation_worker_assert_reused_creation(&f, original.data, reuse, false);
+			UT_ASSERT_EQ(test_candidate_acquire_calls, 6);
+			UT_ASSERT_EQ(operation_worker_allocations, allocations);
+		}
+}
+
+UT_TEST(test_operation_worker_kept_insert_covers_visible_reused_creation)
+{
+	for (int reuse = 0; reuse < 2; reuse++) {
+		OperationWorkerFixture f;
+		PGAlignedBlock original;
+		ClusterR4CrBuildStepResult step;
+
+		operation_worker_reused_creation(&f, reuse, false);
+		operation_worker_row_effect(0, CLUSTER_SAVEPOINT_EFFECT_LIVE);
+		memcpy(original.data, f.cr.source.data, BLCKSZ);
+		step = operation_worker_finish(&f);
+		cluster_cr_build_on_holder_forget(0, 1000);
+		UT_ASSERT_EQ(step, CLUSTER_R4_CR_STEP_FULL);
+		operation_worker_assert_reused_creation(&f, original.data, reuse, true);
+		UT_ASSERT_EQ(test_candidate_acquire_calls, 6);
+	}
+}
+
+UT_TEST(test_operation_worker_unkept_reused_creation_needs_no_witness)
+{
+	for (int discarded = 0; discarded < 2; discarded++) {
+		OperationWorkerFixture f;
+		ClusterR4CrBuildStepResult step;
+
+		operation_worker_reused_creation(&f, true, false);
+		if (discarded)
+			operation_worker_row_effect(1, CLUSTER_SAVEPOINT_EFFECT_DISCARDED);
+		else
+			test_mixed_top_slot.commit_scn = 80;
+		step = operation_worker_finish(&f);
+		cluster_cr_build_on_holder_forget(0, 1000);
+		UT_ASSERT_EQ(step, CLUSTER_R4_CR_STEP_FULL);
+		UT_ASSERT(!ItemIdIsUsed(PageGetItemId((Page)f.cr.source.data, 2)));
+		UT_ASSERT_EQ(ClusterPageGetItlSlots((Page)f.cr.source.data)[2].flags, ITL_FLAG_FREE);
+		UT_ASSERT_EQ(test_candidate_held_count, 0);
+	}
+}
+
+UT_TEST(test_operation_worker_reused_creation_witness_mismatch_refuses)
+{
+	for (int fault = 0; fault < 6; fault++) {
+		OperationWorkerFixture f;
+		PGAlignedBlock changed;
+		Page page;
+		ItemId item;
+		HeapTupleHeader tuple;
+		ClusterR4CrBuildStepResult step;
+
+		operation_worker_reused_creation(&f, true, false);
+		operation_worker_creation_first(&f);
+		page = (Page)f.cr.source.data;
+		item = PageGetItemId(page, 2);
+		tuple = (HeapTupleHeader)PageGetItem(page, item);
+		if (fault == 0)
+			HeapTupleHeaderSetXmin(tuple, TEST_ORIGIN_XID + 1);
+		else if (fault == 1)
+			ItemIdSetNormal(item, ItemIdGetOffset(item), ItemIdGetLength(item) - 1);
+		else if (fault == 2)
+			tuple->t_hoff = 0;
+		else if (fault == 3)
+			tuple->t_infomask |= HEAP_XMAX_IS_MULTI;
+		else if (fault == 4)
+			ItemIdSetUnused(item);
+		else {
+			UndoRecordHeader *older
+				= (UndoRecordHeader *)(test_operation_page.data + sizeof(UndoBlockHeader));
+			UndoOperationTrailer tail;
+			char *bytes = (char *)(older + 1) + older->payload_length - sizeof(tail);
+
+			older->xid = TEST_ORIGIN_XID + 3;
+			memcpy(&tail, bytes, sizeof(tail));
+			tail.operation_fxid = U64FromFullTransactionId(
+				FullTransactionIdFromEpochAndXid(9, TEST_ORIGIN_XID + 3));
+			memcpy(bytes, &tail, sizeof(tail));
+		}
+		memcpy(changed.data, f.cr.source.data, BLCKSZ);
+		step = operation_worker_finish(&f);
+		cluster_cr_build_on_holder_forget(0, 1000);
+		UT_ASSERT_EQ(step, CLUSTER_R4_CR_STEP_FAIL);
+		UT_ASSERT_EQ(f.reason, CLUSTER_CR_BUILD_BAD_UNDO);
+		UT_ASSERT_EQ(memcmp(changed.data, f.cr.source.data, BLCKSZ), 0);
+		UT_ASSERT_EQ(test_candidate_held_count, 0);
+	}
+}
+
+UT_TEST(test_operation_worker_reused_creation_never_bypasses_unknown_top)
+{
+	OperationWorkerFixture f;
+	PGAlignedBlock before;
+	ClusterR4CrBuildStepResult step;
+
+	operation_worker_reused_creation(&f, true, false);
+	operation_worker_creation_first(&f);
+	test_tt_slot.xid++;
+	memcpy(before.data, f.cr.source.data, BLCKSZ);
+	step = operation_worker_finish(&f);
+	cluster_cr_build_on_holder_forget(0, 1000);
+	UT_ASSERT_EQ(step, CLUSTER_R4_CR_STEP_FAIL);
+	UT_ASSERT_EQ(f.reason, CLUSTER_CR_BUILD_BAD_UNDO);
+	UT_ASSERT_EQ(memcmp(before.data, f.cr.source.data, BLCKSZ), 0);
+	UT_ASSERT_EQ(test_candidate_held_count, 0);
+}
+
+UT_TEST(test_operation_worker_reused_creation_cohort_has_private_witnesses)
+{
+	OperationWorkerFixture f[2];
+	PGAlignedBlock original;
+	ClusterR4CrBuildStepResult step[2] = { CLUSTER_R4_CR_STEP_PENDING, CLUSTER_R4_CR_STEP_PENDING };
+	int allocations = operation_worker_allocations;
+
+	operation_worker_reused_creation(&f[0], true, false);
+	f[1] = f[0];
+	f[1].extension.slot_generation++;
+	f[1].extension.owner.builder_incarnation++;
+	memcpy(original.data, f[0].cr.source.data, BLCKSZ);
+	test_operation_worker_current_busy = true;
+	for (int tick = 0; tick < 100; tick++)
+		for (unsigned i = 0; i < 2; i++)
+			if (step[i] == CLUSTER_R4_CR_STEP_PENDING)
+				step[i] = operation_worker_step_at(&f[i], i);
+	for (unsigned i = 0; i < 2; i++) {
+		cluster_cr_build_on_holder_forget(i, 1000 + i);
+		UT_ASSERT_EQ(step[i], CLUSTER_R4_CR_STEP_FULL);
+		operation_worker_assert_reused_creation(&f[i], original.data, true, false);
+	}
+	UT_ASSERT_EQ(test_candidate_acquire_calls, 12);
+	UT_ASSERT_EQ(test_candidate_held_count, 0);
+	UT_ASSERT_EQ(operation_worker_allocations, allocations);
+}

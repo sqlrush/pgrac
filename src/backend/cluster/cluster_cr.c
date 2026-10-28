@@ -784,6 +784,14 @@ typedef struct CrR4OperationTop {
 	bool conservative;
 } CrR4OperationTop;
 
+/* Private evidence of a qualified kept INSERT, not a TID reuse grant. */
+typedef struct CrR4KeptCreation {
+	struct CrR4KeptCreation *next;
+	TransactionId xid;
+	OffsetNumber offset;
+	uint16 length;
+} CrR4KeptCreation;
+
 typedef struct CrR4OperationContext {
 	bool enabled, reading, operation_mode, pending;
 	bool current_owner;
@@ -797,6 +805,7 @@ typedef struct CrR4OperationContext {
 	ClusterTxResolution top;
 	ClusterSavepointReaderRecord operation;
 	CrR4OperationTop *tops;
+	CrR4KeptCreation *creations;
 	uint32 top_count;
 	PGAlignedBlock *walk;
 	char *result_page; /* Borrowed only during the admitted call. */
@@ -830,6 +839,12 @@ cr_r4_operation_forget(uint32 index, uint64 generation)
 
 		pfree(operation->tops);
 		operation->tops = next;
+	}
+	while (operation->creations != NULL) {
+		CrR4KeptCreation *next = operation->creations->next;
+
+		pfree(operation->creations);
+		operation->creations = next;
 	}
 	if (operation->walk != NULL)
 		pfree(operation->walk);
@@ -992,8 +1007,77 @@ cr_r4_operation_covers_target(const CrR4OperationContext *operation, const UndoR
 										 record->target_offset);
 }
 
-/* A LIVE overlap must expose a real predecessor in the private walk. The
- * inverse's idempotent absent-creation success cannot establish lineage.
+static bool
+cr_r4_operation_creation_matches(const CrR4OperationContext *operation,
+								 const CrR4KeptCreation *creation)
+{
+	Page page = (Page)operation->result_page;
+	PageHeader header = (PageHeader)page;
+	ItemId item;
+	HeapTupleHeader tuple;
+
+	if (creation->offset < FirstOffsetNumber || creation->offset > PageGetMaxOffsetNumber(page))
+		return false;
+	item = PageGetItemId(page, creation->offset);
+	if (!ItemIdIsNormal(item) || ItemIdGetLength(item) < SizeofHeapTupleHeader
+		|| ItemIdGetLength(item) != creation->length || ItemIdGetOffset(item) < header->pd_upper
+		|| (size_t)ItemIdGetOffset(item) + ItemIdGetLength(item) > header->pd_special)
+		return false;
+	tuple = (HeapTupleHeader)PageGetItem(page, item);
+	return tuple->t_hoff >= SizeofHeapTupleHeader && tuple->t_hoff <= creation->length
+		   && (tuple->t_infomask & HEAP_XMAX_IS_MULTI) == 0
+		   && HeapTupleHeaderGetRawXmin(tuple) == creation->xid;
+}
+
+/* Record only the first kept operation at this offset, after its original
+ * inverse and admission recheck. Later versions cannot replace this witness. */
+static bool
+cr_r4_operation_remember_creation(CrR4OperationContext *operation, const UndoRecordHeader *record)
+{
+	CrR4KeptCreation creation = { .xid = record->xid, .offset = record->target_offset };
+	CrR4KeptCreation *stored;
+	Page page = (Page)operation->result_page;
+	UndoInsertPayload insert;
+	unsigned bit = record->target_offset - FirstOffsetNumber;
+
+	if (record->record_type != UNDO_RECORD_INSERT
+		|| (operation->kept_offsets[bit / 8] & (1U << (bit % 8))) != 0)
+		return true;
+	if (record->target_offset > PageGetMaxOffsetNumber(page))
+		return false;
+	creation.length = ItemIdGetLength(PageGetItemId(page, record->target_offset));
+	memcpy(&insert, record + 1, sizeof(insert));
+	if (!cr_r4_operation_creation_matches(operation, &creation)
+		|| (insert.inserted_tuple_len != 0 && insert.inserted_tuple_len != creation.length))
+		return false;
+	stored = MemoryContextAllocZero(TopMemoryContext, sizeof(*stored));
+	*stored = creation;
+	stored->next = operation->creations;
+	operation->creations = stored;
+	return true;
+}
+
+/* An absent walk TID is useful only with an explicit distinct kept creator. */
+static bool
+cr_r4_operation_covers_creation(const CrR4OperationContext *operation,
+								const UndoRecordHeader *record, const BufferTag *tag)
+{
+	Page walk = operation->walk != NULL ? (Page)operation->walk->data : NULL;
+
+	if (walk == NULL || record->record_type != UNDO_RECORD_INSERT
+		|| record->target_block != tag->blockNum || record->target_offset < FirstOffsetNumber
+		|| record->target_offset > PageGetMaxOffsetNumber(walk)
+		|| ItemIdIsUsed(PageGetItemId(walk, record->target_offset)))
+		return false;
+	for (const CrR4KeptCreation *creation = operation->creations; creation != NULL;
+		 creation = creation->next)
+		if (creation->offset == record->target_offset && creation->xid != record->xid)
+			return cr_r4_operation_creation_matches(operation, creation);
+	return false;
+}
+
+/* A LIVE overlap needs an exact walk predecessor or a distinct kept creation.
+ * The inverse's idempotent absent-creation success alone proves no lineage.
  * Reject unqualified MX before an inverse can clear its flag; raw numeric
  * equality is not a member proof. The inverse still checks raw identities. */
 static bool
@@ -1005,6 +1089,7 @@ cr_r4_operation_projection_safe(const CrR4OperationContext *operation, char page
 	Page page = (Page)(operation->walk != NULL ? operation->walk->data : page_bytes);
 	PageHeader header = (PageHeader)page;
 	bool overlap = false;
+	bool covered_creation = false;
 
 	*covered_target = false;
 	for (unsigned i = 0; i < count; i++) {
@@ -1012,10 +1097,12 @@ cr_r4_operation_projection_safe(const CrR4OperationContext *operation, char page
 
 		overlap |= (operation->kept_offsets[bit / 8] & (1U << (bit % 8))) != 0;
 	}
-	if (overlap && !keep) {
-		if (!cr_r4_operation_covers_target(operation, record, tag, offsets, count))
+	if (overlap) {
+		covered_creation = cr_r4_operation_covers_creation(operation, record, tag);
+		if (!keep && !covered_creation
+			&& !cr_r4_operation_covers_target(operation, record, tag, offsets, count))
 			return false;
-		*covered_target = true;
+		*covered_target = !keep || covered_creation;
 	}
 	for (unsigned i = 0; i < count; i++) {
 		ItemId item;
@@ -1023,7 +1110,7 @@ cr_r4_operation_projection_safe(const CrR4OperationContext *operation, char page
 
 		if (offsets[i] > PageGetMaxOffsetNumber(page)
 			|| !ItemIdIsNormal(PageGetItemId(page, offsets[i]))) {
-			if (overlap)
+			if (overlap && !covered_creation)
 				return false;
 			continue;
 		}
@@ -1098,7 +1185,8 @@ cr_r4_operation_project(CrR4OperationContext *operation, ClusterR4CrSlotExtensio
 													   &operation->identity))
 		return false;
 	if (keep) {
-		if (!cluster_semantic_activation_recheck(&operation->admission))
+		if (!cluster_semantic_activation_recheck(&operation->admission)
+			|| !cr_r4_operation_remember_creation(operation, record))
 			return false;
 		if ((operation->kept_slots & (1U << locator->itl_slot_index)) == 0)
 			ClusterPageGetItlSlots((Page)operation->result_page)[locator->itl_slot_index] = after;

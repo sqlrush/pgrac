@@ -7605,7 +7605,7 @@ UT_TEST(test_retained_slot_identity_does_not_escape_original_final_fences)
 int
 main(void)
 {
-	UT_PLAN(329);
+	UT_PLAN(335);
 	UT_RUN(test_operation_worker_real_builder_yields_before_visibility);
 	UT_RUN(test_operation_worker_real_origin_completes_private_inverse);
 	UT_RUN(test_operation_worker_pending_current_is_bounded_and_counts_once);
@@ -7660,6 +7660,12 @@ main(void)
 	UT_RUN(test_operation_worker_mixed_top_exact_identity_refusals);
 	UT_RUN(test_operation_worker_mixed_top_cohort_has_private_observations);
 	UT_RUN(test_operation_worker_malformed_transaction_prev_preserves_output);
+	UT_RUN(test_operation_worker_kept_insert_covers_discarded_reused_creation);
+	UT_RUN(test_operation_worker_kept_insert_covers_visible_reused_creation);
+	UT_RUN(test_operation_worker_unkept_reused_creation_needs_no_witness);
+	UT_RUN(test_operation_worker_reused_creation_witness_mismatch_refuses);
+	UT_RUN(test_operation_worker_reused_creation_never_bypasses_unknown_top);
+	UT_RUN(test_operation_worker_reused_creation_cohort_has_private_witnesses);
 
 	UT_RUN(test_operation_poll_does_not_complete_inline);
 	UT_RUN(test_operation_poll_stages_outputs);
