@@ -29,6 +29,7 @@ static bool prefix_error, prefix_wait, prefix_unchanged, prefix_bad_physical, pr
 static bool prefix_legacy_synced;
 static unsigned prefix_durable_steps;
 static void (*prefix_callback)(void);
+static ClusterRecoveryStampHandleV1 prefix_window;
 
 static void
 page_prefix_fixture_reset(void)
@@ -38,6 +39,7 @@ page_prefix_fixture_reset(void)
  prefix_error = prefix_wait = prefix_unchanged = prefix_bad_physical = prefix_insert_refuse = false;
  prefix_legacy_synced = false; prefix_durable_steps = 0;
  prefix_callback = NULL;
+ memset(&prefix_window, 0, sizeof(prefix_window));
  memset(prefix_targets, 0, sizeof(prefix_targets));
  memset(prefix_graph, 0, sizeof(prefix_graph));
  memset(prefix_contributors, 0, sizeof(prefix_contributors));
@@ -100,6 +102,50 @@ rf_page_authority_ctrc_replays_destroy_v1(RfPageCtrcAuthorityV1 **authority)
  if (authority && *authority) { UT_ASSERT(*authority == (RfPageCtrcAuthorityV1 *)&prefix_page_token); *authority = NULL; prefix_destroyed++; }
 }
 
+/* The native PAGE/WAL leaf is controlled here. Publish its descriptor through
+ * the original F4 codec/state machine so Start-current and handoff exercise
+ * the real shared window, not a replacement currentness predicate. This
+ * private publication does not exercise the native PAGE admission factory. */
+static void
+prefix_publish_window(const struct ClusterRecoveryStartV1 *start,
+ const ClusterRecoveryCtrcReplaySetSourceV1 *source,
+ const ClusterSpaceIdentity *space, BlockNumber block,
+ const RfPageVersionV1 *before, RfPageCtrcFpiInsertV1 *out)
+{
+ ClusterRecoveryStampOwnerV1 owner = {0};
+ ClusterRecoveryStampFpiV1 fpi = {0};
+ bool inserted;
+
+ owner.writer = start->writer; owner.target = source->generation.source.claim;
+ owner.executor_boot = start->owner_boot; owner.executor_pid = start->pid;
+ owner.recovery_serial = start->serial;
+ fpi.locator = space->key.locator;
+ fpi.image.owner = GENERIC_XLOG_CTRC_ITL;
+ fpi.image.fork_number = MAIN_FORKNUM; fpi.image.block_number = block;
+ fpi.image.result_token = before->mutation_token + 1;
+ fpi.image.version.page_class = RF_PAGE_CLASS_ORDINARY;
+ fpi.image.version.before_kind = fpi.image.version.result_kind = RF_PAGE_STATE_PRESENT;
+ fpi.image.version.before = *before;
+ memcpy(fpi.image.version.result_incarnation, before->segment_incarnation, 16);
+ memset(fpi.image.after_sha256, 9, sizeof(fpi.image.after_sha256));
+ UT_ASSERT(cluster_space_identity_encode(space, fpi.image.space_identity,
+  sizeof(fpi.image.space_identity)));
+ fpi.protection.source_binding_cookie = 1; fpi.protection.protection_fingerprint = 1;
+ UT_ASSERT(stamp_owner_valid(&owner));
+ UT_ASSERT(stamp_fpi_image_matches(&owner, &fpi));
+ UT_ASSERT(stamp_prepare(&owner, CLUSTER_RECOVERY_STAMP_FPI,
+  (const uint8 *)&fpi, sizeof(fpi), &out->window));
+ out->record_start = owner.writer.startup_first_lsn + 40000;
+ out->record_end = out->record_start + 128;
+ CritSectionCount++;
+ inserted = cluster_recovery_stamp_inserting_v1(&out->window)
+  && cluster_recovery_stamp_inserted_v1(&out->window, out->record_start, out->record_end);
+ CritSectionCount--;
+ UT_ASSERT(inserted);
+ out->wal_flushed = true;
+ prefix_window = out->window;
+}
+
 /* The actual native graph step has separate protected file/Generic/F4 tests. */
 RfPageCtrcStepResultV1
 rf_page_recovery_ctrc_replays_itl_graph_step_smgr_v1(const struct ClusterRecoveryStartV1 *start,
@@ -120,9 +166,8 @@ rf_page_recovery_ctrc_replays_itl_graph_step_smgr_v1(const struct ClusterRecover
  if (prefix_wait && prefix_steps == 1) { ctrc_driver_waiting = true; result.phase = RF_PAGE_CTRC_STEP_WAIT; return result; }
  if (prefix_unchanged) { result.phase = RF_PAGE_CTRC_STEP_UNCHANGED; return result; }
  result.phase = prefix_insert_refuse ? RF_PAGE_CTRC_STEP_REFUSED : RF_PAGE_CTRC_STEP_TARGET_SYNCED;
- result.inserted.window.key.window_seq = 311;
- result.inserted.record_start = 40000; result.inserted.record_end = 40128;
- result.inserted.wal_flushed = true;
+ prefix_publish_window(start, source, space, block, before, &result.inserted);
+ if (prefix_insert_refuse) UT_ASSERT(cluster_recovery_stamp_fail_v1(&result.inserted.window));
  return result;
 }
 
@@ -138,8 +183,10 @@ rf_page_recovery_ctrc_replays_itl_graph_durable_smgr_v1(const struct ClusterReco
  RfPageCtrcStepResultV1 result = rf_page_recovery_ctrc_replays_itl_graph_step_smgr_v1(
   start, work, source, authority, space, block, before, canonical, physical, count, budget);
  prefix_durable_steps++;
- if (result.phase == RF_PAGE_CTRC_STEP_TARGET_SYNCED && !prefix_legacy_synced)
+ if (result.phase == RF_PAGE_CTRC_STEP_TARGET_SYNCED && !prefix_legacy_synced) {
+  UT_ASSERT(cluster_recovery_stamp_durable_v1(&result.inserted.window));
   result.phase = RF_PAGE_CTRC_STEP_FPI_DURABLE;
+ }
  return result;
 }
 
@@ -226,7 +273,7 @@ UT_TEST(test_startup_page_prefix_repeat_retains_exact_pending_result)
  UT_ASSERT(ClusterColdRecoveryCtrcPageAdvance(info.cluster_tx_start, 1024 * 1024));
  UT_ASSERT(cluster_recovery_cold_start->ctrc_page_progress->pending);
  saved = cluster_recovery_cold_start->ctrc_page_progress->result;
- UT_ASSERT_EQ(saved.inserted.window.key.window_seq, 311);
+ UT_ASSERT_EQ(saved.inserted.window.key.window_seq, prefix_window.key.window_seq);
  UT_ASSERT(ClusterColdRecoveryCtrcPageAdvance(info.cluster_tx_start, 0));
  UT_ASSERT_EQ(prefix_steps, 1); UT_ASSERT_EQ(prefix_destroyed, 2);
  UT_ASSERT_EQ(cluster_recovery_cold_start->ctrc_page_progress->next_target, 0);
@@ -325,7 +372,8 @@ UT_TEST(test_startup_page_prefix_inserted_refusal_retains_original_debt)
  UT_ASSERT(!ClusterColdRecoveryCtrcPageAdvance(info.cluster_tx_start, 1024 * 1024));
  UT_ASSERT_EQ(prefix_steps, 1); UT_ASSERT_EQ(prefix_destroyed, 2);
  UT_ASSERT(cluster_recovery_cold_start->ctrc_page_progress->pending);
- UT_ASSERT_EQ(cluster_recovery_cold_start->ctrc_page_progress->result.inserted.window.key.window_seq, 311);
+ UT_ASSERT_EQ(cluster_recovery_cold_start->ctrc_page_progress->result.inserted.window.key.window_seq,
+  prefix_window.key.window_seq);
  UT_ASSERT(!ClusterColdRecoveryTxCurrent(info.cluster_tx_start));
  UT_ASSERT(!ClusterColdRecoveryCtrcPageAdvance(info.cluster_tx_start, 0));
  UT_ASSERT_EQ(prefix_steps, 1); UT_ASSERT_EQ(window_region.checkpoint_owner.ctrc_accepted_generation, 0);
