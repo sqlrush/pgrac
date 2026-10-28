@@ -68,6 +68,7 @@
 #include "commands/schemacmds.h"
 #include "commands/seclabel.h"
 #include "commands/user.h"
+#include "commands/view.h"
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_tt_local.h"
 #include "commands/tablecmds.h"
@@ -77,6 +78,7 @@
 #include "miscadmin.h"
 #include "nodes/value.h"
 #include "parser/parse_node.h"
+#include "parser/analyze.h"
 #include "parser/parse_oper.h"
 #include "parser/parse_type.h"
 #include "port/pg_crc32c.h"
@@ -11420,10 +11422,235 @@ UT_TEST(test_native_database_settings_utility_warm_guards_preserve_binding)
 	database_settings_lookup_active = false;
 }
 
+/* Actual view prefix stops before parse analysis can query or lock sources.
+ * Query semantics, permissions, options and rewrite remain beyond this boundary. */
+static bool view_lookup_active, view_expect_binding;
+static unsigned view_lookups, view_unbound, view_bad_lookup;
+static const char *view_source_text;
+static int view_location, view_length;
+static SelectStmt view_select;
+static A_Const view_constant;
+static ResTarget view_target;
+static ListCell view_target_cell;
+static List view_targets;
+static RangeVar view_relation;
+static String view_alias;
+static ListCell view_alias_cell, view_option_cell;
+static List view_aliases, view_options;
+static Boolean view_option_value;
+static DefElem view_option;
+static ViewStmt native_view_statement;
+static Node *view_expected_statement;
+
+Query *
+parse_analyze_fixedparams(RawStmt *parseTree, const char *sourceText, const Oid *paramTypes,
+						  int numParams, QueryEnvironment *queryEnv)
+{
+	view_lookups++;
+	if (view_expect_binding && utility_binds == 0)
+		view_unbound++;
+	if (!view_lookup_active || !parseTree || !IsA(parseTree, RawStmt)
+		|| parseTree->stmt != native_view_statement.query
+		|| parseTree->stmt_location != view_location || parseTree->stmt_len != view_length
+		|| sourceText != view_source_text || paramTypes != NULL || numParams != 0
+		|| queryEnv != NULL)
+		view_bad_lookup++;
+	pfree(parseTree);		 /* Only this native prefix's RawStmt; its query is borrowed. */
+	siglongjmp(boundary, 2); /* Stop before real parse analysis or source locks. */
+}
+
+#include "test_cluster_fresh_view.inc"
+
+static void
+reset_native_view(bool expect_binding, unsigned form)
+{
+	static const char *sources[]
+		= { "CREATE VIEW target_view AS SELECT 1", "CREATE OR REPLACE VIEW target_view AS SELECT 1",
+			"CREATE VIEW target_view AS SELECT 1 WITH LOCAL CHECK OPTION",
+			"CREATE VIEW target_view(result) WITH (security_barrier=true) AS SELECT 1 WITH "
+			"CASCADED CHECK OPTION" };
+
+	reset_create_preflight();
+	view_lookup_active = true;
+	view_expect_binding = expect_binding;
+	view_lookups = view_unbound = view_bad_lookup = 0;
+	view_source_text = sources[form];
+	view_location = form % 2 ? 0 : -1;
+	view_length = form % 2 ? (int)strlen(view_source_text) : 0;
+	view_constant = (A_Const){ .type = T_A_Const, .location = -1 };
+	view_constant.val.ival = (Integer){ .type = T_Integer, .ival = 1 };
+	view_target = (ResTarget){ .type = T_ResTarget, .val = (Node *)&view_constant, .location = -1 };
+	view_target_cell.ptr_value = &view_target;
+	view_targets
+		= (List){ .type = T_List, .length = 1, .max_length = 1, .elements = &view_target_cell };
+	view_select = (SelectStmt){ .type = T_SelectStmt, .targetList = &view_targets };
+	view_relation = (RangeVar){ .type = T_RangeVar,
+								.relname = "target_view",
+								.relpersistence = RELPERSISTENCE_PERMANENT };
+	view_alias = (String){ .type = T_String, .sval = "result" };
+	view_alias_cell.ptr_value = &view_alias;
+	view_aliases
+		= (List){ .type = T_List, .length = 1, .max_length = 1, .elements = &view_alias_cell };
+	view_option_value = (Boolean){ .type = T_Boolean, .boolval = true };
+	view_option = (DefElem){ .type = T_DefElem,
+							 .defname = "security_barrier",
+							 .arg = (Node *)&view_option_value };
+	view_option_cell.ptr_value = &view_option;
+	view_options
+		= (List){ .type = T_List, .length = 1, .max_length = 1, .elements = &view_option_cell };
+	native_view_statement = (ViewStmt){ .type = T_ViewStmt,
+										.view = &view_relation,
+										.query = (Node *)&view_select,
+										.replace = form == 1,
+										.aliases = form == 3 ? &view_aliases : NIL,
+										.options = form == 3 ? &view_options : NIL,
+										.withCheckOption = form < 2	   ? NO_CHECK_OPTION
+														   : form == 2 ? LOCAL_CHECK_OPTION
+																	   : CASCADED_CHECK_OPTION };
+	view_expected_statement = (Node *)&native_view_statement;
+}
+
+static void
+native_view_entry(void)
+{
+	(void)DefineView(&native_view_statement, view_source_text, view_location, view_length);
+}
+
+UT_TEST(test_native_view_binds_before_first_query_in_all_profiles)
+{
+	for (unsigned form = 0; form < 4; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_view(binds, form);
+			set_native_operator_mode(mode);
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_view_entry();
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(view_lookups, repeat + 1);
+				UT_ASSERT_EQ(view_unbound, 0);
+				UT_ASSERT_EQ(view_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	view_lookup_active = false;
+}
+
+UT_TEST(test_native_view_refuses_before_lookup_on_publication_child_and_top_errors)
+{
+	for (unsigned form = 0; form < 4; form++) {
+		for (unsigned failure = 0; failure < 5; failure++) {
+			bool allocated = failure == 0 || failure == 2;
+			int caught;
+
+			reset_native_view(true, form);
+			if (failure == 0)
+				utility_bind_ok = false;
+			else if (failure == 1 || failure == 2) {
+				if (failure == 2)
+					create_sql_entry(view_expected_statement);
+				utility_in_child = true;
+			} else {
+				utility_current_xid = 401;
+				utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_view_entry();
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, failure == 0  ? ERRCODE_DATA_CORRUPTED
+									 : failure < 3 ? ERRCODE_FEATURE_NOT_SUPPORTED
+												   : ERRCODE_INTERNAL_ERROR);
+			UT_ASSERT_STR_EQ(
+				error_message,
+				failure == 0  ? "canonical ACTIVE publication failed before shared catalog creation"
+				: failure < 3 ? "shared catalog creation does not support subtransactions"
+							  : "shared catalog top-level transaction identity mismatch");
+			UT_ASSERT_EQ(view_lookups, 0);
+			UT_ASSERT_EQ(view_unbound + view_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_xids, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, failure == 2 ? 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, allocated || failure == 3 ? 400 : InvalidTransactionId);
+		}
+	}
+	view_lookup_active = false;
+}
+
+UT_TEST(test_native_view_context_guards_keep_nonshared_route)
+{
+	for (unsigned form = 0; form < 4; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+
+			for (unsigned guard = 0; guard < 3; guard++) {
+				int caught;
+
+				reset_native_view(binds, form);
+				set_native_operator_mode(mode);
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_view_entry();
+				UT_ASSERT_EQ(caught, binds ? 1 : 2);
+				UT_ASSERT_EQ(error_code, !binds		  ? 0
+										 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+													  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				UT_ASSERT_EQ(view_lookups, binds ? 0 : 1);
+				UT_ASSERT_EQ(view_unbound + view_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	view_lookup_active = false;
+}
+
+UT_TEST(test_native_view_utility_warm_guards_preserve_binding)
+{
+	for (unsigned form = 0; form < 4; form++) {
+		for (unsigned guard = 0; guard < 4; guard++) {
+			int caught;
+
+			reset_native_view(true, form);
+			create_sql_entry(view_expected_statement);
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			XactReadOnly = guard == 1;
+			utility_parallel = guard == 2;
+			utility_recovery = guard == 3;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_view_entry();
+			UT_ASSERT_EQ(caught, guard ? 1 : 2);
+			UT_ASSERT_EQ(error_code, !guard		  ? 0
+									 : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+												  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT_EQ(view_lookups, guard ? 0 : 1);
+			UT_ASSERT_EQ(view_unbound + view_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_prepares, guard ? 1 : 2);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			UT_ASSERT_EQ(utility_top_xid, 400);
+		}
+	}
+	view_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(169);
+	UT_PLAN(173);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -11593,6 +11820,10 @@ main(void)
 	UT_RUN(test_native_database_settings_refuses_before_lookup_on_publication_child_and_top_errors);
 	UT_RUN(test_native_database_settings_context_guards_keep_nonshared_route);
 	UT_RUN(test_native_database_settings_utility_warm_guards_preserve_binding);
+	UT_RUN(test_native_view_binds_before_first_query_in_all_profiles);
+	UT_RUN(test_native_view_refuses_before_lookup_on_publication_child_and_top_errors);
+	UT_RUN(test_native_view_context_guards_keep_nonshared_route);
+	UT_RUN(test_native_view_utility_warm_guards_preserve_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

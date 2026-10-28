@@ -1168,6 +1168,13 @@ test_cluster_fresh_database_settings.inc: $(top_srcdir)/src/backend/commands/dbc
 	     /^}/ { emit=0 } \
 	     END { if (helpers > 1 || entries != 2 || cuts != 2 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
+test_cluster_fresh_view.inc: $(top_srcdir)/src/backend/commands/view.c Makefile
+	awk '/^DefineView\(/ { print "ObjectAddress"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /viewParse = parse_analyze_fixedparams\(rawstmt, queryString, NULL, 0, NULL\);/ \
+	     { print "return InvalidObjectAddress; }"; emit=0; cuts++ } \
+	     END { if (entries != 1 || cuts != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
 test_cluster_fresh_scope: test_cluster_fresh_scope.c unit_test.h \
 		test_cluster_fresh_control.inc test_cluster_fresh_startup.inc test_cluster_fresh_read.inc \
 		test_cluster_fresh_boolean.inc test_cluster_fresh_index.inc test_cluster_fresh_utility.inc \
@@ -1181,7 +1188,8 @@ test_cluster_fresh_scope: test_cluster_fresh_scope.c unit_test.h \
 		test_cluster_fresh_foreign_server.inc test_cluster_fresh_user_mapping.inc \
 		test_cluster_fresh_statistics_alter.inc test_cluster_fresh_operator.inc \
 		test_cluster_fresh_opclass.inc test_cluster_fresh_aggregate.inc test_cluster_fresh_tsearch.inc \
-		test_cluster_fresh_publication.inc test_cluster_fresh_database_settings.inc
+		test_cluster_fresh_publication.inc test_cluster_fresh_database_settings.inc \
+		test_cluster_fresh_view.inc
 	$(CC) $(CFLAGS) -Wno-unused-variable -Wno-unused-but-set-variable $(CPPFLAGS) $< \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 # PGRAC: link the real durable-prefix codec/reader, not a test copy.
@@ -6495,7 +6503,8 @@ clean distclean maintainer-clean:
 		test_cluster_fresh_foreign_server.inc test_cluster_fresh_user_mapping.inc \
 		test_cluster_fresh_statistics_alter.inc test_cluster_fresh_operator.inc \
 		test_cluster_fresh_opclass.inc test_cluster_fresh_aggregate.inc test_cluster_fresh_tsearch.inc \
-		test_cluster_fresh_publication.inc test_cluster_fresh_database_settings.inc
+		test_cluster_fresh_publication.inc test_cluster_fresh_database_settings.inc \
+		test_cluster_fresh_view.inc
 	rm -f $(TESTS) pgrac_fenced_live_rejoin_client probe_pgrac_fenced_cib \
 		test_cluster_tt_locator_stats.inc \
 		test_cluster_heap_inplace_version.inc test_cluster_heap_inplace_legacy_version.inc \
