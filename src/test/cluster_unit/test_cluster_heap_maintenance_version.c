@@ -12128,6 +12128,7 @@ static bool phase_finally_owned_writer;
 static bool phase_mixed_proof_subset;
 static uint8 phase_unknown_proof_mask;
 static unsigned phase_foreign_checks, phase_foreign_refuse_at, phase_foreign_error_at;
+static unsigned phase_foreign_target_checks, phase_foreign_target_refuse_at;
 
 /* Actual runtime current checks are covered in outcome tests; this collector
  * fixture controls source retirement and asserts that no page lock is held. */
@@ -12144,6 +12145,30 @@ cluster_runtime_visibility_foreign_companion_current_admitted(
 		&& !resolution->local_canonical_valid && ClusterR4TxCompanionIsValid(resolution);
 }
 
+
+bool
+cluster_runtime_visibility_foreign_companion_target_current_admitted(
+	const ClusterTxResolution *resolution, const ClusterCtrcItlTargetIdentity *target,
+	const ClusterSemanticAdmissionToken *token)
+{
+	const ClusterHeapFreezePageBatchV1 *page = &phase_source->page;
+	const ClusterHeapFreezeCarrierRequestV1 *request = &page->carrier_requests[0];
+	UT_ASSERT(target != NULL);
+	UT_ASSERT_EQ(target->spc_oid, page->identity.key.locator.spcOid);
+	UT_ASSERT_EQ(target->db_oid, page->identity.key.locator.dbOid);
+	UT_ASSERT_EQ(target->rel_number, page->identity.key.locator.relNumber);
+	UT_ASSERT_EQ(target->fork_number, MAIN_FORKNUM);
+	UT_ASSERT_EQ(target->block_number, page->block);
+	UT_ASSERT_EQ(target->itl_xid, request->carrier.xid);
+	UT_ASSERT_EQ(target->itl_slot_index, request->locator.itl_slot_index);
+	UT_ASSERT_EQ(target->itl_slot_wrap, request->carrier.wrap);
+	UT_ASSERT_EQ(target->itl_class, request->carrier.flags);
+	UT_ASSERT(target->needs_wal && target->reserved8[0] == 0 && target->reserved8[1] == 0);
+	UT_ASSERT_EQ(memcmp(target->uba, &request->carrier.undo_segment_head, sizeof(target->uba)), 0);
+	phase_foreign_target_checks++;
+	return cluster_runtime_visibility_foreign_companion_current_admitted(resolution, token)
+		&& phase_foreign_target_refuse_at != phase_foreign_target_checks;
+}
 
 static void
 phase_preflight(void)
@@ -12265,6 +12290,7 @@ phase_setup(QualifiedXminFixture *f, LVRelState *v,
 	bounds_lifecycle_setup(f, v, targets, batch);
 	phase_source = f; phase_preflights = phase_resolves = phase_rechecks = 0;
 	phase_foreign_checks = phase_foreign_refuse_at = phase_foreign_error_at = 0;
+	phase_foreign_target_checks = phase_foreign_target_refuse_at = 0;
 	phase_error_stage = phase_finally_calls = phase_finally_debt = phase_finally_pins = 0;
 	phase_finally_owned_writer = false;
 	v->shared_freeze_batch = f->page;
@@ -16632,10 +16658,37 @@ UT_TEST(test_actual_collector_foreign_retention_refusal_retires_only_candidate)
 	}
 }
 
+UT_TEST(test_actual_collector_requires_its_own_foreign_page_receipt_twice)
+{
+	for (unsigned refuse_at = 0; refuse_at <= 2; refuse_at++) {
+		QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+		bool rows = false;
+		phase_setup(&f, &v, targets, false); foreign_creation_project(&f);
+		v.shared_freeze_input = f.input; v.shared_freeze_batch = f.page;
+		phase_use_original_resident = true; phase_foreign_target_refuse_at = refuse_at;
+		phase_resident_completed = false; phase_resident_expected_resumes = 0;
+		phase_resident_hint_error = false; phase_resident_hint_calls = 0;
+		memset(phase_resident_releases, 0, sizeof(phase_resident_releases));
+		v.rel = &relation_data; v.identity = space_identity;
+		v.shared_freeze_input.writer_context_valid = false;
+		relation_data.rd_isvalid = resume_allowed = true;
+		UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs_admitted(&v, 1, &f.authority,
+			f.fence.master_sequence, &f.admission, &rows), refuse_at == 0
+			? CLUSTER_HEAP_FREEZE_PROOF_PROVEN : CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+		UT_ASSERT_EQ(rows, refuse_at == 0);
+		UT_ASSERT_EQ(phase_foreign_target_checks, refuse_at == 1 ? 1 : 2);
+		UT_ASSERT_EQ(v.shared_freeze_xmin_candidates.target_count, refuse_at == 0 ? 1 : 0);
+		UT_ASSERT_EQ(hints + inserts + edges + dirties + flushes, 0);
+		UT_ASSERT_EQ(memcmp(current_page.data, before_page.data, BLCKSZ), 0);
+		UT_ASSERT_EQ(backend_pin_count, 1); UT_ASSERT(!local_x && f.admission.entered);
+		bounds_original_census_leave(&f.admission); bounds_lifecycle_assert_empty(&f.admission);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(352);
+	UT_PLAN(353);
 
 	UT_RUN(test_pin_free_admitted_phase_reaches_recent_native_wal_before_owner_leave);
 	UT_RUN(test_pin_free_phase_recent_refusal_retires_only_its_original_owner);
@@ -16999,6 +17052,7 @@ main(void)
 	UT_RUN(test_foreign_candidate_never_enters_unqualified_native_writer);
 	UT_RUN(test_actual_collector_binds_current_foreign_creation_without_hint_or_wal);
 	UT_RUN(test_actual_collector_foreign_retention_refusal_retires_only_candidate);
+	UT_RUN(test_actual_collector_requires_its_own_foreign_page_receipt_twice);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

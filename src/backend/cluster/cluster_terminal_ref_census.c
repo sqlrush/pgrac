@@ -7290,10 +7290,11 @@ cluster_ctrc_participant_delegate_prepare_v1(const ClusterCtrcTxnKeyV1 *key,
 	return prepared;
 }
 
-bool
-cluster_ctrc_itl_original_full_xid_matches_shared(
+static bool
+ctrc_itl_original_full_xid_matches_shared(
 	const ClusterCtrcTxnKeyV1 *key, FullTransactionId original,
-	const ClusterTxLocator *locator, const ClusterCtrcParticipantIdentity *receiver)
+	const ClusterTxLocator *locator, const ClusterCtrcParticipantIdentity *receiver,
+	const ClusterCtrcItlTargetIdentity *expected_target)
 {
 	const ClusterCtrcParticipantEntry *participant;
 	const ClusterCtrcParticipantIdentity *original_receiver;
@@ -7344,8 +7345,9 @@ cluster_ctrc_itl_original_full_xid_matches_shared(
 		goto done;
 
 	/* The complete chain is bounded and validated before accepting a hit.
-	 * Several pages may retain this same DATA locator; none is selected as
-	 * page authority here. Do not confuse ITL wrap with canonical TT wrap. */
+	 * Identity-only callers may match several pages sharing this DATA locator.
+	 * Page consumers additionally require their own exact target. Neither
+	 * mode acquires page authority. ITL wrap is not canonical TT wrap. */
 	for (cursor = ctrc_participant_receipt_heads()[index]; cursor != 0;
 		 cursor = ctrc_receipt_links()[cursor - 1].next_plus_one) {
 		const ClusterCtrcReceipt *receipt = &ctrc_receipt_entries()[cursor - 1];
@@ -7369,13 +7371,33 @@ cluster_ctrc_itl_original_full_xid_matches_shared(
 			&& ctrc_target_exact_itl_valid(key, target)
 			&& (publication->reference_kind != CTRC_REF_IMAGE_ITL_V1 || ctrc_image_target_domain_valid(target))
 			&& target->itl_slot_index == locator->itl_slot_index && target->itl_class == locator->itl_kind
-			&& memcmp(target->uba, &locator->uba, sizeof(target->uba)) == 0)
+			&& memcmp(target->uba, &locator->uba, sizeof(target->uba)) == 0
+			&& (expected_target == NULL
+				|| cluster_ctrc_itl_target_identity_matches(target, expected_target)))
 			matched = true;
 	}
 done:
 	LWLockRelease(&CtrcShared->receipt_lock);
 	ctrc_participant_locks_release(lock_mask);
 	return matched;
+}
+
+bool
+cluster_ctrc_itl_original_full_xid_matches_shared(
+	const ClusterCtrcTxnKeyV1 *key, FullTransactionId original,
+	const ClusterTxLocator *locator, const ClusterCtrcParticipantIdentity *receiver)
+{
+	return ctrc_itl_original_full_xid_matches_shared(key, original, locator, receiver, NULL);
+}
+
+bool
+cluster_ctrc_itl_original_full_xid_target_matches_shared(
+	const ClusterCtrcTxnKeyV1 *key, FullTransactionId original,
+	const ClusterTxLocator *locator, const ClusterCtrcParticipantIdentity *receiver,
+	const ClusterCtrcItlTargetIdentity *target)
+{
+	return target != NULL
+		&& ctrc_itl_original_full_xid_matches_shared(key, original, locator, receiver, target);
 }
 
 static bool

@@ -1145,6 +1145,12 @@ extern bool cluster_ctrc_origin_fullxid_match_v2(const uint8 *bytes, Size length
 extern bool cluster_ctrc_itl_original_full_xid_matches_shared(
 	const ClusterCtrcTxnKeyV1 *key, FullTransactionId original,
 	const ClusterTxLocator *locator, const ClusterCtrcParticipantIdentity *receiver);
+/* Same retained identity, additionally bound to this exact captured page/ITL.
+ * Read-only observation only: no page lock, owner or lifetime is acquired. */
+extern bool cluster_ctrc_itl_original_full_xid_target_matches_shared(
+	const ClusterCtrcTxnKeyV1 *key, FullTransactionId original,
+	const ClusterTxLocator *locator, const ClusterCtrcParticipantIdentity *receiver,
+	const ClusterCtrcItlTargetIdentity *target);
 /* New receivers only; an old raw-only participant is never backfilled.
  * Local producers recheck the envelope's FullXid under origin_lock and retain
  * that lock through receiver publication; foreign producers use the original

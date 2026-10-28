@@ -213,7 +213,7 @@ SCAN_RULES: Tuple[ScanRule, ...] = (
             "src/backend/cluster/cluster_tt_slot.c",
             "src/backend/cluster/cluster_tt_durable.c",
         ),
-        r"\b(?:cluster_ctrc_origin_original_full_xid_(?:exact|shared)|cluster_ctrc_itl_original_full_xid_matches_shared|cluster_ctrc_origin_fullxid_(?:capture_v2|match_v2)|cluster_ctrc_origin_grant_fullxid_v2|cluster_ctrc_itl_delegate_(?:prepare|accept)_v[12]|ctrc_itl_delegate_(?:prepare|accept)|gcs_block_resource_x_ctrc_receive_image|ctrc_origin_fullxid_encode_v2|cluster_multixact_current_member_proof_bind_origin_v2|cluster_tt_slot_origin_identity_(?:retain|read))\s*\(",
+        r"\b(?:cluster_ctrc_origin_original_full_xid_(?:exact|shared)|cluster_ctrc_itl_original_full_xid_(?:target_)?matches_shared|cluster_ctrc_origin_fullxid_(?:capture_v2|match_v2)|cluster_ctrc_origin_grant_fullxid_v2|cluster_ctrc_itl_delegate_(?:prepare|accept)_v[12]|ctrc_itl_delegate_(?:prepare|accept)|gcs_block_resource_x_ctrc_receive_image|ctrc_origin_fullxid_encode_v2|cluster_multixact_current_member_proof_bind_origin_v2|cluster_tt_slot_origin_identity_(?:retain|read))\s*\(",
     ),
     ScanRule(
         "CTRC_RECEIPT_LIFECYCLE",
@@ -710,7 +710,9 @@ _classify_owners(
 # Read-only retention lookups issue no successor and retire no responsibility.
 for path, owners in (
     ("src/backend/cluster/cluster_terminal_ref_census.c",
-     ("cluster_ctrc_itl_original_full_xid_matches_shared",)),
+     ("ctrc_itl_original_full_xid_matches_shared",
+      "cluster_ctrc_itl_original_full_xid_matches_shared",
+      "cluster_ctrc_itl_original_full_xid_target_matches_shared",)),
     ("src/backend/cluster/cluster_runtime_visibility.c",
      ("cluster_runtime_visibility_foreign_companion_retained",)),
 ):

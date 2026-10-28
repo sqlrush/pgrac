@@ -565,6 +565,9 @@ cluster_membership_get_last_admitted_incarnation(int32 node_id)
 		: node_id == 0 ? test_receiver_peer_boot : node_id == 1 ? test_receiver_self_admitted : 0;
 }
 
+static ClusterCtrcItlTargetIdentity test_receiver_target;
+static unsigned test_receiver_target_checks;
+
 /* The shared owner is exercised in test_cluster_ctrc_cleaner. This boundary
  * is an explicitly installed exact receiver record, never codec success. */
 bool
@@ -595,6 +598,17 @@ cluster_ctrc_itl_original_full_xid_matches_shared(
 	case 9: test_receiver_self_admitted++; break;
 	}
 	return matched;
+}
+
+bool
+cluster_ctrc_itl_original_full_xid_target_matches_shared(
+	const ClusterCtrcTxnKeyV1 *key, FullTransactionId original,
+	const ClusterTxLocator *locator, const ClusterCtrcParticipantIdentity *receiver,
+	const ClusterCtrcItlTargetIdentity *target)
+{
+	test_receiver_target_checks++;
+	return target != NULL && memcmp(target, &test_receiver_target, sizeof(*target)) == 0
+		&& cluster_ctrc_itl_original_full_xid_matches_shared(key, original, locator, receiver);
 }
 
 ClusterSemanticAdmissionResult
@@ -7693,10 +7707,50 @@ UT_TEST(test_foreign_current_observation_uses_original_entered_receiver_retentio
 	}
 }
 
+UT_TEST(test_foreign_target_current_preserves_source_and_admission_checks)
+{
+	int saved_node = cluster_node_id;
+	for (unsigned fault = 0; fault <= 5; fault++) {
+		ClusterTxResolution origin, received, before;
+		ClusterCtrcItlTargetIdentity target;
+		ClusterSemanticAdmissionToken admission = {
+			.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+			.record_generation = 5, .formation_epoch = 42,
+			.side = CLUSTER_SEMANTIC_TARGET_SIDE, .entered = true};
+		setup_original_full_xid(false);
+		UT_ASSERT_EQ(resolve_original_full_xid(CLUSTER_TX_RESOLVE_TERMINAL_CENSUS,
+			&origin), CLUSTER_TX_COMMITTED);
+		test_receiver_registered = true; test_receiver_retained = origin;
+		test_receiver_peer_boot = origin.origin_companion.key.origin_boot_incarnation;
+		test_receiver_peer_generation = 3;
+		test_receiver_peer_epoch = origin.origin_companion.key.formation_epoch;
+		test_receiver_self_admitted = test_boot_incarnation;
+		received = origin;
+		memset(&received.local_canonical, 0, sizeof(received.local_canonical));
+		received.local_canonical_generation = 0; received.local_canonical_valid = false;
+		received.local_original_full_xid = InvalidFullTransactionId;
+		memset(&received.local_creation_target, 0, sizeof(received.local_creation_target));
+		memset(&test_receiver_target, 0, sizeof(test_receiver_target));
+		test_receiver_target.rel_number = 123; test_receiver_target.block_number = 7;
+		target = test_receiver_target;
+		if (fault == 2) target.block_number++;
+		if (fault == 3) test_receiver_drift = 8;
+		if (fault == 4) test_receiver_peer_boot++;
+		if (fault == 5) admission.entered = false;
+		test_receiver_target_checks = 0; before = received; cluster_node_id = 1;
+		UT_ASSERT_EQ(cluster_runtime_visibility_foreign_companion_target_current_admitted(
+			&received, fault == 1 ? NULL : &target, &admission), fault == 0);
+		cluster_node_id = saved_node;
+		if (fault == 0 || fault == 2 || fault == 3) UT_ASSERT_EQ(test_receiver_target_checks, 1);
+		UT_ASSERT_EQ(memcmp(&received, &before, sizeof(before)), 0);
+		UT_ASSERT_EQ(test_remote_origin_calls, 0); UT_ASSERT_EQ(test_candidate_held_count, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(211);
+	UT_PLAN(212);
 	UT_RUN(test_original_full_xid_reaches_same_and_cross_segment_census_result);
 	UT_RUN(test_original_full_xid_missing_or_key_alias_keeps_verdict_without_identity);
 	UT_RUN(test_original_full_xid_not_queried_for_other_roles_or_abort);
@@ -7908,6 +7962,7 @@ main(void)
 	UT_RUN(test_foreign_v4_without_receiver_retention_discards_only_companion);
 	UT_RUN(test_foreign_retained_companion_cannot_escape_source_or_root_drift);
 	UT_RUN(test_foreign_current_observation_uses_original_entered_receiver_retention);
+	UT_RUN(test_foreign_target_current_preserves_source_and_admission_checks);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

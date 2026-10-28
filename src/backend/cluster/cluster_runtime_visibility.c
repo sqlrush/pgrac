@@ -3078,7 +3078,8 @@ done:
  * original CTRC locks; no foreign current image or new grant is acquired. */
 static bool
 cluster_runtime_visibility_foreign_companion_retained(
-	const ClusterTxResolution *resolution, const ClusterSemanticAdmissionToken *admission)
+	const ClusterTxResolution *resolution, const ClusterSemanticAdmissionToken *admission,
+	const ClusterCtrcItlTargetIdentity *target)
 {
 	const ClusterCtrcTxnKeyV1 *key = &resolution->origin_companion.key;
 	ClusterCtrcParticipantIdentity receiver = {0};
@@ -3109,8 +3110,11 @@ cluster_runtime_visibility_foreign_companion_retained(
 			admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, key->owner_instance, key->segment_id, &root)
 		|| root.root_id != key->root_id || root.root_generation != key->root_generation
 		|| key->root_descriptor_incarnation != root.root_generation
-		|| !cluster_ctrc_itl_original_full_xid_matches_shared(key,
-			resolution->origin_companion.original_full_xid, &resolution->locator_echo, &receiver))
+		|| !(target != NULL
+			? cluster_ctrc_itl_original_full_xid_target_matches_shared(key,
+				resolution->origin_companion.original_full_xid, &resolution->locator_echo, &receiver, target)
+			: cluster_ctrc_itl_original_full_xid_matches_shared(key,
+				resolution->origin_companion.original_full_xid, &resolution->locator_echo, &receiver)))
 		return false;
 	return cluster_runtime_visibility_resolve_root_admitted(CLUSTER_TX_RESOLVE_TERMINAL_CENSUS,
 			admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, key->owner_instance, key->segment_id, &final_root)
@@ -3133,7 +3137,19 @@ cluster_runtime_visibility_foreign_companion_current_admitted(
 	return resolution != NULL && !resolution->local_canonical_valid
 		&& admission != NULL && admission->entered
 		&& cluster_semantic_activation_recheck_r4_terminal_census(admission)
-		&& cluster_runtime_visibility_foreign_companion_retained(resolution, admission)
+		&& cluster_runtime_visibility_foreign_companion_retained(resolution, admission, NULL)
+		&& cluster_semantic_activation_recheck_r4_terminal_census(admission);
+}
+
+bool
+cluster_runtime_visibility_foreign_companion_target_current_admitted(
+	const ClusterTxResolution *resolution, const ClusterCtrcItlTargetIdentity *target,
+	const ClusterSemanticAdmissionToken *admission)
+{
+	return resolution != NULL && !resolution->local_canonical_valid && target != NULL
+		&& admission != NULL && admission->entered
+		&& cluster_semantic_activation_recheck_r4_terminal_census(admission)
+		&& cluster_runtime_visibility_foreign_companion_retained(resolution, admission, target)
 		&& cluster_semantic_activation_recheck_r4_terminal_census(admission);
 }
 
@@ -3197,7 +3213,7 @@ cluster_runtime_visibility_resolve_exact_origin_admitted(
 		memset(&out->local_aborted_xmax_target, 0, sizeof(out->local_aborted_xmax_target));
 		if (out->origin_companion.present
 			&& (mode != CLUSTER_TX_RESOLVE_TERMINAL_CENSUS
-				|| !cluster_runtime_visibility_foreign_companion_retained(out, admission)))
+				|| !cluster_runtime_visibility_foreign_companion_retained(out, admission, NULL)))
 			memset(&out->origin_companion, 0, sizeof(out->origin_companion));
 		goto recheck;
 	}

@@ -9250,6 +9250,49 @@ UT_TEST(test_qualified_foreign_registration_saturates_without_losing_custody)
 	UT_ASSERT_EQ(held_count, 0);
 }
 
+UT_TEST(test_receiver_companion_target_requires_its_own_page_and_itl)
+{
+	for (unsigned fault = 0; fault <= 12; fault++) {
+		ClusterCtrcReceiptHandle handle;
+		ClusterCtrcParticipantIdentity destination;
+		ClusterCtrcItlTargetIdentity target;
+		ClusterItlSlotData slot;
+		ClusterTxLocator locator;
+		ClusterCtrcParticipantEntry before;
+		ClusterCtrcReceipt receipt;
+		uint64 generation;
+		UT_ASSERT(seed_delegation_itl_source(&handle, &destination, &target, &slot));
+		locator = receiver_companion_locator(&handle, &slot);
+		before = *handle.participant;
+		receipt = *handle.receipt;
+		generation = pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation);
+		switch (fault) {
+		case 1: target.spc_oid++; break;
+		case 2: target.db_oid++; break;
+		case 3: target.rel_number++; break;
+		case 4: target.fork_number++; break;
+		case 5: target.block_number++; break;
+		case 6: target.itl_slot_index++; break;
+		case 7: target.itl_slot_wrap++; break;
+		case 8: target.itl_xid++; break;
+		case 9: target.itl_class++; break;
+		case 10: target.needs_wal = false; break;
+		case 11: target.reserved8[0] = 1; break;
+		case 12: target.uba[0] ^= 1; break;
+		}
+		check_receiver_companion_readonly(&handle, &handle.key, handle.original_full_xid,
+			&locator, &handle.participant->identity, true);
+		UT_ASSERT_EQ(cluster_ctrc_itl_original_full_xid_target_matches_shared(&handle.key,
+			handle.original_full_xid, &locator, &handle.participant->identity, &target), fault == 0);
+		UT_ASSERT(!cluster_ctrc_itl_original_full_xid_target_matches_shared(&handle.key,
+			handle.original_full_xid, &locator, &handle.participant->identity, NULL));
+		UT_ASSERT_EQ(memcmp(&before, handle.participant, sizeof(before)), 0);
+		UT_ASSERT_EQ(memcmp(&receipt, handle.receipt, sizeof(receipt)), 0);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation), generation);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
 int
 main(void)
 {
@@ -9257,7 +9300,7 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(201);
+	UT_PLAN(202);
 	UT_RUN(test_prepare_path_namespace_precedes_input_and_resets_output);
 	UT_RUN(test_prepare_path_input_precedes_journal_exhaustion);
 	UT_RUN(test_prepare_path_chain_precedes_locator_and_keeps_blocked_state);
@@ -9462,6 +9505,7 @@ main(void)
 	UT_RUN(test_qualified_foreign_first_registration_revokes_each_local_scan_cut);
 	UT_RUN(test_qualified_foreign_refusal_and_exact_duplicate_keep_registration_cut);
 	UT_RUN(test_qualified_foreign_registration_saturates_without_losing_custody);
+	UT_RUN(test_receiver_companion_target_requires_its_own_page_and_itl);
 	free(CtrcShared);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

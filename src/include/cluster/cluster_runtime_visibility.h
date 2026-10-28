@@ -51,6 +51,7 @@ typedef enum ClusterTxResolveReason ClusterTxResolveReason;
 typedef enum ClusterTxOutcome ClusterTxOutcome;
 typedef struct ClusterTxLocator ClusterTxLocator;
 typedef struct ClusterTxResolution ClusterTxResolution;
+typedef struct ClusterCtrcItlTargetIdentity ClusterCtrcItlTargetIdentity;
 typedef struct ClusterSemanticAdmissionToken ClusterSemanticAdmissionToken;
 typedef struct ClusterUndoBlock0Generation ClusterUndoBlock0Generation;
 typedef union ClusterUndoBlock0CurrentGuard ClusterUndoBlock0CurrentGuard;
@@ -174,6 +175,11 @@ extern ClusterTxOutcome cluster_runtime_visibility_resolve_exact_origin_admitted
  * lifetime token; callers must keep final page and authority checks. */
 extern bool cluster_runtime_visibility_foreign_companion_current_admitted(
 	const ClusterTxResolution *resolution, const ClusterSemanticAdmissionToken *admission);
+/* Exact captured page/ITL variant; retains the original source/admission
+ * checks. This observation does not replace final page or writer ownership. */
+extern bool cluster_runtime_visibility_foreign_companion_target_current_admitted(
+	const ClusterTxResolution *resolution, const ClusterCtrcItlTargetIdentity *target,
+	const ClusterSemanticAdmissionToken *admission);
 extern ClusterTxOutcome cluster_runtime_visibility_resolve_terminal_census_retained_exact(
 	const ClusterTxLocator *locator, SCN retained_commit_scn,
 	const ClusterSemanticAdmissionToken *admission, ClusterTxResolution *out,

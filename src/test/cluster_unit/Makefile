@@ -10571,16 +10571,18 @@ test_cluster_vacuum_shared_mx.inc: $(top_srcdir)/src/backend/access/heap/vacuuml
 
 # Real admission/resident-page owners and inner guard cleanup, with injected errors.
 test_cluster_vacuum_proof_cleanup.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
-	awk '/^lazy_cleanout_shared_freeze_page\(/ { print "static bool"; emit=1; cleanout++ } \
+	awk '/^lazy_foreign_shared_freeze_companion_current\(/ { print "static bool"; emit=1; target++ } \
+	     /^lazy_cleanout_shared_freeze_page\(/ { print "static bool"; emit=1; cleanout++ } \
 	     /^lazy_shared_freeze_transport_snapshot\(/ { print "static void"; emit=1; cost++ } \
 	     /^(lazy_recheck_shared_freeze_page|lazy_observe_shared_freeze_bounds|lazy_collect_shared_freeze_proofs(_admitted)?)\(/ { print "static ClusterHeapFreezeProofStatusV1"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 4 || cleanout > 1 || cost > 1) exit 1 }' $< > $@.tmp
+	     emit { print } /^}/ { emit=0 } END { if (found != 4 || target != 1 || cleanout > 1 || cost > 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # The real seqlock read used by opt-in collector admission ownership tests.
 test_cluster_vacuum_admitted_phase.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
-	awk '/^lazy_collect_shared_freeze_proofs_admitted\(/ { print "static ClusterHeapFreezeProofStatusV1"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	awk '/^lazy_foreign_shared_freeze_companion_current\(/ { print "static bool"; emit=1; target++ } \
+	     /^lazy_collect_shared_freeze_proofs_admitted\(/ { print "static ClusterHeapFreezeProofStatusV1"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1 || target != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Execute the original outer VACUUM admission owner around the admitted phase.

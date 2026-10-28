@@ -2032,6 +2032,53 @@ lazy_observe_shared_freeze_bounds(LVRelState *vacrel,
  * keeps the page unproven.  No tuple-freeze permission survives its release,
  * and a cleanout invalidates the saved fence.
  */
+/* Use only the immutable captured carrier and page address. An identity
+ * retained by another page is insufficient here; no page/authority lock or
+ * foreign current request may be acquired by this read-only observation. */
+static bool
+lazy_foreign_shared_freeze_companion_current(
+	const ClusterHeapFreezePageBatchV1 *page, const ClusterTxResolution *resolution,
+	const ClusterSemanticAdmissionToken *admission)
+{
+	ClusterCtrcItlTargetIdentity target = {0};
+	bool found = false;
+
+	if (page == NULL || resolution == NULL
+		|| page->carrier_request_count > CLUSTER_ITL_INITRANS_DEFAULT)
+		return false;
+	for (uint8 index = 0; index < page->carrier_request_count; index++)
+	{
+		const ClusterHeapFreezeCarrierRequestV1 *request = &page->carrier_requests[index];
+		const ClusterTxLocator *locator = &resolution->locator_echo;
+
+		/* Canonical TT wrap comes from the resolver, not the captured ITL.
+		 * The DATA address, raw carrier identity and ITL wrap stay exact. */
+		if (request->locator.xid != locator->xid
+			|| request->locator.itl_slot_index != locator->itl_slot_index
+			|| request->locator.itl_kind != locator->itl_kind
+			|| memcmp(&request->locator.uba, &locator->uba, sizeof(locator->uba)) != 0
+			|| request->carrier.xid != locator->xid || request->carrier.flags != locator->itl_kind
+			|| memcmp(&request->carrier.undo_segment_head, &locator->uba, sizeof(locator->uba)) != 0)
+			continue;
+		if (found)
+			return false;
+		found = true;
+		target.spc_oid = page->identity.key.locator.spcOid;
+		target.db_oid = page->identity.key.locator.dbOid;
+		target.rel_number = page->identity.key.locator.relNumber;
+		target.fork_number = MAIN_FORKNUM;
+		target.block_number = page->block;
+		target.itl_xid = request->carrier.xid;
+		target.itl_slot_index = request->locator.itl_slot_index;
+		target.itl_slot_wrap = request->carrier.wrap;
+		target.itl_class = request->carrier.flags;
+		target.needs_wal = true;
+		memcpy(target.uba, &request->carrier.undo_segment_head, sizeof(target.uba));
+	}
+	return found && cluster_runtime_visibility_foreign_companion_target_current_admitted(
+		resolution, &target, admission);
+}
+
 /* Borrow the original caller's admission for proof collection and optional
  * existing cleanout. This phase never enters/leaves admission: it returns
  * after local ownership cleanup, leaving the original owner available for
@@ -2151,8 +2198,8 @@ lazy_collect_shared_freeze_proofs_admitted(LVRelState *vacrel, Buffer recent_buf
 		 * Recheck the original receiver outside page/content locks; never
 		 * manufacture a local canonical projection from peer bytes. */
 		if (!resolution.local_canonical_valid
-			&& !cluster_runtime_visibility_foreign_companion_current_admitted(
-				&resolution, admission))
+			&& !lazy_foreign_shared_freeze_companion_current(
+				&vacrel->shared_freeze_batch, &resolution, admission))
 			continue;
 		if (cluster_heap_freeze_build_canonical_proof_v1(&request->locator,
 				&resolution, &expected_fence, &expected_fence, true, true, true,
@@ -2180,8 +2227,8 @@ lazy_collect_shared_freeze_proofs_admitted(LVRelState *vacrel, Buffer recent_buf
 	if (row_inputs_current && !cleaned)
 		for (uint8 index = 0; index < proofs.proof_count; index++)
 			if (!proofs.proofs[index].resolution.local_canonical_valid
-				&& !cluster_runtime_visibility_foreign_companion_current_admitted(
-					&proofs.proofs[index].resolution, admission))
+				&& !lazy_foreign_shared_freeze_companion_current(
+					&vacrel->shared_freeze_batch, &proofs.proofs[index].resolution, admission))
 			{
 				row_inputs_current = false;
 				status = CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN;
