@@ -2817,6 +2817,23 @@ pcm_resource_x_reconfig_proof_slot_locked(struct GrdEntry *entry,
 				memcpy(&word, state->grant_intent.payload + offset, sizeof(word));
 				digest = pcm_resource_x_proof_digest_u64(digest, word);
 			}
+			/* The immutable A does not contain H's later native/image proof. */
+			digest = pcm_resource_x_proof_digest_u64(digest, request->blocked_holders_bitmap);
+			digest = pcm_resource_x_proof_digest_u64(digest, request->source_carrier_generation);
+			digest = pcm_resource_x_proof_digest_u64(digest, request->requester_target_generation);
+			digest = pcm_resource_x_proof_digest_u64(digest, request->page_scn_lsn);
+			digest = pcm_resource_x_proof_digest_u64(digest, request->holder_connection_generation);
+			digest = pcm_resource_x_proof_digest_u64(digest, request->acting_formation);
+			digest = pcm_resource_x_proof_digest_u64(digest, request->source_proof_crc32c);
+			digest = pcm_resource_x_proof_digest_u64(digest, request->page_checksum);
+			digest = pcm_resource_x_proof_digest_u64(digest, request->dependency_count);
+			digest = pcm_resource_x_proof_digest_u64(digest, request->proof_kind);
+			digest = pcm_resource_x_proof_digest_u64(digest, request->source_disposition);
+			digest = pcm_resource_x_proof_digest_u64(digest, request->proof_flags);
+			for (int n = 0; n < RESOURCE_X_DEPENDENCY_MAX; n++)
+				digest = pcm_resource_x_proof_digest_u64(digest, request->dependencies[n]);
+			for (int n = 0; n < RESOURCE_X_SOURCE_FENCE_BYTES; n++)
+				digest = pcm_resource_x_proof_digest_u64(digest, request->source_fence[n]);
 		}
 	}
 	for (holder_node = 0; holder_node < RESOURCE_X_PROTOCOL_NODE_LIMIT; holder_node++) {
@@ -20395,6 +20412,86 @@ pcm_resource_x_acquire_canonical_unsealed(const ClusterPcmResourceXMasterState *
 	return memcmp(request, &expected, sizeof(expected)) == 0;
 }
 
+/* Keep the original source proof in the original canonical request. This is
+ * evidence, not directory/native completion or permission to retire PI. */
+static void
+pcm_resource_x_acquire_source_proof_store(ClusterPcmResourceXMasterRequest *request,
+	const ResourceXDecodedBlockedToN *proof)
+{
+	memcpy(request->source_fence, proof->source_fence, sizeof(request->source_fence));
+	request->source_carrier_generation = proof->source_carrier_generation;
+	request->requester_target_generation = proof->requester_target_generation;
+	request->page_scn_lsn = proof->page_scn_lsn;
+	request->dependency_count = proof->dependency_count;
+	memcpy(request->dependencies, proof->dependencies, sizeof(request->dependencies));
+	request->source_proof_crc32c = proof->source_proof_crc32c;
+	request->page_checksum = proof->page_checksum;
+	request->source_disposition = proof->source_disposition;
+	request->proof_kind = proof->proof_kind;
+	request->proof_flags = proof->proof_flags;
+	request->holder_connection_generation = proof->holder_connection_generation;
+	request->acting_formation = proof->acting_formation;
+}
+
+static void
+pcm_resource_x_acquire_source_proof_load(const ClusterPcmResourceXMasterRequest *request,
+	ResourceXDecodedBlockedToN *proof)
+{
+	memset(proof, 0, sizeof(*proof));
+	memcpy(proof->source_fence, request->source_fence, sizeof(proof->source_fence));
+	proof->source_carrier_generation = request->source_carrier_generation;
+	proof->requester_target_generation = request->requester_target_generation;
+	proof->page_scn_lsn = request->page_scn_lsn;
+	proof->dependency_count = request->dependency_count;
+	memcpy(proof->dependencies, request->dependencies, sizeof(proof->dependencies));
+	proof->source_proof_crc32c = request->source_proof_crc32c;
+	proof->page_checksum = request->page_checksum;
+	proof->source_disposition = request->source_disposition;
+	proof->proof_kind = request->proof_kind;
+	proof->proof_flags = request->proof_flags;
+	proof->holder_connection_generation = request->holder_connection_generation;
+	proof->acting_formation = request->acting_formation;
+}
+
+/* The native generation axis is not the GRD grant generation. A compatible
+ * S source retains its native generation; a true X->S or S/X->N commit
+ * advances it once. Neither arithmetic nor a wire CRC proves that commit:
+ * the authenticated source must first retain the actual native evidence. */
+static bool
+pcm_resource_x_acquire_source_proof_valid(const ResourceXDecodedBlockedToN *proof,
+	const ResourceXDecodedAcquireDecision *decision, const ResourceXDecodedCommon *common)
+{
+	uint64 native_generation = pcm_resource_x_source_fence_get_u64(proof->source_fence + 20);
+	uint64 requester_connection = pcm_resource_x_source_fence_get_u64(proof->source_fence + 12);
+	uint32 source_node = 0;
+	bool compatible = decision->directory_mode == PCM_STATE_S && common->target_mode == PCM_STATE_S;
+
+	for (int n = 0; n < 4; n++)
+		source_node = (source_node << 8) | proof->source_fence[n];
+	if (decision->source_kind != RESOURCE_X_ACQUIRE_SOURCE_REMOTE_CURRENT
+		|| decision->source_node < 0 || decision->source_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+		|| source_node != (uint32)decision->source_node
+		|| pcm_resource_x_source_fence_get_u64(proof->source_fence + 4)
+			!= decision->holders[source_node].boot_incarnation
+		|| requester_connection == 0 || requester_connection == UINT64_MAX
+		|| native_generation == 0 || native_generation == UINT64_MAX
+		|| (!compatible && native_generation >= UINT64_MAX - 1)
+		|| proof->source_fence[28] != decision->directory_mode || proof->source_fence[29] != 1
+		|| proof->source_fence[30] != 0 || proof->source_fence[31] != 0
+		|| proof->source_carrier_generation != native_generation + (compatible ? 0 : 1)
+		|| proof->requester_target_generation != common->assertion_sequence
+		|| proof->source_proof_crc32c == 0 || proof->acting_formation != common->resource_formation
+		|| proof->holder_connection_generation == 0 || proof->holder_connection_generation == UINT64_MAX
+		|| proof->source_disposition != RESOURCE_X_DISPOSITION_REMOTE_NONWRITABLE
+		|| proof->proof_kind != RESOURCE_X_PROOF_REMOTE_CARRIER || proof->proof_flags != 0
+		|| proof->dependency_count > RESOURCE_X_DEPENDENCY_MAX)
+		return false;
+	for (int n = proof->dependency_count; n < RESOURCE_X_DEPENDENCY_MAX; n++)
+		if (proof->dependencies[n] != 0)
+			return false;
+	return true;
+}
+
 /* A lives in the original grant body even when its transport descriptor has
  * completed, or when a remote source carries it directly to R. That empty
  * descriptor is never evidence that the canonical authority has retired. */
@@ -20410,6 +20507,9 @@ pcm_resource_x_acquire_canonical_decided(const ClusterPcmResourceXMasterState *s
 	ResourceXDecodedCommon common;
 	const ResourceXDecodedAcquireDecision *a;
 	ResourceXWireReject reject;
+	ResourceXDecodedBlockedToN source_proof;
+	uint32 acknowledged;
+	bool source_acked;
 
 	if (!pcm_resource_x_bootstrap_priority_valid(priority) || !priority->has_acquire_intent
 		|| priority->state != RESOURCE_X_BOOTSTRAP_PRIORITY_CANONICAL
@@ -20446,16 +20546,26 @@ pcm_resource_x_acquire_canonical_decided(const ClusterPcmResourceXMasterState *s
 		return false;
 	if ((request->blocked_holders_bitmap & ~a->required_holders_bitmap) != 0)
 		return false;
+	/* A compatible S source supplies a proof without being an incompatible
+	 * holder. Its independent ACK therefore owns a receipt outside that mask. */
+	acknowledged = request->blocked_holders_bitmap;
+	source_acked = a->source_kind == RESOURCE_X_ACQUIRE_SOURCE_REMOTE_CURRENT
+		&& state->acquire_ack_connections[a->source_node] != 0;
+
+	if (source_acked) {
+		pcm_resource_x_acquire_source_proof_load(request, &source_proof);
+		if (!pcm_resource_x_acquire_source_proof_valid(&source_proof, a, &frame.common))
+			return false;
+		acknowledged |= UINT32_C(1) << a->source_node;
+	} else if (a->source_kind == RESOURCE_X_ACQUIRE_SOURCE_REMOTE_CURRENT
+		&& (acknowledged & (UINT32_C(1) << a->source_node)) != 0)
+		return false;
 	for (int node = 0; node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++) {
 		uint32 bit = UINT32_C(1) << node;
 		uint32 connection = state->acquire_ack_connections[node];
 
-		/* This consumer records only a non-source's original control ACK.
-		 * A source proof has its independent native/image owner. */
 		if (connection == UINT32_MAX
-			|| ((connection != 0) != ((request->blocked_holders_bitmap & bit) != 0))
-			|| (connection != 0 && a->source_kind == RESOURCE_X_ACQUIRE_SOURCE_REMOTE_CURRENT
-				&& a->source_node == node))
+			|| ((connection != 0) != ((acknowledged & bit) != 0)))
 			return false;
 	}
 	memset(&expected, 0, sizeof(expected));
@@ -20470,6 +20580,8 @@ pcm_resource_x_acquire_canonical_decided(const ClusterPcmResourceXMasterState *s
 	expected.incompatible_holders_bitmap = a->required_holders_bitmap;
 	expected.blocked_holders_bitmap = request->blocked_holders_bitmap;
 	expected.source_node = a->source_node;
+	if (source_acked)
+		pcm_resource_x_acquire_source_proof_store(&expected, &source_proof);
 	expected.phase = a->required_holders_bitmap != request->blocked_holders_bitmap
 		? RESOURCE_X_MASTER_WAIT_BLOCKERS
 		: RESOURCE_X_MASTER_WAIT_PROOF;
@@ -27490,6 +27602,9 @@ pcm_resource_x_acquire_holder_ack_exact(const ResourceXDecodedFrame *blocked,
 	ResourceXWireReject reject;
 	uint8 bytes[RESOURCE_X_SOURCE_WITNESS_V3_BYTES];
 	uint16 len = 0;
+	ResourceXDecodedBlockedToN source_proof;
+	ClusterPcmResourceXMasterRequest candidate;
+	bool source;
 	uint32 original_connection;
 	uint32 bit;
 	int32 requester;
@@ -27515,14 +27630,18 @@ pcm_resource_x_acquire_holder_ack_exact(const ResourceXDecodedFrame *blocked,
 		|| !frame.has_acquire_decision
 		|| frame.common.semantic_crc32c != blocked->common.semantic_crc32c)
 		return RESOURCE_X_APPLY_INVALID;
-	if (frame.body.acquire_witness.has_source_proof)
-		return RESOURCE_X_APPLY_BAD_STATE;
+	source = frame.body.acquire_witness.has_source_proof;
 	decision = frame.body.acquire_witness.decision;
-	if (len != RESOURCE_X_WITNESS_V3_BYTES || decision.directory_mode != PCM_STATE_S
-		|| frame.common.target_mode != PCM_STATE_X
-		|| frame.body.acquire_witness.original_ack.source_candidate != 0
+	source_proof = frame.body.acquire_witness.original_proof;
+	if (frame.body.acquire_witness.original_ack.source_candidate != 0
 		|| frame.body.acquire_witness.original_ack.retain_pi_if_dirty != 0
-		|| frame.body.acquire_witness.original_ack.flags != 0)
+		|| (source
+			? (len != RESOURCE_X_SOURCE_WITNESS_V3_BYTES
+				|| frame.body.acquire_witness.original_ack.flags != RESOURCE_X_COMMON_FLAG_PI_ESTABLISHED
+				|| !pcm_resource_x_acquire_source_proof_valid(&source_proof, &decision, &frame.common))
+			: (len != RESOURCE_X_WITNESS_V3_BYTES || decision.directory_mode != PCM_STATE_S
+				|| frame.common.target_mode != PCM_STATE_X
+				|| frame.body.acquire_witness.original_ack.flags != 0)))
 		return RESOURCE_X_APPLY_INVALID;
 	original_connection = frame.body.acquire_witness.original_ack.sender_connection_generation;
 	bit = UINT32_C(1) << authenticated_source_node;
@@ -27565,11 +27684,16 @@ pcm_resource_x_acquire_holder_ack_exact(const ResourceXDecodedFrame *blocked,
 		goto done;
 	}
 	holder = &state->holder_grants[authenticated_source_node];
-	if ((decision.required_holders_bitmap & bit) == 0
-		|| (decision.source_kind == RESOURCE_X_ACQUIRE_SOURCE_REMOTE_CURRENT
-			&& decision.source_node == authenticated_source_node)
-		|| (PcmState)pg_atomic_read_u32(&ref.entry->master_state) != PCM_STATE_S
-		|| (pg_atomic_read_u32(&ref.entry->s_holders_bitmap) & bit) == 0
+	if ((source
+			? (decision.source_kind != RESOURCE_X_ACQUIRE_SOURCE_REMOTE_CURRENT
+				|| decision.source_node != authenticated_source_node)
+			: ((decision.required_holders_bitmap & bit) == 0
+				|| (decision.source_kind == RESOURCE_X_ACQUIRE_SOURCE_REMOTE_CURRENT
+					&& decision.source_node == authenticated_source_node)))
+		|| (PcmState)pg_atomic_read_u32(&ref.entry->master_state) != decision.directory_mode
+		|| (decision.directory_mode == PCM_STATE_S
+			? (pg_atomic_read_u32(&ref.entry->s_holders_bitmap) & bit) == 0
+			: ref.entry->x_holder_node != authenticated_source_node)
 		|| holder->boot_incarnation != decision.holders[authenticated_source_node].boot_incarnation
 		|| holder->grant_generation != decision.holders[authenticated_source_node].grant_generation
 		|| holder->resource_formation != frame.common.resource_formation
@@ -27578,13 +27702,19 @@ pcm_resource_x_acquire_holder_ack_exact(const ResourceXDecodedFrame *blocked,
 		result = RESOURCE_X_APPLY_STALE;
 		goto done;
 	}
-	if ((request->blocked_holders_bitmap & bit) != 0) {
+	if (state->acquire_ack_connections[authenticated_source_node] != 0) {
+		candidate = *request;
+		if (source)
+			pcm_resource_x_acquire_source_proof_store(&candidate, &source_proof);
 		result = state->acquire_ack_connections[authenticated_source_node] == original_connection
+			&& memcmp(&candidate, request, sizeof(candidate)) == 0
 			? RESOURCE_X_APPLY_DUPLICATE : RESOURCE_X_APPLY_STALE;
 		goto done;
 	}
+	if (source)
+		pcm_resource_x_acquire_source_proof_store(request, &source_proof);
 	state->acquire_ack_connections[authenticated_source_node] = original_connection;
-	request->blocked_holders_bitmap |= bit;
+	request->blocked_holders_bitmap |= bit & decision.required_holders_bitmap;
 	if (request->blocked_holders_bitmap == request->incompatible_holders_bitmap)
 		request->phase = RESOURCE_X_MASTER_WAIT_PROOF;
 	broadcast = true;
