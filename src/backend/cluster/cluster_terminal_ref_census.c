@@ -2834,6 +2834,22 @@ cluster_ctrc_active_scan_begin(ClusterCtrcActiveScan *scan, FullTransactionId re
 	return true;
 }
 
+/* Read only the worker's original admitted cut. A departed or restarted
+ * ancestor remains custody, but cannot certify this cut's producer source. */
+static bool
+ctrc_participant_identity_matches_source(const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcParticipantIdentity *identity,
+	const ClusterSemanticActiveSampleFence *source)
+{
+	return ctrc_participant_identity_valid(key, identity)
+		&& identity->formation_epoch == source->formation_epoch
+		&& identity->admission_record_generation == source->record_generation
+		&& ((identity->node_id < 64 ? source->admitted_members_lo
+									: source->admitted_members_hi)
+			& (UINT64_C(1) << (identity->node_id % 64))) != 0
+		&& identity->boot_incarnation == source->admitted_incarnation[identity->node_id];
+}
+
 /* Qualification belongs to the original local receiver, not merely to a
  * known raw/full transaction pair. Caller holds this participant's SH lock.
  * A failed match only removes positive coverage; its retained minimum stays. */
@@ -2847,11 +2863,9 @@ ctrc_participant_active_source_matches(const ClusterCtrcParticipantEntry *entry,
 	FullTransactionId original;
 	uint64 protected_index;
 
-	if (!ctrc_participant_identity_valid(&entry->key, receiver)
+	if (!ctrc_participant_identity_matches_source(&entry->key, receiver, source)
 		|| receiver->node_id != source->local_node_id
 		|| receiver->boot_incarnation != source->local_boot_incarnation
-		|| receiver->formation_epoch != source->formation_epoch
-		|| receiver->admission_record_generation != source->record_generation
 		|| !ctrc_participant_index(&entry->key, receiver->node_id, &protected_index)
 		|| protected_index != index)
 		return false;
@@ -2859,13 +2873,23 @@ ctrc_participant_active_source_matches(const ClusterCtrcParticipantEntry *entry,
 	 * Foreign copies additionally require the immutable protected handoff. */
 	if (entry->key.origin_node_id == source->local_node_id)
 		return true;
-	if (!ctrc_bytes_zero(&entry->delegation_path, sizeof(entry->delegation_path)))
-		return ctrc_delegation_path_valid(&entry->delegation_path, &entry->key,
+	if (!ctrc_bytes_zero(&entry->delegation_path, sizeof(entry->delegation_path))) {
+		const ClusterCtrcDelegationPathV2 *path = &entry->delegation_path;
+
+		if (!ctrc_delegation_path_valid(path, &entry->key,
 			receiver, parent, entry->original_identity_v2, entry->grant_generation,
-			entry->original_full_xid);
+			entry->original_full_xid)
+			|| !ctrc_participant_identity_matches_source(&entry->key, &path->root_receiver, source))
+			return false;
+		for (unsigned i = 0; i < path->hop_count; i++) {
+			if (!ctrc_participant_identity_matches_source(&entry->key, &path->hops[i].receiver, source))
+				return false;
+		}
+		return true;
+	}
 	if (!ctrc_bytes_zero(parent, sizeof(*parent))) {
 		if (parent->sequence == 0 || parent->sequence >= CLUSTER_CTRC_MAX_PARTICIPANTS
-			|| !ctrc_participant_identity_valid(&entry->key, &parent->receiver)
+			|| !ctrc_participant_identity_matches_source(&entry->key, &parent->receiver, source)
 			|| parent->receiver.node_id == receiver->node_id)
 			return false;
 		original_receiver = &parent->receiver;

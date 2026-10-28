@@ -9645,6 +9645,14 @@ UT_TEST(test_source_scan_accepts_only_exact_protected_parent_and_multihop_path)
 		source.local_boot_incarnation = receiver.boot_incarnation;
 		source.admitted_members_lo |= UINT64_C(1) << receiver.node_id;
 		source.admitted_incarnation[receiver.node_id] = receiver.boot_incarnation;
+		source.admitted_members_lo |= UINT64_C(1) << first.participant->identity.node_id;
+		source.admitted_incarnation[first.participant->identity.node_id] =
+			first.participant->identity.boot_incarnation;
+		if (multihop) {
+			source.admitted_members_lo |= UINT64_C(1) << middle.participant->identity.node_id;
+			source.admitted_incarnation[middle.participant->identity.node_id] =
+				middle.participant->identity.boot_incarnation;
+		}
 		/* The fixture uses one allocation to model different nodes. Remove
 		 * peer table copies from the receiver's scan, not peer responsibility. */
 		MemSet(ctrc_origin_entries(), 0, sizeof(*ctrc_origin_entries()) * CtrcShared->origin_key_entries);
@@ -9679,6 +9687,141 @@ UT_TEST(test_source_scan_accepts_only_exact_protected_parent_and_multihop_path)
 			UT_ASSERT_EQ(held_count, 0);
 		}
 	}
+}
+
+UT_TEST(test_source_scan_requires_current_original_first_parent)
+{
+	ClusterCtrcReceiptHandle first, received;
+	ClusterCtrcParticipantIdentity receiver, parent;
+	ClusterCtrcPublicationIdV1 publication;
+	ClusterCtrcTargetV1 target;
+	ClusterSemanticActiveSampleFence source, pristine;
+	ClusterCtrcParticipantEntry before;
+	ClusterCtrcReceipt receipt_before;
+	uint8 record[224];
+	uint64 saved_epoch = test_cluster_epoch;
+	uint64 head;
+
+	test_cluster_epoch = 23;
+	UT_ASSERT(seed_delegation_record(&first, &receiver, &publication, &target, record));
+	parent = first.participant->identity;
+	UT_ASSERT_EQ(cluster_ctrc_receipt_prepare_delegation_v1(&first.key, &parent,
+		&receiver, first.participant->grant_generation, &publication, &target,
+		record, sizeof(record), &received), CLUSTER_CTRC_PREPARE_READY);
+	test_cluster_epoch = saved_epoch;
+	source = active_source_for_key(&received.key);
+	source.local_node_id = receiver.node_id;
+	source.local_boot_incarnation = receiver.boot_incarnation;
+	source.admitted_members_lo |= (UINT64_C(1) << parent.node_id)
+		| (UINT64_C(1) << receiver.node_id);
+	source.admitted_incarnation[parent.node_id] = parent.boot_incarnation;
+	source.admitted_incarnation[receiver.node_id] = receiver.boot_incarnation;
+	/* One allocation models separate nodes; only the actual receiver row is
+	 * local to this scan. The remote custody is not being retired. */
+	MemSet(ctrc_origin_entries(), 0, sizeof(*ctrc_origin_entries()) * CtrcShared->origin_key_entries);
+	MemSet(first.participant, 0, sizeof(*first.participant));
+	pristine = source;
+	before = *received.participant;
+	receipt_before = *received.receipt;
+	head = ctrc_participant_receipt_heads()[received.participant_index];
+	for (unsigned fault = 0; fault < 4; fault++) {
+		ClusterCtrcActiveScan scan;
+
+		source = pristine;
+		if (fault == 1) source.admitted_members_lo &= ~(UINT64_C(1) << parent.node_id);
+		if (fault == 2) source.admitted_incarnation[parent.node_id] = 0;
+		if (fault == 3) source.admitted_incarnation[parent.node_id]++;
+		UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(9, 10000)));
+		finish_source_receiver_scan(&scan, &source);
+		UT_ASSERT_EQ(scan.unqualified_entries, fault == 0 ? 0 : 1);
+		UT_ASSERT(FullTransactionIdEquals(scan.min_full, before.original_full_xid));
+		UT_ASSERT(memcmp(&before, received.participant, sizeof(before)) == 0);
+		UT_ASSERT(memcmp(&receipt_before, received.receipt, sizeof(receipt_before)) == 0);
+		UT_ASSERT_EQ(ctrc_participant_receipt_heads()[received.participant_index], head);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
+UT_TEST(test_source_scan_checks_every_actual_multihop_ancestor_in_same_cut)
+{
+	ClusterCtrcReceiptHandle current, next;
+	ClusterCtrcParticipantIdentity receiver;
+	ClusterCtrcItlTargetIdentity target;
+	ClusterCtrcTargetV1 pending;
+	ClusterItlSlotData slot;
+	ClusterSemanticActiveSampleFence source, pristine;
+	ClusterCtrcParticipantEntry before;
+	ClusterCtrcReceipt receipt_before;
+	ClusterCtrcActiveScan scan;
+	uint8 record[CLUSTER_CTRC_DELEGATION_V2_MAX_BYTES];
+	Size length = 0;
+	uint64 head, saved_epoch = test_cluster_epoch;
+
+	fixture_declared_nodes = 16;
+	test_cluster_epoch = 23;
+	UT_ASSERT(seed_delegation_itl_source(&current, &receiver, &target, &slot));
+	for (unsigned node = 2; node < CLUSTER_CTRC_MAX_PARTICIPANTS; node++) {
+		receiver.node_id = node;
+		receiver.boot_incarnation = 1200 + node;
+		UT_ASSERT(cluster_ctrc_itl_delegate_prepare_v2(&target, &slot,
+			&current.participant->identity, &receiver, record, sizeof(record), &length));
+		cluster_node_id = node;
+		image_pending_target(&pending);
+		UT_ASSERT_EQ(cluster_ctrc_itl_image_prepare_v2(&slot, &current.participant->identity,
+			&receiver, record, length, &pending, &next), CLUSTER_CTRC_PREPARE_READY);
+		UT_ASSERT(multihop_apply_image(&next, &slot, &target));
+		current = next;
+	}
+	test_cluster_epoch = saved_epoch;
+	UT_ASSERT_EQ(current.participant->delegation_path.hop_count, 14);
+	source = active_source_for_key(&current.key);
+	source.local_node_id = receiver.node_id;
+	source.local_boot_incarnation = receiver.boot_incarnation;
+	for (unsigned node = 0; node < CLUSTER_CTRC_MAX_PARTICIPANTS; node++) {
+		uint64 index;
+
+		source.admitted_members_lo |= UINT64_C(1) << node;
+		if (node == current.key.origin_node_id)
+			continue;
+		UT_ASSERT(ctrc_participant_index(&current.key, node, &index));
+		source.admitted_incarnation[node] = ctrc_participant_entries()[index].identity.boot_incarnation;
+		if (&ctrc_participant_entries()[index] != current.participant)
+			MemSet(&ctrc_participant_entries()[index], 0, sizeof(*current.participant));
+	}
+	MemSet(ctrc_origin_entries(), 0, sizeof(*ctrc_origin_entries()) * CtrcShared->origin_key_entries);
+	pristine = source;
+	before = *current.participant;
+	receipt_before = *current.receipt;
+	head = ctrc_participant_receipt_heads()[current.participant_index];
+	/* Qualified only when every original root/hop, including non-parent
+	 * ancestors, belongs to this same fixed worker cut. */
+	UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(9, 10000)));
+	finish_source_receiver_scan(&scan, &source);
+	UT_ASSERT_EQ(scan.unqualified_entries, 0);
+	for (unsigned node = 0; node < receiver.node_id; node++) {
+		for (unsigned fault = 0; fault < 3; fault++) {
+			source = pristine;
+			if (fault == 0) source.admitted_members_lo &= ~(UINT64_C(1) << node);
+			if (fault == 1) source.admitted_incarnation[node] = 0;
+			if (fault == 2) source.admitted_incarnation[node]++;
+			UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(9, 10000)));
+			finish_source_receiver_scan(&scan, &source);
+			UT_ASSERT_EQ(scan.unqualified_entries, 1);
+			UT_ASSERT(FullTransactionIdEquals(scan.min_full, before.original_full_xid));
+			UT_ASSERT(memcmp(&before, current.participant, sizeof(before)) == 0);
+			UT_ASSERT(memcmp(&receipt_before, current.receipt, sizeof(receipt_before)) == 0);
+			UT_ASSERT_EQ(ctrc_participant_receipt_heads()[current.participant_index], head);
+			UT_ASSERT_EQ(held_count, 0);
+		}
+	}
+	/* An old admitted boot is not repaired by this local scan. The original
+	 * source-less API still reports its retained non-authoritative minimum. */
+	UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(9, 10000)));
+	finish_qualified_foreign_registration_scan(&scan);
+	UT_ASSERT_EQ(scan.unqualified_entries, 0);
+	UT_ASSERT(FullTransactionIdEquals(scan.min_full, before.original_full_xid));
+	UT_ASSERT(memcmp(&before, current.participant, sizeof(before)) == 0);
+	UT_ASSERT(memcmp(&receipt_before, current.receipt, sizeof(receipt_before)) == 0);
 }
 
 UT_TEST(test_source_scan_local_origin_keeps_original_locked_fullxid_handoff)
@@ -9732,7 +9875,7 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(210);
+	UT_PLAN(212);
 	UT_RUN(test_prepare_path_namespace_precedes_input_and_resets_output);
 	UT_RUN(test_prepare_path_input_precedes_journal_exhaustion);
 	UT_RUN(test_prepare_path_chain_precedes_locator_and_keeps_blocked_state);
@@ -9948,6 +10091,8 @@ main(void)
 	UT_RUN(test_source_scan_requires_exact_receiver_and_original_foreign_envelope);
 	UT_RUN(test_source_scan_accepts_only_exact_protected_parent_and_multihop_path);
 	UT_RUN(test_source_scan_local_origin_keeps_original_locked_fullxid_handoff);
+	UT_RUN(test_source_scan_requires_current_original_first_parent);
+	UT_RUN(test_source_scan_checks_every_actual_multihop_ancestor_in_same_cut);
 	free(CtrcShared);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
