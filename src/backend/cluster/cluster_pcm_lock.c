@@ -28532,18 +28532,23 @@ cluster_pcm_lock_resource_x_requester_join_exact(const ResourceXDecodedFrame *fr
  * authenticates a material's producer; it does not validate native C or
  * turn an observation of a boot into a grant. */
 static bool
-pcm_resource_x_requester_acquire_peer(int32 node, uint64 boot, uint64 epoch)
+pcm_resource_x_requester_acquire_peer(int32 node, uint64 boot, uint64 epoch, uint32 ingress)
 {
 	uint64 before, after, generation, after_generation;
+	uint32 connection_before, connection_after;
 
 	if (node == cluster_node_id)
-		return boot != 0 && cluster_qvotec_get_self_incarnation() == boot;
-	return cluster_reconfig_get_observed_slot(node, &before, &generation)
+		return ingress == 1 && boot != 0 && cluster_qvotec_get_self_incarnation() == boot;
+	return cluster_sf_peer_pcm_x_connection_generation(node, &connection_before)
+		&& connection_before == ingress
+		&& cluster_reconfig_get_observed_slot(node, &before, &generation)
 		&& before == boot && generation != 0 && generation != UINT64_MAX
 		&& cluster_reconfig_get_observed_epoch(node) == epoch
 		&& cluster_reconfig_get_observed_fresh_alive(node)
 		&& cluster_reconfig_get_observed_slot(node, &after, &after_generation)
 		&& before == after && generation == after_generation
+		&& cluster_sf_peer_pcm_x_connection_generation(node, &connection_after)
+		&& connection_after == ingress
 		&& cluster_reconfig_get_observed_epoch(node) == epoch
 		&& cluster_reconfig_get_observed_fresh_alive(node);
 }
@@ -28595,8 +28600,11 @@ pcm_resource_x_requester_acquire_join(const ResourceXDecodedFrame *frame, int32 
 		|| !pcm_resource_x_requester_acquire_anchor(&decoded, anchor))
 		return RESOURCE_X_APPLY_INVALID;
 	a = pcm_resource_x_requester_acquire_decision(&decoded);
-	if (a == NULL || a->master_node != master || a->requester_ingress_generation != master_ingress
-		|| decoded.common.sender_connection_generation != source_ingress
+	/* The wire sender and A's directional connection fields belong to their
+	 * original sender/master. Our capability samples belong to this receiver.
+	 * Authenticate each local observation in its own domain; canonical A below
+	 * still retains every original directional field byte-for-byte. */
+	if (a == NULL || a->master_node != master
 		|| a->episode.r4_generation != r4
 		|| cluster_qvotec_get_self_incarnation() != a->episode.requester_incarnation
 		|| (is_grant ? source != master : source != decoded.common.action_node)
@@ -28605,7 +28613,7 @@ pcm_resource_x_requester_acquire_join(const ResourceXDecodedFrame *frame, int32 
 		|| (!is_grant && !is_image && decoded.body.acquire_witness.has_source_proof))
 		return RESOURCE_X_APPLY_STALE;
 	boot = is_grant ? decoded.common.master_session_incarnation : a->holders[source].boot_incarnation;
-	if (!pcm_resource_x_requester_acquire_peer(source, boot, a->episode.cluster_epoch))
+	if (!pcm_resource_x_requester_acquire_peer(source, boot, a->episode.cluster_epoch, source_ingress))
 		return RESOURCE_X_APPLY_STALE;
 	canonical = decoded;
 	canonical.common.sender_connection_generation = PGRAC_RESOURCE_X_RETAINED_SENDER_GENERATION;
@@ -28646,7 +28654,6 @@ pcm_resource_x_requester_acquire_join(const ResourceXDecodedFrame *frame, int32 
 		|| round->master_session_incarnation != decoded.common.master_session_incarnation
 		|| round->r4_record_generation != r4 || round->current_master_node != master
 		|| round->master_ingress_connection_generation != master_ingress
-		|| request->sender_connection_generation != a->master_ingress_generation
 		|| !pcm_resource_x_active_empty_locked(ref.entry))
 		goto done;
 	join = &state->requester_join;
@@ -29322,7 +29329,9 @@ pcm_resource_x_acquire_holder_ack_exact(const ResourceXDecodedFrame *blocked,
 		|| frame.body.acquire_witness.original_ack.retain_pi_if_dirty != 0
 		|| (source
 			? (len != RESOURCE_X_SOURCE_WITNESS_V3_BYTES
-				|| frame.body.acquire_witness.original_ack.flags != RESOURCE_X_COMMON_FLAG_PI_ESTABLISHED
+				|| frame.body.acquire_witness.original_ack.flags
+					!= (decision.directory_mode == PCM_STATE_S && frame.common.target_mode == PCM_STATE_S
+						? 0 : RESOURCE_X_COMMON_FLAG_PI_ESTABLISHED)
 				|| !pcm_resource_x_acquire_source_proof_valid(&source_proof, &decision, &frame.common))
 			: (len != RESOURCE_X_WITNESS_V3_BYTES || decision.directory_mode != PCM_STATE_S
 				|| frame.common.target_mode != PCM_STATE_X

@@ -10354,13 +10354,18 @@ gcs_block_resource_x_payload_candidate(uint8 msg_type, uint32 payload_length)
 	if (msg_type == RESOURCE_X_MSG_IMAGE_OR_GRANT)
 		return payload_length == RESOURCE_X_CONTROL_V1_BYTES
 			   || payload_length == RESOURCE_X_PROOF_V1_BYTES
-			   || payload_length == RESOURCE_X_IMAGE_V2_BYTES;
+			   || payload_length == RESOURCE_X_IMAGE_V2_BYTES
+			   || payload_length == RESOURCE_X_DECISION_V3_BYTES
+			   || payload_length == RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES;
 	if (msg_type == RESOURCE_X_MSG_BLOCK_TO_N)
 		return payload_length == RESOURCE_X_CONTROL_V1_BYTES
-			   || payload_length == RESOURCE_X_PROOF_V1_BYTES;
+			   || payload_length == RESOURCE_X_PROOF_V1_BYTES
+			   || payload_length == RESOURCE_X_DECISION_V3_BYTES;
 	if (msg_type == RESOURCE_X_MSG_BLOCKED_TO_N)
 		return payload_length == RESOURCE_X_CONTROL_V1_BYTES
-			   || payload_length == RESOURCE_X_PROOF_V1_BYTES;
+			   || payload_length == RESOURCE_X_PROOF_V1_BYTES
+			   || payload_length == RESOURCE_X_WITNESS_V3_BYTES
+			   || payload_length == RESOURCE_X_SOURCE_WITNESS_V3_BYTES;
 	if (msg_type == RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE)
 		return payload_length == RESOURCE_X_CONTROL_V1_BYTES
 			   || payload_length == RESOURCE_X_SHORT_V1_BYTES;
@@ -15520,10 +15525,9 @@ done:
 	return result;
 }
 
-/* A complete type-15 join executes R9 on the selected writer side.  TARGET
- * never falls back to the local ticket projection and publishes the exact
- * post-T3 ref/BufferDesc generation into the requester round before waking
- * its same-node followers. */
+/* Retain authenticated requester evidence under TARGET admission. Complete
+ * acquisition frames only wake their original executor; legacy READY joins
+ * still use their existing native terminal owner. */
 static ResourceXApplyResult
 gcs_block_resource_x_requester_join_ingress(const ClusterICEnvelope *env,
 											const ResourceXDecodedFrame *frame,
@@ -15541,7 +15545,9 @@ gcs_block_resource_x_requester_join_ingress(const ClusterICEnvelope *env,
 
 	if (env == NULL || frame == NULL || out == NULL || authenticated_connection_generation == 0
 		|| (frame->kind != RESOURCE_X_WIRE_IMAGE_ENVELOPE
-			&& frame->kind != RESOURCE_X_WIRE_AUTHORITY_GRANT))
+			&& frame->kind != RESOURCE_X_WIRE_AUTHORITY_GRANT
+			&& !(frame->kind == RESOURCE_X_WIRE_BLOCKED_TO_N && frame->has_acquire_decision
+				 && !frame->body.acquire_witness.has_source_proof)))
 		return RESOURCE_X_APPLY_INVALID;
 	source = (int32)env->source_node_id;
 	if (cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1,
@@ -15576,7 +15582,7 @@ gcs_block_resource_x_requester_join_ingress(const ClusterICEnvelope *env,
 					result = cluster_pcm_lock_resource_x_requester_join_current_exact(
 						frame, source, authenticated_connection_generation, master_node,
 						master_ingress, admission.record_generation, out);
-					if (result == RESOURCE_X_APPLY_STALE
+					if (!frame->has_acquire_decision && result == RESOURCE_X_APPLY_STALE
 						&& cluster_semantic_activation_recheck(&admission))
 						result = gcs_block_resource_x_cleanup_frame_exact(
 							frame, source, authenticated_connection_generation, master_node,
@@ -16008,6 +16014,29 @@ gcs_block_try_resource_x_frame(const ClusterICEnvelope *env, const void *payload
 			env, &frame, authenticated_capability_generation);
 		break;
 	case RESOURCE_X_WIRE_BLOCKED_TO_N:
+		if (frame.has_acquire_decision) {
+			bool master_role = frame.body.acquire_witness.decision.master_node == cluster_node_id;
+			bool requester_role = frame.common.logical_assertion.requester_node == cluster_node_id
+				&& !frame.body.acquire_witness.has_source_proof;
+
+			/* H->M and H->R retain independent obligations even when M=R.
+			 * Neither consumer's failure permits discarding the other's input.
+			 * A source ACK is M's receipt; only its image supplies R's I. */
+			if (master_role)
+				result = cluster_pcm_lock_resource_x_blocked_to_n_exact(
+					&frame, (int32)env->source_node_id, &snapshot);
+			else
+				snapshot.phase = UINT8_MAX;
+			if (requester_role) {
+				ResourceXApplyResult requester_result = gcs_block_resource_x_requester_join_ingress(
+					env, &frame, authenticated_capability_generation, &join_snapshot);
+
+				if (!master_role || result == RESOURCE_X_APPLY_APPLIED
+					|| result == RESOURCE_X_APPLY_DUPLICATE)
+					result = requester_result;
+			}
+			break;
+		}
 		if (frame.common.outcome == RESOURCE_X_OUTCOME_RETRY
 			&& frame.common.observed_mode == PCM_STATE_N
 			&& frame.common.target_mode == PCM_STATE_N) {
@@ -16059,7 +16088,8 @@ gcs_block_try_resource_x_frame(const ClusterICEnvelope *env, const void *payload
 	case RESOURCE_X_WIRE_AUTHORITY_GRANT:
 		result = gcs_block_resource_x_requester_join_ingress(
 			env, &frame, authenticated_capability_generation, &join_snapshot);
-		if ((result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE)
+		if (!frame.has_acquire_decision
+			&& (result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE)
 			&& (join_snapshot.flags & RESOURCE_X_REQUESTER_JOIN_READY) != 0) {
 			(void)gcs_block_resource_x_requester_terminal_try(env, &frame,
 															  authenticated_capability_generation,
@@ -16069,7 +16099,7 @@ gcs_block_try_resource_x_frame(const ClusterICEnvelope *env, const void *payload
 	}
 	/* The second leg may be the source proof or the install notification.
 	 * Both close the identical retained master request exactly once. */
-	if ((frame.kind == RESOURCE_X_WIRE_BLOCKED_TO_N
+	if (!frame.has_acquire_decision && (frame.kind == RESOURCE_X_WIRE_BLOCKED_TO_N
 		 || frame.kind == RESOURCE_X_WIRE_INSTALL_SETTLEMENT)
 		&& (result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE)
 		&& snapshot.phase == RESOURCE_X_MASTER_SETTLED) {

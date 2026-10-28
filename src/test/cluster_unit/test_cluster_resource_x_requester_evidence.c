@@ -160,7 +160,7 @@ evidence_offer_as(const ResourceXDecodedFrame *frame, int source, ResourceXReque
 		? &frame->body.acquire_image.source.decision : &frame->body.acquire_witness.decision;
 	auth_peer_boot = source == 0 ? 31 : source == 1 ? 101 : a->holders[source].boot_incarnation;
 	return cluster_pcm_lock_resource_x_requester_join_current_exact(frame, source,
-		frame->common.sender_connection_generation, 0, 61, 77, out);
+		fake_rx_capability_generation, 0, 61, 77, out);
 }
 
 static ResourceXApplyResult

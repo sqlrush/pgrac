@@ -10251,3 +10251,45 @@ clean distclean maintainer-clean: clean-requester-evidence
 .PHONY: clean-requester-evidence
 clean-requester-evidence:
 	rm -f test_cluster_resource_x_requester_evidence
+
+# Original receiver and requester admission, with the real codec/PCM owners.
+TESTS += test_cluster_resource_x_requester_ingress
+all: test_cluster_resource_x_requester_ingress
+test_cluster_resource_x_requester_ingress: test_cluster_resource_x_requester_ingress.c \
+		test_cluster_resource_x_master_ack_fixture.inc \
+		test_cluster_resource_x_acquire_fixture.inc test_cluster_resource_x_acquire_candidate.inc \
+		test_cluster_resource_x_decision_owner_layout.inc \
+		test_cluster_resource_x_requester_evidence_fixture.inc \
+		test_cluster_resource_x_requester_ingress.inc \
+		test_cluster_resource_x_transport_frames.inc test_cluster_pcm_lock
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+test_cluster_resource_x_requester_evidence_fixture.inc: test_cluster_resource_x_requester_evidence.c Makefile
+	awk '/^typedef struct EvidenceFixture / { emit=1; begin++ } \
+	     /^UT_TEST\(/ { end++; exit } emit { print } \
+	     END { if (begin != 1 || end != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_resource_x_requester_ingress.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^typedef enum GcsBlockResourceXDiagnostic / { emit=1; types++ } \
+	     /^gcs_block_resource_x_frame_diagnostic\(/ { print "static GcsBlockResourceXDiagnostic"; emit=1; bodies++ } \
+	     /^gcs_block_resource_x_requester_join_ingress\(/ { print "static ResourceXApplyResult"; emit=1; bodies++ } \
+	     /^gcs_block_resource_x_gate_session_recheck_result\(/ { print "static ResourceXApplyResult"; emit=1; bodies++ } \
+	     /^gcs_block_try_resource_x_frame\(/ { print "static bool"; emit=1; bodies++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (types != 1 || bodies != 4 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+clean distclean maintainer-clean: clean-requester-ingress
+.PHONY: clean-requester-ingress
+clean-requester-ingress:
+	rm -f test_cluster_resource_x_requester_ingress \
+		test_cluster_resource_x_requester_evidence_fixture.inc test_cluster_resource_x_requester_evidence_fixture.inc.tmp \
+		test_cluster_resource_x_requester_ingress.inc test_cluster_resource_x_requester_ingress.inc.tmp

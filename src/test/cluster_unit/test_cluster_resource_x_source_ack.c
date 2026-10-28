@@ -45,7 +45,8 @@ source_ack(PublishFixture *f, int node)
 	w.original_ack.sender_connection_generation = 61;
 	w.has_source_proof = node == w.decision.source_node;
 	if (w.has_source_proof) {
-		w.original_ack.flags = RESOURCE_X_COMMON_FLAG_PI_ESTABLISHED;
+		w.original_ack.flags = w.decision.directory_mode == PCM_STATE_S
+			&& frame.common.target_mode == PCM_STATE_S ? 0 : RESOURCE_X_COMMON_FLAG_PI_ESTABLISHED;
 		p->source_fence[3] = node;
 		source_put_u64(p->source_fence + 4, w.decision.holders[node].boot_incarnation);
 		source_put_u64(p->source_fence + 12, 83);
