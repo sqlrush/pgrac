@@ -2013,6 +2013,10 @@ AlterPublicationOwner(const char *name, Oid newOwnerId)
 	ObjectAddress address;
 	Form_pg_publication pubform;
 
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedPublicationWrite("ALTER PUBLICATION", true);
+#endif
+
 	rel = table_open(PublicationRelationId, RowExclusiveLock);
 
 	tup = SearchSysCacheCopy1(PUBLICATIONNAME, CStringGetDatum(name));

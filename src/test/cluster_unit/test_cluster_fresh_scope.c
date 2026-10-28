@@ -5961,6 +5961,8 @@ GetUserId(void)
 }
 
 static bool publication_lookup_active, publication_expect_binding;
+static bool publication_owner_lookup_active, publication_owner_expect_binding;
+static unsigned publication_owner_lookups, publication_owner_unbound, publication_owner_bad_lookup;
 static unsigned publication_entry_kind, publication_lookups, publication_lookup_kind;
 static unsigned publication_unbound, publication_bad_lookup;
 Oid MyDatabaseId;
@@ -6413,6 +6415,14 @@ static unsigned role_rename_lookups, role_rename_unbound, role_rename_bad_lookup
 Relation
 table_open(Oid relationId, LOCKMODE lockmode)
 {
+	if (publication_owner_lookup_active) {
+		publication_owner_lookups++;
+		if (publication_owner_expect_binding && utility_binds == 0)
+			publication_owner_unbound++;
+		if (relationId != PublicationRelationId || lockmode != RowExclusiveLock)
+			publication_owner_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before the real publication catalog lock/query. */
+	}
 	if (database_options_lookup_active) {
 		database_options_lookups++;
 		if (database_options_expect_binding && utility_binds == 0)
@@ -16261,10 +16271,187 @@ UT_TEST(test_native_database_options_keeps_move_restriction_before_binding)
 	database_options_lookup_active = false;
 }
 
+/* Actual named owner prefix stops at its first catalog lock. The full BIND
+ * helper is already extracted by publication.inc; downstream owner work stays native. */
+#include "test_cluster_fresh_publication_owner.inc"
+static AlterOwnerStmt native_publication_owner_statement;
+static String publication_owner_name;
+static RoleSpec publication_owner_role;
+static Node *publication_owner_expected_statement;
+static const char *publication_owner_expected_name;
+static Oid publication_owner_newowner;
+
+static void
+reset_native_publication_owner(bool expect_binding, unsigned form)
+{
+	static const char *const names[] = { "owner_publication", "other_owner_publication" };
+	static const Oid owners[] = { 901, 902 };
+
+	reset_create_preflight();
+	publication_owner_lookup_active = true;
+	publication_owner_expect_binding = expect_binding;
+	publication_owner_lookups = publication_owner_unbound = publication_owner_bad_lookup = 0;
+	publication_owner_expected_name = names[form];
+	publication_owner_newowner = owners[form];
+	publication_owner_name
+		= (String){ .type = T_String, .sval = (char *)publication_owner_expected_name };
+	publication_owner_role = (RoleSpec){ .type = T_RoleSpec,
+										 .roletype = ROLESPEC_CSTRING,
+										 .rolename = "publication_new_owner",
+										 .location = -1 };
+	native_publication_owner_statement
+		= (AlterOwnerStmt){ .type = T_AlterOwnerStmt,
+							.objectType = OBJECT_PUBLICATION,
+							.object = (Node *)&publication_owner_name,
+							.newowner = &publication_owner_role };
+	publication_owner_expected_statement = (Node *)&native_publication_owner_statement;
+}
+
+static void
+native_publication_owner_entry(unsigned form)
+{
+	(void)form;
+	(void)AlterPublicationOwner(publication_owner_expected_name, publication_owner_newowner);
+}
+
+UT_TEST(test_native_publication_owner_binds_before_first_query_in_all_profiles)
+{
+	for (unsigned form = 0; form < 2; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_publication_owner(binds, form);
+			set_native_operator_mode(mode);
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_publication_owner_entry(form);
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(publication_owner_lookups, repeat + 1);
+				UT_ASSERT_EQ(publication_owner_unbound, 0);
+				UT_ASSERT_EQ(publication_owner_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	publication_owner_lookup_active = false;
+}
+
+UT_TEST(test_native_publication_owner_refuses_before_lookup_on_publication_child_and_top_errors)
+{
+	for (unsigned form = 0; form < 2; form++) {
+		for (unsigned failure = 0; failure < 5; failure++) {
+			bool allocated = failure == 0 || failure == 2;
+			int caught;
+
+			reset_native_publication_owner(true, form);
+			if (failure == 0)
+				utility_bind_ok = false;
+			else if (failure == 1 || failure == 2) {
+				if (failure == 2)
+					create_sql_entry(publication_owner_expected_statement);
+				utility_in_child = true;
+			} else {
+				utility_current_xid = 401;
+				utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_publication_owner_entry(form);
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, failure == 0  ? ERRCODE_DATA_CORRUPTED
+									 : failure < 3 ? ERRCODE_FEATURE_NOT_SUPPORTED
+												   : ERRCODE_INTERNAL_ERROR);
+			UT_ASSERT_STR_EQ(
+				error_message,
+				failure == 0
+					? "canonical ACTIVE publication failed before shared catalog alteration"
+				: failure < 3 ? "shared catalog alteration does not support subtransactions"
+							  : "shared catalog top-level transaction identity mismatch");
+			UT_ASSERT_EQ(publication_owner_lookups, 0);
+			UT_ASSERT_EQ(publication_owner_unbound + publication_owner_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_xids, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, failure == 2 ? 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, allocated || failure == 3 ? 400 : InvalidTransactionId);
+		}
+	}
+	publication_owner_lookup_active = false;
+}
+
+UT_TEST(test_native_publication_owner_context_guards_keep_nonshared_route)
+{
+	for (unsigned form = 0; form < 2; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+
+			for (unsigned guard = 0; guard < 3; guard++) {
+				int caught;
+
+				reset_native_publication_owner(binds, form);
+				set_native_operator_mode(mode);
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_publication_owner_entry(form);
+				UT_ASSERT_EQ(caught, binds ? 1 : 2);
+				UT_ASSERT_EQ(error_code, !binds		  ? 0
+										 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+													  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				if (binds)
+					UT_ASSERT(strstr(error_message, "ALTER PUBLICATION") != NULL);
+				UT_ASSERT_EQ(publication_owner_lookups, binds ? 0 : 1);
+				UT_ASSERT_EQ(publication_owner_unbound + publication_owner_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	publication_owner_lookup_active = false;
+}
+
+UT_TEST(test_native_publication_owner_utility_warm_guards_preserve_binding)
+{
+	for (unsigned form = 0; form < 2; form++) {
+		for (unsigned guard = 0; guard < 4; guard++) {
+			int caught;
+
+			reset_native_publication_owner(true, form);
+			create_sql_entry(publication_owner_expected_statement);
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			XactReadOnly = guard == 1;
+			utility_parallel = guard == 2;
+			utility_recovery = guard == 3;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_publication_owner_entry(form);
+			UT_ASSERT_EQ(caught, guard ? 1 : 2);
+			UT_ASSERT_EQ(error_code, !guard		  ? 0
+									 : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+												  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT_EQ(publication_owner_lookups, guard ? 0 : 1);
+			UT_ASSERT_EQ(publication_owner_unbound + publication_owner_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_prepares, guard ? 1 : 2);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			UT_ASSERT_EQ(utility_top_xid, 400);
+		}
+	}
+	publication_owner_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(255);
+	UT_PLAN(259);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -16520,6 +16707,10 @@ main(void)
 	UT_RUN(test_native_database_options_utility_warm_guards_preserve_binding);
 	UT_RUN(test_native_database_options_keeps_original_option_errors_before_binding);
 	UT_RUN(test_native_database_options_keeps_move_restriction_before_binding);
+	UT_RUN(test_native_publication_owner_binds_before_first_query_in_all_profiles);
+	UT_RUN(test_native_publication_owner_refuses_before_lookup_on_publication_child_and_top_errors);
+	UT_RUN(test_native_publication_owner_context_guards_keep_nonshared_route);
+	UT_RUN(test_native_publication_owner_utility_warm_guards_preserve_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
