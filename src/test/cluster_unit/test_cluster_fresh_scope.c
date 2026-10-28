@@ -75,6 +75,7 @@
 #include "commands/seclabel.h"
 #include "commands/sequence.h"
 #include "commands/subscriptioncmds.h"
+#include "commands/trigger.h"
 #include "commands/user.h"
 #include "commands/view.h"
 #include "cluster/cluster_ic.h"
@@ -350,6 +351,11 @@ cluster_tt_local_prepare_canonical_active(TransactionId xid, ClusterCanonicalTxn
 	return true;
 }
 
+static bool trigger_rename_lookup_active, trigger_rename_expect_binding;
+static unsigned trigger_rename_lookups, trigger_rename_unbound, trigger_rename_bad_lookup;
+static unsigned trigger_rename_unexpected_callbacks;
+static RangeVar *trigger_rename_expected_relation;
+
 static bool rule_rename_lookup_active, rule_rename_expect_binding;
 static unsigned rule_rename_lookups, rule_rename_unbound, rule_rename_bad_lookup;
 static unsigned rule_rename_unexpected_callbacks;
@@ -388,6 +394,8 @@ static unsigned database_identity_lookups, database_identity_unbound, database_i
 CommandTag
 CreateCommandTag(Node *statement)
 {
+	if (trigger_rename_lookup_active && IsA(statement, RenameStmt))
+		return AlterObjectTypeCommandTag(((RenameStmt *)statement)->renameType);
 	if (rule_rename_lookup_active && IsA(statement, RenameStmt))
 		return AlterObjectTypeCommandTag(((RenameStmt *)statement)->renameType);
 	if (database_identity_lookup_active
@@ -622,6 +630,11 @@ CreateCommandTag(Node *statement)
 const char *
 GetCommandTagName(CommandTag tag)
 {
+	if (trigger_rename_lookup_active) {
+		if ((unsigned)tag >= lengthof(rename_dispatch_command_names))
+			siglongjmp(boundary, 3);
+		return rename_dispatch_command_names[tag];
+	}
 	if (rule_rename_lookup_active) {
 		if ((unsigned)tag >= lengthof(rename_dispatch_command_names))
 			siglongjmp(boundary, 3);
@@ -7885,6 +7898,18 @@ RangeVarCallbackOwnsRelation(const RangeVar *relation, Oid relid, Oid oldrelid, 
 }
 
 static void
+RangeVarCallbackForRenameTrigger(const RangeVar *relation, Oid relid, Oid oldrelid, void *arg)
+{
+	(void)relation;
+	(void)relid;
+	(void)oldrelid;
+	(void)arg;
+	trigger_rename_unexpected_callbacks++;
+	siglongjmp(boundary,
+			   3); /* The query boundary must not invoke the native permission callback. */
+}
+
+static void
 RangeVarCallbackForRenameRule(const RangeVar *relation, Oid relid, Oid oldrelid, void *arg)
 {
 	(void)relation;
@@ -7900,6 +7925,15 @@ Oid
 RangeVarGetRelidExtended(const RangeVar *relation, LOCKMODE lockmode, uint32 flags,
 						 RangeVarGetRelidCallback callback, void *callback_arg)
 {
+	if (trigger_rename_lookup_active) {
+		trigger_rename_lookups++;
+		if (trigger_rename_expect_binding && utility_binds == 0)
+			trigger_rename_unbound++;
+		if (relation != trigger_rename_expected_relation || lockmode != AccessExclusiveLock
+			|| flags != 0 || callback != RangeVarCallbackForRenameTrigger || callback_arg != NULL)
+			trigger_rename_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before the real query, lock or permission callback. */
+	}
 	if (rule_rename_lookup_active) {
 		rule_rename_lookups++;
 		if (rule_rename_expect_binding && utility_binds == 0)
@@ -17051,10 +17085,193 @@ UT_TEST(test_native_rule_rename_utility_warm_guards_preserve_binding)
 	rule_rename_lookup_active = false;
 }
 
+/* Actual native trigger rename prefix exits before its first relation query;
+ * the permission callback, name lookup and mutation stay native. */
+#include "test_cluster_fresh_trigger_rename.inc"
+static RenameStmt native_trigger_rename_statement;
+static RangeVar trigger_rename_relation;
+static Node *trigger_rename_expected_statement;
+static const char *trigger_rename_old_name, *trigger_rename_new_name;
+
+static void
+reset_native_trigger_rename(bool expect_binding, unsigned form)
+{
+	static const char *const tables[] = { "trigger_table", "other_trigger_table" };
+	static const char *const old_names[] = { "old_trigger", "other_old_trigger" };
+	static const char *const new_names[] = { "new_trigger", "other_new_trigger" };
+
+	reset_create_preflight();
+	trigger_rename_lookup_active = true;
+	trigger_rename_expect_binding = expect_binding;
+	trigger_rename_lookups = trigger_rename_unbound = trigger_rename_bad_lookup = 0;
+	trigger_rename_unexpected_callbacks = 0;
+	trigger_rename_relation = (RangeVar){ .type = T_RangeVar,
+										  .catalogname = form ? "trigger_database" : NULL,
+										  .schemaname = form ? "trigger_schema" : NULL,
+										  .relname = (char *)tables[form],
+										  .inh = form != 0,
+										  .location = -1 };
+	trigger_rename_expected_relation = &trigger_rename_relation;
+	trigger_rename_old_name = old_names[form];
+	trigger_rename_new_name = new_names[form];
+	native_trigger_rename_statement = (RenameStmt){ .type = T_RenameStmt,
+													.renameType = OBJECT_TRIGGER,
+													.relationType = OBJECT_TABLE,
+													.relation = &trigger_rename_relation,
+													.subname = (char *)trigger_rename_old_name,
+													.newname = (char *)trigger_rename_new_name };
+	trigger_rename_expected_statement = (Node *)&native_trigger_rename_statement;
+}
+
+static void
+native_trigger_rename_entry(unsigned form)
+{
+	(void)form;
+	(void)renametrig((RenameStmt *)trigger_rename_expected_statement);
+}
+
+UT_TEST(test_native_trigger_rename_binds_before_first_query_in_all_profiles)
+{
+	for (unsigned form = 0; form < 2; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_trigger_rename(binds, form);
+			set_native_operator_mode(mode);
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_trigger_rename_entry(form);
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(trigger_rename_lookups, repeat + 1);
+				UT_ASSERT_EQ(trigger_rename_unbound, 0);
+				UT_ASSERT_EQ(trigger_rename_bad_lookup, 0);
+				UT_ASSERT_EQ(trigger_rename_unexpected_callbacks, 0);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	trigger_rename_lookup_active = false;
+}
+
+UT_TEST(test_native_trigger_rename_refuses_before_lookup_on_publication_child_and_top_errors)
+{
+	for (unsigned form = 0; form < 2; form++) {
+		for (unsigned failure = 0; failure < 5; failure++) {
+			bool allocated = failure == 0 || failure == 2;
+			int caught;
+
+			reset_native_trigger_rename(true, form);
+			if (failure == 0)
+				utility_bind_ok = false;
+			else if (failure == 1 || failure == 2) {
+				if (failure == 2)
+					create_sql_entry(trigger_rename_expected_statement);
+				utility_in_child = true;
+			} else {
+				utility_current_xid = 401;
+				utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_trigger_rename_entry(form);
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, failure == 0  ? ERRCODE_DATA_CORRUPTED
+									 : failure < 3 ? ERRCODE_FEATURE_NOT_SUPPORTED
+												   : ERRCODE_INTERNAL_ERROR);
+			UT_ASSERT_STR_EQ(
+				error_message,
+				failure == 0
+					? "canonical ACTIVE publication failed before shared catalog alteration"
+				: failure < 3 ? "shared catalog alteration does not support subtransactions"
+							  : "shared catalog top-level transaction identity mismatch");
+			UT_ASSERT_EQ(trigger_rename_lookups, 0);
+			UT_ASSERT_EQ(trigger_rename_unbound + trigger_rename_bad_lookup, 0);
+			UT_ASSERT_EQ(trigger_rename_unexpected_callbacks, 0);
+			UT_ASSERT_EQ(utility_xids, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, failure == 2 ? 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, allocated || failure == 3 ? 400 : InvalidTransactionId);
+		}
+	}
+	trigger_rename_lookup_active = false;
+}
+
+UT_TEST(test_native_trigger_rename_context_guards_keep_nonshared_route)
+{
+	for (unsigned form = 0; form < 2; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+
+			for (unsigned guard = 0; guard < 3; guard++) {
+				int caught;
+
+				reset_native_trigger_rename(binds, form);
+				set_native_operator_mode(mode);
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_trigger_rename_entry(form);
+				UT_ASSERT_EQ(caught, binds ? 1 : 2);
+				UT_ASSERT_EQ(error_code, !binds		  ? 0
+										 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+													  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				if (binds)
+					UT_ASSERT(strstr(error_message, "ALTER TRIGGER") != NULL);
+				UT_ASSERT_EQ(trigger_rename_lookups, binds ? 0 : 1);
+				UT_ASSERT_EQ(trigger_rename_unbound + trigger_rename_bad_lookup, 0);
+				UT_ASSERT_EQ(trigger_rename_unexpected_callbacks, 0);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	trigger_rename_lookup_active = false;
+}
+
+UT_TEST(test_native_trigger_rename_utility_warm_guards_preserve_binding)
+{
+	for (unsigned form = 0; form < 2; form++) {
+		for (unsigned guard = 0; guard < 4; guard++) {
+			int caught;
+
+			reset_native_trigger_rename(true, form);
+			create_sql_entry(trigger_rename_expected_statement);
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			XactReadOnly = guard == 1;
+			utility_parallel = guard == 2;
+			utility_recovery = guard == 3;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_trigger_rename_entry(form);
+			UT_ASSERT_EQ(caught, guard ? 1 : 2);
+			UT_ASSERT_EQ(error_code, !guard		  ? 0
+									 : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+												  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT_EQ(trigger_rename_lookups, guard ? 0 : 1);
+			UT_ASSERT_EQ(trigger_rename_unbound + trigger_rename_bad_lookup, 0);
+			UT_ASSERT_EQ(trigger_rename_unexpected_callbacks, 0);
+			UT_ASSERT_EQ(utility_prepares, guard ? 1 : 2);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			UT_ASSERT_EQ(utility_top_xid, 400);
+		}
+	}
+	trigger_rename_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(271);
+	UT_PLAN(275);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -17327,6 +17544,10 @@ main(void)
 	UT_RUN(test_native_rule_rename_refuses_before_lookup_on_publication_child_and_top_errors);
 	UT_RUN(test_native_rule_rename_context_guards_keep_nonshared_route);
 	UT_RUN(test_native_rule_rename_utility_warm_guards_preserve_binding);
+	UT_RUN(test_native_trigger_rename_binds_before_first_query_in_all_profiles);
+	UT_RUN(test_native_trigger_rename_refuses_before_lookup_on_publication_child_and_top_errors);
+	UT_RUN(test_native_trigger_rename_context_guards_keep_nonshared_route);
+	UT_RUN(test_native_trigger_rename_utility_warm_guards_preserve_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
