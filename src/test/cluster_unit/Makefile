@@ -1431,6 +1431,9 @@ test_cluster_startup_cf_entry: test_cluster_startup_cf_entry.c test_cluster_cf_e
 		test_cluster_rejoin_cf.h test_cluster_rejoin_cf.inc test_cluster_rejoin_cf_types.inc \
 		test_cluster_cold_own_root_cf.h test_cluster_cold_own_root_cf.inc \
 		test_cluster_wal_pin_cf.h test_cluster_wal_pin_cf.inc test_cluster_wal_pin_cf_types.inc \
+		test_cluster_ir_preflight_cf.h \
+		$(top_srcdir)/src/backend/cluster/cluster_ir.c \
+		$(top_srcdir)/src/backend/cluster/cluster_ir_lock.c \
 		test_cluster_startup_cf_entry.inc test_cluster_startup_cf_callsite.inc \
 		test_cluster_merge_cf_entry.inc \
 		test_cluster_merge_cold_cf.inc \
