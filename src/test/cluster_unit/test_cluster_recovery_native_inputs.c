@@ -1098,6 +1098,7 @@ cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **held)
 #define relmap_history_fixture episode_pending_relmap_history_fixture
 #include "test_cluster_recovery_episode_clog_side.inc"
 #undef relmap_history_fixture
+#include "test_cluster_recovery_episode_birth_halfspace.inc"
 #include "test_cluster_recovery_episode_generation_xid.inc"
 #include "test_cluster_recovery_clog_full_roots.inc"
 
@@ -1288,7 +1289,17 @@ main(int argc, char **argv)
 		UT_RUN(test_episode_clog_side_whole_output_owner_error_retains_original_custody);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(202);
+	if (getenv("PGRAC_PRE2_TEST_BIRTH_HALFSPACE") != NULL) {
+		UT_PLAN(3);
+		UT_RUN(test_episode_birth_halfspace_accepts_last_unambiguous_whole_page_position);
+		UT_RUN(test_episode_birth_halfspace_refuses_exact_whole_page_half_cycle);
+		UT_RUN(test_episode_birth_halfspace_refuses_later_tail_with_legal_query_distance);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	UT_PLAN(205);
+	UT_RUN(test_episode_birth_halfspace_accepts_last_unambiguous_whole_page_position);
+	UT_RUN(test_episode_birth_halfspace_refuses_exact_whole_page_half_cycle);
+	UT_RUN(test_episode_birth_halfspace_refuses_later_tail_with_legal_query_distance);
 	UT_RUN(test_episode_clog_side_matches_all_physical_generations_in_one_original_pass);
 	UT_RUN(test_episode_clog_side_refuses_complete_native_header_and_payload_mismatches);
 	UT_RUN(test_episode_clog_side_requires_every_original_plan_before_and_after_reread);

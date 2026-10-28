@@ -3002,6 +3002,24 @@ history_pending_clog_side_counts(ClusterRecoveryRelmapHistory *history,
 	return inventory_history_inputs(inventory, history->original.scope, false);
 }
 
+/* The original bounds already order every counter between checkpoint and
+ * tail and keep that interval below half a raw cycle. The exact FULL page
+ * first can precede checkpoint and query; include it in that same interval.
+ * This necessary consistency check grants no native era or lifetime. */
+static bool
+history_pending_birth_halfspace(const ClusterRecoveryRelmapPendingBirthV1 *birth)
+{
+	const ClusterRecoveryRelmapPendingXidV1 *inputs = &birth->inputs;
+	uint64 first;
+
+	if (birth->birth_index >= inputs->clog_count
+		|| birth->birth_index >= CLUSTER_RECOVERY_RELMAP_CLOG_HISTORY_MAX)
+		return false;
+	first = inputs->clog[birth->birth_index].full_birth.first_full_xid;
+	return first <= inputs->tail_next
+		&& inputs->tail_next - first < UINT64_C(0x80000000);
+}
+
 static bool
 history_pending_terminal_read(ClusterRecoveryRelmapHistory *history,
 	const ClusterRelmapV2Image *pending, ClusterRecoveryRelmapPendingTerminalV1 *out,
@@ -3079,6 +3097,7 @@ history_pending_terminal_read(ClusterRecoveryRelmapHistory *history,
 		if (ok && birth != NULL) {
 			ok = history_pending_xid_finish(history, pending, xid, &birth->inputs)
 				&& history_pending_birth_match(&birth->inputs, pending, &birth->birth_index)
+				&& (!xid->side_clog || history_pending_birth_halfspace(birth))
 				&& memcmp(&birth->inputs.history, &result.base.history,
 					sizeof(result.base.history)) == 0
 				&& saved->source_index == birth->inputs.history.observation.source_index
