@@ -721,6 +721,21 @@ cluster_pcm_lock_resource_x_itl_recycle_finish_exact(const ResourceXLocalOwnerHa
 	return RESOURCE_X_APPLY_APPLIED;
 }
 
+static unsigned receive_custody_calls;
+static bool receive_custody_ok;
+static bool
+gcs_block_resource_x_ctrc_receive_image(const ResourceXDecodedFrame *frame,
+	const ClusterSemanticAdmissionToken *admission, int32 source, uint32 connection)
+{
+	UT_ASSERT(admission->entered);
+	UT_ASSERT_EQ(admission->record_generation, 77);
+	UT_ASSERT_EQ(source, 1);
+	UT_ASSERT_EQ(connection, 61);
+	UT_ASSERT_EQ(frame->body.image_envelope.ctrc_delegation_bytes, 232);
+	receive_custody_calls++;
+	return receive_custody_ok;
+}
+
 #include "test_cluster_resource_x_terminal_owner.inc"
 
 /* The exact foreground terminal predicate is compiled below. Only its two
@@ -2526,10 +2541,36 @@ UT_TEST(test_actual_failed_round_observation_retries_only_exact_predecessor_shap
 	scenario = 0;
 }
 
+UT_TEST(test_actual_v3_receive_registers_under_admission_and_stays_before_pcm)
+{
+	for (unsigned variant = 0; variant < 3; variant++) {
+		ClusterICEnvelope env = { 0 };
+		ResourceXDecodedFrame frame = { 0 };
+		ResourceXRequesterJoinSnapshot out = { 0 };
+
+		reset_delivery_fixture();
+		master = 1;
+		scenario = variant == 2 ? 9 : 0;
+		peer_checks = rechecks = leaves = joins = installs = publishes = 0;
+		receive_custody_calls = 0;
+		receive_custody_ok = variant == 0;
+		env.source_node_id = 1;
+		frame.kind = RESOURCE_X_WIRE_IMAGE_ENVELOPE;
+		frame.common.resource_formation = 17;
+		frame.common.master_session_incarnation = 31;
+		frame.body.image_envelope.ctrc_delegation_bytes = 232;
+		UT_ASSERT_EQ(gcs_block_resource_x_requester_join_ingress(&env, &frame, 61, &out),
+			variant == 0 ? RESOURCE_X_APPLY_BAD_STATE : RESOURCE_X_APPLY_STALE);
+		UT_ASSERT_EQ(receive_custody_calls, variant == 2 ? 0 : 1);
+		UT_ASSERT_EQ(joins + installs + publishes + cleanup_joins, 0);
+		UT_ASSERT_EQ(leaves, 1);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(29);
+	UT_PLAN(30);
 	UT_RUN(test_actual_terminal_ingress_keeps_master_and_physical_source_distinct);
 	UT_RUN(test_actual_kind9_ingress_does_not_send_ack_for_fused_admission);
 	UT_RUN(test_actual_fused_admission_notifies_ready_resource_without_registry_tick);
@@ -2559,6 +2600,7 @@ main(void)
 	UT_RUN(test_eviction_reserves_before_n_and_registers_before_release);
 	UT_RUN(test_eviction_retains_first_separately_from_latest);
 	UT_RUN(test_actual_failed_round_observation_retries_only_exact_predecessor_shape);
+	UT_RUN(test_actual_v3_receive_registers_under_admission_and_stays_before_pcm);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

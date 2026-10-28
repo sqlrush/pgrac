@@ -10149,6 +10149,82 @@ refused:
 	return false;
 }
 
+/* First-hop protective receive, not image authority. The Tier1 caller has
+ * already authenticated the DATA source; R11's original admission and OPEN
+ * table independently supply both expected identities. Preserve every local
+ * parent on later refusal/ERROR. No page or PCM join is published here. */
+static bool
+gcs_block_resource_x_ctrc_receive_image(const ResourceXDecodedFrame *frame,
+	const ClusterSemanticAdmissionToken *admission, int32 source, uint32 connection)
+{
+	ClusterCtrcParticipantIdentity sender, receiver, final_sender, final_receiver;
+	const ResourceXDecodedImageEnvelope *image;
+	const ClusterItlSlotData *slots;
+	const uint8 *bundle;
+	PageHeader page;
+	uint8 expected_source[12];
+	uint16 bytes, count = 0, used;
+	uint64 self_boot = cluster_qvotec_get_self_incarnation();
+
+	if (frame == NULL || frame->kind != RESOURCE_X_WIRE_IMAGE_ENVELOPE
+		|| frame->common.logical_assertion.requester_node != cluster_node_id
+		|| frame->common.logical_assertion.resource.forkNum != MAIN_FORKNUM)
+		return false;
+	image = &frame->body.image_envelope;
+	bytes = image->ctrc_delegation_bytes;
+	bundle = image->ctrc_delegation;
+	page = (PageHeader)image->page_bytes;
+	if (image->image_length != BLCKSZ || !PageHasItl((Page)page)
+		|| bytes < RESOURCE_X_CTRC_BUNDLE_HEADER_BYTES
+		|| bytes > RESOURCE_X_CTRC_BUNDLE_MAX_BYTES
+		|| PageGetPageSize((Page)page) != BLCKSZ
+		|| PageGetPageLayoutVersion((Page)page) != PG_PAGE_LAYOUT_VERSION
+		|| (page->pd_flags & ~PD_VALID_FLAG_BITS) != 0
+		|| page->pd_lower < SizeOfPageHeaderData || page->pd_lower > page->pd_upper
+		|| page->pd_upper > page->pd_special || page->pd_special != MAXALIGN(page->pd_special)
+		|| page->pd_special > BLCKSZ - CLUSTER_ITL_ARRAY_SIZE)
+		return false;
+	slots = ClusterPageGetItlSlots((Page)page);
+	for (uint16 i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
+		if (slots[i].flags == ITL_FLAG_FREE) {
+			ClusterItlSlotData empty = { 0 };
+
+			empty.wrap = slots[i].wrap;
+			if (memcmp(&empty, &slots[i], sizeof(empty)) != 0)
+				return false;
+		} else if (slots[i].flags < ITL_FLAG_ACTIVE || slots[i].flags > ITL_FLAG_NEEDS_CLEANOUT
+			|| !TransactionIdIsNormal(slots[i].xid) || UBA_is_invalid(slots[i].undo_segment_head))
+			return false;
+		else
+			count++;
+	}
+	if (count == 0 || bytes != RESOURCE_X_CTRC_BUNDLE_HEADER_BYTES
+			+ count * CLUSTER_CTRC_DELEGATION_V1_BYTES
+		|| bundle[0] != 0 || bundle[1] != RESOURCE_X_CTRC_BUNDLE_VERSION
+		|| bundle[2] != (uint8)(bytes >> 8) || bundle[3] != (uint8)bytes
+		|| bundle[4] != 0 || bundle[5] != count || bundle[6] != 0 || bundle[7] != 0
+		|| !gcs_block_resource_x_ctrc_source_identities(admission, source, connection,
+			self_boot, &receiver, &sender))
+		return false;
+	gcs_block_resource_x_put_u32(expected_source, sender.node_id);
+	gcs_block_resource_x_put_u64(expected_source + 4, sender.boot_incarnation);
+	if (memcmp(expected_source, image->source_fence, sizeof(expected_source)) != 0)
+		return false;
+	used = RESOURCE_X_CTRC_BUNDLE_HEADER_BYTES;
+	for (uint16 i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
+		if (slots[i].flags == ITL_FLAG_FREE)
+			continue;
+		if (!cluster_ctrc_itl_delegate_accept_v1(&slots[i], &sender, &receiver,
+			bundle + used, CLUSTER_CTRC_DELEGATION_V1_BYTES))
+			return false;
+		used += CLUSTER_CTRC_DELEGATION_V1_BYTES;
+	}
+	return gcs_block_resource_x_ctrc_source_identities(admission, source, connection,
+			self_boot, &final_receiver, &final_sender)
+		&& memcmp(&receiver, &final_receiver, sizeof(receiver)) == 0
+		&& memcmp(&sender, &final_sender, sizeof(sender)) == 0;
+}
+
 static bool
 gcs_block_pcm_x_resource_x_abort_pre_arm(BufferDesc *buf, const ClusterPcmOwnSnapshot *revoking)
 {
@@ -13762,6 +13838,17 @@ gcs_block_resource_x_requester_join_ingress(const ClusterICEnvelope *env,
 					result = gcs_block_resource_x_gate_session_recheck_result(
 						&frame->common.logical_assertion.resource, &gate, master_node,
 						master_session);
+				if (result == RESOURCE_X_APPLY_APPLIED
+					&& frame->kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE
+					&& frame->body.image_envelope.ctrc_delegation_bytes != 0) {
+					/* Retain the upstream parent before any local visibility.
+					 * Exact receipt installation and subtree CLOSE are not yet
+					 * qualified: neither success nor partial custody enters PCM.
+					 * Later refusal never cancels an accepted responsibility. */
+					result = gcs_block_resource_x_ctrc_receive_image(frame, &admission,
+						source, authenticated_connection_generation)
+						? RESOURCE_X_APPLY_BAD_STATE : RESOURCE_X_APPLY_STALE;
+				}
 				if (result == RESOURCE_X_APPLY_APPLIED) {
 					result = cluster_pcm_lock_resource_x_requester_join_current_exact(
 						frame, source, authenticated_connection_generation, master_node,
@@ -14141,12 +14228,8 @@ gcs_block_try_resource_x_frame(const ClusterICEnvelope *env, const void *payload
 										   &frame, &reject)) {
 		return true;
 	}
-	/* A decoded delegation carrier is not receiver protection. Keep the new
-	 * wire closed before any PCM/join/install side effect until the actual
-	 * local custody registration owns this path. Never fall back to V2. */
-	if (frame.kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE
-		&& frame.body.image_envelope.ctrc_delegation_bytes != 0)
-		return true;
+	/* Delegated images reach only the authenticated, admitted protective
+	 * receiver below. That branch still refuses before PCM join/install. */
 	cluster_pcm_lock_resource_x_trace_frame(RESOURCE_X_TRACE_RECEIVE, &frame,
 											(int32)env->source_node_id, 0);
 	if (env->epoch != cluster_epoch_get_current()) {

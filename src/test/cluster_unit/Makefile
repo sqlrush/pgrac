@@ -2917,8 +2917,9 @@ test_cluster_page_wal_image.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_b
 	     /^gcs_block_pcm_x_resource_x_build_source_frames\(/ \
 	       || /^gcs_block_resource_x_ctrc_source_identities\(/ \
 	       || /^gcs_block_pcm_x_resource_x_delegate_source_frames\(/ \
+	       || /^gcs_block_resource_x_ctrc_receive_image\(/ \
 	       { print "static bool"; emit=1; n++ } \
-	     emit { print } emit && /^}/ { emit=0 } END { if (n != 6 || emit) exit 1 }' $< > $@.tmp
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 7 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_page_wal_pregrant.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile

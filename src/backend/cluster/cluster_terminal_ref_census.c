@@ -6175,6 +6175,82 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 		return ctrc_receipt_prepare_refused(false);
 	return result;
 }
+
+/* The authenticated IMAGE owns the copied slot and the two current peer
+ * identities. Only the immutable origin envelope supplies the transaction
+ * key/epoch. UBA checks its physical TT locator; it never widens a raw xid.
+ * This parent-only registration deliberately cannot retire or authorize a
+ * page. The ordinary receipt engine may subsequently add exact references. */
+bool
+cluster_ctrc_itl_delegate_accept_v1(const ClusterItlSlotData *slot,
+	const ClusterCtrcParticipantIdentity *authenticated_sender,
+	const ClusterCtrcParticipantIdentity *receiver, const uint8 *record, Size length)
+{
+	ClusterCtrcTxnKeyV1 key;
+	ClusterCtrcDelegationCustodyV1 parent = { 0 };
+	ClusterCtrcParticipantEntry fresh = { 0 };
+	ClusterCtrcParticipantEntry *participant;
+	FullTransactionId original;
+	uint32 segment, block, grant, lock_mask;
+	uint16 tt_offset, row_offset;
+	uint64 index;
+	bool accepted = false;
+
+	if (!cluster_ctrc_shmem_ready() || slot == NULL || receiver == NULL
+		|| cluster_node_id < 0 || receiver->node_id != (uint16)cluster_node_id
+		|| record == NULL || length != CLUSTER_CTRC_DELEGATION_V1_BYTES
+		|| !ctrc_txn_key_decode(record + 24, &key))
+		return false;
+	grant = ctrc_get_u32_le(record + 12);
+	if (!ctrc_delegation_first_hop_match(record, length, &key, authenticated_sender,
+			receiver, grant, &original, &parent.sequence)
+		|| !TransactionIdIsNormal(slot->xid) || slot->xid != key.xid
+		|| slot->flags < ITL_FLAG_ACTIVE || slot->flags > ITL_FLAG_NEEDS_CLEANOUT
+		|| !uba_decode(slot->undo_segment_head, &segment, &block, &tt_offset, &row_offset)
+		|| uba_origin_node_id(slot->undo_segment_head) != key.origin_node_id
+		|| segment != key.segment_id || tt_offset != key.slot_offset
+		|| !ctrc_participant_index(&key, receiver->node_id, &index))
+		return false;
+	parent.receiver = *authenticated_sender;
+	if (cluster_ctrc_participant_open(&fresh, &key, grant, receiver)
+		!= CLUSTER_CTRC_PARTICIPANT_OPENED)
+		return false;
+	fresh.original_full_xid = original;
+	memcpy(fresh.original_identity_v2, record + 8, sizeof(fresh.original_identity_v2));
+	fresh.delegation_parent = parent;
+	if (!ctrc_participant_delegations_valid(&fresh))
+		return false;
+
+	lock_mask = ctrc_participant_lock_mask(index);
+	ctrc_participant_locks_acquire(lock_mask);
+	LWLockAcquire(&CtrcShared->receipt_lock, LW_SHARED);
+	participant = &ctrc_participant_entries()[index];
+	if (!ctrc_receipt_chain_exact_locked(index, false))
+		goto done;
+	if (ctrc_bytes_zero(participant, sizeof(*participant))) {
+		/* One publication under the original shard lock, before the caller
+		 * can make any image visible. Failure after this point keeps custody. */
+		ctrc_note_unqualified_registration();
+		*participant = fresh;
+		accepted = true;
+	} else {
+		/* No raw-only qualification or alternate-parent merge. Even a fully
+		 * drained local row keeps this original parent until subtree CLOSE. */
+		accepted = participant->state == CTRC_PARTICIPANT_OPEN
+			&& participant->seal_generation == 0 && participant->grant_generation == grant
+			&& memcmp(&participant->key, &key, sizeof(key)) == 0
+			&& memcmp(&participant->identity, receiver, sizeof(*receiver)) == 0
+			&& FullTransactionIdEquals(participant->original_full_xid, original)
+			&& memcmp(participant->original_identity_v2, record + 8,
+				sizeof(participant->original_identity_v2)) == 0
+			&& memcmp(&participant->delegation_parent, &parent, sizeof(parent)) == 0
+			&& ctrc_participant_delegations_valid(participant);
+	}
+done:
+	LWLockRelease(&CtrcShared->receipt_lock);
+	ctrc_participant_locks_release(lock_mask);
+	return accepted;
+}
 #endif
 
 ClusterCtrcPrepareResult

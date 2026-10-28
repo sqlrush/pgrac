@@ -213,7 +213,7 @@ SCAN_RULES: Tuple[ScanRule, ...] = (
             "src/backend/cluster/cluster_tt_slot.c",
             "src/backend/cluster/cluster_tt_durable.c",
         ),
-        r"\b(?:cluster_ctrc_origin_original_full_xid_(?:exact|shared)|cluster_ctrc_origin_fullxid_(?:capture_v2|match_v2)|cluster_ctrc_origin_grant_fullxid_v2|cluster_ctrc_itl_delegate_prepare_v1|ctrc_origin_fullxid_encode_v2|cluster_multixact_current_member_proof_bind_origin_v2|cluster_tt_slot_origin_identity_(?:retain|read))\s*\(",
+        r"\b(?:cluster_ctrc_origin_original_full_xid_(?:exact|shared)|cluster_ctrc_origin_fullxid_(?:capture_v2|match_v2)|cluster_ctrc_origin_grant_fullxid_v2|cluster_ctrc_itl_delegate_(?:prepare|accept)_v1|gcs_block_resource_x_ctrc_receive_image|ctrc_origin_fullxid_encode_v2|cluster_multixact_current_member_proof_bind_origin_v2|cluster_tt_slot_origin_identity_(?:retain|read))\s*\(",
     ),
     ScanRule(
         "CTRC_RECEIPT_LIFECYCLE",
@@ -580,6 +580,23 @@ for path, owners in (
         "CTRC_TARGET_PAGE_PENDING_ITL_SLOT|CTRC_TARGET_EXACT_ITL_SLOT",
         "cluster_ctrc_itl_delegate_prepare_v1",
         "RETAIN_PENDING_SUBTREE_CLOSE_ACK",
+        "MXA-T40",
+    )
+# Protective IMAGE receive owns the original parent before PCM admission.
+# It cannot install a page or release a parent when local receipts are absent.
+for path, owners in (
+    ("src/backend/cluster/cluster_gcs_block.c",
+     ("gcs_block_resource_x_ctrc_receive_image", "gcs_block_resource_x_requester_join_ingress")),
+    ("src/backend/cluster/cluster_terminal_ref_census.c",
+     ("cluster_ctrc_itl_delegate_accept_v1",)),
+):
+    _classify_owners(
+        "CTRC_ORIGIN_PROVENANCE", path, owners,
+        "REGISTERED_REFERENCE",
+        "CTRC_REF_HEAP_ITL_UBA",
+        "CTRC_TARGET_PAGE_PENDING_ITL_SLOT|CTRC_TARGET_EXACT_ITL_SLOT",
+        "cluster_ctrc_itl_delegate_accept_v1",
+        "RETAIN_PENDING_PARENT_CLOSE_ACK",
         "MXA-T40",
     )
 # The new producer retains outgoing custody; receipt discharge cannot close

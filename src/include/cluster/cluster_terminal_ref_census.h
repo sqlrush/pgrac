@@ -1021,6 +1021,15 @@ extern bool cluster_ctrc_itl_delegate_prepare_v1(
 	const ClusterCtrcItlTargetIdentity *target, const ClusterItlSlotData *slot,
 	const ClusterCtrcParticipantIdentity *sender,
 	const ClusterCtrcParticipantIdentity *receiver, uint8 *record, Size length);
+/* Before-visible first-hop retention on an authenticated current/PI receive.
+ * The immutable record supplies the original key/grant/FullXid; the incoming
+ * ordinary slot must match its physical TT origin/segment/slot and raw xid.
+ * Retain the parent under the original participant -> receipt locks, even
+ * before a local receipt exists. Exact retry only; no raw-only backfill,
+ * alternate parent merge, page authority, local drain or subtree ACK. */
+extern bool cluster_ctrc_itl_delegate_accept_v1(const ClusterItlSlotData *slot,
+	const ClusterCtrcParticipantIdentity *authenticated_sender,
+	const ClusterCtrcParticipantIdentity *receiver, const uint8 *record, Size length);
 /* First receipt at the delegated receiver only. authenticated_sender must
  * come from the existing protected current/PI transport, never the record.
  * A successful registration retains the parent before exposing a handle;
