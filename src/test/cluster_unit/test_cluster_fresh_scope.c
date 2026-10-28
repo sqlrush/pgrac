@@ -44,6 +44,7 @@
 #include "commands/dbcommands.h"
 #include "commands/defrem.h"
 #include "commands/extension.h"
+#include "commands/event_trigger.h"
 #include "commands/policy.h"
 #include "commands/schemacmds.h"
 #include "commands/seclabel.h"
@@ -355,6 +356,8 @@ CreateCommandTag(Node *statement)
 			return CMDTAG_ALTER_FUNCTION;
 		case OBJECT_COLLATION:
 			return CMDTAG_ALTER_COLLATION;
+		case OBJECT_EVENT_TRIGGER:
+			return CMDTAG_ALTER_EVENT_TRIGGER;
 		case OBJECT_TABLESPACE:
 			return CMDTAG_ALTER_TABLESPACE;
 		default:
@@ -6143,6 +6146,10 @@ static unsigned collation_lookups, collation_unbound, collation_bad_lookup, coll
 static String collation_name_node;
 static ListCell collation_name_cell;
 static List collation_names;
+static bool event_trigger_lookup_active, event_trigger_expect_binding,
+	event_trigger_superuser_denied;
+static unsigned event_trigger_lookups, event_trigger_unbound, event_trigger_bad_lookup;
+static unsigned event_trigger_lookup_kind, event_trigger_entry_kind;
 
 Oid
 get_database_oid(const char *dbname, bool missing_ok)
@@ -6159,6 +6166,16 @@ get_database_oid(const char *dbname, bool missing_ok)
 Relation
 table_open(Oid relationId, LOCKMODE lockmode)
 {
+	if (event_trigger_lookup_active) {
+		event_trigger_lookups++;
+		event_trigger_lookup_kind = 2;
+		if (event_trigger_expect_binding && utility_binds == 0)
+			event_trigger_unbound++;
+		if (event_trigger_entry_kind == 0 || relationId != EventTriggerRelationId
+			|| lockmode != RowExclusiveLock)
+			event_trigger_bad_lookup++;
+		siglongjmp(boundary, 2);
+	}
 	if (collation_lookup_active) {
 		collation_lookups++;
 		collation_lookup_kind = 2;
@@ -7954,10 +7971,238 @@ UT_TEST(test_native_collation_utility_warm_context_guards_preserve_binding)
 	collation_lookup_active = false;
 }
 
+/* Actual CREATE includes its original permission refusal. Normally superuser
+ * jumps before role-cache lookup; false exercises that real refusal. */
+bool
+superuser(void)
+{
+	event_trigger_lookups++;
+	event_trigger_lookup_kind = 1;
+	if (event_trigger_expect_binding && utility_binds == 0)
+		event_trigger_unbound++;
+	if (!event_trigger_lookup_active || event_trigger_entry_kind != 0)
+		event_trigger_bad_lookup++;
+	if (event_trigger_superuser_denied)
+		return false;
+	siglongjmp(boundary, 2);
+}
+
+#include "test_cluster_fresh_event_trigger.inc"
+static CreateEventTrigStmt native_event_trigger_create;
+static AlterEventTrigStmt native_event_trigger_alter;
+static AlterOwnerStmt native_event_trigger_owner;
+static String event_trigger_owner_name;
+
+static void
+reset_native_event_trigger(bool expect_binding, unsigned kind)
+{
+	reset_create_preflight();
+	event_trigger_lookup_active = true;
+	event_trigger_expect_binding = expect_binding;
+	event_trigger_superuser_denied = false;
+	event_trigger_lookups = event_trigger_unbound = event_trigger_bad_lookup = 0;
+	event_trigger_lookup_kind = 0;
+	event_trigger_entry_kind = kind;
+	native_event_trigger_create = (CreateEventTrigStmt){ .type = T_CreateEventTrigStmt,
+														 .trigname = "event_trigger",
+														 .eventname = "ddl_command_start" };
+	native_event_trigger_alter = (AlterEventTrigStmt){ .type = T_AlterEventTrigStmt,
+													   .trigname = "event_trigger",
+													   .tgenabled = 'O' };
+	event_trigger_owner_name = (String){ .type = T_String, .sval = "event_trigger" };
+	native_event_trigger_owner = (AlterOwnerStmt){ .type = T_AlterOwnerStmt,
+												   .objectType = OBJECT_EVENT_TRIGGER,
+												   .object = (Node *)&event_trigger_owner_name };
+}
+
+static Node *
+native_event_trigger_statement(unsigned kind)
+{
+	return kind == 0   ? (Node *)&native_event_trigger_create
+		   : kind == 1 ? (Node *)&native_event_trigger_alter
+					   : (Node *)&native_event_trigger_owner;
+}
+
+static void
+native_event_trigger_entry(unsigned kind)
+{
+	if (kind == 0)
+		(void)CreateEventTrigger(&native_event_trigger_create);
+	else if (kind == 1)
+		(void)AlterEventTrigger(&native_event_trigger_alter);
+	else
+		(void)AlterEventTriggerOwner("event_trigger", 20);
+}
+
+UT_TEST(test_native_event_triggers_bind_before_role_cache_or_catalog_lock_in_all_profiles)
+{
+	for (unsigned kind = 0; kind < 3; kind++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_event_trigger(binds, kind);
+			cluster_shared_catalog = (mode & 1) != 0;
+			utility_storage_mode = (mode & 2) != 0;
+			cluster_shared_config = (mode & 4) != 0;
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_event_trigger_entry(kind);
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(event_trigger_lookups, repeat + 1);
+				UT_ASSERT_EQ(event_trigger_lookup_kind, kind == 0 ? 1 : 2);
+				UT_ASSERT_EQ(event_trigger_unbound, 0);
+				UT_ASSERT_EQ(event_trigger_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	event_trigger_lookup_active = false;
+}
+
+UT_TEST(test_native_event_trigger_refusals_precede_role_cache_or_lock)
+{
+	for (unsigned kind = 0; kind < 3; kind++) {
+		for (unsigned failure = 0; failure < 5; failure++) {
+			bool allocated = failure == 0 || failure == 2;
+			int caught;
+
+			reset_native_event_trigger(true, kind);
+			if (failure == 0)
+				utility_bind_ok = false;
+			else if (failure == 1 || failure == 2) {
+				if (failure == 2)
+					create_sql_entry(native_event_trigger_statement(kind));
+				utility_in_child = true;
+			} else {
+				utility_current_xid = 401;
+				utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_event_trigger_entry(kind);
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, failure == 0					? ERRCODE_DATA_CORRUPTED
+									 : failure == 1 || failure == 2 ? ERRCODE_FEATURE_NOT_SUPPORTED
+																	: ERRCODE_INTERNAL_ERROR);
+			if (failure == 1 || failure == 2)
+				UT_ASSERT_STR_EQ(
+					error_message,
+					kind == 0 ? "shared catalog creation does not support subtransactions"
+							  : "shared catalog alteration does not support subtransactions");
+			UT_ASSERT_EQ(event_trigger_lookups, 0);
+			UT_ASSERT_EQ(utility_xids, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, failure == 2 ? 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, allocated || failure == 3 ? 400 : InvalidTransactionId);
+		}
+	}
+	event_trigger_lookup_active = false;
+}
+
+UT_TEST(test_native_event_trigger_context_guards_keep_nonshared_route)
+{
+	for (unsigned kind = 0; kind < 3; kind++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+
+			for (unsigned guard = 0; guard < 3; guard++) {
+				int caught;
+
+				reset_native_event_trigger(binds, kind);
+				cluster_shared_catalog = (mode & 1) != 0;
+				utility_storage_mode = (mode & 2) != 0;
+				cluster_shared_config = (mode & 4) != 0;
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_event_trigger_entry(kind);
+				UT_ASSERT_EQ(caught, binds ? 1 : 2);
+				UT_ASSERT_EQ(error_code, !binds		  ? 0
+										 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+													  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				UT_ASSERT_EQ(event_trigger_lookups, binds ? 0 : 1);
+				UT_ASSERT_EQ(event_trigger_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	event_trigger_lookup_active = false;
+}
+
+UT_TEST(test_native_event_trigger_utility_warm_context_guards_preserve_binding)
+{
+	for (unsigned kind = 0; kind < 3; kind++) {
+		for (unsigned guard = 0; guard < 4; guard++) {
+			int caught;
+
+			reset_native_event_trigger(true, kind);
+			create_sql_entry(native_event_trigger_statement(kind));
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			XactReadOnly = guard == 1;
+			utility_parallel = guard == 2;
+			utility_recovery = guard == 3;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_event_trigger_entry(kind);
+			UT_ASSERT_EQ(caught, guard ? 1 : 2);
+			UT_ASSERT_EQ(error_code, !guard		  ? 0
+									 : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+												  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT_EQ(event_trigger_lookups, guard ? 0 : 1);
+			UT_ASSERT_EQ(event_trigger_unbound, 0);
+			UT_ASSERT_EQ(event_trigger_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_prepares, guard ? 1 : 2);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			UT_ASSERT_EQ(utility_top_xid, 400);
+		}
+	}
+	event_trigger_lookup_active = false;
+}
+
+UT_TEST(test_native_event_trigger_original_permission_refusal_survives_early_binding)
+{
+	for (unsigned mode = 0; mode < 8; mode++) {
+		bool binds = mode == 3 || mode == 7;
+		int caught;
+
+		reset_native_event_trigger(binds, 0);
+		cluster_shared_catalog = (mode & 1) != 0;
+		utility_storage_mode = (mode & 2) != 0;
+		cluster_shared_config = (mode & 4) != 0;
+		event_trigger_superuser_denied = true;
+		caught = sigsetjmp(boundary, 1);
+		if (!caught)
+			(void)CreateEventTrigger(&native_event_trigger_create);
+		UT_ASSERT_EQ(caught, 1);
+		UT_ASSERT_EQ(error_code, ERRCODE_INSUFFICIENT_PRIVILEGE);
+		UT_ASSERT_STR_EQ(error_message,
+						 "permission denied to create event trigger \"event_trigger\"");
+		UT_ASSERT_STR_EQ(error_hint, "Must be superuser to create an event trigger.");
+		UT_ASSERT_EQ(event_trigger_lookups, 1);
+		UT_ASSERT_EQ(event_trigger_lookup_kind, 1);
+		UT_ASSERT_EQ(event_trigger_unbound, 0);
+		UT_ASSERT_EQ(event_trigger_bad_lookup, 0);
+		UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+		UT_ASSERT_EQ(utility_prepares, binds ? 1 : 0);
+		UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+	}
+	event_trigger_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(105);
+	UT_PLAN(110);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -8063,6 +8308,11 @@ main(void)
 	UT_RUN(test_native_collation_refusals_precede_lookup_or_lock);
 	UT_RUN(test_native_collation_context_guards_keep_nonshared_route);
 	UT_RUN(test_native_collation_utility_warm_context_guards_preserve_binding);
+	UT_RUN(test_native_event_triggers_bind_before_role_cache_or_catalog_lock_in_all_profiles);
+	UT_RUN(test_native_event_trigger_refusals_precede_role_cache_or_lock);
+	UT_RUN(test_native_event_trigger_context_guards_keep_nonshared_route);
+	UT_RUN(test_native_event_trigger_utility_warm_context_guards_preserve_binding);
+	UT_RUN(test_native_event_trigger_original_permission_refusal_survives_early_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

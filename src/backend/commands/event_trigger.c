@@ -9,6 +9,10 @@
  * IDENTIFICATION
  *	  src/backend/commands/event_trigger.c
  *
+ * PGRAC MODIFICATIONS
+ *    Preflight native event trigger changes before role work or catalog locks.
+ *    Author: SqlRush <sqlrush@gmail.com>
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -31,6 +35,10 @@
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_ts_config.h"
 #include "catalog/pg_type.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_mode.h"
+#include "cluster/cluster_tt_local.h"
+#endif
 #include "commands/dbcommands.h"
 #include "commands/event_trigger.h"
 #include "commands/extension.h"
@@ -106,6 +114,37 @@ static bool obtain_object_name_namespace(const ObjectAddress *object,
 static const char *stringify_grant_objtype(ObjectType objtype);
 static const char *stringify_adefprivs_objtype(ObjectType objtype);
 
+#ifdef USE_PGRAC_CLUSTER
+/* Direct callers must bind before role catalog work or locks. */
+static void
+PreflightClusterSharedEventTriggerWrite(bool create)
+{
+	ClusterCanonicalTxnBinding binding;
+	TransactionId current_xid;
+	const char *command = create ? "CREATE EVENT TRIGGER" : "ALTER EVENT TRIGGER";
+	const char *action = create ? "creation" : "alteration";
+
+	if (!cluster_shared_catalog || !cluster_storage_mode_enabled())
+		return;
+
+	PreventCommandIfReadOnly(command);
+	PreventCommandIfParallelMode(command);
+	PreventCommandDuringRecovery(command);
+	if (IsSubTransaction())
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("shared catalog %s does not support subtransactions", action)));
+	current_xid = GetCurrentTransactionIdIfAny();
+	if (TransactionIdIsValid(current_xid)
+		&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("shared catalog top-level transaction identity mismatch")));
+	if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("canonical ACTIVE publication failed before shared catalog %s", action)));
+}
+#endif
+
 /*
  * Create an event trigger.
  */
@@ -118,6 +157,10 @@ CreateEventTrigger(CreateEventTrigStmt *stmt)
 	Oid			evtowner = GetUserId();
 	ListCell   *lc;
 	List	   *tags = NULL;
+
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedEventTriggerWrite(true);
+#endif
 
 	/*
 	 * It would be nice to allow database owners or even regular users to do
@@ -371,6 +414,10 @@ AlterEventTrigger(AlterEventTrigStmt *stmt)
 	Form_pg_event_trigger evtForm;
 	char		tgenabled = stmt->tgenabled;
 
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedEventTriggerWrite(false);
+#endif
+
 	tgrel = table_open(EventTriggerRelationId, RowExclusiveLock);
 
 	tup = SearchSysCacheCopy1(EVENTTRIGGERNAME,
@@ -414,6 +461,10 @@ AlterEventTriggerOwner(const char *name, Oid newOwnerId)
 	Form_pg_event_trigger evtForm;
 	Relation	rel;
 	ObjectAddress address;
+
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedEventTriggerWrite(false);
+#endif
 
 	rel = table_open(EventTriggerRelationId, RowExclusiveLock);
 
