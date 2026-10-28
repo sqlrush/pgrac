@@ -5739,9 +5739,10 @@ test_cluster_pcm_source_finish_consumer.inc: $(top_srcdir)/src/backend/cluster/c
 	awk '/^gcs_block_pcm_trace_guard_capture\(/ { print "static void"; emit=1; capture++ } \
 	     /^gcs_block_pcm_trace_guard\(/ { print "static void"; emit=1; guard++ } \
 	     /^gcs_block_pcm_trace_refusal\(/ { print "static ClusterWaitTraceGuard"; emit=1; refusal++ } \
+	     /^gcs_block_resource_x_acquire_s_source_finish_owned\(/ { print "static ResourceXApplyResult"; emit=1; acquire++ } \
 	     /^gcs_block_resource_x_source_finish_owned\(/ { print "static ResourceXApplyResult"; emit=1; found++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (found != 1 || capture != 1 || guard != 1 || refusal != 1 || emit) exit 1 }' $< > $@.tmp
+	     END { if (found != 1 || acquire != 1 || capture != 1 || guard != 1 || refusal != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # PGRAC: real bounded discard/PI owners, not copies of their decisions.

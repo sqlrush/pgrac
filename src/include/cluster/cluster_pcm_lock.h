@@ -2023,6 +2023,17 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_s_source_prepare
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_s_source_publish_exact(
 	const ResourceXDecodedFrame *block, int32 authenticated_master_node, int32 buffer_id,
 	const struct ClusterPcmOwnSnapshot *prepared, const struct ClusterPcmOwnSnapshot *finished);
+/* Process-local copy only, with no owned pin or grant. All outputs remain
+ * unchanged on refusal. The source worker must revalidate the live native
+ * descriptor before finish, then publish the same retained reservation. */
+typedef enum ResourceXAcquireSSourceState {
+	RESOURCE_X_ACQUIRE_S_SOURCE_PENDING = 1,
+	RESOURCE_X_ACQUIRE_S_SOURCE_PUBLISHED = 2
+} ResourceXAcquireSSourceState;
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_s_source_snapshot_exact(
+	const ResourceXDecodedFrame *block, int32 authenticated_master_node, int32 *buffer_id,
+	struct ClusterPcmOwnSnapshot *prepared, ResourceXDecodedFrame *image,
+	ResourceXAcquireSSourceState *pair_state);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_block_to_n_prepared_s_source_exact(
 	const ResourceXDecodedFrame *block, int32 authenticated_master_node,
 	const ResourceXDecodedFrame *blocked_status, const ResourceXDecodedFrame *image_envelope,

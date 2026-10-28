@@ -25166,6 +25166,58 @@ done:
 }
 
 ResourceXApplyResult
+cluster_pcm_lock_resource_x_acquire_s_source_snapshot_exact(const ResourceXDecodedFrame *block,
+	int32 master, int32 *buffer_id, ClusterPcmOwnSnapshot *prepared,
+	ResourceXDecodedFrame *image, ResourceXAcquireSSourceState *pair_state)
+{
+	ResourceXDecodedFrame canonical, copy;
+	ResourceXWireReject reject;
+	ClusterPcmResourceXMasterState *state;
+	PcmEntryRef ref;
+	PcmEntryAcquireResult acquired;
+	ResourceXApplyResult result;
+
+	if (buffer_id == NULL || prepared == NULL || image == NULL || pair_state == NULL
+		|| !pcm_resource_x_s_source_block_valid(block, master, &canonical))
+		return RESOURCE_X_APPLY_INVALID;
+	if (ClusterPcm == NULL)
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (!pcm_entry_ref_acquire(&canonical.common.logical_assertion.resource, false, &ref, &acquired))
+		return acquired == PCM_ENTRY_ACQUIRE_NOT_FOUND ? RESOURCE_X_APPLY_NOT_FOUND : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	LWLockAcquire(&ref.entry->entry_lock.lock, LW_SHARED);
+	state = pcm_resource_x_master_state_for_entry(ref.entry);
+	if (state == NULL) { result = RESOURCE_X_APPLY_RECOVERY_BLOCKED; goto done; }
+	if (pcm_resource_x_s_source_empty(state)) {
+		result = RESOURCE_X_APPLY_NOT_FOUND; goto done;
+	}
+	if (!pcm_resource_x_s_source_pair_valid(ref.entry, state)) {
+		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED; goto done;
+	}
+	result = pcm_resource_x_s_source_domain_locked(ref.entry, state, &canonical, master);
+	if (result != RESOURCE_X_APPLY_APPLIED) goto done;
+	if (!pcm_resource_x_s_source_block_matches(state, &canonical)) {
+		result = RESOURCE_X_APPLY_STALE; goto done;
+	}
+	if (!cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, state->holder_image.payload,
+		state->holder_image.payload_bytes, &copy, &reject)) {
+		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED; goto done;
+	}
+	/* No reference moves, transport ownership or shared-state change. This
+	 * copy remains subordinate to the original reservation and live native
+	 * fence, both of which the finish/publish boundary rechecks. */
+	*buffer_id = state->holder_acquire_s_buffer_id;
+	*prepared = state->holder_acquire_s_native;
+	*image = copy;
+	*pair_state = state->holder_status.valid == RESOURCE_X_HOLDER_PAIR_PENDING
+		? RESOURCE_X_ACQUIRE_S_SOURCE_PENDING : RESOURCE_X_ACQUIRE_S_SOURCE_PUBLISHED;
+	result = RESOURCE_X_APPLY_APPLIED;
+done:
+	LWLockRelease(&ref.entry->entry_lock.lock);
+	pcm_entry_ref_release(&ref);
+	return result;
+}
+
+ResourceXApplyResult
 cluster_pcm_lock_resource_x_acquire_s_source_publish_exact(const ResourceXDecodedFrame *block,
 	int32 master, int32 buffer_id, const ClusterPcmOwnSnapshot *prepared, const ClusterPcmOwnSnapshot *finished)
 {

@@ -352,10 +352,126 @@ UT_TEST(test_s_source_invalid_wal_projection_cannot_produce_a_pair)
 	UT_ASSERT_EQ(f.master.state->holder_status.valid, 0);
 }
 
+static ResourceXDecodedFrame
+ss_forward_reencode(ResourceXDecodedFrame frame)
+{
+	uint8 bytes[RESOURCE_X_DECISION_V3_BYTES]; uint16 len = 0; ResourceXWireReject reject;
+	ResourceXDecodedFrame out = {0};
+	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_BLOCK_TO_N, &frame, bytes, sizeof(bytes), &len, &reject));
+	UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_BLOCK_TO_N, bytes, len, &out, &reject));
+	return out;
+}
+
+static ResourceXApplyResult
+ss_snapshot(SSourceFixture *f, int32 *id, ClusterPcmOwnSnapshot *native,
+	ResourceXDecodedFrame *image, ResourceXAcquireSSourceState *state)
+{
+	ResourceXApplyResult r = cluster_pcm_lock_resource_x_acquire_s_source_snapshot_exact(
+		&f->block, f->source_master, id, native, image, state);
+	UT_ASSERT_EQ(fake_lwlock_depth, 0); return r;
+}
+
+UT_TEST(test_s_source_snapshot_copies_original_pending_without_mutation)
+{
+	SSourceFixture f; ClusterPcmOwnSnapshot native; ResourceXDecodedFrame image;
+	int32 id = -1; ResourceXAcquireSSourceState state = 0; ClusterPcmResourceXMasterState *before;
+	if (!ss_start(&f)) return;
+	UT_ASSERT_EQ(ss_prepare(&f), RESOURCE_X_APPLY_APPLIED);
+	before = malloc(sizeof(*before)); UT_ASSERT(before != NULL); if (!before) return;
+	memcpy(before, f.master.state, sizeof(*before));
+	UT_ASSERT_EQ(ss_snapshot(&f, &id, &native, &image, &state), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(id, 7); UT_ASSERT_EQ(state, RESOURCE_X_HOLDER_PAIR_PENDING);
+	UT_ASSERT(cluster_pcm_own_snapshot_equal_exact(&native, &f.prepared));
+	UT_ASSERT(image.has_acquire_decision);
+	UT_ASSERT(memcmp(image.body.acquire_image.original_image.page_bytes, f.page.data, BLCKSZ) == 0);
+	UT_ASSERT(memcmp(before, f.master.state, sizeof(*before)) == 0); free(before);
+}
+
+UT_TEST(test_s_source_snapshot_published_pair_survives_transport_drain)
+{
+	SSourceFixture f; ClusterPcmOwnSnapshot native; ResourceXDecodedFrame image;
+	int32 id; ResourceXAcquireSSourceState state;
+	if (!ss_start(&f)) return;
+	UT_ASSERT_EQ(ss_prepare(&f), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(ss_publish(&f), RESOURCE_X_APPLY_APPLIED);
+	for (int half = 0; half < 2; half++) {
+		ResourceXIntentSlot sent = half ? f.master.state->holder_image_intent : f.master.state->holder_status_intent.slot;
+		ResourceXIntentSlot staged;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_capture_exact(&sent, 100001, &staged), RESOURCE_X_INTENT_STAGED);
+		UT_ASSERT(cluster_pcm_lock_resource_x_outbound_intent_complete_exact(&staged));
+	}
+	UT_ASSERT_EQ(f.master.state->holder_status_intent.slot.state, RESOURCE_X_INTENT_SLOT_EMPTY);
+	UT_ASSERT_EQ(f.master.state->holder_image_intent.state, RESOURCE_X_INTENT_SLOT_EMPTY);
+	UT_ASSERT_EQ(ss_snapshot(&f, &id, &native, &image, &state), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(state, RESOURCE_X_HOLDER_PAIR_PUBLISHED);
+	UT_ASSERT_EQ(native.generation, f.prepared.generation);
+	UT_ASSERT_EQ(f.master.state->holder_acquire_s_native.flags, PCM_OWN_FLAG_REVOKING);
+}
+
+UT_TEST(test_s_source_snapshot_rejects_changed_forward_and_preserves_outputs)
+{
+	for (int n = 0; n < 3; n++) {
+		SSourceFixture f; ClusterPcmOwnSnapshot native, before;
+		ResourceXDecodedFrame image, before_image; int32 id = -51; ResourceXAcquireSSourceState state = 93;
+		if (!ss_start(&f)) return;
+		UT_ASSERT_EQ(ss_prepare(&f), RESOURCE_X_APPLY_APPLIED);
+		memset(&native, 0x63, sizeof(native)); before = native;
+		memset(&image, 0x27, sizeof(image)); before_image = image;
+		if (n == 0) f.block.common.semantic_crc32c++;
+		else if (n == 1) f.source_master = 1;
+		else { f.block.common.sender_connection_generation++; f.block = ss_forward_reencode(f.block); }
+		UT_ASSERT(ss_snapshot(&f, &id, &native, &image, &state) != RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(id, -51); UT_ASSERT_EQ(state, 93);
+		UT_ASSERT(memcmp(&native, &before, sizeof(native)) == 0);
+		UT_ASSERT(memcmp(&image, &before_image, sizeof(image)) == 0);
+		UT_ASSERT_EQ(f.master.state->holder_status.valid, RESOURCE_X_HOLDER_PAIR_PENDING);
+	}
+}
+
+UT_TEST(test_s_source_snapshot_gate_freeze_does_not_forget_native_debt)
+{
+	SSourceFixture f; ClusterPcmOwnSnapshot native; ResourceXDecodedFrame image;
+	int32 id = -1; ResourceXAcquireSSourceState state = 0; if (!ss_start(&f)) return;
+	UT_ASSERT_EQ(ss_prepare(&f), RESOURCE_X_APPLY_APPLIED);
+	{ ResourceXReconfigToken token; UT_ASSERT(cluster_resource_x_reconfig_freeze(17, 18, &token)); }
+	UT_ASSERT_EQ(ss_snapshot(&f, &id, &native, &image, &state), RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+	UT_ASSERT_EQ(id, -1); UT_ASSERT_EQ(state, 0);
+	UT_ASSERT_EQ(f.master.state->holder_status.valid, RESOURCE_X_HOLDER_PAIR_PENDING);
+	UT_ASSERT(cluster_pcm_own_snapshot_equal_exact(&f.master.state->holder_acquire_s_native, &f.prepared));
+}
+
+UT_TEST(test_s_source_snapshot_corrupt_pair_is_not_adopted)
+{
+	for (int n = 0; n < 3; n++) {
+		SSourceFixture f; ClusterPcmOwnSnapshot native; ResourceXDecodedFrame image;
+		int32 id = -1; ResourceXAcquireSSourceState state = 0; if (!ss_start(&f)) return;
+		UT_ASSERT_EQ(ss_prepare(&f), RESOURCE_X_APPLY_APPLIED);
+		if (n == 0) f.master.state->holder_image.payload[700] ^= 1;
+		else if (n == 1) f.master.state->holder_acquire_s_native.reservation_token = 0;
+		else f.master.state->holder_acquire_s_reserved = 1;
+		UT_ASSERT_EQ(ss_snapshot(&f, &id, &native, &image, &state), RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+		UT_ASSERT_EQ(id, -1); UT_ASSERT_EQ(state, 0);
+		UT_ASSERT_EQ(f.master.state->holder_status.valid, RESOURCE_X_HOLDER_PAIR_PENDING);
+	}
+}
+
+UT_TEST(test_s_source_snapshot_requires_every_output_and_original_reservation)
+{
+	SSourceFixture f; ClusterPcmOwnSnapshot native; ResourceXDecodedFrame image;
+	int32 id = -1; ResourceXAcquireSSourceState state = 0; if (!ss_start(&f)) return;
+	UT_ASSERT_EQ(ss_snapshot(&f, &id, &native, &image, &state), RESOURCE_X_APPLY_NOT_FOUND);
+	UT_ASSERT_EQ(ss_prepare(&f), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_s_source_snapshot_exact(&f.block, 0, NULL, &native, &image, &state), RESOURCE_X_APPLY_INVALID);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_s_source_snapshot_exact(&f.block, 0, &id, NULL, &image, &state), RESOURCE_X_APPLY_INVALID);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_s_source_snapshot_exact(&f.block, 0, &id, &native, NULL, &state), RESOURCE_X_APPLY_INVALID);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_s_source_snapshot_exact(&f.block, 0, &id, &native, &image, NULL), RESOURCE_X_APPLY_INVALID);
+	UT_ASSERT_EQ(id, -1); UT_ASSERT_EQ(state, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(20);
+	UT_PLAN(26);
 	UT_RUN(test_s_source_reserves_complete_pair_before_native_finish);
 	UT_RUN(test_s_source_exact_prepare_duplicate_is_not_a_second_native_commit);
 	UT_RUN(test_s_source_changed_token_descriptor_or_page_cannot_replace_pending);
@@ -376,5 +492,11 @@ main(void)
 	UT_RUN(test_s_source_bad_ids_and_connection_generations_do_not_reserve);
 	UT_RUN(test_s_source_master_directory_does_not_change_at_reserve_or_publish);
 	UT_RUN(test_s_source_invalid_wal_projection_cannot_produce_a_pair);
+	UT_RUN(test_s_source_snapshot_copies_original_pending_without_mutation);
+	UT_RUN(test_s_source_snapshot_published_pair_survives_transport_drain);
+	UT_RUN(test_s_source_snapshot_rejects_changed_forward_and_preserves_outputs);
+	UT_RUN(test_s_source_snapshot_gate_freeze_does_not_forget_native_debt);
+	UT_RUN(test_s_source_snapshot_corrupt_pair_is_not_adopted);
+	UT_RUN(test_s_source_snapshot_requires_every_output_and_original_reservation);
 	UT_DONE(); return ut_failed_count == 0 ? 0 : 1;
 }

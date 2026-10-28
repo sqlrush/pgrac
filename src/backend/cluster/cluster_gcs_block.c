@@ -11257,6 +11257,97 @@ gcs_block_pcm_service_begin(ClusterContentTraceServiceScope *scope,
 	cluster_content_trace_service_begin(scope, &service);
 }
 
+/* Resume only an already-retained complete-A S source. The immutable pair
+ * precedes native S->N; neither a transport callback nor a stale caller's
+ * image can supply this proof. No pin/owner handle moves into this branch. */
+static ResourceXApplyResult
+gcs_block_resource_x_acquire_s_source_finish_owned(
+	const ResourceXDecodedFrame *block, int32 master, uint64 r4_generation,
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *caller_prepared)
+{
+	ResourceXDecodedFrame image;
+	ClusterPcmOwnSnapshot prepared, live, finished, expected;
+	ResourceXAcquireSSourceState pair_state;
+	ClusterPcmOwnFinishRefusal refusal = {0};
+	ResourceXApplyResult result;
+	volatile ClusterPcmOwnResult own = CLUSTER_PCM_OWN_INVALID;
+	MemoryContext error_context = CurrentMemoryContext;
+	int32 buffer_id = -1;
+	int live_id = -1;
+	XLogRecPtr page_lsn;
+
+	if (buf == NULL || r4_generation == 0 || r4_generation == UINT64_MAX
+		|| cluster_pcm_x_revoke_finish_mode(&block->common.logical_assertion.resource, 0)
+			!= CLUSTER_PCM_X_REVOKE_FINISH_RETAIN
+		|| cluster_pcm_lock_resource_x_acquire_s_source_snapshot_exact(
+			block, master, &buffer_id, &prepared, &image, &pair_state) != RESOURCE_X_APPLY_APPLIED
+		|| buffer_id != buf->buf_id
+		|| !cluster_pcm_own_snapshot_equal_exact(&prepared, caller_prepared)
+		|| cluster_bufmgr_pcm_own_snapshot_by_tag(&prepared.tag, &live_id, &live) != CLUSTER_PCM_OWN_OK
+		|| live_id != buffer_id)
+		goto fail_closed;
+	expected = prepared;
+	expected.generation++;
+	expected.pcm_state = PCM_STATE_N;
+	expected.buffer_type = BUF_TYPE_PI;
+	if (image.body.acquire_image.original_image.source_carrier_generation != expected.generation)
+		goto fail_closed;
+	page_lsn = PageGetLSN((Page)image.body.acquire_image.original_image.page_bytes);
+	if (cluster_pcm_own_snapshot_equal_exact(&live, &expected)) {
+		/* A worker may have left after the irreversible native commit but
+		 * before publication. Adopt exactly that N+PI, never commit again. */
+		finished = live;
+	} else {
+		if (pair_state != RESOURCE_X_ACQUIRE_S_SOURCE_PENDING
+			|| !cluster_pcm_own_fence_equal_exact(&live, &prepared))
+			goto fail_closed;
+		memset(&finished, 0, sizeof(finished));
+		PG_TRY();
+		{
+			/* The clean S source owns no first-dirty reference to move. The
+			 * original native function retains its WAL/DATA and IO checks. */
+			own = cluster_bufmgr_pcm_own_finish_revoke_retain(
+				buf, &prepared, page_lsn, &finished, &refusal, NULL);
+		}
+		PG_CATCH();
+		{
+			ErrorData *error;
+
+			MemoryContextSwitchTo(error_context);
+			error = CopyErrorData();
+			FlushErrorState();
+			/* The native function has released its pin/content/IO scopes.
+			 * Do not abort REVOKING or discard the original PENDING pair. */
+			gcs_block_resource_x_fail_closed_current();
+			ereport(LOG, (errmsg_internal("complete-A S-source native finish failed: %s",
+				error->message != NULL ? error->message : "(no message)")));
+			FreeErrorData(error);
+			own = CLUSTER_PCM_OWN_CORRUPT;
+		}
+		PG_END_TRY();
+		if (own != CLUSTER_PCM_OWN_OK) {
+			if (own == CLUSTER_PCM_OWN_BUSY
+				&& (refusal.reason == CLUSTER_PCM_OWN_FINISH_REFUSAL_CONTENT_LOCK
+					|| refusal.reason == CLUSTER_PCM_OWN_FINISH_REFUSAL_IO_IN_PROGRESS
+					|| refusal.reason == CLUSTER_PCM_OWN_FINISH_REFUSAL_DATA_IO_RETRY)
+				&& cluster_bufmgr_pcm_own_snapshot_by_tag(&prepared.tag, &live_id, &live) == CLUSTER_PCM_OWN_OK
+				&& live_id == buffer_id && cluster_pcm_own_fence_equal_exact(&live, &prepared)
+				&& (live.semantic_buf_state & (BM_VALID | BM_IO_ERROR)) == BM_VALID)
+				return RESOURCE_X_APPLY_BAD_STATE; /* Original local service wait. */
+			goto fail_closed;
+		}
+	}
+	if (!cluster_pcm_own_snapshot_equal_exact(&finished, &expected))
+		goto fail_closed;
+	result = cluster_pcm_lock_resource_x_acquire_s_source_publish_exact(
+		block, master, buffer_id, &prepared, &finished);
+	if (result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE)
+		return result;
+fail_closed:
+	gcs_block_resource_x_fail_closed_current();
+	return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+}
+
 /* The initial callback and the winning LMS retry use one finish/publish
  * boundary. Ownership of the supplied pin and local handle moves into this
  * call; the caller must return immediately and must not unwind them again.
@@ -11282,7 +11373,20 @@ gcs_block_resource_x_source_finish_owned(
 	ResourceXApplyResult image_result;
 	ResourceXApplyResult pair_result;
 	volatile ClusterPcmOwnResult finish_result = CLUSTER_PCM_OWN_INVALID;
-	XLogRecPtr page_lsn = PageGetLSN((Page)image->body.image_envelope.page_bytes);
+	XLogRecPtr page_lsn;
+
+	if (block->has_acquire_decision) {
+		if (held_x_revoke_active || target_revoke_owner_held || tagless_target_x || target_x_drop) {
+			gcs_block_resource_x_fail_closed_current();
+			if (held_x_revoke_active)
+				(void)cluster_bufmgr_pcm_own_abandon_held_x_revoke_after_fail_closed(&held_x_revoke);
+			(void)gcs_block_resource_x_terminal_owner_release(&target_revoke_owner, &target_revoke_owner_held);
+			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		}
+		return gcs_block_resource_x_acquire_s_source_finish_owned(
+			block, authenticated_master_node, writer_r4_generation, buf, &revoking);
+	}
+	page_lsn = PageGetLSN((Page)image->body.image_envelope.page_bytes);
 
 	memset(&finish_refusal, 0, sizeof(finish_refusal));
 	memset(&retained, 0, sizeof(retained));
