@@ -5323,7 +5323,7 @@ cluster_typed_replay_foreign_gate(ClusterColdTypedReplay *rep)
 
 /* Native redo of the current record; the caller sets apply_foreign. */
 static void
-cluster_typed_replay_apply(XLogReaderState *r, void *arg)
+cluster_typed_replay_apply_native(XLogReaderState *r, void *arg)
 {
 	ClusterColdTypedReplay *rep = (ClusterColdTypedReplay *) arg;
 
@@ -5332,6 +5332,21 @@ cluster_typed_replay_apply(XLogReaderState *r, void *arg)
 	cluster_cold_touched_add_record_v1(&rep->touched, r);
 	ApplyWalRecord(r, &r->record->header, rep->replayTLI);
 	cluster_recovery_merge_set_apply_foreign(false);
+}
+
+static void
+cluster_typed_replay_apply(XLogReaderState *r, void *arg)
+{
+	ClusterColdTypedReplay *rep = (ClusterColdTypedReplay *) arg;
+
+	if (!rep->apply_foreign && XLogRecGetRmid(r) == RM_CLOG_ID) {
+		if (rep->fence_plan == NULL
+			|| !cluster_cold_typed_clog_native_v1(rep->typed, *rep->fence_plan, r,
+				cluster_typed_replay_apply_native, arg))
+			cluster_typed_replay_mismatch(rep, rep->typed->own_participant, r->ReadRecPtr,
+				"the original native CLOG consumer lost its source or record");
+	} else
+		cluster_typed_replay_apply_native(r, arg);
 }
 
 static bool

@@ -19,10 +19,18 @@
 typedef struct SideNativeClogReplay {
 	bool attempted;
 	bool applied;
+	bool native_consumed;
 } SideNativeClogReplay;
 
 /* Exact original physical RECOVERY operation only; NULL is not a grant. */
 extern SideNativeClogReplay *side_plan_clog_replay_state(
 	const RfSideOnlinePlanV1 *plan, uint32 index, const RfPageOnlineRecordIdentityV1 *identity);
+
+/* The original Startup caller executes its native redo inside this bracket.
+ * No caller success flag or cold-owner permission substitutes for that call.
+ * Returned consumption is deliberately separate from cold durable apply. */
+extern bool side_plan_clog_native_replay(const RfSideOnlinePlanV1 *plan,
+	const ClusterWalSourceRef *source, XLogReaderState *reader,
+	void (*redo)(XLogReaderState *, void *), bool (*current)(void *), void *arg);
 
 #endif

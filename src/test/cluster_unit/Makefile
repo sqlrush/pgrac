@@ -3066,7 +3066,7 @@ test_cluster_side_xact_budget_product.o: $(top_srcdir)/src/backend/cluster/clust
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DRF_SIDE_XACT_TESTING \
 		-Dmalloc=side_xact_fixture_malloc -Dfree=side_xact_fixture_free \
 		-ffunction-sections -fdata-sections -c $< -o $@
-test_cluster_side_xact test_cluster_pi_contribution test_cluster_recovery_c0_plan test_cluster_cold_tt_redo: test_cluster_side_relmap_terminal.inc test_cluster_side_clog_applied.inc
+test_cluster_side_xact test_cluster_pi_contribution test_cluster_recovery_c0_plan test_cluster_cold_tt_redo: test_cluster_side_relmap_terminal.inc test_cluster_side_clog_applied.inc test_cluster_side_clog_native_consumed.inc
 test_cluster_side_xact: $(top_builddir)/src/backend/cluster/cluster_wal_claim.o
 test_cluster_side_xact: test_cluster_side_clog_full.inc test_cluster_side_clog_witness.inc
 ifeq ($(enable_pgrac_cluster),yes)
@@ -3513,6 +3513,7 @@ test_cluster_recovery_episode_side_owner.o: test_cluster_recovery_episode_side_o
         test_cluster_side_xact.c \
         test_cluster_heap_small_scn.inc \
         test_cluster_side_clog_applied.inc \
+        test_cluster_side_clog_native_consumed.inc \
         test_cluster_side_clog_full.inc \
         test_cluster_side_clog_witness.inc \
         test_cluster_side_relmap_terminal.inc \
@@ -9584,6 +9585,7 @@ test_cluster_cold_tt_base: test_cluster_cold_tt_base.c unit_test.h test_cluster_
 
 test_cluster_cold_recovery_startup_core.o: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_startup.c \
 		$(top_srcdir)/src/backend/cluster/cluster_control_bootstrap_private.h \
+		$(top_srcdir)/src/backend/cluster/cluster_side_online_plan_internal.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_census.h \
 		$(top_srcdir)/src/include/cluster/cluster_side_online_plan.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h \
@@ -9601,6 +9603,7 @@ test_cluster_cold_source_completion.inc: $(top_srcdir)/src/backend/cluster/clust
 	mv $@.tmp $@
 
 test_cluster_cold_recovery_startup: test_cluster_cold_recovery_startup.c unit_test.h $(CLUSTER_COLD_STARTUP_O) \
+		test_cluster_cold_native_clog_consumed.inc \
 		test_cluster_recovery_duty_compare.inc \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
 		$(top_builddir)/src/common/libpgcommon.a \
