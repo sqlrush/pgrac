@@ -4601,6 +4601,8 @@ test_cluster_recovery_episode_clog.o: test_cluster_recovery_episode_clog.c \
 
 test_cluster_recovery_native_inputs: test_cluster_recovery_episode_native_clog.inc \
         test_cluster_recovery_episode_clog.h test_cluster_recovery_episode_clog.o
+test_cluster_recovery_native_inputs: test_cluster_recovery_clog_full_roots.inc \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_root_set.h
 test_cluster_recovery_native_inputs: test_cluster_recovery_episode_history.inc \
 		test_cluster_recovery_relmap_fold.inc test_cluster_recovery_episode_pending.inc \
 		test_cluster_recovery_episode_base.inc test_cluster_recovery_episode_sources.inc test_cluster_recovery_episode_pages.inc \
