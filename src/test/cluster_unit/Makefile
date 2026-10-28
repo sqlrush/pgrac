@@ -5599,7 +5599,7 @@ test_cluster_pcm_settlement_ingress.inc: $(top_srcdir)/src/backend/cluster/clust
 	     END { if (count != 4 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_pcm_lock test_cluster_pcm_object_retire test_cluster_pcm_stop_cv test_cluster_pcm_read_grant test_cluster_resource_x_acquire_ingress test_cluster_resource_x_decision_send test_cluster_resource_x_decision_publish: %: %.c test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
+test_cluster_pcm_lock test_cluster_pcm_object_retire test_cluster_pcm_stop_cv test_cluster_pcm_read_grant test_cluster_resource_x_acquire_ingress test_cluster_resource_x_decision_send test_cluster_resource_x_decision_publish test_cluster_resource_x_holder_send: %: %.c test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
 		test_cluster_pcm_master_durable.inc \
 		test_cluster_pcm_bootstrap_tick.inc \
 		test_cluster_pcm_settlement_ingress.inc \
@@ -10170,3 +10170,15 @@ clean distclean maintainer-clean: clean-resource-x-transport
 .PHONY: clean-resource-x-transport
 clean-resource-x-transport:
 	rm -f test_cluster_resource_x_transport test_cluster_resource_x_transport_frames.inc test_cluster_resource_x_transport_frames.inc.tmp
+
+# The real holder containers and actual PCM send lifecycle, with only the
+# future conditional native publisher replaced by explicit typed input.
+TESTS += test_cluster_resource_x_holder_send
+all: test_cluster_resource_x_holder_send
+test_cluster_resource_x_holder_send: test_cluster_resource_x_decision_owner_layout.inc \
+		test_cluster_resource_x_transport_frames.inc \
+		cluster_unit_port_stubs.o cluster_catalog_trace_test.o
+clean distclean maintainer-clean: clean-resource-x-holder-send
+.PHONY: clean-resource-x-holder-send
+clean-resource-x-holder-send:
+	rm -f test_cluster_resource_x_holder_send

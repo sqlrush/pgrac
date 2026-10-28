@@ -612,6 +612,13 @@ typedef struct ClusterPcmResourceXControlIntent {
 	uint8 payload[RESOURCE_X_PROOF_V1_BYTES];
 } ClusterPcmResourceXControlIntent;
 
+/* Holder completion keeps its full immutable decision and original ACK.
+ * Unrelated cleanup/control owners retain their independently bounded room. */
+typedef struct ClusterPcmResourceXHolderStatusIntent {
+	ResourceXIntentSlot slot;
+	uint8 payload[RESOURCE_X_SOURCE_WITNESS_V3_BYTES];
+} ClusterPcmResourceXHolderStatusIntent;
+
 typedef struct ClusterPcmResourceXSourceSettlement {
 	ClusterPcmResourceXControlIntent intent;
 	uint64 last_loss_send_us;
@@ -663,7 +670,7 @@ typedef struct ClusterPcmResourceXHolderStatus {
 	uint16 payload_bytes;
 	uint8 kind;
 	uint8 valid;
-	uint8 payload[RESOURCE_X_PROOF_V1_BYTES];
+	uint8 payload[RESOURCE_X_SOURCE_WITNESS_V3_BYTES];
 } ClusterPcmResourceXHolderStatus;
 
 typedef struct ClusterPcmResourceXHolderImage {
@@ -675,7 +682,7 @@ typedef struct ClusterPcmResourceXHolderImage {
 	uint16 payload_bytes;
 	uint8 kind;
 	uint8 valid;
-	uint8 payload[RESOURCE_X_IMAGE_V2_BYTES];
+	uint8 payload[RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES];
 } ClusterPcmResourceXHolderImage;
 
 typedef struct ClusterPcmResourceXRequesterJoin {
@@ -741,7 +748,7 @@ typedef struct ClusterPcmResourceXMasterState {
 	ClusterPcmResourceXTerminalTombstone terminal_tombstone;
 	ClusterPcmResourceXBlockIntent block_intents[RESOURCE_X_PROTOCOL_NODE_LIMIT];
 	ClusterPcmResourceXHolderStatus holder_status;
-	ClusterPcmResourceXControlIntent holder_status_intent;
+	ClusterPcmResourceXHolderStatusIntent holder_status_intent;
 	ClusterPcmResourceXGrantIntent grant_intent;
 	ClusterPcmResourceXRequesterJoin requester_join;
 	ClusterPcmResourceXDeferredSettlement deferred_settlement;
@@ -772,21 +779,23 @@ StaticAssertDecl(sizeof(ClusterPcmResourceXBootstrapReceipt) == 224,
 				 "Resource-X bootstrap receipt layout must remain 224 bytes");
 StaticAssertDecl(sizeof(ClusterPcmResourceXControlIntent) == 408,
 				 "Resource-X control intent layout must remain 408 bytes");
+StaticAssertDecl(sizeof(ClusterPcmResourceXHolderStatusIntent) == 1144,
+				 "Resource-X holder completion intent must retain the full witness");
 StaticAssertDecl(sizeof(ClusterPcmResourceXSourceSettlement) == 432,
 				 "Resource-X source settlement debt layout must remain 432 bytes");
 StaticAssertDecl(sizeof(ClusterPcmResourceXGrantIntent) == 832,
 				 "Resource-X master grant intent must retain the full decision");
 StaticAssertDecl(sizeof(ClusterPcmResourceXBlockIntent) == 832,
 				 "Resource-X master block intent must retain the full decision");
-StaticAssertDecl(sizeof(ClusterPcmResourceXHolderStatus) == 384,
-				 "Resource-X holder status layout must remain 384 bytes");
-StaticAssertDecl(sizeof(ClusterPcmResourceXHolderImage) == 8824,
-				 "Resource-X holder image layout must remain 8824 bytes");
+StaticAssertDecl(sizeof(ClusterPcmResourceXHolderStatus) == 1120,
+				 "Resource-X holder status must retain the full witness");
+StaticAssertDecl(sizeof(ClusterPcmResourceXHolderImage) == 9872,
+				 "Resource-X holder image must retain the complete source envelope");
 StaticAssertDecl(sizeof(ClusterPcmResourceXRequesterJoin) == 9120,
 				 "Resource-X requester join layout must remain 9120 bytes");
 StaticAssertDecl(sizeof(ClusterPcmResourceXDeferredSettlement) == 160,
 				 "Resource-X deferred settlement must remain bounded");
-StaticAssertDecl(sizeof(ClusterPcmResourceXMasterState) == 75736,
+StaticAssertDecl(sizeof(ClusterPcmResourceXMasterState) == 78256,
 				 "D4 Resource-X master state must bind object generation");
 
 typedef struct ClusterPcmShared {
@@ -1952,6 +1961,8 @@ static ResourceXApplyResult
 pcm_resource_x_holder_pair_decode_locked(const ClusterPcmResourceXMasterState *state,
 										 ResourceXDecodedFrame *status_out,
 										 ResourceXDecodedFrame *image_out);
+static bool pcm_resource_x_holder_send_pair_valid(
+	const struct GrdEntry *entry, const ClusterPcmResourceXMasterState *state);
 
 /* A committed drain leaves the canonical pair bytes in place so an exact
  * duplicate settlement can be authenticated without touching BufferDesc
@@ -5125,7 +5136,9 @@ pcm_resource_x_intent_payload_exact(ResourceXWireKind kind, uint16 payload_bytes
 		return payload_bytes == RESOURCE_X_SHORT_V1_BYTES;
 	case RESOURCE_X_WIRE_BLOCKED_TO_N:
 		return payload_bytes == RESOURCE_X_CONTROL_V1_BYTES
-			   || payload_bytes == RESOURCE_X_PROOF_V1_BYTES;
+			   || payload_bytes == RESOURCE_X_PROOF_V1_BYTES
+			   || payload_bytes == RESOURCE_X_WITNESS_V3_BYTES
+			   || payload_bytes == RESOURCE_X_SOURCE_WITNESS_V3_BYTES;
 	case RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2:
 	case RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2:
 		return payload_bytes == RESOURCE_X_PROOF_V1_BYTES;
@@ -5133,7 +5146,8 @@ pcm_resource_x_intent_payload_exact(ResourceXWireKind kind, uint16 payload_bytes
 		return payload_bytes == RESOURCE_X_PROOF_V1_BYTES
 			   || payload_bytes == RESOURCE_X_DECISION_V3_BYTES;
 	case RESOURCE_X_WIRE_IMAGE_ENVELOPE:
-		return payload_bytes == RESOURCE_X_IMAGE_V2_BYTES;
+		return payload_bytes == RESOURCE_X_IMAGE_V2_BYTES
+			   || payload_bytes == RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES;
 	}
 	return false;
 }
@@ -5158,6 +5172,18 @@ cluster_pcm_lock_resource_x_intent_arm_exact(ResourceXIntentSlot *slot,
 			: (body->owner_kind != RESOURCE_X_INTENT_OWNER_MASTER_GRANT
 				|| body->owner_generation != authority_generation
 				|| destination_node != (uint32)body->assertion.requester_node)))
+		return false;
+	if ((payload_bytes == RESOURCE_X_WITNESS_V3_BYTES
+		 || payload_bytes == RESOURCE_X_SOURCE_WITNESS_V3_BYTES
+		 || payload_bytes == RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES)
+		&& (body->owner_generation != logical_generation
+			|| (body->owner_kind != RESOURCE_X_INTENT_OWNER_HOLDER_STATUS
+				&& body->owner_kind != RESOURCE_X_INTENT_OWNER_HOLDER_IMAGE)
+			|| (kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE
+				&& body->owner_kind != RESOURCE_X_INTENT_OWNER_HOLDER_IMAGE)
+			|| (body->owner_kind == RESOURCE_X_INTENT_OWNER_HOLDER_IMAGE
+				&& (destination_node != (uint32)body->assertion.requester_node
+					|| payload_bytes == RESOURCE_X_SOURCE_WITNESS_V3_BYTES))))
 		return false;
 	if (slot->state != RESOURCE_X_INTENT_SLOT_EMPTY)
 		return slot->logical_generation == logical_generation
@@ -22649,7 +22675,7 @@ static bool
 pcm_resource_x_rearm_holder_status_locked(ClusterPcmResourceXMasterState *state,
 										  const ClusterPcmResourceXHolderStatus *record)
 {
-	ClusterPcmResourceXControlIntent *intent;
+	ClusterPcmResourceXHolderStatusIntent *intent;
 	uint64 now_us;
 
 	Assert(state != NULL);
@@ -22676,12 +22702,12 @@ pcm_resource_x_rearm_holder_status_locked(ClusterPcmResourceXMasterState *state,
 }
 
 static bool
-pcm_resource_x_holder_source_slots_exact(ClusterPcmResourceXMasterState *state,
+pcm_resource_x_holder_source_slots_exact(const ClusterPcmResourceXMasterState *state,
 										 const ClusterPcmResourceXHolderStatus *status_record,
 										 const ClusterPcmResourceXHolderImage *image_record)
 {
-	ResourceXIntentSlot *status_slot;
-	ResourceXIntentSlot *image_slot;
+	const ResourceXIntentSlot *status_slot;
+	const ResourceXIntentSlot *image_slot;
 
 	Assert(state != NULL);
 	Assert(status_record != NULL);
@@ -22782,7 +22808,7 @@ ResourceXApplyResult
 cluster_pcm_lock_resource_x_block_to_n_exact(const ResourceXDecodedFrame *block,
 											 int32 authenticated_master_node)
 {
-	ClusterPcmResourceXControlIntent *intent;
+	ClusterPcmResourceXHolderStatusIntent *intent;
 	ClusterPcmResourceXHolderStatus *record;
 	ClusterPcmResourceXMasterState *state;
 	PcmEntryRef entry_ref;
@@ -24428,7 +24454,7 @@ cluster_pcm_lock_resource_x_holder_status_intent_snapshot_exact(const ResourceXA
 																void *payload_out,
 																uint16 payload_capacity)
 {
-	ClusterPcmResourceXControlIntent *intent;
+	ClusterPcmResourceXHolderStatusIntent *intent;
 	ClusterPcmResourceXMasterState *state;
 	PcmEntryRef entry_ref;
 	PcmEntryAcquireResult acquire_result;
@@ -24464,11 +24490,16 @@ cluster_pcm_lock_resource_x_holder_status_intent_snapshot_exact(const ResourceXA
 			&& state->holder_status.valid != RESOURCE_X_HOLDER_PAIR_PUBLISHED)
 		|| intent->slot.payload_bytes > payload_capacity
 		|| (intent->slot.payload_bytes != RESOURCE_X_CONTROL_V1_BYTES
-			&& intent->slot.payload_bytes != RESOURCE_X_PROOF_V1_BYTES)
+			&& intent->slot.payload_bytes != RESOURCE_X_PROOF_V1_BYTES
+			&& intent->slot.payload_bytes != RESOURCE_X_WITNESS_V3_BYTES
+			&& intent->slot.payload_bytes != RESOURCE_X_SOURCE_WITNESS_V3_BYTES)
 		|| intent->slot.kind != RESOURCE_X_WIRE_BLOCKED_TO_N
 		|| intent->slot.body.owner_kind != RESOURCE_X_INTENT_OWNER_HOLDER_STATUS
 		|| intent->slot.body.owner_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
-		|| intent->slot.body.owner_index != 0) {
+		|| intent->slot.body.owner_index != 0
+		|| ((intent->slot.payload_bytes == RESOURCE_X_WITNESS_V3_BYTES
+			 || intent->slot.payload_bytes == RESOURCE_X_SOURCE_WITNESS_V3_BYTES)
+			&& !pcm_resource_x_holder_send_pair_valid(entry, state))) {
 		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 		goto holder_status_intent_done;
 	}
@@ -24556,7 +24587,7 @@ cluster_pcm_lock_resource_x_holder_image_intent_snapshot_exact(const ResourceXAs
 	if (slot_out != NULL)
 		memset(slot_out, 0, sizeof(*slot_out));
 	if (!resource_x_assertion_valid(assertion) || slot_out == NULL || payload_out == NULL
-		|| payload_capacity < RESOURCE_X_IMAGE_V2_BYTES)
+		|| payload_capacity < RESOURCE_X_CONTROL_V1_BYTES)
 		return RESOURCE_X_APPLY_INVALID;
 	if (!pcm_entry_ref_acquire(&assertion->resource, false, &entry_ref, &acquire_result))
 		return RESOURCE_X_APPLY_NOT_FOUND;
@@ -24578,15 +24609,22 @@ cluster_pcm_lock_resource_x_holder_image_intent_snapshot_exact(const ResourceXAs
 	}
 	if (intent->state > RESOURCE_X_INTENT_SLOT_STAGED
 		|| !pcm_resource_x_intent_body_valid(&intent->body)
-		|| intent->payload_bytes != RESOURCE_X_IMAGE_V2_BYTES
-		|| intent->kind != RESOURCE_X_WIRE_IMAGE_ENVELOPE
+		|| intent->payload_bytes > payload_capacity
+		|| !((intent->kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE
+				&& (intent->payload_bytes == RESOURCE_X_IMAGE_V2_BYTES
+					|| intent->payload_bytes == RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES))
+			|| (intent->kind == RESOURCE_X_WIRE_BLOCKED_TO_N
+				&& intent->payload_bytes == RESOURCE_X_WITNESS_V3_BYTES))
 		|| intent->body.owner_kind != RESOURCE_X_INTENT_OWNER_HOLDER_IMAGE
 		|| intent->body.owner_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
 		|| intent->body.owner_index != 0
 		|| state->holder_image.valid != RESOURCE_X_HOLDER_PAIR_PUBLISHED
 		|| state->holder_image.payload_bytes != intent->payload_bytes
 		|| state->holder_image.logical_generation != intent->logical_generation
-		|| state->holder_image.authority_generation != intent->authority_generation) {
+		|| state->holder_image.authority_generation != intent->authority_generation
+		|| ((intent->payload_bytes == RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES
+			 || intent->payload_bytes == RESOURCE_X_WITNESS_V3_BYTES)
+			&& !pcm_resource_x_holder_send_pair_valid(entry, state))) {
 		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 		goto holder_image_intent_done;
 	}
@@ -25512,7 +25550,7 @@ source_prepare_done:
 		else if (result == RESOURCE_X_APPLY_DUPLICATE
 				 && state->holder_status_intent.slot.state != RESOURCE_X_INTENT_SLOT_EMPTY) {
 			ResourceXDecodedFrame retained_ack;
-			const ClusterPcmResourceXControlIntent *intent = &state->holder_status_intent;
+			const ClusterPcmResourceXHolderStatusIntent *intent = &state->holder_status_intent;
 
 			/* A duplicate does not compete with the already-owned ACK, even
 			 * while its physical tail is only partially sent. */
@@ -25630,7 +25668,7 @@ cluster_pcm_lock_resource_x_source_settlement_receive_end_exact(const ResourceXA
 		|| !resource_x_assertion_equal(assertion, &request.common.logical_assertion))
 		goto done;
 	if (ack != NULL) {
-		ClusterPcmResourceXControlIntent *intent = &state->holder_status_intent;
+		ClusterPcmResourceXHolderStatusIntent *intent = &state->holder_status_intent;
 		ResourceXDecodedFrame canonical = *ack;
 		ResourceXIntentBodyHandle body = { 0 };
 		ResourceXWireReject reject;
@@ -28432,6 +28470,71 @@ pcm_resource_x_intent_identity_equal(const ResourceXIntentSlot *left,
 		   && memcmp(&left->body, &right->body, sizeof(left->body)) == 0;
 }
 
+/* Validate immutable send evidence, not native completion. Both independent
+ * destinations retain the same A and original holder ACK. The source also
+ * retains its image/WAL component. One DATA completion may empty its slot,
+ * but it never discards either retained record or the other send duty.
+ * The master's resource_binding is deliberately not this holder's local
+ * directory binding; only the original native publisher may prove service. */
+static bool
+pcm_resource_x_holder_send_pair_valid(const struct GrdEntry *entry,
+									const ClusterPcmResourceXMasterState *state)
+{
+	const ClusterPcmResourceXHolderStatus *status = &state->holder_status;
+	const ClusterPcmResourceXHolderImage *image = &state->holder_image;
+	ResourceXDecodedFrame frame;
+	ResourceXDecodedAcquireWitness witness;
+	const ResourceXDecodedAcquireWitness *other;
+	ResourceXDecodedCommon common;
+	ResourceXWireReject reject;
+	bool source = status->payload_bytes == RESOURCE_X_SOURCE_WITNESS_V3_BYTES;
+
+	if (status->valid != RESOURCE_X_HOLDER_PAIR_PUBLISHED
+		|| image->valid != RESOURCE_X_HOLDER_PAIR_PUBLISHED
+		|| (status->payload_bytes != RESOURCE_X_WITNESS_V3_BYTES && !source)
+		|| status->kind != RESOURCE_X_WIRE_BLOCKED_TO_N
+		|| image->payload_bytes != (source ? RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES : RESOURCE_X_WITNESS_V3_BYTES)
+		|| image->kind != (source ? RESOURCE_X_WIRE_IMAGE_ENVELOPE : RESOURCE_X_WIRE_BLOCKED_TO_N)
+		|| !pcm_resource_x_intent_body_valid(&status->body)
+		|| !pcm_resource_x_intent_body_valid(&image->body)
+		|| status->body.owner_kind != RESOURCE_X_INTENT_OWNER_HOLDER_STATUS
+		|| image->body.owner_kind != RESOURCE_X_INTENT_OWNER_HOLDER_IMAGE
+		|| status->body.owner_node != (uint32)cluster_node_id
+		|| image->body.owner_node != status->body.owner_node
+		|| status->body.owner_generation != status->logical_generation
+		|| image->body.owner_generation != status->logical_generation
+		|| image->logical_generation != status->logical_generation
+		|| image->authority_generation != status->authority_generation
+		|| image->resource_formation != status->resource_formation
+		|| !resource_x_assertion_equal(&status->body.assertion, &image->body.assertion)
+		|| !BufferTagsEqual(&entry->tag, &status->body.assertion.resource)
+		|| image->destination_node != (uint32)status->body.assertion.requester_node
+		|| !pcm_resource_x_holder_source_slots_exact(state, status, image)
+		|| memcmp(state->holder_status_intent.payload, status->payload, status->payload_bytes) != 0
+		|| !cluster_resource_x_wire_decode(RESOURCE_X_MSG_BLOCKED_TO_N, status->payload,
+			status->payload_bytes, &frame, &reject)
+		|| !frame.has_acquire_decision || frame.kind != RESOURCE_X_WIRE_BLOCKED_TO_N
+		|| !resource_x_assertion_equal(&frame.common.logical_assertion, &status->body.assertion)
+		|| frame.common.assertion_sequence != status->logical_generation
+		|| frame.common.authority_generation != status->authority_generation
+		|| frame.common.resource_formation != status->resource_formation
+		|| frame.common.action_node != (int32)status->body.owner_node
+		|| frame.common.sender_connection_generation != PGRAC_RESOURCE_X_RETAINED_SENDER_GENERATION
+		|| frame.body.acquire_witness.decision.master_node != (int32)status->destination_node
+		|| frame.body.acquire_witness.has_source_proof != source)
+		return false;
+	witness = frame.body.acquire_witness;
+	common = frame.common;
+	if (!cluster_resource_x_wire_decode(source ? RESOURCE_X_MSG_IMAGE_OR_GRANT : RESOURCE_X_MSG_BLOCKED_TO_N,
+		image->payload, image->payload_bytes, &frame, &reject)
+		|| !frame.has_acquire_decision || frame.kind != image->kind)
+		return false;
+	other = source ? &frame.body.acquire_image.source : &frame.body.acquire_witness;
+	common.semantic_crc32c = frame.common.semantic_crc32c;
+	return pcm_resource_x_common_equal(&common, &frame.common)
+		&& memcmp(&witness, other, sizeof(witness)) == 0;
+}
+
 /* This validates a retained transport body, not conditional authority. The
  * publisher still owns canonical A; transport completion never proves A/I/C.
  * A correct CRC alone cannot redirect another original owner/container. */
@@ -28445,6 +28548,14 @@ pcm_resource_x_outbound_decision_valid(const struct GrdEntry *entry,
 	const ResourceXDecodedAcquireDecision *decision;
 	uint8 type;
 
+	if (slot->payload_bytes == RESOURCE_X_WITNESS_V3_BYTES
+		|| slot->payload_bytes == RESOURCE_X_SOURCE_WITNESS_V3_BYTES
+		|| slot->payload_bytes == RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES) {
+		if ((slot != &state->holder_status_intent.slot || payload != state->holder_status_intent.payload)
+			&& (slot != &state->holder_image_intent || payload != state->holder_image.payload))
+			return false;
+		return pcm_resource_x_holder_send_pair_valid(entry, state);
+	}
 	if (slot->payload_bytes != RESOURCE_X_DECISION_V3_BYTES)
 		return true; /* Original non-conditional producers keep their gates. */
 	if (!pcm_resource_x_intent_body_valid(&slot->body))
@@ -28532,12 +28643,18 @@ pcm_resource_x_outbound_intent_lock_exact(const ResourceXIntentSlot *expected,
 		if ((expected->kind != RESOURCE_X_WIRE_BLOCKED_TO_N
 			 && expected->kind != RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2)
 			|| (expected->payload_bytes != RESOURCE_X_CONTROL_V1_BYTES
-				&& expected->payload_bytes != RESOURCE_X_PROOF_V1_BYTES))
+				&& expected->payload_bytes != RESOURCE_X_PROOF_V1_BYTES
+				&& !(expected->kind == RESOURCE_X_WIRE_BLOCKED_TO_N
+					&& (expected->payload_bytes == RESOURCE_X_WITNESS_V3_BYTES
+						|| expected->payload_bytes == RESOURCE_X_SOURCE_WITNESS_V3_BYTES))))
 			return NULL;
 		break;
 	case RESOURCE_X_INTENT_OWNER_HOLDER_IMAGE:
-		if (expected->kind != RESOURCE_X_WIRE_IMAGE_ENVELOPE
-			|| expected->payload_bytes != RESOURCE_X_IMAGE_V2_BYTES)
+		if (!((expected->kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE
+				&& (expected->payload_bytes == RESOURCE_X_IMAGE_V2_BYTES
+					|| expected->payload_bytes == RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES))
+			|| (expected->kind == RESOURCE_X_WIRE_BLOCKED_TO_N
+				&& expected->payload_bytes == RESOURCE_X_WITNESS_V3_BYTES)))
 			return NULL;
 		break;
 	case RESOURCE_X_INTENT_OWNER_MASTER_GRANT:
@@ -28648,7 +28765,8 @@ cluster_pcm_lock_resource_x_outbound_intent_snapshot_exact(const ResourceXIntent
 		pcm_entry_ref_release(&entry_ref);
 		return RESOURCE_X_APPLY_STALE;
 	}
-	if (expected->body.owner_kind == RESOURCE_X_INTENT_OWNER_HOLDER_IMAGE) {
+	if (expected->body.owner_kind == RESOURCE_X_INTENT_OWNER_HOLDER_IMAGE
+		&& expected->payload_bytes == RESOURCE_X_IMAGE_V2_BYTES) {
 		state = pcm_resource_x_master_state_for_entry(entry);
 		if (state == NULL || state->holder_status.valid != RESOURCE_X_HOLDER_PAIR_PUBLISHED
 			|| state->holder_image.valid != RESOURCE_X_HOLDER_PAIR_PUBLISHED
@@ -28897,7 +29015,10 @@ pcm_resource_x_outbound_owner_valid(const ResourceXIntentSlot *slot, uint32 owne
 			   && (slot->kind == RESOURCE_X_WIRE_BLOCKED_TO_N
 				   || slot->kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2)
 			   && (slot->payload_bytes == RESOURCE_X_CONTROL_V1_BYTES
-				   || slot->payload_bytes == RESOURCE_X_PROOF_V1_BYTES);
+				   || slot->payload_bytes == RESOURCE_X_PROOF_V1_BYTES
+				   || (slot->kind == RESOURCE_X_WIRE_BLOCKED_TO_N
+					   && (slot->payload_bytes == RESOURCE_X_WITNESS_V3_BYTES
+						   || slot->payload_bytes == RESOURCE_X_SOURCE_WITNESS_V3_BYTES)));
 	if (owner_index == RESOURCE_X_PROTOCOL_NODE_LIMIT + 1)
 		return slot->body.owner_kind == RESOURCE_X_INTENT_OWNER_MASTER_GRANT
 			   && slot->body.owner_index == 0
@@ -28909,8 +29030,11 @@ pcm_resource_x_outbound_owner_valid(const ResourceXIntentSlot *slot, uint32 owne
 		return slot->body.owner_kind == RESOURCE_X_INTENT_OWNER_HOLDER_IMAGE
 			   && slot->body.owner_index == 0
 			   && slot->body.owner_generation == slot->logical_generation
-			   && slot->kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE
-			   && slot->payload_bytes == RESOURCE_X_IMAGE_V2_BYTES;
+			   && ((slot->kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE
+					&& (slot->payload_bytes == RESOURCE_X_IMAGE_V2_BYTES
+						|| slot->payload_bytes == RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES))
+				   || (slot->kind == RESOURCE_X_WIRE_BLOCKED_TO_N
+					   && slot->payload_bytes == RESOURCE_X_WITNESS_V3_BYTES));
 	if (owner_index == RESOURCE_X_PROTOCOL_NODE_LIMIT + 3)
 		return slot->body.owner_kind == RESOURCE_X_INTENT_OWNER_REQUESTER_SETTLEMENT
 			   && slot->body.owner_index == 0
