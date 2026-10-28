@@ -26,6 +26,8 @@
  */
 struct ClusterHeapFreezePolicySampleV1;
 struct ClusterHeapFreezeCohortObservation;
+struct ClusterHeapFreezeProofBatchV1;
+struct ClusterCtrcItlReadGuardV1;
 
 typedef struct ClusterHeapFreezePageInputV1
 {
@@ -45,6 +47,11 @@ typedef struct ClusterHeapFreezePageInputV1
 	 * retention or mutation authority and are never serialized. */
 	const struct ClusterHeapFreezePolicySampleV1 *freeze_policy;
 	const struct ClusterHeapFreezeCohortObservation *freeze_cohort;
+	/* Original collector-owned scopes, indexed by this exact proof batch.
+	 * Borrow until its original finally; native apply never acquires or
+	 * releases these scopes. NULL keeps foreign proofs unqualified. */
+	const struct ClusterHeapFreezeProofBatchV1 *freeze_source_proofs;
+	const struct ClusterCtrcItlReadGuardV1 *freeze_source_guards;
 	PGAlignedBlock image;
 } ClusterHeapFreezePageInputV1;
 
@@ -461,6 +468,13 @@ extern bool cluster_heap_freeze_prepare_xmin_batch_v1(
  * supply remote/provenance/producer-retention qualification.
  * Their separate current/provenance/retention qualification remains required;
  * the match performs no sampling or callback under page locks.
+ * Foreign proofs additionally borrow the original collector's exact proof
+ * batch and indexed receiver guards. Source/current checks run before writer
+ * restoration without content locks; pure guard/identity/target matching is
+ * repeated after the final callbacks and SPACE, before CRIT. Apply never
+ * acquires or releases a source guard. Preowned foreign content locks refuse
+ * rather than invoking source checks under that lock. Original finally must
+ * keep all borrowed scopes until native apply has returned or unwound.
  *
  * Dormant: production VACUUM must not call this until ORIGINAL FullXid,
  * cutoff/H provenance and admission are closed independently of raw XIDs.

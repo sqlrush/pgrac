@@ -2003,6 +2003,55 @@ static void page_verify_redirects(Page page);
 #include "test_cluster_heap_freeze_helpers.inc"
 
 /* Plans here are fixture-qualified, not shared FullXid/provenance evidence. */
+static bool heap_freeze_retained_sources_current(
+	const ClusterHeapFreezePageInputV1 *, const ClusterHeapFreezeProofBatchV1 *,
+	const ClusterSemanticAdmissionToken *, bool);
+
+/* Native consumer source/registry inputs are controlled here. The real
+ * issuer's registry binding and CLOSE lifetime run in ctrc_cleaner. */
+static unsigned native_foreign_source_checks, native_foreign_guard_checks;
+static bool native_foreign_source_refused, native_foreign_source_error;
+static unsigned native_foreign_guard_refuse_at;
+
+static bool
+native_foreign_guard_matches(const ClusterCtrcItlReadGuardV1 *guard,
+	const ClusterCtrcTxnKeyV1 *key, FullTransactionId original,
+	const ClusterCtrcItlTargetIdentity *target, uint16 node,
+	uint64 formation, uint64 generation)
+{
+	UBA expected = uba_encode(CLUSTER_UNDO_SEGS_PER_INSTANCE + 1, 1, 0, 128);
+
+	native_foreign_guard_checks++;
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	return native_foreign_guard_refuse_at != native_foreign_guard_checks
+		&& guard->serial == 315 && guard->slot == 0 && guard->pid == 2901
+		&& key->origin_node_id == 1 && node == 0 && formation == 21 && generation == 13
+		&& FullTransactionIdEquals(original, FullTransactionIdFromEpochAndXid(1, 77))
+		&& target->spc_oid == relation_data.rd_locator.spcOid
+		&& target->db_oid == relation_data.rd_locator.dbOid
+		&& target->rel_number == relation_data.rd_locator.relNumber
+		&& target->fork_number == MAIN_FORKNUM && target->block_number == 7
+		&& target->itl_xid == 77 && target->itl_slot_index == 0
+		&& target->itl_slot_wrap == 2 && target->itl_class == ITL_FLAG_ACTIVE
+		&& target->needs_wal && memcmp(target->uba, &expected, sizeof(expected)) == 0;
+}
+
+static bool
+native_foreign_source_current(const ClusterTxResolution *resolution,
+	const ClusterCtrcItlTargetIdentity *target, const ClusterSemanticAdmissionToken *admission,
+	const ClusterCtrcItlReadGuardV1 *guard)
+{
+	UT_ASSERT(!local_x && !local_share && backend_pin_count == fixture_expected_backend_pins());
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT(ClusterR4TxCompanionIsValid(resolution) && admission->entered);
+	UT_ASSERT(target->block_number == 7 && guard->serial == 315);
+	native_foreign_source_checks++;
+	if (native_foreign_source_error) elog(ERROR, "injected retained foreign source ERROR");
+	return !native_foreign_source_refused;
+}
+
+#define cluster_ctrc_itl_read_guard_matches_admission_v1 native_foreign_guard_matches
+#define cluster_runtime_visibility_foreign_companion_target_guard_current_admitted native_foreign_source_current
 static bool
 heap_freeze_apply_prepared(Relation rel, Buffer buffer,
 						   TransactionId snapshotConflictHorizon,
@@ -2010,11 +2059,14 @@ heap_freeze_apply_prepared(Relation rel, Buffer buffer,
 						   const ClusterSpaceIdentity *identity, bool conditional,
 						   const ClusterHeapFreezePageInputV1 *freeze_input,
 						   const ClusterSemanticAdmissionToken *freeze_admission,
+						   const ClusterHeapFreezeProofBatchV1 *freeze_proofs,
 						   const ClusterHeapFreezeObservedBoundsV1 *expected_bounds,
 						   FullTransactionId expected_legal_next)
 #include "test_cluster_heap_freeze_apply.inc"
 
 #include "test_cluster_heap_freeze_xmin_apply.inc"
+#undef cluster_runtime_visibility_foreign_companion_target_guard_current_admitted
+#undef cluster_ctrc_itl_read_guard_matches_admission_v1
 
 /* Execute the full native freeze body with the planned pre-lock identity. */
 static void
@@ -2397,7 +2449,7 @@ UT_TEST(test_qualified_freeze_kernel_changes_only_planned_headers)
 		tuples[i].t_infomask = HEAP_XMIN_FROZEN | HEAP_XMAX_INVALID;
 		tuples[i].checkflags = HEAP_FREEZE_CHECK_XMIN_COMMITTED;
 	}
-	heap_freeze_apply_prepared(&relation_data, 1, 70, tuples, 2, &space_identity, false, NULL, NULL, NULL, InvalidFullTransactionId);
+	heap_freeze_apply_prepared(&relation_data, 1, 70, tuples, 2, &space_identity, false, NULL, NULL, NULL, NULL, InvalidFullTransactionId);
 	check_publication(true);
 	UT_ASSERT_EQ(tx_checks, 0);
 	UT_ASSERT_EQ(freeze_data_calls, 2);
@@ -2502,7 +2554,7 @@ UT_TEST(test_exact_xmin_plan_preserves_xmax_through_native_wal_and_redo)
 		if (!prepared)
 			continue;
 		tx_committed = false;
-		heap_freeze_apply_prepared(&relation_data, 1, 70, &plan, 1, &space_identity, false, NULL, NULL, NULL, InvalidFullTransactionId);
+		heap_freeze_apply_prepared(&relation_data, 1, 70, &plan, 1, &space_identity, false, NULL, NULL, NULL, NULL, InvalidFullTransactionId);
 		check_publication(true);
 		UT_ASSERT_EQ(tx_checks, 0);
 		UT_ASSERT_EQ(freeze_data_calls, 2);
@@ -3285,7 +3337,7 @@ UT_TEST(test_freeze_native_wal_dedup_and_redo)
 			tuples[i].checkflags = HEAP_FREEZE_CHECK_XMIN_COMMITTED;
 		}
 		if (shared)
-			heap_freeze_apply_prepared(&relation_data, 1, 70, tuples, 3, &space_identity, false, NULL, NULL, NULL, InvalidFullTransactionId);
+			heap_freeze_apply_prepared(&relation_data, 1, 70, tuples, 3, &space_identity, false, NULL, NULL, NULL, NULL, InvalidFullTransactionId);
 		else
 			run_freeze(&relation_data, 1, 70, tuples, 3, NULL);
 		check_publication(shared);
@@ -3357,7 +3409,7 @@ UT_TEST(test_freeze_kernel_rejects_invalid_space_before_write)
 		expecting_error = true;
 		if (setjmp(error_jump) == 0) {
 			heap_freeze_apply_prepared(&relation_data, 1, 70, &tuple, 1,
-									 bad == 4 ? NULL : &space_identity, false, NULL, NULL, NULL, InvalidFullTransactionId);
+									 bad == 4 ? NULL : &space_identity, false, NULL, NULL, NULL, NULL, InvalidFullTransactionId);
 			UT_ASSERT(false);
 		}
 		expecting_error = false;
@@ -4116,7 +4168,7 @@ UT_TEST(test_xmin_locked_kernel_refuses_foreign_proof_before_native_wal)
 		expecting_error = true;
 		if (setjmp(error_jump) == 0) {
 			UT_ASSERT(!cluster_heap_freeze_apply_xmin_batch_locked_v1(&relation_data,
-				1, &f.input, &f.page, &f.fence, &f.authority, &f.admission,
+				1, &f.input, &f.page, &f.proofs, &f.fence, &f.authority, &f.admission,
 				&target, 1, &plan, conflict_horizon,
 				FullTransactionIdFromEpochAndXid(1, 100), 10));
 		} else {
@@ -4337,7 +4389,7 @@ UT_TEST(test_original_freeze_space_refusal_still_errors)
 	space_buffer_permanent = false; expecting_error = true;
 	PG_TRY();
 	{
-		heap_freeze_apply_prepared(&relation_data, 1, 77, &plan, 1, &space_identity, false, NULL, NULL, NULL, InvalidFullTransactionId);
+		heap_freeze_apply_prepared(&relation_data, 1, 77, &plan, 1, &space_identity, false, NULL, NULL, NULL, NULL, InvalidFullTransactionId);
 	}
 	PG_CATCH(); { caught = true; } PG_END_TRY();
 	expecting_error = false;
@@ -16786,10 +16838,165 @@ UT_TEST(test_original_outer_finally_releases_foreign_scope_before_admission_leav
 	free(v); free(f);
 }
 
+UT_TEST(test_retained_foreign_scope_reaches_original_resumed_native_writer)
+{
+	QualifiedXminFixture f;
+	ClusterCtrcItlReadGuardV1 guards[CLUSTER_HEAP_FREEZE_MAX_PROOF_BATCH] = {0};
+	foreign_creation_setup(&f);
+	UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&f.page, &f.proofs, &f.fence), 1);
+	guards[0] = (ClusterCtrcItlReadGuardV1){.serial = 315, .slot = 0, .pid = 2901};
+	f.input.freeze_source_proofs = &f.proofs;
+	f.input.freeze_source_guards = guards;
+	fixture_release_original_writer(); resume_allowed = true;
+	UT_ASSERT(qualified_xmin_apply(&f, 0));
+	UT_ASSERT_EQ(conditional_resumes, 1); UT_ASSERT_EQ(conditional_unlocks, 1);
+	UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1);
+	UT_ASSERT_EQ(guards[0].serial, 315);
+	UT_ASSERT_EQ(backend_pin_count, 1); UT_ASSERT(f.admission.entered && !local_x);
+}
+
+static void
+retained_foreign_native_setup(QualifiedXminFixture *f,
+	ClusterCtrcItlReadGuardV1 guards[CLUSTER_HEAP_FREEZE_MAX_PROOF_BATCH])
+{
+	foreign_creation_setup(f);
+	UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&f->page, &f->proofs, &f->fence), 1);
+	memset(guards, 0, sizeof(*guards) * CLUSTER_HEAP_FREEZE_MAX_PROOF_BATCH);
+	guards[0] = (ClusterCtrcItlReadGuardV1){.serial = 315, .slot = 0, .pid = 2901};
+	f->input.freeze_source_proofs = &f->proofs; f->input.freeze_source_guards = guards;
+	native_foreign_source_checks = native_foreign_guard_checks = 0;
+	native_foreign_guard_refuse_at = 0;
+	native_foreign_source_refused = native_foreign_source_error = false;
+}
+
+UT_TEST(test_foreign_native_missing_or_stale_scope_refuses_before_writer)
+{
+	for (unsigned fault = 0; fault < 7; fault++) {
+		QualifiedXminFixture f; ClusterHeapFreezeProofBatchV1 other;
+		ClusterCtrcItlReadGuardV1 guards[CLUSTER_HEAP_FREEZE_MAX_PROOF_BATCH];
+		retained_foreign_native_setup(&f, guards); other = f.proofs;
+		switch (fault) {
+		case 0: f.input.freeze_source_guards = NULL; break;
+		case 1: f.input.freeze_source_proofs = &other; break;
+		case 2: guards[0].serial++; break;
+		case 3: guards[0].slot++; break;
+		case 4: guards[0].pid++; break;
+		case 5: guards[0].serial = 0; break;
+		case 6: break; /* A preowned foreign content lock is never queried. */
+		}
+		if (fault != 6) fixture_release_original_writer();
+		resume_allowed = true;
+		UT_ASSERT(!qualified_xmin_apply(&f, 0));
+		UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + inserts + edges + dirties + flushes, 0);
+		UT_ASSERT_EQ(native_foreign_source_checks, 0);
+		UT_ASSERT_EQ(backend_pin_count, 1); UT_ASSERT(f.admission.entered);
+		UT_ASSERT_EQ(memcmp(current_page.data, before_page.data, BLCKSZ), 0);
+	}
+}
+
+UT_TEST(test_foreign_native_source_refusal_and_error_preserve_original_scope)
+{
+	for (unsigned fault = 0; fault < 4; fault++) {
+		QualifiedXminFixture f;
+		ClusterCtrcItlReadGuardV1 guards[CLUSTER_HEAP_FREEZE_MAX_PROOF_BATCH];
+		retained_foreign_native_setup(&f, guards);
+		fixture_release_original_writer(); resume_allowed = true;
+		if (fault == 0) native_foreign_source_refused = true;
+		if (fault == 1) native_foreign_source_error = true;
+		if (fault == 2) resume_allowed = false;
+		if (fault == 3) target_recheck_error = true;
+		if (fault == 1 || fault == 3) {
+			expecting_error = true;
+			if (setjmp(error_jump) == 0) {
+				(void)qualified_xmin_apply(&f, 0); UT_ASSERT(false);
+			}
+			expecting_error = false;
+		} else UT_ASSERT(!qualified_xmin_apply(&f, 0));
+		UT_ASSERT_EQ(native_foreign_source_checks, 1);
+		UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+		UT_ASSERT_EQ(guards[0].serial, 315);
+		UT_ASSERT_EQ(backend_pin_count, 1); UT_ASSERT(f.admission.entered && !local_x && !resumed_writer);
+		UT_ASSERT_EQ(conditional_unlocks, fault == 3 ? 1 : 0);
+		UT_ASSERT_EQ(memcmp(current_page.data, before_page.data, BLCKSZ), 0);
+	}
+	native_foreign_source_refused = native_foreign_source_error = false;
+}
+
+UT_TEST(test_foreign_native_guard_is_rechecked_through_final_space_before_crit)
+{
+	for (unsigned stage = 1; stage <= 4; stage++) {
+		QualifiedXminFixture f;
+		ClusterCtrcItlReadGuardV1 guards[CLUSTER_HEAP_FREEZE_MAX_PROOF_BATCH];
+		retained_foreign_native_setup(&f, guards);
+		fixture_release_original_writer(); resume_allowed = true;
+		native_foreign_guard_refuse_at = stage;
+		UT_ASSERT(!qualified_xmin_apply(&f, 0));
+		UT_ASSERT_EQ(native_foreign_guard_checks, stage);
+		UT_ASSERT_EQ(native_foreign_source_checks, stage <= 2 ? 0 : 1);
+		UT_ASSERT_EQ(conditional_resumes, stage <= 2 ? 0 : 1);
+		UT_ASSERT_EQ(conditional_unlocks, stage <= 2 ? 0 : 1);
+		UT_ASSERT_EQ(space_observation_checks, stage == 4 ? 1 : 0);
+		UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+		UT_ASSERT_EQ(guards[0].serial, 315); UT_ASSERT_EQ(backend_pin_count, 1);
+		UT_ASSERT(f.admission.entered && !local_x && !resumed_writer);
+		UT_ASSERT_EQ(memcmp(current_page.data, before_page.data, BLCKSZ), 0);
+	}
+	native_foreign_guard_refuse_at = 0;
+}
+
+UT_TEST(test_mixed_foreign_local_native_batch_keeps_guard_and_native_redo)
+{
+	QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+	ClusterCtrcItlReadGuardV1 guards[CLUSTER_HEAP_FREEZE_MAX_PROOF_BATCH] = {0};
+	qualified_xmin_batch_setup(&f, targets); foreign_creation_project(&f);
+	UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&f.page, &f.proofs, &f.fence), 3);
+	guards[0] = (ClusterCtrcItlReadGuardV1){.serial = 315, .slot = 0, .pid = 2901};
+	f.input.freeze_source_proofs = &f.proofs; f.input.freeze_source_guards = guards;
+	native_foreign_source_checks = native_foreign_guard_checks = native_foreign_guard_refuse_at = 0;
+	native_foreign_source_refused = native_foreign_source_error = false;
+	fixture_release_original_writer(); resume_allowed = true;
+	UT_ASSERT(qualified_xmin_batch_apply(&f, targets, 3));
+	UT_ASSERT_EQ(native_foreign_source_checks, 1); UT_ASSERT_EQ(native_foreign_guard_checks, 4);
+	UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1); UT_ASSERT_EQ(edges, 1);
+	UT_ASSERT_EQ(guards[0].serial, 315); UT_ASSERT_EQ(backend_pin_count, 1);
+	UT_ASSERT(f.admission.entered && !local_x && !resumed_writer);
+	for (unsigned i = 1; i <= 3; i++) UT_ASSERT(HeapTupleHeaderXminFrozen(freeze_tuple(current_page.data, i)));
+}
+
+UT_TEST(test_actual_collector_exports_only_its_original_native_source_borrow)
+{
+	for (unsigned refusal = 0; refusal <= 2; refusal++) {
+		QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+		bool rows = false;
+		phase_setup(&f, &v, targets, false); foreign_creation_project(&f);
+		v.shared_freeze_input = f.input; v.shared_freeze_batch = f.page;
+		phase_use_original_resident = true; phase_foreign_refuse_at = refusal;
+		phase_resident_completed = false; phase_resident_expected_resumes = 0;
+		phase_resident_hint_error = false; phase_resident_hint_calls = 0;
+		memset(phase_resident_releases, 0, sizeof(phase_resident_releases));
+		v.rel = &relation_data; v.identity = space_identity;
+		v.shared_freeze_input.writer_context_valid = false;
+		relation_data.rd_isvalid = resume_allowed = true;
+		UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs_admitted(&v, 1, &f.authority,
+			f.fence.master_sequence, &f.admission, &rows), refusal == 0
+			? CLUSTER_HEAP_FREEZE_PROOF_PROVEN : CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+		UT_ASSERT_EQ(rows, refusal == 0);
+		UT_ASSERT(v.shared_freeze_input.freeze_source_proofs == (refusal == 0
+			? &v.shared_freeze_proofs : NULL));
+		UT_ASSERT(v.shared_freeze_input.freeze_source_guards == (refusal == 0
+			? v.shared_freeze_source_guards : NULL));
+		UT_ASSERT(lazy_release_shared_freeze_sources(&v));
+		UT_ASSERT(v.shared_freeze_input.freeze_source_proofs == NULL);
+		UT_ASSERT(v.shared_freeze_input.freeze_source_guards == NULL);
+		UT_ASSERT_EQ(backend_pin_count, 1); UT_ASSERT(f.admission.entered && !local_x);
+		bounds_original_census_leave(&f.admission); bounds_lifecycle_assert_empty(&f.admission);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(355);
+	UT_PLAN(361);
 
 	UT_RUN(test_pin_free_admitted_phase_reaches_recent_native_wal_before_owner_leave);
 	UT_RUN(test_pin_free_phase_recent_refusal_retires_only_its_original_owner);
@@ -17156,6 +17363,12 @@ main(void)
 	UT_RUN(test_actual_collector_requires_its_own_foreign_page_receipt_twice);
 	UT_RUN(test_actual_admitted_foreign_continuation_keeps_one_scope_until_original_finally);
 	UT_RUN(test_original_outer_finally_releases_foreign_scope_before_admission_leave);
+	UT_RUN(test_retained_foreign_scope_reaches_original_resumed_native_writer);
+	UT_RUN(test_foreign_native_missing_or_stale_scope_refuses_before_writer);
+	UT_RUN(test_foreign_native_source_refusal_and_error_preserve_original_scope);
+	UT_RUN(test_foreign_native_guard_is_rechecked_through_final_space_before_crit);
+	UT_RUN(test_mixed_foreign_local_native_batch_keeps_guard_and_native_redo);
+	UT_RUN(test_actual_collector_exports_only_its_original_native_source_borrow);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

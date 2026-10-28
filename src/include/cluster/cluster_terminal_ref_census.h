@@ -1177,6 +1177,12 @@ extern bool cluster_ctrc_itl_read_guard_matches_v1(
 	const ClusterCtrcItlReadGuardV1 *guard, const ClusterCtrcTxnKeyV1 *key,
 	FullTransactionId original, const ClusterCtrcParticipantIdentity *receiver,
 	const ClusterCtrcItlTargetIdentity *target);
+/* Pure issuer-local binding to the original receiver/admission. Does not
+ * sample source state or replace the caller's current admission checks. */
+extern bool cluster_ctrc_itl_read_guard_matches_admission_v1(
+	const ClusterCtrcItlReadGuardV1 *guard, const ClusterCtrcTxnKeyV1 *key,
+	FullTransactionId original, const ClusterCtrcItlTargetIdentity *target,
+	uint16 node_id, uint64 formation_epoch, uint64 admission_generation);
 /* New receivers only; an old raw-only participant is never backfilled.
  * Local producers recheck the envelope's FullXid under origin_lock and retain
  * that lock through receiver publication; foreign producers use the original

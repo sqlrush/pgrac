@@ -9432,6 +9432,49 @@ UT_TEST(test_retained_reader_binds_exact_source_after_close_without_new_receipt)
 	UT_ASSERT_EQ(held_count, 0);
 }
 
+UT_TEST(test_retained_native_reader_matches_original_admission_after_close)
+{
+	ClusterCtrcReceiptHandle h; ClusterCtrcParticipantIdentity destination;
+	ClusterCtrcItlTargetIdentity target; ClusterItlSlotData slot;
+	ClusterTxLocator locator; ClusterCtrcItlReadGuardV1 guard = {0}, stale;
+	UT_ASSERT(seed_delegation_itl_source(&h, &destination, &target, &slot));
+	locator = receiver_companion_locator(&h, &slot);
+	UT_ASSERT(cluster_ctrc_itl_original_full_xid_target_hold_shared(&h.key,
+		h.original_full_xid, &locator, &h.participant->identity, &target, &guard));
+	for (unsigned closed = 0; closed < 2; closed++) {
+		if (closed) UT_ASSERT_EQ(cluster_ctrc_participant_close(h.participant,
+			&h.participant->identity, h.participant->grant_generation, 91), CLUSTER_CTRC_CLOSE_PENDING_DRAIN);
+		for (unsigned fault = 0; fault < 10; fault++) {
+			ClusterCtrcTxnKeyV1 key = h.key;
+			ClusterCtrcItlTargetIdentity t = target;
+			FullTransactionId full = h.original_full_xid;
+			ClusterCtrcParticipantIdentity receiver = h.participant->identity;
+			stale = guard;
+			switch (fault) {
+			case 0: break;
+			case 1: receiver.node_id++; break;
+			case 2: receiver.formation_epoch++; break;
+			case 3: receiver.admission_record_generation++; break;
+			case 4: key.root_generation++; break;
+			case 5: full = FullTransactionIdFromU64(U64FromFullTransactionId(full) + (UINT64CONST(1) << 32)); break;
+			case 6: t.block_number++; break;
+			case 7: t.itl_slot_wrap++; break;
+			case 8: stale.serial++; break;
+			case 9: stale.pid++; break;
+			}
+			UT_ASSERT_EQ(cluster_ctrc_itl_read_guard_matches_admission_v1(&stale, &key, full,
+				&t, receiver.node_id, receiver.formation_epoch, receiver.admission_record_generation), fault == 0);
+			UT_ASSERT_EQ(h.participant->retained_reader_count, 1);
+		}
+	}
+	stale = guard;
+	UT_ASSERT(cluster_ctrc_itl_read_guard_release_shared(&guard));
+	UT_ASSERT(!cluster_ctrc_itl_read_guard_matches_admission_v1(&stale, &h.key, h.original_full_xid,
+		&target, h.participant->identity.node_id, h.participant->identity.formation_epoch,
+		h.participant->identity.admission_record_generation));
+	UT_ASSERT_EQ(held_count, 0);
+}
+
 int
 main(void)
 {
@@ -9439,7 +9482,7 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(205);
+	UT_PLAN(206);
 	UT_RUN(test_prepare_path_namespace_precedes_input_and_resets_output);
 	UT_RUN(test_prepare_path_input_precedes_journal_exhaustion);
 	UT_RUN(test_prepare_path_chain_precedes_locator_and_keeps_blocked_state);
@@ -9650,6 +9693,7 @@ main(void)
 	UT_RUN(test_retained_reader_blocks_key_ack_after_receipt_cleanup);
 	UT_RUN(test_retained_reader_rejects_stale_tokens_and_exit_releases_only_its_own);
 	UT_RUN(test_retained_reader_binds_exact_source_after_close_without_new_receipt);
+	UT_RUN(test_retained_native_reader_matches_original_admission_after_close);
 	free(CtrcShared);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

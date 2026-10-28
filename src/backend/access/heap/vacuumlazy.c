@@ -2040,6 +2040,8 @@ lazy_release_shared_freeze_sources(LVRelState *vacrel)
 {
 	bool released = true;
 
+	vacrel->shared_freeze_input.freeze_source_proofs = NULL;
+	vacrel->shared_freeze_input.freeze_source_guards = NULL;
 	for (unsigned index = 0; index < CLUSTER_HEAP_FREEZE_MAX_PROOF_BATCH; index++)
 		if (!cluster_ctrc_itl_read_guard_release_shared(&vacrel->shared_freeze_source_guards[index]))
 			released = false;
@@ -2320,6 +2322,11 @@ lazy_collect_shared_freeze_proofs_admitted(LVRelState *vacrel, Buffer recent_buf
 	{
 		vacrel->shared_freeze_proofs = proofs;
 		vacrel->shared_freeze_fence = current_fence;
+		if (row_inputs_current && !cleaned)
+		{
+			vacrel->shared_freeze_input.freeze_source_proofs = &vacrel->shared_freeze_proofs;
+			vacrel->shared_freeze_input.freeze_source_guards = vacrel->shared_freeze_source_guards;
+		}
 		/* A retained row subset does not qualify the whole page. */
 		vacrel->shared_freeze_fence_valid =
 			status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN && !cleaned;

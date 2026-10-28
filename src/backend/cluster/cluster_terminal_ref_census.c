@@ -7504,6 +7504,30 @@ cluster_ctrc_itl_read_guard_matches_v1(
 }
 
 bool
+cluster_ctrc_itl_read_guard_matches_admission_v1(
+	const ClusterCtrcItlReadGuardV1 *guard, const ClusterCtrcTxnKeyV1 *key,
+	FullTransactionId original, const ClusterCtrcItlTargetIdentity *target,
+	uint16 node_id, uint64 formation_epoch, uint64 admission_generation)
+{
+	const CtrcItlRetainedReader *reader;
+
+	if (guard == NULL || key == NULL || target == NULL
+		|| guard->serial == 0 || guard->slot >= CLUSTER_CTRC_ITL_READ_GUARDS
+		|| guard->pid != MyProcPid || node_id >= CLUSTER_CTRC_MAX_PARTICIPANTS
+		|| formation_epoch == 0 || admission_generation == 0
+		|| admission_generation > UINT32_MAX)
+		return false;
+	reader = &CtrcItlReaders[guard->slot];
+	return reader->identity.node_id == node_id
+		&& reader->identity.formation_epoch == formation_epoch
+		&& reader->identity.admission_record_generation == admission_generation
+		&& key->formation_epoch == formation_epoch
+		&& key->admission_record_generation == admission_generation
+		&& cluster_ctrc_itl_read_guard_matches_v1(guard, key, original,
+			&reader->identity, target);
+}
+
+bool
 cluster_ctrc_itl_read_guard_release_shared(ClusterCtrcItlReadGuardV1 *guard)
 {
 	CtrcItlRetainedReader *reader;

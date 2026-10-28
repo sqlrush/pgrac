@@ -1969,9 +1969,9 @@ test_cluster_heap_borrowed_pin.inc: $(top_srcdir)/src/backend/storage/buffer/buf
 	mv $@.tmp $@
 
 test_cluster_heap_freeze_xmin_apply.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
-	awk '/^cluster_heap_freeze_apply_xmin_batch_locked_v1\(/ { print "static bool"; emit=1; found++ } \
+	awk '/^(heap_freeze_retained_sources_current|cluster_heap_freeze_apply_xmin_batch_locked_v1)\(/ { print "static bool"; emit=1; found++ } \
 	     /^cluster_heap_freeze_apply_xmin(_batch(_recent)?)?_v1\(/ { print "bool"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 4) exit 1 }' $< > $@.tmp
+	     emit { print } /^}/ { emit=0 } END { if (found != 5) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_heap_freeze_redo.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
