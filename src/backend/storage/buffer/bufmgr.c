@@ -3265,6 +3265,157 @@ cluster_bufmgr_pcm_own_acquire_claim_exact(
 	return result;
 }
 
+/* Original staged acquisition preparation. No physical action is legal here.
+ * The entry stage fences pre-native release before BufHdr adopts the hold;
+ * entry, provider and header domains never nest. Author: SqlRush. */
+typedef enum ClusterAcquirePreparationAction
+{
+	CLUSTER_ACQUIRE_PREPARATION_QUIET,
+	CLUSTER_ACQUIRE_PREPARATION_ADOPT,
+	CLUSTER_ACQUIRE_PREPARATION_WITHDRAW
+} ClusterAcquirePreparationAction;
+
+static bool
+cluster_bufmgr_acquire_prepared_native(BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
+	const ResourceXDecodedAcquireIntent *episode, uint64 executor_sequence,
+	ClusterAcquirePreparationAction action, ClusterPcmOwnSnapshot *out)
+{
+	ClusterPcmOwnSnapshot expected = *base, live;
+	ClusterPcmOwnResult result = CLUSTER_PCM_OWN_STALE;
+	uint64 attempt;
+	uint32 state;
+
+	if (buf == NULL || buf->buf_id != episode->buffer_id
+		|| episode->buffer_id < 0 || episode->buffer_id >= NBuffers
+		|| ClusterPcmOwnArray == NULL || executor_sequence == 0
+		|| executor_sequence == UINT64_MAX)
+		return false;
+	expected.flags = PCM_OWN_FLAG_GRANT_PENDING;
+	expected.reservation_token = episode->reservation_token;
+	if (base->generation != episode->base_generation
+		|| base->flags != 0 || base->reservation_token >= UINT64_MAX - 1
+		|| episode->reservation_token != base->reservation_token + 1)
+		return false;
+	state = LockBufHdr(buf);
+	cluster_pcm_own_snapshot_locked(buf, &live);
+	attempt = cluster_pcm_own_delivery_attempt_get(buf->buf_id);
+	if (cluster_pcm_own_snapshot_equal_exact(&expected, &live)
+		&& live.writer_activation_token == 0 && live.resource_x_activation_generation == 0
+		&& (pg_atomic_read_u64(&ClusterPcmOwnArray[buf->buf_id].write_io_generation) & 1) == 0) {
+		if (action == CLUSTER_ACQUIRE_PREPARATION_ADOPT && attempt == 0)
+			result = cluster_pcm_own_delivery_hold_adopt_grant_exact(buf->buf_id,
+				episode->base_generation, episode->reservation_token, executor_sequence);
+		else if (action == CLUSTER_ACQUIRE_PREPARATION_WITHDRAW && attempt == executor_sequence)
+			result = cluster_pcm_own_delivery_hold_unadopt_grant_exact(buf->buf_id,
+				episode->base_generation, episode->reservation_token, executor_sequence);
+		else if (action != CLUSTER_ACQUIRE_PREPARATION_ADOPT && attempt == 0)
+			result = CLUSTER_PCM_OWN_OK;
+	}
+	if (result == CLUSTER_PCM_OWN_OK)
+		*out = live;
+	UnlockBufHdr(buf, state);
+	return result == CLUSTER_PCM_OWN_OK;
+}
+
+ResourceXApplyResult
+cluster_bufmgr_pcm_own_acquire_stage_begin_exact(BufferDesc *buf,
+	const ClusterPcmOwnSnapshot *base, uint64 reservation_token, uint8 path,
+	const ClusterSemanticAdmissionToken *admission, const ResourceXDeliveryClaim *claim,
+	ResourceXDeliveryClaim *out)
+{
+	ClusterPcmOwnSnapshot original, quiet;
+	ResourceXDecodedAcquireIntent episode, checked;
+	ResourceXDeliveryClaim owned, prepared;
+	ClusterPcmOwnResult native;
+	volatile ResourceXApplyResult result;
+	volatile bool exported = false;
+
+	if (base == NULL || claim == NULL || out == NULL)
+		return RESOURCE_X_APPLY_INVALID;
+	original = *base;
+	owned = *claim;
+	native = cluster_bufmgr_pcm_own_acquire_intent_exact(buf, &original, reservation_token,
+		path, admission, NULL, &episode);
+	if (native != CLUSTER_PCM_OWN_OK)
+		return native == CLUSTER_PCM_OWN_BUSY || native == CLUSTER_PCM_OWN_NOT_READY
+			? RESOURCE_X_APPLY_BAD_STATE : RESOURCE_X_APPLY_STALE;
+	if (!BufferTagsEqual(&original.tag, &owned.observation.request.logical_assertion.resource)
+		|| owned.observation.request.observed_mode != original.pcm_state
+		|| owned.observation.r4_record_generation != episode.r4_generation
+		|| owned.observation.request.resource_formation != episode.cluster_epoch
+		|| cluster_gcs_lookup_master(original.tag) != owned.observation.master_node)
+		return RESOURCE_X_APPLY_STALE;
+	result = cluster_pcm_lock_resource_x_requester_acquire_stage_begin_exact(&owned, &episode, &prepared);
+	if (result != RESOURCE_X_APPLY_APPLIED)
+		return result;
+	PG_TRY();
+	{
+		native = cluster_bufmgr_pcm_own_acquire_intent_exact(buf, &original, reservation_token,
+			path, admission, &episode, &checked);
+		if (native != CLUSTER_PCM_OWN_OK)
+			result = native == CLUSTER_PCM_OWN_BUSY || native == CLUSTER_PCM_OWN_NOT_READY
+				? RESOURCE_X_APPLY_BAD_STATE : RESOURCE_X_APPLY_STALE;
+		else if (!cluster_pcm_lock_resource_x_gate_open_exact(episode.cluster_epoch))
+			result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		else if (cluster_gcs_lookup_master(original.tag) != owned.observation.master_node)
+			result = RESOURCE_X_APPLY_STALE;
+		else if (!cluster_bufmgr_acquire_prepared_native(buf, &original, &episode,
+			prepared.executor_sequence, CLUSTER_ACQUIRE_PREPARATION_ADOPT, &quiet))
+			result = RESOURCE_X_APPLY_BAD_STATE;
+		else {
+			/* No ERROR-capable provider after adopting the native hold. */
+			*out = prepared;
+			exported = true;
+			result = RESOURCE_X_APPLY_APPLIED;
+		}
+	}
+	PG_FINALLY();
+	{
+		if (!exported
+			&& (!cluster_bufmgr_acquire_prepared_native(buf, &original, &episode,
+				prepared.executor_sequence, CLUSTER_ACQUIRE_PREPARATION_QUIET, &quiet)
+				|| cluster_pcm_lock_resource_x_requester_acquire_stage_revert_exact(
+					&prepared, &episode, &quiet) != RESOURCE_X_APPLY_APPLIED))
+			result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	}
+	PG_END_TRY();
+	return result;
+}
+
+/* Explicit unpublished withdrawal, including after domain closure/cancel.
+ * Preserve the GP/IO/PI owner; only this exact preparation hold is released.
+ * Quiet native withdrawal precedes PCM reversion, with no ERROR providers. */
+ResourceXApplyResult
+cluster_bufmgr_pcm_own_acquire_stage_release_exact(BufferDesc *buf,
+	const ClusterPcmOwnSnapshot *base, const ResourceXDecodedAcquireIntent *episode,
+	const ResourceXDeliveryClaim *claim)
+{
+	ClusterPcmOwnSnapshot quiet;
+	ResourceXApplyResult result;
+
+	if (buf == NULL || base == NULL || episode == NULL || claim == NULL
+		|| claim->purpose != RESOURCE_X_DELIVERY_ACQUIRE_PREPARED)
+		return RESOURCE_X_APPLY_INVALID;
+	if (!BufferTagsEqual(&base->tag, &claim->observation.request.logical_assertion.resource)
+		|| claim->target.buffer_id_plus_one != (uint32)episode->buffer_id + 1
+		|| claim->target.generation != episode->base_generation
+		|| claim->target.reservation_token != episode->reservation_token
+		|| claim->target.flags != PCM_OWN_FLAG_GRANT_PENDING
+		|| MyProc == NULL || MyProc->pid != MyProcPid || MyProcPid <= 0
+		|| MyBackendId != episode->backend_id || MyProc->backendId != episode->backend_id
+		|| MyProc->cluster_grd_generation != episode->backend_generation
+		|| cluster_qvotec_get_self_incarnation() != episode->requester_incarnation
+		|| GetPrivateRefCount(BufferDescriptorGetBuffer(buf)) <= 0)
+		return RESOURCE_X_APPLY_STALE;
+	result = cluster_pcm_lock_resource_x_requester_acquire_stage_observe_exact(claim, episode);
+	if (result != RESOURCE_X_APPLY_APPLIED)
+		return result;
+	if (!cluster_bufmgr_acquire_prepared_native(buf, base, episode,
+		claim->executor_sequence, CLUSTER_ACQUIRE_PREPARATION_WITHDRAW, &quiet))
+		return RESOURCE_X_APPLY_STALE;
+	return cluster_pcm_lock_resource_x_requester_acquire_stage_revert_exact(claim, episode, &quiet);
+}
+
 static bool
 cluster_bufmgr_resource_x_wait_retry(LWLock *content_lock, int32 buffer_id,
 								 uint32 wait_index, bool *barrier_refused)

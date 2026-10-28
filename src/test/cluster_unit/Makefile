@@ -10438,3 +10438,36 @@ clean distclean maintainer-clean: clean-native-acquire-claim
 clean-native-acquire-claim:
 	rm -f test_cluster_native_acquire_claim test_cluster_native_acquire_claim.inc test_cluster_native_acquire_claim.inc.tmp \
 		test_cluster_native_acquire_input_fixture.inc test_cluster_native_acquire_input_fixture.inc.tmp
+
+# Original native preparation only; no physical operation or native C.
+TESTS += test_cluster_native_acquire_stage
+all: test_cluster_native_acquire_stage
+test_cluster_native_acquire_stage: test_cluster_native_acquire_stage.c \
+        test_cluster_native_acquire_stage.inc test_cluster_native_acquire_claim_fixture.inc \
+        test_cluster_native_acquire_claim $(CLUSTER_PCM_OWN_O) \
+        $(top_srcdir)/src/include/cluster/cluster_pcm_lock.h \
+        $(top_srcdir)/src/include/cluster/cluster_pcm_x_bufmgr.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+test_cluster_native_acquire_stage.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^\/\* Original staged acquisition preparation/ { emit=1; found++ } \
+	     /^static bool$$/ && emit { pending=1; next } \
+	     /^cluster_bufmgr_resource_x_wait_retry\(/ && pending { emit=0; stop=1 } \
+	     emit { if (pending) { print "static bool"; pending=0 } print } \
+	     END { if (found != 1 || !stop) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_native_acquire_claim_fixture.inc: test_cluster_native_acquire_claim.c Makefile
+	awk '/^UT_TEST\(/ { stop=1 } !stop { print; lines++ } \
+	     END { if (!stop || lines < 50) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+clean distclean maintainer-clean: clean-native-acquire-stage
+.PHONY: clean-native-acquire-stage
+clean-native-acquire-stage:
+	rm -f test_cluster_native_acquire_stage test_cluster_native_acquire_stage.inc test_cluster_native_acquire_stage.inc.tmp \
+		test_cluster_native_acquire_claim_fixture.inc test_cluster_native_acquire_claim_fixture.inc.tmp

@@ -681,6 +681,34 @@ cluster_pcm_own_delivery_hold_adopt_grant_exact(int buf_id, uint64 expected_gene
 	return CLUSTER_PCM_OWN_OK;
 }
 
+/* Unpublished preparation only: retain the original GP reservation and
+ * semantic buffer state. The bufmgr caller holds BufHdr and proves no
+ * physical action has begun; this is not general reservation cancellation. */
+ClusterPcmOwnResult
+cluster_pcm_own_delivery_hold_unadopt_grant_exact(int buf_id, uint64 expected_generation,
+	uint64 reservation_token, uint64 delivery_attempt)
+{
+	ClusterPcmOwnEntry *entry;
+
+	if (delivery_attempt == 0 || delivery_attempt == UINT64_MAX
+		|| expected_generation == UINT64_MAX || reservation_token == 0
+		|| reservation_token == UINT64_MAX)
+		return CLUSTER_PCM_OWN_INVALID;
+	if (!cluster_pcm_own_entry_for_buf(buf_id, &entry))
+		return CLUSTER_PCM_OWN_NOT_READY;
+	if (pg_atomic_read_u64(&entry->generation) != expected_generation
+		|| pg_atomic_read_u64(&entry->reservation_token) != reservation_token
+		|| pg_atomic_read_u64(&entry->delivery_attempt) != delivery_attempt)
+		return CLUSTER_PCM_OWN_STALE;
+	if (pg_atomic_read_u32(&entry->flags) != PCM_OWN_FLAG_GRANT_PENDING
+		|| pg_atomic_read_u64(&entry->writer_activation_token) != 0
+		|| pg_atomic_read_u64(&entry->resource_x_activation_generation) != 0
+		|| (pg_atomic_read_u64(&entry->write_io_generation) & 1) != 0)
+		return CLUSTER_PCM_OWN_BUSY;
+	pg_atomic_write_u64(&entry->delivery_attempt, 0);
+	return CLUSTER_PCM_OWN_OK;
+}
+
 ClusterPcmOwnResult
 cluster_pcm_own_delivery_hold_release_exact(int buf_id, uint64 expected_generation,
 											uint64 delivery_attempt)

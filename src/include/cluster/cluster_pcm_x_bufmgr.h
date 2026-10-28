@@ -1031,4 +1031,14 @@ extern ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_self_handoff_probe(const BufferTag *tag,
 										  ClusterPcmOwnSelfHandoffSample *sample_out);
 
+/* Original full-E unpublished preparation. No physical IO/install/C is
+ * permitted until a later exact stage closes this withdrawal path. */
+extern ResourceXApplyResult cluster_bufmgr_pcm_own_acquire_stage_begin_exact(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *base, uint64 reservation_token, uint8 path,
+	const struct ClusterSemanticAdmissionToken *admission, const ResourceXDeliveryClaim *claim,
+	ResourceXDeliveryClaim *out);
+extern ResourceXApplyResult cluster_bufmgr_pcm_own_acquire_stage_release_exact(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
+	const ResourceXDecodedAcquireIntent *episode, const ResourceXDeliveryClaim *claim);
+
 #endif /* CLUSTER_PCM_X_BUFMGR_H */

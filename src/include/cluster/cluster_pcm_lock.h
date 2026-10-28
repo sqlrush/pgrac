@@ -1711,6 +1711,7 @@ typedef struct ResourceXDeliveryTarget {
 
 #define RESOURCE_X_DELIVERY_NORMAL UINT8_C(1)
 #define RESOURCE_X_DELIVERY_CLEANUP UINT8_C(2)
+#define RESOURCE_X_DELIVERY_ACQUIRE_PREPARED UINT8_C(3)
 typedef struct ResourceXDeliveryClaim {
 	ResourceXInstallClaimJoinObservation observation;
 	ResourceXDeliveryTarget target;
@@ -2805,5 +2806,18 @@ extern void cluster_pcm_lock_pi_holder_note(BufferTag tag, int32 holder_node);
 extern bool cluster_pcm_lock_pi_discard_collect(BufferTag tag, SCN written_scn,
 												uint32 *holders_out);
 
+/* Original full-E preparation only. Generic delivery claims reject PREPARED.
+ * Revert requires bufmgr's exact unpublished/zero-hold native observation;
+ * neither operation grants physical IO, image installation or native C. */
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_stage_observe_exact(
+	const ResourceXDeliveryClaim *claim, const ResourceXDecodedAcquireIntent *episode);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_stage_begin_exact(
+	const ResourceXDeliveryClaim *claim, const ResourceXDecodedAcquireIntent *episode,
+	ResourceXDeliveryClaim *out);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_stage_revert_exact(
+	const ResourceXDeliveryClaim *claim, const ResourceXDecodedAcquireIntent *episode,
+	const struct ClusterPcmOwnSnapshot *quiet);
+
 #endif /* USE_PGRAC_CLUSTER */
+
 #endif /* CLUSTER_PCM_LOCK_H */

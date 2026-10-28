@@ -202,6 +202,9 @@ extern ClusterPcmOwnResult cluster_pcm_own_delivery_grant_begin_exact(int buf_id
 																	  uint64 expected_generation,
 																	  uint64 delivery_attempt,
 																	  uint64 *out_token);
+/* BufHdr-owned unpublished withdrawal; preserves GP and token/generation. */
+extern ClusterPcmOwnResult cluster_pcm_own_delivery_hold_unadopt_grant_exact(
+	int buf_id, uint64 expected_generation, uint64 reservation_token, uint64 delivery_attempt);
 extern ClusterPcmOwnResult cluster_pcm_own_delivery_hold_release_exact(int buf_id,
 																	   uint64 expected_generation,
 																	   uint64 delivery_attempt);
