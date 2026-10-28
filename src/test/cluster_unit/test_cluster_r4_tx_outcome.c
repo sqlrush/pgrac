@@ -203,6 +203,8 @@ static int test_candidate_max_held_count;
 static int test_candidate_extract_calls;
 static bool test_candidate_mutate_record_on_recheck;
 static bool test_operation_page_enabled;
+static bool test_operation_worker_enabled;
+static bool test_operation_worker_current_busy;
 static PGAlignedBlock test_operation_page;
 static int test_operation_acquire_failure_call;
 static int test_operation_pin_depth;
@@ -424,6 +426,20 @@ size_t
 cluster_undo_get_record(UBA uba, void *out_buffer, size_t buffer_size)
 {
 	test_undo_read_calls++;
+	if (test_operation_worker_enabled) {
+		uint32 segment, block;
+		uint16 tt, row;
+		UndoSlotDirEntry slot;
+
+		if (!uba_decode_record(uba, &segment, &block, &tt, &row) || block != 7 || row > 1)
+			return 0;
+		memcpy(&slot, test_operation_page.data + BLCKSZ - ((uint32)row + 1) * sizeof(slot),
+			   sizeof(slot));
+		if (slot.record_length > buffer_size)
+			return 0;
+		memcpy(out_buffer, test_operation_page.data + slot.record_offset, slot.record_length);
+		return slot.record_length;
+	}
 	UT_ASSERT(test_uba_equal(uba, test_origin_locator.uba));
 	UT_ASSERT(out_buffer != NULL);
 	UT_ASSERT(buffer_size >= sizeof(test_origin_record));
@@ -827,6 +843,11 @@ cluster_undo_block0_current_acquire_begin_admitted(
 	if (test_operation_release_pending_call != 0
 		&& test_operation_release_pending_call == test_candidate_release_calls)
 		UT_ASSERT_EQ(test_operation_release_poll_count, 2);
+	/* Model original current_resid_already_active() for the cohort test. */
+	if (test_operation_worker_current_busy && test_candidate_held_count != 0) {
+		*failure = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+		return CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
+	}
 	if (test_operation_acquire_failure_call == test_candidate_acquire_calls)
 		return CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
 	if (test_candidate_acquire_step == CLUSTER_UNDO_BLOCK0_CURRENT_HELD) {
@@ -1498,6 +1519,8 @@ reset_exact_origin_fixture(void)
 	test_candidate_extract_calls = 0;
 	test_candidate_mutate_record_on_recheck = false;
 	test_operation_page_enabled = false;
+	test_operation_worker_enabled = false;
+	test_operation_worker_current_busy = false;
 	test_operation_acquire_failure_call = 0;
 	test_operation_pin_depth = 0;
 	test_operation_release_pending_call = 0;
@@ -7567,11 +7590,30 @@ UT_TEST(test_retained_slot_identity_does_not_escape_original_final_fences)
 #include "test_cluster_savepoint_origin_driver.inc"
 #include "test_cluster_savepoint_cr_consumer.inc"
 #include "test_cluster_savepoint_origin_poll.inc"
+#include "test_cluster_savepoint_origin_worker.inc"
 
 int
 main(void)
 {
-	UT_PLAN(275);
+	UT_PLAN(292);
+	UT_RUN(test_operation_worker_real_builder_yields_before_visibility);
+	UT_RUN(test_operation_worker_real_origin_completes_private_inverse);
+	UT_RUN(test_operation_worker_pending_current_is_bounded_and_counts_once);
+	UT_RUN(test_operation_worker_exact_forget_cancels_every_reader_phase);
+	UT_RUN(test_operation_worker_stale_admission_cancels_original_guard);
+	UT_RUN(test_operation_worker_wrong_owner_does_not_cancel_other_key);
+	UT_RUN(test_operation_worker_changed_route_cancels_exact_key);
+	UT_RUN(test_operation_worker_changed_private_source_never_publishes_full);
+	UT_RUN(test_operation_worker_unknown_prepared_and_cold_refuse);
+	UT_RUN(test_operation_worker_reselects_discarded_head_below_read_scn);
+	UT_RUN(test_operation_worker_sequence_regression_and_cycle_refuse);
+	UT_RUN(test_operation_worker_chain_limit_never_counts_pending_ticks);
+	UT_RUN(test_operation_worker_unadmitted_operation_has_no_authority);
+	UT_RUN(test_operation_worker_active_sample_survives_later_commit);
+	UT_RUN(test_operation_worker_error_then_original_forget_is_idempotent);
+	UT_RUN(test_operation_worker_surviving_live_refuses_full);
+	UT_RUN(test_operation_worker_same_segment_cohort_waits_and_cancel_hands_off);
+
 	UT_RUN(test_operation_poll_does_not_complete_inline);
 	UT_RUN(test_operation_poll_stages_outputs);
 	UT_RUN(test_operation_poll_same_and_cross_segment_complete);

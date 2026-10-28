@@ -70,13 +70,15 @@ typedef enum ClusterR4CrBuildStepResult {
 	CLUSTER_R4_CR_STEP_FULL = 0,
 	CLUSTER_R4_CR_STEP_NEED_UNDO = 1,
 	CLUSTER_R4_CR_STEP_RETRY = 2,
-	CLUSTER_R4_CR_STEP_FAIL = 3
+	CLUSTER_R4_CR_STEP_FAIL = 3,
+	CLUSTER_R4_CR_STEP_PENDING = 4
 } ClusterR4CrBuildStepResult;
 
 StaticAssertDecl(CLUSTER_R4_CR_STEP_FULL == 0, "R4 build-step FULL ordinal");
 StaticAssertDecl(CLUSTER_R4_CR_STEP_NEED_UNDO == 1, "R4 build-step NEED_UNDO ordinal");
 StaticAssertDecl(CLUSTER_R4_CR_STEP_RETRY == 2, "R4 build-step RETRY ordinal");
 StaticAssertDecl(CLUSTER_R4_CR_STEP_FAIL == 3, "R4 build-step FAIL ordinal");
+StaticAssertDecl(CLUSTER_R4_CR_STEP_PENDING == 4, "R4 local pending ordinal");
 
 /* Existing wire id, distinct for each bounded record dependency.  The low
  * two bits keep the four-slot routing; zero is never a publishable id. */
@@ -94,6 +96,18 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation, bool 
 								ClusterR4CrSlotExtension *extension, char result_page[BLCKSZ],
 								const char foreign_undo_page[BLCKSZ],
 								ClusterCrBuildReason *reason_out);
+
+/* Worker-0's original entered admission and immutable slot page stay owned
+ * across local PENDING ticks. This process-local result never changes the
+ * shared/wire state: BUILDING remains BUILDING. Exact forget cancels any
+ * attached origin read and retires its private construction observations.
+ * Starting an operation requires this admitted entry; the original entry
+ * retains top-only behavior when no admitted construction exists. */
+extern ClusterR4CrBuildStepResult cluster_cr_build_on_holder_step_admitted(
+	uint32 slot_index, uint64 slot_generation, bool foreign_undo_ready,
+	ClusterR4CrSlotExtension *extension, char result_page[BLCKSZ],
+	const char foreign_undo_page[BLCKSZ], const ClusterSemanticAdmissionToken *admission,
+	ClusterCrBuildReason *reason_out);
 
 /* Process-local metadata only; neither a terminal verdict nor a row proof. */
 #define CLUSTER_R4_RESIDENT_RECORD_BATCH_MAX 8

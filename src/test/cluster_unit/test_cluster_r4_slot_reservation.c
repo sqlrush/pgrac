@@ -39,6 +39,12 @@
 
 UT_DEFINE_GLOBALS();
 
+#include "test_cluster_operation_refusal_boundary.inc"
+#include "cluster/cluster_undo_record_api.h"
+
+bool cluster_trace_normal_stop;
+volatile uint32 CritSectionCount;
+
 int cluster_gcs_reply_timeout_ms = 3000;
 static TimestampTz ut_now = INT64CONST(1000000);
 
@@ -312,9 +318,10 @@ static bool ut_reclaim_race_injected;
 static bool ut_real_builder;
 int cluster_cr_chain_walk_max_steps = 4096;
 MemoryContext TopMemoryContext = (MemoryContext)0x1;
-extern ClusterR4CrBuildStepResult continuation_real_step(uint32, uint64, bool,
-														 ClusterR4CrSlotExtension *, char *,
-														 const char *, ClusterCrBuildReason *);
+extern ClusterR4CrBuildStepResult
+continuation_real_step_admitted(uint32, uint64, bool, ClusterR4CrSlotExtension *, char *,
+								const char *, const ClusterSemanticAdmissionToken *,
+								ClusterCrBuildReason *);
 extern void continuation_real_forget(uint32, uint64);
 extern bool continuation_real_pending(uint32, uint64, ClusterTxLocator *);
 extern bool continuation_real_extract(const char *, const ClusterTxLocator *, char *, size_t *,
@@ -427,12 +434,18 @@ cluster_cr_r4_extract_resident_record(const char resident_undo_page[BLCKSZ],
 }
 
 ClusterR4CrBuildStepResult
-cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation, bool foreign_undo_ready,
-								ClusterR4CrSlotExtension *extension, char result_page[BLCKSZ],
-								const char foreign_undo_page[BLCKSZ],
-								ClusterCrBuildReason *reason_out)
+cluster_cr_build_on_holder_step_admitted(uint32 slot_index, uint64 slot_generation,
+										 bool foreign_undo_ready,
+										 ClusterR4CrSlotExtension *extension,
+										 char result_page[BLCKSZ],
+										 const char foreign_undo_page[BLCKSZ],
+										 const ClusterSemanticAdmissionToken *admission,
+										 ClusterCrBuildReason *reason_out)
 {
 	UBA foreign_uba;
+
+	UT_ASSERT_NOT_NULL(admission);
+	UT_ASSERT(admission->entered);
 
 	ut_builder_step_calls++;
 	ut_builder_slot_index = slot_index;
@@ -443,8 +456,9 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation, bool 
 	ut_builder_foreign_page = foreign_undo_page;
 	ut_state_at_builder_step = pg_atomic_read_u32(&ut_cr_server_shared.slots[slot_index].state);
 	if (ut_real_builder)
-		return continuation_real_step(slot_index, slot_generation, foreign_undo_ready, extension,
-									  result_page, foreign_undo_page, reason_out);
+		return continuation_real_step_admitted(slot_index, slot_generation, foreign_undo_ready,
+											   extension, result_page, foreign_undo_page, admission,
+											   reason_out);
 	if (ut_builder_throw_query_cancel) {
 		ut_builder_error_code = ERRCODE_QUERY_CANCELED;
 		CurrentMemoryContext = (MemoryContext)&ut_error_memory_context_storage;
@@ -1940,6 +1954,41 @@ UT_TEST(test_r4_worker0_build_step_publishes_ready_full)
 	UT_ASSERT_EQ(ut_leave_calls, 0);
 }
 
+UT_TEST(test_r4_worker0_pending_keeps_building_until_final_full)
+{
+	ClusterLmsSharedState state;
+	ClusterLmsCrSlot *slot = prepare_worker0_claim(&state);
+
+	UT_ASSERT(cluster_cr_server_test_r4_claim_queued(0));
+	ut_builder_step_result = CLUSTER_R4_CR_STEP_PENDING;
+	for (int tick = 0; tick < 3; tick++) {
+		UT_ASSERT(!cluster_cr_server_test_r4_build_step(0));
+		UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state), CLUSTER_LMS_CR_R4_BUILDING);
+		UT_ASSERT_EQ(ut_builder_step_calls, tick + 1);
+		UT_ASSERT_EQ(ut_send_calls, 0);
+		UT_ASSERT_EQ(ut_forget_calls, 0);
+		UT_ASSERT_EQ(ut_leave_calls, 0);
+	}
+	ut_builder_step_result = CLUSTER_R4_CR_STEP_FULL;
+	UT_ASSERT(cluster_cr_server_test_r4_build_step(0));
+	UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state), CLUSTER_LMS_CR_R4_READY_FULL);
+	UT_ASSERT_EQ(slot->r4.terminal_reason, CLUSTER_CR_BUILD_NONE);
+}
+
+UT_TEST(test_r4_worker0_pending_with_reason_fails_closed)
+{
+	ClusterLmsSharedState state;
+	ClusterLmsCrSlot *slot = prepare_worker0_claim(&state);
+
+	UT_ASSERT(cluster_cr_server_test_r4_claim_queued(0));
+	ut_builder_step_result = CLUSTER_R4_CR_STEP_PENDING;
+	ut_builder_step_reason = CLUSTER_CR_BUILD_BAD_UNDO;
+	UT_ASSERT(cluster_cr_server_test_r4_build_step(0));
+	UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state), CLUSTER_LMS_CR_R4_READY_FAIL);
+	UT_ASSERT_EQ(slot->r4.terminal_reason, CLUSTER_CR_BUILD_PROTOCOL);
+	UT_ASSERT_EQ(ut_send_calls, 0);
+}
+
 /* A complete builder-owned foreign tuple must become visible before worker 0
  * release-publishes BUILDING->NEED_UNDO.  This step only yields the slot; it
  * does not send, forget, wake, or leave the retained TARGET episode. */
@@ -3311,7 +3360,7 @@ UT_TEST(test_normal_stop_cr_r4_seal_precedes_reservation_and_copy)
 int
 main(void)
 {
-	UT_PLAN(52);
+	UT_PLAN(54);
 	UT_RUN(test_normal_stop_cr_requires_initialized_actual_owner);
 	UT_RUN(test_normal_stop_cr_all_owned_states_not_recovery_drain);
 	UT_RUN(test_normal_stop_cr_original_terminal_must_release_local_context);
@@ -3338,6 +3387,8 @@ main(void)
 	UT_RUN(test_r4_lmon_reclaim_refuses_unproved_or_legacy_slot_without_mutation);
 	UT_RUN(test_r4_worker0_claim_all_local_uses_token_without_peer_matcher);
 	UT_RUN(test_r4_worker0_build_step_publishes_ready_full);
+	UT_RUN(test_r4_worker0_pending_keeps_building_until_final_full);
+	UT_RUN(test_r4_worker0_pending_with_reason_fails_closed);
 	UT_RUN(test_r4_worker0_build_step_publishes_one_need_undo);
 	UT_RUN(test_r4_worker0_query_cancel_terminalizes_exact_building_slot);
 	UT_RUN(test_r4_worker0_foreign_undo_requests_origin_selection_without_local_scur);

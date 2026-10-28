@@ -772,6 +772,306 @@ cr_r4_history_reselect(ClusterR4CrBuildContext *context, Page page, SCN read_scn
 	return true;
 }
 
+/* Only private construction observations: no TT ownership or retention pin. */
+typedef struct CrR4OperationTop {
+	struct CrR4OperationTop *next;
+	ClusterTTSlotPhysicalLocator canonical;
+	uint32 generation;
+	FullTransactionId top_fxid;
+	uint64 last_sequence;
+	bool conservative;
+} CrR4OperationTop;
+
+typedef struct CrR4OperationContext {
+	bool enabled, reading, operation_mode, pending;
+	bool current_owner;
+	uint64 slot_generation, builder_incarnation;
+	ClusterR4CrRouteProof route;
+	ClusterSemanticAdmissionToken admission;
+	ClusterRuntimeVisibilityOperationRead read;
+	ClusterTxLocator locator;
+	PGAlignedBlock source;
+	ClusterSavepointReaderIdentity identity;
+	ClusterTxResolution top;
+	ClusterSavepointReaderRecord operation;
+	CrR4OperationTop *tops;
+	uint32 top_count;
+} CrR4OperationContext;
+
+static CrR4OperationContext CrR4OperationContexts[CLUSTER_LMS_CR_SLOTS];
+
+static void
+cr_r4_operation_abort(CrR4OperationContext *operation)
+{
+	if (operation->reading)
+		cluster_runtime_visibility_operation_origin_read_cancel(&operation->read);
+	operation->reading = operation->pending = false;
+	operation->current_owner = false;
+}
+
+static void
+cr_r4_operation_forget(uint32 index, uint64 generation)
+{
+	CrR4OperationContext *operation = &CrR4OperationContexts[index];
+
+	if (!operation->enabled || operation->slot_generation != generation)
+		return;
+	cr_r4_operation_abort(operation);
+	while (operation->tops != NULL) {
+		CrR4OperationTop *next = operation->tops->next;
+
+		pfree(operation->tops);
+		operation->tops = next;
+	}
+	memset(operation, 0, sizeof(*operation));
+}
+
+long
+cluster_cr_build_on_holder_wait_timeout(long idle_timeout_ms)
+{
+	if (idle_timeout_ms <= 0)
+		return idle_timeout_ms;
+	for (unsigned i = 0; i < CLUSTER_LMS_CR_SLOTS; i++)
+		if (CrR4OperationContexts[i].pending)
+			return Min(idle_timeout_ms, 1L);
+	return idle_timeout_ms;
+}
+
+/* The original current adapter permits one guard per resource per process.
+ * Keep a reader's three phases together; competing slots wait locally. */
+bool
+cluster_cr_build_on_holder_origin_active(void)
+{
+	for (unsigned i = 0; i < CLUSTER_LMS_CR_SLOTS; i++)
+		if (CrR4OperationContexts[i].current_owner)
+			return true;
+	return false;
+}
+
+/* A repeated canonical slot must keep the same complete transaction identity
+ * and visit older operation sequences. ACTIVE remains conservative even if a
+ * later original TT sample observes COMMITTED for this construction. */
+static bool
+cr_r4_operation_top(CrR4OperationContext *operation, uint32 limit, bool *conservative)
+{
+	const ClusterSavepointReaderIdentity *identity = &operation->identity;
+	CrR4OperationTop *top;
+
+	for (top = operation->tops; top != NULL; top = top->next) {
+		if (top->canonical.segment_id != identity->canonical.segment_id
+			|| top->canonical.xid != identity->canonical.xid
+			|| top->canonical.slot_offset != identity->canonical.slot_offset
+			|| top->canonical.wrap != identity->canonical.wrap
+			|| top->generation != identity->canonical_generation)
+			continue;
+		if (!FullTransactionIdEquals(top->top_fxid, identity->top_fxid)
+			|| identity->operation_sequence >= top->last_sequence)
+			return false;
+		break;
+	}
+	if (top == NULL) {
+		if (operation->top_count >= limit)
+			return false;
+		top = MemoryContextAllocZero(TopMemoryContext, sizeof(*top));
+		top->canonical = identity->canonical;
+		top->generation = identity->canonical_generation;
+		top->top_fxid = identity->top_fxid;
+		top->next = operation->tops;
+		operation->tops = top;
+		operation->top_count++;
+	}
+	top->last_sequence = identity->operation_sequence;
+	top->conservative |= operation->top.outcome == CLUSTER_TX_IN_PROGRESS;
+	*conservative = top->conservative;
+	return true;
+}
+
+static bool
+cr_r4_operation_apply(CrR4OperationContext *operation, ClusterR4CrBuildContext *context,
+					  ClusterTxLocator *locator, ClusterR4CrSlotExtension *extension,
+					  char page[BLCKSZ], char record_bytes[BLCKSZ])
+{
+	UndoRecordHeader *record;
+	size_t length;
+	bool conservative;
+
+	if (memcmp(page, operation->source.data, BLCKSZ) != 0
+		|| operation->top.outcome == CLUSTER_TX_PREPARED
+		|| (operation->top.outcome != CLUSTER_TX_IN_PROGRESS
+			&& operation->top.outcome != CLUSTER_TX_COMMITTED
+			&& operation->top.outcome != CLUSTER_TX_ABORTED)
+		|| !cluster_savepoint_reader_extract_identity(&operation->identity,
+													  &operation->top.locator_echo, record_bytes,
+													  record_bytes, &length, &operation->operation)
+		|| !cr_r4_operation_top(operation, context->max_steps, &conservative))
+		return false;
+	record = (UndoRecordHeader *)record_bytes;
+	/* Surviving LIVE needs the still-unimplemented whole history projection. */
+	if (!conservative
+		&& operation->operation.operation.effect_state != CLUSTER_SAVEPOINT_EFFECT_DISCARDED
+		&& operation->top.outcome == CLUSTER_TX_COMMITTED
+		&& scn_time_cmp(operation->top.commit_scn, extension->route_proof.read_scn) <= 0)
+		return false;
+	*locator = operation->top.locator_echo;
+	if (!cluster_cr_history_inverse_operation_identity(
+			page, &extension->route_proof.tag, locator, locator->uba, record,
+			record_bytes + sizeof(*record), record->payload_length, &operation->identity)
+		|| !cluster_semantic_activation_recheck(&operation->admission))
+		return false;
+	operation->operation_mode = true;
+	context->record_format = 2;
+	return true;
+}
+
+/* false is a typed refusal, including a foreign operation. The preliminary
+ * getter only selects this branch; original current TT/DATA must requalify it. */
+static ClusterR4CrBuildStepResult
+cr_r4_operation_step(uint32 index, ClusterR4CrBuildContext *context, ClusterTxLocator *locator,
+					 ClusterR4CrSlotExtension *extension, char page[BLCKSZ],
+					 char record_bytes[BLCKSZ], bool *applied)
+{
+	CrR4OperationContext *operation = &CrR4OperationContexts[index];
+	ClusterTxResolveReason reason;
+	ClusterRuntimeVisibilityOperationStep step;
+
+	*applied = false;
+	if (!operation->enabled || context->have_previous || context->record_format == 1
+		|| uba_origin_node_id(locator->uba) != (NodeId)cluster_node_id)
+		return CLUSTER_R4_CR_STEP_FAIL;
+	if (!operation->reading) {
+		operation->locator = *locator;
+		memcpy(operation->source.data, page, BLCKSZ);
+		if (!cluster_runtime_visibility_operation_origin_read_begin(
+				&operation->read, locator, NULL,
+				&ClusterPageGetItlSlots((Page)page)[locator->itl_slot_index],
+				&extension->route_proof.tag, CLUSTER_TX_RESOLVE_VISIBILITY, &operation->admission,
+				&reason))
+			return CLUSTER_R4_CR_STEP_FAIL;
+		operation->reading = true;
+		return CLUSTER_R4_CR_STEP_PENDING;
+	}
+	if (memcmp(locator, &operation->locator, sizeof(*locator)) != 0)
+		return CLUSTER_R4_CR_STEP_FAIL;
+	if (!operation->current_owner && cluster_cr_build_on_holder_origin_active())
+		return CLUSTER_R4_CR_STEP_PENDING;
+	operation->current_owner = true;
+	step = cluster_runtime_visibility_operation_origin_read_poll(
+		&operation->read, &operation->identity, &operation->top, &operation->operation,
+		record_bytes, &reason);
+	if (step == CLUSTER_RUNTIME_VISIBILITY_OPERATION_PENDING)
+		return CLUSTER_R4_CR_STEP_PENDING;
+	operation->reading = false;
+	operation->current_owner = false;
+	if (step != CLUSTER_RUNTIME_VISIBILITY_OPERATION_COMPLETE
+		|| !cr_r4_operation_apply(operation, context, locator, extension, page, record_bytes))
+		return CLUSTER_R4_CR_STEP_FAIL;
+	*applied = true;
+	return CLUSTER_R4_CR_STEP_PENDING;
+}
+
+/* Once an operation is seen, its restored old head is not a read-SCN horizon.
+ * Inspect every retained head; an old legacy survivor is explicitly refused
+ * below, until the complete mixed survivor projection is available. */
+static bool
+cr_r4_operation_reselect(ClusterR4CrBuildContext *context, Page page)
+{
+	const ClusterItlSlotData *slots = ClusterPageGetItlSlots(page);
+	unsigned count = 0;
+
+	for (unsigned i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
+		if (slots[i].flags == ITL_FLAG_FREE)
+			continue;
+		if (!SCN_VALID(slots[i].write_scn))
+			return false;
+		context->candidates[count++]
+			= (ClusterCRCandidateChain){ .slot_idx = i,
+										 .xid = slots[i].xid,
+										 .write_scn = slots[i].write_scn,
+										 .undo_segment_head = slots[i].undo_segment_head };
+	}
+	qsort(context->candidates, count, sizeof(context->candidates[0]),
+		  cluster_cr_chain_cmp_by_write_scn_desc);
+	context->candidate_count = count;
+	context->candidate_cursor = context->covered_candidate_mask = 0;
+	context->have_previous = false;
+	for (unsigned i = 0; i < count; i++) {
+		if (!cluster_tx_locator_from_itl(page, context->candidates[i].slot_idx,
+										 &context->locators[i], NULL))
+			return false;
+		context->locators[i].tt_wrap = TT_WRAP_INVALID;
+	}
+	return true;
+}
+
+static ClusterR4CrBuildStepResult
+cr_r4_operation_continue(uint32 index, ClusterR4CrBuildContext *context, ClusterTxLocator *locator,
+						 ClusterR4CrSlotExtension *extension, char page[BLCKSZ],
+						 char record_bytes[BLCKSZ], CrR4UndoTrace *trace,
+						 ClusterCrBuildReason *reason)
+{
+	bool applied;
+
+	*reason = CLUSTER_CR_BUILD_BAD_UNDO;
+	if (cr_r4_operation_step(index, context, locator, extension, page, record_bytes, &applied)
+		== CLUSTER_R4_CR_STEP_FAIL)
+		return CLUSTER_R4_CR_STEP_FAIL;
+	if (applied && !cr_r4_operation_reselect(context, (Page)page))
+		return CLUSTER_R4_CR_STEP_FAIL;
+	*reason = CLUSTER_CR_BUILD_NONE;
+	if (!applied || context->candidate_count > 0)
+		return CLUSTER_R4_CR_STEP_PENDING;
+	cr_r4_undo_trace(trace, "build.full", "OPERATION_WALK_COMPLETED", 1);
+	return CLUSTER_R4_CR_STEP_FULL;
+}
+
+ClusterR4CrBuildStepResult
+cluster_cr_build_on_holder_step_admitted(uint32 index, uint64 generation, bool foreign_ready,
+										 ClusterR4CrSlotExtension *extension, char page[BLCKSZ],
+										 const char foreign_page[BLCKSZ],
+										 const ClusterSemanticAdmissionToken *admission,
+										 ClusterCrBuildReason *reason)
+{
+	CrR4OperationContext *operation;
+	ClusterR4CrBuildStepResult result;
+	bool same_key;
+
+	if (reason == NULL)
+		return CLUSTER_R4_CR_STEP_FAIL;
+	*reason = CLUSTER_CR_BUILD_PROTOCOL;
+	if (index >= CLUSTER_LMS_CR_SLOTS || generation == 0 || extension == NULL)
+		return CLUSTER_R4_CR_STEP_FAIL;
+	operation = &CrR4OperationContexts[index];
+	same_key = operation->enabled && operation->slot_generation == generation
+			   && operation->builder_incarnation == extension->owner.builder_incarnation;
+	if (admission == NULL || !admission->entered
+		|| admission->feature_bit != CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
+		|| admission->side != CLUSTER_SEMANTIC_TARGET_SIDE
+		|| admission->formation_epoch != extension->route_proof.formation_epoch
+		|| admission->record_generation != extension->route_proof.activation_generation
+		|| !cluster_semantic_activation_recheck(admission)
+		|| (operation->enabled
+			&& (!same_key || memcmp(&operation->admission, admission, sizeof(*admission)) != 0
+				|| memcmp(&operation->route, &extension->route_proof, sizeof(operation->route))
+					   != 0))) {
+		if (same_key)
+			cr_r4_operation_abort(operation);
+		return CLUSTER_R4_CR_STEP_FAIL;
+	}
+	if (!operation->enabled) {
+		operation->enabled = true;
+		operation->slot_generation = generation;
+		operation->builder_incarnation = extension->owner.builder_incarnation;
+		memcpy(&operation->admission, admission, sizeof(*admission));
+		memcpy(&operation->route, &extension->route_proof, sizeof(operation->route));
+	}
+	result = cluster_cr_build_on_holder_step(index, generation, foreign_ready, extension, page,
+											 foreign_page, reason);
+	operation->pending = result == CLUSTER_R4_CR_STEP_PENDING;
+	if (result == CLUSTER_R4_CR_STEP_FAIL || result == CLUSTER_R4_CR_STEP_RETRY)
+		cr_r4_operation_abort(operation);
+	return result;
+}
+
 /*
  * cluster_cr_build_on_holder_step -- build from the immutable slot page only.
  *
@@ -809,13 +1109,16 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation, bool 
 	if (context->in_use) {
 		ClusterTxLocator *locator;
 
-		if (!foreign_undo_ready || context->slot_generation != slot_generation
+		if ((!foreign_undo_ready && !CrR4OperationContexts[slot_index].reading
+			 && !CrR4OperationContexts[slot_index].operation_mode)
+			|| context->slot_generation != slot_generation
 			|| context->builder_incarnation != extension->owner.builder_incarnation
 			|| context->candidate_cursor >= context->candidate_count)
 			return CLUSTER_R4_CR_STEP_FAIL;
 		locator = &context->locators[context->candidate_cursor];
-		if (!cr_r4_foreign_request_matches(slot_index, slot_generation, extension, context,
-										   locator))
+		if (foreign_undo_ready
+			&& !cr_r4_foreign_request_matches(slot_index, slot_generation, extension, context,
+											  locator))
 			return CLUSTER_R4_CR_STEP_FAIL;
 	} else if (foreign_undo_ready)
 		return CLUSTER_R4_CR_STEP_FAIL;
@@ -923,6 +1226,7 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation, bool 
 			bool chain_complete;
 			bool horizon_reached;
 			bool record_from_foreign_page = supplied_foreign_record;
+			bool record_from_operation = CrR4OperationContexts[slot_index].reading;
 			bool terminal;
 			uint32 foreign_segment;
 			uint32 foreign_block;
@@ -944,7 +1248,7 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation, bool 
 				*reason_out = CLUSTER_CR_BUILD_BAD_UNDO;
 				return CLUSTER_R4_CR_STEP_FAIL;
 			}
-			if (!record_from_foreign_page) {
+			if (!record_from_foreign_page && !record_from_operation) {
 				if (extension->build_steps >= context->max_steps) {
 					cr_r4_undo_trace(trace, "undo.reject", "CHAIN_LIMIT", 0);
 					*reason_out = CLUSTER_CR_BUILD_CHAIN_LIMIT;
@@ -965,7 +1269,8 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation, bool 
 				}
 				context->visited_ubas[context->visited_count++] = current_uba;
 			}
-			if (origin != (NodeId)cluster_node_id && !record_from_foreign_page) {
+			if (origin != (NodeId)cluster_node_id && !record_from_foreign_page
+				&& !record_from_operation) {
 				if (!uba_decode(current_uba, &foreign_segment, &foreign_block, &foreign_tt_offset,
 								&foreign_row)
 					|| foreign_block == 0
@@ -1010,6 +1315,9 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation, bool 
 				return CLUSTER_R4_CR_STEP_FAIL;
 			}
 
+			if (record_from_operation)
+				return cr_r4_operation_continue(slot_index, context, locator, extension,
+												result_page, record_buffer.data, trace, reason_out);
 			cr_r4_undo_trace(trace, "undo.read.begin", "COPY_BOUNDARY", -1);
 			if (record_from_foreign_page) {
 				record_length = 0;
@@ -1048,6 +1356,22 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation, bool 
 			}
 			if (record_length < sizeof(UndoRecordHeader)) {
 				cr_r4_undo_trace(trace, "record.header.reject", "SHORT_HEADER", 0);
+				*reason_out = CLUSTER_CR_BUILD_BAD_UNDO;
+				return CLUSTER_R4_CR_STEP_FAIL;
+			}
+			record = (UndoRecordHeader *)record_buffer.data;
+			if ((record->flags & UNDO_REC_FLAG_HAS_OPERATION) != 0) {
+				*reason_out = CLUSTER_CR_BUILD_BAD_UNDO;
+				if (record_from_foreign_page)
+					return CLUSTER_R4_CR_STEP_FAIL;
+				return cr_r4_operation_continue(slot_index, context, locator, extension,
+												result_page, record_buffer.data, trace, reason_out);
+			}
+			if (CrR4OperationContexts[slot_index].operation_mode
+				&& scn_time_cmp(
+					   ClusterPageGetItlSlots((Page)result_page)[locator->itl_slot_index].write_scn,
+					   extension->route_proof.read_scn)
+					   <= 0) {
 				*reason_out = CLUSTER_CR_BUILD_BAD_UNDO;
 				return CLUSTER_R4_CR_STEP_FAIL;
 			}
@@ -1106,8 +1430,10 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation, bool 
 					cr_r4_clear_foreign_request(extension, context);
 					supplied_foreign_record = false;
 				}
-				if (!cr_r4_history_reselect(context, (Page)result_page,
-											extension->route_proof.read_scn)) {
+				if (!(CrR4OperationContexts[slot_index].operation_mode
+						  ? cr_r4_operation_reselect(context, (Page)result_page)
+						  : cr_r4_history_reselect(context, (Page)result_page,
+												   extension->route_proof.read_scn))) {
 					*reason_out = CLUSTER_CR_BUILD_BAD_LOCATOR;
 					return CLUSTER_R4_CR_STEP_FAIL;
 				}
@@ -1314,6 +1640,7 @@ cluster_cr_build_on_holder_forget(uint32 slot_index, uint64 slot_generation)
 
 	if (slot_index >= CLUSTER_LMS_CR_SLOTS || slot_generation == 0)
 		return;
+	cr_r4_operation_forget(slot_index, slot_generation);
 	context = &CrR4BuildContexts[slot_index];
 	if (!context->in_use || context->slot_generation != slot_generation)
 		return;

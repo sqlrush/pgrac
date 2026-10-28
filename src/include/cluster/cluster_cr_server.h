@@ -516,6 +516,12 @@ extern bool cluster_lms_undo_verdict_fill_page(TransactionId xid, bool authorita
  * unchanged 53R97). */
 extern bool cluster_lms_undo_multi_verdict_submit(const GcsBlockForwardPayload *fwd);
 
+/* Process-local worker progress only, never a visibility/retirement proof.
+ * Keep the original idle interval when no local operation is pending. */
+extern long cluster_cr_build_on_holder_wait_timeout(long idle_timeout_ms);
+/* Existing worker origin/legacy drains yield while this private read owns
+ * current guards. Completion and exact forget release the local turn. */
+extern bool cluster_cr_build_on_holder_origin_active(void);
 /* LMS main-loop side: construct every PENDING slot (errors become DENIED
  * results — fail-closed to the requester, never an LMS restart). */
 extern void cluster_lms_cr_drain(void);

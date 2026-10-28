@@ -7542,10 +7542,22 @@ test_cluster_operation_cr_entry.inc: $(top_srcdir)/src/backend/cluster/cluster_c
 	     END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Original holder body plus real origin reader in one explicit boundary fixture.
+CLUSTER_OPERATION_WORKER_TEST_O = test_cluster_operation_worker_product.o
+$(CLUSTER_OPERATION_WORKER_TEST_O): test_cluster_operation_worker_product.c \
+        $(top_srcdir)/src/backend/cluster/cluster_cr.c \
+        $(top_srcdir)/src/include/cluster/cluster_cr.h \
+        $(top_srcdir)/src/include/cluster/cluster_cr_server.h \
+        $(top_srcdir)/src/include/cluster/cluster_cr_history.h \
+        $(top_srcdir)/src/include/cluster/cluster_runtime_visibility.h \
+        $(top_srcdir)/src/include/cluster/cluster_savepoint_reader.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
 test_cluster_r4_tx_outcome: test_cluster_r4_tx_outcome.c unit_test.h \
 		test_cluster_savepoint_origin_plan.inc $(CLUSTER_SAVEPOINT_READER_O) \
 		test_cluster_savepoint_origin_driver.inc \
 		test_cluster_savepoint_cr_consumer.inc test_cluster_savepoint_origin_poll.inc \
+		test_cluster_savepoint_origin_worker.inc $(CLUSTER_OPERATION_WORKER_TEST_O) \
 		test_cluster_hot_bufpage_product.o test_cluster_operation_cr_entry.inc \
 		$(top_builddir)/src/backend/cluster/cluster_cr_apply.o \
 		$(top_srcdir)/src/include/cluster/cluster_cr.h \
@@ -7558,15 +7570,15 @@ test_cluster_r4_tx_outcome: test_cluster_r4_tx_outcome.c unit_test.h \
 		test_cluster_undo_pending_product.o \
 		$(CLUSTER_R4_RUNTIME_VIS_TEST_O) $(CLUSTER_R4_RUNTIME_VIS_UBA_O) \
 		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
-		$(CLUSTER_CR_SERVER_POLICY_O) $(CLUSTER_RUNTIME_VIS_POLICY_O)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_CR_SERVER_POLICY_O) $(CLUSTER_RUNTIME_VIS_POLICY_O) test_cluster_r4_multi_resolve_product.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_OPERATION_WORKER_TEST_O) \
 		$(CLUSTER_SAVEPOINT_READER_O) \
 		test_cluster_hot_bufpage_product.o \
 		$(top_builddir)/src/backend/cluster/cluster_cr_apply.o \
 		test_cluster_undo_pending_product.o \
 		$(CLUSTER_R4_RUNTIME_VIS_TEST_O) $(CLUSTER_R4_RUNTIME_VIS_UBA_O) \
 		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
-		$(CLUSTER_CR_SERVER_POLICY_O) $(CLUSTER_RUNTIME_VIS_POLICY_O) \
+		$(CLUSTER_CR_SERVER_POLICY_O) $(CLUSTER_RUNTIME_VIS_POLICY_O) test_cluster_r4_multi_resolve_product.o \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
@@ -7734,9 +7746,12 @@ $(CLUSTER_R4_CONTINUATION_PAGE_O): $(top_srcdir)/src/backend/storage/page/bufpag
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 $(CLUSTER_R4_CONTINUATION_CR_O): $(top_srcdir)/src/backend/cluster/cluster_cr.c \
 		$(top_srcdir)/src/include/cluster/cluster_cr.h \
-		$(top_srcdir)/src/include/cluster/cluster_cr_history.h
+		$(top_srcdir)/src/include/cluster/cluster_cr_history.h \
+		$(top_srcdir)/src/include/cluster/cluster_runtime_visibility.h \
+		$(top_srcdir)/src/include/cluster/cluster_savepoint_reader.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
 		-Dcluster_cr_build_on_holder_step=continuation_real_step \
+		-Dcluster_cr_build_on_holder_step_admitted=continuation_real_step_admitted \
 		-Dcluster_cr_build_on_holder_forget=continuation_real_forget \
 		-Dcluster_cr_build_on_holder_pending_locator=continuation_real_pending \
 		-Dcluster_cr_r4_extract_resident_record=continuation_real_extract \
@@ -7748,7 +7763,7 @@ test_cluster_cr_dependency_drain.inc: $(top_srcdir)/src/backend/cluster/cluster_
 	mv $@.tmp $@
 
 test_cluster_cr_dependency: test_cluster_cr_dependency.c test_cluster_cr_dependency_drain.inc \
-		test_cluster_r4_slot_reservation.c unit_test.h \
+		test_cluster_r4_slot_reservation.c unit_test.h test_cluster_operation_refusal_boundary.inc $(CLUSTER_SAVEPOINT_READER_O) \
 		$(CLUSTER_R4_SLOT_RESERVATION_TEST_O) $(CLUSTER_R4_LMS_DATA_PLANE_TEST_O) \
 		$(CLUSTER_R4_SLOT_RESERVATION_UBA_O) $(CLUSTER_R4_CONTINUATION_CR_O) \
 		test_cluster_r4_multi_resolve_product.o $(CLUSTER_CR_APPLY_O) $(CLUSTER_R4_CONTINUATION_PAGE_O)
@@ -7757,10 +7772,11 @@ test_cluster_cr_dependency: test_cluster_cr_dependency.c test_cluster_cr_depende
 		$< $(CLUSTER_R4_SLOT_RESERVATION_TEST_O) $(CLUSTER_R4_LMS_DATA_PLANE_TEST_O) \
 		$(CLUSTER_R4_SLOT_RESERVATION_UBA_O) $(CLUSTER_R4_CONTINUATION_CR_O) \
 		test_cluster_r4_multi_resolve_product.o $(CLUSTER_CR_APPLY_O) $(CLUSTER_R4_CONTINUATION_PAGE_O) \
-		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(top_builddir)/src/common/libpgcommon_srv.a \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_SAVEPOINT_READER_O) $(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
-test_cluster_r4_slot_reservation: test_cluster_r4_slot_reservation.c unit_test.h \
+test_cluster_r4_slot_reservation: test_cluster_r4_slot_reservation.c unit_test.h $(CLUSTER_SAVEPOINT_READER_O) \
+        test_cluster_operation_refusal_boundary.inc \
 		$(CLUSTER_R4_SLOT_RESERVATION_TEST_O) $(CLUSTER_R4_LMS_DATA_PLANE_TEST_O) \
 		$(CLUSTER_R4_SLOT_RESERVATION_UBA_O) $(CLUSTER_R4_CONTINUATION_CR_O) \
 		test_cluster_r4_multi_resolve_product.o $(CLUSTER_CR_APPLY_O) $(CLUSTER_R4_CONTINUATION_PAGE_O)
@@ -7770,7 +7786,7 @@ test_cluster_r4_slot_reservation: test_cluster_r4_slot_reservation.c unit_test.h
 		$(CLUSTER_R4_SLOT_RESERVATION_UBA_O) $(CLUSTER_R4_CONTINUATION_CR_O) \
 		test_cluster_r4_multi_resolve_product.o $(CLUSTER_CR_APPLY_O) $(CLUSTER_R4_CONTINUATION_PAGE_O) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
-		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_SAVEPOINT_READER_O) $(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # Stage 8 R4 D11: exercise the thin observation adapter and the real holder
@@ -7809,7 +7825,9 @@ $(CLUSTER_R4_CR_WALK_TEST_O): test_cluster_r4_cr_walk_product.c \
 		$(top_srcdir)/src/backend/cluster/cluster_cr.c \
 		$(top_srcdir)/src/include/cluster/cluster_cr.h \
 		$(top_srcdir)/src/include/cluster/cluster_cr_history.h \
-		$(top_srcdir)/src/include/cluster/cluster_undo_record.h
+		$(top_srcdir)/src/include/cluster/cluster_undo_record.h \
+		$(top_srcdir)/src/include/cluster/cluster_runtime_visibility.h \
+		$(top_srcdir)/src/include/cluster/cluster_savepoint_reader.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_resident_record_batch: test_cluster_resident_record_batch.c unit_test.h \
@@ -7821,7 +7839,8 @@ test_cluster_resident_record_batch: test_cluster_resident_record_batch.c unit_te
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_R4_CR_WALK_TEST_O) \
 		$(CLUSTER_UBA_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
-test_cluster_r4_cr_walk: test_cluster_r4_cr_walk.c unit_test.h \
+test_cluster_r4_cr_walk: test_cluster_r4_cr_walk.c unit_test.h $(CLUSTER_SAVEPOINT_READER_O) \
+        test_cluster_operation_refusal_boundary.inc \
 		test_cluster_hot_bufpage_product.o \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UBA_O) $(CLUSTER_CR_APPLY_O) \
 		$(CLUSTER_R4_CR_WALK_TEST_O) $(CLUSTER_R4_MULTI_RESOLVE_TEST_O)
@@ -7830,7 +7849,7 @@ test_cluster_r4_cr_walk: test_cluster_r4_cr_walk.c unit_test.h \
 		$(CLUSTER_HOT_BUFPAGE_TEST_O) \
 		$(CLUSTER_R4_CR_WALK_TEST_O) $(CLUSTER_R4_MULTI_RESOLVE_TEST_O) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
-		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_SAVEPOINT_READER_O) $(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 test_cluster_initdb_relmap: test_cluster_initdb_relmap.c unit_test.h \

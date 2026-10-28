@@ -1256,9 +1256,9 @@ cr_server_r4_build_step(uint32 slot_index)
 
 	PG_TRY();
 	{
-		step_result = cluster_cr_build_on_holder_step(
+		step_result = cluster_cr_build_on_holder_step_admitted(
 			slot_index, key.slot_generation, foreign_undo_ready, &slot->r4, slot->result_page,
-			slot->foreign_undo_page, &step_reason);
+			slot->foreign_undo_page, &context->admission, &step_reason);
 		reason = step_reason;
 		if (foreign_undo_ready) {
 			memset(slot->foreign_undo_page, 0, BLCKSZ);
@@ -1301,6 +1301,12 @@ cr_server_r4_build_step(uint32 slot_index)
 		if (reason == CLUSTER_CR_BUILD_NONE
 			|| cluster_cr_build_result_for_reason(reason) != CLUSTER_CR_BUILD_FAIL_CLOSED)
 			reason = CLUSTER_CR_BUILD_PROTOCOL;
+		terminal_state = CLUSTER_LMS_CR_R4_READY_FAIL;
+		break;
+	case CLUSTER_R4_CR_STEP_PENDING:
+		if (reason == CLUSTER_CR_BUILD_NONE)
+			return false; /* original BUILDING; next worker tick polls again */
+		reason = CLUSTER_CR_BUILD_PROTOCOL;
 		terminal_state = CLUSTER_LMS_CR_R4_READY_FAIL;
 		break;
 	case CLUSTER_R4_CR_STEP_NEED_UNDO:
@@ -3958,11 +3964,12 @@ cluster_lms_cr_drain(void)
 	/* M4 Candidate-2 origin work shares this existing worker-0 tick and is
 	 * process-local, so it must progress even when the legacy CR table is
 	 * absent. */
-	cluster_gcs_block_r4_tx_resolve_drain();
+	if (!cluster_cr_build_on_holder_origin_active())
+		cluster_gcs_block_r4_tx_resolve_drain();
 	cr_server_r4_maintain_dependencies();
 	origin_active = cluster_gcs_block_r4_tx_resolve_active();
 	cr_server_trace_origin_gate(origin_active);
-	if (origin_active) {
+	if (origin_active && !cluster_cr_build_on_holder_origin_active()) {
 		cr_server_r4_note_origin_deferral();
 		return;
 	}
@@ -3995,6 +4002,11 @@ cluster_lms_cr_drain(void)
 			(void)cr_server_r4_ship_terminal((uint32)i);
 		}
 	}
+
+	/* Original origin and legacy consumers cannot enter another current
+	 * acquisition while the operation reader retains this process's turn. */
+	if (origin_active || cluster_cr_build_on_holder_origin_active())
+		return;
 
 	/*
 	 * A complete-TT legacy verdict may perform a synchronous durable scan.

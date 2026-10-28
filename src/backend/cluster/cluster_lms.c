@@ -1195,7 +1195,8 @@ LmsMain(void)
 		 * acquire/release.  Keep the ordinary 100ms idle sleep when no such
 		 * work exists, but do not multiply that sleep across an eight-slot
 		 * page census while the bounded context is genuinely pending. */
-			lms_wait_timeout_ms = cluster_gcs_block_r4_tx_resolve_wait_timeout(LMS_IDLE_TIMEOUT_MS);
+			lms_wait_timeout_ms = cluster_cr_build_on_holder_wait_timeout(
+				cluster_gcs_block_r4_tx_resolve_wait_timeout(LMS_IDLE_TIMEOUT_MS));
 			(void)lms_r4_drain_ack_tick(cluster_lms_state, r4_worker_incarnation);
 
 			/* PGRAC: spec-7.2 D2 — with a live DATA plane the wait moves into
@@ -1406,9 +1407,10 @@ LmsWorkerMain(int worker_id)
 			 * origin FSM is process-local, so every DATA worker must advance
 			 * the contexts accepted on its own channel without blocking that
 			 * channel on SCUR acquisition or release. */
-				cluster_gcs_block_r4_tx_resolve_drain();
-				lms_wait_timeout_ms
-					= cluster_gcs_block_r4_tx_resolve_wait_timeout(LMS_IDLE_TIMEOUT_MS);
+				if (!cluster_cr_build_on_holder_origin_active())
+					cluster_gcs_block_r4_tx_resolve_drain();
+				lms_wait_timeout_ms = cluster_cr_build_on_holder_wait_timeout(
+					cluster_gcs_block_r4_tx_resolve_wait_timeout(LMS_IDLE_TIMEOUT_MS));
 				/* spec-7.3 D4 — drain this worker's outbound ring (backends
 			 * staged REQUEST/FORWARD/INVALIDATE for our shard), then service
 			 * the mesh.  REPLY / INVALIDATE-ACK for blocks we received are

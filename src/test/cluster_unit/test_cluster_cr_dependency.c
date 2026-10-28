@@ -10,13 +10,17 @@ int reservation_fixture_main(void);
 #include "cluster/cluster_update_trace.h"
 
 static bool dependency_origin_pending;
+static bool dependency_cr_origin_pending;
+static int dependency_origin_drains;
 static int dependency_legacy_calls;
 static uint32 cluster_lms_cr_legacy_drain_cursor;
 static UtClusterCrServerShared *dependency_shared;
 
 void
 cluster_gcs_block_r4_tx_resolve_drain(void)
-{}
+{
+	dependency_origin_drains++;
+}
 
 bool
 cluster_gcs_block_r4_tx_resolve_active(void)
@@ -55,6 +59,12 @@ void dependency_real_drain(void);
 #define cr_serve_slot dependency_legacy_serve
 #define cluster_lmon_duty_mark_dirty(duty) ((void)0)
 #define cluster_lmon_wakeup dependency_noop
+static bool
+dependency_cr_origin_active(void)
+{
+	return dependency_cr_origin_pending;
+}
+#define cluster_cr_build_on_holder_origin_active dependency_cr_origin_active
 #include "test_cluster_cr_dependency_drain.inc"
 
 UT_TEST(test_lost_dependency_retires_while_origin_busy_and_stop_sealed)
@@ -182,17 +192,49 @@ UT_TEST(test_admission_loss_never_sends_image_or_unproved_reply)
 	UT_ASSERT(slot_is_canonical_free_with_generation(slot, 1));
 }
 
+UT_TEST(test_active_cr_progresses_before_queued_origin_and_legacy)
+{
+	ClusterLmsSharedState state;
+	ClusterLmsCrSlot *slot = prepare_worker0_claim(&state);
+	int drains = dependency_origin_drains;
+	int legacy;
+
+	UT_ASSERT(cluster_cr_server_test_r4_claim_queued(0));
+	dependency_cr_origin_pending = true;
+	dependency_origin_pending = true;
+	ut_builder_step_result = CLUSTER_R4_CR_STEP_PENDING;
+	dependency_real_drain();
+	UT_ASSERT_EQ(dependency_origin_drains, drains);
+	UT_ASSERT_EQ(ut_builder_step_calls, 1);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state), CLUSTER_LMS_CR_R4_BUILDING);
+	UT_ASSERT_EQ(ut_send_calls, 0);
+	dependency_origin_pending = false;
+	pg_atomic_write_u32(&ut_cr_server_shared.slots[1].state, CLUSTER_LMS_CR_PENDING);
+	legacy = dependency_legacy_calls;
+	dependency_real_drain();
+	UT_ASSERT_EQ(dependency_origin_drains, drains);
+	UT_ASSERT_EQ(dependency_legacy_calls, legacy);
+	UT_ASSERT_EQ(ut_builder_step_calls, 2);
+	dependency_cr_origin_pending = false;
+	dependency_origin_pending = true;
+	dependency_real_drain();
+	UT_ASSERT_EQ(dependency_origin_drains, drains + 1);
+	UT_ASSERT_EQ(ut_builder_step_calls, 2);
+	dependency_origin_pending = false;
+}
+
 int
 main(void)
 {
 	dependency_shared = &ut_cr_server_shared;
-	UT_PLAN(6);
+	UT_PLAN(7);
 	UT_RUN(test_lost_dependency_retires_while_origin_busy_and_stop_sealed);
 	UT_RUN(test_dependency_terminal_backpressure_retains_owner_until_send);
 	UT_RUN(test_reply_wins_and_maintenance_never_builds_under_origin_guard);
 	UT_RUN(test_dependency_wrong_worker_or_reused_generation_never_retires);
 	UT_RUN(test_full_image_fence_loss_returns_zero_body_retry);
 	UT_RUN(test_admission_loss_never_sends_image_or_unproved_reply);
+	UT_RUN(test_active_cr_progresses_before_queued_origin_and_legacy);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

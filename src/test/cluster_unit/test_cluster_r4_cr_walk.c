@@ -38,6 +38,9 @@
 
 UT_DEFINE_GLOBALS();
 
+#define OPERATION_REFUSAL_BOUNDARY_ADMISSION
+#include "test_cluster_operation_refusal_boundary.inc"
+
 extern bool cr_history_test_synchronous(char *page, SCN read_scn, const BufferTag *tag,
 										bool server_mode, bool *partial, uint32 *steps);
 
