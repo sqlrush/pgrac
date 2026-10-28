@@ -481,6 +481,16 @@ cluster_lms_outbound_enqueue_resource_x_requester(int32 master,
 												  const struct ResourceXDecodedFrame *control,
 												  const struct ResourceXDecodedFrame *proof);
 
+struct BufferDesc;
+struct ClusterSemanticAdmissionToken;
+/* Bind native identity to the original prepared, unsent ordinary round.
+ * ADMITTED means physical transport takeover only, never authority or C.
+ * Caller retains native/domain/terminal cleanup; no reservation is allocated. */
+extern ClusterLmsEnqueueResult cluster_lms_outbound_enqueue_resource_x_acquire(
+	int32 master, const struct ResourceXDecodedFrame *prepared, struct BufferDesc *buf,
+	const struct ClusterPcmOwnSnapshot *base, uint64 reservation_token, uint8 path,
+	uint8 requested_mode, const struct ClusterSemanticAdmissionToken *admission);
+
 extern ClusterLmsEnqueueResult
 cluster_lms_outbound_enqueue_resource_x_intent(int worker_id,
 											   const struct ResourceXIntentSlot *intent,

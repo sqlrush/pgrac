@@ -10331,3 +10331,44 @@ clean distclean maintainer-clean: clean-native-acquire-intent
 .PHONY: clean-native-acquire-intent
 clean-native-acquire-intent:
 	rm -f test_cluster_native_acquire_intent test_cluster_native_acquire_intent.inc test_cluster_native_acquire_intent.inc.tmp
+
+# Original pinned reservation through the actual requester physical handoff.
+TESTS += test_cluster_native_request_send
+all: test_cluster_native_request_send
+test_cluster_native_request_send: test_cluster_native_request_send.c \
+		test_cluster_native_request_send.inc test_cluster_native_request_ring.inc \
+		test_cluster_native_acquire_intent.inc test_cluster_pcm_snapshot_owner.inc \
+		test_cluster_pcm_lock $(CLUSTER_PCM_OWN_O) unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_lms.h \
+		$(top_srcdir)/src/include/cluster/cluster_pcm_x_bufmgr.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+test_cluster_native_request_send.inc: $(top_srcdir)/src/backend/cluster/cluster_lms_outbound.c Makefile
+	awk '/^cluster_lms_outbound_enqueue_resource_x_acquire\(/ { print "ClusterLmsEnqueueResult"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_native_request_ring.inc: $(top_srcdir)/src/backend/cluster/cluster_lms_outbound.c Makefile
+	awk '/^#define PGRAC_LMS_OUTBOUND_(CAPACITY|PAYLOAD_MAX) / { print; constants++ } \
+	     /^typedef enum ClusterLmsOutboundKind / { emit=1; types++ } \
+	     /^typedef struct ClusterLmsOutbound(Slot|State|SharedState) / { emit=1; types++ } \
+	     /^static ClusterLmsOutbound(SharedState|State) \*cluster_lms_outbound_/ { print; globals++ } \
+	     /^static LWLock \*cluster_lms_outbound_locks/ { print; globals++ } \
+	     /^#define OB_(RING|LOCK)\(/ { print; constants++ } \
+	     /^lms_outbound_resource_x_transport_mutation_mark\(/ { print "static bool"; emit=1; bodies++ } \
+	     /^cluster_lms_outbound_enqueue_resource_x_requester\(/ { print "ClusterLmsEnqueueResult"; emit=1; bodies++ } \
+	     /^cluster_lms_outbound_resource_x_send_complete\(/ { print "void"; emit=1; bodies++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (constants != 4 || types != 4 || globals != 3 || bodies != 3 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+clean distclean maintainer-clean: clean-native-request-send
+.PHONY: clean-native-request-send
+clean-native-request-send:
+	rm -f test_cluster_native_request_send test_cluster_native_request_send.inc test_cluster_native_request_send.inc.tmp \
+		test_cluster_native_request_ring.inc test_cluster_native_request_ring.inc.tmp

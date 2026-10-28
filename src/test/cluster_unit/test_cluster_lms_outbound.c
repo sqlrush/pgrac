@@ -87,6 +87,17 @@ pg_re_throw(void)
 	abort();
 }
 
+/* This drain fixture has no native descriptor/reservation owner. The native
+ * requester fixture supplies the real capture; an accidental call here fails. */
+ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_acquire_intent_exact(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *base, uint64 reservation_token, uint8 path,
+	const ClusterSemanticAdmissionToken *admission,
+	const ResourceXDecodedAcquireIntent *expected, ResourceXDecodedAcquireIntent *out)
+{
+	abort();
+}
+
 void
 cluster_pcm_lock_check_shutdown_wait(void)
 {

@@ -809,6 +809,55 @@ cluster_lms_outbound_enqueue_resource_x_requester(int32 master,
 	return CLUSTER_LMS_ENQUEUE_ADMITTED;
 }
 
+/* The caller retains its original round and pinned native reservation.
+ * Capture precedes the original ring/entry handoff; admission there owns the
+ * one physical request, not a grant, image installation or local completion. */
+ClusterLmsEnqueueResult
+cluster_lms_outbound_enqueue_resource_x_acquire(
+	int32 master, const ResourceXDecodedFrame *prepared, BufferDesc *buf,
+	const ClusterPcmOwnSnapshot *base, uint64 reservation_token, uint8 path,
+	uint8 requested_mode, const ClusterSemanticAdmissionToken *admission)
+{
+	ResourceXDecodedFrame frame;
+	ClusterPcmOwnResult result;
+
+	if (prepared == NULL || buf == NULL || base == NULL || admission == NULL
+		|| master < 0 || master >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+		|| (requested_mode != PCM_STATE_S && requested_mode != PCM_STATE_X)
+		|| (path != RESOURCE_X_ACQUIRE_FIRST_FILL && path != RESOURCE_X_ACQUIRE_RESIDENT)
+		|| prepared->kind != RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP
+		|| prepared->payload_bytes != RESOURCE_X_CONTROL_V1_BYTES
+		|| prepared->has_acquire_intent || prepared->has_acquire_decision
+		|| prepared->blocked_has_remote_proof
+		|| (prepared->common.flags != 0
+			&& prepared->common.flags != RESOURCE_X_COMMON_FLAG_REMOTE_ADMISSION)
+		|| prepared->common.base_authority_generation != 0
+		|| prepared->common.authority_generation != 0
+		|| prepared->common.outcome != RESOURCE_X_OUTCOME_NONE
+		|| prepared->common.observed_mode != PCM_STATE_N
+		|| prepared->common.target_mode != PCM_STATE_X
+		|| prepared->common.action_node != cluster_node_id
+		|| prepared->common.logical_assertion.requester_node != cluster_node_id
+		|| !BufferTagsEqual(&prepared->common.logical_assertion.resource, &base->tag))
+		return CLUSTER_LMS_ENQUEUE_INVALID;
+
+	memset(&frame, 0, sizeof(frame));
+	frame.kind = RESOURCE_X_WIRE_ASSERT_X;
+	frame.payload_bytes = RESOURCE_X_ACQUIRE_V3_BYTES;
+	frame.has_acquire_intent = true;
+	frame.common = prepared->common;
+	frame.common.observed_mode = base->pcm_state;
+	frame.common.target_mode = requested_mode;
+	frame.common.flags = 0;
+	frame.common.semantic_crc32c = 0;
+	result = cluster_bufmgr_pcm_own_acquire_intent_exact(buf, base, reservation_token,
+		path, admission, NULL, &frame.body.acquire_intent);
+	if (result != CLUSTER_PCM_OWN_OK)
+		return result == CLUSTER_PCM_OWN_BUSY || result == CLUSTER_PCM_OWN_NOT_READY
+			? CLUSTER_LMS_ENQUEUE_UNAVAILABLE : CLUSTER_LMS_ENQUEUE_INVALID;
+	return cluster_lms_outbound_enqueue_resource_x_requester(master, &frame, NULL);
+}
+
 void
 cluster_lms_outbound_resource_x_send_complete(const ResourceXIntentSlot *intent, bool sent)
 {
