@@ -12,13 +12,15 @@
  * PGRAC MODIFICATIONS
  *     Modified by: SqlRush <sqlrush@gmail.com>
  *
- *     Declare original-origin recovery I/O and Startup CLOG base observations.
+ *     Declare original-origin recovery I/O, Startup CLOG base observations
+ *     and the explicit native FullXid page-birth record.
  *     Spec: 2026-10-14-pre2-m5-e1-format-closure-v1.md
  *-------------------------------------------------------------------------
  */
 #ifndef CLOG_H
 #define CLOG_H
 
+#include "access/transam.h"
 #include "access/xlogreader.h"
 #include "storage/sync.h"
 #include "lib/stringinfo.h"
@@ -43,6 +45,18 @@ typedef struct xl_clog_truncate
 	TransactionId oldestXact;
 	Oid			oldestXactDb;
 } xl_clog_truncate;
+
+/* Native homogeneous WAL: a physical page-generation birth, not an issued
+ * transaction, retained lifetime, terminal outcome or recovery permission. */
+typedef struct xl_clog_zeropage_full
+{
+	int32 pageno;
+	uint32 reserved_zero;
+	uint64 first_full_xid;
+} xl_clog_zeropage_full;
+StaticAssertDecl(sizeof(xl_clog_zeropage_full) == 16, "CLOG full birth WAL size");
+StaticAssertDecl(offsetof(xl_clog_zeropage_full, first_full_xid) == 8,
+				 "CLOG full birth WAL offset");
 
 extern void TransactionIdSetTreeStatus(TransactionId xid, int nsubxids,
 									   TransactionId *subxids, XidStatus status, XLogRecPtr lsn);
@@ -160,6 +174,12 @@ extern void StartupCLOG(void);
 extern void TrimCLOG(void);
 extern void CheckPointCLOG(void);
 extern void ExtendCLOG(TransactionId newestXact);
+/* Dormant original allocator entry. Supply its actual FullXid candidate
+ * while holding the original XidGenLock EXCLUSIVE; skipped page boundaries
+ * may be initialized without issuing any transaction. No live caller or
+ * birth/era/lifetime grant is installed by this entry. Native ERROR can
+ * follow a dirty page or inserted WAL; it is not rollback/retry permission. */
+extern void ExtendCLOGFull(FullTransactionId newestXact);
 extern void TruncateCLOG(TransactionId oldestXact, Oid oldestxid_datoid);
 
 extern int	clogsyncfiletag(const FileTag *ftag, char *path);
@@ -167,6 +187,7 @@ extern int	clogsyncfiletag(const FileTag *ftag, char *path);
 /* XLOG stuff */
 #define CLOG_ZEROPAGE		0x00
 #define CLOG_TRUNCATE		0x10
+#define CLOG_ZEROPAGE_FULL	0x20
 
 extern void clog_redo(XLogReaderState *record);
 extern void clog_desc(StringInfo buf, XLogReaderState *record);
