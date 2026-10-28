@@ -5097,7 +5097,15 @@ test_cluster_cf_blocker_trace.inc: $(top_srcdir)/src/backend/cluster/cluster_ges
 
 test_cluster_cf_enqueue test_cluster_control_walr test_cluster_control_ir: test_cluster_cf_blocker_trace.inc
 
-test_cluster_cf_enqueue: test_cluster_cf_enqueue.c unit_test.h \
+test_cluster_cf_inputs_unlock.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_inputs.c Makefile
+	awk '/^typedef struct WalInputsWork \{/ { emit=1; types++ } \
+	     /^inputs_unlock\(/ { print "static void"; emit=1; functions++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (types != 1 || functions != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_cf_enqueue: test_cluster_cf_enqueue.c unit_test.h test_cluster_cf_inputs_unlock.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_private.h \
 		$(CLUSTER_CF_ENQUEUE_O) $(CLUSTER_LOCK_OWNER_O) $(top_builddir)/src/backend/cluster/cluster_control_request.o \
 		$(CLUSTER_LMD_WAIT_STATE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \

@@ -124,9 +124,37 @@ static char g_cf_trace_log[2048];
 static unsigned g_cf_trace_logs;
 static char g_walr_release_log[2048];
 static unsigned g_walr_release_logs;
+static char g_cf_release_log[2048];
+static unsigned g_cf_release_logs;
 static char g_cold_fence_log[2048];
 static unsigned g_cold_fence_logs;
 static ClusterGesTimeoutDetail g_timeout_detail;
+
+#ifndef PGRAC_CONTROL_CF_EMBEDDED
+static sigjmp_buf cf_fatal_jump;
+static bool cf_expect_fatal, cf_in_fatal;
+static char cf_fatal_message[256];
+
+bool
+errstart_cold(int elevel, const char *domain pg_attribute_unused())
+{
+	if (!cf_expect_fatal || elevel != FATAL)
+		abort();
+	cf_in_fatal = true;
+	return true;
+}
+
+int
+errmsg_internal(const char *fmt, ...)
+{
+	va_list args;
+
+	va_start(args, fmt);
+	vsnprintf(cf_fatal_message, sizeof(cf_fatal_message), fmt, args);
+	va_end(args);
+	return 0;
+}
+#endif
 
 const ClusterGesTimeoutDetail *
 cluster_ges_timeout_detail_get(void)
@@ -143,11 +171,25 @@ errstart(int elevel pg_attribute_unused(), const char *domain pg_attribute_unuse
 void
 errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
 		  const char *funcname pg_attribute_unused())
-{}
+{
+#ifndef PGRAC_CONTROL_CF_EMBEDDED
+	if (cf_in_fatal) {
+		cf_in_fatal = false;
+		siglongjmp(cf_fatal_jump, 1);
+	}
+#endif
+}
 
 int
 errmsg(const char *fmt, ...)
 {
+	if (strstr(fmt, "PGRAC_FAMILY=CF_RELEASE") != NULL) {
+		va_list args;
+		va_start(args, fmt);
+		vsnprintf(g_cf_release_log, sizeof(g_cf_release_log), fmt, args);
+		va_end(args);
+		++g_cf_release_logs;
+	}
 	if (strstr(fmt, "PGRAC_FAMILY=COLD_FENCE") != NULL) {
 		va_list args;
 		va_start(args, fmt);
@@ -2109,6 +2151,223 @@ UT_TEST(test_cf_trace_original_pending_age_and_grant_pid)
 	cluster_shared_config = false;
 }
 
+#include "../../backend/cluster/cluster_control_root_private.h"
+#include "test_cluster_cf_inputs_unlock.inc"
+
+static void
+cf_release_fixture_begin(void)
+{
+	UT_ASSERT(!cluster_cf_held(ShareLock));
+	UT_ASSERT(!cluster_cf_held(ExclusiveLock));
+	UT_ASSERT_EQ(pg_atomic_read_u32(&MyProc->cluster_grd_registered_count), 0);
+	cluster_shared_config = true;
+	MyBackendType = B_CHECKPOINTER;
+	MyProcPid = 4002;
+	cluster_cf_enqueue_timeout_ms = 1000;
+	owner_clock_step = 100000;
+	owner_ack_on_wait = false;
+	g_next_request_id++;
+	g_seven_result = g_s5_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	g_capture_log = true;
+	cluster_trace_control_config = false; /* Permanent refusal diagnostics. */
+	g_cf_release_logs = 0;
+	g_cf_release_log[0] = '\0';
+}
+
+static void
+cf_release_fixture_end(void)
+{
+	UT_ASSERT(!cluster_cf_held(ShareLock));
+	UT_ASSERT_EQ(pg_atomic_read_u32(&MyProc->cluster_grd_registered_count), 0);
+	cluster_shared_config = g_capture_log = false;
+	MyBackendType = B_INVALID;
+	cluster_cf_enqueue_timeout_ms = 30000;
+	owner_clock_step = 60000000;
+}
+
+/* Catch only the original FATAL boundary; the producer body is verbatim. */
+static bool
+cf_inputs_fatal(WalInputsWork *work)
+{
+	volatile bool caught = false;
+
+	cf_fatal_message[0] = '\0';
+	cf_expect_fatal = true;
+	if (sigsetjmp(cf_fatal_jump, 1) == 0)
+		inputs_unlock(work);
+	else
+		caught = true;
+	cf_expect_fatal = false;
+	return caught;
+}
+
+static void
+cf_inputs_release_deadline(bool acquired)
+{
+	WalInputsWork work = { 0 };
+	ClusterControlRequestView view;
+	ClusterControlRequestKey original_key;
+	ClusterControlRequestHandle original_handle;
+	uint32 cursor = 0;
+	uint64 cookie;
+	unsigned waits, acquires;
+	int releases;
+	char expected[128];
+
+	cf_release_fixture_begin();
+	if (!acquired)
+		g_s5_result = CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+	UT_ASSERT_EQ(cluster_cf_lock(ShareLock), acquired);
+	work.cf_attempted = true;
+	cookie = cluster_cf_owner_cookie(ShareLock);
+	UT_ASSERT(cookie != 0);
+	UT_ASSERT(cluster_control_request_next(&cursor, &view));
+	original_key = view.message.key;
+	original_handle = view.handle;
+	waits = owner_wait_calls;
+	acquires = g_seven_count;
+	releases = g_s6_count;
+	UT_ASSERT(cf_inputs_fatal(&work));
+	printf("# actual inputs_unlock FATAL: %s\n# actual CF refusal: %s\n",
+		   cf_fatal_message, g_cf_release_log);
+	UT_ASSERT_STR_EQ(cf_fatal_message, "could not release WAL input CF read owner");
+	UT_ASSERT(work.cf_attempted);
+	UT_ASSERT_EQ(g_cf_release_logs, 1);
+	UT_ASSERT(strstr(g_cf_release_log, "task=owner_wait reason=deadline"));
+	UT_ASSERT(strstr(g_cf_release_log, "owner_release=0"));
+	UT_ASSERT(strstr(g_cf_release_log, "timeout_ms=1000 effective_ms=1000"));
+	UT_ASSERT(strstr(g_cf_release_log, "state=4 shared=1"));
+	snprintf(expected, sizeof(expected), "control_owner=" UINT64_FORMAT, cookie);
+	UT_ASSERT(strstr(g_cf_release_log, expected));
+	snprintf(expected, sizeof(expected), "holder_procno=%u holder_request=" UINT64_FORMAT,
+			 view.message.key.holder.procno, view.message.key.holder.request_id);
+	UT_ASSERT(strstr(g_cf_release_log, expected));
+	UT_ASSERT(owner_wait_calls > waits);
+	UT_ASSERT_EQ(g_seven_count, acquires);
+	UT_ASSERT_EQ(g_s6_count, releases);
+	UT_ASSERT(cluster_cf_held(ShareLock));
+	UT_ASSERT(!cluster_cf_held_is_usable(ShareLock));
+	UT_ASSERT(!cluster_cf_release_completed(ShareLock, cookie));
+	cursor = 0;
+	UT_ASSERT(cluster_control_request_next(&cursor, &view));
+	UT_ASSERT_EQ(view.state, CLUSTER_CONTROL_REQUEST_ABANDONED);
+	UT_ASSERT(memcmp(&view.message.key, &original_key, sizeof(original_key)) == 0);
+	UT_ASSERT_EQ(view.handle.generation, original_handle.generation);
+	UT_ASSERT_EQ(view.handle.slot, original_handle.slot);
+	UT_ASSERT(acknowledge_retirements()); /* Explicit fixture ACK, not a network. */
+	inputs_unlock(&work);
+	UT_ASSERT(!work.cf_attempted);
+	UT_ASSERT(cluster_cf_release_completed(ShareLock, cookie));
+	UT_ASSERT_EQ(g_cf_release_logs, 1);
+	cf_release_fixture_end();
+}
+
+UT_TEST(cf_inputs_control_unavailable_preserves_fatal_and_exact_debt)
+{
+	cf_inputs_release_deadline(true);
+}
+
+UT_TEST(cf_inputs_failed_acquire_cleanup_has_same_precise_release_refusal)
+{
+	cf_inputs_release_deadline(false);
+}
+
+UT_TEST(cf_release_caller_mismatch_is_distinct_and_never_retires_foreign_owner)
+{
+	static const char caller, foreign;
+	uint64 cookie;
+	unsigned waits;
+
+	cf_release_fixture_begin();
+	MyBackendType = B_LMON;
+	cf_poll_result = CLUSTER_GES_ACQUIRE_GRANTED;
+	UT_ASSERT(cluster_cf_lock_poll_owned(ShareLock, &caller));
+	cookie = cluster_cf_owner_cookie(ShareLock);
+	waits = owner_wait_calls;
+	UT_ASSERT_EQ(cluster_cf_unlock_owned(ShareLock, &foreign), CLUSTER_CF_RELEASE_UNCONFIRMED);
+	printf("# actual CF caller refusal: %s\n", g_cf_release_log);
+	UT_ASSERT_EQ(g_cf_release_logs, 1);
+	UT_ASSERT(strstr(g_cf_release_log, "task=cf_unlock reason=caller_mismatch"));
+	UT_ASSERT(strstr(g_cf_release_log, "caller_tagged=1 slot_caller_tagged=1"));
+	UT_ASSERT(cluster_cf_held_is_usable(ShareLock));
+	UT_ASSERT_EQ(cluster_cf_owner_cookie(ShareLock), cookie);
+	UT_ASSERT_EQ(owner_wait_calls, waits);
+	UT_ASSERT(!acknowledge_retirements());
+	UT_ASSERT_EQ(cluster_cf_unlock_owned(ShareLock, &caller), CLUSTER_CF_RELEASE_UNCONFIRMED);
+	UT_ASSERT(acknowledge_retirements());
+	UT_ASSERT_EQ(cluster_cf_unlock_owned(ShareLock, &caller), CLUSTER_CF_RELEASE_CONFIRMED);
+	cf_release_fixture_end();
+}
+
+UT_TEST(cf_release_service_gate_records_refusal_without_waiting)
+{
+	unsigned waits;
+
+	cf_release_fixture_begin();
+	UT_ASSERT(cluster_cf_lock(ShareLock));
+	MyBackendType = B_LMON;
+	waits = owner_wait_calls;
+	UT_ASSERT_EQ(cluster_cf_unlock_confirmed(ShareLock), CLUSTER_CF_RELEASE_UNCONFIRMED);
+	printf("# actual CF service refusal: %s\n", g_cf_release_log);
+	UT_ASSERT_EQ(g_cf_release_logs, 1);
+	UT_ASSERT(strstr(g_cf_release_log, "task=owner_wait reason=wait_gate"));
+	UT_ASSERT(strstr(g_cf_release_log, "owner_release=0"));
+	UT_ASSERT_EQ(owner_wait_calls, waits);
+	UT_ASSERT(cluster_cf_held(ShareLock));
+	UT_ASSERT(acknowledge_retirements());
+	UT_ASSERT_EQ(cluster_cf_unlock_confirmed(ShareLock), CLUSTER_CF_RELEASE_CONFIRMED);
+	cf_release_fixture_end();
+}
+
+UT_TEST(cf_release_critical_section_keeps_original_refusal_without_log)
+{
+	cf_release_fixture_begin();
+	UT_ASSERT(cluster_cf_lock(ShareLock));
+	CritSectionCount = 1;
+	UT_ASSERT_EQ(cluster_cf_unlock_confirmed(ShareLock), CLUSTER_CF_RELEASE_UNCONFIRMED);
+	UT_ASSERT_EQ(g_cf_release_logs, 0);
+	UT_ASSERT(cluster_cf_held(ShareLock));
+	CritSectionCount = 0;
+	UT_ASSERT(acknowledge_retirements());
+	UT_ASSERT_EQ(cluster_cf_unlock_confirmed(ShareLock), CLUSTER_CF_RELEASE_CONFIRMED);
+	cf_release_fixture_end();
+}
+
+UT_TEST(cf_inputs_confirmed_release_has_no_refusal_log_or_fatal)
+{
+	WalInputsWork work = { 0 };
+	unsigned waits;
+
+	cf_release_fixture_begin();
+	UT_ASSERT(cluster_cf_lock(ShareLock));
+	work.cf_attempted = true;
+	waits = owner_wait_calls;
+	owner_ack_on_wait = true;
+	inputs_unlock(&work);
+	owner_ack_on_wait = false;
+	UT_ASSERT_EQ(owner_wait_calls, waits + 1);
+	UT_ASSERT(!work.cf_attempted);
+	UT_ASSERT_EQ(g_cf_release_logs, 0);
+	cf_release_fixture_end();
+}
+
+UT_TEST(cf_inputs_unheld_and_native_release_keep_original_noop)
+{
+	WalInputsWork work = { 0 };
+
+	cf_release_fixture_begin();
+	work.cf_attempted = true;
+	inputs_unlock(&work);
+	UT_ASSERT(!work.cf_attempted);
+	g_seven_result = CLUSTER_LOCK_ACQUIRE_OK_NATIVE;
+	UT_ASSERT(cluster_cf_lock(ShareLock));
+	work.cf_attempted = true;
+	inputs_unlock(&work);
+	UT_ASSERT(!work.cf_attempted);
+	UT_ASSERT_EQ(g_cf_release_logs, 0);
+	cf_release_fixture_end();
+}
+
 int
 main(void)
 {
@@ -2116,7 +2375,7 @@ main(void)
 	pg_atomic_init_u32(&owner_proc.cluster_grd_registered_count, 0);
 	pg_atomic_init_u64(&owner_proc.cluster_grd_redeclare_acked, 0);
 	pg_atomic_init_u64(&owner_proc.cluster_grd_redeclare_acked_epoch, 0);
-	UT_PLAN(48);
+	UT_PLAN(55);
 	UT_RUN(test_cf_resid_encode);
 	UT_RUN(test_lock_grant_then_release);
 	UT_RUN(test_held_and_write_permitted);
@@ -2165,6 +2424,13 @@ main(void)
 	UT_RUN(test_cf_blocker_snapshot_is_bounded_and_has_no_pid_guess);
 	UT_RUN(test_cf_trace_off_and_critical_keep_original_operations);
 	UT_RUN(test_cf_trace_original_pending_age_and_grant_pid);
+	UT_RUN(cf_inputs_control_unavailable_preserves_fatal_and_exact_debt);
+	UT_RUN(cf_inputs_failed_acquire_cleanup_has_same_precise_release_refusal);
+	UT_RUN(cf_release_caller_mismatch_is_distinct_and_never_retires_foreign_owner);
+	UT_RUN(cf_release_service_gate_records_refusal_without_waiting);
+	UT_RUN(cf_release_critical_section_keeps_original_refusal_without_log);
+	UT_RUN(cf_inputs_confirmed_release_has_no_refusal_log_or_fatal);
+	UT_RUN(cf_inputs_unheld_and_native_release_keep_original_noop);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;

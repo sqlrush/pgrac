@@ -542,8 +542,21 @@ cf_unlock(LOCKMODE mode, const void *caller)
 
 	if (!slot->held)
 		return CLUSTER_CF_RELEASE_NOT_HELD;
-	if (slot->caller != caller)
+	if (slot->caller != caller) {
+		if (CritSectionCount == 0)
+			ereport(LOG,
+				(errmsg("PGRAC_FAMILY=CF_RELEASE task=cf_unlock reason=caller_mismatch"
+						" node=%d pid=%d mode=%d caller_tagged=%d slot_caller_tagged=%d"
+						" control_owner=" UINT64_FORMAT " state=%d shared=%d"
+						" holder_node=%d holder_procno=%u holder_request=" UINT64_FORMAT
+						" epoch=" UINT64_FORMAT " confirmed=0",
+						cluster_node_id, MyProcPid, mode, caller != NULL, slot->caller != NULL,
+						cookie, (int)slot->owner.state, slot->owner.shared,
+						slot->owner.request.holder.node_id, slot->owner.request.holder.procno,
+						slot->owner.request.holder.request_id,
+						slot->owner.request.holder.cluster_epoch)));
 		return CLUSTER_CF_RELEASE_UNCONFIRMED;
+	}
 	if (!slot->coordinated) {
 		memset(slot, 0, sizeof(*slot));
 		return CLUSTER_CF_RELEASE_NOT_HELD;
