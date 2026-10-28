@@ -3754,6 +3754,163 @@ cluster_bufmgr_pcm_own_acquire_read_disk_exact(BufferDesc *buf,
 }
 /* End original first-fill disk execution. */
 
+/* Original first-fill shared disk staging. Shared bytes remain unpublished;
+ * the original execution, GP and input IO still own the eventual C or abort. */
+static bool
+cluster_bufmgr_acquire_disk_stage_output_private(ResourceXDiskStageObservation *out,
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
+	const ResourceXDecodedAcquireIntent *episode, const ClusterSemanticAdmissionToken *admission,
+	const ResourceXDeliveryClaim *execution)
+{
+	const void *inputs[] = { buf, base, episode, admission, execution };
+	const Size lengths[] = { sizeof(*buf), sizeof(*base), sizeof(*episode),
+		sizeof(*admission), sizeof(*execution) };
+	uintptr_t begin = (uintptr_t)out, end;
+
+	if (out == NULL || begin > UINTPTR_MAX - sizeof(*out))
+		return false;
+	end = begin + sizeof(*out);
+	if (ShmemAddrIsValid(out) || ShmemAddrIsValid((void *)(end - 1)))
+		return false;
+	for (unsigned i = 0; i < lengthof(inputs); i++) {
+		uintptr_t first = (uintptr_t)inputs[i];
+		if (first > UINTPTR_MAX - lengths[i]
+			|| (begin < first + lengths[i] && first < end))
+			return false;
+	}
+	return true;
+}
+
+/* Only native/local reads occur here. Providers and the entry owner are
+ * sampled off content/header locks by the caller. A non-NULL page requires
+ * content X, and the identical original input-IO fence before any copy. */
+static bool
+cluster_bufmgr_acquire_disk_stage_native(BufferDesc *buf,
+	const ClusterPcmOwnSnapshot *base, const ResourceXDecodedAcquireIntent *episode,
+	const ResourceXDeliveryClaim *execution, ResourceOwner io_owner,
+	uint64 expected_write, const PGIOAlignedBlock *page, ResourceXDiskStageObservation *out)
+{
+	ClusterPcmOwnSnapshot expected = *base, live;
+	uint64 write;
+	uint32 state;
+	bool exact;
+
+	if (buf->buf_id != episode->buffer_id || buf->buf_id < 0 || buf->buf_id >= NBuffers
+		|| ClusterPcmOwnArray == NULL || CurrentResourceOwner != io_owner
+		|| !ResourceOwnerHasBufferIO(io_owner, BufferDescriptorGetBuffer(buf))
+		|| MyProc == NULL || MyProcPid <= 0 || MyProc->pid != MyProcPid
+		|| MyProc->pgprocno < 0 || MyBackendId != episode->backend_id
+		|| MyProc->backendId != episode->backend_id
+		|| MyProc->cluster_grd_generation != episode->backend_generation
+		|| (page != NULL && !LWLockHeldByMeInMode(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE)))
+		return false;
+	expected.flags = PCM_OWN_FLAG_GRANT_PENDING;
+	expected.reservation_token = episode->reservation_token;
+	state = LockBufHdr(buf);
+	cluster_pcm_own_snapshot_locked(buf, &live);
+	write = pg_atomic_read_u64(&ClusterPcmOwnArray[buf->buf_id].write_io_generation);
+	exact = cluster_pcm_own_snapshot_equal_exact(&expected, &live)
+		&& live.semantic_buf_state == (BM_TAG_VALID | BM_IO_IN_PROGRESS)
+		&& live.pcm_state == PCM_STATE_N && live.buffer_type == BUF_TYPE_CURRENT
+		&& live.writer_activation_token == 0 && live.resource_x_activation_generation == 0
+		&& cluster_pcm_own_delivery_attempt_get(buf->buf_id) == execution->executor_sequence
+		&& (write & 1) == 0 && (expected_write == UINT64_MAX || write == expected_write);
+	if (exact) {
+		if (page != NULL)
+			memcpy(BufferGetBlock(BufferDescriptorGetBuffer(buf)), page->data, BLCKSZ);
+		out->pending = live;
+		out->write_io_generation = write;
+		out->executor_sequence = execution->executor_sequence;
+	}
+	UnlockBufHdr(buf, state);
+	return exact;
+}
+
+/* The private observation describes the same immutable A before/after IO
+ * and shared staging. It grants no publication or cancellation permission. */
+static bool
+cluster_bufmgr_acquire_disk_stage_authority(BufferDesc *buf,
+	const ClusterPcmOwnSnapshot *base, const ResourceXDecodedAcquireIntent *episode,
+	const ClusterSemanticAdmissionToken *admission, const ResourceXDeliveryClaim *execution,
+	ResourceOwner io_owner, bool capture, ResourceXDiskStageObservation *out)
+{
+	ResourceXDecodedFrame grant, image;
+	ResourceXRequesterJoinSnapshot join;
+	uint64 watermark;
+
+	if (!cluster_bufmgr_acquire_disk_owned(buf, base, episode, admission, execution,
+			io_owner, &watermark)
+		|| cluster_pcm_lock_resource_x_requester_acquire_execute_frames_exact(
+			execution, episode, &grant, &image, &join) != RESOURCE_X_APPLY_APPLIED)
+		return false;
+	if (!capture)
+		return out->authority_generation == grant.common.authority_generation
+			&& out->decision_crc32c == grant.common.semantic_crc32c;
+	out->authority_generation = grant.common.authority_generation;
+	out->decision_crc32c = grant.common.semantic_crc32c;
+	return true;
+}
+
+ResourceXApplyResult
+cluster_bufmgr_pcm_own_acquire_stage_disk_exact(BufferDesc *buf,
+	const ClusterPcmOwnSnapshot *base, const ResourceXDecodedAcquireIntent *episode,
+	const ClusterSemanticAdmissionToken *admission, const ResourceXDeliveryClaim *execution,
+	ResourceXDiskStageObservation *out)
+{
+	ClusterPcmOwnSnapshot original;
+	ResourceXDecodedAcquireIntent entered;
+	ResourceXDeliveryClaim owned;
+	ResourceXDiskStageObservation staged = { 0 };
+	PGIOAlignedBlock page;
+	ResourceOwner io_owner = CurrentResourceOwner;
+	ResourceXApplyResult result;
+	LWLock *content;
+	volatile bool copied = false;
+
+	if (buf == NULL || base == NULL || episode == NULL || admission == NULL || execution == NULL
+		|| !cluster_bufmgr_acquire_disk_stage_output_private(out, buf, base, episode, admission, execution))
+		return RESOURCE_X_APPLY_INVALID;
+	content = BufferDescriptorGetContentLock(buf);
+	if (LWLockHeldByMe(content) || episode->path != RESOURCE_X_ACQUIRE_FIRST_FILL
+		|| execution->observation.request.target_mode != PCM_STATE_S)
+		return RESOURCE_X_APPLY_BAD_STATE;
+	original = *base;
+	entered = *episode;
+	owned = *execution;
+	if (!cluster_bufmgr_acquire_disk_stage_authority(buf, &original, &entered, admission,
+			&owned, io_owner, true, &staged)
+		|| !cluster_bufmgr_acquire_disk_stage_native(buf, &original, &entered, &owned,
+			io_owner, UINT64_MAX, NULL, &staged))
+		return RESOURCE_X_APPLY_BAD_STATE;
+	result = cluster_bufmgr_pcm_own_acquire_read_disk_exact(buf, &original, &entered,
+		admission, &owned, &page, &staged.page_lsn, &staged.page_scn);
+	if (result != RESOURCE_X_APPLY_APPLIED)
+		return result;
+	staged.page_crc32c = cluster_gcs_block_compute_checksum(page.data);
+	if (!cluster_bufmgr_acquire_disk_stage_authority(buf, &original, &entered, admission,
+			&owned, io_owner, false, &staged))
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	LWLockAcquire(content, LW_EXCLUSIVE);
+	PG_TRY();
+	{
+		copied = cluster_bufmgr_acquire_disk_stage_native(buf, &original, &entered, &owned,
+			io_owner, staged.write_io_generation, &page, &staged);
+	}
+	PG_FINALLY();
+	{
+		LWLockRelease(content);
+	}
+	PG_END_TRY();
+	if (!copied || !cluster_bufmgr_acquire_disk_stage_authority(buf, &original, &entered,
+			admission, &owned, io_owner, false, &staged)
+		|| !cluster_bufmgr_acquire_disk_stage_native(buf, &original, &entered, &owned,
+			io_owner, staged.write_io_generation, NULL, &staged))
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	*out = staged;
+	return RESOURCE_X_APPLY_APPLIED;
+}
+/* End original first-fill shared disk staging. */
+
 
 /*
  * PGRAC (t/400 L3 review R2 P0-2): a legacy grant reservation that observes

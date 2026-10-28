@@ -909,6 +909,30 @@ extern ResourceXApplyResult cluster_bufmgr_pcm_own_acquire_read_disk_exact(
 	const struct ClusterSemanticAdmissionToken *admission,
 	const ResourceXDeliveryClaim *execution, PGIOAlignedBlock *out_page,
 	XLogRecPtr *out_page_lsn, uint64 *out_page_scn);
+/* A private observation of unpublished DISK bytes, never an install/grant
+ * capability. Completion must recheck E/A, the native/IO owner and actual
+ * shared bytes; no PAGE/WAL memory-source proof is synthesized from disk. */
+typedef struct ResourceXDiskStageObservation {
+	ClusterPcmOwnSnapshot pending;
+	uint64 executor_sequence;
+	uint64 write_io_generation;
+	uint64 authority_generation;
+	XLogRecPtr page_lsn;
+	uint64 page_scn;
+	uint32 page_crc32c;
+	uint32 decision_crc32c;
+} ResourceXDiskStageObservation;
+
+StaticAssertDecl(sizeof(ResourceXDiskStageObservation) == 112,
+				 "Resource-X disk staging observation is process-local");
+
+/* Read and stage only the original first-fill S DISK source. Keep GP,
+ * delivery hold and input IO unchanged, with BM_VALID still clear. */
+extern ResourceXApplyResult cluster_bufmgr_pcm_own_acquire_stage_disk_exact(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
+	const ResourceXDecodedAcquireIntent *episode,
+	const struct ClusterSemanticAdmissionToken *admission,
+	const ResourceXDeliveryClaim *execution, ResourceXDiskStageObservation *out);
 extern ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_delivery_begin_x_reservation(BufferDesc *buf,
 													const ClusterPcmOwnSnapshot *expected,

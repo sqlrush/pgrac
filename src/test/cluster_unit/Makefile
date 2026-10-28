@@ -10565,3 +10565,32 @@ clean distclean maintainer-clean: clean-native-read-commit
 .PHONY: clean-native-read-commit
 clean-native-read-commit:
 	rm -f test_cluster_native_read_commit
+
+# Actual shared staging of the original verified first-fill DISK source.
+TESTS += test_cluster_native_disk_stage
+all: test_cluster_native_disk_stage
+test_cluster_native_disk_stage: test_cluster_native_disk_stage.c \
+        test_cluster_native_disk_stage.inc test_cluster_native_disk_read_fixture.inc \
+        test_cluster_native_disk_read
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+test_cluster_native_disk_stage.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^\/\* Original first-fill shared disk staging/ { emit=1; found++ } \
+	     /^\/\* End original first-fill shared disk staging/ { emit=0; stop=1 } \
+	     emit { print } END { if (found != 1 || !stop) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_native_disk_read_fixture.inc: test_cluster_native_disk_read.c Makefile
+	awk '/^UT_TEST\(/ { stop=1 } !stop { print; lines++ } \
+	     END { if (!stop || lines < 100) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+clean distclean maintainer-clean: clean-native-disk-stage
+.PHONY: clean-native-disk-stage
+clean-native-disk-stage:
+	rm -f test_cluster_native_disk_stage test_cluster_native_disk_stage.inc test_cluster_native_disk_stage.inc.tmp \
+		test_cluster_native_disk_read_fixture.inc test_cluster_native_disk_read_fixture.inc.tmp
