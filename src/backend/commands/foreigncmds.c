@@ -300,6 +300,30 @@ AlterForeignDataWrapperOwner(const char *name, Oid newOwnerId)
 	ObjectAddress address;
 	Form_pg_foreign_data_wrapper form;
 
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_catalog && cluster_storage_mode_enabled()) {
+		ClusterCanonicalTxnBinding binding;
+		TransactionId current_xid;
+
+		PreventCommandIfReadOnly("ALTER FOREIGN DATA WRAPPER");
+		PreventCommandIfParallelMode("ALTER FOREIGN DATA WRAPPER");
+		PreventCommandDuringRecovery("ALTER FOREIGN DATA WRAPPER");
+		if (IsSubTransaction())
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("shared catalog alteration does not support subtransactions")));
+		current_xid = GetCurrentTransactionIdIfAny();
+		if (TransactionIdIsValid(current_xid)
+			&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("shared catalog top-level transaction identity mismatch")));
+		if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+			ereport(
+				ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("canonical ACTIVE publication failed before shared catalog alteration")));
+	}
+#endif
+
 
 	rel = table_open(ForeignDataWrapperRelationId, RowExclusiveLock);
 
@@ -439,6 +463,30 @@ AlterForeignServerOwner(const char *name, Oid newOwnerId)
 	Relation	rel;
 	ObjectAddress address;
 	Form_pg_foreign_server form;
+
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_catalog && cluster_storage_mode_enabled()) {
+		ClusterCanonicalTxnBinding binding;
+		TransactionId current_xid;
+
+		PreventCommandIfReadOnly("ALTER SERVER");
+		PreventCommandIfParallelMode("ALTER SERVER");
+		PreventCommandDuringRecovery("ALTER SERVER");
+		if (IsSubTransaction())
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("shared catalog alteration does not support subtransactions")));
+		current_xid = GetCurrentTransactionIdIfAny();
+		if (TransactionIdIsValid(current_xid)
+			&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("shared catalog top-level transaction identity mismatch")));
+		if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+			ereport(
+				ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("canonical ACTIVE publication failed before shared catalog alteration")));
+	}
+#endif
 
 	rel = table_open(ForeignServerRelationId, RowExclusiveLock);
 

@@ -5961,6 +5961,9 @@ GetUserId(void)
 }
 
 static bool publication_lookup_active, publication_expect_binding;
+static bool foreign_owner_lookup_active, foreign_owner_expect_binding;
+static unsigned foreign_owner_lookups, foreign_owner_unbound, foreign_owner_bad_lookup;
+static Oid foreign_owner_expected_relation;
 static bool publication_owner_lookup_active, publication_owner_expect_binding;
 static unsigned publication_owner_lookups, publication_owner_unbound, publication_owner_bad_lookup;
 static unsigned publication_entry_kind, publication_lookups, publication_lookup_kind;
@@ -6415,6 +6418,14 @@ static unsigned role_rename_lookups, role_rename_unbound, role_rename_bad_lookup
 Relation
 table_open(Oid relationId, LOCKMODE lockmode)
 {
+	if (foreign_owner_lookup_active) {
+		foreign_owner_lookups++;
+		if (foreign_owner_expect_binding && utility_binds == 0)
+			foreign_owner_unbound++;
+		if (relationId != foreign_owner_expected_relation || lockmode != RowExclusiveLock)
+			foreign_owner_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before the real foreign catalog lock/query. */
+	}
 	if (publication_owner_lookup_active) {
 		publication_owner_lookups++;
 		if (publication_owner_expect_binding && utility_binds == 0)
@@ -16448,10 +16459,194 @@ UT_TEST(test_native_publication_owner_utility_warm_guards_preserve_binding)
 	publication_owner_lookup_active = false;
 }
 
+/* Actual named foreign owner prefixes stop before their first catalog locks;
+ * permissions, catalog queries and owner mutations stay native. */
+#include "test_cluster_fresh_foreign_owner.inc"
+static AlterOwnerStmt native_foreign_owner_statement;
+static String foreign_owner_name;
+static RoleSpec foreign_owner_role;
+static Node *foreign_owner_expected_statement;
+static const char *foreign_owner_expected_name;
+static Oid foreign_owner_newowner;
+static const char *foreign_owner_command;
+
+static void
+reset_native_foreign_owner(bool expect_binding, unsigned form)
+{
+	static const char *const names[]
+		= { "owner_wrapper", "other_owner_wrapper", "owner_server", "other_owner_server" };
+	static const Oid owners[] = { 901, 902, 903, 904 };
+	static const Oid catalogs[] = { ForeignDataWrapperRelationId, ForeignServerRelationId };
+	static const char *const commands[] = { "ALTER FOREIGN DATA WRAPPER", "ALTER SERVER" };
+
+	reset_create_preflight();
+	foreign_owner_lookup_active = true;
+	foreign_owner_expect_binding = expect_binding;
+	foreign_owner_lookups = foreign_owner_unbound = foreign_owner_bad_lookup = 0;
+	foreign_owner_expected_name = names[form];
+	foreign_owner_newowner = owners[form];
+	foreign_owner_expected_relation = catalogs[form / 2];
+	foreign_owner_command = commands[form / 2];
+	foreign_owner_name = (String){ .type = T_String, .sval = (char *)foreign_owner_expected_name };
+	foreign_owner_role = (RoleSpec){ .type = T_RoleSpec,
+									 .roletype = ROLESPEC_CSTRING,
+									 .rolename = "foreign_new_owner",
+									 .location = -1 };
+	native_foreign_owner_statement
+		= (AlterOwnerStmt){ .type = T_AlterOwnerStmt,
+							.objectType = form < 2 ? OBJECT_FDW : OBJECT_FOREIGN_SERVER,
+							.object = (Node *)&foreign_owner_name,
+							.newowner = &foreign_owner_role };
+	foreign_owner_expected_statement = (Node *)&native_foreign_owner_statement;
+}
+
+static void
+native_foreign_owner_entry(unsigned form)
+{
+	if (form < 2)
+		(void)AlterForeignDataWrapperOwner(foreign_owner_expected_name, foreign_owner_newowner);
+	else
+		(void)AlterForeignServerOwner(foreign_owner_expected_name, foreign_owner_newowner);
+}
+
+UT_TEST(test_native_foreign_owner_binds_before_first_query_in_all_profiles)
+{
+	for (unsigned form = 0; form < 4; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_foreign_owner(binds, form);
+			set_native_operator_mode(mode);
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_foreign_owner_entry(form);
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(foreign_owner_lookups, repeat + 1);
+				UT_ASSERT_EQ(foreign_owner_unbound, 0);
+				UT_ASSERT_EQ(foreign_owner_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	foreign_owner_lookup_active = false;
+}
+
+UT_TEST(test_native_foreign_owner_refuses_before_lookup_on_publication_child_and_top_errors)
+{
+	for (unsigned form = 0; form < 4; form++) {
+		for (unsigned failure = 0; failure < 5; failure++) {
+			bool allocated = failure == 0 || failure == 2;
+			int caught;
+
+			reset_native_foreign_owner(true, form);
+			if (failure == 0)
+				utility_bind_ok = false;
+			else if (failure == 1 || failure == 2) {
+				if (failure == 2)
+					create_sql_entry(foreign_owner_expected_statement);
+				utility_in_child = true;
+			} else {
+				utility_current_xid = 401;
+				utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_foreign_owner_entry(form);
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, failure == 0  ? ERRCODE_DATA_CORRUPTED
+									 : failure < 3 ? ERRCODE_FEATURE_NOT_SUPPORTED
+												   : ERRCODE_INTERNAL_ERROR);
+			UT_ASSERT_STR_EQ(
+				error_message,
+				failure == 0
+					? "canonical ACTIVE publication failed before shared catalog alteration"
+				: failure < 3 ? "shared catalog alteration does not support subtransactions"
+							  : "shared catalog top-level transaction identity mismatch");
+			UT_ASSERT_EQ(foreign_owner_lookups, 0);
+			UT_ASSERT_EQ(foreign_owner_unbound + foreign_owner_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_xids, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, failure == 2 ? 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, allocated || failure == 3 ? 400 : InvalidTransactionId);
+		}
+	}
+	foreign_owner_lookup_active = false;
+}
+
+UT_TEST(test_native_foreign_owner_context_guards_keep_nonshared_route)
+{
+	for (unsigned form = 0; form < 4; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+
+			for (unsigned guard = 0; guard < 3; guard++) {
+				int caught;
+
+				reset_native_foreign_owner(binds, form);
+				set_native_operator_mode(mode);
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_foreign_owner_entry(form);
+				UT_ASSERT_EQ(caught, binds ? 1 : 2);
+				UT_ASSERT_EQ(error_code, !binds		  ? 0
+										 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+													  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				if (binds)
+					UT_ASSERT(strstr(error_message, foreign_owner_command) != NULL);
+				UT_ASSERT_EQ(foreign_owner_lookups, binds ? 0 : 1);
+				UT_ASSERT_EQ(foreign_owner_unbound + foreign_owner_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	foreign_owner_lookup_active = false;
+}
+
+UT_TEST(test_native_foreign_owner_utility_warm_guards_preserve_binding)
+{
+	for (unsigned form = 0; form < 4; form++) {
+		for (unsigned guard = 0; guard < 4; guard++) {
+			int caught;
+
+			reset_native_foreign_owner(true, form);
+			create_sql_entry(foreign_owner_expected_statement);
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			XactReadOnly = guard == 1;
+			utility_parallel = guard == 2;
+			utility_recovery = guard == 3;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_foreign_owner_entry(form);
+			UT_ASSERT_EQ(caught, guard ? 1 : 2);
+			UT_ASSERT_EQ(error_code, !guard		  ? 0
+									 : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+												  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT_EQ(foreign_owner_lookups, guard ? 0 : 1);
+			UT_ASSERT_EQ(foreign_owner_unbound + foreign_owner_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_prepares, guard ? 1 : 2);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			UT_ASSERT_EQ(utility_top_xid, 400);
+		}
+	}
+	foreign_owner_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(259);
+	UT_PLAN(263);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -16711,6 +16906,10 @@ main(void)
 	UT_RUN(test_native_publication_owner_refuses_before_lookup_on_publication_child_and_top_errors);
 	UT_RUN(test_native_publication_owner_context_guards_keep_nonshared_route);
 	UT_RUN(test_native_publication_owner_utility_warm_guards_preserve_binding);
+	UT_RUN(test_native_foreign_owner_binds_before_first_query_in_all_profiles);
+	UT_RUN(test_native_foreign_owner_refuses_before_lookup_on_publication_child_and_top_errors);
+	UT_RUN(test_native_foreign_owner_context_guards_keep_nonshared_route);
+	UT_RUN(test_native_foreign_owner_utility_warm_guards_preserve_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
