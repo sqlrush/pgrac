@@ -51,6 +51,7 @@
 #include "catalog/pg_rewrite.h"
 #include "catalog/pg_statistic_ext.h"
 #include "catalog/pg_subscription.h"
+#include "catalog/pg_tablespace.h"
 #include "catalog/pg_transform.h"
 #include "catalog/pg_ts_config.h"
 #include "catalog/pg_ts_dict.h"
@@ -75,6 +76,7 @@
 #include "commands/seclabel.h"
 #include "commands/sequence.h"
 #include "commands/subscriptioncmds.h"
+#include "commands/tablespace.h"
 #include "commands/trigger.h"
 #include "commands/user.h"
 #include "commands/view.h"
@@ -350,6 +352,10 @@ cluster_tt_local_prepare_canonical_active(TransactionId xid, ClusterCanonicalTxn
 	binding->segment_id = 1;
 	return true;
 }
+
+static bool tablespace_options_lookup_active, tablespace_options_expect_binding;
+static unsigned tablespace_options_lookups, tablespace_options_unbound;
+static unsigned tablespace_options_bad_lookup;
 
 static bool trigger_rename_lookup_active, trigger_rename_expect_binding;
 static unsigned trigger_rename_lookups, trigger_rename_unbound, trigger_rename_bad_lookup;
@@ -6449,6 +6455,14 @@ static unsigned role_rename_lookups, role_rename_unbound, role_rename_bad_lookup
 Relation
 table_open(Oid relationId, LOCKMODE lockmode)
 {
+	if (tablespace_options_lookup_active) {
+		tablespace_options_lookups++;
+		if (tablespace_options_expect_binding && utility_binds == 0)
+			tablespace_options_unbound++;
+		if (relationId != TableSpaceRelationId || lockmode != RowExclusiveLock)
+			tablespace_options_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before the real tablespace catalog lock/query. */
+	}
 	if (subscription_owner_lookup_active) {
 		subscription_owner_lookups++;
 		if (subscription_owner_expect_binding && utility_binds == 0)
@@ -17268,10 +17282,258 @@ UT_TEST(test_native_trigger_rename_utility_warm_guards_preserve_binding)
 	trigger_rename_lookup_active = false;
 }
 
+/* Actual native options prefix exits before the first catalog lock/query. */
+#include "test_cluster_fresh_tablespace_options.inc"
+static AlterTableSpaceOptionsStmt native_tablespace_options_statement;
+static Integer tablespace_options_value;
+static DefElem tablespace_options_option;
+static ListCell tablespace_options_cell;
+static List tablespace_options_list;
+static Node *tablespace_options_expected_statement;
+
+static void
+reset_native_tablespace_options(bool expect_binding, unsigned form)
+{
+	static const char *const names[] = { "options_space", "other_options_space" };
+
+	reset_create_preflight();
+	tablespace_options_lookup_active = true;
+	tablespace_options_expect_binding = expect_binding;
+	tablespace_options_lookups = tablespace_options_unbound = tablespace_options_bad_lookup = 0;
+	tablespace_options_value = (Integer){ .type = T_Integer, .ival = 2 };
+	tablespace_options_option = (DefElem){ .type = T_DefElem,
+										   .defname = "seq_page_cost",
+										   .arg = form ? NULL : (Node *)&tablespace_options_value,
+										   .defaction = DEFELEM_UNSPEC,
+										   .location = -1 };
+	tablespace_options_cell = (ListCell){ .ptr_value = &tablespace_options_option };
+	tablespace_options_list = (List){ .type = T_List,
+									  .length = 1,
+									  .max_length = 1,
+									  .elements = &tablespace_options_cell };
+	native_tablespace_options_statement
+		= (AlterTableSpaceOptionsStmt){ .type = T_AlterTableSpaceOptionsStmt,
+										.tablespacename = (char *)names[form],
+										.options = &tablespace_options_list,
+										.isReset = form != 0 };
+	tablespace_options_expected_statement = (Node *)&native_tablespace_options_statement;
+}
+
+static void
+native_tablespace_options_entry(unsigned form)
+{
+	(void)form;
+	(void)AlterTableSpaceOptions(&native_tablespace_options_statement);
+}
+
+UT_TEST(test_native_tablespace_options_binds_before_first_query_in_all_profiles)
+{
+	for (unsigned form = 0; form < 2; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_tablespace_options(binds, form);
+			set_native_operator_mode(mode);
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_tablespace_options_entry(form);
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(tablespace_options_lookups, repeat + 1);
+				UT_ASSERT_EQ(tablespace_options_unbound, 0);
+				UT_ASSERT_EQ(tablespace_options_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	tablespace_options_lookup_active = false;
+}
+
+UT_TEST(test_native_tablespace_options_refuses_before_lookup_on_publication_child_and_top_errors)
+{
+	for (unsigned form = 0; form < 2; form++) {
+		for (unsigned failure = 0; failure < 5; failure++) {
+			bool allocated = failure == 0 || failure == 2;
+			int caught;
+
+			reset_native_tablespace_options(true, form);
+			if (failure == 0)
+				utility_bind_ok = false;
+			else if (failure == 1 || failure == 2) {
+				if (failure == 2)
+					create_sql_entry(tablespace_options_expected_statement);
+				utility_in_child = true;
+			} else {
+				utility_current_xid = 401;
+				utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_tablespace_options_entry(form);
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, failure == 0  ? ERRCODE_DATA_CORRUPTED
+									 : failure < 3 ? ERRCODE_FEATURE_NOT_SUPPORTED
+												   : ERRCODE_INTERNAL_ERROR);
+			UT_ASSERT_STR_EQ(
+				error_message,
+				failure == 0
+					? "canonical ACTIVE publication failed before shared catalog alteration"
+				: failure < 3 ? "shared catalog alteration does not support subtransactions"
+							  : "shared catalog top-level transaction identity mismatch");
+			UT_ASSERT_EQ(tablespace_options_lookups, 0);
+			UT_ASSERT_EQ(tablespace_options_unbound + tablespace_options_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_xids, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, failure == 2 ? 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, allocated || failure == 3 ? 400 : InvalidTransactionId);
+		}
+	}
+	tablespace_options_lookup_active = false;
+}
+
+UT_TEST(test_native_tablespace_options_context_guards_keep_nonshared_route)
+{
+	for (unsigned form = 0; form < 2; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+
+			for (unsigned guard = 0; guard < 3; guard++) {
+				int caught;
+
+				reset_native_tablespace_options(binds, form);
+				set_native_operator_mode(mode);
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_tablespace_options_entry(form);
+				UT_ASSERT_EQ(caught, binds ? 1 : 2);
+				UT_ASSERT_EQ(error_code, !binds		  ? 0
+										 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+													  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				if (binds)
+					UT_ASSERT(strstr(error_message, "ALTER TABLESPACE") != NULL);
+				UT_ASSERT_EQ(tablespace_options_lookups, binds ? 0 : 1);
+				UT_ASSERT_EQ(tablespace_options_unbound + tablespace_options_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	tablespace_options_lookup_active = false;
+}
+
+UT_TEST(test_native_tablespace_options_utility_warm_guards_preserve_binding)
+{
+	for (unsigned form = 0; form < 2; form++) {
+		for (unsigned guard = 0; guard < 4; guard++) {
+			int caught;
+
+			reset_native_tablespace_options(true, form);
+			create_sql_entry(tablespace_options_expected_statement);
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			XactReadOnly = guard == 1;
+			utility_parallel = guard == 2;
+			utility_recovery = guard == 3;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_tablespace_options_entry(form);
+			UT_ASSERT_EQ(caught, guard ? 1 : 2);
+			UT_ASSERT_EQ(error_code, !guard		  ? 0
+									 : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+												  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT_EQ(tablespace_options_lookups, guard ? 0 : 1);
+			UT_ASSERT_EQ(tablespace_options_unbound + tablespace_options_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_prepares, guard ? 1 : 2);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			UT_ASSERT_EQ(utility_top_xid, 400);
+		}
+	}
+	tablespace_options_lookup_active = false;
+}
+
+UT_TEST(test_native_tablespace_options_pg_undo_refusal_precedes_binding_and_keeps_scope)
+{
+	static const char *const near_names[] = { "pg_undox", "PG_UNDO", NULL };
+
+	for (unsigned form = 0; form < 2; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			bool protected = (mode & 5) != 0;
+
+			for (unsigned warm = 0; warm < 2; warm++) {
+				for (unsigned guard = 0; guard < 6; guard++) {
+					int caught;
+
+					reset_native_tablespace_options(binds, form);
+					set_native_operator_mode(mode);
+					if (warm)
+						create_sql_entry(tablespace_options_expected_statement);
+					native_tablespace_options_statement.tablespacename = "pg_undo";
+					utility_in_child = guard == 1;
+					XactReadOnly = guard == 2;
+					utility_parallel = guard == 3;
+					utility_recovery = guard == 4;
+					if (guard == 5)
+						utility_current_xid = 401;
+					utility_bind_ok = false;
+					caught = sigsetjmp(boundary, 1);
+					if (!caught)
+						native_tablespace_options_entry(form);
+					UT_ASSERT_EQ(caught, protected ? 1 : 2);
+					UT_ASSERT_EQ(error_code, protected ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+					if (protected) {
+						UT_ASSERT_STR_EQ(error_message, "pg_undo cannot be altered");
+						UT_ASSERT_STR_EQ(error_hint,
+										 "pg_undo is managed by the cluster runtime; "
+										 "Stage 1.22 does not support modifying its options.");
+					}
+					UT_ASSERT_EQ(tablespace_options_lookups, protected ? 0 : 1);
+					UT_ASSERT_EQ(tablespace_options_unbound + tablespace_options_bad_lookup, 0);
+					UT_ASSERT_EQ(utility_xids, binds && warm ? 1 : 0);
+					UT_ASSERT_EQ(utility_prepares, binds && warm ? 1 : 0);
+					UT_ASSERT_EQ(utility_binds, binds && warm ? 1 : 0);
+					UT_ASSERT_EQ(utility_top_xid, binds && warm ? 400 : InvalidTransactionId);
+				}
+				for (unsigned name = 0; name < lengthof(near_names); name++) {
+					int caught;
+
+					reset_native_tablespace_options(binds, form);
+					set_native_operator_mode(mode);
+					if (warm)
+						create_sql_entry(tablespace_options_expected_statement);
+					native_tablespace_options_statement.tablespacename = (char *)near_names[name];
+					caught = sigsetjmp(boundary, 1);
+					if (!caught)
+						native_tablespace_options_entry(form);
+					UT_ASSERT_EQ(caught, 2);
+					UT_ASSERT_EQ(error_code, 0);
+					UT_ASSERT_EQ(tablespace_options_lookups, 1);
+					UT_ASSERT_EQ(tablespace_options_unbound + tablespace_options_bad_lookup, 0);
+					UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+					UT_ASSERT_EQ(utility_prepares, binds ? warm + 1 : 0);
+					UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+					UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+				}
+			}
+		}
+	}
+	tablespace_options_lookup_active = false;
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(275);
+	UT_PLAN(280);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -17548,6 +17810,12 @@ main(void)
 	UT_RUN(test_native_trigger_rename_refuses_before_lookup_on_publication_child_and_top_errors);
 	UT_RUN(test_native_trigger_rename_context_guards_keep_nonshared_route);
 	UT_RUN(test_native_trigger_rename_utility_warm_guards_preserve_binding);
+	UT_RUN(test_native_tablespace_options_binds_before_first_query_in_all_profiles);
+	UT_RUN(
+		test_native_tablespace_options_refuses_before_lookup_on_publication_child_and_top_errors);
+	UT_RUN(test_native_tablespace_options_context_guards_keep_nonshared_route);
+	UT_RUN(test_native_tablespace_options_utility_warm_guards_preserve_binding);
+	UT_RUN(test_native_tablespace_options_pg_undo_refusal_precedes_binding_and_keeps_scope);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

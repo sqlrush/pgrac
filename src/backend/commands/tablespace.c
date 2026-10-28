@@ -86,6 +86,8 @@
 #include "catalog/pg_tablespace.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_guc.h" /* PGRAC: spec-6.14 shared-catalog CREATE TABLESPACE refusal */
+#include "cluster/cluster_mode.h"
+#include "cluster/cluster_tt_local.h"
 #include "cluster/cluster_ts.h" /* PGRAC: spec-5.7 TT (§3.3) tablespace-DDL lock */
 #endif
 #include "commands/comment.h"
@@ -1142,6 +1144,35 @@ AlterTableSpaceOptions(AlterTableSpaceOptionsStmt *stmt)
 	bool		repl_null[Natts_pg_tablespace];
 	bool		repl_repl[Natts_pg_tablespace];
 	HeapTuple	newtuple;
+
+#ifdef USE_PGRAC_CLUSTER
+	if ((cluster_shared_config || cluster_shared_catalog) && stmt->tablespacename != NULL
+		&& strcmp(stmt->tablespacename, "pg_undo") == 0)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("pg_undo cannot be altered"),
+						errhint("pg_undo is managed by the cluster runtime; "
+								"Stage 1.22 does not support modifying its options.")));
+	if (cluster_shared_catalog && cluster_storage_mode_enabled()) {
+		ClusterCanonicalTxnBinding binding;
+		TransactionId current_xid;
+
+		PreventCommandIfReadOnly("ALTER TABLESPACE");
+		PreventCommandIfParallelMode("ALTER TABLESPACE");
+		PreventCommandDuringRecovery("ALTER TABLESPACE");
+		if (IsSubTransaction())
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("shared catalog alteration does not support subtransactions")));
+		current_xid = GetCurrentTransactionIdIfAny();
+		if (TransactionIdIsValid(current_xid)
+			&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("shared catalog top-level transaction identity mismatch")));
+		if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+			ereport(
+				ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("canonical ACTIVE publication failed before shared catalog alteration")));
+	}
+#endif
 
 	/* Search pg_tablespace */
 	rel = table_open(TableSpaceRelationId, RowExclusiveLock);
