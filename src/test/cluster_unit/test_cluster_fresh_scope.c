@@ -35,6 +35,7 @@
 #include "catalog/pg_control.h"
 #include "catalog/pg_extension.h"
 #include "catalog/pg_foreign_server_d.h"
+#include "catalog/pg_language.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_policy.h"
 #include "catalog/pg_type_d.h"
@@ -47,6 +48,7 @@
 #include "commands/extension.h"
 #include "commands/event_trigger.h"
 #include "commands/policy.h"
+#include "commands/proclang.h"
 #include "commands/schemacmds.h"
 #include "commands/seclabel.h"
 #include "commands/user.h"
@@ -8023,9 +8025,20 @@ UT_TEST(test_native_collation_utility_warm_context_guards_preserve_binding)
 
 /* Actual CREATE includes its original permission refusal. Normally superuser
  * jumps before role-cache lookup; false exercises that real refusal. */
+static bool language_lookup_active, language_expect_binding, language_superuser_denied;
+static unsigned language_lookups, language_unbound;
+
 bool
 superuser(void)
 {
+	if (language_lookup_active) {
+		language_lookups++;
+		if (language_expect_binding && utility_binds == 0)
+			language_unbound++;
+		if (language_superuser_denied)
+			return false;
+		siglongjmp(boundary, 2); /* Stop before the real superuser/role-cache query. */
+	}
 	event_trigger_lookups++;
 	event_trigger_lookup_kind = 1;
 	if (event_trigger_expect_binding && utility_binds == 0)
@@ -8520,10 +8533,201 @@ UT_TEST(test_native_owner_dispatch_pg_undo_name_refusal_matches_utility_before_b
 	owner_lookup_active = false;
 }
 
+/* Exercise the actual LANGUAGE prefix including its original permission error.
+ * Handler validation and all catalog changes remain beyond this boundary. */
+#include "test_cluster_fresh_language.inc"
+static CreatePLangStmt native_language_stmt;
+static String language_handler_name;
+static ListCell language_handler_cell;
+static List language_handler_names;
+
+static void
+reset_native_language(bool expect_binding, unsigned kind)
+{
+	reset_create_preflight();
+	language_lookup_active = true;
+	language_expect_binding = expect_binding;
+	language_superuser_denied = false;
+	language_lookups = language_unbound = 0;
+	language_handler_name = (String){ .type = T_String, .sval = "language_handler" };
+	language_handler_cell = (ListCell){ .ptr_value = &language_handler_name };
+	language_handler_names = (List){ .type = T_List,
+									 .length = 1,
+									 .max_length = 1,
+									 .elements = &language_handler_cell };
+	native_language_stmt = (CreatePLangStmt){ .type = T_CreatePLangStmt,
+											  .replace = (kind & 1) != 0,
+											  .pltrusted = (kind & 2) != 0,
+											  .plname = "preflight_language",
+											  .plhandler = &language_handler_names };
+}
+
+UT_TEST(test_native_language_binds_before_superuser_query_in_all_profiles)
+{
+	for (unsigned kind = 0; kind < 4; kind++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_language(binds, kind);
+			cluster_shared_catalog = (mode & 1) != 0;
+			utility_storage_mode = (mode & 2) != 0;
+			cluster_shared_config = (mode & 4) != 0;
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					(void)CreateProceduralLanguage(&native_language_stmt);
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(language_lookups, repeat + 1);
+				UT_ASSERT_EQ(language_unbound, 0);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	language_lookup_active = false;
+}
+
+UT_TEST(test_native_language_publication_child_and_wrong_top_precede_superuser_query)
+{
+	for (unsigned kind = 0; kind < 4; kind++) {
+		for (unsigned failure = 0; failure < 5; failure++) {
+			bool allocated = failure == 0 || failure == 2;
+			int caught;
+
+			reset_native_language(true, kind);
+			if (failure == 0)
+				utility_bind_ok = false;
+			else if (failure == 1 || failure == 2) {
+				if (failure == 2)
+					create_sql_entry((Node *)&native_language_stmt);
+				utility_in_child = true;
+			} else {
+				utility_current_xid = 401;
+				utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				(void)CreateProceduralLanguage(&native_language_stmt);
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, failure == 0  ? ERRCODE_DATA_CORRUPTED
+									 : failure < 3 ? ERRCODE_FEATURE_NOT_SUPPORTED
+												   : ERRCODE_INTERNAL_ERROR);
+			UT_ASSERT_STR_EQ(
+				error_message,
+				failure == 0  ? "canonical ACTIVE publication failed before shared catalog creation"
+				: failure < 3 ? "shared catalog creation does not support subtransactions"
+							  : "shared catalog top-level transaction identity mismatch");
+			UT_ASSERT_EQ(language_lookups, 0);
+			UT_ASSERT_EQ(utility_xids, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, failure == 2 ? 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, allocated || failure == 3 ? 400 : InvalidTransactionId);
+		}
+	}
+	language_lookup_active = false;
+}
+
+UT_TEST(test_native_language_context_guards_keep_nonshared_route)
+{
+	for (unsigned kind = 0; kind < 4; kind++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+
+			for (unsigned guard = 0; guard < 3; guard++) {
+				int caught;
+
+				reset_native_language(binds, kind);
+				cluster_shared_catalog = (mode & 1) != 0;
+				utility_storage_mode = (mode & 2) != 0;
+				cluster_shared_config = (mode & 4) != 0;
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					(void)CreateProceduralLanguage(&native_language_stmt);
+				UT_ASSERT_EQ(caught, binds ? 1 : 2);
+				UT_ASSERT_EQ(error_code, !binds		  ? 0
+										 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+													  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				if (binds)
+					UT_ASSERT(strstr(error_message, "CREATE LANGUAGE") != NULL);
+				UT_ASSERT_EQ(language_lookups, binds ? 0 : 1);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	language_lookup_active = false;
+}
+
+UT_TEST(test_native_language_utility_warm_context_guards_preserve_binding)
+{
+	for (unsigned kind = 0; kind < 4; kind++) {
+		for (unsigned guard = 0; guard < 4; guard++) {
+			int caught;
+
+			reset_native_language(true, kind);
+			create_sql_entry((Node *)&native_language_stmt);
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			XactReadOnly = guard == 1;
+			utility_parallel = guard == 2;
+			utility_recovery = guard == 3;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				(void)CreateProceduralLanguage(&native_language_stmt);
+			UT_ASSERT_EQ(caught, guard ? 1 : 2);
+			UT_ASSERT_EQ(error_code, !guard		  ? 0
+									 : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+												  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT_EQ(language_lookups, guard ? 0 : 1);
+			UT_ASSERT_EQ(language_unbound, 0);
+			UT_ASSERT_EQ(utility_prepares, guard ? 1 : 2);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			UT_ASSERT_EQ(utility_top_xid, 400);
+		}
+	}
+	language_lookup_active = false;
+}
+
+UT_TEST(test_native_language_original_permission_refusal_survives_early_binding)
+{
+	for (unsigned kind = 0; kind < 4; kind++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_language(binds, kind);
+			cluster_shared_catalog = (mode & 1) != 0;
+			utility_storage_mode = (mode & 2) != 0;
+			cluster_shared_config = (mode & 4) != 0;
+			language_superuser_denied = true;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				(void)CreateProceduralLanguage(&native_language_stmt);
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, ERRCODE_INSUFFICIENT_PRIVILEGE);
+			UT_ASSERT_STR_EQ(error_message,
+							 "must be superuser to create custom procedural language");
+			UT_ASSERT_EQ(language_lookups, 1);
+			UT_ASSERT_EQ(language_unbound, 0);
+			UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, binds ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+		}
+	}
+	language_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(116);
+	UT_PLAN(121);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -8640,6 +8844,11 @@ main(void)
 	UT_RUN(test_native_owner_dispatch_utility_warm_and_context_guards_preserve_binding);
 	UT_RUN(test_native_owner_dispatch_original_type_refusal_matches_utility_scope_and_precedence);
 	UT_RUN(test_native_owner_dispatch_pg_undo_name_refusal_matches_utility_before_binding);
+	UT_RUN(test_native_language_binds_before_superuser_query_in_all_profiles);
+	UT_RUN(test_native_language_publication_child_and_wrong_top_precede_superuser_query);
+	UT_RUN(test_native_language_context_guards_keep_nonshared_route);
+	UT_RUN(test_native_language_utility_warm_context_guards_preserve_binding);
+	UT_RUN(test_native_language_original_permission_refusal_survives_early_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
