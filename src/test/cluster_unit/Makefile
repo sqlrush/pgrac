@@ -4178,7 +4178,7 @@ test_cluster_side_xact_budget_product.o: $(top_srcdir)/src/backend/cluster/clust
 		-ffunction-sections -fdata-sections -c $< -o $@
 test_cluster_side_xact test_cluster_pi_contribution test_cluster_recovery_c0_plan test_cluster_cold_tt_redo: test_cluster_side_relmap_terminal.inc
 test_cluster_side_xact: $(top_builddir)/src/backend/cluster/cluster_wal_claim.o
-test_cluster_side_xact: test_cluster_side_clog_full.inc
+test_cluster_side_xact: test_cluster_side_clog_full.inc test_cluster_side_clog_witness.inc
 
 CLUSTER_SIDE_ONLINE_PLAN_TEST_O = test_cluster_side_online_plan.o
 $(CLUSTER_SIDE_ONLINE_PLAN_TEST_O): \
