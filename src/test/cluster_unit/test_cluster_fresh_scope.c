@@ -35,11 +35,13 @@
 #include "catalog/pg_extension.h"
 #include "catalog/pg_foreign_server_d.h"
 #include "catalog/pg_namespace.h"
+#include "catalog/pg_policy.h"
 #include "catalog/pg_type_d.h"
 #include "commands/comment.h"
 #include "commands/dbcommands.h"
 #include "commands/defrem.h"
 #include "commands/extension.h"
+#include "commands/policy.h"
 #include "commands/schemacmds.h"
 #include "commands/seclabel.h"
 #include "commands/user.h"
@@ -51,6 +53,7 @@
 #include "foreign/foreign.h"
 #include "miscadmin.h"
 #include "nodes/value.h"
+#include "parser/parse_node.h"
 #include "port/pg_crc32c.h"
 #include "storage/fd.h"
 #include "storage/large_object.h"
@@ -58,6 +61,7 @@
 #include "tcop/utility.h"
 #include "tcop/tcopprot.h"
 #include "utils/acl.h"
+#include "utils/array.h"
 #include "utils/rel.h"
 #include "../../backend/cluster/cluster_control_bootstrap_private.h"
 #include "unit_test.h"
@@ -7279,10 +7283,322 @@ UT_TEST(test_native_security_label_nonshared_object_type_routes_unchanged)
 	label_lookup_active = false;
 }
 
+/* Run original policy syntax/role helpers and native prefixes. Array/parser
+ * setup is controlled; the relation lookup jumps2 before any real lock. */
+static bool policy_expect_binding;
+static unsigned policy_lookups, policy_role_lookups, policy_arrays, policy_parses;
+static unsigned policy_unbound, policy_bad_boundary;
+static bool policy_explicit_role;
+static RangeVar policy_target;
+static RoleSpec policy_role;
+static ListCell policy_role_cell;
+static List policy_roles;
+static CreatePolicyStmt native_policy_create;
+static AlterPolicyStmt native_policy_alter;
+static RenameStmt native_policy_rename;
+static Node *policy_expected_statement;
+static ParseState policy_parse_states[2];
+static ArrayType policy_role_array;
+
+static void
+RangeVarCallbackForPolicy(const RangeVar *rv, Oid relid, Oid oldrelid, void *arg)
+{
+	(void)rv;
+	(void)relid;
+	(void)oldrelid;
+	(void)arg;
+	abort(); /* This callback must remain beyond the real lookup boundary. */
+}
+
+Oid
+get_rolespec_oid(const RoleSpec *role, bool missing_ok)
+{
+	policy_role_lookups++;
+	if (policy_expect_binding && utility_binds == 0)
+		policy_unbound++;
+	if (role != &policy_role || role->roletype != ROLESPEC_CSTRING
+		|| strcmp(role->rolename, "policy_role") != 0 || missing_ok)
+		policy_bad_boundary++;
+	return 700;
+}
+
+ArrayType *
+construct_array_builtin(Datum *elems, int nelems, Oid elmtype)
+{
+	policy_arrays++;
+	if (policy_expect_binding && utility_binds == 0)
+		policy_unbound++;
+	if (nelems != 1 || elmtype != OIDOID || elems == NULL
+		|| DatumGetObjectId(elems[0]) != (policy_explicit_role ? 700 : ACL_ID_PUBLIC))
+		policy_bad_boundary++;
+	return &policy_role_array;
+}
+
+ParseState *
+make_parsestate(ParseState *parent)
+{
+	policy_parses++;
+	if (policy_expect_binding && utility_binds == 0)
+		policy_unbound++;
+	if (parent != NULL)
+		policy_bad_boundary++;
+	return &policy_parse_states[(policy_parses - 1) % 2];
+}
+
+Oid
+RangeVarGetRelidExtended(const RangeVar *relation, LOCKMODE lockmode, uint32 flags,
+						 RangeVarGetRelidCallback callback, void *callback_arg)
+{
+	policy_lookups++;
+	if (policy_expect_binding && utility_binds == 0)
+		policy_unbound++;
+	if (relation != &policy_target || lockmode != AccessExclusiveLock || flags != 0
+		|| callback != RangeVarCallbackForPolicy || callback_arg != policy_expected_statement)
+		policy_bad_boundary++;
+	siglongjmp(boundary, 2);
+}
+
+#include "test_cluster_fresh_policy.inc"
+
+static void
+reset_native_policy(bool expect_binding, unsigned kind)
+{
+	reset_create_preflight();
+	policy_expect_binding = expect_binding;
+	policy_lookups = policy_role_lookups = policy_arrays = policy_parses = 0;
+	policy_unbound = policy_bad_boundary = 0;
+	policy_explicit_role = kind == 1 || kind == 3;
+	policy_target = (RangeVar){ .type = T_RangeVar, .relname = "policy_table" };
+	policy_role
+		= (RoleSpec){ .type = T_RoleSpec, .roletype = ROLESPEC_CSTRING, .rolename = "policy_role" };
+	policy_role_cell = (ListCell){ .ptr_value = &policy_role };
+	policy_roles
+		= (List){ .type = T_List, .length = 1, .max_length = 1, .elements = &policy_role_cell };
+	native_policy_create
+		= (CreatePolicyStmt){ .type = T_CreatePolicyStmt,
+							  .policy_name = "policy",
+							  .table = &policy_target,
+							  .cmd_name = "all",
+							  .permissive = true,
+							  .roles = policy_explicit_role ? &policy_roles : NIL };
+	native_policy_alter = (AlterPolicyStmt){ .type = T_AlterPolicyStmt,
+											 .policy_name = "policy",
+											 .table = &policy_target,
+											 .roles = policy_explicit_role ? &policy_roles : NIL };
+	native_policy_rename = (RenameStmt){ .type = T_RenameStmt,
+										 .renameType = OBJECT_POLICY,
+										 .relation = &policy_target,
+										 .subname = "policy",
+										 .newname = "renamed" };
+	policy_expected_statement = kind < 2   ? (Node *)&native_policy_create
+								: kind < 4 ? (Node *)&native_policy_alter
+										   : (Node *)&native_policy_rename;
+}
+
+static void
+native_policy_entry(unsigned kind)
+{
+	if (kind < 2)
+		(void)CreatePolicy(&native_policy_create);
+	else if (kind < 4)
+		(void)AlterPolicy(&native_policy_alter);
+	else
+		(void)rename_policy(&native_policy_rename);
+}
+
+UT_TEST(test_native_policy_changes_bind_before_role_setup_and_table_lock_in_all_profiles)
+{
+	for (unsigned kind = 0; kind < 5; kind++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_policy(binds, kind);
+			cluster_shared_catalog = (mode & 1) != 0;
+			utility_storage_mode = (mode & 2) != 0;
+			cluster_shared_config = (mode & 4) != 0;
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_policy_entry(kind);
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(policy_lookups, repeat + 1);
+				UT_ASSERT_EQ(policy_role_lookups, policy_explicit_role ? repeat + 1 : 0);
+				UT_ASSERT_EQ(policy_arrays, kind < 2 || kind == 3 ? repeat + 1 : 0);
+				UT_ASSERT_EQ(policy_parses, kind < 2 ? 2 * (repeat + 1) : 0);
+				UT_ASSERT_EQ(policy_unbound, 0);
+				UT_ASSERT_EQ(policy_bad_boundary, 0);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+			}
+		}
+	}
+}
+
+UT_TEST(test_native_policy_refusals_precede_role_setup_and_table_lock)
+{
+	for (unsigned kind = 0; kind < 5; kind++) {
+		for (unsigned failure = 0; failure < 5; failure++) {
+			bool allocated = failure == 0 || failure == 2;
+			int caught;
+
+			reset_native_policy(true, kind);
+			if (failure == 0)
+				utility_bind_ok = false;
+			else if (failure == 1 || failure == 2) {
+				if (failure == 2)
+					create_sql_entry(policy_expected_statement);
+				utility_in_child = true;
+			} else {
+				utility_current_xid = 401;
+				utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_policy_entry(kind);
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, failure == 0					? ERRCODE_DATA_CORRUPTED
+									 : failure == 1 || failure == 2 ? ERRCODE_FEATURE_NOT_SUPPORTED
+																	: ERRCODE_INTERNAL_ERROR);
+			UT_ASSERT_EQ(policy_lookups + policy_role_lookups + policy_arrays + policy_parses, 0);
+			UT_ASSERT_EQ(utility_xids, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, failure == 2 ? 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, allocated || failure == 3 ? 400 : InvalidTransactionId);
+			if (failure == 1 || failure == 2)
+				UT_ASSERT_STR_EQ(
+					error_message,
+					kind < 2 ? "shared catalog creation does not support subtransactions"
+							 : "shared catalog alteration does not support subtransactions");
+		}
+	}
+}
+
+UT_TEST(test_native_policy_context_guards_keep_nonshared_route)
+{
+	for (unsigned kind = 0; kind < 5; kind++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+
+			for (unsigned guard = 0; guard < 3; guard++) {
+				int caught;
+
+				reset_native_policy(binds, kind);
+				cluster_shared_catalog = (mode & 1) != 0;
+				utility_storage_mode = (mode & 2) != 0;
+				cluster_shared_config = (mode & 4) != 0;
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_policy_entry(kind);
+				UT_ASSERT_EQ(caught, binds ? 1 : 2);
+				UT_ASSERT_EQ(error_code, !binds		  ? 0
+										 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+													  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				UT_ASSERT_EQ(policy_lookups, binds ? 0 : 1);
+				UT_ASSERT_EQ(policy_bad_boundary, 0);
+				UT_ASSERT_EQ(utility_xids, 0);
+				UT_ASSERT_EQ(utility_prepares, 0);
+				if (binds)
+					UT_ASSERT_EQ(policy_role_lookups + policy_arrays + policy_parses, 0);
+			}
+		}
+	}
+}
+
+UT_TEST(test_native_policy_utility_warm_context_guards_preserve_binding)
+{
+	for (unsigned kind = 0; kind < 5; kind++) {
+		for (unsigned guard = 0; guard < 4; guard++) {
+			int caught;
+
+			reset_native_policy(true, kind);
+			create_sql_entry(policy_expected_statement);
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			XactReadOnly = guard == 1;
+			utility_parallel = guard == 2;
+			utility_recovery = guard == 3;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_policy_entry(kind);
+			UT_ASSERT_EQ(caught, guard ? 1 : 2);
+			UT_ASSERT_EQ(error_code, !guard		  ? 0
+									 : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+												  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT_EQ(policy_lookups, guard ? 0 : 1);
+			UT_ASSERT_EQ(policy_unbound, 0);
+			UT_ASSERT_EQ(policy_bad_boundary, 0);
+			UT_ASSERT_EQ(utility_prepares, guard ? 1 : 2);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			UT_ASSERT_EQ(utility_top_xid, 400);
+		}
+	}
+}
+
+UT_TEST(test_native_policy_create_retains_syntax_errors_before_allocation_and_valid_commands)
+{
+	const char *commands[] = { "all", "select", "insert", "update", "delete" };
+	const char *invalid_commands[] = { NULL, "unknown", "select", "delete", "insert" };
+	Node expression = { .type = T_A_Const };
+
+	for (unsigned mode = 0; mode < 8; mode++) {
+		for (unsigned invalid = 0; invalid < lengthof(invalid_commands); invalid++) {
+			int caught;
+
+			reset_native_policy(false, 0);
+			cluster_shared_catalog = (mode & 1) != 0;
+			utility_storage_mode = (mode & 2) != 0;
+			cluster_shared_config = (mode & 4) != 0;
+			native_policy_create.cmd_name = (char *)invalid_commands[invalid];
+			if (invalid == 2 || invalid == 3)
+				native_policy_create.with_check = &expression;
+			if (invalid == 4)
+				native_policy_create.qual = &expression;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				(void)CreatePolicy(&native_policy_create);
+			UT_ASSERT_EQ(caught, 1);
+			if (invalid < 2)
+				UT_ASSERT_STR_EQ(error_message, "unrecognized policy command");
+			else {
+				UT_ASSERT_EQ(error_code, ERRCODE_SYNTAX_ERROR);
+				UT_ASSERT_STR_EQ(error_message,
+								 invalid < 4 ? "WITH CHECK cannot be applied to SELECT or DELETE"
+											 : "only WITH CHECK expression allowed for INSERT");
+			}
+			UT_ASSERT_EQ(policy_lookups + policy_role_lookups + policy_arrays + policy_parses, 0);
+			UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+		}
+	}
+	for (unsigned command = 0; command < lengthof(commands); command++) {
+		int caught;
+
+		reset_native_policy(true, command % 2);
+		native_policy_create.cmd_name = (char *)commands[command];
+		caught = sigsetjmp(boundary, 1);
+		if (!caught)
+			(void)CreatePolicy(&native_policy_create);
+		UT_ASSERT_EQ(caught, 2);
+		UT_ASSERT_EQ(error_code, 0);
+		UT_ASSERT_EQ(policy_lookups, 1);
+		UT_ASSERT_EQ(policy_unbound, 0);
+		UT_ASSERT_EQ(policy_bad_boundary, 0);
+		UT_ASSERT_EQ(utility_xids, 1);
+		UT_ASSERT_EQ(utility_prepares, 1);
+		UT_ASSERT_EQ(utility_binds, 1);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(92);
+	UT_PLAN(97);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -7375,6 +7691,11 @@ main(void)
 	UT_RUN(test_native_security_label_utility_warm_context_guards_preserve_binding);
 	UT_RUN(test_native_security_label_original_shared_scope_matches_utility_refusal);
 	UT_RUN(test_native_security_label_nonshared_object_type_routes_unchanged);
+	UT_RUN(test_native_policy_changes_bind_before_role_setup_and_table_lock_in_all_profiles);
+	UT_RUN(test_native_policy_refusals_precede_role_setup_and_table_lock);
+	UT_RUN(test_native_policy_context_guards_keep_nonshared_route);
+	UT_RUN(test_native_policy_utility_warm_context_guards_preserve_binding);
+	UT_RUN(test_native_policy_create_retains_syntax_errors_before_allocation_and_valid_commands);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

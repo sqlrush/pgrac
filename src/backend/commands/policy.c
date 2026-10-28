@@ -8,6 +8,10 @@
  *
  * src/backend/commands/policy.c
  *
+ * PGRAC MODIFICATIONS
+ *    Preflight native policy changes before role work and table locks.
+ *    Author: SqlRush <sqlrush@gmail.com>
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -27,6 +31,10 @@
 #include "catalog/pg_authid.h"
 #include "catalog/pg_policy.h"
 #include "catalog/pg_type.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_mode.h"
+#include "cluster/cluster_tt_local.h"
+#endif
 #include "commands/policy.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
@@ -38,6 +46,9 @@
 #include "rewrite/rewriteManip.h"
 #include "rewrite/rowsecurity.h"
 #include "storage/lock.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "tcop/utility.h"
+#endif
 #include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
@@ -562,6 +573,37 @@ RemoveRoleFromObjectPolicy(Oid roleid, Oid classid, Oid policy_id)
 	return keep_policy;
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* Direct callers must bind before role catalog work or table locks. */
+static void
+PreflightClusterSharedPolicyWrite(bool create)
+{
+	ClusterCanonicalTxnBinding binding;
+	TransactionId current_xid;
+	const char *command = create ? "CREATE POLICY" : "ALTER POLICY";
+	const char *action = create ? "creation" : "alteration";
+
+	if (!cluster_shared_catalog || !cluster_storage_mode_enabled())
+		return;
+
+	PreventCommandIfReadOnly(command);
+	PreventCommandIfParallelMode(command);
+	PreventCommandDuringRecovery(command);
+	if (IsSubTransaction())
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("shared catalog %s does not support subtransactions", action)));
+	current_xid = GetCurrentTransactionIdIfAny();
+	if (TransactionIdIsValid(current_xid)
+		&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("shared catalog top-level transaction identity mismatch")));
+	if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("canonical ACTIVE publication failed before shared catalog %s", action)));
+}
+#endif
+
 /*
  * CreatePolicy -
  *	 handles the execution of the CREATE POLICY command.
@@ -613,6 +655,10 @@ CreatePolicy(CreatePolicyStmt *stmt)
 		ereport(ERROR,
 				(errcode(ERRCODE_SYNTAX_ERROR),
 				 errmsg("only WITH CHECK expression allowed for INSERT")));
+
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedPolicyWrite(true);
+#endif
 
 	/* Collect role ids */
 	role_oids = policy_role_list_to_array(stmt->roles, &nitems);
@@ -794,6 +840,10 @@ AlterPolicy(AlterPolicyStmt *stmt)
 	char		polcmd;
 	bool		polcmd_isnull;
 	int			i;
+
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedPolicyWrite(false);
+#endif
 
 	/* Parse role_ids */
 	if (stmt->roles != NULL)
@@ -1106,6 +1156,10 @@ rename_policy(RenameStmt *stmt)
 	SysScanDesc sscan;
 	HeapTuple	policy_tuple;
 	ObjectAddress address;
+
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedPolicyWrite(false);
+#endif
 
 	/* Get id of table.  Also handles permissions checks. */
 	table_id = RangeVarGetRelidExtended(stmt->relation, AccessExclusiveLock,
