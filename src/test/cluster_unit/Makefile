@@ -9186,9 +9186,11 @@ test_cluster_ctrc_delegation_close.inc: $(top_srcdir)/src/backend/cluster/cluste
 	mv $@.tmp $@
 
 test_cluster_ctrc_delegation_forward.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
-	awk '/^cluster_gcs_ctrc_dispatch_delegated_close\(/ { print "bool"; emit=1; found++ } \
+	awk '/^gcs_ctrc_dispatch_delegated_request\(/ { print "static bool"; emit=1; common++ } \
+	     /^cluster_gcs_ctrc_dispatch_delegated_close\(/ { print "bool"; emit=1; found++ } \
+	     /^cluster_gcs_ctrc_dispatch_delegated_certificate\(/ { print "bool"; emit=1; certificate++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
+	     END { if (found != 1 || common != 1 || certificate != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_ctrc_delegation_reply.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile

@@ -19456,8 +19456,8 @@ cluster_gcs_ctrc_dispatch_close(const ClusterCtrcCloseDispatch *dispatch)
 
 /* The existing background CLOSE family, for a retained immediate child.
  * HELLO connection counters and OPEN custody counters are distinct domains. */
-bool
-cluster_gcs_ctrc_dispatch_delegated_close(const ClusterCtrcDelegationCloseV1 *request)
+static bool
+gcs_ctrc_dispatch_delegated_request(const ClusterCtrcDelegationCloseV1 *request, bool certificate)
 {
 	ClusterSemanticAdmissionToken admission = { 0 };
 	ClusterUndoBlock0ResolvedRoot root;
@@ -19470,7 +19470,9 @@ cluster_gcs_ctrc_dispatch_delegated_close(const ClusterCtrcDelegationCloseV1 *re
 		| PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1;
 	bool dispatched = false;
 
-	if (request == NULL || !cluster_ctrc_delegation_close_encode_v1(request, bytes, sizeof(bytes))
+	if (request == NULL || !(certificate
+			? cluster_ctrc_delegation_certificate_encode_v1(request, bytes, sizeof(bytes))
+			: cluster_ctrc_delegation_close_encode_v1(request, bytes, sizeof(bytes)))
 		|| cluster_node_id < 0 || request->parent.node_id != (uint16)cluster_node_id
 		|| request->key.system_identifier != GetSystemIdentifier()
 		|| request->key.cluster_epoch != cluster_epoch_get_current()
@@ -19511,7 +19513,8 @@ cluster_gcs_ctrc_dispatch_delegated_close(const ClusterCtrcDelegationCloseV1 *re
 			&& root.root_generation == request->key.root_generation
 			&& request->key.root_descriptor_incarnation == root.root_generation
 			&& cluster_semantic_activation_recheck_r4_terminal_census(&admission)
-			&& cluster_ctrc_participant_delegated_close_matches_shared(request)
+			&& (certificate ? cluster_ctrc_participant_delegated_certificate_matches_shared(request)
+				: cluster_ctrc_participant_delegated_close_matches_shared(request))
 			&& cluster_semantic_activation_recheck_r4_terminal_census(&admission)) {
 			BufferTag route = GcsBlockCurrentMxRouteTagMake(request->request_id,
 				request->key.cluster_epoch, cluster_node_id, CLUSTER_CTRC_INTERNAL_ENDPOINT);
@@ -19528,6 +19531,18 @@ cluster_gcs_ctrc_dispatch_delegated_close(const ClusterCtrcDelegationCloseV1 *re
 	}
 	PG_END_TRY();
 	return dispatched;
+}
+
+bool
+cluster_gcs_ctrc_dispatch_delegated_close(const ClusterCtrcDelegationCloseV1 *request)
+{
+	return gcs_ctrc_dispatch_delegated_request(request, false);
+}
+
+bool
+cluster_gcs_ctrc_dispatch_delegated_certificate(const ClusterCtrcDelegationCloseV1 *request)
+{
+	return gcs_ctrc_dispatch_delegated_request(request, true);
 }
 
 static void
@@ -19953,6 +19968,11 @@ gcs_block_try_land_ctrc_reply(const ClusterICEnvelope *env, const void *payload)
 		gcs_block_land_root_subtree_reply(env, outer, page);
 		return true;
 	}
+
+	/* Wire6 is notification custody only. Consume its negative replies here;
+	 * no origin correlation, child completion or retirement is inferred. */
+	if (page[4] == CLUSTER_CTRC_DELEGATION_CERTIFICATE_WIRE_VERSION && page[5] == 0)
+		return true;
 
 	MemSet(&key, 0, sizeof(key));
 	MemSet(&identity, 0, sizeof(identity));
@@ -20454,7 +20474,7 @@ gcs_block_try_ctrc_forward136(const ClusterICEnvelope *env, const void *payload)
 {
 	ClusterCtrcSealRequestV1 request;
 	ClusterCtrcDelegationCloseV1 delegated_close;
-	bool delegated;
+	bool delegated, certificate;
 	ClusterCtrcTxnKeyV1 key;
 	ClusterCtrcParticipantIdentity identity;
 	ClusterCtrcLocalReleaseAckV1 ack;
@@ -20486,6 +20506,9 @@ gcs_block_try_ctrc_forward136(const ClusterICEnvelope *env, const void *payload)
 			&& env->payload_length != CLUSTER_CTRC_DELEGATION_CLOSE_V1_BYTES))
 		return false;
 	delegated = env->payload_length == CLUSTER_CTRC_DELEGATION_CLOSE_V1_BYTES;
+	certificate = delegated && ((const uint8 *)payload)[68]
+		== (uint8)CLUSTER_CTRC_DELEGATION_CERTIFICATE_WIRE_VERSION
+		&& ((const uint8 *)payload)[69] == 0;
 	MemSet(&delegated_close, 0, sizeof(delegated_close));
 	MemSet(&request, 0, sizeof(request));
 	MemSet(&key, 0, sizeof(key));
@@ -20501,9 +20524,13 @@ gcs_block_try_ctrc_forward136(const ClusterICEnvelope *env, const void *payload)
 		|| !cluster_gcs_block_family_on_data_plane())
 		return true;
 	if (delegated) {
-		if (!cluster_ctrc_delegation_close_decode_v1((const uint8 *)payload, env->payload_length,
-			GetSystemIdentifier(), (int32)env->source_node_id, cluster_node_id,
-			cluster_epoch_get_current(), &delegated_close))
+		if (!(certificate
+			? cluster_ctrc_delegation_certificate_decode_v1((const uint8 *)payload, env->payload_length,
+				GetSystemIdentifier(), (int32)env->source_node_id, cluster_node_id,
+				cluster_epoch_get_current(), &delegated_close)
+			: cluster_ctrc_delegation_close_decode_v1((const uint8 *)payload, env->payload_length,
+				GetSystemIdentifier(), (int32)env->source_node_id, cluster_node_id,
+				cluster_epoch_get_current(), &delegated_close)))
 			return true;
 		key = delegated_close.key;
 		request.request_id = delegated_close.request_id;
@@ -20512,7 +20539,7 @@ gcs_block_try_ctrc_forward136(const ClusterICEnvelope *env, const void *payload)
 		request.requester_backend_id = CLUSTER_CTRC_INTERNAL_ENDPOINT;
 		request.grant_generation = delegated_close.grant_generation;
 		request.seal_generation = delegated_close.seal_generation;
-		request.suboperation = CTRC_SEAL_CLOSE_AND_CLEAN;
+		request.suboperation = certificate ? CTRC_SEAL_CERTIFICATE_COMMITTED : CTRC_SEAL_CLOSE_AND_CLEAN;
 		request.participant_capability_record_generation
 			= delegated_close.receiver.capability_record_generation;
 	} else if (!cluster_ctrc_seal_request_decode((const uint8 *)payload, env->payload_length,
@@ -20585,14 +20612,15 @@ gcs_block_try_ctrc_forward136(const ClusterICEnvelope *env, const void *payload)
 						 * of the HELLO connection generation checked above. */
 						&& delegated_close.parent.capability_record_generation
 							== (uint32)admission.record_generation) {
-						result = cluster_ctrc_participant_delegated_close_shared(&delegated_close,
-							&first_reason);
-						if (result == CTRC_SEAL_REPLY_BLOCKED_RETAIN
+						result = certificate
+							? cluster_ctrc_participant_delegated_certificate_shared(&delegated_close, &first_reason)
+							: cluster_ctrc_participant_delegated_close_shared(&delegated_close, &first_reason);
+						if (!certificate && result == CTRC_SEAL_REPLY_BLOCKED_RETAIN
 							&& cluster_ctrc_participant_delegation_merge_observed_shared(&delegated_close)) {
 							result = CTRC_SEAL_REPLY_DELEGATION_MERGED;
 							first_reason = 0;
 						}
-						if (result == CTRC_SEAL_REPLY_PENDING_DRAIN
+						if (!certificate && result == CTRC_SEAL_REPLY_PENDING_DRAIN
 							&& cluster_ctrc_participant_delegated_subtree_ack_shared(&delegated_close, &subtree_ack)) {
 							result = CTRC_SEAL_REPLY_DELEGATION_SUBTREE_ACK;
 							first_reason = 0;

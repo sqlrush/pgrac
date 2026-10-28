@@ -195,6 +195,7 @@ reset_dispatch_fixture(void)
 	observe_enqueue_order = enqueue_order_exact = false;
 	dispatch_enqueue_hook = NULL;
 	driver_delegation_dispatch = NULL;
+	driver_certificate_dispatch = NULL;
 }
 
 static bool

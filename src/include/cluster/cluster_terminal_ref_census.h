@@ -42,6 +42,7 @@
 /* Explicit parent-bound CLOSE extension; wire2 keeps its origin-only meaning. */
 #define CLUSTER_CTRC_DELEGATION_CLOSE_V1_BYTES 216
 #define CLUSTER_CTRC_DELEGATION_CLOSE_WIRE_VERSION UINT16_C(3)
+#define CLUSTER_CTRC_DELEGATION_CERTIFICATE_WIRE_VERSION UINT16_C(6)
 #define CLUSTER_CTRC_SUBTREE_ACK_WIRE_VERSION UINT16_C(4)
 #define CLUSTER_CTRC_SUBTREE_ACK_BYTES 592
 #define CLUSTER_CTRC_ROOT_ACK_WIRE_VERSION UINT16_C(5)
@@ -489,6 +490,10 @@ typedef struct ClusterCtrcParticipantEntry {
 	/* Authenticated origin certificate notice retained while child custody
 	 * still exists. It is not a child completion or a release certificate. */
 	uint64 root_certificate_request_id;
+	/* Original accepted parent notice and outgoing per-child phase IDs.
+	 * Neither is a child completion or permission to retire custody. */
+	uint64 parent_certificate_request_id;
+	uint64 delegation_certificate_request_id[CLUSTER_CTRC_MAX_PARTICIPANTS];
 } ClusterCtrcParticipantEntry;
 
 typedef struct ClusterCtrcReceipt {
@@ -986,6 +991,16 @@ extern bool cluster_ctrc_delegation_close_encode_v1(const ClusterCtrcDelegationC
 extern bool cluster_ctrc_delegation_close_decode_v1(const uint8 *bytes, Size length,
 	uint64 authenticated_system_identifier, int32 envelope_source_node, int32 local_node,
 	uint64 current_epoch, ClusterCtrcDelegationCloseV1 *request_out);
+/* Same explicit216B fields, separate wire6 CERTIFICATE phase; wire3 is CLOSE only. */
+extern bool cluster_ctrc_delegation_certificate_encode_v1(const ClusterCtrcDelegationCloseV1 *request,
+	uint8 *bytes, Size length);
+extern bool cluster_ctrc_delegation_certificate_decode_v1(const uint8 *bytes, Size length,
+	uint64 authenticated_system_identifier, int32 envelope_source_node, int32 local_node,
+	uint64 current_epoch, ClusterCtrcDelegationCloseV1 *request_out);
+/* Retains the exact notice on already frozen accepted custody. Never reclaims
+ * receipts/edges or exports a positive certificate reply. */
+extern ClusterCtrcSealReplyResult cluster_ctrc_participant_delegated_certificate_shared(
+	const ClusterCtrcDelegationCloseV1 *request, uint16 *first_reason);
 /* Only an existing exact accepted parent can close local admission. Pending
  * parent/children remain registered; this entry cannot return a release ACK. */
 extern ClusterCtrcSealReplyResult cluster_ctrc_participant_delegated_close_shared(
@@ -1254,6 +1269,12 @@ extern bool cluster_ctrc_origin_begin_seal_shared(const ClusterCtrcTxnKeyV1 *key
 extern bool cluster_ctrc_origin_next_close_dispatch_shared(ClusterCtrcCloseDispatch *dispatch_out);
 extern bool cluster_ctrc_participant_next_delegated_close_shared(
 	ClusterCtrcDelegationCloseV1 *request_out);
+/* Same one-circumference cleaner budget: CLOSE before retained notice,
+ * CERTIFICATE after notice. The output phase is never inferred from an ID. */
+extern bool cluster_ctrc_participant_next_delegated_dispatch_shared(
+	ClusterCtrcDelegationCloseV1 *request_out, bool *certificate_out);
+extern bool cluster_ctrc_participant_delegated_certificate_matches_shared(
+	const ClusterCtrcDelegationCloseV1 *request);
 extern bool cluster_ctrc_participant_delegated_close_matches_shared(
 	const ClusterCtrcDelegationCloseV1 *request);
 extern bool cluster_ctrc_participant_delegated_close_snapshot_shared(uint64 request_id,
