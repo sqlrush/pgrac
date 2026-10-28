@@ -456,6 +456,50 @@ typedef struct ClusterRecoveryRelmapPendingAllNativeV1 {
 extern bool cluster_recovery_relmap_history_pending_all_native_v1(
 	ClusterRecoveryRelmapHistory *history, const ClusterRelmapV2Image *pending,
 	ClusterRecoveryRelmapPendingAllNativeV1 *out, ClusterRecoveryNativeInventoryDiag *diag);
+/* By-value native snapshots for EVERY distinct FULL birth page in the
+ * original complete inventory. Legacy lifecycle records remain in inputs,
+ * without an inferred era or a native-page certificate. */
+typedef struct ClusterRecoveryRelmapNativePageV1 {
+	ClusterRecoveryRelmapHistoryEntryV1 history;
+	uint64 record_ordinal;
+	XLogRecPtr read_lsn, end_lsn;
+	uint32 record_crc;
+	xl_clog_zeropage_full birth;
+	ClusterRelmapClogBaseV1 native;
+} ClusterRecoveryRelmapNativePageV1;
+typedef struct ClusterRecoveryRelmapPendingNativePagesV1 {
+	ClusterRecoveryRelmapPendingAllNativeV1 inputs;
+	uint32 page_count;
+} ClusterRecoveryRelmapPendingNativePagesV1;
+/* Derive all page keys internally, preflight the complete128 bound and
+ * original budget before native I/O, then retain every fd under this SAME
+ * episode. Reuse the query fd and compare all pages around the same original
+ * physical reread. Duplicate physical-page births refuse rather than choosing
+ * a generation. Old APIs retain attached custody; final history recheck also
+ * compares every held page. Entered refusal/ERROR is sticky, retains earlier
+ * fds/pins/debt and requires original destroy; no partial output or retry.
+ * No caller CF/native lock or critical section. Buffers must be disjoint
+ * from query, each other and all history storage before any clear.
+ * These are snapshots, not proof of applied birth, era/no-reuse/truncation,
+ * continuous lifetime, full dual-copy coverage or joint COMPLETE/release. */
+extern bool cluster_recovery_relmap_history_pending_native_pages_v1(
+	ClusterRecoveryRelmapHistory *history, const ClusterRelmapV2Image *pending,
+	ClusterRecoveryRelmapPendingNativePagesV1 *out, ClusterRecoveryNativeInventoryDiag *diag);
+/* Opt in to the original sealed SIDE plan's historical applied input for
+ * EVERY physical CLOG frame in the same original reread. Same whole-output,
+ * held-fd, budget and sticky-failure contract as pending_native_pages; no
+ * additional pass/read or mutation. Equal present bytes plus historical apply
+ * remain observations, not birth-era/no-reuse/truncation/continuous lifetime,
+ * native qualification or joint COMPLETE/release authority. */
+extern bool cluster_recovery_relmap_history_pending_applied_pages_v1(
+	ClusterRecoveryRelmapHistory *history, const ClusterRelmapV2Image *pending,
+	ClusterRecoveryRelmapPendingNativePagesV1 *out, ClusterRecoveryNativeInventoryDiag *diag);
+/* Copy an attached snapshot without I/O or rebasing. Original metadata and
+ * PAGE-current guards bracket the copy; final physical/native recheck remains
+ * mandatory. A bad ordinal/overlap is an ordinary precondition refusal. */
+extern bool cluster_recovery_relmap_history_native_page_v1(
+	ClusterRecoveryRelmapHistory *history, uint32 ordinal,
+	ClusterRecoveryRelmapNativePageV1 *out);
 extern void cluster_recovery_relmap_history_destroy_v1(ClusterRecoveryRelmapHistory **history);
 
 /* Borrow the original startup cold scope for two complete physical passes.
