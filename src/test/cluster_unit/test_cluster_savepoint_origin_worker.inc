@@ -22,6 +22,7 @@ int cluster_cr_chain_walk_max_steps = 4096;
 int MyProcPid = 1;
 MemoryContext TopMemoryContext = (MemoryContext)1;
 static int operation_worker_allocations;
+static int operation_worker_expected_logs;
 
 void *
 MemoryContextAllocZero(MemoryContext context pg_attribute_unused(), Size size)
@@ -38,8 +39,12 @@ pfree(void *pointer)
 }
 
 bool
-errstart(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
+errstart(int elevel, const char *domain pg_attribute_unused())
 {
+	if (elevel == LOG && operation_worker_expected_logs > 0) {
+		operation_worker_expected_logs--;
+		return false;
+	}
 	UT_ASSERT(false);
 	return false;
 }
@@ -2557,6 +2562,337 @@ UT_TEST(test_operation_worker_update_creation_cohort_is_private)
 		operation_worker_assert_reused_creation(&f[i], original.data, true, false);
 	}
 	UT_ASSERT_EQ(test_candidate_acquire_calls, 12);
+	UT_ASSERT_EQ(test_candidate_held_count, 0);
+	UT_ASSERT_EQ(operation_worker_allocations, allocations);
+}
+
+#define OPERATION_WORKER_LONG_RECORDS 24
+
+/* One DATA block, twenty-four distinct tuple creations and exact page edges.
+ * Modes are all discarded, all LIVE, and alternating even-row LIVE. */
+static void
+operation_worker_long_chain(OperationWorkerFixture *f, bool same, unsigned mode)
+{
+	UndoSlotDirEntry directory;
+	UndoRecordHeader record;
+	UndoItlHistoryTrailer history;
+	UndoOperationTrailer tail;
+	PGAlignedBlock prototype;
+	ClusterItlSlotData *head;
+	char tuple_bytes[60];
+	HeapTupleHeader tuple = (HeapTupleHeader)tuple_bytes;
+	Page page;
+
+	operation_worker_init(f, same);
+	memcpy(&directory, test_operation_page.data + BLCKSZ - sizeof(directory), sizeof(directory));
+	memcpy(prototype.data, test_operation_page.data + directory.record_offset,
+		   directory.record_length);
+	memcpy(&record, prototype.data, sizeof(record));
+	memcpy(&history, prototype.data + sizeof(record) + sizeof(UndoInsertPayload), sizeof(history));
+	memcpy(&tail, prototype.data + directory.record_length - sizeof(tail), sizeof(tail));
+	for (unsigned row = 0; row < OPERATION_WORKER_LONG_RECORDS; row++) {
+		char *bytes
+			= test_operation_page.data + sizeof(UndoBlockHeader) + row * directory.record_length;
+
+		record.target_offset = row + 2;
+		record.write_scn = 60 + row;
+		record.flags = (record.flags & ~UNDO_REC_FLAG_FIRST_IN_TX)
+					   | (row == 0 ? UNDO_REC_FLAG_FIRST_IN_TX : 0);
+		record.prev_uba = row == 0 ? (UBA)InvalidUba_init
+								   : uba_encode(TEST_RECORD_SEGMENT, 7, TEST_TT_OFFSET, row - 1);
+		memset(&history.entries[0].prior, 0, sizeof(history.entries[0].prior));
+		history.entries[0].prior.wrap = 8;
+		if (row != 0)
+			history.entries[0].prior = (ClusterItlSlotData){ .xid = TEST_ORIGIN_XID,
+															 .wrap = 8,
+															 .flags = ITL_FLAG_ACTIVE,
+															 .write_scn = 59 + row,
+															 .undo_segment_head = record.prev_uba };
+		history.entries[0].after_write_scn = record.write_scn;
+		tail.operation_sequence = 100 + row;
+		tail.effect_state = mode == 1 || (mode == 2 && row % 2 == 0)
+								? CLUSTER_SAVEPOINT_EFFECT_LIVE
+								: CLUSTER_SAVEPOINT_EFFECT_DISCARDED;
+		memcpy(bytes, prototype.data, directory.record_length);
+		memcpy(bytes, &record, sizeof(record));
+		memcpy(bytes + sizeof(record) + sizeof(UndoInsertPayload), &history, sizeof(history));
+		memcpy(bytes + directory.record_length - sizeof(tail), &tail, sizeof(tail));
+		directory.record_offset = sizeof(UndoBlockHeader) + row * directory.record_length;
+		directory.flags = record.flags;
+		memcpy(test_operation_page.data + BLCKSZ - (row + 1) * sizeof(directory), &directory,
+			   sizeof(directory));
+	}
+	((UndoBlockHeader *)test_operation_page.data)->slot_count = OPERATION_WORKER_LONG_RECORDS;
+	((UndoBlockHeader *)test_operation_page.data)->free_offset
+		= directory.record_offset + directory.record_length;
+	UT_ASSERT(directory.record_offset + directory.record_length
+			  < BLCKSZ - OPERATION_WORKER_LONG_RECORDS * sizeof(directory));
+	page = (Page)f->cr.source.data;
+	memcpy(tuple_bytes, PageGetItem(page, PageGetItemId(page, 1)), sizeof(tuple_bytes));
+	PageInit(page, BLCKSZ, CLUSTER_ITL_SPECIAL_SIZE);
+	((PageHeader)page)->pd_flags |= PD_HAS_ITL;
+	for (unsigned offset = 1; offset <= OPERATION_WORKER_LONG_RECORDS + 1; offset++) {
+		HeapTupleHeaderSetXmin(tuple, offset == 1 ? TEST_ORIGIN_XID - 5 : TEST_ORIGIN_XID + 1);
+		ItemPointerSet(&tuple->t_ctid, 23, offset);
+		tuple_bytes[59] = offset;
+		UT_ASSERT_EQ(PageAddItem(page, tuple_bytes, sizeof(tuple_bytes), offset, false, true),
+					 offset);
+	}
+	head = &ClusterPageGetItlSlots(page)[2];
+	*head = (ClusterItlSlotData){ .xid = TEST_ORIGIN_XID,
+								  .wrap = 8,
+								  .flags = ITL_FLAG_COMMITTED,
+								  .commit_scn = 65,
+								  .write_scn = 83,
+								  .undo_segment_head
+								  = uba_encode(TEST_RECORD_SEGMENT, 7, TEST_TT_OFFSET, 23) };
+	test_tt_slot.commit_scn = 65;
+}
+
+static ClusterR4CrBuildStepResult
+operation_worker_long_finish(OperationWorkerFixture *f)
+{
+	ClusterR4CrBuildStepResult step = CLUSTER_R4_CR_STEP_PENDING;
+
+	for (unsigned tick = 0; tick < 512 && step == CLUSTER_R4_CR_STEP_PENDING; tick++) {
+		int before = test_candidate_acquire_calls + test_candidate_poll_calls
+					 + test_candidate_release_calls + test_operation_release_poll_count;
+
+		step = operation_worker_step(f);
+		UT_ASSERT(test_candidate_acquire_calls + test_candidate_poll_calls
+					  + test_candidate_release_calls + test_operation_release_poll_count - before
+				  <= 1);
+		UT_ASSERT_EQ(test_candidate_wait_calls, 0);
+		UT_ASSERT_EQ(test_operation_release_wait_count, 0);
+	}
+	UT_ASSERT(step != CLUSTER_R4_CR_STEP_PENDING);
+	return step;
+}
+
+static void
+operation_worker_long_advance(OperationWorkerFixture *f, unsigned completed)
+{
+	OffsetNumber last = OPERATION_WORKER_LONG_RECORDS + 2 - completed;
+
+	UT_ASSERT(completed > 0 && completed < OPERATION_WORKER_LONG_RECORDS);
+	/* Release begin precedes the inverse; wait for its distinct tuple effect. */
+	for (unsigned tick = 0;
+		 tick < 512 && ItemIdIsUsed(PageGetItemId((Page)f->cr.source.data, last)); tick++)
+		UT_ASSERT_EQ(operation_worker_step(f), CLUSTER_R4_CR_STEP_PENDING);
+	UT_ASSERT(!ItemIdIsUsed(PageGetItemId((Page)f->cr.source.data, last)));
+	UT_ASSERT_EQ(f->extension.build_steps, completed);
+	UT_ASSERT_EQ(test_candidate_acquire_calls, completed * 3);
+	UT_ASSERT_EQ(test_candidate_release_calls, completed * 3);
+	UT_ASSERT_EQ(test_candidate_held_count, 0);
+}
+
+/* Literal survivor masks, not a second inverse or a decoded expectation. */
+static void
+operation_worker_long_expected(char expected[BLCKSZ], const char source[BLCKSZ], uint32 kept)
+{
+	ClusterItlSlotData *head;
+
+	memcpy(expected, source, BLCKSZ);
+	for (unsigned row = 0; row < OPERATION_WORKER_LONG_RECORDS; row++)
+		if ((kept & (1U << row)) == 0)
+			ItemIdSetUnused(PageGetItemId((Page)expected, row + 2));
+	head = &ClusterPageGetItlSlots((Page)expected)[2];
+	if (kept == 0) {
+		memset(head, 0, sizeof(*head));
+		head->wrap = 8;
+	} else if (kept == 0x555555U) {
+		head->flags = ITL_FLAG_ACTIVE;
+		head->commit_scn = InvalidScn;
+		head->write_scn = 82;
+		head->undo_segment_head = uba_encode(TEST_RECORD_SEGMENT, 7, TEST_TT_OFFSET, 22);
+	} else
+		UT_ASSERT_EQ(kept, 0xffffffU);
+}
+
+UT_TEST(test_operation_worker_long_discarded_chain_reaches_original_end)
+{
+	for (int same = 0; same < 2; same++) {
+		OperationWorkerFixture f;
+		PGAlignedBlock expected;
+		ClusterR4CrBuildStepResult step;
+		int allocations = operation_worker_allocations;
+
+		operation_worker_long_chain(&f, same, 0);
+		operation_worker_long_expected(expected.data, f.cr.source.data, 0);
+		step = operation_worker_long_finish(&f);
+		cluster_cr_build_on_holder_forget(0, 1000);
+		UT_ASSERT_EQ(step, CLUSTER_R4_CR_STEP_FULL);
+		UT_ASSERT_EQ(memcmp(expected.data, f.cr.source.data, BLCKSZ), 0);
+		UT_ASSERT_EQ(f.extension.build_steps, 24);
+		UT_ASSERT_EQ(test_candidate_acquire_calls, 72);
+		UT_ASSERT_EQ(test_candidate_release_calls, 72);
+		UT_ASSERT_EQ(test_candidate_held_count, 0);
+		UT_ASSERT_EQ(operation_worker_allocations, allocations);
+	}
+}
+
+UT_TEST(test_operation_worker_long_live_chain_preserves_literal_survivors)
+{
+	for (unsigned mode = 1; mode <= 2; mode++)
+		for (int same = 0; same < 2; same++) {
+			OperationWorkerFixture f;
+			PGAlignedBlock expected;
+			ClusterR4CrBuildStepResult step;
+			int allocations = operation_worker_allocations;
+
+			operation_worker_long_chain(&f, same, mode);
+			operation_worker_long_expected(expected.data, f.cr.source.data,
+										   mode == 1 ? 0xffffffU : 0x555555U);
+			step = operation_worker_long_finish(&f);
+			cluster_cr_build_on_holder_forget(0, 1000);
+			UT_ASSERT_EQ(step, CLUSTER_R4_CR_STEP_FULL);
+			UT_ASSERT_EQ(memcmp(expected.data, f.cr.source.data, BLCKSZ), 0);
+			UT_ASSERT_EQ(f.extension.build_steps, 24);
+			UT_ASSERT_EQ(test_candidate_acquire_calls, 72);
+			UT_ASSERT_EQ(test_candidate_release_calls, 72);
+			UT_ASSERT_EQ(test_candidate_held_count, 0);
+			UT_ASSERT_EQ(operation_worker_allocations, allocations);
+		}
+}
+
+UT_TEST(test_operation_worker_long_active_sample_never_promotes)
+{
+	OperationWorkerFixture f;
+	PGAlignedBlock expected;
+	ClusterR4CrBuildStepResult step;
+	int allocations = operation_worker_allocations;
+
+	operation_worker_long_chain(&f, false, 1);
+	operation_worker_long_expected(expected.data, f.cr.source.data, 0);
+	test_tt_slot.status = TT_SLOT_ACTIVE;
+	test_tt_slot.commit_scn = InvalidScn;
+	test_native_status = TRANSACTION_STATUS_IN_PROGRESS;
+	test_twophase_xid = TEST_ORIGIN_XID;
+	test_current_owner_available = true;
+	operation_worker_long_advance(&f, 1);
+	test_tt_slot.status = TT_SLOT_COMMITTED;
+	test_tt_slot.commit_scn = 65;
+	test_native_status = TRANSACTION_STATUS_COMMITTED;
+	step = operation_worker_long_finish(&f);
+	cluster_cr_build_on_holder_forget(0, 1000);
+	UT_ASSERT_EQ(step, CLUSTER_R4_CR_STEP_FULL);
+	UT_ASSERT_EQ(memcmp(expected.data, f.cr.source.data, BLCKSZ), 0);
+	UT_ASSERT_EQ(f.extension.build_steps, 24);
+	UT_ASSERT_EQ(test_candidate_acquire_calls, 72);
+	UT_ASSERT_EQ(test_candidate_release_calls, 72);
+	UT_ASSERT_EQ(operation_worker_allocations, allocations);
+}
+
+UT_TEST(test_operation_worker_long_chain_limit_is_exact)
+{
+	for (int limit = 23; limit <= 24; limit++) {
+		OperationWorkerFixture f;
+		PGAlignedBlock expected;
+		ClusterItlSlotData *head;
+		ClusterR4CrBuildStepResult step;
+		int allocations = operation_worker_allocations;
+
+		operation_worker_long_chain(&f, false, 0);
+		operation_worker_long_expected(expected.data, f.cr.source.data, 0);
+		if (limit == 23) {
+			*PageGetItemId((Page)expected.data, 2) = *PageGetItemId((Page)f.cr.source.data, 2);
+			head = &ClusterPageGetItlSlots((Page)expected.data)[2];
+			head->xid = TEST_ORIGIN_XID;
+			head->flags = ITL_FLAG_ACTIVE;
+			head->write_scn = 60;
+			head->undo_segment_head = uba_encode(TEST_RECORD_SEGMENT, 7, TEST_TT_OFFSET, 0);
+		}
+		cluster_cr_chain_walk_max_steps = limit;
+		step = operation_worker_long_finish(&f);
+		cluster_cr_build_on_holder_forget(0, 1000);
+		cluster_cr_chain_walk_max_steps = 4096;
+		UT_ASSERT_EQ(step, limit == 24 ? CLUSTER_R4_CR_STEP_FULL : CLUSTER_R4_CR_STEP_FAIL);
+		UT_ASSERT_EQ(f.reason, limit == 24 ? CLUSTER_CR_BUILD_NONE : CLUSTER_CR_BUILD_CHAIN_LIMIT);
+		UT_ASSERT_EQ(memcmp(expected.data, f.cr.source.data, BLCKSZ), 0);
+		UT_ASSERT_EQ(f.extension.build_steps, limit);
+		UT_ASSERT_EQ(test_candidate_acquire_calls, limit * 3);
+		UT_ASSERT_EQ(test_candidate_release_calls, limit * 3);
+		UT_ASSERT_EQ(test_candidate_held_count, 0);
+		UT_ASSERT_EQ(operation_worker_allocations, allocations);
+	}
+}
+
+UT_TEST(test_operation_worker_long_deep_history_refusals)
+{
+	for (unsigned fault = 0; fault < 4; fault++) {
+		OperationWorkerFixture f;
+		PGAlignedBlock remaining;
+		UndoSlotDirEntry directory;
+		UndoRecordHeader *record;
+		UndoOperationTrailer tail;
+		UndoItlHistoryTrailer history;
+		char *body;
+		ClusterR4CrBuildStepResult step;
+		int allocations = operation_worker_allocations;
+
+		operation_worker_long_chain(&f, false, 0);
+		operation_worker_long_advance(&f, 16);
+		memcpy(&directory, test_operation_page.data + BLCKSZ - 8 * sizeof(directory),
+			   sizeof(directory));
+		record = (UndoRecordHeader *)(test_operation_page.data + directory.record_offset);
+		body = (char *)(record + 1);
+		memcpy(&tail, body + record->payload_length - sizeof(tail), sizeof(tail));
+		if (fault == 0)
+			tail.operation_sequence = 108;
+		else if (fault == 1) {
+			directory.record_length = 0;
+			memcpy(test_operation_page.data + BLCKSZ - 8 * sizeof(directory), &directory,
+				   sizeof(directory));
+		} else if (fault == 2) {
+			memcpy(&history, body + sizeof(UndoInsertPayload), sizeof(history));
+			history.entries[0].prior.undo_segment_head
+				= uba_encode(TEST_RECORD_SEGMENT, 7, TEST_TT_OFFSET, 23);
+			memcpy(body + sizeof(UndoInsertPayload), &history, sizeof(history));
+		} else
+			tail.canonical_segment_generation++;
+		memcpy(body + record->payload_length - sizeof(tail), &tail, sizeof(tail));
+		if (fault == 2)
+			operation_worker_long_advance(&f, 17);
+		memcpy(remaining.data, f.cr.source.data, BLCKSZ);
+		operation_worker_expected_logs = fault == 1 ? 1 : 0;
+		step = operation_worker_long_finish(&f);
+		cluster_cr_build_on_holder_forget(0, 1000);
+		UT_ASSERT_EQ(operation_worker_expected_logs, 0);
+		UT_ASSERT_EQ(step, CLUSTER_R4_CR_STEP_FAIL);
+		UT_ASSERT_EQ(f.reason,
+					 fault == 1 ? CLUSTER_CR_BUILD_SNAPSHOT_TOO_OLD : CLUSTER_CR_BUILD_BAD_UNDO);
+		UT_ASSERT_EQ(memcmp(remaining.data, f.cr.source.data, BLCKSZ), 0);
+		UT_ASSERT_EQ(f.extension.build_steps, fault == 2 ? 18 : 17);
+		UT_ASSERT_EQ(test_candidate_held_count, 0);
+		UT_ASSERT_EQ(operation_worker_allocations, allocations);
+	}
+}
+
+UT_TEST(test_operation_worker_long_cohort_has_private_progress)
+{
+	OperationWorkerFixture f[2];
+	PGAlignedBlock expected;
+	ClusterR4CrBuildStepResult step[2] = { CLUSTER_R4_CR_STEP_PENDING, CLUSTER_R4_CR_STEP_PENDING };
+	int allocations = operation_worker_allocations;
+
+	operation_worker_long_chain(&f[0], false, 2);
+	f[1] = f[0];
+	f[1].extension.slot_generation++;
+	f[1].extension.owner.builder_incarnation++;
+	operation_worker_long_expected(expected.data, f[0].cr.source.data, 0x555555U);
+	test_operation_worker_current_busy = true;
+	for (unsigned tick = 0; tick < 1000; tick++)
+		for (unsigned i = 0; i < 2; i++)
+			if (step[i] == CLUSTER_R4_CR_STEP_PENDING)
+				step[i] = operation_worker_step_at(&f[i], i);
+	for (unsigned i = 0; i < 2; i++) {
+		cluster_cr_build_on_holder_forget(i, 1000 + i);
+		UT_ASSERT_EQ(step[i], CLUSTER_R4_CR_STEP_FULL);
+		UT_ASSERT_EQ(memcmp(expected.data, f[i].cr.source.data, BLCKSZ), 0);
+		UT_ASSERT_EQ(f[i].extension.build_steps, 24);
+	}
+	UT_ASSERT_EQ(test_candidate_acquire_calls, 144);
+	UT_ASSERT_EQ(test_candidate_release_calls, 144);
 	UT_ASSERT_EQ(test_candidate_held_count, 0);
 	UT_ASSERT_EQ(operation_worker_allocations, allocations);
 }

@@ -200,7 +200,7 @@ static int test_candidate_wait_calls;
 static int test_candidate_wakes_before_terminal;
 static uint64 test_vis_evidence[CLUSTER_VIS_METRIC_COUNT];
 static int test_candidate_exit_hooks_ensure_calls;
-static uint32 test_candidate_acquire_segments[16];
+static uint32 test_candidate_acquire_segments[144];
 static int test_candidate_held_count;
 static int test_candidate_max_held_count;
 static int test_candidate_extract_calls;
@@ -432,13 +432,23 @@ cluster_undo_get_record(UBA uba, void *out_buffer, size_t buffer_size)
 	if (test_operation_worker_enabled) {
 		uint32 segment, block;
 		uint16 tt, row;
+		UndoBlockHeader header;
 		UndoSlotDirEntry slot;
+		uint32 directory;
 
-		if (!uba_decode_record(uba, &segment, &block, &tt, &row) || block != 7 || row > 1)
+		memcpy(&header, test_operation_page.data, sizeof(header));
+		if (!uba_decode_record(uba, &segment, &block, &tt, &row) || block != 7
+			|| header.slot_count == 0
+			|| header.slot_count > (BLCKSZ - sizeof(header)) / sizeof(slot)
+			|| row >= header.slot_count)
 			return 0;
+		directory = BLCKSZ - (uint32)header.slot_count * sizeof(slot);
 		memcpy(&slot, test_operation_page.data + BLCKSZ - ((uint32)row + 1) * sizeof(slot),
 			   sizeof(slot));
-		if (slot.record_length > buffer_size)
+		if (header.free_offset < sizeof(header) || header.free_offset > directory
+			|| slot.record_offset < sizeof(header) || slot.record_offset > header.free_offset
+			|| slot.record_length > header.free_offset - slot.record_offset
+			|| slot.record_length > buffer_size)
 			return 0;
 		memcpy(out_buffer, test_operation_page.data + slot.record_offset, slot.record_length);
 		return slot.record_length;
@@ -7605,7 +7615,7 @@ UT_TEST(test_retained_slot_identity_does_not_escape_original_final_fences)
 int
 main(void)
 {
-	UT_PLAN(341);
+	UT_PLAN(347);
 	UT_RUN(test_operation_worker_real_builder_yields_before_visibility);
 	UT_RUN(test_operation_worker_real_origin_completes_private_inverse);
 	UT_RUN(test_operation_worker_pending_current_is_bounded_and_counts_once);
@@ -7672,6 +7682,12 @@ main(void)
 	UT_RUN(test_operation_worker_unkept_update_removes_reused_creation);
 	UT_RUN(test_operation_worker_update_creation_witness_mismatch_refuses);
 	UT_RUN(test_operation_worker_update_creation_cohort_is_private);
+	UT_RUN(test_operation_worker_long_discarded_chain_reaches_original_end);
+	UT_RUN(test_operation_worker_long_live_chain_preserves_literal_survivors);
+	UT_RUN(test_operation_worker_long_active_sample_never_promotes);
+	UT_RUN(test_operation_worker_long_chain_limit_is_exact);
+	UT_RUN(test_operation_worker_long_deep_history_refusals);
+	UT_RUN(test_operation_worker_long_cohort_has_private_progress);
 
 	UT_RUN(test_operation_poll_does_not_complete_inline);
 	UT_RUN(test_operation_poll_stages_outputs);
