@@ -464,6 +464,13 @@ DropTableSpace(DropTableSpaceStmt *stmt)
 	char	   *detail;
 	char	   *detail_log;
 
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_config || cluster_shared_catalog)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("CREATE/DROP TABLESPACE is not supported in shared mode"),
+						errdetail("PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED")));
+#endif
+
 	/*
 	 * Find the target tuple
 	 */

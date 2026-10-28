@@ -368,6 +368,8 @@ cluster_tt_local_prepare_canonical_active(TransactionId xid, ClusterCanonicalTxn
 	return true;
 }
 
+static bool tablespace_drop_scope_lookup_active;
+static unsigned tablespace_drop_scope_lookups, tablespace_drop_scope_bad_lookup;
 static bool tablespace_options_lookup_active, tablespace_options_expect_binding;
 static unsigned tablespace_options_lookups, tablespace_options_unbound;
 static unsigned tablespace_options_bad_lookup;
@@ -6571,6 +6573,12 @@ static unsigned role_rename_lookups, role_rename_unbound, role_rename_bad_lookup
 Relation
 table_open(Oid relationId, LOCKMODE lockmode)
 {
+	if (tablespace_drop_scope_lookup_active) {
+		tablespace_drop_scope_lookups++;
+		if (relationId != TableSpaceRelationId || lockmode != RowExclusiveLock)
+			tablespace_drop_scope_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before the real tablespace catalog lock/query. */
+	}
 	if (type_mutation_scope_lookup_active) {
 		type_mutation_scope_lookups++;
 		type_mutation_scope_lookup_kind = 2;
@@ -20437,10 +20445,159 @@ UT_TEST(test_native_cluster_scope_preserves_original_option_error_precedence)
 	cluster_scope_lookup_active = false;
 }
 
+/* Actual native DROP TABLESPACE entry stops before its first catalog lock.
+ * The name initializer and all original declarations remain in the prefix. */
+#include "test_cluster_fresh_tablespace_drop_scope.inc"
+static DropTableSpaceStmt native_tablespace_drop_scope_statement;
+static RangeVar tablespace_drop_scope_warm_relation;
+static AlterObjectSchemaStmt tablespace_drop_scope_warm_statement;
+
+static void
+reset_native_tablespace_drop_scope(unsigned form)
+{
+	static const char *const names[]
+		= { "pg_undo", "pg_default", "pg_global", "native_tablespace", "other_tablespace" };
+
+	reset_create_preflight();
+	tablespace_drop_scope_lookup_active = true;
+	tablespace_drop_scope_lookups = tablespace_drop_scope_bad_lookup = 0;
+	native_tablespace_drop_scope_statement
+		= (DropTableSpaceStmt){ .type = T_DropTableSpaceStmt,
+								.tablespacename = (char *)names[form / 2],
+								.missing_ok = (form & 1) != 0 };
+	tablespace_drop_scope_warm_relation
+		= (RangeVar){ .type = T_RangeVar, .relname = "supported_warm_table" };
+	tablespace_drop_scope_warm_statement
+		= (AlterObjectSchemaStmt){ .type = T_AlterObjectSchemaStmt,
+								   .objectType = OBJECT_TABLE,
+								   .relation = &tablespace_drop_scope_warm_relation,
+								   .newschema = "supported_warm_destination",
+								   .missing_ok = false };
+}
+
+static void
+native_tablespace_drop_scope_entry(void)
+{
+	DropTableSpace(&native_tablespace_drop_scope_statement);
+}
+
+static void
+assert_native_tablespace_drop_scope_result(bool blocked, int caught)
+{
+	UT_ASSERT_EQ(caught, blocked ? 1 : 2);
+	UT_ASSERT_EQ(error_code, blocked ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+	if (blocked) {
+		UT_ASSERT_STR_EQ(error_message, "CREATE/DROP TABLESPACE is not supported in shared mode");
+		UT_ASSERT_STR_EQ(error_detail,
+						 "PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+	}
+	UT_ASSERT_EQ(tablespace_drop_scope_lookups, blocked ? 0 : 1);
+	UT_ASSERT_EQ(tablespace_drop_scope_bad_lookup, 0);
+}
+
+UT_TEST(test_native_tablespace_drop_scope_matches_utility_before_catalog_lock)
+{
+	for (unsigned form = 0; form < 10; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool blocked = (mode & 5) != 0;
+			int caught;
+
+			reset_native_tablespace_drop_scope(form);
+			set_native_operator_mode(mode);
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				create_sql_entry((Node *)&native_tablespace_drop_scope_statement);
+			UT_ASSERT_EQ(caught, blocked ? 1 : 0);
+			UT_ASSERT_EQ(error_code, blocked ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+			if (blocked) {
+				UT_ASSERT_STR_EQ(error_message,
+								 "CREATE/DROP TABLESPACE is not supported in shared mode");
+				UT_ASSERT_STR_EQ(error_detail,
+								 "PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+			}
+			UT_ASSERT_EQ(
+				tablespace_drop_scope_lookups + utility_xids + utility_prepares + utility_binds, 0);
+			reset_error();
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_tablespace_drop_scope_entry();
+			assert_native_tablespace_drop_scope_result(blocked, caught);
+			UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			UT_ASSERT_EQ(utility_top_xid, InvalidTransactionId);
+		}
+	}
+	tablespace_drop_scope_lookup_active = false;
+}
+
+UT_TEST(test_native_tablespace_drop_scope_precedes_context_child_top_and_publication)
+{
+	for (unsigned form = 0; form < 10; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			for (unsigned fault = 0; fault < 7; fault++) {
+				int caught;
+
+				reset_native_tablespace_drop_scope(form);
+				set_native_operator_mode(mode);
+				XactReadOnly = fault == 0;
+				utility_parallel = fault == 1;
+				utility_recovery = fault == 2;
+				utility_in_child = fault == 3;
+				if (fault == 4 || fault == 5) {
+					utility_current_xid = 401;
+					utility_top_xid = fault == 4 ? 400 : InvalidTransactionId;
+				}
+				utility_bind_ok = fault != 6;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_tablespace_drop_scope_entry();
+				assert_native_tablespace_drop_scope_result((mode & 5) != 0, caught);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+				UT_ASSERT_EQ(utility_top_xid, fault == 4 ? 400 : InvalidTransactionId);
+				UT_ASSERT_EQ(utility_current_xid,
+							 fault == 4 || fault == 5 ? 401 : InvalidTransactionId);
+			}
+		}
+	}
+	tablespace_drop_scope_lookup_active = false;
+}
+
+UT_TEST(test_native_tablespace_drop_scope_preserves_existing_supported_top_binding)
+{
+	for (unsigned form = 0; form < 10; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			for (unsigned fault = 0; fault < 5; fault++) {
+				int caught;
+
+				reset_native_tablespace_drop_scope(form);
+				create_sql_entry((Node *)&tablespace_drop_scope_warm_statement);
+				UT_ASSERT_EQ(utility_xids, 1);
+				UT_ASSERT_EQ(utility_prepares, 1);
+				UT_ASSERT_EQ(utility_binds, 1);
+				set_native_operator_mode(mode);
+				XactReadOnly = fault == 0;
+				utility_parallel = fault == 1;
+				utility_recovery = fault == 2;
+				utility_in_child = fault == 3;
+				utility_bind_ok = fault != 4;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_tablespace_drop_scope_entry();
+				assert_native_tablespace_drop_scope_result((mode & 5) != 0, caught);
+				UT_ASSERT_EQ(utility_xids, 1);
+				UT_ASSERT_EQ(utility_prepares, 1);
+				UT_ASSERT_EQ(utility_binds, 1);
+				UT_ASSERT_EQ(utility_top_xid, 400);
+				UT_ASSERT_EQ(utility_current_xid, 400);
+			}
+		}
+	}
+	tablespace_drop_scope_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(325);
+	UT_PLAN(328);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -20768,6 +20925,9 @@ main(void)
 	UT_RUN(test_native_cluster_scope_precedes_context_child_top_and_publication);
 	UT_RUN(test_native_cluster_scope_preserves_existing_supported_top_binding);
 	UT_RUN(test_native_cluster_scope_preserves_original_option_error_precedence);
+	UT_RUN(test_native_tablespace_drop_scope_matches_utility_before_catalog_lock);
+	UT_RUN(test_native_tablespace_drop_scope_precedes_context_child_top_and_publication);
+	UT_RUN(test_native_tablespace_drop_scope_preserves_existing_supported_top_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
