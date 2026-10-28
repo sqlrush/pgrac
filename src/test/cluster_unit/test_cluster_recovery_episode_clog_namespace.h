@@ -121,4 +121,5 @@
 #define pgstat_count_slru_page_zeroed d3_episode_clog_pgstat_count_slru_page_zeroed
 #define pgstat_count_slru_truncate d3_episode_clog_pgstat_count_slru_truncate
 #define pgstat_get_slru_index d3_episode_clog_pgstat_get_slru_index
+#define ShmemVariableCache d3_episode_clog_ShmemVariableCache
 #endif

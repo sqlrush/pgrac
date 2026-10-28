@@ -78,6 +78,9 @@ typedef struct ClusterRelmapClogBaseV1 {
 	ino_t inode;
 	off_t size;
 	uint8 image[BLCKSZ];
+	/* Raw local retention input, never a FullXid era or foreign horizon. */
+	bool truncation_horizon_observed;
+	TransactionId oldest_clog_xid;
 } ClusterRelmapClogBaseV1;
 typedef struct ClusterRelmapClogBaseHandleV1 ClusterRelmapClogBaseHandleV1;
 /* Start with *held NULL. Subsequent reads require the exact original source,
@@ -89,6 +92,10 @@ typedef struct ClusterRelmapClogBaseHandleV1 ClusterRelmapClogBaseHandleV1;
  * Shared mutation sequences also reject writes by other backends of this
  * postmaster and refuse observations while a native attempt is in progress.
  * Saturation refuses; normal/ERROR completion never restores an old sequence.
+ * Own-origin reads also save the raw oldestClogXid under the original native
+ * truncation lock and require it unchanged within the read and held baseline.
+ * Foreign horizons stay unobserved/zero; even an observed local raw value
+ * does not prove a FullXid era, no-reuse interval or truncation authority.
  * This does not exclude inter-instance writes or certify physical lifetime.
  * Missing/short/aliased files refuse. IN_PROGRESS stays IN_PROGRESS.
  * No caller native/CF lock or critical section; output/held/source are
