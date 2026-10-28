@@ -30,6 +30,7 @@
 #include "catalog/index.h"
 #include "catalog/namespace.h"
 #include "catalog/objectaddress.h"
+#include "catalog/pg_aggregate.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_control.h"
@@ -7788,6 +7789,10 @@ static unsigned opclass_entry_kind, opclass_lookups, opclass_bad_lookup, opclass
 static List opclass_names;
 static char *opclass_amname;
 
+static bool aggregate_lookup_active, aggregate_expect_binding;
+static unsigned aggregate_lookups, aggregate_unbound, aggregate_bad_lookup;
+static List aggregate_names;
+
 static bool operator_lookup_active;
 static unsigned operator_entry_kind, operator_lookups, operator_bad_lookup, operator_lookup_kind;
 static List operator_names;
@@ -7796,6 +7801,14 @@ static ObjectWithArgs native_operator_args;
 Oid
 QualifiedNameGetCreationNamespace(List *names, char **objname)
 {
+	if (aggregate_lookup_active) {
+		aggregate_lookups++;
+		if (aggregate_expect_binding && utility_binds == 0)
+			aggregate_unbound++;
+		if (names != &aggregate_names || objname == NULL)
+			aggregate_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before the real aggregate namespace query. */
+	}
 	if (opclass_lookup_active) {
 		opclass_lookups++;
 		opclass_lookup_kind = 1;
@@ -10444,10 +10457,197 @@ UT_TEST(test_native_opclass_scope_refusal_preserves_existing_top_binding)
 	opclass_lookup_active = false;
 }
 
+/* The actual aggregate prefix stops before its namespace query. Argument,
+ * oldstyle/replace, function, ACL and catalog work remain beyond this boundary. */
+#include "test_cluster_fresh_aggregate.inc"
+static ParseState aggregate_parse_state;
+static String aggregate_name_nodes[2];
+static ListCell aggregate_name_cells[2], aggregate_arg_cells[2], aggregate_input_cell;
+static List aggregate_args, aggregate_inputs;
+static TypeName aggregate_input_type;
+static FunctionParameter aggregate_input;
+static Integer aggregate_direct_args;
+static DefineStmt native_aggregate_stmt;
+
+static void
+reset_native_aggregate(bool expect_binding, unsigned form)
+{
+	reset_create_preflight();
+	aggregate_lookup_active = true;
+	aggregate_expect_binding = expect_binding;
+	aggregate_lookups = aggregate_unbound = aggregate_bad_lookup = 0;
+	aggregate_name_nodes[0] = (String){ .type = T_String, .sval = "aggregate" };
+	aggregate_name_nodes[1] = (String){ .type = T_String, .sval = "schema" };
+	aggregate_name_cells[0].ptr_value = &aggregate_name_nodes[form & 1 ? 1 : 0];
+	aggregate_name_cells[1].ptr_value = &aggregate_name_nodes[0];
+	aggregate_names = (List){ .type = T_List,
+							  .length = form & 1 ? 2 : 1,
+							  .max_length = 2,
+							  .elements = aggregate_name_cells };
+	aggregate_input_type = (TypeName){ .type = T_TypeName, .typeOid = INT4OID };
+	aggregate_input = (FunctionParameter){ .type = T_FunctionParameter,
+										   .name = "input",
+										   .argType = &aggregate_input_type,
+										   .mode = FUNC_PARAM_IN };
+	aggregate_input_cell.ptr_value = &aggregate_input;
+	aggregate_inputs
+		= (List){ .type = T_List, .length = 1, .max_length = 1, .elements = &aggregate_input_cell };
+	aggregate_direct_args = (Integer){ .type = T_Integer, .ival = -1 };
+	aggregate_arg_cells[0].ptr_value = &aggregate_inputs;
+	aggregate_arg_cells[1].ptr_value = &aggregate_direct_args;
+	aggregate_args
+		= (List){ .type = T_List, .length = 2, .max_length = 2, .elements = aggregate_arg_cells };
+	native_aggregate_stmt = (DefineStmt){ .type = T_DefineStmt,
+										  .kind = OBJECT_AGGREGATE,
+										  .defnames = &aggregate_names,
+										  .args = form & 2 ? NIL : &aggregate_args,
+										  .oldstyle = (form & 2) != 0,
+										  .replace = (form & 1) != 0 };
+}
+
+static void
+native_aggregate_entry(void)
+{
+	(void)DefineAggregate(&aggregate_parse_state, native_aggregate_stmt.defnames,
+						  native_aggregate_stmt.args, native_aggregate_stmt.oldstyle,
+						  native_aggregate_stmt.definition, native_aggregate_stmt.replace);
+}
+
+UT_TEST(test_native_aggregate_binds_before_namespace_query_in_all_profiles)
+{
+	for (unsigned form = 0; form < 4; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_aggregate(binds, form);
+			set_native_operator_mode(mode);
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_aggregate_entry();
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(aggregate_lookups, repeat + 1);
+				UT_ASSERT_EQ(aggregate_unbound, 0);
+				UT_ASSERT_EQ(aggregate_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	aggregate_lookup_active = false;
+}
+
+UT_TEST(test_native_aggregate_refuses_before_query_on_publication_child_and_top_errors)
+{
+	for (unsigned form = 0; form < 4; form++) {
+		for (unsigned failure = 0; failure < 5; failure++) {
+			bool allocated = failure == 0 || failure == 2;
+			int caught;
+
+			reset_native_aggregate(true, form);
+			if (failure == 0)
+				utility_bind_ok = false;
+			else if (failure == 1 || failure == 2) {
+				if (failure == 2)
+					create_sql_entry((Node *)&native_aggregate_stmt);
+				utility_in_child = true;
+			} else {
+				utility_current_xid = 401;
+				utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_aggregate_entry();
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, failure == 0  ? ERRCODE_DATA_CORRUPTED
+									 : failure < 3 ? ERRCODE_FEATURE_NOT_SUPPORTED
+												   : ERRCODE_INTERNAL_ERROR);
+			UT_ASSERT_STR_EQ(
+				error_message,
+				failure == 0  ? "canonical ACTIVE publication failed before shared catalog creation"
+				: failure < 3 ? "shared catalog creation does not support subtransactions"
+							  : "shared catalog top-level transaction identity mismatch");
+			UT_ASSERT_EQ(aggregate_lookups, 0);
+			UT_ASSERT_EQ(aggregate_unbound + aggregate_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_xids, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, failure == 2 ? 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, allocated || failure == 3 ? 400 : InvalidTransactionId);
+		}
+	}
+	aggregate_lookup_active = false;
+}
+
+UT_TEST(test_native_aggregate_context_guards_keep_nonshared_route)
+{
+	for (unsigned form = 0; form < 4; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+
+			for (unsigned guard = 0; guard < 3; guard++) {
+				int caught;
+
+				reset_native_aggregate(binds, form);
+				set_native_operator_mode(mode);
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_aggregate_entry();
+				UT_ASSERT_EQ(caught, binds ? 1 : 2);
+				UT_ASSERT_EQ(error_code, !binds		  ? 0
+										 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+													  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				UT_ASSERT_EQ(aggregate_lookups, binds ? 0 : 1);
+				UT_ASSERT_EQ(aggregate_unbound + aggregate_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	aggregate_lookup_active = false;
+}
+
+UT_TEST(test_native_aggregate_utility_warm_guards_preserve_binding)
+{
+	for (unsigned form = 0; form < 4; form++) {
+		for (unsigned guard = 0; guard < 4; guard++) {
+			int caught;
+
+			reset_native_aggregate(true, form);
+			create_sql_entry((Node *)&native_aggregate_stmt);
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			XactReadOnly = guard == 1;
+			utility_parallel = guard == 2;
+			utility_recovery = guard == 3;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_aggregate_entry();
+			UT_ASSERT_EQ(caught, guard ? 1 : 2);
+			UT_ASSERT_EQ(error_code, !guard		  ? 0
+									 : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+												  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT_EQ(aggregate_lookups, guard ? 0 : 1);
+			UT_ASSERT_EQ(aggregate_unbound + aggregate_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_prepares, guard ? 1 : 2);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			UT_ASSERT_EQ(utility_top_xid, 400);
+		}
+	}
+	aggregate_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(152);
+	UT_PLAN(156);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -10600,6 +10800,10 @@ main(void)
 	UT_RUN(test_native_opclass_scope_matches_utility_before_lookup_or_binding);
 	UT_RUN(test_native_opclass_scope_refusal_precedes_context_child_top_and_publication);
 	UT_RUN(test_native_opclass_scope_refusal_preserves_existing_top_binding);
+	UT_RUN(test_native_aggregate_binds_before_namespace_query_in_all_profiles);
+	UT_RUN(test_native_aggregate_refuses_before_query_on_publication_child_and_top_errors);
+	UT_RUN(test_native_aggregate_context_guards_keep_nonshared_route);
+	UT_RUN(test_native_aggregate_utility_warm_guards_preserve_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
