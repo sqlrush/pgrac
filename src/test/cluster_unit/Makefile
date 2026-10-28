@@ -3576,6 +3576,7 @@ test_cluster_recovery_consumed_inputs.o: $(top_srcdir)/src/backend/cluster/clust
 		-Drf_side_online_plan_clog_applied_v1=test_episode_consumed_cold_applied -c $< -o $@
 
 test_cluster_recovery_native_inputs: test_cluster_recovery_consumed_inputs.o test_cluster_recovery_episode_consumed_pages.inc
+test_cluster_recovery_native_inputs: test_cluster_recovery_episode_page_history.inc
 test_cluster_recovery_native_inputs: test_cluster_recovery_episode_all_clog.inc test_cluster_recovery_episode_native_pages.inc
 test_cluster_recovery_native_inputs: test_cluster_recovery_episode_applied_pages.inc \
         test_cluster_recovery_episode_applied_owner.inc test_cluster_recovery_episode_side_owner.h \

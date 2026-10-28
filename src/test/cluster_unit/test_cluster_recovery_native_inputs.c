@@ -1109,6 +1109,7 @@ cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **held)
 #include "test_cluster_recovery_episode_side_owner.h"
 #include "test_cluster_recovery_episode_applied_owner.inc"
 #include "test_cluster_recovery_episode_consumed_pages.inc"
+#include "test_cluster_recovery_episode_page_history.inc"
 #include "test_cluster_recovery_episode_generation_xid.inc"
 #include "test_cluster_recovery_clog_full_roots.inc"
 
@@ -1347,7 +1348,19 @@ main(int argc, char **argv)
 		UT_RUN(test_episode_all_clog_whole_output_and_late_error_preserve_custody);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(220);
+	if (getenv("PGRAC_PRE2_TEST_PAGE_HISTORY") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_episode_page_history_checks_later_nonquery_full_eras);
+		UT_RUN(test_episode_page_history_refuses_postbirth_zero_and_truncate);
+		UT_RUN(test_episode_page_history_uses_each_sources_whole_page_halfspace);
+		UT_RUN(test_episode_page_history_preserves_prebirth_legacy_input);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	UT_PLAN(224);
+	UT_RUN(test_episode_page_history_checks_later_nonquery_full_eras);
+	UT_RUN(test_episode_page_history_refuses_postbirth_zero_and_truncate);
+	UT_RUN(test_episode_page_history_uses_each_sources_whole_page_halfspace);
+	UT_RUN(test_episode_page_history_preserves_prebirth_legacy_input);
 	UT_RUN(test_episode_consumed_pages_fresh_carriers_have_no_consumption);
 	UT_RUN(test_episode_consumed_pages_native_founder_and_cold_foreign_share_original_reads);
 	UT_RUN(test_episode_consumed_pages_foreign_late_failure_retains_all_custody);
