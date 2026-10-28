@@ -3617,6 +3617,10 @@ RenameType(RenameStmt *stmt)
 	Form_pg_type typTup;
 	ObjectAddress address;
 
+#ifdef USE_PGRAC_CLUSTER
+	CheckClusterSharedTypeSupport();
+#endif
+
 	/* Make a TypeName so we can use standard type lookup machinery */
 	typename = makeTypeNameFromNameList(names);
 	typeOid = typenameTypeId(NULL, typename);
@@ -4127,6 +4131,10 @@ AlterType(AlterTypeStmt *stmt)
 	bool		requireSuper = false;
 	AlterTypeRecurseParams atparams;
 	ListCell   *pl;
+
+#ifdef USE_PGRAC_CLUSTER
+	CheckClusterSharedTypeSupport();
+#endif
 
 	catalog = table_open(TypeRelationId, RowExclusiveLock);
 

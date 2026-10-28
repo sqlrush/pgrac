@@ -360,6 +360,10 @@ static bool tablespace_options_lookup_active, tablespace_options_expect_binding;
 static unsigned tablespace_options_lookups, tablespace_options_unbound;
 static unsigned tablespace_options_bad_lookup;
 
+static bool type_mutation_scope_lookup_active;
+static unsigned type_mutation_scope_route, type_mutation_scope_lookups;
+static unsigned type_mutation_scope_lookup_kind, type_mutation_scope_bad_lookup;
+static List *type_mutation_scope_expected_names;
 static bool type_scope_lookup_active;
 static unsigned type_scope_route, type_scope_lookups, type_scope_lookup_kind, type_scope_bad_lookup;
 static List *type_scope_expected_names;
@@ -6528,6 +6532,14 @@ static unsigned role_rename_lookups, role_rename_unbound, role_rename_bad_lookup
 Relation
 table_open(Oid relationId, LOCKMODE lockmode)
 {
+	if (type_mutation_scope_lookup_active) {
+		type_mutation_scope_lookups++;
+		type_mutation_scope_lookup_kind = 2;
+		if (type_mutation_scope_route != 2 || relationId != TypeRelationId
+			|| lockmode != RowExclusiveLock)
+			type_mutation_scope_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before the real type catalog lock/query. */
+	}
 	if (type_scope_lookup_active) {
 		type_scope_lookups++;
 		type_scope_lookup_kind = 1;
@@ -18181,6 +18193,13 @@ UT_TEST(test_native_relation_rename_scope_refusal_precedes_context_and_binding)
 TypeName *
 makeTypeNameFromNameList(List *names)
 {
+	if (type_mutation_scope_lookup_active) {
+		type_mutation_scope_lookups++;
+		type_mutation_scope_lookup_kind = 1;
+		if (type_mutation_scope_route != 1 || names != type_mutation_scope_expected_names)
+			type_mutation_scope_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before TypeName allocation and the type query. */
+	}
 	if (type_scope_lookup_active) {
 		type_scope_lookups++;
 		type_scope_lookup_kind = 2;
@@ -18886,10 +18905,206 @@ UT_TEST(test_native_type_scope_preserves_existing_supported_top_binding)
 	type_scope_lookup_active = false;
 }
 
+/* Actual TYPE/DOMAIN rename and TYPE options prefixes stop before their
+ * first name allocation or catalog lock. No native success is substituted. */
+#include "test_cluster_fresh_type_mutation_scope.inc"
+static String type_mutation_scope_parts[2];
+static ListCell type_mutation_scope_cells[2];
+static List type_mutation_scope_names;
+static RenameStmt native_type_mutation_scope_rename;
+static AlterTypeStmt native_type_mutation_scope_options;
+static String type_mutation_scope_storage;
+static DefElem type_mutation_scope_option;
+static ListCell type_mutation_scope_option_cell;
+static List type_mutation_scope_options;
+static RangeVar type_mutation_scope_warm_relation;
+static AlterObjectSchemaStmt type_mutation_scope_warm_statement;
+
+static void
+reset_native_type_mutation_scope(unsigned form)
+{
+	ObjectType objecttype = form % 4 < 2 ? OBJECT_TYPE : OBJECT_DOMAIN;
+	unsigned count = form % 2 ? 2 : 1;
+	unsigned optionkind = form < 4 ? 0 : (form - 4) / 2;
+
+	reset_create_preflight();
+	error_detail[0] = '\0';
+	type_mutation_scope_lookup_active = true;
+	type_mutation_scope_route = form < 4 ? 1 : 2;
+	type_mutation_scope_lookups = type_mutation_scope_lookup_kind = type_mutation_scope_bad_lookup
+		= 0;
+	type_mutation_scope_parts[0]
+		= (String){ .type = T_String,
+					.sval = count == 1 ? "native_mutation_type" : "native_mutation_schema" };
+	type_mutation_scope_parts[1] = (String){ .type = T_String, .sval = "qualified_mutation_type" };
+	for (unsigned i = 0; i < 2; i++)
+		type_mutation_scope_cells[i] = (ListCell){ .ptr_value = &type_mutation_scope_parts[i] };
+	type_mutation_scope_names = (List){ .type = T_List,
+										.length = count,
+										.max_length = 2,
+										.elements = type_mutation_scope_cells };
+	type_mutation_scope_expected_names = &type_mutation_scope_names;
+	native_type_mutation_scope_rename
+		= (RenameStmt){ .type = T_RenameStmt,
+						.renameType = objecttype,
+						.object = (Node *)&type_mutation_scope_names,
+						.newname = form % 2 ? "qualified_type_new_name" : "type_new_name",
+						.missing_ok = false };
+	type_mutation_scope_storage = (String){ .type = T_String, .sval = "extended" };
+	type_mutation_scope_option
+		= (DefElem){ .type = T_DefElem,
+					 .defname = optionkind == 1	  ? "storage"
+								: optionkind == 2 ? "receive"
+												  : "send",
+					 .arg = optionkind == 1 ? (Node *)&type_mutation_scope_storage : NULL,
+					 .defaction = DEFELEM_UNSPEC,
+					 .location = -1 };
+	type_mutation_scope_option_cell = (ListCell){ .ptr_value = &type_mutation_scope_option };
+	type_mutation_scope_options = (List){ .type = T_List,
+										  .length = 1,
+										  .max_length = 1,
+										  .elements = &type_mutation_scope_option_cell };
+	native_type_mutation_scope_options
+		= (AlterTypeStmt){ .type = T_AlterTypeStmt,
+						   .typeName = &type_mutation_scope_names,
+						   .options = optionkind == 0 ? NIL : &type_mutation_scope_options };
+	type_mutation_scope_warm_relation
+		= (RangeVar){ .type = T_RangeVar, .relname = "supported_warm_table" };
+	type_mutation_scope_warm_statement
+		= (AlterObjectSchemaStmt){ .type = T_AlterObjectSchemaStmt,
+								   .objectType = OBJECT_TABLE,
+								   .relation = &type_mutation_scope_warm_relation,
+								   .newschema = "supported_warm_destination",
+								   .missing_ok = false };
+}
+
+static void
+native_type_mutation_scope_entry(unsigned form)
+{
+	if (form < 4)
+		(void)RenameType(&native_type_mutation_scope_rename);
+	else
+		(void)AlterType(&native_type_mutation_scope_options);
+}
+
+static void
+assert_native_type_mutation_scope_result(bool blocked, int caught)
+{
+	UT_ASSERT_EQ(caught, blocked ? 1 : 2);
+	UT_ASSERT_EQ(error_code, blocked ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+	if (blocked) {
+		UT_ASSERT_STR_EQ(error_message, "custom types is not supported in shared mode");
+		UT_ASSERT_STR_EQ(error_detail,
+						 "PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+	}
+	UT_ASSERT_EQ(type_mutation_scope_lookups, blocked ? 0 : 1);
+	UT_ASSERT_EQ(type_mutation_scope_lookup_kind, blocked ? 0 : type_mutation_scope_route);
+	UT_ASSERT_EQ(type_mutation_scope_bad_lookup, 0);
+}
+
+UT_TEST(test_native_type_mutation_scope_matches_utility_before_catalog_or_name_processing)
+{
+	for (unsigned form = 0; form < 12; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool blocked = (mode & 5) != 0;
+			int caught;
+
+			reset_native_type_mutation_scope(form);
+			set_native_operator_mode(mode);
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				create_sql_entry(form < 4 ? (Node *)&native_type_mutation_scope_rename
+										  : (Node *)&native_type_mutation_scope_options);
+			UT_ASSERT_EQ(caught, blocked ? 1 : 0);
+			UT_ASSERT_EQ(error_code, blocked ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+			if (blocked) {
+				UT_ASSERT_STR_EQ(error_message, "custom types is not supported in shared mode");
+				UT_ASSERT_STR_EQ(error_detail,
+								 "PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+			}
+			UT_ASSERT_EQ(
+				type_mutation_scope_lookups + utility_xids + utility_prepares + utility_binds, 0);
+			reset_error();
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_type_mutation_scope_entry(form);
+			assert_native_type_mutation_scope_result(blocked, caught);
+			UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			UT_ASSERT_EQ(utility_top_xid, InvalidTransactionId);
+		}
+	}
+	type_mutation_scope_lookup_active = false;
+}
+
+UT_TEST(test_native_type_mutation_scope_precedes_context_child_top_and_publication)
+{
+	for (unsigned form = 0; form < 12; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			for (unsigned fault = 0; fault < 7; fault++) {
+				int caught;
+
+				reset_native_type_mutation_scope(form);
+				set_native_operator_mode(mode);
+				XactReadOnly = fault == 0;
+				utility_parallel = fault == 1;
+				utility_recovery = fault == 2;
+				utility_in_child = fault == 3;
+				if (fault == 4 || fault == 5) {
+					utility_current_xid = 401;
+					utility_top_xid = fault == 4 ? 400 : InvalidTransactionId;
+				}
+				utility_bind_ok = fault != 6;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_type_mutation_scope_entry(form);
+				assert_native_type_mutation_scope_result((mode & 5) != 0, caught);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+				UT_ASSERT_EQ(utility_top_xid, fault == 4 ? 400 : InvalidTransactionId);
+				UT_ASSERT_EQ(utility_current_xid,
+							 fault == 4 || fault == 5 ? 401 : InvalidTransactionId);
+			}
+		}
+	}
+	type_mutation_scope_lookup_active = false;
+}
+
+UT_TEST(test_native_type_mutation_scope_preserves_existing_supported_top_binding)
+{
+	for (unsigned form = 0; form < 12; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			for (unsigned fault = 0; fault < 5; fault++) {
+				int caught;
+
+				reset_native_type_mutation_scope(form);
+				create_sql_entry((Node *)&type_mutation_scope_warm_statement);
+				UT_ASSERT_EQ(utility_xids, 1);
+				UT_ASSERT_EQ(utility_prepares, 1);
+				UT_ASSERT_EQ(utility_binds, 1);
+				set_native_operator_mode(mode);
+				XactReadOnly = fault == 0;
+				utility_parallel = fault == 1;
+				utility_recovery = fault == 2;
+				utility_in_child = fault == 3;
+				utility_bind_ok = fault != 4;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_type_mutation_scope_entry(form);
+				assert_native_type_mutation_scope_result((mode & 5) != 0, caught);
+				UT_ASSERT_EQ(utility_xids, 1);
+				UT_ASSERT_EQ(utility_prepares, 1);
+				UT_ASSERT_EQ(utility_binds, 1);
+				UT_ASSERT_EQ(utility_top_xid, 400);
+				UT_ASSERT_EQ(utility_current_xid, 400);
+			}
+		}
+	}
+	type_mutation_scope_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(303);
+	UT_PLAN(306);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -19195,6 +19410,9 @@ main(void)
 	UT_RUN(test_native_type_scope_matches_utility_before_catalog_or_name_processing);
 	UT_RUN(test_native_type_scope_precedes_context_child_top_and_publication);
 	UT_RUN(test_native_type_scope_preserves_existing_supported_top_binding);
+	UT_RUN(test_native_type_mutation_scope_matches_utility_before_catalog_or_name_processing);
+	UT_RUN(test_native_type_mutation_scope_precedes_context_child_top_and_publication);
+	UT_RUN(test_native_type_mutation_scope_preserves_existing_supported_top_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
