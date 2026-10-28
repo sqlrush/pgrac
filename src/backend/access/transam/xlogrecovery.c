@@ -2089,7 +2089,7 @@ cluster_recovery_cold_page_completed_attempt(const struct ClusterRecoveryStartV1
 	const ClusterColdCtrcWorkV1 *work, ClusterWalInputsV1 *scope,
 	ClusterColdCtrcPageProgressV1 *progress, uint32 index,
 	const RfPageOnlineTargetViewV1 *view, const ClusterRecoveryCensusPageV1 *physical_page,
-	uint32 source_index)
+	uint32 source_index, PGAlignedBlock *out_image)
 {
 	RfPageStableBaseProofV1 *volatile proof = NULL;
 	RfPageCtrcAuthorityV1 *volatile authority = NULL;
@@ -2133,18 +2133,38 @@ cluster_recovery_cold_page_completed_attempt(const struct ClusterRecoveryStartV1
 				&& memcmp(&progress->completed[index].unchanged, &unchanged, sizeof(unchanged)) == 0) {
 				if (saved.phase == RF_PAGE_CTRC_STEP_UNCHANGED_SYNCED
 					&& ClusterColdRecoveryCtrcPageUnchangedCurrent(start, work,
-						&progress->completed[index].unchanged, storage))
-					detail = rf_page_recovery_ctrc_replays_unchanged_readback_v1(start, work,
-						&start->ctrc_page_sources[source_index], authority,
-						&progress->completed[index].unchanged, storage,
-						work->counts.subject_count, available - 2 * part);
+						&progress->completed[index].unchanged, storage)) {
+					if (out_image != NULL) {
+						RfPageCtrcReadbackImageV1 copied = rf_page_recovery_ctrc_replays_unchanged_image_v1(
+							start, work, &start->ctrc_page_sources[source_index], authority,
+							&progress->completed[index].unchanged, storage,
+							work->counts.subject_count, available - 2 * part);
+
+						detail = copied.detail;
+						if (detail == RF_PAGE_PROOF_DETAIL_OK) *out_image = copied.image;
+					} else
+						detail = rf_page_recovery_ctrc_replays_unchanged_readback_v1(start, work,
+							&start->ctrc_page_sources[source_index], authority,
+							&progress->completed[index].unchanged, storage,
+							work->counts.subject_count, available - 2 * part);
+				}
 				else if (saved.phase == RF_PAGE_CTRC_STEP_FPI_DURABLE
 					&& ClusterColdRecoveryCtrcPageCompletedCurrent(start, work,
-						&progress->completed[index].result.inserted, storage))
-					detail = rf_page_recovery_ctrc_replays_completed_readback_v1(start, work,
-						&start->ctrc_page_sources[source_index], authority,
-						&progress->completed[index].result.inserted, storage,
-						work->counts.subject_count, available - 2 * part);
+						&progress->completed[index].result.inserted, storage)) {
+					if (out_image != NULL) {
+						RfPageCtrcReadbackImageV1 copied = rf_page_recovery_ctrc_replays_completed_image_v1(
+							start, work, &start->ctrc_page_sources[source_index], authority,
+							&progress->completed[index].result.inserted, storage,
+							work->counts.subject_count, available - 2 * part);
+
+						detail = copied.detail;
+						if (detail == RF_PAGE_PROOF_DETAIL_OK) *out_image = copied.image;
+					} else
+						detail = rf_page_recovery_ctrc_replays_completed_readback_v1(start, work,
+							&start->ctrc_page_sources[source_index], authority,
+							&progress->completed[index].result.inserted, storage,
+							work->counts.subject_count, available - 2 * part);
+				}
 			}
 		}
 		if (detail == RF_PAGE_PROOF_DETAIL_OK && proof == NULL)
@@ -2165,6 +2185,59 @@ cluster_recovery_cold_page_completed_attempt(const struct ClusterRecoveryStartV1
 		|| memcmp(&progress->completed[index].unchanged, &unchanged, sizeof(unchanged)) != 0)
 		return RF_PAGE_PROOF_DETAIL_ROOT_STALE;
 	return detail;
+}
+
+RfPageCtrcReadbackImageV1
+ClusterColdRecoveryCtrcPageImage(const struct ClusterRecoveryStartV1 *start, uint32 index)
+{
+	RfPageCtrcReadbackImageV1 result = {0};
+	struct ClusterRecoveryStartV1 *state;
+	ClusterColdCtrcPageProgressV1 *progress;
+	const ClusterColdCtrcWorkV1 *work;
+	ClusterWalInputsV1 *scope;
+
+	result.detail = RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	if (start == NULL || start != cluster_recovery_cold_start
+		|| !cluster_recovery_cold_ctrc_replays_actor()) return result;
+	state = cluster_recovery_cold_start;
+	progress = state->ctrc_page_progress;
+	/* Absence, a skipped target or a pending prefix supplies no page image. */
+	if (progress == NULL || progress->pending || progress->next_target != progress->target_count
+		|| index >= progress->target_count || progress->completed[index].storage == NULL)
+		return result;
+	work = state->ctrc_observation_work; scope = state->ctrc_observation_inputs;
+	PG_TRY();
+	{
+		RfPageOnlineTargetViewV1 view;
+		ClusterRecoveryCensusPageV1 physical_page;
+		uint32 source_index;
+
+		result.detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+		if (cluster_recovery_cold_page_advance_current(start, work, scope, progress)
+			&& rf_page_online_plan_target_v1(start->ctrc_page_plan, index, &view)
+			&& !view.history_only && view.page_identity.forknum == MAIN_FORKNUM
+			&& cluster_recovery_cold_page_target(start, &view, &physical_page) && physical_page.heap
+			&& cluster_recovery_cold_page_tail(start, &view, &source_index))
+			result.detail = cluster_recovery_cold_page_completed_attempt(start, work, scope,
+				progress, index, &view, &physical_page, source_index, &result.image);
+		/* The attempt destroys PAGE/proof and rechecks every original input.
+		 * No candidate bytes escape on late cleanup or progress drift. */
+		if (result.detail == RF_PAGE_PROOF_DETAIL_OK
+			&& (progress->pending || progress->next_target != progress->target_count))
+			result.detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+		if (result.detail != RF_PAGE_PROOF_DETAIL_OK) {
+			MemSet(&result.image, 0, sizeof(result.image));
+			if (result.detail != RF_PAGE_PROOF_DETAIL_WOULD_BLOCK)
+				cluster_recovery_cold_page_plan_refuse(state, result.detail);
+		}
+	}
+	PG_CATCH();
+	{
+		cluster_recovery_cold_page_plan_refuse(state, RF_PAGE_PROOF_DETAIL_INTERNAL);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return result;
 }
 
 static bool
@@ -2196,7 +2269,7 @@ cluster_recovery_cold_page_completed_recheck(const struct ClusterRecoveryStartV1
 			|| !cluster_recovery_cold_page_target(start, &view, &physical_page) || !physical_page.heap
 			|| !cluster_recovery_cold_page_tail(start, &view, &source_index)) return false;
 		detail = cluster_recovery_cold_page_completed_attempt(start, work, scope,
-			progress, index, &view, &physical_page, source_index);
+			progress, index, &view, &physical_page, source_index, NULL);
 		if (detail == RF_PAGE_PROOF_DETAIL_OK) { index++; continue; }
 		if (detail != RF_PAGE_PROOF_DETAIL_WOULD_BLOCK) return false;
 		/* Same original owner and result; duration alone is not a refusal. */
