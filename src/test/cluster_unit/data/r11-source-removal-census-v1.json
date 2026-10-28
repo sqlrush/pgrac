@@ -15,8 +15,8 @@
   },
   "current_product_snapshot": {
     "algorithm": "sha256-canonical-path-blob-v1",
-    "path_count": 2410,
-    "sha256": "aaae70f918c190d789c781a2bf01199415fd704bd5f75ce905ceb377af5ab449"
+    "path_count": 2411,
+    "sha256": "986dbe8f16d6d6eae3836cc98a23e6615a4b2f37b15696462b124ad41aaf4481"
   },
   "gates": {
     "L1": {

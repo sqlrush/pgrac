@@ -3066,13 +3066,14 @@ test_cluster_side_xact_budget_product.o: $(top_srcdir)/src/backend/cluster/clust
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DRF_SIDE_XACT_TESTING \
 		-Dmalloc=side_xact_fixture_malloc -Dfree=side_xact_fixture_free \
 		-ffunction-sections -fdata-sections -c $< -o $@
-test_cluster_side_xact test_cluster_pi_contribution test_cluster_recovery_c0_plan test_cluster_cold_tt_redo: test_cluster_side_relmap_terminal.inc
+test_cluster_side_xact test_cluster_pi_contribution test_cluster_recovery_c0_plan test_cluster_cold_tt_redo: test_cluster_side_relmap_terminal.inc test_cluster_side_clog_applied.inc
 test_cluster_side_xact: $(top_builddir)/src/backend/cluster/cluster_wal_claim.o
 test_cluster_side_xact: test_cluster_side_clog_full.inc test_cluster_side_clog_witness.inc
 
 CLUSTER_SIDE_ONLINE_PLAN_TEST_O = test_cluster_side_online_plan.o
 $(CLUSTER_SIDE_ONLINE_PLAN_TEST_O): \
 		$(top_srcdir)/src/backend/cluster/cluster_side_online_plan.c \
+		$(top_srcdir)/src/backend/cluster/cluster_side_online_plan_internal.h \
 		Makefile \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_tt_record.h \
 		$(top_srcdir)/src/include/access/clog.h \
@@ -3176,6 +3177,7 @@ SIDE_OWNER_TEST_CPPFLAGS = -DRF_SIDE_OWNER_TESTING \
 	-Dcluster_undo_preflight_tt_target_v1=fixture_preflight_tt_target \
 	-Dcluster_undo_apply_tt_v1=fixture_apply_tt
 $(CLUSTER_SIDE_ONLINE_OWNER_O): $(top_srcdir)/src/backend/cluster/cluster_side_online_owner.c \
+		$(top_srcdir)/src/backend/cluster/cluster_side_online_plan_internal.h \
 		$(top_builddir)/src/include/pg_config.h Makefile \
 		$(top_srcdir)/src/include/access/clog.h \
 		$(top_srcdir)/src/include/cluster/cluster_native_startup.h \
