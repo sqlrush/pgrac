@@ -10021,8 +10021,8 @@ gcs_block_resource_x_ctrc_source_identities(
  * admission. First validate every slot, then retain each exact destination
  * custody before encoding any output. Partial refusal retains responsibility;
  * it never cancels a producer's edge or stages an incomplete image. The V3
- * receiver stays closed before PCM until before-visible registration and the
- * original background CLOSE/ACK chain are connected. No capability is enabled
+ * receiver retains its parent before the original join; typed IMAGE receipts
+ * still precede physical visibility. No capability is enabled
  * here, and non-ITL V2 construction remains byte-exact. */
 static bool
 gcs_block_pcm_x_resource_x_delegate_source_frames(
@@ -14114,13 +14114,28 @@ gcs_block_resource_x_requester_join_ingress(const ClusterICEnvelope *env,
 				if (result == RESOURCE_X_APPLY_APPLIED
 					&& frame->kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE
 					&& frame->body.image_envelope.ctrc_delegation_bytes != 0) {
-					/* Retain the upstream parent before any local visibility.
-					 * Exact receipt installation and subtree CLOSE are not yet
-					 * qualified: neither success nor partial custody enters PCM.
-					 * Later refusal never cancels an accepted responsibility. */
-					result = gcs_block_resource_x_ctrc_receive_image(frame, &admission,
-						source, authenticated_connection_generation)
-						? RESOURCE_X_APPLY_BAD_STATE : RESOURCE_X_APPLY_STALE;
+					/* Retain the upstream parent before the original join.
+					 * Participant work crosses lock domains, so recheck the
+					 * same admitted endpoints and original master session.
+					 * Later refusal retains custody; physical installation
+					 * still requires all exact typed IMAGE receipts. */
+					if (!gcs_block_resource_x_ctrc_receive_image(frame, &admission,
+							source, authenticated_connection_generation))
+						result = RESOURCE_X_APPLY_STALE;
+					else {
+						result = gcs_block_resource_x_target_peer_result_exact(&admission, source,
+							authenticated_connection_generation);
+						if (result == RESOURCE_X_APPLY_APPLIED)
+							result = gcs_block_resource_x_target_peer_result_exact(&admission,
+								master_node, master_ingress);
+						if (result == RESOURCE_X_APPLY_APPLIED)
+							result = gcs_block_resource_x_gate_session_recheck_result(
+								&frame->common.logical_assertion.resource, &gate, master_node,
+								master_session);
+						if (result == RESOURCE_X_APPLY_APPLIED
+							&& !cluster_semantic_activation_recheck(&admission))
+							result = RESOURCE_X_APPLY_STALE;
+					}
 				}
 				if (result == RESOURCE_X_APPLY_APPLIED) {
 					result = cluster_pcm_lock_resource_x_requester_join_current_exact(
@@ -14501,8 +14516,8 @@ gcs_block_try_resource_x_frame(const ClusterICEnvelope *env, const void *payload
 										   &frame, &reject)) {
 		return true;
 	}
-	/* Delegated images reach only the authenticated, admitted protective
-	 * receiver below. That branch still refuses before PCM join/install. */
+	/* Delegated images reach the authenticated protective receiver before
+	 * the retained join; typed receipts still precede physical visibility. */
 	cluster_pcm_lock_resource_x_trace_frame(RESOURCE_X_TRACE_RECEIVE, &frame,
 											(int32)env->source_node_id, 0);
 	if (env->epoch != cluster_epoch_get_current()) {

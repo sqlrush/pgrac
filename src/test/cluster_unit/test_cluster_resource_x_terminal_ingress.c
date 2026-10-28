@@ -55,6 +55,10 @@ static int context_cover_checks;
 static ClusterSemanticResourceXPeerOpenResult peer_observation_gap;
 static bool peer_gap_during_claim, peer_gap_after_install;
 static int authority_mutations;
+static unsigned receive_custody_calls;
+static bool receive_custody_ok;
+static unsigned receive_after_custody, receive_join_outcome;
+static const ClusterSemanticAdmissionToken *receive_custody_admission;
 static PGPROC recycle_proc;
 PGPROC *MyProc = &recycle_proc;
 static bool recycle_gap_after_arm, recycle_gap_after_context;
@@ -156,13 +160,22 @@ cluster_pcm_lock_resource_x_requester_join_current_exact(const ResourceXDecodedF
 														 uint32 master_ingress, uint64 r4,
 														 ResourceXRequesterJoinSnapshot *out)
 {
-	(void)frame;
 	(void)out;
 	UT_ASSERT_EQ(source, 1);
 	UT_ASSERT_EQ(source_ingress, 61);
 	UT_ASSERT_EQ(current_master, master);
 	UT_ASSERT_EQ(master_ingress, 61);
 	UT_ASSERT_EQ(r4, 77);
+	if (frame->kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE
+		&& frame->body.image_envelope.ctrc_delegation_bytes != 0) {
+		UT_ASSERT_EQ(receive_custody_calls, 1);
+		UT_ASSERT(receive_custody_admission != NULL && receive_custody_admission->entered);
+		UT_ASSERT_EQ(leaves, 0);
+		if (receive_join_outcome == 2)
+			siglongjmp(*PG_exception_stack, 1);
+		if (receive_join_outcome == 1)
+			return RESOURCE_X_APPLY_BAD_STATE;
+	}
 	joins++;
 	if (delivery_enabled)
 		return RESOURCE_X_APPLY_STALE;
@@ -297,6 +310,14 @@ cluster_semantic_activation_resource_x_peer_open_check(const ClusterSemanticAdmi
 													   int32 node, uint32 generation)
 {
 	peer_checks++;
+	if (receive_custody_calls != 0) {
+		if ((receive_after_custody == 2 && node == 1)
+			|| (receive_after_custody == 3 && node == 0))
+			return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_CAPABILITY_DRIFT;
+		if ((receive_after_custody == 6 && node == 1)
+			|| (receive_after_custody == 7 && node == 0))
+			return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_TABLE_TORN;
+	}
 	if (!token->entered || node < 0 || generation != 61 || scenario == 7
 		|| (scenario == 13 && peer_checks == 2))
 		return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_ADMISSION_DRIFT;
@@ -725,8 +746,6 @@ cluster_pcm_lock_resource_x_itl_recycle_finish_exact(const ResourceXLocalOwnerHa
 	return RESOURCE_X_APPLY_APPLIED;
 }
 
-static unsigned receive_custody_calls;
-static bool receive_custody_ok;
 static bool
 gcs_block_resource_x_ctrc_receive_image(const ResourceXDecodedFrame *frame,
 	const ClusterSemanticAdmissionToken *admission, int32 source, uint32 connection)
@@ -737,6 +756,19 @@ gcs_block_resource_x_ctrc_receive_image(const ResourceXDecodedFrame *frame,
 	UT_ASSERT_EQ(connection, 61);
 	UT_ASSERT_EQ(frame->body.image_envelope.ctrc_delegation_bytes, 232);
 	receive_custody_calls++;
+	receive_custody_admission = admission;
+	if (receive_after_custody == 1)
+		scenario = 10;
+	if (receive_after_custody == 4)
+		scenario = 12;
+	if (receive_after_custody == 5)
+		session_gap = true;
+	if (receive_after_custody == 8)
+		master = 3;
+	if (receive_after_custody == 9)
+		scenario = 9;
+	if (receive_after_custody == 10)
+		siglongjmp(*PG_exception_stack, 1);
 	return receive_custody_ok;
 }
 
@@ -829,6 +861,8 @@ gcs_block_resource_x_gate_session_snapshot_result(const BufferTag *tag, Resource
 		(*node)++;
 	else if (terminal_identity_conflict == 3)
 		(*session)++;
+	if (receive_after_custody == 11 && receive_custody_calls != 0)
+		scenario = 10;
 	return PCM_X_SESSION_AUTH_OK;
 }
 
@@ -1143,6 +1177,8 @@ reset_delivery_fixture(void)
 	recycle_gap_after_arm = recycle_gap_after_context = false;
 	recycle_arms = recycle_cancels = recycle_finishes = 0;
 	recycle_cancel_result = RESOURCE_X_APPLY_APPLIED;
+	receive_custody_calls = receive_after_custody = receive_join_outcome = 0;
+	receive_custody_admission = NULL;
 }
 
 UT_TEST(test_actual_quiet_tick_installs_or_redrives_without_foreground)
@@ -2545,7 +2581,7 @@ UT_TEST(test_actual_failed_round_observation_retries_only_exact_predecessor_shap
 	scenario = 0;
 }
 
-UT_TEST(test_actual_v3_receive_registers_under_admission_and_stays_before_pcm)
+UT_TEST(test_actual_v3_receive_requires_custody_before_pcm)
 {
 	for (unsigned variant = 0; variant < 3; variant++) {
 		ClusterICEnvelope env = { 0 };
@@ -2553,6 +2589,7 @@ UT_TEST(test_actual_v3_receive_registers_under_admission_and_stays_before_pcm)
 		ResourceXRequesterJoinSnapshot out = { 0 };
 
 		reset_delivery_fixture();
+		delivery_enabled = false;
 		master = 1;
 		scenario = variant == 2 ? 9 : 0;
 		peer_checks = rechecks = leaves = joins = installs = publishes = 0;
@@ -2564,8 +2601,94 @@ UT_TEST(test_actual_v3_receive_registers_under_admission_and_stays_before_pcm)
 		frame.common.master_session_incarnation = 31;
 		frame.body.image_envelope.ctrc_delegation_bytes = 232;
 		UT_ASSERT_EQ(gcs_block_resource_x_requester_join_ingress(&env, &frame, 61, &out),
-			variant == 0 ? RESOURCE_X_APPLY_BAD_STATE : RESOURCE_X_APPLY_STALE);
+			variant == 0 ? RESOURCE_X_APPLY_APPLIED : RESOURCE_X_APPLY_STALE);
 		UT_ASSERT_EQ(receive_custody_calls, variant == 2 ? 0 : 1);
+		UT_ASSERT_EQ(joins, variant == 0 ? 1 : 0);
+		UT_ASSERT_EQ(installs + publishes + cleanup_joins, 0);
+		UT_ASSERT_EQ(leaves, 1);
+	}
+}
+
+UT_TEST(test_actual_qualified_v3_custody_reaches_original_join_before_visibility)
+{
+	ClusterICEnvelope env = { 0 };
+	ResourceXDecodedFrame frame = { 0 };
+	ResourceXRequesterJoinSnapshot out = { 0 };
+
+	reset_delivery_fixture();
+	delivery_enabled = false;
+	receive_custody_ok = true;
+	env.source_node_id = 1;
+	frame.kind = RESOURCE_X_WIRE_IMAGE_ENVELOPE;
+	frame.common.resource_formation = 17;
+	frame.common.master_session_incarnation = 31;
+	frame.body.image_envelope.ctrc_delegation_bytes = 232;
+	UT_ASSERT_EQ(gcs_block_resource_x_requester_join_ingress(&env, &frame, 61, &out),
+		RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(receive_custody_calls, 1);
+	UT_ASSERT_EQ(joins, 1);
+	UT_ASSERT_EQ(installs + publishes + cleanup_joins, 0);
+	UT_ASSERT_EQ(leaves, 1);
+}
+
+UT_TEST(test_actual_v3_custody_gap_rechecks_source_master_gate_and_admission)
+{
+	for (unsigned drift = 1; drift <= 11; drift++) {
+		ClusterICEnvelope env = { 0 };
+		ResourceXDecodedFrame frame = { 0 };
+		ResourceXRequesterJoinSnapshot out = { 0 };
+
+		if (drift == 10) /* ERROR is checked by the following test. */
+			continue;
+		reset_delivery_fixture();
+		delivery_enabled = false;
+		receive_custody_ok = true;
+		receive_after_custody = drift;
+		env.source_node_id = 1;
+		frame.kind = RESOURCE_X_WIRE_IMAGE_ENVELOPE;
+		frame.common.resource_formation = 17;
+		frame.common.master_session_incarnation = 31;
+		frame.body.image_envelope.ctrc_delegation_bytes = 232;
+		UT_ASSERT_EQ(gcs_block_resource_x_requester_join_ingress(&env, &frame, 61, &out),
+			(drift >= 5 && drift <= 7) ? RESOURCE_X_APPLY_BAD_STATE : RESOURCE_X_APPLY_STALE);
+		UT_ASSERT_EQ(receive_custody_calls, 1);
+		UT_ASSERT_EQ(joins + installs + publishes + cleanup_joins, 0);
+		UT_ASSERT_EQ(leaves, 1);
+	}
+}
+
+UT_TEST(test_actual_v3_custody_and_join_errors_leave_original_admission_once)
+{
+	for (unsigned stage = 0; stage < 3; stage++) {
+		ClusterICEnvelope env = { 0 };
+		ResourceXDecodedFrame frame = { 0 };
+		ResourceXRequesterJoinSnapshot out = { 0 };
+		volatile bool caught = false;
+		ResourceXApplyResult result = RESOURCE_X_APPLY_INVALID;
+
+		reset_delivery_fixture();
+		delivery_enabled = false;
+		receive_custody_ok = true;
+		receive_after_custody = stage == 0 ? 10 : 0;
+		receive_join_outcome = stage == 1 ? 2 : stage == 2 ? 1 : 0;
+		env.source_node_id = 1;
+		frame.kind = RESOURCE_X_WIRE_IMAGE_ENVELOPE;
+		frame.common.resource_formation = 17;
+		frame.common.master_session_incarnation = 31;
+		frame.body.image_envelope.ctrc_delegation_bytes = 232;
+		PG_TRY();
+		{
+			result = gcs_block_resource_x_requester_join_ingress(&env, &frame, 61, &out);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, stage < 2);
+		if (stage == 2)
+			UT_ASSERT_EQ(result, RESOURCE_X_APPLY_BAD_STATE);
+		UT_ASSERT_EQ(receive_custody_calls, 1);
 		UT_ASSERT_EQ(joins + installs + publishes + cleanup_joins, 0);
 		UT_ASSERT_EQ(leaves, 1);
 	}
@@ -2574,7 +2697,7 @@ UT_TEST(test_actual_v3_receive_registers_under_admission_and_stays_before_pcm)
 int
 main(void)
 {
-	UT_PLAN(30);
+	UT_PLAN(33);
 	UT_RUN(test_actual_terminal_ingress_keeps_master_and_physical_source_distinct);
 	UT_RUN(test_actual_kind9_ingress_does_not_send_ack_for_fused_admission);
 	UT_RUN(test_actual_fused_admission_notifies_ready_resource_without_registry_tick);
@@ -2604,7 +2727,10 @@ main(void)
 	UT_RUN(test_eviction_reserves_before_n_and_registers_before_release);
 	UT_RUN(test_eviction_retains_first_separately_from_latest);
 	UT_RUN(test_actual_failed_round_observation_retries_only_exact_predecessor_shape);
-	UT_RUN(test_actual_v3_receive_registers_under_admission_and_stays_before_pcm);
+	UT_RUN(test_actual_v3_receive_requires_custody_before_pcm);
+	UT_RUN(test_actual_qualified_v3_custody_reaches_original_join_before_visibility);
+	UT_RUN(test_actual_v3_custody_gap_rechecks_source_master_gate_and_admission);
+	UT_RUN(test_actual_v3_custody_and_join_errors_leave_original_admission_once);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
