@@ -1836,7 +1836,8 @@ cold_record_side_kind(const ClusterColdRecordV1 *record)
 	if (record->rmid == RM_XACT_ID
 		&& (info == XLOG_XACT_COMMIT || info == XLOG_XACT_ABORT))
 		return RF_SIDE_ONLINE_OPERATION_XACT;
-	if ((record->rmid == RM_CLOG_ID && (info == CLOG_ZEROPAGE || info == CLOG_TRUNCATE))
+	if ((record->rmid == RM_CLOG_ID
+		 && (info == CLOG_ZEROPAGE || info == CLOG_TRUNCATE || info == CLOG_ZEROPAGE_FULL))
 		|| (record->rmid == RM_MULTIXACT_ID
 			&& (info == XLOG_MULTIXACT_ZERO_OFF_PAGE || info == XLOG_MULTIXACT_ZERO_MEM_PAGE
 				|| info == XLOG_MULTIXACT_CREATE_ID || info == XLOG_MULTIXACT_TRUNCATE_ID)))

@@ -7,6 +7,7 @@
  */
 
 #include "postgres.h"
+#ifdef USE_PGRAC_CLUSTER
 
 #include "access/xact.h"
 #include "access/xlogrecord.h"
@@ -74,10 +75,10 @@ enum {
 #undef RF_ROUTE
 };
 
-StaticAssertDecl(RF_OPCODE_ROUTE_MANIFEST_COUNT_V1 == 141,
-				 "opcode manifest must contain exactly 141 rows");
-StaticAssertDecl(RF_OPCODE_ROUTE_MANIFEST_LIVE_COUNT_V1 == 141,
-				 "opcode manifest must contain exactly 141 live rows");
+StaticAssertDecl(RF_OPCODE_ROUTE_MANIFEST_COUNT_V1 == 142,
+				 "opcode manifest must contain exactly 142 rows");
+StaticAssertDecl(RF_OPCODE_ROUTE_MANIFEST_LIVE_COUNT_V1 == 142,
+				 "opcode manifest must contain exactly 142 live rows");
 StaticAssertDecl(lengthof(rf_opcode_route_manifest_v1) == RF_OPCODE_ROUTE_MANIFEST_COUNT_V1,
 				 "STOP-06 generated table count must match manifest count");
 
@@ -146,3 +147,4 @@ rf_opcode_route_lookup_v1(uint8 rmid, uint8 raw_info, bool has_blocks, bool spac
 	*route = entry->route;
 	return RF_OPCODE_ROUTE_OK;
 }
+#endif /* USE_PGRAC_CLUSTER */

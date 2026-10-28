@@ -12819,10 +12819,23 @@ UT_TEST(test_native_terminal_witness_rejects_unbound_plan)
 #undef terminal_witness_plan
 #undef terminal_witness_plan_shape
 
+#include "test_cluster_side_clog_full.inc"
+
 int
 main(void)
 {
-	UT_PLAN(195);
+	if (getenv("PGRAC_PRE2_TEST_CLOG_FULL_SIDE") != NULL) {
+		UT_PLAN(3);
+		UT_RUN(test_full_clog_plan_owns_all_original_birth_bytes);
+		UT_RUN(test_full_clog_shape_refuses_incomplete_or_unconsumed_frame);
+		UT_RUN(test_full_clog_cold_owner_keeps_native_postread_before_projection);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
+	UT_PLAN(198);
+	UT_RUN(test_full_clog_plan_owns_all_original_birth_bytes);
+	UT_RUN(test_full_clog_shape_refuses_incomplete_or_unconsumed_frame);
+	UT_RUN(test_full_clog_cold_owner_keeps_native_postread_before_projection);
 	UT_RUN(adopted_relmap_test_native_terminal_witness_uses_original_bound_plan_budget);
 	UT_RUN(adopted_relmap_test_native_terminal_witness_rejects_duplicate_physical_raw_terminal);
 	UT_RUN(adopted_relmap_test_native_terminal_witness_owns_exact_original_header_and_payload);

@@ -20,6 +20,8 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "access/clog.h"
 
 #include "cluster/cluster_multixact.h"
 #include "cluster/cluster_remote_xact.h"
@@ -69,6 +71,25 @@ cluster_side_projection_target_preflight_v1(const ClusterSideProjectionApplyInpu
 		|| input->origin_thread > (1 << 7))
 		return CLUSTER_SIDE_PROJECTION_APPLY_BLOCKED;
 	operation = input->operation;
+	if (operation->kind == CLUSTER_SIDE_PROJECTION_CLOG
+		&& operation->normalized_info == CLOG_ZEROPAGE_FULL) {
+		xl_clog_zeropage_full birth;
+		TransactionId raw;
+
+		if (operation->action != CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE
+			|| TransactionIdIsValid(operation->oldest_xid) || OidIsValid(operation->oldest_database)
+			|| !input->source_retained || input->cluster_epoch == 0
+			|| input->source_lsn == InvalidXLogRecPtr || input->source_end_lsn <= input->source_lsn
+			|| input->owned_payload == NULL || input->owned_payload_length != sizeof(birth))
+			return CLUSTER_SIDE_PROJECTION_APPLY_BLOCKED;
+		memcpy(&birth, input->owned_payload, sizeof(birth));
+		raw = (TransactionId)birth.first_full_xid;
+		if (birth.reserved_zero != 0 || birth.pageno < 0
+			|| birth.pageno != operation->page_number || !TransactionIdIsNormal(raw)
+			|| (raw % RF_SIDE_CLOG_XACTS_PER_PAGE != 0 && raw != FirstNormalTransactionId)
+			|| raw / RF_SIDE_CLOG_XACTS_PER_PAGE != (uint32)birth.pageno)
+			return CLUSTER_SIDE_PROJECTION_APPLY_BLOCKED;
+	}
 	if (operation->kind == CLUSTER_SIDE_PROJECTION_MULTIXACT) {
 		uint32 i;
 
@@ -304,3 +325,4 @@ cluster_side_projection_lookup(bool verified)
 	return verified ? CLUSTER_SIDE_PROJECTION_LOOKUP_OK
 					: CLUSTER_SIDE_PROJECTION_LOOKUP_FAIL_CLOSED;
 }
+#endif /* USE_PGRAC_CLUSTER */

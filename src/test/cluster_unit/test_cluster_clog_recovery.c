@@ -1747,6 +1747,8 @@ native_held_base_constructor_error_and_later_refusals_keep_custody_sticky(void)
 	}
 }
 
+#include "test_cluster_clog_full_consumer.inc"
+
 int
 main(void)
 {
@@ -1778,7 +1780,7 @@ main(void)
 	snprintf(path, sizeof(path), "%s/native_side/origin_0/pg_xact", fixture_root);
 	if (symlink(path, "pg_xact") != 0)
 		return 2;
-	UT_PLAN(48);
+	UT_PLAN(51);
 	UT_RUN(separate_original_origin_controls);
 	UT_RUN(commit_and_abort_persist_full_tree_without_local_pollution);
 	UT_RUN(conflicting_late_child_refuses_before_any_tree_write);
@@ -1851,6 +1853,9 @@ main(void)
 	UT_RUN(clog_full_birth_requires_exclusive_native_issuer);
 	UT_RUN(clog_full_birth_redo_checks_complete_native_image);
 	UT_RUN(clog_full_birth_error_keeps_native_dirty_state);
+	UT_RUN(native_full_clog_consumer_preserves_original_page_and_neighbors);
+	UT_RUN(native_full_clog_consumer_refuses_shape_and_scope_before_io);
+	UT_RUN(native_full_clog_consumer_keeps_late_failure_incomplete);
 	fixture_cleanup();
 	UT_DONE();
 	return ut_failed_count != 0;

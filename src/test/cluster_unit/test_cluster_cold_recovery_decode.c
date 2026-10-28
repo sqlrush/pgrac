@@ -1170,10 +1170,33 @@ UT_TEST(test_stripe_join_rejects_incomplete_or_unbound_original_frame)
 	}
 }
 
+UT_TEST(test_full_clog_birth_keeps_native_and_foreign_owner_routes)
+{
+	for (unsigned foreign = 0; foreign < 2; foreign++)
+		for (unsigned fault = 0; fault < 3; fault++) {
+			FakeRecord record;
+			ClusterColdDecodedV1 out = { 0 };
+			xl_clog_zeropage_full birth = { 97, 0, (UINT64_C(7) << 32) | UINT64_C(3178496) };
+
+			fake_record(&record, RM_CLOG_ID, CLOG_ZEROPAGE_FULL, 0);
+			preflight_plan.route.codec_id = RF_ROUTE_CODEC_SIDE_STANDARD;
+			if (fault == 1) birth.reserved_zero = 1;
+			memcpy(record.data, &birth, sizeof(birth));
+			record.storage.decoded.main_data_len = sizeof(birth) - (fault == 2 ? 1 : 0);
+			UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID,
+				true, foreign != 0, &out), fault == 0 ? CLUSTER_COLD_OK
+													 : CLUSTER_COLD_COMPONENT_INVALID);
+			if (fault == 0)
+				UT_ASSERT_EQ(out.record.record_flags,
+					foreign ? CLUSTER_COLD_RECORD_FOREIGN_SIDE : 0);
+		}
+}
+
 int
 main(void)
 {
-	UT_PLAN(21);
+	UT_PLAN(22);
+	UT_RUN(test_full_clog_birth_keeps_native_and_foreign_owner_routes);
 	UT_RUN(test_stripe_join_uses_real_native_or_foreign_consumer);
 	UT_RUN(test_stripe_join_rejects_incomplete_or_unbound_original_frame);
 	UT_RUN(test_complete_standby_payloads_keep_original_effect_routes);
