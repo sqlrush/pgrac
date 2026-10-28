@@ -357,6 +357,14 @@ static bool tablespace_options_lookup_active, tablespace_options_expect_binding;
 static unsigned tablespace_options_lookups, tablespace_options_unbound;
 static unsigned tablespace_options_bad_lookup;
 
+static bool relation_rename_lookup_active, relation_rename_expect_binding;
+static unsigned relation_rename_lookups, relation_rename_unbound, relation_rename_bad_lookup;
+static unsigned relation_rename_unexpected_callbacks;
+static RangeVar *relation_rename_expected_relation;
+static uint32 relation_rename_expected_flags;
+static LOCKMODE relation_rename_expected_lockmode;
+static void *relation_rename_expected_callback_arg;
+
 static bool column_rename_lookup_active, column_rename_expect_binding;
 static unsigned column_rename_lookups, column_rename_unbound, column_rename_bad_lookup;
 static unsigned column_rename_unexpected_callbacks;
@@ -406,6 +414,11 @@ static unsigned database_identity_lookups, database_identity_unbound, database_i
 CommandTag
 CreateCommandTag(Node *statement)
 {
+	if (relation_rename_lookup_active && IsA(statement, RenameStmt)) {
+		RenameStmt *stmt = (RenameStmt *)statement;
+		return AlterObjectTypeCommandTag(stmt->renameType == OBJECT_COLUMN ? stmt->relationType
+																		   : stmt->renameType);
+	}
 	if (column_rename_lookup_active && IsA(statement, RenameStmt)) {
 		RenameStmt *stmt = (RenameStmt *)statement;
 		return AlterObjectTypeCommandTag(stmt->renameType == OBJECT_COLUMN ? stmt->relationType
@@ -647,6 +660,11 @@ CreateCommandTag(Node *statement)
 const char *
 GetCommandTagName(CommandTag tag)
 {
+	if (relation_rename_lookup_active) {
+		if ((unsigned)tag >= lengthof(rename_dispatch_command_names))
+			siglongjmp(boundary, 3);
+		return rename_dispatch_command_names[tag];
+	}
 	if (column_rename_lookup_active) {
 		if ((unsigned)tag >= lengthof(rename_dispatch_command_names))
 			siglongjmp(boundary, 3);
@@ -7928,6 +7946,18 @@ RangeVarCallbackOwnsRelation(const RangeVar *relation, Oid relid, Oid oldrelid, 
 }
 
 static void
+RangeVarCallbackForAlterRelation(const RangeVar *relation, Oid relid, Oid oldrelid, void *arg)
+{
+	(void)relation;
+	(void)relid;
+	(void)oldrelid;
+	(void)arg;
+	relation_rename_unexpected_callbacks++;
+	siglongjmp(boundary,
+			   3); /* The query boundary must not invoke the native permission callback. */
+}
+
+static void
 RangeVarCallbackForRenameAttribute(const RangeVar *relation, Oid relid, Oid oldrelid, void *arg)
 {
 	(void)relation;
@@ -7967,6 +7997,18 @@ Oid
 RangeVarGetRelidExtended(const RangeVar *relation, LOCKMODE lockmode, uint32 flags,
 						 RangeVarGetRelidCallback callback, void *callback_arg)
 {
+	if (relation_rename_lookup_active) {
+		relation_rename_lookups++;
+		if (relation_rename_expect_binding && utility_binds == 0)
+			relation_rename_unbound++;
+		if (relation != relation_rename_expected_relation
+			|| lockmode != relation_rename_expected_lockmode
+			|| flags != relation_rename_expected_flags
+			|| callback != RangeVarCallbackForAlterRelation
+			|| callback_arg != relation_rename_expected_callback_arg)
+			relation_rename_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before the real query, lock or permission callback. */
+	}
 	if (column_rename_lookup_active) {
 		column_rename_lookups++;
 		if (column_rename_expect_binding && utility_binds == 0)
@@ -17814,10 +17856,255 @@ UT_TEST(test_native_column_rename_scope_refusal_precedes_context_and_binding)
 }
 
 
+/* Actual native relation rename prefix stops in its original loop before
+ * the first query; permissions, lockmode retry and mutation remain native. */
+#include "test_cluster_fresh_relation_rename.inc"
+static const struct {
+	ObjectType object_type;
+	LOCKMODE lockmode;
+	const char *command, *relation_name;
+} relation_rename_cases[]
+	= { { OBJECT_TABLE, AccessExclusiveLock, "ALTER TABLE", "rename_table" },
+		{ OBJECT_INDEX, ShareUpdateExclusiveLock, "ALTER INDEX", "rename_index" },
+		{ OBJECT_SEQUENCE, AccessExclusiveLock, "ALTER SEQUENCE", "rename_sequence" },
+		{ OBJECT_VIEW, AccessExclusiveLock, "ALTER VIEW", "rename_view" },
+		{ OBJECT_FOREIGN_TABLE, AccessExclusiveLock, "ALTER FOREIGN TABLE", "rename_foreign" } };
+static RenameStmt native_relation_rename_statement;
+static RangeVar relation_rename_relation;
+static Node *relation_rename_expected_statement;
+
+static void
+reset_native_relation_rename(bool expect_binding, unsigned form)
+{
+	unsigned kind = form / 2;
+	bool missing_ok = (form & 1) != 0;
+
+	reset_create_preflight();
+	error_detail[0] = '\0';
+	relation_rename_expected_flags = missing_ok ? RVR_MISSING_OK : 0;
+	relation_rename_expected_lockmode = relation_rename_cases[kind].lockmode;
+	relation_rename_lookup_active = true;
+	relation_rename_expect_binding = expect_binding;
+	relation_rename_lookups = relation_rename_unbound = relation_rename_bad_lookup = 0;
+	relation_rename_unexpected_callbacks = 0;
+	relation_rename_relation
+		= (RangeVar){ .type = T_RangeVar,
+					  .catalogname = missing_ok ? "rename_database" : NULL,
+					  .schemaname = missing_ok ? "rename_schema" : NULL,
+					  .relname = (char *)relation_rename_cases[kind].relation_name,
+					  .inh = !missing_ok,
+					  .location = -1 };
+	relation_rename_expected_relation = &relation_rename_relation;
+	native_relation_rename_statement
+		= (RenameStmt){ .type = T_RenameStmt,
+						.renameType = relation_rename_cases[kind].object_type,
+						.relation = &relation_rename_relation,
+						.newname = missing_ok ? "renamed_if_exists" : "renamed_relation",
+						.missing_ok = missing_ok };
+	relation_rename_expected_statement = (Node *)&native_relation_rename_statement;
+	relation_rename_expected_callback_arg = &native_relation_rename_statement;
+}
+
+static void
+native_relation_rename_entry(unsigned form)
+{
+	(void)form;
+	(void)RenameRelation((RenameStmt *)relation_rename_expected_statement);
+}
+
+UT_TEST(test_native_relation_rename_binds_before_first_query_in_all_profiles)
+{
+	for (unsigned form = 0; form < 10; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_relation_rename(binds, form);
+			set_native_operator_mode(mode);
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_relation_rename_entry(form);
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(relation_rename_lookups, repeat + 1);
+				UT_ASSERT_EQ(relation_rename_unbound, 0);
+				UT_ASSERT_EQ(relation_rename_bad_lookup, 0);
+				UT_ASSERT_EQ(relation_rename_unexpected_callbacks, 0);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	relation_rename_lookup_active = false;
+}
+
+UT_TEST(test_native_relation_rename_refuses_before_lookup_on_publication_child_and_top_errors)
+{
+	for (unsigned form = 0; form < 10; form++) {
+		for (unsigned failure = 0; failure < 5; failure++) {
+			bool allocated = failure == 0 || failure == 2;
+			int caught;
+
+			reset_native_relation_rename(true, form);
+			if (failure == 0)
+				utility_bind_ok = false;
+			else if (failure == 1 || failure == 2) {
+				if (failure == 2)
+					create_sql_entry(relation_rename_expected_statement);
+				utility_in_child = true;
+			} else {
+				utility_current_xid = 401;
+				utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_relation_rename_entry(form);
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, failure == 0  ? ERRCODE_DATA_CORRUPTED
+									 : failure < 3 ? ERRCODE_FEATURE_NOT_SUPPORTED
+												   : ERRCODE_INTERNAL_ERROR);
+			UT_ASSERT_STR_EQ(
+				error_message,
+				failure == 0
+					? "canonical ACTIVE publication failed before shared catalog alteration"
+				: failure < 3 ? "shared catalog alteration does not support subtransactions"
+							  : "shared catalog top-level transaction identity mismatch");
+			UT_ASSERT_EQ(relation_rename_lookups, 0);
+			UT_ASSERT_EQ(relation_rename_unbound + relation_rename_bad_lookup, 0);
+			UT_ASSERT_EQ(relation_rename_unexpected_callbacks, 0);
+			UT_ASSERT_EQ(utility_xids, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, failure == 2 ? 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, allocated || failure == 3 ? 400 : InvalidTransactionId);
+		}
+	}
+	relation_rename_lookup_active = false;
+}
+
+UT_TEST(test_native_relation_rename_context_guards_keep_nonshared_route)
+{
+	for (unsigned form = 0; form < 10; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+
+			for (unsigned guard = 0; guard < 3; guard++) {
+				int caught;
+
+				reset_native_relation_rename(binds, form);
+				set_native_operator_mode(mode);
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_relation_rename_entry(form);
+				UT_ASSERT_EQ(caught, binds ? 1 : 2);
+				UT_ASSERT_EQ(error_code, !binds		  ? 0
+										 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+													  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				if (binds)
+					UT_ASSERT(strstr(error_message, relation_rename_cases[form / 2].command)
+							  != NULL);
+				UT_ASSERT_EQ(relation_rename_lookups, binds ? 0 : 1);
+				UT_ASSERT_EQ(relation_rename_unbound + relation_rename_bad_lookup, 0);
+				UT_ASSERT_EQ(relation_rename_unexpected_callbacks, 0);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	relation_rename_lookup_active = false;
+}
+
+UT_TEST(test_native_relation_rename_utility_warm_guards_preserve_binding)
+{
+	for (unsigned form = 0; form < 10; form++) {
+		for (unsigned guard = 0; guard < 4; guard++) {
+			int caught;
+
+			reset_native_relation_rename(true, form);
+			create_sql_entry(relation_rename_expected_statement);
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			XactReadOnly = guard == 1;
+			utility_parallel = guard == 2;
+			utility_recovery = guard == 3;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_relation_rename_entry(form);
+			UT_ASSERT_EQ(caught, guard ? 1 : 2);
+			UT_ASSERT_EQ(error_code, !guard		  ? 0
+									 : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+												  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT_EQ(relation_rename_lookups, guard ? 0 : 1);
+			UT_ASSERT_EQ(relation_rename_unbound + relation_rename_bad_lookup, 0);
+			UT_ASSERT_EQ(relation_rename_unexpected_callbacks, 0);
+			UT_ASSERT_EQ(utility_prepares, guard ? 1 : 2);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			UT_ASSERT_EQ(utility_top_xid, 400);
+		}
+	}
+	relation_rename_lookup_active = false;
+}
+
+UT_TEST(test_native_relation_rename_scope_refusal_precedes_context_and_binding)
+{
+	for (unsigned kind = 0; kind < 2; kind++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			bool blocked = (mode & 5) != 0;
+
+			for (unsigned warm = 0; warm < 2; warm++) {
+				for (unsigned fault = 0; fault < 7; fault++) {
+					int caught;
+
+					reset_native_relation_rename(binds, kind);
+					set_native_operator_mode(mode);
+					if (warm)
+						create_sql_entry(relation_rename_expected_statement);
+					native_relation_rename_statement.renameType = OBJECT_MATVIEW;
+					utility_in_child = fault == 1;
+					XactReadOnly = fault == 2;
+					utility_parallel = fault == 3;
+					utility_recovery = fault == 4;
+					if (fault == 5)
+						utility_current_xid = 401;
+					utility_bind_ok = fault != 6;
+					caught = sigsetjmp(boundary, 1);
+					if (!caught)
+						native_relation_rename_entry(kind);
+					UT_ASSERT_EQ(caught, blocked ? 1 : 2);
+					UT_ASSERT_EQ(error_code, blocked ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+					if (blocked) {
+						UT_ASSERT(strstr(error_message, "materialized views") != NULL);
+						UT_ASSERT(strstr(error_message, "is not supported in shared mode") != NULL);
+						UT_ASSERT_STR_EQ(
+							error_detail,
+							"PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+					}
+					UT_ASSERT_EQ(relation_rename_lookups, blocked ? 0 : 1);
+					UT_ASSERT_EQ(relation_rename_unbound + relation_rename_bad_lookup, 0);
+					UT_ASSERT_EQ(relation_rename_unexpected_callbacks, 0);
+					UT_ASSERT_EQ(utility_xids, binds && warm ? 1 : 0);
+					UT_ASSERT_EQ(utility_prepares, binds && warm ? 1 : 0);
+					UT_ASSERT_EQ(utility_binds, binds && warm ? 1 : 0);
+					UT_ASSERT_EQ(utility_top_xid, binds && warm ? 400 : InvalidTransactionId);
+				}
+			}
+		}
+	}
+	relation_rename_lookup_active = false;
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(285);
+	UT_PLAN(290);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -18105,6 +18392,11 @@ main(void)
 	UT_RUN(test_native_column_rename_context_guards_keep_nonshared_route);
 	UT_RUN(test_native_column_rename_utility_warm_guards_preserve_binding);
 	UT_RUN(test_native_column_rename_scope_refusal_precedes_context_and_binding);
+	UT_RUN(test_native_relation_rename_binds_before_first_query_in_all_profiles);
+	UT_RUN(test_native_relation_rename_refuses_before_lookup_on_publication_child_and_top_errors);
+	UT_RUN(test_native_relation_rename_context_guards_keep_nonshared_route);
+	UT_RUN(test_native_relation_rename_utility_warm_guards_preserve_binding);
+	UT_RUN(test_native_relation_rename_scope_refusal_precedes_context_and_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
