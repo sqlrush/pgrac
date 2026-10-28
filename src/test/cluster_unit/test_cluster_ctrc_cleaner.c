@@ -7606,6 +7606,173 @@ UT_TEST(test_publisher_gauge_availability_preserves_original_snapshot_contract)
 	UT_ASSERT_EQ(held_count, 0);
 }
 
+static bool
+unsettled_read_actual_snapshot(uint64 *count, int32 *origin)
+{
+	ClusterCtrcDebugSnapshot snapshot;
+
+	if (!cluster_ctrc_debug_snapshot(&snapshot))
+		return false;
+#ifdef CLUSTER_CTRC_UNSETTLED_STATS_V1
+	if (snapshot.unsettled_stats_available) {
+		*count = snapshot.unsettled_count;
+		*origin = snapshot.unsettled_origin_node_id;
+		return true;
+	}
+#endif
+	return false;
+}
+
+UT_TEST(test_unsettled_gauge_keeps_shared_responsibilities_until_original_retirement)
+{
+	ClusterCtrcCloseDispatch dispatch;
+	ClusterCtrcSealReplyResult result;
+	ClusterCtrcOriginEntry before;
+	uint64 count = UINT64_MAX;
+	int32 origin = -1;
+
+	reset_fixture();
+	UT_ASSERT(unsettled_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, 0);
+	/* Uses the original shared handoff and ACK-frozen receipt producer;
+	 * the independent physical block0 durability boundary is assumed. */
+	completion_prepare_original_origin(0, &dispatch);
+	before = ctrc_origin_entries()[0];
+	UT_ASSERT(unsettled_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, 3);
+	UT_ASSERT_EQ(origin, 0);
+	UT_ASSERT(memcmp(&before, &ctrc_origin_entries()[0], sizeof(before)) == 0);
+	UT_ASSERT(cluster_ctrc_participant_certificate_batch_shared(&dispatch, 1, &result));
+	UT_ASSERT_EQ(result, CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED);
+	UT_ASSERT(unsettled_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, 1);
+	UT_ASSERT_EQ(ctrc_origin_entries()[0].state, CTRC_ORIGIN_RELEASE_PROVEN);
+	UT_ASSERT(cluster_ctrc_origin_note_certificate_reply_shared(dispatch.request_id, 0, result));
+	UT_ASSERT(unsettled_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, 0);
+	UT_ASSERT(!cluster_ctrc_origin_note_certificate_reply_shared(dispatch.request_id, 0, result));
+	UT_ASSERT(unsettled_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, 0);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_unsettled_gauge_retains_reservations_phases_and_opaque_occupancy)
+{
+	static const uint8 origin_states[] = { CTRC_ORIGIN_OPEN,	   CTRC_ORIGIN_SEALING,
+										   CTRC_ORIGIN_SEALED,	   CTRC_ORIGIN_CLEANING,
+										   CTRC_ORIGIN_CERTIFYING, CTRC_ORIGIN_RELEASE_PROVEN,
+										   CTRC_ORIGIN_BLOCKED,	   UINT8_MAX,
+										   CTRC_ORIGIN_EMPTY };
+	static const uint8 participant_states[]
+		= { CTRC_PARTICIPANT_OPEN,		CTRC_PARTICIPANT_CLOSED_DRAINING,
+			CTRC_PARTICIPANT_ACK_READY, CTRC_PARTICIPANT_ACK_FROZEN,
+			CTRC_PARTICIPANT_BLOCKED,	UINT8_MAX };
+	static const uint32 receipt_states[] = { CTRC_RECEIPT_PREPARED,	   CTRC_RECEIPT_APPLIED,
+											 CTRC_RECEIPT_CLEANED,	   CTRC_RECEIPT_CANCELLED,
+											 CTRC_RECEIPT_ACK_FROZEN,  CTRC_RECEIPT_BLOCKED,
+											 CTRC_RECEIPT_RETARGETING, UINT32_MAX };
+	ClusterCtrcOriginReservation reservation;
+	ClusterCtrcTxnKeyV1 key;
+	ClusterCtrcOriginEntry *entry;
+	ClusterCtrcParticipantEntry *participant;
+	ClusterCtrcReceipt *receipt;
+	uint64 count = UINT64_MAX;
+	int32 origin = -1;
+
+	reset_fixture();
+	key = fresh_origin_key();
+	test_my_proc.xid = key.xid;
+	test_top_full = FullTransactionIdFromEpochAndXid(7, key.xid);
+	pg_atomic_write_u64(&test_my_proc.cluster_top_full_xid_atomic,
+						U64FromFullTransactionId(test_top_full));
+	UT_ASSERT_EQ(cluster_ctrc_origin_reserve_active(&key, &reservation),
+				 CLUSTER_CTRC_ORIGIN_RESERVED_PENDING);
+	UT_ASSERT_EQ(ctrc_origin_entries()[0].state, CTRC_ORIGIN_EMPTY);
+	UT_ASSERT(unsettled_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, 1);
+	UT_ASSERT(cluster_ctrc_origin_cancel_pre_bind(&reservation));
+	UT_ASSERT(unsettled_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, 0);
+	entry = seed_origin(0, 0);
+	for (unsigned i = 0; i < lengthof(origin_states); i++) {
+		entry->state = origin_states[i];
+		UT_ASSERT(unsettled_read_actual_snapshot(&count, &origin));
+		UT_ASSERT_EQ(count, 1);
+	}
+	MemSet(entry, 0, sizeof(*entry));
+	participant = &ctrc_participant_entries()[0];
+	for (unsigned i = 0; i < lengthof(participant_states); i++) {
+		participant->state = participant_states[i];
+		UT_ASSERT(unsettled_read_actual_snapshot(&count, &origin));
+		UT_ASSERT_EQ(count, 1);
+	}
+	participant->state = CTRC_PARTICIPANT_EMPTY;
+	participant->key.xid = FirstNormalTransactionId;
+	UT_ASSERT(unsettled_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, 1);
+	MemSet(participant, 0, sizeof(*participant));
+	receipt = &ctrc_receipt_entries()[0];
+	for (unsigned i = 0; i < lengthof(receipt_states); i++) {
+		receipt->state = receipt_states[i];
+		UT_ASSERT(unsettled_read_actual_snapshot(&count, &origin));
+		UT_ASSERT_EQ(count, 1);
+	}
+	receipt->state = CTRC_RECEIPT_FREE;
+	ctrc_receipt_probe_states()[0] = CTRC_RECEIPT_PROBE_OCCUPIED;
+	UT_ASSERT(unsettled_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, 1);
+	ctrc_receipt_probe_states()[0] = UINT8_MAX;
+	UT_ASSERT(unsettled_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, 1);
+	ctrc_receipt_probe_states()[0] = CTRC_RECEIPT_PROBE_TOMBSTONE;
+	UT_ASSERT(unsettled_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, 0);
+	ctrc_receipt_probe_states()[0] = CTRC_RECEIPT_PROBE_EMPTY;
+	UT_ASSERT(unsettled_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, 0);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_unsettled_gauge_availability_requires_original_snapshot_success)
+{
+	ClusterCtrcDebugSnapshot snapshot;
+	ClusterCtrcSharedHeader *saved;
+	uint64 count = UINT64_MAX;
+	int32 origin = -1;
+	int saved_node = cluster_node_id;
+
+	reset_fixture();
+	printf("# unsettled_snapshot_bytes=%zu shared_header=%zu shared_region=" UINT64_FORMAT "\n",
+		   sizeof(snapshot), sizeof(*CtrcShared), CtrcShared->total_bytes);
+	cluster_node_id = 3;
+	UT_ASSERT(unsettled_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, 0);
+	UT_ASSERT_EQ(origin, 3);
+	for (int i = 0; i < 2; i++) {
+		cluster_node_id = i == 0 ? -1 : CLUSTER_CTRC_MAX_PARTICIPANTS;
+		count = UINT64_MAX;
+		origin = -1;
+		UT_ASSERT(cluster_ctrc_debug_snapshot(&snapshot));
+		UT_ASSERT(!unsettled_read_actual_snapshot(&count, &origin));
+		UT_ASSERT_EQ(count, UINT64_MAX);
+		UT_ASSERT_EQ(origin, -1);
+	}
+	cluster_node_id = 0;
+	pg_atomic_write_u32(&CtrcShared->test_barrier_phase, CTRC_TEST_BARRIER_COUNT);
+	UT_ASSERT(!unsettled_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, UINT64_MAX);
+	UT_ASSERT_EQ(origin, -1);
+	pg_atomic_write_u32(&CtrcShared->test_barrier_phase, CTRC_TEST_BARRIER_NONE);
+	saved = CtrcShared;
+	CtrcShared = NULL;
+	UT_ASSERT(!unsettled_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, UINT64_MAX);
+	UT_ASSERT_EQ(origin, -1);
+	CtrcShared = saved;
+	cluster_node_id = saved_node;
+	UT_ASSERT_EQ(held_count, 0);
+}
+
 int
 main(void)
 {
@@ -7613,7 +7780,7 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(179);
+	UT_PLAN(182);
 	UT_RUN(test_bounded_pool_selectors_observe_work_after_intervening_unlock);
 	UT_RUN(test_empty_bounded_pool_scan_keeps_round_robin_position);
 	UT_RUN(test_empty_pool_selectors_cancel_without_retaining_shared_locks);
@@ -7798,6 +7965,9 @@ main(void)
 	UT_RUN(test_completion_snapshot_preserves_unavailable_zero_origin_and_attach_counts);
 	UT_RUN(test_publisher_gauge_observes_original_certifying_until_shared_handoff);
 	UT_RUN(test_publisher_gauge_availability_preserves_original_snapshot_contract);
+	UT_RUN(test_unsettled_gauge_keeps_shared_responsibilities_until_original_retirement);
+	UT_RUN(test_unsettled_gauge_retains_reservations_phases_and_opaque_occupancy);
+	UT_RUN(test_unsettled_gauge_availability_requires_original_snapshot_success);
 	free(CtrcShared);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

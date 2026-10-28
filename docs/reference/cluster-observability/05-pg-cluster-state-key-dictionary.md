@@ -1324,3 +1324,16 @@ receipt 清理、参与者 ACK、证书发表、一般状态推进、重复回�
 | `ctrc_publisher_pending_count` | uint64 十进制文本 | 原本地 origin 表处于 `CERTIFYING` 的条目数；反映共享发表 handoff 尚未完成，可包括写入前或已耐久但尚未 handoff 的条目。 |
 
 这是查询时的阶段快照，退回 `BLOCKED` 或进入 `RELEASE_PROVEN` 后不再计入。`RELEASE_PROVEN` 仍可能等待通知或最终责任退休，不能据该计数为 0 推断所有清偿已完成。阶段观察也不证明磁盘耐久、owner 可运行、槽可复用或 undo 可回收；原身份和释放检查仍由实际使用路径完成。该值不是自 postmaster 启动累计的完成数。
+
+
+## Cleaner 未退休责任行（分类 `ctrc`）
+
+| 键 | 值 | 读法 |
+|---|---|---|
+| `ctrc_unsettled_stats_available` | `true` / `false` | 原诊断快照成功且本实例 origin 有效时为 `true`；否则省略以下 origin 和计数，不把不可用展示成 0。 |
+| `ctrc_unsettled_origin_node_id` | 非负整数文本 | 执行观察的本实例节点号，从 0 开始；不是远端事务节点号或集群合计。 |
+| `ctrc_unsettled_count` | uint64 十进制文本 | 查询时本地 origin、participant、receipt 三张表中尚占用的责任行数之和；同一事务可占多行，不是去重事务数或累计完成数。 |
+
+origin 和 participant 非全零的行计入，包含预留但仍为 `EMPTY` 的 origin、`RELEASE_PROVEN`、`ACK_FROZEN`、`BLOCKED` 和非零异常行。receipt 状态非 `FREE` 或池中位置仍占用时计入，空位置与可复用 tombstone 不计。责任只有完成原退休才退出该观察范围；异常占用并不证明身份有效或可推进。
+
+三张表分别在原保护锁下依次观察，并非同一时刻的完整切片。计数为 0 不证明无其他残留责任、停机就绪、可复用事务槽或可回收 undo；应结合原阶段、日志及实际使用路径的完整检查。该计数也不表示可供给的容量。

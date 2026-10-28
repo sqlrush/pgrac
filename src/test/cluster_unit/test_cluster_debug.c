@@ -634,6 +634,8 @@ cluster_ctrc_no_progress_stats_snapshot(ClusterCtrcNoProgressStats *out)
 
 static bool publisher_stats_available;
 static bool publisher_stats_zero;
+static bool unsettled_stats_available;
+static bool unsettled_stats_zero;
 
 bool
 cluster_ctrc_debug_snapshot(ClusterCtrcDebugSnapshot *snapshot)
@@ -645,6 +647,11 @@ cluster_ctrc_debug_snapshot(ClusterCtrcDebugSnapshot *snapshot)
 	snapshot->publisher_stats_available = publisher_stats_available;
 	snapshot->publisher_origin_node_id = 3;
 	snapshot->publisher_pending_count = publisher_stats_zero ? 0 : UINT64_MAX;
+#endif
+#ifdef CLUSTER_CTRC_UNSETTLED_STATS_V1
+	snapshot->unsettled_stats_available = unsettled_stats_available;
+	snapshot->unsettled_origin_node_id = 3;
+	snapshot->unsettled_count = unsettled_stats_zero ? 0 : UINT64_MAX;
 #endif
 	return true;
 }
@@ -6700,10 +6707,42 @@ UT_TEST(test_debug_publisher_gauge_preserves_availability_zero_unsigned_and_orig
 	ctrc_debug_snapshot_available = true;
 }
 
+UT_TEST(test_debug_unsettled_gauge_preserves_availability_zero_unsigned_and_origin)
+{
+	LOCAL_FCINFO(fcinfo, 0);
+	ReturnSetInfo rsinfo;
+
+	for (int mode = 0; mode < 4; mode++) {
+		bool available = mode == 1 || mode == 2;
+
+		memset(fcinfo, 0, SizeForFunctionCallInfo(0));
+		memset(&rsinfo, 0, sizeof(rsinfo));
+		captured_dump_row_count = captured_formatted_value_count = 0;
+		fcinfo->resultinfo = (fmNodePtr)&rsinfo;
+		unsettled_stats_available = mode != 0;
+		unsettled_stats_zero = mode == 1;
+		ctrc_debug_snapshot_available = mode != 3;
+		(void)cluster_dump_state(fcinfo);
+		UT_ASSERT_EQ(captured_dump_count("ctrc", "ctrc_unsettled_stats_available"), 1);
+		if (captured_dump_count("ctrc", "ctrc_unsettled_stats_available") == 1)
+			UT_ASSERT_STR_EQ(captured_dump_value("ctrc", "ctrc_unsettled_stats_available"),
+							 available ? "true" : "false");
+		UT_ASSERT_EQ(captured_dump_count("ctrc", "ctrc_unsettled_origin_node_id"), available);
+		UT_ASSERT_EQ(captured_dump_count("ctrc", "ctrc_unsettled_count"), available);
+		if (available && captured_dump_count("ctrc", "ctrc_unsettled_count") == 1) {
+			UT_ASSERT_STR_EQ(captured_dump_value("ctrc", "ctrc_unsettled_origin_node_id"), "3");
+			UT_ASSERT_STR_EQ(captured_dump_value("ctrc", "ctrc_unsettled_count"),
+							 mode == 1 ? "0" : "18446744073709551615");
+		}
+	}
+	unsettled_stats_available = unsettled_stats_zero = false;
+	ctrc_debug_snapshot_available = true;
+}
+
 int
 main(void)
 {
-	UT_PLAN(32);
+	UT_PLAN(33);
 	UT_RUN(test_debug_dump_retention_observations_preserve_availability_and_unsigned_values);
 	UT_RUN(test_debug_dump_exposes_native_drop_context_and_real_io_observation);
 	UT_RUN(test_debug_dump_exposes_pcm_first_refusal_identity_and_subpredicate);
@@ -6736,6 +6775,7 @@ main(void)
 	UT_RUN(test_debug_no_progress_counts_keep_availability_reason_and_unsigned_origin);
 	UT_RUN(test_debug_completion_count_preserves_availability_zero_unsigned_and_origin);
 	UT_RUN(test_debug_publisher_gauge_preserves_availability_zero_unsigned_and_origin);
+	UT_RUN(test_debug_unsettled_gauge_preserves_availability_zero_unsigned_and_origin);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

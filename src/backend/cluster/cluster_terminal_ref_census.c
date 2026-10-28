@@ -2807,8 +2807,15 @@ cluster_ctrc_debug_snapshot(ClusterCtrcDebugSnapshot *snapshot)
 		= cluster_node_id >= 0 && cluster_node_id < CLUSTER_CTRC_MAX_PARTICIPANTS;
 	if (snapshot->publisher_stats_available)
 		snapshot->publisher_origin_node_id = cluster_node_id;
+	snapshot->unsettled_stats_available
+		= cluster_node_id >= 0 && cluster_node_id < CLUSTER_CTRC_MAX_PARTICIPANTS;
+	if (snapshot->unsettled_stats_available)
+		snapshot->unsettled_origin_node_id = cluster_node_id;
 	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
 	for (i = 0; i < CtrcShared->origin_key_entries; i++) {
+		if (snapshot->unsettled_stats_available
+			&& !ctrc_bytes_zero(&ctrc_origin_entries()[i], sizeof(ClusterCtrcOriginEntry)))
+			snapshot->unsettled_count++;
 		switch ((ClusterCtrcOriginState)ctrc_origin_entries()[i].state) {
 		case CTRC_ORIGIN_OPEN:
 			snapshot->origin_open++;
@@ -2837,6 +2844,10 @@ cluster_ctrc_debug_snapshot(ClusterCtrcDebugSnapshot *snapshot)
 
 	ctrc_participant_locks_acquire(CTRC_PARTICIPANT_ALL_SHARDS);
 	for (i = 0; i < CtrcShared->participant_key_entries; i++) {
+		if (snapshot->unsettled_stats_available
+			&& !ctrc_bytes_zero(&ctrc_participant_entries()[i],
+								sizeof(ClusterCtrcParticipantEntry)))
+			snapshot->unsettled_count++;
 		switch ((ClusterCtrcParticipantState)ctrc_participant_entries()[i].state) {
 		case CTRC_PARTICIPANT_OPEN:
 			snapshot->participant_open++;
@@ -2862,7 +2873,12 @@ cluster_ctrc_debug_snapshot(ClusterCtrcDebugSnapshot *snapshot)
 	LWLockAcquire(&CtrcShared->receipt_lock, LW_EXCLUSIVE);
 	for (i = 0; i < CtrcShared->receipt_entries; i++) {
 		uint32 state = pg_atomic_read_u32((pg_atomic_uint32 *)&ctrc_receipt_entries()[i].state);
+		uint8 probe = ctrc_receipt_probe_states()[i];
 
+		if (snapshot->unsettled_stats_available
+			&& (state != CTRC_RECEIPT_FREE
+				|| (probe != CTRC_RECEIPT_PROBE_EMPTY && probe != CTRC_RECEIPT_PROBE_TOMBSTONE)))
+			snapshot->unsettled_count++;
 		switch ((ClusterCtrcReceiptState)state) {
 		case CTRC_RECEIPT_PREPARED:
 			snapshot->receipt_prepared++;

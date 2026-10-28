@@ -856,6 +856,7 @@ extern void cluster_ctrc_active_scan_step_source(
 
 
 #define CLUSTER_CTRC_PUBLISHER_STATS_V1 1
+#define CLUSTER_CTRC_UNSETTLED_STATS_V1 1
 
 typedef struct ClusterCtrcDebugSnapshot {
 	uint64 origin_open;
@@ -882,6 +883,11 @@ typedef struct ClusterCtrcDebugSnapshot {
 	uint64 publisher_pending_count;
 	int32 publisher_origin_node_id;
 	bool publisher_stats_available;
+	/* Occupied responsibility rows, not distinct keys or an idle proof.
+	 * Require snapshot success; domains are sampled under separate locks. */
+	uint64 unsettled_count;
+	int32 unsettled_origin_node_id;
+	bool unsettled_stats_available;
 } ClusterCtrcDebugSnapshot;
 
 typedef enum ClusterCtrcCapacityDisposition {

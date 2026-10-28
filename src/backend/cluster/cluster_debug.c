@@ -4652,6 +4652,19 @@ dump_ctrc_publisher(ReturnSetInfo *rsinfo, const ClusterCtrcDebugSnapshot *snaps
 }
 
 static void
+dump_ctrc_unsettled(ReturnSetInfo *rsinfo, const ClusterCtrcDebugSnapshot *snapshot)
+{
+	bool available = snapshot != NULL && snapshot->unsettled_stats_available;
+
+	emit_row(rsinfo, "ctrc", "ctrc_unsettled_stats_available", available ? "true" : "false");
+	if (!available)
+		return;
+	emit_row(rsinfo, "ctrc", "ctrc_unsettled_origin_node_id",
+			 fmt_int64(snapshot->unsettled_origin_node_id));
+	emit_row(rsinfo, "ctrc", "ctrc_unsettled_count", fmt_uint64(snapshot->unsettled_count));
+}
+
+static void
 dump_ctrc(ReturnSetInfo *rsinfo)
 {
 	ClusterCtrcDebugSnapshot snapshot;
@@ -4669,6 +4682,7 @@ dump_ctrc(ReturnSetInfo *rsinfo)
 	MemSet(&snapshot, 0, sizeof(snapshot));
 	snapshot_available = cluster_ctrc_debug_snapshot(&snapshot);
 	dump_ctrc_publisher(rsinfo, snapshot_available ? &snapshot : NULL);
+	dump_ctrc_unsettled(rsinfo, snapshot_available ? &snapshot : NULL);
 	if (!snapshot_available)
 		return;
 	reason = cluster_ctrc_cleaner_reason_get();
