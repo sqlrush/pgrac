@@ -197,7 +197,7 @@ static int test_candidate_wait_calls;
 static int test_candidate_wakes_before_terminal;
 static uint64 test_vis_evidence[CLUSTER_VIS_METRIC_COUNT];
 static int test_candidate_exit_hooks_ensure_calls;
-static uint32 test_candidate_acquire_segments[8];
+static uint32 test_candidate_acquire_segments[16];
 static int test_candidate_held_count;
 static int test_candidate_max_held_count;
 static int test_candidate_extract_calls;
@@ -833,6 +833,8 @@ cluster_undo_block0_current_acquire_begin_admitted(
 	ClusterUndoBlock0Result *failure pg_attribute_unused())
 {
 	UT_ASSERT(test_candidate_acquire_calls < (int)lengthof(test_candidate_acquire_segments));
+	if (test_candidate_acquire_calls >= (int)lengthof(test_candidate_acquire_segments))
+		return CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
 	test_candidate_acquire_segments[test_candidate_acquire_calls] = key->segment_id;
 	test_candidate_acquire_calls++;
 	UT_ASSERT_EQ(key->owner_instance, 1);
@@ -7595,7 +7597,7 @@ UT_TEST(test_retained_slot_identity_does_not_escape_original_final_fences)
 int
 main(void)
 {
-	UT_PLAN(297);
+	UT_PLAN(305);
 	UT_RUN(test_operation_worker_real_builder_yields_before_visibility);
 	UT_RUN(test_operation_worker_real_origin_completes_private_inverse);
 	UT_RUN(test_operation_worker_pending_current_is_bounded_and_counts_once);
@@ -7616,8 +7618,16 @@ main(void)
 	UT_RUN(test_operation_worker_stable_abort_allows_older_inverse);
 	UT_RUN(test_operation_worker_active_to_abort_remains_conservative);
 	UT_RUN(test_operation_worker_error_then_original_forget_is_idempotent);
-	UT_RUN(test_operation_worker_surviving_live_refuses_full);
+	UT_RUN(test_operation_worker_single_surviving_live_preserves_source);
 	UT_RUN(test_operation_worker_same_segment_cohort_waits_and_cancel_hands_off);
+	UT_RUN(test_operation_worker_live_head_keeps_result_while_older_insert_is_discarded);
+	UT_RUN(test_operation_worker_discarded_head_keeps_older_live_history);
+	UT_RUN(test_operation_worker_live_result_survives_disjoint_update_delete_and_lock);
+	UT_RUN(test_operation_worker_surviving_tid_overlap_refuses_older_projection);
+	UT_RUN(test_operation_worker_surviving_result_rejects_unknown_older_top);
+	UT_RUN(test_operation_worker_surviving_result_mutation_refuses_publication);
+	UT_RUN(test_operation_worker_exact_forget_frees_survivor_walk_and_original_guard);
+	UT_RUN(test_operation_worker_cohort_keeps_separate_survivor_pages);
 
 	UT_RUN(test_operation_poll_does_not_complete_inline);
 	UT_RUN(test_operation_poll_stages_outputs);
