@@ -318,6 +318,10 @@ cluster_control_root_revalidate(const ClusterControlRootReadToken *token,
 	return stub_root_revalidate_result;
 }
 
+/* Negative terminal results never manufacture provider authority. */
+static ClusterControlRootResult stub_terminal_result = CLUSTER_CONTROL_ROOT_ABSENT;
+static unsigned stub_terminal_validate_calls;
+
 ClusterControlRootResult
 cluster_control_root_v3_validate_rejoin_terminal(
 	const ClusterControlRootIdentity *expected_identity, uint64 failed_incarnation,
@@ -329,9 +333,10 @@ cluster_control_root_v3_validate_rejoin_terminal(
 	(void)failed_incarnation;
 	(void)expected_snapshot;
 	(void)expected_token;
+	stub_terminal_validate_calls++;
 	if (out_proof != NULL)
 		memset(out_proof, 0, sizeof(*out_proof));
-	return CLUSTER_CONTROL_ROOT_ABSENT;
+	return stub_terminal_result;
 }
 
 ClusterControlRootResult
@@ -1935,6 +1940,60 @@ UT_TEST(test_external_fence_rejoin_claim_receives_exact_offer)
 	complete_token.root_publish_seq = complete_snapshot.root_publish_seq;
 	complete_token.record_crc32c = UINT32_C(14);
 	complete_token.root_flags = complete_snapshot.root_flags;
+	/* A terminal read refusal must not enqueue AUTHORIZE_ON or consume the
+	 * clear proof. Physical ROOT validation is an explicit negative-result
+	 * leaf here; the original async rejoin and local socket protocol are real. */
+	{
+		static const struct {
+			ClusterControlRootResult result;
+			PgracExternalFenceRejoinStatus status;
+			PgracExternalFenceDenyReason reason;
+		} cases[]
+			= { { CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE, PGRAC_EXTERNAL_FENCE_REJOIN_WAITING_ROOT,
+				  PGRAC_EXTERNAL_FENCE_DENY_ROOT_NOT_COMPLETE },
+				{ CLUSTER_CONTROL_ROOT_ABSENT, PGRAC_EXTERNAL_FENCE_REJOIN_WAITING_ROOT,
+				  PGRAC_EXTERNAL_FENCE_DENY_ROOT_NOT_COMPLETE },
+				{ CLUSTER_CONTROL_ROOT_RECONFIG_WAIT, PGRAC_EXTERNAL_FENCE_REJOIN_WAITING_ROOT,
+				  PGRAC_EXTERNAL_FENCE_DENY_ROOT_NOT_COMPLETE },
+				{ CLUSTER_CONTROL_ROOT_STORAGE_CONTRACT_UNVERIFIED,
+				  PGRAC_EXTERNAL_FENCE_REJOIN_WAITING_ROOT,
+				  PGRAC_EXTERNAL_FENCE_DENY_ROOT_NOT_COMPLETE },
+				{ CLUSTER_CONTROL_ROOT_STALE_TOKEN, PGRAC_EXTERNAL_FENCE_REJOIN_STALE,
+				  PGRAC_EXTERNAL_FENCE_DENY_ROOT_STALE },
+				{ CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH, PGRAC_EXTERNAL_FENCE_REJOIN_STALE,
+				  PGRAC_EXTERNAL_FENCE_DENY_ROOT_STALE },
+				{ CLUSTER_CONTROL_ROOT_IO_ERROR, PGRAC_EXTERNAL_FENCE_REJOIN_STALE,
+				  PGRAC_EXTERNAL_FENCE_DENY_ROOT_STALE },
+				{ CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN, PGRAC_EXTERNAL_FENCE_REJOIN_STALE,
+				  PGRAC_EXTERNAL_FENCE_DENY_ROOT_STALE } };
+		ClusterControlRootSnapshot terminal_snapshot = complete_snapshot;
+		ClusterControlRootReadToken terminal_token = complete_token;
+		PgracExternalFenceRejoinAuthorityClearV1 *original_clear = authority_clear;
+
+		terminal_snapshot.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
+		terminal_token.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
+		for (unsigned i = 0; i < lengthof(cases); i++) {
+			uint8 pending_byte;
+			ssize_t pending_bytes;
+			int peek_errno;
+			unsigned calls = stub_terminal_validate_calls;
+
+			stub_terminal_result = cases[i].result;
+			authorize_status = cluster_external_fence_rejoin_authorize_on_async(
+				op, &authority_clear, &old_identity, &terminal_snapshot, &terminal_token,
+				response.protected_set_digest, &reason);
+			UT_ASSERT_EQ(authorize_status, cases[i].status);
+			UT_ASSERT_EQ(reason, cases[i].reason);
+			UT_ASSERT(authority_clear == original_clear);
+			UT_ASSERT_EQ(stub_terminal_validate_calls, calls + 1);
+			pending_bytes = recv(peer_fd, &pending_byte, 1, MSG_PEEK | MSG_DONTWAIT);
+			peek_errno = errno;
+			UT_ASSERT(pending_bytes == -1 && (peek_errno == EAGAIN || peek_errno == EWOULDBLOCK));
+			if (ut_current_failed)
+				goto cleanup;
+		}
+		stub_terminal_result = CLUSTER_CONTROL_ROOT_ABSENT;
+	}
 	authorize_status = cluster_external_fence_rejoin_authorize_on_async(
 		op, &authority_clear, &old_identity, &complete_snapshot, &complete_token,
 		response.protected_set_digest, &reason);
@@ -2082,6 +2141,7 @@ UT_TEST(test_external_fence_rejoin_claim_receives_exact_offer)
 	UT_ASSERT_EQ(reason, PGRAC_EXTERNAL_FENCE_DENY_REJOIN_CONSUMED);
 
 cleanup:
+	stub_terminal_result = CLUSTER_CONTROL_ROOT_ABSENT;
 	cluster_external_fence_rejoin_authority_clear_release(&authority_clear);
 	cluster_external_fence_rejoin_release(&op);
 	UT_ASSERT(op == NULL);
