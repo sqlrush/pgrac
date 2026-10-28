@@ -1770,12 +1770,176 @@ clog_recovery_full_record_shape(const ClusterSideProjectionOperationV1 *op,
 }
 
 static bool
+clog_recovery_own_full_permitted(int origin)
+{
+	return cluster_shared_config && AmStartupProcess() && InRecovery
+		&& origin >= 0 && origin < CLOG_RECOVERY_ORIGINS && origin == cluster_node_id
+		&& XactCtl->shared != NULL && ClogRecoveryLocks != NULL
+		&& cluster_undo_recovery_cold_origin_authorized_v1(origin);
+}
+
+static bool
+clog_recovery_own_full_directory_ready(int origin)
+{
+	return clog_recovery_own_full_permitted(origin) && clog_native_directory_ready(origin)
+		&& clog_recovery_own_full_permitted(origin);
+}
+
+/* The original shared cache cannot be discarded to force a physical read. */
+static bool
+clog_recovery_disk_zero(SlruCtl disk, int page, const struct stat *expected)
+{
+	PGAlignedBlock bytes;
+	char path[MAXPGPATH];
+	struct stat opened, after;
+	volatile int fd = -1;
+	volatile bool ok = false;
+	int length = snprintf(path, sizeof(path), "%s/%04X", disk->Dir,
+		page / SLRU_PAGES_PER_SEGMENT);
+	off_t offset = (off_t)(page % SLRU_PAGES_PER_SEGMENT) * BLCKSZ;
+
+	if (length < 0 || length >= sizeof(path))
+		return false;
+	PG_TRY();
+	{
+		fd = OpenTransientFile(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | PG_BINARY);
+		if (fd >= 0 && fstat(fd, &opened) == 0 && S_ISREG(opened.st_mode)
+			&& opened.st_nlink == 1 && opened.st_uid == geteuid()
+			&& (opened.st_mode & (S_IWGRP | S_IWOTH)) == 0
+			&& clog_recovery_same_file(expected, &opened)
+			&& pg_pread(fd, bytes.data, BLCKSZ, offset) == BLCKSZ) {
+			ok = true;
+			for (int i = 0; i < BLCKSZ && ok; i++)
+				ok = bytes.data[i] == 0;
+			ok = ok && fstat(fd, &after) == 0 && clog_recovery_same_file(expected, &after)
+				&& clog_recovery_page_identity(disk, page, &after)
+				&& clog_recovery_same_file(expected, &after);
+		}
+	}
+	PG_FINALLY();
+	{
+		if (fd >= 0 && CloseTransientFile(fd) != 0)
+			ok = false;
+	}
+	PG_END_TRY();
+	return ok;
+}
+
+static bool
+clog_recovery_own_full_zero(int origin, int page, bool verify)
+{
+	SlruCtlData disk;
+	char path[MAXPGPATH];
+	struct stat before, after, routed;
+	bool exists;
+	volatile bool ok = false, finished = false;
+	int length;
+
+	if (!clog_recovery_own_full_directory_ready(origin))
+		return false;
+	/* Only disk identity/readback uses this absolute copy. Native cache and
+	 * writes keep XactCtl, its locks and unrelated dirty/group-LSN state. */
+	disk = *XactCtl;
+	length = snprintf(disk.Dir, sizeof(disk.Dir), "%s/native_side/origin_%d/pg_xact",
+		cluster_shared_data_dir, origin);
+	if (length < 0 || length >= sizeof(disk.Dir))
+		return false;
+	length = snprintf(path, sizeof(path), "%s/%04X", disk.Dir, page / SLRU_PAGES_PER_SEGMENT);
+	if (length < 0 || length >= sizeof(path))
+		return false;
+	exists = lstat(path, &before) == 0;
+	if ((!exists && (errno != ENOENT || verify))
+		|| (exists && (!S_ISREG(before.st_mode) || before.st_nlink != 1
+			|| before.st_uid != geteuid() || (before.st_mode & (S_IWGRP | S_IWOTH)) != 0))
+		|| (verify && !clog_recovery_page_identity(&disk, page, &before)))
+		return false;
+	PG_TRY();
+	{
+		int slot;
+
+		LWLockAcquire(XactCtl->shared->ControlLock, LW_EXCLUSIVE);
+		ok = clog_recovery_own_full_directory_ready(origin);
+		if (ok && verify) {
+			slot = SimpleLruReadPage(XactCtl, page, true, InvalidTransactionId);
+			for (int i = 0; i < BLCKSZ && ok; i++)
+				ok = XactCtl->shared->page_buffer[slot][i] == 0;
+		} else if (ok) {
+			slot = SimpleLruZeroPage(XactCtl, page);
+			SimpleLruWritePage(XactCtl, slot);
+		}
+		finished = true;
+	}
+	PG_FINALLY();
+	{
+		/* Leave native SLRU's error/dirty/I/O ownership intact. */
+		if (LWLockHeldByMe(XactCtl->shared->ControlLock)) {
+			/* elog ERROR clears the original lock's interrupt holdoff. */
+			if (!finished)
+				HOLD_INTERRUPTS();
+			LWLockRelease(XactCtl->shared->ControlLock);
+		}
+	}
+	PG_END_TRY();
+	if (!ok || !clog_recovery_own_full_directory_ready(origin)
+		|| !clog_recovery_page_identity(&disk, page, &after)
+		|| (exists && (before.st_dev != after.st_dev || before.st_ino != after.st_ino))
+		|| after.st_size != (verify ? before.st_size
+			: Max(exists ? before.st_size : 0,
+				(off_t)(page % SLRU_PAGES_PER_SEGMENT + 1) * BLCKSZ))
+		|| !clog_recovery_page_identity(XactCtl, page, &routed)
+		|| !clog_recovery_same_file(&after, &routed))
+		return false;
+	if (verify)
+		return clog_recovery_disk_zero(&disk, page, &after)
+			&& clog_recovery_own_full_directory_ready(origin);
+	return clog_recovery_sync(&disk, page, &after) && clog_recovery_sync(&disk, -1, NULL)
+		&& clog_recovery_own_full_zero(origin, page, true);
+}
+
+static bool
+clog_recovery_own_full_record(int origin, const ClusterSideProjectionOperationV1 *op,
+	bool verify, const uint8 *payload, uint32 length)
+{
+	volatile bool locked = false, ok = false, finished = false;
+	LWLock *lock;
+
+	/* Own legacy ZERO/TRUNCATE and C0 terminal permissions remain separate. */
+	if (!clog_recovery_full_record_shape(op, payload, length)
+		|| !clog_recovery_own_full_directory_ready(origin))
+		return false;
+	if (!verify)
+		clog_relmap_native_mutation(origin);
+	lock = &ClogRecoveryLocks[origin * 2 + 1].lock;
+	PG_TRY();
+	{
+		LWLockAcquire(lock, LW_EXCLUSIVE);
+		locked = true;
+		ok = clog_recovery_own_full_zero(origin, op->page_number, verify);
+		finished = true;
+	}
+	PG_FINALLY();
+	{
+		if (locked) {
+			if (!finished)
+				HOLD_INTERRUPTS();
+			LWLockRelease(lock);
+		}
+		if (!verify)
+			clog_relmap_native_mutation_end(origin);
+	}
+	PG_END_TRY();
+	return ok;
+}
+
+static bool
 clog_recovery_record(int origin, const ClusterSideProjectionOperationV1 *op, bool verify,
 					 const uint8 *payload, uint32 length)
 {
 	volatile bool locked = false, ok = false;
 	LWLock *lock;
 
+	if (origin == cluster_node_id)
+		return clog_recovery_own_full_record(origin, op, verify, payload, length);
 	if (!clog_recovery_permitted(origin) || op == NULL || op->kind != CLUSTER_SIDE_PROJECTION_CLOG
 		|| op->page_number < 0 || (uint32)op->page_number > UINT32_MAX / CLOG_XACTS_PER_PAGE)
 		return false;

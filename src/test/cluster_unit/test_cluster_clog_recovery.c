@@ -1313,6 +1313,7 @@ fixture_cleanup(void)
 }
 
 #include "test_cluster_clog_full_consumer.inc"
+#include "test_cluster_clog_own_full.inc"
 
 int
 main(void)
@@ -1364,7 +1365,15 @@ main(void)
 		UT_RUN(relmap_other_process_mutation_during_root_cannot_publish);
 		goto mutation_done;
 	}
-	UT_PLAN(54);
+	if (getenv("PGRAC_OWN_FULL_CLOG_ONLY") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(own_full_cold_replay_preserves_native_cache_and_reads_disk);
+		UT_RUN(own_full_cold_replay_requires_exact_cold_role_shape_and_route);
+		UT_RUN(own_full_cold_replay_errors_keep_original_cache_and_cleanup);
+		UT_RUN(own_full_cold_replay_revokes_equal_byte_held_observation);
+		goto mutation_done;
+	}
+	UT_PLAN(58);
 	UT_RUN(separate_original_origin_controls);
 	UT_RUN(commit_and_abort_persist_full_tree_without_local_pollution);
 	UT_RUN(conflicting_late_child_refuses_before_any_tree_write);
@@ -1419,6 +1428,10 @@ main(void)
 	UT_RUN(relmap_other_process_inflight_write_refuses_new_and_old_reads);
 	UT_RUN(relmap_other_process_mutation_during_root_cannot_publish);
 	UT_RUN(relmap_shared_mutation_saturation_and_missing_state_never_grant);
+	UT_RUN(own_full_cold_replay_preserves_native_cache_and_reads_disk);
+	UT_RUN(own_full_cold_replay_requires_exact_cold_role_shape_and_route);
+	UT_RUN(own_full_cold_replay_errors_keep_original_cache_and_cleanup);
+	UT_RUN(own_full_cold_replay_revokes_equal_byte_held_observation);
 mutation_done:
 	fixture_cleanup();
 	UT_DONE();
