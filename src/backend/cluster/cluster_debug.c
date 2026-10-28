@@ -4606,6 +4606,19 @@ dump_multixact_current(ReturnSetInfo *rsinfo)
 }
 
 static void
+dump_ctrc_completion(ReturnSetInfo *rsinfo)
+{
+	ClusterCtrcCompletionStats stats;
+	bool available = cluster_ctrc_completion_stats_snapshot(&stats);
+
+	emit_row(rsinfo, "ctrc", "ctrc_completion_stats_available", available ? "true" : "false");
+	if (!available)
+		return;
+	emit_row(rsinfo, "ctrc", "ctrc_completion_origin_node_id", fmt_int64(stats.origin_node_id));
+	emit_row(rsinfo, "ctrc", "ctrc_real_completion_count", fmt_uint64(stats.real_completion_count));
+}
+
+static void
 dump_ctrc_no_progress(ReturnSetInfo *rsinfo)
 {
 	ClusterCtrcNoProgressStats stats;
@@ -4636,6 +4649,7 @@ dump_ctrc(ReturnSetInfo *rsinfo)
 		emit_row(rsinfo, "ctrc", cluster_ctrc_stat_name((ClusterCtrcStatId)i),
 				 fmt_int64((int64)cluster_ctrc_stat_get((ClusterCtrcStatId)i)));
 
+	dump_ctrc_completion(rsinfo);
 	dump_ctrc_no_progress(rsinfo);
 	MemSet(&snapshot, 0, sizeof(snapshot));
 	if (!cluster_ctrc_debug_snapshot(&snapshot))

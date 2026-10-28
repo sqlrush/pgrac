@@ -1302,3 +1302,14 @@
 | `ctrc_phase_no_progress_by_reason.PARTICIPANT_ACK` | uint64 十进制文本 | 最终原因是参与者 ACK 的无进展 pass。 |
 | `ctrc_phase_no_progress_by_reason.BLOCK0_CERTIFICATE` | uint64 十进制文本 | 最终原因是 block0 certificate 的无进展 pass。 |
 | `ctrc_phase_no_progress_by_reason.BLOCKED` | uint64 十进制文本 | 最终原因是 BLOCKED 的无进展 pass；结合原阶段与日志定位。 |
+
+
+## Cleaner 清偿完成计数（分类 `ctrc`）
+
+| 键 | 值 | 读法 |
+|---|---|---|
+| `ctrc_completion_stats_available` | `true` / `false` | `false` 时省略以下 origin 和完成计数，不把不可用展示成 0。 |
+| `ctrc_completion_origin_node_id` | 非负整数文本 | 执行清偿的本实例节点号，从 0 开始；不是被处理事务的节点号或集群合计。 |
+| `ctrc_real_completion_count` | uint64 十进制文本 | 本 postmaster 生命周期内，原 origin 清偿责任实际退休的次数；原证书和全部必要通知完成后，每次成功退休恰好加一。零参与者的成功退休也计入。 |
+
+receipt 清理、参与者 ACK、证书发表、一般状态推进、重复回复或失败重试都不单独增加完成计数。计数表示原清偿责任完成，不表示 allocator 已复用事务槽或已回收 undo 块。统计跨 worker 累计，attach 不清零；可用的真实 0 与不可用不同，比较时间窗增量时同时保留 origin 和实例生命周期。
