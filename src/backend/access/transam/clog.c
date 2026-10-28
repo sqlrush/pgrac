@@ -124,9 +124,15 @@ static SlruCtlData XactCtlData;
 #define CLOG_RECOVERY_BUFFERS 2
 static SlruCtlData ClogRecoveryCtl[CLOG_RECOVERY_ORIGINS];
 static LWLockPadded *ClogRecoveryLocks;
+typedef struct ClogRelmapMutation {
+	pg_atomic_uint64 generation;
+	pg_atomic_uint32 writers;
+} ClogRelmapMutation;
+static ClogRelmapMutation *ClogRelmapMutations;
 
 static void clog_recovery_shmem_init(void);
 static void clog_relmap_native_mutation(int origin);
+static void clog_relmap_native_mutation_end(int origin);
 #endif
 
 
@@ -713,6 +719,9 @@ TransactionIdSetStatusBit(TransactionId xid, XidStatus status, XLogRecPtr lsn, i
 		if (XactCtl->shared->group_lsn[lsnindex] < lsn)
 			XactCtl->shared->group_lsn[lsnindex] = lsn;
 	}
+#ifdef USE_PGRAC_CLUSTER
+	clog_relmap_native_mutation_end(cluster_node_id);
+#endif
 }
 
 /*
@@ -984,6 +993,7 @@ struct ClusterRelmapClogBaseHandleV1 {
 	int fd;
 	bool failed;
 	bool invalidated;
+	uint64 mutation_generation;
 	struct ClusterRelmapClogBaseHandleV1 *next;
 	ClusterRecoveryRelmapSourceV1 source;
 	ClusterRelmapClogBaseV1 base;
@@ -991,7 +1001,8 @@ struct ClusterRelmapClogBaseHandleV1 {
 
 /* Nonowning process-local bookkeeping for the original handles. A native
  * write can restore identical bytes, so inode/image equality cannot revive
- * an observation across that write. This is not cross-process exclusion or
+ * an observation across that write. The shared sequence below also observes
+ * other backends of this postmaster; neither is inter-instance exclusion or
  * an era/history/lifetime proof. The original destructor still owns the fd. */
 static ClusterRelmapClogBaseHandleV1 *ClogRelmapBases;
 
@@ -999,6 +1010,9 @@ static void
 clog_relmap_native_mutation(int origin)
 {
 	ClusterRelmapClogBaseHandleV1 *held;
+	ClogRelmapMutation *mutation;
+	uint32 writers;
+	uint64 generation;
 
 	if (!cluster_shared_config)
 		return;
@@ -1006,6 +1020,64 @@ clog_relmap_native_mutation(int origin)
 		if (held->pid == getpid()
 			&& held->source.selected.source.claim.identity.origin_thread_id == origin + 1)
 			held->invalidated = true;
+	if (ClogRelmapMutations == NULL || origin < 0 || origin >= CLOG_RECOVERY_ORIGINS)
+		return;
+	mutation = &ClogRelmapMutations[origin];
+	/* Reserve before changing the sequence: a new read must not sample an
+	 * attempt that has announced itself but has not yet changed any bytes.
+	 * CAS operations are full barriers. Saturation never wraps into a grant. */
+	writers = pg_atomic_read_u32(&mutation->writers);
+	while (writers != UINT32_MAX
+		&& !pg_atomic_compare_exchange_u32(&mutation->writers, &writers, writers + 1))
+		;
+	generation = pg_atomic_read_u64(&mutation->generation);
+	while (generation != UINT64_MAX
+		&& !pg_atomic_compare_exchange_u64(&mutation->generation, &generation, generation + 1))
+		;
+}
+
+static void
+clog_relmap_native_mutation_end(int origin)
+{
+	ClogRelmapMutation *mutation;
+	uint32 writers;
+	if (!cluster_shared_config || ClogRelmapMutations == NULL
+		|| origin < 0 || origin >= CLOG_RECOVERY_ORIGINS)
+		return;
+	mutation = &ClogRelmapMutations[origin];
+	writers = pg_atomic_read_u32(&mutation->writers);
+	while (writers != 0 && writers != UINT32_MAX
+		&& !pg_atomic_compare_exchange_u32(&mutation->writers, &writers, writers - 1))
+		;
+}
+
+static bool
+clog_relmap_mutation_snapshot(int origin, uint64 *generation)
+{
+	ClogRelmapMutation *mutation;
+	uint64 value;
+	if (ClogRelmapMutations == NULL || origin < 0 || origin >= CLOG_RECOVERY_ORIGINS)
+		return false;
+	mutation = &ClogRelmapMutations[origin];
+	if (pg_atomic_read_u32(&mutation->writers) != 0)
+		return false;
+	pg_read_barrier();
+	value = pg_atomic_read_u64(&mutation->generation);
+	pg_read_barrier();
+	if (value == 0 || value == UINT64_MAX || pg_atomic_read_u32(&mutation->writers) != 0)
+		return false;
+	pg_read_barrier();
+	if (pg_atomic_read_u64(&mutation->generation) != value)
+		return false;
+	*generation = value;
+	return true;
+}
+
+static bool
+clog_relmap_mutation_matches(int origin, uint64 generation)
+{
+	uint64 current;
+	return clog_relmap_mutation_snapshot(origin, &current) && current == generation;
 }
 
 static void
@@ -1058,6 +1130,7 @@ clog_relmap_base_read(const ClusterRecoveryRelmapSourceV1 *source,
 	struct stat before, opened, after;
 	char path[MAXPGPATH];
 	int origin, page, length;
+	uint64 mutation_generation = 0;
 	bool existing;
 	volatile int fd = -1;
 	volatile bool locked = false, ok = false;
@@ -1140,11 +1213,14 @@ clog_relmap_base_read(const ClusterRecoveryRelmapSourceV1 *source,
 
 	PG_TRY();
 	{
-		ok = cluster_wal_inputs_relmap_source_revalidate_v1(&original);
+		ok = clog_relmap_mutation_snapshot(origin, &mutation_generation)
+			&& (!existing || held->mutation_generation == mutation_generation)
+			&& cluster_wal_inputs_relmap_source_revalidate_v1(&original);
 		if (ok) {
 			LWLockAcquire(lock, LW_EXCLUSIVE);
 			locked = true;
-			ok = !held->invalidated && clog_relmap_source_current(&original, origin)
+			ok = !held->invalidated && clog_relmap_mutation_matches(origin, mutation_generation)
+				&& clog_relmap_source_current(&original, origin)
 				&& clog_native_directory_ready(origin)
 				&& clog_recovery_page_identity(&disk, page, &before);
 			if (ok) {
@@ -1171,6 +1247,7 @@ clog_relmap_base_read(const ClusterRecoveryRelmapSourceV1 *source,
 					&& clog_recovery_same_file(&before, &after)
 					&& clog_native_directory_ready(origin)
 					&& clog_relmap_source_current(&original, origin)
+					&& clog_relmap_mutation_matches(origin, mutation_generation)
 					&& (!existing || memcmp(base.image, held->base.image, BLCKSZ) == 0);
 			}
 			LWLockRelease(lock);
@@ -1178,7 +1255,8 @@ clog_relmap_base_read(const ClusterRecoveryRelmapSourceV1 *source,
 		}
 		/* There is no native lock or borrowed-output publication over ROOT I/O. */
 		ok = ok && cluster_wal_inputs_relmap_source_revalidate_v1(&original)
-			&& memcmp(source, &original, sizeof(original)) == 0 && !held->invalidated;
+			&& memcmp(source, &original, sizeof(original)) == 0 && !held->invalidated
+			&& clog_relmap_mutation_matches(origin, mutation_generation);
 		if (!ok)
 			cluster_wal_inputs_relmap_source_fail_v1(&original);
 	}
@@ -1216,6 +1294,7 @@ clog_relmap_base_read(const ClusterRecoveryRelmapSourceV1 *source,
 		& CLOG_XACT_BITMASK;
 	base.device = before.st_dev; base.inode = before.st_ino; base.size = before.st_size;
 	held->fd = fd;
+	held->mutation_generation = mutation_generation;
 	memcpy(&held->base, &base, sizeof(base));
 	held->failed = false;
 	*custody = held;
@@ -1515,16 +1594,18 @@ clog_recovery_access(int origin, TransactionId xid, int nsubxids, const Transact
 	}
 	if (!verify)
 		clog_relmap_native_mutation(origin);
-	if (origin == cluster_node_id)
-		return clog_recovery_own_abort(origin, xid, verify);
-	lock = &ClogRecoveryLocks[origin * 2 + 1].lock;
+	lock = origin == cluster_node_id ? NULL : &ClogRecoveryLocks[origin * 2 + 1].lock;
 	PG_TRY();
 	{
-		LWLockAcquire(lock, LW_EXCLUSIVE);
-		locked = true;
-		clog_recovery_cache_discard(&ClogRecoveryCtl[origin]);
-		if (clog_recovery_terminal_directory_ready(origin, xid, nsubxids, status))
-			ok = clog_recovery_tree(origin, xid, nsubxids, subxids, status, verify);
+		if (origin == cluster_node_id)
+			ok = clog_recovery_own_abort(origin, xid, verify);
+		else {
+			LWLockAcquire(lock, LW_EXCLUSIVE);
+			locked = true;
+			clog_recovery_cache_discard(&ClogRecoveryCtl[origin]);
+			if (clog_recovery_terminal_directory_ready(origin, xid, nsubxids, status))
+				ok = clog_recovery_tree(origin, xid, nsubxids, subxids, status, verify);
+		}
 	}
 	PG_FINALLY();
 	{
@@ -1532,6 +1613,8 @@ clog_recovery_access(int origin, TransactionId xid, int nsubxids, const Transact
 			clog_recovery_cache_discard(&ClogRecoveryCtl[origin]);
 			LWLockRelease(lock);
 		}
+		if (!verify)
+			clog_relmap_native_mutation_end(origin);
 	}
 	PG_END_TRY();
 	return ok;
@@ -1730,6 +1813,8 @@ clog_recovery_record(int origin, const ClusterSideProjectionOperationV1 *op, boo
 			clog_recovery_cache_discard(&ClogRecoveryCtl[origin]);
 			LWLockRelease(lock);
 		}
+		if (!verify)
+			clog_relmap_native_mutation_end(origin);
 	}
 	PG_END_TRY();
 	return ok;
@@ -1774,6 +1859,13 @@ clog_recovery_shmem_init(void)
 {
 	bool found;
 
+	ClogRelmapMutations = ShmemInitStruct("CLOG relmap mutation",
+		CLOG_RECOVERY_ORIGINS * sizeof(ClogRelmapMutation), &found);
+	if (!found)
+		for (int origin = 0; origin < CLOG_RECOVERY_ORIGINS; ++origin) {
+			pg_atomic_init_u64(&ClogRelmapMutations[origin].generation, 1);
+			pg_atomic_init_u32(&ClogRelmapMutations[origin].writers, 0);
+		}
 	ClogRecoveryLocks = ShmemInitStruct("CLOG recovery locks",
 										2 * CLOG_RECOVERY_ORIGINS * sizeof(LWLockPadded), &found);
 	for (int origin = 0; origin < CLOG_RECOVERY_ORIGINS; origin++) {
@@ -1815,6 +1907,7 @@ CLOGShmemSize(void)
 		size = add_size(
 			size, mul_size(CLOG_RECOVERY_ORIGINS, SimpleLruShmemSize(CLOG_RECOVERY_BUFFERS, 0)));
 		size = add_size(size, mul_size(2 * CLOG_RECOVERY_ORIGINS, sizeof(LWLockPadded)));
+		size = add_size(size, mul_size(CLOG_RECOVERY_ORIGINS, sizeof(ClogRelmapMutation)));
 	}
 #endif
 	return size;
@@ -1869,15 +1962,25 @@ BootStrapCLOG(void)
 static int
 ZeroCLOGPage(int pageno, bool writeXlog)
 {
-	int			slotno;
+	volatile int slotno;
 
 #ifdef USE_PGRAC_CLUSTER
 	clog_relmap_native_mutation(cluster_node_id);
+	PG_TRY();
+	{
 #endif
 	slotno = SimpleLruZeroPage(XactCtl, pageno);
 
 	if (writeXlog)
 		WriteZeroPageXlogRec(pageno);
+#ifdef USE_PGRAC_CLUSTER
+	}
+	PG_FINALLY();
+	{
+		clog_relmap_native_mutation_end(cluster_node_id);
+	}
+	PG_END_TRY();
+#endif
 
 	return slotno;
 }
@@ -2086,6 +2189,8 @@ TruncateCLOG(TransactionId oldestXact, Oid oldestxid_datoid)
 
 #ifdef USE_PGRAC_CLUSTER
 	clog_relmap_native_mutation(cluster_node_id);
+	PG_TRY();
+	{
 #endif
 	/*
 	 * Advance oldestClogXid before truncating clog, so concurrent xact status
@@ -2106,6 +2211,14 @@ TruncateCLOG(TransactionId oldestXact, Oid oldestxid_datoid)
 
 	/* Now we can remove the old CLOG segment(s) */
 	SimpleLruTruncate(XactCtl, cutoffPage);
+#ifdef USE_PGRAC_CLUSTER
+	}
+	PG_FINALLY();
+	{
+		clog_relmap_native_mutation_end(cluster_node_id);
+	}
+	PG_END_TRY();
+#endif
 }
 
 
@@ -2229,10 +2342,20 @@ clog_redo(XLogReaderState *record)
 
 #ifdef USE_PGRAC_CLUSTER
 		clog_relmap_native_mutation(cluster_node_id);
+		PG_TRY();
+		{
 #endif
 		AdvanceOldestClogXid(xlrec.oldestXact);
 
 		SimpleLruTruncate(XactCtl, xlrec.pageno);
+#ifdef USE_PGRAC_CLUSTER
+		}
+		PG_FINALLY();
+		{
+			clog_relmap_native_mutation_end(cluster_node_id);
+		}
+		PG_END_TRY();
+#endif
 	}
 	else
 		elog(PANIC, "clog_redo: unknown op code %u", info);
