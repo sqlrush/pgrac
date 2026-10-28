@@ -7849,8 +7849,12 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 		ctrc_receipt_handle_fill(handle, participant, participant_index, &receipts[receipt_index],
 								 receipt_index);
 	}
+	/* A complete foreign identity still has no local origin/PGPROC handoff.
+	 * Revoke the prior scan cut before this first receiver becomes visible,
+	 * even when its original FullXid was copied from an authenticated grant.
+	 * Exact local handoffs and already registered duplicates need no restart. */
 	if (participant_was_empty && !ctrc_bytes_zero(participant, sizeof(*participant))
-		&& (!FullTransactionIdIsNormal(participant->original_full_xid)
+		&& (!local_origin || !FullTransactionIdIsNormal(participant->original_full_xid)
 			|| XidFromFullTransactionId(participant->original_full_xid) != participant->key.xid))
 		ctrc_note_unqualified_registration();
 

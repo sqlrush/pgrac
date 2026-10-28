@@ -9036,6 +9036,220 @@ UT_TEST(test_receiver_companion_data_segment_does_not_replace_canonical_key)
 		&locator, NULL, false);
 }
 
+/* These tests model the distinct origin and receiver shared-memory tables.
+ * Capture the real protected origin envelope first, then give the receiver
+ * its own empty origin table; this is not retirement of the remote owner. */
+typedef struct QualifiedForeignRegistrationFixture
+{
+	ClusterCtrcOriginEntry source;
+	ClusterCtrcParticipantIdentity receiver;
+	ClusterCtrcPublicationIdV1 publication;
+	ClusterCtrcTargetV1 target;
+	uint8 original[CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES];
+} QualifiedForeignRegistrationFixture;
+
+static bool
+qualified_foreign_registration_fixture(QualifiedForeignRegistrationFixture *fixture)
+{
+	ClusterCtrcOriginEntry *origin;
+
+	reset_fixture();
+	cluster_node_id = 0;
+	origin = seed_origin(0, 2);
+	fixture->source = *origin;
+	fixture->receiver = origin->touched[1];
+	if (!cluster_ctrc_origin_fullxid_capture_v2(&origin->key, &fixture->receiver,
+		origin->grant_generation, fixture->original))
+		return false;
+	fixture_receipt_inputs(origin, 2201, &fixture->publication, &fixture->target);
+	fixture->publication.requester_node_id = fixture->receiver.node_id;
+	fixture->publication.requester_boot_incarnation = fixture->receiver.boot_incarnation;
+	MemSet(origin, 0, sizeof(*origin));
+	cluster_node_id = fixture->receiver.node_id;
+	return true;
+}
+
+static void
+finish_qualified_foreign_registration_scan(ClusterCtrcActiveScan *scan)
+{
+	uint64 slices = 0;
+
+	/* Later fixtures use the full configured participant capacity. Do not
+	 * inherit the early four-node helper's fixed 1,000-slice limit. */
+	while (scan->status == CTRC_ACTIVE_SCAN_INCOMPLETE
+		&& slices++ < scan->total_entries / CLUSTER_CTRC_ACTIVE_SCAN_SLICE + 1)
+		cluster_ctrc_active_scan_step(scan);
+	UT_ASSERT_NE(scan->status, CTRC_ACTIVE_SCAN_INCOMPLETE);
+}
+
+static const ClusterCtrcActiveScan *qualified_foreign_old_scan;
+static uint64 qualified_foreign_expected_generation;
+static unsigned qualified_foreign_unlock_observations;
+
+static bool
+observe_qualified_foreign_registration_unlock(LWLock *lock,
+	LWLockMode mode pg_attribute_unused(), bool acquire)
+{
+	if (!acquire && lock == &CtrcShared->receipt_lock) {
+		qualified_foreign_unlock_observations++;
+		UT_ASSERT_EQ(pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation),
+			qualified_foreign_expected_generation);
+		UT_ASSERT(!cluster_ctrc_active_scan_registration_current(qualified_foreign_old_scan));
+	}
+	return false;
+}
+
+UT_TEST(test_qualified_foreign_first_registration_revokes_each_local_scan_cut)
+{
+	for (unsigned phase = 0; phase < 3; phase++) {
+		QualifiedForeignRegistrationFixture fixture;
+		ClusterCtrcReceiptHandle handle;
+		ClusterCtrcActiveScan old, fresh;
+		FullTransactionId reference = FullTransactionIdFromEpochAndXid(9, 10000);
+		uint64 index, generation, cursor;
+
+		UT_ASSERT(qualified_foreign_registration_fixture(&fixture));
+		UT_ASSERT(ctrc_participant_index(&fixture.source.key, fixture.receiver.node_id, &index));
+		UT_ASSERT(cluster_ctrc_active_scan_begin(&old, reference));
+		if (phase != 0)
+			while (old.next_index <= CtrcShared->origin_key_entries + index
+				&& old.status == CTRC_ACTIVE_SCAN_INCOMPLETE)
+				cluster_ctrc_active_scan_step(&old);
+		if (phase == 2)
+			finish_qualified_foreign_registration_scan(&old);
+		UT_ASSERT(cluster_ctrc_active_scan_registration_current(&old));
+		UT_ASSERT(FullTransactionIdEquals(old.min_full, reference));
+		UT_ASSERT_EQ(old.unqualified_entries, 0);
+		generation = old.unqualified_registration_generation;
+		cursor = old.next_index;
+		qualified_foreign_old_scan = &old;
+		qualified_foreign_expected_generation = generation + 1;
+		qualified_foreign_unlock_observations = 0;
+		external_lock_hook = observe_qualified_foreign_registration_unlock;
+		UT_ASSERT_EQ(cluster_ctrc_receipt_prepare_origin_v2(&fixture.source.key,
+			&fixture.receiver, fixture.source.grant_generation, &fixture.publication,
+			&fixture.target, fixture.original, sizeof(fixture.original), &handle),
+			CLUSTER_CTRC_PREPARE_READY);
+		external_lock_hook = NULL;
+		UT_ASSERT_EQ(qualified_foreign_unlock_observations, 1);
+		UT_ASSERT(handle.valid);
+		UT_ASSERT(FullTransactionIdEquals(handle.original_full_xid,
+			fixture.source.original_full_xid));
+		UT_ASSERT(!cluster_ctrc_active_scan_registration_current(&old));
+		if (phase != 2) {
+			cluster_ctrc_active_scan_step(&old);
+			UT_ASSERT_EQ(old.status, CTRC_ACTIVE_SCAN_INVALID);
+			UT_ASSERT_EQ(old.next_index, cursor);
+			UT_ASSERT(!FullTransactionIdIsValid(old.min_full));
+		}
+		UT_ASSERT(cluster_ctrc_active_scan_begin(&fresh, reference));
+		finish_qualified_foreign_registration_scan(&fresh);
+		UT_ASSERT_EQ(fresh.status, CTRC_ACTIVE_SCAN_COMPLETE);
+		UT_ASSERT(cluster_ctrc_active_scan_registration_current(&fresh));
+		UT_ASSERT_EQ(fresh.unqualified_entries, 0);
+		UT_ASSERT(FullTransactionIdEquals(fresh.min_full, fixture.source.original_full_xid));
+		UT_ASSERT_EQ(flush_calls, 0);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
+UT_TEST(test_qualified_foreign_refusal_and_exact_duplicate_keep_registration_cut)
+{
+	QualifiedForeignRegistrationFixture fixture;
+	ClusterCtrcReceiptHandle handle, duplicate;
+	ClusterCtrcActiveScan scan;
+	ClusterCtrcParticipantEntry participant_before;
+	ClusterCtrcReceipt receipt_before;
+	uint64 index, generation;
+
+	UT_ASSERT(qualified_foreign_registration_fixture(&fixture));
+	UT_ASSERT(ctrc_participant_index(&fixture.source.key, fixture.receiver.node_id, &index));
+	UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(9, 10000)));
+	finish_qualified_foreign_registration_scan(&scan);
+	generation = scan.unqualified_registration_generation;
+	participant_before = ctrc_participant_entries()[index];
+	for (unsigned fault = 0; fault < 4; fault++) {
+		ClusterCtrcParticipantIdentity receiver = fixture.receiver;
+		uint8 original[CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES];
+		Size length = sizeof(original);
+		uint32 grant = fixture.source.grant_generation;
+
+		memcpy(original, fixture.original, sizeof(original));
+		switch (fault) {
+		case 0: length--; break;
+		case 1: original[0] ^= 1; break;
+		case 2: receiver.boot_incarnation++; break;
+		case 3: grant++; break;
+		}
+		MemSet(&handle, 0xa5, sizeof(handle));
+		UT_ASSERT_EQ(cluster_ctrc_receipt_prepare_origin_v2(&fixture.source.key, &receiver,
+			grant, &fixture.publication, &fixture.target, original, length, &handle),
+			CLUSTER_CTRC_PREPARE_REFUSED);
+		UT_ASSERT(!handle.valid);
+		UT_ASSERT(memcmp(&participant_before, &ctrc_participant_entries()[index],
+			sizeof(participant_before)) == 0);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation), generation);
+		UT_ASSERT(cluster_ctrc_active_scan_registration_current(&scan));
+	}
+	UT_ASSERT_EQ(cluster_ctrc_receipt_prepare_origin_v2(&fixture.source.key,
+		&fixture.receiver, fixture.source.grant_generation, &fixture.publication,
+		&fixture.target, fixture.original, sizeof(fixture.original), &handle),
+		CLUSTER_CTRC_PREPARE_READY);
+	UT_ASSERT(handle.valid);
+	if (!handle.valid)
+		return;
+	participant_before = *handle.participant;
+	receipt_before = *handle.receipt;
+	UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(9, 10000)));
+	finish_qualified_foreign_registration_scan(&scan);
+	generation = scan.unqualified_registration_generation;
+	UT_ASSERT_EQ(cluster_ctrc_receipt_prepare_origin_v2(&fixture.source.key,
+		&fixture.receiver, fixture.source.grant_generation, &fixture.publication,
+		&fixture.target, fixture.original, sizeof(fixture.original), &duplicate),
+		CLUSTER_CTRC_PREPARE_DUPLICATE);
+	UT_ASSERT(duplicate.valid);
+	UT_ASSERT_EQ(duplicate.receipt_index, handle.receipt_index);
+	UT_ASSERT(memcmp(&participant_before, handle.participant, sizeof(participant_before)) == 0);
+	UT_ASSERT(memcmp(&receipt_before, handle.receipt, sizeof(receipt_before)) == 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation), generation);
+	UT_ASSERT(cluster_ctrc_active_scan_registration_current(&scan));
+	UT_ASSERT(FullTransactionIdEquals(scan.min_full, fixture.source.original_full_xid));
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_qualified_foreign_registration_saturates_without_losing_custody)
+{
+	QualifiedForeignRegistrationFixture fixture;
+	ClusterCtrcReceiptHandle handle, duplicate;
+	ClusterCtrcActiveScan old, fresh;
+	ClusterCtrcParticipantEntry participant_before;
+
+	UT_ASSERT(qualified_foreign_registration_fixture(&fixture));
+	pg_atomic_write_u64(&CtrcShared->unqualified_registration_generation, UINT64_MAX - 1);
+	UT_ASSERT(cluster_ctrc_active_scan_begin(&old, FullTransactionIdFromEpochAndXid(9, 10000)));
+	finish_qualified_foreign_registration_scan(&old);
+	UT_ASSERT_EQ(cluster_ctrc_receipt_prepare_origin_v2(&fixture.source.key,
+		&fixture.receiver, fixture.source.grant_generation, &fixture.publication,
+		&fixture.target, fixture.original, sizeof(fixture.original), &handle),
+		CLUSTER_CTRC_PREPARE_READY);
+	UT_ASSERT(handle.valid);
+	if (!handle.valid)
+		return;
+	participant_before = *handle.participant;
+	UT_ASSERT_EQ(pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation), UINT64_MAX);
+	UT_ASSERT(!cluster_ctrc_active_scan_registration_current(&old));
+	UT_ASSERT(!cluster_ctrc_active_scan_begin(&fresh, FullTransactionIdFromEpochAndXid(9, 10000)));
+	UT_ASSERT_EQ(fresh.status, CTRC_ACTIVE_SCAN_INVALID);
+	UT_ASSERT(!FullTransactionIdIsValid(fresh.min_full));
+	UT_ASSERT_EQ(cluster_ctrc_receipt_prepare_origin_v2(&fixture.source.key,
+		&fixture.receiver, fixture.source.grant_generation, &fixture.publication,
+		&fixture.target, fixture.original, sizeof(fixture.original), &duplicate),
+		CLUSTER_CTRC_PREPARE_DUPLICATE);
+	UT_ASSERT(memcmp(&participant_before, handle.participant, sizeof(participant_before)) == 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&CtrcShared->unqualified_registration_generation), UINT64_MAX);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
 int
 main(void)
 {
@@ -9043,7 +9257,7 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(198);
+	UT_PLAN(201);
 	UT_RUN(test_prepare_path_namespace_precedes_input_and_resets_output);
 	UT_RUN(test_prepare_path_input_precedes_journal_exhaustion);
 	UT_RUN(test_prepare_path_chain_precedes_locator_and_keeps_blocked_state);
@@ -9245,6 +9459,9 @@ main(void)
 	UT_RUN(test_receiver_companion_accepts_direct_parent_and_full_path_only_after_apply);
 	UT_RUN(test_receiver_companion_multiple_pages_share_identity_but_entire_chain_must_match);
 	UT_RUN(test_receiver_companion_data_segment_does_not_replace_canonical_key);
+	UT_RUN(test_qualified_foreign_first_registration_revokes_each_local_scan_cut);
+	UT_RUN(test_qualified_foreign_refusal_and_exact_duplicate_keep_registration_cut);
+	UT_RUN(test_qualified_foreign_registration_saturates_without_losing_custody);
 	free(CtrcShared);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
