@@ -242,6 +242,7 @@ TESTS += test_cluster_same_host_provider
 TESTS += test_cluster_recovery_worker_pre2
 
 CLUSTER_VERSION_O = $(top_builddir)/src/backend/cluster/cluster_version.o
+TESTS += test_cluster_tx_exit_dispatch
 
 # Path to cluster_guc.o + cluster_elog.o (needed by test_cluster_guc only).
 # These reference PG backend symbols (DefineCustomIntVariable, etc.) that
@@ -551,6 +552,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_page_stable_base,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_side_xact test_cluster_pi_contribution,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_side_online_owner test_cluster_remote_xact_writer,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_r4_tx_enqueue,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_tx_exit_dispatch,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_r4_tx_rpc_slots,$(SIMPLE_TESTS))
 # PGRAC: real configuration object tests have their own link rule.
 # Author: SqlRush <sqlrush@gmail.com>
@@ -989,6 +991,31 @@ test_cluster_control_retire: test_cluster_control_retire.c test_cluster_control_
 test_cluster_r4_tx_enqueue: test_cluster_r4_tx_enqueue.c unit_test.h $(CLUSTER_VERSION_O) cluster_unit_port_stubs.o \
 		$(top_srcdir)/src/backend/cluster/cluster_tx_enqueue.c \
 		$(top_srcdir)/src/include/cluster/cluster_tx_enqueue.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) cluster_unit_port_stubs.o -o $@
+
+test_cluster_tx_exit_dispatch.inc: $(top_srcdir)/src/backend/storage/ipc/ipc.c $(srcdir)/Makefile
+	awk 'BEGIN { print "#define CLUSTER_TX_EXIT_DISPATCH_PRESENT 1" } \
+	     /^bool[ \t]+shmem_exit_inprogress = false;/ { print; flags++ } \
+	     /^static bool atexit_callback_setup = false;/ { print; setup++ } \
+	     /^#define MAX_ON_EXITS / { tables++; globals=1 } \
+	     globals { print } \
+	     globals && /before_shmem_exit_index;$$/ { globals=0 } \
+	     /^(shmem_exit|on_proc_exit|before_shmem_exit|on_shmem_exit|cancel_before_shmem_exit|on_exit_reset)\(/ { print "void"; emit=1; found++ } \
+	     emit { print } emit && /^}$$/ { emit=0; done++ } \
+	     END { if (flags != 1 || setup != 1 || tables != 1 || globals || found != 6 || done != 6) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_tx_exit_registration.inc: $(top_srcdir)/src/backend/utils/init/postinit.c $(srcdir)/Makefile
+	awk '/^[ \t]*before_shmem_exit\(cluster_grd_cleanup_on_backend_exit_callback, 0\);$$/ { print; grd++ } \
+	     /^[ \t]*before_shmem_exit\(cluster_tx_enqueue_cleanup_on_backend_exit_callback, 0\);$$/ { print; tx++ } \
+	     END { if (grd != 1 || tx != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_tx_exit_dispatch: test_cluster_tx_exit_dispatch.c test_cluster_r4_tx_enqueue.c \
+		unit_test.h test_cluster_tx_exit_dispatch.inc test_cluster_tx_exit_registration.inc \
+		$(CLUSTER_VERSION_O) cluster_unit_port_stubs.o \
+		$(top_srcdir)/src/backend/cluster/cluster_tx_enqueue.c \
+		$(top_srcdir)/src/backend/cluster/cluster_lmd_wait_state.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) cluster_unit_port_stubs.o -o $@
 
 # spec-2.4 D16: test_cluster_epoch links cluster_epoch.o standalone.
@@ -6352,6 +6379,8 @@ check_r11_source_removal_census:
 # Standard PG targets
 # ----------
 clean distclean maintainer-clean:
+	rm -f test_cluster_tx_exit_dispatch.inc test_cluster_tx_exit_dispatch.inc.tmp \
+		test_cluster_tx_exit_registration.inc test_cluster_tx_exit_registration.inc.tmp
 	rm -f test_cluster_external_fence_duty.inc
 	rm -f test_cluster_resolver_cache_caller.inc test_cluster_resolver_cache_caller.inc.tmp
 	rm -f test_cluster_relation_size.inc
