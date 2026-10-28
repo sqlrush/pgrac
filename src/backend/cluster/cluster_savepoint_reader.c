@@ -45,10 +45,56 @@ savepoint_reader_expected_valid(const ClusterSavepointOperation *expected,
 }
 
 bool
-cluster_savepoint_reader_decode(const ClusterSavepointOperation *expected,
-								const ClusterTxLocator *locator, UBA current_uba,
-								const UndoRecordHeader *record, const char *body,
-								size_t payload_length, ClusterSavepointReaderRecord *out)
+cluster_savepoint_reader_identity_from_operation(const ClusterSavepointOperation *expected,
+												 const ClusterTxLocator *locator,
+												 ClusterSavepointReaderIdentity *out)
+{
+	ClusterSavepointReaderIdentity identity = { 0 };
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (expected == NULL || locator == NULL || !savepoint_reader_expected_valid(expected, locator))
+		return false;
+	identity.canonical = (ClusterTTSlotPhysicalLocator){ .segment_id = expected->top.segment_id,
+														 .xid = expected->top.xid,
+														 .slot_offset = expected->top.slot_offset,
+														 .wrap = expected->top.slot_wrap };
+	identity.canonical_generation = expected->top.segment_generation;
+	identity.top_fxid = expected->top_fxid;
+	identity.operation_fxid = expected->operation_fxid;
+	identity.operation_sequence = expected->operation_sequence;
+	identity.command_id = expected->command_id;
+	identity.subid = expected->subid;
+	*out = identity;
+	return true;
+}
+
+static bool
+savepoint_reader_identity_valid(const ClusterSavepointReaderIdentity *expected,
+								const ClusterTxLocator *locator)
+{
+	const ClusterTTSlotPhysicalLocator *top = &expected->canonical;
+
+	return TransactionIdIsNormal(top->xid)
+		   && top->xid == XidFromFullTransactionId(expected->top_fxid) && top->segment_id > 0
+		   && top->segment_id <= PG_UINT16_MAX
+		   && (top->segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE < UNDO_OWNER_INSTANCE_MAX
+		   && expected->canonical_generation != PG_UINT32_MAX
+		   && top->slot_offset < TT_SLOTS_PER_SEGMENT && top->wrap <= TT_WRAP_MAX
+		   && locator->xid == top->xid && locator->tt_wrap == top->wrap
+		   && TransactionIdIsNormal(XidFromFullTransactionId(expected->operation_fxid))
+		   && U64FromFullTransactionId(expected->operation_fxid)
+				  > U64FromFullTransactionId(expected->top_fxid)
+		   && expected->operation_sequence != 0 && expected->command_id != InvalidCommandId
+		   && expected->subid > TopSubTransactionId;
+}
+
+bool
+cluster_savepoint_reader_decode_identity(const ClusterSavepointReaderIdentity *expected,
+										 const ClusterTxLocator *locator, UBA current_uba,
+										 const UndoRecordHeader *record, const char *body,
+										 size_t payload_length, ClusterSavepointReaderRecord *out)
 {
 	ClusterSavepointReaderRecord decoded = { 0 };
 	UndoRecordHeader canonical;
@@ -61,11 +107,12 @@ cluster_savepoint_reader_decode(const ClusterSavepointOperation *expected,
 		return false;
 	memset(out, 0, sizeof(*out));
 	if (expected == NULL || locator == NULL || record == NULL || body == NULL
-		|| !savepoint_reader_expected_valid(expected, locator)
+		|| !savepoint_reader_identity_valid(expected, locator)
 		|| !uba_decode_record(current_uba, &segment, &block, &tt_offset, &row)
-		|| tt_offset != expected->top.slot_offset
-		|| record->tt_slot_segment_id != expected->top.segment_id
-		|| record->origin_node_id != expected->top.origin_instance - 1
+		|| tt_offset != expected->canonical.slot_offset
+		|| record->tt_slot_segment_id != expected->canonical.segment_id
+		|| record->origin_node_id
+			   != (expected->canonical.segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE
 		|| record->xid != XidFromFullTransactionId(expected->operation_fxid)
 		|| cluster_undo_record_uba_equal(record->prev_uba, current_uba)
 		|| !cluster_undo_record_decode_operation_payload(record, body, payload_length,
@@ -74,7 +121,7 @@ cluster_savepoint_reader_decode(const ClusterSavepointOperation *expected,
 		return false;
 	if (decoded.operation.canonical_top_fxid != U64FromFullTransactionId(expected->top_fxid)
 		|| decoded.operation.operation_fxid != U64FromFullTransactionId(expected->operation_fxid)
-		|| decoded.operation.canonical_segment_generation != expected->top.segment_generation
+		|| decoded.operation.canonical_segment_generation != expected->canonical_generation
 		|| decoded.operation.operation_sequence != expected->operation_sequence
 		|| decoded.operation.command_id != expected->command_id
 		|| decoded.operation.subid != expected->subid)
@@ -83,33 +130,25 @@ cluster_savepoint_reader_decode(const ClusterSavepointOperation *expected,
 	/* The old physical key validator remains top-only. Project only its
 	 * private header input; tuple and operation validation keep the raw child. */
 	canonical = *record;
-	canonical.xid = expected->top.xid;
+	canonical.xid = expected->canonical.xid;
 	if (!cluster_undo_record_validate_identity(locator, current_uba, &canonical, NULL))
 		return false;
 	*out = decoded;
 	return true;
 }
 
-bool
-cluster_savepoint_reader_extract(const ClusterSavepointOperation *expected,
-								 const ClusterTxLocator *locator, const char page[BLCKSZ],
-								 char record_out[BLCKSZ], size_t *record_length_out,
-								 ClusterSavepointReaderRecord *out)
+/* Locate bytes without interpreting an operation or granting authority. */
+static bool
+savepoint_reader_record(const ClusterTxLocator *locator, const char page[BLCKSZ],
+						UndoRecordHeader *record_out, UndoSlotDirEntry *slot_out)
 {
 	UndoBlockHeader header;
 	UndoSlotDirEntry slot;
-	UndoRecordHeader record;
-	ClusterSavepointReaderRecord decoded;
 	uint32 segment, block;
 	uint16 tt_offset, row;
 	uint32 directory;
 
-	if (record_length_out != NULL)
-		*record_length_out = 0;
-	if (out != NULL)
-		memset(out, 0, sizeof(*out));
-	if (expected == NULL || locator == NULL || page == NULL || record_out == NULL
-		|| record_length_out == NULL || out == NULL
+	if (locator == NULL || page == NULL
 		|| !uba_decode_record(locator->uba, &segment, &block, &tt_offset, &row))
 		return false;
 	memcpy(&header, page, sizeof(header));
@@ -121,20 +160,158 @@ cluster_savepoint_reader_extract(const ClusterSavepointOperation *expected,
 	if (header.free_offset < sizeof(header) || header.free_offset > directory)
 		return false;
 	memcpy(&slot, page + BLCKSZ - ((uint32)row + 1) * sizeof(slot), sizeof(slot));
-	if (slot.record_offset < sizeof(header) || slot.record_length < sizeof(record)
+	if (slot.record_offset < sizeof(header) || slot.record_length < sizeof(*record_out)
 		|| slot.record_offset > header.free_offset
 		|| slot.record_length > header.free_offset - slot.record_offset)
 		return false;
-	memcpy(&record, page + slot.record_offset, sizeof(record));
-	if (slot.record_type != record.record_type || slot.flags != record.flags
-		|| slot.record_length != sizeof(record) + (size_t)record.payload_length
-		|| !cluster_savepoint_reader_decode(expected, locator, locator->uba, &record,
-											page + slot.record_offset + sizeof(record),
-											record.payload_length, &decoded))
+	memcpy(record_out, page + slot.record_offset, sizeof(*record_out));
+	if (slot.record_type != record_out->record_type || slot.flags != record_out->flags
+		|| slot.record_length != sizeof(*record_out) + (size_t)record_out->payload_length)
+		return false;
+	*slot_out = slot;
+	return true;
+}
+
+bool
+cluster_savepoint_reader_extract_identity(const ClusterSavepointReaderIdentity *expected,
+										  const ClusterTxLocator *locator, const char page[BLCKSZ],
+										  char record_out[BLCKSZ], size_t *record_length_out,
+										  ClusterSavepointReaderRecord *out)
+{
+	UndoRecordHeader record;
+	UndoSlotDirEntry slot;
+	ClusterSavepointReaderRecord decoded;
+
+	if (record_length_out != NULL)
+		*record_length_out = 0;
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (expected == NULL || record_out == NULL || record_length_out == NULL || out == NULL
+		|| !savepoint_reader_record(locator, page, &record, &slot)
+		|| !cluster_savepoint_reader_decode_identity(expected, locator, locator->uba, &record,
+													 page + slot.record_offset + sizeof(record),
+													 record.payload_length, &decoded))
 		return false;
 	memmove(record_out, page + slot.record_offset, slot.record_length);
 	*record_length_out = slot.record_length;
 	*out = decoded;
+	return true;
+}
+
+bool
+cluster_savepoint_reader_decode(const ClusterSavepointOperation *expected,
+								const ClusterTxLocator *locator, UBA current_uba,
+								const UndoRecordHeader *record, const char *body,
+								size_t payload_length, ClusterSavepointReaderRecord *out)
+{
+	ClusterSavepointReaderIdentity identity;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	return cluster_savepoint_reader_identity_from_operation(expected, locator, &identity)
+		   && cluster_savepoint_reader_decode_identity(&identity, locator, current_uba, record,
+													   body, payload_length, out);
+}
+
+bool
+cluster_savepoint_reader_extract(const ClusterSavepointOperation *expected,
+								 const ClusterTxLocator *locator, const char page[BLCKSZ],
+								 char record_out[BLCKSZ], size_t *record_length_out,
+								 ClusterSavepointReaderRecord *out)
+{
+	ClusterSavepointReaderIdentity identity;
+
+	if (record_length_out != NULL)
+		*record_length_out = 0;
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	return cluster_savepoint_reader_identity_from_operation(expected, locator, &identity)
+		   && cluster_savepoint_reader_extract_identity(&identity, locator, page, record_out,
+														record_length_out, out);
+}
+
+/* Independently match the immutable page-slot incarnation and addressed head;
+ * the tail is not allowed to choose the page owner or its after-image. */
+static bool
+savepoint_reader_head_matches(const ClusterItlSlotData *head, const BufferTag *tag,
+							  const ClusterTxLocator *locator, const UndoItlHistoryTrailer *history)
+{
+	unsigned i;
+
+	if (head->xid != locator->xid
+		|| !cluster_undo_record_uba_equal(head->undo_segment_head, locator->uba))
+		return false;
+	for (i = 0; i < history->count; i++) {
+		const UndoItlHistoryEntry *entry = &history->entries[i];
+		uint16 wrap = entry->prior.wrap;
+		bool role = entry->after_kind == ITL_FLAG_ACTIVE
+						? head->flags >= ITL_FLAG_ACTIVE && head->flags <= ITL_FLAG_NEEDS_CLEANOUT
+						: ITL_FLAG_IS_LOCK_ONLY(head->flags);
+		bool request_role = entry->after_kind == ITL_FLAG_ACTIVE
+								? locator->itl_kind >= ITL_FLAG_ACTIVE
+									  && locator->itl_kind <= ITL_FLAG_NEEDS_CLEANOUT
+								: ITL_FLAG_IS_LOCK_ONLY(locator->itl_kind);
+
+		if (entry->block != tag->blockNum)
+			continue;
+		if (entry->prior.flags != ITL_FLAG_FREE
+			&& !(entry->prior.flags == entry->after_kind && entry->prior.xid == head->xid))
+			wrap++;
+		return role && request_role && entry->slot_index == locator->itl_slot_index
+			   && head->wrap == wrap && head->write_scn == entry->after_write_scn;
+	}
+	return false;
+}
+
+/* Produce a challenge from protected bytes, not a live-backend binding.
+ * Author: SqlRush <sqlrush@gmail.com> */
+bool
+cluster_savepoint_reader_discover_head(const ClusterItlSlotData *head, const BufferTag *tag,
+									   const ClusterTxLocator *locator, const char page[BLCKSZ],
+									   ClusterSavepointReaderIdentity *out)
+{
+	ClusterSavepointReaderIdentity identity = { 0 };
+	ClusterSavepointReaderRecord decoded;
+	ClusterTxLocator canonical;
+	UndoRecordHeader record;
+	UndoSlotDirEntry slot;
+	uint32 segment, block;
+	uint16 tt, row;
+	const char *body;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (head == NULL || tag == NULL || locator == NULL
+		|| !savepoint_reader_record(locator, page, &record, &slot))
+		return false;
+	body = page + slot.record_offset + sizeof(record);
+	if (record.target_locator.spcOid != tag->spcOid || record.target_locator.dbOid != tag->dbOid
+		|| record.target_locator.relNumber != tag->relNumber || record.target_fork != tag->forkNum
+		|| !uba_decode_record(locator->uba, &segment, &block, &tt, &row)
+		|| !cluster_undo_record_decode_operation_payload(&record, body, record.payload_length,
+														 &decoded.body_length, &decoded.history,
+														 &decoded.operation)
+		|| !savepoint_reader_head_matches(head, tag, locator, &decoded.history))
+		return false;
+	identity.canonical
+		= (ClusterTTSlotPhysicalLocator){ .segment_id = record.tt_slot_segment_id,
+										  .xid = head->xid,
+										  .slot_offset = tt,
+										  .wrap = (uint16)(record.tt_wrap_plus1 - 1) };
+	identity.canonical_generation = decoded.operation.canonical_segment_generation;
+	identity.top_fxid = FullTransactionIdFromU64(decoded.operation.canonical_top_fxid);
+	identity.operation_fxid = FullTransactionIdFromU64(decoded.operation.operation_fxid);
+	identity.operation_sequence = decoded.operation.operation_sequence;
+	identity.command_id = decoded.operation.command_id;
+	identity.subid = decoded.operation.subid;
+	canonical = *locator;
+	if (canonical.tt_wrap == TT_WRAP_INVALID)
+		canonical.tt_wrap = identity.canonical.wrap;
+	if (!cluster_savepoint_reader_decode_identity(&identity, &canonical, locator->uba, &record,
+												  body, record.payload_length, &decoded))
+		return false;
+	*out = identity;
 	return true;
 }
 

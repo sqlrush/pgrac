@@ -311,20 +311,34 @@ cluster_cr_history_operation_modify_identity(char result_page[BLCKSZ], const Buf
  * A known LIVE or DISCARDED state alone never grants transaction visibility.
  * The existing scratch-discard-on-refusal rule also applies to this entry. */
 static inline bool
+cluster_cr_history_inverse_operation_identity(char result_page[BLCKSZ], const BufferTag *tag,
+											  const ClusterTxLocator *locator, UBA current_uba,
+											  const UndoRecordHeader *record, const char *body,
+											  size_t payload_length,
+											  const ClusterSavepointReaderIdentity *expected)
+{
+	ClusterSavepointReaderRecord decoded;
+
+	if (!cluster_savepoint_reader_decode_identity(expected, locator, current_uba, record, body,
+												  payload_length, &decoded)
+		|| !cluster_cr_history_operation_modify_identity(result_page, tag, record, body))
+		return false;
+	return cluster_cr_history_inverse_decoded(result_page, tag, locator, current_uba, record, body,
+											  &decoded.history, expected->canonical.xid);
+}
+
+static inline bool
 cluster_cr_history_inverse_operation(char result_page[BLCKSZ], const BufferTag *tag,
 									 const ClusterTxLocator *locator, UBA current_uba,
 									 const UndoRecordHeader *record, const char *body,
 									 size_t payload_length,
 									 const ClusterSavepointOperation *expected)
 {
-	ClusterSavepointReaderRecord decoded;
+	ClusterSavepointReaderIdentity identity;
 
-	if (!cluster_savepoint_reader_decode(expected, locator, current_uba, record, body,
-										 payload_length, &decoded)
-		|| !cluster_cr_history_operation_modify_identity(result_page, tag, record, body))
-		return false;
-	return cluster_cr_history_inverse_decoded(result_page, tag, locator, current_uba, record, body,
-											  &decoded.history, expected->top.xid);
+	return cluster_savepoint_reader_identity_from_operation(expected, locator, &identity)
+		   && cluster_cr_history_inverse_operation_identity(
+			   result_page, tag, locator, current_uba, record, body, payload_length, &identity);
 }
 
 #endif

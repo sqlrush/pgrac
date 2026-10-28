@@ -321,3 +321,290 @@ UT_TEST(test_operation_cr_final_admission_fence)
 	UT_ASSERT_EQ(f.origin.reason, CLUSTER_TX_RESOLVE_AUTHORITY_STALE);
 	UT_ASSERT(operation_cr_has_child(f.source.data));
 }
+
+/* A NULL expected receipt asks the real consumer to discover this immutable
+ * head. No live-backend binding or native parent lookup supplies its owner. */
+static bool
+operation_cr_discover(OperationCrFixture *f, char *result)
+{
+	return cluster_cr_apply_operation_origin_admitted(
+		f->source.data, &f->tag, 100, &test_origin_locator, NULL, &f->origin.admission, result,
+		&f->origin.top, &f->origin.operation, &f->origin.reason);
+}
+
+UT_TEST(test_operation_head_without_backend_binding)
+{
+	for (int same = 0; same < 2; same++) {
+		OperationCrFixture f;
+
+		operation_cr_init(&f, same, CLUSTER_SAVEPOINT_EFFECT_DISCARDED);
+		memset(&f.origin.expected, 0, sizeof(f.origin.expected));
+		test_local_binding_available = false;
+		test_current_owner_available = false;
+		UT_ASSERT(operation_cr_discover(&f, f.origin.output.data));
+		operation_cr_assert_inverse(&f);
+		UT_ASSERT_EQ(f.origin.top.top_xid, TEST_ORIGIN_XID);
+		UT_ASSERT_EQ(test_subtrans_parent_calls, 0);
+		UT_ASSERT_EQ(test_candidate_acquire_calls, 3);
+		UT_ASSERT_EQ(test_candidate_release_calls, 3);
+	}
+}
+
+UT_TEST(test_operation_head_unknown_tt_wrap)
+{
+	OperationCrFixture f;
+
+	operation_cr_init(&f, false, CLUSTER_SAVEPOINT_EFFECT_DISCARDED);
+	test_origin_locator.tt_wrap = TT_WRAP_INVALID;
+	UT_ASSERT(operation_cr_discover(&f, f.origin.output.data));
+	UT_ASSERT_EQ(f.origin.top.locator_echo.tt_wrap, TEST_ORIGIN_WRAP);
+	operation_cr_assert_inverse(&f);
+}
+
+UT_TEST(test_operation_head_prior_owner_and_role_wrap)
+{
+	for (int role = 0; role < 2; role++) {
+		OperationCrFixture f;
+		UndoItlHistoryTrailer history;
+		ClusterItlSlotData *restored;
+		char *bytes;
+
+		operation_cr_init(&f, false, CLUSTER_SAVEPOINT_EFFECT_DISCARDED);
+		bytes = test_operation_page.data + sizeof(UndoBlockHeader) + sizeof(UndoRecordHeader)
+				+ sizeof(UndoInsertPayload);
+		memcpy(&history, bytes, sizeof(history));
+		history.entries[0].prior.wrap = 7;
+		if (role)
+			history.entries[0].prior.flags = ITL_FLAG_LOCK_ONLY_ACTIVE;
+		else
+			history.entries[0].prior.xid = TEST_ORIGIN_XID + 1;
+		memcpy(bytes, &history, sizeof(history));
+		UT_ASSERT(operation_cr_discover(&f, f.origin.output.data));
+		if (f.origin.top.outcome == CLUSTER_TX_UNKNOWN)
+			continue;
+		restored = &ClusterPageGetItlSlots((Page)f.origin.output.data)[2];
+		UT_ASSERT_EQ(restored->wrap, 7);
+		UT_ASSERT_EQ(restored->xid, role ? TEST_ORIGIN_XID : TEST_ORIGIN_XID + 1);
+		UT_ASSERT_EQ(restored->flags, role ? ITL_FLAG_LOCK_ONLY_ACTIVE : ITL_FLAG_ACTIVE);
+		UT_ASSERT(!operation_cr_has_child(f.origin.output.data));
+	}
+}
+
+UT_TEST(test_operation_head_live_keeps_validated_source)
+{
+	OperationCrFixture f;
+
+	operation_cr_init(&f, false, CLUSTER_SAVEPOINT_EFFECT_LIVE);
+	UT_ASSERT(operation_cr_discover(&f, f.origin.output.data));
+	UT_ASSERT_EQ(memcmp(f.source.data, f.origin.output.data, BLCKSZ), 0);
+	UT_ASSERT_EQ(f.origin.operation.operation.effect_state, CLUSTER_SAVEPOINT_EFFECT_LIVE);
+}
+
+UT_TEST(test_operation_head_post_top_discard)
+{
+	OperationCrFixture f;
+
+	operation_cr_init(&f, false, CLUSTER_SAVEPOINT_EFFECT_LIVE);
+	operation_driver_action = 1;
+	operation_driver_action_release = 2;
+	UT_ASSERT(operation_cr_discover(&f, f.origin.output.data));
+	UT_ASSERT_EQ(f.origin.operation.operation.effect_state, CLUSTER_SAVEPOINT_EFFECT_DISCARDED);
+	operation_cr_assert_inverse(&f);
+}
+
+UT_TEST(test_operation_head_preserves_sampled_active)
+{
+	OperationCrFixture f;
+
+	operation_cr_init(&f, false, CLUSTER_SAVEPOINT_EFFECT_LIVE);
+	test_tt_slot.status = TT_SLOT_ACTIVE;
+	test_tt_slot.commit_scn = InvalidScn;
+	test_native_status = TRANSACTION_STATUS_IN_PROGRESS;
+	test_twophase_xid = TEST_ORIGIN_XID;
+	operation_driver_action = 2;
+	operation_driver_action_release = 2;
+	UT_ASSERT(operation_cr_discover(&f, f.origin.output.data));
+	UT_ASSERT_EQ(f.origin.top.outcome, CLUSTER_TX_IN_PROGRESS);
+	UT_ASSERT_EQ(f.origin.top.commit_scn, InvalidScn);
+	operation_cr_assert_inverse(&f);
+}
+
+UT_TEST(test_operation_head_prepared_refuses)
+{
+	OperationCrFixture f;
+
+	operation_cr_init(&f, false, CLUSTER_SAVEPOINT_EFFECT_DISCARDED);
+	test_tt_slot.status = TT_SLOT_ACTIVE;
+	test_tt_slot.commit_scn = InvalidScn;
+	test_native_status = TRANSACTION_STATUS_IN_PROGRESS;
+	test_twophase_prepared = true;
+	test_twophase_xid = TEST_ORIGIN_XID;
+	UT_ASSERT(!operation_cr_discover(&f, f.origin.output.data));
+	UT_ASSERT_EQ(f.origin.reason, CLUSTER_TX_RESOLVE_TWOPHASE_CONFLICT);
+	operation_driver_assert_refused(&f.origin);
+}
+
+static void
+operation_head_bad_root(OperationCrFixture *f, int fault)
+{
+	ClusterItlSlotData *head = &ClusterPageGetItlSlots((Page)f->source.data)[2];
+
+	switch (fault) {
+	case 0:
+		head->xid++;
+		break;
+	case 1:
+		head->wrap++;
+		break;
+	case 2:
+		head->write_scn++;
+		break;
+	case 3:
+		head->undo_segment_head = uba_encode(TEST_RECORD_SEGMENT, 6, TEST_TT_OFFSET, 0);
+		break;
+	case 4:
+		head->flags = ITL_FLAG_LOCK_ONLY_ACTIVE;
+		break;
+	case 5:
+		f->tag.relNumber++;
+		break;
+	case 6:
+		f->tag.blockNum++;
+		break;
+	case 7:
+		test_origin_locator.tt_wrap++;
+		break;
+	case 8:
+		test_origin_locator.itl_slot_index = CLUSTER_ITL_INITRANS_DEFAULT;
+		break;
+	case 9:
+		test_origin_locator.itl_kind = ITL_FLAG_LOCK_ONLY_ACTIVE;
+		break;
+	}
+}
+
+UT_TEST(test_operation_head_exact_root_required)
+{
+	for (int fault = 0; fault < 10; fault++) {
+		OperationCrFixture f;
+
+		operation_cr_init(&f, false, CLUSTER_SAVEPOINT_EFFECT_LIVE);
+		operation_head_bad_root(&f, fault);
+		UT_ASSERT(!operation_cr_discover(&f, f.origin.output.data));
+		operation_driver_assert_refused(&f.origin);
+	}
+}
+
+UT_TEST(test_operation_head_tail_cannot_choose_other_owner)
+{
+	OperationCrFixture f;
+	UndoOperationTrailer tail;
+
+	operation_cr_init(&f, false, CLUSTER_SAVEPOINT_EFFECT_DISCARDED);
+	memcpy(&tail, operation_plan_tail(), sizeof(tail));
+	tail.canonical_top_fxid--;
+	memcpy(operation_plan_tail(), &tail, sizeof(tail));
+	UT_ASSERT(!operation_cr_discover(&f, f.origin.output.data));
+	operation_driver_assert_refused(&f.origin);
+	UT_ASSERT_EQ(test_native_status_calls, 0);
+}
+
+UT_TEST(test_operation_head_canonical_not_self_certified)
+{
+	for (int fault = 0; fault < 3; fault++) {
+		OperationCrFixture f;
+
+		operation_cr_init(&f, false, CLUSTER_SAVEPOINT_EFFECT_DISCARDED);
+		if (fault == 0)
+			test_candidate_tt_generation++;
+		else if (fault == 1)
+			test_tt_slot.wrap++;
+		else
+			test_tt_slot.xid++;
+		UT_ASSERT(!operation_cr_discover(&f, f.origin.output.data));
+		operation_driver_assert_refused(&f.origin);
+	}
+}
+
+UT_TEST(test_operation_head_fresh_data_and_release_fences)
+{
+	for (int action = 3; action <= 8; action++) {
+		OperationCrFixture f;
+
+		operation_cr_init(&f, false, CLUSTER_SAVEPOINT_EFFECT_DISCARDED);
+		operation_driver_action = action;
+		operation_driver_action_release = action == 8 ? 1 : 2;
+		UT_ASSERT(!operation_cr_discover(&f, f.origin.output.data));
+		operation_driver_assert_refused(&f.origin);
+	}
+}
+
+UT_TEST(test_operation_head_source_result_alias)
+{
+	OperationCrFixture f;
+
+	operation_cr_init(&f, false, CLUSTER_SAVEPOINT_EFFECT_DISCARDED);
+	UT_ASSERT(operation_cr_discover(&f, f.source.data));
+	if (f.origin.top.outcome != CLUSTER_TX_UNKNOWN)
+		UT_ASSERT(!operation_cr_has_child(f.source.data));
+}
+
+UT_TEST(test_operation_head_final_admission_fence)
+{
+	OperationCrFixture f;
+
+	operation_cr_init(&f, false, CLUSTER_SAVEPOINT_EFFECT_LIVE);
+	test_operation_cr_revoke_on_decision = true;
+	UT_ASSERT(!operation_cr_discover(&f, f.origin.output.data));
+	operation_driver_assert_refused(&f.origin);
+	UT_ASSERT(test_admission_revoked);
+}
+
+UT_TEST(test_operation_head_cold_reads_and_missing_data)
+{
+	for (int missing = 0; missing < 2; missing++) {
+		for (int mask = 1; mask <= 3; mask++) {
+			OperationCrFixture f;
+
+			operation_cr_init(&f, false, CLUSTER_SAVEPOINT_EFFECT_DISCARDED);
+			test_candidate_cold_copy_mask = mask;
+			test_candidate_data_pool_disabled = missing;
+			UT_ASSERT_EQ(operation_cr_discover(&f, f.origin.output.data), !missing);
+			if (missing)
+				operation_driver_assert_refused(&f.origin);
+			else {
+				operation_cr_assert_inverse(&f);
+				UT_ASSERT_EQ(test_candidate_data_pin_calls, test_candidate_data_unpin_calls);
+			}
+		}
+	}
+}
+
+UT_TEST(test_operation_head_error_never_publishes)
+{
+	for (int fault = 0; fault < 3; fault++) {
+		OperationCrFixture f;
+		volatile bool caught = false;
+
+		operation_cr_init(&f, false, CLUSTER_SAVEPOINT_EFFECT_DISCARDED);
+		if (fault < 2) {
+			test_candidate_cold_copy_mask = fault == 0 ? 1 : 2;
+			test_candidate_data_io_throw = true;
+		} else {
+			operation_driver_action = 9;
+			operation_driver_action_release = 3;
+		}
+		PG_TRY();
+		{
+			(void)operation_cr_discover(&f, f.origin.output.data);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(caught);
+		operation_driver_assert_refused(&f.origin);
+		UT_ASSERT(operation_cr_has_child(f.source.data));
+	}
+}

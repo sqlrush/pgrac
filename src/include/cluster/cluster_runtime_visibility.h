@@ -53,6 +53,8 @@ typedef struct ClusterTxLocator ClusterTxLocator;
 typedef struct ClusterTxResolution ClusterTxResolution;
 typedef struct ClusterSavepointOperation ClusterSavepointOperation;
 typedef struct ClusterSavepointReaderRecord ClusterSavepointReaderRecord;
+typedef struct ClusterSavepointReaderIdentity ClusterSavepointReaderIdentity;
+typedef struct buftag BufferTag;
 typedef struct ClusterSemanticAdmissionToken ClusterSemanticAdmissionToken;
 typedef struct ClusterUndoBlock0Generation ClusterUndoBlock0Generation;
 typedef union ClusterUndoBlock0CurrentGuard ClusterUndoBlock0CurrentGuard;
@@ -207,6 +209,18 @@ cluster_runtime_visibility_origin_plan_freeze_operation_held(
 	const ClusterUndoBlock0Generation *expected_generation, ClusterUndoBlock0CurrentGuard *guard,
 	const ClusterUndoBlock0ResolvedRoot *root, ClusterRuntimeVisibilityOriginPlan *plan,
 	ClusterTxResolveReason *reason_out);
+
+/* Discovery from this exact immutable page/PI head uses a historical compare
+ * identity, never a fabricated backend publication receipt. Caller owns the
+ * source/retention scope. This is the same DATA->TT->fresh DATA continuation;
+ * no top/disposition is published by discovery alone. */
+extern ClusterRuntimeVisibilityOriginStep
+cluster_runtime_visibility_origin_plan_discover_operation_head_held(
+	const ClusterTxLocator *locator, const ClusterItlSlotData *head, const BufferTag *tag,
+	ClusterTxResolveMode mode, const ClusterSemanticAdmissionToken *admission,
+	const ClusterUndoBlock0Generation *expected_generation, ClusterUndoBlock0CurrentGuard *guard,
+	const ClusterUndoBlock0ResolvedRoot *root, ClusterRuntimeVisibilityOriginPlan *plan,
+	ClusterTxResolveReason *reason_out);
 extern ClusterTxOutcome cluster_runtime_visibility_origin_plan_copy_operation_held(
 	ClusterRuntimeVisibilityOriginPlan *plan, ClusterTxResolveMode mode,
 	const ClusterSemanticAdmissionToken *admission, ClusterUndoBlock0CurrentGuard *guard,
@@ -226,6 +240,15 @@ extern ClusterTxOutcome cluster_runtime_visibility_resolve_operation_origin_admi
 	ClusterTxResolveMode mode, const ClusterSemanticAdmissionToken *admission,
 	ClusterTxResolution *top_out, ClusterSavepointReaderRecord *operation_out,
 	char data_out[BLCKSZ], ClusterTxResolveReason *reason_out);
+/* Blocking original origin owner for immutable-head discovery. The identity
+ * is compare data, not a parent mapping or terminal/cache/reclamation proof.
+ * All outputs remain private through the final release/admission fence. */
+extern ClusterTxOutcome cluster_runtime_visibility_resolve_operation_head_origin_admitted(
+	const ClusterTxLocator *locator, const ClusterItlSlotData *head, const BufferTag *tag,
+	ClusterTxResolveMode mode, const ClusterSemanticAdmissionToken *admission,
+	ClusterSavepointReaderIdentity *identity_out, ClusterTxResolution *top_out,
+	ClusterSavepointReaderRecord *operation_out, char data_out[BLCKSZ],
+	ClusterTxResolveReason *reason_out);
 extern bool cluster_runtime_visibility_origin_plan_canonical_logical(
 	const ClusterRuntimeVisibilityOriginPlan *plan, ClusterUndoBlock0LogicalKey *logical_out);
 extern bool cluster_runtime_visibility_origin_plan_canonical_physical(

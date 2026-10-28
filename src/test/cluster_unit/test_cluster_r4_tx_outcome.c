@@ -7566,7 +7566,22 @@ UT_TEST(test_retained_slot_identity_does_not_escape_original_final_fences)
 int
 main(void)
 {
-	UT_PLAN(241);
+	UT_PLAN(256);
+	UT_RUN(test_operation_head_without_backend_binding);
+	UT_RUN(test_operation_head_unknown_tt_wrap);
+	UT_RUN(test_operation_head_prior_owner_and_role_wrap);
+	UT_RUN(test_operation_head_live_keeps_validated_source);
+	UT_RUN(test_operation_head_post_top_discard);
+	UT_RUN(test_operation_head_preserves_sampled_active);
+	UT_RUN(test_operation_head_prepared_refuses);
+	UT_RUN(test_operation_head_exact_root_required);
+	UT_RUN(test_operation_head_tail_cannot_choose_other_owner);
+	UT_RUN(test_operation_head_canonical_not_self_certified);
+	UT_RUN(test_operation_head_fresh_data_and_release_fences);
+	UT_RUN(test_operation_head_source_result_alias);
+	UT_RUN(test_operation_head_final_admission_fence);
+	UT_RUN(test_operation_head_cold_reads_and_missing_data);
+	UT_RUN(test_operation_head_error_never_publishes);
 	UT_RUN(test_operation_cr_final_admission_fence);
 	UT_RUN(test_operation_cr_discarded_before_snapshot_is_inverse);
 	UT_RUN(test_operation_cr_live_uses_top_commit_boundary);

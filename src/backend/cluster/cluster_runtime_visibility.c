@@ -1873,7 +1873,7 @@ typedef struct ClusterRuntimeVisibilityOriginPlanData {
 	bool candidate_valid;
 	bool candidate_recycled_abort;
 	bool operation_plan;
-	ClusterSavepointOperation operation;
+	ClusterSavepointReaderIdentity operation;
 	ClusterTxResolveMode mode;
 	ClusterTxLocator locator;
 	ClusterTxLocator canonical_locator;
@@ -2360,7 +2360,8 @@ cluster_runtime_visibility_origin_plan_freeze_data_held(
 static ClusterRuntimeVisibilityOriginStep
 cluster_runtime_visibility_origin_plan_freeze_operation_internal(
 	const ClusterTxLocator *locator, const ClusterSavepointOperation *expected,
-	ClusterTxResolveMode mode, const ClusterSemanticAdmissionToken *admission,
+	const ClusterItlSlotData *head, const BufferTag *tag, ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission,
 	const ClusterUndoBlock0Generation *expected_generation, ClusterUndoBlock0CurrentGuard *guard,
 	const ClusterUndoBlock0ResolvedRoot *root, ClusterRuntimeVisibilityOriginPlan *plan,
 	ClusterTxResolveReason *reason_out, bool allow_readthrough)
@@ -2375,8 +2376,8 @@ cluster_runtime_visibility_origin_plan_freeze_operation_internal(
 
 	if (plan != NULL)
 		memset(plan, 0, sizeof(*plan));
-	if (locator == NULL || expected == NULL || admission == NULL || guard == NULL || root == NULL
-		|| plan == NULL
+	if (locator == NULL || (expected == NULL && (head == NULL || tag == NULL)) || admission == NULL
+		|| guard == NULL || root == NULL || plan == NULL
 		|| (mode != CLUSTER_TX_RESOLVE_VISIBILITY && mode != CLUSTER_TX_RESOLVE_TERMINAL_CENSUS)) {
 		reason = CLUSTER_TX_RESOLVE_PROTOCOL;
 		goto failed;
@@ -2396,21 +2397,28 @@ cluster_runtime_visibility_origin_plan_freeze_operation_internal(
 			&& (!expected_generation->known || expected_generation->value != generation.value))
 		|| !cluster_runtime_visibility_origin_data_copy(segment, data->data_logical.owner_instance,
 														block, page.data, allow_readthrough)
-		|| !cluster_savepoint_reader_extract(expected, locator, page.data, data->record_buf.data,
-											 &data->record_length, &decoded))
+		|| !(expected != NULL ? cluster_savepoint_reader_identity_from_operation(expected, locator,
+																				 &data->operation)
+							  : cluster_savepoint_reader_discover_head(
+									head, tag, locator, page.data, &data->operation)))
+		goto failed;
+	data->locator = data->canonical_locator = *locator;
+	data->locator.tt_wrap = data->canonical_locator.tt_wrap = data->operation.canonical.wrap;
+	if (!cluster_savepoint_reader_extract_identity(&data->operation, &data->locator, page.data,
+												   data->record_buf.data, &data->record_length,
+												   &decoded))
 		goto failed;
 	data->magic = CLUSTER_RUNTIME_VISIBILITY_ORIGIN_PLAN_MAGIC;
 	data->valid = true;
 	data->operation_plan = true;
-	data->operation = *expected;
 	data->mode = mode;
-	data->locator = data->canonical_locator = *locator;
 	data->data_root = *root;
 	data->data_generation = generation;
 	data->data_block_no = block;
 	data->tt_slot_offset = slot;
-	data->tt_logical.owner_instance = expected->top.origin_instance;
-	data->tt_logical.segment_id = expected->top.segment_id;
+	data->tt_logical.segment_id = data->operation.canonical.segment_id;
+	data->tt_logical.owner_instance
+		= (uint8)((data->tt_logical.segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE + 1);
 	if (reason_out != NULL)
 		*reason_out = CLUSTER_TX_RESOLVE_NONE;
 	return CLUSTER_RUNTIME_VISIBILITY_ORIGIN_NEEDS_CANONICAL;
@@ -2432,8 +2440,21 @@ cluster_runtime_visibility_origin_plan_freeze_operation_held(
 	ClusterTxResolveReason *reason_out)
 {
 	return cluster_runtime_visibility_origin_plan_freeze_operation_internal(
-		locator, expected, mode, admission, expected_generation, guard, root, plan, reason_out,
-		false);
+		locator, expected, NULL, NULL, mode, admission, expected_generation, guard, root, plan,
+		reason_out, false);
+}
+
+ClusterRuntimeVisibilityOriginStep
+cluster_runtime_visibility_origin_plan_discover_operation_head_held(
+	const ClusterTxLocator *locator, const ClusterItlSlotData *head, const BufferTag *tag,
+	ClusterTxResolveMode mode, const ClusterSemanticAdmissionToken *admission,
+	const ClusterUndoBlock0Generation *expected_generation, ClusterUndoBlock0CurrentGuard *guard,
+	const ClusterUndoBlock0ResolvedRoot *root, ClusterRuntimeVisibilityOriginPlan *plan,
+	ClusterTxResolveReason *reason_out)
+{
+	return cluster_runtime_visibility_origin_plan_freeze_operation_internal(
+		locator, NULL, head, tag, mode, admission, expected_generation, guard, root, plan,
+		reason_out, false);
 }
 
 bool
@@ -2567,9 +2588,9 @@ cluster_runtime_visibility_origin_plan_sample_canonical_held(
 	/* Never admit a recycled/raw-xid fallback or another native parent as
 	 * the canonical owner of this independently qualified operation. */
 	if (plan_data->operation_plan
-		&& (generation.value != plan_data->operation.top.segment_generation
-			|| exact_slot.xid != plan_data->operation.top.xid
-			|| exact_slot.wrap != plan_data->operation.top.slot_wrap
+		&& (generation.value != plan_data->operation.canonical_generation
+			|| exact_slot.xid != plan_data->operation.canonical.xid
+			|| exact_slot.wrap != plan_data->operation.canonical.wrap
 			|| exact_slot.status < TT_SLOT_ACTIVE || exact_slot.status > TT_SLOT_ABORTED))
 		goto failed;
 	outcome = cluster_runtime_visibility_origin_candidate_decide(
@@ -2589,7 +2610,7 @@ cluster_runtime_visibility_origin_plan_sample_canonical_held(
 	if (outcome == CLUSTER_TX_UNKNOWN)
 		goto failed;
 	if (plan_data->operation_plan
-		&& (top_xid != plan_data->operation.top.xid
+		&& (top_xid != plan_data->operation.canonical.xid
 			|| proof_kind == CLUSTER_TX_PROOF_ORIGIN_SUBTRANS_TOP))
 		goto failed;
 	memset(&plan_data->candidate, 0, sizeof(plan_data->candidate));
@@ -2847,8 +2868,8 @@ cluster_runtime_visibility_origin_plan_copy_operation_internal(
 		|| !cluster_runtime_visibility_origin_data_copy(
 			data->data_logical.segment_id, data->data_logical.owner_instance, data->data_block_no,
 			page.data, allow_readthrough)
-		|| !cluster_savepoint_reader_extract(&data->operation, &data->locator, page.data,
-											 record.data, &length, &decoded)
+		|| !cluster_savepoint_reader_extract_identity(&data->operation, &data->locator, page.data,
+													  record.data, &length, &decoded)
 		|| !cluster_runtime_visibility_operation_record_matches(data, record.data, length)
 		|| cluster_undo_block0_current_sample_generation(guard, root, &final_generation)
 			   != CLUSTER_UNDO_BLOCK0_OK
@@ -2891,6 +2912,9 @@ cluster_runtime_visibility_origin_plan_copy_operation_held(
 typedef struct ClusterOperationOriginRead {
 	const ClusterTxLocator *locator;
 	const ClusterSavepointOperation *expected;
+	const ClusterItlSlotData *head;
+	const BufferTag *tag;
+	ClusterSavepointReaderIdentity identity;
 	const ClusterSemanticAdmissionToken *admission;
 	ClusterTxResolveMode mode;
 	ClusterTxResolveReason reason;
@@ -2912,13 +2936,18 @@ cluster_runtime_visibility_operation_origin_observe(ClusterOperationOriginRead *
 													const ClusterUndoBlock0ResolvedRoot *root)
 {
 	if (phase == 0) {
+		bool frozen;
+
 		read->data_root = *root;
-		return cluster_runtime_visibility_origin_plan_freeze_operation_internal(
-				   read->locator, read->expected, read->mode, read->admission, NULL, &read->guard,
-				   root, &read->plan, &read->reason, true)
-				   == CLUSTER_RUNTIME_VISIBILITY_ORIGIN_NEEDS_CANONICAL
-			   && cluster_runtime_visibility_origin_plan_canonical_logical(&read->plan,
-																		   &read->tt_logical);
+		frozen = cluster_runtime_visibility_origin_plan_freeze_operation_internal(
+					 read->locator, read->expected, read->head, read->tag, read->mode,
+					 read->admission, NULL, &read->guard, root, &read->plan, &read->reason, true)
+					 == CLUSTER_RUNTIME_VISIBILITY_ORIGIN_NEEDS_CANONICAL
+				 && cluster_runtime_visibility_origin_plan_canonical_logical(&read->plan,
+																			 &read->tt_logical);
+		if (frozen)
+			read->identity = cluster_runtime_visibility_origin_plan_data(&read->plan)->operation;
+		return frozen;
 	}
 	if (phase == 1)
 		return cluster_runtime_visibility_origin_plan_sample_canonical_held(
@@ -2969,10 +2998,11 @@ cluster_runtime_visibility_operation_origin_phase(ClusterOperationOriginRead *re
 
 /* Never expose the final held copy before its original release and admission
  * fence succeed. ERROR uses the original guard cleanup and rethrows. */
-ClusterTxOutcome
-cluster_runtime_visibility_resolve_operation_origin_admitted(
+static ClusterTxOutcome
+cluster_runtime_visibility_resolve_operation_origin_internal(
 	const ClusterTxLocator *locator, const ClusterSavepointOperation *expected,
-	ClusterTxResolveMode mode, const ClusterSemanticAdmissionToken *admission,
+	const ClusterItlSlotData *head, const BufferTag *tag, ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission, ClusterSavepointReaderIdentity *identity_out,
 	ClusterTxResolution *top_out, ClusterSavepointReaderRecord *operation_out,
 	char data_out[BLCKSZ], ClusterTxResolveReason *reason_out)
 {
@@ -2983,14 +3013,17 @@ cluster_runtime_visibility_resolve_operation_origin_admitted(
 	int phase;
 
 	read.reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+	if (identity_out != NULL)
+		memset(identity_out, 0, sizeof(*identity_out));
 	if (top_out != NULL)
 		memset(top_out, 0, sizeof(*top_out));
 	if (operation_out != NULL)
 		memset(operation_out, 0, sizeof(*operation_out));
 	if (reason_out != NULL)
 		*reason_out = read.reason;
-	if (locator == NULL || expected == NULL || admission == NULL || top_out == NULL
-		|| operation_out == NULL || data_out == NULL
+	if (locator == NULL
+		|| (expected == NULL && (head == NULL || tag == NULL || identity_out == NULL))
+		|| admission == NULL || top_out == NULL || operation_out == NULL || data_out == NULL
 		|| (mode != CLUSTER_TX_RESOLVE_VISIBILITY && mode != CLUSTER_TX_RESOLVE_TERMINAL_CENSUS)) {
 		read.reason = CLUSTER_TX_RESOLVE_PROTOCOL;
 		goto failed;
@@ -3001,6 +3034,8 @@ cluster_runtime_visibility_resolve_operation_origin_admitted(
 		goto failed;
 	read.locator = locator;
 	read.expected = expected;
+	read.head = head;
+	read.tag = tag;
 	read.mode = mode;
 	read.admission = admission;
 	read.data_logical.owner_instance = (uint8)(cluster_node_id + 1);
@@ -3021,6 +3056,8 @@ cluster_runtime_visibility_resolve_operation_origin_admitted(
 								PointerGetDatum(&read.cleanup));
 	if (!observed || !cluster_runtime_visibility_admission_current(mode, admission))
 		goto failed;
+	if (identity_out != NULL)
+		*identity_out = read.identity;
 	*top_out = read.top;
 	*operation_out = read.operation;
 	memcpy(data_out, read.page.data, BLCKSZ);
@@ -3033,6 +3070,31 @@ failed:
 		*reason_out = read.reason == CLUSTER_TX_RESOLVE_NONE ? CLUSTER_TX_RESOLVE_AUTHORITY_STALE
 															 : read.reason;
 	return CLUSTER_TX_UNKNOWN;
+}
+
+ClusterTxOutcome
+cluster_runtime_visibility_resolve_operation_origin_admitted(
+	const ClusterTxLocator *locator, const ClusterSavepointOperation *expected,
+	ClusterTxResolveMode mode, const ClusterSemanticAdmissionToken *admission,
+	ClusterTxResolution *top_out, ClusterSavepointReaderRecord *operation_out,
+	char data_out[BLCKSZ], ClusterTxResolveReason *reason_out)
+{
+	return cluster_runtime_visibility_resolve_operation_origin_internal(
+		locator, expected, NULL, NULL, mode, admission, NULL, top_out, operation_out, data_out,
+		reason_out);
+}
+
+ClusterTxOutcome
+cluster_runtime_visibility_resolve_operation_head_origin_admitted(
+	const ClusterTxLocator *locator, const ClusterItlSlotData *head, const BufferTag *tag,
+	ClusterTxResolveMode mode, const ClusterSemanticAdmissionToken *admission,
+	ClusterSavepointReaderIdentity *identity_out, ClusterTxResolution *top_out,
+	ClusterSavepointReaderRecord *operation_out, char data_out[BLCKSZ],
+	ClusterTxResolveReason *reason_out)
+{
+	return cluster_runtime_visibility_resolve_operation_origin_internal(
+		locator, NULL, head, tag, mode, admission, identity_out, top_out, operation_out, data_out,
+		reason_out);
 }
 
 bool

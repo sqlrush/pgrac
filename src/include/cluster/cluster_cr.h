@@ -137,7 +137,10 @@ extern void cluster_cr_build_on_holder_forget(uint32 slot_index, uint64 slot_gen
 
 /* One exact head operation on a private historical image, not a whole-page
  * FULL verdict or current/own-command visibility. The blocking local-origin
- * read requires caller-qualified expected identity and original retention;
+ * read requires the original immutable current/PI source and retention scope.
+ * A non-NULL expected is an independently qualified producer receipt; NULL
+ * discovers a historical challenge from this exact source head and DATA,
+ * then qualifies original TT and fresh DATA without backend parent lookup.
  * caller holds no buffer/content locks. Return the independent top/disposition
  * after final release, inverse validation and admission recheck. PREPARED/UNKNOWN refuse.
  * false clears top/operation, preserves result; source/result may alias.

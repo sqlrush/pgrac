@@ -2584,6 +2584,7 @@ cluster_cr_apply_operation_origin_admitted(const char source_page[BLCKSZ], const
 	PGAlignedBlock data, scratch;
 	ClusterTxResolution top;
 	ClusterSavepointReaderRecord operation;
+	ClusterSavepointReaderIdentity identity;
 	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
 	const PageHeaderData *header = (const PageHeaderData *)source_page;
 	const UndoRecordHeader *record;
@@ -2596,8 +2597,8 @@ cluster_cr_apply_operation_origin_admitted(const char source_page[BLCKSZ], const
 		memset(operation_out, 0, sizeof(*operation_out));
 	if (reason_out != NULL)
 		*reason_out = reason;
-	if (source_page == NULL || tag == NULL || locator == NULL || expected == NULL
-		|| admission == NULL || result_page == NULL || top_out == NULL || operation_out == NULL
+	if (source_page == NULL || tag == NULL || locator == NULL || admission == NULL
+		|| result_page == NULL || top_out == NULL || operation_out == NULL
 		|| !SCN_VALID(read_scn)) {
 		reason = CLUSTER_TX_RESOLVE_PROTOCOL;
 		goto failed;
@@ -2606,12 +2607,21 @@ cluster_cr_apply_operation_origin_admitted(const char source_page[BLCKSZ], const
 	if (!PageHasItl((Page)source_page) || header->pd_lower < SizeOfPageHeaderData
 		|| header->pd_lower > header->pd_upper || header->pd_upper > header->pd_special
 		|| header->pd_special < SizeOfPageHeaderData || header->pd_special > BLCKSZ
-		|| BLCKSZ - header->pd_special < CLUSTER_ITL_SPECIAL_SIZE)
+		|| BLCKSZ - header->pd_special < CLUSTER_ITL_SPECIAL_SIZE
+		|| locator->itl_slot_index >= CLUSTER_ITL_INITRANS_DEFAULT)
 		goto failed;
-	if (cluster_runtime_visibility_resolve_operation_origin_admitted(
-			locator, expected, CLUSTER_TX_RESOLVE_VISIBILITY, admission, &top, &operation,
-			data.data, &reason)
-		== CLUSTER_TX_UNKNOWN)
+	if (expected != NULL) {
+		if (!cluster_savepoint_reader_identity_from_operation(expected, locator, &identity)
+			|| cluster_runtime_visibility_resolve_operation_origin_admitted(
+				   locator, expected, CLUSTER_TX_RESOLVE_VISIBILITY, admission, &top, &operation,
+				   data.data, &reason)
+				   == CLUSTER_TX_UNKNOWN)
+			goto failed;
+	} else if (cluster_runtime_visibility_resolve_operation_head_origin_admitted(
+				   locator, &ClusterPageGetItlSlots((Page)source_page)[locator->itl_slot_index],
+				   tag, CLUSTER_TX_RESOLVE_VISIBILITY, admission, &identity, &top, &operation,
+				   data.data, &reason)
+			   == CLUSTER_TX_UNKNOWN)
 		goto failed;
 	if (top.outcome == CLUSTER_TX_PREPARED) {
 		reason = CLUSTER_TX_RESOLVE_TWOPHASE_CONFLICT;
@@ -2620,14 +2630,14 @@ cluster_cr_apply_operation_origin_admitted(const char source_page[BLCKSZ], const
 	reason = CLUSTER_TX_RESOLVE_BAD_COMPOSITION;
 	/* The extractor supports overlap and leaves an aligned record at DATA's
 	 * front, avoiding another block-sized buffer or any new acquisition. */
-	if (!cluster_savepoint_reader_extract(expected, locator, data.data, data.data, &length,
-										  &operation))
+	if (!cluster_savepoint_reader_extract_identity(&identity, &top.locator_echo, data.data,
+												   data.data, &length, &operation))
 		goto failed;
 	record = (const UndoRecordHeader *)data.data;
 	memcpy(scratch.data, source_page, BLCKSZ);
-	if (!cluster_cr_history_inverse_operation(scratch.data, tag, locator, locator->uba, record,
-											  data.data + sizeof(*record), record->payload_length,
-											  expected))
+	if (!cluster_cr_history_inverse_operation_identity(
+			scratch.data, tag, &top.locator_echo, locator->uba, record, data.data + sizeof(*record),
+			record->payload_length, &identity))
 		goto failed;
 	inverse = operation.operation.effect_state == CLUSTER_SAVEPOINT_EFFECT_DISCARDED
 			  || top.outcome != CLUSTER_TX_COMMITTED || scn_time_cmp(top.commit_scn, read_scn) > 0;
