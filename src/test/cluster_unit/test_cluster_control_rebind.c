@@ -328,7 +328,11 @@ rebind_receive(const ClusterSemanticControlRebindWireV3 *message, unsigned peer,
 	test_rebind_dispatch_envelope = fault == 5 ? NULL : &env;
 	IsUnderPostmaster = true;
 	MyAuxProcType = LmonProcess;
-	accepted = semantic_control_rebind_ingress(&env, bytes);
+	if (fault == 6) {
+		cluster_semantic_activation_ack_handler(&env, bytes);
+		accepted = semantic_control_rebind.acks[peer].valid;
+	} else
+		accepted = semantic_control_rebind_ingress(&env, bytes);
 	MyAuxProcType = NotAnAuxProcess;
 	IsUnderPostmaster = false;
 	test_rebind_dispatch_envelope = NULL;
@@ -450,7 +454,7 @@ UT_TEST(rebind_rejects_changed_nontransport_identity)
 		if (fault == 4)
 			test_gate_publish(6, 1, 6, 7, false);
 		if (fault == 5)
-			test_terminal_stop = true;
+			test_terminal_prebump = true; /* Stop itself permits CONTROL draining. */
 		rebind_tick(1000001);
 		UT_ASSERT_EQ(test_send_calls[3], 0);
 		UT_ASSERT_EQ(semantic_control_rebind.read_seq, 0);
@@ -1034,10 +1038,285 @@ UT_TEST(rebind_final_observation_contention_is_not_identity_drift)
 	}
 }
 
+/* The real LMON-local census, with only original external inputs. */
+static ClusterNormalStopPollResult
+rebind_stop_poll(const char **domain, const char **reason)
+{
+	ClusterNormalStopPollResult result;
+	IsUnderPostmaster = true;
+	MyAuxProcType = LmonProcess;
+	result = cluster_semantic_normal_stop_poll(domain, NULL, reason);
+	MyAuxProcType = NotAnAuxProcess;
+	IsUnderPostmaster = false;
+	return result;
+}
+
+UT_TEST(rebind_stop_consumes_complete_proof_with_online_closed)
+{
+	ClusterSemanticActivationAckTableV1 ordinary;
+	ClusterSemanticAdmissionToken token = rebind_resource_x_token();
+	uint64 members[4];
+	rebind_finish_proof();
+	ordinary = *SemanticActivationAckTable;
+	test_terminal_stop = true;
+	IsUnderPostmaster = true;
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_match(&test_serving_expected_open,
+		test_serving_expected_root, members, NULL), CLUSTER_NORMAL_STOP_READY);
+	for (unsigned node = 0; node < 4; node++)
+		UT_ASSERT_EQ(members[node], SemanticControlRebindState->baseline.cut.members[node]);
+	UT_ASSERT(cluster_semantic_activation_resource_x_peer_open_check(&token, 3, 20)
+		!= CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH);
+	UT_ASSERT(memcmp(&ordinary, SemanticActivationAckTable, sizeof(ordinary)) == 0);
+	test_first_open_finish();
+}
+
+UT_TEST(rebind_stop_partial_wait_cannot_hide_nontransport_drift)
+{
+	rebind_start();
+	test_terminal_stop = true;
+	IsUnderPostmaster = true;
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_match(&test_serving_expected_open,
+		test_serving_expected_root, NULL, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	test_serving_formation++;
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_match(&test_serving_expected_open,
+		test_serving_expected_root, NULL, NULL), CLUSTER_NORMAL_STOP_INVALID);
+	test_first_open_finish();
+}
+
+UT_TEST(rebind_stop_request_preserves_original_collection)
+{
+	rebind_start();
+	test_terminal_stop = true;
+	rebind_finish_current_round();
+	UT_ASSERT_EQ(semantic_control_rebind.phase, SEMANTIC_CONTROL_REBIND_COMPLETE);
+	UT_ASSERT_EQ(rebind_stop_poll(NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+	IsUnderPostmaster = true;
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_match(&test_serving_expected_open,
+		test_serving_expected_root, NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+	test_first_open_finish();
+}
+
+UT_TEST(rebind_stop_census_tracks_collection_and_reply_retirement)
+{
+	ClusterSemanticControlRebindWireV3 request;
+	const char *domain;
+	rebind_start();
+	rebind_complete_read();
+	rebind_tick(1000001);
+	UT_ASSERT_EQ(rebind_stop_poll(&domain, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT(strcmp(domain, "R4_CONTROL_REBIND") == 0);
+	for (unsigned peer = 1; peer < 4; peer++) {
+		ClusterSemanticControlRebindWireV3 ack = rebind_ack(peer);
+		UT_ASSERT(rebind_receive(&ack, peer, 0));
+	}
+	rebind_tick(1000002);
+	UT_ASSERT_EQ(rebind_stop_poll(NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+	request = rebind_ack(3);
+	request.kind = 1;
+	request.result = 0;
+	request.coordinator_node = 3;
+	request.member_node = 0;
+	request.round_nonce = 88;
+	UT_ASSERT(semantic_control_rebind_binding(3, 88, request.proof_binding));
+	UT_ASSERT(rebind_receive(&request, 3, 0));
+	test_send_results[3] = CLUSTER_IC_SEND_NOT_ADMITTED;
+	rebind_tick(1000003);
+	UT_ASSERT_EQ(rebind_stop_poll(NULL, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT(semantic_control_rebind.requests[3].valid);
+	test_send_results[3] = CLUSTER_IC_SEND_WOULD_BLOCK;
+	rebind_tick(1000004);
+	UT_ASSERT(!semantic_control_rebind.requests[3].valid);
+	UT_ASSERT_EQ(rebind_stop_poll(NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+	test_first_open_finish();
+}
+
+UT_TEST(rebind_stop_census_bad_geometry_overrides_other_pending)
+{
+	for (unsigned fault = 0; fault < 9; fault++) {
+		rebind_finish_proof();
+		semantic_activation_local_inflight[0][0] = 1;
+		pg_atomic_write_u32(&SemanticActivationShmem->inflight[0][0], 1);
+		switch (fault) {
+		case 0: semantic_control_rebind.phase = 99; break;
+		case 1: semantic_control_rebind.nonce++; break;
+		case 2: semantic_control_rebind.read_seq = 99; break;
+		case 3: pg_atomic_write_u64(&SemanticControlRebindState->read_seq, 99); break;
+		case 4: semantic_control_rebind.acks[1].message.member_node = 2; break;
+		case 5: semantic_control_rebind.requests[0] = semantic_control_rebind.acks[1]; break;
+		case 6: semantic_control_rebind.table.observed_members_hi = 1; break;
+		case 7: pg_atomic_write_u64(&SemanticControlRebindState->progress_seq, 3); break;
+		case 8: pg_atomic_write_u64(&SemanticControlRebindState->completion_seq, 3); break;
+		}
+		UT_ASSERT_EQ(rebind_stop_poll(NULL, NULL), CLUSTER_NORMAL_STOP_INVALID);
+		test_first_open_finish();
+	}
+}
+
+UT_TEST(rebind_live_lmon_and_dispatch_use_original_entries)
+{
+	uint64 old_ring;
+	rebind_setup();
+	test_serving_finish_root();
+	test_peer_capability_generation++;
+	for (unsigned peer = 0; peer < 4; peer++)
+		test_rebind_stream_serial[peer] += 100;
+	test_serving_tick();
+	UT_ASSERT(semantic_control_rebind.read_seq != 0);
+	rebind_complete_read();
+	test_serving_tick();
+	old_ring = semantic_activation_ack_local_ingress.producer_seq;
+	for (unsigned peer = 1; peer < 4; peer++) {
+		ClusterSemanticControlRebindWireV3 ack = rebind_ack(peer);
+		UT_ASSERT(rebind_receive(&ack, peer, 6));
+	}
+	UT_ASSERT_EQ(semantic_activation_ack_local_ingress.producer_seq, old_ring);
+	test_serving_tick();
+	UT_ASSERT_EQ(semantic_control_rebind.phase, SEMANTIC_CONTROL_REBIND_COMPLETE);
+	test_first_open_finish();
+}
+
+UT_TEST(rebind_stop_completed_read_yields_to_original_rebind_owner)
+{
+	ClusterSemanticActivationRecord got;
+	uint8 root[512];
+	uint64 stop_seq;
+	rebind_setup();
+	test_serving_finish_root();
+	test_terminal_stop = true;
+	IsUnderPostmaster = true;
+	MyAuxProcType = LmonProcess;
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_read_identity(&got, root, NULL, NULL),
+		CLUSTER_NORMAL_STOP_PENDING);
+	stop_seq = semantic_activation_lmon_stop_read_seq;
+	UT_ASSERT(stop_seq != 0);
+	ut_a148_complete_stop_read(&test_serving_expected_open);
+	test_peer_capability_generation++;
+	for (unsigned peer = 0; peer < 4; peer++)
+		test_rebind_stream_serial[peer] += 100;
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_read_identity(&got, root, NULL, NULL),
+		CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(semantic_activation_lmon_stop_read_seq, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&SemanticActivationShmem->record_cas_completion_seq), stop_seq);
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_read_identity(&got, root, NULL, NULL),
+		CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT(semantic_control_rebind.read_seq > stop_seq);
+	UT_ASSERT_EQ(semantic_activation_lmon_stop_read_seq, 0);
+	MyAuxProcType = NotAnAuxProcess;
+	IsUnderPostmaster = false;
+	rebind_finish_current_round();
+	IsUnderPostmaster = true;
+	MyAuxProcType = LmonProcess;
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_read_identity(&got, root, NULL, NULL),
+		CLUSTER_NORMAL_STOP_PENDING);
+	ut_a148_complete_stop_read(&test_serving_expected_open);
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_read_identity(&got, root, NULL, NULL),
+		CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(got.record_generation, test_serving_expected_open.record_generation);
+	test_first_open_finish();
+}
+
+UT_TEST(rebind_control_seal_preserves_completed_proof_without_new_work)
+{
+	uint64 nonce, completion, requests;
+	rebind_finish_proof();
+	test_terminal_stop = true;
+	test_rebind_control_sealed = true;
+	nonce = semantic_control_rebind.nonce;
+	completion = pg_atomic_read_u64(&SemanticControlRebindState->completion_seq);
+	requests = pg_atomic_read_u64(&SemanticActivationShmem->record_cas_request_seq);
+	rebind_tick(2000000);
+	UT_ASSERT_EQ(semantic_control_rebind.phase, SEMANTIC_CONTROL_REBIND_COMPLETE);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&SemanticControlRebindState->completion_seq), completion);
+	UT_ASSERT_EQ(semantic_control_rebind.nonce, nonce);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&SemanticActivationShmem->record_cas_request_seq), requests);
+	UT_ASSERT_EQ(rebind_stop_poll(NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+	IsUnderPostmaster = true;
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_match(&test_serving_expected_open,
+		test_serving_expected_root, NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+	test_first_open_finish();
+}
+
+
+UT_TEST(rebind_capability_gap_retains_original_pending_reply_and_round)
+{
+	ClusterSemanticControlRebindWireV3 request;
+	uint64 nonce;
+	rebind_start();
+	rebind_complete_read();
+	rebind_tick(1000001);
+	request = rebind_ack(3);
+	request.kind = 1;
+	request.result = 0;
+	request.coordinator_node = 3;
+	request.member_node = 0;
+	request.round_nonce = 88;
+	UT_ASSERT(semantic_control_rebind_binding(3, 88, request.proof_binding));
+	UT_ASSERT(rebind_receive(&request, 3, 0));
+	nonce = semantic_control_rebind.nonce;
+	test_terminal_stop = true;
+	test_capability_missing_bitmap = UINT64CONST(1) << 2;
+	rebind_tick(1000002);
+	UT_ASSERT(semantic_control_rebind.requests[3].valid);
+	UT_ASSERT_EQ(semantic_control_rebind.phase, SEMANTIC_CONTROL_REBIND_COLLECTING);
+	UT_ASSERT_EQ(semantic_control_rebind.nonce, nonce);
+	IsUnderPostmaster = true;
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_match(&test_serving_expected_open,
+		test_serving_expected_root, NULL, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	test_capability_missing_bitmap = 0;
+	rebind_tick(1000003);
+	UT_ASSERT(!semantic_control_rebind.requests[3].valid);
+	UT_ASSERT_EQ(semantic_control_rebind.nonce, nonce);
+	test_first_open_finish();
+}
+
+UT_TEST(rebind_sealed_control_refuses_ingress_and_new_round)
+{
+	ClusterSemanticControlRebindWireV3 request;
+	uint64 nonce, seq;
+	rebind_finish_proof();
+	request = rebind_ack(3);
+	request.kind = 1;
+	request.result = 0;
+	request.coordinator_node = 3;
+	request.member_node = 0;
+	request.round_nonce = 88;
+	UT_ASSERT(semantic_control_rebind_binding(3, 88, request.proof_binding));
+	test_terminal_stop = test_rebind_control_sealed = true;
+	UT_ASSERT(!rebind_receive(&request, 3, 0));
+	UT_ASSERT(!semantic_control_rebind.requests[3].valid);
+	nonce = semantic_control_rebind.nonce;
+	seq = pg_atomic_read_u64(&SemanticActivationShmem->record_cas_request_seq);
+	test_peer_capability_generation++;
+	for (unsigned peer = 0; peer < 4; peer++)
+		test_rebind_stream_serial[peer]++;
+	rebind_tick(3000000);
+	UT_ASSERT_EQ(semantic_control_rebind.nonce, nonce);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&SemanticActivationShmem->record_cas_request_seq), seq);
+	IsUnderPostmaster = true;
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_match(&test_serving_expected_open,
+		test_serving_expected_root, NULL, NULL), CLUSTER_NORMAL_STOP_INVALID);
+	test_first_open_finish();
+}
+
+UT_TEST(rebind_ingress_without_original_success_has_no_responsibility)
+{
+	ClusterSemanticControlRebindWireV3 request = rebind_message(false);
+	rebind_setup();
+	request.coordinator_node = 3;
+	request.member_node = 0;
+	request.capability_word = test_peer_capability_word;
+	UT_ASSERT(!SemanticControlRebindState->baseline.valid);
+	UT_ASSERT(!rebind_receive(&request, 3, 0));
+	UT_ASSERT(!semantic_control_rebind.requests[3].valid);
+	rebind_tick(1000000);
+	UT_ASSERT_EQ(rebind_stop_poll(NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+	test_first_open_finish();
+}
+
 int
 main(void)
 {
-	UT_PLAN(54);
+	UT_PLAN(90);
 	UT_RUN(rebind_codec_has_independent_exact_request_and_ack_bytes);
 	UT_RUN(rebind_codec_rejects_invalid_identity_without_mutating_output);
 	UT_RUN(rebind_decoder_rejects_wrong_version_reserved_and_identity);
@@ -1092,6 +1371,42 @@ main(void)
 	UT_RUN(test_terminal_peer_aba_invalidates_original_snapshot);
 	UT_RUN(test_terminal_peer_mid_sample_drift_is_refused);
 	UT_RUN(test_terminal_peer_uses_actual_recovered_open_carrier);
+	UT_RUN(rebind_stop_consumes_complete_proof_with_online_closed);
+	UT_RUN(rebind_stop_partial_wait_cannot_hide_nontransport_drift);
+	UT_RUN(rebind_stop_request_preserves_original_collection);
+	UT_RUN(rebind_stop_census_tracks_collection_and_reply_retirement);
+	UT_RUN(rebind_stop_census_bad_geometry_overrides_other_pending);
+	UT_RUN(rebind_live_lmon_and_dispatch_use_original_entries);
+	UT_RUN(rebind_stop_completed_read_yields_to_original_rebind_owner);
+	UT_RUN(rebind_control_seal_preserves_completed_proof_without_new_work);
+	UT_RUN(rebind_capability_gap_retains_original_pending_reply_and_round);
+	UT_RUN(rebind_sealed_control_refuses_ingress_and_new_round);
+	UT_RUN(test_a148_stop_identity_matches_full_record_root_and_current_members);
+	UT_RUN(test_stop_identity_trace_off_is_silent);
+	UT_RUN(test_stop_identity_trace_keeps_first_predicate_and_full_identity);
+	UT_RUN(test_stop_identity_pending_does_not_consume_first_rejection);
+	UT_RUN(test_stop_identity_trace_names_service_binding);
+	UT_RUN(test_stop_identity_trace_defers_original_snapshot_until_lock_free);
+	UT_RUN(test_stop_identity_trace_does_not_relabel_before_tuple_as_after);
+	UT_RUN(test_stop_identity_trace_keeps_before_and_after_at_late_rejection);
+	UT_RUN(test_stop_identity_trace_names_original_clean_writer_rejection);
+	UT_RUN(test_a148_stop_identity_rejects_record_and_namespace_contradictions);
+	UT_RUN(test_a148_stop_identity_observation_gaps_do_not_publish_partial_identity);
+	UT_RUN(test_a148_stop_identity_rechecks_each_original_publication);
+	UT_RUN(test_a148_stop_read_uses_original_mailbox_before_identity);
+	UT_RUN(test_a148_stop_read_preserves_every_existing_mailbox_owner);
+	UT_RUN(test_a148_stop_read_keeps_completion_through_observation_gap);
+	UT_RUN(test_a148_stop_read_never_accepts_failed_or_changed_durable_identity);
+	UT_RUN(test_a148_stop_read_has_one_lmon_owner_and_no_activation_interleave);
+	UT_RUN(test_a148_semantic_stop_poll_requires_original_owner_and_shared_state);
+	UT_RUN(test_a148_semantic_stop_poll_all_admission_cells_and_original_release);
+	UT_RUN(test_a148_semantic_stop_poll_mailbox_completion_is_not_consumption);
+	UT_RUN(test_a148_semantic_stop_poll_ack_responsibilities_use_original_retirement);
+	UT_RUN(test_a148_semantic_stop_poll_restart_active_and_terminal_caches);
+	UT_RUN(test_a148_semantic_stop_poll_invalid_not_hidden_by_pending);
+	UT_RUN(test_a148_postmaster_retention_hint_preserves_unknown_and_publication_history);
+	UT_RUN(test_a148_stop_poll_includes_original_phase3_handoff);
+	UT_RUN(rebind_ingress_without_original_success_has_no_responsibility);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

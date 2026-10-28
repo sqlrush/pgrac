@@ -24,6 +24,14 @@
 int cluster_node_id = 0;
 bool cluster_enabled = true;
 
+/* Explicit clock input for the now-connected bounded CONTROL duty. No
+ * OPEN/rebind baseline exists in this codec/ordinary-activation fixture. */
+TimestampTz
+GetCurrentTimestamp(void)
+{
+	return INT64CONST(1000000);
+}
+
 /* This codec fixture has no postmaster, formation, or ROOT serving owner.
  * Linux retains the whole LMON call graph; reaching one of these is a bug. */
 bool IsUnderPostmaster = false;

@@ -10,6 +10,8 @@
 #include "postgres.h"
 
 #include "cluster/cluster_conf.h"
+#include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_relmap_arb.h"
 #include "storage/proc.h"
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_cr_server.h"
@@ -1038,10 +1040,23 @@ cluster_reconfig_join_in_progress(void)
 {
 	return test_terminal_join;
 }
+static bool test_rebind_control_sealed;
+/* External clock input for the real bounded LMON/retry body. */
+static TimestampTz test_rebind_now = INT64CONST(1000000);
+TimestampTz
+GetCurrentTimestamp(void)
+{
+	return test_rebind_now;
+}
 bool
 cluster_normal_stop_requested(void)
 {
 	return test_terminal_stop;
+}
+bool
+cluster_normal_stop_service_control_sealed(void)
+{
+	return test_terminal_stop && test_rebind_control_sealed;
 }
 static bool test_clean_admitted = true;
 
@@ -1597,6 +1612,7 @@ test_gate_reset(void)
 	test_stop_storage_quorum = true;
 	test_terminal_membership_cut = 2;
 	test_terminal_fenced = test_terminal_prebump = test_terminal_join = test_terminal_stop = false;
+	test_rebind_control_sealed = false;
 	test_terminal_sessions_ok = true;
 	test_terminal_qv_status = CLUSTER_QVOTEC_READY;
 	test_terminal_nonmember = -1;

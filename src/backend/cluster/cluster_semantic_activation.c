@@ -859,9 +859,8 @@ static SemanticOpenProofStatus semantic_open_proof_recheck(
 static bool semantic_open_proof_current(const ClusterSemanticOpenProofIdentity *identity);
 static ClusterNormalStopPollResult semantic_serving_match(
 	const ClusterSemanticActivationRecord *open, const uint8 *root);
-static bool semantic_control_rebind_tick(TimestampTz now) pg_attribute_unused();
-static bool semantic_control_rebind_ingress(const ClusterICEnvelope *env, const void *payload)
-	pg_attribute_unused();
+static bool semantic_control_rebind_tick(TimestampTz now);
+static bool semantic_control_rebind_ingress(const ClusterICEnvelope *env, const void *payload);
 static bool normal_start_service_binding_current(const ClusterSemanticActivationRecord *open,
 												 const uint8 *root,
 												 const ClusterSemanticActivationAckTableV1 *table);
@@ -1608,6 +1607,13 @@ cluster_semantic_activation_ack_handler(const ClusterICEnvelope *env, const void
 	SemanticActivationAckIngressResult result;
 	uint32 payload_length = env != NULL ? env->payload_length : 0;
 
+	/* Version 3 never enters the original activation/restart ring. Its
+	 * bounded slots retain the actual CONTROL dispatch provenance. */
+	if (payload != NULL && payload_length == CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES
+		&& ((const uint8 *)payload)[4] == 3 && ((const uint8 *)payload)[5] == 0) {
+		(void)semantic_control_rebind_ingress(env, payload);
+		return;
+	}
 	result = semantic_activation_ack_ingress_receive(&semantic_activation_ack_local_ingress, env,
 													 payload, payload_length, cluster_node_id,
 													 cluster_epoch_get_current());
@@ -14939,6 +14945,8 @@ cluster_semantic_activation_lmon_tick(void)
 	 * This value-only receipt cannot replace the remaining service owners. */
 	(void)cluster_recovery_tx_result_accept_v1();
 	(void)cluster_recovery_ctrc_result_accept_v1();
+	if (semantic_control_rebind_tick(GetCurrentTimestamp()))
+		return;
 	if (semantic_serving_lmon_tick())
 		return;
 	/* A normal-stop read owns the same original LMON/QVOTEC slot until its
@@ -15481,7 +15489,7 @@ semantic_normal_stop_match_mode(
 	const ClusterSemanticActivationRecord *open_record,
 	const uint8 root_descriptor[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES],
 	uint64 member_incarnations_out[CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT], const char **reason_out,
-	SemanticStopTrace *trace, bool use_open_view)
+	SemanticStopTrace *trace, bool use_open_view, bool allow_stop)
 {
 	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_INVALID;
 	const char *reason = "SEMANTIC_STOP_IDENTITY_INVALID";
@@ -15562,7 +15570,7 @@ semantic_normal_stop_match_mode(
 	if (!semantic_activation_snapshot(&before))
 		goto done;
 	if (use_open_view) {
-		proof_status = semantic_open_proof_snapshot(&table, &proof);
+		proof_status = semantic_open_proof_snapshot_mode(&table, &proof, allow_stop);
 		if (proof_status == SEMANTIC_OPEN_PROOF_PENDING || proof_status == SEMANTIC_OPEN_PROOF_TABLE_TORN
 			|| proof_status == SEMANTIC_OPEN_PROOF_OBSERVATION_PENDING)
 			goto done;
@@ -15651,7 +15659,7 @@ semantic_normal_stop_match_mode(
 	if (!semantic_activation_snapshot(&after))
 		goto done;
 	if (use_open_view) {
-		proof_status = semantic_open_proof_snapshot(&table_after, &proof_after);
+		proof_status = semantic_open_proof_snapshot_mode(&table_after, &proof_after, allow_stop);
 		if (proof_status == SEMANTIC_OPEN_PROOF_PENDING || proof_status == SEMANTIC_OPEN_PROOF_TABLE_TORN
 			|| proof_status == SEMANTIC_OPEN_PROOF_OBSERVATION_PENDING)
 			goto done;
@@ -15718,8 +15726,8 @@ done:
 	return result;
 }
 
-/* Normal-stop still uses its original carrier until the census slice enables
- * the same view and accounts for every new owner responsibility. */
+/* Stop consumes the same complete proof, without reopening online admission.
+ * Its original strict image checks and both publication cuts remain intact. */
 static ClusterNormalStopPollResult
 semantic_normal_stop_match_impl(
 	const ClusterSemanticActivationRecord *open_record,
@@ -15728,14 +15736,14 @@ semantic_normal_stop_match_impl(
 	SemanticStopTrace *trace)
 {
 	return semantic_normal_stop_match_mode(open_record, root_descriptor,
-		member_incarnations_out, reason_out, trace, false);
+		member_incarnations_out, reason_out, trace, true, true);
 }
 
 static ClusterNormalStopPollResult
 semantic_serving_match(const ClusterSemanticActivationRecord *open, const uint8 *root)
 {
 	return semantic_normal_stop_match_mode(open, root, NULL, NULL, NULL,
-		semantic_serving.cut.open_proof.source == CLUSTER_SEMANTIC_OPEN_PROOF_REBOUND);
+		semantic_serving.cut.open_proof.source == CLUSTER_SEMANTIC_OPEN_PROOF_REBOUND, false);
 }
 
 static void
@@ -16174,6 +16182,10 @@ cluster_semantic_normal_stop_read_identity(
 		|| SemanticActivationAckTable == NULL || SemanticActivationPgrdSnapshot == NULL
 		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT)
 		goto done;
+	/* Clean-leave may poll before the next periodic semantic duty. Give
+	 * the same original LMON its bounded continuation first, without moving
+	 * any existing mailbox result to a new owner. */
+	(void)semantic_control_rebind_tick(GetCurrentTimestamp());
 	if (semantic_activation_authority_mailbox_owner(false) >= 0) {
 		reason = "SEMANTIC_STOP_READ_OWNER_BUSY";
 		result = semantic_activation_lmon_stop_read_seq == 0 ? CLUSTER_NORMAL_STOP_PENDING
@@ -16215,6 +16227,8 @@ cluster_semantic_normal_stop_read_identity(
 			goto done;
 		result = CLUSTER_NORMAL_STOP_PENDING;
 		reason = "SEMANTIC_STOP_READ_PENDING";
+		if (semantic_control_rebind_stop_wait())
+			goto done;
 		if (request_seq == completion_seq)
 			(void)semantic_activation_record_read_mailbox_submit(
 				&semantic_activation_lmon_stop_read_seq);
@@ -16243,8 +16257,15 @@ cluster_semantic_normal_stop_read_identity(
 	if (!semantic_activation_pgrd_snapshot_copy(root))
 		goto done;
 	result = cluster_semantic_normal_stop_match(&open, root, incarnations, &reason);
-	if (result == CLUSTER_NORMAL_STOP_PENDING)
+	if (result == CLUSTER_NORMAL_STOP_PENDING) {
+		/* This creator has consumed its exact completed read. A rebind
+		 * needs the same original slot; retaining our completed result while
+		 * waiting for that proof would form a local wait cycle. No identity
+		 * is granted: a subsequent stop read must re-read after the proof. */
+		if (semantic_control_rebind_stop_wait())
+			semantic_activation_lmon_stop_read_seq = 0;
 		goto done;
+	}
 	semantic_activation_lmon_stop_read_seq = 0;
 	if (result == CLUSTER_NORMAL_STOP_READY) {
 		*open_out = open;
@@ -16277,6 +16298,109 @@ semantic_activation_stop_note(SemanticActivationStopObservation *out,
 		out->key = key;
 		out->reason = reason;
 	}
+}
+
+/* Only the original LMON can observe these private slots. Valid consumed
+ * ACKs and a completed publication are retained evidence, not unpaid work.
+ * Slot/nonce/creator geometry is checked even when an older owner is busy. */
+static void
+semantic_control_rebind_stop_poll(SemanticActivationStopObservation *out)
+{
+	const SemanticControlRebindRuntime *r = &semantic_control_rebind;
+	SemanticControlRebindShmem *s = SemanticControlRebindState;
+	uint64 base, progress, complete, read, request, completion;
+	bool invalid = false, pending = false, changed = false;
+	const char *reason = "SEMANTIC_STOP_REBIND_PENDING";
+
+	if (s == NULL) {
+		invalid = r->phase != SEMANTIC_CONTROL_REBIND_IDLE || r->nonce != 0 || r->read_seq != 0;
+		for (unsigned peer = 0; peer < 4; peer++)
+			invalid |= r->requests[peer].valid || r->acks[peer].valid;
+		goto done;
+	}
+	base = pg_atomic_read_u64(&s->baseline_seq);
+	progress = pg_atomic_read_u64(&s->progress_seq);
+	complete = pg_atomic_read_u64(&s->completion_seq);
+	read = pg_atomic_read_u64(&s->read_seq);
+	invalid = (base & 1) != 0 || base == UINT64_MAX || (progress & 1) != 0
+		|| progress == UINT64_MAX || (complete & 1) != 0 || complete == UINT64_MAX
+		|| r->phase > SEMANTIC_CONTROL_REBIND_INVALID || r->phase == SEMANTIC_CONTROL_REBIND_INVALID
+		|| r->nonce != pg_atomic_read_u64(&s->nonce) || r->nonce == UINT64_MAX
+		|| r->read_seq != read;
+	if (r->nonce != 0) {
+		invalid |= base == 0 || !s->baseline.valid || r->cut.base_seq != base
+			|| progress == 0 || s->progress.nonce != r->nonce || s->progress.phase != r->phase
+			|| memcmp(&s->progress.cut, &r->cut, sizeof(r->cut)) != 0
+			|| !semantic_open_proof_owner_current(&r->cut)
+			|| r->table.expected_members_lo != 15 || r->table.expected_members_hi != 0
+			|| (r->table.observed_members_lo & ~UINT64_C(15)) != 0
+			|| r->table.observed_members_hi != 0;
+		changed = r->cut.owner_pid != s->original_cut.owner_pid
+			|| r->cut.owner_procno != s->original_cut.owner_procno
+			|| r->cut.owner_generation != s->original_cut.owner_generation
+			|| memcmp(r->cut.streams, s->original_cut.streams, sizeof(r->cut.streams)) != 0;
+		for (unsigned peer = 0; peer < 4; peer++) {
+			invalid |= s->progress.generations[peer] != r->table.expected[peer].capability_generation
+				|| s->progress.words[peer] != r->table.expected[peer].capability_word;
+			changed |= r->table.expected[peer].capability_generation
+				!= s->baseline.table.expected[peer].capability_generation;
+		}
+	} else
+		invalid |= r->phase != SEMANTIC_CONTROL_REBIND_IDLE || read != 0 || progress != 0;
+	if (read != 0) {
+		request = pg_atomic_read_u64(&SemanticActivationShmem->record_cas_request_seq);
+		completion = pg_atomic_read_u64(&SemanticActivationShmem->record_cas_completion_seq);
+		invalid |= read == UINT64_MAX || request != read
+			|| (completion != read && completion != read - 1)
+			|| pg_atomic_read_u32(&SemanticActivationShmem->record_cas_request_kind)
+				!= CLUSTER_SEMANTIC_AUTHORITY_REQUEST_RECORD_READ
+			|| s->read_nonce != r->nonce || r->read_nonce != r->nonce || r->read_verified
+			|| s->read_owner_pid != r->cut.owner_pid || s->read_owner_procno != r->cut.owner_procno
+			|| s->read_owner_generation != r->cut.owner_generation;
+		pending = true;
+	}
+	if (r->phase == SEMANTIC_CONTROL_REBIND_READING)
+		pending |= !r->read_verified || changed;
+	else if (r->phase == SEMANTIC_CONTROL_REBIND_COLLECTING)
+		pending = true; /* Publication, not an observed bitmap, retires this round. */
+	else if (r->phase == SEMANTIC_CONTROL_REBIND_COMPLETE)
+		invalid |= !r->read_verified || read != 0 || complete == 0
+			|| s->completion.nonce != r->nonce
+			|| memcmp(&s->completion.cut, &r->cut, sizeof(r->cut)) != 0
+			|| r->table.observed_members_lo != 15;
+	for (unsigned peer = 0; peer < 4; peer++) {
+		const SemanticControlRebindIngress *items[] = { &r->requests[peer], &r->acks[peer] };
+		for (unsigned kind = 0; kind < lengthof(items); kind++) {
+			const SemanticControlRebindIngress *item = items[kind];
+			const ClusterSemanticControlRebindWireV3 *m = &item->message;
+			uint8 encoded[CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES];
+			if (!item->valid)
+				continue;
+			invalid |= peer == (unsigned)cluster_node_id || item->stream.peer != peer
+				|| item->stream.plane != CLUSTER_IC_PLANE_CONTROL || item->stream.channel != -1
+				|| item->stream.serial == 0 || item->stream.owner_pid != MyProcPid
+				|| !item->capability.valid || item->capability.generation == 0
+				|| item->capability.generation == UINT32_MAX
+				|| !cluster_semantic_control_rebind_wire_encode(m, encoded)
+				|| m->kind != (kind == 0 ? CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_REQUEST
+					: CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_ACK)
+				|| m->coordinator_node != (kind == 0 ? peer : (unsigned)cluster_node_id)
+				|| m->member_node != (kind == 0 ? (unsigned)cluster_node_id : peer);
+			if (kind == 0)
+				pending = true; /* Only the real send/retirement clears valid. */
+			else {
+				invalid |= m->round_nonce != r->nonce;
+				pending |= (r->table.observed_members_lo & (UINT64_C(1) << peer)) == 0;
+			}
+		}
+	}
+done:
+	if (invalid)
+		reason = "SEMANTIC_STOP_REBIND_GEOMETRY_INVALID";
+	if (invalid || pending)
+		semantic_activation_stop_note(out,
+			invalid ? CLUSTER_NORMAL_STOP_INVALID : CLUSTER_NORMAL_STOP_PENDING,
+			"R4_CONTROL_REBIND", r->nonce, reason);
 }
 
 ClusterNormalStopPollResult
@@ -16328,6 +16452,7 @@ cluster_semantic_normal_stop_poll(const char **domain_out, uint64 *key_out, cons
 	if (owner >= 0)
 		semantic_activation_stop_note(&out, CLUSTER_NORMAL_STOP_PENDING, "R4_MAILBOX_OWNER",
 									  (uint64)owner, "SEMANTIC_STOP_COMPLETION_UNCONSUMED");
+	semantic_control_rebind_stop_poll(&out);
 	/* Only this process submits the authority mailbox; QVOTEC may complete
 	 * it concurrently. A retained result without a local owner is a cache. */
 	request_seq = pg_atomic_read_u64(&SemanticActivationShmem->record_cas_request_seq);

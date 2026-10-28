@@ -1,5 +1,4 @@
 /* Same-OPEN CONTROL collection and its read-only proven view.
- * Live dispatch is staged until the normal-stop census is connected.
  * Author: SqlRush <sqlrush@gmail.com> */
 #include "../../common/sha2_int.h"
 
@@ -92,7 +91,7 @@ semantic_control_rebind_memory(SemanticControlRebindCut *cut,
 		|| MyProc->pgprocno < 0 || MyProc->cluster_grd_generation == 0
 		|| MyProc->cluster_grd_generation == UINT64_MAX || SemanticControlRebindState == NULL
 		|| !cluster_shared_config || cluster_node_id < 0 || cluster_node_id >= 4
-		|| cluster_normal_stop_requested() || !cluster_qvotec_in_quorum()
+		|| !cluster_qvotec_in_quorum()
 		|| !cluster_write_fence_allowed() || cluster_reconfig_has_pending_prebump_stage())
 		return SEMANTIC_CONTROL_REBIND_BAD;
 	seq = pg_atomic_read_u64(&SemanticControlRebindState->baseline_seq);
@@ -231,15 +230,24 @@ semantic_control_rebind_ingress(const ClusterICEnvelope *env, const void *payloa
 	SemanticControlRebindIngress *slot;
 	ClusterICControlIngress ingress;
 	ClusterSemanticControlRebindWireV3 *m = &item.message;
+	uint64 baseline_seq;
 	unsigned peer;
 
-	if (!IsUnderPostmaster || !AmLmonProcess() || env == NULL || payload == NULL
+	if (!IsUnderPostmaster || !AmLmonProcess() || SemanticControlRebindState == NULL
+		|| env == NULL || payload == NULL
+		|| cluster_normal_stop_service_control_sealed()
 		|| env->msg_type != PGRAC_IC_MSG_SEMANTIC_ACTIVATION_ACK_V1 || env->payload_length != 152
 		|| cluster_node_id < 0 || cluster_node_id >= 4 || env->source_node_id >= 4
 		|| env->source_node_id == (uint32)cluster_node_id
 		|| env->dest_node_id != (uint32)cluster_node_id || env->epoch != cluster_epoch_get_current()
 		|| !cluster_semantic_control_rebind_wire_decode(payload, m)
 		|| m->transition_epoch != env->epoch || !cluster_ic_dispatch_control_ingress(env, &ingress))
+		return false;
+	baseline_seq = pg_atomic_read_u64(&SemanticControlRebindState->baseline_seq);
+	if (baseline_seq == 0 || (baseline_seq & 1) != 0 || baseline_seq == UINT64_MAX)
+		return false;
+	pg_read_barrier();
+	if (!SemanticControlRebindState->baseline.valid)
 		return false;
 	peer = env->source_node_id;
 	if (ingress.carrier != CLUSTER_IC_CONTROL_TCP || ingress.source_node != (int32)peer
@@ -268,7 +276,8 @@ semantic_control_rebind_ingress(const ClusterICEnvelope *env, const void *payloa
 		slot = &semantic_control_rebind.acks[peer];
 	}
 	item.valid = true;
-	if (!semantic_control_rebind_frame_current(&item))
+	if (!semantic_control_rebind_frame_current(&item)
+		|| pg_atomic_read_u64(&SemanticControlRebindState->baseline_seq) != baseline_seq)
 		return false;
 	*slot = item;
 	return true;
@@ -377,7 +386,7 @@ semantic_control_rebind_send(unsigned peer, const ClusterSemanticControlRebindWi
 {
 	uint8 bytes[152];
 	ClusterICSendResult result;
-	if (!semantic_control_rebind_cut_current()
+	if (cluster_normal_stop_service_control_sealed() || !semantic_control_rebind_cut_current()
 		|| !cluster_semantic_control_rebind_wire_encode(message, bytes))
 		return false;
 	result = cluster_ic_send_envelope(PGRAC_IC_MSG_SEMANTIC_ACTIVATION_ACK_V1, peer, bytes,
@@ -445,6 +454,12 @@ semantic_control_rebind_tick_impl(TimestampTz now)
 
 	if (!IsUnderPostmaster || !AmLmonProcess() || SemanticControlRebindState == NULL)
 		return false;
+	/* Before the original successful OPEN there is no rebind authority.
+	 * Do not create a failed candidate merely by ticking startup/nonshared. */
+	if (pg_atomic_read_u64(&SemanticControlRebindState->baseline_seq) == 0
+		&& r->nonce == 0 && r->read_seq == 0
+		&& pg_atomic_read_u64(&SemanticControlRebindState->read_seq) == 0)
+		return false;
 	check = semantic_control_rebind_memory(&cut, &table, &changed);
 	shared_read_seq = pg_atomic_read_u64(&SemanticControlRebindState->read_seq);
 	pg_read_barrier();
@@ -482,13 +497,22 @@ semantic_control_rebind_tick_impl(TimestampTz now)
 			return false;
 		}
 	}
-	if (check != SEMANTIC_CONTROL_REBIND_SAME) {
+	/* The original control seal is reached only after the owner census.
+	 * Retain completed evidence, never admit a new round, send or read here.
+	 * An already-owned read above is still consumed by its exact creator. */
+	if (cluster_normal_stop_service_control_sealed())
+		return false;
+	/* An unavailable observation cannot retire a retained reply or replace
+	 * its candidate. Keep the original owner until a coherent cut can prove
+	 * either the same K or a real contradiction. */
+	if (check == SEMANTIC_CONTROL_REBIND_WAIT)
+		return false;
+	if (check == SEMANTIC_CONTROL_REBIND_BAD) {
 		semantic_control_rebind_clear_completion();
 		memset(r->acks, 0, sizeof(r->acks));
 		memset(r->requests, 0, sizeof(r->requests));
 		r->read_verified = false;
-		r->phase = check == SEMANTIC_CONTROL_REBIND_BAD ? SEMANTIC_CONTROL_REBIND_INVALID
-														: SEMANTIC_CONTROL_REBIND_IDLE;
+		r->phase = SEMANTIC_CONTROL_REBIND_INVALID;
 		return false;
 	}
 	for (unsigned peer = 0; peer < 4; peer++)
@@ -674,7 +698,7 @@ semantic_open_proof_carrier_compatible(const ClusterSemanticActivationAckTableV1
  * is captured here. Existing authenticated shared cap records couple the
  * producer's CONTROL stream to this read cut; postmaster uses try-lock only. */
 static SemanticControlRebindCheck
-semantic_open_proof_cut_check(const SemanticControlRebindProgress *progress)
+semantic_open_proof_cut_check(const SemanticControlRebindProgress *progress, bool allow_stop)
 {
 	const SemanticControlRebindBaseline *base = &SemanticControlRebindState->baseline;
 	const SemanticControlRebindCut *cut = &progress->cut;
@@ -688,7 +712,8 @@ semantic_open_proof_cut_check(const SemanticControlRebindProgress *progress)
 	bool sampled, busy, missing = false;
 
 	if (!base->valid || !semantic_open_proof_owner_current(cut) || !cluster_shared_config
-		|| cluster_node_id < 0 || cluster_node_id >= 4 || cluster_normal_stop_requested()
+		|| cluster_node_id < 0 || cluster_node_id >= 4
+		|| (!allow_stop && cluster_normal_stop_requested())
 		|| !cluster_qvotec_in_quorum() || !cluster_write_fence_allowed()
 		|| cluster_reconfig_has_pending_prebump_stage() || cluster_reconfig_join_in_progress()
 		|| !semantic_activation_snapshot(&gate) || gate.transition_closed
@@ -776,8 +801,8 @@ semantic_open_proof_cut_check(const SemanticControlRebindProgress *progress)
 }
 
 static SemanticOpenProofStatus
-semantic_open_proof_snapshot(ClusterSemanticActivationAckTableV1 *table,
-	ClusterSemanticOpenProofIdentity *identity)
+semantic_open_proof_snapshot_mode(ClusterSemanticActivationAckTableV1 *table,
+	ClusterSemanticOpenProofIdentity *identity, bool allow_stop)
 {
 	SemanticControlRebindShmem *shared = SemanticControlRebindState;
 	SemanticControlRebindProgress progress;
@@ -809,7 +834,7 @@ semantic_open_proof_snapshot(ClusterSemanticActivationAckTableV1 *table,
 		|| progress.nonce != pg_atomic_read_u64(&shared->nonce)
 		|| progress.cut.base_seq != base_seq || !semantic_open_proof_carrier_compatible(table))
 		return SEMANTIC_OPEN_PROOF_INVALID;
-	cut_check = semantic_open_proof_cut_check(&progress);
+	cut_check = semantic_open_proof_cut_check(&progress, allow_stop);
 	if (cut_check == SEMANTIC_CONTROL_REBIND_BAD)
 		return SEMANTIC_OPEN_PROOF_INVALID;
 	observation_pending = cut_check == SEMANTIC_CONTROL_REBIND_WAIT;
@@ -874,7 +899,7 @@ semantic_open_proof_snapshot(ClusterSemanticActivationAckTableV1 *table,
 		|| pg_atomic_read_u64(&shared->baseline_seq) != base_seq
 		|| pg_atomic_read_u64(&SemanticActivationAckTable->publication_seq) != ordinary_seq)
 		return SEMANTIC_OPEN_PROOF_INVALID;
-	cut_check = semantic_open_proof_cut_check(&progress);
+	cut_check = semantic_open_proof_cut_check(&progress, allow_stop);
 	if (cut_check == SEMANTIC_CONTROL_REBIND_BAD)
 		return SEMANTIC_OPEN_PROOF_INVALID;
 	if (observation_pending || cut_check == SEMANTIC_CONTROL_REBIND_WAIT)
@@ -885,6 +910,25 @@ semantic_open_proof_snapshot(ClusterSemanticActivationAckTableV1 *table,
 	identity->completion_seq = completion_seq;
 	identity->round_nonce = nonce;
 	return SEMANTIC_OPEN_PROOF_REBOUND;
+}
+
+/* Online admissions keep their existing stop-request refusal. Only the
+ * strict stop matcher uses the same proof while draining original owners. */
+static SemanticOpenProofStatus
+semantic_open_proof_snapshot(ClusterSemanticActivationAckTableV1 *table,
+	ClusterSemanticOpenProofIdentity *identity)
+{
+	return semantic_open_proof_snapshot_mode(table, identity, false);
+}
+
+static bool
+semantic_control_rebind_stop_wait(void)
+{
+	ClusterSemanticActivationAckTableV1 table;
+	ClusterSemanticOpenProofIdentity identity;
+	SemanticOpenProofStatus status = semantic_open_proof_snapshot_mode(&table, &identity, true);
+	return status == SEMANTIC_OPEN_PROOF_PENDING
+		|| status == SEMANTIC_OPEN_PROOF_OBSERVATION_PENDING;
 }
 
 static SemanticOpenProofStatus
