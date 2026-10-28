@@ -38,6 +38,7 @@ static int pins[5];
 static bool heap_locked[3];
 static int wait_calls, key_frees, heap_relocks, recent_calls;
 static int vm_pins_during_wait, vm_pins_at_relock;
+static int vm_failure_site, vm_failure_sqlstate, vm_failure_hits;
 typedef enum RetryFault {
 	RETRY_FAULT_NONE,
 	RETRY_FAULT_MODIFIER,
@@ -135,6 +136,10 @@ visibilitymap_pin(Relation relation, BlockNumber block, Buffer *vm)
 	UT_ASSERT_EQ(block, 44);
 	UT_ASSERT(!heap_locked[1] && !heap_locked[2]);
 	UT_ASSERT_EQ(*vm, InvalidBuffer);
+	if (vm_failure_site == 1) {
+		vm_failure_hits++;
+		ereport(ERROR, (errcode(vm_failure_sqlstate), errmsg("scripted VM pin interruption")));
+	}
 	*vm = 3;
 	pins[3]++;
 }
@@ -147,6 +152,11 @@ visibilitymap_pin_recent(Relation relation, BlockNumber block, Buffer recent, Bu
 	UT_ASSERT_EQ(recent, 3);
 	UT_ASSERT_EQ(*vm, InvalidBuffer);
 	recent_calls++;
+	if (vm_failure_site == 2) {
+		vm_failure_hits++;
+		ereport(ERROR,
+				(errcode(vm_failure_sqlstate), errmsg("scripted resident VM pin interruption")));
+	}
 	if (recent_misses > 0) {
 		recent_misses--;
 		return false;
@@ -637,10 +647,81 @@ UT_TEST(pruned_tuple_after_capacity_wait_refuses_and_keeps_exact_abort_owner)
 			}
 }
 
+UT_TEST(vm_repin_errors_keep_ready_receipt_for_exact_abort_owner)
+{
+	const int sqlstates[] = { ERRCODE_QUERY_CANCELED, ERRCODE_T_R_DEADLOCK_DETECTED,
+							  ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS };
+
+	for (int site = 1; site <= 2; site++)
+		for (int result = 0; result < 2; result++)
+			for (unsigned state = 0; state < lengthof(sqlstates); state++) {
+				ClusterUndoRecordPrepareReceipt receipt;
+				RetryObservation observed;
+
+				recent_misses = 0;
+				vm_failure_site = site;
+				vm_failure_sqlstate = sqlstates[state];
+				vm_failure_hits = 0;
+				observed = run_retry(false, false, 1, RETRY_FAULT_NONE,
+									 result ? CLUSTER_TXW_RETRY : CLUSTER_TXW_RESOLVED, &receipt);
+				UT_ASSERT(observed.errored);
+				if (observed.errored) {
+					UT_ASSERT(!observed.requalified && !observed.reacquire);
+					UT_ASSERT_EQ(vm_failure_hits, 1);
+					UT_ASSERT_EQ(receipt_error_level, ERROR);
+					UT_ASSERT_EQ(receipt_error_code, sqlstates[state]);
+					UT_ASSERT_EQ(receipt_error_detail[0], '\0');
+					UT_ASSERT_EQ(wait_calls, 1);
+					UT_ASSERT_EQ(vm_pins_during_wait, 0);
+					UT_ASSERT_EQ(heap_relocks, site - 1);
+					UT_ASSERT_EQ(recent_calls, site - 1);
+					UT_ASSERT_EQ(heap_locked[1], site == 2);
+					UT_ASSERT(!heap_locked[2]);
+					UT_ASSERT_EQ(pins[1], 1);
+					UT_ASSERT_EQ(pins[2] + pins[3] + pins[4], 0);
+					UT_ASSERT_EQ(observed.old_vm, InvalidBuffer);
+					UT_ASSERT_EQ(observed.new_vm, InvalidBuffer);
+					UT_ASSERT_EQ(key_frees, 1);
+					UT_ASSERT_EQ(observed.deadline, 500);
+					UT_ASSERT_EQ(receipt.absolute_deadline_us, 100);
+					UT_ASSERT_EQ(memcmp(&receipt, &before_wait_receipt, sizeof(receipt)), 0);
+					UT_ASSERT_EQ(
+						memcmp(&receipt, &cluster_undo_record_reservation.receipt, sizeof(receipt)),
+						0);
+					UT_ASSERT(cluster_undo_record_reservation.active);
+					UT_ASSERT_EQ(receipt.ctrc_prepared_mask, 1);
+					UT_ASSERT_EQ(receipt_prepare_calls, 1);
+					UT_ASSERT_EQ(receipt_cancel_calls + receipt_unref_calls + receipt_leave_calls,
+								 0);
+					UT_ASSERT_EQ(receipt_apply_calls + receipt_wal_calls, 0);
+				}
+
+				/* Buffer cleanup is modeled explicitly; the exact receipt
+				 * abort owner below is production code, not ResourceOwner. */
+				if (heap_locked[1])
+					LockBuffer(1, BUFFER_LOCK_UNLOCK);
+				if (BufferIsValid(observed.old_vm))
+					ReleaseBuffer(observed.old_vm);
+				ReleaseBuffer(1);
+				receipt_abort_after_lwlock_release();
+				UT_ASSERT(!cluster_undo_record_reservation.active);
+				UT_ASSERT(!cluster_undo_record_reservation.consume_locked);
+				UT_ASSERT_EQ(receipt_cancel_calls, 1);
+				UT_ASSERT_EQ(receipt_unref_calls, 1);
+				UT_ASSERT_EQ(receipt_leave_calls, 1);
+				UT_ASSERT_EQ(receipt_apply_calls + receipt_wal_calls, 0);
+				if (observed.errored)
+					UT_ASSERT_EQ(receipt_error_code, sqlstates[state]);
+				receipt_abort_after_lwlock_release();
+				UT_ASSERT_EQ(receipt_cancel_calls + receipt_unref_calls + receipt_leave_calls, 3);
+			}
+	vm_failure_site = 0;
+}
+
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(10);
 	UT_RUN(single_page_retry_releases_vm_before_wait_and_reloads_tuple);
 	UT_RUN(pair_retry_releases_each_vm_reference_before_page_choice_reentry);
 	UT_RUN(repin_retries_a_resident_miss_without_carrying_a_vm_pin);
@@ -650,6 +731,7 @@ main(void)
 	UT_RUN(unprovable_capacity_keeps_refusal_and_abort_owner);
 	UT_RUN(wait_errors_preserve_cancel_or_admission_sqlstate_and_abort_owner);
 	UT_RUN(pruned_tuple_after_capacity_wait_refuses_and_keeps_exact_abort_owner);
+	UT_RUN(vm_repin_errors_keep_ready_receipt_for_exact_abort_owner);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
