@@ -10,6 +10,10 @@
  * IDENTIFICATION
  *	  src/backend/commands/collationcmds.c
  *
+ * PGRAC MODIFICATIONS
+ *    Preflight native collation changes before catalog lookups or locks.
+ *    Author: SqlRush <sqlrush@gmail.com>
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -24,6 +28,10 @@
 #include "catalog/pg_collation.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_namespace.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_mode.h"
+#include "cluster/cluster_tt_local.h"
+#endif
 #include "commands/alter.h"
 #include "commands/collationcmds.h"
 #include "commands/comment.h"
@@ -32,6 +40,9 @@
 #include "common/string.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "tcop/utility.h"
+#endif
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
@@ -47,6 +58,37 @@ typedef struct
 	int			enc;			/* encoding */
 } CollAliasData;
 
+
+#ifdef USE_PGRAC_CLUSTER
+/* Direct callers must bind before catalog lookups or locks. */
+static void
+PreflightClusterSharedCollationWrite(bool create)
+{
+	ClusterCanonicalTxnBinding binding;
+	TransactionId current_xid;
+	const char *command = create ? "CREATE COLLATION" : "ALTER COLLATION";
+	const char *action = create ? "creation" : "alteration";
+
+	if (!cluster_shared_catalog || !cluster_storage_mode_enabled())
+		return;
+
+	PreventCommandIfReadOnly(command);
+	PreventCommandIfParallelMode(command);
+	PreventCommandDuringRecovery(command);
+	if (IsSubTransaction())
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("shared catalog %s does not support subtransactions", action)));
+	current_xid = GetCurrentTransactionIdIfAny();
+	if (TransactionIdIsValid(current_xid)
+		&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("shared catalog top-level transaction identity mismatch")));
+	if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("canonical ACTIVE publication failed before shared catalog %s", action)));
+}
+#endif
 
 /*
  * CREATE COLLATION
@@ -76,6 +118,10 @@ DefineCollation(ParseState *pstate, List *names, List *parameters, bool if_not_e
 	char	   *collversion = NULL;
 	Oid			newoid;
 	ObjectAddress address;
+
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedCollationWrite(true);
+#endif
 
 	collNamespace = QualifiedNameGetCreationNamespace(names, &collName);
 
@@ -412,6 +458,10 @@ AlterCollation(AlterCollationStmt *stmt)
 	char	   *oldversion;
 	char	   *newversion;
 	ObjectAddress address;
+
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedCollationWrite(false);
+#endif
 
 	rel = table_open(CollationRelationId, RowExclusiveLock);
 	collOid = get_collation_oid(stmt->collname, false);

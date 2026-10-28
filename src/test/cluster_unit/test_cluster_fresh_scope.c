@@ -31,12 +31,14 @@
 #include "catalog/namespace.h"
 #include "catalog/objectaddress.h"
 #include "catalog/pg_am.h"
+#include "catalog/pg_collation.h"
 #include "catalog/pg_control.h"
 #include "catalog/pg_extension.h"
 #include "catalog/pg_foreign_server_d.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_policy.h"
 #include "catalog/pg_type_d.h"
+#include "commands/collationcmds.h"
 #include "commands/comment.h"
 #include "commands/conversioncmds.h"
 #include "commands/dbcommands.h"
@@ -6136,6 +6138,11 @@ static CommentStmt native_comment_stmt;
 static bool label_lookup_active, label_expect_binding;
 static unsigned label_lookups, label_unbound, label_bad_lookup;
 static SecLabelStmt native_label_stmt;
+static bool collation_lookup_active, collation_expect_binding;
+static unsigned collation_lookups, collation_unbound, collation_bad_lookup, collation_lookup_kind;
+static String collation_name_node;
+static ListCell collation_name_cell;
+static List collation_names;
 
 Oid
 get_database_oid(const char *dbname, bool missing_ok)
@@ -6152,6 +6159,15 @@ get_database_oid(const char *dbname, bool missing_ok)
 Relation
 table_open(Oid relationId, LOCKMODE lockmode)
 {
+	if (collation_lookup_active) {
+		collation_lookups++;
+		collation_lookup_kind = 2;
+		if (collation_expect_binding && utility_binds == 0)
+			collation_unbound++;
+		if (relationId != CollationRelationId || lockmode != RowExclusiveLock)
+			collation_bad_lookup++;
+		siglongjmp(boundary, 2);
+	}
 	if (schema_lookup_active) {
 		schema_lookups++;
 		if (schema_expect_binding && utility_binds == 0)
@@ -7608,6 +7624,15 @@ static CreateConversionStmt native_conversion_stmt;
 Oid
 QualifiedNameGetCreationNamespace(List *names, char **objname)
 {
+	if (collation_lookup_active) {
+		collation_lookups++;
+		collation_lookup_kind = 1;
+		if (collation_expect_binding && utility_binds == 0)
+			collation_unbound++;
+		if (names != &collation_names || objname == NULL)
+			collation_bad_lookup++;
+		siglongjmp(boundary, 2);
+	}
 	conversion_lookups++;
 	if (conversion_expect_binding && utility_binds == 0)
 		conversion_unbound++;
@@ -7758,10 +7783,181 @@ UT_TEST(test_native_conversion_utility_warm_context_guards_preserve_binding)
 	}
 }
 
+/* Actual native collation prefixes stop before the first namespace lookup or
+ * pg_collation lock. Provider/version work and catalog writes do not execute. */
+#include "test_cluster_fresh_collation.inc"
+static DefineStmt native_collation_create;
+static AlterCollationStmt native_collation_alter;
+
+static void
+reset_native_collation(bool expect_binding)
+{
+	reset_create_preflight();
+	collation_lookup_active = true;
+	collation_expect_binding = expect_binding;
+	collation_lookups = collation_unbound = collation_bad_lookup = collation_lookup_kind = 0;
+	collation_name_node = (String){ .type = T_String, .sval = "collation" };
+	collation_name_cell = (ListCell){ .ptr_value = &collation_name_node };
+	collation_names
+		= (List){ .type = T_List, .length = 1, .max_length = 1, .elements = &collation_name_cell };
+	native_collation_create = (DefineStmt){ .type = T_DefineStmt,
+											.kind = OBJECT_COLLATION,
+											.defnames = &collation_names };
+	native_collation_alter
+		= (AlterCollationStmt){ .type = T_AlterCollationStmt, .collname = &collation_names };
+}
+
+static void
+native_collation_entry(unsigned kind)
+{
+	if (kind == 0)
+		(void)DefineCollation(NULL, &collation_names, NIL, false);
+	else
+		(void)AlterCollation(&native_collation_alter);
+}
+
+UT_TEST(test_native_collations_bind_before_namespace_lookup_or_catalog_lock_in_all_profiles)
+{
+	for (unsigned kind = 0; kind < 2; kind++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_collation(binds);
+			cluster_shared_catalog = (mode & 1) != 0;
+			utility_storage_mode = (mode & 2) != 0;
+			cluster_shared_config = (mode & 4) != 0;
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_collation_entry(kind);
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(collation_lookups, repeat + 1);
+				UT_ASSERT_EQ(collation_lookup_kind, kind == 0 ? 1 : 2);
+				UT_ASSERT_EQ(collation_unbound, 0);
+				UT_ASSERT_EQ(collation_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	collation_lookup_active = false;
+}
+
+UT_TEST(test_native_collation_refusals_precede_lookup_or_lock)
+{
+	for (unsigned kind = 0; kind < 2; kind++) {
+		for (unsigned failure = 0; failure < 5; failure++) {
+			bool allocated = failure == 0 || failure == 2;
+			int caught;
+
+			reset_native_collation(true);
+			if (failure == 0)
+				utility_bind_ok = false;
+			else if (failure == 1 || failure == 2) {
+				if (failure == 2)
+					create_sql_entry(kind == 0 ? (Node *)&native_collation_create
+											   : (Node *)&native_collation_alter);
+				utility_in_child = true;
+			} else {
+				utility_current_xid = 401;
+				utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_collation_entry(kind);
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, failure == 0					? ERRCODE_DATA_CORRUPTED
+									 : failure == 1 || failure == 2 ? ERRCODE_FEATURE_NOT_SUPPORTED
+																	: ERRCODE_INTERNAL_ERROR);
+			if (failure == 1 || failure == 2)
+				UT_ASSERT_STR_EQ(
+					error_message,
+					kind == 0 ? "shared catalog creation does not support subtransactions"
+							  : "shared catalog alteration does not support subtransactions");
+			UT_ASSERT_EQ(collation_lookups, 0);
+			UT_ASSERT_EQ(collation_lookup_kind, 0);
+			UT_ASSERT_EQ(utility_xids, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, failure == 2 ? 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, allocated || failure == 3 ? 400 : InvalidTransactionId);
+		}
+	}
+	collation_lookup_active = false;
+}
+
+UT_TEST(test_native_collation_context_guards_keep_nonshared_route)
+{
+	for (unsigned kind = 0; kind < 2; kind++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+
+			for (unsigned guard = 0; guard < 3; guard++) {
+				int caught;
+
+				reset_native_collation(binds);
+				cluster_shared_catalog = (mode & 1) != 0;
+				utility_storage_mode = (mode & 2) != 0;
+				cluster_shared_config = (mode & 4) != 0;
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_collation_entry(kind);
+				UT_ASSERT_EQ(caught, binds ? 1 : 2);
+				UT_ASSERT_EQ(error_code, !binds		  ? 0
+										 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+													  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				UT_ASSERT_EQ(collation_lookups, binds ? 0 : 1);
+				UT_ASSERT_EQ(collation_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	collation_lookup_active = false;
+}
+
+UT_TEST(test_native_collation_utility_warm_context_guards_preserve_binding)
+{
+	for (unsigned kind = 0; kind < 2; kind++) {
+		for (unsigned guard = 0; guard < 4; guard++) {
+			int caught;
+
+			reset_native_collation(true);
+			create_sql_entry(kind == 0 ? (Node *)&native_collation_create
+									   : (Node *)&native_collation_alter);
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			XactReadOnly = guard == 1;
+			utility_parallel = guard == 2;
+			utility_recovery = guard == 3;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_collation_entry(kind);
+			UT_ASSERT_EQ(caught, guard ? 1 : 2);
+			UT_ASSERT_EQ(error_code, !guard		  ? 0
+									 : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+												  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT_EQ(collation_lookups, guard ? 0 : 1);
+			UT_ASSERT_EQ(collation_unbound, 0);
+			UT_ASSERT_EQ(collation_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_prepares, guard ? 1 : 2);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			UT_ASSERT_EQ(utility_top_xid, 400);
+		}
+	}
+	collation_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(101);
+	UT_PLAN(105);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -7863,6 +8059,10 @@ main(void)
 	UT_RUN(test_native_conversion_refusals_precede_namespace_lookup);
 	UT_RUN(test_native_conversion_context_guards_keep_nonshared_route);
 	UT_RUN(test_native_conversion_utility_warm_context_guards_preserve_binding);
+	UT_RUN(test_native_collations_bind_before_namespace_lookup_or_catalog_lock_in_all_profiles);
+	UT_RUN(test_native_collation_refusals_precede_lookup_or_lock);
+	UT_RUN(test_native_collation_context_guards_keep_nonshared_route);
+	UT_RUN(test_native_collation_utility_warm_context_guards_preserve_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
