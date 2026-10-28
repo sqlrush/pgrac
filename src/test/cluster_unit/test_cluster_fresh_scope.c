@@ -46,6 +46,10 @@
 #include "catalog/pg_proc.h"
 #include "catalog/pg_statistic_ext.h"
 #include "catalog/pg_transform.h"
+#include "catalog/pg_ts_config.h"
+#include "catalog/pg_ts_dict.h"
+#include "catalog/pg_ts_parser.h"
+#include "catalog/pg_ts_template.h"
 #include "catalog/pg_type_d.h"
 #include "catalog/pg_user_mapping.h"
 #include "commands/alter.h"
@@ -6195,6 +6199,22 @@ static unsigned extension_lookups, extension_unbound, extension_bad_lookup, exte
 static String extension_name;
 static AlterExtensionStmt extension_update;
 static AlterExtensionContentsStmt extension_contents;
+static bool tsearch_lookup_active, tsearch_expect_binding, tsearch_superuser_denied;
+static unsigned tsearch_entry_kind, tsearch_expected_boundary, tsearch_lookup_kind;
+static unsigned tsearch_lookups, tsearch_unbound, tsearch_bad_lookup;
+static List tsearch_names;
+
+static void
+record_tsearch_lookup(unsigned kind)
+{
+	tsearch_lookups++;
+	tsearch_lookup_kind = kind;
+	if (tsearch_expect_binding && utility_binds == 0)
+		tsearch_unbound++;
+	if (kind != tsearch_expected_boundary)
+		tsearch_bad_lookup++;
+}
+
 static bool schema_lookup_active, schema_expect_binding;
 static unsigned schema_lookups, schema_unbound, schema_bad_lookup;
 static bool comment_lookup_active, comment_expect_binding, comment_database_exists;
@@ -7801,6 +7821,13 @@ static ObjectWithArgs native_operator_args;
 Oid
 QualifiedNameGetCreationNamespace(List *names, char **objname)
 {
+	if (tsearch_lookup_active) {
+		record_tsearch_lookup(2);
+		if ((tsearch_entry_kind != 1 && tsearch_entry_kind != 3) || names != &tsearch_names
+			|| objname == NULL)
+			tsearch_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before the real text-search namespace query. */
+	}
 	if (aggregate_lookup_active) {
 		aggregate_lookups++;
 		if (aggregate_expect_binding && utility_binds == 0)
@@ -8170,6 +8197,14 @@ static unsigned language_lookups, language_unbound;
 bool
 superuser(void)
 {
+	if (tsearch_lookup_active) {
+		record_tsearch_lookup(1);
+		if (tsearch_entry_kind != 0 && tsearch_entry_kind != 2)
+			tsearch_bad_lookup++;
+		if (tsearch_superuser_denied)
+			return false;
+		siglongjmp(boundary, 2); /* Stop before the real superuser/role-cache query. */
+	}
 	if (language_lookup_active) {
 		language_lookups++;
 		if (language_expect_binding && utility_binds == 0)
@@ -10644,10 +10679,292 @@ UT_TEST(test_native_aggregate_utility_warm_guards_preserve_binding)
 	aggregate_lookup_active = false;
 }
 
+/* Actual prefixes stop at role-cache, namespace, dictionary or configuration
+ * lookup boundaries. No text-search catalog operation succeeds in this fixture. */
+Oid
+get_ts_dict_oid(List *names, bool missing_ok)
+{
+	record_tsearch_lookup(3);
+	if (!tsearch_lookup_active || tsearch_entry_kind != 4 || names != &tsearch_names || missing_ok)
+		tsearch_bad_lookup++;
+	siglongjmp(boundary, 2);
+}
+
+static HeapTuple
+GetTSConfigTuple(List *names)
+{
+	record_tsearch_lookup(4);
+	if (!tsearch_lookup_active || tsearch_entry_kind != 5 || names != &tsearch_names)
+		tsearch_bad_lookup++;
+	siglongjmp(boundary, 2); /* Stop before the actual private helper and its queries. */
+}
+
+#include "test_cluster_fresh_tsearch.inc"
+static String tsearch_name_nodes[2];
+static ListCell tsearch_name_cells[2], tsearch_dict_cell;
+static List tsearch_dicts;
+static DefineStmt native_tsearch_create;
+static AlterTSDictionaryStmt native_tsearch_dictionary;
+static AlterTSConfigurationStmt native_tsearch_configuration;
+static ObjectAddress tsearch_copied;
+static Node *tsearch_expected_statement;
+static const ObjectType tsearch_create_types[]
+	= { OBJECT_TSPARSER, OBJECT_TSDICTIONARY, OBJECT_TSTEMPLATE, OBJECT_TSCONFIGURATION };
+static const AlterTSConfigType tsearch_mapping_types[]
+	= { ALTER_TSCONFIG_ADD_MAPPING, ALTER_TSCONFIG_ALTER_MAPPING_FOR_TOKEN,
+		ALTER_TSCONFIG_REPLACE_DICT, ALTER_TSCONFIG_REPLACE_DICT_FOR_TOKEN,
+		ALTER_TSCONFIG_DROP_MAPPING };
+
+static void
+reset_native_tsearch(bool expect_binding, unsigned kind, unsigned form)
+{
+	static const unsigned boundaries[] = { 1, 2, 1, 2, 3, 4 };
+
+	reset_create_preflight();
+	tsearch_lookup_active = true;
+	tsearch_expect_binding = expect_binding;
+	tsearch_superuser_denied = false;
+	tsearch_entry_kind = kind;
+	tsearch_expected_boundary = boundaries[kind];
+	tsearch_lookup_kind = tsearch_lookups = tsearch_unbound = tsearch_bad_lookup = 0;
+	tsearch_name_nodes[0] = (String){ .type = T_String, .sval = "text_search" };
+	tsearch_name_nodes[1] = (String){ .type = T_String, .sval = "schema" };
+	tsearch_name_cells[0].ptr_value = &tsearch_name_nodes[form % 2 ? 1 : 0];
+	tsearch_name_cells[1].ptr_value = &tsearch_name_nodes[0];
+	tsearch_names = (List){ .type = T_List,
+							.length = form % 2 ? 2 : 1,
+							.max_length = 2,
+							.elements = tsearch_name_cells };
+	tsearch_dict_cell.ptr_value = &tsearch_names;
+	tsearch_dicts
+		= (List){ .type = T_List, .length = 1, .max_length = 1, .elements = &tsearch_dict_cell };
+	native_tsearch_create = (DefineStmt){ .type = T_DefineStmt,
+										  .kind = tsearch_create_types[kind < 4 ? kind : 0],
+										  .defnames = &tsearch_names };
+	native_tsearch_dictionary
+		= (AlterTSDictionaryStmt){ .type = T_AlterTSDictionaryStmt, .dictname = &tsearch_names };
+	native_tsearch_configuration
+		= (AlterTSConfigurationStmt){ .type = T_AlterTSConfigurationStmt,
+									  .kind = tsearch_mapping_types[form / 2],
+									  .cfgname = &tsearch_names,
+									  .tokentype = form / 2 == 2 ? NIL : &tsearch_names,
+									  .dicts = form / 2 == 4 ? NIL : &tsearch_dicts,
+									  .override = form / 2 == 1,
+									  .replace = form / 2 == 2 || form / 2 == 3,
+									  .missing_ok = (form % 2) != 0 };
+	tsearch_copied = InvalidObjectAddress;
+	tsearch_expected_statement = kind < 4	 ? (Node *)&native_tsearch_create
+								 : kind == 4 ? (Node *)&native_tsearch_dictionary
+											 : (Node *)&native_tsearch_configuration;
+}
+
+static void
+native_tsearch_entry(unsigned kind)
+{
+	switch (kind) {
+	case 0:
+		(void)DefineTSParser(native_tsearch_create.defnames, native_tsearch_create.definition);
+		break;
+	case 1:
+		(void)DefineTSDictionary(native_tsearch_create.defnames, native_tsearch_create.definition);
+		break;
+	case 2:
+		(void)DefineTSTemplate(native_tsearch_create.defnames, native_tsearch_create.definition);
+		break;
+	case 3:
+		(void)DefineTSConfiguration(native_tsearch_create.defnames,
+									native_tsearch_create.definition, &tsearch_copied);
+		break;
+	case 4:
+		(void)AlterTSDictionary(&native_tsearch_dictionary);
+		break;
+	case 5:
+		(void)AlterTSConfiguration(&native_tsearch_configuration);
+		break;
+	}
+}
+
+UT_TEST(test_native_tsearch_binds_before_first_query_in_all_profiles)
+{
+	for (unsigned kind = 0; kind < 6; kind++) {
+		for (unsigned form = 0; form < 10; form++) {
+			for (unsigned mode = 0; mode < 8; mode++) {
+				bool binds = mode == 3 || mode == 7;
+				int caught;
+
+				reset_native_tsearch(binds, kind, form);
+				set_native_operator_mode(mode);
+				for (unsigned repeat = 0; repeat < 2; repeat++) {
+					caught = sigsetjmp(boundary, 1);
+					if (!caught)
+						native_tsearch_entry(kind);
+					UT_ASSERT_EQ(caught, 2);
+					UT_ASSERT_EQ(error_code, 0);
+					UT_ASSERT_EQ(tsearch_lookups, repeat + 1);
+					UT_ASSERT_EQ(tsearch_lookup_kind, tsearch_expected_boundary);
+					UT_ASSERT_EQ(tsearch_unbound + tsearch_bad_lookup, 0);
+					UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+					UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+					UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+					UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+				}
+			}
+		}
+	}
+	tsearch_lookup_active = false;
+}
+
+UT_TEST(test_native_tsearch_refuses_before_queries_on_publication_child_and_top_errors)
+{
+	for (unsigned kind = 0; kind < 6; kind++) {
+		for (unsigned form = 0; form < 10; form++) {
+			for (unsigned failure = 0; failure < 5; failure++) {
+				bool allocated = failure == 0 || failure == 2;
+				int caught;
+
+				reset_native_tsearch(true, kind, form);
+				if (failure == 0)
+					utility_bind_ok = false;
+				else if (failure == 1 || failure == 2) {
+					if (failure == 2)
+						create_sql_entry(tsearch_expected_statement);
+					utility_in_child = true;
+				} else {
+					utility_current_xid = 401;
+					utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+				}
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_tsearch_entry(kind);
+				UT_ASSERT_EQ(caught, 1);
+				UT_ASSERT_EQ(error_code, failure == 0  ? ERRCODE_DATA_CORRUPTED
+										 : failure < 3 ? ERRCODE_FEATURE_NOT_SUPPORTED
+													   : ERRCODE_INTERNAL_ERROR);
+				UT_ASSERT_STR_EQ(
+					error_message,
+					failure == 0 ? (kind < 4 ? "canonical ACTIVE publication failed before shared "
+											   "catalog creation"
+											 : "canonical ACTIVE publication failed before shared "
+											   "catalog alteration")
+					: failure < 3
+						? (kind < 4 ? "shared catalog creation does not support subtransactions"
+									: "shared catalog alteration does not support subtransactions")
+						: "shared catalog top-level transaction identity mismatch");
+				UT_ASSERT_EQ(tsearch_lookups, 0);
+				UT_ASSERT_EQ(tsearch_unbound + tsearch_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids, allocated ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, allocated ? 1 : 0);
+				UT_ASSERT_EQ(utility_binds, failure == 2 ? 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid,
+							 allocated || failure == 3 ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	tsearch_lookup_active = false;
+}
+
+UT_TEST(test_native_tsearch_context_guards_keep_nonshared_routes)
+{
+	for (unsigned kind = 0; kind < 6; kind++) {
+		for (unsigned form = 0; form < 10; form++) {
+			for (unsigned mode = 0; mode < 8; mode++) {
+				bool binds = mode == 3 || mode == 7;
+
+				for (unsigned guard = 0; guard < 3; guard++) {
+					int caught;
+
+					reset_native_tsearch(binds, kind, form);
+					set_native_operator_mode(mode);
+					XactReadOnly = guard == 0;
+					utility_parallel = guard == 1;
+					utility_recovery = guard == 2;
+					caught = sigsetjmp(boundary, 1);
+					if (!caught)
+						native_tsearch_entry(kind);
+					UT_ASSERT_EQ(caught, binds ? 1 : 2);
+					UT_ASSERT_EQ(error_code, !binds		  ? 0
+											 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+														  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+					UT_ASSERT_EQ(tsearch_lookups, binds ? 0 : 1);
+					UT_ASSERT_EQ(tsearch_unbound + tsearch_bad_lookup, 0);
+					UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+				}
+			}
+		}
+	}
+	tsearch_lookup_active = false;
+}
+
+UT_TEST(test_native_tsearch_utility_warm_guards_preserve_binding)
+{
+	for (unsigned kind = 0; kind < 6; kind++) {
+		for (unsigned form = 0; form < 10; form++) {
+			for (unsigned guard = 0; guard < 4; guard++) {
+				int caught;
+
+				reset_native_tsearch(true, kind, form);
+				create_sql_entry(tsearch_expected_statement);
+				UT_ASSERT_EQ(utility_prepares, 1);
+				UT_ASSERT_EQ(utility_xids, 1);
+				UT_ASSERT_EQ(utility_binds, 1);
+				XactReadOnly = guard == 1;
+				utility_parallel = guard == 2;
+				utility_recovery = guard == 3;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_tsearch_entry(kind);
+				UT_ASSERT_EQ(caught, guard ? 1 : 2);
+				UT_ASSERT_EQ(error_code, !guard		  ? 0
+										 : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+													  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				UT_ASSERT_EQ(tsearch_lookups, guard ? 0 : 1);
+				UT_ASSERT_EQ(tsearch_unbound + tsearch_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_prepares, guard ? 1 : 2);
+				UT_ASSERT_EQ(utility_xids, 1);
+				UT_ASSERT_EQ(utility_binds, 1);
+				UT_ASSERT_EQ(utility_top_xid, 400);
+			}
+		}
+	}
+	tsearch_lookup_active = false;
+}
+
+UT_TEST(test_native_tsearch_retains_parser_template_permission_refusals)
+{
+	for (unsigned kind = 0; kind <= 2; kind += 2) {
+		for (unsigned form = 0; form < 10; form++) {
+			for (unsigned mode = 0; mode < 8; mode++) {
+				bool binds = mode == 3 || mode == 7;
+				int caught;
+
+				reset_native_tsearch(binds, kind, form);
+				set_native_operator_mode(mode);
+				tsearch_superuser_denied = true;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_tsearch_entry(kind);
+				UT_ASSERT_EQ(caught, 1);
+				UT_ASSERT_EQ(error_code, ERRCODE_INSUFFICIENT_PRIVILEGE);
+				UT_ASSERT_STR_EQ(error_message,
+								 kind == 0 ? "must be superuser to create text search parsers"
+										   : "must be superuser to create text search templates");
+				UT_ASSERT_EQ(tsearch_lookups, 1);
+				UT_ASSERT_EQ(tsearch_lookup_kind, 1);
+				UT_ASSERT_EQ(tsearch_unbound + tsearch_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	tsearch_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(156);
+	UT_PLAN(161);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -10804,6 +11121,11 @@ main(void)
 	UT_RUN(test_native_aggregate_refuses_before_query_on_publication_child_and_top_errors);
 	UT_RUN(test_native_aggregate_context_guards_keep_nonshared_route);
 	UT_RUN(test_native_aggregate_utility_warm_guards_preserve_binding);
+	UT_RUN(test_native_tsearch_binds_before_first_query_in_all_profiles);
+	UT_RUN(test_native_tsearch_refuses_before_queries_on_publication_child_and_top_errors);
+	UT_RUN(test_native_tsearch_context_guards_keep_nonshared_routes);
+	UT_RUN(test_native_tsearch_utility_warm_guards_preserve_binding);
+	UT_RUN(test_native_tsearch_retains_parser_template_permission_refusals);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
