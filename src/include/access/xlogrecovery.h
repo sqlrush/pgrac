@@ -245,7 +245,10 @@ extern bool ClusterColdRecoveryCtrcPageAdvance(const struct ClusterRecoveryStart
  * and complete owner/source/current/local-debt checks. Retain each full result
  * and its original raw FD on the same Start until original cleanup. All result
  * slots count against memory_budget before the first PAGE/FPI; zero budget
- * only continues existing progress. No replay pin/history release, independent
+ * only continues existing progress. Final same-FD images must remain byte-exact
+ * under the original all-ITL projector and a frozen complete canonical terminal
+ * vector, revalidated after PAGE cleanup. The vector and image scratch peak are
+ * reserved before the first PAGE. No replay pin/history release, independent
  * or joint service COMPLETE, relmap acceptance or OPEN is granted. */
 extern bool ClusterColdRecoveryCtrcPageDrain(const struct ClusterRecoveryStartV1 *start,
 	Size memory_budget);
