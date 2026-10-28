@@ -107,3 +107,73 @@ UT_TEST(native_allocator_full_birth_wal_error_keeps_native_duty_unpublished)
 	UT_ASSERT(held && state.xid_held && state.slru_held);
 	native_clog_end();
 }
+
+UT_TEST(native_allocator_captured_gap_wal_replays_original_page)
+{
+	XidNativeClogState before, after;
+	XidNativeClogReplayState replay;
+
+	native_clog_begin(UINT64_C(0x500007ffe), false);
+	UT_ASSERT_EQ(U64FromFullTransactionId(GetNewTransactionIdFullCLOG(false)), UINT64_C(0x500008004));
+	test_xid_native_clog_state(&before);
+	native_clog_wal(&before, 7, UINT64_C(0x500008000));
+	test_xid_native_clog_replay(XID_CLOG_REPLAY_VALID, &replay);
+	UT_ASSERT(replay.io_ok && !replay.file_existed && !replay.caught);
+	UT_ASSERT_EQ(replay.writes, 1); UT_ASSERT_EQ(replay.inserts, 0);
+	UT_ASSERT_EQ(replay.file_size, 2 * BLCKSZ);
+	UT_ASSERT(replay.target_zero && !replay.target_sentinel && replay.neighbor_sentinel);
+	test_xid_native_clog_state(&after);
+	UT_ASSERT_EQ(memcmp(&before.bytes, &after.bytes, sizeof(before.bytes)), 0);
+	UT_ASSERT_EQ(after.inserts, 1); UT_ASSERT_EQ(after.dirty_pages, 0);
+	UT_ASSERT_EQ(U64FromFullTransactionId(variables.nextXid), UINT64_C(0x500008005));
+	UT_ASSERT_EQ(proc.xid, 32772); UT_ASSERT_EQ(visible_xids[0], 32772);
+	UT_ASSERT(!held && !after.xid_held && !after.slru_held);
+	native_clog_end();
+}
+UT_TEST(native_allocator_captured_wrap_wal_replays_page_zero)
+{
+	XidNativeClogState before, after;
+	XidNativeClogReplayState replay;
+
+	native_clog_begin(UINT64_C(0x7fffffffe), false);
+	UT_ASSERT_EQ(U64FromFullTransactionId(GetNewTransactionIdFullCLOG(true)), UINT64_C(0x800000004));
+	test_xid_native_clog_state(&before);
+	native_clog_wal(&before, 4, UINT64_C(0x800000003));
+	test_xid_native_clog_replay(XID_CLOG_REPLAY_VALID, &replay);
+	UT_ASSERT(replay.io_ok && !replay.file_existed && !replay.caught);
+	UT_ASSERT_EQ(replay.writes, 1); UT_ASSERT_EQ(replay.inserts, 0);
+	UT_ASSERT_EQ(replay.file_size, 2 * BLCKSZ);
+	UT_ASSERT(replay.target_zero && !replay.target_sentinel && replay.neighbor_sentinel);
+	test_xid_native_clog_state(&after);
+	UT_ASSERT_EQ(memcmp(&before.bytes, &after.bytes, sizeof(before.bytes)), 0);
+	UT_ASSERT_EQ(after.inserts, 1); UT_ASSERT_EQ(after.dirty_pages, 0);
+	UT_ASSERT_EQ(U64FromFullTransactionId(variables.nextXid), UINT64_C(0x800000005));
+	UT_ASSERT_EQ(proc.xid | visible_xids[0], 0); UT_ASSERT_EQ(subxids[0].count, 1);
+	UT_ASSERT_EQ(proc.subxids.xids[0], 4);
+	UT_ASSERT(!held && !after.xid_held && !after.slru_held);
+	native_clog_end();
+}
+UT_TEST(native_allocator_captured_wal_refuses_malformed_redo_before_write)
+{
+	for (unsigned fault = XID_CLOG_REPLAY_RESERVED; fault <= XID_CLOG_REPLAY_BLOCKREF; ++fault) {
+		XidNativeClogState before, after;
+		XidNativeClogReplayState replay;
+
+		native_clog_begin(UINT64_C(0x500007ffe), false);
+		UT_ASSERT_EQ(U64FromFullTransactionId(GetNewTransactionIdFullCLOG(false)), UINT64_C(0x500008004));
+		test_xid_native_clog_state(&before);
+		native_clog_wal(&before, 7, UINT64_C(0x500008000));
+		test_xid_native_clog_replay((XidNativeClogReplayFault)fault, &replay);
+		UT_ASSERT(replay.io_ok && !replay.file_existed && replay.caught);
+		UT_ASSERT_EQ(replay.writes | replay.inserts, 0);
+		UT_ASSERT_EQ(replay.file_size, 2 * BLCKSZ);
+		UT_ASSERT(!replay.target_zero && replay.target_sentinel && replay.neighbor_sentinel);
+		test_xid_native_clog_state(&after);
+		UT_ASSERT_EQ(memcmp(&before.bytes, &after.bytes, sizeof(before.bytes)), 0);
+		UT_ASSERT_EQ(after.inserts, 1); UT_ASSERT_EQ(after.dirty_pages, 1);
+		UT_ASSERT_EQ(U64FromFullTransactionId(variables.nextXid), UINT64_C(0x500008005));
+		UT_ASSERT_EQ(proc.xid, 32772); UT_ASSERT_EQ(visible_xids[0], 32772);
+		UT_ASSERT(!held && !after.xid_held && !after.slru_held);
+		native_clog_end();
+	}
+}

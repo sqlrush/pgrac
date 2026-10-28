@@ -260,6 +260,13 @@ int
 main(void)
 {
 #ifdef TEST_CLUSTER_XID_NATIVE_CLOG
+	if (getenv("PGRAC_XID_CLOG_REPLAY_ONLY") != NULL) {
+		UT_PLAN(3);
+		UT_RUN(native_allocator_captured_gap_wal_replays_original_page);
+		UT_RUN(native_allocator_captured_wrap_wal_replays_page_zero);
+		UT_RUN(native_allocator_captured_wal_refuses_malformed_redo_before_write);
+		UT_DONE(); return ut_failed_count ? 1 : 0;
+	}
 	if (getenv("PGRAC_XID_NATIVE_CLOG_ONLY") != NULL) {
 		UT_PLAN(4);
 		UT_RUN(native_allocator_full_birth_uses_gap_page_and_original_candidate);
@@ -268,11 +275,14 @@ main(void)
 		UT_RUN(native_allocator_full_birth_wal_error_keeps_native_duty_unpublished);
 		UT_DONE(); return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(13);
+	UT_PLAN(16);
 	UT_RUN(native_allocator_full_birth_uses_gap_page_and_original_candidate);
 	UT_RUN(native_allocator_full_birth_keeps_epoch_through_subxact_wrap);
 	UT_RUN(native_allocator_full_birth_rederives_before_any_native_call);
 	UT_RUN(native_allocator_full_birth_wal_error_keeps_native_duty_unpublished);
+	UT_RUN(native_allocator_captured_gap_wal_replays_original_page);
+	UT_RUN(native_allocator_captured_wrap_wal_replays_page_zero);
+	UT_RUN(native_allocator_captured_wal_refuses_malformed_redo_before_write);
 #else
 	UT_PLAN(9);
 #endif
