@@ -11,6 +11,7 @@
 
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_clean_leave.h"
+#include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_cr_server.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_epoch_ballot.h"
@@ -26,6 +27,7 @@
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_recovery_duty.h"
+#include "cluster/cluster_relmap_arb.h"
 #include "cluster/cluster_replacement_wire.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_sf_dep.h"
@@ -12064,6 +12066,36 @@ UT_TEST(test_a148_stop_poll_includes_original_phase3_handoff)
 	test_gate_reset();
 }
 
+/* The normal-start fixtures carry no retained cold input. Keep the added
+ * original CTRC handoff at the same NULL-only boundary as the TX handoff;
+ * non-NULL work must not acquire a fabricated positive observation. */
+int cluster_cold_recovery_plan_memory = CLUSTER_COLD_PLAN_MEMORY_DEFAULT_KB;
+
+static bool
+ClusterColdRecoveryCtrcObserve(const struct ClusterRecoveryStartV1 *start,
+							   Size budget pg_attribute_unused())
+{
+	return start == NULL;
+}
+
+bool
+cluster_recovery_ctrc_result_wait_v1(const struct ClusterRecoveryStartV1 *start)
+{
+	return start == NULL;
+}
+
+bool
+cluster_recovery_merge_claim_is_held(void)
+{
+	return false;
+}
+
+void
+cluster_recovery_merge_claim_release_if_held(void)
+{
+	UT_ASSERT(!cluster_recovery_merge_claim_is_held());
+}
+
 #include "test_cluster_normal_cold_startup.h"
 static void test_serving_setup(bool restart);
 static void test_serving_finish_root(void);
@@ -12161,10 +12193,212 @@ UT_TEST(test_stop_trace_recovered_equal_epoch_refuses_before_owner)
 }
 
 
+/* ROOT results, QVOTEC completion and scheduling are explicit leaves here.
+ * Drive the original coordinator round rather than a copied retry decision. */
+static void
+ut_prepared_round_cf_setup(bool activating)
+{
+	ClusterControlRootMigrationImage image = { 0 };
+	ClusterControlRootMigrationRoundV1 round = ut_cutover_round();
+	ClusterControlRootFileToken token = { 0 };
+	ClusterSemanticActivationAckTableV1 *table;
+	uint8 sha[PG_SHA256_DIGEST_LENGTH];
+	uint64 seq;
+
+	ut_open_applied_env_setup_coordinator();
+	if (activating) {
+		ut_open_applied_prepared_table_setup();
+		table = SemanticActivationAckTable;
+		test_gate_publish(2, table->source_feature_bitmap, table->record_generation,
+						  table->transition_epoch, true);
+		round.prepare_generation = table->record_generation;
+		token.file_txn_seq = 1;
+		memset(sha, 0x11, sizeof(sha));
+		UT_ASSERT(cluster_r4_bit22_cutover_seam_store(&token, sha, &round));
+		ut_activate_result = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	} else {
+		round.prepare_generation = 1;
+		UT_ASSERT(cluster_r4_bit22_cutover_begin(&image, &round));
+		table = SemanticActivationAckTable;
+		for (int node = 0; node < CLUSTER_MAX_NODES; node++)
+			if (cluster_membership_is_member(node))
+				table->observed[node] = table->expected[node];
+		table->observed_members_lo = table->expected_members_lo;
+		table->observed_members_hi = table->expected_members_hi;
+		table->flags = CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID
+					   | CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_COMPLETE;
+		ut_create_result = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	}
+	/* The original first step submits PREPARE or COMMIT; complete that same
+	 * request at the existing QVOTEC leaf before the first ROOT attempt. */
+	UT_ASSERT(semantic_activation_ack_lmon_bit22_advance());
+	seq = pg_atomic_read_u64(&SemanticActivationShmem->record_cas_request_seq);
+	UT_ASSERT(seq != 0);
+	pg_atomic_write_u64(&SemanticActivationShmem->record_cas_completion_seq, seq);
+	pg_atomic_write_u32(&SemanticActivationShmem->record_cas_result,
+						CLUSTER_SEMANTIC_ACTIVATION_OK);
+	UT_ASSERT_EQ(ut_create_calls + ut_activate_calls, 0);
+}
+
+UT_TEST(test_prepared_round_cf_refusal_retries_without_advancing_or_resubmitting)
+{
+	for (unsigned activating = 0; activating < 2; activating++) {
+		ClusterSemanticActivationAckTableV1 before;
+		uint8 seam[TEST_SEMANTIC_BIT22_SEAM_BYTES];
+		uint64 seq;
+
+		ut_prepared_round_cf_setup(activating != 0);
+		if (ut_current_failed)
+			return;
+		before = *SemanticActivationAckTable;
+		memcpy(seam, SemanticActivationBit22Seam, sizeof(seam));
+		seq = pg_atomic_read_u64(&SemanticActivationShmem->record_cas_request_seq);
+		for (unsigned wake = 0; wake < 3; wake++) {
+			UT_ASSERT_EQ(semantic_activation_ack_lmon_bit22_advance(), activating != 0);
+			UT_ASSERT_EQ(ut_create_calls, activating ? 0 : wake + 1);
+			UT_ASSERT_EQ(ut_activate_calls, activating ? wake + 1 : 0);
+			UT_ASSERT_EQ(memcmp(&before, SemanticActivationAckTable, sizeof(before)), 0);
+			UT_ASSERT_EQ(memcmp(seam, SemanticActivationBit22Seam, sizeof(seam)), 0);
+			UT_ASSERT_EQ(pg_atomic_read_u64(&SemanticActivationShmem->record_cas_request_seq), seq);
+			UT_ASSERT(!cluster_r4_bit22_cutover_active());
+		}
+		ut_create_result = ut_activate_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+		UT_ASSERT(semantic_activation_ack_lmon_bit22_advance());
+		UT_ASSERT_EQ(ut_create_calls, activating ? 0 : 4);
+		UT_ASSERT_EQ(ut_activate_calls, activating ? 4 : 0);
+		UT_ASSERT_EQ(SemanticActivationAckTable->stage,
+					 activating ? CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_COMMIT_APPLIED
+								: CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_PREPARED);
+		UT_ASSERT_EQ(SemanticActivationAckTable->record_generation,
+					 before.record_generation + activating);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&SemanticActivationBit22Seam->valid), 1);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&SemanticActivationShmem->record_cas_request_seq), seq);
+		UT_ASSERT(!cluster_r4_bit22_cutover_active()); /* OPEN_APPLIED is still owed. */
+	}
+	test_gate_reset();
+}
+
+UT_TEST(test_prepared_round_cf_retry_requalifies_current_authority)
+{
+	for (unsigned activating = 0; activating < 2; activating++) {
+		for (unsigned drift = 0; drift < 8; drift++) {
+			ClusterSemanticActivationAckTableV1 before;
+			uint8 seam[TEST_SEMANTIC_BIT22_SEAM_BYTES];
+			uint64 seq;
+
+			ut_prepared_round_cf_setup(activating != 0);
+			UT_ASSERT_EQ(semantic_activation_ack_lmon_bit22_advance(), activating != 0);
+			UT_ASSERT_EQ(ut_create_calls + ut_activate_calls, 1);
+			ut_create_result = ut_activate_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+			switch (drift) {
+			case 0:
+				test_current_epoch++;
+				break;
+			case 1:
+				test_membership_snapshot_lo ^= UINT64_C(2);
+				break;
+			case 2:
+				test_membership_snapshot_epoch++;
+				break;
+			case 3:
+				test_qvotec_in_quorum = false;
+				break;
+			case 4:
+				SemanticActivationAckTable->coordinator_node = 1;
+				break;
+			case 5:
+				SemanticActivationAckTable->observed_members_lo &= ~UINT64_C(2);
+				break;
+			case 6:
+				test_peer_capability_generation++;
+				break;
+			case 7:
+				test_remote_admitted_incarnations[1]++;
+				break;
+			}
+			before = *SemanticActivationAckTable;
+			memcpy(seam, SemanticActivationBit22Seam, sizeof(seam));
+			seq = pg_atomic_read_u64(&SemanticActivationShmem->record_cas_request_seq);
+			UT_ASSERT(!semantic_activation_ack_lmon_bit22_advance());
+			UT_ASSERT_EQ(ut_create_calls + ut_activate_calls, 1);
+			UT_ASSERT_EQ(memcmp(&before, SemanticActivationAckTable, sizeof(before)), 0);
+			UT_ASSERT_EQ(memcmp(seam, SemanticActivationBit22Seam, sizeof(seam)), 0);
+			UT_ASSERT_EQ(pg_atomic_read_u64(&SemanticActivationShmem->record_cas_request_seq), seq);
+			UT_ASSERT(!cluster_r4_bit22_cutover_active());
+		}
+	}
+	test_gate_reset();
+}
+
+UT_TEST(test_prepared_round_activate_retry_requires_its_original_staged_seam)
+{
+	for (unsigned drift = 0; drift < 2; drift++) {
+		ClusterSemanticActivationAckTableV1 before;
+
+		ut_prepared_round_cf_setup(true);
+		UT_ASSERT(semantic_activation_ack_lmon_bit22_advance());
+		UT_ASSERT_EQ(ut_activate_calls, 1);
+		ut_activate_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+		if (drift == 0)
+			pg_atomic_write_u32(&SemanticActivationBit22Seam->valid, 0);
+		else
+			SemanticActivationBit22Seam->transition_epoch++;
+		before = *SemanticActivationAckTable;
+		UT_ASSERT(!semantic_activation_ack_lmon_bit22_advance());
+		UT_ASSERT_EQ(ut_activate_calls, 1);
+		UT_ASSERT_EQ(memcmp(&before, SemanticActivationAckTable, sizeof(before)), 0);
+		UT_ASSERT(!cluster_r4_bit22_cutover_active());
+	}
+	test_gate_reset();
+}
+
+UT_TEST(test_prepared_round_real_root_refusals_never_advance)
+{
+	static const ClusterControlRootResult results[]
+		= { CLUSTER_CONTROL_ROOT_STALE_TOKEN,	   CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH,
+			CLUSTER_CONTROL_ROOT_IO_ERROR,		   CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN,
+			CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT, CLUSTER_CONTROL_ROOT_MIGRATION_ROUND_MISMATCH };
+
+	for (unsigned activating = 0; activating < 2; activating++) {
+		for (unsigned i = 0; i < lengthof(results); i++) {
+			ClusterSemanticActivationAckTableV1 before;
+			uint8 seam[TEST_SEMANTIC_BIT22_SEAM_BYTES];
+
+			ut_prepared_round_cf_setup(activating != 0);
+			ut_create_result = ut_activate_result = results[i];
+			before = *SemanticActivationAckTable;
+			memcpy(seam, SemanticActivationBit22Seam, sizeof(seam));
+			UT_ASSERT_EQ(semantic_activation_ack_lmon_bit22_advance(), activating != 0);
+			UT_ASSERT_EQ(ut_create_calls + ut_activate_calls, 1);
+			UT_ASSERT_EQ(memcmp(&before, SemanticActivationAckTable, sizeof(before)), 0);
+			UT_ASSERT_EQ(memcmp(seam, SemanticActivationBit22Seam, sizeof(seam)), 0);
+			UT_ASSERT(!cluster_r4_bit22_cutover_active());
+		}
+	}
+	test_gate_reset();
+}
+
+UT_TEST(test_prepared_round_fixture_cannot_accept_unmodelled_cold_handoff)
+{
+	const struct ClusterRecoveryStartV1 *unknown = (const void *)(uintptr_t)1;
+
+	UT_ASSERT(ClusterColdRecoveryCtrcObserve(NULL, 1));
+	UT_ASSERT(cluster_recovery_ctrc_result_wait_v1(NULL));
+	UT_ASSERT(!ClusterColdRecoveryCtrcObserve(unknown, 1));
+	UT_ASSERT(!cluster_recovery_ctrc_result_wait_v1(unknown));
+	UT_ASSERT(!cluster_recovery_merge_claim_is_held());
+	cluster_recovery_merge_claim_release_if_held();
+}
+
 int
 main(void)
 {
-	UT_PLAN(417);
+	UT_PLAN(422);
+	UT_RUN(test_prepared_round_cf_refusal_retries_without_advancing_or_resubmitting);
+	UT_RUN(test_prepared_round_cf_retry_requalifies_current_authority);
+	UT_RUN(test_prepared_round_activate_retry_requires_its_original_staged_seam);
+	UT_RUN(test_prepared_round_real_root_refusals_never_advance);
+	UT_RUN(test_prepared_round_fixture_cannot_accept_unmodelled_cold_handoff);
 	UT_RUN(test_stop_trace_preserves_recovered_record_acceptance);
 	UT_RUN(test_stop_trace_preserves_recovered_service_owner_guards);
 	UT_RUN(test_stop_trace_recovered_equal_epoch_refuses_before_owner);
