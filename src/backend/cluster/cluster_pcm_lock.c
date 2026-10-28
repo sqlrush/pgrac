@@ -14912,6 +14912,8 @@ cluster_pcm_lock_resource_x_delivery_bind_target_exact(
 			observation->r4_record_generation, request->sender_connection_generation,
 			observation->master_ingress_connection_generation))
 		result = RESOURCE_X_APPLY_STALE;
+	else if (round->has_acquire_intent)
+		result = RESOURCE_X_APPLY_BAD_STATE;
 	else if (!cluster_pcm_lock_resource_x_gate_open_exact(request->resource_formation)
 			 || physical_phase == RESOURCE_X_BOOTSTRAP_ROUND_EMPTY
 			 || !pcm_resource_x_install_claim_valid_locked(round)
@@ -15080,6 +15082,8 @@ cluster_pcm_lock_resource_x_delivery_claim_begin_exact(const ResourceXAcquisitio
 	if (!pcm_resource_x_install_claim_ref_exact_locked(round, ref)
 		|| memcmp(target, &round->delivery_target, sizeof(*target)) != 0)
 		result = RESOURCE_X_APPLY_STALE;
+	else if (round->has_acquire_intent)
+		result = RESOURCE_X_APPLY_BAD_STATE;
 	else if (!cluster_pcm_lock_resource_x_gate_open_exact(ref->formation)
 			 || round->delivery_executor_sequence >= UINT64_MAX - 1
 			 || round->head_no_progress_deadline_us == 0
@@ -15536,7 +15540,8 @@ cluster_pcm_lock_resource_x_delivery_claim_end_exact(const ResourceXDeliveryClai
 							   &entry_ref, &acquire_result))
 		return RESOURCE_X_APPLY_NOT_FOUND;
 	LWLockAcquire(&entry_ref.entry->entry_lock.lock, LW_EXCLUSIVE);
-	if (!pcm_resource_x_delivery_claim_exact_locked(entry_ref.entry, claim))
+	if (entry_ref.entry->resource_x_bootstrap_round.has_acquire_intent
+		|| !pcm_resource_x_delivery_claim_exact_locked(entry_ref.entry, claim))
 		result = RESOURCE_X_APPLY_STALE;
 	else {
 		entry_ref.entry->resource_x_bootstrap_round.delivery_executor_purpose = 0;
@@ -28845,10 +28850,10 @@ requester_join_frames_done:
 	return result;
 }
 
-/* Copy complete ordinary materials under their original owner. This read
- * grants no execution lease; native publication must revalidate and claim. */
-ResourceXApplyResult
-cluster_pcm_lock_resource_x_requester_acquire_frames_exact(
+/* Validate retained complete materials under their original owner. This is
+ * shared by the read-only input and the original pre-native executor claim. */
+static ResourceXApplyResult
+pcm_resource_x_requester_acquire_frames_locked(struct GrdEntry *entry,
 	const ResourceXInstallClaimJoinObservation *observation,
 	const ResourceXDecodedAcquireIntent *episode, ResourceXDecodedFrame *grant_out,
 	ResourceXDecodedFrame *image_out, ResourceXRequesterJoinSnapshot *out)
@@ -28858,30 +28863,18 @@ cluster_pcm_lock_resource_x_requester_acquire_frames_exact(
 	const ResourceXDecodedAcquireDecision *a;
 	const ClusterPcmResourceXBootstrapRound *round;
 	const ClusterPcmResourceXMasterState *state;
-	PcmEntryRef ref;
-	PcmEntryAcquireResult acquired;
+	static const ResourceXDeliveryTarget empty_target;
 	ResourceXApplyResult result = RESOURCE_X_APPLY_STALE;
 
-	if (observation == NULL || episode == NULL || grant_out == NULL || image_out == NULL
-		|| out == NULL || grant_out == image_out
-		|| !resource_x_assertion_valid(&observation->request.logical_assertion)
-		|| observation->request.logical_assertion.requester_node != cluster_node_id
-		|| observation->entry_binding_generation == 0
-		|| observation->entry_binding_generation == UINT64_MAX)
-		return RESOURCE_X_APPLY_INVALID;
-	if (!cluster_pcm_lock_resource_x_gate_open_exact(observation->request.resource_formation))
-		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
-	if (!pcm_entry_ref_acquire(&observation->request.logical_assertion.resource, false, &ref, &acquired))
-		return RESOURCE_X_APPLY_NOT_FOUND;
-	LWLockAcquire(&ref.entry->entry_lock.lock, LW_SHARED);
-	round = &ref.entry->resource_x_bootstrap_round;
-	state = pcm_resource_x_master_state_for_entry(ref.entry);
+	round = &entry->resource_x_bootstrap_round;
+	state = pcm_resource_x_master_state_for_entry(entry);
 	if (state == NULL || !pcm_resource_x_requester_acquire_valid_locked(round)
-		|| !pcm_resource_x_install_claim_valid_locked(round)) {
+		|| !pcm_resource_x_install_claim_valid_locked(round)
+		|| !pcm_resource_x_local_owner_valid_locked(&entry->resource_x_local_owner)) {
 		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 		goto done;
 	}
-	if (ref.binding_generation != observation->entry_binding_generation
+	if (entry->binding_generation != observation->entry_binding_generation
 		|| !pcm_resource_x_common_equal(&observation->request, &round->request)
 		|| !pcm_resource_x_node_request_key_matches_locked(round,
 			&observation->request.logical_assertion, observation->master_node,
@@ -28894,10 +28887,11 @@ cluster_pcm_lock_resource_x_requester_acquire_frames_exact(
 	if (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_REQUEST_DISPATCHED
 		|| round->failed_attempt_floor >= round->request.assertion_sequence
 		|| round->cancelled_attempt_floor >= round->request.assertion_sequence
-		|| round->head_failure_reason != 0 || round->delivery_target.buffer_id_plus_one != 0
+		|| round->head_failure_reason != 0 || memcmp(&round->delivery_target, &empty_target, sizeof(empty_target)) != 0
+		|| round->delivery_executor_purpose != 0
 		|| round->install_claim_source != RESOURCE_X_INSTALL_CLAIM_NONE
-		|| !pcm_resource_x_active_empty_locked(ref.entry)
-		|| ref.entry->resource_x_local_owner.state != RESOURCE_X_LOCAL_OWNER_EMPTY) {
+		|| !pcm_resource_x_active_empty_locked(entry)
+		|| entry->resource_x_local_owner.state != RESOURCE_X_LOCAL_OWNER_EMPTY) {
 		result = RESOURCE_X_APPLY_BAD_STATE;
 		goto done;
 	}
@@ -28935,6 +28929,139 @@ cluster_pcm_lock_resource_x_requester_acquire_frames_exact(
 	*out = snapshot;
 	result = RESOURCE_X_APPLY_APPLIED;
 done:
+	return result;
+}
+
+/* Copy complete ordinary materials without an executor or native grant. */
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_requester_acquire_frames_exact(
+	const ResourceXInstallClaimJoinObservation *observation,
+	const ResourceXDecodedAcquireIntent *episode, ResourceXDecodedFrame *grant_out,
+	ResourceXDecodedFrame *image_out, ResourceXRequesterJoinSnapshot *out)
+{
+	PcmEntryRef ref;
+	PcmEntryAcquireResult acquired;
+	ResourceXApplyResult result;
+
+	if (observation == NULL || episode == NULL || grant_out == NULL || image_out == NULL
+		|| out == NULL || grant_out == image_out
+		|| !resource_x_assertion_valid(&observation->request.logical_assertion)
+		|| observation->request.logical_assertion.requester_node != cluster_node_id
+		|| observation->entry_binding_generation == 0
+		|| observation->entry_binding_generation == UINT64_MAX)
+		return RESOURCE_X_APPLY_INVALID;
+	if (!cluster_pcm_lock_resource_x_gate_open_exact(observation->request.resource_formation))
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (!pcm_entry_ref_acquire(&observation->request.logical_assertion.resource, false, &ref, &acquired))
+		return RESOURCE_X_APPLY_NOT_FOUND;
+	LWLockAcquire(&ref.entry->entry_lock.lock, LW_SHARED);
+	result = pcm_resource_x_requester_acquire_frames_locked(ref.entry, observation, episode,
+		grant_out, image_out, out);
+	LWLockRelease(&ref.entry->entry_lock.lock);
+	pcm_entry_ref_release(&ref);
+	return result;
+}
+
+/* Claim only the original local executor. Native IO/publication requires
+ * its own exact handoff; complete evidence alone never grants it. */
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_requester_acquire_claim_exact(
+	const ResourceXInstallClaimJoinObservation *observation,
+	const ResourceXDecodedAcquireIntent *episode, ResourceXDecodedFrame *grant_out,
+	ResourceXDecodedFrame *image_out, ResourceXRequesterJoinSnapshot *out,
+	ResourceXDeliveryClaim *claim_out)
+{
+	ResourceXDecodedFrame grant, image;
+	ResourceXRequesterJoinSnapshot snapshot;
+	ResourceXDeliveryClaim claim = {0};
+	PcmEntryRef ref;
+	PcmEntryAcquireResult acquired;
+	ClusterPcmResourceXBootstrapRound *round;
+	ResourceXApplyResult result;
+
+	if (observation == NULL || episode == NULL || grant_out == NULL || image_out == NULL
+		|| out == NULL || claim_out == NULL || grant_out == image_out
+		|| !resource_x_assertion_valid(&observation->request.logical_assertion)
+		|| observation->request.logical_assertion.requester_node != cluster_node_id
+		|| observation->entry_binding_generation == 0
+		|| observation->entry_binding_generation == UINT64_MAX)
+		return RESOURCE_X_APPLY_INVALID;
+	if (!cluster_pcm_lock_resource_x_gate_open_exact(observation->request.resource_formation))
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (episode->buffer_id < 0 || episode->buffer_id >= NBuffers)
+		return RESOURCE_X_APPLY_INVALID;
+	if (!pcm_entry_ref_acquire(&observation->request.logical_assertion.resource, false, &ref, &acquired))
+		return RESOURCE_X_APPLY_NOT_FOUND;
+	LWLockAcquire(&ref.entry->entry_lock.lock, LW_EXCLUSIVE);
+	round = &ref.entry->resource_x_bootstrap_round;
+	result = pcm_resource_x_requester_acquire_frames_locked(ref.entry, observation, episode,
+		&grant, &image, &snapshot);
+	if (result == RESOURCE_X_APPLY_APPLIED) {
+		if (round->delivery_executor_sequence >= UINT64_MAX - 1)
+			result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		else {
+			claim.observation = *observation;
+			claim.target.generation = episode->base_generation;
+			claim.target.reservation_token = episode->reservation_token;
+			claim.target.buffer_id_plus_one = (uint32)episode->buffer_id + 1;
+			claim.target.flags = PCM_OWN_FLAG_GRANT_PENDING;
+			claim.executor_sequence = round->delivery_executor_sequence + 1;
+			claim.purpose = RESOURCE_X_DELIVERY_NORMAL;
+			round->delivery_target = claim.target;
+			round->delivery_executor_sequence = claim.executor_sequence;
+			round->delivery_executor_purpose = claim.purpose;
+			pcm_resource_x_intent_mark_dirty();
+			*grant_out = grant;
+			*image_out = image;
+			*out = snapshot;
+			*claim_out = claim;
+		}
+	}
+	LWLockRelease(&ref.entry->entry_lock.lock);
+	pcm_entry_ref_release(&ref);
+	return result;
+}
+
+/* Release only an exact pre-native executor. A published native handoff
+ * cannot be undone here, and request/material/reservation debt is retained. */
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_requester_acquire_claim_release_exact(
+	const ResourceXDeliveryClaim *claim)
+{
+	PcmEntryRef ref;
+	PcmEntryAcquireResult acquired;
+	ClusterPcmResourceXBootstrapRound *round;
+	ResourceXApplyResult result;
+
+	if (claim == NULL || !resource_x_assertion_valid(&claim->observation.request.logical_assertion))
+		return RESOURCE_X_APPLY_INVALID;
+	if (!pcm_entry_ref_acquire(&claim->observation.request.logical_assertion.resource, false, &ref, &acquired))
+		return RESOURCE_X_APPLY_NOT_FOUND;
+	LWLockAcquire(&ref.entry->entry_lock.lock, LW_EXCLUSIVE);
+	round = &ref.entry->resource_x_bootstrap_round;
+	if (round->has_acquire_intent != 1 || claim->purpose != RESOURCE_X_DELIVERY_NORMAL
+		|| !pcm_resource_x_delivery_claim_exact_locked(ref.entry, claim))
+		result = RESOURCE_X_APPLY_STALE;
+	else if (!pcm_resource_x_requester_acquire_valid_locked(round)
+		|| !pcm_resource_x_install_claim_valid_locked(round)
+		|| !pcm_resource_x_local_owner_valid_locked(&ref.entry->resource_x_local_owner)
+		|| round->delivery_executor_sequence == UINT64_MAX
+		|| claim->target.generation != round->acquire_intent.base_generation
+		|| claim->target.reservation_token != round->acquire_intent.reservation_token
+		|| claim->target.buffer_id_plus_one != (uint32)round->acquire_intent.buffer_id + 1
+		|| claim->target.flags != PCM_OWN_FLAG_GRANT_PENDING)
+		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	else if (round->install_claim_source != RESOURCE_X_INSTALL_CLAIM_NONE
+		|| !pcm_resource_x_active_empty_locked(ref.entry)
+		|| ref.entry->resource_x_local_owner.state != RESOURCE_X_LOCAL_OWNER_EMPTY)
+		result = RESOURCE_X_APPLY_BAD_STATE;
+	else {
+		memset(&round->delivery_target, 0, sizeof(round->delivery_target));
+		round->delivery_executor_purpose = 0;
+		pcm_resource_x_intent_mark_dirty();
+		ConditionVariableBroadcast(&ref.entry->wait_cv);
+		result = RESOURCE_X_APPLY_APPLIED;
+	}
 	LWLockRelease(&ref.entry->entry_lock.lock);
 	pcm_entry_ref_release(&ref);
 	return result;

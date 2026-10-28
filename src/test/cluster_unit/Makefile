@@ -10408,3 +10408,33 @@ clean-native-acquire-input:
 	rm -f test_cluster_native_acquire_input test_cluster_native_acquire_input.inc test_cluster_native_acquire_input.inc.tmp \
 		test_cluster_native_request_fixture.inc test_cluster_native_request_fixture.inc.tmp \
 		test_cluster_acquire_evidence_fixture.inc test_cluster_acquire_evidence_fixture.inc.tmp
+
+# Complete original materials -> one pre-native executor, without IO/C.
+TESTS += test_cluster_native_acquire_claim
+all: test_cluster_native_acquire_claim
+test_cluster_native_acquire_claim: test_cluster_native_acquire_claim.c \
+        test_cluster_native_acquire_claim.inc test_cluster_native_acquire_input_fixture.inc \
+        test_cluster_native_acquire_input $(CLUSTER_PCM_OWN_O) \
+        $(top_srcdir)/src/include/cluster/cluster_pcm_lock.h \
+        $(top_srcdir)/src/include/cluster/cluster_pcm_x_bufmgr.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+test_cluster_native_acquire_claim.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^cluster_bufmgr_pcm_own_acquire_claim_exact\(/ { print "ResourceXApplyResult"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_native_acquire_input_fixture.inc: test_cluster_native_acquire_input.c Makefile
+	awk '/^UT_TEST\(/ { stop=1 } !stop { print; lines++ } \
+	     END { if (!stop || lines < 100) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+clean distclean maintainer-clean: clean-native-acquire-claim
+.PHONY: clean-native-acquire-claim
+clean-native-acquire-claim:
+	rm -f test_cluster_native_acquire_claim test_cluster_native_acquire_claim.inc test_cluster_native_acquire_claim.inc.tmp \
+		test_cluster_native_acquire_input_fixture.inc test_cluster_native_acquire_input_fixture.inc.tmp

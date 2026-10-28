@@ -3196,6 +3196,75 @@ cluster_bufmgr_pcm_own_acquire_input_exact(
 	return RESOURCE_X_APPLY_APPLIED;
 }
 
+/* The claim is acquired before the ERROR-capable native/domain recheck.
+ * Until export, FINALLY owns its exact pre-native release, never native IO. */
+ResourceXApplyResult
+cluster_bufmgr_pcm_own_acquire_claim_exact(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *base, uint64 reservation_token, uint8 path,
+	const ClusterSemanticAdmissionToken *admission,
+	const ResourceXInstallClaimJoinObservation *observation, ResourceXDecodedFrame *grant_out,
+	ResourceXDecodedFrame *image_out, ResourceXRequesterJoinSnapshot *out,
+	ResourceXDeliveryClaim *claim_out)
+{
+	ResourceXInstallClaimJoinObservation observed;
+	ResourceXDecodedAcquireIntent episode, checked;
+	ResourceXDecodedFrame grant, image;
+	ResourceXRequesterJoinSnapshot snapshot;
+	ResourceXDeliveryClaim claim;
+	ClusterPcmOwnResult native;
+	volatile ResourceXApplyResult result;
+	volatile bool exported = false;
+
+	if (observation == NULL || grant_out == NULL || image_out == NULL || out == NULL
+		|| claim_out == NULL || grant_out == image_out)
+		return RESOURCE_X_APPLY_INVALID;
+	observed = *observation;
+	native = cluster_bufmgr_pcm_own_acquire_intent_exact(buf, base, reservation_token,
+		path, admission, NULL, &episode);
+	if (native != CLUSTER_PCM_OWN_OK)
+		return native == CLUSTER_PCM_OWN_BUSY || native == CLUSTER_PCM_OWN_NOT_READY
+			? RESOURCE_X_APPLY_BAD_STATE : RESOURCE_X_APPLY_STALE;
+	if (!BufferTagsEqual(&observed.request.logical_assertion.resource, &base->tag)
+		|| observed.request.observed_mode != base->pcm_state
+		|| observed.r4_record_generation != episode.r4_generation
+		|| observed.request.resource_formation != episode.cluster_epoch
+		|| cluster_gcs_lookup_master(base->tag) != observed.master_node)
+		return RESOURCE_X_APPLY_STALE;
+	result = cluster_pcm_lock_resource_x_requester_acquire_claim_exact(
+		&observed, &episode, &grant, &image, &snapshot, &claim);
+	if (result != RESOURCE_X_APPLY_APPLIED)
+		return result;
+	PG_TRY();
+	{
+		native = cluster_bufmgr_pcm_own_acquire_intent_exact(buf, base, reservation_token,
+			path, admission, &episode, &checked);
+		if (native != CLUSTER_PCM_OWN_OK)
+			result = native == CLUSTER_PCM_OWN_BUSY || native == CLUSTER_PCM_OWN_NOT_READY
+				? RESOURCE_X_APPLY_BAD_STATE : RESOURCE_X_APPLY_STALE;
+		else if (!cluster_pcm_lock_resource_x_gate_open_exact(observed.request.resource_formation))
+			result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		else if (cluster_gcs_lookup_master(base->tag) != observed.master_node)
+			result = RESOURCE_X_APPLY_STALE;
+		else {
+			*grant_out = grant;
+			*image_out = image;
+			*out = snapshot;
+			*claim_out = claim;
+			exported = true;
+			result = RESOURCE_X_APPLY_APPLIED;
+		}
+	}
+	PG_FINALLY();
+	{
+		if (!exported
+			&& cluster_pcm_lock_resource_x_requester_acquire_claim_release_exact(&claim)
+				!= RESOURCE_X_APPLY_APPLIED)
+			result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	}
+	PG_END_TRY();
+	return result;
+}
+
 static bool
 cluster_bufmgr_resource_x_wait_retry(LWLock *content_lock, int32 buffer_id,
 								 uint32 wait_index, bool *barrier_refused)

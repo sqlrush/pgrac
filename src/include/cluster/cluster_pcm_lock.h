@@ -2174,6 +2174,15 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_frames
 	const ResourceXInstallClaimJoinObservation *observation,
 	const ResourceXDecodedAcquireIntent *episode, ResourceXDecodedFrame *grant_out,
 	ResourceXDecodedFrame *image_out, ResourceXRequesterJoinSnapshot *out);
+/* One pre-native executor in the original round, not permission for IO/C.
+ * Caller must release in FINALLY until an exact native handoff is made. */
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_claim_exact(
+	const ResourceXInstallClaimJoinObservation *observation,
+	const ResourceXDecodedAcquireIntent *episode, ResourceXDecodedFrame *grant_out,
+	ResourceXDecodedFrame *image_out, ResourceXRequesterJoinSnapshot *out,
+	ResourceXDeliveryClaim *claim_out);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_claim_release_exact(
+	const ResourceXDeliveryClaim *claim);
 extern ResourceXApplyResult
 cluster_pcm_lock_resource_x_install_settlement_exact(const ResourceXDecodedFrame *settlement,
 													 int32 authenticated_source_node,
