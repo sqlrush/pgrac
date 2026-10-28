@@ -159,8 +159,11 @@ UT_TEST(test_startup_pending_storage_noop_and_wait_do_not_leak)
 	for (unsigned mode = 0; mode < 2; mode++) {
 		prefix_ready(); prefix_unchanged = true; prefix_wait = mode == 1;
 		UT_ASSERT(ClusterColdRecoveryCtrcPageAdvance(info.cluster_tx_start, 1024 * 1024));
-		UT_ASSERT(!pending_storage_live); UT_ASSERT_EQ(pending_storage_created + pending_storage_closes, 0);
+		UT_ASSERT(pending_storage_live); UT_ASSERT_EQ(pending_storage_created, 2);
+		UT_ASSERT_EQ(pending_storage_closes, 0);
 		UT_ASSERT_EQ(cluster_recovery_cold_start->ctrc_page_progress->next_target, 2);
+		cluster_recovery_cold_observation_close(info.cluster_tx_start);
+		UT_ASSERT(!pending_storage_live); UT_ASSERT_EQ(pending_storage_closes, 2);
 	}
 }
 

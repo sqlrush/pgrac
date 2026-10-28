@@ -258,6 +258,10 @@ struct ClusterSharedFsPageV1;
 extern bool ClusterColdRecoveryCtrcPageCompletedCurrent(const struct ClusterRecoveryStartV1 *start,
 	const struct ClusterColdCtrcWorkV1 *work, const struct RfPageCtrcFpiInsertV1 *inserted,
 	struct ClusterSharedFsPageV1 *storage);
+struct RfPageCtrcUnchangedV1;
+extern bool ClusterColdRecoveryCtrcPageUnchangedCurrent(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work, const struct RfPageCtrcUnchangedV1 *unchanged,
+	struct ClusterSharedFsPageV1 *storage);
 extern const struct RfPageOnlinePlanV1 *ClusterColdRecoveryCtrcPagePlan(
 	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work);
 /* Original complete generation vector in the SAME sealed graph's participant
