@@ -86,7 +86,7 @@
 #endif
 
 #define CLUSTER_CTRC_SHMEM_MAGIC UINT32_C(0x43545243)
-#define CLUSTER_CTRC_SHMEM_VERSION UINT32_C(23)
+#define CLUSTER_CTRC_SHMEM_VERSION UINT32_C(24)
 #ifndef CLUSTER_CTRC_TEST_TABLE_VISIT
 #define CLUSTER_CTRC_TEST_TABLE_VISIT(kind) ((void)0)
 #endif
@@ -463,7 +463,8 @@ ctrc_participant_delegations_valid(const ClusterCtrcParticipantEntry *participan
 
 	if (participant->delegation_certificate_state > CTRC_DELEGATION_RECEIPTS_RECLAIMED
 		|| (participant->delegation_certificate_state == CTRC_DELEGATION_RECEIPTS_RECLAIMED
-			&& (participant->parent_certificate_request_id == 0
+			&& ((participant->parent_certificate_request_id == 0
+					&& participant->root_certificate_request_id == 0)
 				|| participant->delegation_certificate_confirmed_bitmap != participant->delegation_ack_bitmap))
 		|| (participant->delegation_certificate_confirmed_bitmap & ~participant->delegation_ack_bitmap) != 0
 		|| (participant->delegation_certificate_confirmed_bitmap != 0
@@ -2677,6 +2678,7 @@ static bool ctrc_participant_freeze_next_ack_shared(void);
 static Size ctrc_participant_freeze_ack_batch_shared(Size maximum);
 #ifndef CLUSTER_CTRC_UNIT_TEST
 static Size ctrc_participant_reclaim_delegated_batch_shared(void);
+static bool ctrc_delegated_certificate_retired_exact_locked(uint64 index);
 #endif
 static bool
 ctrc_origin_next_certificate_snapshot_shared(ClusterCtrcOriginCertificateSnapshot *snapshot);
@@ -8649,7 +8651,9 @@ ctrc_root_local_ack_exact_locked(uint64 index, const ClusterCtrcTxnKeyV1 *key,
 		&& ctrc_bytes_zero(&participant->delegation_path, sizeof(participant->delegation_path))
 		&& participant->delegation_count != 0
 		&& ctrc_delegated_local_ack_summary_exact(participant, &ctrc_participant_ack_entries()[index])
-		&& ctrc_receipt_chain_exact_locked(index, true);
+		&& (participant->delegation_certificate_state == CTRC_DELEGATION_RECEIPTS_RECLAIMED
+			? ctrc_delegated_certificate_retired_exact_locked(index)
+			: ctrc_receipt_chain_exact_locked(index, true));
 }
 #endif
 
@@ -9089,7 +9093,8 @@ ctrc_participant_reclaim_delegated_batch_shared(void)
 		if ((ctrc_participant_lock_mask(index) & lock_mask) == 0
 			|| !ctrc_cleaner_owns_key(&participant->key)
 			|| participant->identity.node_id != (uint16)cluster_node_id
-			|| participant->parent_certificate_request_id == 0
+			|| (participant->parent_certificate_request_id == 0
+				&& participant->root_certificate_request_id == 0)
 			|| participant->delegation_certificate_state != CTRC_DELEGATION_CERTIFICATE_NONE
 			|| participant->delegation_certificate_confirmed_bitmap != participant->delegation_ack_bitmap
 			|| !ctrc_delegated_local_ack_summary_exact(participant, &ctrc_participant_ack_entries()[index])
