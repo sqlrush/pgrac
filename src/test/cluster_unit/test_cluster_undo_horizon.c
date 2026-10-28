@@ -104,9 +104,11 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 	}
 	if (native_history_enabled && lock == ProcArrayLock) {
 		UT_ASSERT(!native_history_locked && !native_xid_locked);
-		UT_ASSERT_EQ(mode, LW_EXCLUSIVE);
+		UT_ASSERT(mode == LW_EXCLUSIVE || mode == LW_SHARED);
 		native_history_locked = true;
-		native_history_cuts++;
+		native_history_promise_lock = mode == LW_SHARED;
+		if (native_history_promise_lock) native_history_promise_reads++;
+		else native_history_cuts++;
 		return true;
 	}
 	UT_ASSERT(lock == XidGenLock && !native_xid_locked);
@@ -127,7 +129,9 @@ LWLockRelease(LWLock *lock)
 	if (native_history_enabled && lock == ProcArrayLock) {
 		UT_ASSERT(native_history_locked && !native_xid_locked);
 		native_history_locked = false;
-		native_history_unlocks++;
+		if (native_history_promise_lock) native_history_promise_unlocks++;
+		else native_history_unlocks++;
+		native_history_promise_lock = false;
 		return;
 	}
 	UT_ASSERT(lock == XidGenLock && native_xid_locked);
@@ -182,7 +186,8 @@ static bool test_horizon_seal;
 static bool test_horizon_capable = true;
 /* Explicit allocation, available before the new header in the RED product. */
 #define TEST_FULLXID_SOURCE_CAP UINT32_C(0x40000000)
-static uint32 test_source_cap_word = TEST_FULLXID_SOURCE_CAP;
+#define TEST_RETAINED_H_CAP UINT32_C(0x80000000)
+static uint32 test_source_cap_word = TEST_FULLXID_SOURCE_CAP | TEST_RETAINED_H_CAP;
 static int32 test_source_cap_missing_peer = -1;
 static bool test_source_cap_drop_on_recheck;
 
@@ -557,6 +562,15 @@ cluster_undo_retention_horizon_sample(ClusterUndoRetentionSample *out)
 	test_cohort_clock_shift = 0;
 	return test_retention_sample_valid;
 }
+/* Old horizon/peer fixtures retain their explicit controlled H boundary;
+ * opt-in composition cases execute the actual native promise accessor. */
+bool
+cluster_undo_retention_horizon_covers(SCN horizon)
+{
+	if (native_history_enabled)
+		return native_history_covers(horizon);
+	return SCN_VALID(horizon) && horizon != (SCN)UINT64_MAX;
+}
 bool
 cluster_mrp_should_start(void)
 {
@@ -633,7 +647,7 @@ reset_v2_receiver(void)
 	test_v2_fence.admitted_incarnation[0] = 40;
 	test_v2_fence.admitted_incarnation[1] = 41;
 	test_v2_identity = test_v2_ingress = test_horizon_capable = true;
-	test_source_cap_word = TEST_FULLXID_SOURCE_CAP;
+	test_source_cap_word = TEST_FULLXID_SOURCE_CAP | TEST_RETAINED_H_CAP;
 	test_source_cap_missing_peer = -1;
 	test_source_cap_drop_on_recheck = false;
 	test_v2_change_on_recheck = false;
@@ -3887,10 +3901,121 @@ UT_TEST(test_fullxid_source_downgrade_revokes_fixed_cohort_and_watermark)
 }
 
 
+UT_TEST(test_retained_h_protocol_is_advertised_with_original_sources)
+{
+	uint32 word = cluster_ic_local_capability_word();
+
+	UT_ASSERT((word & TEST_RETAINED_H_CAP) != 0);
+	UT_ASSERT((word & TEST_FULLXID_SOURCE_CAP) != 0);
+	UT_ASSERT((word & PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2) != 0);
+	UT_ASSERT((word & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) == 0);
+}
+
+UT_TEST(test_missing_only_retained_h_support_refuses_sender_and_receiver)
+{
+	ClusterHeapFreezeReportV2 report = reset_v2_receiver();
+	ClusterHeapFreezeReportV2SlotShmem before = test_horizon_store.freeze_slots[1];
+
+	test_source_cap_word = TEST_FULLXID_SOURCE_CAP;
+	receive_v2_report(&report);
+	UT_ASSERT(memcmp(&before, &test_horizon_store.freeze_slots[1], sizeof(before)) == 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&test_horizon_store.wire_reject_count), 1);
+	reset_v2_sender();
+	test_source_cap_word = TEST_FULLXID_SOURCE_CAP;
+	undo_horizon_send_v2(1, &test_sender_sample, &test_retention_sample);
+	UT_ASSERT_EQ(test_v2_sends, 0);
+	UT_ASSERT_EQ(test_horizon_store.report_sequence, 0);
+}
+
+UT_TEST(test_retained_h_only_downgrade_revokes_existing_cohort_and_candidate)
+{
+	ClusterHeapFreezeReportV2 report = reset_v2_cohort(true);
+	ClusterHeapFreezeCohortObservation saved, unchanged;
+	ClusterHeapFreezeWatermark candidate, before;
+	UndoHorizonV2MaintenanceObservation observed = {0};
+
+	cohort_receive(65, report);
+	UT_ASSERT_EQ(cluster_heap_freeze_cohort_observe(&saved), CLUSTER_HEAP_FREEZE_COHORT_READY);
+	observed.fence = test_v2_fence;
+	observed.active_sample_id = test_sender_sample.sample_id;
+	UT_ASSERT(undo_horizon_publish_freeze_watermark(&saved, &observed, test_horizon_now));
+	UT_ASSERT(cluster_heap_freeze_watermark_sample(&candidate));
+	before = candidate;
+	unchanged = saved;
+	test_source_cap_word = TEST_FULLXID_SOURCE_CAP;
+	UT_ASSERT_EQ(cluster_heap_freeze_cohort_current(&saved), CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED);
+	UT_ASSERT(!cluster_heap_freeze_watermark_sample(&candidate));
+	UT_ASSERT(memcmp(&saved, &unchanged, sizeof(saved)) == 0);
+	UT_ASSERT(memcmp(&test_horizon_store.freeze_watermark, &before, sizeof(before)) == 0);
+}
+
+UT_TEST(test_actual_native_promise_precedes_v2_sender_sequence_debit)
+{
+	ClusterUndoRetentionSample actual;
+	unsigned clocks;
+
+	reset_v2_sender();
+	native_history_reset();
+	/* Numeric H alone is insufficient, even with all original peer bits. */
+	undo_horizon_send_v2(1, &test_sender_sample, &test_retention_sample);
+	UT_ASSERT_EQ(test_v2_sends, 0);
+	UT_ASSERT_EQ(test_horizon_store.report_sequence, 0);
+	UT_ASSERT_EQ(native_history_clocks, 0);
+	UT_ASSERT(cluster_undo_retention_horizon_sample(&actual));
+	UT_ASSERT_EQ(actual.horizon_scn, native_history_clock);
+	clocks = native_history_clocks;
+	undo_horizon_send_v2(1, &test_sender_sample, &actual);
+	UT_ASSERT_EQ(test_v2_sends, 1);
+	UT_ASSERT_EQ(test_horizon_store.report_sequence, 1);
+	UT_ASSERT_EQ(native_history_clocks, clocks);
+	UT_ASSERT_EQ(native_history_promise_reads, native_history_promise_unlocks);
+	UT_ASSERT(native_history_promise_reads >= 3);
+	UT_ASSERT(!native_history_locked && !native_xid_locked);
+	native_history_enabled = false;
+}
+
+UT_TEST(test_actual_native_promise_bounds_saved_cohort_and_candidate)
+{
+	ClusterHeapFreezeCohortObservation saved, forged;
+	ClusterHeapFreezeWatermark candidate, before;
+	UndoHorizonV2MaintenanceObservation observed = {0};
+	unsigned clocks;
+
+	(void)reset_v2_cohort(false);
+	native_history_reset();
+	UT_ASSERT_EQ(cluster_heap_freeze_cohort_observe(&saved), CLUSTER_HEAP_FREEZE_COHORT_READY);
+	UT_ASSERT_EQ(saved.source_local_horizon_scn, native_history_clock);
+	UT_ASSERT_EQ(procArray->cluster_read_scn_floor, native_history_clock);
+	clocks = native_history_clocks;
+	UT_ASSERT_EQ(cluster_heap_freeze_cohort_current(&saved), CLUSTER_HEAP_FREEZE_COHORT_READY);
+	observed.fence = test_v2_fence;
+	observed.active_sample_id = test_sender_sample.sample_id;
+	UT_ASSERT(undo_horizon_publish_freeze_watermark(&saved, &observed, test_horizon_now));
+	UT_ASSERT(cluster_heap_freeze_watermark_sample(&before));
+	forged = saved;
+	forged.source_local_horizon_scn++;
+	UT_ASSERT_EQ(cluster_heap_freeze_cohort_current(&forged), CLUSTER_HEAP_FREEZE_COHORT_INVALID);
+	UT_ASSERT(!undo_horizon_publish_freeze_watermark(&forged, &observed, test_horizon_now));
+	UT_ASSERT(memcmp(&before, &test_horizon_store.freeze_watermark, sizeof(before)) == 0);
+	/* A corrupt candidate cannot manufacture coverage by re-sampling H. */
+	test_horizon_store.freeze_watermark.horizon_scn = native_history_clock + 1;
+	memset(&candidate, 0xa5, sizeof(candidate));
+	UT_ASSERT(!cluster_heap_freeze_watermark_sample(&candidate));
+	UT_ASSERT_EQ(candidate.publication_sequence, 0);
+	UT_ASSERT_EQ(native_history_clocks, clocks);
+	UT_ASSERT_EQ(native_history_promise_reads, native_history_promise_unlocks);
+	UT_ASSERT(!native_history_locked && !native_xid_locked);
+	test_horizon_store.freeze_watermark = before;
+	UT_ASSERT(cluster_heap_freeze_watermark_sample(&candidate));
+	UT_ASSERT(memcmp(&candidate, &before, sizeof(before)) == 0);
+	native_history_enabled = false;
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(127);
+	UT_PLAN(132);
 	UndoHorizonShmem = &test_horizon_store;
 
 	UT_RUN(test_u1_no_required_peer);
@@ -4022,6 +4147,11 @@ main(void)
 	UT_RUN(test_fullxid_source_capability_precedes_sender_sequence_debit);
 	UT_RUN(test_fullxid_source_downgrade_revokes_fixed_cohort_and_watermark);
 
+	UT_RUN(test_retained_h_protocol_is_advertised_with_original_sources);
+	UT_RUN(test_missing_only_retained_h_support_refuses_sender_and_receiver);
+	UT_RUN(test_retained_h_only_downgrade_revokes_existing_cohort_and_candidate);
+	UT_RUN(test_actual_native_promise_precedes_v2_sender_sequence_debit);
+	UT_RUN(test_actual_native_promise_bounds_saved_cohort_and_candidate);
 	UT_DONE();
 	free(procArray);
 	return ut_failed_count == 0 ? 0 : 1;

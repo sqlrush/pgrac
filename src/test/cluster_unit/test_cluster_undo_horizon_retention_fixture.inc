@@ -6,12 +6,15 @@
 
 static bool native_history_enabled, native_history_locked;
 static unsigned native_history_cuts, native_history_unlocks, native_history_clocks;
+static unsigned native_history_promise_reads, native_history_promise_unlocks;
+static bool native_history_promise_lock;
 static SCN native_history_clock;
 static PGPROC native_history_procs[4];
 static PGPROC *allProcs = native_history_procs;
 static ProcArrayStruct *procArray;
 bool native_history_sample(ClusterUndoRetentionSample *out);
 SCN native_history_scalar(void);
+bool native_history_covers(SCN);
 
 SCN
 cluster_scn_current(void)
@@ -29,6 +32,9 @@ cluster_scn_current(void)
 #include "test_cluster_retention_sample.inc"
 #undef cluster_undo_retention_horizon
 #undef cluster_undo_retention_horizon_sample
+#define cluster_undo_retention_horizon_covers native_history_covers
+#include "test_cluster_retention_promise.inc"
+#undef cluster_undo_retention_horizon_covers
 
 static void
 native_history_reset(void)
@@ -47,6 +53,7 @@ native_history_reset(void)
 	}
 	native_history_clock = scn_encode(0, 700);
 	native_history_cuts = native_history_unlocks = native_history_clocks = 0;
-	native_history_locked = false;
+	native_history_locked = native_history_promise_lock = false;
+	native_history_promise_reads = native_history_promise_unlocks = 0;
 	native_history_enabled = true;
 }

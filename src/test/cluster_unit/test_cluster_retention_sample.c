@@ -33,7 +33,7 @@ PGPROC *MyProc = &entries[0];
 static LWLockPadded locks[NUM_INDIVIDUAL_LWLOCKS];
 LWLockPadded *MainLWLockArray = locks;
 static SCN sample_clock;
-static unsigned acquires, releases, clock_reads, lock_errors;
+static unsigned acquires, releases, clock_reads, lock_errors, shared_acquires;
 static bool held, change_after_unlock, corrupt_count_after_lock;
 static bool sample_mrp, clock_sampled;
 static SCN sample_mrp_bound;
@@ -56,11 +56,12 @@ cluster_mrp_standby_consistent_scn(void)
 bool
 LWLockAcquire(LWLock *lock, LWLockMode mode)
 {
-	if (held || lock != ProcArrayLock || mode != LW_EXCLUSIVE)
+	if (held || lock != ProcArrayLock || (mode != LW_EXCLUSIVE && mode != LW_SHARED))
 		lock_errors++;
 	held = true;
 	clock_sampled = false;
 	acquires++;
+	if (mode == LW_SHARED) shared_acquires++;
 	if (corrupt_count_after_lock)
 		procArray->numProcs = -1;
 	return true;
@@ -105,6 +106,7 @@ ExceptionalCondition(const char *condition, const char *file, int line)
 
 #include "test_cluster_retention_sample.inc"
 #include "test_cluster_retention_publish.inc"
+#include "test_cluster_retention_promise.inc"
 
 static void
 reset_fixture(void)
@@ -125,7 +127,7 @@ reset_fixture(void)
 	sample_mrp = false;
 	sample_mrp_bound = InvalidScn;
 	MyProc = &entries[0];
-	acquires = releases = clock_reads = lock_errors = 0;
+	acquires = releases = clock_reads = lock_errors = shared_acquires = 0;
 	held = change_after_unlock = corrupt_count_after_lock = false;
 }
 
@@ -675,10 +677,67 @@ UT_TEST(test_unknown_fold_cannot_hide_a_new_finite_reader)
 	UT_ASSERT_EQ(lock_errors, 0);
 }
 
+UT_TEST(test_native_promise_covers_only_finite_already_retained_cuts)
+{
+	ClusterUndoRetentionSample sample;
+	SCN saved;
+
+	reset_fixture();
+	UT_ASSERT(!cluster_undo_retention_horizon_covers(700));
+	UT_ASSERT_EQ(clock_reads, 0);
+	UT_ASSERT(cluster_undo_retention_horizon_sample(&sample));
+	saved = procArray->cluster_read_scn_floor;
+	UT_ASSERT(cluster_undo_retention_horizon_covers(700));
+	UT_ASSERT(cluster_undo_retention_horizon_covers(699));
+	UT_ASSERT(!cluster_undo_retention_horizon_covers(701));
+	UT_ASSERT(!cluster_undo_retention_horizon_covers(InvalidScn));
+	UT_ASSERT(!cluster_undo_retention_horizon_covers((SCN)UINT64_MAX));
+	UT_ASSERT_EQ(procArray->cluster_read_scn_floor, saved);
+	UT_ASSERT_EQ(shared_acquires, 4);
+	UT_ASSERT_EQ(clock_reads, 1);
+	UT_ASSERT_EQ(acquires, releases);
+	UT_ASSERT_EQ(lock_errors, 0);
+	UT_ASSERT(!held);
+}
+
+UT_TEST(test_native_promise_survives_unproven_later_cut_and_blocks_resurrection)
+{
+	ClusterUndoRetentionSample sample;
+
+	reset_fixture();
+	UT_ASSERT(cluster_undo_retention_horizon_sample(&sample));
+	procArray->numProcs = 1;
+	entries[0].xmin = 10;
+	UT_ASSERT(ProcArrayPublishReadScn(InvalidScn, InvalidScn));
+	UT_ASSERT(!cluster_undo_retention_horizon_sample(&sample));
+	UT_ASSERT(cluster_undo_retention_horizon_covers(700));
+	UT_ASSERT(!ProcArrayPublishReadScn(699, 699));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&entries[0].cluster_read_scn_atomic), InvalidScn);
+	UT_ASSERT_EQ(acquires, releases);
+	UT_ASSERT_EQ(lock_errors, 0);
+}
+
+UT_TEST(test_native_promise_missing_owner_or_nonfinite_floor_never_covers)
+{
+	reset_fixture();
+	procArray->cluster_read_scn_floor = (SCN)UINT64_MAX;
+	UT_ASSERT(!cluster_undo_retention_horizon_covers(700));
+	procArray->cluster_read_scn_floor = InvalidScn;
+	UT_ASSERT(!cluster_undo_retention_horizon_covers(700));
+	cluster_node_id = -1;
+	UT_ASSERT(!cluster_undo_retention_horizon_covers(700));
+	cluster_node_id = 0;
+	free(procArray); procArray = NULL;
+	UT_ASSERT(!cluster_undo_retention_horizon_covers(700));
+	UT_ASSERT_EQ(acquires, 2);
+	UT_ASSERT_EQ(acquires, releases);
+	UT_ASSERT_EQ(lock_errors, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(28);
+	UT_PLAN(31);
 	UT_RUN(test_empty_array_has_one_prescan_clock);
 	UT_RUN(test_all_database_and_vacuum_snapshot_minima_are_included);
 	UT_RUN(test_equal_time_prefers_snapshot_without_changing_scalar_bits);
@@ -707,6 +766,9 @@ main(void)
 	UT_RUN(test_regressing_clock_or_snapshot_cut_cannot_lower_an_old_promise);
 	UT_RUN(test_publication_without_an_original_owner_refuses_before_locking);
 	UT_RUN(test_unknown_fold_cannot_hide_a_new_finite_reader);
+	UT_RUN(test_native_promise_covers_only_finite_already_retained_cuts);
+	UT_RUN(test_native_promise_survives_unproven_later_cut_and_blocks_resurrection);
+	UT_RUN(test_native_promise_missing_owner_or_nonfinite_floor_never_covers);
 	free(procArray);
 	UT_DONE();
 	return ut_failed_count != 0;

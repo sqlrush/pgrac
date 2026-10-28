@@ -2402,6 +2402,27 @@ cluster_undo_retention_horizon_sample(ClusterUndoRetentionSample *out)
 	return true;
 }
 
+/* Read only the per-boot promise retained by successful native H cuts. This
+ * does not sample H or acquire a PGPROC identity: later snapshot publication
+ * is serialized against the same monotone floor by ProcArrayPublishReadScn.
+ * Call outside page/content and undo lifecycle locks. */
+bool
+cluster_undo_retention_horizon_covers(SCN horizon)
+{
+	ProcArrayStruct *arrayP = procArray;
+	bool covered;
+
+	if (cluster_node_id < 0 || arrayP == NULL || !SCN_VALID(horizon) ||
+		horizon == (SCN) UINT64_MAX)
+		return false;
+	LWLockAcquire(ProcArrayLock, LW_SHARED);
+	covered = SCN_VALID(arrayP->cluster_read_scn_floor) &&
+		arrayP->cluster_read_scn_floor != (SCN) UINT64_MAX &&
+		scn_time_cmp(horizon, arrayP->cluster_read_scn_floor) <= 0;
+	LWLockRelease(ProcArrayLock);
+	return covered;
+}
+
 /* Compatibility entry point: preserve the original numeric H and refusal. */
 SCN
 cluster_undo_retention_horizon(void)

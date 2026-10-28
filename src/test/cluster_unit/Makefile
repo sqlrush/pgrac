@@ -8912,6 +8912,13 @@ test_cluster_retention_sample.inc: $(top_srcdir)/src/backend/storage/ipc/procarr
 	     END { if (count != 2 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Read the original per-boot native promise without sampling another H cut.
+test_cluster_retention_promise.inc: $(top_srcdir)/src/backend/storage/ipc/procarray.c Makefile
+	awk '/^cluster_undo_retention_horizon_covers\(/ { print "bool"; emit=1; count++ } \
+	     emit { print } /^}$$/ { emit=0 } \
+	     END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 # Original finite read publication, serialized with successful native H cuts.
 test_cluster_retention_publish.inc: $(top_srcdir)/src/backend/storage/ipc/procarray.c Makefile
 	awk '/^ProcArrayPublishReadScn\(/ { print "bool"; emit=1; count++ } \
@@ -8920,7 +8927,7 @@ test_cluster_retention_publish.inc: $(top_srcdir)/src/backend/storage/ipc/procar
 	mv $@.tmp $@
 
 test_cluster_retention_sample: test_cluster_retention_sample.c unit_test.h \
-		test_cluster_retention_publish.inc \
+		test_cluster_retention_publish.inc test_cluster_retention_promise.inc \
 		test_cluster_pgproc_active_types.inc test_cluster_retention_sample.inc \
 		$(top_srcdir)/src/include/access/twophase.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_retention.h \
@@ -10041,7 +10048,7 @@ clean-undo-horizon-cleaner:
 test_cluster_undo_horizon: test_cluster_undo_horizon.c unit_test.h \
 		test_cluster_ko_native_capability.inc \
 		test_cluster_undo_horizon_cleaner.inc \
-		$(srcdir)/test_cluster_undo_horizon_retention_fixture.inc \
+		$(srcdir)/test_cluster_undo_horizon_retention_fixture.inc test_cluster_retention_promise.inc \
 		test_cluster_pgproc_active_types.inc test_cluster_retention_sample.inc \
 		$(CLUSTER_UNDO_RETENTION_O) \
 		test_cluster_subtrans_watermark.inc $(CLUSTER_XID_STRIPE_O) \
@@ -10983,6 +10990,7 @@ clean distclean maintainer-clean: clean-retention-sample
 .PHONY: clean-retention-sample
 clean-retention-sample:
 	rm -f test_cluster_retention_publish.inc test_cluster_retention_publish.inc.tmp
+	rm -f test_cluster_retention_promise.inc test_cluster_retention_promise.inc.tmp
 	rm -f test_cluster_retention_sample.inc test_cluster_retention_sample.inc.tmp
 
 # Original backend-local writer, with controlled ownership/object/pin leaves.

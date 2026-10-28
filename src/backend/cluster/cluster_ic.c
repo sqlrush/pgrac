@@ -606,7 +606,7 @@ cluster_ic_local_capability_word(void)
 		  | PGRAC_IC_HELLO_CAP_UNDO_ROOT_DESCRIPTOR_V1 | PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1;
 	/* Protocol implementation only; every F export still needs the original
 	 * complete source-qualified census, and H/positive admission is separate. */
-	capabilities |= PGRAC_IC_HELLO_HEAP_FREEZE_SOURCE_MASK;
+	capabilities |= PGRAC_IC_HELLO_HEAP_FREEZE_RETAINED_MASK;
 
 	/* PGRAC: codec support only; never an application/admission assertion.
 	 * Author: SqlRush <sqlrush@gmail.com> */

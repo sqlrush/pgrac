@@ -1645,11 +1645,22 @@ static bool
 cohort_peer_generation_current(int32 peer, uint32 capability, uint32 generation)
 {
 	UT_ASSERT(peer >= 0 && peer < CLUSTER_MAX_NODES);
-	UT_ASSERT_EQ(capability, PGRAC_IC_HELLO_HEAP_FREEZE_SOURCE_MASK);
+	UT_ASSERT_EQ(capability, PGRAC_IC_HELLO_HEAP_FREEZE_RETAINED_MASK);
 	UT_ASSERT(!local_x && !local_share && backend_pin_count == fixture_expected_backend_pins());
 	cohort_peer_current_checks++;
 	if (cohort_peer_revoke_worker) cohort_worker_live = false;
 	return generation == cohort_live_generation[peer];
+}
+
+/* Retain this native-writer fixture's existing controlled history boundary.
+ * The actual per-boot covers accessor and sampler are composed separately
+ * by test_cluster_retention_sample and test_cluster_undo_horizon. */
+bool
+cluster_undo_retention_horizon_covers(SCN horizon)
+{
+	UT_ASSERT(!local_x && !local_share && backend_pin_count == fixture_expected_backend_pins());
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	return SCN_VALID(horizon) && horizon != (SCN)UINT64_MAX;
 }
 
 static TimestampTz

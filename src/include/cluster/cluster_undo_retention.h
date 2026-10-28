@@ -56,6 +56,12 @@ typedef struct ClusterUndoRetentionSample {
  * it is not a global F/H or producer-lifetime certificate. */
 extern bool cluster_undo_retention_horizon_sample(ClusterUndoRetentionSample *out);
 
+/* True only for a finite H covered by this ProcArray boot's retained native
+ * promise. Read-only SH lock, no reader/clock resample or PGPROC token. The
+ * original boot/admission and every required peer still need validation;
+ * this local check alone does not qualify a global F/H or native writer. */
+extern bool cluster_undo_retention_horizon_covers(SCN horizon);
+
 /*
  * cluster_undo_retention_horizon -- own-instance retention lower bound:
  *	min(pre-scan local clock, live read_scn, actual ADG future-read SCN).
