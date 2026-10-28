@@ -6345,6 +6345,7 @@ UT_TEST(ordinary_recovery_complete_roles_keep_the_original_cf_wait_policy)
 #include "test_cluster_cold_own_root_cf.h"
 #include "test_cluster_wal_pin_cf.h"
 #include "test_cluster_ir_preflight_cf.h"
+#include "test_cluster_merge_project_cf.h"
 
 int
 main(void)
@@ -6356,6 +6357,18 @@ main(void)
 	pg_atomic_init_u64(&owner_proc.cluster_grd_redeclare_acked_epoch, 0);
 	cluster_control_request_shmem_init();
 	retire_driver = cluster_control_request_driver_start();
+	if (getenv("PGRAC_PRE2_TEST_PROJECT_CF_CONTROL") != NULL) {
+		UT_PLAN(1);
+		UT_RUN(startup_projection_uses_the_original_canonical_cut);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_PROJECT_CF_LIVENESS") != NULL) {
+		UT_PLAN(1);
+		UT_RUN(startup_projection_cf_slice_keeps_exact_cleanup_without_reading_roots);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_IR_CF_LIVENESS") != NULL) {
 		UT_PLAN(1);
 		UT_RUN(startup_ir_cf_slice_requires_retirement_and_fresh_preflight);
@@ -6450,7 +6463,7 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(120);
+	UT_PLAN(124);
 	UT_RUN(startup_cf_timeout_waits_for_exact_completion_before_begin);
 	UT_RUN(startup_cf_completion_does_not_preserve_changed_native_input);
 	UT_RUN(startup_cf_unsafe_native_context_never_takes_a_registry_lock);
@@ -6571,6 +6584,10 @@ main(void)
 	UT_RUN(startup_ir_real_root_and_fence_refusals_never_grant_authority);
 	UT_RUN(startup_ir_set_excludes_single_purpose_modes_before_cf);
 	UT_RUN(ordinary_ir_cf_refusal_keeps_original_wait_policy);
+	UT_RUN(startup_projection_uses_the_original_canonical_cut);
+	UT_RUN(startup_projection_cf_slice_keeps_exact_cleanup_without_reading_roots);
+	UT_RUN(startup_projection_under_ir_does_not_adopt_another_wait_policy);
+	UT_RUN(startup_projection_preserves_real_root_and_existing_slot_refusals);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
