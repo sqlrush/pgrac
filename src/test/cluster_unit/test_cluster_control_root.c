@@ -26832,6 +26832,15 @@ main(int argc, char **argv)
 		return ut_failed_count ? 1 : 0;
 	}
 
+	if (getenv("PGRAC_PRE2_TEST_RECOVERY_WAL") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_recovery_checkpoint_selects_native_not_common_counters);
+		UT_RUN(test_recovery_checkpoint_refusal_does_not_export_input);
+		UT_RUN(test_exact_recovery_source_sync_never_publishes_stale_input);
+		UT_RUN(test_exact_recovery_source_discards_stale_or_cancelled_input);
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_RETENTION") != NULL) {
 		UT_PLAN(12);
 		UT_RUN(test_v2_retention_reader_owns_exact_live_thread_and_cf);
