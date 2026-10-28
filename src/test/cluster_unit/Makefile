@@ -1045,6 +1045,18 @@ test_cluster_fresh_access_method.inc: $(top_srcdir)/src/backend/commands/amcmds.
 	     /^}/ { emit=0 } \
 	     END { if (entries != 1 || cuts != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
+test_cluster_fresh_function.inc: $(top_srcdir)/src/backend/commands/functioncmds.c Makefile
+	awk '/^PreflightClusterSharedFunctionWrite\(/ { print "static void"; emit=1; helpers++ } \
+	     /^CreateFunction\(/ || /^AlterFunction\(/ || /^CreateCast\(/ || /^CreateTransform\(/ \
+	     { print "ObjectAddress"; emit=1; entry=1; entries++ } \
+	     emit { print } \
+	     entry && (/&funcname\);/ || /rel = table_open\(ProcedureRelationId, RowExclusiveLock\);/ \
+	               || /sourcetypeid = typenameTypeId\(NULL, stmt->sourcetype\);/ \
+	               || /typeid = typenameTypeId\(NULL, stmt->type_name\);/) \
+	     { print "return InvalidObjectAddress; }"; emit=0; entry=0; cuts++ } \
+	     /^}/ { emit=0 } \
+	     END { if (helpers > 1 || entries != 4 || cuts != 4 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
 test_cluster_fresh_scope: test_cluster_fresh_scope.c unit_test.h \
 		test_cluster_fresh_control.inc test_cluster_fresh_startup.inc test_cluster_fresh_read.inc \
 		test_cluster_fresh_boolean.inc test_cluster_fresh_index.inc test_cluster_fresh_utility.inc \
@@ -1054,7 +1066,7 @@ test_cluster_fresh_scope: test_cluster_fresh_scope.c unit_test.h \
 		test_cluster_fresh_schema.inc test_cluster_fresh_comment.inc test_cluster_fresh_seclabel.inc \
 		test_cluster_fresh_policy.inc test_cluster_fresh_conversion.inc test_cluster_fresh_collation.inc \
 		test_cluster_fresh_event_trigger.inc test_cluster_fresh_owner.inc test_cluster_fresh_language.inc \
-		test_cluster_fresh_access_method.inc
+		test_cluster_fresh_access_method.inc test_cluster_fresh_function.inc
 	$(CC) $(CFLAGS) -Wno-unused-variable -Wno-unused-but-set-variable $(CPPFLAGS) $< \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 # PGRAC: link the real durable-prefix codec/reader, not a test copy.
@@ -6364,7 +6376,7 @@ clean distclean maintainer-clean:
 		test_cluster_fresh_schema.inc test_cluster_fresh_comment.inc test_cluster_fresh_seclabel.inc \
 		test_cluster_fresh_policy.inc test_cluster_fresh_conversion.inc test_cluster_fresh_collation.inc \
 		test_cluster_fresh_event_trigger.inc test_cluster_fresh_owner.inc test_cluster_fresh_language.inc \
-		test_cluster_fresh_access_method.inc
+		test_cluster_fresh_access_method.inc test_cluster_fresh_function.inc
 	rm -f $(TESTS) pgrac_fenced_live_rejoin_client probe_pgrac_fenced_cib \
 		test_cluster_tt_locator_stats.inc \
 		test_cluster_heap_inplace_version.inc test_cluster_heap_inplace_legacy_version.inc \
