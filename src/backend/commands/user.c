@@ -1762,9 +1762,35 @@ CheckOwnedObjectsStorageDrop(DropOwnedStmt *stmt, bool isTopLevel)
 void
 ReassignOwnedObjects(ReassignOwnedStmt *stmt)
 {
-	List	   *role_ids = roleSpecsToIds(stmt->roles);
+	List *role_ids;
 	ListCell   *cell;
 	Oid			newrole;
+
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_catalog && cluster_storage_mode_enabled()) {
+		ClusterCanonicalTxnBinding binding;
+		TransactionId current_xid;
+
+		PreventCommandIfReadOnly("REASSIGN OWNED");
+		PreventCommandIfParallelMode("REASSIGN OWNED");
+		PreventCommandDuringRecovery("REASSIGN OWNED");
+		if (IsSubTransaction())
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("shared catalog alteration does not support subtransactions")));
+		current_xid = GetCurrentTransactionIdIfAny();
+		if (TransactionIdIsValid(current_xid)
+			&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("shared catalog top-level transaction identity mismatch")));
+		if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+			ereport(
+				ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("canonical ACTIVE publication failed before shared catalog alteration")));
+	}
+#endif
+
+	role_ids = roleSpecsToIds(stmt->roles);
 
 	/* Check privileges */
 	foreach(cell, role_ids)
