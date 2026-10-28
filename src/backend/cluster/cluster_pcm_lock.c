@@ -28845,6 +28845,101 @@ requester_join_frames_done:
 	return result;
 }
 
+/* Copy complete ordinary materials under their original owner. This read
+ * grants no execution lease; native publication must revalidate and claim. */
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_requester_acquire_frames_exact(
+	const ResourceXInstallClaimJoinObservation *observation,
+	const ResourceXDecodedAcquireIntent *episode, ResourceXDecodedFrame *grant_out,
+	ResourceXDecodedFrame *image_out, ResourceXRequesterJoinSnapshot *out)
+{
+	ResourceXDecodedFrame grant, image;
+	ResourceXRequesterJoinSnapshot snapshot;
+	const ResourceXDecodedAcquireDecision *a;
+	const ClusterPcmResourceXBootstrapRound *round;
+	const ClusterPcmResourceXMasterState *state;
+	PcmEntryRef ref;
+	PcmEntryAcquireResult acquired;
+	ResourceXApplyResult result = RESOURCE_X_APPLY_STALE;
+
+	if (observation == NULL || episode == NULL || grant_out == NULL || image_out == NULL
+		|| out == NULL || grant_out == image_out
+		|| !resource_x_assertion_valid(&observation->request.logical_assertion)
+		|| observation->request.logical_assertion.requester_node != cluster_node_id
+		|| observation->entry_binding_generation == 0
+		|| observation->entry_binding_generation == UINT64_MAX)
+		return RESOURCE_X_APPLY_INVALID;
+	if (!cluster_pcm_lock_resource_x_gate_open_exact(observation->request.resource_formation))
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (!pcm_entry_ref_acquire(&observation->request.logical_assertion.resource, false, &ref, &acquired))
+		return RESOURCE_X_APPLY_NOT_FOUND;
+	LWLockAcquire(&ref.entry->entry_lock.lock, LW_SHARED);
+	round = &ref.entry->resource_x_bootstrap_round;
+	state = pcm_resource_x_master_state_for_entry(ref.entry);
+	if (state == NULL || !pcm_resource_x_requester_acquire_valid_locked(round)
+		|| !pcm_resource_x_install_claim_valid_locked(round)) {
+		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		goto done;
+	}
+	if (ref.binding_generation != observation->entry_binding_generation
+		|| !pcm_resource_x_common_equal(&observation->request, &round->request)
+		|| !pcm_resource_x_node_request_key_matches_locked(round,
+			&observation->request.logical_assertion, observation->master_node,
+			observation->request.resource_formation, observation->request.master_session_incarnation,
+			observation->r4_record_generation, observation->request.sender_connection_generation,
+			observation->master_ingress_connection_generation)
+		|| !round->has_acquire_intent
+		|| !pcm_resource_x_acquire_identity_equal(episode, &round->acquire_intent))
+		goto done;
+	if (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_REQUEST_DISPATCHED
+		|| round->failed_attempt_floor >= round->request.assertion_sequence
+		|| round->cancelled_attempt_floor >= round->request.assertion_sequence
+		|| round->head_failure_reason != 0 || round->delivery_target.buffer_id_plus_one != 0
+		|| round->install_claim_source != RESOURCE_X_INSTALL_CLAIM_NONE
+		|| !pcm_resource_x_active_empty_locked(ref.entry)
+		|| ref.entry->resource_x_local_owner.state != RESOURCE_X_LOCAL_OWNER_EMPTY) {
+		result = RESOURCE_X_APPLY_BAD_STATE;
+		goto done;
+	}
+	if (pcm_resource_x_requester_join_empty_locked(&state->requester_join)) {
+		result = RESOURCE_X_APPLY_NOT_FOUND;
+		goto done;
+	}
+	if (state->requester_join.acquire_format != 1
+		|| !pcm_resource_x_requester_join_decode_locked(&state->requester_join, &grant, &image)
+		|| !pcm_resource_x_requester_join_snapshot_locked(&state->requester_join, &snapshot)) {
+		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		goto done;
+	}
+	a = &grant.body.acquire_decision;
+	if (!pcm_resource_x_acquire_identity_equal(episode, &a->episode)
+		|| a->master_node != observation->master_node
+		|| !resource_x_assertion_equal(&grant.common.logical_assertion,
+			&round->request.logical_assertion)
+		|| grant.common.assertion_sequence != round->request.assertion_sequence
+		|| grant.common.resource_formation != round->resource_formation
+		|| grant.common.master_session_incarnation != round->master_session_incarnation
+		|| grant.common.observed_mode != round->request.observed_mode
+		|| grant.common.target_mode != round->request.target_mode)
+		goto done;
+	if ((snapshot.flags & RESOURCE_X_REQUESTER_JOIN_EVIDENCE_COMPLETE) == 0) {
+		result = RESOURCE_X_APPLY_BAD_STATE;
+		goto done;
+	}
+	if (!cluster_pcm_lock_resource_x_gate_open_exact(round->resource_formation)) {
+		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		goto done;
+	}
+	*grant_out = grant;
+	*image_out = image;
+	*out = snapshot;
+	result = RESOURCE_X_APPLY_APPLIED;
+done:
+	LWLockRelease(&ref.entry->entry_lock.lock);
+	pcm_entry_ref_release(&ref);
+	return result;
+}
+
 static ResourceXApplyResult
 pcm_resource_x_build_authority_grant_locked(struct GrdEntry *entry,
 											const ClusterPcmResourceXMasterRequest *request,

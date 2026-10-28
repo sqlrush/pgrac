@@ -2166,6 +2166,14 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_join_current_e
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_join_frames_exact(
 	const ResourceXAssertion *assertion, ResourceXDecodedFrame *grant_out,
 	ResourceXDecodedFrame *image_out, ResourceXRequesterJoinSnapshot *out);
+/* Read-only complete ordinary materials for the original native executor.
+ * APPLIED is neither a lease, IO permission nor native completion. Caller
+ * must revalidate current admission/peer domains and claim its executor.
+ * Distinct outputs are unchanged on refusal; no legacy READY is published. */
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_frames_exact(
+	const ResourceXInstallClaimJoinObservation *observation,
+	const ResourceXDecodedAcquireIntent *episode, ResourceXDecodedFrame *grant_out,
+	ResourceXDecodedFrame *image_out, ResourceXRequesterJoinSnapshot *out);
 extern ResourceXApplyResult
 cluster_pcm_lock_resource_x_install_settlement_exact(const ResourceXDecodedFrame *settlement,
 													 int32 authenticated_source_node,

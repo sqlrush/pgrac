@@ -61,6 +61,7 @@
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_mode.h"	/* PGRAC (spec-6.14 D8): storage-mode gate */
 #include "cluster/cluster_pcm_direct_init.h"
+#include "cluster/cluster_gcs.h"
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_pcm_lock.h"
@@ -3143,6 +3144,56 @@ cluster_bufmgr_pcm_own_acquire_intent_exact(
 		return CLUSTER_PCM_OWN_STALE;
 	*out = candidate;
 	return CLUSTER_PCM_OWN_OK;
+}
+
+ResourceXApplyResult
+cluster_bufmgr_pcm_own_acquire_input_exact(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *base, uint64 reservation_token, uint8 path,
+	const ClusterSemanticAdmissionToken *admission,
+	const ResourceXInstallClaimJoinObservation *observation, ResourceXDecodedFrame *grant_out,
+	ResourceXDecodedFrame *image_out, ResourceXRequesterJoinSnapshot *out)
+{
+	ResourceXInstallClaimJoinObservation observed;
+	ResourceXDecodedAcquireIntent episode, checked;
+	ResourceXDecodedFrame grant, image;
+	ResourceXRequesterJoinSnapshot snapshot;
+	ClusterPcmOwnResult native;
+	ResourceXApplyResult result;
+
+	if (observation == NULL || grant_out == NULL || image_out == NULL || out == NULL
+		|| grant_out == image_out)
+		return RESOURCE_X_APPLY_INVALID;
+	observed = *observation;
+	native = cluster_bufmgr_pcm_own_acquire_intent_exact(buf, base, reservation_token,
+		path, admission, NULL, &episode);
+	if (native != CLUSTER_PCM_OWN_OK)
+		return native == CLUSTER_PCM_OWN_BUSY || native == CLUSTER_PCM_OWN_NOT_READY
+			? RESOURCE_X_APPLY_BAD_STATE : RESOURCE_X_APPLY_STALE;
+	if (!BufferTagsEqual(&observed.request.logical_assertion.resource, &base->tag)
+		|| observed.request.observed_mode != base->pcm_state
+		|| observed.r4_record_generation != episode.r4_generation
+		|| observed.request.resource_formation != episode.cluster_epoch
+		|| cluster_gcs_lookup_master(base->tag) != observed.master_node)
+		return RESOURCE_X_APPLY_STALE;
+	result = cluster_pcm_lock_resource_x_requester_acquire_frames_exact(
+		&observed, &episode, &grant, &image, &snapshot);
+	if (result != RESOURCE_X_APPLY_APPLIED)
+		return result;
+	/* No PCM entry lock crosses pin/provider/header sampling. This remains
+	 * input for an executor, never authorization to mutate or read disk. */
+	native = cluster_bufmgr_pcm_own_acquire_intent_exact(buf, base, reservation_token,
+		path, admission, &episode, &checked);
+	if (native != CLUSTER_PCM_OWN_OK)
+		return native == CLUSTER_PCM_OWN_BUSY || native == CLUSTER_PCM_OWN_NOT_READY
+			? RESOURCE_X_APPLY_BAD_STATE : RESOURCE_X_APPLY_STALE;
+	if (!cluster_pcm_lock_resource_x_gate_open_exact(observed.request.resource_formation))
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (cluster_gcs_lookup_master(base->tag) != observed.master_node)
+		return RESOURCE_X_APPLY_STALE;
+	*grant_out = grant;
+	*image_out = image;
+	*out = snapshot;
+	return RESOURCE_X_APPLY_APPLIED;
 }
 
 static bool

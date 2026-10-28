@@ -884,6 +884,13 @@ extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_acquire_intent_exact(
 	BufferDesc *buf, const ClusterPcmOwnSnapshot *base, uint64 reservation_token, uint8 path,
 	const struct ClusterSemanticAdmissionToken *admission,
 	const ResourceXDecodedAcquireIntent *expected, ResourceXDecodedAcquireIntent *out);
+/* Capture the original native episode on both sides of a complete material
+ * read. No executor, IO activation, authority or native C is published. */
+extern ResourceXApplyResult cluster_bufmgr_pcm_own_acquire_input_exact(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *base, uint64 reservation_token, uint8 path,
+	const struct ClusterSemanticAdmissionToken *admission,
+	const ResourceXInstallClaimJoinObservation *observation, ResourceXDecodedFrame *grant_out,
+	ResourceXDecodedFrame *image_out, ResourceXRequesterJoinSnapshot *out);
 extern ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_delivery_begin_x_reservation(BufferDesc *buf,
 													const ClusterPcmOwnSnapshot *expected,
