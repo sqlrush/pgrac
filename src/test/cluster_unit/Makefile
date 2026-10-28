@@ -10030,6 +10030,7 @@ clean-undo-horizon-cleaner:
 	rm -f test_cluster_undo_horizon_cleaner.inc test_cluster_undo_horizon_cleaner.inc.tmp
 
 test_cluster_undo_horizon: test_cluster_undo_horizon.c unit_test.h \
+		test_cluster_ko_native_capability.inc \
 		test_cluster_undo_horizon_cleaner.inc \
 		$(srcdir)/test_cluster_undo_horizon_retention_fixture.inc \
 		test_cluster_pgproc_active_types.inc test_cluster_retention_sample.inc \

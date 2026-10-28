@@ -80,7 +80,7 @@ cluster_sf_peer_capability_word_sample(int32 peer, uint32 required,
 	UT_ASSERT(!native_lock_held && !native_cleaner_lock_held && !sender_maintenance_held);
 	UT_ASSERT(peer == 1 || (sender_high_peer_enabled && peer == 65)
 			  || (receiver_mode && peer == 0));
-	UT_ASSERT_EQ(required, PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2);
+	UT_ASSERT_EQ(required, PGRAC_IC_HELLO_HEAP_FREEZE_SOURCE_MASK);
 	sender_capability_reads++;
 	*word = required;
 	*generation = test_capability_generation;
@@ -94,7 +94,7 @@ cluster_sf_peer_capability_generation_matches(int32 peer, uint32 required, uint3
 	UT_ASSERT(!native_lock_held && !native_cleaner_lock_held && !sender_maintenance_held);
 	UT_ASSERT(peer == 1 || (sender_high_peer_enabled && peer == 65)
 			  || (receiver_mode && peer == 0));
-	UT_ASSERT_EQ(required, PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2);
+	UT_ASSERT_EQ(required, PGRAC_IC_HELLO_HEAP_FREEZE_SOURCE_MASK);
 	if (sender_peer_current_observer != NULL
 		&& (sender_peer_observer_target == 0 || sender_peer_observer_target == peer)) {
 		void (*observe)(void) = sender_peer_current_observer;

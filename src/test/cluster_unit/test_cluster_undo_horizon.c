@@ -180,6 +180,22 @@ static unsigned test_horizon_sends;
 static bool test_horizon_cut;
 static bool test_horizon_seal;
 static bool test_horizon_capable = true;
+/* Explicit allocation, available before the new header in the RED product. */
+#define TEST_FULLXID_SOURCE_CAP UINT32_C(0x40000000)
+static uint32 test_source_cap_word = TEST_FULLXID_SOURCE_CAP;
+static int32 test_source_cap_missing_peer = -1;
+static bool test_source_cap_drop_on_recheck;
+
+/* Execute the original HELLO publisher, not a copied capability expression. */
+bool cluster_shared_config;
+bool cluster_smart_fusion;
+int cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+int cluster_smart_fusion_tier_min = CLUSTER_IC_TIER_1;
+bool cluster_ic_suppress_caps_reply;
+bool cluster_ic_suppress_gcs_done_cap;
+bool cluster_ic_suppress_xid_flock_cap;
+#include "test_cluster_ko_native_capability.inc"
+
 static bool test_v1_capable = true;
 static ClusterUndoHorizonWire test_horizon_last;
 static ClusterUndoRetentionSample test_retention_sample
@@ -375,6 +391,8 @@ cluster_sf_peer_capability_word_sample(int32 peer, uint32 required, uint32 *word
 									   uint32 *generation)
 {
 	*word = test_horizon_capable ? PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2 : 0;
+	if (peer != test_source_cap_missing_peer)
+		*word |= test_source_cap_word;
 	*generation = test_cohort_all_caps ? test_cohort_generations[peer] : test_v2_cap_generation;
 	return (test_cohort_all_caps || peer == test_v2_peer) && (*word & required) == required;
 }
@@ -383,6 +401,10 @@ bool
 cluster_sf_peer_capability_generation_matches(int32 peer, uint32 required, uint32 generation)
 {
 	retire_actual_cleaner_at_peer(peer);
+	if (test_source_cap_drop_on_recheck) {
+		test_source_cap_drop_on_recheck = false;
+		test_source_cap_word = 0;
+	}
 	if (test_cohort_all_caps) {
 		if (peer == test_cohort_trigger_peer) {
 			int32 changed = test_cohort_changed_peer;
@@ -407,7 +429,9 @@ cluster_sf_peer_capability_generation_matches(int32 peer, uint32 required, uint3
 				pg_atomic_fetch_add_u32(&test_horizon_store.freeze_watermark_seq, 2);
 			}
 		}
-		return required == PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2 && test_horizon_capable
+		return (required & ~(PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2 |
+			(peer == test_source_cap_missing_peer ? 0 : test_source_cap_word))) == 0
+			   && test_horizon_capable
 			   && generation == test_cohort_generations[peer];
 	}
 	if (test_v2_cap_change_on_recheck) {
@@ -429,7 +453,9 @@ cluster_sf_peer_capability_generation_matches(int32 peer, uint32 required, uint3
 		else if (change == 4)
 			test_registration_generation++;
 	}
-	return peer == test_v2_peer && required == PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2
+	return peer == test_v2_peer
+		   && (required & ~(PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2 |
+			(peer == test_source_cap_missing_peer ? 0 : test_source_cap_word))) == 0
 		   && test_horizon_capable && generation == test_v2_cap_generation;
 }
 
@@ -607,6 +633,9 @@ reset_v2_receiver(void)
 	test_v2_fence.admitted_incarnation[0] = 40;
 	test_v2_fence.admitted_incarnation[1] = 41;
 	test_v2_identity = test_v2_ingress = test_horizon_capable = true;
+	test_source_cap_word = TEST_FULLXID_SOURCE_CAP;
+	test_source_cap_missing_peer = -1;
+	test_source_cap_drop_on_recheck = false;
 	test_v2_change_on_recheck = false;
 	test_v2_stream_serial = 19;
 	test_v2_stream_checks = 0;
@@ -3785,10 +3814,83 @@ UT_TEST(test_original_cleaner_retirement_keeps_native_cut_until_new_complete_fol
 	}
 }
 
+
+UT_TEST(test_fullxid_source_protocol_is_advertised_separately_from_codec)
+{
+	uint32 word = cluster_ic_local_capability_word();
+
+	UT_ASSERT((word & PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2) != 0);
+	UT_ASSERT((word & TEST_FULLXID_SOURCE_CAP) != 0);
+	UT_ASSERT((word & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) == 0);
+}
+
+UT_TEST(test_fullxid_source_capability_precedes_receive_publication)
+{
+	for (int fault = 0; fault < 2; fault++) {
+		ClusterHeapFreezeReportV2 report = reset_v2_receiver();
+		ClusterHeapFreezeReportV2SlotShmem before = test_horizon_store.freeze_slots[1];
+
+		if (fault == 0)
+			test_source_cap_word = 0;
+		else
+			test_source_cap_drop_on_recheck = true;
+		receive_v2_report(&report);
+		UT_ASSERT(memcmp(&before, &test_horizon_store.freeze_slots[1], sizeof(before)) == 0);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&test_horizon_store.wire_reject_count), 1);
+		UT_ASSERT_EQ(test_v2_cap_generation, 19);
+	}
+}
+
+UT_TEST(test_fullxid_source_capability_precedes_sender_sequence_debit)
+{
+	for (int fault = 0; fault < 2; fault++) {
+		(void)reset_v2_receiver();
+		reset_v2_sender();
+		if (fault == 0)
+			test_source_cap_word = 0;
+		else
+			test_source_cap_drop_on_recheck = true;
+		undo_horizon_send_v2(1, &test_sender_sample, &test_retention_sample);
+		UT_ASSERT_EQ(test_v2_sends, 0);
+		UT_ASSERT_EQ(test_horizon_store.report_sequence, 0);
+		UT_ASSERT_EQ(test_v2_cap_generation, 19);
+	}
+}
+
+UT_TEST(test_fullxid_source_downgrade_revokes_fixed_cohort_and_watermark)
+{
+	for (int peer = 1; peer <= 65; peer += 64) {
+		ClusterHeapFreezeReportV2 report = reset_v2_cohort(true);
+		ClusterHeapFreezeCohortObservation saved, unchanged;
+		ClusterHeapFreezeWatermark candidate, before;
+		ClusterHeapFreezeReportV2View view;
+		UndoHorizonV2MaintenanceObservation observed;
+
+		cohort_receive(65, report);
+		UT_ASSERT_EQ(cluster_heap_freeze_cohort_observe(&saved), CLUSTER_HEAP_FREEZE_COHORT_READY);
+		memset(&observed, 0, sizeof(observed));
+		observed.fence = test_v2_fence;
+		observed.active_sample_id = test_sender_sample.sample_id;
+		UT_ASSERT(undo_horizon_publish_freeze_watermark(&saved, &observed, test_horizon_now));
+		UT_ASSERT(cluster_heap_freeze_watermark_sample(&candidate));
+		before = candidate;
+		unchanged = saved;
+		/* Independent from reconnect: same generation loses this feature. */
+		test_source_cap_missing_peer = peer;
+		UT_ASSERT(!cluster_heap_freeze_report_v2_sample(peer, &view));
+		UT_ASSERT_EQ(cluster_heap_freeze_cohort_current(&saved), CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED);
+		UT_ASSERT(!cluster_heap_freeze_watermark_sample(&candidate));
+		UT_ASSERT(memcmp(&saved, &unchanged, sizeof(saved)) == 0);
+		UT_ASSERT(memcmp(&test_horizon_store.freeze_watermark, &before, sizeof(before)) == 0);
+		UT_ASSERT_EQ(test_cohort_generations[peer], 19);
+	}
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(123);
+	UT_PLAN(127);
 	UndoHorizonShmem = &test_horizon_store;
 
 	UT_RUN(test_u1_no_required_peer);
@@ -3915,6 +4017,11 @@ main(void)
 	UT_RUN(test_original_cleaner_complete_publication_reaches_v2_and_fixed_cohort);
 	UT_RUN(test_original_cleaner_retirement_revokes_each_v2_candidate_boundary);
 	UT_RUN(test_original_cleaner_retirement_keeps_native_cut_until_new_complete_fold);
+	UT_RUN(test_fullxid_source_protocol_is_advertised_separately_from_codec);
+	UT_RUN(test_fullxid_source_capability_precedes_receive_publication);
+	UT_RUN(test_fullxid_source_capability_precedes_sender_sequence_debit);
+	UT_RUN(test_fullxid_source_downgrade_revokes_fixed_cohort_and_watermark);
+
 	UT_DONE();
 	free(procArray);
 	return ut_failed_count == 0 ? 0 : 1;
