@@ -10134,3 +10134,39 @@ clean distclean maintainer-clean: clean-decision-publish
 .PHONY: clean-decision-publish
 clean-decision-publish:
 	rm -f test_cluster_resource_x_decision_publish test_cluster_resource_x_acquire_fixture.inc test_cluster_resource_x_acquire_fixture.inc.tmp
+
+# Original DATA owner plus the real complete acquisition codec. The older
+# ring suite keeps its marker codec; this companion runs actual wire bytes.
+TESTS += test_cluster_resource_x_transport
+all: test_cluster_resource_x_transport
+test_cluster_resource_x_transport: test_cluster_resource_x_transport.c \
+		test_cluster_lms_outbound.c unit_test.h test_cluster_r4_refusal_handoff.inc \
+		test_cluster_resource_x_transport_frames.inc \
+		$(top_srcdir)/src/include/cluster/cluster_resource_x_node_wire.h \
+		$(CLUSTER_VERSION_O) cluster_lms_outbound_test.o \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		cluster_unit_port_stubs.o cluster_catalog_trace_test.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) cluster_lms_outbound_test.o \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# Share only the original independent typed-frame builders, never test cases
+# or a copied product implementation; fail if any expected builder vanishes.
+test_cluster_resource_x_transport_frames.inc: test_cluster_resource_x_node_wire.c Makefile
+	awk '/^(make_control_frame|make_typed_frame|make_wal_image|witness_attach|make_witness_bytes|make_ship_bytes)\(/ \
+	       { print "static ResourceXDecodedFrame"; emit=1; frames++ } \
+	     /^(test_put_u32_be|test_put_u64_be|test_reseal|make_acquire_bytes|make_decision_bytes)\(/ \
+	       { print "static void"; emit=1; helpers++ } \
+	     /^(ship_crc|ship_get_u32)\(/ { print "static uint32"; emit=1; crc++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (frames != 6 || helpers != 5 || crc != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+cluster_lms_outbound_test.o test_cluster_lms_outbound: \
+		$(top_srcdir)/src/include/cluster/cluster_resource_x_node_wire.h
+
+clean distclean maintainer-clean: clean-resource-x-transport
+.PHONY: clean-resource-x-transport
+clean-resource-x-transport:
+	rm -f test_cluster_resource_x_transport test_cluster_resource_x_transport_frames.inc test_cluster_resource_x_transport_frames.inc.tmp

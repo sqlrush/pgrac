@@ -243,7 +243,7 @@ cluster_ic_tier1_resource_x_stream_generation(int32 peer, int channel)
 static uint32 ut_peer_capabilities[CLUSTER_MAX_NODES];
 static uint32 ut_peer_cap_generation[CLUSTER_MAX_NODES];
 static ResourceXIntentSlot ut_resource_x_owner_slot;
-static uint8 ut_resource_x_owner_payload[RESOURCE_X_IMAGE_V2_BYTES];
+static uint8 ut_resource_x_owner_payload[RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES];
 static int ut_resource_x_stage_count = 0;
 static bool ut_resource_x_stage_not_due;
 static int ut_resource_x_rearm_count = 0;

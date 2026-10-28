@@ -531,26 +531,35 @@ lms_outbound_resource_x_intent_valid(const ResourceXIntentSlot *intent)
 		return false;
 	switch ((ResourceXIntentOwnerKind)intent->body.owner_kind) {
 	case RESOURCE_X_INTENT_OWNER_MASTER_BLOCK:
-		return intent->payload_bytes == RESOURCE_X_CONTROL_V1_BYTES
+		return (intent->payload_bytes == RESOURCE_X_CONTROL_V1_BYTES
+				|| intent->payload_bytes == RESOURCE_X_DECISION_V3_BYTES)
 			   && intent->kind == RESOURCE_X_WIRE_BLOCK_TO_N
 			   && intent->body.owner_generation == intent->logical_generation
 			   && intent->body.owner_index == intent->destination_node
-			   && intent->body.assertion.requester_node != (int32)intent->destination_node;
+			   && (intent->payload_bytes == RESOURCE_X_DECISION_V3_BYTES
+				   || intent->body.assertion.requester_node != (int32)intent->destination_node);
 	case RESOURCE_X_INTENT_OWNER_HOLDER_STATUS:
-		return (intent->payload_bytes == RESOURCE_X_CONTROL_V1_BYTES
-				|| intent->payload_bytes == RESOURCE_X_PROOF_V1_BYTES)
-			   && (intent->kind == RESOURCE_X_WIRE_BLOCKED_TO_N
-				   || intent->kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2)
+		return (((intent->payload_bytes == RESOURCE_X_CONTROL_V1_BYTES
+				 || intent->payload_bytes == RESOURCE_X_PROOF_V1_BYTES)
+				&& (intent->kind == RESOURCE_X_WIRE_BLOCKED_TO_N
+					|| intent->kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2))
+				|| ((intent->payload_bytes == RESOURCE_X_WITNESS_V3_BYTES
+					 || intent->payload_bytes == RESOURCE_X_SOURCE_WITNESS_V3_BYTES)
+					&& intent->kind == RESOURCE_X_WIRE_BLOCKED_TO_N))
 			   && intent->body.owner_generation == intent->logical_generation
 			   && intent->body.owner_index == 0;
 	case RESOURCE_X_INTENT_OWNER_HOLDER_IMAGE:
-		return intent->payload_bytes == RESOURCE_X_IMAGE_V2_BYTES
-			   && intent->kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE
+		return (((intent->payload_bytes == RESOURCE_X_IMAGE_V2_BYTES
+				  || intent->payload_bytes == RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES)
+				 && intent->kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE)
+				|| (intent->payload_bytes == RESOURCE_X_WITNESS_V3_BYTES
+					&& intent->kind == RESOURCE_X_WIRE_BLOCKED_TO_N))
 			   && intent->body.assertion.requester_node == (int32)intent->destination_node
 			   && intent->body.owner_generation == intent->logical_generation
 			   && intent->body.owner_index == 0;
 	case RESOURCE_X_INTENT_OWNER_MASTER_GRANT:
-		return intent->payload_bytes == RESOURCE_X_PROOF_V1_BYTES
+		return (intent->payload_bytes == RESOURCE_X_PROOF_V1_BYTES
+				|| intent->payload_bytes == RESOURCE_X_DECISION_V3_BYTES)
 			   && intent->kind == RESOURCE_X_WIRE_AUTHORITY_GRANT
 			   && intent->body.assertion.requester_node == (int32)intent->destination_node
 			   && intent->body.owner_generation == intent->authority_generation
@@ -592,6 +601,51 @@ lms_outbound_resource_x_intent_msg_type(const ResourceXIntentSlot *intent)
 	default:
 		return 0;
 	}
+}
+
+/* The semantic owner still supplies the immutable body and native proof.
+ * Match its complete conditional frame to this physical claim before the
+ * only mutable field (the enclosing DATA sender) is rebound. A valid codec
+ * frame alone cannot redirect a different original owner or destination. */
+static bool
+lms_outbound_resource_x_intent_payload_valid(const ResourceXIntentSlot *intent,
+											   const uint8 *payload)
+{
+	ResourceXDecodedFrame frame;
+	ResourceXWireReject reject;
+	const ResourceXDecodedAcquireDecision *decision;
+	const ResourceXDecodedCommon *common;
+
+	if (intent->payload_bytes != RESOURCE_X_DECISION_V3_BYTES
+		&& intent->payload_bytes != RESOURCE_X_WITNESS_V3_BYTES
+		&& intent->payload_bytes != RESOURCE_X_SOURCE_WITNESS_V3_BYTES
+		&& intent->payload_bytes != RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES)
+		return true; /* Original non-conditional producers keep their gates. */
+	if (intent->body.owner_node != (uint32)cluster_node_id
+		|| !cluster_resource_x_wire_decode(lms_outbound_resource_x_intent_msg_type(intent),
+			payload, intent->payload_bytes, &frame, &reject)
+		|| !frame.has_acquire_decision || frame.kind != intent->kind)
+		return false;
+	common = &frame.common;
+	if (!BufferTagsEqual(&common->logical_assertion.resource, &intent->body.assertion.resource)
+		|| common->logical_assertion.requester_node != intent->body.assertion.requester_node
+		|| common->assertion_sequence != intent->logical_generation
+		|| common->authority_generation != intent->authority_generation)
+		return false;
+	if (intent->body.owner_kind == RESOURCE_X_INTENT_OWNER_MASTER_BLOCK
+		|| intent->body.owner_kind == RESOURCE_X_INTENT_OWNER_MASTER_GRANT) {
+		decision = &frame.body.acquire_decision;
+		return decision->master_node == (int32)intent->body.owner_node
+			&& common->action_node == (int32)intent->destination_node;
+	}
+	decision = frame.kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE
+		? &frame.body.acquire_image.source.decision : &frame.body.acquire_witness.decision;
+	if (common->action_node != (int32)intent->body.owner_node)
+		return false;
+	if (intent->body.owner_kind == RESOURCE_X_INTENT_OWNER_HOLDER_STATUS)
+		return decision->master_node == (int32)intent->destination_node;
+	return intent->body.owner_kind == RESOURCE_X_INTENT_OWNER_HOLDER_IMAGE
+		&& common->logical_assertion.requester_node == (int32)intent->destination_node;
 }
 
 static bool
@@ -772,7 +826,7 @@ int
 cluster_lms_outbound_resource_x_intent_pump(void)
 {
 	ResourceXIntentSlot intent;
-	uint8 payload[RESOURCE_X_IMAGE_V2_BYTES];
+	uint8 payload[RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES];
 	int staged = 0;
 	int call;
 
@@ -1090,7 +1144,7 @@ cluster_lms_outbound_drain_send(int worker_id)
 		ResourceXIntentSlot resource_x_intent;
 		ResourceXIntentSlot resource_x_current;
 		ResourceXWireReject resource_x_reject = RESOURCE_X_WIRE_REJECT_NONE;
-		uint8 resource_x_payload[RESOURCE_X_IMAGE_V2_BYTES];
+		uint8 resource_x_payload[RESOURCE_X_ACQUIRE_IMAGE_V3_BYTES];
 		const void *send_payload;
 		uint32 send_payload_len;
 		ClusterICSendResult rc;
@@ -1208,7 +1262,8 @@ cluster_lms_outbound_drain_send(int worker_id)
 			 * Rebind only this staged physical copy to the current DATA session;
 			 * requester ingress restores the canonical generation before it
 			 * compares a proof-bound image CRC. */
-			if (!cluster_resource_x_wire_rebind_sender_generation(
+			if (!lms_outbound_resource_x_intent_payload_valid(&resource_x_current, resource_x_payload)
+				|| !cluster_resource_x_wire_rebind_sender_generation(
 					slot.msg_type, resource_x_payload, (uint16)send_payload_len,
 					slot.connection_generation, &resource_x_reject)) {
 				(void)cluster_pcm_lock_resource_x_outbound_intent_hard_rearm_exact(
