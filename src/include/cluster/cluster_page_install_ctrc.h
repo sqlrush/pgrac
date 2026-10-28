@@ -146,7 +146,8 @@ typedef struct RfPageCtrcStepResultV1 {
  * descriptors on every return/ERROR without releasing any original grant.
  * memory_budget covers simultaneous private snapshots, original F4 and the
  * complete bounded storage preparation allocation.
- * WAIT is only an actual conditional PAGE collision. UNCHANGED is a protected
+ * WAIT in these older entries is only an actual conditional PAGE collision.
+ * UNCHANGED is a protected
  * observation, TARGET_SYNCED only local installation; neither clears debt nor
  * publishes DURABLE/COMPLETE/OPEN. PAGE remains held after successful promotion
  * except during the explicit pre-WAL gap; caller destroys it on every exit.
@@ -193,7 +194,14 @@ extern RfPageCtrcStepResultV1 rf_page_recovery_ctrc_replays_itl_graph_durable_sm
  * compare every byte with preparation. Only UNCHANGED_SYNCED reports this
  * local completion; the older entries still return observation-only UNCHANGED.
  * No FPI, WAL or write is produced for an unchanged page. Rewritten pages use
- * the original FPI_DURABLE branch. False/ERROR/close failure retains all debt;
+ * the original FPI_DURABLE branch. Before dropping preparation PAGE, rewritten
+ * pages retire only an exact clean, unpinned native CURRENT/N predecessor via
+ * the original bufmgr invalidation; dirty/first/PCM/PI/CR/CF owners are retained.
+ * Native cache contention also returns WAIT before insertion. Once absent,
+ * check that local observation at the existing current gates, including the
+ * off-PAGE WAL gap. Unexpected residency refuses with original window debt;
+ * an absence observation never grants future PAGE or mutation authority.
+ * False/ERROR/close failure retains all debt;
  * neither phase grants post-return FD custody, discharge or service completion.
  * All original immutable-input, budget and cleanup contracts apply. */
 extern RfPageCtrcStepResultV1 rf_page_recovery_ctrc_replays_itl_graph_sync_smgr_v1(

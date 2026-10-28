@@ -41,7 +41,9 @@
 #include "access/xloginsert.h"
 #include "access/xlogutils.h"
 #ifdef USE_PGRAC_CLUSTER
+#include "access/xlogrecovery.h"
 #include "cluster/cluster_page_cold_redo.h"
+#include "cluster/cluster_page_buffer_ctrc.h"
 #endif
 #include "catalog/catalog.h"
 #ifdef USE_ASSERT_CHECKING
@@ -55,6 +57,9 @@
 #include "pg_trace.h"
 #include "pgstat.h"
 #include "postmaster/bgwriter.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "postmaster/interrupt.h"
+#endif
 #include "storage/buf_internals.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_catalog_stats.h"	/* spec-6.14 D10b — catalog buf hit/miss */
@@ -7534,6 +7539,134 @@ InvalidateBufferCommitTailLocked(BufferDesc *buf, BufferTag *oldTag, uint32 oldH
 	 */
 	StrategyFreeBuffer(buf);
 }
+
+#ifdef USE_PGRAC_CLUSTER
+/* No native mapping/header lock crosses a recovery owner check. Absence is
+ * also observed in the original off-PAGE hash/WAL-preparation gap, where it
+ * grants no promotion or mutation authority. */
+static bool
+ctrc_page_cache_current(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work, const RfPageCtrcAuthorityV1 *authority,
+	const ClusterSpaceIdentity *space, BlockNumber blockno, const RfPageVersionV1 *before,
+	bool require_page)
+{
+	struct ClusterWalInputsV1 *scope;
+	RfPageIdentityV1 identity = {0};
+
+	if (!cluster_enabled || !cluster_shared_config || !IsUnderPostmaster
+		|| MyBackendType != B_STARTUP || MyProcPid <= 0 || CritSectionCount != 0
+		|| ShutdownRequestPending || RecoveryInProgress() || NBuffers <= 0
+		|| BufferDescriptors == NULL || ClusterPcmOwnArray == NULL
+		|| start == NULL || work == NULL || authority == NULL || space == NULL || before == NULL
+		|| blockno == InvalidBlockNumber || space->state != CLUSTER_SPACE_IDENTITY_LIVE
+		|| !rf_page_version_present_v1(before)
+		|| memcmp(space->incarnation, before->segment_incarnation, 16) != 0
+		|| !ClusterColdRecoveryCtrcWorkCurrent(start, work))
+		return false;
+	scope = ClusterColdRecoveryCtrcScope(start, work);
+	if (scope == NULL) return false;
+	identity.system_identifier = space->key.system_identifier;
+	memcpy(identity.storage_uuid, space->key.storage_uuid, sizeof(identity.storage_uuid));
+	identity.locator = space->key.locator;
+	identity.forknum = MAIN_FORKNUM; identity.blockno = blockno;
+	return rf_page_identity_valid_v1(&identity) && (!require_page
+		|| (rf_page_authority_ctrc_replays_scope_nowait_v1(authority, scope)
+			&& rf_page_authority_ctrc_replays_covers_nowait_v1(authority, &identity, before)));
+}
+
+ClusterCtrcPageCacheResultV1
+cluster_bufmgr_ctrc_page_cache_v1(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work, const RfPageCtrcAuthorityV1 *authority,
+	const ClusterSpaceIdentity *space, BlockNumber blockno, const RfPageVersionV1 *before,
+	const char *before_image)
+{
+	BufferTag tag;
+	uint32 hash, state;
+	LWLock *partition;
+	BufferDesc *buf;
+	ClusterPcmOwnSnapshot own;
+	ClusterPageWalRefV1 first;
+	ClusterPageWalFirstResultV1 first_result;
+	ClusterCtrcPageCacheResultV1 result = CLUSTER_CTRC_PAGE_CACHE_WAIT;
+	int id;
+	const char *page;
+	const Size checksum = offsetof(PageHeaderData, pd_checksum);
+
+	if (!ctrc_page_cache_current(start, work, authority, space, blockno, before,
+			before_image != NULL))
+		return CLUSTER_CTRC_PAGE_CACHE_REFUSED;
+	InitBufferTag(&tag, &space->key.locator, MAIN_FORKNUM, blockno);
+	hash = BufTableHashCode(&tag); partition = BufMappingPartitionLock(hash);
+	if (!LWLockConditionalAcquire(partition, LW_EXCLUSIVE))
+		return CLUSTER_CTRC_PAGE_CACHE_WAIT;
+	id = BufTableLookup(&tag, hash);
+	if (id < 0) {
+		result = CLUSTER_CTRC_PAGE_CACHE_ABSENT;
+		LWLockRelease(partition);
+	} else if (id >= NBuffers) {
+		result = CLUSTER_CTRC_PAGE_CACHE_REFUSED;
+		LWLockRelease(partition);
+	} else {
+		buf = GetBufferDescriptor(id); state = LockBufHdr(buf);
+		if (buf->buf_id != id || !BufferTagsEqual(&buf->tag, &tag)
+			|| (state & BM_TAG_VALID) == 0 || (state & BM_IO_ERROR) != 0) {
+			result = CLUSTER_CTRC_PAGE_CACHE_REFUSED;
+			goto unchanged;
+		}
+		/* Observation cannot erase a concurrent residency, including in the
+		 * original WAL gap or after an insertion has already begun. */
+		if (before_image == NULL) goto unchanged;
+		if (BUF_STATE_GET_REFCOUNT(state) != 0
+			|| (state & (BM_VALID | BM_PERMANENT)) != (BM_VALID | BM_PERMANENT)
+			|| (state & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED
+				| BM_IO_IN_PROGRESS | BM_PIN_COUNT_WAITER)) != 0)
+			goto unchanged;
+		cluster_pcm_own_snapshot_locked(buf, &own);
+		if (own.generation == UINT64_MAX || own.reservation_token == UINT64_MAX
+			|| cluster_pcm_own_classify_live_flags(own.flags, own.reservation_token)
+				== CLUSTER_PCM_OWN_CORRUPT) {
+			result = CLUSTER_CTRC_PAGE_CACHE_REFUSED;
+			goto unchanged;
+		}
+		/* Never turn an E1 cache cleanup into a PCM/PI/CR release. */
+		if (own.pcm_state != PCM_STATE_N || own.flags != 0
+			|| own.writer_activation_token != 0 || own.resource_x_activation_generation != 0
+			|| cluster_pcm_own_delivery_attempt_get(id) != 0
+			|| buf->buffer_type != BUF_TYPE_CURRENT || buf->pi_flags != 0
+			|| buf->pi_buf_id != INVALID_BUFFER_ID || buf->cr_chain_head != INVALID_BUFFER_ID
+			|| buf->cr_chain_next != INVALID_BUFFER_ID || buf->cf_state != CF_STATE_NONE
+			|| buf->cf_request_count != 0)
+			goto unchanged;
+		first_result = cluster_page_wal_first_observe_locked_v1(buf, &first);
+		if (first_result != CLUSTER_PAGE_WAL_FIRST_ABSENT) {
+			if (first_result == CLUSTER_PAGE_WAL_FIRST_INVALID)
+				result = CLUSTER_CTRC_PAGE_CACHE_REFUSED;
+			goto unchanged;
+		}
+		/* Zero pins under the same mapping/header locks excludes content
+		 * users. Only the storage checksum may differ from the read image. */
+		page = (const char *)BufHdrGetBlock(buf);
+		if (PageIsNew((Page)before_image)
+			|| ((PageHeader)before_image)->pd_block_scn != before->mutation_token
+			|| memcmp(page, before_image, checksum) != 0
+			|| memcmp(page + checksum + sizeof(uint16),
+				before_image + checksum + sizeof(uint16), BLCKSZ - checksum - sizeof(uint16)) != 0) {
+			result = CLUSTER_CTRC_PAGE_CACHE_REFUSED;
+			goto unchanged;
+		}
+		/* The original commit owns tuple generation, attribution cleanup,
+		 * mapping removal and freelist publication; it releases both locks. */
+		if (InvalidateBufferCommitLocked(buf, &tag, hash, partition, state))
+			result = CLUSTER_CTRC_PAGE_CACHE_ABSENT;
+		goto revalidate;
+unchanged:
+		UnlockBufHdr(buf, state); LWLockRelease(partition);
+	}
+revalidate:
+	return ctrc_page_cache_current(start, work, authority, space, blockno, before,
+		before_image != NULL) ? result : CLUSTER_CTRC_PAGE_CACHE_REFUSED;
+}
+#endif
 
 /*
  * InvalidateBufferTry -- bounded, non-waiting variant of InvalidateBuffer
