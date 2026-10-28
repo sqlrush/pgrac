@@ -2,6 +2,7 @@
 # Author: SqlRush <sqlrush@gmail.com>
 test_pgrac_shared_config = shared_module('test_pgrac_shared_config',
   files('test_pgrac_shared_config.c',
+        'test_pgrac_m2_pause.c', 'test_pgrac_m2_pause_state.c',
         'test_pgrac_wal_history_native.c',
         'test_pgrac_storage_sync.c'),
   kwargs: pg_test_mod_args,

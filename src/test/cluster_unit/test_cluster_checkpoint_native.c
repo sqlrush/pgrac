@@ -34,6 +34,7 @@
 #include "cluster/cluster_recovery_plan.h"
 #include "storage/fd.h"
 #include "storage/lwlock.h"
+#include "storage/proc.h"
 #include "utils/wait_event.h"
 #include "utils/timestamp.h"
 #include "port/pg_crc32c.h"
@@ -49,6 +50,7 @@ bool cluster_shared_config = true, cluster_enabled = true;
 bool cluster_shared_catalog = true, cluster_xid_striping = true;
 bool enableFsync = true;
 bool cluster_controlfile_shared_authority = true;
+bool cluster_trace_control_config = false;
 char *DataDir = "/unused-native-adapter";
 AuxProcType MyAuxProcType = CheckpointerProcess;
 volatile uint32 CritSectionCount;
@@ -61,6 +63,8 @@ static sigjmp_buf error_boundary;
 static ControlFileData current, selected, candidate;
 static XLogRecPtr expected_control_checkpoint;
 static ControlFileData *ControlFile = &current;
+static PGPROC trace_proc;
+PGPROC *MyProc = &trace_proc;
 static ClusterWalSourceRef ref;
 static LWLockPadded locks[NUM_INDIVIDUAL_LWLOCKS];
 LWLockPadded *MainLWLockArray = locks;
@@ -113,6 +117,8 @@ static unsigned wait_log_count, budget_charges, exhaust_after_charge;
 static int native_sqlstate;
 static int native_report_level;
 static char wait_detail[768];
+static char precondition_detail[2048];
+static unsigned precondition_details;
 static LOCKMODE retiring_mode;
 
 static void
@@ -326,6 +332,12 @@ errdetail(const char *f, ...)
 		va_start(args, f);
 		vsnprintf(wait_detail, sizeof(wait_detail), f, args);
 		va_end(args);
+	} else if (native_report_level == FATAL) {
+		va_list args;
+		va_start(args, f);
+		vsnprintf(precondition_detail, sizeof(precondition_detail), f, args);
+		va_end(args);
+		++precondition_details;
 	}
 	return 0;
 }
@@ -890,6 +902,11 @@ native_candidate(bool shutdown)
 static void
 reset_fixture(void)
 {
+	ControlFile = &current;
+	MyProc = &trace_proc;
+	cluster_trace_control_config = false;
+	precondition_details = 0;
+	precondition_detail[0] = '\0';
 	memset(&cf_attempt, 0, sizeof(cf_attempt));
 	retirement_polls = retire_remaining = direct_wait_slices = writer_wait_step = 0;
 	required_retire_polls = 3;
@@ -3074,6 +3091,189 @@ UT_TEST(native_empty_input_requires_the_original_bound_initializer)
 	cluster_shared_catalog = cluster_xid_striping = true;
 }
 
+static XLogRecPtr
+writer_bind_input(const EndOfWalRecoveryInfo *end)
+{
+	if (sigsetjmp(error_boundary, 1))
+		return InvalidXLogRecPtr;
+	return ClusterStartupWriterBegin(end);
+}
+
+UT_TEST(writer_begin_precondition_detail_is_opt_in_and_never_grants)
+{
+	for (unsigned trace = 0; trace < 2; ++trace) {
+		unsigned before;
+
+		writer_begin_fixture();
+		UT_ASSERT(startup_first_native_site());
+		cluster_trace_control_config = trace != 0;
+		local_lock = true;
+		before = retirement_polls;
+		UT_ASSERT_EQ(writer_bind(), InvalidXLogRecPtr);
+		UT_ASSERT_EQ(native_error_level, FATAL);
+		UT_ASSERT_EQ(native_sqlstate, ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE);
+		UT_ASSERT_EQ(precondition_details, trace);
+		UT_ASSERT_EQ(precondition_detail[0] != '\0', trace != 0);
+		if (trace != 0)
+			UT_ASSERT(
+				strstr(precondition_detail, "first_failed=16 first_failed_name=native_cf_lock")
+				!= NULL);
+		UT_ASSERT(local_lock && clusterStartupWriterSelected && !clusterStartupWriterBound);
+		UT_ASSERT_EQ(retirement_polls, before);
+		UT_ASSERT_EQ(route_calls | bind_calls | native_writes | local_updates, 0);
+	}
+	writer_begin_fixture();
+	cluster_trace_control_config = true;
+	UT_ASSERT_EQ(writer_begin(), wal_segment_size);
+	UT_ASSERT_EQ(precondition_details, 0);
+}
+
+UT_TEST(writer_begin_precondition_detail_names_all_original_predicates)
+{
+	static const char *const names[]
+		= { "input_null",		"backend_type",			"shared_config",	"enabled",
+			"shared_authority", "writer_bound",			"writer_installed", "critical_section",
+			"shutdown",			"archive_recovery",		"standby_signal",	"recovery_signal",
+			"aborted_record",	"missing_continuation", "control_state",	"native_cf_lock",
+			"cf_s_retained",	"cf_x_retained" };
+
+	for (unsigned fault = 0; fault < lengthof(names); ++fault) {
+		ControlFileData before_control;
+		ClusterWalStartupImage before_writer;
+		unsigned before_polls, before_advances;
+
+		writer_begin_fixture();
+		UT_ASSERT(startup_first_native_site());
+		cluster_trace_control_config = true;
+		switch (fault) {
+		case 0:
+			break; /* The actual call receives NULL below. */
+		case 1:
+			MyBackendType = B_CHECKPOINTER;
+			break;
+		case 2:
+			cluster_shared_config = false;
+			break;
+		case 3:
+			cluster_enabled = false;
+			break;
+		case 4:
+			cluster_controlfile_shared_authority = false;
+			break;
+		case 5:
+			clusterStartupWriterBound = true;
+			break;
+		case 6:
+			clusterStartupWriterInstalled = true;
+			break;
+		case 7:
+			CritSectionCount = 1;
+			break;
+		case 8:
+			ShutdownRequestPending = true;
+			break;
+		case 9:
+			ArchiveRecoveryRequested = true;
+			break;
+		case 10:
+			input.standby_signal_file_found = true;
+			break;
+		case 11:
+			input.recovery_signal_file_found = true;
+			break;
+		case 12:
+			input.abortedRecPtr = 1;
+			break;
+		case 13:
+			input.missingContrecPtr = 1;
+			break;
+		case 14:
+			current.state = DB_IN_PRODUCTION;
+			break;
+		case 15:
+			local_lock = true;
+			break;
+		case 16:
+			cf_mode = ShareLock;
+			break;
+		case 17:
+			cf_mode = ExclusiveLock;
+			break;
+		}
+		before_control = current;
+		before_writer = clusterStartupWriter;
+		before_polls = retirement_polls;
+		before_advances = advance_calls;
+		UT_ASSERT_EQ(writer_bind_input(fault == 0 ? NULL : &input), InvalidXLogRecPtr);
+		UT_ASSERT_EQ(native_error_level, FATAL);
+		UT_ASSERT_EQ(native_sqlstate, ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE);
+		UT_ASSERT_EQ(precondition_details, 1);
+		UT_ASSERT(strstr(precondition_detail, "operation=writer_begin_precondition") != NULL);
+		UT_ASSERT(strstr(precondition_detail, "observation=POST_REFUSAL") != NULL);
+		{
+			char expected[96];
+
+			snprintf(expected, sizeof(expected), "first_failed=%u first_failed_name=%s", fault + 1,
+					 names[fault]);
+			UT_ASSERT(strstr(precondition_detail, expected) != NULL);
+		}
+		for (unsigned predicate = 0; predicate < lengthof(names); ++predicate) {
+			char expected[96];
+			int failed = fault == predicate;
+
+			if (fault == 0 && predicate >= 10 && predicate <= 13)
+				failed = -1; /* No fields are read through an absent input. */
+			snprintf(expected, sizeof(expected), "failed_%s=%d", names[predicate], failed);
+			UT_ASSERT(strstr(precondition_detail, expected) != NULL);
+		}
+		UT_ASSERT_EQ(memcmp(&current, &before_control, sizeof(current)), 0);
+		UT_ASSERT_EQ(memcmp(&clusterStartupWriter, &before_writer, sizeof(before_writer)), 0);
+		UT_ASSERT_EQ(retirement_polls, before_polls);
+		UT_ASSERT_EQ(advance_calls, before_advances);
+		UT_ASSERT_EQ(route_calls | bind_calls | native_writes | local_updates, 0);
+	}
+}
+
+UT_TEST(writer_begin_precondition_detail_keeps_unknowns_and_retained_owner)
+{
+	writer_begin_fixture();
+	cluster_trace_control_config = true;
+	ControlFile = NULL;
+	MyProc = NULL;
+	UT_ASSERT_EQ(writer_bind_input(NULL), InvalidXLogRecPtr);
+	UT_ASSERT_EQ(precondition_details, 1);
+	UT_ASSERT(strstr(precondition_detail, "failed_input_null=1") != NULL);
+	UT_ASSERT(strstr(precondition_detail, "first_failed=1 first_failed_name=input_null") != NULL);
+	UT_ASSERT(strstr(precondition_detail, "failed_control_state=-1") != NULL);
+	UT_ASSERT(strstr(precondition_detail, "failed_native_cf_lock=-1") != NULL);
+
+	for (unsigned exclusive = 0; exclusive < 2; ++exclusive) {
+		ClusterCfAttemptObservation before;
+		unsigned polls;
+		LOCKMODE mode = exclusive ? ExclusiveLock : ShareLock;
+
+		writer_begin_fixture();
+		UT_ASSERT(startup_first_native_site());
+		cluster_trace_control_config = true;
+		fixture_wait_slice(mode);
+		before = cf_attempt;
+		polls = retirement_polls;
+		UT_ASSERT_EQ(writer_bind(), InvalidXLogRecPtr);
+		UT_ASSERT_EQ(native_error_level, FATAL);
+		UT_ASSERT_EQ(native_sqlstate, ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE);
+		UT_ASSERT_EQ(precondition_details, 1);
+		UT_ASSERT(strstr(precondition_detail,
+						 exclusive ? "failed_cf_x_retained=1" : "failed_cf_s_retained=1")
+				  != NULL);
+		UT_ASSERT(strstr(precondition_detail, "selected=1") != NULL);
+		UT_ASSERT_EQ(retiring_mode, mode);
+		UT_ASSERT_EQ(memcmp(&before, &cf_attempt, sizeof(before)), 0);
+		UT_ASSERT_EQ(retirement_polls, polls);
+		UT_ASSERT_EQ(route_calls | bind_calls | native_writes | local_updates, 0);
+	}
+	reset_fixture();
+}
+
 int
 main(void)
 {
@@ -3102,7 +3302,7 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(85);
+	UT_PLAN(88);
 	UT_RUN(recovery_checkpoint_selects_scope_only_for_closed_online_owner);
 	UT_RUN(recovery_checkpoint_closed_admission_uses_only_original_scope);
 	UT_RUN(recovery_checkpoint_window_and_scope_reach_the_same_publisher);
@@ -3189,6 +3389,9 @@ main(void)
 	UT_RUN(native_startup_insert_has_no_link_or_page_from_predecessor);
 	UT_RUN(native_first_record_has_zero_xl_prev_only_for_bound_successor);
 	UT_RUN(native_startup_flush_requires_bound_owner_and_exact_timeline);
+	UT_RUN(writer_begin_precondition_detail_is_opt_in_and_never_grants);
+	UT_RUN(writer_begin_precondition_detail_names_all_original_predicates);
+	UT_RUN(writer_begin_precondition_detail_keeps_unknowns_and_retained_owner);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

@@ -7,6 +7,7 @@
  */
 #include "postgres.h"
 #include "cluster/cluster_content_trace.h"
+#include "cluster/cluster_block_io_trace.h"
 
 #include <setjmp.h>
 #include <sys/mman.h>
@@ -173,6 +174,9 @@ bool cluster_online_join = true;
 int cluster_lms_workers = 4;
 ClusterConf *ClusterConfShmem = NULL;
 bool cluster_smart_fusion = false;
+int MyProcPid = 1;
+TimestampTz MyStartTimestamp = 1;
+bool cluster_trace_gcs_capacity = false;
 BackendId MyBackendId = 1;
 BackendType MyBackendType = B_BACKEND;
 PGPROC *MyProc = NULL;
@@ -2290,6 +2294,21 @@ cluster_runtime_visibility_origin_plan_freeze_data_held(
 	return CLUSTER_RUNTIME_VISIBILITY_ORIGIN_COMPLETE;
 }
 
+ClusterRuntimeVisibilityOriginStep
+cluster_runtime_visibility_origin_plan_freeze_data_observed_held(
+	const ClusterTxLocator *locator, ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission,
+	const ClusterUndoBlock0Generation *expected_generation, ClusterUndoBlock0CurrentGuard *guard,
+	const ClusterUndoBlock0ResolvedRoot *root, ClusterRuntimeVisibilityOriginPlan *plan,
+	ClusterTxResolution *out, ClusterTxResolveReason *reason_out,
+	ClusterRuntimeVisibilityDataDiagnostic *diagnostic)
+{
+	if (diagnostic != NULL)
+		memset(diagnostic, 0, sizeof(*diagnostic));
+	return cluster_runtime_visibility_origin_plan_freeze_data_held(
+		locator, mode, admission, expected_generation, guard, root, plan, out, reason_out);
+}
+
 bool
 cluster_runtime_visibility_origin_plan_canonical_logical(
 	const ClusterRuntimeVisibilityOriginPlan *plan, ClusterUndoBlock0LogicalKey *logical_out)
@@ -2443,6 +2462,71 @@ cluster_sf_peer_capability_family_sample(int32 peer_id, uint32 required_bits, ui
 		*optional_out = true;
 	*generation_out = route_test_capability_generation(peer_id);
 	return *generation_out != 0;
+}
+
+/* Current native GCS dependencies for this original legacy-read fixture.
+ * Identity/capability samples reuse the fixture's existing fixed peer view.
+ * No first-fill service, membership or outbound-capacity runtime is modeled. */
+void
+ConditionVariableBroadcast(ConditionVariable *cv pg_attribute_unused())
+{}
+
+void
+cluster_pcm_lock_check_shutdown_wait(void)
+{
+	CHECK_FOR_INTERRUPTS();
+}
+
+void
+cluster_content_trace_gcs_capacity(const ClusterContentTraceGcsCapacity *cut pg_attribute_unused())
+{
+	/* The fixture keeps the existing capacity diagnostic disabled. */
+	if (cluster_trace_gcs_capacity)
+		abort();
+}
+
+void
+cluster_block_io_trace_failed(BufferTag tag pg_attribute_unused(),
+	const char *bytes pg_attribute_unused(), const char *source pg_attribute_unused(),
+	uint32 expected pg_attribute_unused(), uint32 calculated pg_attribute_unused())
+{}
+
+void
+cluster_block_io_trace_source(const ClusterPcmReadSource *source pg_attribute_unused(),
+	const char *phase pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+cluster_lms_outbound_wait_capacity(int worker pg_attribute_unused(),
+	uint64 epoch pg_attribute_unused())
+{
+	abort();
+}
+
+ClusterMembershipState
+cluster_membership_get_state(int32 node pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+cluster_reconfig_get_observed_fresh_alive(int32 node)
+{
+	uint64 incarnation, generation;
+	return node >= 0 && node < CLUSTER_MAX_NODES
+		&& cluster_reconfig_get_observed_slot(node, &incarnation, &generation)
+		&& incarnation != 0 && generation != 0;
+}
+
+bool
+cluster_sf_peer_pcm_x_connection_generation(int32 node, uint32 *generation)
+{
+	if (generation == NULL)
+		return false;
+	*generation = route_test_capability_generation(node);
+	return *generation != 0;
 }
 
 bool
@@ -5246,7 +5330,7 @@ UT_TEST(test_shared_acquire_error_retires_only_its_quiescent_n_reservation)
 		if (sigsetjmp(jump, 1) == 0) {
 			PG_exception_stack = &jump;
 			granted = cluster_bufmgr_pcm_acquire_shared_owned(&capacity_buffer, &base, token,
-															  &retry_denied);
+															  &retry_denied, NULL);
 		} else
 			caught = true;
 		PG_exception_stack = saved_stack;

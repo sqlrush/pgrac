@@ -89,6 +89,7 @@ static ClusterTxOutcome test_resolve_outcomes[16];
 static ClusterTxResolveReason test_resolve_reasons[16];
 static int test_resolve_count;
 static int test_resolve_pos;
+static int test_resolve_epoch_change_at;
 static uint64 test_epochs[16];
 static int test_epoch_count;
 static int test_epoch_pos;
@@ -170,6 +171,11 @@ cluster_buffer_trace_tx_wait(ClusterWaitTraceSite site, uint64 wait_seq,
 	test_resource_trace_seq = wait_seq;
 	test_resource_trace_xid = tx_xid;
 }
+
+/* Content-owner diagnostics are outside this standalone wait fixture. */
+void
+cluster_content_trace_wait_clear(ClusterContentTraceWait kind pg_attribute_unused())
+{}
 
 PGPROC *MyProc;
 PROC_HDR *ProcGlobal;
@@ -314,6 +320,12 @@ cluster_tx_resolve_exact(const ClusterTxLocator *locator pg_attribute_unused(),
 	UT_ASSERT_EQ((int)mode, (int)CLUSTER_TX_RESOLVE_ROW_WAIT);
 	UT_ASSERT(test_resolve_count > 0);
 	pos = test_resolve_pos < test_resolve_count ? test_resolve_pos++ : test_resolve_count - 1;
+	if (pos + 1 == test_resolve_epoch_change_at) {
+		test_epochs[0] = TEST_EPOCH + 1;
+		test_epoch_count = 1;
+		test_epoch_pos = 0;
+		test_resolve_epoch_change_at = 0;
+	}
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
 	if (reason_out != NULL)
@@ -614,6 +626,7 @@ reset_fixture(void)
 	memset(test_resolve_reasons, 0, sizeof(test_resolve_reasons));
 	test_resolve_count = 0;
 	test_resolve_pos = 0;
+	test_resolve_epoch_change_at = 0;
 	memset(test_epochs, 0, sizeof(test_epochs));
 	test_epochs[0] = TEST_EPOCH;
 	test_epoch_count = 1;
@@ -910,6 +923,119 @@ UT_TEST(test_formation_drift_cleans_registered_state)
 	UT_ASSERT_EQ(test_wait_clear_calls, 1);
 	UT_ASSERT_EQ(test_wfg_cancel_calls, 0);
 	UT_ASSERT_EQ(test_wfg_exact_cancel_calls, 1);
+	assert_slot_clean();
+}
+
+/* Removing the post-resolve epoch fence must not expose a returned outcome. */
+UT_TEST(test_terminal_return_after_epoch_change_stays_unprovable)
+{
+	const ClusterTxOutcome outcomes[] = { CLUSTER_TX_COMMITTED, CLUSTER_TX_ABORTED };
+	const int budgets[] = { 1000, -1 };
+
+	for (int i = 0; i < lengthof(outcomes); i++) {
+		for (int j = 0; j < lengthof(budgets); j++) {
+			ClusterTxLocator locator = test_locator();
+			ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+
+			reset_fixture();
+			script_resolve(0, CLUSTER_TX_IN_PROGRESS, CLUSTER_TX_RESOLVE_NONE);
+			script_resolve(1, outcomes[i], CLUSTER_TX_RESOLVE_NONE);
+			test_resolve_epoch_change_at = 2;
+			UT_ASSERT_EQ(cluster_tx_enqueue_wait_exact(&locator, budgets[j], &reason),
+						 CLUSTER_TXW_UNPROVABLE);
+			UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_RF_DEFERRED);
+			UT_ASSERT_EQ(test_resolve_pos, 2);
+			UT_ASSERT_EQ(test_wait_clear_calls, 1);
+			UT_ASSERT_EQ(test_wfg_exact_cancel_calls, 1);
+			UT_ASSERT_EQ(test_wfg_last_remove_result, CLUSTER_LMD_GRAPH_REMOVE_REMOVED);
+			UT_ASSERT_EQ(test_wfg_waiter.cluster_epoch, TEST_EPOCH);
+			UT_ASSERT_EQ(test_wait_read_result, CLUSTER_LMD_WAIT_STATE_READ_INACTIVE);
+			UT_ASSERT_EQ(test_wait_latch_calls, 0);
+			UT_ASSERT_EQ(pg_atomic_read_u64(&ClusterTxw->timeout_count), 0);
+			assert_slot_clean();
+		}
+	}
+}
+
+UT_TEST(test_epoch_change_during_resolve_precedes_reply_reason)
+{
+	const ClusterTxOutcome outcomes[]
+		= { CLUSTER_TX_IN_PROGRESS, CLUSTER_TX_PREPARED, CLUSTER_TX_UNKNOWN };
+
+	for (int i = 0; i < lengthof(outcomes); i++) {
+		ClusterTxLocator locator = test_locator();
+		ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+
+		reset_fixture();
+		test_scripted_clock = true;
+		script_resolve(0, CLUSTER_TX_IN_PROGRESS, CLUSTER_TX_RESOLVE_NONE);
+		script_resolve(1, outcomes[i],
+					   outcomes[i] == CLUSTER_TX_UNKNOWN ? CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE
+														 : CLUSTER_TX_RESOLVE_NONE);
+		test_resolve_epoch_change_at = 2;
+		UT_ASSERT_EQ(cluster_tx_enqueue_wait_exact(&locator, 1, &reason), CLUSTER_TXW_UNPROVABLE);
+		UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_RF_DEFERRED);
+		UT_ASSERT_EQ(test_resolve_pos, 2);
+		UT_ASSERT_EQ(test_wait_latch_calls, 0);
+		UT_ASSERT_EQ(test_wfg_exact_cancel_calls, 1);
+		UT_ASSERT_EQ(test_wait_clear_calls, 1);
+		UT_ASSERT_EQ(test_wait_read_result, CLUSTER_LMD_WAIT_STATE_READ_INACTIVE);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&ClusterTxw->timeout_count), 0);
+		assert_slot_clean();
+	}
+}
+
+UT_TEST(test_epoch_refusal_allows_reentry_without_clearing_peer_slot)
+{
+	ClusterTxLocator locator = test_locator();
+	ClusterTxLocator peer_locator = locator;
+	ClusterTxwWaitSlot peer_before;
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+	uint64 old_wait_seq;
+
+	reset_fixture();
+	cluster_trace_tx_identity = true;
+	peer_locator.xid = 1200;
+	memcpy(ClusterTxw->slots[1].identity.target_locator_words, &peer_locator, sizeof(peer_locator));
+	ClusterTxw->slots[1].waiting = CLUSTER_TXW_SLOT_TARGET;
+	pg_atomic_write_u32(&ClusterTxw->active_waiters, 1);
+	peer_before = ClusterTxw->slots[1];
+	script_resolve(0, CLUSTER_TX_IN_PROGRESS, CLUSTER_TX_RESOLVE_NONE);
+	script_resolve(1, CLUSTER_TX_COMMITTED, CLUSTER_TX_RESOLVE_NONE);
+	test_resolve_epoch_change_at = 2;
+	UT_ASSERT_EQ(cluster_tx_enqueue_wait_exact(&locator, 1000, &reason), CLUSTER_TXW_UNPROVABLE);
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_RF_DEFERRED);
+	UT_ASSERT_EQ(test_trace_count, 2);
+	UT_ASSERT_EQ(test_trace_rows[1].status, CLUSTER_TXW_UNPROVABLE);
+	UT_ASSERT_EQ(test_wfg_waiter.cluster_epoch, TEST_EPOCH);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&ClusterTxw->active_waiters), 1);
+	UT_ASSERT_EQ(memcmp(&ClusterTxw->slots[1], &peer_before, sizeof(peer_before)), 0);
+	old_wait_seq = test_wfg_waiter.wait_seq;
+
+	/* The backend and its real wait-state sequence survive into a new wait. */
+	test_epochs[0] = TEST_EPOCH + 1;
+	test_epoch_count = 1;
+	test_epoch_pos = 0;
+	locator.xid = 901;
+	locator.tt_wrap = 6;
+	script_resolve(2, CLUSTER_TX_IN_PROGRESS, CLUSTER_TX_RESOLVE_NONE);
+	script_resolve(3, CLUSTER_TX_ABORTED, CLUSTER_TX_RESOLVE_NONE);
+	UT_ASSERT_EQ(cluster_tx_enqueue_wait_exact(&locator, 1000, &reason), CLUSTER_TXW_RESOLVED);
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_NONE);
+	UT_ASSERT_EQ(test_trace_count, 4);
+	UT_ASSERT_EQ(test_trace_rows[2].xid, 901);
+	UT_ASSERT_EQ(test_trace_rows[2].itl_wrap, 6);
+	UT_ASSERT_EQ(test_trace_rows[3].status, CLUSTER_TXW_RESOLVED);
+	UT_ASSERT_EQ(test_wfg_waiter.cluster_epoch, TEST_EPOCH + 1);
+	UT_ASSERT(test_wfg_waiter.wait_seq > old_wait_seq);
+	UT_ASSERT_EQ(test_wfg_exact_cancel_calls, 2);
+	UT_ASSERT_EQ(test_wait_clear_calls, 2);
+	UT_ASSERT_EQ(memcmp(test_cleanup_events, "GWGW", 4), 0);
+	UT_ASSERT_EQ(test_wait_read_result, CLUSTER_LMD_WAIT_STATE_READ_INACTIVE);
+	UT_ASSERT_EQ(ClusterTxw->slots[0].waiting, CLUSTER_TXW_SLOT_FREE);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&ClusterTxw->active_waiters), 1);
+	UT_ASSERT_EQ(memcmp(&ClusterTxw->slots[1], &peer_before, sizeof(peer_before)), 0);
+	txw_slot_clear(1, CLUSTER_TXW_SLOT_TARGET);
 	assert_slot_clean();
 }
 
@@ -1818,7 +1944,7 @@ UT_TEST(test_wait_snapshot_unavailable_and_invalid_are_not_empty)
 int
 main(void)
 {
-	UT_PLAN(47);
+	UT_PLAN(50);
 	UT_RUN(test_wait_snapshot_copies_real_source_and_target_without_mutation);
 	UT_RUN(test_wait_snapshot_truncation_is_not_empty);
 	UT_RUN(test_wait_snapshot_unavailable_and_invalid_are_not_empty);
@@ -1830,6 +1956,9 @@ main(void)
 	UT_RUN(test_prepared_waits_and_lost_wakes_only_repoll);
 	UT_RUN(test_unknown_fails_before_registration_with_exact_reason);
 	UT_RUN(test_formation_drift_cleans_registered_state);
+	UT_RUN(test_terminal_return_after_epoch_change_stays_unprovable);
+	UT_RUN(test_epoch_change_during_resolve_precedes_reply_reason);
+	UT_RUN(test_epoch_refusal_allows_reentry_without_clearing_peer_slot);
 	UT_RUN(test_zero_epoch_is_a_valid_stable_formation);
 	UT_RUN(test_zero_to_nonzero_epoch_drift_fails_closed);
 	UT_RUN(test_monotonic_timeout_uses_only_timeout_counter);

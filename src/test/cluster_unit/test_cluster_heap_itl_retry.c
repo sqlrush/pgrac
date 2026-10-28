@@ -38,7 +38,16 @@ static int pins[5];
 static bool heap_locked[3];
 static int wait_calls, key_frees, heap_relocks, recent_calls;
 static int vm_pins_during_wait, vm_pins_at_relock;
-static int retry_fault, recent_misses;
+typedef enum RetryFault {
+	RETRY_FAULT_NONE,
+	RETRY_FAULT_MODIFIER,
+	RETRY_FAULT_BINDING,
+	RETRY_FAULT_CANCEL,
+	RETRY_FAULT_ADMISSION
+} RetryFault;
+
+static RetryFault retry_fault;
+static int recent_misses;
 static ClusterTxwResult wake_result;
 static bool pair_case;
 static uint64 expected_capacity_deadline;
@@ -183,11 +192,30 @@ cluster_heap_itl_wait_capacity_after_census(Buffer old_buffer, Buffer new_buffer
 	PageSetLSN(page, 200);
 	((PageHeader)page)->pd_block_scn = 200;
 	receipt_clock_us = 101; /* READY's prepare deadline was 100. */
-	if (retry_fault == 1)
+	if (retry_fault == RETRY_FAULT_MODIFIER)
 		receipt_modifier_valid = false;
-	if (retry_fault == 2)
+	if (retry_fault == RETRY_FAULT_BINDING)
 		retry_binding->slot_offset += sizeof(TTSlot);
-	*reason = "ITL_FRESH_REQUALIFY";
+	if (retry_fault == RETRY_FAULT_CANCEL || retry_fault == RETRY_FAULT_ADMISSION)
+		ereport(ERROR,
+				(errcode(retry_fault == RETRY_FAULT_CANCEL ? ERRCODE_QUERY_CANCELED
+														   : ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+				 errmsg("scripted capacity-wait interruption")));
+	switch (wake_result) {
+	case CLUSTER_TXW_RESOLVED:
+	case CLUSTER_TXW_RETRY:
+		*reason = "ITL_FRESH_REQUALIFY";
+		break;
+	case CLUSTER_TXW_TIMEOUT:
+		*reason = "ITL_CAPACITY_WAIT_EXPIRED";
+		break;
+	case CLUSTER_TXW_DEADLOCK:
+		*reason = "ITL_WAIT_DEADLOCK";
+		break;
+	default:
+		*reason = "ITL_BLOCKER_UNPROVABLE";
+		break;
+	}
 	return wake_result;
 }
 
@@ -217,27 +245,33 @@ typedef struct RetryObservation {
 	uint64 deadline;
 } RetryObservation;
 
+/* Error exits inspect these fields after longjmp. Automatic nonvolatile
+ * locals changed by the real consumer would have indeterminate values. */
+typedef struct RetryOwner {
+	ClusterUndoRecordPrepareReceipt receipt;
+	PGAlignedBlock image;
+	Buffer old_vm;
+	Buffer new_vm;
+	uint64 capacity_deadline;
+	HeapTuple old_key;
+	bool key_copied;
+} RetryOwner;
+
 static RetryObservation
-run_retry(bool pair, bool temporary_lock, int vm_kind, int fault, ClusterTxwResult result,
+run_retry(bool pair, bool temporary_lock, int vm_kind, RetryFault fault, ClusterTxwResult result,
 		  ClusterUndoRecordPrepareReceipt *final_receipt)
 {
-	PGAlignedBlock image;
 	ClusterCtrcTargetV1 pending;
-	ClusterUndoRecordPrepareReceipt *retry_receipt = palloc(sizeof(*retry_receipt));
+	RetryOwner *const retry_owner = palloc(sizeof(*retry_owner));
 	ClusterCanonicalTxnBinding canonical_binding = { 0 };
 	Relation relation = (Relation)1;
 	Buffer buffer = 1, newbuf = pair ? 2 : 1;
 	Buffer itl_capacity_wait_buffer = pair ? 2 : 1;
-	Buffer vmbuffer = vm_kind ? 3 : InvalidBuffer;
-	Buffer vmbuffer_new = pair && vm_kind > 1 ? (vm_kind == 2 ? 3 : 4) : InvalidBuffer;
 	BlockNumber block = 44;
 	TransactionId canonical_xid = 700;
-	uint64 itl_capacity_absolute_deadline_us = 500;
 	uint64 undo_prepare_deadline_us = 100;
 	CommandId pgrac_entry_cid = 7, cid = 999;
 	bool iscombo = true, old_tuple_temp_locked = temporary_lock;
-	bool old_key_copied = true;
-	HeapTuple old_key_tuple = palloc(sizeof(HeapTupleData));
 	HeapTupleData oldtup = { 0 };
 	ItemPointerData tid;
 	ItemPointer otid = &tid;
@@ -245,7 +279,18 @@ run_retry(bool pair, bool temporary_lock, int vm_kind, int fault, ClusterTxwResu
 	Page page;
 	volatile RetryObservation observed = { 0 };
 
-#define undo_receipt (*retry_receipt)
+#define undo_receipt (retry_owner->receipt)
+#define image (retry_owner->image)
+#define vmbuffer (retry_owner->old_vm)
+#define vmbuffer_new (retry_owner->new_vm)
+#define itl_capacity_absolute_deadline_us (retry_owner->capacity_deadline)
+#define old_key_tuple (retry_owner->old_key)
+#define old_key_copied (retry_owner->key_copied)
+	vmbuffer = vm_kind ? 3 : InvalidBuffer;
+	vmbuffer_new = pair && vm_kind > 1 ? (vm_kind == 2 ? 3 : 4) : InvalidBuffer;
+	itl_capacity_absolute_deadline_us = 500;
+	old_key_tuple = palloc(sizeof(HeapTupleData));
+	old_key_copied = true;
 	/* The VM pin services below model descriptors 3/4; production page
 	 * planning only accesses the reused adapter's real heap descriptor 1. */
 	NBuffers = 4;
@@ -319,8 +364,17 @@ run_retry(bool pair, bool temporary_lock, int vm_kind, int fault, ClusterTxwResu
 	*final_receipt = undo_receipt;
 	/* No stale pre-wait final plan may authorize a write on the moved tuple. */
 	UT_ASSERT(!heap_receipt_test_plan_recheck(&undo_receipt));
-	pfree(retry_receipt);
+	/* Model the test's private allocation context after observing ownership. */
+	if (old_key_tuple != NULL)
+		pfree(old_key_tuple);
+	pfree(retry_owner);
 #undef undo_receipt
+#undef image
+#undef vmbuffer
+#undef vmbuffer_new
+#undef itl_capacity_absolute_deadline_us
+#undef old_key_tuple
+#undef old_key_copied
 	return observed;
 }
 
@@ -411,14 +465,108 @@ UT_TEST(exact_receipt_invalidation_refuses_without_renewing_or_orphaning)
 	}
 }
 
+static void
+check_wait_exit(bool pair, int vm_kind, ClusterTxwResult result, RetryFault fault, int sqlstate,
+				const char *reason)
+{
+	ClusterUndoRecordPrepareReceipt receipt;
+	RetryObservation observed;
+
+	recent_misses = 0;
+	observed = run_retry(pair, pair, vm_kind, fault, result, &receipt);
+	UT_ASSERT(observed.errored);
+	if (!observed.errored) {
+		if (heap_locked[1])
+			LockBuffer(1, BUFFER_LOCK_UNLOCK);
+		receipt_abort_after_lwlock_release();
+		return;
+	}
+	UT_ASSERT(!observed.requalified && !observed.reacquire);
+	UT_ASSERT_EQ(receipt_error_code, sqlstate);
+	if (reason != NULL) {
+		UT_ASSERT_STR_CONTAINS(receipt_error_detail, reason);
+		UT_ASSERT_STR_CONTAINS(receipt_error_detail, "deadline_us=500");
+	} else
+		UT_ASSERT_EQ(receipt_error_detail[0], '\0');
+	UT_ASSERT_EQ(wait_calls, 1);
+	UT_ASSERT_EQ(vm_pins_during_wait, 0);
+	UT_ASSERT_EQ(pins[2] + pins[3] + pins[4], 0);
+	UT_ASSERT_EQ(observed.old_vm, InvalidBuffer);
+	UT_ASSERT_EQ(observed.new_vm, InvalidBuffer);
+	UT_ASSERT(!heap_locked[1] && !heap_locked[2]);
+	UT_ASSERT_EQ(heap_relocks + recent_calls, 0);
+	UT_ASSERT(!observed.old_key_retired);
+	UT_ASSERT_EQ(key_frees, 0);
+	UT_ASSERT_EQ(observed.deadline, 500);
+	UT_ASSERT_EQ(receipt.absolute_deadline_us, 100);
+	UT_ASSERT_EQ(memcmp(&receipt, &before_wait_receipt, sizeof(receipt)), 0);
+	UT_ASSERT_EQ(memcmp(&receipt, &cluster_undo_record_reservation.receipt, sizeof(receipt)), 0);
+	UT_ASSERT(cluster_undo_record_reservation.active);
+	UT_ASSERT_EQ(receipt.ctrc_prepared_mask, 1);
+	UT_ASSERT_EQ(receipt_prepare_calls, 1);
+	UT_ASSERT_EQ(receipt_cancel_calls + receipt_unref_calls + receipt_leave_calls, 0);
+	UT_ASSERT_EQ(receipt_apply_calls + receipt_wal_calls, 0);
+
+	/* PG releases its locks before invoking this real exact receipt owner. */
+	receipt_abort_after_lwlock_release();
+	UT_ASSERT(!cluster_undo_record_reservation.active);
+	UT_ASSERT(!cluster_undo_record_reservation.consume_locked);
+	UT_ASSERT_EQ(receipt_cancel_calls, 1);
+	UT_ASSERT_EQ(receipt_unref_calls, 1);
+	UT_ASSERT_EQ(receipt_leave_calls, 1);
+	UT_ASSERT_EQ(receipt_apply_calls + receipt_wal_calls, 0);
+	UT_ASSERT_EQ(receipt_error_code, sqlstate);
+	receipt_abort_after_lwlock_release();
+	UT_ASSERT_EQ(receipt_cancel_calls + receipt_unref_calls + receipt_leave_calls, 3);
+}
+
+UT_TEST(capacity_timeout_keeps_original_sqlstate_and_abort_owner)
+{
+	for (int pair = 0; pair < 2; pair++)
+		for (int vm_kind = 0; vm_kind <= (pair ? 3 : 1); vm_kind++)
+			check_wait_exit(pair, vm_kind, CLUSTER_TXW_TIMEOUT, 0, ERRCODE_CLUSTER_GES_TIMEOUT,
+							"PGRAC_REASON=ITL_CAPACITY_WAIT_EXPIRED");
+}
+
+UT_TEST(capacity_deadlock_keeps_original_sqlstate_and_abort_owner)
+{
+	for (int pair = 0; pair < 2; pair++)
+		for (int vm_kind = 0; vm_kind <= (pair ? 3 : 1); vm_kind++)
+			check_wait_exit(pair, vm_kind, CLUSTER_TXW_DEADLOCK, 0, ERRCODE_T_R_DEADLOCK_DETECTED,
+							"PGRAC_REASON=ITL_WAIT_DEADLOCK");
+}
+
+UT_TEST(unprovable_capacity_keeps_refusal_and_abort_owner)
+{
+	for (int pair = 0; pair < 2; pair++)
+		for (int vm_kind = 0; vm_kind <= (pair ? 3 : 1); vm_kind++)
+			check_wait_exit(pair, vm_kind, CLUSTER_TXW_UNPROVABLE, 0,
+							ERRCODE_PROGRAM_LIMIT_EXCEEDED, "PGRAC_REASON=ITL_BLOCKER_UNPROVABLE");
+}
+
+UT_TEST(wait_errors_preserve_cancel_or_admission_sqlstate_and_abort_owner)
+{
+	for (int pair = 0; pair < 2; pair++)
+		for (int vm_kind = 0; vm_kind <= (pair ? 3 : 1); vm_kind++)
+			for (int error = 0; error < 2; error++)
+				check_wait_exit(
+					pair, vm_kind, CLUSTER_TXW_RESOLVED,
+					error ? RETRY_FAULT_ADMISSION : RETRY_FAULT_CANCEL,
+					error ? ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS : ERRCODE_QUERY_CANCELED, NULL);
+}
+
 int
 main(void)
 {
-	UT_PLAN(4);
+	UT_PLAN(8);
 	UT_RUN(single_page_retry_releases_vm_before_wait_and_reloads_tuple);
 	UT_RUN(pair_retry_releases_each_vm_reference_before_page_choice_reentry);
 	UT_RUN(repin_retries_a_resident_miss_without_carrying_a_vm_pin);
 	UT_RUN(exact_receipt_invalidation_refuses_without_renewing_or_orphaning);
+	UT_RUN(capacity_timeout_keeps_original_sqlstate_and_abort_owner);
+	UT_RUN(capacity_deadlock_keeps_original_sqlstate_and_abort_owner);
+	UT_RUN(unprovable_capacity_keeps_refusal_and_abort_owner);
+	UT_RUN(wait_errors_preserve_cancel_or_admission_sqlstate_and_abort_owner);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

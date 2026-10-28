@@ -230,6 +230,10 @@ typedef struct GcsBlockR4TxOriginContext {
 	ClusterSemanticAdmissionToken admission;
 	ClusterUndoBlock0CurrentGuard guard;
 	ClusterRuntimeVisibilityOriginPlan origin_plan;
+	ClusterRuntimeVisibilityDataDiagnostic data_diagnostic;
+	bool data_generation_sampled;
+	int32 data_generation_result;
+	ClusterUndoBlock0Generation data_selected_generation;
 	ClusterCurrentMxProofForwardV2 current_mx_request;
 	ClusterTTSlotPhysicalLocator current_mx_locators[CLUSTER_CURRENT_MX_MAX_PROOF_ASKS_PER_FRAME];
 	ClusterCurrentMemberProof current_mx_proofs[CLUSTER_CURRENT_MX_MAX_PROOF_ASKS_PER_FRAME];
@@ -9220,7 +9224,16 @@ gcs_block_r4_tx_origin_log_first_denied(const GcsBlockR4TxOriginContext *context
 			" native_sampled=%d native_status=%u prepared_sampled=%d "
 			"prepared=%d procarray_sampled=0 root=" UINT64_FORMAT "/" UINT64_FORMAT
 			" final_root_sampled=%d final_root=" UINT64_FORMAT "/" UINT64_FORMAT
-			" admission_initial=%d admission_final=%d",
+			" admission_initial=%d admission_final=%d"
+			" data_select_sampled=%d data_select_result=%d data_select_known=%d "
+			"data_select_generation=%u expected_generation_known=%d "
+			"data_diag=%d data_first_predicate=%d "
+			"data_generation_result=%d data_generation_known=%d data_generation=%u "
+			"data_resident_result=%d data_copy_attempted=%d data_copied=%d data_copy_result=%d "
+			"data_extract_attempted=%d data_extracted=%d data_record_length=%zu "
+			"data_tt_segment=%u data_uba0=" UINT64_FORMAT " data_uba1=" UINT64_FORMAT
+			" data_locator_wrap=%u data_itl_kind=%u data_itl_index=%u "
+			"phase_root=" UINT64_FORMAT "/" UINT64_FORMAT,
 			context->forward.base.original_requester_node,
 			context->forward.base.requester_backend_id, context->forward.base.request_id,
 			context->locator.xid, (int)context->failure_phase, (int)context->reason,
@@ -9237,7 +9250,21 @@ gcs_block_r4_tx_origin_log_first_denied(const GcsBlockR4TxOriginContext *context
 			diagnostic.native_status, diagnostic.prepared_sampled, diagnostic.prepared,
 			diagnostic.root_id, diagnostic.root_generation, diagnostic.final_root_sampled,
 			diagnostic.final_root_id, diagnostic.final_root_generation,
-			diagnostic.initial_admission_current, diagnostic.final_admission_current)));
+			diagnostic.initial_admission_current, diagnostic.final_admission_current,
+			context->data_generation_sampled, context->data_generation_result,
+			context->data_selected_generation.known, context->data_selected_generation.value,
+			context->expected_generation.known, context->data_diagnostic.valid,
+			(int)context->data_diagnostic.first_failure, context->data_diagnostic.generation_result,
+			context->data_diagnostic.generation_known, context->data_diagnostic.generation_value,
+			context->data_diagnostic.resident_copy_result,
+			context->data_diagnostic.data_copy_attempted, context->data_diagnostic.data_copied,
+			context->data_diagnostic.data_copy_result,
+			context->data_diagnostic.record_extract_attempted,
+			context->data_diagnostic.record_extracted, context->data_diagnostic.record_length,
+			context->data_diagnostic.tt_segment_id, context->locator.uba.raw[0],
+			context->locator.uba.raw[1], context->locator.tt_wrap, context->locator.itl_kind,
+			context->locator.itl_slot_index, context->root.root_id,
+			context->root.root_generation)));
 }
 
 static void
@@ -9787,20 +9814,22 @@ gcs_block_r4_tx_origin_step(GcsBlockR4TxOriginContext *context)
 		if (!context->expected_generation.known) {
 			ClusterUndoBlock0Generation sampled = { false, 0 };
 
-			if (cluster_undo_block0_current_sample_generation(&context->guard, &context->root,
-															  &sampled)
-					!= CLUSTER_UNDO_BLOCK0_OK
-				|| !sampled.known || sampled.value == UINT32_MAX) {
+			context->data_generation_sampled = true;
+			context->data_generation_result = cluster_undo_block0_current_sample_generation(
+				&context->guard, &context->root, &sampled);
+			context->data_selected_generation = sampled;
+			if (context->data_generation_result != CLUSTER_UNDO_BLOCK0_OK || !sampled.known
+				|| sampled.value == UINT32_MAX) {
 				context->reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
 				context->phase = GCS_BLOCK_R4_TX_ORIGIN_FINAL_RELEASE_BEGIN;
 				break;
 			}
 			context->expected_generation = sampled;
 		}
-		origin_step = cluster_runtime_visibility_origin_plan_freeze_data_held(
+		origin_step = cluster_runtime_visibility_origin_plan_freeze_data_observed_held(
 			&context->locator, context->resolve_mode, &context->admission,
 			&context->expected_generation, &context->guard, &context->root, &context->origin_plan,
-			&context->resolution, &context->reason);
+			&context->resolution, &context->reason, &context->data_diagnostic);
 		if (origin_step == CLUSTER_RUNTIME_VISIBILITY_ORIGIN_COMPLETE) {
 			context->outcome = context->resolution.outcome;
 			if (context->undo_data_fetch)

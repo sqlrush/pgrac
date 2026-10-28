@@ -34,6 +34,7 @@
 #include "cluster/cluster_cf_stats.h"
 #include "cluster/cluster_clean_leave.h" /* RF-ROOT P6: leaver write-refusal gate */
 #include "cluster/cluster_conf.h"
+#include "cluster/cluster_epoch.h"
 #include "cluster/cluster_ges.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_lock_acquire.h"
@@ -488,6 +489,55 @@ cluster_cf_release_completed(LOCKMODE mode, uint64 cookie)
 {
 	Assert(mode == ShareLock || mode == ExclusiveLock);
 	return cookie != 0 && cookie == (mode == ShareLock ? cf_retired_s : cf_retired_x);
+}
+
+bool
+cluster_cf_retirement_snapshot(LOCKMODE mode, const void *caller, ClusterCfRetirementSnapshot *out)
+{
+	CfHoldState *slot;
+	const ClusterLockOwner *owner;
+	const ClusterLockAcquireRequest *request;
+	ClusterControlRequestView view;
+	ClusterResId resid;
+	uint64 epoch, generation;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if ((mode != ShareLock && mode != ExclusiveLock) || !cluster_shared_config || MyProc == NULL
+		|| MyProcPid <= 0)
+		return false;
+	slot = cf_slot(mode);
+	owner = &slot->owner;
+	request = &owner->request;
+	epoch = cluster_epoch_get_current();
+	generation = cluster_grd_redeclare_generation();
+	cluster_cf_resid_encode(&resid);
+	if (!slot->held || !slot->coordinated || !slot->release_pending || slot->caller != caller
+		|| !owner->shared || owner->state != CLUSTER_LOCK_OWNER_RETIRING
+		|| owner->cooperative_acquire || owner->conversion != CLUSTER_LOCK_OWNER_NO_CONVERSION
+		|| owner->secondary.generation != 0 || owner->attempt.generation == 0 || epoch == 0
+		|| generation == 0 || owner->generation != generation || request->control_owner_id == 0
+		|| request->request_id == 0 || request->holder.request_id != request->request_id
+		|| request->holder.node_id != (uint32)cluster_node_id
+		|| request->holder.procno != (uint32)MyProc->pgprocno
+		|| request->holder.cluster_epoch != epoch || request->lockmode != mode
+		|| memcmp(&request->resid, &resid, sizeof(resid)) != 0
+		|| !cluster_control_request_snapshot(&owner->attempt, &view)
+		|| (view.state != CLUSTER_CONTROL_REQUEST_ABANDONED
+			&& view.state != CLUSTER_CONTROL_REQUEST_TERMINAL)
+		|| view.owner_exited || view.owner.incarnation == 0 || view.owner.pid != MyProcPid
+		|| view.owner.procno != (uint32)MyProc->pgprocno || view.mode != mode
+		|| memcmp(&view.message.key.resid, &resid, sizeof(resid)) != 0
+		|| memcmp(&view.message.key.holder, &request->holder, sizeof(request->holder)) != 0
+		|| cluster_epoch_get_current() != epoch || cluster_grd_redeclare_generation() != generation)
+		return false;
+	/* This handle came from the embedded request's original registration,
+	 * not from a caller-supplied lookup by PID or resource. Retain its exact
+	 * creator incarnation when comparing subsequent observations. */
+	out->cookie = request->control_owner_id;
+	out->registry = view;
+	return true;
 }
 
 static void
