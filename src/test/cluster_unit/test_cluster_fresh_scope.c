@@ -335,9 +335,29 @@ cluster_tt_local_prepare_canonical_active(TransactionId xid, ClusterCanonicalTxn
 	return true;
 }
 
+/* Native rename scopes preserve all existing tag and lookup fallbacks. */
+static bool rename_dispatch_lookup_active, rename_dispatch_expect_binding;
+static unsigned rename_dispatch_lookups, rename_dispatch_lookup_kind,
+	rename_dispatch_expected_boundary;
+static unsigned rename_dispatch_unbound, rename_dispatch_bad_lookup,
+	rename_dispatch_unexpected_dependencies;
+static RenameStmt native_rename_dispatch_statement;
+static Node *rename_dispatch_expected_statement;
+#include "test_cluster_fresh_rename_tag.inc"
+static const char *const rename_dispatch_command_names[] = {
+#define PG_CMDTAG(symbol, name, event, rewrite, rows) [symbol] = name,
+#include "tcop/cmdtaglist.h"
+#undef PG_CMDTAG
+};
+
 CommandTag
 CreateCommandTag(Node *statement)
 {
+	if (rename_dispatch_lookup_active && IsA(statement, RenameStmt)) {
+		RenameStmt *stmt = (RenameStmt *)statement;
+		return AlterObjectTypeCommandTag(stmt->renameType == OBJECT_COLUMN ? stmt->relationType
+																		   : stmt->renameType);
+	}
 	if (IsA(statement, TruncateStmt))
 		return CMDTAG_TRUNCATE_TABLE;
 	if (IsA(statement, CreateForeignTableStmt))
@@ -557,6 +577,11 @@ CreateCommandTag(Node *statement)
 const char *
 GetCommandTagName(CommandTag tag)
 {
+	if (rename_dispatch_lookup_active) {
+		if ((unsigned)tag >= lengthof(rename_dispatch_command_names))
+			siglongjmp(boundary, 3);
+		return rename_dispatch_command_names[tag];
+	}
 	if (tag == CMDTAG_ALTER_AGGREGATE)
 		return "ALTER AGGREGATE";
 	if (tag == CMDTAG_ALTER_CONVERSION)
@@ -6463,6 +6488,18 @@ ObjectAddress
 get_object_address(ObjectType objtype, Node *object, Relation *relp, LOCKMODE lockmode,
 				   bool missing_ok)
 {
+	if (rename_dispatch_lookup_active) {
+		rename_dispatch_lookups++;
+		rename_dispatch_lookup_kind = 12;
+		if (rename_dispatch_expect_binding && utility_binds == 0)
+			rename_dispatch_unbound++;
+		if (rename_dispatch_expected_boundary != 12
+			|| objtype != native_rename_dispatch_statement.renameType
+			|| object != native_rename_dispatch_statement.object || relp == NULL
+			|| lockmode != AccessExclusiveLock || missing_ok)
+			rename_dispatch_bad_lookup++;
+		siglongjmp(boundary, 2); /* Before actual object resolution or lock. */
+	}
 	if (label_lookup_active) {
 		label_lookups++;
 		if (label_expect_binding && utility_binds == 0)
@@ -14833,10 +14870,404 @@ UT_TEST(test_native_default_acl_keeps_original_privilege_errors)
 	default_acl_lookup_active = false;
 }
 
+/* Stop before each original native rename callee, never return success. */
+static ObjectAddress
+observe_native_rename_stmt(RenameStmt *stmt, unsigned route)
+{
+	if (!rename_dispatch_lookup_active)
+		siglongjmp(boundary, 3);
+	rename_dispatch_lookups++;
+	rename_dispatch_lookup_kind = route;
+	if (rename_dispatch_expect_binding && utility_binds == 0)
+		rename_dispatch_unbound++;
+	if (stmt != &native_rename_dispatch_statement || route != rename_dispatch_expected_boundary)
+		rename_dispatch_bad_lookup++;
+	siglongjmp(boundary, 2); /* Before the original native callee. */
+}
+
+static ObjectAddress
+observe_native_rename_names(const char *oldname, const char *newname, unsigned route)
+{
+	if (oldname != native_rename_dispatch_statement.subname
+		|| newname != native_rename_dispatch_statement.newname)
+		rename_dispatch_bad_lookup++;
+	return observe_native_rename_stmt(&native_rename_dispatch_statement, route);
+}
+
+static ObjectAddress
+observe_native_rename_rule(RangeVar *relation, const char *oldname, const char *newname)
+{
+	if (relation != native_rename_dispatch_statement.relation)
+		rename_dispatch_bad_lookup++;
+	return observe_native_rename_names(oldname, newname, 11);
+}
+
+static Relation
+native_rename_unexpected_relation(void)
+{
+	rename_dispatch_unexpected_dependencies++;
+	siglongjmp(boundary, 3);
+}
+
+static void
+native_rename_unexpected_void(void)
+{
+	rename_dispatch_unexpected_dependencies++;
+	siglongjmp(boundary, 3);
+}
+
+#define RenameConstraint(s) observe_native_rename_stmt((s), 1)
+#define RenameRelation(s) observe_native_rename_stmt((s), 2)
+#define renameatt(s) observe_native_rename_stmt((s), 3)
+#define renametrig(s) observe_native_rename_stmt((s), 4)
+#define rename_policy(s) observe_native_rename_stmt((s), 5)
+#define RenameType(s) observe_native_rename_stmt((s), 6)
+#define RenameDatabase(o, n) observe_native_rename_names((o), (n), 7)
+#define RenameRole(o, n) observe_native_rename_names((o), (n), 8)
+#define RenameSchema(o, n) observe_native_rename_names((o), (n), 9)
+#define RenameTableSpace(o, n) observe_native_rename_names((o), (n), 10)
+#define RenameRewriteRule(r, o, n) observe_native_rename_rule((r), (o), (n))
+#define table_open(...) native_rename_unexpected_relation()
+#define table_close(...) native_rename_unexpected_void()
+#define AlterObjectRename_internal(...) native_rename_unexpected_void()
+#include "test_cluster_fresh_rename_dispatch.inc"
+#undef RenameConstraint
+#undef RenameRelation
+#undef renameatt
+#undef renametrig
+#undef rename_policy
+#undef RenameType
+#undef RenameDatabase
+#undef RenameRole
+#undef RenameSchema
+#undef RenameTableSpace
+#undef RenameRewriteRule
+#undef table_open
+#undef table_close
+#undef AlterObjectRename_internal
+
+static RangeVar rename_dispatch_relation;
+static String rename_dispatch_name;
+static ListCell rename_dispatch_name_cell;
+static List rename_dispatch_names;
+static ObjectWithArgs rename_dispatch_routine;
+static const struct {
+	ObjectType type;
+	unsigned route;
+	const char *command;
+} rename_dispatch_targets[] = { { OBJECT_TABCONSTRAINT, 1, "ALTER TABLE" },
+								{ OBJECT_DATABASE, 7, "ALTER DATABASE" },
+								{ OBJECT_ROLE, 8, "ALTER ROLE" },
+								{ OBJECT_SCHEMA, 9, "ALTER SCHEMA" },
+								{ OBJECT_TABLESPACE, 10, "ALTER TABLESPACE" },
+								{ OBJECT_TABLE, 2, "ALTER TABLE" },
+								{ OBJECT_SEQUENCE, 2, "ALTER SEQUENCE" },
+								{ OBJECT_VIEW, 2, "ALTER VIEW" },
+								{ OBJECT_INDEX, 2, "ALTER INDEX" },
+								{ OBJECT_FOREIGN_TABLE, 2, "ALTER FOREIGN TABLE" },
+								{ OBJECT_COLUMN, 3, "ALTER TABLE" },
+								{ OBJECT_RULE, 11, "ALTER RULE" },
+								{ OBJECT_TRIGGER, 4, "ALTER TRIGGER" },
+								{ OBJECT_POLICY, 5, "ALTER POLICY" },
+								{ OBJECT_AGGREGATE, 12, "ALTER AGGREGATE" },
+								{ OBJECT_COLLATION, 12, "ALTER COLLATION" },
+								{ OBJECT_CONVERSION, 12, "ALTER CONVERSION" },
+								{ OBJECT_EVENT_TRIGGER, 12, "ALTER EVENT TRIGGER" },
+								{ OBJECT_FDW, 12, "ALTER FOREIGN DATA WRAPPER" },
+								{ OBJECT_FOREIGN_SERVER, 12, "ALTER SERVER" },
+								{ OBJECT_FUNCTION, 12, "ALTER FUNCTION" },
+								{ OBJECT_LANGUAGE, 12, "ALTER LANGUAGE" },
+								{ OBJECT_PROCEDURE, 12, "ALTER PROCEDURE" },
+								{ OBJECT_ROUTINE, 12, "ALTER ROUTINE" },
+								{ OBJECT_STATISTIC_EXT, 12, "ALTER STATISTICS" },
+								{ OBJECT_TSCONFIGURATION, 12, "ALTER TEXT SEARCH CONFIGURATION" },
+								{ OBJECT_TSDICTIONARY, 12, "ALTER TEXT SEARCH DICTIONARY" },
+								{ OBJECT_TSPARSER, 12, "ALTER TEXT SEARCH PARSER" },
+								{ OBJECT_TSTEMPLATE, 12, "ALTER TEXT SEARCH TEMPLATE" },
+								{ OBJECT_PUBLICATION, 12, "ALTER PUBLICATION" },
+								{ OBJECT_SUBSCRIPTION, 12, "ALTER SUBSCRIPTION" } };
+
+static void
+reset_native_rename_dispatch(bool expect_binding, unsigned form)
+{
+	ObjectType type = rename_dispatch_targets[form % 31].type;
+
+	reset_create_preflight();
+	rename_dispatch_lookup_active = true;
+	rename_dispatch_expect_binding = expect_binding;
+	rename_dispatch_lookups = rename_dispatch_lookup_kind = rename_dispatch_unbound
+		= rename_dispatch_bad_lookup = 0;
+	rename_dispatch_unexpected_dependencies = 0;
+	rename_dispatch_expected_boundary = rename_dispatch_targets[form % 31].route;
+	rename_dispatch_relation = (RangeVar){ .type = T_RangeVar, .relname = "rename_relation" };
+	rename_dispatch_name = (String){ .type = T_String, .sval = "rename_object" };
+	rename_dispatch_name_cell = (ListCell){ .ptr_value = &rename_dispatch_name };
+	rename_dispatch_names = (List){ .type = T_List,
+									.length = 1,
+									.max_length = 1,
+									.elements = &rename_dispatch_name_cell };
+	rename_dispatch_routine
+		= (ObjectWithArgs){ .type = T_ObjectWithArgs, .objname = &rename_dispatch_names };
+	native_rename_dispatch_statement
+		= (RenameStmt){ .type = T_RenameStmt,
+						.renameType = type,
+						.relationType = OBJECT_TABLE,
+						.relation = &rename_dispatch_relation,
+						.object = type == OBJECT_AGGREGATE || type == OBJECT_FUNCTION
+										  || type == OBJECT_PROCEDURE || type == OBJECT_ROUTINE
+									  ? (Node *)&rename_dispatch_routine
+									  : (Node *)&rename_dispatch_names,
+						.subname = "rename_source",
+						.newname = "rename_destination",
+						.missing_ok = form >= 31 };
+	rename_dispatch_expected_statement = (Node *)&native_rename_dispatch_statement;
+}
+
+static void
+native_rename_dispatch_entry(void)
+{
+	(void)ExecRenameStmt(&native_rename_dispatch_statement);
+}
+
+UT_TEST(test_native_rename_dispatch_binds_before_first_query_in_all_profiles)
+{
+	for (unsigned form = 0; form < 62; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_rename_dispatch(binds, form);
+			set_native_operator_mode(mode);
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_rename_dispatch_entry();
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(rename_dispatch_lookups, repeat + 1);
+				UT_ASSERT_EQ(rename_dispatch_lookup_kind,
+							 rename_dispatch_lookups ? rename_dispatch_expected_boundary : 0);
+				UT_ASSERT_EQ(rename_dispatch_unbound, 0);
+				UT_ASSERT_EQ(rename_dispatch_bad_lookup + rename_dispatch_unexpected_dependencies,
+							 0);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	rename_dispatch_lookup_active = false;
+}
+
+UT_TEST(test_native_rename_dispatch_refuses_before_lookup_on_publication_child_and_top_errors)
+{
+	for (unsigned form = 0; form < 62; form++) {
+		for (unsigned failure = 0; failure < 5; failure++) {
+			bool allocated = failure == 0 || failure == 2;
+			int caught;
+
+			reset_native_rename_dispatch(true, form);
+			if (failure == 0)
+				utility_bind_ok = false;
+			else if (failure == 1 || failure == 2) {
+				if (failure == 2)
+					create_sql_entry(rename_dispatch_expected_statement);
+				utility_in_child = true;
+			} else {
+				utility_current_xid = 401;
+				utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_rename_dispatch_entry();
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, failure == 0  ? ERRCODE_DATA_CORRUPTED
+									 : failure < 3 ? ERRCODE_FEATURE_NOT_SUPPORTED
+												   : ERRCODE_INTERNAL_ERROR);
+			UT_ASSERT_STR_EQ(
+				error_message,
+				failure == 0
+					? "canonical ACTIVE publication failed before shared catalog alteration"
+				: failure < 3 ? "shared catalog alteration does not support subtransactions"
+							  : "shared catalog top-level transaction identity mismatch");
+			UT_ASSERT_EQ(rename_dispatch_lookups, 0);
+			UT_ASSERT_EQ(rename_dispatch_lookup_kind,
+						 rename_dispatch_lookups ? rename_dispatch_expected_boundary : 0);
+			UT_ASSERT_EQ(rename_dispatch_unbound + rename_dispatch_bad_lookup
+							 + rename_dispatch_unexpected_dependencies,
+						 0);
+			UT_ASSERT_EQ(utility_xids, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, failure == 2 ? 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, allocated || failure == 3 ? 400 : InvalidTransactionId);
+		}
+	}
+	rename_dispatch_lookup_active = false;
+}
+
+UT_TEST(test_native_rename_dispatch_context_guards_keep_nonshared_route)
+{
+	for (unsigned form = 0; form < 62; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+
+			for (unsigned guard = 0; guard < 3; guard++) {
+				int caught;
+
+				reset_native_rename_dispatch(binds, form);
+				set_native_operator_mode(mode);
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_rename_dispatch_entry();
+				UT_ASSERT_EQ(caught, binds ? 1 : 2);
+				UT_ASSERT_EQ(error_code, !binds		  ? 0
+										 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+													  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				if (binds)
+					UT_ASSERT(strstr(error_message, rename_dispatch_targets[form % 31].command)
+							  != NULL);
+				UT_ASSERT_EQ(rename_dispatch_lookups, binds ? 0 : 1);
+				UT_ASSERT_EQ(rename_dispatch_lookup_kind,
+							 rename_dispatch_lookups ? rename_dispatch_expected_boundary : 0);
+				UT_ASSERT_EQ(rename_dispatch_unbound + rename_dispatch_bad_lookup
+								 + rename_dispatch_unexpected_dependencies,
+							 0);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	rename_dispatch_lookup_active = false;
+}
+
+UT_TEST(test_native_rename_dispatch_utility_warm_guards_preserve_binding)
+{
+	for (unsigned form = 0; form < 62; form++) {
+		for (unsigned guard = 0; guard < 4; guard++) {
+			int caught;
+
+			reset_native_rename_dispatch(true, form);
+			create_sql_entry(rename_dispatch_expected_statement);
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			XactReadOnly = guard == 1;
+			utility_parallel = guard == 2;
+			utility_recovery = guard == 3;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_rename_dispatch_entry();
+			UT_ASSERT_EQ(caught, guard ? 1 : 2);
+			UT_ASSERT_EQ(error_code, !guard		  ? 0
+									 : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+												  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT_EQ(rename_dispatch_lookups, guard ? 0 : 1);
+			UT_ASSERT_EQ(rename_dispatch_lookup_kind,
+						 rename_dispatch_lookups ? rename_dispatch_expected_boundary : 0);
+			UT_ASSERT_EQ(rename_dispatch_unbound + rename_dispatch_bad_lookup
+							 + rename_dispatch_unexpected_dependencies,
+						 0);
+			UT_ASSERT_EQ(utility_prepares, guard ? 1 : 2);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			UT_ASSERT_EQ(utility_top_xid, 400);
+		}
+	}
+	rename_dispatch_lookup_active = false;
+}
+
+UT_TEST(test_native_rename_dispatch_scope_refusals_match_utility_before_binding)
+{
+	static const struct {
+		ObjectType type, relation_type;
+		const char *message;
+	} forbidden[]
+		= { { OBJECT_MATVIEW, OBJECT_TABLE, "materialized views is not supported in shared mode" },
+			{ OBJECT_TYPE, OBJECT_TABLE, "custom types is not supported in shared mode" },
+			{ OBJECT_DOMAIN, OBJECT_TABLE, "custom types is not supported in shared mode" },
+			{ OBJECT_OPERATOR, OBJECT_TABLE, "custom operators is not supported in shared mode" },
+			{ OBJECT_OPCLASS, OBJECT_TABLE, "custom operators is not supported in shared mode" },
+			{ OBJECT_OPFAMILY, OBJECT_TABLE, "custom operators is not supported in shared mode" },
+			{ OBJECT_EXTENSION, OBJECT_TABLE,
+			  "CREATE/DROP EXTENSION is not supported in shared mode" },
+			{ OBJECT_COLUMN, OBJECT_TYPE, "custom types is not supported in shared mode" },
+			{ OBJECT_ATTRIBUTE, OBJECT_TYPE, "custom types is not supported in shared mode" },
+			{ OBJECT_DOMCONSTRAINT, OBJECT_TABLE, "custom types is not supported in shared mode" },
+			{ OBJECT_COLUMN, OBJECT_MATVIEW, "materialized views is not supported in shared mode" },
+			{ OBJECT_TYPE, OBJECT_MATVIEW, "custom types is not supported in shared mode" },
+			{ OBJECT_MATVIEW, OBJECT_TYPE, "custom types is not supported in shared mode" } };
+
+	for (unsigned type = 0; type < lengthof(forbidden); type++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			int caught;
+
+			if (mode == 0 || mode == 2)
+				continue; /* Unsupported policy is scoped to original config OR catalog. */
+			reset_native_rename_dispatch(false, 0);
+			set_native_operator_mode(mode);
+			native_rename_dispatch_statement.renameType = forbidden[type].type;
+			native_rename_dispatch_statement.relationType = forbidden[type].relation_type;
+			XactReadOnly = utility_parallel = utility_recovery = utility_in_child = true;
+			utility_bind_ok = false;
+			for (unsigned native = 0; native < 2; native++) {
+				reset_error();
+				caught = sigsetjmp(boundary, 1);
+				if (!caught) {
+					if (native)
+						native_rename_dispatch_entry();
+					else
+						create_sql_entry(rename_dispatch_expected_statement);
+				}
+				UT_ASSERT_EQ(caught, 1);
+				UT_ASSERT_EQ(error_code, ERRCODE_FEATURE_NOT_SUPPORTED);
+				UT_ASSERT_STR_EQ(error_message, forbidden[type].message);
+				UT_ASSERT_STR_EQ(error_detail,
+								 "PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+				UT_ASSERT_EQ(rename_dispatch_lookups + rename_dispatch_unbound
+								 + rename_dispatch_bad_lookup
+								 + rename_dispatch_unexpected_dependencies,
+							 0);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	rename_dispatch_lookup_active = false;
+}
+
+UT_TEST(test_native_rename_dispatch_keeps_original_unrecognized_target_error)
+{
+	for (unsigned mode = 0; mode < 8; mode++) {
+		bool binds = mode == 3 || mode == 7;
+		char expected[100];
+		int caught;
+
+		reset_native_rename_dispatch(binds, 0);
+		set_native_operator_mode(mode);
+		native_rename_dispatch_statement.renameType = OBJECT_LARGEOBJECT;
+		snprintf(expected, sizeof(expected), "unrecognized rename stmt type: %d",
+				 (int)OBJECT_LARGEOBJECT);
+		caught = sigsetjmp(boundary, 1);
+		if (!caught)
+			native_rename_dispatch_entry();
+		UT_ASSERT_EQ(caught, 1);
+		UT_ASSERT_STR_EQ(error_message, expected);
+		UT_ASSERT_EQ(rename_dispatch_lookups + rename_dispatch_unbound + rename_dispatch_bad_lookup
+						 + rename_dispatch_unexpected_dependencies,
+					 0);
+		UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+		UT_ASSERT_EQ(utility_prepares, binds ? 1 : 0);
+		UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+	}
+	rename_dispatch_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(233);
+	UT_PLAN(239);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -15070,6 +15501,12 @@ main(void)
 	UT_RUN(test_native_default_acl_utility_warm_guards_preserve_binding);
 	UT_RUN(test_native_default_acl_keeps_original_option_errors);
 	UT_RUN(test_native_default_acl_keeps_original_privilege_errors);
+	UT_RUN(test_native_rename_dispatch_binds_before_first_query_in_all_profiles);
+	UT_RUN(test_native_rename_dispatch_refuses_before_lookup_on_publication_child_and_top_errors);
+	UT_RUN(test_native_rename_dispatch_context_guards_keep_nonshared_route);
+	UT_RUN(test_native_rename_dispatch_utility_warm_guards_preserve_binding);
+	UT_RUN(test_native_rename_dispatch_scope_refusals_match_utility_before_binding);
+	UT_RUN(test_native_rename_dispatch_keeps_original_unrecognized_target_error);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
