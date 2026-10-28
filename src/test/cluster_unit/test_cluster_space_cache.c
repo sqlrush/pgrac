@@ -51,6 +51,7 @@ UT_DEFINE_GLOBALS();
 
 bool cluster_enabled = true, cluster_shared_config = true;
 int cluster_node_id = 0, wal_level = WAL_LEVEL_REPLICA;
+BackendType MyBackendType = B_BACKEND;
 int NBuffers = 1, NLocBuffer;
 char *BufferBlocks;
 Block *LocalBufferBlockPointers;
@@ -96,6 +97,28 @@ bool InRecovery;
 static uint8 expected_xlog_info = XLOG_FPI_FOR_HINT;
 static BufferDescPadded hint_descriptor[1];
 BufferDescPadded *BufferDescriptors = hint_descriptor;
+
+/* This process models an already-ready foreground. Recovery-only gates must
+ * not be reached by the cache/publication tests. */
+ClusterNormalStartState
+cluster_semantic_normal_start_state(void)
+{
+	return CLUSTER_NORMAL_START_TARGET_READY;
+}
+
+bool
+cluster_semantic_activation_recovered_open_current(void)
+{
+	UT_ASSERT(false);
+	return false;
+}
+
+bool
+cluster_semantic_activation_phase1_pristine(void)
+{
+	UT_ASSERT(false);
+	return false;
+}
 
 bool
 LWLockHeldByMeInMode(LWLock *lock, LWLockMode mode)
@@ -1084,6 +1107,165 @@ UT_TEST(test_terminal_census_preserves_required_cleanup_and_versions_it)
 		}
 	}
 }
+/* This adapter gives the identity fork and heap page separate observations
+ * despite the fixture's single backing array. Requalification uses UPDATE's
+ * original identity preflight block without content-X; the qualification before
+ * publication remains a leaf. */
+static ClusterSpaceIdentity
+terminal_update_identity_preflight(void)
+{
+	PGAlignedBlock heap_image = page;
+	ClusterSpaceIdentity identity = { 0 };
+
+	UT_ASSERT(content_x && !pinned && !locked && CritSectionCount == 0);
+	LockBuffer(1, BUFFER_LOCK_UNLOCK);
+	UT_ASSERT(cluster_space_identity_page_encode(&disk_identity, disk_identity.operation, page.data,
+												 BLCKSZ));
+	identity = update_identity(&relation_data);
+	UT_ASSERT(!pinned && !locked && CritSectionCount == 0);
+	page = heap_image;
+	UT_ASSERT(ConditionalLockBuffer(1));
+	return identity;
+}
+
+static void
+terminal_update_census_input(bool lock_only, ClusterHeapItlTerminalCensus *census,
+							 uint8 *terminal_flags)
+{
+	ClusterItlSlotData *slots = ClusterPageGetItlSlots(page.data);
+
+	memset(census, 0, sizeof(*census));
+	memset(terminal_flags, 0, CLUSTER_ITL_INITRANS_DEFAULT);
+	census->terminal_mask = CLUSTER_HEAP_ITL_SLOT_BIT(3);
+	census->terminal_count = 1;
+	census->outcomes[3] = CLUSTER_TX_COMMITTED;
+	census->resolutions[3].commit_scn = 80;
+	memcpy(census->slots, slots, sizeof(census->slots));
+	terminal_flags[3] = lock_only ? ITL_FLAG_LOCK_ONLY_COMMITTED : ITL_FLAG_COMMITTED;
+}
+
+static void
+terminal_update_census_setup(bool lock_only, ClusterHeapItlTerminalCensus *census,
+							 uint8 *terminal_flags)
+{
+	ClusterSpaceIdentity identity;
+	ClusterItlSlotData *slots;
+
+	(void)hint_setup(false);
+	identity = terminal_update_identity_preflight();
+	UT_ASSERT_EQ(memcmp(&identity, &disk_identity, sizeof(identity)), 0);
+	PageInitHeapPage(page.data, BLCKSZ, 0);
+	((PageHeader)page.data)->pd_block_scn = 20;
+	slots = ClusterPageGetItlSlots(page.data);
+	for (int i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
+		slots[i].xid = 900 + i;
+		slots[i].wrap = 20 + i;
+		slots[i].flags = ITL_FLAG_ACTIVE;
+		/* Opaque retained history bytes are compared, never resolved here. */
+		slots[i].undo_segment_head.raw[0] = UINT64_C(0x100000000) + i;
+		slots[i].undo_segment_head.raw[1] = UINT64_C(0x200000000) + i;
+	}
+	if (lock_only)
+		slots[3].flags = ITL_FLAG_LOCK_ONLY_ACTIVE;
+	terminal_update_census_input(lock_only, census, terminal_flags);
+	hint_before = page;
+}
+
+UT_TEST(test_terminal_census_invalidated_update_identity_stays_unapplied)
+{
+	for (int lock_only = 0; lock_only < 2; lock_only++) {
+		for (int invalidation = 0; invalidation < 3; invalidation++) {
+			ClusterHeapItlTerminalCensus census;
+			uint8 terminal_flags[CLUSTER_ITL_INITRANS_DEFAULT];
+			ClusterItlSlotData before[CLUSTER_ITL_INITRANS_DEFAULT];
+			ClusterItlSlotData *slots;
+
+			terminal_update_census_setup(lock_only, &census, terminal_flags);
+			slots = ClusterPageGetItlSlots(page.data);
+			memcpy(before, slots, sizeof(before));
+			invalidate(invalidate_arg, invalidation == 0   ? relation_data.rd_id
+									   : invalidation == 1 ? InvalidOid
+														   : 20000);
+			for (int observation = 0; observation < (invalidation == 2 ? 1 : 3); observation++) {
+				ClusterHeapItlTerminalBatchApplyResult result
+					= terminal_census_publish(1, &census, terminal_flags);
+
+				UT_ASSERT_EQ(read_calls, 1);
+				UT_ASSERT(!pinned && !locked && content_x && CritSectionCount == 0);
+				if (invalidation == 2) {
+					UT_ASSERT_EQ(result.kind, CLUSTER_HEAP_ITL_BATCH_EXACT_STAMPED);
+					UT_ASSERT_EQ(result.stamped_mask, CLUSTER_HEAP_ITL_SLOT_BIT(3));
+					UT_ASSERT_EQ(result.stamped_count, 1);
+					UT_ASSERT_EQ(slots[3].flags, terminal_flags[3]);
+					UT_ASSERT_EQ(slots[3].commit_scn, 80);
+					for (int i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
+						if (i != 3)
+							UT_ASSERT_EQ(memcmp(&slots[i], &before[i], sizeof(slots[i])), 0);
+					check_hint_version();
+				} else {
+					UT_ASSERT_EQ(result.kind, CLUSTER_HEAP_ITL_BATCH_REFUSED);
+					UT_ASSERT_EQ(result.stamped_mask + result.stamped_count, 0);
+					UT_ASSERT_EQ(memcmp(page.data, hint_before.data, BLCKSZ), 0);
+					UT_ASSERT_EQ(hint_calls + dirty_calls + wal_calls + version_edges, 0);
+					UT_ASSERT_EQ(next_token, 100);
+				}
+			}
+		}
+	}
+}
+
+UT_TEST(test_terminal_census_original_update_preflight_requalifies_after_invalidation)
+{
+	for (int lock_only = 0; lock_only < 2; lock_only++) {
+		for (int global = 0; global < 2; global++) {
+			ClusterHeapItlTerminalCensus census;
+			ClusterHeapItlTerminalBatchApplyResult result;
+			uint8 terminal_flags[CLUSTER_ITL_INITRANS_DEFAULT];
+			ClusterItlSlotData before[CLUSTER_ITL_INITRANS_DEFAULT];
+			ClusterItlSlotData *slots;
+			ClusterSpaceIdentity refreshed;
+
+			terminal_update_census_setup(lock_only, &census, terminal_flags);
+			invalidate(invalidate_arg, global ? InvalidOid : relation_data.rd_id);
+			result = terminal_census_publish(1, &census, terminal_flags);
+			UT_ASSERT_EQ(result.kind, CLUSTER_HEAP_ITL_BATCH_REFUSED);
+			UT_ASSERT_EQ(memcmp(page.data, hint_before.data, BLCKSZ), 0);
+			UT_ASSERT_EQ(wal_calls + version_edges + dirty_calls + hint_calls, 0);
+			UT_ASSERT_EQ(read_calls, 1);
+			refreshed = terminal_update_identity_preflight();
+			UT_ASSERT_EQ(memcmp(&refreshed, &disk_identity, sizeof(refreshed)), 0);
+			UT_ASSERT_EQ(read_calls, 2);
+			UT_ASSERT_EQ(memcmp(page.data, hint_before.data, BLCKSZ), 0);
+			/* Fresh qualification is supplied at the existing fixture leaf;
+			 * the old census is not an authority carried across this unlock. */
+			terminal_update_census_input(lock_only, &census, terminal_flags);
+			slots = ClusterPageGetItlSlots(page.data);
+			memcpy(before, slots, sizeof(before));
+			result = terminal_census_publish(1, &census, terminal_flags);
+			UT_ASSERT_EQ(result.kind, CLUSTER_HEAP_ITL_BATCH_EXACT_STAMPED);
+			UT_ASSERT_EQ(result.stamped_mask, CLUSTER_HEAP_ITL_SLOT_BIT(3));
+			UT_ASSERT_EQ(result.stamped_count, 1);
+			UT_ASSERT_EQ(slots[3].flags, terminal_flags[3]);
+			UT_ASSERT_EQ(slots[3].commit_scn, 80);
+			UT_ASSERT_EQ(slots[3].wrap, before[3].wrap);
+			UT_ASSERT_EQ(memcmp(&slots[3].undo_segment_head, &before[3].undo_segment_head,
+								sizeof(slots[3].undo_segment_head)),
+						 0);
+			for (int i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
+				if (i != 3)
+					UT_ASSERT_EQ(memcmp(&slots[i], &before[i], sizeof(slots[i])), 0);
+			UT_ASSERT_EQ(wal_calls, 1);
+			UT_ASSERT_EQ(dirty_calls, 1);
+			UT_ASSERT_EQ(version_edges, 1);
+			UT_ASSERT_EQ(hint_calls + CritSectionCount, 0);
+			UT_ASSERT_EQ(recorded_edge.before.mutation_token, 20);
+			UT_ASSERT_EQ(((PageHeader)page.data)->pd_block_scn, 101);
+			UT_ASSERT_EQ(PageGetLSN(page.data), 200);
+			UT_ASSERT(!pinned && !locked && content_x);
+		}
+	}
+}
+
 UT_TEST(test_fsm_hint_uses_explicit_rebuildable_component)
 {
 	(void)hint_setup(false);
@@ -1145,7 +1327,7 @@ UT_TEST(test_fsm_truncate_fpi_keeps_rebuildable_class)
 int
 main(void)
 {
-	UT_PLAN(23);
+	UT_PLAN(25);
 	UT_RUN(test_insert_allocation_and_delete_share_one_identity_read);
 	UT_RUN(test_targeted_invalidation_reloads_new_incarnation);
 	UT_RUN(test_unrelated_invalidation_preserves_hit_global_reset_drops_it);
@@ -1169,6 +1351,8 @@ main(void)
 	UT_RUN(test_fsm_hint_uses_explicit_rebuildable_component);
 	UT_RUN(test_unprepared_shared_hint_cannot_emit_native_fpi);
 	UT_RUN(test_fsm_truncate_fpi_keeps_rebuildable_class);
+	UT_RUN(test_terminal_census_invalidated_update_identity_stays_unapplied);
+	UT_RUN(test_terminal_census_original_update_preflight_requalifies_after_invalidation);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
