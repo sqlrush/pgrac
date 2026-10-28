@@ -723,7 +723,8 @@
 /* Explicit parent-bound CTRC CLOSE wire3; fresh homogeneous clusters only. */
 /* Per-child stable background CLOSE correlation changes participant stride.
  * Fresh homogeneous clusters only; no in-place upgrade. */
-#define CATALOG_VERSION_NO 202610279
+/* Explicit wire3 MERGED result5 retains the accepted parent/tree; fresh only. */
+#define CATALOG_VERSION_NO 202610280
 
 /* spec-5.13 (2026-06-27): clean-leave catalog surface — cluster_get_clean_leave_state
  * SRF (oid 8960) + pg_cluster_clean_leave_state view + pg_cluster_clean_leave_request

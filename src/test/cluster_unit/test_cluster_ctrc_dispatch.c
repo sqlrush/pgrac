@@ -33,6 +33,8 @@ int ctrc_cleaner_original_main(void);
 int cluster_lms_workers = 1;
 static uint64 dispatch_self_boot = 1101;
 static uint32 dispatch_peer_connection_generation = 29;
+static int dispatch_excluded_member = -1;
+static uint64 dispatch_observed_boot_delta;
 static unsigned enters, leaves, enqueues, rechecks;
 static bool data_plane = true, root_exact = true, fence_ok = true;
 static unsigned fail_recheck;
@@ -59,7 +61,7 @@ cluster_write_fence_allowed(void)
 bool
 cluster_membership_is_member(int node)
 {
-	return node >= 0 && node < 4;
+	return node >= 0 && node < 4 && node != dispatch_excluded_member;
 }
 uint64
 cluster_epoch_get_current(void)
@@ -94,7 +96,7 @@ cluster_reconfig_get_observed_epoch(int node pg_attribute_unused())
 bool
 cluster_reconfig_get_observed_slot(int node, uint64 *incarnation, uint64 *generation)
 {
-	*incarnation = 1101 + node;
+	*incarnation = 1101 + node + dispatch_observed_boot_delta;
 	*generation = 1;
 	return true;
 }
@@ -182,6 +184,8 @@ reset_dispatch_fixture(void)
 	reset_fixture();
 	dispatch_self_boot = 1101;
 	dispatch_peer_connection_generation = 29;
+	dispatch_excluded_member = -1;
+	dispatch_observed_boot_delta = 0;
 	test_capability_generation = 29;
 	test_cluster_epoch = 23;
 	enters = leaves = enqueues = rechecks = fail_recheck = 0;

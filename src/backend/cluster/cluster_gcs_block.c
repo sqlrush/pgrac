@@ -19723,6 +19723,77 @@ cluster_gcs_ctrc_dispatch_batch(const ClusterCtrcCloseDispatch *dispatches, Size
 	}
 }
 
+/* Explicit delegated-only merge reply: reconstruct the exact retained216B
+ * request, authenticate its original child, and retain the parent's other
+ * local/ancestor responsibility. No ACK or certificate is accepted here. */
+static void
+gcs_block_land_delegation_merge_reply(const ClusterICEnvelope *env,
+	const GcsBlockReplyHeader *outer, const uint8 *page)
+{
+	ClusterCtrcDelegationCloseV1 request;
+	ClusterCtrcSealReplyHeaderV1 header;
+	ClusterCtrcLocalReleaseAckV1 ignored_ack;
+	ClusterSemanticAdmissionToken admission = { 0 };
+	ClusterUndoBlock0ResolvedRoot root;
+	ClusterUndoBlock0LogicalKey logical;
+	uint8 bytes[CLUSTER_CTRC_DELEGATION_CLOSE_V1_BYTES];
+	uint64 self_boot, child_boot = 0, observed = 0;
+	uint32 connection = 0;
+	uint32 required = PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1 | PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1;
+
+	if (env->epoch != outer->epoch || !cluster_gcs_block_family_on_data_plane()
+		|| (cluster_ic_local_capability_word() & required) != required
+		|| !cluster_membership_is_member(cluster_node_id)
+		|| !cluster_membership_is_member((int32)env->source_node_id)
+		|| (cluster_write_fence_enforcing() && !cluster_write_fence_allowed())
+		|| !cluster_ctrc_participant_delegated_close_snapshot_shared(outer->request_id,
+			(uint16)env->source_node_id, &request)
+		|| request.key.system_identifier != GetSystemIdentifier()
+		|| request.key.cluster_epoch != outer->epoch
+		|| !cluster_ctrc_delegation_close_encode_v1(&request, bytes, sizeof(bytes))
+		|| !cluster_ctrc_seal_reply_decode(page, GCS_BLOCK_DATA_SIZE, bytes, sizeof(bytes),
+			(int32)env->source_node_id, cluster_node_id, &header, &ignored_ack)
+		|| header.result != CTRC_SEAL_REPLY_DELEGATION_MERGED)
+		return;
+	self_boot = cluster_qvotec_get_self_incarnation();
+	if (self_boot == 0 || self_boot != request.parent.boot_incarnation
+		|| cluster_membership_get_last_admitted_incarnation(cluster_node_id) != self_boot
+		|| !cluster_reconfig_get_observed_slot(request.receiver.node_id, &child_boot, &observed)
+		|| child_boot == 0 || observed == 0 || child_boot != request.receiver.boot_incarnation
+		|| cluster_membership_get_last_admitted_incarnation(request.receiver.node_id) != child_boot
+		|| cluster_reconfig_get_observed_epoch(request.receiver.node_id) != request.key.formation_epoch
+		|| !cluster_sf_peer_multixact_current_capability_generation(request.receiver.node_id, &connection)
+		|| connection == 0
+		|| !cluster_sf_peer_capability_generation_matches(request.receiver.node_id, required, connection)
+		|| cluster_semantic_activation_enter_r4_terminal_census(&admission) != CLUSTER_SEMANTIC_ADMISSION_OK)
+		return;
+	PG_TRY();
+	{
+		MemSet(&root, 0, sizeof(root));
+		logical.owner_instance = request.key.owner_instance;
+		logical.segment_id = request.key.segment_id;
+		if (admission.record_generation <= UINT32_MAX
+			&& admission.formation_epoch == request.key.formation_epoch
+			&& admission.record_generation == request.key.admission_record_generation
+			&& request.parent.capability_record_generation == (uint32)admission.record_generation
+			&& request.receiver.capability_record_generation == (uint32)admission.record_generation
+			&& cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(&admission,
+				CLUSTER_UNDO_PATH_RUNTIME_SHARED, logical.owner_instance, logical.segment_id, &root)
+			&& root.intent == CLUSTER_UNDO_PATH_RUNTIME_SHARED && root.root_id == request.key.root_id
+			&& root.root_generation == request.key.root_generation
+			&& request.key.root_descriptor_incarnation == root.root_generation
+			&& cluster_semantic_activation_recheck_r4_terminal_census(&admission)
+			&& cluster_sf_peer_capability_generation_matches(request.receiver.node_id, required, connection)
+			&& cluster_semantic_activation_recheck_r4_terminal_census(&admission))
+			(void)cluster_ctrc_participant_delegation_merge_land_shared(&request);
+	}
+	PG_FINALLY();
+	{
+		cluster_semantic_activation_leave(&admission);
+	}
+	PG_END_TRY();
+}
+
 /* CTRC status 30 uses the legacy-sized outer carriage but has no backend
  * outstanding slot: requester_backend_id is the closed internal endpoint.
  * Reconstruct the exact staged CLOSE or certificate-notification request and
@@ -19766,6 +19837,10 @@ gcs_block_try_land_ctrc_reply(const ClusterICEnvelope *env, const void *payload)
 		|| GcsBlockReplyHeaderGetForwardingMasterNode(outer) != GCS_BLOCK_REPLY_NO_FORWARDING_MASTER
 		|| outer->checksum != gcs_block_compute_checksum((const char *)page))
 		return true;
+	if (page[4] == CLUSTER_CTRC_DELEGATION_CLOSE_WIRE_VERSION && page[5] == 0) {
+		gcs_block_land_delegation_merge_reply(env, outer, page);
+		return true;
+	}
 
 	MemSet(&key, 0, sizeof(key));
 	MemSet(&identity, 0, sizeof(identity));
@@ -20393,14 +20468,21 @@ gcs_block_try_ctrc_forward136(const ClusterICEnvelope *env, const void *payload)
 						/* Custody uses the OPEN record domain, independently
 						 * of the HELLO connection generation checked above. */
 						&& delegated_close.parent.capability_record_generation
-							== (uint32)admission.record_generation)
+							== (uint32)admission.record_generation) {
 						result = cluster_ctrc_participant_delegated_close_shared(&delegated_close,
 							&first_reason);
+						if (result == CTRC_SEAL_REPLY_BLOCKED_RETAIN
+							&& cluster_ctrc_participant_delegation_merge_observed_shared(&delegated_close)) {
+							result = CTRC_SEAL_REPLY_DELEGATION_MERGED;
+							first_reason = 0;
+						}
+					}
 				} else
 					result = cluster_ctrc_participant_request_shared(
 						&key, &identity, request.grant_generation, request.seal_generation,
 						(ClusterCtrcSealSuboperation)request.suboperation, &first_reason, &ack);
-				if (result == CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK
+				if ((result == CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK
+						|| result == CTRC_SEAL_REPLY_DELEGATION_MERGED)
 					&& !cluster_semantic_activation_recheck_r4_terminal_census(&admission)) {
 					MemSet(&ack, 0, sizeof(ack));
 					first_reason = CTRC_SEAL_REASON_IDENTITY;

@@ -70,7 +70,9 @@ typedef enum ClusterCtrcSealReplyResult {
 	CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK = 1,
 	CTRC_SEAL_REPLY_PENDING_DRAIN = 2,
 	CTRC_SEAL_REPLY_BLOCKED_RETAIN = 3,
-	CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED = 4
+	CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED = 4,
+	/* Explicit wire3 only: redundant pending custody, never a release ACK. */
+	CTRC_SEAL_REPLY_DELEGATION_MERGED = 5
 } ClusterCtrcSealReplyResult;
 
 typedef enum ClusterCtrcSealReason {
@@ -934,6 +936,10 @@ extern bool cluster_ctrc_delegation_close_decode_v1(const uint8 *bytes, Size len
  * parent/children remain registered; this entry cannot return a release ACK. */
 extern ClusterCtrcSealReplyResult cluster_ctrc_participant_delegated_close_shared(
 	const ClusterCtrcDelegationCloseV1 *request, uint16 *first_reason);
+/* Read-only observation of an already-qualified OPEN receiver whose immutable
+ * original registration has a different parent (or a direct origin grant). */
+extern bool cluster_ctrc_participant_delegation_merge_observed_shared(
+	const ClusterCtrcDelegationCloseV1 *request);
 extern bool cluster_ctrc_local_release_ack_encode(const ClusterCtrcLocalReleaseAckV1 *ack,
 												  uint8 bytes[CLUSTER_CTRC_LOCAL_ACK_BYTES]);
 extern bool cluster_ctrc_local_release_ack_decode(const uint8 bytes[CLUSTER_CTRC_LOCAL_ACK_BYTES],
@@ -1167,6 +1173,12 @@ extern bool cluster_ctrc_origin_next_close_dispatch_shared(ClusterCtrcCloseDispa
 extern bool cluster_ctrc_participant_next_delegated_close_shared(
 	ClusterCtrcDelegationCloseV1 *request_out);
 extern bool cluster_ctrc_participant_delegated_close_matches_shared(
+	const ClusterCtrcDelegationCloseV1 *request);
+extern bool cluster_ctrc_participant_delegated_close_snapshot_shared(uint64 request_id,
+	uint16 source_node, ClusterCtrcDelegationCloseV1 *request_out);
+/* Caller must hold the original current R4 admission and have authenticated
+ * the exact wire3 MERGED reply. Only redundant outgoing pending is removed. */
+extern bool cluster_ctrc_participant_delegation_merge_land_shared(
 	const ClusterCtrcDelegationCloseV1 *request);
 extern bool cluster_ctrc_cleaner_run_pass(void);
 

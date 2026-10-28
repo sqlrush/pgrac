@@ -232,7 +232,7 @@ SCAN_RULES: Tuple[ScanRule, ...] = (
             "src/backend/cluster/cluster_gcs_block.c",
             "src/backend/cluster/cluster_terminal_ref_census.c",
         ),
-        r"\bcluster_ctrc_(?:seal_request_(?:encode|decode)|seal_reply_(?:encode|decode)|delegation_close_(?:encode|decode)_v1|participant_(?:request_shared|delegated_close_shared|next_delegated_close_shared|delegated_close_matches_shared)|origin_ack_land_shared)\s*\(",
+        r"\bcluster_ctrc_(?:seal_request_(?:encode|decode)|seal_reply_(?:encode|decode)|delegation_close_(?:encode|decode)_v1|participant_(?:request_shared|delegated_close_shared|next_delegated_close_shared|delegated_close_matches_shared|delegated_close_snapshot_shared|delegation_merge_(?:observed|land)_shared)|origin_ack_land_shared)\s*\(",
     ),
     ScanRule(
         "CTRC_RELATION_GATE",
@@ -324,6 +324,42 @@ _classify_owners(
     "ALL_CTRC_TARGET_KINDS",
     "NO_SUCCESSOR_ON_CLOSE",
     "cluster_ctrc_participant_request_apply",
+    "MXA-T24",
+)
+# Wire3 MERGED discharges only redundant outgoing pending custody. The
+# receiver observation and request lookup retain every accepted tree edge.
+_classify_owners(
+    "CTRC_CLOSE_WIRE",
+    "src/backend/cluster/cluster_gcs_block.c",
+    ("gcs_block_land_delegation_merge_reply",),
+    "TERMINAL_PROJECTION_DISCHARGE",
+    "ALL_CTRC_REFERENCE_KINDS",
+    "ALL_CTRC_TARGET_KINDS",
+    "NO_SUCCESSOR_ON_CLOSE",
+    "cluster_ctrc_participant_delegation_merge_land_shared",
+    "MXA-T24",
+)
+_classify_owners(
+    "CTRC_CLOSE_WIRE",
+    "src/backend/cluster/cluster_terminal_ref_census.c",
+    ("cluster_ctrc_participant_delegation_merge_land_shared",),
+    "TERMINAL_PROJECTION_DISCHARGE",
+    "ALL_CTRC_REFERENCE_KINDS",
+    "ALL_CTRC_TARGET_KINDS",
+    "NO_SUCCESSOR_ON_CLOSE",
+    "cluster_ctrc_participant_delegation_merge_land_shared",
+    "MXA-T24",
+)
+_classify_owners(
+    "CTRC_CLOSE_WIRE",
+    "src/backend/cluster/cluster_terminal_ref_census.c",
+    ("cluster_ctrc_participant_delegation_merge_observed_shared",
+     "cluster_ctrc_participant_delegated_close_snapshot_shared"),
+    "REGISTERED_REFERENCE",
+    "ALL_CTRC_REFERENCE_KINDS",
+    "ALL_CTRC_TARGET_KINDS",
+    "NO_REFERENCE_TRANSFER_REQUIRED",
+    "RETAIN_PENDING_UNTIL_PROTECTED_MERGE",
     "MXA-T24",
 )
 

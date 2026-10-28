@@ -61,6 +61,7 @@ cluster_gcs_block_note_send_outcome(GcsBlockSendFamily family pg_attribute_unuse
 
 #include "test_cluster_ctrc_delegation_close.inc"
 #include "test_cluster_ctrc_delegation_forward.inc"
+#include "test_cluster_ctrc_delegation_reply.inc"
 
 static void
 close_test_identity(const ClusterCtrcParticipantIdentity *identity, uint8 *bytes)
@@ -854,10 +855,466 @@ UT_TEST(test_background_sequence_allocation_rechecks_the_exact_row_after_origina
 	}
 }
 
+UT_TEST(test_qualified_existing_receiver_reports_merge_without_changing_its_parent)
+{
+	for (unsigned delegated = 0; delegated < 2; delegated++) {
+		ClusterCtrcReceiptHandle source;
+		ClusterCtrcParticipantIdentity receiver;
+		ClusterItlSlotData slot;
+		ClusterCtrcParticipantEntry before;
+		ClusterCtrcDelegationCloseV1 request = {0};
+		ClusterCtrcSealReplyHeaderV1 header;
+		ClusterCtrcLocalReleaseAckV1 ack;
+		ClusterICEnvelope env = {0};
+		uint8 record[224], bytes[CLOSE_TEST_BYTES];
+		uint64 index;
+
+		reset_dispatch_fixture();
+		UT_ASSERT(seed_merge_receiver(delegated, &source, &receiver, &slot, record, &index));
+		before = ctrc_participant_entries()[index];
+		request.key = source.key;
+		request.parent = source.participant->identity;
+		request.receiver = receiver;
+		request.original_full_xid = source.original_full_xid;
+		request.request_id = 17001;
+		request.seal_generation = 41;
+		request.delegation_sequence = source.participant->delegations[receiver.node_id].sequence;
+		request.grant_generation = source.participant->grant_generation;
+		UT_ASSERT(cluster_ctrc_delegation_close_encode_v1(&request, bytes, sizeof(bytes)));
+		env.msg_type = PGRAC_IC_MSG_GCS_BLOCK_FORWARD;
+		env.source_node_id = request.parent.node_id;
+		env.dest_node_id = receiver.node_id;
+		env.epoch = source.key.cluster_epoch;
+		env.payload_length = sizeof(bytes);
+		dispatch_self_boot = receiver.boot_incarnation;
+		close_source_generation = dispatch_peer_connection_generation = 29;
+		close_expected_destination = request.parent.node_id;
+		close_replies = 0;
+		UT_ASSERT(gcs_block_try_ctrc_forward136(&env, bytes));
+		UT_ASSERT_EQ(close_replies, 1);
+		UT_ASSERT(cluster_ctrc_seal_reply_decode(close_reply + sizeof(GcsBlockReplyHeader),
+			BLCKSZ, bytes, sizeof(bytes), receiver.node_id, request.parent.node_id, &header, &ack));
+		/* Explicit wire3 result5 is merge-only, never a release ACK. */
+		UT_ASSERT_EQ(header.result, 5);
+		UT_ASSERT_EQ(header.first_reason, 0);
+		UT_ASSERT_EQ(header.ack_length, 0);
+		UT_ASSERT(ctrc_bytes_zero(&ack, sizeof(ack)));
+		UT_ASSERT(memcmp(&ctrc_participant_entries()[index], &before, sizeof(before)) == 0);
+		UT_ASSERT_EQ(source.participant->delegation_count, 1);
+		UT_ASSERT_EQ(enters, leaves);
+		UT_ASSERT_EQ(held_count, 0);
+		UT_ASSERT_EQ(allocated, 0);
+	}
+}
+
+/* Actual accepted tree 0->1->{2,3}, plus redundant pending 2->3.
+ * Original acceptance keeps 3's parent1; only 2's pending can be removed. */
+static bool
+close_merge_roundtrip_setup(bool other_child, ClusterCtrcParticipantEntry **sender,
+	ClusterCtrcParticipantEntry **receiver, ClusterCtrcDelegationCloseV1 *request,
+	uint8 reply[GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE])
+{
+	ClusterCtrcReceiptHandle first, middle;
+	ClusterCtrcParticipantIdentity destination, other;
+	ClusterCtrcItlTargetIdentity target;
+	ClusterCtrcDelegationCloseV1 upstream = {0};
+	ClusterICEnvelope env = {0};
+	ClusterItlSlotData slot;
+	uint8 path[CLUSTER_CTRC_DELEGATION_V2_MAX_BYTES], bytes[CLOSE_TEST_BYTES];
+	uint64 index;
+	Size length = 0;
+	uint32 first_segment;
+
+	reset_dispatch_fixture();
+	if (!seed_multihop_source(&first, &middle, &destination, &slot, &target)
+		|| !close_test_pending_child(first.participant, &destination, path, &length))
+		return false;
+	cluster_node_id = destination.node_id;
+	if (!cluster_ctrc_itl_delegate_accept_v2(&slot, &first.participant->identity,
+		&destination, path, length)
+		|| !ctrc_participant_index(&first.key, destination.node_id, &index))
+		return false;
+	*receiver = &ctrc_participant_entries()[index];
+	cluster_node_id = middle.participant->identity.node_id;
+	if (!close_test_pending_child(middle.participant, &destination, path, &length))
+		return false;
+	cluster_node_id = destination.node_id;
+	if (!cluster_ctrc_itl_delegate_accept_v2(&slot, &middle.participant->identity,
+		&destination, path, length))
+		return false;
+	*sender = middle.participant;
+	cluster_node_id = (*sender)->identity.node_id;
+	if (other_child) {
+		other = destination;
+		other.node_id = 4;
+		other.boot_incarnation = 1105;
+		if (!close_test_pending_child(*sender, &other, path, &length))
+			return false;
+	}
+	upstream.key = middle.key;
+	upstream.parent = (*sender)->delegation_parent.receiver;
+	upstream.receiver = (*sender)->identity;
+	upstream.original_full_xid = middle.original_full_xid;
+	upstream.request_id = 17001;
+	upstream.seal_generation = 41;
+	upstream.delegation_sequence = (*sender)->delegation_parent.sequence;
+	upstream.grant_generation = (*sender)->grant_generation;
+	if (!cluster_ctrc_delegation_close_encode_v1(&upstream, bytes, sizeof(bytes)))
+		return false;
+	env.msg_type = PGRAC_IC_MSG_GCS_BLOCK_FORWARD;
+	env.source_node_id = upstream.parent.node_id;
+	env.dest_node_id = upstream.receiver.node_id;
+	env.epoch = upstream.key.cluster_epoch;
+	env.payload_length = sizeof(bytes);
+	dispatch_self_boot = upstream.receiver.boot_incarnation;
+	close_source_generation = dispatch_peer_connection_generation = 29;
+	close_expected_destination = upstream.parent.node_id;
+	close_replies = 0;
+	if (!gcs_block_try_ctrc_forward136(&env, bytes))
+		return false;
+	first_segment = ((uint32)middle.key.owner_instance - 1) * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+	if (!cluster_ctrc_cleaner_bind_worker((middle.key.segment_id - first_segment)
+		% CLUSTER_CTRC_CLEANER_WORKERS)
+		|| !cluster_ctrc_participant_next_delegated_close_shared(request)
+		|| request->receiver.node_id != destination.node_id
+		|| !cluster_ctrc_delegation_close_encode_v1(request, bytes, sizeof(bytes)))
+		return false;
+	cluster_node_id = destination.node_id;
+	dispatch_self_boot = destination.boot_incarnation;
+	env.source_node_id = request->parent.node_id;
+	env.dest_node_id = request->receiver.node_id;
+	close_expected_destination = request->parent.node_id;
+	close_replies = 0;
+	if (!gcs_block_try_ctrc_forward136(&env, bytes) || close_replies != 1)
+		return false;
+	memcpy(reply, close_reply, sizeof(close_reply));
+	cluster_node_id = request->parent.node_id;
+	dispatch_self_boot = request->parent.boot_incarnation;
+	return true;
+}
+
+static bool
+close_merge_land(const uint8 *reply)
+{
+	const GcsBlockReplyHeader *outer = (const GcsBlockReplyHeader *)reply;
+	ClusterICEnvelope env = {0};
+
+	env.msg_type = PGRAC_IC_MSG_GCS_BLOCK_REPLY;
+	env.source_node_id = outer->sender_node;
+	env.dest_node_id = cluster_node_id;
+	env.epoch = outer->epoch;
+	env.payload_length = GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE;
+	return gcs_block_try_land_ctrc_reply(&env, reply);
+}
+
+UT_TEST(test_actual_merge_reply_retires_only_the_exact_redundant_pending)
+{
+	ClusterCtrcParticipantEntry *sender, *receiver, expected, receiver_before;
+	ClusterCtrcDelegationCloseV1 request;
+	uint8 reply[GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE];
+
+	UT_ASSERT(close_merge_roundtrip_setup(false, &sender, &receiver, &request, reply));
+	expected = *sender;
+	receiver_before = *receiver;
+	MemSet(&expected.delegations[request.receiver.node_id], 0, sizeof(expected.delegations[0]));
+	expected.delegation_close_request_id[request.receiver.node_id] = 0;
+	expected.delegation_count = expected.last_delegation_sequence = 0;
+	UT_ASSERT(close_merge_land(reply));
+	UT_ASSERT(memcmp(sender, &expected, sizeof(expected)) == 0);
+	UT_ASSERT(memcmp(receiver, &receiver_before, sizeof(receiver_before)) == 0);
+	UT_ASSERT_EQ(sender->applied_count, 1);
+	UT_ASSERT_EQ(sender->state, CTRC_PARTICIPANT_CLOSED_DRAINING);
+	UT_ASSERT(sender->delegation_parent.sequence != 0);
+	UT_ASSERT(!ctrc_participant_delegations_empty(sender));
+	UT_ASSERT_EQ(enters, leaves);
+	UT_ASSERT_EQ(held_count, 0);
+	UT_ASSERT_EQ(allocated, 0);
+}
+
+UT_TEST(test_merge_pending_retirement_never_renumbers_other_children)
+{
+	ClusterCtrcParticipantEntry *sender, *receiver, expected;
+	ClusterCtrcDelegationCloseV1 request, next;
+	uint8 reply[GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE];
+
+	UT_ASSERT(close_merge_roundtrip_setup(true, &sender, &receiver, &request, reply));
+	expected = *sender;
+	MemSet(&expected.delegations[request.receiver.node_id], 0, sizeof(expected.delegations[0]));
+	expected.delegation_close_request_id[request.receiver.node_id] = 0;
+	expected.delegation_count--;
+	UT_ASSERT(close_merge_land(reply));
+	UT_ASSERT(memcmp(sender, &expected, sizeof(expected)) == 0);
+	UT_ASSERT(ctrc_participant_delegations_valid(sender));
+	UT_ASSERT(cluster_ctrc_participant_next_delegated_close_shared(&next));
+	UT_ASSERT_EQ(next.receiver.node_id, 4);
+	UT_ASSERT_EQ(next.delegation_sequence, 2);
+	UT_ASSERT_EQ(enters, leaves);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_merge_result_is_only_explicit_wire3_without_any_release_payload)
+{
+	ClusterCtrcParticipantEntry *sender, *receiver;
+	ClusterCtrcDelegationCloseV1 request;
+	ClusterCtrcSealReplyHeaderV1 header;
+	ClusterCtrcLocalReleaseAckV1 ack;
+	uint8 reply[GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE], bytes[CLOSE_TEST_BYTES], page[BLCKSZ], old[136];
+	const uint8 *valid;
+
+	UT_ASSERT(close_merge_roundtrip_setup(false, &sender, &receiver, &request, reply));
+	UT_ASSERT(cluster_ctrc_delegation_close_encode_v1(&request, bytes, sizeof(bytes)));
+	valid = reply + sizeof(GcsBlockReplyHeader);
+	UT_ASSERT(cluster_ctrc_seal_reply_decode(valid, BLCKSZ, bytes, sizeof(bytes), 3, 2, &header, &ack));
+	UT_ASSERT_EQ(header.result, CTRC_SEAL_REPLY_DELEGATION_MERGED);
+	UT_ASSERT(ctrc_bytes_zero(valid + CLUSTER_CTRC_REPLY_ACK_OFFSET,
+		BLCKSZ - CLUSTER_CTRC_REPLY_ACK_OFFSET));
+	UT_ASSERT(cluster_ctrc_seal_request_encode(&request.key, request.request_id,
+		request.grant_generation, request.seal_generation, 29, CTRC_SEAL_CLOSE_AND_CLEAN, old, sizeof(old)));
+	UT_ASSERT(!cluster_ctrc_seal_reply_encode(old, sizeof(old), 3, 0,
+		CTRC_SEAL_REPLY_DELEGATION_MERGED, 0, NULL, page, sizeof(page)));
+	UT_ASSERT(ctrc_bytes_zero(page, sizeof(page)));
+	UT_ASSERT(!cluster_ctrc_seal_reply_encode(bytes, sizeof(bytes), 3, 2,
+		CTRC_SEAL_REPLY_DELEGATION_MERGED, CTRC_SEAL_REASON_IDENTITY, NULL, page, sizeof(page)));
+	UT_ASSERT(!cluster_ctrc_seal_reply_encode(bytes, sizeof(bytes), 3, 2,
+		CTRC_SEAL_REPLY_DELEGATION_MERGED, 0, &ack, page, sizeof(page)));
+	for (unsigned fault = 0; fault < 9; fault++) {
+		memcpy(page, valid, sizeof(page));
+		switch (fault) {
+			case 0: page[4] = 2; break;
+			case 1: page[40] = CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK; break;
+			case 2: page[40] = CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED; break;
+			case 3: page[40] = 6; break;
+			case 4: page[41] = CTRC_SEAL_CERTIFICATE_COMMITTED; break;
+			case 5: page[42] = CTRC_SEAL_REASON_IDENTITY; break;
+			case 6: page[46] = 1; break;
+			case 7: page[CLUSTER_CTRC_REPLY_ACK_OFFSET] = 1; break;
+			case 8: page[48] ^= 1; break;
+		}
+		ctrc_put_u32_le(page + 60, ctrc_crc32c_exact(page, 60));
+		UT_ASSERT(!cluster_ctrc_seal_reply_decode(page, sizeof(page), bytes, sizeof(bytes), 3, 2, &header, &ack));
+		UT_ASSERT(ctrc_bytes_zero(&header, sizeof(header)));
+		UT_ASSERT(ctrc_bytes_zero(&ack, sizeof(ack)));
+	}
+}
+
+UT_TEST(test_merge_observation_never_qualifies_unknown_closed_or_conflicting_receivers)
+{
+	for (unsigned fault = 0; fault < 14; fault++) {
+		ClusterCtrcParticipantEntry *sender, *receiver, before;
+		ClusterCtrcDelegationCloseV1 request;
+		uint8 reply[GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE];
+
+		UT_ASSERT(close_merge_roundtrip_setup(false, &sender, &receiver, &request, reply));
+		cluster_node_id = request.receiver.node_id;
+		switch (fault) {
+			case 0: MemSet(receiver, 0, sizeof(*receiver)); break;
+			case 1: receiver->state = CTRC_PARTICIPANT_CLOSED_DRAINING; receiver->seal_generation = 41; break;
+			case 2: MemSet(receiver->original_identity_v2, 0, sizeof(receiver->original_identity_v2)); break;
+			case 3: receiver->original_full_xid = InvalidFullTransactionId; break;
+			case 4: receiver->original_full_xid = FullTransactionIdFromU64(U64FromFullTransactionId(request.original_full_xid) + (UINT64_C(1) << 32)); break;
+			case 5: receiver->grant_generation++; break;
+			case 6: receiver->identity.boot_incarnation++; break;
+			case 7: receiver->original_identity_v2[64] ^= 1; break;
+			case 8: receiver->delegation_path.hops[0].sequence++; break;
+			case 9: receiver->reserved8[0] = 1; break;
+			case 10: request.parent = receiver->delegation_parent.receiver; break;
+			case 11: request.parent = receiver->delegation_parent.receiver; request.parent.boot_incarnation++; break;
+			case 12: request.reserved = 1; break;
+			case 13: cluster_node_id = 1; break;
+		}
+		before = *receiver;
+		UT_ASSERT(!cluster_ctrc_participant_delegation_merge_observed_shared(&request));
+		UT_ASSERT(memcmp(receiver, &before, sizeof(before)) == 0);
+		UT_ASSERT_EQ(sender->delegation_count, 1);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
+UT_TEST(test_actual_merge_reply_rejects_framing_digest_and_stale_request_without_mutation)
+{
+	for (unsigned fault = 0; fault < 20; fault++) {
+		ClusterCtrcParticipantEntry *sender, *receiver, before;
+		ClusterCtrcDelegationCloseV1 request;
+		uint8 reply[GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE];
+		GcsBlockReplyHeader *outer = (GcsBlockReplyHeader *)reply;
+		uint8 *page = reply + sizeof(*outer);
+
+		UT_ASSERT(close_merge_roundtrip_setup(false, &sender, &receiver, &request, reply));
+		switch (fault) {
+			case 0: outer->reserved_0[0] = 1; break;
+			case 1: outer->requester_backend_id++; break;
+			case 2: outer->transition_id = 1; break;
+			case 3: outer->page_lsn = 1; break;
+			case 4: outer->epoch++; break;
+			case 5: outer->sender_node = 1; break;
+			case 6: outer->request_id++; break;
+			case 7: GcsBlockReplyHeaderSetForwardingMasterNode(outer, 1); break;
+			case 8: page[4] = 2; break;
+			case 9: page[40] = CTRC_SEAL_REPLY_PENDING_DRAIN; page[42] = CTRC_SEAL_REASON_CLEANOUT; break;
+			case 10: page[48] ^= 1; break;
+			case 11: page[CLUSTER_CTRC_REPLY_ACK_OFFSET] = 1; break;
+			case 12: sender->delegation_close_request_id[3] = 0; break;
+			case 13: sender->delegation_close_request_id[3]++; break;
+			case 14: sender->grant_generation++; break;
+			case 15: sender->seal_generation++; break;
+			case 16: sender->delegations[3].receiver.boot_incarnation++; break;
+			case 17: sender->original_identity_v2[64] ^= 1; break;
+			case 18: sender->original_full_xid = InvalidFullTransactionId; break;
+			case 19: sender->state = CTRC_PARTICIPANT_OPEN; sender->seal_generation = 0; break;
+		}
+		ctrc_put_u32_le(page + 60, ctrc_crc32c_exact(page, 60));
+		outer->checksum = gcs_block_compute_checksum((const char *)page);
+		before = *sender;
+		UT_ASSERT(close_merge_land(reply));
+		UT_ASSERT(memcmp(sender, &before, sizeof(before)) == 0);
+		UT_ASSERT_EQ(enters, leaves);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
+UT_TEST(test_actual_merge_reply_requires_live_boot_hello_root_and_current_admission)
+{
+	for (unsigned fault = 0; fault < 11; fault++) {
+		ClusterCtrcParticipantEntry *sender, *receiver, before;
+		ClusterCtrcDelegationCloseV1 request;
+		uint8 reply[GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE];
+		volatile bool caught = false;
+
+		UT_ASSERT(close_merge_roundtrip_setup(false, &sender, &receiver, &request, reply));
+		before = *sender;
+		rechecks = resolves = 0;
+		switch (fault) {
+			case 0: dispatch_excluded_member = 3; break;
+			case 1: dispatch_observed_boot_delta = 1; break;
+			case 2: dispatch_self_boot++; break;
+			case 3: close_source_generation = 0; break;
+			case 4: close_source_generation++; break;
+			case 5: root_exact = false; break;
+			case 6: fail_recheck = 1; break;
+			case 7: fail_recheck = 2; break;
+			case 8: fence_ok = false; break;
+			case 9: data_plane = false; break;
+			case 10: throw_resolve = 1; break;
+		}
+		PG_TRY();
+		{
+			UT_ASSERT(close_merge_land(reply));
+		}
+		PG_CATCH();
+		{
+			caught = true;
+			UT_ASSERT_EQ(fault, 10);
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, fault == 10);
+		UT_ASSERT(memcmp(sender, &before, sizeof(before)) == 0);
+		UT_ASSERT_EQ(enters, leaves);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
+UT_TEST(test_actual_merge_reply_keeps_hello_separate_and_duplicate_is_a_noop)
+{
+	ClusterCtrcParticipantEntry *sender, *receiver, before, expected;
+	ClusterCtrcDelegationCloseV1 request, ignored;
+	uint8 reply[GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE];
+	uint64 progress;
+
+	UT_ASSERT(close_merge_roundtrip_setup(false, &sender, &receiver, &request, reply));
+	close_source_generation = dispatch_peer_connection_generation = 7;
+	UT_ASSERT(close_merge_land(reply));
+	UT_ASSERT_EQ(sender->delegation_count, 0);
+	before = *sender;
+	progress = cluster_ctrc_stat_get(CTRC_STAT_SEMANTIC_PROGRESS);
+	UT_ASSERT(close_merge_land(reply));
+	UT_ASSERT(memcmp(sender, &before, sizeof(before)) == 0);
+	UT_ASSERT_EQ(cluster_ctrc_stat_get(CTRC_STAT_SEMANTIC_PROGRESS), progress);
+	MemSet(&ignored, 0x5a, sizeof(ignored));
+	UT_ASSERT(!cluster_ctrc_participant_delegated_close_snapshot_shared(request.request_id, 3, &ignored));
+	UT_ASSERT(ctrc_bytes_zero(&ignored, sizeof(ignored)));
+	/* Even with no redundant children, own APPLIED and the incoming parent
+	 * still forbid any upstream release. */
+	expected = *sender;
+	UT_ASSERT(!cluster_ctrc_participant_delegation_merge_land_shared(&request));
+	UT_ASSERT(memcmp(sender, &expected, sizeof(expected)) == 0);
+	UT_ASSERT_EQ(sender->applied_count, 1);
+	UT_ASSERT(sender->delegation_parent.sequence != 0);
+	UT_ASSERT_EQ(enters, leaves);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_receiver_merge_observation_is_rechecked_before_the_existing_reply)
+{
+	for (unsigned phase = 1; phase <= 2; phase++) {
+		ClusterCtrcParticipantEntry *sender, *receiver, before;
+		ClusterCtrcDelegationCloseV1 request;
+		ClusterCtrcSealReplyHeaderV1 header;
+		ClusterCtrcLocalReleaseAckV1 ack;
+		ClusterICEnvelope env = {0};
+		uint8 reply[GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE], bytes[CLOSE_TEST_BYTES];
+
+		UT_ASSERT(close_merge_roundtrip_setup(false, &sender, &receiver, &request, reply));
+		before = *receiver;
+		UT_ASSERT(cluster_ctrc_delegation_close_encode_v1(&request, bytes, sizeof(bytes)));
+		cluster_node_id = request.receiver.node_id;
+		dispatch_self_boot = request.receiver.boot_incarnation;
+		env.msg_type = PGRAC_IC_MSG_GCS_BLOCK_FORWARD;
+		env.source_node_id = request.parent.node_id;
+		env.dest_node_id = request.receiver.node_id;
+		env.epoch = request.key.cluster_epoch;
+		env.payload_length = sizeof(bytes);
+		rechecks = 0;
+		fail_recheck = phase;
+		UT_ASSERT(gcs_block_try_ctrc_forward136(&env, bytes));
+		UT_ASSERT(cluster_ctrc_seal_reply_decode(close_reply + sizeof(GcsBlockReplyHeader),
+			BLCKSZ, bytes, sizeof(bytes), 3, 2, &header, &ack));
+		UT_ASSERT_EQ(header.result, CTRC_SEAL_REPLY_BLOCKED_RETAIN);
+		UT_ASSERT_EQ(header.first_reason, CTRC_SEAL_REASON_IDENTITY);
+		UT_ASSERT(memcmp(receiver, &before, sizeof(before)) == 0);
+		UT_ASSERT_EQ(sender->delegation_count, 1);
+		UT_ASSERT_EQ(enters, leaves);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
+UT_TEST(test_merge_landing_error_after_exact_retirement_leaves_admission_once)
+{
+	ClusterCtrcParticipantEntry *sender, *receiver, expected, receiver_before;
+	ClusterCtrcDelegationCloseV1 request;
+	uint8 reply[GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE];
+	volatile bool caught = false;
+
+	UT_ASSERT(close_merge_roundtrip_setup(false, &sender, &receiver, &request, reply));
+	expected = *sender;
+	receiver_before = *receiver;
+	MemSet(&expected.delegations[3], 0, sizeof(expected.delegations[3]));
+	expected.delegation_close_request_id[3] = 0;
+	expected.delegation_count = expected.last_delegation_sequence = 0;
+	wakeup_hook = throw_from_participant_wakeup;
+	PG_TRY();
+	{
+		(void)close_merge_land(reply);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	wakeup_hook = NULL;
+	UT_ASSERT(caught);
+	UT_ASSERT(memcmp(sender, &expected, sizeof(expected)) == 0);
+	UT_ASSERT(memcmp(receiver, &receiver_before, sizeof(receiver_before)) == 0);
+	UT_ASSERT_EQ(enters, leaves);
+	UT_ASSERT_EQ(held_count, 0);
+	UT_ASSERT_EQ(allocated, 0);
+	UT_ASSERT(close_merge_land(reply));
+	UT_ASSERT(memcmp(sender, &expected, sizeof(expected)) == 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(19);
+	UT_PLAN(29);
 	UT_RUN(test_actual_delegated_close_enters_drain_and_retains_parent);
 	UT_RUN(test_actual_delegated_close_malformed_is_consumed_without_mutation);
 	UT_RUN(test_delegated_close_codec_is_explicit_and_roundtrips_all_binding_fields);
@@ -877,6 +1334,16 @@ main(void)
 	UT_RUN(test_background_error_cleans_original_batch_and_admission_but_keeps_retry_identity);
 	UT_RUN(test_background_selector_has_one_circumference_budget_and_fair_child_rotation);
 	UT_RUN(test_background_sequence_allocation_rechecks_the_exact_row_after_original_lock_gap);
+	UT_RUN(test_qualified_existing_receiver_reports_merge_without_changing_its_parent);
+	UT_RUN(test_actual_merge_reply_retires_only_the_exact_redundant_pending);
+	UT_RUN(test_merge_pending_retirement_never_renumbers_other_children);
+	UT_RUN(test_merge_result_is_only_explicit_wire3_without_any_release_payload);
+	UT_RUN(test_merge_observation_never_qualifies_unknown_closed_or_conflicting_receivers);
+	UT_RUN(test_actual_merge_reply_rejects_framing_digest_and_stale_request_without_mutation);
+	UT_RUN(test_actual_merge_reply_requires_live_boot_hello_root_and_current_admission);
+	UT_RUN(test_actual_merge_reply_keeps_hello_separate_and_duplicate_is_a_noop);
+	UT_RUN(test_receiver_merge_observation_is_rechecked_before_the_existing_reply);
+	UT_RUN(test_merge_landing_error_after_exact_retirement_leaves_admission_once);
 	free(CtrcShared);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

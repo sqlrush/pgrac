@@ -427,8 +427,8 @@ ctrc_delegation_path_valid(const ClusterCtrcDelegationPathV2 *path,
 	return true;
 }
 
-/* No subtree ACK implementation may retire this pending custody yet. A zero
- * count alone cannot conceal an occupied slot or a consumed sequence. */
+/* Merge-only pending retirement cannot remove accepted parent/path custody.
+ * A zero count alone cannot conceal any occupied slot or correlation. */
 static bool
 ctrc_participant_delegations_empty(const ClusterCtrcParticipantEntry *participant)
 {
@@ -466,7 +466,12 @@ ctrc_participant_delegations_valid(const ClusterCtrcParticipantEntry *participan
 		return false;
 	if (participant->delegation_reserved != 0
 		|| participant->delegation_count >= CLUSTER_CTRC_MAX_PARTICIPANTS
-		|| participant->last_delegation_sequence != participant->delegation_count)
+		|| participant->last_delegation_sequence >= CLUSTER_CTRC_MAX_PARTICIPANTS
+		|| participant->last_delegation_sequence < participant->delegation_count
+		/* Only a closed row can retire redundant pending custody. Keep every
+		 * remaining sequence unchanged; OPEN publication is still dense. */
+		|| (participant->state != CTRC_PARTICIPANT_CLOSED_DRAINING
+			&& participant->last_delegation_sequence != participant->delegation_count))
 		return false;
 	for (uint16 node = 0; node < CLUSTER_CTRC_MAX_PARTICIPANTS; node++) {
 		const ClusterCtrcDelegationCustodyV1 *entry = &participant->delegations[node];
@@ -1146,7 +1151,11 @@ cluster_ctrc_seal_reply_encode(const uint8 *request_bytes, Size request_length, 
 			request_bytes, request_length,
 			ack != NULL ? ack->transaction_key.system_identifier : UINT64_C(1), destination_node,
 			source_node, current_epoch, &request, &ignored_key)
-		|| !ctrc_reply_result_valid(result, request.suboperation, first_reason, ack)
+		|| !(ctrc_reply_result_valid(result, request.suboperation, first_reason, ack)
+			|| (request.wire_version == CLUSTER_CTRC_DELEGATION_CLOSE_WIRE_VERSION
+				&& result == CTRC_SEAL_REPLY_DELEGATION_MERGED
+				&& request.suboperation == CTRC_SEAL_CLOSE_AND_CLEAN
+				&& first_reason == 0 && ack == NULL))
 		|| (request.wire_version == CLUSTER_CTRC_DELEGATION_CLOSE_WIRE_VERSION
 			&& (ack != NULL || result == CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK
 				|| result == CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED))
@@ -1229,8 +1238,11 @@ cluster_ctrc_seal_reply_decode(const uint8 *page, Size page_length, const uint8 
 	if (request.wire_version == CLUSTER_CTRC_DELEGATION_CLOSE_WIRE_VERSION
 		&& (carries_ack || page[40] == CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED))
 		return false;
-	if (!ctrc_reply_result_valid((ClusterCtrcSealReplyResult)page[40], page[41],
-								 ctrc_get_u16_le(page + 42), carries_ack ? &ack : NULL)
+	if (!(ctrc_reply_result_valid((ClusterCtrcSealReplyResult)page[40], page[41],
+				ctrc_get_u16_le(page + 42), carries_ack ? &ack : NULL)
+			|| (request.wire_version == CLUSTER_CTRC_DELEGATION_CLOSE_WIRE_VERSION
+				&& page[40] == CTRC_SEAL_REPLY_DELEGATION_MERGED
+				&& page[41] == CTRC_SEAL_CLOSE_AND_CLEAN && ctrc_get_u16_le(page + 42) == 0))
 		|| ctrc_get_u16_le(page + 46) != (carries_ack ? CLUSTER_CTRC_LOCAL_ACK_BYTES : 0))
 		return false;
 	if (carries_ack) {
@@ -4732,6 +4744,80 @@ cluster_ctrc_participant_delegated_close_matches_shared(const ClusterCtrcDelegat
 #endif
 }
 
+bool
+cluster_ctrc_participant_delegated_close_snapshot_shared(uint64 request_id, uint16 source_node,
+	ClusterCtrcDelegationCloseV1 *request_out)
+{
+	if (request_out != NULL)
+		MemSet(request_out, 0, sizeof(*request_out));
+#ifndef CLUSTER_CTRC_UNIT_TEST
+	if (request_out == NULL || request_id == 0 || request_id == UINT64_MAX
+		|| source_node >= CLUSTER_CTRC_MAX_PARTICIPANTS || cluster_node_id < 0
+		|| source_node == (uint16)cluster_node_id || !cluster_ctrc_shmem_ready())
+		return false;
+	/* Request IDs are allocated once from the original global sequence.
+	 * Search at most one participant circumference, then revalidate again
+	 * under the original shard when the protected reply is landed. */
+	for (uint64 index = 0; index < CtrcShared->participant_key_entries; index++) {
+		ClusterCtrcDelegationCloseV1 current = { 0 };
+		bool found;
+
+		CHECK_FOR_INTERRUPTS();
+		ctrc_participant_locks_acquire(ctrc_participant_lock_mask(index));
+		found = ctrc_participant_entries()[index].delegation_close_request_id[source_node] == request_id
+			&& ctrc_delegated_close_snapshot_locked(index, source_node, &current)
+			&& ctrc_delegation_close_valid(&current);
+		ctrc_participant_locks_release(ctrc_participant_lock_mask(index));
+		if (found) {
+			*request_out = current;
+			return true;
+		}
+	}
+#else
+	(void)request_id;
+	(void)source_node;
+#endif
+	return false;
+}
+
+bool
+cluster_ctrc_participant_delegation_merge_land_shared(const ClusterCtrcDelegationCloseV1 *request)
+{
+#ifndef CLUSTER_CTRC_UNIT_TEST
+	ClusterCtrcDelegationCloseV1 current;
+	ClusterCtrcParticipantEntry *participant;
+	uint64 index;
+	bool landed;
+
+	if (!ctrc_delegation_close_valid(request) || !cluster_ctrc_shmem_ready()
+		|| cluster_node_id < 0 || request->parent.node_id != (uint16)cluster_node_id
+		|| !ctrc_participant_index(&request->key, request->parent.node_id, &index))
+		return false;
+	ctrc_participant_locks_acquire(ctrc_participant_lock_mask(index));
+	landed = ctrc_delegated_close_snapshot_locked(index, request->receiver.node_id, &current)
+		&& memcmp(&current, request, sizeof(current)) == 0;
+	if (landed) {
+		participant = &ctrc_participant_entries()[index];
+		/* The caller authenticated an exact wire3 MERGED observation. This
+		 * was never an accepted tree edge: retain all local references and
+		 * the original incoming parent/path, not a subtree release ACK. */
+		MemSet(&participant->delegations[request->receiver.node_id], 0,
+			sizeof(participant->delegations[0]));
+		participant->delegation_close_request_id[request->receiver.node_id] = 0;
+		participant->delegation_count--;
+		if (participant->delegation_count == 0)
+			participant->last_delegation_sequence = 0;
+	}
+	ctrc_participant_locks_release(ctrc_participant_lock_mask(index));
+	if (landed)
+		ctrc_semantic_progress(true);
+	return landed;
+#else
+	(void)request;
+	return false;
+#endif
+}
+
 #ifndef CLUSTER_CTRC_UNIT_TEST
 static bool
 ctrc_cleaner_terminal_sample_mode(const ClusterCtrcTxnKeyV1 *key, bool capacity_probe,
@@ -7916,6 +8002,34 @@ cluster_ctrc_participant_delegated_close_shared(const ClusterCtrcDelegationClose
 	if (first_reason != NULL)
 		*first_reason = CTRC_SEAL_REASON_IDENTITY;
 	return CTRC_SEAL_REPLY_BLOCKED_RETAIN;
+#endif
+}
+
+bool
+cluster_ctrc_participant_delegation_merge_observed_shared(const ClusterCtrcDelegationCloseV1 *request)
+{
+#ifndef CLUSTER_CTRC_UNIT_TEST
+	ClusterCtrcDelegationCustodyV1 incoming;
+	uint64 index;
+	bool merged;
+
+	if (!ctrc_delegation_close_valid(request) || !cluster_ctrc_shmem_ready()
+		|| cluster_node_id < 0 || request->receiver.node_id != (uint16)cluster_node_id
+		|| !ctrc_participant_index(&request->key, request->receiver.node_id, &index))
+		return false;
+	incoming.receiver = request->parent;
+	incoming.sequence = request->delegation_sequence;
+	ctrc_participant_locks_acquire(ctrc_participant_lock_mask(index));
+	/* Reuse the original immutable merge predicate. This cannot adopt an
+	 * incoming parent, close the receiver, or qualify a raw-only row. */
+	merged = ctrc_participant_delegation_merge_matches(&ctrc_participant_entries()[index],
+		&request->key, &request->receiver, request->grant_generation, &incoming,
+		request->original_full_xid);
+	ctrc_participant_locks_release(ctrc_participant_lock_mask(index));
+	return merged;
+#else
+	(void)request;
+	return false;
 #endif
 }
 

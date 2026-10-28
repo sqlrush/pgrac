@@ -5566,7 +5566,7 @@ clean distclean maintainer-clean:
 		test_cluster_resource_x_failed_round_observation.inc \
 		test_cluster_pcm_aux_consumer.inc test_cluster_pcm_aux_ledger.inc test_cluster_pcm_writer_prepare.inc \
 		test_cluster_ctrc_dispatch.inc test_cluster_ctrc_delegation_close.inc \
-		test_cluster_ctrc_delegation_forward.inc \
+		test_cluster_ctrc_delegation_forward.inc test_cluster_ctrc_delegation_reply.inc \
 		test_cluster_ctrc_run_pass.inc \
 		test_cluster_ctrc_read_scope.inc \
 		test_cluster_undo_cleaner_holds.inc \
@@ -9191,9 +9191,17 @@ test_cluster_ctrc_delegation_forward.inc: $(top_srcdir)/src/backend/cluster/clus
 	     END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_ctrc_delegation_reply.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^gcs_block_land_delegation_merge_reply\(/ { print "static void"; emit=1; merge++ } \
+	     /^gcs_block_try_land_ctrc_reply\(/ { print "static bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (found != 1 || merge != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_ctrc_delegation_close: test_cluster_ctrc_delegation_close.c test_cluster_ctrc_dispatch.c \
 		test_cluster_ctrc_cleaner.c test_cluster_ctrc_dispatch.inc test_cluster_ctrc_delegation_close.inc \
-		test_cluster_ctrc_run_pass.inc test_cluster_ctrc_delegation_forward.inc unit_test.h $(CLUSTER_SCN_O) $(CLUSTER_UBA_O) \
+		test_cluster_ctrc_run_pass.inc test_cluster_ctrc_delegation_forward.inc \
+		test_cluster_ctrc_delegation_reply.inc unit_test.h $(CLUSTER_SCN_O) $(CLUSTER_UBA_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
 		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
