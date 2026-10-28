@@ -2407,6 +2407,10 @@ AlterDatabase(ParseState *pstate, AlterDatabaseStmt *stmt, bool isTopLevel)
 					 errmsg("invalid connection limit: %d", dbconnlimit)));
 	}
 
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedDatabaseWrite("ALTER DATABASE");
+#endif
+
 	/*
 	 * Get the old tuple.  We don't need a lock on the database per se,
 	 * because we're not going to do anything that would mess up incoming

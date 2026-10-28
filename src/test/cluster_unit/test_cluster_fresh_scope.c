@@ -116,6 +116,11 @@ char *DataDir, *cluster_shared_data_dir, *cluster_wal_threads_dir;
 char *cluster_undo_tablespace_path;
 static ControlFileData *ControlFile;
 static sigjmp_buf boundary;
+/* Native database options stop before a catalog lock or move restriction. */
+static bool database_options_lookup_active, database_options_expect_binding,
+	database_options_expected_top;
+static unsigned database_options_lookups, database_options_unbound, database_options_bad_lookup,
+	database_options_restrictions, database_options_unexpected_dependencies;
 static int error_code;
 static char error_message[256], error_hint[256];
 static char error_detail[160];
@@ -268,6 +273,13 @@ ReadControlFile(void)
 void
 PreventInTransactionBlock(bool top, const char *stmt)
 {
+	if (database_options_lookup_active) {
+		database_options_restrictions++;
+		if (top != database_options_expected_top
+			|| strcmp(stmt, "ALTER DATABASE SET TABLESPACE") != 0)
+			database_options_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before the original restriction and move. */
+	}
 	(void)top;
 	(void)stmt;
 }
@@ -6401,6 +6413,14 @@ static unsigned role_rename_lookups, role_rename_unbound, role_rename_bad_lookup
 Relation
 table_open(Oid relationId, LOCKMODE lockmode)
 {
+	if (database_options_lookup_active) {
+		database_options_lookups++;
+		if (database_options_expect_binding && utility_binds == 0)
+			database_options_unbound++;
+		if (relationId != DatabaseRelationId || lockmode != RowExclusiveLock)
+			database_options_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before the real database catalog lock/query. */
+	}
 	if (database_identity_lookup_active) {
 		database_identity_lookups++;
 		if (database_identity_expect_binding && utility_binds == 0)
@@ -15917,10 +15937,334 @@ UT_TEST(test_native_database_identity_utility_warm_guards_preserve_binding)
 	database_identity_lookup_active = false;
 }
 
+/* Actual options prefix and int32 helper; Boolean/conflict and BIND helpers
+ * already come from the existing actual includes. No native query/move succeeds. */
+static void
+database_options_unexpected_move(const char *dbname, const char *tablespace)
+{
+	(void)dbname;
+	(void)tablespace;
+	database_options_unexpected_dependencies++;
+	siglongjmp(boundary, 3);
+}
+#define movedb(dbname, tablespace) database_options_unexpected_move((dbname), (tablespace))
+#include "test_cluster_fresh_database_options.inc"
+#undef movedb
+static AlterDatabaseStmt native_database_options_statement;
+static Node *database_options_expected_statement;
+static DefElem database_options_defs[4];
+static Integer database_options_integers[3];
+static String database_options_strings[2];
+static ListCell database_options_cells[4];
+static List database_options_list;
+
+static void
+reset_native_database_options(bool expect_binding, unsigned form)
+{
+	static const char *const names[]
+		= { "is_template", "allow_connections", "connection_limit", "tablespace" };
+	unsigned option_form = form % 8;
+
+	reset_create_preflight();
+	database_options_lookup_active = true;
+	database_options_expect_binding = expect_binding;
+	database_options_expected_top = form < 8;
+	database_options_lookups = database_options_unbound = database_options_bad_lookup
+		= database_options_restrictions = database_options_unexpected_dependencies = 0;
+	database_options_integers[0] = (Integer){ .type = T_Integer, .ival = 1 };
+	database_options_integers[1] = (Integer){ .type = T_Integer, .ival = 0 };
+	database_options_integers[2] = (Integer){ .type = T_Integer, .ival = -1 };
+	database_options_strings[0] = (String){ .type = T_String, .sval = "on" };
+	database_options_strings[1] = (String){ .type = T_String, .sval = "g_move_target" };
+	for (unsigned i = 0; i < 4; i++) {
+		database_options_defs[i] = (DefElem){ .type = T_DefElem,
+											  .defname = (char *)names[i],
+											  .arg = i < 3 ? (Node *)&database_options_integers[i]
+														   : (Node *)&database_options_strings[1],
+											  .location = -1 };
+		database_options_cells[i].ptr_value = &database_options_defs[i];
+	}
+	database_options_list = (List){ .type = T_List,
+									.length = option_form < 5 ? 1 : 3,
+									.max_length = 4,
+									.elements = database_options_cells };
+	if (option_form == 2)
+		database_options_cells[0].ptr_value = &database_options_defs[1];
+	if (option_form == 3 || option_form == 4)
+		database_options_cells[0].ptr_value = &database_options_defs[2];
+	if (option_form == 4)
+		database_options_integers[2].ival = 0;
+	if (option_form == 5) {
+		database_options_integers[1].ival = 1;
+		database_options_integers[2].ival = 128;
+	}
+	if (option_form == 6)
+		for (unsigned i = 0; i < 3; i++)
+			database_options_defs[i].arg = NULL;
+	if (option_form == 7) {
+		database_options_defs[0].arg = (Node *)&database_options_strings[0];
+		database_options_integers[2].ival = 32;
+	}
+	native_database_options_statement
+		= (AlterDatabaseStmt){ .type = T_AlterDatabaseStmt,
+							   .dbname = form % 2 ? "options_database" : "other_options_database",
+							   .options = option_form ? &database_options_list : NIL };
+	database_options_expected_statement = (Node *)&native_database_options_statement;
+}
+
+static void
+native_database_options_entry(unsigned form)
+{
+	(void)form;
+	(void)AlterDatabase(NULL, &native_database_options_statement, database_options_expected_top);
+}
+
+UT_TEST(test_native_database_options_binds_before_first_query_in_all_profiles)
+{
+	for (unsigned form = 0; form < 16; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_database_options(binds, form);
+			set_native_operator_mode(mode);
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_database_options_entry(form);
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(database_options_lookups, repeat + 1);
+				UT_ASSERT_EQ(database_options_unbound, 0);
+				UT_ASSERT_EQ(database_options_bad_lookup + database_options_restrictions
+								 + database_options_unexpected_dependencies,
+							 0);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	database_options_lookup_active = false;
+}
+
+UT_TEST(test_native_database_options_refuses_before_lookup_on_publication_child_and_top_errors)
+{
+	for (unsigned form = 0; form < 16; form++) {
+		for (unsigned failure = 0; failure < 5; failure++) {
+			bool allocated = failure == 0 || failure == 2;
+			int caught;
+
+			reset_native_database_options(true, form);
+			if (failure == 0)
+				utility_bind_ok = false;
+			else if (failure == 1 || failure == 2) {
+				if (failure == 2)
+					create_sql_entry(database_options_expected_statement);
+				utility_in_child = true;
+			} else {
+				utility_current_xid = 401;
+				utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_database_options_entry(form);
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, failure == 0  ? ERRCODE_DATA_CORRUPTED
+									 : failure < 3 ? ERRCODE_FEATURE_NOT_SUPPORTED
+												   : ERRCODE_INTERNAL_ERROR);
+			UT_ASSERT_STR_EQ(
+				error_message,
+				failure == 0
+					? "canonical ACTIVE publication failed before shared catalog alteration"
+				: failure < 3 ? "shared catalog alteration does not support subtransactions"
+							  : "shared catalog top-level transaction identity mismatch");
+			UT_ASSERT_EQ(database_options_lookups, 0);
+			UT_ASSERT_EQ(database_options_unbound + database_options_bad_lookup
+							 + database_options_restrictions
+							 + database_options_unexpected_dependencies,
+						 0);
+			UT_ASSERT_EQ(utility_xids, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, failure == 2 ? 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, allocated || failure == 3 ? 400 : InvalidTransactionId);
+		}
+	}
+	database_options_lookup_active = false;
+}
+
+UT_TEST(test_native_database_options_context_guards_keep_nonshared_route)
+{
+	for (unsigned form = 0; form < 16; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+
+			for (unsigned guard = 0; guard < 3; guard++) {
+				int caught;
+
+				reset_native_database_options(binds, form);
+				set_native_operator_mode(mode);
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_database_options_entry(form);
+				UT_ASSERT_EQ(caught, binds ? 1 : 2);
+				UT_ASSERT_EQ(error_code, !binds		  ? 0
+										 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+													  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				if (binds)
+					UT_ASSERT(strstr(error_message, "ALTER DATABASE") != NULL);
+				UT_ASSERT_EQ(database_options_lookups, binds ? 0 : 1);
+				UT_ASSERT_EQ(database_options_unbound + database_options_bad_lookup
+								 + database_options_restrictions
+								 + database_options_unexpected_dependencies,
+							 0);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	database_options_lookup_active = false;
+}
+
+UT_TEST(test_native_database_options_utility_warm_guards_preserve_binding)
+{
+	for (unsigned form = 0; form < 16; form++) {
+		for (unsigned guard = 0; guard < 4; guard++) {
+			int caught;
+
+			reset_native_database_options(true, form);
+			create_sql_entry(database_options_expected_statement);
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			XactReadOnly = guard == 1;
+			utility_parallel = guard == 2;
+			utility_recovery = guard == 3;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_database_options_entry(form);
+			UT_ASSERT_EQ(caught, guard ? 1 : 2);
+			UT_ASSERT_EQ(error_code, !guard		  ? 0
+									 : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+												  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT_EQ(database_options_lookups, guard ? 0 : 1);
+			UT_ASSERT_EQ(database_options_unbound + database_options_bad_lookup
+							 + database_options_restrictions
+							 + database_options_unexpected_dependencies,
+						 0);
+			UT_ASSERT_EQ(utility_prepares, guard ? 1 : 2);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			UT_ASSERT_EQ(utility_top_xid, 400);
+		}
+	}
+	database_options_lookup_active = false;
+}
+
+UT_TEST(test_native_database_options_keeps_original_option_errors_before_binding)
+{
+	for (unsigned failure = 0; failure < 10; failure++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			for (unsigned top = 0; top < 2; top++) {
+				int caught;
+
+				reset_native_database_options(false, top ? 5 : 13);
+				set_native_operator_mode(mode);
+				database_options_list.length = 1;
+				if (failure < 4) {
+					database_options_cells[0].ptr_value = &database_options_defs[failure];
+					database_options_cells[1] = database_options_cells[0];
+					database_options_list.length = 2;
+				} else if (failure == 4)
+					database_options_defs[0].defname = "unexpected_database_option";
+				else if (failure == 5)
+					database_options_integers[0].ival = 2;
+				else if (failure == 6) {
+					database_options_cells[0].ptr_value = &database_options_defs[1];
+					database_options_strings[0].sval = "maybe";
+					database_options_defs[1].arg = (Node *)&database_options_strings[0];
+				} else if (failure == 7) {
+					database_options_cells[0].ptr_value = &database_options_defs[2];
+					database_options_strings[0].sval = "many";
+					database_options_defs[2].arg = (Node *)&database_options_strings[0];
+				} else if (failure == 8) {
+					database_options_cells[0].ptr_value = &database_options_defs[2];
+					database_options_integers[2].ival = -2;
+				} else {
+					database_options_cells[0].ptr_value = &database_options_defs[3];
+					database_options_cells[1].ptr_value = &database_options_defs[0];
+					database_options_list.length = 2;
+				}
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_database_options_entry(0);
+				UT_ASSERT_EQ(caught, 1);
+				UT_ASSERT_EQ(error_code, failure == 9	? ERRCODE_FEATURE_NOT_SUPPORTED
+										 : failure == 8 ? ERRCODE_INVALID_PARAMETER_VALUE
+														: ERRCODE_SYNTAX_ERROR);
+				UT_ASSERT_STR_EQ(
+					error_message,
+					failure < 4	   ? "conflicting or redundant options"
+					: failure == 4 ? "option \"unexpected_database_option\" not recognized"
+					: failure < 7  ? (failure == 5 ? "is_template requires a Boolean value"
+												   : "allow_connections requires a Boolean value")
+					: failure == 7 ? "connection_limit requires an integer value"
+					: failure == 8
+						? "invalid connection limit: -2"
+						: "option \"tablespace\" cannot be specified with other options");
+				UT_ASSERT_EQ(database_options_lookups + database_options_unbound
+								 + database_options_bad_lookup + database_options_restrictions
+								 + database_options_unexpected_dependencies,
+							 0);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	database_options_lookup_active = false;
+}
+
+UT_TEST(test_native_database_options_keeps_move_restriction_before_binding)
+{
+	for (unsigned mode = 0; mode < 8; mode++) {
+		for (unsigned top = 0; top < 2; top++) {
+			for (unsigned context = 0; context < 5; context++) {
+				int caught;
+
+				reset_native_database_options(false, top ? 0 : 8);
+				set_native_operator_mode(mode);
+				database_options_cells[0].ptr_value = &database_options_defs[3];
+				database_options_list.length = 1;
+				native_database_options_statement.options = &database_options_list;
+				create_sql_entry(database_options_expected_statement);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+				XactReadOnly = context == 1;
+				utility_parallel = context == 2;
+				utility_recovery = context == 3;
+				utility_in_child = context == 4;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_database_options_entry(0);
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(database_options_restrictions, 1);
+				UT_ASSERT_EQ(database_options_lookups + database_options_unbound
+								 + database_options_bad_lookup
+								 + database_options_unexpected_dependencies,
+							 0);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	database_options_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(249);
+	UT_PLAN(255);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -16170,6 +16514,12 @@ main(void)
 	UT_RUN(test_native_database_identity_refuses_before_lookup_on_publication_child_and_top_errors);
 	UT_RUN(test_native_database_identity_context_guards_keep_nonshared_route);
 	UT_RUN(test_native_database_identity_utility_warm_guards_preserve_binding);
+	UT_RUN(test_native_database_options_binds_before_first_query_in_all_profiles);
+	UT_RUN(test_native_database_options_refuses_before_lookup_on_publication_child_and_top_errors);
+	UT_RUN(test_native_database_options_context_guards_keep_nonshared_route);
+	UT_RUN(test_native_database_options_utility_warm_guards_preserve_binding);
+	UT_RUN(test_native_database_options_keeps_original_option_errors_before_binding);
+	UT_RUN(test_native_database_options_keeps_move_restriction_before_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
