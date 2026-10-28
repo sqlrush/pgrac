@@ -26,4 +26,21 @@ extern void test_xid_native_clog_start(bool fail);
 extern bool test_xid_native_clog_extend(FullTransactionId candidate);
 extern void test_xid_native_clog_state(XidNativeClogState *out);
 extern void test_xid_native_clog_stop(void);
+
+typedef enum XidNativeClogReplayFault
+{
+	XID_CLOG_REPLAY_VALID,
+	XID_CLOG_REPLAY_RESERVED,
+	XID_CLOG_REPLAY_PAGE,
+	XID_CLOG_REPLAY_SHORT,
+	XID_CLOG_REPLAY_BLOCKREF
+} XidNativeClogReplayFault;
+typedef struct XidNativeClogReplayState
+{
+	unsigned writes, inserts;
+	int64 file_size;
+	bool io_ok, file_existed, caught, target_zero, target_sentinel, neighbor_sentinel;
+} XidNativeClogReplayState;
+extern void test_xid_native_clog_replay(XidNativeClogReplayFault fault,
+									 XidNativeClogReplayState *out);
 #endif
