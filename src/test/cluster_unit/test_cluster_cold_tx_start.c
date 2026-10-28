@@ -2325,9 +2325,21 @@ UT_TEST(test_relmap_failure_revokes_original_episode_without_free_or_release)
 #include "test_cluster_cold_ctrc_page_prefix.inc"
 #include "test_cluster_cold_ctrc_unchanged_sync.inc"
 #include "test_cluster_cold_ctrc_pending_window.inc"
+#include "test_cluster_cold_ctrc_returned_fpi.inc"
 
 int main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_STARTUP_RETURNED_FPI") != NULL) {
+		UT_PLAN(7);
+		UT_RUN(test_startup_returned_durable_is_saved_before_page_cleanup);
+		UT_RUN(test_startup_returned_durable_survives_late_owner_loss);
+		UT_RUN(test_startup_returned_failed_operation_survives_late_owner_loss);
+		UT_RUN(test_startup_returned_durable_survives_page_cleanup_error);
+		UT_RUN(test_startup_returned_failed_operation_survives_page_cleanup_error);
+		UT_RUN(test_startup_returned_unchanged_cannot_advance_after_owner_loss);
+		UT_RUN(test_startup_returned_unchanged_cannot_advance_after_cleanup_error);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_STARTUP_PENDING_WINDOW") != NULL) {
 		UT_PLAN(5);
 		UT_RUN(test_startup_pending_fpi_uses_original_shared_window_without_advancing);
@@ -2423,7 +2435,14 @@ int main(void)
 		UT_RUN(test_ctrc_pages_native_error_retires_cursor_before_original_scope);
 		reset(); UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(179);
+	UT_PLAN(186);
+	UT_RUN(test_startup_returned_durable_is_saved_before_page_cleanup);
+	UT_RUN(test_startup_returned_durable_survives_late_owner_loss);
+	UT_RUN(test_startup_returned_failed_operation_survives_late_owner_loss);
+	UT_RUN(test_startup_returned_durable_survives_page_cleanup_error);
+	UT_RUN(test_startup_returned_failed_operation_survives_page_cleanup_error);
+	UT_RUN(test_startup_returned_unchanged_cannot_advance_after_owner_loss);
+	UT_RUN(test_startup_returned_unchanged_cannot_advance_after_cleanup_error);
 	UT_RUN(test_startup_pending_fpi_uses_original_shared_window_without_advancing);
 	UT_RUN(test_startup_pending_fpi_refuses_original_failed_window);
 	UT_RUN(test_startup_pending_fpi_cannot_rebind_a_later_original_window);
