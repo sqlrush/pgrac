@@ -1426,6 +1426,7 @@ test_cluster_startup_cf_callsite.inc: $(top_srcdir)/src/backend/access/transam/x
 	mv $@.tmp $@
 
 test_cluster_startup_cf_entry: test_cluster_startup_cf_entry.c test_cluster_cf_enqueue.c \
+		test_cluster_prepared_cf.h test_cluster_prepared_cf.inc \
 		test_cluster_startup_cf_entry.inc test_cluster_startup_cf_callsite.inc \
 		test_cluster_merge_cf_entry.inc \
 		test_cluster_merge_cold_cf.inc \
@@ -1437,8 +1438,25 @@ test_cluster_startup_cf_entry: test_cluster_startup_cf_entry.c test_cluster_cf_e
 		test_cluster_cf_blocker_trace.inc test_cluster_startup_interrupt.inc unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_cf_enqueue.c \
 		$(top_srcdir)/src/backend/cluster/cluster_lock_owner.c \
-		$(top_srcdir)/src/backend/cluster/cluster_control_request.c $(CLUSTER_LMD_WAIT_STATE_O)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+		$(top_srcdir)/src/backend/cluster/cluster_control_request.c $(CLUSTER_LMD_WAIT_STATE_O) \
+		$(CLUSTER_UNIT_CRYPTOHASH_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_PORT_LIBS) \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) $(LDFLAGS) $(filter -lcrypto,$(LIBS)) -o $@
+
+# Join both original prepared ROOT consumers and authority checks to CF/CONTROL.
+# Physical ROOT I/O and the all-member ACK observation remain explicit leaves.
+test_cluster_prepared_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_control_root.c \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_duty.c Makefile
+	awk 'FNR == NR && /^(write_u16_le|write_u32_le|write_u64_le|make_file_token)\(/ { print "static void"; emit=1; codecs++ } \
+	     FNR == NR && /^(control_root_sha256|bytes_are_zero|cluster_control_root_feature_bitmap_is_known|encode_round|file_token_equal)\(/ { print "static bool"; emit=1; predicates++ } \
+	     /^acquire_clusterwide_cf\(/ { print "static bool"; emit=1; acquires++ } \
+	     /^release_cf\(/ { print "static ClusterControlRootResult"; emit=1; releases++ } \
+	     /^(cluster_control_root_create_authority_current_v1|cluster_control_root_activate_authority_current_v1)\(/ { print "bool"; emit=1; authorities++ } \
+	     /^(cluster_control_root_create_prepared|cluster_control_root_activate_prepared)\(/ { print "ClusterControlRootResult"; emit=1; consumers++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (codecs != 4 || predicates != 5 || acquires != 1 || releases != 1 || authorities != 2 || consumers != 2 || emit) exit 1 }' \
+	     $(filter %.c,$^) > $@.tmp
+	mv $@.tmp $@
 
 # Original claim custody declaration and CF consumer, with the real CF producer.
 test_cluster_merge_cf_entry.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_merge.c Makefile

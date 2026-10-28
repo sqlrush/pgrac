@@ -6317,6 +6317,8 @@ UT_TEST(ordinary_recovery_complete_roles_keep_the_original_cf_wait_policy)
 	}
 }
 
+#include "test_cluster_prepared_cf.h"
+
 int
 main(void)
 {
@@ -6327,6 +6329,12 @@ main(void)
 	pg_atomic_init_u64(&owner_proc.cluster_grd_redeclare_acked_epoch, 0);
 	cluster_control_request_shmem_init();
 	retire_driver = cluster_control_request_driver_start();
+	if (getenv("PGRAC_PRE2_TEST_PREPARED_CF_LIVENESS") != NULL) {
+		UT_PLAN(1);
+		UT_RUN(lmon_prepared_cf_successful_publication_must_finish_original_round);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_SELF_CF_LIVENESS") != NULL) {
 		UT_PLAN(1);
 		UT_RUN(startup_self_seal_cf_slice_waits_for_exact_completion_in_both_intervals);
@@ -6345,7 +6353,7 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(83);
+	UT_PLAN(89);
 	UT_RUN(startup_cf_timeout_waits_for_exact_completion_before_begin);
 	UT_RUN(startup_cf_completion_does_not_preserve_changed_native_input);
 	UT_RUN(startup_cf_unsafe_native_context_never_takes_a_registry_lock);
@@ -6429,6 +6437,12 @@ main(void)
 	UT_RUN(startup_recovery_complete_original_preconditions_do_not_become_cf_waits);
 	UT_RUN(startup_recovery_complete_original_cancel_keeps_shared_cleanup_responsibility);
 	UT_RUN(ordinary_recovery_complete_roles_keep_the_original_cf_wait_policy);
+	UT_RUN(lmon_prepared_cf_requires_exact_retirement_before_reapply);
+	UT_RUN(lmon_prepared_cf_wrong_ack_cannot_release_the_original_request);
+	UT_RUN(lmon_prepared_cf_service_consumed_ack_still_finishes_own_receipt);
+	UT_RUN(lmon_prepared_cf_retry_rechecks_coordinator_and_prepared_ack);
+	UT_RUN(lmon_prepared_cf_real_token_and_round_failure_still_refuse);
+	UT_RUN(lmon_prepared_cf_hard_failure_never_publishes_root);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
