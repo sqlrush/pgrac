@@ -2007,6 +2007,142 @@ ClusterColdRecoveryCtrcPageAdvance(const struct ClusterRecoveryStartV1 *start,
 	return ready;
 }
 
+bool
+ClusterColdRecoveryCtrcPageCompletedCurrent(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, const RfPageCtrcFpiInsertV1 *inserted,
+	struct ClusterSharedFsPageV1 *storage)
+{
+	const ClusterColdCtrcPageProgressV1 *progress;
+
+	if (inserted == NULL || storage == NULL || CritSectionCount != 0
+		|| !ClusterColdRecoveryCtrcWorkCurrent(start, work)
+		|| !start->ctrc_observation_complete || work != start->ctrc_observation_work)
+		return false;
+	progress = start->ctrc_page_progress;
+	if (progress == NULL || progress->pending || progress->next_target != progress->target_count
+		|| progress->plan != start->ctrc_page_plan || progress->sources != start->ctrc_page_sources
+		|| progress->source_count != start->ctrc_page_source_count)
+		return false;
+	for (uint32 i = 0; i < progress->next_target; i++) {
+		const ClusterColdCtrcPageCompletedV1 *completed = &progress->completed[i];
+
+		if (inserted == &completed->result.inserted)
+			return storage == completed->storage
+				&& completed->result.phase == RF_PAGE_CTRC_STEP_FPI_DURABLE
+				&& inserted->wal_flushed && inserted->record_start < inserted->record_end
+				&& inserted->window.key.window_seq != 0;
+	}
+	return false;
+}
+
+/* The original result/FD vector remains owned by Start after F4 clear. Build
+ * only a temporary original PAGE/proof, then compare the entire retained
+ * operation again after both destructors, outside PAGE and before service. */
+static RfPageProofDetailV1
+cluster_recovery_cold_page_completed_attempt(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, ClusterWalInputsV1 *scope,
+	ClusterColdCtrcPageProgressV1 *progress, uint32 index,
+	const RfPageOnlineTargetViewV1 *view, const ClusterRecoveryCensusPageV1 *physical_page,
+	uint32 source_index)
+{
+	RfPageStableBaseProofV1 *volatile proof = NULL;
+	RfPageCtrcAuthorityV1 *volatile authority = NULL;
+	RfPageCtrcStepResultV1 saved = progress->completed[index].result;
+	struct ClusterSharedFsPageV1 *storage = progress->completed[index].storage;
+	const GenericXLogRecoveryImageV1 *image = &saved.inserted.image;
+	RfPageProofDetailV1 detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+	Size available = progress->budget - progress->reserved_bytes;
+	Size part = available / 3;
+
+	if (image->block_number != view->page_identity.blockno
+		|| memcmp(&image->identity, &physical_page->reservation.identity, sizeof(image->identity)) != 0
+		|| memcmp(&image->version.before, &view->expected_result, sizeof(view->expected_result)) != 0)
+		return RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+	PG_TRY();
+	{
+		RfPageStableCtrcBuildV1 built = rf_page_stable_base_proof_build_ctrc_replays_v1(
+			view->graph, start->ctrc_page_sources, start->ctrc_page_source_count, part);
+		proof = built.proof; detail = built.detail;
+		if (detail == RF_PAGE_PROOF_DETAIL_OK && proof != NULL
+			&& cluster_recovery_cold_page_advance_current(start, work, scope, progress)) {
+			RfPageAuthorityTargetV1 target = {0};
+			RfPageCtrcAuthorityBuildV1 page;
+
+			target.page_identity = view->page_identity; target.expected_result = view->expected_result;
+			target.stable_base = proof; target.source = view->source; target.contributors = view->contributors;
+			page = rf_page_authority_ctrc_replays_preflight_v1(&target, 1,
+				start->ctrc_page_sources, start->ctrc_page_source_count, part);
+			authority = page.authority;
+			detail = page.verdict == RF_PAGE_AUTHORITY_WOULD_BLOCK
+				? RF_PAGE_PROOF_DETAIL_WOULD_BLOCK : RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+			if (page.verdict == RF_PAGE_AUTHORITY_OK && authority != NULL
+				&& cluster_recovery_cold_page_advance_current(start, work, scope, progress)
+				&& index < progress->next_target && progress->completed[index].storage == storage
+				&& memcmp(&progress->completed[index].result, &saved, sizeof(saved)) == 0
+				&& ClusterColdRecoveryCtrcPageCompletedCurrent(start, work,
+					&progress->completed[index].result.inserted, storage))
+				detail = rf_page_recovery_ctrc_replays_completed_readback_v1(start, work,
+					&start->ctrc_page_sources[source_index], authority,
+					&progress->completed[index].result.inserted, storage,
+					work->counts.subject_count, available - 2 * part);
+		}
+		if (detail == RF_PAGE_PROOF_DETAIL_OK && proof == NULL)
+			detail = RF_PAGE_PROOF_DETAIL_INTERNAL;
+	}
+	PG_FINALLY();
+	{
+		RfPageCtrcAuthorityV1 *release = authority;
+		RfPageStableBaseProofV1 *discard = proof;
+		authority = NULL; proof = NULL;
+		rf_page_authority_ctrc_replays_destroy_v1(&release);
+		rf_page_stable_base_proof_destroy_v1(&discard);
+	}
+	PG_END_TRY();
+	if (!cluster_recovery_cold_page_advance_current(start, work, scope, progress)
+		|| index >= progress->next_target || progress->completed[index].storage != storage
+		|| memcmp(&progress->completed[index].result, &saved, sizeof(saved)) != 0)
+		return RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+	return detail;
+}
+
+static bool
+cluster_recovery_cold_page_completed_recheck(const struct ClusterRecoveryStartV1 *start)
+{
+	const ClusterColdCtrcWorkV1 *work = start->ctrc_observation_work;
+	ClusterWalInputsV1 *scope = start->ctrc_observation_inputs;
+	ClusterColdCtrcPageProgressV1 *progress = start->ctrc_page_progress;
+	uint32 index = 0;
+
+	if (!cluster_recovery_cold_page_advance_current(start, work, scope, progress)) return false;
+	if (progress == NULL) return rf_page_online_plan_target_count_v1(start->ctrc_page_plan) == 0;
+	for (;;) {
+		RfPageOnlineTargetViewV1 view;
+		ClusterRecoveryCensusPageV1 physical_page;
+		RfPageProofDetailV1 detail;
+		uint32 source_index;
+
+		ResetLatch(MyLatch);
+		HandleStartupProcInterrupts();
+		if (!cluster_recovery_cold_page_advance_current(start, work, scope, progress)
+			|| progress->pending || progress->next_target != progress->target_count) return false;
+		if (index == progress->target_count) return true;
+		/* Unchanged/history/non-heap targets retain their independent duties;
+		 * absence of a saved FPI never qualifies those targets here. */
+		if (progress->completed[index].storage == NULL) { index++; continue; }
+		if (!rf_page_online_plan_target_v1(start->ctrc_page_plan, index, &view)
+			|| view.history_only || view.page_identity.forknum != MAIN_FORKNUM
+			|| !cluster_recovery_cold_page_target(start, &view, &physical_page) || !physical_page.heap
+			|| !cluster_recovery_cold_page_tail(start, &view, &source_index)) return false;
+		detail = cluster_recovery_cold_page_completed_attempt(start, work, scope,
+			progress, index, &view, &physical_page, source_index);
+		if (detail == RF_PAGE_PROOF_DETAIL_OK) { index++; continue; }
+		if (detail != RF_PAGE_PROOF_DETAIL_WOULD_BLOCK) return false;
+		/* Same original owner and result; duration alone is not a refusal. */
+		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+			100L, WAIT_EVENT_CLUSTER_THREAD_RECOVERY);
+	}
+}
+
 /* Finish each exact bufferless FPI operation through the original protected
  * readback/current/local-debt path. Keep its full value and same raw FD for
  * the remaining fixed graph and independent joint service, not a new owner. */
@@ -2067,6 +2203,7 @@ ClusterColdRecoveryCtrcPageDrain(const struct ClusterRecoveryStartV1 *start,
 			progress->pending = false;
 			progress->next_target++;
 		}
+		if (ready) ready = cluster_recovery_cold_page_completed_recheck(start);
 	}
 	PG_CATCH();
 	{

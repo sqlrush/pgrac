@@ -249,6 +249,15 @@ extern bool ClusterColdRecoveryCtrcPageAdvance(const struct ClusterRecoveryStart
  * or joint service COMPLETE, relmap acceptance or OPEN is granted. */
 extern bool ClusterColdRecoveryCtrcPageDrain(const struct ClusterRecoveryStartV1 *start,
 	Size memory_budget);
+struct RfPageCtrcFpiInsertV1;
+struct ClusterSharedFsPageV1;
+/* Local immutable membership only: the ORIGINAL retained result address and
+ * SAME raw descriptor must belong to this Start's completed target vector.
+ * Safe under its original PAGE; no manifest I/O, cleanup or new authority.
+ * Full source/PAGE/writer/flush/bytes checks remain the readback's duty. */
+extern bool ClusterColdRecoveryCtrcPageCompletedCurrent(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work, const struct RfPageCtrcFpiInsertV1 *inserted,
+	struct ClusterSharedFsPageV1 *storage);
 extern const struct RfPageOnlinePlanV1 *ClusterColdRecoveryCtrcPagePlan(
 	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work);
 /* Original complete generation vector in the SAME sealed graph's participant

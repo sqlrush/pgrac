@@ -238,8 +238,8 @@ prefix_setup_targets(void)
 static void
 prefix_service_wait(void)
 {
- UT_ASSERT_EQ(prefix_steps, 1); UT_ASSERT_EQ(prefix_proofs, 2); UT_ASSERT_EQ(prefix_pages, 2);
- UT_ASSERT_EQ(prefix_destroyed, 4); /* Original execution and protected readback. */
+ UT_ASSERT_EQ(prefix_steps, 1); UT_ASSERT_EQ(prefix_proofs, 3); UT_ASSERT_EQ(prefix_pages, 3);
+ UT_ASSERT_EQ(prefix_destroyed, 6); /* Execution, pending and final readbacks. */
  UT_ASSERT(observation_scope_live && observation_cursor_live);
  /* Leave the real CTRC independent result pending, then cancel this fixture. */
  pg_re_throw();

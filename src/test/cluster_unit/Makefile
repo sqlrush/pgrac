@@ -13931,6 +13931,8 @@ test_cluster_cold_tx_start: test_cluster_cold_ctrc_pending_storage.inc
 # Original pending FPI protected same-descriptor readback.
 test_cluster_ctrc_native_fpi: test_cluster_ctrc_native_readback.inc
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_pending_readback.inc
+test_cluster_ctrc_native_fpi: test_cluster_ctrc_native_completed.inc
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_completed_readback.inc
 
 # Original local directory observation and Startup consumer.
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_local_empty.inc
