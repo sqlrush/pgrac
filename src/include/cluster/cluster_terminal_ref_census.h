@@ -916,6 +916,16 @@ extern Size cluster_ctrc_shmem_size(void);
 extern void cluster_ctrc_shmem_init(void);
 extern void cluster_ctrc_shmem_register(void);
 extern bool cluster_ctrc_shmem_ready(void);
+
+/* Instant local observation under all original directory locks. The caller
+ * holds zero LWLocks; contention or any nonzero entry retains obligations.
+ * EMPTY is not first/pin/remote-history discharge or permission to release. */
+typedef enum ClusterCtrcLocalEmptyV1 {
+	CLUSTER_CTRC_LOCAL_REFUSED = 0,
+	CLUSTER_CTRC_LOCAL_WAIT,
+	CLUSTER_CTRC_LOCAL_EMPTY
+} ClusterCtrcLocalEmptyV1;
+extern ClusterCtrcLocalEmptyV1 cluster_ctrc_recovery_local_empty_v1(void);
 extern const char *cluster_ctrc_stat_name(ClusterCtrcStatId stat);
 extern uint64 cluster_ctrc_stat_get(ClusterCtrcStatId stat);
 extern void cluster_ctrc_stat_bump(ClusterCtrcStatId stat);

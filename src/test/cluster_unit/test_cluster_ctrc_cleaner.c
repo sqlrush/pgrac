@@ -465,6 +465,7 @@ static XLogRecPtr (*origin_durability_hook)(int origin);
 static void (*barrier_hook)(void);
 static void (*pool_upgrade_hook)(void);
 static void (*wakeup_hook)(void);
+static void (*config_read_hook)(void);
 /* Optional boundary for a caller's native/truncation guards; shared CTRC
  * lock ordering is still checked by the original fixture below. */
 static bool (*external_lock_hook)(LWLock *lock, LWLockMode mode, bool acquire);
@@ -730,6 +731,7 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 	return true;
 }
 
+#ifndef CTRC_CLEANER_EXTERNAL_CONDITIONAL_PROVIDER
 bool
 LWLockConditionalAcquire(LWLock *lock, LWLockMode mode)
 {
@@ -751,6 +753,7 @@ LWLockConditionalAcquire(LWLock *lock, LWLockMode mode)
 		return false;
 	return LWLockAcquire(lock, mode);
 }
+#endif
 
 void
 LWLockRelease(LWLock *lock)
@@ -760,12 +763,14 @@ LWLockRelease(LWLock *lock)
 	test_lock_leave(lock);
 }
 
+#ifndef CTRC_CLEANER_EXTERNAL_HELD_PROVIDER
 void
 ForEachLWLockHeldByMe(void (*callback)(LWLock *, LWLockMode, void *), void *context)
 {
 	for (unsigned i = 0; i < held_count; i++)
 		callback((LWLock *)held_locks[i], LW_SHARED, context);
 }
+#endif
 
 static int
 test_clock_gettime(clockid_t clock_id pg_attribute_unused(), struct timespec *ts)
@@ -793,6 +798,7 @@ s_lock(volatile slock_t *lock pg_attribute_unused(), const char *file pg_attribu
 int
 cluster_conf_declared_node_count_early(void)
 {
+	if (config_read_hook != NULL) config_read_hook();
 	return 4;
 }
 
@@ -907,6 +913,7 @@ reset_fixture(void)
 	allow_new_service_participant = true;
 	new_service_participant_calls = 0;
 	external_lock_hook = NULL;
+	config_read_hook = NULL;
 	if (held_count != 0 || allocated != 0)
 		abort();
 	free(CtrcShared);

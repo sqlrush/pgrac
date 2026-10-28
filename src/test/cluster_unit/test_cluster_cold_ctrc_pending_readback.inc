@@ -6,6 +6,7 @@ static void
 pending_readback_reset(void)
 {
 	pending_readback_calls = pending_readback_mode = pending_readback_cleanups = 0;
+	startup_local_empty_reset();
 }
 
 RfPageProofDetailV1
