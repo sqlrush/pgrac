@@ -1049,6 +1049,7 @@ static void episode_controlled_clog_release(ClusterRelmapClogBaseHandleV1 **held
 #undef cluster_clog_relmap_base_release_v1
 
 static bool episode_native_clog;
+static unsigned episode_native_clog_calls;
 
 size_t
 cluster_clog_relmap_base_custody_bytes_v1(void)
@@ -1063,7 +1064,9 @@ cluster_clog_relmap_base_read_v1(const ClusterRecoveryRelmapSourceV1 *source,
 {
 	if (episode_native_clog) {
 		void *native = *held;
-		bool ok = test_episode_native_clog_read(source, full, out, &native);
+		bool ok;
+		episode_native_clog_calls++;
+		ok = test_episode_native_clog_read(source, full, out, &native);
 		*held = native;
 		return ok;
 	}
@@ -1092,6 +1095,7 @@ cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **held)
 #include "test_cluster_recovery_episode_clog_side.inc"
 #include "test_cluster_recovery_episode_birth_halfspace.inc"
 #include "test_cluster_recovery_episode_all_clog.inc"
+#include "test_cluster_recovery_episode_native_pages.inc"
 #include "test_cluster_recovery_episode_generation_xid.inc"
 #include "test_cluster_recovery_clog_full_roots.inc"
 
@@ -1103,6 +1107,14 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_NATIVE_PAGES") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_episode_native_pages_holds_all_origins_on_original_descriptors);
+		UT_RUN(test_episode_native_pages_partial_failure_keeps_all_open_custody);
+		UT_RUN(test_episode_native_pages_whole_capacity_budget_and_duplicate_preflight);
+		UT_RUN(test_episode_native_pages_alias_error_and_final_recheck_keep_debt);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_EPISODE_BIRTH_TERMINAL") != NULL) {
 		UT_PLAN(4);
 		UT_RUN(test_episode_birth_terminal_joins_source_counter_and_both_polarities_in_one_pass);
@@ -1297,7 +1309,11 @@ main(int argc, char **argv)
 		UT_RUN(test_episode_all_clog_whole_output_and_late_error_preserve_custody);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(203);
+	UT_PLAN(207);
+	UT_RUN(test_episode_native_pages_holds_all_origins_on_original_descriptors);
+	UT_RUN(test_episode_native_pages_partial_failure_keeps_all_open_custody);
+	UT_RUN(test_episode_native_pages_whole_capacity_budget_and_duplicate_preflight);
+	UT_RUN(test_episode_native_pages_alias_error_and_final_recheck_keep_debt);
 	UT_RUN(test_episode_all_clog_retains_every_source_without_changing_query_input);
 	UT_RUN(test_episode_all_clog_keeps_foreign_full_birth_and_its_own_counter);
 	UT_RUN(test_episode_all_clog_capacity_is_for_whole_set_not_query_origin);

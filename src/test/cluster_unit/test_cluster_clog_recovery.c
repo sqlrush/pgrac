@@ -16,6 +16,7 @@
  */
 #include "postgres.h"
 #include <dirent.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
 static int fixture_unlink(const char *path);
@@ -79,6 +80,9 @@ static struct {
 static unsigned fixture_lock_count;
 static void *allocations[300];
 static unsigned allocation_count;
+static void *fixture_shared_mutation;
+static Size fixture_shared_mutation_size;
+static void (*fixture_native_sync_hook)(void);
 
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
@@ -180,9 +184,23 @@ TransactionIdFollowsOrEquals(TransactionId a, TransactionId b)
 }
 
 void *
-ShmemInitStruct(const char *name pg_attribute_unused(), Size size, bool *found)
+ShmemInitStruct(const char *name, Size size, bool *found)
 {
 	void *p = calloc(1, size);
+	if (strcmp(name, "CLOG relmap mutation") == 0) {
+		free(p);
+		if (fixture_shared_mutation != NULL) {
+			if (size != fixture_shared_mutation_size) abort();
+			*found = true;
+			return fixture_shared_mutation;
+		}
+		p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_SHARED, -1, 0);
+		if (p == MAP_FAILED) abort();
+		fixture_shared_mutation = p;
+		fixture_shared_mutation_size = size;
+		*found = false;
+		return p;
+	}
 	if (p == NULL || allocation_count >= lengthof(allocations))
 		abort();
 	allocations[allocation_count++] = p;
@@ -337,6 +355,8 @@ int
 pg_fsync(int fd)
 {
 	struct stat st;
+	if (fixture_native_sync_hook != NULL)
+		fixture_native_sync_hook();
 	UT_ASSERT_EQ(fstat(fd, &st), 0);
 	synced_fd = fd;
 	if (S_ISDIR(st.st_mode)) {
@@ -1259,6 +1279,7 @@ UT_TEST(own_c0_native_error_and_revocation_preserve_cache_ownership)
 #include "test_cluster_clog_relmap_participant.inc"
 #include "test_cluster_clog_page_birth.inc"
 #include "test_cluster_clog_relmap_mutation.inc"
+#include "test_cluster_clog_relmap_shared_mutation.inc"
 
 static void
 fixture_cleanup(void)
@@ -1287,6 +1308,8 @@ fixture_cleanup(void)
 	}
 	for (unsigned i = 0; i < allocation_count; i++)
 		free(allocations[i]);
+	if (fixture_shared_mutation != NULL)
+		UT_ASSERT_EQ(munmap(fixture_shared_mutation, fixture_shared_mutation_size), 0);
 }
 
 #include "test_cluster_clog_full_consumer.inc"
@@ -1331,7 +1354,17 @@ main(void)
 		UT_RUN(relmap_native_mutation_during_first_or_final_root_refuses);
 		goto mutation_done;
 	}
-	UT_PLAN(47);
+	if (getenv("PGRAC_RELMAP_SHARED_MUTATION_ONLY") != NULL) {
+		UT_PLAN(6);
+		UT_RUN(relmap_other_process_terminal_aba_revokes_original_custody);
+		UT_RUN(relmap_other_process_zero_full_and_truncate_revoke);
+		UT_RUN(relmap_other_process_local_status_zero_and_redo_revoke);
+		UT_RUN(relmap_other_process_verify_refusal_and_origin_isolation);
+		UT_RUN(relmap_other_process_inflight_write_refuses_new_and_old_reads);
+		UT_RUN(relmap_other_process_mutation_during_root_cannot_publish);
+		goto mutation_done;
+	}
+	UT_PLAN(54);
 	UT_RUN(separate_original_origin_controls);
 	UT_RUN(commit_and_abort_persist_full_tree_without_local_pollution);
 	UT_RUN(conflicting_late_child_refuses_before_any_tree_write);
@@ -1379,6 +1412,13 @@ main(void)
 	UT_RUN(relmap_verify_refusal_other_origin_and_release_preserve_custody);
 	UT_RUN(relmap_failed_native_mutation_cannot_revalidate_old_bytes);
 	UT_RUN(relmap_native_mutation_during_first_or_final_root_refuses);
+	UT_RUN(relmap_other_process_terminal_aba_revokes_original_custody);
+	UT_RUN(relmap_other_process_zero_full_and_truncate_revoke);
+	UT_RUN(relmap_other_process_local_status_zero_and_redo_revoke);
+	UT_RUN(relmap_other_process_verify_refusal_and_origin_isolation);
+	UT_RUN(relmap_other_process_inflight_write_refuses_new_and_old_reads);
+	UT_RUN(relmap_other_process_mutation_during_root_cannot_publish);
+	UT_RUN(relmap_shared_mutation_saturation_and_missing_state_never_grant);
 mutation_done:
 	fixture_cleanup();
 	UT_DONE();
