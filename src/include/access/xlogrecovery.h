@@ -249,7 +249,8 @@ extern bool ClusterColdRecoveryCtrcPageAdvance(const struct ClusterRecoveryStart
  * under the original all-ITL projector and a frozen complete canonical terminal
  * vector, then every effective tuple xmin/xmax must bind its actual terminal
  * DATA ITL in that same whole image. Full current checks follow both predicates.
- * This does not prove HOT/history coverage. The vector and image scratch peak are
+ * Local HOT topology is checked against the actual target block; nonlocal
+ * and retained history coverage remain separate obligations. The vector and image scratch peak are
  * reserved before the first PAGE. No replay pin/history release, independent
  * or joint service COMPLETE, relmap acceptance or OPEN is granted. */
 extern bool ClusterColdRecoveryCtrcPageDrain(const struct ClusterRecoveryStartV1 *start,

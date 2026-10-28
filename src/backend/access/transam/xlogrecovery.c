@@ -2319,6 +2319,7 @@ cluster_recovery_cold_page_completed_recheck(const struct ClusterRecoveryStartV1
 			for (;;) {
 				RfPageCtrcReadbackImageV1 observed;
 				PGAlignedBlock projected;
+				RfPageOnlineTargetViewV1 target;
 
 				ResetLatch(MyLatch);
 				HandleStartupProcInterrupts();
@@ -2342,6 +2343,10 @@ cluster_recovery_cold_page_completed_recheck(const struct ClusterRecoveryStartV1
 						observed.image.data, projected.data) != CLUSTER_CTRC_ITL_CLEANOUT_ALREADY_TERMINAL
 					|| memcmp(&observed.image, &projected, sizeof(projected)) != 0
 					|| !cluster_ctrc_recovery_heap_itl_references_v1(observed.image.data)
+					|| !rf_page_online_plan_target_v1(start->ctrc_page_plan, index, &target)
+					|| target.history_only || target.page_identity.forknum != MAIN_FORKNUM
+					|| !cluster_ctrc_recovery_heap_hot_references_v1(observed.image.data,
+						target.page_identity.blockno)
 					|| !cluster_recovery_cold_page_projection_subjects(start, work, scope,
 						progress, subjects, &accepted, false)) break;
 				index++;

@@ -2339,9 +2339,18 @@ static void startup_local_empty_reset(void);
 #include "test_cluster_cold_ctrc_page_image.inc"
 #include "test_cluster_cold_ctrc_final_projection.inc"
 #include "test_cluster_cold_ctrc_heap_refs.inc"
+#include "test_cluster_cold_ctrc_hot_refs.inc"
 
 int main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_STARTUP_HOT_REFS") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_startup_final_hot_refs_use_each_actual_block_after_page_cleanup);
+		UT_RUN(test_startup_final_hot_refs_late_refusal_or_input_drift_prevents_handoff);
+		UT_RUN(test_startup_final_hot_refs_error_retains_original_fds_and_pins);
+		UT_RUN(test_startup_final_hot_refs_repeat_never_caches_topology_success);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_STARTUP_HEAP_REFS") != NULL) {
 		UT_PLAN(4);
 		UT_RUN(test_startup_final_heap_refs_consume_every_same_fd_image);
@@ -2545,7 +2554,12 @@ int main(void)
 		UT_RUN(test_ctrc_pages_native_error_retires_cursor_before_original_scope);
 		reset(); UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(240);
+	UT_PLAN(244);
+	UT_RUN(test_startup_final_hot_refs_use_each_actual_block_after_page_cleanup);
+	UT_RUN(test_startup_final_hot_refs_late_refusal_or_input_drift_prevents_handoff);
+	UT_RUN(test_startup_final_hot_refs_error_retains_original_fds_and_pins);
+	UT_RUN(test_startup_final_hot_refs_repeat_never_caches_topology_success);
+
 	UT_RUN(test_startup_final_heap_refs_consume_every_same_fd_image);
 	UT_RUN(test_startup_final_heap_refs_refusal_owner_or_work_drift_prevents_handoff);
 	UT_RUN(test_startup_final_heap_refs_error_keeps_original_fds_and_retention);
