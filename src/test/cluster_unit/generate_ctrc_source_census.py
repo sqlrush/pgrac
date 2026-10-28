@@ -564,6 +564,20 @@ _classify_owners(
     "LOCAL_RECEIPT_DISCHARGE_ONLY|RETAIN_PENDING_PARENT_CLOSE_ACK",
     "MXA-T21",
 )
+# Typed IMAGE copy intents retain the authenticated immutable parent first.
+# The original shared journal owns the new publication domain; no caller ID
+# or epoch inference can qualify it, and no page visibility is implied.
+for category in ("CTRC_ORIGIN_PROVENANCE", "CTRC_RECEIPT_LIFECYCLE"):
+    _classify_owners(
+        category, "src/backend/cluster/cluster_terminal_ref_census.c",
+        ("cluster_ctrc_itl_image_prepare_v1",),
+        "REGISTERED_REFERENCE",
+        "CTRC_REF_IMAGE_ITL_V1",
+        "CTRC_TARGET_PAGE_PENDING_ITL_SLOT|CTRC_TARGET_EXACT_ITL_SLOT",
+        "cluster_ctrc_receipt_apply_shared",
+        "cluster_ctrc_receipt_cancel_shared|cluster_ctrc_receipt_discharge_itl_shared|RETAIN_PENDING_PARENT_CLOSE_ACK",
+        "MXA-T40",
+    )
 # Ordinary DATA/PI source preparation registers the existing exact ITL
 # producer before publishing the bundle. Neither its local receipt nor a
 # rejected partial image may retire pending downstream CLOSE/ACK custody.
@@ -576,7 +590,7 @@ for path, owners in (
     _classify_owners(
         "CTRC_ORIGIN_PROVENANCE", path, owners,
         "REGISTERED_REFERENCE",
-        "CTRC_REF_HEAP_ITL_UBA",
+        "CTRC_REF_HEAP_ITL_UBA|CTRC_REF_IMAGE_ITL_V1",
         "CTRC_TARGET_PAGE_PENDING_ITL_SLOT|CTRC_TARGET_EXACT_ITL_SLOT",
         "cluster_ctrc_itl_delegate_prepare_v1",
         "RETAIN_PENDING_SUBTREE_CLOSE_ACK",
@@ -1208,7 +1222,7 @@ _classify_owners(
         "ctrc_cleaner_clean_itl_receipt",
     ),
     "TERMINAL_PROJECTION_DISCHARGE",
-    "CTRC_REF_HEAP_ITL_UBA",
+    "CTRC_REF_HEAP_ITL_UBA|CTRC_REF_IMAGE_ITL_V1",
     "CTRC_TARGET_EXACT_ITL_SLOT",
     "TERMINAL_INDEPENDENT_ITL_PROJECTION",
     "cluster_ctrc_receipt_discharge_itl_shared",

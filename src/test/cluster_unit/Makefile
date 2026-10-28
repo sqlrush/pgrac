@@ -2213,6 +2213,15 @@ test_cluster_heap_ctrc_origin_v2.inc: $(top_srcdir)/src/backend/cluster/cluster_
 	     END { if (found != 10 || done != 10 || emit) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Complete original publication-domain predicates shared by the existing
+# prepare/apply/ACK extracts. Keep the original per-family extraction gates.
+test_cluster_heap_ctrc_publication_domain.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
+	@awk 'BEGIN { pattern = "^(ctrc_itl_reference_kind|ctrc_publication_owner_valid|ctrc_image_target_domain_valid)\\(" } \
+	     $$0 ~ pattern { emit=1; count++; print "static bool" } \
+	     emit { print } /^}/ { if (emit) done++; emit=0 } \
+	     END { if (count != 3 || done != 3 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_heap_ctrc_participant.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
 	@awk 'BEGIN { pattern = "^(cluster_ctrc_origin_has_exact_touch|cluster_ctrc_origin_record_touched|cluster_ctrc_participant_index_compute|cluster_ctrc_participant_open|cluster_ctrc_receipt_prepare_shared_observed|ctrc_allocate_journal_sequence|ctrc_origin_protects_local_receipt_locked|ctrc_participant_identity_valid|ctrc_participant_index|ctrc_participant_locks_acquire|ctrc_participant_locks_release|ctrc_participant_receipt_heads|ctrc_publication_prepare_valid|ctrc_publication_request_equal|ctrc_receipt_chain_exact_locked|ctrc_receipt_entries|ctrc_receipt_handle_fill|ctrc_receipt_hash_bytes|ctrc_receipt_links|ctrc_receipt_prepare_existing_locked|ctrc_receipt_prepare_locators_valid_locked|ctrc_receipt_prepare_refused|ctrc_receipt_prepare_shared_internal|ctrc_receipt_prepare_table_observed|ctrc_receipt_prepare_with_sequence|ctrc_receipt_probe_hash|ctrc_receipt_probe_states|ctrc_receipt_publication_matches|ctrc_relation_namespace_valid|ctrc_target_pending_itl_valid|ctrc_target_pending_offnum_valid|ctrc_target_predecessor_version_valid)\\(" } \
 	     $$0 ~ pattern { name=$$0; sub(/\(.*/, "", name); if (seen[name]++) exit 1; order[++found]=name; ret=prev; sub(/^static[ \t]+/, "", ret); returns[name]="static " ret; emit=1; head=1 } \
@@ -2439,6 +2448,7 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_heap_ctrc_types.inc test_cluster_heap_ctrc_begin.inc \
 		test_cluster_heap_ctrc_step.inc test_cluster_heap_ctrc_origin.inc \
 		test_cluster_heap_ctrc_origin_v2.inc \
+		test_cluster_heap_ctrc_publication_domain.inc \
 		test_cluster_heap_ctrc_participant.inc test_cluster_heap_ctrc_terminal.inc \
 		test_cluster_heap_itl_finish_discharge.inc \
 		test_cluster_heap_itl_publication.inc \
@@ -5426,6 +5436,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_heap_ctrc_step.inc test_cluster_heap_ctrc_step.inc.tmp
 	rm -f test_cluster_heap_ctrc_origin.inc test_cluster_heap_ctrc_origin.inc.tmp
 	rm -f test_cluster_heap_ctrc_origin_v2.inc test_cluster_heap_ctrc_origin_v2.inc.tmp
+	rm -f test_cluster_heap_ctrc_publication_domain.inc test_cluster_heap_ctrc_publication_domain.inc.tmp
 	rm -f test_cluster_heap_ctrc_participant.inc test_cluster_heap_ctrc_participant.inc.tmp
 	rm -f test_cluster_heap_ctrc_terminal.inc test_cluster_heap_ctrc_terminal.inc.tmp
 	rm -f test_cluster_heap_itl_finish_discharge.inc test_cluster_heap_itl_finish_discharge.inc.tmp

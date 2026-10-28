@@ -86,7 +86,7 @@
 #endif
 
 #define CLUSTER_CTRC_SHMEM_MAGIC UINT32_C(0x43545243)
-#define CLUSTER_CTRC_SHMEM_VERSION UINT32_C(15)
+#define CLUSTER_CTRC_SHMEM_VERSION UINT32_C(16)
 #ifndef CLUSTER_CTRC_TEST_TABLE_VISIT
 #define CLUSTER_CTRC_TEST_TABLE_VISIT(kind) ((void)0)
 #endif
@@ -1326,6 +1326,34 @@ ctrc_target_offnum_finalizes_exact(const ClusterCtrcPublicationIdV1 *publication
 }
 
 static bool
+ctrc_itl_reference_kind(uint8 kind)
+{
+	return kind == CTRC_REF_HEAP_ITL_UBA || kind == CTRC_REF_IMAGE_ITL_V1;
+}
+
+static bool
+ctrc_publication_owner_valid(const ClusterCtrcPublicationIdV1 *publication)
+{
+	if (publication->reference_kind == CTRC_REF_IMAGE_ITL_V1)
+		return publication->requester_backend_id == InvalidBackendId
+			&& publication->operation_id != 0
+			&& publication->wire_request_id == publication->operation_id
+			&& publication->attempt_generation == 1
+			&& (publication->journal_sequence == 0
+				|| publication->journal_sequence == publication->operation_id);
+	return publication->requester_backend_id > 0;
+}
+
+static bool
+ctrc_image_target_domain_valid(const ClusterCtrcTargetV1 *target)
+{
+	return target != NULL && target->page_operation_kind == CLUSTER_CTRC_IMAGE_INSTALL_V1
+		&& target->fork_number == MAIN_FORKNUM
+		&& target->publication_acquisition_epoch != 0
+		&& target->relation_persistence == RELPERSISTENCE_PERMANENT && target->needs_wal == 1;
+}
+
+static bool
 ctrc_publication_prepare_valid(const ClusterCtrcParticipantEntry *participant,
 							   const ClusterCtrcPublicationIdV1 *publication,
 							   const ClusterCtrcTargetV1 *target)
@@ -1337,16 +1365,18 @@ ctrc_publication_prepare_valid(const ClusterCtrcParticipantEntry *participant,
 		   && publication->requester_boot_incarnation == participant->identity.boot_incarnation
 		   && publication->capability_record_generation
 				  == participant->identity.capability_record_generation
-		   && publication->requester_backend_id > 0 && publication->wire_request_id != 0
+		   && ctrc_publication_owner_valid(publication) && publication->wire_request_id != 0
 		   && publication->operation_id != 0 && publication->attempt_generation != 0
 		   && publication->reserved8 == 0 && publication->journal_sequence == 0
 		   && publication->key_sequence == 0 && publication->journal_slot_generation == 0
 		   && publication->grant_generation == participant->grant_generation
-		   && ((publication->reference_kind == CTRC_REF_HEAP_ITL_UBA
+		   && ((ctrc_itl_reference_kind(publication->reference_kind)
 				&& publication->descriptor_hash == 0 && publication->member_ordinal == UINT16_MAX
 				&& publication->member_role == 0
 				&& publication->target_kind == CTRC_TARGET_PAGE_PENDING_ITL_SLOT
-				&& ctrc_target_pending_itl_valid(target))
+				&& ctrc_target_pending_itl_valid(target)
+				&& (publication->reference_kind != CTRC_REF_IMAGE_ITL_V1
+					|| ctrc_image_target_domain_valid(target)))
 			   || (publication->reference_kind >= CTRC_REF_CURRENT_MX_LOCKER
 				   && publication->reference_kind <= CTRC_REF_HOT_FOLLOW_EDGE
 				   && publication->descriptor_hash != 0
@@ -5946,7 +5976,7 @@ cluster_ctrc_itl_delegate_prepare_v1(
 			&& receipt->publication.requester_boot_incarnation == sender->boot_incarnation
 			&& receipt->publication.capability_record_generation
 				== sender->capability_record_generation
-			&& receipt->publication.reference_kind == CTRC_REF_HEAP_ITL_UBA
+			&& ctrc_itl_reference_kind(receipt->publication.reference_kind)
 			&& receipt->publication.target_kind == CTRC_TARGET_PAGE_PENDING_ITL_SLOT
 			&& receipt->disposition == CTRC_RELEASE_NONE
 			&& receipt->target.relation_persistence == RELPERSISTENCE_PERMANENT
@@ -5975,8 +6005,10 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 									 const ClusterKoPeerAdmissionV3 *continuation,
 									 ClusterCtrcPreparePath *path_out,
 									 const uint8 *received_origin_v2,
-									 const ClusterCtrcDelegationCustodyV1 *received_parent)
+									 const ClusterCtrcDelegationCustodyV1 *received_parent,
+									 bool image_publication)
 {
+	ClusterCtrcPublicationIdV1 image_identity = { 0 };
 	ClusterCtrcParticipantEntry *participant;
 	ClusterCtrcReceipt *receipts;
 	ClusterCtrcPrepareResult result;
@@ -6006,7 +6038,9 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 			*path_out = CLUSTER_CTRC_PREPARE_PATH_NAMESPACE;
 		return ctrc_receipt_prepare_refused(true);
 	}
-	if (handle == NULL || identity == NULL || publication == NULL || target == NULL
+	if (handle == NULL || identity == NULL || target == NULL
+		|| (image_publication ? publication != NULL : publication == NULL)
+		|| (!image_publication && publication->reference_kind == CTRC_REF_IMAGE_ITL_V1)
 		|| cluster_node_id < 0 || identity->node_id != (uint16)cluster_node_id
 		|| !cluster_ctrc_shmem_ready()
 		|| !ctrc_participant_index(key, identity->node_id, &participant_index)) {
@@ -6036,6 +6070,26 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 		if (path_out != NULL)
 			*path_out = CLUSTER_CTRC_PREPARE_PATH_JOURNAL;
 		return ctrc_receipt_prepare_refused(false);
+	}
+
+	if (image_publication) {
+		/* There is no accepted duplicate without a caller-owned handle:
+		 * this new copy intent needs a current object admission and a fresh
+		 * original journal operation. No backend slot or PID is invented. */
+		if (journal_sequence == 0 || received_parent == NULL || received_origin_v2 == NULL)
+			return ctrc_receipt_prepare_refused(false);
+		image_identity.requester_node_id = identity->node_id;
+		image_identity.requester_boot_incarnation = identity->boot_incarnation;
+		image_identity.capability_record_generation = identity->capability_record_generation;
+		image_identity.requester_backend_id = InvalidBackendId;
+		image_identity.wire_request_id = journal_sequence;
+		image_identity.operation_id = journal_sequence;
+		image_identity.attempt_generation = 1;
+		image_identity.member_ordinal = UINT16_MAX;
+		image_identity.reference_kind = CTRC_REF_IMAGE_ITL_V1;
+		image_identity.target_kind = CTRC_TARGET_PAGE_PENDING_ITL_SLOT;
+		image_identity.grant_generation = grant_generation;
+		publication = &image_identity;
 	}
 
 	/* The allocator above takes origin_lock exclusively. Recheck only after
@@ -6251,6 +6305,38 @@ done:
 	ctrc_participant_locks_release(lock_mask);
 	return accepted;
 }
+
+ClusterCtrcPrepareResult
+cluster_ctrc_itl_image_prepare_v1(const ClusterItlSlotData *slot,
+	const ClusterCtrcParticipantIdentity *authenticated_sender,
+	const ClusterCtrcParticipantIdentity *receiver, const uint8 *record, Size length,
+	const ClusterCtrcTargetV1 *pending_target, ClusterCtrcReceiptHandle *handle)
+{
+	ClusterCtrcTxnKeyV1 key;
+	ClusterCtrcDelegationCustodyV1 parent = { 0 };
+	FullTransactionId original;
+	uint32 grant;
+
+	if (handle != NULL)
+		MemSet(handle, 0, sizeof(*handle));
+	if (handle == NULL || !ctrc_target_pending_itl_valid(pending_target)
+		|| !ctrc_image_target_domain_valid(pending_target)
+		|| !cluster_ctrc_itl_delegate_accept_v1(slot, authenticated_sender, receiver, record, length))
+		return CLUSTER_CTRC_PREPARE_REFUSED;
+	/* The protective accept above validates every original/slot byte before
+	 * any receipt. Retain that parent even if object/journal/capacity refuses
+	 * this attempt. The shared engine rechecks immutable bytes under locks. */
+	if (!ctrc_txn_key_decode(record + 24, &key))
+		return CLUSTER_CTRC_PREPARE_REFUSED;
+	grant = ctrc_get_u32_le(record + 12);
+	if (!ctrc_delegation_first_hop_match(record, length, &key, authenticated_sender,
+		receiver, grant, &original, &parent.sequence))
+		return CLUSTER_CTRC_PREPARE_REFUSED;
+	parent.receiver = *authenticated_sender;
+	return ctrc_receipt_prepare_shared_internal(&key, receiver, grant, NULL,
+		pending_target, handle, NULL, NULL, record + 8, &parent, true);
+}
+
 #endif
 
 ClusterCtrcPrepareResult
@@ -6276,7 +6362,7 @@ cluster_ctrc_receipt_prepare_delegation_v1(const ClusterCtrcTxnKeyV1 *key,
 	 * publication. Parent/full identity are installed before its handle.
 	 * No re-signed origin V2 is synthesized for the delegated receiver. */
 	return ctrc_receipt_prepare_shared_internal(key, receiver, grant, publication,
-		target, handle, NULL, NULL, record + 8, &parent);
+		target, handle, NULL, NULL, record + 8, &parent, false);
 #else
 	return CLUSTER_CTRC_PREPARE_REFUSED;
 #endif
@@ -6296,7 +6382,7 @@ cluster_ctrc_receipt_prepare_origin_v2(const ClusterCtrcTxnKeyV1 *key,
 		return CLUSTER_CTRC_PREPARE_REFUSED;
 #ifndef CLUSTER_CTRC_UNIT_TEST
 	return ctrc_receipt_prepare_shared_internal(key, receiver, grant, publication,
-		target, handle, NULL, NULL, bytes, NULL);
+		target, handle, NULL, NULL, bytes, NULL, false);
 #else
 	return CLUSTER_CTRC_PREPARE_REFUSED;
 #endif
@@ -6322,7 +6408,7 @@ cluster_ctrc_receipt_prepare_shared_observed(const ClusterCtrcTxnKeyV1 *key,
 {
 #ifndef CLUSTER_CTRC_UNIT_TEST
 	return ctrc_receipt_prepare_shared_internal(key, identity, grant_generation, publication,
-												target, handle, NULL, path_out, NULL, NULL);
+												target, handle, NULL, path_out, NULL, NULL, false);
 #else
 	if (path_out != NULL)
 		*path_out = CLUSTER_CTRC_PREPARE_PATH_UNKNOWN;
@@ -6360,7 +6446,7 @@ cluster_ctrc_receipt_apply_prepared(ClusterCtrcParticipantEntry *participant,
 		|| receipt->publication.journal_sequence == 0 || receipt->publication.key_sequence == 0
 		|| receipt->publication.journal_slot_generation == 0)
 		return CLUSTER_CTRC_APPLY_FAIL_CLOSED;
-	target_valid = receipt->publication.reference_kind == CTRC_REF_HEAP_ITL_UBA
+	target_valid = ctrc_itl_reference_kind(receipt->publication.reference_kind)
 					   ? ctrc_target_exact_itl_valid(&participant->key, final_target)
 					   : ctrc_target_exact_tid_valid(&receipt->publication, final_target);
 	if (!target_valid)
@@ -6378,7 +6464,7 @@ cluster_ctrc_receipt_apply_prepared(ClusterCtrcParticipantEntry *participant,
 	}
 	if (expected != CTRC_RECEIPT_PREPARED)
 		return CLUSTER_CTRC_APPLY_FAIL_CLOSED;
-	target_finalizes = receipt->publication.reference_kind == CTRC_REF_HEAP_ITL_UBA
+	target_finalizes = ctrc_itl_reference_kind(receipt->publication.reference_kind)
 						   ? ctrc_target_itl_finalizes_prepared(&receipt->target, final_target)
 						   : ctrc_target_offnum_finalizes_exact(&receipt->publication,
 																&receipt->target, final_target);
@@ -6446,7 +6532,7 @@ ctrc_receipt_retarget_itl_exact(const ClusterCtrcParticipantEntry *participant,
 	publication = &receipt->publication;
 	current_target = &receipt->target;
 	if (publication->grant_generation != participant->grant_generation
-		|| publication->reference_kind != CTRC_REF_HEAP_ITL_UBA
+		|| !ctrc_itl_reference_kind(publication->reference_kind)
 		|| publication->target_kind != CTRC_TARGET_PAGE_PENDING_ITL_SLOT
 		|| publication->descriptor_hash != 0 || publication->member_ordinal != UINT16_MAX
 		|| publication->member_role != 0 || publication->journal_sequence == 0
@@ -6572,7 +6658,7 @@ cluster_ctrc_receipt_itl_reuse_candidate_shared(const ClusterCtrcReceiptHandle *
 	target = &receipt->target;
 	return pg_atomic_read_u32((pg_atomic_uint32 *)&receipt->state) == CTRC_RECEIPT_APPLIED
 		   && handle->participant->state == CTRC_PARTICIPANT_OPEN
-		   && receipt->publication.reference_kind == CTRC_REF_HEAP_ITL_UBA
+		   && ctrc_itl_reference_kind(receipt->publication.reference_kind)
 		   && receipt->publication.target_kind == CTRC_TARGET_PAGE_PENDING_ITL_SLOT
 		   && receipt->publication.grant_generation == handle->participant->grant_generation
 		   && receipt->disposition == CTRC_RELEASE_NONE
@@ -6695,7 +6781,7 @@ cluster_ctrc_receipt_discharge_itl(ClusterCtrcParticipantEntry *participant,
 		|| receipt->publication.grant_generation != participant->grant_generation
 		|| (participant->state != CTRC_PARTICIPANT_OPEN
 			&& participant->state != CTRC_PARTICIPANT_CLOSED_DRAINING)
-		|| receipt->publication.reference_kind != CTRC_REF_HEAP_ITL_UBA
+		|| !ctrc_itl_reference_kind(receipt->publication.reference_kind)
 		|| receipt->publication.target_kind != CTRC_TARGET_PAGE_PENDING_ITL_SLOT
 		|| !ctrc_target_exact_itl_valid(&participant->key, &receipt->target))
 		return CLUSTER_CTRC_DISCHARGE_RETAIN;
@@ -7775,15 +7861,17 @@ ctrc_receipt_snapshot_valid(const ClusterCtrcParticipantEntry *participant,
 		|| publication->requester_boot_incarnation != participant->identity.boot_incarnation
 		|| publication->capability_record_generation
 			   != participant->identity.capability_record_generation
-		|| publication->requester_backend_id <= 0 || publication->wire_request_id == 0
+		|| !ctrc_publication_owner_valid(publication) || publication->wire_request_id == 0
 		|| publication->operation_id == 0 || publication->attempt_generation == 0
 		|| publication->reserved8 != 0 || publication->journal_sequence == 0
 		|| publication->key_sequence == 0 || publication->journal_slot_generation == 0
 		|| publication->grant_generation != participant->grant_generation)
 		return false;
 
-	if (publication->reference_kind == CTRC_REF_HEAP_ITL_UBA) {
-		if (publication->descriptor_hash != 0 || publication->member_ordinal != UINT16_MAX
+	if (ctrc_itl_reference_kind(publication->reference_kind)) {
+		if ((publication->reference_kind == CTRC_REF_IMAGE_ITL_V1
+			 && !ctrc_image_target_domain_valid(&receipt->target))
+			|| publication->descriptor_hash != 0 || publication->member_ordinal != UINT16_MAX
 			|| publication->member_role != 0
 			|| publication->target_kind != CTRC_TARGET_PAGE_PENDING_ITL_SLOT)
 			return false;
@@ -8405,7 +8493,7 @@ ctrc_cleaner_companion_target_matches(const ClusterCtrcReceipt *original,
 					&& !SCN_VALID(slot->commit_scn);
 
 	return (data || lock) && terminal_matches
-		   && candidate->publication.reference_kind == CTRC_REF_HEAP_ITL_UBA
+		   && ctrc_itl_reference_kind(candidate->publication.reference_kind)
 		   && memcmp(&original->publication, &candidate->publication, sizeof(original->publication))
 				  != 0
 		   && b->kind == CTRC_TARGET_EXACT_ITL_SLOT && b->spc_oid == a->spc_oid
@@ -9081,7 +9169,7 @@ ctrc_cleaner_prepare_current_mx_successor(
 			&key, &participant, grant, &publication, &pending_target, &handles[prepared_count],
 			check_object ? &admission : NULL, NULL,
 			key.origin_node_id != (uint16)cluster_node_id
-				? proofs[source_ordinal].origin_fullxid_v2 : NULL, NULL);
+				? proofs[source_ordinal].origin_fullxid_v2 : NULL, NULL, false);
 		if (prepare_result != CLUSTER_CTRC_PREPARE_READY
 			&& prepare_result != CLUSTER_CTRC_PREPARE_DUPLICATE)
 			goto successor_failed;
@@ -9558,7 +9646,7 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 	if (participant == NULL || receipt == NULL
 		|| participant_index >= CtrcShared->participant_key_entries
 		|| receipt_index >= CtrcShared->receipt_entries
-		|| receipt->publication.reference_kind != CTRC_REF_HEAP_ITL_UBA
+		|| !ctrc_itl_reference_kind(receipt->publication.reference_kind)
 		|| receipt->state != CTRC_RECEIPT_APPLIED
 		|| receipt->key.origin_node_id != (uint16)cluster_node_id
 		|| !ctrc_target_exact_itl_valid(&receipt->key, &receipt->target)
@@ -9867,7 +9955,7 @@ ctrc_cleaner_read_scope_exact(const ClusterCtrcParticipantEntry *participant,
 		|| receipt->publication.journal_slot_generation == 0
 		|| memcmp(&receipt->key, &participant->key, sizeof(receipt->key)) != 0
 		|| receipt->target.fork_number < 0 || receipt->target.fork_number > MAX_FORKNUM
-		|| (receipt->publication.reference_kind == CTRC_REF_HEAP_ITL_UBA
+		|| (ctrc_itl_reference_kind(receipt->publication.reference_kind)
 				? !ctrc_target_exact_itl_valid(&receipt->key, &receipt->target)
 				: !ctrc_target_exact_tid_valid(&receipt->publication, &receipt->target))
 		|| !ctrc_participant_index(&receipt->key, participant->identity.node_id, &expected_index)
@@ -10042,7 +10130,7 @@ ctrc_cleaner_clean_next_receipt(void)
 	{
 		if (ctrc_cleaner_read_scope_begin(&participant, &receipt, participant_index, receipt_index,
 										  &serial)) {
-			if (receipt.publication.reference_kind == CTRC_REF_HEAP_ITL_UBA)
+			if (ctrc_itl_reference_kind(receipt.publication.reference_kind))
 				cleaned = ctrc_cleaner_clean_itl_receipt(&participant, &receipt, participant_index,
 														 receipt_index);
 			else

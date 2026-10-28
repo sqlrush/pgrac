@@ -7709,6 +7709,195 @@ UT_TEST(test_image_receiver_first_registration_revokes_prior_scan_cut)
 	}
 }
 
+
+/* IMAGE operations have no ordinary backend ID. They must receive their
+ * publication identity from the original shared journal, never from a PID,
+ * caller-selected sequence or a guessed backend slot. */
+static void
+image_pending_target(ClusterCtrcTargetV1 *target)
+{
+	ClusterCtrcPublicationIdV1 unused;
+
+	fixture_receipt_inputs(&ctrc_origin_entries()[0], 0, &unused, target);
+	target->page_operation_kind = CLUSTER_CTRC_IMAGE_INSTALL_V1;
+}
+
+UT_TEST(test_image_publication_allocates_original_journal_identity_without_backend)
+{
+	ClusterCtrcReceiptHandle source, image;
+	ClusterCtrcParticipantIdentity receiver;
+	ClusterItlSlotData slot;
+	ClusterCtrcTargetV1 pending;
+	uint8 record[224];
+	uint64 index, next;
+
+	UT_ASSERT(seed_delegation_receive(&source, &receiver, &slot, record, &index));
+	image_pending_target(&pending);
+	next = CtrcShared->global_journal_generation;
+	UT_ASSERT_EQ(cluster_ctrc_itl_image_prepare_v1(&slot, &source.participant->identity,
+		&receiver, record, sizeof(record), &pending, &image), CLUSTER_CTRC_PREPARE_READY);
+	UT_ASSERT(image.valid);
+	if (!image.valid)
+		return;
+	UT_ASSERT_EQ(image.receipt->publication.reference_kind, CTRC_REF_IMAGE_ITL_V1);
+	UT_ASSERT_EQ(image.receipt->publication.requester_backend_id, InvalidBackendId);
+	UT_ASSERT_EQ(image.receipt->publication.operation_id, next);
+	UT_ASSERT_EQ(image.receipt->publication.wire_request_id, next);
+	UT_ASSERT_EQ(image.receipt->publication.journal_sequence, next);
+	UT_ASSERT_EQ(CtrcShared->global_journal_generation, next + 1);
+	UT_ASSERT_EQ(image.participant_index, index);
+	UT_ASSERT_EQ(image.participant->delegation_parent.sequence, 1);
+	UT_ASSERT(FullTransactionIdEquals(image.original_full_xid, source.original_full_xid));
+	UT_ASSERT_EQ(image.participant->prepared_count, 1);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_image_publication_uses_exact_original_apply_and_premutation_cancel)
+{
+	ClusterCtrcReceiptHandle source, image, cancelled;
+	ClusterCtrcParticipantIdentity receiver;
+	ClusterItlSlotData slot;
+	ClusterCtrcTargetV1 pending, exact, wrong;
+	ClusterCtrcApplyToken token;
+	uint8 record[224];
+	uint64 index;
+
+	UT_ASSERT(seed_delegation_receive(&source, &receiver, &slot, record, &index));
+	image_pending_target(&pending);
+	UT_ASSERT_EQ(cluster_ctrc_itl_image_prepare_v1(&slot, &source.participant->identity,
+		&receiver, record, sizeof(record), &pending, &image), CLUSTER_CTRC_PREPARE_READY);
+	if (!image.valid)
+		return;
+	exact = pending;
+	exact.kind = CTRC_TARGET_EXACT_ITL_SLOT;
+	exact.itl_xid = slot.xid;
+	exact.itl_slot_wrap = slot.wrap;
+	exact.itl_class = slot.flags;
+	memcpy(exact.uba, &slot.undo_segment_head, sizeof(exact.uba));
+	exact.planned_predecessor_sha256[0] = 1;
+	UT_ASSERT(cluster_ctrc_sha256_exact(&slot, sizeof(slot), exact.planned_successor_sha256));
+	wrong = exact;
+	wrong.block_number++;
+	UT_ASSERT_EQ(cluster_ctrc_receipt_apply_shared(&image, &wrong, &token),
+		CLUSTER_CTRC_APPLY_RETRY_REQUIRED);
+	UT_ASSERT_EQ(image.receipt->state, CTRC_RECEIPT_PREPARED);
+	UT_ASSERT(!token.valid);
+	UT_ASSERT_EQ(cluster_ctrc_receipt_apply_shared(&image, &exact, &token),
+		CLUSTER_CTRC_APPLY_APPLIED);
+	UT_ASSERT(token.valid);
+	UT_ASSERT(!cluster_ctrc_receipt_cancel_shared(&image));
+	UT_ASSERT_EQ(image.receipt->state, CTRC_RECEIPT_APPLIED);
+	UT_ASSERT_EQ(cluster_ctrc_itl_image_prepare_v1(&slot, &source.participant->identity,
+		&receiver, record, sizeof(record), &pending, &cancelled), CLUSTER_CTRC_PREPARE_READY);
+	UT_ASSERT(cancelled.valid);
+	if (!cancelled.valid)
+		return;
+	UT_ASSERT(image.receipt->publication.operation_id != cancelled.receipt->publication.operation_id);
+	UT_ASSERT(cluster_ctrc_receipt_cancel_shared(&cancelled));
+	UT_ASSERT(ctrc_receipt_snapshot_valid(cancelled.participant, cancelled.receipt));
+	UT_ASSERT_EQ(image.participant->prepared_count, 0);
+	UT_ASSERT_EQ(image.participant->applied_count, 1);
+	UT_ASSERT_EQ(image.participant->cancelled_count, 1);
+	UT_ASSERT_EQ(image.participant->delegation_parent.sequence, 1);
+	UT_ASSERT_EQ(source.participant->delegation_count, 1);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_image_publication_refuses_invalid_target_before_custody_or_sequence)
+{
+	for (unsigned fault = 0; fault < 9; fault++) {
+		ClusterCtrcReceiptHandle source, image;
+		ClusterCtrcParticipantIdentity receiver;
+		ClusterItlSlotData slot;
+		ClusterCtrcTargetV1 pending;
+		ClusterCtrcParticipantEntry saved;
+		uint8 record[224];
+		uint64 index, next;
+
+		UT_ASSERT(seed_delegation_receive(&source, &receiver, &slot, record, &index));
+		image_pending_target(&pending);
+		switch (fault) {
+		case 0: pending.kind = CTRC_TARGET_EXACT_ITL_SLOT; break;
+		case 1: pending.page_operation_kind = 1; break;
+		case 2: pending.publication_acquisition_epoch = 0; break;
+		case 3: pending.publication_own_generation = 0; break;
+		case 4: pending.relation_persistence = 't'; break;
+		case 5: pending.needs_wal = false; break;
+		case 6: pending.block_number = InvalidBlockNumber; break;
+		case 7: pending.itl_xid = slot.xid; break;
+		case 8: pending.fork_number = FSM_FORKNUM; break;
+		}
+		saved = ctrc_participant_entries()[index];
+		next = CtrcShared->global_journal_generation;
+		MemSet(&image, 0xa5, sizeof(image));
+		UT_ASSERT_EQ(cluster_ctrc_itl_image_prepare_v1(&slot, &source.participant->identity,
+			&receiver, record, sizeof(record), &pending, &image), CLUSTER_CTRC_PREPARE_REFUSED);
+		UT_ASSERT(ctrc_bytes_zero(&image, sizeof(image)));
+		UT_ASSERT(memcmp(&saved, &ctrc_participant_entries()[index], sizeof(saved)) == 0);
+		UT_ASSERT_EQ(CtrcShared->global_journal_generation, next);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
+UT_TEST(test_image_publication_keeps_parent_when_journal_is_exhausted)
+{
+	ClusterCtrcReceiptHandle source, image;
+	ClusterCtrcParticipantIdentity receiver;
+	ClusterItlSlotData slot;
+	ClusterCtrcTargetV1 pending;
+	ClusterCtrcParticipantEntry saved;
+	uint8 record[224];
+	uint64 index;
+
+	UT_ASSERT(seed_delegation_receive(&source, &receiver, &slot, record, &index));
+	UT_ASSERT(cluster_ctrc_itl_delegate_accept_v1(&slot, &source.participant->identity,
+		&receiver, record, sizeof(record)));
+	saved = ctrc_participant_entries()[index];
+	image_pending_target(&pending);
+	CtrcShared->global_journal_generation = UINT64_MAX;
+	UT_ASSERT_EQ(cluster_ctrc_itl_image_prepare_v1(&slot, &source.participant->identity,
+		&receiver, record, sizeof(record), &pending, &image), CLUSTER_CTRC_PREPARE_REFUSED);
+	UT_ASSERT(ctrc_bytes_zero(&image, sizeof(image)));
+	UT_ASSERT(memcmp(&saved, &ctrc_participant_entries()[index], sizeof(saved)) == 0);
+	UT_ASSERT_EQ(CtrcShared->global_journal_generation, UINT64_MAX);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_image_publication_cannot_be_forged_through_ordinary_publication_api)
+{
+	for (unsigned fake_backend = 0; fake_backend < 2; fake_backend++) {
+		ClusterCtrcReceiptHandle source, image;
+		ClusterCtrcParticipantIdentity receiver;
+		ClusterItlSlotData slot;
+		ClusterCtrcTargetV1 pending;
+		ClusterCtrcPublicationIdV1 forged;
+		ClusterCtrcParticipantEntry saved;
+		uint8 record[224];
+		uint64 index, next;
+
+		UT_ASSERT(seed_delegation_receive(&source, &receiver, &slot, record, &index));
+		UT_ASSERT(cluster_ctrc_itl_delegate_accept_v1(&slot, &source.participant->identity,
+			&receiver, record, sizeof(record)));
+		saved = ctrc_participant_entries()[index];
+		fixture_receipt_inputs(&ctrc_origin_entries()[0], 9999, &forged, &pending);
+		image_pending_target(&pending);
+		forged.requester_node_id = receiver.node_id;
+		forged.requester_boot_incarnation = receiver.boot_incarnation;
+		forged.capability_record_generation = receiver.capability_record_generation;
+		forged.requester_backend_id = fake_backend ? 11 : InvalidBackendId;
+		forged.wire_request_id = forged.operation_id;
+		forged.reference_kind = CTRC_REF_IMAGE_ITL_V1;
+		next = CtrcShared->global_journal_generation;
+		UT_ASSERT_EQ(cluster_ctrc_receipt_prepare_delegation_v1(&source.key,
+			&source.participant->identity, &receiver, source.participant->grant_generation,
+			&forged, &pending, record, sizeof(record), &image), CLUSTER_CTRC_PREPARE_REFUSED);
+		UT_ASSERT(!image.valid);
+		UT_ASSERT(memcmp(&saved, &ctrc_participant_entries()[index], sizeof(saved)) == 0);
+		UT_ASSERT_EQ(CtrcShared->global_journal_generation, next);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
 int
 main(void)
 {
@@ -7716,7 +7905,7 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(174);
+	UT_PLAN(179);
 	UT_RUN(test_prepare_path_namespace_precedes_input_and_resets_output);
 	UT_RUN(test_prepare_path_input_precedes_journal_exhaustion);
 	UT_RUN(test_prepare_path_chain_precedes_locator_and_keeps_blocked_state);
@@ -7894,6 +8083,11 @@ main(void)
 	UT_RUN(test_image_receiver_does_not_qualify_old_rows_or_replace_parent);
 	UT_RUN(test_image_receiver_custody_composes_with_original_receipt_prepare);
 	UT_RUN(test_image_receiver_first_registration_revokes_prior_scan_cut);
+	UT_RUN(test_image_publication_allocates_original_journal_identity_without_backend);
+	UT_RUN(test_image_publication_uses_exact_original_apply_and_premutation_cancel);
+	UT_RUN(test_image_publication_refuses_invalid_target_before_custody_or_sequence);
+	UT_RUN(test_image_publication_keeps_parent_when_journal_is_exhausted);
+	UT_RUN(test_image_publication_cannot_be_forged_through_ordinary_publication_api);
 	free(CtrcShared);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

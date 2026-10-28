@@ -718,7 +718,9 @@
  * Fresh homogeneous clusters only; no in-place upgrade. */
 /* First delegated receiver retains original parent identity/sequence.
  * Fresh homogeneous clusters only; no in-place upgrade. */
-#define CATALOG_VERSION_NO 202610274
+/* Versioned IMAGE ITL publication domain uses the original shared journal,
+ * not a backend ID. Fresh homogeneous clusters only; no in-place upgrade. */
+#define CATALOG_VERSION_NO 202610275
 
 /* spec-5.13 (2026-06-27): clean-leave catalog surface — cluster_get_clean_leave_state
  * SRF (oid 8960) + pg_cluster_clean_leave_state view + pg_cluster_clean_leave_request

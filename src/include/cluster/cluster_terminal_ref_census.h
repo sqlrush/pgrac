@@ -156,8 +156,14 @@ typedef enum ClusterCtrcReferenceKind {
 	CTRC_REF_CURRENT_MX_LOCKER = 2,
 	CTRC_REF_CURRENT_MX_UPDATER = 3,
 	CTRC_REF_RECOMPOSED_SURVIVOR = 4,
-	CTRC_REF_HOT_FOLLOW_EDGE = 5
+	CTRC_REF_HOT_FOLLOW_EDGE = 5,
+	/* Explicit publication domain; never an ordinary backend operation.
+	 * Canonical publication TLV tag 11 dispatches this versioned kind. */
+	CTRC_REF_IMAGE_ITL_V1 = 6
 } ClusterCtrcReferenceKind;
+
+/* In-process pending target operation; not an undo record opcode. */
+#define CLUSTER_CTRC_IMAGE_INSTALL_V1 UINT8_C(128)
 
 typedef enum ClusterCtrcTargetKind {
 	CTRC_TARGET_EXACT_ITL_SLOT = 1,
@@ -1027,9 +1033,21 @@ extern bool cluster_ctrc_itl_delegate_prepare_v1(
  * Retain the parent under the original participant -> receipt locks, even
  * before a local receipt exists. Exact retry only; no raw-only backfill,
  * alternate parent merge, page authority, local drain or subtree ACK. */
+
 extern bool cluster_ctrc_itl_delegate_accept_v1(const ClusterItlSlotData *slot,
 	const ClusterCtrcParticipantIdentity *authenticated_sender,
 	const ClusterCtrcParticipantIdentity *receiver, const uint8 *record, Size length);
+/* Prepare one IMAGE copy intent after retaining its original parent. No
+ * backend/PID or operation sequence is accepted from the caller. The original
+ * journal supplies one unique operation and receipt generation. A retry owns
+ * a new intent; retain the returned handle through apply or premutation cancel.
+ * This does not prove an image was installed or authorize page visibility. */
+extern ClusterCtrcPrepareResult cluster_ctrc_itl_image_prepare_v1(
+	const ClusterItlSlotData *slot,
+	const ClusterCtrcParticipantIdentity *authenticated_sender,
+	const ClusterCtrcParticipantIdentity *receiver, const uint8 *record, Size length,
+	const ClusterCtrcTargetV1 *pending_target, ClusterCtrcReceiptHandle *handle);
+
 /* First receipt at the delegated receiver only. authenticated_sender must
  * come from the existing protected current/PI transport, never the record.
  * A successful registration retains the parent before exposing a handle;
