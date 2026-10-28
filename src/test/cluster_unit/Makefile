@@ -10753,3 +10753,5 @@ test_cluster_cold_tx_start: test_cluster_startup_native_ctrc.h test_cluster_cold
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_untouched_pages.inc
 
 test_cluster_recovery_native_inputs: test_cluster_recovery_census_current_pages.inc
+
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_post_service.inc
