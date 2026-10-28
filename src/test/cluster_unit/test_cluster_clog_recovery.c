@@ -1312,6 +1312,7 @@ UT_TEST(own_c0_native_error_and_revocation_preserve_cache_ownership)
 #include "test_cluster_clog_page_birth.inc"
 #include "test_cluster_clog_relmap_mutation.inc"
 #include "test_cluster_clog_relmap_shared_mutation.inc"
+#include "test_cluster_clog_resident_birth.inc"
 
 static void
 fixture_cleanup(void)
@@ -1459,7 +1460,21 @@ main(void)
 		UT_RUN(relmap_native_advance_during_root_keeps_failure_and_custody);
 		goto mutation_done;
 	}
-	UT_PLAN(80);
+	if (getenv("PGRAC_RESIDENT_BIRTH_ONLY") != NULL) {
+		UT_PLAN(5);
+	UT_RUN(resident_birth_comes_from_native_full_producer_not_query);
+	UT_RUN(resident_birth_redo_legacy_and_wal_error_boundaries);
+	UT_RUN(resident_birth_cache_loss_refuses_held_rebase_and_disk_inference);
+	UT_RUN(resident_birth_is_rechecked_after_original_final_root);
+	UT_RUN(resident_birth_original_slru_remap_truncate_and_delete_clear_slots);
+		goto mutation_done;
+	}
+	UT_PLAN(85);
+	UT_RUN(resident_birth_comes_from_native_full_producer_not_query);
+	UT_RUN(resident_birth_redo_legacy_and_wal_error_boundaries);
+	UT_RUN(resident_birth_cache_loss_refuses_held_rebase_and_disk_inference);
+	UT_RUN(resident_birth_is_rechecked_after_original_final_root);
+	UT_RUN(resident_birth_original_slru_remap_truncate_and_delete_clear_slots);
 	UT_RUN(relmap_native_advance_refuses_old_counter_without_page_mutation);
 	UT_RUN(relmap_native_advance_noop_and_foreign_keep_original_observation);
 	UT_RUN(relmap_native_advance_during_root_keeps_failure_and_custody);

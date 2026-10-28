@@ -84,6 +84,11 @@ typedef struct ClusterRelmapClogBaseV1 {
 	/* Actual local next counter, not an issued XID or native era grant. */
 	bool native_next_observed;
 	uint64 next_full_xid;
+	/* Own clean resident FULL initialization, matched to the entire disk page.
+	 * Zero/unknown after legacy initialization, eviction or disk-only reload.
+	 * It is a native producer input, not issuance, era or lifetime authority. */
+	bool resident_birth_observed;
+	uint64 resident_first_full_xid;
 } ClusterRelmapClogBaseV1;
 typedef struct ClusterRelmapClogBaseHandleV1 ClusterRelmapClogBaseHandleV1;
 /* Start with *held NULL. Subsequent reads require the exact original source,
@@ -103,6 +108,11 @@ typedef struct ClusterRelmapClogBaseHandleV1 ClusterRelmapClogBaseHandleV1;
  * and whole-ROOT reads, requiring the same actual value and held baseline.
  * Its XidGenLock is released before all I/O; foreign counters stay unobserved.
  * A sampled next counter is not an issued receipt or era/lifetime authority.
+ * Own clean resident FULL initialization is compared with the entire fd page,
+ * then sampled again after original ROOT I/O under a short native ControlLock.
+ * Eviction, legacy initialization and disk-only reload supply no birth value;
+ * an attached observed/value pair cannot be replaced after metadata loss.
+ * Foreign origins never borrow this instance's resident initialization.
  * This does not exclude inter-instance writes or certify physical lifetime.
  * Missing/short/aliased files refuse. IN_PROGRESS stays IN_PROGRESS.
  * No caller native/CF lock or critical section; output/held/source are

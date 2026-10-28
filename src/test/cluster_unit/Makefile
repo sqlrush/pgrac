@@ -10703,3 +10703,9 @@ test_cluster_terminal_ref_census: test_cluster_ctrc_census_tuple_refs.inc
 test_cluster_terminal_ref_census: test_cluster_ctrc_census_hot.inc
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_census_hot.inc
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_cross_page.inc
+
+# PGRAC: every complete CLOG fixture consumer includes resident birth tests.
+# Author: SqlRush <sqlrush@gmail.com>
+test_cluster_clog_recovery test_cluster_side_native_clog.o \
+        test_cluster_recovery_episode_clog.o test_cluster_xid_native_clog.o: \
+        test_cluster_clog_resident_birth.inc
