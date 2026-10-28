@@ -34,6 +34,7 @@
 #include "catalog/pg_collation.h"
 #include "catalog/pg_control.h"
 #include "catalog/pg_extension.h"
+#include "catalog/pg_foreign_data_wrapper.h"
 #include "catalog/pg_foreign_server_d.h"
 #include "catalog/pg_language.h"
 #include "catalog/pg_namespace.h"
@@ -6188,6 +6189,8 @@ static unsigned collation_lookups, collation_unbound, collation_bad_lookup, coll
 static String collation_name_node;
 static ListCell collation_name_cell;
 static List collation_names;
+static bool fdw_lookup_active, fdw_expect_binding;
+static unsigned fdw_lookups, fdw_unbound, fdw_bad_lookup;
 static bool function_lookup_active, function_expect_binding;
 static unsigned function_entry_kind, function_lookups, function_unbound, function_bad_lookup;
 static unsigned function_lookup_kind;
@@ -6217,6 +6220,14 @@ get_database_oid(const char *dbname, bool missing_ok)
 Relation
 table_open(Oid relationId, LOCKMODE lockmode)
 {
+	if (fdw_lookup_active) {
+		fdw_lookups++;
+		if (fdw_expect_binding && utility_binds == 0)
+			fdw_unbound++;
+		if (relationId != ForeignDataWrapperRelationId || lockmode != RowExclusiveLock)
+			fdw_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before the real wrapper catalog lock. */
+	}
 	if (function_lookup_active) {
 		function_lookups++;
 		function_lookup_kind = 2;
@@ -9176,10 +9187,189 @@ UT_TEST(test_native_function_utility_warm_context_guards_preserve_binding)
 	function_lookup_active = false;
 }
 
+/* Actual FDW creation/alteration prefixes stop at their first catalog lock.
+ * Permission/handler/validator checks and catalog writes are not executed. */
+#include "test_cluster_fresh_fdw.inc"
+static CreateFdwStmt native_fdw_create;
+static AlterFdwStmt native_fdw_alter;
+static ParseState fdw_parse_state;
+
+static void
+reset_native_fdw(bool expect_binding)
+{
+	reset_create_preflight();
+	fdw_lookup_active = true;
+	fdw_expect_binding = expect_binding;
+	fdw_lookups = fdw_unbound = fdw_bad_lookup = 0;
+	native_fdw_create = (CreateFdwStmt){ .type = T_CreateFdwStmt, .fdwname = "preflight_fdw" };
+	native_fdw_alter = (AlterFdwStmt){ .type = T_AlterFdwStmt, .fdwname = "preflight_fdw" };
+}
+
+static Node *
+native_fdw_statement(unsigned kind)
+{
+	return kind ? (Node *)&native_fdw_alter : (Node *)&native_fdw_create;
+}
+
+static void
+native_fdw_entry(unsigned kind)
+{
+	if (kind)
+		(void)AlterForeignDataWrapper(&fdw_parse_state, &native_fdw_alter);
+	else
+		(void)CreateForeignDataWrapper(&fdw_parse_state, &native_fdw_create);
+}
+
+UT_TEST(test_native_fdw_binds_before_catalog_lock_in_all_profiles)
+{
+	for (unsigned kind = 0; kind < 2; kind++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_fdw(binds);
+			cluster_shared_catalog = (mode & 1) != 0;
+			utility_storage_mode = (mode & 2) != 0;
+			cluster_shared_config = (mode & 4) != 0;
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_fdw_entry(kind);
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(fdw_lookups, repeat + 1);
+				UT_ASSERT_EQ(fdw_bad_lookup, 0);
+				UT_ASSERT_EQ(fdw_unbound, 0);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	fdw_lookup_active = false;
+}
+
+UT_TEST(test_native_fdw_publication_child_and_wrong_top_precede_catalog_lock)
+{
+	for (unsigned kind = 0; kind < 2; kind++) {
+		for (unsigned failure = 0; failure < 5; failure++) {
+			bool allocated = failure == 0 || failure == 2;
+			int caught;
+
+			reset_native_fdw(true);
+			if (failure == 0)
+				utility_bind_ok = false;
+			else if (failure == 1 || failure == 2) {
+				if (failure == 2)
+					create_sql_entry(native_fdw_statement(kind));
+				utility_in_child = true;
+			} else {
+				utility_current_xid = 401;
+				utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_fdw_entry(kind);
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, failure == 0  ? ERRCODE_DATA_CORRUPTED
+									 : failure < 3 ? ERRCODE_FEATURE_NOT_SUPPORTED
+												   : ERRCODE_INTERNAL_ERROR);
+			if (failure == 0)
+				UT_ASSERT_STR_EQ(
+					error_message,
+					kind ? "canonical ACTIVE publication failed before shared catalog alteration"
+						 : "canonical ACTIVE publication failed before shared catalog creation");
+			else if (failure < 3)
+				UT_ASSERT_STR_EQ(error_message,
+								 kind ? "shared catalog alteration does not support subtransactions"
+									  : "shared catalog creation does not support subtransactions");
+			else
+				UT_ASSERT_STR_EQ(error_message,
+								 "shared catalog top-level transaction identity mismatch");
+			UT_ASSERT_EQ(fdw_lookups, 0);
+			UT_ASSERT_EQ(fdw_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_xids, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, failure == 2 ? 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, allocated || failure == 3 ? 400 : InvalidTransactionId);
+		}
+	}
+	fdw_lookup_active = false;
+}
+
+UT_TEST(test_native_fdw_context_guards_keep_nonshared_route)
+{
+	for (unsigned kind = 0; kind < 2; kind++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+
+			for (unsigned guard = 0; guard < 3; guard++) {
+				int caught;
+
+				reset_native_fdw(binds);
+				cluster_shared_catalog = (mode & 1) != 0;
+				utility_storage_mode = (mode & 2) != 0;
+				cluster_shared_config = (mode & 4) != 0;
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_fdw_entry(kind);
+				UT_ASSERT_EQ(caught, binds ? 1 : 2);
+				UT_ASSERT_EQ(error_code, !binds		  ? 0
+										 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+													  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				if (binds)
+					UT_ASSERT(strstr(error_message, kind ? "ALTER FOREIGN DATA WRAPPER"
+														 : "CREATE FOREIGN DATA WRAPPER")
+							  != NULL);
+				UT_ASSERT_EQ(fdw_lookups, binds ? 0 : 1);
+				UT_ASSERT_EQ(fdw_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	fdw_lookup_active = false;
+}
+
+UT_TEST(test_native_fdw_utility_warm_context_guards_preserve_binding)
+{
+	for (unsigned kind = 0; kind < 2; kind++) {
+		for (unsigned guard = 0; guard < 4; guard++) {
+			int caught;
+
+			reset_native_fdw(true);
+			create_sql_entry(native_fdw_statement(kind));
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			XactReadOnly = guard == 1;
+			utility_parallel = guard == 2;
+			utility_recovery = guard == 3;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_fdw_entry(kind);
+			UT_ASSERT_EQ(caught, guard ? 1 : 2);
+			UT_ASSERT_EQ(error_code, !guard		  ? 0
+									 : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+												  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT_EQ(fdw_lookups, guard ? 0 : 1);
+			UT_ASSERT_EQ(fdw_bad_lookup, 0);
+			UT_ASSERT_EQ(fdw_unbound, 0);
+			UT_ASSERT_EQ(utility_prepares, guard ? 1 : 2);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			UT_ASSERT_EQ(utility_top_xid, 400);
+		}
+	}
+	fdw_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(129);
+	UT_PLAN(133);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -9309,6 +9499,10 @@ main(void)
 	UT_RUN(test_native_function_publication_child_and_wrong_top_precede_catalog_lock);
 	UT_RUN(test_native_function_context_guards_keep_nonshared_route);
 	UT_RUN(test_native_function_utility_warm_context_guards_preserve_binding);
+	UT_RUN(test_native_fdw_binds_before_catalog_lock_in_all_profiles);
+	UT_RUN(test_native_fdw_publication_child_and_wrong_top_precede_catalog_lock);
+	UT_RUN(test_native_fdw_context_guards_keep_nonshared_route);
+	UT_RUN(test_native_fdw_utility_warm_context_guards_preserve_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

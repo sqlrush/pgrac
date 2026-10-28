@@ -9,6 +9,10 @@
  * IDENTIFICATION
  *	  src/backend/commands/foreigncmds.c
  *
+ * PGRAC MODIFICATIONS
+ *    Preflight shared foreign catalog commands before catalog access.
+ *    Author: SqlRush <sqlrush@gmail.com>
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -567,6 +571,38 @@ parse_func_options(ParseState *pstate, List *func_options,
 	}
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* Direct callers must bind before their first catalog lock. */
+static void
+PreflightClusterSharedFdwWrite(Node *stmt, bool alter)
+{
+	ClusterCanonicalTxnBinding binding;
+	TransactionId current_xid;
+	const char *command;
+	const char *action = alter ? "alteration" : "creation";
+
+	if (!cluster_shared_catalog || !cluster_storage_mode_enabled())
+		return;
+
+	command = CreateCommandName(stmt);
+	PreventCommandIfReadOnly(command);
+	PreventCommandIfParallelMode(command);
+	PreventCommandDuringRecovery(command);
+	if (IsSubTransaction())
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("shared catalog %s does not support subtransactions", action)));
+	current_xid = GetCurrentTransactionIdIfAny();
+	if (TransactionIdIsValid(current_xid)
+		&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("shared catalog top-level transaction identity mismatch")));
+	if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("canonical ACTIVE publication failed before shared catalog %s", action)));
+}
+#endif
+
 /*
  * Create a foreign-data wrapper
  */
@@ -586,6 +622,10 @@ CreateForeignDataWrapper(ParseState *pstate, CreateFdwStmt *stmt)
 	Oid			ownerId;
 	ObjectAddress myself;
 	ObjectAddress referenced;
+
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedFdwWrite((Node *)stmt, false);
+#endif
 
 	rel = table_open(ForeignDataWrapperRelationId, RowExclusiveLock);
 
@@ -703,6 +743,10 @@ AlterForeignDataWrapper(ParseState *pstate, AlterFdwStmt *stmt)
 	Oid			fdwhandler;
 	Oid			fdwvalidator;
 	ObjectAddress myself;
+
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedFdwWrite((Node *)stmt, true);
+#endif
 
 	rel = table_open(ForeignDataWrapperRelationId, RowExclusiveLock);
 
