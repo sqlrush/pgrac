@@ -835,6 +835,7 @@ clog_recovery_cache_discard(SlruCtl ctl)
 			&& LWLockHeldByMe(&shared->buffer_locks[slot].lock))
 			LWLockRelease(&shared->buffer_locks[slot].lock);
 		shared->page_status[slot] = SLRU_PAGE_EMPTY;
+		shared->page_initial_full_xid[slot] = 0;
 		shared->page_dirty[slot] = false;
 	}
 	LWLockRelease(shared->ControlLock);
@@ -984,6 +985,36 @@ clog_recovery_sync(SlruCtl ctl, int page, const struct stat *expected)
 	}
 	PG_END_TRY();
 	return ok;
+}
+
+/* Read only a clean, resident native FULL initialization whose entire page
+ * equals the original fd observation. No disk reload, raw query or foreign
+ * controller supplies a missing generation; this is not lifetime authority. */
+static bool clog_full_birth_valid(const xl_clog_zeropage_full *birth);
+
+static uint64
+clog_relmap_resident_birth(SlruCtl ctl, int page, const uint8 *image)
+{
+	SlruShared shared = ctl->shared;
+	uint64 value = 0;
+
+	LWLockAcquire(shared->ControlLock, LW_SHARED);
+	for (int slot = 0; slot < shared->num_slots; slot++) {
+		xl_clog_zeropage_full birth;
+
+		if (shared->page_status[slot] != SLRU_PAGE_VALID
+			|| shared->page_number[slot] != page || shared->page_dirty[slot]
+			|| memcmp(shared->page_buffer[slot], image, BLCKSZ) != 0)
+			continue;
+		birth.pageno = page;
+		birth.reserved_zero = 0;
+		birth.first_full_xid = shared->page_initial_full_xid[slot];
+		if (clog_full_birth_valid(&birth))
+			value = birth.first_full_xid;
+		break;
+	}
+	LWLockRelease(shared->ControlLock);
+	return value;
 }
 
 /* A declared relmap participant borrows the original whole replay episode.
@@ -1293,6 +1324,13 @@ clog_relmap_base_read(const ClusterRecoveryRelmapSourceV1 *source,
 						|| base.oldest_clog_xid == ShmemVariableCache->oldestClogXid)
 					&& (!existing || memcmp(base.image, held->base.image, BLCKSZ) == 0);
 			}
+			if (ok && origin == cluster_node_id) {
+				base.resident_first_full_xid = clog_relmap_resident_birth(ctl, page, base.image);
+				base.resident_birth_observed = base.resident_first_full_xid != 0;
+			}
+			ok = ok && (!existing
+				|| (base.resident_birth_observed == held->base.resident_birth_observed
+					&& base.resident_first_full_xid == held->base.resident_first_full_xid));
 			LWLockRelease(lock);
 			locked = false;
 		}
@@ -1301,6 +1339,9 @@ clog_relmap_base_read(const ClusterRecoveryRelmapSourceV1 *source,
 			&& memcmp(source, &original, sizeof(original)) == 0 && !held->invalidated
 			&& (!base.native_next_observed
 				|| base.next_full_xid == U64FromFullTransactionId(ReadNextFullTransactionId()))
+			&& clog_relmap_mutation_matches(origin, mutation_generation)
+			&& (origin != cluster_node_id || base.resident_first_full_xid
+				== clog_relmap_resident_birth(ctl, page, base.image))
 			&& clog_relmap_mutation_matches(origin, mutation_generation);
 		if (!ok)
 			cluster_wal_inputs_relmap_source_fail_v1(&original);
@@ -2350,6 +2391,9 @@ ExtendCLOGFull(FullTransactionId newestXact)
 {
 	TransactionId raw = XidFromFullTransactionId(newestXact);
 	xl_clog_zeropage_full birth = {0};
+#ifdef USE_PGRAC_CLUSTER
+	int slot;
+#endif
 
 	/* This is a production guard, including release builds. The original
 	 * caller supplies its actual candidate, not an inferred raw-xid era. */
@@ -2361,10 +2405,18 @@ ExtendCLOGFull(FullTransactionId newestXact)
 	birth.first_full_xid = U64FromFullTransactionId(newestXact);
 
 	LWLockAcquire(XactSLRULock, LW_EXCLUSIVE);
+#ifdef USE_PGRAC_CLUSTER
+	slot = ZeroCLOGPage(birth.pageno, false);
+#else
 	ZeroCLOGPage(birth.pageno, false);
+#endif
 	XLogBeginInsert();
 	XLogRegisterData((char *)&birth, sizeof(birth));
 	(void)XLogInsert(RM_CLOG_ID, CLOG_ZEROPAGE_FULL);
+#ifdef USE_PGRAC_CLUSTER
+	/* Failed insertion leaves the original dirty page with unknown birth. */
+	XactCtl->shared->page_initial_full_xid[slot] = birth.first_full_xid;
+#endif
 	LWLockRelease(XactSLRULock);
 }
 
@@ -2529,6 +2581,9 @@ clog_redo(XLogReaderState *record)
 		slotno = ZeroCLOGPage(birth.pageno, false);
 		SimpleLruWritePage(XactCtl, slotno);
 		Assert(!XactCtl->shared->page_dirty[slotno]);
+#ifdef USE_PGRAC_CLUSTER
+		XactCtl->shared->page_initial_full_xid[slotno] = birth.first_full_xid;
+#endif
 		LWLockRelease(XactSLRULock);
 	}
 	else if (info == CLOG_ZEROPAGE)

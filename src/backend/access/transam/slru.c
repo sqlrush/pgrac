@@ -171,6 +171,9 @@ SimpleLruShmemSize(int nslots, int nlsns)
 	sz += MAXALIGN(nslots * sizeof(SlruPageStatus));	/* page_status[] */
 	sz += MAXALIGN(nslots * sizeof(bool));	/* page_dirty[] */
 	sz += MAXALIGN(nslots * sizeof(int));	/* page_number[] */
+#ifdef USE_PGRAC_CLUSTER
+	sz += MAXALIGN(nslots * sizeof(uint64)); /* page_initial_full_xid[] */
+#endif
 	sz += MAXALIGN(nslots * sizeof(int));	/* page_lru_count[] */
 	sz += MAXALIGN(nslots * sizeof(LWLockPadded));	/* buffer_locks[] */
 
@@ -241,6 +244,10 @@ SimpleLruInit(SlruCtl ctl, const char *name, int nslots, int nlsns,
 		offset += MAXALIGN(nslots * sizeof(bool));
 		shared->page_number = (int *) (ptr + offset);
 		offset += MAXALIGN(nslots * sizeof(int));
+#ifdef USE_PGRAC_CLUSTER
+		shared->page_initial_full_xid = (uint64 *) (ptr + offset);
+		offset += MAXALIGN(nslots * sizeof(uint64));
+#endif
 		shared->page_lru_count = (int *) (ptr + offset);
 		offset += MAXALIGN(nslots * sizeof(int));
 
@@ -263,6 +270,9 @@ SimpleLruInit(SlruCtl ctl, const char *name, int nslots, int nlsns,
 			shared->page_buffer[slotno] = ptr;
 			shared->page_status[slotno] = SLRU_PAGE_EMPTY;
 			shared->page_dirty[slotno] = false;
+#ifdef USE_PGRAC_CLUSTER
+			shared->page_initial_full_xid[slotno] = 0;
+#endif
 			shared->page_lru_count[slotno] = 0;
 			ptr += BLCKSZ;
 		}
@@ -307,6 +317,9 @@ SimpleLruZeroPage(SlruCtl ctl, int pageno)
 		   shared->page_number[slotno] == pageno);
 
 	/* Mark the slot as containing this page */
+#ifdef USE_PGRAC_CLUSTER
+	shared->page_initial_full_xid[slotno] = 0;
+#endif
 	shared->page_number[slotno] = pageno;
 	shared->page_status[slotno] = SLRU_PAGE_VALID;
 	shared->page_dirty[slotno] = true;
@@ -380,7 +393,12 @@ SimpleLruWaitIO(SlruCtl ctl, int slotno)
 		{
 			/* indeed, the I/O must have failed */
 			if (shared->page_status[slotno] == SLRU_PAGE_READ_IN_PROGRESS)
+			{
 				shared->page_status[slotno] = SLRU_PAGE_EMPTY;
+#ifdef USE_PGRAC_CLUSTER
+				shared->page_initial_full_xid[slotno] = 0;
+#endif
+			}
 			else				/* write_in_progress */
 			{
 				shared->page_status[slotno] = SLRU_PAGE_VALID;
@@ -454,6 +472,9 @@ SimpleLruReadPage(SlruCtl ctl, int pageno, bool write_ok,
 				!shared->page_dirty[slotno]));
 
 		/* Mark the slot read-busy */
+#ifdef USE_PGRAC_CLUSTER
+		shared->page_initial_full_xid[slotno] = 0;
+#endif
 		shared->page_number[slotno] = pageno;
 		shared->page_status[slotno] = SLRU_PAGE_READ_IN_PROGRESS;
 		shared->page_dirty[slotno] = false;
@@ -1297,6 +1318,9 @@ restart:
 			!shared->page_dirty[slotno])
 		{
 			shared->page_status[slotno] = SLRU_PAGE_EMPTY;
+#ifdef USE_PGRAC_CLUSTER
+			shared->page_initial_full_xid[slotno] = 0;
+#endif
 			continue;
 		}
 
@@ -1390,6 +1414,9 @@ restart:
 			!shared->page_dirty[slotno])
 		{
 			shared->page_status[slotno] = SLRU_PAGE_EMPTY;
+#ifdef USE_PGRAC_CLUSTER
+			shared->page_initial_full_xid[slotno] = 0;
+#endif
 			continue;
 		}
 
