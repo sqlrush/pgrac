@@ -1263,6 +1263,13 @@ test_cluster_fresh_statistics_create.inc: $(top_srcdir)/src/backend/commands/sta
 	     { print "} return InvalidObjectAddress; }"; emit=0; cuts++ } \
 	     END { if (entries != 1 || cuts != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
+test_cluster_fresh_object_depends.inc: $(top_srcdir)/src/backend/commands/alter.c Makefile
+	awk '/^ExecAlterObjectDependsStmt\(/ { print "ObjectAddress"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /&rel, AccessExclusiveLock, false\);/ \
+	     { print "return InvalidObjectAddress; }"; emit=0; cuts++ } \
+	     END { if (entries != 1 || cuts != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
 test_cluster_fresh_scope: test_cluster_fresh_scope.c unit_test.h \
 		test_cluster_fresh_control.inc test_cluster_fresh_startup.inc test_cluster_fresh_read.inc \
 		test_cluster_fresh_boolean.inc test_cluster_fresh_index.inc test_cluster_fresh_utility.inc \
@@ -1271,7 +1278,7 @@ test_cluster_fresh_scope: test_cluster_fresh_scope.c unit_test.h \
 		test_cluster_fresh_import_filter.inc test_cluster_fresh_extension.inc \
 		test_cluster_fresh_schema.inc test_cluster_fresh_comment.inc test_cluster_fresh_seclabel.inc \
 		test_cluster_fresh_policy.inc test_cluster_fresh_conversion.inc test_cluster_fresh_collation.inc \
-		test_cluster_fresh_event_trigger.inc test_cluster_fresh_owner.inc test_cluster_fresh_language.inc \
+		test_cluster_fresh_event_trigger.inc test_cluster_fresh_owner.inc test_cluster_fresh_object_depends.inc test_cluster_fresh_language.inc \
 		test_cluster_fresh_access_method.inc test_cluster_fresh_function.inc test_cluster_fresh_fdw.inc \
 		test_cluster_fresh_foreign_server.inc test_cluster_fresh_user_mapping.inc \
 		test_cluster_fresh_statistics_alter.inc test_cluster_fresh_statistics_create.inc test_cluster_fresh_operator.inc \
@@ -6586,7 +6593,7 @@ clean distclean maintainer-clean:
 		test_cluster_fresh_catalog_index.inc test_cluster_shared_utility.inc \
 		test_cluster_fresh_schema.inc test_cluster_fresh_comment.inc test_cluster_fresh_seclabel.inc \
 		test_cluster_fresh_policy.inc test_cluster_fresh_conversion.inc test_cluster_fresh_collation.inc \
-		test_cluster_fresh_event_trigger.inc test_cluster_fresh_owner.inc test_cluster_fresh_language.inc \
+		test_cluster_fresh_event_trigger.inc test_cluster_fresh_owner.inc test_cluster_fresh_object_depends.inc test_cluster_fresh_language.inc \
 		test_cluster_fresh_access_method.inc test_cluster_fresh_function.inc test_cluster_fresh_fdw.inc \
 		test_cluster_fresh_foreign_server.inc test_cluster_fresh_user_mapping.inc \
 		test_cluster_fresh_statistics_alter.inc test_cluster_fresh_statistics_create.inc test_cluster_fresh_operator.inc \

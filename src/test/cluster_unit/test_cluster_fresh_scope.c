@@ -13851,10 +13851,292 @@ UT_TEST(test_native_statistics_create_unsupported_from_refuses_before_allocation
 	statistics_create_lookup_active = false;
 }
 
+/* Actual dependency entry stops before its first object lookup and lock. */
+static bool depends_lookup_active, depends_expect_binding, depends_use_reference;
+static unsigned depends_lookups, depends_unbound, depends_bad_lookup;
+static AlterObjectDependsStmt native_depends_statement;
+static RangeVar depends_relation;
+static String depends_name, depends_extension;
+static ListCell depends_name_cell;
+static List depends_names;
+static ObjectWithArgs depends_routine;
+static ObjectAddress depends_reference_address;
+static Node *depends_expected_statement;
+static const struct {
+	ObjectType type;
+	const char *command;
+} depends_supported[] = { { OBJECT_FUNCTION, "ALTER FUNCTION" },
+						  { OBJECT_PROCEDURE, "ALTER PROCEDURE" },
+						  { OBJECT_ROUTINE, "ALTER ROUTINE" },
+						  { OBJECT_TRIGGER, "ALTER TRIGGER" },
+						  { OBJECT_INDEX, "ALTER INDEX" } };
+
+ObjectAddress
+get_object_address_rv(ObjectType objtype, RangeVar *rel, List *object, Relation *relp,
+					  LOCKMODE lockmode, bool missing_ok)
+{
+	if (!depends_lookup_active)
+		siglongjmp(boundary, 3);
+	depends_lookups++;
+	if (depends_expect_binding && utility_binds == 0)
+		depends_unbound++;
+	if (objtype != native_depends_statement.objectType || rel != native_depends_statement.relation
+		|| object != (List *)native_depends_statement.object || relp == NULL
+		|| lockmode != AccessExclusiveLock || missing_ok)
+		depends_bad_lookup++;
+	siglongjmp(boundary, 2); /* Before the real object lookup or lock. */
+}
+
+#include "test_cluster_fresh_object_depends.inc"
+
+static void
+reset_native_depends(bool expect_binding, unsigned form)
+{
+	unsigned kind = form % 5;
+
+	reset_create_preflight();
+	depends_lookup_active = true;
+	depends_expect_binding = expect_binding;
+	depends_lookups = depends_unbound = depends_bad_lookup = 0;
+	depends_relation = (RangeVar){ .type = T_RangeVar, .relname = "dependency_relation" };
+	depends_name = (String){ .type = T_String, .sval = "dependency_object" };
+	depends_extension = (String){ .type = T_String, .sval = "dependency_extension" };
+	depends_name_cell = (ListCell){ .ptr_value = &depends_name };
+	depends_names
+		= (List){ .type = T_List, .length = 1, .max_length = 1, .elements = &depends_name_cell };
+	depends_routine = (ObjectWithArgs){ .type = T_ObjectWithArgs, .objname = &depends_names };
+	native_depends_statement
+		= (AlterObjectDependsStmt){ .type = T_AlterObjectDependsStmt,
+									.objectType = depends_supported[kind].type,
+									.relation = kind >= 3 ? &depends_relation : NULL,
+									.object = kind < 3	  ? (Node *)&depends_routine
+											  : kind == 3 ? (Node *)&depends_names
+														  : NULL,
+									.extname = &depends_extension,
+									.remove = ((form / 5) % 2) != 0 };
+	depends_reference_address
+		= (ObjectAddress){ .classId = 811, .objectId = 812, .objectSubId = 813 };
+	depends_use_reference = form >= 10;
+	depends_expected_statement = (Node *)&native_depends_statement;
+}
+
+static void
+native_depends_entry(void)
+{
+	(void)ExecAlterObjectDependsStmt(&native_depends_statement,
+									 depends_use_reference ? &depends_reference_address : NULL);
+}
+
+UT_TEST(test_native_depends_binds_before_first_query_in_all_profiles)
+{
+	for (unsigned form = 0; form < 20; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_depends(binds, form);
+			set_native_operator_mode(mode);
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_depends_entry();
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(depends_lookups, repeat + 1);
+				UT_ASSERT_EQ(depends_unbound, 0);
+				UT_ASSERT_EQ(depends_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	depends_lookup_active = false;
+}
+
+UT_TEST(test_native_depends_refuses_before_lookup_on_publication_child_and_top_errors)
+{
+	for (unsigned form = 0; form < 20; form++) {
+		for (unsigned failure = 0; failure < 5; failure++) {
+			bool allocated = failure == 0 || failure == 2;
+			int caught;
+
+			reset_native_depends(true, form);
+			if (failure == 0)
+				utility_bind_ok = false;
+			else if (failure == 1 || failure == 2) {
+				if (failure == 2)
+					create_sql_entry(depends_expected_statement);
+				utility_in_child = true;
+			} else {
+				utility_current_xid = 401;
+				utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_depends_entry();
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, failure == 0  ? ERRCODE_DATA_CORRUPTED
+									 : failure < 3 ? ERRCODE_FEATURE_NOT_SUPPORTED
+												   : ERRCODE_INTERNAL_ERROR);
+			UT_ASSERT_STR_EQ(
+				error_message,
+				failure == 0
+					? "canonical ACTIVE publication failed before shared catalog alteration"
+				: failure < 3 ? "shared catalog alteration does not support subtransactions"
+							  : "shared catalog top-level transaction identity mismatch");
+			UT_ASSERT_EQ(depends_lookups, 0);
+			UT_ASSERT_EQ(depends_unbound + depends_bad_lookup, 0);
+			UT_ASSERT_EQ(depends_reference_address.classId, 811);
+			UT_ASSERT_EQ(depends_reference_address.objectId, 812);
+			UT_ASSERT_EQ(depends_reference_address.objectSubId, 813);
+			UT_ASSERT_EQ(utility_xids, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, failure == 2 ? 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, allocated || failure == 3 ? 400 : InvalidTransactionId);
+		}
+	}
+	depends_lookup_active = false;
+}
+
+UT_TEST(test_native_depends_context_guards_keep_nonshared_route)
+{
+	for (unsigned form = 0; form < 20; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+
+			for (unsigned guard = 0; guard < 3; guard++) {
+				int caught;
+
+				reset_native_depends(binds, form);
+				set_native_operator_mode(mode);
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_depends_entry();
+				UT_ASSERT_EQ(caught, binds ? 1 : 2);
+				UT_ASSERT_EQ(error_code, !binds		  ? 0
+										 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+													  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				if (binds)
+					UT_ASSERT(strstr(error_message, depends_supported[form % 5].command) != NULL);
+				UT_ASSERT_EQ(depends_lookups, binds ? 0 : 1);
+				UT_ASSERT_EQ(depends_unbound + depends_bad_lookup, 0);
+				UT_ASSERT_EQ(depends_reference_address.classId, 811);
+				UT_ASSERT_EQ(depends_reference_address.objectId, 812);
+				UT_ASSERT_EQ(depends_reference_address.objectSubId, 813);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	depends_lookup_active = false;
+}
+
+UT_TEST(test_native_depends_utility_warm_guards_preserve_binding)
+{
+	for (unsigned form = 0; form < 20; form++) {
+		for (unsigned guard = 0; guard < 4; guard++) {
+			int caught;
+
+			reset_native_depends(true, form);
+			create_sql_entry(depends_expected_statement);
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			XactReadOnly = guard == 1;
+			utility_parallel = guard == 2;
+			utility_recovery = guard == 3;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_depends_entry();
+			UT_ASSERT_EQ(caught, guard ? 1 : 2);
+			UT_ASSERT_EQ(error_code, !guard		  ? 0
+									 : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+												  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT_EQ(depends_lookups, guard ? 0 : 1);
+			UT_ASSERT_EQ(depends_unbound + depends_bad_lookup, 0);
+			UT_ASSERT_EQ(depends_reference_address.classId, 811);
+			UT_ASSERT_EQ(depends_reference_address.objectId, 812);
+			UT_ASSERT_EQ(depends_reference_address.objectSubId, 813);
+			UT_ASSERT_EQ(utility_prepares, guard ? 1 : 2);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			UT_ASSERT_EQ(utility_top_xid, 400);
+		}
+	}
+	depends_lookup_active = false;
+}
+
+UT_TEST(test_native_depends_scope_refusals_match_utility_before_binding)
+{
+	static const struct {
+		ObjectType type;
+		const char *message;
+	} forbidden[]
+		= { { OBJECT_MATVIEW, "materialized views is not supported in shared mode" },
+			{ OBJECT_TYPE, "custom types is not supported in shared mode" },
+			{ OBJECT_DOMAIN, "custom types is not supported in shared mode" },
+			{ OBJECT_OPERATOR, "custom operators is not supported in shared mode" },
+			{ OBJECT_OPCLASS, "custom operators is not supported in shared mode" },
+			{ OBJECT_OPFAMILY, "custom operators is not supported in shared mode" },
+			{ OBJECT_EXTENSION, "CREATE/DROP EXTENSION is not supported in shared mode" } };
+
+	for (unsigned type = 0; type < lengthof(forbidden); type++) {
+		for (unsigned form = 0; form < 4; form++) {
+			for (unsigned mode = 0; mode < 8; mode++) {
+				bool shared = mode != 0 && mode != 2;
+				int caught;
+
+				reset_native_depends(false, form * 5);
+				set_native_operator_mode(mode);
+				native_depends_statement.objectType = forbidden[type].type;
+				native_depends_statement.relation = &depends_relation;
+				native_depends_statement.object = NULL;
+				XactReadOnly = utility_parallel = utility_recovery = utility_in_child = true;
+				utility_bind_ok = false;
+				if (shared) {
+					caught = sigsetjmp(boundary, 1);
+					if (!caught)
+						create_sql_entry(depends_expected_statement);
+					UT_ASSERT_EQ(caught, 1);
+					UT_ASSERT_EQ(error_code, ERRCODE_FEATURE_NOT_SUPPORTED);
+					UT_ASSERT_STR_EQ(error_message, forbidden[type].message);
+					UT_ASSERT_STR_EQ(
+						error_detail,
+						"PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+					UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+					reset_error();
+				}
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_depends_entry();
+				UT_ASSERT_EQ(caught, shared ? 1 : 2);
+				UT_ASSERT_EQ(error_code, shared ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+				if (shared) {
+					UT_ASSERT_STR_EQ(error_message, forbidden[type].message);
+					UT_ASSERT_STR_EQ(
+						error_detail,
+						"PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+				}
+				UT_ASSERT_EQ(depends_lookups, shared ? 0 : 1);
+				UT_ASSERT_EQ(depends_unbound + depends_bad_lookup, 0);
+				UT_ASSERT_EQ(depends_reference_address.classId, 811);
+				UT_ASSERT_EQ(depends_reference_address.objectId, 812);
+				UT_ASSERT_EQ(depends_reference_address.objectSubId, 813);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	depends_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(217);
+	UT_PLAN(222);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -14072,6 +14354,11 @@ main(void)
 	UT_RUN(test_native_statistics_create_context_guards_keep_nonshared_route);
 	UT_RUN(test_native_statistics_create_utility_warm_guards_preserve_binding);
 	UT_RUN(test_native_statistics_create_unsupported_from_refuses_before_allocation);
+	UT_RUN(test_native_depends_binds_before_first_query_in_all_profiles);
+	UT_RUN(test_native_depends_refuses_before_lookup_on_publication_child_and_top_errors);
+	UT_RUN(test_native_depends_context_guards_keep_nonshared_route);
+	UT_RUN(test_native_depends_utility_warm_guards_preserve_binding);
+	UT_RUN(test_native_depends_scope_refusals_match_utility_before_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

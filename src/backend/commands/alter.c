@@ -477,6 +477,60 @@ ExecAlterObjectDependsStmt(AlterObjectDependsStmt *stmt, ObjectAddress *refAddre
 	ObjectAddress refAddr;
 	Relation	rel;
 
+#ifdef USE_PGRAC_CLUSTER
+	ClusterCanonicalTxnBinding binding;
+	TransactionId current_xid;
+	const char *command;
+	const char *unsupported = NULL;
+
+	/* Direct callers must check shared scope and bind before object lookup. */
+	if (cluster_shared_config || cluster_shared_catalog) {
+		switch (stmt->objectType) {
+		case OBJECT_MATVIEW:
+			unsupported = "materialized views";
+			break;
+		case OBJECT_TYPE:
+		case OBJECT_DOMAIN:
+			unsupported = "custom types";
+			break;
+		case OBJECT_OPERATOR:
+		case OBJECT_OPCLASS:
+		case OBJECT_OPFAMILY:
+			unsupported = "custom operators";
+			break;
+		case OBJECT_EXTENSION:
+			unsupported = "CREATE/DROP EXTENSION";
+			break;
+		default:
+			break;
+		}
+		if (unsupported != NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("%s is not supported in shared mode", unsupported),
+					 errdetail("PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED")));
+	}
+	if (cluster_shared_catalog && cluster_storage_mode_enabled()) {
+		command = CreateCommandName((Node *)stmt);
+		PreventCommandIfReadOnly(command);
+		PreventCommandIfParallelMode(command);
+		PreventCommandDuringRecovery(command);
+		if (IsSubTransaction())
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("shared catalog alteration does not support subtransactions")));
+		current_xid = GetCurrentTransactionIdIfAny();
+		if (TransactionIdIsValid(current_xid)
+			&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("shared catalog top-level transaction identity mismatch")));
+		if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+			ereport(
+				ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("canonical ACTIVE publication failed before shared catalog alteration")));
+	}
+#endif
+
 	address =
 		get_object_address_rv(stmt->objectType, stmt->relation, (List *) stmt->object,
 							  &rel, AccessExclusiveLock, false);
