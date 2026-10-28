@@ -93,6 +93,9 @@ static void (*fixture_native_sync_hook)(void);
 static void (*fixture_native_write_hook)(void);
 static bool fixture_native_sync_fallback;
 static unsigned fixture_native_sync_requests;
+static bool fixture_native_truncate, fixture_native_truncate_flush_error;
+static unsigned fixture_native_truncate_flushes;
+static void (*fixture_native_truncate_flush_hook)(XLogRecPtr);
 
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
@@ -320,8 +323,16 @@ void
 pgstat_count_slru_truncate(int i pg_attribute_unused())
 {}
 void
-XLogFlush(XLogRecPtr lsn pg_attribute_unused())
+XLogFlush(XLogRecPtr lsn)
 {
+	if (fixture_native_truncate) {
+		fixture_native_truncate_flushes++;
+		if (fixture_native_truncate_flush_hook != NULL)
+			fixture_native_truncate_flush_hook(lsn);
+		if (fixture_native_truncate_flush_error)
+			elog(ERROR, "native truncate WAL flush fixture");
+		return;
+	}
 	abort();
 }
 bool
@@ -1338,6 +1349,7 @@ fixture_cleanup(void)
 #include "test_cluster_clog_relmap_physical_mutation.inc"
 #include "test_cluster_clog_relmap_native_init.inc"
 #include "test_cluster_clog_relmap_horizon.inc"
+#include "test_cluster_clog_native_truncate.inc"
 
 int
 main(void)
@@ -1420,7 +1432,19 @@ main(void)
 		UT_RUN(relmap_own_horizon_drift_during_native_read_refuses);
 		goto mutation_done;
 	}
-	UT_PLAN(69);
+	if (getenv("PGRAC_NATIVE_CLOG_TRUNCATE_ONLY") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(native_clog_truncate_advances_before_wal_flush_and_delete);
+		UT_RUN(native_clog_truncate_without_old_segment_preserves_observation);
+		UT_RUN(native_clog_truncate_redo_uses_original_horizon_and_delete);
+		UT_RUN(native_clog_truncate_flush_error_retains_files_and_custody);
+		goto mutation_done;
+	}
+	UT_PLAN(73);
+	UT_RUN(native_clog_truncate_advances_before_wal_flush_and_delete);
+	UT_RUN(native_clog_truncate_without_old_segment_preserves_observation);
+	UT_RUN(native_clog_truncate_redo_uses_original_horizon_and_delete);
+	UT_RUN(native_clog_truncate_flush_error_retains_files_and_custody);
 	UT_RUN(separate_original_origin_controls);
 	UT_RUN(commit_and_abort_persist_full_tree_without_local_pollution);
 	UT_RUN(conflicting_late_child_refuses_before_any_tree_write);
