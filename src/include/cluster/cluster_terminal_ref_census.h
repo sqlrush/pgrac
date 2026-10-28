@@ -44,6 +44,8 @@
 #define CLUSTER_CTRC_DELEGATION_CLOSE_WIRE_VERSION UINT16_C(3)
 #define CLUSTER_CTRC_SUBTREE_ACK_WIRE_VERSION UINT16_C(4)
 #define CLUSTER_CTRC_SUBTREE_ACK_BYTES 592
+#define CLUSTER_CTRC_ROOT_ACK_WIRE_VERSION UINT16_C(5)
+#define CLUSTER_CTRC_ROOT_ACK_BYTES 600
 #define CLUSTER_CTRC_REPLY_HEADER_BYTES 64
 #define CLUSTER_CTRC_LOCAL_ACK_BYTES 416
 #define CLUSTER_CTRC_REPLY_ACK_OFFSET 64
@@ -76,7 +78,8 @@ typedef enum ClusterCtrcSealReplyResult {
 	/* Explicit wire3 only: redundant pending custody, never a release ACK. */
 	CTRC_SEAL_REPLY_DELEGATION_MERGED = 5,
 	/* Explicit wire4 only. Retained subtree proof, not an origin release. */
-	CTRC_SEAL_REPLY_DELEGATION_SUBTREE_ACK = 6
+	CTRC_SEAL_REPLY_DELEGATION_SUBTREE_ACK = 6,
+	CTRC_SEAL_REPLY_ROOT_SUBTREE_ACK = 7
 } ClusterCtrcSealReplyResult;
 
 typedef enum ClusterCtrcSealReason {
@@ -356,6 +359,19 @@ typedef struct ClusterCtrcCloseDispatch {
 	uint32 reserved32;
 } ClusterCtrcCloseDispatch;
 
+/* Node-indexed suffix retained with the original origin ACK. The first
+ * 416 bytes of a root proof remain in the original local-ACK inbox. */
+typedef struct ClusterCtrcRootSubtreeSuffixV1 {
+	uint64 subtree_bitmap;
+	uint8 children_digest_sha256[32];
+	XLogRecPtr required_lsn[CLUSTER_SF_DEP_MAX_ORIGINS];
+	FullTransactionId original_full_xid;
+	uint32 crc32c;
+	uint32 reserved;
+} ClusterCtrcRootSubtreeSuffixV1;
+StaticAssertDecl(sizeof(ClusterCtrcRootSubtreeSuffixV1) == 184,
+	"CTRC root suffix must remain 184 bytes");
+
 typedef struct ClusterCtrcOriginEntry {
 	ClusterCtrcTxnKeyV1 key;
 	uint64 reservation_generation;
@@ -372,6 +388,9 @@ typedef struct ClusterCtrcOriginEntry {
 	uint8 reserved8[6];
 	ClusterCtrcParticipantIdentity touched[CLUSTER_CTRC_MAX_PARTICIPANTS];
 	uint64 close_request_id[CLUSTER_CTRC_MAX_PARTICIPANTS];
+	uint32 root_subtree_ack_bitmap;
+	uint32 root_subtree_reserved;
+	ClusterCtrcRootSubtreeSuffixV1 root_subtree_acks[CLUSTER_CTRC_MAX_PARTICIPANTS];
 } ClusterCtrcOriginEntry;
 
 typedef enum ClusterCtrcOriginReservationKind {
@@ -579,6 +598,13 @@ typedef struct ClusterCtrcLocalReleaseAckV1 {
 	uint8 reserved[20];
 	uint32 crc32c;
 } ClusterCtrcLocalReleaseAckV1;
+
+typedef struct ClusterCtrcRootSubtreeAckV1 {
+	ClusterCtrcLocalReleaseAckV1 local_ack;
+	ClusterCtrcRootSubtreeSuffixV1 subtree;
+} ClusterCtrcRootSubtreeAckV1;
+StaticAssertDecl(sizeof(ClusterCtrcRootSubtreeAckV1) == CLUSTER_CTRC_ROOT_ACK_BYTES,
+	"CTRC root proof must remain 600 bytes");
 
 typedef struct ClusterCtrcDelegatedSubtreeAckV1 {
 	ClusterCtrcLocalReleaseAckV1 local_ack;
@@ -795,6 +821,10 @@ typedef struct ClusterCtrcCertificateInput {
 	uint64 seal_generation;
 	bool block0_terminal_exact;
 	bool all_dependencies_durable;
+	const ClusterCtrcRootSubtreeSuffixV1 *root_subtrees;
+	uint32 root_subtree_bitmap;
+	uint32 reserved32;
+	FullTransactionId original_full_xid;
 } ClusterCtrcCertificateInput;
 
 /* Stack-only immutable copy used across the no-CTRC-lock block-0 certificate
@@ -964,6 +994,18 @@ extern bool cluster_ctrc_participant_delegated_local_ack_shared(
 /* Original non-root parent only: all retained children must have exact
  * proofs before the original local freeze may contribute to this aggregate.
  * Neither production nor consumption retires any parent/child or receipt. */
+/* Root proof uses the original 136-byte request and fixed-page reply.
+ * It retains all local/child custody until the exact certificate notification. */
+extern bool cluster_ctrc_root_ack_reply_encode(const uint8 *request,
+	const ClusterCtrcRootSubtreeAckV1 *ack, uint8 *page, Size page_length);
+extern bool cluster_ctrc_root_ack_reply_decode(const uint8 *page, Size page_length,
+	const uint8 *request, int32 source, int32 destination, ClusterCtrcRootSubtreeAckV1 *out);
+extern bool cluster_ctrc_participant_root_subtree_ack_shared(const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcParticipantIdentity *identity, uint32 grant, uint64 seal,
+	ClusterCtrcRootSubtreeAckV1 *out);
+extern bool cluster_ctrc_origin_root_ack_land_shared(uint64 request_id,
+	const ClusterCtrcRootSubtreeAckV1 *ack);
+
 extern bool cluster_ctrc_participant_delegated_subtree_ack_shared(
 	const ClusterCtrcDelegationCloseV1 *request, ClusterCtrcDelegatedSubtreeAckV1 *out);
 extern bool cluster_ctrc_participant_delegated_ack_land_shared(

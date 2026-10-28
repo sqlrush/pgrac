@@ -86,7 +86,7 @@
 #endif
 
 #define CLUSTER_CTRC_SHMEM_MAGIC UINT32_C(0x43545243)
-#define CLUSTER_CTRC_SHMEM_VERSION UINT32_C(19)
+#define CLUSTER_CTRC_SHMEM_VERSION UINT32_C(20)
 #ifndef CLUSTER_CTRC_TEST_TABLE_VISIT
 #define CLUSTER_CTRC_TEST_TABLE_VISIT(kind) ((void)0)
 #endif
@@ -1488,6 +1488,183 @@ cluster_ctrc_delegated_ack_reply_decode(const uint8 *page, Size page_length,
 		|| !ctrc_subtree_ack_decode_body(request, page + CLUSTER_CTRC_REPLY_ACK_OFFSET, &candidate))
 		return false;
 	*out = candidate;
+	return true;
+}
+
+/* Explicit root domain; a retained local proof cannot be substituted for
+ * its complete subtree and original transaction identity. */
+static bool
+ctrc_root_ack_shape_valid(const ClusterCtrcRootSubtreeAckV1 *ack)
+{
+	const ClusterCtrcLocalReleaseAckV1 *local;
+	uint64 own;
+
+	if (ack == NULL || ack->subtree.reserved != 0)
+		return false;
+	local = &ack->local_ack;
+	if (!ctrc_local_ack_shape_valid(local)
+		|| !FullTransactionIdIsNormal(ack->subtree.original_full_xid)
+		|| U64FromFullTransactionId(ack->subtree.original_full_xid) == UINT64_MAX
+		|| XidFromFullTransactionId(ack->subtree.original_full_xid) != local->transaction_key.xid)
+		return false;
+	own = UINT64_C(1) << local->participant_node_id;
+	if ((ack->subtree.subtree_bitmap & own) == 0
+		|| ack->subtree.subtree_bitmap == own
+		|| (ack->subtree.subtree_bitmap >> CLUSTER_CTRC_MAX_PARTICIPANTS) != 0
+		|| (local->participant_node_id != local->transaction_key.origin_node_id
+			&& (ack->subtree.subtree_bitmap & (UINT64_C(1) << local->transaction_key.origin_node_id)) != 0)
+		|| ctrc_bytes_zero(ack->subtree.children_digest_sha256, 32)
+		|| memcmp(ack->subtree.children_digest_sha256, cluster_ctrc_empty_sha256, 32) == 0)
+		return false;
+	for (unsigned node = 0; node < CLUSTER_SF_DEP_MAX_ORIGINS; node++)
+		if (ack->subtree.required_lsn[node] < local->required_lsn_vector[node]
+			|| (node == local->participant_node_id
+				&& ack->subtree.required_lsn[node] < local->highest_local_cleanout_lsn))
+			return false;
+	return true;
+}
+
+static bool
+ctrc_root_ack_encode_body(const ClusterCtrcRootSubtreeAckV1 *ack,
+	uint8 bytes[CLUSTER_CTRC_ROOT_ACK_BYTES])
+{
+	MemSet(bytes, 0, CLUSTER_CTRC_ROOT_ACK_BYTES);
+	if (!ctrc_root_ack_shape_valid(ack)
+		|| !cluster_ctrc_local_release_ack_encode(&ack->local_ack, bytes)
+		|| ctrc_get_u32_le(bytes + 412) != ack->local_ack.crc32c)
+		return false;
+	ctrc_put_u64_le(bytes + 416, ack->subtree.subtree_bitmap);
+	memcpy(bytes + 424, ack->subtree.children_digest_sha256, 32);
+	for (unsigned node = 0; node < CLUSTER_SF_DEP_MAX_ORIGINS; node++)
+		ctrc_put_u64_le(bytes + 456 + node * 8, ack->subtree.required_lsn[node]);
+	ctrc_put_u64_le(bytes + 584, U64FromFullTransactionId(ack->subtree.original_full_xid));
+	ctrc_put_u32_le(bytes + 592, ctrc_crc32c_exact(bytes, 592));
+	return true;
+}
+
+static bool
+ctrc_root_ack_bytes_exact(const ClusterCtrcRootSubtreeAckV1 *ack)
+{
+	uint8 bytes[CLUSTER_CTRC_ROOT_ACK_BYTES];
+
+	return ctrc_root_ack_encode_body(ack, bytes)
+		&& ack->subtree.crc32c == ctrc_get_u32_le(bytes + 592);
+}
+
+static bool
+ctrc_root_reply_header(const uint8 *request, int32 source, int32 destination, uint8 header[64])
+{
+	uint8 digest[32];
+
+	if (request == NULL || source < 0 || source >= CLUSTER_CTRC_MAX_PARTICIPANTS
+		|| destination < 0 || destination >= CLUSTER_CTRC_MAX_PARTICIPANTS
+		|| !cluster_ctrc_sha256_exact(request, CLUSTER_CTRC_SEAL_REQUEST_BYTES, digest))
+		return false;
+	MemSet(header, 0, CLUSTER_CTRC_REPLY_HEADER_BYTES);
+	ctrc_put_u32_le(header, CLUSTER_CTRC_WIRE_MAGIC);
+	ctrc_put_u16_le(header + 4, CLUSTER_CTRC_ROOT_ACK_WIRE_VERSION);
+	ctrc_put_u16_le(header + 6, CLUSTER_CTRC_REPLY_HEADER_BYTES);
+	ctrc_put_u64_le(header + 8, ctrc_get_u64_le(request));
+	ctrc_put_u64_le(header + 16, ctrc_get_u64_le(request + 8));
+	ctrc_put_u64_le(header + 24, ctrc_get_u64_le(request + 120));
+	ctrc_put_u32_le(header + 32, source);
+	ctrc_put_u32_le(header + 36, destination);
+	header[40] = CTRC_SEAL_REPLY_ROOT_SUBTREE_ACK;
+	header[41] = CTRC_SEAL_CLOSE_AND_CLEAN;
+	ctrc_put_u16_le(header + 46, CLUSTER_CTRC_ROOT_ACK_BYTES);
+	memcpy(header + 48, digest, 8);
+	ctrc_put_u32_le(header + 56, BLCKSZ);
+	ctrc_put_u32_le(header + 60, ctrc_crc32c_exact(header, 60));
+	return true;
+}
+
+bool
+cluster_ctrc_root_ack_reply_encode(const uint8 *request, const ClusterCtrcRootSubtreeAckV1 *ack,
+	uint8 *page, Size page_length)
+{
+	uint8 header[CLUSTER_CTRC_REPLY_HEADER_BYTES], body[CLUSTER_CTRC_ROOT_ACK_BYTES];
+
+	if (page != NULL && page_length != 0)
+		MemSet(page, 0, page_length);
+	if (page == NULL || page_length != BLCKSZ || ack == NULL
+		|| !ctrc_ack_matches_request(&ack->local_ack, request, ack->local_ack.participant_node_id,
+			ack->local_ack.transaction_key.origin_node_id)
+		|| !ctrc_root_reply_header(request, ack->local_ack.participant_node_id,
+			ack->local_ack.transaction_key.origin_node_id, header)
+		|| !ctrc_root_ack_encode_body(ack, body)
+		|| ack->subtree.crc32c != ctrc_get_u32_le(body + 592))
+		return false;
+	memcpy(page, header, sizeof(header));
+	memcpy(page + CLUSTER_CTRC_REPLY_ACK_OFFSET, body, sizeof(body));
+	return true;
+}
+
+bool
+cluster_ctrc_root_ack_reply_decode(const uint8 *page, Size page_length, const uint8 *request,
+	int32 source, int32 destination, ClusterCtrcRootSubtreeAckV1 *out)
+{
+	ClusterCtrcRootSubtreeAckV1 candidate = { 0 };
+	uint8 header[CLUSTER_CTRC_REPLY_HEADER_BYTES], body[CLUSTER_CTRC_ROOT_ACK_BYTES];
+	const uint8 *bytes;
+	Size tail = CLUSTER_CTRC_REPLY_ACK_OFFSET + CLUSTER_CTRC_ROOT_ACK_BYTES;
+
+	if (out != NULL)
+		MemSet(out, 0, sizeof(*out));
+	if (out == NULL || page == NULL || page_length != BLCKSZ
+		|| !ctrc_root_reply_header(request, source, destination, header)
+		|| memcmp(page, header, sizeof(header)) != 0
+		|| !ctrc_bytes_zero(page + tail, BLCKSZ - tail))
+		return false;
+	bytes = page + CLUSTER_CTRC_REPLY_ACK_OFFSET;
+	if (!cluster_ctrc_local_release_ack_decode(bytes, &candidate.local_ack))
+		return false;
+	candidate.subtree.subtree_bitmap = ctrc_get_u64_le(bytes + 416);
+	memcpy(candidate.subtree.children_digest_sha256, bytes + 424, 32);
+	for (unsigned node = 0; node < CLUSTER_SF_DEP_MAX_ORIGINS; node++)
+		candidate.subtree.required_lsn[node] = ctrc_get_u64_le(bytes + 456 + node * 8);
+	candidate.subtree.original_full_xid = FullTransactionIdFromU64(ctrc_get_u64_le(bytes + 584));
+	candidate.subtree.crc32c = ctrc_get_u32_le(bytes + 592);
+	candidate.subtree.reserved = ctrc_get_u32_le(bytes + 596);
+	if (!ctrc_ack_matches_request(&candidate.local_ack, request, source, destination)
+		|| !ctrc_root_ack_encode_body(&candidate, body) || memcmp(body, bytes, sizeof(body)) != 0)
+		return false;
+	*out = candidate;
+	return true;
+}
+
+/* A root proof may not absorb another original direct participant or
+ * overlap an already retained root. Unsupported histories remain pending. */
+static bool
+ctrc_origin_root_metadata_valid(const ClusterCtrcOriginEntry *origin)
+{
+	uint64 covered = 0;
+
+	if (origin == NULL || origin->root_subtree_reserved != 0
+		|| (origin->root_subtree_ack_bitmap & ~origin->ack_bitmap) != 0
+		|| (origin->root_subtree_ack_bitmap & ~origin->touched_bitmap) != 0)
+		return false;
+	for (unsigned node = 0; node < CLUSTER_CTRC_MAX_PARTICIPANTS; node++) {
+		const ClusterCtrcRootSubtreeSuffixV1 *proof = &origin->root_subtree_acks[node];
+		uint64 own = UINT64_C(1) << node;
+
+		if ((origin->root_subtree_ack_bitmap & own) == 0) {
+			if (!ctrc_bytes_zero(proof, sizeof(*proof)))
+				return false;
+			continue;
+		}
+		if (proof->reserved != 0 || !FullTransactionIdIsNormal(proof->original_full_xid)
+			|| U64FromFullTransactionId(proof->original_full_xid) == UINT64_MAX
+			|| XidFromFullTransactionId(proof->original_full_xid) != origin->key.xid
+			|| !FullTransactionIdEquals(proof->original_full_xid, origin->original_full_xid)
+			|| (proof->subtree_bitmap & own) == 0 || proof->subtree_bitmap == own
+			|| (proof->subtree_bitmap >> CLUSTER_CTRC_MAX_PARTICIPANTS) != 0
+			|| (proof->subtree_bitmap & (origin->touched_bitmap & ~own)) != 0
+			|| (proof->subtree_bitmap & covered) != 0
+			|| ctrc_bytes_zero(proof->children_digest_sha256, 32)
+			|| memcmp(proof->children_digest_sha256, cluster_ctrc_empty_sha256, 32) == 0)
+			return false;
+		covered |= proof->subtree_bitmap;
+	}
 	return true;
 }
 
@@ -5657,6 +5834,9 @@ ctrc_cleaner_publish_certificate(const ClusterCtrcOriginCertificateSnapshot *sna
 	input.acks = snapshot->ack_count == 0 ? NULL : snapshot->acks;
 	input.ack_count = snapshot->ack_count;
 	input.frozen_touched_bitmap = snapshot->origin.touched_bitmap;
+	input.root_subtree_bitmap = snapshot->origin.root_subtree_ack_bitmap;
+	input.root_subtrees = input.root_subtree_bitmap != 0 ? snapshot->origin.root_subtree_acks : NULL;
+	input.original_full_xid = snapshot->origin.original_full_xid;
 	input.seal_generation = snapshot->origin.seal_generation;
 	input.block0_terminal_exact = true;
 	input.all_dependencies_durable = true;
@@ -8187,6 +8367,99 @@ cluster_ctrc_participant_delegated_subtree_ack_shared(const ClusterCtrcDelegatio
 #endif
 }
 
+#ifndef CLUSTER_CTRC_UNIT_TEST
+static bool
+ctrc_root_local_ack_exact_locked(uint64 index, const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcParticipantIdentity *identity, uint32 grant, uint64 seal)
+{
+	const ClusterCtrcParticipantEntry *participant = &ctrc_participant_entries()[index];
+
+	return memcmp(&participant->key, key, sizeof(*key)) == 0
+		&& memcmp(&participant->identity, identity, sizeof(*identity)) == 0
+		&& participant->grant_generation == grant && participant->seal_generation == seal
+		&& ctrc_bytes_zero(&participant->delegation_parent, sizeof(participant->delegation_parent))
+		&& ctrc_bytes_zero(&participant->delegation_path, sizeof(participant->delegation_path))
+		&& participant->delegation_count != 0
+		&& ctrc_delegated_local_ack_summary_exact(participant, &ctrc_participant_ack_entries()[index])
+		&& ctrc_receipt_chain_exact_locked(index, true);
+}
+#endif
+
+bool
+cluster_ctrc_participant_root_subtree_ack_shared(const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcParticipantIdentity *identity, uint32 grant, uint64 seal,
+	ClusterCtrcRootSubtreeAckV1 *out)
+{
+	if (out != NULL)
+		MemSet(out, 0, sizeof(*out));
+#ifndef CLUSTER_CTRC_UNIT_TEST
+	{
+		ClusterCtrcParticipantEntry participant;
+		ClusterCtrcRootSubtreeAckV1 candidate = { 0 };
+		uint8 children[CLUSTER_CTRC_MAX_PARTICIPANTS * 58];
+		uint8 body[CLUSTER_CTRC_ROOT_ACK_BYTES];
+		Size length = 0;
+		uint64 index;
+		bool exact;
+
+		if (out == NULL || key == NULL || identity == NULL || !cluster_ctrc_shmem_ready()
+			|| cluster_node_id < 0 || identity->node_id != (uint16)cluster_node_id
+			|| !ctrc_participant_index(key, identity->node_id, &index))
+			return false;
+		ctrc_participant_locks_acquire(ctrc_participant_lock_mask(index));
+		LWLockAcquire(&CtrcShared->receipt_lock, LW_SHARED);
+		exact = ctrc_root_local_ack_exact_locked(index, key, identity, grant, seal);
+		if (exact) {
+			participant = ctrc_participant_entries()[index];
+			candidate.local_ack = ctrc_participant_ack_entries()[index];
+		}
+		LWLockRelease(&CtrcShared->receipt_lock);
+		ctrc_participant_locks_release(ctrc_participant_lock_mask(index));
+		if (!exact)
+			return false;
+		candidate.subtree.original_full_xid = participant.original_full_xid;
+		candidate.subtree.subtree_bitmap = UINT64_C(1) << identity->node_id;
+		for (unsigned node = 0; node < CLUSTER_CTRC_MAX_PARTICIPANTS; node++) {
+			if ((participant.delegation_ack_bitmap & (UINT64_C(1) << node)) != 0) {
+				ctrc_put_u16_le(children + length, node);
+				ctrc_put_u64_le(children + length + 2, participant.delegations[node].sequence);
+				ctrc_put_u64_le(children + length + 10, participant.delegation_close_request_id[node]);
+				ctrc_put_u64_le(children + length + 18, participant.delegation_subtree_bitmap[node]);
+				memcpy(children + length + 26, participant.delegation_ack_digest[node], 32);
+				length += 58;
+				candidate.subtree.subtree_bitmap |= participant.delegation_subtree_bitmap[node];
+			}
+			candidate.subtree.required_lsn[node] = Max(participant.delegation_required_lsn[node],
+				candidate.local_ack.required_lsn_vector[node]);
+		}
+		candidate.subtree.required_lsn[identity->node_id]
+			= Max(candidate.subtree.required_lsn[identity->node_id], candidate.local_ack.highest_local_cleanout_lsn);
+		if (!cluster_ctrc_sha256_exact(children, length, candidate.subtree.children_digest_sha256)
+			|| !ctrc_root_ack_encode_body(&candidate, body))
+			return false;
+		candidate.subtree.crc32c = ctrc_get_u32_le(body + 592);
+		/* A hash never spans an unverified row or frozen receipt cut. */
+		ctrc_participant_locks_acquire(ctrc_participant_lock_mask(index));
+		LWLockAcquire(&CtrcShared->receipt_lock, LW_SHARED);
+		exact = memcmp(&participant, &ctrc_participant_entries()[index], sizeof(participant)) == 0
+			&& memcmp(&candidate.local_ack, &ctrc_participant_ack_entries()[index], sizeof(candidate.local_ack)) == 0
+			&& ctrc_root_local_ack_exact_locked(index, key, identity, grant, seal);
+		LWLockRelease(&CtrcShared->receipt_lock);
+		ctrc_participant_locks_release(ctrc_participant_lock_mask(index));
+		if (!exact)
+			return false;
+		*out = candidate;
+		return true;
+	}
+#else
+	(void)key;
+	(void)identity;
+	(void)grant;
+	(void)seal;
+	return false;
+#endif
+}
+
 bool
 cluster_ctrc_origin_ack_land_entry(ClusterCtrcOriginEntry *origin, uint64 request_id,
 								   const ClusterCtrcLocalReleaseAckV1 *ack,
@@ -8284,6 +8557,57 @@ cluster_ctrc_origin_ack_land_shared(uint64 request_id, const ClusterCtrcLocalRel
 		return false;
 	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
 	landed = ctrc_origin_ack_land_locked(request_id, ack, &progressed);
+	LWLockRelease(&CtrcShared->origin_lock);
+	if (progressed)
+		ctrc_semantic_progress(true);
+	return landed;
+#else
+	(void)request_id;
+	(void)ack;
+	return false;
+#endif
+}
+
+bool
+cluster_ctrc_origin_root_ack_land_shared(uint64 request_id, const ClusterCtrcRootSubtreeAckV1 *ack)
+{
+#ifndef CLUSTER_CTRC_UNIT_TEST
+	ClusterCtrcOriginEntry candidate;
+	ClusterCtrcOriginEntry *origin;
+	ClusterCtrcLocalReleaseAckV1 slot;
+	uint64 origin_index, ack_index;
+	uint32 bit;
+	bool landed = false;
+	bool progressed = false;
+
+	if (request_id == 0 || !ctrc_root_ack_bytes_exact(ack) || !cluster_ctrc_shmem_ready()
+		|| !ctrc_origin_index(&ack->local_ack.transaction_key, &origin_index)
+		|| !ctrc_origin_ack_index(&ack->local_ack.transaction_key,
+			ack->local_ack.participant_node_id, &ack_index))
+		return false;
+	bit = UINT32_C(1) << ack->local_ack.participant_node_id;
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+	origin = &ctrc_origin_entries()[origin_index];
+	candidate = *origin;
+	slot = ctrc_origin_ack_entries()[ack_index];
+	/* No failed root proof changes the original row or its ACK slot. An
+	 * existing local-only ACK cannot be upgraded retrospectively. */
+	if (ctrc_origin_root_metadata_valid(origin)
+		&& FullTransactionIdEquals(origin->original_full_xid, ack->subtree.original_full_xid)
+		&& (((origin->ack_bitmap & bit) == 0)
+			|| ((origin->root_subtree_ack_bitmap & bit) != 0
+				&& memcmp(&origin->root_subtree_acks[ack->local_ack.participant_node_id],
+					&ack->subtree, sizeof(ack->subtree)) == 0))
+		&& cluster_ctrc_origin_ack_land_entry(&candidate, request_id, &ack->local_ack, &slot)) {
+		candidate.root_subtree_ack_bitmap |= bit;
+		candidate.root_subtree_acks[ack->local_ack.participant_node_id] = ack->subtree;
+		if (ctrc_origin_root_metadata_valid(&candidate)) {
+			progressed = origin->ack_bitmap != candidate.ack_bitmap;
+			ctrc_origin_ack_entries()[ack_index] = slot;
+			*origin = candidate;
+			landed = true;
+		}
+	}
 	LWLockRelease(&CtrcShared->origin_lock);
 	if (progressed)
 		ctrc_semantic_progress(true);
@@ -11870,18 +12194,28 @@ cluster_ctrc_origin_certificate_validate(const ClusterCtrcCertificateInput *inpu
 	const ClusterCtrcLocalReleaseAckV1 *first = NULL;
 	uint64 allowed_bitmap = (UINT64_C(1) << CLUSTER_CTRC_MAX_PARTICIPANTS) - 1;
 	uint64 seen_bitmap = 0;
+	uint64 covered_bitmap = 0;
 	uint16 i;
 
-	if (input == NULL || input->reserved16 != 0 || input->seal_generation == 0
-		|| input->seal_generation == UINT64_MAX || !input->block0_terminal_exact
-		|| !input->all_dependencies_durable || (input->frozen_touched_bitmap & ~allowed_bitmap) != 0
+	if (input == NULL || input->reserved16 != 0 || input->reserved32 != 0
+		|| input->seal_generation == 0 || input->seal_generation == UINT64_MAX
+		|| !input->block0_terminal_exact || !input->all_dependencies_durable
+		|| (input->frozen_touched_bitmap & ~allowed_bitmap) != 0
 		|| input->ack_count > CLUSTER_CTRC_MAX_PARTICIPANTS
-		|| (input->ack_count != 0 && input->acks == NULL))
+		|| (input->ack_count != 0 && input->acks == NULL)
+		|| (input->root_subtree_bitmap & ~input->frozen_touched_bitmap) != 0
+		|| ((input->root_subtree_bitmap != 0) != (input->root_subtrees != NULL)))
 		return CLUSTER_CTRC_CERTIFICATE_RETAIN;
+	if (input->root_subtrees != NULL)
+		for (i = 0; i < CLUSTER_CTRC_MAX_PARTICIPANTS; i++)
+			if ((input->root_subtree_bitmap & (UINT32_C(1) << i)) == 0
+				&& !ctrc_bytes_zero(&input->root_subtrees[i], sizeof(input->root_subtrees[i])))
+				return CLUSTER_CTRC_CERTIFICATE_RETAIN;
 
 	for (i = 0; i < input->ack_count; i++) {
 		const ClusterCtrcLocalReleaseAckV1 *ack = &input->acks[i];
 		uint64 node_bit;
+		uint64 contribution;
 
 		if (!ctrc_ack_bytes_exact(ack) || ack->seal_generation != input->seal_generation
 			|| ack->participant_node_id >= CLUSTER_CTRC_MAX_PARTICIPANTS)
@@ -11892,10 +12226,22 @@ cluster_ctrc_origin_certificate_validate(const ClusterCtrcCertificateInput *inpu
 		if (first == NULL)
 			first = ack;
 		else if (memcmp(&ack->transaction_key, &first->transaction_key,
-						sizeof(ack->transaction_key))
-					 != 0
+						sizeof(ack->transaction_key)) != 0
 				 || ack->grant_generation != first->grant_generation)
 			return CLUSTER_CTRC_CERTIFICATE_RETAIN;
+		contribution = node_bit;
+		if ((input->root_subtree_bitmap & node_bit) != 0) {
+			ClusterCtrcRootSubtreeAckV1 root = { *ack, input->root_subtrees[ack->participant_node_id] };
+
+			if (!ctrc_root_ack_bytes_exact(&root)
+				|| !FullTransactionIdEquals(root.subtree.original_full_xid, input->original_full_xid)
+				|| (root.subtree.subtree_bitmap & (input->frozen_touched_bitmap & ~node_bit)) != 0)
+				return CLUSTER_CTRC_CERTIFICATE_RETAIN;
+			contribution = root.subtree.subtree_bitmap;
+		}
+		if ((contribution & covered_bitmap) != 0)
+			return CLUSTER_CTRC_CERTIFICATE_RETAIN;
+		covered_bitmap |= contribution;
 		seen_bitmap |= node_bit;
 	}
 	if (seen_bitmap != input->frozen_touched_bitmap)
@@ -11907,9 +12253,10 @@ bool
 cluster_ctrc_origin_certificate_digest(const ClusterCtrcCertificateInput *input, uint8 digest[32])
 {
 	static const uint8 ack_set_domain[] = "PGRAC-CTRC-ACKSET-V1";
+	static const uint8 root_set_domain[] = "PGRAC-CTRC-ACKSET-V2";
 	const ClusterCtrcLocalReleaseAckV1 *ordered[CLUSTER_CTRC_MAX_PARTICIPANTS];
 	pg_sha256_ctx context;
-	uint8 ack_bytes[CLUSTER_CTRC_LOCAL_ACK_BYTES];
+	uint8 ack_bytes[CLUSTER_CTRC_ROOT_ACK_BYTES];
 	uint8 count_bytes[2];
 	uint8 length_bytes[4];
 	uint16 node_id;
@@ -11925,19 +12272,32 @@ cluster_ctrc_origin_certificate_digest(const ClusterCtrcCertificateInput *input,
 		ordered[input->acks[i].participant_node_id] = &input->acks[i];
 
 	pg_sha256_init(&context);
-	pg_sha256_update(&context, ack_set_domain, sizeof(ack_set_domain));
+	if (input->root_subtree_bitmap != 0)
+		pg_sha256_update(&context, root_set_domain, sizeof(root_set_domain));
+	else
+		pg_sha256_update(&context, ack_set_domain, sizeof(ack_set_domain));
 	ctrc_put_u16_le(count_bytes, input->ack_count);
 	pg_sha256_update(&context, count_bytes, sizeof(count_bytes));
-	ctrc_put_u32_le(length_bytes, CLUSTER_CTRC_LOCAL_ACK_BYTES);
 	for (node_id = 0; node_id < CLUSTER_CTRC_MAX_PARTICIPANTS; node_id++) {
+		Size length = CLUSTER_CTRC_LOCAL_ACK_BYTES;
+		bool encoded;
+
 		if (ordered[node_id] == NULL)
 			continue;
-		if (!cluster_ctrc_local_release_ack_encode(ordered[node_id], ack_bytes)) {
+		if ((input->root_subtree_bitmap & (UINT32_C(1) << node_id)) != 0) {
+			ClusterCtrcRootSubtreeAckV1 root = { *ordered[node_id], input->root_subtrees[node_id] };
+
+			length = CLUSTER_CTRC_ROOT_ACK_BYTES;
+			encoded = ctrc_root_ack_encode_body(&root, ack_bytes);
+		} else
+			encoded = cluster_ctrc_local_release_ack_encode(ordered[node_id], ack_bytes);
+		if (!encoded) {
 			MemSet(digest, 0, 32);
 			return false;
 		}
+		ctrc_put_u32_le(length_bytes, length);
 		pg_sha256_update(&context, length_bytes, sizeof(length_bytes));
-		pg_sha256_update(&context, ack_bytes, sizeof(ack_bytes));
+		pg_sha256_update(&context, ack_bytes, length);
 	}
 	pg_sha256_final(&context, digest);
 	return true;
@@ -11960,6 +12320,7 @@ cluster_ctrc_origin_certificate_snapshot_entry(
 		|| origin->seal_generation == UINT64_MAX
 		|| !ctrc_bytes_zero(origin->reserved8, sizeof(origin->reserved8))
 		|| !ctrc_origin_frozen_touch_set_valid(origin)
+		|| !ctrc_origin_root_metadata_valid(origin)
 		|| origin->close_dispatched_bitmap != origin->touched_bitmap
 		|| origin->close_confirmed_bitmap != origin->touched_bitmap
 		|| origin->ack_bitmap != origin->touched_bitmap)
@@ -11997,6 +12358,9 @@ cluster_ctrc_origin_certificate_snapshot_entry(
 	input.acks = snapshot->ack_count == 0 ? NULL : snapshot->acks;
 	input.ack_count = snapshot->ack_count;
 	input.frozen_touched_bitmap = origin->touched_bitmap;
+	input.root_subtree_bitmap = origin->root_subtree_ack_bitmap;
+	input.root_subtrees = input.root_subtree_bitmap != 0 ? origin->root_subtree_acks : NULL;
+	input.original_full_xid = origin->original_full_xid;
 	input.seal_generation = origin->seal_generation;
 	input.block0_terminal_exact = true;
 	input.all_dependencies_durable = true;
@@ -12095,6 +12459,7 @@ ctrc_normal_stop_origin_exact(const ClusterCtrcOriginEntry *origin, uint64 index
 
 	if (!ctrc_origin_index(&origin->key, &actual_index) || actual_index != index
 		|| origin->reservation_generation == UINT64_MAX
+		|| !ctrc_origin_root_metadata_valid(origin)
 		|| !ctrc_bytes_zero(origin->reserved8, sizeof(origin->reserved8)))
 		return false;
 	if (FullTransactionIdIsValid(origin->original_full_xid)
@@ -12162,6 +12527,11 @@ ctrc_normal_stop_origins_locked(ClusterCtrcNormalStopObservation *out)
 				&& ack->capability_record_generation == identity->capability_record_generation
 				&& ack->formation_epoch == identity->formation_epoch
 				&& ack->admission_record_generation == identity->admission_record_generation;
+		if (exact && (origin->root_subtree_ack_bitmap & (UINT32_C(1) << node)) != 0) {
+			ClusterCtrcRootSubtreeAckV1 proof = { *ack, origin->root_subtree_acks[node] };
+
+			exact = ctrc_root_ack_bytes_exact(&proof);
+		}
 		ctrc_normal_stop_note(out,
 							  exact ? CLUSTER_NORMAL_STOP_PENDING : CLUSTER_NORMAL_STOP_INVALID,
 							  CTRC_STOP_DOMAIN_ORIGIN_ACK,

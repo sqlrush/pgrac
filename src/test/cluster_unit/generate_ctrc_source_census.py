@@ -232,7 +232,7 @@ SCAN_RULES: Tuple[ScanRule, ...] = (
             "src/backend/cluster/cluster_gcs_block.c",
             "src/backend/cluster/cluster_terminal_ref_census.c",
         ),
-        r"\bcluster_ctrc_(?:seal_request_(?:encode|decode)|seal_reply_(?:encode|decode)|delegated_ack_reply_(?:encode|decode)|delegation_close_(?:encode|decode)_v1|participant_(?:request_shared|delegated_close_shared|delegated_local_ack_shared|delegated_subtree_ack_shared|delegated_ack_land_shared|next_delegated_close_shared|delegated_close_matches_shared|delegated_close_snapshot_shared|delegation_merge_(?:observed|land)_shared)|origin_ack_land_shared)\s*\(",
+        r"\bcluster_ctrc_(?:seal_request_(?:encode|decode)|seal_reply_(?:encode|decode)|root_ack_reply_(?:encode|decode)|delegated_ack_reply_(?:encode|decode)|delegation_close_(?:encode|decode)_v1|participant_(?:request_shared|delegated_close_shared|delegated_local_ack_shared|delegated_subtree_ack_shared|root_subtree_ack_shared|delegated_ack_land_shared|next_delegated_close_shared|delegated_close_matches_shared|delegated_close_snapshot_shared|delegation_merge_(?:observed|land)_shared)|origin_(?:ack_land_shared|root_ack_land_shared))\s*\(",
     ),
     ScanRule(
         "CTRC_RELATION_GATE",
@@ -379,6 +379,32 @@ _classify_owners(
     "ALL_CTRC_TARGET_KINDS",
     "NO_REFERENCE_TRANSFER_REQUIRED",
     "RETAIN_PENDING_UNTIL_PROTECTED_MERGE",
+    "MXA-T24",
+)
+
+# Explicit root proofs enter the original origin ACK ledger and certificate
+# digest. Participant/child custody remains until exact certificate notice.
+_classify_owners(
+    "CTRC_CLOSE_WIRE",
+    "src/backend/cluster/cluster_gcs_block.c",
+    ("gcs_block_land_root_subtree_reply",),
+    "TERMINAL_PROJECTION_DISCHARGE",
+    "ALL_CTRC_REFERENCE_KINDS",
+    "ALL_CTRC_TARGET_KINDS",
+    "NO_SUCCESSOR_ON_CLOSE",
+    "cluster_ctrc_origin_root_ack_land_shared",
+    "MXA-T24",
+)
+_classify_owners(
+    "CTRC_CLOSE_WIRE",
+    "src/backend/cluster/cluster_terminal_ref_census.c",
+    ("cluster_ctrc_root_ack_reply_encode", "cluster_ctrc_root_ack_reply_decode",
+     "cluster_ctrc_participant_root_subtree_ack_shared", "cluster_ctrc_origin_root_ack_land_shared"),
+    "TERMINAL_PROJECTION_DISCHARGE",
+    "ALL_CTRC_REFERENCE_KINDS",
+    "ALL_CTRC_TARGET_KINDS",
+    "NO_SUCCESSOR_ON_CLOSE",
+    "cluster_ctrc_origin_root_ack_land_shared|RETAIN_CUSTODY_UNTIL_CERTIFICATE",
     "MXA-T24",
 )
 

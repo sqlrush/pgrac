@@ -9193,9 +9193,10 @@ test_cluster_ctrc_delegation_forward.inc: $(top_srcdir)/src/backend/cluster/clus
 
 test_cluster_ctrc_delegation_reply.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
 	awk '/^gcs_block_land_delegation_merge_reply\(/ { print "static void"; emit=1; merge++ } \
+	     /^gcs_block_land_root_subtree_reply\(/ { print "static void"; emit=1; root++ } \
 	     /^gcs_block_try_land_ctrc_reply\(/ { print "static bool"; emit=1; found++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (found != 1 || merge != 1 || emit) exit 1 }' $< > $@.tmp
+	     END { if (found != 1 || merge != 1 || root != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_ctrc_delegation_close: test_cluster_ctrc_delegation_close.c test_cluster_ctrc_dispatch.c \
