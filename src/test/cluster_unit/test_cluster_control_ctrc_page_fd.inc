@@ -8,6 +8,7 @@ static unsigned ctrc_page_fd_fault, ctrc_page_fd_opens, ctrc_page_fd_closes;
 static bool ctrc_page_fd_invalid;
 static ResourceOwner ctrc_page_fd_owner;
 static int ctrc_page_fd_pid;
+static MemoryContext ctrc_page_fd_context;
 static void (*ctrc_page_fd_read_transport)(SMgrRelation, ForkNumber, BlockNumber, void *) = smgrread;
 
 static void
@@ -34,6 +35,8 @@ cluster_shared_fs_page_open_v1(RelFileLocator locator, BlockNumber block, Size m
 	UT_ASSERT(ctrc_read_native_live != NULL && memory_budget >= cluster_shared_fs_page_bytes_v1());
 	UT_ASSERT(memcmp(&locator, &ctrc_read_native_live->space.key.locator, sizeof(locator)) == 0);
 	ctrc_page_fd_opens++;
+	ctrc_page_fd_context = CurrentMemoryContext;
+	if (ctrc_page_fd_fault == 8) pg_re_throw();
 	if (!ctrc_page_fd_enabled || ctrc_page_fd_fault == 1) return NULL;
 	ctrc_page_fd_owner = CurrentResourceOwner; ctrc_page_fd_pid = MyProcPid;
 	ctrc_page_fd_live = true;

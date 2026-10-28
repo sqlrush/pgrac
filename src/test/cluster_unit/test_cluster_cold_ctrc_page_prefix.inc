@@ -17,6 +17,7 @@
  *-------------------------------------------------------------------------
  */
 static uint32 prefix_count;
+static void pending_storage_fixture_reset(void);
 static RfPageOnlineTargetViewV1 prefix_targets[2];
 static RfPageStableGraphRequestV1 prefix_graph[2];
 static RfContributorVectorV1 prefix_contributors[2];
@@ -35,6 +36,7 @@ static ClusterRecoveryStampHandleV1 prefix_window;
 static void
 page_prefix_fixture_reset(void)
 {
+ pending_storage_fixture_reset();
  prefix_count = prefix_steps = prefix_proofs = prefix_pages = prefix_destroyed = 0;
  prefix_source_ordinal = 0;
  prefix_error = prefix_wait = prefix_unchanged = prefix_bad_physical = prefix_insert_refuse = false;

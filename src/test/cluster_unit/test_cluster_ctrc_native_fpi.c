@@ -465,6 +465,7 @@ bool native_install_original_writer_installed(ClusterWalWriterToken *writer,
 #include "test_cluster_ctrc_native_unchanged_sync.inc"
 #include "test_cluster_ctrc_native_cache.inc"
 #include "test_cluster_ctrc_native_unchanged_cache.inc"
+#include "test_cluster_ctrc_native_held_fd.inc"
 
 int
 main(int argc, char **argv)
@@ -473,6 +474,17 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_NATIVE_HELD_FD") != NULL) {
+		UT_PLAN(7);
+		UT_RUN(test_native_held_fd_retains_same_durable_storage);
+		UT_RUN(test_native_held_fd_uses_long_lived_context_and_restores_caller);
+		UT_RUN(test_native_held_fd_preserves_four_older_close_contracts);
+		UT_RUN(test_native_held_fd_does_not_transfer_other_phases);
+		UT_RUN(test_native_held_fd_late_refusal_closes_and_keeps_debt);
+		UT_RUN(test_native_held_fd_error_closes_and_keeps_debt);
+		UT_RUN(test_native_held_fd_open_error_restores_caller_context);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_NATIVE_UNCHANGED_CACHE") != NULL) {
 		UT_PLAN(6);
 		UT_RUN(test_native_unchanged_cache_retires_only_through_original_page_gate);
@@ -539,7 +551,14 @@ main(int argc, char **argv)
 		UT_RUN(test_native_step_fixed_fd_close_failure_cannot_claim_target_synced);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(79);
+	UT_PLAN(86);
+	UT_RUN(test_native_held_fd_retains_same_durable_storage);
+	UT_RUN(test_native_held_fd_uses_long_lived_context_and_restores_caller);
+	UT_RUN(test_native_held_fd_preserves_four_older_close_contracts);
+	UT_RUN(test_native_held_fd_does_not_transfer_other_phases);
+	UT_RUN(test_native_held_fd_late_refusal_closes_and_keeps_debt);
+	UT_RUN(test_native_held_fd_error_closes_and_keeps_debt);
+	UT_RUN(test_native_held_fd_open_error_restores_caller_context);
 	UT_RUN(test_native_unchanged_cache_retires_only_through_original_page_gate);
 	UT_RUN(test_native_unchanged_cache_busy_waits_before_sync_without_retiring_duties);
 	UT_RUN(test_native_unchanged_cache_refusal_never_reports_synced);

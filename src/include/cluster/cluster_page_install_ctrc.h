@@ -212,5 +212,29 @@ extern RfPageCtrcStepResultV1 rf_page_recovery_ctrc_replays_itl_graph_sync_smgr_
 	BlockNumber blockno, const RfPageVersionV1 *expected_before, const char canonical[BLCKSZ],
 	const struct ClusterRecoveryUndoEntry *physical, Size physical_count, Size memory_budget);
 
+struct ClusterSharedFsPageV1;
+typedef struct RfPageCtrcHeldStepV1 {
+	RfPageCtrcStepResultV1 result;
+	struct ClusterSharedFsPageV1 *storage;
+} RfPageCtrcHeldStepV1;
+
+/* Opt in to retaining the SAME original raw MAIN/SPACE descriptors only on
+ * FPI_DURABLE, after all original sync/postread, F4 and currentness checks.
+ * The returned non-NULL storage belongs to this process/ResourceOwner and is
+ * allocated in TopMemoryContext. Keep the original Start and borrowed inputs
+ * alive; close storage before retiring that owner. The caller must save both
+ * values before callbacks/ERROR and close on every eventual local cleanup.
+ * All other phases and ERROR close locally as before. No descriptor is
+ * reopened or added, and the original budget still covers the preparation.
+ * This transfers only private FD cleanup, never PAGE/IR/WALR, window debt,
+ * discharge or COMPLETE/OPEN authority. The four older entries still close
+ * their descriptors on every return. */
+extern RfPageCtrcHeldStepV1 rf_page_recovery_ctrc_replays_itl_graph_hold_smgr_v1(
+	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work,
+	const struct ClusterRecoveryCtrcReplaySetSourceV1 *source,
+	RfPageCtrcAuthorityV1 *authority, const struct ClusterSpaceIdentity *space,
+	BlockNumber blockno, const RfPageVersionV1 *expected_before, const char canonical[BLCKSZ],
+	const struct ClusterRecoveryUndoEntry *physical, Size physical_count, Size memory_budget);
+
 #endif /* USE_PGRAC_CLUSTER */
 #endif /* CLUSTER_PAGE_INSTALL_CTRC_H */

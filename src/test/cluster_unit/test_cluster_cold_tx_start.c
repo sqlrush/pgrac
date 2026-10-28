@@ -2,6 +2,7 @@
  * binding/fence, WAL, storage and ResourceOwner services remain fixture leaves. */
 #define USE_PGRAC_CLUSTER 1
 #include "postgres.h"
+#include "cluster/storage/cluster_shared_fs_page.h"
 #include <setjmp.h>
 #include "access/xlog.h"
 #include "access/xloginsert.h"
@@ -2326,9 +2327,21 @@ UT_TEST(test_relmap_failure_revokes_original_episode_without_free_or_release)
 #include "test_cluster_cold_ctrc_unchanged_sync.inc"
 #include "test_cluster_cold_ctrc_pending_window.inc"
 #include "test_cluster_cold_ctrc_returned_fpi.inc"
+#include "test_cluster_cold_ctrc_pending_storage.inc"
 
 int main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_STARTUP_PENDING_STORAGE") != NULL) {
+		UT_PLAN(7);
+		UT_RUN(test_startup_pending_storage_is_saved_before_page_cleanup);
+		UT_RUN(test_startup_pending_storage_loss_refuses_without_reopening);
+		UT_RUN(test_startup_pending_storage_late_owner_loss_retains_cleanup);
+		UT_RUN(test_startup_pending_storage_page_cleanup_error_keeps_handle);
+		UT_RUN(test_startup_pending_storage_requires_handle_for_durable_result);
+		UT_RUN(test_startup_pending_storage_noop_and_wait_do_not_leak);
+		UT_RUN(test_startup_pending_storage_checks_original_guards_before_metadata);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_STARTUP_RETURNED_FPI") != NULL) {
 		UT_PLAN(7);
 		UT_RUN(test_startup_returned_durable_is_saved_before_page_cleanup);
@@ -2435,7 +2448,14 @@ int main(void)
 		UT_RUN(test_ctrc_pages_native_error_retires_cursor_before_original_scope);
 		reset(); UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(186);
+	UT_PLAN(193);
+	UT_RUN(test_startup_pending_storage_is_saved_before_page_cleanup);
+	UT_RUN(test_startup_pending_storage_loss_refuses_without_reopening);
+	UT_RUN(test_startup_pending_storage_late_owner_loss_retains_cleanup);
+	UT_RUN(test_startup_pending_storage_page_cleanup_error_keeps_handle);
+	UT_RUN(test_startup_pending_storage_requires_handle_for_durable_result);
+	UT_RUN(test_startup_pending_storage_noop_and_wait_do_not_leak);
+	UT_RUN(test_startup_pending_storage_checks_original_guards_before_metadata);
 	UT_RUN(test_startup_returned_durable_is_saved_before_page_cleanup);
 	UT_RUN(test_startup_returned_durable_survives_late_owner_loss);
 	UT_RUN(test_startup_returned_failed_operation_survives_late_owner_loss);
