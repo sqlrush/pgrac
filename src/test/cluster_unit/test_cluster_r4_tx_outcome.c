@@ -7597,7 +7597,7 @@ UT_TEST(test_retained_slot_identity_does_not_escape_original_final_fences)
 int
 main(void)
 {
-	UT_PLAN(317);
+	UT_PLAN(322);
 	UT_RUN(test_operation_worker_real_builder_yields_before_visibility);
 	UT_RUN(test_operation_worker_real_origin_completes_private_inverse);
 	UT_RUN(test_operation_worker_pending_current_is_bounded_and_counts_once);
@@ -7640,6 +7640,11 @@ main(void)
 	UT_RUN(test_operation_worker_live_root_projection_requires_identical_creation_bytes);
 	UT_RUN(test_operation_worker_kept_lock_does_not_grant_full_modify_coverage);
 	UT_RUN(test_operation_worker_root_overlap_never_bypasses_unknown_older_top);
+	UT_RUN(test_operation_worker_cross_page_discard_restores_each_exact_role);
+	UT_RUN(test_operation_worker_cross_page_live_keeps_both_roles);
+	UT_RUN(test_operation_worker_cross_page_late_live_inverses_both_roles);
+	UT_RUN(test_operation_worker_cross_page_role_and_tuple_mismatches_refuse);
+	UT_RUN(test_operation_worker_cross_page_cohort_keeps_role_proofs_separate);
 
 	UT_RUN(test_operation_poll_does_not_complete_inline);
 	UT_RUN(test_operation_poll_stages_outputs);
