@@ -2914,8 +2914,12 @@ test_cluster_page_wal_image.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_b
 	awk '/^gcs_block_resource_x_put_u32\(/ || /^gcs_block_resource_x_put_u64\(/ \
 	       { print "static void"; emit=1; n++ } \
 	     /^gcs_block_pcm_x_resource_x_dependency_crc\(/ { print "static uint32"; emit=1; n++ } \
-	     /^gcs_block_pcm_x_resource_x_build_source_frames\(/ { print "static bool"; emit=1; n++ } \
-	     emit { print } emit && /^}/ { emit=0 } END { if (n != 4) exit 1 }' $< > $@
+	     /^gcs_block_pcm_x_resource_x_build_source_frames\(/ \
+	       || /^gcs_block_resource_x_ctrc_source_identities\(/ \
+	       || /^gcs_block_pcm_x_resource_x_delegate_source_frames\(/ \
+	       { print "static bool"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 6 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
 
 test_cluster_page_wal_pregrant.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
 	awk '/^[[:space:]]gcs_block_pcm_x_resource_x_install_target_image_exact\(/ { print "static ClusterPcmOwnResult"; emit=1; n++ } \

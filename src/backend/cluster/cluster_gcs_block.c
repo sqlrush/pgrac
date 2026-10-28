@@ -9966,6 +9966,189 @@ gcs_block_pcm_x_resource_x_build_source_frames(
 	return true;
 }
 
+/* Ordinary ITL receipts use the original OPEN record as their participant
+ * stamp (runtime_visibility's local producer uses the same domain). A DATA
+ * connection generation is separately checked in its local HELLO domain;
+ * never copy that transport counter into an origin's immutable144B record. */
+static bool
+gcs_block_resource_x_ctrc_source_identities(
+	const ClusterSemanticAdmissionToken *admission, int32 requester_node,
+	uint32 requester_connection_generation, uint64 source_boot,
+	ClusterCtrcParticipantIdentity *sender, ClusterCtrcParticipantIdentity *receiver)
+{
+	uint64 observed_boot = 0;
+	uint64 observed_generation = 0;
+	const uint32 required = PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1
+		| PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2;
+
+	memset(sender, 0, sizeof(*sender));
+	memset(receiver, 0, sizeof(*receiver));
+	if (!cluster_enabled || !cluster_shared_config || cluster_node_id < 0
+		|| cluster_node_id >= CLUSTER_CTRC_MAX_PARTICIPANTS || requester_node < 0
+		|| requester_node >= CLUSTER_CTRC_MAX_PARTICIPANTS || requester_node == cluster_node_id
+		|| admission == NULL || !admission->entered
+		|| admission->feature_bit != CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1
+		|| admission->side != CLUSTER_SEMANTIC_TARGET_SIDE
+		|| admission->record_generation == 0 || admission->record_generation > UINT32_MAX
+		|| admission->formation_epoch != cluster_epoch_get_current()
+		|| !cluster_semantic_activation_recheck(admission)
+		|| source_boot == 0 || source_boot != cluster_qvotec_get_self_incarnation()
+		|| (cluster_ic_local_capability_word() & required) != required
+		|| !cluster_membership_is_member(requester_node)
+		|| !cluster_reconfig_get_observed_slot(requester_node, &observed_boot, &observed_generation)
+		|| observed_boot == 0 || observed_generation == 0
+		|| cluster_reconfig_get_observed_epoch(requester_node) != admission->formation_epoch
+		|| cluster_membership_get_last_admitted_incarnation(requester_node) != observed_boot
+		|| !cluster_sf_peer_capability_generation_matches(requester_node, required,
+			requester_connection_generation)
+		|| cluster_semantic_activation_resource_x_peer_open_check(admission, requester_node,
+			requester_connection_generation) != CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH
+		|| !cluster_semantic_activation_recheck(admission))
+		return false;
+
+	sender->node_id = (uint16)cluster_node_id;
+	sender->capability_record_generation = (uint32)admission->record_generation;
+	sender->boot_incarnation = source_boot;
+	sender->formation_epoch = admission->formation_epoch;
+	sender->admission_record_generation = admission->record_generation;
+	*receiver = *sender;
+	receiver->node_id = (uint16)requester_node;
+	receiver->boot_incarnation = observed_boot;
+	return true;
+}
+
+/* The caller still owns the original REVOKING source/copy and entered
+ * admission. First validate every slot, then retain each exact destination
+ * custody before encoding any output. Partial refusal retains responsibility;
+ * it never cancels a producer's edge or stages an incomplete image. The V3
+ * receiver stays closed before PCM until before-visible registration and the
+ * original background CLOSE/ACK chain are connected. No capability is enabled
+ * here, and non-ITL V2 construction remains byte-exact. */
+static bool
+gcs_block_pcm_x_resource_x_delegate_source_frames(
+	const ResourceXDecodedFrame *block, const ClusterSemanticAdmissionToken *admission,
+	uint32 peer_capabilities, ResourceXDecodedFrame *status, ResourceXDecodedFrame *image)
+{
+	ResourceXDecodedFrame canonical;
+	ClusterCtrcParticipantIdentity sender, receiver, final_sender, final_receiver;
+	ClusterCtrcItlTargetIdentity target = { 0 };
+	ClusterItlSlotData *slots;
+	PageHeader header;
+	uint8 bundle[RESOURCE_X_CTRC_BUNDLE_MAX_BYTES] = { 0 };
+	uint8 encoded[RESOURCE_X_IMAGE_V3_MAX_BYTES];
+	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
+	uint16 encoded_bytes = 0;
+	uint16 count = 0, used = RESOURCE_X_CTRC_BUNDLE_HEADER_BYTES;
+	uint64 source_boot;
+	uint32 connection;
+	const BufferTag *tag;
+
+	StaticAssertStmt(RESOURCE_X_CTRC_BUNDLE_HEADER_BYTES
+		+ CLUSTER_ITL_INITRANS_DEFAULT * CLUSTER_CTRC_DELEGATION_V1_BYTES
+		<= RESOURCE_X_CTRC_BUNDLE_MAX_BYTES, "ordinary ITL bundle must fit retained IMAGE");
+	if (block == NULL || status == NULL || image == NULL
+		|| block->kind != RESOURCE_X_WIRE_BLOCK_TO_N
+		|| status->kind != RESOURCE_X_WIRE_BLOCKED_TO_N
+		|| image->kind != RESOURCE_X_WIRE_IMAGE_ENVELOPE
+		|| image->body.image_envelope.image_length != BLCKSZ
+		|| image->body.image_envelope.ctrc_delegation_bytes != 0)
+		goto refused;
+	header = (PageHeader)image->body.image_envelope.page_bytes;
+	if (!PageHasItl((Page)header))
+		return true;
+	tag = &block->common.logical_assertion.resource;
+	if (tag->forkNum != MAIN_FORKNUM
+		|| !BufferTagsEqual(tag, &image->common.logical_assertion.resource)
+		|| block->common.logical_assertion.requester_node
+			!= image->common.logical_assertion.requester_node
+		|| (peer_capabilities & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) == 0
+		|| PageGetPageSize((Page)header) != BLCKSZ
+		|| PageGetPageLayoutVersion((Page)header) != PG_PAGE_LAYOUT_VERSION
+		|| (header->pd_flags & ~PD_VALID_FLAG_BITS) != 0
+		|| header->pd_lower < SizeOfPageHeaderData || header->pd_lower > header->pd_upper
+		|| header->pd_upper > header->pd_special || header->pd_special != MAXALIGN(header->pd_special)
+		|| header->pd_special > BLCKSZ - CLUSTER_ITL_ARRAY_SIZE)
+		goto refused;
+	slots = ClusterPageGetItlSlots((Page)header);
+	/* Unknown/lock-only/MX slots are not ordinary ITL transaction records.
+	 * A FREE slot may keep only its reuse counter, not a hidden old reference. */
+	for (uint16 i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
+		if (slots[i].flags == ITL_FLAG_FREE) {
+			ClusterItlSlotData empty = { 0 };
+
+			empty.wrap = slots[i].wrap;
+			if (memcmp(&empty, &slots[i], sizeof(empty)) != 0)
+				goto refused;
+		} else if (slots[i].flags < ITL_FLAG_ACTIVE || slots[i].flags > ITL_FLAG_NEEDS_CLEANOUT
+			|| !TransactionIdIsNormal(slots[i].xid) || UBA_is_invalid(slots[i].undo_segment_head))
+			goto refused;
+		else
+			count++;
+	}
+	connection = image->common.sender_connection_generation;
+	/* source_fence is the already-built canonical original local proof. */
+	source_boot = cluster_qvotec_get_self_incarnation();
+	{
+		uint8 expected[8];
+
+		gcs_block_resource_x_put_u64(expected, source_boot);
+		if (memcmp(expected, image->body.image_envelope.source_fence + 4, sizeof(expected)) != 0)
+			goto refused;
+	}
+	if (!gcs_block_resource_x_ctrc_source_identities(admission,
+		block->common.logical_assertion.requester_node, connection, source_boot, &sender, &receiver))
+		goto refused;
+	if (count == 0)
+		return true;
+	target.spc_oid = tag->spcOid;
+	target.db_oid = tag->dbOid;
+	target.rel_number = tag->relNumber;
+	target.fork_number = tag->forkNum;
+	target.block_number = tag->blockNum;
+	target.needs_wal = true;
+	for (uint16 i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
+		if (slots[i].flags == ITL_FLAG_FREE)
+			continue;
+		target.itl_xid = slots[i].xid;
+		target.itl_slot_index = i;
+		target.itl_slot_wrap = slots[i].wrap;
+		target.itl_class = slots[i].flags;
+		memcpy(target.uba, &slots[i].undo_segment_head, sizeof(target.uba));
+		if (!cluster_ctrc_itl_delegate_prepare_v1(&target, &slots[i], &sender, &receiver,
+			bundle + used, CLUSTER_CTRC_DELEGATION_V1_BYTES))
+			goto refused;
+		used += CLUSTER_CTRC_DELEGATION_V1_BYTES;
+	}
+	if (!gcs_block_resource_x_ctrc_source_identities(admission,
+		block->common.logical_assertion.requester_node, connection, source_boot,
+		&final_sender, &final_receiver)
+		|| memcmp(&sender, &final_sender, sizeof(sender)) != 0
+		|| memcmp(&receiver, &final_receiver, sizeof(receiver)) != 0)
+		goto refused;
+	bundle[1] = 1;
+	bundle[2] = (uint8)(used >> 8);
+	bundle[3] = (uint8)used;
+	bundle[5] = (uint8)count;
+	image->body.image_envelope.ctrc_delegation_bytes = used;
+	memcpy(image->body.image_envelope.ctrc_delegation, bundle, used);
+	image->payload_bytes = RESOURCE_X_IMAGE_V2_BYTES + used;
+	if (!cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, image, encoded,
+		sizeof(encoded), &encoded_bytes, &reject) || encoded_bytes != image->payload_bytes
+		|| !cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, encoded,
+			encoded_bytes, &canonical, &reject)
+		|| canonical.kind != RESOURCE_X_WIRE_IMAGE_ENVELOPE || canonical.common.semantic_crc32c == 0)
+		goto refused;
+	*image = canonical;
+	status->body.blocked_to_n.source_proof_crc32c = image->common.semantic_crc32c;
+	return true;
+refused:
+	if (status != NULL)
+		memset(status, 0, sizeof(*status));
+	if (image != NULL)
+		memset(image, 0, sizeof(*image));
+	return false;
+}
+
 static bool
 gcs_block_pcm_x_resource_x_abort_pre_arm(BufferDesc *buf, const ClusterPcmOwnSnapshot *revoking)
 {
@@ -10228,7 +10411,8 @@ gcs_block_resource_x_source_finish_owned(
 static ResourceXApplyResult
 gcs_block_pcm_x_resource_x_source_block_to_n(const ResourceXDecodedFrame *block,
 											 int32 authenticated_master_node,
-											 uint64 r4_record_generation)
+											 uint64 r4_record_generation,
+											 const ClusterSemanticAdmissionToken *admission)
 {
 	PGAlignedBlock aligned_page;
 	ClusterPageWalBindingV1 page_wal = { 0 };
@@ -10704,6 +10888,12 @@ gcs_block_pcm_x_resource_x_source_block_to_n(const ResourceXDecodedFrame *block,
 				block, &revoking, aligned_page.data, page_lsn, page_scn, &page_wal,
 				requester_connection_generation, source_boot_incarnation, source_mode, &status,
 				&image);
+			/* Only the original fully-qualified PI path carries delegation.
+			 * Legacy shared-storage V2 copies retain their original behavior. */
+			if (frame_ready && (capability_word & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) != 0
+				&& (cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) != 0)
+				frame_ready = gcs_block_pcm_x_resource_x_delegate_source_frames(
+					block, admission, capability_word, &status, &image);
 		}
 		if (!frame_ready)
 			result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
@@ -13268,7 +13458,7 @@ gcs_block_resource_x_type17_ingress(const ClusterICEnvelope *env,
 				 || frame->common.observed_mode == (uint8)PCM_STATE_S)
 				&& frame->common.source_candidate == 1 && frame->common.retain_pi_if_dirty == 1)
 				result = gcs_block_pcm_x_resource_x_source_block_to_n(frame, master_node,
-																	  admission.record_generation);
+																	  admission.record_generation, &admission);
 			else if (frame->common.observed_mode == (uint8)PCM_STATE_S
 					 && frame->common.logical_assertion.requester_node != cluster_node_id)
 				result = gcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(

@@ -653,7 +653,8 @@ errdetail_log(const char *fmt pg_attribute_unused(), ...)
 static ResourceXApplyResult
 gcs_block_pcm_x_resource_x_source_block_to_n(
 	const ResourceXDecodedFrame *frame pg_attribute_unused(), int32 node pg_attribute_unused(),
-	uint64 r4 pg_attribute_unused())
+	uint64 r4 pg_attribute_unused(),
+	const ClusterSemanticAdmissionToken *admission pg_attribute_unused())
 {
 	authority_mutations++;
 	return RESOURCE_X_APPLY_APPLIED;
@@ -664,13 +665,13 @@ gcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(
 	const ResourceXDecodedFrame *frame, int32 node, uint32 ingress pg_attribute_unused(), uint64 r4,
 	const ClusterSemanticAdmissionToken *admission pg_attribute_unused())
 {
-	return gcs_block_pcm_x_resource_x_source_block_to_n(frame, node, r4);
+	return gcs_block_pcm_x_resource_x_source_block_to_n(frame, node, r4, admission);
 }
 
 ResourceXApplyResult
 cluster_pcm_lock_resource_x_block_to_n_exact(const ResourceXDecodedFrame *frame, int32 node)
 {
-	return gcs_block_pcm_x_resource_x_source_block_to_n(frame, node, 77);
+	return gcs_block_pcm_x_resource_x_source_block_to_n(frame, node, 77, NULL);
 }
 
 ResourceXApplyResult
@@ -679,7 +680,7 @@ cluster_pcm_lock_resource_x_assert_bootstrapped_exact(
 	uint64 session pg_attribute_unused(), uint32 outbound pg_attribute_unused(),
 	ResourceXMasterSnapshot *out pg_attribute_unused())
 {
-	return gcs_block_pcm_x_resource_x_source_block_to_n(frame, node, r4);
+	return gcs_block_pcm_x_resource_x_source_block_to_n(frame, node, r4, NULL);
 }
 
 ResourceXApplyResult
@@ -1522,6 +1523,8 @@ UT_TEST(test_actual_peer_observation_gap_keeps_delivery_and_ingress_owned)
 static int first_error_step, first_private_refs, first_pending_refs, first_releases;
 static uint32 first_requester_caps, first_master_caps, first_copied_caps;
 static bool first_master_sample_ok;
+static uint32 first_local_caps;
+static unsigned first_delegation_frames;
 
 static bool
 first_master_capability_sample(int32 node, uint32 required, uint32 *word, uint32 *generation)
@@ -1596,6 +1599,8 @@ run_actual_source_first_cleanup(int route, bool semantic_retained)
 	(first_copied_caps = (peer_caps), first_capture_fixture((ClusterPageWalRefV1 *)(first)))
 #define cluster_sf_peer_capability_word_sample first_master_capability_sample
 #define gcs_block_pcm_x_resource_x_build_source_frames(...) first_frame_fixture()
+#define gcs_block_pcm_x_resource_x_delegate_source_frames(...) (first_delegation_frames++, true)
+#define cluster_ic_local_capability_word() first_local_caps
 #define cluster_pcm_lock_resource_x_block_to_n_prepared_s_source_exact(...) first_pair_fixture(NULL)
 #define cluster_pcm_lock_resource_x_block_to_n_drop_x_source_exact(a, b, c, d, e, f, first)        \
 	first_pair_fixture((ClusterPageWalRefV1 *)(first))
@@ -1612,6 +1617,8 @@ pre_retained_failure:
 #undef cluster_bufmgr_copy_block_for_gcs
 #undef cluster_sf_peer_capability_word_sample
 #undef gcs_block_pcm_x_resource_x_build_source_frames
+#undef gcs_block_pcm_x_resource_x_delegate_source_frames
+#undef cluster_ic_local_capability_word
 #undef cluster_pcm_lock_resource_x_block_to_n_prepared_s_source_exact
 #undef cluster_pcm_lock_resource_x_block_to_n_drop_x_source_exact
 #undef cluster_pcm_lock_resource_x_block_to_n_prepared_x_source_exact
@@ -1669,6 +1676,23 @@ UT_TEST(test_actual_source_copy_requires_requester_and_master_pi_capability)
 		UT_ASSERT_EQ(first_pending_refs, 1);
 	}
 	first_requester_caps = first_master_caps = 0;
+}
+
+UT_TEST(test_source_delegation_requires_original_qualified_pi_path)
+{
+	for (unsigned variant = 0; variant < 5; variant++) {
+		first_requester_caps = variant == 1 ? 0 : PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2;
+		first_master_caps = variant == 2 ? 0 : PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2;
+		first_local_caps = variant == 3 ? 0 : PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2;
+		first_master_sample_ok = variant != 4;
+		first_error_step = first_private_refs = first_pending_refs = first_releases = 0;
+		first_delegation_frames = 0;
+		UT_ASSERT_EQ(run_actual_source_first_cleanup(1, false), RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(first_delegation_frames, variant == 0 ? 1 : 0);
+		UT_ASSERT_EQ(first_private_refs, 0);
+		UT_ASSERT_EQ(first_pending_refs, 1);
+	}
+	first_requester_caps = first_master_caps = first_local_caps = 0;
 }
 
 static ResourceXApplyResult
@@ -2505,7 +2529,7 @@ UT_TEST(test_actual_failed_round_observation_retries_only_exact_predecessor_shap
 int
 main(void)
 {
-	UT_PLAN(28);
+	UT_PLAN(29);
 	UT_RUN(test_actual_terminal_ingress_keeps_master_and_physical_source_distinct);
 	UT_RUN(test_actual_kind9_ingress_does_not_send_ack_for_fused_admission);
 	UT_RUN(test_actual_fused_admission_notifies_ready_resource_without_registry_tick);
@@ -2519,6 +2543,7 @@ main(void)
 	UT_RUN(test_actual_image_ingress_yields_before_join_and_after_t3);
 	UT_RUN(test_actual_source_first_ref_is_released_across_errors);
 	UT_RUN(test_actual_source_copy_requires_requester_and_master_pi_capability);
+	UT_RUN(test_source_delegation_requires_original_qualified_pi_path);
 	UT_RUN(test_actual_source_gate_never_rolls_back_armed_pair_for_sample_gap);
 	UT_RUN(test_actual_source_before_mutation_waits_without_exporting_session);
 	UT_RUN(test_actual_foreground_retained_and_predecessor_wait_reobserve_without_fuse);
