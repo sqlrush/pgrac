@@ -10313,3 +10313,21 @@ clean distclean maintainer-clean: clean-master-publish-tick
 .PHONY: clean-master-publish-tick
 clean-master-publish-tick:
 	rm -f test_cluster_resource_x_master_publish_tick
+
+# Original native reservation -> process-local complete acquisition identity.
+TESTS += test_cluster_native_acquire_intent
+all: test_cluster_native_acquire_intent
+test_cluster_native_acquire_intent: test_cluster_native_acquire_intent.c \
+		test_cluster_native_acquire_intent.inc test_cluster_pcm_own
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DBUFMGR_SOURCE_PATH='"$(top_srcdir)/src/backend/storage/buffer/bufmgr.c"' \
+		$< $(CLUSTER_PCM_OWN_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+test_cluster_native_acquire_intent.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^cluster_bufmgr_pcm_own_acquire_intent_exact\(/ { print "ClusterPcmOwnResult"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+clean distclean maintainer-clean: clean-native-acquire-intent
+.PHONY: clean-native-acquire-intent
+clean-native-acquire-intent:
+	rm -f test_cluster_native_acquire_intent test_cluster_native_acquire_intent.inc test_cluster_native_acquire_intent.inc.tmp

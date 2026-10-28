@@ -2986,6 +2986,165 @@ static void cluster_bufmgr_pcm_direct_init_snapshot_locked(BufferDesc *buf, uint
 
 static inline int32 GetPrivateRefCount(Buffer buffer);
 
+/* Identity capture for an already-owned ordinary reservation.  Admission
+ * providers may take their own locks or ERROR, so neither provider sampling
+ * nor private-pin lookup runs under BufHdr.  Two native samples bracket those
+ * observations; no sidecar, token, grant or IO permission is published here.
+ * The eventual executor must revalidate this identity at its own linearization. */
+ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_acquire_intent_exact(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *base, uint64 reservation_token, uint8 path,
+	const ClusterSemanticAdmissionToken *admission,
+	const ResourceXDecodedAcquireIntent *expected, ResourceXDecodedAcquireIntent *out)
+{
+	ResourceXDecodedAcquireIntent candidate;
+	ClusterPcmOwnSnapshot first;
+	ClusterSemanticAdmissionToken entered;
+	PGPROC *proc;
+	int pid;
+	int pgprocno;
+	int32 buffer_id;
+
+	if (buf == NULL || base == NULL || admission == NULL || out == NULL
+		|| (path != RESOURCE_X_ACQUIRE_FIRST_FILL && path != RESOURCE_X_ACQUIRE_RESIDENT))
+		return CLUSTER_PCM_OWN_INVALID;
+	buffer_id = buf->buf_id;
+	if (buffer_id < 0 || buffer_id >= NBuffers
+		|| base->tag.forkNum < MAIN_FORKNUM || base->tag.forkNum > MAX_FORKNUM
+		|| !cluster_pcm_x_buffer_tag_tracked(&base->tag, cluster_shared_catalog))
+		return CLUSTER_PCM_OWN_INVALID;
+	if (ClusterPcmOwnArray == NULL)
+		return CLUSTER_PCM_OWN_NOT_READY;
+	if (base->generation >= UINT64_MAX - 1 || base->reservation_token >= UINT64_MAX - 1
+		|| reservation_token == UINT64_MAX)
+		return CLUSTER_PCM_OWN_EXHAUSTED;
+	if (reservation_token == 0)
+		return CLUSTER_PCM_OWN_INVALID;
+	if (base->flags != 0 || base->writer_activation_token != 0
+		|| base->resource_x_activation_generation != 0
+		|| reservation_token != base->reservation_token + 1)
+		return CLUSTER_PCM_OWN_STALE;
+
+	proc = MyProc;
+	pid = MyProcPid;
+	if (proc == NULL || pid <= 0 || proc->pid != pid || proc->pgprocno < 0
+		|| MyBackendId <= InvalidBackendId || MyBackendId > MaxBackends
+		|| proc->backendId != MyBackendId || proc->cluster_grd_generation == 0
+		|| proc->cluster_grd_generation == UINT64_MAX)
+		return CLUSTER_PCM_OWN_STALE;
+	pgprocno = proc->pgprocno;
+	entered = *admission;
+	if (!entered.entered || entered.side != CLUSTER_SEMANTIC_TARGET_SIDE
+		|| entered.feature_bit != CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1
+		|| entered.formation_epoch == 0 || entered.formation_epoch == UINT64_MAX
+		|| entered.record_generation == 0 || entered.record_generation == UINT64_MAX)
+		return CLUSTER_PCM_OWN_NOT_READY;
+	memset(&candidate, 0, sizeof(candidate));
+	candidate.backend_id = MyBackendId;
+	candidate.backend_generation = proc->cluster_grd_generation;
+	candidate.base_generation = base->generation;
+	candidate.reservation_token = reservation_token;
+	candidate.cluster_epoch = entered.formation_epoch;
+	candidate.r4_generation = entered.record_generation;
+	candidate.buffer_id = buffer_id;
+	candidate.path = path;
+	candidate.requester_incarnation = cluster_qvotec_get_self_incarnation();
+	if (candidate.requester_incarnation == 0 || candidate.requester_incarnation == UINT64_MAX)
+		return CLUSTER_PCM_OWN_NOT_READY;
+
+	for (unsigned pass = 0; pass < 2; pass++)
+	{
+		ClusterPcmOwnSnapshot live;
+		ClusterPcmOwnResult result = CLUSTER_PCM_OWN_OK;
+		uint32 state;
+		uint32 semantic;
+
+		/* Check the actual caller/domain again after a provider, including an
+		 * ERROR-capable one. Do not combine independently owned lock domains. */
+		if (!cluster_semantic_activation_recheck(admission)
+			|| !admission->entered || admission->side != entered.side
+			|| admission->feature_bit != entered.feature_bit
+			|| admission->formation_epoch != entered.formation_epoch
+			|| admission->record_generation != entered.record_generation
+			|| cluster_epoch_get_current() != candidate.cluster_epoch
+			|| cluster_qvotec_get_self_incarnation() != candidate.requester_incarnation)
+			return CLUSTER_PCM_OWN_NOT_READY;
+		if (MyProc != proc || MyProcPid != pid || MyBackendId != candidate.backend_id
+			|| proc->pid != pid || proc->pgprocno != pgprocno
+			|| proc->backendId != candidate.backend_id
+			|| proc->cluster_grd_generation != candidate.backend_generation
+			|| buf->buf_id != buffer_id
+			|| GetPrivateRefCount(BufferDescriptorGetBuffer(buf)) <= 0)
+			return CLUSTER_PCM_OWN_STALE;
+
+		state = LockBufHdr(buf);
+		cluster_pcm_own_snapshot_locked(buf, &live);
+		semantic = live.semantic_buf_state;
+		if (!BufferTagsEqual(&live.tag, &base->tag)
+			|| live.generation != base->generation
+			|| live.reservation_token != reservation_token)
+			result = CLUSTER_PCM_OWN_STALE;
+		else if (cluster_pcm_own_classify_live_flags(live.flags, live.reservation_token)
+				 == CLUSTER_PCM_OWN_CORRUPT)
+			result = CLUSTER_PCM_OWN_CORRUPT;
+		else if (live.flags == 0)
+			result = CLUSTER_PCM_OWN_STALE;
+		else if (live.flags != PCM_OWN_FLAG_GRANT_PENDING
+				 || live.writer_activation_token != 0
+				 || live.resource_x_activation_generation != 0
+				 || cluster_pcm_own_delivery_attempt_get(buffer_id) != 0
+				 || (pg_atomic_read_u64(&ClusterPcmOwnArray[buffer_id].write_io_generation) & 1) != 0)
+			result = CLUSTER_PCM_OWN_BUSY;
+		else if (path == RESOURCE_X_ACQUIRE_FIRST_FILL)
+		{
+			/* An input IO bit is a required shape, not proof of who owns IO. */
+			if (semantic != (BM_TAG_VALID | BM_IO_IN_PROGRESS)
+				|| live.pcm_state != (uint8)PCM_STATE_N
+				|| live.buffer_type != (uint8)BUF_TYPE_CURRENT)
+				result = CLUSTER_PCM_OWN_CORRUPT;
+		}
+		else if ((semantic & (BM_TAG_VALID | BM_VALID)) != (BM_TAG_VALID | BM_VALID)
+				 || (semantic & BM_IO_ERROR) != 0)
+			result = CLUSTER_PCM_OWN_CORRUPT;
+		else if ((semantic & BM_IO_IN_PROGRESS) != 0)
+			result = CLUSTER_PCM_OWN_BUSY;
+		else if ((live.pcm_state == (uint8)PCM_STATE_N
+				  && (live.buffer_type == (uint8)BUF_TYPE_CURRENT
+					  || live.buffer_type == (uint8)BUF_TYPE_PI)
+				  && (semantic & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED)) == 0)
+				 || (live.pcm_state == (uint8)PCM_STATE_S
+					 && live.buffer_type == (uint8)BUF_TYPE_SCUR)
+				 || (live.pcm_state == (uint8)PCM_STATE_X
+					 && live.buffer_type == (uint8)BUF_TYPE_XCUR))
+			result = CLUSTER_PCM_OWN_OK;
+		else
+			result = CLUSTER_PCM_OWN_CORRUPT;
+		if (result == CLUSTER_PCM_OWN_OK
+			&& (live.pcm_state != base->pcm_state || live.buffer_type != base->buffer_type
+				|| semantic != base->semantic_buf_state
+				|| (pass != 0 && !cluster_pcm_own_snapshot_equal_exact(&live, &first))))
+			result = CLUSTER_PCM_OWN_STALE;
+		if (pass == 0)
+			first = live;
+		UnlockBufHdr(buf, state);
+		if (result != CLUSTER_PCM_OWN_OK)
+			return result;
+	}
+	/* Compare semantic fields, not C padding; expected may alias out. */
+	if (expected != NULL
+		&& (expected->requester_incarnation != candidate.requester_incarnation
+			|| expected->backend_generation != candidate.backend_generation
+			|| expected->base_generation != candidate.base_generation
+			|| expected->reservation_token != candidate.reservation_token
+			|| expected->cluster_epoch != candidate.cluster_epoch
+			|| expected->r4_generation != candidate.r4_generation
+			|| expected->backend_id != candidate.backend_id
+			|| expected->buffer_id != candidate.buffer_id || expected->path != candidate.path))
+		return CLUSTER_PCM_OWN_STALE;
+	*out = candidate;
+	return CLUSTER_PCM_OWN_OK;
+}
+
 static bool
 cluster_bufmgr_resource_x_wait_retry(LWLock *content_lock, int32 buffer_id,
 								 uint32 wait_index, bool *barrier_refused)

@@ -875,6 +875,15 @@ extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_publish_installed_x_image(
 extern ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_begin_x_reservation(BufferDesc *buf, const ClusterPcmOwnSnapshot *expected,
 										   uint64 *out_token);
+struct ClusterSemanticAdmissionToken;
+/* Capture only the identity of an existing pinned ordinary reservation.
+ * No token, grant, IO permission or completion is created. Optional expected
+ * rechecks the same native episode; all refusals preserve out, even when it
+ * aliases expected. Admission and descriptor owners are sampled separately. */
+extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_acquire_intent_exact(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *base, uint64 reservation_token, uint8 path,
+	const struct ClusterSemanticAdmissionToken *admission,
+	const ResourceXDecodedAcquireIntent *expected, ResourceXDecodedAcquireIntent *out);
 extern ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_delivery_begin_x_reservation(BufferDesc *buf,
 													const ClusterPcmOwnSnapshot *expected,
