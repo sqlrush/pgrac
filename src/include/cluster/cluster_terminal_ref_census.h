@@ -452,6 +452,9 @@ typedef struct ClusterCtrcParticipantEntry {
 	uint32 delegation_reserved;
 	uint64 last_delegation_sequence;
 	ClusterCtrcDelegationCustodyV1 delegations[CLUSTER_CTRC_MAX_PARTICIPANTS];
+	/* Original request-id domain, armed once per pending child. Neither an
+	 * enqueue nor a negative reply retires the custody it identifies. */
+	uint64 delegation_close_request_id[CLUSTER_CTRC_MAX_PARTICIPANTS];
 } ClusterCtrcParticipantEntry;
 
 typedef struct ClusterCtrcReceipt {
@@ -1161,6 +1164,10 @@ extern bool cluster_ctrc_origin_note_local_close_batch_shared(
 extern bool cluster_ctrc_origin_next_open_shared(ClusterCtrcTxnKeyV1 *key_out);
 extern bool cluster_ctrc_origin_begin_seal_shared(const ClusterCtrcTxnKeyV1 *key);
 extern bool cluster_ctrc_origin_next_close_dispatch_shared(ClusterCtrcCloseDispatch *dispatch_out);
+extern bool cluster_ctrc_participant_next_delegated_close_shared(
+	ClusterCtrcDelegationCloseV1 *request_out);
+extern bool cluster_ctrc_participant_delegated_close_matches_shared(
+	const ClusterCtrcDelegationCloseV1 *request);
 extern bool cluster_ctrc_cleaner_run_pass(void);
 
 typedef enum ClusterCtrcNormalStopDomain {

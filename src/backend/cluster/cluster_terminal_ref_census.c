@@ -86,7 +86,7 @@
 #endif
 
 #define CLUSTER_CTRC_SHMEM_MAGIC UINT32_C(0x43545243)
-#define CLUSTER_CTRC_SHMEM_VERSION UINT32_C(17)
+#define CLUSTER_CTRC_SHMEM_VERSION UINT32_C(18)
 #ifndef CLUSTER_CTRC_TEST_TABLE_VISIT
 #define CLUSTER_CTRC_TEST_TABLE_VISIT(kind) ((void)0)
 #endif
@@ -435,6 +435,8 @@ ctrc_participant_delegations_empty(const ClusterCtrcParticipantEntry *participan
 	return participant->delegation_count == 0 && participant->delegation_reserved == 0
 		&& participant->last_delegation_sequence == 0
 		&& ctrc_bytes_zero(participant->delegations, sizeof(participant->delegations))
+		&& ctrc_bytes_zero(participant->delegation_close_request_id,
+			sizeof(participant->delegation_close_request_id))
 		&& ctrc_bytes_zero(&participant->delegation_parent, sizeof(participant->delegation_parent))
 		&& ctrc_bytes_zero(&participant->delegation_path, sizeof(participant->delegation_path));
 }
@@ -470,8 +472,20 @@ ctrc_participant_delegations_valid(const ClusterCtrcParticipantEntry *participan
 		const ClusterCtrcDelegationCustodyV1 *entry = &participant->delegations[node];
 		uint32 bit;
 
-		if (ctrc_bytes_zero(entry, sizeof(*entry)))
+		if (ctrc_bytes_zero(entry, sizeof(*entry))) {
+			if (participant->delegation_close_request_id[node] != 0)
+				return false;
 			continue;
+		}
+		if (participant->delegation_close_request_id[node] == UINT64_MAX
+			|| (participant->state == CTRC_PARTICIPANT_OPEN
+				&& participant->delegation_close_request_id[node] != 0))
+			return false;
+		for (uint16 prior = 0; prior < node; prior++)
+			if (participant->delegation_close_request_id[node] != 0
+				&& participant->delegation_close_request_id[node]
+					== participant->delegation_close_request_id[prior])
+				return false;
 		if (!ctrc_participant_identity_valid(&participant->key, &entry->receiver)
 			|| entry->receiver.node_id != node || node == participant->identity.node_id
 			|| node == participant->key.origin_node_id || entry->sequence == 0
@@ -2046,6 +2060,7 @@ typedef enum CtrcCleanerScanKind {
 	CTRC_SCAN_RECEIPT,
 	CTRC_SCAN_ACK,
 	CTRC_SCAN_CERTIFICATE,
+	CTRC_SCAN_DELEGATION,
 	CTRC_SCAN_COUNT
 } CtrcCleanerScanKind;
 
@@ -2066,6 +2081,8 @@ typedef struct CtrcCleanerBatch {
 static CtrcCleanerBatch CtrcBatch;
 static CtrcCleanerOriginHint CtrcOriginHint[CTRC_CLEANER_ORIGINS];
 static uint64 CtrcDispatchCursor;
+static uint64 CtrcDelegationCursor;
+static uint64 CtrcDelegationRound;
 static int CtrcWorkerId = -1;
 static uint64 CtrcLocalProgress;
 static uint64 CtrcLocalPasses;
@@ -2801,6 +2818,7 @@ cluster_ctrc_shmem_init(void)
 		MemSet(&CtrcBatch, 0, sizeof(CtrcBatch));
 		MemSet(CtrcOriginHint, 0, sizeof(CtrcOriginHint));
 		CtrcDispatchCursor = 0;
+		CtrcDelegationCursor = CtrcDelegationRound = 0;
 		CtrcWorkerId = -1;
 		CtrcLocalProgress = CtrcLocalPasses = 0;
 		MemSet(CtrcShared, 0, capacity.total_bytes);
@@ -4567,6 +4585,154 @@ cluster_ctrc_origin_next_close_dispatch_shared(ClusterCtrcCloseDispatch *dispatc
 }
 
 #ifndef CLUSTER_CTRC_UNIT_TEST
+/* Participant lock only. The original grant/root/path is retained; this
+ * snapshot creates no new edge and authorizes no release. */
+static bool
+ctrc_delegated_close_snapshot_locked(uint64 index, uint16 node,
+	ClusterCtrcDelegationCloseV1 *request)
+{
+	const ClusterCtrcParticipantEntry *participant = &ctrc_participant_entries()[index];
+	const ClusterCtrcParticipantIdentity *root;
+	const ClusterCtrcDelegationCustodyV1 *child;
+	FullTransactionId original;
+
+	MemSet(request, 0, sizeof(*request));
+	if (node >= CLUSTER_CTRC_MAX_PARTICIPANTS || cluster_node_id < 0
+		|| participant->identity.node_id != (uint16)cluster_node_id
+		|| participant->state != CTRC_PARTICIPANT_CLOSED_DRAINING
+		|| participant->seal_generation == 0 || participant->grant_generation == 0
+		|| !ctrc_txn_key_valid(&participant->key)
+		|| !ctrc_participant_identity_valid(&participant->key, &participant->identity)
+		|| !ctrc_participant_delegations_valid(participant))
+		return false;
+	child = &participant->delegations[node];
+	if (child->sequence == 0)
+		return false;
+	root = participant->delegation_path.version != 0
+		? &participant->delegation_path.root_receiver
+		: participant->delegation_parent.sequence != 0
+			? &participant->delegation_parent.receiver : &participant->identity;
+	if (!cluster_ctrc_origin_fullxid_match_v2(participant->original_identity_v2,
+		sizeof(participant->original_identity_v2), &participant->key, root,
+		participant->grant_generation, &original)
+		|| !FullTransactionIdEquals(original, participant->original_full_xid))
+		return false;
+	request->key = participant->key;
+	request->parent = participant->identity;
+	request->receiver = child->receiver;
+	request->original_full_xid = original;
+	request->request_id = participant->delegation_close_request_id[node];
+	request->seal_generation = participant->seal_generation;
+	request->grant_generation = participant->grant_generation;
+	request->delegation_sequence = child->sequence;
+	return true;
+}
+#endif
+
+bool
+cluster_ctrc_participant_next_delegated_close_shared(ClusterCtrcDelegationCloseV1 *request_out)
+{
+#ifndef CLUSTER_CTRC_UNIT_TEST
+	uint64 limit, capacity;
+
+	if (request_out != NULL)
+		MemSet(request_out, 0, sizeof(*request_out));
+	if (request_out == NULL || !cluster_ctrc_shmem_ready())
+		return false;
+	capacity = CtrcShared->participant_key_entries;
+	limit = ctrc_scan_limit(CTRC_SCAN_DELEGATION, capacity);
+	for (uint64 visited = 0; visited < limit; visited++) {
+		ClusterCtrcDelegationCloseV1 candidate = { 0 };
+		uint64 index = CtrcDelegationCursor % capacity;
+		uint16 first_node = CtrcDelegationRound % CLUSTER_CTRC_MAX_PARTICIPANTS;
+		bool found = false;
+
+		CHECK_FOR_INTERRUPTS();
+		CtrcDelegationCursor = (index + 1) % capacity;
+		if (CtrcDelegationCursor == 0)
+			CtrcDelegationRound = (CtrcDelegationRound + 1) % CLUSTER_CTRC_MAX_PARTICIPANTS;
+		ctrc_participant_locks_acquire(ctrc_participant_lock_mask(index));
+		if (ctrc_cleaner_owns_key(&ctrc_participant_entries()[index].key))
+			for (unsigned i = 0; i < CLUSTER_CTRC_MAX_PARTICIPANTS; i++) {
+				uint16 node = (first_node + i) % CLUSTER_CTRC_MAX_PARTICIPANTS;
+
+				if (ctrc_delegated_close_snapshot_locked(index, node, &candidate)) {
+					found = true;
+					break;
+				}
+			}
+		ctrc_participant_locks_release(ctrc_participant_lock_mask(index));
+		if (!found)
+			continue;
+		if (candidate.request_id == 0) {
+			ClusterCtrcDelegationCloseV1 current;
+			uint64 request_id = 0;
+
+			/* Never nest the original origin sequence lock with a participant
+			 * shard. A racing allocation may be unused, but is never reused. */
+			LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+			if (CtrcShared->global_request_generation != 0
+				&& CtrcShared->global_request_generation != UINT64_MAX)
+				request_id = CtrcShared->global_request_generation++;
+			LWLockRelease(&CtrcShared->origin_lock);
+			if (request_id == 0) {
+				ctrc_scan_charge(CTRC_SCAN_DELEGATION, visited + 1);
+				return false;
+			}
+			ctrc_participant_locks_acquire(ctrc_participant_lock_mask(index));
+			found = ctrc_delegated_close_snapshot_locked(index, candidate.receiver.node_id, &current);
+			if (found) {
+				uint64 armed = current.request_id;
+
+				current.request_id = 0;
+				found = memcmp(&current, &candidate, sizeof(candidate)) == 0;
+				if (found) {
+					candidate.request_id = armed != 0 ? armed : request_id;
+					ctrc_participant_entries()[index]
+						.delegation_close_request_id[candidate.receiver.node_id] = candidate.request_id;
+				}
+			}
+			ctrc_participant_locks_release(ctrc_participant_lock_mask(index));
+		}
+		if (found) {
+			ctrc_scan_charge(CTRC_SCAN_DELEGATION, visited + 1);
+			*request_out = candidate;
+			return true;
+		}
+	}
+	ctrc_scan_charge(CTRC_SCAN_DELEGATION, limit);
+	return false;
+#else
+	if (request_out != NULL)
+		MemSet(request_out, 0, sizeof(*request_out));
+	return false;
+#endif
+}
+
+bool
+cluster_ctrc_participant_delegated_close_matches_shared(const ClusterCtrcDelegationCloseV1 *request)
+{
+#ifndef CLUSTER_CTRC_UNIT_TEST
+	ClusterCtrcDelegationCloseV1 current;
+	uint64 index;
+	bool matches;
+
+	if (!ctrc_delegation_close_valid(request) || !cluster_ctrc_shmem_ready()
+		|| cluster_node_id < 0 || request->parent.node_id != (uint16)cluster_node_id
+		|| !ctrc_participant_index(&request->key, request->parent.node_id, &index))
+		return false;
+	ctrc_participant_locks_acquire(ctrc_participant_lock_mask(index));
+	matches = ctrc_delegated_close_snapshot_locked(index, request->receiver.node_id, &current)
+		&& memcmp(&current, request, sizeof(current)) == 0;
+	ctrc_participant_locks_release(ctrc_participant_lock_mask(index));
+	return matches;
+#else
+	(void)request;
+	return false;
+#endif
+}
+
+#ifndef CLUSTER_CTRC_UNIT_TEST
 static bool
 ctrc_cleaner_terminal_sample_mode(const ClusterCtrcTxnKeyV1 *key, bool capacity_probe,
 								  ClusterCtrcTerminalStatus *status_out, SCN *commit_scn_out,
@@ -5337,6 +5503,7 @@ cluster_ctrc_cleaner_run_pass(void)
 	CtrcBatch.remaining[CTRC_SCAN_RECEIPT] = CtrcShared->receipt_entries;
 	CtrcBatch.remaining[CTRC_SCAN_ACK] = CtrcShared->participant_key_entries;
 	CtrcBatch.remaining[CTRC_SCAN_CERTIFICATE] = CtrcShared->origin_key_entries;
+	CtrcBatch.remaining[CTRC_SCAN_DELEGATION] = CtrcShared->participant_key_entries;
 	PG_TRY();
 	{
 		/* Service the terminal pipeline before admitting new seals. Each
@@ -5372,6 +5539,17 @@ cluster_ctrc_cleaner_run_pass(void)
 			/* An accepted duplicate and a remote enqueue are not progress.
 			 * Only the actual shared reply/participant edges record it. */
 			cluster_gcs_ctrc_dispatch_batch(dispatches, dispatch_count);
+		}
+		for (unsigned i = 0; i < CTRC_CLEANER_DISPATCH_BATCH
+			&& CtrcBatch.remaining[CTRC_SCAN_DELEGATION] != 0; i++) {
+			ClusterCtrcDelegationCloseV1 request;
+
+			CHECK_FOR_INTERRUPTS();
+			if (!cluster_ctrc_participant_next_delegated_close_shared(&request))
+				break;
+			cluster_ctrc_stat_bump(CTRC_STAT_CLEANER_ATTEMPT);
+			/* Enqueue and a PENDING reply are not subtree completion. */
+			(void)cluster_gcs_ctrc_dispatch_delegated_close(&request);
 		}
 		for (unsigned i = 0;
 			 i < CTRC_CLEANER_CERTIFICATE_BATCH && CtrcBatch.remaining[CTRC_SCAN_CERTIFICATE] != 0;

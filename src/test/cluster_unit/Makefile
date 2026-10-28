@@ -2174,8 +2174,8 @@ test_cluster_heap_ctrc_init_state.inc: $(top_srcdir)/src/backend/cluster/cluster
 	@awk '/^#define CTRC_CLEANER_(DISPATCH_BATCH|ORIGINS) / { print; constants++ } \
 	     /^typedef (enum CtrcCleanerScanKind|struct (CtrcCleanerOriginHint|CtrcCleanerBatch)) / { emit=1; types++ } \
 	     emit { print } emit && /^}/ { emit=0; done++ } \
-	     /^static .* Ctrc(Batch;|OriginHint\[|DispatchCursor;|WorkerId =|LocalProgress;|LocalPasses;)/ { print; globals++ } \
-	     END { if (constants != 2 || types != 3 || done != 3 || globals != 6 || emit) exit 1 }' $< > $@.tmp
+	     /^static .* Ctrc(Batch;|OriginHint\[|DispatchCursor;|DelegationCursor;|DelegationRound;|WorkerId =|LocalProgress;|LocalPasses;)/ { print; globals++ } \
+	     END { if (constants != 2 || types != 3 || done != 3 || globals != 8 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_heap_ctrc_lwlock_init.inc: $(top_srcdir)/src/backend/storage/lmgr/lwlock.c Makefile
@@ -5566,6 +5566,7 @@ clean distclean maintainer-clean:
 		test_cluster_resource_x_failed_round_observation.inc \
 		test_cluster_pcm_aux_consumer.inc test_cluster_pcm_aux_ledger.inc test_cluster_pcm_writer_prepare.inc \
 		test_cluster_ctrc_dispatch.inc test_cluster_ctrc_delegation_close.inc \
+		test_cluster_ctrc_delegation_forward.inc \
 		test_cluster_ctrc_run_pass.inc \
 		test_cluster_ctrc_read_scope.inc \
 		test_cluster_undo_cleaner_holds.inc \
@@ -9184,9 +9185,15 @@ test_cluster_ctrc_delegation_close.inc: $(top_srcdir)/src/backend/cluster/cluste
 	     END { if (checksum != 1 || forward != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_ctrc_delegation_forward.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^cluster_gcs_ctrc_dispatch_delegated_close\(/ { print "bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_ctrc_delegation_close: test_cluster_ctrc_delegation_close.c test_cluster_ctrc_dispatch.c \
 		test_cluster_ctrc_cleaner.c test_cluster_ctrc_dispatch.inc test_cluster_ctrc_delegation_close.inc \
-		test_cluster_ctrc_run_pass.inc unit_test.h $(CLUSTER_SCN_O) $(CLUSTER_UBA_O) \
+		test_cluster_ctrc_run_pass.inc test_cluster_ctrc_delegation_forward.inc unit_test.h $(CLUSTER_SCN_O) $(CLUSTER_UBA_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
 		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \

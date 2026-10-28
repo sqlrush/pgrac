@@ -39,6 +39,7 @@ static unsigned fail_recheck;
 static unsigned throw_resolve;
 static unsigned resolves;
 static bool observe_enqueue_order, enqueue_order_exact;
+static bool (*dispatch_enqueue_hook)(int, uint8, uint32, const void *, uint16, uint32, uint32);
 
 bool
 cluster_gcs_block_family_on_data_plane(void)
@@ -163,6 +164,8 @@ cluster_lms_outbound_enqueue_cap_bound(int worker pg_attribute_unused(),
 {
 	if (held_count != 0)
 		abort();
+	if (dispatch_enqueue_hook != NULL)
+		return dispatch_enqueue_hook(worker, type, destination, payload, bytes, required, generation);
 	enqueues++;
 	if (observe_enqueue_order)
 		enqueue_order_exact
@@ -186,6 +189,8 @@ reset_dispatch_fixture(void)
 	allocation_failure = false;
 	data_plane = root_exact = fence_ok = true;
 	observe_enqueue_order = enqueue_order_exact = false;
+	dispatch_enqueue_hook = NULL;
+	driver_delegation_dispatch = NULL;
 }
 
 static bool

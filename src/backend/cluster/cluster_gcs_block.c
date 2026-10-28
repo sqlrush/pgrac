@@ -19437,6 +19437,82 @@ cluster_gcs_ctrc_dispatch_close(const ClusterCtrcCloseDispatch *dispatch)
 	return dispatched;
 }
 
+/* The existing background CLOSE family, for a retained immediate child.
+ * HELLO connection counters and OPEN custody counters are distinct domains. */
+bool
+cluster_gcs_ctrc_dispatch_delegated_close(const ClusterCtrcDelegationCloseV1 *request)
+{
+	ClusterSemanticAdmissionToken admission = { 0 };
+	ClusterUndoBlock0ResolvedRoot root;
+	ClusterUndoBlock0LogicalKey logical;
+	uint8 bytes[CLUSTER_CTRC_DELEGATION_CLOSE_V1_BYTES];
+	uint64 child_boot = 0, child_observed = 0;
+	uint64 self_boot;
+	uint32 connection_generation = 0;
+	uint32 required = PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1
+		| PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1;
+	bool dispatched = false;
+
+	if (request == NULL || !cluster_ctrc_delegation_close_encode_v1(request, bytes, sizeof(bytes))
+		|| cluster_node_id < 0 || request->parent.node_id != (uint16)cluster_node_id
+		|| request->key.system_identifier != GetSystemIdentifier()
+		|| request->key.cluster_epoch != cluster_epoch_get_current()
+		|| !cluster_gcs_block_family_on_data_plane()
+		|| (cluster_ic_local_capability_word() & required) != required
+		|| !cluster_membership_is_member(cluster_node_id)
+		|| !cluster_membership_is_member(request->receiver.node_id)
+		|| (cluster_write_fence_enforcing() && !cluster_write_fence_allowed()))
+		return false;
+	self_boot = cluster_qvotec_get_self_incarnation();
+	if (self_boot == 0 || self_boot != request->parent.boot_incarnation
+		|| cluster_membership_get_last_admitted_incarnation(cluster_node_id) != self_boot
+		|| !cluster_reconfig_get_observed_slot(request->receiver.node_id, &child_boot, &child_observed)
+		|| child_boot == 0 || child_observed == 0 || child_boot != request->receiver.boot_incarnation
+		|| cluster_membership_get_last_admitted_incarnation(request->receiver.node_id) != child_boot
+		|| cluster_reconfig_get_observed_epoch(request->receiver.node_id) != request->key.formation_epoch
+		|| !cluster_sf_peer_multixact_current_capability_generation(request->receiver.node_id,
+			&connection_generation)
+		|| connection_generation == 0
+		|| !cluster_sf_peer_capability_generation_matches(request->receiver.node_id,
+			required, connection_generation)
+		|| cluster_semantic_activation_enter_r4_terminal_census(&admission)
+			!= CLUSTER_SEMANTIC_ADMISSION_OK)
+		return false;
+	PG_TRY();
+	{
+		MemSet(&root, 0, sizeof(root));
+		logical.owner_instance = request->key.owner_instance;
+		logical.segment_id = request->key.segment_id;
+		if (admission.record_generation <= UINT32_MAX
+			&& admission.formation_epoch == request->key.formation_epoch
+			&& admission.record_generation == request->key.admission_record_generation
+			&& request->parent.capability_record_generation == (uint32)admission.record_generation
+			&& request->receiver.capability_record_generation == (uint32)admission.record_generation
+			&& cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(&admission,
+				CLUSTER_UNDO_PATH_RUNTIME_SHARED, logical.owner_instance, logical.segment_id, &root)
+			&& root.intent == CLUSTER_UNDO_PATH_RUNTIME_SHARED && root.root_id == request->key.root_id
+			&& root.root_generation == request->key.root_generation
+			&& request->key.root_descriptor_incarnation == root.root_generation
+			&& cluster_semantic_activation_recheck_r4_terminal_census(&admission)
+			&& cluster_ctrc_participant_delegated_close_matches_shared(request)
+			&& cluster_semantic_activation_recheck_r4_terminal_census(&admission)) {
+			BufferTag route = GcsBlockCurrentMxRouteTagMake(request->request_id,
+				request->key.cluster_epoch, cluster_node_id, CLUSTER_CTRC_INTERNAL_ENDPOINT);
+			int worker = cluster_lms_shard_for_tag(&route, cluster_lms_workers);
+
+			dispatched = worker >= 0 && worker < cluster_lms_workers
+				&& cluster_lms_outbound_enqueue_cap_bound(worker, PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
+					request->receiver.node_id, bytes, sizeof(bytes), required, connection_generation);
+		}
+	}
+	PG_FINALLY();
+	{
+		cluster_semantic_activation_leave(&admission);
+	}
+	PG_END_TRY();
+	return dispatched;
+}
+
 static void
 gcs_ctrc_dispatch_local_certificates(const ClusterCtrcCloseDispatch *dispatches, Size count)
 {

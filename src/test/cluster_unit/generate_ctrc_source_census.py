@@ -232,7 +232,7 @@ SCAN_RULES: Tuple[ScanRule, ...] = (
             "src/backend/cluster/cluster_gcs_block.c",
             "src/backend/cluster/cluster_terminal_ref_census.c",
         ),
-        r"\bcluster_ctrc_(?:seal_request_(?:encode|decode)|seal_reply_(?:encode|decode)|delegation_close_(?:encode|decode)_v1|participant_(?:request_shared|delegated_close_shared)|origin_ack_land_shared)\s*\(",
+        r"\bcluster_ctrc_(?:seal_request_(?:encode|decode)|seal_reply_(?:encode|decode)|delegation_close_(?:encode|decode)_v1|participant_(?:request_shared|delegated_close_shared|next_delegated_close_shared|delegated_close_matches_shared)|origin_ack_land_shared)\s*\(",
     ),
     ScanRule(
         "CTRC_RELATION_GATE",
@@ -287,6 +287,7 @@ _classify_owners(
     "src/backend/cluster/cluster_gcs_block.c",
     (
         "cluster_gcs_ctrc_dispatch_close",
+        "cluster_gcs_ctrc_dispatch_delegated_close",
         "gcs_ctrc_dispatch_prepare",
         "gcs_ctrc_dispatch_local_closes",
         "gcs_block_try_ctrc_forward136",
@@ -314,6 +315,9 @@ _classify_owners(
         "cluster_ctrc_delegation_close_decode_v1",
         "ctrc_seal_reply_request_decode",
         "cluster_ctrc_participant_delegated_close_shared",
+        "cluster_ctrc_participant_next_delegated_close_shared",
+        "cluster_ctrc_participant_delegated_close_matches_shared",
+        "cluster_ctrc_cleaner_run_pass",
     ),
     "TERMINAL_PROJECTION_DISCHARGE",
     "ALL_CTRC_REFERENCE_KINDS",
@@ -543,6 +547,19 @@ _classify_owners(
     "ALL_CTRC_TARGET_KINDS",
     "NO_REFERENCE_TRANSFER_REQUIRED",
     "NO_REFERENCE_TO_DISCHARGE",
+    "MXA-T40",
+)
+# Background forwarding reads the original identity and pending child only;
+# selecting or enqueuing CLOSE cannot retire a downstream responsibility.
+_classify_owners(
+    "CTRC_ORIGIN_PROVENANCE",
+    "src/backend/cluster/cluster_terminal_ref_census.c",
+    ("ctrc_delegated_close_snapshot_locked",),
+    "REGISTERED_REFERENCE",
+    "ALL_CTRC_REFERENCE_KINDS",
+    "ALL_CTRC_TARGET_KINDS",
+    "cluster_ctrc_participant_next_delegated_close_shared",
+    "RETAIN_PENDING_SUBTREE_CLOSE_ACK",
     "MXA-T40",
 )
 # First-hop matching checks the original sender binding; receiving a local

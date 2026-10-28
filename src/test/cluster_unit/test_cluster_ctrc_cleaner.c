@@ -3686,6 +3686,13 @@ UT_TEST(test_ack_batch_final_count_summary_and_identity_faults_are_isolated)
  * and finally cleanup. Only physical I/O/network leaves are fixture inputs. */
 static bool driver_other_progress;
 static bool driver_interrupt;
+static bool (*driver_delegation_dispatch)(const ClusterCtrcDelegationCloseV1 *request);
+
+static bool
+driver_delegation_dispatch_boundary(const ClusterCtrcDelegationCloseV1 *request)
+{
+	return driver_delegation_dispatch != NULL && driver_delegation_dispatch(request);
+}
 
 static bool
 driver_no_receipt(void)
@@ -3723,6 +3730,7 @@ bool ctrc_fixture_run_pass(void);
 #define ctrc_cleaner_publish_certificate driver_no_certificate
 #define ctrc_cleaner_terminal_sample_exact driver_no_terminal
 #define cluster_gcs_ctrc_dispatch_batch driver_dispatch_boundary
+#define cluster_gcs_ctrc_dispatch_delegated_close driver_delegation_dispatch_boundary
 #ifndef CLUSTER_CTRC_DRIVER_BODY
 #define CLUSTER_CTRC_DRIVER_BODY "test_cluster_ctrc_run_pass.inc"
 #endif
@@ -3732,6 +3740,7 @@ bool ctrc_fixture_run_pass(void);
 #undef ctrc_cleaner_publish_certificate
 #undef ctrc_cleaner_terminal_sample_exact
 #undef cluster_gcs_ctrc_dispatch_batch
+#undef cluster_gcs_ctrc_dispatch_delegated_close
 
 static bool
 bind_test_worker(unsigned worker)

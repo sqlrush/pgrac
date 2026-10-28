@@ -4670,6 +4670,7 @@ cluster_gcs_block_resource_x_source_settlement_tick(const ResourceXAcquisitionRe
 extern bool cluster_gcs_block_resource_x_cutover_tick(void);
 extern bool cluster_gcs_ctrc_dispatch_close(const ClusterCtrcCloseDispatch *dispatch);
 extern void cluster_gcs_ctrc_dispatch_batch(const ClusterCtrcCloseDispatch *dispatches, Size count);
+extern bool cluster_gcs_ctrc_dispatch_delegated_close(const ClusterCtrcDelegationCloseV1 *request);
 
 
 /* ============================================================

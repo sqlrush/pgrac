@@ -60,6 +60,7 @@ cluster_gcs_block_note_send_outcome(GcsBlockSendFamily family pg_attribute_unuse
 }
 
 #include "test_cluster_ctrc_delegation_close.inc"
+#include "test_cluster_ctrc_delegation_forward.inc"
 
 static void
 close_test_identity(const ClusterCtrcParticipantIdentity *identity, uint8 *bytes)
@@ -501,10 +502,362 @@ UT_TEST(test_actual_delegated_close_keeps_connection_and_admission_domains_separ
 	UT_ASSERT_EQ(held_count, 0);
 }
 
+static ClusterCtrcDelegationCloseV1 forward_captured;
+static uint32 forward_connection;
+static bool forward_accept = true;
+static bool forward_throw;
+
+static bool
+close_test_capture_outbound(int worker, uint8 type, uint32 destination,
+	const void *payload, uint16 bytes, uint32 required, uint32 connection)
+{
+	if (held_count != 0 || worker != 0 || type != PGRAC_IC_MSG_GCS_BLOCK_FORWARD
+		|| destination != 3 || bytes != CLUSTER_CTRC_DELEGATION_CLOSE_V1_BYTES
+		|| (required & PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1) == 0
+		|| !cluster_ctrc_delegation_close_decode_v1(payload, bytes, 42, 2, 3, 23, &forward_captured))
+		abort();
+	forward_connection = connection;
+	enqueues++;
+	if (forward_throw)
+		pg_re_throw();
+	return forward_accept;
+}
+
+UT_TEST(test_original_background_pass_forwards_closed_child_custody)
+{
+	uint8 bytes[CLOSE_TEST_BYTES], path[CLUSTER_CTRC_DELEGATION_V2_MAX_BYTES];
+	ClusterICEnvelope env;
+	ClusterCtrcParticipantEntry *receiver;
+	ClusterCtrcParticipantIdentity child;
+	Size length = 0;
+	uint32 first;
+
+	UT_ASSERT(close_test_setup(bytes, &env, &receiver));
+	child = receiver->identity;
+	child.node_id = 3;
+	child.boot_incarnation = 1104;
+	UT_ASSERT(close_test_pending_child(receiver, &child, path, &length));
+	UT_ASSERT(gcs_block_try_ctrc_forward136(&env, bytes));
+	first = ((uint32)receiver->key.owner_instance - 1) * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+	UT_ASSERT(cluster_ctrc_cleaner_bind_worker(
+		(receiver->key.segment_id - first) % CLUSTER_CTRC_CLEANER_WORKERS));
+	enqueues = 0;
+	dispatch_enqueue_hook = close_test_capture_outbound;
+	driver_delegation_dispatch = cluster_gcs_ctrc_dispatch_delegated_close;
+	(void)ctrc_fixture_run_pass();
+	UT_ASSERT_EQ(enqueues, 1);
+	UT_ASSERT_EQ(receiver->state, CTRC_PARTICIPANT_CLOSED_DRAINING);
+	UT_ASSERT_EQ(receiver->delegation_count, 1);
+	UT_ASSERT_EQ(held_count, 0);
+	UT_ASSERT(!CtrcBatch.active);
+}
+
+
+/* Controlled original queue/HELLO/OS boundaries; the selector, identity
+ * matcher, dispatcher, admission and cleaner finally below are production C. */
+static bool
+close_forward_setup(ClusterCtrcParticipantEntry **participant)
+{
+	uint8 bytes[CLOSE_TEST_BYTES], path[CLUSTER_CTRC_DELEGATION_V2_MAX_BYTES];
+	ClusterICEnvelope env;
+	ClusterCtrcParticipantIdentity child;
+	Size length = 0;
+	uint32 first;
+
+	fixture_declared_nodes = 4;
+	if (!close_test_setup(bytes, &env, participant))
+		return false;
+	child = (*participant)->identity;
+	child.node_id = 3;
+	child.boot_incarnation = 1104;
+	if (!close_test_pending_child(*participant, &child, path, &length)
+		|| !gcs_block_try_ctrc_forward136(&env, bytes))
+		return false;
+	first = ((uint32)(*participant)->key.owner_instance - 1) * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+	if (!cluster_ctrc_cleaner_bind_worker(
+		((*participant)->key.segment_id - first) % CLUSTER_CTRC_CLEANER_WORKERS))
+		return false;
+	enqueues = 0;
+	forward_connection = 0;
+	forward_accept = true;
+	forward_throw = false;
+	MemSet(&forward_captured, 0, sizeof(forward_captured));
+	dispatch_enqueue_hook = close_test_capture_outbound;
+	driver_delegation_dispatch = cluster_gcs_ctrc_dispatch_delegated_close;
+	driver_other_progress = driver_interrupt = false;
+	return true;
+}
+
+UT_TEST(test_background_close_refusal_retries_the_same_request_without_retiring_custody)
+{
+	ClusterCtrcParticipantEntry *participant, expected;
+	ClusterCtrcDelegationCloseV1 first;
+	uint64 next_request, progress;
+
+	UT_ASSERT(close_forward_setup(&participant));
+	expected = *participant;
+	next_request = CtrcShared->global_request_generation;
+	progress = cluster_ctrc_stat_get(CTRC_STAT_SEMANTIC_PROGRESS);
+	forward_accept = false;
+	(void)ctrc_fixture_run_pass();
+	UT_ASSERT_EQ(enqueues, 1);
+	first = forward_captured;
+	UT_ASSERT_EQ(first.request_id, next_request);
+	UT_ASSERT_EQ(first.parent.node_id, 2);
+	UT_ASSERT_EQ(first.receiver.node_id, 3);
+	UT_ASSERT_EQ(first.seal_generation, 41);
+	UT_ASSERT_EQ(first.delegation_sequence, participant->delegations[3].sequence);
+	expected.delegation_close_request_id[3] = next_request;
+	UT_ASSERT(memcmp(participant, &expected, sizeof(expected)) == 0);
+	forward_accept = true;
+	(void)ctrc_fixture_run_pass();
+	UT_ASSERT_EQ(enqueues, 2);
+	UT_ASSERT(memcmp(&forward_captured, &first, sizeof(first)) == 0);
+	UT_ASSERT_EQ(CtrcShared->global_request_generation, next_request + 1);
+	UT_ASSERT_EQ(cluster_ctrc_stat_get(CTRC_STAT_SEMANTIC_PROGRESS), progress);
+	UT_ASSERT(memcmp(participant, &expected, sizeof(expected)) == 0);
+	UT_ASSERT_EQ(enters, leaves);
+	UT_ASSERT_EQ(held_count, 0);
+	UT_ASSERT(!CtrcBatch.active);
+}
+
+UT_TEST(test_background_selector_rejects_unqualified_or_exhausted_rows_without_partial_output)
+{
+	for (unsigned fault = 0; fault < 10; fault++) {
+		ClusterCtrcParticipantEntry *participant, before;
+		ClusterCtrcDelegationCloseV1 request;
+		uint64 next_request;
+
+		UT_ASSERT(close_forward_setup(&participant));
+		switch (fault) {
+			case 0: participant->state = CTRC_PARTICIPANT_OPEN; break;
+			case 1: participant->original_full_xid = InvalidFullTransactionId; break;
+			case 2: participant->original_identity_v2[143] ^= 1; break;
+			case 3: participant->delegations[3].sequence = 0; break;
+			case 4: participant->delegation_close_request_id[3] = UINT64_MAX; break;
+			case 5: participant->delegation_close_request_id[0] = 7; break;
+			case 6: participant->state = CTRC_PARTICIPANT_BLOCKED; break;
+			case 7: CtrcShared->global_request_generation = UINT64_MAX; break;
+			case 8: cluster_node_id = 3; break;
+			case 9: participant->key.reserved[0] = 1; break;
+		}
+		before = *participant;
+		next_request = CtrcShared->global_request_generation;
+		MemSet(&request, 0xa5, sizeof(request));
+		UT_ASSERT(!cluster_ctrc_participant_next_delegated_close_shared(&request));
+		UT_ASSERT(ctrc_bytes_zero(&request, sizeof(request)));
+		UT_ASSERT(memcmp(participant, &before, sizeof(before)) == 0);
+		UT_ASSERT_EQ(CtrcShared->global_request_generation, next_request);
+		UT_ASSERT_EQ(enqueues, 0);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
+UT_TEST(test_background_dispatch_requires_current_hello_admission_root_and_exact_custody)
+{
+	for (unsigned fault = 0; fault < 13; fault++) {
+		ClusterCtrcParticipantEntry *participant, before;
+		ClusterCtrcDelegationCloseV1 request;
+
+		UT_ASSERT(close_forward_setup(&participant));
+		UT_ASSERT(cluster_ctrc_participant_next_delegated_close_shared(&request));
+		switch (fault) {
+			case 0: close_source_generation = 0; break;
+			case 1: close_source_generation = 7; break;
+			case 2: dispatch_self_boot++; break;
+			case 3: request.receiver.boot_incarnation++; break;
+			case 4: request.parent.capability_record_generation++; break;
+			case 5: request.receiver.capability_record_generation++; break;
+			case 6: root_exact = false; break;
+			case 7: fence_ok = false; break;
+			case 8: fail_recheck = rechecks + 1; break;
+			case 9: fail_recheck = rechecks + 2; break;
+			case 10: data_plane = false; break;
+			case 11: participant->delegations[3].receiver.boot_incarnation++; break;
+			case 12: request.request_id++; break;
+		}
+		before = *participant;
+		UT_ASSERT(!cluster_gcs_ctrc_dispatch_delegated_close(&request));
+		UT_ASSERT_EQ(enqueues, 0);
+		UT_ASSERT(memcmp(participant, &before, sizeof(before)) == 0);
+		UT_ASSERT_EQ(enters, leaves);
+		UT_ASSERT_EQ(held_count, 0);
+		UT_ASSERT_EQ(allocated, 0);
+	}
+}
+
+UT_TEST(test_background_dispatch_uses_hello_connection_and_preserves_open_custody_generation)
+{
+	ClusterCtrcParticipantEntry *participant, before;
+	ClusterCtrcDelegationCloseV1 request;
+
+	UT_ASSERT(close_forward_setup(&participant));
+	UT_ASSERT(cluster_ctrc_participant_next_delegated_close_shared(&request));
+	before = *participant;
+	dispatch_peer_connection_generation = close_source_generation = 7;
+	UT_ASSERT(cluster_gcs_ctrc_dispatch_delegated_close(&request));
+	UT_ASSERT_EQ(enqueues, 1);
+	UT_ASSERT_EQ(forward_connection, 7);
+	UT_ASSERT_EQ(forward_captured.parent.capability_record_generation, 29);
+	UT_ASSERT_EQ(forward_captured.receiver.capability_record_generation, 29);
+	UT_ASSERT(memcmp(&forward_captured, &request, sizeof(request)) == 0);
+	UT_ASSERT(memcmp(participant, &before, sizeof(before)) == 0);
+	UT_ASSERT_EQ(enters, leaves);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_background_error_cleans_original_batch_and_admission_but_keeps_retry_identity)
+{
+	for (unsigned phase = 0; phase < 2; phase++) {
+		ClusterCtrcParticipantEntry *participant, expected;
+		uint64 request_id;
+		volatile bool caught = false;
+
+		UT_ASSERT(close_forward_setup(&participant));
+		expected = *participant;
+		request_id = CtrcShared->global_request_generation;
+		if (phase == 0)
+			throw_resolve = resolves + 1;
+		else
+			forward_throw = true;
+		PG_TRY();
+		{
+			(void)ctrc_fixture_run_pass();
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(caught);
+		expected.delegation_close_request_id[3] = request_id;
+		UT_ASSERT(memcmp(participant, &expected, sizeof(expected)) == 0);
+		UT_ASSERT_EQ(enters, leaves);
+		UT_ASSERT_EQ(held_count, 0);
+		UT_ASSERT_EQ(allocated, 0);
+		UT_ASSERT(!CtrcBatch.active);
+		throw_resolve = 0;
+		forward_throw = false;
+		enqueues = 0;
+		(void)ctrc_fixture_run_pass();
+		UT_ASSERT_EQ(enqueues, 1);
+		UT_ASSERT_EQ(forward_captured.request_id, request_id);
+		UT_ASSERT(memcmp(participant, &expected, sizeof(expected)) == 0);
+		UT_ASSERT_EQ(enters, leaves);
+		UT_ASSERT(!CtrcBatch.active);
+	}
+}
+
+UT_TEST(test_background_selector_has_one_circumference_budget_and_fair_child_rotation)
+{
+	uint8 bytes[CLOSE_TEST_BYTES], path[CLUSTER_CTRC_DELEGATION_V2_MAX_BYTES];
+	ClusterICEnvelope env;
+	ClusterCtrcParticipantEntry *participant;
+	ClusterCtrcParticipantIdentity child;
+	ClusterCtrcDelegationCloseV1 request;
+	Size length;
+	uint32 selected = 0;
+	uint64 ids[CLUSTER_CTRC_MAX_PARTICIPANTS] = { 0 };
+
+	fixture_declared_nodes = 16;
+	UT_ASSERT(close_test_setup(bytes, &env, &participant));
+	for (unsigned node = 3; node < CLUSTER_CTRC_MAX_PARTICIPANTS; node++) {
+		child = participant->identity;
+		child.node_id = node;
+		child.boot_incarnation = 1101 + node;
+		UT_ASSERT(close_test_pending_child(participant, &child, path, &length));
+	}
+	UT_ASSERT(gcs_block_try_ctrc_forward136(&env, bytes));
+	for (unsigned pass = 0; pass < CLUSTER_CTRC_MAX_PARTICIPANTS; pass++) {
+		CtrcBatch.active = true;
+		CtrcBatch.remaining[CTRC_SCAN_DELEGATION] = CtrcShared->participant_key_entries;
+		UT_ASSERT(cluster_ctrc_participant_next_delegated_close_shared(&request));
+		UT_ASSERT(request.receiver.node_id >= 3);
+		selected |= UINT32_C(1) << request.receiver.node_id;
+		if (ids[request.receiver.node_id] == 0)
+			ids[request.receiver.node_id] = request.request_id;
+		UT_ASSERT_EQ(request.request_id, ids[request.receiver.node_id]);
+		UT_ASSERT(!cluster_ctrc_participant_next_delegated_close_shared(&request));
+		UT_ASSERT(ctrc_bytes_zero(&request, sizeof(request)));
+		UT_ASSERT_EQ(CtrcBatch.remaining[CTRC_SCAN_DELEGATION], 0);
+		UT_ASSERT(!cluster_ctrc_participant_next_delegated_close_shared(&request));
+		UT_ASSERT_EQ(held_count, 0);
+		MemSet(&CtrcBatch, 0, sizeof(CtrcBatch));
+	}
+	UT_ASSERT_EQ(selected, UINT32_C(0xfff8));
+	UT_ASSERT_EQ(participant->delegation_count, 13);
+	fixture_declared_nodes = 4;
+}
+
+static ClusterCtrcParticipantEntry *forward_race_participant;
+static unsigned forward_race;
+static uint64 forward_race_id;
+
+/* Serial controlled interleaving in the new lock gap, using the original
+ * locks/sequence domain. This is not a native concurrency test. */
+static bool
+close_forward_origin_gap(LWLock *lock, LWLockMode mode pg_attribute_unused(), bool acquire)
+{
+	uint64 index;
+	unsigned action = forward_race;
+
+	if (!acquire || lock != &CtrcShared->origin_lock || action == 0)
+		return false;
+	if (held_count != 0)
+		abort();
+	forward_race = 0;
+	if (!ctrc_participant_index(&forward_race_participant->key,
+		forward_race_participant->identity.node_id, &index))
+		abort();
+	if (action == 2) {
+		LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+		forward_race_id = CtrcShared->global_request_generation++;
+		LWLockRelease(&CtrcShared->origin_lock);
+	}
+	ctrc_participant_locks_acquire(ctrc_participant_lock_mask(index));
+	if (action == 1)
+		forward_race_participant->delegations[3].receiver.boot_incarnation++;
+	else
+		forward_race_participant->delegation_close_request_id[3] = forward_race_id;
+	ctrc_participant_locks_release(ctrc_participant_lock_mask(index));
+	return false;
+}
+
+UT_TEST(test_background_sequence_allocation_rechecks_the_exact_row_after_original_lock_gap)
+{
+	for (unsigned action = 1; action <= 2; action++) {
+		ClusterCtrcParticipantEntry *participant, expected;
+		ClusterCtrcDelegationCloseV1 request;
+		uint64 next_request;
+
+		UT_ASSERT(close_forward_setup(&participant));
+		expected = *participant;
+		next_request = CtrcShared->global_request_generation;
+		forward_race_participant = participant;
+		forward_race = action;
+		external_lock_hook = close_forward_origin_gap;
+		if (action == 1) {
+			UT_ASSERT(!cluster_ctrc_participant_next_delegated_close_shared(&request));
+			expected.delegations[3].receiver.boot_incarnation++;
+			UT_ASSERT(ctrc_bytes_zero(&request, sizeof(request)));
+			UT_ASSERT_EQ(CtrcShared->global_request_generation, next_request + 1);
+		} else {
+			UT_ASSERT(cluster_ctrc_participant_next_delegated_close_shared(&request));
+			UT_ASSERT_EQ(request.request_id, forward_race_id);
+			expected.delegation_close_request_id[3] = forward_race_id;
+			UT_ASSERT_EQ(CtrcShared->global_request_generation, next_request + 2);
+		}
+		external_lock_hook = NULL;
+		UT_ASSERT(memcmp(participant, &expected, sizeof(expected)) == 0);
+		UT_ASSERT_EQ(held_count, 0);
+		UT_ASSERT_EQ(enqueues, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(19);
 	UT_RUN(test_actual_delegated_close_enters_drain_and_retains_parent);
 	UT_RUN(test_actual_delegated_close_malformed_is_consumed_without_mutation);
 	UT_RUN(test_delegated_close_codec_is_explicit_and_roundtrips_all_binding_fields);
@@ -516,6 +869,14 @@ main(void)
 	UT_RUN(test_actual_delegated_close_error_leaves_original_admission_and_retains_custody);
 	UT_RUN(test_actual_multihop_close_keeps_the_complete_accepted_path);
 	UT_RUN(test_actual_delegated_close_keeps_connection_and_admission_domains_separate);
+	UT_RUN(test_original_background_pass_forwards_closed_child_custody);
+	UT_RUN(test_background_close_refusal_retries_the_same_request_without_retiring_custody);
+	UT_RUN(test_background_selector_rejects_unqualified_or_exhausted_rows_without_partial_output);
+	UT_RUN(test_background_dispatch_requires_current_hello_admission_root_and_exact_custody);
+	UT_RUN(test_background_dispatch_uses_hello_connection_and_preserves_open_custody_generation);
+	UT_RUN(test_background_error_cleans_original_batch_and_admission_but_keeps_retry_identity);
+	UT_RUN(test_background_selector_has_one_circumference_budget_and_fair_child_rotation);
+	UT_RUN(test_background_sequence_allocation_rechecks_the_exact_row_after_original_lock_gap);
 	free(CtrcShared);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
