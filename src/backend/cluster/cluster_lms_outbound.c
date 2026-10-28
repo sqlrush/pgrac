@@ -1032,6 +1032,69 @@ lms_outbound_block_request_current(ClusterLmsOutboundSlot *slot, int worker, boo
 	return true;
 }
 
+/* Copied failure observations only. No shared slot or transport ownership is
+ * carried by this stack array, and normal successful sends stay silent. */
+typedef struct LmsOrdinaryTtOutboundDiagnostic {
+	GcsBlockForwardPayload request;
+	const char *phase;
+	uint64 frame_epoch;
+	uint64 membership;
+	uint64 stream;
+	uint32 destination;
+	int send_result;
+} LmsOrdinaryTtOutboundDiagnostic;
+
+static void
+lms_outbound_ordinary_tt_capture(LmsOrdinaryTtOutboundDiagnostic *observations, int capacity,
+								 int *count, const ClusterLmsOutboundSlot *slot, const char *phase,
+								 int send_result)
+{
+	GcsBlockForwardPayload request;
+	LmsOrdinaryTtOutboundDiagnostic *d;
+
+	if (*count < 0 || *count >= capacity || slot->kind != CLUSTER_LMS_OUTBOUND_FRAME
+		|| slot->msg_type != PGRAC_IC_MSG_GCS_BLOCK_FORWARD || slot->payload_len != sizeof(request))
+		return;
+	memcpy(&request, slot->payload, sizeof(request));
+	if (!GcsBlockForwardPayloadIsUndoVerdictRequest(&request)
+		|| GcsBlockForwardPayloadIsUndoVerdictAuthoritative(&request))
+		return;
+	d = &observations[(*count)++];
+	d->request = request;
+	d->phase = phase;
+	d->frame_epoch = slot->frame_epoch;
+	d->membership = slot->request_membership_generation;
+	d->stream = slot->request_stream_generation;
+	d->destination = slot->dest_node_id;
+	d->send_result = send_result;
+}
+
+static void
+lms_outbound_ordinary_tt_emit(int worker, const LmsOrdinaryTtOutboundDiagnostic *observations,
+							  int count)
+{
+	static uint32 emitted;
+	int i;
+
+	for (i = 0; i < count && emitted < 64; i++) {
+		const LmsOrdinaryTtOutboundDiagnostic *d = &observations[i];
+		const GcsBlockForwardPayload *r = &d->request;
+
+		emitted++;
+		elog(LOG,
+			 "PGRAC ordinary TT outbound refused: node=%d worker=%d destination=%u "
+			 "requester=%d backend=%d request=" UINT64_FORMAT " xid=" UINT64_FORMAT
+			 " epoch=" UINT64_FORMAT " tag=%u/%u/%u/%u/%u phase=%s send_result=%d "
+			 "frame_epoch=" UINT64_FORMAT " membership=" UINT64_FORMAT " stream=" UINT64_FORMAT
+			 " detail_budget_exhausted=%d",
+			 cluster_node_id, worker, d->destination, r->original_requester_node,
+			 r->requester_backend_id, r->request_id,
+			 (uint64)GcsBlockForwardPayloadGetExpectedPiWatermarkScn(r), r->epoch, r->tag.spcOid,
+			 r->tag.dbOid, r->tag.relNumber, r->tag.forkNum, r->tag.blockNum, d->phase,
+			 d->send_result, d->frame_epoch, d->membership, d->stream, emitted == 64);
+	}
+}
+
 /*
  * cluster_lms_outbound_drain_send — one worker drains + sends its own ring.
  *
@@ -1073,6 +1136,8 @@ cluster_lms_outbound_drain_send(int worker_id)
 	ClusterLmsOutboundSlot retained[64];
 	int n_retained = 0;
 	bool peer_blocked[CLUSTER_MAX_NODES] = { 0 };
+	LmsOrdinaryTtOutboundDiagnostic observations[64];
+	int n_observations = 0;
 
 	if (worker_id < 0 || worker_id >= CLUSTER_LMS_MAX_WORKERS)
 		return 0;
@@ -1284,8 +1349,11 @@ cluster_lms_outbound_drain_send(int worker_id)
 			}
 		}
 		if (slot.kind == (uint8)CLUSTER_LMS_OUTBOUND_FRAME
-			&& !lms_outbound_frame_current(&slot, worker_id))
+			&& !lms_outbound_frame_current(&slot, worker_id)) {
+			lms_outbound_ordinary_tt_capture(observations, lengthof(observations), &n_observations,
+											 &slot, "FRAME_STALE", -1);
 			continue;
+		}
 
 		/* A peer that refused a frame this batch keeps its later frames
 		 * queued BEHIND the refused one (per-peer order). */
@@ -1303,6 +1371,8 @@ cluster_lms_outbound_drain_send(int worker_id)
 			}
 			Assert(n_retained < (int)lengthof(retained));
 			retained[n_retained++] = slot;
+			lms_outbound_ordinary_tt_capture(observations, lengthof(observations), &n_observations,
+											 &slot, "PEER_BLOCKED", -1);
 			continue;
 		}
 
@@ -1345,6 +1415,9 @@ cluster_lms_outbound_drain_send(int worker_id)
 		/* Actual transport result, not admission or enqueue success. */
 		cluster_pcm_lock_resource_x_trace_wire(slot.msg_type, (int32)slot.dest_node_id,
 											   send_payload, send_payload_len, (int32)rc);
+		if (rc == CLUSTER_IC_SEND_NOT_ADMITTED || rc == CLUSTER_IC_SEND_HARD_ERROR)
+			lms_outbound_ordinary_tt_capture(observations, lengthof(observations), &n_observations,
+											 &slot, "SEND_RESULT", (int)rc);
 		if (slot.kind == (uint8)CLUSTER_LMS_OUTBOUND_ZERO_BLOCK_REPLY
 			|| slot.kind == (uint8)CLUSTER_LMS_OUTBOUND_DIRECT_ZERO_BLOCK_REPLY)
 			cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_REPLY, rc);
@@ -1423,6 +1496,8 @@ finish_batch:
 		for (i = n_retained - 1; i >= 0; i--) {
 			if (ring->count >= PGRAC_LMS_OUTBOUND_CAPACITY) {
 				cluster_lms_obs_note_outbound_requeue_drop(worker_id);
+				lms_outbound_ordinary_tt_capture(observations, lengthof(observations),
+												 &n_observations, &retained[i], "REQUEUE_DROP", -1);
 				continue;
 			}
 			ring->tail
@@ -1435,6 +1510,9 @@ finish_batch:
 		ConditionVariableBroadcast(&ring->space_cv);
 	}
 
+	/* Formatting can throw. All original callbacks and FIFO/capacity cleanup
+	 * must finish before an observation is emitted. */
+	lms_outbound_ordinary_tt_emit(worker_id, observations, n_observations);
 	return sent;
 }
 
