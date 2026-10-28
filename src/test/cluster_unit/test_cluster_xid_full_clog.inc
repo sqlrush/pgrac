@@ -37,6 +37,8 @@ static struct {
 	jmp_buf error;
 } full_clog_fixture;
 
+static void (*full_clog_native_extend)(FullTransactionId);
+
 void
 ExtendCLOGFull(FullTransactionId candidate)
 {
@@ -47,6 +49,8 @@ ExtendCLOGFull(FullTransactionId candidate)
 	full_clog_fixture.full[i] = U64FromFullTransactionId(candidate);
 	if (proc.xid != 0 || visible_xids[0] != 0 || proc.subxidStatus.count != 0)
 		full_clog_fixture.early_publication++;
+	if (full_clog_native_extend != NULL)
+		full_clog_native_extend(candidate);
 	extended();
 	if (full_clog_fixture.fail_after == i + 1)
 		longjmp(full_clog_fixture.error, 1);

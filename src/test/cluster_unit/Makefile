@@ -6580,7 +6580,7 @@ check_r11_source_removal_census:
 # ----------
 clean distclean maintainer-clean:
 	rm -f test_cluster_recovery_episode_clog.o test_cluster_recovery_episode_side_owner.o
-	rm -f test_cluster_side_native_clog.o
+	rm -f test_cluster_side_native_clog.o test_cluster_xid_native_clog.o
 	rm -f test_cluster_external_fence_duty.inc
 	rm -f test_cluster_resolver_cache_caller.inc test_cluster_resolver_cache_caller.inc.tmp
 	rm -f test_cluster_relation_size.inc
@@ -11490,7 +11490,30 @@ test_cluster_xid_retention: test_cluster_xid_retention.c test_cluster_xid_alloca
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h \
 		test_cluster_xid_full_clog.inc \
 		$(top_srcdir)/src/include/access/clog.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_XID_STRIPE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_XID_STRIPE_O) \
+		$(CLUSTER_XID_RETAINED_NATIVE_CLOG_O) $(CLUSTER_UNIT_PORT_LIBS) \
+		$(if $(CLUSTER_XID_RETAINED_NATIVE_CLOG_O),$(R4_RUNTIME_VIS_TEST_DEAD_STRIP)) -o $@
+
+ifeq ($(enable_pgrac_cluster),yes)
+CLUSTER_XID_RETAINED_NATIVE_CLOG_O = test_cluster_xid_native_clog.o
+test_cluster_xid_retention: $(CLUSTER_XID_RETAINED_NATIVE_CLOG_O) \
+		test_cluster_xid_retention_native_clog.inc test_cluster_xid_native_clog.h
+test_cluster_xid_native_clog.o: test_cluster_xid_native_clog.c \
+		test_cluster_xid_native_clog.h test_cluster_xid_native_clog_namespace.h \
+		test_cluster_clog_recovery.c unit_test.h \
+		test_cluster_clog_relmap_participant.inc test_cluster_clog_page_birth.inc \
+		test_cluster_clog_relmap_mutation.inc test_cluster_clog_relmap_shared_mutation.inc \
+		test_cluster_clog_full_consumer.inc test_cluster_clog_own_full.inc \
+		$(top_srcdir)/src/backend/access/transam/clog.c \
+		$(top_srcdir)/src/backend/access/transam/slru.c \
+		$(top_srcdir)/src/include/access/clog.h \
+		$(top_srcdir)/src/include/access/slru.h \
+		$(top_srcdir)/src/include/access/transam.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_native_inventory.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -Werror -ffunction-sections -fdata-sections -c $< -o $@
+endif
+
 
 # Exercise the original recovery -> seed -> claim -> WAL gate. Dependency
 # boundaries are controlled by the test; the admission predicates are not.

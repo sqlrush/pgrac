@@ -1,5 +1,6 @@
 /* PGRAC: original allocator composed with the original retention guard.
- * COMPLETE, native authority, SLRU, locks and ERROR are controlled fixtures.
+ * COMPLETE, authority, locks and ERROR are controlled fixtures. Optional FULL
+ * composition tests execute original native CLOG/SLRU and real file I/O.
  * Author: SqlRush <sqlrush@gmail.com>
  * Spec: 2026-10-14-pre2-m5-e1-format-closure-v1.md */
 #include "postgres.h"
@@ -458,11 +459,27 @@ UT_TEST(retention_guard_valid_entry_observes_under_both_locks_and_returns_only_i
 }
 
 #include "test_cluster_xid_retention_full_clog.inc"
+#ifdef USE_PGRAC_CLUSTER
+#include "test_cluster_xid_retention_native_clog.inc"
+#endif
 
 int
 main(void)
 {
+#ifdef USE_PGRAC_CLUSTER
+	if (getenv("PGRAC_RETAINED_NATIVE_CLOG_ONLY") != NULL) {
+		UT_PLAN(3);
+		UT_RUN(retained_native_clog_initializes_before_original_top_and_child_publication);
+		UT_RUN(retained_native_clog_gap_preserves_full_page_birth_across_epoch);
+		UT_RUN(retained_native_clog_refusal_preserves_actual_initialization_and_pins);
+		free(relmap_runtime_shmem);
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
+	UT_PLAN(30);
+#else
 	UT_PLAN(27);
+#endif
 	UT_RUN(native_subxid_publication_preserves_the_final_cache_slot);
 	UT_RUN(native_publication_keeps_the_full_era_across_raw_rollover);
 	UT_RUN(no_storage_or_procarray_mutation_before_reservation);
@@ -490,6 +507,11 @@ main(void)
 	UT_RUN(retained_full_clog_late_refusal_and_slru_error_never_publish);
 	UT_RUN(retained_full_clog_rejects_another_native_origin_before_extension);
 	UT_RUN(retained_full_clog_rejects_another_native_system_before_extension);
+#ifdef USE_PGRAC_CLUSTER
+	UT_RUN(retained_native_clog_initializes_before_original_top_and_child_publication);
+	UT_RUN(retained_native_clog_gap_preserves_full_page_birth_across_epoch);
+	UT_RUN(retained_native_clog_refusal_preserves_actual_initialization_and_pins);
+#endif
 	free(relmap_runtime_shmem);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
