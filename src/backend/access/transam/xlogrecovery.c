@@ -1760,6 +1760,10 @@ cluster_recovery_cold_page_attempt(const struct ClusterRecoveryStartV1 *start,
 	RfPageProofDetailV1 detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
 	Size available = progress->budget - sizeof(*progress);
 	Size part = available / 3;
+	bool pending = progress->pending;
+	RfPageCtrcStepResultV1 pending_result = progress->result;
+	struct ClusterSharedFsPageV1 *pending_storage = progress->storage;
+	uint32 pending_target = progress->next_target;
 
 	PG_TRY();
 	{
@@ -1782,23 +1786,45 @@ cluster_recovery_cold_page_attempt(const struct ClusterRecoveryStartV1 *start,
 			detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
 			if (page.verdict == RF_PAGE_AUTHORITY_OK && authority != NULL
 				&& cluster_recovery_cold_page_advance_current(start, work, scope, progress)) {
-				RfPageCtrcHeldStepV1 held = rf_page_recovery_ctrc_replays_itl_graph_hold_smgr_v1(
-					start, work, &start->ctrc_page_sources[source_index], authority,
-					&physical_page->reservation.identity, view->page_identity.blockno,
-					&view->expected_result, view->canonical_page, start->ctrc_physical->entries,
-					start->ctrc_physical->count, available - 2 * part);
+				RfPageCtrcHeldStepV1 held = {0};
 				RfPageCtrcAuthorityV1 *release = authority;
 				const RfPageCtrcStepResultV1 *step = &held.result;
 
-				if (cluster_recovery_cold_page_step_has_operation(step)) {
-					progress->result = *step;
-					progress->storage = held.storage;
-					progress->pending = true;
+				if (pending) {
+					const GenericXLogRecoveryImageV1 *image = &pending_result.inserted.image;
+
+					if (image->block_number == view->page_identity.blockno
+						&& memcmp(&image->identity, &physical_page->reservation.identity,
+							sizeof(image->identity)) == 0
+						&& memcmp(&image->version.before, &view->expected_result,
+							sizeof(view->expected_result)) == 0)
+						detail = rf_page_recovery_ctrc_replays_fpi_readback_v1(start, work,
+							&start->ctrc_page_sources[source_index], authority,
+							&progress->result.inserted, pending_storage,
+							work->counts.subject_count, available - 2 * part);
+				} else {
+					held = rf_page_recovery_ctrc_replays_itl_graph_hold_smgr_v1(
+						start, work, &start->ctrc_page_sources[source_index], authority,
+						&physical_page->reservation.identity, view->page_identity.blockno,
+						&view->expected_result, view->canonical_page, start->ctrc_physical->entries,
+						start->ctrc_physical->count, available - 2 * part);
+					if (cluster_recovery_cold_page_step_has_operation(step)) {
+						progress->result = *step;
+						progress->storage = held.storage;
+						progress->pending = true;
+					}
 				}
 				authority = NULL;
 				rf_page_authority_ctrc_replays_destroy_v1(&release);
 				/* PAGE is gone before any original ROOT/current snapshot. */
-				if (cluster_recovery_cold_page_advance_current(start, work, scope, progress))
+				if (!cluster_recovery_cold_page_advance_current(start, work, scope, progress))
+					detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+				else if (pending) {
+					if (!progress->pending || progress->next_target != pending_target
+						|| progress->storage != pending_storage
+						|| memcmp(&progress->result, &pending_result, sizeof(pending_result)) != 0)
+						detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+				} else
 					detail = cluster_recovery_cold_page_step_result(progress, step);
 			}
 		}
@@ -1866,24 +1892,35 @@ ClusterColdRecoveryCtrcPageAdvance(const struct ClusterRecoveryStartV1 *start,
 			ClusterRecoveryCensusPageV1 physical_page;
 			RfPageProofDetailV1 detail = RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
 			uint32 source_index;
+			bool pending;
 
 			ResetLatch(MyLatch);
 			HandleStartupProcInterrupts();
 			if (!cluster_recovery_cold_page_advance_current(start, work, scope, progress)) break;
 			if (progress->target_count != count) break;
-			if (progress->pending || progress->next_target == count) { ready = true; break; }
+			pending = progress->pending;
+			if (!pending && progress->next_target == count) { ready = true; break; }
 			if (progress->next_target > count
 				|| !rf_page_online_plan_target_v1(start->ctrc_page_plan, progress->next_target, &view)) break;
 			/* These targets remain original obligations, not ITL projections. */
 			if (view.history_only || view.page_identity.forknum != MAIN_FORKNUM) {
+				if (pending) break;
 				progress->next_target++; continue;
 			}
 			if (!cluster_recovery_cold_page_target(start, &view, &physical_page)) break;
-			if (!physical_page.heap) { progress->next_target++; continue; }
+			if (!physical_page.heap) {
+				if (pending) break;
+				progress->next_target++; continue;
+			}
 			if (!cluster_recovery_cold_page_tail(start, &view, &source_index)) break;
 			detail = cluster_recovery_cold_page_attempt(start, work, scope, progress,
 				&view, &physical_page, source_index);
-			if (detail == RF_PAGE_PROOF_DETAIL_OK) continue;
+			if (detail == RF_PAGE_PROOF_DETAIL_OK) {
+				/* Readback retains the original pending window and FD. Its
+				 * first/pin/companion and service duties are still outstanding. */
+				if (pending) { ready = true; break; }
+				continue;
+			}
 			if (detail != RF_PAGE_PROOF_DETAIL_WOULD_BLOCK) {
 				if (start == cluster_recovery_cold_start)
 					cluster_recovery_cold_observation_refuse(state, "page_execute", (int)detail);

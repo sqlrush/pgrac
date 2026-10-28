@@ -24,6 +24,7 @@ static RfContributorVectorV1 prefix_contributors[2];
 static RfPageStableEdgeInputV1 prefix_edges[2];
 static PGAlignedBlock prefix_images[2];
 static unsigned prefix_steps, prefix_proofs, prefix_pages, prefix_destroyed;
+static unsigned pending_readback_calls;
 static unsigned prefix_proof_token, prefix_page_token;
 static uint32 prefix_source_ordinal;
 static bool prefix_error, prefix_wait, prefix_unchanged, prefix_bad_physical, prefix_insert_refuse;
@@ -237,8 +238,8 @@ prefix_setup_targets(void)
 static void
 prefix_service_wait(void)
 {
- UT_ASSERT_EQ(prefix_steps, 1); UT_ASSERT_EQ(prefix_proofs, 1); UT_ASSERT_EQ(prefix_pages, 1);
- UT_ASSERT_EQ(prefix_destroyed, 2);
+ UT_ASSERT_EQ(prefix_steps, 1); UT_ASSERT_EQ(prefix_proofs, 2); UT_ASSERT_EQ(prefix_pages, 2);
+ UT_ASSERT_EQ(prefix_destroyed, 4); /* Original execution and protected readback. */
  UT_ASSERT(observation_scope_live && observation_cursor_live);
  /* Leave the real CTRC independent result pending, then cancel this fixture. */
  pg_re_throw();
@@ -283,7 +284,7 @@ UT_TEST(test_startup_page_prefix_repeat_retains_exact_pending_result)
  saved = cluster_recovery_cold_start->ctrc_page_progress->result;
  UT_ASSERT_EQ(saved.inserted.window.key.window_seq, prefix_window.key.window_seq);
  UT_ASSERT(ClusterColdRecoveryCtrcPageAdvance(info.cluster_tx_start, 0));
- UT_ASSERT_EQ(prefix_steps, 1); UT_ASSERT_EQ(prefix_destroyed, 2);
+ UT_ASSERT_EQ(prefix_steps, 1); UT_ASSERT_EQ(prefix_destroyed, 6);
  UT_ASSERT_EQ(cluster_recovery_cold_start->ctrc_page_progress->next_target, 0);
  UT_ASSERT(memcmp(&saved, &cluster_recovery_cold_start->ctrc_page_progress->result, sizeof(saved)) == 0);
  UT_ASSERT_EQ(window_region.checkpoint_owner.ctrc_accepted_generation, 0);

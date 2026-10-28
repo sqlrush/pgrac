@@ -308,10 +308,39 @@ UT_TEST(test_page_fd_prepare_sync_failure_and_configured_root_spelling)
 	UT_ASSERT(cluster_shared_fs_page_close_v1(target)); UT_ASSERT_EQ(page_external, 0);
 }
 
+extern bool cluster_shared_fs_page_matches_v1(ClusterSharedFsPageV1 *, RelFileLocator, BlockNumber);
+
+UT_TEST(test_page_fd_matches_exact_relation_block_and_original_custody)
+{
+ ClusterSharedFsPageV1 *target;
+ RelFileLocator changed;
+ unsigned writes, syncs;
+ page_setup("page_fd_identity"); target = page_open(); UT_ASSERT_NOT_NULL(target);
+ writes = page_writes; syncs = page_syncs;
+ UT_ASSERT(cluster_shared_fs_page_matches_v1(target, page_locator, 1));
+ for (unsigned i = 0; i < 3; i++) {
+  changed = page_locator;
+  if (i == 0) changed.spcOid++;
+  if (i == 1) changed.dbOid++;
+  if (i == 2) changed.relNumber++;
+  UT_ASSERT(!cluster_shared_fs_page_matches_v1(target, changed, 1));
+ }
+ UT_ASSERT(!cluster_shared_fs_page_matches_v1(target, page_locator, 0));
+ UT_ASSERT(!cluster_shared_fs_page_matches_v1(NULL, page_locator, 1));
+ UT_ASSERT(cluster_shared_fs_page_matches_v1(target, page_locator, 1));
+ UT_ASSERT_EQ(page_writes, writes); UT_ASSERT_EQ(page_syncs, syncs); UT_ASSERT_EQ(page_external, 5);
+ CurrentResourceOwner = (ResourceOwner)(uintptr_t)2;
+ UT_ASSERT(!cluster_shared_fs_page_matches_v1(target, page_locator, 1));
+ CurrentResourceOwner = (ResourceOwner)(uintptr_t)1;
+ UT_ASSERT(!cluster_shared_fs_page_matches_v1(target, page_locator, 1));
+ UT_ASSERT(cluster_shared_fs_page_close_v1(target)); UT_ASSERT_EQ(page_external, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(9);
+	UT_RUN(test_page_fd_matches_exact_relation_block_and_original_custody);
 	UT_RUN(test_page_fd_existing_extent_roundtrip_and_explicit_close);
 	UT_RUN(test_page_fd_replacement_and_ancestor_drift_stay_refused);
 	UT_RUN(test_page_fd_extent_actor_and_owner_drift_stay_refused);

@@ -6,6 +6,7 @@ static bool pending_storage_live, pending_storage_invalid, pending_storage_missi
 static bool pending_storage_check_close, pending_storage_cleanup_seen;
 static unsigned pending_storage_created, pending_storage_checks, pending_storage_closes;
 static unsigned pending_storage_token;
+static void pending_readback_reset(void);
 
 static void
 pending_storage_fixture_reset(void)
@@ -14,6 +15,7 @@ pending_storage_fixture_reset(void)
 	pending_storage_invalid = pending_storage_missing = false;
 	pending_storage_check_close = pending_storage_cleanup_seen = false;
 	pending_storage_created = pending_storage_checks = pending_storage_closes = 0;
+	pending_readback_reset();
 }
 
 RfPageCtrcHeldStepV1
@@ -26,6 +28,18 @@ rf_page_recovery_ctrc_replays_itl_graph_hold_smgr_v1(const struct ClusterRecover
 	RfPageCtrcHeldStepV1 held = {0};
 	held.result = rf_page_recovery_ctrc_replays_itl_graph_sync_smgr_v1(start, work, source,
 		authority, space, block, before, canonical, physical, count, budget);
+	/* The older controlled leaf populated only its F4 descriptor. Mirror the
+	 * native returned frame's complete identity/edge for the real continuation. */
+	if (held.result.inserted.window.key.window_seq != 0) {
+		ClusterRecoveryStampFpiV1 envelope;
+		memcpy(&envelope, held.result.inserted.window.payload, sizeof(envelope));
+		held.result.inserted.image.identity = *space;
+		held.result.inserted.image.owner = envelope.image.owner;
+		held.result.inserted.image.fork_number = envelope.image.fork_number;
+		held.result.inserted.image.block_number = block;
+		held.result.inserted.image.result_token = envelope.image.result_token;
+		held.result.inserted.image.version = envelope.image.version;
+	}
 	if (held.result.phase == RF_PAGE_CTRC_STEP_FPI_DURABLE && !pending_storage_missing) {
 		UT_ASSERT(!pending_storage_live); pending_storage_live = true; pending_storage_created++;
 		held.storage = (void *)&pending_storage_token;

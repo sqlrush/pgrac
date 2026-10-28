@@ -51,6 +51,14 @@ cluster_shared_fs_page_current_v1(ClusterSharedFsPageV1 *target)
 }
 
 bool
+cluster_shared_fs_page_matches_v1(ClusterSharedFsPageV1 *target,
+	RelFileLocator locator, BlockNumber block)
+{
+	return cluster_shared_fs_page_current_v1(target) && block == 7
+		&& RelFileLocatorEquals(locator, ctrc_read_native_live->space.key.locator);
+}
+
+bool
 cluster_shared_fs_page_read_v1(ClusterSharedFsPageV1 *target, ForkNumber fork, BlockNumber block, char *out)
 {
 	UT_ASSERT(cluster_shared_fs_page_current_v1(target));

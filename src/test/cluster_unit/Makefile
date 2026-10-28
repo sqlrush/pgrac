@@ -13883,3 +13883,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_ctrc_
 test_cluster_ctrc_native_fpi: test_cluster_ctrc_native_unchanged_cache.inc
 test_cluster_ctrc_native_fpi: test_cluster_ctrc_native_held_fd.inc
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_pending_storage.inc
+
+# Original pending FPI protected same-descriptor readback.
+test_cluster_ctrc_native_fpi: test_cluster_ctrc_native_readback.inc
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_pending_readback.inc

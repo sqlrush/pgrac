@@ -19,6 +19,10 @@ extern Size cluster_shared_fs_page_bytes_v1(void);
 extern ClusterSharedFsPageV1 *cluster_shared_fs_page_open_v1(
 	RelFileLocator locator, BlockNumber block, Size memory_budget);
 extern bool cluster_shared_fs_page_current_v1(ClusterSharedFsPageV1 *target);
+/* Read-only binding to the SAME opened relation and target block. A mismatch
+ * grants nothing and never reopens/rebinds the private handle. */
+extern bool cluster_shared_fs_page_matches_v1(ClusterSharedFsPageV1 *target,
+	RelFileLocator locator, BlockNumber block);
 extern bool cluster_shared_fs_page_read_v1(ClusterSharedFsPageV1 *target,
 	ForkNumber fork, BlockNumber block, char *out);
 /* The original typed executor must still prove PAGE/source/writer custody
