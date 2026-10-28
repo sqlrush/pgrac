@@ -461,6 +461,7 @@ UT_TEST(retention_guard_valid_entry_observes_under_both_locks_and_returns_only_i
 #include "test_cluster_xid_retention_full_clog.inc"
 #ifdef USE_PGRAC_CLUSTER
 #include "test_cluster_xid_retention_native_clog.inc"
+#include "test_cluster_xid_retention_xact_native_clog.inc"
 #endif
 
 int
@@ -476,7 +477,7 @@ main(void)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(30);
+	UT_PLAN(33);
 #else
 	UT_PLAN(27);
 #endif
@@ -511,6 +512,9 @@ main(void)
 	UT_RUN(retained_native_clog_initializes_before_original_top_and_child_publication);
 	UT_RUN(retained_native_clog_gap_preserves_full_page_birth_across_epoch);
 	UT_RUN(retained_native_clog_refusal_preserves_actual_initialization_and_pins);
+	UT_RUN(original_xact_full_native_retains_top_owner_through_child_publication);
+	UT_RUN(original_xact_full_native_recursion_keeps_actual_epoch_and_striped_gap);
+	UT_RUN(original_xact_full_native_refusals_keep_top_pin_and_completed_initialization);
 #endif
 	free(relmap_runtime_shmem);
 	UT_DONE();

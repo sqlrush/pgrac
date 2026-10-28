@@ -19,6 +19,7 @@ static TransactionId xact_child[4], xact_parent[4];
 static ResourceOwner xact_lock_owner[4];
 static int xact_wal_level;
 static int xact_error_level;
+static FullTransactionId (*xact_native_allocator)(bool child);
 
 static void AssignTransactionId(TransactionState s);
 
@@ -38,8 +39,13 @@ xact_start_error(int level, const char *domain)
 static FullTransactionId
 xact_allocate_native(bool child)
 {
-	FullTransactionId xid = cluster_relmap_retention_allocate_xid_v2(child,
-		retention_sysid, retention_dbinc, retention_origin);
+	FullTransactionId xid;
+
+	if (xact_native_allocator != NULL)
+		xid = xact_native_allocator(child);
+	else
+		xid = cluster_relmap_retention_allocate_xid_v2(child,
+			retention_sysid, retention_dbinc, retention_origin);
 
 	caller_assignments++;
 	return xid;
@@ -148,6 +154,7 @@ xact_caller_fixture(uint64 first, unsigned origin)
 	nUnreportedXids = 0;
 	xact_wal_level = WAL_LEVEL_MINIMAL;
 	xact_error_level = 0;
+	xact_native_allocator = NULL;
 	xact_source_resource_owner = (ResourceOwner)(uintptr_t)99;
 	memset(unreportedXids, 0, sizeof(unreportedXids));
 	memset(xact_lock_owner, 0, sizeof(xact_lock_owner));

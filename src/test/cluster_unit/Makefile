@@ -11497,7 +11497,8 @@ test_cluster_xid_retention: test_cluster_xid_retention.c test_cluster_xid_alloca
 ifeq ($(enable_pgrac_cluster),yes)
 CLUSTER_XID_RETAINED_NATIVE_CLOG_O = test_cluster_xid_native_clog.o
 test_cluster_xid_retention: $(CLUSTER_XID_RETAINED_NATIVE_CLOG_O) \
-		test_cluster_xid_retention_native_clog.inc test_cluster_xid_native_clog.h
+		test_cluster_xid_retention_native_clog.inc \
+		test_cluster_xid_retention_xact_native_clog.inc test_cluster_xid_native_clog.h
 test_cluster_xid_native_clog.o: test_cluster_xid_native_clog.c \
 		test_cluster_xid_native_clog.h test_cluster_xid_native_clog_namespace.h \
 		test_cluster_clog_recovery.c unit_test.h \
