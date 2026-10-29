@@ -5600,7 +5600,7 @@ test_cluster_pcm_settlement_ingress.inc: $(top_srcdir)/src/backend/cluster/clust
 	     END { if (count != 4 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_pcm_lock test_cluster_pcm_object_retire test_cluster_pcm_stop_cv test_cluster_pcm_read_grant test_cluster_resource_x_acquire_ingress test_cluster_resource_x_decision_send test_cluster_resource_x_decision_publish test_cluster_resource_x_holder_send test_cluster_resource_x_master_ack test_cluster_resource_x_master_done test_cluster_resource_x_master_consumed test_cluster_resource_x_source_ack test_cluster_resource_x_s_source: %: %.c test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
+test_cluster_pcm_lock test_cluster_pcm_object_retire test_cluster_pcm_stop_cv test_cluster_pcm_read_grant test_cluster_resource_x_acquire_ingress test_cluster_resource_x_decision_send test_cluster_resource_x_decision_publish test_cluster_resource_x_holder_send test_cluster_resource_x_master_ack test_cluster_resource_x_master_done test_cluster_resource_x_master_consumed test_cluster_resource_x_master_quiet test_cluster_resource_x_source_ack test_cluster_resource_x_s_source: %: %.c test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
 		test_cluster_pcm_master_durable.inc \
 		test_cluster_pcm_bootstrap_tick.inc \
 		test_cluster_pcm_settlement_ingress.inc \
@@ -10850,3 +10850,34 @@ clean-native-disk-quiet:
 		test_cluster_native_read_continue_fixture.inc.tmp test_cluster_native_disk_abort.inc \
 		test_cluster_native_disk_abort.inc.tmp test_cluster_native_disk_quiet.inc \
 		test_cluster_native_disk_quiet.inc.tmp
+
+# Original quiet receipt uses retained send slots and passive LMS probes.
+TESTS += test_cluster_native_quiet_notice test_cluster_resource_x_master_quiet
+all: test_cluster_native_quiet_notice test_cluster_resource_x_master_quiet
+test_cluster_native_quiet_notice: test_cluster_native_quiet_notice.c \
+		test_cluster_native_disk_quiet_fixture.inc test_cluster_native_disk_quiet
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+test_cluster_native_disk_quiet_fixture.inc: test_cluster_native_disk_quiet.c Makefile
+	awk '/^UT_TEST\(/ { stop=1 } !stop { print; lines++ } \
+	     END { if (!stop || lines < 150) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_resource_x_master_quiet: test_cluster_resource_x_master_consumed_fixture.inc \
+		test_cluster_resource_x_master_consumed
+test_cluster_resource_x_master_consumed_fixture.inc: test_cluster_resource_x_master_consumed.c Makefile
+	awk '/^UT_TEST\(/ { stop=1 } !stop { print; lines++ } \
+	     END { if (!stop || lines < 50) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+clean distclean maintainer-clean: clean-native-quiet-notice
+.PHONY: clean-native-quiet-notice
+clean-native-quiet-notice:
+	rm -f test_cluster_native_quiet_notice test_cluster_native_disk_quiet_fixture.inc \
+		test_cluster_native_disk_quiet_fixture.inc.tmp test_cluster_resource_x_master_quiet \
+		test_cluster_resource_x_master_consumed_fixture.inc \
+		test_cluster_resource_x_master_consumed_fixture.inc.tmp

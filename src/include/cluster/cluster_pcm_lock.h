@@ -1722,6 +1722,7 @@ typedef struct ResourceXDeliveryTarget {
 #define RESOURCE_X_DELIVERY_ACQUIRE_READ_SETTLED UINT8_C(9)
 #define RESOURCE_X_DELIVERY_ACQUIRE_READ_SEALING UINT8_C(10)
 #define RESOURCE_X_DELIVERY_ACQUIRE_READ_QUIET UINT8_C(11)
+#define RESOURCE_X_DELIVERY_ACQUIRE_READ_QUIET_CONSUMED UINT8_C(12)
 /* Immutable evidence retained by the original full-E executor. This is not
  * caller authority or a PAGE/WAL memory-source proof for disk bytes. */
 typedef struct ResourceXAcquireReadReceipt {

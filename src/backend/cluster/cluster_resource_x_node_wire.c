@@ -622,7 +622,9 @@ resource_x_pair_common_valid(uint8 msg_type, ResourceXWireKind kind,
 			ResourceXDecodedCommon decision = *common;
 			if (common->outcome != RESOURCE_X_OUTCOME_OK
 				&& !(kind == RESOURCE_X_WIRE_INSTALL_SETTLEMENT
-					&& common->outcome == RESOURCE_X_OUTCOME_DUPLICATE)) {
+					&& (common->outcome == RESOURCE_X_OUTCOME_DUPLICATE
+						|| common->outcome == RESOURCE_X_OUTCOME_QUIET
+						|| common->outcome == RESOURCE_X_OUTCOME_QUIET_RETIRED))) {
 				resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_ENUM);
 				return false;
 			}
@@ -658,9 +660,14 @@ resource_x_pair_common_valid(uint8 msg_type, ResourceXWireKind kind,
 static uint8
 resource_x_frame_version(ResourceXWireKind kind, uint16 len, uint8 outcome)
 {
-	if (len == RESOURCE_X_COMPLETE_V5_BYTES)
+	if (len == RESOURCE_X_COMPLETE_V5_BYTES) {
+		if (outcome == RESOURCE_X_OUTCOME_QUIET)
+			return RESOURCE_X_QUIET_WIRE_VERSION;
+		if (outcome == RESOURCE_X_OUTCOME_QUIET_RETIRED)
+			return RESOURCE_X_QUIET_RETIRED_WIRE_VERSION;
 		return outcome == RESOURCE_X_OUTCOME_DUPLICATE
 			? RESOURCE_X_CONSUMED_WIRE_VERSION : RESOURCE_X_COMPLETION_WIRE_VERSION;
+	}
 	if (len == RESOURCE_X_ACQUIRE_V3_BYTES)
 		return RESOURCE_X_ACQUIRE_WIRE_VERSION;
 	if (len == RESOURCE_X_DECISION_V4_BYTES || len == RESOURCE_X_WITNESS_V4_BYTES
@@ -833,7 +840,8 @@ resource_x_decision_body_valid(const ResourceXDecodedFrame *frame)
 			return false;
 	}
 	if (frame->kind == RESOURCE_X_WIRE_INSTALL_SETTLEMENT
-		&& frame->common.outcome == RESOURCE_X_OUTCOME_DUPLICATE)
+		&& (frame->common.outcome == RESOURCE_X_OUTCOME_DUPLICATE
+			|| frame->common.outcome == RESOURCE_X_OUTCOME_QUIET_RETIRED))
 		return frame->common.action_node == body->master_node;
 	if (frame->kind == RESOURCE_X_WIRE_AUTHORITY_GRANT || frame->kind == RESOURCE_X_WIRE_INSTALL_SETTLEMENT)
 		return frame->common.action_node == frame->common.logical_assertion.requester_node;
@@ -856,7 +864,9 @@ resource_x_completion_body_valid(const ResourceXDecodedFrame *frame)
 		&& a->episode.base_generation < UINT64_MAX - 1
 		&& a->source_kind == RESOURCE_X_ACQUIRE_SOURCE_DISK
 		&& a->holders_bitmap == 0 && a->required_holders_bitmap == 0 && a->pi_holders_bitmap == 0
-		&& c->native_generation == a->episode.base_generation + 1
+		&& c->native_generation == a->episode.base_generation
+			+ ((frame->common.outcome == RESOURCE_X_OUTCOME_QUIET
+				|| frame->common.outcome == RESOURCE_X_OUTCOME_QUIET_RETIRED) ? 0 : 1)
 		&& (c->write_io_generation & 1) == 0
 		&& (!SCN_VALID(a->disk_watermark_scn)
 			|| (SCN_VALID(c->page_scn) && scn_local(c->page_scn)

@@ -15388,7 +15388,8 @@ gcs_block_resource_x_acquire_done_ingress(const ClusterICEnvelope *env,
 	if (env == NULL || frame == NULL || !frame->has_acquire_decision
 		|| frame->kind != RESOURCE_X_WIRE_INSTALL_SETTLEMENT
 		|| frame->payload_bytes != RESOURCE_X_COMPLETE_V5_BYTES
-		|| frame->common.outcome != RESOURCE_X_OUTCOME_OK
+		|| (frame->common.outcome != RESOURCE_X_OUTCOME_OK
+			&& frame->common.outcome != RESOURCE_X_OUTCOME_QUIET)
 		|| env->msg_type != RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE
 		|| env->payload_length != RESOURCE_X_COMPLETE_V5_BYTES
 		|| env->source_node_id != (uint32)frame->common.logical_assertion.requester_node
@@ -15601,7 +15602,8 @@ gcs_block_resource_x_requester_join_ingress(const ClusterICEnvelope *env,
 	if (env == NULL || frame == NULL || out == NULL || authenticated_connection_generation == 0)
 		return RESOURCE_X_APPLY_INVALID;
 	consumed = frame->kind == RESOURCE_X_WIRE_INSTALL_SETTLEMENT && frame->has_acquire_decision
-		&& frame->common.outcome == RESOURCE_X_OUTCOME_DUPLICATE;
+		&& (frame->common.outcome == RESOURCE_X_OUTCOME_DUPLICATE
+			|| frame->common.outcome == RESOURCE_X_OUTCOME_QUIET_RETIRED);
 	if (consumed)
 		memset(out, 0, sizeof(*out));
 	if (!consumed && (frame->kind != RESOURCE_X_WIRE_IMAGE_ENVELOPE
@@ -16137,7 +16139,9 @@ gcs_block_try_resource_x_frame(const ClusterICEnvelope *env, const void *payload
 							   (unsigned long long)snapshot.final_authority_generation)));
 		break;
 	case RESOURCE_X_WIRE_INSTALL_SETTLEMENT: {
-		if (frame.has_acquire_decision && frame.common.outcome == RESOURCE_X_OUTCOME_DUPLICATE)
+		if (frame.has_acquire_decision
+			&& (frame.common.outcome == RESOURCE_X_OUTCOME_DUPLICATE
+				|| frame.common.outcome == RESOURCE_X_OUTCOME_QUIET_RETIRED))
 			result = gcs_block_resource_x_requester_join_ingress(env, &frame,
 				authenticated_capability_generation, &join_snapshot);
 		else
