@@ -947,6 +947,11 @@ extern ResourceXApplyResult cluster_bufmgr_pcm_own_acquire_done_disk_exact(
 	const ResourceXDecodedAcquireIntent *episode,
 	const struct ClusterSemanticAdmissionToken *admission,
 	const ResourceXDeliveryClaim *execution);
+extern ResourceXApplyResult cluster_bufmgr_pcm_own_acquire_settle_disk_exact(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
+	const ResourceXDecodedAcquireIntent *episode,
+	const struct ClusterSemanticAdmissionToken *admission,
+	const ResourceXDeliveryClaim *execution);
 extern ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_delivery_begin_x_reservation(BufferDesc *buf,
 													const ClusterPcmOwnSnapshot *expected,

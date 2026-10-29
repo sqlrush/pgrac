@@ -17723,12 +17723,12 @@ cluster_bufmgr_pcm_own_acquire_complete_disk_exact(BufferDesc *buf,
 		return result;
 	if (current.purpose == RESOURCE_X_DELIVERY_ACQUIRE_READ_ARMED)
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
-	if (current.purpose == RESOURCE_X_DELIVERY_ACQUIRE_READ_COMPLETE
-		|| current.purpose == RESOURCE_X_DELIVERY_ACQUIRE_READ_NOTICE) {
+	if (current.purpose >= RESOURCE_X_DELIVERY_ACQUIRE_READ_COMPLETE
+		&& current.purpose <= RESOURCE_X_DELIVERY_ACQUIRE_READ_SETTLED) {
 		if (!cluster_bufmgr_acquire_read_context(buf, &original, &entered, admission, &owned, io_owner, false)
 			|| !cluster_bufmgr_acquire_read_terminal(buf, &original, &entered, &owned, &receipt,
-				current.purpose == RESOURCE_X_DELIVERY_ACQUIRE_READ_NOTICE
-					? CLUSTER_ACQUIRE_READ_RELEASED : CLUSTER_ACQUIRE_READ_RELEASE, &terminal))
+				current.purpose == RESOURCE_X_DELIVERY_ACQUIRE_READ_COMPLETE
+					? CLUSTER_ACQUIRE_READ_RELEASE : CLUSTER_ACQUIRE_READ_RELEASED, &terminal))
 			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 		return RESOURCE_X_APPLY_DUPLICATE;
 	}
@@ -17798,8 +17798,8 @@ cluster_bufmgr_pcm_own_acquire_done_disk_exact(BufferDesc *buf,
 	result = cluster_pcm_lock_resource_x_requester_acquire_read_owner_exact(&owned, &entered, &current, &receipt);
 	if (result != RESOURCE_X_APPLY_APPLIED)
 		return result;
-	if ((current.purpose != RESOURCE_X_DELIVERY_ACQUIRE_READ_COMPLETE
-		 && current.purpose != RESOURCE_X_DELIVERY_ACQUIRE_READ_NOTICE)
+	if ((current.purpose < RESOURCE_X_DELIVERY_ACQUIRE_READ_COMPLETE
+		 || current.purpose > RESOURCE_X_DELIVERY_ACQUIRE_READ_SETTLED)
 		|| !cluster_bufmgr_acquire_read_terminal(buf, &original, &entered, &owned, &receipt,
 			CLUSTER_ACQUIRE_READ_RELEASED, &terminal))
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
@@ -17810,7 +17810,53 @@ cluster_bufmgr_pcm_own_acquire_done_disk_exact(BufferDesc *buf,
 		|| !cluster_bufmgr_acquire_read_terminal(buf, &original, &entered, &owned, &receipt,
 			CLUSTER_ACQUIRE_READ_RELEASED, &terminal)
 		|| cluster_pcm_lock_resource_x_requester_acquire_read_owner_exact(&owned, &entered, &current, &retained)
-			!= RESOURCE_X_APPLY_APPLIED || current.purpose != RESOURCE_X_DELIVERY_ACQUIRE_READ_NOTICE
+			!= RESOURCE_X_APPLY_APPLIED || current.purpose < RESOURCE_X_DELIVERY_ACQUIRE_READ_NOTICE
+		|| current.purpose > RESOURCE_X_DELIVERY_ACQUIRE_READ_SETTLED
+		|| memcmp(&receipt, &retained, sizeof(receipt)) != 0)
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	return result;
+}
+
+/* A master ACK and quiet transport are still not a live native observation.
+ * Only the original pinned executor can retire its matching NOTICE. */
+ResourceXApplyResult
+cluster_bufmgr_pcm_own_acquire_settle_disk_exact(BufferDesc *buf,
+	const ClusterPcmOwnSnapshot *base, const ResourceXDecodedAcquireIntent *episode,
+	const ClusterSemanticAdmissionToken *admission, const ResourceXDeliveryClaim *execution)
+{
+	ClusterPcmOwnSnapshot original, terminal;
+	ResourceXDecodedAcquireIntent entered;
+	ResourceXDeliveryClaim owned, current;
+	ResourceXAcquireReadReceipt receipt, retained;
+	ResourceXApplyResult result;
+	ResourceOwner owner = CurrentResourceOwner;
+
+	if (buf == NULL || base == NULL || episode == NULL || admission == NULL || execution == NULL
+		|| ClusterPcmOwnArray == NULL)
+		return RESOURCE_X_APPLY_INVALID;
+	if (LWLockHeldByMe(BufferDescriptorGetContentLock(buf)))
+		return RESOURCE_X_APPLY_BAD_STATE;
+	original = *base;
+	entered = *episode;
+	owned = *execution;
+	if (!cluster_bufmgr_acquire_read_context(buf, &original, &entered, admission, &owned, owner, false))
+		return RESOURCE_X_APPLY_BAD_STATE;
+	result = cluster_pcm_lock_resource_x_requester_acquire_read_owner_exact(&owned, &entered, &current, &receipt);
+	if (result != RESOURCE_X_APPLY_APPLIED)
+		return result;
+	if ((current.purpose < RESOURCE_X_DELIVERY_ACQUIRE_READ_NOTICE
+		 || current.purpose > RESOURCE_X_DELIVERY_ACQUIRE_READ_SETTLED)
+		|| !cluster_bufmgr_acquire_read_terminal(buf, &original, &entered, &owned, &receipt,
+			CLUSTER_ACQUIRE_READ_RELEASED, &terminal))
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	result = cluster_pcm_lock_resource_x_requester_acquire_read_settle_exact(&owned, &entered, &receipt, &terminal);
+	if (result != RESOURCE_X_APPLY_APPLIED && result != RESOURCE_X_APPLY_DUPLICATE)
+		return result;
+	if (!cluster_bufmgr_acquire_read_context(buf, &original, &entered, admission, &owned, owner, false)
+		|| !cluster_bufmgr_acquire_read_terminal(buf, &original, &entered, &owned, &receipt,
+			CLUSTER_ACQUIRE_READ_RELEASED, &terminal)
+		|| cluster_pcm_lock_resource_x_requester_acquire_read_owner_exact(&owned, &entered, &current, &retained)
+			!= RESOURCE_X_APPLY_APPLIED || current.purpose != RESOURCE_X_DELIVERY_ACQUIRE_READ_SETTLED
 		|| memcmp(&receipt, &retained, sizeof(receipt)) != 0)
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	return result;

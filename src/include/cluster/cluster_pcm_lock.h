@@ -1718,6 +1718,8 @@ typedef struct ResourceXDeliveryTarget {
 #define RESOURCE_X_DELIVERY_ACQUIRE_READ_ARMED UINT8_C(5)
 #define RESOURCE_X_DELIVERY_ACQUIRE_READ_COMPLETE UINT8_C(6)
 #define RESOURCE_X_DELIVERY_ACQUIRE_READ_NOTICE UINT8_C(7)
+#define RESOURCE_X_DELIVERY_ACQUIRE_READ_CONSUMED UINT8_C(8)
+#define RESOURCE_X_DELIVERY_ACQUIRE_READ_SETTLED UINT8_C(9)
 /* Immutable evidence retained by the original full-E executor. This is not
  * caller authority or a PAGE/WAL memory-source proof for disk bytes. */
 typedef struct ResourceXAcquireReadReceipt {
@@ -2862,6 +2864,15 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_read_c
 /* Arm the original asynchronous DONE only after exact released native C.
  * LOCAL_WAIT preserves both the occupied original slot and this E/A/I. */
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_read_notice_exact(
+	const ResourceXDeliveryClaim *execution, const ResourceXDecodedAcquireIntent *episode,
+	const ResourceXAcquireReadReceipt *receipt, const struct ClusterPcmOwnSnapshot *terminal);
+/* Master consumption is independent of local physical delivery quiescence. */
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_read_consumed_exact(
+	const ResourceXDecodedFrame *notice, int32 authenticated_master,
+	uint32 authenticated_ingress, int32 current_master, uint32 master_ingress,
+	uint64 r4_generation);
+/* The original native executor retires NOTICE, retaining full stable S evidence. */
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_read_settle_exact(
 	const ResourceXDeliveryClaim *execution, const ResourceXDecodedAcquireIntent *episode,
 	const ResourceXAcquireReadReceipt *receipt, const struct ClusterPcmOwnSnapshot *terminal);
 

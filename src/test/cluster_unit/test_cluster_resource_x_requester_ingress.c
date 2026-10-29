@@ -69,6 +69,8 @@ ingress_terminal(void)
 	return RESOURCE_X_APPLY_INVALID;
 }
 
+#include "test_cluster_resource_x_master_done_ingress.inc"
+
 /* Logging and unrelated handlers are leaves, not replacements for the tested
  * receiver, TARGET admission, session recheck, join or master ACK policy. */
 #define gcs_block_resource_x_diagnostic_should_log(kind, result) false
