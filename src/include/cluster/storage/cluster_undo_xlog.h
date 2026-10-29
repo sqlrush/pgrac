@@ -222,6 +222,56 @@ cluster_undo_tt_bind_v2_decode(const void *payload, Size length, xl_undo_tt_iden
 	return true;
 }
 
+typedef struct xl_undo_tt_slot_commit_v2 {
+	xl_undo_tt_identity_v2 identity;
+	SCN commit_scn;
+} xl_undo_tt_slot_commit_v2;
+
+typedef struct xl_undo_tt_slot_set_head_v2 {
+	xl_undo_tt_identity_v2 identity;
+	UBA first_undo_block;
+} xl_undo_tt_slot_set_head_v2;
+
+StaticAssertDecl(sizeof(xl_undo_tt_slot_commit_v2) == 40
+				 && offsetof(xl_undo_tt_slot_commit_v2, identity) == 0
+				 && offsetof(xl_undo_tt_slot_commit_v2, commit_scn) == 32,
+				 "TT V2 standalone commit is a 32-byte identity followed by SCN");
+StaticAssertDecl(sizeof(xl_undo_tt_slot_set_head_v2) == 48
+				 && offsetof(xl_undo_tt_slot_set_head_v2, identity) == 0
+				 && offsetof(xl_undo_tt_slot_set_head_v2, first_undo_block) == 32,
+				 "TT V2 top-only head is a 32-byte identity followed by UBA");
+
+static inline bool
+cluster_undo_tt_commit_v2_decode(const void *payload, Size length,
+								 xl_undo_tt_slot_commit_v2 *out)
+{
+	xl_undo_tt_slot_commit_v2 rec;
+
+	if (payload == NULL || out == NULL || length != sizeof(rec))
+		return false;
+	memcpy(&rec, payload, sizeof(rec));
+	if (!cluster_undo_tt_bind_v2_decode(&rec.identity, sizeof(rec.identity), &rec.identity)
+		|| !SCN_VALID(rec.commit_scn) || rec.commit_scn == UINT64_MAX)
+		return false;
+	*out = rec;
+	return true;
+}
+
+static inline bool
+cluster_undo_tt_set_head_v2_decode(const void *payload, Size length,
+								   xl_undo_tt_slot_set_head_v2 *out)
+{
+	xl_undo_tt_slot_set_head_v2 rec;
+
+	if (payload == NULL || out == NULL || length != sizeof(rec))
+		return false;
+	memcpy(&rec, payload, sizeof(rec));
+	if (!cluster_undo_tt_bind_v2_decode(&rec.identity, sizeof(rec.identity), &rec.identity))
+		return false;
+	*out = rec;
+	return true;
+}
+
 /*
  * On-disk WAL payload for XLOG_HW_RESERVE (spec-5.7a D1, §3.1a M1c).
  *
@@ -503,6 +553,83 @@ cluster_undo_tt_ctrc_release_decode(const uint8 bytes[CLUSTER_UNDO_TT_CTRC_RELEA
 	if (!cluster_undo_tt_ctrc_release_valid(&record))
 		return false;
 	*record_out = record;
+	return true;
+}
+
+/* V2 retains the original field-coded offsets and appends the exact FullXid.
+ * The nested V1 type describes those fields; its version is explicitly 2 here. */
+#define CLUSTER_UNDO_TT_CTRC_RELEASE_V2_VERSION UINT8_C(2)
+#define CLUSTER_UNDO_TT_CTRC_RELEASE_V2_BYTES 104
+
+typedef struct xl_undo_tt_slot_ctrc_release_v2 {
+	xl_undo_tt_slot_ctrc_release_v1 release;
+	uint64 original_full_xid;
+} xl_undo_tt_slot_ctrc_release_v2;
+
+StaticAssertDecl(sizeof(xl_undo_tt_slot_ctrc_release_v2) == 104
+				 && offsetof(xl_undo_tt_slot_ctrc_release_v2, release) == 0
+				 && offsetof(xl_undo_tt_slot_ctrc_release_v1, format_version) == 94
+				 && offsetof(xl_undo_tt_slot_ctrc_release_v2, original_full_xid) == 96,
+				 "TT V2 release version and FullXid must be at bytes 94 and 96");
+
+static inline bool
+cluster_undo_tt_ctrc_release_v2_valid(const xl_undo_tt_slot_ctrc_release_v2 *record)
+{
+	xl_undo_tt_slot_ctrc_release_v1 fields;
+
+	if (record == NULL
+		|| record->release.format_version != CLUSTER_UNDO_TT_CTRC_RELEASE_V2_VERSION
+		|| record->original_full_xid == UINT64_MAX
+		|| (TransactionId)record->original_full_xid != record->release.xid)
+		return false;
+	fields = record->release;
+	fields.format_version = CLUSTER_UNDO_TT_CTRC_RELEASE_VERSION;
+	return cluster_undo_tt_ctrc_release_valid(&fields);
+}
+
+static inline bool
+cluster_undo_tt_ctrc_release_v2_encode(const xl_undo_tt_slot_ctrc_release_v2 *record,
+									 uint8 bytes[CLUSTER_UNDO_TT_CTRC_RELEASE_V2_BYTES])
+{
+	xl_undo_tt_slot_ctrc_release_v1 fields;
+
+	if (bytes != NULL)
+		memset(bytes, 0, CLUSTER_UNDO_TT_CTRC_RELEASE_V2_BYTES);
+	if (bytes == NULL || !cluster_undo_tt_ctrc_release_v2_valid(record))
+		return false;
+	fields = record->release;
+	fields.format_version = CLUSTER_UNDO_TT_CTRC_RELEASE_VERSION;
+	if (!cluster_undo_tt_ctrc_release_encode(&fields, bytes))
+		return false;
+	bytes[94] = CLUSTER_UNDO_TT_CTRC_RELEASE_V2_VERSION;
+	cluster_undo_tt_ctrc_put_u64_le(bytes + 96, record->original_full_xid);
+	return true;
+}
+
+static inline bool
+cluster_undo_tt_ctrc_release_v2_decode(const void *payload, Size length,
+									 xl_undo_tt_slot_ctrc_release_v2 *out)
+{
+	xl_undo_tt_slot_ctrc_release_v2 rec;
+	uint8 fields[CLUSTER_UNDO_TT_CTRC_RELEASE_BYTES];
+	const uint8 *bytes = (const uint8 *)payload;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (payload == NULL || out == NULL || length != CLUSTER_UNDO_TT_CTRC_RELEASE_V2_BYTES)
+		return false;
+	if (bytes[94] != CLUSTER_UNDO_TT_CTRC_RELEASE_V2_VERSION)
+		return false;
+	/* Reuse the original complete field validation without changing input. */
+	memcpy(fields, bytes, sizeof(fields));
+	fields[94] = CLUSTER_UNDO_TT_CTRC_RELEASE_VERSION;
+	if (!cluster_undo_tt_ctrc_release_decode(fields, &rec.release))
+		return false;
+	rec.release.format_version = CLUSTER_UNDO_TT_CTRC_RELEASE_V2_VERSION;
+	rec.original_full_xid = cluster_undo_tt_ctrc_get_u64_le(bytes + 96);
+	if (!cluster_undo_tt_ctrc_release_v2_valid(&rec))
+		return false;
+	*out = rec;
 	return true;
 }
 

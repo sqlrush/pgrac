@@ -133,6 +133,23 @@ cluster_undo_decode(XLogReaderState *record, ClusterUndoDecoded *out)
 	case CLUSTER_UNDO_KIND_TT_COMMIT: {
 		xl_undo_tt_slot_commit rec;
 
+		if (XLogRecGetDataLen(record) == sizeof(xl_undo_tt_slot_commit_v2)) {
+			xl_undo_tt_slot_commit_v2 v2;
+
+			if (!cluster_undo_tt_commit_v2_decode(XLogRecGetData(record),
+												XLogRecGetDataLen(record), &v2))
+				return false;
+			out->instance = v2.identity.instance;
+			out->segment_id = v2.identity.segment_id;
+			out->expected_generation = v2.identity.segment_generation;
+			out->slot_offset = v2.identity.slot_offset;
+			out->wrap = v2.identity.wrap;
+			out->xid = v2.identity.xid;
+			out->format_version = v2.identity.format_version;
+			out->original_full_xid = v2.identity.original_full_xid;
+			out->commit_scn = v2.commit_scn;
+			break;
+		}
 		if (XLogRecGetDataLen(record) != sizeof(rec))
 			return false; /* malformed: BLOCKED (U-SIDE-04) */
 		memcpy(&rec, XLogRecGetData(record), sizeof(rec));
@@ -147,7 +164,21 @@ cluster_undo_decode(XLogReaderState *record, ClusterUndoDecoded *out)
 		break;
 	}
 	case CLUSTER_UNDO_KIND_TT_ABORT: {
-		if (XLogRecGetDataLen(record) == sizeof(xl_undo_tt_slot_abort_exact)) {
+		if (XLogRecGetDataLen(record) == sizeof(xl_undo_tt_identity_v2)) {
+			xl_undo_tt_identity_v2 v2;
+
+			if (!cluster_undo_tt_bind_v2_decode(XLogRecGetData(record),
+											  XLogRecGetDataLen(record), &v2))
+				return false;
+			out->instance = v2.instance;
+			out->segment_id = v2.segment_id;
+			out->expected_generation = v2.segment_generation;
+			out->slot_offset = v2.slot_offset;
+			out->wrap = v2.wrap;
+			out->xid = v2.xid;
+			out->format_version = v2.format_version;
+			out->original_full_xid = v2.original_full_xid;
+		} else if (XLogRecGetDataLen(record) == sizeof(xl_undo_tt_slot_abort_exact)) {
 			xl_undo_tt_slot_abort_exact rec;
 
 			memcpy(&rec, XLogRecGetData(record), sizeof(rec));
@@ -181,6 +212,23 @@ cluster_undo_decode(XLogReaderState *record, ClusterUndoDecoded *out)
 	case CLUSTER_UNDO_KIND_TT_SET_HEAD: {
 		xl_undo_tt_slot_set_head rec;
 
+		if (XLogRecGetDataLen(record) == sizeof(xl_undo_tt_slot_set_head_v2)) {
+			xl_undo_tt_slot_set_head_v2 v2;
+
+			if (!cluster_undo_tt_set_head_v2_decode(XLogRecGetData(record),
+												  XLogRecGetDataLen(record), &v2))
+				return false;
+			out->instance = v2.identity.instance;
+			out->segment_id = v2.identity.segment_id;
+			out->expected_generation = v2.identity.segment_generation;
+			out->slot_offset = v2.identity.slot_offset;
+			out->wrap = v2.identity.wrap;
+			out->xid = v2.identity.xid;
+			out->format_version = v2.identity.format_version;
+			out->original_full_xid = v2.identity.original_full_xid;
+			out->first_undo_block = v2.first_undo_block;
+			break;
+		}
 		if (XLogRecGetDataLen(record) != sizeof(rec))
 			return false;
 		memcpy(&rec, XLogRecGetData(record), sizeof(rec));
@@ -197,7 +245,15 @@ cluster_undo_decode(XLogReaderState *record, ClusterUndoDecoded *out)
 	case CLUSTER_UNDO_KIND_TT_CTRC_RELEASE: {
 		xl_undo_tt_slot_ctrc_release_v1 rec;
 
-		if (XLogRecGetDataLen(record) != CLUSTER_UNDO_TT_CTRC_RELEASE_BYTES
+		if (XLogRecGetDataLen(record) == CLUSTER_UNDO_TT_CTRC_RELEASE_V2_BYTES) {
+			xl_undo_tt_slot_ctrc_release_v2 v2;
+
+			if (!cluster_undo_tt_ctrc_release_v2_decode(XLogRecGetData(record),
+													  XLogRecGetDataLen(record), &v2))
+				return false;
+			rec = v2.release;
+			out->original_full_xid = v2.original_full_xid;
+		} else if (XLogRecGetDataLen(record) != CLUSTER_UNDO_TT_CTRC_RELEASE_BYTES
 			|| !cluster_undo_tt_ctrc_release_decode((const uint8 *)XLogRecGetData(record), &rec))
 			return false;
 		out->instance = rec.owner_instance;
@@ -362,6 +418,16 @@ cluster_undo_preflight_for_use(const ClusterUndoDecoded *decoded, bool pi_inspec
 	uint16 opcode;
 
 	if (decoded == NULL || decoded->kind == CLUSTER_UNDO_KIND_UNKNOWN)
+		return false;
+	/* Staged V2 readers must not feed raw-only TT32 mutation/inspection.
+	 * Also reject a caller relabelling a retained full identity as legacy. */
+	if ((decoded->kind == CLUSTER_UNDO_KIND_TT_BIND
+		 || decoded->kind == CLUSTER_UNDO_KIND_TT_COMMIT
+		 || decoded->kind == CLUSTER_UNDO_KIND_TT_ABORT
+		 || decoded->kind == CLUSTER_UNDO_KIND_TT_SET_HEAD
+		 || decoded->kind == CLUSTER_UNDO_KIND_TT_CTRC_RELEASE)
+		&& (decoded->format_version == CLUSTER_UNDO_TT_IDENTITY_V2_VERSION
+			|| decoded->original_full_xid != 0))
 		return false;
 
 	/* §2.1-2 route: the D-SIDE-01 registry is the single judgement.

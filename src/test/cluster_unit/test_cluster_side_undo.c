@@ -299,6 +299,369 @@ make_bind_v2_payload(uint8 payload[32], uint64 full_xid)
 	memcpy(payload + 24, &full_xid, sizeof(full_xid));
 }
 
+UT_TEST(test_decode_tt_commit_v2_preserves_complete_identity)
+{
+	const uint64 fulls[] = { 1234, (UINT64_C(7) << 32) | 1234 };
+	FakeRecord fr;
+	uint8 bytes[41];
+	ClusterUndoDecoded out;
+	SCN scn = 901;
+
+	for (Size i = 0; i < lengthof(fulls); i++) {
+		make_bind_v2_payload(bytes + 1, fulls[i]);
+		memcpy(bytes + 33, &scn, sizeof(scn));
+		UT_ASSERT(cluster_undo_decode(make_record(&fr, RM_CLUSTER_UNDO_ID,
+			XLOG_UNDO_TT_SLOT_COMMIT, bytes + 1, 40), &out));
+		UT_ASSERT_EQ(out.format_version, 2);
+		UT_ASSERT_EQ(out.expected_generation, 9);
+		UT_ASSERT_EQ(out.original_full_xid, fulls[i]);
+		UT_ASSERT_EQ(out.xid, 1234);
+		UT_ASSERT_EQ(out.commit_scn, scn);
+		UT_ASSERT(!cluster_undo_preflight(&out));
+		UT_ASSERT(!cluster_undo_inspect_pi(&out));
+	}
+}
+
+UT_TEST(test_decode_tt_abort_v2_preserves_complete_identity)
+{
+	const uint64 fulls[] = { 1234, (UINT64_C(7) << 32) | 1234 };
+	FakeRecord fr;
+	uint8 bytes[33];
+	ClusterUndoDecoded out;
+
+	for (Size i = 0; i < lengthof(fulls); i++) {
+		make_bind_v2_payload(bytes + 1, fulls[i]);
+		UT_ASSERT(cluster_undo_decode(make_record(&fr, RM_CLUSTER_UNDO_ID,
+			XLOG_UNDO_TT_SLOT_ABORT, bytes + 1, 32), &out));
+		UT_ASSERT_EQ(out.format_version, 2);
+		UT_ASSERT_EQ(out.expected_generation, 9);
+		UT_ASSERT_EQ(out.original_full_xid, fulls[i]);
+		UT_ASSERT_EQ(out.xid, 1234);
+		UT_ASSERT_EQ(out.commit_scn, InvalidScn);
+		UT_ASSERT(!cluster_undo_preflight(&out));
+		UT_ASSERT(!cluster_undo_inspect_pi(&out));
+	}
+}
+
+UT_TEST(test_decode_tt_head_v2_preserves_complete_identity)
+{
+	const uint64 fulls[] = { 1234, (UINT64_C(7) << 32) | 1234 };
+	FakeRecord fr;
+	uint8 bytes[49];
+	ClusterUndoDecoded out;
+	UBA head = InvalidUba_init;
+
+	head.raw[0] = 7 | (UINT64_C(9) << 32);
+	head.raw[1] = 3;
+	for (Size i = 0; i < lengthof(fulls); i++) {
+		make_bind_v2_payload(bytes + 1, fulls[i]);
+		memcpy(bytes + 33, &head, sizeof(head));
+		UT_ASSERT(cluster_undo_decode(make_record(&fr, RM_CLUSTER_UNDO_ID,
+			XLOG_UNDO_TT_SLOT_SET_HEAD, bytes + 1, 48), &out));
+		UT_ASSERT_EQ(out.format_version, 2);
+		UT_ASSERT_EQ(out.expected_generation, 9);
+		UT_ASSERT_EQ(out.original_full_xid, fulls[i]);
+		UT_ASSERT_EQ(out.xid, 1234);
+		UT_ASSERT_EQ(memcmp(&out.first_undo_block, &head, sizeof(head)), 0);
+		UT_ASSERT(!cluster_undo_preflight(&out));
+		UT_ASSERT(!cluster_undo_inspect_pi(&out));
+	}
+}
+
+static void
+make_release_v2_payload(uint8 bytes[104], uint64 full)
+{
+	xl_undo_tt_slot_ctrc_release_v1 legacy = { 0 };
+
+	legacy.segment_id = 7;
+	legacy.segment_generation = 9;
+	legacy.xid = 1234;
+	legacy.cluster_epoch = 11;
+	legacy.root_id = 12;
+	legacy.root_generation = 13;
+	legacy.formation_epoch = 14;
+	legacy.admission_record_generation = 15;
+	legacy.seal_generation = 16;
+	legacy.touched_nodes_low = 1;
+	memset(legacy.ack_set_digest, 0x5a, sizeof(legacy.ack_set_digest));
+	legacy.slot_offset = 3;
+	legacy.slot_wrap = 0;
+	legacy.owner_instance = 1;
+	legacy.terminal_status = TT_SLOT_COMMITTED;
+	legacy.format_version = CLUSTER_UNDO_TT_CTRC_RELEASE_VERSION;
+	legacy.flags = CLUSTER_UNDO_TT_CTRC_RELEASE_ALL_TOUCHED_ACKED;
+	if (!cluster_undo_tt_ctrc_release_encode(&legacy, bytes))
+		abort();
+	bytes[94] = 2;
+	cluster_undo_tt_ctrc_put_u64_le(bytes + 96, full);
+}
+
+UT_TEST(test_decode_tt_release_v2_preserves_complete_identity)
+{
+	const uint64 fulls[] = { 1234, (UINT64_C(7) << 32) | 1234 };
+	FakeRecord fr;
+	uint8 bytes[105];
+	ClusterUndoDecoded out;
+
+	for (Size i = 0; i < lengthof(fulls); i++) {
+		make_release_v2_payload(bytes + 1, fulls[i]);
+		UT_ASSERT(cluster_undo_decode(make_record(&fr, RM_CLUSTER_UNDO_ID,
+			XLOG_UNDO_TT_SLOT_CTRC_RELEASE, bytes + 1, 104), &out));
+		UT_ASSERT_EQ(out.format_version, 2);
+		UT_ASSERT_EQ(out.expected_generation, 9);
+		UT_ASSERT_EQ(out.original_full_xid, fulls[i]);
+		UT_ASSERT_EQ(out.xid, 1234);
+		UT_ASSERT_EQ(out.seal_generation, 16);
+		UT_ASSERT_EQ(out.root_id, 12);
+		UT_ASSERT_EQ(out.ack_set_digest[0], 0x5a);
+		UT_ASSERT(!cluster_undo_preflight(&out));
+		UT_ASSERT(!cluster_undo_inspect_pi(&out));
+	}
+}
+
+static Size
+make_terminal_v2_payload(uint8 opcode, uint8 bytes[105], uint64 full)
+{
+	SCN scn = 901;
+	UBA head = InvalidUba_init;
+
+	memset(bytes, 0, 105);
+	if (opcode == XLOG_UNDO_TT_SLOT_CTRC_RELEASE) {
+		make_release_v2_payload(bytes, full);
+		return 104;
+	}
+	make_bind_v2_payload(bytes, full);
+	if (opcode == XLOG_UNDO_TT_SLOT_COMMIT) {
+		memcpy(bytes + 32, &scn, sizeof(scn));
+		return 40;
+	}
+	if (opcode == XLOG_UNDO_TT_SLOT_ABORT)
+		return 32;
+	head.raw[0] = 7 | (UINT64_C(9) << 32);
+	head.raw[1] = 3;
+	memcpy(bytes + 32, &head, sizeof(head));
+	return 48;
+}
+
+UT_TEST(test_terminal_v2_rejects_malformed_versions_lengths_and_identity)
+{
+	const uint8 opcodes[] = { XLOG_UNDO_TT_SLOT_COMMIT, XLOG_UNDO_TT_SLOT_ABORT,
+		XLOG_UNDO_TT_SLOT_SET_HEAD, XLOG_UNDO_TT_SLOT_CTRC_RELEASE };
+	const uint64 invalid_fulls[] = { 0, 1, 2, UINT64_MAX, (UINT64_C(7) << 32) | 1235,
+		(UINT64_C(7) << 32), (UINT64_C(7) << 32) | 1, (UINT64_C(7) << 32) | 2 };
+	const uint8 bad_versions[] = { 0, 1, 3, UINT8_MAX };
+	FakeRecord fr;
+	uint8 bytes[105];
+	ClusterUndoDecoded out;
+
+	for (Size c = 0; c < lengthof(opcodes); c++) {
+		Size len = make_terminal_v2_payload(opcodes[c], bytes, 1234);
+		Size full_offset = c == 3 ? 96 : 24;
+		Size version_offset = c == 3 ? 94 : 17;
+		Size lengths[] = { 0, 1, len - 1, len + 1 };
+
+		for (Size i = 0; i < lengthof(lengths); i++)
+			UT_ASSERT(!cluster_undo_decode(make_record(&fr, RM_CLUSTER_UNDO_ID,
+				opcodes[c], bytes, lengths[i]), &out));
+		for (Size i = 0; i < lengthof(bad_versions); i++) {
+			make_terminal_v2_payload(opcodes[c], bytes, 1234);
+			bytes[version_offset] = bad_versions[i];
+			UT_ASSERT(!cluster_undo_decode(make_record(&fr, RM_CLUSTER_UNDO_ID,
+				opcodes[c], bytes, len), &out));
+		}
+		for (Size i = 0; i < lengthof(invalid_fulls); i++) {
+			make_terminal_v2_payload(opcodes[c], bytes, 1234);
+			if (c == 3)
+				cluster_undo_tt_ctrc_put_u64_le(bytes + full_offset, invalid_fulls[i]);
+			else
+				memcpy(bytes + full_offset, &invalid_fulls[i], sizeof(uint64));
+			UT_ASSERT(!cluster_undo_decode(make_record(&fr, RM_CLUSTER_UNDO_ID,
+				opcodes[c], bytes, len), &out));
+		}
+		/* Every flags/reserved byte in the common prefix is validated. */
+		for (Size byte = 18; c != 3 && byte < 24; byte++) {
+			make_terminal_v2_payload(opcodes[c], bytes, 1234);
+			bytes[byte] = 1;
+			UT_ASSERT(!cluster_undo_decode(make_record(&fr, RM_CLUSTER_UNDO_ID,
+				opcodes[c], bytes, len), &out));
+		}
+		make_terminal_v2_payload(opcodes[c], bytes, (UINT64_C(7) << 32) | 1234);
+		make_record(&fr, RM_CLUSTER_UNDO_ID, opcodes[c], bytes, len);
+		memmove(fr.data + 1, fr.data, len);
+		fr.u.dec.main_data++;
+		UT_ASSERT(cluster_undo_decode(&fr.st, &out));
+		UT_ASSERT_EQ(out.original_full_xid, (UINT64_C(7) << 32) | 1234);
+	}
+	/* COMMIT must carry a finite SCN; ordinary HEAD cannot accept operation flags/tail. */
+	for (Size i = 0; i < 2; i++) {
+		SCN bad = i == 0 ? InvalidScn : UINT64_MAX;
+
+		make_terminal_v2_payload(XLOG_UNDO_TT_SLOT_COMMIT, bytes, 1234);
+		memcpy(bytes + 32, &bad, sizeof(bad));
+		UT_ASSERT(!cluster_undo_decode(make_record(&fr, RM_CLUSTER_UNDO_ID,
+			XLOG_UNDO_TT_SLOT_COMMIT, bytes, 40), &out));
+	}
+	make_terminal_v2_payload(XLOG_UNDO_TT_SLOT_SET_HEAD, bytes, 1234);
+	UT_ASSERT(!cluster_undo_decode(make_record(&fr, RM_CLUSTER_UNDO_ID,
+		XLOG_UNDO_TT_SLOT_SET_HEAD, bytes, 96), &out));
+}
+
+UT_TEST(test_terminal_v2_never_reaches_legacy_target_apply_or_header)
+{
+	const uint8 opcodes[] = { XLOG_UNDO_TT_SLOT_COMMIT, XLOG_UNDO_TT_SLOT_ABORT,
+		XLOG_UNDO_TT_SLOT_SET_HEAD, XLOG_UNDO_TT_SLOT_CTRC_RELEASE };
+	FakeRecord fr;
+	uint8 bytes[105];
+	ClusterUndoDecoded out;
+	PGAlignedBlock base, prepared;
+	TTSlot before;
+
+	for (Size c = 0; c < lengthof(opcodes); c++) {
+		Size len = make_terminal_v2_payload(opcodes[c], bytes, (UINT64_C(7) << 32) | 1234);
+
+		UT_ASSERT(cluster_undo_decode(make_record(&fr, RM_CLUSTER_UNDO_ID,
+			opcodes[c], bytes, len), &out));
+		memset(&apply_slot, 0, sizeof(apply_slot));
+		apply_slot.xid = 1234;
+		apply_slot.status = TT_SLOT_ACTIVE;
+		before = apply_slot;
+		apply_read_calls = 0;
+		for (Size relabel = 0; relabel < 2; relabel++) {
+			if (relabel)
+				out.format_version = c < 3 ? 0 : CLUSTER_UNDO_TT_CTRC_RELEASE_VERSION;
+			memset(base.data, 0, BLCKSZ);
+			memset(prepared.data, 0x5a, BLCKSZ);
+			UT_ASSERT(!cluster_undo_preflight(&out));
+			UT_ASSERT(!cluster_undo_inspect_pi(&out));
+			UT_ASSERT_EQ(cluster_undo_preflight_tt_target_v1(&out), CLUSTER_UNDO_TARGET_BLOCKED);
+			UT_ASSERT_EQ(cluster_undo_preflight_legacy_slot_v1(&out, &apply_slot),
+				CLUSTER_UNDO_TARGET_BLOCKED);
+			UT_ASSERT_EQ(cluster_undo_apply_tt_v1(&out), CLUSTER_UNDO_APPLY_BLOCKED);
+			UT_ASSERT_EQ(cluster_undo_prepare_header_v1(&out, NULL, 0, base.data, prepared.data),
+				CLUSTER_UNDO_HEADER_BLOCKED);
+			UT_ASSERT_EQ(apply_read_calls, 0);
+			UT_ASSERT_EQ(memcmp(&apply_slot, &before, sizeof(before)), 0);
+			for (Size i = 0; i < BLCKSZ; i++)
+				UT_ASSERT_EQ((uint8)prepared.data[i], 0x5a);
+		}
+	}
+}
+
+UT_TEST(test_release_v2_codec_preserves_original_fields_and_rejects_bad_inputs)
+{
+	uint8 bytes[105], encoded[104], before[104];
+	xl_undo_tt_slot_ctrc_release_v2 decoded, saved;
+	const Size wrong_lengths[] = { 0, 95, 96, 103, 105 };
+	const Size invalid_bytes[] = { 8, 64, 89, 92, 93, 94, 95, 96 };
+	const Size required_u64_offsets[] = { 16, 24, 40, 48 };
+
+	make_release_v2_payload(bytes, (UINT64_C(7) << 32) | 1234);
+	memcpy(before, bytes, sizeof(before));
+	UT_ASSERT(cluster_undo_tt_ctrc_release_v2_decode(bytes, 104, &decoded));
+	saved = decoded;
+	UT_ASSERT(cluster_undo_tt_ctrc_release_v2_encode(&decoded, encoded));
+	UT_ASSERT_EQ(memcmp(encoded, before, sizeof(before)), 0);
+	UT_ASSERT_EQ(memcmp(bytes, before, sizeof(before)), 0);
+	UT_ASSERT_EQ(sizeof(decoded), 104);
+	UT_ASSERT_EQ(offsetof(xl_undo_tt_slot_ctrc_release_v2, original_full_xid), 96);
+	UT_ASSERT_EQ(decoded.release.format_version, 2);
+	for (Size i = 0; i < lengthof(wrong_lengths); i++) {
+		memset(&decoded, 0x5a, sizeof(decoded));
+		UT_ASSERT(!cluster_undo_tt_ctrc_release_v2_decode(bytes, wrong_lengths[i], &decoded));
+		UT_ASSERT_EQ(memcmp(&decoded, &(xl_undo_tt_slot_ctrc_release_v2){ 0 }, sizeof(decoded)), 0);
+	}
+	for (Size i = 0; i < lengthof(invalid_bytes); i++) {
+		memcpy(bytes, before, sizeof(before));
+		bytes[invalid_bytes[i]] ^= 0xff;
+		UT_ASSERT(!cluster_undo_tt_ctrc_release_v2_decode(bytes, 104, &decoded));
+		UT_ASSERT_EQ(memcmp(&decoded, &(xl_undo_tt_slot_ctrc_release_v2){ 0 }, sizeof(decoded)), 0);
+	}
+	for (Size i = 0; i < lengthof(required_u64_offsets); i++) {
+		memcpy(bytes, before, sizeof(before));
+		memset(bytes + required_u64_offsets[i], 0, sizeof(uint64));
+		UT_ASSERT(!cluster_undo_tt_ctrc_release_v2_decode(bytes, 104, &decoded));
+		UT_ASSERT_EQ(memcmp(&decoded, &(xl_undo_tt_slot_ctrc_release_v2){ 0 }, sizeof(decoded)), 0);
+	}
+	UT_ASSERT(!cluster_undo_tt_ctrc_release_v2_decode(NULL, 104, &decoded));
+	UT_ASSERT(!cluster_undo_tt_ctrc_release_v2_decode(before, 104, NULL));
+	decoded = saved;
+	decoded.original_full_xid++;
+	memset(encoded, 0x5a, sizeof(encoded));
+	UT_ASSERT(!cluster_undo_tt_ctrc_release_v2_encode(&decoded, encoded));
+	UT_ASSERT_EQ(memcmp(encoded, (uint8[104]){ 0 }, sizeof(encoded)), 0);
+	UT_ASSERT(!cluster_undo_tt_ctrc_release_v2_encode(NULL, encoded));
+	UT_ASSERT(!cluster_undo_tt_ctrc_release_v2_encode(&saved, NULL));
+}
+
+UT_TEST(test_terminal_v2_descriptors_keep_exact_full_identity)
+{
+	const uint8 opcodes[] = { XLOG_UNDO_TT_SLOT_COMMIT, XLOG_UNDO_TT_SLOT_ABORT,
+		XLOG_UNDO_TT_SLOT_SET_HEAD, XLOG_UNDO_TT_SLOT_CTRC_RELEASE };
+	const uint64 fulls[] = { 1234, (UINT64_C(7) << 32) | 1234 };
+	FakeRecord fr;
+	uint8 bytes[105];
+	char text[512], expected[64];
+	StringInfoData buf = { .data = text, .maxlen = sizeof(text) };
+
+	for (Size c = 0; c < lengthof(opcodes); c++) {
+		Size len = 0;
+
+		for (Size i = 0; i < lengthof(fulls); i++) {
+			len = make_terminal_v2_payload(opcodes[c], bytes, fulls[i]);
+			resetStringInfo(&buf);
+			cluster_undo_desc(&buf, make_record(&fr, RM_CLUSTER_UNDO_ID, opcodes[c], bytes, len));
+			snprintf(expected, sizeof(expected), "original_full_xid " UINT64_FORMAT, fulls[i]);
+			UT_ASSERT(strstr(text, expected) != NULL);
+			UT_ASSERT(strstr(text, "v2)") != NULL);
+			UT_ASSERT(strstr(text, "generation 9") != NULL);
+		}
+		bytes[c == 3 ? 94 : 17] = 3;
+		resetStringInfo(&buf);
+		cluster_undo_desc(&buf, make_record(&fr, RM_CLUSTER_UNDO_ID, opcodes[c], bytes, len));
+		UT_ASSERT(strstr(text, "malformed") != NULL);
+		UT_ASSERT(strstr(text, "original_full_xid") == NULL);
+		resetStringInfo(&buf);
+		cluster_undo_desc(&buf, make_record(&fr, RM_CLUSTER_UNDO_ID, opcodes[c], bytes, len - 1));
+		UT_ASSERT(strstr(text, "malformed") != NULL);
+	}
+}
+
+UT_TEST(test_legacy_terminal_descriptions_remain_legacy)
+{
+	FakeRecord fr;
+	xl_undo_tt_slot_commit commit = { 0 };
+	xl_undo_tt_slot_abort abort_record = { 0 };
+	xl_undo_tt_slot_set_head head = { 0 };
+	uint8 bytes[104];
+	char text[512];
+	StringInfoData buf = { .data = text, .maxlen = sizeof(text) };
+
+	commit.instance = abort_record.instance = head.instance = 1;
+	commit.segment_id = abort_record.segment_id = head.segment_id = 7;
+	commit.slot_offset = abort_record.slot_offset = head.slot_offset = 3;
+	commit.wrap = abort_record.wrap = head.wrap = 5;
+	commit.xid = abort_record.xid = head.xid = 1234;
+	commit.commit_scn = 901;
+	resetStringInfo(&buf);
+	cluster_undo_desc(&buf, make_record(&fr, RM_CLUSTER_UNDO_ID,
+		XLOG_UNDO_TT_SLOT_COMMIT, &commit, sizeof(commit)));
+	UT_ASSERT(strcmp(text, "instance 1 segment 7 slot 3 wrap 5 xid 1234 commit_scn 901") == 0);
+	resetStringInfo(&buf);
+	cluster_undo_desc(&buf, make_record(&fr, RM_CLUSTER_UNDO_ID,
+		XLOG_UNDO_TT_SLOT_ABORT, &abort_record, sizeof(abort_record)));
+	UT_ASSERT(strcmp(text, "instance 1 seg 7 slot 3 wrap 5 xid 1234 (prepared abort)") == 0);
+	resetStringInfo(&buf);
+	cluster_undo_desc(&buf, make_record(&fr, RM_CLUSTER_UNDO_ID,
+		XLOG_UNDO_TT_SLOT_SET_HEAD, &head, sizeof(head)));
+	UT_ASSERT(strcmp(text, "instance 1 seg 7 slot 3 wrap 5 xid 1234 (set undo head)") == 0);
+	make_release_v2_payload(bytes, 1234);
+	bytes[94] = CLUSTER_UNDO_TT_CTRC_RELEASE_VERSION;
+	resetStringInfo(&buf);
+	cluster_undo_desc(&buf, make_record(&fr, RM_CLUSTER_UNDO_ID,
+		XLOG_UNDO_TT_SLOT_CTRC_RELEASE, bytes, 96));
+	UT_ASSERT(strcmp(text, "instance 1 seg 7 generation 9 slot 3 wrap 0 xid 1234 terminal 2 seal 16 touched 1") == 0);
+}
+
 UT_TEST(test_decode_tt_bind_v2_preserves_epoch_zero_and_original_epoch)
 {
 	const uint64 full_xids[] = { UINT64_C(1234), (UINT64_C(7) << 32) | 1234 };
@@ -841,10 +1204,19 @@ UT_TEST(test_overlapping_undo_record_and_slot_ranges_refuse)
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(24);
 
 	UT_RUN(test_decode_tt_commit_fields);
 	UT_RUN(test_decode_tt_bind_exact_shape_and_reserved_bytes);
+	UT_RUN(test_decode_tt_commit_v2_preserves_complete_identity);
+	UT_RUN(test_decode_tt_abort_v2_preserves_complete_identity);
+	UT_RUN(test_decode_tt_head_v2_preserves_complete_identity);
+	UT_RUN(test_decode_tt_release_v2_preserves_complete_identity);
+	UT_RUN(test_terminal_v2_rejects_malformed_versions_lengths_and_identity);
+	UT_RUN(test_terminal_v2_never_reaches_legacy_target_apply_or_header);
+	UT_RUN(test_release_v2_codec_preserves_original_fields_and_rejects_bad_inputs);
+	UT_RUN(test_terminal_v2_descriptors_keep_exact_full_identity);
+	UT_RUN(test_legacy_terminal_descriptions_remain_legacy);
 	UT_RUN(test_decode_tt_bind_v2_preserves_epoch_zero_and_original_epoch);
 	UT_RUN(test_decode_tt_bind_v2_rejects_unknown_shape_and_raw_identity);
 	UT_RUN(test_tt_bind_v2_stays_closed_before_any_legacy_mutation);
