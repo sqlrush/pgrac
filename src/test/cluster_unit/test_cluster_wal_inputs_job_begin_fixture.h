@@ -132,6 +132,7 @@ cluster_wal_claim_v2_encode(const ClusterWalThreadClaimV2 *claim,
 {
 	(void)claim; (void)bytes; abort();
 }
+#ifndef PGRAC_WAL_INPUTS_REAL_CUT
 ClusterControlRootResult
 cluster_wal_cut_begin_v1(const ClusterWalSourceRef *source, ClusterWalCutV1 **out)
 {
@@ -142,6 +143,16 @@ cluster_wal_cut_poll_v1(ClusterWalCutV1 *cut, ClusterWalWriterFlushV1 *out)
 {
 	(void)cut; (void)out; abort();
 }
+#endif
+
+#include "postmaster/interrupt.h"
+#ifndef PGRAC_WAL_INPUTS_REAL_CUT
+volatile sig_atomic_t ShutdownRequestPending;
+#endif
+/* Local native writer I/O is outside this remote collector fixture. */
+ClusterControlRootResult
+cluster_wal_inputs_prepare_live_local_v1(ClusterWalInputsV1 *inputs, uint32 index, XLogRecPtr *end)
+{ (void)inputs; (void)index; (void)end; abort(); }
 
 #include "test_cluster_wal_inputs_job_begin_bodies.inc"
 

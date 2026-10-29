@@ -108,7 +108,10 @@ extern bool cluster_wal_inputs_scope_job_binding_v1(ClusterWalInputsJobV1 *job);
 extern bool cluster_wal_inputs_scope_job_revoke_v1(ClusterWalInputsJobV1 *job);
 extern bool cluster_wal_inputs_scope_job_drained_v1(ClusterWalInputsJobV1 *job);
 extern bool cluster_wal_inputs_scope_job_forget_v1(ClusterWalInputsJobV1 *job);
+extern bool cluster_wal_inputs_scope_job_suspended_v1(ClusterWalInputsJobV1 *job);
 extern ClusterWalReadPinV1 **cluster_wal_inputs_scope_job_pin_slot_v1(ClusterWalInputsJobV1 *job);
+extern ClusterWalrReleaseResult cluster_wal_read_pin_suspend_job_v1(
+	ClusterWalReadPinV1 **pin, ClusterWalInputsJobV1 *job);
 
 /* Surround exactly one original synchronous CF S call. The sequence is a
  * stack-local observation, never permission or a token retained across yield.
@@ -126,6 +129,9 @@ extern bool cluster_wal_inputs_job_begin_outcome_v1(ClusterWalInputsJobV1 *job,
 	uint32 result, bool error);
 extern ClusterControlRootResult cluster_wal_inputs_job_revalidate_prepare_v1(
 	ClusterWalInputsJobV1 *job, ClusterWalInputsV1 **scope);
+extern ClusterControlRootResult cluster_wal_inputs_job_lifecycle_prepare_v1(
+	ClusterWalInputsJobV1 *job, ClusterWalInputsV1 **scope, bool resume);
+extern bool cluster_wal_inputs_job_suspend_finish_v1(ClusterWalInputsJobV1 *job);
 
 StaticAssertDecl(CLUSTER_WAL_INPUT_JOB_COUNT == 4, "WAL input job slot count changed");
 StaticAssertDecl(CLUSTER_WAL_RETENTION_MAX_THREADS == 128, "WAL input member limit changed");

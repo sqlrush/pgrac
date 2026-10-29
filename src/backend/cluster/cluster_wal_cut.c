@@ -25,6 +25,7 @@
 #include "utils/resowner.h"
 #include "utils/timestamp.h"
 #include "cluster_wal_inputs_job_payload_private.h"
+#include "cluster_wal_cut_job_private.h"
 
 #define WAL_CUT_RETRY_US INT64CONST(100000)
 
@@ -329,15 +330,15 @@ cut_collector_procno(void)
 	return MyProc->pgprocno;
 }
 
-ClusterControlRootResult
-cluster_wal_cut_begin_v1(const ClusterWalSourceRef *source, ClusterWalCutV1 **out)
+static ClusterControlRootResult
+cut_begin(const ClusterWalSourceRef *source, MemoryContext context, ClusterWalCutV1 **out)
 {
 	ClusterWalCutMessageV1 request = { 0 };
 	ClusterWalCutV1 *cut;
 	int32 procno = cut_collector_procno();
 	bool acquired = false;
 	bool retained_read;
-	if (source == NULL || out == NULL || *out != NULL || !cut_background()
+	if (source == NULL || context == NULL || out == NULL || *out != NULL || !cut_background()
 		|| CurrentResourceOwner == NULL || cut_shared == NULL || procno < 0)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	/* Remote online cuts are a post-recovery consumer.  Do not create a
@@ -356,9 +357,9 @@ cluster_wal_cut_begin_v1(const ClusterWalSourceRef *source, ClusterWalCutV1 **ou
 	if (!pg_strong_random(&request.nonce, sizeof(request.nonce))
 		|| !cut_collector_current(&request, retained_read))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
-	/* The input scope keeps its ResourceOwner/current memory context alive.
-	 * Native ERROR cleanup releases that owner before resetting its context. */
-	cut = palloc0(sizeof(*cut));
+	/* Stable job callers select their allocation lifetime before publication;
+	 * this does not change the original ResourceOwner or request identity. */
+	cut = MemoryContextAllocZero(context, sizeof(*cut));
 	cut->pid = getpid();
 	cut->procno = procno;
 	cut->owner = CurrentResourceOwner;
@@ -387,6 +388,55 @@ cluster_wal_cut_begin_v1(const ClusterWalSourceRef *source, ClusterWalCutV1 **ou
 	*out = cut;
 	cluster_lmon_wakeup();
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+ClusterControlRootResult
+cluster_wal_cut_begin_v1(const ClusterWalSourceRef *source, ClusterWalCutV1 **out)
+{
+	return cut_begin(source, CurrentMemoryContext, out);
+}
+
+ClusterControlRootResult
+cluster_wal_cut_begin_in_context_v1(const ClusterWalSourceRef *source,
+	MemoryContext context, ClusterWalCutV1 **out)
+{
+	return cut_begin(source, context, out);
+}
+
+bool
+cluster_wal_cut_context_binding_v1(const ClusterWalCutV1 *cut, MemoryContext context,
+	ResourceOwner owner, int32 pid, const ClusterWalSourceRef *source)
+{
+	/* The scope retains this allocated chunk until its explicit final release.
+	 * This checks lifetime/identity, even after epoch loss or cancellation;
+	 * it is not a replacement for the original poll's currentness proof. */
+	return cut != NULL && (uintptr_t)cut % MAXIMUM_ALIGNOF == 0 && context != NULL
+		&& owner != NULL && owner == CurrentResourceOwner && pid > 0 && pid == getpid()
+		&& source != NULL && GetMemoryChunkContext((void *)cut) == context
+		&& cut->owner == owner && cut->pid == pid && cut->revision != 0
+		&& cut->procno >= 0 && MyProc != NULL && MyProc->pgprocno == cut->procno
+		&& cut_message_valid(&cut->requested)
+		&& memcmp(&cut->requested.source, source, sizeof(*source)) == 0;
+}
+
+bool
+cluster_wal_cut_cancel_in_context_v1(ClusterWalCutV1 *cut, MemoryContext context,
+	ResourceOwner owner, int32 pid, const ClusterWalSourceRef *source)
+{
+	if (!cluster_wal_cut_context_binding_v1(cut, context, owner, pid, source))
+		return false;
+	cut_cancel(cut);
+	return true;
+}
+
+bool
+cluster_wal_cut_release_in_context_v1(ClusterWalCutV1 **cut, MemoryContext context,
+	ResourceOwner owner, int32 pid, const ClusterWalSourceRef *source)
+{
+	if (cut == NULL || !cluster_wal_cut_context_binding_v1(*cut, context, owner, pid, source))
+		return false;
+	cluster_wal_cut_release_v1(cut);
+	return *cut == NULL;
 }
 
 ClusterControlRootResult

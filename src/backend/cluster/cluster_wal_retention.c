@@ -1492,15 +1492,18 @@ cluster_wal_read_pin_acquire_job_v1(const uint16 *threads, uint16 nthreads,
 }
 
 static ClusterWalrReleaseResult
-read_pin_job_release(ClusterWalReadPinV1 **out, ClusterWalInputsJobV1 *job, bool first)
+read_pin_job_release(ClusterWalReadPinV1 **out, ClusterWalInputsJobV1 *job, bool first, bool suspending)
 {
 	ClusterWalReadPinV1 *pin;
 	bool synchronous;
 
 	if (out == NULL || (pin = *out) == NULL || !read_pin_valid(pin) || pin->job != job
 		|| !cluster_wal_inputs_job_pin_matches_v1(job, pin, pin->generation, false)
-		|| job->state != WAL_INPUT_JOB_STATE_RETIRING_WALR
-		|| (job->flags & WAL_INPUT_JOB_FLAG_REVOKED) == 0
+		|| (suspending
+			? (job->state != WAL_INPUT_JOB_STATE_BUILDING || job->flags != 0 || pin->retiring
+				|| !cluster_wal_inputs_scope_job_suspended_v1(job))
+			: (job->state != WAL_INPUT_JOB_STATE_RETIRING_WALR
+				|| (job->flags & WAL_INPUT_JOB_FLAG_REVOKED) == 0))
 		|| (active_root_publish_guard != NULL && active_root_publish_guard->borrowed_from_read_pin))
 		return CLUSTER_WALR_RELEASE_INVALID;
 	synchronous = first && !pin->retiring;
@@ -1559,13 +1562,19 @@ read_pin_job_release(ClusterWalReadPinV1 **out, ClusterWalInputsJobV1 *job, bool
 ClusterWalrReleaseResult
 cluster_wal_read_pin_release_job_v1(ClusterWalReadPinV1 **pin, ClusterWalInputsJobV1 *job)
 {
-	return read_pin_job_release(pin, job, true);
+	return read_pin_job_release(pin, job, true, false);
 }
 
 ClusterWalrReleaseResult
 cluster_wal_read_pin_release_job_poll_v1(ClusterWalReadPinV1 **pin, ClusterWalInputsJobV1 *job)
 {
-	return read_pin_job_release(pin, job, false);
+	return read_pin_job_release(pin, job, false, false);
+}
+
+ClusterWalrReleaseResult
+cluster_wal_read_pin_suspend_job_v1(ClusterWalReadPinV1 **pin, ClusterWalInputsJobV1 *job)
+{
+	return read_pin_job_release(pin, job, true, true);
 }
 
 static bool

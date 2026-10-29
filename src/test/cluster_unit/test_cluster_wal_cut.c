@@ -31,6 +31,8 @@ int cluster_node_id, MyProcPid = 100;
 bool cluster_enabled = true, cluster_shared_config = true;
 ResourceOwner CurrentResourceOwner = (void *)1;
 MemoryContext TopMemoryContext = (void *)1;
+MemoryContext CurrentMemoryContext = (void *)1;
+static struct { void *pointer; MemoryContext context; } cut_allocations[256];
 static uint64 epoch = 17, incarnations[2] = { 31, 41 }, random_counter;
 static bool quorum = true, pending, native_ready = true;
 static bool flush_ready = true, stop_requested, flush_error;
@@ -115,7 +117,30 @@ palloc0(Size n)
 void
 pfree(void *p)
 {
+	for (unsigned i = 0; i < lengthof(cut_allocations); ++i)
+		if (cut_allocations[i].pointer == p)
+			cut_allocations[i].pointer = NULL;
 	free(p);
+}
+void *
+MemoryContextAllocZero(MemoryContext context, Size bytes)
+{
+	void *pointer = palloc0(bytes);
+	for (unsigned i = 0; i < lengthof(cut_allocations); ++i)
+		if (cut_allocations[i].pointer == NULL) {
+			cut_allocations[i].pointer = pointer;
+			cut_allocations[i].context = context;
+			return pointer;
+		}
+	abort();
+}
+MemoryContext
+GetMemoryChunkContext(void *pointer)
+{
+	for (unsigned i = 0; i < lengthof(cut_allocations); ++i)
+		if (cut_allocations[i].pointer == pointer)
+			return cut_allocations[i].context;
+	abort();
 }
 uint64
 GetSystemIdentifier(void)
@@ -270,7 +295,9 @@ cluster_wal_writer_flush_sample_v1(const ClusterWalWriterSampleV1 *sample,
 	return cluster_wal_writer_confirm_v1(sample, out);
 }
 
+#define getpid() MyProcPid
 #include "../../backend/cluster/cluster_wal_cut.c"
+#undef getpid
 
 static void
 select_node(int node)
@@ -881,13 +908,76 @@ UT_TEST(stop_unknown_source_state_is_never_empty)
  UT_ASSERT_EQ(cluster_wal_cut_normal_stop_poll_v1(&reason),CLUSTER_NORMAL_STOP_INVALID);
 }
 
+UT_TEST(stable_descriptor_uses_requested_context_and_exact_original_binding)
+{
+	ClusterWalCutV1 *cut = NULL;
+	MemoryContext context = (MemoryContext)2;
+	ClusterWalSourceRef wrong;
+	reset();
+	UT_ASSERT_EQ(cluster_wal_cut_begin_in_context_v1(&sources[1], context, &cut),
+		CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT(cluster_wal_cut_context_binding_v1(cut, context, CurrentResourceOwner, MyProcPid, &sources[1]));
+	UT_ASSERT(!cluster_wal_cut_context_binding_v1(cut, (MemoryContext)3, CurrentResourceOwner, MyProcPid, &sources[1]));
+	UT_ASSERT(!cluster_wal_cut_context_binding_v1(cut, context, (ResourceOwner)2, MyProcPid, &sources[1]));
+	UT_ASSERT(!cluster_wal_cut_context_binding_v1(cut, context, CurrentResourceOwner, MyProcPid + 1, &sources[1]));
+	wrong = sources[1];
+	++wrong.claim.identity.root_lineage_seq;
+	UT_ASSERT(!cluster_wal_cut_context_binding_v1(cut, context, CurrentResourceOwner, MyProcPid, &wrong));
+	UT_ASSERT(cluster_wal_cut_release_in_context_v1(&cut, context, CurrentResourceOwner, MyProcPid, &sources[1]));
+	UT_ASSERT(cut == NULL && active_cut == NULL && cut_shared->owner_pid == 0);
+}
+
+UT_TEST(stable_cancel_keeps_allocation_and_clears_original_completion_hint)
+{
+	ClusterWalCutV1 *cut = NULL;
+	MemoryContext context = (MemoryContext)2;
+	ClusterWalWriterFlushV1 sample;
+	reset();
+	UT_ASSERT_EQ(cluster_wal_cut_begin_in_context_v1(&sources[1], context, &cut), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	cut_shared->completion_pending = true;
+	UT_ASSERT(cluster_wal_cut_cancel_in_context_v1(cut, context, CurrentResourceOwner, MyProcPid, &sources[1]));
+	UT_ASSERT(cut->stale && active_cut == NULL);
+	UT_ASSERT(!cut_shared->completion_pending && cut_shared->owner_pid == 0);
+	UT_ASSERT(cluster_wal_cut_context_binding_v1(cut, context, CurrentResourceOwner, MyProcPid, &sources[1]));
+	UT_ASSERT_EQ(cluster_wal_cut_poll_v1(cut, &sample), CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+	UT_ASSERT(cluster_wal_cut_release_in_context_v1(&cut, context, CurrentResourceOwner, MyProcPid, &sources[1]));
+}
+
+UT_TEST(stable_owner_callback_cancels_without_dropping_descriptor)
+{
+	ClusterWalCutV1 *cut = NULL;
+	MemoryContext context = (MemoryContext)2;
+	reset();
+	UT_ASSERT_EQ(cluster_wal_cut_begin_in_context_v1(&sources[1], context, &cut), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+	UT_ASSERT(cut->stale && cut_shared->owner_pid == 0 && active_cut == NULL);
+	UT_ASSERT(cluster_wal_cut_context_binding_v1(cut, context, CurrentResourceOwner, MyProcPid, &sources[1]));
+	UT_ASSERT(cluster_wal_cut_release_in_context_v1(&cut, context, CurrentResourceOwner, MyProcPid, &sources[1]));
+}
+
+UT_TEST(stable_foreign_cleanup_does_not_cancel_or_free_original_request)
+{
+	ClusterWalCutV1 *cut = NULL;
+	MemoryContext context = (MemoryContext)2;
+	reset();
+	UT_ASSERT_EQ(cluster_wal_cut_begin_in_context_v1(&sources[1], context, &cut), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT(!cluster_wal_cut_cancel_in_context_v1(cut, (MemoryContext)3, CurrentResourceOwner, MyProcPid, &sources[1]));
+	UT_ASSERT(!cluster_wal_cut_release_in_context_v1(&cut, context, (ResourceOwner)2, MyProcPid, &sources[1]));
+	UT_ASSERT(cut == active_cut && !cut->stale && cut_shared->owner_pid == MyProcPid);
+	UT_ASSERT(cluster_wal_cut_release_in_context_v1(&cut, context, CurrentResourceOwner, MyProcPid, &sources[1]));
+}
+
 int
 main(void)
 {
  UT_RUN(stop_accepts_only_derived_old_wb_read_and_finishes_original_cut);
  UT_RUN(stop_source_reply_is_owned_until_transport_accepts);
  UT_RUN(stop_unknown_source_state_is_never_empty);
-	UT_PLAN(16);
+	UT_PLAN(20);
+	UT_RUN(stable_descriptor_uses_requested_context_and_exact_original_binding);
+	UT_RUN(stable_cancel_keeps_allocation_and_clears_original_completion_hint);
+	UT_RUN(stable_owner_callback_cancels_without_dropping_descriptor);
+	UT_RUN(stable_foreign_cleanup_does_not_cancel_or_free_original_request);
 	UT_RUN(fixed_remote_cut_actively_flushes_idle_original_writer);
 	UT_RUN(recovered_remote_cut_requires_semantic_open);
 	UT_RUN(old_reply_and_other_owner_cannot_complete_new_job);

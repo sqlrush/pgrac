@@ -55,6 +55,9 @@ extern MemoryContext cluster_wal_inputs_job_context_v1(ClusterWalInputsJobV1 *jo
 extern ClusterControlRootResult cluster_wal_inputs_job_begin_v1(ClusterWalInputsJobV1 *job,
 	const uint8 storage_uuid[16], uint64 system_identifier, ClusterWalInputsV1 **usable);
 extern ClusterControlRootResult cluster_wal_inputs_job_revalidate_v1(ClusterWalInputsJobV1 *job);
+extern ClusterControlRootResult cluster_wal_inputs_job_suspend_v1(ClusterWalInputsJobV1 *job);
+extern ClusterControlRootResult cluster_wal_inputs_job_resume_v1(ClusterWalInputsJobV1 *job,
+	ClusterWalInputsV1 **usable);
 /* Permanently revoke the scope and advance only its original cleanup. */
 extern ClusterWalInputsJobResultV1 cluster_wal_inputs_job_wait_failed_v1(ClusterWalInputsJobV1 *job);
 extern ClusterWalInputsJobResultV1 cluster_wal_inputs_job_retire_v1(ClusterWalInputsJobV1 *job);

@@ -34,6 +34,7 @@
 #include "cluster_control_root_private.h"
 #include "cluster_recovery_anchor_private.h"
 #include "cluster_wal_inputs_job_payload_private.h"
+#include "cluster_wal_cut_job_private.h"
 
 typedef enum WalInputsPurpose {
 	WAL_INPUTS_ONLINE,
@@ -150,15 +151,25 @@ cluster_wal_inputs_scope_job_binding_v1(ClusterWalInputsJobV1 *job)
 		|| scope->thread_count > CLUSTER_WAL_RETENTION_MAX_THREADS || scope->count > CLUSTER_WAL_INPUTS_MAX
 		|| memcmp(&scope->tx, &tx, sizeof(tx)) != 0 || memcmp(&scope->ctrc, &ctrc, sizeof(ctrc)) != 0)
 		return false;
-	/* No remote producer is wired in this storage-only slice. Never discard
-	 * an unimplemented descriptor responsibility as if it were absent. */
 	for (unsigned i = 0; i < lengthof(scope->remote); ++i)
-		if (scope->remote[i] != NULL)
+		if (scope->remote[i] != NULL && (i >= scope->count
+			|| !cluster_wal_cut_context_binding_v1(scope->remote[i], job->context,
+				job->owner, job->owner_pid, &scope->items[i].source)))
 			return false;
 	if ((job->state == WAL_INPUT_JOB_STATE_BUILDING || job->state == WAL_INPUT_JOB_STATE_USABLE
+		 || job->state == WAL_INPUT_JOB_STATE_SUSPENDED
 		 || job->pin != NULL) && scope->pin != job->pin)
 		return false;
+	if (job->state == WAL_INPUT_JOB_STATE_SUSPENDED && (!scope->suspended || scope->stale))
+		return false;
 	return job->state != WAL_INPUT_JOB_STATE_DONE || (scope->stale && scope->suspended && scope->pin == NULL);
+}
+
+bool
+cluster_wal_inputs_scope_job_suspended_v1(ClusterWalInputsJobV1 *job)
+{
+	return cluster_wal_inputs_scope_job_binding_v1(job) && job->inputs != NULL
+		&& job->inputs->suspended && !job->inputs->stale;
 }
 
 ClusterWalInputsV1 *
@@ -194,8 +205,14 @@ cluster_wal_inputs_scope_job_revoke_v1(ClusterWalInputsJobV1 *job)
 {
 	if (!cluster_wal_inputs_scope_job_binding_v1(job))
 		return false;
-	if (job->inputs != NULL)
+	if (job->inputs != NULL) {
+		for (unsigned i = 0; i < lengthof(job->inputs->remote); ++i)
+			if (job->inputs->remote[i] != NULL
+				&& !cluster_wal_cut_cancel_in_context_v1(job->inputs->remote[i], job->context,
+					job->owner, job->owner_pid, &job->inputs->items[i].source))
+				return false;
 		job->inputs->stale = true;
+	}
 	return true;
 }
 
@@ -206,6 +223,11 @@ cluster_wal_inputs_scope_job_drained_v1(ClusterWalInputsJobV1 *job)
 		|| job->cf.state == CF_JOB_RECEIPT_RETIRING || (job->flags & WAL_INPUT_JOB_FLAG_REVOKED) == 0)
 		return false;
 	if (job->inputs != NULL) {
+		for (unsigned i = 0; i < lengthof(job->inputs->remote); ++i)
+			if (job->inputs->remote[i] != NULL
+				&& !cluster_wal_cut_release_in_context_v1(&job->inputs->remote[i], job->context,
+					job->owner, job->owner_pid, &job->inputs->items[i].source))
+				return false;
 		job->inputs->pin = NULL;
 		job->inputs->stale = job->inputs->suspended = true;
 	}
@@ -337,6 +359,13 @@ inputs_build_current(ClusterWalInputsV1 *inputs)
 		&& !inputs->stale && !inputs->suspended && inputs->thread_count > 0
 		&& inputs->thread_count <= CLUSTER_WAL_RETENTION_MAX_THREADS
 		&& cluster_wal_read_pin_covers_v1(inputs->pin, inputs->threads[0]);
+}
+
+static ClusterControlRootResult
+inputs_revalidate(ClusterWalInputsV1 *inputs)
+{
+	return inputs != NULL && inputs->job != NULL
+		? cluster_wal_inputs_job_revalidate_v1(inputs->job) : cluster_wal_inputs_revalidate_v1(inputs);
 }
 
 static bool
@@ -487,7 +516,7 @@ cluster_wal_inputs_local_predecessor_retired_v1(ClusterWalInputsV1 *inputs,
 		|| predecessor->claim.identity.origin_owner_incarnation == 0
 		|| predecessor->claim.identity.origin_owner_incarnation
 			   == writer->claim.identity.origin_owner_incarnation
-		|| cluster_wal_inputs_revalidate_v1(inputs) != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		|| inputs_revalidate(inputs) != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return false;
 	for (uint32 i = 0; i < inputs->count; i++) {
 		const ClusterWalInputV1 *item = &inputs->items[i];
@@ -911,7 +940,7 @@ cluster_wal_inputs_visit_retained_v1(ClusterWalInputsV1 *inputs, uint32 index,
 		return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
 	PG_TRY();
 	{
-		result = cluster_wal_inputs_revalidate_v1(inputs);
+		result = inputs_revalidate(inputs);
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
 			if (item->kind == CLUSTER_WAL_INPUT_CHECKPOINT)
 				result = cluster_wal_retained_visit_v1(
@@ -932,7 +961,7 @@ cluster_wal_inputs_visit_retained_v1(ClusterWalInputsV1 *inputs, uint32 index,
 				result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 		}
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-			result = cluster_wal_inputs_revalidate_v1(inputs);
+			result = inputs_revalidate(inputs);
 	}
 	PG_CATCH();
 	{
@@ -1029,7 +1058,7 @@ cluster_wal_inputs_prepare_live_local_v1(ClusterWalInputsV1 *inputs, uint32 inde
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	PG_TRY();
 	{
-		result = cluster_wal_inputs_revalidate_v1(inputs);
+		result = inputs_revalidate(inputs);
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
 			if (item->source.claim.identity.origin_node_id != cluster_node_id)
 				result = CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
@@ -1039,7 +1068,7 @@ cluster_wal_inputs_prepare_live_local_v1(ClusterWalInputsV1 *inputs, uint32 inde
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			result = cluster_wal_writer_check(&native.writer);
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-			result = cluster_wal_inputs_revalidate_v1(inputs);
+			result = inputs_revalidate(inputs);
 	}
 	PG_CATCH();
 	{
@@ -1082,7 +1111,7 @@ cluster_wal_inputs_visit_live_local_v1(ClusterWalInputsV1 *inputs, uint32 index,
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			result = cluster_wal_writer_check(&inputs->local_cut.writer);
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-			result = cluster_wal_inputs_revalidate_v1(inputs);
+			result = inputs_revalidate(inputs);
 	}
 	PG_CATCH();
 	{
@@ -1133,7 +1162,7 @@ inputs_ctrc_local_cut(ClusterWalInputsV1 *inputs, uint32 index, ClusterWalWriter
 		|| CritSectionCount != 0 || ShutdownRequestPending
 		|| cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
-	result = cluster_wal_inputs_revalidate_v1(inputs);
+	result = inputs_revalidate(inputs);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	result = cluster_wal_writer_check(writer);
@@ -1172,7 +1201,7 @@ inputs_ctrc_local_cut(ClusterWalInputsV1 *inputs, uint32 index, ClusterWalWriter
 	if (native.flushed_end < native.complete_end) {
 		/* Original Startup I/O only, without CF/content/critical locks.
 		 * Requalify before the native device call; never adopt a new writer. */
-		result = cluster_wal_inputs_revalidate_v1(inputs);
+		result = inputs_revalidate(inputs);
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			result = cluster_wal_writer_check(writer);
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
@@ -1182,7 +1211,7 @@ inputs_ctrc_local_cut(ClusterWalInputsV1 *inputs, uint32 index, ClusterWalWriter
 	}
 	result = cluster_wal_writer_check(writer);
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-		result = cluster_wal_inputs_revalidate_v1(inputs);
+		result = inputs_revalidate(inputs);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (timeline != writer->ref.timeline)
@@ -1215,7 +1244,7 @@ inputs_ctrc_local_visit(ClusterWalInputsV1 *inputs, uint32 index,
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		result = cluster_wal_writer_check(&native.writer);
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-		result = cluster_wal_inputs_revalidate_v1(inputs);
+		result = inputs_revalidate(inputs);
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		*out = observed;
 	return result;
@@ -1227,11 +1256,19 @@ inputs_remote_sample(ClusterWalInputsV1 *inputs, uint32 index, ClusterWalWriterF
 	const ClusterWalInputV1 *item = &inputs->items[index];
 	ClusterControlRootResult result;
 	ClusterWalSourceRef selected;
-	/* The original job remote-descriptor lifetime is not wired here yet. */
-	if (inputs->job != NULL)
-		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	MemoryContext context = NULL;
+	if (inputs->job != NULL) {
+		if (index >= inputs->count || item->source.claim.identity.origin_node_id == cluster_node_id
+			|| !cluster_wal_inputs_job_scope_matches_v1(inputs->job, inputs, false))
+			return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+		context = cluster_wal_inputs_job_context_v1(inputs->job);
+		if (context == NULL)
+			return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	}
 	if (inputs->remote[index] == NULL) {
-		result = cluster_wal_cut_begin_v1(&item->source, &inputs->remote[index]);
+		result = context != NULL
+			? cluster_wal_cut_begin_in_context_v1(&item->source, context, &inputs->remote[index])
+			: cluster_wal_cut_begin_v1(&item->source, &inputs->remote[index]);
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			return result;
 	}
@@ -1274,11 +1311,11 @@ cluster_wal_inputs_prepare_live_v1(ClusterWalInputsV1 *inputs, uint32 index,
 		return cluster_wal_inputs_prepare_live_local_v1(inputs, index, out_complete_end);
 	PG_TRY();
 	{
-		result = cluster_wal_inputs_revalidate_v1(inputs);
+		result = inputs_revalidate(inputs);
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			result = inputs_remote_sample(inputs, index, &native);
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-			result = cluster_wal_inputs_revalidate_v1(inputs);
+			result = inputs_revalidate(inputs);
 	}
 	PG_CATCH();
 	{
@@ -1331,7 +1368,7 @@ cluster_wal_inputs_visit_live_v1(ClusterWalInputsV1 *inputs, uint32 index,
 			&& memcmp(&native, &after, sizeof(native)) != 0)
 			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-			result = cluster_wal_inputs_revalidate_v1(inputs);
+			result = inputs_revalidate(inputs);
 	}
 	PG_CATCH();
 	{
@@ -1363,7 +1400,7 @@ typedef struct WalContributionWork {
 static ClusterControlRootResult
 inputs_contribution_cuts(ClusterWalInputsV1 *inputs, WalContributionWork *work)
 {
-	ClusterControlRootResult result = cluster_wal_inputs_revalidate_v1(inputs);
+	ClusterControlRootResult result = inputs_revalidate(inputs);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	work->count = inputs->count;
@@ -1543,7 +1580,7 @@ inputs_contribution_build(ClusterWalInputsV1 *inputs, bool space_active, WalCont
 				return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
 		}
 	}
-	result = cluster_wal_inputs_revalidate_v1(inputs);
+	result = inputs_revalidate(inputs);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (work->census == NULL) {
@@ -1551,7 +1588,7 @@ inputs_contribution_build(ClusterWalInputsV1 *inputs, bool space_active, WalCont
 		if (work->detail != RF_PAGE_PROOF_DETAIL_OK)
 			return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
 	}
-	result = cluster_wal_inputs_revalidate_v1(inputs);
+	result = inputs_revalidate(inputs);
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& inputs->local_cut.complete_end != InvalidXLogRecPtr)
 		result = cluster_wal_writer_check(&inputs->local_cut.writer);
@@ -2047,7 +2084,7 @@ cluster_wal_inputs_ctrc_namespace_v1(ClusterWalInputsV1 *inputs, int *root_fd)
 			inputs->stale = true;
 			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 		} else if (!scope->namespace_verified) {
-			result = cluster_wal_inputs_revalidate_v1(inputs);
+			result = inputs_revalidate(inputs);
 			if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 				&& (!inputs_current(inputs) || !inputs_namespace_current(inputs))) {
 				inputs->stale = true;
@@ -2265,7 +2302,7 @@ cluster_wal_inputs_tx_serial_validate_v1(ClusterWalInputsV1 *inputs,
 
 	if (!cluster_wal_inputs_tx_serial_current_v1(inputs, request))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
-	result = cluster_wal_inputs_revalidate_v1(inputs);
+	result = inputs_revalidate(inputs);
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& !cluster_wal_inputs_tx_serial_current_v1(inputs, request))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
@@ -2635,7 +2672,7 @@ inputs_ctrc_replays_grant(ClusterWalInputsV1 *inputs)
 		plan->set_revoked = true;
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	}
-	result = cluster_wal_inputs_revalidate_v1(inputs);
+	result = inputs_revalidate(inputs);
 	if (result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE)
 		return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY || !inputs_ctrc_replays_current(inputs)) {
@@ -3311,6 +3348,99 @@ cluster_wal_inputs_job_revalidate_v1(ClusterWalInputsJobV1 *job)
 		pfree(work);
 	if (!cluster_wal_inputs_job_begin_outcome_v1(job, result, false))
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	return result;
+}
+
+ClusterControlRootResult
+cluster_wal_inputs_job_suspend_v1(ClusterWalInputsJobV1 *job)
+{
+	ClusterWalInputsV1 *inputs;
+	ClusterControlRootResult result;
+
+	result = cluster_wal_inputs_job_lifecycle_prepare_v1(job, &inputs, false);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY || job->state == WAL_INPUT_JOB_STATE_SUSPENDED)
+		return result;
+	PG_TRY();
+	{
+		if (!inputs_build_current(inputs))
+			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		else {
+			ClusterWalrReleaseResult released;
+
+			/* Revoke public borrowing before the first original release.
+			 * Only a fully confirmed synchronous release is resumable. */
+			inputs->suspended = true;
+			released = cluster_wal_read_pin_suspend_job_v1(&inputs->pin, job);
+			result = released == CLUSTER_WALR_RELEASE_CONFIRMED ? CLUSTER_CONTROL_ROOT_OK_PRIMARY
+				: released == CLUSTER_WALR_RELEASE_UNCONFIRMED ? CLUSTER_CONTROL_ROOT_RECONFIG_WAIT
+				: CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+		}
+	}
+	PG_CATCH();
+	{
+		if (!cluster_wal_inputs_job_begin_outcome_v1(job, UINT32_MAX, true))
+			elog(FATAL, "invalid original WAL input job after suspend error");
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		if (!cluster_wal_inputs_job_suspend_finish_v1(job))
+			elog(FATAL, "could not confirm original WAL input job suspension");
+	} else if (!cluster_wal_inputs_job_begin_outcome_v1(job, result, false))
+		elog(FATAL, "invalid original WAL input job after suspension");
+	return result;
+}
+
+ClusterControlRootResult
+cluster_wal_inputs_job_resume_v1(ClusterWalInputsJobV1 *job, ClusterWalInputsV1 **usable)
+{
+	ClusterWalInputsV1 *inputs;
+	WalInputsWork *volatile work = NULL;
+	ClusterControlRootResult result;
+
+	if (usable == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	*usable = NULL;
+	result = cluster_wal_inputs_job_lifecycle_prepare_v1(job, &inputs, true);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (job->state == WAL_INPUT_JOB_STATE_USABLE) {
+		result = cluster_wal_inputs_job_revalidate_v1(job);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			*usable = inputs;
+		return result;
+	}
+	PG_TRY();
+	{
+		ClusterWalPinResult pinned;
+
+		pinned = cluster_wal_read_pin_acquire_job_v1(inputs->threads, inputs->thread_count, job, &inputs->pin);
+		if (pinned != CLUSTER_WAL_PIN_OK)
+			result = pinned == CLUSTER_WAL_PIN_INVALID ? CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT
+				: CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+		else {
+			inputs->suspended = false;
+			work = palloc0(sizeof(*work));
+			result = inputs_job_root_phase(inputs, work, false, false);
+			if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && !inputs_build_current(inputs))
+				result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		}
+	}
+	PG_CATCH();
+	{
+		if (!cluster_wal_inputs_job_begin_outcome_v1(job, UINT32_MAX, true))
+			elog(FATAL, "invalid original WAL input job after resume error");
+		if (work != NULL)
+			pfree(work);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (work != NULL)
+		pfree(work);
+	if (!cluster_wal_inputs_job_begin_outcome_v1(job, result, false))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		*usable = inputs;
 	return result;
 }
 
