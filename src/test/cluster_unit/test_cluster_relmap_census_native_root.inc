@@ -66,9 +66,9 @@ cluster_wal_inputs_cold_census_v1(ClusterWalInputsV1 *inputs,
 	*records = 0;
 	*detail = RF_PAGE_PROOF_DETAIL_OK;
 	if (native_root_fault == 2) return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
-	for (unsigned i = 0; i < 2; i++) {
+	for (unsigned i = 0; i < episode_count; i++) {
 		/* Deliberately opposite to the selected-input carrier order. */
-		ClusterWalSourceRef source = episode_sources[1 - i].selected.source;
+		ClusterWalSourceRef source = episode_sources[episode_count - 1 - i].selected.source;
 		RfContributorStreamCutV1 cut = {0};
 		ClusterWalTailObservation tail = {0};
 		XLogReaderState reader = {0};
@@ -104,6 +104,7 @@ native_root_setup(CensusFixture *f, bool pending)
 	for (unsigned i = 0; i < 2; i++) {
 		episode_sources[i].selected.source.timeline = 1;
 		episode_sources[i].selected.source.claim.identity.origin_owner_incarnation = 909;
+		episode_sources[i].replay = episode_sources[i].selected;
 		native_episode_inputs[i].source = episode_sources[i];
 	}
 }

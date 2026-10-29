@@ -1140,11 +1140,13 @@ main(int argc, char **argv)
 	test_program_path = argv[0];
 	setup_fixture();
 #ifdef RECOVERY_SCOPE_NATIVE_CENSUS
-	UT_PLAN(4);
+	UT_PLAN(6);
 	UT_RUN(test_scope_native_census_uses_original_episode_and_retires_before_holders);
 	UT_RUN(test_scope_native_census_missing_corrupt_pending_pairs_keep_original_debt);
 	UT_RUN(test_scope_native_census_late_source_loss_and_error_do_not_replace_custody);
 	UT_RUN(test_scope_native_census_entry_roles_do_not_borrow_legacy_cold_authority);
+	UT_RUN(test_scope_native_census_keeps_real_history_in_original_two_origin_scope);
+	UT_RUN(test_scope_native_census_refuses_uncovered_and_missing_real_history_windows);
 	UT_DONE(); return ut_failed_count != 0;
 #endif
 	if (getenv("PGRAC_PRE2_TEST_SCOPE_CENSUS") != NULL) {

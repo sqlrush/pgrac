@@ -162,7 +162,68 @@ scope_native_second_origin(uint8 bytes[66048], ClusterRecoveryAnchorV2 *anchor,
 }
 
 static void
-scope_native_setup(ClusterWalInputsV1 **inputs)
+scope_native_history(ControlRootImage *root, const ClusterRecoveryAnchorV2 *anchor,
+	unsigned mode)
+{
+	ControlRootImage old = *root;
+	ClusterRecoveryAnchorV2 retained = *anchor;
+	ClusterWalHistoryImage history = {0};
+	ClusterWalHistoryStage stage;
+	ClusterRelmapCheckpointWindow window = {0};
+	ControlFileData native = {0};
+	uint8 bytes[66048], uuid[16] = {0x49};
+	char path[MAXPGPATH];
+	const char *dirs[] = {"global/wal_history", "global/wal_history/thread_1",
+		"global/wal_history/thread_1/.staging"};
+
+	for (unsigned i = 0; i < lengthof(dirs); i++) {
+		path_for(path, sizeof(path), dirs[i]);
+		UT_ASSERT(mkdir(path, 0700) == 0 || errno == EEXIST);
+	}
+	/* A distinct retained generation with actual claim/anchor/checkpoint WAL.
+	 * No ordering or authority is inferred from its numeric incarnation. */
+	old.records[0].identity.origin_owner_incarnation += 1000;
+	old.refs[0].history_generation = 0;
+	memset(old.refs[0].history_sha256, 0, 32);
+	UT_ASSERT_EQ(cluster_control_root_v3_encode(&old), 0);
+	memcpy(bytes, old.bytes, sizeof(bytes));
+	v2_claim_object(bytes, 0, &old);
+	retained.identity = old.records[0].identity;
+	memcpy(retained.claim_sha256, old.refs[0].claim_sha256, 32);
+	native.state = retained.state;
+	native.checkPoint = retained.checkpoint;
+	native.checkPointCopy = retained.checkpoint_copy;
+	snprintf(test_checkpoint_prefix_path, sizeof(test_checkpoint_prefix_path),
+		"%s/thread_1/generation_" UINT64_FORMAT "/durable_prefix/current",
+		cluster_wal_threads_dir, retained.identity.origin_owner_incarnation);
+	v2_checkpoint_wal_record(&retained.identity, &native, 8);
+	window = (ClusterRelmapCheckpointWindow){TEST_SYSID, retained.database_incarnation,
+		17, retained.identity.origin_owner_incarnation, 31, 5, 80, 100, 0};
+	UT_ASSERT(cluster_relmap_checkpoint_window_encode_v2(&window, &retained.checkpoint_copy,
+		retained.checkpoint, test_checkpoint_end, mode == 2 ? 96 : 85, retained.native_window));
+	if (mode == 3) memset(retained.native_window, 0, sizeof(retained.native_window));
+	v2_anchor_object(bytes, &retained, &retained.identity, path);
+	UT_ASSERT_EQ(cluster_control_root_v3_decode(bytes, sizeof(bytes), v2_storage, TEST_SYSID, &old), 0);
+	old.records[0].checkpoint_record_crc32c = old.records[0].tail_last_record_crc32c = test_checkpoint_crc;
+	old.records[0].validated_tail_lsn_exclusive = test_checkpoint_end;
+	tx_ir_complete(&old.records[0]);
+	history.count = 1;
+	history.records[0].snapshot = old.records[0];
+	history.records[0].refs = old.refs[0];
+	history.records[0].publisher_node = old.publisher_node[0];
+	history.records[0].publisher_incarnation = old.publisher_incarnation[0];
+	put_u64_le(uuid + 8, ++root->header.file_txn_seq);
+	test_actual_cf = test_cf_mode = ExclusiveLock;
+	UT_ASSERT_EQ(cluster_wal_history_prepare(root, 0, &history, root->header.file_txn_seq, uuid, &stage), 0);
+	UT_ASSERT_EQ(cluster_wal_history_install(&stage), 0);
+	root->refs[0].history_generation = stage.generation;
+	memcpy(root->refs[0].history_sha256, stage.sha256, 32);
+	UT_ASSERT_EQ(cluster_wal_history_discard(&stage), 0);
+	test_actual_cf = test_cf_mode = NoLock;
+}
+
+static void
+scope_native_setup_mode(ClusterWalInputsV1 **inputs, unsigned history_mode)
 {
 	uint8 bytes[66048];
 	ClusterRecoveryAnchorV2 anchors[2];
@@ -195,10 +256,23 @@ scope_native_setup(ClusterWalInputsV1 **inputs)
 	UT_ASSERT_EQ(cluster_control_root_v3_decode(bytes, sizeof(bytes), v2_storage, TEST_SYSID, &root), 0);
 	tx_ir_complete(&root.records[0]);
 	tx_ir_complete(&root.records[1]);
+	if (history_mode) scope_native_history(&root, &anchors[0], history_mode);
 	UT_ASSERT_EQ(cluster_control_root_v3_encode(&root), 0);
 	v2_write_roots(root.bytes);
 	UT_ASSERT_EQ(cluster_wal_inputs_begin_v1(v2_storage, TEST_SYSID, &original), 0);
 	tx_inputs_capture(original, NULL);
+	if (history_mode) {
+		uint32 count = 0;
+		/* The original failed replay set still has two origins. The selected
+		 * scope additionally retains history under those SAME requests/WALR. */
+		for (uint32 i = 0; i < cluster_wal_inputs_count_v1(original); i++)
+			if (cluster_wal_inputs_at_v1(original, i)->current) {
+				tx_inputs_typed.sources[count] = tx_inputs_typed.sources[i];
+				tx_inputs_typed.participants[count++] = tx_inputs_typed.participants[i];
+			}
+		UT_ASSERT_EQ(count, 2);
+		tx_inputs_typed.participant_count = tx_inputs_typed.replay_count = count;
+	}
 	cluster_wal_inputs_release_v1(&original);
 	tx_inputs_activate();
 	ctrc_inputs_activate_work();
@@ -223,6 +297,12 @@ scope_native_setup(ClusterWalInputsV1 **inputs)
 	scope_native_write_pair(InvalidOid, false, false);
 	scope_native_write_pair(5, false, false);
 	scope_native_destroyed = scope_native_legacy_calls = 0;
+}
+
+static void
+scope_native_setup(ClusterWalInputsV1 **inputs)
+{
+	scope_native_setup_mode(inputs, 0);
 }
 
 static bool
@@ -333,4 +413,40 @@ UT_TEST(test_scope_native_census_entry_roles_do_not_borrow_legacy_cold_authority
 	UT_ASSERT(borrowed != NULL);
 	UT_ASSERT_EQ(scope_native_legacy_calls, 0);
 	scope_native_finish(&inputs);
+}
+
+UT_TEST(test_scope_native_census_keeps_real_history_in_original_two_origin_scope)
+{
+	ClusterWalInputsV1 *inputs = NULL;
+	const ClusterRelmapRetentionCensus *borrowed = NULL;
+
+	scope_native_setup_mode(&inputs, 1);
+	UT_ASSERT_EQ(cluster_wal_inputs_relmap_count_v1(inputs), 3);
+	UT_ASSERT(scope_native_prepare(inputs, &borrowed));
+	UT_ASSERT(borrowed != NULL);
+	UT_ASSERT_EQ(ctrc_set_calls, 2);
+	UT_ASSERT_EQ(ctrc_set_held, 2);
+	UT_ASSERT(inputs_pin_held);
+	UT_ASSERT_EQ(relmap_failed, 0);
+	UT_ASSERT_EQ(scope_native_legacy_calls, 0);
+	scope_native_finish(&inputs);
+	UT_ASSERT_EQ(scope_native_destroyed, 1);
+}
+
+UT_TEST(test_scope_native_census_refuses_uncovered_and_missing_real_history_windows)
+{
+	for (unsigned mode = 2; mode <= 3; mode++) {
+		ClusterWalInputsV1 *inputs = NULL;
+		const ClusterRelmapRetentionCensus *borrowed = NULL;
+
+		scope_native_setup_mode(&inputs, mode);
+		UT_ASSERT_EQ(cluster_wal_inputs_relmap_count_v1(inputs), 3);
+		UT_ASSERT(!scope_native_prepare(inputs, &borrowed));
+		UT_ASSERT(borrowed == NULL);
+		UT_ASSERT(relmap_failed > 0);
+		UT_ASSERT_EQ(ctrc_set_held, 2);
+		UT_ASSERT(inputs_pin_held);
+		UT_ASSERT(fcntl(scope_native_fd, F_GETFD) >= 0);
+		scope_native_finish(&inputs);
+	}
 }
