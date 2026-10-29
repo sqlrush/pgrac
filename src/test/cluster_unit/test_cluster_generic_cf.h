@@ -7,6 +7,8 @@ static ClusterControlRootPatch generic_patch;
 static ClusterControlRootPublishReason generic_reason;
 static unsigned generic_pin_begins, generic_pin_ends;
 static bool generic_pin_active, generic_pin_confirmed;
+static bool generic_rejoin_io;
+static void (*generic_after_cf_read)(void);
 
 static ClusterWalPinResult
 generic_pin_begin(const ClusterControlRootReadToken *token, bool sealed,
@@ -39,8 +41,56 @@ generic_snapshot(const ClusterControlRootSnapshot *snapshot pg_attribute_unused(
 				 const uint8 storage[16] pg_attribute_unused(),
 				 const uint8 authority[16] pg_attribute_unused(), bool v2 pg_attribute_unused())
 {
+	if (generic_rejoin_io) {
+		UT_ASSERT_EQ(snapshot->identity.origin_owner_incarnation, 77);
+		UT_ASSERT_EQ(snapshot->identity.root_lineage_seq, 6);
+		UT_ASSERT_EQ(snapshot->lifecycle, CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN);
+		return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	}
 	UT_ASSERT(false); /* No storage path is expected after a failed CF. */
 	return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+}
+
+/* Physical publication remains a leaf; the generic CAS/one-use authority,
+ * exact CF owner and readback/token paths above and below it are real. */
+static void
+generic_encode_record(uint8 *dst, const ClusterControlRootSnapshot *record, uint64 incarnation,
+					  uint32 node, ClusterControlRootPublishReason reason)
+{
+	if (!generic_rejoin_io) {
+		prepared_encode_record(dst, record, incarnation, node, reason);
+		return;
+	}
+	UT_ASSERT(cluster_cf_held_is_clusterwide(ExclusiveLock));
+	UT_ASSERT_EQ(incarnation, 77);
+	UT_ASSERT_EQ(node, 0);
+	UT_ASSERT(reason == CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_OPEN
+			  || reason == CLUSTER_CONTROL_ROOT_PUBLISH_OWNER_REJOIN);
+	memcpy(dst, record, Min(sizeof(*record), CLUSTER_CONTROL_ROOT_RECORD_BYTES));
+}
+
+static bool
+generic_updated(const ControlRootImage *old, const ControlRootImage *next)
+{
+	if (!generic_rejoin_io)
+		return prepared_updated(old, next);
+	UT_ASSERT(cluster_cf_held_is_clusterwide(ExclusiveLock));
+	UT_ASSERT_EQ(next->header.file_txn_seq, old->header.file_txn_seq + 1);
+	UT_ASSERT_EQ(next->records[0].identity.origin_owner_incarnation, 77);
+	UT_ASSERT_EQ(next->records[0].identity.root_lineage_seq, 6);
+	++prepared_writes;
+	prepared_disk = *next;
+	return true;
+}
+
+static ClusterControlRootResult
+generic_read_pair(ControlRootImage *primary, ControlRootImage *bak)
+{
+	ClusterControlRootResult result = prepared_read_pair(primary, bak);
+
+	if (generic_after_cf_read != NULL)
+		generic_after_cf_read();
+	return result;
 }
 
 #define patch_shape_valid generic_shape
@@ -49,10 +99,10 @@ generic_snapshot(const ClusterControlRootSnapshot *snapshot pg_attribute_unused(
 #define acquire_clusterwide_cf prepared_acquire
 #define release_cf prepared_release
 #define storage_contract_check prepared_storage
-#define read_canonical_pair prepared_read_pair
-#define encode_record prepared_encode_record
+#define read_canonical_pair generic_read_pair
+#define encode_record generic_encode_record
 #define encode_header prepared_encode_header
-#define publish_updated_image prepared_updated
+#define publish_updated_image generic_updated
 #define build_control_path prepared_path
 #define read_one_image prepared_read_one
 #define snapshot_validate generic_snapshot
@@ -114,6 +164,8 @@ static void
 generic_fixture(ClusterControlRootPublishReason reason)
 {
 	prepared_fixture(false);
+	generic_rejoin_io = false;
+	generic_after_cf_read = NULL;
 	cluster_control_root_publish_authority_clear_v1();
 	generic_reason = reason;
 	generic_pin_begins = generic_pin_ends = 0;

@@ -6463,7 +6463,7 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(124);
+	UT_PLAN(134);
 	UT_RUN(startup_cf_timeout_waits_for_exact_completion_before_begin);
 	UT_RUN(startup_cf_completion_does_not_preserve_changed_native_input);
 	UT_RUN(startup_cf_unsafe_native_context_never_takes_a_registry_lock);
@@ -6556,7 +6556,17 @@ main(void)
 	UT_RUN(generic_cf_refusal_consumes_authority_before_any_retry);
 	UT_RUN(generic_cf_drift_never_consumes_a_different_publication);
 	UT_RUN(generic_cf_unconfirmed_pin_release_never_restores_authority);
-	UT_RUN(rejoin_cf_slice_releases_stage_but_keeps_original_cleanup);
+	UT_RUN(rejoin_cf_wait_keeps_original_staged_publication);
+	UT_RUN(rejoin_unconfirmed_walr_is_not_a_cf_wait);
+	UT_RUN(rejoin_requalifies_at_actual_write_boundary);
+	UT_RUN(rejoin_retained_ack_can_learn_its_root_after_exact_read_retirement);
+	UT_RUN(rejoin_retained_ack_requires_its_exact_cf_receipt);
+	UT_RUN(rejoin_retained_ack_requalifies_after_fresh_reads_before_bind);
+	UT_RUN(rejoin_retained_ack_rechecks_context_and_original_deadline);
+	UT_RUN(rejoin_retained_ack_rejects_changed_root_key_before_rebind);
+	UT_RUN(rejoin_retained_ack_rechecks_exact_jcmk_completion);
+	UT_RUN(rejoin_retained_ack_does_not_retry_hard_or_preexisting_cf);
+	UT_RUN(ordinary_rejoin_cf_slice_releases_stage_but_keeps_original_cleanup);
 	UT_RUN(rejoin_fresh_attempt_rechecks_original_root_and_jcmk);
 	UT_RUN(rejoin_fresh_proof_drift_never_reuses_consumed_publication);
 	UT_RUN(rejoin_staged_marker_wait_is_not_a_root_wait);

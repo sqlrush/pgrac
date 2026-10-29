@@ -1516,27 +1516,30 @@ test_cluster_generic_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_control_r
 	     /^reason_mask\(/ { print "static uint64"; emit=1; masks++ } \
 	     /^patch_shape_valid\(/ { print "static bool"; emit=1; shapes++ } \
 	     /^root_publish_requires_walr\(/ { print "static bool"; emit=1; selectors++ } \
-	     /^cluster_control_root_compare_and_publish\(/ { print "ClusterControlRootResult"; emit=1; consumers++ } \
+	     /^(cluster_control_root_compare_and_publish|cluster_control_root_rejoin_compare_and_publish_checked)\(/ { print "ClusterControlRootResult"; emit=1; consumers++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (reserved != 1 || masks != 1 || shapes != 1 || selectors != 1 || consumers != 1 || emit) exit 1 }' $< > $@.tmp
+	     END { if (reserved != 1 || masks != 1 || shapes != 1 || selectors != 1 || consumers != 2 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Original retained coordinator stage layout.
 test_cluster_rejoin_cf_types.inc: $(top_srcdir)/src/backend/cluster/cluster_reconfig.c Makefile
-	awk '/^typedef struct ClusterReconfigJoinCommitStage \{/ { emit=1; types++ } \
-	     emit { print } /^} ClusterReconfigJoinCommitStage;/ { emit=0 } \
-	     END { if (types != 1 || emit) exit 1 }' $< > $@.tmp
+	awk '/^typedef struct ClusterReconfigJoin(BindContinuation|CommitStage) \{/ { emit=1; types++ } \
+	     emit { print } /^} ClusterReconfigJoin(BindContinuation|CommitStage);/ { emit=0 } \
+	     END { if (types != 2 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Join the original coordinator stage to its ROOT publisher and CF refusal.
 test_cluster_rejoin_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_duty.c \
 		$(top_srcdir)/src/backend/cluster/cluster_reconfig.c Makefile
-	awk 'FNR == NR && /^(cluster_recovery_duty_key_encode_for_claim|cluster_recovery_owner_rejoin_v1)\(/ { print "static bool"; emit=1; publishers++ } \
+	awk 'FNR == NR && /^(cluster_recovery_duty_key_encode_for_claim|cluster_recovery_owner_rejoin_v1|cluster_recovery_owner_rejoin_checked_v1|owner_marker_absent|owner_marker_committed_valid)\(/ { print "static bool"; emit=1; publishers++ } \
 	     FNR == NR && /^(cluster_recovery_duty_key_compare_for_claim|cluster_recovery_duty_key_compare)\(/ { print "static ClusterRecoveryDutyCompare"; emit=1; compares++ } \
+	     FNR == NR && /^cluster_recovery_owner_import_select_marker_v1\(/ { print "static ClusterRecoveryOwnerImportResult"; emit=1; selects++ } \
+	     FNR != NR && /^(cluster_reconfig_join_bind_current|cluster_reconfig_join_bind_context_current)\(/ { print "static bool"; emit=1; revalidates++ } \
+	     FNR != NR && /^cluster_reconfig_join_bind_cf_poll\(/ { print "static int"; emit=1; waits++ } \
 	     FNR != NR && /^cluster_reconfig_release_join_commit_stage\(/ { print "static void"; emit=1; releases++ } \
 	     FNR != NR && /^cluster_reconfig_poll_join_commit_stage\(/ { print "static bool"; emit=1; polls++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (publishers != 2 || compares != 2 || releases != 1 || polls != 1 || emit) exit 1 }' \
+	     END { if (publishers != 5 || compares != 2 || selects != 1 || waits != 1 || revalidates != 2 || releases != 1 || polls != 1 || emit) exit 1 }' \
 	     $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 

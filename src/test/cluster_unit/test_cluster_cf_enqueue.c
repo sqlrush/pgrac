@@ -258,6 +258,7 @@ volatile uint32 InterruptHoldoffCount;
 static TimestampTz owner_clock;
 static long owner_clock_step = 60000000;
 static bool owner_ack_on_wait;
+static bool owner_ack_on_wakeup;
 static bool owner_rebuild_frozen;
 static unsigned owner_wait_calls;
 static bool acknowledge_retirements(void);
@@ -280,7 +281,10 @@ cluster_grd_control_rebuild_frozen(uint64 epoch, uint64 generation)
 
 void
 cluster_lmon_wakeup(void)
-{}
+{
+	if (owner_ack_on_wakeup)
+		UT_ASSERT(acknowledge_retirements());
+}
 void
 ResetLatch(Latch *latch pg_attribute_unused())
 {}

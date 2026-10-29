@@ -347,11 +347,10 @@ owner_marker_committed_valid(const ClusterJoinCommitMarker *marker, int32 node_i
 }
 
 ClusterRecoveryOwnerImportResult
-cluster_recovery_owner_import_select_v1(int32 node_id, const ClusterWalThreadClaim *immutable_claim,
-										uint64 frozen_admitted_bitmap_low,
-										uint64 frozen_admitted_bitmap_high,
-										const ClusterRecoveryOwnerDiskSampleV1 *samples,
-										int total_disk_count, uint64 *out_incarnation)
+cluster_recovery_owner_import_select_marker_v1(
+	int32 node_id, const ClusterWalThreadClaim *immutable_claim, uint64 frozen_admitted_bitmap_low,
+	uint64 frozen_admitted_bitmap_high, const ClusterRecoveryOwnerDiskSampleV1 *samples,
+	int total_disk_count, const ClusterJoinCommitMarker *expected_marker, uint64 *out_incarnation)
 {
 	ClusterJoinCommitMarker committed[CLUSTER_MAX_VOTING_DISKS];
 	uint32 majority;
@@ -365,7 +364,8 @@ cluster_recovery_owner_import_select_v1(int32 node_id, const ClusterWalThreadCla
 		*out_incarnation = 0;
 	if (out_incarnation == NULL || immutable_claim == NULL || samples == NULL || node_id < 0
 		|| node_id >= CLUSTER_MAX_NODES || total_disk_count <= 0
-		|| total_disk_count > CLUSTER_MAX_VOTING_DISKS)
+		|| total_disk_count > CLUSTER_MAX_VOTING_DISKS
+		|| (expected_marker != NULL && !owner_marker_committed_valid(expected_marker, node_id)))
 		return CLUSTER_RECOVERY_OWNER_IMPORT_BAD_ARGUMENT;
 	if (!cluster_wal_thread_claim_validate(immutable_claim, (uint16)(node_id + 1), node_id, NULL))
 		return CLUSTER_RECOVERY_OWNER_IMPORT_CLAIM_MISMATCH;
@@ -396,7 +396,9 @@ cluster_recovery_owner_import_select_v1(int32 node_id, const ClusterWalThreadCla
 			for (b = 0; b < n_committed; b++)
 				if (memcmp(&committed[a], &committed[b], sizeof(committed[a])) == 0)
 					same++;
-			if (same >= majority) {
+			if (same >= majority
+				&& (expected_marker == NULL
+					|| memcmp(expected_marker, &committed[a], sizeof(*expected_marker)) == 0)) {
 				*out_incarnation = committed[a].admitted_incarnation;
 				return CLUSTER_RECOVERY_OWNER_IMPORT_JCMK;
 			}
@@ -405,6 +407,8 @@ cluster_recovery_owner_import_select_v1(int32 node_id, const ClusterWalThreadCla
 	}
 	if (join_unreadable)
 		return CLUSTER_RECOVERY_OWNER_IMPORT_IO_FAILED;
+	if (expected_marker != NULL)
+		return CLUSTER_RECOVERY_OWNER_IMPORT_JCMK_UNPROVEN;
 	if (!initial_member)
 		return CLUSTER_RECOVERY_OWNER_IMPORT_SLOT_UNPROVEN;
 	for (i = 0; i < total_disk_count; i++) {
@@ -429,8 +433,25 @@ cluster_recovery_owner_import_select_v1(int32 node_id, const ClusterWalThreadCla
 	return CLUSTER_RECOVERY_OWNER_IMPORT_SLOT_UNPROVEN;
 }
 
+ClusterRecoveryOwnerImportResult
+cluster_recovery_owner_import_select_v1(int32 node_id, const ClusterWalThreadClaim *immutable_claim,
+										uint64 frozen_admitted_bitmap_low,
+										uint64 frozen_admitted_bitmap_high,
+										const ClusterRecoveryOwnerDiskSampleV1 *samples,
+										int total_disk_count, uint64 *out_incarnation)
+{
+	return cluster_recovery_owner_import_select_marker_v1(
+		node_id, immutable_claim, frozen_admitted_bitmap_low, frozen_admitted_bitmap_high, samples,
+		total_disk_count, NULL, out_incarnation);
+}
+
 bool
-cluster_recovery_owner_rejoin_v1(int32 node_id, uint64 admitted_incarnation)
+cluster_recovery_owner_rejoin_checked_v1(int32 node_id, uint64 admitted_incarnation,
+										 const ClusterJoinCommitMarker *expected_marker,
+										 const ClusterRecoveryDutyKey *expected_key,
+										 ClusterRecoveryDutyKey *observed_key,
+										 bool (*revalidate)(bool publishing),
+										 ClusterControlRootResult *out_result)
 {
 	ClusterControlRootIdentity identity;
 	ClusterControlRootSnapshot snapshot;
@@ -443,13 +464,21 @@ cluster_recovery_owner_rejoin_v1(int32 node_id, uint64 admitted_incarnation)
 	ClusterWalThreadClaim immutable_claim;
 	uint64 proven_incarnation = 0;
 
+	if (out_result != NULL)
+		*out_result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (observed_key != NULL)
+		memset(observed_key, 0, sizeof(*observed_key));
 	if (node_id < 0 || node_id >= CLUSTER_MAX_NODES || admitted_incarnation == 0)
 		return false;
 	root_result
 		= cluster_control_root_lookup_owner_by_node_runtime(node_id, &identity, &snapshot, &token);
-	if ((root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
-		 && root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
-		|| !cluster_recovery_duty_key_valid_v1(&identity)
+	if (root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
+		if (out_result != NULL)
+			*out_result = root_result;
+		return false;
+	}
+	if (!cluster_recovery_duty_key_valid_v1(&identity)
 		|| cluster_recovery_duty_key_compare(&identity, &snapshot.identity)
 			   != CLUSTER_RECOVERY_DUTY_COMPARE_EXACT
 		|| (snapshot.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE
@@ -490,15 +519,28 @@ cluster_recovery_owner_rejoin_v1(int32 node_id, uint64 admitted_incarnation)
 		|| (snapshot.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED
 			&& identity.root_lineage_seq == UINT64_MAX))
 		return false;
+	if (expected_key != NULL
+		&& cluster_recovery_duty_key_compare(expected_key, &identity)
+			   != CLUSTER_RECOVERY_DUTY_COMPARE_EXACT)
+		return false;
 	cluster_wal_thread_claim_fill(&immutable_claim, identity.origin_thread_id,
 								  identity.origin_node_id, identity.thread_claim_created_at);
 	if (immutable_claim.crc != identity.thread_claim_crc32c)
 		return false;
-	owner_result = cluster_recovery_owner_import_read_v1(node_id, &immutable_claim, 0, 0,
-														 &proven_incarnation);
+	owner_result = expected_marker != NULL
+					   ? cluster_recovery_owner_import_read_marker_v1(
+							 node_id, &immutable_claim, 0, 0, expected_marker, &proven_incarnation)
+					   : cluster_recovery_owner_import_read_v1(node_id, &immutable_claim, 0, 0,
+															   &proven_incarnation);
 	if (owner_result != CLUSTER_RECOVERY_OWNER_IMPORT_JCMK
 		|| proven_incarnation != admitted_incarnation)
 		return false;
+	/* ROOT/JCMK reads may wait. The retained stage rechecks its exact ACK,
+	 * observed slot, owner generation and original deadline before binding. */
+	if (revalidate != NULL && !revalidate(false))
+		return false;
+	if (observed_key != NULL)
+		*observed_key = identity;
 	/* A previous attempt may have completed the single ROOT CAS and then lost
 	 * the local membership publish race.  Exact OPEN+owner plus the same direct
 	 * majority JCMK is the already-satisfied gate; never advance lineage twice. */
@@ -541,12 +583,14 @@ cluster_recovery_owner_rejoin_v1(int32 node_id, uint64 admitted_incarnation)
 				? CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_OPEN
 				: CLUSTER_CONTROL_ROOT_PUBLISH_OWNER_REJOIN))
 		return false;
-	root_result = cluster_control_root_compare_and_publish(
+	root_result = cluster_control_root_rejoin_compare_and_publish_checked(
 		&token, &patch,
 		(snapshot.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED)
 			? CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_OPEN
 			: CLUSTER_CONTROL_ROOT_PUBLISH_OWNER_REJOIN,
-		&published, &published_token);
+		&published, &published_token, revalidate);
+	if (out_result != NULL)
+		*out_result = root_result;
 	cluster_control_root_publish_authority_clear_v1();
 	if (root_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& published.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
@@ -561,6 +605,13 @@ cluster_recovery_owner_rejoin_v1(int32 node_id, uint64 admitted_incarnation)
 		return true;
 	}
 	return false;
+}
+
+bool
+cluster_recovery_owner_rejoin_v1(int32 node_id, uint64 admitted_incarnation)
+{
+	return cluster_recovery_owner_rejoin_checked_v1(node_id, admitted_incarnation, NULL, NULL, NULL,
+													NULL, NULL);
 }
 
 /*

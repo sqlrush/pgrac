@@ -12585,11 +12585,10 @@ recovery_complete_v3_publish(const ClusterControlRootReadToken *expected,
 }
 
 ClusterControlRootResult
-cluster_control_root_compare_and_publish(const ClusterControlRootReadToken *expected_token,
-										 const ClusterControlRootPatch *patch,
-										 ClusterControlRootPublishReason reason,
-										 ClusterControlRootSnapshot *out_snapshot,
-										 ClusterControlRootReadToken *out_token)
+cluster_control_root_rejoin_compare_and_publish_checked(
+	const ClusterControlRootReadToken *expected_token, const ClusterControlRootPatch *patch,
+	ClusterControlRootPublishReason reason, ClusterControlRootSnapshot *out_snapshot,
+	ClusterControlRootReadToken *out_token, bool (*revalidate)(bool publishing))
 {
 	ControlRootImage *primary;
 	ControlRootImage *bak;
@@ -12618,7 +12617,10 @@ cluster_control_root_compare_and_publish(const ClusterControlRootReadToken *expe
 		memset(out_snapshot, 0, sizeof(*out_snapshot));
 	if (out_token != NULL)
 		memset(out_token, 0, sizeof(*out_token));
-	if (alias || expected_token == NULL || expected_token->source != CONTROL_ROOT_SOURCE_PRIMARY
+	if ((revalidate != NULL
+		 && (reason != CLUSTER_CONTROL_ROOT_PUBLISH_OWNER_REJOIN
+			 && reason != CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_OPEN))
+		|| alias || expected_token == NULL || expected_token->source != CONTROL_ROOT_SOURCE_PRIMARY
 		|| expected_token->origin_thread_id == 0
 		|| expected_token->origin_thread_id > CLUSTER_CONTROL_ROOT_RECORD_COUNT
 		|| expected_token->reserved20 != 0 || expected_token->reserved32 != 0
@@ -12700,7 +12702,10 @@ cluster_control_root_compare_and_publish(const ClusterControlRootReadToken *expe
 			updated->header.file_txn_seq++;
 			updated->header.published_at_usec = snapshot.published_at_usec;
 			encode_header(updated);
-			if (!publish_updated_image(primary, updated))
+			/* A CF wait and canonical read must not outlive the owning stage. */
+			if (revalidate != NULL && !revalidate(true))
+				result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+			else if (!publish_updated_image(primary, updated))
 				result = CLUSTER_CONTROL_ROOT_IO_ERROR;
 			else {
 				ControlRootImage *readback = palloc(sizeof(*readback));
@@ -12742,6 +12747,17 @@ release_walr:
 			*out_token = token;
 	}
 	return result;
+}
+
+ClusterControlRootResult
+cluster_control_root_compare_and_publish(const ClusterControlRootReadToken *expected_token,
+										 const ClusterControlRootPatch *patch,
+										 ClusterControlRootPublishReason reason,
+										 ClusterControlRootSnapshot *out_snapshot,
+										 ClusterControlRootReadToken *out_token)
+{
+	return cluster_control_root_rejoin_compare_and_publish_checked(expected_token, patch, reason,
+																   out_snapshot, out_token, NULL);
 }
 
 /* PGRAC: keep the exact shared recovery source inside one owned read scope.

@@ -46,6 +46,7 @@
 
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_recovery_duty.h"
+#include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_thread_recovery.h"
 #include "cluster/cluster_wal_state.h"
 #include "cluster/cluster_wal_thread.h"
@@ -326,6 +327,29 @@ typedef struct ClusterReconfigJoinPrepareStage {
 	bool submitted;
 } ClusterReconfigJoinPrepareStage;
 
+/* Process-local ACK-completed / waiting-bind substate. The original stage
+ * owns this continuation; neither the marker nor ROOT authority is replayed.
+ * Original LMON latch/tick and CONTROL retirement terminate its CF wait. */
+typedef struct ClusterReconfigJoinBindContinuation {
+	bool marker_acked;
+	bool cf_waiting;
+	bool root_key_valid;
+	ClusterJoinCommitMarker marker;
+	uint64 marker_seq;
+	uint64 expected_epoch;
+	uint64 observed_incarnation;
+	uint64 observed_generation;
+	uint64 epoch;
+	uint64 lms_generation;
+	uint64 boot;
+	int32 pid;
+	PGPROC *proc;
+	Latch *latch;
+	ClusterRecoveryDutyKey root_key;
+	LOCKMODE cf_mode;
+	ClusterCfRetirementSnapshot cf;
+} ClusterReconfigJoinBindContinuation;
+
 typedef struct ClusterReconfigJoinCommitStage {
 	ClusterMarkerAsync async;
 	ClusterMarkerAsync fence_async;
@@ -338,6 +362,7 @@ typedef struct ClusterReconfigJoinCommitStage {
 	bool submitted;
 	bool fence_ready;
 	bool external_rejoin_consumed;
+	ClusterReconfigJoinBindContinuation bind;
 } ClusterReconfigJoinCommitStage;
 
 typedef enum ClusterExternalRejoinPhase {
@@ -3421,6 +3446,7 @@ cluster_reconfig_release_join_commit_stage(void)
 	join_commit_stage.submitted = false;
 	join_commit_stage.fence_ready = false;
 	join_commit_stage.external_rejoin_consumed = false;
+	memset(&join_commit_stage.bind, 0, sizeof(join_commit_stage.bind));
 	if (had_prebump)
 		cluster_reconfig_set_prebump_sync_active(0);
 	if (had_external_rejoin)
@@ -3642,6 +3668,86 @@ cluster_reconfig_poll_join_fence_stage(TimestampTz now)
 	return true;
 }
 
+/* The stage deadline is inherited once, never renewed by a CF attempt. */
+static bool
+cluster_reconfig_join_bind_context_current(TimestampTz now)
+{
+	ClusterReconfigJoinBindContinuation *bind = &join_commit_stage.bind;
+
+	return !(MyProc != bind->proc || MyLatch != bind->latch || MyProcPid != bind->pid
+			 || MyBackendType != B_LMON || ShutdownRequestPending || CritSectionCount != 0
+			 || !cluster_enabled || !cluster_shared_config || !cluster_controlfile_shared_authority
+			 || cluster_current_phase() >= CLUSTER_PHASE_RUNNING || bind->epoch == 0
+			 || bind->epoch != cluster_epoch_get_current() || bind->lms_generation == 0
+			 || bind->lms_generation != cluster_grd_redeclare_generation() || bind->boot == 0
+			 || bind->boot != cluster_qvotec_get_self_incarnation()
+			 || !cluster_recovery_transport_components_current()
+			 || bind->marker_seq != join_commit_stage.async.inflight_seq
+			 || bind->expected_epoch != join_commit_stage.async.staged_expect_epoch
+			 || memcmp(&bind->marker, &join_commit_stage.marker, sizeof(bind->marker)) != 0
+			 || join_commit_stage.node_id != bind->marker.node_id
+			 || join_commit_stage.admitted_incarnation != bind->observed_incarnation
+			 || join_commit_stage.async.deadline_us == 0
+			 || (uint64)now >= join_commit_stage.async.deadline_us);
+}
+
+/* Do not block LMON: it owns the original CONTROL service needed for the
+ * exact ACK. Returning pending leaves this work on its existing latch/tick.
+ * No timeout slice, wake, or absent hold is a completion receipt. */
+static int
+cluster_reconfig_join_bind_cf_poll(TimestampTz now)
+{
+	ClusterReconfigJoinBindContinuation *bind = &join_commit_stage.bind;
+	ClusterCfRetirementSnapshot current;
+
+	if (!cluster_reconfig_join_bind_context_current(now))
+		return -1;
+	if (!bind->cf_waiting)
+		return cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock) ? -1 : 0;
+	if ((bind->cf_mode != ShareLock && bind->cf_mode != ExclusiveLock)
+		|| cluster_cf_held(bind->cf_mode == ShareLock ? ExclusiveLock : ShareLock))
+		return -1;
+	if (cluster_cf_held(bind->cf_mode)) {
+		if (bind->cf.cookie == 0 || !cluster_cf_retirement_snapshot(bind->cf_mode, NULL, &current)
+			|| current.cookie != bind->cf.cookie
+			|| current.registry.handle.slot != bind->cf.registry.handle.slot
+			|| current.registry.handle.generation != bind->cf.registry.handle.generation
+			|| memcmp(&current.registry.owner, &bind->cf.registry.owner,
+					  sizeof(current.registry.owner))
+				   != 0
+			|| memcmp(&current.registry.message.key, &bind->cf.registry.message.key,
+					  sizeof(current.registry.message.key))
+				   != 0)
+			return -1;
+		cluster_cf_retirement_poll();
+		if (cluster_cf_held(bind->cf_mode))
+			return 1;
+	}
+	if (bind->cf.cookie != 0 && !cluster_cf_release_completed(bind->cf_mode, bind->cf.cookie))
+		return -1;
+	bind->cf_waiting = false;
+	return 0;
+}
+
+/* Runs again after ROOT/JCMK I/O, immediately before one-use ROOT bind. */
+static bool
+cluster_reconfig_join_bind_current(bool publishing)
+{
+	ClusterReconfigJoinBindContinuation *bind = &join_commit_stage.bind;
+	uint64 incarnation = 0;
+	uint64 generation = 0;
+
+	return (publishing ? cluster_reconfig_join_bind_context_current(GetCurrentTimestamp())
+							 && !bind->cf_waiting && !cluster_cf_held(ShareLock)
+							 && cluster_cf_held_is_clusterwide(ExclusiveLock)
+					   : cluster_reconfig_join_bind_cf_poll(GetCurrentTimestamp()) == 0)
+		   && cluster_reconfig_get_observed_slot(join_commit_stage.node_id, &incarnation,
+												 &generation)
+		   && incarnation == bind->observed_incarnation && generation == bind->observed_generation
+		   && cluster_membership_vet_joiner(join_commit_stage.node_id, incarnation, generation)
+				  == CLUSTER_JOIN_ACCEPT;
+}
+
 static bool
 cluster_reconfig_poll_join_commit_stage(void)
 {
@@ -3651,6 +3757,8 @@ cluster_reconfig_poll_join_commit_stage(void)
 	uint64 admitted_incarnation = 0;
 	uint64 admitted_generation = 0;
 	ClusterMarkerPollResult pr;
+	ClusterReconfigJoinBindContinuation *bind = &join_commit_stage.bind;
+	bool retained_ack = bind->marker_acked;
 
 	if (!join_commit_stage.async.has_staged_event)
 		return false;
@@ -3658,35 +3766,44 @@ cluster_reconfig_poll_join_commit_stage(void)
 	now = GetCurrentTimestamp();
 	if (join_commit_stage.fence_ready)
 		return cluster_reconfig_poll_join_fence_stage(now);
-	if (!join_commit_stage.submitted) {
-		if (!cluster_reconfig_submit_join_marker_async(
-				&join_commit_stage.async, join_commit_stage.node_id, &join_commit_stage.marker,
-				CLUSTER_MARKER_KIND_JOIN_COMMITTED, now))
+	if (retained_ack) {
+		int pending = cluster_reconfig_join_bind_cf_poll(now);
+
+		if (pending < 0)
+			goto reject_bind;
+		if (pending > 0)
 			return true;
-		join_commit_stage.submitted = true;
-		return true;
-	}
+	} else {
+		if (!join_commit_stage.submitted) {
+			if (!cluster_reconfig_submit_join_marker_async(
+					&join_commit_stage.async, join_commit_stage.node_id, &join_commit_stage.marker,
+					CLUSTER_MARKER_KIND_JOIN_COMMITTED, now))
+				return true;
+			join_commit_stage.submitted = true;
+			return true;
+		}
 
-	pr = cluster_reconfig_poll_join_marker_async(&join_commit_stage.async, now, &result,
-												 &elapsed_us);
-	if (pr == CLUSTER_MARKER_POLL_PENDING || pr == CLUSTER_MARKER_POLL_IDLE)
-		return true;
-	if (pr == CLUSTER_MARKER_POLL_TIMEOUT) {
-		cluster_reconfig_note_marker_timeout(CLUSTER_MARKER_KIND_JOIN_COMMITTED,
-											 join_commit_stage.node_id, elapsed_us);
-		cluster_reconfig_release_join_commit_stage();
-		return true;
-	}
+		pr = cluster_reconfig_poll_join_marker_async(&join_commit_stage.async, now, &result,
+													 &elapsed_us);
+		if (pr == CLUSTER_MARKER_POLL_PENDING || pr == CLUSTER_MARKER_POLL_IDLE)
+			return true;
+		if (pr == CLUSTER_MARKER_POLL_TIMEOUT) {
+			cluster_reconfig_note_marker_timeout(CLUSTER_MARKER_KIND_JOIN_COMMITTED,
+												 join_commit_stage.node_id, elapsed_us);
+			cluster_reconfig_release_join_commit_stage();
+			return true;
+		}
 
-	cluster_reconfig_note_marker_slow_ack(CLUSTER_MARKER_KIND_JOIN_COMMITTED,
-										  join_commit_stage.node_id, elapsed_us);
-	if (result != CLUSTER_JOIN_MARKER_SUBMIT_ACK) {
-		ereport(LOG,
-				(errmsg("cluster membership: COMMITTED join marker for node %d did not reach a "
-						"voting-disk majority; not committing (will retry)",
-						join_commit_stage.node_id)));
-		cluster_reconfig_release_join_commit_stage();
-		return true;
+		cluster_reconfig_note_marker_slow_ack(CLUSTER_MARKER_KIND_JOIN_COMMITTED,
+											  join_commit_stage.node_id, elapsed_us);
+		if (result != CLUSTER_JOIN_MARKER_SUBMIT_ACK) {
+			ereport(LOG,
+					(errmsg("cluster membership: COMMITTED join marker for node %d did not reach a "
+							"voting-disk majority; not committing (will retry)",
+							join_commit_stage.node_id)));
+			cluster_reconfig_release_join_commit_stage();
+			return true;
+		}
 	}
 	/* STOP04 §11.7/§11.9: a consumed external rejoin can never publish MEMBER
 	 * without the mandatory durable excluded-set shrink. */
@@ -3700,24 +3817,92 @@ cluster_reconfig_poll_join_commit_stage(void)
 	if (!cluster_reconfig_get_observed_slot(join_commit_stage.node_id, &admitted_incarnation,
 											&admitted_generation)
 		|| admitted_incarnation != join_commit_stage.admitted_incarnation
+		|| (retained_ack
+			&& (admitted_incarnation != bind->observed_incarnation
+				|| admitted_generation != bind->observed_generation))
 		|| cluster_membership_vet_joiner(join_commit_stage.node_id, admitted_incarnation,
 										 admitted_generation)
-			   != CLUSTER_JOIN_ACCEPT
-		|| (!join_commit_stage.external_rejoin_consumed
-			&& !cluster_recovery_owner_rejoin_v1(join_commit_stage.node_id,
-												 join_commit_stage.admitted_incarnation))
-		|| !cluster_reconfig_prepare_join_commit(join_commit_stage.node_id,
-												 join_commit_stage.admitted_incarnation,
-												 join_commit_stage.async.staged_expect_epoch)) {
-		pg_atomic_fetch_add_u64(&ReconfigShmem->join_reject_count, 1);
-		cluster_reconfig_release_join_commit_stage();
-		return true;
+			   != CLUSTER_JOIN_ACCEPT)
+		goto reject_bind;
+	if (!join_commit_stage.external_rejoin_consumed) {
+		bool continuation
+			= cluster_shared_config && cluster_current_phase() < CLUSTER_PHASE_RUNNING;
+		bool owner_ready;
+		uint64 before = cluster_cf_attempt_sequence();
+		ClusterRecoveryDutyKey observed_key;
+		ClusterControlRootResult owner_result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+
+		if (continuation && !retained_ack) {
+			bind->marker_acked = true;
+			bind->marker = join_commit_stage.marker;
+			bind->marker_seq = join_commit_stage.async.inflight_seq;
+			bind->expected_epoch = join_commit_stage.async.staged_expect_epoch;
+			bind->observed_incarnation = admitted_incarnation;
+			bind->observed_generation = admitted_generation;
+			bind->epoch = cluster_epoch_get_current();
+			bind->lms_generation = cluster_grd_redeclare_generation();
+			bind->boot = cluster_qvotec_get_self_incarnation();
+			bind->pid = MyProcPid;
+			bind->proc = MyProc;
+			bind->latch = MyLatch;
+		}
+		owner_ready = continuation
+						  ? cluster_recovery_owner_rejoin_checked_v1(
+								join_commit_stage.node_id, admitted_incarnation, &bind->marker,
+								bind->root_key_valid ? &bind->root_key : NULL, &observed_key,
+								cluster_reconfig_join_bind_current, &owner_result)
+						  : cluster_recovery_owner_rejoin_v1(join_commit_stage.node_id,
+															 admitted_incarnation);
+		if (!owner_ready) {
+			ClusterCfAttemptObservation attempt;
+
+			if (!continuation || owner_result != CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE
+				|| !cluster_cf_last_attempt_since(before, &attempt)
+				|| !cluster_cf_attempt_wait_slice(&attempt)
+				|| (attempt.mode != ShareLock && attempt.mode != ExclusiveLock)
+				|| (attempt.mode == ExclusiveLock
+					&& !cluster_recovery_duty_key_valid_v1(&observed_key)))
+				goto reject_bind;
+			memset(&bind->cf, 0, sizeof(bind->cf));
+			if (attempt.owner_state_at_return != CLUSTER_LOCK_OWNER_EMPTY
+				&& (!cluster_cf_retirement_snapshot(attempt.mode, NULL, &bind->cf)
+					|| bind->cf.cookie != attempt.control_owner_id
+					|| bind->cf.registry.message.key.holder.request_id != attempt.request_id
+					|| bind->cf.registry.message.key.holder.cluster_epoch != attempt.request_epoch))
+				goto reject_bind;
+			/* An initial CF-S refusal has not observed a ROOT key. Keep only
+			 * the ACK pending; the first proven read must still pass the
+			 * complete ROOT/JCMK and post-read completion checks. */
+			if (cluster_recovery_duty_key_valid_v1(&observed_key)) {
+				bind->root_key = observed_key;
+				bind->root_key_valid = true;
+			}
+			bind->cf_mode = attempt.mode;
+			bind->cf_waiting = true;
+			if (cluster_reconfig_join_bind_cf_poll(GetCurrentTimestamp()) < 0)
+				goto reject_bind;
+			return true;
+		}
 	}
+	if (!cluster_reconfig_prepare_join_commit(join_commit_stage.node_id,
+											  join_commit_stage.admitted_incarnation,
+											  join_commit_stage.async.staged_expect_epoch))
+		goto reject_bind;
 
 	if (cluster_write_fence_enforcement == CLUSTER_WRITE_FENCE_ENFORCE_ON)
 		return cluster_reconfig_poll_join_fence_stage(now);
 	if (!cluster_reconfig_publish_prepared_join_commit())
 		pg_atomic_fetch_add_u64(&ReconfigShmem->join_reject_count, 1);
+	cluster_reconfig_release_join_commit_stage();
+	return true;
+
+reject_bind:
+	if (cluster_trace_control_config)
+		ereport(LOG, (errmsg("retained join ROOT bind refused"),
+					  errdetail("PGRAC_FAMILY=CF_OWNER_WAIT consumer=join_bind node=%d "
+								"marker_seq=" UINT64_FORMAT " cookie=" UINT64_FORMAT,
+								join_commit_stage.node_id, bind->marker_seq, bind->cf.cookie)));
+	pg_atomic_fetch_add_u64(&ReconfigShmem->join_reject_count, 1);
 	cluster_reconfig_release_join_commit_stage();
 	return true;
 }
@@ -10163,6 +10348,7 @@ cluster_reconfig_commit_member(int32 node_id, uint64 admitted_incarnation)
 	join_commit_stage.submitted = false;
 	join_commit_stage.fence_ready = false;
 	join_commit_stage.external_rejoin_consumed = external_required;
+	memset(&join_commit_stage.bind, 0, sizeof(join_commit_stage.bind));
 	(void)cluster_reconfig_poll_join_commit_stage();
 
 	return false;

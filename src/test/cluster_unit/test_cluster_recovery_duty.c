@@ -145,6 +145,15 @@ cluster_recovery_owner_import_read_v1(int32 node_id, const ClusterWalThreadClaim
 	return ut_owner_read_result;
 }
 
+ClusterRecoveryOwnerImportResult
+cluster_recovery_owner_import_read_marker_v1(int32 node_id, const ClusterWalThreadClaim *claim,
+											 uint64 lo, uint64 hi,
+											 const ClusterJoinCommitMarker *expected, uint64 *out)
+{
+	(void)expected;
+	return cluster_recovery_owner_import_read_v1(node_id, claim, lo, hi, out);
+}
+
 ClusterControlRootResult
 cluster_control_root_compare_and_publish(const ClusterControlRootReadToken *expected_token,
 										 const ClusterControlRootPatch *patch,
@@ -221,6 +230,17 @@ cluster_control_root_compare_and_publish(const ClusterControlRootReadToken *expe
 		memset(out_token, 0, sizeof(*out_token));
 	}
 	return ut_root_publish_result;
+}
+
+ClusterControlRootResult
+cluster_control_root_rejoin_compare_and_publish_checked(
+	const ClusterControlRootReadToken *expected_token, const ClusterControlRootPatch *patch,
+	ClusterControlRootPublishReason reason, ClusterControlRootSnapshot *out_snapshot,
+	ClusterControlRootReadToken *out_token, bool (*revalidate)(bool))
+{
+	UT_ASSERT(revalidate == NULL);
+	return cluster_control_root_compare_and_publish(expected_token, patch, reason, out_snapshot,
+													out_token);
 }
 
 void *

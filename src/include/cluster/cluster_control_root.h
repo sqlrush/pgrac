@@ -593,6 +593,11 @@ extern ClusterControlRootResult
 cluster_control_root_read_recovery_subject(uint16 origin_thread,
 										   const ClusterControlRootIdentity *expected,
 										   ClusterControlRecoverySubject *out);
+/* Rejoin's local stage revalidation, immediately before physical publication. */
+extern ClusterControlRootResult cluster_control_root_rejoin_compare_and_publish_checked(
+	const ClusterControlRootReadToken *expected_token, const ClusterControlRootPatch *patch,
+	ClusterControlRootPublishReason reason, ClusterControlRootSnapshot *out_snapshot,
+	ClusterControlRootReadToken *out_token, bool (*revalidate)(bool publishing));
 extern ClusterControlRootResult cluster_control_root_compare_and_publish(
 	const ClusterControlRootReadToken *expected_token, const ClusterControlRootPatch *patch,
 	ClusterControlRootPublishReason reason, ClusterControlRootSnapshot *out_snapshot,

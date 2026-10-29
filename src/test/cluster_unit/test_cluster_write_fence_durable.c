@@ -117,6 +117,8 @@ cluster_voting_disk_read_join_slot(int fd, uint32 node_id, void *out_slot512)
 	return CLUSTER_VOTING_DISK_IO_OK;
 }
 
+static const ClusterJoinCommitMarker *owner_expected_marker;
+
 ClusterRecoveryOwnerImportResult
 cluster_recovery_owner_import_select_v1(int32 node_id, const ClusterWalThreadClaim *immutable_claim,
 										uint64 frozen_admitted_bitmap_low,
@@ -134,6 +136,17 @@ cluster_recovery_owner_import_select_v1(int32 node_id, const ClusterWalThreadCla
 	UT_ASSERT_EQ(samples[1].slot.incarnation, 70);
 	*out_incarnation = 77;
 	return CLUSTER_RECOVERY_OWNER_IMPORT_JCMK;
+}
+
+ClusterRecoveryOwnerImportResult
+cluster_recovery_owner_import_select_marker_v1(int32 node_id, const ClusterWalThreadClaim *claim,
+											   uint64 lo, uint64 hi,
+											   const ClusterRecoveryOwnerDiskSampleV1 *samples,
+											   int count, const ClusterJoinCommitMarker *expected,
+											   uint64 *out)
+{
+	UT_ASSERT(expected == owner_expected_marker);
+	return cluster_recovery_owner_import_select_v1(node_id, claim, lo, hi, samples, count, out);
 }
 
 static ClusterFenceMarker
@@ -164,6 +177,7 @@ reset_mock(void)
 	mock_open_fd_count = 0;
 	cache_invalidation_count = 0;
 	owner_selector_total = 0;
+	owner_expected_marker = NULL;
 	cluster_write_fence_enforcement = CLUSTER_WRITE_FENCE_ENFORCE_ON;
 }
 
@@ -180,6 +194,12 @@ UT_TEST(test_owner_import_runtime_reads_every_distinct_disk)
 	mock_join_slots[0].admitted_incarnation = 77;
 	mock_owner_incarnations[1] = 70;
 	UT_ASSERT_EQ(cluster_recovery_owner_import_read_v1(0, &claim, 1, 0, &incarnation),
+				 CLUSTER_RECOVERY_OWNER_IMPORT_JCMK);
+	UT_ASSERT_EQ(owner_selector_total, 3);
+	UT_ASSERT_EQ(incarnation, 77);
+	owner_expected_marker = &mock_join_slots[0];
+	UT_ASSERT_EQ(cluster_recovery_owner_import_read_marker_v1(0, &claim, 1, 0,
+															  owner_expected_marker, &incarnation),
 				 CLUSTER_RECOVERY_OWNER_IMPORT_JCMK);
 	UT_ASSERT_EQ(owner_selector_total, 3);
 	UT_ASSERT_EQ(incarnation, 77);
