@@ -1112,4 +1112,11 @@ extern ResourceXApplyResult cluster_bufmgr_pcm_own_acquire_resume_disk_exact(
 	const struct ClusterSemanticAdmissionToken *admission, const ResourceXDeliveryClaim *original,
 	ResourceXDeliveryClaim *execution_out, uint8 *phase_out);
 
+/* Explicit original ARMED disk/S continuation. Revalidate retained I and
+ * actual native cut; execute only missing C/IO/publication, never reread. */
+extern ResourceXApplyResult cluster_bufmgr_pcm_own_acquire_continue_disk_exact(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
+	const ResourceXDecodedAcquireIntent *episode,
+	const struct ClusterSemanticAdmissionToken *admission, const ResourceXDeliveryClaim *original);
+
 #endif /* CLUSTER_PCM_X_BUFMGR_H */
