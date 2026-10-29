@@ -3182,6 +3182,86 @@ ClusterColdRecoveryCtrcTxRecord(const struct ClusterRecoveryStartV1 *start,
 	return out;
 }
 
+/* Match original value fields; C structure padding is not source identity. */
+static bool
+cluster_recovery_cold_native_record_source_matches(const ClusterRecoveryNativeRecord *record,
+	const ClusterRecoveryWalSourceObservationV1 *source)
+{
+	const ClusterWalSourceRef *a = &record->source, *b = &source->source;
+	const RfContributorStreamCutV1 *x = &record->cut, *y = &source->cut;
+	const ClusterControlRootIdentity *left = &a->claim.identity, *right = &b->claim.identity;
+
+	return left->system_identifier == right->system_identifier
+		&& memcmp(left->storage_uuid, right->storage_uuid, 16) == 0
+		&& memcmp(left->authority_uuid, right->authority_uuid, 16) == 0
+		&& left->origin_thread_id == right->origin_thread_id
+		&& left->reserved42 == 0 && right->reserved42 == 0
+		&& left->origin_node_id == right->origin_node_id
+		&& left->thread_claim_created_at == right->thread_claim_created_at
+		&& left->thread_claim_crc32c == right->thread_claim_crc32c
+		&& left->reserved60 == 0 && right->reserved60 == 0
+		&& left->origin_owner_incarnation == right->origin_owner_incarnation
+		&& left->root_lineage_seq == right->root_lineage_seq
+		&& a->claim.database_incarnation == b->claim.database_incarnation
+		&& a->claim.max_config_generation == b->claim.max_config_generation
+		&& memcmp(a->claim.claim_sha256, b->claim.claim_sha256, 32) == 0
+		&& a->timeline == b->timeline
+		&& x->failed_thread == y->failed_thread && x->flags == y->flags
+		&& x->timeline_id == y->timeline_id && x->scan_begin_inclusive == y->scan_begin_inclusive
+		&& x->scan_end_exclusive == y->scan_end_exclusive
+		&& x->contributor_count == y->contributor_count && x->component_count == y->component_count
+		&& x->origin_owner_incarnation == y->origin_owner_incarnation;
+}
+
+ClusterRecoveryNativeRecordObservationV1
+ClusterColdRecoveryCtrcNativeRecord(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work, uint64 index)
+{
+	ClusterRecoveryNativeRecordObservationV1 out = {0};
+	struct ClusterRecoveryStartV1 *state = cluster_recovery_cold_start;
+	ClusterRecoveryNativeEffect empty = {0};
+	bool held = false;
+
+	if (start == NULL || start != state || CritSectionCount != 0 || ShutdownRequestPending
+		|| !start->ctrc_observation_complete || work != start->ctrc_observation_work
+		|| index > start->ctrc_observation_manifest.native_effect_count) return out;
+	ForEachLWLockHeldByMe(cluster_recovery_cold_ctrc_lock_held, &held);
+	if (held || !ClusterColdRecoveryCtrcObserve(start, 0)) return out;
+	PG_TRY();
+	{
+		ClusterRecoveryNativeRecordObservationV1 current = cluster_recovery_census_native_record_v1(
+			state->ctrc_observation_census, index);
+		ClusterRecoveryWalSourceObservationV1 source;
+		bool ok = current.observed && current.index == index && index <= current.count
+			&& current.count <= state->ctrc_observation_manifest.native_effect_count
+			&& current.source_count == state->ctrc_observation_manifest.source_count;
+
+		if (ok && index == current.count)
+			ok = current.source_index == 0 && current.record_ordinal == 0
+				&& memcmp(&current.primary, &empty, sizeof(empty)) == 0;
+		else if (ok)
+			ok = current.primary.record != NULL && current.primary.kind != 0
+				&& current.source_index < current.source_count
+				&& cluster_recovery_census_wal_source_at_v1(state->ctrc_observation_census,
+					current.source_index, &source)
+				&& source.source_index == current.source_index
+				&& cluster_recovery_cold_native_record_source_matches(current.primary.record, &source);
+		if (ok && ClusterColdRecoveryCtrcObserve(start, 0)) out = current;
+		else {
+			cluster_recovery_cold_observation_refuse(state, "native_record", 0);
+			cluster_recovery_cold_observation_close(state);
+		}
+	}
+	PG_CATCH();
+	{
+		cluster_recovery_cold_observation_refuse(state, "native_record_error", 0);
+		cluster_recovery_cold_observation_close(state);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return out;
+}
+
 ClusterRecoveryCensusTxDependencyV1
 ClusterColdRecoveryCtrcTxDependency(const struct ClusterRecoveryStartV1 *start,
 	const struct ClusterColdCtrcWorkV1 *work, uint32 index)

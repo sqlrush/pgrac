@@ -1120,6 +1120,52 @@ cluster_recovery_census_tx_record_v1(ClusterRecoveryCensus *census, uint32 index
 	return out;
 }
 
+ClusterRecoveryNativeRecordObservationV1
+cluster_recovery_census_native_record_v1(ClusterRecoveryCensus *census, uint64 index)
+{
+	ClusterRecoveryNativeRecordObservationV1 out = {0};
+	ClusterRecoveryCensusManifest before, after;
+	ClusterRecoveryNativeEffect empty = {0};
+	bool held = false;
+	bool ok = false;
+
+	if (census == NULL || census->status != CLUSTER_RECOVERY_CENSUS_DRAINED
+		|| CritSectionCount != 0 || ShutdownRequestPending
+		|| census->diag.inventory.undo_records > UINT64_MAX - census->diag.inventory.native_records
+		|| index > census->diag.inventory.native_records + census->diag.inventory.undo_records) return out;
+	ForEachLWLockHeldByMe(census_page_lock_held, &held);
+	if (held) return out;
+	PG_TRY();
+	{
+		if (cluster_recovery_census_manifest(census, &before)) {
+			ClusterRecoveryNativeRecordObservationV1 current
+				= cluster_recovery_native_inventory_record_v1(census->inventory, index);
+
+			ok = current.observed && current.index == index
+				&& current.count == census->diag.inventory.native_records + census->diag.inventory.undo_records
+				&& current.count <= before.native_effect_count
+				&& current.source_count == before.source_count
+				&& (index == current.count
+					? current.source_index == 0 && current.record_ordinal == 0
+						&& memcmp(&current.primary, &empty, sizeof(empty)) == 0
+					: current.primary.record != NULL && current.primary.kind != 0
+						&& current.source_index < current.source_count)
+				&& cluster_recovery_census_manifest(census, &after)
+				&& memcmp(&before, &after, sizeof(before)) == 0
+				&& current.count == census->diag.inventory.native_records + census->diag.inventory.undo_records;
+			if (ok) out = current;
+		}
+		if (!ok) (void)census_fail(census, CLUSTER_RECOVERY_CENSUS_REFUSED);
+	}
+	PG_CATCH();
+	{
+		(void)census_fail(census, CLUSTER_RECOVERY_CENSUS_REFUSED);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return out;
+}
+
 ClusterRecoveryCensusTxDependencyV1
 cluster_recovery_census_tx_dependency_v1(ClusterRecoveryCensus *census, uint32 index)
 {

@@ -1250,6 +1250,51 @@ cluster_recovery_native_inventory_next(ClusterRecoveryNativeInventory *inventory
 	return inventory->status;
 }
 
+ClusterRecoveryNativeRecordObservationV1
+cluster_recovery_native_inventory_record_v1(ClusterRecoveryNativeInventory *inventory,
+	uint64 index)
+{
+	ClusterRecoveryNativeRecordObservationV1 out = {0};
+	NativeInventoryRecord *saved;
+	ClusterRecoveryNativeEffect primary = {0};
+	uint64 position = 0, count;
+
+	if (inventory == NULL || !inventory->complete
+		|| inventory->status != CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED) return out;
+	if (inventory->diag.undo_records > UINT64_MAX - inventory->diag.native_records) {
+		inventory->complete = false;
+		(void)inventory_refuse(inventory, CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED,
+			RF_PAGE_PROOF_DETAIL_SOURCE_GAP);
+		return out;
+	}
+	count = inventory->diag.native_records + inventory->diag.undo_records;
+	if (index > count) return out;
+	for (saved = inventory->head; saved != NULL && position < index; saved = saved->next)
+		position++;
+	if (position != index || (index == count ? saved != NULL
+		: saved == NULL || saved->source_index >= inventory->source_count
+			|| cluster_recovery_native_scan_primary(saved->scan, &primary)
+				!= CLUSTER_RECOVERY_NATIVE_EFFECT
+			|| primary.record == NULL
+			|| !inventory_source_equal(&primary.record->source,
+				&inventory->sources[saved->source_index].source)
+			|| !inventory_cut_equal(&primary.record->cut,
+				&inventory->sources[saved->source_index].cut))) {
+		inventory->complete = false;
+		(void)inventory_refuse(inventory, CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED,
+			RF_PAGE_PROOF_DETAIL_SOURCE_GAP);
+		return out;
+	}
+	out.observed = true;
+	out.index = index; out.count = count;
+	out.source_count = inventory->source_count;
+	if (saved != NULL) {
+		out.source_index = saved->source_index; out.record_ordinal = saved->ordinal;
+		out.primary = primary;
+	}
+	return out;
+}
+
 static ClusterRecoveryTerminalResult
 inventory_terminal_fail(ClusterRecoveryNativeInventory *inventory,
 						ClusterRecoveryTerminalResult result)

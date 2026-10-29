@@ -286,6 +286,14 @@ typedef struct ClusterRecoveryCensusTxRecordV1 {
 extern ClusterRecoveryCensusTxRecordV1
 cluster_recovery_census_tx_record_v1(ClusterRecoveryCensus *census, uint32 index);
 
+/* Entire original saved native WAL record set after DRAINED, with complete
+ * payloads and source positions. Same complete manifest/current, pre-lock,
+ * borrowed lifetime and entered failure/ERROR contract as tx_record_v1.
+ * Complete end is observed with index==count and empty primary. Does not
+ * consume the original effect cursor, qualify owners or discharge debt. */
+extern ClusterRecoveryNativeRecordObservationV1 cluster_recovery_census_native_record_v1(
+	ClusterRecoveryCensus *census, uint64 index);
+
 /* Final physical TX_RECORD check through the SAME original undo namespace,
  * bracketed by complete saved manifest/source/current checks. No new graph,
  * scope, baseline or progress. RECORD matches one original node, count is

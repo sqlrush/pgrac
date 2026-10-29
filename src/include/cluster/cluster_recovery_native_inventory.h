@@ -578,6 +578,26 @@ cluster_recovery_native_inventory_recheck(ClusterWalInputsV1 *inputs,
 extern ClusterRecoveryNativeInventoryResult
 cluster_recovery_native_inventory_next(ClusterRecoveryNativeInventory *inventory,
 									   ClusterRecoveryNativeEffect *out);
+/* Complete saved native records, independent of every effect/fold cursor.
+ * Includes all original payload arrays, not just effects naming the query or
+ * a PAGE. source_index is the original physical source order; record_ordinal
+ * is the position within that source's complete WAL transcript. Other WAL
+ * families remain separate obligations in the original manifest.
+ *
+ * observed with index==count and an empty primary is complete end, including
+ * count zero. Invalid/incomplete/refused/range results are all zero. Pointers
+ * borrow the original inventory lifetime and must not be modified. No I/O,
+ * allocation, physical reread, progress or authority is supplied; the caller
+ * must bracket use with the original complete source/current checks. Indexed
+ * access walks the saved list and never rewinds or consumes an old cursor. */
+typedef struct ClusterRecoveryNativeRecordObservationV1 {
+	bool observed;
+	uint64 index, count, record_ordinal;
+	uint32 source_index, source_count;
+	ClusterRecoveryNativeEffect primary;
+} ClusterRecoveryNativeRecordObservationV1;
+extern ClusterRecoveryNativeRecordObservationV1 cluster_recovery_native_inventory_record_v1(
+	ClusterRecoveryNativeInventory *inventory, uint64 index);
 /* Join each retained SET_HEAD with its last preceding TT_BIND in the same
  * source/cut, with no intervening segment lifecycle change. Missing or
  * overwritten identity refuses; current TT generations are never guessed.

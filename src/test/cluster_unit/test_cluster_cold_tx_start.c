@@ -2431,6 +2431,7 @@ static void startup_local_empty_reset(void);
 
 #include "test_cluster_cold_ctrc_references.inc"
 #include "test_cluster_cold_ctrc_tx_records.inc"
+#include "test_cluster_cold_ctrc_native_records.inc"
 #include "test_cluster_cold_ctrc_tx_dependencies.inc"
 #include "test_cluster_cold_ctrc_tx_reference_edges.inc"
 #include "test_cluster_cold_ctrc_reference_terminals.inc"
@@ -2882,11 +2883,18 @@ int main(void)
 		UT_RUN(test_start_tx_records_error_cleans_original_observation_in_order);
 		UT_DONE(); return ut_failed_count != 0;
 	}
+	if (getenv("PGRAC_PRE2_TEST_START_NATIVE_RECORDS") != NULL) {
+		UT_PLAN(3);
+	UT_RUN(test_start_native_records_complete_unfiltered_input_and_empty_end);
+	UT_RUN(test_start_native_records_preconditions_do_not_enter_or_replace_owner);
+	UT_RUN(test_start_native_records_late_shape_source_owner_and_error_revoke_whole_view);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_FIRST
-	UT_PLAN(349);
+	UT_PLAN(352);
 #else
-	UT_PLAN(345);
+	UT_PLAN(348);
 #endif
 	UT_RUN(test_startup_native_images_accept_only_unchanged_complete_terminal_page);
 	UT_RUN(test_startup_native_images_reject_unresolved_ambiguous_and_mx_itls);
@@ -2897,8 +2905,11 @@ int main(void)
 	UT_RUN(test_startup_native_directory_real_origin_cannot_be_discharged_by_wait);
 	UT_RUN(test_startup_native_directory_invalid_layout_and_partial_error_keep_debt);
 #else
-	UT_PLAN(337);
+	UT_PLAN(340);
 #endif
+	UT_RUN(test_start_native_records_complete_unfiltered_input_and_empty_end);
+	UT_RUN(test_start_native_records_preconditions_do_not_enter_or_replace_owner);
+	UT_RUN(test_start_native_records_late_shape_source_owner_and_error_revoke_whole_view);
 	UT_RUN(test_startup_history_uses_original_finite_cohort_floor);
 	UT_RUN(test_startup_history_missing_equal_stale_reports_wait_without_rebase);
 	UT_RUN(test_startup_history_wait_repeats_physical_checks_and_keeps_debt);

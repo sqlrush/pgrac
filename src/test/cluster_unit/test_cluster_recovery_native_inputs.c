@@ -69,7 +69,11 @@ static ClusterRecoveryGraphResult census_dependency_test_at(const ClusterRecover
 static ClusterRecoveryGraphResult census_ref_test_find(const ClusterRecoveryReferenceGraph *,
  const ClusterRecoveryTxnKey *,UBA,ClusterRecoveryGraphDependency *);
 #define cluster_recovery_reference_graph_dependency_find census_ref_test_find
+static ClusterRecoveryNativeRecordObservationV1 census_native_test_record(
+ ClusterRecoveryNativeInventory *, uint64);
+#define cluster_recovery_native_inventory_record_v1 census_native_test_record
 #include "../../backend/cluster/cluster_recovery_census.c"
+#undef cluster_recovery_native_inventory_record_v1
 #undef cluster_recovery_reference_graph_dependency_find
 #undef cluster_recovery_root_set_read_current_relation
 #undef HandleStartupProcInterrupts
@@ -1148,6 +1152,7 @@ cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **held)
 #include "test_cluster_recovery_census_namespace.inc"
 
 #include "test_cluster_recovery_census_tx_records.inc"
+#include "test_cluster_recovery_census_native_records.inc"
 #include "test_cluster_recovery_census_tx_dependencies.inc"
 #include "test_cluster_recovery_census_tx_reference_edges.inc"
 #include "test_cluster_recovery_census_tx_recheck.inc"
@@ -1508,7 +1513,20 @@ main(int argc, char **argv)
 		UT_RUN(test_census_references_bound_metadata_and_tuple_storage_before_publication);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(277);
+	if (getenv("PGRAC_PRE2_TEST_CENSUS_NATIVE_RECORDS") != NULL) {
+		UT_PLAN(4);
+	UT_RUN(test_census_native_records_keep_entire_payload_source_and_drained_cursor);
+	UT_RUN(test_census_native_records_prefix_locks_and_range_do_not_enter);
+	UT_RUN(test_census_native_records_late_current_shape_and_error_are_sticky);
+	UT_RUN(test_census_native_records_original_final_wal_rewrite_refuses_whole_view);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	UT_PLAN(281);
+	UT_RUN(test_census_native_records_keep_entire_payload_source_and_drained_cursor);
+	UT_RUN(test_census_native_records_prefix_locks_and_range_do_not_enter);
+	UT_RUN(test_census_native_records_late_current_shape_and_error_are_sticky);
+	UT_RUN(test_census_native_records_original_final_wal_rewrite_refuses_whole_view);
+
 	UT_RUN(test_census_tx_final_recheck_accepts_original_complete_files_and_empty_end);
 	UT_RUN(test_census_tx_final_recheck_detects_same_inode_late_predecessor_rewrite);
 	UT_RUN(test_census_tx_final_recheck_does_not_enter_under_locks_or_stale_source);

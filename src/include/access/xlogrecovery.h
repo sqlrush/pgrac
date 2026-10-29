@@ -334,6 +334,16 @@ extern struct ClusterRecoveryCensusTxRecordV1 ClusterColdRecoveryCtrcTxRecord(
 	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work,
 	uint32 index);
 
+/* Complete original native WAL records through the same Start/work and full
+ * simultaneous IR/WALR observation. Keeps complete payloads/source positions,
+ * including nontransaction/query records; other WAL remains in the manifest.
+ * Same pre-PAGE/current, borrowed lifetime and sticky cleanup as TxRecord.
+ * observed/index==count/empty primary is complete end, not discharge or OPEN. */
+struct ClusterRecoveryNativeRecordObservationV1;
+extern struct ClusterRecoveryNativeRecordObservationV1 ClusterColdRecoveryCtrcNativeRecord(
+	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work,
+	uint64 index);
+
 /* Exact roots and resolved TX predecessor edges of this SAME complete
  * original Start/work/accepted-TX/full simultaneous ALL IR-WALR observation.
  * Same pre-PAGE checks, borrowed lifetime, whole-output failure and original
