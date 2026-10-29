@@ -61,7 +61,9 @@ master_done_stage(PublishFixture *f)
 static void
 master_done_send(PublishFixture *f)
 {
-	ResourceXIntentSlot slot = master_done_stage(f);
+	/* The original GCS ready tick may already own the physical stage. */
+	ResourceXIntentSlot slot = f->state->grant_intent.slot.state == RESOURCE_X_INTENT_SLOT_STAGED
+		? f->state->grant_intent.slot : master_done_stage(f);
 	UT_ASSERT(cluster_pcm_lock_resource_x_outbound_transport_complete_exact(
 		&slot, true, ++fake_pcm_clock_us));
 }
@@ -101,6 +103,10 @@ master_done_quiet(PublishFixture *f)
 	static const ClusterPcmResourceXDeferredSettlement empty_deferred;
 	struct StopPcmEntryLayout *directory = (struct StopPcmEntryLayout *)fake_pcm_entries.data[0];
 	int node = f->request.common.logical_assertion.requester_node;
+	/* Master consumption now retains notification debt until its real callback. */
+	UT_ASSERT_EQ(f->state->deferred_settlement.present, 3);
+	UT_ASSERT_EQ(f->state->grant_intent.slot.kind, RESOURCE_X_WIRE_INSTALL_SETTLEMENT);
+	master_done_send(f);
 	UT_ASSERT_EQ(f->state->requests[node].phase, RESOURCE_X_MASTER_NONE);
 	UT_ASSERT(memcmp(&f->state->requests[node], &empty_request, sizeof(empty_request)) == 0);
 	UT_ASSERT_EQ(f->state->bootstrap_priority[node].state, RESOURCE_X_BOOTSTRAP_PRIORITY_EMPTY);
@@ -261,6 +267,8 @@ UT_TEST(test_master_done_fifo_survives_exact_head_completion)
 	UT_ASSERT_EQ(acquire_deliver(&next), RESOURCE_X_APPLY_APPLIED);
 	master_done_send(&f);
 	UT_ASSERT_EQ(master_done_receive(&done), RESOURCE_X_APPLY_APPLIED);
+	/* Complete the newly required original notification before admitting a successor. */
+	master_done_send(&f);
 	later = bootstrap_next_work();
 	UT_ASSERT_EQ(later.request.logical_assertion.requester_node, 2);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_resume_exact(&later, &ack), RESOURCE_X_APPLY_APPLIED);
@@ -274,6 +282,7 @@ UT_TEST(test_master_done_late_duplicate_cannot_clear_same_node_successor)
 	if (!master_done_start(&f, &done)) return;
 	master_done_send(&f);
 	UT_ASSERT_EQ(master_done_receive(&done), RESOURCE_X_APPLY_APPLIED);
+	master_done_send(&f);
 	next = f.request; next.common.assertion_sequence++;
 	next.body.acquire_intent.reservation_token++;
 	UT_ASSERT_EQ(acquire_deliver(&next), RESOURCE_X_APPLY_APPLIED);
@@ -373,6 +382,8 @@ UT_TEST(test_master_done_later_a_overwrites_only_nonauthority_replay_history)
 	if (!master_done_start(&f, &done)) return;
 	master_done_send(&f);
 	UT_ASSERT_EQ(master_done_receive(&done), RESOURCE_X_APPLY_APPLIED);
+	/* Complete the newly required original notification before admitting a successor. */
+	master_done_send(&f);
 	next = acquire_frame(2, RESOURCE_X_ACQUIRE_FIRST_FILL, PCM_STATE_N, PCM_STATE_S);
 	UT_ASSERT_EQ(acquire_deliver(&next), RESOURCE_X_APPLY_APPLIED);
 	work = bootstrap_next_work();

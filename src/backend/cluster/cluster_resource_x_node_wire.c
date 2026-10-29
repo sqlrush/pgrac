@@ -620,7 +620,9 @@ resource_x_pair_common_valid(uint8 msg_type, ResourceXWireKind kind,
 			 || (kind == RESOURCE_X_WIRE_INSTALL_SETTLEMENT && msg_type == RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE))
 			&& !acquire_intent) {
 			ResourceXDecodedCommon decision = *common;
-			if (common->outcome != RESOURCE_X_OUTCOME_OK) {
+			if (common->outcome != RESOURCE_X_OUTCOME_OK
+				&& !(kind == RESOURCE_X_WIRE_INSTALL_SETTLEMENT
+					&& common->outcome == RESOURCE_X_OUTCOME_DUPLICATE)) {
 				resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_ENUM);
 				return false;
 			}
@@ -654,10 +656,11 @@ resource_x_pair_common_valid(uint8 msg_type, ResourceXWireKind kind,
 /* REQUEST keeps its independent format; conditional A and its envelopes
  * require their current complete format, including the disk watermark. */
 static uint8
-resource_x_frame_version(ResourceXWireKind kind, uint16 len)
+resource_x_frame_version(ResourceXWireKind kind, uint16 len, uint8 outcome)
 {
 	if (len == RESOURCE_X_COMPLETE_V5_BYTES)
-		return RESOURCE_X_COMPLETION_WIRE_VERSION;
+		return outcome == RESOURCE_X_OUTCOME_DUPLICATE
+			? RESOURCE_X_CONSUMED_WIRE_VERSION : RESOURCE_X_COMPLETION_WIRE_VERSION;
 	if (len == RESOURCE_X_ACQUIRE_V3_BYTES)
 		return RESOURCE_X_ACQUIRE_WIRE_VERSION;
 	if (len == RESOURCE_X_DECISION_V4_BYTES || len == RESOURCE_X_WITNESS_V4_BYTES
@@ -671,7 +674,7 @@ static void
 resource_x_common_encode(uint8 *bytes, ResourceXWireKind kind, const ResourceXDecodedCommon *common,
 						 uint16 len)
 {
-	bytes[0] = resource_x_frame_version(kind, len);
+	bytes[0] = resource_x_frame_version(kind, len, common->outcome);
 	bytes[1] = (uint8)kind;
 	resource_x_put_u16(bytes + 2, len);
 	resource_x_assertion_encode(bytes + 8, &common->logical_assertion);
@@ -829,6 +832,9 @@ resource_x_decision_body_valid(const ResourceXDecodedFrame *frame)
 				   || source_bit == requester_bit)
 			return false;
 	}
+	if (frame->kind == RESOURCE_X_WIRE_INSTALL_SETTLEMENT
+		&& frame->common.outcome == RESOURCE_X_OUTCOME_DUPLICATE)
+		return frame->common.action_node == body->master_node;
 	if (frame->kind == RESOURCE_X_WIRE_AUTHORITY_GRANT || frame->kind == RESOURCE_X_WIRE_INSTALL_SETTLEMENT)
 		return frame->common.action_node == frame->common.logical_assertion.requester_node;
 	if (frame->kind != RESOURCE_X_WIRE_BLOCK_TO_N || body->source_kind == RESOURCE_X_ACQUIRE_SOURCE_DISK)
@@ -1611,7 +1617,7 @@ cluster_resource_x_wire_decode(uint8 msg_type, const void *payload, uint16 paylo
 		resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_TYPE_KIND);
 		return false;
 	}
-	if (bytes[0] != resource_x_frame_version(kind, payload_len)) {
+	if (bytes[0] != resource_x_frame_version(kind, payload_len, bytes[80])) {
 		resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_VERSION);
 		return false;
 	}

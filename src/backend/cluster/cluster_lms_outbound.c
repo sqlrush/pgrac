@@ -558,9 +558,11 @@ lms_outbound_resource_x_intent_valid(const ResourceXIntentSlot *intent)
 			   && intent->body.owner_generation == intent->logical_generation
 			   && intent->body.owner_index == 0;
 	case RESOURCE_X_INTENT_OWNER_MASTER_GRANT:
-		return (intent->payload_bytes == RESOURCE_X_PROOF_V1_BYTES
-				|| intent->payload_bytes == RESOURCE_X_DECISION_V4_BYTES)
-			   && intent->kind == RESOURCE_X_WIRE_AUTHORITY_GRANT
+		return ((intent->kind == RESOURCE_X_WIRE_AUTHORITY_GRANT
+				&& (intent->payload_bytes == RESOURCE_X_PROOF_V1_BYTES
+					|| intent->payload_bytes == RESOURCE_X_DECISION_V4_BYTES))
+			   || (intent->kind == RESOURCE_X_WIRE_INSTALL_SETTLEMENT
+				&& intent->payload_bytes == RESOURCE_X_COMPLETE_V5_BYTES))
 			   && intent->body.assertion.requester_node == (int32)intent->destination_node
 			   && intent->body.owner_generation == intent->authority_generation
 			   && intent->body.owner_index == 0;
@@ -634,10 +636,18 @@ lms_outbound_resource_x_intent_payload_valid(const ResourceXIntentSlot *intent,
 		|| common->assertion_sequence != intent->logical_generation
 		|| common->authority_generation != intent->authority_generation)
 		return false;
-	if (intent->payload_bytes == RESOURCE_X_COMPLETE_V5_BYTES)
+	if (intent->payload_bytes == RESOURCE_X_COMPLETE_V5_BYTES) {
+		decision = &frame.body.acquire_completion.decision;
+		if (intent->body.owner_kind == RESOURCE_X_INTENT_OWNER_MASTER_GRANT)
+			return common->outcome == RESOURCE_X_OUTCOME_DUPLICATE
+				&& common->action_node == (int32)intent->body.owner_node
+				&& decision->master_node == (int32)intent->body.owner_node
+				&& common->logical_assertion.requester_node == (int32)intent->destination_node;
 		return intent->body.owner_kind == RESOURCE_X_INTENT_OWNER_REQUESTER_SETTLEMENT
+			&& common->outcome == RESOURCE_X_OUTCOME_OK
 			&& common->action_node == (int32)intent->body.owner_node
-			&& frame.body.acquire_completion.decision.master_node == (int32)intent->destination_node;
+			&& decision->master_node == (int32)intent->destination_node;
+	}
 	if (intent->body.owner_kind == RESOURCE_X_INTENT_OWNER_MASTER_BLOCK
 		|| intent->body.owner_kind == RESOURCE_X_INTENT_OWNER_MASTER_GRANT) {
 		decision = &frame.body.acquire_decision;

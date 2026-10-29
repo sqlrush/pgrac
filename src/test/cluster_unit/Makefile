@@ -5600,7 +5600,7 @@ test_cluster_pcm_settlement_ingress.inc: $(top_srcdir)/src/backend/cluster/clust
 	     END { if (count != 4 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_pcm_lock test_cluster_pcm_object_retire test_cluster_pcm_stop_cv test_cluster_pcm_read_grant test_cluster_resource_x_acquire_ingress test_cluster_resource_x_decision_send test_cluster_resource_x_decision_publish test_cluster_resource_x_holder_send test_cluster_resource_x_master_ack test_cluster_resource_x_master_done test_cluster_resource_x_source_ack test_cluster_resource_x_s_source: %: %.c test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
+test_cluster_pcm_lock test_cluster_pcm_object_retire test_cluster_pcm_stop_cv test_cluster_pcm_read_grant test_cluster_resource_x_acquire_ingress test_cluster_resource_x_decision_send test_cluster_resource_x_decision_publish test_cluster_resource_x_holder_send test_cluster_resource_x_master_ack test_cluster_resource_x_master_done test_cluster_resource_x_master_consumed test_cluster_resource_x_source_ack test_cluster_resource_x_s_source: %: %.c test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
 		test_cluster_pcm_master_durable.inc \
 		test_cluster_pcm_bootstrap_tick.inc \
 		test_cluster_pcm_settlement_ingress.inc \
@@ -10694,3 +10694,35 @@ clean distclean maintainer-clean: clean-resource-x-master-done
 clean-resource-x-master-done:
 	rm -f test_cluster_resource_x_master_done test_cluster_resource_x_master_done_ingress.inc \
 		test_cluster_resource_x_master_done_ingress.inc.tmp
+
+# Master consumed-notification uses the original grant transport owner.
+TESTS += test_cluster_resource_x_master_consumed
+all: test_cluster_resource_x_master_consumed
+test_cluster_resource_x_master_consumed: test_cluster_resource_x_master_done_fixture.inc \
+		test_cluster_resource_x_consumed_lms.inc test_cluster_resource_x_consumed_ring.inc \
+		test_cluster_resource_x_master_done_ingress.inc test_cluster_resource_x_master_ack_fixture.inc \
+		test_cluster_resource_x_decision_owner_layout.inc test_cluster_resource_x_acquire_fixture.inc \
+		test_cluster_resource_x_acquire_candidate.inc cluster_unit_port_stubs.o cluster_catalog_trace_test.o
+test_cluster_resource_x_master_done_fixture.inc: test_cluster_resource_x_master_done.c Makefile
+	awk '/^UT_TEST\(/ { stop=1 } !stop { print; lines++ } \
+	     END { if (!stop || lines < 50) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_resource_x_consumed_lms.inc: $(top_srcdir)/src/backend/cluster/cluster_lms_outbound.c Makefile
+	awk '/^lms_outbound_resource_x_intent_(valid|payload_valid)\(/ { print "static bool"; emit=1; found++ } \
+	     /^lms_outbound_resource_x_intent_msg_type\(/ { print "static uint8"; emit=1; found++ } \
+	     /^cluster_lms_outbound_enqueue_resource_x_intent\(/ { print "ClusterLmsEnqueueResult"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (found != 4 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+clean distclean maintainer-clean: clean-resource-x-master-consumed
+.PHONY: clean-resource-x-master-consumed
+clean-resource-x-master-consumed:
+	rm -f test_cluster_resource_x_master_consumed test_cluster_resource_x_master_done_fixture.inc \
+		test_cluster_resource_x_master_done_fixture.inc.tmp test_cluster_resource_x_consumed_lms.inc \
+		test_cluster_resource_x_consumed_lms.inc.tmp test_cluster_resource_x_consumed_ring.inc \
+		test_cluster_resource_x_consumed_ring.inc.tmp
+
+test_cluster_resource_x_consumed_ring.inc: test_cluster_native_request_ring.inc Makefile
+	awk '/^ClusterLmsEnqueueResult$$/ { stop=1 } !stop { print; lines++ } \
+	     END { if (!stop || lines < 50) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
