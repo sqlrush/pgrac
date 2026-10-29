@@ -6505,6 +6505,7 @@ UT_TEST(ordinary_recovery_complete_roles_keep_the_original_cf_wait_policy)
 #include "test_cluster_cf_deadline.h"
 #include "test_cluster_ir_pin_deadline.h"
 #include "test_cluster_seal_deadline.h"
+#include "test_cluster_classification_cf.h"
 
 int
 main(void)
@@ -6516,6 +6517,22 @@ main(void)
 	pg_atomic_init_u64(&owner_proc.cluster_grd_redeclare_acked_epoch, 0);
 	cluster_control_request_shmem_init();
 	retire_driver = cluster_control_request_driver_start();
+	if (getenv("PGRAC_PRE2_TEST_CLASSIFICATION_CF") != NULL) {
+		UT_PLAN(10);
+		UT_RUN(startup_root_classification_restarts_before_any_fence_admission);
+		UT_RUN(startup_root_classification_rejects_changed_prefix_without_adopting_it);
+		UT_RUN(startup_root_classification_excludes_completed_origins_only_after_the_full_pass);
+		UT_RUN(startup_root_classification_keeps_the_original_deadline_and_zero_never_sleeps);
+		UT_RUN(startup_root_classification_zero_ready_finishes_one_complete_attempt);
+		UT_RUN(startup_root_classification_never_retries_hard_or_untyped_failure);
+		UT_RUN(startup_root_classification_reproves_context_before_and_after_reapplication);
+		UT_RUN(startup_root_classification_does_not_adopt_preexisting_cf_debt);
+		UT_RUN(startup_root_classification_preserves_error_cleanup_and_original_sqlstate);
+		UT_RUN(startup_root_classification_exact_ack_cannot_renew_an_expired_plan);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
+
 	if (getenv("PGRAC_PRE2_TEST_SEAL_DEADLINE") != NULL) {
 		UT_PLAN(17);
 		UT_RUN(startup_seal_cf_failure_returns_to_its_caller_without_waiting);
@@ -6759,7 +6776,7 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(243);
+	UT_PLAN(253);
 	UT_RUN(startup_cf_timeout_waits_for_exact_completion_before_begin);
 	UT_RUN(startup_cf_completion_does_not_preserve_changed_native_input);
 	UT_RUN(startup_cf_unsafe_native_context_never_takes_a_registry_lock);
@@ -7004,6 +7021,16 @@ main(void)
 	UT_RUN(startup_seal_x_wait_requires_the_original_exact_receipt);
 	UT_RUN(startup_seal_hard_root_failure_never_waits_or_replays);
 	UT_RUN(startup_seal_zero_complete_attempt_still_publishes_once);
+	UT_RUN(startup_root_classification_restarts_before_any_fence_admission);
+	UT_RUN(startup_root_classification_rejects_changed_prefix_without_adopting_it);
+	UT_RUN(startup_root_classification_excludes_completed_origins_only_after_the_full_pass);
+	UT_RUN(startup_root_classification_keeps_the_original_deadline_and_zero_never_sleeps);
+	UT_RUN(startup_root_classification_zero_ready_finishes_one_complete_attempt);
+	UT_RUN(startup_root_classification_never_retries_hard_or_untyped_failure);
+	UT_RUN(startup_root_classification_reproves_context_before_and_after_reapplication);
+	UT_RUN(startup_root_classification_does_not_adopt_preexisting_cf_debt);
+	UT_RUN(startup_root_classification_preserves_error_cleanup_and_original_sqlstate);
+	UT_RUN(startup_root_classification_exact_ack_cannot_renew_an_expired_plan);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

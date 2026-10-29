@@ -1463,6 +1463,7 @@ test_cluster_startup_cf_callsite.inc: $(top_srcdir)/src/backend/access/transam/x
 	mv $@.tmp $@
 
 test_cluster_startup_cf_entry: test_cluster_startup_cf_entry.c test_cluster_cf_enqueue.c test_cluster_cf_deadline.h test_cluster_ir_pin_deadline.h test_cluster_seal_deadline.h \
+		test_cluster_classification_cf.h test_cluster_classification_cf.inc \
 		test_cluster_prepared_cf.h test_cluster_prepared_job.h test_cluster_prepared_cf.inc \
 		$(top_srcdir)/src/include/cluster/cluster_control_root_prepared.h \
 		test_cluster_generic_cf.h test_cluster_generic_cf.inc \
@@ -1524,6 +1525,15 @@ test_cluster_pre_ir_project_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_re
 	     /^recovery_fence_project_wait\(/ { print "static ClusterMergeEngage"; emit=1; n++ } \
 	     emit { print } /^}/ { emit=0 } \
 	     END { if (n != 6 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Actual cold preflight classification, linked to ROOT and CF.
+test_cluster_classification_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_merge.c Makefile
+	awk '/^(recovery_fence_deadline_begin|recovery_fence_classify_origins)\(/ { print "static void"; emit=1; n++ } \
+	     /^recovery_fence_origin_input_acceptable\(/ { print "static bool"; emit=1; n++ } \
+	     /^cluster_recovery_merge_preflight_readonly\(/ { print "ClusterMergeEngage"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (n != 4 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Actual cold seal caller, linked to the failure-input publisher and CF.
