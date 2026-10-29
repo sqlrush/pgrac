@@ -9982,8 +9982,9 @@ test_cluster_recovery_reference_graph: test_cluster_recovery_reference_graph.c u
 		$(top_srcdir)/src/include/cluster/cluster_recovery_undo_scan.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_record.h \
 		$(top_srcdir)/src/backend/cluster/cluster_uba.c \
-		test_cluster_heap_small_scn.inc cluster_unit_port_stubs.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LDFLAGS) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+		test_cluster_heap_small_scn.inc cluster_unit_port_stubs.o \
+		$(top_builddir)/src/common/cluster_undo_segment_init.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(top_builddir)/src/common/cluster_undo_segment_init.o $(LDFLAGS) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # Independent upstream checksum implementation for integrity fixtures.
 cluster_unit_page_checksum.o: $(top_srcdir)/src/backend/storage/page/checksum.c
@@ -10816,3 +10817,8 @@ test_cluster_cold_tx_start: test_cluster_cold_ctrc_native_images.inc
 # Original complete TX-forest views through the same census and Startup owner.
 test_cluster_recovery_native_inputs: test_cluster_recovery_census_tx_records.inc
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_tx_records.inc
+
+# Original TX root/predecessor views.
+test_cluster_recovery_reference_graph: test_cluster_recovery_tx_dependencies.inc
+test_cluster_recovery_native_inputs: test_cluster_recovery_census_tx_dependencies.inc
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_tx_dependencies.inc

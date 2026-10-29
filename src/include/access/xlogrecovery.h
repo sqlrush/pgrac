@@ -334,6 +334,16 @@ extern struct ClusterRecoveryCensusTxRecordV1 ClusterColdRecoveryCtrcTxRecord(
 	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work,
 	uint32 index);
 
+/* Exact roots and resolved TX predecessor edges of this SAME complete
+ * original Start/work/accepted-TX/full simultaneous ALL IR-WALR observation.
+ * Same pre-PAGE checks, borrowed lifetime, whole-output failure and original
+ * sticky reverse cleanup as TxRecord. No caller graph/root set is accepted;
+ * this is native adjacency, not a semantic owner proof or COMPLETE authority. */
+struct ClusterRecoveryCensusTxDependencyV1;
+extern struct ClusterRecoveryCensusTxDependencyV1 ClusterColdRecoveryCtrcTxDependency(
+	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work,
+	uint32 index);
+
 /* Same original complete observation and accepted TX; raw, immutable decoded
  * PAGE WAL inputs of every selected generation. Zero count is complete-empty.
  * Outputs clear on refusal; readers borrow original cursor/scope lifetime.

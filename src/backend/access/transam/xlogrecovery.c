@@ -2948,6 +2948,51 @@ ClusterColdRecoveryCtrcTxRecord(const struct ClusterRecoveryStartV1 *start,
 	return out;
 }
 
+ClusterRecoveryCensusTxDependencyV1
+ClusterColdRecoveryCtrcTxDependency(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work, uint32 index)
+{
+	ClusterRecoveryCensusTxDependencyV1 out = {0};
+	struct ClusterRecoveryStartV1 *state = cluster_recovery_cold_start;
+	bool held = false;
+
+	if (start == NULL || start != state || CritSectionCount != 0 || ShutdownRequestPending
+		|| !start->ctrc_observation_complete || work != start->ctrc_observation_work
+		|| index > start->ctrc_observation_manifest.tx_record_count) return out;
+	ForEachLWLockHeldByMe(cluster_recovery_cold_ctrc_lock_held, &held);
+	if (held || !ClusterColdRecoveryCtrcObserve(start, 0)) return out;
+	PG_TRY();
+	{
+		ClusterRecoveryCensusTxDependencyV1 current = cluster_recovery_census_tx_dependency_v1(
+			state->ctrc_observation_census, index);
+		const ClusterRecoveryGraphDependency *dependency = &current.value;
+
+		if (current.observed
+			&& dependency->count == state->ctrc_observation_manifest.tx_record_count
+			&& dependency->index == index && dependency->root_count <= dependency->count
+			&& dependency->root == (index < dependency->root_count)
+			&& (index == dependency->count ? dependency->value.record == NULL
+				&& dependency->predecessor.record == NULL : dependency->value.record != NULL)
+			&& (dependency->predecessor.record == NULL
+				|| (dependency->predecessor_index < dependency->count
+					&& dependency->predecessor_index != index))
+			&& ClusterColdRecoveryCtrcObserve(start, 0))
+			out = current;
+		else {
+			cluster_recovery_cold_observation_refuse(state, "tx_dependency", 0);
+			cluster_recovery_cold_observation_close(state);
+		}
+	}
+	PG_CATCH();
+	{
+		cluster_recovery_cold_observation_refuse(state, "tx_dependency_error", 0);
+		cluster_recovery_cold_observation_close(state);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return out;
+}
+
 bool
 ClusterColdRecoveryCtrcWalSourceCount(const struct ClusterRecoveryStartV1 *start,
 	const struct ClusterColdCtrcWorkV1 *work, uint32 *out)

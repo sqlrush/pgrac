@@ -113,6 +113,25 @@ extern ClusterRecoveryGraphResult
 cluster_recovery_reference_graph_at(const ClusterRecoveryReferenceGraph *graph, uint32 index,
 									ClusterRecoveryGraphRecord *out);
 
+/* Native adjacency of the original observed TX forest. Roots are exactly
+ * those supplied before traversal; a discovered predecessor is not promoted
+ * to a root. count/root_count/index and predecessor_index are local indexes,
+ * never hash IDs or chronology. predecessor_index is meaningful only when
+ * predecessor.record is non-NULL. Complete end has index==count and no records.
+ * Both records borrow this same graph and retain full UBA128/physical generation.
+ * No new traversal, I/O, allocation, roots, PAGE_VERSION edge, semantic owner
+ * proof, retention transfer or completion. Invalid results clear the whole out.
+ * Original producer coverage/lifetime and all final rechecks remain mandatory. */
+typedef struct ClusterRecoveryGraphDependency {
+	uint32 count, root_count, index, predecessor_index;
+	bool root;
+	ClusterRecoveryGraphRecord value;
+	ClusterRecoveryGraphRecord predecessor;
+} ClusterRecoveryGraphDependency;
+extern ClusterRecoveryGraphResult cluster_recovery_reference_graph_dependency_at(
+	const ClusterRecoveryReferenceGraph *graph, uint32 index,
+	ClusterRecoveryGraphDependency *out);
+
 /* Match a page locator against saved, fully re-read records, never against
  * the current TT slot generation guessed from the UBA. The forest must be
  * observed and outlive this lookup and all returned borrowed records.
