@@ -3650,6 +3650,20 @@ cluster_bufmgr_acquire_disk_outputs_private(
 	return true;
 }
 
+/* The original synchronous call has stopped before this callback runs.
+ * Its KO reference must close before an outer acquisition can prove quiet.
+ * Register only this temporary scope; no permanent exit callback is added. */
+static void
+cluster_bufmgr_acquire_disk_io_cleanup(int code, Datum arg)
+{
+	const ClusterKoDirectoryIoV3 *io = (const ClusterKoDirectoryIoV3 *)DatumGetPointer(arg);
+
+	(void)code;
+	if (!cluster_ko_directory_io_end_v3(io))
+		ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
+			errmsg("could not close original disk acquisition IO scope")));
+}
+
 /* Each physical read keeps the original E, IO owner and master watermark.
  * A storage refresh is not another acquisition or another native completion. */
 static ResourceXApplyResult
@@ -3668,7 +3682,7 @@ cluster_bufmgr_acquire_disk_read_once(BufferDesc *buf,
 		return RESOURCE_X_APPLY_BAD_STATE;
 	if (!cluster_ko_directory_io_begin_v3(BufTagGetRelFileLocator(&base->tag), &io))
 		return RESOURCE_X_APPLY_BAD_STATE;
-	PG_TRY();
+	PG_ENSURE_ERROR_CLEANUP(cluster_bufmgr_acquire_disk_io_cleanup, PointerGetDatum(&io));
 	{
 		/* KO admission and opening storage can yield or ERROR. Revalidate
 		 * after each boundary, with no entry/header/content lock held by IO. */
@@ -3682,12 +3696,12 @@ cluster_bufmgr_acquire_disk_read_once(BufferDesc *buf,
 			}
 		}
 	}
-	PG_FINALLY();
-	{
-		ended = cluster_ko_directory_io_end_v3(&io);
-	}
-	PG_END_TRY();
-	if (!read || !ended)
+	PG_END_ENSURE_ERROR_CLEANUP(cluster_bufmgr_acquire_disk_io_cleanup, PointerGetDatum(&io));
+	ended = cluster_ko_directory_io_end_v3(&io);
+	if (!ended)
+		ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
+			errmsg("could not close original disk acquisition IO scope")));
+	if (!read)
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	if (!PageIsVerifiedForFork(page, BufTagGetForkNum(&base->tag), base->tag.blockNum,
 			PIV_LOG_WARNING | PIV_REPORT_STAT)) {
@@ -18332,13 +18346,13 @@ cluster_bufmgr_pcm_own_acquire_quiet_unarmed_disk_exact(BufferDesc *buf,
 	if (owned.purpose != RESOURCE_X_DELIVERY_ACQUIRE_PREPARED
 		&& owned.purpose != RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING)
 		return RESOURCE_X_APPLY_INVALID;
-	owned.purpose = RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING;
 	if (!cluster_bufmgr_acquire_quiet_context(buf, &entered_base, &entered, &owned, owner))
 		return RESOURCE_X_APPLY_STALE;
 	result = cluster_pcm_lock_resource_x_requester_acquire_read_close_observe_exact(&owned, &entered, &current, &receipt);
 	if (result != RESOURCE_X_APPLY_APPLIED)
 		return result;
-	if (current.purpose == RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING) {
+	if (current.purpose == RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING
+		|| current.purpose == RESOURCE_X_DELIVERY_ACQUIRE_PREPARED) {
 		receipt.write_io_generation = pg_atomic_read_u64(&ClusterPcmOwnArray[buf->buf_id].write_io_generation);
 		if ((receipt.write_io_generation & 1) != 0 || receipt.write_io_generation >= UINT64_MAX - 1
 			|| !cluster_bufmgr_acquire_unarmed_physical(buf, &entered_base, &entered, &owned,
@@ -18368,6 +18382,112 @@ cluster_bufmgr_pcm_own_acquire_quiet_unarmed_disk_exact(BufferDesc *buf,
 	return cluster_pcm_lock_resource_x_requester_acquire_read_quiet_exact(&owned, &entered, &receipt, &native);
 }
 /* End original unarmed disk quiet. */
+
+/* Original pre-C disk error guard. No native C occurs inside this scope.
+ * Preserve immutable original identity on the stack until each synchronous
+ * producer has stopped. Shared quiet/DONE remains the existing LMS debt. */
+typedef struct ClusterAcquireDiskGuard {
+	BufferDesc *buf;
+	ResourceOwner owner;
+	ClusterPcmOwnSnapshot base;
+	ResourceXDecodedAcquireIntent episode;
+	ResourceXDeliveryClaim original;
+} ClusterAcquireDiskGuard;
+
+static void
+cluster_bufmgr_acquire_prepare_cleanup(int code, Datum arg)
+{
+	const ClusterAcquireDiskGuard *guard = (const ClusterAcquireDiskGuard *)DatumGetPointer(arg);
+	ResourceXDeliveryClaim current;
+	ResourceXAcquireReadReceipt receipt;
+	ResourceXApplyResult result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+
+	(void)code;
+	if (CurrentResourceOwner == guard->owner
+		&& cluster_pcm_lock_resource_x_requester_acquire_read_close_observe_exact(
+			&guard->original, &guard->episode, &current, &receipt) == RESOURCE_X_APPLY_APPLIED) {
+		if (current.purpose == RESOURCE_X_DELIVERY_ACQUIRE_PREPARED
+			|| current.purpose == RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING
+			|| current.purpose == RESOURCE_X_DELIVERY_ACQUIRE_UNARMED_SEALING
+			|| current.purpose == RESOURCE_X_DELIVERY_ACQUIRE_UNARMED_QUIET
+			|| current.purpose == RESOURCE_X_DELIVERY_ACQUIRE_UNARMED_CONSUMED)
+			result = cluster_bufmgr_pcm_own_acquire_quiet_unarmed_disk_exact(
+				guard->buf, &guard->base, &guard->episode, &guard->original);
+		else if (current.purpose == RESOURCE_X_DELIVERY_ACQUIRE_READ_ARMED
+			|| current.purpose == RESOURCE_X_DELIVERY_ACQUIRE_READ_SEALING
+			|| current.purpose == RESOURCE_X_DELIVERY_ACQUIRE_READ_QUIET
+			|| current.purpose == RESOURCE_X_DELIVERY_ACQUIRE_READ_QUIET_CONSUMED)
+			result = cluster_bufmgr_pcm_own_acquire_quiet_disk_exact(
+				guard->buf, &guard->base, &guard->episode, &guard->original);
+	}
+	/* An installed C or an unprovable producer/owner cannot enter generic
+	 * AbortBufferIO/ResourceOwner cleanup as though it were unpublished. */
+	if (result != RESOURCE_X_APPLY_APPLIED && result != RESOURCE_X_APPLY_DUPLICATE)
+		ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
+			errmsg("could not quiesce original disk acquisition before owner cleanup")));
+}
+
+ResourceXApplyResult
+cluster_bufmgr_pcm_own_acquire_prepare_disk_exact(BufferDesc *buf,
+	const ClusterPcmOwnSnapshot *base, const ResourceXDecodedAcquireIntent *episode,
+	const ClusterSemanticAdmissionToken *admission, const ResourceXDeliveryClaim *prepared)
+{
+	ClusterAcquireDiskGuard guard;
+	ResourceXDeliveryClaim current, execution;
+	ResourceXAcquireReadReceipt receipt;
+	ResourceXDecodedFrame grant, image;
+	ResourceXRequesterJoinSnapshot join;
+	ResourceXDiskStageObservation staged;
+	ClusterPcmOwnSnapshot native;
+	volatile ResourceXApplyResult result;
+
+	if (buf == NULL || base == NULL || episode == NULL || admission == NULL || prepared == NULL
+		|| ClusterPcmOwnArray == NULL)
+		return RESOURCE_X_APPLY_INVALID;
+	guard.buf = buf;
+	guard.owner = CurrentResourceOwner;
+	guard.base = *base;
+	guard.episode = *episode;
+	guard.original = *prepared;
+	if (guard.original.purpose != RESOURCE_X_DELIVERY_ACQUIRE_PREPARED
+		|| LWLockHeldByMe(BufferDescriptorGetContentLock(buf))
+		|| !cluster_bufmgr_acquire_quiet_context(buf, &guard.base, &guard.episode, &guard.original, guard.owner))
+		return RESOURCE_X_APPLY_BAD_STATE;
+	result = cluster_pcm_lock_resource_x_requester_acquire_read_close_observe_exact(
+		&guard.original, &guard.episode, &current, &receipt);
+	if (result != RESOURCE_X_APPLY_APPLIED)
+		return result;
+	if (current.purpose != RESOURCE_X_DELIVERY_ACQUIRE_PREPARED)
+		return RESOURCE_X_APPLY_BAD_STATE;
+	receipt.write_io_generation = pg_atomic_read_u64(&ClusterPcmOwnArray[buf->buf_id].write_io_generation);
+	if ((receipt.write_io_generation & 1) != 0 || receipt.write_io_generation >= UINT64_MAX - 1
+		|| !cluster_bufmgr_acquire_unarmed_physical(buf, &guard.base, &guard.episode,
+			&guard.original, &receipt, guard.owner, CLUSTER_ACQUIRE_QUIET_OBSERVE, &native))
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	/* This callback is installed before execution can change the shared
+	 * owner. Nested disk scopes pop first on ERROR and process exit alike. */
+	PG_ENSURE_ERROR_CLEANUP(cluster_bufmgr_acquire_prepare_cleanup, PointerGetDatum(&guard));
+	{
+		result = cluster_bufmgr_pcm_own_acquire_execute_begin_exact(buf, &guard.base, &guard.episode,
+			admission, &guard.original, &grant, &image, &join, &execution);
+		if (result == RESOURCE_X_APPLY_APPLIED) {
+			result = cluster_bufmgr_pcm_own_acquire_stage_disk_exact(buf, &guard.base,
+				&guard.episode, admission, &execution, &staged);
+			if (result == RESOURCE_X_APPLY_APPLIED) {
+				cluster_bufmgr_acquire_read_receipt(&staged, &receipt);
+				result = cluster_pcm_lock_resource_x_requester_acquire_read_arm_exact(
+					&execution, &guard.episode, &receipt);
+			}
+		}
+	}
+	PG_END_ENSURE_ERROR_CLEANUP(cluster_bufmgr_acquire_prepare_cleanup, PointerGetDatum(&guard));
+	if (result != RESOURCE_X_APPLY_APPLIED)
+		cluster_bufmgr_acquire_prepare_cleanup(0, PointerGetDatum(&guard));
+	/* ARMED retains the same original handle and input IO. Only the existing
+	 * explicit continuation may publish C; no ordinary caller is activated. */
+	return result;
+}
+/* End original pre-C disk error guard. */
 #endif
 
 /*

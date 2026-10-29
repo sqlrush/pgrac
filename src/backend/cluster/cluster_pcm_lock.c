@@ -29029,6 +29029,7 @@ pcm_resource_x_requester_acquire_frames_mode_locked(struct GrdEntry *entry,
 	if (closing && (claim == NULL || episode->path != RESOURCE_X_ACQUIRE_FIRST_FILL
 			|| observation->request.target_mode != PCM_STATE_S
 			|| (claim->purpose != RESOURCE_X_DELIVERY_ACQUIRE_READ_ARMED
+				&& claim->purpose != RESOURCE_X_DELIVERY_ACQUIRE_PREPARED
 				&& claim->purpose != RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING
 				&& !pcm_resource_x_acquire_read_closing(claim->purpose))))
 		return RESOURCE_X_APPLY_BAD_STATE;
@@ -29653,13 +29654,15 @@ pcm_resource_x_acquire_read_close_locked(struct GrdEntry *entry,
 	ResourceXApplyResult result;
 	const ResourceXDecodedAcquireDecision *a;
 
-	if (execution->purpose != RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING
+	if ((execution->purpose != RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING
+			&& execution->purpose != RESOURCE_X_DELIVERY_ACQUIRE_PREPARED)
 		|| execution->target.generation != episode->base_generation
 		|| execution->target.reservation_token != episode->reservation_token
 		|| execution->target.buffer_id_plus_one != (uint32)episode->buffer_id + 1
 		|| execution->target.flags != PCM_OWN_FLAG_GRANT_PENDING
 		|| (round->delivery_executor_purpose != RESOURCE_X_DELIVERY_ACQUIRE_READ_ARMED
 			&& round->delivery_executor_purpose != RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING
+			&& round->delivery_executor_purpose != RESOURCE_X_DELIVERY_ACQUIRE_PREPARED
 			&& !pcm_resource_x_acquire_read_closing(round->delivery_executor_purpose)))
 		return RESOURCE_X_APPLY_BAD_STATE;
 	candidate = *execution;
@@ -29676,12 +29679,14 @@ pcm_resource_x_acquire_read_close_locked(struct GrdEntry *entry,
 		|| a->source_service_generation != 0 || a->directory_mode != PCM_STATE_N
 		|| a->holders_bitmap != 0 || a->required_holders_bitmap != 0 || a->pi_holders_bitmap != 0
 		|| (candidate.purpose != RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING
+			&& candidate.purpose != RESOURCE_X_DELIVERY_ACQUIRE_PREPARED
 			&& (round->acquire_read_receipt.authority_generation != grant.common.authority_generation
 				|| round->acquire_read_receipt.decision_crc32c != grant.common.semantic_crc32c)))
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	*current = candidate;
 	*receipt = round->acquire_read_receipt;
-	if (candidate.purpose == RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING) {
+	if (candidate.purpose == RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING
+		|| candidate.purpose == RESOURCE_X_DELIVERY_ACQUIRE_PREPARED) {
 		receipt->authority_generation = grant.common.authority_generation;
 		receipt->decision_crc32c = grant.common.semantic_crc32c;
 	}
@@ -29786,6 +29791,7 @@ cluster_pcm_lock_resource_x_requester_acquire_unarmed_seal_exact(
 		if (receipt->authority_generation != observed.authority_generation
 			|| receipt->decision_crc32c != observed.decision_crc32c
 			|| (current.purpose != RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING
+				&& current.purpose != RESOURCE_X_DELIVERY_ACQUIRE_PREPARED
 				&& current.purpose != RESOURCE_X_DELIVERY_ACQUIRE_UNARMED_SEALING))
 			result = RESOURCE_X_APPLY_STALE;
 		else if (current.purpose == RESOURCE_X_DELIVERY_ACQUIRE_UNARMED_SEALING)
@@ -29823,8 +29829,7 @@ cluster_pcm_lock_resource_x_requester_acquire_read_quiet_exact(
 	result = pcm_resource_x_acquire_read_close_locked(ref.entry, execution, episode, &current, &observed);
 	if (result == RESOURCE_X_APPLY_APPLIED) {
 		if (memcmp(receipt, &observed, sizeof(observed)) != 0
-			|| current.purpose == RESOURCE_X_DELIVERY_ACQUIRE_READ_ARMED
-			|| current.purpose == RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING)
+			|| !pcm_resource_x_acquire_read_closing(current.purpose))
 			result = RESOURCE_X_APPLY_STALE;
 		else if (pcm_resource_x_acquire_read_is_quiet(current.purpose))
 			result = RESOURCE_X_APPLY_DUPLICATE;

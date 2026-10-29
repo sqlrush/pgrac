@@ -10913,3 +10913,33 @@ clean-native-unarmed-quiet:
 	rm -f test_cluster_native_unarmed_quiet test_cluster_native_quiet_notice_fixture.inc \
 		test_cluster_native_quiet_notice_fixture.inc.tmp test_cluster_resource_x_master_unarmed \
 		test_cluster_native_unarmed_quiet.inc test_cluster_native_unarmed_quiet.inc.tmp
+
+# Original pre-C disk execution is bracketed before native IO/pin cleanup.
+TESTS += test_cluster_native_disk_guard
+all: test_cluster_native_disk_guard
+test_cluster_native_disk_guard: test_cluster_native_disk_guard.c \
+		test_cluster_native_unarmed_quiet_fixture.inc test_cluster_native_unarmed_quiet \
+		test_cluster_native_disk_guard.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+test_cluster_native_unarmed_quiet_fixture.inc: test_cluster_native_unarmed_quiet.c Makefile
+	awk '/^UT_TEST\(/ { stop=1 } !stop { print; lines++ } \
+	     END { if (!stop || lines < 100) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_native_disk_guard.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^\/\* Original pre-C disk error guard/ { emit=1; found++ } \
+	     /^\/\* End original pre-C disk error guard/ { emit=0; stop=1 } \
+	     emit { print } END { if (found != 1 || !stop) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+clean distclean maintainer-clean: clean-native-disk-guard
+.PHONY: clean-native-disk-guard
+clean-native-disk-guard:
+	rm -f test_cluster_native_disk_guard test_cluster_native_unarmed_quiet_fixture.inc \
+		test_cluster_native_unarmed_quiet_fixture.inc.tmp test_cluster_native_disk_guard.inc \
+		test_cluster_native_disk_guard.inc.tmp

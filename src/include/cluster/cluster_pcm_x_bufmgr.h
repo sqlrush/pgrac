@@ -1131,4 +1131,12 @@ extern ResourceXApplyResult cluster_bufmgr_pcm_own_acquire_quiet_unarmed_disk_ex
 	BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
 	const ResourceXDecodedAcquireIntent *episode, const ResourceXDeliveryClaim *original);
 
+/* Guard the original PREPARED disk/S producer before ResourceOwner cleanup.
+ * APPLIED retains verified ARMED and original input IO, without native C.
+ * Continue that same handle explicitly; never call again to reread/rearm. */
+extern ResourceXApplyResult cluster_bufmgr_pcm_own_acquire_prepare_disk_exact(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
+	const ResourceXDecodedAcquireIntent *episode,
+	const struct ClusterSemanticAdmissionToken *admission, const ResourceXDeliveryClaim *prepared);
+
 #endif /* CLUSTER_PCM_X_BUFMGR_H */
