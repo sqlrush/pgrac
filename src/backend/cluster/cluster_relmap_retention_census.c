@@ -1600,6 +1600,81 @@ census_native_episode_current(const CensusEpisode *saved)
 		&& cluster_wal_inputs_relmap_count_v1(saved->sources[0].scope) == saved->count;
 }
 
+static bool census_native_root_source_same(const ClusterWalSourceRef *left,
+	const ClusterWalSourceRef *right);
+
+/* Snapshot EVERY selected generation before namespace/native I/O. Each origin
+ * must still name exactly one original replay generation and request. History
+ * does not become another replay owner, nor a replacement for a missing base. */
+static bool
+census_native_episode_sources(const ClusterRecoveryRelmapSourceV1 *original,
+	CensusEpisode *saved, uint32 replay_sources[CLUSTER_RELMAP_RETENTION_MAX_ORIGINS])
+{
+	const ClusterControlRootIdentity *identity = &original->selected.source.claim.identity;
+	uint16 replay_origins[CLUSTER_RELMAP_RETENTION_MAX_ORIGINS];
+	uint32 origins = 0;
+
+	for (size_t i = 0; i < CLUSTER_RELMAP_RETENTION_MAX_ORIGINS; i++) {
+		replay_sources[i] = UINT32_MAX;
+		replay_origins[i] = CLUSTER_RELMAP_RETENTION_MAX_ORIGINS;
+	}
+	for (uint32 i = 0; i < saved->count; i++) {
+		ClusterRecoveryRelmapSourceV1 *entry = &saved->sources[i];
+		const ClusterControlRootIdentity *id;
+
+		*entry = cluster_wal_inputs_relmap_source_v1(original->scope, i);
+		id = &entry->selected.source.claim.identity;
+		if (!cluster_wal_inputs_relmap_source_current_v1(entry)
+			|| entry->scope != original->scope || entry->input_index != i
+			|| entry->input_count != saved->count || entry->replay_count != original->replay_count
+			|| entry->replay_index >= original->replay_count || entry->ir_request_id == 0
+			|| entry->work_generation != original->work_generation
+			|| entry->selected.kind != CLUSTER_WAL_INPUT_CHECKPOINT
+			|| entry->replay.kind != CLUSTER_WAL_INPUT_CHECKPOINT
+			|| id->origin_node_id < 0 || id->origin_node_id >= CLUSTER_RELMAP_RETENTION_MAX_ORIGINS
+			|| id->system_identifier != identity->system_identifier
+			|| entry->selected.source.claim.database_incarnation
+				!= original->selected.source.claim.database_incarnation
+			|| memcmp(id->storage_uuid, identity->storage_uuid, 16) != 0)
+			return false;
+		for (uint32 j = 0; j < i; j++)
+			if (census_native_root_source_same(&entry->selected.source, &saved->sources[j].selected.source))
+				return false;
+	}
+	for (uint32 i = 0; i < saved->count; i++) {
+		const ClusterRecoveryRelmapSourceV1 *entry = &saved->sources[i];
+		const ClusterRecoveryRelmapSourceV1 *base;
+		uint16 origin = entry->selected.source.claim.identity.origin_node_id;
+		uint32 index;
+
+		for (index = 0; index < saved->count; index++)
+			if (census_native_root_source_same(&entry->replay.source, &saved->sources[index].selected.source))
+				break;
+		if (index == saved->count)
+			return false;
+		base = &saved->sources[index];
+		/* The installed current flag/lifecycle may differ from the original
+		 * replay view. Its complete native checkpoint/window may not. */
+		if (base->selected.source.claim.identity.origin_node_id != origin
+			|| base->selected.checkpoint_start != entry->replay.checkpoint_start
+			|| base->selected.native_redo != entry->replay.native_redo
+			|| memcmp(&base->selected.native_checkpoint, &entry->replay.native_checkpoint,
+				sizeof(entry->replay.native_checkpoint)) != 0
+			|| memcmp(base->selected.native_window, entry->replay.native_window, 160) != 0
+			|| base->replay_index != entry->replay_index || base->ir_request_id != entry->ir_request_id
+			|| memcmp(&base->replay, &entry->replay, sizeof(entry->replay)) != 0
+			|| (replay_sources[origin] != UINT32_MAX && replay_sources[origin] != index)
+			|| (replay_origins[entry->replay_index] != CLUSTER_RELMAP_RETENTION_MAX_ORIGINS
+				&& replay_origins[entry->replay_index] != origin))
+			return false;
+		if (replay_sources[origin] == UINT32_MAX)
+			origins++;
+		replay_sources[origin] = index;
+		replay_origins[entry->replay_index] = origin;
+	}
+	return origins == original->replay_count && census_native_episode_current(saved);
+}
+
 ClusterRelmapCensusResult
 cluster_relmap_retention_census_begin_native_episode(
 	const ClusterRecoveryRelmapSourceV1 *source, ClusterRecoveryRootSet *roots,
@@ -1622,9 +1697,10 @@ cluster_relmap_retention_census_begin_native_episode(
 	{
 		do {
 			ClusterRelmapRetentionDirectory *pointers[CLUSTER_RELMAP_RETENTION_MAX_ORIGINS];
-			bool origins[CLUSTER_RELMAP_RETENTION_MAX_ORIGINS] = {false};
+			uint32 replay_sources[CLUSTER_RELMAP_RETENTION_MAX_ORIGINS];
+			uint64 floors[CLUSTER_WAL_INPUTS_MAX], issued[CLUSTER_WAL_INPUTS_MAX];
 			const ClusterControlRootIdentity *identity = &original.selected.source.claim.identity;
-			uint32 count;
+			uint32 count, origin_count = 0;
 			size_t source_bytes, directory_bytes;
 			ClusterRecoveryRootsResult root_result;
 
@@ -1632,8 +1708,8 @@ cluster_relmap_retention_census_begin_native_episode(
 				|| !cluster_wal_inputs_relmap_source_current_v1(&original)
 				|| (count = cluster_wal_inputs_relmap_count_v1(original.scope)) == 0
 				|| count > CLUSTER_WAL_INPUTS_MAX
-				|| count > CLUSTER_RELMAP_RETENTION_MAX_ORIGINS || original.work_generation == 0
-				|| original.replay_count != count)
+				|| original.work_generation == 0 || original.replay_count == 0
+				|| original.replay_count > CLUSTER_RELMAP_RETENTION_MAX_ORIGINS)
 				break;
 			/* Bound the peak: directories, temporary saved sources, and the
 			 * original cursor's second saved set coexist until publication. */
@@ -1650,30 +1726,7 @@ cluster_relmap_retention_census_begin_native_episode(
 				break;
 			}
 			saved->count = count;
-			for (uint32 i = 0; i < count; i++) {
-				ClusterRecoveryRelmapSourceV1 *entry = &saved->sources[i];
-				const ClusterControlRootIdentity *id;
-
-				*entry = cluster_wal_inputs_relmap_source_v1(original.scope, i);
-				id = &entry->selected.source.claim.identity;
-				if (!cluster_wal_inputs_relmap_source_current_v1(entry)
-					|| entry->scope != original.scope || entry->input_index != i
-					|| entry->input_count != count || entry->replay_count != count
-					|| entry->work_generation != original.work_generation
-					|| entry->selected.kind != CLUSTER_WAL_INPUT_CHECKPOINT
-					|| id->origin_node_id < 0
-					|| id->origin_node_id >= CLUSTER_RELMAP_RETENTION_MAX_ORIGINS
-					|| origins[id->origin_node_id]
-					|| id->system_identifier != identity->system_identifier
-					|| entry->selected.source.claim.database_incarnation
-						!= original.selected.source.claim.database_incarnation
-					|| memcmp(id->storage_uuid, identity->storage_uuid, 16) != 0)
-					break;
-				origins[id->origin_node_id] = true;
-				if (i + 1 == count)
-					result = CLUSTER_RELMAP_CENSUS_MORE;
-			}
-			if (result != CLUSTER_RELMAP_CENSUS_MORE)
+			if (!census_native_episode_sources(&original, (CensusEpisode *)saved, replay_sources))
 				break;
 			result = CLUSTER_RELMAP_CENSUS_CHANGED;
 			for (uint32 i = 0; i < count; i++) {
@@ -1690,18 +1743,37 @@ cluster_relmap_retention_census_begin_native_episode(
 					|| window->origin != saved->sources[i].selected.source.claim.identity.origin_node_id
 					|| window->native_floor > window->last_issued
 					|| window->last_issued > native.post_flush_issued
-					|| native.post_flush_issued - window->native_floor >= UINT64CONST(0x80000000)
-					|| cluster_relmap_retention_build_start(&directories[i], window->system_identifier,
+					|| native.post_flush_issued - window->native_floor >= UINT64CONST(0x80000000))
+					break;
+				floors[i] = window->native_floor;
+				issued[i] = native.post_flush_issued;
+				if (replay_sources[window->origin] == i) {
+					if (cluster_relmap_retention_build_start(&directories[i], window->system_identifier,
 						window->database_incarnation, window->origin, original.work_generation,
 						window->native_floor, native.post_flush_issued) != CLUSTER_RELMAP_RETENTION_OK)
-					break;
-				pointers[i] = &directories[i];
+						break;
+					pointers[origin_count++] = &directories[i];
+				}
 				if (i + 1 == count)
 					result = CLUSTER_RELMAP_CENSUS_MORE;
 			}
 			if (result != CLUSTER_RELMAP_CENSUS_MORE)
 				break;
-			result = cluster_relmap_retention_census_begin_episode(&original, roots, pointers, count,
+			/* Never widen a native window using min/max across generations.
+			 * History outside the SAME original replay window stays unsupported. */
+			result = CLUSTER_RELMAP_CENSUS_CHANGED;
+			for (uint32 i = 0; i < count; i++) {
+				uint16 origin = saved->sources[i].selected.source.claim.identity.origin_node_id;
+				const ClusterRelmapRetentionDirectory *base = &directories[replay_sources[origin]];
+
+				if (floors[i] < base->native_floor || issued[i] > base->last_issued)
+					break;
+				if (i + 1 == count && origin_count == original.replay_count)
+					result = CLUSTER_RELMAP_CENSUS_MORE;
+			}
+			if (result != CLUSTER_RELMAP_CENSUS_MORE)
+				break;
+			result = cluster_relmap_retention_census_begin_episode(&original, roots, pointers, origin_count,
 				memory_budget - source_bytes - directory_bytes,
 				(ClusterRelmapRetentionCensus **)&fresh);
 			if (result != CLUSTER_RELMAP_CENSUS_MORE)
@@ -1748,7 +1820,7 @@ typedef struct CensusNativeRoot {
 	uint32 source_index, completed;
 	uint64 records, source_records;
 	bool active;
-	bool seen[CLUSTER_RELMAP_RETENTION_MAX_ORIGINS];
+	bool seen[CLUSTER_WAL_INPUTS_MAX];
 	RfContributorStreamCutV1 cut;
 } CensusNativeRoot;
 
@@ -1845,7 +1917,7 @@ cluster_relmap_retention_census_open_native_episode(
 	{
 		do {
 			CensusNativeRoot work = {0};
-			bool origins[CLUSTER_RELMAP_RETENTION_MAX_ORIGINS] = {false};
+			uint32 replay_sources[CLUSTER_RELMAP_RETENTION_MAX_ORIGINS];
 			const ClusterControlRootIdentity *identity = &original.selected.source.claim.identity;
 			ClusterRecoveryRootsResult root_result;
 			RfPageProofDetailV1 detail;
@@ -1857,8 +1929,9 @@ cluster_relmap_retention_census_open_native_episode(
 			if (!census_episode_context() || root_budget == 0 || payload_budget == 0
 				|| !cluster_wal_inputs_relmap_source_current_v1(&original)
 				|| (count = cluster_wal_inputs_relmap_count_v1(original.scope)) == 0
-				|| count > CLUSTER_WAL_INPUTS_MAX || count > CLUSTER_RELMAP_RETENTION_MAX_ORIGINS
-				|| original.work_generation == 0 || original.replay_count != count)
+				|| count > CLUSTER_WAL_INPUTS_MAX || original.work_generation == 0
+				|| original.replay_count == 0
+				|| original.replay_count > CLUSTER_RELMAP_RETENTION_MAX_ORIGINS)
 				break;
 			bytes = sizeof(*saved) + (size_t)count * sizeof(saved->sources[0]);
 			/* This saved set coexists with both snapshots/directories in the
@@ -1869,28 +1942,7 @@ cluster_relmap_retention_census_open_native_episode(
 				break;
 			}
 			saved->count = count;
-			for (uint32 i = 0; i < count; i++) {
-				ClusterRecoveryRelmapSourceV1 *entry = &saved->sources[i];
-				const ClusterControlRootIdentity *id;
-
-				*entry = cluster_wal_inputs_relmap_source_v1(original.scope, i);
-				id = &entry->selected.source.claim.identity;
-				if (!cluster_wal_inputs_relmap_source_current_v1(entry)
-					|| entry->scope != original.scope || entry->input_index != i
-					|| entry->input_count != count || entry->replay_count != count
-					|| entry->work_generation != original.work_generation
-					|| entry->selected.kind != CLUSTER_WAL_INPUT_CHECKPOINT
-					|| id->origin_node_id < 0 || id->origin_node_id >= lengthof(origins)
-					|| origins[id->origin_node_id]
-					|| id->system_identifier != identity->system_identifier
-					|| entry->selected.source.claim.database_incarnation
-						!= original.selected.source.claim.database_incarnation
-					|| memcmp(id->storage_uuid, identity->storage_uuid, 16) != 0)
-					break;
-				origins[id->origin_node_id] = true;
-				if (i + 1 == count) result = CLUSTER_RELMAP_CENSUS_MORE;
-			}
-			if (result != CLUSTER_RELMAP_CENSUS_MORE)
+			if (!census_native_episode_sources(&original, (CensusEpisode *)saved, replay_sources))
 				break;
 			result = CLUSTER_RELMAP_CENSUS_UNAVAILABLE;
 			if (!census_native_episode_current((CensusEpisode *)saved)

@@ -2,7 +2,7 @@
  * Native source/authority leaves are controlled; ROOT readers and pairs are real.
  * Author: SqlRush <sqlrush@gmail.com>
  * Spec: 2026-10-14-pre2-m5-e1-format-closure-v1.md */
-static ClusterRecoveryRelmapNativeInputV1 native_episode_inputs[2];
+static ClusterRecoveryRelmapNativeInputV1 native_episode_inputs[3];
 static unsigned native_episode_calls, native_episode_fault;
 static int native_episode_fd;
 static ClusterRelmapRetentionDirectory *const *native_episode_control_dirs;
@@ -52,6 +52,7 @@ native_episode_setup(CensusFixture *f, bool pending)
 		ClusterRecoveryRelmapNativeInputV1 *n = &native_episode_inputs[i];
 		s->input_index = i; s->input_count = 2;
 		s->selected.kind = CLUSTER_WAL_INPUT_CHECKPOINT;
+		s->replay = s->selected;
 		memset(n, 0, sizeof(*n));
 		n->source = *s;
 		n->window.system_identifier = 817;

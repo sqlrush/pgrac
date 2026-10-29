@@ -74,11 +74,13 @@ extern ClusterRelmapCensusResult cluster_relmap_retention_census_begin_episode(
 	size_t memory_budget, ClusterRelmapRetentionCensus **out);
 
 /* Original all-source native-input factory, before the physical scan. Takes
- * no caller floor/issued or directory values. Require one complete original
- * checkpoint generation per origin; history/terminal/missing/legacy windows
- * remain unsupported. Native inputs are read through the original full-source
+ * no caller floor/issued or directory values. Keep every selected checkpoint
+ * generation, with exactly one original replay generation/request per origin.
+ * Each historical window must fit that original replay window; windows are
+ * never combined to widen its bounds. Missing replay, terminal or legacy
+ * inputs remain unsupported. Native inputs use the original full-source
  * checkpoint visitor, with the entire fixed cohort checked around each read.
- * BUILDING uses each actual native floor and post-flush published last-issued,
+ * BUILDING uses each replay's actual floor and post-flush published last-issued,
  * never checkpoint nextXid or a lease ceiling. Recheck the original physical
  * ROOT after producer I/O before publishing the cursor exactly once.
  *

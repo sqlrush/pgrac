@@ -1019,10 +1019,17 @@ ProcessInterrupts(void)
 #include "test_cluster_relmap_census_native_episode.inc"
 #include "test_cluster_relmap_census_native_root.inc"
 #include "test_cluster_relmap_census_native_execute.inc"
+#include "test_cluster_relmap_census_native_history.inc"
 
 int
 main(void)
 {
+	if (getenv("PGRAC_CENSUS_NATIVE_HISTORY_FOCUS") != NULL) {
+		UT_PLAN(5);
+		census_native_history_run();
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
 	if (getenv("PGRAC_CENSUS_NATIVE_EXECUTE_FOCUS") != NULL) {
 		UT_PLAN(4);
 		census_native_execute_run();
@@ -1047,7 +1054,8 @@ main(void)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(139);
+	UT_PLAN(144);
+	census_native_history_run();
 	census_native_execute_run();
 	census_native_root_run();
 	census_native_episode_run();

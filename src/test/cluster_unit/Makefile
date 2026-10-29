@@ -679,6 +679,7 @@ test_cluster_relmap_physical_pair.o: test_cluster_relmap_physical_pair.c \
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_relmap_retention_census: test_cluster_relmap_retention_census.c \
+		test_cluster_relmap_census_native_history.inc \
 		test_cluster_relmap_census_native_root.inc \
 		test_cluster_relmap_census_native_execute.inc \
 		test_cluster_relmap_census_native_episode.inc \
