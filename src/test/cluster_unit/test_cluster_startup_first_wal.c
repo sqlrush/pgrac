@@ -73,3 +73,30 @@ test_startup_first_native_end(void)
 	shared_memory = NULL;
 	page_wal_shared = NULL;
 }
+
+BufferDescPadded *
+test_startup_first_native_residency(ClusterSpaceIdentity *identity,
+	RfPageVersionV1 *version, char *image)
+{
+	UT_ASSERT(identity != NULL && version != NULL && image != NULL);
+	*identity = space;
+	memset(version, 0, sizeof(*version));
+	memcpy(version->segment_incarnation, space.incarnation, 16);
+	version->mutation_token = ((PageHeader)page.data)->pd_block_scn;
+	memcpy(image, page.data, BLCKSZ);
+	return BufferDescriptors;
+}
+
+ClusterPageWalFirstResultV1
+test_startup_first_native_observe(BufferDesc *buf, ClusterPageWalRefV1 *out)
+{
+	UT_ASSERT(buf == &desc.bufferdesc);
+	return cluster_page_wal_first_observe_locked_v1(buf, out);
+}
+
+void
+test_startup_first_native_reuse(BufferDesc *buf)
+{
+	UT_ASSERT(buf == &desc.bufferdesc);
+	cluster_page_wal_reset_reuse_locked(buf);
+}

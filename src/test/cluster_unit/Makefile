@@ -10647,9 +10647,12 @@ test_cluster_ctrc_page_cache.inc: $(top_srcdir)/src/backend/storage/buffer/bufmg
 	     END { if (current != 1 || gate != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 test_cluster_ctrc_page_cache: test_cluster_ctrc_page_cache.c test_cluster_ctrc_page_cache.inc unit_test.h \
+		test_cluster_startup_first_wal.o test_cluster_startup_first_wal.h test_cluster_ctrc_cache_native_retirement.inc \
+		test_cluster_ctrc_cache_native_tail.inc \
 		$(top_srcdir)/src/include/cluster/cluster_page_buffer_ctrc.h \
 		$(top_builddir)/src/backend/cluster/cluster_page_stable_base.o $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		test_cluster_startup_first_wal.o \
 		$(top_builddir)/src/backend/cluster/cluster_page_stable_base.o \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_unchanged_sync.inc
@@ -10795,3 +10798,14 @@ clean: clean-startup-first-wal
 .PHONY: clean-startup-first-wal
 clean-startup-first-wal:
 	rm -f test_cluster_startup_first_wal.o
+
+# Whole native invalidation tail used only by the isolated cache fixture.
+test_cluster_ctrc_cache_native_tail.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^InvalidateBufferCommitTailLocked\(/ { print "static void"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (n != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+clean: clean-ctrc-cache-native-tail
+.PHONY: clean-ctrc-cache-native-tail
+clean-ctrc-cache-native-tail:
+	rm -f test_cluster_ctrc_cache_native_tail.inc test_cluster_ctrc_cache_native_tail.inc.tmp
