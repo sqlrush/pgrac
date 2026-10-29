@@ -6368,7 +6368,7 @@ main(void)
 	cluster_control_request_shmem_init();
 	retire_driver = cluster_control_request_driver_start();
 	if (getenv("PGRAC_PRE2_TEST_PREPARED_JOB") != NULL) {
-		UT_PLAN(11);
+		UT_PLAN(12);
 		UT_RUN(prepared_job_delivers_publication_once_after_exact_release);
 		UT_RUN(prepared_job_wrong_ack_keeps_published_result_private);
 		UT_RUN(prepared_job_census_may_consume_original_ack_first);
@@ -6380,6 +6380,7 @@ main(void)
 		UT_RUN(prepared_job_first_release_keeps_original_bounded_confirmation);
 		UT_RUN(prepared_job_error_before_release_cleans_only_the_original_hold);
 		UT_RUN(prepared_job_unbound_error_never_adopts_a_later_cf_request);
+		UT_RUN(prepared_job_result_identity_guard_is_readonly_after_confirmation);
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
@@ -6489,7 +6490,7 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(145);
+	UT_PLAN(146);
 	UT_RUN(startup_cf_timeout_waits_for_exact_completion_before_begin);
 	UT_RUN(startup_cf_completion_does_not_preserve_changed_native_input);
 	UT_RUN(startup_cf_unsafe_native_context_never_takes_a_registry_lock);
@@ -6584,6 +6585,7 @@ main(void)
 	UT_RUN(prepared_job_first_release_keeps_original_bounded_confirmation);
 	UT_RUN(prepared_job_error_before_release_cleans_only_the_original_hold);
 	UT_RUN(prepared_job_unbound_error_never_adopts_a_later_cf_request);
+	UT_RUN(prepared_job_result_identity_guard_is_readonly_after_confirmation);
 	UT_RUN(lmon_prepared_cf_requires_exact_retirement_before_reapply);
 	UT_RUN(lmon_prepared_cf_wrong_ack_cannot_release_the_original_request);
 	UT_RUN(lmon_prepared_cf_service_consumed_ack_still_finishes_own_receipt);

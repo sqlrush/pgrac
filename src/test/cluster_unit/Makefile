@@ -1508,10 +1508,11 @@ test_cluster_prepared_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_control_
 	     /^(cluster_control_root_create_prepared|cluster_control_root_activate_prepared)\(/ { print "ClusterControlRootResult"; emit=1; consumers++ } \
 	     /^(cluster_control_root_create_prepared_job_v1|cluster_control_root_activate_prepared_job_v1|cluster_control_root_prepared_job_poll_v1)\(/ { print "ClusterControlRootResult"; emit=1; jobs++ } \
 	     /^(prepared_work_ready|prepared_work_current)\(/ { print "static bool"; emit=1; workchecks++ } \
+	     /^cluster_control_root_prepared_job_identity_current_v1\(/ { print "bool"; emit=1; identities++ } \
 	     /^prepared_work_bind\(/ { print "static void"; emit=1; workbinds++ } \
 	     /^(prepared_work_consume|prepared_work_release|control_root_create_prepared|control_root_activate_prepared)\(/ { print "static ClusterControlRootResult"; emit=1; worksteps++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (codecs != 4 || predicates != 5 || acquires != 1 || releases != 1 || authorities != 2 || consumers != 2 || jobs != 3 || workchecks != 2 || workbinds != 1 || worksteps != 4 || emit) exit 1 }' \
+	     END { if (codecs != 4 || predicates != 5 || acquires != 1 || releases != 1 || authorities != 2 || consumers != 2 || jobs != 3 || workchecks != 2 || identities != 1 || workbinds != 1 || worksteps != 4 || emit) exit 1 }' \
 	     $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 
@@ -9568,6 +9569,7 @@ test_cluster_stop_membership_observation.inc: $(top_srcdir)/src/backend/cluster/
 		END { if (!done || starts != 1) exit 1 }' $< > $@
 
 test_cluster_r4_activation_fsm: test_cluster_r4_activation_fsm.c unit_test.h test_cluster_first_open.h test_cluster_serving_admission.h test_cluster_sample_ack_handoff.h test_cluster_clean_restart_formation.h test_cluster_commit_carrier.h test_cluster_normal_cold_scn.inc \
+		test_cluster_prepared_round.h $(top_srcdir)/src/include/cluster/cluster_control_root_prepared.h \
 		test_cluster_terminal_peer.inc \
 		test_cluster_stop_membership_observation.inc \
 		test_cluster_normal_cold_startup.h test_cluster_normal_cold_capture.inc \

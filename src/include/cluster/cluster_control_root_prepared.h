@@ -53,5 +53,9 @@ extern ClusterControlRootResult cluster_control_root_activate_prepared_job_v1(
 extern ClusterControlRootResult
 cluster_control_root_prepared_job_poll_v1(ClusterControlRootPreparedWorkV1 *work,
 										  ClusterControlRootFileToken *out_token);
+/* Read-only rejection guard for a result held across a caller observation
+ * gap. This does not prove release completion or authorize ROOT access. */
+extern bool
+cluster_control_root_prepared_job_identity_current_v1(const ClusterControlRootPreparedWorkV1 *work);
 
 #endif

@@ -24,6 +24,7 @@
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_control_root.h" /* bit22 (G3 accessor test) */
+#include "cluster/cluster_control_root_prepared.h"
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_recovery_duty.h"
@@ -568,11 +569,14 @@ superuser(void)
 	return true;
 }
 
+static unsigned ut_root_image_calls;
+
 ClusterControlRootResult
 cluster_control_root_build_migration_image(const ClusterControlRootMigrationRoundV1 *round
 											   pg_attribute_unused(),
 										   ClusterControlRootMigrationImage *out)
 {
+	++ut_root_image_calls;
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
@@ -1350,9 +1354,12 @@ test_gate_inflight(ClusterSemanticAdmissionSide side, int feature_index)
 						 + ((Size)side * 64 + (Size)feature_index) * sizeof(pg_atomic_uint32));
 }
 
+static void ut_prepared_job_reset(void);
+
 static void
 test_gate_reset(void)
 {
+	ut_prepared_job_reset();
 	cluster_shared_config = false;
 	cluster_trace_normal_stop = false;
 	test_capture_stop_log = test_stop_diag_held_lock = test_stop_diag_unsafe_log = false;
@@ -12390,10 +12397,26 @@ UT_TEST(test_prepared_round_fixture_cannot_accept_unmodelled_cold_handoff)
 	cluster_recovery_merge_claim_release_if_held();
 }
 
+#include "test_cluster_prepared_round.h"
+
 int
 main(void)
 {
-	UT_PLAN(422);
+	UT_PLAN(436);
+	UT_RUN(test_prepared_round_published_result_waits_for_original_release_without_replay);
+	UT_RUN(test_prepared_round_completed_result_survives_table_observation_gap);
+	UT_RUN(test_prepared_round_identity_loss_retires_original_debt_without_delivery);
+	UT_RUN(test_prepared_round_activate_seam_identity_loss_keeps_original_cleanup);
+	UT_RUN(test_prepared_round_failed_published_result_waits_then_refuses);
+	UT_RUN(test_prepared_round_missing_receipt_proof_never_replays_or_completes);
+	UT_RUN(test_prepared_round_error_keeps_work_at_original_address_for_next_tick);
+	UT_RUN(test_prepared_round_cleanup_precedes_original_lmon_early_return);
+	UT_RUN(test_prepared_round_stop_census_keeps_debt_until_exact_cleanup);
+	UT_RUN(test_prepared_round_confirmed_operation_failure_terminates_original_round);
+	UT_RUN(test_prepared_round_error_before_binding_keeps_original_refusal_semantics);
+	UT_RUN(test_prepared_round_synchronous_success_rechecks_round_before_stage);
+	UT_RUN(test_prepared_round_cached_success_rejects_later_producer_identity_loss);
+	UT_RUN(test_prepared_round_old_cleanup_cannot_invalidate_replacement_round);
 	UT_RUN(test_prepared_round_cf_refusal_retries_without_advancing_or_resubmitting);
 	UT_RUN(test_prepared_round_cf_retry_requalifies_current_authority);
 	UT_RUN(test_prepared_round_activate_retry_requires_its_original_staged_seam);

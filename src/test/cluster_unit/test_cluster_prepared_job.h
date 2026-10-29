@@ -441,3 +441,59 @@ UT_TEST(prepared_job_unbound_error_never_adopts_a_later_cf_request)
 			UT_ASSERT(!cluster_cf_held(ExclusiveLock));
 		}
 }
+
+UT_TEST(prepared_job_result_identity_guard_is_readonly_after_confirmation)
+{
+	for (int activate = 0; activate < 2; activate++) {
+		ClusterControlRootFileToken out;
+		ClusterControlRootPreparedWorkV1 copy;
+		int requests;
+		unsigned reads;
+
+		prepared_job_fixture(activate);
+		UT_ASSERT(!cluster_control_root_prepared_job_identity_current_v1(NULL));
+		UT_ASSERT(!cluster_control_root_prepared_job_identity_current_v1(&prepared_job));
+		g_seven_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+		UT_ASSERT_EQ(prepared_job_call(&out), CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN);
+		/* Identity alone must not be used as a release confirmation. */
+		UT_ASSERT(cluster_control_root_prepared_job_identity_current_v1(&prepared_job));
+		UT_ASSERT_EQ(prepared_job.release.state, CF_JOB_RECEIPT_RETIRING);
+		UT_ASSERT(acknowledge_retirements());
+		UT_ASSERT_EQ(cluster_control_root_prepared_job_poll_v1(&prepared_job, &out),
+					 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		requests = g_seven_count;
+		reads = prepared_reads;
+		UT_ASSERT(cluster_control_root_prepared_job_identity_current_v1(&prepared_job));
+		copy = prepared_job;
+		UT_ASSERT(!cluster_control_root_prepared_job_identity_current_v1(&copy));
+		owner_epoch++;
+		UT_ASSERT(!cluster_control_root_prepared_job_identity_current_v1(&prepared_job));
+		owner_epoch--;
+		owner_generation++;
+		UT_ASSERT(!cluster_control_root_prepared_job_identity_current_v1(&prepared_job));
+		owner_generation--;
+		CurrentResourceOwner = (ResourceOwner)2;
+		UT_ASSERT(!cluster_control_root_prepared_job_identity_current_v1(&prepared_job));
+		CurrentResourceOwner = (ResourceOwner)1;
+		MyProcPid++;
+		UT_ASSERT(!cluster_control_root_prepared_job_identity_current_v1(&prepared_job));
+		MyProcPid--;
+		MyProc = NULL;
+		UT_ASSERT(!cluster_control_root_prepared_job_identity_current_v1(&prepared_job));
+		MyProc = &owner_proc;
+		owner_proc.pgprocno++;
+		UT_ASSERT(!cluster_control_root_prepared_job_identity_current_v1(&prepared_job));
+		owner_proc.pgprocno--;
+		prepared_job.release.job_generation++;
+		UT_ASSERT(!cluster_control_root_prepared_job_identity_current_v1(&prepared_job));
+		prepared_job.release.job_generation--;
+		prepared_job.rejected = true;
+		UT_ASSERT(!cluster_control_root_prepared_job_identity_current_v1(&prepared_job));
+		prepared_job.rejected = false;
+		UT_ASSERT(cluster_control_root_prepared_job_identity_current_v1(&prepared_job));
+		UT_ASSERT_EQ(g_seven_count, requests);
+		UT_ASSERT_EQ(prepared_reads, reads);
+		UT_ASSERT_EQ(prepared_writes, 1);
+		prepared_job_closed();
+	}
+}

@@ -11901,6 +11901,17 @@ prepared_work_current(const ClusterControlRootPreparedWorkV1 *work)
 		   && cluster_grd_redeclare_generation() == work->owner_generation;
 }
 
+bool
+cluster_control_root_prepared_job_identity_current_v1(const ClusterControlRootPreparedWorkV1 *work)
+{
+	return work != NULL && work->address == work && work->proc != NULL && MyProc == work->proc
+		   && MyProcPid == work->pid && MyProc->pgprocno == work->procno && work->generation != 0
+		   && work->release.job_generation == work->generation && !work->rejected
+		   && (work->phase == CONTROL_ROOT_PREPARED_WORK_RETIRING
+			   || work->phase == CONTROL_ROOT_PREPARED_WORK_CONSUMED)
+		   && prepared_work_current(work);
+}
+
 static ClusterControlRootResult
 prepared_work_consume(ClusterControlRootPreparedWorkV1 *work, ClusterCfJobResultV1 release,
 					  ClusterControlRootFileToken *out_token)
