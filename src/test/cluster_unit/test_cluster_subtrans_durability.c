@@ -29,6 +29,7 @@ static void fixture_lru_init(SlruCtl ctl, const char *name, int slots, int lsn_g
 #define SimpleLruInit fixture_lru_init
 #include "../../backend/access/transam/subtrans.c"
 #undef SimpleLruInit
+#include "test_cluster_slru_non_clog.h"
 #include "../../backend/access/transam/slru.c"
 
 #undef printf

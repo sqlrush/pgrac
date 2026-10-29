@@ -16,6 +16,8 @@
 #define CritSectionCount d3_clog_CritSectionCount
 #define ExceptionalCondition d3_clog_ExceptionalCondition
 #define ExtendCLOG d3_clog_ExtendCLOG
+#define cluster_clog_relmap_writeback_begin d3_clog_cluster_clog_relmap_writeback_begin
+#define cluster_clog_relmap_writeback_end d3_clog_cluster_clog_relmap_writeback_end
 #define FreeDir d3_clog_FreeDir
 #define InRecovery d3_clog_InRecovery
 #define InterruptHoldoffCount d3_clog_InterruptHoldoffCount

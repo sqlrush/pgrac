@@ -21,6 +21,7 @@
 #include "storage/shmem.h"
 #include "miscadmin.h"
 #include "../../backend/access/transam/subtrans.c"
+#include "test_cluster_slru_non_clog.h"
 #include "../../backend/access/transam/slru.c"
 
 #undef printf
