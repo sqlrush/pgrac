@@ -181,6 +181,32 @@ cluster_wal_inputs_job_scope_create_v1(ClusterWalInputsJobV1 *job)
 }
 
 ClusterControlRootResult
+cluster_wal_inputs_job_revalidate_prepare_v1(ClusterWalInputsJobV1 *job, ClusterWalInputsV1 **scope)
+{
+	ClusterWalInputsJobSlotV1 *slot;
+
+	if (scope == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	*scope = NULL;
+	slot = inputs_job_find(job, false);
+	if (slot == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (job->state == WAL_INPUT_JOB_STATE_RETIRING_CF
+		|| job->state == WAL_INPUT_JOB_STATE_RETIRING_WALR || job->state == WAL_INPUT_JOB_STATE_DONE)
+		return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+	if (job->state != WAL_INPUT_JOB_STATE_USABLE)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	/* The same scope/pin stays allocated, but old public borrows cannot be
+	 * used during the new ROOT proof. ERROR has no new business verdict. */
+	job->original_result = UINT32_MAX;
+	inputs_job_transition(slot, WAL_INPUT_JOB_STATE_BUILDING, 0);
+	*scope = job->inputs;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+ClusterControlRootResult
 cluster_wal_inputs_job_cf_prepare_v1(ClusterWalInputsJobV1 *job, uint64 *before)
 {
 	ClusterWalInputsJobSlotV1 *slot;
@@ -470,6 +496,13 @@ cluster_wal_inputs_job_retire_v1(ClusterWalInputsJobV1 *job)
 			job->flags | WAL_INPUT_JOB_FLAG_REVOKED);
 	}
 	return inputs_job_retire_step(job, first);
+}
+
+ClusterWalInputsJobResultV1
+cluster_wal_inputs_job_wait_failed_v1(ClusterWalInputsJobV1 *job)
+{
+	/* Keep the original verdict. Cleanup must not acquire a new ROOT proof. */
+	return cluster_wal_inputs_job_retire_v1(job);
 }
 
 ClusterWalInputsJobResultV1

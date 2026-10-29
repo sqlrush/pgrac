@@ -124,6 +124,8 @@ extern bool cluster_wal_inputs_job_scope_matches_v1(ClusterWalInputsJobV1 *job,
  * refused/throwing build. UINT32_MAX retains an unknown ERROR verdict. */
 extern bool cluster_wal_inputs_job_begin_outcome_v1(ClusterWalInputsJobV1 *job,
 	uint32 result, bool error);
+extern ClusterControlRootResult cluster_wal_inputs_job_revalidate_prepare_v1(
+	ClusterWalInputsJobV1 *job, ClusterWalInputsV1 **scope);
 
 StaticAssertDecl(CLUSTER_WAL_INPUT_JOB_COUNT == 4, "WAL input job slot count changed");
 StaticAssertDecl(CLUSTER_WAL_RETENTION_MAX_THREADS == 128, "WAL input member limit changed");

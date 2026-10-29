@@ -3278,6 +3278,43 @@ cluster_wal_inputs_cold_sync_v1(const ClusterControlRootSnapshot *expected,
 }
 
 ClusterControlRootResult
+cluster_wal_inputs_job_revalidate_v1(ClusterWalInputsJobV1 *job)
+{
+	ClusterWalInputsV1 *inputs;
+	WalInputsWork *volatile work = NULL;
+	ClusterControlRootResult result;
+
+	result = cluster_wal_inputs_job_revalidate_prepare_v1(job, &inputs);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	PG_TRY();
+	{
+		if (!inputs_build_current(inputs))
+			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		else {
+			work = palloc0(sizeof(*work));
+			result = inputs_job_root_phase(inputs, work, false, false);
+			if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && !inputs_build_current(inputs))
+				result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		}
+	}
+	PG_CATCH();
+	{
+		if (!cluster_wal_inputs_job_begin_outcome_v1(job, UINT32_MAX, true))
+			elog(FATAL, "invalid original WAL input job after revalidation error");
+		if (work != NULL)
+			pfree(work);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (work != NULL)
+		pfree(work);
+	if (!cluster_wal_inputs_job_begin_outcome_v1(job, result, false))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	return result;
+}
+
+ClusterControlRootResult
 cluster_wal_inputs_revalidate_v1(ClusterWalInputsV1 *inputs)
 {
 	WalInputsWork *work;
