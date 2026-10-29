@@ -55,6 +55,8 @@ typedef struct ClusterWalPinLock {
 	ClusterLockAcquireRequest request;
 	bool held;
 	bool release_uncertain;
+	/* Job-only native custody survives the original install's ERROR unwind. */
+	volatile bool native_held;
 } ClusterWalPinLock;
 
 typedef struct ClusterWalPinThread {
@@ -110,18 +112,30 @@ struct ClusterWalRootPublishGuard {
 
 struct ClusterWalReadPinV1 {
 	uint32 magic;
+	uint16 cursor; /* Independent original-pin mirror of the job cleanup cursor. */
 	uint64 generation;
 	int32 owner_pid;
 	ResourceOwner owner;
 	uint16 nthreads;
 	bool poisoned;
+	bool retiring;
+	ClusterWalInputsJobV1 *job;
 	ClusterWalPinLock locks[FLEXIBLE_ARRAY_MEMBER];
 };
 
 StaticAssertDecl(offsetof(ClusterWalReadPinV1, locks)
 				 + CLUSTER_WAL_RETENTION_MAX_THREADS * sizeof(ClusterWalPinLock)
-				 + CLUSTER_WAL_INPUT_JOB_BACKLINK_RESERVE <= CLUSTER_WAL_INPUT_JOB_PIN_BYTES,
+				 <= CLUSTER_WAL_INPUT_JOB_PIN_BYTES,
 				 "WAL input read pin exceeds its payload envelope");
+StaticAssertDecl(sizeof(((ClusterWalPinLock *)0)->native_held)
+				 <= sizeof(((ClusterWalInputsJobControlBudgetV1 *)0)->native_flags[0][0]),
+				 "WAL input native flag exceeds its control charge");
+StaticAssertDecl(sizeof(((ClusterWalReadPinV1 *)0)->retiring)
+				 <= sizeof(((ClusterWalInputsJobControlBudgetV1 *)0)->pin_retiring[0]),
+				 "WAL input retiring flag exceeds its control charge");
+StaticAssertDecl(sizeof(((ClusterWalReadPinV1 *)0)->cursor)
+				 <= sizeof(((ClusterWalInputsJobControlBudgetV1 *)0)->pin_cursors[0]),
+				 "WAL input pin cursor exceeds its control charge");
 
 static ClusterWalRetentionPin *active_pin;
 static ClusterWalReadPinV1 *active_read_pin;
@@ -1200,11 +1214,27 @@ read_pin_valid(const ClusterWalReadPinV1 *pin)
 }
 
 bool
+cluster_wal_read_pin_job_binding_v1(ClusterWalInputsJobV1 *job, ClusterWalReadPinV1 *pin,
+								  uint64 generation, uint16 cursor)
+{
+	if (pin == NULL)
+		return generation == 0 && cursor == 0
+			&& (active_read_pin == NULL || active_read_pin->job != job);
+	return read_pin_valid(pin) && pin->job == job && generation != 0
+		&& generation == pin->generation && generation == read_pin_generation
+		&& cursor == pin->cursor && cursor <= pin->nthreads && (pin->retiring || cursor == 0);
+}
+
+bool
 cluster_wal_read_pin_covers_v1(ClusterWalReadPinV1 *pin, uint16 thread)
 {
 	bool found = false;
 
 	if (!cluster_shared_config || !read_pin_valid(pin) || pin->poisoned)
+		return false;
+	if (pin->job != NULL
+		&& (!cluster_wal_inputs_job_pin_matches_v1(pin->job, pin, pin->generation, false)
+			|| (pin->job->flags & WAL_INPUT_JOB_FLAG_REVOKED) != 0))
 		return false;
 	for (uint16 i = 0; i < pin->nthreads; i++) {
 		ClusterWalPinLock *lock = &pin->locks[i];
@@ -1261,7 +1291,7 @@ cluster_wal_read_pin_release_v1(ClusterWalReadPinV1 **pin)
 		return CLUSTER_WALR_RELEASE_INVALID;
 	if (*pin == NULL)
 		return CLUSTER_WALR_RELEASE_NOT_HELD;
-	if (!read_pin_valid(*pin)
+	if (!read_pin_valid(*pin) || (*pin)->job != NULL
 		|| (active_root_publish_guard != NULL && active_root_publish_guard->borrowed_from_read_pin))
 		return CLUSTER_WALR_RELEASE_INVALID;
 	(*pin)->poisoned = true;
@@ -1364,6 +1394,189 @@ failed:
 		return CLUSTER_WAL_PIN_RELEASE_UNCERTAIN;
 	}
 	return result;
+}
+
+/* Same original native/S5 leg, with its owned ref in stable member storage.
+ * Failed promotion and ERROR cannot discard the ref ahead of exact ACK. */
+static ClusterLockAcquireResult
+read_pin_job_finish_native(ClusterLockAcquireRequest *request, void *argument)
+{
+	volatile bool *native_held = argument;
+	LockAcquireResult native;
+
+	walr_native_locktag_init((uint16)request->resid.field1, &request->locktag);
+	native = LockAcquire(&request->locktag, request->lockmode, request->sessionLock, request->dontwait);
+	if (native == LOCKACQUIRE_OK || native == LOCKACQUIRE_ALREADY_CLEAR || native == LOCKACQUIRE_ALREADY_HELD)
+		*native_held = true;
+	if (native != LOCKACQUIRE_OK)
+		return CLUSTER_LOCK_ACQUIRE_NOT_AVAIL;
+	return cluster_lock_acquire_s5_promote(request);
+}
+
+ClusterWalPinResult
+cluster_wal_read_pin_acquire_job_v1(const uint16 *threads, uint16 nthreads,
+								 ClusterWalInputsJobV1 *job, ClusterWalReadPinV1 **out)
+{
+	ClusterWalReadPinV1 *pin;
+	MemoryContext context = cluster_wal_inputs_job_context_v1(job);
+	bool failed = false;
+
+	if (!cluster_shared_config || context == NULL || threads == NULL || nthreads == 0
+		|| nthreads > CLUSTER_WAL_RETENTION_MAX_THREADS || out == NULL || *out != NULL)
+		return CLUSTER_WAL_PIN_INVALID;
+	if (active_read_pin != NULL || active_pin != NULL || active_root_publish_guard != NULL
+		|| active_reuse_guard != NULL || active_e1_context != NULL || active_action_context != NULL)
+		return CLUSTER_WAL_PIN_CAPACITY;
+	for (uint16 i = 0; i < nthreads; ++i)
+		if (threads[i] == 0 || threads[i] > CLUSTER_WAL_RETENTION_MAX_THREADS
+			|| (i != 0 && threads[i - 1] >= threads[i]))
+			return CLUSTER_WAL_PIN_INVALID;
+	if (read_pin_generation == UINT64_MAX)
+		return CLUSTER_WAL_PIN_UNAVAILABLE;
+	walr_resource_ensure_callback();
+	pin = MemoryContextAllocZero(context, offsetof(ClusterWalReadPinV1, locks)
+		+ (Size)nthreads * sizeof(ClusterWalPinLock));
+	pin->magic = CLUSTER_WAL_READ_PIN_MAGIC;
+	pin->generation = ++read_pin_generation;
+	pin->owner_pid = MyProcPid;
+	pin->owner = CurrentResourceOwner;
+	pin->nthreads = nthreads;
+	pin->poisoned = true;
+	active_read_pin = pin;
+	if (!cluster_wal_inputs_job_pin_bind_v1(job, pin, pin->generation)) {
+		active_read_pin = NULL;
+		pfree(pin);
+		return CLUSTER_WAL_PIN_INVALID;
+	}
+	pin->job = job;
+	*out = pin; /* Cleanup locator published before the first throwing grant. */
+	PG_TRY();
+	{
+		for (uint16 i = 0; i < nthreads; ++i) {
+			ClusterWalPinLock *lock = &pin->locks[i];
+			ClusterLockAcquireResult result;
+
+			if (!walr_share_request_init(threads[i], &lock->request))
+				elog(FATAL, "invalid original WAL input job member");
+			lock->request.timeout_ms = 0; /* Existing GES exchange/first-confirmation budget. */
+			result = cluster_lock_owner_request_acquire_retained(&lock->request,
+				read_pin_job_finish_native, (void *)&lock->native_held);
+			lock->release_uncertain = lock->request.control_owner_id != 0;
+			if (result != CLUSTER_LOCK_ACQUIRE_OK_GRANTED) {
+				if (!cluster_wal_inputs_job_pin_cleanup_v1(job, pin, pin->generation, false, false))
+					elog(FATAL, "lost original WAL input job after partial acquire");
+				failed = true;
+				break;
+			}
+			lock->held = true;
+			lock->release_uncertain = false;
+		}
+	}
+	PG_CATCH();
+	{
+		if (!cluster_wal_inputs_job_pin_cleanup_v1(job, pin, pin->generation, true, false))
+			elog(FATAL, "lost original WAL input job during acquire cleanup");
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (failed)
+		return CLUSTER_WAL_PIN_RELEASE_UNCERTAIN;
+	pin->poisoned = false;
+	if (!cluster_wal_read_pin_covers_v1(pin, threads[0])) {
+		pin->poisoned = true;
+		if (!cluster_wal_inputs_job_pin_cleanup_v1(job, pin, pin->generation, false, false))
+			elog(FATAL, "lost stale original WAL input job");
+		return CLUSTER_WAL_PIN_RELEASE_UNCERTAIN;
+	}
+	return CLUSTER_WAL_PIN_OK;
+}
+
+static ClusterWalrReleaseResult
+read_pin_job_release(ClusterWalReadPinV1 **out, ClusterWalInputsJobV1 *job, bool first)
+{
+	ClusterWalReadPinV1 *pin;
+	bool synchronous;
+
+	if (out == NULL || (pin = *out) == NULL || !read_pin_valid(pin) || pin->job != job
+		|| !cluster_wal_inputs_job_pin_matches_v1(job, pin, pin->generation, false)
+		|| job->state != WAL_INPUT_JOB_STATE_RETIRING_WALR
+		|| (job->flags & WAL_INPUT_JOB_FLAG_REVOKED) == 0
+		|| (active_root_publish_guard != NULL && active_root_publish_guard->borrowed_from_read_pin))
+		return CLUSTER_WALR_RELEASE_INVALID;
+	synchronous = first && !pin->retiring;
+	if (!pin->retiring) {
+		pin->retiring = true;
+		job->walr_next = pin->cursor = pin->nthreads;
+	}
+	pin->poisoned = true;
+	while (job->walr_next > 0) {
+		ClusterWalPinLock *lock = &pin->locks[job->walr_next - 1];
+		ClusterLockAcquireResult result;
+
+		if (lock->request.control_owner_id == 0) {
+			/* Only never-registered members may be skipped. Losing an owned
+			 * guard/identity is a contradiction, never terminal evidence. */
+			if (lock->held || lock->release_uncertain || lock->native_held
+				|| lock->request.request_id != 0 || lock->request.holder.request_id != 0)
+				return CLUSTER_WALR_RELEASE_INVALID;
+			--job->walr_next;
+			--pin->cursor;
+			continue;
+		}
+		if (lock->native_held && !walr_request_has_native_lock(&lock->request))
+			return CLUSTER_WALR_RELEASE_INVALID;
+		lock->release_uncertain = true;
+		result = synchronous ? cluster_lock_owner_request_release(&lock->request)
+			: cluster_lock_owner_request_release_poll(&lock->request);
+		if (result != CLUSTER_LOCK_ACQUIRE_OK_GRANTED)
+			return result == CLUSTER_LOCK_ACQUIRE_PENDING
+				? CLUSTER_WALR_RELEASE_UNCONFIRMED : CLUSTER_WALR_RELEASE_INVALID;
+		if (lock->native_held) {
+			walr_native_lock_release_or_fatal(&lock->request);
+			lock->native_held = false;
+		}
+		memset(&lock->request, 0, sizeof(lock->request));
+		lock->held = lock->release_uncertain = false;
+		--job->walr_next;
+		--pin->cursor;
+		if (!synchronous && job->walr_next > 0) {
+			/* Exact original retirement completion drives the next member,
+			 * including when its predecessor consumed the original ACK latch. */
+			SetLatch(MyLatch);
+			return CLUSTER_WALR_RELEASE_UNCONFIRMED;
+		}
+	}
+	if (!cluster_wal_inputs_job_pin_detach_v1(job, pin, pin->generation))
+		return CLUSTER_WALR_RELEASE_INVALID;
+	active_read_pin = NULL;
+	explicit_bzero(pin, offsetof(ClusterWalReadPinV1, locks)
+		+ (Size)pin->nthreads * sizeof(ClusterWalPinLock));
+	pfree(pin);
+	*out = NULL;
+	return CLUSTER_WALR_RELEASE_CONFIRMED;
+}
+
+ClusterWalrReleaseResult
+cluster_wal_read_pin_release_job_v1(ClusterWalReadPinV1 **pin, ClusterWalInputsJobV1 *job)
+{
+	return read_pin_job_release(pin, job, true);
+}
+
+ClusterWalrReleaseResult
+cluster_wal_read_pin_release_job_poll_v1(ClusterWalReadPinV1 **pin, ClusterWalInputsJobV1 *job)
+{
+	return read_pin_job_release(pin, job, false);
+}
+
+static bool
+read_pin_job_owner_cleanup(ClusterWalReadPinV1 *pin, bool isCommit)
+{
+	if (pin->job == NULL)
+		return false;
+	if (!cluster_wal_inputs_job_pin_cleanup_v1(pin->job, pin, pin->generation, !isCommit, true))
+		elog(FATAL, "invalid original WAL input job during WALR owner cleanup");
+	pin->poisoned = true;
+	return true;
 }
 
 ClusterWalPinResult
@@ -1953,7 +2166,11 @@ walr_resource_release_callback(ResourceReleasePhase phase, bool isCommit, bool i
 	}
 	if (active_read_pin != NULL && active_read_pin->owner == CurrentResourceOwner) {
 		ClusterWalReadPinV1 *pin = active_read_pin;
-		ClusterWalrReleaseResult result = cluster_wal_read_pin_release_v1(&pin);
+		ClusterWalrReleaseResult result;
+
+		if (read_pin_job_owner_cleanup(pin, isCommit))
+			return;
+		result = cluster_wal_read_pin_release_v1(&pin);
 
 		if (result != CLUSTER_WALR_RELEASE_CONFIRMED) {
 			if (cluster_trace_control_config && CritSectionCount == 0)

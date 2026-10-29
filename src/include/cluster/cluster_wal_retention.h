@@ -361,6 +361,17 @@ extern ClusterWalPinResult cluster_wal_read_pin_acquire_v1(const uint16 *threads
 														   ClusterWalReadPinV1 **out);
 extern bool cluster_wal_read_pin_covers_v1(ClusterWalReadPinV1 *pin, uint16 thread);
 extern ClusterWalrReleaseResult cluster_wal_read_pin_release_v1(ClusterWalReadPinV1 **pin);
+struct ClusterWalInputsJobV1;
+/* Original Aux caller only. Even failed/throwing acquisition retains the
+ * original allocation and stable guards; an output is never input authority. */
+extern ClusterWalPinResult cluster_wal_read_pin_acquire_job_v1(const uint16 *threads,
+	uint16 nthreads, struct ClusterWalInputsJobV1 *job, ClusterWalReadPinV1 **out);
+/* Called by the original job after CF confirmation. Reentry never restarts
+ * the first confirmation budget; poll processes at most one original member. */
+extern ClusterWalrReleaseResult cluster_wal_read_pin_release_job_v1(
+	ClusterWalReadPinV1 **pin, struct ClusterWalInputsJobV1 *job);
+extern ClusterWalrReleaseResult cluster_wal_read_pin_release_job_poll_v1(
+	ClusterWalReadPinV1 **pin, struct ClusterWalInputsJobV1 *job);
 extern ClusterWalPinResult
 cluster_wal_retention_pin_acquire(const ClusterWalRetentionPinThreadRequest *requests,
 								  uint16 nthreads, ClusterWalRetentionPin **out_pin);

@@ -31,8 +31,8 @@ typedef struct ClusterWalInputV1 {
 typedef struct ClusterWalInputsV1 ClusterWalInputsV1;
 
 /* Original auxiliary caller lifetime, not an input-use permission. The
- * lifetime/CF foundation rejects input scopes and WALR pins until their
- * corresponding job-bound interfaces are installed. */
+ * lifetime/CF/pin storage remains cleanup-only until the corresponding
+ * complete input publication interface is installed. */
 typedef enum ClusterWalInputsConsumerV1 {
 	WAL_INPUT_JOB_RETAINED_CUT = 0,
 	WAL_INPUT_JOB_PI_NOTICE = 1,

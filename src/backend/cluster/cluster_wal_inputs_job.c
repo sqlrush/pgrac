@@ -76,16 +76,27 @@ inputs_job_find(ClusterWalInputsJobV1 *job, bool owner_cleanup)
 			for (unsigned j = 0; j < sizeof(job->reserved); ++j)
 				if (job->reserved[j] != 0)
 					return NULL;
-			/* Input/pin binding is a later slice. Never treat an unsupported
-			 * debt as absent or advertise a usable/suspended input scope. */
-			if (job->inputs != NULL || job->pin != NULL || job->pin_generation != 0
-				|| job->walr_next != 0
+			/* Input publication remains unsupported. A bound pin is original
+			 * BUILDING/cleanup storage, never a usable input scope. */
+			if (job->inputs != NULL
+				|| !cluster_wal_read_pin_job_binding_v1(job, job->pin,
+					job->pin_generation, job->walr_next)
 				|| (job->state != WAL_INPUT_JOB_STATE_NEW
+					&& job->state != WAL_INPUT_JOB_STATE_BUILDING
 					&& job->state != WAL_INPUT_JOB_STATE_RETIRING_CF
+					&& job->state != WAL_INPUT_JOB_STATE_RETIRING_WALR
 					&& job->state != WAL_INPUT_JOB_STATE_DONE)
-				|| (job->state == WAL_INPUT_JOB_STATE_NEW ? job->flags != 0
+				|| (job->state == WAL_INPUT_JOB_STATE_NEW
+					&& (job->pin != NULL || job->walr_next != 0))
+				|| (job->state == WAL_INPUT_JOB_STATE_BUILDING && job->pin == NULL)
+				|| (job->state != WAL_INPUT_JOB_STATE_RETIRING_WALR && job->walr_next != 0)
+				|| ((job->state == WAL_INPUT_JOB_STATE_NEW || job->state == WAL_INPUT_JOB_STATE_BUILDING)
+					? job->flags != 0
 					: (job->flags & WAL_INPUT_JOB_FLAG_REVOKED) == 0)
-				|| (job->state == WAL_INPUT_JOB_STATE_DONE && job->cf.state == CF_JOB_RECEIPT_RETIRING)
+				|| ((job->state == WAL_INPUT_JOB_STATE_DONE
+					|| job->state == WAL_INPUT_JOB_STATE_RETIRING_WALR)
+					&& job->cf.state == CF_JOB_RECEIPT_RETIRING)
+				|| (job->state == WAL_INPUT_JOB_STATE_DONE && job->pin != NULL)
 				|| (job->cf.state == CF_JOB_RECEIPT_UNBOUND
 					&& memcmp(&job->cf, &unbound, sizeof(unbound)) != 0))
 				return NULL;
@@ -100,6 +111,57 @@ inputs_job_transition(ClusterWalInputsJobSlotV1 *slot, uint32 state, uint16 flag
 {
 	slot->job->state = slot->state = state;
 	slot->job->flags = slot->flags = flags;
+}
+
+bool
+cluster_wal_inputs_job_pin_bind_v1(ClusterWalInputsJobV1 *job, ClusterWalReadPinV1 *pin,
+								 uint64 generation)
+{
+	ClusterWalInputsJobSlotV1 *slot = inputs_job_find(job, false);
+
+	if (slot == NULL || job->state != WAL_INPUT_JOB_STATE_NEW || job->pin != NULL
+		|| job->cf.state == CF_JOB_RECEIPT_RETIRING || pin == NULL
+		|| !cluster_wal_read_pin_job_binding_v1(NULL, pin, generation, 0))
+		return false;
+	job->pin = pin;
+	job->pin_generation = generation;
+	inputs_job_transition(slot, WAL_INPUT_JOB_STATE_BUILDING, job->flags);
+	return true;
+}
+
+bool
+cluster_wal_inputs_job_pin_matches_v1(ClusterWalInputsJobV1 *job, ClusterWalReadPinV1 *pin,
+									uint64 generation, bool owner_cleanup)
+{
+	return pin != NULL && inputs_job_find(job, owner_cleanup) != NULL
+		&& job->pin == pin && job->pin_generation == generation;
+}
+
+bool
+cluster_wal_inputs_job_pin_detach_v1(ClusterWalInputsJobV1 *job, ClusterWalReadPinV1 *pin,
+								   uint64 generation)
+{
+	if (!cluster_wal_inputs_job_pin_matches_v1(job, pin, generation, false)
+		|| job->state != WAL_INPUT_JOB_STATE_RETIRING_WALR || job->walr_next != 0)
+		return false;
+	job->pin = NULL;
+	job->pin_generation = 0;
+	return true;
+}
+
+bool
+cluster_wal_inputs_job_pin_cleanup_v1(ClusterWalInputsJobV1 *job, ClusterWalReadPinV1 *pin,
+									uint64 generation, bool error, bool owner_cleanup)
+{
+	ClusterWalInputsJobSlotV1 *slot;
+
+	if (!cluster_wal_inputs_job_pin_matches_v1(job, pin, generation, owner_cleanup))
+		return false;
+	slot = &inputs_jobs[job->consumer];
+	inputs_job_transition(slot,
+		job->state == WAL_INPUT_JOB_STATE_RETIRING_WALR ? job->state : WAL_INPUT_JOB_STATE_RETIRING_CF,
+		job->flags | WAL_INPUT_JOB_FLAG_REVOKED | (error ? WAL_INPUT_JOB_FLAG_ERROR : 0));
+	return true;
 }
 
 static void
@@ -120,7 +182,8 @@ inputs_jobs_resource_release(ResourceReleasePhase phase, bool isCommit,
 			elog(FATAL, "invalid original WAL input job during owner cleanup");
 		if (job->state == WAL_INPUT_JOB_STATE_DONE)
 			continue;
-		inputs_job_transition(&inputs_jobs[i], WAL_INPUT_JOB_STATE_RETIRING_CF,
+		inputs_job_transition(&inputs_jobs[i],
+			job->state == WAL_INPUT_JOB_STATE_RETIRING_WALR ? job->state : WAL_INPUT_JOB_STATE_RETIRING_CF,
 			job->flags | WAL_INPUT_JOB_FLAG_REVOKED | (isCommit ? 0 : WAL_INPUT_JOB_FLAG_ERROR));
 		/* Only revoke. The original service loop observes ACK completion;
 		 * this callback neither waits nor releases the caller's context. */
@@ -195,8 +258,8 @@ cluster_wal_inputs_job_context_v1(ClusterWalInputsJobV1 *job)
 		&& job->cf.state != CF_JOB_RECEIPT_RETIRING ? job->context : NULL;
 }
 
-ClusterWalInputsJobResultV1
-cluster_wal_inputs_job_poll_v1(ClusterWalInputsJobV1 *job)
+static ClusterWalInputsJobResultV1
+inputs_job_retire_step(ClusterWalInputsJobV1 *job, bool first)
 {
 	ClusterCfJobResultV1 result;
 	ClusterWalInputsJobSlotV1 *slot = inputs_job_find(job, false);
@@ -205,29 +268,46 @@ cluster_wal_inputs_job_poll_v1(ClusterWalInputsJobV1 *job)
 		return WAL_INPUT_JOB_INVALID;
 	if (job->state == WAL_INPUT_JOB_STATE_DONE)
 		return WAL_INPUT_JOB_DONE;
-	if (job->state != WAL_INPUT_JOB_STATE_RETIRING_CF)
+	if (job->state != WAL_INPUT_JOB_STATE_RETIRING_CF && job->state != WAL_INPUT_JOB_STATE_RETIRING_WALR)
 		return WAL_INPUT_JOB_INVALID;
-	if (job->cf.state != CF_JOB_RECEIPT_UNBOUND) {
+	if (job->state == WAL_INPUT_JOB_STATE_RETIRING_CF && job->cf.state != CF_JOB_RECEIPT_UNBOUND) {
 		result = cluster_cf_job_retirement_poll_v1(&job->cf);
 		if (result != CF_JOB_CONFIRMED)
 			return result == CF_JOB_PENDING ? WAL_INPUT_JOB_PENDING : WAL_INPUT_JOB_INVALID;
+	}
+	if (job->pin != NULL) {
+		ClusterWalrReleaseResult released;
+
+		inputs_job_transition(slot, WAL_INPUT_JOB_STATE_RETIRING_WALR, job->flags);
+		released = first ? cluster_wal_read_pin_release_job_v1(&job->pin, job)
+			: cluster_wal_read_pin_release_job_poll_v1(&job->pin, job);
+		if (released != CLUSTER_WALR_RELEASE_CONFIRMED)
+			return released == CLUSTER_WALR_RELEASE_UNCONFIRMED ? WAL_INPUT_JOB_PENDING : WAL_INPUT_JOB_INVALID;
 	}
 	inputs_job_transition(slot, WAL_INPUT_JOB_STATE_DONE, job->flags);
 	return WAL_INPUT_JOB_DONE;
 }
 
 ClusterWalInputsJobResultV1
+cluster_wal_inputs_job_poll_v1(ClusterWalInputsJobV1 *job)
+{
+	return inputs_job_retire_step(job, false);
+}
+
+ClusterWalInputsJobResultV1
 cluster_wal_inputs_job_retire_v1(ClusterWalInputsJobV1 *job)
 {
 	ClusterWalInputsJobSlotV1 *slot = inputs_job_find(job, false);
+	bool first;
 
 	if (slot == NULL)
 		return WAL_INPUT_JOB_INVALID;
-	if (job->state == WAL_INPUT_JOB_STATE_NEW) {
+	first = job->state == WAL_INPUT_JOB_STATE_NEW || job->state == WAL_INPUT_JOB_STATE_BUILDING;
+	if (first) {
 		inputs_job_transition(slot, WAL_INPUT_JOB_STATE_RETIRING_CF,
 			job->flags | WAL_INPUT_JOB_FLAG_REVOKED);
 	}
-	return cluster_wal_inputs_job_poll_v1(job);
+	return inputs_job_retire_step(job, first);
 }
 
 ClusterWalInputsJobResultV1
@@ -263,7 +343,8 @@ cluster_wal_inputs_jobs_stop_census_v1(void)
 			continue;
 		if (inputs_job_find(job, false) == NULL)
 			return WAL_INPUT_JOB_INVALID;
-		if (job->state == WAL_INPUT_JOB_STATE_RETIRING_CF || job->cf.state == CF_JOB_RECEIPT_RETIRING)
+		if (job->pin != NULL || job->state == WAL_INPUT_JOB_STATE_RETIRING_CF
+			|| job->state == WAL_INPUT_JOB_STATE_RETIRING_WALR || job->cf.state == CF_JOB_RECEIPT_RETIRING)
 			pending = true;
 	}
 	return pending ? WAL_INPUT_JOB_PENDING : WAL_INPUT_JOB_DONE;
@@ -276,7 +357,8 @@ cluster_wal_inputs_jobs_service_poll_v1(void)
 		elog(FATAL, "invalid original WAL input job during service cleanup");
 	for (uint32 i = 0; i < CLUSTER_WAL_INPUT_JOB_COUNT; ++i)
 		if (inputs_jobs[i].job != NULL
-			&& inputs_jobs[i].job->state == WAL_INPUT_JOB_STATE_RETIRING_CF
+			&& (inputs_jobs[i].job->state == WAL_INPUT_JOB_STATE_RETIRING_CF
+				|| inputs_jobs[i].job->state == WAL_INPUT_JOB_STATE_RETIRING_WALR)
 			&& cluster_wal_inputs_job_poll_v1(inputs_jobs[i].job) == WAL_INPUT_JOB_INVALID)
 			elog(FATAL, "could not confirm original WAL input job cleanup");
 }

@@ -13,8 +13,10 @@
 void *cf_fixture_alloczero(MemoryContext context, Size size);
 int cf_job_retirement_fixture_main(void);
 bool cf_fixture_errstart_cold(int elevel, const char *domain);
+void cf_fixture_plain_free(void *memory);
 #define TopMemoryContext cf_fixture_top
 #define MemoryContextAllocZero cf_fixture_alloczero
+#define pfree cf_fixture_plain_free
 #define main cf_job_retirement_fixture_main
 #define errstart_cold cf_fixture_errstart_cold
 #include "test_cluster_cf_job_retirement.c"
@@ -22,6 +24,7 @@ bool cf_fixture_errstart_cold(int elevel, const char *domain);
 #undef main
 #undef MemoryContextAllocZero
 #undef TopMemoryContext
+#undef pfree
 
 #include "cluster_wal_inputs_job_private.h"
 #include "test_cluster_wal_inputs_job_callback.inc"
@@ -130,6 +133,8 @@ RegisterResourceReleaseCallback(ResourceReleaseCallback callback, void *arg)
 	job_resource_callback = callback;
 	job_resource_argument = arg;
 }
+
+#include "test_cluster_wal_inputs_job_pin_fixture.h"
 
 /* Compile the complete, unchanged production implementation in this unit.
  * Internal state is visible only here for corruption and overflow cases. */
@@ -597,6 +602,7 @@ UT_TEST(job_exit_callback_preserves_exact_identity_and_pending_debt)
 	foundation_end();
 }
 
+#ifndef PGRAC_WAL_INPUTS_JOB_EMBEDDED
 int
 main(void)
 {
@@ -631,3 +637,4 @@ main(void)
 	UT_DONE();
 	return ut_failed_count != 0;
 }
+#endif

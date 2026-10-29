@@ -467,6 +467,7 @@ cluster_wal_inputs_job.o cluster_semantic_activation.o: \
 	$(srcdir)/cluster_wal_inputs_job_private.h \
 	$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
 	$(top_srcdir)/src/include/cluster/cluster_cf_enqueue.h
+cluster_wal_inputs_job.o: $(top_srcdir)/src/include/cluster/cluster_wal_retention.h
 # These actual-type payload assertions must run after a budget/header edit,
 # including builds without compiler-generated dependency files.
 cluster_wal_inputs.o cluster_wal_retention.o cluster_wal_cut.o \

@@ -78,8 +78,26 @@ typedef struct ClusterWalInputsJobControlBudgetV1 {
 	ClusterWalInputsJobV1 *caller_links[CLUSTER_WAL_INPUT_JOB_COUNT];
 	ClusterWalInputsJobV1 *scope_links[CLUSTER_WAL_INPUT_JOB_COUNT];
 	ClusterWalInputsJobV1 *pin_links[2];
+	/* Original pin/member padding carries these persistent native/retiring
+	 * flags. Charge both Aux processes even though only one pin is active. */
+	bool native_flags[2][CLUSTER_WAL_RETENTION_MAX_THREADS];
+	bool pin_retiring[2];
+	uint16 pin_cursors[2];
 	uint8 cf_bindings[2][CLUSTER_CF_JOB_BINDING_MAX_BYTES];
 } ClusterWalInputsJobControlBudgetV1;
+
+/* Local binding checks never grant input authority. The original active
+ * pin and its process generation independently witness the job backlink. */
+extern bool cluster_wal_read_pin_job_binding_v1(ClusterWalInputsJobV1 *job,
+	ClusterWalReadPinV1 *pin, uint64 generation, uint16 cursor);
+extern bool cluster_wal_inputs_job_pin_bind_v1(ClusterWalInputsJobV1 *job,
+	ClusterWalReadPinV1 *pin, uint64 generation);
+extern bool cluster_wal_inputs_job_pin_matches_v1(ClusterWalInputsJobV1 *job,
+	ClusterWalReadPinV1 *pin, uint64 generation, bool owner_cleanup);
+extern bool cluster_wal_inputs_job_pin_detach_v1(ClusterWalInputsJobV1 *job,
+	ClusterWalReadPinV1 *pin, uint64 generation);
+extern bool cluster_wal_inputs_job_pin_cleanup_v1(ClusterWalInputsJobV1 *job,
+	ClusterWalReadPinV1 *pin, uint64 generation, bool error, bool owner_cleanup);
 
 StaticAssertDecl(CLUSTER_WAL_INPUT_JOB_COUNT == 4, "WAL input job slot count changed");
 StaticAssertDecl(CLUSTER_WAL_RETENTION_MAX_THREADS == 128, "WAL input member limit changed");
