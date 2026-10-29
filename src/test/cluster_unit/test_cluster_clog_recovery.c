@@ -1352,6 +1352,7 @@ fixture_cleanup(void)
 #include "test_cluster_clog_own_full.inc"
 #include "test_cluster_clog_cold_birth.inc"
 #include "test_cluster_clog_foreign_birth.inc"
+#include "test_cluster_clog_full_residency.inc"
 #include "test_cluster_clog_relmap_physical_mutation.inc"
 #include "test_cluster_clog_relmap_native_init.inc"
 #include "test_cluster_clog_relmap_horizon.inc"
@@ -1491,7 +1492,19 @@ main(void)
 		UT_RUN(foreign_birth_final_publication_rechecks_authority_and_error_cleanup);
 		goto mutation_done;
 	}
-	UT_PLAN(94);
+	if (getenv("PGRAC_FULL_RESIDENCY_ONLY") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(full_residency_second_apply_preserves_first_native_page);
+		UT_RUN(full_residency_target_replacement_and_verify_do_not_borrow_birth);
+		UT_RUN(full_residency_actual_capacity_eviction_stays_unknown_after_reload);
+		UT_RUN(full_residency_failure_and_legacy_keep_original_complete_invalidation);
+		goto mutation_done;
+	}
+	UT_PLAN(98);
+	UT_RUN(full_residency_second_apply_preserves_first_native_page);
+	UT_RUN(full_residency_target_replacement_and_verify_do_not_borrow_birth);
+	UT_RUN(full_residency_actual_capacity_eviction_stays_unknown_after_reload);
+	UT_RUN(full_residency_failure_and_legacy_keep_original_complete_invalidation);
 	UT_RUN(foreign_birth_apply_uses_matching_controller_not_local_birth);
 	UT_RUN(foreign_birth_verify_legacy_and_reload_never_restore_input);
 	UT_RUN(foreign_birth_final_root_loss_refuses_without_rebasing);

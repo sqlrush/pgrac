@@ -113,6 +113,8 @@ typedef struct ClusterRelmapClogBaseHandleV1 ClusterRelmapClogBaseHandleV1;
  * Eviction, legacy initialization and disk-only reload supply no birth value;
  * an attached observed/value pair cannot be replaced after metadata loss.
  * A foreign FULL cold apply supplies only its own verified recovery slot.
+ * FULL replay preserves unrelated actual resident slots at original capacity;
+ * target verification reloads disk without recreating its birth input.
  * Foreign origins never borrow this instance's resident initialization.
  * This does not exclude inter-instance writes or certify physical lifetime.
  * Missing/short/aliased files refuse. IN_PROGRESS stays IN_PROGRESS.

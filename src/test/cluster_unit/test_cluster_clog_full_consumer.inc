@@ -60,6 +60,8 @@ UT_TEST(native_full_clog_consumer_preserves_original_page_and_neighbors)
 		UT_ASSERT(writes > before_writes && syncs > before_syncs && dirsyncs > before_dirsyncs);
 		UT_ASSERT_EQ(birth.first_full_xid,
 			(epochs[i] << 32) | (pages[i] == 0 ? 3 : pages[i] * UINT64_C(32768)));
+		/* FULL verification may retain real resident pages until teardown. */
+		clog_recovery_cache_discard(&ClogRecoveryCtl[1]);
 		fixture_idle();
 	}
 }
