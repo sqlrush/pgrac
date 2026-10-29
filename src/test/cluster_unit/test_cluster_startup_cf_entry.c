@@ -70,6 +70,7 @@ void entry_actual_owner_service_poll(void);
 
 bool cluster_enabled = true;
 bool enableFsync = true;
+int cluster_recovery_merge_wait_timeout = 10000;
 bool InRecovery, ArchiveRecoveryRequested;
 volatile sig_atomic_t ShutdownRequestPending;
 static ControlFileData control;
@@ -96,6 +97,12 @@ static bool claim_teardown;
 static void (*claim_on_reset)(void);
 static bool cold_consumer;
 static unsigned cold_release_waits, cold_reads;
+static bool cold_deadline_active, cold_observation_pending;
+static uint64 set_cf_clock_ns;
+static long cold_deadline_waits[8];
+static int cold_refresh_budgets[8];
+static unsigned cold_refresh_calls;
+static bool cold_expire_at_refresh, cold_expire_at_observation;
 static unsigned entry_latch_sets;
 static uint64 entry_timeout(LOCKMODE mode);
 
@@ -207,7 +214,8 @@ WaitLatch(Latch *latch, int events, long timeout, uint32 event)
 	}
 	UT_ASSERT(latch == MyLatch);
 	UT_ASSERT_EQ(events, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH);
-	UT_ASSERT(timeout == 20 || (cold_consumer && timeout == 100));
+	UT_ASSERT(cold_deadline_active ? timeout > 0 && timeout <= 100
+								   : timeout == 20 || (cold_consumer && timeout == 100));
 	UT_ASSERT_EQ(event, WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
 	UT_ASSERT(!entry_native_lock && CritSectionCount == 0 && control_locked == NULL);
 	if (entry_clean_consumer)
@@ -217,6 +225,10 @@ WaitLatch(Latch *latch, int events, long timeout, uint32 event)
 	UT_ASSERT(entry_resets > entry_waits);
 	if (++entry_waits > 8)
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR), errmsg("fixture exceeded eight wakes")));
+	if (cold_deadline_active) {
+		cold_deadline_waits[entry_waits - 1] = timeout;
+		set_cf_clock_ns += (uint64)timeout * NS_PER_MS;
+	}
 	owner_clock += INT64CONST(1000000); /* Time alone must not end retirement. */
 	if (entry_on_wait != NULL)
 		entry_on_wait();
@@ -1453,6 +1465,11 @@ UT_TEST(startup_claim_cf_original_startup_cancel_retains_cleanup)
 
 static ClusterFormationSnapshotV1 cold_cohort;
 static ClusterWalSourceRef cold_restart;
+#include "test_cluster_merge_ir_cf_types.inc"
+static ClusterRecoveryFencePlan cold_deadline_plan;
+static bool recovery_fence_plan_valid(const ClusterRecoveryFencePlan *plan);
+static bool recovery_fence_deadline_current(const ClusterRecoveryFencePlan *plan);
+static int recovery_fence_acquire_budget(const ClusterRecoveryFencePlan *plan, int budget);
 void *
 palloc(Size size)
 {
@@ -1482,7 +1499,15 @@ cluster_reconfig_capture_formation_snapshot_v1(uint16 thread, ClusterFormationSn
 ClusterFormationWitnessResult
 cluster_authority_startup_refresh_recovery(int budget)
 {
-	UT_ASSERT_EQ(budget, 100);
+	if (cold_deadline_active) {
+		UT_ASSERT(budget > 0 && budget <= 100);
+		UT_ASSERT(cold_refresh_calls < lengthof(cold_refresh_budgets));
+		if (cold_refresh_calls < lengthof(cold_refresh_budgets))
+			cold_refresh_budgets[cold_refresh_calls++] = budget;
+		if (cold_expire_at_refresh)
+			set_cf_clock_ns = cold_deadline_plan.merge_deadline_ns;
+	} else
+		UT_ASSERT_EQ(budget, 100);
 	return CLUSTER_FORMATION_WITNESS_READY;
 }
 static ClusterControlRootResult
@@ -1494,7 +1519,9 @@ recovery_merge_cold_inputs_observe(const ClusterWalSourceRef *restart,
 	UT_ASSERT(cluster_cf_held_is_clusterwide(ShareLock));
 	UT_ASSERT(cluster_formation_snapshot_matches_v1(cohort, &cold_cohort));
 	++cold_reads;
-	*pending = false;
+	*pending = cold_observation_pending;
+	if (cold_deadline_active && cold_expire_at_observation)
+		set_cf_clock_ns = cold_deadline_plan.merge_deadline_ns;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 #define cluster_cf_lock claim_actual_cf_lock
@@ -1520,6 +1547,20 @@ cold_fixture(void)
 	claim_fixture(false);
 	cold_consumer = true;
 	cold_reads = cold_release_waits = 0;
+	cold_deadline_active = cold_observation_pending = false;
+	cold_expire_at_refresh = cold_expire_at_observation = false;
+	cold_refresh_calls = 0;
+	memset(cold_deadline_waits, 0, sizeof(cold_deadline_waits));
+	memset(cold_refresh_budgets, 0, sizeof(cold_refresh_budgets));
+	memset(&cold_deadline_plan, 0, sizeof(cold_deadline_plan));
+	cold_deadline_plan.magic = CLUSTER_RECOVERY_FENCE_PLAN_MAGIC;
+	cold_deadline_plan.owner_pid = MyProcPid;
+	cold_deadline_plan.owner = CurrentResourceOwner;
+	cold_deadline_plan.owner_boot = control_creator.incarnation;
+	cold_deadline_plan.own_thread = 1;
+	cold_deadline_plan.merge_wait_timeout_ms_snapshot = 10000;
+	set_cf_clock_ns = NS_PER_S;
+	cold_deadline_plan.merge_deadline_ns = set_cf_clock_ns + 10000 * NS_PER_MS;
 	memset(&cold_cohort, 0, sizeof(cold_cohort));
 	cold_cohort.local_epoch = owner_epoch;
 	cold_cohort.startup_formation_generation = 9;
@@ -1534,7 +1575,7 @@ cold_call(bool *ready)
 
 	PG_TRY();
 	{
-		*ready = recovery_merge_wait_cold_inputs(1);
+		*ready = recovery_merge_wait_cold_inputs(&cold_deadline_plan, 1);
 		completed = true;
 	}
 	PG_CATCH();
@@ -6356,6 +6397,7 @@ UT_TEST(ordinary_recovery_complete_roles_keep_the_original_cf_wait_policy)
 #include "test_cluster_wal_pin_cf.h"
 #include "test_cluster_ir_preflight_cf.h"
 #include "test_cluster_merge_ir_cf.h"
+#include "test_cluster_cold_input_deadline.h"
 #include "test_cluster_merge_project_cf.h"
 
 int
@@ -6368,6 +6410,21 @@ main(void)
 	pg_atomic_init_u64(&owner_proc.cluster_grd_redeclare_acked_epoch, 0);
 	cluster_control_request_shmem_init();
 	retire_driver = cluster_control_request_driver_start();
+	if (getenv("PGRAC_PRE2_TEST_COLD_INPUT_DEADLINE") != NULL) {
+		UT_PLAN(10);
+		UT_RUN(startup_cold_zero_attempt_never_sleeps_for_pending_metadata);
+		UT_RUN(startup_cold_zero_cf_slice_retains_exact_cleanup_without_sleep);
+		UT_RUN(startup_cold_cf_retirement_wait_uses_the_original_remaining_deadline);
+		UT_RUN(startup_cold_metadata_wait_uses_the_same_remaining_deadline);
+		UT_RUN(startup_cold_refresh_cannot_start_cf_after_original_expiry);
+		UT_RUN(startup_cold_ready_observation_still_refuses_after_original_expiry);
+		UT_RUN(startup_cold_zero_ready_keeps_its_complete_first_attempt);
+		UT_RUN(startup_cold_exact_cf_ack_before_deadline_can_still_reach_ready);
+		UT_RUN(startup_cold_cf_grant_after_deadline_runs_only_original_cleanup);
+		UT_RUN(startup_cold_original_plan_identity_is_required_before_refresh);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_IR_SET_CF") != NULL) {
 		UT_PLAN(14);
 		UT_RUN(startup_merge_first_cf_slice_restarts_the_whole_ir_set);
@@ -6510,7 +6567,7 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(160);
+	UT_PLAN(170);
 	UT_RUN(startup_cf_timeout_waits_for_exact_completion_before_begin);
 	UT_RUN(startup_cf_completion_does_not_preserve_changed_native_input);
 	UT_RUN(startup_cf_unsafe_native_context_never_takes_a_registry_lock);
@@ -6671,6 +6728,16 @@ main(void)
 	UT_RUN(startup_merge_empty_cf_slice_waits_without_inventing_a_receipt);
 	UT_RUN(startup_merge_owner_census_ack_keeps_exact_cf_completion);
 	UT_RUN(startup_merge_hard_error_keeps_original_cf_cleanup);
+	UT_RUN(startup_cold_zero_attempt_never_sleeps_for_pending_metadata);
+	UT_RUN(startup_cold_zero_cf_slice_retains_exact_cleanup_without_sleep);
+	UT_RUN(startup_cold_cf_retirement_wait_uses_the_original_remaining_deadline);
+	UT_RUN(startup_cold_metadata_wait_uses_the_same_remaining_deadline);
+	UT_RUN(startup_cold_refresh_cannot_start_cf_after_original_expiry);
+	UT_RUN(startup_cold_ready_observation_still_refuses_after_original_expiry);
+	UT_RUN(startup_cold_zero_ready_keeps_its_complete_first_attempt);
+	UT_RUN(startup_cold_exact_cf_ack_before_deadline_can_still_reach_ready);
+	UT_RUN(startup_cold_cf_grant_after_deadline_runs_only_original_cleanup);
+	UT_RUN(startup_cold_original_plan_identity_is_required_before_refresh);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

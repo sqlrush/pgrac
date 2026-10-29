@@ -2017,7 +2017,8 @@ recovery_merge_cold_inputs_observe(const ClusterWalSourceRef *restart,
  * usable input seal. The caller re-enters its original proof/read loop.
  * Author: SqlRush <sqlrush@gmail.com> */
 static void
-recovery_merge_cold_cf_wait(const ClusterCfAttemptObservation *attempt,
+recovery_merge_cold_cf_wait(const ClusterRecoveryFencePlan *plan,
+							const ClusterCfAttemptObservation *attempt,
 							const ClusterFormationSnapshotV1 *cohort,
 							const ClusterWalSourceRef *restart, uint16 own_thread, uint64 epoch,
 							uint64 generation, ResourceOwner owner, uint64 boot, bool recovery)
@@ -2045,6 +2046,7 @@ recovery_merge_cold_cf_wait(const ClusterCfAttemptObservation *attempt,
 		ClusterFormationSnapshotV1 observed;
 		ClusterWalSourceRef input;
 		bool held;
+		int wait_ms;
 
 		HandleStartupProcInterrupts();
 		CHECK_FOR_INTERRUPTS();
@@ -2058,6 +2060,10 @@ recovery_merge_cold_cf_wait(const ClusterCfAttemptObservation *attempt,
 			|| generation != cluster_grd_redeclare_generation()
 			|| !cluster_recovery_transport_components_current())
 			goto refuse;
+		reason = "MERGE_DEADLINE_OR_ZERO_ATTEMPT";
+		if (plan->merge_wait_timeout_ms_snapshot == 0 || !recovery_fence_deadline_current(plan))
+			goto refuse;
+		reason = "CONTEXT_CHANGED_AFTER_WAIT_SLICE";
 		ResetLatch(MyLatch);
 		if (!cluster_reconfig_capture_formation_snapshot_v1(own_thread, &observed)
 			|| !cluster_formation_snapshot_matches_v1(cohort, &observed)
@@ -2072,7 +2078,10 @@ recovery_merge_cold_cf_wait(const ClusterCfAttemptObservation *attempt,
 				if (empty_waited)
 					return;
 				empty_waited = true;
-				(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+				wait_ms = recovery_fence_acquire_budget(plan, 100);
+				if (wait_ms <= 0)
+					goto refuse;
+				(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, wait_ms,
 								WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
 				continue;
 			}
@@ -2092,9 +2101,14 @@ recovery_merge_cold_cf_wait(const ClusterCfAttemptObservation *attempt,
 			goto refuse;
 		cluster_lock_owners_service_poll();
 		cluster_cf_retirement_poll();
-		if (cluster_cf_held(ShareLock))
-			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+		if (cluster_cf_held(ShareLock)) {
+			reason = "MERGE_DEADLINE_OR_ZERO_ATTEMPT";
+			wait_ms = recovery_fence_acquire_budget(plan, 100);
+			if (wait_ms <= 0)
+				goto refuse;
+			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, wait_ms,
 							WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
+		}
 	}
 refuse:
 	ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
@@ -2105,7 +2119,7 @@ refuse:
 }
 
 static bool
-recovery_merge_wait_cold_inputs(uint16 own_thread)
+recovery_merge_wait_cold_inputs(const ClusterRecoveryFencePlan *plan, uint16 own_thread)
 {
 	ClusterFormationSnapshotV1 cohort, current;
 	ClusterWalSourceRef restart;
@@ -2121,6 +2135,10 @@ recovery_merge_wait_cold_inputs(uint16 own_thread)
 	ResourceOwner owner = CurrentResourceOwner;
 	bool recovery = InRecovery;
 
+	if (!recovery_fence_plan_valid(plan) || plan->own_thread != own_thread || plan->owner != owner
+		|| plan->owner_boot != boot)
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+						errmsg("cold input observation has no original plan owner")));
 	if (!cluster_wal_thread_restart_v2_ref(&restart)
 		|| !cluster_reconfig_capture_formation_snapshot_v1(own_thread, &cohort)
 		|| cohort.startup_formation_generation == 0)
@@ -2133,10 +2151,22 @@ recovery_merge_wait_cold_inputs(uint16 own_thread)
 			ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 			ClusterFormationWitnessResult proof;
 			bool pending = true;
+			int wait_ms;
 
 			HandleStartupProcInterrupts();
 			CHECK_FOR_INTERRUPTS();
-			proof = cluster_authority_startup_refresh_recovery(100);
+			wait_ms = recovery_fence_acquire_budget(plan, 100);
+			if (wait_ms <= 0)
+				ereport(FATAL,
+						(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+						 errmsg("cold input observation exceeded its original merge deadline"),
+						 errdetail("stage=merge_deadline before=refresh")));
+			proof = cluster_authority_startup_refresh_recovery(wait_ms);
+			if (!recovery_fence_deadline_current(plan))
+				ereport(FATAL,
+						(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+						 errmsg("cold input observation exceeded its original merge deadline"),
+						 errdetail("stage=merge_deadline after=refresh")));
 			if (!cluster_reconfig_capture_formation_snapshot_v1(own_thread, &current)
 				|| !cluster_formation_snapshot_matches_v1(&cohort, &current))
 				break;
@@ -2166,6 +2196,12 @@ recovery_merge_wait_cold_inputs(uint16 own_thread)
 							|| !cluster_wal_thread_restart_v2_ref(&input)
 							|| memcmp(&restart, &input, sizeof(input)) != 0))
 						result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+					else if (!recovery_fence_deadline_current(plan))
+						ereport(
+							FATAL,
+							(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+							 errmsg("cold input observation exceeded its original merge deadline"),
+							 errdetail("stage=merge_deadline after=CF_acquire")));
 					else
 						result = recovery_merge_cold_inputs_observe(&restart, &cohort, root, inputs,
 																	&pending);
@@ -2176,8 +2212,8 @@ recovery_merge_wait_cold_inputs(uint16 own_thread)
 					 * its still-pending release into another blocking failure. */
 					cf_attempted = false;
 					waited = true;
-					recovery_merge_cold_cf_wait(&attempt, &cohort, &restart, own_thread, epoch,
-												generation, owner, boot, recovery);
+					recovery_merge_cold_cf_wait(plan, &attempt, &cohort, &restart, own_thread,
+												epoch, generation, owner, boot, recovery);
 					continue;
 				}
 				if (cluster_cf_held(ShareLock))
@@ -2195,6 +2231,11 @@ recovery_merge_wait_cold_inputs(uint16 own_thread)
 				&& proof != CLUSTER_FORMATION_WITNESS_CACHE_EXPIRED
 				&& proof != CLUSTER_FORMATION_WITNESS_MARKER_UNPROVEN)
 				break;
+			if (!recovery_fence_deadline_current(plan))
+				ereport(FATAL,
+						(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+						 errmsg("cold input observation exceeded its original merge deadline"),
+						 errdetail("stage=merge_deadline after=observation")));
 			if (!cluster_reconfig_capture_formation_snapshot_v1(own_thread, &current)
 				|| !cluster_formation_snapshot_matches_v1(&cohort, &current))
 				break;
@@ -2214,9 +2255,17 @@ recovery_merge_wait_cold_inputs(uint16 own_thread)
 						cohort.startup_formation_generation, (unsigned)own_thread)));
 				reported = true;
 			}
+			if (plan->merge_wait_timeout_ms_snapshot == 0)
+				break;
 			ResetLatch(MyLatch);
-			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-				100, WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
+			wait_ms = recovery_fence_acquire_budget(plan, 100);
+			if (wait_ms <= 0)
+				ereport(FATAL,
+						(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+						 errmsg("cold input observation exceeded its original merge deadline"),
+						 errdetail("stage=merge_deadline before=metadata_wait")));
+			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, wait_ms,
+							WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
 		}
 	}
 	PG_FINALLY();
@@ -2273,7 +2322,7 @@ cluster_recovery_merge_preflight_readonly(uint16 own_thread, XLogRecPtr own_redo
 	if (cluster_shared_config && cluster_recovery_plan_snapshot(&observed)
 		&& !observed.failed && observed.own_thread == own_thread
 		&& (observed.n_alive > 0 || observed.n_unknown > 0)) {
-		if (!recovery_merge_wait_cold_inputs(own_thread)) {
+		if (!recovery_merge_wait_cold_inputs(plan, own_thread)) {
 			MemSet(plan, 0, sizeof(*plan));
 			pfree(plan);
 			return CLUSTER_MERGE_NO_NOT_COLD;

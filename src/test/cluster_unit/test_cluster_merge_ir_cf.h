@@ -2,12 +2,10 @@
  * The unbound composite WALR pin, fence proof, S4 transport, clock and
  * master ACK delivery are explicit leaves. No alternate retry driver.
  * Author: SqlRush <sqlrush@gmail.com> */
-#include "test_cluster_merge_ir_cf_types.inc"
 
 static ClusterRecoveryFencePlan set_cf_plan;
 static char set_cf_pin;
 static unsigned set_cf_pin_acquires, set_cf_pin_checks, set_cf_pin_binds;
-static uint64 set_cf_clock_ns;
 static bool set_cf_pin_current;
 static void (*set_cf_on_wait)(void);
 static void (*set_cf_on_pin_check)(void);

@@ -1470,6 +1470,7 @@ test_cluster_startup_cf_entry: test_cluster_startup_cf_entry.c test_cluster_cf_e
 		test_cluster_cold_own_root_cf.h test_cluster_cold_own_root_cf.inc \
 		test_cluster_wal_pin_cf.h test_cluster_wal_pin_cf.inc test_cluster_wal_pin_cf_types.inc \
 		test_cluster_ir_preflight_cf.h \
+		test_cluster_cold_input_deadline.h \
 		test_cluster_merge_ir_cf.h test_cluster_merge_ir_cf.inc test_cluster_merge_ir_cf_types.inc \
 		test_cluster_merge_project_cf.h test_cluster_merge_project_cf.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_ir.c \
