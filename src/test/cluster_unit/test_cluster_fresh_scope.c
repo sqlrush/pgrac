@@ -84,6 +84,7 @@
 #include "commands/trigger.h"
 #include "commands/typecmds.h"
 #include "commands/user.h"
+#include "commands/vacuum.h"
 #include "commands/view.h"
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_tt_local.h"
@@ -282,12 +283,20 @@ ReadControlFile(void)
 {
 	legacy_calls++; /* Non-shared native route is not replaced. */
 }
+static bool vacuum_scope_lookup_active, vacuum_scope_expected_top;
+static unsigned vacuum_scope_restrictions, vacuum_scope_queries, vacuum_scope_bad_lookup;
 static bool cluster_scope_lookup_active, cluster_scope_expected_top;
 static unsigned cluster_scope_lookups, cluster_scope_restrictions, cluster_scope_bad_lookup;
 static const RangeVar *cluster_scope_expected_relation;
 void
 PreventInTransactionBlock(bool top, const char *stmt)
 {
+	if (vacuum_scope_lookup_active) {
+		vacuum_scope_restrictions++;
+		if (top != vacuum_scope_expected_top || strcmp(stmt, "VACUUM") != 0)
+			vacuum_scope_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before the original transaction restriction. */
+	}
 	if (cluster_scope_lookup_active) {
 		cluster_scope_restrictions++;
 		if (top != cluster_scope_expected_top || strcmp(stmt, "CLUSTER") != 0)
@@ -947,6 +956,12 @@ cluster_storage_mode_enabled(void)
 bool
 IsInTransactionBlock(bool top)
 {
+	if (vacuum_scope_lookup_active) {
+		vacuum_scope_queries++;
+		if (top != vacuum_scope_expected_top)
+			vacuum_scope_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before the original transaction-state query. */
+	}
 	return utility_in_transaction || !top;
 }
 char *
@@ -21154,10 +21169,222 @@ UT_TEST(test_native_tablespace_move_scope_preserves_existing_supported_top_bindi
 	tablespace_move_scope_lookup_active = false;
 }
 
+/* Actual core entry through both transaction boundaries. The manual wrapper's
+ * option validation and downstream maintenance are outside this ordering test. */
+#include "test_cluster_fresh_vacuum_scope.inc"
+static VacuumParams native_vacuum_scope_params;
+static unsigned char vacuum_scope_params_before[sizeof(VacuumParams)];
+static VacuumStmt native_vacuum_scope_statement;
+static VacuumRelation vacuum_scope_target;
+static RangeVar vacuum_scope_relation;
+static ListCell vacuum_scope_target_cell, vacuum_scope_option_cell;
+static List vacuum_scope_targets, vacuum_scope_options;
+static DefElem vacuum_scope_full;
+static Integer vacuum_scope_boolean;
+static RangeVar vacuum_scope_warm_relation;
+static AlterObjectSchemaStmt vacuum_scope_warm_statement;
+
+static bool
+vacuum_scope_refused(unsigned form, unsigned mode)
+{
+	static const bool shared_modes[] = { false, true, false, true, true, true, true, true };
+	unsigned kind = form / 6;
+
+	return shared_modes[mode] && (kind == 1 || kind == 3);
+}
+
+static void
+reset_native_vacuum_scope(unsigned form)
+{
+	static const bits32 options[]
+		= { VACOPT_VACUUM | VACOPT_PROCESS_MAIN | VACOPT_PROCESS_TOAST,
+			VACOPT_VACUUM | VACOPT_FULL | VACOPT_PROCESS_MAIN | VACOPT_PROCESS_TOAST,
+			VACOPT_VACUUM | VACOPT_ANALYZE | VACOPT_PROCESS_MAIN | VACOPT_PROCESS_TOAST,
+			VACOPT_VACUUM | VACOPT_ANALYZE | VACOPT_FULL | VACOPT_PROCESS_MAIN
+				| VACOPT_PROCESS_TOAST,
+			VACOPT_VACUUM | VACOPT_FREEZE | VACOPT_PROCESS_MAIN | VACOPT_PROCESS_TOAST,
+			VACOPT_ANALYZE,
+			VACOPT_VACUUM | VACOPT_PROCESS_MAIN | VACOPT_SKIP_DATABASE_STATS | VACOPT_SKIP_LOCKED,
+			VACOPT_ANALYZE | VACOPT_SKIP_LOCKED };
+	unsigned kind = form / 6, target = (form / 2) % 3;
+
+	reset_create_preflight();
+	vacuum_scope_lookup_active = false;
+	vacuum_scope_expected_top = (form & 1) != 0;
+	vacuum_scope_restrictions = vacuum_scope_queries = vacuum_scope_bad_lookup = 0;
+	native_vacuum_scope_params = (VacuumParams){ .options = options[kind],
+												 .freeze_min_age = -1,
+												 .freeze_table_age = -1,
+												 .multixact_freeze_min_age = -1,
+												 .multixact_freeze_table_age = -1,
+												 .is_wraparound = false,
+												 .log_min_duration = -1,
+												 .index_cleanup = VACOPTVALUE_UNSPECIFIED,
+												 .truncate = VACOPTVALUE_UNSPECIFIED,
+												 .nworkers = kind >= 6 ? -1 : 0 };
+	memcpy(vacuum_scope_params_before, &native_vacuum_scope_params, sizeof(VacuumParams));
+	vacuum_scope_relation = (RangeVar){ .type = T_RangeVar,
+										.relname = "native_vacuum_table",
+										.schemaname = "vacuum_schema",
+										.inh = true,
+										.relpersistence = RELPERSISTENCE_PERMANENT,
+										.location = -1 };
+	vacuum_scope_target = (VacuumRelation){ .type = T_VacuumRelation,
+											.relation = target == 2 ? NULL : &vacuum_scope_relation,
+											.oid = target == 2 ? 42001 : InvalidOid,
+											.va_cols = NIL };
+	one_element(&vacuum_scope_targets, &vacuum_scope_target_cell, &vacuum_scope_target);
+	vacuum_scope_boolean = (Integer){ .type = T_Integer, .ival = kind == 1 || kind == 3 };
+	vacuum_scope_full = (DefElem){ .type = T_DefElem,
+								   .defname = "full",
+								   .arg = (Node *)&vacuum_scope_boolean,
+								   .defaction = DEFELEM_UNSPEC,
+								   .location = -1 };
+	one_element(&vacuum_scope_options, &vacuum_scope_option_cell, &vacuum_scope_full);
+	native_vacuum_scope_statement = (VacuumStmt){ .type = T_VacuumStmt,
+												  .options = &vacuum_scope_options,
+												  .rels = target == 0 ? NIL : &vacuum_scope_targets,
+												  .is_vacuumcmd = kind != 5 && kind != 7 };
+	vacuum_scope_warm_relation
+		= (RangeVar){ .type = T_RangeVar, .relname = "supported_warm_table" };
+	vacuum_scope_warm_statement
+		= (AlterObjectSchemaStmt){ .type = T_AlterObjectSchemaStmt,
+								   .objectType = OBJECT_TABLE,
+								   .relation = &vacuum_scope_warm_relation,
+								   .newschema = "supported_warm_destination",
+								   .missing_ok = false };
+}
+
+static void
+native_vacuum_scope_entry(void)
+{
+	vacuum_scope_lookup_active = true;
+	vacuum(native_vacuum_scope_statement.rels, &native_vacuum_scope_params, NULL, NULL,
+		   vacuum_scope_expected_top);
+}
+
+static void
+assert_native_vacuum_scope_result(unsigned form, bool blocked, int caught)
+{
+	bool analyze_only = form / 6 == 5 || form / 6 == 7;
+
+	UT_ASSERT_EQ(caught, blocked ? 1 : 2);
+	UT_ASSERT_EQ(error_code, blocked ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+	if (blocked) {
+		UT_ASSERT_STR_EQ(error_message, "VACUUM FULL is not supported in shared mode");
+		UT_ASSERT_STR_EQ(error_detail,
+						 "PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+	}
+	UT_ASSERT_EQ(vacuum_scope_restrictions, !blocked && !analyze_only ? 1 : 0);
+	UT_ASSERT_EQ(vacuum_scope_queries, !blocked && analyze_only ? 1 : 0);
+	UT_ASSERT_EQ(vacuum_scope_bad_lookup, 0);
+	UT_ASSERT_EQ(
+		memcmp(vacuum_scope_params_before, &native_vacuum_scope_params, sizeof(VacuumParams)), 0);
+}
+
+UT_TEST(test_native_vacuum_scope_matches_utility_before_transaction_work)
+{
+	for (unsigned form = 0; form < 48; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool blocked = vacuum_scope_refused(form, mode);
+			int caught;
+
+			reset_native_vacuum_scope(form);
+			set_native_operator_mode(mode);
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				create_sql_entry((Node *)&native_vacuum_scope_statement);
+			UT_ASSERT_EQ(caught, blocked ? 1 : 0);
+			UT_ASSERT_EQ(error_code, blocked ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+			if (blocked) {
+				UT_ASSERT_STR_EQ(error_message, "VACUUM FULL is not supported in shared mode");
+				UT_ASSERT_STR_EQ(error_detail,
+								 "PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+			}
+			UT_ASSERT_EQ(vacuum_scope_restrictions + vacuum_scope_queries + utility_xids
+							 + utility_prepares + utility_binds,
+						 0);
+			reset_error();
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_vacuum_scope_entry();
+			assert_native_vacuum_scope_result(form, blocked, caught);
+			UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			UT_ASSERT_EQ(utility_top_xid, InvalidTransactionId);
+		}
+	}
+	vacuum_scope_lookup_active = false;
+}
+
+UT_TEST(test_native_vacuum_scope_precedes_context_child_top_and_publication)
+{
+	for (unsigned form = 0; form < 48; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			for (unsigned fault = 0; fault < 7; fault++) {
+				int caught;
+
+				reset_native_vacuum_scope(form);
+				set_native_operator_mode(mode);
+				XactReadOnly = fault == 0;
+				utility_parallel = fault == 1;
+				utility_recovery = fault == 2;
+				utility_in_child = fault == 3;
+				if (fault == 4 || fault == 5) {
+					utility_current_xid = 401;
+					utility_top_xid = fault == 4 ? 400 : InvalidTransactionId;
+				}
+				utility_bind_ok = fault != 6;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_vacuum_scope_entry();
+				assert_native_vacuum_scope_result(form, vacuum_scope_refused(form, mode), caught);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+				UT_ASSERT_EQ(utility_top_xid, fault == 4 ? 400 : InvalidTransactionId);
+				UT_ASSERT_EQ(utility_current_xid,
+							 fault == 4 || fault == 5 ? 401 : InvalidTransactionId);
+			}
+		}
+	}
+	vacuum_scope_lookup_active = false;
+}
+
+UT_TEST(test_native_vacuum_scope_preserves_existing_supported_top_binding)
+{
+	for (unsigned form = 0; form < 48; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			for (unsigned fault = 0; fault < 5; fault++) {
+				int caught;
+
+				reset_native_vacuum_scope(form);
+				create_sql_entry((Node *)&vacuum_scope_warm_statement);
+				UT_ASSERT_EQ(utility_xids, 1);
+				UT_ASSERT_EQ(utility_prepares, 1);
+				UT_ASSERT_EQ(utility_binds, 1);
+				set_native_operator_mode(mode);
+				XactReadOnly = fault == 0;
+				utility_parallel = fault == 1;
+				utility_recovery = fault == 2;
+				utility_in_child = fault == 3;
+				utility_bind_ok = fault != 4;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_vacuum_scope_entry();
+				assert_native_vacuum_scope_result(form, vacuum_scope_refused(form, mode), caught);
+				UT_ASSERT_EQ(utility_xids, 1);
+				UT_ASSERT_EQ(utility_prepares, 1);
+				UT_ASSERT_EQ(utility_binds, 1);
+				UT_ASSERT_EQ(utility_top_xid, 400);
+				UT_ASSERT_EQ(utility_current_xid, 400);
+			}
+		}
+	}
+	vacuum_scope_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(339);
+	UT_PLAN(342);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -21499,6 +21726,9 @@ main(void)
 	UT_RUN(test_native_tablespace_move_scope_matches_utility_before_role_lookup);
 	UT_RUN(test_native_tablespace_move_scope_precedes_context_child_top_and_publication);
 	UT_RUN(test_native_tablespace_move_scope_preserves_existing_supported_top_binding);
+	UT_RUN(test_native_vacuum_scope_matches_utility_before_transaction_work);
+	UT_RUN(test_native_vacuum_scope_precedes_context_child_top_and_publication);
+	UT_RUN(test_native_vacuum_scope_preserves_existing_supported_top_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
