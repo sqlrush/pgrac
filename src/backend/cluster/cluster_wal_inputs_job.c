@@ -132,6 +132,96 @@ cluster_wal_inputs_job_scope_create_v1(ClusterWalInputsJobV1 *job)
 	return true;
 }
 
+ClusterControlRootResult
+cluster_wal_inputs_job_cf_prepare_v1(ClusterWalInputsJobV1 *job, uint64 *before)
+{
+	ClusterWalInputsJobSlotV1 *slot;
+	uint64 sequence;
+
+	if (before == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	*before = 0;
+	slot = inputs_job_find(job, false);
+	if (slot == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (job->state == WAL_INPUT_JOB_STATE_RETIRING_CF
+		|| job->state == WAL_INPUT_JOB_STATE_RETIRING_WALR || job->state == WAL_INPUT_JOB_STATE_DONE)
+		return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+	if (job->state != WAL_INPUT_JOB_STATE_BUILDING || job->inputs == NULL || job->flags != 0)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (job->cf.state != CF_JOB_RECEIPT_UNBOUND) {
+		ClusterCfJobResultV1 result;
+		bool retiring = job->cf.state == CF_JOB_RECEIPT_RETIRING;
+
+		if (job->cf.original.registry.mode != ShareLock)
+			return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+		result = cluster_cf_job_retirement_poll_v1(&job->cf);
+		if (result == CF_JOB_INVALID)
+			return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+		/* An observed pending phase is irrevocably cleanup-only, even if
+		 * this poll just received its exact ACK. Never restart the build. */
+		if (retiring) {
+			inputs_job_transition(slot, WAL_INPUT_JOB_STATE_RETIRING_CF,
+				job->flags | WAL_INPUT_JOB_FLAG_REVOKED);
+			return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+		}
+	}
+	/* Never drain a different duty, or overwrite a previous receipt while
+	 * any CF hold remains. Only the original terminalizer confirmed it. */
+	if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	sequence = cluster_cf_attempt_sequence();
+	if (sequence >= UINT64_MAX - 1)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (job->cf.state == CF_JOB_RECEIPT_CONFIRMED) {
+		memset(&job->cf, 0, sizeof(job->cf));
+		job->cf.job_generation = job->generation;
+	}
+	*before = sequence;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+ClusterCfJobResultV1
+cluster_wal_inputs_job_cf_release_v1(ClusterWalInputsJobV1 *job, uint64 before)
+{
+	ClusterWalInputsJobSlotV1 *slot = inputs_job_find(job, false);
+	ClusterCfAttemptObservation attempt;
+	ClusterCfJobResultV1 result;
+
+	if (slot == NULL)
+		return CF_JOB_INVALID;
+	/* Reentry is not another first release or synchronous wait. The
+	 * original service loop owns the existing receipt's later polling. */
+	if (job->state == WAL_INPUT_JOB_STATE_RETIRING_CF)
+		return CF_JOB_PENDING;
+	if (job->state != WAL_INPUT_JOB_STATE_BUILDING || job->inputs == NULL || job->flags != 0
+		|| job->cf.state != CF_JOB_RECEIPT_UNBOUND || before >= UINT64_MAX - 1
+		|| !cluster_cf_last_attempt_since(before, &attempt) || attempt.sequence != before + 1
+		|| attempt.mode != ShareLock || attempt.cooperative || attempt.caller != NULL
+		|| cluster_cf_held(ExclusiveLock))
+		return CF_JOB_INVALID;
+	if (attempt.owner_state_at_return == CLUSTER_LOCK_OWNER_EMPTY && attempt.control_owner_id == 0) {
+		if (!cluster_cf_held(ShareLock))
+			return CF_JOB_CONFIRMED; /* This actual call retained no coordinated debt. */
+		/* Preserve the original native/no-GRD policy. NOT_HELD here is
+		 * the original unlock's explicit native-slot cleanup, not an ACK. */
+		if (attempt.result != CLUSTER_LOCK_ACQUIRE_OK_NATIVE
+			|| !cluster_cf_held_is_usable(ShareLock)
+			|| cluster_cf_held_is_clusterwide(ShareLock))
+			return CF_JOB_INVALID;
+		return cluster_cf_unlock_confirmed(ShareLock) == CLUSTER_CF_RELEASE_NOT_HELD
+			&& !cluster_cf_held(ShareLock) ? CF_JOB_CONFIRMED : CF_JOB_INVALID;
+	}
+	if (!cluster_cf_held(ShareLock) || attempt.control_owner_id == 0
+		|| attempt.control_owner_id != cluster_cf_owner_cookie(ShareLock))
+		return CF_JOB_INVALID;
+	result = cluster_cf_unlock_job_v1(ShareLock, NULL, &job->cf);
+	if (result == CF_JOB_PENDING)
+		inputs_job_transition(slot, WAL_INPUT_JOB_STATE_RETIRING_CF,
+			job->flags | WAL_INPUT_JOB_FLAG_REVOKED);
+	return result;
+}
+
 bool
 cluster_wal_inputs_job_pin_bind_v1(ClusterWalInputsJobV1 *job, ClusterWalReadPinV1 *pin,
 								 uint64 generation)

@@ -110,6 +110,14 @@ extern bool cluster_wal_inputs_scope_job_drained_v1(ClusterWalInputsJobV1 *job);
 extern bool cluster_wal_inputs_scope_job_forget_v1(ClusterWalInputsJobV1 *job);
 extern ClusterWalReadPinV1 **cluster_wal_inputs_scope_job_pin_slot_v1(ClusterWalInputsJobV1 *job);
 
+/* Surround exactly one original synchronous CF S call. The sequence is a
+ * stack-local observation, never permission or a token retained across yield.
+ * Only a proven CONFIRMED receipt may be consumed for the next phase. */
+extern ClusterControlRootResult cluster_wal_inputs_job_cf_prepare_v1(ClusterWalInputsJobV1 *job,
+	uint64 *before);
+extern ClusterCfJobResultV1 cluster_wal_inputs_job_cf_release_v1(ClusterWalInputsJobV1 *job,
+	uint64 before);
+
 StaticAssertDecl(CLUSTER_WAL_INPUT_JOB_COUNT == 4, "WAL input job slot count changed");
 StaticAssertDecl(CLUSTER_WAL_RETENTION_MAX_THREADS == 128, "WAL input member limit changed");
 StaticAssertDecl(sizeof(ClusterWalInputsJobV1) <= 272, "WAL input job header exceeds budget");
