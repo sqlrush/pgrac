@@ -1909,6 +1909,29 @@ lazy_recheck_shared_freeze_page(LVRelState *vacrel, Buffer recent_buffer,
 			&& U64FromFullTransactionId(vacrel->cutoffs.SharedFreezeLimitFull) != UINT64_MAX
 			&& FullTransactionIdEquals(vacrel->cutoffs.SharedFreezeLimitFull,
 				vacrel->cutoffs.SharedFreezePolicySample.freeze_limit);
+		if (prefer_xmin)
+		{
+			/* Canonical evidence alone is not an age candidate. Bind the
+			 * exact physical creator and compare its complete FullXid; this
+			 * preference does not replace the later F/H or native WAL gates. */
+			uint16 bound = Min(vacrel->shared_freeze_batch.tuple_count, MaxHeapTuplesPerPage);
+
+			prefer_xmin = false;
+			if (cluster_heap_freeze_bind_creation_targets_v1(
+					&vacrel->shared_freeze_batch, proofs, current_fence) != 0)
+				for (uint16 index = 0; index < bound; index++)
+				{
+					FullTransactionId creator =
+						vacrel->shared_freeze_batch.tuples[index].original_creator_full_xid;
+
+					if (FullTransactionIdIsValid(creator)
+						&& FullTransactionIdPrecedes(creator, vacrel->cutoffs.SharedFreezeLimitFull))
+					{
+						prefer_xmin = true;
+						break;
+					}
+				}
+		}
 		if (!prefer_xmin && (*row_inputs_current
 			|| (status == CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN && retained_mask != 0)))
 		{

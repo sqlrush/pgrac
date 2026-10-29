@@ -17168,6 +17168,72 @@ production_xmin_optional_cleanout_setup(QualifiedXminFixture *f, LVRelState *v,
 	v->identity = space_identity;
 }
 
+UT_TEST(test_production_outer_no_old_creation_candidate_keeps_optional_cleanout)
+{
+	for (unsigned batch = 0; batch < 2; batch++) {
+		for (unsigned bound = 0; bound < 3; bound++) {
+			QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+			FullTransactionId oldest, limit;
+			production_xmin_optional_cleanout_setup(&f, &v, targets, batch != 0);
+			/* The original batch includes (0,MAX-2), (1,66), (1,77).
+			 * Equal/earlier complete bounds select none, including when
+			 * an older epoch has a numerically higher raw xid. */
+			oldest = batch ? FullTransactionIdFromEpochAndXid(0, UINT32_MAX - 2)
+				: FullTransactionIdFromEpochAndXid(1, 77);
+			limit = bound == 0 ? oldest
+				: bound == 1 ? FullTransactionIdFromU64(U64FromFullTransactionId(oldest) - 1)
+				: FullTransactionIdFromEpochAndXid(0, batch ? UINT32_MAX - 100 : 100);
+			for (unsigned i = 0; i < f.proofs.proof_count; i++)
+				UT_ASSERT(!FullTransactionIdPrecedes(f.proofs.proofs[i].resolution.local_original_full_xid,
+					limit));
+			f.policy.freeze_limit = limit;
+			v.cutoffs.SharedFreezePolicySample.freeze_limit = limit;
+			v.cutoffs.SharedFreezeLimitFull = limit;
+			(void)proof_owner_collect(&v, 1);
+			UT_ASSERT_EQ(v.shared_freeze_changed_pages, 0);
+			UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+			UT_ASSERT_EQ(phase_resident_hint_calls, 1);
+			UT_ASSERT_EQ(phase_optional_hint_begins, 1);
+			UT_ASSERT_EQ(phase_optional_hint_finishes, 1);
+			UT_ASSERT_EQ(recent_pin_calls, 1); UT_ASSERT_EQ(recent_unpins, 1);
+			for (unsigned row = 1; row <= (batch ? 3 : 1); row++) {
+				UT_ASSERT(!HeapTupleHeaderXminFrozen(freeze_tuple(current_page.data, row)));
+				UT_ASSERT(memcmp(freeze_tuple(current_page.data, row),
+					freeze_tuple(before_page.data, row), 64) == 0);
+			}
+			UT_ASSERT_EQ(ClusterPageGetItlSlots(current_page.data)[0].flags, ITL_FLAG_COMMITTED);
+			UT_ASSERT_EQ(ClusterPageGetItlSlots(current_page.data)[0].commit_scn, 9);
+			production_xmin_owner_assert_released(&v);
+		}
+	}
+}
+
+UT_TEST(test_production_outer_one_old_creation_still_precedes_optional_cleanout)
+{
+	QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+	production_xmin_optional_cleanout_setup(&f, &v, targets, true);
+	/* Only original row 2, (0,MAX-2), precedes (1,66). */
+	f.policy.freeze_limit = FullTransactionIdFromEpochAndXid(1, 66);
+	v.cutoffs.SharedFreezePolicySample.freeze_limit = f.policy.freeze_limit;
+	v.cutoffs.SharedFreezeLimitFull = f.policy.freeze_limit;
+	expected_nplans = 1;
+	UT_ASSERT_EQ(proof_owner_collect(&v, 1), CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED);
+	UT_ASSERT_EQ(v.shared_freeze_changed_pages, 1);
+	UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1); UT_ASSERT_EQ(edges, 1);
+	UT_ASSERT_EQ(phase_resident_hint_calls, 0);
+	UT_ASSERT_EQ(phase_optional_hint_begins + phase_optional_hint_finishes, 0);
+	UT_ASSERT(HeapTupleHeaderXminFrozen(freeze_tuple(current_page.data, 2)));
+	for (unsigned row = 1; row <= 3; row += 2) {
+		UT_ASSERT(!HeapTupleHeaderXminFrozen(freeze_tuple(current_page.data, row)));
+		UT_ASSERT(memcmp(freeze_tuple(current_page.data, row),
+			freeze_tuple(before_page.data, row), 64) == 0);
+	}
+	UT_ASSERT(memcmp(ClusterPageGetItlSlots(current_page.data),
+		ClusterPageGetItlSlots(before_page.data), CLUSTER_ITL_ARRAY_SIZE) == 0);
+	UT_ASSERT_EQ(recent_pin_calls, 2); UT_ASSERT_EQ(recent_unpins, 2);
+	production_xmin_owner_assert_released(&v);
+}
+
 UT_TEST(test_production_outer_preserves_xmin_input_before_optional_itl_cleanout)
 {
 	for (unsigned batch = 0; batch < 2; batch++) {
@@ -17300,9 +17366,11 @@ UT_TEST(test_production_outer_native_errors_unwind_pin_before_original_leave)
 int
 main(void)
 {
-	UT_PLAN(369);
+	UT_PLAN(371);
 
 	UT_RUN(test_production_outer_shared_age_above_native_cutoff_reaches_wal);
+	UT_RUN(test_production_outer_no_old_creation_candidate_keeps_optional_cleanout);
+	UT_RUN(test_production_outer_one_old_creation_still_precedes_optional_cleanout);
 	UT_RUN(test_production_outer_preserves_xmin_input_before_optional_itl_cleanout);
 	UT_RUN(test_production_outer_deferred_hint_does_not_bypass_missing_h);
 	UT_RUN(test_production_outer_keeps_cleanout_without_original_writer_or_shared_policy);
