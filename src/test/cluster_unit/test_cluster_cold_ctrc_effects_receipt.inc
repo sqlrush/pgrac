@@ -127,7 +127,7 @@ UT_TEST(test_startup_effects_receipt_local_wait_cannot_rebase_original_input)
 		effects_receipt_ready(path); effects_receipt_fault = 22; effects_receipt_wait = true;
 		retirement_run_startup();
 		UT_ASSERT(!retirement_service_reached && info.cluster_tx_start->revoked);
-		UT_ASSERT_EQ(effects_receipt_probes, 3);
+		UT_ASSERT_EQ(effects_receipt_probes, 1); /* Refuse before waiting on drift. */
 		UT_ASSERT(observation_scope_live && observation_cursor_live && claim_held);
 		UT_ASSERT_EQ(pending_storage_created, path == 2 ? 0 : 2);
 		UT_ASSERT_EQ(pending_storage_closes, 0);

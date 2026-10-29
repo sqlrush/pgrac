@@ -31,9 +31,16 @@ UT_TEST(test_ctrc_observation_requires_every_original_c0_terminal)
 		tx = window_region.checkpoint_owner.tx_result;
 		ctrc = window_region.checkpoint_owner.ctrc_result;
 		UT_ASSERT(!ClusterColdRecoveryCtrcObserve(info.cluster_tx_start, 2 * 1024 * 1024));
-		UT_ASSERT_EQ(observation_steps, 3); /* Full original census preceded qualification. */
-		UT_ASSERT(strstr(ClusterColdRecoveryCtrcObservationRefusal(info.cluster_tx_start),
-			"stage=physical_terminal result=0") != NULL);
+		if (fault == 8) {
+			/* The original C0 already fixed this effects input: refuse before
+			 * opening a census; retain cleanup duty in the original owner. */
+			UT_ASSERT_EQ(observation_steps, 0);
+			UT_ASSERT(info.cluster_tx_start->revoked);
+		} else {
+			UT_ASSERT_EQ(observation_steps, 3);
+			UT_ASSERT(strstr(ClusterColdRecoveryCtrcObservationRefusal(info.cluster_tx_start),
+				"stage=physical_terminal result=0") != NULL);
+		}
 		UT_ASSERT(!observation_cursor_live && !observation_scope_live);
 		UT_ASSERT(ClusterColdRecoveryCtrcPhysical(info.cluster_tx_start, &native_ctrc_work) == NULL);
 		UT_ASSERT(memcmp(&original, &native_ctrc_work.entries[0], sizeof(original)) == 0);
@@ -112,8 +119,13 @@ UT_TEST(test_ctrc_borrowed_physical_view_rechecks_original_terminal_proofs)
 		UT_ASSERT(ClusterColdRecoveryCtrcPhysical(info.cluster_tx_start, &native_ctrc_work) == NULL);
 		UT_ASSERT(!ClusterColdRecoveryCtrcObserve(info.cluster_tx_start, 2 * 1024 * 1024));
 		UT_ASSERT_EQ(observation_steps, steps); UT_ASSERT_EQ(observation_scope_begins, begins);
-		UT_ASSERT(!observation_cursor_live && !observation_scope_live);
 		UT_ASSERT_EQ(window_region.checkpoint_owner.ctrc_result.state, CLUSTER_RECOVERY_CTRC_RESULT_PENDING);
+		if (fault == 5) {
+			UT_ASSERT(info.cluster_tx_start->revoked);
+			UT_ASSERT(observation_cursor_live && observation_scope_live);
+			release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+		}
+		UT_ASSERT(!observation_cursor_live && !observation_scope_live);
 		UT_ASSERT_EQ(window_region.checkpoint_owner.ctrc_accepted_generation, 0);
 	}
 }

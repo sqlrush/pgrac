@@ -670,6 +670,7 @@ static void reset(void)
 	memset(&observed_writer, 0, sizeof(observed_writer));
 	typed.tx_fence = (struct ClusterRecoveryFencePlan *)&tx_fence_object;
 	typed.plan = (ClusterColdPlanV1 *)&typed;
+	typed.effects_receipt.plan = typed.plan; /* Sealed before the first C0 use. */
 	typed.top_tx_census = &census;
 	census.plan = typed.plan;
 	typed.participant_count = 1;
@@ -2402,9 +2403,19 @@ static void startup_local_empty_reset(void);
 #include "test_cluster_cold_ctrc_tx_forest_terminals.inc"
 
 #include "test_cluster_cold_ctrc_effects_receipt.inc"
+#include "test_cluster_cold_ctrc_effects_lifetime.inc"
 
 int main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_START_EFFECTS_LIFETIME") != NULL) {
+		UT_PLAN(5);
+		UT_RUN(test_startup_effects_lifetime_stable_input_survives_complete_handoff);
+		UT_RUN(test_startup_effects_lifetime_first_validation_cannot_rebase_before_page);
+		UT_RUN(test_startup_effects_lifetime_service_wait_cannot_replace_input);
+		UT_RUN(test_startup_effects_lifetime_repeated_page_call_keeps_original_input);
+		UT_RUN(test_startup_effects_lifetime_final_owner_cannot_accept_changed_input);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_START_EFFECTS_RECEIPT") != NULL) {
 		UT_PLAN(5);
 		UT_RUN(test_startup_effects_receipt_keeps_fpi_unchanged_and_zero_page_input);
@@ -2802,9 +2813,9 @@ int main(void)
 	}
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_FIRST
-	UT_PLAN(336);
+	UT_PLAN(341);
 #else
-	UT_PLAN(332);
+	UT_PLAN(337);
 #endif
 	UT_RUN(test_startup_native_images_accept_only_unchanged_complete_terminal_page);
 	UT_RUN(test_startup_native_images_reject_unresolved_ambiguous_and_mx_itls);
@@ -2815,8 +2826,13 @@ int main(void)
 	UT_RUN(test_startup_native_directory_real_origin_cannot_be_discharged_by_wait);
 	UT_RUN(test_startup_native_directory_invalid_layout_and_partial_error_keep_debt);
 #else
-	UT_PLAN(324);
+	UT_PLAN(329);
 #endif
+	UT_RUN(test_startup_effects_lifetime_stable_input_survives_complete_handoff);
+	UT_RUN(test_startup_effects_lifetime_first_validation_cannot_rebase_before_page);
+	UT_RUN(test_startup_effects_lifetime_service_wait_cannot_replace_input);
+	UT_RUN(test_startup_effects_lifetime_repeated_page_call_keeps_original_input);
+	UT_RUN(test_startup_effects_lifetime_final_owner_cannot_accept_changed_input);
 	UT_RUN(test_startup_effects_receipt_keeps_fpi_unchanged_and_zero_page_input);
 	UT_RUN(test_startup_effects_receipt_late_unready_refuses_service_and_retry);
 	UT_RUN(test_startup_effects_receipt_complete_value_cannot_change_after_page_checks);

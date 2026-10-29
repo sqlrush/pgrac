@@ -736,6 +736,8 @@ struct ClusterRecoveryStartV1 {
 	ClusterWalWriterToken writer;
 	uint8 operation_uuid[16];
 	bool revoked;
+	bool effects_fixed;
+	ClusterColdEffectsReceiptV1 effects_receipt;
 	bool relmap_declared;
 	bool ctrc_observation_started, ctrc_observation_complete;
 	bool ctrc_page_plan_started;
@@ -941,10 +943,23 @@ ClusterColdRecoveryTxCurrent(const struct ClusterRecoveryStartV1 *start)
 		|| start->census->plan != start->inputs->plan
 		|| !ClusterStartupInstalledRecoveryWriterV1(&writer, operation_uuid, &install_generation))
 		return false;
-	return start->install_generation == install_generation
+	if (!(start->install_generation == install_generation
 		&& cluster_recovery_cold_writer_same(&start->writer, &writer)
 		&& memcmp(start->operation_uuid, operation_uuid, 16) == 0
-		&& cluster_recovery_cold_pending_page_current(start);
+		&& cluster_recovery_cold_pending_page_current(start)))
+		return false;
+	/* Once first consumed, the original effects input belongs to this whole
+	 * Start, including independent service waits and final owner handoff.
+	 * Keep this check local: nowait/lock-held callers must not revoke the
+	 * shared checkpoint slot or retire any original resource here. */
+	if (start->effects_fixed
+		&& (!cluster_cold_typed_effects_ready_v1(start->inputs)
+			|| memcmp(&start->effects_receipt, &start->inputs->effects_receipt,
+				sizeof(start->effects_receipt)) != 0)) {
+		cluster_recovery_cold_start->revoked = true;
+		return false;
+	}
+	return true;
 }
 
 bool
@@ -2948,19 +2963,9 @@ ClusterColdRecoveryCtrcPageDrain(const struct ClusterRecoveryStartV1 *start,
 	state = cluster_recovery_cold_start;
 	PG_TRY();
 	{
-		const ClusterColdTypedV1 *typed = ClusterColdRecoveryTxInputs(start);
-
-		if (typed != NULL && cluster_cold_typed_effects_ready_v1(typed)) {
-			ClusterColdEffectsReceiptV1 receipt;
-
-			/* Copy the original representation, including every participant's
-			 * proof/result suffix; no receipt can be rebuilt after a wait. */
-			memcpy(&receipt, &typed->effects_receipt, sizeof(receipt));
+		if (ClusterColdRecoveryTxEffectsCurrent(start)) {
 			ready = cluster_recovery_cold_page_drain(start, memory_budget)
-				&& ClusterColdRecoveryTxInputs(start) == typed
-				&& cluster_cold_typed_effects_ready_v1(typed)
-				&& start == cluster_recovery_cold_start && state->inputs == typed
-				&& memcmp(&receipt, &typed->effects_receipt, sizeof(receipt)) == 0;
+				&& ClusterColdRecoveryTxEffectsCurrent(start);
 		}
 	}
 	PG_CATCH();
@@ -3517,7 +3522,14 @@ ClusterColdRecoveryTxEffectsCurrent(const struct ClusterRecoveryStartV1 *start)
 
 	/* The receipt is independently sealed to the original plan/result.  Do
 	 * not infer completeness from a caller bit or from a proven loser. */
-	return typed != NULL && cluster_cold_typed_effects_ready_v1(typed);
+	if (typed == NULL || !cluster_cold_typed_effects_ready_v1(typed))
+		return false;
+	if (!start->effects_fixed) {
+		memcpy(&cluster_recovery_cold_start->effects_receipt,
+			&typed->effects_receipt, sizeof(typed->effects_receipt));
+		cluster_recovery_cold_start->effects_fixed = true;
+	}
+	return true;
 }
 
 bool
