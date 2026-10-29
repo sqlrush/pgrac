@@ -23,6 +23,8 @@
  * This is a request identity, never a master grant or native completion. */
 #define RESOURCE_X_ACQUIRE_WIRE_VERSION 3
 #define RESOURCE_X_DECISION_WIRE_VERSION 4
+#define RESOURCE_X_COMPLETION_WIRE_VERSION 5
+#define RESOURCE_X_COMPLETE_V5_BYTES 264
 #define RESOURCE_X_ACQUIRE_V3_BYTES 160
 #define RESOURCE_X_DECISION_V4_BYTES 736
 
@@ -204,6 +206,18 @@ typedef struct ResourceXAcquireDecisionV4 {
 	uint8 disk_watermark_scn[8];
 	ResourceXAcquireHolderV3 holders[RESOURCE_X_PROTOCOL_NODE_LIMIT];
 } ResourceXAcquireDecisionV4;
+
+/* DISK/S only: complete A prefix followed by local completion evidence.
+ * All omitted holder records are proved zero by both codec directions. */
+typedef struct ResourceXAcquireCompletionV5 {
+	uint8 decision_prefix[224];
+	uint8 native_generation[8];
+	uint8 write_io_generation[8];
+	uint8 page_lsn[8];
+	uint8 page_scn[8];
+	uint8 page_crc32c[4];
+	uint8 decision_crc32c[4];
+} ResourceXAcquireCompletionV5;
 
 typedef struct ResourceXLocalProofDeclarationV1 {
 	ResourceXWireCommonV1 common;
@@ -439,6 +453,18 @@ typedef struct ResourceXDecodedAcquireDecision {
 	ResourceXDecodedAcquireHolder holders[RESOURCE_X_PROTOCOL_NODE_LIMIT];
 } ResourceXDecodedAcquireDecision;
 
+/* FIRST_FILL/S DISK has no holders: its complete A is losslessly encoded
+ * without the 32 provably zero holder records. Other sources are refused. */
+typedef struct ResourceXDecodedAcquireCompletion {
+	ResourceXDecodedAcquireDecision decision;
+	uint64 native_generation;
+	uint64 write_io_generation;
+	XLogRecPtr page_lsn;
+	uint64 page_scn;
+	uint32 page_crc32c;
+	uint32 decision_crc32c;
+} ResourceXDecodedAcquireCompletion;
+
 /* Original ACK sender identity belongs to the retained receipt. Only the
  * enclosing common header is rebound for this physical delivery/session. */
 typedef struct ResourceXDecodedAcquireWitness {
@@ -468,10 +494,11 @@ typedef struct ResourceXDecodedFrame {
 		ResourceXDecodedInstallSettlement install_settlement;
 		ResourceXDecodedAcquireIntent acquire_intent;
 		ResourceXDecodedAcquireDecision acquire_decision;
+		ResourceXDecodedAcquireCompletion acquire_completion;
 		ResourceXDecodedAcquireWitness acquire_witness;
 		ResourceXDecodedAcquireImage acquire_image;
 	} body;
-	bool has_acquire_decision; /* V3 A or A+original ACK, never legacy completion. */
+	bool has_acquire_decision; /* Conditional A, witness, image or typed completion. */
 } ResourceXDecodedFrame;
 
 StaticAssertDecl(sizeof(ResourceXAcquireImageV4) == RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES
@@ -487,6 +514,10 @@ StaticAssertDecl(offsetof(ResourceXAcquireWitnessV4, original_ack) == RESOURCE_X
 
 StaticAssertDecl(BLCKSZ == RESOURCE_X_PAGE_BYTES,
 				 "Resource-X V1 requires the current 8192-byte page ABI");
+StaticAssertDecl(sizeof(ResourceXAcquireCompletionV5) == RESOURCE_X_COMPLETE_V5_BYTES
+				 && offsetof(ResourceXAcquireCompletionV5, native_generation) == 224
+				 && offsetof(ResourceXAcquireCompletionV5, decision_crc32c) == 260,
+				 "conditional DISK/S completion has one exact wire layout");
 StaticAssertDecl(sizeof(ResourceXWireCommonV1) == RESOURCE_X_CONTROL_V1_BYTES,
 				 "Resource-X common V1 wire size changed");
 StaticAssertDecl(sizeof(ResourceXAcquireRequestV3) == RESOURCE_X_ACQUIRE_V3_BYTES,

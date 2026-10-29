@@ -10629,3 +10629,49 @@ clean-native-disk-complete:
 	rm -f test_cluster_native_disk_complete test_cluster_native_disk_complete.inc test_cluster_native_disk_complete.inc.tmp \
 		test_cluster_native_disk_terminate.inc test_cluster_native_disk_terminate.inc.tmp \
 		test_cluster_native_disk_stage_fixture.inc test_cluster_native_disk_stage_fixture.inc.tmp
+
+# Original completed disk S to the retained requester DONE owner.
+TESTS += test_cluster_native_disk_done
+all: test_cluster_native_disk_done
+test_cluster_native_disk_done: test_cluster_native_disk_done.c \
+        test_cluster_native_disk_complete_fixture.inc test_cluster_native_disk_done.inc \
+		test_cluster_native_disk_done_candidate.inc test_cluster_native_disk_done_lms.inc \
+        test_cluster_resource_x_decision_owner_layout.inc test_cluster_native_disk_complete
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+test_cluster_native_disk_complete_fixture.inc: test_cluster_native_disk_complete.c Makefile
+	awk '/^UT_TEST\(/ { stop=1 } !stop { print; lines++ } \
+	     END { if (!stop || lines < 150) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_native_disk_done.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^\/\* Original disk completion DONE/ { emit=1; found++ } \
+	     /^\/\* End original disk completion DONE/ { emit=0; stop=1 } \
+	     emit { print } END { if (found != 1 || !stop) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+clean distclean maintainer-clean: clean-native-disk-done
+.PHONY: clean-native-disk-done
+clean-native-disk-done:
+	rm -f test_cluster_native_disk_done test_cluster_native_disk_done.inc test_cluster_native_disk_done.inc.tmp \
+		test_cluster_native_disk_done_candidate.inc test_cluster_native_disk_done_candidate.inc.tmp \
+		test_cluster_native_disk_done_lms.inc test_cluster_native_disk_done_lms.inc.tmp \
+		test_cluster_native_disk_complete_fixture.inc test_cluster_native_disk_complete_fixture.inc.tmp
+
+test_cluster_native_disk_done_candidate.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^gcs_block_resource_x_payload_candidate\(/ { print "static bool"; emit=1; found++ } \
+	     emit { print } /^}/ && emit { emit=0; stop=1 } \
+	     END { if (found != 1 || !stop || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_native_disk_done_lms.inc: $(top_srcdir)/src/backend/cluster/cluster_lms_outbound.c Makefile
+	awk '/^lms_outbound_resource_x_intent_(valid|payload_valid)\(/ { print "static bool"; emit=1; found++ } \
+	     /^lms_outbound_resource_x_intent_msg_type\(/ { print "static uint8"; emit=1; found++ } \
+	     /^cluster_lms_outbound_enqueue_resource_x_intent\(/ { print "ClusterLmsEnqueueResult"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (found != 4 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@

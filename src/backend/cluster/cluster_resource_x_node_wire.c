@@ -8,6 +8,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_resource_x_node_wire.h"
+#include "cluster/cluster_scn.h"
 #include "port/pg_crc32c.h"
 
 
@@ -247,7 +248,8 @@ resource_x_pair_length(uint8 msg_type, ResourceXWireKind kind, uint16 len)
 		return msg_type == RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE
 			   && len == RESOURCE_X_CONTROL_V1_BYTES;
 	if (kind == RESOURCE_X_WIRE_INSTALL_SETTLEMENT)
-		return msg_type == RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE && len == RESOURCE_X_SHORT_V1_BYTES;
+		return msg_type == RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE
+			&& (len == RESOURCE_X_SHORT_V1_BYTES || len == RESOURCE_X_COMPLETE_V5_BYTES);
 	if (kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2)
 		return msg_type == RESOURCE_X_MSG_BLOCK_TO_N && len == RESOURCE_X_PROOF_V1_BYTES;
 	if (kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2)
@@ -260,6 +262,12 @@ static bool
 resource_x_frame_length(const ResourceXDecodedFrame *frame, uint16 *len)
 {
 	if (frame->has_acquire_decision) {
+		if (frame->kind == RESOURCE_X_WIRE_INSTALL_SETTLEMENT) {
+			if (frame->has_acquire_intent || frame->blocked_has_remote_proof)
+				return false;
+			*len = RESOURCE_X_COMPLETE_V5_BYTES;
+			return true;
+		}
 		if (frame->kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE) {
 			if (frame->has_acquire_intent || frame->blocked_has_remote_proof)
 				return false;
@@ -608,7 +616,8 @@ resource_x_pair_common_valid(uint8 msg_type, ResourceXWireKind kind,
 {
 	if (acquire_decision) {
 		if (((kind == RESOURCE_X_WIRE_BLOCKED_TO_N && msg_type == RESOURCE_X_MSG_BLOCKED_TO_N)
-			 || (kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE && msg_type == RESOURCE_X_MSG_IMAGE_OR_GRANT))
+			 || (kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE && msg_type == RESOURCE_X_MSG_IMAGE_OR_GRANT)
+			 || (kind == RESOURCE_X_WIRE_INSTALL_SETTLEMENT && msg_type == RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE))
 			&& !acquire_intent) {
 			ResourceXDecodedCommon decision = *common;
 			if (common->outcome != RESOURCE_X_OUTCOME_OK) {
@@ -647,6 +656,8 @@ resource_x_pair_common_valid(uint8 msg_type, ResourceXWireKind kind,
 static uint8
 resource_x_frame_version(ResourceXWireKind kind, uint16 len)
 {
+	if (len == RESOURCE_X_COMPLETE_V5_BYTES)
+		return RESOURCE_X_COMPLETION_WIRE_VERSION;
 	if (len == RESOURCE_X_ACQUIRE_V3_BYTES)
 		return RESOURCE_X_ACQUIRE_WIRE_VERSION;
 	if (len == RESOURCE_X_DECISION_V4_BYTES || len == RESOURCE_X_WITNESS_V4_BYTES
@@ -762,7 +773,8 @@ resource_x_acquire_native_valid(const ResourceXDecodedAcquireIntent *body, uint8
 static bool
 resource_x_decision_body_valid(const ResourceXDecodedFrame *frame)
 {
-	const ResourceXDecodedAcquireDecision *body = &frame->body.acquire_decision;
+	const ResourceXDecodedAcquireDecision *body = frame->kind == RESOURCE_X_WIRE_INSTALL_SETTLEMENT
+		? &frame->body.acquire_completion.decision : &frame->body.acquire_decision;
 	uint32 requester_bit = UINT32_C(1) << frame->common.logical_assertion.requester_node;
 	uint32 required;
 	uint32 source_bit;
@@ -817,12 +829,33 @@ resource_x_decision_body_valid(const ResourceXDecodedFrame *frame)
 				   || source_bit == requester_bit)
 			return false;
 	}
-	if (frame->kind == RESOURCE_X_WIRE_AUTHORITY_GRANT)
+	if (frame->kind == RESOURCE_X_WIRE_AUTHORITY_GRANT || frame->kind == RESOURCE_X_WIRE_INSTALL_SETTLEMENT)
 		return frame->common.action_node == frame->common.logical_assertion.requester_node;
 	if (frame->kind != RESOURCE_X_WIRE_BLOCK_TO_N || body->source_kind == RESOURCE_X_ACQUIRE_SOURCE_DISK)
 		return false;
 	return frame->common.action_node == body->source_node
 		|| (required & (UINT32_C(1) << frame->common.action_node)) != 0;
+}
+
+/* Lossless omission is legal only when the full A proves every holder zero.
+ * A completion is not a durable-storage source proof or a second grant. */
+static bool
+resource_x_completion_body_valid(const ResourceXDecodedFrame *frame)
+{
+	const ResourceXDecodedAcquireCompletion *c = &frame->body.acquire_completion;
+	const ResourceXDecodedAcquireDecision *a = &c->decision;
+
+	return frame->common.target_mode == (uint8)PCM_STATE_S
+		&& a->episode.path == RESOURCE_X_ACQUIRE_FIRST_FILL
+		&& a->episode.base_generation < UINT64_MAX - 1
+		&& a->source_kind == RESOURCE_X_ACQUIRE_SOURCE_DISK
+		&& a->holders_bitmap == 0 && a->required_holders_bitmap == 0 && a->pi_holders_bitmap == 0
+		&& c->native_generation == a->episode.base_generation + 1
+		&& (c->write_io_generation & 1) == 0
+		&& (!SCN_VALID(a->disk_watermark_scn)
+			|| (SCN_VALID(c->page_scn) && scn_local(c->page_scn)
+				>= scn_local(a->disk_watermark_scn))) /* SCN_CMP_OK: scn_time_cmp via scn_local */
+		&& resource_x_decision_body_valid(frame);
 }
 
 static bool resource_x_body_valid(const ResourceXDecodedFrame *frame, ResourceXWireReject *reject);
@@ -1021,7 +1054,8 @@ resource_x_body_valid(const ResourceXDecodedFrame *frame, ResourceXWireReject *r
 {
 	bool valid = true;
 	if (frame->has_acquire_decision) {
-		valid = frame->kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE
+		valid = frame->kind == RESOURCE_X_WIRE_INSTALL_SETTLEMENT
+			? resource_x_completion_body_valid(frame) : frame->kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE
 			? resource_x_acquire_image_valid(frame, reject)
 			: frame->kind == RESOURCE_X_WIRE_BLOCKED_TO_N
 				? resource_x_witness_body_valid(frame, reject) : resource_x_decision_body_valid(frame);
@@ -1156,10 +1190,11 @@ static bool
 resource_x_body_encode(uint8 *bytes, const ResourceXDecodedFrame *frame, ResourceXWireReject *reject)
 {
 	if (frame->has_acquire_intent || frame->has_acquire_decision) {
+		bool complete = frame->has_acquire_decision && frame->kind == RESOURCE_X_WIRE_INSTALL_SETTLEMENT;
 		bool image = frame->has_acquire_decision && frame->kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE;
 		bool witness = frame->has_acquire_decision && (image || frame->kind == RESOURCE_X_WIRE_BLOCKED_TO_N);
-		const ResourceXDecodedAcquireDecision *decision = witness
-			? &resource_x_frame_witness(frame)->decision : &frame->body.acquire_decision;
+		const ResourceXDecodedAcquireDecision *decision = complete ? &frame->body.acquire_completion.decision
+			: witness ? &resource_x_frame_witness(frame)->decision : &frame->body.acquire_decision;
 		const ResourceXDecodedAcquireIntent *body = frame->has_acquire_decision
 			? &decision->episode : &frame->body.acquire_intent;
 
@@ -1186,10 +1221,19 @@ resource_x_body_encode(uint8 *bytes, const ResourceXDecodedFrame *frame, Resourc
 			bytes[212] = decision->directory_mode;
 			bytes[213] = decision->source_kind;
 			resource_x_put_u64(bytes + 216, decision->disk_watermark_scn);
-			for (int node = 0; node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++) {
+			for (int node = 0; !complete && node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++) {
 				resource_x_put_u64(bytes + 224 + node * 16, decision->holders[node].boot_incarnation);
 				resource_x_put_u64(bytes + 232 + node * 16, decision->holders[node].grant_generation);
 			}
+		}
+		if (complete) {
+			const ResourceXDecodedAcquireCompletion *c = &frame->body.acquire_completion;
+			resource_x_put_u64(bytes + 224, c->native_generation);
+			resource_x_put_u64(bytes + 232, c->write_io_generation);
+			resource_x_put_u64(bytes + 240, c->page_lsn);
+			resource_x_put_u64(bytes + 248, c->page_scn);
+			resource_x_put_u32(bytes + 256, c->page_crc32c);
+			resource_x_put_u32(bytes + 260, c->decision_crc32c);
 		}
 		if (witness) {
 			ResourceXDecodedFrame ack;
@@ -1307,12 +1351,13 @@ resource_x_body_decode(const uint8 *bytes, ResourceXDecodedFrame *frame,
 					   ResourceXWireReject *reject)
 {
 	if (frame->has_acquire_intent || frame->has_acquire_decision) {
+		bool complete = frame->has_acquire_decision && frame->kind == RESOURCE_X_WIRE_INSTALL_SETTLEMENT;
 		bool image = frame->has_acquire_decision && frame->kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE;
 		bool witness = frame->has_acquire_decision && (image || frame->kind == RESOURCE_X_WIRE_BLOCKED_TO_N);
 		ResourceXDecodedAcquireWitness *w = image
 			? &frame->body.acquire_image.source : &frame->body.acquire_witness;
-		ResourceXDecodedAcquireDecision *decision = witness
-			? &w->decision : &frame->body.acquire_decision;
+		ResourceXDecodedAcquireDecision *decision = complete ? &frame->body.acquire_completion.decision
+			: witness ? &w->decision : &frame->body.acquire_decision;
 		ResourceXDecodedAcquireIntent *body = frame->has_acquire_decision
 			? &decision->episode : &frame->body.acquire_intent;
 
@@ -1344,10 +1389,19 @@ resource_x_body_decode(const uint8 *bytes, ResourceXDecodedFrame *frame,
 			decision->directory_mode = bytes[212];
 			decision->source_kind = bytes[213];
 			decision->disk_watermark_scn = resource_x_get_u64(bytes + 216);
-			for (int node = 0; node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++) {
+			for (int node = 0; !complete && node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++) {
 				decision->holders[node].boot_incarnation = resource_x_get_u64(bytes + 224 + node * 16);
 				decision->holders[node].grant_generation = resource_x_get_u64(bytes + 232 + node * 16);
 			}
+		}
+		if (complete) {
+			ResourceXDecodedAcquireCompletion *c = &frame->body.acquire_completion;
+			c->native_generation = resource_x_get_u64(bytes + 224);
+			c->write_io_generation = resource_x_get_u64(bytes + 232);
+			c->page_lsn = resource_x_get_u64(bytes + 240);
+			c->page_scn = resource_x_get_u64(bytes + 248);
+			c->page_crc32c = resource_x_get_u32(bytes + 256);
+			c->decision_crc32c = resource_x_get_u32(bytes + 260);
 		}
 		if (witness) {
 			ResourceXDecodedFrame ack;
@@ -1544,6 +1598,7 @@ cluster_resource_x_wire_decode(uint8 msg_type, const void *payload, uint16 paylo
 	if (bytes == NULL || out == NULL)
 		return false;
 	if (payload_len != RESOURCE_X_CONTROL_V1_BYTES && payload_len != RESOURCE_X_SHORT_V1_BYTES
+		&& payload_len != RESOURCE_X_COMPLETE_V5_BYTES
 		&& payload_len != RESOURCE_X_PROOF_V1_BYTES && payload_len != RESOURCE_X_IMAGE_V2_BYTES
 		&& payload_len != RESOURCE_X_ACQUIRE_V3_BYTES && payload_len != RESOURCE_X_DECISION_V4_BYTES
 		&& payload_len != RESOURCE_X_WITNESS_V4_BYTES && payload_len != RESOURCE_X_SOURCE_WITNESS_V4_BYTES
@@ -1573,6 +1628,7 @@ cluster_resource_x_wire_decode(uint8 msg_type, const void *payload, uint16 paylo
 	decoded.payload_bytes = payload_len;
 	decoded.has_acquire_intent = payload_len == RESOURCE_X_ACQUIRE_V3_BYTES;
 	decoded.has_acquire_decision = payload_len == RESOURCE_X_DECISION_V4_BYTES
+		|| payload_len == RESOURCE_X_COMPLETE_V5_BYTES
 		|| payload_len == RESOURCE_X_WITNESS_V4_BYTES || payload_len == RESOURCE_X_SOURCE_WITNESS_V4_BYTES
 		|| payload_len == RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES;
 	decoded.blocked_has_remote_proof

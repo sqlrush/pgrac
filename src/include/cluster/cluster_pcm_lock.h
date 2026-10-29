@@ -622,7 +622,9 @@ typedef enum ResourceXApplyResult {
 	RESOURCE_X_APPLY_STALE,
 	RESOURCE_X_APPLY_BAD_STATE,
 	RESOURCE_X_APPLY_INVALID,
-	RESOURCE_X_APPLY_RECOVERY_BLOCKED
+	RESOURCE_X_APPLY_RECOVERY_BLOCKED,
+	/* Finite local owner occupied; wait, never a wire or transaction error. */
+	RESOURCE_X_APPLY_LOCAL_WAIT
 } ResourceXApplyResult;
 
 typedef enum ResourceXBootstrapRoundAction {
@@ -1715,6 +1717,7 @@ typedef struct ResourceXDeliveryTarget {
 #define RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING UINT8_C(4)
 #define RESOURCE_X_DELIVERY_ACQUIRE_READ_ARMED UINT8_C(5)
 #define RESOURCE_X_DELIVERY_ACQUIRE_READ_COMPLETE UINT8_C(6)
+#define RESOURCE_X_DELIVERY_ACQUIRE_READ_NOTICE UINT8_C(7)
 /* Immutable evidence retained by the original full-E executor. This is not
  * caller authority or a PAGE/WAL memory-source proof for disk bytes. */
 typedef struct ResourceXAcquireReadReceipt {
@@ -2853,6 +2856,12 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_read_a
 	const ResourceXDeliveryClaim *execution, const ResourceXDecodedAcquireIntent *episode,
 	const ResourceXAcquireReadReceipt *receipt);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_read_complete_exact(
+	const ResourceXDeliveryClaim *execution, const ResourceXDecodedAcquireIntent *episode,
+	const ResourceXAcquireReadReceipt *receipt, const struct ClusterPcmOwnSnapshot *terminal);
+
+/* Arm the original asynchronous DONE only after exact released native C.
+ * LOCAL_WAIT preserves both the occupied original slot and this E/A/I. */
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_read_notice_exact(
 	const ResourceXDeliveryClaim *execution, const ResourceXDecodedAcquireIntent *episode,
 	const ResourceXAcquireReadReceipt *receipt, const struct ClusterPcmOwnSnapshot *terminal);
 
