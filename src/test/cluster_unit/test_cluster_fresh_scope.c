@@ -398,6 +398,9 @@ static bool domain_alter_scope_lookup_active;
 static unsigned domain_alter_scope_route, domain_alter_scope_lookups;
 static unsigned domain_alter_scope_lookup_kind, domain_alter_scope_bad_lookup;
 static List *domain_alter_scope_names_by_route[4], *domain_alter_scope_expected_names;
+static bool sequence_create_lookup_active, sequence_create_expect_binding;
+static unsigned sequence_create_lookups, sequence_create_unbound, sequence_create_bad_lookup;
+static MemoryContext sequence_create_expected_context;
 static bool type_factory_scope_lookup_active;
 static unsigned type_factory_scope_route, type_factory_scope_lookups;
 static unsigned type_factory_scope_lookup_kind, type_factory_scope_bad_lookup;
@@ -6081,6 +6084,16 @@ errmsg_internal(const char *fmt, ...)
 void *
 MemoryContextAllocZeroAligned(MemoryContext context, Size size)
 {
+	if (sequence_create_lookup_active) {
+		sequence_create_lookups++;
+		if (sequence_create_expect_binding
+			&& (utility_binds == 0 || !TransactionIdIsValid(utility_top_xid)
+				|| utility_current_xid != utility_top_xid))
+			sequence_create_unbound++;
+		if (size != sizeof(CreateStmt) || context != sequence_create_expected_context)
+			sequence_create_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before allocation, zeroing or node-tag assignment. */
+	}
 	if (type_factory_scope_lookup_active) {
 		type_factory_scope_lookups++;
 		type_factory_scope_lookup_kind = 2;
@@ -21381,10 +21394,285 @@ UT_TEST(test_native_vacuum_scope_preserves_existing_supported_top_binding)
 	vacuum_scope_lookup_active = false;
 }
 
+/* Actual native creation prefix retains the original CreateStmt initializer
+ * or assignment. The real makeNode allocator is a negative boundary only. */
+#include "test_cluster_fresh_sequence_create.inc"
+static ParseState sequence_create_parse_state;
+static bool sequence_create_use_parse_state;
+static RangeVar sequence_create_target;
+static Integer sequence_create_option_value;
+static DefElem sequence_create_option;
+static ListCell sequence_create_option_cell;
+static List sequence_create_options;
+static CreateSeqStmt native_sequence_create_statement;
+static Node *sequence_create_expected_statement;
+static RangeVar sequence_create_warm_relation;
+static AlterObjectSchemaStmt sequence_create_warm_statement;
+
+static void
+reset_native_sequence_create(bool expect_binding, unsigned form)
+{
+	reset_create_preflight();
+	sequence_create_lookup_active = false;
+	sequence_create_expect_binding = expect_binding;
+	sequence_create_lookups = sequence_create_unbound = sequence_create_bad_lookup = 0;
+	sequence_create_expected_context = CurrentMemoryContext;
+	sequence_create_use_parse_state = (form & 4) != 0;
+	sequence_create_parse_state = (ParseState){ 0 };
+	sequence_create_target = (RangeVar){ .type = T_RangeVar,
+										 .schemaname = (form & 4) != 0 ? "sequence_schema" : NULL,
+										 .relname = "native_created_sequence",
+										 .inh = false,
+										 .relpersistence = form < 8	   ? RELPERSISTENCE_PERMANENT
+														   : form < 16 ? RELPERSISTENCE_TEMP
+																	   : RELPERSISTENCE_UNLOGGED,
+										 .location = -1 };
+	sequence_create_option_value = (Integer){ .type = T_Integer, .ival = 64 };
+	sequence_create_option = (DefElem){ .type = T_DefElem,
+										.defname = "cache",
+										.arg = (Node *)&sequence_create_option_value,
+										.defaction = DEFELEM_UNSPEC,
+										.location = -1 };
+	one_element(&sequence_create_options, &sequence_create_option_cell, &sequence_create_option);
+	native_sequence_create_statement
+		= (CreateSeqStmt){ .type = T_CreateSeqStmt,
+						   .sequence = &sequence_create_target,
+						   .options = (form & 1) != 0 ? &sequence_create_options : NIL,
+						   .ownerId = (form & 2) != 0 ? 24001 : InvalidOid,
+						   .for_identity = (form & 2) != 0,
+						   .if_not_exists = (form & 1) != 0 };
+	sequence_create_expected_statement = (Node *)&native_sequence_create_statement;
+	sequence_create_warm_relation
+		= (RangeVar){ .type = T_RangeVar, .relname = "supported_warm_table" };
+	sequence_create_warm_statement
+		= (AlterObjectSchemaStmt){ .type = T_AlterObjectSchemaStmt,
+								   .objectType = OBJECT_TABLE,
+								   .relation = &sequence_create_warm_relation,
+								   .newschema = "supported_warm_destination",
+								   .missing_ok = false };
+}
+
+static void
+native_sequence_create_entry(void)
+{
+	sequence_create_lookup_active = true;
+	(void)DefineSequence(sequence_create_use_parse_state ? &sequence_create_parse_state : NULL,
+						 &native_sequence_create_statement);
+}
+
+UT_TEST(test_native_sequence_create_binds_before_first_allocation_in_all_profiles)
+{
+	for (unsigned form = 0; form < 16; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_sequence_create(binds, form);
+			set_native_operator_mode(mode);
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_sequence_create_entry();
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(sequence_create_lookups, repeat + 1);
+				UT_ASSERT_EQ(sequence_create_unbound, 0);
+				UT_ASSERT_EQ(sequence_create_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	sequence_create_lookup_active = false;
+}
+
+UT_TEST(test_native_sequence_create_refuses_before_allocation_on_publication_child_and_top_errors)
+{
+	for (unsigned form = 0; form < 16; form++) {
+		for (unsigned failure = 0; failure < 5; failure++) {
+			bool allocated = failure == 0 || failure == 2;
+			int caught;
+
+			reset_native_sequence_create(true, form);
+			if (failure == 0)
+				utility_bind_ok = false;
+			else if (failure == 1 || failure == 2) {
+				if (failure == 2)
+					create_sql_entry(sequence_create_expected_statement);
+				utility_in_child = true;
+			} else {
+				utility_current_xid = 401;
+				utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_sequence_create_entry();
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, failure == 0  ? ERRCODE_DATA_CORRUPTED
+									 : failure < 3 ? ERRCODE_FEATURE_NOT_SUPPORTED
+												   : ERRCODE_INTERNAL_ERROR);
+			UT_ASSERT_STR_EQ(
+				error_message,
+				failure == 0  ? "canonical ACTIVE publication failed before shared catalog creation"
+				: failure < 3 ? "shared catalog creation does not support subtransactions"
+							  : "shared catalog top-level transaction identity mismatch");
+			UT_ASSERT_EQ(sequence_create_lookups, 0);
+			UT_ASSERT_EQ(sequence_create_unbound + sequence_create_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_xids, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, failure == 2 ? 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, allocated || failure == 3 ? 400 : InvalidTransactionId);
+		}
+	}
+	sequence_create_lookup_active = false;
+}
+
+UT_TEST(test_native_sequence_create_context_guards_keep_nonshared_route)
+{
+	for (unsigned form = 0; form < 16; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+
+			for (unsigned guard = 0; guard < 3; guard++) {
+				int caught;
+
+				reset_native_sequence_create(binds, form);
+				set_native_operator_mode(mode);
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_sequence_create_entry();
+				UT_ASSERT_EQ(caught, binds ? 1 : 2);
+				UT_ASSERT_EQ(error_code, !binds		  ? 0
+										 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+													  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				UT_ASSERT_EQ(sequence_create_lookups, binds ? 0 : 1);
+				UT_ASSERT_EQ(sequence_create_unbound + sequence_create_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	sequence_create_lookup_active = false;
+}
+
+UT_TEST(test_native_sequence_create_utility_warm_guards_preserve_binding)
+{
+	for (unsigned form = 0; form < 16; form++) {
+		for (unsigned guard = 0; guard < 4; guard++) {
+			int caught;
+
+			reset_native_sequence_create(true, form);
+			create_sql_entry(sequence_create_expected_statement);
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			XactReadOnly = guard == 1;
+			utility_parallel = guard == 2;
+			utility_recovery = guard == 3;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_sequence_create_entry();
+			UT_ASSERT_EQ(caught, guard ? 1 : 2);
+			UT_ASSERT_EQ(error_code, !guard		  ? 0
+									 : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+												  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT_EQ(sequence_create_lookups, guard ? 0 : 1);
+			UT_ASSERT_EQ(sequence_create_unbound + sequence_create_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_prepares, guard ? 1 : 2);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			UT_ASSERT_EQ(utility_top_xid, 400);
+		}
+	}
+	sequence_create_lookup_active = false;
+}
+
+static void
+assert_native_sequence_create_unlogged(bool blocked, int caught)
+{
+	UT_ASSERT_EQ(caught, blocked ? 1 : 2);
+	UT_ASSERT_EQ(error_code, blocked ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+	if (blocked) {
+		UT_ASSERT_STR_EQ(error_message, "UNLOGGED sequences is not supported in shared mode");
+		UT_ASSERT_STR_EQ(error_detail,
+						 "PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+	}
+	UT_ASSERT_EQ(sequence_create_lookups, blocked ? 0 : 1);
+	UT_ASSERT_EQ(sequence_create_unbound + sequence_create_bad_lookup, 0);
+}
+
+UT_TEST(test_native_sequence_create_unlogged_scope_precedes_binding_and_keeps_existing_debt)
+{
+	for (unsigned form = 16; form < 24; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool blocked = mode == 1 || mode == 3 || mode == 5 || mode == 7;
+			int caught;
+
+			reset_native_sequence_create(false, form);
+			set_native_operator_mode(mode);
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				create_sql_entry(sequence_create_expected_statement);
+			UT_ASSERT_EQ(caught, blocked ? 1 : 0);
+			UT_ASSERT_EQ(error_code, blocked ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+			if (blocked) {
+				UT_ASSERT_STR_EQ(error_message,
+								 "UNLOGGED sequences is not supported in shared mode");
+				UT_ASSERT_STR_EQ(error_detail,
+								 "PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+			}
+			UT_ASSERT_EQ(sequence_create_lookups + utility_xids + utility_prepares + utility_binds,
+						 0);
+			reset_error();
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_sequence_create_entry();
+			assert_native_sequence_create_unlogged(blocked, caught);
+			UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			for (unsigned warm = 0; warm < 2; warm++) {
+				for (unsigned fault = 0; fault < 7; fault++) {
+					reset_native_sequence_create(false, form);
+					if (warm)
+						create_sql_entry((Node *)&sequence_create_warm_statement);
+					set_native_operator_mode(mode);
+					XactReadOnly = fault == 0;
+					utility_parallel = fault == 1;
+					utility_recovery = fault == 2;
+					utility_in_child = fault == 3;
+					if (fault == 4 || fault == 5) {
+						utility_current_xid = 401;
+						utility_top_xid = fault == 4 ? 400 : InvalidTransactionId;
+					}
+					utility_bind_ok = fault != 6;
+					caught = sigsetjmp(boundary, 1);
+					if (!caught)
+						native_sequence_create_entry();
+					assert_native_sequence_create_unlogged(blocked, caught);
+					UT_ASSERT_EQ(utility_xids, warm);
+					UT_ASSERT_EQ(utility_prepares, warm);
+					UT_ASSERT_EQ(utility_binds, warm);
+					UT_ASSERT_EQ(utility_top_xid, fault == 4   ? 400
+												  : fault == 5 ? InvalidTransactionId
+												  : warm	   ? 400
+															   : InvalidTransactionId);
+					UT_ASSERT_EQ(utility_current_xid, fault == 4 || fault == 5 ? 401
+													  : warm ? 400
+															 : InvalidTransactionId);
+				}
+			}
+		}
+	}
+	sequence_create_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(342);
+	UT_PLAN(347);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -21729,6 +22017,12 @@ main(void)
 	UT_RUN(test_native_vacuum_scope_matches_utility_before_transaction_work);
 	UT_RUN(test_native_vacuum_scope_precedes_context_child_top_and_publication);
 	UT_RUN(test_native_vacuum_scope_preserves_existing_supported_top_binding);
+	UT_RUN(test_native_sequence_create_binds_before_first_allocation_in_all_profiles);
+	UT_RUN(
+		test_native_sequence_create_refuses_before_allocation_on_publication_child_and_top_errors);
+	UT_RUN(test_native_sequence_create_context_guards_keep_nonshared_route);
+	UT_RUN(test_native_sequence_create_utility_warm_guards_preserve_binding);
+	UT_RUN(test_native_sequence_create_unlogged_scope_precedes_binding_and_keeps_existing_debt);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
