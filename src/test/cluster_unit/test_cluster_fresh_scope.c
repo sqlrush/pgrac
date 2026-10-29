@@ -64,6 +64,7 @@
 #include "catalog/pg_type_d.h"
 #include "catalog/pg_user_mapping.h"
 #include "commands/alter.h"
+#include "commands/createas.h"
 #include "commands/collationcmds.h"
 #include "commands/cluster.h"
 #include "commands/comment.h"
@@ -90,6 +91,7 @@
 #include "cluster/cluster_tt_local.h"
 #include "commands/tablecmds.h"
 #include "common/controldata_utils.h"
+#include "executor/execdesc.h"
 #include "foreign/fdwapi.h"
 #include "foreign/foreign.h"
 #include "miscadmin.h"
@@ -21669,10 +21671,341 @@ UT_TEST(test_native_sequence_create_unlogged_scope_precedes_binding_and_keeps_ex
 	sequence_create_lookup_active = false;
 }
 
+/* Actual CTAS prefix stops at the original existence query. No namespace
+ * lookup, successful creation, receiver, planner or executor is substituted. */
+static bool ctas_create_lookup_active, ctas_create_expect_binding;
+static unsigned ctas_create_lookups, ctas_create_unbound, ctas_create_bad_lookup;
+static ParseState ctas_create_parse_state;
+static bool ctas_create_use_parse_state;
+static RangeVar ctas_create_target;
+static IntoClause ctas_create_into;
+static Query ctas_create_query;
+static ExecuteStmt ctas_create_execute;
+static Const ctas_create_constant;
+static TargetEntry ctas_create_target_entry;
+static ListCell ctas_create_target_cell;
+static List ctas_create_targets;
+static CreateTableAsStmt native_ctas_create_statement;
+static Node *ctas_create_expected_statement;
+static QueryCompletion ctas_create_completion;
+static RangeVar ctas_create_warm_relation;
+static AlterObjectSchemaStmt ctas_create_warm_statement;
+
+bool
+CreateTableAsRelExists(CreateTableAsStmt *stmt)
+{
+	ctas_create_lookups++;
+	if (ctas_create_expect_binding
+		&& (utility_binds == 0 || !TransactionIdIsValid(utility_top_xid)
+			|| utility_current_xid != utility_top_xid))
+		ctas_create_unbound++;
+	if (!ctas_create_lookup_active || (Node *)stmt != ctas_create_expected_statement
+		|| stmt->into != &ctas_create_into || stmt->query != (Node *)&ctas_create_query)
+		ctas_create_bad_lookup++;
+	siglongjmp(boundary, 2); /* Stop before real namespace or catalog lookup. */
+}
+
+#include "test_cluster_fresh_ctas_create.inc"
+
+static void
+reset_native_ctas_create(bool expect_binding, unsigned form)
+{
+	bool matview = form >= 24;
+	unsigned shape = matview ? form - 24 : form % 8;
+	bool select_into = !matview && (shape == 4 || shape == 5);
+	bool execute = !matview && shape >= 6;
+
+	reset_create_preflight();
+	ctas_create_lookup_active = false;
+	ctas_create_expect_binding = expect_binding;
+	ctas_create_lookups = ctas_create_unbound = ctas_create_bad_lookup = 0;
+	ctas_create_use_parse_state = (shape & 1) != 0;
+	ctas_create_parse_state = (ParseState){ .p_sourcetext = "native CTAS prefix" };
+	ctas_create_target
+		= (RangeVar){ .type = T_RangeVar,
+					  .schemaname = (shape & 1) != 0 ? "ctas_schema" : NULL,
+					  .relname = "native_created_ctas",
+					  .inh = false,
+					  .relpersistence = matview || form < 8 ? RELPERSISTENCE_PERMANENT
+										: form < 16			? RELPERSISTENCE_TEMP
+															: RELPERSISTENCE_UNLOGGED,
+					  .location = -1 };
+	ctas_create_constant = (Const){ .xpr.type = T_Const,
+									.consttype = INT4OID,
+									.consttypmod = -1,
+									.constcollid = InvalidOid,
+									.constlen = sizeof(int32),
+									.constvalue = Int32GetDatum(1),
+									.constisnull = false,
+									.constbyval = true,
+									.location = -1 };
+	ctas_create_target_entry = (TargetEntry){ .xpr.type = T_TargetEntry,
+											  .expr = (Expr *)&ctas_create_constant,
+											  .resno = 1,
+											  .resname = "value" };
+	one_element(&ctas_create_targets, &ctas_create_target_cell, &ctas_create_target_entry);
+	ctas_create_execute = (ExecuteStmt){ .type = T_ExecuteStmt, .name = "native_ctas_source" };
+	ctas_create_query = (Query){ .type = T_Query,
+								 .commandType = execute ? CMD_UTILITY : CMD_SELECT,
+								 .querySource = QSRC_ORIGINAL,
+								 .canSetTag = true,
+								 .utilityStmt = execute ? (Node *)&ctas_create_execute : NULL,
+								 .targetList = execute ? NIL : &ctas_create_targets };
+	ctas_create_into = (IntoClause){ .type = T_IntoClause,
+									 .rel = &ctas_create_target,
+									 .onCommit = ONCOMMIT_NOOP,
+									 .viewQuery = matview ? (Node *)&ctas_create_query : NULL,
+									 .skipData = !select_into && (shape & 1) != 0 };
+	native_ctas_create_statement
+		= (CreateTableAsStmt){ .type = T_CreateTableAsStmt,
+							   .query = (Node *)&ctas_create_query,
+							   .into = &ctas_create_into,
+							   .objtype = matview ? OBJECT_MATVIEW : OBJECT_TABLE,
+							   .is_select_into = select_into,
+							   .if_not_exists = shape == 2 || shape == 3 };
+	ctas_create_expected_statement = (Node *)&native_ctas_create_statement;
+	ctas_create_completion = (QueryCompletion){ 0 };
+	ctas_create_warm_relation = (RangeVar){ .type = T_RangeVar, .relname = "supported_warm_table" };
+	ctas_create_warm_statement = (AlterObjectSchemaStmt){ .type = T_AlterObjectSchemaStmt,
+														  .objectType = OBJECT_TABLE,
+														  .relation = &ctas_create_warm_relation,
+														  .newschema = "supported_warm_destination",
+														  .missing_ok = false };
+}
+
+static void
+native_ctas_create_entry(void)
+{
+	ctas_create_lookup_active = true;
+	(void)ExecCreateTableAs(ctas_create_use_parse_state ? &ctas_create_parse_state : NULL,
+							&native_ctas_create_statement, NULL, NULL,
+							ctas_create_use_parse_state ? &ctas_create_completion : NULL);
+}
+
+UT_TEST(test_native_ctas_create_binds_before_first_lookup_in_all_profiles)
+{
+	for (unsigned form = 0; form < 16; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_ctas_create(binds, form);
+			set_native_operator_mode(mode);
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_ctas_create_entry();
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(ctas_create_lookups, repeat + 1);
+				UT_ASSERT_EQ(ctas_create_unbound, 0);
+				UT_ASSERT_EQ(ctas_create_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	ctas_create_lookup_active = false;
+}
+
+UT_TEST(test_native_ctas_create_refuses_before_lookup_on_publication_child_and_top_errors)
+{
+	for (unsigned form = 0; form < 16; form++) {
+		for (unsigned failure = 0; failure < 5; failure++) {
+			bool allocated = failure == 0 || failure == 2;
+			int caught;
+
+			reset_native_ctas_create(true, form);
+			if (failure == 0)
+				utility_bind_ok = false;
+			else if (failure == 1 || failure == 2) {
+				if (failure == 2)
+					create_sql_entry(ctas_create_expected_statement);
+				utility_in_child = true;
+			} else {
+				utility_current_xid = 401;
+				utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_ctas_create_entry();
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, failure == 0  ? ERRCODE_DATA_CORRUPTED
+									 : failure < 3 ? ERRCODE_FEATURE_NOT_SUPPORTED
+												   : ERRCODE_INTERNAL_ERROR);
+			UT_ASSERT_STR_EQ(
+				error_message,
+				failure == 0  ? "canonical ACTIVE publication failed before shared catalog creation"
+				: failure < 3 ? "shared catalog creation does not support subtransactions"
+							  : "shared catalog top-level transaction identity mismatch");
+			UT_ASSERT_EQ(ctas_create_lookups, 0);
+			UT_ASSERT_EQ(ctas_create_unbound + ctas_create_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_xids, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, failure == 2 ? 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, allocated || failure == 3 ? 400 : InvalidTransactionId);
+		}
+	}
+	ctas_create_lookup_active = false;
+}
+
+UT_TEST(test_native_ctas_create_context_guards_keep_nonshared_route)
+{
+	for (unsigned form = 0; form < 16; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+
+			for (unsigned guard = 0; guard < 3; guard++) {
+				int caught;
+
+				reset_native_ctas_create(binds, form);
+				set_native_operator_mode(mode);
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_ctas_create_entry();
+				UT_ASSERT_EQ(caught, binds ? 1 : 2);
+				UT_ASSERT_EQ(error_code, !binds		  ? 0
+										 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+													  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				if (binds) {
+					char expected[160];
+					snprintf(expected, sizeof(expected),
+							 guard == 0	  ? "cannot execute %s in a read-only transaction"
+							 : guard == 1 ? "cannot execute %s during a parallel operation"
+										  : "cannot execute %s during recovery",
+							 native_ctas_create_statement.is_select_into ? "SELECT INTO"
+																		 : "CREATE TABLE AS");
+					UT_ASSERT_STR_EQ(error_message, expected);
+				}
+				UT_ASSERT_EQ(ctas_create_lookups, binds ? 0 : 1);
+				UT_ASSERT_EQ(ctas_create_unbound + ctas_create_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	ctas_create_lookup_active = false;
+}
+
+UT_TEST(test_native_ctas_create_utility_warm_guards_preserve_binding)
+{
+	for (unsigned form = 0; form < 16; form++) {
+		for (unsigned guard = 0; guard < 4; guard++) {
+			int caught;
+
+			reset_native_ctas_create(true, form);
+			create_sql_entry(ctas_create_expected_statement);
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			XactReadOnly = guard == 1;
+			utility_parallel = guard == 2;
+			utility_recovery = guard == 3;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_ctas_create_entry();
+			UT_ASSERT_EQ(caught, guard ? 1 : 2);
+			UT_ASSERT_EQ(error_code, !guard		  ? 0
+									 : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+												  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT_EQ(ctas_create_lookups, guard ? 0 : 1);
+			UT_ASSERT_EQ(ctas_create_unbound + ctas_create_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_prepares, guard ? 1 : 2);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			UT_ASSERT_EQ(utility_top_xid, 400);
+		}
+	}
+	ctas_create_lookup_active = false;
+}
+
+static void
+assert_native_ctas_create_unsupported(bool blocked, int caught, const char *message)
+{
+	UT_ASSERT_EQ(caught, blocked ? 1 : 2);
+	UT_ASSERT_EQ(error_code, blocked ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+	if (blocked) {
+		UT_ASSERT_STR_EQ(error_message, message);
+		UT_ASSERT_STR_EQ(error_detail,
+						 "PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+	}
+	UT_ASSERT_EQ(ctas_create_lookups, blocked ? 0 : 1);
+	UT_ASSERT_EQ(ctas_create_unbound + ctas_create_bad_lookup, 0);
+}
+
+UT_TEST(test_native_ctas_create_scope_precedes_binding_and_keeps_existing_debt)
+{
+	for (unsigned form = 16; form < 28; form++) {
+		const char *message = form < 24 ? "UNLOGGED tables is not supported in shared mode"
+										: "materialized views is not supported in shared mode";
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool blocked
+				= mode == 1 || mode == 3 || mode == 4 || mode == 5 || mode == 6 || mode == 7;
+			int caught;
+
+			reset_native_ctas_create(false, form);
+			set_native_operator_mode(mode);
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				create_sql_entry(ctas_create_expected_statement);
+			UT_ASSERT_EQ(caught, blocked ? 1 : 0);
+			UT_ASSERT_EQ(error_code, blocked ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+			if (blocked) {
+				UT_ASSERT_STR_EQ(error_message, message);
+				UT_ASSERT_STR_EQ(error_detail,
+								 "PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+			}
+			UT_ASSERT_EQ(ctas_create_lookups + utility_xids + utility_prepares + utility_binds, 0);
+			reset_error();
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_ctas_create_entry();
+			assert_native_ctas_create_unsupported(blocked, caught, message);
+			UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			for (unsigned warm = 0; warm < 2; warm++) {
+				for (unsigned fault = 0; fault < 7; fault++) {
+					reset_native_ctas_create(false, form);
+					if (warm)
+						create_sql_entry((Node *)&ctas_create_warm_statement);
+					set_native_operator_mode(mode);
+					XactReadOnly = fault == 0;
+					utility_parallel = fault == 1;
+					utility_recovery = fault == 2;
+					utility_in_child = fault == 3;
+					if (fault == 4 || fault == 5) {
+						utility_current_xid = 401;
+						utility_top_xid = fault == 4 ? 400 : InvalidTransactionId;
+					}
+					utility_bind_ok = fault != 6;
+					caught = sigsetjmp(boundary, 1);
+					if (!caught)
+						native_ctas_create_entry();
+					assert_native_ctas_create_unsupported(blocked, caught, message);
+					UT_ASSERT_EQ(utility_xids, warm);
+					UT_ASSERT_EQ(utility_prepares, warm);
+					UT_ASSERT_EQ(utility_binds, warm);
+					UT_ASSERT_EQ(utility_top_xid, fault == 4   ? 400
+												  : fault == 5 ? InvalidTransactionId
+												  : warm	   ? 400
+															   : InvalidTransactionId);
+					UT_ASSERT_EQ(utility_current_xid, fault == 4 || fault == 5 ? 401
+													  : warm ? 400
+															 : InvalidTransactionId);
+				}
+			}
+		}
+	}
+	ctas_create_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(347);
+	UT_PLAN(352);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -22023,6 +22356,11 @@ main(void)
 	UT_RUN(test_native_sequence_create_context_guards_keep_nonshared_route);
 	UT_RUN(test_native_sequence_create_utility_warm_guards_preserve_binding);
 	UT_RUN(test_native_sequence_create_unlogged_scope_precedes_binding_and_keeps_existing_debt);
+	UT_RUN(test_native_ctas_create_binds_before_first_lookup_in_all_profiles);
+	UT_RUN(test_native_ctas_create_refuses_before_lookup_on_publication_child_and_top_errors);
+	UT_RUN(test_native_ctas_create_context_guards_keep_nonshared_route);
+	UT_RUN(test_native_ctas_create_utility_warm_guards_preserve_binding);
+	UT_RUN(test_native_ctas_create_scope_precedes_binding_and_keeps_existing_debt);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
