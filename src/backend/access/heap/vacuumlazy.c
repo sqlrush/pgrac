@@ -1963,8 +1963,6 @@ lazy_observe_shared_freeze_bounds(LVRelState *vacrel,
 	if (FullTransactionIdIsValid(vacrel->cutoffs.SharedFreezeLimitFull)
 		&& U64FromFullTransactionId(vacrel->cutoffs.SharedFreezeLimitFull) != UINT64_MAX
 		&& TransactionIdIsNormal(XidFromFullTransactionId(vacrel->cutoffs.SharedFreezeLimitFull))
-		&& XidFromFullTransactionId(vacrel->cutoffs.SharedFreezeLimitFull)
-		== vacrel->cutoffs.FreezeLimit
 		&& FullTransactionIdEquals(vacrel->cutoffs.SharedFreezePolicySample.freeze_limit,
 								   vacrel->cutoffs.SharedFreezeLimitFull))
 	{

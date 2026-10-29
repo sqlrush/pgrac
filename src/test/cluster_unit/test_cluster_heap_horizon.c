@@ -243,15 +243,60 @@ UT_TEST(real_vacuum_retains_full_policy_before_both_scan_exits)
 		cutoffs.SharedFreezeLimitFull = fxid(9, 42);
 		UT_ASSERT_EQ(vacuum_policy_scan(10, 180, variant == 0 ? 100000 : 1,
 			RELPERSISTENCE_PERMANENT, 90, &cutoffs), variant != 0);
-		UT_ASSERT(FullTransactionIdEquals(cutoffs.SharedFreezeLimitFull, fxid(2, 80)));
+		UT_ASSERT(FullTransactionIdEquals(cutoffs.SharedFreezeLimitFull, fxid(2, 820)));
 		UT_ASSERT(FullTransactionIdEquals(cutoffs.SharedFreezePolicySample.legal_next, fxid(2, 1000)));
-		UT_ASSERT(FullTransactionIdEquals(cutoffs.SharedFreezePolicySample.freeze_limit, fxid(2, 80)));
+		UT_ASSERT(FullTransactionIdEquals(cutoffs.SharedFreezePolicySample.freeze_limit, fxid(2, 820)));
 		UT_ASSERT_EQ(cutoffs.SharedFreezePolicySample.allocation_fence.incarnation, 81);
 		UT_ASSERT_EQ(cutoffs.FreezeLimit, 80);
 		UT_ASSERT_EQ(cutoffs.MultiXactCutoff, 42);
 		UT_ASSERT_EQ(age_sample_reads, 1);
 		UT_ASSERT_EQ(age_watermark_reads, 1);
 	}
+}
+
+UT_TEST(real_vacuum_shared_age_is_independent_of_native_deletion_ceiling)
+{
+	const int ages[] = {0, 180, 980};
+	const TransactionId shared[] = {900, 820, 20};
+	const TransactionId native[] = {80, 80, 20};
+
+	for (unsigned i = 0; i < lengthof(ages); i++) {
+		struct VacuumCutoffs cutoffs;
+		setup_age();
+		age_watermark_ready = true;
+		age_watermark.active_full_xid_min = 900;
+		UT_ASSERT(!vacuum_policy_scan(10, ages[i], 100000,
+			RELPERSISTENCE_PERMANENT, 90, &cutoffs));
+		UT_ASSERT(FullTransactionIdEquals(cutoffs.SharedFreezeLimitFull, fxid(0, shared[i])));
+		UT_ASSERT(FullTransactionIdEquals(cutoffs.SharedFreezePolicySample.freeze_limit,
+			cutoffs.SharedFreezeLimitFull));
+		UT_ASSERT_EQ(cutoffs.OldestXmin, 80);
+		UT_ASSERT_EQ(cutoffs.FreezeLimit, native[i]);
+		UT_ASSERT_EQ(cutoffs.MultiXactCutoff, 42);
+		UT_ASSERT_EQ(age_sample_reads, 1); UT_ASSERT_EQ(age_watermark_reads, 1);
+		UT_ASSERT_EQ(age_fence_reads, 1);
+		UT_ASSERT_EQ(age_lock_acquires, 1); UT_ASSERT_EQ(age_lock_releases, 1);
+	}
+}
+
+UT_TEST(real_vacuum_shared_age_preserves_full_epoch_above_activation_floor)
+{
+	struct VacuumCutoffs cutoffs;
+	setup_age();
+	stub_next_full = age_cache.nextXid = fxid(1, 100);
+	activation_floor = U64FromFullTransactionId(fxid(1, 50));
+	age_future = fxid(1, 1000);
+	age_watermark_ready = true;
+	age_watermark.active_full_xid_min = U64FromFullTransactionId(fxid(1, 900));
+	UT_ASSERT(!vacuum_policy_scan(10, 0, 100000,
+		RELPERSISTENCE_PERMANENT, 90, &cutoffs));
+	UT_ASSERT(FullTransactionIdEquals(cutoffs.SharedFreezeLimitFull, fxid(1, 900)));
+	UT_ASSERT(FullTransactionIdEquals(cutoffs.SharedFreezePolicySample.legal_next, fxid(1, 1000)));
+	UT_ASSERT_EQ(cutoffs.OldestXmin, 50); UT_ASSERT_EQ(cutoffs.FreezeLimit, 50);
+	UT_ASSERT_EQ(cutoffs.MultiXactCutoff, 42);
+	UT_ASSERT(cluster_heap_freeze_policy_sample_current_v1(&cutoffs.SharedFreezePolicySample));
+	UT_ASSERT_EQ(age_sample_reads, 1); UT_ASSERT_EQ(age_watermark_reads, 1);
+	UT_ASSERT_EQ(age_lock_acquires, 1); UT_ASSERT_EQ(age_lock_releases, 1);
 }
 
 UT_TEST(real_vacuum_discards_previous_full_policy_on_refusal_or_nontarget)
@@ -1379,7 +1424,7 @@ UT_TEST(observed_bounds_aggregate_fullxid_cannot_replace_saved_source_even_if_po
 int
 main(void)
 {
-	UT_PLAN(64);
+	UT_PLAN(66);
 	UT_RUN(observed_bounds_cap_policy_at_same_cohort_and_preserve_h_domain);
 	UT_RUN(observed_bounds_reproduces_original_fixed_cohort_h_minimum);
 	UT_RUN(observed_bounds_rejects_changed_or_missing_original_h_atomically);
@@ -1402,6 +1447,8 @@ main(void)
 	UT_RUN(full_policy_keeps_prior_epoch_floor_and_raw_wrapper_compatibility);
 	UT_RUN(full_policy_refusal_preserves_both_outputs);
 	UT_RUN(real_vacuum_retains_full_policy_before_both_scan_exits);
+	UT_RUN(real_vacuum_shared_age_is_independent_of_native_deletion_ceiling);
+	UT_RUN(real_vacuum_shared_age_preserves_full_epoch_above_activation_floor);
 	UT_RUN(real_vacuum_discards_previous_full_policy_on_refusal_or_nontarget);
 	UT_RUN(published_watermark_caps_existing_vacuum_limit);
 	UT_RUN(published_watermark_never_raises_age_or_activation_ceiling);

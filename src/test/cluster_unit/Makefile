@@ -2003,9 +2003,9 @@ test_cluster_heap_maintenance_identity.inc: $(top_srcdir)/src/backend/access/hea
 # Execute original census ingress invalidation with the native freeze/WAL continuation.
 # Original full policy sampler, composed with the actual stripe lease fixture.
 test_cluster_heap_freeze_policy_sample.inc: $(top_srcdir)/src/backend/cluster/cluster_heap_horizon.c Makefile
-	@awk '/^cluster_heap_freeze_policy_sample_v1\(/ { print "static bool"; emit=1; found++ } \
+	@awk '/^cluster_heap_freeze_policy_sample_(common|v1)\(/ { print "static bool"; emit=1; found++ } \
 	     emit { print } emit && /^}/ { emit=0; done++ } \
-	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	     END { if (found != 2 || done != 2 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Original retained stripe types, pointers and current comparison only.

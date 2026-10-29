@@ -42,6 +42,12 @@ typedef struct ClusterHeapFreezePolicySampleV1 {
  * check never samples nextXid again; call without page/census locks. */
 extern bool cluster_heap_freeze_policy_sample_v1(TransactionId ceiling, TransactionId frozen,
 	int min_age, int table_age, ClusterHeapFreezePolicySampleV1 *out);
+/* Independent shared FullXid age bound. ceiling still validates the native
+ * window, but caps only the caller's native deletion/freezing policy. Shared
+ * mutation requires the original terminal, F/H and current-source proofs.
+ * Failure preserves out; this entry also takes only one legal-next sample. */
+extern bool cluster_heap_freeze_shared_policy_sample_v1(TransactionId ceiling, TransactionId frozen,
+	int min_age, int table_age, ClusterHeapFreezePolicySampleV1 *out);
 extern bool cluster_heap_freeze_policy_sample_current_v1(
 	const ClusterHeapFreezePolicySampleV1 *sample);
 

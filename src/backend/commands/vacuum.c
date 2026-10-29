@@ -1277,11 +1277,12 @@ vacuum_get_cutoffs(Relation rel, const VacuumParams *params,
 		ClusterHeapFreezePolicySampleV1 sample;
 
 		/*
-		 * Use one legal-next sample for both age policies, still capped
-		 * by the original activation-clamped OldestXmin. Missing evidence
-		 * requests a full scan without advancing the freeze boundary.
+		 * Use one legal-next sample for both age policies. Shared FullXid
+		 * preparation has its own proved bound; native deletion/freezing
+		 * must keep the activation-clamped OldestXmin. Missing evidence
+		 * requests a full scan without advancing either freeze boundary.
 		 */
-		if (!cluster_heap_freeze_policy_sample_v1(cutoffs->OldestXmin, cutoffs->relfrozenxid,
+		if (!cluster_heap_freeze_shared_policy_sample_v1(cutoffs->OldestXmin, cutoffs->relfrozenxid,
 											freeze_min_age, freeze_table_age, &sample)) {
 			cutoffs->FreezeLimit = cutoffs->relfrozenxid;
 			if (TransactionIdPrecedes(cutoffs->OldestXmin, cutoffs->FreezeLimit))
@@ -1293,6 +1294,8 @@ vacuum_get_cutoffs(Relation rel, const VacuumParams *params,
 		cutoffs->SharedFreezePolicySample = sample;
 		cutoffs->SharedFreezeLimitFull = sample.freeze_limit;
 		cutoffs->FreezeLimit = XidFromFullTransactionId(sample.freeze_limit);
+		if (TransactionIdPrecedes(cutoffs->OldestXmin, cutoffs->FreezeLimit))
+			cutoffs->FreezeLimit = cutoffs->OldestXmin;
 		if (sample.aggressive)
 			return true;
 	} else

@@ -17096,6 +17096,29 @@ UT_TEST(test_production_outer_selected_xmin_writes_before_original_leave)
 	}
 }
 
+UT_TEST(test_production_outer_shared_age_above_native_cutoff_reaches_wal)
+{
+	for (unsigned batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+		production_xmin_owner_setup(&f, &v, targets, batch != 0);
+		v.cutoffs.OldestXmin = v.cutoffs.FreezeLimit = 50;
+		/* This fixture's creator is raw 77 in the same epoch, above 50. */
+		UT_ASSERT(HeapTupleHeaderGetRawXmin(freeze_tuple(current_page.data, 1))
+			> v.cutoffs.FreezeLimit);
+		UT_ASSERT(FullTransactionIdEquals(v.cutoffs.SharedFreezeLimitFull, f.policy.freeze_limit));
+		UT_ASSERT_EQ(proof_owner_collect(&v, 1), CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED);
+		UT_ASSERT_EQ(v.cutoffs.OldestXmin, 50); UT_ASSERT_EQ(v.cutoffs.FreezeLimit, 50);
+		UT_ASSERT_EQ(v.shared_freeze_changed_pages, 1);
+		UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1); UT_ASSERT_EQ(edges, 1);
+		UT_ASSERT_EQ(recent_pin_calls, 1); UT_ASSERT_EQ(recent_unpins, 1);
+		for (unsigned row = 1; row <= (batch ? 3 : 1); row++)
+			UT_ASSERT(HeapTupleHeaderXminFrozen(freeze_tuple(current_page.data, row)));
+		UT_ASSERT(memcmp(ClusterPageGetItlSlots(current_page.data),
+			ClusterPageGetItlSlots(before_page.data), CLUSTER_ITL_ARRAY_SIZE) == 0);
+		production_xmin_owner_assert_released(&v);
+	}
+}
+
 UT_TEST(test_production_outer_mixed_keep_writes_only_exact_selected_xmin)
 {
 	QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
@@ -17171,8 +17194,9 @@ UT_TEST(test_production_outer_native_errors_unwind_pin_before_original_leave)
 int
 main(void)
 {
-	UT_PLAN(365);
+	UT_PLAN(366);
 
+	UT_RUN(test_production_outer_shared_age_above_native_cutoff_reaches_wal);
 	UT_RUN(test_pin_free_admitted_phase_reaches_recent_native_wal_before_owner_leave);
 	UT_RUN(test_pin_free_phase_recent_refusal_retires_only_its_original_owner);
 	UT_RUN(test_pin_free_phase_recent_errors_unwind_pin_before_original_owner_leave);
