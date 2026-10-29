@@ -11978,6 +11978,7 @@ test_cluster_recovery_merge_seal test_cluster_recovery_merge_complete: %: %.c un
 		$(top_srcdir)/src/backend/cluster/cluster_control_root_private.h \
 		test_cluster_recovery_duty_compare.inc \
 		test_cluster_recovery_merge_seal_boundary.h test_cluster_recovery_merge_cold_fixture.h \
+		test_cluster_recovery_merge_deadline.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_duty.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_worker.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_merge.c \

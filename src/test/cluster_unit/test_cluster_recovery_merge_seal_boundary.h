@@ -52,6 +52,7 @@ char *cluster_wal_threads_dir = "/fixture/wal";
 char *cluster_shared_data_dir = "/fixture/data";
 int cluster_shared_storage_backend = CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS;
 int cluster_external_fence_acquire_timeout_ms = 5000;
+int cluster_recovery_merge_wait_timeout = 10000;
 int cluster_cssd_heartbeat_interval_ms = 1000;
 int cluster_cssd_dead_deadband_factor = 3;
 int cluster_node_id = 0;
@@ -122,6 +123,10 @@ static char formation_obj[NODES + 1];
 static char needs_obj[NODES + 1];
 static char admissions_obj[NODES + 1];
 static char pin_obj;
+static bool deadline_serial_leaf;
+static int deadline_formation_budget[NODES + 1];
+static int deadline_admission_budget[NODES + 1];
+static int deadline_ir_budget, deadline_ir_release_budget;
 
 /* ---- ereport capture ---- */
 static jmp_buf fatal_jump;
@@ -445,6 +450,10 @@ cluster_control_root_recovery_source_v1(const ClusterControlRootSnapshot *expect
 	uint16 tid = expected->identity.origin_thread_id;
 
 	UT_ASSERT(tid > 1 && tid <= NODES);
+#ifdef TEST_MERGE_DEADLINE
+	if (deadline_source_hook != NULL)
+		deadline_source_hook();
+#endif
 	source_calls[tid]++;
 	memset(out, 0, sizeof(*out));
 	*native_redo = InvalidXLogRecPtr;
@@ -587,6 +596,7 @@ cluster_formation_witness_build_recovery_control_wait(uint16 origin_thread,
 													ClusterFormationWitnessV1 **out)
 {
 	UT_ASSERT(cluster_shared_config);
+	deadline_formation_budget[origin_thread] = timeout_ms;
 	UT_ASSERT(origin_thread > 1 && origin_thread <= NODES);
 	cold_formations_built++;
 	formations_built++;
@@ -670,6 +680,7 @@ cluster_external_fence_admit_set_wait(const PgracExternalFenceNeedSetV1 *needs,
 
 	UT_ASSERT_EQ(fence_thread(formation, formation_obj), tid);
 	event("admit:%u;", (unsigned)tid);
+	deadline_admission_budget[tid] = timeout_ms;
 	*out = (PgracExternalFenceAdmissionSetV1 *)&admissions_obj[tid];
 	return PGRAC_EXTERNAL_FENCE_WRITE_EXCLUDED;
 }
@@ -844,6 +855,19 @@ cluster_recovery_serial_acquire_set(
 	ClusterRecoverySerialGuardSet *set pg_attribute_unused(),
 	uint16 *failed_index pg_attribute_unused())
 {
+	if (deadline_serial_leaf) {
+		deadline_ir_budget = overall_acquire_timeout_ms;
+		deadline_ir_release_budget = requests[0].release_timeout_ms;
+		memset(set, 0, sizeof(*set));
+		set->count = count;
+		set->release_timeout_ms = requests[0].release_timeout_ms;
+		for (uint16 i = 0; i < count; i++) {
+			UT_ASSERT_EQ(requests[i].acquire_timeout_ms, overall_acquire_timeout_ms);
+			set->guards[i].held = true;
+		}
+		*failed_index = CLUSTER_RECOVERY_SERIAL_SET_FAILED_NONE;
+		return CLUSTER_RECOVERY_SERIAL_GRANTED;
+	}
 	UNREACHED();
 }
 
@@ -858,6 +882,8 @@ cluster_thread_recovery_pin_request_build_v1(
 	ClusterWalRetentionInterval *interval pg_attribute_unused(),
 	ClusterWalRetentionPinThreadRequest *out pg_attribute_unused())
 {
+	if (deadline_serial_leaf)
+		return true;
 	UNREACHED();
 }
 
@@ -866,6 +892,10 @@ cluster_wal_retention_pin_acquire(
 	const ClusterWalRetentionPinThreadRequest *requests pg_attribute_unused(),
 	uint16 nthreads pg_attribute_unused(), ClusterWalRetentionPin **out_pin pg_attribute_unused())
 {
+	if (deadline_serial_leaf) {
+		*out_pin = (ClusterWalRetentionPin *)&pin_obj;
+		return CLUSTER_WAL_PIN_OK;
+	}
 	UNREACHED();
 }
 
@@ -889,6 +919,8 @@ ClusterWalPinResult
 cluster_wal_retention_pin_bind_set(ClusterWalRetentionPin *pin pg_attribute_unused(),
 								   ClusterRecoverySerialGuardSet *held_set pg_attribute_unused())
 {
+	if (deadline_serial_leaf)
+		return CLUSTER_WAL_PIN_OK;
 	UNREACHED();
 }
 

@@ -33,6 +33,29 @@
 #include <setjmp.h>
 #include <stdarg.h>
 #include <stdlib.h>
+#include <time.h>
+
+static int64 deadline_clock_ns = INT64CONST(1000000000);
+static int64 deadline_clock_step_ns;
+static bool deadline_clock_failed;
+static unsigned deadline_monotonic_reads;
+static void (*deadline_source_hook)(void);
+
+static int
+deadline_clock_gettime(clockid_t clock, struct timespec *out)
+{
+	if (clock == CLOCK_MONOTONIC) {
+		deadline_monotonic_reads++;
+		if (deadline_clock_failed) {
+			errno = EIO;
+			return -1;
+		}
+	}
+	out->tv_sec = deadline_clock_ns / INT64CONST(1000000000);
+	out->tv_nsec = deadline_clock_ns % INT64CONST(1000000000);
+	deadline_clock_ns += deadline_clock_step_ns;
+	return 0;
+}
 
 /* Every ereport of the module lands in the fixture; ERROR and above jump
  * back to the test (see the boundary). */
@@ -47,7 +70,10 @@ static void test_ereport_end(void);
 		test_ereport_end();                                                                        \
 	} while (0)
 
+#define clock_gettime deadline_clock_gettime
+#define TEST_MERGE_DEADLINE 1
 #include "../../backend/cluster/cluster_recovery_merge.c"
+#undef clock_gettime
 
 #include "unit_test.h"
 
@@ -596,10 +622,12 @@ UT_TEST(test_commit_refusal_retains_exact_field_and_first_result)
 	UT_ASSERT_EQ(strlen(cluster_recovery_merge_fence_plan_refusal_v1(NULL)), 0);
 }
 
+#include "test_cluster_recovery_merge_deadline.h"
+
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(23);
 	UT_RUN(test_commit_refusal_retains_exact_field_and_first_result);
 	UT_RUN(test_commit_trace_identifies_original_snapshot_refusal_without_committing);
 	UT_RUN(test_pre2_need_set_refusal_reports_original_provider_predicate);
@@ -615,6 +643,14 @@ main(void)
 	UT_RUN(test_projection_defers_unsealed_inputs);
 	UT_RUN(test_sealed_input_is_proven);
 	UT_RUN(test_unsafe_history_refused_before_seal);
+	UT_RUN(test_cold_deadline_never_resnapshots_after_preflight);
+	UT_RUN(test_cold_deadline_zero_keeps_one_complete_attempt);
+	UT_RUN(test_cold_deadline_first_projection_runs_before_expiry_refusal);
+	UT_RUN(test_cold_deadline_post_seal_projection_cannot_renew_budget);
+	UT_RUN(test_cold_deadline_bounds_waitable_owner_budgets);
+	UT_RUN(test_cold_deadline_ir_acquire_keeps_independent_release_budget);
+	UT_RUN(test_cold_deadline_commit_rechecks_after_projection);
+	UT_RUN(test_cold_deadline_clock_failure_is_explicit_refusal);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
