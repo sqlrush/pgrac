@@ -1017,10 +1017,17 @@ ProcessInterrupts(void)
 #include "test_cluster_relmap_census_committed_cold.inc"
 #include "test_cluster_relmap_census_episode.inc"
 #include "test_cluster_relmap_census_native_episode.inc"
+#include "test_cluster_relmap_census_native_root.inc"
 
 int
 main(void)
 {
+	if (getenv("PGRAC_CENSUS_NATIVE_ROOT_FOCUS") != NULL) {
+		UT_PLAN(5);
+		census_native_root_run();
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
 	if (getenv("PGRAC_CENSUS_NATIVE_EPISODE_FOCUS") != NULL) {
 		UT_PLAN(6);
 		census_native_episode_run();
@@ -1033,7 +1040,8 @@ main(void)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(130);
+	UT_PLAN(135);
+	census_native_root_run();
 	census_native_episode_run();
 	census_episode_run();
 	UT_RUN(test_retained_batch_prepare_keeps_unselected_and_unused_original_pins);

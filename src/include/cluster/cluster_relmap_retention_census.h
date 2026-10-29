@@ -93,6 +93,26 @@ extern ClusterRelmapCensusResult cluster_relmap_retention_census_begin_native_ep
 	const struct ClusterRecoveryRelmapSourceV1 *source, ClusterRecoveryRootSet *roots,
 	size_t memory_budget, ClusterRelmapRetentionCensus **out);
 
+/* Same original episode/native-input producer, without caller-supplied ROOT.
+ * Borrow the SAME original scope's namespace descriptor, enumerate EVERY
+ * retained WAL target through its cold census, then run the original complete
+ * two-pass physical ROOT before begin_native_episode. Cold census order is
+ * matched by full source generation, not selected/replay indexes. Retain all
+ * original source/current/IR-WALR checks around I/O and verify the same original
+ * namespace after producer I/O. Missing/unknown/non-file effects remain owner
+ * obligations; enumeration is not discharge or ROOT/isolation authority.
+ *
+ * Success owns its local ROOT/directories/cursor, NEVER the borrowed fd or
+ * original scope/protections. Destroy before that original scope/ResourceOwner
+ * on EVERY exit. root_budget bounds ROOT, payload_budget each original target
+ * decode, memory_budget peak local source snapshots/directories/cursor.
+ * All preconditions/unsupported shapes/fresh-output/error contracts and native
+ * qualification limits above remain. No apply, new owner/acquire/release/live
+ * caller, independent success setter, COMPLETE or OPEN authority. */
+extern ClusterRelmapCensusResult cluster_relmap_retention_census_open_native_episode(
+	const struct ClusterRecoveryRelmapSourceV1 *source, size_t root_budget,
+	size_t memory_budget, size_t payload_budget, ClusterRelmapRetentionCensus **out);
+
 /* Initial single-origin census from the original execution checkpoint/WAL
  * producer, without caller-filled directory bounds. Borrow the original
  * isolated OBSERVED ROOT, never a configured path. The caller still qualifies
