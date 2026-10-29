@@ -177,7 +177,7 @@ extern void cluster_visibility_resolve_scratch_scn(Page page, uint8 slot_index,
 												   ClusterVisResolve *out);
 
 /* FULL scratch with an exact tuple target and original retained read scope.
- * Own-child INSERT/UPDATE/DELETE heads require operation proof before SELF CIDs. */
+ * Own-child tuple operations require exact retained proof before SELF CIDs. */
 extern void cluster_visibility_resolve_scratch_tuple_scn(Page page, HeapTuple tuple,
 														 const BufferTag *tag, uint8 slot_index,
 														 ClusterVisXidKind which, SCN read_scn,

@@ -4,8 +4,12 @@
  */
 #include "postgres.h"
 #include "cluster/cluster_scn.h"
+#include "cluster/cluster_undo_record.h"
 extern bool cluster_undo_horizon_read_admission_enforce(SCN read_scn);
 int scratch_fixture_main(void);
+extern NodeId self_unused_origin(UBA address);
+extern ClusterTxOutcome self_unused_exact(const ClusterTxLocator *, ClusterTxResolveMode,
+	ClusterTxResolution *, ClusterTxResolveReason *);
 #define main scratch_fixture_main
 #define GetTopFullTransactionIdIfAny self_unused_top_full
 #define cluster_tx_resolve_operation_head self_unused_operation_head
@@ -40,6 +44,31 @@ static bool self_current;
 static bool self_child;
 static int self_update_layout;
 static int self_update_defect;
+enum SelfHistoryDefect {
+	SELF_HISTORY_OK,
+	SELF_HISTORY_SEQUENCE,
+	SELF_HISTORY_TOP_ERA,
+	SELF_HISTORY_GENERATION,
+	SELF_HISTORY_DISCARDED,
+	SELF_HISTORY_WRITER_ERA,
+	SELF_HISTORY_CID,
+	SELF_HISTORY_PRIOR_SELF,
+	SELF_HISTORY_PRIOR_FOREIGN,
+	SELF_HISTORY_PRIOR_TT,
+	SELF_HISTORY_PRIOR_OWNER,
+	SELF_HISTORY_PRIOR_FREE,
+	SELF_HISTORY_PRIOR_SCN,
+	SELF_HISTORY_OLD_XMIN,
+	SELF_HISTORY_ERROR,
+	SELF_HISTORY_UNKNOWN,
+	SELF_HISTORY_OLD_HOFF
+};
+static int self_history_records;
+static bool self_history_cross_page;
+static enum SelfHistoryDefect self_history_defect;
+static int self_history_expected_calls;
+static PGAlignedBlock self_history_pages[2];
+static ClusterItlSlotData self_history_heads[24];
 static int self_operation_defect;
 static int self_operation_calls;
 static int self_admission_enters;
@@ -327,6 +356,194 @@ self_update_record(char data[BLCKSZ], bool creator)
 														   &decoded_length, &history, &operation));
 }
 
+/* Keep the DATA fixture independent of the roots supplied by the consumer. */
+static void
+self_history_rewrite(char bytes[BLCKSZ], unsigned index, bool creator)
+{
+	UndoRecordHeader *record = (UndoRecordHeader *)(bytes + 256);
+	char *body = (char *)record + sizeof(*record);
+	char *operation_bytes = body + record->payload_length - sizeof(UndoOperationTrailer);
+	UndoOperationTrailer operation;
+	UndoItlHistoryTrailer history;
+	bool last = index + 1 == self_history_records;
+	bool addressed = last || self_history_defect == SELF_HISTORY_OLD_XMIN
+					 || self_history_defect == SELF_HISTORY_OLD_HOFF;
+	bool affected = index == 1;
+
+	memcpy(&operation, operation_bytes, sizeof(operation));
+	memcpy(&history, operation_bytes - sizeof(history), sizeof(history));
+	operation.operation_sequence = self_history_records - index;
+	if (!addressed && index % 2 == 0) {
+		record->xid++;
+		operation.operation_fxid++;
+	} else if (!addressed) {
+		if (creator && record->record_type == UNDO_RECORD_UPDATE) {
+			UndoUpdatePayload update;
+			memcpy(&update, body, sizeof(update));
+			update.new_offset = 3;
+			memcpy(body, &update, sizeof(update));
+		} else
+			record->target_offset = 3;
+	}
+	if (!last) {
+		record->flags &= ~UNDO_REC_FLAG_FIRST_IN_TX;
+		record->prev_uba = self_history_heads[index + 1].undo_segment_head;
+		operation.effect_state = CLUSTER_SAVEPOINT_EFFECT_DISCARDED;
+		for (unsigned i = 0; i < history.count; i++)
+			if (history.entries[i].block == 0)
+				history.entries[i].prior = self_history_heads[index + 1];
+	}
+	if (affected && self_history_defect == SELF_HISTORY_SEQUENCE)
+		operation.operation_sequence++;
+	if (affected && self_history_defect == SELF_HISTORY_TOP_ERA) {
+		operation.canonical_top_fxid += UINT64CONST(1) << 32;
+		operation.operation_fxid += UINT64CONST(1) << 32;
+	}
+	if (affected && self_history_defect == SELF_HISTORY_GENERATION)
+		operation.canonical_segment_generation++;
+	if (last && self_history_defect == SELF_HISTORY_DISCARDED)
+		operation.effect_state = CLUSTER_SAVEPOINT_EFFECT_DISCARDED;
+	if (last && self_history_defect == SELF_HISTORY_WRITER_ERA)
+		operation.operation_fxid += UINT64CONST(1) << 32;
+	if (last && self_history_defect == SELF_HISTORY_CID)
+		operation.command_id++;
+	if (index == 0 && addressed) {
+		uint16 offset;
+		operation.effect_state = CLUSTER_SAVEPOINT_EFFECT_LIVE;
+		if (record->record_type == UNDO_RECORD_UPDATE) {
+			UndoUpdatePayload update;
+			memcpy(&update, body, sizeof(update));
+			offset = update.old_tuple_offset;
+		} else {
+			UndoDeletePayload deleted;
+			memcpy(&deleted, body, sizeof(deleted));
+			offset = deleted.full_tuple_offset;
+		}
+		if (self_history_defect == SELF_HISTORY_OLD_XMIN)
+			HeapTupleHeaderSetXmin((HeapTupleHeader)(body + offset), UT_RAW_XID + 80);
+		if (self_history_defect == SELF_HISTORY_OLD_HOFF)
+			((HeapTupleHeader)(body + offset))->t_hoff = 0;
+	}
+	memcpy(operation_bytes - sizeof(history), &history, sizeof(history));
+	memcpy(operation_bytes, &operation, sizeof(operation));
+}
+
+/* Corrupt a link while retaining a structurally valid record envelope. */
+static void
+self_history_prior_defect(char bytes[BLCKSZ])
+{
+	UndoRecordHeader *record = (UndoRecordHeader *)(bytes + 256);
+	char *tail = (char *)record + sizeof(*record) + record->payload_length
+				 - sizeof(UndoOperationTrailer) - sizeof(UndoItlHistoryTrailer);
+	UndoItlHistoryTrailer history;
+	uint32 segment = self_binding.segment_id;
+	ClusterItlSlotData *prior;
+
+	memcpy(&history, tail, sizeof(history));
+	prior = &history.entries[history.entries[0].block == 0 ? 0 : 1].prior;
+	if (self_history_defect == SELF_HISTORY_PRIOR_SELF)
+		prior->undo_segment_head = self_history_heads[0].undo_segment_head;
+	if (self_history_defect == SELF_HISTORY_PRIOR_FOREIGN)
+		prior->undo_segment_head
+			= uba_encode((UT_PEER_NODE * CLUSTER_UNDO_SEGS_PER_INSTANCE) + 1, 3, 3, 63);
+	if (self_history_defect == SELF_HISTORY_PRIOR_TT)
+		prior->undo_segment_head = uba_encode(segment, 4, 4, 63);
+	if (self_history_defect == SELF_HISTORY_PRIOR_OWNER) {
+		prior->xid++;
+		prior->wrap--;
+	}
+	if (self_history_defect == SELF_HISTORY_PRIOR_FREE) {
+		memset(prior, 0, sizeof(*prior));
+		prior->wrap = 7;
+	}
+	if (self_history_defect == SELF_HISTORY_PRIOR_SCN)
+		prior->write_scn--;
+	memcpy(tail, &history, sizeof(history));
+}
+
+static void
+self_history_store(const char bytes[BLCKSZ], unsigned index)
+{
+	const UndoRecordHeader *record = (const UndoRecordHeader *)(bytes + 256);
+	unsigned page_index = self_history_cross_page && index >= self_history_records / 2;
+	UndoBlockHeader *block = (UndoBlockHeader *)self_history_pages[page_index].data;
+	uint32 segment, number;
+	uint16 slot, row;
+	UndoSlotDirEntry *directory;
+
+	UT_ASSERT(uba_decode_record(self_history_heads[index].undo_segment_head, &segment, &number,
+								&slot, &row));
+	directory = (UndoSlotDirEntry *)(self_history_pages[page_index].data + BLCKSZ
+									 - ((size_t)row + 1) * sizeof(*directory));
+	*directory = (UndoSlotDirEntry){ .record_offset = block->free_offset,
+									 .record_length = sizeof(*record) + record->payload_length,
+									 .record_type = record->record_type,
+									 .flags = record->flags };
+	UT_ASSERT(block->free_offset + directory->record_length
+			  <= BLCKSZ - block->slot_count * sizeof(*directory));
+	memcpy(self_history_pages[page_index].data + block->free_offset, record,
+		   directory->record_length);
+	block->free_offset += directory->record_length;
+}
+
+static void
+self_history_build(bool creator, const BufferTag *tag)
+{
+	ClusterItlSlotData root = ClusterPageGetItlSlots(ut_visibility_page.data)[0];
+	PGAlignedBlock bytes;
+	ClusterTxLocator locator = { 0 };
+
+	UT_ASSERT(self_history_records == 3 || self_history_records == 24);
+	memset(self_history_pages, 0, sizeof(self_history_pages));
+	for (unsigned i = 0; i < 2; i++) {
+		UndoBlockHeader *block = (UndoBlockHeader *)self_history_pages[i].data;
+		block->magic = PGRAC_UNDO_BLOCK_MAGIC;
+		block->block_version = UNDO_BLOCK_VERSION_1;
+		block->slot_count = 65;
+		block->free_offset = 256;
+	}
+	for (unsigned i = 0; i < self_history_records; i++) {
+		unsigned page_index = self_history_cross_page && i >= self_history_records / 2;
+		unsigned row_index = page_index ? i - self_history_records / 2 : i;
+		self_history_heads[i] = root;
+		self_history_heads[i].write_scn -= i;
+		self_history_heads[i].undo_segment_head
+			= uba_encode(self_binding.segment_id, 4 - page_index, 3, 64 - row_index);
+	}
+	for (unsigned i = 0; i < self_history_records; i++) {
+		ClusterSavepointReaderRecord decoded;
+		UndoRecordHeader *record = (UndoRecordHeader *)(bytes.data + 256);
+		locator.xid = root.xid;
+		locator.uba = self_history_heads[i].undo_segment_head;
+		self_operation_record(bytes.data, &locator, &self_history_heads[i], tag, creator);
+		if (self_update_layout != 0)
+			self_update_record(bytes.data, creator);
+		self_history_rewrite(bytes.data, i, creator);
+		if (i == 0)
+			self_history_prior_defect(bytes.data);
+		UT_ASSERT(cluster_undo_record_decode_operation_payload(
+			record, bytes.data + 256 + sizeof(*record), record->payload_length,
+			&decoded.body_length, &decoded.history, &decoded.operation));
+		self_history_store(bytes.data, i);
+	}
+}
+
+static void
+self_history_copy(const ClusterTxLocator *locator, const ClusterItlSlotData *head,
+				  char data[BLCKSZ])
+{
+	unsigned index = self_operation_calls - 1;
+	unsigned page_index = self_history_cross_page && index >= self_history_records / 2;
+	UT_ASSERT(index < self_history_records);
+	UT_ASSERT(
+		cluster_undo_record_uba_equal(locator->uba, self_history_heads[index].undo_segment_head));
+	UT_ASSERT_EQ(locator->xid, self_history_heads[index].xid);
+	UT_ASSERT_EQ(locator->itl_slot_index, 0);
+	UT_ASSERT_EQ(locator->tt_wrap, index == 0 ? TT_WRAP_INVALID : 7);
+	UT_ASSERT_EQ(head->wrap, self_history_heads[index].wrap);
+	memcpy(data, self_history_pages[page_index].data, BLCKSZ);
+}
+
 ClusterTxOutcome
 cluster_runtime_visibility_resolve_operation_head_origin_admitted(
 	const ClusterTxLocator *locator, const ClusterItlSlotData *head, const BufferTag *tag,
@@ -345,16 +562,35 @@ cluster_runtime_visibility_resolve_operation_head_origin_admitted(
 	UT_ASSERT_EQ(mode, CLUSTER_TX_RESOLVE_VISIBILITY);
 	if (self_operation_defect == 18)
 		pg_re_throw();
-	self_operation_record(data, locator, head, tag, (tuple->t_infomask & HEAP_XMAX_INVALID) != 0);
-	if (self_update_layout != 0)
-		self_update_record(data, (tuple->t_infomask & HEAP_XMAX_INVALID) != 0);
+	if (self_history_records != 0) {
+		if (self_operation_calls == 2 && self_history_defect == SELF_HISTORY_ERROR)
+			pg_re_throw();
+		if (self_operation_calls == 2 && self_history_defect == SELF_HISTORY_UNKNOWN)
+			return CLUSTER_TX_UNKNOWN;
+		self_history_copy(locator, head, data);
+	} else {
+		self_operation_record(data, locator, head, tag,
+							  (tuple->t_infomask & HEAP_XMAX_INVALID) != 0);
+		if (self_update_layout != 0)
+			self_update_record(data, (tuple->t_infomask & HEAP_XMAX_INVALID) != 0);
+	}
 	if (!cluster_savepoint_reader_discover_head(head, tag, locator, data, identity))
 		return CLUSTER_TX_UNKNOWN;
 	exact.tt_wrap = identity->canonical.wrap;
 	if (!cluster_savepoint_reader_extract_identity(identity, &exact, data, record.data, &length,
 												   operation))
 		return CLUSTER_TX_UNKNOWN;
-	(void)cluster_tx_resolve_exact(locator, CLUSTER_TX_RESOLVE_VISIBILITY, top, reason);
+	if (self_history_records != 0) {
+		/* The legacy canonical-status fixture only accepts its original root.
+		 * Retain that independent top sample and echo the addressed DATA. */
+		ClusterTxLocator sampled = *locator;
+		sampled.uba = self_history_heads[0].undo_segment_head;
+		sampled.tt_wrap = TT_WRAP_INVALID;
+		(void)cluster_tx_resolve_exact(&sampled, CLUSTER_TX_RESOLVE_VISIBILITY, top, reason);
+		top->locator_echo = *locator;
+		top->locator_echo.tt_wrap = 7;
+	} else
+		(void)cluster_tx_resolve_exact(locator, CLUSTER_TX_RESOLVE_VISIBILITY, top, reason);
 	if (self_operation_defect == 6)
 		top->outcome = CLUSTER_TX_UNKNOWN;
 	if (self_operation_defect == 7)
@@ -538,6 +774,8 @@ self_case(bool creator, bool combo, CommandId curcid, bool peer, int defect, boo
 	context.read_scn = snapshot.read_scn;
 	context.logical_root = tuple.t_self;
 	context.tag.blockNum = 0;
+	if (self_history_records != 0)
+		self_history_build(creator, &context.tag);
 	memcpy(before.data, ut_visibility_page.data, BLCKSZ);
 	ut_error_armed = true;
 	PG_TRY();
@@ -553,9 +791,16 @@ self_case(bool creator, bool combo, CommandId curcid, bool peer, int defect, boo
 	UT_ASSERT_EQ(caught, expected_error);
 	if (!caught)
 		UT_ASSERT_EQ(visible, expected_visible);
-	if ((peer || expected_error) && !(self_child && self_operation_defect == 5))
+	if ((peer || expected_error) && !(self_child && self_operation_defect == 5)
+		&& self_history_defect != SELF_HISTORY_CID)
 		UT_ASSERT_EQ(self_cid_calls, 0);
-	if (self_child) {
+	if (self_history_records != 0) {
+		UT_ASSERT_EQ(self_operation_calls, self_history_expected_calls);
+		UT_ASSERT_EQ(self_admission_enters, self_history_expected_calls);
+		UT_ASSERT_EQ(self_admission_leaves, self_history_expected_calls);
+		UT_ASSERT(!self_admission_held);
+		UT_ASSERT_EQ(self_cid_calls, !expected_error || self_history_defect == SELF_HISTORY_CID);
+	} else if (self_child) {
 		bool refused = self_operation_defect >= 15 && self_operation_defect <= 17;
 
 		UT_ASSERT_EQ(self_operation_calls, refused ? 0 : 1);
@@ -707,10 +952,109 @@ UT_TEST(test_own_child_update_command_id_matches_tuple)
 	self_operation_defect = self_update_layout = 0;
 }
 
+static void
+self_history_case(bool creator, CommandId curcid, bool expected_visible, bool expected_error,
+				  int expected_calls)
+{
+	self_child = true;
+	self_history_expected_calls = expected_calls;
+	self_case(creator, false, curcid, false, 0, expected_visible, expected_error);
+	self_child = false;
+}
+
+UT_TEST(test_own_child_history_insert_delete_commands)
+{
+	for (int length = 3; length <= 24; length += 21) {
+		self_history_records = length;
+		for (int cross = 0; cross <= 1; cross++) {
+			self_history_cross_page = cross;
+			self_history_case(true, 2, false, false, length);
+			self_history_case(true, 3, true, false, length);
+			self_history_case(false, 2, true, false, length);
+			self_history_case(false, 3, false, false, length);
+		}
+	}
+	self_history_records = 0;
+	self_history_cross_page = false;
+}
+UT_TEST(test_own_child_history_update_commands)
+{
+	for (int length = 3; length <= 24; length += 21) {
+		self_history_records = length;
+		for (self_update_layout = 1; self_update_layout <= 2; self_update_layout++) {
+			for (int cross = 0; cross <= 1; cross++) {
+				self_history_cross_page = cross;
+				self_history_case(true, 2, false, false, length);
+				self_history_case(true, 3, true, false, length);
+				self_history_case(false, 2, true, false, length);
+				self_history_case(false, 3, false, false, length);
+			}
+		}
+	}
+	self_history_records = self_update_layout = 0;
+	self_history_cross_page = false;
+}
+UT_TEST(test_own_child_history_identity_and_disposition_refusals)
+{
+	self_history_records = 3;
+	for (int cross = 0; cross <= 1; cross++) {
+		self_history_cross_page = cross;
+		for (self_history_defect = SELF_HISTORY_SEQUENCE; self_history_defect <= SELF_HISTORY_CID;
+			 self_history_defect++) {
+			int calls = self_history_defect <= SELF_HISTORY_GENERATION ? 2 : 3;
+			self_history_case(true, 3, false, true, calls);
+			self_history_case(false, 3, false, true, calls);
+		}
+	}
+	self_history_records = 0;
+	self_history_defect = SELF_HISTORY_OK;
+	self_history_cross_page = false;
+}
+UT_TEST(test_own_child_history_prior_refusals)
+{
+	self_history_records = 3;
+	for (int cross = 0; cross <= 1; cross++) {
+		self_history_cross_page = cross;
+		for (self_history_defect = SELF_HISTORY_PRIOR_SELF;
+			 self_history_defect <= SELF_HISTORY_PRIOR_SCN; self_history_defect++) {
+			int calls = self_history_defect == SELF_HISTORY_PRIOR_SCN ? 2 : 1;
+			self_history_case(true, 3, false, true, calls);
+			self_history_case(false, 3, false, true, calls);
+		}
+	}
+	self_history_records = 0;
+	self_history_defect = SELF_HISTORY_OK;
+	self_history_cross_page = false;
+}
+UT_TEST(test_own_child_history_error_unwinds_every_read)
+{
+	self_history_records = 3;
+	for (self_history_defect = SELF_HISTORY_ERROR; self_history_defect <= SELF_HISTORY_UNKNOWN;
+		 self_history_defect++) {
+		self_history_case(true, 3, false, true, 2);
+		self_history_case(false, 3, false, true, 2);
+	}
+	self_history_records = 0;
+	self_history_defect = SELF_HISTORY_OK;
+}
+UT_TEST(test_own_child_history_matching_bad_image_stops)
+{
+	self_history_records = 3;
+	self_history_defect = SELF_HISTORY_OLD_XMIN;
+	self_history_case(false, 3, false, true, 1);
+	self_update_layout = 1;
+	self_history_case(false, 3, false, true, 1);
+	self_history_defect = SELF_HISTORY_OLD_HOFF;
+	self_history_case(false, 3, false, true, 1);
+	self_history_case(true, 3, false, true, 1);
+	self_history_records = self_update_layout = 0;
+	self_history_defect = SELF_HISTORY_OK;
+}
+
 int
 main(void)
 {
-	UT_PLAN(18);
+	UT_PLAN(24);
 	UT_RUN(test_existing_delete_current_command);
 	UT_RUN(test_existing_delete_next_command);
 	UT_RUN(test_update_old_version_next_command);
@@ -729,6 +1073,12 @@ main(void)
 	UT_RUN(test_own_child_update_targets_are_role_specific);
 	UT_RUN(test_own_child_update_old_image_is_checked);
 	UT_RUN(test_own_child_update_command_id_matches_tuple);
+	UT_RUN(test_own_child_history_insert_delete_commands);
+	UT_RUN(test_own_child_history_update_commands);
+	UT_RUN(test_own_child_history_identity_and_disposition_refusals);
+	UT_RUN(test_own_child_history_prior_refusals);
+	UT_RUN(test_own_child_history_error_unwinds_every_read);
+	UT_RUN(test_own_child_history_matching_bad_image_stops);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -1362,6 +1362,54 @@ vis_scratch_operation_target(Page page, HeapTuple tuple, const BufferTag *tag,
 	return false;
 }
 
+/* A matching role must be proved or refused, never skipped as another row. */
+static bool
+vis_scratch_operation_addresses_tuple(HeapTuple tuple, const BufferTag *tag,
+									  ClusterVisXidKind which, TransactionId raw_xid,
+									  const UndoRecordHeader *record)
+{
+	OffsetNumber offset = ItemPointerGetOffsetNumber(&tuple->t_self);
+
+	if (record->xid != raw_xid)
+		return false;
+	if (record->record_type == UNDO_RECORD_UPDATE && which == CLUSTER_VIS_XMIN) {
+		UndoUpdatePayload update;
+		memcpy(&update, (const char *)record + sizeof(*record), sizeof(update));
+		return update.new_block == tag->blockNum && update.new_offset == offset;
+	}
+	return ((which == CLUSTER_VIS_XMIN && record->record_type == UNDO_RECORD_INSERT)
+			|| (which == CLUSTER_VIS_XMAX_UPDATE
+				&& (record->record_type == UNDO_RECORD_UPDATE
+					|| record->record_type == UNDO_RECORD_DELETE)))
+		   && record->target_block == tag->blockNum && record->target_offset == offset;
+}
+
+/* Only a freshly proved page prior can supply the next retained head. */
+static bool
+vis_scratch_operation_prior(const ClusterSavepointReaderRecord *operation, const BufferTag *tag,
+							const UndoRecordHeader *record, ClusterTxLocator *locator,
+							ClusterItlSlotData *head)
+{
+	for (unsigned i = 0; i < operation->history.count; i++) {
+		const UndoItlHistoryEntry *entry = &operation->history.entries[i];
+		const ClusterItlSlotData *prior = &entry->prior;
+		if (entry->block != tag->blockNum || entry->slot_index != locator->itl_slot_index)
+			continue;
+		if (prior->xid != locator->xid
+			|| (prior->flags != ITL_FLAG_ACTIVE && prior->flags != ITL_FLAG_LOCK_ONLY_ACTIVE)
+			|| !cluster_undo_rollback_address_valid(record, prior->undo_segment_head, false)
+			|| cluster_undo_record_uba_equal(prior->undo_segment_head, locator->uba))
+			return false;
+		*head = *prior;
+		locator->uba = prior->undo_segment_head;
+		locator->itl_kind = prior->flags;
+		return true;
+	}
+	return false;
+}
+
+/* Walk retained page history without replaying the FULL result as a WALK page.
+ * Every head is independently qualified before its prior or tuple role is used. */
 static void
 vis_scratch_own_operation(Page page, HeapTuple tuple, const BufferTag *tag, uint8 slot_index,
 						  ClusterVisXidKind which, TransactionId raw_xid,
@@ -1373,10 +1421,12 @@ vis_scratch_own_operation(Page page, HeapTuple tuple, const BufferTag *tag, uint
 	ClusterTxResolution top;
 	ClusterSavepointReaderIdentity identity;
 	ClusterSavepointReaderRecord operation;
+	ClusterItlSlotData head = ClusterPageGetItlSlots(page)[slot_index];
 	ClusterTxResolveReason reason;
 	ClusterTxOutcome outcome;
 	PGAlignedBlock data;
 	size_t length;
+	uint64 sequence = 0;
 	uint64 epoch = cluster_epoch_get_current();
 	uint64 top_value = U64FromFullTransactionId(top_fxid);
 	uint32 delta = raw_xid - XidFromFullTransactionId(top_fxid);
@@ -1385,34 +1435,50 @@ vis_scratch_own_operation(Page page, HeapTuple tuple, const BufferTag *tag, uint
 											&locator, &unused_wait)
 		|| delta == 0 || delta >= (uint32)0x80000000 || top_value > UINT64_MAX - delta)
 		return;
-	cluster_vis_resolve_depth++;
-	PG_TRY();
-	{
-		outcome = cluster_tx_resolve_operation_head(
-			&locator, &ClusterPageGetItlSlots(page)[slot_index], tag, &identity, &top, &operation,
-			data.data, &reason);
+	for (;;) {
+		const UndoRecordHeader *record = (const UndoRecordHeader *)data.data;
+		cluster_vis_resolve_depth++;
+		PG_TRY();
+		{
+			outcome = cluster_tx_resolve_operation_head(&locator, &head, tag, &identity, &top,
+														&operation, data.data, &reason);
+		}
+		PG_FINALLY();
+		{
+			cluster_vis_resolve_depth--;
+		}
+		PG_END_TRY();
+		if (outcome != CLUSTER_TX_IN_PROGRESS
+			|| !vis_scratch_self_proven(ref, &locator, &top, epoch)
+			|| U64FromFullTransactionId(identity.top_fxid) != top_value
+			|| identity.canonical.segment_id != top.local_canonical.segment_id
+			|| identity.canonical.xid != top.local_canonical.xid
+			|| identity.canonical.slot_offset != top.local_canonical.slot_offset
+			|| identity.canonical.wrap != top.local_canonical.wrap
+			|| identity.canonical_generation != top.local_canonical_generation
+			|| (sequence != 0 && identity.operation_sequence >= sequence)
+			|| U64FromFullTransactionId(GetTopFullTransactionIdIfAny()) != top_value
+			|| !cluster_savepoint_reader_extract_identity(&identity, &top.locator_echo, data.data,
+														  data.data, &length, &operation))
+			return;
+		if (vis_scratch_operation_addresses_tuple(tuple, tag, which, raw_xid, record)) {
+			if (U64FromFullTransactionId(identity.operation_fxid) != top_value + delta
+				|| operation.operation.effect_state != CLUSTER_SAVEPOINT_EFFECT_LIVE
+				|| !vis_scratch_operation_target(page, tuple, tag, which, raw_xid, record))
+				return;
+			out->evidence = CLUSTER_VIS_EVIDENCE_REMOTE;
+			out->status = CLUSTER_TT_STATUS_IN_PROGRESS;
+			out->scratch_self = true;
+			out->scratch_operation_cid_valid = true;
+			out->scratch_operation_cid = operation.operation.command_id;
+			out->diagnostic_reason = NULL;
+			return;
+		}
+		sequence = identity.operation_sequence;
+		locator = top.locator_echo;
+		if (!vis_scratch_operation_prior(&operation, tag, record, &locator, &head))
+			return;
 	}
-	PG_FINALLY();
-	{
-		cluster_vis_resolve_depth--;
-	}
-	PG_END_TRY();
-	if (outcome != CLUSTER_TX_IN_PROGRESS || !vis_scratch_self_proven(ref, &locator, &top, epoch)
-		|| U64FromFullTransactionId(identity.top_fxid) != top_value
-		|| U64FromFullTransactionId(identity.operation_fxid) != top_value + delta
-		|| U64FromFullTransactionId(GetTopFullTransactionIdIfAny()) != top_value
-		|| !cluster_savepoint_reader_extract_identity(&identity, &top.locator_echo, data.data,
-													  data.data, &length, &operation)
-		|| operation.operation.effect_state != CLUSTER_SAVEPOINT_EFFECT_LIVE
-		|| !vis_scratch_operation_target(page, tuple, tag, which, raw_xid,
-										 (const UndoRecordHeader *)data.data))
-		return;
-	out->evidence = CLUSTER_VIS_EVIDENCE_REMOTE;
-	out->status = CLUSTER_TT_STATUS_IN_PROGRESS;
-	out->scratch_self = true;
-	out->scratch_operation_cid_valid = true;
-	out->scratch_operation_cid = operation.operation.command_id;
-	out->diagnostic_reason = NULL;
 }
 
 void
