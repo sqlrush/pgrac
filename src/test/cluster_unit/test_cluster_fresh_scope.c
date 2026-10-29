@@ -368,6 +368,9 @@ cluster_tt_local_prepare_canonical_active(TransactionId xid, ClusterCanonicalTxn
 	return true;
 }
 
+static bool tablespace_move_scope_lookup_active;
+static unsigned tablespace_move_scope_lookups, tablespace_move_scope_bad_lookup;
+static List *tablespace_move_scope_expected_roles;
 static bool tablespace_rename_lookup_active, tablespace_rename_expect_binding;
 static unsigned tablespace_rename_lookups, tablespace_rename_unbound, tablespace_rename_bad_lookup;
 static bool tablespace_create_scope_lookup_active, tablespace_create_scope_superuser_denied;
@@ -13418,6 +13421,12 @@ static List reassign_role_list;
 List *
 roleSpecsToIds(List *memberNames)
 {
+	if (tablespace_move_scope_lookup_active) {
+		tablespace_move_scope_lookups++;
+		if (memberNames != tablespace_move_scope_expected_roles)
+			tablespace_move_scope_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before the real helper and its role queries. */
+	}
 	if (reassign_lookup_active) {
 		reassign_lookups++;
 		if (reassign_expect_binding && utility_binds == 0)
@@ -20979,10 +20988,176 @@ UT_TEST(test_native_tablespace_rename_utility_warm_guards_preserve_binding)
 	tablespace_rename_lookup_active = false;
 }
 
+/* The first role lookup is an initializer in the original native prefix.
+ * Both initializer and explicit-assignment forms are extracted verbatim. */
+#include "test_cluster_fresh_tablespace_move_scope.inc"
+static AlterTableMoveAllStmt native_tablespace_move_scope_statement;
+static RoleSpec tablespace_move_scope_role;
+static ListCell tablespace_move_scope_role_cell;
+static List tablespace_move_scope_role_list;
+static RangeVar tablespace_move_scope_warm_relation;
+static AlterObjectSchemaStmt tablespace_move_scope_warm_statement;
+
+static void
+reset_native_tablespace_move_scope(unsigned form)
+{
+	static const ObjectType kinds[] = { OBJECT_TABLE, OBJECT_INDEX, OBJECT_MATVIEW };
+
+	reset_create_preflight();
+	tablespace_move_scope_lookup_active = true;
+	tablespace_move_scope_lookups = tablespace_move_scope_bad_lookup = 0;
+	tablespace_move_scope_role = (RoleSpec){ .type = T_RoleSpec,
+											 .roletype = ROLESPEC_CSTRING,
+											 .rolename = "tablespace_move_owner",
+											 .location = -1 };
+	tablespace_move_scope_role_cell = (ListCell){ .ptr_value = &tablespace_move_scope_role };
+	tablespace_move_scope_role_list = (List){ .type = T_List,
+											  .length = 1,
+											  .max_length = 1,
+											  .elements = &tablespace_move_scope_role_cell };
+	native_tablespace_move_scope_statement
+		= (AlterTableMoveAllStmt){ .type = T_AlterTableMoveAllStmt,
+								   .orig_tablespacename = "old_move_space",
+								   .objtype = kinds[form / 4],
+								   .roles
+								   = (form & 1) != 0 ? &tablespace_move_scope_role_list : NIL,
+								   .new_tablespacename = "new_move_space",
+								   .nowait = (form & 2) != 0 };
+	tablespace_move_scope_expected_roles = native_tablespace_move_scope_statement.roles;
+	tablespace_move_scope_warm_relation
+		= (RangeVar){ .type = T_RangeVar, .relname = "supported_warm_table" };
+	tablespace_move_scope_warm_statement
+		= (AlterObjectSchemaStmt){ .type = T_AlterObjectSchemaStmt,
+								   .objectType = OBJECT_TABLE,
+								   .relation = &tablespace_move_scope_warm_relation,
+								   .newschema = "supported_warm_destination",
+								   .missing_ok = false };
+}
+
+static void
+native_tablespace_move_scope_entry(void)
+{
+	(void)AlterTableMoveAll(&native_tablespace_move_scope_statement);
+}
+
+static void
+assert_native_tablespace_move_scope_result(bool blocked, int caught)
+{
+	UT_ASSERT_EQ(caught, blocked ? 1 : 2);
+	UT_ASSERT_EQ(error_code, blocked ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+	if (blocked) {
+		UT_ASSERT_STR_EQ(error_message,
+						 "ALTER TABLE SET TABLESPACE is not supported in shared mode");
+		UT_ASSERT_STR_EQ(error_detail,
+						 "PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+	}
+	UT_ASSERT_EQ(tablespace_move_scope_lookups, blocked ? 0 : 1);
+	UT_ASSERT_EQ(tablespace_move_scope_bad_lookup, 0);
+}
+
+UT_TEST(test_native_tablespace_move_scope_matches_utility_before_role_lookup)
+{
+	for (unsigned form = 0; form < 12; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool blocked = (mode & 5) != 0;
+			int caught;
+
+			reset_native_tablespace_move_scope(form);
+			set_native_operator_mode(mode);
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				create_sql_entry((Node *)&native_tablespace_move_scope_statement);
+			UT_ASSERT_EQ(caught, blocked ? 1 : 0);
+			UT_ASSERT_EQ(error_code, blocked ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+			if (blocked) {
+				UT_ASSERT_STR_EQ(error_message,
+								 "ALTER TABLE SET TABLESPACE is not supported in shared mode");
+				UT_ASSERT_STR_EQ(error_detail,
+								 "PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+			}
+			UT_ASSERT_EQ(
+				tablespace_move_scope_lookups + utility_xids + utility_prepares + utility_binds, 0);
+			reset_error();
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_tablespace_move_scope_entry();
+			assert_native_tablespace_move_scope_result(blocked, caught);
+			UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			UT_ASSERT_EQ(utility_top_xid, InvalidTransactionId);
+		}
+	}
+	tablespace_move_scope_lookup_active = false;
+}
+
+UT_TEST(test_native_tablespace_move_scope_precedes_context_child_top_and_publication)
+{
+	for (unsigned form = 0; form < 12; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			for (unsigned fault = 0; fault < 7; fault++) {
+				int caught;
+
+				reset_native_tablespace_move_scope(form);
+				set_native_operator_mode(mode);
+				XactReadOnly = fault == 0;
+				utility_parallel = fault == 1;
+				utility_recovery = fault == 2;
+				utility_in_child = fault == 3;
+				if (fault == 4 || fault == 5) {
+					utility_current_xid = 401;
+					utility_top_xid = fault == 4 ? 400 : InvalidTransactionId;
+				}
+				utility_bind_ok = fault != 6;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_tablespace_move_scope_entry();
+				assert_native_tablespace_move_scope_result((mode & 5) != 0, caught);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+				UT_ASSERT_EQ(utility_top_xid, fault == 4 ? 400 : InvalidTransactionId);
+				UT_ASSERT_EQ(utility_current_xid,
+							 fault == 4 || fault == 5 ? 401 : InvalidTransactionId);
+			}
+		}
+	}
+	tablespace_move_scope_lookup_active = false;
+}
+
+UT_TEST(test_native_tablespace_move_scope_preserves_existing_supported_top_binding)
+{
+	for (unsigned form = 0; form < 12; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			for (unsigned fault = 0; fault < 5; fault++) {
+				int caught;
+
+				reset_native_tablespace_move_scope(form);
+				create_sql_entry((Node *)&tablespace_move_scope_warm_statement);
+				UT_ASSERT_EQ(utility_xids, 1);
+				UT_ASSERT_EQ(utility_prepares, 1);
+				UT_ASSERT_EQ(utility_binds, 1);
+				set_native_operator_mode(mode);
+				XactReadOnly = fault == 0;
+				utility_parallel = fault == 1;
+				utility_recovery = fault == 2;
+				utility_in_child = fault == 3;
+				utility_bind_ok = fault != 4;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_tablespace_move_scope_entry();
+				assert_native_tablespace_move_scope_result((mode & 5) != 0, caught);
+				UT_ASSERT_EQ(utility_xids, 1);
+				UT_ASSERT_EQ(utility_prepares, 1);
+				UT_ASSERT_EQ(utility_binds, 1);
+				UT_ASSERT_EQ(utility_top_xid, 400);
+				UT_ASSERT_EQ(utility_current_xid, 400);
+			}
+		}
+	}
+	tablespace_move_scope_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(336);
+	UT_PLAN(339);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -21321,6 +21496,9 @@ main(void)
 	UT_RUN(test_native_tablespace_rename_refuses_before_lookup_on_publication_child_and_top_errors);
 	UT_RUN(test_native_tablespace_rename_context_guards_keep_nonshared_route);
 	UT_RUN(test_native_tablespace_rename_utility_warm_guards_preserve_binding);
+	UT_RUN(test_native_tablespace_move_scope_matches_utility_before_role_lookup);
+	UT_RUN(test_native_tablespace_move_scope_precedes_context_child_top_and_publication);
+	UT_RUN(test_native_tablespace_move_scope_preserves_existing_supported_top_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

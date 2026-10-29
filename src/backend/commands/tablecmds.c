@@ -15394,7 +15394,16 @@ AlterTableMoveAll(AlterTableMoveAllStmt *stmt)
 	HeapTuple	tuple;
 	Oid			orig_tablespaceoid;
 	Oid			new_tablespaceoid;
-	List	   *role_oids = roleSpecsToIds(stmt->roles);
+	List *role_oids;
+
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_config || cluster_shared_catalog)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("ALTER TABLE SET TABLESPACE is not supported in shared mode"),
+						errdetail("PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED")));
+#endif
+
+	role_oids = roleSpecsToIds(stmt->roles);
 
 	/* Ensure we were not asked to move something we can't */
 	if (stmt->objtype != OBJECT_TABLE && stmt->objtype != OBJECT_INDEX &&
