@@ -1827,7 +1827,8 @@ lazy_recheck_shared_freeze_page(LVRelState *vacrel, Buffer recent_buffer,
 		uint64 master_after = 0;
 		SCN page_scn_after = InvalidScn;
 		bool authority_current,
-			admission_current;
+			admission_current,
+			prefer_xmin;
 
 		if (vacrel->shared_freeze_input.writer_context_valid)
 		{
@@ -1896,8 +1897,20 @@ lazy_recheck_shared_freeze_page(LVRelState *vacrel, Buffer recent_buffer,
 				&& cluster_heap_freeze_validate_carrier_cleanout_v1(
 					&vacrel->shared_freeze_batch, proofs, current_fence)
 				== CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
-		if (*row_inputs_current
-			|| (status == CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN && retained_mask != 0))
+		/* Do not consume the original page version with an optional hint
+		 * before its canonical xmin attempt. This only defers cleanout: the
+		 * later F/H, source, writer and final WAL gates still decide apply. */
+		prefer_xmin = *row_inputs_current
+			&& vacrel->versioned && vacrel->shared_maintenance_restricted
+			&& vacrel->shared_freeze_input.writer_context_valid
+			&& proofs->proof_count > 0
+			&& FullTransactionIdIsValid(vacrel->cutoffs.SharedFreezeLimitFull)
+			&& TransactionIdIsNormal(XidFromFullTransactionId(vacrel->cutoffs.SharedFreezeLimitFull))
+			&& U64FromFullTransactionId(vacrel->cutoffs.SharedFreezeLimitFull) != UINT64_MAX
+			&& FullTransactionIdEquals(vacrel->cutoffs.SharedFreezeLimitFull,
+				vacrel->cutoffs.SharedFreezePolicySample.freeze_limit);
+		if (!prefer_xmin && (*row_inputs_current
+			|| (status == CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN && retained_mask != 0)))
 		{
 			hint_scope = true;
 			*cleaned = lazy_cleanout_shared_freeze_page(vacrel, recent_buffer, proofs,

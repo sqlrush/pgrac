@@ -2536,6 +2536,8 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_vacuum_admitted_phase.inc \
 		test_cluster_vacuum_proof_owner.inc \
 		test_cluster_vacuum_resident_recheck.inc \
+		test_cluster_vacuum_freeze_cleanout.inc test_cluster_vacuum_proof_cleanout.inc \
+		$(top_srcdir)/src/include/cluster/cluster_itl_cleanout.h \
 		test_cluster_vacuum_recent_pin.inc \
 		test_cluster_vacuum_resident_release.inc \
 		test_cluster_freeze_writer_context.inc $(CLUSTER_RESOURCE_X_IDENTITY_O) test_cluster_heap_maintenance_policy.inc unit_test.h \
@@ -10649,6 +10651,12 @@ test_cluster_vacuum_admitted_phase.inc: $(top_srcdir)/src/backend/access/heap/va
 # Execute the original outer VACUUM admission owner around the admitted phase.
 test_cluster_vacuum_proof_owner.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
 	awk '/^lazy_collect_shared_freeze_proofs\(/ { print "static ClusterHeapFreezeProofStatusV1"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Original optional cleanout before the resident recheck exports row inputs.
+test_cluster_vacuum_freeze_cleanout.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
+	awk '/^lazy_cleanout_shared_freeze_page\(/ { print "static bool"; emit=1; found++ } \
 	     emit { print } /^}/ { emit=0 } END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 

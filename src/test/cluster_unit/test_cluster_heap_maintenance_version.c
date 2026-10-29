@@ -131,6 +131,8 @@ static bool recent_pin_held;
 static bool phase_pin_released;
 static bool phase_use_original_resident;
 static bool phase_use_original_recent_pin;
+static bool phase_use_original_cleanout;
+static unsigned phase_optional_hint_begins, phase_optional_hint_finishes;
 /* Retain earlier resident observations when the same owner enters native apply. */
 static unsigned phase_prior_lock_activity, phase_prior_authority_activity;
 static unsigned phase_prior_writer_checks, phase_prior_route_checks, phase_prior_authority_checks;
@@ -2341,6 +2343,8 @@ reset(uint8 opcode, bool shared)
 	recent_caller_pins = 0; phase_pin_released = false;
 	phase_use_original_resident = false;
 	phase_use_original_recent_pin = false;
+	phase_use_original_cleanout = false;
+	phase_optional_hint_begins = phase_optional_hint_finishes = 0;
 	phase_prior_lock_activity = phase_prior_authority_activity = 0;
 	phase_prior_writer_checks = phase_prior_route_checks = phase_prior_authority_checks = 0;
 	writer_state = PCM_STATE_X;
@@ -15368,9 +15372,9 @@ UT_TEST(test_real_outer_collector_reuse_refusal_retires_previous_observations)
 }
 
 /* Execute the original resident recheck and all three original paired releases.
- * Recent-buffer mapping/pin counts remain the existing explicit leaf. Hint
- * publication is unavailable here: its false-only provider cannot mutate/WAL.
- * Original hint publication is covered in the independent page-owner cases. */
+ * Recent mapping and physical hint publication remain explicit leaves. The
+ * opt-in cleanout mode executes the full original helper and stamp predicate;
+ * the old mode keeps its false-only provider. */
 #include "test_cluster_vacuum_resident_release.inc"
 static unsigned phase_resident_releases[3], phase_resident_hint_calls;
 static bool phase_resident_hint_error;
@@ -15396,6 +15400,35 @@ phase_resident_release_mutation(Buffer buffer)
 	ClusterUnlockReleaseBufferAfterConditionalMutation(buffer);
 }
 
+#include "cluster/cluster_itl_cleanout.h"
+#include "test_cluster_vacuum_proof_cleanout.inc"
+
+static ClusterSpaceHintResult
+phase_optional_hint_begin(Buffer buffer, RfPageProducerBatchV1 *batch)
+{
+	UT_ASSERT(buffer == 1 && local_x && backend_pin_count == 1);
+	UT_ASSERT(phase_use_original_cleanout && batch != NULL);
+	memset(batch, 0, sizeof(*batch));
+	phase_optional_hint_begins++;
+	return CLUSTER_SPACE_HINT_VERSIONED;
+}
+
+static void
+phase_optional_hint_finish(Buffer buffer, bool standard,
+	const RfPageProducerBatchV1 *batch)
+{
+	UT_ASSERT(buffer == 1 && standard && batch != NULL);
+	UT_ASSERT(local_x && backend_pin_count == 1);
+	phase_optional_hint_finishes++;
+	((PageHeader)current_page.data)->pd_block_scn++;
+}
+
+#define cluster_space_hint_begin phase_optional_hint_begin
+#define cluster_space_hint_finish phase_optional_hint_finish
+#include "test_cluster_vacuum_freeze_cleanout.inc"
+#undef cluster_space_hint_finish
+#undef cluster_space_hint_begin
+
 static bool
 phase_resident_hint_unavailable(LVRelState *v, Buffer buffer,
 	const ClusterHeapFreezeProofBatchV1 *proofs,
@@ -15408,6 +15441,8 @@ phase_resident_hint_unavailable(LVRelState *v, Buffer buffer,
 	UT_ASSERT_EQ(retained_mask, 0);
 	phase_resident_hint_calls++;
 	if (phase_resident_hint_error) elog(ERROR, "injected resident hint preparation ERROR");
+	if (phase_use_original_cleanout)
+		return lazy_cleanout_shared_freeze_page(v, buffer, proofs, retained, retained_mask);
 	return false;
 }
 
@@ -17119,6 +17154,77 @@ UT_TEST(test_production_outer_shared_age_above_native_cutoff_reaches_wal)
 	}
 }
 
+static void
+production_xmin_optional_cleanout_setup(QualifiedXminFixture *f, LVRelState *v,
+	ClusterHeapFreezeXminTargetV1 targets[3], bool batch)
+{
+	production_xmin_owner_setup(f, v, targets, batch);
+	phase_use_original_resident = phase_use_original_cleanout = true;
+	phase_resident_completed = false;
+	phase_resident_expected_resumes = 1;
+	phase_resident_hint_error = false;
+	phase_resident_hint_calls = 0;
+	memset(phase_resident_releases, 0, sizeof(phase_resident_releases));
+	v->identity = space_identity;
+}
+
+UT_TEST(test_production_outer_preserves_xmin_input_before_optional_itl_cleanout)
+{
+	for (unsigned batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+		production_xmin_optional_cleanout_setup(&f, &v, targets, batch != 0);
+		UT_ASSERT_EQ(proof_owner_collect(&v, 1), CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED);
+		UT_ASSERT_EQ(v.shared_freeze_changed_pages, 1);
+		UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1); UT_ASSERT_EQ(edges, 1);
+		UT_ASSERT_EQ(phase_resident_hint_calls, 0);
+		UT_ASSERT_EQ(phase_optional_hint_begins + phase_optional_hint_finishes, 0);
+		UT_ASSERT_EQ(recent_pin_calls, 2); UT_ASSERT_EQ(recent_unpins, 2);
+		for (unsigned row = 1; row <= (batch ? 3 : 1); row++)
+			UT_ASSERT(HeapTupleHeaderXminFrozen(freeze_tuple(current_page.data, row)));
+		UT_ASSERT(memcmp(ClusterPageGetItlSlots(current_page.data),
+			ClusterPageGetItlSlots(before_page.data), CLUSTER_ITL_ARRAY_SIZE) == 0);
+		production_xmin_owner_assert_released(&v);
+	}
+}
+
+UT_TEST(test_production_outer_deferred_hint_does_not_bypass_missing_h)
+{
+	QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+	production_xmin_optional_cleanout_setup(&f, &v, targets, false);
+	/* An installed xmin without a published SCN must keep H unavailable. */
+	sampler_slots[0].xmin = 100;
+	pg_atomic_write_u64(&sampler_slots[0].cluster_read_scn_atomic, InvalidScn);
+	(void)proof_owner_collect(&v, 1);
+	UT_ASSERT_EQ(v.shared_freeze_changed_pages, 0);
+	UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+	UT_ASSERT_EQ(phase_resident_hint_calls, 0);
+	UT_ASSERT_EQ(phase_optional_hint_begins + phase_optional_hint_finishes, 0);
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	production_xmin_owner_assert_released(&v);
+}
+
+UT_TEST(test_production_outer_keeps_cleanout_without_original_writer_or_shared_policy)
+{
+	for (unsigned missing = 0; missing < 2; missing++) {
+		QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+		production_xmin_optional_cleanout_setup(&f, &v, targets, false);
+		if (missing == 0) {
+			v.shared_freeze_input.writer_context_valid = false;
+			phase_resident_expected_resumes = 0;
+		} else v.cutoffs.SharedFreezeLimitFull = InvalidFullTransactionId;
+		(void)proof_owner_collect(&v, 1);
+		UT_ASSERT_EQ(v.shared_freeze_changed_pages, 0);
+		UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+		UT_ASSERT_EQ(phase_resident_hint_calls, 1);
+		UT_ASSERT_EQ(phase_optional_hint_begins, 1);
+		UT_ASSERT_EQ(phase_optional_hint_finishes, 1);
+		UT_ASSERT_EQ(ClusterPageGetItlSlots(current_page.data)[0].flags, ITL_FLAG_COMMITTED);
+		UT_ASSERT_EQ(ClusterPageGetItlSlots(current_page.data)[0].commit_scn, 9);
+		UT_ASSERT(!HeapTupleHeaderXminFrozen(freeze_tuple(current_page.data, 1)));
+		production_xmin_owner_assert_released(&v);
+	}
+}
+
 UT_TEST(test_production_outer_mixed_keep_writes_only_exact_selected_xmin)
 {
 	QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
@@ -17194,9 +17300,12 @@ UT_TEST(test_production_outer_native_errors_unwind_pin_before_original_leave)
 int
 main(void)
 {
-	UT_PLAN(366);
+	UT_PLAN(369);
 
 	UT_RUN(test_production_outer_shared_age_above_native_cutoff_reaches_wal);
+	UT_RUN(test_production_outer_preserves_xmin_input_before_optional_itl_cleanout);
+	UT_RUN(test_production_outer_deferred_hint_does_not_bypass_missing_h);
+	UT_RUN(test_production_outer_keeps_cleanout_without_original_writer_or_shared_policy);
 	UT_RUN(test_pin_free_admitted_phase_reaches_recent_native_wal_before_owner_leave);
 	UT_RUN(test_pin_free_phase_recent_refusal_retires_only_its_original_owner);
 	UT_RUN(test_pin_free_phase_recent_errors_unwind_pin_before_original_owner_leave);
