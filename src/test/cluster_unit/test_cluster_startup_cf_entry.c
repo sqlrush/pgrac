@@ -6399,6 +6399,7 @@ UT_TEST(ordinary_recovery_complete_roles_keep_the_original_cf_wait_policy)
 #include "test_cluster_merge_ir_cf.h"
 #include "test_cluster_cold_input_deadline.h"
 #include "test_cluster_merge_project_cf.h"
+#include "test_cluster_pre_ir_project_cf.h"
 
 int
 main(void)
@@ -6410,6 +6411,19 @@ main(void)
 	pg_atomic_init_u64(&owner_proc.cluster_grd_redeclare_acked_epoch, 0);
 	cluster_control_request_shmem_init();
 	retire_driver = cluster_control_request_driver_start();
+	if (getenv("PGRAC_PRE2_TEST_PRE_IR_REPROOF") != NULL) {
+		UT_PLAN(1);
+		UT_RUN(startup_projection_reproves_cohort_after_the_new_cf_grant);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_PRE_IR_PROJECT") != NULL) {
+		UT_PLAN(2);
+		UT_RUN(startup_initial_projection_restarts_after_exact_cf_completion);
+		UT_RUN(startup_postseal_projection_restarts_without_rewriting_sealed_origins);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_COLD_INPUT_DEADLINE") != NULL) {
 		UT_PLAN(10);
 		UT_RUN(startup_cold_zero_attempt_never_sleeps_for_pending_metadata);
@@ -6567,7 +6581,7 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(170);
+	UT_PLAN(181);
 	UT_RUN(startup_cf_timeout_waits_for_exact_completion_before_begin);
 	UT_RUN(startup_cf_completion_does_not_preserve_changed_native_input);
 	UT_RUN(startup_cf_unsafe_native_context_never_takes_a_registry_lock);
@@ -6738,6 +6752,17 @@ main(void)
 	UT_RUN(startup_cold_exact_cf_ack_before_deadline_can_still_reach_ready);
 	UT_RUN(startup_cold_cf_grant_after_deadline_runs_only_original_cleanup);
 	UT_RUN(startup_cold_original_plan_identity_is_required_before_refresh);
+	UT_RUN(startup_initial_projection_restarts_after_exact_cf_completion);
+	UT_RUN(startup_postseal_projection_restarts_without_rewriting_sealed_origins);
+	UT_RUN(startup_projection_reproves_cohort_after_the_new_cf_grant);
+	UT_RUN(startup_projection_zero_and_original_deadline_do_not_sleep_past_the_budget);
+	UT_RUN(startup_projection_hard_old_untyped_and_ordinary_cf_failures_never_retry);
+	UT_RUN(startup_projection_original_owner_cohort_restart_and_fence_cannot_change);
+	UT_RUN(startup_projection_rejects_pin_ir_or_completed_plan_before_cf);
+	UT_RUN(startup_projection_native_source_cf_slice_restarts_the_complete_projection);
+	UT_RUN(startup_projection_exact_ack_between_polls_has_a_live_continuation);
+	UT_RUN(startup_projection_zero_ready_preserves_one_complete_attempt);
+	UT_RUN(startup_postseal_retry_does_not_repeat_the_original_seal_calls);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

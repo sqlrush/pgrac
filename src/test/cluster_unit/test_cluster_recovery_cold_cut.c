@@ -6,6 +6,7 @@
 #include <stdarg.h>
 #include "access/xlog.h"
 #include "catalog/pg_control.h"
+#include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_recovery_merge.h"
@@ -29,6 +30,27 @@ static ClusterControlRootResult source_result;
 static int source_calls;
 static jmp_buf fatal_jump;
 static char details[4096];
+
+/* This fixture calls only the original direct projection wrapper, which
+ * passes no retry observation. A CF continuation here is out of scope. */
+uint64
+cluster_cf_attempt_sequence(void)
+{
+	abort();
+}
+bool
+cluster_cf_last_attempt_since(uint64 before, ClusterCfAttemptObservation *out)
+{
+	(void)before;
+	(void)out;
+	abort();
+}
+bool
+cluster_cf_attempt_wait_slice(const ClusterCfAttemptObservation *attempt)
+{
+	(void)attempt;
+	abort();
+}
 
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
@@ -84,12 +106,7 @@ cluster_shared_fs_sentinel_has_participant(int node)
 {
 	return node >= 0 && node < 4;
 }
-ClusterRecoveryDutyCompare
-cluster_recovery_duty_key_compare(const ClusterRecoveryDutyKey *a, const ClusterRecoveryDutyKey *b)
-{
-	return memcmp(a, b, sizeof(*a)) == 0 ? CLUSTER_RECOVERY_DUTY_COMPARE_EXACT
-										 : CLUSTER_RECOVERY_DUTY_COMPARE_DIFFERENT;
-}
+#include "test_cluster_recovery_duty_compare.inc"
 ClusterControlRootResult
 cluster_control_root_lookup_owner_by_node_runtime(int32 node, ClusterControlRootIdentity *id,
 												  ClusterControlRootSnapshot *root,

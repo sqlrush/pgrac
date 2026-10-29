@@ -1473,6 +1473,7 @@ test_cluster_startup_cf_entry: test_cluster_startup_cf_entry.c test_cluster_cf_e
 		test_cluster_cold_input_deadline.h \
 		test_cluster_merge_ir_cf.h test_cluster_merge_ir_cf.inc test_cluster_merge_ir_cf_types.inc \
 		test_cluster_merge_project_cf.h test_cluster_merge_project_cf.inc \
+		test_cluster_pre_ir_project_cf.h test_cluster_pre_ir_project_cf.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_ir.c \
 		$(top_srcdir)/src/backend/cluster/cluster_ir_lock.c \
 		test_cluster_startup_cf_entry.inc test_cluster_startup_cf_callsite.inc \
@@ -1509,9 +1510,18 @@ test_cluster_merge_ir_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery
 
 # Original positive canonical projection; its caller phases stay distinct.
 test_cluster_merge_project_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_merge.c Makefile
-	awk '/^cluster_recovery_merge_project_readonly\(/ { print "static ClusterMergeEngage"; emit=1; n++ } \
+	awk '/^(cluster_recovery_merge_project_readonly|recovery_merge_project_attempt)\(/ { print "static ClusterMergeEngage"; emit=1; n++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (n != 1 || emit) exit 1 }' $< > $@.tmp
+	     END { if (n != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_pre_ir_project_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_merge.c Makefile
+	awk '/^recovery_fence_origin_unsealed\(/ { print "static bool"; emit=1; n++ } \
+	     /^(recovery_fence_deadline_require|recovery_fence_plan_seal_inputs)\(/ { print "static void"; emit=1; n++ } \
+	     /^recovery_fence_project_context_current\(/ { print "static bool"; emit=1; n++ } \
+	     /^recovery_fence_project_wait\(/ { print "static ClusterMergeEngage"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (n != 5 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Join both original prepared ROOT consumers and authority checks to CF/CONTROL.
@@ -10590,13 +10600,15 @@ test_cluster_wal_state_rmw: test_cluster_wal_state_rmw.c unit_test.h \
 # Header-only; scn_recovery_cmp stubbed in-test (cluster_scn.o not
 # linked).  Header deps explicit per L229.
 test_cluster_recovery_cold_cut.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_merge.c Makefile
-	awk '/^cluster_recovery_merge_project_readonly\(/ { print prev; emit=1; count++ } \
+	awk '/^(cluster_recovery_merge_project_readonly|recovery_merge_project_attempt)\(/ { print prev; emit=1; count++ } \
 	     emit { print } /^}/ { emit=0 } { prev=$$0 } \
-	     END { if (count != 1) exit 1 }' $< > $@.tmp
+	     END { if (count != 2 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_recovery_cold_cut: test_cluster_recovery_cold_cut.c unit_test.h \
 		test_cluster_recovery_cold_cut.inc \
+		test_cluster_recovery_duty_compare.inc \
+		$(top_srcdir)/src/include/cluster/cluster_cf_enqueue.h \
 		$(top_srcdir)/src/include/cluster/cluster_control_root.h \
 		$(top_srcdir)/src/include/cluster/cluster_wal_source.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@

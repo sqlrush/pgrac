@@ -13,6 +13,9 @@ int cluster_shared_storage_backend = CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS;
 char *cluster_shared_data_dir = "projection-fixture";
 static ClusterRecoveryPlan project_census;
 static unsigned project_sources, project_validations;
+static bool project_multiple;
+static bool project_source_timeout;
+static void (*project_after_source)(void);
 
 static void
 project_blockers_init(StringInfo out)
@@ -56,7 +59,7 @@ project_pool(ClusterRecoveryWorkerPool *out)
 static ClusterRecoveryStreamVerdict
 project_stream(uint16 thread)
 {
-	UT_ASSERT_EQ(thread, 2);
+	UT_ASSERT(thread == 2 || (project_multiple && thread == 3));
 	++project_validations;
 	return CLUSTER_RECOVERY_STREAM_OK;
 }
@@ -64,7 +67,7 @@ project_stream(uint16 thread)
 static bool
 project_participant(int node)
 {
-	UT_ASSERT_EQ(node, 1);
+	UT_ASSERT(node == 1 || (project_multiple && node == 2));
 	return true;
 }
 
@@ -73,11 +76,20 @@ project_source(const ClusterControlRootSnapshot *root, const ClusterControlRootR
 			   ClusterWalSourceRef *out, XLogRecPtr *redo)
 {
 	UT_ASSERT(!cluster_cf_held(ShareLock) && !cluster_cf_held(ExclusiveLock));
-	UT_ASSERT_EQ(root->identity.origin_thread_id, 2);
+	UT_ASSERT(root->identity.origin_thread_id == 2
+			  || (project_multiple && root->identity.origin_thread_id == 3));
 	UT_ASSERT_EQ(root->root_publish_seq, token->root_publish_seq);
 	++project_sources;
+	if (project_source_timeout) {
+		project_source_timeout = false;
+		g_seven_result = CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
+		UT_ASSERT(!claim_actual_cf_lock(ShareLock));
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	}
 	memset(out, 0, sizeof(*out));
 	*redo = 150;
+	if (project_after_source != NULL)
+		project_after_source();
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
@@ -109,6 +121,9 @@ project_fixture(void)
 	project_census.n_crashed_candidate = 1;
 	cluster_recovery_plan_candidate_set(&project_census, 2);
 	project_sources = project_validations = 0;
+	project_multiple = false;
+	project_source_timeout = false;
+	project_after_source = NULL;
 	for (unsigned i = 0; i < 2; ++i) {
 		retention_image.records[i].checkpoint_lower_lsn = 100;
 		retention_image.records[i].validated_tail_lsn_exclusive = 300;

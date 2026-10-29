@@ -69,6 +69,66 @@ uint64 cluster_qvotec_get_self_incarnation(void) { return fence_owner_boot; }
 uint64 cluster_cf_owner_cookie(LOCKMODE mode pg_attribute_unused()) { return 0; }
 
 
+/* These metadata-only TUs never model a pending CF owner. The actual
+ * projection continuation is linked to CF/owner/CONTROL in Startup tests. */
+bool cluster_enabled = true;
+bool cluster_controlfile_shared_authority = true;
+bool InRecovery;
+volatile sig_atomic_t ShutdownRequestPending;
+BackendType MyBackendType = B_INVALID;
+AuxProcType MyAuxProcType = NotAnAuxProcess;
+PGPROC *MyProc;
+LWLockPadded *MainLWLockArray;
+bool
+LWLockHeldByMe(LWLock *lock)
+{
+	(void)lock;
+	abort();
+}
+bool
+cluster_cf_last_attempt_since(uint64 before, ClusterCfAttemptObservation *out)
+{
+	(void)before;
+	(void)out;
+	abort();
+}
+bool
+cluster_cf_attempt_wait_slice(const ClusterCfAttemptObservation *attempt)
+{
+	(void)attempt;
+	abort();
+}
+bool
+cluster_cf_retirement_snapshot(LOCKMODE mode, const void *caller, ClusterCfRetirementSnapshot *out)
+{
+	(void)mode;
+	(void)caller;
+	(void)out;
+	abort();
+}
+bool
+cluster_cf_release_completed(LOCKMODE mode, uint64 cookie)
+{
+	(void)mode;
+	(void)cookie;
+	abort();
+}
+void
+cluster_cf_retirement_poll(void)
+{
+	abort();
+}
+void
+cluster_lock_owners_service_poll(void)
+{
+	abort();
+}
+bool
+cluster_recovery_transport_components_current(void)
+{
+	abort();
+}
+
 /* ---- fixture state ---- */
 static ClusterRecoveryPlan census;
 static ClusterRecoveryWorkerPool pool;

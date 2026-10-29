@@ -147,6 +147,10 @@ typedef struct RecoveryFenceCfContext {
 	bool recovery;
 } RecoveryFenceCfContext;
 
+static ClusterMergeEngage recovery_fence_project_wait(ClusterRecoveryFencePlan *plan,
+													  XLogRecPtr own_redo, uint64 replay[2],
+													  XLogRecPtr *start);
+
 void
 cluster_recovery_merge_window_enter(void)
 {
@@ -1395,14 +1399,17 @@ streaming_stream_advance(ClusterRecoveryMergeState *st, int idx, const XLogRecPt
  * producer below may expose its bitmap to xlogrecovery.
  */
 static ClusterMergeEngage
-cluster_recovery_merge_project_readonly(uint16 own_thread, XLogRecPtr own_redo,
-										uint64 out_bitmap[2], XLogRecPtr *out_start)
+recovery_merge_project_attempt(uint16 own_thread, XLogRecPtr own_redo, uint64 out_bitmap[2],
+							   XLogRecPtr *out_start, ClusterCfAttemptObservation *retry)
 {
 	ClusterRecoveryPlan plan;
 	ClusterRecoveryWorkerPool pool;
 	bool have_pool;
 	uint16 tid;
 	StringInfoData blockers;
+
+	if (retry != NULL)
+		MemSet(retry, 0, sizeof(*retry));
 
 	if (!cluster_merged_recovery)
 		return CLUSTER_MERGE_NO_DISABLED;
@@ -1477,6 +1484,8 @@ cluster_recovery_merge_project_readonly(uint16 own_thread, XLogRecPtr own_redo,
 		ClusterControlRootResult root_result;
 		bool root_ok;
 		bool seal_pending;
+		uint64 before;
+		ClusterCfAttemptObservation attempt;
 
 		if (!is_candidate && tid != own_thread)
 			continue;
@@ -1495,8 +1504,17 @@ cluster_recovery_merge_project_readonly(uint16 own_thread, XLogRecPtr own_redo,
 		 * Author: SqlRush <sqlrush@gmail.com> */
 		MemSet(&root_identity, 0, sizeof(root_identity));
 		MemSet(&root_snapshot, 0, sizeof(root_snapshot));
+		before = retry != NULL ? cluster_cf_attempt_sequence() : 0;
 		root_result = cluster_control_root_lookup_owner_by_node_runtime(
 			(int)tid - 1, &root_identity, &root_snapshot, &root_token);
+		if (retry != NULL && blockers.len == 0
+			&& root_result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE
+			&& cluster_cf_last_attempt_since(before, &attempt) && attempt.mode == ShareLock
+			&& cluster_cf_attempt_wait_slice(&attempt)) {
+			*retry = attempt;
+			pfree(blockers.data);
+			return CLUSTER_MERGE_NO_NO_PLAN;
+		}
 		root_ok = (root_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 				   || root_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 				  && cluster_recovery_duty_key_valid_for_claim(&root_identity, cluster_shared_config)
@@ -1586,8 +1604,17 @@ cluster_recovery_merge_project_readonly(uint16 own_thread, XLogRecPtr own_redo,
 			if (cluster_shared_config) {
 				ClusterWalSourceRef source;
 
+				before = retry != NULL ? cluster_cf_attempt_sequence() : 0;
 				root_result = cluster_control_root_recovery_source_v1(&root_snapshot, &root_token,
 																	  &source, &redo);
+				if (retry != NULL && blockers.len == 0
+					&& root_result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE
+					&& cluster_cf_last_attempt_since(before, &attempt) && attempt.mode == ShareLock
+					&& cluster_cf_attempt_wait_slice(&attempt)) {
+					*retry = attempt;
+					pfree(blockers.data);
+					return CLUSTER_MERGE_NO_NO_PLAN;
+				}
 				if (root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY || redo == 0
 					|| redo < root_snapshot.checkpoint_lower_lsn
 					|| redo > root_snapshot.validated_tail_lsn_exclusive) {
@@ -1614,6 +1641,13 @@ cluster_recovery_merge_project_readonly(uint16 own_thread, XLogRecPtr own_redo,
 									 "recovered).")));
 	pfree(blockers.data);
 	return CLUSTER_MERGE_ENGAGE;
+}
+
+static ClusterMergeEngage
+cluster_recovery_merge_project_readonly(uint16 own_thread, XLogRecPtr own_redo,
+										uint64 out_bitmap[2], XLogRecPtr *out_start)
+{
+	return recovery_merge_project_attempt(own_thread, own_redo, out_bitmap, out_start, NULL);
 }
 
 /*
@@ -1942,7 +1976,7 @@ recovery_fence_plan_seal_inputs(ClusterRecoveryFencePlan *plan, uint16 own_threa
 		memcpy(replay, plan->replay_thread_bitmap, sizeof(replay));
 		memcpy(start, plan->start_lsn, sizeof(start));
 	} else
-		engage = cluster_recovery_merge_project_readonly(own_thread, own_redo, replay, start);
+		engage = recovery_fence_project_wait(plan, own_redo, replay, start);
 	recovery_fence_deadline_require(plan);
 	if (engage == CLUSTER_MERGE_ENGAGE
 		&& memcmp(replay, plan->replay_thread_bitmap, sizeof(replay)) != 0)
@@ -2116,6 +2150,120 @@ refuse:
 					errdetail("PGRAC_FAMILY=STARTUP_CONTROL consumer=cold_inputs reason=%s "
 							  "cookie=" UINT64_FORMAT " request=" UINT64_FORMAT,
 							  reason, attempt->control_owner_id, attempt->request_id)));
+}
+
+/* Reprove the complete original read context after every yielding retry.
+ * This observes no ROOT and grants no CF or replay authority. */
+static bool
+recovery_fence_project_context_current(const ClusterRecoveryFencePlan *plan,
+									   const RecoveryFenceCfContext *context, uint16 own_thread,
+									   const ClusterFormationSnapshotV1 *cohort,
+									   const ClusterWalSourceRef *restart)
+{
+	ClusterFormationSnapshotV1 observed;
+	ClusterWalSourceRef input;
+
+	if (!recovery_fence_plan_valid(plan) || plan->own_thread != own_thread || context->proc == NULL
+		|| context->latch == NULL || context->owner == NULL || context->boot == 0
+		|| context->epoch == 0 || context->generation == 0 || MyProc != context->proc
+		|| MyLatch != context->latch || MyProcPid != context->pid
+		|| CurrentResourceOwner != context->owner || plan->owner != context->owner
+		|| plan->owner_boot != context->boot || plan->sealed || plan->serial_held
+		|| plan->serial_guards.count != 0 || plan->retention_pin != NULL || plan->committed
+		|| MyBackendType != B_STARTUP || !AmStartupProcess() || !cluster_enabled
+		|| !cluster_shared_config || !cluster_controlfile_shared_authority || ShutdownRequestPending
+		|| CritSectionCount != 0 || LWLockHeldByMe(ControlFileLock)
+		|| InRecovery != context->recovery || context->boot != cluster_qvotec_get_self_incarnation()
+		|| context->epoch != cluster_epoch_get_current()
+		|| context->generation != cluster_grd_redeclare_generation()
+		|| !cluster_recovery_transport_components_current()
+		|| !cluster_reconfig_capture_formation_snapshot_v1(own_thread, &observed)
+		|| !cluster_formation_snapshot_matches_v1(cohort, &observed)
+		|| !cluster_wal_thread_restart_v2_ref(&input)
+		|| memcmp(restart, &input, sizeof(input)) != 0)
+		return false;
+	for (uint16 i = 0; i < plan->origin_count; i++) {
+		const ClusterRecoveryFenceOrigin *origin = &plan->origins[i];
+		PgracExternalFenceDenyReason reason;
+
+		if (cluster_formation_witness_revalidate_nowait(origin->formation)
+				!= CLUSTER_FORMATION_WITNESS_READY
+			|| !cluster_external_fence_need_set_revalidate_nowait(origin->needs, origin->formation,
+																  &reason)
+			|| !cluster_external_fence_revalidate_set_nowait(origin->admissions, origin->needs,
+															 origin->formation, &reason))
+			return false;
+	}
+	return true;
+}
+
+/* Initial and post-seal projections precede this plan's pin/IR acquisition.
+ * Only their caller retries a fresh typed CF slice. Keep already published
+ * seals; restart all projection outputs after exact cleanup and reproof.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static ClusterMergeEngage
+recovery_fence_project_wait(ClusterRecoveryFencePlan *plan, XLogRecPtr own_redo, uint64 replay[2],
+							XLogRecPtr *start)
+{
+	ClusterFormationSnapshotV1 cohort;
+	ClusterWalSourceRef restart;
+	RecoveryFenceCfContext context = { .proc = MyProc,
+									   .latch = MyLatch,
+									   .owner = CurrentResourceOwner,
+									   .pid = MyProcPid,
+									   .boot = cluster_qvotec_get_self_incarnation(),
+									   .epoch = cluster_epoch_get_current(),
+									   .generation = cluster_grd_redeclare_generation(),
+									   .recovery = InRecovery };
+	uint16 own_thread;
+	bool wait_allowed;
+	bool waited = false;
+
+	if (!recovery_fence_plan_valid(plan) || plan->sealed || plan->serial_held
+		|| plan->serial_guards.count != 0 || plan->retention_pin != NULL || plan->committed)
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+						errmsg("cold projection has no original pre-IR plan")));
+	own_thread = plan->own_thread;
+	wait_allowed = cluster_shared_config && MyBackendType == B_STARTUP && AmStartupProcess()
+				   && context.owner != NULL && plan->owner == context.owner
+				   && plan->owner_boot == context.boot && !cluster_cf_held(ShareLock)
+				   && !cluster_cf_held(ExclusiveLock)
+				   && cluster_reconfig_capture_formation_snapshot_v1(own_thread, &cohort)
+				   && cohort.startup_formation_generation != 0
+				   && cluster_wal_thread_restart_v2_ref(&restart);
+	for (;;) {
+		ClusterCfAttemptObservation attempt;
+		ClusterMergeEngage engage;
+
+		if (waited
+			&& !recovery_fence_project_context_current(plan, &context, own_thread, &cohort,
+													   &restart))
+			ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+							errmsg("cold projection context changed during its CF retry")));
+		recovery_fence_deadline_require(plan);
+		MemSet(start, 0, sizeof(*start) * (CLUSTER_WAL_STATE_SLOT_COUNT + 1));
+		engage = recovery_merge_project_attempt(own_thread, own_redo, replay, start,
+												wait_allowed ? &attempt : NULL);
+		/* A typed failed acquire still owns its original cleanup debt.
+		 * Let that waiter refuse expiry without releasing unrelated proof
+		 * owners; successful/no-wait projections use the original cleanup. */
+		if (!wait_allowed || !cluster_cf_attempt_wait_slice(&attempt))
+			recovery_fence_deadline_require(plan);
+		if (waited
+			&& !recovery_fence_project_context_current(plan, &context, own_thread, &cohort,
+													   &restart))
+			ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+							errmsg("cold projection context changed after its new CF grant")));
+		if (!wait_allowed || !cluster_cf_attempt_wait_slice(&attempt))
+			return engage;
+		if (!recovery_fence_project_context_current(plan, &context, own_thread, &cohort, &restart))
+			ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+							errmsg("cold projection context changed before its CF wait")));
+		recovery_merge_cold_cf_wait(plan, &attempt, &cohort, &restart, own_thread, context.epoch,
+									context.generation, context.owner, context.boot,
+									context.recovery);
+		waited = true;
+	}
 }
 
 static bool
@@ -2336,8 +2484,8 @@ cluster_recovery_merge_preflight_readonly(uint16 own_thread, XLogRecPtr own_redo
 	if (!cluster_shared_config && recovery_merge_cold_merge_needed(own_thread))
 		engage = CLUSTER_MERGE_REFUSE_UNSHARED;
 	else
-		engage = cluster_recovery_merge_project_readonly(
-			own_thread, own_redo, plan->replay_thread_bitmap, plan->start_lsn);
+		engage = recovery_fence_project_wait(plan, own_redo, plan->replay_thread_bitmap,
+											 plan->start_lsn);
 	recovery_fence_deadline_require(plan);
 	engage = cluster_recovery_merge_profile_gate(engage, cluster_shared_config);
 	if (engage != CLUSTER_MERGE_ENGAGE) {
