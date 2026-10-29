@@ -17861,6 +17861,92 @@ cluster_bufmgr_pcm_own_acquire_settle_disk_exact(BufferDesc *buf,
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	return result;
 }
+
+/* Entry/provider observations stay outside BufHdr/content. An ARMED
+ * episode is deliberately not physical permission, even after IO ended. */
+static bool
+cluster_bufmgr_acquire_resume_native(BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
+	const ResourceXDecodedAcquireIntent *episode, const ClusterSemanticAdmissionToken *admission,
+	const ResourceXDeliveryClaim *execution, const ResourceXDeliveryClaim *current,
+	const ResourceXAcquireReadReceipt *receipt, ResourceOwner owner, bool allow_held)
+{
+	ClusterPcmOwnSnapshot live;
+	bool input = current->purpose == RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING
+		|| (current->purpose == RESOURCE_X_DELIVERY_ACQUIRE_READ_ARMED
+			&& ResourceOwnerHasBufferIO(owner, BufferDescriptorGetBuffer(buf)));
+
+	if (!cluster_bufmgr_acquire_read_context(buf, base, episode, admission, execution, owner, input))
+		return false;
+	if (current->purpose == RESOURCE_X_DELIVERY_ACQUIRE_READ_ARMED)
+		return true; /* Observation only; caller must retain and wait. */
+	if (current->purpose == RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING)
+		return cluster_bufmgr_acquire_prepared_native(buf, base, episode,
+			execution->executor_sequence, CLUSTER_ACQUIRE_PREPARATION_VERIFY, &live);
+	if (cluster_bufmgr_acquire_read_terminal(buf, base, episode, execution, receipt,
+			CLUSTER_ACQUIRE_READ_RELEASED, &live))
+		return true;
+	return allow_held && current->purpose == RESOURCE_X_DELIVERY_ACQUIRE_READ_COMPLETE
+		&& cluster_bufmgr_acquire_read_terminal(buf, base, episode, execution, receipt,
+			CLUSTER_ACQUIRE_READ_HELD, &live);
+}
+
+/* Recover the same original execution after local handoff failed. No
+ * phase is reopened and no new claim/IO is issued. Only the old completion
+ * replay may release phase6's exact leftover hold; later holds stay closed. */
+ResourceXApplyResult
+cluster_bufmgr_pcm_own_acquire_resume_disk_exact(BufferDesc *buf,
+	const ClusterPcmOwnSnapshot *base, const ResourceXDecodedAcquireIntent *episode,
+	const ClusterSemanticAdmissionToken *admission, const ResourceXDeliveryClaim *original,
+	ResourceXDeliveryClaim *execution_out, uint8 *phase_out)
+{
+	ClusterPcmOwnSnapshot entered_base;
+	ResourceXDecodedAcquireIntent entered;
+	ResourceXDeliveryClaim owned, current, latest;
+	ResourceXAcquireReadReceipt receipt, retained;
+	ResourceOwner owner = CurrentResourceOwner;
+	ResourceXApplyResult result;
+
+	if (buf == NULL || base == NULL || episode == NULL || admission == NULL
+		|| original == NULL || execution_out == NULL || phase_out == NULL || ClusterPcmOwnArray == NULL)
+		return RESOURCE_X_APPLY_INVALID;
+	if (LWLockHeldByMe(BufferDescriptorGetContentLock(buf)))
+		return RESOURCE_X_APPLY_BAD_STATE;
+	entered_base = *base;
+	entered = *episode;
+	owned = *original;
+	if (entered_base.flags != 0 || entered_base.reservation_token >= UINT64_MAX - 1
+		|| entered.reservation_token != entered_base.reservation_token + 1)
+		return RESOURCE_X_APPLY_BAD_STATE;
+	result = cluster_pcm_lock_resource_x_requester_acquire_read_resume_exact(
+		&owned, &entered, &current, &receipt);
+	if (result != RESOURCE_X_APPLY_APPLIED)
+		return result;
+	owned.purpose = RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING;
+	if (!cluster_bufmgr_acquire_resume_native(buf, &entered_base, &entered, admission,
+			&owned, &current, &receipt, owner, true))
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (current.purpose == RESOURCE_X_DELIVERY_ACQUIRE_READ_ARMED)
+		return RESOURCE_X_APPLY_LOCAL_WAIT;
+	if (current.purpose >= RESOURCE_X_DELIVERY_ACQUIRE_READ_COMPLETE
+		&& cluster_bufmgr_pcm_own_acquire_complete_disk_exact(buf, &entered_base, &entered,
+			admission, &owned) != RESOURCE_X_APPLY_DUPLICATE)
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (!cluster_bufmgr_acquire_resume_native(buf, &entered_base, &entered, admission,
+			&owned, &current, &receipt, owner, false))
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	result = cluster_pcm_lock_resource_x_requester_acquire_read_resume_exact(
+		&owned, &entered, &latest, &retained);
+	if (result != RESOURCE_X_APPLY_APPLIED)
+		return result;
+	if (latest.purpose < current.purpose || memcmp(&receipt, &retained, sizeof(receipt)) != 0)
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (current.purpose == RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING && latest.purpose != current.purpose)
+		return RESOURCE_X_APPLY_LOCAL_WAIT;
+	*execution_out = owned;
+	*phase_out = latest.purpose;
+	return latest.purpose == RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING
+		? RESOURCE_X_APPLY_APPLIED : RESOURCE_X_APPLY_DUPLICATE;
+}
 /* End original disk completion DONE. */
 #endif
 

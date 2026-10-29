@@ -1103,4 +1103,13 @@ extern ResourceXApplyResult cluster_bufmgr_pcm_own_acquire_execute_begin_exact(
 	ResourceXDecodedFrame *grant_out, ResourceXDecodedFrame *image_out,
 	ResourceXRequesterJoinSnapshot *out, ResourceXDeliveryClaim *execution_out);
 
+/* Same-E disk/S recovery, not a new executor or installed-byte grant.
+ * APPLIED restores EXECUTING; DUPLICATE proves original C already complete.
+ * ARMED returns LOCAL_WAIT without output, reread or native mutation. */
+extern ResourceXApplyResult cluster_bufmgr_pcm_own_acquire_resume_disk_exact(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
+	const ResourceXDecodedAcquireIntent *episode,
+	const struct ClusterSemanticAdmissionToken *admission, const ResourceXDeliveryClaim *original,
+	ResourceXDeliveryClaim *execution_out, uint8 *phase_out);
+
 #endif /* CLUSTER_PCM_X_BUFMGR_H */

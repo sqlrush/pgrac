@@ -2854,6 +2854,11 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_execut
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_read_owner_exact(
 	const ResourceXDeliveryClaim *execution, const ResourceXDecodedAcquireIntent *episode,
 	ResourceXDeliveryClaim *current_out, ResourceXAcquireReadReceipt *receipt_out);
+/* Restore only the same original capability after execution handoff. This
+ * observes its retained phase; it does not claim or complete native work. */
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_read_resume_exact(
+	const ResourceXDeliveryClaim *original, const ResourceXDecodedAcquireIntent *episode,
+	ResourceXDeliveryClaim *current_out, ResourceXAcquireReadReceipt *receipt_out);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_read_arm_exact(
 	const ResourceXDeliveryClaim *execution, const ResourceXDecodedAcquireIntent *episode,
 	const ResourceXAcquireReadReceipt *receipt);

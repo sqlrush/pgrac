@@ -29445,6 +29445,47 @@ cluster_pcm_lock_resource_x_requester_acquire_read_owner_exact(
 	return result;
 }
 
+/* A lost local begin output must not cause a second claim or REQUEST.
+ * Normalize only its original pre-C capability; the retained owner still
+ * validates full E/A/I, executor, target, floors and domain independently. */
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_requester_acquire_read_resume_exact(
+	const ResourceXDeliveryClaim *original, const ResourceXDecodedAcquireIntent *episode,
+	ResourceXDeliveryClaim *current_out, ResourceXAcquireReadReceipt *receipt_out)
+{
+	ResourceXDeliveryClaim execution, current;
+	ResourceXAcquireReadReceipt receipt;
+	const ResourceXInstallClaimJoinObservation *observed;
+	ResourceXApplyResult result;
+
+	if (!pcm_resource_x_acquire_read_input(original, episode) || current_out == NULL || receipt_out == NULL
+		|| (original->purpose != RESOURCE_X_DELIVERY_ACQUIRE_PREPARED
+			&& original->purpose != RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING)
+		|| original->observation.master_node < 0
+		|| original->observation.master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+		|| original->observation.master_ingress_connection_generation == 0
+		|| original->observation.master_ingress_connection_generation == UINT32_MAX)
+		return RESOURCE_X_APPLY_INVALID;
+	execution = *original;
+	execution.purpose = RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING;
+	observed = &execution.observation;
+	if (!pcm_resource_x_requester_acquire_peer(observed->master_node,
+			observed->request.master_session_incarnation, episode->cluster_epoch,
+			observed->master_ingress_connection_generation))
+		return RESOURCE_X_APPLY_STALE;
+	result = cluster_pcm_lock_resource_x_requester_acquire_read_owner_exact(
+		&execution, episode, &current, &receipt);
+	if (result != RESOURCE_X_APPLY_APPLIED)
+		return result;
+	if (!pcm_resource_x_requester_acquire_peer(observed->master_node,
+			observed->request.master_session_incarnation, episode->cluster_epoch,
+			observed->master_ingress_connection_generation))
+		return RESOURCE_X_APPLY_STALE;
+	*current_out = current;
+	*receipt_out = receipt;
+	return RESOURCE_X_APPLY_APPLIED;
+}
+
 ResourceXApplyResult
 cluster_pcm_lock_resource_x_requester_acquire_read_arm_exact(
 	const ResourceXDeliveryClaim *execution, const ResourceXDecodedAcquireIntent *episode,
