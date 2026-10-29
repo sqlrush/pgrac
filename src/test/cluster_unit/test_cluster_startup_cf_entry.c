@@ -6454,6 +6454,7 @@ UT_TEST(ordinary_recovery_complete_roles_keep_the_original_cf_wait_policy)
 #include "test_cluster_commit_owner_cf.h"
 
 #include "test_cluster_cf_deadline.h"
+#include "test_cluster_ir_pin_deadline.h"
 
 int
 main(void)
@@ -6465,6 +6466,25 @@ main(void)
 	pg_atomic_init_u64(&owner_proc.cluster_grd_redeclare_acked_epoch, 0);
 	cluster_control_request_shmem_init();
 	retire_driver = cluster_control_request_driver_start();
+	if (getenv("PGRAC_PRE2_TEST_IR_PIN_DEADLINE") != NULL) {
+		UT_PLAN(14);
+		UT_RUN(startup_ir_preflight_carries_the_original_deadline);
+		UT_RUN(startup_ir_budget_is_recomputed_after_root_preflight);
+		UT_RUN(startup_pin_wait_is_bounded_by_the_original_deadline);
+		UT_RUN(startup_ir_exhaustion_during_preflight_starts_no_ir);
+		UT_RUN(startup_ir_expiry_rolls_back_with_the_independent_cleanup_budget);
+		UT_RUN(startup_ir_preflight_cannot_renew_the_set_aggregate_budget);
+		UT_RUN(startup_ir_expired_submillisecond_or_unknown_clock_publishes_nothing);
+		UT_RUN(startup_pin_walr_and_root_share_the_same_absolute_budget);
+		UT_RUN(startup_pin_walr_restores_cleanup_on_success_refusal_and_error);
+		UT_RUN(startup_pin_expiry_preserves_partial_walr_cleanup_debt);
+		UT_RUN(startup_pin_zero_mode_never_sleeps_or_retries);
+		UT_RUN(startup_pin_ack_is_live_before_deadline_and_refused_at_deadline);
+		UT_RUN(startup_pin_expired_submillisecond_and_unknown_clock_create_no_request);
+		UT_RUN(startup_bounded_pin_rejects_initializer_and_foreign_role);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_CF_DEADLINE") != NULL) {
 		UT_PLAN(12);
 		UT_RUN(startup_cf_request_uses_remaining_original_budget);
@@ -6666,7 +6686,7 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(212);
+	UT_PLAN(226);
 	UT_RUN(startup_cf_timeout_waits_for_exact_completion_before_begin);
 	UT_RUN(startup_cf_completion_does_not_preserve_changed_native_input);
 	UT_RUN(startup_cf_unsafe_native_context_never_takes_a_registry_lock);
@@ -6879,6 +6899,20 @@ main(void)
 	UT_RUN(startup_projection_recomputes_the_cf_budget_after_metadata);
 	UT_RUN(startup_bounded_source_preserves_exact_proof_and_native_refusal);
 	UT_RUN(startup_actual_bounded_source_never_waits_under_held_ir);
+	UT_RUN(startup_ir_preflight_carries_the_original_deadline);
+	UT_RUN(startup_ir_budget_is_recomputed_after_root_preflight);
+	UT_RUN(startup_pin_wait_is_bounded_by_the_original_deadline);
+	UT_RUN(startup_ir_exhaustion_during_preflight_starts_no_ir);
+	UT_RUN(startup_ir_expiry_rolls_back_with_the_independent_cleanup_budget);
+	UT_RUN(startup_ir_preflight_cannot_renew_the_set_aggregate_budget);
+	UT_RUN(startup_ir_expired_submillisecond_or_unknown_clock_publishes_nothing);
+	UT_RUN(startup_pin_walr_and_root_share_the_same_absolute_budget);
+	UT_RUN(startup_pin_walr_restores_cleanup_on_success_refusal_and_error);
+	UT_RUN(startup_pin_expiry_preserves_partial_walr_cleanup_debt);
+	UT_RUN(startup_pin_zero_mode_never_sleeps_or_retries);
+	UT_RUN(startup_pin_ack_is_live_before_deadline_and_refused_at_deadline);
+	UT_RUN(startup_pin_expired_submillisecond_and_unknown_clock_create_no_request);
+	UT_RUN(startup_bounded_pin_rejects_initializer_and_foreign_role);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

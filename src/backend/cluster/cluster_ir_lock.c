@@ -22,6 +22,8 @@
  */
 #include "postgres.h"
 
+#include <time.h>
+
 #include "cluster/cluster_guc.h" /* cluster_ges_request_timeout_ms */
 #include "cluster/cluster_external_fence.h"
 #include "cluster/cluster_ir.h"
@@ -271,8 +273,34 @@ recovery_serial_release_guard_valid(const ClusterRecoverySerialGuard *guard)
 static ClusterRecoverySerialReleaseResult
 recovery_serial_release_with_timeout(ClusterRecoverySerialGuard *guard, int timeout_ms);
 
+/* The cold caller owns this absolute deadline. Ordinary requests and reverse
+ * cleanup retain their original budgets. No deadline enters the IR identity. */
+static bool
+recovery_serial_monotonic_ns(uint64 *out)
+{
+	struct timespec now;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0 || now.tv_nsec < 0
+		|| now.tv_nsec >= NS_PER_S || (uint64)now.tv_sec > (UINT64_MAX - NS_PER_S) / NS_PER_S)
+		return false;
+	*out = (uint64)now.tv_sec * NS_PER_S + (uint64)now.tv_nsec;
+	return true;
+}
+
+static int
+recovery_serial_acquire_budget(uint64 deadline_ns, int ceiling_ms)
+{
+	uint64 now;
+
+	if (deadline_ns == 0)
+		return ceiling_ms;
+	if (!recovery_serial_monotonic_ns(&now) || now >= deadline_ns)
+		return 0;
+	return (int)Min((uint64)ceiling_ms, (deadline_ns - now) / NS_PER_MS);
+}
+
 static ClusterRecoverySerialAcquireResult
-recovery_serial_preflight(const ClusterRecoverySerialRequest *request)
+recovery_serial_preflight(const ClusterRecoverySerialRequest *request, uint64 deadline_ns)
 {
 	ClusterControlRootSnapshot snapshot;
 	ClusterControlRootReadToken token;
@@ -294,9 +322,12 @@ recovery_serial_preflight(const ClusterRecoverySerialRequest *request)
 			|| memcmp(&subject.pending, &request->pending, sizeof(request->pending)) != 0)
 			return CLUSTER_RECOVERY_SERIAL_STALE;
 	} else {
-		root_result = cluster_control_root_read_canonical(
-			request->duty.origin_thread_id, &request->duty, CLUSTER_CONTROL_ROOT_READ_STRONG,
-			&snapshot, &token);
+		root_result = deadline_ns != 0 ? cluster_control_root_v3_read_canonical_deadline_v1(
+											 request->duty.origin_thread_id, &request->duty,
+											 &snapshot, &token, deadline_ns)
+									   : cluster_control_root_read_canonical(
+											 request->duty.origin_thread_id, &request->duty,
+											 CLUSTER_CONTROL_ROOT_READ_STRONG, &snapshot, &token);
 		if (root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 			&& root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 			return CLUSTER_RECOVERY_SERIAL_ROOT_UNAVAILABLE;
@@ -319,9 +350,9 @@ recovery_serial_preflight(const ClusterRecoverySerialRequest *request)
 	return CLUSTER_RECOVERY_SERIAL_GRANTED;
 }
 
-ClusterRecoverySerialAcquireResult
-cluster_recovery_serial_acquire(const ClusterRecoverySerialRequest *request,
-								ClusterRecoverySerialGuard *guard)
+static ClusterRecoverySerialAcquireResult
+recovery_serial_acquire(const ClusterRecoverySerialRequest *request,
+						ClusterRecoverySerialGuard *guard, uint64 deadline_ns)
 {
 	ClusterRecoverySerialAcquireResult preflight;
 	ClusterLockAcquireRequest lock_request;
@@ -335,7 +366,9 @@ cluster_recovery_serial_acquire(const ClusterRecoverySerialRequest *request,
 	memset(guard, 0, sizeof(*guard));
 	if (!recovery_serial_request_valid(request))
 		return CLUSTER_RECOVERY_SERIAL_INTERNAL_FAILURE;
-	preflight = recovery_serial_preflight(request);
+	if (recovery_serial_acquire_budget(deadline_ns, request->acquire_timeout_ms) <= 0)
+		return CLUSTER_RECOVERY_SERIAL_RETRY;
+	preflight = recovery_serial_preflight(request, deadline_ns);
 	if (preflight != CLUSTER_RECOVERY_SERIAL_GRANTED) {
 		if (preflight == CLUSTER_RECOVERY_SERIAL_STALE
 			|| preflight == CLUSTER_RECOVERY_SERIAL_ROOT_UNAVAILABLE
@@ -357,7 +390,10 @@ cluster_recovery_serial_acquire(const ClusterRecoverySerialRequest *request,
 	lock_request.sessionLock = false;
 	lock_request.recovery_bootstrap = true;
 	lock_request.caller_local_start_ts_ms = (uint64)(GetCurrentTimestamp() / 1000);
-	lock_request.timeout_ms = Min(request->acquire_timeout_ms, ir_base_timeout_ms);
+	lock_request.timeout_ms = recovery_serial_acquire_budget(
+		deadline_ns, Min(request->acquire_timeout_ms, ir_base_timeout_ms));
+	if (lock_request.timeout_ms <= 0)
+		return CLUSTER_RECOVERY_SERIAL_RETRY;
 	lock_request.wait_event = WAIT_EVENT_CLUSTER_GES_REPLY_WAIT;
 	lock_result = cluster_shared_config
 					  ? cluster_lock_owner_request_acquire(&lock_request, NULL, NULL)
@@ -423,6 +459,13 @@ cluster_recovery_serial_acquire(const ClusterRecoverySerialRequest *request,
 	}
 	IR_BUMP(grant_count);
 	return CLUSTER_RECOVERY_SERIAL_GRANTED;
+}
+
+ClusterRecoverySerialAcquireResult
+cluster_recovery_serial_acquire(const ClusterRecoverySerialRequest *request,
+								ClusterRecoverySerialGuard *guard)
+{
+	return recovery_serial_acquire(request, guard, 0);
 }
 
 static ClusterRecoverySerialRevalidateResult
@@ -510,13 +553,14 @@ cluster_recovery_serial_tx_revalidate(ClusterRecoverySerialGuard *guard)
 	return CLUSTER_RECOVERY_SERIAL_CURRENT;
 }
 
-ClusterRecoverySerialAcquireResult
-cluster_recovery_serial_acquire_set(const ClusterRecoverySerialRequest *requests, uint16 count,
-									int overall_acquire_timeout_ms,
-									ClusterRecoverySerialGuardSet *set, uint16 *failed_index)
+static ClusterRecoverySerialAcquireResult
+recovery_serial_acquire_set(const ClusterRecoverySerialRequest *requests, uint16 count,
+							int overall_acquire_timeout_ms, ClusterRecoverySerialGuardSet *set,
+							uint16 *failed_index, uint64 deadline_ns)
 {
 	instr_time started;
 	uint16 i;
+	uint64 attempt_deadline_ns = deadline_ns;
 
 	if (failed_index != NULL)
 		*failed_index = CLUSTER_RECOVERY_SERIAL_SET_FAILED_NONE;
@@ -532,11 +576,24 @@ cluster_recovery_serial_acquire_set(const ClusterRecoverySerialRequest *requests
 			|| requests[i].mode == CLUSTER_RECOVERY_SERIAL_INPUT_SEAL
 			|| requests[i].mode == CLUSTER_RECOVERY_SERIAL_INITIALIZER
 			|| requests[i].mode == CLUSTER_RECOVERY_SERIAL_TX_CLOSURE
+			|| (deadline_ns != 0
+				&& (!cluster_shared_config
+					|| requests[i].mode != CLUSTER_RECOVERY_SERIAL_COLD_FORMED))
 			|| (i > 0 && requests[i - 1].duty.origin_thread_id >= requests[i].duty.origin_thread_id)
 			|| (i > 0 && requests[i - 1].release_timeout_ms != requests[i].release_timeout_ms))
 			return CLUSTER_RECOVERY_SERIAL_INTERNAL_FAILURE;
 	}
 
+	if (deadline_ns != 0) {
+		uint64 now;
+		uint64 budget = (uint64)overall_acquire_timeout_ms * NS_PER_MS;
+
+		if (!recovery_serial_monotonic_ns(&now) || now > UINT64_MAX - budget) {
+			*failed_index = 0;
+			return CLUSTER_RECOVERY_SERIAL_RETRY;
+		}
+		attempt_deadline_ns = Min(deadline_ns, now + budget);
+	}
 	INSTR_TIME_SET_CURRENT(started);
 	for (i = 0; i < count; i++) {
 		ClusterRecoverySerialRequest bounded_request = requests[i];
@@ -559,7 +616,7 @@ cluster_recovery_serial_acquire_set(const ClusterRecoverySerialRequest *requests
 		} else {
 			bounded_request.acquire_timeout_ms
 				= Min(bounded_request.acquire_timeout_ms, remaining_ms);
-			result = cluster_recovery_serial_acquire(&bounded_request, &guard);
+			result = recovery_serial_acquire(&bounded_request, &guard, attempt_deadline_ns);
 		}
 		if (result != CLUSTER_RECOVERY_SERIAL_GRANTED) {
 			ClusterRecoverySerialReleaseResult rollback_result;
@@ -582,6 +639,25 @@ cluster_recovery_serial_acquire_set(const ClusterRecoverySerialRequest *requests
 	}
 
 	return CLUSTER_RECOVERY_SERIAL_GRANTED;
+}
+
+ClusterRecoverySerialAcquireResult
+cluster_recovery_serial_acquire_set(const ClusterRecoverySerialRequest *requests, uint16 count,
+									int overall_acquire_timeout_ms,
+									ClusterRecoverySerialGuardSet *set, uint16 *failed_index)
+{
+	return recovery_serial_acquire_set(requests, count, overall_acquire_timeout_ms, set,
+									   failed_index, 0);
+}
+
+ClusterRecoverySerialAcquireResult
+cluster_recovery_serial_acquire_set_deadline_v1(const ClusterRecoverySerialRequest *requests,
+												uint16 count, int overall_acquire_timeout_ms,
+												ClusterRecoverySerialGuardSet *set,
+												uint16 *failed_index, uint64 deadline_ns)
+{
+	return recovery_serial_acquire_set(requests, count, overall_acquire_timeout_ms, set,
+									   failed_index, deadline_ns);
 }
 
 static ClusterRecoverySerialReleaseResult

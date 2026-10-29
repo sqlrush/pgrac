@@ -371,6 +371,14 @@ cluster_wal_retention_pin_acquire(const ClusterWalRetentionPinThreadRequest *req
 extern ClusterWalPinResult cluster_wal_retention_pin_acquire_inputs_v1(
 	const ClusterWalRetentionPinThreadRequest *requests, uint16 nthreads,
 	const uint16 *input_threads, uint16 ninput_threads, ClusterWalRetentionPin **out_pin);
+/* Non-initializer cold Startup union. Its original absolute deadline bounds
+ * WALR/ROOT acquisition and CF waiting; zero permits one complete attempt.
+ * No deadline changes the pin identity or its independent cleanup budget. */
+extern ClusterWalPinResult
+cluster_wal_retention_pin_acquire_deadline_v1(const ClusterWalRetentionPinThreadRequest *requests,
+											  uint16 nthreads, const uint16 *input_threads,
+											  uint16 ninput_threads,
+											  ClusterWalRetentionPin **out_pin, uint64 deadline_ns);
 extern ClusterWalPinResult
 cluster_wal_retention_pin_bind_one(ClusterWalRetentionPin *pin,
 								   ClusterRecoverySerialGuard *held_serial);
@@ -379,6 +387,8 @@ cluster_wal_retention_pin_bind_set(ClusterWalRetentionPin *pin,
 								   ClusterRecoverySerialGuardSet *held_set);
 extern ClusterWalPinResult
 cluster_wal_retention_pin_preflight_revalidate_wait_v1(ClusterWalRetentionPin *pin);
+extern ClusterWalPinResult
+cluster_wal_retention_pin_preflight_deadline_v1(ClusterWalRetentionPin *pin, uint64 deadline_ns);
 extern ClusterWalPinResult cluster_wal_retention_pin_revalidate(ClusterWalRetentionPin *pin);
 /* Borrow the current ResourceOwner's complete bound COLD_FORMED set. This
  * neither acquires nor transfers ownership and cannot qualify DATA by itself.

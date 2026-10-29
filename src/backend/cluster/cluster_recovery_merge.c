@@ -2897,13 +2897,9 @@ recovery_fence_plan_acquire_serial_inputs(ClusterRecoveryFencePlan *plan,
 		}
 		pin_result = CLUSTER_WAL_PIN_INVALID;
 		if (valid) {
-			if (ninput_threads != 0)
-				pin_result = cluster_wal_retention_pin_acquire_inputs_v1(
-					pin_requests, plan->origin_count, input_threads, ninput_threads,
-					&plan->retention_pin);
-			else
-				pin_result = cluster_wal_retention_pin_acquire(pin_requests, plan->origin_count,
-																 &plan->retention_pin);
+			pin_result = cluster_wal_retention_pin_acquire_deadline_v1(
+				pin_requests, plan->origin_count, input_threads, ninput_threads,
+				&plan->retention_pin, plan->merge_deadline_ns);
 		}
 		pfree(intervals);
 		pfree(pin_requests);
@@ -2938,8 +2934,13 @@ recovery_fence_plan_acquire_serial_inputs(ClusterRecoveryFencePlan *plan,
 		for (i = 0; i < plan->origin_count; i++)
 			requests[i].acquire_timeout_ms = acquire_budget;
 		before = cluster_cf_attempt_sequence();
-		result = cluster_recovery_serial_acquire_set(requests, plan->origin_count, acquire_budget,
-													 &plan->serial_guards, &failed_index);
+		result = cluster_shared_config
+					 ? cluster_recovery_serial_acquire_set_deadline_v1(
+						   requests, plan->origin_count, acquire_budget, &plan->serial_guards,
+						   &failed_index, plan->merge_deadline_ns)
+					 : cluster_recovery_serial_acquire_set(requests, plan->origin_count,
+														   acquire_budget, &plan->serial_guards,
+														   &failed_index);
 		if (result == CLUSTER_RECOVERY_SERIAL_GRANTED)
 			break;
 		/* ROOT_UNAVAILABLE remains hard unless this exact attempt supplies
@@ -2966,7 +2967,8 @@ recovery_fence_plan_acquire_serial_inputs(ClusterRecoveryFencePlan *plan,
 			pfree(requests);
 			return false;
 		}
-		bind_result = cluster_wal_retention_pin_preflight_revalidate_wait_v1(context.pin);
+		bind_result
+			= cluster_wal_retention_pin_preflight_deadline_v1(context.pin, plan->merge_deadline_ns);
 		if (bind_result != CLUSTER_WAL_PIN_OK
 			|| !recovery_fence_cf_context_current(plan, &context)) {
 			pfree(requests);

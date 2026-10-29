@@ -63,6 +63,16 @@ set_cf_pin_acquire_inputs(const ClusterWalRetentionPinThreadRequest *requests, u
 }
 
 static ClusterWalPinResult
+set_cf_pin_deadline(const ClusterWalRetentionPinThreadRequest *requests, uint16 count,
+					const uint16 *threads, uint16 nthreads, ClusterWalRetentionPin **out,
+					uint64 deadline_ns)
+{
+	UT_ASSERT_EQ(deadline_ns, set_cf_plan.merge_deadline_ns);
+	return nthreads ? set_cf_pin_acquire_inputs(requests, count, threads, nthreads, out)
+					: set_cf_pin_acquire(requests, count, out);
+}
+
+static ClusterWalPinResult
 pg_attribute_unused() set_cf_pin_revalidate(ClusterWalRetentionPin *pin)
 {
 	UT_ASSERT(pin == (ClusterWalRetentionPin *)&set_cf_pin);
@@ -72,6 +82,13 @@ pg_attribute_unused() set_cf_pin_revalidate(ClusterWalRetentionPin *pin)
 	if (set_cf_on_pin_check != NULL)
 		set_cf_on_pin_check();
 	return set_cf_pin_current ? CLUSTER_WAL_PIN_OK : CLUSTER_WAL_PIN_STALE;
+}
+
+static ClusterWalPinResult
+set_cf_pin_preflight_deadline(ClusterWalRetentionPin *pin, uint64 deadline_ns)
+{
+	UT_ASSERT_EQ(deadline_ns, set_cf_plan.merge_deadline_ns);
+	return set_cf_pin_revalidate(pin);
 }
 
 static ClusterWalPinResult
@@ -125,6 +142,8 @@ pg_attribute_unused() set_cf_wait(Latch *latch, int events, long timeout, uint32
 #define clock_gettime set_cf_clock_gettime
 #define WaitLatch set_cf_wait
 #define cluster_thread_recovery_pin_request_build_v1 set_cf_pin_request
+#define cluster_wal_retention_pin_acquire_deadline_v1 set_cf_pin_deadline
+#define cluster_wal_retention_pin_preflight_deadline_v1 set_cf_pin_preflight_deadline
 #define cluster_wal_retention_pin_acquire set_cf_pin_acquire
 #define cluster_wal_retention_pin_acquire_inputs_v1 set_cf_pin_acquire_inputs
 #define cluster_wal_retention_pin_preflight_revalidate_wait_v1 set_cf_pin_revalidate
@@ -142,6 +161,8 @@ pg_attribute_unused() set_cf_wait(Latch *latch, int events, long timeout, uint32
 #undef cluster_wal_retention_pin_preflight_revalidate_wait_v1
 #undef cluster_wal_retention_pin_acquire_inputs_v1
 #undef cluster_wal_retention_pin_acquire
+#undef cluster_wal_retention_pin_acquire_deadline_v1
+#undef cluster_wal_retention_pin_preflight_deadline_v1
 #undef cluster_thread_recovery_pin_request_build_v1
 #undef WaitLatch
 #undef clock_gettime

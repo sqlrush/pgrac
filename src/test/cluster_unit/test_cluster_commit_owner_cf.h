@@ -56,6 +56,16 @@ commit_owner_pin_acquire_inputs(const ClusterWalRetentionPinThreadRequest *reque
 }
 
 static ClusterWalPinResult
+commit_owner_pin_deadline(const ClusterWalRetentionPinThreadRequest *requests, uint16 count,
+						  const uint16 *threads, uint16 nthreads, ClusterWalRetentionPin **out,
+						  uint64 deadline_ns)
+{
+	UT_ASSERT_EQ(deadline_ns, cold_deadline_plan.merge_deadline_ns);
+	return nthreads ? commit_owner_pin_acquire_inputs(requests, count, threads, nthreads, out)
+					: commit_owner_pin_acquire(requests, count, out);
+}
+
+static ClusterWalPinResult
 commit_owner_pin_bind(ClusterWalRetentionPin *pin, ClusterRecoverySerialGuardSet *set)
 {
 	UT_ASSERT(pin == (ClusterWalRetentionPin *)&commit_cf_pin);
@@ -96,6 +106,8 @@ commit_owner_pin_release(ClusterWalRetentionPin **pin)
 #define recovery_fence_cf_context_current commit_owner_ir_context_current
 #define recovery_fence_wait_own_cf commit_owner_ir_wait
 #define cluster_thread_recovery_pin_request_build_v1 commit_owner_pin_request
+#define cluster_wal_retention_pin_acquire_deadline_v1 commit_owner_pin_deadline
+#define cluster_wal_retention_pin_preflight_deadline_v1 set_cf_pin_preflight_deadline
 #define cluster_wal_retention_pin_acquire commit_owner_pin_acquire
 #define cluster_wal_retention_pin_acquire_inputs_v1 commit_owner_pin_acquire_inputs
 #define cluster_wal_retention_pin_preflight_revalidate_wait_v1 set_cf_pin_revalidate
@@ -115,6 +127,8 @@ commit_owner_pin_release(ClusterWalRetentionPin **pin)
 #undef cluster_wal_retention_pin_preflight_revalidate_wait_v1
 #undef cluster_wal_retention_pin_acquire_inputs_v1
 #undef cluster_wal_retention_pin_acquire
+#undef cluster_wal_retention_pin_acquire_deadline_v1
+#undef cluster_wal_retention_pin_preflight_deadline_v1
 #undef cluster_thread_recovery_pin_request_build_v1
 #undef recovery_fence_wait_own_cf
 #undef recovery_fence_cf_context_current

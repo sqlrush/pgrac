@@ -1462,7 +1462,7 @@ test_cluster_startup_cf_callsite.inc: $(top_srcdir)/src/backend/access/transam/x
 	     END { if (calls != 1 || complete != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_startup_cf_entry: test_cluster_startup_cf_entry.c test_cluster_cf_enqueue.c test_cluster_cf_deadline.h \
+test_cluster_startup_cf_entry: test_cluster_startup_cf_entry.c test_cluster_cf_enqueue.c test_cluster_cf_deadline.h test_cluster_ir_pin_deadline.h \
 		test_cluster_prepared_cf.h test_cluster_prepared_job.h test_cluster_prepared_cf.inc \
 		$(top_srcdir)/src/include/cluster/cluster_control_root_prepared.h \
 		test_cluster_generic_cf.h test_cluster_generic_cf.inc \
@@ -1620,17 +1620,19 @@ test_cluster_wal_pin_cf_types.inc: $(top_srcdir)/src/backend/cluster/cluster_wal
 test_cluster_wal_pin_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_retention.c \
 		$(top_srcdir)/src/backend/cluster/cluster_control_root.c Makefile
 	awk 'FNR == NR && /^(control_root_read_ready|pin_valid|walr_request_current|pin_readers_current|pin_thread_walr_current)\(/ { print "static bool"; emit=1; predicates++ } \
+	     FNR == NR && /^walr_deadline_budget\(/ { print "static int"; emit=1; budgets++ } \
+	     FNR == NR && /^(walr_request_acquire|walr_request_acquire_actual)\(/ { print "static ClusterLockAcquireResult"; emit=1; acquisitions++ } \
 	     FNR == NR && /^pin_free\(/ { print "static void"; emit=1; frees++ } \
 	     FNR == NR && /^pin_walr_for_thread\(/ { print "static ClusterWalPinLock *"; emit=1; selectors++ } \
 	     FNR == NR && /^root_publish_member\(/ { print "static const ClusterWalRootPublishGuard *"; emit=1; selectors++ } \
 	     FNR == NR && /^pin_release_locks\(/ { print "static ClusterWalrReleaseResult"; emit=1; releases++ } \
 	     FNR == NR && /^(pin_fail_after_locks|pin_current_after_grants|pin_acquire_inputs)\(/ { print "static ClusterWalPinResult"; emit=1; callers++ } \
-	     FNR == NR && /^(cluster_wal_retention_pin_acquire|cluster_wal_retention_pin_preflight_revalidate_wait_v1)\(/ { print "ClusterWalPinResult"; emit=1; callers++ } \
+	     FNR == NR && /^(cluster_wal_retention_pin_acquire|cluster_wal_retention_pin_acquire_deadline_v1|cluster_wal_retention_pin_preflight_deadline_v1|cluster_wal_retention_pin_preflight_revalidate_wait_v1)\(/ { print "ClusterWalPinResult"; emit=1; callers++ } \
 	     FNR == NR && /^pin_startup_cf_(capture|free)\(/ { print "static void"; emit=1; helpers++ } \
 	     FNR == NR && /^pin_startup_cf_(current|wait)\(/ { print "static bool"; emit=1; helpers++ } \
 	     FNR != NR && /^(cluster_control_root_read_canonical|cluster_control_root_read_recovery_subject|cluster_control_root_revalidate)\(/ { print "ClusterControlRootResult"; emit=1; readers++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (predicates != 5 || frees != 1 || selectors != 2 || releases != 1 || callers != 5 || helpers > 4 || readers != 3 || emit) exit 1 }' \
+	     END { if (predicates != 5 || frees != 1 || selectors != 2 || releases != 1 || callers != 7 || budgets != 1 || acquisitions != 2 || helpers > 4 || readers != 3 || emit) exit 1 }' \
 	     $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 

@@ -18,6 +18,25 @@ static ClusterWalPinThread pin_cf_thread;
 static ClusterWalPinLock pin_cf_reader;
 static ClusterWalRetentionPin pin_cf_existing;
 static bool pin_cf_preflight;
+static int pin_cf_walr_budgets[8], pin_cf_release_budget;
+static uint64 pin_cf_after_walr_ns;
+static bool pin_cf_walr_error, pin_cf_walr_refuse;
+
+static void
+walr_native_locktag_init(uint16 thread pg_attribute_unused(), LOCKTAG *tag pg_attribute_unused())
+{}
+static void
+walr_native_lock_release_or_fatal(const ClusterLockAcquireRequest *request pg_attribute_unused())
+{
+	UT_ASSERT(false);
+}
+static ClusterLockAcquireResult
+walr_request_finish_native(ClusterLockAcquireRequest *request pg_attribute_unused(),
+						   void *argument pg_attribute_unused())
+{
+	UT_ASSERT(false);
+	return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+}
 
 /* These leaves only stand in for the pre-existing WALR/input setup. */
 static bool
@@ -40,17 +59,24 @@ pin_request_valid(const ClusterWalRetentionPinThreadRequest *request, int segsiz
 	return true;
 }
 static ClusterLockAcquireResult
-walr_request_acquire_actual(ClusterLockAcquireRequest *request)
+pin_cf_owner_acquire(ClusterLockAcquireRequest *request,
+					 ClusterControlNativeFinish finish pg_attribute_unused(),
+					 void *argument pg_attribute_unused())
 {
 	UT_ASSERT_EQ(request->lockmode, ShareLock);
-	++pin_cf_walr_acquires;
-	return CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	UT_ASSERT(pin_cf_walr_acquires < lengthof(pin_cf_walr_budgets));
+	pin_cf_walr_budgets[pin_cf_walr_acquires++] = request->timeout_ms;
+	set_cf_clock_ns += pin_cf_after_walr_ns;
+	if (pin_cf_walr_error)
+		ereport(ERROR, (errmsg("modeled WALR transport error")));
+	return pin_cf_walr_refuse ? CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT : CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
 }
 static ClusterLockAcquireResult
 walr_request_release_actual(const ClusterLockAcquireRequest *request)
 {
 	UT_ASSERT_EQ(request->lockmode, ShareLock);
 	++pin_cf_walr_releases;
+	pin_cf_release_budget = request->timeout_ms;
 	return pin_cf_release_confirmed ? CLUSTER_LOCK_ACQUIRE_OK_GRANTED
 									: CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
 }
@@ -92,6 +118,8 @@ pin_cf_errdetail(const char *format, ...)
 	va_end(args);
 	return 0;
 }
+#define clock_gettime cf_budget_clock_gettime
+#define cluster_lock_owner_request_acquire pin_cf_owner_acquire
 #define errstart pin_cf_errstart
 #define errdetail pin_cf_errdetail
 #define acquire_clusterwide_cf prepared_acquire
@@ -115,6 +143,8 @@ pin_cf_errdetail(const char *format, ...)
 #undef acquire_clusterwide_cf
 #undef errdetail
 #undef errstart
+#undef cluster_lock_owner_request_acquire
+#undef clock_gettime
 
 static void
 pin_cf_fixture(bool preflight, bool pending)
@@ -142,6 +172,11 @@ pin_cf_fixture(bool preflight, bool pending)
 	failure_formation = failure_needs = failure_admissions = true;
 	pin_cf_walr_live = pin_cf_release_confirmed = true;
 	pin_cf_walr_acquires = pin_cf_walr_releases = 0;
+	pin_cf_after_walr_ns = 0;
+	cf_budget_clock_fail = false;
+	pin_cf_walr_error = pin_cf_walr_refuse = false;
+	pin_cf_release_budget = -1;
+	memset(pin_cf_walr_budgets, 0, sizeof(pin_cf_walr_budgets));
 	pin_cf_preflight = preflight;
 	pin_cf_out = NULL;
 	active_pin = NULL;

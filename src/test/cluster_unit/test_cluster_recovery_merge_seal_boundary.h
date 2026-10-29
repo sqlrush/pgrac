@@ -965,6 +965,17 @@ cluster_recovery_serial_acquire_set(
 	UNREACHED();
 }
 
+ClusterRecoverySerialAcquireResult
+cluster_recovery_serial_acquire_set_deadline_v1(const ClusterRecoverySerialRequest *requests,
+												uint16 count, int overall_acquire_timeout_ms,
+												ClusterRecoverySerialGuardSet *set,
+												uint16 *failed_index,
+												uint64 deadline_ns pg_attribute_unused())
+{
+	return cluster_recovery_serial_acquire_set(requests, count, overall_acquire_timeout_ms, set,
+											   failed_index);
+}
+
 bool
 cluster_thread_recovery_pin_request_build_v1(
 	uint16 dead_tid pg_attribute_unused(), const ClusterRecoveryDutyKey *duty pg_attribute_unused(),
@@ -998,6 +1009,24 @@ cluster_wal_retention_pin_acquire_inputs_v1(
 	const ClusterWalRetentionPinThreadRequest *requests pg_attribute_unused(),
 	uint16 nthreads pg_attribute_unused(), const uint16 *input_threads pg_attribute_unused(),
 	uint16 ninput_threads pg_attribute_unused(), ClusterWalRetentionPin **out_pin pg_attribute_unused())
+{
+	UNREACHED();
+}
+
+ClusterWalPinResult
+cluster_wal_retention_pin_acquire_deadline_v1(const ClusterWalRetentionPinThreadRequest *requests,
+											  uint16 count, const uint16 *threads, uint16 nthreads,
+											  ClusterWalRetentionPin **out,
+											  uint64 deadline_ns pg_attribute_unused())
+{
+	return nthreads ? cluster_wal_retention_pin_acquire_inputs_v1(requests, count, threads,
+																  nthreads, out)
+					: cluster_wal_retention_pin_acquire(requests, count, out);
+}
+
+ClusterWalPinResult
+cluster_wal_retention_pin_preflight_deadline_v1(ClusterWalRetentionPin *pin pg_attribute_unused(),
+												uint64 deadline_ns pg_attribute_unused())
 {
 	UNREACHED();
 }
