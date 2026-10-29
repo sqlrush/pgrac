@@ -105,6 +105,7 @@ typedef struct ClusterUndoCleanerActiveSample {
  * Counts do not prove pool coverage, owner progress, or reusable capacity. */
 typedef struct ClusterUndoCapacityStats {
 	int32 origin_node_id;
+	uint64 active_full_wait_count;
 	uint64 pool_wait_count;
 	uint64 wakeup_recheck_count;
 	uint64 cancel_count;
@@ -154,6 +155,7 @@ typedef struct UndoCleanerSharedState {
 	ClusterUndoCleanerActiveSample active_sample;
 	uint64 active_sample_sequence; /* shared across worker0 respawns; never wraps */
 	ConditionVariable capacity_cv;
+	uint64 active_full_wait_count;
 	uint64 capacity_wait_entered;
 	uint64 capacity_wait_repolled;
 	uint64 capacity_wait_refused_context;
@@ -268,6 +270,12 @@ extern bool cluster_undo_cleaner_capacity_owner_snapshot(unsigned worker_id,
 														 uint64 *worker_generation);
 extern bool cluster_undo_cleaner_wait_for_capacity(uint32 segment_id,
 												   ClusterCtrcTxnKeyV1 *continuation);
+/* The native transaction lock wait uses exactly the original capacity
+ * context predicate. These diagnostics never establish a reusable slot. */
+extern bool cluster_undo_cleaner_capacity_context_safe(void);
+extern void cluster_undo_cleaner_tx_slot_wait_begin(void);
+extern void cluster_undo_cleaner_tx_slot_wait_end(bool cancelled);
+extern bool cluster_undo_cleaner_tx_slot_waiting(void);
 
 /* D6 counter accessors (dump_undo + tests). */
 extern uint64 cluster_undo_cleaner_pass_count(void);

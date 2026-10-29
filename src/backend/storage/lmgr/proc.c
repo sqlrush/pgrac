@@ -13,6 +13,8 @@
  * PGRAC MODIFICATIONS: register actual configuration outcomes for native
  * process lifetimes, including auxiliaries outside ProcSignal; retire only
  * at real native cleanup. No configuration admission is implied.
+ * The frontend transaction-slot wait labels its original native lock sleep.
+ * Modified by: SqlRush <sqlrush@gmail.com>
  * Author: SqlRush <sqlrush@gmail.com>
  *
  *-------------------------------------------------------------------------
@@ -46,6 +48,7 @@
 #include "cluster/cluster_grd.h" /* spec-2.17 D28c — cluster_grd_alloc_generation */
 #include "cluster/cluster_guc.h" /* spec-2.17 — cluster_enabled */
 #include "cluster/cluster_shared_config.h" /* native family lifetime reset */
+#include "cluster/cluster_undo_cleaner.h"
 #endif
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -1084,6 +1087,11 @@ AuxiliaryPidGetProc(int pid)
  *		we release the partition lock.
  *
  * NOTES: The process queue is now a priority queue for locking.
+ *
+ * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
+ * What changed: a scoped frontend transaction-slot wait reports its own event.
+ * Why: retain native queue/deadlock/timeout behavior while identifying capacity
+ * waits separately from ordinary transaction-lock callers.
  */
 ProcWaitStatus
 ProcSleep(LOCALLOCK *locallock, LockMethod lockMethodTable)
@@ -1368,8 +1376,15 @@ ProcSleep(LOCALLOCK *locallock, LockMethod lockMethodTable)
 		}
 		else
 		{
+			/* PGRAC: change only the reported event of the original lock wait. */
+			uint32 wait_event = PG_WAIT_LOCK | locallock->tag.lock.locktag_type;
+
+#ifdef USE_PGRAC_CLUSTER
+			if (cluster_undo_cleaner_tx_slot_waiting())
+				wait_event = WAIT_EVENT_CLUSTER_UNDO_TX_SLOT_WAIT;
+#endif
 			(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_EXIT_ON_PM_DEATH, 0,
-							 PG_WAIT_LOCK | locallock->tag.lock.locktag_type);
+							 wait_event);
 			ResetLatch(MyLatch);
 			/* check for deadlocks first, as that's probably log-worthy */
 			if (got_deadlock_timeout)

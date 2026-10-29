@@ -42,9 +42,11 @@
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "storage/ipc.h"
+#include "storage/lock.h"
 #include "storage/shmem.h"
 #include "utils/memutils.h"
 #include "utils/timestamp.h" /* S3 forensics — cleaner liveness-tick age */
+#include "utils/wait_event.h"
 
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"
@@ -274,8 +276,116 @@ cluster_tt_local_append_binding(void)
 typedef enum ClusterTTLocalReserveResult {
 	CLUSTER_TT_LOCAL_UNAVAILABLE = 0,
 	CLUSTER_TT_LOCAL_RESERVED,
-	CLUSTER_TT_LOCAL_NEED_CAPACITY
+	CLUSTER_TT_LOCAL_NEED_CAPACITY,
+	CLUSTER_TT_LOCAL_NEED_ACTIVE_SLOT
 } ClusterTTLocalReserveResult;
+
+/*
+ * cluster_tt_local_active_wait_owner -- Resolve an exact local XID lock owner.
+ * Inputs: selected segment and unpublished caller XID. Returns a native VXID,
+ * or a request to recheck a changed allocator; false preserves refusal.
+ * Side Effects: bounded original shmem/lock reads, no allocation authority.
+ */
+static bool
+cluster_tt_local_active_wait_owner(uint32 segment_id, TransactionId top_xid,
+								   VirtualTransactionId *owner, bool *recheck)
+{
+	ClusterTTSlotCurrentSnapshot before, after;
+	VirtualTransactionId *owners;
+	LOCKTAG tag;
+	int count;
+	bool valid;
+
+	*recheck = false;
+	if (!cluster_tt_slot_current_snapshot(cluster_node_id, &before))
+		return false;
+	if (before.segment_id != segment_id) {
+		*recheck = true;
+		return true;
+	}
+	if (before.binding_generation == 0 || before.binding_generation == UINT64_MAX)
+		return false;
+	for (unsigned i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
+		const ClusterTTSlotCurrentOwner *slot = &before.slots[i];
+
+		if (cluster_tt_slot_is_protected(segment_id, i))
+			return false;
+		if (slot->status != CTS_ACTIVE) {
+			*recheck = slot->status == CTS_FREE || slot->status == CTS_COMMITTED
+					   || slot->status == CTS_ABORTED;
+			return *recheck;
+		}
+		if (!TransactionIdIsNormal(slot->xid) || slot->xid == top_xid
+			|| slot->wrap == TT_WRAP_INVALID || slot->commit_scn != InvalidScn)
+			return false;
+		for (unsigned j = 0; j < i; j++)
+			if (before.slots[j].xid == slot->xid)
+				return false;
+	}
+	/* A transaction XID lock has one exact native owner. Prepared/dummy or
+	 * unknown identities cannot be converted into a running local backend. */
+	SET_LOCKTAG_TRANSACTION(tag, before.slots[0].xid);
+	owners = GetLockConflicts(&tag, ShareLock, &count);
+	valid = count == 1 && VirtualTransactionIdIsValid(owners[0])
+			&& !VirtualTransactionIdIsRecoveredPreparedXact(owners[0]);
+	if (valid)
+		*owner = owners[0];
+	pfree(owners);
+	if (!cluster_tt_slot_current_snapshot(cluster_node_id, &after))
+		return false;
+	if (memcmp(&before, &after, sizeof(before)) != 0) {
+		*recheck = true;
+		return true;
+	}
+	return valid;
+}
+
+/*
+ * cluster_tt_local_wait_for_active_slot -- Wait in the original deadlock graph.
+ * Inputs: unchanged selected segment and unpublished caller. Returns only an
+ * allocator recheck request. Side Effects: original native VXID wait; finally
+ * retires frontend scope on caller timeout/cancel/deadlock/other ERROR.
+ */
+static bool
+cluster_tt_local_wait_for_active_slot(uint32 segment_id, TransactionId top_xid)
+{
+	VirtualTransactionId owner;
+	bool recheck;
+	volatile bool completed = false;
+	uint32 previous_wait_event = *my_wait_event_info;
+
+	if (!cluster_undo_cleaner_capacity_context_safe()
+		|| !cluster_tt_local_active_wait_owner(segment_id, top_xid, &owner, &recheck))
+		return false;
+	if (recheck)
+		return true;
+	if (!cluster_undo_cleaner_capacity_context_safe())
+		return false;
+	cluster_undo_cleaner_tx_slot_wait_begin();
+	PG_TRY();
+	{
+		(void)VirtualXactLock(owner, true);
+		completed = true;
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_cleaner_tx_slot_wait_end(!completed && geterrcode() == ERRCODE_QUERY_CANCELED);
+		pgstat_report_wait_start(previous_wait_event);
+	}
+	PG_END_TRY();
+	return true;
+}
+
+static void
+cluster_tt_local_active_full_error(uint32 segment_id)
+{
+	ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					errmsg("cluster TT slot allocator exhausted on segment %u (48 slots full)",
+						   segment_id),
+					errdetail("A safe wait on an exact local transaction owner is not available."),
+					errhint("Retry after active transactions finish; inspect prepared transactions "
+							"and held resources.")));
+}
 
 static void
 cluster_tt_local_rollover_error(uint32 seg, bool at_hard_cap)
@@ -335,7 +445,8 @@ cluster_tt_local_rollover_error(uint32 seg, bool at_hard_cap)
  *
  *	Returns RESERVED when the exact binding is available, UNAVAILABLE
  *	when cluster mode is disabled or xid is not normal, and NEED_CAPACITY
- *	on pool hard cap before owning a slot or canonical responsibility.
+ *	on pool hard cap, or NEED_ACTIVE_SLOT on an occupied selected segment,
+ *	before owning a slot or canonical responsibility.
  *	Only the caller may wait, after leaving its modifier. Other failures
  *	retain their original ERROR path, with no provisional fallback.
  *
@@ -346,7 +457,7 @@ cluster_tt_local_rollover_error(uint32 seg, bool at_hard_cap)
 static ClusterTTLocalReserveResult
 cluster_tt_local_reserve_binding(TransactionId top_xid, uint32 *out_segment_id,
 								 uint16 *out_slot_offset, uint32 *out_tt_slot_id,
-								 bool *capacity_preflight_safe)
+								 bool *capacity_preflight_safe, bool active_slot_pending)
 {
 	if (!cluster_enabled || cluster_node_id < 0)
 		return CLUSTER_TT_LOCAL_UNAVAILABLE;
@@ -411,21 +522,17 @@ cluster_tt_local_reserve_binding(TransactionId top_xid, uint32 *out_segment_id,
 				break;
 			}
 
-			if (!retained_pressure)
-				/* All 48 slots ACTIVE -- genuine in-flight concurrency limit. */
-				ereport(
-					ERROR,
-					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-					 errmsg("cluster TT slot allocator exhausted on segment %u (48 slots full)",
-							seg),
-					 errdetail("node=%d retention_horizon_scn=" UINT64_FORMAT
-							   " current_scn=" UINT64_FORMAT " retain_skip=" UINT64_FORMAT
-							   " retention_recycle=" UINT64_FORMAT ".",
-							   cluster_node_id, cluster_tt_slot_retention_horizon_scn(),
-							   (uint64)cluster_scn_current(), cluster_tt_slot_retain_skip_count(),
-							   cluster_tt_slot_retention_recycle_count()),
-					 errhint("All concurrent xacts on this node hold ACTIVE slots; retry after "
-							 "shorter transactions commit or abort.")));
+			if (!retained_pressure || active_slot_pending) {
+				if (!*capacity_preflight_safe || cluster_tt_local_binding_count != 0)
+					cluster_tt_local_active_full_error(seg);
+				*out_segment_id = seg;
+				*out_slot_offset = INVALID_TT_SLOT_OFFSET;
+				*out_tt_slot_id = 0;
+				/* After native owner completion, exact terminal clearing must
+				 * finish in this segment rather than escaping through rollover. */
+				return retained_pressure ? CLUSTER_TT_LOCAL_NEED_CAPACITY
+										 : CLUSTER_TT_LOCAL_NEED_ACTIVE_SLOT;
+			}
 
 			/*
 			 * spec-3.12 D2b / C3b: retained COMMITTED slots (a long reader holds
@@ -853,6 +960,7 @@ cluster_tt_local_prepare_canonical_active(TransactionId top_xid,
 	ClusterSemanticAdmissionToken capacity_admission = { 0 };
 	ClusterXidStripeSampleFence capacity_lease = { 0 };
 	bool capacity_pending = false;
+	bool active_slot_pending = false;
 	bool capacity_striped = false;
 	/* Never regain preflight after this prepare has owned a slot or started
 	 * a segment producer, even if an unpublished binding is later forgotten. */
@@ -931,9 +1039,11 @@ cluster_tt_local_prepare_canonical_active(TransactionId top_xid,
 			if (capacity_pending)
 				cluster_tt_local_modifier_recheck_or_error(&modifier_token);
 
-			reserve_result = cluster_tt_local_reserve_binding(
-				top_xid, &segment_id, &slot_offset, &tt_slot_id, &capacity_preflight_safe);
-			if (reserve_result == CLUSTER_TT_LOCAL_NEED_CAPACITY) {
+			reserve_result
+				= cluster_tt_local_reserve_binding(top_xid, &segment_id, &slot_offset, &tt_slot_id,
+												   &capacity_preflight_safe, active_slot_pending);
+			if (reserve_result == CLUSTER_TT_LOCAL_NEED_CAPACITY
+				|| reserve_result == CLUSTER_TT_LOCAL_NEED_ACTIVE_SLOT) {
 				cluster_tt_local_modifier_recheck_or_error(&modifier_token);
 				if (!capacity_pending) {
 					capacity_admission = modifier_token;
@@ -1032,6 +1142,12 @@ cluster_tt_local_prepare_canonical_active(TransactionId top_xid,
 		PG_END_TRY();
 
 		cluster_semantic_activation_leave(&modifier_token);
+		if (reserve_result == CLUSTER_TT_LOCAL_NEED_ACTIVE_SLOT) {
+			active_slot_pending = true;
+			if (cluster_tt_local_wait_for_active_slot(segment_id, top_xid))
+				continue;
+			cluster_tt_local_active_full_error(segment_id);
+		}
 		if (reserve_result == CLUSTER_TT_LOCAL_NEED_CAPACITY) {
 			/* Only this invocation's token was released. The original wait
 			 * predicate still refuses pins, locks and any other admission. */

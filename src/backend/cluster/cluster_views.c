@@ -302,8 +302,8 @@ static const uint32 cluster_wait_event_infos[CLUSTER_WAIT_EVENTS_COUNT] = {
 	WAIT_EVENT_CLUSTER_LMS_DATA_RECV, /* PGRAC spec-7.2 D6 */
 	WAIT_EVENT_CLUSTER_LMS_DATA_SEND, /* PGRAC spec-7.2 D6 */
 
-	/* Cluster: Undo (8 = 4 remote/retention + 3 owner-as-master grant-plane
-	 * waits + frontend capacity; the I/O-internal CR_CONSTRUCT / TT_DURABLE_IO / BUF_FLUSH
+	/* Cluster: Undo (9 = 4 remote/retention + 3 owner-as-master grant-plane
+	 * waits + 2 frontend capacity waits; the I/O-internal CR_CONSTRUCT / TT_DURABLE_IO / BUF_FLUSH
 	 * / EXTENT_CLAIM enum events stay off this roster, as before) */
 	WAIT_EVENT_UNDO_REMOTE_READ,
 	WAIT_EVENT_UNDO_TT_LOOKUP_REMOTE,
@@ -313,6 +313,7 @@ static const uint32 cluster_wait_event_infos[CLUSTER_WAIT_EVENTS_COUNT] = {
 	WAIT_EVENT_UNDO_BLOCK_INVALIDATE_WAIT,
 	WAIT_EVENT_UNDO_BLOCK_REMASTER_WAIT,
 	WAIT_EVENT_CLUSTER_UNDO_CAPACITY_WAIT,
+	WAIT_EVENT_CLUSTER_UNDO_TX_SLOT_WAIT,
 
 	/* Cluster: ADG (4) */
 	WAIT_EVENT_ADG_MRP_APPLY_WAIT,

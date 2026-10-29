@@ -980,6 +980,8 @@ dump_undo_cleaner(ReturnSetInfo *rsinfo)
 	if (capacity_available) {
 		emit_row(rsinfo, "undo_cleaner", "tt_capacity_origin_node_id",
 				 fmt_int32(capacity.origin_node_id));
+		emit_row(rsinfo, "undo_cleaner", "tt_slot_active_full_wait_count",
+				 fmt_uint64(capacity.active_full_wait_count));
 		emit_row(rsinfo, "undo_cleaner", "tt_capacity_pool_wait_count",
 				 fmt_uint64(capacity.pool_wait_count));
 		emit_row(rsinfo, "undo_cleaner", "tt_capacity_wakeup_recheck_count",

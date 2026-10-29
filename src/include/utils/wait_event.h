@@ -494,6 +494,7 @@ typedef enum {
 	WAIT_EVENT_UNDO_BLOCK_INVALIDATE_WAIT, /* spec-5.22b D2-6: PI-discard invalidate broadcast */
 	WAIT_EVENT_UNDO_BLOCK_REMASTER_WAIT,   /* spec-5.22b D2-6: remaster serve-gate wait */
 	WAIT_EVENT_CLUSTER_UNDO_CAPACITY_WAIT, /* Frontend undo capacity recheck. */
+	WAIT_EVENT_CLUSTER_UNDO_TX_SLOT_WAIT,  /* Frontend native transaction slot wait. */
 
 	/* Cluster: ADG (4 events) -- #95 */
 	WAIT_EVENT_ADG_MRP_APPLY_WAIT = PG_WAIT_CLUSTER_ADG,

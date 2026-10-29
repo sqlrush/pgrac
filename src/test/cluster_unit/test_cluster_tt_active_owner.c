@@ -10,6 +10,8 @@ int durable_fixture_main(int argc, char **argv);
 #include "test_cluster_tt_durable.c"
 #undef main
 #include "cluster/cluster_xid_stripe_boot.h"
+#include "storage/lock.h"
+#include "utils/wait_event.h"
 #include "../../backend/cluster/cluster_tt_slot.c"
 #include "../../backend/cluster/cluster_tt_local.c"
 
@@ -52,6 +54,14 @@ static bool capacity_rollover_fill_once;
 static bool capacity_passive_rollover;
 static bool capacity_selection_unknown;
 static bool capacity_prior_reservation;
+static bool slot_wait_test, slot_wait_context_safe, slot_wait_in_native;
+static unsigned slot_wait_lookups, slot_wait_calls, slot_wait_begins, slot_wait_ends;
+static unsigned slot_wait_cancels;
+static unsigned slot_wait_drift, slot_wait_owner_kind;
+static int slot_wait_error;
+static bool slot_wait_commit, slot_wait_terminal_capacity;
+static uint32 slot_wait_event;
+uint32 *my_wait_event_info = &slot_wait_event;
 static void fill_selected_segment(ClusterTTSlotAllocStatus status);
 bool cluster_shared_catalog;
 bool cluster_xid_striping;
@@ -269,9 +279,137 @@ cluster_undo_tt_rollover_locked(int node, uint32 old, bool *hard_cap, bool *no_s
 	return cluster_tt_slot_current_segment(node);
 }
 
+/* Native scheduling and the separately exercised safe-context predicate are
+ * leaf seams. Allocation, owner snapshot, selection and publication are real. */
+bool cluster_undo_cleaner_capacity_context_safe(void);
+void cluster_undo_cleaner_tx_slot_wait_begin(void);
+void cluster_undo_cleaner_tx_slot_wait_end(bool cancelled);
+
+bool
+cluster_undo_cleaner_capacity_context_safe(void)
+{
+	UT_ASSERT_EQ(lock_depth, 0);
+	UT_ASSERT_EQ(modifier_enters, modifier_leaves);
+	return slot_wait_context_safe && !capacity_other_admission;
+}
+
+void
+cluster_undo_cleaner_tx_slot_wait_begin(void)
+{
+	UT_ASSERT(!slot_wait_in_native);
+	slot_wait_in_native = true;
+	slot_wait_begins++;
+}
+
+void
+cluster_undo_cleaner_tx_slot_wait_end(bool cancelled)
+{
+	UT_ASSERT(slot_wait_in_native);
+	slot_wait_in_native = false;
+	slot_wait_ends++;
+	slot_wait_cancels += cancelled;
+}
+
+void
+pfree(void *pointer)
+{
+	free(pointer);
+}
+
+int
+geterrcode(void)
+{
+	return last_ereport_errcode;
+}
+
+VirtualTransactionId *
+GetLockConflicts(const LOCKTAG *tag, LOCKMODE mode, int *count)
+{
+	VirtualTransactionId *owners = calloc(3, sizeof(*owners));
+
+	UT_ASSERT(slot_wait_test);
+	UT_ASSERT_EQ(tag->locktag_type, LOCKTAG_TRANSACTION);
+	UT_ASSERT_EQ(tag->locktag_field1, 200);
+	UT_ASSERT_EQ(mode, ShareLock);
+	UT_ASSERT_EQ(lock_depth, 0);
+	UT_ASSERT_EQ(modifier_enters, modifier_leaves);
+	slot_wait_lookups++;
+	*count = slot_wait_owner_kind == 1 ? 0 : slot_wait_owner_kind == 2 ? 2 : 1;
+	owners[0].backendId = slot_wait_owner_kind == 3 ? InvalidBackendId : 9;
+	owners[0].localTransactionId = 19;
+	owners[1].backendId = 10;
+	owners[1].localTransactionId = 20;
+	if (slot_wait_owner_kind == 4)
+		slot_wait_context_safe = false;
+	if (slot_wait_drift != 0) {
+		unsigned drift = slot_wait_drift;
+
+		slot_wait_drift = 0;
+		if (drift == 1) {
+			cluster_tt_slot_rollover(0, 2, NULL);
+			cluster_tt_slot_rollover(0, 1, NULL);
+			/* Restore byte-identical slots: only the real binding generation
+			 * distinguishes this allocator lifetime from the first snapshot. */
+			for (unsigned i = 0; i < 48; i++) {
+				bool retained, current_drift;
+				uint16 wrap;
+
+				UT_ASSERT_EQ(cluster_tt_slot_alloc_current_exact(0, 1, 200 + i, &retained,
+																 &current_drift, &wrap),
+							 i);
+			}
+		} else
+			cluster_tt_slot_mark_aborted(1, 1, 201, allocator_storage.per_node[0].slots[1].wrap);
+	}
+	return owners;
+}
+
+bool
+VirtualXactLock(VirtualTransactionId owner, bool wait)
+{
+	const ClusterTTSlotAllocEntry *entry = &allocator_storage.per_node[0].slots[0];
+
+	UT_ASSERT(slot_wait_test && slot_wait_in_native);
+	UT_ASSERT_EQ(owner.backendId, 9);
+	UT_ASSERT_EQ(owner.localTransactionId, 19);
+	UT_ASSERT(wait);
+	UT_ASSERT_EQ(modifier_enters, modifier_leaves);
+	UT_ASSERT_EQ(lock_depth, 0);
+	UT_ASSERT_EQ(cluster_tt_local_binding_count, 0);
+	UT_ASSERT_EQ(g_bind_emit_calls, 0);
+	UT_ASSERT_EQ(g_ctrc_reserve_calls, 0);
+	UT_ASSERT_EQ(g_current_acquire_calls, 0);
+	slot_wait_calls++;
+	pgstat_report_wait_start(PG_WAIT_LOCK | LOCKTAG_VIRTUALTRANSACTION);
+	if (slot_wait_error != 0)
+		ereport(ERROR, (errcode(slot_wait_error), errmsg("native transaction wait ended")));
+	if (capacity_admission_change == 5)
+		modifier_refused = true;
+	if (capacity_admission_change == 6)
+		capacity_lease_current = false;
+	if (slot_wait_commit)
+		cluster_tt_slot_mark_committed(1, 0, 200, entry->wrap, (SCN)91);
+	else
+		cluster_tt_slot_mark_aborted(1, 0, 200, entry->wrap);
+	return true;
+}
+
 bool
 cluster_undo_cleaner_wait_for_capacity(uint32 segment, ClusterCtrcTxnKeyV1 *key)
 {
+	if (slot_wait_test && slot_wait_terminal_capacity) {
+		UT_ASSERT_EQ(segment, 1);
+		UT_ASSERT_EQ(slot_wait_calls, 1);
+		UT_ASSERT_EQ(cold_selection_calls, 0);
+		UT_ASSERT_EQ(g_bind_emit_calls, 0);
+		UT_ASSERT_EQ(lock_depth, 0);
+		UT_ASSERT_EQ(modifier_enters, modifier_leaves);
+		capacity_waits++;
+		/* Terminal/release/handoff are the existing cleaner boundary here;
+		 * the real allocator must still observe and claim FREE. */
+		cluster_tt_slot_free(1, 0);
+		return true;
+	}
 	UT_ASSERT(cold_fixture && cold_capacity_refused);
 	if (capacity_test) {
 		capacity_waits++;
@@ -389,6 +527,13 @@ reset_active_owner(void)
 	memset(&allocator_storage, 0, sizeof(allocator_storage));
 	ClusterTTSlotShm = &allocator_storage;
 	lock_depth = modifier_enters = modifier_leaves = rollovers_on_enter = 0;
+	slot_wait_test = slot_wait_in_native = slot_wait_commit = slot_wait_terminal_capacity = false;
+	slot_wait_context_safe = true;
+	slot_wait_lookups = slot_wait_calls = slot_wait_begins = slot_wait_ends = 0;
+	slot_wait_cancels = 0;
+	slot_wait_drift = slot_wait_owner_kind = 0;
+	slot_wait_error = 0;
+	slot_wait_event = WAIT_EVENT_CLIENT_READ;
 	modifier_refused = false;
 	cluster_shared_config = false;
 	MyBackendType = B_BACKEND;
@@ -546,8 +691,8 @@ UT_TEST(test_binding_growth_error_preserves_existing_reservations)
 		uint32 slot_id;
 		bool preflight_safe = true;
 
-		UT_ASSERT(
-			cluster_tt_local_reserve_binding(101 + i, &segment, &slot, &slot_id, &preflight_safe));
+		UT_ASSERT(cluster_tt_local_reserve_binding(101 + i, &segment, &slot, &slot_id,
+												   &preflight_safe, false));
 	}
 	UT_ASSERT_EQ(cluster_tt_local_binding_count, 8);
 	UT_ASSERT_EQ(cluster_tt_local_binding_capacity, 8);
@@ -1210,6 +1355,179 @@ UT_TEST(test_missing_origin_identity_never_changes_active_success)
 	UT_ASSERT(!cluster_tt_slot_origin_identity_read(&g_ctrc_original_reservation.key, &full));
 	UT_ASSERT_EQ(lock_depth, 0);
 }
+/* This catches the original immediate 54000 branch, using 48 allocations
+ * rather than supplying a precomputed NEED_ACTIVE verdict to the caller. */
+static void
+start_full_active_test(void)
+{
+	reset_active_owner();
+	slot_wait_test = capacity_test = true;
+	for (unsigned i = 0; i < 48; i++) {
+		bool retained = true, drift = true;
+		uint16 wrap;
+
+		UT_ASSERT_EQ(cluster_tt_slot_alloc_current_exact(0, 1, 200 + i, &retained, &drift, &wrap),
+					 i);
+		UT_ASSERT(!retained && !drift);
+	}
+}
+
+UT_TEST(test_49th_active_transaction_waits_in_selected_segment_without_rollover)
+{
+	for (unsigned commit = 0; commit < 2; commit++) {
+		start_full_active_test();
+		slot_wait_commit = commit != 0;
+		require_published_on(1);
+		UT_ASSERT_EQ(slot_wait_calls, 1);
+		UT_ASSERT_EQ(slot_wait_begins, 1);
+		UT_ASSERT_EQ(slot_wait_ends, 1);
+		UT_ASSERT(!slot_wait_in_native);
+		UT_ASSERT_EQ(slot_wait_event, WAIT_EVENT_CLIENT_READ);
+		UT_ASSERT_EQ(cold_selection_calls, 0);
+		UT_ASSERT_EQ(capacity_waits, 0);
+		for (unsigned i = 1; i < 48; i++) {
+			UT_ASSERT_EQ(allocator_storage.per_node[0].slots[i].status, CTS_ACTIVE);
+			UT_ASSERT_EQ(allocator_storage.per_node[0].slots[i].xid, 200 + i);
+		}
+	}
+}
+
+UT_TEST(test_active_native_errors_propagate_without_publishing_or_double_leave)
+{
+	static const int errors[]
+		= { ERRCODE_QUERY_CANCELED, ERRCODE_LOCK_NOT_AVAILABLE, ERRCODE_T_R_DEADLOCK_DETECTED,
+			ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS };
+
+	for (unsigned i = 0; i < lengthof(errors); i++) {
+		start_full_active_test();
+		slot_wait_error = errors[i];
+		require_capacity_error(errors[i]);
+		UT_ASSERT_EQ(slot_wait_calls, 1);
+		UT_ASSERT_EQ(slot_wait_begins, 1);
+		UT_ASSERT_EQ(slot_wait_ends, 1);
+		UT_ASSERT(!slot_wait_in_native);
+		UT_ASSERT_EQ(slot_wait_cancels, errors[i] == ERRCODE_QUERY_CANCELED);
+		UT_ASSERT_EQ(slot_wait_event, WAIT_EVENT_CLIENT_READ);
+		UT_ASSERT_EQ(cold_selection_calls, 0);
+	}
+}
+
+UT_TEST(test_active_wait_rechecks_exact_admission_and_lease_before_reservation)
+{
+	for (unsigned change = 1; change <= 6; change++) {
+		start_full_active_test();
+		capacity_admission_change = change;
+		cluster_shared_catalog = cluster_xid_striping = true;
+		require_capacity_error(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS);
+		UT_ASSERT_EQ(slot_wait_calls, 1);
+		UT_ASSERT_EQ(capacity_lease_captures, 1);
+		UT_ASSERT_EQ(cold_selection_calls, 0);
+	}
+}
+
+UT_TEST(test_active_wait_refuses_unknown_prepared_or_changed_unsafe_context)
+{
+	for (unsigned refusal = 0; refusal < 5; refusal++) {
+		start_full_active_test();
+		slot_wait_context_safe = refusal != 0;
+		slot_wait_owner_kind = refusal;
+		require_capacity_error(ERRCODE_PROGRAM_LIMIT_EXCEEDED);
+		UT_ASSERT_EQ(slot_wait_calls, 0);
+		UT_ASSERT_EQ(slot_wait_begins, 0);
+		UT_ASSERT_EQ(cold_selection_calls, 0);
+	}
+}
+
+UT_TEST(test_active_snapshot_change_reenters_allocator_without_native_wait)
+{
+	for (unsigned drift = 1; drift < 3; drift++) {
+		start_full_active_test();
+		slot_wait_drift = drift;
+		require_published_on(1);
+		UT_ASSERT_EQ(slot_wait_lookups, drift == 1 ? 2 : 1);
+		UT_ASSERT_EQ(slot_wait_calls, drift == 1 ? 1 : 0);
+		UT_ASSERT_EQ(cold_selection_calls, 0);
+	}
+}
+
+UT_TEST(test_active_wait_terminal_cleanup_uses_original_capacity_not_rollover)
+{
+	start_full_active_test();
+	cluster_undo_retention_horizon_enabled = true;
+	slot_wait_commit = slot_wait_terminal_capacity = true;
+	require_published_on(1);
+	UT_ASSERT_EQ(slot_wait_calls, 1);
+	UT_ASSERT_EQ(capacity_waits, 1);
+	UT_ASSERT_EQ(cold_selection_calls, 0);
+	cluster_undo_retention_horizon_enabled = false;
+}
+
+UT_TEST(test_active_wait_unknown_slot_identity_never_acquires_native_wait)
+{
+	for (unsigned fault = 0; fault < 7; fault++) {
+		ClusterTTSlotAllocPerSegment *segment;
+
+		start_full_active_test();
+		segment = &allocator_storage.per_node[0];
+		switch (fault) {
+		case 0:
+			segment->binding_generation = 0;
+			break;
+		case 1:
+			segment->binding_generation = UINT64_MAX;
+			break;
+		case 2:
+			segment->slots[47].xid = FrozenTransactionId;
+			break;
+		case 3:
+			segment->slots[47].xid = 200;
+			break;
+		case 4:
+			segment->slots[47].wrap = TT_WRAP_INVALID;
+			break;
+		case 5:
+			segment->slots[47].commit_scn = (SCN)91;
+			break;
+		case 6:
+			segment->slots[47].status = UINT8_MAX;
+			break;
+		}
+		require_capacity_error(ERRCODE_PROGRAM_LIMIT_EXCEEDED);
+		UT_ASSERT_EQ(slot_wait_lookups, 0);
+		UT_ASSERT_EQ(slot_wait_calls, 0);
+		UT_ASSERT_EQ(cold_selection_calls, 0);
+	}
+}
+
+UT_TEST(test_allocator_snapshot_is_complete_readonly_and_unavailable_leaves_output)
+{
+	ClusterTTSlotCurrentSnapshot snapshot, before;
+	ClusterTTSlotShmem *saved;
+
+	start_full_active_test();
+	UT_ASSERT(cluster_tt_slot_current_snapshot(0, &snapshot));
+	UT_ASSERT_EQ(snapshot.segment_id, 1);
+	UT_ASSERT_EQ(snapshot.binding_generation, 1);
+	for (unsigned i = 0; i < 48; i++) {
+		UT_ASSERT_EQ(snapshot.slots[i].segment_id, 1);
+		UT_ASSERT_EQ(snapshot.slots[i].slot_offset, i);
+		UT_ASSERT_EQ(snapshot.slots[i].xid, 200 + i);
+		UT_ASSERT_EQ(snapshot.slots[i].status, CTS_ACTIVE);
+	}
+	before = snapshot;
+	saved = ClusterTTSlotShm;
+	ClusterTTSlotShm = NULL;
+	UT_ASSERT(!cluster_tt_slot_current_snapshot(0, &snapshot));
+	ClusterTTSlotShm = saved;
+	UT_ASSERT(!cluster_tt_slot_current_snapshot(-1, &snapshot));
+	UT_ASSERT(!cluster_tt_slot_current_snapshot(128, &snapshot));
+	UT_ASSERT(!cluster_tt_slot_current_snapshot(0, NULL));
+	UT_ASSERT_EQ(memcmp(&before, &snapshot, sizeof(before)), 0);
+	UT_ASSERT_EQ(cluster_tt_slot_current_segment(0), 1);
+	UT_ASSERT_EQ(g_bind_emit_calls, 0);
+	UT_ASSERT_EQ(lock_depth, 0);
+}
+
 #ifdef TT_ACTIVE_OWNER_FIXTURE_MAIN
 int TT_ACTIVE_OWNER_FIXTURE_MAIN(void);
 #define main TT_ACTIVE_OWNER_FIXTURE_MAIN
@@ -1218,7 +1536,15 @@ int TT_ACTIVE_OWNER_FIXTURE_MAIN(void);
 int
 main(void)
 {
-	UT_PLAN(37);
+	UT_PLAN(45);
+	UT_RUN(test_active_wait_unknown_slot_identity_never_acquires_native_wait);
+	UT_RUN(test_allocator_snapshot_is_complete_readonly_and_unavailable_leaves_output);
+	UT_RUN(test_49th_active_transaction_waits_in_selected_segment_without_rollover);
+	UT_RUN(test_active_native_errors_propagate_without_publishing_or_double_leave);
+	UT_RUN(test_active_wait_rechecks_exact_admission_and_lease_before_reservation);
+	UT_RUN(test_active_wait_refuses_unknown_prepared_or_changed_unsafe_context);
+	UT_RUN(test_active_snapshot_change_reenters_allocator_without_native_wait);
+	UT_RUN(test_active_wait_terminal_cleanup_uses_original_capacity_not_rollover);
 	UT_RUN(test_recovered_open_gate_precedes_canonical_reservation);
 	UT_RUN(test_binding_memory_error_precedes_allocator_and_cold_selection);
 	UT_RUN(test_binding_growth_error_preserves_existing_reservations);
