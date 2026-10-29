@@ -543,6 +543,18 @@ extern TransactionId GetCurrentTransactionIdIfAny(void);
 extern TransactionId GetStableLatestTransactionId(void);
 extern SubTransactionId GetCurrentSubTransactionId(void);
 extern FullTransactionId GetTopFullTransactionId(void);
+#ifdef USE_PGRAC_CLUSTER
+/* Dormant opt-in before the first top XID assignment. Identity only routes to
+ * the original qualified retention directory; it grants no authority. The
+ * original native allocator initializes FULL CLOG before publication, and all
+ * descendants use the same route. An entered assignment ERROR blocks further
+ * retained assignment until the next original top-level transaction boundary.
+ * No live caller, recovery completion or retention release is enabled here.
+ * Author: SqlRush <sqlrush@gmail.com>
+ * Spec: 2026-10-14-pre2-m5-e1-format-closure-v1.md */
+extern FullTransactionId GetTopFullTransactionIdRelmap(uint64 system_identifier,
+	uint64 database_incarnation, uint16 origin);
+#endif
 extern FullTransactionId GetTopFullTransactionIdIfAny(void);
 extern FullTransactionId GetCurrentFullTransactionId(void);
 extern FullTransactionId GetCurrentFullTransactionIdIfAny(void);

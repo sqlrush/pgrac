@@ -11500,15 +11500,18 @@ test_cluster_xid_retention_xact_types.inc: $(top_srcdir)/src/backend/access/tran
 
 test_cluster_xid_retention_xact_functions.inc: $(top_srcdir)/src/backend/access/transam/xact.c Makefile
 	awk '/^AssignTransactionId\(/ { print "static void"; emit=1; functions++ } \
+	     /^ResetRelmapTransactionIdAllocation\(/ { print "static void pg_attribute_unused()"; emit=1; functions++ } \
 	     /^IsTransactionState\(/ { print "static bool"; emit=1; functions++ } \
 	     /^GetTopTransactionId\(/ { print "static TransactionId"; emit=1; functions++ } \
 	     /^GetTopFullTransactionId(IfAny)?\(/ { print "static FullTransactionId"; emit=1; functions++ } \
-	     emit { print } /^}/ { emit=0 } END { if (functions != 5) exit 1 }' $< > $@.tmp
+	     /^(GetTopFullTransactionIdRelmap|GetCurrentFullTransactionId)\(/ { print "static FullTransactionId pg_attribute_unused()"; emit=1; functions++ } \
+	     emit { print } /^}/ { emit=0 } END { if (functions != 8) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 XID_RETENTION_TEST_INPUTS = test_cluster_xid_retention.c test_cluster_xid_allocation.c \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h \
 		$(top_srcdir)/src/include/access/transam.h \
+		$(top_srcdir)/src/include/access/xact.h \
 		test_cluster_pgproc_active_types.inc \
 		test_cluster_xid_allocation_stripe.inc \
 		$(top_srcdir)/src/include/cluster/cluster_xid_stripe_boot.h \
@@ -11589,7 +11592,8 @@ test_cluster_xid_native_clog: test_cluster_xid_native_clog_main.o \
 TESTS += test_cluster_xid_retention_native_clog
 all: test_cluster_xid_retention_native_clog
 test_cluster_xid_retention_native_clog_main.o: $(XID_RETENTION_TEST_INPUTS) \
-		test_cluster_xid_retention_native_clog.inc test_cluster_xid_native_clog.h Makefile
+		test_cluster_xid_retention_native_clog.inc test_cluster_xid_retention_native_xact.inc \
+		test_cluster_xid_native_clog.h Makefile
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DTEST_CLUSTER_XID_RETENTION_NATIVE_CLOG -c $< -o $@
 
 test_cluster_xid_retention_native_clog: test_cluster_xid_retention_native_clog_main.o \

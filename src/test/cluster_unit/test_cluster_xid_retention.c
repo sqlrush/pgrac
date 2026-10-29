@@ -465,6 +465,7 @@ UT_TEST(retention_guard_valid_entry_observes_under_both_locks_and_returns_only_i
 
 #ifdef TEST_CLUSTER_XID_RETENTION_NATIVE_CLOG
 #include "test_cluster_xid_retention_native_clog.inc"
+#include "test_cluster_xid_retention_native_xact.inc"
 #endif
 
 int
@@ -472,7 +473,7 @@ main(void)
 {
 #ifdef TEST_CLUSTER_XID_RETENTION_NATIVE_CLOG
 	bool focus = getenv("PGRAC_RETENTION_NATIVE_CLOG_FOCUS") != NULL;
-	UT_PLAN(focus ? 6 : 27);
+	UT_PLAN(focus ? 12 : 33);
 	if (!focus) {
 #else
 	UT_PLAN(21);
@@ -506,6 +507,12 @@ main(void)
 	UT_RUN(retained_native_lease_wait_rederives_before_clog);
 	UT_RUN(retained_native_late_guard_refusal_keeps_born_page_and_pins);
 	UT_RUN(retained_native_wal_error_keeps_unpublished_issuance_and_pins);
+	UT_RUN(retained_xact_top_and_children_use_actual_native_birth);
+	UT_RUN(retained_xact_wrap_and_ordinary_identity_are_distinct);
+	UT_RUN(retained_xact_identity_and_admission_refuse_before_effects);
+	UT_RUN(retained_xact_guard_and_native_error_never_retry);
+	UT_RUN(retained_xact_postpublication_error_keeps_top_and_pins);
+	UT_RUN(retained_xact_reset_does_not_leak_to_next_transaction);
 #endif
 	free(relmap_runtime_shmem);
 	UT_DONE();

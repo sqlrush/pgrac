@@ -192,6 +192,7 @@
 #include "cluster/cluster_touched_peers.h"	  /* PGRAC: spec-5.14 D1 per-tx reset */
 #include "cluster/cluster_visibility_resolve.h" /* PGRAC: spec-6.14 D8 depth reset */
 #include "cluster/cluster_relmap_lock.h"		  /* PGRAC: spec-6.14 D5 abort release */
+#include "cluster/cluster_relmap_retention_runtime.h"
 #include "cluster/cluster_clean_leave.h"		  /* PGRAC: spec-5.13 §3.1 refuse-writes gate */
 #include "cluster/cluster_node_remove.h"		  /* PGRAC: spec-5.18 INV-LF9 self-demote gate */
 #include "cluster/cluster_reconfig.h"			  /* PGRAC: spec-5.15 §2.4 joiner write gate */
@@ -341,6 +342,17 @@ typedef struct TransactionStateData
 	int			parallelModeLevel;	/* Enter/ExitParallelMode counter */
 	bool		chain;			/* start a new block after this one */
 	bool		topXidLogged;	/* for a subxact: is top-level XID logged? */
+	/* Dormant allocation route, owned only by TopTransactionStateData.
+	 * Routing identities do not confer retained-directory authority.
+	 * Author: SqlRush <sqlrush@gmail.com>
+	 * Spec: 2026-10-14-pre2-m5-e1-format-closure-v1.md */
+#ifdef USE_PGRAC_CLUSTER
+	uint64		relmapSystemIdentifier;
+	uint64		relmapDatabaseIncarnation;
+	uint16		relmapOrigin;
+	bool		relmapRetainedAllocation;
+	bool		relmapAssignmentFailed;
+#endif
 	struct TransactionStateData *parent;	/* back link to parent */
 } TransactionStateData;
 
@@ -610,6 +622,54 @@ GetTopFullTransactionId(void)
 		AssignTransactionId(&TopTransactionStateData);
 	return XactTopFullTransactionId;
 }
+
+#ifdef USE_PGRAC_CLUSTER
+/* Only the original next top-level transaction may retire this local route.
+ * No retention pin, native page or original outcome duty is changed.
+ * Author: SqlRush <sqlrush@gmail.com>
+ * Spec: 2026-10-14-pre2-m5-e1-format-closure-v1.md */
+static void
+ResetRelmapTransactionIdAllocation(void)
+{
+	TopTransactionStateData.relmapSystemIdentifier = 0;
+	TopTransactionStateData.relmapDatabaseIncarnation = 0;
+	TopTransactionStateData.relmapOrigin = 0;
+	TopTransactionStateData.relmapRetainedAllocation = false;
+	TopTransactionStateData.relmapAssignmentFailed = false;
+}
+
+/* Explicit dormant entry. All descendants keep the same original allocation
+ * route, including through the ordinary current-XID accessors. Never adopt an
+ * already issued ordinary top XID or switch the retained identity mid-xact.
+ * Author: SqlRush <sqlrush@gmail.com>
+ * Spec: 2026-10-14-pre2-m5-e1-format-closure-v1.md */
+FullTransactionId
+GetTopFullTransactionIdRelmap(uint64 system_identifier,
+							uint64 database_incarnation, uint16 origin)
+{
+	TransactionState top = &TopTransactionStateData;
+
+	if (!cluster_enabled || !cluster_shared_config || !IsNormalProcessingMode()
+		|| cluster_node_id < 0 || origin != cluster_node_id
+		|| origin >= CLUSTER_MAX_NODES || system_identifier == 0 || database_incarnation == 0
+		|| top->state != TRANS_INPROGRESS || CurrentTransactionState->state != TRANS_INPROGRESS
+		|| IsInParallelMode() || IsParallelWorker()
+		|| top->relmapAssignmentFailed
+		|| (top->relmapRetainedAllocation
+			? (top->relmapSystemIdentifier != system_identifier
+				|| top->relmapDatabaseIncarnation != database_incarnation || top->relmapOrigin != origin)
+			: FullTransactionIdIsValid(XactTopFullTransactionId)))
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
+				 errmsg("cannot select retained transaction ID allocation for this transaction")));
+
+	top->relmapSystemIdentifier = system_identifier;
+	top->relmapDatabaseIncarnation = database_incarnation;
+	top->relmapOrigin = origin;
+	top->relmapRetainedAllocation = true;
+	return GetTopFullTransactionId();
+}
+#endif
 
 /*
  *	GetTopFullTransactionIdIfAny
@@ -902,7 +962,24 @@ AssignTransactionId(TransactionState s)
 	 * PGPROC, the subtrans entry is needed to ensure that other backends see
 	 * the Xid as "running".  See GetNewTransactionId.
 	 */
-	s->fullTransactionId = GetNewTransactionId(isSubXact);
+#ifdef USE_PGRAC_CLUSTER
+	if (TopTransactionStateData.relmapRetainedAllocation)
+	{
+		if (TopTransactionStateData.relmapAssignmentFailed)
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
+					 errmsg("retained transaction ID assignment previously failed")));
+		/* Native initialization, publication and all original downstream
+		 * bookkeeping must finish before another assignment is allowed. */
+		TopTransactionStateData.relmapAssignmentFailed = true;
+		s->fullTransactionId = cluster_relmap_retention_allocate_xid_v2(isSubXact,
+			TopTransactionStateData.relmapSystemIdentifier,
+			TopTransactionStateData.relmapDatabaseIncarnation,
+			TopTransactionStateData.relmapOrigin);
+	}
+	else
+#endif
+		s->fullTransactionId = GetNewTransactionId(isSubXact);
 	if (!isSubXact)
 		XactTopFullTransactionId = s->fullTransactionId;
 
@@ -981,6 +1058,10 @@ AssignTransactionId(TransactionState s)
 			TopTransactionStateData.didLogXid = true;
 		}
 	}
+#ifdef USE_PGRAC_CLUSTER
+	if (TopTransactionStateData.relmapRetainedAllocation)
+		TopTransactionStateData.relmapAssignmentFailed = false;
+#endif
 }
 
 /*
@@ -2586,6 +2667,7 @@ StartTransaction(void)
 	Assert(s->state == TRANS_DEFAULT);
 
 #ifdef USE_PGRAC_CLUSTER
+	ResetRelmapTransactionIdAllocation();
 	/* PGRAC: the real transaction boundary also covers AND CHAIN and several
 	 * transactions in one frontend message. Never apply protocol defaults in
 	 * the old transaction's cleanup or after new resources have been acquired.
