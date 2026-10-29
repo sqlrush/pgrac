@@ -135,6 +135,7 @@ RegisterResourceReleaseCallback(ResourceReleaseCallback callback, void *arg)
 }
 
 #include "test_cluster_wal_inputs_job_pin_fixture.h"
+#include "test_cluster_wal_inputs_job_scope_fixture.h"
 
 /* Compile the complete, unchanged production implementation in this unit.
  * Internal state is visible only here for corruption and overflow cases. */

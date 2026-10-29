@@ -112,11 +112,118 @@ struct ClusterWalInputsV1 {
 	uint32 local_index;
 	ClusterWalWriterFlushV1 local_cut;
 	ClusterWalCutV1 *remote[CLUSTER_WAL_INPUTS_MAX];
+	ClusterWalInputsJobV1 *job; /* Cleanup backlink, never input authority. */
 };
 
-StaticAssertDecl(sizeof(ClusterWalInputsV1) + CLUSTER_WAL_INPUT_JOB_BACKLINK_RESERVE
+StaticAssertDecl(sizeof(ClusterWalInputsV1)
 				 <= CLUSTER_WAL_INPUT_JOB_SCOPE_BYTES,
 				 "WAL input scope exceeds its payload envelope");
+
+/* Only two consumer classes are valid for either original Aux role. Keep
+ * allocation witnesses outside borrowed scopes before dereferencing them. */
+static ClusterWalInputsV1 *inputs_job_scopes[CLUSTER_WAL_INPUT_JOB_COUNT / 2];
+StaticAssertDecl(2 * sizeof(inputs_job_scopes)
+				 <= sizeof(((ClusterWalInputsJobControlBudgetV1 *)0)->scope_locators),
+				 "WAL input scope locators exceed their control charge");
+
+bool
+cluster_wal_inputs_scope_job_binding_v1(ClusterWalInputsJobV1 *job)
+{
+	ClusterWalInputsV1 *scope = job->inputs;
+	ClusterRecoveryTxIoScopeV1 tx;
+	ClusterRecoveryCtrcIoScopeV1 ctrc;
+
+	if (scope == NULL) {
+		for (unsigned i = 0; i < lengthof(inputs_job_scopes); ++i)
+			if (inputs_job_scopes[i] != NULL && inputs_job_scopes[i]->job == job)
+				return false;
+		return true;
+	}
+	if (job->consumer >= CLUSTER_WAL_INPUT_JOB_COUNT
+		|| inputs_job_scopes[job->consumer / 2] != scope)
+		return false;
+	memset(&tx, 0, sizeof(tx));
+	memset(&ctrc, 0, sizeof(ctrc));
+	ctrc.namespace_fd = -1;
+	if (scope->job != job || scope->owner != job->owner || scope->pid != job->owner_pid
+		|| scope->purpose != WAL_INPUTS_ONLINE
+		|| scope->thread_count > CLUSTER_WAL_RETENTION_MAX_THREADS || scope->count > CLUSTER_WAL_INPUTS_MAX
+		|| memcmp(&scope->tx, &tx, sizeof(tx)) != 0 || memcmp(&scope->ctrc, &ctrc, sizeof(ctrc)) != 0)
+		return false;
+	/* No remote producer is wired in this storage-only slice. Never discard
+	 * an unimplemented descriptor responsibility as if it were absent. */
+	for (unsigned i = 0; i < lengthof(scope->remote); ++i)
+		if (scope->remote[i] != NULL)
+			return false;
+	if ((job->state == WAL_INPUT_JOB_STATE_BUILDING || job->pin != NULL) && scope->pin != job->pin)
+		return false;
+	return job->state != WAL_INPUT_JOB_STATE_DONE || (scope->stale && scope->suspended && scope->pin == NULL);
+}
+
+ClusterWalInputsV1 *
+cluster_wal_inputs_scope_job_allocate_v1(ClusterWalInputsJobV1 *job)
+{
+	MemoryContext context = cluster_wal_inputs_job_context_v1(job);
+	ClusterWalInputsV1 *scope;
+
+	if (context == NULL || job->state != WAL_INPUT_JOB_STATE_NEW || job->pin != NULL
+		|| job->inputs != NULL || inputs_job_scopes[job->consumer / 2] != NULL)
+		return NULL;
+	scope = MemoryContextAllocZero(context, sizeof(*scope));
+	scope->ctrc.namespace_fd = -1;
+	scope->pid = job->owner_pid;
+	scope->owner = job->owner;
+	scope->purpose = WAL_INPUTS_ONLINE;
+	scope->job = job;
+	inputs_job_scopes[job->consumer / 2] = scope;
+	return scope;
+}
+
+ClusterWalReadPinV1 **
+cluster_wal_inputs_scope_job_pin_slot_v1(ClusterWalInputsJobV1 *job)
+{
+	if (cluster_wal_inputs_job_context_v1(job) == NULL || job->state != WAL_INPUT_JOB_STATE_BUILDING
+		|| job->inputs == NULL || !cluster_wal_inputs_scope_job_binding_v1(job))
+		return NULL;
+	return &job->inputs->pin;
+}
+
+bool
+cluster_wal_inputs_scope_job_revoke_v1(ClusterWalInputsJobV1 *job)
+{
+	if (!cluster_wal_inputs_scope_job_binding_v1(job))
+		return false;
+	if (job->inputs != NULL)
+		job->inputs->stale = true;
+	return true;
+}
+
+bool
+cluster_wal_inputs_scope_job_drained_v1(ClusterWalInputsJobV1 *job)
+{
+	if (!cluster_wal_inputs_scope_job_binding_v1(job) || job->pin != NULL
+		|| job->cf.state == CF_JOB_RECEIPT_RETIRING || (job->flags & WAL_INPUT_JOB_FLAG_REVOKED) == 0)
+		return false;
+	if (job->inputs != NULL) {
+		job->inputs->pin = NULL;
+		job->inputs->stale = job->inputs->suspended = true;
+	}
+	return true;
+}
+
+bool
+cluster_wal_inputs_scope_job_forget_v1(ClusterWalInputsJobV1 *job)
+{
+	if (!cluster_wal_inputs_scope_job_binding_v1(job) || job->state != WAL_INPUT_JOB_STATE_DONE
+		|| job->pin != NULL || job->cf.state == CF_JOB_RECEIPT_RETIRING)
+		return false;
+	if (job->inputs != NULL) {
+		inputs_job_scopes[job->consumer / 2] = NULL;
+		job->inputs->job = NULL;
+		job->inputs = NULL;
+	}
+	return true;
+}
 
 /* A locator, not another owner or a grant. Keep the native incarnation outside
  * borrowed allocations so stale/forged views are rejected before dereference. */
@@ -170,6 +277,9 @@ inputs_scope_role(const ClusterWalInputsV1 *inputs)
 {
 	const ClusterColdTypedV1 *typed;
 	uint64 generation, serial;
+	/* Only the frozen job publication path may make this storage usable. */
+	if (inputs->job != NULL)
+		return false;
 	if (inputs->purpose == WAL_INPUTS_CTRC_CENSUS) {
 		ClusterRecoveryCheckpointOwnerV1 owner;
 
@@ -474,6 +584,8 @@ cluster_wal_inputs_release_v1(ClusterWalInputsV1 **inputs)
 		return;
 	if (!inputs_owned(*inputs))
 		elog(ERROR, "WAL input scope belongs to another resource owner");
+	if ((*inputs)->job != NULL)
+		elog(ERROR, "WAL input job scope requires its original job cleanup");
 	inputs_tx_serial_release(*inputs);
 	inputs_namespace_close(*inputs);
 	for (uint32 i = 0; i < CLUSTER_WAL_INPUTS_MAX; i++)

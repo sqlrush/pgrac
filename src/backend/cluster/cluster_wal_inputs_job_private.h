@@ -77,6 +77,8 @@ typedef struct ClusterWalInputsJobControlBudgetV1 {
 	ClusterWalInputsJobCallbackBudgetV1 callbacks[2];
 	ClusterWalInputsJobV1 *caller_links[CLUSTER_WAL_INPUT_JOB_COUNT];
 	ClusterWalInputsJobV1 *scope_links[CLUSTER_WAL_INPUT_JOB_COUNT];
+	/* Two permitted consumer classes per Aux, across both original Aux roles. */
+	ClusterWalInputsV1 *scope_locators[CLUSTER_WAL_INPUT_JOB_COUNT];
 	ClusterWalInputsJobV1 *pin_links[2];
 	/* Original pin/member padding carries these persistent native/retiring
 	 * flags. Charge both Aux processes even though only one pin is active. */
@@ -98,6 +100,15 @@ extern bool cluster_wal_inputs_job_pin_detach_v1(ClusterWalInputsJobV1 *job,
 	ClusterWalReadPinV1 *pin, uint64 generation);
 extern bool cluster_wal_inputs_job_pin_cleanup_v1(ClusterWalInputsJobV1 *job,
 	ClusterWalReadPinV1 *pin, uint64 generation, bool error, bool owner_cleanup);
+
+/* BUILDING storage only, never input-use or ROOT admission. */
+extern bool cluster_wal_inputs_job_scope_create_v1(ClusterWalInputsJobV1 *job);
+extern ClusterWalInputsV1 *cluster_wal_inputs_scope_job_allocate_v1(ClusterWalInputsJobV1 *job);
+extern bool cluster_wal_inputs_scope_job_binding_v1(ClusterWalInputsJobV1 *job);
+extern bool cluster_wal_inputs_scope_job_revoke_v1(ClusterWalInputsJobV1 *job);
+extern bool cluster_wal_inputs_scope_job_drained_v1(ClusterWalInputsJobV1 *job);
+extern bool cluster_wal_inputs_scope_job_forget_v1(ClusterWalInputsJobV1 *job);
+extern ClusterWalReadPinV1 **cluster_wal_inputs_scope_job_pin_slot_v1(ClusterWalInputsJobV1 *job);
 
 StaticAssertDecl(CLUSTER_WAL_INPUT_JOB_COUNT == 4, "WAL input job slot count changed");
 StaticAssertDecl(CLUSTER_WAL_RETENTION_MAX_THREADS == 128, "WAL input member limit changed");

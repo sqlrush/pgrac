@@ -76,9 +76,8 @@ inputs_job_find(ClusterWalInputsJobV1 *job, bool owner_cleanup)
 			for (unsigned j = 0; j < sizeof(job->reserved); ++j)
 				if (job->reserved[j] != 0)
 					return NULL;
-			/* Input publication remains unsupported. A bound pin is original
-			 * BUILDING/cleanup storage, never a usable input scope. */
-			if (job->inputs != NULL
+			/* Bound scope/pin storage is still BUILDING/cleanup-only. */
+			if (!cluster_wal_inputs_scope_job_binding_v1(job)
 				|| !cluster_wal_read_pin_job_binding_v1(job, job->pin,
 					job->pin_generation, job->walr_next)
 				|| (job->state != WAL_INPUT_JOB_STATE_NEW
@@ -87,8 +86,8 @@ inputs_job_find(ClusterWalInputsJobV1 *job, bool owner_cleanup)
 					&& job->state != WAL_INPUT_JOB_STATE_RETIRING_WALR
 					&& job->state != WAL_INPUT_JOB_STATE_DONE)
 				|| (job->state == WAL_INPUT_JOB_STATE_NEW
-					&& (job->pin != NULL || job->walr_next != 0))
-				|| (job->state == WAL_INPUT_JOB_STATE_BUILDING && job->pin == NULL)
+					&& (job->inputs != NULL || job->pin != NULL || job->walr_next != 0))
+				|| (job->state == WAL_INPUT_JOB_STATE_BUILDING && job->inputs == NULL && job->pin == NULL)
 				|| (job->state != WAL_INPUT_JOB_STATE_RETIRING_WALR && job->walr_next != 0)
 				|| ((job->state == WAL_INPUT_JOB_STATE_NEW || job->state == WAL_INPUT_JOB_STATE_BUILDING)
 					? job->flags != 0
@@ -111,6 +110,26 @@ inputs_job_transition(ClusterWalInputsJobSlotV1 *slot, uint32 state, uint16 flag
 {
 	slot->job->state = slot->state = state;
 	slot->job->flags = slot->flags = flags;
+	if ((flags & WAL_INPUT_JOB_FLAG_REVOKED) != 0
+		&& !cluster_wal_inputs_scope_job_revoke_v1(slot->job))
+		elog(FATAL, "invalid original WAL input scope during revocation");
+}
+
+bool
+cluster_wal_inputs_job_scope_create_v1(ClusterWalInputsJobV1 *job)
+{
+	ClusterWalInputsJobSlotV1 *slot = inputs_job_find(job, false);
+	ClusterWalInputsV1 *scope;
+
+	if (slot == NULL || job->state != WAL_INPUT_JOB_STATE_NEW || job->pin != NULL
+		|| job->inputs != NULL || job->cf.state == CF_JOB_RECEIPT_RETIRING)
+		return false;
+	scope = cluster_wal_inputs_scope_job_allocate_v1(job);
+	if (scope == NULL)
+		return false;
+	job->inputs = scope;
+	inputs_job_transition(slot, WAL_INPUT_JOB_STATE_BUILDING, job->flags);
+	return true;
 }
 
 bool
@@ -119,7 +138,8 @@ cluster_wal_inputs_job_pin_bind_v1(ClusterWalInputsJobV1 *job, ClusterWalReadPin
 {
 	ClusterWalInputsJobSlotV1 *slot = inputs_job_find(job, false);
 
-	if (slot == NULL || job->state != WAL_INPUT_JOB_STATE_NEW || job->pin != NULL
+	if (slot == NULL || (job->state != WAL_INPUT_JOB_STATE_NEW && job->state != WAL_INPUT_JOB_STATE_BUILDING)
+		|| job->pin != NULL
 		|| job->cf.state == CF_JOB_RECEIPT_RETIRING || pin == NULL
 		|| !cluster_wal_read_pin_job_binding_v1(NULL, pin, generation, 0))
 		return false;
@@ -254,7 +274,8 @@ cluster_wal_inputs_job_open_v1(ClusterWalInputsConsumerV1 consumer, MemoryContex
 MemoryContext
 cluster_wal_inputs_job_context_v1(ClusterWalInputsJobV1 *job)
 {
-	return inputs_job_find(job, false) != NULL && job->state == WAL_INPUT_JOB_STATE_NEW
+	return inputs_job_find(job, false) != NULL && job->pin == NULL
+		&& (job->state == WAL_INPUT_JOB_STATE_NEW || job->state == WAL_INPUT_JOB_STATE_BUILDING)
 		&& job->cf.state != CF_JOB_RECEIPT_RETIRING ? job->context : NULL;
 }
 
@@ -284,6 +305,8 @@ inputs_job_retire_step(ClusterWalInputsJobV1 *job, bool first)
 		if (released != CLUSTER_WALR_RELEASE_CONFIRMED)
 			return released == CLUSTER_WALR_RELEASE_UNCONFIRMED ? WAL_INPUT_JOB_PENDING : WAL_INPUT_JOB_INVALID;
 	}
+	if (!cluster_wal_inputs_scope_job_drained_v1(job))
+		return WAL_INPUT_JOB_INVALID;
 	inputs_job_transition(slot, WAL_INPUT_JOB_STATE_DONE, job->flags);
 	return WAL_INPUT_JOB_DONE;
 }
@@ -322,6 +345,8 @@ cluster_wal_inputs_job_finish_v1(ClusterWalInputsJobV1 **out)
 	job = *out;
 	if (job->state != WAL_INPUT_JOB_STATE_DONE)
 		return WAL_INPUT_JOB_PENDING;
+	if (!cluster_wal_inputs_scope_job_forget_v1(job))
+		return WAL_INPUT_JOB_INVALID;
 	context = job->context;
 	/* Clear both stable locators before deleting any borrowed allocation. */
 	memset(slot, 0, sizeof(*slot));
@@ -343,7 +368,8 @@ cluster_wal_inputs_jobs_stop_census_v1(void)
 			continue;
 		if (inputs_job_find(job, false) == NULL)
 			return WAL_INPUT_JOB_INVALID;
-		if (job->pin != NULL || job->state == WAL_INPUT_JOB_STATE_RETIRING_CF
+		if ((job->inputs != NULL && job->state != WAL_INPUT_JOB_STATE_DONE)
+			|| job->pin != NULL || job->state == WAL_INPUT_JOB_STATE_RETIRING_CF
 			|| job->state == WAL_INPUT_JOB_STATE_RETIRING_WALR || job->cf.state == CF_JOB_RECEIPT_RETIRING)
 			pending = true;
 	}

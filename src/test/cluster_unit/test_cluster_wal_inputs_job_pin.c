@@ -429,6 +429,7 @@ UT_TEST(pin_interrupt_during_first_confirmation_retains_original_custody)
 	pin_cleanup(&job, &pin);
 }
 
+#ifndef PGRAC_WAL_INPUTS_JOB_PIN_EMBEDDED
 int
 main(void)
 {
@@ -464,3 +465,4 @@ main(void)
 	UT_DONE();
 	return ut_failed_count != 0;
 }
+#endif
