@@ -1,5 +1,6 @@
 /* PGRAC: original allocator composed with the original retention guard.
- * COMPLETE, native authority, SLRU, locks and ERROR are controlled fixtures.
+ * Original cases control COMPLETE, native authority, SLRU, locks and ERROR;
+ * explicit FULL cases also execute the original native CLOG/SLRU bridge.
  * Author: SqlRush <sqlrush@gmail.com>
  * Spec: 2026-10-14-pre2-m5-e1-format-closure-v1.md */
 #include "postgres.h"
@@ -17,6 +18,7 @@ static bool retention_wrap_ready = true;
 int xid_allocation_original_main(void);
 
 #define CLUSTER_XID_RETENTION_TEST
+#define TEST_CLUSTER_XID_NATIVE_CLOG
 #define main xid_allocation_original_main
 #include "test_cluster_xid_allocation.c"
 #undef main
@@ -457,10 +459,19 @@ UT_TEST(retention_guard_valid_entry_observes_under_both_locks_and_returns_only_i
 	}
 }
 
+#include "test_cluster_xid_retention_native_clog.inc"
+
 int
 main(void)
 {
-	UT_PLAN(21);
+	if (getenv("PGRAC_RETAINED_FULL_FOCUS") != NULL) {
+		UT_PLAN(4);
+		retention_full_run();
+		free(relmap_runtime_shmem);
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
+	UT_PLAN(25);
 	UT_RUN(native_subxid_publication_preserves_the_final_cache_slot);
 	UT_RUN(native_publication_keeps_the_full_era_across_raw_rollover);
 	UT_RUN(no_storage_or_procarray_mutation_before_reservation);
@@ -482,6 +493,7 @@ main(void)
 	UT_RUN(original_xact_failure_keeps_unassigned_top_and_existing_pin);
 	UT_RUN(retention_guard_refuses_caller_lock_context_without_consuming_pins);
 	UT_RUN(retention_guard_valid_entry_observes_under_both_locks_and_returns_only_its_lock);
+	retention_full_run();
 	free(relmap_runtime_shmem);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;

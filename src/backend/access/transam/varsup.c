@@ -645,7 +645,7 @@ cluster_relmap_retention_allocate_xid_v2(bool isSubXact, uint64 system_identifie
 	allocation.system_identifier = system_identifier;
 	allocation.database_incarnation = database_incarnation;
 	allocation.origin = origin;
-	return get_new_transaction_id(isSubXact, &allocation, false);
+	return get_new_transaction_id(isSubXact, &allocation, true);
 }
 
 /* Original Startup has finished every native/SIDE fold, still excludes new

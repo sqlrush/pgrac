@@ -11424,6 +11424,10 @@ test_cluster_xid_allocation: test_cluster_xid_allocation.c unit_test.h \
 		$(top_srcdir)/src/include/access/clog.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_XID_STRIPE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
+test_cluster_xid_retention: test_cluster_xid_native_clog.o \
+		test_cluster_xid_native_clog.inc test_cluster_xid_native_clog.h \
+		test_cluster_xid_retention_native_clog.inc
+
 # Compose the original native allocator with its actual runtime guard and core.
 test_cluster_xid_recovery_native.inc: $(top_srcdir)/src/backend/access/transam/varsup.c \
 		$(top_srcdir)/src/backend/access/transam/transam.c Makefile
@@ -11512,7 +11516,7 @@ test_cluster_xid_retention: test_cluster_xid_retention.c test_cluster_xid_alloca
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h \
 		test_cluster_xid_full_clog.inc \
 		$(top_srcdir)/src/include/access/clog.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_XID_STRIPE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_xid_native_clog.o $(CLUSTER_XID_STRIPE_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 # Current C allocator families retain their original generated/header inputs.
 test_cluster_xid_native_clog_main.o: test_cluster_xid_allocation.c unit_test.h \

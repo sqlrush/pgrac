@@ -224,7 +224,9 @@ extern ClusterRelmapRetentionResult cluster_relmap_retention_runtime_allocation_
  * Enter from the original allocation context with neither XidGenLock nor the
  * retention lock held; this function acquires and releases the native lock.
  * Reuses all original native wrap/StopLimit/stripe/herding/lease checks and
- * SLRU extension. First and recomputed candidates are checked before extension;
+ * SLRU extension. CLOG receives the actual FullXid for every skipped position
+ * and the candidate; native page initialization is not an issuance or lifetime
+ * certificate. First and recomputed candidates are checked before extension;
  * the final candidate and original nofail stores share XidGenLock->retention.
  * Refusal raises existing53RB5 with no fallback or automatic retry. Ordinary
  * GetNewTransactionId remains unchanged in behavior. No live caller, COMPLETE

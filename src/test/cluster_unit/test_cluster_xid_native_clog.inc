@@ -19,6 +19,14 @@ static bool native_clog_enabled;
 void
 ExtendCLOGFull(FullTransactionId candidate)
 {
+#ifdef CLUSTER_XID_RETENTION_TEST
+	/* Preserve the original retention cases' controlled extension provider.
+	 * Only the new explicit native composition enables actual CLOG effects. */
+	if (!full_clog_fixture.active) {
+		extended();
+		return;
+	}
+#endif
 	xid_fixture_extend_full(candidate);
 	if (native_clog_enabled) {
 		UT_ASSERT(held && reservation && full_clog_fixture.early_publication == 0);
