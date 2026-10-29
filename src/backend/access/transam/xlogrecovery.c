@@ -2909,6 +2909,45 @@ ClusterColdRecoveryCtrcReferences(const struct ClusterRecoveryStartV1 *start,
 	return ClusterColdRecoveryCtrcObserve(start, 0) ? start->ctrc_references : NULL;
 }
 
+/* Bind the original forest's borrowed records to this exact complete Start.
+ * Stable TX dependencies alone cannot retire reference or owner obligations. */
+ClusterRecoveryCensusTxRecordV1
+ClusterColdRecoveryCtrcTxRecord(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work, uint32 index)
+{
+	ClusterRecoveryCensusTxRecordV1 out = {0};
+	struct ClusterRecoveryStartV1 *state = cluster_recovery_cold_start;
+	bool held = false;
+
+	if (start == NULL || start != state || CritSectionCount != 0 || ShutdownRequestPending
+		|| !start->ctrc_observation_complete || work != start->ctrc_observation_work
+		|| index > start->ctrc_observation_manifest.tx_record_count) return out;
+	ForEachLWLockHeldByMe(cluster_recovery_cold_ctrc_lock_held, &held);
+	if (held || !ClusterColdRecoveryCtrcObserve(start, 0)) return out;
+	PG_TRY();
+	{
+		ClusterRecoveryCensusTxRecordV1 current = cluster_recovery_census_tx_record_v1(
+			state->ctrc_observation_census, index);
+
+		if (current.observed && current.count == state->ctrc_observation_manifest.tx_record_count
+			&& (index == current.count ? current.value.record == NULL : current.value.record != NULL)
+			&& ClusterColdRecoveryCtrcObserve(start, 0))
+			out = current;
+		else {
+			cluster_recovery_cold_observation_refuse(state, "tx_record", 0);
+			cluster_recovery_cold_observation_close(state);
+		}
+	}
+	PG_CATCH();
+	{
+		cluster_recovery_cold_observation_refuse(state, "tx_record_error", 0);
+		cluster_recovery_cold_observation_close(state);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return out;
+}
+
 bool
 ClusterColdRecoveryCtrcWalSourceCount(const struct ClusterRecoveryStartV1 *start,
 	const struct ClusterColdCtrcWorkV1 *work, uint32 *out)

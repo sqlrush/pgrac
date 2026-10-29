@@ -10812,3 +10812,7 @@ clean-ctrc-cache-native-tail:
 
 # Original native CTRC image predicates through the original Startup drain.
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_native_images.inc
+
+# Original complete TX-forest views through the same census and Startup owner.
+test_cluster_recovery_native_inputs: test_cluster_recovery_census_tx_records.inc
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_tx_records.inc

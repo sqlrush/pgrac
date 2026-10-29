@@ -319,6 +319,21 @@ struct ClusterRecoveryCensusReferencesV1;
 extern const struct ClusterRecoveryCensusReferencesV1 *ClusterColdRecoveryCtrcReferences(
 	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work);
 
+/* Original complete TX forest through this SAME Start/work/accepted-TX and
+ * full simultaneous IR/WALR observation. The by-value wrapper never accepts a
+ * caller graph or source. Includes non-root predecessors, complete native
+ * record bytes and independent record-segment generations under original
+ * borrowed-owner lifetime, not fresh physical-file/lifetime qualification.
+ * Original current/manifest checks may do I/O; call
+ * before PAGE/content protection. Invalid results are all zero; complete end
+ * is observed with a NULL record at index==count, including count zero.
+ * Entered refusal/ERROR revokes the original observation with original cleanup.
+ * Stable supplied forest is not full G_ref/G_owner, discharge or completion. */
+struct ClusterRecoveryCensusTxRecordV1;
+extern struct ClusterRecoveryCensusTxRecordV1 ClusterColdRecoveryCtrcTxRecord(
+	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work,
+	uint32 index);
+
 /* Same original complete observation and accepted TX; raw, immutable decoded
  * PAGE WAL inputs of every selected generation. Zero count is complete-empty.
  * Outputs clear on refusal; readers borrow original cursor/scope lifetime.
