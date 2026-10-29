@@ -1297,7 +1297,29 @@ vis_scratch_self_proven(const ClusterUndoTTSlotRef *ref, const ClusterTxLocator 
 		&& cluster_epoch_get_current() == epoch;
 }
 
-/* Match only a normal tuple at the exact head's INSERT/DELETE target. */
+/* UPDATE creation and modification use different physical targets. */
+static bool
+vis_scratch_update_operation_target(HeapTuple tuple, const BufferTag *tag, ClusterVisXidKind which,
+									const UndoRecordHeader *record, const char *body)
+{
+	UndoUpdatePayload update;
+	HeapTupleHeaderData old;
+	OffsetNumber offset = ItemPointerGetOffsetNumber(&tuple->t_self);
+
+	memcpy(&update, body, sizeof(update));
+	if (update.old_tuple_length < SizeofHeapTupleHeader)
+		return false;
+	memcpy(&old, body + update.old_tuple_offset, SizeofHeapTupleHeader);
+	if (old.t_hoff < SizeofHeapTupleHeader || old.t_hoff > update.old_tuple_length)
+		return false;
+	if (which == CLUSTER_VIS_XMIN)
+		return update.new_block == tag->blockNum && update.new_offset == offset;
+	return which == CLUSTER_VIS_XMAX_UPDATE && record->target_block == tag->blockNum
+		   && record->target_offset == offset && update.old_tuple_length == tuple->t_len
+		   && HeapTupleHeaderGetRawXmin(&old) == HeapTupleHeaderGetRawXmin(tuple->t_data);
+}
+
+/* Match a normal tuple to the exact head's operation-specific target role. */
 static bool
 vis_scratch_operation_target(Page page, HeapTuple tuple, const BufferTag *tag,
 							 ClusterVisXidKind which, TransactionId raw_xid,
@@ -1307,11 +1329,11 @@ vis_scratch_operation_target(Page page, HeapTuple tuple, const BufferTag *tag,
 	PageHeader header = (PageHeader)page;
 	ItemId item;
 	const char *body = (const char *)record + sizeof(*record);
+	bool old_target;
 
 	if (tag == NULL || ItemPointerGetBlockNumber(&tuple->t_self) != tag->blockNum
 		|| offset < FirstOffsetNumber || offset > PageGetMaxOffsetNumber(page)
-		|| record->xid != raw_xid || record->target_block != tag->blockNum
-		|| record->target_offset != offset)
+		|| record->xid != raw_xid)
 		return false;
 	item = PageGetItemId(page, offset);
 	if (!ItemIdIsNormal(item) || ItemIdGetLength(item) != tuple->t_len
@@ -1319,11 +1341,14 @@ vis_scratch_operation_target(Page page, HeapTuple tuple, const BufferTag *tag,
 		|| (size_t)ItemIdGetOffset(item) + tuple->t_len > header->pd_special
 		|| PageGetItem(page, item) != (Item)tuple->t_data)
 		return false;
+	if (record->record_type == UNDO_RECORD_UPDATE)
+		return vis_scratch_update_operation_target(tuple, tag, which, record, body);
+	old_target = record->target_block == tag->blockNum && record->target_offset == offset;
 	if (which == CLUSTER_VIS_XMIN && record->record_type == UNDO_RECORD_INSERT) {
 		UndoInsertPayload inserted;
 
 		memcpy(&inserted, body, sizeof(inserted));
-		return inserted.inserted_tuple_len == tuple->t_len;
+		return old_target && inserted.inserted_tuple_len == tuple->t_len;
 	}
 	if (which == CLUSTER_VIS_XMAX_UPDATE && record->record_type == UNDO_RECORD_DELETE) {
 		UndoDeletePayload deleted;
@@ -1331,7 +1356,7 @@ vis_scratch_operation_target(Page page, HeapTuple tuple, const BufferTag *tag,
 
 		memcpy(&deleted, body, sizeof(deleted));
 		memcpy(&old, body + deleted.full_tuple_offset, SizeofHeapTupleHeader);
-		return deleted.full_tuple_length == tuple->t_len
+		return old_target && deleted.full_tuple_length == tuple->t_len
 			   && HeapTupleHeaderGetRawXmin(&old) == HeapTupleHeaderGetRawXmin(tuple->t_data);
 	}
 	return false;

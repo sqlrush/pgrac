@@ -38,6 +38,8 @@ extern ClusterTxOutcome cluster_tx_resolve_exact(const ClusterTxLocator *, Clust
 volatile uint32 CritSectionCount = 0;
 static bool self_current;
 static bool self_child;
+static int self_update_layout;
+static int self_update_defect;
 static int self_operation_defect;
 static int self_operation_calls;
 static int self_admission_enters;
@@ -256,6 +258,75 @@ self_operation_record(char data[BLCKSZ], const ClusterTxLocator *locator,
 	block->free_offset = 256 + directory->record_length;
 }
 
+/* Replace only the operation body/targets; keep the original exact envelope. */
+static void
+self_update_record(char data[BLCKSZ], bool creator)
+{
+	UndoRecordHeader *record = (UndoRecordHeader *)(data + 256);
+	UndoBlockHeader *block = (UndoBlockHeader *)data;
+	UndoSlotDirEntry *directory
+		= (UndoSlotDirEntry *)(data + BLCKSZ
+							   - (size_t)block->slot_count * sizeof(UndoSlotDirEntry));
+	char *body = (char *)record + sizeof(*record);
+	UndoItlHistoryTrailer history;
+	UndoOperationTrailer operation;
+	UndoUpdatePayload update = { 0 };
+	HeapTupleHeaderData old = { 0 };
+	uint16 decoded_length;
+	Size length;
+
+	memcpy(&operation, body + record->payload_length - sizeof(operation), sizeof(operation));
+	memcpy(&history, body + record->payload_length - sizeof(operation) - sizeof(history),
+		   sizeof(history));
+	record->record_type = UNDO_RECORD_UPDATE;
+	record->target_block = creator && self_update_layout == 2 ? 1 : 0;
+	record->target_offset = creator && self_update_layout == 1 ? 2 : 1;
+	update.new_block = !creator && self_update_layout == 2 ? 1 : 0;
+	update.new_offset = !creator && self_update_layout == 1 ? 2 : 1;
+	if (self_update_defect == 1) {
+		if (creator)
+			update.new_offset = 3;
+		else
+			record->target_offset = 3;
+	}
+	if (self_update_defect == 2) {
+		if (creator)
+			update.new_block = 2;
+		else
+			record->target_block = 2;
+	}
+	update.old_tuple_offset = sizeof(update);
+	update.old_tuple_length = SizeofHeapTupleHeader;
+	if (self_update_defect == 4)
+		update.old_tuple_length += 4;
+	if (self_update_defect == 7)
+		update.old_tuple_length--;
+	old.t_hoff = self_update_defect == 8 ? 0 : SizeofHeapTupleHeader;
+	if (self_update_defect == 9)
+		old.t_hoff++;
+	old.t_infomask = HEAP_XMIN_FROZEN | HEAP_XMAX_INVALID;
+	HeapTupleHeaderSetXmin(&old, self_update_defect == 3 ? UT_RAW_XID + 80 : FrozenTransactionId);
+	ItemPointerSet(&old.t_ctid, record->target_block, record->target_offset);
+	length = sizeof(update) + update.old_tuple_length;
+	memset(body, 0x5a, length);
+	memcpy(body, &update, sizeof(update));
+	memcpy(body + sizeof(update), &old, Min(update.old_tuple_length, SizeofHeapTupleHeader));
+	history.entries[0].block = record->target_block;
+	if (update.new_block != record->target_block) {
+		history.count = 2;
+		history.entries[1] = history.entries[0];
+		history.entries[1].block = update.new_block;
+	}
+	memcpy(body + length, &history, sizeof(history));
+	memcpy(body + length + sizeof(history), &operation, sizeof(operation));
+	record->payload_length = length + sizeof(history) + sizeof(operation);
+	directory->record_type = UNDO_RECORD_UPDATE;
+	directory->record_length = sizeof(*record) + record->payload_length;
+	block->free_offset = directory->record_offset + directory->record_length;
+	UT_ASSERT(cluster_undo_record_decode_operation_payload(record, body, record->payload_length,
+														   &decoded_length, &history, &operation));
+}
+
 ClusterTxOutcome
 cluster_runtime_visibility_resolve_operation_head_origin_admitted(
 	const ClusterTxLocator *locator, const ClusterItlSlotData *head, const BufferTag *tag,
@@ -275,6 +346,8 @@ cluster_runtime_visibility_resolve_operation_head_origin_admitted(
 	if (self_operation_defect == 18)
 		pg_re_throw();
 	self_operation_record(data, locator, head, tag, (tuple->t_infomask & HEAP_XMAX_INVALID) != 0);
+	if (self_update_layout != 0)
+		self_update_record(data, (tuple->t_infomask & HEAP_XMAX_INVALID) != 0);
 	if (!cluster_savepoint_reader_discover_head(head, tag, locator, data, identity))
 		return CLUSTER_TX_UNKNOWN;
 	exact.tt_wrap = identity->canonical.wrap;
@@ -348,6 +421,38 @@ self_reset_case(bool peer, int defect)
 	usedComboCids = 1;
 }
 
+/* The queried tuple stays at LP1; same-page UPDATE also has the other role. */
+static void
+self_update_tuple(HeapTuple tuple, bool creator)
+{
+	HeapTupleHeader other = (HeapTupleHeader)(ut_visibility_page.data + 1088);
+	HeapTupleHeader old = creator ? other : tuple->t_data;
+	HeapTupleHeader newer = creator ? tuple->t_data : other;
+	BlockNumber new_block = !creator && self_update_layout == 2 ? 1 : 0;
+	OffsetNumber new_offset = !creator && self_update_layout == 1 ? 2 : 1;
+
+	HeapTupleHeaderSetXmin(old, FrozenTransactionId);
+	old->t_infomask = HEAP_XMIN_FROZEN;
+	HeapTupleHeaderSetXmax(old, UT_RAW_XID + 1);
+	old->t_choice.t_heap.t_field3.t_cid = 2;
+	ItemPointerSet(&old->t_ctid, new_block, new_offset);
+	HeapTupleHeaderSetXmin(newer, UT_RAW_XID + 1);
+	newer->t_infomask = HEAP_XMAX_INVALID | HEAP_UPDATED;
+	newer->t_choice.t_heap.t_field3.t_cid = 2;
+	ItemPointerSet(&newer->t_ctid, new_block, new_offset);
+	other->t_hoff = SizeofHeapTupleHeader;
+	if (self_update_layout == 1) {
+		PageHeader page = (PageHeader)ut_visibility_page.data;
+		Size other_length = SizeofHeapTupleHeader + (creator && self_update_defect == 4 ? 4 : 0);
+
+		page->pd_lower += sizeof(ItemIdData);
+		ItemIdSetNormal(PageGetItemId(ut_visibility_page.data, 2), 1088, other_length);
+		memset((char *)other + SizeofHeapTupleHeader, 0x5a, other_length - SizeofHeapTupleHeader);
+		old->t_infomask2 |= HEAP_HOT_UPDATED;
+		newer->t_infomask2 |= HEAP_ONLY_TUPLE;
+	}
+}
+
 static void
 self_setup_tuple(bool creator, bool combo, bool peer, int defect, HeapTuple tuple, BufferTag *tag)
 {
@@ -406,6 +511,8 @@ self_setup_tuple(bool creator, bool combo, bool peer, int defect, HeapTuple tupl
 		tag->dbOid = 5;
 		tag->relNumber = 12345;
 	}
+	if (self_update_layout != 0)
+		self_update_tuple(tuple, creator);
 }
 
 static void
@@ -537,10 +644,73 @@ UT_TEST(test_own_child_admission_refusals_and_error_unwind)
 	self_operation_defect = 0;
 }
 
+UT_TEST(test_own_child_update_new_version_commands)
+{
+	self_child = true;
+	for (self_update_layout = 1; self_update_layout <= 2; self_update_layout++) {
+		self_update_defect = 0;
+		self_case(true, false, 2, false, 0, false, false);
+		self_case(true, false, 3, false, 0, true, false);
+		self_update_defect = 4;
+		self_case(true, false, 3, false, 0, true, false);
+	}
+	self_child = false;
+	self_update_layout = self_update_defect = 0;
+}
+UT_TEST(test_own_child_update_old_version_commands)
+{
+	self_child = true;
+	for (self_update_layout = 1; self_update_layout <= 2; self_update_layout++) {
+		self_case(false, false, 2, false, 0, true, false);
+		self_case(false, false, 3, false, 0, false, false);
+	}
+	self_child = false;
+	self_update_layout = 0;
+}
+UT_TEST(test_own_child_update_targets_are_role_specific)
+{
+	self_child = true;
+	for (self_update_layout = 1; self_update_layout <= 2; self_update_layout++) {
+		for (self_update_defect = 1; self_update_defect <= 2; self_update_defect++) {
+			self_case(true, false, 3, false, 0, false, true);
+			self_case(false, false, 3, false, 0, false, true);
+		}
+	}
+	self_child = false;
+	self_update_layout = self_update_defect = 0;
+}
+UT_TEST(test_own_child_update_old_image_is_checked)
+{
+	self_child = true;
+	for (self_update_layout = 1; self_update_layout <= 2; self_update_layout++) {
+		for (self_update_defect = 3; self_update_defect <= 4; self_update_defect++)
+			self_case(false, false, 3, false, 0, false, true);
+		for (self_update_defect = 7; self_update_defect <= 9; self_update_defect++) {
+			self_case(true, false, 3, false, 0, false, true);
+			self_case(false, false, 3, false, 0, false, true);
+		}
+	}
+	self_child = false;
+	self_update_layout = self_update_defect = 0;
+}
+UT_TEST(test_own_child_update_command_id_matches_tuple)
+{
+	self_child = true;
+	self_operation_defect = 5;
+	for (self_update_layout = 1; self_update_layout <= 2; self_update_layout++) {
+		self_case(true, false, 3, false, 0, false, true);
+		UT_ASSERT_EQ(self_cid_calls, 1);
+		self_case(false, false, 3, false, 0, false, true);
+		UT_ASSERT_EQ(self_cid_calls, 1);
+	}
+	self_child = false;
+	self_operation_defect = self_update_layout = 0;
+}
+
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(18);
 	UT_RUN(test_existing_delete_current_command);
 	UT_RUN(test_existing_delete_next_command);
 	UT_RUN(test_update_old_version_next_command);
@@ -554,6 +724,11 @@ main(void)
 	UT_RUN(test_own_child_operation_identity_refusals);
 	UT_RUN(test_own_child_operation_cid_matches_tuple);
 	UT_RUN(test_own_child_admission_refusals_and_error_unwind);
+	UT_RUN(test_own_child_update_new_version_commands);
+	UT_RUN(test_own_child_update_old_version_commands);
+	UT_RUN(test_own_child_update_targets_are_role_specific);
+	UT_RUN(test_own_child_update_old_image_is_checked);
+	UT_RUN(test_own_child_update_command_id_matches_tuple);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
