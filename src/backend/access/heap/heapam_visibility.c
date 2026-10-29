@@ -63,6 +63,8 @@
  *
  * PGRAC MODIFICATIONS
  *	  Modified by: SqlRush <sqlrush@gmail.com>
+ *	  Bind own-child scratch operation proofs to exact tuples and command IDs.
+ *
  *	  Preserve request-owned scratch verdict metadata for selection-miss logs.
  *	  Compile cluster-only scratch proof helpers only in cluster builds.
  *
@@ -2247,8 +2249,10 @@ HeapTupleSatisfiesMVCCScratchInternal(HeapTuple htup, Snapshot snapshot,
 			cluster_r4_scratch_visibility_unknown(raw_xmin,
 												  "scratch xmin lacks a valid DATA ITL reference");
 
-		cluster_visibility_resolve_scratch_scn(page, creator_index, raw_xmin, snapshot->read_scn,
-											   &resolved);
+		/* PGRAC: bind child SELF proof to this exact scratch tuple. */
+		cluster_visibility_resolve_scratch_tuple_scn(page, htup, &context->tag, creator_index,
+													 CLUSTER_VIS_XMIN, snapshot->read_scn,
+													 &resolved);
 		if (unlikely(cluster_trace_visibility_enabled)) {
 			cluster_catalog_trace_event("scratch.authority", "status", resolved.status);
 			cluster_catalog_trace_event("scratch.authority", "evidence", resolved.evidence);
@@ -2273,6 +2277,8 @@ HeapTupleSatisfiesMVCCScratchInternal(HeapTuple htup, Snapshot snapshot,
 				cluster_r4_scratch_visibility_unknown(raw_xmin,
 													 "scratch SELF cmin mapping is unavailable");
 			cmin = HeapTupleHeaderGetCmin(tuple);
+			if (resolved.scratch_operation_cid_valid && cmin != resolved.scratch_operation_cid)
+				cluster_r4_scratch_visibility_unknown(raw_xmin, "scratch operation cmin mismatch");
 			if (unlikely(cluster_trace_visibility_enabled))
 				cluster_catalog_trace_event("scratch.self", "cmin", cmin);
 			if (cmin >= snapshot->curcid)
@@ -2332,8 +2338,10 @@ HeapTupleSatisfiesMVCCScratchInternal(HeapTuple htup, Snapshot snapshot,
 		cluster_r4_scratch_visibility_unknown(raw_xmax,
 											  "scratch xmax lacks a valid DATA ITL reference");
 
-	cluster_visibility_resolve_scratch_scn(page, tuple->t_itl_slot_idx, raw_xmax,
-										   snapshot->read_scn, &resolved);
+	/* PGRAC: bind child SELF proof to this exact scratch tuple. */
+	cluster_visibility_resolve_scratch_tuple_scn(page, htup, &context->tag, tuple->t_itl_slot_idx,
+												 CLUSTER_VIS_XMAX_UPDATE, snapshot->read_scn,
+												 &resolved);
 	if (unlikely(cluster_trace_visibility_enabled)) {
 		cluster_catalog_trace_event("scratch.authority", "status", resolved.status);
 		cluster_catalog_trace_event("scratch.authority", "evidence", resolved.evidence);
@@ -2358,6 +2366,8 @@ HeapTupleSatisfiesMVCCScratchInternal(HeapTuple htup, Snapshot snapshot,
 			cluster_r4_scratch_visibility_unknown(raw_xmax,
 												 "scratch SELF cmax mapping is unavailable");
 		cmax = HeapTupleHeaderGetCmax(tuple);
+		if (resolved.scratch_operation_cid_valid && cmax != resolved.scratch_operation_cid)
+			cluster_r4_scratch_visibility_unknown(raw_xmax, "scratch operation cmax mismatch");
 		if (unlikely(cluster_trace_visibility_enabled))
 			cluster_catalog_trace_event("scratch.self", "cmax", cmax);
 		CLUSTER_CATALOG_TRACE_RETURN(cluster_r4_scratch_return(observation, cmax >= snapshot->curcid));

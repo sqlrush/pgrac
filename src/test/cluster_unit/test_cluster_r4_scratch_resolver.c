@@ -39,6 +39,8 @@
 #include "cluster/cluster_tt_durable.h"
 #include "cluster/cluster_tt_status.h"
 #include "cluster/cluster_tx_resolve.h"
+#include "cluster/cluster_savepoint_reader.h"
+#include "cluster/cluster_undo_horizon.h"
 #include "cluster/cluster_undo_verdict.h"
 #include "cluster/cluster_visibility_resolve.h"
 #include "cluster/cluster_xid_authority.h"
@@ -1039,6 +1041,33 @@ errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_un
 			siglongjmp(ut_error_jump, 1);
 		abort();
 	}
+}
+
+/* Backend top ownership and operation-origin I/O are explicit boundaries. */
+FullTransactionId
+GetTopFullTransactionIdIfAny(void)
+{
+	return InvalidFullTransactionId;
+}
+
+extern ClusterTxOutcome
+cluster_tx_resolve_operation_head(const ClusterTxLocator *, const ClusterItlSlotData *,
+								  const BufferTag *, ClusterSavepointReaderIdentity *,
+								  ClusterTxResolution *, ClusterSavepointReaderRecord *,
+								  char[BLCKSZ], ClusterTxResolveReason *);
+
+ClusterTxOutcome
+cluster_tx_resolve_operation_head(const ClusterTxLocator *locator pg_attribute_unused(),
+								  const ClusterItlSlotData *head pg_attribute_unused(),
+								  const BufferTag *tag pg_attribute_unused(),
+								  ClusterSavepointReaderIdentity *identity pg_attribute_unused(),
+								  ClusterTxResolution *top pg_attribute_unused(),
+								  ClusterSavepointReaderRecord *operation pg_attribute_unused(),
+								  char data[BLCKSZ] pg_attribute_unused(),
+								  ClusterTxResolveReason *reason pg_attribute_unused())
+{
+	UT_ASSERT(false);
+	return CLUSTER_TX_UNKNOWN;
 }
 
 bool

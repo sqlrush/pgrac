@@ -9344,7 +9344,8 @@ $(CLUSTER_R4_HOT_HANDLER_TEST_O): $(top_srcdir)/src/backend/access/heap/heapam_h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -ffunction-sections -fdata-sections \
 		-c $< -o $@
 
-$(CLUSTER_R4_HOT_VIS_TEST_O): $(top_srcdir)/src/backend/access/heap/heapam_visibility.c
+$(CLUSTER_R4_HOT_VIS_TEST_O): $(top_srcdir)/src/backend/access/heap/heapam_visibility.c \
+		$(top_srcdir)/src/include/cluster/cluster_visibility_resolve.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT \
 		-DCLUSTER_R4_VISIBILITY_EXTERNAL_HINT_STUB \
 		-ffunction-sections -fdata-sections \
@@ -9733,28 +9734,41 @@ test_cluster_cr_mvcc_origin: test_cluster_cr_mvcc_origin.c test_cluster_cr_mvcc_
 		$(top_srcdir)/src/backend/cluster/cluster_itl_cleanout.c \
 		$(top_srcdir)/src/backend/cluster/cluster_tt_status_hint.c \
 		$(CLUSTER_R4_SCRATCH_RESOLVER_TEST_O) $(CLUSTER_VIS_VERDICT_O) \
-		$(CLUSTER_R4_HOT_VIS_TEST_O)
+		$(CLUSTER_R4_HOT_VIS_TEST_O) $(CLUSTER_SAVEPOINT_READER_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(CLUSTER_R4_SCRATCH_RESOLVER_TEST_O) $(CLUSTER_VIS_VERDICT_O) \
 		$(CLUSTER_R4_HOT_VIS_TEST_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(CLUSTER_SAVEPOINT_READER_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 $(CLUSTER_R4_SCRATCH_RESOLVER_TEST_O): \
-		$(top_srcdir)/src/backend/cluster/cluster_visibility_resolve.c
+		$(top_srcdir)/src/backend/cluster/cluster_visibility_resolve.c \
+		$(top_srcdir)/src/include/cluster/cluster_visibility_resolve.h \
+		$(top_srcdir)/src/include/cluster/cluster_tx_resolve.h \
+		$(top_srcdir)/src/include/cluster/cluster_savepoint_reader.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
 		-DCLUSTER_CTRC_UNIT_TEST=1 -c $< -o $@
 
 # Real FULL/SELF evaluator and original raw/combo CID getters; origin I/O is fixture-owned.
+test_cluster_scratch_operation_entry.inc: $(top_srcdir)/src/backend/cluster/cluster_tx_resolve.c
+	awk '/^cluster_tx_resolve_recovered_open_admitted\(/ { print "static bool"; emit=1; n++ } \
+	     /^cluster_tx_resolve_operation_head\(/ { print "ClusterTxOutcome"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } END { if (n != 2) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 TESTS += test_cluster_scratch_self
 all: test_cluster_scratch_self
 test_cluster_scratch_self: test_cluster_scratch_self.c test_cluster_r4_scratch_resolver.c \
+        test_cluster_scratch_operation_entry.inc \
         test_cluster_native_prehistory_proof.inc cluster_snapshot_test_stubs.h unit_test.h \
         $(top_srcdir)/src/backend/utils/time/combocid.c \
         $(top_srcdir)/src/backend/cluster/cluster_uba.c \
-        $(CLUSTER_R4_SCRATCH_RESOLVER_TEST_O) $(CLUSTER_VIS_VERDICT_O) $(CLUSTER_R4_HOT_VIS_TEST_O)
+        $(CLUSTER_R4_SCRATCH_RESOLVER_TEST_O) $(CLUSTER_VIS_VERDICT_O) $(CLUSTER_R4_HOT_VIS_TEST_O) \
+        $(CLUSTER_SAVEPOINT_READER_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
         $(CLUSTER_R4_SCRATCH_RESOLVER_TEST_O) $(CLUSTER_VIS_VERDICT_O) $(CLUSTER_R4_HOT_VIS_TEST_O) \
+        $(CLUSTER_SAVEPOINT_READER_O) \
         $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(top_builddir)/src/common/libpgcommon_srv.a \
         $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
@@ -9763,10 +9777,11 @@ test_cluster_r4_scratch_resolver: test_cluster_r4_scratch_resolver.c unit_test.h
 		cluster_snapshot_test_stubs.h \
 		$(top_srcdir)/src/backend/cluster/cluster_tt_status_hint.c \
 		$(CLUSTER_R4_SCRATCH_RESOLVER_TEST_O) $(CLUSTER_VIS_VERDICT_O) \
-		$(CLUSTER_R4_HOT_VIS_TEST_O)
+		$(CLUSTER_R4_HOT_VIS_TEST_O) $(CLUSTER_SAVEPOINT_READER_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(CLUSTER_R4_SCRATCH_RESOLVER_TEST_O) $(CLUSTER_VIS_VERDICT_O) \
 		$(CLUSTER_R4_HOT_VIS_TEST_O) \
+		$(CLUSTER_SAVEPOINT_READER_O) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@

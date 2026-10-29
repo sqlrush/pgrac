@@ -110,6 +110,9 @@ typedef struct ClusterVisResolve {
 	 * published canonical binding proved local command-ID ownership. Not a
 	 * native visibility fallback and never inferred from a raw xid alone. */
 	bool scratch_self;
+	/* Exact local operation CID; the native tuple mapping must match it. */
+	bool scratch_operation_cid_valid;
+	CommandId scratch_operation_cid;
 	/* Stage-8 PRE adjustment 23: a wait consumer may use only the exact
 	 * page-derived DATA locator captured under the same content lock as the
 	 * verdict.  The ref/raw xid is never promoted into a remote wait key. */
@@ -172,6 +175,13 @@ extern void cluster_visibility_resolve_from_ref_scn(TransactionId raw_xid,
 extern void cluster_visibility_resolve_scratch_scn(Page page, uint8 slot_index,
 												   TransactionId raw_xid, SCN read_scn,
 												   ClusterVisResolve *out);
+
+/* FULL scratch with an exact tuple target and original retained read scope.
+ * Own-child INSERT/DELETE heads require operation proof before SELF CIDs. */
+extern void cluster_visibility_resolve_scratch_tuple_scn(Page page, HeapTuple tuple,
+														 const BufferTag *tag, uint8 slot_index,
+														 ClusterVisXidKind which, SCN read_scn,
+														 ClusterVisResolve *out);
 
 
 /*

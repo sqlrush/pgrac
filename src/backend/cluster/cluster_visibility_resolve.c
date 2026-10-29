@@ -53,6 +53,7 @@
 #include "cluster/cluster_recovery_merge.h"		/* spec-4.5a G6: materialized authority gate */
 #include "cluster/cluster_remote_xact.h"		/* spec-4.5a G6: wrap-checked authority */
 #include "cluster/cluster_runtime_visibility.h" /* spec-6.12i CP3: active-runtime resolve */
+#include "cluster/cluster_savepoint_reader.h"
 #include "cluster/cluster_subtrans.h"			/* SUBCOMMITTED parent follow */
 #include "cluster/cluster_tt_local.h"
 #include "cluster/cluster_tt_durable.h"			/* spec-4.8 D2 remote_active_failclosed counter */
@@ -1294,6 +1295,136 @@ vis_scratch_self_proven(const ClusterUndoTTSlotRef *ref, const ClusterTxLocator 
 		&& binding.publish_state == CLUSTER_CANONICAL_TXN_PUBLISHED
 		&& binding.reserved16 == 0 && !XLogRecPtrIsInvalid(binding.active_lsn)
 		&& cluster_epoch_get_current() == epoch;
+}
+
+/* Match only a normal tuple at the exact head's INSERT/DELETE target. */
+static bool
+vis_scratch_operation_target(Page page, HeapTuple tuple, const BufferTag *tag,
+							 ClusterVisXidKind which, TransactionId raw_xid,
+							 const UndoRecordHeader *record)
+{
+	OffsetNumber offset = ItemPointerGetOffsetNumber(&tuple->t_self);
+	PageHeader header = (PageHeader)page;
+	ItemId item;
+	const char *body = (const char *)record + sizeof(*record);
+
+	if (tag == NULL || ItemPointerGetBlockNumber(&tuple->t_self) != tag->blockNum
+		|| offset < FirstOffsetNumber || offset > PageGetMaxOffsetNumber(page)
+		|| record->xid != raw_xid || record->target_block != tag->blockNum
+		|| record->target_offset != offset)
+		return false;
+	item = PageGetItemId(page, offset);
+	if (!ItemIdIsNormal(item) || ItemIdGetLength(item) != tuple->t_len
+		|| ItemIdGetOffset(item) < header->pd_upper
+		|| (size_t)ItemIdGetOffset(item) + tuple->t_len > header->pd_special
+		|| PageGetItem(page, item) != (Item)tuple->t_data)
+		return false;
+	if (which == CLUSTER_VIS_XMIN && record->record_type == UNDO_RECORD_INSERT) {
+		UndoInsertPayload inserted;
+
+		memcpy(&inserted, body, sizeof(inserted));
+		return inserted.inserted_tuple_len == tuple->t_len;
+	}
+	if (which == CLUSTER_VIS_XMAX_UPDATE && record->record_type == UNDO_RECORD_DELETE) {
+		UndoDeletePayload deleted;
+		HeapTupleHeaderData old;
+
+		memcpy(&deleted, body, sizeof(deleted));
+		memcpy(&old, body + deleted.full_tuple_offset, SizeofHeapTupleHeader);
+		return deleted.full_tuple_length == tuple->t_len
+			   && HeapTupleHeaderGetRawXmin(&old) == HeapTupleHeaderGetRawXmin(tuple->t_data);
+	}
+	return false;
+}
+
+static void
+vis_scratch_own_operation(Page page, HeapTuple tuple, const BufferTag *tag, uint8 slot_index,
+						  ClusterVisXidKind which, TransactionId raw_xid,
+						  FullTransactionId top_fxid, const ClusterUndoTTSlotRef *ref,
+						  ClusterVisResolve *out)
+{
+	ClusterTxLocator locator;
+	ClusterTxLocator unused_wait;
+	ClusterTxResolution top;
+	ClusterSavepointReaderIdentity identity;
+	ClusterSavepointReaderRecord operation;
+	ClusterTxResolveReason reason;
+	ClusterTxOutcome outcome;
+	PGAlignedBlock data;
+	size_t length;
+	uint64 epoch = cluster_epoch_get_current();
+	uint64 top_value = U64FromFullTransactionId(top_fxid);
+	uint32 delta = raw_xid - XidFromFullTransactionId(top_fxid);
+
+	if (!cluster_vis_exact_locators_for_ref(page, slot_index, CLUSTER_VIS_XMIN, ref->local_xid, ref,
+											&locator, &unused_wait)
+		|| delta == 0 || delta >= (uint32)0x80000000 || top_value > UINT64_MAX - delta)
+		return;
+	cluster_vis_resolve_depth++;
+	PG_TRY();
+	{
+		outcome = cluster_tx_resolve_operation_head(
+			&locator, &ClusterPageGetItlSlots(page)[slot_index], tag, &identity, &top, &operation,
+			data.data, &reason);
+	}
+	PG_FINALLY();
+	{
+		cluster_vis_resolve_depth--;
+	}
+	PG_END_TRY();
+	if (outcome != CLUSTER_TX_IN_PROGRESS || !vis_scratch_self_proven(ref, &locator, &top, epoch)
+		|| U64FromFullTransactionId(identity.top_fxid) != top_value
+		|| U64FromFullTransactionId(identity.operation_fxid) != top_value + delta
+		|| U64FromFullTransactionId(GetTopFullTransactionIdIfAny()) != top_value
+		|| !cluster_savepoint_reader_extract_identity(&identity, &top.locator_echo, data.data,
+													  data.data, &length, &operation)
+		|| operation.operation.effect_state != CLUSTER_SAVEPOINT_EFFECT_LIVE
+		|| !vis_scratch_operation_target(page, tuple, tag, which, raw_xid,
+										 (const UndoRecordHeader *)data.data))
+		return;
+	out->evidence = CLUSTER_VIS_EVIDENCE_REMOTE;
+	out->status = CLUSTER_TT_STATUS_IN_PROGRESS;
+	out->scratch_self = true;
+	out->scratch_operation_cid_valid = true;
+	out->scratch_operation_cid = operation.operation.command_id;
+	out->diagnostic_reason = NULL;
+}
+
+void
+cluster_visibility_resolve_scratch_tuple_scn(Page page, HeapTuple tuple, const BufferTag *tag,
+											 uint8 slot_index, ClusterVisXidKind which,
+											 SCN read_scn, ClusterVisResolve *out)
+{
+	ClusterUndoTTSlotRef ref;
+	FullTransactionId top_fxid;
+	TransactionId raw_xid;
+
+	if (out == NULL)
+		return;
+	memset(out, 0, sizeof(*out));
+	out->evidence = CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS;
+	out->status = CLUSTER_TT_STATUS_UNKNOWN;
+	out->diagnostic_reason = "OWN_OPERATION_UNPROVABLE";
+	if (tuple == NULL || tuple->t_data == NULL
+		|| (which != CLUSTER_VIS_XMIN && which != CLUSTER_VIS_XMAX_UPDATE))
+		return;
+	raw_xid = which == CLUSTER_VIS_XMIN ? HeapTupleHeaderGetRawXmin(tuple->t_data)
+										: HeapTupleHeaderGetRawXmax(tuple->t_data);
+	/* Native membership selects a branch, never a parent/status authority. */
+	if (page != NULL && tag != NULL && SCN_VALID(read_scn) && TransactionIdIsNormal(raw_xid)
+		&& PageHasItl(page) && PageGetSpecialSize(page) >= CLUSTER_ITL_ARRAY_SIZE
+		&& slot_index < CLUSTER_ITL_INITRANS_DEFAULT
+		&& cluster_itl_get_tt_ref(page, slot_index, &ref) && ref.local_xid != raw_xid
+		&& ref.origin_node_id == cluster_node_id
+		&& FullTransactionIdIsValid(top_fxid = GetTopFullTransactionIdIfAny())
+		&& ref.local_xid == XidFromFullTransactionId(top_fxid)
+		&& TransactionIdIsCurrentTransactionId(raw_xid)) {
+		out->ref = ref;
+		vis_scratch_own_operation(page, tuple, tag, slot_index, which, raw_xid, top_fxid, &ref,
+								  out);
+		return;
+	}
+	cluster_visibility_resolve_scratch_scn(page, slot_index, raw_xid, read_scn, out);
 }
 
 void

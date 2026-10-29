@@ -229,6 +229,13 @@ extern ClusterTxOutcome cluster_tx_resolve_exact(const ClusterTxLocator *locator
 												 ClusterTxResolveMode mode,
 												 ClusterTxResolution *out,
 												 ClusterTxResolveReason *reason_out);
+/* Blocking immutable-head read under fresh TARGET admission. Caller retains
+ * the original source/undo read scope and holds no heap content lock. */
+extern ClusterTxOutcome
+cluster_tx_resolve_operation_head(const ClusterTxLocator *locator, const ClusterItlSlotData *head,
+								  const BufferTag *tag, ClusterSavepointReaderIdentity *identity,
+								  ClusterTxResolution *top, ClusterSavepointReaderRecord *operation,
+								  char data[BLCKSZ], ClusterTxResolveReason *reason_out);
 extern ClusterTxOutcome
 cluster_tx_resolve_exact_admitted(const ClusterTxLocator *locator, ClusterTxResolveMode mode,
 								  const ClusterSemanticAdmissionToken *admission,

@@ -725,6 +725,18 @@ cluster_visibility_resolve_scratch_scn(Page page, uint8 slot_index, TransactionI
 											read_scn, out);
 }
 
+void
+cluster_visibility_resolve_scratch_tuple_scn(Page page, HeapTuple tuple,
+											 const BufferTag *tag pg_attribute_unused(),
+											 uint8 slot_index, ClusterVisXidKind which,
+											 SCN read_scn, ClusterVisResolve *out)
+{
+	TransactionId raw = which == CLUSTER_VIS_XMIN ? HeapTupleHeaderGetRawXmin(tuple->t_data)
+												  : HeapTupleHeaderGetRawXmax(tuple->t_data);
+
+	cluster_visibility_resolve_scratch_scn(page, slot_index, raw, read_scn, out);
+}
+
 bool cluster_crossnode_write_write = true;
 bool cluster_tx_enqueue_wait_enabled = true;
 ClusterTxwResult
