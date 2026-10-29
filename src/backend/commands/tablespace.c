@@ -263,6 +263,11 @@ CreateTableSpace(CreateTableSpaceStmt *stmt)
 				 errmsg("CREATE TABLESPACE is not supported with cluster.shared_catalog"),
 				 errhint("Cross-node tablespace support is not yet implemented "
 						 "(spec-6.14b).")));
+
+	if (cluster_shared_config)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("CREATE/DROP TABLESPACE is not supported in shared mode"),
+						errdetail("PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED")));
 #endif
 
 	/* Must be superuser */

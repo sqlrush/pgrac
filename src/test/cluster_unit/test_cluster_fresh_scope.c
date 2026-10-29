@@ -368,6 +368,8 @@ cluster_tt_local_prepare_canonical_active(TransactionId xid, ClusterCanonicalTxn
 	return true;
 }
 
+static bool tablespace_create_scope_lookup_active, tablespace_create_scope_superuser_denied;
+static unsigned tablespace_create_scope_lookups;
 static bool tablespace_drop_scope_lookup_active;
 static unsigned tablespace_drop_scope_lookups, tablespace_drop_scope_bad_lookup;
 static bool tablespace_options_lookup_active, tablespace_options_expect_binding;
@@ -8872,6 +8874,12 @@ static unsigned language_lookups, language_unbound;
 bool
 superuser(void)
 {
+	if (tablespace_create_scope_lookup_active) {
+		tablespace_create_scope_lookups++;
+		if (tablespace_create_scope_superuser_denied)
+			return false;
+		siglongjmp(boundary, 2); /* Stop before the real privilege/role-cache query. */
+	}
 	if (type_factory_scope_lookup_active) {
 		type_factory_scope_lookups++;
 		type_factory_scope_lookup_kind = 1;
@@ -20594,10 +20602,212 @@ UT_TEST(test_native_tablespace_drop_scope_preserves_existing_supported_top_bindi
 	tablespace_drop_scope_lookup_active = false;
 }
 
+/* Actual CREATE includes the unchanged shared_catalog and permission refusals.
+ * The explicit denied fixture exercises native permission ERROR; all other
+ * allowed calls stop before the real privilege/role-cache lookup. */
+#include "test_cluster_fresh_tablespace_create_scope.inc"
+static CreateTableSpaceStmt native_tablespace_create_scope_statement;
+static RoleSpec tablespace_create_scope_owner;
+static RangeVar tablespace_create_scope_warm_relation;
+static AlterObjectSchemaStmt tablespace_create_scope_warm_statement;
+/* Literal profile results: none, original catalog diagnostic, config diagnostic. */
+static const unsigned tablespace_create_scope_kind[] = { 0, 1, 0, 1, 2, 1, 2, 1 };
+
+static void
+reset_native_tablespace_create_scope(unsigned form)
+{
+	static const char *const names[] = { "pg_undo", "native_tablespace", "other_tablespace" };
+
+	reset_create_preflight();
+	tablespace_create_scope_lookup_active = true;
+	tablespace_create_scope_superuser_denied = false;
+	tablespace_create_scope_lookups = 0;
+	tablespace_create_scope_owner = (RoleSpec){ .type = T_RoleSpec,
+												.roletype = ROLESPEC_CSTRING,
+												.rolename = "native_tablespace_owner",
+												.location = -1 };
+	native_tablespace_create_scope_statement
+		= (CreateTableSpaceStmt){ .type = T_CreateTableSpaceStmt,
+								  .tablespacename = (char *)names[form / 4],
+								  .owner = (form & 1) != 0 ? &tablespace_create_scope_owner : NULL,
+								  .location = (form & 2) != 0 ? "relative_tablespace_path"
+															  : "/tmp/native_tablespace_path",
+								  .options = NIL };
+	tablespace_create_scope_warm_relation
+		= (RangeVar){ .type = T_RangeVar, .relname = "supported_warm_table" };
+	tablespace_create_scope_warm_statement
+		= (AlterObjectSchemaStmt){ .type = T_AlterObjectSchemaStmt,
+								   .objectType = OBJECT_TABLE,
+								   .relation = &tablespace_create_scope_warm_relation,
+								   .newschema = "supported_warm_destination",
+								   .missing_ok = false };
+}
+
+static void
+native_tablespace_create_scope_entry(void)
+{
+	(void)CreateTableSpace(&native_tablespace_create_scope_statement);
+}
+
+static void
+assert_native_tablespace_create_scope_result(unsigned mode, int caught)
+{
+	unsigned kind = tablespace_create_scope_kind[mode];
+
+	UT_ASSERT_EQ(caught, kind ? 1 : 2);
+	UT_ASSERT_EQ(error_code, kind ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+	if (kind) {
+		UT_ASSERT_STR_EQ(error_message,
+						 kind == 1
+							 ? "CREATE TABLESPACE is not supported with cluster.shared_catalog"
+							 : "CREATE/DROP TABLESPACE is not supported in shared mode");
+		UT_ASSERT_STR_EQ(
+			error_hint,
+			kind == 1 ? "Cross-node tablespace support is not yet implemented (spec-6.14b)." : "");
+		UT_ASSERT_STR_EQ(
+			error_detail,
+			kind == 1 ? "" : "PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+	}
+	UT_ASSERT_EQ(tablespace_create_scope_lookups, kind ? 0 : 1);
+}
+
+UT_TEST(test_native_tablespace_create_scope_matches_utility_before_role_cache)
+{
+	for (unsigned form = 0; form < 12; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool blocked = tablespace_create_scope_kind[mode] != 0;
+			int caught;
+
+			reset_native_tablespace_create_scope(form);
+			set_native_operator_mode(mode);
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				create_sql_entry((Node *)&native_tablespace_create_scope_statement);
+			UT_ASSERT_EQ(caught, blocked ? 1 : 0);
+			UT_ASSERT_EQ(error_code, blocked ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+			if (blocked) {
+				UT_ASSERT_STR_EQ(error_message,
+								 "CREATE/DROP TABLESPACE is not supported in shared mode");
+				UT_ASSERT_STR_EQ(error_detail,
+								 "PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+			}
+			UT_ASSERT_EQ(tablespace_create_scope_lookups + utility_xids + utility_prepares
+							 + utility_binds,
+						 0);
+			reset_error();
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_tablespace_create_scope_entry();
+			assert_native_tablespace_create_scope_result(mode, caught);
+			UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			UT_ASSERT_EQ(utility_top_xid, InvalidTransactionId);
+		}
+	}
+	tablespace_create_scope_lookup_active = false;
+}
+
+UT_TEST(test_native_tablespace_create_scope_precedes_context_child_top_and_publication)
+{
+	for (unsigned form = 0; form < 12; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			for (unsigned fault = 0; fault < 7; fault++) {
+				int caught;
+
+				reset_native_tablespace_create_scope(form);
+				set_native_operator_mode(mode);
+				XactReadOnly = fault == 0;
+				utility_parallel = fault == 1;
+				utility_recovery = fault == 2;
+				utility_in_child = fault == 3;
+				if (fault == 4 || fault == 5) {
+					utility_current_xid = 401;
+					utility_top_xid = fault == 4 ? 400 : InvalidTransactionId;
+				}
+				utility_bind_ok = fault != 6;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_tablespace_create_scope_entry();
+				assert_native_tablespace_create_scope_result(mode, caught);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+				UT_ASSERT_EQ(utility_top_xid, fault == 4 ? 400 : InvalidTransactionId);
+				UT_ASSERT_EQ(utility_current_xid,
+							 fault == 4 || fault == 5 ? 401 : InvalidTransactionId);
+			}
+		}
+	}
+	tablespace_create_scope_lookup_active = false;
+}
+
+UT_TEST(test_native_tablespace_create_scope_preserves_existing_supported_top_binding)
+{
+	for (unsigned form = 0; form < 12; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			for (unsigned fault = 0; fault < 5; fault++) {
+				int caught;
+
+				reset_native_tablespace_create_scope(form);
+				create_sql_entry((Node *)&tablespace_create_scope_warm_statement);
+				UT_ASSERT_EQ(utility_xids, 1);
+				UT_ASSERT_EQ(utility_prepares, 1);
+				UT_ASSERT_EQ(utility_binds, 1);
+				set_native_operator_mode(mode);
+				XactReadOnly = fault == 0;
+				utility_parallel = fault == 1;
+				utility_recovery = fault == 2;
+				utility_in_child = fault == 3;
+				utility_bind_ok = fault != 4;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_tablespace_create_scope_entry();
+				assert_native_tablespace_create_scope_result(mode, caught);
+				UT_ASSERT_EQ(utility_xids, 1);
+				UT_ASSERT_EQ(utility_prepares, 1);
+				UT_ASSERT_EQ(utility_binds, 1);
+				UT_ASSERT_EQ(utility_top_xid, 400);
+				UT_ASSERT_EQ(utility_current_xid, 400);
+			}
+		}
+	}
+	tablespace_create_scope_lookup_active = false;
+}
+
+UT_TEST(test_native_tablespace_create_scope_preserves_original_permission_refusal)
+{
+	const char *messages[] = { "permission denied to create tablespace \"pg_undo\"",
+							   "permission denied to create tablespace \"native_tablespace\"",
+							   "permission denied to create tablespace \"other_tablespace\"" };
+
+	for (unsigned form = 0; form < 12; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			int caught;
+
+			reset_native_tablespace_create_scope(form);
+			set_native_operator_mode(mode);
+			tablespace_create_scope_superuser_denied = true;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_tablespace_create_scope_entry();
+			if (tablespace_create_scope_kind[mode])
+				assert_native_tablespace_create_scope_result(mode, caught);
+			else {
+				UT_ASSERT_EQ(caught, 1);
+				UT_ASSERT_EQ(error_code, ERRCODE_INSUFFICIENT_PRIVILEGE);
+				UT_ASSERT_STR_EQ(error_message, messages[form / 4]);
+				UT_ASSERT_STR_EQ(error_hint, "Must be superuser to create a tablespace.");
+				UT_ASSERT_STR_EQ(error_detail, "");
+				UT_ASSERT_EQ(tablespace_create_scope_lookups, 1);
+			}
+			UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			UT_ASSERT_EQ(utility_top_xid, InvalidTransactionId);
+		}
+	}
+	tablespace_create_scope_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(328);
+	UT_PLAN(332);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -20928,6 +21138,10 @@ main(void)
 	UT_RUN(test_native_tablespace_drop_scope_matches_utility_before_catalog_lock);
 	UT_RUN(test_native_tablespace_drop_scope_precedes_context_child_top_and_publication);
 	UT_RUN(test_native_tablespace_drop_scope_preserves_existing_supported_top_binding);
+	UT_RUN(test_native_tablespace_create_scope_matches_utility_before_role_cache);
+	UT_RUN(test_native_tablespace_create_scope_precedes_context_child_top_and_publication);
+	UT_RUN(test_native_tablespace_create_scope_preserves_existing_supported_top_binding);
+	UT_RUN(test_native_tablespace_create_scope_preserves_original_permission_refusal);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
