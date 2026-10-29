@@ -80,7 +80,8 @@ episode_setup(CensusFixture *f, bool pending)
 	census_pair(f->fd, 6, 7, false, pending, false);
 	f->roots = begin_roots(f->fd, 4 * 1024 * 1024);
 	UT_ASSERT_EQ(finish_roots(f->roots, NULL), CLUSTER_RECOVERY_ROOTS_OBSERVED);
-	census_execute_active = census_execute_recovery = true;
+	census_execute_active = true;
+	census_execute_recovery = false;
 	MyBackendType = B_STARTUP;
 	CritSectionCount = 0;
 	cluster_shared_catalog = census_merger_held = census_namespace_x = true;

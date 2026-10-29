@@ -1124,6 +1124,12 @@ cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **held)
 #include "test_cluster_recovery_clog_full_roots.inc"
 #include "test_cluster_recovery_scope_census.inc"
 
+#ifdef RECOVERY_SCOPE_NATIVE_CENSUS
+#undef cluster_relmap_retention_census_destroy
+#undef cluster_relmap_retention_census_execute_native_episode
+#include "test_cluster_recovery_scope_native_census.inc"
+#endif
+
 
 int
 main(int argc, char **argv)
@@ -1132,6 +1138,14 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
+#ifdef RECOVERY_SCOPE_NATIVE_CENSUS
+	UT_PLAN(4);
+	UT_RUN(test_scope_native_census_uses_original_episode_and_retires_before_holders);
+	UT_RUN(test_scope_native_census_missing_corrupt_pending_pairs_keep_original_debt);
+	UT_RUN(test_scope_native_census_late_source_loss_and_error_do_not_replace_custody);
+	UT_RUN(test_scope_native_census_entry_roles_do_not_borrow_legacy_cold_authority);
+	UT_DONE(); return ut_failed_count != 0;
+#endif
 	if (getenv("PGRAC_PRE2_TEST_SCOPE_CENSUS") != NULL) {
 		UT_PLAN(4);
 		scope_census_run();

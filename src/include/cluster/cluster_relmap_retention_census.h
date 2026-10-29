@@ -50,6 +50,9 @@ extern ClusterRelmapCensusResult cluster_relmap_retention_census_begin(
  * storage identity and exact origin coverage from EVERY original selected
  * generation under the already-held simultaneous full IR/WALR set. source
  * must be an unchanged original relmap participant, not a new owner/scope.
+ * It runs in that original post-native Startup context, with the declared
+ * episode's simultaneous IR/WALR holders. The independent legacy cold merger
+ * and namespace-X context are not acquired or substituted for this owner.
  * The original isolated OBSERVED ROOT and already-qualified unpublished
  * BUILDING directories retain ALL generic preconditions above; this adapter
  * does not qualify their numeric bounds, native era/history/lifetime or ROOT.

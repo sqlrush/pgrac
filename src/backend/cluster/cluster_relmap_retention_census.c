@@ -436,6 +436,16 @@ census_open_context(void)
 		   && cluster_relmap_authority_x_held();
 }
 
+/* The declared E1 participant belongs to the original post-native Startup
+ * episode, not the independent legacy cold merger. Original source-current
+ * checks below retain the complete simultaneous IR/WALR owner requirement. */
+static bool
+census_episode_context(void)
+{
+	return MyBackendType == B_STARTUP && !RecoveryInProgress() && CritSectionCount == 0
+		&& cluster_shared_catalog;
+}
+
 /* These original source checks do no physical ROOT I/O. Never invoke them
  * from inside the native ROOT reader; the wrapper brackets each returned tick. */
 static bool
@@ -445,13 +455,13 @@ census_episode_current(const ClusterRelmapRetentionCensus *census)
 
 	if (episode == NULL)
 		return true;
-	if (!census_open_context()
+	if (!census_episode_context()
 		|| cluster_wal_inputs_relmap_count_v1(episode->sources[0].scope) != episode->count)
 		return false;
 	for (uint32 i = 0; i < episode->count; i++)
 		if (!cluster_wal_inputs_relmap_source_current_v1(&episode->sources[i]))
 			return false;
-	return census_open_context()
+	return census_episode_context()
 		&& cluster_wal_inputs_relmap_count_v1(episode->sources[0].scope) == episode->count;
 }
 
@@ -1490,7 +1500,7 @@ cluster_relmap_retention_census_begin_episode(
 			size_t bytes, origin_count = 0;
 			const ClusterControlRootIdentity *identity = &original.selected.source.claim.identity;
 
-			if (!census_open_context()
+			if (!census_episode_context()
 				|| !cluster_wal_inputs_relmap_source_current_v1(&original)
 				|| (sources = cluster_wal_inputs_relmap_count_v1(original.scope)) == 0
 				|| sources > CLUSTER_WAL_INPUTS_MAX || directories == NULL || count == 0
@@ -1580,13 +1590,13 @@ cluster_relmap_retention_census_begin_episode(
 static bool
 census_native_episode_current(const CensusEpisode *saved)
 {
-	if (!census_open_context() || saved->count == 0
+	if (!census_episode_context() || saved->count == 0
 		|| cluster_wal_inputs_relmap_count_v1(saved->sources[0].scope) != saved->count)
 		return false;
 	for (uint32 i = 0; i < saved->count; i++)
 		if (!cluster_wal_inputs_relmap_source_current_v1(&saved->sources[i]))
 			return false;
-	return census_open_context()
+	return census_episode_context()
 		&& cluster_wal_inputs_relmap_count_v1(saved->sources[0].scope) == saved->count;
 }
 
@@ -1618,7 +1628,7 @@ cluster_relmap_retention_census_begin_native_episode(
 			size_t source_bytes, directory_bytes;
 			ClusterRecoveryRootsResult root_result;
 
-			if (!census_open_context()
+			if (!census_episode_context()
 				|| !cluster_wal_inputs_relmap_source_current_v1(&original)
 				|| (count = cluster_wal_inputs_relmap_count_v1(original.scope)) == 0
 				|| count > CLUSTER_WAL_INPUTS_MAX
@@ -1844,7 +1854,7 @@ cluster_relmap_retention_census_open_native_episode(
 			size_t bytes;
 			int fd = -1, current_fd = -1;
 
-			if (!census_open_context() || root_budget == 0 || payload_budget == 0
+			if (!census_episode_context() || root_budget == 0 || payload_budget == 0
 				|| !cluster_wal_inputs_relmap_source_current_v1(&original)
 				|| (count = cluster_wal_inputs_relmap_count_v1(original.scope)) == 0
 				|| count > CLUSTER_WAL_INPUTS_MAX || count > CLUSTER_RELMAP_RETENTION_MAX_ORIGINS
