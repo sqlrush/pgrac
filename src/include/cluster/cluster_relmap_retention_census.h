@@ -113,6 +113,22 @@ extern ClusterRelmapCensusResult cluster_relmap_retention_census_open_native_epi
 	const struct ClusterRecoveryRelmapSourceV1 *source, size_t root_budget,
 	size_t memory_budget, size_t payload_budget, ClusterRelmapRetentionCensus **out);
 
+/* Synchronous original-episode factory and complete physical pending scan.
+ * Publish one local DRAINED cursor only after the entire original census and
+ * final source/current recheck, with no pending pin in ANY namespace/origin.
+ * A pending pin refuses without arbitration or retry. Entered refusal/ERROR
+ * revokes the original matching episode and destroys only local custody;
+ * original borrowed fd/all-IR/WALR/pins/debt remain. Entry aliases/nonfresh out
+ * and context refusals retain the open_native_episode unchanged-output contract.
+ * Success owns the same local ROOT/directories/cursor and MUST be destroyed
+ * before the original scope/ResourceOwner. Budgets/unsupported shapes and all
+ * original native/isolation/lifetime preconditions above still apply. DRAINED
+ * is an observation, not era/lifetime qualification, discharge, allocation or
+ * truncation admission, COMPLETE, OPEN or release authority. No live caller. */
+extern bool cluster_relmap_retention_census_execute_native_episode(
+	const struct ClusterRecoveryRelmapSourceV1 *source, size_t root_budget,
+	size_t memory_budget, size_t payload_budget, ClusterRelmapRetentionCensus **out);
+
 /* Initial single-origin census from the original execution checkpoint/WAL
  * producer, without caller-filled directory bounds. Borrow the original
  * isolated OBSERVED ROOT, never a configured path. The caller still qualifies

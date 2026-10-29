@@ -2364,6 +2364,50 @@ census_execute_pending(const ClusterRelmapRetentionCensus *census)
 }
 
 bool
+cluster_relmap_retention_census_execute_native_episode(
+	const ClusterRecoveryRelmapSourceV1 *source, size_t root_budget,
+	size_t memory_budget, size_t payload_budget, ClusterRelmapRetentionCensus **out)
+{
+	ClusterRecoveryRelmapSourceV1 original;
+	ClusterRelmapRetentionCensus *volatile fresh = NULL;
+	volatile bool accepted = false;
+
+	if (out == NULL || source == NULL
+		|| census_recovery_overlap(out, sizeof(*out), source, sizeof(*source))
+		|| *out != NULL || MyBackendType != B_STARTUP || CritSectionCount != 0)
+		return false;
+	memcpy(&original, source, sizeof(original));
+	PG_TRY();
+	{
+		if (cluster_relmap_retention_census_open_native_episode(&original, root_budget,
+			memory_budget, payload_budget, (ClusterRelmapRetentionCensus **)&fresh)
+				== CLUSTER_RELMAP_CENSUS_MORE
+			&& census_execute_drain((ClusterRelmapRetentionCensus *)fresh)
+			&& !census_execute_pending((ClusterRelmapRetentionCensus *)fresh)
+			&& census_recovery_current((ClusterRelmapRetentionCensus *)fresh)) {
+			/* Only a complete clean local observation crosses this boundary.
+			 * Pending arbitration and joint completion retain their owners. */
+			*out = (ClusterRelmapRetentionCensus *)fresh;
+			fresh = NULL;
+			accepted = true;
+		}
+	}
+	PG_FINALLY();
+	{
+		if (!accepted) {
+			if (fresh != NULL)
+				census_failed((ClusterRelmapRetentionCensus *)fresh,
+					CLUSTER_RELMAP_CENSUS_UNAVAILABLE);
+			else
+				cluster_wal_inputs_relmap_source_fail_v1(&original);
+		}
+		cluster_relmap_retention_census_destroy((ClusterRelmapRetentionCensus *)fresh);
+	}
+	PG_END_TRY();
+	return accepted;
+}
+
+bool
 cluster_relmap_retention_census_committed_cold(ClusterRelmapRetentionCensus *census, Oid dbid,
 											   ClusterRelmapCensusCommitted *out)
 {
