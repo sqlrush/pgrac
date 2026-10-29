@@ -50,6 +50,10 @@ extern ClusterControlRootResult cluster_wal_inputs_job_open_v1(
 	ClusterWalInputsConsumerV1 consumer, MemoryContext caller_lifetime,
 	ClusterWalInputsJobV1 **job);
 extern MemoryContext cluster_wal_inputs_job_context_v1(ClusterWalInputsJobV1 *job);
+/* Only the complete original ROOT/pin/claim/final proof publishes usable.
+ * Refusal clears output while the original job retains cleanup ownership. */
+extern ClusterControlRootResult cluster_wal_inputs_job_begin_v1(ClusterWalInputsJobV1 *job,
+	const uint8 storage_uuid[16], uint64 system_identifier, ClusterWalInputsV1 **usable);
 extern ClusterWalInputsJobResultV1 cluster_wal_inputs_job_retire_v1(ClusterWalInputsJobV1 *job);
 extern ClusterWalInputsJobResultV1 cluster_wal_inputs_job_poll_v1(ClusterWalInputsJobV1 *job);
 extern ClusterWalInputsJobResultV1 cluster_wal_inputs_job_finish_v1(ClusterWalInputsJobV1 **job);

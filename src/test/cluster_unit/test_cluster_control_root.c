@@ -62,6 +62,17 @@
 #include "../../backend/cluster/cluster_control_root_private.h"
 #include "../../backend/cluster/cluster_control_bootstrap_private.h"
 #include "../../backend/cluster/cluster_recovery_anchor_private.h"
+#include "../../backend/cluster/cluster_wal_inputs_job_private.h"
+
+/* This immutable-file fixture creates only legacy, non-job scopes. Actual
+ * original job ownership is exercised by the separate job-body fixtures. */
+bool
+cluster_wal_inputs_job_scope_matches_v1(ClusterWalInputsJobV1 *job,
+	const ClusterWalInputsV1 *scope, bool building)
+{
+	(void)job; (void)scope; (void)building;
+	abort(); /* Entering this unsupported boundary cannot manufacture proof. */
+}
 
 #undef printf
 #undef fprintf

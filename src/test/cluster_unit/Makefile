@@ -142,6 +142,7 @@ TESTS = test_cluster_relmap_lock test_cluster_vm_read_visibility test_cluster_he
 		test_cluster_wal_inputs_job_pin \
 		test_cluster_wal_inputs_job_scope \
 		test_cluster_wal_inputs_job_cf \
+		test_cluster_wal_inputs_job_begin \
 		test_cluster_control_walr \
 		test_cluster_control_ir \
 		test_cluster_recovery_cold_cut test_cluster_typed_redo \
@@ -426,6 +427,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_cf_job_retirement test_cluster_control
 SIMPLE_TESTS := $(filter-out test_cluster_wal_inputs_job_pin,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_wal_inputs_job_scope,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_wal_inputs_job_cf,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_wal_inputs_job_begin,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_heap_cr_reuse test_cluster_snapshot_admission test_cluster_undo_header_durability test_cluster_tt_2pc_finish test_cluster_control_transport test_cluster_cr_native_origin test_cluster_cr_mvcc_origin test_cluster_tt_abort_owner test_cluster_tt_active_owner test_cluster_pcm_aux_consumer test_cluster_pcm_aux_reobserve test_cluster_multixact_current_stats test_cluster_vacuum_native_window test_cluster_subtrans_watermark \
 		test_cluster_r4_production_reachability test_cluster_heap_update_temp_lock test_cluster_heap_dml_lifetime \
 		test_cluster_pcm_aux_mutation test_cluster_heap_extend_current test_cluster_heap_pair_scope \
@@ -4343,7 +4345,7 @@ test_cluster_wal_inputs_product.o: $(top_srcdir)/src/backend/cluster/cluster_wal
 		$(top_srcdir)/src/include/cluster/storage/cluster_shared_fs.h \
 		$(top_srcdir)/src/include/access/xlogrecovery.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) \
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
 		-Dcluster_wal_claim_v2_read=test_wal_inputs_claim_read -c $< -o $@
 
 test_cluster_catalog_origin_io.o: $(top_srcdir)/src/backend/cluster/cluster_initdb_origin.c \
@@ -4519,6 +4521,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_relma
 		$(WAL_INPUT_CONTRIBUTION_TEST_OBJS) \
 		test_cluster_page_stable_ctrc.o \
 		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_inputs_job_private.h \
 		test_cluster_wal_inputs_product.o \
 		$(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
 		$(top_builddir)/src/backend/cluster/cluster_wal_history.o \
@@ -5176,13 +5179,41 @@ test_cluster_wal_inputs_job: test_cluster_wal_inputs_job.c test_cluster_cf_job_r
 		$(CLUSTER_CF_ENQUEUE_O) $(CLUSTER_LOCK_OWNER_O) $(CLUSTER_CONTROL_REQUEST_O) \
 		$(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
-test_cluster_wal_inputs_job test_cluster_wal_inputs_job_pin test_cluster_wal_inputs_job_scope test_cluster_wal_inputs_job_cf: \
+test_cluster_wal_inputs_job test_cluster_wal_inputs_job_pin test_cluster_wal_inputs_job_scope test_cluster_wal_inputs_job_cf test_cluster_wal_inputs_job_begin: \
 		test_cluster_wal_inputs_job_pin_fixture.h test_cluster_wal_inputs_job_pin_types.inc \
 		test_cluster_wal_inputs_job_pin_bodies.inc test_cluster_control_walr.inc \
 		test_cluster_wal_inputs_job_scope_fixture.h test_cluster_wal_inputs_job_scope_types.inc \
 		test_cluster_wal_inputs_job_scope_bodies.inc \
 		$(top_srcdir)/src/include/cluster/cluster_wal_retention.h \
 		$(top_srcdir)/src/backend/cluster/cluster_wal_inputs_job_private.h
+
+test_cluster_wal_inputs_job_begin: test_cluster_wal_inputs_job_begin.c test_cluster_wal_inputs_job_pin.c \
+		test_cluster_wal_inputs_job.c test_cluster_cf_job_retirement.c test_cluster_cf_enqueue.c \
+		test_cluster_wal_inputs_job_begin_fixture.h test_cluster_wal_inputs_job_begin_types.inc \
+		test_cluster_wal_inputs_job_begin_bodies.inc \
+		unit_test.h test_cluster_cf_job_ack.inc test_cluster_wal_inputs_job_callback.inc \
+		test_cluster_cf_blocker_trace.inc test_cluster_startup_interrupt.inc \
+		test_cluster_startup_interrupt_fixture.h \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_inputs_job.c \
+		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
+		$(CLUSTER_CF_ENQUEUE_O) $(CLUSTER_LOCK_OWNER_O) $(CLUSTER_CONTROL_REQUEST_O) \
+		$(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_CRYPTOHASH_O) $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(top_srcdir)/src/backend/cluster $< \
+		$(CLUSTER_CF_ENQUEUE_O) $(CLUSTER_LOCK_OWNER_O) $(CLUSTER_CONTROL_REQUEST_O) \
+		$(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_CRYPTOHASH_O) $(CLUSTER_UNIT_PORT_LIBS) \
+		$(LDFLAGS) $(filter -lcrypto,$(LIBS)) -o $@
+
+test_cluster_wal_inputs_job_begin_types.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_inputs.c Makefile
+	awk '/^typedef struct WalInputsWork/ { emit=1; count++ } \
+	     emit { print } /^} WalInputsWork;/ { emit=0 } \
+	     END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_wal_inputs_job_begin_bodies.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_inputs.c Makefile
+	awk '/^(inputs_build_current|inputs_unlock|inputs_root|inputs_checkpoint|inputs_terminal|inputs_collect|inputs_claims|inputs_remote_sample|inputs_job_root_phase|cluster_wal_inputs_job_begin_v1|cluster_wal_inputs_revalidate_v1|cluster_wal_inputs_suspend_v1|cluster_wal_inputs_wait_failed_v1|cluster_wal_inputs_resume_v1|cluster_wal_inputs_root_token_v1|cluster_wal_inputs_at_v1)\(/ { print prev; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } { prev=$$0 } \
+	     END { if (count != 16 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
 
 test_cluster_wal_inputs_job_cf: test_cluster_wal_inputs_job_cf.c test_cluster_wal_inputs_job_pin.c \
 		test_cluster_wal_inputs_job.c test_cluster_cf_job_retirement.c test_cluster_cf_enqueue.c \

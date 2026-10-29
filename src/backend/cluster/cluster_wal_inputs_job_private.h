@@ -117,6 +117,13 @@ extern ClusterControlRootResult cluster_wal_inputs_job_cf_prepare_v1(ClusterWalI
 	uint64 *before);
 extern ClusterCfJobResultV1 cluster_wal_inputs_job_cf_release_v1(ClusterWalInputsJobV1 *job,
 	uint64 before);
+extern ClusterControlRootResult cluster_wal_inputs_job_begin_ready_v1(ClusterWalInputsJobV1 *job);
+extern bool cluster_wal_inputs_job_scope_matches_v1(ClusterWalInputsJobV1 *job,
+	const ClusterWalInputsV1 *scope, bool building);
+/* Called only by the original begin after its full proof, or to revoke a
+ * refused/throwing build. UINT32_MAX retains an unknown ERROR verdict. */
+extern bool cluster_wal_inputs_job_begin_outcome_v1(ClusterWalInputsJobV1 *job,
+	uint32 result, bool error);
 
 StaticAssertDecl(CLUSTER_WAL_INPUT_JOB_COUNT == 4, "WAL input job slot count changed");
 StaticAssertDecl(CLUSTER_WAL_RETENTION_MAX_THREADS == 128, "WAL input member limit changed");
