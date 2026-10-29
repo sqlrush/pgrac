@@ -72,6 +72,9 @@ static unsigned int publish_events;
 static FullTransactionId assigned_xid, next_xid;
 static unsigned int sequence, xid_order, lock_order, wal_order, stage_order;
 static unsigned int full_requests, raw_requests, assignments;
+/* full_requests counts both top FullXid entries; retained_requests is a subset. */
+static unsigned retained_requests, retained_writer_reads;
+static bool retained_assignment_error, retained_assignment_drift;
 static unsigned int xid_under_lock, xid_in_crit, local_acquires;
 static unsigned int begins, inserts, flushes, stages, preserves, sync_commits;
 static unsigned int registered;
@@ -272,6 +275,25 @@ GetTopFullTransactionId(void)
 {
 	full_requests++;
 	return assign_top();
+}
+
+FullTransactionId
+GetTopFullTransactionIdRelmap(uint64 system_identifier, uint64 database_incarnation, uint16 origin)
+{
+	FullTransactionId top;
+
+	full_requests++;
+	retained_requests++;
+	retained_writer_reads = writer_reads;
+	if (system_identifier != writer_ref.claim.identity.system_identifier
+		|| database_incarnation != writer_ref.claim.database_incarnation
+		|| origin != writer_ref.claim.identity.origin_node_id || retained_assignment_error)
+		ereport(ERROR, (errmsg("controlled retained allocation refusal")));
+	/* Already assigned fixture XIDs represent the same retained transaction;
+	 * ordinary-to-retained refusal is exercised by the actual xact fixture. */
+	top = assign_top();
+	if (retained_assignment_drift) writer_epoch++;
+	return top;
 }
 
 TransactionId
@@ -600,6 +622,8 @@ reset(bool preassigned)
 	error_level = 0;
 	sequence = xid_order = lock_order = wal_order = stage_order = 0;
 	full_requests = raw_requests = assignments = 0;
+	retained_requests = retained_writer_reads = 0;
+	retained_assignment_error = retained_assignment_drift = false;
 	xid_under_lock = xid_in_crit = local_acquires = 0;
 	begins = inserts = flushes = stages = preserves = sync_commits = 0;
 	CritSectionCount = 0;
@@ -1110,11 +1134,18 @@ UT_TEST(unarmed_commit_preserves_other_writers_pending_and_global_lock)
 #include "test_cluster_relmap_tt_terminal.inc"
 #include "test_cluster_relmap_active_hook.inc"
 #include "test_cluster_relmap_active_hook_terminal.inc"
+#include "test_cluster_relmap_retained_producer.inc"
 
 int
 main(void)
 {
-	UT_PLAN(92);
+	bool focus = getenv("PGRAC_RELMAP_RETAINED_FOCUS") != NULL;
+	UT_PLAN(focus ? 4 : 96);
+	UT_RUN(retained_stage_uses_native_writer_identity_before_mapping_and_wal);
+	UT_RUN(retained_stage_missing_writer_never_assigns_or_stages);
+	UT_RUN(retained_stage_allocator_error_preserves_outputs_and_pins);
+	UT_RUN(retained_stage_writer_drift_keeps_issuance_without_stage);
+	if (!focus) {
 	UT_RUN(v2_late_active_tt_commit_then_relmap_postcommit);
 	UT_RUN(v2_late_active_relmap_abort_then_tt_abort);
 	UT_RUN(v2_late_active_committed_tt_keeps_partial_relmap_failure);
@@ -1207,6 +1238,7 @@ main(void)
 	UT_RUN(shared_ack_exhaustion_panics_with_both_arms_retained);
 	UT_RUN(database_ack_exhaustion_panics_with_remaining_arm_retained);
 	UT_RUN(unarmed_commit_preserves_other_writers_pending_and_global_lock);
+	}
 	UT_DONE();
 	return ut_failed_count != 0;
 }

@@ -64,6 +64,45 @@ cluster_relmap_owner_capture_v2(ClusterRelmapOwnerSampleV2 *out)
 	return true;
 }
 
+bool
+cluster_relmap_owner_capture_retained_v2(ClusterRelmapOwnerSampleV2 *out)
+{
+#ifdef USE_PGRAC_CLUSTER
+	ClusterRelmapOwnerSampleV2 work = { 0 };
+	FullTransactionId top;
+#endif
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+#ifdef USE_PGRAC_CLUSTER
+	if (!relmap_owner_context(true) || LWLockHeldByMe(RelationMappingLock)
+		|| LWLockHeldByMe(XidGenLock)
+		|| cluster_wal_writer_begin(GetWALInsertionTimeLine(), &work.writer)
+			!= CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return false;
+	/* Keep this original writer across native allocation and its waits. The
+	 * final matcher must reject drift, never sample a newer writer to adopt. */
+	work.owner.node = cluster_node_id;
+	work.owner.membership_epoch = work.writer.epoch;
+	work.owner.boot_incarnation = cluster_qvotec_get_self_incarnation();
+	work.owner.admitted_incarnation =
+		cluster_membership_get_last_admitted_incarnation(cluster_node_id);
+	work.producer_pid = MyProcPid;
+	top = GetTopFullTransactionIdRelmap(work.writer.ref.claim.identity.system_identifier,
+		work.writer.ref.claim.database_incarnation, work.writer.ref.claim.identity.origin_node_id);
+	if (!FullTransactionIdIsValid(top) || !TransactionIdIsNormal(XidFromFullTransactionId(top)))
+		return false;
+	work.owner.top_full_xid = U64FromFullTransactionId(top);
+	if (!cluster_relmap_owner_matches_v2(&work))
+		return false;
+	*out = work;
+	return true;
+#else
+	return false;
+#endif
+}
+
 static bool
 relmap_owner_matches_v2(const ClusterRelmapOwnerSampleV2 *sample, bool require_active)
 {

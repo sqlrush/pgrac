@@ -1337,7 +1337,7 @@ relmap_producer_stage_v2(bool shared, const RelMapFile *updates,
 		|| LWLockHeldByMe(RelationMappingLock) || LWLockHeldByMe(XidGenLock)
 		|| (!shared && (!OidIsValid(MyDatabaseTableSpace)
 			|| MyDatabaseTableSpace == GLOBALTABLESPACE_OID))
-		|| !cluster_relmap_owner_capture_v2(&sample))
+		|| !cluster_relmap_owner_capture_retained_v2(&sample))
 		return false;
 	identity.system_identifier = sample.writer.ref.claim.identity.system_identifier;
 	identity.database_incarnation = sample.writer.ref.claim.database_incarnation;

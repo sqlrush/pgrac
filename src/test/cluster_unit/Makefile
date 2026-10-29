@@ -607,6 +607,7 @@ test_cluster_relmap_arb: test_cluster_relmap_arb.c unit_test.h \
 		$(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 test_cluster_relmap_xid_order: test_cluster_relmap_xid_order.c unit_test.h \
+		test_cluster_relmap_retained_producer.inc \
 		test_cluster_relmap_producer_stage.inc test_cluster_relmap_commit_native.h \
 		test_cluster_relmap_producer_prepare.inc \
 		test_cluster_relmap_producer_terminal.inc \
@@ -11485,9 +11486,9 @@ test_cluster_xid_retention_runtime.inc: $(top_srcdir)/src/backend/cluster/cluste
 
 test_cluster_xid_retention_owner.inc: $(top_srcdir)/src/backend/cluster/cluster_relmap_owner.c Makefile
 	awk '/^relmap_owner_(context|matches_v2)\(/ { print "static bool"; emit=1; functions++ } \
-	     /^cluster_relmap_owner_(capture|matches)_v2\(/ { print "bool"; emit=1; functions++ } \
+	     /^cluster_relmap_owner_(capture(_retained)?|matches)_v2\(/ { print "bool"; emit=1; functions++ } \
 	     /^cluster_relmap_owner_retention_begin_v2\(/ { print "ClusterRelmapRetentionResult"; emit=1; functions++ } \
-	     emit { print } /^}/ { emit=0 } END { if (functions != 5) exit 1 }' $< > $@.tmp
+	     emit { print } /^}/ { emit=0 } END { if (functions != 6) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_xid_retention_xact_types.inc: $(top_srcdir)/src/backend/access/transam/xact.c Makefile
@@ -11593,6 +11594,7 @@ TESTS += test_cluster_xid_retention_native_clog
 all: test_cluster_xid_retention_native_clog
 test_cluster_xid_retention_native_clog_main.o: $(XID_RETENTION_TEST_INPUTS) \
 		test_cluster_xid_retention_native_clog.inc test_cluster_xid_retention_native_xact.inc \
+		test_cluster_xid_retention_owner_capture.inc \
 		test_cluster_xid_native_clog.h Makefile
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DTEST_CLUSTER_XID_RETENTION_NATIVE_CLOG -c $< -o $@
 
