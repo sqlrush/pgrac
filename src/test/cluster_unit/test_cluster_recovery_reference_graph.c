@@ -672,11 +672,15 @@ UT_TEST(test_observed_index_exposes_every_predecessor_without_io)
 }
 
 #include "test_cluster_recovery_tx_dependencies.inc"
+#include "test_cluster_recovery_tx_reference_edges.inc"
 
 int
 main(void)
 {
-	UT_PLAN(20);
+	UT_PLAN(23);
+	UT_RUN(test_tx_reference_find_preserves_shared_tail_indexes_and_native_uba);
+	UT_RUN(test_tx_reference_find_refuses_every_full_identity_and_address_difference);
+	UT_RUN(test_tx_reference_find_prefix_empty_invalidated_and_inconsistent_bucket);
 	UT_RUN(test_tx_dependencies_preserve_roots_shared_tail_and_physical_generation);
 	UT_RUN(test_tx_dependencies_keep_an_already_root_predecessor_and_native_uba);
 	UT_RUN(test_tx_dependencies_prefix_empty_end_range_and_invalidation);

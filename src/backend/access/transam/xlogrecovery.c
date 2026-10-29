@@ -2993,6 +2993,68 @@ ClusterColdRecoveryCtrcTxDependency(const struct ClusterRecoveryStartV1 *start,
 	return out;
 }
 
+ClusterRecoveryCensusTxReferenceV1
+ClusterColdRecoveryCtrcTxReference(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work, uint32 index)
+{
+	ClusterRecoveryCensusTxReferenceV1 out = {0};
+	struct ClusterRecoveryStartV1 *state = cluster_recovery_cold_start;
+	bool held = false;
+
+	if (start == NULL || start != state || CritSectionCount != 0 || ShutdownRequestPending
+		|| !start->ctrc_observation_complete || work != start->ctrc_observation_work
+		|| start->ctrc_references == NULL || index > start->ctrc_references->count) return out;
+	ForEachLWLockHeldByMe(cluster_recovery_cold_ctrc_lock_held, &held);
+	if (held || !ClusterColdRecoveryCtrcObserve(start, 0)) return out;
+	PG_TRY();
+	{
+		ClusterRecoveryCensusTxReferenceV1 current = cluster_recovery_census_tx_reference_v1(
+			state->ctrc_observation_census, index);
+		const ClusterRecoveryGraphDependency *dependency = &current.transaction;
+		ClusterRecoveryGraphDependency empty = {0};
+		bool ok = current.observed && current.index == index
+			&& current.count == state->ctrc_references->count;
+
+		if (ok && index == current.count)
+			ok = current.reference == NULL && memcmp(dependency, &empty, sizeof(empty)) == 0;
+		else if (ok) {
+			const ClusterRecoveryCensusReferenceV1 *reference = &state->ctrc_references->entries[index];
+
+			ok = current.reference == reference
+				&& (reference->entry.kind == CLUSTER_RECOVERY_HEAP_ITL
+					|| reference->entry.kind == CLUSTER_RECOVERY_HEAP_ITEM);
+			if (ok && reference->entry.kind == CLUSTER_RECOVERY_HEAP_ITL
+				&& reference->entry.itl.flags != ITL_FLAG_FREE)
+				ok = dependency->value.record != NULL
+					&& dependency->value.record == reference->transaction.record
+					&& dependency->value.record_segment_generation == reference->transaction.record_segment_generation
+					&& memcmp(&dependency->value.transaction, &reference->transaction.transaction,
+						sizeof(dependency->value.transaction)) == 0
+					&& dependency->count == state->ctrc_observation_manifest.tx_record_count
+					&& dependency->index < dependency->count && dependency->root_count <= dependency->count
+					&& dependency->root == (dependency->index < dependency->root_count)
+					&& (dependency->predecessor.record == NULL
+						|| (dependency->predecessor_index < dependency->count
+							&& dependency->predecessor_index != dependency->index));
+			else if (ok) ok = reference->transaction.record == NULL
+				&& memcmp(dependency, &empty, sizeof(empty)) == 0;
+		}
+		if (ok && ClusterColdRecoveryCtrcObserve(start, 0)) out = current;
+		else {
+			cluster_recovery_cold_observation_refuse(state, "tx_reference", 0);
+			cluster_recovery_cold_observation_close(state);
+		}
+	}
+	PG_CATCH();
+	{
+		cluster_recovery_cold_observation_refuse(state, "tx_reference_error", 0);
+		cluster_recovery_cold_observation_close(state);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return out;
+}
+
 bool
 ClusterColdRecoveryCtrcWalSourceCount(const struct ClusterRecoveryStartV1 *start,
 	const struct ClusterColdCtrcWorkV1 *work, uint32 *out)

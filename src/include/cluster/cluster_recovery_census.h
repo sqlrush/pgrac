@@ -299,6 +299,25 @@ typedef struct ClusterRecoveryCensusTxDependencyV1 {
 extern ClusterRecoveryCensusTxDependencyV1
 cluster_recovery_census_tx_dependency_v1(ClusterRecoveryCensus *census, uint32 index);
 
+/* Enumerate EVERY original PAGE/history reference and join each non-FREE
+ * ITL to its exact original TX forest node/dependency indexes. FREE ITLs and
+ * all raw tuple/MX/HOT/line-pointer items remain present with no TX edge;
+ * absence of that edge is not proof that their obligations are discharged.
+ * This is an ITL stored-head edge, never a PAGE_VERSION inverse edge.
+ * reference borrows original immutable census bytes; transaction records
+ * borrow the same observed forest. Complete end has index==count and NULL
+ * reference; invalid/prefix/refused output is entirely zero. Same pre-PAGE,
+ * original manifest/source, sticky false/ERROR and lifetime contract as TX
+ * views. No native read/pass/allocation, owner proof, retention or completion. */
+typedef struct ClusterRecoveryCensusTxReferenceV1 {
+	bool observed;
+	uint32 count, index;
+	const ClusterRecoveryCensusReferenceV1 *reference;
+	ClusterRecoveryGraphDependency transaction;
+} ClusterRecoveryCensusTxReferenceV1;
+extern ClusterRecoveryCensusTxReferenceV1
+cluster_recovery_census_tx_reference_v1(ClusterRecoveryCensus *census, uint32 index);
+
 /* Borrow the original live cold inputs and their ROOT-selected isolated
  * namespace fd. The caller holds isolation, retention and these owners for
  * the entire cursor lifetime; this API establishes none of those premises.

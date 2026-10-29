@@ -64,7 +64,11 @@ static ClusterRecoveryGraphResult census_dependency_test_at(const ClusterRecover
 #define cluster_recovery_reference_graph_at census_tx_test_at
 #define HandleStartupProcInterrupts census_namespace_interrupts
 #define cluster_recovery_root_set_read_current_relation census_current_read
+static ClusterRecoveryGraphResult census_ref_test_find(const ClusterRecoveryReferenceGraph *,
+ const ClusterRecoveryTxnKey *,UBA,ClusterRecoveryGraphDependency *);
+#define cluster_recovery_reference_graph_dependency_find census_ref_test_find
 #include "../../backend/cluster/cluster_recovery_census.c"
+#undef cluster_recovery_reference_graph_dependency_find
 #undef cluster_recovery_root_set_read_current_relation
 #undef HandleStartupProcInterrupts
 #undef cluster_recovery_reference_graph_at
@@ -1142,6 +1146,7 @@ cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **held)
 
 #include "test_cluster_recovery_census_tx_records.inc"
 #include "test_cluster_recovery_census_tx_dependencies.inc"
+#include "test_cluster_recovery_census_tx_reference_edges.inc"
 
 int
 main(int argc, char **argv)
@@ -1150,6 +1155,13 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_CENSUS_TX_REFERENCE_EDGES") != NULL) {
+		UT_PLAN(3);
+		UT_RUN(test_census_tx_references_join_all_original_current_and_history_items);
+		UT_RUN(test_census_tx_references_prefix_empty_lock_and_range_are_distinct);
+		UT_RUN(test_census_tx_references_late_source_graph_generation_and_error_are_sticky);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_CENSUS_TX_DEPENDENCIES") != NULL) {
 		UT_PLAN(3);
 		UT_RUN(test_census_tx_dependencies_construct_original_roots_and_cross_relation_edge);
@@ -1485,7 +1497,10 @@ main(int argc, char **argv)
 		UT_RUN(test_census_references_bound_metadata_and_tuple_storage_before_publication);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(271);
+	UT_PLAN(274);
+	UT_RUN(test_census_tx_references_join_all_original_current_and_history_items);
+	UT_RUN(test_census_tx_references_prefix_empty_lock_and_range_are_distinct);
+	UT_RUN(test_census_tx_references_late_source_graph_generation_and_error_are_sticky);
 	UT_RUN(test_census_tx_dependencies_construct_original_roots_and_cross_relation_edge);
 	UT_RUN(test_census_tx_dependencies_prefix_lock_and_range_do_not_enter);
 	UT_RUN(test_census_tx_dependencies_late_source_count_error_revoke_whole_forest);

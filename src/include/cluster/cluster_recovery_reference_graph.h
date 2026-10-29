@@ -132,6 +132,16 @@ extern ClusterRecoveryGraphResult cluster_recovery_reference_graph_dependency_at
 	const ClusterRecoveryReferenceGraph *graph, uint32 index,
 	ClusterRecoveryGraphDependency *out);
 
+/* Resolve a complete original transaction/native UBA128 to its already
+ * observed dependency index, using the original immutable node hash table.
+ * No root insertion, traversal, record read or allocation. Missing/different
+ * identities refuse and clear out; native indexes are not canonical graph IDs.
+ * out must be disjoint from graph-owned storage. Same borrowed lifetime and
+ * lack of completion/owner authority as dependency_at above. */
+extern ClusterRecoveryGraphResult cluster_recovery_reference_graph_dependency_find(
+	const ClusterRecoveryReferenceGraph *graph, const ClusterRecoveryTxnKey *transaction,
+	UBA address, ClusterRecoveryGraphDependency *out);
+
 /* Match a page locator against saved, fully re-read records, never against
  * the current TT slot generation guessed from the UBA. The forest must be
  * observed and outlive this lookup and all returned borrowed records.

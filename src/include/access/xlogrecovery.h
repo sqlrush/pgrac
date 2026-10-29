@@ -344,6 +344,17 @@ extern struct ClusterRecoveryCensusTxDependencyV1 ClusterColdRecoveryCtrcTxDepen
 	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work,
 	uint32 index);
 
+/* Same original Start/work/accepted-TX/full simultaneous ALL IR-WALR.
+ * Complete PAGE/history emissions remain borrowed from this original Start;
+ * non-FREE ITL stored heads resolve to this SAME observed TX dependency index.
+ * Raw tuple/MX/HOT obligations remain explicit. Same pre-PAGE/current and
+ * sticky cleanup contract as TxDependency; no independent semantic graph,
+ * terminal/owner proof, discharge, retention transfer or COMPLETE right. */
+struct ClusterRecoveryCensusTxReferenceV1;
+extern struct ClusterRecoveryCensusTxReferenceV1 ClusterColdRecoveryCtrcTxReference(
+	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work,
+	uint32 index);
+
 /* Same original complete observation and accepted TX; raw, immutable decoded
  * PAGE WAL inputs of every selected generation. Zero count is complete-empty.
  * Outputs clear on refusal; readers borrow original cursor/scope lifetime.

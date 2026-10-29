@@ -2377,6 +2377,7 @@ static void startup_local_empty_reset(void);
 #include "test_cluster_cold_ctrc_references.inc"
 #include "test_cluster_cold_ctrc_tx_records.inc"
 #include "test_cluster_cold_ctrc_tx_dependencies.inc"
+#include "test_cluster_cold_ctrc_tx_reference_edges.inc"
 #include "test_cluster_cold_ctrc_reference_terminals.inc"
 #include "test_cluster_cold_ctrc_reference_tuples.inc"
 #include "test_cluster_cold_ctrc_census_hot.inc"
@@ -2752,6 +2753,14 @@ int main(void)
 		UT_DONE();
 		return ut_failed_count == 0 ? 0 : 1;
 	}
+	if (getenv("PGRAC_PRE2_TEST_START_TX_REFERENCE_EDGES") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_start_tx_references_preserve_exact_member_itl_free_tuple_and_end);
+		UT_RUN(test_start_tx_references_preconditions_do_not_enter);
+		UT_RUN(test_start_tx_references_late_owner_source_shape_and_pointer_are_sticky);
+		UT_RUN(test_start_tx_references_error_retains_original_debt_and_reverse_cleanup);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_START_TX_DEPENDENCIES") != NULL) {
 		UT_PLAN(4);
 		UT_RUN(test_start_tx_dependencies_keep_exact_original_roots_edge_and_empty_end);
@@ -2770,9 +2779,9 @@ int main(void)
 	}
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_FIRST
-	UT_PLAN(322);
+	UT_PLAN(326);
 #else
-	UT_PLAN(318);
+	UT_PLAN(322);
 #endif
 	UT_RUN(test_startup_native_images_accept_only_unchanged_complete_terminal_page);
 	UT_RUN(test_startup_native_images_reject_unresolved_ambiguous_and_mx_itls);
@@ -2783,8 +2792,12 @@ int main(void)
 	UT_RUN(test_startup_native_directory_real_origin_cannot_be_discharged_by_wait);
 	UT_RUN(test_startup_native_directory_invalid_layout_and_partial_error_keep_debt);
 #else
-	UT_PLAN(310);
+	UT_PLAN(314);
 #endif
+	UT_RUN(test_start_tx_references_preserve_exact_member_itl_free_tuple_and_end);
+	UT_RUN(test_start_tx_references_preconditions_do_not_enter);
+	UT_RUN(test_start_tx_references_late_owner_source_shape_and_pointer_are_sticky);
+	UT_RUN(test_start_tx_references_error_retains_original_debt_and_reverse_cleanup);
 	UT_RUN(test_start_tx_dependencies_keep_exact_original_roots_edge_and_empty_end);
 	UT_RUN(test_start_tx_dependencies_do_not_enter_with_other_work_lock_or_range);
 	UT_RUN(test_start_tx_dependencies_bad_shape_late_owner_and_source_are_sticky);

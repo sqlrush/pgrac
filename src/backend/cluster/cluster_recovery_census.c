@@ -1127,6 +1127,69 @@ cluster_recovery_census_tx_dependency_v1(ClusterRecoveryCensus *census, uint32 i
 	return out;
 }
 
+ClusterRecoveryCensusTxReferenceV1
+cluster_recovery_census_tx_reference_v1(ClusterRecoveryCensus *census, uint32 index)
+{
+	ClusterRecoveryCensusTxReferenceV1 out = {0}, current = {0};
+	ClusterRecoveryCensusManifest before, after;
+	bool held = false, ok = false;
+
+	if (census == NULL || census->status != CLUSTER_RECOVERY_CENSUS_DRAINED
+		|| CritSectionCount != 0 || ShutdownRequestPending || index > census->reference_count)
+		return out;
+	ForEachLWLockHeldByMe(census_page_lock_held, &held);
+	if (held) return out;
+	PG_TRY();
+	{
+		if (cluster_recovery_census_manifest(census, &before)
+			&& census->references != NULL && census->references->count == census->reference_count) {
+			current.count = census->reference_count;
+			current.index = index;
+			ok = true;
+			if (index < current.count) {
+				const ClusterRecoveryCensusReferenceV1 *reference = &census->references->entries[index];
+				const ClusterRecoveryGraphRecord *record = &reference->transaction;
+				const ClusterRecoveryHeapEntry *entry = &reference->entry;
+
+				current.reference = reference;
+				ok = reference->page_index < census->page_count
+					&& census->pages->entries[reference->page_index].heap
+					&& (entry->kind == CLUSTER_RECOVERY_HEAP_ITL || entry->kind == CLUSTER_RECOVERY_HEAP_ITEM);
+				if (ok && entry->kind == CLUSTER_RECOVERY_HEAP_ITL && entry->itl.flags != ITL_FLAG_FREE) {
+					ClusterTxLocator locator = {0};
+					ClusterTxResolveReason reason;
+
+					locator.uba = entry->itl.undo_segment_head;
+					locator.xid = entry->itl.xid;
+					locator.itl_kind = entry->itl.flags;
+					locator.itl_slot_index = entry->index;
+					locator.tt_wrap = record->transaction.slot_wrap;
+					ok = record->record != NULL
+						&& cluster_undo_record_validate_identity(&locator, record->record->address,
+							&record->record->header, &reason)
+						&& cluster_recovery_reference_graph_dependency_find(census->graph,
+							&record->transaction, locator.uba, &current.transaction) == CLUSTER_RECOVERY_GRAPH_RECORD
+						&& current.transaction.count == before.tx_record_count
+						&& current.transaction.value.record == record->record
+						&& current.transaction.value.record_segment_generation == record->record_segment_generation;
+				} else if (ok) ok = record->record == NULL;
+			}
+			ok = ok && cluster_recovery_census_manifest(census, &after)
+				&& memcmp(&before, &after, sizeof(before)) == 0
+				&& current.count == census->reference_count;
+			if (ok) { current.observed = true; out = current; }
+		}
+		if (!ok) (void)census_fail(census, CLUSTER_RECOVERY_CENSUS_REFUSED);
+	}
+	PG_CATCH();
+	{
+		(void)census_fail(census, CLUSTER_RECOVERY_CENSUS_REFUSED);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return out;
+}
+
 bool
 cluster_recovery_census_wal_source_count_v1(ClusterRecoveryCensus *census, uint32 *out)
 {
