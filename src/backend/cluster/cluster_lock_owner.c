@@ -276,9 +276,9 @@ lock_owner_reap(void)
 	}
 }
 
-ClusterLockAcquireResult
-cluster_lock_owner_request_acquire(ClusterLockAcquireRequest *request,
-								   ClusterControlNativeFinish finish, void *argument)
+static ClusterLockAcquireResult
+lock_owner_request_acquire(ClusterLockAcquireRequest *request,
+						   ClusterControlNativeFinish finish, void *argument, bool retain_guard)
 {
 	ClusterLockOwner *owner;
 	ClusterLockAcquireResult result;
@@ -316,20 +316,37 @@ cluster_lock_owner_request_acquire(ClusterLockAcquireRequest *request,
 				|| result == CLUSTER_LOCK_ACQUIRE_OK_CONVERTED)
 				result = CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 			lock_owner_abandon(owner);
-			owner->auto_reap = true;
+			owner->auto_reap = !retain_guard;
 		}
 		*request = owner->request;
 	}
 	PG_CATCH();
 	{
 		lock_owner_abandon(owner);
-		owner->auto_reap = true;
+		owner->auto_reap = !retain_guard;
 		*request = owner->request;
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
 	lock_owner_reap();
 	return result;
+}
+
+ClusterLockAcquireResult
+cluster_lock_owner_request_acquire(ClusterLockAcquireRequest *request,
+								   ClusterControlNativeFinish finish, void *argument)
+{
+	return lock_owner_request_acquire(request, finish, argument, false);
+}
+
+ClusterLockAcquireResult
+cluster_lock_owner_request_acquire_retained(ClusterLockAcquireRequest *request,
+											ClusterControlNativeFinish finish, void *argument)
+{
+	/* The original caller owns this stable guard even if acquisition fails
+	 * or throws. Census may prove terminal retirement, but only that caller
+	 * consumes the guard before releasing its associated local resources. */
+	return lock_owner_request_acquire(request, finish, argument, true);
 }
 
 static ClusterLockOwner *
