@@ -98,6 +98,22 @@ cluster_undo_decode(XLogReaderState *record, ClusterUndoDecoded *out)
 	case CLUSTER_UNDO_KIND_TT_BIND: {
 		xl_undo_tt_slot_bind rec;
 
+		if (XLogRecGetDataLen(record) == sizeof(xl_undo_tt_identity_v2)) {
+			xl_undo_tt_identity_v2 v2;
+
+			if (!cluster_undo_tt_bind_v2_decode(XLogRecGetData(record),
+											  XLogRecGetDataLen(record), &v2))
+				return false;
+			out->instance = v2.instance;
+			out->segment_id = v2.segment_id;
+			out->expected_generation = v2.segment_generation;
+			out->slot_offset = v2.slot_offset;
+			out->wrap = v2.wrap;
+			out->xid = v2.xid;
+			out->format_version = v2.format_version;
+			out->original_full_xid = v2.original_full_xid;
+			break;
+		}
 		if (XLogRecGetDataLen(record) != sizeof(rec))
 			return false;
 		memcpy(&rec, XLogRecGetData(record), sizeof(rec));
@@ -371,9 +387,11 @@ cluster_undo_preflight_for_use(const ClusterUndoDecoded *decoded, bool pi_inspec
 	}
 	switch (decoded->kind) {
 	case CLUSTER_UNDO_KIND_TT_BIND:
+		/* V2 is readable, but cannot enter a raw-only TT32 mutation path. */
 		if (decoded->slot_offset >= TT_SLOTS_PER_SEGMENT || !TransactionIdIsNormal(decoded->xid)
 			|| decoded->wrap == TT_WRAP_INVALID
-			|| decoded->format_version != CLUSTER_UNDO_TT_BIND_VERSION || decoded->flags != 0)
+			|| decoded->format_version != CLUSTER_UNDO_TT_BIND_VERSION || decoded->flags != 0
+			|| decoded->original_full_xid != 0)
 			return false;
 		break;
 	case CLUSTER_UNDO_KIND_TT_COMMIT:

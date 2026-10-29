@@ -103,6 +103,7 @@ typedef struct ClusterUndoDecoded {
 	uint8 new_state;
 	uint8 reserved_zero[1];
 	UBA first_undo_block;
+	uint64 original_full_xid; /* explicit V2 identity; zero for legacy records */
 } ClusterUndoDecoded;
 
 /*

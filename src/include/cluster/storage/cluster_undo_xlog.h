@@ -36,6 +36,7 @@
 #ifndef CLUSTER_UNDO_XLOG_H
 #define CLUSTER_UNDO_XLOG_H
 
+#include "access/transam.h"
 #include "access/xlogreader.h"
 #include "common/relpath.h" /* ForkNumber (spec-5.7 HW records) */
 #include "lib/stringinfo.h"
@@ -162,6 +163,64 @@ StaticAssertDecl(offsetof(xl_undo_tt_slot_bind, segment_generation) == 4,
 StaticAssertDecl(offsetof(xl_undo_tt_slot_bind, xid) == 8, "bind xid offset must remain fixed");
 StaticAssertDecl(offsetof(xl_undo_tt_slot_bind, instance) == 16,
 				 "bind identity trailer offset must remain fixed");
+
+/* Explicit V2 identity prefix. V1's reserved bytes keep their old meaning. */
+#define CLUSTER_UNDO_TT_IDENTITY_V2_VERSION 2
+
+typedef struct xl_undo_tt_identity_v2 {
+	uint32 segment_id;
+	uint32 segment_generation;
+	TransactionId xid;
+	uint16 slot_offset;
+	uint16 wrap;
+	uint8 instance;
+	uint8 format_version;
+	uint16 flags;
+	uint32 reserved;
+	uint64 original_full_xid;
+} xl_undo_tt_identity_v2;
+
+StaticAssertDecl(sizeof(xl_undo_tt_identity_v2) == 32,
+				 "TT V2 identity prefix must be exactly 32 bytes");
+StaticAssertDecl(offsetof(xl_undo_tt_identity_v2, segment_id) == 0,
+				 "TT V2 segment offset must remain fixed");
+StaticAssertDecl(offsetof(xl_undo_tt_identity_v2, segment_generation) == 4,
+				 "TT V2 generation offset must remain fixed");
+StaticAssertDecl(offsetof(xl_undo_tt_identity_v2, xid) == 8,
+				 "TT V2 xid offset must remain fixed");
+StaticAssertDecl(offsetof(xl_undo_tt_identity_v2, slot_offset) == 12,
+				 "TT V2 slot offset must remain fixed");
+StaticAssertDecl(offsetof(xl_undo_tt_identity_v2, wrap) == 14,
+				 "TT V2 wrap offset must remain fixed");
+StaticAssertDecl(offsetof(xl_undo_tt_identity_v2, instance) == 16,
+				 "TT V2 instance offset must remain fixed");
+StaticAssertDecl(offsetof(xl_undo_tt_identity_v2, format_version) == 17,
+				 "TT V2 version offset must remain fixed");
+StaticAssertDecl(offsetof(xl_undo_tt_identity_v2, flags) == 18,
+				 "TT V2 flags offset must remain fixed");
+StaticAssertDecl(offsetof(xl_undo_tt_identity_v2, reserved) == 20,
+				 "TT V2 reserved offset must remain fixed");
+StaticAssertDecl(offsetof(xl_undo_tt_identity_v2, original_full_xid) == 24,
+				 "TT V2 original FullXid offset must remain fixed");
+
+/* Pure shape/identity parse, also used by frontend rmgrdesc. Copy first:
+ * main data need not be aligned. No epoch inference or target authority. */
+static inline bool
+cluster_undo_tt_bind_v2_decode(const void *payload, Size length, xl_undo_tt_identity_v2 *out)
+{
+	xl_undo_tt_identity_v2 rec;
+
+	if (payload == NULL || out == NULL || length != sizeof(rec))
+		return false;
+	memcpy(&rec, payload, sizeof(rec));
+	if (rec.format_version != CLUSTER_UNDO_TT_IDENTITY_V2_VERSION || rec.flags != 0
+		|| rec.reserved != 0 || !TransactionIdIsNormal(rec.xid)
+		|| rec.original_full_xid == UINT64_MAX
+		|| (TransactionId)rec.original_full_xid != rec.xid)
+		return false;
+	*out = rec;
+	return true;
+}
 
 /*
  * On-disk WAL payload for XLOG_HW_RESERVE (spec-5.7a D1, §3.1a M1c).

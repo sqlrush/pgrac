@@ -49,14 +49,38 @@ cluster_undo_desc(StringInfo buf, XLogReaderState *record)
 		break;
 	}
 	case XLOG_UNDO_TT_SLOT_BIND: {
-		xl_undo_tt_slot_bind *rec = (xl_undo_tt_slot_bind *)payload;
+		xl_undo_tt_slot_bind rec;
+		xl_undo_tt_identity_v2 v2;
+
+		if (XLogRecGetDataLen(record) == sizeof(v2)) {
+			if (!cluster_undo_tt_bind_v2_decode(payload, XLogRecGetDataLen(record), &v2))
+				appendStringInfoString(buf, "malformed TT BIND payload");
+			else
+				appendStringInfo(buf,
+					"instance %u segment %u generation %u slot %u wrap %u xid %u original_full_xid " UINT64_FORMAT " (active bind v%u)",
+					(unsigned)v2.instance, (unsigned)v2.segment_id,
+					(unsigned)v2.segment_generation, (unsigned)v2.slot_offset,
+					(unsigned)v2.wrap, (unsigned)v2.xid, v2.original_full_xid,
+					(unsigned)v2.format_version);
+			break;
+		}
+		if (XLogRecGetDataLen(record) != sizeof(rec)) {
+			appendStringInfoString(buf, "malformed TT BIND payload");
+			break;
+		}
+		memcpy(&rec, payload, sizeof(rec));
+		if (rec.format_version != CLUSTER_UNDO_TT_BIND_VERSION || rec.flags != 0
+			|| rec.reserved8 != 0 || rec.reserved32 != 0) {
+			appendStringInfoString(buf, "malformed TT BIND payload");
+			break;
+		}
 
 		appendStringInfo(buf,
 			"instance %u segment %u generation %u slot %u wrap %u xid %u (active bind v%u)",
-			(unsigned)rec->instance, (unsigned)rec->segment_id,
-			(unsigned)rec->segment_generation, (unsigned)rec->slot_offset,
-			(unsigned)rec->wrap, (unsigned)rec->xid,
-			(unsigned)rec->format_version);
+			(unsigned)rec.instance, (unsigned)rec.segment_id,
+			(unsigned)rec.segment_generation, (unsigned)rec.slot_offset,
+			(unsigned)rec.wrap, (unsigned)rec.xid,
+			(unsigned)rec.format_version);
 		break;
 	}
 	case XLOG_UNDO_TT_SLOT_COMMIT: {

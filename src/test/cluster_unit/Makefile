@@ -3589,10 +3589,19 @@ test_cluster_undo_producer: test_cluster_undo_producer.c unit_test.h \
 		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -lssl -lcrypto $(filter -llz4 -lzstd,$(LIBS)) -o $@
 
 test_cluster_side_undo: test_cluster_side_undo.c unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_side_undo.h \
+		$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h \
+		test_cluster_undo_desc_product.o \
+		$(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_SIDE_UNDO_O) $(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_SIDE_UNDO_O) $(CLUSTER_SIDE_ROUTE_O) \
-		$(CLUSTER_RF_ROUTE_O) \
+		$(CLUSTER_RF_ROUTE_O) test_cluster_undo_desc_product.o \
+		$(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+test_cluster_undo_desc_product.o: $(top_srcdir)/src/backend/access/rmgrdesc/clusterundodesc.c \
+		$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
 CLUSTER_SIDE_XACT_O = test_cluster_side_xact_product.o
 CLUSTER_REMOTE_XACT_IDENTITY_O = \
