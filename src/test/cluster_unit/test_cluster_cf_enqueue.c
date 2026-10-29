@@ -323,6 +323,13 @@ cluster_grd_control_rebuild_frozen(uint64 epoch, uint64 generation)
 void
 cluster_lmon_wakeup(void)
 {}
+#ifndef PGRAC_CF_JOB_LATCH_FIXTURE
+void
+SetLatch(Latch *latch pg_attribute_unused())
+{
+	abort(); /* Legacy fixtures never bind a CF job completion. */
+}
+#endif
 void
 ResetLatch(Latch *latch pg_attribute_unused())
 {}

@@ -112,6 +112,47 @@ extern bool cluster_cf_release_completed(LOCKMODE mode, uint64 cookie);
 extern void cluster_cf_retirement_poll(void);
 extern void cluster_cf_unlock(LOCKMODE mode);
 
+/* Read-only identity of this task's unusable cleanup, never CF permission.
+ * The embedded owner's original registry handle binds the creator incarnation.
+ * Nothing here adopts another task or consumes a completion. */
+typedef struct ClusterCfRetirementSnapshot {
+	uint64 cookie;
+	ClusterControlRequestView registry;
+} ClusterCfRetirementSnapshot;
+
+extern bool cluster_cf_retirement_snapshot(LOCKMODE mode, const void *caller,
+										   ClusterCfRetirementSnapshot *out);
+
+typedef enum ClusterCfJobResultV1 {
+	CF_JOB_INVALID = -1,
+	CF_JOB_PENDING = 0,
+	CF_JOB_CONFIRMED = 1
+} ClusterCfJobResultV1;
+
+typedef enum ClusterCfJobReceiptStateV1 {
+	CF_JOB_RECEIPT_UNBOUND = 0,
+	CF_JOB_RECEIPT_RETIRING = 1,
+	CF_JOB_RECEIPT_CONFIRMED = 2
+} ClusterCfJobReceiptStateV1;
+
+/* Caller-owned, process-local completion only; never CF permission.
+ * Initialize to zero with a nonzero, immutable job_generation before use.
+ * Keep its address/storage alive until CONFIRMED, including ERROR unwind.
+ * RETIRING receipts must not be copied, reset or rebound. After consuming
+ * CONFIRMED the original job may zero original/state for its next release. */
+typedef struct ClusterCfJobReceiptV1 {
+	ClusterCfRetirementSnapshot original;
+	uint64 job_generation;
+	uint32 state;
+	uint32 reserved;
+} ClusterCfJobReceiptV1;
+
+StaticAssertDecl(sizeof(ClusterCfJobReceiptV1) <= 184, "CF job receipt exceeds its byte limit");
+
+extern ClusterCfJobResultV1 cluster_cf_unlock_job_v1(LOCKMODE mode, const void *caller,
+													  ClusterCfJobReceiptV1 *receipt);
+extern ClusterCfJobResultV1 cluster_cf_job_retirement_poll_v1(ClusterCfJobReceiptV1 *receipt);
+
 typedef enum ClusterCfReleaseResult {
 	CLUSTER_CF_RELEASE_NOT_HELD = 0,
 	CLUSTER_CF_RELEASE_CONFIRMED = 1,
