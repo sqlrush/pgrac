@@ -2341,6 +2341,8 @@ static void startup_local_empty_reset(void);
 #include "test_cluster_cold_ctrc_heap_refs.inc"
 #include "test_cluster_cold_ctrc_hot_refs.inc"
 
+#include "test_cluster_cold_ctrc_references.inc"
+
 int main(void)
 {
 	if (getenv("PGRAC_PRE2_TEST_STARTUP_HOT_REFS") != NULL) {
@@ -2554,7 +2556,16 @@ int main(void)
 		UT_RUN(test_ctrc_pages_native_error_retires_cursor_before_original_scope);
 		reset(); UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(244);
+	if (getenv("PGRAC_PRE2_TEST_START_REFERENCES") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_ctrc_references_missing_view_refuses_before_observation_publication);
+		UT_RUN(test_ctrc_references_cannot_rebind_same_start_to_another_complete_view);
+		UT_RUN(test_ctrc_references_error_uses_original_failure_and_reverse_cleanup);
+		UT_RUN(test_ctrc_references_after_getter_owner_drift_refuses_without_new_scope);
+		UT_DONE();
+		return ut_failed_count == 0 ? 0 : 1;
+	}
+	UT_PLAN(248);
 	UT_RUN(test_startup_final_hot_refs_use_each_actual_block_after_page_cleanup);
 	UT_RUN(test_startup_final_hot_refs_late_refusal_or_input_drift_prevents_handoff);
 	UT_RUN(test_startup_final_hot_refs_error_retains_original_fds_and_pins);
@@ -2811,6 +2822,10 @@ int main(void)
 	UT_RUN(test_original_lmon_does_not_accept_unfinished_or_unproven_tx);
 	UT_RUN(test_actual_startup_keeps_private_tx_input_until_lmon_accepts);
 	UT_RUN(test_tx_handoff_refuses_pending_or_drift_without_destroying_input);
+	UT_RUN(test_ctrc_references_missing_view_refuses_before_observation_publication);
+	UT_RUN(test_ctrc_references_cannot_rebind_same_start_to_another_complete_view);
+	UT_RUN(test_ctrc_references_error_uses_original_failure_and_reverse_cleanup);
+	UT_RUN(test_ctrc_references_after_getter_owner_drift_refuses_without_new_scope);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

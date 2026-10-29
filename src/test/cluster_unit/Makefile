@@ -14071,6 +14071,10 @@ test_cluster_clog_recovery test_cluster_side_native_clog.o \
         test_cluster_recovery_episode_clog.o test_cluster_xid_native_clog.o: \
         $(top_srcdir)/src/include/access/slru.h
 
+# Complete original relation/history references stay with the original census.
+test_cluster_recovery_native_inputs: test_cluster_recovery_reference_inputs.inc
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_references.inc
+
 # Rebuild integrated native CLOG consumers when their included fixture or layout changes.
 test_cluster_relmap_publish_clog_bridge.o test_cluster_relmap_native_clog.o \
         test_cluster_clog_retention: test_cluster_clog_relmap_physical_mutation.inc \

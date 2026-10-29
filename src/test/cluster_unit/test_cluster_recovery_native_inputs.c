@@ -914,6 +914,7 @@ cleanup:
 #include "test_cluster_recovery_wal_sources.inc"
 #include "test_cluster_recovery_page_graph.inc"
 #include "test_cluster_recovery_census_page_plan.inc"
+#include "test_cluster_recovery_reference_inputs.inc"
 
 UT_TEST(test_owned_ctrc_census_borrows_namespace_and_revokes_changed_work)
 {
@@ -1381,7 +1382,15 @@ main(int argc, char **argv)
 		UT_RUN(test_episode_page_sources_preserve_unrelated_eventless_generation);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(237);
+	if (getenv("PGRAC_PRE2_TEST_CENSUS_REFERENCES") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_census_references_own_every_untouched_heap_and_inverse_history_emission);
+		UT_RUN(test_census_references_complete_empty_is_not_prefix_or_lost_scope);
+		UT_RUN(test_census_references_reject_modified_metadata_tuple_and_rebound_pointer);
+		UT_RUN(test_census_references_bound_metadata_and_tuple_storage_before_publication);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	UT_PLAN(241);
 	UT_RUN(test_episode_page_sources_refuse_same_origin_without_clog);
 	UT_RUN(test_episode_page_sources_refuse_same_origin_without_counter);
 	UT_RUN(test_episode_page_sources_preserve_unrelated_eventless_generation);
@@ -1622,6 +1631,10 @@ main(int argc, char **argv)
 	UT_RUN(test_episode_sources_sibling_metadata_drift_revokes_complete_view);
 	UT_RUN(test_episode_pages_borrowed_output_preserves_complete_baseline);
 	UT_RUN(test_episode_pages_changed_payload_revokes_copied_source);
+	UT_RUN(test_census_references_own_every_untouched_heap_and_inverse_history_emission);
+	UT_RUN(test_census_references_complete_empty_is_not_prefix_or_lost_scope);
+	UT_RUN(test_census_references_reject_modified_metadata_tuple_and_rebound_pointer);
+	UT_RUN(test_census_references_bound_metadata_and_tuple_storage_before_publication);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

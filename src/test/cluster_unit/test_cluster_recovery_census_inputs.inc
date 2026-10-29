@@ -850,7 +850,10 @@ UT_TEST(test_owned_page_inventory_capacity_never_silently_omits_physical_pages)
 	UT_ASSERT(file >= 0);
 	for (unsigned i = 0; i < 4096; i++) UT_ASSERT_EQ(write(file, page.data, BLCKSZ), BLCKSZ);
 	UT_ASSERT_EQ(close(file), 0);
-	UT_ASSERT_EQ(cluster_recovery_census_begin(inputs, fd, 2 * 1024 * 1024, &census), 0);
+	/* Preserve the six original per-child caps and add the reference share,
+	 * so this case still reaches the PAGE cap after the complete ROOT scan. */
+	UT_ASSERT_EQ(cluster_recovery_census_begin(inputs, fd,
+		((2 * 1024 * 1024 - sizeof(*census)) / 6) * 7 + sizeof(*census), &census), 0);
 	UT_ASSERT_EQ(owned_census_until(census, 0), CLUSTER_RECOVERY_CENSUS_CAPACITY);
 	UT_ASSERT(cluster_recovery_census_pages_v1(census) == NULL);
 	owned_census_sticky(census, CLUSTER_RECOVERY_CENSUS_CAPACITY);
