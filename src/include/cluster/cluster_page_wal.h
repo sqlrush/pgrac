@@ -241,6 +241,13 @@ cluster_page_wal_eviction_snapshot_locked_v1(struct BufferDesc *buf,
 extern bool cluster_page_wal_prepare_install_v1(Buffer buffer,
 												const ClusterPageWalBindingV1 *carrier, Page image,
 												ClusterPageWalInstallV1 *prepared);
+/* Original first-fill IO, content-X and exact native delivery fence. This
+ * prepares attribution only; the caller publishes in the same lock hold. */
+struct BufferDesc;
+struct ClusterPcmOwnSnapshot;
+extern bool cluster_page_wal_prepare_input_install_v1(struct BufferDesc *buf,
+	const struct ClusterPcmOwnSnapshot *pending, uint64 attempt,
+	const ClusterPageWalBindingV1 *carrier, Page image, ClusterPageWalInstallV1 *prepared);
 extern bool cluster_page_wal_publish_install_v1(Buffer buffer, ClusterPageWalInstallV1 *prepared);
 extern void cluster_page_wal_release_install_v1(ClusterPageWalInstallV1 *prepared);
 /* Original T2/T3 owner, still content-X: compare the installed attribution

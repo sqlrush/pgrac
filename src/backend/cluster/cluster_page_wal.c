@@ -375,25 +375,13 @@ cluster_page_wal_eviction_snapshot_locked_v1(BufferDesc *buf, const ClusterPcmOw
 	return CLUSTER_PAGE_WAL_CAPTURED;
 }
 
-bool
-cluster_page_wal_prepare_install_v1(Buffer buffer, const ClusterPageWalBindingV1 *carrier,
-									Page image, ClusterPageWalInstallV1 *prepared)
+static bool
+page_wal_prepare_carrier(BufferDesc *buf, uint32 state, const ClusterPageWalBindingV1 *carrier,
+	Page image, ClusterPageWalInstallV1 *prepared)
 {
 	static const ClusterPageWalBindingV1 zero = { 0 };
 	ClusterPageWalInstallV1 result = { 0 };
 	ClusterWalSourceRef current;
-	BufferDesc *buf;
-	uint32 state;
-	if (bindings == NULL || buffer <= 0 || buffer > NBuffers || carrier == NULL || image == NULL
-		|| prepared == NULL || !cluster_enabled || !cluster_shared_config)
-		return false;
-	buf = GetBufferDescriptor(buffer - 1);
-	if (!LWLockHeldByMeInMode(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE))
-		return false;
-	state = pg_atomic_read_u32(&buf->state);
-	if ((state & (BM_VALID | BM_TAG_VALID)) != (BM_VALID | BM_TAG_VALID)
-		|| (state & (BM_IO_ERROR | BM_IO_IN_PROGRESS)) != 0)
-		return false;
 	if (memcmp(carrier, &zero, sizeof(zero)) != 0) {
 		if ((state & BM_PERMANENT) == 0
 			|| !cluster_page_wal_binding_matches_v1(carrier, BufTagGetRelFileLocator(&buf->tag),
@@ -412,6 +400,59 @@ cluster_page_wal_prepare_install_v1(Buffer buffer, const ClusterPageWalBindingV1
 	result.binding = *carrier;
 	*prepared = result;
 	return true;
+}
+
+bool
+cluster_page_wal_prepare_install_v1(Buffer buffer, const ClusterPageWalBindingV1 *carrier,
+									Page image, ClusterPageWalInstallV1 *prepared)
+{
+	BufferDesc *buf;
+	uint32 state;
+	if (bindings == NULL || buffer <= 0 || buffer > NBuffers || carrier == NULL || image == NULL
+		|| prepared == NULL || !cluster_enabled || !cluster_shared_config)
+		return false;
+	buf = GetBufferDescriptor(buffer - 1);
+	if (!LWLockHeldByMeInMode(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE))
+		return false;
+	state = pg_atomic_read_u32(&buf->state);
+	if ((state & (BM_VALID | BM_TAG_VALID)) != (BM_VALID | BM_TAG_VALID)
+		|| (state & (BM_IO_ERROR | BM_IO_IN_PROGRESS)) != 0)
+		return false;
+	return page_wal_prepare_carrier(buf, state, carrier, image, prepared);
+}
+
+bool
+cluster_page_wal_prepare_input_install_v1(BufferDesc *buf,
+	const ClusterPcmOwnSnapshot *pending, uint64 attempt,
+	const ClusterPageWalBindingV1 *carrier, Page image, ClusterPageWalInstallV1 *prepared)
+{
+	uint32 state;
+	bool exact;
+
+	if (bindings == NULL || buf == NULL || pending == NULL || carrier == NULL || image == NULL
+		|| prepared == NULL || !cluster_enabled || !cluster_shared_config
+		|| buf->buf_id < 0 || buf->buf_id >= NBuffers || ClusterPcmOwnArray == NULL
+		|| attempt == 0 || attempt == UINT64_MAX
+		|| !LWLockHeldByMeInMode(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE))
+		return false;
+	state = LockBufHdr(buf);
+	exact = pending->semantic_buf_state == (BM_TAG_VALID | BM_IO_IN_PROGRESS)
+		&& (state & CLUSTER_PCM_OWN_SEMANTIC_BUF_STATE_MASK) == pending->semantic_buf_state
+		&& pending->pcm_state == PCM_STATE_N && buf->pcm_state == pending->pcm_state
+		&& pending->buffer_type == BUF_TYPE_CURRENT && buf->buffer_type == pending->buffer_type
+		&& pending->flags == PCM_OWN_FLAG_GRANT_PENDING && cluster_pcm_own_flags_get(buf->buf_id) == pending->flags
+		&& pending->reservation_token != 0 && pending->reservation_token < UINT64_MAX - 1
+		&& pending->generation != 0 && pending->generation < UINT64_MAX - 1
+		&& pending->writer_activation_token == 0 && pending->resource_x_activation_generation == 0
+		&& BufferTagsEqual(&pending->tag, &buf->tag)
+		&& cluster_pcm_own_gen_get(buf->buf_id) == pending->generation
+		&& cluster_pcm_own_reservation_token_get(buf->buf_id) == pending->reservation_token
+		&& cluster_pcm_own_writer_activation_token_get(buf->buf_id) == 0
+		&& cluster_pcm_own_resource_x_activation_generation_get(buf->buf_id) == 0
+		&& cluster_pcm_own_delivery_attempt_get(buf->buf_id) == attempt
+		&& (pg_atomic_read_u64(&ClusterPcmOwnArray[buf->buf_id].write_io_generation) & 1) == 0;
+	UnlockBufHdr(buf, state);
+	return exact && page_wal_prepare_carrier(buf, state, carrier, image, prepared);
 }
 bool
 cluster_page_wal_publish_install_v1(Buffer buffer, ClusterPageWalInstallV1 *prepared)

@@ -18664,6 +18664,211 @@ cluster_bufmgr_pcm_own_acquire_fill_disk_exact(BufferDesc *buf,
 }
 /* End original disk episode lifecycle. */
 
+/* Original first-fill current-image lifecycle. Validate retained wire/source
+ * evidence off native locks; only the original input IO may copy or finish.
+ * The memory image's disk checksum is not an on-disk verification witness. */
+static bool
+cluster_bufmgr_acquire_image_page_valid(Page page, const BufferTag *tag)
+{
+	PageHeader header = (PageHeader)page;
+	bool space = tag->forkNum == SPACE_FORKNUM;
+
+	if (tag->forkNum < MAIN_FORKNUM || tag->forkNum > MAX_FORKNUM
+		|| (space && tag->blockNum > CLUSTER_SPACE_RESERVATION_BLOCK))
+		return false;
+	if (PageIsNew(page)) {
+		for (Size i = 0; i < BLCKSZ; i++)
+			if (page[i] != 0)
+				return false;
+		return true;
+	}
+	if (PageGetPageSize(page) != BLCKSZ || PageGetPageLayoutVersion(page) != PG_PAGE_LAYOUT_VERSION
+		|| (header->pd_flags & (~PD_VALID_FLAG_BITS | PD_UNDO_SEG_HEADER)) != 0
+		|| ((header->pd_flags & PD_SPACE_METADATA) != 0) != space
+		|| header->pd_lower < SizeOfPageHeaderData || header->pd_lower > header->pd_upper
+		|| header->pd_upper > header->pd_special || header->pd_special > BLCKSZ
+		|| header->pd_special != MAXALIGN(header->pd_special))
+		return false;
+	return !space || (tag->blockNum == 0
+		? cluster_space_identity_page_valid(page, BLCKSZ)
+		: cluster_space_reservation_page_valid(page, BLCKSZ));
+}
+
+static bool
+cluster_bufmgr_acquire_image_owned(BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
+	const ResourceXDecodedAcquireIntent *episode, const ClusterSemanticAdmissionToken *admission,
+	const ResourceXDeliveryClaim *execution, ResourceOwner owner,
+	ResourceXDecodedFrame *grant, ResourceXDecodedFrame *image)
+{
+	ResourceXRequesterJoinSnapshot join;
+	ClusterPcmOwnSnapshot live;
+
+	if (LWLockHeldByMe(BufferDescriptorGetContentLock(buf))
+		|| !cluster_bufmgr_acquire_read_context(buf, base, episode, admission, execution, owner, true)
+		|| cluster_pcm_lock_resource_x_requester_acquire_execute_frames_exact(
+			execution, episode, grant, image, &join) != RESOURCE_X_APPLY_APPLIED
+		|| !cluster_bufmgr_acquire_prepared_native(buf, base, episode,
+			execution->executor_sequence, CLUSTER_ACQUIRE_PREPARATION_VERIFY, &live))
+		return false;
+	return grant->kind == RESOURCE_X_WIRE_AUTHORITY_GRANT && grant->has_acquire_decision
+		&& grant->body.acquire_decision.source_kind == RESOURCE_X_ACQUIRE_SOURCE_REMOTE_CURRENT
+		&& image->kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE && image->has_acquire_decision
+		&& image->body.acquire_image.original_image.image_length == BLCKSZ;
+}
+
+typedef struct ClusterAcquireImageStageGuard {
+	BufferDesc *buf;
+	ClusterPageWalInstallV1 wal;
+} ClusterAcquireImageStageGuard;
+
+static void
+cluster_bufmgr_acquire_image_stage_cleanup(int code, Datum arg)
+{
+	ClusterAcquireImageStageGuard *guard = (ClusterAcquireImageStageGuard *)DatumGetPointer(arg);
+	LWLock *content = BufferDescriptorGetContentLock(guard->buf);
+
+	(void)code;
+	cluster_page_wal_release_install_v1(&guard->wal);
+	if (LWLockHeldByMeInMode(content, LW_EXCLUSIVE))
+		LWLockRelease(content);
+}
+
+static ResourceXApplyResult
+cluster_bufmgr_acquire_stage_image(BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
+	const ResourceXDecodedAcquireIntent *episode, const ClusterSemanticAdmissionToken *admission,
+	const ResourceXDeliveryClaim *execution, ResourceOwner owner, ResourceXDiskStageObservation *out)
+{
+	ResourceXDecodedFrame grant, image;
+	ResourceXDiskStageObservation staged = {0};
+	ClusterAcquireImageStageGuard guard = {0};
+	const ResourceXDecodedImageEnvelope *source = &image.body.acquire_image.original_image;
+	PGIOAlignedBlock page;
+	LWLock *content = BufferDescriptorGetContentLock(buf);
+	volatile bool copied = false;
+
+	if (!cluster_bufmgr_acquire_image_owned(buf, base, episode, admission, execution, owner, &grant, &image)
+		|| !cluster_bufmgr_acquire_disk_stage_native(buf, base, episode, execution,
+			owner, UINT64_MAX, NULL, &staged))
+		return RESOURCE_X_APPLY_BAD_STATE;
+	memcpy(page.data, source->page_bytes, BLCKSZ);
+	staged.authority_generation = grant.common.authority_generation;
+	staged.decision_crc32c = grant.common.semantic_crc32c;
+	staged.page_crc32c = cluster_gcs_block_compute_checksum(page.data);
+	staged.page_lsn = PageGetLSN(page.data);
+	staged.page_scn = (uint64)((PageHeader)page.data)->pd_block_scn;
+	if (!cluster_bufmgr_acquire_image_page_valid(page.data, &base->tag)
+		|| staged.page_crc32c != source->page_checksum || staged.page_scn != source->page_scn_lsn)
+		return RESOURCE_X_APPLY_BAD_STATE;
+	guard.buf = buf;
+	PG_ENSURE_ERROR_CLEANUP(cluster_bufmgr_acquire_image_stage_cleanup, PointerGetDatum(&guard));
+	{
+		LWLockAcquire(content, LW_EXCLUSIVE);
+		PG_TRY();
+		{
+			if (cluster_page_wal_prepare_input_install_v1(buf, &staged.pending,
+					execution->executor_sequence, &source->page_wal, page.data, &guard.wal)) {
+				copied = cluster_bufmgr_acquire_disk_stage_native(buf, base, episode, execution,
+					owner, staged.write_io_generation, &page, &staged);
+				if (copied)
+					copied = cluster_page_wal_publish_install_v1(BufferDescriptorGetBuffer(buf), &guard.wal);
+			}
+		}
+		PG_FINALLY();
+		{
+			cluster_bufmgr_acquire_image_stage_cleanup(0, PointerGetDatum(&guard));
+		}
+		PG_END_TRY();
+	}
+	PG_END_ENSURE_ERROR_CLEANUP(cluster_bufmgr_acquire_image_stage_cleanup, PointerGetDatum(&guard));
+	/* Full E/A/all-H/source/WAL evidence is re-read only outside content and
+	 * header locks. The copy remains unpublished until the original I arms. */
+	if (!copied || !cluster_bufmgr_acquire_image_owned(buf, base, episode, admission, execution, owner, &grant, &image)
+		|| staged.authority_generation != grant.common.authority_generation
+		|| staged.decision_crc32c != grant.common.semantic_crc32c
+		|| staged.page_crc32c != source->page_checksum || staged.page_scn != source->page_scn_lsn
+		|| !cluster_bufmgr_acquire_disk_stage_native(buf, base, episode, execution,
+			owner, staged.write_io_generation, NULL, &staged))
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	*out = staged;
+	return RESOURCE_X_APPLY_APPLIED;
+}
+
+ResourceXApplyResult
+cluster_bufmgr_pcm_own_acquire_fill_image_exact(BufferDesc *buf,
+	const ClusterPcmOwnSnapshot *base, const ResourceXDecodedAcquireIntent *episode,
+	const ClusterSemanticAdmissionToken *admission, const ResourceXDeliveryClaim *prepared)
+{
+	ClusterAcquireDiskGuard guard;
+	ResourceXDeliveryClaim current, execution;
+	ResourceXAcquireReadReceipt receipt;
+	ResourceXDiskStageObservation staged;
+	ResourceXDecodedFrame grant, image;
+	ResourceXRequesterJoinSnapshot join;
+	ClusterPcmOwnSnapshot native;
+	volatile ResourceXApplyResult result;
+
+	if (buf == NULL || base == NULL || episode == NULL || admission == NULL || prepared == NULL
+		|| ClusterPcmOwnArray == NULL)
+		return RESOURCE_X_APPLY_INVALID;
+	guard.buf = buf;
+	guard.owner = CurrentResourceOwner;
+	guard.base = *base;
+	guard.episode = *episode;
+	guard.original = *prepared;
+	if (guard.original.purpose != RESOURCE_X_DELIVERY_ACQUIRE_PREPARED
+		|| LWLockHeldByMe(BufferDescriptorGetContentLock(buf))
+		|| !cluster_bufmgr_acquire_quiet_context(buf, &guard.base, &guard.episode, &guard.original, guard.owner))
+		return RESOURCE_X_APPLY_BAD_STATE;
+	result = cluster_pcm_lock_resource_x_requester_acquire_read_close_observe_exact(
+		&guard.original, &guard.episode, &current, &receipt);
+	if (result != RESOURCE_X_APPLY_APPLIED)
+		return result;
+	/* A same-handle replay only proves the existing C and shared handoff. */
+	if (current.purpose >= RESOURCE_X_DELIVERY_ACQUIRE_READ_COMPLETE
+		&& current.purpose <= RESOURCE_X_DELIVERY_ACQUIRE_READ_SETTLED) {
+		execution = guard.original;
+		execution.purpose = RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING;
+		if (!cluster_bufmgr_acquire_read_context(buf, &guard.base, &guard.episode,
+				admission, &execution, guard.owner, false))
+			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		return cluster_bufmgr_acquire_disk_installed_handoff(&guard);
+	}
+	if (current.purpose != RESOURCE_X_DELIVERY_ACQUIRE_PREPARED)
+		return RESOURCE_X_APPLY_BAD_STATE;
+	receipt.write_io_generation = pg_atomic_read_u64(&ClusterPcmOwnArray[buf->buf_id].write_io_generation);
+	if ((receipt.write_io_generation & 1) != 0 || receipt.write_io_generation >= UINT64_MAX - 1
+		|| !cluster_bufmgr_acquire_unarmed_physical(buf, &guard.base, &guard.episode,
+			&guard.original, &receipt, guard.owner, CLUSTER_ACQUIRE_QUIET_OBSERVE, &native))
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	PG_ENSURE_ERROR_CLEANUP(cluster_bufmgr_acquire_disk_episode_cleanup, PointerGetDatum(&guard));
+	{
+		result = cluster_bufmgr_pcm_own_acquire_execute_begin_exact(buf, &guard.base, &guard.episode,
+			admission, &guard.original, &grant, &image, &join, &execution);
+		if (result == RESOURCE_X_APPLY_APPLIED)
+			result = cluster_bufmgr_acquire_stage_image(buf, &guard.base, &guard.episode,
+				admission, &execution, guard.owner, &staged);
+		if (result == RESOURCE_X_APPLY_APPLIED) {
+			cluster_bufmgr_acquire_read_receipt(&staged, &receipt);
+			result = cluster_pcm_lock_resource_x_requester_acquire_read_arm_exact(&execution, &guard.episode, &receipt);
+		}
+		if (result == RESOURCE_X_APPLY_APPLIED)
+			result = cluster_bufmgr_pcm_own_acquire_continue_disk_exact(buf, &guard.base,
+				&guard.episode, admission, &guard.original);
+		if (result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE) {
+			if (!cluster_bufmgr_acquire_read_context(buf, &guard.base, &guard.episode,
+					admission, &execution, guard.owner, false))
+				result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+			else
+				result = cluster_bufmgr_acquire_disk_installed_handoff(&guard);
+		}
+	}
+	PG_END_ENSURE_ERROR_CLEANUP(cluster_bufmgr_acquire_disk_episode_cleanup, PointerGetDatum(&guard));
+	if (result != RESOURCE_X_APPLY_APPLIED && result != RESOURCE_X_APPLY_DUPLICATE)
+		cluster_bufmgr_acquire_disk_episode_cleanup(0, PointerGetDatum(&guard));
+	return result;
+}
+/* End original first-fill current-image lifecycle. */
+
 #endif
 
 /*

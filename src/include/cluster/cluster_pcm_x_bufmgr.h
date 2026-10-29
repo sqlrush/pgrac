@@ -1147,4 +1147,12 @@ extern ResourceXApplyResult cluster_bufmgr_pcm_own_acquire_fill_disk_exact(
 	const ResourceXDecodedAcquireIntent *episode,
 	const struct ClusterSemanticAdmissionToken *admission, const ResourceXDeliveryClaim *prepared);
 
+/* Same original first-fill/S scope for a retained remote current image.
+ * Copies authenticated memory bytes, never smgrread; native C and original
+ * IO completion precede the existing asynchronous requester receipt owner. */
+extern ResourceXApplyResult cluster_bufmgr_pcm_own_acquire_fill_image_exact(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
+	const ResourceXDecodedAcquireIntent *episode,
+	const struct ClusterSemanticAdmissionToken *admission, const ResourceXDeliveryClaim *prepared);
+
 #endif /* CLUSTER_PCM_X_BUFMGR_H */
