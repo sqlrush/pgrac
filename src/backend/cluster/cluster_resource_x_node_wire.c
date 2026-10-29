@@ -249,7 +249,8 @@ resource_x_pair_length(uint8 msg_type, ResourceXWireKind kind, uint16 len)
 			   && len == RESOURCE_X_CONTROL_V1_BYTES;
 	if (kind == RESOURCE_X_WIRE_INSTALL_SETTLEMENT)
 		return msg_type == RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE
-			&& (len == RESOURCE_X_SHORT_V1_BYTES || len == RESOURCE_X_COMPLETE_V5_BYTES);
+			&& (len == RESOURCE_X_SHORT_V1_BYTES || len == RESOURCE_X_COMPLETE_V5_BYTES
+				|| len == RESOURCE_X_SOURCE_COMPLETE_V11_BYTES);
 	if (kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2)
 		return msg_type == RESOURCE_X_MSG_BLOCK_TO_N && len == RESOURCE_X_PROOF_V1_BYTES;
 	if (kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2)
@@ -265,7 +266,8 @@ resource_x_frame_length(const ResourceXDecodedFrame *frame, uint16 *len)
 		if (frame->kind == RESOURCE_X_WIRE_INSTALL_SETTLEMENT) {
 			if (frame->has_acquire_intent || frame->blocked_has_remote_proof)
 				return false;
-			*len = RESOURCE_X_COMPLETE_V5_BYTES;
+			*len = frame->body.acquire_completion.decision.source_kind == RESOURCE_X_ACQUIRE_SOURCE_DISK
+				? RESOURCE_X_COMPLETE_V5_BYTES : RESOURCE_X_SOURCE_COMPLETE_V11_BYTES;
 			return true;
 		}
 		if (frame->kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE) {
@@ -662,17 +664,20 @@ resource_x_pair_common_valid(uint8 msg_type, ResourceXWireKind kind,
 static uint8
 resource_x_frame_version(ResourceXWireKind kind, uint16 len, uint8 outcome)
 {
-	if (len == RESOURCE_X_COMPLETE_V5_BYTES) {
+	if (len == RESOURCE_X_COMPLETE_V5_BYTES || len == RESOURCE_X_SOURCE_COMPLETE_V11_BYTES) {
+		bool source = len == RESOURCE_X_SOURCE_COMPLETE_V11_BYTES;
+
 		if (outcome == RESOURCE_X_OUTCOME_QUIET_NO_IMAGE)
-			return RESOURCE_X_QUIET_NO_IMAGE_WIRE_VERSION;
+			return source ? RESOURCE_X_SOURCE_QUIET_NO_IMAGE_WIRE_VERSION : RESOURCE_X_QUIET_NO_IMAGE_WIRE_VERSION;
 		if (outcome == RESOURCE_X_OUTCOME_QUIET_NO_IMAGE_RETIRED)
-			return RESOURCE_X_QUIET_NO_IMAGE_RETIRED_WIRE_VERSION;
+			return source ? RESOURCE_X_SOURCE_QUIET_NO_IMAGE_RETIRED_WIRE_VERSION : RESOURCE_X_QUIET_NO_IMAGE_RETIRED_WIRE_VERSION;
 		if (outcome == RESOURCE_X_OUTCOME_QUIET)
-			return RESOURCE_X_QUIET_WIRE_VERSION;
+			return source ? RESOURCE_X_SOURCE_QUIET_WIRE_VERSION : RESOURCE_X_QUIET_WIRE_VERSION;
 		if (outcome == RESOURCE_X_OUTCOME_QUIET_RETIRED)
-			return RESOURCE_X_QUIET_RETIRED_WIRE_VERSION;
-		return outcome == RESOURCE_X_OUTCOME_DUPLICATE
-			? RESOURCE_X_CONSUMED_WIRE_VERSION : RESOURCE_X_COMPLETION_WIRE_VERSION;
+			return source ? RESOURCE_X_SOURCE_QUIET_RETIRED_WIRE_VERSION : RESOURCE_X_QUIET_RETIRED_WIRE_VERSION;
+		if (outcome == RESOURCE_X_OUTCOME_DUPLICATE)
+			return source ? RESOURCE_X_SOURCE_CONSUMED_WIRE_VERSION : RESOURCE_X_CONSUMED_WIRE_VERSION;
+		return source ? RESOURCE_X_SOURCE_COMPLETION_WIRE_VERSION : RESOURCE_X_COMPLETION_WIRE_VERSION;
 	}
 	if (len == RESOURCE_X_ACQUIRE_V3_BYTES)
 		return RESOURCE_X_ACQUIRE_WIRE_VERSION;
@@ -858,21 +863,26 @@ resource_x_decision_body_valid(const ResourceXDecodedFrame *frame)
 		|| (required & (UINT32_C(1) << frame->common.action_node)) != 0;
 }
 
-/* Lossless omission is legal only when the full A proves every holder zero.
- * A completion is not a durable-storage source proof or a second grant. */
+/* Omit holders only from the original no-holder disk format. Source reads
+ * retain the complete A; codec validity is not native/source authority. */
 static bool
 resource_x_completion_body_valid(const ResourceXDecodedFrame *frame)
 {
 	const ResourceXDecodedAcquireCompletion *c = &frame->body.acquire_completion;
 	const ResourceXDecodedAcquireDecision *a = &c->decision;
+	bool disk = a->source_kind == RESOURCE_X_ACQUIRE_SOURCE_DISK;
 	bool no_image = frame->common.outcome == RESOURCE_X_OUTCOME_QUIET_NO_IMAGE
 		|| frame->common.outcome == RESOURCE_X_OUTCOME_QUIET_NO_IMAGE_RETIRED;
 
 	return frame->common.target_mode == (uint8)PCM_STATE_S
-		&& a->episode.path == RESOURCE_X_ACQUIRE_FIRST_FILL
 		&& a->episode.base_generation < UINT64_MAX - 1
-		&& a->source_kind == RESOURCE_X_ACQUIRE_SOURCE_DISK
-		&& a->holders_bitmap == 0 && a->required_holders_bitmap == 0 && a->pi_holders_bitmap == 0
+		&& (disk
+			? (frame->payload_bytes == RESOURCE_X_COMPLETE_V5_BYTES
+				&& a->episode.path == RESOURCE_X_ACQUIRE_FIRST_FILL
+				&& a->holders_bitmap == 0 && a->required_holders_bitmap == 0 && a->pi_holders_bitmap == 0)
+			: (frame->payload_bytes == RESOURCE_X_SOURCE_COMPLETE_V11_BYTES
+				&& (a->source_kind == RESOURCE_X_ACQUIRE_SOURCE_REMOTE_CURRENT
+					|| a->source_kind == RESOURCE_X_ACQUIRE_SOURCE_LOCAL_CURRENT)))
 		&& c->native_generation == a->episode.base_generation
 			+ ((frame->common.outcome == RESOURCE_X_OUTCOME_QUIET
 				|| frame->common.outcome == RESOURCE_X_OUTCOME_QUIET_RETIRED || no_image) ? 0 : 1)
@@ -1247,19 +1257,22 @@ resource_x_body_encode(uint8 *bytes, const ResourceXDecodedFrame *frame, Resourc
 			bytes[212] = decision->directory_mode;
 			bytes[213] = decision->source_kind;
 			resource_x_put_u64(bytes + 216, decision->disk_watermark_scn);
-			for (int node = 0; !complete && node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++) {
+			for (int node = 0; (!complete || frame->payload_bytes == RESOURCE_X_SOURCE_COMPLETE_V11_BYTES)
+				 && node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++) {
 				resource_x_put_u64(bytes + 224 + node * 16, decision->holders[node].boot_incarnation);
 				resource_x_put_u64(bytes + 232 + node * 16, decision->holders[node].grant_generation);
 			}
 		}
 		if (complete) {
 			const ResourceXDecodedAcquireCompletion *c = &frame->body.acquire_completion;
-			resource_x_put_u64(bytes + 224, c->native_generation);
-			resource_x_put_u64(bytes + 232, c->write_io_generation);
-			resource_x_put_u64(bytes + 240, c->page_lsn);
-			resource_x_put_u64(bytes + 248, c->page_scn);
-			resource_x_put_u32(bytes + 256, c->page_crc32c);
-			resource_x_put_u32(bytes + 260, c->decision_crc32c);
+			uint16 offset = frame->payload_bytes == RESOURCE_X_SOURCE_COMPLETE_V11_BYTES ? 736 : 224;
+
+			resource_x_put_u64(bytes + offset, c->native_generation);
+			resource_x_put_u64(bytes + offset + 8, c->write_io_generation);
+			resource_x_put_u64(bytes + offset + 16, c->page_lsn);
+			resource_x_put_u64(bytes + offset + 24, c->page_scn);
+			resource_x_put_u32(bytes + offset + 32, c->page_crc32c);
+			resource_x_put_u32(bytes + offset + 36, c->decision_crc32c);
 		}
 		if (witness) {
 			ResourceXDecodedFrame ack;
@@ -1415,19 +1428,22 @@ resource_x_body_decode(const uint8 *bytes, ResourceXDecodedFrame *frame,
 			decision->directory_mode = bytes[212];
 			decision->source_kind = bytes[213];
 			decision->disk_watermark_scn = resource_x_get_u64(bytes + 216);
-			for (int node = 0; !complete && node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++) {
+			for (int node = 0; (!complete || frame->payload_bytes == RESOURCE_X_SOURCE_COMPLETE_V11_BYTES)
+				 && node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++) {
 				decision->holders[node].boot_incarnation = resource_x_get_u64(bytes + 224 + node * 16);
 				decision->holders[node].grant_generation = resource_x_get_u64(bytes + 232 + node * 16);
 			}
 		}
 		if (complete) {
 			ResourceXDecodedAcquireCompletion *c = &frame->body.acquire_completion;
-			c->native_generation = resource_x_get_u64(bytes + 224);
-			c->write_io_generation = resource_x_get_u64(bytes + 232);
-			c->page_lsn = resource_x_get_u64(bytes + 240);
-			c->page_scn = resource_x_get_u64(bytes + 248);
-			c->page_crc32c = resource_x_get_u32(bytes + 256);
-			c->decision_crc32c = resource_x_get_u32(bytes + 260);
+			uint16 offset = frame->payload_bytes == RESOURCE_X_SOURCE_COMPLETE_V11_BYTES ? 736 : 224;
+
+			c->native_generation = resource_x_get_u64(bytes + offset);
+			c->write_io_generation = resource_x_get_u64(bytes + offset + 8);
+			c->page_lsn = resource_x_get_u64(bytes + offset + 16);
+			c->page_scn = resource_x_get_u64(bytes + offset + 24);
+			c->page_crc32c = resource_x_get_u32(bytes + offset + 32);
+			c->decision_crc32c = resource_x_get_u32(bytes + offset + 36);
 		}
 		if (witness) {
 			ResourceXDecodedFrame ack;
@@ -1624,7 +1640,7 @@ cluster_resource_x_wire_decode(uint8 msg_type, const void *payload, uint16 paylo
 	if (bytes == NULL || out == NULL)
 		return false;
 	if (payload_len != RESOURCE_X_CONTROL_V1_BYTES && payload_len != RESOURCE_X_SHORT_V1_BYTES
-		&& payload_len != RESOURCE_X_COMPLETE_V5_BYTES
+		&& payload_len != RESOURCE_X_COMPLETE_V5_BYTES && payload_len != RESOURCE_X_SOURCE_COMPLETE_V11_BYTES
 		&& payload_len != RESOURCE_X_PROOF_V1_BYTES && payload_len != RESOURCE_X_IMAGE_V2_BYTES
 		&& payload_len != RESOURCE_X_ACQUIRE_V3_BYTES && payload_len != RESOURCE_X_DECISION_V4_BYTES
 		&& payload_len != RESOURCE_X_WITNESS_V4_BYTES && payload_len != RESOURCE_X_SOURCE_WITNESS_V4_BYTES
@@ -1654,7 +1670,7 @@ cluster_resource_x_wire_decode(uint8 msg_type, const void *payload, uint16 paylo
 	decoded.payload_bytes = payload_len;
 	decoded.has_acquire_intent = payload_len == RESOURCE_X_ACQUIRE_V3_BYTES;
 	decoded.has_acquire_decision = payload_len == RESOURCE_X_DECISION_V4_BYTES
-		|| payload_len == RESOURCE_X_COMPLETE_V5_BYTES
+		|| payload_len == RESOURCE_X_COMPLETE_V5_BYTES || payload_len == RESOURCE_X_SOURCE_COMPLETE_V11_BYTES
 		|| payload_len == RESOURCE_X_WITNESS_V4_BYTES || payload_len == RESOURCE_X_SOURCE_WITNESS_V4_BYTES
 		|| payload_len == RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES;
 	decoded.blocked_has_remote_proof

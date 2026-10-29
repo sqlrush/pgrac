@@ -33,6 +33,14 @@
 #define RESOURCE_X_COMPLETE_V5_BYTES 264
 #define RESOURCE_X_ACQUIRE_V3_BYTES 160
 #define RESOURCE_X_DECISION_V4_BYTES 736
+/* Read-source receipts keep the entire master-selected holder set. */
+#define RESOURCE_X_SOURCE_COMPLETION_WIRE_VERSION 11
+#define RESOURCE_X_SOURCE_CONSUMED_WIRE_VERSION 12
+#define RESOURCE_X_SOURCE_QUIET_WIRE_VERSION 13
+#define RESOURCE_X_SOURCE_QUIET_RETIRED_WIRE_VERSION 14
+#define RESOURCE_X_SOURCE_QUIET_NO_IMAGE_WIRE_VERSION 15
+#define RESOURCE_X_SOURCE_QUIET_NO_IMAGE_RETIRED_WIRE_VERSION 16
+#define RESOURCE_X_SOURCE_COMPLETE_V11_BYTES (RESOURCE_X_DECISION_V4_BYTES + 40)
 
 typedef enum ResourceXAcquirePath {
 	RESOURCE_X_ACQUIRE_FIRST_FILL = 1,
@@ -228,6 +236,18 @@ typedef struct ResourceXAcquireCompletionV5 {
 	uint8 page_crc32c[4];
 	uint8 decision_crc32c[4];
 } ResourceXAcquireCompletionV5;
+
+/* Current-source read completion retains all holder identities from A.
+ * This envelope alone proves neither native installation nor source/WAL. */
+typedef struct ResourceXAcquireSourceCompletionV11 {
+	ResourceXAcquireDecisionV4 decision;
+	uint8 native_generation[8];
+	uint8 write_io_generation[8];
+	uint8 page_lsn[8];
+	uint8 page_scn[8];
+	uint8 page_crc32c[4];
+	uint8 decision_crc32c[4];
+} ResourceXAcquireSourceCompletionV11;
 
 typedef struct ResourceXLocalProofDeclarationV1 {
 	ResourceXWireCommonV1 common;
@@ -463,8 +483,8 @@ typedef struct ResourceXDecodedAcquireDecision {
 	ResourceXDecodedAcquireHolder holders[RESOURCE_X_PROTOCOL_NODE_LIMIT];
 } ResourceXDecodedAcquireDecision;
 
-/* FIRST_FILL/S DISK has no holders: its complete A is losslessly encoded
- * without the 32 provably zero holder records. Other sources are refused. */
+/* DISK/S omits only provably zero holders; current-source S receipts carry
+ * the entire A. Neither form substitutes for original native/source proof. */
 typedef struct ResourceXDecodedAcquireCompletion {
 	ResourceXDecodedAcquireDecision decision;
 	uint64 native_generation;
@@ -524,6 +544,10 @@ StaticAssertDecl(offsetof(ResourceXAcquireWitnessV4, original_ack) == RESOURCE_X
 
 StaticAssertDecl(BLCKSZ == RESOURCE_X_PAGE_BYTES,
 				 "Resource-X V1 requires the current 8192-byte page ABI");
+StaticAssertDecl(sizeof(ResourceXAcquireSourceCompletionV11) == RESOURCE_X_SOURCE_COMPLETE_V11_BYTES
+				 && offsetof(ResourceXAcquireSourceCompletionV11, native_generation) == 736
+				 && offsetof(ResourceXAcquireSourceCompletionV11, decision_crc32c) == 772,
+				 "source read completion retains the complete master decision");
 StaticAssertDecl(sizeof(ResourceXAcquireCompletionV5) == RESOURCE_X_COMPLETE_V5_BYTES
 				 && offsetof(ResourceXAcquireCompletionV5, native_generation) == 224
 				 && offsetof(ResourceXAcquireCompletionV5, decision_crc32c) == 260,
