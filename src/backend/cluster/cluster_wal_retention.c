@@ -34,6 +34,7 @@
 #include "utils/resowner.h"
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
+#include "cluster_wal_inputs_job_payload_private.h"
 
 #define CLUSTER_WAL_PIN_MAGIC UINT32_C(0x57414c50)
 #define CLUSTER_WAL_READ_PIN_MAGIC UINT32_C(0x57525031)
@@ -116,6 +117,11 @@ struct ClusterWalReadPinV1 {
 	bool poisoned;
 	ClusterWalPinLock locks[FLEXIBLE_ARRAY_MEMBER];
 };
+
+StaticAssertDecl(offsetof(ClusterWalReadPinV1, locks)
+				 + CLUSTER_WAL_RETENTION_MAX_THREADS * sizeof(ClusterWalPinLock)
+				 + CLUSTER_WAL_INPUT_JOB_BACKLINK_RESERVE <= CLUSTER_WAL_INPUT_JOB_PIN_BYTES,
+				 "WAL input read pin exceeds its payload envelope");
 
 static ClusterWalRetentionPin *active_pin;
 static ClusterWalReadPinV1 *active_read_pin;

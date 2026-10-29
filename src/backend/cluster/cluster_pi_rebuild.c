@@ -15,6 +15,7 @@
 #include "storage/buffile.h"
 #include "utils/resowner.h"
 #include "utils/timestamp.h"
+#include "cluster_wal_inputs_job_payload_private.h"
 
 #define PI_REBUILD_BATCH 64
 
@@ -48,6 +49,10 @@ typedef struct PiRebuildJob {
 	/* PGRAC: when this cut's census began, for its completion reading. */
 	TimestampTz started;
 } PiRebuildJob;
+
+StaticAssertDecl(sizeof(PiRebuildJob) + CLUSTER_WAL_INPUT_JOB_BACKLINK_RESERVE
+				 <= CLUSTER_WAL_INPUT_JOB_REBUILD_BYTES,
+				 "WAL input rebuild exceeds its payload envelope");
 
 static PiRebuildJob *pi_rebuild_job;
 static bool pi_rebuild_callback_registered;

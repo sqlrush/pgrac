@@ -29,6 +29,7 @@
 #include "utils/resowner.h"
 #include "utils/timestamp.h"
 #include "cluster_pi_data_wire.h"
+#include "cluster_wal_inputs_job_payload_private.h"
 
 StaticAssertDecl(CLUSTER_SPACE_STRUCTURE_WAL_BYTES == 656, "structural receipt SPACE layout");
 StaticAssertDecl(CLUSTER_KO_SHARED_V2_BYTES == 160, "structural receipt KO layout");
@@ -111,6 +112,10 @@ struct ClusterPiWritebackNoticeV1 {
 	ClusterThreadRecoveryFabricPlanV1 *plan;
 };
 
+StaticAssertDecl(sizeof(ClusterPiWritebackNoticeV1) + CLUSTER_WAL_INPUT_JOB_BACKLINK_RESERVE
+				 <= CLUSTER_WAL_INPUT_JOB_NOTICE_BYTES,
+				 "WAL input notice exceeds its payload envelope");
+
 typedef struct WritebackBatch {
 	ResourceOwner owner;
 	pid_t pid;
@@ -141,6 +146,10 @@ typedef struct WritebackBatch {
 	ClusterThreadRecoveryFabricPlanV1 *plan;
 	ClusterWalSourceRef sources[CLUSTER_WAL_INPUTS_MAX];
 } WritebackBatch;
+
+StaticAssertDecl(sizeof(WritebackBatch) + CLUSTER_WAL_INPUT_JOB_BACKLINK_RESERVE
+				 <= CLUSTER_WAL_INPUT_JOB_BATCH_BYTES,
+				 "WAL input batch exceeds its payload envelope");
 
 static WritebackShared *wb_shared;
 static ClusterPiWritebackJobV1 *wb_active;

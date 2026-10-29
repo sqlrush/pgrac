@@ -24,6 +24,7 @@
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 #include "utils/timestamp.h"
+#include "cluster_wal_inputs_job_payload_private.h"
 
 #define WAL_CUT_RETRY_US INT64CONST(100000)
 
@@ -66,6 +67,9 @@ struct ClusterWalCutV1 {
 	ClusterWalCutMessageV1 requested;
 	ClusterWalWriterFlushV1 accepted;
 };
+
+StaticAssertDecl(sizeof(ClusterWalCutV1) <= CLUSTER_WAL_INPUT_JOB_REMOTE_CUT_BYTES,
+				 "WAL input remote cut exceeds its payload envelope");
 
 static WalCutShared *cut_shared;
 static ClusterWalCutV1 *active_cut;

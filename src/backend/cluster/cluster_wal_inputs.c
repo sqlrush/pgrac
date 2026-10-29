@@ -33,6 +33,7 @@
 
 #include "cluster_control_root_private.h"
 #include "cluster_recovery_anchor_private.h"
+#include "cluster_wal_inputs_job_payload_private.h"
 
 typedef enum WalInputsPurpose {
 	WAL_INPUTS_ONLINE,
@@ -112,6 +113,10 @@ struct ClusterWalInputsV1 {
 	ClusterWalWriterFlushV1 local_cut;
 	ClusterWalCutV1 *remote[CLUSTER_WAL_INPUTS_MAX];
 };
+
+StaticAssertDecl(sizeof(ClusterWalInputsV1) + CLUSTER_WAL_INPUT_JOB_BACKLINK_RESERVE
+				 <= CLUSTER_WAL_INPUT_JOB_SCOPE_BYTES,
+				 "WAL input scope exceeds its payload envelope");
 
 /* A locator, not another owner or a grant. Keep the native incarnation outside
  * borrowed allocations so stale/forged views are rejected before dereference. */
