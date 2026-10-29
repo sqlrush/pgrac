@@ -133,7 +133,10 @@ extern size_t cluster_clog_relmap_base_custody_bytes_v1(void);
  * complete terminal record, original source/base/era and mutation authority.
  * These calls neither resolve an unknown transaction nor publish visibility.
  * Own-origin redo retains the ordinary native CLOG owner; an exact durable
- * C0 top ABORT uses that same cache without discarding unrelated dirty bits. */
+ * C0 top ABORT uses that same cache without discarding unrelated dirty bits.
+ * Foreign targets always reload from disk and lose their cached birth input;
+ * successful calls may retain untouched clean FULL slots at native capacity.
+ * An entered failure discards all foreign cached initialization input. */
 extern bool cluster_clog_native_recovery_apply_v1(int origin, TransactionId xid, int nsubxids,
 												  const TransactionId *subxids, XidStatus status);
 extern bool cluster_clog_native_recovery_verify_v1(int origin, TransactionId xid, int nsubxids,
