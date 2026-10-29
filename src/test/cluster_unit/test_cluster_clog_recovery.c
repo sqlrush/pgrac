@@ -39,6 +39,9 @@ static int fixture_unlink(const char *path);
 UT_DEFINE_GLOBALS();
 #endif
 
+static VariableCacheData fixture_variable_cache;
+VariableCache ShmemVariableCache = &fixture_variable_cache;
+
 bool cluster_shared_config = true;
 int cluster_node_id = 0;
 char *cluster_shared_data_dir;
@@ -1793,6 +1796,7 @@ native_held_base_constructor_error_and_later_refusals_keep_custody_sticky(void)
 #include "test_cluster_clog_own_full.inc"
 #include "test_cluster_clog_relmap_physical_mutation.inc"
 #include "test_cluster_clog_relmap_native_init.inc"
+#include "test_cluster_clog_relmap_horizon.inc"
 
 int
 main(void)
@@ -1868,7 +1872,15 @@ main(void)
 		UT_RUN(relmap_native_own_eviction_revokes_without_logical_mutation);
 		goto mutation_done;
 	}
-	UT_PLAN(75);
+	if (getenv("PGRAC_RELMAP_HORIZON_ONLY") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(relmap_own_raw_truncation_horizon_is_not_an_era);
+		UT_RUN(relmap_foreign_horizon_never_borrows_local_variable_cache);
+		UT_RUN(relmap_own_horizon_change_keeps_original_fd_and_failure);
+		UT_RUN(relmap_own_horizon_drift_during_native_read_refuses);
+		goto mutation_done;
+	}
+	UT_PLAN(79);
 	UT_RUN(separate_original_origin_controls);
 	UT_RUN(commit_and_abort_persist_full_tree_without_local_pollution);
 	UT_RUN(conflicting_late_child_refuses_before_any_tree_write);
@@ -1935,6 +1947,10 @@ main(void)
 	UT_RUN(relmap_episode_error_keeps_held_fd_until_local_cleanup);
 	UT_RUN(relmap_episode_own_route_and_cache_are_not_substituted);
 	UT_RUN(relmap_episode_exact_source_history_and_root_recheck);
+	UT_RUN(relmap_own_raw_truncation_horizon_is_not_an_era);
+	UT_RUN(relmap_foreign_horizon_never_borrows_local_variable_cache);
+	UT_RUN(relmap_own_horizon_change_keeps_original_fd_and_failure);
+	UT_RUN(relmap_own_horizon_drift_during_native_read_refuses);
 	/* Restore the original own fixture after the native terminal phase. */
 	XactCtl->sync_handler = SYNC_HANDLER_NONE;
 	UT_RUN(clog_full_birth_uses_actual_native_zero_and_full_wal);

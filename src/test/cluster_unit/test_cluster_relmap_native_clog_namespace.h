@@ -104,4 +104,5 @@
 #define ut_current_failed d3_clog_ut_current_failed
 #define ut_failed_count d3_clog_ut_failed_count
 #define ut_test_count d3_clog_ut_test_count
+#define ShmemVariableCache d3_clog_ShmemVariableCache
 #endif

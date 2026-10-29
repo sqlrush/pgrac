@@ -119,4 +119,5 @@
 #define pgstat_count_slru_page_zeroed d3_side_native_clog_pgstat_count_slru_page_zeroed
 #define pgstat_count_slru_truncate d3_side_native_clog_pgstat_count_slru_truncate
 #define pgstat_get_slru_index d3_side_native_clog_pgstat_get_slru_index
+#define ShmemVariableCache d3_side_native_clog_ShmemVariableCache
 #endif

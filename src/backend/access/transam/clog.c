@@ -1470,7 +1470,7 @@ clog_relmap_base_read(const ClusterRecoveryRelmapSourceV1 *source,
 		return false;
 	origin = original.selected.source.claim.identity.origin_thread_id - 1;
 	if (!cluster_shared_config || !AmStartupProcess()
-		|| (origin == cluster_node_id ? XactCtl->shared == NULL
+		|| (origin == cluster_node_id ? XactCtl->shared == NULL || ShmemVariableCache == NULL
 			: ClogRecoveryLocks == NULL || ClogRecoveryCtl[origin].shared == NULL))
 		return false;
 	ctl = origin == cluster_node_id ? XactCtl : &ClogRecoveryCtl[origin];
@@ -1528,7 +1528,14 @@ clog_relmap_base_read(const ClusterRecoveryRelmapSourceV1 *source,
 		if (ok) {
 			LWLockAcquire(lock, LW_EXCLUSIVE);
 			locked = true;
+			/* Only this instance's native truncation lock protects this raw
+			 * horizon. Foreign controls have no corresponding VariableCache. */
+			base.truncation_horizon_observed = origin == cluster_node_id;
+			if (base.truncation_horizon_observed)
+				base.oldest_clog_xid = ShmemVariableCache->oldestClogXid;
 			ok = !held->invalidated && clog_relmap_mutation_matches(origin, mutation_generation)
+				&& (!existing || (base.truncation_horizon_observed == held->base.truncation_horizon_observed
+					&& base.oldest_clog_xid == held->base.oldest_clog_xid))
 				&& clog_relmap_source_current(&original, origin)
 				&& clog_native_directory_ready(origin)
 				&& clog_recovery_page_identity(&disk, page, &before);
@@ -1557,6 +1564,8 @@ clog_relmap_base_read(const ClusterRecoveryRelmapSourceV1 *source,
 					&& clog_native_directory_ready(origin)
 					&& clog_relmap_source_current(&original, origin)
 					&& clog_relmap_mutation_matches(origin, mutation_generation)
+					&& (!base.truncation_horizon_observed
+						|| base.oldest_clog_xid == ShmemVariableCache->oldestClogXid)
 					&& (!existing || memcmp(base.image, held->base.image, BLCKSZ) == 0);
 			}
 			LWLockRelease(lock);
