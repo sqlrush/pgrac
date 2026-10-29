@@ -30,6 +30,32 @@ typedef struct ClusterWalInputV1 {
 
 typedef struct ClusterWalInputsV1 ClusterWalInputsV1;
 
+/* Original auxiliary caller lifetime, not an input-use permission. The
+ * lifetime/CF foundation rejects input scopes and WALR pins until their
+ * corresponding job-bound interfaces are installed. */
+typedef enum ClusterWalInputsConsumerV1 {
+	WAL_INPUT_JOB_RETAINED_CUT = 0,
+	WAL_INPUT_JOB_PI_NOTICE = 1,
+	WAL_INPUT_JOB_PI_BATCH = 2,
+	WAL_INPUT_JOB_PI_REBUILD = 3
+} ClusterWalInputsConsumerV1;
+typedef struct ClusterWalInputsJobV1 ClusterWalInputsJobV1;
+typedef enum ClusterWalInputsJobResultV1 {
+	WAL_INPUT_JOB_INVALID = -1,
+	WAL_INPUT_JOB_PENDING = 0,
+	WAL_INPUT_JOB_DONE = 1
+} ClusterWalInputsJobResultV1;
+
+extern ClusterControlRootResult cluster_wal_inputs_job_open_v1(
+	ClusterWalInputsConsumerV1 consumer, MemoryContext caller_lifetime,
+	ClusterWalInputsJobV1 **job);
+extern MemoryContext cluster_wal_inputs_job_context_v1(ClusterWalInputsJobV1 *job);
+extern ClusterWalInputsJobResultV1 cluster_wal_inputs_job_retire_v1(ClusterWalInputsJobV1 *job);
+extern ClusterWalInputsJobResultV1 cluster_wal_inputs_job_poll_v1(ClusterWalInputsJobV1 *job);
+extern ClusterWalInputsJobResultV1 cluster_wal_inputs_job_finish_v1(ClusterWalInputsJobV1 **job);
+extern void cluster_wal_inputs_jobs_service_poll_v1(void);
+extern ClusterWalInputsJobResultV1 cluster_wal_inputs_jobs_stop_census_v1(void);
+
 /* Release every read pin while a background job waits for a peer. Suspended
  * scopes cannot expose inputs, read WAL or qualify use of an existing plan.
  * Resume reacquires the same sorted pin set and compares the complete original

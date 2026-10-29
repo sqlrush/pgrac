@@ -38,6 +38,9 @@
 #ifndef CLUSTER_CF_ENQUEUE_H
 #define CLUSTER_CF_ENQUEUE_H
 
+/* Both local S/X completion bindings, enforced against their actual type. */
+#define CLUSTER_CF_JOB_BINDING_MAX_BYTES 80
+
 #include "cluster/cluster_grd.h" /* ClusterResId */
 #include "cluster/cluster_lock_owner.h"
 #include "cluster/cluster_sequence.h" /* CLUSTER_SQ_RESID_TYPE (collision check) */

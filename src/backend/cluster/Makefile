@@ -381,6 +381,7 @@ OBJS = \
 	cluster_views.o \
 	cluster_wal_claim.o \
 	cluster_wal_inputs.o \
+	cluster_wal_inputs_job.o \
 	cluster_pi_contribution_stream.o \
 	cluster_wal_cut.o \
 	cluster_pi_data.o \
@@ -462,6 +463,10 @@ cluster_wal_tail.o: $(top_srcdir)/src/include/cluster/cluster_wal_tail.h
 cluster_wal_inputs.o: $(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
 	$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h \
 	$(srcdir)/cluster_control_root_private.h $(srcdir)/cluster_recovery_anchor_private.h
+cluster_wal_inputs_job.o cluster_semantic_activation.o: \
+	$(srcdir)/cluster_wal_inputs_job_private.h \
+	$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
+	$(top_srcdir)/src/include/cluster/cluster_cf_enqueue.h
 cluster_wal_writer.o: $(top_srcdir)/src/include/cluster/cluster_semantic_activation.h
 cluster_stats.o: $(top_srcdir)/src/include/cluster/cluster_semantic_activation.h
 cluster_recovery_namespace.o: $(top_srcdir)/src/include/cluster/cluster_recovery_namespace.h

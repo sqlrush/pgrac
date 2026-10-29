@@ -70,7 +70,8 @@ typedef struct CfHoldState {
 	uint64 job_creator;
 } CfHoldState;
 
-StaticAssertDecl(2 * (sizeof(CfHoldState) - offsetof(CfHoldState, job_receipt)) <= 80,
+StaticAssertDecl(2 * (sizeof(CfHoldState) - offsetof(CfHoldState, job_receipt))
+					 <= CLUSTER_CF_JOB_BINDING_MAX_BYTES,
 				 "CF job bindings exceed their control-state budget");
 
 static CfHoldState cf_hold_x;

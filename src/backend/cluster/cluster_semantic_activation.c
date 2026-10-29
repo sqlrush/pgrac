@@ -16,6 +16,7 @@
  */
 #include "postgres.h"
 #include "cluster/cluster_clean_leave.h"
+#include "cluster_wal_inputs_job_private.h"
 
 #include "access/xlog.h"
 #include "miscadmin.h"
@@ -882,6 +883,7 @@ static struct {
 StaticAssertDecl(MAXALIGN(sizeof(SemanticControlRebindShmem)) + sizeof(SemanticControlRebindRuntime)
 						 + sizeof(SemanticControlRebindState) + sizeof(semantic_serving.pgsa)
 						 + 2 * sizeof(ClusterSemanticOpenProofIdentity)
+						 + CLUSTER_WAL_INPUT_JOB_CONTROL_RESERVE
 					 <= CLUSTER_SEMANTIC_CONTROL_REBIND_STATE_BUDGET,
 				 "CONTROL rebind shared and owner state exceeds its per-instance budget");
 static bool
