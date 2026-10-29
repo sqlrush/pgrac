@@ -1447,6 +1447,100 @@ cluster_ctrc_recovery_heap_itl_references_v1(const char *page_image)
 	return true;
 }
 
+
+/* Read only the local native update graph. A stale ordinary ctid can name a
+ * reused item; it is not an edge unless the native updater/xmin match holds. */
+bool
+cluster_ctrc_recovery_heap_hot_references_v1(const char *page_image, BlockNumber block_number)
+{
+	Page page = (Page)page_image;
+	OffsetNumber successor[MaxHeapTuplesPerPage + 1] = {0};
+	OffsetNumber predecessor[MaxHeapTuplesPerPage + 1] = {0};
+	uint8 color[MaxHeapTuplesPerPage + 1] = {0};
+	OffsetNumber maxoff;
+
+	if (block_number == InvalidBlockNumber
+		|| !cluster_ctrc_recovery_heap_itl_references_v1(page_image)) return false;
+	maxoff = PageGetMaxOffsetNumber(page);
+	if (maxoff > MaxHeapTuplesPerPage) return false;
+	for (OffsetNumber offset = FirstOffsetNumber; offset <= maxoff; offset++) {
+		ItemId item = PageGetItemId(page, offset);
+		OffsetNumber destination;
+		HeapTupleHeader next;
+
+		if (ItemIdIsRedirected(item)) {
+			destination = ItemIdGetRedirect(item);
+			next = (HeapTupleHeader)PageGetItem(page, PageGetItemId(page, destination));
+			if (!HeapTupleHeaderIsHeapOnly(next)) return false;
+		} else if (ItemIdIsNormal(item)) {
+			HeapTupleHeader tuple = (HeapTupleHeader)PageGetItem(page, item);
+			bool hot = HeapTupleHeaderIsHotUpdated(tuple);
+			ItemId target;
+
+			if (HeapTupleHeaderIsSpeculative(tuple)
+				|| (ItemPointerIsValid(&tuple->t_ctid) && HeapTupleHeaderIndicatesMovedPartitions(tuple))
+				|| (HeapTupleHeaderIsHeapOnly(tuple) && (tuple->t_infomask & HEAP_UPDATED) == 0))
+				return false;
+			if ((tuple->t_infomask & HEAP_XMAX_INVALID) != 0) continue;
+			destination = ItemPointerGetOffsetNumberNoCheck(&tuple->t_ctid);
+			if (ItemPointerGetBlockNumberNoCheck(&tuple->t_ctid) != block_number
+				|| destination < FirstOffsetNumber || destination > maxoff || destination == offset) {
+				if (hot) return false;
+				continue;
+			}
+			target = PageGetItemId(page, destination);
+			if (!ItemIdIsNormal(target)) {
+				if (hot) return false;
+				continue;
+			}
+			next = (HeapTupleHeader)PageGetItem(page, target);
+			if (!TransactionIdEquals(HeapTupleHeaderGetRawXmax(tuple), HeapTupleHeaderGetXmin(next))) {
+				if (hot) return false;
+				continue;
+			}
+			/* Match the raw HOT flag, as native amcheck does: its visibility
+			 * shortcut masks aborted xmin/xmax and is not link polarity. */
+			if (((tuple->t_infomask2 & HEAP_HOT_UPDATED) != 0) != HeapTupleHeaderIsHeapOnly(next))
+				return false;
+		} else continue;
+		if (predecessor[destination] != InvalidOffsetNumber) return false;
+		predecessor[destination] = offset;
+		successor[offset] = destination;
+	}
+	for (OffsetNumber offset = FirstOffsetNumber; offset <= maxoff; offset++) {
+		ItemId item = PageGetItemId(page, offset);
+		OffsetNumber cursor = offset;
+
+		/* Only aborted heap-only tuples may have no predecessor. Status
+		 * comes from the already qualified native DATA ITL, not a hint. */
+		if (ItemIdIsNormal(item) && predecessor[offset] == InvalidOffsetNumber) {
+			HeapTupleHeader tuple = (HeapTupleHeader)PageGetItem(page, item);
+
+			if (HeapTupleHeaderIsHeapOnly(tuple)) {
+				const ClusterItlSlotData *slots = ClusterPageGetItlSlots(page);
+				bool aborted = false;
+
+				if (!HeapTupleHeaderXminFrozen(tuple))
+					for (unsigned i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
+						if (slots[i].xid == HeapTupleHeaderGetRawXmin(tuple)
+							&& slots[i].flags == ITL_FLAG_ABORTED) aborted = true;
+				if (!aborted) return false;
+			}
+		}
+		while (cursor != InvalidOffsetNumber && color[cursor] == 0) {
+			color[cursor] = 1;
+			cursor = successor[cursor];
+		}
+		if (cursor != InvalidOffsetNumber && color[cursor] == 1) return false;
+		cursor = offset;
+		while (cursor != InvalidOffsetNumber && color[cursor] == 1) {
+			color[cursor] = 2;
+			cursor = successor[cursor];
+		}
+	}
+	return true;
+}
+
 static bool
 ctrc_target_pending_offnum_valid(const ClusterCtrcPublicationIdV1 *publication,
 								 const ClusterCtrcTargetV1 *target)

@@ -1270,6 +1270,17 @@ extern ClusterCtrcItlCleanoutApplyResult cluster_ctrc_recovery_itl_page_image_v1
  * TT/FullXid generation, HOT/history completeness, discharge or completion.
  * No mutation, allocation, locks or I/O; false preserves all input bytes. */
 extern bool cluster_ctrc_recovery_heap_itl_references_v1(const char *page_image);
+/* Local HOT/redirect topology only, after complete native tuple/ITL grammar.
+ * Uses the actual protected target block: effective HOT successors must be
+ * local normal heap-only updates with matching native xmin, one predecessor
+ * and no cycle. Non-aborted heap-only tuples need a predecessor; aborted
+ * orphan tuples retain their native meaning. Ordinary stale/cross-page ctid
+ * does not assert a local edge. Speculative/partition-move links refuse.
+ * No mutation, allocation, locks or I/O. The caller retains full canonical
+ * TT/source/PAGE/history custody and proves every nonlocal/retained edge;
+ * true does not establish complete G_ref, discharge or completion. */
+extern bool cluster_ctrc_recovery_heap_hot_references_v1(
+	const char *page_image, BlockNumber block_number);
 /* Process-local image observations, never receipt or terminal authority. */
 typedef struct ClusterCtrcItlCarrierImageV1 {
 	uint8 mask;
