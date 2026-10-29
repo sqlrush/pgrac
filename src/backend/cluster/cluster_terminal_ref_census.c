@@ -5099,8 +5099,8 @@ refuse:
 }
 
 #ifndef CLUSTER_CTRC_UNIT_TEST
-/* Caller holds origin_lock. Keep the actual notification bytes in the
- * snapshot; the publication validator still accepts only CERTIFYING. */
+/* Caller holds origin_lock. Preserve the actual phase and close bytes;
+ * only the original cleaner may advance a seal into CERTIFYING. */
 static bool
 ctrc_capacity_snapshot_index_locked(uint64 index, ClusterCtrcOriginCertificateSnapshot *snapshot)
 {
@@ -5115,10 +5115,15 @@ ctrc_capacity_snapshot_index_locked(uint64 index, ClusterCtrcOriginCertificateSn
 	origin = &ctrc_origin_entries()[index];
 	if (origin->state == CTRC_ORIGIN_CERTIFYING)
 		return ctrc_origin_certificate_snapshot_index_locked(index, snapshot);
-	if (origin->state != CTRC_ORIGIN_RELEASE_PROVEN
-		|| (origin->touched_bitmap & ~origin->close_confirmed_bitmap) == 0
-		|| (origin->close_dispatched_bitmap & ~origin->touched_bitmap) != 0
-		|| (origin->close_confirmed_bitmap & ~origin->close_dispatched_bitmap) != 0)
+	if (origin->state == CTRC_ORIGIN_RELEASE_PROVEN) {
+		if ((origin->touched_bitmap & ~origin->close_confirmed_bitmap) == 0
+			|| (origin->close_dispatched_bitmap & ~origin->touched_bitmap) != 0
+			|| (origin->close_confirmed_bitmap & ~origin->close_dispatched_bitmap) != 0)
+			return false;
+	} else if ((origin->state != CTRC_ORIGIN_SEALED
+				&& (origin->state != CTRC_ORIGIN_SEALING || origin->touched_bitmap != 0))
+			   || origin->close_dispatched_bitmap != origin->touched_bitmap
+			   || origin->close_confirmed_bitmap != origin->touched_bitmap)
 		return false;
 	nodes = CtrcShared->origin_ack_inbox_entries / CtrcShared->origin_key_entries;
 	if (nodes == 0 || nodes > CLUSTER_CTRC_MAX_PARTICIPANTS)
@@ -5168,8 +5173,9 @@ ctrc_capacity_pool_candidates(uint64 epoch, CtrcCapacityCandidate *candidates,
 			observation->unproven_reasons |= CLUSTER_CAPACITY_UNPROVEN_IDENTITY;
 			continue;
 		}
-		if (origin->state != CTRC_ORIGIN_CERTIFYING
-			&& origin->state != CTRC_ORIGIN_RELEASE_PROVEN) {
+		if (origin->state != CTRC_ORIGIN_CERTIFYING && origin->state != CTRC_ORIGIN_RELEASE_PROVEN
+			&& origin->state != CTRC_ORIGIN_SEALED
+			&& (origin->state != CTRC_ORIGIN_SEALING || origin->touched_bitmap != 0)) {
 			observation->unproven_reasons |= CLUSTER_CAPACITY_UNPROVEN_PHASE;
 			continue;
 		}
@@ -5259,9 +5265,9 @@ ctrc_capacity_certificate_probe(const CtrcCapacityCandidate *candidate,
  * cluster_ctrc_capacity_probe_pool_v1 -- Observe existing certificate supply.
  *
  * Inputs: original CURRENT, qualified horizon/epoch and caller-local output.
- * Returns: exact owner work, allocator recheck or missing evidence. Only
- * CERTIFYING and unfinished RELEASE_PROVEN notifications are proved; other
- * phases cannot acquire a positive result.
+ * Returns: exact owner work, allocator recheck or missing evidence. Proves
+ * completed seals awaiting the original certificate transition, CERTIFYING
+ * work and unfinished RELEASE_PROVEN notifications.
  * Side Effects: advances the original process-local certificate cursor and
  * reads canonical blocks outside CTRC locks. Never grants or reserves supply.
  *
