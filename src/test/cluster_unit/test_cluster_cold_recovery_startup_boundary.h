@@ -27,6 +27,140 @@
 #ifndef TEST_CLUSTER_COLD_RECOVERY_STARTUP_BOUNDARY_H
 #define TEST_CLUSTER_COLD_RECOVERY_STARTUP_BOUNDARY_H
 
+#include "miscadmin.h"
+#include "access/xlog.h"
+#include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_startup_phase.h"
+#include "postmaster/startup.h"
+#include "storage/latch.h"
+#include "storage/lwlock.h"
+#include "storage/proc.h"
+#include "utils/resowner.h"
+
+/* This driver-only suite does not run a Startup process. Its original ROOT
+ * reader is a leaf; CF waiting is exercised with actual CF/CONTROL in
+ * test_cluster_startup_cf_entry. Any accidental wait here must fail loudly. */
+BackendType MyBackendType = B_INVALID;
+AuxProcType MyAuxProcType = NotAnAuxProcess;
+PGPROC *MyProc;
+Latch *MyLatch;
+int MyProcPid;
+ResourceOwner CurrentResourceOwner;
+LWLockPadded *MainLWLockArray;
+volatile uint32 CritSectionCount;
+volatile sig_atomic_t InterruptPending, ShutdownRequestPending;
+bool InRecovery, cluster_enabled, cluster_controlfile_shared_authority;
+
+uint64
+GetSystemIdentifier(void)
+{
+	abort();
+}
+uint64
+cluster_grd_redeclare_generation(void)
+{
+	abort();
+}
+uint64
+cluster_qvotec_get_self_incarnation(void)
+{
+	abort();
+}
+void
+HandleStartupProcInterrupts(void)
+{
+	abort();
+}
+void
+ProcessInterrupts(void)
+{
+	abort();
+}
+bool
+LWLockHeldByMe(LWLock *lock pg_attribute_unused())
+{
+	abort();
+}
+void
+ResetLatch(Latch *latch pg_attribute_unused())
+{
+	abort();
+}
+int
+WaitLatch(Latch *latch pg_attribute_unused(), int events pg_attribute_unused(),
+		  long timeout pg_attribute_unused(), uint32 event pg_attribute_unused())
+{
+	abort();
+}
+int
+errdetail(const char *format pg_attribute_unused(), ...)
+{
+	abort();
+}
+uint64
+cluster_cf_attempt_sequence(void)
+{
+	abort();
+}
+bool
+cluster_cf_last_attempt_since(uint64 before pg_attribute_unused(),
+							  ClusterCfAttemptObservation *out pg_attribute_unused())
+{
+	abort();
+}
+bool
+cluster_cf_attempt_wait_slice(const ClusterCfAttemptObservation *attempt pg_attribute_unused())
+{
+	abort();
+}
+bool
+cluster_cf_held(LOCKMODE mode pg_attribute_unused())
+{
+	abort();
+}
+bool
+cluster_cf_release_completed(LOCKMODE mode pg_attribute_unused(),
+							 uint64 cookie pg_attribute_unused())
+{
+	abort();
+}
+bool
+cluster_cf_retirement_snapshot(LOCKMODE mode pg_attribute_unused(),
+							   const void *caller pg_attribute_unused(),
+							   ClusterCfRetirementSnapshot *out pg_attribute_unused())
+{
+	abort();
+}
+void
+cluster_cf_retirement_poll(void)
+{
+	abort();
+}
+void
+cluster_lock_owners_service_poll(void)
+{
+	abort();
+}
+bool
+cluster_reconfig_capture_formation_snapshot_v1(
+	uint16 thread pg_attribute_unused(), ClusterFormationSnapshotV1 *out pg_attribute_unused())
+{
+	abort();
+}
+bool
+cluster_formation_snapshot_matches_v1(
+	const ClusterFormationSnapshotV1 *expected pg_attribute_unused(),
+	const ClusterFormationSnapshotV1 *observed pg_attribute_unused())
+{
+	abort();
+}
+bool
+cluster_recovery_transport_components_current(void)
+{
+	abort();
+}
+
 /* Minimal memory-context fixtures: one context, plain heap allocations. */
 static MemoryContextData fixture_context;
 MemoryContext TopMemoryContext = &fixture_context;

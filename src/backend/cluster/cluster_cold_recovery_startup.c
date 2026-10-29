@@ -35,6 +35,8 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+#include "miscadmin.h"
+#include "access/xlog.h"
 #include "access/xlogreader.h"
 #include "access/clog.h"
 #include "access/multixact.h"
@@ -50,11 +52,16 @@
 #include "cluster/cluster_undo_recovery.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "cluster/cluster_epoch.h"
+#include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_control_root.h"
+#include "cluster/cluster_grd.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_qvotec.h"
+#include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_page_cold_redo.h"
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_recovery_merge.h"
+#include "cluster/cluster_startup_phase.h"
 #include "cluster/cluster_relmap_checkpoint.h"
 #include "cluster/cluster_relmap_retention_runtime.h"
 #include "cluster/cluster_wal_retention.h"
@@ -63,7 +70,14 @@
 #include "cluster/cluster_xid_stripe_xlog.h"
 #include "storage/bufpage.h"
 #include "storage/checksum.h"
+#include "postmaster/interrupt.h"
+#include "postmaster/startup.h"
+#include "storage/latch.h"
+#include "storage/lwlock.h"
+#include "storage/proc.h"
 #include "utils/memutils.h"
+#include "utils/resowner.h"
+#include "utils/wait_event.h"
 #include "cluster_control_bootstrap_private.h"
 
 /* cluster.cold_recovery_plan_memory, kB; registered with the cluster GUCs. */
@@ -264,6 +278,143 @@ cold_own_identity_refuse(ClusterColdTypedV1 *typed, uint16 thread,
 		(unsigned)thread, (int)CLUSTER_RECOVERY_DUTY_COMPARE_EXACT, (int)compare);
 }
 
+typedef struct ColdOwnRootCfWait {
+	PGPROC *proc;
+	Latch *latch;
+	ResourceOwner owner;
+	ClusterColdTypedV1 *typed;
+	MemoryContext context;
+	struct ClusterColdReplayRootV1 *roots;
+	ClusterFormationSnapshotV1 cohort;
+	ClusterWalSourceRef restart;
+	int pid, node;
+	uint16 thread;
+	uint64 epoch, generation, boot, system_identifier;
+	bool recovery, captured;
+} ColdOwnRootCfWait;
+
+static void
+cold_own_root_cf_capture(ColdOwnRootCfWait *original, ClusterColdTypedV1 *typed, uint16 thread)
+{
+	memset(original, 0, sizeof(*original));
+	original->proc = MyProc;
+	original->latch = MyLatch;
+	original->owner = CurrentResourceOwner;
+	original->typed = typed;
+	original->context = typed->context;
+	original->roots = typed->replay_roots;
+	original->pid = MyProcPid;
+	original->node = cluster_node_id;
+	original->thread = thread;
+	original->epoch = cluster_epoch_get_current();
+	original->generation = cluster_grd_redeclare_generation();
+	original->boot = cluster_qvotec_get_self_incarnation();
+	original->system_identifier = GetSystemIdentifier();
+	original->recovery = InRecovery;
+	original->captured
+		= thread == (uint16)(cluster_node_id + 1)
+		  && cluster_reconfig_capture_formation_snapshot_v1(thread, &original->cohort)
+		  && original->cohort.startup_formation_generation != 0
+		  && cluster_wal_thread_restart_v2_ref(&original->restart);
+}
+
+static bool
+cold_own_root_cf_current(const ColdOwnRootCfWait *original)
+{
+	ClusterFormationSnapshotV1 cohort;
+	ClusterWalSourceRef restart;
+
+	return original->captured && original->proc != NULL && original->latch != NULL
+		   && original->owner != NULL && original->context != NULL && original->roots != NULL
+		   && MyProc == original->proc && MyLatch == original->latch && MyProcPid == original->pid
+		   && CurrentResourceOwner == original->owner && MyBackendType == B_STARTUP
+		   && AmStartupProcess() && !ShutdownRequestPending && CritSectionCount == 0
+		   && !LWLockHeldByMe(ControlFileLock) && cluster_enabled && cluster_shared_config
+		   && cluster_controlfile_shared_authority && cluster_node_id == original->node
+		   && original->thread == (uint16)(cluster_node_id + 1) && original->epoch != 0
+		   && original->generation != 0 && original->boot != 0 && original->system_identifier != 0
+		   && original->typed->context == original->context
+		   && original->typed->replay_roots == original->roots
+		   && GetSystemIdentifier() == original->system_identifier
+		   && InRecovery == original->recovery && cluster_epoch_get_current() == original->epoch
+		   && cluster_grd_redeclare_generation() == original->generation
+		   && cluster_qvotec_get_self_incarnation() == original->boot
+		   && cluster_recovery_transport_components_current()
+		   && cluster_reconfig_capture_formation_snapshot_v1(original->thread, &cohort)
+		   && cluster_formation_snapshot_matches_v1(&original->cohort, &cohort)
+		   && cluster_wal_thread_restart_v2_ref(&restart)
+		   && memcmp(&original->restart, &restart, sizeof(restart)) == 0;
+}
+
+/* No serial set is held in pass 1. Retire only this lookup's failed request;
+ * neither its cleanup receipt nor the read below supplies replay authority. */
+static void
+cold_own_root_cf_wait(const ColdOwnRootCfWait *original, const ClusterCfAttemptObservation *attempt)
+{
+	ClusterCfRetirementSnapshot retiring;
+	bool empty = attempt->owner_state_at_return == CLUSTER_LOCK_OWNER_EMPTY;
+	bool empty_waited = false;
+	const char *reason = "CONTEXT_CHANGED_AFTER_WAIT_SLICE";
+
+	if (!cold_own_root_cf_current(original) || cluster_cf_held(ExclusiveLock))
+		goto refuse;
+	reason = "CF_WAIT_IDENTITY_OR_COMPLETION";
+	if (!empty
+		&& (!cluster_cf_retirement_snapshot(ShareLock, NULL, &retiring)
+			|| retiring.cookie != attempt->control_owner_id
+			|| retiring.registry.message.key.holder.request_id != attempt->request_id
+			|| retiring.registry.message.key.holder.cluster_epoch != attempt->request_epoch))
+		goto refuse;
+	for (;;) {
+		ClusterCfRetirementSnapshot current;
+		bool held;
+
+		HandleStartupProcInterrupts();
+		CHECK_FOR_INTERRUPTS();
+		reason = "CONTEXT_CHANGED_AFTER_WAIT_SLICE";
+		if (!cold_own_root_cf_current(original))
+			goto refuse;
+		ResetLatch(MyLatch);
+		held = cluster_cf_held(ShareLock);
+		if (!held && !cluster_cf_held(ExclusiveLock)) {
+			if (!empty && cluster_cf_release_completed(ShareLock, retiring.cookie))
+				return;
+			if (empty) {
+				if (empty_waited)
+					return;
+				empty_waited = true;
+				(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+								WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
+				continue;
+			}
+		}
+		reason = "CF_WAIT_IDENTITY_OR_COMPLETION";
+		if (empty || !held || cluster_cf_held(ExclusiveLock)
+			|| !cluster_cf_retirement_snapshot(ShareLock, NULL, &current)
+			|| current.cookie != retiring.cookie
+			|| current.registry.handle.slot != retiring.registry.handle.slot
+			|| current.registry.handle.generation != retiring.registry.handle.generation
+			|| memcmp(&current.registry.owner, &retiring.registry.owner,
+					  sizeof(current.registry.owner))
+				   != 0
+			|| memcmp(&current.registry.message.key, &retiring.registry.message.key,
+					  sizeof(current.registry.message.key))
+				   != 0)
+			goto refuse;
+		cluster_lock_owners_service_poll();
+		cluster_cf_retirement_poll();
+		if (cluster_cf_held(ShareLock))
+			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+							WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
+	}
+refuse:
+	ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+					errmsg("cold own-root lookup cannot continue its control-file wait"),
+					errdetail("PGRAC_FAMILY=STARTUP_CONTROL consumer=cold_own_root reason=%s "
+							  "cookie=" UINT64_FORMAT " request=" UINT64_FORMAT,
+							  reason, attempt->control_owner_id, attempt->request_id)));
+}
+
 /* The founder's previous generation must be sealed like every peer. */
 static bool
 cold_own_root(ClusterColdTypedV1 *typed, uint16 own_thread, ColdRoot *out)
@@ -271,9 +422,36 @@ cold_own_root(ClusterColdTypedV1 *typed, uint16 own_thread, ColdRoot *out)
 	ClusterControlRootIdentity identity;
 	ClusterControlRootResult result;
 	ClusterRecoveryDutyCompare compare;
+	ColdOwnRootCfWait original;
+	bool startup = cluster_shared_config && MyBackendType == B_STARTUP && AmStartupProcess();
+	bool waited = false;
 
-	result = cluster_control_root_lookup_owner_by_node_runtime((int32)own_thread - 1, &identity,
-															   &out->root, &out->token);
+	if (startup)
+		cold_own_root_cf_capture(&original, typed, own_thread);
+	for (;;) {
+		ClusterCfAttemptObservation attempt;
+		uint64 before = startup ? cluster_cf_attempt_sequence() : 0;
+
+		result = cluster_control_root_lookup_owner_by_node_runtime((int32)own_thread - 1, &identity,
+																   &out->root, &out->token);
+		/* The acquire can yield. Reject a fresh read from a changed context
+		 * before its provisional outputs reach any original admission gate. */
+		if (waited && !cold_own_root_cf_current(&original)) {
+			memset(&out->root, 0, sizeof(out->root));
+			memset(&out->token, 0, sizeof(out->token));
+			cold_refuse(
+				typed, CLUSTER_COLD_PARTICIPANT_INVALID,
+				"own thread %u root predicate=WAIT_CONTEXT expected=original actual=changed",
+				(unsigned)own_thread);
+			return false;
+		}
+		if (result != CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE || !startup
+			|| !cluster_cf_last_attempt_since(before, &attempt)
+			|| !cluster_cf_attempt_wait_slice(&attempt) || attempt.mode != ShareLock)
+			break;
+		cold_own_root_cf_wait(&original, &attempt);
+		waited = true;
+	}
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
 		cold_refuse(typed, CLUSTER_COLD_PARTICIPANT_INVALID,

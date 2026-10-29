@@ -18,16 +18,27 @@
 #include <unistd.h>
 
 #include "access/xlog.h"
+#include "access/xlogutils.h"
 #include "miscadmin.h"
 
+#include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_epoch.h"
+#include "cluster/cluster_grd.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_qvotec.h"
+#include "cluster/cluster_startup_phase.h"
 #include "cluster/cluster_lock_acquire.h"
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_wal_retention.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster_control_root_private.h"
 #include "portability/instr_time.h"
+#include "postmaster/interrupt.h"
+#include "postmaster/startup.h"
+#include "storage/latch.h"
 #include "storage/lock.h"
+#include "storage/lwlock.h"
+#include "storage/proc.h"
 #include "storage/ipc.h"
 #include "utils/memutils.h"
 #include "cluster/cluster_lock_owner.h"
@@ -746,35 +757,256 @@ pin_thread_walr_current(const ClusterWalRetentionPin *pin, const ClusterWalPinTh
 		   && walr_request_current(&guard->walr.acquire_request);
 }
 
+/* Process-local input copies only: neither a pin nor cleanup receipt grants
+ * permission to enter IR or accept a different ROOT cut. */
+typedef struct ClusterWalPinStartupCfWait {
+	PGPROC *proc;
+	Latch *latch;
+	ResourceOwner owner;
+	ClusterWalRetentionPin *pin;
+	ClusterWalRetentionPin saved;
+	char *inputs;
+	int pid, node;
+	uint64 epoch, generation, boot, system_identifier;
+	bool recovery;
+} ClusterWalPinStartupCfWait;
+
+static void
+pin_startup_cf_capture(ClusterWalPinStartupCfWait *original, ClusterWalRetentionPin *pin)
+{
+	Size bytes
+		= (Size)pin->nthreads * sizeof(*pin->threads) + (Size)pin->nreaders * sizeof(*pin->readers);
+	char *next;
+
+	memset(original, 0, sizeof(*original));
+	original->proc = MyProc;
+	original->latch = MyLatch;
+	original->owner = CurrentResourceOwner;
+	original->pin = pin;
+	memcpy(&original->saved, pin, sizeof(*pin));
+	original->pid = MyProcPid;
+	original->node = cluster_node_id;
+	original->epoch = cluster_epoch_get_current();
+	original->generation = cluster_grd_redeclare_generation();
+	original->boot = cluster_qvotec_get_self_incarnation();
+	original->system_identifier = GetSystemIdentifier();
+	original->recovery = InRecovery;
+	for (uint16 i = 0; i < pin->nthreads; i++) {
+		const ClusterWalPinThread *thread = &pin->threads[i];
+
+		if ((thread->nintervals != 0 && thread->intervals == NULL)
+			|| thread->nintervals > (MaxAllocSize - bytes) / sizeof(*thread->intervals))
+			return;
+		bytes += (Size)thread->nintervals * sizeof(*thread->intervals);
+	}
+	original->inputs = palloc(bytes);
+	next = original->inputs;
+	bytes = (Size)pin->nthreads * sizeof(*pin->threads);
+	memcpy(next, pin->threads, bytes);
+	next += bytes;
+	bytes = (Size)pin->nreaders * sizeof(*pin->readers);
+	if (bytes != 0)
+		memcpy(next, pin->readers, bytes);
+	next += bytes;
+	for (uint16 i = 0; i < pin->nthreads; i++) {
+		bytes = (Size)pin->threads[i].nintervals * sizeof(*pin->threads[i].intervals);
+		if (bytes != 0)
+			memcpy(next, pin->threads[i].intervals, bytes);
+		next += bytes;
+	}
+}
+
+static void
+pin_startup_cf_free(ClusterWalPinStartupCfWait *original)
+{
+	if (original->inputs != NULL)
+		pfree(original->inputs);
+}
+
+static bool
+pin_startup_cf_current(const ClusterWalPinStartupCfWait *original)
+{
+	ClusterWalRetentionPin *pin = original->pin;
+	const char *next = original->inputs;
+	Size bytes;
+
+	if (next == NULL || original->proc == NULL || original->latch == NULL || original->owner == NULL
+		|| MyProc != original->proc || MyLatch != original->latch || MyProcPid != original->pid
+		|| CurrentResourceOwner != original->owner || MyBackendType != B_STARTUP
+		|| !AmStartupProcess() || ShutdownRequestPending || CritSectionCount != 0
+		|| LWLockHeldByMe(ControlFileLock) || !cluster_enabled || !cluster_shared_config
+		|| !cluster_controlfile_shared_authority || cluster_node_id != original->node
+		|| original->epoch == 0 || original->generation == 0 || original->boot == 0
+		|| original->system_identifier == 0 || GetSystemIdentifier() != original->system_identifier
+		|| InRecovery != original->recovery || cluster_epoch_get_current() != original->epoch
+		|| cluster_grd_redeclare_generation() != original->generation
+		|| cluster_qvotec_get_self_incarnation() != original->boot
+		|| !cluster_recovery_transport_components_current() || !pin_valid(pin)
+		|| memcmp(pin, &original->saved, sizeof(*pin)) != 0 || pin->poisoned
+		|| pin->state != CLUSTER_WAL_PIN_STATE_ACQUIRED_UNBOUND || pin->serial_set != NULL
+		|| active_root_publish_guard != NULL || active_reuse_guard != NULL)
+		return false;
+	bytes = (Size)pin->nthreads * sizeof(*pin->threads);
+	if (memcmp(next, pin->threads, bytes) != 0)
+		return false;
+	next += bytes;
+	bytes = (Size)pin->nreaders * sizeof(*pin->readers);
+	if (bytes != 0 && memcmp(next, pin->readers, bytes) != 0)
+		return false;
+	next += bytes;
+	if (!pin_readers_current(pin))
+		return false;
+	for (uint16 i = 0; i < pin->nthreads; i++) {
+		const ClusterWalPinThread *thread = &pin->threads[i];
+		PgracExternalFenceDenyReason reason = PGRAC_EXTERNAL_FENCE_DENY_NONE;
+
+		bytes = (Size)thread->nintervals * sizeof(*thread->intervals);
+		if ((bytes != 0 && memcmp(next, thread->intervals, bytes) != 0) || thread->serial != NULL
+			|| thread->walr.request.lockmode != ShareLock || !pin_thread_walr_current(pin, thread)
+			|| cluster_formation_witness_revalidate_nowait(thread->formation)
+				   != CLUSTER_FORMATION_WITNESS_READY
+			|| !cluster_external_fence_need_set_revalidate_nowait(thread->needs, thread->formation,
+																  &reason)
+			|| !cluster_external_fence_revalidate_set_nowait(thread->admissions, thread->needs,
+															 thread->formation, &reason))
+			return false;
+		next += bytes;
+	}
+	return true;
+}
+
+static bool
+pin_startup_cf_wait(const ClusterWalPinStartupCfWait *original,
+					const ClusterCfAttemptObservation *attempt)
+{
+	ClusterCfRetirementSnapshot retiring;
+	bool empty = attempt->owner_state_at_return == CLUSTER_LOCK_OWNER_EMPTY;
+	bool empty_waited = false;
+	const char *reason = "CONTEXT_CHANGED_AFTER_WAIT_SLICE";
+
+	if (!pin_startup_cf_current(original) || cluster_cf_held(ExclusiveLock))
+		goto refuse;
+	reason = "CF_WAIT_IDENTITY_OR_COMPLETION";
+	if (!empty
+		&& (!cluster_cf_retirement_snapshot(ShareLock, NULL, &retiring)
+			|| retiring.cookie != attempt->control_owner_id
+			|| retiring.registry.message.key.holder.request_id != attempt->request_id
+			|| retiring.registry.message.key.holder.cluster_epoch != attempt->request_epoch))
+		goto refuse;
+	for (;;) {
+		ClusterCfRetirementSnapshot current;
+		bool held;
+
+		HandleStartupProcInterrupts();
+		CHECK_FOR_INTERRUPTS();
+		reason = "CONTEXT_CHANGED_AFTER_WAIT_SLICE";
+		if (!pin_startup_cf_current(original))
+			goto refuse;
+		ResetLatch(MyLatch);
+		held = cluster_cf_held(ShareLock);
+		if (!held && !cluster_cf_held(ExclusiveLock)) {
+			if (!empty && cluster_cf_release_completed(ShareLock, retiring.cookie))
+				return true;
+			if (empty) {
+				if (empty_waited)
+					return true;
+				empty_waited = true;
+				(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+								WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
+				continue;
+			}
+		}
+		reason = "CF_WAIT_IDENTITY_OR_COMPLETION";
+		if (empty || !held || cluster_cf_held(ExclusiveLock)
+			|| !cluster_cf_retirement_snapshot(ShareLock, NULL, &current)
+			|| current.cookie != retiring.cookie
+			|| current.registry.handle.slot != retiring.registry.handle.slot
+			|| current.registry.handle.generation != retiring.registry.handle.generation
+			|| memcmp(&current.registry.owner, &retiring.registry.owner,
+					  sizeof(current.registry.owner))
+				   != 0
+			|| memcmp(&current.registry.message.key, &retiring.registry.message.key,
+					  sizeof(current.registry.message.key))
+				   != 0)
+			goto refuse;
+		cluster_lock_owners_service_poll();
+		cluster_cf_retirement_poll();
+		if (cluster_cf_held(ShareLock))
+			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+							WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
+	}
+refuse:
+	/* Return through the original pin unwind; never bypass WALR cleanup. */
+	ereport(LOG, (errmsg("startup retention pin cannot continue its control-file wait"),
+				  errdetail("PGRAC_FAMILY=STARTUP_CONTROL consumer=unbound_pin reason=%s "
+							"cookie=" UINT64_FORMAT " request=" UINT64_FORMAT,
+							reason, attempt->control_owner_id, attempt->request_id)));
+	return false;
+}
+
 static ClusterWalPinResult
 pin_current_after_grants(ClusterWalRetentionPin *pin)
 {
 	uint16 i;
+	ClusterWalPinStartupCfWait original;
+	bool startup = cluster_shared_config && MyBackendType == B_STARTUP && AmStartupProcess();
+	bool waited = false;
 
 	if (!pin_readers_current(pin))
 		return CLUSTER_WAL_PIN_STALE;
+	if (startup)
+		pin_startup_cf_capture(&original, pin);
 	for (i = 0; i < pin->nthreads; i++) {
 		ClusterWalPinThread *thread = &pin->threads[i];
 		ClusterControlRootSnapshot snapshot;
 		ClusterControlRootResult result;
 		PgracExternalFenceDenyReason reason = PGRAC_EXTERNAL_FENCE_DENY_NONE;
 		bool root_current;
-		if (thread->pending.generation != 0) {
-			ClusterControlRecoverySubject subject;
-			result = cluster_control_root_read_recovery_subject(thread->duty.origin_thread_id,
-																&thread->duty, &subject);
-			root_current
-				= result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
-				  && subject.kind == CLUSTER_CONTROL_RECOVERY_PENDING_INITIALIZER
-				  && memcmp(&subject.duty, &thread->duty, sizeof(thread->duty)) == 0
-				  && memcmp(&subject.pending, &thread->pending, sizeof(thread->pending)) == 0;
-		} else {
-			result = cluster_control_root_revalidate(&thread->root_read, &thread->duty, &snapshot);
-			root_current = control_root_read_ready(result)
-						   && memcmp(&snapshot.identity, &thread->duty, sizeof(thread->duty)) == 0
-						   && snapshot.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
-						   && snapshot.root_flags == thread->root_read.root_flags;
+		for (;;) {
+			ClusterCfAttemptObservation attempt;
+			uint64 before = startup ? cluster_cf_attempt_sequence() : 0;
+
+			if (thread->pending.generation != 0) {
+				ClusterControlRecoverySubject subject;
+				result = cluster_control_root_read_recovery_subject(thread->duty.origin_thread_id,
+																	&thread->duty, &subject);
+				root_current
+					= result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+					  && subject.kind == CLUSTER_CONTROL_RECOVERY_PENDING_INITIALIZER
+					  && memcmp(&subject.duty, &thread->duty, sizeof(thread->duty)) == 0
+					  && memcmp(&subject.pending, &thread->pending, sizeof(thread->pending)) == 0;
+			} else {
+				result
+					= cluster_control_root_revalidate(&thread->root_read, &thread->duty, &snapshot);
+				root_current
+					= control_root_read_ready(result)
+					  && memcmp(&snapshot.identity, &thread->duty, sizeof(thread->duty)) == 0
+					  && snapshot.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+					  && snapshot.root_flags == thread->root_read.root_flags;
+			}
+			/* A canonical acquire may yield. Do not accept provisional output
+			 * under a different pin, actor or original input binding. */
+			if (waited && !pin_startup_cf_current(&original)) {
+				ereport(LOG, (errmsg("startup retention pin input changed after control-file wait"),
+							  errdetail("PGRAC_FAMILY=STARTUP_CONTROL consumer=unbound_pin "
+										"reason=CONTEXT_CHANGED_AFTER_READ")));
+				goto stale;
+			}
+			if (result != CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE || !startup
+				|| !cluster_cf_last_attempt_since(before, &attempt)
+				|| !cluster_cf_attempt_wait_slice(&attempt) || attempt.mode != ShareLock)
+				break;
+			if (!pin_startup_cf_wait(&original, &attempt))
+				goto stale;
+			waited = true;
 		}
+
+		if (waited && !root_current)
+			ereport(LOG, (errmsg("startup retention pin rejected its original ROOT input"),
+						  errdetail("PGRAC_FAMILY=STARTUP_CONTROL consumer=unbound_pin "
+									"reason=ROOT_OR_TOKEN_REFUSED result=%d thread=%u",
+									(int)result, (unsigned)thread->duty.origin_thread_id)));
+
 		if (!root_current || !pin_thread_walr_current(pin, thread)
 			|| cluster_formation_witness_revalidate_nowait(thread->formation)
 				   != CLUSTER_FORMATION_WITNESS_READY
@@ -782,9 +1014,15 @@ pin_current_after_grants(ClusterWalRetentionPin *pin)
 																  &reason)
 			|| !cluster_external_fence_revalidate_set_nowait(thread->admissions, thread->needs,
 															 thread->formation, &reason))
-			return CLUSTER_WAL_PIN_STALE;
+			goto stale;
 	}
+	if (startup)
+		pin_startup_cf_free(&original);
 	return CLUSTER_WAL_PIN_OK;
+stale:
+	if (startup)
+		pin_startup_cf_free(&original);
+	return CLUSTER_WAL_PIN_STALE;
 }
 
 static bool walr_share_request_init(uint16 thread_id, ClusterLockAcquireRequest *request);
