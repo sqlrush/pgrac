@@ -5310,6 +5310,13 @@ cluster_cr_tuple_verdict(Buffer buf, HeapTuple htup, Snapshot snapshot, bool *ou
 		}
 		hdr = (const UndoRecordHeader *)record_buf.data;
 
+		/* Retained history and operation disposition require the full-page
+		 * reader, even before an old-SCN stop or an unrelated-block skip. */
+		if ((hdr->flags & (UNDO_REC_FLAG_HAS_ITL_HISTORY | UNDO_REC_FLAG_HAS_OPERATION)) != 0) {
+			reason = CR_TUPLE_OUTCOME_FALLBACK_UNCERTAIN;
+			goto fallback;
+		}
+
 		if (hdr->origin_node_id != (uint16)cluster_node_id
 			&& !cluster_merged_instance_is_materialized((int)hdr->origin_node_id)) {
 			reason = CR_TUPLE_OUTCOME_FALLBACK_CROSS_BLOCK; /* cross-instance UBA -> full-block */

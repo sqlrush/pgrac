@@ -11,8 +11,9 @@
  *	      inverse INSERT/UPDATE/DELETE/ITL transitions, walk-time identity guard,
  *	      target-only prune (uses cluster_cr_apply.o + cluster_cr_tuple.o).
  *
- *	  The walk DRIVER + verdict (cluster_cr_tuple_verdict) and the differential
- *	  fast-vs-full-block equivalence need a live undo reader / backend, so they
+ *	  The production walk DRIVER (cluster_cr_tuple_verdict) also runs with
+ *	  scripted buffer/storage/final-verdict boundaries. The differential
+ *	  fast-vs-full-block equivalence checks need a live undo reader / backend, so they
  *	  are covered by cluster_tap t/309 (real own-instance CR), NOT here.
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
@@ -38,6 +39,7 @@
 #include "storage/itemid.h"
 
 #include "cluster/cluster_cr_tuple.h"
+#include "cluster/cluster_cr_apply.h"
 #include "cluster/cluster_itl_slot.h"
 #include "cluster/cluster_undo_record.h"
 
@@ -540,10 +542,270 @@ UT_TEST(test_retained_history_requires_full_page_without_tuple_mutation)
 	UT_ASSERT_EQ(memcmp(before.data, page, BLCKSZ), 0);
 }
 
+/* Run the production walk with explicit buffer/storage/verdict boundaries. */
+#include "utils/memutils.h"
+#include "../../backend/cluster/cluster_uba.c"
+
+static char *cr_tuple_scratch;
+static PGAlignedBlock tuple_walk_scratch;
+static PGAlignedBlock tuple_walk_records[2];
+static size_t tuple_walk_lengths[2];
+static int tuple_walk_reads;
+static int tuple_walk_verdicts;
+static RelFileLocator tuple_walk_locator = { 1663, 5, 12345 };
+static bool tuple_walk_expected_present;
+static int tuple_walk_limit = 16;
+
+static Page
+tuple_walk_page(Buffer buffer)
+{
+	UT_ASSERT_EQ(buffer, 1);
+	return synthetic_page;
+}
+
+static void
+tuple_walk_tag(Buffer buffer, RelFileLocator *locator, ForkNumber *fork, BlockNumber *block)
+{
+	UT_ASSERT_EQ(buffer, 1);
+	*locator = tuple_walk_locator;
+	*fork = MAIN_FORKNUM;
+	*block = 17;
+}
+
+static void *
+tuple_walk_alloc(MemoryContext context pg_attribute_unused(), Size bytes)
+{
+	UT_ASSERT_EQ(bytes, BLCKSZ);
+	memset(tuple_walk_scratch.data, 0, BLCKSZ);
+	return tuple_walk_scratch.data;
+}
+
+static size_t
+tuple_walk_get_record(UBA address, void *out, size_t capacity)
+{
+	unsigned index = (unsigned)tuple_walk_reads++;
+
+	UT_ASSERT(index < lengthof(tuple_walk_records));
+	if (index >= lengthof(tuple_walk_records))
+		return 0;
+	UT_ASSERT(cluster_undo_record_uba_equal(address, uba_encode(1, 7, 2, 1 - index)));
+	UT_ASSERT(capacity >= tuple_walk_lengths[index]);
+	memcpy(out, tuple_walk_records[index].data, tuple_walk_lengths[index]);
+	return tuple_walk_lengths[index];
+}
+
+static ClusterCrVerdict
+cluster_cr_verdict_on_image(const char *page, OffsetNumber offset, const ClusterItlSlotData *slot,
+							Snapshot snapshot, bool remote, int32 origin, bool *visible)
+{
+	tuple_walk_verdicts++;
+	UT_ASSERT_EQ(offset, TEST_TUPLE_OFFSET);
+	UT_ASSERT(slot == ClusterPageGetItlSlots(synthetic_page));
+	UT_ASSERT_EQ(snapshot->read_scn, 100);
+	UT_ASSERT(!remote && origin == -1);
+	UT_ASSERT_EQ(ItemIdIsNormal(PageGetItemId((Page)page, offset)), tuple_walk_expected_present);
+	*visible = false;
+	return CLUSTER_CR_DECIDED;
+}
+
+static bool
+tuple_walk_materialized(int node pg_attribute_unused())
+{
+	UT_ASSERT(false);
+	return false;
+}
+
+#define BufferGetPage tuple_walk_page
+#define BufferGetTag tuple_walk_tag
+#define MemoryContextAllocZero tuple_walk_alloc
+#define TopMemoryContext ((MemoryContext)NULL)
+#define cluster_node_id 0
+#define cluster_cr_chain_walk_max_steps tuple_walk_limit
+#define cluster_undo_get_record tuple_walk_get_record
+#define cluster_merged_instance_is_materialized tuple_walk_materialized
+#include "test_cluster_cr_tuple_walk.inc"
+#undef BufferGetPage
+#undef BufferGetTag
+#undef MemoryContextAllocZero
+#undef TopMemoryContext
+#undef cluster_node_id
+#undef cluster_cr_chain_walk_max_steps
+#undef cluster_undo_get_record
+#undef cluster_merged_instance_is_materialized
+
+static void
+tuple_walk_validate_record(const UndoRecordHeader *record)
+{
+	uint16 body_length;
+	UndoItlHistoryTrailer history;
+	UndoOperationTrailer operation;
+	const char *payload = (const char *)record + sizeof(*record);
+
+	if ((record->flags & UNDO_REC_FLAG_HAS_OPERATION) != 0) {
+		if ((record->flags & UNDO_REC_FLAG_HAS_ITL_HISTORY) != 0)
+			UT_ASSERT(cluster_undo_record_decode_operation_payload(
+				record, payload, record->payload_length, &body_length, &history, &operation));
+	} else
+		UT_ASSERT(cluster_undo_record_decode_payload(record, payload, record->payload_length,
+													 &body_length, &history));
+}
+
+static void
+tuple_walk_record(unsigned index, uint8 flags, SCN scn, bool other_block)
+{
+	char *bytes = tuple_walk_records[index].data;
+	UndoRecordHeader *record = (UndoRecordHeader *)bytes;
+	UndoItlHistoryTrailer history = { 0 };
+	UndoOperationTrailer operation = { 0 };
+	size_t length;
+
+	memset(bytes, 0, BLCKSZ);
+	length = build_insert_record(bytes, TEST_TUPLE_OFFSET);
+	record->flags = flags | UNDO_REC_FLAG_FIRST_IN_TX;
+	record->xid = (flags & UNDO_REC_FLAG_HAS_OPERATION) ? CAND_XID + 1 : CAND_XID;
+	record->origin_node_id = 0;
+	record->tt_slot_segment_id = 1;
+	record->tt_slot_id = 3;
+	record->tt_wrap_plus1 = 8;
+	record->write_scn = scn;
+	record->target_locator = tuple_walk_locator;
+	record->target_fork = MAIN_FORKNUM;
+	record->target_block = other_block ? 18 : 17;
+	if ((flags & UNDO_REC_FLAG_HAS_ITL_HISTORY) != 0) {
+		history.magic = UNDO_ITL_HISTORY_MAGIC;
+		history.version = UNDO_ITL_HISTORY_VERSION;
+		history.count = 1;
+		history.entries[0].block = record->target_block;
+		history.entries[0].after_kind = ITL_FLAG_ACTIVE;
+		history.entries[0].after_write_scn = scn;
+		memcpy(bytes + length, &history, sizeof(history));
+		length += sizeof(history);
+	}
+	if ((flags & UNDO_REC_FLAG_HAS_OPERATION) != 0) {
+		operation.version = UNDO_OPERATION_TRAILER_VERSION;
+		operation.length = sizeof(operation);
+		operation.effect_state = CLUSTER_SAVEPOINT_EFFECT_DISCARDED;
+		operation.canonical_top_fxid = CAND_XID;
+		operation.operation_fxid = CAND_XID + 1;
+		operation.operation_sequence = 1;
+		operation.canonical_segment_generation = 7;
+		operation.command_id = 4;
+		operation.subid = TopSubTransactionId + 1;
+		memcpy(bytes + length, &operation, sizeof(operation));
+		length += sizeof(operation);
+	}
+	record->payload_length = length - sizeof(*record);
+	tuple_walk_lengths[index] = length;
+	tuple_walk_validate_record(record);
+}
+
+static void
+tuple_walk_check(bool fallback, int reads)
+{
+	Page page = build_page(InvalidScn);
+	ClusterItlSlotData *slot = ClusterPageGetItlSlots(page);
+	HeapTupleData tuple = { 0 };
+	SnapshotData snapshot = { 0 };
+	ClusterCRTupleOutcome reason = CR_TUPLE_OUTCOME__COUNT;
+	PGAlignedBlock before;
+	bool visible = true;
+
+	set_occupant(page, TEST_TUPLE_OFFSET, CAND_XID, InvalidTransactionId, HEAP_XMAX_INVALID);
+	tuple_at(page, TEST_TUPLE_OFFSET)->t_itl_slot_idx = 0;
+	slot->xid = CAND_XID;
+	slot->flags = ITL_FLAG_ACTIVE;
+	slot->write_scn = 150;
+	slot->undo_segment_head = uba_encode(1, 7, 2, 1);
+	tuple.t_data = tuple_at(page, TEST_TUPLE_OFFSET);
+	tuple.t_len = TEST_TUPLE_LEN;
+	ItemPointerSet(&tuple.t_self, 17, TEST_TUPLE_OFFSET);
+	snapshot.read_scn = 100;
+	tuple_walk_reads = tuple_walk_verdicts = 0;
+	tuple_walk_expected_present = false;
+	cr_tuple_scratch = NULL;
+	memcpy(before.data, page, BLCKSZ);
+	UT_ASSERT_EQ(cluster_cr_tuple_verdict(1, &tuple, &snapshot, &visible, &reason),
+				 fallback ? CLUSTER_CR_NOT_APPLICABLE : CLUSTER_CR_DECIDED);
+	UT_ASSERT_EQ(reason, fallback ? CR_TUPLE_OUTCOME_FALLBACK_UNCERTAIN : CR_TUPLE_OUTCOME_VERDICT);
+	UT_ASSERT_EQ(tuple_walk_reads, reads);
+	UT_ASSERT_EQ(tuple_walk_verdicts, fallback ? 0 : 1);
+	UT_ASSERT_EQ(visible, fallback);
+	UT_ASSERT_EQ(memcmp(before.data, page, BLCKSZ), 0);
+}
+
+UT_TEST(test_tuple_walk_history_precedes_scn_and_block_shortcuts)
+{
+	const uint8 flags[] = { UNDO_REC_FLAG_HAS_ITL_HISTORY,
+							UNDO_REC_FLAG_HAS_ITL_HISTORY | UNDO_REC_FLAG_HAS_OPERATION,
+							UNDO_REC_FLAG_HAS_OPERATION };
+	unsigned i;
+	int scn;
+	int other;
+
+	for (i = 0; i < lengthof(flags); i++)
+		for (scn = 99; scn <= 101; scn++)
+			for (other = 0; other <= 1; other++) {
+				tuple_walk_record(0, flags[i], scn, other);
+				tuple_walk_check(true, 1);
+			}
+}
+
+UT_TEST(test_tuple_walk_history_after_legacy_predecessor)
+{
+	UndoRecordHeader *first;
+
+	tuple_walk_record(0, 0, 120, true);
+	first = (UndoRecordHeader *)tuple_walk_records[0].data;
+	first->prev_uba = uba_encode(1, 7, 2, 0);
+	first->flags &= ~UNDO_REC_FLAG_FIRST_IN_TX;
+	tuple_walk_record(1, UNDO_REC_FLAG_HAS_ITL_HISTORY | UNDO_REC_FLAG_HAS_OPERATION, 99, false);
+	tuple_walk_check(true, 2);
+}
+
+UT_TEST(test_tuple_walk_legacy_scn_stop_keeps_image_verdict)
+{
+	int scn;
+
+	for (scn = 99; scn <= 100; scn++) {
+		tuple_walk_record(0, 0, scn, false);
+		tuple_walk_check(false, 1);
+	}
+	tuple_walk_record(0, 0, 101, true);
+	tuple_walk_check(false, 1);
+}
+
+UT_TEST(test_operation_flag_without_history_requires_full_page)
+{
+	Page page = build_page(InvalidScn);
+	PGAlignedBlock before;
+	ClusterCRTupleOutcome reason = CR_TUPLE_OUTCOME__COUNT;
+
+	set_occupant(page, TEST_TUPLE_OFFSET, CAND_XID, InvalidTransactionId, HEAP_XMAX_INVALID);
+	tuple_walk_record(0, UNDO_REC_FLAG_HAS_OPERATION, 101, false);
+	memcpy(before.data, page, BLCKSZ);
+	UT_ASSERT_EQ(cluster_cr_tuple_apply_record(page, TEST_TUPLE_OFFSET, tuple_walk_records[0].data,
+											   tuple_walk_lengths[0], &reason),
+				 CR_TUPLE_APPLY_FALLBACK);
+	UT_ASSERT_EQ(reason, CR_TUPLE_OUTCOME_FALLBACK_UNCERTAIN);
+	UT_ASSERT_EQ(memcmp(before.data, page, BLCKSZ), 0);
+}
+
+UT_TEST(test_tuple_walk_truncated_operation_cannot_reach_image_verdict)
+{
+	int scn;
+
+	for (scn = 99; scn <= 101; scn += 2) {
+		tuple_walk_record(0, UNDO_REC_FLAG_HAS_ITL_HISTORY | UNDO_REC_FLAG_HAS_OPERATION, scn,
+						  false);
+		tuple_walk_lengths[0] = sizeof(UndoRecordHeader);
+		tuple_walk_check(true, 1);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(22);
 	UT_RUN(test_retained_history_requires_full_page_without_tuple_mutation);
 	UT_RUN(test_elig_ok_own_instance_nchains1);
 	UT_RUN(test_elig_ok_watermark_at_or_before_read_scn);
@@ -561,6 +823,11 @@ main(void)
 	UT_RUN(test_apply_delete_inverse_target_restores);
 	UT_RUN(test_apply_same_txn_multi_update_consecutive_inverse);
 	UT_RUN(test_apply_nontarget_insert_is_noop);
+	UT_RUN(test_tuple_walk_history_precedes_scn_and_block_shortcuts);
+	UT_RUN(test_tuple_walk_history_after_legacy_predecessor);
+	UT_RUN(test_tuple_walk_legacy_scn_stop_keeps_image_verdict);
+	UT_RUN(test_operation_flag_without_history_requires_full_page);
+	UT_RUN(test_tuple_walk_truncated_operation_cannot_reach_image_verdict);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

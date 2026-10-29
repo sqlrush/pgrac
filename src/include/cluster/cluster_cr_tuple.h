@@ -178,6 +178,7 @@ extern ClusterCRTupleApplyResult cluster_cr_tuple_apply_record(char *scratch_pag
  *                               (the walk already ereported the precise SQLSTATE)
  *     CLUSTER_CR_NOT_APPLICABLE could not prove equivalence -> caller falls back
  *                               to the authoritative full-block (INV-T2/T3)
+ *   Explicit history/operation records defer before SCN and block shortcuts.
  *   *out_reason (optional) receives the outcome classification for the counters.
  */
 extern ClusterCrVerdict cluster_cr_tuple_verdict(Buffer buf, HeapTuple htup, Snapshot snapshot,

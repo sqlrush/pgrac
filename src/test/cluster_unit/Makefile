@@ -10738,10 +10738,17 @@ test_cluster_cr_tuple_stat: test_cluster_cr_tuple_stat.c unit_test.h \
 
 # spec-5.54 D7: test_cluster_cr_tuple — D1 static eligibility predicate + D2
 # TargetTupleCrState per-record transitions on a synthetic ITL page.  Links
-# cluster_cr_tuple.o + cluster_cr_apply.o; stubs scn_time_cmp + the walk-driver
-# heavy deps (undo reader / verdict-on-image) the per-record logic does not use.
+# cluster_cr_tuple.o + cluster_cr_apply.o and the extracted production walk.
+# Buffer/storage/allocation/final-verdict boundaries are scripted.
+# Exact production tuple-walk entry; only its backend boundaries are scripted.
+test_cluster_cr_tuple_walk.inc: $(top_srcdir)/src/backend/cluster/cluster_cr.c
+	awk '/^cluster_cr_tuple_verdict\(/ { print "ClusterCrVerdict"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } END { if (n != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 CLUSTER_CR_TUPLE_O = $(top_builddir)/src/backend/cluster/cluster_cr_tuple.o
-test_cluster_cr_tuple: test_cluster_cr_tuple.c unit_test.h \
+test_cluster_cr_tuple: test_cluster_cr_tuple.c unit_test.h test_cluster_cr_tuple_walk.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_uba.c \
 		$(CLUSTER_CR_TUPLE_O) $(CLUSTER_CR_APPLY_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_CR_TUPLE_O) $(CLUSTER_CR_APPLY_O) \
