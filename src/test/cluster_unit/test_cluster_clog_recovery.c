@@ -19,6 +19,8 @@
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
+static int fixture_native_nbuffers = 2048;
+#define NBuffers fixture_native_nbuffers
 static int fixture_unlink(const char *path);
 #define unlink fixture_unlink
 #ifndef CLUSTER_CLOG_SOURCE
@@ -28,6 +30,7 @@ static int fixture_unlink(const char *path);
 #include "../../backend/access/transam/slru.c"
 
 #undef unlink
+#undef NBuffers
 #undef printf
 #undef fprintf
 #undef snprintf
@@ -86,12 +89,15 @@ static struct {
 	bool held;
 } fixture_locks[6000];
 static unsigned fixture_lock_count;
-static void *allocations[300];
+/* Retain the additional native own/foreign initialization until cleanup. */
+static void *allocations[300 + CLOG_RECOVERY_ORIGINS + 2];
 static unsigned allocation_count;
 static void *fixture_shared_mutation;
 static Size fixture_shared_mutation_size;
 static void (*fixture_native_sync_hook)(void);
 static void (*fixture_native_write_hook)(void);
+static bool fixture_native_sync_fallback;
+static unsigned fixture_native_sync_requests;
 
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
@@ -330,6 +336,13 @@ bool
 RegisterSyncRequest(const FileTag *tag pg_attribute_unused(),
 					SyncRequestType type pg_attribute_unused(), bool retry pg_attribute_unused())
 {
+	if (fixture_native_sync_fallback) {
+		UT_ASSERT_EQ(tag->handler, SYNC_HANDLER_CLOG);
+		UT_ASSERT_EQ(type, SYNC_REQUEST);
+		UT_ASSERT(!retry);
+		fixture_native_sync_requests++;
+		return false;
+	}
 	if (!native_fixture)
 		abort();
 	++native_sync_requests;
@@ -1779,6 +1792,7 @@ native_held_base_constructor_error_and_later_refusals_keep_custody_sticky(void)
 #include "test_cluster_clog_full_consumer.inc"
 #include "test_cluster_clog_own_full.inc"
 #include "test_cluster_clog_relmap_physical_mutation.inc"
+#include "test_cluster_clog_relmap_native_init.inc"
 
 int
 main(void)
@@ -1848,7 +1862,13 @@ main(void)
 		UT_RUN(relmap_abrupt_write_error_keeps_original_writer_debt);
 		goto mutation_done;
 	}
-	UT_PLAN(73);
+	if (getenv("PGRAC_RELMAP_OWN_WRITEBACK_ONLY") != NULL) {
+		UT_PLAN(2);
+		UT_RUN(relmap_native_own_checkpoint_revokes_equal_byte_observation);
+		UT_RUN(relmap_native_own_eviction_revokes_without_logical_mutation);
+		goto mutation_done;
+	}
+	UT_PLAN(75);
 	UT_RUN(separate_original_origin_controls);
 	UT_RUN(commit_and_abort_persist_full_tree_without_local_pollution);
 	UT_RUN(conflicting_late_child_refuses_before_any_tree_write);
@@ -1946,6 +1966,8 @@ main(void)
 	UT_RUN(relmap_physical_write_in_progress_refuses_old_and_new_reads);
 	UT_RUN(relmap_returned_write_error_restores_native_state_but_revokes_observation);
 	UT_RUN(relmap_abrupt_write_error_keeps_original_writer_debt);
+	UT_RUN(relmap_native_own_checkpoint_revokes_equal_byte_observation);
+	UT_RUN(relmap_native_own_eviction_revokes_without_logical_mutation);
 mutation_done:
 	fixture_cleanup();
 	UT_DONE();
