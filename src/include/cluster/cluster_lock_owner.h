@@ -72,5 +72,10 @@ extern bool cluster_lock_owner_request_refresh(ClusterLockAcquireRequest *reques
 extern bool cluster_lock_owner_request_usable(const ClusterLockAcquireRequest *request);
 extern ClusterLockAcquireResult
 cluster_lock_owner_request_release(const ClusterLockAcquireRequest *request);
+/* Same stable guard and retirement proof; no synchronous confirmation wait.
+ * The caller retains its local native ref until OK_GRANTED, and must record
+ * that result before consuming the guard. A missing owner is not success. */
+extern ClusterLockAcquireResult
+cluster_lock_owner_request_release_poll(const ClusterLockAcquireRequest *request);
 
 #endif

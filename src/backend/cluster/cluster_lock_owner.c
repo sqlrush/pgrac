@@ -544,6 +544,17 @@ cluster_lock_owner_request_release(const ClusterLockAcquireRequest *request)
 			   : CLUSTER_LOCK_ACQUIRE_PENDING;
 }
 
+ClusterLockAcquireResult
+cluster_lock_owner_request_release_poll(const ClusterLockAcquireRequest *request)
+{
+	ClusterLockOwner *owner = lock_owner_from_guard(request);
+
+	if (owner == NULL)
+		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+	return cluster_lock_owner_release_poll(owner) ? CLUSTER_LOCK_ACQUIRE_OK_GRANTED
+													: CLUSTER_LOCK_ACQUIRE_PENDING;
+}
+
 static ClusterLockAcquireResult lock_owner_install_result(ClusterLockOwner *owner);
 
 static ClusterLockAcquireResult
