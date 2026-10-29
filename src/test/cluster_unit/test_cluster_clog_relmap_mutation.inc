@@ -175,8 +175,8 @@ UT_TEST(relmap_failed_native_mutation_cannot_revalidate_old_bytes)
 		UT_ASSERT(relmap_mutation_open(1, TRANSACTION_STATUS_COMMITTED, &base, &held));
 		if (held == NULL) return;
 		InRecovery = true;
-		/* Native mutation's original caller owns ERROR lock cleanup. */
-		relmap_base_interrupts = false;
+		/* Exercise terminal cleanup with elog's real holdoff reset. */
+		relmap_base_interrupts = true;
 		if (failure == 0) directory_sync_error = EIO;
 		else fail_dirsync = expect_error = true;
 		PG_TRY();
