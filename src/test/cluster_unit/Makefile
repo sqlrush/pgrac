@@ -3593,6 +3593,7 @@ test_cluster_recovery_native_inputs: test_cluster_recovery_consumed_inputs.o tes
 test_cluster_recovery_native_inputs: test_cluster_recovery_episode_local_bounds.inc
 test_cluster_recovery_native_inputs: test_cluster_recovery_episode_resident_birth.inc
 test_cluster_recovery_native_inputs: test_cluster_recovery_episode_initialized_pages.inc
+test_cluster_recovery_native_inputs: test_cluster_recovery_episode_multipage_init.inc
 test_cluster_recovery_native_inputs: test_cluster_recovery_episode_native_bounds.inc
 
 # The original allocator and native CLOG producer lend only test observations.
@@ -10424,10 +10425,12 @@ test_cluster_cold_tx_start: $(top_srcdir)/src/include/cluster/cluster_recovery_c
 
 ifeq ($(enable_pgrac_cluster),yes)
 STARTUP_NATIVE_CTRC_TEST_O = test_cluster_startup_native_ctrc.o
-STARTUP_NATIVE_CTRC_TEST_CPPFLAGS = -DTEST_CLUSTER_STARTUP_NATIVE_CTRC
+STARTUP_NATIVE_FIRST_TEST_O = test_cluster_startup_first_wal.o
+STARTUP_NATIVE_FIRST_SUPPORT_O = test_cluster_page_data_stable.o
+STARTUP_NATIVE_CTRC_TEST_CPPFLAGS = -DTEST_CLUSTER_STARTUP_NATIVE_CTRC -DTEST_CLUSTER_STARTUP_NATIVE_FIRST
 endif
 
-test_cluster_cold_tx_start: test_cluster_cold_tx_start.c test_cluster_cold_tx_owner.inc $(STARTUP_NATIVE_CTRC_TEST_O) \
+test_cluster_cold_tx_start: test_cluster_cold_tx_start.c test_cluster_cold_tx_owner.inc $(STARTUP_NATIVE_CTRC_TEST_O) $(STARTUP_NATIVE_FIRST_TEST_O) $(STARTUP_NATIVE_FIRST_SUPPORT_O) \
 		test_cluster_cold_tx_claim_eor_boundary.inc test_cluster_cold_claim_service.inc \
 		test_cluster_cold_tx_finish_boundary.inc \
 		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h \
@@ -10451,7 +10454,7 @@ test_cluster_cold_tx_start: test_cluster_cold_tx_start.c test_cluster_cold_tx_ow
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(STARTUP_NATIVE_CTRC_TEST_CPPFLAGS) -ffunction-sections -fdata-sections $< \
         $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c \
         $(top_srcdir)/src/backend/cluster/cluster_recovery_ctrc_record.c \
-		$(STARTUP_NATIVE_CTRC_TEST_O) \
+		$(STARTUP_NATIVE_CTRC_TEST_O) $(STARTUP_NATIVE_FIRST_TEST_O) $(STARTUP_NATIVE_FIRST_SUPPORT_O) \
         $(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/common/libpgcommon_srv.a \
         $(CLUSTER_UNIT_PORT_LIBS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
         $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
@@ -10776,3 +10779,19 @@ clean-final-namespace:
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_final_namespace.inc
 
 test_cluster_recovery_native_inputs: test_cluster_recovery_census_namespace.inc
+
+# Original native first-record owner; separate provider namespace, no product variant.
+test_cluster_startup_first_wal.o: test_cluster_startup_first_wal.c \
+		test_cluster_startup_first_wal.h test_cluster_startup_first_wal_namespace.h \
+		test_cluster_page_wal.c unit_test.h test_cluster_page_wal_insert.inc \
+		test_cluster_page_wal_pregrant.inc test_cluster_page_data_scn.inc \
+		test_cluster_page_wal_image.inc test_cluster_pcm_checksum_owner.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_page_wal.c \
+		$(top_srcdir)/src/include/cluster/cluster_page_wal.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
+test_cluster_cold_tx_start: test_cluster_startup_first_wal.h test_cluster_cold_ctrc_native_first.inc
+clean: clean-startup-first-wal
+.PHONY: clean-startup-first-wal
+clean-startup-first-wal:
+	rm -f test_cluster_startup_first_wal.o

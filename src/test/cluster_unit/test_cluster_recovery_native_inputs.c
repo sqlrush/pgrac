@@ -1122,6 +1122,7 @@ cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **held)
 #include "test_cluster_recovery_episode_issued_clog.inc"
 #include "test_cluster_recovery_episode_resident_birth.inc"
 #include "test_cluster_recovery_episode_initialized_pages.inc"
+#include "test_cluster_recovery_episode_multipage_init.inc"
 #include "test_cluster_recovery_episode_page_history.inc"
 #include "test_cluster_recovery_episode_page_sources.inc"
 #include "test_cluster_recovery_consumed_native_redo.inc"
@@ -1144,6 +1145,14 @@ main(int argc, char **argv)
 	UT_RUN(test_census_namespace_complete_set_keeps_original_pages_and_manifest);
 	UT_RUN(test_census_namespace_added_object_revokes_private_census_not_original_pin);
 	UT_RUN(test_census_namespace_preflight_and_entered_source_or_error_keep_pin);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_MULTIPAGE_INIT") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_episode_multipage_init_keeps_both_actual_foreign_births);
+		UT_RUN(test_episode_multipage_init_wrong_foreign_epoch_closes_whole_group);
+		UT_RUN(test_episode_multipage_init_real_eviction_stays_unknown);
+		UT_RUN(test_episode_multipage_init_late_equal_bytes_keep_original_custody);
 		UT_DONE(); return ut_failed_count != 0;
 	}
 	if (getenv("PGRAC_PRE2_TEST_INITIALIZED_PAGES") != NULL) {
@@ -1451,7 +1460,11 @@ main(int argc, char **argv)
 		UT_RUN(test_census_references_bound_metadata_and_tuple_storage_before_publication);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(260);
+	UT_PLAN(264);
+	UT_RUN(test_episode_multipage_init_keeps_both_actual_foreign_births);
+	UT_RUN(test_episode_multipage_init_wrong_foreign_epoch_closes_whole_group);
+	UT_RUN(test_episode_multipage_init_real_eviction_stays_unknown);
+	UT_RUN(test_episode_multipage_init_late_equal_bytes_keep_original_custody);
 	UT_RUN(test_census_namespace_complete_set_keeps_original_pages_and_manifest);
 	UT_RUN(test_census_namespace_added_object_revokes_private_census_not_original_pin);
 	UT_RUN(test_census_namespace_preflight_and_entered_source_or_error_keep_pin);
