@@ -26,4 +26,5 @@ extern void test_episode_native_clog_redo(XLogReaderState *reader);
 /* Fixture outcome through original CLOG storage, not XACT/TT authority. */
 extern void test_episode_native_clog_set_committed(TransactionId xid);
 extern void test_episode_native_clog_write_all(void);
+extern void test_episode_native_clog_local_bounds(bool on, uint64 next, TransactionId oldest);
 #endif

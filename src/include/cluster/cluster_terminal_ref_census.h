@@ -1270,6 +1270,13 @@ extern ClusterCtrcItlCleanoutApplyResult cluster_ctrc_recovery_itl_page_image_v1
  * TT/FullXid generation, HOT/history completeness, discharge or completion.
  * No mutation, allocation, locks or I/O; false preserves all input bytes. */
 extern bool cluster_ctrc_recovery_heap_itl_references_v1(const char *page_image);
+/* The same tuple grammar for complete saved census versions. Eight original
+ * same-page/version ITLs are required; historical ACTIVE/NEEDS_CLEANOUT DATA
+ * slots bind identity only. The caller independently qualifies every slot's
+ * exact canonical terminal, source, generation and history. Packed tuple bytes
+ * may be unaligned. No mutation, I/O, allocation, graph seal or release. */
+extern bool cluster_ctrc_recovery_heap_tuple_itl_references_v1(
+	const ClusterItlSlotData *slots, const char *tuple_bytes, Size tuple_length);
 /* Local HOT/redirect topology only, after complete native tuple/ITL grammar.
  * Uses the actual protected target block: effective HOT successors must be
  * local normal heap-only updates with matching native xmin, one predecessor
@@ -1281,6 +1288,19 @@ extern bool cluster_ctrc_recovery_heap_itl_references_v1(const char *page_image)
  * true does not establish complete G_ref, discharge or completion. */
 extern bool cluster_ctrc_recovery_heap_hot_references_v1(
 	const char *page_image, BlockNumber block_number);
+/* Process-local complete line-pointer view, in native offset order. Tuple
+ * bytes may be packed/unaligned and remain owned by the original census.
+ * The same local HOT rule accepts historical ACTIVE ITLs as identity inputs;
+ * an orphan still needs an actual ABORTED DATA slot, never an inferred loser.
+ * The caller proves complete page/version enumeration and canonical identity.
+ * No synthetic physical page, terminal transition, graph seal or release. */
+typedef struct ClusterCtrcRecoveryHeapItemV1 {
+	ItemIdData item;
+	const char *tuple_bytes;
+	uint16 tuple_length;
+} ClusterCtrcRecoveryHeapItemV1;
+extern bool cluster_ctrc_recovery_heap_hot_items_v1(const ClusterItlSlotData *slots,
+	const ClusterCtrcRecoveryHeapItemV1 *items, Size count, BlockNumber block_number);
 /* Process-local image observations, never receipt or terminal authority. */
 typedef struct ClusterCtrcItlCarrierImageV1 {
 	uint8 mask;

@@ -31,7 +31,7 @@ static union {
 static union {
 	uint64 align;
 	uint8 bytes[offsetof(ClusterRecoveryCensusReferencesV1, entries)
-		+ 2 * sizeof(ClusterRecoveryCensusReferenceV1)];
+		+ 24 * sizeof(ClusterRecoveryCensusReferenceV1)];
 } observation_references_storage[2];
 static unsigned observation_reference_fault, observation_reference_calls;
 

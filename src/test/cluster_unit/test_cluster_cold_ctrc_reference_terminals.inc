@@ -145,6 +145,17 @@ UT_TEST(test_startup_reference_terminals_keep_free_and_tuple_candidates_unqualif
 	references->entries[0].transaction.record = NULL;
 	references->entries[1].entry.kind = CLUSTER_RECOVERY_HEAP_ITEM;
 	references->entries[1].transaction.record = NULL;
+	/* A saved item group now supplies its complete original eight-slot view,
+	 * even when the only item and every slot are unused. */
+	for (unsigned slot = 0; slot < CLUSTER_ITL_INITRANS_DEFAULT; slot++) {
+		ClusterRecoveryCensusReferenceV1 *value = &references->entries[2 + slot];
+
+		memset(value, 0, sizeof(*value));
+		value->page_index = references->entries[1].page_index;
+		value->version = references->entries[1].version;
+		value->entry.kind = CLUSTER_RECOVERY_HEAP_ITL; value->entry.index = slot;
+	}
+	references->count += CLUSTER_ITL_INITRANS_DEFAULT;
 	retirement_run_startup();
 	UT_ASSERT(retirement_service_reached);
 	UT_ASSERT_EQ(window_region.checkpoint_owner.ctrc_accepted_generation, 0);

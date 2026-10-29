@@ -167,3 +167,29 @@ test_episode_native_clog_write_all(void)
 	CheckPointCLOG();
 	episode_clog_unlocked();
 }
+
+/* Test setup restores the original cache fields before this fixture ends. */
+void
+test_episode_native_clog_local_bounds(bool on, uint64 next, TransactionId oldest)
+{
+	static bool saved;
+	static FullTransactionId prior_next;
+	static TransactionId prior_oldest;
+
+	UT_ASSERT(ShmemVariableCache != NULL);
+	if (on && !saved) {
+		prior_next = ShmemVariableCache->nextXid;
+		prior_oldest = ShmemVariableCache->oldestClogXid;
+		saved = true;
+	}
+	UT_ASSERT(saved);
+	LWLockAcquire(XidGenLock, LW_EXCLUSIVE);
+	ShmemVariableCache->nextXid = on ? FullTransactionIdFromU64(next) : prior_next;
+	LWLockRelease(XidGenLock);
+	LWLockAcquire(XactTruncationLock, LW_EXCLUSIVE);
+	ShmemVariableCache->oldestClogXid = on ? oldest : prior_oldest;
+	LWLockRelease(XactTruncationLock);
+	if (!on)
+		saved = false;
+	episode_clog_unlocked();
+}

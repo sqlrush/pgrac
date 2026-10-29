@@ -507,6 +507,18 @@ extern bool cluster_recovery_relmap_history_pending_applied_pages_v1(
 extern bool cluster_recovery_relmap_history_pending_consumed_pages_v1(
 	ClusterRecoveryRelmapHistory *history, const ClusterRelmapV2Image *pending,
 	ClusterRecoveryRelmapPendingNativePagesV1 *out, ClusterRecoveryNativeInventoryDiag *diag);
+/* Opt in to consumed_pages plus OWN query's existing native counter/raw
+ * horizon consistency, in the same reread/held-page reads before publication.
+ * Tail must not exceed actual native next; query must precede it within half
+ * a raw cycle and lie inside the raw oldestClogXid-to-next interval, also
+ * strictly below half a cycle. Missing/foreign query inputs refuse; no local
+ * cache is borrowed for a foreign origin. Other origins remain unqualified
+ * observations. This derives no FullXid floor, era/no-reuse/truncation or
+ * continuous lifetime authority. Old endpoints retain their exact modes;
+ * same whole-output/sticky failure/FD/pins-debt and no COMPLETE/release. */
+extern bool cluster_recovery_relmap_history_pending_local_bounds_pages_v1(
+	ClusterRecoveryRelmapHistory *history, const ClusterRelmapV2Image *pending,
+	ClusterRecoveryRelmapPendingNativePagesV1 *out, ClusterRecoveryNativeInventoryDiag *diag);
 /* Copy an attached snapshot without I/O or rebasing. Original metadata and
  * PAGE-current guards bracket the copy; final physical/native recheck remains
  * mandatory. A bad ordinal/overlap is an ordinary precondition refusal. */
