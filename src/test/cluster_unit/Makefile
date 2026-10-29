@@ -4331,6 +4331,9 @@ test_cluster_side_native_clog.o: test_cluster_side_native_clog.c \
 		test_cluster_clog_relmap_physical_mutation.inc \
 		test_cluster_clog_relmap_native_init.inc \
 		test_cluster_clog_relmap_horizon.inc \
+		test_cluster_clog_native_counter.inc test_cluster_clog_relmap_counter.inc \
+		test_cluster_clog_native_advance_next.inc test_cluster_clog_relmap_native_counter.inc \
+		test_cluster_clog_native_horizon.inc test_cluster_clog_native_truncate.inc \
 		$(top_srcdir)/src/backend/access/transam/clog.c \
 		$(top_srcdir)/src/backend/access/transam/slru.c \
 		$(top_srcdir)/src/include/access/clog.h \
@@ -4810,6 +4813,9 @@ test_cluster_recovery_episode_clog.o: test_cluster_recovery_episode_clog.c \
 		test_cluster_clog_relmap_physical_mutation.inc \
 		test_cluster_clog_relmap_native_init.inc \
 		test_cluster_clog_relmap_horizon.inc \
+		test_cluster_clog_native_counter.inc test_cluster_clog_relmap_counter.inc \
+		test_cluster_clog_native_advance_next.inc test_cluster_clog_relmap_native_counter.inc \
+		test_cluster_clog_native_horizon.inc test_cluster_clog_native_truncate.inc \
         $(top_srcdir)/src/backend/access/transam/clog.c \
         $(top_srcdir)/src/backend/access/transam/slru.c \
         $(top_srcdir)/src/include/access/clog.h \
@@ -6047,8 +6053,26 @@ test_cluster_multixact_recovery test_cluster_multixact_limits_io: %: %.c unit_te
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
 		$< $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
+# The original local truncation horizon body, isolated from other varsup providers.
+# Author: SqlRush <sqlrush@gmail.com>
+test_cluster_clog_native_horizon.inc: $(top_srcdir)/src/backend/access/transam/varsup.c Makefile
+	awk '/^AdvanceOldestClogXid\(/ { print "static void"; emit=1; count++; \
+	         sub(/^AdvanceOldestClogXid/, "fixture_native_advance_oldest_clog_xid") } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 # PGRAC: original-origin CLOG against real disposable native SLRU files.
 # Author: SqlRush <sqlrush@gmail.com>
+# Keep the native recovery counter producer private to the CLOG fixture.
+test_cluster_clog_native_advance_next.inc: $(top_srcdir)/src/backend/access/transam/varsup.c Makefile
+	@awk '/^AdvanceNextFullTransactionIdPastXid\(/ { print "static void"; sub(/^AdvanceNextFullTransactionIdPastXid/, "fixture_native_advance_next_full_xid"); emit = 1; count++ } emit { print } emit && /^}/ { emit = 0 } END { if (count != 1) exit 1 }' $< > $@.tmp
+	@mv $@.tmp $@
+
+# Extract only the original read-only native counter getter for this fixture.
+test_cluster_clog_native_counter.inc: $(top_srcdir)/src/backend/access/transam/varsup.c Makefile
+	@awk '/^ReadNextFullTransactionId\(/ { print "FullTransactionId"; emit = 1; count++ } emit { print } emit && /^}/ { emit = 0 } END { if (count != 1) exit 1 }' $< > $@.tmp
+	@mv $@.tmp $@
+
 test_cluster_clog_recovery: test_cluster_clog_recovery.c unit_test.h \
 		test_cluster_clog_relmap_participant.inc test_cluster_clog_page_birth.inc \
 		test_cluster_clog_relmap_mutation.inc \
@@ -6058,6 +6082,9 @@ test_cluster_clog_recovery: test_cluster_clog_recovery.c unit_test.h \
 		test_cluster_clog_relmap_physical_mutation.inc \
 		test_cluster_clog_relmap_native_init.inc \
 		test_cluster_clog_relmap_horizon.inc \
+		test_cluster_clog_native_counter.inc test_cluster_clog_relmap_counter.inc \
+		test_cluster_clog_native_advance_next.inc test_cluster_clog_relmap_native_counter.inc \
+		test_cluster_clog_native_horizon.inc test_cluster_clog_native_truncate.inc \
 		$(top_srcdir)/src/backend/access/transam/clog.c \
 		$(top_srcdir)/src/include/access/clog.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h \
@@ -6652,6 +6679,9 @@ check_r11_source_removal_census:
 # Standard PG targets
 # ----------
 clean distclean maintainer-clean:
+	rm -f test_cluster_clog_native_counter.inc test_cluster_clog_native_counter.inc.tmp
+	rm -f test_cluster_clog_native_advance_next.inc test_cluster_clog_native_advance_next.inc.tmp
+	rm -f test_cluster_clog_native_horizon.inc test_cluster_clog_native_horizon.inc.tmp
 	rm -f test_cluster_recovery_episode_clog.o test_cluster_recovery_episode_side_owner.o test_cluster_recovery_consumed_inputs.o test_cluster_recovery_scope_native_census_product.o
 	rm -f test_cluster_side_native_clog.o
 	rm -f test_cluster_external_fence_duty.inc
@@ -11604,6 +11634,9 @@ test_cluster_xid_native_clog.o: test_cluster_xid_native_clog.c \
 		test_cluster_clog_relmap_physical_mutation.inc \
 		test_cluster_clog_relmap_native_init.inc \
 		test_cluster_clog_relmap_horizon.inc \
+		test_cluster_clog_native_counter.inc test_cluster_clog_relmap_counter.inc \
+		test_cluster_clog_native_advance_next.inc test_cluster_clog_relmap_native_counter.inc \
+		test_cluster_clog_native_horizon.inc test_cluster_clog_native_truncate.inc \
         $(top_builddir)/src/include/pg_config.h $(top_srcdir)/src/include/access/clog.h \
         $(top_srcdir)/src/backend/access/transam/clog.c \
         $(top_srcdir)/src/backend/access/transam/slru.c
@@ -14107,4 +14140,9 @@ test_cluster_relmap_publish_clog_bridge.o test_cluster_relmap_native_clog.o \
         test_cluster_clog_retention: test_cluster_clog_relmap_physical_mutation.inc \
         test_cluster_clog_relmap_native_init.inc \
         test_cluster_clog_relmap_horizon.inc \
+        test_cluster_clog_native_counter.inc test_cluster_clog_relmap_counter.inc \
+        test_cluster_clog_native_advance_next.inc test_cluster_clog_relmap_native_counter.inc \
+        test_cluster_clog_native_horizon.inc test_cluster_clog_native_truncate.inc \
+        $(top_srcdir)/src/include/access/clog.h \
         $(top_srcdir)/src/include/access/slru.h
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_reference_terminals.inc

@@ -106,3 +106,4 @@
 #define ut_test_count d3_clog_ut_test_count
 #define ShmemVariableCache d3_clog_ShmemVariableCache
 #endif
+#define ReadNextFullTransactionId d3_clog_ReadNextFullTransactionId

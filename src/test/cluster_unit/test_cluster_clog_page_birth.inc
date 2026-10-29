@@ -20,11 +20,17 @@ static struct {
 	bool fail;
 } birth_wal;
 
-/* Only ZERO redo is exercised here. The unrelated native TRUNCATE branch
- * must never mutate a fixture horizon to make these tests pass. */
+#include "test_cluster_clog_native_horizon.inc"
+
+/* TRUNCATE opts into the original lock/advance body. Other fixtures retain
+ * their original unavailable provider and cannot invent a native horizon. */
 void
-AdvanceOldestClogXid(TransactionId oldest pg_attribute_unused())
+AdvanceOldestClogXid(TransactionId oldest)
 {
+	if (fixture_native_truncate) {
+		fixture_native_advance_oldest_clog_xid(oldest);
+		return;
+	}
 	abort();
 }
 
@@ -51,8 +57,15 @@ XLogRecPtr
 XLogInsert(RmgrId rmid, uint8 info)
 {
 	UT_ASSERT_EQ(rmid, RM_CLOG_ID);
-	UT_ASSERT(LWLockHeldByMe(XidGenLock));
-	UT_ASSERT(LWLockHeldByMe(XactSLRULock));
+	if (fixture_native_truncate) {
+		UT_ASSERT_EQ(info, CLOG_TRUNCATE);
+		UT_ASSERT(!LWLockHeldByMe(XidGenLock));
+		UT_ASSERT(!LWLockHeldByMe(XactSLRULock));
+		UT_ASSERT(!LWLockHeldByMe(XactTruncationLock));
+	} else {
+		UT_ASSERT(LWLockHeldByMe(XidGenLock));
+		UT_ASSERT(LWLockHeldByMe(XactSLRULock));
+	}
 	birth_wal.info = info;
 	birth_wal.inserts++;
 	if (birth_wal.fail) elog(ERROR, "full birth insertion fixture");

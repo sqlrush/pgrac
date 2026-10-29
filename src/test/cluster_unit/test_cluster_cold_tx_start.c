@@ -2342,9 +2342,20 @@ static void startup_local_empty_reset(void);
 #include "test_cluster_cold_ctrc_hot_refs.inc"
 
 #include "test_cluster_cold_ctrc_references.inc"
+#include "test_cluster_cold_ctrc_reference_terminals.inc"
 
 int main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_REFERENCE_TERMINALS") != NULL) {
+		UT_PLAN(6);
+		UT_RUN(test_startup_reference_terminals_include_untouched_and_inverse_versions);
+		UT_RUN(test_startup_reference_terminals_reject_full_identity_drift_not_raw_xid_match);
+		UT_RUN(test_startup_reference_terminals_require_original_record_and_physical_page);
+		UT_RUN(test_startup_reference_terminals_repeat_rechecks_last_historical_reference);
+		UT_RUN(test_startup_reference_terminals_do_not_skip_zero_page_wal_graph);
+		UT_RUN(test_startup_reference_terminals_keep_free_and_tuple_candidates_unqualified);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_STARTUP_HOT_REFS") != NULL) {
 		UT_PLAN(4);
 		UT_RUN(test_startup_final_hot_refs_use_each_actual_block_after_page_cleanup);
@@ -2565,7 +2576,13 @@ int main(void)
 		UT_DONE();
 		return ut_failed_count == 0 ? 0 : 1;
 	}
-	UT_PLAN(248);
+	UT_PLAN(254);
+	UT_RUN(test_startup_reference_terminals_include_untouched_and_inverse_versions);
+	UT_RUN(test_startup_reference_terminals_reject_full_identity_drift_not_raw_xid_match);
+	UT_RUN(test_startup_reference_terminals_require_original_record_and_physical_page);
+	UT_RUN(test_startup_reference_terminals_repeat_rechecks_last_historical_reference);
+	UT_RUN(test_startup_reference_terminals_do_not_skip_zero_page_wal_graph);
+	UT_RUN(test_startup_reference_terminals_keep_free_and_tuple_candidates_unqualified);
 	UT_RUN(test_startup_final_hot_refs_use_each_actual_block_after_page_cleanup);
 	UT_RUN(test_startup_final_hot_refs_late_refusal_or_input_drift_prevents_handoff);
 	UT_RUN(test_startup_final_hot_refs_error_retains_original_fds_and_pins);

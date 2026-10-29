@@ -101,6 +101,9 @@ static void (*fixture_native_sync_hook)(void);
 static void (*fixture_native_write_hook)(void);
 static bool fixture_native_sync_fallback;
 static unsigned fixture_native_sync_requests;
+static bool fixture_native_truncate, fixture_native_truncate_flush_error;
+static unsigned fixture_native_truncate_flushes;
+static void (*fixture_native_truncate_flush_hook)(XLogRecPtr);
 
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
@@ -329,8 +332,16 @@ void
 pgstat_count_slru_truncate(int i pg_attribute_unused())
 {}
 void
-XLogFlush(XLogRecPtr lsn pg_attribute_unused())
+XLogFlush(XLogRecPtr lsn)
 {
+	if (fixture_native_truncate) {
+		fixture_native_truncate_flushes++;
+		if (fixture_native_truncate_flush_hook != NULL)
+			fixture_native_truncate_flush_hook(lsn);
+		if (fixture_native_truncate_flush_error)
+			elog(ERROR, "native truncate WAL flush fixture");
+		return;
+	}
 	if (!native_fixture)
 		abort();
 	++native_wal_flushes;
@@ -1797,6 +1808,11 @@ native_held_base_constructor_error_and_later_refusals_keep_custody_sticky(void)
 #include "test_cluster_clog_relmap_physical_mutation.inc"
 #include "test_cluster_clog_relmap_native_init.inc"
 #include "test_cluster_clog_relmap_horizon.inc"
+#include "test_cluster_clog_native_counter.inc"
+#include "test_cluster_clog_relmap_counter.inc"
+#include "test_cluster_clog_native_advance_next.inc"
+#include "test_cluster_clog_relmap_native_counter.inc"
+#include "test_cluster_clog_native_truncate.inc"
 
 int
 main(void)
@@ -1880,7 +1896,41 @@ main(void)
 		UT_RUN(relmap_own_horizon_drift_during_native_read_refuses);
 		goto mutation_done;
 	}
-	UT_PLAN(79);
+	if (getenv("PGRAC_NATIVE_CLOG_TRUNCATE_ONLY") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(native_clog_truncate_advances_before_wal_flush_and_delete);
+		UT_RUN(native_clog_truncate_without_old_segment_preserves_observation);
+		UT_RUN(native_clog_truncate_redo_uses_original_horizon_and_delete);
+		UT_RUN(native_clog_truncate_flush_error_retains_files_and_custody);
+		goto mutation_done;
+	}
+	if (getenv("PGRAC_RELMAP_COUNTER_ONLY") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(relmap_own_actual_next_counter_is_only_an_observation);
+		UT_RUN(relmap_foreign_counter_never_borrows_local_next);
+		UT_RUN(relmap_own_counter_drift_keeps_original_baseline_and_fd);
+		UT_RUN(relmap_counter_change_during_first_or_final_root_refuses);
+		goto mutation_done;
+	}
+	if (getenv("PGRAC_NATIVE_COUNTER_ONLY") != NULL) {
+		UT_PLAN(3);
+		UT_RUN(relmap_native_advance_refuses_old_counter_without_page_mutation);
+		UT_RUN(relmap_native_advance_noop_and_foreign_keep_original_observation);
+		UT_RUN(relmap_native_advance_during_root_keeps_failure_and_custody);
+		goto mutation_done;
+	}
+	UT_PLAN(90);
+	UT_RUN(relmap_native_advance_refuses_old_counter_without_page_mutation);
+	UT_RUN(relmap_native_advance_noop_and_foreign_keep_original_observation);
+	UT_RUN(relmap_native_advance_during_root_keeps_failure_and_custody);
+	UT_RUN(relmap_own_actual_next_counter_is_only_an_observation);
+	UT_RUN(relmap_foreign_counter_never_borrows_local_next);
+	UT_RUN(relmap_own_counter_drift_keeps_original_baseline_and_fd);
+	UT_RUN(relmap_counter_change_during_first_or_final_root_refuses);
+	UT_RUN(native_clog_truncate_advances_before_wal_flush_and_delete);
+	UT_RUN(native_clog_truncate_without_old_segment_preserves_observation);
+	UT_RUN(native_clog_truncate_redo_uses_original_horizon_and_delete);
+	UT_RUN(native_clog_truncate_flush_error_retains_files_and_custody);
 	UT_RUN(separate_original_origin_controls);
 	UT_RUN(commit_and_abort_persist_full_tree_without_local_pollution);
 	UT_RUN(conflicting_late_child_refuses_before_any_tree_write);
