@@ -2919,6 +2919,13 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_done_exact(
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_done_resume_exact(
 	const ResourceXBootstrapWork *work);
 
+/* Read-only source-receipt join for the original, revalidated master work.
+ * APPLIED proves matching A, original holder ACK and completed FORWARD sends;
+ * it does not settle the source carrier, grant directory state, or authorize
+ * a consumed notification. Output is unchanged on every other result. */
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_source_done_snapshot_exact(
+	const ResourceXBootstrapWork *work, ResourceXDecodedFrame *notice_out);
+
 #endif /* USE_PGRAC_CLUSTER */
 
 #endif /* CLUSTER_PCM_LOCK_H */

@@ -15388,12 +15388,13 @@ gcs_block_resource_x_acquire_done_ingress(const ClusterICEnvelope *env,
 
 	if (env == NULL || frame == NULL || !frame->has_acquire_decision
 		|| frame->kind != RESOURCE_X_WIRE_INSTALL_SETTLEMENT
-		|| frame->payload_bytes != RESOURCE_X_COMPLETE_V5_BYTES
+		|| (frame->payload_bytes != RESOURCE_X_COMPLETE_V5_BYTES
+			&& frame->payload_bytes != RESOURCE_X_SOURCE_COMPLETE_V11_BYTES)
 		|| (frame->common.outcome != RESOURCE_X_OUTCOME_OK
 			&& frame->common.outcome != RESOURCE_X_OUTCOME_QUIET
 			&& frame->common.outcome != RESOURCE_X_OUTCOME_QUIET_NO_IMAGE)
 		|| env->msg_type != RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE
-		|| env->payload_length != RESOURCE_X_COMPLETE_V5_BYTES
+		|| env->payload_length != frame->payload_bytes
 		|| env->source_node_id != (uint32)frame->common.logical_assertion.requester_node
 		|| env->dest_node_id != (uint32)cluster_node_id
 		|| env->epoch != frame->body.acquire_completion.decision.episode.cluster_epoch)

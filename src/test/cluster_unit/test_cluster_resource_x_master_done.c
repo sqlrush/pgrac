@@ -459,10 +459,30 @@ UT_TEST(test_master_done_history_requires_monotonic_floor_and_authority)
 	}
 }
 
+UT_TEST(test_master_done_extended_receipt_tail_cannot_hide_other_responsibility)
+{
+	for (int consumed = 0; consumed < 2; consumed++) {
+		PublishFixture f; ResourceXDecodedFrame done;
+		ResourceXIntentSlot out; uint8 payload[RESOURCE_X_DECISION_V4_BYTES];
+		if (!master_done_start(&f, &done)) return;
+		if (consumed) master_done_send(&f);
+		UT_ASSERT_EQ(master_done_receive(&done), RESOURCE_X_APPLY_APPLIED);
+		f.state->deferred_settlement.payload[sizeof(f.state->deferred_settlement.payload) - 1] = 1;
+		ClusterPcmResourceXMasterState before = *f.state;
+		if (consumed)
+			UT_ASSERT(cluster_pcm_lock_resource_x_outbound_intent_snapshot_exact(
+				&f.state->grant_intent.slot, &out, payload, sizeof(payload)) != RESOURCE_X_APPLY_APPLIED);
+		else
+			UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_done_resume_exact(&f.work),
+				RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+		UT_ASSERT(memcmp(&before, f.state, sizeof(before)) == 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(26);
+	UT_PLAN(27);
 	UT_RUN(test_master_done_consumes_exact_c_after_real_grant_callback);
 	UT_RUN(test_master_done_duplicate_keeps_generation_and_current_provenance);
 	UT_RUN(test_master_done_before_callback_retained_and_drained_by_original_tick);
@@ -489,6 +509,7 @@ main(void)
 	UT_RUN(test_master_done_unsealed_publish_cannot_erase_unproven_receipt);
 	UT_RUN(test_master_done_decoded_discriminators_cannot_alias_another_body);
 	UT_RUN(test_master_done_history_requires_monotonic_floor_and_authority);
+	UT_RUN(test_master_done_extended_receipt_tail_cannot_hide_other_responsibility);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }
