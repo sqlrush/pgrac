@@ -5233,6 +5233,7 @@ check_r11_source_removal_census:
 # Standard PG targets
 # ----------
 clean distclean maintainer-clean:
+	rm -f test_cluster_cold_history_scn.inc test_cluster_cold_history_scn.inc.tmp
 	rm -f test_cluster_clog_native_counter.inc test_cluster_clog_native_counter.inc.tmp
 	rm -f test_cluster_clog_native_advance_next.inc test_cluster_clog_native_advance_next.inc.tmp
 	rm -f test_cluster_clog_native_horizon.inc test_cluster_clog_native_horizon.inc.tmp
@@ -10367,6 +10368,17 @@ test_cluster_cold_tx_owner.inc: $(top_srcdir)/src/backend/access/transam/xlogrec
 	     /^static bool cluster_backup_recovery_have_manifest/ { emit=0; done++ } \
 	     emit { print } END { if (count != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
+
+test_cluster_cold_history_scn.inc: $(top_srcdir)/src/backend/cluster/cluster_scn.c Makefile
+	awk '/^scn_time_cmp\(SCN a, SCN b\)$$/ { emit=1; print "int"; count++ } \
+	     emit { print } emit && /^}$$/ { emit=0; done++ } \
+	     END { if (count != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_cold_tx_start: test_cluster_cold_history_scn.inc test_cluster_cold_ctrc_history_horizon.inc \
+	$(top_srcdir)/src/backend/cluster/cluster_undo_horizon.c \
+	$(top_srcdir)/src/include/cluster/cluster_undo_horizon.h \
+	$(top_srcdir)/src/include/cluster/cluster_undo_retention.h $(top_srcdir)/src/include/cluster/cluster_cr.h
 
 test_cluster_cold_tx_writer.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
 	awk '/^ClusterStartupInstalled(Recovery)?WriterV1\(/ { print "bool"; emit=1; count++ } \

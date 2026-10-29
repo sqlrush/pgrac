@@ -19,6 +19,9 @@
 #include "cluster/cluster_recovery_census.h"
 #include "cluster/cluster_undo_recovery.h"
 #include "cluster/cluster_undo_smgr.h"
+#include "cluster/cluster_undo_horizon.h"
+#include "cluster/cluster_undo_retention.h"
+#include "cluster/cluster_cr.h"
 #include "cluster/cluster_recovery_undo_scan.h"
 #include "cluster/storage/cluster_undo_block0.h"
 #include "cluster/storage/cluster_undo_xlog.h"
@@ -208,6 +211,54 @@ static bool ctrc_driver_waiting, ctrc_driver_false_authorization, ctrc_driver_er
 static ClusterControlRootResult ctrc_driver_result;
 static void (*ctrc_driver_acquire_step)(void), (*ctrc_driver_authorize_step)(void);
 static void (*ctrc_driver_wait_step)(void);
+/* Real original floor fold; only report transport/local ProcArray sampling
+ * and scheduling are leaves. No horizon or completion producer is replaced. */
+bool cluster_undo_retention_horizon_enabled = true;
+int cluster_lmon_main_loop_interval = 1000;
+static SCN history_local_floor = 1000000;
+static ClusterUndoHorizonReportView history_views[CLUSTER_MAX_NODES];
+static uint8 history_required[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+static bool history_members_ok = true, history_fence, history_disabled;
+static bool history_probe, history_expect_wait;
+static int history_view_count = CLUSTER_MAX_NODES;
+static uint64 history_epoch = 4;
+static unsigned history_samples;
+static void (*history_sample_step)(void);
+
+SCN cluster_undo_retention_horizon(void) { return history_local_floor; }
+bool cluster_cr_native_prehistory_disabled(void) { return history_disabled; }
+TimestampTz GetCurrentTimestamp(void) { return INT64CONST(10000000); }
+bool cluster_undo_horizon_epoch_fence_tripped(uint64 epoch)
+{
+	UT_ASSERT_EQ(epoch, history_epoch); return history_fence;
+}
+bool cluster_undo_horizon_required_members(uint8 *required, uint64 *epoch)
+{
+	memcpy(required, history_required, sizeof(history_required)); *epoch = history_epoch;
+	return history_members_ok;
+}
+int cluster_undo_horizon_sample_views(ClusterUndoHorizonReportView *views, int capacity)
+{
+	UT_ASSERT_EQ(capacity, CLUSTER_MAX_NODES);
+	if (history_probe) {
+		history_samples++;
+		UT_ASSERT_EQ(ctrc_driver_lwlocks, 0);
+		UT_ASSERT(observation_scope_live && observation_cursor_live);
+		if (history_sample_step != NULL) history_sample_step();
+	}
+	memcpy(views, history_views, sizeof(history_views)); return history_view_count;
+}
+static void
+history_fixture_reset(void)
+{
+	cluster_undo_retention_horizon_enabled = true; history_local_floor = 1000000;
+	memset(history_views, 0, sizeof(history_views)); memset(history_required, 0, sizeof(history_required));
+	history_members_ok = true; history_fence = history_disabled = false;
+	history_probe = history_expect_wait = false; history_view_count = CLUSTER_MAX_NODES;
+	history_epoch = 4; history_samples = 0; history_sample_step = NULL;
+}
+#include "test_cluster_cold_history_scn.inc"
+#include "../../backend/cluster/cluster_undo_horizon.c"
 static const struct ClusterRecoveryStartV1 *destroy_probe;
 static ClusterRecoveryPlanShmem window_region;
 static bool found_window_region;
@@ -627,6 +678,7 @@ bool cluster_undo_smgr_recovery_abort_write_v1(ClusterUndoSmgrRecoveryStampV1 st
 
 static void reset(void)
 {
+	history_fixture_reset();
 	memset(&startup_first_floor, 0, sizeof(startup_first_floor));
 	startup_first_calls = 0; startup_first_available = true; startup_first_step = NULL;
 	ctrc_driver_acquires = ctrc_driver_authorizations = ctrc_driver_waits = 0;
@@ -1826,7 +1878,8 @@ WaitLatch(Latch *latch, int events, long timeout, uint32 wait_event_info)
 	UT_ASSERT(latch == MyLatch);
 	UT_ASSERT_EQ(events, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH);
 	UT_ASSERT_EQ(timeout, 100);
-	if (ctrc_driver_waiting) {
+	if (ctrc_driver_waiting || (history_probe && history_expect_wait
+		&& wait_event_info == WAIT_EVENT_CLUSTER_THREAD_RECOVERY)) {
 		UT_ASSERT_EQ(wait_event_info, WAIT_EVENT_CLUSTER_THREAD_RECOVERY);
 		UT_ASSERT(observation_cursor_live && observation_scope_live);
 		UT_ASSERT_EQ(ctrc_driver_lwlocks, 0);
@@ -2405,9 +2458,19 @@ static void startup_local_empty_reset(void);
 #include "test_cluster_cold_ctrc_effects_receipt.inc"
 #include "test_cluster_cold_ctrc_effects_lifetime.inc"
 #include "test_cluster_cold_ctrc_final_tx_recheck.inc"
+#include "test_cluster_cold_ctrc_history_horizon.inc"
 
 int main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_START_HISTORY_HORIZON") != NULL) {
+		UT_PLAN(5);
+		UT_RUN(test_startup_history_uses_original_finite_cohort_floor);
+		UT_RUN(test_startup_history_missing_equal_stale_reports_wait_without_rebase);
+		UT_RUN(test_startup_history_wait_repeats_physical_checks_and_keeps_debt);
+		UT_RUN(test_startup_history_sampling_error_and_late_terminal_refuse);
+		UT_RUN(test_startup_history_requalifies_after_independent_service);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_START_FINAL_TX_RECHECK") != NULL) {
 		UT_PLAN(3);
 		UT_RUN(test_startup_final_tx_rechecks_complete_forest_before_and_after_service);
@@ -2821,9 +2884,9 @@ int main(void)
 	}
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_FIRST
-	UT_PLAN(344);
+	UT_PLAN(349);
 #else
-	UT_PLAN(340);
+	UT_PLAN(345);
 #endif
 	UT_RUN(test_startup_native_images_accept_only_unchanged_complete_terminal_page);
 	UT_RUN(test_startup_native_images_reject_unresolved_ambiguous_and_mx_itls);
@@ -2834,8 +2897,13 @@ int main(void)
 	UT_RUN(test_startup_native_directory_real_origin_cannot_be_discharged_by_wait);
 	UT_RUN(test_startup_native_directory_invalid_layout_and_partial_error_keep_debt);
 #else
-	UT_PLAN(332);
+	UT_PLAN(337);
 #endif
+	UT_RUN(test_startup_history_uses_original_finite_cohort_floor);
+	UT_RUN(test_startup_history_missing_equal_stale_reports_wait_without_rebase);
+	UT_RUN(test_startup_history_wait_repeats_physical_checks_and_keeps_debt);
+	UT_RUN(test_startup_history_sampling_error_and_late_terminal_refuse);
+	UT_RUN(test_startup_history_requalifies_after_independent_service);
 	UT_RUN(test_startup_final_tx_rechecks_complete_forest_before_and_after_service);
 	UT_RUN(test_startup_final_tx_late_record_error_owner_and_end_retain_original_debt);
 	UT_RUN(test_startup_final_tx_drift_during_service_cannot_retire_inputs);

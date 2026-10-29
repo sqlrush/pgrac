@@ -209,6 +209,9 @@
 #include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_page_install_ctrc.h"
 #include "cluster/cluster_page_wal.h"
+#include "cluster/cluster_cr.h"
+#include "cluster/cluster_undo_horizon.h"
+#include "cluster/cluster_undo_retention.h"
 #include "cluster/storage/cluster_shared_fs_page.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_wal_writer.h"
@@ -2875,6 +2878,89 @@ cluster_recovery_cold_page_completed_recheck(const struct ClusterRecoveryStartV1
 	return ready;
 }
 
+/* The immutable original work and physical observations remain the terminal
+ * factory's inputs. Only unreleased COMMITTED history needs the finite H
+ * below; a terminal stamp or an empty volatile directory cannot supply it. */
+static bool
+cluster_recovery_cold_page_history_scn(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, ClusterWalInputsV1 *scope,
+	ClusterColdCtrcPageProgressV1 *progress, SCN *maximum)
+{
+	const ClusterColdCtrcPhysicalV1 *physical;
+	SCN latest = InvalidScn;
+
+	if (!cluster_recovery_cold_page_advance_current(start, work, scope, progress)) return false;
+	physical = start->ctrc_physical;
+	if (physical == NULL || physical->count != work->counts.subject_count) return false;
+	for (uint32 i = 0; i < work->counts.subject_count; i++) {
+		ClusterRecoveryUndoEntry observed = physical->entries[i];
+		ClusterColdTtSlotInputV1 terminal;
+
+		if (!cluster_recovery_ctrc_terminal_subject_v1(start, work, i, &observed, &terminal)
+			|| !cluster_recovery_cold_page_advance_current(start, work, scope, progress)
+			|| start->ctrc_physical != physical
+			|| memcmp(&observed, &physical->entries[i], sizeof(observed)) != 0) return false;
+		if ((terminal.slot.flags & TT_SLOT_FLAG_CTRC_RELEASE_PROVEN) != 0) continue;
+		if (terminal.slot.status == TT_SLOT_ABORTED && !SCN_VALID(terminal.slot.commit_scn)) continue;
+		if (terminal.slot.status != TT_SLOT_COMMITTED || !SCN_VALID(terminal.slot.commit_scn)
+			|| terminal.slot.commit_scn == CLUSTER_UNDO_HORIZON_REPORT_UNCONSTRAINED) return false;
+		if (!SCN_VALID(latest) || scn_time_cmp(terminal.slot.commit_scn, latest) > 0)
+			latest = terminal.slot.commit_scn;
+	}
+	if (!cluster_recovery_cold_page_advance_current(start, work, scope, progress)) return false;
+	*maximum = latest;
+	return true;
+}
+
+/* Original cleaner-side H sampling/fold, inside the same Start/source and
+ * canonical-terminal bracket. Missing/stale/equal/infinite reports are WAIT,
+ * never a terminal failure or local-only fallback. No supplied floor, saved
+ * infinity or new release proof. Caller repeats ALL physical checks on WAIT. */
+static bool
+cluster_recovery_cold_page_history_ready(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, ClusterWalInputsV1 *scope,
+	ClusterColdCtrcPageProgressV1 *progress, bool *ready)
+{
+	ClusterUndoHorizonReportView views[CLUSTER_MAX_NODES];
+	ClusterUndoHorizonFloor floor;
+	ClusterUndoHorizonStallReason reason;
+	ClusterRecoveryTxResultObservationV1 accepted, confirmed;
+	uint8 required[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	SCN maximum, after, local_floor;
+	uint64 epoch;
+	int32 blame;
+	int nviews;
+	bool observed = false;
+
+	*ready = false;
+	if (!cluster_recovery_cold_page_advance_current(start, work, scope, progress)
+		|| !cluster_recovery_ctrc_terminal_result_v1(start, work, &accepted)
+		|| !cluster_recovery_cold_page_history_scn(start, work, scope, progress, &maximum)) return false;
+	if (!SCN_VALID(maximum)) observed = true;
+	else if (cluster_undo_retention_horizon_enabled && !cluster_cr_native_prehistory_disabled()) {
+		local_floor = cluster_undo_retention_horizon();
+		nviews = cluster_undo_horizon_sample_views(views, CLUSTER_MAX_NODES);
+		if (nviews == CLUSTER_MAX_NODES
+			&& cluster_undo_horizon_required_members(required, &epoch) && epoch == start->writer.epoch
+			&& cluster_undo_horizon_cluster_floor(local_floor, views, nviews, required,
+				cluster_node_id, epoch, (uint64)GetCurrentTimestamp(),
+				(uint32)cluster_lmon_main_loop_interval, &floor, &reason, &blame)
+				== CLUSTER_UNDO_HORIZON_FOLD_OK
+			&& floor.epoch == epoch && SCN_VALID(floor.scn)
+			&& floor.scn != CLUSTER_UNDO_HORIZON_REPORT_UNCONSTRAINED
+			&& scn_time_cmp(maximum, floor.scn) < 0
+			&& !cluster_undo_horizon_epoch_fence_tripped(epoch)
+			&& cluster_undo_retention_horizon_enabled && !cluster_cr_native_prehistory_disabled())
+			observed = true;
+	}
+	if (!cluster_recovery_cold_page_history_scn(start, work, scope, progress, &after)
+		|| maximum != after || !cluster_recovery_ctrc_terminal_result_v1(start, work, &confirmed)
+		|| memcmp(&accepted, &confirmed, sizeof(accepted)) != 0
+		|| !cluster_recovery_cold_page_advance_current(start, work, scope, progress)) return false;
+	*ready = observed;
+	return true;
+}
+
 /* Finish each exact bufferless FPI operation through the original protected
  * readback/current/local-debt path. Keep its full value and same raw FD for
  * the remaining fixed graph and independent joint service, not a new owner. */
@@ -2940,6 +3026,7 @@ cluster_recovery_cold_page_drain(const struct ClusterRecoveryStartV1 *start,
 			ClusterWalInputsV1 *scope;
 			ClusterColdCtrcPageProgressV1 *progress;
 			ClusterCtrcLocalEmptyV1 empty;
+			bool history_ready = false;
 
 			if (start != cluster_recovery_cold_start) { ready = false; break; }
 			work = state->ctrc_observation_work;
@@ -2956,11 +3043,15 @@ cluster_recovery_cold_page_drain(const struct ClusterRecoveryStartV1 *start,
 				&& (progress == NULL
 					? rf_page_online_plan_target_count_v1(start->ctrc_page_plan) == 0
 					: !progress->pending && progress->next_target == progress->target_count);
-			if (!ready || empty == CLUSTER_CTRC_LOCAL_EMPTY) break;
-			if (empty != CLUSTER_CTRC_LOCAL_WAIT) { ready = false; break; }
+			if (!ready) break;
+			if (empty == CLUSTER_CTRC_LOCAL_EMPTY) {
+				ready = cluster_recovery_cold_page_history_ready(start, work, scope, progress,
+					&history_ready);
+				if (!ready || history_ready) break;
+			} else if (empty != CLUSTER_CTRC_LOCAL_WAIT) { ready = false; break; }
 			/* No partial directory locks survive the native probe. Keep
 			 * the same FDs/IR/WALR and redo the entire original readback
-			 * after each local wait; elapsed time is not a refusal. */
+			 * after each directory/H wait; elapsed time is not a refusal. */
 			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
 				100L, WAIT_EVENT_CLUSTER_THREAD_RECOVERY);
 			HandleStartupProcInterrupts();
