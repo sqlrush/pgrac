@@ -1119,6 +1119,7 @@ cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **held)
 #include "test_cluster_recovery_episode_applied_owner.inc"
 #include "test_cluster_recovery_episode_consumed_pages.inc"
 #include "test_cluster_recovery_episode_local_bounds.inc"
+#include "test_cluster_recovery_episode_native_bounds.inc"
 #include "test_cluster_recovery_episode_page_history.inc"
 #include "test_cluster_recovery_episode_page_sources.inc"
 #include "test_cluster_recovery_consumed_native_redo.inc"
@@ -1150,6 +1151,13 @@ main(int argc, char **argv)
 	UT_RUN(test_scope_native_census_refuses_uncovered_and_missing_real_history_windows);
 	UT_DONE(); return ut_failed_count != 0;
 #endif
+	if (getenv("PGRAC_PRE2_TEST_NATIVE_LOCAL_BOUNDS") != NULL) {
+		UT_PLAN(3);
+		UT_RUN(test_episode_native_bounds_advance_before_observation);
+		UT_RUN(test_episode_native_bounds_counter_drift_keeps_custody);
+		UT_RUN(test_episode_native_bounds_horizon_equality_and_crossing);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_SCOPE_CENSUS") != NULL) {
 		UT_PLAN(4);
 		scope_census_run();
@@ -1421,8 +1429,11 @@ main(int argc, char **argv)
 		UT_RUN(test_census_references_bound_metadata_and_tuple_storage_before_publication);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(249);
+	UT_PLAN(252);
 	scope_census_run();
+	UT_RUN(test_episode_native_bounds_advance_before_observation);
+	UT_RUN(test_episode_native_bounds_counter_drift_keeps_custody);
+	UT_RUN(test_episode_native_bounds_horizon_equality_and_crossing);
 	UT_RUN(test_episode_local_bounds_keeps_original_reads_and_foreign_unknown);
 	UT_RUN(test_episode_local_bounds_refuses_counter_tail_and_halfcycle);
 	UT_RUN(test_episode_local_bounds_refuses_raw_horizon_without_rebasing);
