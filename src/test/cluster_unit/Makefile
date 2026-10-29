@@ -11506,7 +11506,7 @@ test_cluster_xid_retention_xact_functions.inc: $(top_srcdir)/src/backend/access/
 	     emit { print } /^}/ { emit=0 } END { if (functions != 5) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_xid_retention: test_cluster_xid_retention.c test_cluster_xid_allocation.c \
+XID_RETENTION_TEST_INPUTS = test_cluster_xid_retention.c test_cluster_xid_allocation.c \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h \
 		$(top_srcdir)/src/include/access/transam.h \
 		test_cluster_pgproc_active_types.inc \
@@ -11535,6 +11535,7 @@ test_cluster_xid_retention: test_cluster_xid_retention.c test_cluster_xid_alloca
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h \
 		test_cluster_xid_full_clog.inc \
 		$(top_srcdir)/src/include/access/clog.h
+test_cluster_xid_retention: $(XID_RETENTION_TEST_INPUTS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_XID_STRIPE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # Current C allocator families retain their original generated/header inputs.
@@ -11585,10 +11586,23 @@ test_cluster_xid_native_clog: test_cluster_xid_native_clog_main.o \
 		test_cluster_xid_native_clog.o $(CLUSTER_XID_STRIPE_O) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
+TESTS += test_cluster_xid_retention_native_clog
+all: test_cluster_xid_retention_native_clog
+test_cluster_xid_retention_native_clog_main.o: $(XID_RETENTION_TEST_INPUTS) \
+		test_cluster_xid_retention_native_clog.inc test_cluster_xid_native_clog.h Makefile
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DTEST_CLUSTER_XID_RETENTION_NATIVE_CLOG -c $< -o $@
+
+test_cluster_xid_retention_native_clog: test_cluster_xid_retention_native_clog_main.o \
+		test_cluster_xid_native_clog.o $(CLUSTER_XID_STRIPE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) test_cluster_xid_retention_native_clog_main.o \
+		test_cluster_xid_native_clog.o $(CLUSTER_XID_STRIPE_O) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+
 clean: clean-xid-native-clog
 .PHONY: clean-xid-native-clog
 clean-xid-native-clog:
-	rm -f test_cluster_xid_native_clog_main.o test_cluster_xid_native_clog.o
+	rm -f test_cluster_xid_native_clog_main.o test_cluster_xid_native_clog.o \
+		test_cluster_xid_retention_native_clog_main.o
 
 # Exercise the original recovery -> seed -> claim -> WAL gate. Dependency
 # boundaries are controlled by the test; the admission predicates are not.

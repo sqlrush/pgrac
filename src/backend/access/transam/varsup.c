@@ -630,7 +630,8 @@ GetNewTransactionIdFullCLOG(bool isSubXact)
 
 #ifdef USE_PGRAC_CLUSTER
 /* Dormant original allocator, with qualification supplied by its original
- * owner. Numeric identity is only routing, not a new authority certificate. */
+ * owner. Native FULL CLOG initialization belongs to this local origin;
+ * numeric identity is only routing, not a new authority certificate. */
 FullTransactionId
 cluster_relmap_retention_allocate_xid_v2(bool isSubXact, uint64 system_identifier,
 	uint64 database_incarnation, uint16 origin)
@@ -638,14 +639,15 @@ cluster_relmap_retention_allocate_xid_v2(bool isSubXact, uint64 system_identifie
 	RelmapXidAllocationV2 allocation = { 0 };
 
 	if (!cluster_enabled || !cluster_shared_config || !IsNormalProcessingMode()
-		|| system_identifier == 0 || database_incarnation == 0 || origin >= CLUSTER_MAX_NODES)
+		|| system_identifier == 0 || database_incarnation == 0 || origin >= CLUSTER_MAX_NODES
+		|| cluster_node_id < 0 || origin != cluster_node_id)
 		ereport(ERROR,
 			(errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
 			 errmsg("refusing to assign a new transaction ID: relmap allocator context is not qualified")));
 	allocation.system_identifier = system_identifier;
 	allocation.database_incarnation = database_incarnation;
 	allocation.origin = origin;
-	return get_new_transaction_id(isSubXact, &allocation, false);
+	return get_new_transaction_id(isSubXact, &allocation, true);
 }
 
 /* Original Startup has finished every native/SIDE fold, still excludes new
