@@ -1704,10 +1704,9 @@ failed:
 	return result;
 }
 
-ClusterWalPinResult
-cluster_wal_retention_root_publish_begin_exact(const ClusterControlRootReadToken *expected_root,
-											   bool require_sealed_pin,
-											   ClusterWalRootPublishGuard **out_guard)
+static ClusterWalPinResult
+root_publish_begin_exact(const ClusterControlRootReadToken *expected_root, bool require_sealed_pin,
+						 ClusterWalRootPublishGuard **out_guard, uint64 deadline_ns)
 {
 	ClusterWalRootPublishGuard *guard;
 	uint16 thread_id;
@@ -1817,7 +1816,8 @@ cluster_wal_retention_root_publish_begin_exact(const ClusterControlRootReadToken
 			pfree(guard);
 			return CLUSTER_WAL_PIN_UNAVAILABLE;
 		}
-		result = walr_request_acquire_actual(&guard->walr.request);
+		result = deadline_ns != 0 ? walr_request_acquire(&guard->walr.request, deadline_ns)
+								  : walr_request_acquire_actual(&guard->walr.request);
 		if (result != CLUSTER_LOCK_ACQUIRE_OK_GRANTED) {
 			pfree(guard);
 			return CLUSTER_WAL_PIN_UNAVAILABLE;
@@ -1827,6 +1827,27 @@ cluster_wal_retention_root_publish_begin_exact(const ClusterControlRootReadToken
 	active_root_publish_guard = guard;
 	*out_guard = guard;
 	return CLUSTER_WAL_PIN_OK;
+}
+
+ClusterWalPinResult
+cluster_wal_retention_root_publish_begin_exact(const ClusterControlRootReadToken *expected_root,
+											   bool require_sealed_pin,
+											   ClusterWalRootPublishGuard **out_guard)
+{
+	return root_publish_begin_exact(expected_root, require_sealed_pin, out_guard, 0);
+}
+
+ClusterWalPinResult
+cluster_wal_retention_root_publish_begin_deadline_v1(
+	const ClusterControlRootReadToken *expected_root, ClusterWalRootPublishGuard **out_guard,
+	uint64 deadline_ns)
+{
+	/* The pre-IR cold sealer takes a fresh ordinary WALR owner. Borrowing a
+	 * pin or converting a sealed recovery owner belongs to other callers. */
+	if (!cluster_shared_config || MyBackendType != B_STARTUP || !AmStartupProcess()
+		|| active_pin != NULL || active_read_pin != NULL)
+		return CLUSTER_WAL_PIN_INVALID;
+	return root_publish_begin_exact(expected_root, false, out_guard, deadline_ns);
 }
 
 /* PGRAC: one ResourceOwner entry holds the complete original input cut, not

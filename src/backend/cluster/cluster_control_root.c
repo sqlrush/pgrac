@@ -56,6 +56,7 @@
 #include "common/sha2.h"
 #include "miscadmin.h"
 #include "port/pg_crc32c.h"
+#include "portability/instr_time.h"
 #include "postmaster/interrupt.h"
 #include "postmaster/startup.h"
 #include "storage/lwlock.h"
@@ -9143,7 +9144,25 @@ typedef struct FailureInputV2Work {
 	ClusterWalSourceRef self_restart;
 	FailureSelfCfWait self_cf_wait;
 	FailureInputCfWait input_cf_wait;
+	/* Process-local cold caller parameters; never a request/ROOT identity. */
+	bool caller_owns_cf_retry;
+	uint64 deadline_ns;
 } FailureInputV2Work;
+
+static bool
+failure_input_deadline_current(const FailureInputV2Work *work)
+{
+	struct timespec now;
+	uint64 ns;
+
+	if (!work->caller_owns_cf_retry || work->deadline_ns == 0)
+		return true;
+	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0 || now.tv_nsec < 0
+		|| now.tv_nsec >= NS_PER_S || (uint64)now.tv_sec > (UINT64_MAX - NS_PER_S) / NS_PER_S)
+		return false;
+	ns = (uint64)now.tv_sec * NS_PER_S + (uint64)now.tv_nsec;
+	return ns < work->deadline_ns;
+}
 
 /*
  * PGRAC (S9P2-05, PU-D-5): after every instance failed, the founder seals
@@ -9198,6 +9217,8 @@ failure_v2_authorized(const ClusterRecoverySerialRequest *request, const Failure
 	uint32 count;
 	bool original_owner = false;
 
+	if (!failure_input_deadline_current(work))
+		return false;
 	if (work->self)
 		return self_predecessor_authorized(request, work);
 	if (cluster_node_id != work->publisher_node
@@ -9249,7 +9270,8 @@ failure_v2_cleanup(FailureInputV2Work *work, ClusterControlRootResult result)
 	if (result == CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN)
 		ereport(
 			FATAL,
-			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+			(errcode(work->caller_owns_cf_retry ? ERRCODE_CLUSTER_RECOVERY_OWNER_CONFLICT
+												: ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 			 errmsg("failed-thread input publisher could not confirm lock release"),
 			 errhint("Keep the failed thread closed until recovery ownership is re-established.")));
 	return result;
@@ -10188,9 +10210,11 @@ failure_v2_tail_read(const ClusterRecoverySerialRequest *request, FailureInputV2
 		ClusterCfAttemptObservation attempt;
 		uint64 before = startup ? cluster_cf_attempt_sequence() : 0;
 
-		if (cluster_cf_lock(mode))
+		if (work->caller_owns_cf_retry ? cluster_cf_lock_deadline_v1(mode, work->deadline_ns)
+									   : cluster_cf_lock(mode))
 			break;
-		if (!startup || !cluster_cf_last_attempt_since(before, &attempt)
+		if (work->caller_owns_cf_retry || !startup
+			|| !cluster_cf_last_attempt_since(before, &attempt)
 			|| !cluster_cf_attempt_wait_slice(&attempt) || attempt.mode != mode)
 			return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 		failure_input_cf_wait(request, work, true, &attempt);
@@ -10199,6 +10223,8 @@ failure_v2_tail_read(const ClusterRecoverySerialRequest *request, FailureInputV2
 	work->cf_mode = mode;
 	if (!cluster_cf_held_is_clusterwide(mode))
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	if (!failure_input_deadline_current(work))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	if (work->input_cf_wait.waited && !failure_input_cf_current(request, work, true))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	result = read_thread_version(&request->duty, &work->base, &work->control, &file_token,
@@ -10296,14 +10322,20 @@ failure_v2_tail_work(const ClusterRecoverySerialRequest *request, FailureInputV2
 	const ClusterControlRootSnapshot *record;
 	int index = request->duty.origin_thread_id - 1;
 
-	retained = cluster_wal_retention_root_publish_begin_exact(&request->expected_root_token, false,
-															  &work->walr);
+	retained = work->caller_owns_cf_retry
+				   ? cluster_wal_retention_root_publish_begin_deadline_v1(
+						 &request->expected_root_token, &work->walr, work->deadline_ns)
+				   : cluster_wal_retention_root_publish_begin_exact(&request->expected_root_token,
+																	false, &work->walr);
 	if (retained != CLUSTER_WAL_PIN_OK)
 		return retained == CLUSTER_WAL_PIN_STALE ? CLUSTER_CONTROL_ROOT_STALE_TOKEN
 												 : CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	/* PGRAC: a self-seal holds no IR; the root CAS and WALR still apply. */
 	if (!work->self) {
-		acquired = cluster_recovery_serial_acquire(request, &work->serial);
+		acquired = work->caller_owns_cf_retry
+					   ? cluster_recovery_serial_input_acquire_deadline_v1(request, &work->serial,
+																		   work->deadline_ns)
+					   : cluster_recovery_serial_acquire(request, &work->serial);
 		if (acquired != CLUSTER_RECOVERY_SERIAL_GRANTED)
 			return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	}
@@ -10344,8 +10376,11 @@ failure_v2_open_work(const ClusterRecoverySerialRequest *request, FailureInputV2
 	int index = request->duty.origin_thread_id - 1;
 	bool startup = MyBackendType == B_STARTUP;
 
-	retained = cluster_wal_retention_root_publish_begin_exact(&request->expected_root_token, false,
-															  &work->walr);
+	retained = work->caller_owns_cf_retry
+				   ? cluster_wal_retention_root_publish_begin_deadline_v1(
+						 &request->expected_root_token, &work->walr, work->deadline_ns)
+				   : cluster_wal_retention_root_publish_begin_exact(&request->expected_root_token,
+																	false, &work->walr);
 	if (retained != CLUSTER_WAL_PIN_OK)
 		return retained == CLUSTER_WAL_PIN_STALE ? CLUSTER_CONTROL_ROOT_STALE_TOKEN
 												 : CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
@@ -10357,9 +10392,12 @@ failure_v2_open_work(const ClusterRecoverySerialRequest *request, FailureInputV2
 		ClusterCfAttemptObservation attempt;
 		uint64 before = startup ? cluster_cf_attempt_sequence() : 0;
 
-		if (cluster_cf_lock(ExclusiveLock))
+		if (work->caller_owns_cf_retry
+				? cluster_cf_lock_deadline_v1(ExclusiveLock, work->deadline_ns)
+				: cluster_cf_lock(ExclusiveLock))
 			break;
-		if (!startup || !cluster_cf_last_attempt_since(before, &attempt)
+		if (work->caller_owns_cf_retry || !startup
+			|| !cluster_cf_last_attempt_since(before, &attempt)
 			|| !cluster_cf_attempt_wait_slice(&attempt) || attempt.mode != ExclusiveLock)
 			return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 		failure_input_cf_wait(request, work, false, &attempt);
@@ -10368,6 +10406,8 @@ failure_v2_open_work(const ClusterRecoverySerialRequest *request, FailureInputV2
 	work->cf_mode = ExclusiveLock;
 	if (!cluster_cf_held_is_clusterwide(ExclusiveLock))
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	if (!failure_input_deadline_current(work))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	if (work->input_cf_wait.waited && !failure_input_cf_current(request, work, false))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	result = read_thread_version(&request->duty, &work->base, &work->control, &file_token,
@@ -10737,7 +10777,8 @@ failure_v2_self_seal_work(const ClusterRecoverySerialRequest *request, FailureIn
 static ClusterControlRootResult
 failure_v2_publish(const ClusterRecoverySerialRequest *request, ClusterControlRootSnapshot *out,
 				   ClusterControlRootReadToken *out_token, bool seal_tail, uint16 version,
-				   const ClusterWalSourceRef *self_restart, uint64 self_min_dead_us)
+				   const ClusterWalSourceRef *self_restart, uint64 self_min_dead_us,
+				   const uint64 *deadline_ns)
 {
 	FailureInputV2Work *work;
 	ClusterControlRootResult result;
@@ -10758,6 +10799,9 @@ failure_v2_publish(const ClusterRecoverySerialRequest *request, ClusterControlRo
 		|| request->mode != CLUSTER_RECOVERY_SERIAL_INPUT_SEAL
 		|| !cluster_recovery_duty_key_valid_for_claim(&request->duty, true)
 		|| request->duty.system_identifier != GetSystemIdentifier()
+		|| (deadline_ns != NULL
+			&& (MyBackendType != B_STARTUP || !AmStartupProcess() || self_restart != NULL
+				|| version != CONTROL_ROOT_HEADER_VERSION_V3))
 		|| (self_restart == NULL
 			&& (request->formation == NULL || request->fence_need_set == NULL
 				|| request->fence_admission_set == NULL)))
@@ -10768,6 +10812,8 @@ failure_v2_publish(const ClusterRecoverySerialRequest *request, ClusterControlRo
 	work->format_version = version;
 	work->publisher_node = cluster_node_id;
 	work->publisher_incarnation = cluster_qvotec_get_self_incarnation();
+	work->caller_owns_cf_retry = deadline_ns != NULL;
+	work->deadline_ns = deadline_ns != NULL ? *deadline_ns : 0;
 	if (self_restart != NULL) {
 		work->self = true;
 		work->self_min_dead_us = self_min_dead_us;
@@ -10803,7 +10849,7 @@ cluster_control_root_v2_failure_open_publish(const ClusterRecoverySerialRequest 
 											 ClusterControlRootSnapshot *out,
 											 ClusterControlRootReadToken *out_token)
 {
-	return failure_v2_publish(request, out, out_token, false, 2, NULL, 0);
+	return failure_v2_publish(request, out, out_token, false, 2, NULL, 0, NULL);
 }
 
 ClusterControlRootResult
@@ -10811,7 +10857,7 @@ cluster_control_root_v2_failure_tail_publish(const ClusterRecoverySerialRequest 
 											 ClusterControlRootSnapshot *out,
 											 ClusterControlRootReadToken *out_token)
 {
-	return failure_v2_publish(request, out, out_token, true, 2, NULL, 0);
+	return failure_v2_publish(request, out, out_token, true, 2, NULL, 0, NULL);
 }
 
 ClusterControlRootResult
@@ -10819,7 +10865,7 @@ cluster_control_root_v3_failure_open_publish(const ClusterRecoverySerialRequest 
 											 ClusterControlRootSnapshot *out,
 											 ClusterControlRootReadToken *out_token)
 {
-	return failure_v2_publish(request, out, out_token, false, 3, NULL, 0);
+	return failure_v2_publish(request, out, out_token, false, 3, NULL, 0, NULL);
 }
 
 ClusterControlRootResult
@@ -10827,7 +10873,25 @@ cluster_control_root_v3_failure_tail_publish(const ClusterRecoverySerialRequest 
 											 ClusterControlRootSnapshot *out,
 											 ClusterControlRootReadToken *out_token)
 {
-	return failure_v2_publish(request, out, out_token, true, 3, NULL, 0);
+	return failure_v2_publish(request, out, out_token, true, 3, NULL, 0, NULL);
+}
+
+ClusterControlRootResult
+cluster_control_root_v3_failure_open_deadline_v1(const ClusterRecoverySerialRequest *request,
+												 ClusterControlRootSnapshot *out,
+												 ClusterControlRootReadToken *out_token,
+												 uint64 deadline_ns)
+{
+	return failure_v2_publish(request, out, out_token, false, 3, NULL, 0, &deadline_ns);
+}
+
+ClusterControlRootResult
+cluster_control_root_v3_failure_tail_deadline_v1(const ClusterRecoverySerialRequest *request,
+												 ClusterControlRootSnapshot *out,
+												 ClusterControlRootReadToken *out_token,
+												 uint64 deadline_ns)
+{
+	return failure_v2_publish(request, out, out_token, true, 3, NULL, 0, &deadline_ns);
 }
 
 /*
@@ -10871,14 +10935,16 @@ cluster_control_root_v3_self_seal_v1(const ClusterWalSourceRef *restart, uint64 
 	request.duty = restart->claim.identity;
 	request.expected_root_token = token;
 	if (snapshot.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN) {
-		result = failure_v2_publish(&request, &snapshot, &token, false, 3, restart, min_dead_us);
+		result
+			= failure_v2_publish(&request, &snapshot, &token, false, 3, restart, min_dead_us, NULL);
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			return result;
 		request.expected_root_token = token;
 	}
 	if (snapshot.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
 		&& (snapshot.root_flags & CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID) == 0) {
-		result = failure_v2_publish(&request, &snapshot, &token, true, 3, restart, min_dead_us);
+		result
+			= failure_v2_publish(&request, &snapshot, &token, true, 3, restart, min_dead_us, NULL);
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			return result;
 	}

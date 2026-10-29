@@ -715,6 +715,14 @@ extern ClusterControlRootResult
 cluster_control_root_v3_failure_tail_publish(const struct ClusterRecoverySerialRequest *request,
 											 ClusterControlRootSnapshot *out,
 											 ClusterControlRootReadToken *out_token);
+/* Cold merge owns retry after confirmed publisher cleanup. These entries
+ * never sleep on CF; they preserve a fresh typed failed acquire for the caller. */
+extern ClusterControlRootResult cluster_control_root_v3_failure_open_deadline_v1(
+	const struct ClusterRecoverySerialRequest *request, ClusterControlRootSnapshot *out,
+	ClusterControlRootReadToken *out_token, uint64 deadline_ns);
+extern ClusterControlRootResult cluster_control_root_v3_failure_tail_deadline_v1(
+	const struct ClusterRecoverySerialRequest *request, ClusterControlRootSnapshot *out,
+	ClusterControlRootReadToken *out_token, uint64 deadline_ns);
 /* PGRAC (S9P2-05, PU-D-5): the founder's StartupProcess seals this node's
  * own crashed generation (OPEN, or sealed without its tail) on self-seal
  * evidence; min_dead_us is the caller's death threshold, raised to the

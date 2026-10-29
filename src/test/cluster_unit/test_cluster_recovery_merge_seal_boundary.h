@@ -660,6 +660,27 @@ cluster_control_root_v3_failure_tail_publish(const ClusterRecoverySerialRequest 
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
+/* Physical metadata leaves for the explicit cold caller. No pending CF is
+ * modeled here; the Startup fixture links that path to actual CF/owner. */
+ClusterControlRootResult
+cluster_control_root_v3_failure_open_deadline_v1(const ClusterRecoverySerialRequest *request,
+												 ClusterControlRootSnapshot *out,
+												 ClusterControlRootReadToken *token,
+												 uint64 deadline_ns)
+{
+	(void)deadline_ns;
+	return cluster_control_root_v3_failure_open_publish(request, out, token);
+}
+ClusterControlRootResult
+cluster_control_root_v3_failure_tail_deadline_v1(const ClusterRecoverySerialRequest *request,
+												 ClusterControlRootSnapshot *out,
+												 ClusterControlRootReadToken *token,
+												 uint64 deadline_ns)
+{
+	(void)deadline_ns;
+	return cluster_control_root_v3_failure_tail_publish(request, out, token);
+}
+
 /* ---- external write exclusion ---- */
 static PgracExternalFenceNeedSetResult cold_need_result = PGRAC_EXTERNAL_FENCE_NEED_SET_OK;
 static const char *cold_need_predicate = "NONE";

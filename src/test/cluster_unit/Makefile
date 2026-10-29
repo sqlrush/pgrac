@@ -1462,7 +1462,7 @@ test_cluster_startup_cf_callsite.inc: $(top_srcdir)/src/backend/access/transam/x
 	     END { if (calls != 1 || complete != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_startup_cf_entry: test_cluster_startup_cf_entry.c test_cluster_cf_enqueue.c test_cluster_cf_deadline.h test_cluster_ir_pin_deadline.h \
+test_cluster_startup_cf_entry: test_cluster_startup_cf_entry.c test_cluster_cf_enqueue.c test_cluster_cf_deadline.h test_cluster_ir_pin_deadline.h test_cluster_seal_deadline.h \
 		test_cluster_prepared_cf.h test_cluster_prepared_job.h test_cluster_prepared_cf.inc \
 		$(top_srcdir)/src/include/cluster/cluster_control_root_prepared.h \
 		test_cluster_generic_cf.h test_cluster_generic_cf.inc \
@@ -1484,7 +1484,7 @@ test_cluster_startup_cf_entry: test_cluster_startup_cf_entry.c test_cluster_cf_e
 		test_cluster_inputs_cf.inc test_cluster_inputs_cf_checkpoint.inc \
 		test_cluster_retention_cf_types.inc test_cluster_retention_cf.inc \
 		test_cluster_recovery_wal_cf.inc test_cluster_self_seal_cf.inc \
-		test_cluster_failure_input_cf.inc \
+		test_cluster_failure_input_cf.inc test_cluster_seal_publish_cf.inc \
 		test_cluster_recovery_complete_cf.inc test_cluster_complete_authority.inc \
 		test_cluster_cf_blocker_trace.inc test_cluster_startup_interrupt.inc unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_cf_enqueue.c \
@@ -1497,9 +1497,9 @@ test_cluster_startup_cf_entry: test_cluster_startup_cf_entry.c test_cluster_cf_e
 # Actual merge caller, including original IR acquire-set rollback before CF wait.
 test_cluster_merge_ir_cf_types.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_merge.c Makefile
 	awk '/^#define CLUSTER_RECOVERY_FENCE_PLAN_MAGIC/ { print; magic++ } \
-	     /^typedef struct (ClusterRecoveryFenceOrigin|RecoveryFenceCfContext)/ || /^struct ClusterRecoveryFencePlan/ { emit=1; n++ } \
-	     emit { print } /^};/ || /^} (ClusterRecoveryFenceOrigin|RecoveryFenceCfContext);/ { emit=0 } \
-	     END { if (magic != 1 || n != 3 || emit) exit 1 }' $< > $@.tmp
+	     /^typedef struct (ClusterRecoveryFenceOrigin|RecoveryFenceCfContext)/ || /^struct ClusterRecoveryFencePlan/ || /^typedef enum RecoveryFenceSealStep/ { emit=1; n++ } \
+	     emit { print } /^};/ || /^} (ClusterRecoveryFenceOrigin|RecoveryFenceCfContext|RecoveryFenceSealStep);/ { emit=0 } \
+	     END { if (magic != 1 || n != 4 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_merge_ir_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_merge.c Makefile
@@ -1524,6 +1524,16 @@ test_cluster_pre_ir_project_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_re
 	     /^recovery_fence_project_wait\(/ { print "static ClusterMergeEngage"; emit=1; n++ } \
 	     emit { print } /^}/ { emit=0 } \
 	     END { if (n != 6 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Actual cold seal caller, linked to the failure-input publisher and CF.
+test_cluster_seal_publish_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_merge.c Makefile
+	awk '/^recovery_fence_acquire_budget_required\(/ { print "static int"; emit=1; n++ } \
+	     /^recovery_fence_origin_seal\(/ { print "static void"; emit=1; n++ } \
+	     /^recovery_fence_seal_publish_wait\(/ { signature=$$0; candidate=1; next } \
+	     candidate { signature=signature "\n" $$0; if (/;$$/) { candidate=0; next } if (/^{$$/) { print "static ClusterControlRootResult"; print signature; emit=1; n++; candidate=0 } next } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (n != 3 || candidate || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_merge_commit_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_merge.c Makefile
@@ -1626,13 +1636,13 @@ test_cluster_wal_pin_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_reten
 	     FNR == NR && /^pin_walr_for_thread\(/ { print "static ClusterWalPinLock *"; emit=1; selectors++ } \
 	     FNR == NR && /^root_publish_member\(/ { print "static const ClusterWalRootPublishGuard *"; emit=1; selectors++ } \
 	     FNR == NR && /^pin_release_locks\(/ { print "static ClusterWalrReleaseResult"; emit=1; releases++ } \
-	     FNR == NR && /^(pin_fail_after_locks|pin_current_after_grants|pin_acquire_inputs)\(/ { print "static ClusterWalPinResult"; emit=1; callers++ } \
-	     FNR == NR && /^(cluster_wal_retention_pin_acquire|cluster_wal_retention_pin_acquire_deadline_v1|cluster_wal_retention_pin_preflight_deadline_v1|cluster_wal_retention_pin_preflight_revalidate_wait_v1)\(/ { print "ClusterWalPinResult"; emit=1; callers++ } \
+	     FNR == NR && /^(pin_fail_after_locks|pin_current_after_grants|pin_acquire_inputs|root_publish_begin_exact)\(/ { print "static ClusterWalPinResult"; emit=1; callers++ } \
+	     FNR == NR && /^(cluster_wal_retention_pin_acquire|cluster_wal_retention_pin_acquire_deadline_v1|cluster_wal_retention_pin_preflight_deadline_v1|cluster_wal_retention_pin_preflight_revalidate_wait_v1|cluster_wal_retention_root_publish_begin_exact|cluster_wal_retention_root_publish_begin_deadline_v1)\(/ { print "ClusterWalPinResult"; emit=1; callers++ } \
 	     FNR == NR && /^pin_startup_cf_(capture|free)\(/ { print "static void"; emit=1; helpers++ } \
 	     FNR == NR && /^pin_startup_cf_(current|wait)\(/ { print "static bool"; emit=1; helpers++ } \
 	     FNR != NR && /^(cluster_control_root_read_canonical|cluster_control_root_read_recovery_subject|cluster_control_root_revalidate)\(/ { print "ClusterControlRootResult"; emit=1; readers++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (predicates != 5 || frees != 1 || selectors != 2 || releases != 1 || callers != 7 || budgets != 1 || acquisitions != 2 || helpers > 4 || readers != 3 || emit) exit 1 }' \
+	     END { if (predicates != 5 || frees != 1 || selectors != 2 || releases != 1 || callers != 10 || budgets != 1 || acquisitions != 2 || helpers > 4 || readers != 3 || emit) exit 1 }' \
 	     $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 
@@ -1719,12 +1729,12 @@ test_cluster_self_seal_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_control
 	awk '/^typedef struct FailureInputV2Work / { types=1; work++ } \
 	     /^typedef struct (FailureSelfCfWait|FailureInputCfWait) / { types=1; helpers++ } \
 	     types { print; if (/^}/) types=0; next } \
-	     /^(self_predecessor_authorized|failure_v2_authorized|failure_v2_current)\(/ { print "static bool"; emit=1; predicates++ } \
+	     /^(failure_input_deadline_current|self_predecessor_authorized|failure_v2_authorized|failure_v2_current)\(/ { print "static bool"; emit=1; predicates++ } \
 	     /^failure_self_cf_current\(/ { print "static bool"; emit=1; checks++ } \
 	     /^failure_self_cf_(capture|wait)\(/ { print "static void"; emit=1; waiters++ } \
 	     /^(failure_v2_cleanup|failure_v2_self_open_read|failure_v2_self_seal_work)\(/ { print "static ClusterControlRootResult"; emit=1; consumers++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (work != 1 || helpers > 2 || predicates != 3 || checks > 1 || waiters > 2 || consumers != 3 || types || emit) exit 1 }' $< > $@.tmp
+	     END { if (work != 1 || helpers > 2 || predicates != 4 || checks > 1 || waiters > 2 || consumers != 3 || types || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Failure input keeps its original fenced or self authority and IR purpose.
@@ -1733,9 +1743,9 @@ test_cluster_failure_input_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_con
 	awk '/^(failure_v2_authorized|failure_v2_current)\(/ { print "static bool"; emit=1; predicates++ } \
 	     /^failure_input_cf_current\(/ { print "static bool"; emit=1; checks++ } \
 	     /^failure_input_cf_(capture|wait)\(/ { print "static void"; emit=1; waiters++ } \
-	     /^(failure_v2_cleanup|failure_v2_tail_read|failure_v2_tail_commit|failure_v2_tail_work|failure_v2_open_work)\(/ { print "static ClusterControlRootResult"; emit=1; consumers++ } \
+	     /^(failure_v2_cleanup|failure_v2_tail_read|failure_v2_tail_commit|failure_v2_tail_work|failure_v2_open_work|failure_v2_publish|cluster_control_root_v3_failure_(open|tail)_deadline_v1)\(/ { print ($$0 ~ /^cluster_control_root_/ ? "ClusterControlRootResult" : "static ClusterControlRootResult"); emit=1; consumers++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (predicates != 2 || checks > 1 || waiters > 2 || consumers != 5 || emit) exit 1 }' $< > $@.tmp
+	     END { if (predicates != 2 || checks > 1 || waiters > 2 || consumers != 8 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Post-IR completion stays within the original one-shot publication call.

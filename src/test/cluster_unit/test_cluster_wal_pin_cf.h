@@ -118,6 +118,30 @@ pin_cf_errdetail(const char *format, ...)
 	va_end(args);
 	return 0;
 }
+/* Cold seal forbids borrowing/converting either pin. These unrelated legs
+ * abort if reached instead of manufacturing an authority proof. */
+#define CLUSTER_WAL_ROOT_PUBLISH_MAGIC UINT32_C(0x57525047)
+static bool
+pin_cf_unavailable_read_cover(ClusterWalReadPinV1 *pin, uint16 thread)
+{
+	(void)pin;
+	(void)thread;
+	abort();
+}
+static bool
+walr_request_has_native_lock(const ClusterLockAcquireRequest *request)
+{
+	(void)request;
+	abort();
+}
+static ClusterLockAcquireResult
+walr_request_convert_actual(ClusterLockAcquireRequest *request, uint64 preserve, bool *cleanup)
+{
+	(void)request;
+	(void)preserve;
+	(void)cleanup;
+	abort();
+}
 #define clock_gettime cf_budget_clock_gettime
 #define cluster_lock_owner_request_acquire pin_cf_owner_acquire
 #define errstart pin_cf_errstart
@@ -131,7 +155,14 @@ pin_cf_errdetail(const char *format, ...)
 #define cluster_formation_witness_revalidate_nowait failure_formation_current
 #define cluster_external_fence_need_set_revalidate_nowait failure_needs_current
 #define cluster_external_fence_revalidate_set_nowait failure_admissions_current
+static ClusterWalPinResult pg_attribute_unused()
+	pin_cf_publish_exact(const ClusterControlRootReadToken *token, bool sealed,
+						 ClusterWalRootPublishGuard **guard);
+#define cluster_wal_retention_root_publish_begin_exact pin_cf_publish_exact
+#define cluster_wal_read_pin_covers_v1 pin_cf_unavailable_read_cover
 #include "test_cluster_wal_pin_cf.inc"
+#undef cluster_wal_read_pin_covers_v1
+#undef cluster_wal_retention_root_publish_begin_exact
 #undef cluster_external_fence_revalidate_set_nowait
 #undef cluster_external_fence_need_set_revalidate_nowait
 #undef cluster_formation_witness_revalidate_nowait

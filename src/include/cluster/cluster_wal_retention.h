@@ -415,6 +415,11 @@ extern ClusterWalPinResult
 cluster_wal_retention_root_publish_begin_exact(const ClusterControlRootReadToken *expected_root,
 											   bool require_sealed_pin,
 											   ClusterWalRootPublishGuard **out_guard);
+/* Fresh ordinary WALR custody for cold input sealing before plan pin/IR.
+ * No borrowed pin, conversion, or change to the independent end contract. */
+extern ClusterWalPinResult cluster_wal_retention_root_publish_begin_deadline_v1(
+	const ClusterControlRootReadToken *expected_root, ClusterWalRootPublishGuard **out_guard,
+	uint64 deadline_ns);
 /* PGRAC: one original sealed cold-input owner protects an entire sorted
  * COMPLETE/CLOSED ROOT cut through CF/CAS/readback. COMPLETE members convert
  * their original S holders only after every IR release; CLOSED inputs retain

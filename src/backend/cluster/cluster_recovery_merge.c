@@ -1883,6 +1883,18 @@ recovery_fence_acquire_budget_required(ClusterRecoveryFencePlan *plan, int owner
  * take their own WALR/IR/CF and return only after confirmed release.  The
  * origin then carries the sealed root and its read token.
  */
+typedef enum RecoveryFenceSealStep {
+	RECOVERY_FENCE_SEAL_OPEN,
+	RECOVERY_FENCE_SEAL_TAIL,
+	RECOVERY_FENCE_SEAL_READ
+} RecoveryFenceSealStep;
+
+static ClusterControlRootResult
+recovery_fence_seal_publish_wait(ClusterRecoveryFencePlan *plan, ClusterRecoveryFenceOrigin *origin,
+								 const ClusterRecoverySerialRequest *request,
+								 RecoveryFenceSealStep step, ClusterControlRootSnapshot *out,
+								 ClusterControlRootReadToken *out_token);
+
 static void
 recovery_fence_origin_seal(ClusterRecoveryFencePlan *plan, ClusterRecoveryFenceOrigin *origin,
 						   uint32 required_flags)
@@ -1903,7 +1915,8 @@ recovery_fence_origin_seal(ClusterRecoveryFencePlan *plan, ClusterRecoveryFenceO
 		= recovery_fence_acquire_budget_required(plan, plan->acquire_timeout_ms_snapshot);
 	request.release_timeout_ms = plan->acquire_timeout_ms_snapshot;
 	if (snapshot.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN) {
-		result = cluster_control_root_v3_failure_open_publish(&request, &snapshot, &token);
+		result = recovery_fence_seal_publish_wait(plan, origin, &request, RECOVERY_FENCE_SEAL_OPEN,
+												  &snapshot, &token);
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			recovery_fence_seal_failed(plan, &origin->duty, "input seal", (int)result);
 		request.expected_root_token = token;
@@ -1911,17 +1924,13 @@ recovery_fence_origin_seal(ClusterRecoveryFencePlan *plan, ClusterRecoveryFenceO
 	if ((snapshot.root_flags & CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID) == 0) {
 		request.acquire_timeout_ms
 			= recovery_fence_acquire_budget_required(plan, plan->acquire_timeout_ms_snapshot);
-		result = cluster_control_root_v3_failure_tail_publish(&request, &snapshot, &token);
+		result = recovery_fence_seal_publish_wait(plan, origin, &request, RECOVERY_FENCE_SEAL_TAIL,
+												  &snapshot, &token);
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			recovery_fence_seal_failed(plan, &origin->duty, "tail seal", (int)result);
 	}
-	result = cluster_shared_config
-				 ? cluster_control_root_v3_read_canonical_deadline_v1(
-					   origin->origin_thread, &origin->duty, &snapshot, &token,
-					   plan->merge_deadline_ns)
-				 : cluster_control_root_read_canonical(origin->origin_thread, &origin->duty,
-													   CLUSTER_CONTROL_ROOT_READ_STRONG, &snapshot,
-													   &token);
+	result = recovery_fence_seal_publish_wait(plan, origin, &request, RECOVERY_FENCE_SEAL_READ,
+											  &snapshot, &token);
 	recovery_fence_deadline_require(plan);
 	if ((result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		 && result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
@@ -2076,6 +2085,8 @@ recovery_merge_cold_cf_wait(const ClusterRecoveryFencePlan *plan,
 							uint64 generation, ResourceOwner owner, uint64 boot, bool recovery)
 {
 	ClusterCfRetirementSnapshot original;
+	LOCKMODE mode = attempt->mode;
+	LOCKMODE other = mode == ShareLock ? ExclusiveLock : ShareLock;
 	PGPROC *proc = MyProc;
 	Latch *latch = MyLatch;
 	RecoveryFenceCfContext context = { .proc = proc,
@@ -2090,11 +2101,12 @@ recovery_merge_cold_cf_wait(const ClusterRecoveryFencePlan *plan,
 	bool empty_waited = false;
 	const char *reason = "UNSAFE_CF_WAIT";
 
-	if (proc == NULL || latch == NULL || owner == NULL || CritSectionCount != 0
-		|| LWLockHeldByMe(ControlFileLock) || cluster_cf_held(ExclusiveLock))
+	if ((mode != ShareLock && mode != ExclusiveLock) || proc == NULL || latch == NULL
+		|| owner == NULL || CritSectionCount != 0 || LWLockHeldByMe(ControlFileLock)
+		|| cluster_cf_held(other))
 		goto refuse;
 	if (!empty
-		&& (!cluster_cf_retirement_snapshot(ShareLock, NULL, &original)
+		&& (!cluster_cf_retirement_snapshot(mode, NULL, &original)
 			|| original.cookie != attempt->control_owner_id
 			|| original.registry.message.key.holder.request_id != attempt->request_id
 			|| original.registry.message.key.holder.cluster_epoch != attempt->request_epoch)) {
@@ -2116,9 +2128,9 @@ recovery_merge_cold_cf_wait(const ClusterRecoveryFencePlan *plan,
 			goto refuse;
 		reason = "CONTEXT_CHANGED_AFTER_WAIT_SLICE";
 		ResetLatch(MyLatch);
-		held = cluster_cf_held(ShareLock);
-		if (!held && !cluster_cf_held(ExclusiveLock)) {
-			if (!empty && cluster_cf_release_completed(ShareLock, original.cookie))
+		held = cluster_cf_held(mode);
+		if (!held && !cluster_cf_held(other)) {
+			if (!empty && cluster_cf_release_completed(mode, original.cookie))
 				return;
 			if (empty) {
 				if (empty_waited)
@@ -2133,8 +2145,8 @@ recovery_merge_cold_cf_wait(const ClusterRecoveryFencePlan *plan,
 			}
 		}
 		reason = "CF_WAIT_IDENTITY_OR_COMPLETION";
-		if (empty || !held || cluster_cf_held(ExclusiveLock)
-			|| !cluster_cf_retirement_snapshot(ShareLock, NULL, &current)
+		if (empty || !held || cluster_cf_held(other)
+			|| !cluster_cf_retirement_snapshot(mode, NULL, &current)
 			|| current.cookie != original.cookie
 			|| current.registry.handle.slot != original.registry.handle.slot
 			|| current.registry.handle.generation != original.registry.handle.generation
@@ -2147,7 +2159,7 @@ recovery_merge_cold_cf_wait(const ClusterRecoveryFencePlan *plan,
 			goto refuse;
 		cluster_lock_owners_service_poll();
 		cluster_cf_retirement_poll();
-		if (cluster_cf_held(ShareLock)) {
+		if (cluster_cf_held(mode)) {
 			reason = "MERGE_DEADLINE_OR_ZERO_ATTEMPT";
 			wait_ms = recovery_fence_acquire_budget(plan, 100);
 			if (wait_ms <= 0)
@@ -2217,6 +2229,93 @@ recovery_fence_project_context_current(const ClusterRecoveryFencePlan *plan,
 	return recovery_fence_plan_valid(plan) && !plan->sealed && !plan->serial_held
 		   && plan->serial_guards.count == 0 && plan->retention_pin == NULL
 		   && recovery_fence_read_context_current(plan, context, own_thread, cohort, restart);
+}
+
+/* This caller owns each prepublication seal retry. The publisher has
+ * confirmed its original IR/WALR cleanup before a CF wait; an already
+ * successful open transition is never invoked again while tail is retried. */
+static ClusterControlRootResult
+recovery_fence_seal_publish_wait(ClusterRecoveryFencePlan *plan, ClusterRecoveryFenceOrigin *origin,
+								 const ClusterRecoverySerialRequest *request,
+								 RecoveryFenceSealStep step, ClusterControlRootSnapshot *out,
+								 ClusterControlRootReadToken *out_token)
+{
+	ClusterFormationSnapshotV1 cohort;
+	ClusterWalSourceRef restart;
+	ClusterRecoveryFenceOrigin original_origin = *origin;
+	ClusterRecoverySerialRequest original_request = *request;
+	RecoveryFenceCfContext context = { .proc = MyProc,
+									   .latch = MyLatch,
+									   .owner = CurrentResourceOwner,
+									   .pid = MyProcPid,
+									   .boot = cluster_qvotec_get_self_incarnation(),
+									   .epoch = cluster_epoch_get_current(),
+									   .generation = cluster_grd_redeclare_generation(),
+									   .recovery = InRecovery };
+	uint16 own_thread = plan->own_thread;
+	bool waited = false;
+	bool wait_allowed;
+
+	if (!cluster_shared_config) {
+		if (step == RECOVERY_FENCE_SEAL_READ)
+			return cluster_control_root_read_canonical(origin->origin_thread, &origin->duty,
+													   CLUSTER_CONTROL_ROOT_READ_STRONG, out,
+													   out_token);
+		return step == RECOVERY_FENCE_SEAL_TAIL
+				   ? cluster_control_root_v3_failure_tail_publish(request, out, out_token)
+				   : cluster_control_root_v3_failure_open_publish(request, out, out_token);
+	}
+	wait_allowed = recovery_fence_plan_valid(plan) && !plan->sealed && !plan->serial_held
+				   && plan->serial_guards.count == 0 && plan->retention_pin == NULL
+				   && !cluster_cf_held(ShareLock) && !cluster_cf_held(ExclusiveLock)
+				   && cluster_reconfig_capture_formation_snapshot_v1(own_thread, &cohort)
+				   && cohort.startup_formation_generation != 0
+				   && cluster_wal_thread_restart_v2_ref(&restart);
+	for (;;) {
+		ClusterCfAttemptObservation attempt;
+		ClusterControlRootResult result;
+		uint64 before;
+
+		recovery_fence_deadline_require(plan);
+		if (waited
+			&& (!recovery_fence_project_context_current(plan, &context, own_thread, &cohort,
+														&restart)
+				|| memcmp(origin, &original_origin, sizeof(*origin)) != 0
+				|| memcmp(request, &original_request, sizeof(*request)) != 0))
+			recovery_fence_seal_refused(plan, "stage=seal_retry reason=ORIGINAL_INPUT_CHANGED");
+		before = cluster_cf_attempt_sequence();
+		if (step == RECOVERY_FENCE_SEAL_READ)
+			result = cluster_control_root_v3_read_canonical_deadline_v1(
+				origin->origin_thread, &origin->duty, out, out_token, plan->merge_deadline_ns);
+		else
+			result = step == RECOVERY_FENCE_SEAL_TAIL
+						 ? cluster_control_root_v3_failure_tail_deadline_v1(request, out, out_token,
+																			plan->merge_deadline_ns)
+						 : cluster_control_root_v3_failure_open_deadline_v1(
+							   request, out, out_token, plan->merge_deadline_ns);
+		if (result != CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE || !wait_allowed
+			|| !cluster_cf_last_attempt_since(before, &attempt)
+			|| !cluster_cf_attempt_wait_slice(&attempt)) {
+			recovery_fence_deadline_require(plan);
+			if (waited
+				&& (!recovery_fence_project_context_current(plan, &context, own_thread, &cohort,
+															&restart)
+					|| memcmp(origin, &original_origin, sizeof(*origin)) != 0
+					|| memcmp(request, &original_request, sizeof(*request)) != 0))
+				recovery_fence_seal_refused(plan,
+											"stage=seal_retry reason=CONTEXT_CHANGED_AFTER_READ");
+			return result;
+		}
+		if (!recovery_fence_project_context_current(plan, &context, own_thread, &cohort, &restart)
+			|| memcmp(origin, &original_origin, sizeof(*origin)) != 0
+			|| memcmp(request, &original_request, sizeof(*request)) != 0)
+			recovery_fence_seal_refused(plan,
+										"stage=seal_retry reason=CONTEXT_CHANGED_BEFORE_WAIT");
+		recovery_merge_cold_cf_wait(plan, &attempt, &cohort, &restart, own_thread, context.epoch,
+									context.generation, context.owner, context.boot,
+									context.recovery);
+		waited = true;
+	}
 }
 
 /* Initial and post-seal projections precede this plan's pin/IR acquisition.

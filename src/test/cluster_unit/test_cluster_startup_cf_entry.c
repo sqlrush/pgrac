@@ -4149,7 +4149,9 @@ self_unavailable_digest(const ClusterRecoveryDutyKey *key, bool v2, ClusterRecov
 #define read_thread_version self_read_thread
 #define encode_extended_image self_encode
 #define publish_updated_image self_publish
+#define clock_gettime cf_budget_clock_gettime
 #include "test_cluster_self_seal_cf.inc"
+#undef clock_gettime
 #undef publish_updated_image
 #undef encode_extended_image
 #undef read_thread_version
@@ -4789,6 +4791,9 @@ failure_at(const PgracExternalFenceNeedSetV1 *needs, uint32 index)
 	UT_ASSERT(needs == (const PgracExternalFenceNeedSetV1 *)2 && index == 0);
 	return failure_null_need ? NULL : &failure_need;
 }
+static bool failure_ir_confirmed = true, failure_walr_confirmed = true;
+static ClusterRecoverySerialGuard *failure_uncertain_ir;
+static ClusterWalRootPublishGuard **failure_uncertain_walr;
 static ClusterRecoverySerialAcquireResult
 failure_ir_acquire(const ClusterRecoverySerialRequest *request, ClusterRecoverySerialGuard *guard)
 {
@@ -4815,6 +4820,11 @@ failure_ir_release(ClusterRecoverySerialGuard *guard)
 	UT_ASSERT_EQ(failure_kind, 1);
 	UT_ASSERT_EQ(memcmp(guard, &failure_serial, sizeof(*guard)), 0);
 	++failure_ir_releases;
+	if (!failure_ir_confirmed) {
+		guard->release_uncertain = true;
+		failure_uncertain_ir = guard;
+		return CLUSTER_RECOVERY_SERIAL_RELEASE_UNCONFIRMED;
+	}
 	memset(guard, 0, sizeof(*guard));
 	return CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED;
 }
@@ -4834,6 +4844,10 @@ failure_walr_end(ClusterWalRootPublishGuard **guard)
 	UT_ASSERT(*guard == (ClusterWalRootPublishGuard *)&failure_walr_identity);
 	UT_ASSERT(!cluster_cf_held_is_usable(ShareLock) && !cluster_cf_held_is_usable(ExclusiveLock));
 	++failure_walr_ends;
+	if (!failure_walr_confirmed) {
+		failure_uncertain_walr = guard;
+		return CLUSTER_WALR_RELEASE_UNCONFIRMED;
+	}
 	*guard = NULL;
 	return CLUSTER_WALR_RELEASE_CONFIRMED;
 }
@@ -4904,6 +4918,31 @@ failure_actual_cf_lock(LOCKMODE mode)
 		g_seven_result = failure_acquire_result;
 	return claim_actual_cf_lock(mode);
 }
+static uint64 failure_deadline_seen;
+static bool
+failure_actual_cf_lock_deadline(LOCKMODE mode, uint64 deadline_ns)
+{
+	++failure_attempts;
+	++g_next_request_id;
+	if (failure_attempts == failure_first_attempt())
+		g_seven_result = failure_acquire_result;
+	failure_deadline_seen = deadline_ns;
+	return claim_actual_cf_lock_deadline(mode, deadline_ns);
+}
+static ClusterRecoverySerialAcquireResult
+failure_ir_acquire_deadline(const ClusterRecoverySerialRequest *request,
+							ClusterRecoverySerialGuard *guard, uint64 deadline_ns)
+{
+	UT_ASSERT_EQ(deadline_ns, failure_deadline_seen);
+	return failure_ir_acquire(request, guard);
+}
+static ClusterWalPinResult
+failure_walr_begin_deadline(const ClusterControlRootReadToken *token,
+							ClusterWalRootPublishGuard **guard, uint64 deadline_ns)
+{
+	failure_deadline_seen = deadline_ns;
+	return failure_walr_begin(token, false, guard);
+}
 /* Compile the original authorizer again against explicit fenced/IR leaves;
  * the earlier self-only copy still has unavailable foreign/IR authority. */
 #define failure_v2_authorized failure_authorized
@@ -4916,11 +4955,14 @@ failure_actual_cf_lock(LOCKMODE mode)
 #define cluster_external_fence_need_set_count failure_count
 #define cluster_external_fence_need_set_at failure_at
 #define cluster_recovery_serial_acquire failure_ir_acquire
+#define cluster_recovery_serial_input_acquire_deadline_v1 failure_ir_acquire_deadline
 #define cluster_recovery_serial_input_revalidate failure_ir_revalidate
 #define cluster_recovery_serial_release failure_ir_release
 #define cluster_wal_retention_root_publish_begin_exact failure_walr_begin
+#define cluster_wal_retention_root_publish_begin_deadline_v1 failure_walr_begin_deadline
 #define cluster_wal_retention_root_publish_end failure_walr_end
 #define cluster_cf_lock failure_actual_cf_lock
+#define cluster_cf_lock_deadline_v1 failure_actual_cf_lock_deadline
 #define read_thread_version failure_read
 #define encode_extended_image self_encode
 #define publish_updated_image failure_publish
@@ -4930,11 +4972,14 @@ failure_actual_cf_lock(LOCKMODE mode)
 #undef publish_updated_image
 #undef encode_extended_image
 #undef read_thread_version
+#undef cluster_cf_lock_deadline_v1
 #undef cluster_cf_lock
 #undef cluster_wal_retention_root_publish_end
+#undef cluster_wal_retention_root_publish_begin_deadline_v1
 #undef cluster_wal_retention_root_publish_begin_exact
 #undef cluster_recovery_serial_release
 #undef cluster_recovery_serial_input_revalidate
+#undef cluster_recovery_serial_input_acquire_deadline_v1
 #undef cluster_recovery_serial_acquire
 #undef cluster_external_fence_need_set_at
 #undef cluster_external_fence_need_set_count
@@ -4966,6 +5011,10 @@ failure_fixture(unsigned kind, unsigned phase)
 {
 	self_fixture(phase);
 	failure_kind = kind;
+	failure_deadline_seen = 0;
+	failure_ir_confirmed = failure_walr_confirmed = true;
+	failure_uncertain_ir = NULL;
+	failure_uncertain_walr = NULL;
 	failure_phase = phase;
 	failure_attempts = failure_reads = failure_wal_reads = failure_publishes = 0;
 	failure_ir_acquires = failure_ir_releases = failure_walr_begins = failure_walr_ends = 0;
@@ -6455,6 +6504,7 @@ UT_TEST(ordinary_recovery_complete_roles_keep_the_original_cf_wait_policy)
 
 #include "test_cluster_cf_deadline.h"
 #include "test_cluster_ir_pin_deadline.h"
+#include "test_cluster_seal_deadline.h"
 
 int
 main(void)
@@ -6466,6 +6516,29 @@ main(void)
 	pg_atomic_init_u64(&owner_proc.cluster_grd_redeclare_acked_epoch, 0);
 	cluster_control_request_shmem_init();
 	retire_driver = cluster_control_request_driver_start();
+	if (getenv("PGRAC_PRE2_TEST_SEAL_DEADLINE") != NULL) {
+		UT_PLAN(17);
+		UT_RUN(startup_seal_cf_failure_returns_to_its_caller_without_waiting);
+		UT_RUN(startup_seal_cf_request_obeys_the_remaining_original_budget);
+		UT_RUN(startup_seal_returns_cf_refusal_only_after_original_ir_and_walr_cleanup);
+		UT_RUN(startup_seal_expiry_and_unknown_clock_start_no_new_owner);
+		UT_RUN(startup_seal_expiry_after_cf_grant_or_wal_scan_never_publishes);
+		UT_RUN(startup_seal_uncertain_cleanup_preserves_debt_and_refuses_before_wait);
+		UT_RUN(startup_seal_error_keeps_original_cleanup_and_sqlstate);
+		UT_RUN(startup_seal_input_ir_uses_the_original_deadline);
+		UT_RUN(startup_seal_merge_retries_after_cleanup_and_never_replays_open);
+		UT_RUN(startup_seal_final_read_retries_without_republishing);
+		UT_RUN(startup_seal_fresh_walr_uses_the_original_budget_without_changing_release);
+		UT_RUN(startup_seal_fresh_walr_refuses_expired_deadline_and_foreign_pin);
+		UT_RUN(startup_seal_wait_rejects_changed_original_context_before_reapplication);
+		UT_RUN(startup_seal_wait_uses_the_original_deadline_and_zero_never_sleeps);
+		UT_RUN(startup_seal_x_wait_requires_the_original_exact_receipt);
+		UT_RUN(startup_seal_hard_root_failure_never_waits_or_replays);
+		UT_RUN(startup_seal_zero_complete_attempt_still_publishes_once);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
+
 	if (getenv("PGRAC_PRE2_TEST_IR_PIN_DEADLINE") != NULL) {
 		UT_PLAN(14);
 		UT_RUN(startup_ir_preflight_carries_the_original_deadline);
@@ -6686,7 +6759,7 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(226);
+	UT_PLAN(243);
 	UT_RUN(startup_cf_timeout_waits_for_exact_completion_before_begin);
 	UT_RUN(startup_cf_completion_does_not_preserve_changed_native_input);
 	UT_RUN(startup_cf_unsafe_native_context_never_takes_a_registry_lock);
@@ -6913,6 +6986,24 @@ main(void)
 	UT_RUN(startup_pin_ack_is_live_before_deadline_and_refused_at_deadline);
 	UT_RUN(startup_pin_expired_submillisecond_and_unknown_clock_create_no_request);
 	UT_RUN(startup_bounded_pin_rejects_initializer_and_foreign_role);
+
+	UT_RUN(startup_seal_cf_failure_returns_to_its_caller_without_waiting);
+	UT_RUN(startup_seal_cf_request_obeys_the_remaining_original_budget);
+	UT_RUN(startup_seal_returns_cf_refusal_only_after_original_ir_and_walr_cleanup);
+	UT_RUN(startup_seal_expiry_and_unknown_clock_start_no_new_owner);
+	UT_RUN(startup_seal_expiry_after_cf_grant_or_wal_scan_never_publishes);
+	UT_RUN(startup_seal_uncertain_cleanup_preserves_debt_and_refuses_before_wait);
+	UT_RUN(startup_seal_error_keeps_original_cleanup_and_sqlstate);
+	UT_RUN(startup_seal_input_ir_uses_the_original_deadline);
+	UT_RUN(startup_seal_merge_retries_after_cleanup_and_never_replays_open);
+	UT_RUN(startup_seal_final_read_retries_without_republishing);
+	UT_RUN(startup_seal_fresh_walr_uses_the_original_budget_without_changing_release);
+	UT_RUN(startup_seal_fresh_walr_refuses_expired_deadline_and_foreign_pin);
+	UT_RUN(startup_seal_wait_rejects_changed_original_context_before_reapplication);
+	UT_RUN(startup_seal_wait_uses_the_original_deadline_and_zero_never_sleeps);
+	UT_RUN(startup_seal_x_wait_requires_the_original_exact_receipt);
+	UT_RUN(startup_seal_hard_root_failure_never_waits_or_replays);
+	UT_RUN(startup_seal_zero_complete_attempt_still_publishes_once);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

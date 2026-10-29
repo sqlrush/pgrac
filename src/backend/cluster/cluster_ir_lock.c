@@ -468,6 +468,31 @@ cluster_recovery_serial_acquire(const ClusterRecoverySerialRequest *request,
 	return recovery_serial_acquire(request, guard, 0);
 }
 
+/* The seal publisher returns CF refusal to its cold merge caller. It never
+ * waits here, and the relative acquire budget includes its ROOT preflight. */
+ClusterRecoverySerialAcquireResult
+cluster_recovery_serial_input_acquire_deadline_v1(const ClusterRecoverySerialRequest *request,
+												  ClusterRecoverySerialGuard *guard,
+												  uint64 deadline_ns)
+{
+	uint64 now;
+	uint64 budget;
+
+	if (guard == NULL)
+		return CLUSTER_RECOVERY_SERIAL_INTERNAL_FAILURE;
+	memset(guard, 0, sizeof(*guard));
+	if (!cluster_shared_config || !recovery_serial_request_valid(request)
+		|| request->mode != CLUSTER_RECOVERY_SERIAL_INPUT_SEAL)
+		return CLUSTER_RECOVERY_SERIAL_INTERNAL_FAILURE;
+	if (deadline_ns != 0) {
+		budget = (uint64)request->acquire_timeout_ms * NS_PER_MS;
+		if (!recovery_serial_monotonic_ns(&now) || now > UINT64_MAX - budget)
+			return CLUSTER_RECOVERY_SERIAL_RETRY;
+		deadline_ns = Min(deadline_ns, now + budget);
+	}
+	return recovery_serial_acquire(request, guard, deadline_ns);
+}
+
 static ClusterRecoverySerialRevalidateResult
 recovery_serial_revalidate_purpose(ClusterRecoverySerialGuard *guard,
 								   ClusterRecoverySerialMode purpose)
