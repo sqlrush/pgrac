@@ -1118,6 +1118,7 @@ cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **held)
 #include "test_cluster_recovery_episode_native_bounds.inc"
 #include "test_cluster_recovery_episode_issued_clog.inc"
 #include "test_cluster_recovery_episode_resident_birth.inc"
+#include "test_cluster_recovery_episode_initialized_pages.inc"
 #include "test_cluster_recovery_episode_page_history.inc"
 #include "test_cluster_recovery_episode_page_sources.inc"
 #include "test_cluster_recovery_consumed_native_redo.inc"
@@ -1134,6 +1135,15 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_INITIALIZED_PAGES") != NULL) {
+		UT_PLAN(5);
+		UT_RUN(test_episode_initialized_pages_uses_both_actual_producers);
+		UT_RUN(test_episode_initialized_pages_refuses_each_unknown_origin);
+		UT_RUN(test_episode_initialized_pages_refuses_equal_bytes_wrong_birth);
+		UT_RUN(test_episode_initialized_pages_cache_loss_keeps_old_custody);
+		UT_RUN(test_episode_initialized_pages_alias_has_no_native_effect);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_CURRENT_PAGES") != NULL) {
 		UT_PLAN(4);
 		UT_RUN(test_census_current_pages_keep_initial_baseline_after_owner_write);
@@ -1430,7 +1440,12 @@ main(int argc, char **argv)
 		UT_RUN(test_census_references_bound_metadata_and_tuple_storage_before_publication);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(252);
+	UT_PLAN(257);
+	UT_RUN(test_episode_initialized_pages_uses_both_actual_producers);
+	UT_RUN(test_episode_initialized_pages_refuses_each_unknown_origin);
+	UT_RUN(test_episode_initialized_pages_refuses_equal_bytes_wrong_birth);
+	UT_RUN(test_episode_initialized_pages_cache_loss_keeps_old_custody);
+	UT_RUN(test_episode_initialized_pages_alias_has_no_native_effect);
 	UT_RUN(test_census_current_pages_keep_initial_baseline_after_owner_write);
 	UT_RUN(test_census_current_pages_refuse_replaced_short_or_unsafe_objects);
 	UT_RUN(test_census_current_pages_preconditions_do_not_enter_or_poison);
