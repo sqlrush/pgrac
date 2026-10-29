@@ -70,6 +70,29 @@ extern ClusterRelmapCensusResult cluster_relmap_retention_census_begin_episode(
 	ClusterRelmapRetentionDirectory *const directories[], size_t count,
 	size_t memory_budget, ClusterRelmapRetentionCensus **out);
 
+/* Original all-source native-input factory, before the physical scan. Takes
+ * no caller floor/issued or directory values. Require one complete original
+ * checkpoint generation per origin; history/terminal/missing/legacy windows
+ * remain unsupported. Native inputs are read through the original full-source
+ * checkpoint visitor, with the entire fixed cohort checked around each read.
+ * BUILDING uses each actual native floor and post-flush published last-issued,
+ * never checkpoint nextXid or a lease ceiling. Recheck the original physical
+ * ROOT after producer I/O before publishing the cursor exactly once.
+ *
+ * This derives numeric observations, not native era/history/no-reuse or
+ * continuous CLOG lifetime qualification. ALL remaining original isolation,
+ * native/SIDE/lifetime preconditions above remain owner duties. There is no
+ * live caller, allocation/truncation admission, COMPLETE or release authority.
+ * The budget covers the peak cursor, both source snapshots and all private
+ * directories. Success owns a contiguous directory block and borrows ROOT;
+ * destroy before the original episode/ROOT/ResourceOwner, on every exit.
+ * The fresh NULL output/alias/precondition/sticky ERROR contracts of the
+ * episode adapter apply. Failure frees only local storage, retaining original
+ * FD/all-IR/WALR/pins/debt. Older APIs retain their original behavior. */
+extern ClusterRelmapCensusResult cluster_relmap_retention_census_begin_native_episode(
+	const struct ClusterRecoveryRelmapSourceV1 *source, ClusterRecoveryRootSet *roots,
+	size_t memory_budget, ClusterRelmapRetentionCensus **out);
+
 /* Initial single-origin census from the original execution checkpoint/WAL
  * producer, without caller-filled directory bounds. Borrow the original
  * isolated OBSERVED ROOT, never a configured path. The caller still qualifies
