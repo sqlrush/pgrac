@@ -1469,6 +1469,8 @@ test_cluster_startup_cf_callsite.inc: $(top_srcdir)/src/backend/access/transam/x
 
 test_cluster_startup_cf_entry: test_cluster_startup_cf_entry.c test_cluster_cf_enqueue.c \
 		test_cluster_prepared_cf.h test_cluster_prepared_cf.inc \
+		test_cluster_generic_cf.h test_cluster_generic_cf.inc \
+		test_cluster_rejoin_cf.h test_cluster_rejoin_cf.inc test_cluster_rejoin_cf_types.inc \
 		test_cluster_startup_cf_entry.inc test_cluster_startup_cf_callsite.inc \
 		test_cluster_merge_cf_entry.inc \
 		test_cluster_merge_cold_cf.inc \
@@ -1478,6 +1480,7 @@ test_cluster_startup_cf_entry: test_cluster_startup_cf_entry.c test_cluster_cf_e
 		test_cluster_failure_input_cf.inc \
 		test_cluster_recovery_complete_cf.inc test_cluster_complete_authority.inc \
 		test_cluster_cf_blocker_trace.inc test_cluster_startup_interrupt.inc unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_census.h \
 		$(top_srcdir)/src/backend/cluster/cluster_cf_enqueue.c \
 		$(top_srcdir)/src/backend/cluster/cluster_lock_owner.c \
 		$(top_srcdir)/src/backend/cluster/cluster_control_request.c $(CLUSTER_LMD_WAIT_STATE_O) \
@@ -1497,6 +1500,36 @@ test_cluster_prepared_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_control_
 	     /^(cluster_control_root_create_prepared|cluster_control_root_activate_prepared)\(/ { print "ClusterControlRootResult"; emit=1; consumers++ } \
 	     emit { print } /^}/ { emit=0 } \
 	     END { if (codecs != 4 || predicates != 5 || acquires != 1 || releases != 1 || authorities != 2 || consumers != 2 || emit) exit 1 }' \
+	     $(filter %.c,$^) > $@.tmp
+	mv $@.tmp $@
+
+# Original generic consumer; an exact failed attempt consumes its authority.
+test_cluster_generic_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_control_root.c Makefile
+	awk '/^snapshot_reserved_zero\(/ { print "static bool"; emit=1; reserved++ } \
+	     /^reason_mask\(/ { print "static uint64"; emit=1; masks++ } \
+	     /^patch_shape_valid\(/ { print "static bool"; emit=1; shapes++ } \
+	     /^root_publish_requires_walr\(/ { print "static bool"; emit=1; selectors++ } \
+	     /^cluster_control_root_compare_and_publish\(/ { print "ClusterControlRootResult"; emit=1; consumers++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (reserved != 1 || masks != 1 || shapes != 1 || selectors != 1 || consumers != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Original retained coordinator stage layout.
+test_cluster_rejoin_cf_types.inc: $(top_srcdir)/src/backend/cluster/cluster_reconfig.c Makefile
+	awk '/^typedef struct ClusterReconfigJoinCommitStage \{/ { emit=1; types++ } \
+	     emit { print } /^} ClusterReconfigJoinCommitStage;/ { emit=0 } \
+	     END { if (types != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Join the original coordinator stage to its ROOT publisher and CF refusal.
+test_cluster_rejoin_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_duty.c \
+		$(top_srcdir)/src/backend/cluster/cluster_reconfig.c Makefile
+	awk 'FNR == NR && /^(cluster_recovery_duty_key_encode_for_claim|cluster_recovery_owner_rejoin_v1)\(/ { print "static bool"; emit=1; publishers++ } \
+	     FNR == NR && /^(cluster_recovery_duty_key_compare_for_claim|cluster_recovery_duty_key_compare)\(/ { print "static ClusterRecoveryDutyCompare"; emit=1; compares++ } \
+	     FNR != NR && /^cluster_reconfig_release_join_commit_stage\(/ { print "static void"; emit=1; releases++ } \
+	     FNR != NR && /^cluster_reconfig_poll_join_commit_stage\(/ { print "static bool"; emit=1; polls++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (publishers != 2 || compares != 2 || releases != 1 || polls != 1 || emit) exit 1 }' \
 	     $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 

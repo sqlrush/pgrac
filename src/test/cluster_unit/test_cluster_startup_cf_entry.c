@@ -14,6 +14,7 @@
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_wal_inputs.h"
+#include "cluster/cluster_relmap_retention_census.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_wal_cut.h"
@@ -6318,6 +6319,8 @@ UT_TEST(ordinary_recovery_complete_roles_keep_the_original_cf_wait_policy)
 }
 
 #include "test_cluster_prepared_cf.h"
+#include "test_cluster_generic_cf.h"
+#include "test_cluster_rejoin_cf.h"
 
 int
 main(void)
@@ -6329,6 +6332,20 @@ main(void)
 	pg_atomic_init_u64(&owner_proc.cluster_grd_redeclare_acked_epoch, 0);
 	cluster_control_request_shmem_init();
 	retire_driver = cluster_control_request_driver_start();
+	if (getenv("PGRAC_PRE2_TEST_REJOIN_CF_LIVENESS") != NULL) {
+		UT_PLAN(1);
+		UT_RUN(rejoin_cf_wait_keeps_original_staged_publication);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_GENERIC_CF_AUTHORITY") != NULL) {
+		UT_PLAN(3);
+		UT_RUN(generic_cf_refusal_consumes_authority_before_any_retry);
+		UT_RUN(generic_cf_drift_never_consumes_a_different_publication);
+		UT_RUN(generic_cf_unconfirmed_pin_release_never_restores_authority);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_PREPARED_CF_LIVENESS") != NULL) {
 		UT_PLAN(1);
 		UT_RUN(lmon_prepared_cf_successful_publication_must_finish_original_round);
@@ -6353,7 +6370,7 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(89);
+	UT_PLAN(97);
 	UT_RUN(startup_cf_timeout_waits_for_exact_completion_before_begin);
 	UT_RUN(startup_cf_completion_does_not_preserve_changed_native_input);
 	UT_RUN(startup_cf_unsafe_native_context_never_takes_a_registry_lock);
@@ -6443,6 +6460,14 @@ main(void)
 	UT_RUN(lmon_prepared_cf_retry_rechecks_coordinator_and_prepared_ack);
 	UT_RUN(lmon_prepared_cf_real_token_and_round_failure_still_refuse);
 	UT_RUN(lmon_prepared_cf_hard_failure_never_publishes_root);
+	UT_RUN(generic_cf_refusal_consumes_authority_before_any_retry);
+	UT_RUN(generic_cf_drift_never_consumes_a_different_publication);
+	UT_RUN(generic_cf_unconfirmed_pin_release_never_restores_authority);
+	UT_RUN(rejoin_cf_slice_releases_stage_but_keeps_original_cleanup);
+	UT_RUN(rejoin_fresh_attempt_rechecks_original_root_and_jcmk);
+	UT_RUN(rejoin_fresh_proof_drift_never_reuses_consumed_publication);
+	UT_RUN(rejoin_staged_marker_wait_is_not_a_root_wait);
+	UT_RUN(rejoin_open_exact_owner_still_requires_fresh_import);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
