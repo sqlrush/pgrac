@@ -53,6 +53,7 @@
 UT_DEFINE_GLOBALS();
 
 #include "test_cluster_wal_retained_cut_records_boundary.h"
+#include "test_cluster_wal_retained_job_boundary.h"
 
 #include "test_cluster_wal_retained_cut_records_cases.h"
 

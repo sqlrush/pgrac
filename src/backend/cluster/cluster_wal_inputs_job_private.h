@@ -56,6 +56,7 @@ typedef struct ClusterWalInputsJobSlotV1 {
 typedef struct ClusterWalInputsJobProcessV1 {
 	uint64 generation;
 	bool callback_registered;
+	MemoryContext caller_lifetime;
 } ClusterWalInputsJobProcessV1;
 
 /* The standalone layout gate also checks the original ResourceOwner list
@@ -87,6 +88,11 @@ typedef struct ClusterWalInputsJobControlBudgetV1 {
 	uint16 pin_cursors[2];
 	uint8 cf_bindings[2][CLUSTER_CF_JOB_BINDING_MAX_BYTES];
 } ClusterWalInputsJobControlBudgetV1;
+
+/* Original Aux-only allocation parent and mark-only ERROR revocation. */
+extern ClusterControlRootResult cluster_wal_inputs_job_open_aux_v1(
+	ClusterWalInputsConsumerV1 consumer, ClusterWalInputsJobV1 **job);
+extern bool cluster_wal_inputs_job_revoke_v1(ClusterWalInputsJobV1 *job, bool error);
 
 /* Local binding checks never grant input authority. The original active
  * pin and its process generation independently witness the job backlink. */

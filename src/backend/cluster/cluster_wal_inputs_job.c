@@ -124,6 +124,21 @@ inputs_job_transition(ClusterWalInputsJobSlotV1 *slot, uint32 state, uint16 flag
 		elog(FATAL, "invalid original WAL input scope during revocation");
 }
 
+bool
+cluster_wal_inputs_job_revoke_v1(ClusterWalInputsJobV1 *job, bool error)
+{
+	ClusterWalInputsJobSlotV1 *slot = inputs_job_find(job, false);
+
+	if (slot == NULL)
+		return false;
+	if (job->state != WAL_INPUT_JOB_STATE_DONE)
+		inputs_job_transition(slot,
+			job->state == WAL_INPUT_JOB_STATE_RETIRING_WALR || job->walr_next != 0
+				? WAL_INPUT_JOB_STATE_RETIRING_WALR : WAL_INPUT_JOB_STATE_RETIRING_CF,
+			job->flags | WAL_INPUT_JOB_FLAG_REVOKED | (error ? WAL_INPUT_JOB_FLAG_ERROR : 0));
+	return true;
+}
+
 ClusterControlRootResult
 cluster_wal_inputs_job_begin_ready_v1(ClusterWalInputsJobV1 *job)
 {
@@ -430,6 +445,22 @@ inputs_jobs_resource_release(ResourceReleasePhase phase, bool isCommit,
 		/* Only revoke. The original service loop observes ACK completion;
 		 * this callback neither waits nor releases the caller's context. */
 	}
+}
+
+ClusterControlRootResult
+cluster_wal_inputs_job_open_aux_v1(ClusterWalInputsConsumerV1 consumer, ClusterWalInputsJobV1 **out)
+{
+	if (out == NULL || !inputs_job_caller(consumer, false))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (inputs_jobs_process.caller_lifetime == NULL) {
+		if (MyBackendType == B_CHECKPOINTER)
+			inputs_jobs_process.caller_lifetime = AllocSetContextCreate(TopMemoryContext,
+				"Checkpointer WAL input jobs", ALLOCSET_DEFAULT_SIZES);
+		else
+			inputs_jobs_process.caller_lifetime = AllocSetContextCreate(TopMemoryContext,
+				"Bgwriter WAL input jobs", ALLOCSET_DEFAULT_SIZES);
+	}
+	return cluster_wal_inputs_job_open_v1(consumer, inputs_jobs_process.caller_lifetime, out);
 }
 
 ClusterControlRootResult

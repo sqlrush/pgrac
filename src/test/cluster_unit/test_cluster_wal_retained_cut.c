@@ -587,6 +587,7 @@ compute(ClusterWalRetainedCutV1 *cut, RfPageProofDetailV1 *detail)
 }
 
 #include "test_cluster_wal_retained_cut_cases.h"
+#include "test_cluster_wal_retained_job_boundary.h"
 
 int
 main(void)
