@@ -54,6 +54,7 @@
 #include "catalog/pg_subscription.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_transform.h"
+#include "catalog/pg_trigger.h"
 #include "catalog/pg_ts_config.h"
 #include "catalog/pg_ts_dict.h"
 #include "catalog/pg_ts_parser.h"
@@ -451,6 +452,10 @@ static unsigned column_rename_unexpected_callbacks;
 static RangeVar *column_rename_expected_relation;
 static uint32 column_rename_expected_flags;
 
+static bool trigger_create_lookup_active, trigger_create_expect_binding;
+static unsigned trigger_create_lookups, trigger_create_unbound, trigger_create_bad_lookup;
+static Oid trigger_create_expected_oid;
+static const RangeVar *trigger_create_expected_relation;
 static bool trigger_rename_lookup_active, trigger_rename_expect_binding;
 static unsigned trigger_rename_lookups, trigger_rename_unbound, trigger_rename_bad_lookup;
 static unsigned trigger_rename_unexpected_callbacks;
@@ -6610,6 +6615,17 @@ static unsigned role_rename_lookups, role_rename_unbound, role_rename_bad_lookup
 Relation
 table_open(Oid relationId, LOCKMODE lockmode)
 {
+	if (trigger_create_lookup_active) {
+		trigger_create_lookups++;
+		if (trigger_create_expect_binding
+			&& (utility_binds == 0 || !TransactionIdIsValid(utility_top_xid)
+				|| utility_current_xid != utility_top_xid))
+			trigger_create_unbound++;
+		if (!OidIsValid(trigger_create_expected_oid) || relationId != trigger_create_expected_oid
+			|| lockmode != ShareRowExclusiveLock)
+			trigger_create_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before real relation lookup or locking. */
+	}
 	if (tablespace_rename_lookup_active) {
 		tablespace_rename_lookups++;
 		if (tablespace_rename_expect_binding
@@ -22002,10 +22018,286 @@ UT_TEST(test_native_ctas_create_scope_precedes_binding_and_keeps_existing_debt)
 	ctas_create_lookup_active = false;
 }
 
+/* Actual root wrapper and core prefix retain original role flags. Both
+ * relation-opening branches are negative boundaries before query or lock. */
+Relation
+table_openrv(const RangeVar *relation, LOCKMODE lockmode)
+{
+	trigger_create_lookups++;
+	if (trigger_create_expect_binding
+		&& (utility_binds == 0 || !TransactionIdIsValid(utility_top_xid)
+			|| utility_current_xid != utility_top_xid))
+		trigger_create_unbound++;
+	if (!trigger_create_lookup_active || OidIsValid(trigger_create_expected_oid)
+		|| relation != trigger_create_expected_relation || lockmode != ShareRowExclusiveLock)
+		trigger_create_bad_lookup++;
+	siglongjmp(boundary, 2); /* Stop before real namespace, relation lookup or locking. */
+}
+
+#include "test_cluster_fresh_trigger_create.inc"
+static CreateTrigStmt native_trigger_create_statement;
+static RangeVar trigger_create_relation;
+static String trigger_create_function_name;
+static ListCell trigger_create_function_cell;
+static List trigger_create_function_names;
+static Node *trigger_create_expected_statement;
+static bool trigger_create_direct_core, trigger_create_internal, trigger_create_partition;
+static const char *trigger_create_query_string;
+static Oid trigger_create_relid;
+static Const trigger_create_when;
+static Node *trigger_create_when_clause;
+static char trigger_create_fires_when;
+
+static void
+reset_native_trigger_create(bool expect_binding, unsigned form)
+{
+	static const char firing_modes[] = { TRIGGER_FIRES_ON_ORIGIN, TRIGGER_FIRES_ALWAYS,
+										 TRIGGER_FIRES_ON_REPLICA, TRIGGER_DISABLED };
+
+	reset_create_preflight();
+	trigger_create_lookup_active = false;
+	trigger_create_expect_binding = expect_binding;
+	trigger_create_lookups = trigger_create_unbound = trigger_create_bad_lookup = 0;
+	trigger_create_internal = trigger_create_partition = false;
+	trigger_create_direct_core = (form & 2) != 0;
+	trigger_create_query_string = (form & 4) != 0 ? NULL : "CREATE TRIGGER native_trigger";
+	trigger_create_relation = (RangeVar){ .type = T_RangeVar,
+										  .schemaname = (form & 4) != 0 ? "trigger_schema" : NULL,
+										  .relname = "native_trigger_table",
+										  .inh = true,
+										  .relpersistence = RELPERSISTENCE_PERMANENT,
+										  .location = -1 };
+	trigger_create_relid = (form & 1) != 0 ? 24001 : InvalidOid;
+	trigger_create_expected_oid = trigger_create_relid;
+	trigger_create_expected_relation = &trigger_create_relation;
+	trigger_create_function_name = (String){ .type = T_String, .sval = "native_trigger_function" };
+	one_element(&trigger_create_function_names, &trigger_create_function_cell,
+				&trigger_create_function_name);
+	trigger_create_when = (Const){ .xpr.type = T_Const,
+								   .consttype = BOOLOID,
+								   .consttypmod = -1,
+								   .constcollid = InvalidOid,
+								   .constlen = sizeof(bool),
+								   .constvalue = BoolGetDatum(true),
+								   .constisnull = false,
+								   .constbyval = true,
+								   .location = -1 };
+	trigger_create_when_clause = (form & 4) != 0 ? (Node *)&trigger_create_when : NULL;
+	trigger_create_fires_when = firing_modes[form % lengthof(firing_modes)];
+	native_trigger_create_statement
+		= (CreateTrigStmt){ .type = T_CreateTrigStmt,
+							.trigname = "native_created_trigger",
+							.relation = &trigger_create_relation,
+							.funcname = &trigger_create_function_names,
+							.row = true,
+							.timing = TRIGGER_TYPE_AFTER,
+							.events = TRIGGER_TYPE_INSERT | TRIGGER_TYPE_UPDATE,
+							.replace = (form & 4) != 0 };
+	trigger_create_expected_statement = (Node *)&native_trigger_create_statement;
+}
+
+static void
+native_trigger_create_entry(void)
+{
+	trigger_create_lookup_active = true;
+	if (trigger_create_direct_core)
+		(void)CreateTriggerFiringOn(&native_trigger_create_statement, trigger_create_query_string,
+									trigger_create_relid, InvalidOid, InvalidOid, InvalidOid,
+									InvalidOid, trigger_create_partition ? 24002 : InvalidOid,
+									trigger_create_when_clause, trigger_create_internal,
+									trigger_create_partition, trigger_create_fires_when);
+	else
+		(void)CreateTrigger(&native_trigger_create_statement, trigger_create_query_string,
+							trigger_create_relid, InvalidOid, InvalidOid, InvalidOid, InvalidOid,
+							trigger_create_partition ? 24002 : InvalidOid,
+							trigger_create_when_clause, trigger_create_internal,
+							trigger_create_partition);
+}
+
+UT_TEST(test_native_trigger_create_binds_before_first_lock_in_all_profiles)
+{
+	for (unsigned form = 0; form < 8; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_trigger_create(binds, form);
+			set_native_operator_mode(mode);
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_trigger_create_entry();
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(trigger_create_lookups, repeat + 1);
+				UT_ASSERT_EQ(trigger_create_unbound, 0);
+				UT_ASSERT_EQ(trigger_create_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	trigger_create_lookup_active = false;
+}
+
+UT_TEST(test_native_trigger_create_refuses_before_lock_on_publication_child_and_top_errors)
+{
+	for (unsigned form = 0; form < 8; form++) {
+		for (unsigned failure = 0; failure < 5; failure++) {
+			bool allocated = failure == 0 || failure == 2;
+			int caught;
+
+			reset_native_trigger_create(true, form);
+			if (failure == 0)
+				utility_bind_ok = false;
+			else if (failure == 1 || failure == 2) {
+				if (failure == 2)
+					create_sql_entry(trigger_create_expected_statement);
+				utility_in_child = true;
+			} else {
+				utility_current_xid = 401;
+				utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_trigger_create_entry();
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, failure == 0  ? ERRCODE_DATA_CORRUPTED
+									 : failure < 3 ? ERRCODE_FEATURE_NOT_SUPPORTED
+												   : ERRCODE_INTERNAL_ERROR);
+			UT_ASSERT_STR_EQ(
+				error_message,
+				failure == 0  ? "canonical ACTIVE publication failed before shared catalog creation"
+				: failure < 3 ? "shared catalog creation does not support subtransactions"
+							  : "shared catalog top-level transaction identity mismatch");
+			UT_ASSERT_EQ(trigger_create_lookups, 0);
+			UT_ASSERT_EQ(trigger_create_unbound + trigger_create_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_xids, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, failure == 2 ? 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, allocated || failure == 3 ? 400 : InvalidTransactionId);
+		}
+	}
+	trigger_create_lookup_active = false;
+}
+
+UT_TEST(test_native_trigger_create_context_guards_keep_nonshared_route)
+{
+	for (unsigned form = 0; form < 8; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+
+			for (unsigned guard = 0; guard < 3; guard++) {
+				int caught;
+
+				reset_native_trigger_create(binds, form);
+				set_native_operator_mode(mode);
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_trigger_create_entry();
+				UT_ASSERT_EQ(caught, binds ? 1 : 2);
+				UT_ASSERT_EQ(error_code, !binds		  ? 0
+										 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+													  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				UT_ASSERT_EQ(trigger_create_lookups, binds ? 0 : 1);
+				UT_ASSERT_EQ(trigger_create_unbound + trigger_create_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	trigger_create_lookup_active = false;
+}
+
+UT_TEST(test_native_trigger_create_utility_warm_guards_preserve_binding)
+{
+	for (unsigned form = 0; form < 8; form++) {
+		for (unsigned guard = 0; guard < 4; guard++) {
+			int caught;
+
+			reset_native_trigger_create(true, form);
+			create_sql_entry(trigger_create_expected_statement);
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			XactReadOnly = guard == 1;
+			utility_parallel = guard == 2;
+			utility_recovery = guard == 3;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_trigger_create_entry();
+			UT_ASSERT_EQ(caught, guard ? 1 : 2);
+			UT_ASSERT_EQ(error_code, !guard		  ? 0
+									 : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+												  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT_EQ(trigger_create_lookups, guard ? 0 : 1);
+			UT_ASSERT_EQ(trigger_create_unbound + trigger_create_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_prepares, guard ? 1 : 2);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			UT_ASSERT_EQ(utility_top_xid, 400);
+		}
+	}
+	trigger_create_lookup_active = false;
+}
+
+UT_TEST(test_native_trigger_create_internal_partition_roles_preserve_caller_responsibility)
+{
+	for (unsigned form = 0; form < 8; form++) {
+		for (unsigned role = 1; role < 4; role++) {
+			for (unsigned mode = 0; mode < 8; mode++) {
+				for (unsigned warm = 0; warm < 2; warm++) {
+					for (unsigned fault = 0; fault < 8; fault++) {
+						int caught;
+
+						reset_native_trigger_create(false, form);
+						if (warm)
+							create_sql_entry(trigger_create_expected_statement);
+						set_native_operator_mode(mode);
+						trigger_create_internal = (role & 1) != 0;
+						trigger_create_partition = (role & 2) != 0;
+						XactReadOnly = fault == 1;
+						utility_parallel = fault == 2;
+						utility_recovery = fault == 3;
+						utility_in_child = fault == 4;
+						if (fault == 5 || fault == 6) {
+							utility_current_xid = 401;
+							utility_top_xid = fault == 5 ? 400 : InvalidTransactionId;
+						}
+						utility_bind_ok = fault != 7;
+						caught = sigsetjmp(boundary, 1);
+						if (!caught)
+							native_trigger_create_entry();
+						UT_ASSERT_EQ(caught, 2);
+						UT_ASSERT_EQ(error_code, 0);
+						UT_ASSERT_EQ(trigger_create_lookups, 1);
+						UT_ASSERT_EQ(trigger_create_unbound + trigger_create_bad_lookup, 0);
+						UT_ASSERT_EQ(utility_xids, warm);
+						UT_ASSERT_EQ(utility_prepares, warm);
+						UT_ASSERT_EQ(utility_binds, warm);
+						UT_ASSERT_EQ(utility_top_xid, fault == 5   ? 400
+													  : fault == 6 ? InvalidTransactionId
+													  : warm	   ? 400
+																   : InvalidTransactionId);
+						UT_ASSERT_EQ(utility_current_xid, fault == 5 || fault == 6 ? 401
+														  : warm ? 400
+																 : InvalidTransactionId);
+					}
+				}
+			}
+		}
+	}
+	trigger_create_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(352);
+	UT_PLAN(357);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -22361,6 +22653,11 @@ main(void)
 	UT_RUN(test_native_ctas_create_context_guards_keep_nonshared_route);
 	UT_RUN(test_native_ctas_create_utility_warm_guards_preserve_binding);
 	UT_RUN(test_native_ctas_create_scope_precedes_binding_and_keeps_existing_debt);
+	UT_RUN(test_native_trigger_create_binds_before_first_lock_in_all_profiles);
+	UT_RUN(test_native_trigger_create_refuses_before_lock_on_publication_child_and_top_errors);
+	UT_RUN(test_native_trigger_create_context_guards_keep_nonshared_route);
+	UT_RUN(test_native_trigger_create_utility_warm_guards_preserve_binding);
+	UT_RUN(test_native_trigger_create_internal_partition_roles_preserve_caller_responsibility);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

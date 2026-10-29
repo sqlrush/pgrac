@@ -11,6 +11,7 @@
  *
  * PGRAC MODIFICATIONS
  *    Preflight native trigger renames before relation queries and locks.
+ *    Preflight root trigger creation before relation queries and locks.
  *    Author: SqlRush <sqlrush@gmail.com>
  *
  *-------------------------------------------------------------------------
@@ -221,6 +222,30 @@ CreateTriggerFiringOn(CreateTrigStmt *stmt, const char *queryString,
 	Oid			existing_constraint_oid = InvalidOid;
 	bool		existing_isInternal = false;
 	bool		existing_isClone = false;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* Keep internal and recursive calls on their caller's existing path. */
+	if (!isInternal && !in_partition && cluster_shared_catalog && cluster_storage_mode_enabled()) {
+		ClusterCanonicalTxnBinding binding;
+		TransactionId current_xid;
+
+		PreventCommandIfReadOnly("CREATE TRIGGER");
+		PreventCommandIfParallelMode("CREATE TRIGGER");
+		PreventCommandDuringRecovery("CREATE TRIGGER");
+		if (IsSubTransaction())
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("shared catalog creation does not support subtransactions")));
+		current_xid = GetCurrentTransactionIdIfAny();
+		if (TransactionIdIsValid(current_xid)
+			&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("shared catalog top-level transaction identity mismatch")));
+		if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("canonical ACTIVE publication failed before shared catalog creation")));
+	}
+#endif
 
 	if (OidIsValid(relOid))
 		rel = table_open(relOid, ShareRowExclusiveLock);
