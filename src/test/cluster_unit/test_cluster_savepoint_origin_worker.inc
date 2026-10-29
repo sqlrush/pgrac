@@ -4521,3 +4521,222 @@ UT_TEST(test_operation_worker_retained_native_error_hands_off_waiter)
 	for (unsigned layout = 0; layout < 4; layout++)
 		operation_worker_retained_error_handoff(1, layout, true);
 }
+
+/* Move an existing small fixture across DATA pages without changing its TT. */
+static UBA
+update_multidata_address(UBA original)
+{
+	uint32 segment, block;
+	uint16 tt, row;
+
+	if (UBA_is_invalid(original))
+		return original;
+	if (!uba_decode_record(original, &segment, &block, &tt, &row) || segment != TEST_RECORD_SEGMENT
+		|| block != 7 || row >= 3) {
+		UT_ASSERT(false);
+		return (UBA)InvalidUba_init;
+	}
+	return uba_encode(segment, 7 + row, tt, 0);
+}
+
+static void
+update_multidata_heap_heads(char page[BLCKSZ])
+{
+	ClusterItlSlotData *slots = ClusterPageGetItlSlots((Page)page);
+
+	for (unsigned i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
+		slots[i].undo_segment_head = update_multidata_address(slots[i].undo_segment_head);
+}
+
+static void
+update_multidata_record(char *bytes, uint16 length)
+{
+	UndoRecordHeader record;
+	UndoItlHistoryTrailer history;
+	char *history_bytes = bytes + length - sizeof(UndoOperationTrailer) - sizeof(history);
+
+	memcpy(&record, bytes, sizeof(record));
+	memcpy(&history, history_bytes, sizeof(history));
+	UT_ASSERT(history.count > 0 && history.count <= UNDO_ITL_HISTORY_TARGETS);
+	record.prev_uba = update_multidata_address(record.prev_uba);
+	for (unsigned i = 0; i < history.count; i++)
+		history.entries[i].prior.undo_segment_head
+			= update_multidata_address(history.entries[i].prior.undo_segment_head);
+	memcpy(bytes, &record, sizeof(record));
+	memcpy(history_bytes, &history, sizeof(history));
+}
+
+static void
+update_multidata_relocate(OperationWorkerFixture *f, char expected[BLCKSZ])
+{
+	PGAlignedBlock original;
+	UndoBlockHeader header;
+
+	memcpy(original.data, test_operation_page.data, BLCKSZ);
+	memcpy(&header, original.data, sizeof(header));
+	UT_ASSERT(header.slot_count == 2 || header.slot_count == 3);
+	memset(test_operation_page.data, 0, BLCKSZ);
+	memset(test_operation_multidata_pages, 0, sizeof(test_operation_multidata_pages));
+	for (unsigned row = 0; row < header.slot_count; row++) {
+		char *page
+			= row == 0 ? test_operation_page.data : test_operation_multidata_pages[row - 1].data;
+		UndoSlotDirEntry directory;
+		UndoBlockHeader local = header;
+
+		memcpy(&directory, original.data + BLCKSZ - (row + 1) * sizeof(directory),
+			   sizeof(directory));
+		memcpy(page + sizeof(header), original.data + directory.record_offset,
+			   directory.record_length);
+		directory.record_offset = sizeof(header);
+		update_multidata_record(page + directory.record_offset, directory.record_length);
+		local.slot_count = 1;
+		local.free_offset = sizeof(header) + directory.record_length;
+		UT_ASSERT(local.free_offset < BLCKSZ - sizeof(directory));
+		memcpy(page, &local, sizeof(local));
+		memcpy(page + BLCKSZ - sizeof(directory), &directory, sizeof(directory));
+	}
+	update_multidata_heap_heads(f->cr.source.data);
+	update_multidata_heap_heads(expected);
+	test_operation_multidata_enabled = true;
+	test_operation_multidata_cold = false;
+	test_operation_multidata_mask = (1U << header.slot_count) - 1;
+	test_operation_multidata_request_count = 0;
+}
+
+static void
+update_multidata_before_oldest(OperationWorkerFixture *f, unsigned records)
+{
+	for (unsigned tick = 0; tick < 128 && f->extension.build_steps < records; tick++)
+		UT_ASSERT_EQ(operation_worker_generation_poll(f, 0), CLUSTER_R4_CR_STEP_PENDING);
+	UT_ASSERT_EQ(f->extension.build_steps, records);
+	UT_ASSERT_EQ(test_candidate_acquire_calls, 3 * (records - 1));
+	UT_ASSERT_EQ(test_candidate_release_calls, test_candidate_acquire_calls);
+	UT_ASSERT_EQ(test_candidate_held_count, 0);
+}
+
+static void
+update_multidata_assert_result(OperationWorkerFixture *f, const char expected[BLCKSZ],
+							   unsigned records, bool fail, int allocations)
+{
+	ClusterR4CrBuildStepResult step = operation_worker_long_finish(f);
+
+	UT_ASSERT_EQ(step, fail ? CLUSTER_R4_CR_STEP_FAIL : CLUSTER_R4_CR_STEP_FULL);
+	UT_ASSERT_EQ(f->reason, fail ? CLUSTER_CR_BUILD_BAD_UNDO : CLUSTER_CR_BUILD_NONE);
+	UT_ASSERT_EQ(memcmp(expected, f->cr.source.data, BLCKSZ), 0);
+	UT_ASSERT_EQ(f->extension.build_steps, records);
+	UT_ASSERT_EQ(test_candidate_acquire_calls, 3 * records);
+	UT_ASSERT_EQ(test_candidate_release_calls, test_candidate_acquire_calls);
+	UT_ASSERT_EQ(test_candidate_cancel_calls, 0);
+	UT_ASSERT_EQ(test_candidate_max_held_count, 1);
+	UT_ASSERT_EQ(test_candidate_held_count, 0);
+	UT_ASSERT_EQ(test_undo_read_calls, records);
+	UT_ASSERT_EQ(test_operation_multidata_request_count, 2 * records);
+	for (unsigned i = 0; i < 2 * records; i++)
+		UT_ASSERT_EQ(test_operation_multidata_requests[i], 6 + records - i / 2);
+	UT_ASSERT_EQ(test_candidate_data_pin_calls, 0);
+	UT_ASSERT_EQ(test_candidate_data_unpin_calls, 0);
+	UT_ASSERT_EQ(test_operation_pin_depth, 0);
+	cluster_cr_build_on_holder_forget(0, 1000);
+	cluster_cr_build_on_holder_forget(0, 1000);
+	UT_ASSERT_EQ(test_candidate_cancel_calls, 0);
+	UT_ASSERT_EQ(operation_worker_allocations, allocations);
+}
+
+static void
+update_multidata_old_role(unsigned role, unsigned layout, bool keep)
+{
+	OperationWorkerFixture f;
+	PGAlignedBlock expected;
+	char old_root[60];
+	int allocations = operation_worker_allocations;
+
+	update_role_challenge(&f, role, layout & 1, layout & 2, keep, old_root);
+	update_role_expected(expected.data, f.cr.source.data, old_root, layout & 1, keep);
+	update_multidata_relocate(&f, expected.data);
+	update_multidata_before_oldest(&f, 2);
+	update_multidata_assert_result(&f, expected.data, 2, false, allocations);
+}
+
+UT_TEST(test_update_multidata_old_roles_keep_projection_independent)
+{
+	for (unsigned role = 0; role < 3; role++)
+		for (unsigned layout = 0; layout < 4; layout++) {
+			update_multidata_old_role(role, layout, false);
+			update_multidata_old_role(role, layout, true);
+		}
+}
+
+static void
+update_multidata_root_modifier(unsigned hot, unsigned layout, bool lock_only)
+{
+	OperationWorkerFixture f;
+	PGAlignedBlock expected;
+	int allocations = operation_worker_allocations;
+
+	update_role_later_root(&f, hot, layout & 1, layout & 2, lock_only);
+	memcpy(expected.data, f.cr.source.data, BLCKSZ);
+	if (!lock_only && !(layout & 1))
+		ClusterPageGetItlSlots((Page)expected.data)[2] = (ClusterItlSlotData){ .wrap = 8 };
+	update_multidata_relocate(&f, expected.data);
+	update_multidata_before_oldest(&f, 3);
+	update_multidata_assert_result(&f, expected.data, 3, lock_only, allocations);
+}
+
+UT_TEST(test_update_multidata_old_target_requires_full_modifier_coverage)
+{
+	for (unsigned hot = 0; hot < 2; hot++)
+		for (unsigned layout = 0; layout < 4; layout++) {
+			update_multidata_root_modifier(hot, layout, false);
+			update_multidata_root_modifier(hot, layout, true);
+		}
+}
+
+static void
+update_multidata_latest_lock(unsigned role, unsigned layout, unsigned mode)
+{
+	OperationWorkerFixture f;
+	PGAlignedBlock before_lock, expected;
+	int allocations = operation_worker_allocations;
+
+	update_creation_latest_lock(&f, role, layout & 1, layout & 2, mode == 1, before_lock.data);
+	memcpy(expected.data, mode == 0 ? f.cr.source.data : before_lock.data, BLCKSZ);
+	if (mode == 2) {
+		UndoSlotDirEntry directory;
+
+		test_mixed_top_slot.commit_scn = 80;
+		ItemIdSetUnused(PageGetItemId((Page)expected.data, 2));
+		memcpy(&directory, test_operation_page.data + BLCKSZ - 2 * sizeof(directory),
+			   sizeof(directory));
+		if (role != 2)
+			memcpy(PageGetItem((Page)expected.data, PageGetItemId((Page)expected.data, 1)),
+				   test_operation_page.data + directory.record_offset + sizeof(UndoRecordHeader)
+					   + sizeof(UndoUpdatePayload),
+				   60);
+		ClusterPageGetItlSlots((Page)expected.data)[2] = (ClusterItlSlotData){ .wrap = 8 };
+		if (!(layout & 1))
+			ClusterPageGetItlSlots((Page)expected.data)[4] = (ClusterItlSlotData){ .wrap = 14 };
+	} else {
+		if (role == 3)
+			ItemIdSetUnused(PageGetItemId((Page)expected.data, 2));
+		if (!(layout & 1))
+			ClusterPageGetItlSlots((Page)expected.data)[2] = (ClusterItlSlotData){ .wrap = 8 };
+	}
+	update_multidata_relocate(&f, expected.data);
+	update_multidata_before_oldest(&f, 3);
+	update_multidata_assert_result(&f, expected.data, 3, false, allocations);
+}
+
+UT_TEST(test_update_multidata_latest_lock_keeps_exact_creation_roles)
+{
+	for (unsigned role = 0; role < 3; role++)
+		for (unsigned layout = 0; layout < 4; layout++)
+			for (unsigned mode = 0; mode < 3; mode++)
+				update_multidata_latest_lock(role, layout, mode);
+}
+
+UT_TEST(test_update_multidata_old_page_lock_does_not_create_new_role)
+{
+	for (unsigned layout = 0; layout < 4; layout++)
+		for (unsigned mode = 0; mode < 2; mode++)
+			update_multidata_latest_lock(3, layout, mode);
+}
