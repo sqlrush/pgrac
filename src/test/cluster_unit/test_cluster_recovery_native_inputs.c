@@ -1122,6 +1122,7 @@ cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **held)
 #include "test_cluster_recovery_consumed_native_redo.inc"
 #include "test_cluster_recovery_episode_generation_xid.inc"
 #include "test_cluster_recovery_clog_full_roots.inc"
+#include "test_cluster_recovery_scope_census.inc"
 
 
 int
@@ -1131,6 +1132,11 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_SCOPE_CENSUS") != NULL) {
+		UT_PLAN(4);
+		scope_census_run();
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_CONSUMED_NATIVE") != NULL) {
 		UT_PLAN(4);
 		UT_RUN(test_episode_consumed_native_redo_reaches_original_sync_and_whole_page);
@@ -1381,7 +1387,8 @@ main(int argc, char **argv)
 		UT_RUN(test_episode_page_sources_preserve_unrelated_eventless_generation);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(237);
+	UT_PLAN(241);
+	scope_census_run();
 	UT_RUN(test_episode_page_sources_refuse_same_origin_without_clog);
 	UT_RUN(test_episode_page_sources_refuse_same_origin_without_counter);
 	UT_RUN(test_episode_page_sources_preserve_unrelated_eventless_generation);

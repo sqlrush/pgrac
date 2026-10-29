@@ -4794,6 +4794,8 @@ test_cluster_recovery_native_inputs: test_cluster_recovery_episode_native_clog.i
         test_cluster_recovery_episode_clog.h test_cluster_recovery_episode_clog.o
 test_cluster_recovery_native_inputs: test_cluster_recovery_clog_full_roots.inc \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_root_set.h
+test_cluster_recovery_native_inputs: test_cluster_recovery_scope_census.inc \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_census.h
 test_cluster_recovery_native_inputs: test_cluster_recovery_episode_history.inc \
 		test_cluster_recovery_relmap_fold.inc test_cluster_recovery_episode_pending.inc \
 		test_cluster_recovery_episode_base.inc test_cluster_recovery_episode_sources.inc test_cluster_recovery_episode_pages.inc \
@@ -4810,6 +4812,7 @@ test_cluster_recovery_native_inputs: test_cluster_recovery_episode_clog_history.
 		test_cluster_recovery_episode_birth_halfspace.inc
 # Redirect one observation leaf only for this program; sibling providers stay original.
 test_cluster_recovery_consumed_inputs.o: $(top_srcdir)/src/backend/cluster/cluster_wal_inputs.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_census.h \
 		$(top_srcdir)/src/include/cluster/cluster_wal_retention.h \
 		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_plan.h \
