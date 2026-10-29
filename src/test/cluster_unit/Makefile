@@ -11056,8 +11056,21 @@ test_cluster_freeze_writer_context.inc: $(top_srcdir)/src/backend/storage/buffer
 	     END { if (types != 2 || array != 1 || find != 2 || exact != 1 || capture != 2 || resume != 1 || cleanup != 4) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_vacuum_cleanup_pin.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	@awk '/^(ConditionalLockBufferForCleanup|IsBufferCleanupOK)\(/ { print "bool"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (count != 2) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_vacuum_initial_writer.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
+	@awk '/^lazy_lock_buffer_for_cleanup\(/ { print "static bool"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (count != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_freeze_writer_context: test_cluster_freeze_writer_context.c unit_test.h \
-		test_cluster_freeze_writer_context.inc $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		test_cluster_freeze_writer_context.inc test_cluster_vacuum_cleanup_pin.inc \
+		test_cluster_vacuum_initial_writer.inc $(CLUSTER_RESOURCE_X_IDENTITY_O) \
 		$(top_srcdir)/src/include/storage/bufmgr.h \
 		$(top_srcdir)/src/include/storage/buf_internals.h \
 		$(top_srcdir)/src/include/cluster/cluster_gcs_block.h \
@@ -11068,6 +11081,12 @@ test_cluster_freeze_writer_context: test_cluster_freeze_writer_context.c unit_te
 		$(top_srcdir)/src/include/cluster/storage/cluster_smgr.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_RESOURCE_X_IDENTITY_O) \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+clean distclean maintainer-clean: clean-vacuum-initial-writer
+.PHONY: clean-vacuum-initial-writer
+clean-vacuum-initial-writer:
+	rm -f test_cluster_vacuum_cleanup_pin.inc test_cluster_vacuum_cleanup_pin.inc.tmp
+	rm -f test_cluster_vacuum_initial_writer.inc test_cluster_vacuum_initial_writer.inc.tmp
 
 clean: clean-foreign-creation-deps
 .PHONY: clean-foreign-creation-deps

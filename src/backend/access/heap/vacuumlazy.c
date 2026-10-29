@@ -298,6 +298,7 @@ typedef struct LVSavedErrInfo
 
 
 /* non-export function prototypes */
+static bool lazy_lock_buffer_for_cleanup(LVRelState *vacrel, Buffer buffer);
 static void lazy_scan_heap(LVRelState *vacrel);
 #ifdef USE_PGRAC_CLUSTER
 static bool lazy_scan_shared_mx(LVRelState *vacrel, Page page, BlockNumber blkno);
@@ -963,6 +964,30 @@ lazy_clear_visibility_versioned(Relation rel, const ClusterSpaceIdentity *identi
 #endif
 
 /*
+ * Restricted shared VACUUM must capture its original ordinary writer before
+ * releasing the page for freeze proof collection.  Conditional content-X is
+ * deliberately read-only and cannot supply that writer.  Obtain the ordinary
+ * writer here, before capture, while keeping the cleanup pin check nonwaiting.
+ * If other pins prevent cleanup, release only our lock/writer and let the
+ * original SHARE/aggressive fallback retain responsibility for the pin.
+ */
+static bool
+lazy_lock_buffer_for_cleanup(LVRelState *vacrel, Buffer buffer)
+{
+#ifdef USE_PGRAC_CLUSTER
+	if (vacrel->versioned && vacrel->shared_maintenance_restricted)
+	{
+		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+		if (IsBufferCleanupOK(buffer))
+			return true;
+		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+		return false;
+	}
+#endif
+	return ConditionalLockBufferForCleanup(buffer);
+}
+
+/*
  *	lazy_scan_heap() -- workhorse function for VACUUM
  *
  *		This routine prunes each page in the heap, and considers the need to
@@ -1155,7 +1180,7 @@ lazy_scan_heap(LVRelState *vacrel)
 		buf = ReadBufferExtended(vacrel->rel, MAIN_FORKNUM, blkno, RBM_NORMAL,
 								 vacrel->bstrategy);
 		page = BufferGetPage(buf);
-		if (!ConditionalLockBufferForCleanup(buf))
+		if (!lazy_lock_buffer_for_cleanup(vacrel, buf))
 		{
 			bool		hastup,
 						recordfreespace;
