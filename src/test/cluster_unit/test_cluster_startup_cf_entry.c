@@ -38,6 +38,7 @@ bool entry_inherited_lock(LWLock *lock, LWLockMode mode);
 #undef UT_TEST
 #define UT_TEST(name) static void pg_attribute_unused() name(void)
 #define PGRAC_CONTROL_CF_EMBEDDED
+#define PGRAC_CF_JOB_LATCH_FIXTURE
 #define errstart entry_inherited_errstart
 #define errfinish entry_inherited_errfinish
 #define errmsg entry_inherited_errmsg
@@ -95,7 +96,15 @@ static bool claim_teardown;
 static void (*claim_on_reset)(void);
 static bool cold_consumer;
 static unsigned cold_release_waits, cold_reads;
+static unsigned entry_latch_sets;
 static uint64 entry_timeout(LOCKMODE mode);
+
+void
+SetLatch(Latch *latch)
+{
+	UT_ASSERT(latch == MyLatch);
+	++entry_latch_sets;
+}
 
 void
 cluster_lock_owners_service_poll(void)
@@ -6340,6 +6349,7 @@ UT_TEST(ordinary_recovery_complete_roles_keep_the_original_cf_wait_policy)
 }
 
 #include "test_cluster_prepared_cf.h"
+#include "test_cluster_prepared_job.h"
 #include "test_cluster_generic_cf.h"
 #include "test_cluster_rejoin_cf.h"
 #include "test_cluster_cold_own_root_cf.h"
@@ -6357,6 +6367,22 @@ main(void)
 	pg_atomic_init_u64(&owner_proc.cluster_grd_redeclare_acked_epoch, 0);
 	cluster_control_request_shmem_init();
 	retire_driver = cluster_control_request_driver_start();
+	if (getenv("PGRAC_PRE2_TEST_PREPARED_JOB") != NULL) {
+		UT_PLAN(11);
+		UT_RUN(prepared_job_delivers_publication_once_after_exact_release);
+		UT_RUN(prepared_job_wrong_ack_keeps_published_result_private);
+		UT_RUN(prepared_job_census_may_consume_original_ack_first);
+		UT_RUN(prepared_job_receipt_survives_a_later_cf_cookie);
+		UT_RUN(prepared_job_preserves_the_original_root_failure);
+		UT_RUN(prepared_job_cannot_be_copied_or_restarted_while_live);
+		UT_RUN(prepared_job_identity_loss_rejects_delivery_but_keeps_cleanup);
+		UT_RUN(prepared_job_release_error_retains_the_original_receipt_address);
+		UT_RUN(prepared_job_first_release_keeps_original_bounded_confirmation);
+		UT_RUN(prepared_job_error_before_release_cleans_only_the_original_hold);
+		UT_RUN(prepared_job_unbound_error_never_adopts_a_later_cf_request);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_PROJECT_CF_CONTROL") != NULL) {
 		UT_PLAN(1);
 		UT_RUN(startup_projection_uses_the_original_canonical_cut);
@@ -6463,7 +6489,7 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(134);
+	UT_PLAN(145);
 	UT_RUN(startup_cf_timeout_waits_for_exact_completion_before_begin);
 	UT_RUN(startup_cf_completion_does_not_preserve_changed_native_input);
 	UT_RUN(startup_cf_unsafe_native_context_never_takes_a_registry_lock);
@@ -6547,6 +6573,17 @@ main(void)
 	UT_RUN(startup_recovery_complete_original_preconditions_do_not_become_cf_waits);
 	UT_RUN(startup_recovery_complete_original_cancel_keeps_shared_cleanup_responsibility);
 	UT_RUN(ordinary_recovery_complete_roles_keep_the_original_cf_wait_policy);
+	UT_RUN(prepared_job_delivers_publication_once_after_exact_release);
+	UT_RUN(prepared_job_wrong_ack_keeps_published_result_private);
+	UT_RUN(prepared_job_census_may_consume_original_ack_first);
+	UT_RUN(prepared_job_receipt_survives_a_later_cf_cookie);
+	UT_RUN(prepared_job_preserves_the_original_root_failure);
+	UT_RUN(prepared_job_cannot_be_copied_or_restarted_while_live);
+	UT_RUN(prepared_job_identity_loss_rejects_delivery_but_keeps_cleanup);
+	UT_RUN(prepared_job_release_error_retains_the_original_receipt_address);
+	UT_RUN(prepared_job_first_release_keeps_original_bounded_confirmation);
+	UT_RUN(prepared_job_error_before_release_cleans_only_the_original_hold);
+	UT_RUN(prepared_job_unbound_error_never_adopts_a_later_cf_request);
 	UT_RUN(lmon_prepared_cf_requires_exact_retirement_before_reapply);
 	UT_RUN(lmon_prepared_cf_wrong_ack_cannot_release_the_original_request);
 	UT_RUN(lmon_prepared_cf_service_consumed_ack_still_finishes_own_receipt);

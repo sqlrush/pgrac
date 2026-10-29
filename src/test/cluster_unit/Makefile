@@ -1463,7 +1463,8 @@ test_cluster_startup_cf_callsite.inc: $(top_srcdir)/src/backend/access/transam/x
 	mv $@.tmp $@
 
 test_cluster_startup_cf_entry: test_cluster_startup_cf_entry.c test_cluster_cf_enqueue.c \
-		test_cluster_prepared_cf.h test_cluster_prepared_cf.inc \
+		test_cluster_prepared_cf.h test_cluster_prepared_job.h test_cluster_prepared_cf.inc \
+		$(top_srcdir)/src/include/cluster/cluster_control_root_prepared.h \
 		test_cluster_generic_cf.h test_cluster_generic_cf.inc \
 		test_cluster_rejoin_cf.h test_cluster_rejoin_cf.inc test_cluster_rejoin_cf_types.inc \
 		test_cluster_cold_own_root_cf.h test_cluster_cold_own_root_cf.inc \
@@ -1505,8 +1506,12 @@ test_cluster_prepared_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_control_
 	     /^release_cf\(/ { print "static ClusterControlRootResult"; emit=1; releases++ } \
 	     /^(cluster_control_root_create_authority_current_v1|cluster_control_root_activate_authority_current_v1)\(/ { print "bool"; emit=1; authorities++ } \
 	     /^(cluster_control_root_create_prepared|cluster_control_root_activate_prepared)\(/ { print "ClusterControlRootResult"; emit=1; consumers++ } \
+	     /^(cluster_control_root_create_prepared_job_v1|cluster_control_root_activate_prepared_job_v1|cluster_control_root_prepared_job_poll_v1)\(/ { print "ClusterControlRootResult"; emit=1; jobs++ } \
+	     /^(prepared_work_ready|prepared_work_current)\(/ { print "static bool"; emit=1; workchecks++ } \
+	     /^prepared_work_bind\(/ { print "static void"; emit=1; workbinds++ } \
+	     /^(prepared_work_consume|prepared_work_release|control_root_create_prepared|control_root_activate_prepared)\(/ { print "static ClusterControlRootResult"; emit=1; worksteps++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (codecs != 4 || predicates != 5 || acquires != 1 || releases != 1 || authorities != 2 || consumers != 2 || emit) exit 1 }' \
+	     END { if (codecs != 4 || predicates != 5 || acquires != 1 || releases != 1 || authorities != 2 || consumers != 2 || jobs != 3 || workchecks != 2 || workbinds != 1 || worksteps != 4 || emit) exit 1 }' \
 	     $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 

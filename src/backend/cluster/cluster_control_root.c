@@ -25,6 +25,7 @@
 #include "cluster/cluster_cf_storage.h"
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_control_root.h"
+#include "cluster/cluster_control_root_prepared.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_external_fence.h"
@@ -11854,10 +11855,89 @@ cluster_control_root_build_migration_image(const ClusterControlRootMigrationRoun
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
-ClusterControlRootResult
-cluster_control_root_create_prepared(const ClusterControlRootMigrationImage *image,
-									 const ClusterControlRootMigrationRoundV1 *round,
-									 ClusterControlRootFileToken *out_token)
+static bool
+prepared_work_ready(const ClusterControlRootPreparedWorkV1 *work,
+					const ClusterControlRootMigrationRoundV1 *round)
+{
+	ClusterControlRootPreparedWorkV1 empty;
+
+	if (work == NULL || round == NULL || work->release.job_generation == 0)
+		return false;
+	memset(&empty, 0, sizeof(empty));
+	empty.release.job_generation = work->release.job_generation;
+	return memcmp(work, &empty, sizeof(empty)) == 0 && MyProc != NULL && MyProcPid > 0
+		   && CurrentResourceOwner != NULL && cluster_node_id >= 0
+		   && round->coordinator_node_id == (uint32)cluster_node_id
+		   && round->coordinator_incarnation != 0
+		   && round->coordinator_incarnation == cluster_qvotec_get_self_incarnation()
+		   && round->transition_epoch != 0 && round->transition_epoch == cluster_epoch_get_current()
+		   && cluster_grd_redeclare_generation() != 0;
+}
+
+static void
+prepared_work_bind(ClusterControlRootPreparedWorkV1 *work,
+				   const ClusterControlRootMigrationRoundV1 *round)
+{
+	work->address = work;
+	work->proc = MyProc;
+	work->resource_owner = CurrentResourceOwner;
+	work->pid = MyProcPid;
+	work->procno = MyProc->pgprocno;
+	work->generation = work->release.job_generation;
+	work->owner_generation = cluster_grd_redeclare_generation();
+	work->cf_cookie = cluster_cf_owner_cookie(ExclusiveLock);
+	work->round = *round;
+	work->result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+	work->phase = CONTROL_ROOT_PREPARED_WORK_WRITING;
+}
+
+static bool
+prepared_work_current(const ClusterControlRootPreparedWorkV1 *work)
+{
+	return CurrentResourceOwner == work->resource_owner && cluster_node_id >= 0
+		   && (uint32)cluster_node_id == work->round.coordinator_node_id
+		   && cluster_qvotec_get_self_incarnation() == work->round.coordinator_incarnation
+		   && cluster_epoch_get_current() == work->round.transition_epoch
+		   && cluster_grd_redeclare_generation() == work->owner_generation;
+}
+
+static ClusterControlRootResult
+prepared_work_consume(ClusterControlRootPreparedWorkV1 *work, ClusterCfJobResultV1 release,
+					  ClusterControlRootFileToken *out_token)
+{
+	ClusterControlRootResult result;
+
+	if (!prepared_work_current(work))
+		work->rejected = true;
+	if (release == CF_JOB_PENDING)
+		return CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN;
+	if (release != CF_JOB_CONFIRMED)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	result = work->rejected ? CLUSTER_CONTROL_ROOT_STALE_TOKEN : work->result;
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && out_token != NULL)
+		*out_token = work->token;
+	memset(&work->token, 0, sizeof(work->token));
+	work->phase = CONTROL_ROOT_PREPARED_WORK_CONSUMED;
+	return result;
+}
+
+static ClusterControlRootResult
+prepared_work_release(ClusterControlRootPreparedWorkV1 *work, ClusterControlRootResult result,
+					  const ClusterControlRootFileToken *token,
+					  ClusterControlRootFileToken *out_token)
+{
+	work->result = result;
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		work->token = *token;
+	work->phase = CONTROL_ROOT_PREPARED_WORK_RETIRING;
+	return cluster_control_root_prepared_job_poll_v1(work, out_token);
+}
+
+static ClusterControlRootResult
+control_root_create_prepared(const ClusterControlRootMigrationImage *image,
+							 const ClusterControlRootMigrationRoundV1 *round,
+							 ClusterControlRootPreparedWorkV1 *work,
+							 ClusterControlRootFileToken *out_token)
 {
 	ControlRootImage *root;
 	ControlRootImage *primary;
@@ -11884,6 +11964,8 @@ cluster_control_root_create_prepared(const ClusterControlRootMigrationImage *ima
 		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 	if (!acquire_clusterwide_cf(ExclusiveLock))
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	if (work != NULL)
+		prepared_work_bind(work, round);
 
 	root = palloc(sizeof(*root));
 	memset(root, 0, sizeof(*root));
@@ -11938,17 +12020,20 @@ cluster_control_root_create_prepared(const ClusterControlRootMigrationImage *ima
 		pfree(primary);
 	}
 	pfree(root);
+	if (work != NULL)
+		return prepared_work_release(work, result, &token, out_token);
 	result = release_cf(ExclusiveLock, result);
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && out_token != NULL)
 		*out_token = token;
 	return result;
 }
 
-ClusterControlRootResult
-cluster_control_root_activate_prepared(const ClusterControlRootFileToken *expected_token,
-									   const uint8 expected_round_sha256[32],
-									   const ClusterControlRootMigrationRoundV1 *round,
-									   ClusterControlRootFileToken *out_token)
+static ClusterControlRootResult
+control_root_activate_prepared(const ClusterControlRootFileToken *expected_token,
+							   const uint8 expected_round_sha256[32],
+							   const ClusterControlRootMigrationRoundV1 *round,
+							   ClusterControlRootPreparedWorkV1 *work,
+							   ClusterControlRootFileToken *out_token)
 {
 	ControlRootImage *primary;
 	ControlRootImage *bak;
@@ -11978,6 +12063,8 @@ cluster_control_root_activate_prepared(const ClusterControlRootFileToken *expect
 		return result;
 	if (!acquire_clusterwide_cf(ExclusiveLock))
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	if (work != NULL)
+		prepared_work_bind(work, round);
 	primary = palloc(sizeof(*primary));
 	bak = palloc(sizeof(*bak));
 	updated = palloc(sizeof(*updated));
@@ -12030,10 +12117,113 @@ cluster_control_root_activate_prepared(const ClusterControlRootFileToken *expect
 	pfree(updated);
 	pfree(bak);
 	pfree(primary);
+	if (work != NULL)
+		return prepared_work_release(work, result, &token, out_token);
 	result = release_cf(ExclusiveLock, result);
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && out_token != NULL)
 		*out_token = token;
 	return result;
+}
+
+ClusterControlRootResult
+cluster_control_root_create_prepared(const ClusterControlRootMigrationImage *image,
+									 const ClusterControlRootMigrationRoundV1 *round,
+									 ClusterControlRootFileToken *out_token)
+{
+	return control_root_create_prepared(image, round, NULL, out_token);
+}
+
+ClusterControlRootResult
+cluster_control_root_activate_prepared(const ClusterControlRootFileToken *expected_token,
+									   const uint8 expected_round_sha256[32],
+									   const ClusterControlRootMigrationRoundV1 *round,
+									   ClusterControlRootFileToken *out_token)
+{
+	return control_root_activate_prepared(expected_token, expected_round_sha256, round, NULL,
+										  out_token);
+}
+
+ClusterControlRootResult
+cluster_control_root_create_prepared_job_v1(const ClusterControlRootMigrationImage *image,
+											const ClusterControlRootMigrationRoundV1 *round,
+											ClusterControlRootPreparedWorkV1 *work,
+											ClusterControlRootFileToken *out_token)
+{
+	ClusterControlRootResult result;
+
+	if (out_token != NULL)
+		memset(out_token, 0, sizeof(*out_token));
+	if (!prepared_work_ready(work, round))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	PG_TRY();
+	{
+		result = control_root_create_prepared(image, round, work, out_token);
+	}
+	PG_CATCH();
+	{
+		if (work->phase == CONTROL_ROOT_PREPARED_WORK_WRITING)
+			work->phase = CONTROL_ROOT_PREPARED_WORK_RETIRING;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return result;
+}
+
+ClusterControlRootResult
+cluster_control_root_activate_prepared_job_v1(const ClusterControlRootFileToken *expected_token,
+											  const uint8 expected_round_sha256[32],
+											  const ClusterControlRootMigrationRoundV1 *round,
+											  ClusterControlRootPreparedWorkV1 *work,
+											  ClusterControlRootFileToken *out_token)
+{
+	ClusterControlRootResult result;
+
+	if (out_token != NULL)
+		memset(out_token, 0, sizeof(*out_token));
+	if (!prepared_work_ready(work, round))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	PG_TRY();
+	{
+		result = control_root_activate_prepared(expected_token, expected_round_sha256, round, work,
+												out_token);
+	}
+	PG_CATCH();
+	{
+		if (work->phase == CONTROL_ROOT_PREPARED_WORK_WRITING)
+			work->phase = CONTROL_ROOT_PREPARED_WORK_RETIRING;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return result;
+}
+
+ClusterControlRootResult
+cluster_control_root_prepared_job_poll_v1(ClusterControlRootPreparedWorkV1 *work,
+										  ClusterControlRootFileToken *out_token)
+{
+	ClusterCfJobResultV1 release;
+
+	if (out_token != NULL)
+		memset(out_token, 0, sizeof(*out_token));
+	if (work == NULL || work->address != work || work->proc == NULL || MyProc != work->proc
+		|| MyProcPid != work->pid || MyProc->pgprocno != work->procno || work->generation == 0
+		|| work->release.job_generation != work->generation
+		|| work->phase != CONTROL_ROOT_PREPARED_WORK_RETIRING)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (!prepared_work_current(work))
+		work->rejected = true;
+	/* ERROR before the first release leaves the original hold to start here.
+	 * A cookie mismatch only refuses binding; it never proves completion.
+	 * The original receipt, once bound, is always polled at its first address. */
+	if (work->cf_cookie == 0
+		|| (work->release.state == CF_JOB_RECEIPT_UNBOUND
+				? cluster_cf_owner_cookie(ExclusiveLock) != work->cf_cookie
+				: work->release.original.cookie != work->cf_cookie))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	release = work->release.state == CF_JOB_RECEIPT_UNBOUND
+				  ? cluster_cf_unlock_job_v1(ExclusiveLock, NULL, &work->release)
+				  : cluster_cf_job_retirement_poll_v1(&work->release);
+	return prepared_work_consume(work, release, out_token);
 }
 
 static uint64

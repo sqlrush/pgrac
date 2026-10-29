@@ -288,6 +288,13 @@ cluster_lmon_wakeup(void)
 void
 ResetLatch(Latch *latch pg_attribute_unused())
 {}
+#ifndef PGRAC_CF_JOB_LATCH_FIXTURE
+void
+SetLatch(Latch *latch pg_attribute_unused())
+{
+	abort(); /* Legacy fixtures never bind a CF job completion. */
+}
+#endif
 int
 WaitLatch(Latch *latch pg_attribute_unused(), int wake_events pg_attribute_unused(),
 		  long timeout pg_attribute_unused(), uint32 event pg_attribute_unused())
