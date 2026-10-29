@@ -14225,3 +14225,8 @@ test_cluster_relmap_publish_clog_bridge.o test_cluster_relmap_native_clog.o \
         $(top_srcdir)/src/include/access/clog.h \
         $(top_srcdir)/src/include/access/slru.h
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_reference_terminals.inc
+
+# The native CLOG fixture and every bridge include this writeback coverage.
+test_cluster_clog_recovery test_cluster_side_native_clog.o \
+		test_cluster_recovery_episode_clog.o test_cluster_relmap_native_clog.o \
+		test_cluster_xid_native_clog.o: test_cluster_clog_relmap_writeback.inc

@@ -1807,6 +1807,7 @@ native_held_base_constructor_error_and_later_refusals_keep_custody_sticky(void)
 #include "test_cluster_clog_own_full.inc"
 #include "test_cluster_clog_relmap_physical_mutation.inc"
 #include "test_cluster_clog_relmap_native_init.inc"
+#include "test_cluster_clog_relmap_writeback.inc"
 #include "test_cluster_clog_relmap_horizon.inc"
 #include "test_cluster_clog_native_counter.inc"
 #include "test_cluster_clog_relmap_counter.inc"
@@ -1919,7 +1920,18 @@ main(void)
 		UT_RUN(relmap_native_advance_during_root_keeps_failure_and_custody);
 		goto mutation_done;
 	}
-	UT_PLAN(90);
+	if (getenv("PGRAC_RELMAP_WRITEBACK_ONLY") != NULL) {
+		relmap_native_own_initialize();
+		UT_PLAN(6);
+		UT_RUN(relmap_checkpoint_equal_bytes_revokes_held_observation);
+		UT_RUN(relmap_direct_writeback_tracks_original_local_and_foreign_caches);
+		UT_RUN(relmap_eviction_writeback_revokes_equal_byte_custody);
+		UT_RUN(relmap_writeback_clean_and_other_origin_preserve_observation);
+		UT_RUN(relmap_failed_writeback_keeps_sticky_debt_and_releases_writer);
+		UT_RUN(relmap_inflight_physical_write_refuses_new_and_original_custody);
+		goto mutation_done;
+	}
+	UT_PLAN(96);
 	UT_RUN(relmap_native_advance_refuses_old_counter_without_page_mutation);
 	UT_RUN(relmap_native_advance_noop_and_foreign_keep_original_observation);
 	UT_RUN(relmap_native_advance_during_root_keeps_failure_and_custody);
@@ -2031,6 +2043,13 @@ main(void)
 	UT_RUN(relmap_clean_write_and_unrelated_controller_preserve_observation);
 	UT_RUN(relmap_physical_write_in_progress_refuses_old_and_new_reads);
 	UT_RUN(relmap_returned_write_error_restores_native_state_but_revokes_observation);
+	relmap_native_own_initialize();
+	UT_RUN(relmap_checkpoint_equal_bytes_revokes_held_observation);
+	UT_RUN(relmap_direct_writeback_tracks_original_local_and_foreign_caches);
+	UT_RUN(relmap_eviction_writeback_revokes_equal_byte_custody);
+	UT_RUN(relmap_writeback_clean_and_other_origin_preserve_observation);
+	UT_RUN(relmap_failed_writeback_keeps_sticky_debt_and_releases_writer);
+	UT_RUN(relmap_inflight_physical_write_refuses_new_and_original_custody);
 	UT_RUN(relmap_abrupt_write_error_keeps_original_writer_debt);
 	UT_RUN(relmap_native_own_checkpoint_revokes_equal_byte_observation);
 	UT_RUN(relmap_native_own_eviction_revokes_without_logical_mutation);
