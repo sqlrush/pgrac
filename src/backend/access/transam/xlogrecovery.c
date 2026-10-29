@@ -2678,6 +2678,8 @@ cluster_recovery_cold_page_census_recheck(const struct ClusterRecoveryStartV1 *s
 		}
 	}
 	return cluster_recovery_cold_page_advance_current(start, work, scope, progress)
+		&& cluster_recovery_census_namespace_current_v1(start->ctrc_observation_census)
+		&& cluster_recovery_cold_page_advance_current(start, work, scope, progress)
 		&& start->ctrc_pages == pages && pages->count == count;
 }
 

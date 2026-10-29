@@ -45,7 +45,7 @@ struct ClusterRecoveryRootSet {
 	pg_cryptohash_ctx *file_hash, *set_hash;
 	uint8 bytes[BLCKSZ];
 	unsigned pass, stage;
-	bool started, reading, merging, rechecking;
+	bool started, reading, merging, rechecking, namespace_checking;
 	ClusterRecoveryRootsResult status;
 };
 
@@ -855,7 +855,8 @@ cluster_recovery_root_set_recheck_begin(ClusterRecoveryRootSet *roots)
 		return CLUSTER_RECOVERY_ROOTS_INVALID;
 	if (roots->status > CLUSTER_RECOVERY_ROOTS_OBSERVED)
 		return roots->status;
-	if (roots->status != CLUSTER_RECOVERY_ROOTS_OBSERVED || roots->scan != NULL)
+	if (roots->status != CLUSTER_RECOVERY_ROOTS_OBSERVED || roots->scan != NULL
+		|| roots->namespace_checking)
 		return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
 	if (fstat(roots->root_fd, &current) != 0)
 		return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_IO);
@@ -1313,6 +1314,103 @@ cluster_recovery_root_set_read_current_relation(ClusterRecoveryRootSet *roots, u
 		return roots->status;
 	}
 	return CLUSTER_RECOVERY_ROOTS_BYTES;
+}
+
+bool
+cluster_recovery_root_set_namespace_current_v1(ClusterRecoveryRootSet *roots,
+	bool (*current)(void *), void *arg)
+{
+	ClusterRecoveryNamespace *volatile scan = NULL;
+	volatile bool complete = false;
+	struct stat held;
+
+	if (roots == NULL) return false;
+	if (roots->status != CLUSTER_RECOVERY_ROOTS_OBSERVED) return false;
+	if (roots->scan != NULL || roots->namespace_checking) {
+		roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
+		return false;
+	}
+	roots->namespace_checking = true;
+	PG_TRY();
+	{
+		ClusterRecoveryNamespaceResult result = CLUSTER_RECOVERY_NAMESPACE_INVALID;
+		bool valid = true;
+
+		/* Reuse the original verification scratch; never adopt a new path or
+		 * overwrite its immutable metadata/content digest after PAGE writes. */
+		for (uint32 at = 0; valid && at < roots->count;) {
+			if ((current != NULL && !current(arg))
+				|| roots->status != CLUSTER_RECOVERY_ROOTS_OBSERVED) { valid = false; break; }
+			for (unsigned work = 0; work < ROOTS_TICK && at < roots->count; work++)
+				roots->verified[at++] = false;
+		}
+		if (valid && current != NULL) valid = current(arg);
+		if (valid && roots->status == CLUSTER_RECOVERY_ROOTS_OBSERVED) {
+			if (fstat(roots->root_fd, &held) != 0)
+				roots_fail(roots, CLUSTER_RECOVERY_ROOTS_IO);
+			else if (!cluster_recovery_namespace_stat_same(&roots->root_stat, &held))
+				roots_fail(roots, CLUSTER_RECOVERY_ROOTS_CHANGED);
+			else {
+				ClusterRecoveryNamespace *opened = NULL;
+				result = cluster_recovery_namespace_begin_bounded(roots->root_fd, roots->capacity,
+					roots->scan_budget, &opened);
+				scan = opened;
+				if (result != CLUSTER_RECOVERY_NAMESPACE_MORE)
+					roots_fail(roots, roots_namespace_result(result));
+			}
+		}
+		while (valid && roots->status == CLUSTER_RECOVERY_ROOTS_OBSERVED && scan != NULL) {
+			ClusterRecoveryNamespaceEntry file;
+			const ClusterRecoveryRootEntry *entry;
+			uint32 index;
+			int fd;
+
+			if ((current != NULL && !current(arg))
+				|| roots->status != CLUSTER_RECOVERY_ROOTS_OBSERVED) { valid = false; break; }
+			result = cluster_recovery_namespace_next(scan, &file, &fd);
+			if (result == CLUSTER_RECOVERY_NAMESPACE_MORE) continue;
+			if (result == CLUSTER_RECOVERY_NAMESPACE_END) break;
+			if (result != CLUSTER_RECOVERY_NAMESPACE_ENTRY) {
+				roots_fail(roots, roots_namespace_result(result)); break;
+			}
+			if (!roots_lookup(roots, file.path, false, &index)) { valid = false; break; }
+			entry = &roots->entries[index];
+			if ((entry->origins & CLUSTER_RECOVERY_ROOT_PHYSICAL) == 0 || roots->verified[index]
+				|| entry->file.kind != file.kind || entry->file.size != file.size
+				|| !(file.kind == CLUSTER_RECOVERY_FILE_RELATION
+					? roots_same_file_object(&entry->file.observed, &file.observed)
+					: cluster_recovery_namespace_stat_same(&entry->file.observed, &file.observed))) {
+				valid = false; break;
+			}
+			roots->verified[index] = true;
+		}
+		valid = valid && result == CLUSTER_RECOVERY_NAMESPACE_END;
+		for (uint32 at = 0; valid && at < roots->count;) {
+			if ((current != NULL && !current(arg))
+				|| roots->status != CLUSTER_RECOVERY_ROOTS_OBSERVED) { valid = false; break; }
+			for (unsigned work = 0; valid && work < ROOTS_TICK && at < roots->count; work++, at++)
+				if ((roots->entries[at].origins & CLUSTER_RECOVERY_ROOT_PHYSICAL) != 0
+					&& !roots->verified[at]) valid = false;
+		}
+		if (valid && roots->status == CLUSTER_RECOVERY_ROOTS_OBSERVED) {
+			if (fstat(roots->root_fd, &held) != 0)
+				roots_fail(roots, CLUSTER_RECOVERY_ROOTS_IO);
+			else if (!cluster_recovery_namespace_stat_same(&roots->root_stat, &held))
+				roots_fail(roots, CLUSTER_RECOVERY_ROOTS_CHANGED);
+			else
+				complete = (current == NULL || current(arg))
+					&& roots->status == CLUSTER_RECOVERY_ROOTS_OBSERVED;
+		}
+	}
+	PG_FINALLY();
+	{
+		cluster_recovery_namespace_destroy(scan);
+		roots->namespace_checking = false;
+		if (!complete && roots->status == CLUSTER_RECOVERY_ROOTS_OBSERVED)
+			roots_fail(roots, CLUSTER_RECOVERY_ROOTS_CHANGED);
+	}
+	PG_END_TRY();
+	return complete;
 }
 
 bool

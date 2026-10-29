@@ -140,6 +140,13 @@ extern ClusterRecoveryRootsResult cluster_recovery_root_set_step(ClusterRecovery
  * Caller still holds original isolation/cuts. This grants no graph authority. */
 extern ClusterRecoveryRootsResult
 cluster_recovery_root_set_recheck_begin(ClusterRecoveryRootSet *roots);
+/* Enumerate the complete original physical set using its reserved scanner
+ * budget. Same relation object/extent may have owner-written bytes; all other
+ * metadata remains exact. Neither entries nor digests are refreshed. The
+ * optional callback runs between bounded ticks; it must not destroy roots.
+ * Caller retains the original isolation. Entered refusal/ERROR revokes it. */
+extern bool cluster_recovery_root_set_namespace_current_v1(ClusterRecoveryRootSet *roots,
+	bool (*current)(void *), void *arg);
 extern uint32 cluster_recovery_root_set_count(const ClusterRecoveryRootSet *roots);
 extern const ClusterRecoveryRootEntry *
 cluster_recovery_root_set_entry(const ClusterRecoveryRootSet *roots, uint32 index);

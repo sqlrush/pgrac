@@ -12,6 +12,7 @@
 #include "storage/lwlock.h"
 #include "miscadmin.h"
 #include "postmaster/interrupt.h"
+#include "postmaster/startup.h"
 #ifdef USE_PGRAC_CLUSTER
 struct ClusterRecoveryCensus {
 	ClusterWalInputsV1 *inputs;
@@ -986,6 +987,48 @@ cluster_recovery_census_page_digest_v1(ClusterRecoveryCensus *census, uint32 ind
 	PG_END_TRY();
 	if (ok) { result.observed = true; memcpy(result.sha256, digest, 32); }
 	return result;
+}
+
+static bool
+census_namespace_current(void *arg)
+{
+	ClusterRecoveryCensus *census = arg;
+
+	HandleStartupProcInterrupts();
+	/* Do not release the borrowed root set while its scanner is active. The
+	 * enclosing census owns failure/ERROR cleanup after scanner retirement. */
+	return census->status == CLUSTER_RECOVERY_CENSUS_DRAINED
+		&& cluster_wal_inputs_count_v1(census->inputs) == census->source_count
+		&& cluster_wal_inputs_revalidate_v1(census->inputs) == CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+bool
+cluster_recovery_census_namespace_current_v1(ClusterRecoveryCensus *census)
+{
+	ClusterRecoveryCensusManifest before, after;
+	bool held = false;
+	volatile bool ok = false;
+
+	if (census == NULL || census->status != CLUSTER_RECOVERY_CENSUS_DRAINED
+		|| CritSectionCount != 0 || ShutdownRequestPending) return false;
+	ForEachLWLockHeldByMe(census_page_lock_held, &held);
+	if (held) return false;
+	PG_TRY();
+	{
+		ok = cluster_recovery_census_manifest(census, &before)
+			&& cluster_recovery_root_set_namespace_current_v1(census->roots,
+				census_namespace_current, census)
+			&& cluster_recovery_census_manifest(census, &after)
+			&& memcmp(&before, &after, sizeof(before)) == 0;
+		if (!ok) (void)census_fail(census, CLUSTER_RECOVERY_CENSUS_REFUSED);
+	}
+	PG_CATCH();
+	{
+		(void)census_fail(census, CLUSTER_RECOVERY_CENSUS_REFUSED);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return ok;
 }
 
 const ClusterRecoveryCensusReferencesV1 *
