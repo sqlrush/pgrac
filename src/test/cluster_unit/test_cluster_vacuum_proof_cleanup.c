@@ -49,6 +49,8 @@ BufferDescPadded *BufferDescriptors = fixture_descriptors;
 /* Only fields consumed by the extracted production helper. */
 typedef struct LVRelState
 {
+	bool versioned, shared_maintenance_restricted;
+	BlockNumber shared_freeze_changed_pages;
 	Relation rel;
 	ClusterSpaceIdentity identity;
 	ClusterHeapFreezePageInputV1 shared_freeze_input;
@@ -1083,6 +1085,22 @@ cluster_ctrc_itl_read_guard_release_shared(ClusterCtrcItlReadGuardV1 *guard)
 {
 	UT_ASSERT_EQ(guard->serial, 0);
 	return guard->serial == 0;
+}
+
+/* These collector-cleanup cases supply read-only, non-versioned inputs. The
+ * native writer is exercised by the maintenance owner fixture, never here. */
+bool
+cluster_heap_freeze_apply_xmin_batch_recent_v1(Relation rel, Buffer buffer,
+	const ClusterHeapFreezePageInputV1 *input, const ClusterHeapFreezePageBatchV1 *page,
+	const ClusterHeapFreezeProofBatchV1 *proofs, const ClusterHeapFreezeFinalFenceV1 *fence,
+	const PcmAuthoritySnapshot *authority, const ClusterSemanticAdmissionToken *admission,
+	const ClusterHeapFreezeXminTargetV1 *targets, uint16 count,
+	FullTransactionId limit, SCN horizon)
+{
+	(void)rel; (void)buffer; (void)input; (void)page; (void)proofs; (void)fence;
+	(void)authority; (void)admission; (void)targets; (void)count; (void)limit; (void)horizon;
+	UT_ASSERT(false);
+	return false;
 }
 
 #include "test_cluster_vacuum_proof_cleanup.inc"

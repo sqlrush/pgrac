@@ -2407,7 +2407,33 @@ lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
 	{
 		status = lazy_collect_shared_freeze_proofs_admitted(vacrel, recent_buffer,
 			&authority_before, master_before, &admission, &row_inputs_current);
-		/* The same entered token is still owned here until PG_FINALLY. */
+		/* Consume only this attempt's exact selected xmin while its original
+		 * sources and admission are still held. A mixed KEEP page can have a
+		 * proved subset; the native entry repeats every selected row's final
+		 * source/TARGET/SPACE checks and owns only its recent pin and writer. */
+		if (vacrel->versioned && vacrel->shared_maintenance_restricted
+			&& row_inputs_current && vacrel->shared_freeze_cohort_observed
+			&& vacrel->shared_freeze_input.writer_context_valid
+			&& (status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN
+				|| status == CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN)
+			&& vacrel->shared_freeze_xmin_candidates.target_count > 0)
+		{
+			if (cluster_heap_freeze_apply_xmin_batch_recent_v1(vacrel->rel, recent_buffer,
+				&vacrel->shared_freeze_input, &vacrel->shared_freeze_batch,
+				&vacrel->shared_freeze_proofs, &vacrel->shared_freeze_fence,
+				&authority_before, &admission,
+				vacrel->shared_freeze_xmin_candidates.targets,
+				vacrel->shared_freeze_xmin_candidates.target_count,
+				vacrel->shared_freeze_candidate_limit_full,
+				(SCN)vacrel->shared_freeze_cohort.horizon_scn))
+			{
+				vacrel->shared_freeze_changed_pages++;
+				status = CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED;
+				row_inputs_current = false;
+			}
+			else
+				status = CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN;
+		}
 	}
 	PG_FINALLY();
 	{
