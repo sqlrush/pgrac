@@ -2338,9 +2338,18 @@ static void startup_local_empty_reset(void);
 #include "test_cluster_cold_ctrc_unchanged_custody.inc"
 #include "test_cluster_cold_ctrc_page_image.inc"
 #include "test_cluster_cold_ctrc_final_projection.inc"
+#include "test_cluster_cold_ctrc_heap_refs.inc"
 
 int main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_STARTUP_HEAP_REFS") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_startup_final_heap_refs_consume_every_same_fd_image);
+		UT_RUN(test_startup_final_heap_refs_refusal_owner_or_work_drift_prevents_handoff);
+		UT_RUN(test_startup_final_heap_refs_error_keeps_original_fds_and_retention);
+		UT_RUN(test_startup_final_heap_refs_repeat_rechecks_without_new_wal_or_fd);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_STARTUP_FINAL_PROJECTION") != NULL) {
 		UT_PLAN(7);
 		UT_RUN(test_startup_final_projection_consumes_all_pages_after_page_cleanup);
@@ -2536,7 +2545,12 @@ int main(void)
 		UT_RUN(test_ctrc_pages_native_error_retires_cursor_before_original_scope);
 		reset(); UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(236);
+	UT_PLAN(240);
+	UT_RUN(test_startup_final_heap_refs_consume_every_same_fd_image);
+	UT_RUN(test_startup_final_heap_refs_refusal_owner_or_work_drift_prevents_handoff);
+	UT_RUN(test_startup_final_heap_refs_error_keeps_original_fds_and_retention);
+	UT_RUN(test_startup_final_heap_refs_repeat_rechecks_without_new_wal_or_fd);
+
 	UT_RUN(test_startup_final_projection_consumes_all_pages_after_page_cleanup);
 	UT_RUN(test_startup_final_projection_refuses_unresolved_rewritten_and_byte_drift);
 	UT_RUN(test_startup_final_projection_rechecks_original_owner_and_full_work);

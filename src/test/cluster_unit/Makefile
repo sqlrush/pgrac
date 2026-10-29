@@ -14031,3 +14031,7 @@ test_cluster_cold_tx_start: test_cluster_cold_ctrc_fpi_retirement.inc
 test_cluster_ctrc_native_fpi: test_cluster_ctrc_native_image.inc
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_page_image.inc
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_final_projection.inc
+
+# Final native heap reference bindings and original Startup consumer.
+test_cluster_terminal_ref_census: test_cluster_ctrc_heap_refs.inc
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_heap_refs.inc
