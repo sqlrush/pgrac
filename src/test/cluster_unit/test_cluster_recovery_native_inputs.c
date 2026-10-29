@@ -58,10 +58,12 @@ static ClusterRecoveryRootsResult census_current_read(ClusterRecoveryRootSet *ro
 static void census_namespace_interrupts(void);
 static ClusterRecoveryGraphResult census_tx_test_at(const ClusterRecoveryReferenceGraph *graph,
 	uint32 index, ClusterRecoveryGraphRecord *out);
+static ClusterRecoveryGraphResult census_tx_test_recheck_at(ClusterRecoveryReferenceGraph *, uint32);
 static ClusterRecoveryGraphResult census_dependency_test_at(const ClusterRecoveryReferenceGraph *,
  uint32,ClusterRecoveryGraphDependency *);
 #define cluster_recovery_reference_graph_dependency_at census_dependency_test_at
 #define cluster_recovery_reference_graph_at census_tx_test_at
+#define cluster_recovery_reference_graph_recheck_at census_tx_test_recheck_at
 #define HandleStartupProcInterrupts census_namespace_interrupts
 #define cluster_recovery_root_set_read_current_relation census_current_read
 static ClusterRecoveryGraphResult census_ref_test_find(const ClusterRecoveryReferenceGraph *,
@@ -72,6 +74,7 @@ static ClusterRecoveryGraphResult census_ref_test_find(const ClusterRecoveryRefe
 #undef cluster_recovery_root_set_read_current_relation
 #undef HandleStartupProcInterrupts
 #undef cluster_recovery_reference_graph_at
+#undef cluster_recovery_reference_graph_recheck_at
 #undef cluster_recovery_reference_graph_dependency_at
 
 static ClusterWalSourceRef inventory_fault_source;
@@ -1147,6 +1150,7 @@ cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **held)
 #include "test_cluster_recovery_census_tx_records.inc"
 #include "test_cluster_recovery_census_tx_dependencies.inc"
 #include "test_cluster_recovery_census_tx_reference_edges.inc"
+#include "test_cluster_recovery_census_tx_recheck.inc"
 
 int
 main(int argc, char **argv)
@@ -1155,6 +1159,13 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_CENSUS_TX_RECHECK") != NULL) {
+		UT_PLAN(3);
+		UT_RUN(test_census_tx_final_recheck_accepts_original_complete_files_and_empty_end);
+		UT_RUN(test_census_tx_final_recheck_detects_same_inode_late_predecessor_rewrite);
+		UT_RUN(test_census_tx_final_recheck_does_not_enter_under_locks_or_stale_source);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_CENSUS_TX_REFERENCE_EDGES") != NULL) {
 		UT_PLAN(3);
 		UT_RUN(test_census_tx_references_join_all_original_current_and_history_items);
@@ -1497,7 +1508,10 @@ main(int argc, char **argv)
 		UT_RUN(test_census_references_bound_metadata_and_tuple_storage_before_publication);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(274);
+	UT_PLAN(277);
+	UT_RUN(test_census_tx_final_recheck_accepts_original_complete_files_and_empty_end);
+	UT_RUN(test_census_tx_final_recheck_detects_same_inode_late_predecessor_rewrite);
+	UT_RUN(test_census_tx_final_recheck_does_not_enter_under_locks_or_stale_source);
 	UT_RUN(test_census_tx_references_join_all_original_current_and_history_items);
 	UT_RUN(test_census_tx_references_prefix_empty_lock_and_range_are_distinct);
 	UT_RUN(test_census_tx_references_late_source_graph_generation_and_error_are_sticky);

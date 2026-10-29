@@ -1039,6 +1039,44 @@ cluster_recovery_census_references_v1(ClusterRecoveryCensus *census)
 	return cluster_recovery_census_manifest(census, &manifest) ? census->references : NULL;
 }
 
+ClusterRecoveryGraphResult
+cluster_recovery_census_tx_recheck_v1(ClusterRecoveryCensus *census, uint32 index)
+{
+	ClusterRecoveryCensusManifest before, after;
+	volatile ClusterRecoveryGraphResult result = CLUSTER_RECOVERY_GRAPH_INVALID;
+	bool held = false;
+	bool ok = false;
+
+	if (census == NULL || census->status != CLUSTER_RECOVERY_CENSUS_DRAINED
+		|| CritSectionCount != 0 || ShutdownRequestPending
+		|| index > census->manifest.tx_record_count) return result;
+	ForEachLWLockHeldByMe(census_page_lock_held, &held);
+	if (held) return result;
+	PG_TRY();
+	{
+		if (cluster_recovery_census_manifest(census, &before)
+			&& cluster_recovery_reference_graph_count(census->graph) == before.tx_record_count) {
+			result = cluster_recovery_reference_graph_recheck_at(census->graph, index);
+			ok = (index == before.tx_record_count
+					? result == CLUSTER_RECOVERY_GRAPH_DRAINED
+					: result == CLUSTER_RECOVERY_GRAPH_RECORD || result == CLUSTER_RECOVERY_GRAPH_PENDING)
+				&& cluster_recovery_census_manifest(census, &after)
+				&& memcmp(&before, &after, sizeof(before)) == 0;
+		}
+		if (!ok) {
+			if (result < CLUSTER_RECOVERY_GRAPH_INVALID) result = CLUSTER_RECOVERY_GRAPH_CHANGED;
+			(void)census_fail(census, CLUSTER_RECOVERY_CENSUS_REFUSED);
+		}
+	}
+	PG_CATCH();
+	{
+		(void)census_fail(census, CLUSTER_RECOVERY_CENSUS_REFUSED);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return result;
+}
+
 /* The original forest owns every complete record. This accessor neither
  * walks nor qualifies a new graph, and cannot advance a partial census. */
 ClusterRecoveryCensusTxRecordV1

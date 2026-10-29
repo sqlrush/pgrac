@@ -2404,9 +2404,17 @@ static void startup_local_empty_reset(void);
 
 #include "test_cluster_cold_ctrc_effects_receipt.inc"
 #include "test_cluster_cold_ctrc_effects_lifetime.inc"
+#include "test_cluster_cold_ctrc_final_tx_recheck.inc"
 
 int main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_START_FINAL_TX_RECHECK") != NULL) {
+		UT_PLAN(3);
+		UT_RUN(test_startup_final_tx_rechecks_complete_forest_before_and_after_service);
+		UT_RUN(test_startup_final_tx_late_record_error_owner_and_end_retain_original_debt);
+		UT_RUN(test_startup_final_tx_drift_during_service_cannot_retire_inputs);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_START_EFFECTS_LIFETIME") != NULL) {
 		UT_PLAN(5);
 		UT_RUN(test_startup_effects_lifetime_stable_input_survives_complete_handoff);
@@ -2813,9 +2821,9 @@ int main(void)
 	}
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_FIRST
-	UT_PLAN(341);
+	UT_PLAN(344);
 #else
-	UT_PLAN(337);
+	UT_PLAN(340);
 #endif
 	UT_RUN(test_startup_native_images_accept_only_unchanged_complete_terminal_page);
 	UT_RUN(test_startup_native_images_reject_unresolved_ambiguous_and_mx_itls);
@@ -2826,8 +2834,11 @@ int main(void)
 	UT_RUN(test_startup_native_directory_real_origin_cannot_be_discharged_by_wait);
 	UT_RUN(test_startup_native_directory_invalid_layout_and_partial_error_keep_debt);
 #else
-	UT_PLAN(329);
+	UT_PLAN(332);
 #endif
+	UT_RUN(test_startup_final_tx_rechecks_complete_forest_before_and_after_service);
+	UT_RUN(test_startup_final_tx_late_record_error_owner_and_end_retain_original_debt);
+	UT_RUN(test_startup_final_tx_drift_during_service_cannot_retire_inputs);
 	UT_RUN(test_startup_effects_lifetime_stable_input_survives_complete_handoff);
 	UT_RUN(test_startup_effects_lifetime_first_validation_cannot_rebase_before_page);
 	UT_RUN(test_startup_effects_lifetime_service_wait_cannot_replace_input);

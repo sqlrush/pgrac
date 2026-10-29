@@ -113,6 +113,16 @@ extern ClusterRecoveryGraphResult
 cluster_recovery_reference_graph_at(const ClusterRecoveryReferenceGraph *graph, uint32 index,
 									ClusterRecoveryGraphRecord *out);
 
+/* Physically reread one saved node through the original namespace callback,
+ * without changing its bytes, roots or traversal. RECORD means exact original
+ * record and physical generation; index==count is DRAINED with no read.
+ * PENDING retries this same index. Entered read/identity/change failures are
+ * sticky and invalidate every borrowed view. Call outside PAGE/other locks;
+ * the caller keeps the original graph, source and retention owners live.
+ * This is a final TX_RECORD check, not full graph, owner or release proof. */
+extern ClusterRecoveryGraphResult cluster_recovery_reference_graph_recheck_at(
+	ClusterRecoveryReferenceGraph *graph, uint32 index);
+
 /* Native adjacency of the original observed TX forest. Roots are exactly
  * those supplied before traversal; a discovered predecessor is not promoted
  * to a root. count/root_count/index and predecessor_index are local indexes,

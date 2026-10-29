@@ -10834,3 +10834,7 @@ test_cluster_cold_tx_start: test_cluster_cold_ctrc_tx_forest_terminals.inc
 # Final Startup retains the original pass-2 effects input across PAGE drain.
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_effects_receipt.inc
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_effects_lifetime.inc
+
+test_cluster_recovery_reference_graph: test_cluster_recovery_tx_recheck.inc
+test_cluster_recovery_native_inputs: test_cluster_recovery_census_tx_recheck.inc
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_final_tx_recheck.inc

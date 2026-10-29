@@ -286,6 +286,15 @@ typedef struct ClusterRecoveryCensusTxRecordV1 {
 extern ClusterRecoveryCensusTxRecordV1
 cluster_recovery_census_tx_record_v1(ClusterRecoveryCensus *census, uint32 index);
 
+/* Final physical TX_RECORD check through the SAME original undo namespace,
+ * bracketed by complete saved manifest/source/current checks. No new graph,
+ * scope, baseline or progress. RECORD matches one original node, count is
+ * DRAINED, PENDING keeps the same index. Entered failure/ERROR invalidates the
+ * original census; the input owner retains its FD/IR/WALR/pins/debt. Caller
+ * holds no LWLock/critical section. Not semantic closure or release authority. */
+extern ClusterRecoveryGraphResult cluster_recovery_census_tx_recheck_v1(
+	ClusterRecoveryCensus *census, uint32 index);
+
 /* Original complete TX roots and resolved predecessor edges, indexed in the
  * same original second-read forest. observed with value.index==value.count
  * is complete end; invalid/prefix/refused results are all zero. This view

@@ -436,6 +436,29 @@ cluster_recovery_reference_graph_at(const ClusterRecoveryReferenceGraph *graph, 
 	return CLUSTER_RECOVERY_GRAPH_RECORD;
 }
 
+ClusterRecoveryGraphResult
+cluster_recovery_reference_graph_recheck_at(ClusterRecoveryReferenceGraph *graph, uint32 index)
+{
+	RecoveryRecordNode *node;
+	ClusterRecoveryGraphResult result;
+	uint32 generation;
+
+	if (!cluster_recovery_reference_graph_observed(graph) || index > graph->count)
+		return graph != NULL && graph->status > CLUSTER_RECOVERY_GRAPH_DRAINED
+			? graph->status : CLUSTER_RECOVERY_GRAPH_INVALID;
+	if (index == graph->count) return CLUSTER_RECOVERY_GRAPH_DRAINED;
+	node = &graph->nodes[index];
+	if (node->state != RECOVERY_NODE_DONE)
+		return recovery_graph_fail(graph, CLUSTER_RECOVERY_GRAPH_INVALID);
+	result = recovery_graph_read_node(graph, node, &generation);
+	if (result != CLUSTER_RECOVERY_GRAPH_MORE) return result;
+	if (!cluster_recovery_reference_graph_observed(graph)
+		|| generation != node->record_generation
+		|| !recovery_graph_record_equal(&node->record, &graph->scratch))
+		return recovery_graph_fail(graph, CLUSTER_RECOVERY_GRAPH_CHANGED);
+	return CLUSTER_RECOVERY_GRAPH_RECORD;
+}
+
 /* Use the edges resolved by the original walk, not a second traversal or
  * a caller-provided root list. Native UBA128 and both physical generations
  * stay in the original records; these indexes are only local adjacency. */

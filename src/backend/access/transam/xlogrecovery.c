@@ -2764,6 +2764,35 @@ cluster_recovery_cold_page_census_recheck(const struct ClusterRecoveryStartV1 *s
 		&& start->ctrc_pages == pages && pages->count == count;
 }
 
+/* Re-read every original TX node, including non-root/shared predecessors,
+ * after PAGE work and after the independent service wait. Original native
+ * namespace/manifest checks retain the same physical generation and bytes;
+ * a saved-forest accessor alone cannot detect later storage changes. */
+static bool
+cluster_recovery_cold_page_tx_recheck(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, ClusterWalInputsV1 *scope,
+	ClusterColdCtrcPageProgressV1 *progress)
+{
+	uint32 count = start->ctrc_observation_manifest.tx_record_count;
+	uint32 index = 0;
+
+	for (;;) {
+		ClusterRecoveryGraphResult result;
+
+		ResetLatch(MyLatch);
+		HandleStartupProcInterrupts();
+		if (!cluster_recovery_cold_page_advance_current(start, work, scope, progress)) return false;
+		result = cluster_recovery_census_tx_recheck_v1(start->ctrc_observation_census, index);
+		if (!cluster_recovery_cold_page_advance_current(start, work, scope, progress)
+			|| start->ctrc_observation_manifest.tx_record_count != count) return false;
+		if (index == count) return result == CLUSTER_RECOVERY_GRAPH_DRAINED;
+		if (result == CLUSTER_RECOVERY_GRAPH_RECORD) { index++; continue; }
+		if (result != CLUSTER_RECOVERY_GRAPH_PENDING) return false;
+		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+			100L, WAIT_EVENT_CLUSTER_THREAD_RECOVERY);
+	}
+}
+
 static bool
 cluster_recovery_cold_page_completed_recheck(const struct ClusterRecoveryStartV1 *start)
 {
@@ -2775,7 +2804,8 @@ cluster_recovery_cold_page_completed_recheck(const struct ClusterRecoveryStartV1
 	volatile bool ready = false;
 	Size bytes;
 
-	if (!cluster_recovery_cold_page_first_empty(start, work, scope, progress)) return false;
+	if (!cluster_recovery_cold_page_first_empty(start, work, scope, progress)
+		|| !cluster_recovery_cold_page_tx_recheck(start, work, scope, progress)) return false;
 	if (progress == NULL)
 		return rf_page_online_plan_target_count_v1(start->ctrc_page_plan) == 0
 			&& cluster_recovery_cold_page_census_recheck(start, work, scope, progress)

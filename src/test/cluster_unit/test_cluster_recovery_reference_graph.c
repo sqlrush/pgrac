@@ -673,11 +673,15 @@ UT_TEST(test_observed_index_exposes_every_predecessor_without_io)
 
 #include "test_cluster_recovery_tx_dependencies.inc"
 #include "test_cluster_recovery_tx_reference_edges.inc"
+#include "test_cluster_recovery_tx_recheck.inc"
 
 int
 main(void)
 {
-	UT_PLAN(23);
+	UT_PLAN(26);
+	UT_RUN(test_tx_final_recheck_reads_all_shared_predecessors_without_rebasing);
+	UT_RUN(test_tx_final_recheck_rejects_late_bytes_generation_and_native_read_failure);
+	UT_RUN(test_tx_final_recheck_requires_observed_forest_and_accepts_real_empty_end);
 	UT_RUN(test_tx_reference_find_preserves_shared_tail_indexes_and_native_uba);
 	UT_RUN(test_tx_reference_find_refuses_every_full_identity_and_address_difference);
 	UT_RUN(test_tx_reference_find_prefix_empty_invalidated_and_inconsistent_bucket);
