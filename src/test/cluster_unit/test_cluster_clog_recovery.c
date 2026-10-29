@@ -91,6 +91,7 @@ static unsigned allocation_count;
 static void *fixture_shared_mutation;
 static Size fixture_shared_mutation_size;
 static void (*fixture_native_sync_hook)(void);
+static void (*fixture_native_write_hook)(void);
 
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
@@ -309,6 +310,8 @@ void
 pgstat_count_slru_page_written(int i pg_attribute_unused())
 {
 	writes++;
+	if (fixture_native_write_hook != NULL)
+		fixture_native_write_hook();
 }
 void
 pgstat_count_slru_flush(int i pg_attribute_unused())
@@ -1775,6 +1778,7 @@ native_held_base_constructor_error_and_later_refusals_keep_custody_sticky(void)
 
 #include "test_cluster_clog_full_consumer.inc"
 #include "test_cluster_clog_own_full.inc"
+#include "test_cluster_clog_relmap_physical_mutation.inc"
 
 int
 main(void)
@@ -1835,7 +1839,16 @@ main(void)
 		UT_RUN(own_full_cold_replay_revokes_equal_byte_held_observation);
 		goto mutation_done;
 	}
-	UT_PLAN(68);
+	if (getenv("PGRAC_RELMAP_PHYSICAL_MUTATION_ONLY") != NULL) {
+		UT_PLAN(5);
+		UT_RUN(relmap_late_physical_write_revokes_equal_byte_observation);
+		UT_RUN(relmap_clean_write_and_unrelated_controller_preserve_observation);
+		UT_RUN(relmap_physical_write_in_progress_refuses_old_and_new_reads);
+		UT_RUN(relmap_returned_write_error_restores_native_state_but_revokes_observation);
+		UT_RUN(relmap_abrupt_write_error_keeps_original_writer_debt);
+		goto mutation_done;
+	}
+	UT_PLAN(73);
 	UT_RUN(separate_original_origin_controls);
 	UT_RUN(commit_and_abort_persist_full_tree_without_local_pollution);
 	UT_RUN(conflicting_late_child_refuses_before_any_tree_write);
@@ -1928,6 +1941,11 @@ main(void)
 	UT_RUN(own_full_cold_replay_requires_exact_cold_role_shape_and_route);
 	UT_RUN(own_full_cold_replay_errors_keep_original_cache_and_cleanup);
 	UT_RUN(own_full_cold_replay_revokes_equal_byte_held_observation);
+	UT_RUN(relmap_late_physical_write_revokes_equal_byte_observation);
+	UT_RUN(relmap_clean_write_and_unrelated_controller_preserve_observation);
+	UT_RUN(relmap_physical_write_in_progress_refuses_old_and_new_reads);
+	UT_RUN(relmap_returned_write_error_restores_native_state_but_revokes_observation);
+	UT_RUN(relmap_abrupt_write_error_keeps_original_writer_debt);
 mutation_done:
 	fixture_cleanup();
 	UT_DONE();
