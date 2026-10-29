@@ -2877,6 +2877,14 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_read_c
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_read_notice_exact(
 	const ResourceXDeliveryClaim *execution, const ResourceXDecodedAcquireIntent *episode,
 	const ResourceXAcquireReadReceipt *receipt, const struct ClusterPcmOwnSnapshot *terminal);
+/* Only the original BufferDesc adapter may roll forward an already-installed
+ * C and hand off its released native proof. Neither API permits new IO/C. */
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_read_recover_complete_exact(
+	const ResourceXDeliveryClaim *execution, const ResourceXDecodedAcquireIntent *episode,
+	const ResourceXAcquireReadReceipt *receipt, const struct ClusterPcmOwnSnapshot *terminal);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_read_handoff_exact(
+	const ResourceXDeliveryClaim *execution, const ResourceXDecodedAcquireIntent *episode,
+	const ResourceXAcquireReadReceipt *receipt, const struct ClusterPcmOwnSnapshot *terminal);
 /* Master consumption is independent of local physical delivery quiescence. */
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_read_consumed_exact(
 	const ResourceXDecodedFrame *notice, int32 authenticated_master,

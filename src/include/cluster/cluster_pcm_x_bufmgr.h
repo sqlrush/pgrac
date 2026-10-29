@@ -1139,4 +1139,12 @@ extern ResourceXApplyResult cluster_bufmgr_pcm_own_acquire_prepare_disk_exact(
 	const ResourceXDecodedAcquireIntent *episode,
 	const struct ClusterSemanticAdmissionToken *admission, const ResourceXDeliveryClaim *prepared);
 
+/* Run the original prepared disk/S episode through native C and a shared
+ * LMS notification handoff. ERROR/exit before C seals original IO; after C
+ * it only finishes that same installation. Does not activate ordinary entry. */
+extern ResourceXApplyResult cluster_bufmgr_pcm_own_acquire_fill_disk_exact(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
+	const ResourceXDecodedAcquireIntent *episode,
+	const struct ClusterSemanticAdmissionToken *admission, const ResourceXDeliveryClaim *prepared);
+
 #endif /* CLUSTER_PCM_X_BUFMGR_H */

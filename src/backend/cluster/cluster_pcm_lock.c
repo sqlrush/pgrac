@@ -252,7 +252,10 @@ typedef struct ClusterPcmResourceXBootstrapRound {
 	 * A transport callback retires only send.pending, not this responsibility. */
 	ResourceXDecodedAcquireIntent acquire_intent;
 	uint8 has_acquire_intent;
-	uint8 acquire_reserved[7];
+	/* Original native C, input IO and delivery fence have been handed off.
+	 * LMS may settle this notification without resampling a later buffer. */
+	uint8 acquire_read_handoff;
+	uint8 acquire_reserved[6];
 	ResourceXAcquireReadReceipt acquire_read_receipt;
 } ClusterPcmResourceXBootstrapRound;
 
@@ -13942,9 +13945,13 @@ pcm_resource_x_requester_acquire_valid_locked(const ClusterPcmResourceXBootstrap
 	static const ResourceXDecodedAcquireIntent empty;
 	static const ResourceXDecodedCommon empty_common;
 	static const ResourceXAcquisitionRef empty_ref;
-	static const uint8 reserved[7];
+	static const uint8 reserved[6];
 
 	if (memcmp(round->acquire_reserved, reserved, sizeof(reserved)) != 0
+		|| round->acquire_read_handoff > 1
+		|| (round->acquire_read_handoff != 0
+			&& (round->delivery_executor_purpose < RESOURCE_X_DELIVERY_ACQUIRE_READ_NOTICE
+				|| round->delivery_executor_purpose > RESOURCE_X_DELIVERY_ACQUIRE_READ_SETTLED))
 		|| !pcm_resource_x_acquire_read_receipt_valid_locked(round))
 		return false;
 	if (round->has_acquire_intent == 0)
@@ -29031,7 +29038,8 @@ pcm_resource_x_requester_acquire_frames_mode_locked(struct GrdEntry *entry,
 			|| (claim->purpose != RESOURCE_X_DELIVERY_ACQUIRE_READ_ARMED
 				&& claim->purpose != RESOURCE_X_DELIVERY_ACQUIRE_PREPARED
 				&& claim->purpose != RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING
-				&& !pcm_resource_x_acquire_read_closing(claim->purpose))))
+				&& !pcm_resource_x_acquire_read_closing(claim->purpose)
+				&& !pcm_resource_x_acquire_read_completed(claim->purpose))))
 		return RESOURCE_X_APPLY_BAD_STATE;
 	if (state == NULL || !pcm_resource_x_requester_acquire_valid_locked(round)
 		|| !pcm_resource_x_install_claim_valid_locked(round)
@@ -29433,6 +29441,10 @@ cluster_pcm_lock_resource_x_requester_acquire_execute_frames_exact(
 	return result;
 }
 
+static ResourceXApplyResult pcm_resource_x_acquire_read_close_locked(struct GrdEntry *entry,
+	const ResourceXDeliveryClaim *execution, const ResourceXDecodedAcquireIntent *episode,
+	ResourceXDeliveryClaim *current, ResourceXAcquireReadReceipt *receipt);
+
 /* The original executor retains I across native and entry lock domains.
  * Completed same-E replay is evidence, never a second installation owner. */
 static ResourceXApplyResult
@@ -29597,10 +29609,10 @@ cluster_pcm_lock_resource_x_requester_acquire_read_arm_exact(
 	return result;
 }
 
-ResourceXApplyResult
-cluster_pcm_lock_resource_x_requester_acquire_read_complete_exact(
+static ResourceXApplyResult
+pcm_resource_x_acquire_read_complete_mode(
 	const ResourceXDeliveryClaim *execution, const ResourceXDecodedAcquireIntent *episode,
-	const ResourceXAcquireReadReceipt *receipt, const ClusterPcmOwnSnapshot *terminal)
+	const ResourceXAcquireReadReceipt *receipt, const ClusterPcmOwnSnapshot *terminal, bool closing)
 {
 	PcmEntryRef ref;
 	PcmEntryAcquireResult acquired;
@@ -29621,9 +29633,12 @@ cluster_pcm_lock_resource_x_requester_acquire_read_complete_exact(
 	if (!pcm_entry_ref_acquire(&execution->observation.request.logical_assertion.resource, false, &ref, &acquired))
 		return RESOURCE_X_APPLY_NOT_FOUND;
 	LWLockAcquire(&ref.entry->entry_lock.lock, LW_EXCLUSIVE);
-	result = pcm_resource_x_acquire_read_owner_locked(ref.entry, execution, episode, &current, &observed);
+	result = closing
+		? pcm_resource_x_acquire_read_close_locked(ref.entry, execution, episode, &current, &observed)
+		: pcm_resource_x_acquire_read_owner_locked(ref.entry, execution, episode, &current, &observed);
 	if (result == RESOURCE_X_APPLY_APPLIED) {
-		if (current.purpose == RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING
+		if ((current.purpose != RESOURCE_X_DELIVERY_ACQUIRE_READ_ARMED
+				&& !pcm_resource_x_acquire_read_completed(current.purpose))
 			|| memcmp(&observed, receipt, sizeof(observed)) != 0)
 			result = RESOURCE_X_APPLY_STALE;
 		else if (pcm_resource_x_acquire_read_completed(current.purpose))
@@ -29638,6 +29653,24 @@ cluster_pcm_lock_resource_x_requester_acquire_read_complete_exact(
 	LWLockRelease(&ref.entry->entry_lock.lock);
 	pcm_entry_ref_release(&ref);
 	return result;
+}
+
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_requester_acquire_read_complete_exact(
+	const ResourceXDeliveryClaim *execution, const ResourceXDecodedAcquireIntent *episode,
+	const ResourceXAcquireReadReceipt *receipt, const ClusterPcmOwnSnapshot *terminal)
+{
+	return pcm_resource_x_acquire_read_complete_mode(execution, episode, receipt, terminal, false);
+}
+
+/* Cleanup can only publish evidence of an already committed native C.
+ * The adapter must prove original IO ended; this cannot authorize a read. */
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_requester_acquire_read_recover_complete_exact(
+	const ResourceXDeliveryClaim *execution, const ResourceXDecodedAcquireIntent *episode,
+	const ResourceXAcquireReadReceipt *receipt, const ClusterPcmOwnSnapshot *terminal)
+{
+	return pcm_resource_x_acquire_read_complete_mode(execution, episode, receipt, terminal, true);
 }
 
 /* Original unpublished disk cleanup. Admission loss can stop new work, but
@@ -29663,12 +29696,17 @@ pcm_resource_x_acquire_read_close_locked(struct GrdEntry *entry,
 		|| (round->delivery_executor_purpose != RESOURCE_X_DELIVERY_ACQUIRE_READ_ARMED
 			&& round->delivery_executor_purpose != RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING
 			&& round->delivery_executor_purpose != RESOURCE_X_DELIVERY_ACQUIRE_PREPARED
-			&& !pcm_resource_x_acquire_read_closing(round->delivery_executor_purpose)))
+			&& !pcm_resource_x_acquire_read_closing(round->delivery_executor_purpose)
+			&& !pcm_resource_x_acquire_read_completed(round->delivery_executor_purpose)))
 		return RESOURCE_X_APPLY_BAD_STATE;
 	candidate = *execution;
 	candidate.purpose = round->delivery_executor_purpose;
 	if (pcm_resource_x_acquire_read_is_quiet(candidate.purpose))
 		candidate.target.flags = 0;
+	if (pcm_resource_x_acquire_read_completed(candidate.purpose)) {
+		candidate.target.generation = episode->base_generation + 1;
+		candidate.target.flags = 0;
+	}
 	result = pcm_resource_x_requester_acquire_frames_mode_locked(entry,
 		&execution->observation, episode, &candidate, &grant, &image, &join, true);
 	if (result != RESOURCE_X_APPLY_APPLIED)
@@ -29851,9 +29889,9 @@ cluster_pcm_lock_resource_x_requester_acquire_read_quiet_exact(
 /* Build only from the original validated A/I owner, never a caller-authored
  * notice. No legacy join/install field is used as local C evidence. */
 static ResourceXApplyResult
-pcm_resource_x_acquire_read_notice_frame_locked(struct GrdEntry *entry,
+pcm_resource_x_acquire_read_notice_frame_mode_locked(struct GrdEntry *entry,
 	const ResourceXDeliveryClaim *execution, const ResourceXDecodedAcquireIntent *episode,
-	const ResourceXAcquireReadReceipt *receipt, ResourceXDecodedFrame *out)
+	const ResourceXAcquireReadReceipt *receipt, ResourceXDecodedFrame *out, bool closing)
 {
 	ResourceXDeliveryClaim current;
 	ResourceXAcquireReadReceipt observed;
@@ -29862,7 +29900,9 @@ pcm_resource_x_acquire_read_notice_frame_locked(struct GrdEntry *entry,
 	ResourceXDecodedAcquireCompletion *c;
 	ResourceXApplyResult result;
 
-	result = pcm_resource_x_acquire_read_owner_locked(entry, execution, episode, &current, &observed);
+	result = closing
+		? pcm_resource_x_acquire_read_close_locked(entry, execution, episode, &current, &observed)
+		: pcm_resource_x_acquire_read_owner_locked(entry, execution, episode, &current, &observed);
 	if (result != RESOURCE_X_APPLY_APPLIED)
 		return result;
 	if (!pcm_resource_x_acquire_read_completed(current.purpose)
@@ -29884,6 +29924,14 @@ pcm_resource_x_acquire_read_notice_frame_locked(struct GrdEntry *entry,
 	c->page_crc32c = receipt->page_crc32c;
 	c->decision_crc32c = receipt->decision_crc32c;
 	return RESOURCE_X_APPLY_APPLIED;
+}
+
+static ResourceXApplyResult
+pcm_resource_x_acquire_read_notice_frame_locked(struct GrdEntry *entry,
+	const ResourceXDeliveryClaim *execution, const ResourceXDecodedAcquireIntent *episode,
+	const ResourceXAcquireReadReceipt *receipt, ResourceXDecodedFrame *out)
+{
+	return pcm_resource_x_acquire_read_notice_frame_mode_locked(entry, execution, episode, receipt, out, false);
 }
 
 static bool
@@ -29913,10 +29961,10 @@ pcm_resource_x_acquire_read_notice_identity(const ResourceXIntentSlot *slot,
 
 /* The native snapshot was observed after IO and exact hold release by the
  * BufferDesc adapter. Transport completion leaves E/A/I and NOTICE retained. */
-ResourceXApplyResult
-cluster_pcm_lock_resource_x_requester_acquire_read_notice_exact(
+static ResourceXApplyResult
+pcm_resource_x_acquire_read_notice_mode(
 	const ResourceXDeliveryClaim *execution, const ResourceXDecodedAcquireIntent *episode,
-	const ResourceXAcquireReadReceipt *receipt, const ClusterPcmOwnSnapshot *terminal)
+	const ResourceXAcquireReadReceipt *receipt, const ClusterPcmOwnSnapshot *terminal, bool handoff)
 {
 	PcmEntryRef ref;
 	PcmEntryAcquireResult acquired;
@@ -29942,7 +29990,7 @@ cluster_pcm_lock_resource_x_requester_acquire_read_notice_exact(
 	if (!pcm_entry_ref_acquire(&execution->observation.request.logical_assertion.resource, false, &ref, &acquired))
 		return RESOURCE_X_APPLY_NOT_FOUND;
 	LWLockAcquire(&ref.entry->entry_lock.lock, LW_EXCLUSIVE);
-	result = pcm_resource_x_acquire_read_notice_frame_locked(ref.entry, execution, episode, receipt, &frame);
+	result = pcm_resource_x_acquire_read_notice_frame_mode_locked(ref.entry, execution, episode, receipt, &frame, handoff);
 	if (result != RESOURCE_X_APPLY_APPLIED)
 		goto done;
 	state = pcm_resource_x_master_state_for_entry(ref.entry);
@@ -29966,6 +30014,13 @@ cluster_pcm_lock_resource_x_requester_acquire_read_notice_exact(
 				|| (ref.entry->resource_x_bootstrap_round.delivery_executor_purpose != RESOURCE_X_DELIVERY_ACQUIRE_READ_SETTLED
 					&& pcm_resource_x_acquire_read_notice_identity(&intent->slot, &body, &frame)))
 			? RESOURCE_X_APPLY_DUPLICATE : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		if (result == RESOURCE_X_APPLY_DUPLICATE && handoff
+			&& ref.entry->resource_x_bootstrap_round.acquire_read_handoff == 0) {
+			if (!pcm_resource_x_intent_mark_dirty())
+				result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+			else
+				ref.entry->resource_x_bootstrap_round.acquire_read_handoff = 1;
+		}
 		goto done;
 	}
 	if (intent->slot.state != RESOURCE_X_INTENT_SLOT_EMPTY) {
@@ -29983,10 +30038,30 @@ cluster_pcm_lock_resource_x_requester_acquire_read_notice_exact(
 	}
 	*intent = prepared;
 	ref.entry->resource_x_bootstrap_round.delivery_executor_purpose = RESOURCE_X_DELIVERY_ACQUIRE_READ_NOTICE;
+	ref.entry->resource_x_bootstrap_round.acquire_read_handoff = handoff ? 1 : 0;
 done:
 	LWLockRelease(&ref.entry->entry_lock.lock);
 	pcm_entry_ref_release(&ref);
 	return result;
+}
+
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_requester_acquire_read_notice_exact(
+	const ResourceXDeliveryClaim *execution, const ResourceXDecodedAcquireIntent *episode,
+	const ResourceXAcquireReadReceipt *receipt, const ClusterPcmOwnSnapshot *terminal)
+{
+	return pcm_resource_x_acquire_read_notice_mode(execution, episode, receipt, terminal, false);
+}
+
+/* Only the original BufferDesc adapter supplies this released native proof.
+ * Normal execution still uses its live admission checks; cleanup may hand
+ * off an already-installed original C without reopening new work. */
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_requester_acquire_read_handoff_exact(
+	const ResourceXDeliveryClaim *execution, const ResourceXDecodedAcquireIntent *episode,
+	const ResourceXAcquireReadReceipt *receipt, const ClusterPcmOwnSnapshot *terminal)
+{
+	return pcm_resource_x_acquire_read_notice_mode(execution, episode, receipt, terminal, true);
 }
 
 /* Reconstruct the original executor only from its retained full-E owner.
@@ -30077,11 +30152,48 @@ pcm_resource_x_acquire_read_notice_retained_locked(struct GrdEntry *entry,
 			&& pcm_resource_x_acquire_read_notice_identity(&intent->slot, &body, frame));
 }
 
+/* The native adapter has already proved original IO termination and exact
+ * fence release. Settle only that notification after M consumption AND the
+ * real callback are quiet. Keep bounded resident E/A/I for native revoke;
+ * never inspect or change a later same-tag buffer from the LMS thread. */
+static bool
+pcm_resource_x_acquire_installed_progress_locked(struct GrdEntry *entry,
+	ClusterPcmResourceXMasterState *state)
+{
+	ClusterPcmResourceXBootstrapRound *round = &entry->resource_x_bootstrap_round;
+	ResourceXDeliveryClaim execution;
+	ResourceXDecodedFrame frame;
+	ClusterPcmResourceXControlIntent *intent;
+
+	if (round->acquire_read_handoff == 0)
+		return true;
+	if (round->acquire_read_handoff != 1 || state == NULL)
+		return false;
+	pcm_resource_x_acquire_read_execution_locked(entry, &execution);
+	if (pcm_resource_x_acquire_read_notice_frame_mode_locked(entry, &execution,
+			&round->acquire_intent, &round->acquire_read_receipt, &frame, true) != RESOURCE_X_APPLY_APPLIED
+		|| !pcm_resource_x_acquire_read_notice_retained_locked(entry, &frame))
+		return false;
+	intent = &state->requester_settlement_intent;
+	if (round->delivery_executor_purpose == RESOURCE_X_DELIVERY_ACQUIRE_READ_NOTICE
+		|| round->delivery_executor_purpose == RESOURCE_X_DELIVERY_ACQUIRE_READ_SETTLED
+		|| intent->slot.state == RESOURCE_X_INTENT_SLOT_STAGED)
+		return true;
+	if (round->delivery_executor_purpose != RESOURCE_X_DELIVERY_ACQUIRE_READ_CONSUMED
+		|| !pcm_resource_x_intent_mark_dirty())
+		return false;
+	/* An ARMED offer is still local; a STAGED one was excluded above. */
+	memset(&intent->slot, 0, sizeof(intent->slot));
+	round->delivery_executor_purpose = RESOURCE_X_DELIVERY_ACQUIRE_READ_SETTLED;
+	ConditionVariableBroadcast(&entry->wait_cv);
+	return true;
+}
+
 /* Passive LMS probes and exact callbacks own this finite continuation.
  * Transport handoff is not master consumption. Once consumed, STAGED is
  * retained until its exact callback; ARMED/whole EMPTY have no DATA owner. */
 static bool
-pcm_resource_x_acquire_quiet_progress_locked(struct GrdEntry *entry,
+pcm_resource_x_acquire_receipt_progress_locked(struct GrdEntry *entry,
 	ClusterPcmResourceXMasterState *state)
 {
 	ClusterPcmResourceXBootstrapRound *round = &entry->resource_x_bootstrap_round;
@@ -30093,7 +30205,7 @@ pcm_resource_x_acquire_quiet_progress_locked(struct GrdEntry *entry,
 	static const ClusterPcmResourceXControlIntent empty;
 
 	if (!pcm_resource_x_acquire_read_is_quiet(round->delivery_executor_purpose))
-		return true;
+		return pcm_resource_x_acquire_installed_progress_locked(entry, state);
 	if (state == NULL || pcm_resource_x_acquire_quiet_frame_locked(entry, &frame) != RESOURCE_X_APPLY_APPLIED)
 		return false;
 	intent = &state->requester_settlement_intent;
@@ -30172,7 +30284,7 @@ pcm_resource_x_acquire_quiet_consumed_locked(struct GrdEntry *entry,
 			? RESOURCE_X_DELIVERY_ACQUIRE_UNARMED_CONSUMED : RESOURCE_X_DELIVERY_ACQUIRE_READ_QUIET_CONSUMED;
 		ConditionVariableBroadcast(&entry->wait_cv);
 	}
-	if (!pcm_resource_x_acquire_quiet_progress_locked(entry, state))
+	if (!pcm_resource_x_acquire_receipt_progress_locked(entry, state))
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	return duplicate ? RESOURCE_X_APPLY_DUPLICATE : RESOURCE_X_APPLY_APPLIED;
 }
@@ -30197,8 +30309,8 @@ pcm_resource_x_acquire_read_consumed_locked(struct GrdEntry *entry,
 		&& round->delivery_executor_purpose != RESOURCE_X_DELIVERY_ACQUIRE_READ_SETTLED)
 		return RESOURCE_X_APPLY_STALE;
 	pcm_resource_x_acquire_read_execution_locked(entry, &execution);
-	result = pcm_resource_x_acquire_read_notice_frame_locked(entry, &execution,
-		&round->acquire_intent, &round->acquire_read_receipt, &expected);
+	result = pcm_resource_x_acquire_read_notice_frame_mode_locked(entry, &execution,
+		&round->acquire_intent, &round->acquire_read_receipt, &expected, round->acquire_read_handoff == 1);
 	if (result != RESOURCE_X_APPLY_APPLIED)
 		return result;
 	if (!pcm_resource_x_acquire_read_notice_retained_locked(entry, &expected))
@@ -30219,6 +30331,8 @@ pcm_resource_x_acquire_read_consumed_locked(struct GrdEntry *entry,
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	round->delivery_executor_purpose = RESOURCE_X_DELIVERY_ACQUIRE_READ_CONSUMED;
 	ConditionVariableBroadcast(&entry->wait_cv);
+	if (!pcm_resource_x_acquire_installed_progress_locked(entry, pcm_resource_x_master_state_for_entry(entry)))
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	return RESOURCE_X_APPLY_APPLIED;
 }
 
@@ -32053,8 +32167,8 @@ pcm_resource_x_acquire_read_notice_send_valid(struct GrdEntry *entry,
 	execution.purpose = RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING;
 	if ((pcm_resource_x_acquire_read_is_quiet(round->delivery_executor_purpose)
 		? pcm_resource_x_acquire_quiet_frame_locked(entry, &frame)
-		: pcm_resource_x_acquire_read_notice_frame_locked(entry, &execution, &round->acquire_intent,
-			&round->acquire_read_receipt, &frame)) != RESOURCE_X_APPLY_APPLIED)
+		: pcm_resource_x_acquire_read_notice_frame_mode_locked(entry, &execution, &round->acquire_intent,
+			&round->acquire_read_receipt, &frame, round->acquire_read_handoff == 1)) != RESOURCE_X_APPLY_APPLIED)
 		return false;
 	memset(&body, 0, sizeof(body));
 	body.assertion = frame.common.logical_assertion;
@@ -32587,8 +32701,9 @@ cluster_pcm_lock_resource_x_outbound_transport_complete_exact(const ResourceXInt
 		&& (entry_ref.entry->resource_x_bootstrap_round.delivery_executor_purpose
 			== RESOURCE_X_DELIVERY_ACQUIRE_READ_QUIET_CONSUMED
 			|| entry_ref.entry->resource_x_bootstrap_round.delivery_executor_purpose
-				== RESOURCE_X_DELIVERY_ACQUIRE_UNARMED_CONSUMED))
-		applied = pcm_resource_x_acquire_quiet_progress_locked(entry_ref.entry,
+				== RESOURCE_X_DELIVERY_ACQUIRE_UNARMED_CONSUMED
+			|| entry_ref.entry->resource_x_bootstrap_round.acquire_read_handoff != 0))
+		applied = pcm_resource_x_acquire_receipt_progress_locked(entry_ref.entry,
 			pcm_resource_x_master_state_for_entry(entry_ref.entry));
 	LWLockRelease(&entry_ref.entry->entry_lock.lock);
 	pcm_entry_ref_release(&entry_ref);
@@ -32711,12 +32826,13 @@ cluster_pcm_lock_resource_x_ready_intent_probe_exact(const BufferTag *tag, uint3
 		result = RESOURCE_X_INTENT_PROBE_CORRUPT;
 		goto ready_probe_done;
 	}
-	if (pcm_resource_x_acquire_read_is_quiet(entry_ref.entry->resource_x_bootstrap_round.delivery_executor_purpose)) {
+	if (pcm_resource_x_acquire_read_is_quiet(entry_ref.entry->resource_x_bootstrap_round.delivery_executor_purpose)
+		|| entry_ref.entry->resource_x_bootstrap_round.acquire_read_handoff != 0) {
 		LWLockRelease(&entry_ref.entry->entry_lock.lock);
 		LWLockAcquire(&entry_ref.entry->entry_lock.lock, LW_EXCLUSIVE);
 		state = pcm_resource_x_master_state_for_entry(entry_ref.entry);
 		if (state == NULL || entry_ref.binding_generation != entry_ref.entry->binding_generation
-			|| !pcm_resource_x_acquire_quiet_progress_locked(entry_ref.entry, state)) {
+			|| !pcm_resource_x_acquire_receipt_progress_locked(entry_ref.entry, state)) {
 			result = RESOURCE_X_INTENT_PROBE_CORRUPT;
 			goto ready_probe_done;
 		}
@@ -32859,13 +32975,14 @@ cluster_pcm_lock_resource_x_outbound_work_probe_exact(uint32 probe_budget,
 			*examined_out = examined;
 			return RESOURCE_X_INTENT_PROBE_CORRUPT;
 		}
-		if (pcm_resource_x_acquire_read_is_quiet(entry->resource_x_bootstrap_round.delivery_executor_purpose)) {
+		if (pcm_resource_x_acquire_read_is_quiet(entry->resource_x_bootstrap_round.delivery_executor_purpose)
+			|| entry->resource_x_bootstrap_round.acquire_read_handoff != 0) {
 			LWLockRelease(&entry->entry_lock.lock);
 			LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
 			state = pcm_resource_x_master_state_for_entry(entry);
 			if (state == NULL || entry_ref.binding_generation != registry_slot->binding_generation
 				|| entry_ref.registry_slot != (uint32)cursor
-				|| !pcm_resource_x_acquire_quiet_progress_locked(entry, state)) {
+				|| !pcm_resource_x_acquire_receipt_progress_locked(entry, state)) {
 				LWLockRelease(&entry->entry_lock.lock);
 				pcm_entry_ref_release(&entry_ref);
 				*examined_out = examined;
