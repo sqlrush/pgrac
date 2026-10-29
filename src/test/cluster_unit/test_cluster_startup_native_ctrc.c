@@ -82,3 +82,24 @@ test_startup_native_ctrc_end(void)
 	CtrcShared = NULL;
 	external_lock_hook = NULL;
 }
+
+/* The original fixture already includes the complete production TU. Reuse
+ * those exact functions with its private symbols, never an online admission. */
+ClusterCtrcItlCleanoutApplyResult
+test_startup_native_ctrc_project(const ClusterColdTtSlotInputV1 *subjects, Size count,
+	const char *before, char *after)
+{
+	return cluster_ctrc_recovery_itl_page_image_v1(subjects, count, before, after);
+}
+
+bool
+test_startup_native_ctrc_heap(const char *image)
+{
+	return cluster_ctrc_recovery_heap_itl_references_v1(image);
+}
+
+bool
+test_startup_native_ctrc_hot(const char *image, BlockNumber block)
+{
+	return cluster_ctrc_recovery_heap_hot_references_v1(image, block);
+}

@@ -10809,3 +10809,6 @@ clean: clean-ctrc-cache-native-tail
 .PHONY: clean-ctrc-cache-native-tail
 clean-ctrc-cache-native-tail:
 	rm -f test_cluster_ctrc_cache_native_tail.inc test_cluster_ctrc_cache_native_tail.inc.tmp
+
+# Original native CTRC image predicates through the original Startup drain.
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_native_images.inc

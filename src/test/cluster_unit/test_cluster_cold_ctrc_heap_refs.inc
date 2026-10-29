@@ -13,6 +13,12 @@ static unsigned heap_refs_calls, heap_refs_fault;
 bool
 cluster_ctrc_recovery_heap_itl_references_v1(const char *image)
 {
+#ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
+	if (startup_native_images) {
+		startup_native_image_calls[1]++;
+		return test_startup_native_ctrc_heap(image);
+	}
+#endif
 	if (!heap_refs_check) return true;
 	heap_refs_calls++;
 	UT_ASSERT(image != NULL);

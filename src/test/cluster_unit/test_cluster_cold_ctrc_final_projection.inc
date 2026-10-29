@@ -14,6 +14,12 @@ ClusterCtrcItlCleanoutApplyResult
 cluster_ctrc_recovery_itl_page_image_v1(const ClusterColdTtSlotInputV1 *subjects,
 	Size count, const char *before, char *after)
 {
+#ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
+	if (startup_native_images) {
+		startup_native_image_calls[0]++;
+		return test_startup_native_ctrc_project(subjects, count, before, after);
+	}
+#endif
 	memcpy(after, before, BLCKSZ);
 	if (!final_projection_check)
 		return CLUSTER_CTRC_ITL_CLEANOUT_ALREADY_TERMINAL;

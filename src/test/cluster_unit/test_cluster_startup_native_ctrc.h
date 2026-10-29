@@ -13,4 +13,10 @@ extern ClusterCtrcLocalEmptyV1 test_startup_native_ctrc_probe(void);
 extern void test_startup_native_ctrc_unlocked(void);
 extern void test_startup_native_ctrc_check(unsigned probes, unsigned attempts, unsigned releases);
 extern void test_startup_native_ctrc_end(void);
+/* Complete original native pure predicates, no directory or service grant. */
+extern ClusterCtrcItlCleanoutApplyResult test_startup_native_ctrc_project(
+	const struct ClusterColdTtSlotInputV1 *subjects, Size count,
+	const char *before, char *after);
+extern bool test_startup_native_ctrc_heap(const char *image);
+extern bool test_startup_native_ctrc_hot(const char *image, BlockNumber block);
 #endif
