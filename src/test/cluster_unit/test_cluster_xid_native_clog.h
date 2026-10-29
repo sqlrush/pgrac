@@ -22,7 +22,7 @@ typedef struct XidNativeClogState
 	xl_clog_zeropage_full bytes;
 	bool xid_held, slru_held, page_zero;
 } XidNativeClogState;
-extern void test_xid_native_clog_start(bool fail);
+extern void test_xid_native_clog_start(bool fail, uint16 origin);
 extern bool test_xid_native_clog_extend(FullTransactionId candidate);
 extern void test_xid_native_clog_state(XidNativeClogState *out);
 extern void test_xid_native_clog_stop(void);

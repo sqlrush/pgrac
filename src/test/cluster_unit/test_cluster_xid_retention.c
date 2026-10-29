@@ -14,6 +14,7 @@ static void retention_native_extended(void);
 static void retention_native_published(FullTransactionId issued);
 static bool retention_error_expected;
 static bool retention_wrap_ready = true;
+static void (*retention_full_clog_leaf)(FullTransactionId candidate);
 int xid_allocation_original_main(void);
 
 #define CLUSTER_XID_RETENTION_TEST
@@ -161,6 +162,10 @@ retention_fixture(uint64 candidate, unsigned origin)
 	free(relmap_runtime_shmem);
 	relmap_runtime_shmem = NULL;
 	reset_allocator();
+	memset(&full_clog_fixture, 0, sizeof(full_clog_fixture));
+	full_clog_fixture.active = true;
+	retention_full_clog_leaf = NULL;
+	cluster_node_id = origin;
 	retention_active = true;
 	retention_held = retention_recompute = retention_error_expected = false;
 	retention_wrap_ready = true;
@@ -324,14 +329,15 @@ UT_TEST(retention_preserves_original_stop_and_lease_gates)
 	(void)retention_call(false, ERRCODE_PROGRAM_LIMIT_EXCEEDED);
 	UT_ASSERT_EQ(extensions + native_publish_count, 0);
 	UT_ASSERT_EQ(relmap_runtime_shmem->directories[0].last_issued, 2051);
-	retention_fixture(2052, 0);
+	/* Match the original node-4 stripe to its local retention directory. */
+	retention_fixture(2052, 4);
 	cluster_shared_catalog = cluster_xid_striping = true;
 	advance_while_unlocked = true;
 	UT_ASSERT_EQ(U64FromFullTransactionId(retention_call(false, 0)), 2084);
 	UT_ASSERT_EQ(waits, 1);
 	UT_ASSERT_EQ(early_extensions, 0);
 	UT_ASSERT_EQ(retention_acquires, 3);
-	UT_ASSERT_EQ(relmap_runtime_shmem->directories[0].last_issued, 2084);
+	UT_ASSERT_EQ(relmap_runtime_shmem->directories[4].last_issued, 2084);
 	retention_fixture((UINT64CONST(7) << 32) + 2052, 0);
 	cluster_shared_catalog = true;
 	retention_wrap_ready = false;
@@ -457,10 +463,21 @@ UT_TEST(retention_guard_valid_entry_observes_under_both_locks_and_returns_only_i
 	}
 }
 
+#ifdef TEST_CLUSTER_XID_RETENTION_NATIVE_CLOG
+#include "test_cluster_xid_retention_native_clog.inc"
+#include "test_cluster_xid_retention_native_xact.inc"
+#endif
+
 int
 main(void)
 {
+#ifdef TEST_CLUSTER_XID_RETENTION_NATIVE_CLOG
+	bool focus = getenv("PGRAC_RETENTION_NATIVE_CLOG_FOCUS") != NULL;
+	UT_PLAN(focus ? 12 : 33);
+	if (!focus) {
+#else
 	UT_PLAN(21);
+#endif
 	UT_RUN(native_subxid_publication_preserves_the_final_cache_slot);
 	UT_RUN(native_publication_keeps_the_full_era_across_raw_rollover);
 	UT_RUN(no_storage_or_procarray_mutation_before_reservation);
@@ -482,6 +499,21 @@ main(void)
 	UT_RUN(original_xact_failure_keeps_unassigned_top_and_existing_pin);
 	UT_RUN(retention_guard_refuses_caller_lock_context_without_consuming_pins);
 	UT_RUN(retention_guard_valid_entry_observes_under_both_locks_and_returns_only_its_lock);
+#ifdef TEST_CLUSTER_XID_RETENTION_NATIVE_CLOG
+	}
+	UT_RUN(retained_native_birth_keeps_owner_pins_and_actual_top);
+	UT_RUN(retained_native_birth_keeps_subxid_epoch_and_replays_captured_bytes);
+	UT_RUN(retained_native_refusals_precede_clog_and_publication);
+	UT_RUN(retained_native_lease_wait_rederives_before_clog);
+	UT_RUN(retained_native_late_guard_refusal_keeps_born_page_and_pins);
+	UT_RUN(retained_native_wal_error_keeps_unpublished_issuance_and_pins);
+	UT_RUN(retained_xact_top_and_children_use_actual_native_birth);
+	UT_RUN(retained_xact_wrap_and_ordinary_identity_are_distinct);
+	UT_RUN(retained_xact_identity_and_admission_refuse_before_effects);
+	UT_RUN(retained_xact_guard_and_native_error_never_retry);
+	UT_RUN(retained_xact_postpublication_error_keeps_top_and_pins);
+	UT_RUN(retained_xact_reset_does_not_leak_to_next_transaction);
+#endif
 	free(relmap_runtime_shmem);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;

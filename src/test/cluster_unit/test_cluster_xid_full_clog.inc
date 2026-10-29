@@ -48,6 +48,10 @@ ExtendCLOGFull(FullTransactionId candidate)
 	if (proc.xid != 0 || visible_xids[0] != 0 || proc.subxidStatus.count != 0)
 		full_clog_fixture.early_publication++;
 	extended();
+#ifdef CLUSTER_XID_RETENTION_TEST
+	if (retention_full_clog_leaf != NULL)
+		retention_full_clog_leaf(candidate);
+#endif
 	if (full_clog_fixture.fail_after == i + 1)
 		longjmp(full_clog_fixture.error, 1);
 }

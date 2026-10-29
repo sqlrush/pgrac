@@ -31,7 +31,7 @@ static void
 native_clog_begin(uint64 next, bool fail)
 {
 	full_clog_reset(next);
-	test_xid_native_clog_start(fail);
+	test_xid_native_clog_start(fail, cluster_node_id);
 	native_clog_enabled = true;
 }
 static void

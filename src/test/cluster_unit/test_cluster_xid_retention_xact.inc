@@ -19,8 +19,13 @@ static TransactionId xact_child[4], xact_parent[4];
 static ResourceOwner xact_lock_owner[4];
 static int xact_wal_level;
 static int xact_error_level;
+static bool xact_retained_entry_test, xact_predicate_error;
 
 static void AssignTransactionId(TransactionState s);
+static FullTransactionId xact_source_retained(uint64 system_identifier,
+	uint64 database_incarnation, uint16 origin);
+static FullTransactionId xact_source_current(void);
+static void xact_source_reset(void);
 
 static bool xact_parallel_mode(void) { return xact_parallel; }
 static bool xact_clean_leave(void) { return xact_leaving; }
@@ -38,7 +43,12 @@ xact_start_error(int level, const char *domain)
 static FullTransactionId
 xact_allocate_native(bool child)
 {
-	FullTransactionId xid = cluster_relmap_retention_allocate_xid_v2(child,
+	FullTransactionId xid;
+
+	if (xact_retained_entry_test)
+		return GetNewTransactionId(child);
+
+	xid = cluster_relmap_retention_allocate_xid_v2(child,
 		retention_sysid, retention_dbinc, retention_origin);
 
 	caller_assignments++;
@@ -58,6 +68,8 @@ xact_register_predicate(TransactionId xid)
 {
 	if (held || retention_held || xid != XidFromFullTransactionId(XactTopFullTransactionId)) abort();
 	xact_predicates++;
+	if (xact_predicate_error)
+		ereport(ERROR, (errcode(ERRCODE_DISK_FULL), errmsg("controlled predicate registration error")));
 }
 
 static void
@@ -81,6 +93,9 @@ xact_wal_insert(RmgrId rmid, uint8 info)
 #define GetTopTransactionId xact_source_top_raw
 #define GetTopFullTransactionId xact_source_top
 #define GetTopFullTransactionIdIfAny xact_source_top_if_any
+#define GetTopFullTransactionIdRelmap xact_source_retained
+#define GetCurrentFullTransactionId xact_source_current
+#define ResetRelmapTransactionIdAllocation xact_source_reset
 #define IsTransactionState xact_source_in_progress
 #define IsInParallelMode xact_parallel_mode
 #define IsParallelWorker() xact_worker
@@ -108,6 +123,9 @@ xact_wal_insert(RmgrId rmid, uint8 info)
 #undef GetTopTransactionId
 #undef GetTopFullTransactionId
 #undef GetTopFullTransactionIdIfAny
+#undef GetTopFullTransactionIdRelmap
+#undef GetCurrentFullTransactionId
+#undef ResetRelmapTransactionIdAllocation
 #undef IsTransactionState
 #undef IsInParallelMode
 #undef IsParallelWorker
@@ -148,6 +166,7 @@ xact_caller_fixture(uint64 first, unsigned origin)
 	nUnreportedXids = 0;
 	xact_wal_level = WAL_LEVEL_MINIMAL;
 	xact_error_level = 0;
+	xact_retained_entry_test = xact_predicate_error = false;
 	xact_source_resource_owner = (ResourceOwner)(uintptr_t)99;
 	memset(unreportedXids, 0, sizeof(unreportedXids));
 	memset(xact_lock_owner, 0, sizeof(xact_lock_owner));

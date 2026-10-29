@@ -30,7 +30,7 @@ bool cluster_wal_inputs_relmap_source_revalidate_v1(const ClusterRecoveryRelmapS
 { (void)s; return false; }
 
 void
-test_xid_native_clog_start(bool fail)
+test_xid_native_clog_start(bool fail, uint16 origin)
 {
 	const char *dirs[] = {"native_side", "native_side/origin_0", "native_side/origin_0/pg_xact",
 		"native_side/origin_1", "native_side/origin_1/pg_xact"};
@@ -43,9 +43,15 @@ test_xid_native_clog_start(bool fail)
 		snprintf(path, sizeof(path), "%s/%s", fixture_root, dirs[i]);
 		UT_ASSERT_EQ(mkdir(path, 0700), 0);
 	}
+	if (origin > 1) {
+		snprintf(path, sizeof(path), "%s/native_side/origin_%u", fixture_root, origin);
+		UT_ASSERT_EQ(mkdir(path, 0700), 0);
+		snprintf(path, sizeof(path), "%s/native_side/origin_%u/pg_xact", fixture_root, origin);
+		UT_ASSERT_EQ(mkdir(path, 0700), 0);
+	}
 	cluster_shared_data_dir = fixture_root;
 	cluster_shared_config = enableFsync = true;
-	cluster_node_id = fixture_origin = 0;
+	cluster_node_id = fixture_origin = origin;
 	MyBackendType = B_BACKEND; MyAuxProcType = NotAnAuxProcess;
 	InRecovery = authority = c0_authority = relmap_base_interrupts = false;
 	InterruptHoldoffCount = CritSectionCount = 0;
@@ -64,7 +70,7 @@ test_xid_native_clog_start(bool fail)
 		XactSLRULock, "pg_xact", LWTRANCHE_XACT_BUFFER, SYNC_HANDLER_NONE);
 	XactCtl->PagePrecedes = CLOGPagePrecedes;
 	UT_ASSERT_EQ(chdir(fixture_root), 0);
-	snprintf(path, sizeof(path), "%s/native_side/origin_0/pg_xact", fixture_root);
+	snprintf(path, sizeof(path), "%s/native_side/origin_%u/pg_xact", fixture_root, origin);
 	UT_ASSERT_EQ(symlink(path, "pg_xact"), 0);
 }
 
@@ -171,6 +177,29 @@ test_xid_native_clog_stop(void)
 	if (LWLockHeldByMe(XidGenLock)) LWLockRelease(XidGenLock);
 	expect_error = birth_wal.fail = false;
 	fixture_idle();
+	/* The original recovery fixture owns origins 0/1. Remove only this
+	 * bridge's additional local origin before its unchanged cleanup. */
+	if (fixture_origin > 1) {
+		char path[MAXPGPATH], dirpath[MAXPGPATH];
+		DIR *dir;
+		struct dirent *entry;
+
+		snprintf(dirpath, sizeof(dirpath), "%s/native_side/origin_%u/pg_xact",
+			fixture_root, fixture_origin);
+		dir = opendir(dirpath);
+		UT_ASSERT(dir != NULL);
+		if (dir != NULL) {
+			while ((entry = readdir(dir)) != NULL) {
+				if (entry->d_name[0] == '.') continue;
+				snprintf(path, sizeof(path), "%s/%s", dirpath, entry->d_name);
+				UT_ASSERT_EQ(unlink(path), 0);
+			}
+			UT_ASSERT_EQ(closedir(dir), 0);
+		}
+		UT_ASSERT_EQ(rmdir(dirpath), 0);
+		snprintf(path, sizeof(path), "%s/native_side/origin_%u", fixture_root, fixture_origin);
+		UT_ASSERT_EQ(rmdir(path), 0);
+	}
 	fixture_cleanup();
 	allocation_count = fixture_lock_count = 0;
 	fixture_shared_mutation = NULL; fixture_shared_mutation_size = 0;
