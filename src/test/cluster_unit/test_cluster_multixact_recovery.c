@@ -18,6 +18,7 @@
 #include <dirent.h>
 #include <sys/wait.h>
 #include "../../backend/access/transam/multixact.c"
+#include "test_cluster_slru_non_clog.h"
 #include "../../backend/access/transam/slru.c"
 
 #undef printf

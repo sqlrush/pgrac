@@ -10850,3 +10850,12 @@ test_cluster_cold_tx_start: test_cluster_cold_ctrc_effects_lifetime.inc
 test_cluster_recovery_reference_graph: test_cluster_recovery_tx_recheck.inc
 test_cluster_recovery_native_inputs: test_cluster_recovery_census_tx_recheck.inc
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_final_tx_recheck.inc
+
+# Original CLOG physical-write bookkeeping is shared by these fixtures.
+test_cluster_clog_recovery test_cluster_side_native_clog.o \
+        test_cluster_recovery_episode_clog.o test_cluster_xid_native_clog.o: test_cluster_clog_relmap_writeback.inc
+
+# Standalone non-CLOG SLRU fixtures have no native CLOG controller.
+test_cluster_subtrans_durability test_cluster_subtrans_order \
+        test_cluster_multixact_recovery test_cluster_multixact_limits_io \
+        test_cluster_subtrans_recovery: test_cluster_slru_non_clog.h

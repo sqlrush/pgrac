@@ -23,6 +23,7 @@
 #ifdef SLRU_TEST_SOURCE
 #include SLRU_TEST_SOURCE
 #else
+#include "test_cluster_slru_non_clog.h"
 #include "../../backend/access/transam/slru.c"
 #endif
 #include "../../backend/storage/sync/sync.c"

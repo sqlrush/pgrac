@@ -1133,6 +1133,35 @@ clog_relmap_native_mutation_end(int origin)
 		;
 }
 
+/* SLRU calls these only around an actual physical write attempt. Controller
+ * identity, rather than directory spelling, identifies original CLOG caches. */
+int
+cluster_clog_relmap_writeback_begin(SlruCtl ctl)
+{
+	int origin;
+	if (!cluster_shared_config)
+		return -1;
+	if (ctl == XactCtl) {
+		if (cluster_node_id < 0 || cluster_node_id >= CLOG_RECOVERY_ORIGINS)
+			return -1;
+		origin = cluster_node_id;
+	} else {
+		for (origin = 0; origin < CLOG_RECOVERY_ORIGINS; ++origin)
+			if (ctl == &ClogRecoveryCtl[origin])
+				break;
+		if (origin == CLOG_RECOVERY_ORIGINS)
+			return -1;
+	}
+	clog_relmap_native_mutation(origin);
+	return origin;
+}
+
+void
+cluster_clog_relmap_writeback_end(int origin)
+{
+	clog_relmap_native_mutation_end(origin);
+}
+
 static bool
 clog_relmap_mutation_snapshot(int origin, uint64 *generation)
 {

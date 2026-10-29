@@ -90,6 +90,7 @@ static unsigned allocation_count;
 static void *fixture_shared_mutation;
 static Size fixture_shared_mutation_size;
 static void (*fixture_native_sync_hook)(void);
+static void (*fixture_physical_write_hook)(void);
 static void (*fixture_native_write_hook)(void);
 static void (*fixture_native_lock_hook)(LWLock *);
 static bool fixture_native_sync_fallback;
@@ -316,6 +317,8 @@ void
 pgstat_count_slru_page_written(int i pg_attribute_unused())
 {
 	writes++;
+	if (fixture_physical_write_hook != NULL)
+		fixture_physical_write_hook();
 	if (fixture_native_write_hook != NULL)
 		fixture_native_write_hook();
 }
@@ -1315,6 +1318,7 @@ UT_TEST(own_c0_native_error_and_revocation_preserve_cache_ownership)
 #include "test_cluster_clog_page_birth.inc"
 #include "test_cluster_clog_relmap_mutation.inc"
 #include "test_cluster_clog_relmap_shared_mutation.inc"
+#include "test_cluster_clog_relmap_writeback.inc"
 #include "test_cluster_clog_resident_birth.inc"
 
 static void
@@ -1509,7 +1513,23 @@ main(void)
 		UT_RUN(terminal_residency_preconditions_and_entered_failures_keep_polarity);
 		goto mutation_done;
 	}
-	UT_PLAN(102);
+	if (getenv("PGRAC_RELMAP_WRITEBACK_ONLY") != NULL) {
+		UT_PLAN(6);
+		UT_RUN(relmap_checkpoint_equal_bytes_revokes_held_observation);
+		UT_RUN(relmap_direct_writeback_tracks_original_local_and_foreign_caches);
+		UT_RUN(relmap_eviction_writeback_revokes_equal_byte_custody);
+		UT_RUN(relmap_writeback_clean_and_other_origin_preserve_observation);
+		UT_RUN(relmap_failed_writeback_keeps_sticky_debt_and_releases_writer);
+		UT_RUN(relmap_inflight_physical_write_refuses_new_and_original_custody);
+		goto mutation_done;
+	}
+	UT_PLAN(108);
+	UT_RUN(relmap_checkpoint_equal_bytes_revokes_held_observation);
+	UT_RUN(relmap_direct_writeback_tracks_original_local_and_foreign_caches);
+	UT_RUN(relmap_eviction_writeback_revokes_equal_byte_custody);
+	UT_RUN(relmap_writeback_clean_and_other_origin_preserve_observation);
+	UT_RUN(relmap_failed_writeback_keeps_sticky_debt_and_releases_writer);
+	UT_RUN(relmap_inflight_physical_write_refuses_new_and_original_custody);
 	UT_RUN(terminal_residency_keeps_only_untouched_native_full_input);
 	UT_RUN(terminal_residency_never_hides_changed_physical_terminal_bits);
 	UT_RUN(terminal_residency_complete_tree_does_not_restore_target_birth);

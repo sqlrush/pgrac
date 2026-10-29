@@ -91,11 +91,16 @@ typedef struct ClusterRelmapClogBaseV1 {
 	uint64 resident_first_full_xid;
 } ClusterRelmapClogBaseV1;
 typedef struct ClusterRelmapClogBaseHandleV1 ClusterRelmapClogBaseHandleV1;
+/* Internal SLRU physical-write bookkeeping; -1 means a non-CLOG controller.
+ * Every nonnegative begin result must reach end, including ERROR exits. */
+struct SlruCtlData;
+extern int cluster_clog_relmap_writeback_begin(struct SlruCtlData *ctl);
+extern void cluster_clog_relmap_writeback_end(int origin);
 /* Start with *held NULL. Subsequent reads require the exact original source,
  * query and full disk image on the same tracked fd. Entered refusal/ERROR
  * poisons custody and the original episode, retaining original protection.
  * Native locks cover only each read; no lock is retained between calls.
- * Native logical mutation in this process invalidates its origin's held
+ * Native mutation and physical writeback in this process invalidate held
  * observations before the attempt, even if the same bytes are restored.
  * Shared mutation sequences also reject writes by other backends of this
  * postmaster and refuse observations while a native attempt is in progress.

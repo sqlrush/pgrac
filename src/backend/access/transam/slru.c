@@ -63,6 +63,7 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #ifdef USE_PGRAC_CLUSTER
+#include "access/clog.h"
 #include "postmaster/bgwriter.h"
 #endif
 #include "storage/fd.h"
@@ -803,7 +804,7 @@ SlruPhysicalReadPage(SlruCtl ctl, int pageno, int slotno)
  * SimpleLruWriteAll.
  */
 static bool
-SlruPhysicalWritePage(SlruCtl ctl, int pageno, int slotno, SlruWriteAll fdata)
+SlruPhysicalWritePageInternal(SlruCtl ctl, int pageno, int slotno, SlruWriteAll fdata)
 {
 	SlruShared	shared = ctl->shared;
 	int			segno = pageno / SLRU_PAGES_PER_SEGMENT;
@@ -971,6 +972,28 @@ SlruPhysicalWritePage(SlruCtl ctl, int pageno, int slotno, SlruWriteAll fdata)
 	}
 
 	return true;
+}
+
+static bool
+SlruPhysicalWritePage(SlruCtl ctl, int pageno, int slotno, SlruWriteAll fdata)
+{
+#ifdef USE_PGRAC_CLUSTER
+	int origin = cluster_clog_relmap_writeback_begin(ctl);
+	volatile bool ok;
+	if (origin >= 0) {
+		PG_TRY();
+		{
+			ok = SlruPhysicalWritePageInternal(ctl, pageno, slotno, fdata);
+		}
+		PG_FINALLY();
+		{
+			cluster_clog_relmap_writeback_end(origin);
+		}
+		PG_END_TRY();
+		return ok;
+	}
+#endif
+	return SlruPhysicalWritePageInternal(ctl, pageno, slotno, fdata);
 }
 
 /*
