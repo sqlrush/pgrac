@@ -287,6 +287,76 @@ typedef struct UndoSegmentHeaderData {
 								  /* total: 8192 bytes (one PG block) */
 } UndoSegmentHeaderData;
 
+/* V2 is a separate explicit view while V1 remains the live layout. Never
+ * cast a legacy page to this view before checking its fixed-prefix marker. */
+#define CLUSTER_UNDO_TT_LAYOUT_V2 2
+#define CLUSTER_UNDO_TT_SLOT_V2_BYTES 40
+
+typedef struct UndoSegmentHeaderDataV2 {
+	PageXLogRecPtr pd_lsn;
+	uint16 pd_checksum;
+	uint16 pd_flags;
+	LocationIndex pd_lower;
+	LocationIndex pd_upper;
+	LocationIndex pd_special;
+	uint16 pd_pagesize_version;
+	TransactionId pd_prune_xid;
+	SCN pd_block_scn;
+	uint32 segment_id;
+	uint32 segment_size_bytes;
+	uint8 segment_state;
+	uint8 owner_instance;
+	uint16 tt_slots_count;
+	BlockNumber head_block;
+	BlockNumber tail_block;
+	BlockNumber last_recyclable_block;
+	uint8 segment_flags;
+	uint8 tt_layout_version;
+	uint16 tt_slot_bytes;
+	uint32 tt_layout_reserved;
+	SCN oldest_active_scn;
+	SCN commit_horizon_scn;
+	TimestampTz created_at;
+	TimestampTz last_used_at;
+	uint64 total_records_written;
+	uint64 total_bytes_used;
+	TTSlotV2 tt_slots[TT_SLOTS_PER_SEGMENT];
+	uint32 tt_next_free_slot;
+	uint32 tt_active_count;
+	uint8 free_block_bitmap[UNDO_FREE_BITMAP_BYTES];
+	uint32 wrap_count;
+	uint8 _reserved[8192 - 3068];
+} UndoSegmentHeaderDataV2;
+
+StaticAssertDecl(sizeof(UndoSegmentHeaderDataV2) == UNDO_SEGMENT_HEADER_SIZE,
+				 "TT V2 block zero must remain exactly 8192 bytes");
+StaticAssertDecl(offsetof(UndoSegmentHeaderDataV2, segment_id) == 32,
+				 "TT V2 segment identity offset must remain fixed");
+StaticAssertDecl(offsetof(UndoSegmentHeaderDataV2, tt_layout_version) == 57,
+				 "TT V2 version must be at byte 57");
+StaticAssertDecl(offsetof(UndoSegmentHeaderDataV2, tt_slot_bytes) == 58,
+				 "TT V2 stride must be at byte 58");
+StaticAssertDecl(offsetof(UndoSegmentHeaderDataV2, tt_layout_reserved) == 60,
+				 "TT V2 reserved word must be at byte 60");
+StaticAssertDecl(offsetof(UndoSegmentHeaderDataV2, oldest_active_scn) == 64,
+				 "TT V2 retention prefix offset must remain fixed");
+StaticAssertDecl(offsetof(UndoSegmentHeaderDataV2, tt_slots) == 112,
+				 "TT V2 slot array must remain at byte 112");
+StaticAssertDecl(sizeof(((UndoSegmentHeaderDataV2 *)0)->tt_slots) == 1920,
+				 "TT V2 slot array must occupy exactly 1920 bytes");
+StaticAssertDecl(offsetof(UndoSegmentHeaderDataV2, tt_next_free_slot) == 2032,
+				 "TT V2 next slot must be at byte 2032");
+StaticAssertDecl(offsetof(UndoSegmentHeaderDataV2, tt_active_count) == 2036,
+				 "TT V2 active count must be at byte 2036");
+StaticAssertDecl(offsetof(UndoSegmentHeaderDataV2, free_block_bitmap) == 2040,
+				 "TT V2 bitmap must be at byte 2040");
+StaticAssertDecl(offsetof(UndoSegmentHeaderDataV2, wrap_count) == 3064,
+				 "TT V2 segment generation must be at byte 3064");
+StaticAssertDecl(offsetof(UndoSegmentHeaderDataV2, _reserved) == 3068,
+				 "TT V2 reserve must begin at byte 3068");
+StaticAssertDecl(112 + TT_SLOTS_PER_SEGMENT * sizeof(TTSlotV2) <= 4096,
+				 "TT V2 slots must remain within the first half page");
+
 
 /*
  * On-disk ABI invariants -- enforced at compile time.
@@ -540,11 +610,46 @@ UndoSegmentHeader_identity_matches(const char *blockbuf, uint32 segment_id, uint
 {
 	PageHeader ph = (PageHeader)blockbuf;
 	const UndoSegmentHeaderData *hdr = (const UndoSegmentHeaderData *)blockbuf;
+	const uint8 legacy_reserved[7] = { 0 };
 
+	/* Reject new/unknown framing before a caller can use the V1 slot stride. */
+	if (blockbuf == NULL || memcmp(hdr->_pad_57, legacy_reserved, sizeof(legacy_reserved)) != 0)
+		return false;
 	if ((ph->pd_flags & PD_UNDO_SEG_HEADER) == 0 || PageGetPageSize((Page)blockbuf) != BLCKSZ
 		|| PageGetPageLayoutVersion((Page)blockbuf) != PG_PAGE_LAYOUT_VERSION
 		|| hdr->segment_id != segment_id || hdr->segment_size_bytes != UNDO_SEGMENT_SIZE_BYTES
 		|| hdr->owner_instance != owner_instance || hdr->tt_slots_count != TT_SLOTS_PER_SEGMENT)
+		return false;
+	return hdr->segment_state == SEGMENT_ALLOCATED || hdr->segment_state == SEGMENT_ACTIVE
+		   || hdr->segment_state == SEGMENT_COMMITTED || hdr->segment_state == SEGMENT_RECYCLABLE;
+}
+
+/* Complete aligned block only. Check the fixed prefix before interpreting
+ * any V2 slot, counter, bitmap or generation. No checksum/current authority. */
+static inline bool
+UndoSegmentHeaderV2_identity_matches(const char *blockbuf, Size length, uint32 segment_id,
+									uint8 owner_instance)
+{
+	const UndoSegmentHeaderDataV2 *hdr;
+	uint8 version;
+	uint16 stride;
+	uint32 reserved;
+
+	if (blockbuf == NULL || length != UNDO_SEGMENT_HEADER_SIZE)
+		return false;
+	memcpy(&version, blockbuf + 57, sizeof(version));
+	memcpy(&stride, blockbuf + 58, sizeof(stride));
+	memcpy(&reserved, blockbuf + 60, sizeof(reserved));
+	if (version != CLUSTER_UNDO_TT_LAYOUT_V2 || stride != CLUSTER_UNDO_TT_SLOT_V2_BYTES
+		|| reserved != 0)
+		return false;
+	hdr = (const UndoSegmentHeaderDataV2 *)blockbuf;
+	if ((hdr->pd_flags & PD_UNDO_SEG_HEADER) == 0 || PageGetPageSize((Page)blockbuf) != BLCKSZ
+		|| PageGetPageLayoutVersion((Page)blockbuf) != PG_PAGE_LAYOUT_VERSION
+		|| segment_id == 0 || owner_instance == 0 || owner_instance > UNDO_OWNER_INSTANCE_MAX
+		|| hdr->segment_id != segment_id || hdr->segment_size_bytes != UNDO_SEGMENT_SIZE_BYTES
+		|| hdr->owner_instance != owner_instance || hdr->tt_slots_count != TT_SLOTS_PER_SEGMENT
+		|| hdr->tt_next_free_slot > TT_SLOTS_PER_SEGMENT || hdr->tt_active_count > TT_SLOTS_PER_SEGMENT)
 		return false;
 	return hdr->segment_state == SEGMENT_ALLOCATED || hdr->segment_state == SEGMENT_ACTIVE
 		   || hdr->segment_state == SEGMENT_COMMITTED || hdr->segment_state == SEGMENT_RECYCLABLE;

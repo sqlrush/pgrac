@@ -122,6 +122,31 @@ StaticAssertDecl(offsetof(TTSlot, commit_scn) == 8, "spec-1.20 invariant: commit
 StaticAssertDecl(offsetof(TTSlot, first_undo_block) == 16,
 				 "spec-1.20 invariant: first_undo_block at byte 16");
 
+/* Explicit new-cluster layout. The live TTSlot alias remains V1 until the
+ * complete V2 producer/recovery batch switches all readers together. */
+typedef struct TTSlotV2 {
+	TransactionId xid;
+	uint16 wrap;
+	uint8 status;
+	uint8 flags;
+	SCN commit_scn;
+	UBA first_undo_block;
+	uint64 original_full_xid;
+} TTSlotV2;
+
+StaticAssertDecl(sizeof(TTSlotV2) == 40, "TT V2 slot must be exactly 40 bytes");
+StaticAssertDecl(offsetof(TTSlotV2, xid) == 0, "TT V2 xid offset must remain fixed");
+StaticAssertDecl(offsetof(TTSlotV2, wrap) == 4, "TT V2 wrap offset must remain fixed");
+StaticAssertDecl(offsetof(TTSlotV2, status) == 6, "TT V2 status offset must remain fixed");
+StaticAssertDecl(offsetof(TTSlotV2, flags) == 7, "TT V2 flags offset must remain fixed");
+StaticAssertDecl(offsetof(TTSlotV2, commit_scn) == 8, "TT V2 SCN offset must remain fixed");
+StaticAssertDecl(offsetof(TTSlotV2, first_undo_block) == 16, "TT V2 UBA offset must remain fixed");
+StaticAssertDecl(offsetof(TTSlotV2, original_full_xid) == 32,
+				 "TT V2 original FullXid must be at byte 32");
+StaticAssertDecl(sizeof(((TTSlotV2 *)0)->original_full_xid) == 8
+				 && offsetof(TTSlotV2, original_full_xid) % 8 == 0 && sizeof(TTSlotV2) % 8 == 0,
+				 "TT V2 original FullXid must occupy an aligned eight bytes");
+
 
 /*
  * Sentinel constants.  Stage 2+ extensions MUST NOT reassign value 0

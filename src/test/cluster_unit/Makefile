@@ -449,6 +449,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_hw_handoff,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_edge_reader,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_heap_epq_wait,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_undo_extent_claim,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_undo_segment,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_rf_route,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_detached,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_guard,$(SIMPLE_TESTS))
@@ -3498,6 +3499,25 @@ test_cluster_side_route: test_cluster_side_route.c unit_test.h \
 # RF-SIDE D-SIDE-02: TT/undo decode + preflight primitives (single
 # parser; malformed/unknown -> BLOCKED pre-mutation).
 CLUSTER_SIDE_UNDO_O = test_cluster_side_xact_undo_product.o
+
+# Compile the one shared fresh-page producer in both its real build modes.
+UNDO_HEADER_INIT_DEPS = $(top_srcdir)/src/common/cluster_undo_segment_init.c \
+	$(top_srcdir)/src/include/cluster/cluster_undo_segment_init.h \
+	$(top_srcdir)/src/include/cluster/cluster_undo_segment.h \
+	$(top_srcdir)/src/include/cluster/cluster_tt_slot.h
+test_cluster_undo_segment_init_backend.o: $(UNDO_HEADER_INIT_DEPS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
+test_cluster_undo_segment_init_frontend.o: $(UNDO_HEADER_INIT_DEPS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND \
+		-Dcluster_undo_segment_make_header_bytes=test_frontend_undo_header_v1 \
+		-Dcluster_undo_segment_make_header_v2_bytes=test_frontend_undo_header_v2 \
+		-c $< -o $@
+
+test_cluster_undo_segment: test_cluster_undo_segment.c unit_test.h $(UNDO_HEADER_INIT_DEPS) \
+		test_cluster_undo_segment_init_backend.o test_cluster_undo_segment_init_frontend.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_undo_segment_init_backend.o \
+		test_cluster_undo_segment_init_frontend.o -o $@
 
 # Use the original transition tables, never mock their decisions in typed
 # header preparation tests. The extracted functions retain their real bodies.

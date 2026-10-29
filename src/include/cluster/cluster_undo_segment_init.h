@@ -67,5 +67,11 @@
 extern void cluster_undo_segment_make_header_bytes(uint32 segment_id, uint8 owner_instance,
 												   char *page);
 
+/* Fresh V2 template only, not an upgrade of the previous destination bytes.
+ * Same aligned BLCKSZ destination contract. Refusal leaves it unchanged;
+ * disabled-cluster builds always refuse. Live V1 callers are not switched. */
+extern bool cluster_undo_segment_make_header_v2_bytes(uint32 segment_id, uint8 owner_instance,
+													char *page);
+
 
 #endif /* CLUSTER_UNDO_SEGMENT_INIT_H */

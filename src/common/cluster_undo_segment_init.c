@@ -153,3 +153,28 @@ cluster_undo_segment_make_header_bytes(uint32 segment_id, uint8 owner_instance, 
 		memset(page, 0, 8192);
 #endif
 }
+
+bool
+cluster_undo_segment_make_header_v2_bytes(uint32 segment_id, uint8 owner_instance, char *page)
+{
+#ifdef USE_PGRAC_CLUSTER
+	UndoSegmentHeaderDataV2 *header;
+
+	if (page == NULL || segment_id == 0 || owner_instance == 0
+		|| owner_instance > UNDO_OWNER_INSTANCE_MAX)
+		return false;
+	/* The common fresh prefix is identical, and all slots/counters/bitmap
+	 * are zero. No predecessor data is read or converted by either helper. */
+	cluster_undo_segment_make_header_bytes(segment_id, owner_instance, page);
+	header = (UndoSegmentHeaderDataV2 *)page;
+	header->tt_layout_version = CLUSTER_UNDO_TT_LAYOUT_V2;
+	header->tt_slot_bytes = CLUSTER_UNDO_TT_SLOT_V2_BYTES;
+	header->tt_layout_reserved = 0;
+	return true;
+#else
+	(void)segment_id;
+	(void)owner_instance;
+	(void)page;
+	return false;
+#endif
+}
