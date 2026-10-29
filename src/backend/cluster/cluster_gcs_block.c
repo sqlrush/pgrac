@@ -10369,7 +10369,8 @@ gcs_block_resource_x_payload_candidate(uint8 msg_type, uint32 payload_length)
 	if (msg_type == RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE)
 		return payload_length == RESOURCE_X_CONTROL_V1_BYTES
 			   || payload_length == RESOURCE_X_SHORT_V1_BYTES
-			   || payload_length == RESOURCE_X_COMPLETE_V5_BYTES;
+			   || payload_length == RESOURCE_X_COMPLETE_V5_BYTES
+			   || payload_length == RESOURCE_X_SOURCE_COMPLETE_V11_BYTES;
 	return false;
 }
 
@@ -15613,8 +15614,9 @@ gcs_block_resource_x_requester_join_ingress(const ClusterICEnvelope *env,
 			&& !(frame->kind == RESOURCE_X_WIRE_BLOCKED_TO_N && frame->has_acquire_decision
 				 && !frame->body.acquire_witness.has_source_proof)))
 		return RESOURCE_X_APPLY_INVALID;
-	if (consumed && (frame->payload_bytes != RESOURCE_X_COMPLETE_V5_BYTES
-		|| env->msg_type != RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE || env->payload_length != RESOURCE_X_COMPLETE_V5_BYTES
+	if (consumed && ((frame->payload_bytes != RESOURCE_X_COMPLETE_V5_BYTES
+			&& frame->payload_bytes != RESOURCE_X_SOURCE_COMPLETE_V11_BYTES)
+		|| env->msg_type != RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE || env->payload_length != frame->payload_bytes
 		|| env->source_node_id != (uint32)frame->body.acquire_completion.decision.master_node
 		|| env->dest_node_id != (uint32)cluster_node_id
 		|| env->epoch != frame->body.acquire_completion.decision.episode.cluster_epoch))

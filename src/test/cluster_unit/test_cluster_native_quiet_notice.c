@@ -19,7 +19,7 @@
 #define QN_RETIRED UINT8_C(13)
 #define QN_CONSUMED UINT8_C(12)
 static ClusterPcmResourceXMasterState *qn_state;
-static ClusterPcmResourceXControlIntent *qn_intent;
+static ClusterPcmResourceXReadIntent *qn_intent;
 
 static bool
 qn_start(EvidenceFixture *f)
@@ -102,7 +102,7 @@ static void
 qn_retired(void)
 {
 	static const ResourceXAcquireReadReceipt empty_receipt;
-	static const ClusterPcmResourceXControlIntent empty_intent;
+	static const ClusterPcmResourceXReadIntent empty_intent;
 	ClusterPcmResourceXBootstrapRound *round = &request_entry()->resource_x_bootstrap_round;
 	UT_ASSERT_EQ(round->has_acquire_intent, 0); UT_ASSERT_EQ(round->delivery_executor_purpose, 0);
 	UT_ASSERT_EQ(round->delivery_target.buffer_id_plus_one, 0);
@@ -173,7 +173,7 @@ UT_TEST(test_quiet_notice_failed_callback_after_ACK_is_quiescent_not_resubmitted
 }
 UT_TEST(test_quiet_notice_NOT_ADMITTED_preserves_exact_send_and_receipt)
 {
-	EvidenceFixture f; ResourceXIntentSlot slot; ClusterPcmResourceXControlIntent before;
+	EvidenceFixture f; ResourceXIntentSlot slot; ClusterPcmResourceXReadIntent before;
 	UT_ASSERT(qn_start(&f)); UT_ASSERT(qn_probe(&slot)); before = *qn_intent;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_not_admitted_exact(&slot, ++fake_pcm_clock_us), RESOURCE_X_INTENT_NOT_ADMITTED);
 	UT_ASSERT(memcmp(before.payload, qn_intent->payload, sizeof(before.payload)) == 0);
@@ -191,7 +191,7 @@ UT_TEST(test_quiet_notice_failure_rearms_same_body_and_late_callback_cannot_clea
 }
 UT_TEST(test_quiet_notice_generic_completion_cannot_discard_transport_owner)
 {
-	EvidenceFixture f; ResourceXIntentSlot slot; ClusterPcmResourceXControlIntent before;
+	EvidenceFixture f; ResourceXIntentSlot slot; ClusterPcmResourceXReadIntent before;
 	UT_ASSERT(qn_start(&f)); slot = qn_stage(); before = *qn_intent;
 	UT_ASSERT(!cluster_pcm_lock_resource_x_outbound_intent_complete_exact(&slot));
 	UT_ASSERT(memcmp(&before, qn_intent, sizeof(before)) == 0);
@@ -242,7 +242,7 @@ UT_TEST(test_quiet_notice_normal_C_consumed_frame_never_retires_quiet)
 UT_TEST(test_quiet_notice_corrupt_receipt_or_foreign_intent_is_not_overwritten)
 {
 	for(int n=0;n<3;n++) {
-		EvidenceFixture f; ResourceXIntentSlot slot; ClusterPcmResourceXControlIntent before;
+		EvidenceFixture f; ResourceXIntentSlot slot; ClusterPcmResourceXReadIntent before;
 		UT_ASSERT(qn_start(&f));
 		if(n==0) request_entry()->resource_x_bootstrap_round.acquire_read_receipt.decision_crc32c++;
 		if(n==1) qn_intent->slot.state=99;

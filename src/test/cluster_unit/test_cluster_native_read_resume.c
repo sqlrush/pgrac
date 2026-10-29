@@ -184,7 +184,7 @@ UT_TEST(test_resume_completed_S_observation_is_a_noop)
 
 UT_TEST(test_resume_notice_does_not_rearm_or_retire_original_DONE)
 {
-	EvidenceFixture f; ResourceXDecodedFrame ack; ClusterPcmResourceXControlIntent notice;
+	EvidenceFixture f; ResourceXDecodedFrame ack; ClusterPcmResourceXReadIntent notice;
 	UT_ASSERT(settle_start(&f, &ack)); resume_canaries(); notice = *done_intent;
 	UT_ASSERT_EQ(resume_run(), RESOURCE_X_APPLY_DUPLICATE); resume_original(7);
 	UT_ASSERT(memcmp(&notice, done_intent, sizeof(notice)) == 0); settle_once(7);
@@ -192,7 +192,7 @@ UT_TEST(test_resume_notice_does_not_rearm_or_retire_original_DONE)
 
 UT_TEST(test_resume_consumed_STAGED_notice_remains_with_physical_owner)
 {
-	EvidenceFixture f; ResourceXDecodedFrame ack; ClusterPcmResourceXControlIntent notice;
+	EvidenceFixture f; ResourceXDecodedFrame ack; ClusterPcmResourceXReadIntent notice;
 	UT_ASSERT(settle_start(&f, &ack)); resume_canaries(); (void)settle_stage();
 	UT_ASSERT_EQ(settle_receive(&ack), RESOURCE_X_APPLY_APPLIED); notice = *done_intent;
 	UT_ASSERT_EQ(resume_run(), RESOURCE_X_APPLY_DUPLICATE); resume_original(8);
@@ -490,7 +490,7 @@ UT_TEST(test_resume_C_during_observation_never_returns_a_second_IO_permission)
 
 UT_TEST(test_resume_notice_never_releases_a_later_same_sequence_hold)
 {
-	EvidenceFixture f; ResourceXDecodedFrame ack; ClusterPcmResourceXControlIntent notice;
+	EvidenceFixture f; ResourceXDecodedFrame ack; ClusterPcmResourceXReadIntent notice;
 	UT_ASSERT(settle_start(&f, &ack)); resume_canaries(); notice = *done_intent;
 	pg_atomic_write_u64(&request_own.delivery_attempt, execution_claim.executor_sequence);
 	UT_ASSERT(resume_run() != RESOURCE_X_APPLY_DUPLICATE); resume_no_output();

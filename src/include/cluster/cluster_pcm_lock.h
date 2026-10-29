@@ -1737,7 +1737,7 @@ typedef struct ResourceXAcquireReadReceipt {
 	uint32 decision_crc32c;
 } ResourceXAcquireReadReceipt;
 StaticAssertDecl(sizeof(ResourceXAcquireReadReceipt) == 40,
-				 "Resource-X disk completion evidence has no implicit padding");
+				 "Resource-X first-fill completion evidence has no implicit padding");
 typedef struct ResourceXDeliveryClaim {
 	ResourceXInstallClaimJoinObservation observation;
 	ResourceXDeliveryTarget target;

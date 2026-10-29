@@ -410,7 +410,7 @@ UT_TEST(test_continue_exact_observer_after_recovery_sees_original_completed_capa
 UT_TEST(test_continue_already_done_consumed_or_settled_never_rearms_notice)
 {
 	for (unsigned phase = 7; phase <= 9; phase++) {
-		EvidenceFixture f; ResourceXDecodedFrame ack; ClusterPcmResourceXControlIntent notice;
+		EvidenceFixture f; ResourceXDecodedFrame ack; ClusterPcmResourceXReadIntent notice;
 		UT_ASSERT(settle_start(&f, &ack)); armed_capability = prepared_claim;
 		if (phase >= 8) UT_ASSERT_EQ(settle_receive(&ack), RESOURCE_X_APPLY_APPLIED);
 		if (phase == 9) UT_ASSERT_EQ(settle_run(), RESOURCE_X_APPLY_APPLIED);
@@ -422,7 +422,7 @@ UT_TEST(test_continue_already_done_consumed_or_settled_never_rearms_notice)
 
 UT_TEST(test_continue_later_hold_after_notice_is_never_released)
 {
-	EvidenceFixture f; ResourceXDecodedFrame ack; ClusterPcmResourceXControlIntent notice;
+	EvidenceFixture f; ResourceXDecodedFrame ack; ClusterPcmResourceXReadIntent notice;
 	UT_ASSERT(settle_start(&f, &ack)); armed_capability = prepared_claim; notice = *done_intent;
 	pg_atomic_write_u64(&request_own.delivery_attempt, execution_claim.executor_sequence);
 	UT_ASSERT(armed_advance() != RESOURCE_X_APPLY_DUPLICATE);

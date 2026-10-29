@@ -568,7 +568,8 @@ lms_outbound_resource_x_intent_valid(const ResourceXIntentSlot *intent)
 			   && intent->body.owner_index == 0;
 	case RESOURCE_X_INTENT_OWNER_REQUESTER_SETTLEMENT:
 		return (intent->payload_bytes == RESOURCE_X_SHORT_V1_BYTES
-				|| intent->payload_bytes == RESOURCE_X_COMPLETE_V5_BYTES)
+				|| intent->payload_bytes == RESOURCE_X_COMPLETE_V5_BYTES
+				|| intent->payload_bytes == RESOURCE_X_SOURCE_COMPLETE_V11_BYTES)
 			   && intent->kind == RESOURCE_X_WIRE_INSTALL_SETTLEMENT
 			   && intent->body.assertion.requester_node == (int32)intent->body.owner_node
 			   && intent->body.owner_generation == intent->logical_generation
@@ -623,7 +624,8 @@ lms_outbound_resource_x_intent_payload_valid(const ResourceXIntentSlot *intent,
 		&& intent->payload_bytes != RESOURCE_X_WITNESS_V4_BYTES
 		&& intent->payload_bytes != RESOURCE_X_SOURCE_WITNESS_V4_BYTES
 		&& intent->payload_bytes != RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES
-		&& intent->payload_bytes != RESOURCE_X_COMPLETE_V5_BYTES)
+		&& intent->payload_bytes != RESOURCE_X_COMPLETE_V5_BYTES
+		&& intent->payload_bytes != RESOURCE_X_SOURCE_COMPLETE_V11_BYTES)
 		return true; /* Original non-conditional producers keep their gates. */
 	if (intent->body.owner_node != (uint32)cluster_node_id
 		|| !cluster_resource_x_wire_decode(lms_outbound_resource_x_intent_msg_type(intent),
@@ -636,15 +638,21 @@ lms_outbound_resource_x_intent_payload_valid(const ResourceXIntentSlot *intent,
 		|| common->assertion_sequence != intent->logical_generation
 		|| common->authority_generation != intent->authority_generation)
 		return false;
-	if (intent->payload_bytes == RESOURCE_X_COMPLETE_V5_BYTES) {
+	if (intent->payload_bytes == RESOURCE_X_COMPLETE_V5_BYTES
+		|| intent->payload_bytes == RESOURCE_X_SOURCE_COMPLETE_V11_BYTES) {
 		decision = &frame.body.acquire_completion.decision;
 		if (intent->body.owner_kind == RESOURCE_X_INTENT_OWNER_MASTER_GRANT)
-			return common->outcome == RESOURCE_X_OUTCOME_DUPLICATE
+			return intent->payload_bytes == RESOURCE_X_COMPLETE_V5_BYTES
+				&& (common->outcome == RESOURCE_X_OUTCOME_DUPLICATE
+					|| common->outcome == RESOURCE_X_OUTCOME_QUIET_RETIRED
+					|| common->outcome == RESOURCE_X_OUTCOME_QUIET_NO_IMAGE_RETIRED)
 				&& common->action_node == (int32)intent->body.owner_node
 				&& decision->master_node == (int32)intent->body.owner_node
 				&& common->logical_assertion.requester_node == (int32)intent->destination_node;
 		return intent->body.owner_kind == RESOURCE_X_INTENT_OWNER_REQUESTER_SETTLEMENT
-			&& common->outcome == RESOURCE_X_OUTCOME_OK
+			&& (common->outcome == RESOURCE_X_OUTCOME_OK
+				|| common->outcome == RESOURCE_X_OUTCOME_QUIET
+				|| common->outcome == RESOURCE_X_OUTCOME_QUIET_NO_IMAGE)
 			&& common->action_node == (int32)intent->body.owner_node
 			&& decision->master_node == (int32)intent->destination_node;
 	}

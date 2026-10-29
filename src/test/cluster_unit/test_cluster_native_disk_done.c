@@ -23,7 +23,7 @@ ClusterLmsEnqueueResult done_actual_lms_enqueue(int worker, const ResourceXInten
 #endif
 
 static ClusterPcmResourceXMasterState *done_state;
-static ClusterPcmResourceXControlIntent *done_intent;
+static ClusterPcmResourceXReadIntent *done_intent;
 
 static ResourceXApplyResult
 done_run(void)
@@ -181,7 +181,7 @@ UT_TEST(test_done_original_retained_bytes_are_canonical)
 UT_TEST(test_done_duplicate_before_send_never_rearms_or_repeats_C)
 {
 	EvidenceFixture f;
-	ClusterPcmResourceXControlIntent before;
+	ClusterPcmResourceXReadIntent before;
 	if (!done_start(&f)) { UT_ASSERT(false); return; }
 	UT_ASSERT_EQ(done_run(), RESOURCE_X_APPLY_APPLIED);
 	before = *done_intent;
@@ -192,7 +192,7 @@ UT_TEST(test_done_duplicate_before_send_never_rearms_or_repeats_C)
 UT_TEST(test_done_NOT_ADMITTED_keeps_exact_original_payload_and_responsibility)
 {
 	EvidenceFixture f;
-	ClusterPcmResourceXControlIntent before;
+	ClusterPcmResourceXReadIntent before;
 	ResourceXIntentSlot slot;
 	if (!done_start(&f)) { UT_ASSERT(false); return; }
 	UT_ASSERT_EQ(done_run(), RESOURCE_X_APPLY_APPLIED);
@@ -256,7 +256,7 @@ UT_TEST(test_done_failed_real_transport_rearms_same_notice_only)
 UT_TEST(test_done_occupied_original_container_is_local_wait_without_eviction)
 {
 	EvidenceFixture f;
-	ClusterPcmResourceXControlIntent before;
+	ClusterPcmResourceXReadIntent before;
 	ClusterPcmResourceXBootstrapRound round;
 	if (!done_start(&f)) { UT_ASSERT(false); return; }
 	memset(done_intent, 0x3B, sizeof(*done_intent));
@@ -449,7 +449,7 @@ UT_TEST(test_done_shared_receipt_corruption_cannot_be_sent)
 UT_TEST(test_done_cancel_floor_never_drops_existing_completion_debt)
 {
 	EvidenceFixture f;
-	ClusterPcmResourceXControlIntent before;
+	ClusterPcmResourceXReadIntent before;
 	if (!done_start(&f)) { UT_ASSERT(false); return; }
 	UT_ASSERT_EQ(done_run(), RESOURCE_X_APPLY_APPLIED); before = *done_intent;
 	request_entry()->resource_x_bootstrap_round.cancelled_attempt_floor = 1;
@@ -470,7 +470,7 @@ UT_TEST(test_done_legacy_X_install_settlement_cannot_consume_typed_S_notice)
 UT_TEST(test_done_original_completion_replay_preserves_notice_and_never_repeats_C)
 {
 	EvidenceFixture f;
-	ClusterPcmResourceXControlIntent before;
+	ClusterPcmResourceXReadIntent before;
 	if (!done_start(&f)) { UT_ASSERT(false); return; }
 	UT_ASSERT_EQ(done_run(), RESOURCE_X_APPLY_APPLIED); before = *done_intent;
 	UT_ASSERT_EQ(complete_run(), RESOURCE_X_APPLY_DUPLICATE);
@@ -540,7 +540,7 @@ UT_TEST(test_done_CRC_valid_altered_full_E_A_I_is_not_a_sendable_owner)
 UT_TEST(test_done_notice_replay_cannot_release_a_subsequent_native_hold)
 {
 	EvidenceFixture f;
-	ClusterPcmResourceXControlIntent before;
+	ClusterPcmResourceXReadIntent before;
 	if (!done_start(&f)) { UT_ASSERT(false); return; }
 	UT_ASSERT_EQ(done_run(), RESOURCE_X_APPLY_APPLIED);
 	before = *done_intent;

@@ -149,7 +149,7 @@ settle_once(uint8 purpose)
 UT_TEST(test_consumed_ACK_retains_full_original_A_I_and_physical_notice)
 {
 	EvidenceFixture f; ResourceXDecodedFrame ack;
-	ResourceXAcquireReadReceipt receipt; ClusterPcmResourceXControlIntent before;
+	ResourceXAcquireReadReceipt receipt; ClusterPcmResourceXReadIntent before;
 	uint8 a[RESOURCE_X_DECISION_V4_BYTES]; unsigned wakes;
 	if (!settle_start(&f, &ack)) { UT_ASSERT(false); return; }
 	receipt = request_entry()->resource_x_bootstrap_round.acquire_read_receipt;
@@ -176,7 +176,7 @@ UT_TEST(test_consumed_quiet_ARMED_notice_retires_only_after_native_S_recheck)
 }
 UT_TEST(test_consumed_no_master_receipt_is_local_wait_without_erasure)
 {
-	EvidenceFixture f; ResourceXDecodedFrame ack; ClusterPcmResourceXControlIntent before;
+	EvidenceFixture f; ResourceXDecodedFrame ack; ClusterPcmResourceXReadIntent before;
 	if (!settle_start(&f, &ack)) { UT_ASSERT(false); return; } before = *done_intent;
 	UT_ASSERT_EQ(settle_run(), RESOURCE_X_APPLY_LOCAL_WAIT);
 	UT_ASSERT(memcmp(&before, done_intent, sizeof(before)) == 0);
@@ -337,7 +337,7 @@ UT_TEST(test_consumed_peer_boot_slot_epoch_and_freshness_turnover_leave_NOTICE)
 UT_TEST(test_consumed_cancel_failure_or_domain_drift_never_erases_existing_debt)
 {
 	for (int n = 0; n < 5; n++) {
-		EvidenceFixture f; ResourceXDecodedFrame ack; ClusterPcmResourceXControlIntent before;
+		EvidenceFixture f; ResourceXDecodedFrame ack; ClusterPcmResourceXReadIntent before;
 		if (!settle_start(&f, &ack)) { UT_ASSERT(false); return; } before = *done_intent;
 		if (n == 0) request_entry()->resource_x_bootstrap_round.cancelled_attempt_floor = 1;
 		if (n == 1) request_entry()->resource_x_bootstrap_round.failed_attempt_floor = 1;
@@ -388,7 +388,7 @@ UT_TEST(test_consumed_GCS_admission_peer_or_master_drift_does_not_skip_guards)
 UT_TEST(test_consumed_native_process_owner_pin_recheck_precedes_retirement)
 {
 	for (int n = 0; n < 4; n++) {
-		EvidenceFixture f; ResourceXDecodedFrame ack; ClusterPcmResourceXControlIntent before;
+		EvidenceFixture f; ResourceXDecodedFrame ack; ClusterPcmResourceXReadIntent before;
 		if (!settle_start(&f, &ack)) { UT_ASSERT(false); return; }
 		UT_ASSERT_EQ(settle_receive(&ack), RESOURCE_X_APPLY_APPLIED); before = *done_intent;
 		if (n == 0) MyProc->pid++;
@@ -563,7 +563,7 @@ settle_damage_physical(unsigned field)
 UT_TEST(test_consumed_malformed_physical_descriptor_cannot_be_acknowledged)
 {
 	for (unsigned n = 0; n < 8; n++) {
-		EvidenceFixture f; ResourceXDecodedFrame ack; ClusterPcmResourceXControlIntent before;
+		EvidenceFixture f; ResourceXDecodedFrame ack; ClusterPcmResourceXReadIntent before;
 		if (!settle_start(&f, &ack)) { UT_ASSERT(false); return; }
 		settle_damage_physical(n); before = *done_intent;
 		UT_ASSERT(settle_receive(&ack) != RESOURCE_X_APPLY_APPLIED);
@@ -574,7 +574,7 @@ UT_TEST(test_consumed_malformed_physical_descriptor_cannot_be_acknowledged)
 UT_TEST(test_consumed_malformed_physical_descriptor_is_retained_after_master_ACK)
 {
 	for (unsigned n = 0; n < 8; n++) {
-		EvidenceFixture f; ResourceXDecodedFrame ack; ClusterPcmResourceXControlIntent before;
+		EvidenceFixture f; ResourceXDecodedFrame ack; ClusterPcmResourceXReadIntent before;
 		if (!settle_start(&f, &ack)) { UT_ASSERT(false); return; }
 		UT_ASSERT_EQ(settle_receive(&ack), RESOURCE_X_APPLY_APPLIED);
 		settle_damage_physical(n); before = *done_intent;

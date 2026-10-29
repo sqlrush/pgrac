@@ -459,7 +459,7 @@ UT_TEST(test_cleanup_same_C_replay_across_notice_consumed_and_settled)
 }
 UT_TEST(test_cleanup_occupied_notice_returns_local_wait_without_eviction)
 {
-	EvidenceFixture f; ClusterPcmResourceXControlIntent before;
+	EvidenceFixture f; ClusterPcmResourceXReadIntent before;
 	UT_ASSERT(de_completed(&f));
 	memset(qn_intent, 0x3B, sizeof(*qn_intent)); qn_intent->slot.state = RESOURCE_X_INTENT_SLOT_ARMED;
 	before = *qn_intent;
@@ -487,7 +487,7 @@ UT_TEST(test_cleanup_handoff_flag_requires_completed_native_shape)
 UT_TEST(test_cleanup_background_handoff_keeps_all_master_ACK_identity_guards)
 {
 	for (int n = 0; n < 7; n++) {
-		EvidenceFixture f; ResourceXDecodedFrame frame; ClusterPcmResourceXControlIntent before;
+		EvidenceFixture f; ResourceXDecodedFrame frame; ClusterPcmResourceXReadIntent before;
 		UT_ASSERT(de_start(&f)); UT_ASSERT_EQ(de_run(), RESOURCE_X_APPLY_APPLIED);
 		before = *qn_intent; frame = done_frame();
 		frame.common.outcome = RESOURCE_X_OUTCOME_DUPLICATE; frame.common.action_node = 0;
