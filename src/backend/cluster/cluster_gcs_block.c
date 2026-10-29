@@ -15376,6 +15376,44 @@ gcs_block_resource_x_acquire_ingress(const ClusterICEnvelope *env,
 	return result;
 }
 
+/* Original authenticated master DISK/S DONE ingress. */
+static ResourceXApplyResult
+gcs_block_resource_x_acquire_done_ingress(const ClusterICEnvelope *env,
+	const ResourceXDecodedFrame *frame, uint32 ingress)
+{
+	ClusterSemanticAdmissionToken admission = {0};
+	volatile ResourceXApplyResult result = RESOURCE_X_APPLY_BAD_STATE;
+	uint32 outbound = 0;
+
+	if (env == NULL || frame == NULL || !frame->has_acquire_decision
+		|| frame->kind != RESOURCE_X_WIRE_INSTALL_SETTLEMENT
+		|| frame->payload_bytes != RESOURCE_X_COMPLETE_V5_BYTES
+		|| env->msg_type != RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE
+		|| env->payload_length != RESOURCE_X_COMPLETE_V5_BYTES
+		|| env->source_node_id != (uint32)frame->common.logical_assertion.requester_node
+		|| env->dest_node_id != (uint32)cluster_node_id
+		|| env->epoch != frame->body.acquire_completion.decision.episode.cluster_epoch)
+		return RESOURCE_X_APPLY_INVALID;
+	if (cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1,
+		CLUSTER_SEMANTIC_TARGET_SIDE, &admission) != CLUSTER_SEMANTIC_ADMISSION_OK)
+		return RESOURCE_X_APPLY_BAD_STATE;
+	PG_TRY();
+	{
+		result = gcs_block_resource_x_acquire_context_result(&frame->common,
+			&frame->body.acquire_completion.decision.episode, &admission, ingress, &outbound);
+		if (result == RESOURCE_X_APPLY_APPLIED)
+			result = cluster_pcm_lock_resource_x_acquire_done_exact(frame,
+				(int32)env->source_node_id, ingress, outbound, admission.record_generation);
+	}
+	PG_FINALLY();
+	{
+		cluster_semantic_activation_leave(&admission);
+	}
+	PG_END_TRY();
+	return result;
+}
+/* End original authenticated master DISK/S DONE ingress. */
+
 /* A retained request is not a newly authenticated packet. Revalidate its
  * original ingress and return connection, plus all current admission domains,
  * before the master samples a base. Temporary unavailability retains work. */
@@ -15450,6 +15488,8 @@ cluster_gcs_block_resource_x_bootstrap_tick(const ResourceXBootstrapWork *work)
 					result = gcs_block_resource_x_bootstrap_admitted(work, &admission);
 					if (result == RESOURCE_X_APPLY_APPLIED)
 						result = cluster_pcm_lock_resource_x_acquire_decision_publish_exact(work, NULL);
+					if (result == RESOURCE_X_APPLY_DUPLICATE)
+						result = cluster_pcm_lock_resource_x_acquire_done_resume_exact(work);
 					if (result == RESOURCE_X_APPLY_STALE)
 						cluster_pcm_lock_resource_x_bootstrap_forget_exact(work);
 					ready = result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE;
@@ -15998,7 +16038,8 @@ gcs_block_try_resource_x_frame(const ClusterICEnvelope *env, const void *payload
 	 * unobserved zero as evidence that the canonical master is EMPTY. */
 	if (frame.kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE
 		|| frame.kind == RESOURCE_X_WIRE_AUTHORITY_GRANT || frame.kind == RESOURCE_X_WIRE_BLOCK_TO_N
-		|| frame.kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2)
+		|| frame.kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2
+		|| (frame.kind == RESOURCE_X_WIRE_INSTALL_SETTLEMENT && frame.has_acquire_decision))
 		snapshot.phase = UINT8_MAX;
 
 	switch (frame.kind) {
@@ -16078,8 +16119,11 @@ gcs_block_try_resource_x_frame(const ClusterICEnvelope *env, const void *payload
 							   (unsigned long long)snapshot.final_authority_generation)));
 		break;
 	case RESOURCE_X_WIRE_INSTALL_SETTLEMENT: {
-		result = cluster_pcm_lock_resource_x_install_settlement_exact(
-			&frame, (int32)env->source_node_id, &snapshot);
+		result = frame.has_acquire_decision
+			? gcs_block_resource_x_acquire_done_ingress(env, &frame,
+				authenticated_capability_generation)
+			: cluster_pcm_lock_resource_x_install_settlement_exact(
+				&frame, (int32)env->source_node_id, &snapshot);
 		if ((result != RESOURCE_X_APPLY_APPLIED && result != RESOURCE_X_APPLY_DUPLICATE)
 			|| gcs_block_resource_x_diagnostic_should_log(
 				GCS_BLOCK_RESOURCE_X_DIAGNOSTIC_INSTALL_SETTLEMENT, (int)result))

@@ -2865,6 +2865,14 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_read_n
 	const ResourceXDeliveryClaim *execution, const ResourceXDecodedAcquireIntent *episode,
 	const ResourceXAcquireReadReceipt *receipt, const struct ClusterPcmOwnSnapshot *terminal);
 
+/* Consume authenticated full E/A/I under the original master owner. Early
+ * receipts remain in that owner until the original transport is quiescent. */
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_done_exact(
+	const ResourceXDecodedFrame *notice, int32 authenticated_sender,
+	uint32 authenticated_ingress, uint32 master_outbound, uint64 r4_generation);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_done_resume_exact(
+	const ResourceXBootstrapWork *work);
+
 #endif /* USE_PGRAC_CLUSTER */
 
 #endif /* CLUSTER_PCM_LOCK_H */
