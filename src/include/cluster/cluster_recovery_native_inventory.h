@@ -500,6 +500,7 @@ extern bool cluster_recovery_relmap_history_pending_applied_pages_v1(
  * generations' cold apply. Every FULL page must also lie in its own observed
  * native counter half-space, without a later same-page ZERO, any later
  * TRUNCATE or an unordered same-origin lifecycle. Pre-birth legacy input stays explicit.
+ * Same-origin ambiguity includes every saved generation, even with no CLOG records.
  * These are necessary consistency checks, not native era/lifetime authority.
  * Does not replace pending_applied_pages or promote
  * native consumption into durability/era/lifetime/COMPLETE/release authority. */

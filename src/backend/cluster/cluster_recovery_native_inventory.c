@@ -3109,6 +3109,12 @@ history_pending_page_history(ClusterRecoveryRelmapHistory *history,
 			|| first > generation->tail_next
 			|| generation->tail_next - first >= UINT64_C(0x80000000))
 			return false;
+		/* Eventless generations still own the same raw physical namespace.
+		 * Their absence from the CLOG list does not order them before birth. */
+		for (uint32 g = 0; g < inputs->generation_count; ++g)
+			if (g != birth->source_index
+				&& inputs->generations[g].observation.source.claim.identity.origin_node_id == origin)
+				return false;
 		for (uint32 j = 0; j < all->clog_count; ++j) {
 			const ClusterRecoveryRelmapClogEventV1 *other = &all->clog[j];
 
