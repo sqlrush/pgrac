@@ -1470,6 +1470,7 @@ test_cluster_startup_cf_entry: test_cluster_startup_cf_entry.c test_cluster_cf_e
 		test_cluster_cold_own_root_cf.h test_cluster_cold_own_root_cf.inc \
 		test_cluster_wal_pin_cf.h test_cluster_wal_pin_cf.inc test_cluster_wal_pin_cf_types.inc \
 		test_cluster_ir_preflight_cf.h \
+		test_cluster_merge_ir_cf.h test_cluster_merge_ir_cf.inc test_cluster_merge_ir_cf_types.inc \
 		test_cluster_merge_project_cf.h test_cluster_merge_project_cf.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_ir.c \
 		$(top_srcdir)/src/backend/cluster/cluster_ir_lock.c \
@@ -1488,6 +1489,22 @@ test_cluster_startup_cf_entry: test_cluster_startup_cf_entry.c test_cluster_cf_e
 		$(CLUSTER_UNIT_CRYPTOHASH_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_PORT_LIBS) \
 		$(CLUSTER_UNIT_CRYPTOHASH_O) $(LDFLAGS) $(filter -lcrypto,$(LIBS)) -o $@
+
+# Actual merge caller, including original IR acquire-set rollback before CF wait.
+test_cluster_merge_ir_cf_types.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_merge.c Makefile
+	awk '/^#define CLUSTER_RECOVERY_FENCE_PLAN_MAGIC/ { print; magic++ } \
+	     /^typedef struct (ClusterRecoveryFenceOrigin|RecoveryFenceCfContext)/ || /^struct ClusterRecoveryFencePlan/ { emit=1; n++ } \
+	     emit { print } /^};/ || /^} (ClusterRecoveryFenceOrigin|RecoveryFenceCfContext);/ { emit=0 } \
+	     END { if (magic != 1 || n != 3 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_merge_ir_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_merge.c Makefile
+	awk '/^(recovery_fence_plan_valid|recovery_fence_monotonic_ns|recovery_fence_deadline_current|recovery_fence_refused_detail|recovery_fence_refused|recovery_fence_cf_context_current|recovery_fence_wait_own_cf|recovery_fence_plan_acquire_serial_inputs)\(/ { print "static bool"; emit=1; n++ } \
+	     /^recovery_fence_acquire_budget\(/ { print "static int"; emit=1; n++ } \
+	     /^(cluster_recovery_merge_fence_plan_acquire_serial|cluster_recovery_merge_fence_plan_acquire_serial_inputs_v1)\(/ { print "bool"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (n != 11 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
 
 # Original positive canonical projection; its caller phases stay distinct.
 test_cluster_merge_project_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_merge.c Makefile

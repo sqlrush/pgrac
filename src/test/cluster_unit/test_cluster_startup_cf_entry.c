@@ -6355,6 +6355,7 @@ UT_TEST(ordinary_recovery_complete_roles_keep_the_original_cf_wait_policy)
 #include "test_cluster_cold_own_root_cf.h"
 #include "test_cluster_wal_pin_cf.h"
 #include "test_cluster_ir_preflight_cf.h"
+#include "test_cluster_merge_ir_cf.h"
 #include "test_cluster_merge_project_cf.h"
 
 int
@@ -6367,6 +6368,25 @@ main(void)
 	pg_atomic_init_u64(&owner_proc.cluster_grd_redeclare_acked_epoch, 0);
 	cluster_control_request_shmem_init();
 	retire_driver = cluster_control_request_driver_start();
+	if (getenv("PGRAC_PRE2_TEST_IR_SET_CF") != NULL) {
+		UT_PLAN(14);
+		UT_RUN(startup_merge_first_cf_slice_restarts_the_whole_ir_set);
+		UT_RUN(startup_merge_middle_cf_slice_rolls_back_before_waiting);
+		UT_RUN(startup_merge_zero_wait_performs_one_complete_ir_attempt);
+		UT_RUN(startup_merge_cf_wait_uses_remaining_original_deadline);
+		UT_RUN(startup_merge_wrong_cf_ack_never_restarts_or_binds);
+		UT_RUN(startup_merge_cf_wait_refuses_changed_original_identity_or_fence);
+		UT_RUN(startup_merge_cf_slot_disappearance_requires_exact_completion);
+		UT_RUN(startup_merge_cf_completion_revalidates_original_unbound_pin);
+		UT_RUN(startup_merge_unconfirmed_ir_rollback_refuses_before_cf_wait);
+		UT_RUN(startup_merge_non_cf_root_refusal_keeps_original_result);
+		UT_RUN(ordinary_merge_cf_refusal_keeps_original_wait_policy);
+		UT_RUN(startup_merge_empty_cf_slice_waits_without_inventing_a_receipt);
+		UT_RUN(startup_merge_owner_census_ack_keeps_exact_cf_completion);
+		UT_RUN(startup_merge_hard_error_keeps_original_cf_cleanup);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_PREPARED_JOB") != NULL) {
 		UT_PLAN(12);
 		UT_RUN(prepared_job_delivers_publication_once_after_exact_release);
@@ -6490,7 +6510,7 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(146);
+	UT_PLAN(160);
 	UT_RUN(startup_cf_timeout_waits_for_exact_completion_before_begin);
 	UT_RUN(startup_cf_completion_does_not_preserve_changed_native_input);
 	UT_RUN(startup_cf_unsafe_native_context_never_takes_a_registry_lock);
@@ -6637,6 +6657,20 @@ main(void)
 	UT_RUN(startup_projection_cf_slice_keeps_exact_cleanup_without_reading_roots);
 	UT_RUN(startup_projection_under_ir_does_not_adopt_another_wait_policy);
 	UT_RUN(startup_projection_preserves_real_root_and_existing_slot_refusals);
+	UT_RUN(startup_merge_first_cf_slice_restarts_the_whole_ir_set);
+	UT_RUN(startup_merge_middle_cf_slice_rolls_back_before_waiting);
+	UT_RUN(startup_merge_zero_wait_performs_one_complete_ir_attempt);
+	UT_RUN(startup_merge_cf_wait_uses_remaining_original_deadline);
+	UT_RUN(startup_merge_wrong_cf_ack_never_restarts_or_binds);
+	UT_RUN(startup_merge_cf_wait_refuses_changed_original_identity_or_fence);
+	UT_RUN(startup_merge_cf_slot_disappearance_requires_exact_completion);
+	UT_RUN(startup_merge_cf_completion_revalidates_original_unbound_pin);
+	UT_RUN(startup_merge_unconfirmed_ir_rollback_refuses_before_cf_wait);
+	UT_RUN(startup_merge_non_cf_root_refusal_keeps_original_result);
+	UT_RUN(ordinary_merge_cf_refusal_keeps_original_wait_policy);
+	UT_RUN(startup_merge_empty_cf_slice_waits_without_inventing_a_receipt);
+	UT_RUN(startup_merge_owner_census_ack_keeps_exact_cf_completion);
+	UT_RUN(startup_merge_hard_error_keeps_original_cf_cleanup);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
