@@ -40,6 +40,7 @@
 #include "cluster/cluster_lock_acquire.h"
 #include "cluster/cluster_lock_owner.h"
 #include "miscadmin.h" /* AmStartupProcess / AmCheckpointerProcess */
+#include "portability/instr_time.h"
 #include "storage/fd.h"
 #include "storage/lock.h"
 #include "storage/proc.h"
@@ -194,13 +195,15 @@ cf_attempt_owner(const CfHoldState *slot)
  * cluster_cf_lock -- acquire the singleton CF lock in `mode` via GES.
  */
 static bool
-cf_lock(LOCKMODE mode, bool cooperative, const void *caller)
+cf_lock(LOCKMODE mode, bool cooperative, const void *caller, uint64 deadline_ns)
 {
 	ClusterLockAcquireResult r;
 	CfHoldState *slot = cf_slot(mode);
 	ClusterLockAcquireRequest *req = &slot->owner.request;
 	const ClusterGesTimeoutDetail *timeout;
 	bool resume;
+	int acquire_timeout_ms;
+	int cleanup_timeout_ms = 0;
 
 	cf_attempt_begin(mode, cooperative, caller);
 	cf_attempt_owner(slot);
@@ -259,6 +262,30 @@ cf_lock(LOCKMODE mode, bool cooperative, const void *caller)
 	if (resume)
 		goto acquire;
 	Assert(!slot->held);
+	cf_attempt_owner(slot);
+
+	/* Only the caller that owns an absolute deadline supplies it. Read the
+	 * remaining budget after old-slot cleanup, immediately before publishing
+	 * a new request. Cleanup retains its independent original timeout.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	acquire_timeout_ms = cluster_cf_enqueue_timeout_ms;
+	cleanup_timeout_ms = acquire_timeout_ms;
+	if (deadline_ns != 0) {
+		struct timespec now;
+		uint64 now_ns, remaining_ms;
+
+		if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0 || now.tv_nsec < 0
+			|| now.tv_nsec >= NS_PER_S
+			|| (uint64)now.tv_sec > (UINT64_MAX - (uint64)now.tv_nsec) / NS_PER_S)
+			return false;
+		now_ns = (uint64)now.tv_sec * NS_PER_S + (uint64)now.tv_nsec;
+		if (now_ns >= deadline_ns || acquire_timeout_ms <= 0)
+			return false;
+		remaining_ms = (deadline_ns - now_ns) / NS_PER_MS;
+		if (remaining_ms == 0)
+			return false;
+		acquire_timeout_ms = (int)Min((uint64)acquire_timeout_ms, remaining_ms);
+	}
 
 	memset(req, 0, sizeof(*req));
 	cluster_cf_resid_encode(&req->resid);
@@ -271,7 +298,7 @@ cf_lock(LOCKMODE mode, bool cooperative, const void *caller)
 	req->sessionLock = false;
 	req->caller_local_start_ts_ms = (uint64)(GetCurrentTimestamp() / 1000);
 	/* spec-5.6 Dc4b: bound the CF acquire wait and label it ClusterCfEnqueueWait. */
-	req->timeout_ms = cluster_cf_enqueue_timeout_ms;
+	req->timeout_ms = acquire_timeout_ms;
 	req->wait_event = WAIT_EVENT_CLUSTER_CF_ENQUEUE;
 
 	/* Visible cleanup responsibility precedes every possible S3/S4 mutation;
@@ -286,12 +313,19 @@ acquire:
 	}
 	PG_CATCH();
 	{
+		if (deadline_ns != 0 && slot->owner.state != CLUSTER_LOCK_OWNER_EMPTY)
+			req->timeout_ms = cleanup_timeout_ms;
 		cf_attempt_owner(slot);
 		if (slot->owner.state == CLUSTER_LOCK_OWNER_EMPTY)
 			memset(slot, 0, sizeof(*slot));
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+	/* The cap belongs only to S1-S5. Every retained success, refusal or
+	 * ERROR keeps the original release budget, including its first bounded
+	 * confirmation. Identity and registry binding are unchanged. */
+	if (deadline_ns != 0 && slot->owner.state != CLUSTER_LOCK_OWNER_EMPTY)
+		req->timeout_ms = cleanup_timeout_ms;
 	/* Capture before EMPTY-slot cleanup erases the just-completed request. */
 	timeout = r == CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT ? cluster_ges_timeout_detail_get() : NULL;
 	cf_attempt.result = r;
@@ -372,10 +406,10 @@ acquire:
 /* Copy original return facts, including requests cleared by EMPTY cleanup.
  * A grant record maps this exact tuple to its own PID, never a remote procno. */
 static bool
-cf_lock_observed(LOCKMODE mode, bool cooperative, const void *caller)
+cf_lock_observed(LOCKMODE mode, bool cooperative, const void *caller, uint64 deadline_ns)
 {
 	static TimestampTz last_refusal;
-	bool acquired = cf_lock(mode, cooperative, caller);
+	bool acquired = cf_lock(mode, cooperative, caller, deadline_ns);
 	TimestampTz now;
 	uint64 now_ms, age_ms = 0;
 	bool age_known, pid_matches;
@@ -422,7 +456,13 @@ cf_lock_observed(LOCKMODE mode, bool cooperative, const void *caller)
 bool
 cluster_cf_lock(LOCKMODE mode)
 {
-	return cf_lock_observed(mode, false, NULL);
+	return cf_lock_observed(mode, false, NULL, 0);
+}
+
+bool
+cluster_cf_lock_deadline_v1(LOCKMODE mode, uint64 deadline_ns)
+{
+	return cf_lock_observed(mode, false, NULL, deadline_ns);
 }
 
 bool
@@ -430,7 +470,7 @@ cluster_cf_lock_poll(LOCKMODE mode)
 {
 	if (!cluster_shared_config || (MyBackendType != B_LMON && MyBackendType != B_LMS))
 		return false;
-	return cf_lock_observed(mode, true, NULL);
+	return cf_lock_observed(mode, true, NULL, 0);
 }
 
 bool
@@ -448,7 +488,7 @@ cluster_cf_lock_poll_owned(LOCKMODE mode, const void *caller)
 	if (caller == NULL || !cluster_shared_config
 		|| (MyBackendType != B_LMON && MyBackendType != B_LMS))
 		return false;
-	return cf_lock_observed(mode, true, caller);
+	return cf_lock_observed(mode, true, caller, 0);
 }
 
 bool

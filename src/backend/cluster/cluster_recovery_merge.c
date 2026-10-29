@@ -1405,7 +1405,8 @@ streaming_stream_advance(ClusterRecoveryMergeState *st, int idx, const XLogRecPt
  */
 static ClusterMergeEngage
 recovery_merge_project_attempt(uint16 own_thread, XLogRecPtr own_redo, uint64 out_bitmap[2],
-							   XLogRecPtr *out_start, ClusterCfAttemptObservation *retry)
+							   XLogRecPtr *out_start, ClusterCfAttemptObservation *retry,
+							   const uint64 *deadline_ns)
 {
 	ClusterRecoveryPlan plan;
 	ClusterRecoveryWorkerPool pool;
@@ -1510,8 +1511,12 @@ recovery_merge_project_attempt(uint16 own_thread, XLogRecPtr own_redo, uint64 ou
 		MemSet(&root_identity, 0, sizeof(root_identity));
 		MemSet(&root_snapshot, 0, sizeof(root_snapshot));
 		before = retry != NULL ? cluster_cf_attempt_sequence() : 0;
-		root_result = cluster_control_root_lookup_owner_by_node_runtime(
-			(int)tid - 1, &root_identity, &root_snapshot, &root_token);
+		root_result
+			= deadline_ns != NULL
+				  ? cluster_control_root_lookup_owner_deadline_v1(
+						(int)tid - 1, &root_identity, &root_snapshot, &root_token, *deadline_ns)
+				  : cluster_control_root_lookup_owner_by_node_runtime((int)tid - 1, &root_identity,
+																	  &root_snapshot, &root_token);
 		if (retry != NULL && blockers.len == 0
 			&& root_result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE
 			&& cluster_cf_last_attempt_since(before, &attempt) && attempt.mode == ShareLock
@@ -1610,8 +1615,11 @@ recovery_merge_project_attempt(uint16 own_thread, XLogRecPtr own_redo, uint64 ou
 				ClusterWalSourceRef source;
 
 				before = retry != NULL ? cluster_cf_attempt_sequence() : 0;
-				root_result = cluster_control_root_recovery_source_v1(&root_snapshot, &root_token,
-																	  &source, &redo);
+				root_result = deadline_ns != NULL
+								  ? cluster_control_root_recovery_source_deadline_v1(
+										&root_snapshot, &root_token, &source, &redo, *deadline_ns)
+								  : cluster_control_root_recovery_source_v1(
+										&root_snapshot, &root_token, &source, &redo);
 				if (retry != NULL && blockers.len == 0
 					&& root_result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE
 					&& cluster_cf_last_attempt_since(before, &attempt) && attempt.mode == ShareLock
@@ -1652,7 +1660,7 @@ static ClusterMergeEngage
 cluster_recovery_merge_project_readonly(uint16 own_thread, XLogRecPtr own_redo,
 										uint64 out_bitmap[2], XLogRecPtr *out_start)
 {
-	return recovery_merge_project_attempt(own_thread, own_redo, out_bitmap, out_start, NULL);
+	return recovery_merge_project_attempt(own_thread, own_redo, out_bitmap, out_start, NULL, NULL);
 }
 
 /*
@@ -1907,8 +1915,13 @@ recovery_fence_origin_seal(ClusterRecoveryFencePlan *plan, ClusterRecoveryFenceO
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			recovery_fence_seal_failed(plan, &origin->duty, "tail seal", (int)result);
 	}
-	result = cluster_control_root_read_canonical(
-		origin->origin_thread, &origin->duty, CLUSTER_CONTROL_ROOT_READ_STRONG, &snapshot, &token);
+	result = cluster_shared_config
+				 ? cluster_control_root_v3_read_canonical_deadline_v1(
+					   origin->origin_thread, &origin->duty, &snapshot, &token,
+					   plan->merge_deadline_ns)
+				 : cluster_control_root_read_canonical(origin->origin_thread, &origin->duty,
+													   CLUSTER_CONTROL_ROOT_READ_STRONG, &snapshot,
+													   &token);
 	recovery_fence_deadline_require(plan);
 	if ((result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		 && result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
@@ -2251,8 +2264,9 @@ recovery_fence_project_wait(ClusterRecoveryFencePlan *plan, XLogRecPtr own_redo,
 							errmsg("cold projection context changed during its CF retry")));
 		recovery_fence_deadline_require(plan);
 		MemSet(start, 0, sizeof(*start) * (CLUSTER_WAL_STATE_SLOT_COUNT + 1));
-		engage = recovery_merge_project_attempt(own_thread, own_redo, replay, start,
-												wait_allowed ? &attempt : NULL);
+		engage = recovery_merge_project_attempt(
+			own_thread, own_redo, replay, start, wait_allowed ? &attempt : NULL,
+			cluster_shared_config ? &plan->merge_deadline_ns : NULL);
 		/* A typed failed acquire still owns its original cleanup debt.
 		 * Let that waiter refuse expiry without releasing unrelated proof
 		 * owners; successful/no-wait projections use the original cleanup. */
@@ -2333,7 +2347,8 @@ recovery_merge_wait_cold_inputs(const ClusterRecoveryFencePlan *plan, uint16 own
 				uint64 before = cluster_cf_attempt_sequence();
 
 				cf_attempted = true;
-				if (cluster_cf_lock(ShareLock) && cluster_cf_held_is_clusterwide(ShareLock)) {
+				if (cluster_cf_lock_deadline_v1(ShareLock, plan->merge_deadline_ns)
+					&& cluster_cf_held_is_clusterwide(ShareLock)) {
 					ClusterWalSourceRef input;
 
 					/* A new acquire can yield too. Reprove the original read
@@ -2523,8 +2538,11 @@ cluster_recovery_merge_preflight_readonly(uint16 own_thread, XLogRecPtr own_redo
 		MemSet(&identity, 0, sizeof(identity));
 		MemSet(&snapshot, 0, sizeof(snapshot));
 		MemSet(&token, 0, sizeof(token));
-		root_result = cluster_control_root_lookup_owner_by_node_runtime(node_id, &identity,
-																		&snapshot, &token);
+		root_result = cluster_shared_config
+						  ? cluster_control_root_lookup_owner_deadline_v1(
+								node_id, &identity, &snapshot, &token, plan->merge_deadline_ns)
+						  : cluster_control_root_lookup_owner_by_node_runtime(node_id, &identity,
+																			  &snapshot, &token);
 		recovery_fence_deadline_require(plan);
 		if ((root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 			 && root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
@@ -3022,7 +3040,8 @@ recovery_fence_commit_attempt(ClusterRecoveryFencePlan *plan, ClusterCfAttemptOb
 			plan->own_thread, plan->start_lsn[plan->own_thread], current_replay, current_start);
 	else
 		engage = recovery_merge_project_attempt(plan->own_thread, plan->start_lsn[plan->own_thread],
-												current_replay, current_start, retry);
+												current_replay, current_start, retry,
+												&plan->merge_deadline_ns);
 	if (retry != NULL && cluster_cf_attempt_wait_slice(retry))
 		return false;
 	if (!recovery_fence_deadline_current(plan))
@@ -3048,9 +3067,12 @@ recovery_fence_commit_attempt(ClusterRecoveryFencePlan *plan, ClusterCfAttemptOb
 		if (origin_index < 0)
 			return recovery_fence_refused(plan, "commit_origin", tid, origin_index, 0);
 		before = retry != NULL ? cluster_cf_attempt_sequence() : 0;
-		root_result = cluster_control_root_read_canonical(tid, &plan->origins[origin_index].duty,
-														  CLUSTER_CONTROL_ROOT_READ_STRONG,
-														  &snapshot, &token);
+		root_result = retry != NULL ? cluster_control_root_v3_read_canonical_deadline_v1(
+										  tid, &plan->origins[origin_index].duty, &snapshot, &token,
+										  plan->merge_deadline_ns)
+									: cluster_control_root_read_canonical(
+										  tid, &plan->origins[origin_index].duty,
+										  CLUSTER_CONTROL_ROOT_READ_STRONG, &snapshot, &token);
 		if (retry != NULL && root_result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE
 			&& cluster_cf_last_attempt_since(before, &attempt) && attempt.mode == ShareLock
 			&& cluster_cf_attempt_wait_slice(&attempt)) {

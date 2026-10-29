@@ -1462,7 +1462,7 @@ test_cluster_startup_cf_callsite.inc: $(top_srcdir)/src/backend/access/transam/x
 	     END { if (calls != 1 || complete != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_startup_cf_entry: test_cluster_startup_cf_entry.c test_cluster_cf_enqueue.c \
+test_cluster_startup_cf_entry: test_cluster_startup_cf_entry.c test_cluster_cf_enqueue.c test_cluster_cf_deadline.h \
 		test_cluster_prepared_cf.h test_cluster_prepared_job.h test_cluster_prepared_cf.inc \
 		$(top_srcdir)/src/include/cluster/cluster_control_root_prepared.h \
 		test_cluster_generic_cf.h test_cluster_generic_cf.inc \
@@ -1604,9 +1604,9 @@ test_cluster_cold_own_root_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_col
 	     FNR == NR && /^cold_own_root_cf_(capture|wait)\(/ { print "static void"; emit=1; helpers++ } \
 	     FNR == NR && /^cold_own_root_cf_current\(/ { print "static bool"; emit=1; checks++ } \
 	     FNR == NR && /^cold_own_root\(/ { print "static bool"; emit=1; callers++ } \
-	     FNR != NR && /^cluster_control_root_lookup_owner_by_node_runtime\(/ { print "ClusterControlRootResult"; emit=1; readers++ } \
+	     FNR != NR && /^(cluster_control_root_lookup_owner_by_node_runtime|cluster_control_root_lookup_owner_deadline_v1)\(/ { print "ClusterControlRootResult"; emit=1; readers++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (flags != 1 || declarations < 1 || declarations > 2 || diagnostics != 4 || helpers > 2 || checks > 1 || callers != 1 || readers != 1 || emit || types) exit 1 }' \
+	     END { if (flags != 1 || declarations < 1 || declarations > 2 || diagnostics != 4 || helpers > 2 || checks > 1 || callers != 1 || readers != 2 || emit || types) exit 1 }' \
 	     $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 
@@ -1690,12 +1690,12 @@ test_cluster_retention_cf_types.inc: $(top_srcdir)/src/backend/cluster/cluster_c
 
 test_cluster_retention_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_control_root.c Makefile
 	awk '/^(cluster_control_root_identity_equal|read_token_equal|canonical_aux_actor|canonical_aux_capture_cut|canonical_aux_finish)\(/ { print ($$0 ~ /^cluster_control_root_identity_equal/ ? "bool" : "static bool"); emit=1; predicates++ } \
-	     /^(runtime_v2_owner_check|release_cf|read_retention_version|read_canonical_version|cluster_control_root_v3_read_canonical|cluster_control_root_v3_terminal_history_blocked)\(/ { print ($$0 ~ /^cluster_control_root_v3_/ ? "ClusterControlRootResult" : "static ClusterControlRootResult"); emit=1; consumers++ } \
+	     /^(runtime_v2_owner_check|release_cf|read_retention_version|read_canonical_version|cluster_control_root_v3_read_canonical|cluster_control_root_v3_read_canonical_deadline_v1|cluster_control_root_v3_terminal_history_blocked)\(/ { print ($$0 ~ /^cluster_control_root_v3_/ ? "ClusterControlRootResult" : "static ClusterControlRootResult"); emit=1; consumers++ } \
 	     /^make_read_token\(/ { print "static void"; emit=1; tokens++ } \
 	     /^retention_startup_cf_current\(/ { print "static bool"; emit=1; checks++ } \
 	     /^retention_startup_cf_(capture|wait)\(/ { print "static void"; emit=1; waiters++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (predicates != 5 || consumers != 6 || tokens != 1 || checks > 1 || waiters > 2 || emit) exit 1 }' $< > $@.tmp
+	     END { if (predicates != 5 || consumers != 7 || tokens != 1 || checks > 1 || waiters > 2 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Exact recovery WAL consumers and their original CF/alias boundaries.
@@ -1706,9 +1706,9 @@ test_cluster_recovery_wal_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_cont
 	     /^(history_ranges_overlap|acquire_clusterwide_cf)\(/ { print "static bool"; emit=1; predicates++ } \
 	     /^recovery_wal_cf_current\(/ { print "static bool"; emit=1; checks++ } \
 	     /^recovery_wal_cf_(capture|wait)\(/ { print "static void"; emit=1; waiters++ } \
-	     /^(recovery_wal_visit_root|recovery_wal_visit|cluster_control_root_recovery_(source_v1|checkpoint_v1|visit|sync_v1))\(/ { print ($$0 ~ /^cluster_control_root_/ ? "ClusterControlRootResult" : "static ClusterControlRootResult"); emit=1; consumers++ } \
+	     /^(recovery_wal_source|recovery_wal_visit_root|recovery_wal_visit|cluster_control_root_recovery_(source_v1|source_deadline_v1|checkpoint_v1|visit|sync_v1))\(/ { print ($$0 ~ /^cluster_control_root_/ ? "ClusterControlRootResult" : "static ClusterControlRootResult"); emit=1; consumers++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (work != 1 || helpers > 1 || predicates != 2 || checks > 1 || waiters > 2 || consumers != 6 || types || emit) exit 1 }' $< > $@.tmp
+	     END { if (work != 1 || helpers > 1 || predicates != 2 || checks > 1 || waiters > 2 || consumers != 8 || types || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Original Startup self-seal authorization and S/X consumer/caller/cleanup.

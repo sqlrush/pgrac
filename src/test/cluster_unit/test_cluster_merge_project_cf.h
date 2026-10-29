@@ -72,8 +72,9 @@ project_participant(int node)
 }
 
 static ClusterControlRootResult
-project_source(const ClusterControlRootSnapshot *root, const ClusterControlRootReadToken *token,
-			   ClusterWalSourceRef *out, XLogRecPtr *redo)
+project_source_impl(const ClusterControlRootSnapshot *root,
+					const ClusterControlRootReadToken *token, ClusterWalSourceRef *out,
+					XLogRecPtr *redo, bool bounded, uint64 deadline_ns)
 {
 	UT_ASSERT(!cluster_cf_held(ShareLock) && !cluster_cf_held(ExclusiveLock));
 	UT_ASSERT(root->identity.origin_thread_id == 2
@@ -83,7 +84,8 @@ project_source(const ClusterControlRootSnapshot *root, const ClusterControlRootR
 	if (project_source_timeout) {
 		project_source_timeout = false;
 		g_seven_result = CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
-		UT_ASSERT(!claim_actual_cf_lock(ShareLock));
+		UT_ASSERT(!(bounded ? claim_actual_cf_lock_deadline(ShareLock, deadline_ns)
+							: claim_actual_cf_lock(ShareLock)));
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	}
 	memset(out, 0, sizeof(*out));
@@ -92,12 +94,26 @@ project_source(const ClusterControlRootSnapshot *root, const ClusterControlRootR
 		project_after_source();
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
+static ClusterControlRootResult
+project_source(const ClusterControlRootSnapshot *root, const ClusterControlRootReadToken *token,
+			   ClusterWalSourceRef *out, XLogRecPtr *redo)
+{
+	return project_source_impl(root, token, out, redo, false, 0);
+}
+static ClusterControlRootResult
+project_source_deadline(const ClusterControlRootSnapshot *root,
+						const ClusterControlRootReadToken *token, ClusterWalSourceRef *out,
+						XLogRecPtr *redo, uint64 deadline_ns)
+{
+	return project_source_impl(root, token, out, redo, true, deadline_ns);
+}
 
 #define cluster_recovery_plan_snapshot project_snapshot
 #define cluster_recovery_worker_pool_snapshot project_pool
 #define cluster_recovery_worker_revalidate project_stream
 #define cluster_shared_fs_sentinel_has_participant project_participant
 #define cluster_control_root_recovery_source_v1 project_source
+#define cluster_control_root_recovery_source_deadline_v1 project_source_deadline
 #define cluster_recovery_duty_key_compare_for_claim rejoin_key_compare_for_claim
 #define initStringInfo project_blockers_init
 #define appendStringInfo project_blockers_append
@@ -106,6 +122,7 @@ project_source(const ClusterControlRootSnapshot *root, const ClusterControlRootR
 #undef initStringInfo
 #undef cluster_recovery_duty_key_compare_for_claim
 #undef cluster_control_root_recovery_source_v1
+#undef cluster_control_root_recovery_source_deadline_v1
 #undef cluster_shared_fs_sentinel_has_participant
 #undef cluster_recovery_worker_revalidate
 #undef cluster_recovery_worker_pool_snapshot

@@ -66,7 +66,21 @@ void entry_actual_owner_service_poll(void);
 #define cluster_lock_owners_service_poll entry_actual_owner_service_poll
 #include "../../backend/cluster/cluster_lock_owner.c"
 #undef cluster_lock_owners_service_poll
+static uint64 set_cf_clock_ns;
+static bool cf_budget_clock_fail;
+static int
+pg_attribute_unused() cf_budget_clock_gettime(clockid_t clock, struct timespec *out)
+{
+	UT_ASSERT_EQ(clock, CLOCK_MONOTONIC);
+	if (cf_budget_clock_fail)
+		return -1;
+	out->tv_sec = set_cf_clock_ns / NS_PER_S;
+	out->tv_nsec = set_cf_clock_ns % NS_PER_S;
+	return 0;
+}
+#define clock_gettime cf_budget_clock_gettime
 #include "../../backend/cluster/cluster_cf_enqueue.c"
+#undef clock_gettime
 
 bool cluster_enabled = true;
 bool enableFsync = true;
@@ -98,7 +112,6 @@ static void (*claim_on_reset)(void);
 static bool cold_consumer;
 static unsigned cold_release_waits, cold_reads;
 static bool cold_deadline_active, cold_observation_pending;
-static uint64 set_cf_clock_ns;
 static long cold_deadline_waits[8];
 static int cold_refresh_budgets[8];
 static unsigned cold_refresh_calls;
@@ -1015,6 +1028,15 @@ claim_actual_cf_lock(LOCKMODE mode)
 		claim_after_acquire();
 	return granted;
 }
+static bool
+claim_actual_cf_lock_deadline(LOCKMODE mode, uint64 deadline_ns)
+{
+	bool granted = cluster_cf_lock_deadline_v1(mode, deadline_ns);
+
+	if (granted && claim_after_acquire != NULL)
+		claim_after_acquire();
+	return granted;
+}
 #define cluster_cf_lock claim_actual_cf_lock
 #include "test_cluster_merge_cf_entry.inc"
 #undef cluster_cf_lock
@@ -1530,7 +1552,9 @@ recovery_merge_cold_inputs_observe(const ClusterWalSourceRef *restart,
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 #define cluster_cf_lock claim_actual_cf_lock
+#define cluster_cf_lock_deadline_v1 claim_actual_cf_lock_deadline
 #include "test_cluster_merge_cold_cf.inc"
+#undef cluster_cf_lock_deadline_v1
 #undef cluster_cf_lock
 
 static void
@@ -2665,8 +2689,18 @@ retention_actual_cf_lock(LOCKMODE mode)
 	++retention_attempts;
 	return claim_actual_cf_lock(mode);
 }
+static bool
+retention_actual_cf_lock_deadline(LOCKMODE mode, uint64 deadline_ns)
+{
+	if (retention_phase == 2 && retention_attempts == 1)
+		g_seven_result = retention_second_result;
+	++retention_attempts;
+	return claim_actual_cf_lock_deadline(mode, deadline_ns);
+}
 #define cluster_cf_lock retention_actual_cf_lock
+#define cluster_cf_lock_deadline_v1 retention_actual_cf_lock_deadline
 #include "test_cluster_retention_cf.inc"
+#undef cluster_cf_lock_deadline_v1
 #undef cluster_cf_lock
 
 static void
@@ -3234,6 +3268,15 @@ recovery_actual_cf_lock(LOCKMODE mode)
 		g_seven_result = recovery_acquire_result;
 	return claim_actual_cf_lock(mode);
 }
+static bool
+recovery_actual_cf_lock_deadline(LOCKMODE mode, uint64 deadline_ns)
+{
+	++recovery_attempts;
+	++g_next_request_id;
+	if (recovery_attempts == (recovery_second_read() ? 2 : 1))
+		g_seven_result = recovery_acquire_result;
+	return claim_actual_cf_lock_deadline(mode, deadline_ns);
+}
 static void *
 recovery_alloc(Size size)
 {
@@ -3319,12 +3362,14 @@ cluster_wal_tail_sync_sealed_v1(const char *dir, const ClusterWalSourceRef *ref,
 	return recovery_physical_wal(dir, ref, segment_size, sealed, checkpoint, out);
 }
 #define cluster_cf_lock recovery_actual_cf_lock
+#define cluster_cf_lock_deadline_v1 recovery_actual_cf_lock_deadline
 #define palloc0 recovery_alloc
 #define storage_contract_check recovery_storage_check
 #include "test_cluster_recovery_wal_cf.inc"
 #undef storage_contract_check
 #undef palloc0
 #undef cluster_cf_lock
+#undef cluster_cf_lock_deadline_v1
 
 typedef struct RecoveryTestOutput {
 	ClusterWalSourceRef source;
@@ -6408,6 +6453,8 @@ UT_TEST(ordinary_recovery_complete_roles_keep_the_original_cf_wait_policy)
 #include "test_cluster_merge_commit_cf.h"
 #include "test_cluster_commit_owner_cf.h"
 
+#include "test_cluster_cf_deadline.h"
+
 int
 main(void)
 {
@@ -6418,6 +6465,23 @@ main(void)
 	pg_atomic_init_u64(&owner_proc.cluster_grd_redeclare_acked_epoch, 0);
 	cluster_control_request_shmem_init();
 	retire_driver = cluster_control_request_driver_start();
+	if (getenv("PGRAC_PRE2_TEST_CF_DEADLINE") != NULL) {
+		UT_PLAN(12);
+		UT_RUN(startup_cf_request_uses_remaining_original_budget);
+		UT_RUN(startup_cf_expired_budget_does_not_publish_a_request);
+		UT_RUN(startup_bounded_source_returns_cf_slice_to_its_caller);
+		UT_RUN(startup_three_projection_phases_pass_the_original_cf_deadline);
+		UT_RUN(startup_cf_bounded_acquire_keeps_the_original_cleanup_budget);
+		UT_RUN(startup_cf_budget_shrinks_without_renewing);
+		UT_RUN(startup_cf_zero_and_ordinary_keep_the_configured_attempt);
+		UT_RUN(startup_cf_clock_failure_cannot_reuse_a_prior_wait);
+		UT_RUN(startup_cf_expiry_after_old_cleanup_never_starts_another_request);
+		UT_RUN(startup_projection_recomputes_the_cf_budget_after_metadata);
+		UT_RUN(startup_bounded_source_preserves_exact_proof_and_native_refusal);
+		UT_RUN(startup_actual_bounded_source_never_waits_under_held_ir);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_COMMIT_CF_OWNER") != NULL) {
 		UT_PLAN(2);
 		UT_RUN(startup_commit_owner_rolls_back_first_and_middle_projection_then_commits);
@@ -6602,7 +6666,7 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(200);
+	UT_PLAN(212);
 	UT_RUN(startup_cf_timeout_waits_for_exact_completion_before_begin);
 	UT_RUN(startup_cf_completion_does_not_preserve_changed_native_input);
 	UT_RUN(startup_cf_unsafe_native_context_never_takes_a_registry_lock);
@@ -6803,6 +6867,18 @@ main(void)
 	UT_RUN(startup_commit_owner_hard_or_untyped_root_refusal_never_retries);
 	UT_RUN(startup_commit_owner_exact_cf_ack_during_cleanup_does_not_lose_continuation);
 	UT_RUN(startup_commit_owner_native_source_cf_retry_keeps_seals_and_pin_failure_refuses);
+	UT_RUN(startup_cf_request_uses_remaining_original_budget);
+	UT_RUN(startup_cf_expired_budget_does_not_publish_a_request);
+	UT_RUN(startup_bounded_source_returns_cf_slice_to_its_caller);
+	UT_RUN(startup_three_projection_phases_pass_the_original_cf_deadline);
+	UT_RUN(startup_cf_bounded_acquire_keeps_the_original_cleanup_budget);
+	UT_RUN(startup_cf_budget_shrinks_without_renewing);
+	UT_RUN(startup_cf_zero_and_ordinary_keep_the_configured_attempt);
+	UT_RUN(startup_cf_clock_failure_cannot_reuse_a_prior_wait);
+	UT_RUN(startup_cf_expiry_after_old_cleanup_never_starts_another_request);
+	UT_RUN(startup_projection_recomputes_the_cf_budget_after_metadata);
+	UT_RUN(startup_bounded_source_preserves_exact_proof_and_native_refusal);
+	UT_RUN(startup_actual_bounded_source_never_waits_under_held_ir);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

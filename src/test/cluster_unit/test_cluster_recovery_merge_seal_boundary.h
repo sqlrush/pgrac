@@ -368,6 +368,11 @@ ClusterFormationWitnessResult cluster_authority_startup_refresh_recovery(int tim
 { UT_ASSERT(!cold_cf_held); UT_ASSERT(timeout_ms > 0); return CLUSTER_FORMATION_WITNESS_READY; }
 bool cluster_cf_lock(LOCKMODE mode)
 { UT_ASSERT_EQ(mode, ShareLock); UT_ASSERT(!cold_cf_held); cold_cf_held = true; return true; }
+bool
+cluster_cf_lock_deadline_v1(LOCKMODE mode, uint64 deadline_ns pg_attribute_unused())
+{
+	return cluster_cf_lock(mode);
+}
 bool cluster_cf_held(LOCKMODE mode)
 { return mode == ShareLock && cold_cf_held; }
 bool cluster_cf_held_is_clusterwide(LOCKMODE mode)
@@ -501,6 +506,27 @@ cluster_control_root_read_canonical(uint16 origin_thread_id,
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
+/* Budget propagation is exercised with actual ROOT/CF in the Startup test.
+ * These legacy tests keep their original metadata and deadline boundaries. */
+ClusterControlRootResult
+cluster_control_root_lookup_owner_deadline_v1(int32 node, ClusterControlRootIdentity *identity,
+											  ClusterControlRootSnapshot *snapshot,
+											  ClusterControlRootReadToken *token,
+											  uint64 deadline_ns pg_attribute_unused())
+{
+	return cluster_control_root_lookup_owner_by_node_runtime(node, identity, snapshot, token);
+}
+ClusterControlRootResult
+cluster_control_root_v3_read_canonical_deadline_v1(uint16 thread,
+												   const ClusterControlRootIdentity *expected,
+												   ClusterControlRootSnapshot *snapshot,
+												   ClusterControlRootReadToken *token,
+												   uint64 deadline_ns pg_attribute_unused())
+{
+	return cluster_control_root_read_canonical(thread, expected, CLUSTER_CONTROL_ROOT_READ_STRONG,
+											   snapshot, token);
+}
+
 /* The source proof needs a sealed, tail-validated generation. */
 ClusterControlRootResult
 cluster_control_root_recovery_source_v1(const ClusterControlRootSnapshot *expected,
@@ -526,6 +552,14 @@ cluster_control_root_recovery_source_v1(const ClusterControlRootSnapshot *expect
 	out->timeline = expected->checkpoint_tli;
 	*native_redo = redo[tid];
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+ClusterControlRootResult
+cluster_control_root_recovery_source_deadline_v1(const ClusterControlRootSnapshot *expected,
+												 const ClusterControlRootReadToken *token,
+												 ClusterWalSourceRef *out, XLogRecPtr *native_redo,
+												 uint64 deadline_ns pg_attribute_unused())
+{
+	return cluster_control_root_recovery_source_v1(expected, token, out, native_redo);
 }
 
 static uint16

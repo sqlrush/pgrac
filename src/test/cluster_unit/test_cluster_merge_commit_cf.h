@@ -17,9 +17,9 @@ commit_cf_pin_current(ClusterWalRetentionPin *pin)
 }
 
 static ClusterControlRootResult
-commit_cf_canonical(uint16 thread, const ClusterControlRootIdentity *expected,
-					ClusterControlRootReadMode policy, ClusterControlRootSnapshot *snapshot,
-					ClusterControlRootReadToken *token)
+commit_cf_canonical_impl(uint16 thread, const ClusterControlRootIdentity *expected,
+						 ClusterControlRootReadMode policy, ClusterControlRootSnapshot *snapshot,
+						 ClusterControlRootReadToken *token, bool bounded, uint64 deadline_ns)
 {
 	ClusterControlRootResult result;
 
@@ -31,13 +31,32 @@ commit_cf_canonical(uint16 thread, const ClusterControlRootIdentity *expected,
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE; /* Explicit untyped leaf. */
 	g_seven_result = commit_cf_reads == commit_cf_failure_at ? CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT
 															 : CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
-	result = cluster_control_root_read_canonical(thread, expected, policy, snapshot, token);
+	result = bounded
+				 ? cluster_control_root_v3_read_canonical_deadline_v1(thread, expected, snapshot,
+																	  token, deadline_ns)
+				 : cluster_control_root_read_canonical(thread, expected, policy, snapshot, token);
 	if (commit_cf_hard == 3)
 		++token->root_publish_seq;
 	return result;
 }
+static ClusterControlRootResult
+commit_cf_canonical(uint16 thread, const ClusterControlRootIdentity *expected,
+					ClusterControlRootReadMode policy, ClusterControlRootSnapshot *snapshot,
+					ClusterControlRootReadToken *token)
+{
+	return commit_cf_canonical_impl(thread, expected, policy, snapshot, token, false, 0);
+}
+static ClusterControlRootResult
+commit_cf_canonical_deadline(uint16 thread, const ClusterControlRootIdentity *expected,
+							 ClusterControlRootSnapshot *snapshot,
+							 ClusterControlRootReadToken *token, uint64 deadline_ns)
+{
+	return commit_cf_canonical_impl(thread, expected, CLUSTER_CONTROL_ROOT_READ_STRONG, snapshot,
+									token, true, deadline_ns);
+}
 
 #define cluster_control_root_read_canonical commit_cf_canonical
+#define cluster_control_root_v3_read_canonical_deadline_v1 commit_cf_canonical_deadline
 #define cluster_recovery_duty_key_compare_for_claim rejoin_key_compare_for_claim
 #define cluster_wal_retention_pin_revalidate commit_cf_pin_current
 #define cluster_formation_witness_revalidate_nowait failure_formation_current
@@ -50,6 +69,7 @@ commit_cf_canonical(uint16 thread, const ClusterControlRootIdentity *expected,
 #undef cluster_wal_retention_pin_revalidate
 #undef cluster_recovery_duty_key_compare_for_claim
 #undef cluster_control_root_read_canonical
+#undef cluster_control_root_v3_read_canonical_deadline_v1
 
 static void
 commit_cf_fixture(void)

@@ -522,6 +522,14 @@ extern ClusterControlRootResult cluster_control_root_read_canonical(
 	uint16 origin_thread_id, const ClusterControlRootIdentity *expected_identity,
 	ClusterControlRootReadMode mode, ClusterControlRootSnapshot *out_snapshot,
 	ClusterControlRootReadToken *out_token);
+/* Process-local Startup read budget, not a token or persisted deadline.
+ * expected may be NULL for canonical discovery; zero is one ordinary attempt. */
+extern ClusterControlRootResult cluster_control_root_v3_read_canonical_deadline_v1(
+	uint16 thread, const ClusterControlRootIdentity *expected, ClusterControlRootSnapshot *out,
+	ClusterControlRootReadToken *token, uint64 deadline_ns);
+extern ClusterControlRootResult cluster_control_root_lookup_owner_deadline_v1(
+	int32 node, ClusterControlRootIdentity *identity, ClusterControlRootSnapshot *snapshot,
+	ClusterControlRootReadToken *token, uint64 deadline_ns);
 /* contract §A: BOOTSTRAP identity discovery + STRONG bound read (token
  * minted by the STRONG step only). */
 /* RF-ROOT P9 verification (implementation): verify the canonical root is ACTIVE and

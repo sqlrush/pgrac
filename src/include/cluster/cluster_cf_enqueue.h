@@ -83,6 +83,9 @@ extern void cluster_cf_resid_encode(ClusterResId *dst);
  *	Use cluster_cf_unlock_confirmed when the caller must consume the verdict.
  */
 extern bool cluster_cf_lock(LOCKMODE mode);
+/* Caller-local CLOCK_MONOTONIC deadline; zero keeps one ordinary attempt.
+ * Neither the configured acquire ceiling nor release cleanup is extended. */
+extern bool cluster_cf_lock_deadline_v1(LOCKMODE mode, uint64 deadline_ns);
 
 /* PGRAC: an observation of one process-local attempt, never lock authority.
  * Capture the sequence immediately around one synchronous consumer call.
