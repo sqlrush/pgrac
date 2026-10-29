@@ -46,6 +46,30 @@ extern ClusterRelmapCensusResult cluster_relmap_retention_census_begin(
 	const uint8 storage_uuid[16], ClusterRelmapRetentionDirectory *const directories[],
 	size_t count, size_t memory_budget, ClusterRelmapRetentionCensus **out);
 
+/* Original Startup episode adapter for the SAME physical scanner. Derive
+ * storage identity and exact origin coverage from EVERY original selected
+ * generation under the already-held simultaneous full IR/WALR set. source
+ * must be an unchanged original relmap participant, not a new owner/scope.
+ * The original isolated OBSERVED ROOT and already-qualified unpublished
+ * BUILDING directories retain ALL generic preconditions above; this adapter
+ * does not qualify their numeric bounds, native era/history/lifetime or ROOT.
+ * In particular, it cannot turn caller-filled bounds into native authority.
+ *
+ * Snapshot full selected carriers within budget (including history/empty
+ * sources) and recheck them before/after every physical scan tick and before
+ * reuse. No source is refreshed. Entered refusal/ERROR revokes the entire
+ * matching episode and invalidates ROOT/directories without clearing pins.
+ * Wrong backend/critical section or nonfresh/known-overlapping output refuses unchanged;
+ * all other distinct refusal leaves *out NULL. Destroy before original scope,
+ * ROOT/directories/ResourceOwner; unfinished destruction revokes the episode.
+ * Generic/unbound and old single-source consumers keep their original modes.
+ * No new scope, acquire, I/O pass, COMPLETE, release, live caller or qualifier. */
+struct ClusterRecoveryRelmapSourceV1;
+extern ClusterRelmapCensusResult cluster_relmap_retention_census_begin_episode(
+	const struct ClusterRecoveryRelmapSourceV1 *source, ClusterRecoveryRootSet *roots,
+	ClusterRelmapRetentionDirectory *const directories[], size_t count,
+	size_t memory_budget, ClusterRelmapRetentionCensus **out);
+
 /* Initial single-origin census from the original execution checkpoint/WAL
  * producer, without caller-filled directory bounds. Borrow the original
  * isolated OBSERVED ROOT, never a configured path. The caller still qualifies

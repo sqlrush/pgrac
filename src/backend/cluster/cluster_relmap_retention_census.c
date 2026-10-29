@@ -27,7 +27,13 @@ typedef struct CensusOrigin {
 	uint64 last_issued;
 } CensusOrigin;
 
+typedef struct CensusEpisode {
+	uint32 count;
+	ClusterRecoveryRelmapSourceV1 sources[FLEXIBLE_ARRAY_MEMBER];
+} CensusEpisode;
+
 struct ClusterRelmapRetentionCensus {
+	CensusEpisode *episode; /* same original all-source owner, never refreshed */
 	ClusterRecoveryRootSet *roots;
 	uint64 system_identifier;
 	uint64 database_incarnation;
@@ -102,6 +108,8 @@ census_input_failed(ClusterRecoveryRootSet *roots,
 static ClusterRelmapCensusResult
 census_failed(ClusterRelmapRetentionCensus *census, ClusterRelmapCensusResult result)
 {
+	if (census->episode != NULL)
+		cluster_wal_inputs_relmap_source_fail_v1(&census->episode->sources[0]);
 	census->result = result;
 	census->rebuild_ready = false;
 	census->cold_observe_ready = false;
@@ -156,10 +164,13 @@ census_root_same(const ClusterRelmapRetentionCensus *census)
 }
 
 static bool census_initial_current(ClusterRelmapRetentionCensus *census);
+static bool census_episode_validate(ClusterRelmapRetentionCensus *census);
 
 static bool
 census_recovery_current(ClusterRelmapRetentionCensus *census)
 {
+	if (!census_episode_validate(census))
+		return false;
 	if (!census_initial_current(census) || !census_root_same(census))
 		return false;
 	for (size_t i = 0; i < census->origin_count; i++)
@@ -173,7 +184,9 @@ census_recovery_sources(const ClusterRelmapRetentionCensus *census, ClusterWalIn
 {
 	uint32 count;
 
-	if (inputs == NULL || cluster_wal_inputs_revalidate_v1(inputs) != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+	if (inputs == NULL
+		|| (census->episode != NULL && inputs != census->episode->sources[0].scope)
+		|| cluster_wal_inputs_revalidate_v1(inputs) != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return false;
 	count = cluster_wal_inputs_count_v1(inputs);
 	if (count == 0 || count > CLUSTER_WAL_INPUTS_MAX)
@@ -420,6 +433,47 @@ census_open_context(void)
 	return MyBackendType == B_STARTUP && RecoveryInProgress() && CritSectionCount == 0
 		   && cluster_shared_catalog && cluster_recovery_merge_claim_is_held()
 		   && cluster_relmap_authority_x_held();
+}
+
+/* These original source checks do no physical ROOT I/O. Never invoke them
+ * from inside the native ROOT reader; the wrapper brackets each returned tick. */
+static bool
+census_episode_current(const ClusterRelmapRetentionCensus *census)
+{
+	const CensusEpisode *episode = census->episode;
+
+	if (episode == NULL)
+		return true;
+	if (!census_open_context()
+		|| cluster_wal_inputs_relmap_count_v1(episode->sources[0].scope) != episode->count)
+		return false;
+	for (uint32 i = 0; i < episode->count; i++)
+		if (!cluster_wal_inputs_relmap_source_current_v1(&episode->sources[i]))
+			return false;
+	return census_open_context()
+		&& cluster_wal_inputs_relmap_count_v1(episode->sources[0].scope) == episode->count;
+}
+
+/* Reuse paths outside the physical tick wrapper need the same sticky ERROR
+ * rule, including the very first owner check. No failure retires protections. */
+static bool
+census_episode_validate(ClusterRelmapRetentionCensus *census)
+{
+	volatile bool accepted = false;
+
+	if (census->episode == NULL)
+		return true;
+	PG_TRY();
+	{
+		accepted = census_episode_current(census);
+	}
+	PG_FINALLY();
+	{
+		if (!accepted)
+			census_failed(census, CLUSTER_RELMAP_CENSUS_CHANGED);
+	}
+	PG_END_TRY();
+	return accepted;
 }
 
 static bool
@@ -1401,6 +1455,125 @@ fail:
 	return census_input_failed(roots, directories, count, result);
 }
 
+ClusterRelmapCensusResult
+cluster_relmap_retention_census_begin_episode(
+	const ClusterRecoveryRelmapSourceV1 *source, ClusterRecoveryRootSet *roots,
+	ClusterRelmapRetentionDirectory *const directories[], size_t count,
+	size_t memory_budget, ClusterRelmapRetentionCensus **out)
+{
+	ClusterRecoveryRelmapSourceV1 original;
+	ClusterRelmapRetentionCensus *volatile fresh = NULL;
+	CensusEpisode *volatile episode = NULL;
+	volatile ClusterRelmapCensusResult result = CLUSTER_RELMAP_CENSUS_INVALID;
+	volatile bool accepted = false;
+
+	if (out == NULL || source == NULL
+		|| census_recovery_overlap(out, sizeof(*out), source, sizeof(*source))
+		|| census_recovery_overlap(out, sizeof(*out), roots, 1)
+		|| (directories != NULL && count <= CLUSTER_RELMAP_RETENTION_MAX_ORIGINS
+			&& census_recovery_overlap(out, sizeof(*out), directories,
+				count * sizeof(*directories))))
+		return result;
+	if (directories != NULL && count <= CLUSTER_RELMAP_RETENTION_MAX_ORIGINS)
+		for (size_t i = 0; i < count; i++)
+			if (census_recovery_overlap(out, sizeof(*out), directories[i], sizeof(*directories[i])))
+				return result;
+	if (*out != NULL || MyBackendType != B_STARTUP || CritSectionCount != 0)
+		return result;
+	memcpy(&original, source, sizeof(original));
+	PG_TRY();
+	{
+		do {
+			bool origins[CLUSTER_RELMAP_RETENTION_MAX_ORIGINS] = {false};
+			uint32 sources;
+			size_t bytes, origin_count = 0;
+			const ClusterControlRootIdentity *identity = &original.selected.source.claim.identity;
+
+			if (!census_open_context()
+				|| !cluster_wal_inputs_relmap_source_current_v1(&original)
+				|| (sources = cluster_wal_inputs_relmap_count_v1(original.scope)) == 0
+				|| sources > CLUSTER_WAL_INPUTS_MAX || directories == NULL || count == 0
+				|| count > CLUSTER_RELMAP_RETENTION_MAX_ORIGINS)
+				break;
+			bytes = sizeof(*episode) + (size_t)sources * sizeof(episode->sources[0]);
+			if (memory_budget < bytes || memory_budget - bytes < sizeof(*fresh)) {
+				result = CLUSTER_RELMAP_CENSUS_CAPACITY;
+				break;
+			}
+			episode = calloc(1, bytes);
+			if (episode == NULL) {
+				result = CLUSTER_RELMAP_CENSUS_CAPACITY;
+				break;
+			}
+			episode->count = sources;
+			for (uint32 i = 0; i < sources; i++) {
+				ClusterRecoveryRelmapSourceV1 *saved = &episode->sources[i];
+				const ClusterControlRootIdentity *id;
+
+				*saved = cluster_wal_inputs_relmap_source_v1(original.scope, i);
+				id = &saved->selected.source.claim.identity;
+				if (!cluster_wal_inputs_relmap_source_current_v1(saved)
+					|| saved->scope != original.scope || saved->input_index != i
+					|| saved->input_count != sources || id->origin_node_id < 0
+					|| id->origin_node_id >= CLUSTER_RELMAP_RETENTION_MAX_ORIGINS
+					|| id->system_identifier != identity->system_identifier
+					|| saved->selected.source.claim.database_incarnation
+						!= original.selected.source.claim.database_incarnation
+					|| memcmp(id->storage_uuid, identity->storage_uuid, 16) != 0)
+					break;
+				if (!origins[id->origin_node_id]) {
+					origins[id->origin_node_id] = true;
+					origin_count++;
+				}
+				if (i + 1 == sources)
+					result = CLUSTER_RELMAP_CENSUS_MORE;
+			}
+			if (result != CLUSTER_RELMAP_CENSUS_MORE || count != origin_count)
+				break;
+			result = CLUSTER_RELMAP_CENSUS_INVALID;
+			for (size_t i = 0; i < count; i++) {
+				if (directories[i] == NULL
+					|| directories[i]->origin >= CLUSTER_RELMAP_RETENTION_MAX_ORIGINS
+					|| !origins[directories[i]->origin])
+					break;
+				/* Also rejects a duplicate directory instead of losing another origin. */
+				origins[directories[i]->origin] = false;
+				if (i + 1 == count)
+					result = CLUSTER_RELMAP_CENSUS_MORE;
+			}
+			if (result != CLUSTER_RELMAP_CENSUS_MORE)
+				break;
+			result = cluster_relmap_retention_census_begin(roots, identity->system_identifier,
+				original.selected.source.claim.database_incarnation, identity->storage_uuid,
+				directories, count, memory_budget - bytes,
+				(ClusterRelmapRetentionCensus **)&fresh);
+			if (result != CLUSTER_RELMAP_CENSUS_MORE)
+				break;
+			fresh->episode = (CensusEpisode *)episode;
+			episode = NULL;
+			if (!census_episode_current((ClusterRelmapRetentionCensus *)fresh)
+				|| !cluster_wal_inputs_relmap_source_current_v1(&original))
+				break;
+			*out = (ClusterRelmapRetentionCensus *)fresh;
+			fresh = NULL;
+			accepted = true;
+		} while (false);
+	}
+	PG_FINALLY();
+	{
+		if (!accepted) {
+			if (result <= CLUSTER_RELMAP_CENSUS_DRAINED)
+				result = CLUSTER_RELMAP_CENSUS_CHANGED;
+			census_input_failed(roots, directories, count, result);
+			cluster_wal_inputs_relmap_source_fail_v1(&original);
+		}
+		cluster_relmap_retention_census_destroy((ClusterRelmapRetentionCensus *)fresh);
+		free((CensusEpisode *)episode);
+	}
+	PG_END_TRY();
+	return result;
+}
+
 /* Reuse the original canonical classifier for global and direct base/db
  * directories. This does not declare other D1 file obligations explained. */
 static bool
@@ -1468,8 +1641,8 @@ census_namespace_finish(ClusterRelmapRetentionCensus *census, ClusterRelmapCensu
 	return CLUSTER_RELMAP_CENSUS_MORE;
 }
 
-ClusterRelmapCensusResult
-cluster_relmap_retention_census_next_committed(ClusterRelmapRetentionCensus *census,
+static ClusterRelmapCensusResult
+census_next_committed(ClusterRelmapRetentionCensus *census,
 	ClusterRelmapCensusCommitted *out)
 {
 	const ClusterRecoveryRootEntry *entry;
@@ -1580,6 +1753,36 @@ cluster_relmap_retention_census_next_committed(ClusterRelmapRetentionCensus *cen
 }
 
 ClusterRelmapCensusResult
+cluster_relmap_retention_census_next_committed(ClusterRelmapRetentionCensus *census,
+	ClusterRelmapCensusCommitted *out)
+{
+	ClusterRelmapCensusResult result;
+
+	if (census == NULL || census->episode == NULL
+		|| census->result > CLUSTER_RELMAP_CENSUS_DRAINED)
+		return census_next_committed(census, out);
+	PG_TRY();
+	{
+		result = census_episode_current(census)
+			? census_next_committed(census, out)
+			: census_failed(census, CLUSTER_RELMAP_CENSUS_CHANGED);
+		if (result <= CLUSTER_RELMAP_CENSUS_DRAINED && !census_episode_current(census))
+			result = census_failed(census, CLUSTER_RELMAP_CENSUS_CHANGED);
+	}
+	PG_CATCH();
+	{
+		census_failed(census, CLUSTER_RELMAP_CENSUS_CHANGED);
+		if (out != NULL)
+			memset(out, 0, sizeof(*out));
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (result > CLUSTER_RELMAP_CENSUS_DRAINED && out != NULL)
+		memset(out, 0, sizeof(*out));
+	return result;
+}
+
+ClusterRelmapCensusResult
 cluster_relmap_retention_census_next(ClusterRelmapRetentionCensus *census)
 {
 	return cluster_relmap_retention_census_next_committed(census, NULL);
@@ -1594,7 +1797,7 @@ census_rebuild_ready(ClusterRelmapRetentionCensus *census)
 		return CLUSTER_RELMAP_PENDING_NOT_READY;
 	/* No I/O: the whole physical ROOT recheck is still required before adopting
 	 * any copied set. Recheck all borrowed qualifications between the two calls. */
-	if (!census_root_same(census)) {
+	if (!census_episode_validate(census) || !census_root_same(census)) {
 		census_failed(census, CLUSTER_RELMAP_CENSUS_CHANGED);
 		return CLUSTER_RELMAP_PENDING_NOT_READY;
 	}
@@ -1921,6 +2124,7 @@ cluster_relmap_retention_census_destroy(ClusterRelmapRetentionCensus *census)
 				(void)CloseTransientFile(census->owned_root_fd);
 			free(census->owned_directory);
 		}
+		free(census->episode);
 		free(census);
 		census = parent;
 	}

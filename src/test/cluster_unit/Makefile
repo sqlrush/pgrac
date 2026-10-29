@@ -677,6 +677,7 @@ test_cluster_relmap_physical_pair.o: test_cluster_relmap_physical_pair.c \
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_relmap_retention_census: test_cluster_relmap_retention_census.c \
+		test_cluster_relmap_census_episode.inc \
 		test_cluster_relmap_census_recovery.inc \
 		test_cluster_relmap_census_batch.inc \
 		test_cluster_relmap_census_all_pins.inc \
@@ -704,13 +705,13 @@ test_cluster_relmap_retention_census: test_cluster_relmap_retention_census.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_root_set.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_namespace.h \
 		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
-		test_cluster_relmap_retention_census_product.o \
+		test_cluster_relmap_retention_census_product.o test_cluster_relmap_v2_codec_product.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_pending.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_CRYPTOHASH_O) cluster_unit_port_stubs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		test_cluster_relmap_retention_census_product.o \
+		test_cluster_relmap_retention_census_product.o test_cluster_relmap_v2_codec_product.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_pending.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o $(LDFLAGS) $(CLUSTER_UNIT_CRYPTOHASH_O) \

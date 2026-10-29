@@ -1015,11 +1015,19 @@ ProcessInterrupts(void)
 #include "test_cluster_relmap_census_cold_initial.inc"
 #include "test_cluster_relmap_census_execute.inc"
 #include "test_cluster_relmap_census_committed_cold.inc"
+#include "test_cluster_relmap_census_episode.inc"
 
 int
 main(void)
 {
-	UT_PLAN(118);
+	if (getenv("PGRAC_CENSUS_EPISODE_FOCUS") != NULL) {
+		UT_PLAN(6);
+		census_episode_run();
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
+	UT_PLAN(124);
+	census_episode_run();
 	UT_RUN(test_retained_batch_prepare_keeps_unselected_and_unused_original_pins);
 	UT_RUN(test_retained_batch_all_original_pins_bind_interval_and_empty_batch);
 	UT_RUN(test_retained_batch_native_clear_rechecks_every_original_pin);
