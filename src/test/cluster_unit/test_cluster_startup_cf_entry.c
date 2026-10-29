@@ -1468,6 +1468,11 @@ static ClusterWalSourceRef cold_restart;
 #include "test_cluster_merge_ir_cf_types.inc"
 static ClusterRecoveryFencePlan cold_deadline_plan;
 static bool recovery_fence_plan_valid(const ClusterRecoveryFencePlan *plan);
+static bool recovery_fence_read_context_current(const ClusterRecoveryFencePlan *plan,
+												const RecoveryFenceCfContext *context,
+												uint16 own_thread,
+												const ClusterFormationSnapshotV1 *cohort,
+												const ClusterWalSourceRef *restart);
 static bool recovery_fence_deadline_current(const ClusterRecoveryFencePlan *plan);
 static int recovery_fence_acquire_budget(const ClusterRecoveryFencePlan *plan, int budget);
 void *
@@ -6400,6 +6405,8 @@ UT_TEST(ordinary_recovery_complete_roles_keep_the_original_cf_wait_policy)
 #include "test_cluster_cold_input_deadline.h"
 #include "test_cluster_merge_project_cf.h"
 #include "test_cluster_pre_ir_project_cf.h"
+#include "test_cluster_merge_commit_cf.h"
+#include "test_cluster_commit_owner_cf.h"
 
 int
 main(void)
@@ -6411,6 +6418,20 @@ main(void)
 	pg_atomic_init_u64(&owner_proc.cluster_grd_redeclare_acked_epoch, 0);
 	cluster_control_request_shmem_init();
 	retire_driver = cluster_control_request_driver_start();
+	if (getenv("PGRAC_PRE2_TEST_COMMIT_CF_OWNER") != NULL) {
+		UT_PLAN(2);
+		UT_RUN(startup_commit_owner_rolls_back_first_and_middle_projection_then_commits);
+		UT_RUN(startup_commit_owner_rolls_back_first_and_middle_canonical_then_commits);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_COMMIT_CF_ATTEMPT") != NULL) {
+		UT_PLAN(2);
+		UT_RUN(startup_commit_project_cf_slice_returns_typed_without_waiting_under_ir);
+		UT_RUN(startup_commit_canonical_cf_slice_returns_typed_without_waiting_under_ir);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_PRE_IR_REPROOF") != NULL) {
 		UT_PLAN(1);
 		UT_RUN(startup_projection_reproves_cohort_after_the_new_cf_grant);
@@ -6581,7 +6602,7 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(181);
+	UT_PLAN(200);
 	UT_RUN(startup_cf_timeout_waits_for_exact_completion_before_begin);
 	UT_RUN(startup_cf_completion_does_not_preserve_changed_native_input);
 	UT_RUN(startup_cf_unsafe_native_context_never_takes_a_registry_lock);
@@ -6763,6 +6784,25 @@ main(void)
 	UT_RUN(startup_projection_exact_ack_between_polls_has_a_live_continuation);
 	UT_RUN(startup_projection_zero_ready_preserves_one_complete_attempt);
 	UT_RUN(startup_postseal_retry_does_not_repeat_the_original_seal_calls);
+	UT_RUN(startup_commit_project_cf_slice_returns_typed_without_waiting_under_ir);
+	UT_RUN(startup_commit_canonical_cf_slice_returns_typed_without_waiting_under_ir);
+	UT_RUN(startup_commit_native_source_cf_slice_retains_original_ir_and_pin);
+	UT_RUN(startup_commit_ready_preserves_original_commit_and_clears_retry_output);
+	UT_RUN(startup_commit_hard_root_token_and_untyped_results_never_return_cf_retry);
+	UT_RUN(startup_commit_old_slots_ordinary_roles_and_untyped_timeouts_keep_original_refusal);
+	UT_RUN(startup_commit_invalid_state_or_original_expiry_clears_retry_before_reads);
+	UT_RUN(startup_commit_zero_budget_keeps_one_attempt_and_never_waits_with_ir);
+	UT_RUN(startup_commit_final_pin_or_fence_refusal_does_not_manufacture_cf_retry);
+	UT_RUN(startup_commit_owner_rolls_back_first_and_middle_projection_then_commits);
+	UT_RUN(startup_commit_owner_rolls_back_first_and_middle_canonical_then_commits);
+	UT_RUN(startup_commit_owner_zero_is_one_complete_attempt_without_cf_wait);
+	UT_RUN(startup_commit_owner_keeps_the_original_absolute_deadline_and_cleanup_budget);
+	UT_RUN(startup_commit_owner_unconfirmed_ir_or_pin_release_retains_the_original_debt);
+	UT_RUN(startup_commit_owner_context_change_or_cancel_never_reacquires_or_commits);
+	UT_RUN(startup_commit_owner_reproves_context_after_the_new_cf_grant);
+	UT_RUN(startup_commit_owner_hard_or_untyped_root_refusal_never_retries);
+	UT_RUN(startup_commit_owner_exact_cf_ack_during_cleanup_does_not_lose_continuation);
+	UT_RUN(startup_commit_owner_native_source_cf_retry_keeps_seals_and_pin_failure_refuses);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

@@ -295,6 +295,67 @@ UT_TEST(test_execution_refusal_preserves_the_first_census_failure)
 	}
 }
 
+UT_TEST(test_commit_reuses_complete_physical_union_without_replaying_the_census)
+{
+	ClusterColdTypedV1 *typed;
+	uint64 scanned;
+
+	fixture();
+	fence_count = 1;
+	history_generation(3, 9, 0x40, 0x80);
+	history_generation(2, 8, 0x20, 0x60);
+	typed = prepare(0x800);
+	UT_ASSERT(cluster_cold_typed_acquire_serial_v1(typed, (ClusterRecoveryFencePlan *)1));
+	scanned = typed->scanned_records;
+	UT_ASSERT(cluster_cold_typed_commit_serial_v1(typed, (ClusterRecoveryFencePlan *)1));
+	UT_ASSERT_EQ(commit_input_calls, 1);
+	UT_ASSERT_EQ(serial_input_calls, 1);
+	UT_ASSERT_EQ(serial_input_count, 3);
+	UT_ASSERT_EQ(census_begins, 2);
+	UT_ASSERT_EQ(census_releases, 2);
+	UT_ASSERT_EQ(typed->scanned_records, scanned);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+	cluster_cold_typed_destroy_v1(&typed);
+}
+
+UT_TEST(test_commit_refuses_changed_local_input_identity_before_owner_entry)
+{
+	ClusterColdTypedV1 *typed;
+
+	fixture();
+	typed = prepare(0x800);
+	UT_ASSERT(cluster_cold_typed_acquire_serial_v1(typed, (ClusterRecoveryFencePlan *)1));
+	++typed->sources[1].claim.identity.origin_thread_id;
+	UT_ASSERT(!cluster_cold_typed_commit_serial_v1(typed, (ClusterRecoveryFencePlan *)1));
+	UT_ASSERT_EQ(commit_input_calls, 0);
+	UT_ASSERT(strstr(typed->refusal_detail, "stage=input_thread") != NULL);
+	UT_ASSERT(!typed->census_root_captured);
+	UT_ASSERT_EQ(census_begins, 2);
+	cluster_cold_typed_destroy_v1(&typed);
+}
+
+UT_TEST(test_commit_owner_refusal_is_sticky_and_discards_provisional_history)
+{
+	ClusterColdTypedV1 *typed;
+	char first[sizeof(typed->refusal_detail)];
+
+	fixture();
+	typed = prepare(0x800);
+	UT_ASSERT(cluster_cold_typed_acquire_serial_v1(typed, (ClusterRecoveryFencePlan *)1));
+	commit_input_ok = false;
+	UT_ASSERT(!cluster_cold_typed_commit_serial_v1(typed, (ClusterRecoveryFencePlan *)1));
+	UT_ASSERT_EQ(commit_input_calls, 1);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SOURCE_GAP);
+	UT_ASSERT(!typed->census_root_captured);
+	UT_ASSERT(strstr(typed->refusal_detail, "stage=commit_inputs") != NULL);
+	strlcpy(first, typed->refusal_detail, sizeof(first));
+	commit_input_ok = true;
+	UT_ASSERT(!cluster_cold_typed_commit_serial_v1(typed, (ClusterRecoveryFencePlan *)1));
+	UT_ASSERT_EQ(commit_input_calls, 1);
+	UT_ASSERT_EQ(strcmp(first, typed->refusal_detail), 0);
+	cluster_cold_typed_destroy_v1(&typed);
+}
+
 UT_TEST(test_execution_pin_refuses_changed_census_before_retention)
 {
 	ClusterColdTypedV1 *typed;
@@ -3925,7 +3986,10 @@ UT_TEST(test_original_typed_owner_retires_fence_after_dependent_read_scope)
 int
 main(void)
 {
-	UT_PLAN(148);
+	UT_PLAN(151);
+	UT_RUN(test_commit_reuses_complete_physical_union_without_replaying_the_census);
+	UT_RUN(test_commit_refuses_changed_local_input_identity_before_owner_entry);
+	UT_RUN(test_commit_owner_refusal_is_sticky_and_discards_provisional_history);
 	UT_RUN(test_execution_refusal_preserves_the_first_census_failure);
 	UT_RUN(test_own_root_lookup_diagnostic_does_not_read_failed_outputs);
 	UT_RUN(test_own_root_key_format_diagnostic_names_the_field);

@@ -1474,6 +1474,8 @@ test_cluster_startup_cf_entry: test_cluster_startup_cf_entry.c test_cluster_cf_e
 		test_cluster_merge_ir_cf.h test_cluster_merge_ir_cf.inc test_cluster_merge_ir_cf_types.inc \
 		test_cluster_merge_project_cf.h test_cluster_merge_project_cf.inc \
 		test_cluster_pre_ir_project_cf.h test_cluster_pre_ir_project_cf.inc \
+		test_cluster_merge_commit_cf.h test_cluster_merge_commit_cf.inc \
+		test_cluster_commit_owner_cf.h test_cluster_commit_owner_cf.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_ir.c \
 		$(top_srcdir)/src/backend/cluster/cluster_ir_lock.c \
 		test_cluster_startup_cf_entry.inc test_cluster_startup_cf_callsite.inc \
@@ -1518,8 +1520,23 @@ test_cluster_merge_project_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_rec
 test_cluster_pre_ir_project_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_merge.c Makefile
 	awk '/^recovery_fence_origin_unsealed\(/ { print "static bool"; emit=1; n++ } \
 	     /^(recovery_fence_deadline_require|recovery_fence_plan_seal_inputs)\(/ { print "static void"; emit=1; n++ } \
-	     /^recovery_fence_project_context_current\(/ { print "static bool"; emit=1; n++ } \
+	     /^(recovery_fence_read_context_current|recovery_fence_project_context_current)\(/ { print "static bool"; emit=1; n++ } \
 	     /^recovery_fence_project_wait\(/ { print "static ClusterMergeEngage"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (n != 6 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_merge_commit_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_merge.c Makefile
+	awk '/^recovery_fence_plan_find_origin\(/ { print "static int"; emit=1; n++ } \
+	     /^(recovery_fence_changed|recovery_fence_commit_attempt)\(/ { print "static bool"; emit=1; n++ } \
+	     /^(cluster_recovery_merge_commit_plan_nowait|cluster_recovery_merge_fence_plan_revalidate_nowait)\(/ { print "bool"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (n != 5 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_commit_owner_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_merge.c Makefile
+	awk '/^(recovery_fence_cf_context_current|recovery_fence_wait_own_cf|recovery_fence_plan_acquire_serial_inputs|recovery_fence_commit_context_current)\(/ { print "static bool"; emit=1; n++ } \
+	     /^cluster_recovery_merge_commit_plan_inputs_v1\(/ { print "bool"; emit=1; n++ } \
 	     emit { print } /^}/ { emit=0 } \
 	     END { if (n != 5 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@

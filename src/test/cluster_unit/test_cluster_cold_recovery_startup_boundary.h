@@ -848,6 +848,8 @@ static uint16 history_sync_threads[MAX_HISTORY];
 static unsigned serial_input_calls;
 static uint16 serial_input_count, serial_input_threads[128];
 static bool serial_input_ok;
+static unsigned commit_input_calls;
+static bool commit_input_ok;
 
 bool
 cluster_recovery_merge_fence_plan_acquire_serial_inputs_v1(
@@ -861,6 +863,20 @@ cluster_recovery_merge_fence_plan_acquire_serial_inputs_v1(
 	UT_ASSERT(count <= lengthof(serial_input_threads));
 	memcpy(serial_input_threads, threads, count * sizeof(*threads));
 	return serial_input_ok;
+}
+
+bool
+cluster_recovery_merge_commit_plan_inputs_v1(ClusterRecoveryFencePlan *plan, const uint16 *threads,
+											 uint16 count)
+{
+	UT_ASSERT_NOT_NULL(plan);
+	UT_ASSERT_EQ(serial_input_calls, 1);
+	UT_ASSERT_EQ(census_begins, census_releases);
+	UT_ASSERT_EQ(count, serial_input_count);
+	UT_ASSERT_EQ(memcmp(threads, serial_input_threads, count * sizeof(*threads)), 0);
+	UT_ASSERT(!cluster_cold_replay_window_active_v1());
+	++commit_input_calls;
+	return commit_input_ok;
 }
 
 static int history_scans;
@@ -1505,6 +1521,8 @@ fixture(void)
 	retention_invalidations = retention_root_reads = 0;
 	serial_input_calls = serial_input_count = 0;
 	serial_input_ok = true;
+	commit_input_calls = 0;
+	commit_input_ok = true;
 	memset(serial_input_threads, 0, sizeof(serial_input_threads));
 	tt_base_captures = tt_base_rechecks = tt_base_destroys = 0;
 	tt_base_participants = 0;

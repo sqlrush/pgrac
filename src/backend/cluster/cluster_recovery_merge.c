@@ -150,6 +150,11 @@ typedef struct RecoveryFenceCfContext {
 static ClusterMergeEngage recovery_fence_project_wait(ClusterRecoveryFencePlan *plan,
 													  XLogRecPtr own_redo, uint64 replay[2],
 													  XLogRecPtr *start);
+static bool recovery_fence_read_context_current(const ClusterRecoveryFencePlan *plan,
+												const RecoveryFenceCfContext *context,
+												uint16 own_thread,
+												const ClusterFormationSnapshotV1 *cohort,
+												const ClusterWalSourceRef *restart);
 
 void
 cluster_recovery_merge_window_enter(void)
@@ -2060,6 +2065,14 @@ recovery_merge_cold_cf_wait(const ClusterRecoveryFencePlan *plan,
 	ClusterCfRetirementSnapshot original;
 	PGPROC *proc = MyProc;
 	Latch *latch = MyLatch;
+	RecoveryFenceCfContext context = { .proc = proc,
+									   .latch = latch,
+									   .owner = owner,
+									   .pid = MyProcPid,
+									   .boot = boot,
+									   .epoch = epoch,
+									   .generation = generation,
+									   .recovery = recovery };
 	bool empty = attempt->owner_state_at_return == CLUSTER_LOCK_OWNER_EMPTY;
 	bool empty_waited = false;
 	const char *reason = "UNSAFE_CF_WAIT";
@@ -2077,33 +2090,19 @@ recovery_merge_cold_cf_wait(const ClusterRecoveryFencePlan *plan,
 	}
 	for (;;) {
 		ClusterCfRetirementSnapshot current;
-		ClusterFormationSnapshotV1 observed;
-		ClusterWalSourceRef input;
 		bool held;
 		int wait_ms;
 
 		HandleStartupProcInterrupts();
 		CHECK_FOR_INTERRUPTS();
 		reason = "CONTEXT_CHANGED_AFTER_WAIT_SLICE";
-		if (MyProc != proc || MyLatch != latch || !AmStartupProcess() || MyBackendType != B_STARTUP
-			|| CurrentResourceOwner != owner || !cluster_enabled || !cluster_shared_config
-			|| !cluster_controlfile_shared_authority || ShutdownRequestPending
-			|| CritSectionCount != 0 || LWLockHeldByMe(ControlFileLock) || boot == 0
-			|| boot != cluster_qvotec_get_self_incarnation() || InRecovery != recovery || epoch == 0
-			|| generation == 0 || epoch != cluster_epoch_get_current()
-			|| generation != cluster_grd_redeclare_generation()
-			|| !cluster_recovery_transport_components_current())
+		if (!recovery_fence_read_context_current(plan, &context, own_thread, cohort, restart))
 			goto refuse;
 		reason = "MERGE_DEADLINE_OR_ZERO_ATTEMPT";
 		if (plan->merge_wait_timeout_ms_snapshot == 0 || !recovery_fence_deadline_current(plan))
 			goto refuse;
 		reason = "CONTEXT_CHANGED_AFTER_WAIT_SLICE";
 		ResetLatch(MyLatch);
-		if (!cluster_reconfig_capture_formation_snapshot_v1(own_thread, &observed)
-			|| !cluster_formation_snapshot_matches_v1(cohort, &observed)
-			|| !cluster_wal_thread_restart_v2_ref(&input)
-			|| memcmp(restart, &input, sizeof(input)) != 0)
-			goto refuse;
 		held = cluster_cf_held(ShareLock);
 		if (!held && !cluster_cf_held(ExclusiveLock)) {
 			if (!empty && cluster_cf_release_completed(ShareLock, original.cookie))
@@ -2155,10 +2154,10 @@ refuse:
 /* Reprove the complete original read context after every yielding retry.
  * This observes no ROOT and grants no CF or replay authority. */
 static bool
-recovery_fence_project_context_current(const ClusterRecoveryFencePlan *plan,
-									   const RecoveryFenceCfContext *context, uint16 own_thread,
-									   const ClusterFormationSnapshotV1 *cohort,
-									   const ClusterWalSourceRef *restart)
+recovery_fence_read_context_current(const ClusterRecoveryFencePlan *plan,
+									const RecoveryFenceCfContext *context, uint16 own_thread,
+									const ClusterFormationSnapshotV1 *cohort,
+									const ClusterWalSourceRef *restart)
 {
 	ClusterFormationSnapshotV1 observed;
 	ClusterWalSourceRef input;
@@ -2168,12 +2167,11 @@ recovery_fence_project_context_current(const ClusterRecoveryFencePlan *plan,
 		|| context->epoch == 0 || context->generation == 0 || MyProc != context->proc
 		|| MyLatch != context->latch || MyProcPid != context->pid
 		|| CurrentResourceOwner != context->owner || plan->owner != context->owner
-		|| plan->owner_boot != context->boot || plan->sealed || plan->serial_held
-		|| plan->serial_guards.count != 0 || plan->retention_pin != NULL || plan->committed
-		|| MyBackendType != B_STARTUP || !AmStartupProcess() || !cluster_enabled
-		|| !cluster_shared_config || !cluster_controlfile_shared_authority || ShutdownRequestPending
-		|| CritSectionCount != 0 || LWLockHeldByMe(ControlFileLock)
-		|| InRecovery != context->recovery || context->boot != cluster_qvotec_get_self_incarnation()
+		|| plan->owner_boot != context->boot || plan->committed || MyBackendType != B_STARTUP
+		|| !AmStartupProcess() || !cluster_enabled || !cluster_shared_config
+		|| !cluster_controlfile_shared_authority || ShutdownRequestPending || CritSectionCount != 0
+		|| LWLockHeldByMe(ControlFileLock) || InRecovery != context->recovery
+		|| context->boot != cluster_qvotec_get_self_incarnation()
 		|| context->epoch != cluster_epoch_get_current()
 		|| context->generation != cluster_grd_redeclare_generation()
 		|| !cluster_recovery_transport_components_current()
@@ -2195,6 +2193,17 @@ recovery_fence_project_context_current(const ClusterRecoveryFencePlan *plan,
 			return false;
 	}
 	return true;
+}
+
+static bool
+recovery_fence_project_context_current(const ClusterRecoveryFencePlan *plan,
+									   const RecoveryFenceCfContext *context, uint16 own_thread,
+									   const ClusterFormationSnapshotV1 *cohort,
+									   const ClusterWalSourceRef *restart)
+{
+	return recovery_fence_plan_valid(plan) && !plan->sealed && !plan->serial_held
+		   && plan->serial_guards.count == 0 && plan->retention_pin == NULL
+		   && recovery_fence_read_context_current(plan, context, own_thread, cohort, restart);
 }
 
 /* Initial and post-seal projections precede this plan's pin/IR acquisition.
@@ -2982,8 +2991,12 @@ cluster_recovery_merge_fence_plan_acquire_serial_inputs_v1(
 	return recovery_fence_plan_acquire_serial_inputs(plan, input_threads, ninput_threads);
 }
 
-bool
-cluster_recovery_merge_commit_plan_nowait(ClusterRecoveryFencePlan *plan)
+/* One commit attempt only. A fresh typed CF slice is not a refusal or
+ * completion: the set's caller must surrender every IR before waiting.
+ * This attempt leaves all original owners untouched.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static bool
+recovery_fence_commit_attempt(ClusterRecoveryFencePlan *plan, ClusterCfAttemptObservation *retry)
 {
 	uint64 current_replay[2] = { 0, 0 };
 	uint64 current_foreign[2];
@@ -2993,13 +3006,25 @@ cluster_recovery_merge_commit_plan_nowait(ClusterRecoveryFencePlan *plan)
 	ClusterMergeEngage engage;
 	uint16 tid;
 
+	if (retry != NULL) {
+		MemSet(retry, 0, sizeof(*retry));
+		if (!cluster_shared_config || MyBackendType != B_STARTUP || !AmStartupProcess()
+			|| cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
+			retry = NULL;
+	}
 	if (!recovery_fence_plan_valid(plan) || !plan->sealed || !plan->serial_held || plan->committed)
 		return recovery_fence_refused(plan, "commit_state", 0, -1, 0);
 	if (!recovery_fence_deadline_current(plan))
 		return recovery_fence_refused(plan, "merge_deadline", 0, -1, 0);
 	MemSet(current_start, 0, sizeof(current_start));
-	engage = cluster_recovery_merge_project_readonly(
-		plan->own_thread, plan->start_lsn[plan->own_thread], current_replay, current_start);
+	if (retry == NULL)
+		engage = cluster_recovery_merge_project_readonly(
+			plan->own_thread, plan->start_lsn[plan->own_thread], current_replay, current_start);
+	else
+		engage = recovery_merge_project_attempt(plan->own_thread, plan->start_lsn[plan->own_thread],
+												current_replay, current_start, retry);
+	if (retry != NULL && cluster_cf_attempt_wait_slice(retry))
+		return false;
 	if (!recovery_fence_deadline_current(plan))
 		return recovery_fence_refused(plan, "merge_deadline", 0, -1, 0);
 	if (engage != CLUSTER_MERGE_ENGAGE)
@@ -3013,6 +3038,8 @@ cluster_recovery_merge_commit_plan_nowait(ClusterRecoveryFencePlan *plan)
 		ClusterControlRootReadToken token;
 		ClusterControlRootResult root_result;
 		ClusterRecoveryDutyCompare duty_result;
+		ClusterCfAttemptObservation attempt;
+		uint64 before;
 		int origin_index;
 
 		if ((current_foreign[(tid - 1) / 64] & (UINT64_C(1) << ((tid - 1) % 64))) == 0)
@@ -3020,9 +3047,16 @@ cluster_recovery_merge_commit_plan_nowait(ClusterRecoveryFencePlan *plan)
 		origin_index = recovery_fence_plan_find_origin(plan, tid);
 		if (origin_index < 0)
 			return recovery_fence_refused(plan, "commit_origin", tid, origin_index, 0);
+		before = retry != NULL ? cluster_cf_attempt_sequence() : 0;
 		root_result = cluster_control_root_read_canonical(tid, &plan->origins[origin_index].duty,
 														  CLUSTER_CONTROL_ROOT_READ_STRONG,
 														  &snapshot, &token);
+		if (retry != NULL && root_result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE
+			&& cluster_cf_last_attempt_since(before, &attempt) && attempt.mode == ShareLock
+			&& cluster_cf_attempt_wait_slice(&attempt)) {
+			*retry = attempt;
+			return false;
+		}
 		if (root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 			&& root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 			return recovery_fence_refused(plan, "commit_root_read", tid, origin_index,
@@ -3146,8 +3180,115 @@ cluster_recovery_merge_commit_plan_nowait(ClusterRecoveryFencePlan *plan)
 		return false;
 	if (!recovery_fence_deadline_current(plan))
 		return recovery_fence_refused(plan, "merge_deadline", 0, -1, 0);
+	return true;
+}
+
+bool
+cluster_recovery_merge_commit_plan_nowait(ClusterRecoveryFencePlan *plan)
+{
+	if (!recovery_fence_commit_attempt(plan, NULL))
+		return false;
 	plan->committed = true;
 	return true;
+}
+
+static bool
+recovery_fence_commit_context_current(const ClusterRecoveryFencePlan *plan,
+									  const RecoveryFenceCfContext *context, uint16 own_thread,
+									  const ClusterFormationSnapshotV1 *cohort,
+									  const ClusterWalSourceRef *restart, bool held)
+{
+	if (!recovery_fence_plan_valid(plan) || !plan->sealed || plan->origin_count == 0
+		|| plan->serial_held != held
+		|| (held ? plan->serial_guards.count != plan->origin_count || plan->retention_pin == NULL
+				 : plan->serial_guards.count != 0 || plan->retention_pin != NULL))
+		return false;
+	return recovery_fence_read_context_current(plan, context, own_thread, cohort, restart);
+}
+
+/* A bound pin cannot be rebound to a different IR set. Surrender both old
+ * protections with their original confirmations, finish this caller's CF
+ * debt without IR, then acquire the same input union in the original order.
+ * Seals and the outer absolute deadline are never recreated.
+ * Author: SqlRush <sqlrush@gmail.com> */
+bool
+cluster_recovery_merge_commit_plan_inputs_v1(ClusterRecoveryFencePlan *plan,
+											 const uint16 *input_threads, uint16 ninput_threads)
+{
+	ClusterFormationSnapshotV1 cohort;
+	ClusterWalSourceRef restart;
+	RecoveryFenceCfContext context = { .proc = MyProc,
+									   .latch = MyLatch,
+									   .owner = CurrentResourceOwner,
+									   .pid = MyProcPid,
+									   .boot = cluster_qvotec_get_self_incarnation(),
+									   .epoch = cluster_epoch_get_current(),
+									   .generation = cluster_grd_redeclare_generation(),
+									   .recovery = InRecovery };
+	uint16 own_thread;
+	bool waited = false;
+
+	if (!recovery_fence_plan_valid(plan) || input_threads == NULL || ninput_threads == 0
+		|| ninput_threads > CLUSTER_WAL_STATE_SLOT_COUNT)
+		return recovery_fence_refused(plan, "commit_input_arguments", 0, -1, 0);
+	own_thread = plan->own_thread;
+	if (!cluster_shared_config || MyBackendType != B_STARTUP || !AmStartupProcess()
+		|| cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock)
+		|| !cluster_reconfig_capture_formation_snapshot_v1(own_thread, &cohort)
+		|| cohort.startup_formation_generation == 0 || !cluster_wal_thread_restart_v2_ref(&restart))
+		return cluster_recovery_merge_commit_plan_nowait(plan);
+	if (!recovery_fence_commit_context_current(plan, &context, own_thread, &cohort, &restart, true))
+		return recovery_fence_refused(plan, "commit_cf_context", 0, -1, 0);
+	for (;;) {
+		ClusterCfAttemptObservation attempt;
+		ClusterRecoverySerialReleaseResult released;
+		ClusterWalrReleaseResult pin_released;
+
+		if (waited
+			&& !recovery_fence_commit_context_current(plan, &context, own_thread, &cohort, &restart,
+													  true))
+			return recovery_fence_refused(plan, "commit_cf_context", 0, -1, 0);
+		if (recovery_fence_commit_attempt(plan, &attempt)) {
+			if (waited
+				&& !recovery_fence_commit_context_current(plan, &context, own_thread, &cohort,
+														  &restart, true))
+				return recovery_fence_refused(plan, "commit_cf_context", 0, -1, 0);
+			plan->committed = true;
+			return true;
+		}
+		if (!cluster_cf_attempt_wait_slice(&attempt))
+			return false;
+		plan->serial_held = false;
+		released = cluster_recovery_serial_release_set(&plan->serial_guards);
+		if (released != CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED || plan->serial_guards.count != 0)
+			ereport(
+				FATAL,
+				(errcode(ERRCODE_CLUSTER_RECOVERY_OWNER_CONFLICT),
+				 errmsg("cold recovery commit IR rollback was not confirmed before CF wait"),
+				 errdetail("retained_ir=%u result=%d cookie=" UINT64_FORMAT,
+						   plan->serial_guards.count, (int)released, attempt.control_owner_id)));
+		pin_released = cluster_wal_retention_pin_release(&plan->retention_pin);
+		if (pin_released != CLUSTER_WALR_RELEASE_CONFIRMED || plan->retention_pin != NULL)
+			return recovery_fence_refused(plan, "commit_cf_pin_release", 0, -1, (int)pin_released);
+		if (!recovery_fence_commit_context_current(plan, &context, own_thread, &cohort, &restart,
+												   false))
+			return recovery_fence_refused(plan, "commit_cf_context", 0, -1, 0);
+		if (plan->merge_wait_timeout_ms_snapshot == 0 || !recovery_fence_deadline_current(plan))
+			return recovery_fence_refused(plan, "merge_deadline", 0, -1, 0);
+		/* IR/pin cleanup may already have consumed this exact CF ACK. */
+		if (attempt.owner_state_at_return == CLUSTER_LOCK_OWNER_EMPTY || cluster_cf_held(ShareLock)
+			|| cluster_cf_held(ExclusiveLock)
+			|| !cluster_cf_release_completed(ShareLock, attempt.control_owner_id))
+			recovery_merge_cold_cf_wait(plan, &attempt, &cohort, &restart, own_thread,
+										context.epoch, context.generation, context.owner,
+										context.boot, context.recovery);
+		if (!recovery_fence_commit_context_current(plan, &context, own_thread, &cohort, &restart,
+												   false))
+			return recovery_fence_refused(plan, "commit_cf_context", 0, -1, 0);
+		if (!recovery_fence_plan_acquire_serial_inputs(plan, input_threads, ninput_threads))
+			return false;
+		waited = true;
+	}
 }
 
 /* Copy one fenced origin's exact ROOT input.  Read-only; grants nothing. */

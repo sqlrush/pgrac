@@ -982,6 +982,10 @@ extern bool cluster_cold_typed_recheck_inputs_v1(ClusterColdTypedV1 *typed);
  * This does not qualify history durability, final freshness or endpoints. */
 extern bool cluster_cold_typed_acquire_serial_v1(ClusterColdTypedV1 *typed,
 												 struct ClusterRecoveryFencePlan *fence);
+/* Commit using the same sealed physical input union. No census or pass-1
+ * replay occurs while IR is held or when its original CF wait resumes. */
+extern bool cluster_cold_typed_commit_serial_v1(ClusterColdTypedV1 *typed,
+												struct ClusterRecoveryFencePlan *fence);
 
 /* Original native checkpoint and its exact window for any selected generation,
  * including history. Legacy zero windows remain zero. Copies only sealed input;

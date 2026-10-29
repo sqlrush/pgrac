@@ -4385,7 +4385,7 @@ cluster_recovery_typed_begin(ClusterRecoveryFencePlan **fence_plan)
 	 * before taking the unchanged foreign-origin IR set. */
 	serial_acquired = cluster_cold_typed_acquire_serial_v1(typed, *fence_plan);
 	if (serial_acquired)
-		plan_committed = cluster_recovery_merge_commit_plan_nowait(*fence_plan);
+		plan_committed = cluster_cold_typed_commit_serial_v1(typed, *fence_plan);
 	if (!serial_acquired || !plan_committed)
 	{
 		if (serial_acquired)

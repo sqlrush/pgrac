@@ -1010,22 +1010,25 @@ cluster_cold_typed_recheck_inputs_v1(ClusterColdTypedV1 *typed)
 	return true;
 }
 
-bool
-cluster_cold_typed_acquire_serial_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence)
+/* Copies the same physical union for initial retention and commit retry.
+ * This reads only the original local plan; it never opens a census under IR. */
+static bool
+cold_execution_input_threads(ClusterColdTypedV1 *typed, uint16 *threads, uint16 *count)
 {
 	bool selected[CLUSTER_WAL_RETENTION_MAX_THREADS + 1] = { false };
-	uint16 threads[CLUSTER_WAL_RETENTION_MAX_THREADS];
-	uint16 count = 0;
-	bool acquired = false;
 
+	*count = 0;
 	if (typed == NULL)
 		return false;
-	if (fence == NULL) {
-		cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "execution input retention refused: stage=fence");
-		goto refused;
+	if (typed->refusal != CLUSTER_COLD_OK)
+		return false;
+	if (!typed->census_root_captured || typed->inputs != NULL || typed->replay_roots == NULL
+		|| typed->participant_count == 0 || typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
+		|| cluster_cold_replay_window_active_v1()) {
+		cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP,
+					"execution input retention refused: stage=input_state");
+		return false;
 	}
-	if (!cluster_cold_typed_recheck_inputs_v1(typed))
-		goto refused;
 	for (uint32 i = 0; i < typed->participant_count; i++) {
 		uint16 thread = typed->participants[i].thread_id;
 
@@ -1037,14 +1040,34 @@ cluster_cold_typed_acquire_serial_v1(ClusterColdTypedV1 *typed, ClusterRecoveryF
 						"thread=%u root_thread=%u source_thread=%u",
 						i, thread, typed->replay_roots[i].root.identity.origin_thread_id,
 						typed->sources[i].claim.identity.origin_thread_id);
-			goto refused;
+			return false;
 		}
 		selected[thread] = true;
 	}
 	for (uint16 thread = 1; thread <= CLUSTER_WAL_RETENTION_MAX_THREADS; thread++) {
 		if (selected[thread])
-			threads[count++] = thread;
+			threads[(*count)++] = thread;
 	}
+	return *count != 0;
+}
+
+bool
+cluster_cold_typed_acquire_serial_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence)
+{
+	uint16 threads[CLUSTER_WAL_RETENTION_MAX_THREADS];
+	uint16 count;
+	bool acquired = false;
+
+	if (typed == NULL)
+		return false;
+	if (fence == NULL) {
+		cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP,
+					"execution input retention refused: stage=fence");
+		goto refused;
+	}
+	if (!cluster_cold_typed_recheck_inputs_v1(typed)
+		|| !cold_execution_input_threads(typed, threads, &count))
+		goto refused;
 	cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "execution input retention is incomplete");
 	PG_TRY();
 	{
@@ -1060,6 +1083,48 @@ cluster_cold_typed_acquire_serial_v1(ClusterColdTypedV1 *typed, ClusterRecoveryF
 	if (!acquired) {
 		cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP,
 					"execution input retention refused: stage=serial_inputs input_threads=%u", count);
+		goto refused;
+	}
+	typed->refusal = CLUSTER_COLD_OK;
+	typed->refusal_detail[0] = '\0';
+	return true;
+
+refused:
+	memset(&typed->history_xid, 0, sizeof(typed->history_xid));
+	typed->census_root_captured = false;
+	return false;
+}
+
+bool
+cluster_cold_typed_commit_serial_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence)
+{
+	uint16 threads[CLUSTER_WAL_RETENTION_MAX_THREADS];
+	uint16 count;
+	bool committed = false;
+
+	if (typed == NULL)
+		return false;
+	if (fence == NULL) {
+		cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "execution input commit refused: stage=fence");
+		goto refused;
+	}
+	if (!cold_execution_input_threads(typed, threads, &count))
+		goto refused;
+	cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "execution input commit is incomplete");
+	PG_TRY();
+	{
+		committed = cluster_recovery_merge_commit_plan_inputs_v1(fence, threads, count);
+	}
+	PG_CATCH();
+	{
+		memset(&typed->history_xid, 0, sizeof(typed->history_xid));
+		typed->census_root_captured = false;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (!committed) {
+		cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP,
+					"execution input commit refused: stage=commit_inputs input_threads=%u", count);
 		goto refused;
 	}
 	typed->refusal = CLUSTER_COLD_OK;

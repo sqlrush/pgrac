@@ -518,6 +518,11 @@ extern bool cluster_recovery_merge_fence_plan_acquire_serial(ClusterRecoveryFenc
 extern bool cluster_recovery_merge_fence_plan_acquire_serial_inputs_v1(
 	ClusterRecoveryFencePlan *plan, const uint16 *input_threads, uint16 ninput_threads);
 extern bool cluster_recovery_merge_commit_plan_nowait(ClusterRecoveryFencePlan *plan);
+/* Startup's original input union. A typed CF slice surrenders the old IR/pin,
+ * waits only without IR, and reacquires before the unchanged commit proof. */
+extern bool cluster_recovery_merge_commit_plan_inputs_v1(ClusterRecoveryFencePlan *plan,
+														 const uint16 *input_threads,
+														 uint16 ninput_threads);
 /* Borrowed diagnostic only, valid until plan destruction. Empty before the
  * first refusal; copied before cleanup by the original Startup FATAL. */
 extern const char *
