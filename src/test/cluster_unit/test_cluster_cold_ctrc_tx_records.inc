@@ -4,6 +4,16 @@
  * Author: SqlRush <sqlrush@gmail.com> */
 static unsigned start_tx_record_fault, start_tx_record_calls;
 static ClusterRecoveryUndoRecord start_tx_record_bytes;
+static bool start_tx_record_sentinel;
+static void (*start_tx_record_step)(uint32 index, ClusterRecoveryCensusTxRecordV1 *out);
+
+static void
+start_tx_forest_fixture_reset(void)
+{
+	start_tx_record_fault = start_tx_record_calls = 0;
+	start_tx_record_sentinel = false;
+	start_tx_record_step = NULL;
+}
 
 ClusterRecoveryCensusTxRecordV1
 cluster_recovery_census_tx_record_v1(ClusterRecoveryCensus *cursor, uint32 index)
@@ -21,10 +31,25 @@ cluster_recovery_census_tx_record_v1(ClusterRecoveryCensus *cursor, uint32 index
 		out.value.transaction.segment_generation = 17;
 		out.value.record_segment_generation = 41;
 		out.value.record = &start_tx_record_bytes;
+		/* Default transport supplies complete original work identity. The
+		 * explicit getter suite below keeps its old sentinel contract. */
+		if (!start_tx_record_sentinel && native_ctrc_work.counts.subject_count != 0) {
+			const ClusterColdTtSlotKeyV1 *key = &native_ctrc_work.entries[
+				index % native_ctrc_work.counts.subject_count].key;
+			out.value.transaction = (ClusterRecoveryTxnKey){
+				.system_identifier = typed.system_identifier,
+				.database_incarnation = typed.observer.database_incarnation,
+				.origin_node_id = key->owner_instance - 1,
+				.segment_id = key->segment_id,
+				.segment_generation = key->segment_generation,
+				.slot_offset = key->slot_offset, .slot_wrap = key->slot_wrap,
+				.xid = key->xid};
+		}
 	}
 	if (start_tx_record_fault == 4) owner_boot++;
 	if (start_tx_record_fault == 5) out.value.record = NULL;
 	if (start_tx_record_fault == 6) observation_manifest.inputs_sha256[31]++;
+	if (start_tx_record_step != NULL) start_tx_record_step(index, &out);
 	return out;
 }
 
@@ -32,6 +57,7 @@ static void
 start_tx_records_ready(uint32 count)
 {
 	observation_two_ready();
+	start_tx_record_sentinel = true;
 	start_tx_record_fault = start_tx_record_calls = 0;
 	memset(&start_tx_record_bytes, 0, sizeof(start_tx_record_bytes));
 	start_tx_record_bytes.body_length = 7;

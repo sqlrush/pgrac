@@ -10827,3 +10827,6 @@ test_cluster_cold_tx_start: test_cluster_cold_ctrc_tx_dependencies.inc
 test_cluster_recovery_reference_graph: test_cluster_recovery_tx_reference_edges.inc
 test_cluster_recovery_native_inputs: test_cluster_recovery_census_tx_reference_edges.inc
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_tx_reference_edges.inc
+
+# Final Startup checks the complete original native TX forest.
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_tx_forest_terminals.inc

@@ -2522,6 +2522,70 @@ cluster_recovery_cold_page_reference_cross_page(const ClusterRecoveryCensusPages
 	return true;
 }
 
+/* PGRAC: every fully reread TX node, including non-root predecessors, must
+ * have its original canonical terminal. PAGE heads alone do not cover the
+ * forest. Physical record generation is independent of TT generation.
+ * This identity/terminal check grants no effect, owner or retention release. */
+static bool
+cluster_recovery_cold_page_tx_terminals(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, ClusterWalInputsV1 *scope,
+	ClusterColdCtrcPageProgressV1 *progress)
+{
+	ClusterRecoveryTxResultObservationV1 accepted, confirmed;
+	const ClusterColdCtrcPhysicalV1 *physical;
+	uint32 count;
+
+	if (!cluster_recovery_cold_page_advance_current(start, work, scope, progress)
+		|| start->inputs == NULL
+		|| !cluster_recovery_ctrc_terminal_result_v1(start, work, &accepted)) return false;
+	physical = start->ctrc_physical;
+	if (physical == NULL || physical->count != work->counts.subject_count) return false;
+	count = start->ctrc_observation_manifest.tx_record_count;
+	for (uint32 index = 0;; index++) {
+		ClusterRecoveryCensusTxRecordV1 record = ClusterColdRecoveryCtrcTxRecord(start, work, index);
+		const ClusterRecoveryTxnKey *transaction = &record.value.transaction;
+		ClusterRecoveryUndoEntry observed;
+		ClusterColdTtSlotInputV1 terminal;
+		uint32 subject = 0;
+		unsigned matches = 0;
+
+		if (!record.observed || record.count != count
+			|| !cluster_recovery_cold_page_advance_current(start, work, scope, progress)
+			|| start->ctrc_physical != physical
+			|| physical->count != work->counts.subject_count) return false;
+		if (index == count) {
+			if (record.value.record != NULL) return false;
+			break;
+		}
+		if (record.value.record == NULL
+			|| transaction->system_identifier != start->inputs->system_identifier
+			|| transaction->database_incarnation != start->inputs->observer.database_incarnation)
+			return false;
+		for (uint32 i = 0; i < work->counts.subject_count; i++) {
+			const ClusterColdTtSlotKeyV1 *key = &work->entries[i].key;
+
+			if ((uint32)transaction->origin_node_id + 1 == key->owner_instance
+				&& transaction->segment_id == key->segment_id
+				&& transaction->segment_generation == key->segment_generation
+				&& transaction->slot_offset == key->slot_offset
+				&& transaction->slot_wrap == key->slot_wrap && transaction->xid == key->xid) {
+				subject = i;
+				matches++;
+			}
+		}
+		if (matches != 1) return false;
+		observed = physical->entries[subject];
+		if (!cluster_recovery_ctrc_terminal_subject_v1(start, work, subject, &observed, &terminal)
+			|| !cluster_recovery_cold_page_advance_current(start, work, scope, progress)
+			|| start->ctrc_physical != physical || physical->count != work->counts.subject_count
+			|| memcmp(&physical->entries[subject], &observed, sizeof(observed)) != 0)
+			return false;
+	}
+	return cluster_recovery_ctrc_terminal_result_v1(start, work, &confirmed)
+		&& memcmp(&accepted, &confirmed, sizeof(accepted)) == 0
+		&& cluster_recovery_cold_page_advance_current(start, work, scope, progress);
+}
+
 /* PGRAC: consume the complete original relation/history view, including
  * pages absent from PAGE WAL. Match the graph's full canonical identity,
  * never a raw xid or a current slot chosen for an older generation. The
@@ -2536,6 +2600,8 @@ cluster_recovery_cold_page_reference_terminals(const struct ClusterRecoveryStart
 	const ClusterRecoveryCensusPagesV1 *pages;
 
 	if (!cluster_recovery_cold_page_advance_current(start, work, scope, progress)) return false;
+	/* PGRAC: include the complete original TX forest before PAGE references. */
+	if (!cluster_recovery_cold_page_tx_terminals(start, work, scope, progress)) return false;
 	references = ClusterColdRecoveryCtrcReferences(start, work);
 	if (references == NULL
 		|| !cluster_recovery_cold_page_advance_current(start, work, scope, progress)) return false;

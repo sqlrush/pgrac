@@ -123,6 +123,7 @@ cluster_recovery_census_pages_v1(ClusterRecoveryCensus *cursor)
 static void
 observation_fixture_reset(void)
 {
+	start_tx_forest_fixture_reset();
 	if (observation_scope_live || observation_cursor_live) abort();
 	observation_scope_begins = observation_census_begins = observation_steps = 0;
 	observation_manifests = observation_census_destroys = observation_scope_releases = 0;
@@ -195,6 +196,8 @@ cluster_recovery_census_begin_ctrc(ClusterWalInputsV1 *inputs, size_t memory_bud
 {
 	if (inputs != (ClusterWalInputsV1 *)&observation_scope_object || !observation_scope_live
 		|| observation_cursor_live || memory_budget == 0) abort();
+	/* An explicitly empty original work has an empty controlled forest. */
+	if (native_ctrc_work.counts.subject_count == 0) observation_manifest.tx_record_count = 0;
 	observation_census_begins++;
 	observation_event('B');
 	if (observation_fault == 2) return CLUSTER_RECOVERY_CENSUS_CAPACITY;

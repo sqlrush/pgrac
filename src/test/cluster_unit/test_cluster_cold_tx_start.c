@@ -164,6 +164,7 @@ static ClusterRecoveryUndoEntry observation_physical[4];
 static unsigned observation_physical_count, observation_fail_allocation;
 static bool observation_release_error, observation_early_read;
 static void observation_fixture_reset(void);
+static void start_tx_forest_fixture_reset(void);
 static void page_graph_fixture_reset(void);
 static void page_prefix_fixture_reset(void);
 static void page_source_fixture_reset(void);
@@ -2398,8 +2399,19 @@ static void startup_local_empty_reset(void);
 #include "test_cluster_cold_ctrc_native_first.inc"
 #endif
 
+#include "test_cluster_cold_ctrc_tx_forest_terminals.inc"
+
 int main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_START_TX_FOREST_TERMINALS") != NULL) {
+		UT_PLAN(5);
+		UT_RUN(test_startup_tx_forest_covers_complete_native_records_and_empty_end);
+		UT_RUN(test_startup_tx_forest_nonroot_full_identity_requires_canonical_terminal);
+		UT_RUN(test_startup_tx_forest_incomplete_record_or_end_refuses_service);
+		UT_RUN(test_startup_tx_forest_late_current_and_error_keep_original_debt);
+		UT_RUN(test_startup_tx_forest_zero_page_still_checks_all_native_transactions);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
 	if (getenv("PGRAC_PRE2_TEST_START_NATIVE_IMAGES") != NULL) {
 		UT_PLAN(4);
@@ -2779,9 +2791,9 @@ int main(void)
 	}
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_FIRST
-	UT_PLAN(326);
+	UT_PLAN(331);
 #else
-	UT_PLAN(322);
+	UT_PLAN(327);
 #endif
 	UT_RUN(test_startup_native_images_accept_only_unchanged_complete_terminal_page);
 	UT_RUN(test_startup_native_images_reject_unresolved_ambiguous_and_mx_itls);
@@ -2792,8 +2804,13 @@ int main(void)
 	UT_RUN(test_startup_native_directory_real_origin_cannot_be_discharged_by_wait);
 	UT_RUN(test_startup_native_directory_invalid_layout_and_partial_error_keep_debt);
 #else
-	UT_PLAN(314);
+	UT_PLAN(319);
 #endif
+	UT_RUN(test_startup_tx_forest_covers_complete_native_records_and_empty_end);
+	UT_RUN(test_startup_tx_forest_nonroot_full_identity_requires_canonical_terminal);
+	UT_RUN(test_startup_tx_forest_incomplete_record_or_end_refuses_service);
+	UT_RUN(test_startup_tx_forest_late_current_and_error_keep_original_debt);
+	UT_RUN(test_startup_tx_forest_zero_page_still_checks_all_native_transactions);
 	UT_RUN(test_start_tx_references_preserve_exact_member_itl_free_tuple_and_end);
 	UT_RUN(test_start_tx_references_preconditions_do_not_enter);
 	UT_RUN(test_start_tx_references_late_owner_source_shape_and_pointer_are_sticky);
