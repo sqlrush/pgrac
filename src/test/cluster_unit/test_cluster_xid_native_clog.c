@@ -97,6 +97,72 @@ test_xid_native_clog_state(XidNativeClogState *out)
 	}
 }
 
+/* Replay the captured producer bytes, never a reconstructed expected record.
+ * Independent file reads observe bytes only; SYNC_HANDLER_NONE grants no
+ * fsync durability, FullXid era or recovery-completion authority. */
+void
+test_xid_native_clog_replay(XidNativeClogReplayFault fault,
+							  XidNativeClogReplayState *out)
+{
+	XLogReaderState reader = {0};
+	DecodedXLogRecord decoded = {0};
+	xl_clog_zeropage_full image = birth_wal.bytes;
+	PGAlignedBlock page;
+	char path[MAXPGPATH];
+	struct stat st;
+	int target = birth_wal.bytes.pageno;
+	int neighbor = target ^ 1;
+	int fd;
+	unsigned before_writes = writes, before_inserts = birth_wal.inserts;
+	volatile bool caught = false;
+
+	memset(out, 0, sizeof(*out));
+	if (target < 0 || target > 1)
+		return;
+	fixture_path(target, path);
+	out->file_existed = stat(path, &st) == 0;
+	out->io_ok = !out->file_existed && errno == ENOENT;
+	memset(page.data, 0xa5, BLCKSZ);
+	fixture_page(target, page.data);
+	memset(page.data, 0x5a, BLCKSZ);
+	fixture_page(neighbor, page.data);
+	reader.record = &decoded;
+	decoded.main_data = (char *)&image;
+	decoded.main_data_len = birth_wal.length;
+	decoded.max_block_id = -1;
+	decoded.header.xl_info = birth_wal.info;
+	decoded.header.xl_rmid = RM_CLOG_ID;
+	if (fault == XID_CLOG_REPLAY_RESERVED) image.reserved_zero = 1;
+	if (fault == XID_CLOG_REPLAY_PAGE) image.pageno = target + 1;
+	if (fault == XID_CLOG_REPLAY_SHORT) --decoded.main_data_len;
+	if (fault == XID_CLOG_REPLAY_BLOCKREF) decoded.max_block_id = 0;
+	expect_error = InRecovery = true;
+	PG_TRY(); {
+		clog_redo(&reader);
+	} PG_CATCH(); { caught = true; } PG_END_TRY();
+	expect_error = InRecovery = false;
+	out->caught = caught;
+	out->writes = writes - before_writes;
+	out->inserts = birth_wal.inserts - before_inserts;
+	fd = open(path, O_RDONLY);
+	if (fd < 0) { out->io_ok = false; return; }
+	if (fstat(fd, &st) != 0) out->io_ok = false;
+	else out->file_size = st.st_size;
+	if (pread(fd, page.data, BLCKSZ, (off_t)target * BLCKSZ) == BLCKSZ) {
+		out->target_zero = out->target_sentinel = true;
+		for (unsigned b = 0; b < BLCKSZ; ++b) {
+			out->target_zero &= (unsigned char)page.data[b] == 0;
+			out->target_sentinel &= (unsigned char)page.data[b] == 0xa5;
+		}
+	} else out->io_ok = false;
+	if (pread(fd, page.data, BLCKSZ, (off_t)neighbor * BLCKSZ) == BLCKSZ) {
+		out->neighbor_sentinel = true;
+		for (unsigned b = 0; b < BLCKSZ; ++b)
+			out->neighbor_sentinel &= (unsigned char)page.data[b] == 0x5a;
+	} else out->io_ok = false;
+	if (close(fd) != 0) out->io_ok = false;
+}
+
 void
 test_xid_native_clog_stop(void)
 {
