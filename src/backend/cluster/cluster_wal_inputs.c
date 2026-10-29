@@ -21,6 +21,7 @@
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_recovery_tt_record.h"
+#include "cluster/cluster_relmap_retention_census.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_side_online_plan.h"
 #include "cluster/cluster_startup_phase.h"
@@ -111,6 +112,11 @@ struct ClusterWalInputsV1 {
 	WalInputsPurpose purpose;
 	ClusterRecoveryTxIoScopeV1 tx;
 	ClusterRecoveryCtrcIoScopeV1 ctrc;
+	/* Local dependent custody, never another IR/WALR or recovery owner. The
+	 * fixed destructor is installed only by the dormant prepare below. */
+	ClusterRelmapRetentionCensus *relmap_census;
+	void (*relmap_census_destroy)(ClusterRelmapRetentionCensus *);
+	bool relmap_census_attempted;
 	uint16 thread_count;
 	uint16 threads[CLUSTER_WAL_RETENTION_MAX_THREADS];
 	uint32 count;
@@ -479,6 +485,15 @@ cluster_wal_inputs_release_v1(ClusterWalInputsV1 **inputs)
 		return;
 	if (!inputs_owned(*inputs))
 		elog(ERROR, "WAL input scope belongs to another resource owner");
+	/* The cursor borrows this scope's namespace fd and complete holder set.
+	 * Retire its local ROOT/directories before ANY original protection. */
+	if ((*inputs)->relmap_census != NULL) {
+		if ((*inputs)->relmap_census_destroy == NULL)
+			elog(FATAL, "WAL input census has no local custody destructor");
+		(*inputs)->relmap_census_destroy((*inputs)->relmap_census);
+		(*inputs)->relmap_census = NULL;
+		(*inputs)->relmap_census_destroy = NULL;
+	}
 	inputs_tx_serial_release(*inputs);
 	inputs_namespace_close(*inputs);
 	for (uint32 i = 0; i < CLUSTER_WAL_INPUTS_MAX; i++)
@@ -3288,6 +3303,64 @@ cluster_wal_inputs_relmap_source_fail_v1(const ClusterRecoveryRelmapSourceV1 *so
 		&& memcmp(&source->input_owner, &active_ctrc_retention.input_owner,
 			sizeof(source->input_owner)) == 0)
 		ClusterColdRecoveryRelmapFail(source->scope->ctrc.start);
+}
+
+/* One local dependent of the ORIGINAL simultaneous all-source scope. A
+ * failed/ERROR attempt is never retried and never releases its protections.
+ * DRAINED remains provisional input, not joint completion or native authority.
+ * Author: SqlRush <sqlrush@gmail.com> */
+bool
+cluster_wal_inputs_relmap_census_prepare_v1(ClusterWalInputsV1 *inputs,
+	size_t root_budget, size_t memory_budget, size_t payload_budget,
+	const ClusterRelmapRetentionCensus **out)
+{
+	ClusterRecoveryTxRetentionV1 original;
+	ClusterRecoveryRelmapSourceV1 source;
+	ClusterRelmapRetentionCensus *volatile fresh = NULL;
+	volatile bool accepted = false;
+
+	/* Locate before dereferencing a caller scope; refuse known borrowed
+	 * output aliases before touching either the output or the one-shot latch. */
+	if (inputs == NULL || inputs != active_ctrc_retention.scope || out == NULL
+		|| inputs_overlap(out, sizeof(*out), inputs, sizeof(*inputs))
+		|| inputs_overlap(out, sizeof(*out), inputs->ctrc.source_plan,
+			sizeof(*inputs->ctrc.source_plan))
+		|| inputs_overlap(out, sizeof(*out), inputs->ctrc.inputs, sizeof(*inputs->ctrc.inputs))
+		|| inputs_overlap(out, sizeof(*out), inputs->ctrc.work, sizeof(*inputs->ctrc.work))
+		|| *out != NULL || MyBackendType != B_STARTUP || CritSectionCount != 0
+		|| !inputs_owned(inputs) || inputs->purpose != WAL_INPUTS_CTRC_CENSUS
+		|| inputs->relmap_census_attempted
+		|| cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
+		return false;
+	original = active_ctrc_retention;
+	/* The first original current read can ERROR before a source is returned.
+	 * Capture its original locator and latch before that read, not after I/O. */
+	inputs->relmap_census_attempted = true;
+	PG_TRY();
+	{
+		source = cluster_wal_inputs_relmap_source_v1(inputs, 0);
+		if (source.scope != NULL
+			&& cluster_relmap_retention_census_execute_native_episode(&source,
+				root_budget, memory_budget, payload_budget,
+				(ClusterRelmapRetentionCensus **)&fresh)
+			&& fresh != NULL && cluster_wal_inputs_relmap_source_current_v1(&source)) {
+			inputs->relmap_census = fresh;
+			inputs->relmap_census_destroy = cluster_relmap_retention_census_destroy;
+			*out = fresh;
+			fresh = NULL;
+			accepted = true;
+		}
+	}
+	PG_FINALLY();
+	{
+		if (!accepted) {
+			cluster_relmap_retention_census_destroy(fresh);
+			if (inputs_ctrc_replays_scope_same(&original))
+				ClusterColdRecoveryRelmapFail(original.scope->ctrc.start);
+		}
+	}
+	PG_END_TRY();
+	return accepted;
 }
 
 bool

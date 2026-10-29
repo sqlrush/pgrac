@@ -12,6 +12,7 @@
 #include "access/xlog.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_recovery_merge.h"
+#include "cluster/cluster_recovery_wal_targets.h"
 #include "cluster/cluster_relmap_arb.h"
 #include "cluster/cluster_relmap_lock.h"
 #include "cluster/cluster_relmap_terminal_scan.h"
@@ -27,7 +28,13 @@ typedef struct CensusOrigin {
 	uint64 last_issued;
 } CensusOrigin;
 
+typedef struct CensusEpisode {
+	uint32 count;
+	ClusterRecoveryRelmapSourceV1 sources[FLEXIBLE_ARRAY_MEMBER];
+} CensusEpisode;
+
 struct ClusterRelmapRetentionCensus {
+	CensusEpisode *episode; /* same original all-source owner, never refreshed */
 	ClusterRecoveryRootSet *roots;
 	uint64 system_identifier;
 	uint64 database_incarnation;
@@ -59,7 +66,7 @@ struct ClusterRelmapRetentionCensus {
 	uint8 cold_observe_pins[32];
 	uint16 cold_observe_origin;
 	bool cold_observe_ready;
-	/* Borrowed construction owns its directory; restart also owns its ROOT.
+	/* Borrowed construction owns its directory/block; restart also owns its ROOT.
 	 * Full initial construction additionally owns its new tracked fd. */
 	ClusterRelmapRetentionDirectory *owned_directory;
 	bool owns_roots;
@@ -102,6 +109,8 @@ census_input_failed(ClusterRecoveryRootSet *roots,
 static ClusterRelmapCensusResult
 census_failed(ClusterRelmapRetentionCensus *census, ClusterRelmapCensusResult result)
 {
+	if (census->episode != NULL)
+		cluster_wal_inputs_relmap_source_fail_v1(&census->episode->sources[0]);
 	census->result = result;
 	census->rebuild_ready = false;
 	census->cold_observe_ready = false;
@@ -156,10 +165,13 @@ census_root_same(const ClusterRelmapRetentionCensus *census)
 }
 
 static bool census_initial_current(ClusterRelmapRetentionCensus *census);
+static bool census_episode_validate(ClusterRelmapRetentionCensus *census);
 
 static bool
 census_recovery_current(ClusterRelmapRetentionCensus *census)
 {
+	if (!census_episode_validate(census))
+		return false;
 	if (!census_initial_current(census) || !census_root_same(census))
 		return false;
 	for (size_t i = 0; i < census->origin_count; i++)
@@ -173,7 +185,9 @@ census_recovery_sources(const ClusterRelmapRetentionCensus *census, ClusterWalIn
 {
 	uint32 count;
 
-	if (inputs == NULL || cluster_wal_inputs_revalidate_v1(inputs) != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+	if (inputs == NULL
+		|| (census->episode != NULL && inputs != census->episode->sources[0].scope)
+		|| cluster_wal_inputs_revalidate_v1(inputs) != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return false;
 	count = cluster_wal_inputs_count_v1(inputs);
 	if (count == 0 || count > CLUSTER_WAL_INPUTS_MAX)
@@ -420,6 +434,57 @@ census_open_context(void)
 	return MyBackendType == B_STARTUP && RecoveryInProgress() && CritSectionCount == 0
 		   && cluster_shared_catalog && cluster_recovery_merge_claim_is_held()
 		   && cluster_relmap_authority_x_held();
+}
+
+/* The declared E1 participant belongs to the original post-native Startup
+ * episode, not the independent legacy cold merger. Original source-current
+ * checks below retain the complete simultaneous IR/WALR owner requirement. */
+static bool
+census_episode_context(void)
+{
+	return MyBackendType == B_STARTUP && !RecoveryInProgress() && CritSectionCount == 0
+		&& cluster_shared_catalog;
+}
+
+/* These original source checks do no physical ROOT I/O. Never invoke them
+ * from inside the native ROOT reader; the wrapper brackets each returned tick. */
+static bool
+census_episode_current(const ClusterRelmapRetentionCensus *census)
+{
+	const CensusEpisode *episode = census->episode;
+
+	if (episode == NULL)
+		return true;
+	if (!census_episode_context()
+		|| cluster_wal_inputs_relmap_count_v1(episode->sources[0].scope) != episode->count)
+		return false;
+	for (uint32 i = 0; i < episode->count; i++)
+		if (!cluster_wal_inputs_relmap_source_current_v1(&episode->sources[i]))
+			return false;
+	return census_episode_context()
+		&& cluster_wal_inputs_relmap_count_v1(episode->sources[0].scope) == episode->count;
+}
+
+/* Reuse paths outside the physical tick wrapper need the same sticky ERROR
+ * rule, including the very first owner check. No failure retires protections. */
+static bool
+census_episode_validate(ClusterRelmapRetentionCensus *census)
+{
+	volatile bool accepted = false;
+
+	if (census->episode == NULL)
+		return true;
+	PG_TRY();
+	{
+		accepted = census_episode_current(census);
+	}
+	PG_FINALLY();
+	{
+		if (!accepted)
+			census_failed(census, CLUSTER_RELMAP_CENSUS_CHANGED);
+	}
+	PG_END_TRY();
+	return accepted;
 }
 
 static bool
@@ -1401,6 +1466,500 @@ fail:
 	return census_input_failed(roots, directories, count, result);
 }
 
+ClusterRelmapCensusResult
+cluster_relmap_retention_census_begin_episode(
+	const ClusterRecoveryRelmapSourceV1 *source, ClusterRecoveryRootSet *roots,
+	ClusterRelmapRetentionDirectory *const directories[], size_t count,
+	size_t memory_budget, ClusterRelmapRetentionCensus **out)
+{
+	ClusterRecoveryRelmapSourceV1 original;
+	ClusterRelmapRetentionCensus *volatile fresh = NULL;
+	CensusEpisode *volatile episode = NULL;
+	volatile ClusterRelmapCensusResult result = CLUSTER_RELMAP_CENSUS_INVALID;
+	volatile bool accepted = false;
+
+	if (out == NULL || source == NULL
+		|| census_recovery_overlap(out, sizeof(*out), source, sizeof(*source))
+		|| census_recovery_overlap(out, sizeof(*out), roots, 1)
+		|| (directories != NULL && count <= CLUSTER_RELMAP_RETENTION_MAX_ORIGINS
+			&& census_recovery_overlap(out, sizeof(*out), directories,
+				count * sizeof(*directories))))
+		return result;
+	if (directories != NULL && count <= CLUSTER_RELMAP_RETENTION_MAX_ORIGINS)
+		for (size_t i = 0; i < count; i++)
+			if (census_recovery_overlap(out, sizeof(*out), directories[i], sizeof(*directories[i])))
+				return result;
+	if (*out != NULL || MyBackendType != B_STARTUP || CritSectionCount != 0)
+		return result;
+	memcpy(&original, source, sizeof(original));
+	PG_TRY();
+	{
+		do {
+			bool origins[CLUSTER_RELMAP_RETENTION_MAX_ORIGINS] = {false};
+			uint32 sources;
+			size_t bytes, origin_count = 0;
+			const ClusterControlRootIdentity *identity = &original.selected.source.claim.identity;
+
+			if (!census_episode_context()
+				|| !cluster_wal_inputs_relmap_source_current_v1(&original)
+				|| (sources = cluster_wal_inputs_relmap_count_v1(original.scope)) == 0
+				|| sources > CLUSTER_WAL_INPUTS_MAX || directories == NULL || count == 0
+				|| count > CLUSTER_RELMAP_RETENTION_MAX_ORIGINS)
+				break;
+			bytes = sizeof(*episode) + (size_t)sources * sizeof(episode->sources[0]);
+			if (memory_budget < bytes || memory_budget - bytes < sizeof(*fresh)) {
+				result = CLUSTER_RELMAP_CENSUS_CAPACITY;
+				break;
+			}
+			episode = calloc(1, bytes);
+			if (episode == NULL) {
+				result = CLUSTER_RELMAP_CENSUS_CAPACITY;
+				break;
+			}
+			episode->count = sources;
+			for (uint32 i = 0; i < sources; i++) {
+				ClusterRecoveryRelmapSourceV1 *saved = &episode->sources[i];
+				const ClusterControlRootIdentity *id;
+
+				*saved = cluster_wal_inputs_relmap_source_v1(original.scope, i);
+				id = &saved->selected.source.claim.identity;
+				if (!cluster_wal_inputs_relmap_source_current_v1(saved)
+					|| saved->scope != original.scope || saved->input_index != i
+					|| saved->input_count != sources || id->origin_node_id < 0
+					|| id->origin_node_id >= CLUSTER_RELMAP_RETENTION_MAX_ORIGINS
+					|| id->system_identifier != identity->system_identifier
+					|| saved->selected.source.claim.database_incarnation
+						!= original.selected.source.claim.database_incarnation
+					|| memcmp(id->storage_uuid, identity->storage_uuid, 16) != 0)
+					break;
+				if (!origins[id->origin_node_id]) {
+					origins[id->origin_node_id] = true;
+					origin_count++;
+				}
+				if (i + 1 == sources)
+					result = CLUSTER_RELMAP_CENSUS_MORE;
+			}
+			if (result != CLUSTER_RELMAP_CENSUS_MORE || count != origin_count)
+				break;
+			result = CLUSTER_RELMAP_CENSUS_INVALID;
+			for (size_t i = 0; i < count; i++) {
+				if (directories[i] == NULL
+					|| directories[i]->origin >= CLUSTER_RELMAP_RETENTION_MAX_ORIGINS
+					|| !origins[directories[i]->origin])
+					break;
+				/* Also rejects a duplicate directory instead of losing another origin. */
+				origins[directories[i]->origin] = false;
+				if (i + 1 == count)
+					result = CLUSTER_RELMAP_CENSUS_MORE;
+			}
+			if (result != CLUSTER_RELMAP_CENSUS_MORE)
+				break;
+			result = cluster_relmap_retention_census_begin(roots, identity->system_identifier,
+				original.selected.source.claim.database_incarnation, identity->storage_uuid,
+				directories, count, memory_budget - bytes,
+				(ClusterRelmapRetentionCensus **)&fresh);
+			if (result != CLUSTER_RELMAP_CENSUS_MORE)
+				break;
+			fresh->episode = (CensusEpisode *)episode;
+			episode = NULL;
+			if (!census_episode_current((ClusterRelmapRetentionCensus *)fresh)
+				|| !cluster_wal_inputs_relmap_source_current_v1(&original))
+				break;
+			*out = (ClusterRelmapRetentionCensus *)fresh;
+			fresh = NULL;
+			accepted = true;
+		} while (false);
+	}
+	PG_FINALLY();
+	{
+		if (!accepted) {
+			if (result <= CLUSTER_RELMAP_CENSUS_DRAINED)
+				result = CLUSTER_RELMAP_CENSUS_CHANGED;
+			census_input_failed(roots, directories, count, result);
+			cluster_wal_inputs_relmap_source_fail_v1(&original);
+		}
+		cluster_relmap_retention_census_destroy((ClusterRelmapRetentionCensus *)fresh);
+		free((CensusEpisode *)episode);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+/* The temporary source snapshot precedes all producer I/O. It is not a
+ * native authority carrier and is never refreshed after a checkpoint visit. */
+static bool
+census_native_episode_current(const CensusEpisode *saved)
+{
+	if (!census_episode_context() || saved->count == 0
+		|| cluster_wal_inputs_relmap_count_v1(saved->sources[0].scope) != saved->count)
+		return false;
+	for (uint32 i = 0; i < saved->count; i++)
+		if (!cluster_wal_inputs_relmap_source_current_v1(&saved->sources[i]))
+			return false;
+	return census_episode_context()
+		&& cluster_wal_inputs_relmap_count_v1(saved->sources[0].scope) == saved->count;
+}
+
+ClusterRelmapCensusResult
+cluster_relmap_retention_census_begin_native_episode(
+	const ClusterRecoveryRelmapSourceV1 *source, ClusterRecoveryRootSet *roots,
+	size_t memory_budget, ClusterRelmapRetentionCensus **out)
+{
+	ClusterRecoveryRelmapSourceV1 original;
+	ClusterRelmapRetentionCensus *volatile fresh = NULL;
+	ClusterRelmapRetentionDirectory *volatile directories = NULL;
+	CensusEpisode *volatile saved = NULL;
+	volatile ClusterRelmapCensusResult result = CLUSTER_RELMAP_CENSUS_INVALID;
+	volatile bool accepted = false;
+
+	if (out == NULL || source == NULL
+		|| census_recovery_overlap(out, sizeof(*out), source, sizeof(*source))
+		|| census_recovery_overlap(out, sizeof(*out), roots, 1)
+		|| *out != NULL || MyBackendType != B_STARTUP || CritSectionCount != 0)
+		return result;
+	memcpy(&original, source, sizeof(original));
+	PG_TRY();
+	{
+		do {
+			ClusterRelmapRetentionDirectory *pointers[CLUSTER_RELMAP_RETENTION_MAX_ORIGINS];
+			bool origins[CLUSTER_RELMAP_RETENTION_MAX_ORIGINS] = {false};
+			const ClusterControlRootIdentity *identity = &original.selected.source.claim.identity;
+			uint32 count;
+			size_t source_bytes, directory_bytes;
+			ClusterRecoveryRootsResult root_result;
+
+			if (!census_episode_context()
+				|| !cluster_wal_inputs_relmap_source_current_v1(&original)
+				|| (count = cluster_wal_inputs_relmap_count_v1(original.scope)) == 0
+				|| count > CLUSTER_WAL_INPUTS_MAX
+				|| count > CLUSTER_RELMAP_RETENTION_MAX_ORIGINS || original.work_generation == 0
+				|| original.replay_count != count)
+				break;
+			/* Bound the peak: directories, temporary saved sources, and the
+			 * original cursor's second saved set coexist until publication. */
+			source_bytes = sizeof(*saved) + (size_t)count * sizeof(saved->sources[0]);
+			directory_bytes = (size_t)count * sizeof(*directories);
+			if (memory_budget < directory_bytes + 2 * source_bytes + sizeof(*fresh)) {
+				result = CLUSTER_RELMAP_CENSUS_CAPACITY;
+				break;
+			}
+			saved = calloc(1, source_bytes);
+			directories = calloc(count, sizeof(*directories));
+			if (saved == NULL || directories == NULL) {
+				result = CLUSTER_RELMAP_CENSUS_CAPACITY;
+				break;
+			}
+			saved->count = count;
+			for (uint32 i = 0; i < count; i++) {
+				ClusterRecoveryRelmapSourceV1 *entry = &saved->sources[i];
+				const ClusterControlRootIdentity *id;
+
+				*entry = cluster_wal_inputs_relmap_source_v1(original.scope, i);
+				id = &entry->selected.source.claim.identity;
+				if (!cluster_wal_inputs_relmap_source_current_v1(entry)
+					|| entry->scope != original.scope || entry->input_index != i
+					|| entry->input_count != count || entry->replay_count != count
+					|| entry->work_generation != original.work_generation
+					|| entry->selected.kind != CLUSTER_WAL_INPUT_CHECKPOINT
+					|| id->origin_node_id < 0
+					|| id->origin_node_id >= CLUSTER_RELMAP_RETENTION_MAX_ORIGINS
+					|| origins[id->origin_node_id]
+					|| id->system_identifier != identity->system_identifier
+					|| entry->selected.source.claim.database_incarnation
+						!= original.selected.source.claim.database_incarnation
+					|| memcmp(id->storage_uuid, identity->storage_uuid, 16) != 0)
+					break;
+				origins[id->origin_node_id] = true;
+				if (i + 1 == count)
+					result = CLUSTER_RELMAP_CENSUS_MORE;
+			}
+			if (result != CLUSTER_RELMAP_CENSUS_MORE)
+				break;
+			result = CLUSTER_RELMAP_CENSUS_CHANGED;
+			for (uint32 i = 0; i < count; i++) {
+				ClusterRecoveryRelmapNativeInputV1 native;
+				const ClusterRelmapCheckpointWindow *window = &native.window;
+
+				if (!census_native_episode_current((CensusEpisode *)saved))
+					break;
+				native = cluster_wal_inputs_relmap_native_v1(original.scope, i);
+				if (!census_native_episode_current((CensusEpisode *)saved)
+					|| memcmp(&native.source, &saved->sources[i], sizeof(native.source)) != 0
+					|| window->system_identifier != identity->system_identifier
+					|| window->database_incarnation != original.selected.source.claim.database_incarnation
+					|| window->origin != saved->sources[i].selected.source.claim.identity.origin_node_id
+					|| window->native_floor > window->last_issued
+					|| window->last_issued > native.post_flush_issued
+					|| native.post_flush_issued - window->native_floor >= UINT64CONST(0x80000000)
+					|| cluster_relmap_retention_build_start(&directories[i], window->system_identifier,
+						window->database_incarnation, window->origin, original.work_generation,
+						window->native_floor, native.post_flush_issued) != CLUSTER_RELMAP_RETENTION_OK)
+					break;
+				pointers[i] = &directories[i];
+				if (i + 1 == count)
+					result = CLUSTER_RELMAP_CENSUS_MORE;
+			}
+			if (result != CLUSTER_RELMAP_CENSUS_MORE)
+				break;
+			result = cluster_relmap_retention_census_begin_episode(&original, roots, pointers, count,
+				memory_budget - source_bytes - directory_bytes,
+				(ClusterRelmapRetentionCensus **)&fresh);
+			if (result != CLUSTER_RELMAP_CENSUS_MORE)
+				break;
+			/* One contiguous block, freed by the original local destructor. */
+			fresh->owned_directory = (ClusterRelmapRetentionDirectory *)directories;
+			directories = NULL;
+			root_result = cluster_recovery_root_set_recheck_begin(roots);
+			while (root_result == CLUSTER_RECOVERY_ROOTS_MORE
+				|| root_result == CLUSTER_RECOVERY_ROOTS_ENTRY || root_result == CLUSTER_RECOVERY_ROOTS_BYTES) {
+				ClusterRecoveryRootsEvent event;
+				CHECK_FOR_INTERRUPTS();
+				root_result = cluster_recovery_root_set_step(roots, &event);
+			}
+			if (root_result != CLUSTER_RECOVERY_ROOTS_OBSERVED
+				|| !census_native_episode_current((CensusEpisode *)saved)
+				|| !census_recovery_current((ClusterRelmapRetentionCensus *)fresh))
+				break;
+			*out = (ClusterRelmapRetentionCensus *)fresh;
+			fresh = NULL;
+			accepted = true;
+		} while (false);
+	}
+	PG_FINALLY();
+	{
+		if (!accepted) {
+			if (result <= CLUSTER_RELMAP_CENSUS_DRAINED)
+				result = CLUSTER_RELMAP_CENSUS_CHANGED;
+			cluster_recovery_root_set_invalidate(roots);
+			cluster_wal_inputs_relmap_source_fail_v1(&original);
+		}
+		cluster_relmap_retention_census_destroy((ClusterRelmapRetentionCensus *)fresh);
+		free((ClusterRelmapRetentionDirectory *)directories);
+		free((CensusEpisode *)saved);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+typedef struct CensusNativeRoot {
+	CensusEpisode *saved;
+	ClusterRecoveryRootSet *roots;
+	size_t payload_budget;
+	uint32 source_index, completed;
+	uint64 records, source_records;
+	bool active;
+	bool seen[CLUSTER_RELMAP_RETENTION_MAX_ORIGINS];
+	RfContributorStreamCutV1 cut;
+} CensusNativeRoot;
+
+static bool
+census_native_root_source_same(const ClusterWalSourceRef *left, const ClusterWalSourceRef *right)
+{
+	/* Compare the complete fixed claim, excluding source's trailing padding. */
+	return left->timeline == right->timeline
+		&& memcmp(&left->claim, &right->claim, sizeof(left->claim)) == 0;
+}
+
+static RfPageProofDetailV1
+census_native_root_source(const ClusterWalSourceRef *source, const RfContributorStreamCutV1 *cut,
+	const ClusterWalTailObservation *completed, void *arg)
+{
+	CensusNativeRoot *work = arg;
+	uint32 index;
+
+	if (source == NULL || cut == NULL || !census_native_episode_current(work->saved)
+		|| cut->flags != RF_CONTRIBUTOR_CUT_COMPLETE
+		|| cut->failed_thread != source->claim.identity.origin_thread_id
+		|| cut->timeline_id != source->timeline
+		|| cut->origin_owner_incarnation != source->claim.identity.origin_owner_incarnation
+		|| cut->scan_begin_inclusive == InvalidXLogRecPtr
+		|| cut->scan_end_exclusive <= cut->scan_begin_inclusive)
+		return RF_PAGE_PROOF_DETAIL_SOURCE_GAP;
+	if (completed == NULL) {
+		if (work->active)
+			return RF_PAGE_PROOF_DETAIL_SOURCE_GAP;
+		/* The original cold census sorts full sources independently of
+		 * selected-input order. Match the complete generation, never ordinal. */
+		for (index = 0; index < work->saved->count; index++)
+			if (census_native_root_source_same(source, &work->saved->sources[index].selected.source))
+				break;
+		if (index == work->saved->count || work->seen[index])
+			return RF_PAGE_PROOF_DETAIL_SOURCE_GAP;
+		work->source_index = index;
+		work->cut = *cut;
+		work->source_records = 0;
+		work->active = true;
+	} else {
+		if (!work->active || completed->records != work->source_records
+			|| !census_native_root_source_same(source,
+				&work->saved->sources[work->source_index].selected.source)
+			|| memcmp(cut, &work->cut, sizeof(*cut)) != 0)
+			return RF_PAGE_PROOF_DETAIL_SOURCE_GAP;
+		work->seen[work->source_index] = true;
+		work->completed++;
+		work->active = false;
+	}
+	return RF_PAGE_PROOF_DETAIL_OK;
+}
+
+static RfPageProofDetailV1
+census_native_root_record(XLogReaderState *reader, const ClusterWalSourceRef *source,
+	const RfContributorStreamCutV1 *cut, void *arg)
+{
+	CensusNativeRoot *work = arg;
+	ClusterRecoveryWalTargetsDiag diag;
+
+	if (!work->active || source == NULL || cut == NULL
+		|| work->records == UINT64_MAX || work->source_records == UINT64_MAX
+		|| !census_native_episode_current(work->saved)
+		|| !census_native_root_source_same(source,
+			&work->saved->sources[work->source_index].selected.source)
+		|| memcmp(cut, &work->cut, sizeof(*cut)) != 0
+		|| !cluster_recovery_wal_targets_collect(work->roots, reader, source, cut,
+			work->payload_budget, &diag)
+		|| !census_native_episode_current(work->saved))
+		return RF_PAGE_PROOF_DETAIL_SOURCE_GAP;
+	work->records++;
+	work->source_records++;
+	return RF_PAGE_PROOF_DETAIL_OK;
+}
+
+ClusterRelmapCensusResult
+cluster_relmap_retention_census_open_native_episode(
+	const ClusterRecoveryRelmapSourceV1 *source, size_t root_budget,
+	size_t memory_budget, size_t payload_budget, ClusterRelmapRetentionCensus **out)
+{
+	ClusterRecoveryRelmapSourceV1 original;
+	ClusterRecoveryRootSet *volatile roots = NULL;
+	ClusterRelmapRetentionCensus *volatile fresh = NULL;
+	CensusEpisode *volatile saved = NULL;
+	volatile ClusterRelmapCensusResult result = CLUSTER_RELMAP_CENSUS_INVALID;
+	volatile bool accepted = false;
+
+	if (out == NULL || source == NULL
+		|| census_recovery_overlap(out, sizeof(*out), source, sizeof(*source))
+		|| *out != NULL || MyBackendType != B_STARTUP || CritSectionCount != 0)
+		return result;
+	memcpy(&original, source, sizeof(original));
+	PG_TRY();
+	{
+		do {
+			CensusNativeRoot work = {0};
+			bool origins[CLUSTER_RELMAP_RETENTION_MAX_ORIGINS] = {false};
+			const ClusterControlRootIdentity *identity = &original.selected.source.claim.identity;
+			ClusterRecoveryRootsResult root_result;
+			RfPageProofDetailV1 detail;
+			uint64 records = 0;
+			uint32 count;
+			size_t bytes;
+			int fd = -1, current_fd = -1;
+
+			if (!census_episode_context() || root_budget == 0 || payload_budget == 0
+				|| !cluster_wal_inputs_relmap_source_current_v1(&original)
+				|| (count = cluster_wal_inputs_relmap_count_v1(original.scope)) == 0
+				|| count > CLUSTER_WAL_INPUTS_MAX || count > CLUSTER_RELMAP_RETENTION_MAX_ORIGINS
+				|| original.work_generation == 0 || original.replay_count != count)
+				break;
+			bytes = sizeof(*saved) + (size_t)count * sizeof(saved->sources[0]);
+			/* This saved set coexists with both snapshots/directories in the
+			 * original native-input factory. ROOT/payload have separate budgets. */
+			if (memory_budget < 3 * bytes + (size_t)count * sizeof(ClusterRelmapRetentionDirectory)
+				+ sizeof(*fresh) || (saved = calloc(1, bytes)) == NULL) {
+				result = CLUSTER_RELMAP_CENSUS_CAPACITY;
+				break;
+			}
+			saved->count = count;
+			for (uint32 i = 0; i < count; i++) {
+				ClusterRecoveryRelmapSourceV1 *entry = &saved->sources[i];
+				const ClusterControlRootIdentity *id;
+
+				*entry = cluster_wal_inputs_relmap_source_v1(original.scope, i);
+				id = &entry->selected.source.claim.identity;
+				if (!cluster_wal_inputs_relmap_source_current_v1(entry)
+					|| entry->scope != original.scope || entry->input_index != i
+					|| entry->input_count != count || entry->replay_count != count
+					|| entry->work_generation != original.work_generation
+					|| entry->selected.kind != CLUSTER_WAL_INPUT_CHECKPOINT
+					|| id->origin_node_id < 0 || id->origin_node_id >= lengthof(origins)
+					|| origins[id->origin_node_id]
+					|| id->system_identifier != identity->system_identifier
+					|| entry->selected.source.claim.database_incarnation
+						!= original.selected.source.claim.database_incarnation
+					|| memcmp(id->storage_uuid, identity->storage_uuid, 16) != 0)
+					break;
+				origins[id->origin_node_id] = true;
+				if (i + 1 == count) result = CLUSTER_RELMAP_CENSUS_MORE;
+			}
+			if (result != CLUSTER_RELMAP_CENSUS_MORE)
+				break;
+			result = CLUSTER_RELMAP_CENSUS_UNAVAILABLE;
+			if (!census_native_episode_current((CensusEpisode *)saved)
+				|| cluster_wal_inputs_ctrc_namespace_v1(original.scope, &fd)
+					!= CLUSTER_CONTROL_ROOT_OK_PRIMARY || fd < 0
+				|| !census_native_episode_current((CensusEpisode *)saved))
+				break;
+			root_result = cluster_recovery_root_set_begin(fd, identity->system_identifier,
+				original.selected.source.claim.database_incarnation, identity->storage_uuid,
+				root_budget, (ClusterRecoveryRootSet **)&roots);
+			if (root_result != CLUSTER_RECOVERY_ROOTS_MORE) {
+				if (root_result == CLUSTER_RECOVERY_ROOTS_CAPACITY) result = CLUSTER_RELMAP_CENSUS_CAPACITY;
+				break;
+			}
+			work.saved = (CensusEpisode *)saved;
+			work.roots = (ClusterRecoveryRootSet *)roots;
+			work.payload_budget = payload_budget;
+			if (cluster_wal_inputs_cold_census_v1(original.scope, census_native_root_record,
+				census_native_root_source, &work, &records, &detail) != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+				|| work.active || work.completed != count || work.records != records
+				|| !census_native_episode_current((CensusEpisode *)saved))
+				break;
+			/* Preserve ALL retained targets before original physical discovery,
+			 * including missing targets. Non-file/other effects stay owner duties. */
+			do {
+				ClusterRecoveryRootsEvent event;
+				CHECK_FOR_INTERRUPTS();
+				if (!census_native_episode_current((CensusEpisode *)saved)) break;
+				root_result = cluster_recovery_root_set_step((ClusterRecoveryRootSet *)roots, &event);
+				if (!census_native_episode_current((CensusEpisode *)saved)) break;
+			} while (root_result == CLUSTER_RECOVERY_ROOTS_MORE
+				|| root_result == CLUSTER_RECOVERY_ROOTS_ENTRY || root_result == CLUSTER_RECOVERY_ROOTS_BYTES);
+			if (root_result != CLUSTER_RECOVERY_ROOTS_OBSERVED
+				|| !census_native_episode_current((CensusEpisode *)saved))
+				break;
+			result = cluster_relmap_retention_census_begin_native_episode(&original,
+				(ClusterRecoveryRootSet *)roots, memory_budget - bytes,
+				(ClusterRelmapRetentionCensus **)&fresh);
+			if (result != CLUSTER_RELMAP_CENSUS_MORE)
+				break;
+			fresh->owns_roots = true;
+			roots = NULL;
+			/* Scope alone owns/closes fd. Compare its SAME original namespace
+			 * after all producer I/O; never replace or adopt the descriptor. */
+			if (cluster_wal_inputs_ctrc_namespace_v1(original.scope, &current_fd)
+					!= CLUSTER_CONTROL_ROOT_OK_PRIMARY || current_fd != fd
+				|| !census_native_episode_current((CensusEpisode *)saved)
+				|| !census_recovery_current((ClusterRelmapRetentionCensus *)fresh))
+				break;
+			*out = (ClusterRelmapRetentionCensus *)fresh;
+			fresh = NULL;
+			accepted = true;
+		} while (false);
+	}
+	PG_FINALLY();
+	{
+		if (!accepted) {
+			if (result <= CLUSTER_RELMAP_CENSUS_DRAINED) result = CLUSTER_RELMAP_CENSUS_CHANGED;
+			cluster_recovery_root_set_invalidate((ClusterRecoveryRootSet *)roots);
+			cluster_wal_inputs_relmap_source_fail_v1(&original);
+		}
+		cluster_relmap_retention_census_destroy((ClusterRelmapRetentionCensus *)fresh);
+		cluster_recovery_root_set_destroy((ClusterRecoveryRootSet *)roots);
+		free((CensusEpisode *)saved);
+	}
+	PG_END_TRY();
+	return result;
+}
+
 /* Reuse the original canonical classifier for global and direct base/db
  * directories. This does not declare other D1 file obligations explained. */
 static bool
@@ -1468,8 +2027,8 @@ census_namespace_finish(ClusterRelmapRetentionCensus *census, ClusterRelmapCensu
 	return CLUSTER_RELMAP_CENSUS_MORE;
 }
 
-ClusterRelmapCensusResult
-cluster_relmap_retention_census_next_committed(ClusterRelmapRetentionCensus *census,
+static ClusterRelmapCensusResult
+census_next_committed(ClusterRelmapRetentionCensus *census,
 	ClusterRelmapCensusCommitted *out)
 {
 	const ClusterRecoveryRootEntry *entry;
@@ -1580,6 +2139,36 @@ cluster_relmap_retention_census_next_committed(ClusterRelmapRetentionCensus *cen
 }
 
 ClusterRelmapCensusResult
+cluster_relmap_retention_census_next_committed(ClusterRelmapRetentionCensus *census,
+	ClusterRelmapCensusCommitted *out)
+{
+	ClusterRelmapCensusResult result;
+
+	if (census == NULL || census->episode == NULL
+		|| census->result > CLUSTER_RELMAP_CENSUS_DRAINED)
+		return census_next_committed(census, out);
+	PG_TRY();
+	{
+		result = census_episode_current(census)
+			? census_next_committed(census, out)
+			: census_failed(census, CLUSTER_RELMAP_CENSUS_CHANGED);
+		if (result <= CLUSTER_RELMAP_CENSUS_DRAINED && !census_episode_current(census))
+			result = census_failed(census, CLUSTER_RELMAP_CENSUS_CHANGED);
+	}
+	PG_CATCH();
+	{
+		census_failed(census, CLUSTER_RELMAP_CENSUS_CHANGED);
+		if (out != NULL)
+			memset(out, 0, sizeof(*out));
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (result > CLUSTER_RELMAP_CENSUS_DRAINED && out != NULL)
+		memset(out, 0, sizeof(*out));
+	return result;
+}
+
+ClusterRelmapCensusResult
 cluster_relmap_retention_census_next(ClusterRelmapRetentionCensus *census)
 {
 	return cluster_relmap_retention_census_next_committed(census, NULL);
@@ -1594,7 +2183,7 @@ census_rebuild_ready(ClusterRelmapRetentionCensus *census)
 		return CLUSTER_RELMAP_PENDING_NOT_READY;
 	/* No I/O: the whole physical ROOT recheck is still required before adopting
 	 * any copied set. Recheck all borrowed qualifications between the two calls. */
-	if (!census_root_same(census)) {
+	if (!census_episode_validate(census) || !census_root_same(census)) {
 		census_failed(census, CLUSTER_RELMAP_CENSUS_CHANGED);
 		return CLUSTER_RELMAP_PENDING_NOT_READY;
 	}
@@ -1785,6 +2374,50 @@ census_execute_pending(const ClusterRelmapRetentionCensus *census)
 }
 
 bool
+cluster_relmap_retention_census_execute_native_episode(
+	const ClusterRecoveryRelmapSourceV1 *source, size_t root_budget,
+	size_t memory_budget, size_t payload_budget, ClusterRelmapRetentionCensus **out)
+{
+	ClusterRecoveryRelmapSourceV1 original;
+	ClusterRelmapRetentionCensus *volatile fresh = NULL;
+	volatile bool accepted = false;
+
+	if (out == NULL || source == NULL
+		|| census_recovery_overlap(out, sizeof(*out), source, sizeof(*source))
+		|| *out != NULL || MyBackendType != B_STARTUP || CritSectionCount != 0)
+		return false;
+	memcpy(&original, source, sizeof(original));
+	PG_TRY();
+	{
+		if (cluster_relmap_retention_census_open_native_episode(&original, root_budget,
+			memory_budget, payload_budget, (ClusterRelmapRetentionCensus **)&fresh)
+				== CLUSTER_RELMAP_CENSUS_MORE
+			&& census_execute_drain((ClusterRelmapRetentionCensus *)fresh)
+			&& !census_execute_pending((ClusterRelmapRetentionCensus *)fresh)
+			&& census_recovery_current((ClusterRelmapRetentionCensus *)fresh)) {
+			/* Only a complete clean local observation crosses this boundary.
+			 * Pending arbitration and joint completion retain their owners. */
+			*out = (ClusterRelmapRetentionCensus *)fresh;
+			fresh = NULL;
+			accepted = true;
+		}
+	}
+	PG_FINALLY();
+	{
+		if (!accepted) {
+			if (fresh != NULL)
+				census_failed((ClusterRelmapRetentionCensus *)fresh,
+					CLUSTER_RELMAP_CENSUS_UNAVAILABLE);
+			else
+				cluster_wal_inputs_relmap_source_fail_v1(&original);
+		}
+		cluster_relmap_retention_census_destroy((ClusterRelmapRetentionCensus *)fresh);
+	}
+	PG_END_TRY();
+	return accepted;
+}
+
+bool
 cluster_relmap_retention_census_committed_cold(ClusterRelmapRetentionCensus *census, Oid dbid,
 											   ClusterRelmapCensusCommitted *out)
 {
@@ -1921,6 +2554,7 @@ cluster_relmap_retention_census_destroy(ClusterRelmapRetentionCensus *census)
 				(void)CloseTransientFile(census->owned_root_fd);
 			free(census->owned_directory);
 		}
+		free(census->episode);
 		free(census);
 		census = parent;
 	}

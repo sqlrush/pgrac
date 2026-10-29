@@ -533,6 +533,7 @@ TESTS += test_cluster_recovery_relation_scan
 TESTS += test_cluster_recovery_native_scan
 TESTS += test_cluster_recovery_native_roots
 TESTS += test_cluster_recovery_native_inputs
+TESTS += test_cluster_recovery_scope_native_census
 TESTS += test_cluster_recovery_wal_targets
 TESTS += test_cluster_recovery_slru_scan
 TESTS += test_cluster_recovery_relmap_scan
@@ -547,6 +548,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_recovery_relation_scan,$(SIMPLE_TESTS)
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_native_scan,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_native_roots,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_native_inputs,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_recovery_scope_native_census,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_slru_scan test_cluster_recovery_relmap_scan test_cluster_recovery_wal_targets,$(SIMPLE_TESTS))
 CLUSTER_BLOCK_APPLY_O = $(top_builddir)/src/backend/cluster/cluster_block_apply.o \
 		test_cluster_block_apply_btree_product.o
@@ -677,6 +679,10 @@ test_cluster_relmap_physical_pair.o: test_cluster_relmap_physical_pair.c \
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_relmap_retention_census: test_cluster_relmap_retention_census.c \
+		test_cluster_relmap_census_native_root.inc \
+		test_cluster_relmap_census_native_execute.inc \
+		test_cluster_relmap_census_native_episode.inc \
+		test_cluster_relmap_census_episode.inc \
 		test_cluster_relmap_census_recovery.inc \
 		test_cluster_relmap_census_batch.inc \
 		test_cluster_relmap_census_all_pins.inc \
@@ -704,13 +710,13 @@ test_cluster_relmap_retention_census: test_cluster_relmap_retention_census.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_root_set.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_namespace.h \
 		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
-		test_cluster_relmap_retention_census_product.o \
+		test_cluster_relmap_retention_census_product.o test_cluster_relmap_v2_codec_product.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_pending.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_CRYPTOHASH_O) cluster_unit_port_stubs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		test_cluster_relmap_retention_census_product.o \
+		test_cluster_relmap_retention_census_product.o test_cluster_relmap_v2_codec_product.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_pending.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o $(LDFLAGS) $(CLUSTER_UNIT_CRYPTOHASH_O) \
@@ -718,7 +724,7 @@ test_cluster_relmap_retention_census: test_cluster_relmap_retention_census.c \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 # Keep the original census-only fixture independent of the unused SIDE join.
-test_cluster_relmap_retention_census_product.o: $(top_srcdir)/src/backend/cluster/cluster_relmap_retention_census.c \
+test_cluster_relmap_retention_census_product.o test_cluster_recovery_scope_native_census_product.o: $(top_srcdir)/src/backend/cluster/cluster_relmap_retention_census.c \
 		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h \
 		$(top_srcdir)/src/include/cluster/cluster_guc.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_merge.h \
@@ -736,7 +742,8 @@ test_cluster_relmap_retention_census_product.o: $(top_srcdir)/src/backend/cluste
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_restore.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_root_set.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_namespace.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
+		$(if $(filter test_cluster_recovery_scope_native_census_product.o,$@),-Dcluster_relmap_retention_census_destroy=scope_native_census_destroy) -c $< -o $@
 
 test_cluster_relmap_census_side: test_cluster_relmap_retention_census.c \
 		test_cluster_relmap_census_recovery.inc \
@@ -4767,8 +4774,8 @@ RECOVERY_CENSUS_TEST_OBJS = \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_relmap_scan.o \
 		$(top_builddir)/src/backend/cluster/cluster_cr_apply.o
 
-test_cluster_recovery_native_inputs: $(top_srcdir)/src/include/access/twophase_rmgr.h
-test_cluster_recovery_native_inputs: $(top_srcdir)/src/backend/cluster/cluster_recovery_census.c \
+test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: $(top_srcdir)/src/include/access/twophase_rmgr.h
+test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: $(top_srcdir)/src/backend/cluster/cluster_recovery_census.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_census.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_page_roots.h
 test_cluster_recovery_episode_side_owner.o: test_cluster_recovery_episode_side_owner.c \
@@ -4810,26 +4817,29 @@ test_cluster_recovery_episode_clog.o: test_cluster_recovery_episode_clog.c \
         $(top_builddir)/src/include/pg_config.h Makefile
 	$(CC) $(CFLAGS) $(CPPFLAGS) -Werror -c $< -o $@
 
-test_cluster_recovery_native_inputs: test_cluster_recovery_episode_native_clog.inc \
+test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: test_cluster_recovery_episode_native_clog.inc \
         test_cluster_recovery_episode_clog.h test_cluster_recovery_episode_clog.o
-test_cluster_recovery_native_inputs: test_cluster_recovery_clog_full_roots.inc \
+test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: test_cluster_recovery_clog_full_roots.inc \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_root_set.h
-test_cluster_recovery_native_inputs: test_cluster_recovery_episode_history.inc \
+test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: test_cluster_recovery_scope_census.inc \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_census.h
+test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: test_cluster_recovery_episode_history.inc \
 		test_cluster_recovery_relmap_fold.inc test_cluster_recovery_episode_pending.inc \
 		test_cluster_recovery_episode_base.inc test_cluster_recovery_episode_sources.inc test_cluster_recovery_episode_pages.inc \
 		$(top_srcdir)/src/include/access/clog.h \
 		$(top_srcdir)/src/include/common/cluster_relmap_v2.h
-test_cluster_recovery_native_inputs: test_cluster_recovery_manifest_inputs.inc test_cluster_recovery_terminal_inputs.inc test_cluster_recovery_tt_terminal_inputs.inc test_cluster_recovery_page_roots_inputs.inc test_cluster_recovery_page_wal_inputs.inc
-test_cluster_recovery_native_inputs: test_cluster_recovery_wal_sources.inc
-test_cluster_recovery_native_inputs: test_cluster_recovery_episode_terminal.inc
-test_cluster_recovery_native_inputs: test_cluster_recovery_episode_generation_xid.inc
-test_cluster_recovery_native_inputs: test_cluster_recovery_episode_clog_history.inc \
+test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: test_cluster_recovery_manifest_inputs.inc test_cluster_recovery_terminal_inputs.inc test_cluster_recovery_tt_terminal_inputs.inc test_cluster_recovery_page_roots_inputs.inc test_cluster_recovery_page_wal_inputs.inc
+test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: test_cluster_recovery_wal_sources.inc
+test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: test_cluster_recovery_episode_terminal.inc
+test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: test_cluster_recovery_episode_generation_xid.inc
+test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: test_cluster_recovery_episode_clog_history.inc \
 		test_cluster_recovery_episode_clog_birth.inc \
 		test_cluster_recovery_episode_birth_match.inc \
 		test_cluster_recovery_episode_birth_terminal.inc test_cluster_recovery_episode_clog_side.inc \
 		test_cluster_recovery_episode_birth_halfspace.inc
 # Redirect one observation leaf only for this program; sibling providers stay original.
 test_cluster_recovery_consumed_inputs.o: $(top_srcdir)/src/backend/cluster/cluster_wal_inputs.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_census.h \
 		$(top_srcdir)/src/include/cluster/cluster_wal_retention.h \
 		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_plan.h \
@@ -4844,19 +4854,19 @@ test_cluster_recovery_consumed_inputs.o: $(top_srcdir)/src/backend/cluster/clust
 		-Dcluster_wal_claim_v2_read=test_wal_inputs_claim_read \
 		-Drf_side_online_plan_clog_applied_v1=test_episode_consumed_cold_applied -c $< -o $@
 
-test_cluster_recovery_native_inputs: test_cluster_recovery_consumed_inputs.o test_cluster_recovery_episode_consumed_pages.inc
-test_cluster_recovery_native_inputs: test_cluster_recovery_episode_page_history.inc
-test_cluster_recovery_native_inputs: test_cluster_recovery_episode_page_sources.inc
-test_cluster_recovery_native_inputs: test_cluster_recovery_consumed_native_redo.inc
-test_cluster_recovery_native_inputs: test_cluster_recovery_episode_all_clog.inc test_cluster_recovery_episode_native_pages.inc
-test_cluster_recovery_native_inputs: test_cluster_recovery_episode_applied_pages.inc \
+test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: test_cluster_recovery_consumed_inputs.o test_cluster_recovery_episode_consumed_pages.inc
+test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: test_cluster_recovery_episode_page_history.inc
+test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: test_cluster_recovery_episode_page_sources.inc
+test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: test_cluster_recovery_consumed_native_redo.inc
+test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: test_cluster_recovery_episode_all_clog.inc test_cluster_recovery_episode_native_pages.inc
+test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: test_cluster_recovery_episode_applied_pages.inc \
         test_cluster_recovery_episode_applied_owner.inc test_cluster_recovery_episode_side_owner.h \
         test_cluster_recovery_episode_side_owner.o
-test_cluster_recovery_native_inputs: test_cluster_recovery_episode_xid.inc \
+test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: test_cluster_recovery_episode_xid.inc \
 		test_cluster_cold_recovery_decode_core.o test_cluster_cold_recovery_xid_core.o
-test_cluster_recovery_native_inputs: test_cluster_recovery_page_graph.inc
-test_cluster_recovery_native_inputs: $(RECOVERY_CENSUS_TEST_OBJS) test_cluster_recovery_prepare_fixture.h test_cluster_recovery_prepare_inputs.inc
-test_cluster_recovery_native_inputs: test_cluster_recovery_xact_join_inputs.inc test_cluster_recovery_relmap_physical_inputs.inc test_cluster_recovery_relmap_inputs.inc test_cluster_recovery_relmap_fixture.h
+test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: test_cluster_recovery_page_graph.inc
+test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: $(RECOVERY_CENSUS_TEST_OBJS) test_cluster_recovery_prepare_fixture.h test_cluster_recovery_prepare_inputs.inc
+test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: test_cluster_recovery_xact_join_inputs.inc test_cluster_recovery_relmap_physical_inputs.inc test_cluster_recovery_relmap_inputs.inc test_cluster_recovery_relmap_fixture.h
 
 # The prefix/base composition consumes both public native-owner declarations.
 $(top_builddir)/src/backend/cluster/cluster_relmap_terminal_scan.o: \
@@ -4985,9 +4995,20 @@ test_cluster_relmap_retained_owner.o: $(top_srcdir)/src/backend/cluster/cluster_
 		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
-test_cluster_recovery_native_inputs: test_cluster_recovery_relmap_fold.inc test_cluster_recovery_relmap_history.inc
 
-test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_relmap_retained_wal test_cluster_ctrc_native_fpi: %: %.c test_cluster_control_root.c unit_test.h wal_test_fixture.h test_cluster_control_root_worker.inc test_cluster_control_root_serving.inc test_cluster_control_recovered_owner.inc test_cluster_control_recovered_founder.inc test_cluster_control_recovered_history.inc \
+# Link the original episode owner to the real census; observe its final destructor.
+test_cluster_recovery_scope_native_census: test_cluster_recovery_native_inputs.c \
+		test_cluster_recovery_scope_native_census.inc Makefile \
+		test_cluster_recovery_scope_native_census_product.o \
+		test_cluster_relmap_v2_codec_product.o \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_pending.o \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o
+
+test_cluster_recovery_scope_native_census_product.o: Makefile $(top_builddir)/src/include/pg_config.h
+
+test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: test_cluster_recovery_relmap_fold.inc test_cluster_recovery_relmap_history.inc
+
+test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census test_cluster_relmap_retained_wal test_cluster_ctrc_native_fpi: %: %.c test_cluster_control_root.c unit_test.h wal_test_fixture.h test_cluster_control_root_worker.inc test_cluster_control_root_serving.inc test_cluster_control_recovered_owner.inc test_cluster_control_recovered_founder.inc test_cluster_control_recovered_history.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_census.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_census.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_native_inventory.c \
@@ -5024,6 +5045,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_relma
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o xlogreader_fs.o \
 		$(top_srcdir)/src/include/cluster/cluster_wal_tail.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
+		$(if $(filter test_cluster_recovery_scope_native_census,$@),test_cluster_recovery_scope_native_census_product.o test_cluster_relmap_v2_codec_product.o $(top_builddir)/src/backend/cluster/cluster_relmap_pending.o $(top_builddir)/src/backend/cluster/cluster_relmap_retention.o) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_retained_owner.o) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_cold_checkpoint_publisher.o) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_native_owner.o) \
@@ -5038,12 +5060,12 @@ test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_relma
 		$(top_builddir)/src/backend/cluster/cluster_recovery_native_scan.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_multixact_join.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_xact_join.o \
-		$(if $(filter test_cluster_recovery_native_inputs,$@),test_cluster_recovery_episode_clog.o test_cluster_recovery_episode_side_owner.o $(CLUSTER_COLD_DECODE_O) test_cluster_cold_recovery_xid_core.o $(top_builddir)/src/backend/cluster/cluster_recovery_reference_graph.o $(top_builddir)/src/backend/cluster/cluster_recovery_undo_store.o $(top_builddir)/src/backend/cluster/cluster_recovery_undo_scan.o $(RECOVERY_CENSUS_TEST_OBJS)) \
+		$(if $(filter test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census,$@),test_cluster_recovery_episode_clog.o test_cluster_recovery_episode_side_owner.o $(CLUSTER_COLD_DECODE_O) test_cluster_cold_recovery_xid_core.o $(top_builddir)/src/backend/cluster/cluster_recovery_reference_graph.o $(top_builddir)/src/backend/cluster/cluster_recovery_undo_store.o $(top_builddir)/src/backend/cluster/cluster_recovery_undo_scan.o $(RECOVERY_CENSUS_TEST_OBJS)) \
 		$(top_builddir)/src/backend/cluster/cluster_thread_recovery_finalize.o \
 		$(WAL_INPUT_CONTRIBUTION_TEST_OBJS) \
 		test_cluster_page_stable_ctrc.o \
 		cluster_page_authority_ctrc_test.o $(if $(filter test_cluster_ctrc_native_fpi,$@),$(CTRC_NATIVE_FPI_TEST_OBJS),cluster_page_install_ctrc_test.o) $(CLUSTER_PAGE_GUARD_O) \
-		$(if $(filter test_cluster_recovery_native_inputs,$@),test_cluster_recovery_consumed_inputs.o,test_cluster_wal_inputs_product.o) \
+		$(if $(filter test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census,$@),test_cluster_recovery_consumed_inputs.o,test_cluster_wal_inputs_product.o) \
 		$(top_builddir)/src/backend/cluster/cluster_wal_history.o \
 		$(top_builddir)/src/backend/cluster/cluster_control_bootstrap.o \
 		cluster_control_bootstrap_read_test.o \
@@ -6629,7 +6651,7 @@ check_r11_source_removal_census:
 # Standard PG targets
 # ----------
 clean distclean maintainer-clean:
-	rm -f test_cluster_recovery_episode_clog.o test_cluster_recovery_episode_side_owner.o test_cluster_recovery_consumed_inputs.o
+	rm -f test_cluster_recovery_episode_clog.o test_cluster_recovery_episode_side_owner.o test_cluster_recovery_consumed_inputs.o test_cluster_recovery_scope_native_census_product.o
 	rm -f test_cluster_side_native_clog.o
 	rm -f test_cluster_external_fence_duty.inc
 	rm -f test_cluster_resolver_cache_caller.inc test_cluster_resolver_cache_caller.inc.tmp
@@ -13984,7 +14006,7 @@ test_cluster_first_fill_reply.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs
 
 # Original Startup PAGE graph preparation and complete census wrapper.
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_page_plan.inc
-test_cluster_recovery_native_inputs: test_cluster_recovery_census_page_plan.inc
+test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: test_cluster_recovery_census_page_plan.inc
 
 # Original Startup full-generation PAGE source binding.
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_page_sources.inc

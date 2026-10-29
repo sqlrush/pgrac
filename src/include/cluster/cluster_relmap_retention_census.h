@@ -46,6 +46,92 @@ extern ClusterRelmapCensusResult cluster_relmap_retention_census_begin(
 	const uint8 storage_uuid[16], ClusterRelmapRetentionDirectory *const directories[],
 	size_t count, size_t memory_budget, ClusterRelmapRetentionCensus **out);
 
+/* Original Startup episode adapter for the SAME physical scanner. Derive
+ * storage identity and exact origin coverage from EVERY original selected
+ * generation under the already-held simultaneous full IR/WALR set. source
+ * must be an unchanged original relmap participant, not a new owner/scope.
+ * It runs in that original post-native Startup context, with the declared
+ * episode's simultaneous IR/WALR holders. The independent legacy cold merger
+ * and namespace-X context are not acquired or substituted for this owner.
+ * The original isolated OBSERVED ROOT and already-qualified unpublished
+ * BUILDING directories retain ALL generic preconditions above; this adapter
+ * does not qualify their numeric bounds, native era/history/lifetime or ROOT.
+ * In particular, it cannot turn caller-filled bounds into native authority.
+ *
+ * Snapshot full selected carriers within budget (including history/empty
+ * sources) and recheck them before/after every physical scan tick and before
+ * reuse. No source is refreshed. Entered refusal/ERROR revokes the entire
+ * matching episode and invalidates ROOT/directories without clearing pins.
+ * Wrong backend/critical section or nonfresh/known-overlapping output refuses unchanged;
+ * all other distinct refusal leaves *out NULL. Destroy before original scope,
+ * ROOT/directories/ResourceOwner; unfinished destruction revokes the episode.
+ * Generic/unbound and old single-source consumers keep their original modes.
+ * No new scope, acquire, I/O pass, COMPLETE, release, live caller or qualifier. */
+struct ClusterRecoveryRelmapSourceV1;
+extern ClusterRelmapCensusResult cluster_relmap_retention_census_begin_episode(
+	const struct ClusterRecoveryRelmapSourceV1 *source, ClusterRecoveryRootSet *roots,
+	ClusterRelmapRetentionDirectory *const directories[], size_t count,
+	size_t memory_budget, ClusterRelmapRetentionCensus **out);
+
+/* Original all-source native-input factory, before the physical scan. Takes
+ * no caller floor/issued or directory values. Require one complete original
+ * checkpoint generation per origin; history/terminal/missing/legacy windows
+ * remain unsupported. Native inputs are read through the original full-source
+ * checkpoint visitor, with the entire fixed cohort checked around each read.
+ * BUILDING uses each actual native floor and post-flush published last-issued,
+ * never checkpoint nextXid or a lease ceiling. Recheck the original physical
+ * ROOT after producer I/O before publishing the cursor exactly once.
+ *
+ * This derives numeric observations, not native era/history/no-reuse or
+ * continuous CLOG lifetime qualification. ALL remaining original isolation,
+ * native/SIDE/lifetime preconditions above remain owner duties. There is no
+ * live caller, allocation/truncation admission, COMPLETE or release authority.
+ * The budget covers the peak cursor, both source snapshots and all private
+ * directories. Success owns a contiguous directory block and borrows ROOT;
+ * destroy before the original episode/ROOT/ResourceOwner, on every exit.
+ * The fresh NULL output/alias/precondition/sticky ERROR contracts of the
+ * episode adapter apply. Failure frees only local storage, retaining original
+ * FD/all-IR/WALR/pins/debt. Older APIs retain their original behavior. */
+extern ClusterRelmapCensusResult cluster_relmap_retention_census_begin_native_episode(
+	const struct ClusterRecoveryRelmapSourceV1 *source, ClusterRecoveryRootSet *roots,
+	size_t memory_budget, ClusterRelmapRetentionCensus **out);
+
+/* Same original episode/native-input producer, without caller-supplied ROOT.
+ * Borrow the SAME original scope's namespace descriptor, enumerate EVERY
+ * retained WAL target through its cold census, then run the original complete
+ * two-pass physical ROOT before begin_native_episode. Cold census order is
+ * matched by full source generation, not selected/replay indexes. Retain all
+ * original source/current/IR-WALR checks around I/O and verify the same original
+ * namespace after producer I/O. Missing/unknown/non-file effects remain owner
+ * obligations; enumeration is not discharge or ROOT/isolation authority.
+ *
+ * Success owns its local ROOT/directories/cursor, NEVER the borrowed fd or
+ * original scope/protections. Destroy before that original scope/ResourceOwner
+ * on EVERY exit. root_budget bounds ROOT, payload_budget each original target
+ * decode, memory_budget peak local source snapshots/directories/cursor.
+ * All preconditions/unsupported shapes/fresh-output/error contracts and native
+ * qualification limits above remain. No apply, new owner/acquire/release/live
+ * caller, independent success setter, COMPLETE or OPEN authority. */
+extern ClusterRelmapCensusResult cluster_relmap_retention_census_open_native_episode(
+	const struct ClusterRecoveryRelmapSourceV1 *source, size_t root_budget,
+	size_t memory_budget, size_t payload_budget, ClusterRelmapRetentionCensus **out);
+
+/* Synchronous original-episode factory and complete physical pending scan.
+ * Publish one local DRAINED cursor only after the entire original census and
+ * final source/current recheck, with no pending pin in ANY namespace/origin.
+ * A pending pin refuses without arbitration or retry. Entered refusal/ERROR
+ * revokes the original matching episode and destroys only local custody;
+ * original borrowed fd/all-IR/WALR/pins/debt remain. Entry aliases/nonfresh out
+ * and context refusals retain the open_native_episode unchanged-output contract.
+ * Success owns the same local ROOT/directories/cursor and MUST be destroyed
+ * before the original scope/ResourceOwner. Budgets/unsupported shapes and all
+ * original native/isolation/lifetime preconditions above still apply. DRAINED
+ * is an observation, not era/lifetime qualification, discharge, allocation or
+ * truncation admission, COMPLETE, OPEN or release authority. No live caller. */
+extern bool cluster_relmap_retention_census_execute_native_episode(
+	const struct ClusterRecoveryRelmapSourceV1 *source, size_t root_budget,
+	size_t memory_budget, size_t payload_budget, ClusterRelmapRetentionCensus **out);
+
 /* Initial single-origin census from the original execution checkpoint/WAL
  * producer, without caller-filled directory bounds. Borrow the original
  * isolated OBSERVED ROOT, never a configured path. The caller still qualifies

@@ -352,6 +352,17 @@ extern bool cluster_wal_inputs_relmap_source_revalidate_v1(
  * its IR/WALR or require a still-current ResourceOwner to retain failure. */
 extern void cluster_wal_inputs_relmap_source_fail_v1(
 	const ClusterRecoveryRelmapSourceV1 *source);
+struct ClusterRelmapRetentionCensus;
+/* Dormant, once per ORIGINAL all-IR/WALR scope. Execute the existing native
+ * provisional census and retain its local custody in this scope. The output
+ * must be fresh/disjoint and is a BORROWED const view: never destroy it or
+ * retain it past scope release. Original release destroys the local cursor
+ * BEFORE its namespace fd or any IR/WALR. Entered false/ERROR revokes only the
+ * matching episode, retains protections/debt and prevents retry. No native
+ * era/lifetime, retained allocation or joint COMPLETE/OPEN grant is implied. */
+extern bool cluster_wal_inputs_relmap_census_prepare_v1(ClusterWalInputsV1 *inputs,
+	size_t root_budget, size_t memory_budget, size_t payload_budget,
+	const struct ClusterRelmapRetentionCensus **out);
 typedef struct ClusterRecoveryRelmapNativeInputV1 {
 	ClusterRecoveryRelmapSourceV1 source;
 	ClusterWalTailObservation tail;
