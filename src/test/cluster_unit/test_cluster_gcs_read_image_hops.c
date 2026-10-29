@@ -36,7 +36,13 @@
 
 UT_DEFINE_GLOBALS();
 
+#ifdef GCS_R4_TX_RPC_FULL_SLOTS
+#define MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND CLUSTER_GCS_BLOCK_MAX_OUTSTANDING_PER_BACKEND
+#define RPC_TEST_SLOT_INDEX (MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND - 1)
+#else
 #define MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND 2
+#define RPC_TEST_SLOT_INDEX 0
+#endif
 #define CLUSTER_GCS_BLOCK_REPLY_DOMAIN_LEGACY_ACQUIRE 0
 #define CLUSTER_GCS_BLOCK_REPLY_DOMAIN_R4_CR 1
 typedef struct ClusterGcsBlockOutstandingSlot {
@@ -1141,7 +1147,7 @@ cluster_grd_outbound_enqueue_backend_msg(uint8 kind, uint32 dest, const void *da
 void
 ConditionVariablePrepareToSleep(ConditionVariable *cv)
 {
-	UT_ASSERT(cv == &blocks[1].slots[0].reply_cv && !rpc_sleeping && locks == 0);
+	UT_ASSERT(cv == &blocks[1].slots[RPC_TEST_SLOT_INDEX].reply_cv && !rpc_sleeping && locks == 0);
 	rpc_prepares++;
 	rpc_sleeping = true;
 }
@@ -1158,7 +1164,7 @@ ConditionVariableCancelSleep(void)
 bool
 ConditionVariableTimedSleep(ConditionVariable *cv, long timeout, uint32 wait_event)
 {
-	UT_ASSERT(cv == &blocks[1].slots[0].reply_cv && rpc_sleeping && locks == 0);
+	UT_ASSERT(cv == &blocks[1].slots[RPC_TEST_SLOT_INDEX].reply_cv && rpc_sleeping && locks == 0);
 	UT_ASSERT_EQ(wait_event, WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
 	if (rpc_sleeps >= lengthof(rpc_timeouts))
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR), errmsg_internal("fixture wait bound")));
@@ -1171,7 +1177,7 @@ ConditionVariableTimedSleep(ConditionVariable *cv, long timeout, uint32 wait_eve
 	if (rpc_action == RPC_QUIET)
 		return false;
 	if (rpc_action == RPC_STALE_SLOT) {
-		blocks[1].slots[0].stale = true;
+		blocks[1].slots[RPC_TEST_SLOT_INDEX].stale = true;
 		return false;
 	}
 	if (rpc_action == RPC_LATE_THEN_EXACT && rpc_sleeps == 1)

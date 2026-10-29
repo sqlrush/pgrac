@@ -53,7 +53,7 @@ CLUSTER_UNIT_CRYPTOHASH_O = $(top_builddir)/src/common/cryptohash.o \
 endif
 
 # Test source files (each becomes a standalone executable)
-TESTS = test_cluster_shared_fs_page test_cluster_relmap_lock test_cluster_vm_read_visibility test_cluster_heap_maintenance test_cluster_vacuum_shared_mx test_cluster_heap_cr_reuse test_cluster_buffer_cr test_cluster_buffer_mapping test_cluster_pi_contribution_stream test_cluster_drop_work test_cluster_smgr_drop test_cluster_shared_fs_drop test_cluster_shared_fs_cold_drop test_cluster_formation_restart test_cluster_basic test_cluster_version test_cluster_backend_types test_cluster_port_runtime test_cluster_relation_size test_cluster_vacuum_proof_cleanup test_cluster_heap_hot_full_trace test_cluster_gcs_read_image_hops test_cluster_gcs_read_image_trace \
+TESTS = test_cluster_shared_fs_page test_cluster_relmap_lock test_cluster_vm_read_visibility test_cluster_heap_maintenance test_cluster_vacuum_shared_mx test_cluster_heap_cr_reuse test_cluster_buffer_cr test_cluster_buffer_mapping test_cluster_pi_contribution_stream test_cluster_drop_work test_cluster_smgr_drop test_cluster_shared_fs_drop test_cluster_shared_fs_cold_drop test_cluster_formation_restart test_cluster_basic test_cluster_version test_cluster_backend_types test_cluster_port_runtime test_cluster_relation_size test_cluster_vacuum_proof_cleanup test_cluster_heap_hot_full_trace test_cluster_gcs_read_image_hops test_cluster_r4_tx_rpc_slots test_cluster_gcs_read_image_trace \
         test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_relmap test_cluster_initdb_config test_cluster_initdb_origin test_cluster_initdb_common test_cluster_catalog_manifest test_cluster_catalog_init test_cluster_catalog_startup test_cluster_initdb_tree test_cluster_initdb_cohort \
         test_pgrac_control_binding test_pgrac_protected_set test_pgrac_fenced_drain test_pgrac_fenced_pacemaker test_pgrac_fenced_cib \
         test_pgrac_fenced_map_filter test_pgrac_fenced_drain_sign_filter \
@@ -243,6 +243,7 @@ TESTS += test_cluster_recovery_worker_pre2
 TESTS += test_cluster_page_ctrc_capacity
 
 CLUSTER_VERSION_O = $(top_builddir)/src/backend/cluster/cluster_version.o
+TESTS += test_cluster_tx_exit_dispatch
 
 # Path to cluster_guc.o + cluster_elog.o (needed by test_cluster_guc only).
 # These reference PG backend symbols (DefineCustomIntVariable, etc.) that
@@ -557,6 +558,8 @@ SIMPLE_TESTS := $(filter-out test_cluster_page_stable_base,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_side_xact test_cluster_pi_contribution,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_side_online_owner test_cluster_remote_xact_writer,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_r4_tx_enqueue,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_tx_exit_dispatch,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_r4_tx_rpc_slots,$(SIMPLE_TESTS))
 # PGRAC: real configuration object tests have their own link rule.
 # Author: SqlRush <sqlrush@gmail.com>
 SIMPLE_TESTS := $(filter-out test_cluster_shared_config,$(SIMPLE_TESTS))
@@ -1030,6 +1033,31 @@ test_cluster_control_retire: test_cluster_control_retire.c test_cluster_control_
 test_cluster_r4_tx_enqueue: test_cluster_r4_tx_enqueue.c unit_test.h $(CLUSTER_VERSION_O) cluster_unit_port_stubs.o \
 		$(top_srcdir)/src/backend/cluster/cluster_tx_enqueue.c \
 		$(top_srcdir)/src/include/cluster/cluster_tx_enqueue.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) cluster_unit_port_stubs.o -o $@
+
+test_cluster_tx_exit_dispatch.inc: $(top_srcdir)/src/backend/storage/ipc/ipc.c $(srcdir)/Makefile
+	awk 'BEGIN { print "#define CLUSTER_TX_EXIT_DISPATCH_PRESENT 1" } \
+	     /^bool[ \t]+shmem_exit_inprogress = false;/ { print; flags++ } \
+	     /^static bool atexit_callback_setup = false;/ { print; setup++ } \
+	     /^#define MAX_ON_EXITS / { tables++; globals=1 } \
+	     globals { print } \
+	     globals && /before_shmem_exit_index;$$/ { globals=0 } \
+	     /^(shmem_exit|on_proc_exit|before_shmem_exit|on_shmem_exit|cancel_before_shmem_exit|on_exit_reset)\(/ { print "void"; emit=1; found++ } \
+	     emit { print } emit && /^}$$/ { emit=0; done++ } \
+	     END { if (flags != 1 || setup != 1 || tables != 1 || globals || found != 6 || done != 6) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_tx_exit_registration.inc: $(top_srcdir)/src/backend/utils/init/postinit.c $(srcdir)/Makefile
+	awk '/^[ \t]*before_shmem_exit\(cluster_grd_cleanup_on_backend_exit_callback, 0\);$$/ { print; grd++ } \
+	     /^[ \t]*before_shmem_exit\(cluster_tx_enqueue_cleanup_on_backend_exit_callback, 0\);$$/ { print; tx++ } \
+	     END { if (grd != 1 || tx != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_tx_exit_dispatch: test_cluster_tx_exit_dispatch.c test_cluster_r4_tx_enqueue.c \
+		unit_test.h test_cluster_tx_exit_dispatch.inc test_cluster_tx_exit_registration.inc \
+		$(CLUSTER_VERSION_O) cluster_unit_port_stubs.o \
+		$(top_srcdir)/src/backend/cluster/cluster_tx_enqueue.c \
+		$(top_srcdir)/src/backend/cluster/cluster_lmd_wait_state.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) cluster_unit_port_stubs.o -o $@
 
 # spec-2.4 D16: test_cluster_epoch links cluster_epoch.o standalone.
@@ -6764,6 +6792,8 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_clog_native_horizon.inc test_cluster_clog_native_horizon.inc.tmp
 	rm -f test_cluster_recovery_episode_clog.o test_cluster_recovery_episode_side_owner.o test_cluster_recovery_consumed_inputs.o test_cluster_recovery_scope_native_census_product.o
 	rm -f test_cluster_side_native_clog.o
+	rm -f test_cluster_tx_exit_dispatch.inc test_cluster_tx_exit_dispatch.inc.tmp \
+		test_cluster_tx_exit_registration.inc test_cluster_tx_exit_registration.inc.tmp
 	rm -f test_cluster_external_fence_duty.inc
 	rm -f test_cluster_resolver_cache_caller.inc test_cluster_resolver_cache_caller.inc.tmp
 	rm -f test_cluster_relation_size.inc
@@ -13807,6 +13837,12 @@ test_cluster_gcs_read_image_hops.inc: $(top_srcdir)/src/backend/cluster/cluster_
 
 test_cluster_gcs_read_image_hops: test_cluster_gcs_read_image_hops.c unit_test.h \
 		test_cluster_gcs_read_image_hops.inc $(top_builddir)/src/port/libpgport_srv.a
+	$(CC) $(CFLAGS) $(PTHREAD_CFLAGS) $(CPPFLAGS) -DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		$< $(top_builddir)/src/port/libpgport_srv.a -o $@
+
+test_cluster_r4_tx_rpc_slots: test_cluster_r4_tx_rpc_slots.c \
+		test_cluster_gcs_read_image_hops.c unit_test.h test_cluster_gcs_read_image_hops.inc \
+		$(top_builddir)/src/port/libpgport_srv.a
 	$(CC) $(CFLAGS) $(PTHREAD_CFLAGS) $(CPPFLAGS) -DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
 		$< $(top_builddir)/src/port/libpgport_srv.a -o $@
 
