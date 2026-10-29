@@ -1125,4 +1125,10 @@ extern ResourceXApplyResult cluster_bufmgr_pcm_own_acquire_quiet_disk_exact(
 	BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
 	const ResourceXDecodedAcquireIntent *episode, const ResourceXDeliveryClaim *original);
 
+/* Same foreground, before any I was armed. Unpublished bytes are never
+ * usable image evidence; retain no-image quiet until exact M settlement. */
+extern ResourceXApplyResult cluster_bufmgr_pcm_own_acquire_quiet_unarmed_disk_exact(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
+	const ResourceXDecodedAcquireIntent *episode, const ResourceXDeliveryClaim *original);
+
 #endif /* CLUSTER_PCM_X_BUFMGR_H */

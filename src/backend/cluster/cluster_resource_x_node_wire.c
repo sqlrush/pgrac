@@ -624,7 +624,9 @@ resource_x_pair_common_valid(uint8 msg_type, ResourceXWireKind kind,
 				&& !(kind == RESOURCE_X_WIRE_INSTALL_SETTLEMENT
 					&& (common->outcome == RESOURCE_X_OUTCOME_DUPLICATE
 						|| common->outcome == RESOURCE_X_OUTCOME_QUIET
-						|| common->outcome == RESOURCE_X_OUTCOME_QUIET_RETIRED))) {
+						|| common->outcome == RESOURCE_X_OUTCOME_QUIET_RETIRED
+						|| common->outcome == RESOURCE_X_OUTCOME_QUIET_NO_IMAGE
+						|| common->outcome == RESOURCE_X_OUTCOME_QUIET_NO_IMAGE_RETIRED))) {
 				resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_ENUM);
 				return false;
 			}
@@ -661,6 +663,10 @@ static uint8
 resource_x_frame_version(ResourceXWireKind kind, uint16 len, uint8 outcome)
 {
 	if (len == RESOURCE_X_COMPLETE_V5_BYTES) {
+		if (outcome == RESOURCE_X_OUTCOME_QUIET_NO_IMAGE)
+			return RESOURCE_X_QUIET_NO_IMAGE_WIRE_VERSION;
+		if (outcome == RESOURCE_X_OUTCOME_QUIET_NO_IMAGE_RETIRED)
+			return RESOURCE_X_QUIET_NO_IMAGE_RETIRED_WIRE_VERSION;
 		if (outcome == RESOURCE_X_OUTCOME_QUIET)
 			return RESOURCE_X_QUIET_WIRE_VERSION;
 		if (outcome == RESOURCE_X_OUTCOME_QUIET_RETIRED)
@@ -841,7 +847,8 @@ resource_x_decision_body_valid(const ResourceXDecodedFrame *frame)
 	}
 	if (frame->kind == RESOURCE_X_WIRE_INSTALL_SETTLEMENT
 		&& (frame->common.outcome == RESOURCE_X_OUTCOME_DUPLICATE
-			|| frame->common.outcome == RESOURCE_X_OUTCOME_QUIET_RETIRED))
+			|| frame->common.outcome == RESOURCE_X_OUTCOME_QUIET_RETIRED
+			|| frame->common.outcome == RESOURCE_X_OUTCOME_QUIET_NO_IMAGE_RETIRED))
 		return frame->common.action_node == body->master_node;
 	if (frame->kind == RESOURCE_X_WIRE_AUTHORITY_GRANT || frame->kind == RESOURCE_X_WIRE_INSTALL_SETTLEMENT)
 		return frame->common.action_node == frame->common.logical_assertion.requester_node;
@@ -858,6 +865,8 @@ resource_x_completion_body_valid(const ResourceXDecodedFrame *frame)
 {
 	const ResourceXDecodedAcquireCompletion *c = &frame->body.acquire_completion;
 	const ResourceXDecodedAcquireDecision *a = &c->decision;
+	bool no_image = frame->common.outcome == RESOURCE_X_OUTCOME_QUIET_NO_IMAGE
+		|| frame->common.outcome == RESOURCE_X_OUTCOME_QUIET_NO_IMAGE_RETIRED;
 
 	return frame->common.target_mode == (uint8)PCM_STATE_S
 		&& a->episode.path == RESOURCE_X_ACQUIRE_FIRST_FILL
@@ -866,11 +875,12 @@ resource_x_completion_body_valid(const ResourceXDecodedFrame *frame)
 		&& a->holders_bitmap == 0 && a->required_holders_bitmap == 0 && a->pi_holders_bitmap == 0
 		&& c->native_generation == a->episode.base_generation
 			+ ((frame->common.outcome == RESOURCE_X_OUTCOME_QUIET
-				|| frame->common.outcome == RESOURCE_X_OUTCOME_QUIET_RETIRED) ? 0 : 1)
+				|| frame->common.outcome == RESOURCE_X_OUTCOME_QUIET_RETIRED || no_image) ? 0 : 1)
 		&& (c->write_io_generation & 1) == 0
-		&& (!SCN_VALID(a->disk_watermark_scn)
-			|| (SCN_VALID(c->page_scn) && scn_local(c->page_scn)
-				>= scn_local(a->disk_watermark_scn))) /* SCN_CMP_OK: scn_time_cmp via scn_local */
+		&& (no_image ? c->page_lsn == 0 && c->page_scn == 0 && c->page_crc32c == 0
+			: !SCN_VALID(a->disk_watermark_scn)
+				|| (SCN_VALID(c->page_scn) && scn_local(c->page_scn)
+					>= scn_local(a->disk_watermark_scn))) /* SCN_CMP_OK: scn_time_cmp via scn_local */
 		&& resource_x_decision_body_valid(frame);
 }
 

@@ -1723,6 +1723,9 @@ typedef struct ResourceXDeliveryTarget {
 #define RESOURCE_X_DELIVERY_ACQUIRE_READ_SEALING UINT8_C(10)
 #define RESOURCE_X_DELIVERY_ACQUIRE_READ_QUIET UINT8_C(11)
 #define RESOURCE_X_DELIVERY_ACQUIRE_READ_QUIET_CONSUMED UINT8_C(12)
+#define RESOURCE_X_DELIVERY_ACQUIRE_UNARMED_SEALING UINT8_C(13)
+#define RESOURCE_X_DELIVERY_ACQUIRE_UNARMED_QUIET UINT8_C(14)
+#define RESOURCE_X_DELIVERY_ACQUIRE_UNARMED_CONSUMED UINT8_C(15)
 /* Immutable evidence retained by the original full-E executor. This is not
  * caller authority or a PAGE/WAL memory-source proof for disk bytes. */
 typedef struct ResourceXAcquireReadReceipt {
@@ -2890,6 +2893,10 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_read_c
 	const ResourceXDeliveryClaim *execution, const ResourceXDecodedAcquireIntent *episode,
 	ResourceXDeliveryClaim *current_out, ResourceXAcquireReadReceipt *receipt_out);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_read_seal_exact(
+	const ResourceXDeliveryClaim *execution, const ResourceXDecodedAcquireIntent *episode,
+	const ResourceXAcquireReadReceipt *receipt, const struct ClusterPcmOwnSnapshot *unpublished);
+/* No published I: only original A and exact write-IO are retained. */
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_unarmed_seal_exact(
 	const ResourceXDeliveryClaim *execution, const ResourceXDecodedAcquireIntent *episode,
 	const ResourceXAcquireReadReceipt *receipt, const struct ClusterPcmOwnSnapshot *unpublished);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_read_quiet_exact(

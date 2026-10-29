@@ -13874,16 +13874,27 @@ pcm_resource_x_install_claim_valid_locked(const ClusterPcmResourceXBootstrapRoun
 }
 
 static bool
+pcm_resource_x_acquire_read_unarmed(uint64 purpose)
+{
+	return purpose == RESOURCE_X_DELIVERY_ACQUIRE_UNARMED_SEALING
+		|| purpose == RESOURCE_X_DELIVERY_ACQUIRE_UNARMED_QUIET
+		|| purpose == RESOURCE_X_DELIVERY_ACQUIRE_UNARMED_CONSUMED;
+}
+
+static bool
 pcm_resource_x_acquire_read_is_quiet(uint64 purpose)
 {
 	return purpose == RESOURCE_X_DELIVERY_ACQUIRE_READ_QUIET
-		|| purpose == RESOURCE_X_DELIVERY_ACQUIRE_READ_QUIET_CONSUMED;
+		|| purpose == RESOURCE_X_DELIVERY_ACQUIRE_READ_QUIET_CONSUMED
+		|| purpose == RESOURCE_X_DELIVERY_ACQUIRE_UNARMED_QUIET
+		|| purpose == RESOURCE_X_DELIVERY_ACQUIRE_UNARMED_CONSUMED;
 }
 
 static bool
 pcm_resource_x_acquire_read_closing(uint64 purpose)
 {
 	return purpose == RESOURCE_X_DELIVERY_ACQUIRE_READ_SEALING
+		|| purpose == RESOURCE_X_DELIVERY_ACQUIRE_UNARMED_SEALING
 		|| pcm_resource_x_acquire_read_is_quiet(purpose);
 }
 
@@ -13911,6 +13922,8 @@ pcm_resource_x_acquire_read_receipt_valid_locked(const ClusterPcmResourceXBootst
 	return round->has_acquire_intent == 1 && round->acquire_intent.path == RESOURCE_X_ACQUIRE_FIRST_FILL
 		&& round->request.target_mode == PCM_STATE_S && r->authority_generation != 0
 		&& r->authority_generation != UINT64_MAX && (r->write_io_generation & 1) == 0
+		&& (!pcm_resource_x_acquire_read_unarmed(round->delivery_executor_purpose)
+			|| (r->page_lsn == 0 && r->page_scn == 0 && r->page_crc32c == 0))
 		&& round->delivery_target.generation == round->acquire_intent.base_generation + (complete ? 1 : 0)
 		&& round->delivery_target.reservation_token == round->acquire_intent.reservation_token
 		&& round->delivery_target.buffer_id_plus_one == (uint32)round->acquire_intent.buffer_id + 1
@@ -29016,6 +29029,7 @@ pcm_resource_x_requester_acquire_frames_mode_locked(struct GrdEntry *entry,
 	if (closing && (claim == NULL || episode->path != RESOURCE_X_ACQUIRE_FIRST_FILL
 			|| observation->request.target_mode != PCM_STATE_S
 			|| (claim->purpose != RESOURCE_X_DELIVERY_ACQUIRE_READ_ARMED
+				&& claim->purpose != RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING
 				&& !pcm_resource_x_acquire_read_closing(claim->purpose))))
 		return RESOURCE_X_APPLY_BAD_STATE;
 	if (state == NULL || !pcm_resource_x_requester_acquire_valid_locked(round)
@@ -29645,6 +29659,7 @@ pcm_resource_x_acquire_read_close_locked(struct GrdEntry *entry,
 		|| execution->target.buffer_id_plus_one != (uint32)episode->buffer_id + 1
 		|| execution->target.flags != PCM_OWN_FLAG_GRANT_PENDING
 		|| (round->delivery_executor_purpose != RESOURCE_X_DELIVERY_ACQUIRE_READ_ARMED
+			&& round->delivery_executor_purpose != RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING
 			&& !pcm_resource_x_acquire_read_closing(round->delivery_executor_purpose)))
 		return RESOURCE_X_APPLY_BAD_STATE;
 	candidate = *execution;
@@ -29660,11 +29675,16 @@ pcm_resource_x_acquire_read_close_locked(struct GrdEntry *entry,
 		|| a->source_kind != RESOURCE_X_ACQUIRE_SOURCE_DISK || a->source_node != -1
 		|| a->source_service_generation != 0 || a->directory_mode != PCM_STATE_N
 		|| a->holders_bitmap != 0 || a->required_holders_bitmap != 0 || a->pi_holders_bitmap != 0
-		|| round->acquire_read_receipt.authority_generation != grant.common.authority_generation
-		|| round->acquire_read_receipt.decision_crc32c != grant.common.semantic_crc32c)
+		|| (candidate.purpose != RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING
+			&& (round->acquire_read_receipt.authority_generation != grant.common.authority_generation
+				|| round->acquire_read_receipt.decision_crc32c != grant.common.semantic_crc32c)))
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	*current = candidate;
 	*receipt = round->acquire_read_receipt;
+	if (candidate.purpose == RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING) {
+		receipt->authority_generation = grant.common.authority_generation;
+		receipt->decision_crc32c = grant.common.semantic_crc32c;
+	}
 	return RESOURCE_X_APPLY_APPLIED;
 }
 
@@ -29724,13 +29744,58 @@ cluster_pcm_lock_resource_x_requester_acquire_read_seal_exact(
 	result = pcm_resource_x_acquire_read_close_locked(ref.entry, execution, episode, &current, &observed);
 	if (result == RESOURCE_X_APPLY_APPLIED) {
 		if (memcmp(receipt, &observed, sizeof(observed)) != 0
-			|| pcm_resource_x_acquire_read_is_quiet(current.purpose))
+			|| (current.purpose != RESOURCE_X_DELIVERY_ACQUIRE_READ_ARMED
+				&& current.purpose != RESOURCE_X_DELIVERY_ACQUIRE_READ_SEALING))
 			result = RESOURCE_X_APPLY_STALE;
 		else if (current.purpose == RESOURCE_X_DELIVERY_ACQUIRE_READ_SEALING)
 			result = RESOURCE_X_APPLY_DUPLICATE;
 		else {
 			ref.entry->resource_x_bootstrap_round.delivery_executor_purpose = RESOURCE_X_DELIVERY_ACQUIRE_READ_SEALING;
 			pcm_resource_x_intent_mark_dirty();
+		}
+	}
+	LWLockRelease(&ref.entry->entry_lock.lock);
+	pcm_entry_ref_release(&ref);
+	return result;
+}
+
+/* An unarmed executor has no published I. Retain only its exact A and
+ * native write-IO cut, before any GP/IO release. No bytes become usable. */
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_requester_acquire_unarmed_seal_exact(
+	const ResourceXDeliveryClaim *execution, const ResourceXDecodedAcquireIntent *episode,
+	const ResourceXAcquireReadReceipt *receipt, const ClusterPcmOwnSnapshot *unpublished)
+{
+	PcmEntryRef ref;
+	PcmEntryAcquireResult acquired;
+	ResourceXDeliveryClaim current;
+	ResourceXAcquireReadReceipt observed;
+	ResourceXApplyResult result;
+
+	if (!pcm_resource_x_acquire_read_input(execution, episode) || receipt == NULL
+		|| receipt->authority_generation == 0 || receipt->authority_generation == UINT64_MAX
+		|| receipt->page_lsn != 0 || receipt->page_scn != 0 || receipt->page_crc32c != 0
+		|| (receipt->write_io_generation & 1) != 0 || receipt->write_io_generation >= UINT64_MAX - 1
+		|| !pcm_resource_x_acquire_read_close_shape(execution, episode, unpublished, false))
+		return RESOURCE_X_APPLY_INVALID;
+	if (!pcm_entry_ref_acquire(&execution->observation.request.logical_assertion.resource, false, &ref, &acquired))
+		return RESOURCE_X_APPLY_NOT_FOUND;
+	LWLockAcquire(&ref.entry->entry_lock.lock, LW_EXCLUSIVE);
+	result = pcm_resource_x_acquire_read_close_locked(ref.entry, execution, episode, &current, &observed);
+	if (result == RESOURCE_X_APPLY_APPLIED) {
+		if (receipt->authority_generation != observed.authority_generation
+			|| receipt->decision_crc32c != observed.decision_crc32c
+			|| (current.purpose != RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING
+				&& current.purpose != RESOURCE_X_DELIVERY_ACQUIRE_UNARMED_SEALING))
+			result = RESOURCE_X_APPLY_STALE;
+		else if (current.purpose == RESOURCE_X_DELIVERY_ACQUIRE_UNARMED_SEALING)
+			result = memcmp(receipt, &observed, sizeof(observed)) == 0
+				? RESOURCE_X_APPLY_DUPLICATE : RESOURCE_X_APPLY_STALE;
+		else if (!pcm_resource_x_intent_mark_dirty())
+			result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		else {
+			ref.entry->resource_x_bootstrap_round.acquire_read_receipt = *receipt;
+			ref.entry->resource_x_bootstrap_round.delivery_executor_purpose = RESOURCE_X_DELIVERY_ACQUIRE_UNARMED_SEALING;
 		}
 	}
 	LWLockRelease(&ref.entry->entry_lock.lock);
@@ -29758,13 +29823,16 @@ cluster_pcm_lock_resource_x_requester_acquire_read_quiet_exact(
 	result = pcm_resource_x_acquire_read_close_locked(ref.entry, execution, episode, &current, &observed);
 	if (result == RESOURCE_X_APPLY_APPLIED) {
 		if (memcmp(receipt, &observed, sizeof(observed)) != 0
-			|| current.purpose == RESOURCE_X_DELIVERY_ACQUIRE_READ_ARMED)
+			|| current.purpose == RESOURCE_X_DELIVERY_ACQUIRE_READ_ARMED
+			|| current.purpose == RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING)
 			result = RESOURCE_X_APPLY_STALE;
 		else if (pcm_resource_x_acquire_read_is_quiet(current.purpose))
 			result = RESOURCE_X_APPLY_DUPLICATE;
 		else {
 			ref.entry->resource_x_bootstrap_round.delivery_target.flags = 0;
-			ref.entry->resource_x_bootstrap_round.delivery_executor_purpose = RESOURCE_X_DELIVERY_ACQUIRE_READ_QUIET;
+			ref.entry->resource_x_bootstrap_round.delivery_executor_purpose =
+				current.purpose == RESOURCE_X_DELIVERY_ACQUIRE_UNARMED_SEALING
+				? RESOURCE_X_DELIVERY_ACQUIRE_UNARMED_QUIET : RESOURCE_X_DELIVERY_ACQUIRE_READ_QUIET;
 			pcm_resource_x_intent_mark_dirty();
 			ConditionVariableBroadcast(&ref.entry->wait_cv);
 		}
@@ -29961,7 +30029,8 @@ pcm_resource_x_acquire_quiet_frame_locked(struct GrdEntry *entry, ResourceXDecod
 	out->kind = RESOURCE_X_WIRE_INSTALL_SETTLEMENT;
 	out->payload_bytes = RESOURCE_X_COMPLETE_V5_BYTES;
 	out->common.action_node = cluster_node_id;
-	out->common.outcome = RESOURCE_X_OUTCOME_QUIET;
+	out->common.outcome = pcm_resource_x_acquire_read_unarmed(current.purpose)
+		? RESOURCE_X_OUTCOME_QUIET_NO_IMAGE : RESOURCE_X_OUTCOME_QUIET;
 	out->common.semantic_crc32c = 0;
 	c = &out->body.acquire_completion;
 	c->native_generation = round->acquire_intent.base_generation;
@@ -30023,7 +30092,8 @@ pcm_resource_x_acquire_quiet_progress_locked(struct GrdEntry *entry,
 	if (state == NULL || pcm_resource_x_acquire_quiet_frame_locked(entry, &frame) != RESOURCE_X_APPLY_APPLIED)
 		return false;
 	intent = &state->requester_settlement_intent;
-	if (round->delivery_executor_purpose == RESOURCE_X_DELIVERY_ACQUIRE_READ_QUIET
+	if ((round->delivery_executor_purpose == RESOURCE_X_DELIVERY_ACQUIRE_READ_QUIET
+			|| round->delivery_executor_purpose == RESOURCE_X_DELIVERY_ACQUIRE_UNARMED_QUIET)
 		&& memcmp(intent, &empty, sizeof(empty)) == 0) {
 		body.assertion = frame.common.logical_assertion;
 		body.owner_generation = frame.common.assertion_sequence;
@@ -30042,6 +30112,7 @@ pcm_resource_x_acquire_quiet_progress_locked(struct GrdEntry *entry,
 	if (!pcm_resource_x_acquire_read_notice_retained_locked(entry, &frame))
 		return false;
 	if (round->delivery_executor_purpose == RESOURCE_X_DELIVERY_ACQUIRE_READ_QUIET
+		|| round->delivery_executor_purpose == RESOURCE_X_DELIVERY_ACQUIRE_UNARMED_QUIET
 		|| intent->slot.state == RESOURCE_X_INTENT_SLOT_STAGED)
 		return true;
 	if (!pcm_resource_x_intent_mark_dirty())
@@ -30076,7 +30147,8 @@ pcm_resource_x_acquire_quiet_consumed_locked(struct GrdEntry *entry,
 		return result;
 	if (!pcm_resource_x_acquire_read_notice_retained_locked(entry, &expected))
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
-	expected.common.outcome = RESOURCE_X_OUTCOME_QUIET_RETIRED;
+	expected.common.outcome = pcm_resource_x_acquire_read_unarmed(round->delivery_executor_purpose)
+		? RESOURCE_X_OUTCOME_QUIET_NO_IMAGE_RETIRED : RESOURCE_X_OUTCOME_QUIET_RETIRED;
 	expected.common.action_node = expected.body.acquire_completion.decision.master_node;
 	expected.common.sender_connection_generation = PGRAC_RESOURCE_X_RETAINED_SENDER_GENERATION;
 	if (!cluster_resource_x_wire_encode(RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE,
@@ -30086,11 +30158,13 @@ pcm_resource_x_acquire_quiet_consumed_locked(struct GrdEntry *entry,
 		|| !pcm_resource_x_acquire_identity_equal(&round->acquire_intent,
 			&notice->body.acquire_completion.decision.episode))
 		return RESOURCE_X_APPLY_STALE;
-	duplicate = round->delivery_executor_purpose == RESOURCE_X_DELIVERY_ACQUIRE_READ_QUIET_CONSUMED;
+	duplicate = round->delivery_executor_purpose == RESOURCE_X_DELIVERY_ACQUIRE_READ_QUIET_CONSUMED
+		|| round->delivery_executor_purpose == RESOURCE_X_DELIVERY_ACQUIRE_UNARMED_CONSUMED;
 	if (!duplicate) {
 		if (!pcm_resource_x_intent_mark_dirty())
 			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
-		round->delivery_executor_purpose = RESOURCE_X_DELIVERY_ACQUIRE_READ_QUIET_CONSUMED;
+		round->delivery_executor_purpose = pcm_resource_x_acquire_read_unarmed(round->delivery_executor_purpose)
+			? RESOURCE_X_DELIVERY_ACQUIRE_UNARMED_CONSUMED : RESOURCE_X_DELIVERY_ACQUIRE_READ_QUIET_CONSUMED;
 		ConditionVariableBroadcast(&entry->wait_cv);
 	}
 	if (!pcm_resource_x_acquire_quiet_progress_locked(entry, state))
@@ -30110,7 +30184,8 @@ pcm_resource_x_acquire_read_consumed_locked(struct GrdEntry *entry,
 	uint8 payload[RESOURCE_X_COMPLETE_V5_BYTES];
 	uint16 len = 0;
 
-	if (notice->common.outcome == RESOURCE_X_OUTCOME_QUIET_RETIRED)
+	if (notice->common.outcome == RESOURCE_X_OUTCOME_QUIET_RETIRED
+		|| notice->common.outcome == RESOURCE_X_OUTCOME_QUIET_NO_IMAGE_RETIRED)
 		return pcm_resource_x_acquire_quiet_consumed_locked(entry, notice, canonical);
 	if (round->delivery_executor_purpose != RESOURCE_X_DELIVERY_ACQUIRE_READ_NOTICE
 		&& round->delivery_executor_purpose != RESOURCE_X_DELIVERY_ACQUIRE_READ_CONSUMED
@@ -30163,7 +30238,8 @@ cluster_pcm_lock_resource_x_requester_acquire_read_consumed_exact(
 		|| notice->has_acquire_intent || notice->blocked_has_remote_proof
 		|| notice->payload_bytes != sizeof(payload)
 		|| (notice->common.outcome != RESOURCE_X_OUTCOME_DUPLICATE
-			&& notice->common.outcome != RESOURCE_X_OUTCOME_QUIET_RETIRED)
+			&& notice->common.outcome != RESOURCE_X_OUTCOME_QUIET_RETIRED
+			&& notice->common.outcome != RESOURCE_X_OUTCOME_QUIET_NO_IMAGE_RETIRED)
 		|| notice->common.logical_assertion.requester_node != cluster_node_id
 		|| notice->common.semantic_crc32c == 0 || master != current_master || ingress == 0 || master_ingress == 0
 		|| !cluster_resource_x_wire_encode(RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE,
@@ -32000,13 +32076,15 @@ pcm_resource_x_acquire_consumed_done_bytes(const uint8 *payload,
 		payload, RESOURCE_X_COMPLETE_V5_BYTES, ack, &reject)
 		|| ack->kind != RESOURCE_X_WIRE_INSTALL_SETTLEMENT || !ack->has_acquire_decision
 		|| (ack->common.outcome != RESOURCE_X_OUTCOME_DUPLICATE
-			&& ack->common.outcome != RESOURCE_X_OUTCOME_QUIET_RETIRED)
+			&& ack->common.outcome != RESOURCE_X_OUTCOME_QUIET_RETIRED
+			&& ack->common.outcome != RESOURCE_X_OUTCOME_QUIET_NO_IMAGE_RETIRED)
 		|| ack->common.action_node != ack->body.acquire_completion.decision.master_node
 		|| ack->common.sender_connection_generation != PGRAC_RESOURCE_X_RETAINED_SENDER_GENERATION)
 		return false;
 	done = *ack;
-	done.common.outcome = ack->common.outcome == RESOURCE_X_OUTCOME_QUIET_RETIRED
-		? RESOURCE_X_OUTCOME_QUIET : RESOURCE_X_OUTCOME_OK;
+	done.common.outcome = ack->common.outcome == RESOURCE_X_OUTCOME_QUIET_NO_IMAGE_RETIRED
+		? RESOURCE_X_OUTCOME_QUIET_NO_IMAGE : ack->common.outcome == RESOURCE_X_OUTCOME_QUIET_RETIRED
+			? RESOURCE_X_OUTCOME_QUIET : RESOURCE_X_OUTCOME_OK;
 	done.common.action_node = done.common.logical_assertion.requester_node;
 	return cluster_resource_x_wire_encode(RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE,
 		&done, done_bytes, RESOURCE_X_COMPLETE_V5_BYTES, &len, &reject)
@@ -32501,8 +32579,10 @@ cluster_pcm_lock_resource_x_outbound_transport_complete_exact(const ResourceXInt
 		}
 	}
 	if (applied && expected->body.owner_kind == RESOURCE_X_INTENT_OWNER_REQUESTER_SETTLEMENT
-		&& entry_ref.entry->resource_x_bootstrap_round.delivery_executor_purpose
-			== RESOURCE_X_DELIVERY_ACQUIRE_READ_QUIET_CONSUMED)
+		&& (entry_ref.entry->resource_x_bootstrap_round.delivery_executor_purpose
+			== RESOURCE_X_DELIVERY_ACQUIRE_READ_QUIET_CONSUMED
+			|| entry_ref.entry->resource_x_bootstrap_round.delivery_executor_purpose
+				== RESOURCE_X_DELIVERY_ACQUIRE_UNARMED_CONSUMED))
 		applied = pcm_resource_x_acquire_quiet_progress_locked(entry_ref.entry,
 			pcm_resource_x_master_state_for_entry(entry_ref.entry));
 	LWLockRelease(&entry_ref.entry->entry_lock.lock);
@@ -33431,7 +33511,8 @@ pcm_resource_x_acquire_done_encode(const ResourceXDecodedFrame *notice, int32 se
 		|| notice->common.logical_assertion.requester_node != sender
 		|| notice->common.action_node != sender
 		|| (notice->common.outcome != RESOURCE_X_OUTCOME_OK
-			&& notice->common.outcome != RESOURCE_X_OUTCOME_QUIET)
+			&& notice->common.outcome != RESOURCE_X_OUTCOME_QUIET
+			&& notice->common.outcome != RESOURCE_X_OUTCOME_QUIET_NO_IMAGE)
 		|| !cluster_resource_x_wire_encode(RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE, notice,
 			input, sizeof(input), &len, &reject)
 		|| len != sizeof(input)
@@ -33520,8 +33601,9 @@ pcm_resource_x_acquire_consumed_prepare(const ResourceXDecodedFrame *notice,
 	uint16 len = 0;
 
 	memset(prepared, 0, sizeof(*prepared));
-	ack.common.outcome = notice->common.outcome == RESOURCE_X_OUTCOME_QUIET
-		? RESOURCE_X_OUTCOME_QUIET_RETIRED : RESOURCE_X_OUTCOME_DUPLICATE;
+	ack.common.outcome = notice->common.outcome == RESOURCE_X_OUTCOME_QUIET_NO_IMAGE
+		? RESOURCE_X_OUTCOME_QUIET_NO_IMAGE_RETIRED : notice->common.outcome == RESOURCE_X_OUTCOME_QUIET
+			? RESOURCE_X_OUTCOME_QUIET_RETIRED : RESOURCE_X_OUTCOME_DUPLICATE;
 	ack.common.action_node = cluster_node_id;
 	ack.common.sender_connection_generation = PGRAC_RESOURCE_X_RETAINED_SENDER_GENERATION;
 	body.assertion = ack.common.logical_assertion;
@@ -33561,7 +33643,8 @@ pcm_resource_x_acquire_done_apply_locked(struct GrdEntry *entry,
 	if (!pcm_resource_x_acquire_consumed_prepare(&notice, &prepared)
 		|| !pcm_resource_x_intent_mark_dirty())
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
-	if (notice.common.outcome != RESOURCE_X_OUTCOME_QUIET) {
+	if (notice.common.outcome != RESOURCE_X_OUTCOME_QUIET
+		&& notice.common.outcome != RESOURCE_X_OUTCOME_QUIET_NO_IMAGE) {
 		cluster_pcm_transition_apply(entry, PCM_TRANS_N_TO_S, node);
 		holder = &state->holder_grants[node];
 		memset(holder, 0, sizeof(*holder));
