@@ -1119,4 +1119,10 @@ extern ResourceXApplyResult cluster_bufmgr_pcm_own_acquire_continue_disk_exact(
 	const ResourceXDecodedAcquireIntent *episode,
 	const struct ClusterSemanticAdmissionToken *admission, const ResourceXDeliveryClaim *original);
 
+/* Only the original live pinned owner may close an uninstalled ARMED disk
+ * fill. Keep the original quiet receipt for independent master settlement. */
+extern ResourceXApplyResult cluster_bufmgr_pcm_own_acquire_quiet_disk_exact(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
+	const ResourceXDecodedAcquireIntent *episode, const ResourceXDeliveryClaim *original);
+
 #endif /* CLUSTER_PCM_X_BUFMGR_H */

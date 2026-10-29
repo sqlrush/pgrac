@@ -18097,6 +18097,185 @@ cluster_bufmgr_pcm_own_acquire_continue_disk_exact(BufferDesc *buf,
 	return result;
 }
 /* End original armed disk continuation. */
+
+/* Original disk quiet handoff. The same foreground is outside its synchronous
+ * storage call; DISK A has no remote image producer. No entry/provider call
+ * is permitted under content/header, and no installed C is rolled back. */
+static bool
+cluster_bufmgr_acquire_quiet_context(BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
+	const ResourceXDecodedAcquireIntent *episode, const ResourceXDeliveryClaim *execution, ResourceOwner owner)
+{
+	return owner != NULL && CurrentResourceOwner == owner && MyProc != NULL && MyProcPid > 0
+		&& MyProc->pid == MyProcPid && MyProc->pgprocno >= 0
+		&& MyBackendId == episode->backend_id && MyProc->backendId == episode->backend_id
+		&& MyProc->cluster_grd_generation == episode->backend_generation
+		&& episode->buffer_id >= 0 && episode->buffer_id < NBuffers && buf->buf_id == episode->buffer_id
+		&& GetPrivateRefCount(BufferDescriptorGetBuffer(buf)) > 0
+		&& cluster_qvotec_get_self_incarnation() == episode->requester_incarnation
+		&& episode->path == RESOURCE_X_ACQUIRE_FIRST_FILL && execution->observation.request.target_mode == PCM_STATE_S
+		&& base->generation == episode->base_generation && base->generation < UINT64_MAX - 1 && base->flags == 0
+		&& base->reservation_token < UINT64_MAX - 1 && episode->reservation_token == base->reservation_token + 1
+		&& BufferTagsEqual(&base->tag, &execution->observation.request.logical_assertion.resource);
+}
+
+typedef enum ClusterAcquireQuietAction {
+	CLUSTER_ACQUIRE_QUIET_OBSERVE = 0,
+	CLUSTER_ACQUIRE_QUIET_WITHDRAW,
+	CLUSTER_ACQUIRE_QUIET_REPLAY
+} ClusterAcquireQuietAction;
+typedef enum ClusterAcquireQuietCut {
+	CLUSTER_ACQUIRE_QUIET_INVALID = 0,
+	CLUSTER_ACQUIRE_QUIET_GP,
+	CLUSTER_ACQUIRE_QUIET_IO,
+	CLUSTER_ACQUIRE_QUIET_DONE
+} ClusterAcquireQuietCut;
+
+static ClusterAcquireQuietCut
+cluster_bufmgr_acquire_quiet_native(BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
+	const ResourceXDecodedAcquireIntent *episode, const ResourceXDeliveryClaim *execution,
+	const ResourceXAcquireReadReceipt *receipt, ResourceOwner owner,
+	ClusterAcquireQuietAction action, ClusterPcmOwnSnapshot *out)
+{
+	ClusterPcmOwnSnapshot expected = *base, live;
+	ClusterAcquireQuietCut cut = CLUSTER_ACQUIRE_QUIET_INVALID;
+	Page page = BufferGetBlock(BufferDescriptorGetBuffer(buf));
+	uint32 state;
+	uint64 hold;
+	bool input;
+
+	if (!LWLockHeldByMeInMode(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE)
+		|| CurrentResourceOwner != owner || owner == NULL
+		|| cluster_gcs_block_compute_checksum(page) != receipt->page_crc32c
+		|| PageGetLSN(page) != receipt->page_lsn || (uint64)((PageHeader)page)->pd_block_scn != receipt->page_scn)
+		return cut;
+	state = LockBufHdr(buf);
+	cluster_pcm_own_snapshot_locked(buf, &live);
+	hold = cluster_pcm_own_delivery_attempt_get(buf->buf_id);
+	input = ResourceOwnerHasBufferIO(owner, BufferDescriptorGetBuffer(buf));
+	if (MyProc == NULL || MyProcPid <= 0 || MyProc->pid != MyProcPid || MyProc->pgprocno < 0
+		|| MyBackendId != episode->backend_id || MyProc->backendId != episode->backend_id
+		|| MyProc->cluster_grd_generation != episode->backend_generation
+		|| live.writer_activation_token != 0 || live.resource_x_activation_generation != 0
+		|| pg_atomic_read_u64(&ClusterPcmOwnArray[buf->buf_id].write_io_generation) != receipt->write_io_generation)
+		goto done;
+	expected.reservation_token = episode->reservation_token;
+	expected.flags = PCM_OWN_FLAG_GRANT_PENDING;
+	expected.semantic_buf_state = BM_TAG_VALID | BM_IO_IN_PROGRESS;
+	expected.pcm_state = PCM_STATE_N;
+	expected.buffer_type = BUF_TYPE_CURRENT;
+	if (input && cluster_pcm_own_snapshot_equal_exact(&expected, &live)
+		&& (hold == execution->executor_sequence || (action == CLUSTER_ACQUIRE_QUIET_WITHDRAW && hold == 0)))
+		cut = CLUSTER_ACQUIRE_QUIET_GP;
+	expected.flags = 0;
+	if (action != CLUSTER_ACQUIRE_QUIET_OBSERVE && hold == 0) {
+		if (input && cluster_pcm_own_snapshot_equal_exact(&expected, &live))
+			cut = CLUSTER_ACQUIRE_QUIET_IO;
+		expected.semantic_buf_state = BM_TAG_VALID | BM_IO_ERROR;
+		if (!input && cluster_pcm_own_snapshot_equal_exact(&expected, &live))
+			cut = CLUSTER_ACQUIRE_QUIET_DONE;
+	}
+	if (action == CLUSTER_ACQUIRE_QUIET_REPLAY && cut != CLUSTER_ACQUIRE_QUIET_DONE)
+		cut = CLUSTER_ACQUIRE_QUIET_INVALID;
+	if (action == CLUSTER_ACQUIRE_QUIET_WITHDRAW && cut == CLUSTER_ACQUIRE_QUIET_GP) {
+		if ((hold != 0 && cluster_pcm_own_delivery_hold_unadopt_grant_exact(buf->buf_id,
+				base->generation, episode->reservation_token, execution->executor_sequence) != CLUSTER_PCM_OWN_OK)
+			|| cluster_pcm_own_reservation_abort_exact(buf->buf_id, base->generation,
+				episode->reservation_token, PCM_OWN_FLAG_GRANT_PENDING) != CLUSTER_PCM_OWN_OK)
+			cut = CLUSTER_ACQUIRE_QUIET_INVALID;
+		else {
+			cluster_pcm_own_snapshot_locked(buf, &live);
+			cut = CLUSTER_ACQUIRE_QUIET_IO;
+		}
+	}
+	if (cut != CLUSTER_ACQUIRE_QUIET_INVALID)
+		*out = live;
+done:
+	UnlockBufHdr(buf, state);
+	return cut;
+}
+
+static bool
+cluster_bufmgr_acquire_quiet_physical(BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
+	const ResourceXDecodedAcquireIntent *episode, const ResourceXDeliveryClaim *execution,
+	const ResourceXAcquireReadReceipt *receipt, ResourceOwner owner,
+	ClusterAcquireQuietAction action, ClusterPcmOwnSnapshot *out)
+{
+	LWLock *content = BufferDescriptorGetContentLock(buf);
+	volatile bool exact = false;
+
+	LWLockAcquire(content, LW_EXCLUSIVE);
+	PG_TRY();
+	{
+		ClusterAcquireQuietCut cut = cluster_bufmgr_acquire_quiet_native(buf, base, episode,
+			execution, receipt, owner, action, out);
+		if (action == CLUSTER_ACQUIRE_QUIET_WITHDRAW && cut == CLUSTER_ACQUIRE_QUIET_IO) {
+			AbortBufferIO(BufferDescriptorGetBuffer(buf));
+			cut = cluster_bufmgr_acquire_quiet_native(buf, base, episode, execution,
+				receipt, owner, CLUSTER_ACQUIRE_QUIET_REPLAY, out);
+		}
+		exact = action == CLUSTER_ACQUIRE_QUIET_OBSERVE
+			? cut == CLUSTER_ACQUIRE_QUIET_GP : cut == CLUSTER_ACQUIRE_QUIET_DONE;
+	}
+	PG_FINALLY();
+	{
+		LWLockRelease(content);
+	}
+	PG_END_TRY();
+	return exact;
+}
+
+ResourceXApplyResult
+cluster_bufmgr_pcm_own_acquire_quiet_disk_exact(BufferDesc *buf,
+	const ClusterPcmOwnSnapshot *base, const ResourceXDecodedAcquireIntent *episode,
+	const ResourceXDeliveryClaim *original)
+{
+	ClusterPcmOwnSnapshot entered_base, native;
+	ResourceXDecodedAcquireIntent entered;
+	ResourceXDeliveryClaim owned, current, latest;
+	ResourceXAcquireReadReceipt receipt, observed;
+	ResourceOwner owner = CurrentResourceOwner;
+	ResourceXApplyResult result;
+
+	if (buf == NULL || base == NULL || episode == NULL || original == NULL || ClusterPcmOwnArray == NULL)
+		return RESOURCE_X_APPLY_INVALID;
+	if (LWLockHeldByMe(BufferDescriptorGetContentLock(buf)))
+		return RESOURCE_X_APPLY_BAD_STATE;
+	entered_base = *base;
+	entered = *episode;
+	owned = *original;
+	if (owned.purpose != RESOURCE_X_DELIVERY_ACQUIRE_PREPARED
+		&& owned.purpose != RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING)
+		return RESOURCE_X_APPLY_INVALID;
+	owned.purpose = RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING;
+	if (!cluster_bufmgr_acquire_quiet_context(buf, &entered_base, &entered, &owned, owner))
+		return RESOURCE_X_APPLY_STALE;
+	result = cluster_pcm_lock_resource_x_requester_acquire_read_close_observe_exact(&owned, &entered, &current, &receipt);
+	if (result != RESOURCE_X_APPLY_APPLIED)
+		return result;
+	if (current.purpose == RESOURCE_X_DELIVERY_ACQUIRE_READ_ARMED) {
+		if (!cluster_bufmgr_acquire_quiet_physical(buf, &entered_base, &entered, &owned,
+				&receipt, owner, CLUSTER_ACQUIRE_QUIET_OBSERVE, &native))
+			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		result = cluster_pcm_lock_resource_x_requester_acquire_read_seal_exact(&owned, &entered, &receipt, &native);
+		if (result != RESOURCE_X_APPLY_APPLIED && result != RESOURCE_X_APPLY_DUPLICATE)
+			return result;
+	}
+	result = cluster_pcm_lock_resource_x_requester_acquire_read_close_observe_exact(&owned, &entered, &latest, &observed);
+	if (result != RESOURCE_X_APPLY_APPLIED || memcmp(&receipt, &observed, sizeof(receipt)) != 0
+		|| !cluster_bufmgr_acquire_quiet_context(buf, &entered_base, &entered, &owned, owner))
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (latest.purpose == RESOURCE_X_DELIVERY_ACQUIRE_READ_QUIET)
+		return cluster_bufmgr_acquire_quiet_physical(buf, &entered_base, &entered, &owned,
+			&receipt, owner, CLUSTER_ACQUIRE_QUIET_REPLAY, &native)
+			? RESOURCE_X_APPLY_DUPLICATE : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (latest.purpose != RESOURCE_X_DELIVERY_ACQUIRE_READ_SEALING
+		|| !cluster_bufmgr_acquire_quiet_physical(buf, &entered_base, &entered, &owned,
+			&receipt, owner, CLUSTER_ACQUIRE_QUIET_WITHDRAW, &native)
+		|| !cluster_bufmgr_acquire_quiet_context(buf, &entered_base, &entered, &owned, owner))
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	return cluster_pcm_lock_resource_x_requester_acquire_read_quiet_exact(&owned, &entered, &receipt, &native);
+}
+/* End original disk quiet handoff. */
 #endif
 
 /*

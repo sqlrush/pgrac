@@ -1720,6 +1720,8 @@ typedef struct ResourceXDeliveryTarget {
 #define RESOURCE_X_DELIVERY_ACQUIRE_READ_NOTICE UINT8_C(7)
 #define RESOURCE_X_DELIVERY_ACQUIRE_READ_CONSUMED UINT8_C(8)
 #define RESOURCE_X_DELIVERY_ACQUIRE_READ_SETTLED UINT8_C(9)
+#define RESOURCE_X_DELIVERY_ACQUIRE_READ_SEALING UINT8_C(10)
+#define RESOURCE_X_DELIVERY_ACQUIRE_READ_QUIET UINT8_C(11)
 /* Immutable evidence retained by the original full-E executor. This is not
  * caller authority or a PAGE/WAL memory-source proof for disk bytes. */
 typedef struct ResourceXAcquireReadReceipt {
@@ -2878,6 +2880,18 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_read_c
 	uint64 r4_generation);
 /* The original native executor retires NOTICE, retaining full stable S evidence. */
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_read_settle_exact(
+	const ResourceXDeliveryClaim *execution, const ResourceXDecodedAcquireIntent *episode,
+	const ResourceXAcquireReadReceipt *receipt, const struct ClusterPcmOwnSnapshot *terminal);
+
+/* Local unpublished cleanup retains the original receipt independently of
+ * live admission. QUIET is not master consumption or permission to reuse E. */
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_read_close_observe_exact(
+	const ResourceXDeliveryClaim *execution, const ResourceXDecodedAcquireIntent *episode,
+	ResourceXDeliveryClaim *current_out, ResourceXAcquireReadReceipt *receipt_out);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_read_seal_exact(
+	const ResourceXDeliveryClaim *execution, const ResourceXDecodedAcquireIntent *episode,
+	const ResourceXAcquireReadReceipt *receipt, const struct ClusterPcmOwnSnapshot *unpublished);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_read_quiet_exact(
 	const ResourceXDeliveryClaim *execution, const ResourceXDecodedAcquireIntent *episode,
 	const ResourceXAcquireReadReceipt *receipt, const struct ClusterPcmOwnSnapshot *terminal);
 
