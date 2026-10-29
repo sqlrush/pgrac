@@ -841,6 +841,30 @@ clog_recovery_cache_discard(SlruCtl ctl)
 	LWLockRelease(shared->ControlLock);
 }
 
+/* FULL replay reloads its target from disk without dropping other actual
+ * resident pages. Original SLRU eviction still loses their birth input.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static void
+clog_recovery_cache_discard_page(SlruCtl ctl, int page)
+{
+	SlruShared shared = ctl->shared;
+
+	if (!LWLockHeldByMe(shared->ControlLock))
+		LWLockAcquire(shared->ControlLock, LW_EXCLUSIVE);
+	for (int slot = 0; slot < shared->num_slots; slot++) {
+		if (shared->page_number[slot] != page)
+			continue;
+		if ((shared->page_status[slot] == SLRU_PAGE_READ_IN_PROGRESS
+			 || shared->page_status[slot] == SLRU_PAGE_WRITE_IN_PROGRESS)
+			&& LWLockHeldByMe(&shared->buffer_locks[slot].lock))
+			LWLockRelease(&shared->buffer_locks[slot].lock);
+		shared->page_status[slot] = SLRU_PAGE_EMPTY;
+		shared->page_initial_full_xid[slot] = 0;
+		shared->page_dirty[slot] = false;
+	}
+	LWLockRelease(shared->ControlLock);
+}
+
 static bool
 clog_native_directory_ready(int origin)
 {
@@ -1729,7 +1753,7 @@ cluster_clog_native_recovery_verify_v1(int origin, TransactionId xid, int nsubxi
 
 /* Retained ZERO may create a page; terminal replay alone never may. */
 static bool
-clog_recovery_zero(int origin, int page, bool verify)
+clog_recovery_zero(int origin, int page, bool verify, bool full)
 {
 	SlruCtl ctl = &ClogRecoveryCtl[origin];
 	char path[MAXPGPATH];
@@ -1737,7 +1761,10 @@ clog_recovery_zero(int origin, int page, bool verify)
 	bool exists, ok;
 	int slot;
 
-	clog_recovery_cache_discard(ctl);
+	if (full)
+		clog_recovery_cache_discard_page(ctl, page);
+	else
+		clog_recovery_cache_discard(ctl);
 	if (!clog_recovery_directory_ready(origin))
 		return false;
 	snprintf(path, sizeof(path), "%s/%04X", ctl->Dir, page / SLRU_PAGES_PER_SEGMENT);
@@ -1771,7 +1798,7 @@ clog_recovery_zero(int origin, int page, bool verify)
 	if (!clog_recovery_permitted(origin) || !clog_recovery_sync(ctl, page, &after)
 		|| !clog_recovery_sync(ctl, -1, NULL))
 		return false;
-	return clog_recovery_zero(origin, page, true);
+	return clog_recovery_zero(origin, page, true, full);
 }
 
 typedef struct ClogRecoveryTruncate {
@@ -2098,7 +2125,8 @@ clog_recovery_record(int origin, const ClusterSideProjectionOperationV1 *op, boo
 		locked = true;
 		LWLockAcquire(lock, LW_EXCLUSIVE);
 		ok = op->action == CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE
-				 ? clog_recovery_zero(origin, op->page_number, verify)
+				 ? clog_recovery_zero(origin, op->page_number, verify,
+									  op->normalized_info == CLOG_ZEROPAGE_FULL)
 				 : clog_recovery_truncate(origin, op->page_number, verify);
 		if (ok && !verify && op->normalized_info == CLOG_ZEROPAGE_FULL) {
 			SlruShared shared = ctl->shared;
@@ -2123,8 +2151,10 @@ clog_recovery_record(int origin, const ClusterSideProjectionOperationV1 *op, boo
 				}
 			}
 			LWLockRelease(shared->ControlLock);
-			retain_cache = ok;
 		}
+		/* Verification keeps unrelated slots, but its disk reload supplies
+		 * no target birth. Any failure still discards the complete cache. */
+		retain_cache = ok && op->normalized_info == CLOG_ZEROPAGE_FULL;
 		finished = true;
 	}
 	PG_FINALLY();
