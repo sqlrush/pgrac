@@ -18,6 +18,8 @@ UT_TEST(test_original_recovered_claim_spans_eor_pending_service_and_handoff)
 	if (!claim_held) return;
 	UT_ASSERT(ClusterBeginColdRecoveryTx(&info));
 	UT_ASSERT(cluster_cold_recovery_consume_loser_inputs_v1(info.cluster_tx_start));
+	/* Original pass-2 route coverage precedes this empty service handoff. */
+	effects_ready = true;
 	serving_actor(); UT_ASSERT(cluster_recovery_tx_result_accept_v1()); startup_actor();
 	tx_wait_destroy_base = input_destroys;
 	ctrc_wait_step = claim_service_accept_on_third_poll;

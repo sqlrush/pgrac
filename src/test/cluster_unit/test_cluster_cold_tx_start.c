@@ -2401,8 +2401,19 @@ static void startup_local_empty_reset(void);
 
 #include "test_cluster_cold_ctrc_tx_forest_terminals.inc"
 
+#include "test_cluster_cold_ctrc_effects_receipt.inc"
+
 int main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_START_EFFECTS_RECEIPT") != NULL) {
+		UT_PLAN(5);
+		UT_RUN(test_startup_effects_receipt_keeps_fpi_unchanged_and_zero_page_input);
+		UT_RUN(test_startup_effects_receipt_late_unready_refuses_service_and_retry);
+		UT_RUN(test_startup_effects_receipt_complete_value_cannot_change_after_page_checks);
+		UT_RUN(test_startup_effects_receipt_local_wait_cannot_rebase_original_input);
+		UT_RUN(test_startup_effects_receipt_error_keeps_original_cleanup_debt);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_START_TX_FOREST_TERMINALS") != NULL) {
 		UT_PLAN(5);
 		UT_RUN(test_startup_tx_forest_covers_complete_native_records_and_empty_end);
@@ -2791,9 +2802,9 @@ int main(void)
 	}
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_FIRST
-	UT_PLAN(331);
+	UT_PLAN(336);
 #else
-	UT_PLAN(327);
+	UT_PLAN(332);
 #endif
 	UT_RUN(test_startup_native_images_accept_only_unchanged_complete_terminal_page);
 	UT_RUN(test_startup_native_images_reject_unresolved_ambiguous_and_mx_itls);
@@ -2804,8 +2815,13 @@ int main(void)
 	UT_RUN(test_startup_native_directory_real_origin_cannot_be_discharged_by_wait);
 	UT_RUN(test_startup_native_directory_invalid_layout_and_partial_error_keep_debt);
 #else
-	UT_PLAN(319);
+	UT_PLAN(324);
 #endif
+	UT_RUN(test_startup_effects_receipt_keeps_fpi_unchanged_and_zero_page_input);
+	UT_RUN(test_startup_effects_receipt_late_unready_refuses_service_and_retry);
+	UT_RUN(test_startup_effects_receipt_complete_value_cannot_change_after_page_checks);
+	UT_RUN(test_startup_effects_receipt_local_wait_cannot_rebase_original_input);
+	UT_RUN(test_startup_effects_receipt_error_keeps_original_cleanup_debt);
 	UT_RUN(test_startup_tx_forest_covers_complete_native_records_and_empty_end);
 	UT_RUN(test_startup_tx_forest_nonroot_full_identity_requires_canonical_terminal);
 	UT_RUN(test_startup_tx_forest_incomplete_record_or_end_refuses_service);

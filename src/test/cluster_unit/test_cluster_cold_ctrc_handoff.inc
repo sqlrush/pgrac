@@ -18,6 +18,8 @@ UT_TEST(test_startup_retains_inputs_until_independent_ctrc_acceptance)
 	reset(); retain(); UT_ASSERT(ClusterBeginColdRecoveryTx(&info));
 	tx_wait_destroy_base = input_destroys;
 	UT_ASSERT(cluster_cold_recovery_consume_loser_inputs_v1(info.cluster_tx_start));
+	/* Original pass-2 route coverage precedes this empty service handoff. */
+	effects_ready = true;
 	serving_actor(); UT_ASSERT(cluster_recovery_tx_result_accept_v1()); startup_actor();
 	UT_ASSERT_EQ(window_region.checkpoint_owner.ctrc_accepted_generation, 0);
 	ctrc_wait_step = ctrc_handoff_accept_on_third_poll;
@@ -36,6 +38,8 @@ ctrc_handoff_fixture(bool pending, bool accepted)
 	tx_wait_destroy_base = input_destroys;
 	if (pending) ctrc_census.subject_count = ctrc_census.unresolved_count = 1;
 	UT_ASSERT(cluster_cold_recovery_consume_loser_inputs_v1(info.cluster_tx_start));
+	/* This handoff follows the original completed pass-2 route leaf. */
+	effects_ready = true;
 	serving_actor(); UT_ASSERT(cluster_recovery_tx_result_accept_v1());
 	if (accepted) UT_ASSERT(cluster_recovery_ctrc_result_accept_v1());
 	startup_actor();

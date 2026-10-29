@@ -2833,8 +2833,8 @@ cluster_recovery_cold_page_completed_recheck(const struct ClusterRecoveryStartV1
 /* Finish each exact bufferless FPI operation through the original protected
  * readback/current/local-debt path. Keep its full value and same raw FD for
  * the remaining fixed graph and independent joint service, not a new owner. */
-bool
-ClusterColdRecoveryCtrcPageDrain(const struct ClusterRecoveryStartV1 *start,
+static bool
+cluster_recovery_cold_page_drain(const struct ClusterRecoveryStartV1 *start,
 	Size memory_budget)
 {
 	struct ClusterRecoveryStartV1 *state;
@@ -2919,6 +2919,48 @@ ClusterColdRecoveryCtrcPageDrain(const struct ClusterRecoveryStartV1 *start,
 			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
 				100L, WAIT_EVENT_CLUSTER_THREAD_RECOVERY);
 			HandleStartupProcInterrupts();
+		}
+	}
+	PG_CATCH();
+	{
+		cluster_recovery_cold_page_plan_refuse(state, RF_PAGE_PROOF_DETAIL_INTERNAL);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (!ready) cluster_recovery_cold_page_plan_refuse(state, RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH);
+	return ready;
+}
+
+
+/* PGRAC: keep the original pass-2 input fixed across PAGE drain and local
+ * waits. Route coverage is an input to the final handoff, not durability or
+ * independent completion authority. The original typed owner still owns it. */
+bool
+ClusterColdRecoveryCtrcPageDrain(const struct ClusterRecoveryStartV1 *start,
+	Size memory_budget)
+{
+	struct ClusterRecoveryStartV1 *state;
+	bool ready = false;
+
+	if (start == NULL) return true;
+	if (!cluster_recovery_cold_ctrc_replays_actor() || start != cluster_recovery_cold_start)
+		return false;
+	state = cluster_recovery_cold_start;
+	PG_TRY();
+	{
+		const ClusterColdTypedV1 *typed = ClusterColdRecoveryTxInputs(start);
+
+		if (typed != NULL && cluster_cold_typed_effects_ready_v1(typed)) {
+			ClusterColdEffectsReceiptV1 receipt;
+
+			/* Copy the original representation, including every participant's
+			 * proof/result suffix; no receipt can be rebuilt after a wait. */
+			memcpy(&receipt, &typed->effects_receipt, sizeof(receipt));
+			ready = cluster_recovery_cold_page_drain(start, memory_budget)
+				&& ClusterColdRecoveryTxInputs(start) == typed
+				&& cluster_cold_typed_effects_ready_v1(typed)
+				&& start == cluster_recovery_cold_start && state->inputs == typed
+				&& memcmp(&receipt, &typed->effects_receipt, sizeof(receipt)) == 0;
 		}
 	}
 	PG_CATCH();

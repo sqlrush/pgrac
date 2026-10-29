@@ -10830,3 +10830,6 @@ test_cluster_cold_tx_start: test_cluster_cold_ctrc_tx_reference_edges.inc
 
 # Final Startup checks the complete original native TX forest.
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_tx_forest_terminals.inc
+
+# Final Startup retains the original pass-2 effects input across PAGE drain.
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_effects_receipt.inc
