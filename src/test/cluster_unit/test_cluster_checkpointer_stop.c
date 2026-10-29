@@ -28,6 +28,7 @@
 #undef fprintf
 #include "unit_test.h"
 UT_DEFINE_GLOBALS();
+#include "test_cluster_wal_inputs_empty_jobs_fixture.h"
 
 static jmp_buf exit_boundary;
 static int exit_code, checkpoint_calls, stopped_calls, complete_calls, prepare_calls;

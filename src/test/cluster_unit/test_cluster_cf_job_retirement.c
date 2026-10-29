@@ -48,6 +48,7 @@ SetLatch(Latch *latch)
 {
 	UT_ASSERT(latch == MyLatch);
 	job_wakes++;
+	latch->is_set = true;
 }
 
 #include "test_cluster_cf_job_ack.inc"

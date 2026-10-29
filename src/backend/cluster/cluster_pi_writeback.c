@@ -888,13 +888,20 @@ wb_background(void)
 void
 cluster_pi_writeback_bgwriter_quiesced_v1(void)
 {
+	ClusterWalInputsJobResultV1 inputs;
+
 	/* The original BG loop calls after its ordinary flush pass has returned
 	 * or was suppressed. Existing WB I/O is independently retained below. */
 	if (MyBackendType != B_BG_WRITER || wb_shared == NULL || CritSectionCount != 0
 		|| !cluster_normal_stop_requested())
 		return;
+	inputs = cluster_wal_inputs_jobs_stop_census_v1();
+	if (inputs == WAL_INPUT_JOB_INVALID)
+		elog(FATAL, "invalid original bgwriter input job during normal stop");
 	SpinLockAcquire(&wb_shared->lock);
-	wb_shared->bgwriter_flush_quiesced = true;
+	/* This existing shared cut also retains the original input cleanup.
+	 * A drained input job is not a physical writeback completion. */
+	wb_shared->bgwriter_flush_quiesced = inputs == WAL_INPUT_JOB_DONE;
 	SpinLockRelease(&wb_shared->lock);
 }
 

@@ -144,7 +144,7 @@ TESTS = test_cluster_relmap_lock test_cluster_vm_read_visibility test_cluster_he
 		test_cluster_wal_inputs_job_cf \
 		test_cluster_wal_inputs_job_begin \
 		test_cluster_wal_inputs_job_revalidate \
-		test_cluster_wal_inputs_job_lifecycle \
+		test_cluster_wal_inputs_job_lifecycle test_cluster_wal_inputs_job_service \
 		test_cluster_control_walr \
 		test_cluster_control_ir \
 		test_cluster_recovery_cold_cut test_cluster_typed_redo \
@@ -431,7 +431,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_wal_inputs_job_scope,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_wal_inputs_job_cf,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_wal_inputs_job_begin,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_wal_inputs_job_revalidate,$(SIMPLE_TESTS))
-SIMPLE_TESTS := $(filter-out test_cluster_wal_inputs_job_lifecycle,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_wal_inputs_job_lifecycle test_cluster_wal_inputs_job_service,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_heap_cr_reuse test_cluster_snapshot_admission test_cluster_undo_header_durability test_cluster_tt_2pc_finish test_cluster_control_transport test_cluster_cr_native_origin test_cluster_cr_mvcc_origin test_cluster_tt_abort_owner test_cluster_tt_active_owner test_cluster_pcm_aux_consumer test_cluster_pcm_aux_reobserve test_cluster_multixact_current_stats test_cluster_vacuum_native_window test_cluster_subtrans_watermark \
 		test_cluster_r4_production_reachability test_cluster_heap_update_temp_lock test_cluster_heap_dml_lifetime \
 		test_cluster_pcm_aux_mutation test_cluster_heap_extend_current test_cluster_heap_pair_scope \
@@ -13388,3 +13388,86 @@ test_cluster_wal_inputs_job_cut_bodies.inc: $(top_srcdir)/src/backend/cluster/cl
 	     emit { print } /^}/ { emit=0 } { prev=$$0 } \
 	     END { if (count != 18 || emit) exit 1 }' $< >> $@.tmp
 	mv $@.tmp $@
+
+# Actual original Aux latch-reset/service prefixes; no copied polling loop.
+test_cluster_wal_inputs_job_bgwriter.inc: $(top_srcdir)/src/backend/postmaster/bgwriter.c Makefile
+	awk '/Clear any already-pending wakeups/ { emit=1; blocks++ } \
+	     emit && /HandleMainLoopInterrupts\(\);/ { print; emit=0; next } \
+	     emit { print } END { if (blocks != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_wal_inputs_job_checkpointer.inc: $(top_srcdir)/src/backend/postmaster/checkpointer.c Makefile
+	awk '/Clear any already-pending wakeups/ { emit=1; blocks++ } \
+	     emit && /pi_pending = cluster_ko_shared_native_poll_v2\(\);/ { print "#endif"; emit=0; next } \
+	     emit { print } END { if (blocks != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_wal_inputs_job_service: test_cluster_wal_inputs_job_service.c \
+		test_cluster_wal_inputs_job_pin.c test_cluster_wal_inputs_job.c \
+		test_cluster_cf_job_retirement.c test_cluster_cf_enqueue.c unit_test.h \
+		test_cluster_cf_job_ack.inc test_cluster_wal_inputs_job_callback.inc \
+		test_cluster_wal_inputs_job_bgwriter.inc test_cluster_wal_inputs_job_checkpointer.inc \
+		test_cluster_wal_inputs_job_pin_fixture.h test_cluster_wal_inputs_job_pin_types.inc \
+		test_cluster_wal_inputs_job_pin_bodies.inc test_cluster_control_walr.inc \
+		test_cluster_wal_inputs_job_scope_fixture.h test_cluster_wal_inputs_job_scope_types.inc \
+		test_cluster_wal_inputs_job_scope_bodies.inc \
+		test_cluster_cf_blocker_trace.inc test_cluster_startup_interrupt.inc \
+		test_cluster_startup_interrupt_fixture.h \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_inputs_job.c \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_inputs_job_private.h \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_cut_job_private.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_retention.h \
+		$(CLUSTER_CF_ENQUEUE_O) $(CLUSTER_LOCK_OWNER_O) $(CLUSTER_CONTROL_REQUEST_O) \
+		$(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(top_srcdir)/src/backend/cluster $< \
+		$(CLUSTER_CF_ENQUEUE_O) $(CLUSTER_LOCK_OWNER_O) $(CLUSTER_CONTROL_REQUEST_O) \
+		$(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+test_cluster_wal_inputs_job_stop.inc: $(top_srcdir)/src/backend/cluster/cluster_clean_leave.c Makefile
+	awk '/^cl_normal_stop_checkpoint_run\(/ { owner=1 } \
+	     owner && /ResetLatch\(MyLatch\);/ { emit=1; blocks++ } \
+	     emit && /if \(step == 0 && !after_checkpoint/ { emit=0; owner=0; next } \
+	     emit { print } END { if (blocks != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_wal_inputs_job_quiesce.inc: $(top_srcdir)/src/backend/cluster/cluster_pi_writeback.c Makefile
+	awk '/^typedef struct WritebackShared/ { emit=1; types++ } \
+	     /^cluster_pi_writeback_bgwriter_quiesced_v1\(/ { print "void"; emit=1; functions++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (types != 1 || functions != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_wal_inputs_job_service: test_cluster_wal_inputs_job_stop.inc test_cluster_wal_inputs_job_quiesce.inc
+
+test_cluster_wal_inputs_job_stop_module.inc: $(top_srcdir)/src/backend/cluster/cluster_clean_leave.c Makefile
+	awk '/^cl_normal_stop_modules_poll\(/ { owner=1 } \
+	     owner && /^[ \t]*case 15:/ { emit=1; cases++ } \
+	     emit { print } emit && /^[ \t]*break;/ { emit=0; owner=0 } \
+	     END { if (cases != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_wal_inputs_job_service: test_cluster_wal_inputs_job_stop_module.inc
+
+# These existing fixtures exercise only the actual empty original job table.
+test_cluster_wal_inputs_empty_jobs.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_inputs_job.c Makefile
+	awk '/^inputs_job_empty\(/ { print "static bool"; emit=1; functions++ } \
+	     /^cluster_wal_inputs_jobs_stop_census_v1\(/ { print "ClusterWalInputsJobResultV1"; emit=1; functions++ } \
+	     /^cluster_wal_inputs_jobs_service_poll_v1\(/ { print "void"; emit=1; functions++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (functions != 3 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_checkpointer_stop test_cluster_checkpoint_error test_cluster_normal_stop test_cluster_pi_writeback: \
+		test_cluster_wal_inputs_empty_jobs_fixture.h test_cluster_wal_inputs_empty_jobs.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_inputs_job_private.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h
+
+test_cluster_wal_inputs_job_stopped.inc: $(top_srcdir)/src/backend/postmaster/checkpointer.c Makefile
+	awk '/ClusterCfAttemptObservation waiting =/ { owner=1 } \
+	     owner && /ResetLatch\(MyLatch\);/ { emit=1; blocks++ } \
+	     emit && /if \(cluster_cf_held_is_usable/ { emit=0; owner=0; next } \
+	     emit { print } END { if (blocks != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_wal_inputs_job_service: test_cluster_wal_inputs_job_stopped.inc

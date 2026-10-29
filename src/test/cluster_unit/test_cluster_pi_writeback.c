@@ -20,6 +20,7 @@ extern void *ShmemInitStruct(const char *name, Size size, bool *found);
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_wal_inputs.h"
+#include "test_cluster_wal_inputs_empty_jobs_fixture.h"
 #include "cluster/cluster_pi_rebuild.h"
 #include "storage/buffile.h"
 #include "storage/ipc.h"

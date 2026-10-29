@@ -43,6 +43,7 @@
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+#include "test_cluster_wal_inputs_empty_jobs_fixture.h"
 bool cluster_trace_cleanup;
 bool cluster_trace_normal_stop;
 static unsigned stop_trace_records, stop_trace_ko_calls;
