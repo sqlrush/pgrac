@@ -51,6 +51,12 @@ typedef struct SlruSharedData
 	SlruPageStatus *page_status;
 	bool	   *page_dirty;
 	int		   *page_number;
+#ifdef USE_PGRAC_CLUSTER
+	/* Native FULL CLOG initialization input for this resident slot only.
+	 * Protected by ControlLock; zero on every slot reassignment/zero/empty.
+	 * Disk reloads cannot reconstruct it, and no other SLRU sets it. */
+	uint64     *page_initial_full_xid;
+#endif
 	int		   *page_lru_count;
 	LWLockPadded *buffer_locks;
 

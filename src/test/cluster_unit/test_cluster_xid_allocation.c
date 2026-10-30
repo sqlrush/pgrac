@@ -118,12 +118,18 @@ static FullTransactionId real_reserved_candidate;
 
 #define proc entries[0]
 #ifdef TEST_CLUSTER_XID_NATIVE_CLOG
+#ifdef TEST_CLUSTER_EPISODE_ALLOCATOR
+#undef ExtendCLOGFull
+#endif
 #define ExtendCLOGFull xid_fixture_extend_full
 void xid_fixture_extend_full(FullTransactionId candidate);
 #endif
 #include "test_cluster_xid_full_clog.inc"
 #ifdef TEST_CLUSTER_XID_NATIVE_CLOG
 #undef ExtendCLOGFull
+#ifdef TEST_CLUSTER_EPISODE_ALLOCATOR
+#define ExtendCLOGFull d3_episode_allocator_ExtendCLOGFull
+#endif
 #include "test_cluster_xid_native_clog.inc"
 #endif
 #undef proc
@@ -137,6 +143,15 @@ static FullTransactionId allocation_real_slot_floor(void);
 static FullTransactionId allocation_real_herding_floor(void);
 
 /* Aliases only isolate these actual bodies from the original cases' leaves. */
+#ifdef TEST_CLUSTER_EPISODE_ALLOCATOR
+#undef cluster_xid_stripe_sample_future
+#undef cluster_xid_stripe_sample_fence_current
+#undef cluster_xid_stripe_lease_ready
+#undef cluster_xid_stripe_window_exceeded
+#undef cluster_xid_wrap_barrier_passed
+#undef cluster_xid_stripe_my_slot_floor
+#undef cluster_xid_stripe_herding_floor
+#endif
 #define cluster_xid_stripe_sample_future allocation_real_future
 #define cluster_xid_stripe_sample_fence_current allocation_real_fence_current
 #define cluster_xid_stripe_lease_ready allocation_real_lease_ready
@@ -152,6 +167,15 @@ static FullTransactionId allocation_real_herding_floor(void);
 #undef cluster_xid_wrap_barrier_passed
 #undef cluster_xid_stripe_my_slot_floor
 #undef cluster_xid_stripe_herding_floor
+#ifdef TEST_CLUSTER_EPISODE_ALLOCATOR
+#define cluster_xid_stripe_sample_future d3_episode_allocator_cluster_xid_stripe_sample_future
+#define cluster_xid_stripe_sample_fence_current d3_episode_allocator_cluster_xid_stripe_sample_fence_current
+#define cluster_xid_stripe_lease_ready d3_episode_allocator_cluster_xid_stripe_lease_ready
+#define cluster_xid_stripe_window_exceeded d3_episode_allocator_cluster_xid_stripe_window_exceeded
+#define cluster_xid_wrap_barrier_passed d3_episode_allocator_cluster_xid_wrap_barrier_passed
+#define cluster_xid_stripe_my_slot_floor d3_episode_allocator_cluster_xid_stripe_my_slot_floor
+#define cluster_xid_stripe_herding_floor d3_episode_allocator_cluster_xid_stripe_herding_floor
+#endif
 static ClusterXidStripeBootShmem allocation_boot;
 
 void
@@ -402,6 +426,10 @@ ExceptionalCondition(const char *condition, const char *file, int line)
 #ifndef CLUSTER_XID_RETENTION_TEST
 #undef errstart
 #undef errstart_cold
+#ifdef TEST_CLUSTER_EPISODE_ALLOCATOR
+#define errstart d3_episode_allocator_errstart
+#define errstart_cold d3_episode_allocator_errstart_cold
+#endif
 bool
 errstart(int level, const char *domain)
 {
@@ -469,6 +497,9 @@ cluster_relmap_owner_terminal_matches_v2(const ClusterRelmapOwnerSampleV2 *owner
 	return false;
 } /* No original-owner authority in this fixture. */
 bool c_allocator_relmap_LWLockHeldByMe(LWLock *lock);
+#ifdef TEST_CLUSTER_EPISODE_ALLOCATOR
+#undef LWLockHeldByMe
+#endif
 #define LWLockHeldByMe c_allocator_relmap_LWLockHeldByMe
 bool
 LWLockHeldByMe(LWLock *lock)
@@ -481,6 +512,9 @@ LWLockHeldByMe(LWLock *lock)
 }
 #include "../../backend/cluster/cluster_relmap_recovery.c"
 #undef LWLockHeldByMe
+#ifdef TEST_CLUSTER_EPISODE_ALLOCATOR
+#define LWLockHeldByMe d3_episode_allocator_LWLockHeldByMe
+#endif
 
 /* The real allocator calls through this test-only observation, which checks
  * original ProcArray publication before delegating to the product tracker. */
@@ -500,12 +534,18 @@ native_publication_checked(FullTransactionId issued)
 #endif
 	cluster_relmap_recovery_issued_publish(issued);
 }
+#ifdef TEST_CLUSTER_EPISODE_ALLOCATOR
+#undef cluster_relmap_recovery_issued_publish
+#endif
 #define cluster_relmap_recovery_issued_publish native_publication_checked
 #ifndef CLUSTER_XID_ALLOCATOR_BODY
 #define CLUSTER_XID_ALLOCATOR_BODY "test_cluster_xid_allocation.inc"
 #endif
 #include CLUSTER_XID_ALLOCATOR_BODY
 #undef cluster_relmap_recovery_issued_publish
+#ifdef TEST_CLUSTER_EPISODE_ALLOCATOR
+#define cluster_relmap_recovery_issued_publish d3_episode_allocator_cluster_relmap_recovery_issued_publish
+#endif
 
 static void
 reset_allocator(void)
