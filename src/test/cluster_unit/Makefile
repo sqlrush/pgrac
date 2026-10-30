@@ -3497,6 +3497,29 @@ test_cluster_vm_redo_consumers.inc: $(top_srcdir)/src/backend/access/heap/heapam
 TESTS += test_cluster_vm_clear_layout test_cluster_vm_clear_layout_noassert
 all: test_cluster_vm_clear_layout test_cluster_vm_clear_layout_noassert
 
+# Cache-only AF observation below an existing heap content lock.
+TESTS += test_cluster_vm_clear_local_read test_cluster_vm_clear_local_read_noassert
+all: test_cluster_vm_clear_local_read test_cluster_vm_clear_local_read_noassert
+
+test_cluster_vm_clear_local_read.inc: extract_vm_clear_local_fixture.py \
+		extract_vacuum_mx_fixture.py $(top_srcdir)/src/backend/access/heap/visibilitymap.c \
+		$(top_srcdir)/src/backend/access/heap/heapam.c \
+		$(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	python3 $(srcdir)/extract_vm_clear_local_fixture.py $(top_srcdir)/src/backend > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_vm_clear_local_read test_cluster_vm_clear_local_read_noassert: \
+		test_cluster_vm_clear_local_read.c test_cluster_vm_clear_local_read.inc \
+		test_cluster_space_bufpage_product.o unit_test.h $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(if $(filter %_noassert,$@),-DFIXTURE_NO_ASSERTS) \
+		-ffunction-sections -fdata-sections $< test_cluster_space_bufpage_product.o \
+		$(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
+.PHONY: clean-vm-clear-local-read
+clean-vm-clear-local-read:
+	rm -f test_cluster_vm_clear_local_read.inc test_cluster_vm_clear_local_read.inc.tmp
+clean distclean maintainer-clean: clean-vm-clear-local-read
+
 test_cluster_vm_clear_layout_product.o test_cluster_vm_clear_layout_product_noassert.o: \
 		test_cluster_vm_clear_product.c $(top_srcdir)/src/backend/access/heap/visibilitymap.c \
 		$(top_srcdir)/src/include/access/visibilitymap.h Makefile
@@ -12982,8 +13005,8 @@ test_cluster_vacuum_proof_guard.inc: $(top_srcdir)/src/backend/cluster/cluster_r
 # Keep the parent reproducible: its two native wrappers precede the new pair.
 # The production caller links the new pair when present, so it cannot be stubbed.
 test_cluster_vacuum_proof_release.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
-	awk '/^(ReleaseBuffer|UnlockReleaseBuffer|ClusterUnlockReleaseBufferAfterConditionalRead|ClusterUnlockReleaseBufferAfterConditionalHint|ClusterUnlockBufferAfterConditionalMutation|ClusterUnlockReleaseBufferAfterConditionalMutation)\(/ { print "void"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found < 2 || found > 6) exit 1 }' $< > $@.tmp
+	awk '/^(ReleaseBuffer|UnlockReleaseBuffer|ClusterUnlockBufferAfterConditionalRead|ClusterUnlockReleaseBufferAfterConditionalRead|ClusterUnlockReleaseBufferAfterConditionalHint|ClusterUnlockBufferAfterConditionalMutation|ClusterUnlockReleaseBufferAfterConditionalMutation)\(/ { print "void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found < 2 || found > 7) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Actual generic-unlock cache-off decision; only the remote/mirror leaves vary.

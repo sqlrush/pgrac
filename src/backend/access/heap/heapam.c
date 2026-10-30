@@ -11594,10 +11594,11 @@ cluster_heap_lock_with_vm_repin(Relation relation, BlockNumber heap_block, Buffe
 /*
  * A tuple lock preserves all-visible and only clears all-frozen.  The caller
  * holds heap content X and the exact VM pin.  A set bit conservatively asks
- * for the original VM-X path.  A clear bit can skip that path only after a
- * qualified current SHARE read; a clean nested-barrier refusal is not proof
- * and falls back to the existing X acquisition/retry.  Heap X prevents this
- * heap block's frozen bit from being set after the qualified observation.
+ * for the original VM-X path. A clear bit can skip that path only under a
+ * local conditional current SHARE read. Missing authority or contention
+ * falls back to the existing X acquisition/retry, never a nested S fetch.
+ * Heap X prevents this heap block's frozen bit from being set after the
+ * qualified observation.
  */
 static bool
 cluster_heap_lock_vm_needs_clear(Relation relation, BlockNumber heap_block, Buffer vmbuffer)
@@ -11618,13 +11619,20 @@ cluster_heap_lock_vm_needs_clear(Relation relation, BlockNumber heap_block, Buff
 		return true;
 	if (visibilitymap_get_status(relation, heap_block, &vmbuffer) & VISIBILITYMAP_ALL_FROZEN)
 		return true;
-	if (!ClusterLockBufferShareBarrierAware(vmbuffer))
+	if (!ClusterConditionalLockBufferShare(vmbuffer))
 		return true;
 	/* A coherent grant does not make a malformed/unversioned bitmap a
 	 * proved zero. The decoder cannot acquire or replace the borrowed pin. */
-	needed = !visibilitymap_get_status_pinned(relation, heap_block, vmbuffer, &status)
-			 || (status & VISIBILITYMAP_ALL_FROZEN) != 0;
-	LockBuffer(vmbuffer, BUFFER_LOCK_UNLOCK);
+	PG_TRY();
+	{
+		needed = !visibilitymap_get_status_pinned(relation, heap_block, vmbuffer, &status)
+				 || (status & VISIBILITYMAP_ALL_FROZEN) != 0;
+	}
+	PG_FINALLY();
+	{
+		ClusterUnlockBufferAfterConditionalRead(vmbuffer);
+	}
+	PG_END_TRY();
 	return needed;
 }
 #endif

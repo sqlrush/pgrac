@@ -42,6 +42,18 @@
 
 UT_DEFINE_GLOBALS();
 
+/* The actual AF decision now owns an exception-safe local read bracket.
+ * This publication fixture has no injected decoder ERROR; never fabricate a
+ * successful exception return. The dedicated local-read fixture exercises it. */
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+
+void
+pg_re_throw(void)
+{
+	abort();
+}
+
 /* Version/storage leaves run online; this is not recovered admission. */
 BackendType MyBackendType = B_BACKEND;
 ClusterNormalStartState
@@ -307,6 +319,20 @@ ClusterLockBufferShareBarrierAware(Buffer buffer)
 	else if (vm_refresh_invalid == 3)
 		tags[1].relNumber++;
 	return true;
+}
+
+/* Controlled scheduling/image leaves for the actual AF decision. The new
+ * cache-only entrance itself is exercised by test_cluster_vm_clear_local_read. */
+bool
+ClusterConditionalLockBufferShare(Buffer buffer)
+{
+	return ClusterLockBufferShareBarrierAware(buffer);
+}
+
+void
+ClusterUnlockBufferAfterConditionalRead(Buffer buffer)
+{
+	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 }
 
 void

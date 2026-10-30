@@ -16163,6 +16163,63 @@ ClusterBufferHasSharedPin(Buffer buffer)
 	return buffer > 0 && buffer <= NBuffers && GetPrivateRefCount(buffer) > 0;
 }
 
+/* Borrow an existing coherent S/X image without conversion, reservation,
+ * repin or waiting. This entrance is only for pinned tracked shared buffers;
+ * READ_IMAGE belongs to its original installing bracket and cannot be reused.
+ * A caller may already hold another content lock. Consume only the original
+ * pin's object admission, and leave both node ownership and pin unchanged. */
+bool
+ClusterConditionalLockBufferShare(Buffer buffer)
+{
+#ifdef USE_PGRAC_CLUSTER
+	BufferDesc *buf;
+	ClusterPcmOwnSnapshot own;
+	volatile bool usable = false;
+
+	if (!ClusterBufferHasSharedPin(buffer) || !cluster_pcm_is_active())
+		return false;
+	buf = GetBufferDescriptor(buffer - 1);
+	if (!cluster_bufmgr_should_pcm_track(buf)
+		|| LWLockHeldByMe(BufferDescriptorGetContentLock(buf))
+		|| !LWLockConditionalAcquire(BufferDescriptorGetContentLock(buf), LW_SHARED))
+		return false;
+
+	PG_TRY();
+	{
+		bool valid = cluster_bufmgr_pcm_own_snapshot(buf, &own) == CLUSTER_PCM_OWN_OK
+			&& own.buffer_type == (uint8) BUF_TYPE_CURRENT
+			&& (own.semantic_buf_state & (BM_TAG_VALID | BM_VALID | BM_IO_IN_PROGRESS | BM_IO_ERROR))
+				== (BM_TAG_VALID | BM_VALID)
+			&& (own.pcm_state == (uint8) PCM_STATE_S || own.pcm_state == (uint8) PCM_STATE_X)
+			&& own.flags == 0 && own.generation != 0 && own.generation != UINT64_MAX
+			&& own.reservation_token != UINT64_MAX
+			&& cluster_pcm_x_activation_fence_open(own.writer_activation_token,
+				own.resource_x_activation_generation);
+		if (valid && cluster_enabled && cluster_shared_config
+			&& cluster_interconnect_tier == CLUSTER_IC_TIER_1
+			&& cluster_smgr_which_for(BufTagGetRelFileLocator(&own.tag), InvalidBackendId) == 1)
+		{
+			PrivateRefCountEntry *ref = GetPrivateRefCountEntry(buffer, false);
+
+			valid = ref != NULL && ref->refcount > 0
+				&& cluster_ko_peer_current_valid_v3(&ref->ko_current,
+					BufTagGetRelFileLocator(&own.tag), own.tag.forkNum, own.tag.blockNum);
+		}
+		usable = valid;
+	}
+	PG_FINALLY();
+	{
+		if (!usable)
+			LWLockRelease(BufferDescriptorGetContentLock(buf));
+	}
+	PG_END_TRY();
+	return usable;
+#else
+	(void)buffer;
+	return false;
+#endif
+}
+
 /* Retain only this backend's original post-T3 use proof.  The caller must
  * already hold its pin and native content-X; descriptor residency, local-X
  * alone and a cached node-level X cannot manufacture a writer ledger. */
@@ -16328,8 +16385,8 @@ ClusterUnlockReleaseBufferAfterConditionalMutation(Buffer buffer)
 }
 
 /*
- * Release a pin and the local content lock after a read-only successful
- * ConditionalLockBuffer().  That acquisition did not acquire PCM ownership or
+ * Release the local content lock (and optionally the pin) after a read-only
+ * ConditionalLockBuffer() or ClusterConditionalLockBufferShare(). Neither acquired PCM ownership or
  * enter its writer ledger.  In particular, a generic LockBuffer(UNLOCK) here
  * could perform a synchronous PCM release when local caching is disabled,
  * raising an ERROR before the pin is released or replacing an unwinding ERROR.
@@ -16340,10 +16397,16 @@ ClusterUnlockReleaseBufferAfterConditionalMutation(Buffer buffer)
  * that modified the page after ConditionalLockBuffer().
  */
 void
-ClusterUnlockReleaseBufferAfterConditionalRead(Buffer buffer)
+ClusterUnlockBufferAfterConditionalRead(Buffer buffer)
 {
 	if (!BufferIsLocal(buffer))
 		LWLockRelease(BufferDescriptorGetContentLock(GetBufferDescriptor(buffer - 1)));
+}
+
+void
+ClusterUnlockReleaseBufferAfterConditionalRead(Buffer buffer)
+{
+	ClusterUnlockBufferAfterConditionalRead(buffer);
 	ReleaseBuffer(buffer);
 }
 
