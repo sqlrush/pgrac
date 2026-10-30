@@ -699,13 +699,13 @@ undo_prepare_tt_slot(const ClusterUndoDecoded *decoded, UndoSegmentHeaderData *h
 
 /* V2 has an explicit target layout. It must never pass through the TT32
  * execution gates or borrow identity from a raw-only predecessor. */
-static bool
-undo_tt_v2_preflight(const ClusterUndoDecoded *decoded)
+bool
+cluster_undo_preflight_tt_v2(const ClusterUndoDecoded *decoded)
 {
 	ClusterSideRouteRow route;
 	xl_undo_tt_identity_v2 identity = { 0 };
 
-	if (decoded->kind != cluster_undo_kind_for_opcode(decoded->opcode)
+	if (decoded == NULL || decoded->kind != cluster_undo_kind_for_opcode(decoded->opcode)
 		|| decoded->format_version != CLUSTER_UNDO_TT_IDENTITY_V2_VERSION
 		|| decoded->instance == 0 || decoded->instance > UNDO_OWNER_INSTANCE_MAX
 		|| decoded->segment_id == 0
@@ -764,7 +764,7 @@ undo_prepare_tt_header_v2(const ClusterUndoDecoded *decoded, const uint8 *payloa
 	static const UBA invalid_head = InvalidUba_init;
 
 	if (base == NULL || out == NULL || payload != NULL || payload_length != 0
-		|| !undo_tt_v2_preflight(decoded))
+		|| !cluster_undo_preflight_tt_v2(decoded))
 		return CLUSTER_UNDO_HEADER_BLOCKED;
 	memcpy(prepared.data, base, BLCKSZ);
 	/* Verify the fixed prefix before reading the V2 generation or slots. */

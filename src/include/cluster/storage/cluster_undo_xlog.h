@@ -955,6 +955,14 @@ extern void cluster_tt_durable_redo_stamp_slot_exact(uint8 instance, uint32 segm
 													 uint16 wrap, TransactionId xid,
 													 SCN commit_scn);
 
+/* Recovery only: exact TT40 delta, full-page fsync and same-descriptor
+ * post-read. The original recovery path/source authority must be active. */
+struct ClusterUndoDecoded;
+extern void cluster_tt_durable_redo_tt_v2(const struct ClusterUndoDecoded *decoded);
+struct xl_xact_tt_commit;
+extern void cluster_tt_durable_redo_xact_commit(const struct xl_xact_tt_commit *delta,
+											 uint64 original_full_xid);
+
 /* spec-3.15 D5: emit XLOG_UNDO_TT_SLOT_ABORT (prepared rollback). */
 extern XLogRecPtr cluster_undo_emit_tt_slot_abort(uint8 instance, uint32 segment_id,
 												  uint16 slot_offset, uint16 wrap,

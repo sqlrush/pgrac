@@ -7070,13 +7070,17 @@ xact_redo_commit(XLogReaderState *record, xl_xact_parsed_commit *parsed,
 	Assert(TransactionIdIsValid(xid));
 
 #ifdef USE_PGRAC_CLUSTER
-	/* Staged V2 parsing must not feed a FullXid-blind TT32 writer. Remove
-	 * this refusal only with the complete TT40 native owner conversion. */
-	if (parsed->has_tt_commit
-		&& (parsed->tt_commit.format_version != CLUSTER_XACT_TT_COMMIT_VERSION
-			|| parsed->tt_original_full_xid != 0))
-		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
-						errmsg("folded TT commit requires an exact TT40 native owner")));
+	if (parsed->has_tt_commit) {
+		xl_xact_tt_commit_v2 carrier, validated;
+
+		carrier.delta = parsed->tt_commit;
+		carrier.original_full_xid = parsed->tt_original_full_xid;
+		if (cluster_xact_tt_commit_read(&carrier, sizeof(carrier), &validated) == 0
+			|| (carrier.delta.format_version == CLUSTER_XACT_TT_COMMIT_VERSION
+				&& carrier.original_full_xid != 0))
+			ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("invalid folded TT commit identity before native replay")));
+	}
 	if (cluster_shared_config && (parsed->nrels != 0 || parsed->nspace_drops != 0)
 		&& !cluster_space_drop_replay_commit(record, xid))
 		elog(PANIC, "xact_redo: exact SPACE deletion commit refused");
@@ -7109,13 +7113,7 @@ xact_redo_commit(XLogReaderState *record, xl_xact_parsed_commit *parsed,
 	 * ordering violation, same contract as the 0x30 redo).
 	 */
 	if (parsed->has_tt_commit)
-		cluster_tt_durable_redo_stamp_slot_exact(parsed->tt_commit.instance,
-										   parsed->tt_commit.segment_id,
-										   parsed->tt_commit.segment_generation,
-										   parsed->tt_commit.slot_offset,
-										   parsed->tt_commit.wrap,
-										   parsed->tt_commit.xid,
-										   parsed->tt_commit.commit_scn);
+		cluster_tt_durable_redo_xact_commit(&parsed->tt_commit, parsed->tt_original_full_xid);
 #endif
 
 	max_xid = TransactionIdLatest(xid, parsed->nsubxacts, parsed->subxacts);

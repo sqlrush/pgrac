@@ -41,6 +41,7 @@
 #include <unistd.h>
 
 #include "access/xlog.h"
+#include "access/xact.h"
 #include "access/xloginsert.h"
 #include "access/xlogreader.h"
 #include "access/xlogutils.h"
@@ -60,6 +61,7 @@
 #include "common/file_perm.h" /* pg_mkdir_p / pg_dir_create_mode (shared subdir, D2-2) */
 #include "miscadmin.h"
 #include "storage/bufpage.h"
+#include "storage/checksum.h"
 #include "storage/fd.h"
 #include "storage/proc.h" /* spec-3.18 D2b MyProc->delayChkptFlags assert */
 
@@ -1209,6 +1211,135 @@ cluster_tt_durable_redo_stamp_slot_exact(uint8 instance, uint32 segment_id,
 						errmsg("could not close undo segment file \"%s\": %m", path)));
 }
 
+/* A V2 delta needs an existing complete TT40 predecessor. Keep every byte
+ * private until preparation succeeds; neither missing files nor TT32 pages
+ * can supply the original identity. Native replay already owns isolation and
+ * the original recovery path authority. */
+void
+cluster_tt_durable_redo_tt_v2(const ClusterUndoDecoded *decoded)
+{
+	PGAlignedBlock before, prepared, post;
+	ClusterUndoHeaderPrepareResultV1 decision;
+	char path[MAXPGPATH];
+	int fd;
+	bool apply;
+	const char *expected;
+	ssize_t transferred;
+
+	if (!cluster_undo_preflight_tt_v2(decoded))
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("invalid exact TT40 redo identity")));
+	if (build_undo_segment_path(cluster_undo_recovery_intent_for_owner(decoded->instance),
+								decoded->instance, decoded->segment_id, path, sizeof(path)) != 0)
+		ereport(PANIC, (errmsg("undo segment path is unavailable for TT40 redo")));
+	fd = cluster_undo_redo_open_segment(decoded->instance, decoded->segment_id, path, false);
+	if (fd < 0)
+		ereport(PANIC, (errcode_for_file_access(),
+						errmsg("could not open undo segment \"%s\" for TT40 redo: %m", path)));
+	transferred = pg_pread(fd, before.data, BLCKSZ, 0);
+	if (transferred != BLCKSZ) {
+		int save_errno = errno;
+
+		(void)close(fd);
+		errno = save_errno;
+		ereport(PANIC, (errcode_for_file_access(),
+						errmsg("could not read undo segment \"%s\" for TT40 redo", path),
+						errdetail("Read %zd of %d bytes.", transferred, BLCKSZ)));
+	}
+	if (!UndoSegmentHeaderV2_identity_matches(before.data, BLCKSZ, decoded->segment_id,
+											 decoded->instance)
+		|| ((PageHeader)before.data)->pd_checksum != pg_checksum_page(before.data, 0)) {
+		(void)close(fd);
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("invalid TT40 predecessor header in undo segment \"%s\"", path)));
+	}
+	decision = cluster_undo_prepare_header_v1(decoded, NULL, 0, before.data, prepared.data);
+	if (decision != CLUSTER_UNDO_HEADER_APPLY && decision != CLUSTER_UNDO_HEADER_ALREADY
+		&& decision != CLUSTER_UNDO_HEADER_SKIP_STALE) {
+		(void)close(fd);
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("conflicting TT40 predecessor in undo segment \"%s\"", path),
+						errdetail("generation=%u slot=%u wrap=%u xid=%u full_xid=" UINT64_FORMAT,
+								  decoded->expected_generation, decoded->slot_offset, decoded->wrap,
+								  decoded->xid, decoded->original_full_xid)));
+	}
+	apply = decision == CLUSTER_UNDO_HEADER_APPLY;
+	if (apply) {
+		((PageHeader)prepared.data)->pd_checksum = pg_checksum_page(prepared.data, 0);
+		transferred = pg_pwrite(fd, prepared.data, BLCKSZ, 0);
+		if (transferred != BLCKSZ) {
+			int save_errno = errno;
+
+			(void)close(fd);
+			errno = save_errno;
+			ereport(PANIC, (errcode_for_file_access(),
+							errmsg("could not write undo segment \"%s\" for TT40 redo", path),
+							errdetail("Wrote %zd of %d bytes.", transferred, BLCKSZ)));
+		}
+	}
+	/* Present effects also need durability after a crashed predecessor. */
+	if (pg_fsync(fd) != 0) {
+		int save_errno = errno;
+
+		(void)close(fd);
+		errno = save_errno;
+		ereport(PANIC, (errcode_for_file_access(),
+						errmsg("could not fsync undo segment \"%s\" after TT40 redo: %m", path)));
+	}
+	expected = apply ? prepared.data : before.data;
+	transferred = pg_pread(fd, post.data, BLCKSZ, 0);
+	if (transferred != BLCKSZ || memcmp(post.data, expected, BLCKSZ) != 0) {
+		(void)close(fd);
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("TT40 redo post-read mismatch in undo segment \"%s\"", path)));
+	}
+	if (close(fd) != 0)
+		ereport(PANIC, (errcode_for_file_access(),
+						errmsg("could not close undo segment \"%s\" after TT40 redo: %m", path)));
+	if (apply) {
+		if (decoded->kind == CLUSTER_UNDO_KIND_TT_COMMIT)
+			cluster_tt_durable_count_redo_apply();
+		cluster_vis_bump_recovery_undo_redo_applies();
+	} else if (decision == CLUSTER_UNDO_HEADER_SKIP_STALE)
+		cluster_vis_bump_recovery_undo_redo_skips();
+}
+
+/* Folded and standalone V2 commits share the exact TT40 mutation owner. */
+void
+cluster_tt_durable_redo_xact_commit(const xl_xact_tt_commit *delta, uint64 original_full_xid)
+{
+	xl_xact_tt_commit_v2 carrier, validated;
+	ClusterUndoDecoded decoded = { 0 };
+
+	if (delta == NULL)
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("missing folded TT commit identity")));
+	carrier.delta = *delta;
+	carrier.original_full_xid = original_full_xid;
+	if (cluster_xact_tt_commit_read(&carrier, sizeof(carrier), &validated) == 0
+		|| (delta->format_version == CLUSTER_XACT_TT_COMMIT_VERSION && original_full_xid != 0))
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("invalid folded TT commit identity during redo")));
+	if (delta->format_version == CLUSTER_XACT_TT_COMMIT_VERSION) {
+		cluster_tt_durable_redo_stamp_slot_exact(delta->instance, delta->segment_id,
+			 delta->segment_generation, delta->slot_offset, delta->wrap, delta->xid,
+			 delta->commit_scn);
+		return;
+	}
+	decoded.kind = CLUSTER_UNDO_KIND_TT_COMMIT;
+	decoded.opcode = XLOG_UNDO_TT_SLOT_COMMIT;
+	decoded.instance = delta->instance;
+	decoded.segment_id = delta->segment_id;
+	decoded.expected_generation = delta->segment_generation;
+	decoded.slot_offset = delta->slot_offset;
+	decoded.wrap = delta->wrap;
+	decoded.xid = delta->xid;
+	decoded.commit_scn = delta->commit_scn;
+	decoded.format_version = CLUSTER_UNDO_TT_IDENTITY_V2_VERSION;
+	decoded.original_full_xid = original_full_xid;
+	cluster_tt_durable_redo_tt_v2(&decoded);
+}
+
 /*
  * Replay XLOG_UNDO_TT_SLOT_COMMIT (spec-3.11 D3) -- the standalone 0x30 record
  * (now emitted only by the 2PC COMMIT PREPARED path; spec-3.18 D4.1).  Thin
@@ -1572,8 +1703,15 @@ cluster_undo_redo(XLogReaderState *record)
 	 * the separate canonical shared SPACE ABI is approved.
 	 */
 	memset(&decoded, 0, sizeof(decoded));
-	if (!cluster_undo_decode(record, &decoded) || decoded.opcode != info
-		|| !cluster_undo_preflight(&decoded))
+	if (!cluster_undo_decode(record, &decoded) || decoded.opcode != info)
+		ereport(PANIC,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("invalid cluster undo record %u during shared decode preflight", info)));
+	if (decoded.format_version == CLUSTER_UNDO_TT_IDENTITY_V2_VERSION) {
+		cluster_tt_durable_redo_tt_v2(&decoded);
+		return;
+	}
+	if (!cluster_undo_preflight(&decoded))
 		ereport(PANIC,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("invalid cluster undo record %u during shared decode preflight", info)));

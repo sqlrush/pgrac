@@ -120,6 +120,9 @@ extern bool cluster_undo_decode(XLogReaderState *record, ClusterUndoDecoded *out
  * STOP-RF-SIDE-SPACE-ABI is active.
  */
 extern bool cluster_undo_preflight(const ClusterUndoDecoded *decoded);
+/* Pure V2 TT shape/route check. It grants no target or write authority;
+ * legacy SIDE target APIs remain closed to TT40 records. */
+extern bool cluster_undo_preflight_tt_v2(const ClusterUndoDecoded *decoded);
 /* Historical record classification only; never permits a TT transition. */
 extern bool cluster_undo_inspect_pi(const ClusterUndoDecoded *decoded);
 

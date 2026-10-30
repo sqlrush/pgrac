@@ -10,6 +10,7 @@
 
 #include <setjmp.h>
 
+#include "access/xact.h"
 #include "cluster/cluster_side_undo.h"
 #include "cluster/cluster_tt_durable.h"
 #include "cluster/cluster_uba.h"
@@ -18,6 +19,7 @@
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/storage/cluster_undo_alloc.h"
 #include "cluster/storage/cluster_undo_xlog.h"
+#include "storage/checksum.h"
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
@@ -32,6 +34,9 @@ static bool note_accept;
 static bool note_pending;
 static bool expect_panic;
 static bool fail_sync;
+static uint32 reads;
+static bool fail_open, fail_write, fail_close, corrupt_post_read;
+static uint32 short_read_number;
 static jmp_buf panic_jump;
 
 void
@@ -57,6 +62,10 @@ static int
 fixture_open(const char *path, int flags)
 {
 	opens++;
+	if (fail_open) {
+		errno = ENOENT;
+		return -1;
+	}
 	return 42;
 }
 
@@ -75,7 +84,12 @@ fixture_read(int fd, void *buffer, size_t length, off_t offset)
 	UT_ASSERT_EQ(fd, 42);
 	UT_ASSERT_EQ(length, BLCKSZ);
 	UT_ASSERT_EQ(offset, 0);
+	reads++;
+	if (reads == short_read_number)
+		return BLCKSZ - 1;
 	memcpy(buffer, disk.data, length);
+	if (corrupt_post_read && reads == 2)
+		((char *)buffer)[BLCKSZ - 1] ^= 1;
 	return length;
 }
 
@@ -87,6 +101,8 @@ fixture_write(int fd, const void *buffer, size_t length, off_t offset)
 			  || (length == sizeof(TTSlot)
 				  && offset == offsetof(UndoSegmentHeaderData, tt_slots) + 4 * sizeof(TTSlot)));
 	UT_ASSERT_EQ(syncs, 0);
+	if (fail_write)
+		return -1;
 	writes++;
 	memcpy(disk.data + offset, buffer, length);
 	return length;
@@ -142,7 +158,7 @@ fixture_close(int fd)
 {
 	UT_ASSERT_EQ(fd, 42);
 	closes++;
-	return 0;
+	return fail_close ? -1 : 0;
 }
 
 static void
@@ -181,6 +197,19 @@ fixture_dir_sync(const char *path, bool isdir)
 #define cluster_tt_durable_count_redo_apply() ((void)0)
 static const UBA InvalidUbaVal = InvalidUba_init; /* the legacy stamp's head reset */
 #include "test_cluster_undo_bind_native.inc"
+#include "test_cluster_undo_tt_v2_native.inc"
+
+/* Other legacy terminal/data-block owners are outside this fixture. An
+ * accidental dispatch to one is a failure, never a successful substitute. */
+#define RecoveryInProgress() true
+#define InRecovery true
+#define cluster_undo_redo_tt_slot_commit(decoded_) abort()
+#define cluster_undo_redo_tt_slot_abort(decoded_) abort()
+#define cluster_undo_redo_tt_slot_set_head(decoded_) abort()
+#define cluster_undo_redo_tt_ctrc_release(decoded_) abort()
+#define cluster_undo_redo_block_write(decoded_, payload_, lsn_) abort()
+#define cluster_hw_redo_reserve(record_) abort()
+#include "test_cluster_undo_dispatch_native.inc"
 
 static void
 reset_io(void)
@@ -189,6 +218,9 @@ reset_io(void)
 	notes = 0;
 	note_pending = false;
 	fail_sync = false;
+	reads = 0;
+	fail_open = fail_write = fail_close = corrupt_post_read = false;
+	short_read_number = 0;
 }
 
 static void
@@ -803,10 +835,401 @@ UT_TEST(test_native_exact_commit_rejects_bad_header_before_write)
 	}
 }
 
+UT_TEST(test_native_v2_bind_keeps_original_full_xid)
+{
+	xl_undo_tt_identity_v2 record = { 0 };
+	XLogReaderState reader = { 0 };
+	DecodedXLogRecord wal = { 0 };
+	bool refused = false;
+	UndoSegmentHeaderDataV2 *header = (UndoSegmentHeaderDataV2 *)disk.data;
+
+	UT_ASSERT(cluster_undo_segment_make_header_v2_bytes(513, 3, disk.data));
+	header->wrap_count = 9;
+	header->pd_checksum = pg_checksum_page(disk.data, 0);
+	durable = disk;
+	record.segment_id = 513;
+	record.segment_generation = 9;
+	record.xid = 701;
+	record.slot_offset = 4;
+	record.wrap = 2;
+	record.instance = 3;
+	record.format_version = CLUSTER_UNDO_TT_IDENTITY_V2_VERSION;
+	record.original_full_xid = (UINT64_C(7) << 32) | 701;
+	wal.header.xl_rmid = RM_CLUSTER_UNDO_ID;
+	wal.header.xl_info = XLOG_UNDO_TT_SLOT_BIND;
+	wal.main_data = (char *)&record;
+	wal.main_data_len = sizeof(record);
+	reader.record = &wal;
+	reset_io();
+	expect_panic = true;
+	if (setjmp(panic_jump) == 0)
+		cluster_undo_redo(&reader);
+	else
+		refused = true;
+	expect_panic = false;
+	UT_ASSERT(!refused);
+	UT_ASSERT_EQ(header->tt_slots[4].status, TT_SLOT_ACTIVE);
+	UT_ASSERT_EQ(header->tt_slots[4].original_full_xid, record.original_full_xid);
+	UT_ASSERT_EQ(writes, 1);
+	UT_ASSERT_EQ(syncs, 1);
+	UT_ASSERT(memcmp(disk.data, durable.data, BLCKSZ) == 0);
+}
+
+/* The actual rmgr entry is exercised above controlled file syscalls. */
+static bool
+replay_v2_record(uint8 opcode, void *payload, Size length)
+{
+	XLogReaderState reader = { 0 };
+	DecodedXLogRecord wal = { 0 };
+	bool accepted = true;
+
+	wal.header.xl_rmid = RM_CLUSTER_UNDO_ID;
+	wal.header.xl_info = opcode;
+	wal.main_data = payload;
+	wal.main_data_len = length;
+	reader.record = &wal;
+	expect_panic = true;
+	if (setjmp(panic_jump) == 0)
+		cluster_undo_redo(&reader);
+	else
+		accepted = false;
+	expect_panic = false;
+	return accepted;
+}
+
+static xl_undo_tt_identity_v2
+native_v2_identity(uint64 full)
+{
+	xl_undo_tt_identity_v2 rec = { 0 };
+
+	rec.segment_id = 513;
+	rec.segment_generation = 9;
+	rec.xid = (TransactionId)full;
+	rec.slot_offset = 4;
+	rec.wrap = 2;
+	rec.instance = 3;
+	rec.format_version = CLUSTER_UNDO_TT_IDENTITY_V2_VERSION;
+	rec.original_full_xid = full;
+	return rec;
+}
+
+static void
+native_v2_base(uint64 full, uint8 status)
+{
+	UndoSegmentHeaderDataV2 *header = (UndoSegmentHeaderDataV2 *)disk.data;
+	TTSlotV2 *slot = &header->tt_slots[4];
+
+	UT_ASSERT(cluster_undo_segment_make_header_v2_bytes(513, 3, disk.data));
+	header->wrap_count = 9;
+	header->_reserved[7] = 0x53;
+	if (status != TT_SLOT_UNUSED) {
+		slot->xid = (TransactionId)full;
+		slot->wrap = 2;
+		slot->status = status;
+		slot->original_full_xid = full;
+		slot->commit_scn = status == TT_SLOT_COMMITTED ? 804 : InvalidScn;
+	}
+	header->pd_checksum = pg_checksum_page(disk.data, 0);
+	durable = disk;
+	reset_io();
+}
+
+static void
+check_native_v2_page(PGAlignedBlock *expected)
+{
+	((PageHeader)expected->data)->pd_checksum = pg_checksum_page(expected->data, 0);
+	UT_ASSERT(memcmp(disk.data, expected->data, BLCKSZ) == 0);
+	UT_ASSERT(memcmp(durable.data, expected->data, BLCKSZ) == 0);
+	UT_ASSERT_EQ(reads, 2);
+	UT_ASSERT_EQ(writes, 1);
+	UT_ASSERT_EQ(syncs, 1);
+	UT_ASSERT_EQ(closes, 1);
+	UT_ASSERT_EQ(applies, 1);
+	UT_ASSERT_EQ(skips + extends + mkdirs + notes, 0);
+}
+
+UT_TEST(test_native_v2_all_terminal_deltas_keep_full_page_identity)
+{
+	for (uint32 epoch = 0; epoch <= 7; epoch += 7) {
+		const uint64 full = ((uint64)epoch << 32) | 701;
+		xl_undo_tt_slot_commit_v2 commit = { 0 };
+		xl_undo_tt_slot_set_head_v2 head = { 0 };
+		xl_undo_tt_slot_ctrc_release_v2 release = { 0 };
+		uint8 bytes[CLUSTER_UNDO_TT_CTRC_RELEASE_V2_BYTES];
+		xl_undo_tt_identity_v2 identity = native_v2_identity(full);
+		PGAlignedBlock expected;
+		TTSlotV2 *slot = &((UndoSegmentHeaderDataV2 *)expected.data)->tt_slots[4];
+
+		native_v2_base(full, TT_SLOT_ACTIVE);
+		commit.identity = identity;
+		commit.commit_scn = 804;
+		expected = disk;
+		slot->status = TT_SLOT_COMMITTED;
+		slot->commit_scn = 804;
+		UT_ASSERT(replay_v2_record(XLOG_UNDO_TT_SLOT_COMMIT, &commit, sizeof(commit)));
+		check_native_v2_page(&expected);
+
+		release.release.segment_id = 513;
+		release.release.segment_generation = 9;
+		release.release.xid = 701;
+		release.release.cluster_epoch = 3;
+		release.release.root_id = 11;
+		release.release.root_generation = 12;
+		release.release.formation_epoch = 13;
+		release.release.admission_record_generation = 14;
+		release.release.seal_generation = 15;
+		release.release.touched_nodes_low = 4;
+		release.release.ack_set_digest[0] = 0x67;
+		release.release.slot_offset = 4;
+		release.release.slot_wrap = 2;
+		release.release.owner_instance = 3;
+		release.release.terminal_status = TT_SLOT_COMMITTED;
+		release.release.format_version = CLUSTER_UNDO_TT_CTRC_RELEASE_V2_VERSION;
+		release.release.flags = CLUSTER_UNDO_TT_CTRC_RELEASE_ALL_TOUCHED_ACKED;
+		release.original_full_xid = full;
+		UT_ASSERT(cluster_undo_tt_ctrc_release_v2_encode(&release, bytes));
+		reset_io();
+		expected = disk;
+		slot->flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+		UT_ASSERT(replay_v2_record(XLOG_UNDO_TT_SLOT_CTRC_RELEASE, bytes, sizeof(bytes)));
+		check_native_v2_page(&expected);
+
+		native_v2_base(full, TT_SLOT_ACTIVE);
+		expected = disk;
+		slot->status = TT_SLOT_ABORTED;
+		UT_ASSERT(replay_v2_record(XLOG_UNDO_TT_SLOT_ABORT, &identity, sizeof(identity)));
+		check_native_v2_page(&expected);
+		reset_io();
+		head.identity = identity;
+		head.first_undo_block = uba_encode(513, 1, 4, 64);
+		expected = disk;
+		slot->first_undo_block = head.first_undo_block;
+		UT_ASSERT(replay_v2_record(XLOG_UNDO_TT_SLOT_SET_HEAD, &head, sizeof(head)));
+		check_native_v2_page(&expected);
+	}
+}
+
+UT_TEST(test_native_v2_conflicts_refuse_before_write)
+{
+	const uint64 full = (UINT64_C(7) << 32) | 701;
+
+	for (int fault = 0; fault < 12; fault++) {
+		xl_undo_tt_slot_commit_v2 record = { 0 };
+		UndoSegmentHeaderDataV2 *header = (UndoSegmentHeaderDataV2 *)disk.data;
+		PGAlignedBlock before;
+
+		native_v2_base(full, TT_SLOT_ACTIVE);
+		record.identity = native_v2_identity(full);
+		record.commit_scn = 804;
+		switch (fault) {
+		case 0: header->tt_layout_version = 0; break;
+		case 1: header->tt_layout_version = 3; break;
+		case 2: header->tt_slot_bytes = 32; break;
+		case 3: header->tt_layout_reserved = 1; break;
+		case 4: header->wrap_count = 8; break;
+		case 5: header->tt_slots[4].original_full_xid = 701; break;
+		case 6: header->tt_slots[4].xid = 702; break;
+		case 7: memset(&header->tt_slots[4], 0, sizeof(TTSlotV2)); break;
+		case 8: header->owner_instance = 2; break;
+		case 9: header->tt_active_count = TT_SLOTS_PER_SEGMENT + 1; break;
+		case 10: header->segment_size_bytes = 0; break;
+		case 11: break; /* corrupted checksum, while framing is otherwise valid */
+		}
+		header->pd_checksum = pg_checksum_page(disk.data, 0);
+		if (fault == 11)
+			header->_reserved[8] ^= 1;
+		before = disk;
+		UT_ASSERT(!replay_v2_record(XLOG_UNDO_TT_SLOT_COMMIT, &record, sizeof(record)));
+		UT_ASSERT_EQ(writes + syncs + applies + skips, 0);
+		UT_ASSERT_EQ(closes, 1);
+		UT_ASSERT(memcmp(disk.data, before.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_native_v2_bad_record_refuses_before_file_access)
+{
+	const uint64 full = (UINT64_C(7) << 32) | 701;
+
+	for (int fault = 0; fault < 12; fault++) {
+		xl_undo_tt_identity_v2 record = native_v2_identity(full);
+		Size length = sizeof(record);
+		PGAlignedBlock before;
+
+		native_v2_base(full, TT_SLOT_UNUSED);
+		before = disk;
+		switch (fault) {
+		case 0: record.format_version = 3; break;
+		case 1: record.flags = 1; break;
+		case 2: record.reserved = 1; break;
+		case 3: record.original_full_xid = 0; break;
+		case 4: record.original_full_xid = UINT64_MAX; break;
+		case 5: record.original_full_xid++; break;
+		case 6: record.instance = 2; break;
+		case 7: record.slot_offset = TT_SLOTS_PER_SEGMENT; break;
+		case 8: record.wrap = TT_WRAP_INVALID; break;
+		case 9: record.segment_generation = UINT32_MAX; break;
+		case 10: record.xid = FrozenTransactionId; break;
+		case 11: length--; break;
+		}
+		UT_ASSERT(!replay_v2_record(XLOG_UNDO_TT_SLOT_BIND, &record, length));
+		UT_ASSERT_EQ(opens + reads + writes + syncs + closes + applies + skips, 0);
+		UT_ASSERT(memcmp(disk.data, before.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_native_legacy_record_cannot_use_tt40_slot_geometry)
+{
+	const uint64 full = (UINT64_C(7) << 32) | 701;
+	xl_undo_tt_slot_bind bind = { .segment_id = 513, .segment_generation = 9,
+		.xid = 701, .slot_offset = 4, .wrap = 2, .instance = 3,
+		.format_version = CLUSTER_UNDO_TT_BIND_VERSION };
+	xl_xact_tt_commit commit = { .segment_id = 513, .segment_generation = 9,
+		.xid = 701, .slot_offset = 4, .wrap = 2, .instance = 3,
+		.format_version = CLUSTER_XACT_TT_COMMIT_VERSION, .commit_scn = 804 };
+
+	for (int folded = 0; folded < 2; folded++) {
+		PGAlignedBlock before;
+		bool refused = false;
+
+		native_v2_base(full, TT_SLOT_ACTIVE);
+		before = disk;
+		if (folded) {
+			expect_panic = true;
+			if (setjmp(panic_jump) == 0)
+				cluster_tt_durable_redo_xact_commit(&commit, 0);
+			else
+				refused = true;
+			expect_panic = false;
+		} else
+			refused = !replay_v2_record(XLOG_UNDO_TT_SLOT_BIND, &bind, sizeof(bind));
+		UT_ASSERT(refused);
+		UT_ASSERT_EQ(writes + syncs + applies + skips, 0);
+		UT_ASSERT_EQ(closes, 1);
+		UT_ASSERT(memcmp(disk.data, before.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_native_v2_present_or_physical_stale_is_durable_without_write)
+{
+	const uint64 full = (UINT64_C(7) << 32) | 701;
+	xl_undo_tt_slot_commit_v2 record = { 0 };
+
+	record.identity = native_v2_identity(full);
+	record.commit_scn = 804;
+	for (int state = 0; state < 3; state++) {
+		UndoSegmentHeaderDataV2 *header = (UndoSegmentHeaderDataV2 *)disk.data;
+		PGAlignedBlock expected;
+
+		native_v2_base(full, TT_SLOT_COMMITTED);
+		if (state == 1)
+			header->wrap_count++;
+		if (state == 2) {
+			header->tt_slots[4].wrap++;
+			header->tt_slots[4].original_full_xid = 701;
+		}
+		header->pd_checksum = pg_checksum_page(disk.data, 0);
+		expected = disk;
+		memset(durable.data, 0, BLCKSZ);
+		UT_ASSERT(replay_v2_record(XLOG_UNDO_TT_SLOT_COMMIT, &record, sizeof(record)));
+		UT_ASSERT_EQ(writes + applies + notes, 0);
+		UT_ASSERT_EQ(syncs, 1);
+		UT_ASSERT_EQ(reads, 2);
+		UT_ASSERT_EQ(closes, 1);
+		UT_ASSERT_EQ(skips, state == 0 ? 0 : 1);
+		fixture_power_loss();
+		UT_ASSERT(memcmp(disk.data, expected.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_native_v2_io_failure_never_reports_completion)
+{
+	xl_undo_tt_identity_v2 record = native_v2_identity((UINT64_C(7) << 32) | 701);
+
+	for (int fault = 0; fault < 7; fault++) {
+		native_v2_base(record.original_full_xid, TT_SLOT_UNUSED);
+		switch (fault) {
+		case 0: fail_open = true; break;
+		case 1: short_read_number = 1; break;
+		case 2: fail_write = true; break;
+		case 3: fail_sync = true; break;
+		case 4: short_read_number = 2; break;
+		case 5: corrupt_post_read = true; break;
+		case 6: fail_close = true; break;
+		}
+		UT_ASSERT(!replay_v2_record(XLOG_UNDO_TT_SLOT_BIND, &record, sizeof(record)));
+		UT_ASSERT_EQ(applies + skips, 0);
+		UT_ASSERT_EQ(extends + mkdirs + notes, 0);
+		UT_ASSERT_EQ(closes, fault == 0 ? 0 : 1);
+		UT_ASSERT_EQ(writes, fault < 3 ? 0 : 1);
+		if (fault == 3) {
+			fixture_power_loss();
+			UT_ASSERT_EQ(((UndoSegmentHeaderDataV2 *)disk.data)->tt_slots[4].status,
+						 TT_SLOT_UNUSED);
+		}
+	}
+}
+
+UT_TEST(test_folded_v2_native_commit_uses_the_same_fullxid_owner)
+{
+	for (int epoch = 0; epoch <= 7; epoch += 7) {
+		uint64 full = ((uint64)epoch << 32) | 701;
+		xl_xact_tt_commit tt = { .segment_id = 513, .segment_generation = 9,
+			.xid = 701, .slot_offset = 4, .wrap = 2, .instance = 3,
+			.format_version = CLUSTER_XACT_TT_COMMIT_V2_VERSION, .commit_scn = 804 };
+		PGAlignedBlock expected;
+		TTSlotV2 *slot = &((UndoSegmentHeaderDataV2 *)expected.data)->tt_slots[4];
+
+		native_v2_base(full, TT_SLOT_ACTIVE);
+		expected = disk;
+		slot->status = TT_SLOT_COMMITTED;
+		slot->commit_scn = 804;
+		cluster_tt_durable_redo_xact_commit(&tt, full);
+		check_native_v2_page(&expected);
+	}
+}
+
+UT_TEST(test_folded_native_dispatch_preserves_v1_and_refuses_bad_identity)
+{
+	xl_xact_tt_commit tt = { .segment_id = 513, .segment_generation = 9,
+		.xid = 701, .slot_offset = 4, .wrap = 2, .instance = 3,
+		.format_version = CLUSTER_XACT_TT_COMMIT_VERSION, .commit_scn = 804 };
+	UndoSegmentHeaderData *header = (UndoSegmentHeaderData *)disk.data;
+
+	cluster_undo_segment_make_header_bytes(513, 3, disk.data);
+	header->wrap_count = 9;
+	header->tt_slots[4].xid = 701;
+	header->tt_slots[4].wrap = 2;
+	header->tt_slots[4].status = TT_SLOT_ACTIVE;
+	reset_io();
+	cluster_tt_durable_redo_xact_commit(&tt, 0);
+	UT_ASSERT_EQ(header->tt_slots[4].status, TT_SLOT_COMMITTED);
+	UT_ASSERT_EQ(header->tt_slots[4].commit_scn, 804);
+	UT_ASSERT_EQ(applies, 1);
+	for (int fault = 0; fault < 4; fault++) {
+		uint64 full = (UINT64_C(7) << 32) | 701;
+		bool refused = false;
+
+		tt.format_version = CLUSTER_XACT_TT_COMMIT_V2_VERSION;
+		if (fault == 0) tt.format_version = CLUSTER_XACT_TT_COMMIT_VERSION;
+		if (fault == 1) tt.format_version = 3;
+		if (fault == 2) full++;
+		if (fault == 3) full = UINT64_MAX;
+		reset_io();
+		expect_panic = true;
+		if (setjmp(panic_jump) == 0)
+			cluster_tt_durable_redo_xact_commit(&tt, full);
+		else
+			refused = true;
+		expect_panic = false;
+		UT_ASSERT(refused);
+		UT_ASSERT_EQ(opens + writes + syncs + applies, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(21);
 	UT_RUN(test_native_exact_commit_rejects_bad_header_before_write);
 	UT_RUN(test_private_abort_head_release_and_exact_stale_results);
 	UT_RUN(test_native_bind_uses_complete_header_identity_and_durable_slot);
@@ -819,6 +1242,15 @@ main(void)
 	UT_RUN(test_native_reuse_durability_and_stale_generation);
 	UT_RUN(test_private_header_decision_preserves_native_generation_and_output);
 	UT_RUN(test_native_recycle_fsync_failure_does_not_report_completion);
+	UT_RUN(test_native_v2_bind_keeps_original_full_xid);
+	UT_RUN(test_native_v2_all_terminal_deltas_keep_full_page_identity);
+	UT_RUN(test_native_v2_conflicts_refuse_before_write);
+	UT_RUN(test_native_v2_present_or_physical_stale_is_durable_without_write);
+	UT_RUN(test_native_v2_io_failure_never_reports_completion);
+	UT_RUN(test_folded_v2_native_commit_uses_the_same_fullxid_owner);
+	UT_RUN(test_folded_native_dispatch_preserves_v1_and_refuses_bad_identity);
+	UT_RUN(test_native_v2_bad_record_refuses_before_file_access);
+	UT_RUN(test_native_legacy_record_cannot_use_tt40_slot_geometry);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
