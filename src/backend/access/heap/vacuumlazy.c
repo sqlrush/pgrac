@@ -73,6 +73,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/pg_rusage.h"
+#include "utils/snapmgr.h"
 #include "utils/timestamp.h"
 
 #ifdef USE_PGRAC_CLUSTER
@@ -2613,6 +2614,42 @@ lazy_prepare_shared_freeze(LVRelState *vacrel, Buffer recent_buffer, Buffer *vmb
 }
 #endif
 
+/* Consume the shared VM decision under its current S scope. The original
+ * maintenance snapshot and cutoff rules govern this completed decision;
+ * delay points and all subsequent heap work run after releasing the scope. */
+static bool
+lazy_scan_skip_shared_page(LVRelState *vacrel, Buffer *vmbuffer, BlockNumber block,
+						  bool *all_visible, bool *skipsallvis)
+{
+	Snapshot snapshot = ActiveSnapshotSet() ? GetActiveSnapshot() : NULL;
+	volatile VisibilityMapReadScope scope = {0};
+	uint8 status = 0;
+	bool skip = false;
+
+	*all_visible = false;
+	PG_TRY();
+	{
+		if (visibilitymap_read_qualified_begin(vacrel->rel, block, snapshot,
+											 vmbuffer, &scope, &status))
+		{
+			*all_visible = (status & VISIBILITYMAP_ALL_VISIBLE) != 0;
+			if (*all_visible && block != vacrel->rel_pages - 1 && vacrel->skipwithvm
+				&& (!vacrel->aggressive || (status & VISIBILITYMAP_ALL_FROZEN) != 0))
+			{
+				if ((status & VISIBILITYMAP_ALL_FROZEN) == 0)
+					*skipsallvis = true;
+				skip = true;
+			}
+		}
+	}
+	PG_FINALLY();
+	{
+		visibilitymap_read_end(&scope);
+	}
+	PG_END_TRY();
+	return skip;
+}
+
 /*
  *	lazy_scan_skip() -- set up range of skippable blocks using visibility map.
  *
@@ -2644,17 +2681,23 @@ lazy_scan_skip(LVRelState *vacrel, Buffer *vmbuffer, BlockNumber next_block,
 				nskippable_blocks = 0;
 	bool		skipsallvis = false;
 
-	/* PGRAC: do not even consult raw VM bits to skip shared heap work. */
-	if (vacrel->shared_maintenance_restricted)
-	{
-		*next_unskippable_allvis = false;
-		*skipping_current_range = false;
-		return next_block;
-	}
-	*next_unskippable_allvis = true;
+	*next_unskippable_allvis = !vacrel->shared_maintenance_restricted;
 	while (next_unskippable_block < rel_pages)
 	{
-		uint8		mapbits = visibilitymap_get_status(vacrel->rel,
+		uint8		mapbits;
+
+		if (vacrel->shared_maintenance_restricted)
+		{
+			if (!lazy_scan_skip_shared_page(vacrel, vmbuffer, next_unskippable_block,
+											  next_unskippable_allvis, &skipsallvis))
+				break;
+			vacuum_delay_point();
+			next_unskippable_block++;
+			nskippable_blocks++;
+			continue;
+		}
+
+		mapbits = visibilitymap_get_status(vacrel->rel,
 													   next_unskippable_block,
 													   vmbuffer);
 

@@ -2374,8 +2374,7 @@ test_cluster_vm_qualified_format.inc test_cluster_vm_qualified_read.inc test_clu
 	python3 $(srcdir)/extract_vm_qualified_ios_fixture.py $(top_srcdir)/src/backend $(patsubst test_cluster_vm_qualified_%.inc,%,$@) > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_vm_qualified_ios test_cluster_vm_qualified_ios_noassert test_cluster_vm_qualified_ios_unassigned: \
-		test_cluster_vm_qualified_ios.c test_cluster_vm_visible_version.c \
+VM_QUALIFIED_FIXTURE_DEPS = test_cluster_vm_visible_version.c \
 		test_cluster_vm_qualified_format.inc test_cluster_vm_qualified_read.inc test_cluster_vm_qualified_ios.inc \
 		test_cluster_heap_maintenance_policy.inc unit_test.h \
 		$(top_srcdir)/src/include/access/visibilitymap.h $(top_srcdir)/src/include/catalog/catversion.h \
@@ -2387,6 +2386,24 @@ test_cluster_vm_qualified_ios test_cluster_vm_qualified_ios_noassert test_cluste
 		test_cluster_vm_empty_scan.inc test_cluster_vm_empty_set.inc \
 		test_cluster_space_bufpage_product.o test_cluster_space_producer_product.o \
 		test_cluster_space_storage_product.o $(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
+
+test_cluster_vm_qualified_ios test_cluster_vm_qualified_ios_noassert test_cluster_vm_qualified_ios_unassigned: test_cluster_vm_qualified_ios.c $(VM_QUALIFIED_FIXTURE_DEPS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(if $(filter %_noassert,$@),-DFIXTURE_NO_ASSERTS) $(if $(filter %_unassigned,$@),-DFIXTURE_UNASSIGNED_CATALOG) $< \
+		test_cluster_space_bufpage_product.o test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
+
+TESTS += test_cluster_vm_vacuum_skip test_cluster_vm_vacuum_skip_noassert test_cluster_vm_vacuum_skip_unassigned
+all: test_cluster_vm_vacuum_skip test_cluster_vm_vacuum_skip_noassert test_cluster_vm_vacuum_skip_unassigned
+
+test_cluster_vm_vacuum_skip.inc: $(srcdir)/extract_vm_vacuum_skip_fixture.py $(srcdir)/extract_vacuum_mx_fixture.py \
+		$(top_srcdir)/src/backend/access/heap/vacuumlazy.c
+	python3 $(srcdir)/extract_vm_vacuum_skip_fixture.py $(top_srcdir)/src/backend/access/heap/vacuumlazy.c > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_vm_vacuum_skip test_cluster_vm_vacuum_skip_noassert test_cluster_vm_vacuum_skip_unassigned: \
+		test_cluster_vm_vacuum_skip.c test_cluster_vm_vacuum_skip.inc test_cluster_vm_qualified_ios.c $(VM_QUALIFIED_FIXTURE_DEPS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(if $(filter %_noassert,$@),-DFIXTURE_NO_ASSERTS) $(if $(filter %_unassigned,$@),-DFIXTURE_UNASSIGNED_CATALOG) $< \
 		test_cluster_space_bufpage_product.o test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \

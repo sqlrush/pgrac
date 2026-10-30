@@ -24,4 +24,6 @@ print(function(visibility, "HeapTupleSatisfiesVacuum", "HTSV_Result"))
 print(function(vacuum, "heap_page_is_all_visible", "static bool"))
 print(function(vacuum, "lazy_scan_prune", "static void"))
 print(function(vacuum, "lazy_scan_noprune", "static bool"))
+if "\nlazy_scan_skip_shared_page(" in vacuum:
+    print(function(vacuum, "lazy_scan_skip_shared_page", "static bool"))
 print(function(vacuum, "lazy_scan_skip", "static BlockNumber"))

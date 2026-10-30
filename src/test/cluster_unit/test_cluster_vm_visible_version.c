@@ -1401,6 +1401,11 @@ typedef struct LVRelState {
 	BlockNumber nonempty_pages;
 	char *relname;
 	BufferAccessStrategy bstrategy;
+	/* Native VM range-selection inputs; no catalogue advancement proof. */
+	BlockNumber rel_pages;
+	bool aggressive;
+	bool skipwithvm;
+	bool skippedallvis;
 } LVRelState;
 /* Identity transport leaves are controlled here; the cache fixture separately
  * executes the real storage guards. Keep every original publication body. */

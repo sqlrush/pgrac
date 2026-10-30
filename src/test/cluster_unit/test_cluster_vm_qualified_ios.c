@@ -517,8 +517,11 @@ UT_TEST(retry_setter_without_publication_proof_is_a_silent_noop)
 	UT_ASSERT(memcmp(pages, before, sizeof(pages)) == 0);
 }
 
+#ifndef VM_QUALIFIED_IOS_MAIN
+#define VM_QUALIFIED_IOS_MAIN main
+#endif
 int
-main(void)
+VM_QUALIFIED_IOS_MAIN(void)
 {
 	if (PGRAC_VM_QUALIFIED_CATALOG_VERSION == 0)
 	{
