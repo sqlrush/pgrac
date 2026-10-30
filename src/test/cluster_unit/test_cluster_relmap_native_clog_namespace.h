@@ -69,6 +69,7 @@
 #define cluster_clog_native_recovery_record_verify_v1                                              \
 	d3_clog_cluster_clog_native_recovery_record_verify_v1
 #define cluster_clog_native_recovery_verify_v1 d3_clog_cluster_clog_native_recovery_verify_v1
+#define cluster_clog_native_recovery_full_sync_v1 d3_clog_cluster_clog_native_recovery_full_sync_v1
 #define cluster_clog_native_terminal_sync_v1 d3_clog_cluster_clog_native_terminal_sync_v1
 #define cluster_node_id d3_clog_cluster_node_id
 #define cluster_shared_config d3_clog_cluster_shared_config
