@@ -265,8 +265,9 @@ TimestampTz replorigin_session_origin_timestamp;
 /* The two real native commit critical-region fragments below retain their
  * WAL/decision/checkpoint ordering. Profiling and unrelated observers are
  * boundaries; the SPACE owner is the real linked product implementation. */
-#define cluster_xp_begin(scope, bucket) ((void)0)
-#define cluster_xp_end(scope) ((void)0)
+#define cluster_xp_begin(scope, bucket) ((void)(scope))
+#define cluster_xp_end(scope) ((void)(scope))
+void cluster_backup_pending_commit_exit(void);
 void
 cluster_backup_pending_commit_exit(void)
 {}
@@ -285,6 +286,7 @@ cluster_scn_pending_commit_clear(SCN scn)
 {
 	return true;
 }
+XLogRecPtr cluster_adg_emit_thread_barrier(void);
 XLogRecPtr
 cluster_adg_emit_thread_barrier(void)
 {
@@ -4067,7 +4069,7 @@ UT_TEST(test_native_commit_logs_decides_and_publishes_before_checkpoint_release)
 	xl_xact_stats_item *droppedstats = NULL;
 	SharedInvalidationMessage *invalMessages = NULL;
 	SCN commit_scn = InvalidScn, tt_commit_scn = InvalidScn;
-	xl_xact_tt_commit tt_fold = { 0 };
+	xl_xact_tt_commit_v2 tt_fold = { 0 };
 	ClusterSpaceIdentity identity;
 	ClusterSpaceIdentityKey expected;
 	uint64 token;
@@ -4120,7 +4122,7 @@ UT_TEST(test_committed_drop_records_wal_without_precommit_physical_authorization
 	xl_xact_stats_item *droppedstats = NULL;
 	SharedInvalidationMessage *invalMessages = NULL;
 	SCN commit_scn = InvalidScn, tt_commit_scn = InvalidScn;
-	xl_xact_tt_commit tt_fold = { 0 };
+	xl_xact_tt_commit_v2 tt_fold = { 0 };
 	ClusterSpaceIdentity identity;
 	ClusterSpaceIdentityKey expected;
 	uint64 token;
@@ -4477,7 +4479,7 @@ UT_TEST(test_native_commit_optional_tail_and_bounded_parser)
 	TransactionId children[2] = { 502, 503 };
 	xl_xact_stats_item stats = { 0 };
 	SharedInvalidationMessage msg = { 0 };
-	xl_xact_tt_commit tt = { 0 };
+	xl_xact_tt_commit_v2 tt = { .delta = { .format_version = CLUSTER_XACT_TT_COMMIT_VERSION } };
 	uint32 len;
 	const char *data;
 
@@ -4627,11 +4629,90 @@ UT_TEST(test_native_structure_claim_passes_locked_identity_and_action)
 	FreeFakeRelcacheEntry(rel);
 }
 
+UT_TEST(test_native_commit_emitter_retains_v2_fullxid_before_original_space_tail)
+{
+	xl_xact_tt_commit_v2 carrier = { .delta = {
+		.segment_id = 1, .segment_generation = 4, .xid = 100,
+		.slot_offset = 7, .wrap = 5, .instance = 1,
+		.format_version = 2, .commit_scn = 42 },
+		.original_full_xid = UINT64_C(0x700000064) };
+	xl_xact_parsed_commit parsed;
+	Relation rel = native_truncate_relation();
+	ClusterSpaceDropState *state;
+	uint32 length;
+	const char *data;
+	bool ok;
+	drop_owner = plain_commit_emitter = true;
+	state = prepare_original_drop(&locator, 1);
+	UT_ASSERT(state != NULL);
+	if (state == NULL) { FreeFakeRelcacheEntry(rel); return; }
+	data = cluster_space_drop_wal(state, &length);
+	START_CRIT_SECTION();
+	MyProc->delayChkptFlags = DELAY_CHKPT_START;
+	XactLogCommitRecord(123, 0, NULL, 1, &locator, 0, NULL, 0, NULL, false,
+		0, InvalidTransactionId, NULL, 42, &carrier, data, length);
+	MyProc->delayChkptFlags = 0;
+	END_CRIT_SECTION();
+	ok = ParseCommitRecord(wal_info, (xl_xact_commit *)commit_bytes, commit_len, &parsed);
+	UT_ASSERT(ok);
+	if (ok) {
+		UT_ASSERT(parsed.has_tt_commit && parsed.nspace_drops == 1);
+		UT_ASSERT_EQ(parsed.tt_commit.format_version, 2);
+		UT_ASSERT_EQ(parsed.tt_original_full_xid, UINT64_C(0x700000064));
+		UT_ASSERT_EQ(parsed.tt_commit.commit_scn, 42);
+	}
+	cluster_space_drop_finish(state);
+	FreeFakeRelcacheEntry(rel);
+}
+
+
+UT_TEST(test_native_v2_commit_emitter_refuses_malformed_identity_before_insert)
+{
+	for (int fault = 0; fault < 9; fault++) {
+		xl_xact_tt_commit_v2 carrier = { .delta = {
+			.segment_id = 1, .segment_generation = 4, .xid = 100,
+			.slot_offset = 7, .wrap = 5, .instance = 1,
+			.format_version = CLUSTER_XACT_TT_COMMIT_V2_VERSION, .commit_scn = 42 },
+			.original_full_xid = UINT64_C(0x700000064) };
+		volatile bool caught = false;
+		int calls = wal_calls;
+		uint32 before_len = commit_len;
+		switch (fault) {
+		case 0: carrier.delta.format_version = 3; break;
+		case 1: carrier.original_full_xid = UINT64_MAX; break;
+		case 2: carrier.original_full_xid++; break;
+		case 3: carrier.delta.xid = FrozenTransactionId; break;
+		case 4: carrier.delta.flags = 1; break;
+		case 5: carrier.delta.reserved = 1; break;
+		case 6: carrier.delta.commit_scn = UINT64_MAX; break;
+		case 7: carrier.delta.commit_scn = 43; break;
+		case 8: carrier.delta.format_version = 1; break; /* Never drop a supplied FullXid. */
+		}
+		expecting_error = true;
+		START_CRIT_SECTION();
+		MyProc->delayChkptFlags = DELAY_CHKPT_START;
+		PG_TRY();
+		{
+			(void)XactLogCommitRecord(123, 0, NULL, 0, NULL, 0, NULL, 0, NULL, false,
+				0, InvalidTransactionId, NULL, 42, &carrier, NULL, 0);
+		}
+		PG_CATCH();
+		{ caught = true; }
+		PG_END_TRY();
+		MyProc->delayChkptFlags = 0;
+		END_CRIT_SECTION();
+		expecting_error = false;
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(wal_calls, calls);
+		UT_ASSERT_EQ(commit_len, before_len);
+	}
+}
+
 int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(93);
+	UT_PLAN(95);
 	UT_RUN(test_observed_create_captures_original_birth_without_owning_scope);
 	UT_RUN(test_observed_create_refuses_unbound_owner_before_effects);
 	UT_RUN(test_native_pending_delete_keeps_birth_before_create_scope_ends);
@@ -4725,6 +4806,8 @@ main(void)
 	UT_RUN(test_checkpoint_redo_may_begin_at_drop_commit);
 	UT_RUN(test_native_commit_optional_tail_and_bounded_parser);
 	UT_RUN(test_native_prepared_commit_preserves_empty_gid);
+	UT_RUN(test_native_commit_emitter_retains_v2_fullxid_before_original_space_tail);
+	UT_RUN(test_native_v2_commit_emitter_refuses_malformed_identity_before_insert);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

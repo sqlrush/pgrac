@@ -45,7 +45,7 @@
 #include "cluster/cluster_tt_status.h" /* ClusterTTStatus */
 
 /* spec-3.18 D4.1: fold-delta out-param; full def in access/xact.h. */
-struct xl_xact_tt_commit;
+struct xl_xact_tt_commit_v2;
 
 typedef enum ClusterCanonicalTxnPublishState {
 	CLUSTER_CANONICAL_TXN_NONE = 0,
@@ -107,7 +107,7 @@ extern void cluster_tt_local_record_commit(TransactionId xid, SCN commit_scn);
  * must NOT do durable I/O).
  */
 extern bool cluster_tt_local_precommit_durable_finish(TransactionId xid, SCN commit_scn,
-													  struct xl_xact_tt_commit *out_fold);
+													  struct xl_xact_tt_commit_v2 *out_fold);
 /* Critical-section safe: write the staged stamp after the commit record flush. */
 extern void cluster_tt_local_commit_durable_apply(XLogRecPtr commit_end);
 extern bool cluster_tt_local_preabort_durable_finish(TransactionId xid);

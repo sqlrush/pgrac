@@ -236,6 +236,9 @@ extern uint8 cluster_tt_slot_durable_commit_stage(uint32 segment_id, uint32 segm
 /* True when exactly this transaction's slot stamp is staged and unwritten. */
 extern bool cluster_tt_slot_durable_commit_staged(uint32 segment_id, uint16 slot_offset,
 												  TransactionId xid, uint16 wrap);
+/* Copy the original staged identity into the versioned native COMMIT tail. */
+struct xl_xact_tt_commit_v2;
+extern void cluster_tt_slot_durable_commit_fold(struct xl_xact_tt_commit_v2 *out);
 /* Critical-section safe: write the staged stamp; PANIC on any failure. */
 extern void cluster_tt_slot_durable_commit_apply(XLogRecPtr commit_end);
 /* Never throws: release a staged stamp that was never written. */

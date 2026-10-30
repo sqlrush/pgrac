@@ -437,6 +437,27 @@ cluster_undo_emit_tt_slot_abort_exact(uint8 instance, uint32 segment_id, uint32 
 }
 
 
+/* Exact ABORT shares the existing opcode and V2 identity prefix with BIND.
+ * The ordinary abort owner performs the original flush before its TT stamp. */
+XLogRecPtr
+cluster_undo_emit_tt_slot_abort_v2(const xl_undo_tt_identity_v2 *identity)
+{
+	xl_undo_tt_identity_v2 rec;
+
+	if (!cluster_undo_tt_bind_v2_decode(identity, sizeof(rec), &rec)
+		|| rec.instance == 0 || rec.instance > UNDO_OWNER_INSTANCE_MAX
+		|| rec.segment_id == 0 || rec.segment_id > UINT16_MAX
+		|| (rec.segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE + 1 != rec.instance
+		|| rec.slot_offset >= TT_SLOTS_PER_SEGMENT || rec.wrap == TT_WRAP_INVALID
+		|| rec.segment_generation == UINT32_MAX)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("invalid canonical TT V2 ABORT identity before WAL insertion")));
+	XLogBeginInsert();
+	XLogRegisterData((char *)&rec, sizeof(rec));
+	return XLogInsert(RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_ABORT);
+}
+
+
 /*
  * cluster_undo_emit_tt_slot_set_head -- spec-4.8 D7-A.
  *

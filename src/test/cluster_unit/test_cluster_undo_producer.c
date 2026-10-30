@@ -552,10 +552,57 @@ UT_TEST(test_v2_bind_producer_refuses_bad_identity_before_insertion)
 	}
 }
 
+
+UT_TEST(test_v2_abort_producer_preserves_original_identity_and_rejects_before_insert)
+{
+	for (unsigned fault = 0; fault < 13; fault++) {
+		xl_undo_tt_identity_v2 identity = { .segment_id = 513, .segment_generation = 9,
+			.xid = 801, .slot_offset = 4, .wrap = 7, .instance = 3,
+			.format_version = CLUSTER_UNDO_TT_IDENTITY_V2_VERSION,
+			.original_full_xid = UINT64_C(0x700000321) };
+		ClusterUndoDecoded decoded;
+		switch (fault) {
+		case 1: identity.format_version = 1; break;
+		case 2: identity.flags = 1; break;
+		case 3: identity.reserved = 1; break;
+		case 4: identity.original_full_xid = UINT64_MAX; break;
+		case 5: identity.original_full_xid++; break;
+		case 6: identity.xid = FrozenTransactionId; break;
+		case 7: identity.instance = 0; break;
+		case 8: identity.segment_id = 1; break;
+		case 9: identity.slot_offset = TT_SLOTS_PER_SEGMENT; break;
+		case 10: identity.wrap = TT_WRAP_INVALID; break;
+		case 11: identity.segment_generation = UINT32_MAX; break;
+		case 12: break;
+		}
+		payload_length = 123;
+		emitted_info = 0xee;
+		if (fault == 0) {
+			UT_ASSERT_EQ(cluster_undo_emit_tt_slot_abort_v2(&identity), 0x900);
+			UT_ASSERT_EQ(emitted_rmid, RM_CLUSTER_UNDO_ID);
+			UT_ASSERT_EQ(emitted_info, XLOG_UNDO_TT_SLOT_ABORT);
+			UT_ASSERT_EQ(payload_length, sizeof(identity));
+			UT_ASSERT_EQ(memcmp(payload, &identity, sizeof(identity)), 0);
+			decoded = decode_emitted(false);
+			UT_ASSERT(cluster_undo_preflight_tt_v2(&decoded));
+			UT_ASSERT_EQ(decoded.original_full_xid, identity.original_full_xid);
+		} else {
+			expect_panic = true;
+			if (setjmp(panic_jump) == 0) {
+				(void)cluster_undo_emit_tt_slot_abort_v2(fault == 12 ? NULL : &identity);
+				UT_ASSERT(false);
+			}
+			expect_panic = false;
+			UT_ASSERT_EQ(payload_length, 123);
+			UT_ASSERT_EQ(emitted_info, 0xee);
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(11);
 	UT_RUN(test_segment_lifecycle_producer_payloads);
 	UT_RUN(test_tt_producer_identity_and_polarity);
 	UT_RUN(test_ctrc_release_producer_certificate);
@@ -566,6 +613,7 @@ main(void)
 	UT_RUN(test_native_block_writer_uses_typed_preparation_before_write_and_sync);
 	UT_RUN(test_v2_bind_producer_preserves_original_fullxid_and_opcode);
 	UT_RUN(test_v2_bind_producer_refuses_bad_identity_before_insertion);
+	UT_RUN(test_v2_abort_producer_preserves_original_identity_and_rejects_before_insert);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

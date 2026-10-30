@@ -933,7 +933,7 @@ cluster_tt_local_get_or_create_binding(TransactionId top_xid, uint32 *out_segmen
 
 bool
 cluster_tt_local_precommit_durable_finish(TransactionId xid, SCN commit_scn,
-										  xl_xact_tt_commit *out_fold)
+										  xl_xact_tt_commit_v2 *out_fold)
 {
 	ClusterSemanticAdmissionToken modifier_token;
 	ClusterSemanticAdmissionResult admission;
@@ -942,7 +942,6 @@ cluster_tt_local_precommit_durable_finish(TransactionId xid, SCN commit_scn,
 	uint32 segment_generation;
 	uint16 slot_offset;
 	uint16 wrap;
-	uint8 owner;
 	TTSlot successor;
 	int idx;
 
@@ -995,25 +994,10 @@ cluster_tt_local_precommit_durable_finish(TransactionId xid, SCN commit_scn,
 		 * the whole xact, so its wrap cannot have changed.
 		 */
 		cluster_tt_local_modifier_recheck_or_error(&modifier_token);
-		owner
-			= cluster_tt_slot_durable_commit_stage(segment_id, segment_generation, slot_offset, xid,
+		(void)cluster_tt_slot_durable_commit_stage(segment_id, segment_generation, slot_offset, xid,
 												   wrap, commit_scn, &modifier_token, &successor);
 
-		/*
-		 * Build the fold delta (mirrors xl_undo_tt_slot_commit fields).  xid is the
-		 * committing top-xid (== slot owner for a non-prepared xact); instance is
-		 * the slot's owner instance, needed for path resolution at redo.
-		 */
-		out_fold->segment_id = segment_id;
-		out_fold->segment_generation = segment_generation;
-		out_fold->xid = successor.xid;
-		out_fold->slot_offset = slot_offset;
-		out_fold->wrap = successor.wrap;
-		out_fold->instance = owner;
-		out_fold->format_version = CLUSTER_XACT_TT_COMMIT_VERSION;
-		out_fold->flags = 0;
-		out_fold->reserved = 0;
-		out_fold->commit_scn = successor.commit_scn;
+		cluster_tt_slot_durable_commit_fold(out_fold);
 		cluster_tt_local_bindings[idx].terminal_state = CLUSTER_TT_LOCAL_TERMINAL_COMMIT_STAGED;
 	}
 	PG_CATCH();

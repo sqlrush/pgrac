@@ -3101,6 +3101,7 @@ test_cluster_space_recovery: test_cluster_space_recovery.c unit_test.h test_clus
 		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -lcrypto -o $@
 
 test_cluster_space_storage_product.o: $(top_srcdir)/src/backend/cluster/cluster_space_storage.c \
+		$(top_srcdir)/src/include/access/xact.h \
 		$(top_srcdir)/src/include/cluster/cluster_space_storage.h \
 		$(top_srcdir)/src/include/cluster/cluster_grd.h \
         $(top_srcdir)/src/include/cluster/cluster_ges_handoff.h \
@@ -3532,7 +3533,7 @@ test_cluster_undo_tt_transition.inc: $(top_srcdir)/src/backend/cluster/cluster_t
 test_cluster_undo_producer_owner.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_xlog.c Makefile
 	awk '/^(cluster_undo_emit_[a-z_0-9]+|cluster_hw_emit_reserve|cluster_undo_xlog_insert_tt_ctrc_release)\(/ \
 	     { print "XLogRecPtr"; emit=1; found++ } emit { print } /^}/ { emit=0 } \
-	     END { if (found != 13) exit 1 }' $< > $@.tmp
+	     END { if (found != 14) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_undo_block_native.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_xlog.c Makefile
@@ -3669,7 +3670,8 @@ test_cluster_side_online_plan.o: \
 		$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DRF_SIDE_ONLINE_TESTING -ffunction-sections -fdata-sections -c $< -o $@
 SIDE_XACT_XACTDESC_O = test_cluster_side_xact_xactdesc.o
-$(SIDE_XACT_XACTDESC_O): $(top_srcdir)/src/backend/access/rmgrdesc/xactdesc.c
+$(SIDE_XACT_XACTDESC_O): $(top_srcdir)/src/backend/access/rmgrdesc/xactdesc.c \
+		$(top_srcdir)/src/include/access/xact.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 SIDE_XACT_TT_2PC_RECORD_O = $(top_builddir)/src/backend/cluster/cluster_tt_2pc_record.o
 test_cluster_side_xact_undo_product.o: $(top_srcdir)/src/backend/cluster/cluster_side_undo.c \
@@ -7941,6 +7943,12 @@ test_cluster_tt_durable test_cluster_tt_rollback_entry test_cluster_tt_abort_own
 test_cluster_tt_active_owner test_cluster_tt_slot_allocator: \
 		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h \
 		$(top_srcdir)/src/include/cluster/cluster_tt_slot.h
+
+$(top_builddir)/src/backend/cluster/cluster_tt_durable.o test_cluster_tt_durable \
+ test_cluster_tt_active_owner test_cluster_tt_abort_owner test_cluster_tt_rollback_entry: \
+		$(top_srcdir)/src/include/access/xact.h \
+		$(top_srcdir)/src/include/cluster/cluster_tt_durable.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h
 
 # spec-3.11 D2/D9: test_cluster_tt_durable — pure decision predicates
 # (redo wrap table / slot match) + lookup / by-xid scan with a mocked

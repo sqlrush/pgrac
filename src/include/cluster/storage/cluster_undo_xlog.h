@@ -930,6 +930,7 @@ extern XLogRecPtr cluster_undo_emit_tt_slot_bind(uint8 instance, uint32 segment_
 
 /* Same opcode, explicit 32-byte V2 identity; invalid input errors before WAL. */
 extern XLogRecPtr cluster_undo_emit_tt_slot_bind_v2(const xl_undo_tt_identity_v2 *identity);
+extern XLogRecPtr cluster_undo_emit_tt_slot_abort_v2(const xl_undo_tt_identity_v2 *identity);
 
 /*
  * cluster_undo_emit_tt_slot_commit (spec-3.11 D3)
