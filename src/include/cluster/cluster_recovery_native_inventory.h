@@ -18,6 +18,7 @@
 #include "cluster/cluster_recovery_root_set.h"
 #include "cluster/cluster_wal_inputs.h"
 #include "common/cluster_relmap_v2.h"
+#include "common/cryptohash.h"
 
 typedef enum ClusterRecoveryNativeInventoryResult {
 	CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED = 0,
@@ -586,8 +587,9 @@ cluster_recovery_native_inventory_next(ClusterRecoveryNativeInventory *inventory
  *
  * observed with index==count and an empty primary is complete end, including
  * count zero. Invalid/incomplete/refused/range results are all zero. Pointers
- * borrow the original inventory lifetime and must not be modified. No I/O,
- * allocation, physical reread, progress or authority is supplied; the caller
+ * borrow the original inventory lifetime and must not be modified. No file
+ * I/O, physical reread, progress or authority is supplied. Full-hash validation
+ * uses fixed-size cryptographic scratch; the caller
  * must bracket use with the original complete source/current checks. Indexed
  * access walks the saved list and never rewinds or consumes an old cursor. */
 typedef struct ClusterRecoveryNativeRecordObservationV1 {
@@ -603,7 +605,25 @@ typedef struct ClusterRecoveryNativeRecordObservationV1 {
 	 * is an unresolved fixed owner-family duty, not an executor/completion
 	 * result, qualified base, raw-record reference or semantic graph seal. */
 	const uint16 *owner_families;
+	/* Complete original validated WAL record, including framing and CRC.
+	 * Immutable borrowed bytes share the original inventory lifetime. */
+	const uint8 *raw_record;
+	uint32 raw_length;
+	uint8 raw_record_sha256[32];
 } ClusterRecoveryNativeRecordObservationV1;
+/* Plain full-record SHA, including the original framing and final CRC. */
+static inline bool
+cluster_recovery_native_raw_sha256_v1(const uint8 *raw, uint32 length, uint8 out[32])
+{
+	pg_cryptohash_ctx *hash = pg_cryptohash_create(PG_SHA256);
+	bool ok;
+
+	if (hash == NULL) return false;
+	ok = pg_cryptohash_init(hash) == 0 && pg_cryptohash_update(hash, raw, length) == 0
+		&& pg_cryptohash_final(hash, out, 32) == 0;
+	pg_cryptohash_free(hash);
+	return ok;
+}
 /* A complete decoder-owned group is published as one value. Upper layers
  * check its envelope before exposing borrowed components; execution and
  * original source/current qualification are separate duties. */
@@ -611,8 +631,17 @@ static inline bool
 cluster_recovery_native_record_effects_valid_v1(const ClusterRecoveryNativeRecordObservationV1 *view,
 	uint64 limit)
 {
+	uint8 digest[32] = {0};
+
 	if (view->index == view->count) return view->effects == NULL && view->effect_count == 0
-		&& view->owner_families == NULL;
+		&& view->owner_families == NULL && view->raw_record == NULL && view->raw_length == 0
+		&& memcmp(view->raw_record_sha256, digest, 32) == 0;
+	if (view->primary.record == NULL || view->raw_record == NULL
+		|| view->raw_length < SizeOfXLogRecord
+		|| view->raw_length != view->primary.record->header.xl_tot_len
+		|| memcmp(view->raw_record, &view->primary.record->header, SizeOfXLogRecord) != 0
+		|| !cluster_recovery_native_raw_sha256_v1(view->raw_record, view->raw_length, digest)
+		|| memcmp(digest, view->raw_record_sha256, 32) != 0) return false;
 	if (view->effects == NULL || view->owner_families == NULL
 		|| view->effect_count == 0 || view->effect_count > limit)
 		return false;

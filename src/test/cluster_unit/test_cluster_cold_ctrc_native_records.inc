@@ -2,11 +2,13 @@
  * test_cluster_recovery_census_native_records.inc.
  * Copyright (c) 2026, pgrac contributors
  * Author: SqlRush <sqlrush@gmail.com> */
+#include "common/cryptohash.h"
 static unsigned start_native_record_fault, start_native_record_calls;
 static uint16 start_native_owner_families[2][3];
 static uint64 start_native_record_count;
 static ClusterRecoveryNativeRecord start_native_records[2];
 static char start_native_payloads[2][8];
+static uint8 start_native_raw[2][SizeOfXLogRecord + 2 + 8];
 static ClusterRecoveryNativeEffect start_native_components[2][3];
 
 ClusterRecoveryNativeRecordObservationV1
@@ -28,6 +30,14 @@ cluster_recovery_census_native_record_v1(ClusterRecoveryCensus *cursor, uint64 i
 		out.primary.bytes = start_native_payloads[index]; out.primary.length = 8;
 		out.effects = start_native_components[index]; out.effect_count = index == 0 ? 1 : 3;
 		out.owner_families = start_native_owner_families[index];
+		out.raw_record = start_native_raw[index]; out.raw_length = sizeof(start_native_raw[index]);
+		{
+			pg_cryptohash_ctx *hash = pg_cryptohash_create(PG_SHA256);
+			UT_ASSERT(hash != NULL); UT_ASSERT_EQ(pg_cryptohash_init(hash), 0);
+			UT_ASSERT_EQ(pg_cryptohash_update(hash, out.raw_record, out.raw_length), 0);
+			UT_ASSERT_EQ(pg_cryptohash_final(hash, out.raw_record_sha256, 32), 0);
+			pg_cryptohash_free(hash);
+		}
 	}
 	if (start_native_record_fault == 3) out.count = observation_manifest.native_effect_count + 1;
 	if (start_native_record_fault == 4) out.source_index = out.source_count;
@@ -50,6 +60,14 @@ cluster_recovery_census_native_record_v1(ClusterRecoveryCensus *cursor, uint64 i
 	if (start_native_record_fault == 34) start_native_owner_families[1][0] = 8;
 	if (start_native_record_fault == 35) start_native_owner_families[1][0] = 0x3fff;
 	if (start_native_record_fault == 36) out.owner_families = start_native_owner_families[0];
+	if (start_native_record_fault == 41) out.raw_record = NULL;
+	if (start_native_record_fault == 42) out.raw_length--;
+	if (start_native_record_fault == 43) out.raw_length++;
+	if (start_native_record_fault == 44) out.raw_record_sha256[31] ^= 1;
+	if (start_native_record_fault == 45) start_native_raw[1][sizeof(start_native_raw[1]) - 1] ^= 1;
+	if (start_native_record_fault == 46) start_native_raw[1][0] ^= 1;
+	if (start_native_record_fault == 47) memset(out.raw_record_sha256, 0, 32);
+	if (start_native_record_fault == 48) out.raw_record = start_native_raw[0];
 	return out;
 }
 
@@ -62,6 +80,7 @@ start_native_records_ready(uint64 count)
 	memset(start_native_records, 0, sizeof(start_native_records));
 	memset(start_native_payloads, 0, sizeof(start_native_payloads));
 	memset(start_native_components, 0, sizeof(start_native_components));
+	memset(start_native_raw, 0, sizeof(start_native_raw));
 	for (unsigned i = 0; i < lengthof(start_native_records); i++) {
 		start_native_records[i].source = observation_wal_sources[0].source;
 		start_native_records[i].cut = observation_wal_sources[0].cut;
@@ -69,6 +88,19 @@ start_native_records_ready(uint64 count)
 		start_native_records[i].payload = start_native_payloads[i];
 		start_native_records[i].payload_length = sizeof(start_native_payloads[i]);
 		start_native_payloads[i][7] = 0x73 + i;
+		start_native_records[i].read_lsn = 8256 + i * 64;
+		start_native_records[i].end_lsn = start_native_records[i].read_lsn
+			+ MAXALIGN(sizeof(start_native_raw[i]));
+		start_native_records[i].header.xl_tot_len = sizeof(start_native_raw[i]);
+		start_native_raw[i][SizeOfXLogRecord] = XLR_BLOCK_ID_DATA_SHORT;
+		start_native_raw[i][SizeOfXLogRecord + 1] = 8;
+		memcpy(start_native_raw[i] + SizeOfXLogRecord + 2, start_native_payloads[i], 8);
+		INIT_CRC32C(start_native_records[i].header.xl_crc);
+		COMP_CRC32C(start_native_records[i].header.xl_crc, start_native_raw[i] + SizeOfXLogRecord, 10);
+		COMP_CRC32C(start_native_records[i].header.xl_crc, &start_native_records[i].header,
+			offsetof(XLogRecord, xl_crc));
+		FIN_CRC32C(start_native_records[i].header.xl_crc);
+		memcpy(start_native_raw[i], &start_native_records[i].header, SizeOfXLogRecord);
 		start_native_owner_families[i][0] = i == 0 ? 1 : 24;
 		start_native_owner_families[i][1] = start_native_owner_families[i][2] = 16;
 		start_native_components[i][0] = (ClusterRecoveryNativeEffect){

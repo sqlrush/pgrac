@@ -1160,13 +1160,24 @@ cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **held)
 
 #include "test_cluster_recovery_owner_routes.inc"
 
+#include "test_cluster_recovery_raw_records.inc"
+
 int
 main(int argc, char **argv)
 {
+
 	(void)argc;
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_RAW_RECORDS") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_reader_raw_record_readahead_release_seek_and_crc_failure_revoke);
+		UT_RUN(test_reader_raw_record_page_and_segment_continuations_exclude_page_headers);
+		UT_RUN(test_census_raw_records_preserve_full_file_bytes_after_both_passes);
+		UT_RUN(test_census_raw_records_missing_length_bytes_hash_and_end_refuse_whole_view);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_OWNER_ROUTES") != NULL) {
 		UT_PLAN(2);
 		UT_RUN(test_census_owner_routes_keep_every_component_and_original_custody);
@@ -1538,7 +1549,12 @@ main(int argc, char **argv)
 	UT_RUN(test_census_native_records_original_final_wal_rewrite_refuses_whole_view);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(286);
+	UT_PLAN(290);
+	UT_RUN(test_reader_raw_record_readahead_release_seek_and_crc_failure_revoke);
+	UT_RUN(test_reader_raw_record_page_and_segment_continuations_exclude_page_headers);
+	UT_RUN(test_census_raw_records_preserve_full_file_bytes_after_both_passes);
+	UT_RUN(test_census_raw_records_missing_length_bytes_hash_and_end_refuse_whole_view);
+
 	UT_RUN(test_census_owner_routes_keep_every_component_and_original_custody);
 	UT_RUN(test_census_owner_routes_missing_wrong_extra_and_nonempty_end_revoke_whole_group);
 

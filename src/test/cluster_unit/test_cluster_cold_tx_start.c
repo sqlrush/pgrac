@@ -2464,8 +2464,17 @@ static void startup_local_empty_reset(void);
 
 #include "test_cluster_cold_ctrc_owner_routes.inc"
 
+#include "test_cluster_cold_ctrc_raw_records.inc"
+
 int main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_START_RAW_RECORDS") != NULL) {
+		UT_PLAN(2);
+		UT_RUN(test_start_raw_records_keep_complete_original_bytes_and_empty_end);
+		UT_RUN(test_start_raw_records_refuse_incomplete_changed_bytes_hash_header_and_end);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+
 	if (getenv("PGRAC_PRE2_TEST_START_OWNER_ROUTES") != NULL) {
 		UT_PLAN(2);
 		UT_RUN(test_start_owner_routes_keep_distinct_mx_duties_without_accepting_completion);
@@ -2908,7 +2917,10 @@ int main(void)
 	}
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_FIRST
-	UT_PLAN(356);
+	UT_PLAN(358);
+	UT_RUN(test_start_raw_records_keep_complete_original_bytes_and_empty_end);
+	UT_RUN(test_start_raw_records_refuse_incomplete_changed_bytes_hash_header_and_end);
+
 	UT_RUN(test_start_owner_routes_keep_distinct_mx_duties_without_accepting_completion);
 	UT_RUN(test_start_owner_routes_refuse_missing_unknown_partial_extra_and_nonempty_end);
 

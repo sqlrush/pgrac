@@ -10866,3 +10866,9 @@ test_cluster_cold_tx_start: test_cluster_cold_ctrc_native_records.inc
 test_cluster_recovery_native_scan: test_cluster_recovery_compound_scan.inc test_cluster_recovery_owner_scan.inc
 test_cluster_recovery_native_inputs: test_cluster_recovery_compound_obligations.inc test_cluster_recovery_owner_routes.inc
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_compound_obligations.inc test_cluster_cold_ctrc_owner_routes.inc
+
+# Complete original native WAL snapshot fixtures.
+test_cluster_recovery_native_inputs: test_cluster_recovery_raw_records.inc
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_raw_records.inc
+
+xlogreader_fs.o: $(top_srcdir)/src/include/access/xlogreader.h

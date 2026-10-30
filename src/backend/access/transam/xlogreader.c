@@ -658,6 +658,23 @@ XLogReadRecord(XLogReaderState *state, char **errormsg)
 	return NULL;
 }
 
+/* PGRAC: only the latest validated decode still owns its original raw
+ * buffer. A queued older record deliberately has no raw view. */
+const XLogRecord *
+XLogReaderCurrentRawRecord(const XLogReaderState *state)
+{
+	if (state == NULL || state->record == NULL || state->cluster_raw_record == NULL
+		|| state->record != state->cluster_raw_decoded
+		|| XLogRecPtrIsInvalid(state->ReadRecPtr) || state->EndRecPtr <= state->ReadRecPtr
+		|| state->record->lsn != state->ReadRecPtr
+		|| state->record->next_lsn != state->EndRecPtr
+		|| state->DecodeRecPtr != state->ReadRecPtr || state->NextRecPtr != state->EndRecPtr
+		|| state->record->header.xl_tot_len < SizeOfXLogRecord
+		|| memcmp(state->cluster_raw_record, &state->record->header, SizeOfXLogRecord) != 0)
+		return NULL;
+	return state->cluster_raw_record;
+}
+
 /*
  * Allocate space for a decoded record.  The only member of the returned
  * object that is initialized is the 'oversized' flag, indicating that the
@@ -790,6 +807,8 @@ XLogDecodeNextRecord(XLogReaderState *state, bool nonblocking)
 	state->errormsg_buf[0] = '\0';
 	state->cluster_record_crc_failed = false;
 	decoded = NULL;
+	state->cluster_raw_record = NULL;
+	state->cluster_raw_decoded = NULL;
 
 	state->abortedRecPtr = InvalidXLogRecPtr;
 	state->missingContrecPtr = InvalidXLogRecPtr;
@@ -1153,6 +1172,8 @@ restart:
 	{
 		/* Record the location of the next record. */
 		decoded->next_lsn = state->NextRecPtr;
+		state->cluster_raw_record = record;
+		state->cluster_raw_decoded = decoded;
 
 		/*
 		 * If it's in the decode buffer, mark the decode buffer space as
@@ -1952,6 +1973,8 @@ ResetDecoder(XLogReaderState *state)
 	state->decode_queue_tail = NULL;
 	state->decode_queue_head = NULL;
 	state->record = NULL;
+	state->cluster_raw_record = NULL;
+	state->cluster_raw_decoded = NULL;
 
 	/* Reset the decode buffer to empty. */
 	state->decode_buffer_tail = state->decode_buffer;
