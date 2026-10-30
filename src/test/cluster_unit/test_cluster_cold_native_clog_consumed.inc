@@ -22,12 +22,20 @@ static unsigned native_record_queries;
 static uint8 native_source_payload[sizeof(xl_clog_truncate_full)];
 static uint32 native_source_payload_length;
 
+#include "test_cluster_cold_native_side.h"
+/* NULL preserves every original isolated fixture path. The opaque plan has
+ * its real layout in a separate translation unit, never this fixture's one. */
+static TestColdNativeSide *native_source_side;
+
 /* The real sealed matcher is covered by SIDE tests. This preserves the
  * fixture's independent full-header/frame check around the real owner. */
 bool
 rf_side_online_plan_clog_matches_v1(const RfSideOnlinePlanV1 *plan,
 	const ClusterWalSourceRef *source, const XLogReaderState *reader)
 {
+	if (native_side_complete_claims)
+		return plan == &side_fixture[0]
+			&& test_cold_native_side_matches(native_source_side, source, reader);
 	return plan == &side_fixture[0] && reader == native_source_reader
 		&& source != NULL && reader != NULL && reader->record != NULL
 		&& memcmp(source, &restart_ref, sizeof(*source)) == 0
@@ -51,6 +59,9 @@ side_plan_clog_native_replay(const RfSideOnlinePlanV1 *plan,
 	const ClusterWalSourceRef *source, XLogReaderState *reader,
 	void (*redo)(XLogReaderState *, void *), bool (*current)(void *), void *arg)
 {
+	if (native_side_complete_claims)
+		return plan == &side_fixture[0]
+			&& test_cold_native_side_replay(native_source_side, source, reader, redo, current, arg);
 	if (native_source_attempted || plan == NULL || source == NULL || reader == NULL
 		|| redo == NULL || current == NULL)
 		return false;
