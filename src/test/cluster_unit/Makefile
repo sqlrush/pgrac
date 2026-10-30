@@ -14469,6 +14469,7 @@ test_cluster_clog_recovery test_cluster_xid_native_clog.o test_cluster_recovery_
         test_cluster_side_native_clog.o test_cluster_relmap_publish_clog_bridge.o \
         test_cluster_relmap_native_clog.o test_cluster_clog_retention: \
         test_cluster_clog_native_full_sync.inc test_cluster_clog_native_full_truncate_sync.inc \
+        test_cluster_clog_native_record_owner.inc \
         test_cluster_clog_native_callback.inc $(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
 clean: clean-clog-native-callback
 .PHONY: clean-clog-native-callback

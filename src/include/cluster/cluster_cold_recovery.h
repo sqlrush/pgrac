@@ -964,6 +964,13 @@ extern bool cluster_cold_typed_clog_native_v1(ClusterColdTypedV1 *typed,
 	struct ClusterRecoveryFencePlan *fence, XLogReaderState *reader,
 	void (*redo)(XLogReaderState *, void *), void *arg);
 
+/* Exact founder record only during the original native callback. This checks
+ * saved source/participant and sealed bytes, without source/ROOT I/O or a new
+ * scope. It authorizes finish verification only, never cold mutation, replay,
+ * retained lifetime or completion. False outside the callback, also on ERROR. */
+extern bool cluster_cold_typed_clog_native_record_current_v1(int origin,
+	const XLogReaderState *reader);
+
 /* Capture actual pass-2 coverage before its adapter is released. A failed
  * completion clears the previous output; consumers recheck the same plan. */
 extern bool cluster_cold_typed_effects_complete_v1(ClusterColdTypedV1 *typed,
