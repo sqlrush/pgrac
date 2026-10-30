@@ -880,7 +880,7 @@ UT_TEST(test_capacity_owner_respawn_requires_fresh_proof_before_sleep)
 		UT_ASSERT_EQ(memcmp(&continuation, &empty, sizeof(empty)), 0);
 		UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_entered, 0);
 		UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_repolled, 0);
-		UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_refused_proof, 0);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&undo_cleaner_state->capacity_wait_refused_proof), 0);
 		UT_ASSERT_EQ(cancelled, 1);
 		UT_ASSERT(!subscribed);
 		UT_ASSERT_EQ(test_lock_depth, 0);
@@ -905,7 +905,7 @@ UT_TEST(test_unrelated_worker_respawn_keeps_exact_owner_wait)
 	UT_ASSERT_EQ(continuation.segment_id, 4);
 	UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_entered, 1);
 	UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_repolled, 1);
-	UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_refused_proof, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&undo_cleaner_state->capacity_wait_refused_proof), 0);
 	UT_ASSERT(!subscribed);
 }
 
@@ -924,8 +924,8 @@ UT_TEST(test_owner_respawn_cannot_override_proof_or_context_refusal)
 		UT_ASSERT(!cluster_undo_cleaner_wait_for_capacity(4, &continuation));
 		UT_ASSERT_EQ(slept, 0);
 		UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_entered, 0);
-		UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_refused_proof, fault == 0);
-		UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_refused_context, fault == 1);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&undo_cleaner_state->capacity_wait_refused_proof), fault == 0);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&undo_cleaner_state->capacity_wait_refused_context), fault == 1);
 		UT_ASSERT(!subscribed);
 	}
 }
@@ -981,7 +981,7 @@ UT_TEST(test_worker_generation_exhaustion_never_reuses_an_incarnation)
 			UT_ASSERT(row.incarnation_generation == UINT64_MAX);
 			UT_ASSERT(!cluster_undo_cleaner_wait_for_capacity(4, &continuation));
 			UT_ASSERT_EQ(slept, 1);
-			UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_refused_proof, spawn + 1);
+			UT_ASSERT_EQ(pg_atomic_read_u64(&undo_cleaner_state->capacity_wait_refused_proof), spawn + 1);
 		}
 	}
 }
@@ -1007,7 +1007,7 @@ UT_TEST(test_owner_generation_and_latch_cannot_be_replaced_by_ready_pid)
 			UT_ASSERT_EQ(row->pid, MyProcPid);
 			UT_ASSERT(!cluster_undo_cleaner_wait_for_capacity(4, &continuation));
 			UT_ASSERT_EQ(slept, 0);
-			UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_refused_proof, 1);
+			UT_ASSERT_EQ(pg_atomic_read_u64(&undo_cleaner_state->capacity_wait_refused_proof), 1);
 			UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_entered, 0);
 			UT_ASSERT(!subscribed);
 		}
@@ -1026,7 +1026,7 @@ UT_TEST(test_newly_ready_owner_requires_reobservation_without_sleep)
 	UT_ASSERT(cluster_undo_cleaner_wait_for_capacity(4, &continuation));
 	UT_ASSERT_EQ(slept, 0);
 	UT_ASSERT_EQ(memcmp(&continuation, &empty, sizeof(empty)), 0);
-	UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_refused_proof, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&undo_cleaner_state->capacity_wait_refused_proof), 0);
 	UT_ASSERT(!subscribed);
 }
 
@@ -1127,7 +1127,7 @@ UT_TEST(test_capacity_every_blocking_hold_refuses_without_sleep)
 		UT_ASSERT(!cluster_undo_cleaner_wait_for_capacity(1, &continuation));
 		UT_ASSERT_EQ(slept, 0);
 		UT_ASSERT_EQ(test_wait_event, WAIT_EVENT_CLIENT_READ);
-		UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_refused_context, 1);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&undo_cleaner_state->capacity_wait_refused_context), 1);
 		UT_ASSERT(!subscribed);
 	}
 }
@@ -1234,7 +1234,7 @@ UT_TEST(test_capacity_cancellation_and_missing_supply_keep_original_outcome)
 		UT_ASSERT_EQ(slept, 0);
 		UT_ASSERT_EQ(test_wait_event, WAIT_EVENT_CLIENT_READ);
 		UT_ASSERT_EQ(cancelled, 1);
-		UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_refused_proof, 1);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&undo_cleaner_state->capacity_wait_refused_proof), 1);
 	}
 }
 
@@ -1946,8 +1946,8 @@ UT_TEST(test_capacity_stats_distinguishes_available_zero_and_preserves_unsigned_
 	UT_ASSERT_EQ(out.refused_proof_count, 0);
 	undo_cleaner_state->capacity_wait_entered = UINT64_MAX;
 	undo_cleaner_state->capacity_wait_repolled = UINT64_C(9223372036854775809);
-	undo_cleaner_state->capacity_wait_refused_context = 19;
-	undo_cleaner_state->capacity_wait_refused_proof = 23;
+	pg_atomic_write_u64(&undo_cleaner_state->capacity_wait_refused_context, 19);
+	pg_atomic_write_u64(&undo_cleaner_state->capacity_wait_refused_proof, 23);
 	pg_atomic_write_u64(&undo_cleaner_state->capacity_wait_cancelled, 17);
 	UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&out));
 	UT_ASSERT_EQ(out.pool_wait_count, UINT64_MAX);
@@ -2042,7 +2042,7 @@ UT_TEST(test_pool_owner_uses_original_cv_and_exact_old_segment_worker)
 	UT_ASSERT_EQ(cancelled, 1);
 	UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_entered, 1);
 	UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_repolled, 1);
-	UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_refused_proof, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&undo_cleaner_state->capacity_wait_refused_proof), 0);
 	UT_ASSERT(!subscribed);
 }
 
@@ -2058,7 +2058,7 @@ UT_TEST(test_pool_recheck_returns_to_allocator_without_sleep_or_grant)
 	UT_ASSERT_EQ(slept, 0);
 	UT_ASSERT_EQ(signalled, 0);
 	UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_entered, 0);
-	UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_refused_proof, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&undo_cleaner_state->capacity_wait_refused_proof), 0);
 	UT_ASSERT(!subscribed);
 }
 
@@ -2076,7 +2076,7 @@ UT_TEST(test_pool_owner_change_cannot_bridge_original_wait_generation)
 	UT_ASSERT_EQ(slept, 0);
 	UT_ASSERT_EQ(signalled, 0);
 	UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_entered, 0);
-	UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_refused_proof, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&undo_cleaner_state->capacity_wait_refused_proof), 0);
 	UT_ASSERT(!subscribed);
 }
 
@@ -2095,7 +2095,7 @@ UT_TEST(test_current_proof_never_calls_pool_and_unproven_never_sleeps)
 		UT_ASSERT_EQ(cluster_undo_cleaner_wait_for_capacity(1, &continuation), fault != 2);
 		UT_ASSERT_EQ(test_pool_calls, fault == 2);
 		UT_ASSERT_EQ(slept, fault == 0);
-		UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_refused_proof, fault == 2);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&undo_cleaner_state->capacity_wait_refused_proof), fault == 2);
 		UT_ASSERT(!subscribed);
 	}
 }
@@ -2173,7 +2173,7 @@ UT_TEST(test_pool_keeps_original_context_refusal_and_cancel_cleanup)
 		UT_ASSERT_EQ(caught, fault == 1);
 		UT_ASSERT_EQ(test_pool_calls, 1);
 		UT_ASSERT_EQ(slept, fault == 1);
-		UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_refused_context, fault == 0);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&undo_cleaner_state->capacity_wait_refused_context), fault == 0);
 		UT_ASSERT_EQ(pg_atomic_read_u64(&undo_cleaner_state->capacity_wait_cancelled), fault == 1);
 		UT_ASSERT_EQ(cancelled, 1);
 		UT_ASSERT_EQ(test_lock_depth, 0);
@@ -2228,7 +2228,7 @@ UT_TEST(test_pool_continuation_survives_current_refusal_and_repeated_cv_reentry)
 		UT_ASSERT_EQ(cancelled, pass + 1);
 		UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_entered, pass + 1);
 		UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_repolled, pass + 1);
-		UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_refused_proof, 0);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&undo_cleaner_state->capacity_wait_refused_proof), 0);
 		UT_ASSERT_EQ(test_lock_depth, 0);
 		UT_ASSERT(!subscribed);
 	}
@@ -2269,7 +2269,7 @@ UT_TEST(test_pool_continuation_recheck_refusal_and_cancel_keep_original_counters
 		UT_ASSERT_EQ(cancelled, 1);
 		UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_entered, fault == 2);
 		UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_repolled, 0);
-		UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_refused_proof, fault == 1);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&undo_cleaner_state->capacity_wait_refused_proof), fault == 1);
 		UT_ASSERT_EQ(pg_atomic_read_u64(&undo_cleaner_state->capacity_wait_cancelled), fault == 2);
 		UT_ASSERT_EQ(test_lock_depth, 0);
 		UT_ASSERT(!subscribed);
@@ -2330,7 +2330,7 @@ UT_TEST(test_zero_key_segment_wait_refuses_malformed_identity)
 		UT_ASSERT_EQ(slept, 0);
 		UT_ASSERT_EQ(cancelled, 1);
 		UT_ASSERT_EQ(memcmp(&continuation, &empty, sizeof(empty)), 0);
-		UT_ASSERT_EQ(undo_cleaner_state->capacity_wait_refused_proof, 1);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&undo_cleaner_state->capacity_wait_refused_proof), 1);
 		UT_ASSERT(!subscribed);
 	}
 }
@@ -2409,6 +2409,42 @@ UT_TEST(test_capacity_retention_snapshot_preserves_zero_unsigned_and_unavailable
 	UT_ASSERT_EQ(slept, 0);
 }
 
+UT_TEST(test_capacity_refusal_producer_and_legacy_reads_do_not_lock_or_truncate)
+{
+	ClusterUndoCapacityStats out;
+	UndoCleanerSharedState *saved;
+	uint64 context = UINT64_C(9223372036854775809);
+	uint64 proof = UINT64_MAX - 1;
+
+	reset_wait_fixture();
+	pg_atomic_write_u64(&undo_cleaner_state->capacity_wait_refused_context, context);
+	pg_atomic_write_u64(&undo_cleaner_state->capacity_wait_refused_proof, proof);
+	test_wait_event = WAIT_EVENT_CLIENT_READ;
+	/* The lock double aborts on any nested acquire. The actual diagnostic
+	 * producer and legacy readers must work in this already-locked context. */
+	test_lock_depth = 1;
+	cluster_undo_cleaner_note_capacity_refusal(true);
+	cluster_undo_cleaner_note_capacity_refusal(false);
+	UT_ASSERT_EQ(cluster_undo_cleaner_capacity_wait_refused_context(), context + 1);
+	UT_ASSERT_EQ(cluster_undo_cleaner_capacity_wait_refused_proof(), proof + 1);
+	UT_ASSERT_EQ(test_lock_depth, 1);
+	UT_ASSERT_EQ(test_wait_event, WAIT_EVENT_CLIENT_READ);
+	test_lock_depth = 0;
+	UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&out));
+	UT_ASSERT_EQ(out.refused_context_count, context + 1);
+	UT_ASSERT_EQ(out.refused_proof_count, proof + 1);
+	saved = undo_cleaner_state;
+	undo_cleaner_state = NULL;
+	cluster_undo_cleaner_note_capacity_refusal(true);
+	cluster_undo_cleaner_note_capacity_refusal(false);
+	UT_ASSERT(!cluster_undo_cleaner_capacity_stats_snapshot(&out));
+	UT_ASSERT_EQ(cluster_undo_cleaner_capacity_wait_refused_context(), 0);
+	UT_ASSERT_EQ(cluster_undo_cleaner_capacity_wait_refused_proof(), 0);
+	undo_cleaner_state = saved;
+	UT_ASSERT_EQ(pg_atomic_read_u64(&saved->capacity_wait_refused_context), context + 1);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&saved->capacity_wait_refused_proof), proof + 1);
+}
+
 UT_TEST(test_capacity_retention_counts_known_bits_only_on_original_refusal)
 {
 	static const ClusterCapacityReasonV1 reasons[]
@@ -2440,7 +2476,8 @@ UT_TEST(test_capacity_retention_counts_known_bits_only_on_original_refusal)
 int
 main(void)
 {
-	UT_PLAN(55);
+	UT_PLAN(56);
+	UT_RUN(test_capacity_refusal_producer_and_legacy_reads_do_not_lock_or_truncate);
 	UT_RUN(test_capacity_retention_snapshot_preserves_zero_unsigned_and_unavailable);
 	UT_RUN(test_capacity_retention_counts_known_bits_only_on_original_refusal);
 	UT_RUN(test_zero_key_segment_wait_uses_exact_worker_and_fresh_probe);

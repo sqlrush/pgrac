@@ -354,13 +354,20 @@ cluster_tt_local_wait_for_active_slot(uint32 segment_id, TransactionId top_xid)
 	volatile bool completed = false;
 	uint32 previous_wait_event = *my_wait_event_info;
 
-	if (!cluster_undo_cleaner_capacity_context_safe()
-		|| !cluster_tt_local_active_wait_owner(segment_id, top_xid, &owner, &recheck))
+	if (!cluster_undo_cleaner_capacity_context_safe()) {
+		cluster_undo_cleaner_note_capacity_refusal(true);
 		return false;
+	}
+	if (!cluster_tt_local_active_wait_owner(segment_id, top_xid, &owner, &recheck)) {
+		cluster_undo_cleaner_note_capacity_refusal(false);
+		return false;
+	}
 	if (recheck)
 		return true;
-	if (!cluster_undo_cleaner_capacity_context_safe())
+	if (!cluster_undo_cleaner_capacity_context_safe()) {
+		cluster_undo_cleaner_note_capacity_refusal(true);
 		return false;
+	}
 	cluster_undo_cleaner_tx_slot_wait_begin();
 	PG_TRY();
 	{

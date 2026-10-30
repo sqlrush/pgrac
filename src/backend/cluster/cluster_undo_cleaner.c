@@ -144,6 +144,8 @@ cluster_undo_cleaner_shmem_init(void)
 		memset(undo_cleaner_state, 0, sizeof(*undo_cleaner_state));
 		LWLockInitialize(&undo_cleaner_state->lwlock, LWTRANCHE_CLUSTER_UNDO_CLEANER);
 		ConditionVariableInit(&undo_cleaner_state->capacity_cv);
+		pg_atomic_init_u64(&undo_cleaner_state->capacity_wait_refused_context, 0);
+		pg_atomic_init_u64(&undo_cleaner_state->capacity_wait_refused_proof, 0);
 		pg_atomic_init_u64(&undo_cleaner_state->capacity_wait_cancelled, 0);
 	}
 }
@@ -238,14 +240,29 @@ cluster_undo_cleaner_capacity_stats_snapshot(ClusterUndoCapacityStats *out)
 	snapshot.active_full_wait_count = undo_cleaner_state->active_full_wait_count;
 	snapshot.pool_wait_count = undo_cleaner_state->capacity_wait_entered;
 	snapshot.wakeup_recheck_count = undo_cleaner_state->capacity_wait_repolled;
-	snapshot.refused_context_count = undo_cleaner_state->capacity_wait_refused_context;
-	snapshot.refused_proof_count = undo_cleaner_state->capacity_wait_refused_proof;
+	snapshot.refused_context_count
+		= pg_atomic_read_u64(&undo_cleaner_state->capacity_wait_refused_context);
+	snapshot.refused_proof_count
+		= pg_atomic_read_u64(&undo_cleaner_state->capacity_wait_refused_proof);
 	snapshot.cancel_count = pg_atomic_read_u64(&undo_cleaner_state->capacity_wait_cancelled);
 	memcpy(snapshot.retain_by_reason, undo_cleaner_state->retain_by_reason,
 		   sizeof(snapshot.retain_by_reason));
 	LWLockRelease(&undo_cleaner_state->lwlock);
 	*out = snapshot;
 	return true;
+}
+
+/* A refused caller may already hold an LWLock. Count without taking another
+ * lock, changing its wait event, or granting any capacity/owner authority. */
+void
+cluster_undo_cleaner_note_capacity_refusal(bool unsafe_context)
+{
+	if (undo_cleaner_state == NULL)
+		return;
+	if (unsafe_context)
+		pg_atomic_fetch_add_u64(&undo_cleaner_state->capacity_wait_refused_context, 1);
+	else
+		pg_atomic_fetch_add_u64(&undo_cleaner_state->capacity_wait_refused_proof, 1);
 }
 
 bool
@@ -593,9 +610,7 @@ cluster_undo_cleaner_wait_for_capacity(uint32 segment_id, ClusterCtrcTxnKeyV1 *c
 	if (undo_cleaner_state == NULL || continuation == NULL)
 		return false;
 	if (!undo_cleaner_capacity_context_safe()) {
-		LWLockAcquire(&undo_cleaner_state->lwlock, LW_EXCLUSIVE);
-		undo_cleaner_state->capacity_wait_refused_context++;
-		LWLockRelease(&undo_cleaner_state->lwlock);
+		cluster_undo_cleaner_note_capacity_refusal(true);
 		pgstat_report_wait_start(previous_wait_event);
 		return false;
 	}
@@ -630,7 +645,7 @@ cluster_undo_cleaner_wait_for_capacity(uint32 segment_id, ClusterCtrcTxnKeyV1 *c
 			if (supplied && !owner_changed)
 				undo_cleaner_state->capacity_wait_entered++;
 			else if (!supplied)
-				undo_cleaner_state->capacity_wait_refused_proof++;
+				cluster_undo_cleaner_note_capacity_refusal(false);
 			LWLockRelease(&undo_cleaner_state->lwlock);
 			if (owner_changed) {
 				/* Re-enter the original allocator/proof under the new owner;
@@ -650,12 +665,7 @@ cluster_undo_cleaner_wait_for_capacity(uint32 segment_id, ClusterCtrcTxnKeyV1 *c
 				retry = true;
 			}
 		} else {
-			LWLockAcquire(&undo_cleaner_state->lwlock, LW_EXCLUSIVE);
-			if (proof == CLUSTER_CTRC_CAPACITY_WAIT)
-				undo_cleaner_state->capacity_wait_refused_context++;
-			else
-				undo_cleaner_state->capacity_wait_refused_proof++;
-			LWLockRelease(&undo_cleaner_state->lwlock);
+			cluster_undo_cleaner_note_capacity_refusal(proof == CLUSTER_CTRC_CAPACITY_WAIT);
 		}
 		completed = true;
 	}
@@ -1465,8 +1475,23 @@ UNDO_CLEANER_COUNTER_ACCESSOR(segments_marked_recyclable)
 UNDO_CLEANER_COUNTER_ACCESSOR(stale_active_skipped)
 UNDO_CLEANER_COUNTER_ACCESSOR(capacity_wait_entered)
 UNDO_CLEANER_COUNTER_ACCESSOR(capacity_wait_repolled)
-UNDO_CLEANER_COUNTER_ACCESSOR(capacity_wait_refused_context)
-UNDO_CLEANER_COUNTER_ACCESSOR(capacity_wait_refused_proof)
+
+uint64
+cluster_undo_cleaner_capacity_wait_refused_context(void)
+{
+	if (undo_cleaner_state == NULL)
+		return 0;
+	return pg_atomic_read_u64(&undo_cleaner_state->capacity_wait_refused_context);
+}
+
+uint64
+cluster_undo_cleaner_capacity_wait_refused_proof(void)
+{
+	if (undo_cleaner_state == NULL)
+		return 0;
+	return pg_atomic_read_u64(&undo_cleaner_state->capacity_wait_refused_proof);
+}
+
 UNDO_CLEANER_COUNTER_ACCESSOR(header_tt_slots_below_horizon) /* spec-5.22e D5-5 */
 
 

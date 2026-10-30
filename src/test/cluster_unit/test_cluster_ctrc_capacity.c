@@ -4304,6 +4304,8 @@ reset_segment_wait(void)
 	cluster_enabled = true;
 	external_lock_hook = capacity_cleaner_lock;
 	MemSet(&native_cleaner_state, 0, sizeof(native_cleaner_state));
+	pg_atomic_init_u64(&native_cleaner_state.capacity_wait_refused_context, 0);
+	pg_atomic_init_u64(&native_cleaner_state.capacity_wait_refused_proof, 0);
 	for (unsigned i = 0; i < CLUSTER_UNDO_CLEANER_WORKER_TYPES; i++) {
 		UndoCleanerWorkerState *worker = &native_cleaner_state.workers[i];
 		worker->status = UNDO_CLEANER_READY;
@@ -4329,7 +4331,7 @@ UT_TEST(test_retired_admission_observation_reaches_original_cleaner_cv)
 	UT_ASSERT(!capacity_subscribed);
 	UT_ASSERT_EQ(native_cleaner_state.capacity_wait_entered, 1);
 	UT_ASSERT_EQ(native_cleaner_state.capacity_wait_repolled, 1);
-	UT_ASSERT_EQ(native_cleaner_state.capacity_wait_refused_proof, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&native_cleaner_state.capacity_wait_refused_proof), 0);
 	UT_ASSERT_EQ(capacity_wait_event, 41);
 	UT_ASSERT_EQ(sample_admission_debt, 0);
 	UT_ASSERT_EQ(sample_enters, sample_leaves);
@@ -4379,7 +4381,7 @@ UT_TEST(test_retired_admission_refusal_never_sleeps_or_retains_debt)
 		UT_ASSERT_EQ(capacity_cancels, 1);
 		UT_ASSERT(!capacity_subscribed);
 		UT_ASSERT_EQ(native_cleaner_state.capacity_wait_entered, 0);
-		UT_ASSERT_EQ(native_cleaner_state.capacity_wait_refused_proof, 1);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&native_cleaner_state.capacity_wait_refused_proof), 1);
 		UT_ASSERT_EQ(sample_admission_debt, 0);
 		UT_ASSERT_EQ(sample_enters, sample_leaves);
 		UT_ASSERT_EQ(sample_holds, sample_releases);

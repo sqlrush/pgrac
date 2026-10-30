@@ -113,6 +113,7 @@ typedef struct ClusterUndoCapacityStats {
 	uint64 pool_wait_count;
 	uint64 wakeup_recheck_count;
 	uint64 cancel_count;
+	/* Original full-pool and selected-slot gate refusals, counted per attempt. */
 	uint64 refused_context_count;
 	uint64 refused_proof_count;
 	uint64 retain_by_reason[CLUSTER_UNDO_CAPACITY_RETAIN_REASON_COUNT];
@@ -163,8 +164,9 @@ typedef struct UndoCleanerSharedState {
 	uint64 active_full_wait_count;
 	uint64 capacity_wait_entered;
 	uint64 capacity_wait_repolled;
-	uint64 capacity_wait_refused_context;
-	uint64 capacity_wait_refused_proof;
+	/* Refusal can occur in an unsafe lock context; counting takes no LWLock. */
+	pg_atomic_uint64 capacity_wait_refused_context;
+	pg_atomic_uint64 capacity_wait_refused_proof;
 	pg_atomic_uint64 capacity_wait_cancelled;
 	uint64 retain_by_reason[CLUSTER_UNDO_CAPACITY_RETAIN_REASON_COUNT];
 
@@ -266,6 +268,8 @@ extern bool cluster_undo_cleaner_worker_snapshot(unsigned worker_id, UndoCleaner
 /* False leaves output untouched. Independent counters are not an authority
  * snapshot or a conservation equation across in-flight callers. */
 extern bool cluster_undo_cleaner_capacity_stats_snapshot(ClusterUndoCapacityStats *out);
+/* Original pool/native-slot refusal only; does not decide whether to wait. */
+extern void cluster_undo_cleaner_note_capacity_refusal(bool unsafe_context);
 extern bool cluster_undo_cleaner_active_sample(ClusterUndoCleanerActiveSample *out);
 extern bool
 cluster_undo_cleaner_active_sample_current(const ClusterUndoCleanerActiveSample *expected);

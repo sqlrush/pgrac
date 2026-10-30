@@ -10,6 +10,7 @@ int durable_fixture_main(int argc, char **argv);
 #include "test_cluster_tt_durable.c"
 #undef main
 #include "cluster/cluster_xid_stripe_boot.h"
+#include "cluster/cluster_undo_cleaner.h"
 #include "storage/lock.h"
 #include "utils/wait_event.h"
 #include "../../backend/cluster/cluster_tt_slot.c"
@@ -43,6 +44,9 @@ cluster_relmap_retention_runtime_after_active_v2(TransactionId xid pg_attribute_
 #endif
 
 static ClusterTTSlotShmem allocator_storage;
+static UndoCleanerSharedState active_capacity_stats_storage;
+static UndoCleanerSharedState *undo_cleaner_state;
+static unsigned slot_stats_lock_acquires;
 static int lock_depth;
 static int modifier_enters;
 static int modifier_leaves;
@@ -142,8 +146,10 @@ repalloc(void *pointer, Size size)
 }
 
 bool
-LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
+LWLockAcquire(LWLock *lock, LWLockMode mode pg_attribute_unused())
 {
+	if (undo_cleaner_state != NULL && lock == &undo_cleaner_state->lwlock)
+		slot_stats_lock_acquires++;
 	lock_depth++;
 	return false;
 }
@@ -154,6 +160,37 @@ LWLockRelease(LWLock *lock pg_attribute_unused())
 	UT_ASSERT(lock_depth > 0);
 	lock_depth--;
 }
+
+/* Scheduling remains a boundary; initialization and both metric ends are real. */
+static void *
+active_capacity_stats_shmem_init(const char *name, Size size, bool *found)
+{
+	UT_ASSERT_STR_EQ(name, "pgrac cluster undo cleaner");
+	UT_ASSERT_EQ(size, sizeof(active_capacity_stats_storage));
+	*found = false;
+	return &active_capacity_stats_storage;
+}
+
+static void
+active_capacity_stats_lock_init(LWLock *lock, int tranche)
+{
+	UT_ASSERT(lock == &active_capacity_stats_storage.lwlock);
+	UT_ASSERT_EQ(tranche, LWTRANCHE_CLUSTER_UNDO_CLEANER);
+}
+
+static void
+active_capacity_stats_cv_init(ConditionVariable *cv)
+{
+	UT_ASSERT(cv == &active_capacity_stats_storage.capacity_cv);
+}
+
+#define ShmemInitStruct active_capacity_stats_shmem_init
+#define LWLockInitialize active_capacity_stats_lock_init
+#define ConditionVariableInit active_capacity_stats_cv_init
+#include "test_cluster_active_capacity_stats.inc"
+#undef ShmemInitStruct
+#undef LWLockInitialize
+#undef ConditionVariableInit
 
 int
 s_lock(volatile slock_t *lock pg_attribute_unused(), const char *file pg_attribute_unused(),
@@ -540,6 +577,8 @@ reset_active_owner(void)
 {
 	void *old_bindings = cluster_tt_local_bindings;
 
+	cluster_undo_cleaner_shmem_init();
+	slot_stats_lock_acquires = 0;
 	cluster_tt_local_reset_binding();
 	free(old_bindings);
 	memset(&allocator_storage, 0, sizeof(allocator_storage));
@@ -1456,6 +1495,65 @@ UT_TEST(test_active_wait_refuses_unknown_prepared_or_changed_unsafe_context)
 	}
 }
 
+static void
+assert_active_refusal_stats(uint64 context, uint64 proof)
+{
+	ClusterUndoCapacityStats stats;
+
+	/* An unsafe-context refusal must not acquire a diagnostic LWLock. */
+	UT_ASSERT_EQ(slot_stats_lock_acquires, 0);
+	UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&stats));
+	UT_ASSERT_EQ(stats.origin_node_id, cluster_node_id);
+	UT_ASSERT_EQ(stats.refused_context_count, context);
+	UT_ASSERT_EQ(stats.refused_proof_count, proof);
+	UT_ASSERT_EQ(stats.active_full_wait_count, 0);
+	UT_ASSERT_EQ(stats.pool_wait_count, 0);
+	UT_ASSERT_EQ(stats.wakeup_recheck_count, 0);
+	UT_ASSERT_EQ(stats.cancel_count, 0);
+}
+
+UT_TEST(test_active_refusal_stats_count_initial_unsafe_context)
+{
+	start_full_active_test();
+	slot_wait_context_safe = false;
+	require_capacity_error(ERRCODE_PROGRAM_LIMIT_EXCEEDED);
+	UT_ASSERT_EQ(slot_wait_lookups + slot_wait_calls + cold_selection_calls, 0);
+	assert_active_refusal_stats(1, 0);
+}
+
+UT_TEST(test_active_refusal_stats_count_only_unproven_exact_owners)
+{
+	for (unsigned kind = 1; kind <= 3; kind++) {
+		start_full_active_test();
+		slot_wait_owner_kind = kind;
+		require_capacity_error(ERRCODE_PROGRAM_LIMIT_EXCEEDED);
+		UT_ASSERT_EQ(slot_wait_lookups, 1);
+		UT_ASSERT_EQ(slot_wait_calls + cold_selection_calls, 0);
+		assert_active_refusal_stats(0, 1);
+	}
+}
+
+UT_TEST(test_active_refusal_stats_count_final_context_without_proof_refusal)
+{
+	start_full_active_test();
+	slot_wait_owner_kind = 4;
+	require_capacity_error(ERRCODE_PROGRAM_LIMIT_EXCEEDED);
+	UT_ASSERT_EQ(slot_wait_lookups, 1);
+	UT_ASSERT_EQ(slot_wait_calls + cold_selection_calls, 0);
+	assert_active_refusal_stats(1, 0);
+}
+
+UT_TEST(test_active_refusal_stats_do_not_count_success_or_snapshot_recheck)
+{
+	for (unsigned drift = 0; drift < 3; drift++) {
+		start_full_active_test();
+		slot_wait_drift = drift;
+		require_published_on(1);
+		UT_ASSERT_EQ(cold_selection_calls, 0);
+		assert_active_refusal_stats(0, 0);
+	}
+}
+
 UT_TEST(test_active_snapshot_change_reenters_allocator_without_native_wait)
 {
 	for (unsigned drift = 1; drift < 3; drift++) {
@@ -1721,7 +1819,7 @@ int TT_ACTIVE_OWNER_FIXTURE_MAIN(void);
 int
 main(void)
 {
-	UT_PLAN(48);
+	UT_PLAN(52);
 	UT_RUN(test_current_origin_snapshot_uses_original_terminal_slot_provenance);
 	UT_RUN(test_current_origin_snapshot_rejects_missing_or_malformed_original_identity);
 	UT_RUN(test_current_origin_snapshot_never_initializes_or_outlives_original_slot);
@@ -1731,6 +1829,10 @@ main(void)
 	UT_RUN(test_active_native_errors_propagate_without_publishing_or_double_leave);
 	UT_RUN(test_active_wait_rechecks_exact_admission_and_lease_before_reservation);
 	UT_RUN(test_active_wait_refuses_unknown_prepared_or_changed_unsafe_context);
+	UT_RUN(test_active_refusal_stats_count_initial_unsafe_context);
+	UT_RUN(test_active_refusal_stats_count_only_unproven_exact_owners);
+	UT_RUN(test_active_refusal_stats_count_final_context_without_proof_refusal);
+	UT_RUN(test_active_refusal_stats_do_not_count_success_or_snapshot_recheck);
 	UT_RUN(test_active_snapshot_change_reenters_allocator_without_native_wait);
 	UT_RUN(test_active_wait_terminal_cleanup_uses_original_capacity_not_rollover);
 	UT_RUN(test_recovered_open_gate_precedes_canonical_reservation);

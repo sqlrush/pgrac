@@ -9505,6 +9505,26 @@ test_cluster_tt_abort_owner: test_cluster_tt_abort_owner.c test_cluster_tt_durab
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
+# Keep the original refusal producer, initialization and snapshot in one fixture.
+test_cluster_active_capacity_stats.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_cleaner.c \
+		$(top_srcdir)/src/include/cluster/cluster_undo_cleaner.h Makefile
+	awk 'FNR == NR { if (/^extern void cluster_undo_cleaner_note_capacity_refusal\(/) expected++; next } \
+	     /^cluster_undo_cleaner_shmem_init\(/ { print "void"; emit=1; basic++ } \
+	     /^cluster_undo_cleaner_capacity_stats_snapshot\(/ { print "bool"; emit=1; basic++ } \
+	     /^cluster_undo_cleaner_note_capacity_refusal\(/ { print "void"; emit=1; hooks++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (basic != 2 || hooks != expected || expected > 1 || emit) exit 1 }' \
+		$(top_srcdir)/src/include/cluster/cluster_undo_cleaner.h $< > $@.tmp
+	mv $@.tmp $@
+
+clean distclean maintainer-clean: clean-active-capacity-stats
+.PHONY: clean-active-capacity-stats
+clean-active-capacity-stats:
+	rm -f test_cluster_active_capacity_stats.inc test_cluster_active_capacity_stats.inc.tmp
+
+test_cluster_tt_active_owner test_cluster_alter_early_bind test_cluster_relmap_native_tt.o: \
+		test_cluster_active_capacity_stats.inc
+
 test_cluster_tt_active_owner: test_cluster_tt_active_owner.c test_cluster_tt_durable.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_tt_local.c \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h \
@@ -10787,11 +10807,12 @@ test_cluster_ctrc_itl_reuse test_cluster_ctrc_successor_fence: test_cluster_ctrc
 # Same actual producer-to-consumer path, including the original CV cleanup.
 test_cluster_ctrc_capacity_wait.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_cleaner.c Makefile
 	awk '/^cluster_undo_cleaner_capacity_stats_snapshot\(/ { print "bool"; emit=1; found++ } \
+	     /^cluster_undo_cleaner_note_capacity_refusal\(/ { print "void"; emit=1; found++ } \
 	     /^undo_cleaner_capacity_owner_generation_locked\(/ { print "static uint64"; emit=1; found++ } \
 	     /^undo_cleaner_capacity_segment_worker\(/ { print "static bool"; emit=1; found++ } \
 	     /^undo_cleaner_capacity_probe\(/ { print "static ClusterCtrcCapacityProbeResult"; emit=1; found++ } \
 	     /^cluster_undo_cleaner_wait_for_capacity\(/ { print "bool"; emit=1; found++ } \
-	     emit { print } /^}$$/ { emit=0 } END { if (found != 5 || emit) exit 1 }' $< > $@.tmp
+	     emit { print } /^}$$/ { emit=0 } END { if (found != 6 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 clean distclean maintainer-clean: clean-ctrc-capacity-wait
