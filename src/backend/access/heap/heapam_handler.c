@@ -2606,6 +2606,9 @@ heapam_scan_bitmap_next_block(TableScanDesc scan,
 	Buffer		buffer;
 	Snapshot	snapshot;
 	int			ntup;
+#ifdef USE_PGRAC_CLUSTER
+	ClusterHeapPageVisibility visibility = {0};
+#endif
 
 	hscan->rs_cindex = 0;
 	hscan->rs_ntuples = 0;
@@ -2623,6 +2626,14 @@ heapam_scan_bitmap_next_block(TableScanDesc scan,
 	 */
 	if (!IsolationIsSerializable() && block >= hscan->rs_nblocks)
 		return false;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* Prepare potentially cold identity evidence before the original heap
+	 * acquisition, without a content lock. Exact entries retain HOT search. */
+	if (tbmres->ntuples < 0)
+		cluster_heap_page_visibility_prepare(scan->rs_rd, block,
+											scan->rs_snapshot, &visibility);
+#endif
 
 	/*
 	 * Acquire pin on the target heap page, trading in any pin we held before.
@@ -2681,6 +2692,10 @@ heapam_scan_bitmap_next_block(TableScanDesc scan,
 		Page		page = BufferGetPage(buffer);
 		OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
 		OffsetNumber offnum;
+#ifdef USE_PGRAC_CLUSTER
+		bool		all_visible = cluster_heap_page_all_visible(scan->rs_rd,
+																  buffer, page, snapshot, &visibility);
+#endif
 
 		for (offnum = FirstOffsetNumber; offnum <= maxoff; offnum = OffsetNumberNext(offnum))
 		{
@@ -2695,7 +2710,11 @@ heapam_scan_bitmap_next_block(TableScanDesc scan,
 			loctup.t_len = ItemIdGetLength(lp);
 			loctup.t_tableOid = scan->rs_rd->rd_id;
 			ItemPointerSet(&loctup.t_self, block, offnum);
-			valid = HeapTupleSatisfiesVisibility(&loctup, snapshot, buffer);
+			valid =
+#ifdef USE_PGRAC_CLUSTER
+				all_visible ||
+#endif
+				HeapTupleSatisfiesVisibility(&loctup, snapshot, buffer);
 			if (valid)
 			{
 				hscan->rs_vistuples[ntup++] = offnum;

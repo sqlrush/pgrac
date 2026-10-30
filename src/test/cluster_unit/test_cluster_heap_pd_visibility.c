@@ -393,8 +393,11 @@ UT_TEST(error_exits_only_new_snapshot_evaluators)
 	}
 }
 
+#ifndef HEAP_PD_VISIBILITY_MAIN
+#define HEAP_PD_VISIBILITY_MAIN main
+#endif
 int
-main(void)
+HEAP_PD_VISIBILITY_MAIN(void)
 {
 	if (PGRAC_VM_QUALIFIED_CATALOG_VERSION == 0)
 	{
