@@ -1760,6 +1760,7 @@ test_native_itl_batch(ClusterColdTtSlotInputV1 *subjects,
 #include "test_cluster_ctrc_census_tuple_refs.inc"
 #include "test_cluster_ctrc_hot_refs.inc"
 #include "test_cluster_ctrc_census_hot.inc"
+#include "test_cluster_ctrc_plain_lock_refs.inc"
 
 UT_TEST(test_ctrc_native_itl_page_uses_all_slots_and_original_terminal_projection)
 {
@@ -4024,6 +4025,10 @@ main(void)
 		CTRC_TEST_ENTRY(test_ctrc_itl_image_calculation_preserves_input_and_replays_exactly),
 		CTRC_TEST_ENTRY(test_ctrc_itl_image_partial_overlap_is_retained),
 		CTRC_TEST_ENTRY(test_ctrc_native_tt_image_matches_original_terminal_rules),
+		CTRC_TEST_ENTRY(test_ctrc_plain_lock_refs_bind_one_lock_carrier_without_using_data_slot),
+		CTRC_TEST_ENTRY(test_ctrc_plain_lock_refs_require_unique_valid_plain_lock_not_raw_data_or_multi),
+		CTRC_TEST_ENTRY(test_ctrc_plain_lock_refs_never_make_local_update_edges_from_matching_raw_xids),
+		CTRC_TEST_ENTRY(test_ctrc_plain_lock_refs_keep_original_projection_and_historical_binding_distinct),
 		CTRC_TEST_ENTRY(test_ctrc_census_hot_shares_complete_native_chain_and_redirect_rule),
 		CTRC_TEST_ENTRY(test_ctrc_census_hot_rejects_complete_view_bounds_and_malformed_items),
 		CTRC_TEST_ENTRY(test_ctrc_census_hot_rejects_native_cycles_collisions_and_wrong_successors),

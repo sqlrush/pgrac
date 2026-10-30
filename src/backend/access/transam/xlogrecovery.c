@@ -2445,8 +2445,10 @@ cluster_recovery_cold_page_reference_cross_page(const ClusterRecoveryCensusPages
 		page = &pages->entries[item->page_index];
 		memcpy(&tuple, item->entry.tuple_bytes, SizeofHeapTupleHeader);
 		if ((tuple.t_infomask & HEAP_XMAX_INVALID) != 0) continue;
-		if ((tuple.t_infomask & HEAP_XMAX_IS_MULTI) != 0
-			|| HEAP_XMAX_IS_LOCKED_ONLY(tuple.t_infomask)) return false;
+		if ((tuple.t_infomask & HEAP_XMAX_IS_MULTI) != 0) return false;
+		/* The preceding complete tuple/terminal checks retain the plain
+		 * locker independently; its ctid cannot join an update successor. */
+		if (HEAP_XMAX_IS_LOCKED_ONLY(tuple.t_infomask)) continue;
 		xmax = HeapTupleHeaderGetRawXmax(&tuple);
 		if (!TransactionIdIsNormal(xmax) || !ItemPointerIsValid(&tuple.t_ctid)) continue;
 		block = ItemPointerGetBlockNumber(&tuple.t_ctid);

@@ -1418,9 +1418,19 @@ cluster_ctrc_recovery_heap_tuple_itl_references_v1(const ClusterItlSlotData *slo
 	/* Invalid xmax retains its native meaning even with stale raw MX bits. */
 	if ((tuple->t_infomask & HEAP_XMAX_INVALID) != 0) return true;
 	xmax = HeapTupleHeaderGetRawXmax(tuple);
-	return (tuple->t_infomask & HEAP_XMAX_IS_MULTI) == 0
-		&& !HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask) && TransactionIdIsNormal(xmax)
-		&& tuple->t_itl_slot_idx < CLUSTER_ITL_INITRANS_DEFAULT
+	if ((tuple->t_infomask & HEAP_XMAX_IS_MULTI) != 0 || !TransactionIdIsNormal(xmax))
+		return false;
+	if (HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask)) {
+		unsigned matches = 0;
+
+		/* Native plain locks use a separate raw-xmax scan, not the DATA
+		 * t_itl_slot_idx. Recovery cannot choose a generation from raw xid:
+		 * require one carrier and qualify ALL canonical ITLs at the caller. */
+		for (unsigned i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
+			if (slots[i].xid == xmax && ITL_FLAG_IS_LOCK_ONLY(slots[i].flags)) matches++;
+		return matches == 1;
+	}
+	return tuple->t_itl_slot_idx < CLUSTER_ITL_INITRANS_DEFAULT
 		&& slots[tuple->t_itl_slot_idx].xid == xmax
 		&& (slots[tuple->t_itl_slot_idx].flags == ITL_FLAG_ACTIVE
 			|| slots[tuple->t_itl_slot_idx].flags == ITL_FLAG_NEEDS_CLEANOUT
@@ -1556,7 +1566,10 @@ cluster_ctrc_recovery_heap_hot_items_v1(const ClusterItlSlotData *slots,
 				|| (ItemPointerIsValid(&tuple->t_ctid) && HeapTupleHeaderIndicatesMovedPartitions(tuple))
 				|| (HeapTupleHeaderIsHeapOnly(tuple) && (tuple->t_infomask & HEAP_UPDATED) == 0))
 				return false;
-			if ((tuple->t_infomask & HEAP_XMAX_INVALID) != 0) continue;
+			/* A plain locker retains a reference, never an update edge. The
+			 * complete tuple/ITL grammar above still qualifies its carrier. */
+			if ((tuple->t_infomask & HEAP_XMAX_INVALID) != 0
+				|| HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask)) continue;
 			destination = ItemPointerGetOffsetNumberNoCheck(&tuple->t_ctid);
 			if (ItemPointerGetBlockNumberNoCheck(&tuple->t_ctid) != block_number
 				|| destination < FirstOffsetNumber || destination > maxoff || destination == offset) {

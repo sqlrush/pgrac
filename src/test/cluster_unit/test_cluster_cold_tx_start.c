@@ -2346,9 +2346,18 @@ static void startup_local_empty_reset(void);
 #include "test_cluster_cold_ctrc_reference_tuples.inc"
 #include "test_cluster_cold_ctrc_census_hot.inc"
 #include "test_cluster_cold_ctrc_cross_page.inc"
+#include "test_cluster_cold_ctrc_plain_lock_refs.inc"
 
 int main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_PLAIN_LOCK_REFS") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_startup_plain_lock_refs_keep_distinct_terminals_without_cross_page_update);
+		UT_RUN(test_startup_plain_lock_refs_still_require_the_complete_canonical_terminal);
+		UT_RUN(test_startup_plain_lock_refs_preserve_multi_refusal_and_inverse_version);
+		UT_RUN(test_startup_plain_lock_refs_repeat_rechecks_update_polarity_and_keeps_debt);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_CROSS_PAGE") != NULL) {
 		UT_PLAN(6);
 		UT_RUN(test_startup_cross_page_pairs_use_complete_current_untouched_view);
@@ -2608,7 +2617,12 @@ int main(void)
 		UT_DONE();
 		return ut_failed_count == 0 ? 0 : 1;
 	}
-	UT_PLAN(271);
+	UT_PLAN(275);
+	UT_RUN(test_startup_plain_lock_refs_keep_distinct_terminals_without_cross_page_update);
+	UT_RUN(test_startup_plain_lock_refs_still_require_the_complete_canonical_terminal);
+	UT_RUN(test_startup_plain_lock_refs_preserve_multi_refusal_and_inverse_version);
+	UT_RUN(test_startup_plain_lock_refs_repeat_rechecks_update_polarity_and_keeps_debt);
+
 	UT_RUN(test_startup_cross_page_pairs_use_complete_current_untouched_view);
 	UT_RUN(test_startup_cross_page_raw_xid_cannot_borrow_another_canonical_terminal);
 	UT_RUN(test_startup_cross_page_matching_pair_cannot_be_heap_only);
