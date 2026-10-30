@@ -60,9 +60,9 @@ for owner, expected in [("BitmapHeapNext", 1), ("BitmapPrefetch", 2)]:
                 statement.split("=", 1)[1].strip().removesuffix(";"))
 
 
-def vm_condition(path, owner):
+def vm_condition(path, owner, anchor="VM_ALL_VISIBLE("):
     body = function(path.read_text(), owner, "unused")
-    at = body.index("VM_ALL_VISIBLE(")
+    at = body.index(anchor)
     start = body.rfind("if (", 0, at) + len("if (")
     depth = 1
     end = start
@@ -74,5 +74,10 @@ def vm_condition(path, owner):
 
 wrapper("fixture_planner_fetch", "Relation heapRel, BlockNumber block, Buffer vmbuffer",
         vm_condition(root / "utils/adt/selfuncs.c", "get_actual_variable_endpoint"))
+statapprox = root.parent.parent / "contrib/pgstattuple/pgstatapprox.c"
+anchor = "VM_ALL_VISIBLE("
+if "\nstatapprox_vm_all_visible(" in statapprox.read_text():
+    print(function(statapprox.read_text(), "statapprox_vm_all_visible", "static bool"))
+    anchor = "statapprox_vm_all_visible("
 wrapper("fixture_statapprox_skip", "Relation rel, BlockNumber blkno, Buffer vmbuffer",
-        vm_condition(root.parent.parent / "contrib/pgstattuple/pgstatapprox.c", "statapprox_heap"))
+        vm_condition(statapprox, "statapprox_heap", anchor))

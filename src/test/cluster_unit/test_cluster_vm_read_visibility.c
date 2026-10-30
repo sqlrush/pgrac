@@ -191,6 +191,9 @@ index_fetch_heap(IndexScanDesc scan, TupleTableSlot *slot)
 	return fixture_visible;
 }
 
+/* The legacy fixture also has no owned maintenance snapshot. */
+#define ActiveSnapshotSet() false
+#define GetActiveSnapshot() NULL
 #include "test_cluster_vm_read_visibility.inc"
 
 static void

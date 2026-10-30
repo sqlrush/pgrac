@@ -129,7 +129,9 @@ bool
 cluster_snapshot_cr_identity_v1(Snapshot snapshot, uint64 *out)
 {
 	UT_ASSERT(snapshot == &ios_snapshot && ios_evaluators == 1);
-	if (!ios_snapshot_live)
+	/* Match the real evaluator's type/source refusal; liveness is controlled. */
+	if (!ios_snapshot_live || snapshot->snapshot_type != SNAPSHOT_MVCC ||
+		snapshot->cluster_source != SNAPSHOT_SOURCE_CLUSTER)
 		return false;
 	*out = snapshot->cluster_cr_identity;
 	return *out != 0;
@@ -273,6 +275,7 @@ ios_reset(bool publish)
 	ios_space_generation = ios_admission_generation = 1;
 	memset(&ios_snapshot, 0, sizeof(ios_snapshot));
 	ios_snapshot.snapshot_type = SNAPSHOT_MVCC;
+	ios_snapshot.cluster_source = SNAPSHOT_SOURCE_CLUSTER;
 	ios_snapshot.read_scn = 700;
 	ios_snapshot.read_epoch = 9;
 	ios_snapshot.cluster_cr_identity = 19;
