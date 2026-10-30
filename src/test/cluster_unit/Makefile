@@ -11614,6 +11614,7 @@ test_cluster_xid_retention_native_clog_main.o: $(XID_RETENTION_TEST_INPUTS) \
 		test_cluster_xid_retention_owner_capture.inc \
 		test_cluster_xid_retention_stage.inc test_cluster_xid_retention_stage_product.inc \
 		test_cluster_xid_retention_pair.inc test_cluster_relmap_physical_pair.h \
+		test_cluster_xid_retention_terminal.inc \
 		$(top_srcdir)/src/include/utils/relmapper.h \
 		$(top_srcdir)/src/include/catalog/pg_tablespace_d.h \
 		$(top_srcdir)/src/include/catalog/storage.h \

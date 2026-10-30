@@ -24,6 +24,8 @@ static unsigned stage_pair_drift_at_rename;
 static bool stage_pair_finishing, stage_pair_terminal_ready, stage_pair_corrupt_preserve;
 static ClusterRelmapRetentionKey stage_pair_write_key;
 static XLogRecPtr stage_pair_write_end;
+static bool (*stage_pair_terminal_reader)(const ClusterRelmapOwnerSampleV2 *, ClusterRelmapRecoveryNativeTerminal *);
+static void (*stage_pair_terminal_write_observer)(void);
 
 static void
 retained_pair_path(char path[MAXPGPATH], unsigned slot, const char *leaf)
@@ -43,6 +45,8 @@ retained_pair_observe(unsigned event)
 	 * prepare validation run under it; terminal cleanup runs after it. */
 	if (stage_pair_finishing || (event != RELMAP_PHYSICAL_READ && event != RELMAP_PHYSICAL_CLOSE))
 		UT_ASSERT_EQ(retention_mapping_held, !stage_pair_finishing);
+	if (stage_pair_finishing && event == RELMAP_PHYSICAL_WRITE && stage_pair_terminal_write_observer != NULL)
+		stage_pair_terminal_write_observer();
 	if (event == RELMAP_PHYSICAL_WRITE && !stage_pair_finishing) {
 		ClusterRelmapRetentionDirectory *d = &relmap_runtime_shmem->directories[retention_origin];
 		bool found = false;
@@ -156,6 +160,7 @@ cluster_relmap_recovery_native_terminal_sync(const ClusterRelmapOwnerSampleV2 *s
 	const ClusterRelmapRetentionDirectory *d = &relmap_runtime_shmem->directories[retention_origin];
 
 	if (!stage_physical_active) return retention_original_native_terminal_sync(sample, out);
+	if (stage_pair_terminal_reader != NULL) return stage_pair_terminal_reader(sample, out);
 	UT_ASSERT(stage_physical_active && stage_pair_finishing && caller_global_x);
 	UT_ASSERT(!retention_mapping_held && !held && !retention_held && CritSectionCount == 0);
 	stage_pair_terminal_reads++;
@@ -190,6 +195,8 @@ retained_pair_start(bool rollover)
 	cluster_relmap_v2_finish_entered = cluster_relmap_v2_prepare_unfinished = false;
 	stage_pair_preserves = stage_pair_syncs = stage_pair_terminal_reads = stage_pair_drift_at_rename = 0;
 	stage_pair_finishing = stage_pair_terminal_ready = stage_pair_corrupt_preserve = false;
+	stage_pair_terminal_reader = NULL;
+	stage_pair_terminal_write_observer = NULL;
 	memset(stage_pair_initial, 0, sizeof(stage_pair_initial));
 	memset(stage_pair_prepared, 0, sizeof(stage_pair_prepared));
 	strlcpy(stage_pair_root, "/tmp/pgrac-retained-pair.XXXXXX", sizeof(stage_pair_root));

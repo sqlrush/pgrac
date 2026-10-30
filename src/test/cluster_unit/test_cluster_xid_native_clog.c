@@ -19,7 +19,11 @@ int d3_xid_native_clog_main(void);
 
 static PGPROC native_proc;
 PGPROC *MyProc = &native_proc;
-static unsigned native_calls;
+static unsigned native_calls, native_terminal_calls;
+static bool native_local_directory, native_terminal_caught;
+static TransactionId native_terminal_xid;
+static XidNativeClogTerminalFault native_terminal_fault;
+static void (*native_terminal_sync_hook)(void);
 
 /* This write-only fixture does not lend authority to unused observers. */
 bool cluster_wal_inputs_relmap_source_current_v1(const ClusterRecoveryRelmapSourceV1 *s)
@@ -56,7 +60,12 @@ test_xid_native_clog_start(bool fail, uint16 origin)
 	InRecovery = authority = c0_authority = relmap_base_interrupts = false;
 	InterruptHoldoffCount = CritSectionCount = 0;
 	expect_error = fail;
-	native_calls = 0;
+	native_calls = native_terminal_calls = 0;
+	native_local_directory = native_terminal_caught = native_fixture = false;
+	fail_open = fail_sync = fail_read = fail_dirsync = fail_sync_close = false;
+	directory_open_error = directory_sync_error = 0;
+	native_short = native_corrupt = false;
+	fixture_native_sync_hook = NULL;
 	memset(&birth_wal, 0, sizeof(birth_wal));
 	birth_wal.mode = LW_EXCLUSIVE; birth_wal.fail = fail;
 	memset(ClogRecoveryCtl, 0, sizeof(ClogRecoveryCtl));
@@ -169,6 +178,126 @@ test_xid_native_clog_replay(XidNativeClogReplayFault fault,
 	if (close(fd) != 0) out->io_ok = false;
 }
 
+/* Local native terminal reads reject the cold fixture's pg_xact symlink.
+ * Opt in before any allocation, preserving the default fixture unchanged. */
+void
+test_xid_native_clog_use_local_directory(void)
+{
+	struct stat st;
+
+	UT_ASSERT(!native_local_directory && native_calls == 0);
+	UT_ASSERT_EQ(lstat("pg_xact", &st), 0);
+	UT_ASSERT(S_ISLNK(st.st_mode));
+	UT_ASSERT_EQ(unlink("pg_xact"), 0);
+	UT_ASSERT_EQ(mkdir("pg_xact", 0700), 0);
+	native_local_directory = native_fixture = true;
+}
+
+void
+test_xid_native_clog_set_status(TransactionId top, int nchildren, TransactionId *children, XidStatus status)
+{
+	UT_ASSERT(native_local_directory && native_fixture);
+	UT_ASSERT(!LWLockHeldByMe(XidGenLock) && !LWLockHeldByMe(XactSLRULock));
+	/* Original FULL birth/checkpoint establishes the complete native file.
+	 * Then leave the original status update dirty until terminal_sync. */
+	CheckPointCLOG();
+	if (status != TRANSACTION_STATUS_IN_PROGRESS)
+		TransactionIdSetTreeStatus(top, nchildren, children, status,
+			status == TRANSACTION_STATUS_COMMITTED ? 1234 : InvalidXLogRecPtr);
+}
+
+static void
+native_terminal_before_sync(void)
+{
+	if (native_terminal_sync_hook != NULL) native_terminal_sync_hook();
+	if (native_terminal_fault == XID_CLOG_TERMINAL_CORRUPT) {
+		char path[MAXPGPATH];
+		uint8 byte;
+		int page = TransactionIdToPage(native_terminal_xid);
+		off_t offset = (off_t)(page % SLRU_PAGES_PER_SEGMENT) * BLCKSZ
+			+ TransactionIdToByte(native_terminal_xid);
+		int fd;
+
+		/* Target this allocated XID, not the old fixture's fixed XID 100. */
+		snprintf(path, sizeof(path), "pg_xact/%04X", page / SLRU_PAGES_PER_SEGMENT);
+		fd = open(path, O_RDWR | O_NOFOLLOW);
+		UT_ASSERT(fd >= 0);
+		if (fd >= 0) {
+			UT_ASSERT_EQ(pread(fd, &byte, 1, offset), 1);
+			byte &= ~(CLOG_XACT_BITMASK << (TransactionIdToBIndex(native_terminal_xid) * CLOG_BITS_PER_XACT));
+			UT_ASSERT_EQ(pwrite(fd, &byte, 1, offset), 1);
+			UT_ASSERT_EQ(close(fd), 0);
+		}
+	}
+}
+
+bool
+test_xid_native_clog_terminal(TransactionId xid, XidNativeClogTerminalFault fault,
+	void (*sync_hook)(void), ClusterClogNativeTerminalV1 *out, bool *caught)
+{
+	volatile bool ok = false;
+
+	UT_ASSERT(native_local_directory && native_fixture);
+	*caught = false;
+	native_terminal_calls++;
+	fail_sync = fault == XID_CLOG_TERMINAL_FILE_SYNC;
+	directory_sync_error = fault == XID_CLOG_TERMINAL_DIRECTORY_SYNC ? EINVAL : 0;
+	native_short = fault == XID_CLOG_TERMINAL_SHORT;
+	native_corrupt = false;
+	fail_sync_close = fault == XID_CLOG_TERMINAL_CLOSE;
+	fail_open = expect_error = fault == XID_CLOG_TERMINAL_OPEN_ERROR;
+	native_terminal_xid = xid;
+	native_terminal_fault = fault;
+	native_terminal_sync_hook = sync_hook;
+	fixture_native_sync_hook = native_terminal_before_sync;
+	LWLockAcquire(XactTruncationLock, LW_SHARED);
+	PG_TRY(); {
+		ok = cluster_clog_native_terminal_sync_v1(xid, out);
+	} PG_CATCH(); {
+		*caught = true;
+		HOLD_INTERRUPTS();
+		LWLockRelease(XactTruncationLock);
+	} PG_END_TRY();
+	if (!*caught) LWLockRelease(XactTruncationLock);
+	native_terminal_caught = *caught;
+	fail_open = fail_sync = fail_sync_close = expect_error = false;
+	directory_sync_error = 0;
+	native_short = native_corrupt = false;
+	fixture_native_sync_hook = NULL;
+	native_terminal_sync_hook = NULL;
+	native_terminal_fault = XID_CLOG_TERMINAL_VALID;
+	return ok;
+}
+
+void
+test_xid_native_clog_terminal_state(TransactionId xid, XidNativeClogTerminalState *out)
+{
+	char path[MAXPGPATH];
+	uint8 byte = 0;
+	int page = TransactionIdToPage(xid);
+	int fd;
+
+	memset(out, 0, sizeof(*out));
+	out->disk_status = (XidStatus)-1;
+	out->calls = native_terminal_calls; out->writes = writes;
+	out->wal_flushes = native_wal_flushes;
+	out->file_syncs = syncs; out->directory_syncs = dirsyncs;
+	out->transient_fds = transient_fds; out->caught = native_terminal_caught;
+	out->truncation_held = LWLockHeldByMe(XactTruncationLock);
+	out->slru_held = LWLockHeldByMe(XactSLRULock);
+	for (int i = 0; i < XactCtl->shared->num_slots; i++)
+		out->dirty |= XactCtl->shared->page_dirty[i];
+	snprintf(path, sizeof(path), "pg_xact/%04X", page / SLRU_PAGES_PER_SEGMENT);
+	fd = open(path, O_RDONLY | O_NOFOLLOW);
+	if (fd >= 0) {
+		out->file_present = true;
+		if (pread(fd, &byte, 1,
+			(off_t)(page % SLRU_PAGES_PER_SEGMENT) * BLCKSZ + TransactionIdToByte(xid)) == 1)
+			out->disk_status = (byte >> (TransactionIdToBIndex(xid) * CLOG_BITS_PER_XACT)) & CLOG_XACT_BITMASK;
+		UT_ASSERT_EQ(close(fd), 0);
+	}
+}
+
 void
 test_xid_native_clog_stop(void)
 {
@@ -177,6 +306,25 @@ test_xid_native_clog_stop(void)
 	if (LWLockHeldByMe(XidGenLock)) LWLockRelease(XidGenLock);
 	expect_error = birth_wal.fail = false;
 	fixture_idle();
+	if (native_local_directory) {
+		DIR *dir = opendir("pg_xact");
+		struct dirent *entry;
+		char path[MAXPGPATH];
+
+		UT_ASSERT(dir != NULL);
+		if (dir != NULL) {
+			while ((entry = readdir(dir)) != NULL) {
+				if (entry->d_name[0] == '.') continue;
+				snprintf(path, sizeof(path), "pg_xact/%s", entry->d_name);
+				UT_ASSERT_EQ(unlink(path), 0);
+			}
+			UT_ASSERT_EQ(closedir(dir), 0);
+		}
+		UT_ASSERT_EQ(rmdir("pg_xact"), 0);
+		snprintf(path, sizeof(path), "%s/native_side/origin_%u/pg_xact", fixture_root, fixture_origin);
+		UT_ASSERT_EQ(symlink(path, "pg_xact"), 0);
+		native_local_directory = false;
+	}
 	/* The original recovery fixture owns origins 0/1. Remove only this
 	 * bridge's additional local origin before its unchanged cleanup. */
 	if (fixture_origin > 1) {

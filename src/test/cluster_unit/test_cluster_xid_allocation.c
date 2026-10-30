@@ -70,6 +70,9 @@ TransactionIdGetStatus(TransactionId xid, XLogRecPtr *lsn)
 bool
 cluster_clog_native_terminal_sync_v1(TransactionId xid, ClusterClogNativeTerminalV1 *out)
 {
+#ifdef TEST_CLUSTER_XID_RETENTION_NATIVE_CLOG
+	if (retention_clog_terminal_sync != NULL) return retention_clog_terminal_sync(xid, out);
+#endif
 	(void)xid;
 	(void)out;
 	abort();
@@ -177,6 +180,9 @@ bool
 LWLockHeldByMe(LWLock *lock)
 {
 #ifdef CLUSTER_XID_RETENTION_TEST
+#ifdef TEST_CLUSTER_XID_RETENTION_NATIVE_CLOG
+	if (lock == XactTruncationLock) return retention_native_lock_held(lock, LW_SHARED);
+#endif
 	return retention_native_lock_held(lock, LW_EXCLUSIVE);
 #else
 	return (held && held_lock == lock) || (stripe_lock_held && stripe_lock == lock);
@@ -477,6 +483,9 @@ bool
 LWLockHeldByMe(LWLock *lock)
 {
 #ifdef CLUSTER_XID_RETENTION_TEST
+#ifdef TEST_CLUSTER_XID_RETENTION_NATIVE_CLOG
+	if (lock == XactTruncationLock) return retention_native_lock_held(lock, LW_SHARED);
+#endif
 	return retention_native_lock_held(lock, LW_EXCLUSIVE);
 #else
 	return lock == XidGenLock && held;
