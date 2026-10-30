@@ -10,6 +10,7 @@ int scratch_fixture_main(void);
 extern NodeId self_unused_origin(UBA address);
 extern ClusterTxOutcome self_unused_exact(const ClusterTxLocator *, ClusterTxResolveMode,
 	ClusterTxResolution *, ClusterTxResolveReason *);
+extern bool self_unused_itl_locator(Page, uint8, ClusterTxLocator *, ClusterTxResolveReason *);
 #define main scratch_fixture_main
 #define GetTopFullTransactionIdIfAny self_unused_top_full
 #define cluster_tx_resolve_operation_head self_unused_operation_head
@@ -18,6 +19,8 @@ extern ClusterTxOutcome self_unused_exact(const ClusterTxLocator *, ClusterTxRes
 #define HeapTupleHeaderGetCmin self_unused_cmin
 #define HeapTupleHeaderGetCmax self_unused_cmax
 #define cluster_tx_resolve_exact self_unused_exact
+#define cluster_itl_get_tt_ref self_unused_itl_ref
+#define cluster_tx_locator_from_itl self_unused_itl_locator
 #define uba_origin_node_id self_unused_origin
 #include "test_cluster_r4_scratch_resolver.c"
 #undef main
@@ -28,6 +31,8 @@ extern ClusterTxOutcome self_unused_exact(const ClusterTxLocator *, ClusterTxRes
 #undef HeapTupleHeaderGetCmin
 #undef HeapTupleHeaderGetCmax
 #undef cluster_tx_resolve_exact
+#undef cluster_itl_get_tt_ref
+#undef cluster_tx_locator_from_itl
 #undef uba_origin_node_id
 #include "cluster/cluster_tt_local.h"
 extern NodeId uba_origin_node_id(UBA address);
@@ -42,6 +47,9 @@ extern ClusterTxOutcome cluster_tx_resolve_exact(const ClusterTxLocator *, Clust
 												 ClusterTxResolution *, ClusterTxResolveReason *);
 
 volatile uint32 CritSectionCount = 0;
+#include "test_cluster_owner_full_fixture.h"
+static bool self_owner_full_pipe;
+static TestOwnerFullFixture self_owner_full;
 static bool self_current;
 static bool self_child;
 static int self_update_layout;
@@ -84,9 +92,39 @@ static int self_drift;
 static int self_cid_calls;
 static ClusterCanonicalTxnBinding self_binding;
 
+static bool self_real_itl_ref(Page page, uint8 index, ClusterUndoTTSlotRef *out);
+static bool self_real_itl_locator(Page page, uint8 index, ClusterTxLocator *out,
+								  ClusterTxResolveReason *reason);
+extern bool cluster_itl_get_tt_ref(Page page, uint8 index, ClusterUndoTTSlotRef *out);
+extern bool cluster_tx_locator_from_itl(Page page, uint8 index, ClusterTxLocator *out,
+										ClusterTxResolveReason *reason);
+#define cluster_itl_get_tt_ref self_real_itl_ref
+#define cluster_tx_locator_from_itl self_real_itl_locator
+#include "test_cluster_scratch_itl_ref.inc"
+#undef cluster_itl_get_tt_ref
+#undef cluster_tx_locator_from_itl
+
+bool
+cluster_itl_get_tt_ref(Page page, uint8 index, ClusterUndoTTSlotRef *out)
+{
+	return self_owner_full_pipe ? self_real_itl_ref(page, index, out)
+								: self_unused_itl_ref(page, index, out);
+}
+
+bool
+cluster_tx_locator_from_itl(Page page, uint8 index, ClusterTxLocator *out,
+							ClusterTxResolveReason *reason)
+{
+	return self_owner_full_pipe ? self_real_itl_locator(page, index, out, reason)
+								: self_unused_itl_locator(page, index, out, reason);
+}
+
 bool
 TransactionIdIsCurrentTransactionId(TransactionId xid)
 {
+	if (self_owner_full_pipe)
+		return xid == self_owner_full.expected.top.xid
+			   || xid == XidFromFullTransactionId(self_owner_full.expected.operation_fxid);
 	return self_current && (xid == UT_RAW_XID || (self_child && xid == UT_RAW_XID + 1));
 }
 
@@ -123,7 +161,29 @@ ClusterTxOutcome
 cluster_tx_resolve_exact(const ClusterTxLocator *locator, ClusterTxResolveMode mode,
 						 ClusterTxResolution *out, ClusterTxResolveReason *reason)
 {
-	ClusterTxOutcome outcome = self_unused_exact(locator, mode, out, reason);
+	ClusterTxOutcome outcome;
+
+	if (self_owner_full_pipe) {
+		const ClusterCanonicalTxnBinding *binding = &self_owner_full.expected.top;
+
+		memset(out, 0, sizeof(*out));
+		out->locator_echo = *locator;
+		out->locator_echo.tt_wrap = binding->slot_wrap;
+		out->top_xid = binding->xid;
+		out->outcome = CLUSTER_TX_IN_PROGRESS;
+		out->proof_kind = CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG;
+		out->authority.origin_epoch = ut_current_epoch;
+		out->authority.authority_scn = self_owner_full.read_scn;
+		out->local_canonical = (ClusterTTSlotPhysicalLocator){ .segment_id = binding->segment_id,
+															   .xid = binding->xid,
+															   .slot_offset = binding->slot_offset,
+															   .wrap = binding->slot_wrap };
+		out->local_canonical_generation = binding->segment_generation;
+		out->local_canonical_valid = true;
+		*reason = CLUSTER_TX_RESOLVE_NONE;
+		return CLUSTER_TX_IN_PROGRESS;
+	}
+	outcome = self_unused_exact(locator, mode, out, reason);
 	out->top_xid = UT_RAW_XID;
 	out->authority.origin_epoch = ut_current_epoch;
 	out->authority.authority_scn = UT_READ_SCN;
@@ -198,6 +258,8 @@ cluster_semantic_activation_leave(ClusterSemanticAdmissionToken *token)
 FullTransactionId
 GetTopFullTransactionIdIfAny(void)
 {
+	if (self_owner_full_pipe)
+		return self_owner_full.expected.top_fxid;
 	return self_child ? FullTransactionIdFromEpochAndXid(1, UT_RAW_XID) : InvalidFullTransactionId;
 }
 
@@ -618,6 +680,16 @@ cluster_runtime_visibility_resolve_own_operation_head_origin_admitted(
 	UT_ASSERT(self_child);
 	UT_ASSERT(self_admission_held && admission->entered);
 	UT_ASSERT_EQ(mode, CLUSTER_TX_RESOLVE_VISIBILITY);
+	if (self_owner_full_pipe) {
+		memcpy(data, self_owner_full.undo.data, BLCKSZ);
+		if (!cluster_savepoint_reader_discover_own_head(owner, head, tag, locator, data, identity))
+			return CLUSTER_TX_UNKNOWN;
+		exact.tt_wrap = identity->canonical.wrap;
+		if (!cluster_savepoint_reader_extract_identity(identity, &exact, data, record.data, &length,
+													   operation))
+			return CLUSTER_TX_UNKNOWN;
+		return cluster_tx_resolve_exact(&exact, mode, top, reason);
+	}
 	if (self_operation_defect == 18)
 		pg_re_throw();
 	if (self_history_records != 0) {
@@ -1159,10 +1231,79 @@ UT_TEST(test_own_child_mixed_top_history_error_unwinds)
 
 #include "test_cluster_scratch_nonowner.inc"
 
+UT_TEST(test_real_owner_full_producer_reaches_native_self_cid_consumer)
+{
+	FILE *producer = popen("./test_cluster_r4_tx_outcome --owner-full-fixture", "r");
+	bool received;
+	int status;
+
+	UT_ASSERT(producer != NULL);
+	if (producer == NULL)
+		return;
+	received = fread(&self_owner_full, sizeof(self_owner_full), 1, producer) == 1;
+	status = pclose(producer);
+	UT_ASSERT(received && status == 0 && self_owner_full.magic == TEST_OWNER_FULL_MAGIC);
+	if (!received || status != 0 || self_owner_full.magic != TEST_OWNER_FULL_MAGIC)
+		return;
+	for (unsigned next = 0; next < 2; next++) {
+		HeapTupleData tuple = { 0 };
+		SnapshotData snapshot = { 0 };
+		ClusterR4HotScratchTestContext context = { 0 };
+		Page page = (Page)ut_visibility_page.data;
+		PGAlignedBlock before;
+		volatile bool visible = false, caught = false;
+
+		self_child = true;
+		self_reset_case(false, 0);
+		self_owner_full_pipe = true;
+		cluster_node_id = self_owner_full.expected.top.origin_instance - 1;
+		self_binding = self_owner_full.expected.top;
+		memcpy(page, self_owner_full.full.data, BLCKSZ);
+		memcpy(before.data, page, BLCKSZ);
+		tuple.t_data = (HeapTupleHeader)PageGetItem(page, PageGetItemId(page, 3));
+		tuple.t_len = ItemIdGetLength(PageGetItemId(page, 3));
+		tuple.t_self = tuple.t_data->t_ctid;
+		tuple.t_tableOid = FirstNormalObjectId;
+		snapshot.snapshot_type = SNAPSHOT_MVCC;
+		snapshot.cluster_source = SNAPSHOT_SOURCE_CLUSTER;
+		snapshot.read_epoch = ut_current_epoch;
+		snapshot.read_scn = self_owner_full.read_scn;
+		snapshot.curcid = self_owner_full.expected.command_id + next;
+		context.scratch_page = page;
+		context.already_full = true;
+		context.read_scn = snapshot.read_scn;
+		context.logical_root = tuple.t_self;
+		context.tag = self_owner_full.tag;
+		ut_error_armed = true;
+		PG_TRY();
+		{
+			visible = HeapTupleSatisfiesMVCCScratch(&tuple, &snapshot, &context);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		ut_error_armed = false;
+		if (caught)
+			printf("# owner FULL consumer rejected: %s; %s\n", ut_error_message, ut_error_detail);
+		UT_ASSERT(!caught);
+		UT_ASSERT_EQ(visible, next != 0);
+		UT_ASSERT_EQ(self_cid_calls, 1);
+		UT_ASSERT_EQ(self_operation_calls, 1);
+		UT_ASSERT_EQ(self_admission_enters, self_admission_leaves);
+		UT_ASSERT(!self_admission_held);
+		UT_ASSERT_EQ(memcmp(before.data, page, BLCKSZ), 0);
+		self_owner_full_pipe = false;
+	}
+	self_child = false;
+	cluster_node_id = UT_SELF_NODE;
+}
+
 int
 main(void)
 {
-	UT_PLAN(33);
+	UT_PLAN(34);
 	UT_RUN(test_existing_delete_current_command);
 	UT_RUN(test_existing_delete_next_command);
 	UT_RUN(test_update_old_version_next_command);
@@ -1197,6 +1338,7 @@ main(void)
 	UT_RUN(test_nonowner_initial_v1_never_fabricates_owner);
 	UT_RUN(test_nonowner_page_prior_and_matched_bad_image_refuse);
 	printf("# nonowner subcases=%d\n", nonowner_cases);
+	UT_RUN(test_real_owner_full_producer_reaches_native_self_cid_consumer);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

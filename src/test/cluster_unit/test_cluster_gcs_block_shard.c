@@ -389,9 +389,9 @@ UT_TEST(test_route_ignores_non_tag_fields)
 enum {
 	GCS_BLOCK_ROUTE_TAG_OFFSET = 16,
 	GCS_BLOCK_LEGACY_ROUTE_LEN = 64,
-	GCS_BLOCK_R4_REQUEST_ROUTE_LEN = 80,
-	GCS_BLOCK_R4_FORWARD_ROUTE_LEN = 96,
-	GCS_BLOCK_R4_ROUTE_PROBE_LEN = 97
+	GCS_BLOCK_R4_REQUEST_ROUTE_LEN = 120,
+	GCS_BLOCK_R4_FORWARD_ROUTE_LEN = 136,
+	GCS_BLOCK_R4_ROUTE_PROBE_LEN = 160
 };
 
 static void
@@ -399,6 +399,15 @@ make_r4_route_frame(uint8 *frame, Size frame_len, BufferTag tag, uint8 fill)
 {
 	memset(frame, fill, frame_len);
 	memcpy(frame + GCS_BLOCK_ROUTE_TAG_OFFSET, &tag, sizeof(tag));
+	if (frame_len == GCS_BLOCK_R4_FORWARD_ROUTE_LEN) {
+		ClusterR4CrForwardPayload *forward = (ClusterR4CrForwardPayload *)frame;
+
+		forward->base.original_requester_node = 0;
+		forward->extension.r4_version = CLUSTER_R4_WIRE_VERSION;
+		forward->extension.r4_kind = CLUSTER_R4_WIRE_CR_BUILD;
+		memset(&forward->requester_owner, 0, sizeof(forward->requester_owner));
+		forward->requester_owner.bytes[36] = 1;
+	}
 }
 
 /* ======================================================================
@@ -457,7 +466,7 @@ UT_TEST(test_r4_extended_route_exact_lengths_and_tag_affinity)
  * ====================================================================== */
 UT_TEST(test_r4_kind4_internal_endpoint_routes_only_to_data_worker0)
 {
-	ClusterR4CrForwardPayload forward;
+	ClusterR4InternalForwardPayload forward;
 	BufferTag tag;
 	int ordinary_shard = 0;
 	int i;
@@ -485,7 +494,7 @@ UT_TEST(test_r4_kind4_internal_endpoint_routes_only_to_data_worker0)
 	forward.extension.r4_kind = CLUSTER_R4_WIRE_CR_BUILD;
 	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &forward,
 												 sizeof(forward), CLUSTER_LMS_MAX_WORKERS),
-				 ordinary_shard);
+				 -1);
 	forward.extension.r4_kind = CLUSTER_R4_WIRE_UNDO_DATA_FETCH;
 	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &forward,
 												 sizeof(forward) - 1, CLUSTER_LMS_MAX_WORKERS),
@@ -501,7 +510,7 @@ UT_TEST(test_r4_kind4_internal_endpoint_routes_only_to_data_worker0)
  * -- is the frozen routing discriminator. */
 UT_TEST(test_r4_kind2_terminal_census_routes_to_existing_data_worker0)
 {
-	ClusterR4CrForwardPayload forward;
+	ClusterR4InternalForwardPayload forward;
 	BufferTag tag;
 	int ordinary_shard = 0;
 	int i;
@@ -523,12 +532,12 @@ UT_TEST(test_r4_kind2_terminal_census_routes_to_existing_data_worker0)
 	forward.extension.r4_version = 0;
 	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &forward,
 												 sizeof(forward), CLUSTER_LMS_MAX_WORKERS),
-				 ordinary_shard);
+				 -1);
 	forward.extension.r4_version = CLUSTER_R4_WIRE_VERSION;
 	forward.extension.r4_kind = CLUSTER_R4_WIRE_CR_BUILD;
 	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &forward,
 												 sizeof(forward), CLUSTER_LMS_MAX_WORKERS),
-				 ordinary_shard);
+				 -1);
 	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &forward,
 												 sizeof(forward) - 1, CLUSTER_LMS_MAX_WORKERS),
 				 -1);

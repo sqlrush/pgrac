@@ -895,15 +895,20 @@ UT_TEST(test_immutable_symlink_and_wrong_owner_are_rejected)
 
 UT_TEST(test_operation_format_requires_a_fresh_shared_catalog_identity)
 {
-	ControlFileData input;
-	uint8 bytes[PG_CONTROL_FILE_SIZE];
+	const uint32 old_versions[] = { 202610220, 202610270 };
 
-	image_input(&input);
-	UT_ASSERT(CATALOG_VERSION_NO > 202610220);
-	input.catalog_version_no = 202610220;
-	memset(bytes, 0xa5, sizeof(bytes));
-	UT_ASSERT_EQ(cluster_cf_control_image_encode(&input, bytes), CLUSTER_CONTROL_ROOT_BAD_VERSION);
-	UT_ASSERT(image_zero(bytes, sizeof(bytes)));
+	UT_ASSERT(CATALOG_VERSION_NO > 202610270);
+	for (unsigned i = 0; i < lengthof(old_versions); i++) {
+		ControlFileData input;
+		uint8 bytes[PG_CONTROL_FILE_SIZE];
+
+		image_input(&input);
+		input.catalog_version_no = old_versions[i];
+		memset(bytes, 0xa5, sizeof(bytes));
+		UT_ASSERT_EQ(cluster_cf_control_image_encode(&input, bytes),
+					 CLUSTER_CONTROL_ROOT_BAD_VERSION);
+		UT_ASSERT(image_zero(bytes, sizeof(bytes)));
+	}
 }
 
 UT_TEST(test_immutable_invalid_input_and_wrong_read_identity)

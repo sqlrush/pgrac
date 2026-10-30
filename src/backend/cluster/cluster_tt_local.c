@@ -789,6 +789,32 @@ cluster_tt_local_get_published_binding(TransactionId top_xid,
 		   && cluster_tt_local_copy_published(&cluster_tt_local_bindings[idx], binding_out);
 }
 
+/* Only the dispatching backend may capture its publication state. This is a
+ * routing challenge; the receiver still proves canonical current TT/DATA. */
+ClusterCanonicalTxnPublishState
+cluster_tt_local_capture_canonical_binding(TransactionId top_xid,
+										   ClusterCanonicalTxnBinding *binding_out)
+{
+	int idx;
+	ClusterCanonicalTxnPublishState state;
+
+	if (binding_out == NULL)
+		return CLUSTER_CANONICAL_TXN_FAILED;
+	memset(binding_out, 0, sizeof(*binding_out));
+	if (!cluster_enabled || cluster_node_id < 0 || !TransactionIdIsNormal(top_xid))
+		return CLUSTER_CANONICAL_TXN_FAILED;
+	idx = cluster_tt_local_find_binding(top_xid);
+	if (idx < 0)
+		return CLUSTER_CANONICAL_TXN_NONE;
+	state = (ClusterCanonicalTxnPublishState)cluster_tt_local_bindings[idx].publish_state;
+	if (state < CLUSTER_CANONICAL_TXN_RESERVED || state > CLUSTER_CANONICAL_TXN_FAILED)
+		return CLUSTER_CANONICAL_TXN_FAILED;
+	if (state == CLUSTER_CANONICAL_TXN_PUBLISHED
+		&& !cluster_tt_local_copy_published(&cluster_tt_local_bindings[idx], binding_out))
+		return CLUSTER_CANONICAL_TXN_FAILED;
+	return state;
+}
+
 /* Only called after the publisher's normal, zero-side-effect retry result.
  * The old allocator has rolled away, so do not free/abort an old physical slot
  * or touch another backend's CURRENT.  Remove just this local candidate. */

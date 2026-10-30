@@ -75,6 +75,7 @@
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_sf_dep.h" /* ClusterSfDepVec / max origins */
 #include "cluster/cluster_terminal_ref_census.h"
+#include "cluster/cluster_tt_local.h"
 #include "cluster/cluster_tx_resolve.h"
 #include "storage/block.h"		   /* BLCKSZ */
 #include "storage/buf_internals.h" /* BufferTag, BufferDesc */
@@ -2050,7 +2051,7 @@ GcsBlockForwardPayloadGetExpectedPiWatermarkScn(const GcsBlockForwardPayload *p)
 /* Stage 8 R4 keeps the legacy 64-byte prefixes and appends these exact
  * byte-array extensions.  Multibyte fields are encoded explicitly little
  * endian; no packed/native cast is a wire authority. */
-#define CLUSTER_R4_WIRE_VERSION ((uint8)1)
+#define CLUSTER_R4_WIRE_VERSION ((uint8)2)
 #define CLUSTER_R4_FORWARD_EXTENDED ((uint8)6)
 #define GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF ((uint8)7)
 #define GCS_BLOCK_FORWARD_KIND_CURRENT_MX_STATS ((uint8)8)
@@ -2163,6 +2164,72 @@ cluster_cr_build_result_for_reason(ClusterCrBuildReason reason)
 	return CLUSTER_CR_BUILD_FAIL_CLOSED;
 }
 
+/* This challenge is not a publication receipt or authority. Original current
+ * TT/DATA must prove its identity before retaining this reader's effects. */
+#define CLUSTER_R4_CR_OWNER_PRESENT UINT16_C(1)
+#define CLUSTER_R4_CR_OWNER_WIRE_BYTES 40
+#define CLUSTER_R4_CR_OWNER_WIRE_VERSION UINT32_C(1)
+#define CLUSTER_R4_CR_REPLY_PAYLOAD_SIZE                                                           \
+	(GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE + CLUSTER_R4_CR_OWNER_WIRE_BYTES)
+
+typedef struct ClusterR4CrOwnerChallenge {
+	FullTransactionId top_fxid;
+	XLogRecPtr active_lsn;
+	uint32 segment_id;
+	uint32 segment_generation;
+	TransactionId top_xid;
+	uint16 slot_offset;
+	uint16 slot_wrap;
+	uint8 origin_instance;
+	uint8 publish_state;
+	uint16 flags;
+} ClusterR4CrOwnerChallenge;
+
+typedef struct ClusterR4CrOwnerWire {
+	uint8 bytes[CLUSTER_R4_CR_OWNER_WIRE_BYTES];
+} ClusterR4CrOwnerWire;
+
+StaticAssertDecl(sizeof(ClusterR4CrOwnerChallenge) == 40, "R4 owner challenge must be 40 bytes");
+StaticAssertDecl(sizeof(ClusterR4CrOwnerWire) == 40, "R4 owner wire must be exactly 40 bytes");
+
+static inline bool
+ClusterR4CrOwnerValid(const ClusterR4CrOwnerChallenge *owner)
+{
+	if (owner == NULL)
+		return false;
+	if (owner->flags == 0)
+		return U64FromFullTransactionId(owner->top_fxid) == 0 && owner->active_lsn == 0
+			   && owner->segment_id == 0 && owner->segment_generation == 0 && owner->top_xid == 0
+			   && owner->slot_offset == 0 && owner->slot_wrap == 0 && owner->origin_instance == 0
+			   && owner->publish_state == 0;
+	return owner->flags == CLUSTER_R4_CR_OWNER_PRESENT && TransactionIdIsNormal(owner->top_xid)
+		   && XidFromFullTransactionId(owner->top_fxid) == owner->top_xid && owner->segment_id != 0
+		   && owner->segment_generation != UINT32_MAX && owner->slot_offset < TT_SLOTS_PER_SEGMENT
+		   && owner->slot_wrap != TT_WRAP_INVALID && owner->origin_instance > 0
+		   && owner->origin_instance <= RESOURCE_X_PROTOCOL_NODE_LIMIT
+		   && owner->publish_state == CLUSTER_CANONICAL_TXN_PUBLISHED
+		   && !XLogRecPtrIsInvalid(owner->active_lsn);
+}
+
+static inline bool
+ClusterR4CrOwnerForRequester(const ClusterR4CrOwnerChallenge *owner, int32 requester_node)
+{
+	return requester_node >= 0 && requester_node < RESOURCE_X_PROTOCOL_NODE_LIMIT
+		   && ClusterR4CrOwnerValid(owner)
+		   && (owner->flags == 0 || owner->origin_instance == requester_node + 1);
+}
+
+static inline bool
+ClusterR4CrOwnerEqual(const ClusterR4CrOwnerChallenge *left, const ClusterR4CrOwnerChallenge *right)
+{
+	return left != NULL && right != NULL && FullTransactionIdEquals(left->top_fxid, right->top_fxid)
+		   && left->active_lsn == right->active_lsn && left->segment_id == right->segment_id
+		   && left->segment_generation == right->segment_generation
+		   && left->top_xid == right->top_xid && left->slot_offset == right->slot_offset
+		   && left->slot_wrap == right->slot_wrap && left->origin_instance == right->origin_instance
+		   && left->publish_state == right->publish_state && left->flags == right->flags;
+}
+
 typedef struct ClusterR4CrRouteProof {
 	BufferTag tag;
 	SCN read_scn;
@@ -2173,9 +2240,10 @@ typedef struct ClusterR4CrRouteProof {
 	SCN expected_page_scn;
 	int32 real_master_node;
 	int32 selected_holder_node;
+	ClusterR4CrOwnerChallenge requester_owner;
 } ClusterR4CrRouteProof;
 
-StaticAssertDecl(sizeof(ClusterR4CrRouteProof) == 80, "R4 CR route proof must remain 80 bytes");
+StaticAssertDecl(sizeof(ClusterR4CrRouteProof) == 120, "R4 CR route proof must be 120 bytes");
 
 /*
  * R4 D3 master-side policy over one coherent PCM snapshot.  NONE means one
@@ -2633,17 +2701,27 @@ StaticAssertDecl(offsetof(ClusterR4ForwardExtension, kind.cr.master_resource_tra
 typedef struct ClusterR4CrRequestPayload {
 	GcsBlockRequestPayload base;
 	ClusterR4RequestExtension extension;
+	ClusterR4CrOwnerWire requester_owner;
 } ClusterR4CrRequestPayload;
+
+/* Original locator subdomains do not carry a CR reader challenge. */
+typedef struct ClusterR4InternalForwardPayload {
+	GcsBlockForwardPayload base;
+	ClusterR4ForwardExtension extension;
+} ClusterR4InternalForwardPayload;
 
 typedef struct ClusterR4CrForwardPayload {
 	GcsBlockForwardPayload base;
 	ClusterR4ForwardExtension extension;
+	ClusterR4CrOwnerWire requester_owner;
 } ClusterR4CrForwardPayload;
 
-StaticAssertDecl(sizeof(ClusterR4CrRequestPayload) == 80,
-				 "R4 CR request payload must remain 80 bytes");
-StaticAssertDecl(sizeof(ClusterR4CrForwardPayload) == 96,
-				 "R4 CR forward payload must remain 96 bytes");
+StaticAssertDecl(sizeof(ClusterR4CrRequestPayload) == 120,
+				 "R4 CR request payload must be 120 bytes");
+StaticAssertDecl(sizeof(ClusterR4CrForwardPayload) == 136,
+				 "R4 CR forward payload must be 136 bytes");
+StaticAssertDecl(sizeof(ClusterR4InternalForwardPayload) == 96,
+				 "R4 internal locator forward must remain 96 bytes");
 
 struct ClusterICEnvelope;
 extern ClusterCrBuildResult cluster_gcs_block_r4_route_cr(const struct ClusterICEnvelope *env,
@@ -2762,6 +2840,54 @@ ClusterR4WireReadU64(const uint8 in[8])
 	for (i = 0; i < 8; i++)
 		value |= (uint64)in[i] << (i * 8);
 	return value;
+}
+
+static inline bool
+ClusterR4CrOwnerWireSet(ClusterR4CrOwnerWire *wire, const ClusterR4CrOwnerChallenge *owner)
+{
+	if (wire == NULL)
+		return false;
+	memset(wire, 0, sizeof(*wire));
+	if (!ClusterR4CrOwnerValid(owner))
+		return false;
+	ClusterR4WireWriteU64(&wire->bytes[0], U64FromFullTransactionId(owner->top_fxid));
+	ClusterR4WireWriteU64(&wire->bytes[8], owner->active_lsn);
+	ClusterR4WireWriteU32(&wire->bytes[16], owner->segment_id);
+	ClusterR4WireWriteU32(&wire->bytes[20], owner->segment_generation);
+	ClusterR4WireWriteU32(&wire->bytes[24], owner->top_xid);
+	ClusterR4WireWriteU16(&wire->bytes[28], owner->slot_offset);
+	ClusterR4WireWriteU16(&wire->bytes[30], owner->slot_wrap);
+	wire->bytes[32] = owner->origin_instance;
+	wire->bytes[33] = owner->publish_state;
+	ClusterR4WireWriteU16(&wire->bytes[34], owner->flags);
+	ClusterR4WireWriteU32(&wire->bytes[36], CLUSTER_R4_CR_OWNER_WIRE_VERSION);
+	return true;
+}
+
+static inline bool
+ClusterR4CrOwnerWireGet(const ClusterR4CrOwnerWire *wire, ClusterR4CrOwnerChallenge *owner)
+{
+	ClusterR4CrOwnerChallenge decoded = { 0 };
+
+	if (owner != NULL)
+		memset(owner, 0, sizeof(*owner));
+	if (wire == NULL || owner == NULL
+		|| ClusterR4WireReadU32(&wire->bytes[36]) != CLUSTER_R4_CR_OWNER_WIRE_VERSION)
+		return false;
+	decoded.top_fxid = FullTransactionIdFromU64(ClusterR4WireReadU64(&wire->bytes[0]));
+	decoded.active_lsn = ClusterR4WireReadU64(&wire->bytes[8]);
+	decoded.segment_id = ClusterR4WireReadU32(&wire->bytes[16]);
+	decoded.segment_generation = ClusterR4WireReadU32(&wire->bytes[20]);
+	decoded.top_xid = ClusterR4WireReadU32(&wire->bytes[24]);
+	decoded.slot_offset = ClusterR4WireReadU16(&wire->bytes[28]);
+	decoded.slot_wrap = ClusterR4WireReadU16(&wire->bytes[30]);
+	decoded.origin_instance = wire->bytes[32];
+	decoded.publish_state = wire->bytes[33];
+	decoded.flags = ClusterR4WireReadU16(&wire->bytes[34]);
+	if (!ClusterR4CrOwnerValid(&decoded))
+		return false;
+	*owner = decoded;
+	return true;
 }
 
 static inline bool

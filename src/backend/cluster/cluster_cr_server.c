@@ -127,6 +127,7 @@ typedef struct ClusterR4CrWorkerContext {
 	uint32 expected_foreign_physical_generation;
 	bool foreign_physical_generation_frozen;
 	uint8 reserved[2];
+	ClusterR4CrOwnerChallenge requester_owner;
 } ClusterR4CrWorkerContext;
 
 /* Immutable finite diagnostic events; never consulted by the slot owner. */
@@ -672,7 +673,7 @@ cluster_lms_cr_submit_r4(const ClusterR4CrForwardPayload *forward,
 {
 	ClusterLmsSharedState *lms_state;
 	ClusterLmsCrSlot *slot = NULL;
-	ClusterR4CrRouteProof route_proof;
+	ClusterR4CrRouteProof route_proof = { 0 };
 	ClusterBufmgrGcsCopyRefusal copy_refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_NONE;
 	XLogRecPtr copied_page_lsn = InvalidXLogRecPtr;
 	SCN copied_page_scn = InvalidScn;
@@ -720,12 +721,14 @@ cluster_lms_cr_submit_r4(const ClusterR4CrForwardPayload *forward,
 
 	read_scn = GcsBlockForwardPayloadGetExpectedPiWatermarkScn(&forward->base);
 	if (!SCN_VALID(read_scn)
+		|| !ClusterR4CrOwnerWireGet(&forward->requester_owner, &route_proof.requester_owner)
+		|| !ClusterR4CrOwnerForRequester(&route_proof.requester_owner,
+										 forward->base.original_requester_node)
 		|| !ClusterR4ForwardExtensionGetCrProof(
 			&forward->extension, forward->base.epoch, &master_authority_generation,
 			&master_resource_transition_count, &copied_page_scn))
 		return CLUSTER_CR_BUILD_FAIL_CLOSED;
 
-	memset(&route_proof, 0, sizeof(route_proof));
 	route_proof.tag = forward->base.tag;
 	route_proof.read_scn = read_scn;
 	route_proof.formation_epoch = forward->base.epoch;
@@ -1031,6 +1034,8 @@ cr_server_r4_queued_identity_valid(const ClusterLmsCrSlot *slot,
 		|| slot->reply_master_node != slot->r4.route_proof.real_master_node
 		|| slot->r4.route_proof.selected_holder_node != cluster_node_id || slot->requester_node < 0
 		|| slot->requester_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT || slot->requester_backend <= 0
+		|| !ClusterR4CrOwnerForRequester(&slot->r4.route_proof.requester_owner,
+										 slot->requester_node)
 		|| slot->reply_master_node < 0 || slot->reply_master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
 		|| slot->transition_id != (uint8)PCM_TRANS_N_TO_S
 		|| slot->r4.requester_capability_generation == 0
@@ -1122,6 +1127,7 @@ cr_server_r4_claim_queued(uint32 slot_index)
 	context->requester_node = slot->requester_node;
 	context->requester_backend_id = slot->requester_backend;
 	context->request_id = slot->request_id;
+	context->requester_owner = slot->r4.route_proof.requester_owner;
 	context->admission = admission;
 	pg_write_barrier();
 	context->in_use = true;
@@ -1154,7 +1160,8 @@ cr_server_r4_terminalize_build_error(uint32 slot_index, ClusterLmsCrSlot *slot,
 		|| slot->r4.owner.builder_pid != MyProcPid || slot->r4.owner.builder_worker_id != 0
 		|| slot->requester_node != key->requester_node
 		|| slot->requester_backend != key->requester_backend_id
-		|| slot->request_id != key->request_id)
+		|| slot->request_id != key->request_id
+		|| !ClusterR4CrOwnerEqual(&key->requester_owner, &slot->r4.route_proof.requester_owner))
 		return false;
 
 	if (sqlerrcode == ERRCODE_QUERY_CANCELED) {
@@ -1212,6 +1219,7 @@ cr_server_r4_build_step(uint32 slot_index)
 		|| context->builder_incarnation != slot->r4.owner.builder_incarnation
 		|| context->requester_node != slot->requester_node
 		|| context->requester_backend_id != slot->requester_backend
+		|| !ClusterR4CrOwnerEqual(&context->requester_owner, &slot->r4.route_proof.requester_owner)
 		|| context->request_id != slot->request_id)
 		return false;
 	if (foreign_undo_ready) {
@@ -1366,6 +1374,7 @@ cr_server_r4_foreign_request_valid(uint32 slot_index, const ClusterLmsCrSlot *sl
 		|| context->builder_incarnation != slot->r4.owner.builder_incarnation
 		|| context->requester_node != slot->requester_node
 		|| context->requester_backend_id != slot->requester_backend
+		|| !ClusterR4CrOwnerEqual(&context->requester_owner, &slot->r4.route_proof.requester_owner)
 		|| context->request_id != slot->request_id
 		|| (slot->epoch == 0 && cluster_conf_node_count() != 4)
 		|| slot->epoch != context->admission.formation_epoch
@@ -1410,7 +1419,7 @@ cr_server_r4_send_foreign_undo(uint32 slot_index)
 {
 	ClusterLmsCrSlot *slot;
 	ClusterR4CrWorkerContext *context;
-	ClusterR4CrForwardPayload forward;
+	ClusterR4InternalForwardPayload forward;
 	ClusterTxLocator locator;
 	ClusterICSendResult send_result;
 	uint32 request_generation;
@@ -1531,6 +1540,8 @@ cr_server_r4_foreign_landing_key_valid(uint32 slot_index, ClusterLmsCrSlot *slot
 		   && cr_server_bytes_zero(slot->r4.owner.reserved, sizeof(slot->r4.owner.reserved))
 		   && context->requester_node == slot->requester_node
 		   && context->requester_backend_id == slot->requester_backend
+		   && ClusterR4CrOwnerEqual(&context->requester_owner,
+									&slot->r4.route_proof.requester_owner)
 		   && context->request_id == slot->request_id
 		   && slot->r4.foreign_request_id
 				  == cluster_cr_r4_dependency_request_id(slot_index, context->slot_generation,
@@ -1714,7 +1725,7 @@ cr_server_r4_ship_terminal(uint32 slot_index)
 {
 	ClusterLmsCrSlot *slot;
 	ClusterR4CrWorkerContext *context;
-	char frame[GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE];
+	char frame[CLUSTER_R4_CR_REPLY_PAYLOAD_SIZE];
 	GcsBlockReplyHeader *header = (GcsBlockReplyHeader *)frame;
 	ClusterICEnvelope envelope;
 	ClusterICSendResult send_result;
@@ -1763,6 +1774,7 @@ cr_server_r4_ship_terminal(uint32 slot_index)
 		|| context->builder_incarnation != slot->r4.owner.builder_incarnation
 		|| context->requester_node != slot->requester_node
 		|| context->requester_backend_id != slot->requester_backend
+		|| !ClusterR4CrOwnerEqual(&context->requester_owner, &slot->r4.route_proof.requester_owner)
 		|| context->request_id != slot->request_id)
 		return false;
 
@@ -1774,6 +1786,10 @@ cr_server_r4_ship_terminal(uint32 slot_index)
 	pg_read_barrier();
 
 	memset(frame, 0, sizeof(frame));
+	if (!ClusterR4CrOwnerWireSet(
+			(ClusterR4CrOwnerWire *)(frame + GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE),
+			&context->requester_owner))
+		return cr_server_r4_release_terminal(slot_index, slot_generation);
 	header->request_id = slot->request_id;
 	header->epoch = slot->epoch;
 	header->sender_node = cluster_node_id;
@@ -1926,6 +1942,7 @@ cluster_cr_server_test_r4_freeze_foreign_generation(uint32 slot_index, uint32 ph
 		|| context->builder_incarnation != slot->r4.owner.builder_incarnation
 		|| context->requester_node != slot->requester_node
 		|| context->requester_backend_id != slot->requester_backend
+		|| !ClusterR4CrOwnerEqual(&context->requester_owner, &slot->r4.route_proof.requester_owner)
 		|| context->request_id != slot->request_id)
 		return false;
 	context->expected_foreign_physical_generation = physical_generation;
@@ -1969,6 +1986,8 @@ cluster_cr_server_test_r4_context_matches(uint32 slot_index, bool expect_present
 		   && context->builder_incarnation == builder_incarnation
 		   && context->requester_node == slot->requester_node
 		   && context->requester_backend_id == slot->requester_backend
+		   && ClusterR4CrOwnerEqual(&context->requester_owner,
+									&slot->r4.route_proof.requester_owner)
 		   && context->request_id == slot->request_id
 		   && memcmp(&context->admission, admission, sizeof(*admission)) == 0;
 }

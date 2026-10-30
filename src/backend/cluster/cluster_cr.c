@@ -1335,6 +1335,33 @@ cr_r4_operation_project(CrR4OperationContext *operation, ClusterR4CrSlotExtensio
 	return true;
 }
 
+/* The requester supplies a challenge only. The original current TT/DATA
+ * reader above independently qualified this exact top and operation. A raw
+ * owner alias cannot be silently treated as another transaction's history. */
+static bool
+cr_r4_operation_owner(const CrR4OperationContext *operation,
+					  const ClusterR4CrSlotExtension *extension, bool *owned)
+{
+	const ClusterR4CrOwnerChallenge *owner = &extension->route_proof.requester_owner;
+	const ClusterSavepointReaderIdentity *identity = &operation->identity;
+
+	*owned = false;
+	if (!ClusterR4CrOwnerValid(owner))
+		return false;
+	if (owner->flags == 0 || owner->top_xid != identity->canonical.xid)
+		return true;
+	if (!FullTransactionIdEquals(owner->top_fxid, identity->top_fxid)
+		|| owner->segment_id != identity->canonical.segment_id
+		|| owner->segment_generation != identity->canonical_generation
+		|| owner->slot_offset != identity->canonical.slot_offset
+		|| owner->slot_wrap != identity->canonical.wrap
+		|| owner->origin_instance
+			   != (uint8)((uint32)uba_origin_node_id(operation->locator.uba) + 1))
+		return false;
+	*owned = operation->top.outcome == CLUSTER_TX_IN_PROGRESS;
+	return true;
+}
+
 static bool
 cr_r4_operation_apply(CrR4OperationContext *operation, ClusterR4CrBuildContext *context,
 					  ClusterTxLocator *locator, ClusterR4CrSlotExtension *extension,
@@ -1342,7 +1369,7 @@ cr_r4_operation_apply(CrR4OperationContext *operation, ClusterR4CrBuildContext *
 {
 	UndoRecordHeader *record;
 	size_t length;
-	bool conservative, keep;
+	bool conservative, keep, owned;
 
 	if (operation->result_page == NULL
 		|| memcmp(operation->result_page, operation->source.data, BLCKSZ) != 0
@@ -1353,14 +1380,16 @@ cr_r4_operation_apply(CrR4OperationContext *operation, ClusterR4CrBuildContext *
 		|| !cluster_savepoint_reader_extract_identity(&operation->identity,
 													  &operation->top.locator_echo, record_bytes,
 													  record_bytes, &length, &operation->operation)
-		|| !cr_r4_operation_top(operation, context->max_steps, &conservative))
+		|| !cr_r4_operation_top(operation, context->max_steps, &conservative)
+		|| !cr_r4_operation_owner(operation, extension, &owned))
 		return false;
 	record = (UndoRecordHeader *)record_bytes;
-	keep = !conservative
-		   && (operation->identity.operation_sequence == 0
-			   || operation->operation.operation.effect_state == CLUSTER_SAVEPOINT_EFFECT_LIVE)
-		   && operation->top.outcome == CLUSTER_TX_COMMITTED
-		   && scn_time_cmp(operation->top.commit_scn, extension->route_proof.read_scn) <= 0;
+	keep = (operation->identity.operation_sequence == 0
+			|| operation->operation.operation.effect_state == CLUSTER_SAVEPOINT_EFFECT_LIVE)
+		   && (owned
+			   || (!conservative && operation->top.outcome == CLUSTER_TX_COMMITTED
+				   && scn_time_cmp(operation->top.commit_scn, extension->route_proof.read_scn)
+						  <= 0));
 	*locator = operation->top.locator_echo;
 	if (!cr_r4_operation_project(operation, extension, locator, record, page, keep))
 		return false;
@@ -1540,8 +1569,8 @@ cluster_cr_build_on_holder_step_admitted(uint32 index, uint64 generation, bool f
 	operation = &CrR4OperationContexts[index];
 	same_key = operation->enabled && operation->slot_generation == generation
 			   && operation->builder_incarnation == extension->owner.builder_incarnation;
-	if (admission == NULL || !admission->entered
-		|| admission->feature_bit != CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
+	if (!ClusterR4CrOwnerValid(&extension->route_proof.requester_owner) || admission == NULL
+		|| !admission->entered || admission->feature_bit != CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
 		|| admission->side != CLUSTER_SEMANTIC_TARGET_SIDE
 		|| admission->formation_epoch != extension->route_proof.formation_epoch
 		|| admission->record_generation != extension->route_proof.activation_generation

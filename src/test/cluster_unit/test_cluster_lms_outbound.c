@@ -50,6 +50,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_gcs_block.h"
+#include "cluster/cluster_epoch.h"
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_ic_router.h" /* cluster_ic_send_envelope prototype */
@@ -851,7 +852,7 @@ static int ut_checksum_call_count = 0;
 static int ut_refill_worker = -1;
 static int ut_refill_admitted = 0;
 static bool ut_r4_real_checksum = false;
-static char ut_r4_reply_payload[GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE];
+static char ut_r4_reply_payload[CLUSTER_R4_CR_REPLY_PAYLOAD_SIZE];
 
 /* Production bodies, including their capability mask and CRC, extracted by
  * the Makefile. Only observation and the final transport are fixture seams. */
@@ -917,7 +918,8 @@ cluster_ic_send_envelope(uint8 msg_type, int32 dest_node_id, const void *payload
 			if (payload_len == sizeof(ut_r4_reply_payload))
 				memcpy(ut_r4_reply_payload, payload, payload_len);
 			ut_sent_log[ut_sent_n].reply_block_zero
-				= payload_len == GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE;
+				= payload_len == GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE
+				  || payload_len == CLUSTER_R4_CR_REPLY_PAYLOAD_SIZE;
 			for (i = 0; ut_sent_log[ut_sent_n].reply_block_zero && i < GCS_BLOCK_DATA_SIZE; i++)
 				if (block_data[i] != 0)
 					ut_sent_log[ut_sent_n].reply_block_zero = false;
@@ -1412,6 +1414,7 @@ UT_TEST(test_r4_real_refusal_producers_cross_outbound_and_requester_boundary)
 			ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_DONE;
 			ut_peer_capabilities[UT_PEER_X] = R4_CR_REQUIRED_HELLO_CAPS;
 			ut_peer_cap_generation[UT_PEER_X] = 42;
+			forward.requester_owner.bytes[36] = 1;
 			forward.base.request_id = 123;
 			forward.base.epoch = 9;
 			forward.base.master_node = masters[m];
@@ -1438,6 +1441,7 @@ UT_TEST(test_r4_real_refusal_producers_cross_outbound_and_requester_boundary)
 			expected.requester_backend_id = forward.base.requester_backend_id;
 			expected.transition_id = PCM_TRANS_N_TO_S;
 			expected.reply_domain = CLUSTER_GCS_BLOCK_REPLY_DOMAIN_R4_CR;
+			expected.owner_bound = true;
 			env.msg_type = PGRAC_IC_MSG_GCS_BLOCK_REPLY;
 			env.source_node_id = cluster_node_id;
 			env.dest_node_id = UT_PEER_X;
@@ -1467,6 +1471,7 @@ UT_TEST(test_r4_real_master_refusal_preserves_redirect)
 	ut_reset_log();
 	ut_peer_capabilities[UT_PEER_X] = R4_CR_REQUIRED_HELLO_CAPS;
 	ut_peer_cap_generation[UT_PEER_X] = 42;
+	request.requester_owner.bytes[36] = 1;
 	request.base.request_id = 321;
 	request.base.epoch = 9;
 	request.base.requester_backend_id = 17;
@@ -2810,13 +2815,66 @@ UT_TEST(test_capacity_wait_membership_and_cancel_remove_subscription)
 	}
 }
 
+UT_TEST(test_owner_refusal_echo_is_bound_and_old_or_changed_owner_is_rejected)
+{
+	ClusterR4CrOwnerChallenge owner = { .top_fxid = FullTransactionIdFromEpochAndXid(9, 100),
+										.active_lsn = 123,
+										.segment_id = 1,
+										.segment_generation = 23,
+										.top_xid = 100,
+										.slot_offset = 3,
+										.slot_wrap = 8,
+										.origin_instance = UT_PEER_X + 1,
+										.publish_state = CLUSTER_CANONICAL_TXN_PUBLISHED,
+										.flags = CLUSTER_R4_CR_OWNER_PRESENT };
+	ClusterR4CrOwnerWire wire;
+	GcsBlockReplyHeader hdr = ut_r4_refusal_header(GCS_BLOCK_REPLY_R4_DENIED, 0);
+	GcsBlockR4ReplyExpectation expected = { 0 };
+	ClusterICEnvelope env = { 0 };
+
+	ut_reset_log();
+	ut_r4_real_checksum = true;
+	ut_peer_capabilities[UT_PEER_X] = R4_CR_REQUIRED_HELLO_CAPS;
+	ut_peer_cap_generation[UT_PEER_X] = 42;
+	UT_ASSERT(ClusterR4CrOwnerWireSet(&wire, &owner));
+	UT_ASSERT(cluster_lms_outbound_enqueue_r4_refusal_cap_bound(2, UT_PEER_X, &hdr, &wire,
+																R4_CR_REQUIRED_HELLO_CAPS, 42));
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(2), 1);
+	UT_ASSERT_EQ(ut_sent_log[0].payload_len, CLUSTER_R4_CR_REPLY_PAYLOAD_SIZE);
+	expected.request_id = hdr.request_id;
+	expected.epoch = hdr.epoch;
+	expected.requester_backend_id = hdr.requester_backend_id;
+	expected.sender_node = hdr.sender_node;
+	expected.transition_id = hdr.transition_id;
+	expected.forwarding_master_node = GCS_BLOCK_REPLY_NO_FORWARDING_MASTER;
+	expected.reply_domain = CLUSTER_GCS_BLOCK_REPLY_DOMAIN_R4_CR;
+	expected.owner_bound = true;
+	expected.requester_owner = owner;
+	env.msg_type = PGRAC_IC_MSG_GCS_BLOCK_REPLY;
+	env.source_node_id = hdr.sender_node;
+	env.dest_node_id = UT_PEER_X;
+	env.payload_length = sizeof(ut_r4_reply_payload);
+	cluster_node_id = UT_PEER_X;
+	UT_ASSERT(gcs_block_decode_r4_reply_payload(&env, ut_r4_reply_payload, &expected));
+	expected.requester_owner.segment_generation++;
+	UT_ASSERT(!gcs_block_decode_r4_reply_payload(&env, ut_r4_reply_payload, &expected));
+	expected.requester_owner = owner;
+	env.payload_length = GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE;
+	UT_ASSERT(!gcs_block_decode_r4_reply_payload(&env, ut_r4_reply_payload, &expected));
+	cluster_node_id = 0;
+	wire.bytes[36] = 0;
+	UT_ASSERT(!cluster_lms_outbound_enqueue_r4_refusal_cap_bound(2, UT_PEER_X, &hdr, &wire,
+																 R4_CR_REQUIRED_HELLO_CAPS, 42));
+}
+
 int
 main(void)
 {
-	UT_PLAN(61);
+	UT_PLAN(62);
 
 	UT_RUN(test_normal_stop_missing_outbound_is_not_empty);
 	UT_RUN(test_ring_shmem_init);
+	UT_RUN(test_owner_refusal_echo_is_bound_and_old_or_changed_owner_is_rejected);
 	UT_RUN(test_admitted_frame_is_never_resubmitted);
 	UT_RUN(test_blocked_peer_does_not_starve_other_peer);
 	UT_RUN(test_refused_frame_retained_and_delivered);

@@ -103,9 +103,10 @@ StaticAssertDecl(sizeof(ClusterLmsOutboundSlot) == 408,
 typedef struct ClusterLmsZeroBlockReplyWire {
 	GcsBlockReplyHeader header;
 	char block_data[GCS_BLOCK_DATA_SIZE];
+	ClusterR4CrOwnerWire requester_owner;
 } ClusterLmsZeroBlockReplyWire;
 
-StaticAssertDecl(sizeof(ClusterLmsZeroBlockReplyWire) == GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE,
+StaticAssertDecl(sizeof(ClusterLmsZeroBlockReplyWire) == CLUSTER_R4_CR_REPLY_PAYLOAD_SIZE,
 				 "staged zero-block reply must preserve the GCS reply wire size");
 
 typedef struct ClusterLmsOutboundState {
@@ -910,7 +911,8 @@ static bool
 lms_outbound_enqueue_zero_block_reply_internal(int worker_id, uint32 dest_node_id,
 											   const GcsBlockReplyHeader *header, bool direct_land,
 											   uint32 required_capability,
-											   uint32 connection_generation)
+											   uint32 connection_generation,
+											   const ClusterR4CrOwnerWire *owner)
 {
 	ClusterLmsOutboundState *ring;
 	LWLock *lock;
@@ -925,6 +927,13 @@ lms_outbound_enqueue_zero_block_reply_internal(int worker_id, uint32 dest_node_i
 			return false;
 	} else if (header->status != (uint8)GCS_BLOCK_REPLY_DENIED_PENDING_X)
 		return false;
+	if (owner != NULL) {
+		ClusterR4CrOwnerChallenge decoded;
+
+		if (!r4_cap_bound || !ClusterR4CrOwnerWireGet(owner, &decoded)
+			|| !ClusterR4CrOwnerForRequester(&decoded, (int32)dest_node_id))
+			return false;
+	}
 	if (cluster_lms_outbound_rings == NULL || OB_LOCK(worker_id) == NULL)
 		return false;
 
@@ -940,10 +949,12 @@ lms_outbound_enqueue_zero_block_reply_internal(int worker_id, uint32 dest_node_i
 	slot->msg_type = PGRAC_IC_MSG_GCS_BLOCK_REPLY;
 	slot->kind = (uint8)(direct_land ? CLUSTER_LMS_OUTBOUND_DIRECT_ZERO_BLOCK_REPLY
 									 : CLUSTER_LMS_OUTBOUND_ZERO_BLOCK_REPLY);
-	slot->payload_len = sizeof(*header);
+	slot->payload_len = sizeof(*header) + (owner != NULL ? sizeof(*owner) : 0);
 	slot->required_capability = required_capability;
 	slot->connection_generation = connection_generation;
 	memcpy(slot->payload, header, sizeof(*header));
+	if (owner != NULL)
+		memcpy(slot->payload + sizeof(*header), owner, sizeof(*owner));
 	ring->head = (ring->head + 1) % PGRAC_LMS_OUTBOUND_CAPACITY;
 	ring->count++;
 	LWLockRelease(lock);
@@ -958,11 +969,11 @@ cluster_lms_outbound_enqueue_zero_block_reply(int worker_id, uint32 dest_node_id
 											  const GcsBlockReplyHeader *header, bool direct_land)
 {
 	return lms_outbound_enqueue_zero_block_reply_internal(worker_id, dest_node_id, header,
-														  direct_land, 0, 0);
+														  direct_land, 0, 0, NULL);
 }
 
 /* PGRAC R4 adaptation: stage a typed 25/26 refusal on the requester's exact
- * HELLO-authenticated connection.  The existing DATA slot remains 144 bytes;
+ * HELLO-authenticated connection.  The existing DATA slot is unchanged;
  * only the 48-byte header is retained until drain expands the zero page. */
 bool
 cluster_lms_outbound_enqueue_zero_block_reply_cap_bound(int worker_id, uint32 dest_node_id,
@@ -973,7 +984,22 @@ cluster_lms_outbound_enqueue_zero_block_reply_cap_bound(int worker_id, uint32 de
 	if (required_capability == 0)
 		return false;
 	return lms_outbound_enqueue_zero_block_reply_internal(
-		worker_id, dest_node_id, header, false, required_capability, connection_generation);
+		worker_id, dest_node_id, header, false, required_capability, connection_generation, NULL);
+}
+
+/* CR refusals echo the same requester challenge; internal verdict refusals
+ * retain their original header-only staging and wire length. */
+bool
+cluster_lms_outbound_enqueue_r4_refusal_cap_bound(int worker_id, uint32 dest_node_id,
+												  const GcsBlockReplyHeader *header,
+												  const ClusterR4CrOwnerWire *owner,
+												  uint32 required_capability,
+												  uint32 connection_generation)
+{
+	if (required_capability == 0 || owner == NULL)
+		return false;
+	return lms_outbound_enqueue_zero_block_reply_internal(
+		worker_id, dest_node_id, header, false, required_capability, connection_generation, owner);
 }
 
 /* A missing first DATA stream leaves the logical request owned by this ring.
@@ -1247,7 +1273,9 @@ cluster_lms_outbound_drain_send(int worker_id)
 		} else if (slot.kind == (uint8)CLUSTER_LMS_OUTBOUND_ZERO_BLOCK_REPLY
 				   || slot.kind == (uint8)CLUSTER_LMS_OUTBOUND_DIRECT_ZERO_BLOCK_REPLY) {
 			if (slot.msg_type != PGRAC_IC_MSG_GCS_BLOCK_REPLY
-				|| slot.payload_len != sizeof(GcsBlockReplyHeader)) {
+				|| (slot.payload_len != sizeof(GcsBlockReplyHeader)
+					&& slot.payload_len
+						   != sizeof(GcsBlockReplyHeader) + CLUSTER_R4_CR_OWNER_WIRE_BYTES)) {
 				rc = CLUSTER_IC_SEND_HARD_ERROR;
 				goto handle_send_result;
 			}
@@ -1263,9 +1291,23 @@ cluster_lms_outbound_drain_send(int worker_id)
 				rc = CLUSTER_IC_SEND_HARD_ERROR;
 				goto handle_send_result;
 			}
+			if (slot.payload_len != sizeof(GcsBlockReplyHeader)) {
+				ClusterR4CrOwnerChallenge decoded;
+
+				memcpy(&zero_reply.requester_owner, slot.payload + sizeof(GcsBlockReplyHeader),
+					   sizeof(zero_reply.requester_owner));
+				if (slot.required_capability == 0
+					|| !ClusterR4CrOwnerWireGet(&zero_reply.requester_owner, &decoded)
+					|| !ClusterR4CrOwnerForRequester(&decoded, (int32)slot.dest_node_id)) {
+					rc = CLUSTER_IC_SEND_HARD_ERROR;
+					goto handle_send_result;
+				}
+			}
 			zero_reply.header.checksum = cluster_gcs_block_compute_checksum(zero_reply.block_data);
 			send_payload = &zero_reply;
-			send_payload_len = sizeof(zero_reply);
+			send_payload_len = slot.payload_len == sizeof(GcsBlockReplyHeader)
+								   ? GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE
+								   : sizeof(zero_reply);
 		} else if (slot.kind != (uint8)CLUSTER_LMS_OUTBOUND_FRAME
 				   && slot.kind != (uint8)CLUSTER_LMS_OUTBOUND_BLOCK_REQUEST) {
 			rc = CLUSTER_IC_SEND_HARD_ERROR;

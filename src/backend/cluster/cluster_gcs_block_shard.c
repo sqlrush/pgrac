@@ -178,9 +178,10 @@ cluster_gcs_block_payload_shard(uint8 msg_type, const void *payload, uint16 payl
 			tag = &((const GcsBlockFirstFillForwardPayload *)payload)->forward.tag;
 			break;
 		}
-		if (payload_len == CLUSTER_CTRC_SEAL_REQUEST_BYTES) {
-			if (!cluster_ctrc_payload_route_tag(payload, payload_len, &route_tag))
-				return -1;
+		/* The new CR carrier and CTRC are both 136 bytes. Decode CTRC's
+		 * explicit format before considering the independent CR shape. */
+		if (payload_len == CLUSTER_CTRC_SEAL_REQUEST_BYTES
+			&& cluster_ctrc_payload_route_tag(payload, payload_len, &route_tag)) {
 			tag = &route_tag;
 			break;
 		}
@@ -201,7 +202,8 @@ cluster_gcs_block_payload_shard(uint8 msg_type, const void *payload, uint16 payl
 			break;
 		}
 		if (payload_len != sizeof(GcsBlockForwardPayload)
-			&& payload_len != sizeof(ClusterR4CrForwardPayload))
+			&& payload_len != sizeof(ClusterR4CrForwardPayload)
+			&& payload_len != sizeof(ClusterR4InternalForwardPayload))
 			return -1;
 		if (payload_len == sizeof(GcsBlockForwardPayload)
 			&& GcsBlockForwardPayloadIsFirstFillS(payload))
@@ -211,14 +213,26 @@ cluster_gcs_block_payload_shard(uint8 msg_type, const void *payload, uint16 payl
 		 * Kind-4 additionally requires its internal endpoint; kind-2 keeps
 		 * the positive backend id of the physical R4_CR reply slot.  Every
 		 * other exact FORWARD96 retains the legacy tag shard. */
-		if (payload_len == sizeof(ClusterR4CrForwardPayload)) {
-			const ClusterR4CrForwardPayload *r4 = (const ClusterR4CrForwardPayload *)payload;
+		if (payload_len == sizeof(ClusterR4InternalForwardPayload)) {
+			const ClusterR4InternalForwardPayload *r4 = payload;
 
-			if (r4->extension.r4_version == CLUSTER_R4_WIRE_VERSION
-				&& (r4->extension.r4_kind == CLUSTER_R4_WIRE_TX_RESOLVE
-					|| (r4->base.requester_backend_id == CLUSTER_GCS_BLOCK_R4_INTERNAL_ENDPOINT
-						&& r4->extension.r4_kind == CLUSTER_R4_WIRE_UNDO_DATA_FETCH)))
+			if (r4->extension.r4_version != CLUSTER_R4_WIRE_VERSION
+				|| (r4->extension.r4_kind != CLUSTER_R4_WIRE_TX_RESOLVE
+					&& r4->extension.r4_kind != CLUSTER_R4_WIRE_UNDO_DATA_FETCH))
+				return -1;
+			if (r4->extension.r4_kind == CLUSTER_R4_WIRE_TX_RESOLVE
+				|| r4->base.requester_backend_id == CLUSTER_GCS_BLOCK_R4_INTERNAL_ENDPOINT)
 				return n_workers > 0 ? 0 : -1;
+		}
+		if (payload_len == sizeof(ClusterR4CrForwardPayload)) {
+			const ClusterR4CrForwardPayload *r4 = payload;
+			ClusterR4CrOwnerChallenge owner;
+
+			if (r4->extension.r4_version != CLUSTER_R4_WIRE_VERSION
+				|| r4->extension.r4_kind != CLUSTER_R4_WIRE_CR_BUILD
+				|| !ClusterR4CrOwnerWireGet(&r4->requester_owner, &owner)
+				|| !ClusterR4CrOwnerForRequester(&owner, r4->base.original_requester_node))
+				return -1;
 		}
 		tag = &((const GcsBlockForwardPayload *)payload)->tag;
 		break;

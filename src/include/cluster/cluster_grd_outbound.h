@@ -134,12 +134,12 @@ StaticAssertDecl(PGRAC_GES_CLEANUP_DIRTY_WARN50_DEPTH < PGRAC_GES_CLEANUP_DIRTY_
 StaticAssertDecl(PGRAC_GES_CLEANUP_DIRTY_WARN90_DEPTH < PGRAC_GES_CLEANUP_DIRTY_BUDGET,
 				 "cleanup retry 90 percent warning must precede exhaustion");
 
-/* The largest request is the 80-byte PRE2 parallel-group payload.
+/* The largest request is the 120-byte R4 CR owner challenge payload.
  * cluster_grd_outbound.c statically couples this limit to GesRequestPayload. */
-#define PGRAC_GES_OUTBOUND_PAYLOAD_MAX 80
+#define PGRAC_GES_OUTBOUND_PAYLOAD_MAX 120
 
 /*
- * Ring slot — fixed 80B payload + envelope metadata.
+ * Ring slot — fixed 120B payload + envelope metadata.
  *
  *   dest_node_id:  receiver cluster_node_id (single peer; broadcast
  *                  reserved for spec-2.18 LMS)
@@ -157,8 +157,8 @@ typedef struct ClusterGrdOutboundSlot {
 	uint8 payload[PGRAC_GES_OUTBOUND_PAYLOAD_MAX];
 } ClusterGrdOutboundSlot;
 
-StaticAssertDecl(sizeof(ClusterGrdOutboundSlot) == 88,
-				 "ClusterGrdOutboundSlot: 8 metadata + 80 payload");
+StaticAssertDecl(sizeof(ClusterGrdOutboundSlot) == 128,
+				 "ClusterGrdOutboundSlot: 8 metadata + 120 payload");
 
 /* Shmem lifecycle */
 extern Size cluster_grd_outbound_shmem_size(void);

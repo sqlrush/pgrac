@@ -712,7 +712,8 @@
  * Fresh homogeneous databases only; not an in-place/rolling format upgrade. */
 /* Target FULL CR diagnostic entry (oid 8980). Fresh homogeneous initdb only. */
 /* PGRAC: operation payload identity; fresh homogeneous initdb only. */
-#define CATALOG_VERSION_NO 202610270
+/* PGRAC: R4 exact requester-owner wire; fresh homogeneous initdb only. */
+#define CATALOG_VERSION_NO 202610301
 
 /* spec-5.13 (2026-06-27): clean-leave catalog surface — cluster_get_clean_leave_state
  * SRF (oid 8960) + pg_cluster_clean_leave_state view + pg_cluster_clean_leave_request

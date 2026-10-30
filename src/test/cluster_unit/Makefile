@@ -92,7 +92,7 @@ TESTS = test_cluster_relmap_lock test_cluster_vm_read_visibility test_cluster_he
 		test_cluster_r4_d10_hint_source test_cluster_r4_d10_tt_source test_cluster_r4_d10_multi_source \
         test_cluster_undo_format \
         test_cluster_recovery_c0_plan test_cluster_checkpoint_stamp test_cluster_recovery_stamp test_cluster_recovery_tt_record test_cluster_recovery_ctrc_record test_cluster_d0_native_reader test_cluster_recovery_tt_io \
-		test_cluster_undo_record test_cluster_undo_lifecycle test_cluster_undo_block0 test_cluster_undo_block0_current test_cluster_undo_smgr_publication test_cluster_terminal_ref_census test_cluster_cr test_cluster_cr_cache test_cluster_cr_shared_route test_cluster_cr_key test_cluster_cr_pool test_cluster_cr_lifecycle test_cluster_cr_admit test_cluster_cr_admit_stat test_cluster_cr_tuple test_cluster_cr_tuple_stat test_cluster_resolver_cache test_cluster_cr_coordinator test_cluster_r4_static_model test_cluster_r4_tx_locator test_cluster_r4_tx_outcome test_cluster_r4_tx_enqueue test_cluster_r4_wire_codec test_cluster_r4_route_policy test_cluster_r4_slot_machine test_cluster_r4_lms_controls test_cluster_r4_slot_reservation test_cluster_r4_observe test_cluster_r4_cr_walk test_cluster_r4_multi_subx_2pc test_cluster_r4_activation_record test_cluster_r4_activation_fsm test_cluster_r4_lock_order test_cluster_r4_scratch_resolver test_cluster_tt_durable test_cluster_terminal_authority test_cluster_sf_dep \
+		test_cluster_undo_record test_cluster_undo_lifecycle test_cluster_undo_block0 test_cluster_undo_block0_current test_cluster_undo_smgr_publication test_cluster_terminal_ref_census test_cluster_cr test_cluster_cr_cache test_cluster_cr_shared_route test_cluster_cr_key test_cluster_cr_pool test_cluster_cr_lifecycle test_cluster_cr_admit test_cluster_cr_admit_stat test_cluster_cr_tuple test_cluster_cr_tuple_stat test_cluster_resolver_cache test_cluster_cr_coordinator test_cluster_r4_static_model test_cluster_r4_tx_locator test_cluster_r4_tx_outcome test_cluster_r4_tx_enqueue test_cluster_r4_wire_codec test_cluster_r4_owner_challenge test_cluster_r4_route_policy test_cluster_r4_slot_machine test_cluster_r4_lms_controls test_cluster_r4_slot_reservation test_cluster_r4_observe test_cluster_r4_cr_walk test_cluster_r4_multi_subx_2pc test_cluster_r4_activation_record test_cluster_r4_activation_fsm test_cluster_r4_lock_order test_cluster_r4_scratch_resolver test_cluster_tt_durable test_cluster_terminal_authority test_cluster_sf_dep \
         test_cluster_r4_itl_capacity \
         test_cluster_retention test_cluster_undo_cleaner test_cluster_visibility_variants test_cluster_writer_chain test_cluster_tt_2pc \
         test_cluster_stage3_acceptance test_cluster_undo_buf test_cluster_undo_extent test_cluster_undo_extent_claim \
@@ -7557,7 +7557,7 @@ test_cluster_r4_tx_outcome: test_cluster_r4_tx_outcome.c unit_test.h \
 		test_cluster_savepoint_origin_plan.inc $(CLUSTER_SAVEPOINT_READER_O) \
 		test_cluster_savepoint_origin_driver.inc \
 		test_cluster_savepoint_cr_consumer.inc test_cluster_savepoint_origin_poll.inc \
-		test_cluster_savepoint_origin_worker.inc $(CLUSTER_OPERATION_WORKER_TEST_O) \
+		test_cluster_savepoint_origin_worker.inc test_cluster_savepoint_owner_worker.inc test_cluster_owner_full_fixture.h $(CLUSTER_OPERATION_WORKER_TEST_O) \
 		test_cluster_hot_bufpage_product.o test_cluster_operation_cr_entry.inc \
 		$(top_builddir)/src/backend/cluster/cluster_cr_apply.o \
 		$(top_srcdir)/src/include/cluster/cluster_cr.h \
@@ -7632,10 +7632,11 @@ test_cluster_gcs_read_rearm_owner.inc: $(top_srcdir)/src/backend/storage/buffer/
 	     /^cluster_bufmgr_pcm_begin_grant_reservation_wait\(/ { print "static ClusterPcmOwnResult"; emit=1; begin_wait++ } \
 	     /^typedef enum ClusterBufmgrPcmRetryRearmResult/ { emit=1; result_type++ } \
 	     /^cluster_bufmgr_pcm_retry_denied_rearm\(/ { print "static ClusterBufmgrPcmRetryRearmResult"; emit=1; rearm++ } \
+	     /^cluster_bufmgr_pcm_abort_shared_owned\(/ { print "static ClusterPcmOwnResult"; emit=1; shared_abort++ } \
 	     /^cluster_bufmgr_pcm_acquire_shared_owned\(/ { print "static bool"; emit=1; shared_owner++ } \
 	     /^LockBufHdr\(/ { print "uint32"; emit=1; header_lock++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (begin != 1 || cancel != 1 || observe != 1 || wait_owner != 1 || begin_wait != 1 || result_type != 1 || rearm != 1 || shared_owner != 1 || header_lock != 1 || emit) exit 1 }' $< > $@.tmp
+	     END { if (begin != 1 || cancel != 1 || observe != 1 || wait_owner != 1 || begin_wait != 1 || result_type != 1 || rearm != 1 || shared_owner != 1 || shared_abort != 1 || header_lock != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_current_mx_reply_builder.inc: $(top_srcdir)/src/backend/cluster/cluster_cr_server.c Makefile
@@ -7645,6 +7646,7 @@ test_cluster_current_mx_reply_builder.inc: $(top_srcdir)/src/backend/cluster/clu
 	mv $@.tmp $@
 
 test_cluster_r4_route_policy: test_cluster_r4_route_policy.c unit_test.h \
+		test_cluster_r4_forward_ingress_boundaries.inc \
 		$(top_srcdir)/src/include/cluster/cluster_runtime_visibility.h \
 		test_cluster_current_mx_reply_builder.inc \
 		test_cluster_pcm_snapshot_owner.inc test_cluster_gcs_read_rearm_owner.inc \
@@ -9760,7 +9762,16 @@ test_cluster_scratch_operation_entry.inc: $(top_srcdir)/src/backend/cluster/clus
 
 TESTS += test_cluster_scratch_self
 all: test_cluster_scratch_self
+test_cluster_scratch_itl_ref.inc: $(top_srcdir)/src/backend/cluster/cluster_itl.c \
+		$(top_srcdir)/src/backend/cluster/cluster_tx_resolve.c
+	awk '/^cluster_itl_get_tt_ref\(/ { n++; if (n == 1) { print "static bool"; emit=1 } } \
+	     /^cluster_tx_locator_from_itl\(/ { print "static bool"; emit=1; locator++ } \
+	     emit { print } /^}/ { emit=0 } END { if (n != 2 || locator != 1) exit 1 }' $^ > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_scratch_self: test_cluster_scratch_self.c test_cluster_r4_scratch_resolver.c \
+        test_cluster_owner_full_fixture.h test_cluster_r4_tx_outcome \
+        test_cluster_scratch_itl_ref.inc \
         test_cluster_scratch_nonowner.inc \
         test_cluster_scratch_operation_entry.inc \
         test_cluster_native_prehistory_proof.inc cluster_snapshot_test_stubs.h unit_test.h \
@@ -13134,3 +13145,7 @@ test_cluster_first_fill_retire: test_cluster_first_fill_retire.c test_cluster_pc
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-DBUFMGR_SOURCE_PATH='"$(top_srcdir)/src/backend/storage/buffer/bufmgr.c"' \
 		$< $(CLUSTER_PCM_OWN_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# Exact new-cluster requester owner carrier (the generic standalone recipe).
+test_cluster_r4_owner_challenge: $(top_srcdir)/src/include/cluster/cluster_gcs_block.h \
+		$(top_srcdir)/src/include/cluster/cluster_grd_outbound.h

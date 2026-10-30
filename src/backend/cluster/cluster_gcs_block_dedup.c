@@ -489,7 +489,8 @@ dedup_r4_route_proof_equal(const ClusterR4CrRouteProof *left, const ClusterR4CrR
 		   && left->master_resource_transition_count == right->master_resource_transition_count
 		   && left->expected_page_scn == right->expected_page_scn
 		   && left->real_master_node == right->real_master_node
-		   && left->selected_holder_node == right->selected_holder_node;
+		   && left->selected_holder_node == right->selected_holder_node
+		   && ClusterR4CrOwnerEqual(&left->requester_owner, &right->requester_owner);
 }
 
 static bool
@@ -512,6 +513,8 @@ dedup_r4_route_input_valid(const GcsBlockR4RouteIdentity *identity, uint8 transi
 	return identity != NULL && proof != NULL && identity->legacy_key.request_id != 0
 		   && identity->legacy_key.requester_backend_id > 0
 		   && identity->legacy_key.origin_node_id < RESOURCE_X_PROTOCOL_NODE_LIMIT
+		   && ClusterR4CrOwnerForRequester(&proof->requester_owner,
+										   identity->legacy_key.origin_node_id)
 		   && identity->activation_generation != 0 && SCN_VALID(identity->read_scn)
 		   && memcmp(&identity->tag, &proof->tag, sizeof(BufferTag)) == 0
 		   && proof->read_scn == identity->read_scn

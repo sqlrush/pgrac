@@ -285,52 +285,52 @@ typedef struct ClusterR4CrSlotExtension {
 
 StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, route_proof) == 0,
 				 "R4 slot route-proof offset");
-StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, owner) == 80, "R4 slot owner-stamp offset");
-StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, slot_generation) == 112,
+StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, owner) == 120, "R4 slot owner-stamp offset");
+StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, slot_generation) == 152,
 				 "R4 slot generation offset");
-StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, foreign_request_id) == 120,
+StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, foreign_request_id) == 160,
 				 "R4 slot foreign-request offset");
-StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, foreign_uba) == 128,
+StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, foreign_uba) == 168,
 				 "R4 slot foreign-UBA offset");
-StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, copied_page_lsn) == 144,
+StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, copied_page_lsn) == 184,
 				 "R4 slot copied-LSN offset");
-StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, copied_page_scn) == 152,
+StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, copied_page_scn) == 192,
 				 "R4 slot copied-SCN offset");
-StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, origin_formation_epoch) == 160,
+StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, origin_formation_epoch) == 200,
 				 "R4 slot origin-formation offset");
-StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, origin_live_hwm_lsn) == 168,
+StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, origin_live_hwm_lsn) == 208,
 				 "R4 slot reply-borne live-HWM offset");
-StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, origin_tt_generation) == 176,
+StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, origin_tt_generation) == 216,
 				 "R4 slot reply-borne TT-generation offset");
-StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, origin_authority_scn) == 184,
+StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, origin_authority_scn) == 224,
 				 "R4 slot reply-borne authority-SCN offset");
-StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, requester_capability_generation) == 192,
+StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, requester_capability_generation) == 232,
 				 "R4 slot requester-capability offset");
-StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, master_capability_generation) == 196,
+StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, master_capability_generation) == 236,
 				 "R4 slot master-capability offset");
-StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, foreign_origin_node) == 200,
+StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, foreign_origin_node) == 240,
 				 "R4 slot foreign-origin offset");
-StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, foreign_segment_id) == 204,
+StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, foreign_segment_id) == 244,
 				 "R4 slot foreign-segment offset");
-StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, foreign_block_no) == 208,
+StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, foreign_block_no) == 248,
 				 "R4 slot foreign-block offset");
-StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, foreign_xid) == 212,
+StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, foreign_xid) == 252,
 				 "R4 slot foreign-xid offset");
-StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, foreign_wrap) == 216,
+StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, foreign_wrap) == 256,
 				 "R4 slot foreign-wrap offset");
-StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, build_steps) == 220,
+StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, build_steps) == 260,
 				 "R4 slot build-steps offset");
-StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, foreign_tt_slot_offset) == 224,
+StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, foreign_tt_slot_offset) == 264,
 				 "R4 slot foreign-TT-slot offset");
-StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, foreign_row_offset) == 226,
+StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, foreign_row_offset) == 266,
 				 "R4 slot foreign-row offset");
-StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, terminal_reason) == 228,
+StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, terminal_reason) == 268,
 				 "R4 slot terminal-reason offset");
-StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, flags) == 229, "R4 slot flags offset");
-StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, reserved) == 230, "R4 slot reserved offset");
-StaticAssertDecl(sizeof(ClusterR4CrSlotExtension) == 256,
-				 "R4 slot extension must remain exactly 256 bytes");
-StaticAssertDecl(MAXALIGN(sizeof(ClusterR4CrSlotExtension)) == 256,
+StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, flags) == 269, "R4 slot flags offset");
+StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, reserved) == 270, "R4 slot reserved offset");
+StaticAssertDecl(sizeof(ClusterR4CrSlotExtension) == 296,
+				 "R4 slot extension must remain exactly 296 bytes");
+StaticAssertDecl(MAXALIGN(sizeof(ClusterR4CrSlotExtension)) == 296,
 				 "R4 slot extension must add no alignment padding");
 StaticAssertDecl(MAXALIGN(BLCKSZ) == BLCKSZ, "R4 foreign page must add no alignment padding");
 
@@ -386,14 +386,14 @@ StaticAssertDecl(sizeof(((ClusterLmsCrSlot *)0)->result_page) == BLCKSZ,
 StaticAssertDecl(offsetof(ClusterLmsCrSlot, r4) == offsetof(ClusterLmsCrSlot, result_page) + BLCKSZ,
 				 "R4 metadata must immediately follow legacy result_page");
 StaticAssertDecl(offsetof(ClusterLmsCrSlot, foreign_undo_page)
-					 == offsetof(ClusterLmsCrSlot, r4) + 256,
+					 == offsetof(ClusterLmsCrSlot, r4) + 296,
 				 "R4 foreign scratch must immediately follow metadata");
-StaticAssertDecl(sizeof(ClusterLmsCrSlot) == offsetof(ClusterLmsCrSlot, r4) + 256 + BLCKSZ,
-				 "R4 slot increment must remain exactly 8448 bytes");
-StaticAssertDecl(sizeof(ClusterR4CrSlotExtension) + BLCKSZ == 8448,
-				 "R4 per-slot increment must remain exactly 8448 bytes");
-StaticAssertDecl(CLUSTER_LMS_CR_SLOTS * (sizeof(ClusterR4CrSlotExtension) + BLCKSZ) == 33792,
-				 "R4 four-slot increment must remain exactly 33792 bytes");
+StaticAssertDecl(sizeof(ClusterLmsCrSlot) == offsetof(ClusterLmsCrSlot, r4) + 296 + BLCKSZ,
+				 "R4 slot increment must remain exactly 8488 bytes");
+StaticAssertDecl(sizeof(ClusterR4CrSlotExtension) + BLCKSZ == 8488,
+				 "R4 per-slot increment must remain exactly 8488 bytes");
+StaticAssertDecl(CLUSTER_LMS_CR_SLOTS * (sizeof(ClusterR4CrSlotExtension) + BLCKSZ) == 33952,
+				 "R4 four-slot increment must remain exactly 33952 bytes");
 
 /* CR-server counter buckets (bumped into the ClusterCRShared region owned
  * by cluster_cr.c). */

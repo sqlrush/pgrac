@@ -875,10 +875,59 @@ int TT_ACTIVE_OWNER_FIXTURE_MAIN(void);
 #define main TT_ACTIVE_OWNER_FIXTURE_MAIN
 #endif
 
+UT_TEST(test_typed_binding_capture_distinguishes_no_owner_from_partial_publication)
+{
+	ClusterCanonicalTxnBinding binding, saved;
+	ClusterTTLocalBinding local;
+
+	reset_active_owner();
+	memset(&binding, 0xa5, sizeof(binding));
+	UT_ASSERT_EQ(cluster_tt_local_capture_canonical_binding(100, &binding),
+				 CLUSTER_CANONICAL_TXN_NONE);
+	UT_ASSERT_EQ(binding.active_lsn, 0);
+	require_published_on(1);
+	UT_ASSERT_EQ(cluster_tt_local_capture_canonical_binding(100, &saved),
+				 CLUSTER_CANONICAL_TXN_PUBLISHED);
+	local = cluster_tt_local_bindings[0];
+	for (int state = CLUSTER_CANONICAL_TXN_RESERVED; state <= CLUSTER_CANONICAL_TXN_FAILED;
+		 state++) {
+		cluster_tt_local_bindings[0].publish_state = state;
+		UT_ASSERT_EQ(cluster_tt_local_capture_canonical_binding(100, &binding), state);
+		if (state == CLUSTER_CANONICAL_TXN_PUBLISHED)
+			UT_ASSERT_EQ(memcmp(&binding, &saved, sizeof(binding)), 0);
+		else
+			UT_ASSERT_EQ(binding.active_lsn, 0);
+	}
+	cluster_tt_local_bindings[0] = local;
+	cluster_tt_local_bindings[0].active_lsn = InvalidXLogRecPtr;
+	UT_ASSERT_EQ(cluster_tt_local_capture_canonical_binding(100, &binding),
+				 CLUSTER_CANONICAL_TXN_FAILED);
+	UT_ASSERT_EQ(binding.active_lsn, 0);
+	UT_ASSERT_EQ(cluster_tt_local_capture_canonical_binding(100, NULL),
+				 CLUSTER_CANONICAL_TXN_FAILED);
+}
+
+UT_TEST(test_typed_capture_never_projects_malformed_registry_as_no_owner)
+{
+	ClusterCanonicalTxnBinding binding;
+	const uint8 states[] = { 0, 255 };
+
+	reset_active_owner();
+	require_published_on(1);
+	for (unsigned i = 0; i < lengthof(states); i++) {
+		cluster_tt_local_bindings[0].publish_state = states[i];
+		UT_ASSERT_EQ(cluster_tt_local_capture_canonical_binding(100, &binding),
+					 CLUSTER_CANONICAL_TXN_FAILED);
+		UT_ASSERT_EQ(binding.active_lsn, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(24);
+	UT_PLAN(26);
+	UT_RUN(test_typed_capture_never_projects_malformed_registry_as_no_owner);
+	UT_RUN(test_typed_binding_capture_distinguishes_no_owner_from_partial_publication);
 	UT_RUN(test_recovered_open_gate_precedes_canonical_reservation);
 	UT_RUN(test_binding_memory_error_precedes_allocator_and_cold_selection);
 	UT_RUN(test_binding_growth_error_preserves_existing_reservations);

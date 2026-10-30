@@ -463,6 +463,7 @@ assert_proof_exact(const ClusterR4CrRouteProof *actual, const ClusterR4CrRoutePr
 	UT_ASSERT_EQ(actual->expected_page_scn, expected->expected_page_scn);
 	UT_ASSERT_EQ(actual->real_master_node, expected->real_master_node);
 	UT_ASSERT_EQ(actual->selected_holder_node, expected->selected_holder_node);
+	UT_ASSERT(ClusterR4CrOwnerEqual(&actual->requester_owner, &expected->requester_owner));
 }
 
 static GcsBlockR4RouteArmResult
@@ -482,9 +483,9 @@ UT_TEST(test_route_abi_and_empty_count)
 {
 	fixture_reset(8);
 	UT_ASSERT_EQ(64, sizeof(GcsBlockR4RouteIdentity));
-	UT_ASSERT_EQ(128, sizeof(GcsBlockR4RouteRecord));
-	UT_ASSERT_EQ(128, sizeof(GcsBlockDedupPayloadMeta));
-	UT_ASSERT_EQ(8472, sizeof(GcsBlockDedupEntry));
+	UT_ASSERT_EQ(168, sizeof(GcsBlockR4RouteRecord));
+	UT_ASSERT_EQ(168, sizeof(GcsBlockDedupPayloadMeta));
+	UT_ASSERT_EQ(8512, sizeof(GcsBlockDedupEntry));
 	UT_ASSERT_EQ(0, cluster_gcs_block_dedup_r4_route_count());
 }
 
@@ -1319,10 +1320,78 @@ UT_TEST(test_stop_route_handoff_is_not_total_cluster_completion)
 	IsUnderPostmaster = false;
 }
 
+UT_TEST(test_owner_challenge_is_exact_route_replay_and_send_identity)
+{
+	for (int fault = 0; fault < 9; fault++) {
+		GcsBlockR4RouteIdentity identity = make_identity(44, 3, 84, (SCN)144, 36);
+		ClusterR4CrRouteProof proof = make_proof(&identity, 2), drifted;
+		GcsBlockR4RouteRecord record;
+
+		proof.requester_owner
+			= (ClusterR4CrOwnerChallenge){ .top_fxid = FullTransactionIdFromEpochAndXid(9, 100),
+										   .active_lsn = 123,
+										   .segment_id = CLUSTER_UNDO_SEGS_PER_INSTANCE + 1,
+										   .segment_generation = 23,
+										   .top_xid = 100,
+										   .slot_offset = 3,
+										   .slot_wrap = 8,
+										   .origin_instance = 2,
+										   .publish_state = CLUSTER_CANONICAL_TXN_PUBLISHED,
+										   .flags = CLUSTER_R4_CR_OWNER_PRESENT };
+		fixture_reset(1);
+		UT_ASSERT_EQ(arm_route(&identity, &proof, &record), GCS_BLOCK_R4_ROUTE_ARM_NEW);
+		UT_ASSERT_EQ(arm_route(&identity, &proof, &record), GCS_BLOCK_R4_ROUTE_ARM_REPLAY);
+		assert_proof_exact(&record.proof, &proof);
+		drifted = proof;
+		switch (fault) {
+		case 0:
+			drifted.requester_owner.top_fxid = FullTransactionIdFromEpochAndXid(10, 100);
+			break;
+		case 1:
+			drifted.requester_owner.segment_generation++;
+			break;
+		case 2:
+			drifted.requester_owner.segment_id++;
+			break;
+		case 3:
+			drifted.requester_owner.slot_offset++;
+			break;
+		case 4:
+			drifted.requester_owner.slot_wrap++;
+			break;
+		case 5:
+			drifted.requester_owner.active_lsn++;
+			break;
+		case 6:
+			memset(&drifted.requester_owner, 0, sizeof(drifted.requester_owner));
+			break;
+		case 7:
+			drifted.requester_owner.origin_instance++;
+			break;
+		case 8:
+			drifted.requester_owner.publish_state = CLUSTER_CANONICAL_TXN_RESERVED;
+			break;
+		}
+		UT_ASSERT_EQ(arm_route(&identity, &drifted, &record),
+					 fault >= 7 ? GCS_BLOCK_R4_ROUTE_ARM_INVALID
+								: GCS_BLOCK_R4_ROUTE_ARM_HOLDER_MOVED);
+		UT_ASSERT_EQ(
+			cluster_gcs_block_dedup_r4_route_finish_send(0, &identity, TEST_ROUTE_TRANSITION,
+														 &drifted, true),
+			fault >= 7 ? GCS_BLOCK_R4_ROUTE_SEND_INVALID : GCS_BLOCK_R4_ROUTE_SEND_COLLISION);
+		UT_ASSERT_EQ(cluster_gcs_block_dedup_r4_route_finish_send(
+						 0, &identity, TEST_ROUTE_TRANSITION, &proof, true),
+					 GCS_BLOCK_R4_ROUTE_SEND_FORWARDED);
+		UT_ASSERT_EQ(arm_route(&identity, &proof, &record), GCS_BLOCK_R4_ROUTE_ARM_REPLAY);
+		assert_proof_exact(&record.proof, &proof);
+		UT_ASSERT_EQ(cluster_gcs_block_dedup_r4_route_count(), 1);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(36);
+	UT_PLAN(37);
 	UT_RUN(test_stop_route_handoff_is_not_total_cluster_completion);
 	UT_RUN(test_stop_seal_new_route_not_original_handoff_or_replay);
 	UT_RUN(test_route_abi_and_empty_count);
@@ -1359,6 +1428,7 @@ main(void)
 	UT_RUN(test_eager_reclaim_mixed_capacity_keeps_uncompleted_generic);
 	UT_RUN(test_done_rejects_uncompleted_or_malformed_route_without_mutation);
 	UT_RUN(test_done_anchor_in_monotonic_future_cannot_reclaim);
+	UT_RUN(test_owner_challenge_is_exact_route_replay_and_send_identity);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

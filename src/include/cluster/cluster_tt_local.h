@@ -76,6 +76,11 @@ extern bool cluster_tt_local_prepare_canonical_active(TransactionId top_xid,
 													  ClusterCanonicalTxnBinding *binding_out);
 extern bool cluster_tt_local_get_published_binding(TransactionId top_xid,
 												   ClusterCanonicalTxnBinding *binding_out);
+/* Exact backend publication state: NONE means this backend has no canonical
+ * publication for this top; partial/failed publication is never NO_OWNER. */
+extern ClusterCanonicalTxnPublishState
+cluster_tt_local_capture_canonical_binding(TransactionId top_xid,
+										   ClusterCanonicalTxnBinding *binding_out);
 
 /*
  * cluster_tt_local_record_commit -- install COMMITTED status for a

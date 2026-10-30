@@ -72,6 +72,8 @@ StaticAssertDecl(PGRAC_GES_OUTBOUND_PAYLOAD_MAX >= sizeof(GesRequestPayload),
 				 "GES outbound ring slot must hold a full GesRequestPayload");
 StaticAssertDecl(PGRAC_GES_OUTBOUND_PAYLOAD_MAX >= sizeof(GesReplyPayload),
 				 "GES outbound ring slot must hold a full GesReplyPayload");
+StaticAssertDecl(PGRAC_GES_OUTBOUND_PAYLOAD_MAX >= sizeof(ClusterR4CrRequestPayload),
+				 "backend outbound ring must hold the complete R4 CR owner challenge");
 
 
 /* ============================================================

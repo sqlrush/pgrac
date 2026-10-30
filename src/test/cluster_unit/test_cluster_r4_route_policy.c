@@ -7,6 +7,7 @@
  */
 #include "postgres.h"
 #include "cluster/cluster_content_trace.h"
+#include "cluster/cluster_block_io_trace.h"
 
 #include <setjmp.h>
 #include <sys/mman.h>
@@ -1005,7 +1006,7 @@ typedef struct RouteSeamCapture {
 	uint16 enqueue_payload_len;
 	uint32 enqueue_required_capability;
 	uint32 enqueue_connection_generation;
-	uint8 enqueue_payload[128];
+	uint8 enqueue_payload[sizeof(ClusterR4CrForwardPayload)];
 
 	int refusal_enqueue_worker;
 	uint32 refusal_enqueue_dest;
@@ -1015,7 +1016,7 @@ typedef struct RouteSeamCapture {
 	ClusterICEnvelope local_dispatch_envelope;
 	int32 local_dispatch_peer;
 	uint32 local_dispatch_payload_len;
-	uint8 local_dispatch_payload[128];
+	uint8 local_dispatch_payload[sizeof(ClusterR4CrForwardPayload)];
 	ClusterICEnvelope foreign_undo_env;
 	GcsBlockReplyHeader foreign_undo_header;
 	char foreign_undo_page[BLCKSZ];
@@ -1105,7 +1106,7 @@ typedef struct RequesterSendCapture {
 	uint32 dest_node;
 	uint16 payload_len;
 	ClusterR4CrRequestPayload request;
-	ClusterR4CrForwardPayload tx_forward;
+	ClusterR4InternalForwardPayload tx_forward;
 	bool tx_kind2;
 	bool tx_denied_reply;
 	bool tx_bad_verdict;
@@ -1136,6 +1137,74 @@ typedef struct RequesterSendCapture {
 	bool slot_armed_by_call[REQUESTER_REPLY_SCRIPT_CAPACITY];
 	uint8 slot_domain_by_call[REQUESTER_REPLY_SCRIPT_CAPACITY];
 } RequesterSendCapture;
+
+
+ClusterPcmReadSourceKind
+cluster_pcm_lock_acquire_buffer_source(BufferDesc *buf pg_attribute_unused(),
+									   ClusterPcmReadSource *source pg_attribute_unused())
+{
+	UT_ASSERT(false); /* This old-path fixture always passes NULL. */
+	return CLUSTER_PCM_SOURCE_RETRY;
+}
+
+static FullTransactionId requester_top_fxid;
+static ClusterCanonicalTxnPublishState requester_publish_state = CLUSTER_CANONICAL_TXN_NONE;
+static ClusterCanonicalTxnBinding requester_binding;
+static int requester_owner_drift;
+
+FullTransactionId
+GetTopFullTransactionIdIfAny(void)
+{
+	return requester_top_fxid;
+}
+
+ClusterCanonicalTxnPublishState
+cluster_tt_local_capture_canonical_binding(TransactionId xid, ClusterCanonicalTxnBinding *out)
+{
+	UT_ASSERT_EQ(xid, XidFromFullTransactionId(requester_top_fxid));
+	memset(out, 0, sizeof(*out));
+	if (requester_publish_state == CLUSTER_CANONICAL_TXN_PUBLISHED)
+		*out = requester_binding;
+	return requester_publish_state;
+}
+
+
+int MyProcPid = 1234;
+TimestampTz MyStartTimestamp = 1000;
+
+void
+ConditionVariableBroadcast(ConditionVariable *cv pg_attribute_unused())
+{}
+void
+cluster_pcm_lock_check_shutdown_wait(void)
+{}
+bool
+cluster_reconfig_get_observed_fresh_alive(int32 node)
+{
+	return node >= 0 && node < RESOURCE_X_PROTOCOL_NODE_LIMIT;
+}
+bool
+cluster_sf_peer_pcm_x_connection_generation(int32 node, uint32 *generation)
+{
+	if (node < 0 || node >= RESOURCE_X_PROTOCOL_NODE_LIMIT || generation == NULL)
+		return false;
+	*generation = 1;
+	return true;
+}
+void
+cluster_block_io_trace_failed(BufferTag tag pg_attribute_unused(),
+							  const char *bytes pg_attribute_unused(),
+							  const char *source pg_attribute_unused(),
+							  uint32 expected pg_attribute_unused(),
+							  uint32 calculated pg_attribute_unused())
+{}
+bool
+cluster_lms_outbound_wait_capacity(int worker pg_attribute_unused(),
+								   uint64 epoch pg_attribute_unused())
+{
+	UT_ASSERT(false); /* These fixtures never exhaust the LMS outbound ring. */
+	return false;
+}
 
 static RequesterSendCapture requester_send;
 static bool capacity_acquire_success;
@@ -1381,6 +1450,7 @@ cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload, 
 	typedef struct TestR4Reply8240 {
 		GcsBlockReplyHeader header;
 		char block_data[GCS_BLOCK_DATA_SIZE];
+		ClusterR4CrOwnerWire requester_owner;
 	} TestR4Reply8240;
 	const ClusterR4CrRequestPayload *request;
 	TestR4Reply8240 reply;
@@ -1429,6 +1499,7 @@ cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload, 
 		reply.header.transition_id = request->base.transition_id;
 		reply.header.status = GCS_BLOCK_REPLY_R4_CR_FULL;
 		GcsBlockReplyHeaderSetForwardingMasterNode(&reply.header, (int32)env->dest_node_id);
+		reply.requester_owner = request->requester_owner;
 		memset(reply.block_data, 0x6d, sizeof(reply.block_data));
 		reply.header.checksum = cluster_gcs_block_compute_checksum(reply.block_data);
 		reply_env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, UT_HOLDER_NODE,
@@ -1488,6 +1559,7 @@ cluster_grd_outbound_enqueue_backend_msg(uint8 msg_type, uint32 dest_node_id, co
 	typedef struct TestR4Reply8240 {
 		GcsBlockReplyHeader header;
 		char block_data[GCS_BLOCK_DATA_SIZE];
+		ClusterR4CrOwnerWire requester_owner;
 	} TestR4Reply8240;
 	TestR4Reply8240 reply;
 	ClusterICEnvelope env;
@@ -1665,7 +1737,7 @@ cluster_grd_outbound_enqueue_backend_msg(uint8 msg_type, uint32 dest_node_id, co
 		}
 		reply.header.checksum = cluster_gcs_block_compute_checksum(reply.block_data);
 		env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, dest_node_id,
-								  (uint32)cluster_node_id, sizeof(reply));
+								  (uint32)cluster_node_id, GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE);
 		cluster_gcs_handle_block_reply_envelope(&env, &reply);
 		if (requester_send.tx_epoch_drift)
 			route_test_epoch++;
@@ -1709,6 +1781,7 @@ cluster_grd_outbound_enqueue_backend_msg(uint8 msg_type, uint32 dest_node_id, co
 	reply.header.transition_id = requester_send.request.base.transition_id;
 	reply.header.status = (uint8)reply_step.status;
 	GcsBlockReplyHeaderSetForwardingMasterNode(&reply.header, reply_step.forwarding_master_node);
+	reply.requester_owner = requester_send.request.requester_owner;
 	memset(reply.block_data, reply_step.block_fill, sizeof(reply.block_data));
 	memcpy(requester_send.reply_page, reply.block_data, sizeof(reply.block_data));
 	reply.header.checksum = cluster_gcs_block_compute_checksum(reply.block_data);
@@ -1716,9 +1789,16 @@ cluster_grd_outbound_enqueue_backend_msg(uint8 msg_type, uint32 dest_node_id, co
 		reply.header.checksum ^= UINT32_C(1);
 	if (requester_send.corrupt_reply_identity)
 		reply.header.request_id++;
-	env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, reply_step.envelope_source_node,
-							  (uint32)cluster_node_id, sizeof(reply));
+	env = route_test_envelope(
+		PGRAC_IC_MSG_GCS_BLOCK_REPLY, reply_step.envelope_source_node, (uint32)cluster_node_id,
+		requester_send.legacy_read ? GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE : sizeof(reply));
 	cluster_gcs_handle_block_reply_envelope(&env, &reply);
+	if (requester_owner_drift == 1)
+		requester_top_fxid = FullTransactionIdFromEpochAndXid(10, requester_binding.xid);
+	if (requester_owner_drift == 2)
+		requester_binding.segment_generation++;
+	if (requester_owner_drift == 3)
+		requester_publish_state = CLUSTER_CANONICAL_TXN_RESERVED;
 	return true;
 }
 
@@ -1741,10 +1821,11 @@ route_test_request80(void)
 	request.base.reserved_0[2] = 0xe8;
 	request.base.reserved_0[3] = 0x03;
 	extension = (uint8 *)&request.extension;
-	extension[0] = 1;
+	extension[0] = 2;
 	extension[1] = 1;
 	extension[4] = 0x34;
 	extension[5] = 0x12;
+	request.requester_owner.bytes[36] = 1;
 	return request;
 }
 
@@ -1752,7 +1833,7 @@ static ClusterR4CrForwardPayload
 route_test_forward96(void)
 {
 	static const uint8 extension_bytes[32]
-		= { 0x01, 0x01, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00,
+		= { 0x02, 0x01, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00,
 			0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x22, 0x22,
 			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
 	ClusterR4CrForwardPayload forward;
@@ -1769,6 +1850,7 @@ route_test_forward96(void)
 	forward.base.expected_pi_watermark_scn_bytes[1] = 0x12;
 	forward.base.reserved_0[4] = 1;
 	memcpy(&forward.extension, extension_bytes, sizeof(extension_bytes));
+	forward.requester_owner.bytes[36] = 1;
 	return forward;
 }
 
@@ -2753,6 +2835,20 @@ cluster_lms_outbound_enqueue_zero_block_reply_cap_bound(int worker_id, uint32 de
 	return route_seam.refusal_enqueue_ok;
 }
 
+bool
+cluster_lms_outbound_enqueue_r4_refusal_cap_bound(int worker, uint32 node,
+												  const GcsBlockReplyHeader *header,
+												  const ClusterR4CrOwnerWire *wire,
+												  uint32 capability, uint32 generation)
+{
+	ClusterR4CrOwnerChallenge owner;
+
+	UT_ASSERT(ClusterR4CrOwnerWireGet(wire, &owner));
+	UT_ASSERT(ClusterR4CrOwnerForRequester(&owner, node));
+	return cluster_lms_outbound_enqueue_zero_block_reply_cap_bound(worker, node, header, capability,
+																   generation);
+}
+
 static void
 route_assert_refusal(GcsBlockReplyStatus status, uint64 page_lsn)
 {
@@ -3084,12 +3180,14 @@ UT_TEST(test_r4_refusal_decoder_requires_exact_domain_identity_and_zero_body)
 	typedef struct TestR4Reply {
 		GcsBlockReplyHeader header;
 		char block_data[GCS_BLOCK_DATA_SIZE];
+		ClusterR4CrOwnerWire requester_owner;
 	} TestR4Reply;
 	TestR4Reply reply;
 	ClusterICEnvelope env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, UT_REQUESTER_NODE,
 												UT_MASTER_NODE, sizeof(reply));
 
 	memset(&reply, 0, sizeof(reply));
+	reply.requester_owner.bytes[36] = 1;
 	reply.header.request_id = UT_REQUEST_ID;
 	reply.header.epoch = UT_FORMATION_EPOCH;
 	reply.header.sender_node = UT_REQUESTER_NODE;
@@ -3140,27 +3238,32 @@ UT_TEST(test_r4_refusal_decoder_requires_exact_domain_identity_and_zero_body)
 
 /* Removing the expected R4 domain gate, accepting a status at the other
  * physical length, or treating status 24 as an ordinary backend reply makes
- * at least one row below fail.  The fixtures use literal 8240/8256 shapes and
+ * at least one row below fail.  The fixtures use literal 8280/8256 shapes and
  * call the production decoder seam, not the production encoder. */
 UT_TEST(test_r4_reply_decoder_binds_domain_status_length_and_undo_authority)
 {
 	typedef struct TestR4Reply8240 {
 		GcsBlockReplyHeader header;
 		char block_data[GCS_BLOCK_DATA_SIZE];
+		ClusterR4CrOwnerWire requester_owner;
 	} TestR4Reply8240;
 	typedef struct TestR4Reply8256 {
-		TestR4Reply8240 base;
+		struct {
+			GcsBlockReplyHeader header;
+			char block_data[GCS_BLOCK_DATA_SIZE];
+		} base;
 		ClusterGcsUndoAuthTrailer auth;
 	} TestR4Reply8256;
 	TestR4Reply8240 reply8240;
 	TestR4Reply8256 reply8256;
 	ClusterICEnvelope env;
 
-	UT_ASSERT_EQ(sizeof(reply8240), 8240);
+	UT_ASSERT_EQ(sizeof(reply8240), 8280);
 	UT_ASSERT_EQ(sizeof(reply8256), 8256);
 
-	/* A holder's finished CR is an exact 8240-byte R4_CR-domain reply. */
+	/* A holder's finished CR is an exact 8280-byte R4_CR-domain reply. */
 	memset(&reply8240, 0, sizeof(reply8240));
+	reply8240.requester_owner.bytes[36] = 1;
 	reply8240.header.request_id = UT_REQUEST_ID;
 	reply8240.header.epoch = UT_FORMATION_EPOCH;
 	reply8240.header.sender_node = UT_HOLDER_NODE;
@@ -3184,7 +3287,7 @@ UT_TEST(test_r4_reply_decoder_binds_domain_status_length_and_undo_authority)
 
 	/* The same status must not alias the authenticated 8256-byte undo shape. */
 	memset(&reply8256, 0, sizeof(reply8256));
-	reply8256.base = reply8240;
+	memcpy(&reply8256.base, &reply8240, sizeof(reply8256.base));
 	env.payload_length = sizeof(reply8256);
 	UT_ASSERT(!cluster_gcs_block_test_decode_r4_reply(
 		&env, &reply8256, UT_REQUEST_ID, UT_FORMATION_EPOCH, UT_REQUESTER_BACKEND, PCM_TRANS_N_TO_S,
@@ -3233,7 +3336,7 @@ UT_TEST(test_r4_reply_decoder_binds_domain_status_length_and_undo_authority)
 
 	/* A short frame is not status 24. Initial rollover generation zero is
 	 * valid when the complete authenticated authority trailer is present. */
-	env.payload_length = sizeof(reply8240);
+	env.payload_length = 8240;
 	UT_ASSERT(!cluster_gcs_block_test_decode_r4_reply(
 		&env, &reply8256, UT_REQUEST_ID, UT_FORMATION_EPOCH, UT_R4_INTERNAL_ENDPOINT,
 		PCM_TRANS_N_TO_S, UT_HOLDER_NODE, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER,
@@ -3251,8 +3354,9 @@ UT_TEST(test_r4_reply_decoder_binds_domain_status_length_and_undo_authority)
 		PCM_TRANS_N_TO_S, UT_HOLDER_NODE, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER,
 		UT_REPLY_DOMAIN_R4_CR));
 
-	/* The two existing typed refusal statuses retain the exact 8240 shape. */
+	/* The two existing typed refusal statuses carry the exact 8280 CR shape. */
 	memset(&reply8240, 0, sizeof(reply8240));
+	reply8240.requester_owner.bytes[36] = 1;
 	reply8240.header.request_id = UT_REQUEST_ID;
 	reply8240.header.epoch = UT_FORMATION_EPOCH;
 	reply8240.header.sender_node = UT_MASTER_NODE;
@@ -3382,6 +3486,7 @@ UT_TEST(test_r4_full_reply_lands_once_in_armed_r4_slot)
 	typedef struct TestR4Reply8240 {
 		GcsBlockReplyHeader header;
 		char block_data[GCS_BLOCK_DATA_SIZE];
+		ClusterR4CrOwnerWire requester_owner;
 	} TestR4Reply8240;
 	TestR4Reply8240 first;
 	TestR4Reply8240 duplicate;
@@ -3392,6 +3497,7 @@ UT_TEST(test_r4_full_reply_lands_once_in_armed_r4_slot)
 	uint64 stale_drop_count = 0;
 
 	memset(&first, 0, sizeof(first));
+	first.requester_owner.bytes[36] = 1;
 	first.header.request_id = UT_REQUEST_ID;
 	first.header.epoch = UT_FORMATION_EPOCH;
 	first.header.page_lsn = UINT64_C(0x12345678);
@@ -4305,6 +4411,10 @@ route_test_reset_public_target_requester(void)
 	if (armed)
 		UT_ASSERT(cluster_gcs_block_test_release_r4_requester_slot());
 	route_seam_reset();
+	requester_top_fxid = InvalidFullTransactionId;
+	requester_publish_state = CLUSTER_CANONICAL_TXN_NONE;
+	memset(&requester_binding, 0, sizeof(requester_binding));
+	requester_owner_drift = 0;
 	memset(&requester_send, 0, sizeof(requester_send));
 	reply_lock_acquire_calls = 0;
 	reply_lock_release_calls = 0;
@@ -5246,7 +5356,7 @@ UT_TEST(test_shared_acquire_error_retires_only_its_quiescent_n_reservation)
 		if (sigsetjmp(jump, 1) == 0) {
 			PG_exception_stack = &jump;
 			granted = cluster_bufmgr_pcm_acquire_shared_owned(&capacity_buffer, &base, token,
-															  &retry_denied);
+															  &retry_denied, NULL);
 		} else
 			caught = true;
 		PG_exception_stack = saved_stack;
@@ -5766,7 +5876,7 @@ UT_TEST(test_target_wrapper_recheck_drift_keeps_dst_and_canonicalizes_slot)
 UT_TEST(test_request80_routes_stored_proof_to_real_forward96_handler)
 {
 	static const uint8 expected_extension[32]
-		= { 0x01, 0x01, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00,
+		= { 0x02, 0x01, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00,
 			0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x22, 0x22,
 			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
 	ClusterR4CrRequestPayload request = route_test_request80();
@@ -6331,7 +6441,7 @@ UT_TEST(test_request80_sender_mismatch_is_consumed_without_route_mutation)
 
 	request.base.sender_node = UT_HOLDER_NODE;
 	route_seam_reset();
-	UT_ASSERT_EQ(env.payload_length, 80);
+	UT_ASSERT_EQ(env.payload_length, 120);
 	UT_ASSERT(cluster_gcs_block_test_r4_request80(&env, &request));
 	UT_ASSERT_EQ(route_seam.capability_calls, 1);
 	UT_ASSERT_EQ(route_seam.capability_peers[0], UT_REQUESTER_NODE);
@@ -6355,7 +6465,7 @@ UT_TEST(test_request80_reserved_extension_is_consumed_without_route_mutation)
 
 	request.extension.reserved[0] = 1;
 	route_seam_reset();
-	UT_ASSERT_EQ(env.payload_length, 80);
+	UT_ASSERT_EQ(env.payload_length, 120);
 	UT_ASSERT(cluster_gcs_block_test_r4_request80(&env, &request));
 	UT_ASSERT_EQ(route_seam.capability_calls, 1);
 	UT_ASSERT_EQ(route_seam.enter_calls, 1);
@@ -6378,7 +6488,7 @@ UT_TEST(test_request80_epoch_mismatch_is_consumed_without_route_mutation)
 
 	request.base.epoch = UT_FORMATION_EPOCH + 1;
 	route_seam_reset();
-	UT_ASSERT_EQ(env.payload_length, 80);
+	UT_ASSERT_EQ(env.payload_length, 120);
 	UT_ASSERT(cluster_gcs_block_test_r4_request80(&env, &request));
 	UT_ASSERT_EQ(route_seam.capability_calls, 1);
 	UT_ASSERT_EQ(route_seam.enter_calls, 1);
@@ -6401,7 +6511,7 @@ UT_TEST(test_request80_wrong_master_is_consumed_before_snapshot)
 
 	route_seam_reset();
 	route_seam.lookup_master_node = 0;
-	UT_ASSERT_EQ(env.payload_length, 80);
+	UT_ASSERT_EQ(env.payload_length, 120);
 	UT_ASSERT(cluster_gcs_block_test_r4_request80(&env, &request));
 	UT_ASSERT_EQ(route_seam.capability_calls, 1);
 	UT_ASSERT_EQ(route_seam.enter_calls, 1);
@@ -6424,7 +6534,7 @@ UT_TEST(test_request80_snapshot_failure_stops_before_route_arm)
 
 	route_seam_reset();
 	route_seam.snapshot_ok = false;
-	UT_ASSERT_EQ(env.payload_length, 80);
+	UT_ASSERT_EQ(env.payload_length, 120);
 	UT_ASSERT(cluster_gcs_block_test_r4_request80(&env, &request));
 	UT_ASSERT_EQ(route_seam.capability_calls, 1);
 	UT_ASSERT_EQ(route_seam.enter_calls, 1);
@@ -6448,7 +6558,7 @@ UT_TEST(test_request80_arm_full_stops_before_publication)
 
 	route_seam_reset();
 	route_seam.arm_result = GCS_BLOCK_R4_ROUTE_ARM_FULL;
-	UT_ASSERT_EQ(env.payload_length, 80);
+	UT_ASSERT_EQ(env.payload_length, 120);
 	UT_ASSERT(cluster_gcs_block_test_r4_request80(&env, &request));
 	UT_ASSERT_EQ(route_seam.capability_calls, 2);
 	UT_ASSERT_EQ(route_seam.peer_open_calls, 2);
@@ -6474,7 +6584,7 @@ UT_TEST(test_request80_enqueue_refusal_finishes_unadmitted_once)
 	route_seam_reset();
 	route_seam.enqueue_ok = false;
 	route_seam.finish_result = GCS_BLOCK_R4_ROUTE_SEND_RETRYABLE;
-	UT_ASSERT_EQ(env.payload_length, 80);
+	UT_ASSERT_EQ(env.payload_length, 120);
 	UT_ASSERT(cluster_gcs_block_test_r4_request80(&env, &request));
 	UT_ASSERT_EQ(route_seam.capability_calls, 2);
 	UT_ASSERT_EQ(route_seam.peer_open_calls, 2);
@@ -6503,7 +6613,7 @@ UT_TEST(test_request80_final_recheck_failure_leaves_after_one_publication)
 
 	route_seam_reset();
 	route_seam.recheck_ok = false;
-	UT_ASSERT_EQ(env.payload_length, 80);
+	UT_ASSERT_EQ(env.payload_length, 120);
 	UT_ASSERT(cluster_gcs_block_test_r4_request80(&env, &request));
 	UT_ASSERT_EQ(route_seam.capability_calls, 2);
 	UT_ASSERT_EQ(route_seam.peer_open_calls, 2);
@@ -6533,7 +6643,7 @@ UT_TEST(test_forward96_master_mismatch_is_consumed_without_holder_submit)
 	forward.base.master_node = UT_HOLDER_NODE;
 	cluster_node_id = UT_HOLDER_NODE;
 	route_seam_reset();
-	UT_ASSERT_EQ(env.payload_length, 96);
+	UT_ASSERT_EQ(env.payload_length, 136);
 	UT_ASSERT(cluster_gcs_block_test_r4_forward96(&env, &forward));
 	UT_ASSERT_EQ(route_seam.capability_calls, 2);
 	UT_ASSERT_EQ(route_seam.capability_peers[0], UT_MASTER_NODE);
@@ -6562,7 +6672,7 @@ UT_TEST(test_forward96_proof_epoch_mismatch_is_consumed_without_holder_submit)
 	forward.extension.kind.cr.master_authority_generation_le[4] = (uint8)(UT_FORMATION_EPOCH + 1);
 	cluster_node_id = UT_HOLDER_NODE;
 	route_seam_reset();
-	UT_ASSERT_EQ(env.payload_length, 96);
+	UT_ASSERT_EQ(env.payload_length, 136);
 	UT_ASSERT(cluster_gcs_block_test_r4_forward96(&env, &forward));
 	UT_ASSERT_EQ(route_seam.capability_calls, 2);
 	UT_ASSERT_EQ(route_seam.capability_peers[0], UT_MASTER_NODE);
@@ -6624,7 +6734,7 @@ test_kind2_requester_generation_roundtrip(uint32 requested_generation)
 	UT_ASSERT_EQ(requester_send.calls, 1);
 	UT_ASSERT(requester_send.tx_kind2);
 	UT_ASSERT(requester_send.slot_armed);
-	UT_ASSERT_EQ(requester_send.payload_len, sizeof(ClusterR4CrForwardPayload));
+	UT_ASSERT_EQ(requester_send.payload_len, sizeof(ClusterR4InternalForwardPayload));
 	UT_ASSERT_EQ(requester_send.dest_node, UT_MASTER_NODE);
 	UT_ASSERT_EQ(requester_send.tx_forward.base.original_requester_node, UT_REQUESTER_NODE);
 	UT_ASSERT_EQ(requester_send.tx_forward.base.master_node, UT_MASTER_NODE);
@@ -6882,7 +6992,7 @@ UT_TEST(test_kind2_requester_sleep_error_cancels_cv_before_slot_release)
 
 UT_TEST(test_kind2_origin_runs_candidate2_cooperatively_and_ships_exact_status22)
 {
-	ClusterR4CrForwardPayload forward;
+	ClusterR4InternalForwardPayload forward;
 	ClusterICEnvelope env;
 	ClusterTxLocator locator;
 	ClusterTxResolution decoded;
@@ -7004,7 +7114,7 @@ UT_TEST(test_kind2_origin_runs_candidate2_cooperatively_and_ships_exact_status22
 
 UT_TEST(test_kind2_origin_capacity_covers_three_remote_c32_bursts)
 {
-	ClusterR4CrForwardPayload forward;
+	ClusterR4InternalForwardPayload forward;
 	ClusterICEnvelope env;
 	ClusterTxLocator locator;
 	int saved_max_backends = MaxBackends;
@@ -7074,10 +7184,10 @@ UT_TEST(test_kind2_origin_capacity_covers_three_remote_c32_bursts)
 	cluster_node_id = saved_node_id;
 }
 
-static ClusterR4CrForwardPayload
+static ClusterR4InternalForwardPayload
 route_test_undo_forward(uint16 wrap)
 {
-	ClusterR4CrForwardPayload forward;
+	ClusterR4InternalForwardPayload forward;
 	ClusterTxLocator locator;
 	memset(&locator, 0, sizeof(locator));
 	locator.uba = uba_encode(5, 408, 6, 1);
@@ -7100,10 +7210,10 @@ route_test_undo_forward(uint16 wrap)
 	return forward;
 }
 
-static ClusterR4CrForwardPayload
+static ClusterR4InternalForwardPayload
 route_test_tx_forward(uint32 generation)
 {
-	ClusterR4CrForwardPayload forward = route_test_undo_forward(TT_WRAP_INVALID);
+	ClusterR4InternalForwardPayload forward = route_test_undo_forward(TT_WRAP_INVALID);
 
 	forward.base.requester_backend_id = UT_REQUESTER_BACKEND;
 	forward.base.master_node = UT_MASTER_NODE;
@@ -7123,8 +7233,9 @@ UT_TEST(test_seal_two_blocks_new_tx_and_undo_contexts_but_not_original_drain)
 
 	cluster_node_id = UT_MASTER_NODE;
 	for (int domain = 0; domain < 2; domain++) {
-		ClusterR4CrForwardPayload forward = domain == 0 ? route_test_tx_forward(UINT32_MAX)
-														: route_test_undo_forward(TT_WRAP_INVALID);
+		ClusterR4InternalForwardPayload forward = domain == 0
+													  ? route_test_tx_forward(UINT32_MAX)
+													  : route_test_undo_forward(TT_WRAP_INVALID);
 		ClusterICEnvelope env = route_test_envelope(
 			PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_REQUESTER_NODE, UT_MASTER_NODE, sizeof(forward));
 
@@ -7166,7 +7277,7 @@ UT_TEST(test_kind2_origin_generation_selection_and_strict_known_negatives)
 	for (variant = 0; variant < 10; variant++) {
 		bool known = variant == 1 || variant == 2;
 		bool positive = variant < 5 && variant != 2;
-		ClusterR4CrForwardPayload forward = route_test_tx_forward(known ? 0 : UINT32_MAX);
+		ClusterR4InternalForwardPayload forward = route_test_tx_forward(known ? 0 : UINT32_MAX);
 		ClusterICEnvelope env = route_test_envelope(
 			PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_REQUESTER_NODE, UT_MASTER_NODE, sizeof(forward));
 		ClusterTxLocator locator;
@@ -7225,7 +7336,7 @@ UT_TEST(test_kind2_origin_generation_selection_and_strict_known_negatives)
 
 UT_TEST(test_kind2_origin_backpressure_does_not_reselect_or_duplicate)
 {
-	ClusterR4CrForwardPayload forward = route_test_tx_forward(UINT32_MAX);
+	ClusterR4InternalForwardPayload forward = route_test_tx_forward(UINT32_MAX);
 	ClusterICEnvelope env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_REQUESTER_NODE,
 												UT_MASTER_NODE, sizeof(forward));
 	GcsBlockReplyHeader header;
@@ -7265,7 +7376,7 @@ UT_TEST(test_kind2_origin_backpressure_does_not_reselect_or_duplicate)
 
 UT_TEST(test_kind4_origin_selects_generation_for_cold_holder)
 {
-	ClusterR4CrForwardPayload forward = route_test_undo_forward(TT_WRAP_INVALID);
+	ClusterR4InternalForwardPayload forward = route_test_undo_forward(TT_WRAP_INVALID);
 	ClusterICEnvelope env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_REQUESTER_NODE,
 												UT_MASTER_NODE, sizeof(forward));
 	uint32 generation = 0;
@@ -7304,7 +7415,7 @@ UT_TEST(test_kind4_origin_generation_sample_failure_never_publishes_data)
 
 	cluster_node_id = UT_MASTER_NODE;
 	for (variant = 0; variant < 6; variant++) {
-		ClusterR4CrForwardPayload forward = route_test_undo_forward(TT_WRAP_INVALID);
+		ClusterR4InternalForwardPayload forward = route_test_undo_forward(TT_WRAP_INVALID);
 		ClusterICEnvelope env = route_test_envelope(
 			PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_REQUESTER_NODE, UT_MASTER_NODE, sizeof(forward));
 		uint32 generation = UINT32_MAX;
@@ -7347,7 +7458,7 @@ UT_TEST(test_kind4_origin_generation_sample_failure_never_publishes_data)
 
 UT_TEST(test_kind4_origin_error_releases_guard_and_returns_correlated_refusal)
 {
-	ClusterR4CrForwardPayload forward = route_test_undo_forward(TT_WRAP_INVALID);
+	ClusterR4InternalForwardPayload forward = route_test_undo_forward(TT_WRAP_INVALID);
 	ClusterICEnvelope env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_REQUESTER_NODE,
 												UT_MASTER_NODE, sizeof(forward));
 	int saved_node = cluster_node_id;
@@ -7372,7 +7483,7 @@ UT_TEST(test_kind4_origin_error_releases_guard_and_returns_correlated_refusal)
 
 UT_TEST(test_kind4_origin_backpressure_retains_same_proven_page_without_reacquiring)
 {
-	ClusterR4CrForwardPayload forward = route_test_undo_forward(TT_WRAP_INVALID);
+	ClusterR4InternalForwardPayload forward = route_test_undo_forward(TT_WRAP_INVALID);
 	ClusterICEnvelope env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_REQUESTER_NODE,
 												UT_MASTER_NODE, sizeof(forward));
 	GcsBlockReplyHeader first_header;
@@ -7419,7 +7530,7 @@ UT_TEST(test_kind4_origin_requires_exact_current_open_and_internal_shape)
 	int variant;
 	cluster_node_id = UT_MASTER_NODE;
 	for (variant = 0; variant < 12; variant++) {
-		ClusterR4CrForwardPayload forward = route_test_undo_forward(TT_WRAP_INVALID);
+		ClusterR4InternalForwardPayload forward = route_test_undo_forward(TT_WRAP_INVALID);
 		ClusterICEnvelope env = route_test_envelope(
 			PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_REQUESTER_NODE, UT_MASTER_NODE, sizeof(forward));
 		int i;
@@ -7483,7 +7594,7 @@ UT_TEST(test_kind4_origin_requires_exact_current_open_and_internal_shape)
 
 UT_TEST(test_kind4_origin_reuses_owned_data_tt_data_and_returns_internal_page)
 {
-	ClusterR4CrForwardPayload forward;
+	ClusterR4InternalForwardPayload forward;
 	ClusterICEnvelope env;
 	ClusterTxLocator locator;
 	int saved_node_id = cluster_node_id;
@@ -7622,10 +7733,219 @@ UT_TEST(test_native_retry_trace_samples_owner_generation_and_clears)
 	ClusterPcmOwnArray = saved_own; NBuffers = saved_buffers;
 }
 
+static void
+route_test_set_requester_owner(void)
+{
+	requester_top_fxid = FullTransactionIdFromEpochAndXid(9, 100);
+	requester_publish_state = CLUSTER_CANONICAL_TXN_PUBLISHED;
+	requester_binding = (ClusterCanonicalTxnBinding){
+		.segment_id = (uint32)cluster_node_id * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1,
+		.segment_generation = 23,
+		.xid = 100,
+		.slot_offset = 3,
+		.slot_wrap = 8,
+		.origin_instance = cluster_node_id + 1,
+		.publish_state = CLUSTER_CANONICAL_TXN_PUBLISHED,
+		.active_lsn = 123
+	};
+}
+
+UT_TEST(test_owner_dispatch_captures_exact_binding_or_explicit_no_owner)
+{
+	int saved_node = cluster_node_id;
+
+	cluster_node_id = UT_REQUESTER_NODE;
+	for (int mode = 0; mode < 3; mode++) {
+		char page[BLCKSZ];
+		ClusterR4CrOwnerChallenge owner;
+		ClusterCrBuildReason reason;
+
+		route_test_reset_public_target_requester();
+		if (mode != 0)
+			route_test_set_requester_owner();
+		if (mode == 1)
+			requester_publish_state = CLUSTER_CANONICAL_TXN_NONE;
+		memset(page, 0xa7, sizeof(page));
+		UT_ASSERT_EQ(
+			cluster_gcs_block_cr_fetch_and_wait(route_test_tag(), UT_READ_SCN, page, &reason),
+			CLUSTER_CR_BUILD_FULL);
+		UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_NONE);
+		UT_ASSERT_EQ(requester_send.calls, 1);
+		UT_ASSERT(ClusterR4CrOwnerWireGet(&requester_send.request.requester_owner, &owner));
+		UT_ASSERT_EQ(owner.flags, mode == 2 ? CLUSTER_R4_CR_OWNER_PRESENT : 0);
+		if (mode == 2) {
+			UT_ASSERT(FullTransactionIdEquals(owner.top_fxid, requester_top_fxid));
+			UT_ASSERT_EQ(owner.segment_id, requester_binding.segment_id);
+			UT_ASSERT_EQ(owner.segment_generation, requester_binding.segment_generation);
+			UT_ASSERT_EQ(owner.slot_offset, requester_binding.slot_offset);
+			UT_ASSERT_EQ(owner.slot_wrap, requester_binding.slot_wrap);
+			UT_ASSERT_EQ(owner.active_lsn, requester_binding.active_lsn);
+			UT_ASSERT_EQ(owner.origin_instance, requester_binding.origin_instance);
+		}
+		UT_ASSERT_EQ(memcmp(page, requester_send.reply_page, BLCKSZ), 0);
+		route_test_assert_public_target_slot_is_canonical();
+	}
+	route_test_reset_public_target_requester();
+	cluster_node_id = saved_node;
+}
+
+UT_TEST(test_owner_dispatch_partial_or_invalid_publication_never_sends)
+{
+	int saved_node = cluster_node_id;
+
+	cluster_node_id = UT_REQUESTER_NODE;
+	for (int fault = 0; fault < 8; fault++) {
+		char page[BLCKSZ], before[BLCKSZ];
+		ClusterCrBuildReason reason;
+
+		route_test_reset_public_target_requester();
+		route_test_set_requester_owner();
+		switch (fault) {
+		case 0:
+			requester_publish_state = CLUSTER_CANONICAL_TXN_RESERVED;
+			break;
+		case 1:
+			requester_publish_state = CLUSTER_CANONICAL_TXN_PUBLISHING;
+			break;
+		case 2:
+			requester_publish_state = CLUSTER_CANONICAL_TXN_FAILED;
+			break;
+		case 3:
+			requester_binding.active_lsn = InvalidXLogRecPtr;
+			break;
+		case 4:
+			requester_binding.reserved16 = 1;
+			break;
+		case 5:
+			requester_binding.xid++;
+			break;
+		case 6:
+			requester_binding.origin_instance++;
+			break;
+		case 7:
+			requester_binding.publish_state = CLUSTER_CANONICAL_TXN_NONE;
+			break;
+		}
+		memset(page, 0xa7, sizeof(page));
+		memcpy(before, page, sizeof(page));
+		UT_ASSERT_EQ(
+			cluster_gcs_block_cr_fetch_and_wait(route_test_tag(), UT_READ_SCN, page, &reason),
+			CLUSTER_CR_BUILD_FAIL_CLOSED);
+		UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_PROTOCOL);
+		UT_ASSERT_EQ(requester_send.calls, 0);
+		UT_ASSERT_EQ(memcmp(page, before, BLCKSZ), 0);
+		UT_ASSERT_EQ(route_seam.enter_calls, route_seam.leave_calls);
+		route_test_assert_public_target_slot_is_canonical();
+	}
+	route_test_reset_public_target_requester();
+	cluster_node_id = saved_node;
+}
+
+UT_TEST(test_owner_full_is_not_consumed_after_top_or_receipt_drift)
+{
+	int saved_node = cluster_node_id;
+
+	cluster_node_id = UT_REQUESTER_NODE;
+	for (int drift = 1; drift <= 3; drift++) {
+		char page[BLCKSZ], before[BLCKSZ];
+		ClusterCrBuildReason reason;
+
+		route_test_reset_public_target_requester();
+		route_test_set_requester_owner();
+		requester_owner_drift = drift;
+		memset(page, 0xa7, sizeof(page));
+		memcpy(before, page, sizeof(page));
+		UT_ASSERT_EQ(
+			cluster_gcs_block_cr_fetch_and_wait(route_test_tag(), UT_READ_SCN, page, &reason),
+			CLUSTER_CR_BUILD_FAIL_CLOSED);
+		UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_PROTOCOL);
+		UT_ASSERT_EQ(requester_send.calls, 1);
+		UT_ASSERT_EQ(memcmp(page, before, BLCKSZ), 0);
+		UT_ASSERT_EQ(route_seam.enter_calls, route_seam.leave_calls);
+		route_test_assert_public_target_slot_is_canonical();
+	}
+	route_test_reset_public_target_requester();
+	cluster_node_id = saved_node;
+}
+
+#include "test_cluster_r4_forward_ingress_boundaries.inc"
+
+/* Exercise the registered ingress, where CR and CTRC now share a length.
+ * A length-only CTRC claim must not swallow the original CR route/challenge. */
+UT_TEST(test_registered_forward_ingress_delivers_cr_owner_challenge)
+{
+	int saved_node = cluster_node_id;
+
+	cluster_node_id = UT_HOLDER_NODE;
+	for (int mode = 0; mode < 2; mode++) {
+		ClusterR4CrForwardPayload forward = route_test_forward96();
+		ClusterICEnvelope env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_MASTER_NODE,
+													UT_HOLDER_NODE, sizeof(forward));
+		ClusterR4CrOwnerChallenge owner = { 0 };
+
+		if (mode == 1) {
+			owner.top_fxid = FullTransactionIdFromEpochAndXid(9, 100);
+			owner.active_lsn = 123;
+			owner.segment_id = UT_REQUESTER_NODE * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+			owner.segment_generation = 23;
+			owner.top_xid = 100;
+			owner.slot_offset = 3;
+			owner.slot_wrap = 8;
+			owner.origin_instance = UT_REQUESTER_NODE + 1;
+			owner.publish_state = CLUSTER_CANONICAL_TXN_PUBLISHED;
+			owner.flags = CLUSTER_R4_CR_OWNER_PRESENT;
+		}
+		UT_ASSERT(ClusterR4CrOwnerWireSet(&forward.requester_owner, &owner));
+		route_seam_reset();
+		route_ctrc_decode_calls = 0;
+		cluster_gcs_handle_block_forward_envelope(&env, &forward);
+		UT_ASSERT_EQ(route_seam.holder_submit_calls, 1);
+		UT_ASSERT_EQ(memcmp(&route_seam.submitted_forward, &forward, sizeof(forward)), 0);
+		UT_ASSERT_EQ(route_seam.enter_calls, 1);
+		UT_ASSERT_EQ(route_seam.leave_calls, 1);
+		UT_ASSERT_EQ(route_ctrc_decode_calls, 0);
+	}
+	cluster_node_id = saved_node;
+}
+
+UT_TEST(test_registered_forward_ingress_keeps_foreign_or_malformed_frames_closed)
+{
+	int saved_node = cluster_node_id;
+
+	cluster_node_id = UT_HOLDER_NODE;
+	for (int fault = 0; fault < 6; fault++) {
+		ClusterR4CrForwardPayload forward = route_test_forward96();
+		ClusterICEnvelope env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_MASTER_NODE,
+													UT_HOLDER_NODE, sizeof(forward));
+		uint8 *bytes = (uint8 *)&forward;
+
+		if (fault < 3) {
+			bytes[62] = fault == 1 ? 2 : 1;
+			bytes[63] = fault == 2 ? 12 : 11;
+		} else if (fault == 3)
+			bytes[64] = 1;
+		else if (fault == 4)
+			env.msg_type = PGRAC_IC_MSG_GCS_BLOCK_REPLY;
+		else
+			env.payload_length--;
+		route_seam_reset();
+		route_ctrc_decode_calls = 0;
+		cluster_gcs_handle_block_forward_envelope(&env, &forward);
+		UT_ASSERT_EQ(route_seam.holder_submit_calls, 0);
+		/* The existing R4 handler acquires its token before decoding the
+		 * extension; malformed frames must still release it without work. */
+		UT_ASSERT_EQ(route_seam.enter_calls, fault >= 1 && fault <= 3 ? 1 : 0);
+		UT_ASSERT_EQ(route_seam.leave_calls, route_seam.enter_calls);
+		UT_ASSERT_EQ(route_seam.raw_send_calls, 0);
+		UT_ASSERT_EQ(route_ctrc_decode_calls, fault == 0 ? 1 : 0);
+	}
+	cluster_node_id = saved_node;
+}
+
 int
 main(void)
 {
-	UT_PLAN(157);
+	UT_PLAN(162);
 	UT_RUN(test_native_retry_trace_samples_owner_generation_and_clears);
 	UT_RUN(test_current_mx_updater_precommit_final_release_failure_is_unknown);
 	UT_RUN(test_current_mx_origin_retry_keeps_unknown_release_and_deadline_fences);
@@ -7783,6 +8103,11 @@ main(void)
 	UT_RUN(test_read_image_full_holder_change_returns_outer_reobserve);
 	UT_RUN(test_undo_full_with_content_lock_honors_cancel_before_admission);
 	UT_RUN(test_undo_full_with_content_lock_honors_termination_before_admission);
+	UT_RUN(test_owner_dispatch_captures_exact_binding_or_explicit_no_owner);
+	UT_RUN(test_owner_dispatch_partial_or_invalid_publication_never_sends);
+	UT_RUN(test_owner_full_is_not_consumed_after_top_or_receipt_drift);
+	UT_RUN(test_registered_forward_ingress_delivers_cr_owner_challenge);
+	UT_RUN(test_registered_forward_ingress_keeps_foreign_or_malformed_frames_closed);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

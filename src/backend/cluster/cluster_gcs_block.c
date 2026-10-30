@@ -217,7 +217,7 @@ typedef struct GcsBlockR4TxOriginContext {
 	TimestampTz deadline;
 	uint32 requester_capability_generation;
 	ClusterCtrcParticipantIdentity current_mx_requester_identity;
-	ClusterR4CrForwardPayload forward;
+	ClusterR4InternalForwardPayload forward;
 	ClusterTxLocator locator;
 	ClusterUndoBlock0LogicalKey logical;
 	ClusterUndoBlock0ResolvedRoot root;
@@ -354,6 +354,8 @@ typedef struct ClusterGcsBlockOutstandingSlot {
 	bool direct_target_prepared;
 	ClusterGcsBlockDirectAbortReason direct_abort_reason;
 	GcsFirstFillReceipt first_fill;
+	ClusterR4CrOwnerChallenge r4_requester_owner;
+	bool r4_cr_owner_bound;
 } ClusterGcsBlockOutstandingSlot;
 
 StaticAssertDecl(CLUSTER_GCS_BLOCK_REPLY_DOMAIN_LEGACY_ACQUIRE == 0
@@ -364,7 +366,8 @@ StaticAssertDecl(offsetof(ClusterGcsBlockOutstandingSlot, reply_domain) == 1,
 				 "GCS block reply domain must consume byte-1 slot padding");
 StaticAssertDecl(offsetof(ClusterGcsBlockOutstandingSlot, request_id) == 8,
 				 "GCS block slot request_id offset must remain 8");
-StaticAssertDecl(sizeof(ClusterGcsBlockOutstandingSlot) == 8688 + MAXALIGN(sizeof(GcsFirstFillReceipt)),
+StaticAssertDecl(sizeof(ClusterGcsBlockOutstandingSlot)
+					 == 8736 + MAXALIGN(sizeof(GcsFirstFillReceipt)),
 				 "GCS receipt must append to the original requester-slot layout");
 
 typedef struct ClusterGcsBlockBackendBlock {
@@ -709,7 +712,7 @@ static ClusterICSendResult gcs_block_send_envelope_or_loopback(uint8 msg_type, i
 															   const void *payload,
 															   uint32 payload_len);
 static bool gcs_block_r4_tx_origin_try_accept(const ClusterICEnvelope *env,
-											  const ClusterR4CrForwardPayload *forward);
+											  const ClusterR4InternalForwardPayload *forward);
 static bool gcs_block_current_mx_origin_try_accept(const ClusterICEnvelope *env,
 												   const void *payload);
 static void gcs_block_r4_tx_origin_context_clear(GcsBlockR4TxOriginContext *context,
@@ -1150,6 +1153,8 @@ gcs_block_try_reserve_r4_slot(BufferTag tag, uint64 request_epoch, int32 expecte
 	memset(slot->reply_block_data, 0, sizeof(slot->reply_block_data));
 	slot->in_use = true;
 	slot->reply_domain = CLUSTER_GCS_BLOCK_REPLY_DOMAIN_R4_CR;
+	memset(&slot->r4_requester_owner, 0, sizeof(slot->r4_requester_owner));
+	slot->r4_cr_owner_bound = false;
 	slot->request_id = gcs_reqid_requester(cluster_node_id, (int)MyBackendId - 1, sequence);
 	slot->transition_id = (uint8)PCM_TRANS_N_TO_S;
 	slot->tag = tag;
@@ -1284,6 +1289,8 @@ gcs_block_clear_slot_locked(ClusterGcsBlockOutstandingSlot *slot)
 	slot->direct_target_prepared = false;
 	slot->direct_abort_reason = GCS_BLOCK_DIRECT_ABORT_NONE;
 	memset(&slot->first_fill, 0, sizeof(slot->first_fill));
+	memset(&slot->r4_requester_owner, 0, sizeof(slot->r4_requester_owner));
+	slot->r4_cr_owner_bound = false;
 }
 
 static void
@@ -2392,6 +2399,8 @@ typedef struct GcsBlockR4ReplyExpectation {
 	int32 sender_node;
 	int32 forwarding_master_node;
 	uint8 reply_domain;
+	bool owner_bound;
+	ClusterR4CrOwnerChallenge requester_owner;
 } GcsBlockR4ReplyExpectation;
 
 static bool gcs_block_decode_r4_reply_payload(const ClusterICEnvelope *env, const void *payload,
@@ -2475,12 +2484,23 @@ gcs_block_decode_r4_reply_payload(const ClusterICEnvelope *env, const void *payl
 	status = (GcsBlockReplyStatus)header->status;
 	switch (status) {
 	case GCS_BLOCK_REPLY_R4_CR_FULL:
-	case GCS_BLOCK_REPLY_R4_TX_RESOLVE_RESULT:
+		if (!expected->owner_bound)
+			return false;
+		payload_size = CLUSTER_R4_CR_REPLY_PAYLOAD_SIZE;
+		break;
 	case GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED:
 	case GCS_BLOCK_REPLY_R4_DENIED:
+		payload_size = expected->owner_bound ? CLUSTER_R4_CR_REPLY_PAYLOAD_SIZE
+											 : GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE;
+		break;
+	case GCS_BLOCK_REPLY_R4_TX_RESOLVE_RESULT:
+		if (expected->owner_bound)
+			return false;
 		payload_size = GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE;
 		break;
 	case GCS_BLOCK_REPLY_R4_UNDO_DATA_RESULT:
+		if (expected->owner_bound)
+			return false;
 		payload_size
 			= GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE + (uint32)sizeof(ClusterGcsUndoAuthTrailer);
 		break;
@@ -2496,6 +2516,15 @@ gcs_block_decode_r4_reply_payload(const ClusterICEnvelope *env, const void *payl
 		|| GcsBlockReplyHeaderGetForwardingMasterNode(header) != expected->forwarding_master_node
 		|| header->checksum != gcs_block_compute_checksum(block_data))
 		return false;
+	if (expected->owner_bound) {
+		ClusterR4CrOwnerChallenge echoed;
+		const ClusterR4CrOwnerWire *wire
+			= (const ClusterR4CrOwnerWire *)(block_data + GCS_BLOCK_DATA_SIZE);
+
+		if (!ClusterR4CrOwnerWireGet(wire, &echoed)
+			|| !ClusterR4CrOwnerEqual(&echoed, &expected->requester_owner))
+			return false;
+	}
 	if (status == GCS_BLOCK_REPLY_R4_UNDO_DATA_RESULT) {
 		uint32 physical_generation;
 
@@ -2561,9 +2590,9 @@ gcs_block_r4_publish_refusal(int worker_id, const ClusterICEnvelope *env,
 		&& current_master_node < CLUSTER_MAX_NODES)
 		header.page_lsn = (uint64)(uint32)(current_master_node + 1);
 	GcsBlockReplyHeaderSetForwardingMasterNode(&header, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
-	queued = cluster_lms_outbound_enqueue_zero_block_reply_cap_bound(
-		worker_id, env->source_node_id, &header, R4_CR_REQUIRED_HELLO_CAPS,
-		requester_capability_generation);
+	queued = cluster_lms_outbound_enqueue_r4_refusal_cap_bound(
+		worker_id, env->source_node_id, &header, &request->requester_owner,
+		R4_CR_REQUIRED_HELLO_CAPS, requester_capability_generation);
 	/* A non-admitted refusal has no transport owner. The requester's existing
 	 * retransmit still owns recovery; expose the refusal instead of claiming
 	 * delivery or blocking the LMS that must drain the full ring. */
@@ -2601,9 +2630,9 @@ gcs_block_r4_publish_holder_refusal(int worker_id, const ClusterR4CrForwardPaylo
 	header.transition_id = forward->base.transition_id;
 	header.status = (uint8)status;
 	GcsBlockReplyHeaderSetForwardingMasterNode(&header, forward->base.master_node);
-	queued = cluster_lms_outbound_enqueue_zero_block_reply_cap_bound(
+	queued = cluster_lms_outbound_enqueue_r4_refusal_cap_bound(
 		worker_id, (uint32)forward->base.original_requester_node, &header,
-		R4_CR_REQUIRED_HELLO_CAPS, requester_capability_generation);
+		&forward->requester_owner, R4_CR_REQUIRED_HELLO_CAPS, requester_capability_generation);
 	if (!queued)
 		cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_REPLY,
 											CLUSTER_IC_SEND_NOT_ADMITTED);
@@ -2613,13 +2642,13 @@ gcs_block_r4_publish_holder_refusal(int worker_id, const ClusterR4CrForwardPaylo
 static bool
 gcs_block_r4_request_base_valid(const ClusterICEnvelope *env,
 								const ClusterR4CrRequestPayload *request, uint64 current_epoch,
-								SCN *read_scn_out)
+								SCN *read_scn_out, ClusterR4CrOwnerChallenge *owner_out)
 {
 	int i;
 
 	if (read_scn_out != NULL)
 		*read_scn_out = InvalidScn;
-	if (env == NULL || request == NULL || read_scn_out == NULL
+	if (env == NULL || request == NULL || read_scn_out == NULL || owner_out == NULL
 		|| env->msg_type != PGRAC_IC_MSG_GCS_BLOCK_REQUEST
 		|| env->payload_length != sizeof(*request)
 		|| env->source_node_id >= RESOURCE_X_PROTOCOL_NODE_LIMIT
@@ -2629,6 +2658,8 @@ gcs_block_r4_request_base_valid(const ClusterICEnvelope *env,
 		|| request->base.requester_backend_id > MaxBackends
 		|| request->base.transition_id != (uint8)PCM_TRANS_N_TO_S
 		|| request->base.epoch != env->epoch || request->base.epoch != current_epoch
+		|| !ClusterR4CrOwnerWireGet(&request->requester_owner, owner_out)
+		|| !ClusterR4CrOwnerForRequester(owner_out, request->base.sender_node)
 		|| request->base.reserved_0[0] != 0 || request->base.reserved_0[1] != 0
 		|| !ClusterR4RequestExtensionGetCr(&request->extension, read_scn_out))
 		return false;
@@ -2651,6 +2682,7 @@ cluster_gcs_block_r4_route_cr(const ClusterICEnvelope *env,
 	PcmAuthoritySnapshot authority;
 	GcsBlockR4RouteIdentity identity;
 	ClusterR4CrRouteProof fresh_proof;
+	ClusterR4CrOwnerChallenge requester_owner;
 	GcsBlockR4RouteRecord stored_record;
 	ClusterR4CrForwardPayload forward;
 	uint64 current_epoch;
@@ -2715,7 +2747,8 @@ cluster_gcs_block_r4_route_cr(const ClusterICEnvelope *env,
 			goto done;
 		}
 		current_epoch = cluster_epoch_get_current();
-		if (!gcs_block_r4_request_base_valid(env, request, current_epoch, &read_scn)) {
+		if (!gcs_block_r4_request_base_valid(env, request, current_epoch, &read_scn,
+											 &requester_owner)) {
 			reason = CLUSTER_CR_BUILD_PROTOCOL;
 			goto done;
 		}
@@ -2772,6 +2805,7 @@ cluster_gcs_block_r4_route_cr(const ClusterICEnvelope *env,
 		fresh_proof.expected_page_scn = expected_page_scn;
 		fresh_proof.real_master_node = real_master_node;
 		fresh_proof.selected_holder_node = current_holder_node;
+		fresh_proof.requester_owner = requester_owner;
 
 		if (dedup_worker_id < 0 || dedup_worker_id >= cluster_lms_workers
 			|| cluster_lms_shard_for_tag(&identity.tag, cluster_lms_workers) != dedup_worker_id) {
@@ -2808,6 +2842,11 @@ cluster_gcs_block_r4_route_cr(const ClusterICEnvelope *env,
 											stored_record.proof.master_authority_generation,
 											stored_record.proof.master_resource_transition_count,
 											stored_record.proof.expected_page_scn);
+		if (!ClusterR4CrOwnerWireSet(&forward.requester_owner,
+									 &stored_record.proof.requester_owner)) {
+			reason = CLUSTER_CR_BUILD_PROTOCOL;
+			goto done;
+		}
 		if (holder_is_local) {
 			ClusterICSendResult local_send_result;
 
@@ -2883,7 +2922,8 @@ gcs_block_try_r4_forward96(const ClusterICEnvelope *env, const void *payload)
 	bool requester_optional_supported = false;
 
 	if (env == NULL || payload == NULL || env->msg_type != PGRAC_IC_MSG_GCS_BLOCK_FORWARD
-		|| env->payload_length != sizeof(ClusterR4CrForwardPayload))
+		|| (env->payload_length != sizeof(ClusterR4CrForwardPayload)
+			&& env->payload_length != sizeof(ClusterR4InternalForwardPayload)))
 		return false;
 	/* Candidate-2 kind-2 is the sole pre-OPEN FORWARD96 subdomain.  Classify
 	 * it before ordinary TARGET admission so malformed kind-2 frames are
@@ -2891,7 +2931,12 @@ gcs_block_try_r4_forward96(const ClusterICEnvelope *env, const void *payload)
 	if (forward->extension.r4_version == CLUSTER_R4_WIRE_VERSION
 		&& (forward->extension.r4_kind == (uint8)CLUSTER_R4_WIRE_TX_RESOLVE
 			|| forward->extension.r4_kind == (uint8)CLUSTER_R4_WIRE_UNDO_DATA_FETCH))
-		return gcs_block_r4_tx_origin_try_accept(env, forward);
+		return env->payload_length == sizeof(ClusterR4InternalForwardPayload)
+				   ? gcs_block_r4_tx_origin_try_accept(
+						 env, (const ClusterR4InternalForwardPayload *)payload)
+				   : true;
+	if (env->payload_length != sizeof(ClusterR4CrForwardPayload))
+		return true;
 	memset(&admission, 0, sizeof(admission));
 	admission_result = cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
 														 CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
@@ -3022,6 +3067,10 @@ cluster_gcs_block_test_decode_r4_reply(const ClusterICEnvelope *env, const void 
 	expected.sender_node = expected_sender_node;
 	expected.forwarding_master_node = expected_forwarding_master_node;
 	expected.reply_domain = expected_reply_domain;
+	expected.owner_bound
+		= env != NULL && payload != NULL && env->payload_length >= sizeof(GcsBlockReplyHeader)
+		  && ((const GcsBlockReplyHeader *)payload)->status != GCS_BLOCK_REPLY_R4_TX_RESOLVE_RESULT
+		  && ((const GcsBlockReplyHeader *)payload)->status != GCS_BLOCK_REPLY_R4_UNDO_DATA_RESULT;
 	return gcs_block_decode_r4_reply_payload(env, payload, &expected);
 }
 
@@ -3056,6 +3105,7 @@ cluster_gcs_block_test_arm_r4_reply_slot(uint64 request_id, uint64 request_epoch
 	slot = &cluster_gcs_block_test_reply_backend.slots[0];
 	slot->in_use = true;
 	slot->reply_domain = CLUSTER_GCS_BLOCK_REPLY_DOMAIN_R4_CR;
+	slot->r4_cr_owner_bound = true;
 	slot->request_id = request_id;
 	slot->transition_id = transition_id;
 	slot->request_epoch = request_epoch;
@@ -6351,6 +6401,36 @@ gcs_block_r4_send_done(const GcsBlockDonePayload *done, int32 master_node,
 
 #undef R4_CR_REQUIRED_HELLO_CAPS
 
+/* Only the dispatching backend captures its publication. NONE is a known
+ * local state; partial/failed publication never becomes NO_OWNER. */
+static bool
+gcs_block_r4_capture_owner(ClusterR4CrOwnerChallenge *owner)
+{
+	ClusterCanonicalTxnBinding binding;
+	ClusterCanonicalTxnPublishState state;
+	FullTransactionId top = GetTopFullTransactionIdIfAny();
+
+	memset(owner, 0, sizeof(*owner));
+	if (!FullTransactionIdIsValid(top))
+		return true;
+	state = cluster_tt_local_capture_canonical_binding(XidFromFullTransactionId(top), &binding);
+	if (state == CLUSTER_CANONICAL_TXN_NONE)
+		return true;
+	if (state != CLUSTER_CANONICAL_TXN_PUBLISHED || binding.reserved16 != 0)
+		return false;
+	owner->top_fxid = top;
+	owner->active_lsn = binding.active_lsn;
+	owner->segment_id = binding.segment_id;
+	owner->segment_generation = binding.segment_generation;
+	owner->top_xid = binding.xid;
+	owner->slot_offset = binding.slot_offset;
+	owner->slot_wrap = binding.slot_wrap;
+	owner->origin_instance = binding.origin_instance;
+	owner->publish_state = binding.publish_state;
+	owner->flags = CLUSTER_R4_CR_OWNER_PRESENT;
+	return ClusterR4CrOwnerForRequester(owner, cluster_node_id);
+}
+
 static ClusterCrBuildResult
 gcs_block_r4_cr_fetch_and_wait_raw(BufferTag tag, SCN read_scn, int32 real_master_node,
 								   char dst_page[GCS_BLOCK_DATA_SIZE],
@@ -6371,6 +6451,7 @@ gcs_block_r4_cr_fetch_and_wait_raw(BufferTag tag, SCN read_scn, int32 real_maste
 	for (;;) {
 		ClusterGcsBlockOutstandingSlot *slot;
 		ClusterR4CrRequestPayload request;
+		ClusterR4CrOwnerChallenge requester_owner;
 		GcsBlockDonePayload done;
 		uint64 request_id = 0;
 		volatile bool got_reply = false;
@@ -6379,6 +6460,8 @@ gcs_block_r4_cr_fetch_and_wait_raw(BufferTag tag, SCN read_scn, int32 real_maste
 		volatile uint8 reply_status = 0;
 
 		CHECK_FOR_INTERRUPTS();
+		if (!gcs_block_r4_capture_owner(&requester_owner))
+			return CLUSTER_CR_BUILD_FAIL_CLOSED;
 		if (cluster_epoch_get_current() != request_epoch) {
 			*reason_out = CLUSTER_CR_BUILD_EPOCH_MISMATCH;
 			return CLUSTER_CR_BUILD_RETRYABLE;
@@ -6393,6 +6476,14 @@ gcs_block_r4_cr_fetch_and_wait_raw(BufferTag tag, SCN read_scn, int32 real_maste
 		if (slot == NULL) {
 			*reason_out = CLUSTER_CR_BUILD_CAPACITY;
 			return CLUSTER_CR_BUILD_RETRYABLE;
+		}
+		{
+			ClusterGcsBlockBackendBlock *blk = gcs_block_my_block();
+
+			LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
+			slot->r4_requester_owner = requester_owner;
+			slot->r4_cr_owner_bound = true;
+			LWLockRelease(&blk->lock.lock);
 		}
 		if (unlikely(cluster_update_trace_enabled)) {
 			ClusterUpdateTraceEvent event = { 0 };
@@ -6420,7 +6511,8 @@ gcs_block_r4_cr_fetch_and_wait_raw(BufferTag tag, SCN read_scn, int32 real_maste
 				cluster_gcs_block_dedup_lifetime_ms(cluster_gcs_block_retransmit_initial_backoff_ms,
 													cluster_gcs_block_retransmit_max_retries,
 													cluster_gcs_reply_timeout_ms));
-			if (!ClusterR4RequestExtensionSetCr(&request.extension, read_scn)) {
+			if (!ClusterR4RequestExtensionSetCr(&request.extension, read_scn)
+				|| !ClusterR4CrOwnerWireSet(&request.requester_owner, &requester_owner)) {
 				invalidated = true;
 				*reason_out = CLUSTER_CR_BUILD_PROTOCOL;
 			}
@@ -6502,8 +6594,12 @@ gcs_block_r4_cr_fetch_and_wait_raw(BufferTag tag, SCN read_scn, int32 real_maste
 						&& slot->reply_header.epoch == request_epoch
 						&& slot->reply_header.requester_backend_id == (int32)MyBackendId
 						&& slot->reply_header.transition_id == (uint8)PCM_TRANS_N_TO_S) {
+						ClusterR4CrOwnerChallenge current_owner;
+
 						reply_status = slot->reply_header.status;
 						if (reply_status == (uint8)GCS_BLOCK_REPLY_R4_CR_FULL
+							&& gcs_block_r4_capture_owner(&current_owner)
+							&& ClusterR4CrOwnerEqual(&current_owner, &requester_owner)
 							&& slot->reply_header.checksum
 								   == gcs_block_compute_checksum(slot->reply_block_data)) {
 							memcpy(dst_page, slot->reply_block_data, GCS_BLOCK_DATA_SIZE);
@@ -6596,7 +6692,7 @@ cluster_gcs_block_r4_tx_resolve_fetch_and_wait_trace_impl(
 	uint64 formation_epoch, ClusterTxResolution *out, ClusterTxResolveReason *reason_out)
 {
 	ClusterGcsBlockOutstandingSlot *slot = NULL;
-	ClusterR4CrForwardPayload forward;
+	ClusterR4InternalForwardPayload forward;
 	ClusterTxResolution decoded;
 	BufferTag tag;
 	uint64 request_id = 0;
@@ -8612,7 +8708,7 @@ gcs_block_r4_tx_origin_timeout(GcsBlockR4TxOriginContext *context)
 
 static bool
 gcs_block_r4_tx_origin_try_accept(const ClusterICEnvelope *env,
-								  const ClusterR4CrForwardPayload *forward)
+								  const ClusterR4InternalForwardPayload *forward)
 {
 	static const uint8 zero_watermark[8] = { 0 };
 	ClusterTxLocator locator;
@@ -21932,7 +22028,8 @@ gcs_block_try_land_r4_terminal_reply(const ClusterICEnvelope *env, const void *p
 		&& hdr->status != (uint8)GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED
 		&& hdr->status != (uint8)GCS_BLOCK_REPLY_R4_DENIED)
 		return false;
-	if (env->payload_length != GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE)
+	if (env->payload_length != GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE
+		&& env->payload_length != CLUSTER_R4_CR_REPLY_PAYLOAD_SIZE)
 		return true;
 
 	if (hdr->requester_backend_id == CLUSTER_GCS_BLOCK_R4_INTERNAL_ENDPOINT
@@ -21977,6 +22074,8 @@ gcs_block_try_land_r4_terminal_reply(const ClusterICEnvelope *env, const void *p
 			expected.forwarding_master_node = slot->expected_master_node;
 		}
 		expected.reply_domain = CLUSTER_GCS_BLOCK_REPLY_DOMAIN_R4_CR;
+		expected.owner_bound = slot->r4_cr_owner_bound;
+		expected.requester_owner = slot->r4_requester_owner;
 		if (!gcs_block_decode_r4_reply_payload(env, payload, &expected)) {
 			pg_atomic_fetch_add_u64(&ClusterGcsBlock->stale_reply_drop_count, 1);
 			LWLockRelease(&blk->lock.lock);
@@ -22278,10 +22377,10 @@ gcs_block_forward_reply_immediate_deny(const GcsBlockForwardPayload *fwd)
 	pfree(deny_buf);
 }
 
-/* The 136-byte CTRC family is disjoint from every BufferTag forward.  It is
- * consumed here even when malformed, so no byte collision can reach legacy
- * holder logic.  A positive ACK is built only while the exact target R4
- * formation/root and both endpoint identities remain current. */
+/* CTRC and owner-bound CR both use 136 bytes. Claim only the existing CTRC
+ * selector domain, then validate the complete frame below. Malformed frames
+ * outside that domain are still consumed by the exact R4/legacy shape gates.
+ * A positive ACK requires the exact current R4 formation/root and endpoints. */
 static bool
 gcs_block_try_ctrc_forward136(const ClusterICEnvelope *env, const void *payload)
 {
@@ -22310,7 +22409,9 @@ gcs_block_try_ctrc_forward136(const ClusterICEnvelope *env, const void *payload)
 	bool source_capability_current;
 	bool bracket_current = false;
 
-	if (env == NULL || payload == NULL || env->payload_length != CLUSTER_CTRC_SEAL_REQUEST_BYTES)
+	if (env == NULL || payload == NULL || env->payload_length != CLUSTER_CTRC_SEAL_REQUEST_BYTES
+		|| ((const uint8 *)payload)[62] != CLUSTER_CTRC_SELECTOR_VERSION
+		|| ((const uint8 *)payload)[63] != CLUSTER_CTRC_FORWARD_KIND)
 		return false;
 	MemSet(&request, 0, sizeof(request));
 	MemSet(&key, 0, sizeof(key));

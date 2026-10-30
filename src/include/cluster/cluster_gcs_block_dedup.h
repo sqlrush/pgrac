@@ -192,7 +192,7 @@ typedef enum GcsBlockR4RouteSendResult {
 
 StaticAssertDecl(sizeof(GcsBlockR4RouteIdentity) == 64,
 				 "R4 CR route identity must remain 64 bytes");
-StaticAssertDecl(sizeof(GcsBlockR4RouteRecord) == 128, "R4 CR route record must remain 128 bytes");
+StaticAssertDecl(sizeof(GcsBlockR4RouteRecord) == 168, "R4 CR route record must remain 168 bytes");
 
 typedef union GcsBlockDedupPayloadMeta {
 	ClusterSfDepVec sf_dep_vec;
@@ -200,8 +200,8 @@ typedef union GcsBlockDedupPayloadMeta {
 	GcsBlockR4RouteRecord r4_route;
 } GcsBlockDedupPayloadMeta;
 
-StaticAssertDecl(sizeof(GcsBlockDedupPayloadMeta) == 128,
-				 "dedup payload metadata remains the established 128-byte cell");
+StaticAssertDecl(sizeof(GcsBlockDedupPayloadMeta) == 168,
+				 "dedup payload metadata includes the separate 40-byte owner challenge");
 
 typedef struct GcsBlockDedupEntry {
 	GcsBlockDedupKey key;				   /* 24B — HTAB key */
@@ -218,7 +218,7 @@ typedef struct GcsBlockDedupEntry {
 	uint8 sf_dep_count;					   /*  1B — exact reservation token */
 	bool first_fill_no_grant;			   /* terminal denial before any grant */
 	uint8 _pad1[4];						   /* dep_vec remains @ 112 */
-	GcsBlockDedupPayloadMeta payload_meta; /* 128B — deps or exact PCM-X identity */
+	GcsBlockDedupPayloadMeta payload_meta; /* 168B — deps or exact bound route */
 	char block_data[GCS_BLOCK_DATA_SIZE];  /* 8192B — full page payload */
 	TimestampTz completed_at_ts;		   /*  8B — generic wall / R4 monotonic replied */
 	TimestampTz registered_at_ts;		   /*  8B — generic wall / R4 monotonic in-flight */
@@ -241,8 +241,8 @@ StaticAssertDecl(offsetof(GcsBlockDedupEntry, reply_header) == 56,
 				 "dedup reply header offset remains 56");
 StaticAssertDecl(offsetof(GcsBlockDedupEntry, payload_meta) == 112,
 				 "dedup payload metadata offset remains 112");
-StaticAssertDecl(sizeof(GcsBlockDedupEntry) == 8472,
-				 "GcsBlockDedupEntry 8472B (8448 spec-6.2 + 24 round-2 DONE lifecycle)");
+StaticAssertDecl(sizeof(GcsBlockDedupEntry) == 8512,
+				 "GcsBlockDedupEntry 8512B including the separate 40B owner challenge");
 
 /* ============================================================
  * GcsBlockDedupResult — outcome of lookup_or_register.
