@@ -227,6 +227,158 @@ sub wait_exit_cell {
  return $completed && !@cleanup;
 }
 
+sub judge_requalification {
+ my ($case,$option)=@_;
+ my ($input,$out,$err)=(encode_json($case),'','');
+ my $ok=run([$ENV{PYTHON} // 'python3',"$FindBin::RealBin/../pre2/m2_itl_capacity.py",$option],
+  '<',\$input,'>',\$out,'2>',\$err,timeout(2));
+ die "requalification evaluator produced no result: $err" unless $out ne '';
+ my $result=decode_json($out);
+ return ($ok ? $result->{$option eq '--requalify-mutation' ? 'mutation' : 'requalified'} : undef,
+  $result->{error} // $err);
+}
+
+sub commit_requalification_mutator {
+ my ($node,$r,$mutator,$start,$selected,$kind,$name,$before,$sql,$waiter_xid,$offset,$until)=@_;
+ die 'mutation exceeded the original deadline' unless clock_gettime(CLOCK_MONOTONIC)<$until;
+ die 'invalid requalification cell' unless ($kind eq 'update' || $kind eq 'delete')
+  && $name eq "m2_b06_$kind";
+ my $pid=0+$mutator->query_safe('SELECT pg_backend_pid()');
+ my $xid=0+$mutator->query_safe('SELECT pg_current_xact_id()::text');
+ die 'selected mutator identity changed' unless $pid==$selected->{pid} && $xid==$selected->{xid};
+ die 'mutation exceeded the original deadline' unless clock_gettime(CLOCK_MONOTONIC)<$until;
+ my $change=$kind eq 'update' ? "UPDATE $name SET v=10 WHERE id=9" : "DELETE FROM $name WHERE id=9";
+ my $changed=decode_json($mutator->query_safe("WITH changed AS ($change
+  RETURNING id,v,ctid::text AS ctid,xmin::text AS xmin,xmax::text AS xmax)
+  SELECT row_to_json(changed) FROM changed"));
+ $r->{run}->pump_nb();
+ my $case={start=>$start,kind=>$kind,sql=>$sql,waiter_xid=>$waiter_xid,before=>$before,
+  mutation_row=>$changed,mutator_pid=>$pid,mutator_xid=>$xid,
+  log=>substr(slurp_file($node->logfile),$offset),reader=>activity($node,$start->{waiter_pid}),
+  holders=>exit_owners($node,$start->{holders})};
+ save_json("b06-$name-mutation",$case);
+ my ($proof,$error)=judge_requalification($case,'--requalify-mutation');
+ my $json=JSON::PP->new->canonical;
+ die "mutation evidence refused: $error" unless defined($proof)
+  && $json->encode($proof) eq $json->encode({kind=>$kind,selected=>$selected,authoritative=>JSON::PP::false});
+ die 'mutation exceeded the original deadline' unless clock_gettime(CLOCK_MONOTONIC)<$until;
+ # Only the still-owned client named by the full live wait evidence commits.
+ $mutator->query_safe('COMMIT');
+ return $case;
+}
+
+sub requalification_cell {
+ my ($node,$nodes,$kind)=@_;
+ my $name="m2_b06_$kind";
+ my $first_session=scalar(@sessions);
+ my ($r,$proof);
+ my $completed=eval {
+  $node->safe_psql('postgres',"CREATE TABLE $name(id int PRIMARY KEY,v int);
+   INSERT INTO $name SELECT g,0 FROM generate_series(1,9) g;");
+  $node->safe_psql('postgres',"VACUUM(FREEZE) $name");
+  my @tids=split /\n/,$node->safe_psql('postgres',"SELECT id,ctid FROM $name ORDER BY id");
+  my %blocks;
+  for my $tid (@tids) {
+   die "invalid original row location: $tid" unless $tid =~ /^\d+\|\((\d+),\d+\)$/;
+   $blocks{$1}=1;
+  }
+  die 'requalification rows do not share one block' unless @tids==9 && keys(%blocks)==1;
+  my ($block)=keys %blocks;
+  my @tag=map {0+$_} split /\|/,$node->safe_psql('postgres',"SELECT
+   COALESCE(NULLIF(c.reltablespace,0),d.dattablespace)||'|'||d.oid||'|'||
+   pg_relation_filenode(c.oid)||'|0|$block' FROM pg_class c,pg_database d
+   WHERE c.oid='$name'::regclass AND d.datname=current_database()");
+  die 'missing full requalification relation tag' unless @tag==5;
+  my $before=decode_json($node->safe_psql('postgres',"SELECT row_to_json(t) FROM (
+   SELECT id,v,ctid::text AS ctid,xmin::text AS xmin,xmax::text AS xmax FROM $name WHERE id=9) t"));
+  my (@holders,%by_pid);
+  for my $row (1..8) {
+   my $s=session($node);
+   my $pid=0+$s->query_safe('SELECT pg_backend_pid()');
+   $s->query_safe("BEGIN; UPDATE $name SET v=1 WHERE id=$row");
+   push @holders,{row=>$row,node=>0,pid=>$pid,xid=>0+$s->query_safe('SELECT pg_current_xact_id()::text')};
+   $by_pid{$pid}=$s;
+  }
+  $r=session($node);
+  $r->query_safe('\\set VERBOSITY verbose');
+  my $pid=0+$r->query_safe('SELECT pg_backend_pid()');
+  $r->query_safe('BEGIN');
+  my $waiter_xid=0+$r->query_safe('SELECT pg_current_xact_id()::text');
+  save_json("b06-$name-setup",{tag=>\@tag,ctids=>\@tids,before=>$before,holders=>\@holders,pid=>$pid,
+   waiter_xid=>$waiter_xid,statement_timeout=>$r->query_safe('SHOW statement_timeout'),
+   ges_request_timeout=>$r->query_safe('SHOW cluster.ges_request_timeout_ms')});
+  my $sql="UPDATE $name SET v=v+1 WHERE id=9;";
+  my $offset=-s $node->logfile;
+  my $until=clock_gettime(CLOCK_MONOTONIC)+10;
+  $r->query_until(qr/B06_SENT/,"\\echo B06_SENT\n$sql\n");
+  my ($start,$selected)=exact_exit_wait($node,$r,$pid,$sql,$block,\@tag,\@holders,$offset,$until,$name);
+  die 'original UPDATE did not enter the exact capacity wait' unless defined($selected);
+  my $mutation=commit_requalification_mutator($node,$r,$by_pid{$selected->{pid}},$start,$selected,
+   $kind,$name,$before,$sql,$waiter_xid,$offset,$until);
+  my @waits=($start);
+  @holders=grep {$_->{pid}!=$selected->{pid}} @holders;
+  my $done=0;
+  while(clock_gettime(CLOCK_MONOTONIC)<$until) {
+   $r->{run}->pump_nb();
+   my $state=activity($node,$pid);
+   die 'original requalification backend disappeared' unless defined($state);
+   if($state->{state} eq 'idle in transaction' && $state->{query} eq $sql) {
+    $done=1; last;
+   }
+   die 'original requalification UPDATE failed' if $state->{state} eq 'idle in transaction (aborted)';
+   my ($case,$next)=exact_exit_wait($node,$r,$pid,$sql,$block,\@tag,\@holders,$offset,$until,$name);
+   if(!defined($next)) {$done=1; last;}
+   die 'more than the original eight owners were selected' if @waits>=8;
+   die 'fresh capacity wait reused a registration' unless $next->{wait_seq}>$selected->{wait_seq};
+   save_json("b06-$name-selection-".scalar(@waits),{evidence=>$case,selected=>$next});
+   die 'owner commit exceeded the original deadline' unless clock_gettime(CLOCK_MONOTONIC)<$until;
+   $by_pid{$next->{pid}}->query_safe('COMMIT');
+   push @waits,$case;
+   @holders=grep {$_->{pid}!=$next->{pid}} @holders;
+  }
+  die 'original UPDATE did not requalify under its original deadline' unless $done;
+  my $state=activity($node,$pid);
+  my ($out,$had_error)=$r->query("\\echo B06_SQLSTATE :SQLSTATE\n");
+  my $post_xid=0+$r->query_safe('SELECT pg_current_xact_id()::text');
+  my $rows=decode_json($r->query_safe("SELECT COALESCE(json_agg(t),'[]'::json) FROM (
+   SELECT id,v,ctid::text AS ctid,xmin::text AS xmin,xmax::text AS xmax FROM $name WHERE id=9) t"));
+  my $case={mutation=>$mutation,waits=>\@waits,log=>substr(slurp_file($node->logfile),$offset),
+   stdout=>$out,stderr=>$r->{stderr},client_had_error=>$had_error ? JSON::PP::true : JSON::PP::false,
+   reader=>$state,waiter_xid=>$post_xid,rows=>$rows,remaining=>exit_owners($node,\@holders)};
+  save_json("b06-$name-finish",$case);
+  my ($result,$error)=judge_requalification($case,'--requalify');
+  save_json("b06-$name-judge",{result=>$result,error=>$error});
+  my $json=JSON::PP->new->canonical;
+  die "requalification evidence refused: $error" unless defined($result)
+   && ($result->{kind} // '') eq $kind && ($result->{completed_waits} // 0)>0
+   && ($result->{released_owners} // 0)==@waits
+   && exists($result->{authoritative}) && !$result->{authoritative}
+   && $json->encode($result->{selected}) eq $json->encode($selected);
+  $proof=$result;
+  # Prove the original UPDATE before explicitly finishing the other clients.
+  $by_pid{$_->{pid}}->query_safe('COMMIT') for @holders;
+  die 'original UPDATE connection was replaced' unless $r->query_safe('SELECT pg_backend_pid()') eq "$pid";
+  $r->query_safe('COMMIT');
+  my $expected=join "\n",((map {"$_|1"} 1..8),($kind eq 'update' ? ('9|11') : ()));
+  for my $member (@$nodes) {
+   die 'committed requalified rows disagree across members'
+    unless $member->safe_psql('postgres',"SELECT id,v FROM $name ORDER BY id") eq $expected;
+  }
+  1;
+ };
+ my $error=$@;
+ save_json("b06-$name-client",{map {$_=>$r->{$_}} qw(stdin stdout stderr)}) if defined($r);
+ my @cleanup;
+ for my $s (splice @sessions,$first_session) {
+  eval {$s->quit or die 'psql did not exit normally'; 1;} or push @cleanup,$@;
+ }
+ save_json("b06-$name-execution",{completed=>$completed ? JSON::PP::true : JSON::PP::false,
+  error=>$error,cleanup=>\@cleanup,proof=>$proof});
+ diag($error) unless $completed;
+ diag(join '\n',@cleanup) if @cleanup;
+ return $completed && !@cleanup;
+}
+
 sub deadlock_victim {
  my ($node,$clients,$until)=@_;
  my $completed=0;
@@ -519,6 +671,10 @@ for my $kind ('cancel','statement_timeout','capacity_timeout') {
 }
 ok(deadlock_cell($node,\@nodes),
  'B08 two exact ITL capacity waits form a confirmed deadlock and the original backend recovers');
+for my $kind ('update','delete') {
+ ok(requalification_cell($node,\@nodes,$kind),
+  "B06 the original UPDATE requalifies after the exact blocker $kind changes its target row");
+}
 $cluster->stop_cluster;
 undef $cluster;
 pass('all four normal members complete the original stop proof');
