@@ -4,7 +4,9 @@
  * Author: SqlRush <sqlrush@gmail.com> */
 #include "postgres.h"
 #include "cluster/cluster_inject.h"
+#ifdef ENABLE_INJECTION
 #undef CLUSTER_INJECTION_POINT /* page fixture supplies its original injection boundary */
+#endif
 #include "cluster/cluster_block_io_trace.h"
 #define PGRAC_TEST_REAL_PI_WRITEBACK 1
 int page_data_boundary_test_main(void);
@@ -36,9 +38,22 @@ int cluster_interconnect_tier = CLUSTER_IC_TIER_1;
 /* Real trace bodies use the configured, disabled diagnostic GUC. */
 bool cluster_trace_block_io = false;
 /* Tracing is disabled above; an unexpected diagnostic dispatch refuses. */
-void write_stderr(const char *fmt,...) { (void)fmt; abort(); }
+void
+write_stderr(const char *fmt, ...)
+{
+	(void)fmt;
+	abort();
+}
 PGPROC *MyProc;
 PROC_HDR *ProcGlobal;
+/* The real unarmed injection registry is retained. Unexpected interrupt
+ * dispatch is outside this standalone owner and must fail the test. */
+volatile sig_atomic_t InterruptPending = false;
+void
+ProcessInterrupts(void)
+{
+	abort();
+}
 static uint64 wb_epoch = 1, wb_nonce;
 static uint64 wb_boots[3] = { 9, 9, 9 };
 static uint64 wb_membership_generation = 2;

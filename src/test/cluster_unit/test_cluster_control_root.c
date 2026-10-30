@@ -5,6 +5,10 @@
  *
  *-------------------------------------------------------------------------
  */
+#ifdef PGRAC_CONTROL_ROOT_RENAME_WRAP
+/* GNU ld must retain both the real common helpers and this fault boundary. */
+#define durable_rename __wrap_durable_rename
+#endif
 #include "postgres.h"
 #include "cluster/cluster_relmap_checkpoint.h"
 #include "cluster/cluster_wal_writer.h"

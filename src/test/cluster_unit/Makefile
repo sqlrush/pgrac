@@ -30,6 +30,12 @@ else
 R4_RUNTIME_VIS_TEST_DEAD_STRIP = -Wl,--gc-sections
 endif
 
+ifeq ($(PORTNAME), linux)
+# Keep the ROOT fixture's rename fault boundary separate from libpgcommon.
+CONTROL_ROOT_TEST_CPPFLAGS = -DPGRAC_CONTROL_ROOT_RENAME_WRAP
+CONTROL_ROOT_TEST_LDFLAGS = -Wl,--wrap=durable_rename
+endif
+
 # The backend CRC dispatcher logs its hardware selection on some platforms.
 # Retain that real dispatcher; supply a fail-stop standalone logging boundary.
 CLUSTER_UNIT_PORT_LIBS = $(top_builddir)/src/port/libpgport_srv.a cluster_unit_port_stubs.o cluster_catalog_trace_test.o
@@ -3300,12 +3306,15 @@ test_cluster_abort_writer_flush.inc: $(top_srcdir)/src/backend/storage/buffer/bu
 test_cluster_pi_drop_storage: test_cluster_pi_drop_storage.c test_cluster_page_data.c
 test_cluster_page_data test_cluster_pi_writeback test_cluster_sync_error test_cluster_pi_drop_storage test_cluster_abort_writer: PI_WRITEBACK_CODEC_OBJS = $(CLUSTER_KO_O)
 test_cluster_page_data test_cluster_sync_error test_cluster_pi_drop_storage test_cluster_abort_writer: $(CLUSTER_KO_O)
-test_cluster_pi_writeback: test_cluster_pi_writeback_v2.inc $(CLUSTER_KO_O) $(CLUSTER_INJECT_O) cluster_pi_io_trace_test.o
+test_cluster_pi_writeback: test_cluster_pi_writeback_v2.inc $(CLUSTER_KO_O) cluster_pi_inject_test.o cluster_pi_io_trace_test.o
 # Keep inherited FlushBuffer diagnostics bound to their real implementations.
-test_cluster_pi_writeback: PI_WRITEBACK_DIAGNOSTIC_OBJS = $(CLUSTER_INJECT_O) cluster_pi_io_trace_test.o
+test_cluster_pi_writeback: PI_WRITEBACK_DIAGNOSTIC_OBJS = cluster_pi_inject_test.o cluster_pi_io_trace_test.o
+cluster_pi_inject_test.o: $(top_srcdir)/src/backend/cluster/cluster_inject.c \
+		$(top_srcdir)/src/include/cluster/cluster_inject.h Makefile
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 cluster_pi_io_trace_test.o: $(top_srcdir)/src/backend/cluster/cluster_block_io_trace.c \
-		$(top_srcdir)/src/include/cluster/cluster_block_io_trace.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+		$(top_srcdir)/src/include/cluster/cluster_block_io_trace.h Makefile
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 test_cluster_pi_writeback: test_cluster_pi_writeback.c test_cluster_page_data.c \
 		$(top_srcdir)/src/backend/cluster/cluster_pi_rebuild.c \
 		$(top_srcdir)/src/include/cluster/cluster_pi_rebuild.h \
@@ -3326,7 +3335,7 @@ test_cluster_page_data test_cluster_pi_writeback test_cluster_sync_error test_cl
 		$(CLUSTER_UNIT_CRYPTOHASH_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $(srcdir)/$@.c test_cluster_page_data_stable.o test_cluster_page_wal_product.o $(CLUSTER_WAL_CLAIM_O) \
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(if $(filter test_cluster_pi_writeback,$@),-ffunction-sections -fdata-sections) $(srcdir)/$@.c test_cluster_page_data_stable.o test_cluster_page_wal_product.o $(CLUSTER_WAL_CLAIM_O) \
 		$(PAGE_DATA_SPACE_OBJS) $(PI_WRITEBACK_CODEC_OBJS) $(PI_WRITEBACK_DIAGNOSTIC_OBJS) \
 		$(top_builddir)/src/backend/storage/lmgr/s_lock.o \
 		$(CLUSTER_PAGE_ONLINE_PLAN_O) $(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) \
@@ -4544,7 +4553,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_relma
 		$(top_builddir)/src/backend/cluster/cluster_wal_tail.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o xlogreader_fs.o \
 		$(top_srcdir)/src/include/cluster/cluster_wal_tail.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(if $(filter test_cluster_control_root,$@),$(CONTROL_ROOT_TEST_CPPFLAGS)) $< $(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_retained_owner.o) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_cold_checkpoint_publisher.o) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_native_owner.o) \
@@ -4576,7 +4585,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_relma
 		$(top_builddir)/src/backend/cluster/cluster_wal_tail.o \
 		xlogreader_fs.o \
 		$(top_builddir)/src/common/libpgcommon.a \
-		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) \
+		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(if $(filter test_cluster_control_root,$@),$(CONTROL_ROOT_TEST_LDFLAGS)) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 # PGRAC: perturb only syscall timing/failure; all read/decoder/selection code is
@@ -5248,9 +5257,9 @@ test_cluster_wal_inputs_job_lifecycle: test_cluster_wal_inputs_job_lifecycle.c t
 		$(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_CRYPTOHASH_O) $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(top_srcdir)/src/backend/cluster $< \
 		$(CLUSTER_CF_ENQUEUE_O) $(CLUSTER_LOCK_OWNER_O) $(CLUSTER_CONTROL_REQUEST_O) \
-		$(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_CRYPTOHASH_O) $(CLUSTER_UNIT_PORT_LIBS) \
+		$(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_CRYPTOHASH_O) \
 		$(top_builddir)/src/backend/storage/lmgr/s_lock.o $(top_builddir)/src/common/libpgcommon.a \
-		$(LDFLAGS) $(filter -lcrypto,$(LIBS)) -o $@
+		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(filter -lcrypto,$(LIBS)) -lm -o $@
 
 test_cluster_wal_inputs_job_begin_types.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_inputs.c Makefile
 	awk '/^typedef struct WalInputsWork/ { emit=1; count++ } \
