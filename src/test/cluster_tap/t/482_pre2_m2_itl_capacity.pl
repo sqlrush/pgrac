@@ -397,6 +397,7 @@ sub deadlock_cell {
 
 $cluster=PostgreSQL::Test::ClusterPRE2->new_cluster('m2_b07',nodes=>4,blackbox=>1,
  required_operations=>[],extra_conf=>['autovacuum=off','cluster.trace_tx_identity=on',
+ 'cluster.trace_control_config=on',
   'log_error_verbosity=verbose','log_line_prefix=\'%m [%p] \'']);
 $cluster->start_cluster;
 my @nodes=$cluster->nodes;
