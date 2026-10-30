@@ -153,7 +153,7 @@ static FullTransactionId native_future;
 static TransactionId native_completed_xid;
 static GlobalTransaction native_locked_gxact;
 static BackendId native_backend_id = 1;
-static bool native_postmaster_environment = true;
+static bool native_postmaster_environment pg_attribute_unused() = true;
 static LWLock *native_prepared_locks[2];
 static LWLockMode native_prepared_modes[2];
 static unsigned native_prepared_depth;
@@ -199,7 +199,7 @@ native_recovery_in_progress(void)
 {
 	return false;
 }
-static bool
+static bool pg_attribute_unused()
 native_lock_held_in_mode(LWLock *lock, LWLockMode mode)
 {
 	if (native_prepared_source_exit || native_reused_source_exit)
@@ -208,7 +208,7 @@ native_lock_held_in_mode(LWLock *lock, LWLockMode mode)
 				return true;
 	return native_lock_held && lock == native_held_lock && native_lock_mode == mode;
 }
-static bool
+static bool pg_attribute_unused()
 native_lock_is_held(LWLock *lock)
 {
 	return native_lock_held && lock == native_held_lock;
@@ -9868,6 +9868,93 @@ UT_TEST(test_source_scan_local_origin_keeps_original_locked_fullxid_handoff)
 	}
 }
 
+
+UT_TEST(test_reserved_original_fullxid_is_read_only_under_original_origin_lock)
+{
+	ClusterCtrcTxnKeyV1 key;
+	ClusterCtrcOriginReservation reservation, replay;
+	ClusterCtrcOriginEntry before;
+	ClusterCtrcSharedHeader header_before;
+	FullTransactionId full;
+	uint32 grant;
+	unsigned locks, reads;
+
+	reset_fixture();
+	cluster_node_id = 0;
+	key = fresh_origin_key();
+	test_my_proc.xid = key.xid;
+	test_top_full = FullTransactionIdFromEpochAndXid(7, key.xid);
+	pg_atomic_write_u64(&test_my_proc.cluster_top_full_xid_atomic,
+		U64FromFullTransactionId(test_top_full));
+	UT_ASSERT_EQ(cluster_ctrc_origin_reserve_active(&key, &reservation),
+		CLUSTER_CTRC_ORIGIN_RESERVED_PENDING);
+	for (unsigned phase = 0; phase < 2; phase++) {
+		if (phase) {
+			UT_ASSERT(cluster_ctrc_origin_open_reserved(&reservation, &grant));
+			UT_ASSERT_EQ(cluster_ctrc_origin_reserve_active(&key, &replay),
+				CLUSTER_CTRC_ORIGIN_RESERVED_EXISTING_OPEN);
+			reservation = replay;
+		}
+		before = ctrc_origin_entries()[0];
+		header_before = *CtrcShared;
+		locks = sleepable_acquisitions;
+		reads = top_full_reads;
+		full = InvalidFullTransactionId;
+		UT_ASSERT(cluster_ctrc_origin_reserved_full_xid(&reservation, &full));
+		UT_ASSERT(FullTransactionIdEquals(full, test_top_full));
+		UT_ASSERT_EQ(sleepable_acquisitions, locks + 1);
+		UT_ASSERT_EQ(top_full_reads, reads);
+		UT_ASSERT_EQ(held_count, 0);
+		UT_ASSERT(memcmp(&before, &ctrc_origin_entries()[0], sizeof(before)) == 0);
+		UT_ASSERT(memcmp(&header_before, CtrcShared, sizeof(header_before)) == 0);
+	}
+}
+
+UT_TEST(test_reserved_original_fullxid_refuses_stale_and_foreign_without_mutation)
+{
+	for (unsigned fault = 0; fault < 14; fault++) {
+		ClusterCtrcTxnKeyV1 key;
+		ClusterCtrcOriginReservation reservation;
+		ClusterCtrcOriginEntry before;
+		ClusterCtrcSharedHeader header_before;
+		FullTransactionId full = FullTransactionIdFromU64(123);
+
+		reset_fixture();
+		cluster_node_id = 0;
+		key = fresh_origin_key();
+		test_my_proc.xid = key.xid;
+		test_top_full = FullTransactionIdFromEpochAndXid(7, key.xid);
+		pg_atomic_write_u64(&test_my_proc.cluster_top_full_xid_atomic,
+			U64FromFullTransactionId(test_top_full));
+		UT_ASSERT_EQ(cluster_ctrc_origin_reserve_active(&key, &reservation),
+			CLUSTER_CTRC_ORIGIN_RESERVED_PENDING);
+		switch (fault) {
+		case 0: reservation.valid = false; break;
+		case 1: reservation.kind = 99; break;
+		case 2: reservation.reservation_generation++; break;
+		case 3: reservation.origin_index++; break;
+		case 4: reservation.key.origin_boot_incarnation++; break;
+		case 5: reservation.original_full_xid = FullTransactionIdFromEpochAndXid(8, key.xid); break;
+		case 6: reservation.reserved8[0] = 1; break;
+		case 7: ctrc_origin_entries()[0].state = CTRC_ORIGIN_BLOCKED; break;
+		case 8: ctrc_origin_entries()[0].grant_generation = 1; break;
+		case 9: reservation.kind = CTRC_ORIGIN_RESERVATION_EXISTING_OPEN; break;
+		case 10: cluster_node_id = 1; break;
+		case 11: reservation.original_full_xid = FullTransactionIdFromU64(UINT64_MAX); break;
+		case 12: break; /* NULL reservation */
+		case 13: break; /* NULL output */
+		}
+		before = ctrc_origin_entries()[0];
+		header_before = *CtrcShared;
+		UT_ASSERT(!cluster_ctrc_origin_reserved_full_xid(fault == 12 ? NULL : &reservation,
+			fault == 13 ? NULL : &full));
+		if (fault != 13) UT_ASSERT_EQ(U64FromFullTransactionId(full), 0);
+		UT_ASSERT(memcmp(&before, &ctrc_origin_entries()[0], sizeof(before)) == 0);
+		UT_ASSERT(memcmp(&header_before, CtrcShared, sizeof(header_before)) == 0);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
 int
 main(void)
 {
@@ -9875,7 +9962,7 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(212);
+	UT_PLAN(214);
 	UT_RUN(test_prepare_path_namespace_precedes_input_and_resets_output);
 	UT_RUN(test_prepare_path_input_precedes_journal_exhaustion);
 	UT_RUN(test_prepare_path_chain_precedes_locator_and_keeps_blocked_state);
@@ -10093,6 +10180,8 @@ main(void)
 	UT_RUN(test_source_scan_local_origin_keeps_original_locked_fullxid_handoff);
 	UT_RUN(test_source_scan_requires_current_original_first_parent);
 	UT_RUN(test_source_scan_checks_every_actual_multihop_ancestor_in_same_cut);
+	UT_RUN(test_reserved_original_fullxid_is_read_only_under_original_origin_lock);
+	UT_RUN(test_reserved_original_fullxid_refuses_stale_and_foreign_without_mutation);
 	free(CtrcShared);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

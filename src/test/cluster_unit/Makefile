@@ -3530,9 +3530,9 @@ test_cluster_undo_tt_transition.inc: $(top_srcdir)/src/backend/cluster/cluster_t
 	     emit { print } /^}/ { emit=0 } END { if (found != 3) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 test_cluster_undo_producer_owner.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_xlog.c Makefile
-	awk '/^(cluster_undo_emit_[a-z_]+|cluster_hw_emit_reserve|cluster_undo_xlog_insert_tt_ctrc_release)\(/ \
+	awk '/^(cluster_undo_emit_[a-z_0-9]+|cluster_hw_emit_reserve|cluster_undo_xlog_insert_tt_ctrc_release)\(/ \
 	     { print "XLogRecPtr"; emit=1; found++ } emit { print } /^}/ { emit=0 } \
-	     END { if (found != 12) exit 1 }' $< > $@.tmp
+	     END { if (found != 13) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_undo_block_native.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_xlog.c Makefile
@@ -7927,7 +7927,9 @@ test_cluster_uba: test_cluster_uba.c unit_test.h \
 # allocator behaviour (3-tier recycle, OVERFLOW, multi-instance, fail-
 # closed) is exercised end-to-end without postmaster.
 CLUSTER_TT_SLOT_O = $(top_builddir)/src/backend/cluster/cluster_tt_slot.o
-CLUSTER_TT_DURABLE_O = $(top_builddir)/src/backend/cluster/cluster_tt_durable.o
+CLUSTER_TT_DURABLE_O = $(top_builddir)/src/backend/cluster/cluster_tt_durable.o \
+	$(top_builddir)/src/backend/storage/page/checksum.o \
+	test_cluster_undo_segment_init_backend.o
 
 # The process-local reservation is allocated by the linked producer and by
 # these fixtures. Rebuild both sides when its header changes.
@@ -8251,10 +8253,10 @@ CLUSTER_UNDO_BLOCK0_RESIDENT_O = \
 	$(top_builddir)/src/backend/cluster/storage/cluster_undo_block0_resident.o
 test_cluster_undo_block0: test_cluster_undo_block0.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_BLOCK0_O) $(CLUSTER_UNDO_BLOCK0_RESIDENT_O) \
-		$(CLUSTER_UNDO_ROOT_DESCRIPTOR_O)
+		$(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) test_cluster_undo_segment_init_backend.o
 	$(CC) $(CFLAGS) $(PTHREAD_CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_BLOCK0_O) $(CLUSTER_UNDO_BLOCK0_RESIDENT_O) \
-		$(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) \
+		$(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) test_cluster_undo_segment_init_backend.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(PTHREAD_LIBS) -o $@
 

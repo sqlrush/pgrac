@@ -43,11 +43,14 @@
 #include "access/transam.h"
 #include "access/xlog.h"
 #include "storage/bufpage.h"
+#include "storage/checksum.h"
+#include "cluster/cluster_undo_segment_init.h"
 #include "storage/proc.h"
 #include "utils/timestamp.h"
 
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_epoch.h"
+#include "cluster/cluster_grd.h"
 #include "cluster/cluster_ges.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_semantic_activation.h"
@@ -589,6 +592,9 @@ static bool g_ctrc_open_ok = true;
 static uint32 g_ctrc_open_grant = 7;
 static int g_ctrc_cancel_pre_bind_calls = 0;
 static int g_ctrc_block_post_bind_calls = 0;
+static int g_bind_v2_emit_calls;
+static xl_undo_tt_identity_v2 g_last_bind_v2;
+static int g_reserved_identity_reads;
 static bool g_bind_emit_error = false;
 static XLogRecPtr g_bind_emit_lsn = (XLogRecPtr)0xabcdef;
 
@@ -738,6 +744,35 @@ cluster_undo_emit_tt_slot_bind(uint8 instance, uint32 segment_id, uint32 segment
 	g_last_bind.wrap = wrap;
 	g_last_bind.xid = xid;
 	g_last_bind.format_version = CLUSTER_UNDO_TT_BIND_VERSION;
+	if (g_after_bind_emit_hook != NULL)
+		g_after_bind_emit_hook();
+	return g_bind_emit_lsn;
+}
+
+bool cluster_ctrc_origin_reserved_full_xid(const ClusterCtrcOriginReservation *, FullTransactionId *);
+bool
+cluster_ctrc_origin_reserved_full_xid(const ClusterCtrcOriginReservation *reservation,
+									FullTransactionId *out)
+{
+	g_reserved_identity_reads++;
+	*out = InvalidFullTransactionId;
+	if (!g_ctrc_original_available || reservation == NULL
+		|| memcmp(reservation, &g_ctrc_original_reservation, sizeof(*reservation)) != 0)
+		return false;
+	*out = g_ctrc_original_reservation.original_full_xid;
+	return true;
+}
+
+XLogRecPtr cluster_undo_emit_tt_slot_bind_v2(const xl_undo_tt_identity_v2 *);
+XLogRecPtr
+cluster_undo_emit_tt_slot_bind_v2(const xl_undo_tt_identity_v2 *identity)
+{
+	g_bind_v2_emit_calls++;
+	g_bind_emit_calls++;
+	g_ctrc_bind_order = ++g_ctrc_event_sequence;
+	if (g_bind_emit_error)
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("injected V2 BIND failure")));
+	g_last_bind_v2 = *identity;
 	if (g_after_bind_emit_hook != NULL)
 		g_after_bind_emit_hook();
 	return g_bind_emit_lsn;
@@ -893,6 +928,12 @@ cluster_undo_smgr_write_header_bytes(ClusterUndoPathIntent intent pg_attribute_u
 		return false;
 	if (buf != NULL && len == sizeof(TTSlot))
 		memcpy(&g_last_written_slot, buf, sizeof(TTSlot));
+	if (buf != NULL && len == BLCKSZ) {
+		if (!g_write_hdr_ok || offset != 0 || !g_current_active)
+			return false;
+		memcpy(g_canned_block, buf, BLCKSZ);
+		return true;
+	}
 	return g_write_hdr_ok && buf != NULL && len == sizeof(TTSlot);
 }
 
@@ -1063,6 +1104,8 @@ reset_current_write_mock(void)
 	g_allocator_current_segment = 1;
 	g_allocator_rollover_after_first_owner = false;
 	g_bind_emit_calls = 0;
+	g_bind_v2_emit_calls = g_reserved_identity_reads = 0;
+	memset(&g_last_bind_v2, 0, sizeof(g_last_bind_v2));
 	memset(&g_last_bind, 0, sizeof(g_last_bind));
 	g_abort_exact_emit_calls = 0;
 	g_flushed_lsn = InvalidXLogRecPtr;
@@ -3662,10 +3705,183 @@ UT_TEST(test_revert_delete_identity_mismatch_failclosed)
 }
 
 
+static void
+active_v2_reset(void)
+{
+	UndoSegmentHeaderDataV2 *h = (UndoSegmentHeaderDataV2 *)g_canned_block;
+	reset_current_write_mock();
+	if (!cluster_undo_segment_make_header_v2_bytes(1, 1, g_canned_block))
+		abort();
+	h->wrap_count = 4;
+	h->pd_checksum = pg_checksum_page(g_canned_block, 0);
+	memcpy(g_current_resident, g_canned_block, BLCKSZ);
+}
+
+static bool
+active_v2_try(uint32 *generation, TTSlot *successor)
+{
+	ClusterSemanticAdmissionToken token = target_modifier_token();
+	volatile bool ok = false;
+	PG_TRY();
+	{
+		ok = cluster_tt_slot_durable_publish_active(&g_allocator_owner, &token,
+													generation, successor) == 0xabcdef;
+	}
+	PG_CATCH();
+	{ }
+	PG_END_TRY();
+	return ok;
+}
+
+UT_TEST(test_active_v2_original_identity_wal_disk_resident_and_retry)
+{
+	uint32 generation;
+	TTSlot prefix;
+	const UndoSegmentHeaderDataV2 *h = (const UndoSegmentHeaderDataV2 *)g_canned_block;
+	uint64 original = UINT64_C(0x700000064);
+	active_v2_reset();
+	UT_ASSERT(active_v2_try(&generation, &prefix));
+	UT_ASSERT_EQ(generation, 4);
+	UT_ASSERT_EQ(g_bind_v2_emit_calls, 1);
+	UT_ASSERT_EQ(g_last_bind_v2.format_version, 2);
+	UT_ASSERT_EQ(g_last_bind_v2.segment_generation, 4);
+	UT_ASSERT_EQ(g_last_bind_v2.original_full_xid, original);
+	UT_ASSERT_EQ(g_last_bind_v2.xid, 100);
+	UT_ASSERT_EQ(g_last_bind_v2.slot_offset, 7);
+	UT_ASSERT_EQ(h->tt_slots[7].original_full_xid, original);
+	UT_ASSERT_EQ(h->tt_slots[7].status, TT_SLOT_ACTIVE);
+	UT_ASSERT_EQ(memcmp(&prefix, &h->tt_slots[7], sizeof(prefix)), 0);
+	UT_ASSERT_EQ(memcmp(g_canned_block, g_current_resident, BLCKSZ), 0);
+	UT_ASSERT_EQ(h->pd_checksum, pg_checksum_page(g_canned_block, 0));
+	UT_ASSERT_EQ(g_write_hdr_calls, 1);
+	UT_ASSERT_EQ(g_reserved_identity_reads, 2);
+	UT_ASSERT(g_ctrc_reserve_order < g_ctrc_bind_order);
+	UT_ASSERT(g_ctrc_bind_order < g_ctrc_write_order);
+	UT_ASSERT(g_ctrc_write_order < g_ctrc_open_order);
+	g_ctrc_reserve_result = CLUSTER_CTRC_ORIGIN_RESERVED_EXISTING_OPEN;
+	UT_ASSERT(active_v2_try(&generation, &prefix));
+	UT_ASSERT_EQ(g_write_hdr_calls, 1);
+	UT_ASSERT_EQ(g_bind_v2_emit_calls, 2);
+	UT_ASSERT_EQ(g_reserved_identity_reads, 4);
+	UT_ASSERT_EQ(g_ctrc_open_calls, 2);
+	UT_ASSERT_EQ(g_current_unpin_calls, 2);
+	UT_ASSERT(!g_current_active);
+	/* Exact terminal predecessor reuse advances wrap, replacing the full
+	 * identity only after the original reservation admitted the new owner. */
+	active_v2_reset();
+	{
+		UndoSegmentHeaderDataV2 *prior = (UndoSegmentHeaderDataV2 *)g_canned_block;
+		g_allocator_owner.wrap = 1;
+		prior->tt_slots[7].xid = 99;
+		prior->tt_slots[7].status = TT_SLOT_COMMITTED;
+		prior->tt_slots[7].commit_scn = (SCN)77;
+		prior->tt_slots[7].original_full_xid = UINT64_C(0x600000063);
+		prior->pd_checksum = pg_checksum_page(g_canned_block, 0);
+		memcpy(g_current_resident, g_canned_block, BLCKSZ);
+	}
+	UT_ASSERT(active_v2_try(&generation, &prefix));
+	UT_ASSERT_EQ(h->tt_slots[7].original_full_xid, original);
+	UT_ASSERT_EQ(h->tt_slots[7].wrap, 1);
+	UT_ASSERT_EQ(h->pd_checksum, pg_checksum_page(g_canned_block, 0));
+}
+
+UT_TEST(test_active_v2_missing_or_cross_epoch_identity_never_binds)
+{
+	for (int variant = 0; variant < 6; variant++) {
+		uint32 generation;
+		TTSlot prefix;
+		char before[BLCKSZ];
+		UndoSegmentHeaderDataV2 *h = (UndoSegmentHeaderDataV2 *)g_canned_block;
+		active_v2_reset();
+		if (variant == 0)
+			g_ctrc_original_available = false;
+		else {
+			h->tt_slots[7].xid = 100;
+			h->tt_slots[7].status = TT_SLOT_ACTIVE;
+			h->tt_slots[7].original_full_xid = UINT64_C(0x800000064);
+			if (variant == 2) h->tt_slots[7].original_full_xid = 0;
+			if (variant == 3) {
+				h->tt_slots[7].status = TT_SLOT_UNUSED;
+				h->tt_slots[7].xid = 0;
+			}
+			if (variant == 4) {
+				h->tt_slots[7].original_full_xid = UINT64_C(0x700000064);
+				h->tt_slots[7].status = TT_SLOT_COMMITTED;
+				h->tt_slots[7].commit_scn = UINT64_MAX;
+			}
+			if (variant == 5) h->tt_slots[7].flags = 0x80;
+			h->pd_checksum = pg_checksum_page(g_canned_block, 0);
+			memcpy(g_current_resident, g_canned_block, BLCKSZ);
+		}
+		memcpy(before, g_canned_block, BLCKSZ);
+		UT_ASSERT(!active_v2_try(&generation, &prefix));
+		UT_ASSERT_EQ(g_bind_emit_calls, 0);
+		UT_ASSERT_EQ(g_write_hdr_calls, 0);
+		UT_ASSERT_EQ(g_ctrc_open_calls, 0);
+		UT_ASSERT_EQ(g_ctrc_cancel_pre_bind_calls, 1);
+		UT_ASSERT_EQ(g_ctrc_block_post_bind_calls, 0);
+		UT_ASSERT_EQ(memcmp(before, g_canned_block, BLCKSZ), 0);
+		UT_ASSERT_EQ(memcmp(before, g_current_resident, BLCKSZ), 0);
+		UT_ASSERT(!g_current_active);
+	}
+}
+
+UT_TEST(test_active_v2_layout_checksum_generation_and_exact_full_preimage)
+{
+	for (int variant = 0; variant < 4; variant++) {
+		uint32 generation;
+		TTSlot prefix;
+		UndoSegmentHeaderDataV2 *h = (UndoSegmentHeaderDataV2 *)g_canned_block;
+		active_v2_reset();
+		if (variant == 0) h->wrap_count++;
+		if (variant == 1) h->pd_checksum ^= 1;
+		if (variant == 2)
+			((UndoSegmentHeaderDataV2 *)g_current_resident)->tt_slots[7].original_full_xid = 1;
+		if (variant == 3) h->tt_layout_version = 3;
+		UT_ASSERT(!active_v2_try(&generation, &prefix));
+		UT_ASSERT_EQ(g_ctrc_reserve_calls, 0);
+		UT_ASSERT_EQ(g_bind_emit_calls, 0);
+		UT_ASSERT_EQ(g_write_hdr_calls, 0);
+		UT_ASSERT_EQ(g_ctrc_open_calls, 0);
+		UT_ASSERT_EQ(g_current_unpin_calls, 1);
+		UT_ASSERT(!g_current_active);
+	}
+}
+
+static void
+active_v2_origin_drift(void)
+{
+	g_ctrc_original_reservation.original_full_xid = FullTransactionIdFromEpochAndXid(8, 100);
+}
+
+UT_TEST(test_active_v2_prebind_cancel_and_postbind_block_keep_custody)
+{
+	for (int variant = 0; variant < 4; variant++) {
+		uint32 generation;
+		TTSlot prefix;
+		active_v2_reset();
+		if (variant == 0) g_bind_emit_error = true;
+		if (variant == 1) g_write_hdr_ok = false;
+		if (variant == 2) g_current_root_drift = true;
+		if (variant == 3) g_after_bind_emit_hook = active_v2_origin_drift;
+		UT_ASSERT(!active_v2_try(&generation, &prefix));
+		UT_ASSERT_EQ(g_ctrc_cancel_pre_bind_calls, variant == 0 ? 1 : 0);
+		UT_ASSERT_EQ(g_ctrc_block_post_bind_calls, variant == 0 ? 0 : 1);
+		UT_ASSERT_EQ(g_ctrc_open_calls, 0);
+		UT_ASSERT_EQ(g_current_unpin_calls, 1);
+		UT_ASSERT(!g_current_active);
+		if (variant >= 2) {
+			const UndoSegmentHeaderDataV2 *h = (const UndoSegmentHeaderDataV2 *)g_canned_block;
+			UT_ASSERT_EQ(h->tt_slots[7].original_full_xid, UINT64_C(0x700000064));
+			UT_ASSERT_EQ(memcmp(g_canned_block, g_current_resident, BLCKSZ), 0);
+		}
+	}
+}
+
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(110);
+	UT_PLAN(114);
 
 	UT_RUN(test_layout_sizes);
 
@@ -3790,6 +4006,10 @@ main(int argc, char **argv)
 	UT_RUN(test_revert_delete_identity_match_apply);
 	UT_RUN(test_revert_delete_identity_mismatch_failclosed);
 
+	UT_RUN(test_active_v2_original_identity_wal_disk_resident_and_retry);
+	UT_RUN(test_active_v2_missing_or_cross_epoch_identity_never_binds);
+	UT_RUN(test_active_v2_layout_checksum_generation_and_exact_full_preimage);
+	UT_RUN(test_active_v2_prebind_cancel_and_postbind_block_keep_custody);
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;
 }

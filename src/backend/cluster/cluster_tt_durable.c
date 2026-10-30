@@ -9,11 +9,16 @@
  *	  contract and cluster_undo_xlog.c for the WAL/redo half
  *	  (XLOG_UNDO_TT_SLOT_COMMIT).
  *
- *	  Concurrency: per-slot 32B targeted writes are lock-free -- each committing
+ *	  Legacy concurrency: per-slot 32B targeted writes are lock-free -- each committing
  *	  xact owns a distinct slot (non-overlapping byte range; spec-3.11 §2.2 /
  *	  Q10) and lifecycle writes the header prefix (offset 32-111), also
  *	  disjoint.  Writes are WAL-protected (no data-file fsync; a torn write is
  *	  recovered by redo -- C10).
+ *
+ *	  Explicit TT40 ACTIVE publication uses the original block-zero current-X
+ *	  owner and content pin. Its protected origin reservation supplies FullXid
+ *	  to the V2 BIND and 40B slot; one sealed header image is written through
+ *	  the checkpoint-tracked header writer and mirrored into the resident page.
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -38,6 +43,7 @@
 #include "access/xlog.h"
 #include "miscadmin.h"
 #include "storage/proc.h"
+#include "storage/checksum.h"
 #include "utils/elog.h"
 #include "utils/timestamp.h"
 
@@ -270,6 +276,35 @@ tt_allocator_corroborates_or_rolled_away(const ClusterTTSlotCurrentOwner *expect
 	return tt_allocator_classify_owner(expected) != TT_ALLOCATOR_OWNER_CONFLICT;
 }
 
+/* Preserve the original transition table while refusing raw-only V2
+ * predecessors. Only the exact original identity can be idempotent. */
+static ClusterTTActiveTransitionDecision
+tt_active_v2_transition(const TTSlotV2 *predecessor, uint32 disk_generation,
+						uint32 expected_generation, TransactionId xid, uint16 wrap,
+						uint64 original_full_xid)
+{
+	TTSlot prefix;
+
+	if (!TransactionIdIsNormal(xid) || original_full_xid == UINT64_MAX
+		|| (TransactionId)original_full_xid != xid
+		|| predecessor->status > TT_SLOT_RECYCLABLE || predecessor->wrap == TT_WRAP_INVALID
+		|| (predecessor->flags & ~TT_SLOT_FLAGS_KNOWN) != 0
+		|| predecessor->commit_scn == UINT64_MAX)
+		return CLUSTER_TT_ACTIVE_CORRUPT;
+	if (predecessor->status == TT_SLOT_UNUSED) {
+		if (predecessor->original_full_xid != 0)
+			return CLUSTER_TT_ACTIVE_CORRUPT;
+	} else if (!TransactionIdIsNormal(predecessor->xid)
+			   || predecessor->original_full_xid == UINT64_MAX
+			   || (TransactionId)predecessor->original_full_xid != predecessor->xid)
+		return CLUSTER_TT_ACTIVE_CORRUPT;
+	else if (predecessor->wrap == wrap && predecessor->original_full_xid != original_full_xid)
+		return CLUSTER_TT_ACTIVE_CONFLICT;
+	memcpy(&prefix, predecessor, sizeof(prefix));
+	return cluster_tt_active_transition_decide(&prefix, disk_generation, expected_generation,
+											   xid, wrap, true);
+}
+
 XLogRecPtr
 cluster_tt_slot_durable_publish_active(const ClusterTTSlotCurrentOwner *expected_owner,
 									   const ClusterSemanticAdmissionToken *admission,
@@ -293,6 +328,15 @@ cluster_tt_slot_durable_publish_active(const ClusterTTSlotCurrentOwner *expected
 	UndoSegmentHeaderData *disk_header = (UndoSegmentHeaderData *)disk_block.data;
 	UndoSegmentHeaderData *resident_header;
 	TTSlot successor;
+	TTSlotV2 successor_v2;
+	UndoSegmentHeaderDataV2 *disk_v2 = (UndoSegmentHeaderDataV2 *)disk_block.data;
+	UndoSegmentHeaderDataV2 *resident_v2;
+	xl_undo_tt_identity_v2 bind_v2;
+	FullTransactionId original_full_xid = InvalidFullTransactionId;
+	FullTransactionId final_full_xid;
+	ClusterTTActiveTransitionDecision transition;
+	static const char legacy_reserved[7] = {0};
+	bool tt_v2;
 	const UBA invalid_uba = InvalidUba_init;
 	volatile XLogRecPtr bind_lsn = InvalidXLogRecPtr;
 	uint64 publication_epoch;
@@ -469,7 +513,24 @@ cluster_tt_slot_durable_publish_active(const ClusterTTSlotCurrentOwner *expected
 		}
 		cluster_tt_durable_io_wait_end();
 
-		if (disk_header->segment_id != expected_owner->segment_id
+		/* Select framing before interpreting shifted V2 counters/generation.
+		 * Legacy reserved bytes keep their original all-zero meaning. */
+		tt_v2 = (uint8)disk_block.data[57] == CLUSTER_UNDO_TT_LAYOUT_V2;
+		resident_v2 = (UndoSegmentHeaderDataV2 *)resident_header;
+		if (tt_v2) {
+			if (!UndoSegmentHeaderV2_identity_matches(disk_block.data, BLCKSZ,
+					expected_owner->segment_id, owner)
+				|| disk_v2->wrap_count != generation.value
+				|| disk_v2->pd_checksum != pg_checksum_page(disk_block.data, 0)
+				|| memcmp(disk_block.data, resident_header, BLCKSZ) != 0)
+				ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+								errmsg("canonical ACTIVE V2 block-zero identity or image mismatch")));
+		} else if (memcmp(disk_header->_pad_57, legacy_reserved, sizeof(legacy_reserved)) != 0
+				   || memcmp(resident_header->_pad_57, legacy_reserved, sizeof(legacy_reserved)) != 0)
+			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("unknown canonical ACTIVE block-zero TT layout")));
+
+		if (!tt_v2 && (disk_header->segment_id != expected_owner->segment_id
 			|| disk_header->owner_instance != owner
 			|| disk_header->tt_slots_count != TT_SLOTS_PER_SEGMENT
 			|| disk_header->wrap_count != generation.value
@@ -479,7 +540,7 @@ cluster_tt_slot_durable_publish_active(const ClusterTTSlotCurrentOwner *expected
 			|| resident_header->wrap_count != disk_header->wrap_count
 			|| memcmp(&resident_header->tt_slots[expected_owner->slot_offset],
 					  &disk_header->tt_slots[expected_owner->slot_offset], sizeof(TTSlot))
-				   != 0)
+				   != 0))
 			ereport(
 				ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
@@ -591,9 +652,19 @@ cluster_tt_slot_durable_publish_active(const ClusterTTSlotCurrentOwner *expected
 									  cluster_ges_request_timeout_ms)));
 		ctrc_pre_bind_cancel_armed = ctrc_reserve_result == CLUSTER_CTRC_ORIGIN_RESERVED_PENDING;
 
-		switch (cluster_tt_active_transition_decide(
-			&disk_header->tt_slots[expected_owner->slot_offset], disk_header->wrap_count,
-			generation.value, expected_owner->xid, expected_owner->wrap, true)) {
+		if (tt_v2) {
+			if (!cluster_ctrc_origin_reserved_full_xid(&ctrc_reservation, &original_full_xid))
+				ereport(ERROR, (errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+								errmsg("canonical ACTIVE V2 original reservation identity is unavailable")));
+			transition = tt_active_v2_transition(&disk_v2->tt_slots[expected_owner->slot_offset],
+				disk_v2->wrap_count, generation.value, expected_owner->xid,
+				expected_owner->wrap, U64FromFullTransactionId(original_full_xid));
+		} else
+			transition = cluster_tt_active_transition_decide(
+				&disk_header->tt_slots[expected_owner->slot_offset], disk_header->wrap_count,
+				generation.value, expected_owner->xid, expected_owner->wrap, true);
+
+		switch (transition) {
 		case CLUSTER_TT_ACTIVE_APPLY:
 			memset(&successor, 0, sizeof(successor));
 			successor.xid = expected_owner->xid;
@@ -603,7 +674,10 @@ cluster_tt_slot_durable_publish_active(const ClusterTTSlotCurrentOwner *expected
 			successor.first_undo_block = invalid_uba;
 			break;
 		case CLUSTER_TT_ACTIVE_IDEMPOTENT:
-			successor = disk_header->tt_slots[expected_owner->slot_offset];
+			if (tt_v2)
+				memcpy(&successor, &disk_v2->tt_slots[expected_owner->slot_offset], sizeof(successor));
+			else
+				successor = disk_header->tt_slots[expected_owner->slot_offset];
 			break;
 		case CLUSTER_TT_ACTIVE_STALE:
 		case CLUSTER_TT_ACTIVE_CONFLICT:
@@ -614,9 +688,22 @@ cluster_tt_slot_durable_publish_active(const ClusterTTSlotCurrentOwner *expected
 					 errmsg("canonical ACTIVE predecessor is not an exact legal transition")));
 		}
 
-		bind_lsn = cluster_undo_emit_tt_slot_bind(owner, expected_owner->segment_id,
-												  generation.value, expected_owner->slot_offset,
-												  expected_owner->wrap, expected_owner->xid);
+		if (tt_v2) {
+			memcpy(&successor_v2, &successor, sizeof(successor));
+			successor_v2.original_full_xid = U64FromFullTransactionId(original_full_xid);
+			MemSet(&bind_v2, 0, sizeof(bind_v2));
+			bind_v2.segment_id = expected_owner->segment_id;
+			bind_v2.segment_generation = generation.value;
+			bind_v2.xid = expected_owner->xid;
+			bind_v2.slot_offset = expected_owner->slot_offset;
+			bind_v2.wrap = expected_owner->wrap;
+			bind_v2.instance = owner;
+			bind_v2.format_version = CLUSTER_UNDO_TT_IDENTITY_V2_VERSION;
+			bind_v2.original_full_xid = successor_v2.original_full_xid;
+			bind_lsn = cluster_undo_emit_tt_slot_bind_v2(&bind_v2);
+		} else
+			bind_lsn = cluster_undo_emit_tt_slot_bind(owner, expected_owner->segment_id,
+				generation.value, expected_owner->slot_offset, expected_owner->wrap, expected_owner->xid);
 		if (XLogRecPtrIsInvalid(bind_lsn))
 			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
 							errmsg("canonical ACTIVE BIND WAL was not inserted")));
@@ -625,7 +712,24 @@ cluster_tt_slot_durable_publish_active(const ClusterTTSlotCurrentOwner *expected
 			ctrc_post_bind_block_armed = true;
 		}
 
-		if (memcmp(&disk_header->tt_slots[expected_owner->slot_offset], &successor,
+		if (tt_v2) {
+			if (memcmp(&disk_v2->tt_slots[expected_owner->slot_offset], &successor_v2,
+					   sizeof(successor_v2)) != 0) {
+				/* Under the original block-zero content-X/current pin, seal one
+				 * private image and publish exactly those successful disk bytes. */
+				disk_v2->tt_slots[expected_owner->slot_offset] = successor_v2;
+				disk_v2->pd_checksum = pg_checksum_page(disk_block.data, 0);
+				cluster_tt_durable_io_wait_start();
+				if (!cluster_undo_smgr_write_header_bytes(root.intent, expected_owner->segment_id,
+						owner, 0, disk_block.data, BLCKSZ)) {
+					cluster_tt_durable_io_wait_end();
+					ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+									errmsg("cannot write canonical ACTIVE V2 TT block zero")));
+				}
+				cluster_tt_durable_io_wait_end();
+				memcpy(resident_header, disk_block.data, BLCKSZ);
+			}
+		} else if (memcmp(&disk_header->tt_slots[expected_owner->slot_offset], &successor,
 				   sizeof(successor))
 			!= 0) {
 			cluster_tt_durable_io_wait_start();
@@ -653,10 +757,14 @@ cluster_tt_slot_durable_publish_active(const ClusterTTSlotCurrentOwner *expected
 			|| cluster_epoch_get_current() != publication_epoch
 			|| cluster_qvotec_get_self_incarnation() != publication_boot_incarnation
 			|| cluster_undo_block0_current_recheck_exclusive(&guard) != CLUSTER_UNDO_BLOCK0_OK
-			|| resident_header->wrap_count != generation.value
-			|| memcmp(&resident_header->tt_slots[expected_owner->slot_offset], &successor,
-					  sizeof(successor))
-				   != 0
+			|| (tt_v2
+				? (resident_v2->wrap_count != generation.value
+				   || memcmp(resident_header, disk_block.data, BLCKSZ) != 0
+				   || !cluster_ctrc_origin_reserved_full_xid(&ctrc_reservation, &final_full_xid)
+				   || !FullTransactionIdEquals(original_full_xid, final_full_xid))
+				: (resident_header->wrap_count != generation.value
+				   || memcmp(&resident_header->tt_slots[expected_owner->slot_offset], &successor,
+							 sizeof(successor)) != 0))
 			|| !tt_allocator_corroborates_or_rolled_away(expected_owner))
 			ereport(ERROR, (errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
 							errmsg("canonical ACTIVE authority drifted during publication")));

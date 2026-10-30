@@ -20,6 +20,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_undo_segment_init.h"
 
 #include "access/xlog.h"
 #include "miscadmin.h"
@@ -459,6 +460,9 @@ make_valid_block0(uint32 segment_id, uint8 owner_instance, uint32 generation, ui
 	hdr->segment_state = SEGMENT_ACTIVE;
 	hdr->owner_instance = owner_instance;
 	hdr->tt_slots_count = TT_SLOTS_PER_SEGMENT;
+	/* The legacy page constructor reserves these bytes as zero; the marker
+	 * is payload data and must not masquerade as an unknown layout. */
+	memset(hdr->_pad_57, 0, sizeof(hdr->_pad_57));
 	hdr->wrap_count = generation;
 }
 
@@ -2434,10 +2438,85 @@ UT_TEST(test_stop_block0_two_actual_segment_roots_share_one_pgrd_not_one_file_id
 	}
 }
 
+
+/* The original resident authority must dispatch the explicit layout before
+ * sampling generation: the V1 generation offset is inside the V2 bitmap. */
+UT_TEST(test_block0_v2_reads_original_generation_before_current_pin)
+{
+	ClusterUndoBlock0LogicalKey logical = make_key(1, 1);
+	ClusterUndoBlock0ResolvedRoot root = make_root(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 0x1111, 7);
+	ClusterUndoBlock0AuthorityProof proof = make_live_proof(1, 0);
+	ClusterUndoBlock0FrameToken token = { 0 };
+	ClusterUndoBlock0Pin pin;
+	ClusterUndoBlock0Generation sampled = make_generation(false, 99);
+	ClusterUndoBlock0Generation expected = make_generation(true, 7);
+	ClusterUndoBlock0Result result;
+	UndoSegmentHeaderDataV2 *header;
+	char *page = NULL;
+
+	fresh_block0_region(2);
+	make_valid_block0(1, 1, 0, 0);
+	UT_ASSERT(cluster_undo_segment_make_header_v2_bytes(1, 1, smgr_image));
+	header = (UndoSegmentHeaderDataV2 *)smgr_image;
+	header->wrap_count = 7;
+	header->tt_slots[7].xid = 100;
+	header->tt_slots[7].original_full_xid = UINT64_C(0x700000064);
+	((UndoSegmentHeaderData *)smgr_image)->wrap_count = UINT32_MAX;
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token), CLUSTER_UNDO_BLOCK0_OK);
+	result = cluster_undo_block0_admit_runtime(&logical, &root, &proof, &token, &pin, &page);
+	UT_ASSERT_EQ(result, CLUSTER_UNDO_BLOCK0_OK);
+	if (result != CLUSTER_UNDO_BLOCK0_OK) {
+		cluster_undo_block0_frame_release(&token);
+		return;
+	}
+	UT_ASSERT_EQ(pin.observed_generation.value, 7);
+	UT_ASSERT_EQ(((UndoSegmentHeaderDataV2 *)page)->tt_slots[7].original_full_xid,
+		UINT64_C(0x700000064));
+	cluster_undo_block0_unpin(&pin);
+	UT_ASSERT_EQ(cluster_undo_block0_sample_resident_generation(&logical, &root, &proof, &sampled),
+		CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(sampled.value, 7);
+	UT_ASSERT_EQ(cluster_undo_block0_pin(&logical, &root, &expected,
+		CLUSTER_UNDO_BLOCK0_EXCLUSIVE, &proof, &pin, &page), CLUSTER_UNDO_BLOCK0_OK);
+	cluster_undo_block0_unpin(&pin);
+}
+
+UT_TEST(test_block0_v2_bad_framing_never_publishes_resident_generation)
+{
+	for (unsigned fault = 0; fault < 4; fault++) {
+		ClusterUndoBlock0LogicalKey logical = make_key(1, 1);
+		ClusterUndoBlock0ResolvedRoot root = make_root(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 0x1111, 7);
+		ClusterUndoBlock0AuthorityProof proof = make_live_proof(1, 0);
+		ClusterUndoBlock0FrameToken token = { 0 };
+		ClusterUndoBlock0Pin pin;
+		ClusterUndoBlock0Generation sampled = make_generation(false, 99);
+		UndoSegmentHeaderDataV2 *header;
+		char *page = NULL;
+
+		fresh_block0_region(1);
+		make_valid_block0(1, 1, 0, 0);
+		UT_ASSERT(cluster_undo_segment_make_header_v2_bytes(1, 1, smgr_image));
+		header = (UndoSegmentHeaderDataV2 *)smgr_image;
+		if (fault == 0) header->tt_layout_version = 3;
+		if (fault == 1) header->tt_slot_bytes = 32;
+		if (fault == 2) header->tt_layout_reserved = 1;
+		if (fault == 3) header->tt_next_free_slot = TT_SLOTS_PER_SEGMENT + 1;
+		UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token), CLUSTER_UNDO_BLOCK0_OK);
+		UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(&logical, &root, &proof, &token, &pin, &page),
+			CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH);
+		UT_ASSERT(page == NULL);
+		UT_ASSERT_EQ(cluster_undo_block0_sample_resident_generation(&logical, &root, &proof, &sampled),
+			CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED);
+		UT_ASSERT(!sampled.known);
+		UT_ASSERT_EQ(sampled.value, 99);
+		cluster_undo_block0_frame_release(&token);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(58);
+	UT_PLAN(60);
 	UT_RUN(test_block0_key_endpoints_map_to_direct_slots);
 	UT_RUN(test_block0_key_rejects_owner_segment_aliases);
 	UT_RUN(test_block0_root_requires_pgrd_identity_and_declared_intent);
@@ -2496,6 +2575,8 @@ main(void)
 	UT_RUN(test_stop_block0_durability_and_undo_anchor_are_not_cleared_by_poll);
 	UT_RUN(test_stop_block0_invalid_late_slot_overrides_active_and_root_drift);
 	UT_RUN(test_stop_block0_two_actual_segment_roots_share_one_pgrd_not_one_file_id);
+	UT_RUN(test_block0_v2_reads_original_generation_before_current_pin);
+	UT_RUN(test_block0_v2_bad_framing_never_publishes_resident_generation);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

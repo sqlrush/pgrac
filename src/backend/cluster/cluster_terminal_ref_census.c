@@ -3159,6 +3159,45 @@ cluster_ctrc_origin_original_full_xid_shared(const ClusterCtrcTxnKeyV1 *key,
 	return valid;
 }
 
+bool
+cluster_ctrc_origin_reserved_full_xid(const ClusterCtrcOriginReservation *reservation,
+									FullTransactionId *full_xid_out)
+{
+	const ClusterCtrcOriginEntry *origin;
+	uint64 index;
+	bool valid;
+
+	if (full_xid_out != NULL)
+		*full_xid_out = InvalidFullTransactionId;
+	if (reservation == NULL || full_xid_out == NULL || !reservation->valid
+		|| (reservation->kind != CTRC_ORIGIN_RESERVATION_PENDING_OWNED
+			&& reservation->kind != CTRC_ORIGIN_RESERVATION_EXISTING_OPEN)
+		|| reservation->reservation_generation == 0
+		|| reservation->reservation_generation == UINT64_MAX
+		|| !FullTransactionIdIsNormal(reservation->original_full_xid)
+		|| U64FromFullTransactionId(reservation->original_full_xid) == UINT64_MAX
+		|| XidFromFullTransactionId(reservation->original_full_xid) != reservation->key.xid
+		|| !ctrc_bytes_zero(reservation->reserved8, sizeof(reservation->reserved8))
+		|| cluster_node_id < 0 || reservation->key.origin_node_id != cluster_node_id
+		|| !cluster_ctrc_shmem_ready() || !ctrc_origin_index(&reservation->key, &index)
+		|| index != reservation->origin_index)
+		return false;
+
+	LWLockAcquire(&CtrcShared->origin_lock, LW_SHARED);
+	origin = &ctrc_origin_entries()[index];
+	valid = origin->reservation_generation == reservation->reservation_generation
+		&& FullTransactionIdEquals(origin->original_full_xid, reservation->original_full_xid)
+		&& memcmp(&origin->key, &reservation->key, sizeof(origin->key)) == 0
+		&& ((reservation->kind == CTRC_ORIGIN_RESERVATION_PENDING_OWNED
+			 && origin->state == CTRC_ORIGIN_EMPTY && origin->grant_generation == 0)
+			|| (reservation->kind == CTRC_ORIGIN_RESERVATION_EXISTING_OPEN
+				&& origin->state == CTRC_ORIGIN_OPEN && origin->grant_generation != 0));
+	if (valid)
+		*full_xid_out = origin->original_full_xid;
+	LWLockRelease(&CtrcShared->origin_lock);
+	return valid;
+}
+
 static bool
 ctrc_participant_index(const ClusterCtrcTxnKeyV1 *key, uint16 participant_node_id,
 					   uint64 *index_out)

@@ -15,6 +15,7 @@
 #include "cluster/cluster_side_undo.h"
 #include "cluster/cluster_uba.h"
 #include "cluster/cluster_undo_segment.h"
+#include "cluster/storage/cluster_undo_alloc.h"
 #include "cluster/storage/cluster_undo_buf.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "storage/proc.h"
@@ -478,10 +479,83 @@ UT_TEST(test_native_block_writer_uses_typed_preparation_before_write_and_sync)
 	}
 }
 
+
+/* Explicit V2 producer, through the original XLogInsert boundary and the
+ * actual native decoder. An epoch-zero normal FullXid is also valid. */
+UT_TEST(test_v2_bind_producer_preserves_original_fullxid_and_opcode)
+{
+	for (unsigned epoch = 0; epoch < 2; epoch++) {
+		xl_undo_tt_identity_v2 identity = { 0 }, emitted;
+		ClusterUndoDecoded decoded;
+
+		identity.segment_id = 513;
+		identity.segment_generation = 9;
+		identity.xid = 801;
+		identity.slot_offset = 4;
+		identity.wrap = 7;
+		identity.instance = 3;
+		identity.format_version = CLUSTER_UNDO_TT_IDENTITY_V2_VERSION;
+		identity.original_full_xid = ((uint64)(epoch ? 7 : 0) << 32) | identity.xid;
+		UT_ASSERT_EQ(cluster_undo_emit_tt_slot_bind_v2(&identity), 0x900);
+		UT_ASSERT_EQ(emitted_rmid, RM_CLUSTER_UNDO_ID);
+		UT_ASSERT_EQ(emitted_info, XLOG_UNDO_TT_SLOT_BIND);
+		UT_ASSERT_EQ(payload_length, 32);
+		UT_ASSERT(memcmp(payload, &identity, sizeof(identity)) == 0);
+		UT_ASSERT(cluster_undo_tt_bind_v2_decode(payload, payload_length, &emitted));
+		UT_ASSERT(memcmp(&emitted, &identity, sizeof(identity)) == 0);
+		/* The generic TT32 consumer stays closed to V2; its explicit typed
+		 * consumer must retain the complete original identity. */
+		decoded = decode_emitted(false);
+		UT_ASSERT(cluster_undo_preflight_tt_v2(&decoded));
+		UT_ASSERT_EQ(decoded.original_full_xid, identity.original_full_xid);
+		UT_ASSERT_EQ(decoded.expected_generation, identity.segment_generation);
+	}
+}
+
+UT_TEST(test_v2_bind_producer_refuses_bad_identity_before_insertion)
+{
+	for (unsigned fault = 0; fault < 12; fault++) {
+		xl_undo_tt_identity_v2 identity = { 0 };
+
+		identity.segment_id = 513;
+		identity.segment_generation = 9;
+		identity.xid = 801;
+		identity.slot_offset = 4;
+		identity.wrap = 7;
+		identity.instance = 3;
+		identity.format_version = CLUSTER_UNDO_TT_IDENTITY_V2_VERSION;
+		identity.original_full_xid = (UINT64_C(7) << 32) | identity.xid;
+		switch (fault) {
+		case 0: identity.format_version = 1; break;
+		case 1: identity.flags = 1; break;
+		case 2: identity.reserved = 1; break;
+		case 3: identity.original_full_xid = UINT64_MAX; break;
+		case 4: identity.original_full_xid++; break;
+		case 5: identity.xid = FrozenTransactionId; break;
+		case 6: identity.instance = 0; break;
+		case 7: identity.segment_id = 1; break;
+		case 8: identity.slot_offset = TT_SLOTS_PER_SEGMENT; break;
+		case 9: identity.wrap = TT_WRAP_INVALID; break;
+		case 10: identity.segment_generation = UINT32_MAX; break;
+		case 11: break; /* NULL payload */
+		}
+		payload_length = 123;
+		emitted_info = 0xee;
+		expect_panic = true;
+		if (setjmp(panic_jump) == 0) {
+			(void)cluster_undo_emit_tt_slot_bind_v2(fault == 11 ? NULL : &identity);
+			UT_ASSERT(false);
+		}
+		expect_panic = false;
+		UT_ASSERT_EQ(payload_length, 123);
+		UT_ASSERT_EQ(emitted_info, 0xee);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(10);
 	UT_RUN(test_segment_lifecycle_producer_payloads);
 	UT_RUN(test_tt_producer_identity_and_polarity);
 	UT_RUN(test_ctrc_release_producer_certificate);
@@ -490,6 +564,8 @@ main(void)
 	UT_RUN(test_unowned_segment_and_hwm_do_not_gain_authority);
 	UT_RUN(test_private_block_preparation_refusal_is_atomic);
 	UT_RUN(test_native_block_writer_uses_typed_preparation_before_write_and_sync);
+	UT_RUN(test_v2_bind_producer_preserves_original_fullxid_and_opcode);
+	UT_RUN(test_v2_bind_producer_refuses_bad_identity_before_insertion);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

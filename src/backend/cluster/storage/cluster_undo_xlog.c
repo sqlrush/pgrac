@@ -264,6 +264,28 @@ cluster_undo_emit_tt_slot_bind(uint8 instance, uint32 segment_id, uint32 segment
 }
 
 
+/* The caller copied FullXid from its protected original origin reservation.
+ * Validate the complete record before beginning insertion in release builds. */
+XLogRecPtr
+cluster_undo_emit_tt_slot_bind_v2(const xl_undo_tt_identity_v2 *identity)
+{
+	xl_undo_tt_identity_v2 rec;
+
+	if (!cluster_undo_tt_bind_v2_decode(identity, sizeof(rec), &rec)
+		|| rec.instance == 0 || rec.instance > UNDO_OWNER_INSTANCE_MAX
+		|| rec.segment_id == 0 || rec.segment_id > UINT16_MAX
+		|| (rec.segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE + 1 != rec.instance
+		|| rec.slot_offset >= TT_SLOTS_PER_SEGMENT || rec.wrap == TT_WRAP_INVALID
+		|| rec.segment_generation == UINT32_MAX)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("invalid canonical TT V2 ACTIVE identity before WAL insertion")));
+
+	XLogBeginInsert();
+	XLogRegisterData((char *)&rec, sizeof(rec));
+	return XLogInsert(RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_BIND);
+}
+
+
 /*
  * cluster_hw_emit_reserve (spec-5.7a D1, §3.1a M1c)
  *

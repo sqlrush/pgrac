@@ -928,6 +928,9 @@ extern XLogRecPtr cluster_undo_emit_tt_slot_bind(uint8 instance, uint32 segment_
 												 uint32 segment_generation, uint16 slot_offset,
 												 uint16 wrap, TransactionId xid);
 
+/* Same opcode, explicit 32-byte V2 identity; invalid input errors before WAL. */
+extern XLogRecPtr cluster_undo_emit_tt_slot_bind_v2(const xl_undo_tt_identity_v2 *identity);
+
 /*
  * cluster_undo_emit_tt_slot_commit (spec-3.11 D3)
  *	  Backend: emit XLOG_UNDO_TT_SLOT_COMMIT for a durable commit_scn stamp on

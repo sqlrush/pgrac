@@ -490,8 +490,23 @@ block0_page_identity(const char *page, const ClusterUndoBlock0LogicalKey *logica
 {
 	PageHeader ph;
 	const UndoSegmentHeaderData *hdr;
+	static const char legacy_reserved[7] = {0};
 
 	if (page == NULL || logical == NULL || generation == NULL)
+		return false;
+	/* V2 moved generation beyond the complete 40-byte slots. Dispatch on
+	 * fixed framing first; unknown/mixed layouts cannot publish a sample. */
+	if ((uint8)page[57] == CLUSTER_UNDO_TT_LAYOUT_V2) {
+		const UndoSegmentHeaderDataV2 *v2 = (const UndoSegmentHeaderDataV2 *)page;
+
+		if (!UndoSegmentHeaderV2_identity_matches(page, BLCKSZ, logical->segment_id,
+												 logical->owner_instance))
+			return false;
+		generation->known = true;
+		generation->value = v2->wrap_count;
+		return true;
+	}
+	if (memcmp(page + 57, legacy_reserved, sizeof(legacy_reserved)) != 0)
 		return false;
 	ph = (PageHeader)page;
 	hdr = (const UndoSegmentHeaderData *)page;
@@ -1741,7 +1756,7 @@ void
 cluster_undo_block0_mark_wal_dirty(ClusterUndoBlock0Pin *pin, XLogRecPtr wal_lsn)
 {
 	ClusterUndoBlock0SlotData *meta;
-	uint32 state;
+	uint32 state pg_attribute_unused(); /* inspected only by cassert */
 
 	Assert(Block0Ctl != NULL);
 	Assert(pin != NULL && pin->slot >= 0 && pin->slot < CLUSTER_UNDO_BLOCK0_SLOT_COUNT);

@@ -1106,6 +1106,10 @@ cluster_ctrc_origin_block_post_bind_entry(ClusterCtrcOriginEntry *origin, uint64
 										  const ClusterCtrcOriginReservation *reservation);
 extern bool cluster_ctrc_origin_cancel_pre_bind(const ClusterCtrcOriginReservation *reservation);
 extern bool cluster_ctrc_origin_block_post_bind(const ClusterCtrcOriginReservation *reservation);
+/* Copy only the exact local PENDING/OPEN reservation's original identity
+ * under the original origin lock. No allocation, widening or row mutation. */
+extern bool cluster_ctrc_origin_reserved_full_xid(
+	const ClusterCtrcOriginReservation *reservation, FullTransactionId *full_xid_out);
 extern bool cluster_ctrc_origin_open_reserved(const ClusterCtrcOriginReservation *reservation,
 											  uint32 *grant_generation);
 extern ClusterCtrcTouchResult

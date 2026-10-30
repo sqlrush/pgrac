@@ -90,6 +90,9 @@ cluster_tt_terminal_transition_decide(const TTSlot *predecessor, uint32 disk_gen
  * a normal, strictly pre-BIND allocator-rollover result: this call acquired
  * no CTRC reservation and wrote nothing; all current/pin holdings are gone.
  * The backend may discard only its unpublished local reservation and retry.
+ * Explicit V2 pages bind the protected original FullXid into the 40-byte
+ * slot and 32-byte WAL identity. successor_out remains only the legacy
+ * 32-byte prefix and is never a source of FullXid qualification.
  * Every other failure raises ERROR.  In particular a BIND emitter failure
  * never returns this retry result, and zero outputs after ERROR prove nothing.
  */
