@@ -2431,11 +2431,11 @@ test_cluster_heap_ctrc_origin_reply.inc: $(top_srcdir)/src/backend/cluster/clust
 
 # Exact original certificate publisher; I/O and scheduling leaves are controlled.
 test_cluster_heap_ctrc_durable_certificate.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c $(top_srcdir)/src/backend/cluster/storage/cluster_undo_block0.c Makefile
-	@awk 'BEGIN { pattern = "^(cluster_ctrc_origin_certificate_digest|ctrc_origin_certificate_snapshot_matches_shared|ctrc_cleaner_publish_certificate|cluster_undo_block0_root_valid|cluster_undo_block0_root_matches|cluster_undo_block0_generation_matches)\\(" } \
+	@awk 'BEGIN { pattern = "^(ctrc_certificate_slot_read|cluster_ctrc_origin_certificate_digest|ctrc_origin_certificate_snapshot_matches_shared|ctrc_cleaner_publish_certificate|cluster_undo_block0_root_valid|cluster_undo_block0_root_matches|cluster_undo_block0_generation_matches)\\(" } \
 	     $$0 ~ pattern { name=$$0; sub(/\(.*/, "", name); ret=prev; sub(/^static[ \t]+/, "", ret); candidate=1; head=1; text=""; decl="" } \
 	     candidate { text=text $$0 "\n"; if (/^\{/) { head=0; if (seen[name]++) exit 1; order[++found]=name; returns[name]="static " ret } else if (head) { decl=decl $$0 "\n"; if (/;[ \t]*$$/) candidate=0 } } \
 	     candidate && /^}/ { candidate=0; body[name]=text; declaration[name]=decl; done++ } { prev=$$0 } \
-	     END { if (found != 6 || done != 6 || candidate) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $(filter %.c,$^) > $@.tmp
+	     END { if (found != 7 || done != 7 || candidate) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_heap_ctrc_begin.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
@@ -2500,7 +2500,7 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_heap_ctrc_g_required_ack_decl.inc \
 		test_cluster_heap_ctrc_g_required_ack_body.inc \
 		test_cluster_heap_ctrc_origin_reply_trace_types.inc \
-		test_cluster_heap_ctrc_durable_certificate.inc \
+		test_cluster_heap_ctrc_durable_certificate.inc $(top_srcdir)/src/include/storage/checksum.h \
 		$(top_srcdir)/src/include/utils/memutils.h \
 		test_cluster_heap_freeze_cohort_current.inc \
 		test_cluster_heap_freeze_cohort_backend.inc \
@@ -2564,11 +2564,13 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_heap_vacuum_version.inc test_cluster_space_bufpage_product.o \
 		test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
 		test_cluster_inplace_itemptr_product.o \
+		$(top_builddir)/src/backend/storage/page/checksum.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_RESOURCE_X_IDENTITY_O) test_cluster_space_bufpage_product.o \
 		$(top_srcdir)/src/backend/cluster/cluster_heap_freeze.c \
 		test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
 		test_cluster_inplace_itemptr_product.o \
+		$(top_builddir)/src/backend/storage/page/checksum.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
@@ -3531,9 +3533,9 @@ test_cluster_undo_tt_transition.inc: $(top_srcdir)/src/backend/cluster/cluster_t
 	     emit { print } /^}/ { emit=0 } END { if (found != 3) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 test_cluster_undo_producer_owner.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_xlog.c Makefile
-	awk '/^(cluster_undo_emit_[a-z_0-9]+|cluster_hw_emit_reserve|cluster_undo_xlog_insert_tt_ctrc_release)\(/ \
+	awk '/^(cluster_undo_emit_[a-z_0-9]+|cluster_hw_emit_reserve|cluster_undo_xlog_insert_tt_ctrc_release(_v2)?)\(/ \
 	     { print "XLogRecPtr"; emit=1; found++ } emit { print } /^}/ { emit=0 } \
-	     END { if (found != 14) exit 1 }' $< > $@.tmp
+	     END { if (found != 15) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_undo_block_native.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_xlog.c Makefile
@@ -9191,10 +9193,12 @@ test_cluster_ctrc_itl_reuse test_cluster_ctrc_successor_fence: test_cluster_ctrc
 		$(top_srcdir)/src/include/storage/pg_sema.h $(top_srcdir)/src/include/utils/wait_event.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_cleaner.h
 
-test_cluster_ctrc_capacity: test_cluster_ctrc_capacity.c test_cluster_ctrc_cleaner.c test_cluster_ctrc_run_pass.inc \
+test_cluster_ctrc_capacity: test_cluster_ctrc_capacity.c test_cluster_ctrc_cleaner.c test_cluster_ctrc_run_pass.inc $(top_srcdir)/src/include/storage/checksum.h \
 		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
-		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h unit_test.h
+		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h unit_test.h \
+		$(top_builddir)/src/backend/storage/page/checksum.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_builddir)/src/backend/storage/page/checksum.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) \
 		$(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@

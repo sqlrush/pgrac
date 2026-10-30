@@ -286,6 +286,13 @@ cluster_undo_xlog_insert_tt_ctrc_release(const xl_undo_tt_slot_ctrc_release_v1 *
 	return 101;
 }
 
+XLogRecPtr
+cluster_undo_xlog_insert_tt_ctrc_release_v2(const xl_undo_tt_slot_ctrc_release_v2 *record)
+{
+	if (!cluster_undo_tt_ctrc_release_v2_valid(record)) abort();
+	return cluster_undo_xlog_insert_tt_ctrc_release(&record->release);
+}
+
 void
 cluster_undo_block0_flush_sync(ClusterUndoBlock0Pin *pin pg_attribute_unused(),
 							   const char *successor, XLogRecPtr lsn, bool fsync_parent)

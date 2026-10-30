@@ -531,6 +531,25 @@ cluster_undo_xlog_insert_tt_ctrc_release(const xl_undo_tt_slot_ctrc_release_v1 *
 }
 
 
+XLogRecPtr
+cluster_undo_xlog_insert_tt_ctrc_release_v2(const xl_undo_tt_slot_ctrc_release_v2 *record)
+{
+	uint8 bytes[CLUSTER_UNDO_TT_CTRC_RELEASE_V2_BYTES];
+
+	if (!cluster_undo_tt_ctrc_release_v2_encode(record, bytes)
+		|| record->release.segment_id > UINT16_MAX
+		|| record->release.segment_generation == 0
+		|| record->release.segment_generation == UINT32_MAX
+		|| record->release.cluster_epoch == 0 || record->release.formation_epoch == 0
+		|| record->release.owner_instance
+			   != ((record->release.segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE) + 1)
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("invalid canonical TT V2 CTRC release certificate")));
+	XLogBeginInsert();
+	XLogRegisterData((char *)bytes, sizeof(bytes));
+	return XLogInsert(RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_CTRC_RELEASE);
+}
+
 /*
  * cluster_undo_emit_segment_recycle -- spec-3.13 D3.
  *

@@ -9547,6 +9547,7 @@ UT_TEST(test_census_original_origin_retirement_advances_walk_and_rejects_old_can
  * Current-lock, physical I/O, admission and WAL insertion are explicit leaves;
  * in-memory readback here does not certify disk durability or live authority. */
 #include "cluster/cluster_undo_segment.h"
+#include "storage/checksum.h"
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/storage/cluster_undo_block0.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
@@ -9565,6 +9566,9 @@ typedef enum DurableCertificateFault {
 } DurableCertificateFault;
 static DurableCertificateFault durable_fault;
 static const ClusterCtrcOriginCertificateSnapshot *durable_snapshot;
+static xl_undo_tt_slot_ctrc_release_v2 durable_record_v2;
+static bool durable_wal_v2;
+static unsigned durable_v2_final_fault;
 static PGAlignedBlock durable_disk, durable_resident;
 static xl_undo_tt_slot_ctrc_release_v1 durable_record;
 static bool durable_admitted, durable_current, durable_pinned;
@@ -9674,6 +9678,20 @@ durable_read(ClusterUndoPathIntent intent, uint32 segment, uint8 owner, uint32 b
 		((UndoSegmentHeaderData *)durable_disk.data)->tt_slots[durable_snapshot->origin.key.slot_offset].flags = 0;
 		memcpy(durable_resident.data, durable_disk.data, BLCKSZ);
 	}
+	if (durable_reads == 2 && durable_v2_final_fault != 0) {
+		UndoSegmentHeaderDataV2 *v2 = (UndoSegmentHeaderDataV2 *)durable_disk.data;
+		switch (durable_v2_final_fault) {
+		case 1: v2->tt_slots[durable_snapshot->origin.key.slot_offset].original_full_xid ^= UINT64_C(1) << 32; break;
+		case 2: v2->tt_layout_version = 0; v2->tt_slot_bytes = 0; break;
+		case 3: v2->_reserved[1] ^= 1; break;
+		case 4: v2->tt_slots[durable_snapshot->origin.key.slot_offset].flags |= 0x80; break;
+		case 5: v2->wrap_count++; break;
+		case 6: v2->tt_slots[durable_snapshot->origin.key.slot_offset].commit_scn++; break;
+		case 7: v2->_reserved[3] ^= 1; break;
+		}
+		if (durable_v2_final_fault != 3) v2->pd_checksum = pg_checksum_page(durable_disk.data, 0);
+		memcpy(durable_resident.data, durable_disk.data, BLCKSZ);
+	}
 	memcpy(out, durable_disk.data, BLCKSZ);
 	if ((durable_reads == 1 && durable_fault == DURABLE_INITIAL_MISMATCH)
 		|| (durable_reads == 2 && durable_fault == DURABLE_FINAL_MISMATCH)) out[BLCKSZ - 1] ^= 1;
@@ -9692,6 +9710,12 @@ static XLogRecPtr durable_insert(const xl_undo_tt_slot_ctrc_release_v1 *record) 
 	UT_ASSERT_EQ(ctrc_origin_entries()[durable_snapshot->origin_index].state, CTRC_ORIGIN_CERTIFYING);
 	durable_record = *record; durable_event('W');
 	return durable_fault == DURABLE_WAL_INVALID ? InvalidXLogRecPtr : UINT64_C(0x123450);
+}
+static XLogRecPtr durable_insert_v2(const xl_undo_tt_slot_ctrc_release_v2 *record) pg_attribute_unused();
+static XLogRecPtr durable_insert_v2(const xl_undo_tt_slot_ctrc_release_v2 *record) {
+	durable_record_v2 = *record; durable_wal_v2 = true;
+	UT_ASSERT(cluster_undo_tt_ctrc_release_v2_valid(record));
+	return durable_insert(&record->release);
 }
 static void durable_flush(ClusterUndoBlock0Pin *pin, const char *successor, XLogRecPtr lsn, bool metadata_only) {
 	UT_ASSERT(durable_admitted && durable_current && durable_pinned); UT_ASSERT(!metadata_only); UT_ASSERT_EQ(lsn, UINT64_C(0x123450));
@@ -9764,6 +9788,7 @@ static bool durable_commit(const ClusterCtrcOriginCertificateSnapshot *snapshot)
 #define cluster_undo_block0_unpin durable_unpin
 #define cluster_undo_smgr_read_block durable_read
 #define cluster_undo_xlog_insert_tt_ctrc_release durable_insert
+#define cluster_undo_xlog_insert_tt_ctrc_release_v2 durable_insert_v2
 #define cluster_undo_block0_flush_sync durable_flush
 #define pg_usleep durable_pause
 #define InterruptPending durable_interrupt_pending
@@ -9773,6 +9798,7 @@ static bool durable_commit(const ClusterCtrcOriginCertificateSnapshot *snapshot)
 #undef InterruptPending
 #undef pg_usleep
 #undef cluster_undo_block0_flush_sync
+#undef cluster_undo_xlog_insert_tt_ctrc_release_v2
 #undef cluster_undo_xlog_insert_tt_ctrc_release
 #undef cluster_undo_smgr_read_block
 #undef cluster_undo_block0_unpin
@@ -9816,6 +9842,7 @@ static bool durable_commit(const ClusterCtrcOriginCertificateSnapshot *snapshot)
 
 static void durable_observers_reset(const ClusterCtrcOriginCertificateSnapshot *snapshot) {
 	UndoSegmentHeaderData *header;
+	memset(&durable_record_v2, 0, sizeof(durable_record_v2)); durable_wal_v2 = false; durable_v2_final_fault = 0;
 	durable_snapshot = snapshot; durable_fault = DURABLE_OK; durable_node = snapshot->origin.key.origin_node_id;
 	durable_admitted = durable_current = durable_pinned = false;
 	durable_enters = durable_leaves = durable_roots = durable_reads = durable_wals = durable_flushes = 0;
@@ -9854,6 +9881,169 @@ static bool durable_snapshot_fixture(QualifiedXminFixture *f, CensusRuntimeAlloc
 }
 static bool census_origin_durable_certificate_publish(const ClusterCtrcOriginCertificateSnapshot *snapshot) {
 	return original_durable_publish(snapshot);
+}
+
+
+static void
+durable_tt40_page(const ClusterCtrcOriginCertificateSnapshot *snapshot, bool aborted, bool replay)
+{
+	UndoSegmentHeaderDataV2 *v2;
+	TTSlotV2 *slot;
+	memset(durable_disk.data, 0, BLCKSZ);
+	v2 = (UndoSegmentHeaderDataV2 *)durable_disk.data;
+	((PageHeader)durable_disk.data)->pd_lower = SizeOfPageHeaderData;
+	((PageHeader)durable_disk.data)->pd_upper = BLCKSZ;
+	((PageHeader)durable_disk.data)->pd_special = BLCKSZ;
+	v2->pd_flags = PD_UNDO_SEG_HEADER;
+	v2->pd_pagesize_version = BLCKSZ | PG_PAGE_LAYOUT_VERSION;
+	v2->segment_id = snapshot->origin.key.segment_id;
+	v2->segment_size_bytes = UNDO_SEGMENT_SIZE_BYTES;
+	v2->owner_instance = snapshot->origin.key.owner_instance;
+	v2->segment_state = SEGMENT_ACTIVE;
+	v2->tt_slots_count = TT_SLOTS_PER_SEGMENT;
+	v2->tt_layout_version = CLUSTER_UNDO_TT_LAYOUT_V2;
+	v2->tt_slot_bytes = CLUSTER_UNDO_TT_SLOT_V2_BYTES;
+	v2->wrap_count = snapshot->origin.key.segment_generation;
+	slot = &v2->tt_slots[snapshot->origin.key.slot_offset];
+	slot->xid = snapshot->origin.key.xid;
+	slot->wrap = snapshot->origin.key.slot_wrap;
+	slot->status = aborted ? TT_SLOT_ABORTED : TT_SLOT_COMMITTED;
+	slot->commit_scn = aborted ? InvalidScn : 9;
+	slot->flags = replay ? TT_SLOT_FLAG_CTRC_RELEASE_PROVEN : TT_FLAGS_RESERVED;
+	slot->original_full_xid = U64FromFullTransactionId(snapshot->origin.original_full_xid);
+	v2->_reserved[sizeof(v2->_reserved) - 1] = 0x5a;
+	v2->pd_checksum = pg_checksum_page(durable_disk.data, 0);
+	memcpy(durable_resident.data, durable_disk.data, BLCKSZ);
+}
+
+UT_TEST(test_tt40_release_original_publisher_preserves_full_identity_and_sealed_page)
+{
+	for (int shape = 0; shape < 4; shape++) {
+		QualifiedXminFixture f; CensusRuntimeAllocation runtime; ClusterCtrcReceiptHandle handle;
+		ClusterCtrcOriginCertificateSnapshot snapshot; PGAlignedBlock expected; uint64 index;
+		UndoSegmentHeaderDataV2 *v2; bool replay = (shape & 1) != 0;
+		if (!durable_snapshot_fixture(&f, &runtime, NULL, false, &handle, &index, &snapshot)) { UT_ASSERT(false); return; }
+		durable_tt40_page(&snapshot, (shape & 2) != 0, replay); expected = durable_disk;
+		v2 = (UndoSegmentHeaderDataV2 *)expected.data;
+		v2->tt_slots[handle.key.slot_offset].flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+		v2->pd_checksum = pg_checksum_page(expected.data, 0);
+		UT_ASSERT(census_origin_durable_certificate_publish(&snapshot));
+		UT_ASSERT_EQ(ctrc_origin_entries()[index].state, CTRC_ORIGIN_RELEASE_PROVEN);
+		UT_ASSERT(memcmp(durable_disk.data, expected.data, BLCKSZ) == 0);
+		UT_ASSERT(memcmp(durable_resident.data, expected.data, BLCKSZ) == 0);
+		UT_ASSERT_EQ(durable_wals, !replay); UT_ASSERT_EQ(durable_flushes, !replay);
+		UT_ASSERT_EQ(durable_reads, 2); UT_ASSERT_EQ(durable_commits, 1);
+		UT_ASSERT(strcmp(durable_events, replay ? "EAPURLC" : "EAPWFURLC") == 0);
+		UT_ASSERT_EQ(durable_wal_v2, !replay);
+		if (!replay) {
+			UT_ASSERT_EQ(durable_record_v2.release.format_version, CLUSTER_UNDO_TT_CTRC_RELEASE_V2_VERSION);
+			UT_ASSERT_EQ(durable_record_v2.original_full_xid, U64FromFullTransactionId(snapshot.origin.original_full_xid));
+			UT_ASSERT_EQ(durable_record_v2.release.segment_generation, snapshot.origin.key.segment_generation);
+			UT_ASSERT_EQ(durable_record_v2.release.seal_generation, snapshot.origin.seal_generation);
+			UT_ASSERT(!ctrc_bytes_zero(durable_record_v2.release.ack_set_digest, 16));
+		}
+		UT_ASSERT(!durable_admitted && !durable_current && !durable_pinned);
+		census_full_layout_release(&runtime);
+	}
+}
+
+UT_TEST(test_tt40_release_refuses_bad_format_fullxid_or_predecessor_without_wal)
+{
+	for (int fault = 0; fault < 15; fault++) {
+		QualifiedXminFixture f; CensusRuntimeAllocation runtime; ClusterCtrcReceiptHandle handle;
+		ClusterCtrcOriginCertificateSnapshot snapshot; ClusterCtrcOriginEntry origin_before;
+		PGAlignedBlock before; uint64 index; UndoSegmentHeaderDataV2 *v2; TTSlotV2 *slot;
+		if (!durable_snapshot_fixture(&f, &runtime, NULL, false, &handle, &index, &snapshot)) { UT_ASSERT(false); return; }
+		durable_tt40_page(&snapshot, false, false); v2 = (UndoSegmentHeaderDataV2 *)durable_disk.data;
+		slot = &v2->tt_slots[handle.key.slot_offset];
+		switch (fault) {
+		case 0: slot->original_full_xid = 0; break;
+		case 1: slot->original_full_xid = UINT64_MAX; break;
+		case 2: slot->original_full_xid ^= UINT64_C(1) << 32; break;
+		case 3: slot->original_full_xid++; break;
+		case 4: v2->tt_layout_version = 3; break;
+		case 5: v2->tt_slot_bytes = sizeof(TTSlot); break;
+		case 6: v2->tt_layout_reserved = 1; break;
+		case 7: v2->wrap_count++; break;
+		case 8: v2->tt_slots_count--; break;
+		case 9: slot->flags = 0x80; break;
+		case 10: slot->status = TT_SLOT_ACTIVE; break;
+		case 11: v2->tt_layout_version = 0; v2->tt_slot_bytes = 0; break;
+		case 12: break; /* Checksum corruption with intact framing and identity. */
+		case 13: slot->commit_scn = UINT64_MAX; break;
+		case 14: break; /* New-page marker must refuse before checksum implementation. */
+		}
+		if (fault != 12) v2->pd_checksum = pg_checksum_page(durable_disk.data, 0);
+		else v2->_reserved[2] ^= 1;
+		if (fault == 14) ((PageHeader)durable_disk.data)->pd_upper = 0;
+		memcpy(durable_resident.data, durable_disk.data, BLCKSZ); before = durable_disk;
+		origin_before = ctrc_origin_entries()[index];
+		UT_ASSERT(!census_origin_durable_certificate_publish(&snapshot));
+		UT_ASSERT_EQ(durable_wals, 0); UT_ASSERT_EQ(durable_flushes, 0); UT_ASSERT_EQ(durable_commits, 0);
+		UT_ASSERT(memcmp(&origin_before, &ctrc_origin_entries()[index], sizeof(origin_before)) == 0);
+		UT_ASSERT(memcmp(before.data, durable_disk.data, BLCKSZ) == 0);
+		UT_ASSERT(memcmp(before.data, durable_resident.data, BLCKSZ) == 0);
+		UT_ASSERT(!durable_admitted && !durable_current && !durable_pinned);
+		UT_ASSERT_EQ(durable_enters, durable_leaves); census_full_layout_release(&runtime);
+	}
+}
+
+UT_TEST(test_tt40_release_original_page_view_refuses_replay_unqualified_context)
+{
+	QualifiedXminFixture f; CensusRuntimeAllocation runtime; ClusterCtrcReceiptHandle handle;
+	ClusterCtrcOriginCertificateSnapshot snapshot; uint64 index;
+	if (!durable_snapshot_fixture(&f, &runtime, NULL, false, &handle, &index, &snapshot)) { UT_ASSERT(false); return; }
+	for (unsigned fault = 0; fault < 4; fault++) {
+		ClusterCtrcTxnKeyV1 key = snapshot.origin.key; TTSlot slot; bool tt_v2 = false;
+		UndoSegmentHeaderDataV2 *page;
+		durable_tt40_page(&snapshot, false, false); page = (UndoSegmentHeaderDataV2 *)durable_disk.data;
+		switch (fault) {
+		case 0: key.segment_generation = page->wrap_count = 0; break;
+		case 1: key.segment_generation = page->wrap_count = UINT32_MAX; break;
+		case 2: key.cluster_epoch = 0; break;
+		case 3: key.formation_epoch = 0; break;
+		}
+		page->pd_checksum = pg_checksum_page(durable_disk.data, 0);
+		UT_ASSERT(!ctrc_certificate_slot_read(durable_disk.data, &key,
+											 snapshot.origin.original_full_xid, &tt_v2, &slot));
+		UT_ASSERT_EQ(durable_wals + durable_flushes + durable_commits, 0);
+	}
+	census_full_layout_release(&runtime);
+}
+
+UT_TEST(test_tt40_release_readback_rechecks_format_fullxid_and_checksum)
+{
+	for (unsigned fault = 1; fault <= 7; fault++) {
+		QualifiedXminFixture f; CensusRuntimeAllocation runtime; ClusterCtrcReceiptHandle handle;
+		ClusterCtrcOriginCertificateSnapshot snapshot; ClusterCtrcOriginEntry before; uint64 index;
+		if (!durable_snapshot_fixture(&f, &runtime, NULL, false, &handle, &index, &snapshot)) { UT_ASSERT(false); return; }
+		durable_tt40_page(&snapshot, false, false); before = ctrc_origin_entries()[index]; durable_v2_final_fault = fault;
+		UT_ASSERT(!census_origin_durable_certificate_publish(&snapshot));
+		UT_ASSERT_EQ(durable_wals, 1); UT_ASSERT_EQ(durable_flushes, 1); UT_ASSERT_EQ(durable_commits, 0);
+		UT_ASSERT(memcmp(&before, &ctrc_origin_entries()[index], sizeof(before)) == 0);
+		UT_ASSERT(!durable_admitted && !durable_current && !durable_pinned);
+		UT_ASSERT_EQ(durable_enters, durable_leaves); census_full_layout_release(&runtime);
+	}
+}
+
+UT_TEST(test_tt40_release_error_after_durable_write_replays_without_duplicate_wal)
+{
+	QualifiedXminFixture f; CensusRuntimeAllocation runtime; ClusterCtrcReceiptHandle handle;
+	ClusterCtrcOriginCertificateSnapshot snapshot; ClusterCtrcOriginEntry before; uint64 index;
+	volatile bool caught = false;
+	if (!durable_snapshot_fixture(&f, &runtime, NULL, false, &handle, &index, &snapshot)) { UT_ASSERT(false); return; }
+	durable_tt40_page(&snapshot, false, false); before = ctrc_origin_entries()[index]; durable_fault = DURABLE_ERROR_READBACK;
+	expecting_error = true;
+	if (setjmp(error_jump) == 0) { (void)census_origin_durable_certificate_publish(&snapshot); UT_ASSERT(false); }
+	else { caught = true; UT_ASSERT(PG_exception_stack == NULL); }
+	expecting_error = false;
+	UT_ASSERT(caught); UT_ASSERT_EQ(durable_wals, 1); UT_ASSERT_EQ(durable_flushes, 1);
+	UT_ASSERT(memcmp(&before, &ctrc_origin_entries()[index], sizeof(before)) == 0);
+	UT_ASSERT(!durable_admitted && !durable_current && !durable_pinned);
+	durable_fault = DURABLE_OK;
+	UT_ASSERT(census_origin_durable_certificate_publish(&snapshot));
+	UT_ASSERT_EQ(durable_wals, 1); UT_ASSERT_EQ(durable_flushes, 1); UT_ASSERT_EQ(durable_commits, 1);
+	UT_ASSERT_EQ(durable_enters, durable_leaves); census_full_layout_release(&runtime);
 }
 
 UT_TEST(test_census_durable_certificate_rejects_empty_snapshot_without_commit)
@@ -17366,7 +17556,7 @@ UT_TEST(test_production_outer_native_errors_unwind_pin_before_original_leave)
 int
 main(void)
 {
-	UT_PLAN(371);
+	UT_PLAN(376);
 
 	UT_RUN(test_production_outer_shared_age_above_native_cutoff_reaches_wal);
 	UT_RUN(test_production_outer_no_old_creation_candidate_keeps_optional_cleanout);
@@ -17467,6 +17657,11 @@ main(void)
 	UT_RUN(test_collector_observer_owned_sources_are_rechecked_after_actual_space);
 	UT_RUN(test_collector_observer_error_preserves_caller_pin_admission_and_page);
 	UT_RUN(test_collector_observer_keep_unproven_preserves_selected_native_subset);
+	UT_RUN(test_tt40_release_original_publisher_preserves_full_identity_and_sealed_page);
+	UT_RUN(test_tt40_release_refuses_bad_format_fullxid_or_predecessor_without_wal);
+	UT_RUN(test_tt40_release_original_page_view_refuses_replay_unqualified_context);
+	UT_RUN(test_tt40_release_readback_rechecks_format_fullxid_and_checksum);
+	UT_RUN(test_tt40_release_error_after_durable_write_replays_without_duplicate_wal);
 	UT_RUN(test_census_durable_certificate_rejects_empty_snapshot_without_commit);
 	UT_RUN(test_census_original_durable_publisher_commits_after_readback_and_cleanup);
 	UT_RUN(test_census_original_durable_publisher_preflight_keeps_origin_before_wait);

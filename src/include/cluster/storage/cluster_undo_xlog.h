@@ -985,6 +985,9 @@ extern XLogRecPtr cluster_undo_emit_tt_slot_set_head(uint8 instance, uint32 segm
  * must flush the returned LSN before publishing the release bit. */
 extern XLogRecPtr
 cluster_undo_xlog_insert_tt_ctrc_release(const xl_undo_tt_slot_ctrc_release_v1 *record);
+/* Explicit TT40 certificate, same opcode and original durability owner. */
+extern XLogRecPtr
+cluster_undo_xlog_insert_tt_ctrc_release_v2(const xl_undo_tt_slot_ctrc_release_v2 *record);
 
 /* spec-3.13 D3: emit XLOG_UNDO_SEGMENT_RECYCLE (caller XLogFlush + pwrite + fsync). */
 extern XLogRecPtr cluster_undo_emit_segment_recycle(uint8 instance, uint32 segment_id,

@@ -75,6 +75,7 @@
 #include "storage/buf_internals.h"
 #include "storage/backendid.h"
 #include "storage/bufpage.h"
+#include "storage/checksum.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
 #include "storage/ipc.h"
@@ -6168,6 +6169,56 @@ cluster_ctrc_terminal_release_sample_exact(uint32 segment_id, uint16 slot_offset
 }
 
 #ifndef CLUSTER_CTRC_UNIT_TEST
+/* Only the original pinned certificate publisher consumes this view. Check
+ * framing before any shifted field and bind TT40 to its retained origin. */
+static bool
+ctrc_certificate_slot_read(char *page, const ClusterCtrcTxnKeyV1 *key,
+						   FullTransactionId original, bool *tt_v2, TTSlot *slot)
+{
+	const uint8 legacy_reserved[7] = { 0 };
+
+	if (page == NULL || key == NULL || tt_v2 == NULL || slot == NULL
+		|| key->slot_offset >= TT_SLOTS_PER_SEGMENT)
+		return false;
+	if ((uint8)page[57] != 0) {
+		const UndoSegmentHeaderDataV2 *header = (const UndoSegmentHeaderDataV2 *)page;
+		const TTSlotV2 *v2;
+
+		if (!UndoSegmentHeaderV2_identity_matches(page, BLCKSZ, key->segment_id,
+											  key->owner_instance)
+			|| header->wrap_count != key->segment_generation
+			|| header->wrap_count == 0 || header->wrap_count == UINT32_MAX
+			|| key->cluster_epoch == 0 || key->formation_epoch == 0
+			|| PageIsNew((Page)page)
+			|| header->pd_checksum != pg_checksum_page(page, 0)
+			|| !FullTransactionIdIsNormal(original)
+			|| U64FromFullTransactionId(original) == UINT64_MAX
+			|| XidFromFullTransactionId(original) != key->xid)
+			return false;
+		v2 = &header->tt_slots[key->slot_offset];
+		if (v2->original_full_xid != U64FromFullTransactionId(original)
+			|| v2->commit_scn == UINT64_MAX)
+			return false;
+		memcpy(slot, v2, sizeof(*slot));
+		*tt_v2 = true;
+	} else {
+		const UndoSegmentHeaderData *header = (const UndoSegmentHeaderData *)page;
+
+		if (memcmp(page + 57, legacy_reserved, sizeof(legacy_reserved)) != 0
+			|| header->segment_id != key->segment_id
+			|| header->owner_instance != key->owner_instance
+			|| header->wrap_count != key->segment_generation
+			|| header->tt_slots_count != TT_SLOTS_PER_SEGMENT)
+			return false;
+		*slot = header->tt_slots[key->slot_offset];
+		*tt_v2 = false;
+	}
+	return slot->xid == key->xid && slot->wrap == key->slot_wrap
+		&& (slot->status == TT_SLOT_COMMITTED || slot->status == TT_SLOT_ABORTED)
+		&& ((slot->status == TT_SLOT_COMMITTED) == SCN_VALID(slot->commit_scn))
+		&& (slot->flags & ~TT_SLOT_FLAGS_KNOWN) == 0;
+}
+
 static bool
 ctrc_cleaner_publish_certificate(const ClusterCtrcOriginCertificateSnapshot *snapshot)
 {
@@ -6184,11 +6235,12 @@ ctrc_cleaner_publish_certificate(const ClusterCtrcOriginCertificateSnapshot *sna
 	PGAlignedBlock disk_block;
 	PGAlignedBlock successor_block;
 	PGAlignedBlock final_disk_block;
-	const UndoSegmentHeaderData *disk_header;
 	UndoSegmentHeaderData *successor_header;
-	const UndoSegmentHeaderData *final_disk_header;
-	const TTSlot *disk_slot;
-	const TTSlot *final_disk_slot;
+	TTSlot disk_slot;
+	TTSlot final_disk_slot;
+	bool tt_v2 = false;
+	bool final_tt_v2 = false;
+	xl_undo_tt_slot_ctrc_release_v2 record_v2;
 	xl_undo_tt_slot_ctrc_release_v1 record;
 	ClusterUndoTtCtrcReleaseRedoDecision decision = CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_CONFLICT;
 	const ClusterCtrcTxnKeyV1 *key;
@@ -6290,17 +6342,8 @@ ctrc_cleaner_publish_certificate(const ClusterCtrcOriginCertificateSnapshot *sna
 										  disk_block.data)
 			|| memcmp(disk_block.data, resident_page, BLCKSZ) != 0)
 			goto certificate_done;
-		disk_header = (const UndoSegmentHeaderData *)disk_block.data;
-		if (disk_header->segment_id != key->segment_id
-			|| disk_header->owner_instance != key->owner_instance
-			|| disk_header->wrap_count != key->segment_generation
-			|| disk_header->tt_slots_count != TT_SLOTS_PER_SEGMENT)
-			goto certificate_done;
-		disk_slot = &disk_header->tt_slots[key->slot_offset];
-		if (disk_slot->xid != key->xid || disk_slot->wrap != key->slot_wrap
-			|| (disk_slot->status != TT_SLOT_COMMITTED && disk_slot->status != TT_SLOT_ABORTED)
-			|| (disk_slot->status == TT_SLOT_COMMITTED) != SCN_VALID(disk_slot->commit_scn)
-			|| (disk_slot->flags & ~TT_SLOT_FLAGS_KNOWN) != 0)
+		if (!ctrc_certificate_slot_read(disk_block.data, key,
+				snapshot->origin.original_full_xid, &tt_v2, &disk_slot))
 			goto certificate_done;
 
 		record.segment_id = key->segment_id;
@@ -6318,11 +6361,11 @@ ctrc_cleaner_publish_certificate(const ClusterCtrcOriginCertificateSnapshot *sna
 		record.slot_offset = key->slot_offset;
 		record.slot_wrap = key->slot_wrap;
 		record.owner_instance = key->owner_instance;
-		record.terminal_status = disk_slot->status;
+		record.terminal_status = disk_slot.status;
 		record.format_version = CLUSTER_UNDO_TT_CTRC_RELEASE_VERSION;
 		record.flags = CLUSTER_UNDO_TT_CTRC_RELEASE_ALL_TOUCHED_ACKED;
 		decision
-			= cluster_undo_tt_ctrc_release_redo_decide(disk_header->wrap_count, disk_slot, &record);
+			= cluster_undo_tt_ctrc_release_redo_decide(key->segment_generation, &disk_slot, &record);
 		if (decision != CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_APPLY
 			&& decision != CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_IDEMPOTENT)
 			goto certificate_done;
@@ -6341,9 +6384,20 @@ ctrc_cleaner_publish_certificate(const ClusterCtrcOriginCertificateSnapshot *sna
 
 		if (decision == CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_APPLY) {
 			memcpy(successor_block.data, disk_block.data, BLCKSZ);
-			successor_header = (UndoSegmentHeaderData *)successor_block.data;
-			successor_header->tt_slots[key->slot_offset].flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
-			certificate_lsn = cluster_undo_xlog_insert_tt_ctrc_release(&record);
+			if (tt_v2) {
+				UndoSegmentHeaderDataV2 *v2 = (UndoSegmentHeaderDataV2 *)successor_block.data;
+
+				v2->tt_slots[key->slot_offset].flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+				v2->pd_checksum = pg_checksum_page(successor_block.data, 0);
+				record_v2.release = record;
+				record_v2.release.format_version = CLUSTER_UNDO_TT_CTRC_RELEASE_V2_VERSION;
+				record_v2.original_full_xid = U64FromFullTransactionId(snapshot->origin.original_full_xid);
+				certificate_lsn = cluster_undo_xlog_insert_tt_ctrc_release_v2(&record_v2);
+			} else {
+				successor_header = (UndoSegmentHeaderData *)successor_block.data;
+				successor_header->tt_slots[key->slot_offset].flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+				certificate_lsn = cluster_undo_xlog_insert_tt_ctrc_release(&record);
+			}
 			if (XLogRecPtrIsInvalid(certificate_lsn))
 				goto certificate_done;
 			cluster_undo_block0_flush_sync(&pin, successor_block.data, certificate_lsn, false);
@@ -6353,14 +6407,14 @@ ctrc_cleaner_publish_certificate(const ClusterCtrcOriginCertificateSnapshot *sna
 										  final_disk_block.data)
 			|| memcmp(final_disk_block.data, resident_page, BLCKSZ) != 0)
 			goto certificate_done;
-		final_disk_header = (const UndoSegmentHeaderData *)final_disk_block.data;
-		final_disk_slot = &final_disk_header->tt_slots[key->slot_offset];
-		if (final_disk_header->segment_id != key->segment_id
-			|| final_disk_header->owner_instance != key->owner_instance
-			|| final_disk_header->wrap_count != key->segment_generation
-			|| final_disk_header->tt_slots_count != TT_SLOTS_PER_SEGMENT
-			|| cluster_undo_tt_ctrc_release_redo_decide(final_disk_header->wrap_count,
-														final_disk_slot, &record)
+		if (!ctrc_certificate_slot_read(final_disk_block.data, key,
+				snapshot->origin.original_full_xid, &final_tt_v2, &final_disk_slot)
+			|| final_tt_v2 != tt_v2
+			|| (tt_v2 && memcmp(final_disk_block.data,
+								decision == CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_APPLY
+									? successor_block.data : disk_block.data, BLCKSZ) != 0)
+			|| cluster_undo_tt_ctrc_release_redo_decide(key->segment_generation,
+													 &final_disk_slot, &record)
 				   != CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_IDEMPOTENT
 			/* The EXCLUSIVE resident pin is still held, so its sampled
 			 * generation cannot change.  Calling the sampling API here would

@@ -599,13 +599,79 @@ UT_TEST(test_v2_abort_producer_preserves_original_identity_and_rejects_before_in
 	}
 }
 
+
+UT_TEST(test_v2_release_producer_preserves_104_bytes_and_rejects_before_insert)
+{
+	for (unsigned fault = 0; fault < 21; fault++) {
+		xl_undo_tt_slot_ctrc_release_v2 record = { 0 };
+		uint8 expected[CLUSTER_UNDO_TT_CTRC_RELEASE_V2_BYTES];
+		ClusterUndoDecoded decoded;
+		record.release.segment_id = 513; record.release.segment_generation = 9;
+		record.release.xid = 801; record.release.cluster_epoch = 11;
+		record.release.root_id = 12; record.release.root_generation = 13;
+		record.release.formation_epoch = 14; record.release.admission_record_generation = 15;
+		record.release.seal_generation = 16; record.release.touched_nodes_low = 4;
+		record.release.slot_offset = 4; record.release.slot_wrap = 7;
+		record.release.owner_instance = 3; record.release.terminal_status = TT_SLOT_COMMITTED;
+		record.release.format_version = CLUSTER_UNDO_TT_CTRC_RELEASE_V2_VERSION;
+		record.release.flags = CLUSTER_UNDO_TT_CTRC_RELEASE_ALL_TOUCHED_ACKED;
+		memset(record.release.ack_set_digest, 0x5a, 16);
+		record.original_full_xid = UINT64_C(0x700000321);
+		switch (fault) {
+		case 1: record.release.format_version = 1; break;
+		case 2: record.original_full_xid = 0; break;
+		case 3: record.original_full_xid = UINT64_MAX; break;
+		case 4: record.original_full_xid++; break;
+		case 5: record.release.xid = FrozenTransactionId; record.original_full_xid = FrozenTransactionId; break;
+		case 6: record.release.slot_offset = TT_SLOTS_PER_SEGMENT; break;
+		case 7: record.release.slot_wrap = TT_WRAP_INVALID; break;
+		case 8: record.release.owner_instance = 0; break;
+		case 9: record.release.root_id = 0; break;
+		case 10: record.release.seal_generation = 0; break;
+		case 11: record.release.touched_nodes_high = 1; break;
+		case 12: record.release.flags = 0; break;
+		case 13: record.release.terminal_status = TT_SLOT_ACTIVE; break;
+		case 14: record.release.segment_generation = UINT32_MAX; break;
+		case 15: record.release.segment_id = 1; break; /* Different physical owner. */
+		case 16: record.release.segment_id = UINT32_MAX; break;
+		case 17: break; /* NULL input. */
+		case 18: record.release.segment_generation = 0; break;
+		case 19: record.release.cluster_epoch = 0; break;
+		case 20: record.release.formation_epoch = 0; break;
+		}
+		payload_length = 123; emitted_info = 0xee;
+		if (fault == 0) {
+			UT_ASSERT(cluster_undo_tt_ctrc_release_v2_encode(&record, expected));
+			UT_ASSERT_EQ(cluster_undo_xlog_insert_tt_ctrc_release_v2(&record), 0x900);
+			UT_ASSERT_EQ(payload_length, 104); UT_ASSERT_EQ(emitted_rmid, RM_CLUSTER_UNDO_ID);
+			UT_ASSERT_EQ(emitted_info, XLOG_UNDO_TT_SLOT_CTRC_RELEASE);
+			UT_ASSERT_EQ(memcmp(payload, expected, 104), 0);
+			decoded = decode_emitted(false);
+			UT_ASSERT(cluster_undo_preflight_tt_v2(&decoded));
+			UT_ASSERT_EQ(decoded.original_full_xid, record.original_full_xid);
+			UT_ASSERT_EQ(decoded.expected_generation, 9);
+			UT_ASSERT_EQ(decoded.seal_generation, 16);
+			UT_ASSERT_EQ(memcmp(decoded.ack_set_digest, record.release.ack_set_digest, 16), 0);
+		} else {
+			expect_panic = true;
+			if (setjmp(panic_jump) == 0) {
+				(void)cluster_undo_xlog_insert_tt_ctrc_release_v2(fault == 17 ? NULL : &record);
+				UT_ASSERT(false);
+			}
+			expect_panic = false;
+			UT_ASSERT_EQ(payload_length, 123); UT_ASSERT_EQ(emitted_info, 0xee);
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(12);
 	UT_RUN(test_segment_lifecycle_producer_payloads);
 	UT_RUN(test_tt_producer_identity_and_polarity);
 	UT_RUN(test_ctrc_release_producer_certificate);
+	UT_RUN(test_v2_release_producer_preserves_104_bytes_and_rejects_before_insert);
 	UT_RUN(test_block_write_producer_checkpoint_boundary);
 	UT_RUN(test_block_write_multi_producer_checkpoint_boundary);
 	UT_RUN(test_unowned_segment_and_hwm_do_not_gain_authority);
