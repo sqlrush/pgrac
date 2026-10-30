@@ -273,6 +273,21 @@ extern struct RfPageCtrcReadbackImageV1 ClusterColdRecoveryCtrcPageImage(
 struct RfPageCtrcOwnerProofV1;
 extern struct RfPageCtrcOwnerProofV1 ClusterColdRecoveryCtrcPageOwnerProof(
 	const struct ClusterRecoveryStartV1 *start, uint32 target_index);
+/* Original PAGE owner -> canonical completion bytes. Accept exactly one
+ * complete canonical atom2 for the SAME native MAIN path/block and full page.
+ * Its logical origin is the original replay generation's origin; native
+ * relation file generation is the explicit no-U64-generation value zero,
+ * not a qualified base/era. Snapshot the entire bounded witness before the
+ * original owner read; derive outcome/rule only from that actual operation.
+ * memory_budget bounds additional temporary witness/path/ID storage.
+ * Return only by value. Inputs remain immutable; normal/ERROR frees private
+ * scratch, preserving native custody and sticky refusal. Caller must retain
+ * and revalidate the original Start and this contribution before graph use.
+ * No complete owner scope/graph, D0 admission, release or joint success. */
+struct RfPageCtrcOwnerCompletionV1;
+extern struct RfPageCtrcOwnerCompletionV1 ClusterColdRecoveryCtrcPageOwnerCompletion(
+	const struct ClusterRecoveryStartV1 *start, uint32 target_index,
+	const uint8 *raw_evidence, Size evidence_length, Size memory_budget);
 struct RfPageCtrcFpiInsertV1;
 struct ClusterSharedFsPageV1;
 /* Local immutable membership only: the ORIGINAL retained result address and

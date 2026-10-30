@@ -10897,3 +10897,5 @@ test_cluster_recovery_native_inputs: test_cluster_recovery_native_callback.inc
 # Complete original PAGE-owner round, including final non-PAGE checks.
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_owner_round.inc
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_owner_continuation.inc
+
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_owner_completion.inc

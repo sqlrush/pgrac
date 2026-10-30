@@ -206,6 +206,7 @@
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_recovery_census.h"
+#include "cluster/cluster_recovery_ctrc_record.h"
 #include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_page_install_ctrc.h"
 #include "cluster/cluster_page_wal.h"
@@ -2380,6 +2381,137 @@ ClusterColdRecoveryCtrcPageOwnerProof(const struct ClusterRecoveryStartV1 *start
 	}
 	PG_END_TRY();
 	return result;
+}
+
+/* A single complete DATA atom for the actual owner-read MAIN object. Native
+ * relation files have no U64 generation: zero is explicit absence, never a
+ * replacement for the SPACE identity/base/lifetime obligations. The logical
+ * origin is the original replay generation, not the new FPI writer. */
+static bool
+cluster_recovery_cold_page_completion_atom(const struct ClusterRecoveryStartV1 *start,
+	const RfPageCtrcOwnerProofV1 *proof, const uint8 *evidence, Size length)
+{
+	const uint8 *atom = evidence + 16, *id = atom + 10;
+	const ClusterRecoveryCtrcReplaySetSourceV1 *source = NULL;
+	uint64 path_length;
+	Size id_length;
+	char *base;
+	char path[MAXPGPATH];
+	int written;
+
+	if (length < BLCKSZ + 96 || cluster_undo_tt_ctrc_get_u64_le(evidence) != 1
+		|| cluster_undo_tt_ctrc_get_u16_le(atom) != 2)
+		return false;
+	path_length = cluster_undo_tt_ctrc_get_u64_le(id + 22);
+	if (path_length == 0 || path_length >= MAXPGPATH) return false;
+	id_length = 46 + (Size)path_length;
+	if (length != 50 + id_length + BLCKSZ
+		|| cluster_undo_tt_ctrc_get_u64_le(evidence + 8) != length - 16
+		|| cluster_undo_tt_ctrc_get_u64_le(atom + 2) != id_length + 16
+		|| cluster_undo_tt_ctrc_get_u64_le(id) != proof->space.key.system_identifier
+		|| cluster_undo_tt_ctrc_get_u64_le(id + 8) != proof->space.key.database_incarnation
+		|| cluster_undo_tt_ctrc_get_u32_le(id + 18) != CLUSTER_RECOVERY_FILE_RELATION
+		|| cluster_undo_tt_ctrc_get_u64_le(id + 30 + path_length) != 0
+		|| cluster_undo_tt_ctrc_get_u64_le(id + 38 + path_length) != proof->blockno
+		|| cluster_undo_tt_ctrc_get_u64_le(id + id_length)
+			!= (uint64)(proof->blockno % RELSEG_SIZE) * BLCKSZ
+		|| cluster_undo_tt_ctrc_get_u64_le(id + id_length + 8) != BLCKSZ
+		|| cluster_undo_tt_ctrc_get_u64_le(id + id_length + 16) != BLCKSZ
+		|| memcmp(id + id_length + 24, proof->image.data, BLCKSZ) != 0)
+		return false;
+	for (uint32 i = 0; i < start->ctrc_page_source_count; i++) {
+		const ClusterRecoveryCtrcReplaySetSourceV1 *candidate = &start->ctrc_page_sources[i];
+		if (candidate->generation_index == proof->replay_source_index) {
+			if (source != NULL) return false;
+			source = candidate;
+		}
+	}
+	if (source == NULL || source->generation_count != proof->replay_source_count
+		|| cluster_undo_tt_ctrc_get_u16_le(id + 16)
+			!= source->generation.source.claim.identity.origin_node_id)
+		return false;
+	base = relpathperm(proof->space.key.locator, MAIN_FORKNUM);
+	written = proof->blockno < RELSEG_SIZE
+		? snprintf(path, sizeof(path), "%s", base)
+		: snprintf(path, sizeof(path), "%s.%u", base, proof->blockno / RELSEG_SIZE);
+	pfree(base);
+	return written > 0 && written < (int)sizeof(path) && (uint64)written == path_length
+		&& memcmp(id + 30, path, path_length) == 0;
+}
+
+/* Couple the existing canonical completion codec to the real original PAGE
+ * owner, rather than letting a graph caller choose a rule or a done flag.
+ * Freeze all supplied bytes before that owner yields; only local pure codecs
+ * follow its final full current check. No graph admission or D0 is added. */
+RfPageCtrcOwnerCompletionV1
+ClusterColdRecoveryCtrcPageOwnerCompletion(const struct ClusterRecoveryStartV1 *start,
+	uint32 index, const uint8 *raw_evidence, Size evidence_length, Size memory_budget)
+{
+	RfPageCtrcOwnerCompletionV1 out = {0};
+	uint8 *volatile evidence = NULL;
+	uint8 ids[MAXPGPATH + 92];
+	Size ids_length = 0;
+	bool encoded = false;
+
+	out.owner.detail = RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	if (start == NULL || start != cluster_recovery_cold_start
+		|| !cluster_recovery_cold_ctrc_replays_actor() || raw_evidence == NULL
+		|| evidence_length < BLCKSZ + 96 || evidence_length > BLCKSZ + MAXPGPATH + 96)
+		return out;
+	/* Include both by-value owner/result frames, the complete witness copy,
+	 * path/base scratch and the original codec's bounded temporary ID copy.
+	 * Account before entering PAGE; no caller buffer is borrowed across I/O. */
+	if (memory_budget < evidence_length + sizeof(out) + sizeof(RfPageCtrcOwnerProofV1)
+		+ 2 * sizeof(ids) + 2 * MAXPGPATH) {
+		out.owner.detail = RF_PAGE_PROOF_DETAIL_CAPACITY;
+		return out;
+	}
+	PG_TRY();
+	{
+		RfPageCtrcOwnerProofV1 actual;
+
+		evidence = MemoryContextAllocExtended(TopMemoryContext, evidence_length,
+			MCXT_ALLOC_ZERO | MCXT_ALLOC_NO_OOM);
+		if (evidence == NULL)
+			out.owner.detail = RF_PAGE_PROOF_DETAIL_OOM;
+		else {
+			memcpy(evidence, raw_evidence, evidence_length);
+			actual = ClusterColdRecoveryCtrcPageOwnerProof(start, index);
+			out.owner.detail = actual.detail;
+			if (actual.detail == RF_PAGE_PROOF_DETAIL_OK) {
+				if (actual.owner_family == 10 && actual.outcome == 1
+					&& (actual.rule == 1 || actual.rule == 6)
+					&& memcmp(evidence, raw_evidence, evidence_length) == 0
+					&& cluster_recovery_cold_page_completion_atom(start, &actual, evidence, evidence_length)
+					&& cluster_recovery_ctrc_witness_ids_from_evidence_v2(evidence,
+						evidence_length, ids, sizeof(ids), &ids_length)
+					&& ids_length <= sizeof(out.completion) - 4
+					&& cluster_recovery_ctrc_owner_completion_bytes_v2(actual.outcome, actual.rule,
+						ids, ids_length, evidence, evidence_length, out.completion, ids_length + 4)) {
+					out.owner = actual;
+					out.length = ids_length + 4;
+					encoded = true;
+				} else
+					out.owner.detail = RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+			}
+		}
+	}
+	PG_CATCH();
+	{
+		if (evidence != NULL) pfree((void *)evidence);
+		cluster_recovery_cold_page_plan_refuse(cluster_recovery_cold_start,
+			RF_PAGE_PROOF_DETAIL_INTERNAL);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (evidence != NULL) pfree((void *)evidence);
+	if (!encoded) {
+		RfPageProofDetailV1 detail = out.owner.detail;
+		MemSet(&out, 0, sizeof(out)); out.owner.detail = detail;
+		if (detail != RF_PAGE_PROOF_DETAIL_WOULD_BLOCK && detail != RF_PAGE_PROOF_DETAIL_OOM)
+			cluster_recovery_cold_page_plan_refuse(cluster_recovery_cold_start, detail);
+	}
+	return out;
 }
 
 /* Native physical TT is input only. Re-run every original canonical terminal

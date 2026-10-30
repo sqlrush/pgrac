@@ -354,6 +354,16 @@ typedef struct RfPageCtrcOwnerProofV1 {
 	PGAlignedBlock image;
 } RfPageCtrcOwnerProofV1;
 
+/* One PAGE owner's canonical atom3 bytes, coupled by value to its actual
+ * protected after-image. This is not a graph node or release certificate.
+ * The graph producer still binds the exact transaction/complete effect scope
+ * and all other required witnesses, owners, base and lifetime qualifications. */
+typedef struct RfPageCtrcOwnerCompletionV1 {
+	RfPageCtrcOwnerProofV1 owner;
+	Size length;
+	uint8 completion[MAXPGPATH + 96];
+} RfPageCtrcOwnerCompletionV1;
+
 extern RfPageCtrcReadbackImageV1 rf_page_recovery_ctrc_replays_completed_image_v1(
 	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work,
 	const struct ClusterRecoveryCtrcReplaySetSourceV1 *source, RfPageCtrcAuthorityV1 *authority,

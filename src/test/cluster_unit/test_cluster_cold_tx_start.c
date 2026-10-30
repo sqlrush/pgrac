@@ -2469,9 +2469,20 @@ static void startup_local_empty_reset(void);
 
 #include "test_cluster_cold_ctrc_owner_round.inc"
 #include "test_cluster_cold_ctrc_owner_continuation.inc"
+#include "test_cluster_cold_ctrc_owner_completion.inc"
 
 int main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_OWNER_COMPLETION") != NULL) {
+		UT_PLAN(6);
+	UT_RUN(test_startup_owner_completion_uses_actual_rule_and_complete_native_witness);
+	UT_RUN(test_startup_owner_completion_rejects_incomplete_or_wrong_object_witness);
+	UT_RUN(test_startup_owner_completion_wait_and_late_drift_never_encode_success);
+	UT_RUN(test_startup_owner_completion_error_keeps_native_duty_and_private_cleanup);
+	UT_RUN(test_startup_owner_completion_budget_and_bad_handle_refuse_before_native_read);
+	UT_RUN(test_startup_owner_completion_changed_input_during_read_cannot_replace_snapshot);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_OWNER_CONTINUATION") != NULL) {
 		UT_PLAN(6);
 		UT_RUN(test_startup_owner_continuation_stable_directory_and_h_wait_keep_same_operations);
@@ -2953,7 +2964,7 @@ int main(void)
 	}
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_FIRST
-	UT_PLAN(377);
+	UT_PLAN(383);
 	UT_RUN(test_start_raw_records_keep_complete_original_bytes_and_empty_end);
 	UT_RUN(test_start_raw_records_refuse_incomplete_changed_bytes_hash_header_and_end);
 
@@ -2963,7 +2974,7 @@ int main(void)
 	UT_RUN(test_start_compound_groups_retain_complete_member_input_and_end);
 	UT_RUN(test_start_compound_groups_refuse_missing_mixed_or_nonempty_end);
 #else
-	UT_PLAN(361);
+	UT_PLAN(367);
 #endif
 	UT_RUN(test_startup_native_images_accept_only_unchanged_complete_terminal_page);
 	UT_RUN(test_startup_native_images_reject_unresolved_ambiguous_and_mx_itls);
@@ -2974,7 +2985,7 @@ int main(void)
 	UT_RUN(test_startup_native_directory_real_origin_cannot_be_discharged_by_wait);
 	UT_RUN(test_startup_native_directory_invalid_layout_and_partial_error_keep_debt);
 #else
-	UT_PLAN(353);
+	UT_PLAN(359);
 #endif
 	UT_RUN(test_startup_owner_continuation_stable_directory_and_h_wait_keep_same_operations);
 	UT_RUN(test_startup_owner_continuation_directory_wait_cannot_replace_original_sample);
@@ -2982,6 +2993,12 @@ int main(void)
 	UT_RUN(test_startup_owner_continuation_last_directory_callback_cannot_change_sample);
 	UT_RUN(test_startup_owner_continuation_last_h_sample_cannot_change_sample);
 	UT_RUN(test_startup_owner_continuation_directory_and_h_errors_keep_original_custody);
+	UT_RUN(test_startup_owner_completion_uses_actual_rule_and_complete_native_witness);
+	UT_RUN(test_startup_owner_completion_rejects_incomplete_or_wrong_object_witness);
+	UT_RUN(test_startup_owner_completion_wait_and_late_drift_never_encode_success);
+	UT_RUN(test_startup_owner_completion_error_keeps_native_duty_and_private_cleanup);
+	UT_RUN(test_startup_owner_completion_budget_and_bad_handle_refuse_before_native_read);
+	UT_RUN(test_startup_owner_completion_changed_input_during_read_cannot_replace_snapshot);
 	UT_RUN(test_startup_owner_round_keeps_complete_fpi_and_unchanged_set);
 	UT_RUN(test_startup_owner_round_later_target_cannot_change_earlier_operation);
 	UT_RUN(test_startup_owner_round_final_nonpage_check_cannot_change_completed_set);
