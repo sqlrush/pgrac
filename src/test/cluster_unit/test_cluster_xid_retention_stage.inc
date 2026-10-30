@@ -13,6 +13,9 @@
  */
 #include "utils/relmapper.h"
 #include "catalog/pg_tablespace_d.h"
+#include "catalog/storage.h"
+#include "cluster/cluster_relmap_recovery.h"
+#include "test_cluster_relmap_physical_pair.h"
 
 Oid MyDatabaseTableSpace = DEFAULTTABLESPACE_OID;
 bool allowSystemTableMods;
@@ -22,6 +25,10 @@ static unsigned stage_pair_reads, stage_pair_writes, stage_inserts, stage_flushe
 static unsigned stage_registered, stage_fault;
 static uint64 stage_committed[2];
 static ClusterRelmapV2Owner stage_written[2];
+static bool stage_physical_active;
+static ClusterRelmapV2PairResult retained_pair_read(const ClusterRelmapV2Namespace *, ClusterRelmapV2View *);
+static bool retained_pair_write(const ClusterRelmapV2Namespace *, uint64,
+	const ClusterRelmapV2Owner *, const RelMapFile *, ClusterRelmapRetentionDirectory *, LWLock *);
 
 FullTransactionId
 GetCurrentFullTransactionIdIfAny(void)
@@ -40,6 +47,7 @@ cluster_relmap_authority_v2_read(const ClusterRelmapV2Namespace *identity,
 	UT_ASSERT_EQ(identity->database_incarnation, retention_dbinc);
 	UT_ASSERT_EQ(identity->dbid, identity->shared ? InvalidOid : MyDatabaseId);
 	stage_pair_reads++;
+	if (stage_physical_active) return retained_pair_read(identity, out);
 	memset(out, 0, sizeof(*out));
 	out->committed = stage_base;
 	out->committed_generation = stage_committed[slot];
@@ -115,6 +123,8 @@ cluster_relmap_authority_v2_write_pending(const ClusterRelmapV2Namespace *identi
 	UT_ASSERT_EQ(stage_wal_header.tsid,
 		identity->shared ? GLOBALTABLESPACE_OID : MyDatabaseTableSpace);
 	UT_ASSERT_EQ(memcmp(pending, &stage_wal_image, sizeof(*pending)), 0);
+	if (stage_physical_active)
+		return retained_pair_write(identity, generation, owner, pending, directory, lock);
 	key.identity = *identity; key.generation = generation; key.origin = owner->node;
 	key.top_full_xid = owner->top_full_xid; key.membership_epoch = owner->membership_epoch;
 	key.admitted_incarnation = owner->admitted_incarnation;
@@ -140,6 +150,7 @@ retained_stage_start(uint64 first, bool striped, bool fail)
 	caller_retained_reader = retained_capture_allocate;
 	retained_capture_drift = 0;
 	retention_owner_begin = true;
+	stage_physical_active = false;
 	stage_pair_reads = stage_pair_writes = stage_inserts = stage_flushes = 0;
 	stage_registered = stage_fault = 0;
 	stage_committed[0] = 7; stage_committed[1] = 8;

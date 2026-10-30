@@ -17,6 +17,7 @@ static bool retention_wrap_ready = true;
 static void (*retention_full_clog_leaf)(FullTransactionId candidate);
 #ifdef TEST_CLUSTER_XID_RETENTION_NATIVE_CLOG
 static bool retention_mapping_held;
+static bool (*retention_terminal_match)(const ClusterRelmapOwnerSampleV2 *);
 #endif
 int xid_allocation_original_main(void);
 
@@ -195,6 +196,7 @@ retention_fixture(uint64 candidate, unsigned origin)
 	retention_wrap_ready = true;
 #ifdef TEST_CLUSTER_XID_RETENTION_NATIVE_CLOG
 	retention_mapping_held = false;
+	retention_terminal_match = NULL;
 #endif
 	retention_acquires = retention_final_observations = retention_fault = retention_error_code = 0;
 	InterruptHoldoffCount = 0;
@@ -495,6 +497,7 @@ UT_TEST(retention_guard_valid_entry_observes_under_both_locks_and_returns_only_i
 #include "test_cluster_xid_retention_native_xact.inc"
 #include "test_cluster_xid_retention_owner_capture.inc"
 #include "test_cluster_xid_retention_stage.inc"
+#include "test_cluster_xid_retention_pair.inc"
 #endif
 
 int
@@ -503,7 +506,9 @@ main(void)
 #ifdef TEST_CLUSTER_XID_RETENTION_NATIVE_CLOG
 	bool focus = getenv("PGRAC_RETENTION_NATIVE_CLOG_FOCUS") != NULL;
 	bool stage_focus = getenv("PGRAC_RETENTION_NATIVE_STAGE_FOCUS") != NULL;
-	UT_PLAN(stage_focus ? 7 : focus ? 23 : 44);
+	bool pair_focus = getenv("PGRAC_RETENTION_NATIVE_PAIR_FOCUS") != NULL;
+	UT_PLAN(pair_focus ? 5 : stage_focus ? 12 : focus ? 28 : 49);
+	if (!pair_focus) {
 	if (!stage_focus) {
 	if (!focus) {
 #else
@@ -556,6 +561,12 @@ main(void)
 	UT_RUN(retained_stage_native_late_guard_keeps_birth_without_relmap);
 	UT_RUN(retained_stage_native_writer_drift_keeps_actual_issuance_only);
 	UT_RUN(retained_stage_native_pair_refusal_keeps_staged_pins_and_outputs);
+	}
+	UT_RUN(retained_pair_native_prepare_and_finish_both_namespaces);
+	UT_RUN(retained_pair_native_commit_refuses_without_terminal_fact);
+	UT_RUN(retained_pair_native_partial_prepare_keeps_custody_and_input);
+	UT_RUN(retained_pair_native_partial_finish_is_one_shot);
+	UT_RUN(retained_pair_native_late_owner_drift_keeps_all_debt);
 #endif
 	free(relmap_runtime_shmem);
 	UT_DONE();
