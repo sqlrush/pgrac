@@ -307,6 +307,8 @@ static bool lazy_scan_shared_mx(LVRelState *vacrel, Page page, BlockNumber blkno
 static void lazy_validate_shared_freeze(LVRelState *vacrel, Page page, BlockNumber blkno, Buffer buffer);
 static ClusterHeapFreezeProofStatusV1 lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer);
 static void lazy_prepare_shared_freeze(LVRelState *vacrel, Buffer recent_buffer, Buffer *vmbuffer);
+static void lazy_publish_shared_empty(LVRelState *vacrel, Buffer buf, BlockNumber blkno,
+									 Buffer *vmbuffer, bool cleanup_lock);
 #endif
 static BlockNumber lazy_scan_skip(LVRelState *vacrel, Buffer *vmbuffer,
 								  BlockNumber next_block,
@@ -1656,6 +1658,25 @@ lazy_scan_heap(LVRelState *vacrel)
 		 * Final steps for block: drop cleanup lock, record free space in the
 		 * FSM
 		 */
+#ifdef USE_PGRAC_CLUSTER
+		/* Pruning can leave only LP_UNUSED without any LP_DEAD cleanup.
+		 * Publish through the same exact empty-page owner as the early scan
+		 * and page-vacuum paths, after all prunestate-driven mutations. */
+		if (vacrel->shared_maintenance_restricted
+			&& visibilitymap_heap_page_is_empty(page))
+		{
+			lazy_publish_shared_empty(vacrel, buf, blkno, &vmbuffer, true);
+			/* The helper releases/reacquires heap authority. New tuples must
+			 * conservatively prevent truncation; do not reuse old hastup. */
+			if (!visibilitymap_heap_page_is_empty(page))
+				vacrel->nonempty_pages = Max(vacrel->nonempty_pages, blkno + 1);
+			/* A successful publication resolved the earlier heap0/VM1 gap.
+			 * Refusal or concurrent insertion retains the original repair. */
+			shared_vm_clear = vacrel->versioned
+				&& (shared_vm_status & VISIBILITYMAP_ALL_VISIBLE) != 0
+				&& !PageIsAllVisible(page);
+		}
+#endif
 		if (prunestate.has_lpdead_items && vacrel->do_index_vacuuming)
 		{
 			/*

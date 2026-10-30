@@ -2355,6 +2355,22 @@ all: test_cluster_vm_vacuum_empty test_cluster_vm_vacuum_empty_noassert
 TESTS += test_cluster_vm_vacuum_fsm_order test_cluster_vm_vacuum_fsm_order_noassert
 all: test_cluster_vm_vacuum_fsm_order test_cluster_vm_vacuum_fsm_order_noassert
 
+TESTS += test_cluster_vm_vacuum_post_prune test_cluster_vm_vacuum_post_prune_noassert
+all: test_cluster_vm_vacuum_post_prune test_cluster_vm_vacuum_post_prune_noassert
+
+# The exact common-final caller suffix, including both deferred-clear paths.
+test_cluster_vm_vacuum_post_prune.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
+	awk '/^lazy_scan_heap\(/ { scan=1 } \
+	     scan && /Final steps for block:/ { print previous; emit=1; found++ } \
+	     emit && /^\t}$$/ { done++; exit } \
+	     emit { print } { previous=$$0 } \
+	     END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_vm_vacuum_post_prune test_cluster_vm_vacuum_post_prune_noassert: \
+		test_cluster_vm_vacuum_post_prune.c test_cluster_vm_vacuum_post_prune.inc \
+		test_cluster_heap_prune_helpers.inc $(top_srcdir)/src/include/access/heapam.h
+
 # Whole original entry bodies and the one-pass caller branch, without rewrites.
 test_cluster_vm_vacuum_acquire.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
 	awk '/^lazy_lock_buffer_for_cleanup\(/ { print "static bool"; emit=1; helper++ } \
@@ -2524,6 +2540,7 @@ test_cluster_vm_visible_heap_cold.o: $(top_srcdir)/src/backend/cluster/cluster_p
 	$(CC) $(CFLAGS) $(CPPFLAGS) -Dcluster_space_relation_read_redo_identity=heap_replay_read_identity \
 		-ffunction-sections -fdata-sections -c $< -o $@
 
+test_cluster_vm_vacuum_post_prune test_cluster_vm_vacuum_post_prune_noassert \
 test_cluster_vm_vacuum_empty test_cluster_vm_vacuum_empty_noassert \
 test_cluster_vm_visible_version test_cluster_vm_visible_version_noassert test_cluster_vm_visible_replay test_cluster_vm_visible_heap_replay test_cluster_vm_visible_assemble_replay: test_cluster_vm_visible_version.c test_cluster_heap_maintenance_policy.inc unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_pcm_lock.h \
@@ -2538,7 +2555,7 @@ test_cluster_vm_visible_version test_cluster_vm_visible_version_noassert test_cl
 		test_cluster_space_bufpage_product.o test_cluster_space_producer_product.o \
 		test_cluster_space_storage_product.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $(if $(filter %_noassert,$@),-DFIXTURE_NO_ASSERTS) $(if $(filter test_cluster_vm_vacuum_empty%,$@),$(srcdir)/test_cluster_vm_vacuum_empty.c,$(if $(filter %_replay,$@),$(srcdir)/$@.c,$<)) test_cluster_space_bufpage_product.o \
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(if $(filter %_noassert,$@),-DFIXTURE_NO_ASSERTS) $(if $(filter test_cluster_vm_vacuum_post_prune%,$@),$(srcdir)/test_cluster_vm_vacuum_post_prune.c,$(if $(filter test_cluster_vm_vacuum_empty%,$@),$(srcdir)/test_cluster_vm_vacuum_empty.c,$(if $(filter %_replay,$@),$(srcdir)/$@.c,$<))) test_cluster_space_bufpage_product.o \
 		test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
 		$(if $(filter %_replay,$@),test_cluster_vm_redo_reader.o $(XLOG_PAGE_EDGE_ENCODER_O)) \
 		$(if $(filter test_cluster_vm_visible_heap_replay test_cluster_vm_visible_assemble_replay,$@),test_cluster_vm_visible_heap_cold.o) \
@@ -6550,6 +6567,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_vm_native_chain.inc
 	rm -f test_cluster_vm_vacuum_acquire.inc test_cluster_vm_vacuum_onepass.inc
 	rm -f test_cluster_vm_vacuum_second_pass.inc
+	rm -f test_cluster_vm_vacuum_post_prune.inc
 	rm -f test_cluster_vm_buffer_matches.inc test_cluster_vm_repair_clear.inc test_cluster_vm_repair_missing_heap.inc test_cluster_vm_repair_lpdead.inc
 	rm -f test_cluster_btree_build_writer.inc test_cluster_btree_build_state.inc \
 		test_cluster_btree_build_finish.inc test_cluster_btree_build_leaf.inc

@@ -1390,6 +1390,7 @@ typedef struct LVRelState {
 	BlockNumber blkno;
 	int64 lpdead_items;
 	BlockNumber lpdead_item_pages;
+	BlockNumber nonempty_pages;
 	char *relname;
 	BufferAccessStrategy bstrategy;
 } LVRelState;
