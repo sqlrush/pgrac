@@ -13,7 +13,7 @@
  *     Modified by: SqlRush <sqlrush@gmail.com>
  *
  *     Declare original-origin recovery I/O, Startup CLOG base observations
- *     and the explicit native FullXid page-birth record.
+ *     and explicit native FullXid page-birth/truncation records.
  *     Spec: 2026-10-14-pre2-m5-e1-format-closure-v1.md
  *-------------------------------------------------------------------------
  */
@@ -57,6 +57,30 @@ typedef struct xl_clog_zeropage_full
 StaticAssertDecl(sizeof(xl_clog_zeropage_full) == 16, "CLOG full birth WAL size");
 StaticAssertDecl(offsetof(xl_clog_zeropage_full, first_full_xid) == 8,
 				 "CLOG full birth WAL offset");
+
+/* The retained native owner logs its actual reserved cutoff, never an era
+ * reconstructed from oldestXact. The legacy 12-byte prefix remains distinct.
+ * This record describes a truncation attempt, not its completion/lifetime. */
+typedef struct xl_clog_truncate_full
+{
+	int32 pageno;
+	TransactionId oldestXact;
+	Oid oldestXactDb;
+	uint32 reserved_zero;
+	uint64 oldest_full_xid;
+} xl_clog_truncate_full;
+StaticAssertDecl(sizeof(xl_clog_truncate_full) == 24, "CLOG full truncate WAL size");
+StaticAssertDecl(offsetof(xl_clog_truncate_full, oldest_full_xid) == 16,
+				 "CLOG full truncate WAL offset");
+
+static inline bool
+ClogTruncateFullIsValid(const xl_clog_truncate_full *cut)
+{
+	return cut != NULL && cut->reserved_zero == 0 && cut->pageno >= 0
+		&& TransactionIdIsNormal(cut->oldestXact)
+		&& (TransactionId)cut->oldest_full_xid == cut->oldestXact
+		&& (uint32)cut->pageno == cut->oldestXact / ((uint32)BLCKSZ * 4);
+}
 
 extern void TransactionIdSetTreeStatus(TransactionId xid, int nsubxids,
 									   TransactionId *subxids, XidStatus status, XLogRecPtr lsn);
@@ -195,8 +219,8 @@ extern bool cluster_clog_native_recovery_record_apply_v1(
 	int origin, const struct ClusterSideProjectionOperationV1 *operation);
 extern bool cluster_clog_native_recovery_record_verify_v1(
 	int origin, const struct ClusterSideProjectionOperationV1 *operation);
-/* FULL requires every owned native16B birth byte, without translating it to
- * a legacy page number. Same original cold authority and native write/sync/
+/* FULL requires the complete native16B birth or24B truncate image, without
+ * reducing it to a raw page/cutoff. Same original cold authority and native write/sync/
  * readback; these calls do not certify issuance, era or physical lifetime. */
 extern bool cluster_clog_native_recovery_full_record_apply_v1(
 	int origin, const struct ClusterSideProjectionOperationV1 *operation,
@@ -228,6 +252,7 @@ extern int	clogsyncfiletag(const FileTag *ftag, char *path);
 #define CLOG_ZEROPAGE		0x00
 #define CLOG_TRUNCATE		0x10
 #define CLOG_ZEROPAGE_FULL	0x20
+#define CLOG_TRUNCATE_FULL	0x30
 
 extern void clog_redo(XLogReaderState *record);
 extern void clog_desc(StringInfo buf, XLogReaderState *record);

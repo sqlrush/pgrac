@@ -528,3 +528,6 @@ cluster_grd.o cluster_ko_lock.o: $(top_srcdir)/src/include/storage/spin.h
 # Native opt-in diagnostic publisher layout.
 cluster_content_trace.o cluster_lock_acquire.o cluster_ges.o cluster_pcm_lock.o cluster_gcs_block.o cluster_tx_enqueue.o cluster_shmem.o: $(top_srcdir)/src/include/cluster/cluster_content_trace.h
 cluster_grd.o: $(top_srcdir)/src/include/cluster/cluster_grd.h
+
+# Rebuild the sole route table when its opcode manifest changes.
+cluster_rf_route.o: $(top_srcdir)/src/include/cluster/cluster_rf_route_manifest.def

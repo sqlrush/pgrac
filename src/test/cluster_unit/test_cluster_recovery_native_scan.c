@@ -592,7 +592,7 @@ UT_TEST(test_second_pass_binds_all_source_and_record_bytes)
 int
 main(void)
 {
-	UT_PLAN(43);
+	UT_PLAN(45);
 	UT_RUN(test_commit_keeps_every_effect_and_owned_source);
 	UT_RUN(test_abort_keeps_deletions_stats_and_subxact_membership);
 	UT_RUN(test_assignment_retains_real_top_membership);
@@ -636,6 +636,8 @@ main(void)
 	UT_RUN(test_prepare_source_budget_blocks_and_strict_completion_gates);
 	UT_RUN(test_prepare_full_bytes_rechecked_even_after_drain);
 	UT_RUN(test_prepare_repeated_resources_have_no_projection_cap);
+	UT_RUN(test_native_clog_full_truncate_keeps_exact_cutoff_image);
+	UT_RUN(test_native_clog_full_truncate_refuses_raw_alias_and_incomplete_image);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

@@ -84,16 +84,14 @@ find_manifest_route(uint8 rmid, uint8 normalized_info, RfOpcodeRouteV1 *route, b
 UT_TEST(test_route_abi_and_counts)
 {
 	UT_ASSERT_EQ(sizeof(RfOpcodeRouteV1), 8);
-	UT_ASSERT_EQ(rf_opcode_route_manifest_count_v1(), 142);
-	UT_ASSERT_EQ(rf_opcode_route_manifest_live_count_v1(), 142);
+	UT_ASSERT_EQ(rf_opcode_route_manifest_count_v1(), 143);
+	UT_ASSERT_EQ(rf_opcode_route_manifest_live_count_v1(), 143);
 }
 
 UT_TEST(test_route_canonical_key_stream)
 {
 	static const uint8 expected[PG_SHA256_DIGEST_LENGTH]
-		= { 0xab, 0x75, 0xd0, 0x89, 0x5a, 0x26, 0xce, 0x90, 0xa3, 0x0d, 0x20,
-			0x33, 0xfa, 0xd5, 0x15, 0x74, 0xfd, 0xec, 0x06, 0x05, 0x68, 0x58,
-			0xf3, 0xa6, 0x0e, 0x91, 0xdc, 0x3d, 0xd7, 0x09, 0x69, 0x27 };
+		= { 0xe0, 0x66, 0x1c, 0x4f, 0x09, 0x4b, 0x43, 0xe1, 0x20, 0x1a, 0xdb, 0x68, 0xd1, 0xc0, 0x04, 0xc9, 0xf9, 0x64, 0xcf, 0x84, 0xf7, 0x1e, 0x81, 0xd0, 0xed, 0x13, 0x70, 0x28, 0xbf, 0x23, 0xbc, 0xa5 };
 	char stream[1024];
 	uint8 digest[PG_SHA256_DIGEST_LENGTH];
 	RfOpcodeRouteV1 route;
@@ -115,7 +113,7 @@ UT_TEST(test_route_canonical_key_stream)
 		used += pg_snprintf(stream + used, sizeof(stream) - used, "%03u:%02X\n", route.rmid,
 							route.normalized_info);
 	}
-	UT_ASSERT_EQ(used, 994);
+	UT_ASSERT_EQ(used, 1001);
 	sha256_bytes((const uint8 *)stream, used, digest);
 	if (memcmp(digest, expected, sizeof(expected)) != 0) {
 		size_t j;
@@ -249,7 +247,7 @@ UT_TEST(test_every_manifest_row_has_one_total_route)
 	}
 
 	UT_ASSERT_EQ(page_count, 77);
-	UT_ASSERT_EQ(side_count, 64);
+	UT_ASSERT_EQ(side_count, 65);
 	UT_ASSERT_EQ(logical_count, 1);
 }
 
@@ -359,7 +357,7 @@ UT_TEST(test_full_clog_route_keeps_side_owner_and_forbids_blocks)
 	UT_ASSERT_EQ(route.codec_id, RF_ROUTE_CODEC_SIDE_STANDARD);
 	UT_ASSERT_EQ(rf_opcode_route_lookup_v1(3, 0x20, true, false, &route),
 				 RF_OPCODE_ROUTE_BLOCK_SHAPE_INVALID);
-	UT_ASSERT_EQ(rf_opcode_route_lookup_v1(3, 0x30, false, false, &route),
+	UT_ASSERT_EQ(rf_opcode_route_lookup_v1(3, 0x40, false, false, &route),
 				 RF_OPCODE_ROUTE_OPCODE_UNSUPPORTED);
 }
 

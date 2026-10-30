@@ -179,7 +179,8 @@ extern ClusterRelmapRetentionResult cluster_relmap_retention_runtime_truncate_un
  * routing, never a certificate.
  * Require normal non-recovery context and no caller-held XidGen/SLRU/native
  * truncation/retention lock. Reserve the stricter cut against late begin,
- * then run unchanged native floor/WAL/SLRU work outside retention. Confirm
+ * then run original native floor/WAL/SLRU work outside retention, preserving
+ * the actual reserved FullXid in distinct FULL truncation WAL. Confirm
  * no eligible files remain before completing; a clean no-op may advance the
  * conservative runtime floor without changing native oldestClogXid.
  * Entered false/ERROR may follow durable WAL, advanced native floor or partial

@@ -40,7 +40,9 @@ UT_DEFINE_GLOBALS();
 #endif
 
 static VariableCacheData fixture_variable_cache;
+#ifndef TEST_CLUSTER_CLOG_RETENTION
 VariableCache ShmemVariableCache = &fixture_variable_cache;
+#endif
 
 bool cluster_shared_config = true;
 int cluster_node_id = 0;
@@ -1963,7 +1965,7 @@ main(void)
 		UT_RUN(foreign_birth_final_publication_rechecks_authority_and_error_cleanup);
 		goto mutation_done;
 	}
-	UT_PLAN(110);
+	UT_PLAN(113);
 	UT_RUN(foreign_birth_apply_uses_matching_controller_not_local_birth);
 	UT_RUN(foreign_birth_verify_legacy_and_reload_never_restore_input);
 	UT_RUN(foreign_birth_final_root_loss_refuses_without_rebasing);
@@ -2099,6 +2101,9 @@ main(void)
 	UT_RUN(relmap_abrupt_write_error_keeps_original_writer_debt);
 	UT_RUN(relmap_native_own_checkpoint_revokes_equal_byte_observation);
 	UT_RUN(relmap_native_own_eviction_revokes_without_logical_mutation);
+	UT_RUN(native_full_truncate_redo_preserves_cutoff_and_original_delete_order);
+	UT_RUN(native_full_truncate_redo_rejects_shape_before_any_native_effect);
+	UT_RUN(native_full_truncate_cold_consumer_requires_complete_original_bytes);
 mutation_done:
 	fixture_cleanup();
 	UT_DONE();

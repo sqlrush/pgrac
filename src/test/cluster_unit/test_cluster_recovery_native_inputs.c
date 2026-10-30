@@ -1470,7 +1470,7 @@ main(int argc, char **argv)
 		UT_RUN(test_census_references_bound_metadata_and_tuple_storage_before_publication);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(267);
+	UT_PLAN(268);
 	UT_RUN(test_episode_initialized_pages_uses_both_actual_producers);
 	UT_RUN(test_episode_initialized_pages_refuses_each_unknown_origin);
 	UT_RUN(test_episode_initialized_pages_refuses_equal_bytes_wrong_birth);
@@ -1549,6 +1549,7 @@ main(int argc, char **argv)
 	UT_RUN(test_episode_clog_history_capacity_refuses_without_partial_output);
 	UT_RUN(test_episode_clog_history_prefix_and_other_generation_remain_unobserved);
 	UT_RUN(test_episode_clog_history_late_error_discards_output_keeps_original_custody);
+	UT_RUN(test_episode_full_truncate_retains_complete_cutoff_without_qualifying_legacy);
 	UT_RUN(test_episode_clog_birth_retains_full_native_image_beside_legacy_history);
 	UT_RUN(test_episode_clog_birth_keeps_native_epochs_separate_from_counter_candidates);
 	UT_RUN(test_episode_clog_birth_capacity_never_publishes_a_partial_history);

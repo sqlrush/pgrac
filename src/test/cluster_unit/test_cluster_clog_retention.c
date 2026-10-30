@@ -4,6 +4,7 @@
  * Author: SqlRush <sqlrush@gmail.com>
  * Spec: 2026-10-14-pre2-m5-e1-format-closure-v1.md */
 #define main clog_recovery_original_main
+#define TEST_CLUSTER_CLOG_RETENTION 1
 int clog_recovery_original_main(void);
 #include "test_cluster_clog_recovery.c"
 #undef main
@@ -16,6 +17,11 @@ ProcessingMode Mode = NormalProcessing;
 static VariableCacheData truncate_variables;
 VariableCache ShmemVariableCache = &truncate_variables;
 static xl_clog_truncate truncate_wal;
+/* Freeze the new WAL contract independently so the original producer can
+ * execute against the same test before the new record is implemented. */
+static uint8 truncate_image[24];
+static uint32 truncate_length;
+static uint8 truncate_info;
 static uint64 truncate_requested;
 static unsigned truncate_fault, truncate_inserts;
 static bool truncate_interleave;
@@ -94,16 +100,21 @@ XLogBeginInsert(void)
 void
 XLogRegisterData(char *data, uint32 length)
 {
-	UT_ASSERT_EQ(length, sizeof(truncate_wal));
-	if (length == sizeof(truncate_wal))
-		memcpy(&truncate_wal, data, length);
+	UT_ASSERT(length == sizeof(truncate_wal) || length == sizeof(truncate_image));
+	truncate_length = length;
+	if (length <= sizeof(truncate_image)) {
+		memset(truncate_image, 0, sizeof(truncate_image));
+		memcpy(truncate_image, data, length);
+		memcpy(&truncate_wal, data, sizeof(truncate_wal));
+	}
 }
 
 XLogRecPtr
 XLogInsert(RmgrId rmid, uint8 info)
 {
 	UT_ASSERT_EQ(rmid, RM_CLOG_ID);
-	UT_ASSERT_EQ(info, CLOG_TRUNCATE);
+	UT_ASSERT(info == CLOG_TRUNCATE || info == 0x30);
+	truncate_info = info;
 	UT_ASSERT_EQ(truncate_variables.oldestClogXid, truncate_wal.oldestXact);
 	UT_ASSERT_EQ(native_wal_flushes, 0);
 	UT_ASSERT_EQ(deleted, 0);
@@ -173,6 +184,8 @@ truncate_reset(uint64 floor, uint64 issued, unsigned origin)
 	truncate_fault = truncate_inserts = native_wal_flushes = deleted = 0;
 	truncate_interleave = false;
 	memset(&truncate_wal, 0, sizeof(truncate_wal));
+	memset(truncate_image, 0, sizeof(truncate_image));
+	truncate_length = truncate_info = 0;
 }
 
 static bool
@@ -427,6 +440,34 @@ UT_TEST(missing_original_vacuum_exclusion_refuses_without_effect)
 	fixture_idle();
 }
 
+UT_TEST(retained_truncate_wal_keeps_exact_pin_clamped_full_cutoff)
+{
+	const uint32 epochs[] = { 0, 7, UINT32_MAX };
+	for (unsigned i = 0; i < lengthof(epochs); ++i) {
+		uint64 base = (uint64)epochs[i] << 32, full = 0;
+		uint32 reserved = 1;
+		ClusterRelmapRetentionKey pin;
+
+		truncate_reset(base + 3, base + 4194404, 0);
+		pin = truncate_key(base + 1048676, true);
+		UT_ASSERT_EQ(cluster_relmap_retention_begin(truncate_directory(), &pin),
+			CLUSTER_RELMAP_RETENTION_OK);
+		truncate_file(0, true);
+		truncate_file(1, true);
+		UT_ASSERT(truncate_call(base + 3145828));
+		UT_ASSERT_EQ(truncate_info, 0x30);
+		UT_ASSERT_EQ(truncate_length, sizeof(truncate_image));
+		memcpy(&reserved, truncate_image + 12, sizeof(reserved));
+		memcpy(&full, truncate_image + 16, sizeof(full));
+		UT_ASSERT_EQ(reserved, 0);
+		UT_ASSERT_EQ(full, pin.top_full_xid);
+		UT_ASSERT_EQ((uint32)full, truncate_wal.oldestXact);
+		UT_ASSERT_EQ(truncate_directory()->pins[0].key.top_full_xid, pin.top_full_xid);
+		truncate_file(1, false);
+		fixture_idle();
+	}
+}
+
 int
 main(void)
 {
@@ -449,7 +490,7 @@ main(void)
 #ifdef CLUSTER_CLOG_RETENTION_CUT_ONLY
 	UT_PLAN(1);
 #else
-	UT_PLAN(8);
+	UT_PLAN(9);
 #endif
 	UT_RUN(original_truncate_uses_all_namespace_minimum_for_files_floor_and_wal);
 #ifdef CLUSTER_CLOG_RETENTION_CUT_ONLY
@@ -464,6 +505,7 @@ main(void)
 	UT_RUN(original_raw_wrap_comparison_keeps_full_xid_pin_segment);
 	UT_RUN(clean_noop_and_unpinned_cut_complete_without_pin_release);
 	UT_RUN(missing_original_vacuum_exclusion_refuses_without_effect);
+	UT_RUN(retained_truncate_wal_keeps_exact_pin_clamped_full_cutoff);
 	}
 	truncate_reset(3, 4194404, 0);
 	UT_ASSERT_EQ(rmdir("pg_xact"), 0);
