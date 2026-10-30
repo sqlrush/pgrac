@@ -45,6 +45,22 @@ static int proved_entry_calls, dispatch_entry_calls;
 static bool replace_on_unlock;
 static bool replace_on_lock;
 static bool scan_lifetime_case;
+/* Lifetime/EPQ fixtures have no qualified catalog or snapshot admission.
+ * Qualified heap PD consumers run the actual helpers in their own fixture. */
+void
+cluster_heap_page_visibility_prepare(Relation relation, BlockNumber block,
+	Snapshot snapshot, ClusterHeapPageVisibility *observation)
+{
+	memset(observation, 0, sizeof(*observation));
+}
+
+bool
+cluster_heap_page_all_visible(Relation relation, Buffer buffer, Page page,
+	Snapshot snapshot, const ClusterHeapPageVisibility *observation)
+{
+	return false;
+}
+
 volatile sig_atomic_t InterruptPending;
 volatile uint32 InterruptHoldoffCount;
 volatile uint32 CritSectionCount;

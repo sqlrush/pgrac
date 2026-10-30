@@ -29,9 +29,11 @@
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
+#include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_tx_resolve.h"
 #include "cluster/cluster_tx_enqueue.h"
 #include "cluster/cluster_undo_record_api.h"
+#include "cluster/cluster_undo_horizon.h"
 #include "cluster/cluster_visibility_resolve.h"
 #endif
 #include "executor/tuptable.h"
@@ -41,6 +43,24 @@
 #include "utils/rel.h"
 
 #ifdef USE_PGRAC_CLUSTER
+/* Operation-local observations, never a saved-page visibility permission.
+ * Prepare without content locks; consume only the original live heap image
+ * under its current content-S bracket. Neither function acquires a block. */
+typedef struct ClusterHeapPageVisibility
+{
+	ClusterSpaceIdentityObservationV1 identity;
+	ClusterUndoReadAdmissionFence admission;
+	uint64 snapshot_identity;
+	CommandId command_id;
+	BlockNumber block;
+	bool valid;
+} ClusterHeapPageVisibility;
+
+extern void cluster_heap_page_visibility_prepare(Relation relation, BlockNumber block,
+	Snapshot snapshot, ClusterHeapPageVisibility *observation);
+extern bool cluster_heap_page_all_visible(Relation relation, Buffer buffer, Page page,
+	Snapshot snapshot, const ClusterHeapPageVisibility *observation);
+
 /* Exact remote Dirty wait channel for the built-in successor consumer only. */
 extern bool cluster_heap_fetch_waitable(Relation relation, Snapshot snapshot, HeapTuple tuple,
 										Buffer *userbuf, bool keep_buf, bool *remote_xmax_wait,

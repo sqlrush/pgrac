@@ -46,7 +46,13 @@ for name, path, owner, args in [
     ("fixture_sample", root / "access/heap/heapam_handler.c", "heapam_scan_sample_next_tuple",
      "TableScanDesc scan, Page page")]:
     statements = assignment(path, owner, "all_visible")
-    assert len(statements) == 1
+    # This legacy fixture has no qualified catalog or prepared heap context.
+    # Keep exercising the original conservative expression; the complete
+    # qualified consumers and saved-page path have their own full-body test.
+    qualified = "cluster_heap_page_all_visible(" in function(path.read_text(), owner, "unused")
+    assert len(statements) == (2 if qualified else 1)
+    if qualified:
+        assert statements[1] == "all_visible = true;"
     wrapper(name, args, statements[0].split("=", 1)[1].strip().removesuffix(";"))
 
 path = root / "executor/nodeBitmapHeapscan.c"

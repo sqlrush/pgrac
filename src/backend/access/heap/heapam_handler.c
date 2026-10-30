@@ -2856,23 +2856,37 @@ heapam_scan_sample_next_tuple(TableScanDesc scan, SampleScanState *scanstate,
 	Page		page;
 	bool		all_visible;
 	OffsetNumber maxoffset;
+#ifdef USE_PGRAC_CLUSTER
+	ClusterHeapPageVisibility visibility = {0};
+#endif
 
 	/*
 	 * When not using pagemode, we must lock the buffer during tuple
 	 * visibility checks.
 	 */
 	if (!pagemode)
+	{
+#ifdef USE_PGRAC_CLUSTER
+		cluster_heap_page_visibility_prepare(scan->rs_rd, blockno,
+											 scan->rs_snapshot, &visibility);
+#endif
 		LockBuffer(hscan->rs_cbuf, BUFFER_LOCK_SHARE);
+	}
 
 #ifdef USE_PGRAC_CLUSTER
 	page = pagemode ? cluster_heap_scan_page(hscan) : BufferGetPage(hscan->rs_cbuf);
 #else
 	page = (Page) BufferGetPage(hscan->rs_cbuf);
 #endif
-	/* PGRAC: TABLESAMPLE cannot trust shared PD_ALL_VISIBLE. */
+	/* Saved pages use only heapgetpage's visibility-matched offset list. */
 	all_visible = !cluster_heap_maintenance_restricted(scan->rs_rd) &&
 		PageIsAllVisible(page) &&
 		!scan->rs_snapshot->takenDuringRecovery;
+#ifdef USE_PGRAC_CLUSTER
+	if (!pagemode && !all_visible && cluster_heap_page_all_visible(scan->rs_rd,
+			hscan->rs_cbuf, page, scan->rs_snapshot, &visibility))
+		all_visible = true;
+#endif
 	maxoffset = PageGetMaxOffsetNumber(page);
 
 	for (;;)

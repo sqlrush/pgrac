@@ -63,6 +63,7 @@
 #include "access/xloginsert.h"
 #include "access/xlogutils.h"
 #include "catalog/catalog.h"
+#include "catalog/catversion.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_database_d.h"
 #include "catalog/pg_replication_origin.h"
@@ -2913,6 +2914,86 @@ heap_setscanlimits(TableScanDesc sscan, BlockNumber startBlk, BlockNumber numBlk
 	scan->rs_numblocks = numBlks;
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* Capture potentially cold identity services before the original heap acquire.
+ * The evaluator is temporary; the caller retains its original snapshot. */
+void
+cluster_heap_page_visibility_prepare(Relation relation, BlockNumber block,
+	Snapshot snapshot, ClusterHeapPageVisibility *observation)
+{
+	ClusterSnapshotReadScopeV1 evaluation;
+	uint32 minimum_catalog = PGRAC_VM_QUALIFIED_CATALOG_VERSION;
+
+	memset(observation, 0, sizeof(*observation));
+	if (relation == NULL || snapshot == NULL || block == InvalidBlockNumber
+		|| !cluster_heap_maintenance_restricted(relation) || !cluster_pcm_is_active()
+		|| minimum_catalog == 0 || GetControlFileCatalogVersion() < minimum_catalog
+		|| snapshot->snapshot_type != SNAPSHOT_MVCC || snapshot->takenDuringRecovery)
+		return;
+	observation->block = block;
+	observation->command_id = snapshot->curcid;
+	cluster_snapshot_read_enter_v1(&evaluation, snapshot);
+	PG_TRY();
+	{
+		observation->valid = cluster_snapshot_cr_identity_v1(snapshot,
+															 &observation->snapshot_identity)
+			&& cluster_undo_horizon_read_admission_capture(evaluation.read_scn,
+																 &observation->admission)
+			&& cluster_space_relation_identity_capture_v1(relation, &observation->identity);
+	}
+	PG_FINALLY();
+	{
+		cluster_snapshot_read_exit_v1(&evaluation);
+	}
+	PG_END_TRY();
+}
+
+/* The PD source is guarded by the qualified catalog's publisher census.
+ * A live current heap bracket supplies freshness, not a grant for a detached
+ * CR/FULL page or for offsets retained from an earlier observation. */
+bool
+cluster_heap_page_all_visible(Relation relation, Buffer buffer, Page page,
+	Snapshot snapshot, const ClusterHeapPageVisibility *observation)
+{
+	ClusterPcmOwnSnapshot own;
+	BufferTag expected;
+	ClusterSnapshotReadScopeV1 evaluation;
+	uint64 snapshot_identity = 0;
+	volatile bool valid = false;
+
+	if (observation == NULL || !observation->valid || relation == NULL || snapshot == NULL
+		|| !BufferIsValid(buffer) || BufferIsLocal(buffer) || !cluster_pcm_is_active()
+		|| page != BufferGetPage(buffer) || !PageIsAllVisible(page)
+		|| snapshot->snapshot_type != SNAPSHOT_MVCC || snapshot->takenDuringRecovery)
+		return false;
+	InitBufferTag(&expected, &relation->rd_locator, MAIN_FORKNUM, observation->block);
+	if (cluster_bufmgr_pcm_own_snapshot(GetBufferDescriptor(buffer - 1), &own)
+		!= CLUSTER_PCM_OWN_OK || !BufferTagsEqual(&own.tag, &expected)
+		|| own.buffer_type != (uint8) BUF_TYPE_CURRENT
+		|| (own.semantic_buf_state & (BM_TAG_VALID | BM_VALID | BM_IO_IN_PROGRESS | BM_IO_ERROR))
+			!= (BM_TAG_VALID | BM_VALID)
+		|| own.generation == 0 || own.generation == UINT64_MAX
+		|| own.reservation_token == 0 || own.reservation_token == UINT64_MAX
+		|| !cluster_heap_pcm_read_authority_valid(&own))
+		return false;
+	cluster_snapshot_read_enter_v1(&evaluation, snapshot);
+	PG_TRY();
+	{
+		valid = cluster_snapshot_cr_identity_v1(snapshot, &snapshot_identity)
+			&& snapshot_identity == observation->snapshot_identity
+			&& snapshot->curcid == observation->command_id
+			&& cluster_undo_horizon_read_admission_current(&observation->admission)
+			&& cluster_space_relation_identity_current_v1(relation, &observation->identity);
+	}
+	PG_FINALLY();
+	{
+		cluster_snapshot_read_exit_v1(&evaluation);
+	}
+	PG_END_TRY();
+	return valid;
+}
+#endif
+
 /*
  * heapgetpage - subroutine for heapgettup()
  *
@@ -2931,6 +3012,9 @@ heapgetpage(TableScanDesc sscan, BlockNumber block)
 	int			ntup;
 	OffsetNumber lineoff;
 	bool		all_visible;
+#ifdef USE_PGRAC_CLUSTER
+	ClusterHeapPageVisibility visibility = {0};
+#endif
 
 	Assert(block < scan->rs_nblocks);
 #ifdef USE_PGRAC_CLUSTER
@@ -2950,6 +3034,12 @@ heapgetpage(TableScanDesc sscan, BlockNumber block)
 	 * pages' worth of consecutive dead tuples.
 	 */
 	CHECK_FOR_INTERRUPTS();
+
+#ifdef USE_PGRAC_CLUSTER
+	if (scan->rs_base.rs_flags & SO_ALLOW_PAGEMODE)
+		cluster_heap_page_visibility_prepare(scan->rs_base.rs_rd, block,
+											 scan->rs_base.rs_snapshot, &visibility);
+#endif
 
 	/* read page using selected strategy */
 	scan->rs_cbuf = ReadBufferExtended(scan->rs_base.rs_rd, MAIN_FORKNUM, block,
@@ -2999,9 +3089,14 @@ heapgetpage(TableScanDesc sscan, BlockNumber block)
 	 * full page write. Until we can prove that beyond doubt, let's check each
 	 * tuple for visibility the hard way.
 	 */
-	/* PGRAC: shared pages always use the original precise tuple check. */
+	/* Unqualified shared pages retain the original precise tuple check. */
 	all_visible = !cluster_heap_maintenance_restricted(scan->rs_base.rs_rd) &&
 		PageIsAllVisible(page) && !snapshot->takenDuringRecovery;
+#ifdef USE_PGRAC_CLUSTER
+	if (!all_visible && cluster_heap_page_all_visible(scan->rs_base.rs_rd,
+			buffer, page, snapshot, &visibility))
+		all_visible = true;
+#endif
 
 	for (lineoff = FirstOffsetNumber; lineoff <= lines; lineoff++)
 	{

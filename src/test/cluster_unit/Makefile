@@ -2439,6 +2439,27 @@ test_cluster_vm_planner test_cluster_vm_planner_noassert test_cluster_vm_planner
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
+TESTS += test_cluster_heap_pd_visibility test_cluster_heap_pd_visibility_noassert test_cluster_heap_pd_visibility_unassigned
+all: test_cluster_heap_pd_visibility test_cluster_heap_pd_visibility_noassert test_cluster_heap_pd_visibility_unassigned
+
+test_cluster_heap_pd_visibility.inc: $(srcdir)/extract_heap_pd_fixture.py $(srcdir)/extract_vacuum_mx_fixture.py \
+		$(top_srcdir)/src/backend/access/heap/heapam.c $(top_srcdir)/src/backend/access/heap/heapam_handler.c \
+		$(top_srcdir)/src/backend/access/heap/heapam_r4_private.h
+	python3 $(srcdir)/extract_heap_pd_fixture.py $(top_srcdir)/src/backend/access/heap > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_pd_visibility test_cluster_heap_pd_visibility_noassert test_cluster_heap_pd_visibility_unassigned: \
+		test_cluster_heap_pd_visibility.c test_cluster_heap_pd_visibility.inc test_cluster_vm_qualified_ios.c $(VM_QUALIFIED_FIXTURE_DEPS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(if $(filter %_noassert,$@),-DFIXTURE_NO_ASSERTS) $(if $(filter %_unassigned,$@),-DFIXTURE_UNASSIGNED_CATALOG) $< \
+		test_cluster_space_bufpage_product.o test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
+.PHONY: check_heap_pd_census
+check: check_heap_pd_census
+check_heap_pd_census:
+	python3 $(srcdir)/check_heap_pd_census.py $(top_srcdir)
+
 # The exact common-final caller suffix, including both deferred-clear paths.
 test_cluster_vm_vacuum_post_prune.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
 	awk '/^lazy_scan_heap\(/ { scan=1 } \
