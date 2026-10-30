@@ -298,6 +298,7 @@ typedef struct LVSavedErrInfo
 
 
 /* non-export function prototypes */
+static bool lazy_lock_buffer_for_cleanup(LVRelState *vacrel, Buffer buffer);
 static void lazy_scan_heap(LVRelState *vacrel);
 #ifdef USE_PGRAC_CLUSTER
 static Buffer lazy_read_shared_heap(LVRelState *vacrel, BlockNumber blkno, Buffer *vmbuffer,
@@ -1051,8 +1052,33 @@ lazy_clear_vm_after_heap(Relation rel, const ClusterSpaceIdentity *identity, Blo
 
 #endif
 
+/*
+ * Restricted shared VACUUM must capture its original ordinary writer before
+ * releasing the page for freeze proof collection.  Conditional content-X is
+ * deliberately read-only and cannot supply that writer.  Obtain the ordinary
+ * writer here, before capture, while keeping the cleanup pin check nonwaiting.
+ * If other pins prevent cleanup, release only our lock/writer and let the
+ * original SHARE/aggressive fallback retain responsibility for the pin.
+ */
+static bool
+lazy_lock_buffer_for_cleanup(LVRelState *vacrel, Buffer buffer)
+{
 #ifdef USE_PGRAC_CLUSTER
-/* Acquire heap ownership without carrying a passive VM pin into the wait. */
+	if (vacrel->versioned && vacrel->shared_maintenance_restricted)
+	{
+		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+		if (IsBufferCleanupOK(buffer))
+			return true;
+		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+		return false;
+	}
+#endif
+	return ConditionalLockBufferForCleanup(buffer);
+}
+
+#ifdef USE_PGRAC_CLUSTER
+/* Acquire the original ordinary writer without carrying a passive VM pin
+ * into the wait. A local conditional cleanup lock cannot supply that writer. */
 static Buffer
 lazy_read_shared_heap(LVRelState *vacrel, BlockNumber blkno, Buffer *vmbuffer, bool force_cleanup,
 					  bool *cleanup_lock)
@@ -1069,7 +1095,7 @@ lazy_read_shared_heap(LVRelState *vacrel, BlockNumber blkno, Buffer *vmbuffer, b
 			LockBufferForCleanup(buf);
 			*cleanup_lock = true;
 		} else {
-			*cleanup_lock = ConditionalLockBufferForCleanup(buf);
+			*cleanup_lock = lazy_lock_buffer_for_cleanup(vacrel, buf);
 			if (!*cleanup_lock)
 				LockBuffer(buf, BUFFER_LOCK_SHARE);
 		}
@@ -1127,6 +1153,7 @@ lazy_read_shared_heap(LVRelState *vacrel, BlockNumber blkno, Buffer *vmbuffer, b
  * Why: Cleanup locking does not provide remote member authority.
  * Shared VM observations precede heap pins; VM-only repair follows heap release
  * so a remote VM acquisition cannot nest below this scan's heap content lock.
+ * One-pass FSM range maintenance also follows heap/VM content-lock release.
  */
 
 static void
@@ -1297,7 +1324,7 @@ lazy_scan_heap(LVRelState *vacrel)
 		{
 			buf = ReadBufferExtended(vacrel->rel, MAIN_FORKNUM, blkno, RBM_NORMAL,
 									 vacrel->bstrategy);
-			cleanup_lock = ConditionalLockBufferForCleanup(buf);
+			cleanup_lock = lazy_lock_buffer_for_cleanup(vacrel, buf);
 			if (!cleanup_lock)
 				LockBuffer(buf, BUFFER_LOCK_SHARE);
 		}
@@ -1430,18 +1457,6 @@ lazy_scan_heap(LVRelState *vacrel)
 				dead_items->num_items = 0;
 
 				/*
-				 * Periodically perform FSM vacuuming to make newly-freed
-				 * space visible on upper FSM pages.  Note we have not yet
-				 * performed FSM processing for blkno.
-				 */
-				if (blkno - next_fsm_block_to_vacuum >= VACUUM_FSM_EVERY_PAGES)
-				{
-					FreeSpaceMapVacuumRange(vacrel->rel, next_fsm_block_to_vacuum,
-											blkno);
-					next_fsm_block_to_vacuum = blkno;
-				}
-
-				/*
 				 * Now perform FSM processing for blkno, and move on to next
 				 * page.
 				 *
@@ -1459,6 +1474,22 @@ lazy_scan_heap(LVRelState *vacrel)
 #ifdef USE_PGRAC_CLUSTER
 				lazy_prepare_shared_freeze(vacrel, buf, &vmbuffer);
 #endif
+				/*
+				 * Periodically perform FSM vacuuming to make newly-freed
+				 * space visible on upper FSM pages.  Note we have not yet
+				 * performed FSM processing for blkno.
+				 *
+				 * PGRAC: the original heap/VM work is complete and the heap
+				 * lock and pin are released. A cold FSM acquisition must not
+				 * wait while either page's content lock is held.
+				 */
+				if (blkno - next_fsm_block_to_vacuum >= VACUUM_FSM_EVERY_PAGES)
+				{
+					FreeSpaceMapVacuumRange(vacrel->rel, next_fsm_block_to_vacuum,
+											blkno);
+					next_fsm_block_to_vacuum = blkno;
+				}
+
 				RecordPageWithFreeSpace(vacrel->rel, blkno, freespace);
 				continue;
 			}

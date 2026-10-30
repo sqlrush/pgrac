@@ -2352,6 +2352,33 @@ all: test_cluster_vm_visible_version_noassert test_cluster_vm_visible_replay tes
 TESTS += test_cluster_vm_vacuum_empty test_cluster_vm_vacuum_empty_noassert
 all: test_cluster_vm_vacuum_empty test_cluster_vm_vacuum_empty_noassert
 
+TESTS += test_cluster_vm_vacuum_fsm_order test_cluster_vm_vacuum_fsm_order_noassert
+all: test_cluster_vm_vacuum_fsm_order test_cluster_vm_vacuum_fsm_order_noassert
+
+# Whole original entry bodies and the one-pass caller branch, without rewrites.
+test_cluster_vm_vacuum_acquire.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
+	awk '/^lazy_lock_buffer_for_cleanup\(/ { print "static bool"; emit=1; helper++ } \
+	     /^lazy_read_shared_heap\(/ { print "static Buffer"; emit=1; reader++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (helper > 1 || reader != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_vm_vacuum_onepass.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
+	awk '/^#define VACUUM_FSM_EVERY_PAGES / { print; getline; print; interval++ } \
+	     /^lazy_scan_heap\(/ { scan=1 } \
+	     scan && !emit && /^\t\tif \(vacrel->nindexes == 0\)/ { emit=1; found++ } \
+	     emit { print; s=$$0; opens=gsub(/\{/, "", s); s=$$0; closes=gsub(/}/, "", s); \
+	       depth+=opens-closes; if (opens) opened=1; \
+	       if (opened && depth == 0) { done++; exit } } \
+	     END { if (interval != 1 || found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_vm_vacuum_fsm_order test_cluster_vm_vacuum_fsm_order_noassert: \
+		test_cluster_vm_vacuum_fsm_order.c unit_test.h test_cluster_vm_vacuum_acquire.inc \
+		test_cluster_vm_vacuum_onepass.inc $(top_srcdir)/src/include/commands/vacuum.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(if $(filter %_noassert,$@),-DFIXTURE_NO_ASSERTS) $< \
+		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
 # Keep the whole native cleanup-to-publication entry, including its old gates.
 test_cluster_vm_vacuum_empty.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
 	@awk '/^lazy_vacuum_heap_page\(/ { signature=1 } \
@@ -6506,6 +6533,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_space_namespace_identity_equal.inc
 	rm -f test_cluster_vm_snapshot_read.inc
 	rm -f test_cluster_vm_native_chain.inc
+	rm -f test_cluster_vm_vacuum_acquire.inc test_cluster_vm_vacuum_onepass.inc
 	rm -f test_cluster_vm_buffer_matches.inc test_cluster_vm_repair_clear.inc test_cluster_vm_repair_missing_heap.inc test_cluster_vm_repair_lpdead.inc
 	rm -f test_cluster_btree_build_writer.inc test_cluster_btree_build_state.inc \
 		test_cluster_btree_build_finish.inc test_cluster_btree_build_leaf.inc
