@@ -55,10 +55,19 @@ sub resume_owner
 	return 1 unless defined $paused_pid;
 	# This OS birth/parent check guards only a cleanup signal. It is not a
 	# substitute for the native PGPROC identity asserted on both sides below.
-	my $same = eval { fingerprint($paused_pid) eq $paused_fingerprint };
+	my $current_fingerprint;
+	my $same = eval {
+		$current_fingerprint = fingerprint($paused_pid);
+		$current_fingerprint eq $paused_fingerprint;
+	};
+	my $sampling_error = $@;
 	if (!$same)
 	{
-		warn "cannot prove the original paused process for SIGCONT: $@";
+		warn "cannot prove the original paused process for SIGCONT: $sampling_error guard="
+			. JSON::PP->new->canonical->encode({pid => $paused_pid,
+				paused_fingerprint => $paused_fingerprint,
+				current_fingerprint => $current_fingerprint,
+				sampling_error => $sampling_error}) . "\n";
 		return 0;
 	}
 	my $pid = $paused_pid;
