@@ -1354,6 +1354,7 @@ fixture_cleanup(void)
 
 #include "test_cluster_clog_full_consumer.inc"
 #include "test_cluster_clog_own_full.inc"
+#include "test_cluster_clog_native_full_sync.inc"
 #include "test_cluster_clog_cold_birth.inc"
 #include "test_cluster_clog_foreign_birth.inc"
 #include "test_cluster_clog_full_residency.inc"
@@ -1523,7 +1524,23 @@ main(void)
 		UT_RUN(relmap_inflight_physical_write_refuses_new_and_original_custody);
 		goto mutation_done;
 	}
-	UT_PLAN(108);
+	if (getenv("PGRAC_CLOG_NATIVE_FULL_SYNC_FOCUS") != NULL) {
+		UT_PLAN(5);
+		UT_RUN(native_full_sync_reads_the_original_redo_page_without_reinitializing);
+		UT_RUN(native_full_sync_rejects_shape_and_context_before_io);
+		UT_RUN(native_full_sync_io_failures_and_error_keep_native_cleanup);
+		UT_RUN(native_full_sync_rejects_owner_mutation_and_changed_disk);
+		UT_RUN(native_full_sync_hook_preserves_legacy_and_foreign_routes);
+		full_sync_cleanup_files();
+		goto mutation_done;
+	}
+	UT_PLAN(113);
+	UT_RUN(native_full_sync_reads_the_original_redo_page_without_reinitializing);
+	UT_RUN(native_full_sync_rejects_shape_and_context_before_io);
+	UT_RUN(native_full_sync_io_failures_and_error_keep_native_cleanup);
+	UT_RUN(native_full_sync_rejects_owner_mutation_and_changed_disk);
+	UT_RUN(native_full_sync_hook_preserves_legacy_and_foreign_routes);
+	full_sync_cleanup_files();
 	UT_RUN(relmap_checkpoint_equal_bytes_revokes_held_observation);
 	UT_RUN(relmap_direct_writeback_tracks_original_local_and_foreign_caches);
 	UT_RUN(relmap_eviction_writeback_revokes_equal_byte_custody);

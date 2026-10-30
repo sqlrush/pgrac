@@ -2158,6 +2158,66 @@ clog_recovery_own_full_record(int origin, const ClusterSideProjectionOperationV1
 	return ok;
 }
 
+/* Complete only the existing founder FULL redo's physical write. Source
+ * attempt/current custody stays with the original native record executor. */
+bool
+cluster_clog_native_recovery_full_sync_v1(int origin, const XLogReaderState *record)
+{
+	ClusterSideProjectionOperationV1 op = { 0 };
+	xl_clog_zeropage_full birth;
+	SlruCtlData disk;
+	struct stat before, after;
+	const DecodedXLogRecord *saved;
+	XLogRecord header;
+	XLogRecPtr start, end;
+	uint64 generation;
+	int length;
+
+	if (!enableFsync || CritSectionCount != 0
+		|| !clog_recovery_own_full_directory_ready(origin)
+		|| LWLockHeldByMe(XactSLRULock) || LWLockHeldByMe(XactTruncationLock)
+		|| LWLockHeldByMe(XidGenLock)
+		|| LWLockHeldByMe(&ClogRecoveryLocks[origin * 2 + 1].lock)
+		|| cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock)
+		|| record == NULL || record->record == NULL
+		|| XLogRecGetRmid(record) != RM_CLOG_ID
+		|| (XLogRecGetInfo(record) & ~XLR_INFO_MASK) != CLOG_ZEROPAGE_FULL
+		|| XLogRecHasAnyBlockRefs(record) || XLogRecGetData(record) == NULL
+		|| XLogRecGetDataLen(record) != sizeof(birth)
+		|| record->EndRecPtr <= record->ReadRecPtr)
+		return false;
+	memcpy(&birth, XLogRecGetData(record), sizeof(birth));
+	op.kind = CLUSTER_SIDE_PROJECTION_CLOG;
+	op.action = CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE;
+	op.normalized_info = CLOG_ZEROPAGE_FULL;
+	op.page_number = birth.pageno;
+	if (!clog_recovery_full_record_shape(&op, (const uint8 *)&birth, sizeof(birth))
+		|| !clog_relmap_mutation_snapshot(origin, &generation))
+		return false;
+	saved = record->record;
+	memcpy(&header, &saved->header, sizeof(header));
+	start = record->ReadRecPtr; end = record->EndRecPtr;
+	disk = *XactCtl;
+	length = snprintf(disk.Dir, sizeof(disk.Dir), "%s/native_side/origin_%d/pg_xact",
+		cluster_shared_data_dir, origin);
+	if (length < 0 || length >= sizeof(disk.Dir)
+		|| !clog_recovery_page_identity(&disk, birth.pageno, &before)
+		|| !clog_recovery_own_full_record(origin, &op, true, (const uint8 *)&birth, sizeof(birth))
+		|| !clog_relmap_mutation_matches(origin, generation)
+		|| !clog_recovery_sync(&disk, birth.pageno, &before)
+		|| !clog_recovery_sync(&disk, -1, NULL)
+		|| !clog_recovery_own_full_directory_ready(origin)
+		|| !clog_recovery_own_full_record(origin, &op, true, (const uint8 *)&birth, sizeof(birth))
+		|| !clog_recovery_page_identity(&disk, birth.pageno, &after)
+		|| !clog_recovery_same_file(&before, &after)
+		|| !clog_relmap_mutation_matches(origin, generation))
+		return false;
+	return record->record == saved && record->ReadRecPtr == start && record->EndRecPtr == end
+		&& memcmp(&saved->header, &header, sizeof(header)) == 0 && saved->max_block_id < 0
+		&& saved->main_data != NULL && saved->main_data_len == sizeof(birth)
+		&& memcmp(saved->main_data, &birth, sizeof(birth)) == 0;
+}
+
 static bool
 clog_recovery_record(int origin, const ClusterSideProjectionOperationV1 *op, bool verify,
 					 const uint8 *payload, uint32 length)

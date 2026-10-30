@@ -125,4 +125,5 @@
 #define pgstat_get_slru_index d3_episode_clog_pgstat_get_slru_index
 #define ShmemVariableCache d3_episode_clog_ShmemVariableCache
 #define ReadNextFullTransactionId d3_episode_clog_ReadNextFullTransactionId
+#define cluster_clog_native_recovery_full_sync_v1 d3_episode_clog_cluster_clog_native_recovery_full_sync_v1
 #endif

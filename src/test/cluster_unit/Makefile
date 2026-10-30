@@ -10873,3 +10873,19 @@ test_cluster_recovery_native_inputs: test_cluster_recovery_raw_records.inc
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_raw_records.inc
 
 xlogreader_fs.o: $(top_srcdir)/src/include/access/xlogreader.h
+
+# Original founder FULL redo callback, shared by all existing native fixtures.
+test_cluster_clog_native_callback.inc: $(top_srcdir)/src/backend/access/transam/xlogrecovery.c Makefile
+	awk '/^cluster_typed_replay_apply_native\(/ { print "static void"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_clog_recovery test_cluster_xid_native_clog.o \
+ test_cluster_recovery_episode_clog.o test_cluster_side_native_clog.o: \
+ test_cluster_clog_native_full_sync.inc test_cluster_clog_native_callback.inc \
+ $(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
+
+clean: clean-clog-native-callback
+.PHONY: clean-clog-native-callback
+clean-clog-native-callback:
+	rm -f test_cluster_clog_native_callback.inc test_cluster_clog_native_callback.inc.tmp
