@@ -90,6 +90,20 @@ cluster_side_projection_target_preflight_v1(const ClusterSideProjectionApplyInpu
 			|| raw / RF_SIDE_CLOG_XACTS_PER_PAGE != (uint32)birth.pageno)
 			return CLUSTER_SIDE_PROJECTION_APPLY_BLOCKED;
 	}
+	if (operation->kind == CLUSTER_SIDE_PROJECTION_CLOG
+		&& operation->normalized_info == CLOG_TRUNCATE_FULL) {
+		xl_clog_truncate_full cut;
+		if (operation->action != CLUSTER_SIDE_PROJECTION_ACTION_TRUNCATE
+			|| !input->source_retained || input->cluster_epoch == 0
+			|| input->source_lsn == InvalidXLogRecPtr || input->source_end_lsn <= input->source_lsn
+			|| input->owned_payload == NULL || input->owned_payload_length != sizeof(cut))
+			return CLUSTER_SIDE_PROJECTION_APPLY_BLOCKED;
+		memcpy(&cut, input->owned_payload, sizeof(cut));
+		if (!ClogTruncateFullIsValid(&cut) || !OidIsValid(cut.oldestXactDb)
+			|| cut.pageno != operation->page_number || cut.oldestXact != operation->oldest_xid
+			|| cut.oldestXactDb != operation->oldest_database)
+			return CLUSTER_SIDE_PROJECTION_APPLY_BLOCKED;
+	}
 	if (operation->kind == CLUSTER_SIDE_PROJECTION_MULTIXACT) {
 		uint32 i;
 

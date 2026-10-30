@@ -3887,6 +3887,26 @@ UT_TEST(test_full_clog_dispatch_uses_only_original_projection_identity)
 	}
 }
 
+UT_TEST(test_full_clog_truncate_dispatch_uses_original_projection_identity)
+{
+	for (unsigned fault = 0; fault < 4; fault++) {
+		ClusterColdRecordV1 record;
+		ClusterColdTypedV1 *typed = control_fixture_mode(&record, true);
+		bool accepted;
+
+		side_record_fixture(&record, RM_CLOG_ID, CLOG_TRUNCATE_FULL,
+			RF_SIDE_ONLINE_OPERATION_PROJECTION);
+		if (fault == 1) side_fixture[1].operations[1].kind = RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL;
+		if (fault == 2) record.record_crc++;
+		if (fault == 3) record.record_flags |= CLUSTER_COLD_RECORD_SIDE_UNOWNED;
+		accepted = consume_control(typed, &record);
+		cluster_cold_replay_window_leave_v1();
+		cluster_cold_typed_destroy_v1(&typed);
+		UT_ASSERT_EQ(accepted, fault == 0);
+		UT_ASSERT_EQ(control_calls, fault == 0 ? 1 : 0);
+	}
+}
+
 #include "test_cluster_cold_native_clog_consumed.inc"
 
 int
@@ -3900,7 +3920,8 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(139);
+	UT_PLAN(140);
+	UT_RUN(test_full_clog_truncate_dispatch_uses_original_projection_identity);
 	UT_RUN(test_full_clog_dispatch_uses_only_original_projection_identity);
 	UT_RUN(test_execution_refusal_preserves_the_first_census_failure);
 	UT_RUN(test_own_root_lookup_diagnostic_does_not_read_failed_outputs);

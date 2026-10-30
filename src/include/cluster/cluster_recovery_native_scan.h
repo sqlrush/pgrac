@@ -223,7 +223,9 @@ extern ClusterRecoveryNativeResult cluster_recovery_native_scan_effects_v1(
  * enabled by this inspector, and no SUBTRANS parent relationship is inferred.
  * CLOG_ZEROPAGE_FULL is a distinct 16-byte native image: its actual first-normal
  * FullXid names page initialization, not an issued transaction. Legacy ZERO
- * remains raw-only. Neither shape supplies held lifetime or terminal rights. */
+ * remains raw-only. CLOG_TRUNCATE_FULL retains the actual reserved cutoff in
+ * a strict24-byte image; legacy TRUNCATE never gains an inferred era. None
+ * supplies held lifetime, successful deletion or terminal rights. */
 
 /* RELMAP_UPDATE retains the entire native image (including inactive slots);
  * RELMAP_ENTRY exposes each active original mapping with its exact ordinal.

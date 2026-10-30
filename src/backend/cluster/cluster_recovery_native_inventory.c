@@ -593,6 +593,10 @@ inventory_relmap_clog_record(ClusterRecoveryNativeInventory *work,
 		event->page = truncate.pageno;
 		event->oldest_xact = truncate.oldestXact;
 		event->oldest_database = truncate.oldestXactDb;
+		if ((effect.record->header.xl_info & ~XLR_INFO_MASK) == CLOG_TRUNCATE_FULL) {
+			memcpy(&event->full_truncate, effect.record->payload, sizeof(event->full_truncate));
+			event->full_truncate_observed = true;
+		}
 	}
 	event->counter_observed = observed;
 	if (observed) {

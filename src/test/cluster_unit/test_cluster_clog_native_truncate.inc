@@ -193,3 +193,118 @@ UT_TEST(native_clog_truncate_flush_error_retains_files_and_custody)
 	relmap_mutation_refuses(&base, &held);
 	native_truncate_end();
 }
+
+
+UT_TEST(native_full_truncate_redo_preserves_cutoff_and_original_delete_order)
+{
+	SyncRequestHandler saved_handler = XactCtl->sync_handler;
+	const uint32 epochs[] = {0, 7, UINT32_MAX};
+
+	/* Match the original truncate fixture's synchronous file mode; the
+	 * previous default group exercises a different writeback transport. */
+	XactCtl->sync_handler = SYNC_HANDLER_NONE;
+	for (unsigned i = 0; i < lengthof(epochs); i++) {
+		ClusterRelmapClogBaseV1 base;
+		ClusterRelmapClogBaseHandleV1 *held = NULL;
+		DecodedXLogRecord decoded = {0};
+		XLogReaderState reader = {0};
+		xl_clog_truncate_full cut;
+		UT_ASSERT(native_truncate_start(true, 3, relmap_base_query(), &base, &held));
+		cut = (xl_clog_truncate_full){32, native_truncate_oldest, 79, 0,
+			((uint64)epochs[i] << 32) | native_truncate_oldest};
+		reader.record = &decoded;
+		decoded.main_data = (char *)&cut; decoded.main_data_len = sizeof(cut);
+		decoded.max_block_id = -1; decoded.header.xl_info = CLOG_TRUNCATE_FULL;
+		clog_redo(&reader);
+		UT_ASSERT(!fixture_exists(0) && fixture_exists(32));
+		UT_ASSERT_EQ(fixture_variable_cache.oldestClogXid, native_truncate_oldest);
+		UT_ASSERT_EQ(birth_wal.begins | fixture_native_truncate_flushes, 0);
+		relmap_mutation_refuses(&base, &held);
+		native_truncate_end();
+	}
+	XactCtl->sync_handler = saved_handler;
+}
+
+UT_TEST(native_full_truncate_redo_rejects_shape_before_any_native_effect)
+{
+	SyncRequestHandler saved_handler = XactCtl->sync_handler;
+	/* Match the original truncate fixture's synchronous file mode; the
+	 * previous default group exercises a different writeback transport. */
+	XactCtl->sync_handler = SYNC_HANDLER_NONE;
+
+	for (unsigned fault = 0; fault < 9; fault++) {
+		ClusterRelmapClogBaseV1 base;
+		ClusterRelmapClogBaseHandleV1 *held = NULL;
+		DecodedXLogRecord decoded = {0};
+		XLogReaderState reader = {0};
+		xl_clog_truncate_full cut;
+		uint64 before, after;
+		volatile bool caught = false;
+		UT_ASSERT(native_truncate_start(true, 3, relmap_base_query(), &base, &held));
+		cut = (xl_clog_truncate_full){32, native_truncate_oldest, 79, 0,
+			(UINT64_C(7) << 32) | native_truncate_oldest};
+		reader.record = &decoded;
+		decoded.main_data = (char *)&cut; decoded.main_data_len = sizeof(cut);
+		decoded.max_block_id = -1; decoded.header.xl_info = CLOG_TRUNCATE_FULL;
+		if (fault == 0) decoded.main_data = NULL;
+		if (fault == 1) decoded.main_data_len--;
+		if (fault == 2) decoded.main_data_len++;
+		if (fault == 3) cut.reserved_zero = 1;
+		if (fault == 4) cut.pageno = -1;
+		if (fault == 5) cut.pageno++;
+		if (fault == 6) cut.oldest_full_xid++;
+		if (fault == 7) cut.oldestXact = 2;
+		if (fault == 8) decoded.max_block_id = 0;
+		UT_ASSERT(clog_relmap_mutation_snapshot(0, &before));
+		expect_error = true;
+		PG_TRY(); { clog_redo(&reader); } PG_CATCH(); { caught = true; } PG_END_TRY();
+		expect_error = false;
+		UT_ASSERT(caught);
+		UT_ASSERT(clog_relmap_mutation_snapshot(0, &after));
+		UT_ASSERT_EQ(before, after);
+		UT_ASSERT_EQ(fixture_variable_cache.oldestClogXid, 3);
+		UT_ASSERT_EQ(deleted, native_truncate_deleted_before);
+		UT_ASSERT(fixture_exists(0) && fixture_exists(32));
+		cluster_clog_relmap_base_release_v1(&held);
+		native_truncate_end();
+	}
+	XactCtl->sync_handler = saved_handler;
+}
+
+UT_TEST(native_full_truncate_cold_consumer_requires_complete_original_bytes)
+{
+	for (unsigned fault = 0; fault < 10; fault++) {
+		ClusterSideProjectionOperationV1 op = fixture_clog_record(true, 97);
+		xl_clog_truncate_full cut = {97, op.oldest_xid, op.oldest_database, 0,
+			(UINT64_C(7) << 32) | op.oldest_xid};
+		uint32 length = sizeof(cut);
+		unsigned before = deleted;
+		bool applied;
+		full_consumer_cold_scope();
+		op.normalized_info = CLOG_TRUNCATE_FULL;
+		fixture_zero(0); fixture_zero(96); fixture_zero(128);
+		if (fault == 1) length--;
+		if (fault == 2) cut.reserved_zero = 1;
+		if (fault == 3) cut.oldest_full_xid++;
+		if (fault == 4) cut.pageno++;
+		if (fault == 5) op.oldest_database++;
+		if (fault == 6) authority = false;
+		if (fault == 7) InRecovery = false;
+		if (fault == 8) op.action = CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE;
+		if (fault == 9) fail_unlink = true;
+		UT_ASSERT(!cluster_clog_native_recovery_record_apply_v1(1, &op));
+		applied = cluster_clog_native_recovery_full_record_apply_v1(1, &op,
+			(const uint8 *)&cut, length);
+		UT_ASSERT_EQ(applied, fault == 0);
+		if (fault == 0) {
+			UT_ASSERT(!fixture_exists(0) && fixture_exists(96) && fixture_exists(128));
+			UT_ASSERT(cluster_clog_native_recovery_full_record_verify_v1(1, &op,
+				(const uint8 *)&cut, length));
+		} else {
+			UT_ASSERT_EQ(deleted, before);
+			UT_ASSERT(fixture_exists(0) && fixture_exists(96) && fixture_exists(128));
+		}
+		fail_unlink = false; InRecovery = authority = true;
+		fixture_idle();
+	}
+}

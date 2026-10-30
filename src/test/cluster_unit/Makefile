@@ -10904,3 +10904,11 @@ test_cluster_cold_tx_start: test_cluster_cold_ctrc_owner_inventory.inc
 
 test_cluster_recovery_native_inputs: test_cluster_recovery_page_raw.inc
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_page_raw.inc
+
+# Complete native FULL truncation payloads change retained input layout.
+test_cluster_clog_recovery test_cluster_recovery_native_scan test_cluster_side_xact \
+        test_cluster_recovery_native_inputs test_cluster_recovery_episode_clog.o \
+        test_cluster_side_native_clog.o test_cluster_cold_recovery_decode \
+        test_cluster_cold_recovery_startup test_cluster_recovery_consumed_inputs.o: \
+        $(top_srcdir)/src/include/access/clog.h \
+        $(top_srcdir)/src/include/cluster/cluster_recovery_native_inventory.h

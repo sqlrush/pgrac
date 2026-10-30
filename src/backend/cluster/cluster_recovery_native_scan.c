@@ -218,6 +218,16 @@ native_slru(ClusterRecoveryNativeScan *scan, uint8 opcode, bool commit_ts)
 								  : CLUSTER_RECOVERY_NATIVE_CLOG_ZERO;
 		return CLUSTER_RECOVERY_NATIVE_MORE;
 	}
+	if (!commit_ts && opcode == CLOG_TRUNCATE_FULL) {
+		xl_clog_truncate_full cut;
+		if (length != sizeof(cut))
+			return CLUSTER_RECOVERY_NATIVE_SHAPE;
+		memcpy(&cut, scan->payload, sizeof(cut));
+		if (!ClogTruncateFullIsValid(&cut))
+			return CLUSTER_RECOVERY_NATIVE_SHAPE;
+		scan->primary = CLUSTER_RECOVERY_NATIVE_CLOG_TRUNCATE;
+		return CLUSTER_RECOVERY_NATIVE_MORE;
+	}
 	if (opcode != truncate)
 		return CLUSTER_RECOVERY_NATIVE_UNSUPPORTED;
 	if (commit_ts) {

@@ -594,7 +594,15 @@ UT_TEST(test_second_pass_binds_all_source_and_record_bytes)
 int
 main(void)
 {
-	UT_PLAN(49);
+	if (getenv("PGRAC_PRE2_TEST_FULL_TRUNCATE") != NULL) {
+		UT_PLAN(2);
+		UT_RUN(test_native_clog_full_truncate_keeps_exact_cutoff_image);
+		UT_RUN(test_native_clog_full_truncate_refuses_raw_alias_and_incomplete_image);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	UT_PLAN(51);
+	UT_RUN(test_native_clog_full_truncate_keeps_exact_cutoff_image);
+	UT_RUN(test_native_clog_full_truncate_refuses_raw_alias_and_incomplete_image);
 	UT_RUN(test_native_owner_routes_complete_commit_and_zero_message_init_duties);
 	UT_RUN(test_native_owner_routes_preserve_prepared_undo_and_complete_mx_array_duties);
 	UT_RUN(test_native_owner_routes_keep_native_slru_and_unknown_duties_distinct);

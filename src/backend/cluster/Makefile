@@ -503,3 +503,6 @@ cluster_initdb_wal.o: $(top_srcdir)/src/bin/initdb/pgrac_wal.c $(top_srcdir)/src
 
 cluster_initdb_side.o: $(top_srcdir)/src/bin/initdb/pgrac_side.c $(top_srcdir)/src/bin/initdb/pgrac_side.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
+# Rebuild the sole route table when its opcode manifest changes.
+cluster_rf_route.o: $(top_srcdir)/src/include/cluster/cluster_rf_route_manifest.def

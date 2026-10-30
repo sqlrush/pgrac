@@ -2236,6 +2236,15 @@ clog_recovery_record(int origin, const ClusterSideProjectionOperationV1 *op, boo
 		if (!clog_recovery_full_record_shape(op, payload, length))
 			return false;
 		memcpy(&birth, payload, sizeof(birth));
+	} else if (op->normalized_info == CLOG_TRUNCATE_FULL) {
+		xl_clog_truncate_full cut;
+
+		if (payload == NULL || length != sizeof(cut))
+			return false;
+		memcpy(&cut, payload, sizeof(cut));
+		if (!ClogTruncateFullIsValid(&cut) || cut.pageno != op->page_number
+			|| cut.oldestXact != op->oldest_xid || cut.oldestXactDb != op->oldest_database)
+			return false;
 	} else if (payload != NULL || length != 0)
 		return false;
 	if (op->action == CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE) {
@@ -2244,7 +2253,8 @@ clog_recovery_record(int origin, const ClusterSideProjectionOperationV1 *op, boo
 			|| OidIsValid(op->oldest_database))
 			return false;
 	} else if (op->action == CLUSTER_SIDE_PROJECTION_ACTION_TRUNCATE) {
-		if (op->normalized_info != CLOG_TRUNCATE || !TransactionIdIsNormal(op->oldest_xid)
+		if ((op->normalized_info != CLOG_TRUNCATE && op->normalized_info != CLOG_TRUNCATE_FULL)
+			|| !TransactionIdIsNormal(op->oldest_xid)
 			|| !OidIsValid(op->oldest_database)
 			|| TransactionIdToPage(op->oldest_xid) != op->page_number)
 			return false;
@@ -2332,7 +2342,8 @@ cluster_clog_native_recovery_full_record_apply_v1(
 	int origin, const ClusterSideProjectionOperationV1 *operation,
 	const uint8 *payload, uint32 length)
 {
-	return operation != NULL && operation->normalized_info == CLOG_ZEROPAGE_FULL
+	return operation != NULL && (operation->normalized_info == CLOG_ZEROPAGE_FULL
+		|| operation->normalized_info == CLOG_TRUNCATE_FULL)
 		&& clog_recovery_record(origin, operation, false, payload, length);
 }
 
@@ -2341,7 +2352,8 @@ cluster_clog_native_recovery_full_record_verify_v1(
 	int origin, const ClusterSideProjectionOperationV1 *operation,
 	const uint8 *payload, uint32 length)
 {
-	return operation != NULL && operation->normalized_info == CLOG_ZEROPAGE_FULL
+	return operation != NULL && (operation->normalized_info == CLOG_ZEROPAGE_FULL
+		|| operation->normalized_info == CLOG_TRUNCATE_FULL)
 		&& clog_recovery_record(origin, operation, true, payload, length);
 }
 
@@ -2803,7 +2815,8 @@ clog_redo(XLogReaderState *record)
 	uint8		info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
 
 	/* Backup blocks are not used in clog records */
-	Assert(info == CLOG_ZEROPAGE_FULL || !XLogRecHasAnyBlockRefs(record));
+	Assert(info == CLOG_ZEROPAGE_FULL || info == CLOG_TRUNCATE_FULL
+		|| !XLogRecHasAnyBlockRefs(record));
 
 	if (info == CLOG_ZEROPAGE_FULL)
 	{
@@ -2842,11 +2855,24 @@ clog_redo(XLogReaderState *record)
 
 		LWLockRelease(XactSLRULock);
 	}
-	else if (info == CLOG_TRUNCATE)
+	else if (info == CLOG_TRUNCATE || info == CLOG_TRUNCATE_FULL)
 	{
 		xl_clog_truncate xlrec;
 
-		memcpy(&xlrec, XLogRecGetData(record), sizeof(xl_clog_truncate));
+		if (info == CLOG_TRUNCATE_FULL) {
+			xl_clog_truncate_full cut;
+
+			if (XLogRecHasAnyBlockRefs(record) || XLogRecGetData(record) == NULL
+				|| XLogRecGetDataLen(record) != sizeof(cut))
+				elog(PANIC, "clog_redo: invalid full truncate record");
+			memcpy(&cut, XLogRecGetData(record), sizeof(cut));
+			if (!ClogTruncateFullIsValid(&cut))
+				elog(PANIC, "clog_redo: invalid full truncate cutoff");
+			xlrec.pageno = cut.pageno;
+			xlrec.oldestXact = cut.oldestXact;
+			xlrec.oldestXactDb = cut.oldestXactDb;
+		} else
+			memcpy(&xlrec, XLogRecGetData(record), sizeof(xl_clog_truncate));
 
 #ifdef USE_PGRAC_CLUSTER
 		clog_relmap_native_mutation(cluster_node_id);

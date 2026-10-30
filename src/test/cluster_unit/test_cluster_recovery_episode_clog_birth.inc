@@ -216,3 +216,59 @@ UT_TEST(test_episode_clog_birth_late_error_keeps_original_held_fd_and_all_protec
 	UT_ASSERT_EQ(inventory_census_calls, census);
 	episode_terminal_done(&history, &inputs);
 }
+
+
+static WalTestRecord
+episode_full_truncate_tail(const ClusterWalSourceRef *source, WalTestRecord previous)
+{
+	const uint32 epochs[] = {0, 7, UINT32_MAX};
+	for (unsigned i = 0; i < lengthof(epochs); i++) {
+		xl_clog_truncate_full cut = {17, 557065, 606, 0,
+			((uint64)epochs[i] << 32) | UINT64_C(557065)};
+		previous = inventory_write_record(source, previous.exclusive_end, previous.record_start,
+			RM_CLOG_ID, CLOG_TRUNCATE_FULL, &cut, sizeof(cut));
+	}
+	{
+		xl_clog_truncate legacy = {17, 557065, 606};
+		return inventory_write_record(source, previous.exclusive_end, previous.record_start,
+			RM_CLOG_ID, CLOG_TRUNCATE, &legacy, sizeof(legacy));
+	}
+}
+
+UT_TEST(test_episode_full_truncate_retains_complete_cutoff_without_qualifying_legacy)
+{
+	ClusterWalInputsV1 *inputs = NULL;
+	ClusterRecoveryRelmapHistory *history = NULL;
+	ClusterRelmapV2Image pending;
+	ClusterRecoveryRelmapFoldSummary summary;
+	ClusterRecoveryRelmapPendingXidV1 xid;
+	ClusterRecoveryNativeInventoryDiag diag;
+	const uint32 epochs[] = {0, 7, UINT32_MAX};
+	xl_clog_truncate_full zero = {0};
+	episode_base_reset();
+	episode_terminal_tail_hook = episode_full_truncate_tail;
+	episode_terminal_begin(EPISODE_TERMINAL_COMMIT, &inputs, &history, &pending);
+	episode_terminal_tail_hook = NULL;
+	if (history == NULL) return;
+	UT_ASSERT_EQ(episode_pending_drain(history, &pending, &summary), CLUSTER_RECOVERY_RELMAP_FOLD_DRAINED);
+	UT_ASSERT(cluster_recovery_relmap_history_pending_xid_v1(history, &pending, &xid, &diag));
+	UT_ASSERT_EQ(xid.clog_count, 4);
+	for (unsigned i = 0; i < xid.clog_count; i++) {
+		const ClusterRecoveryRelmapClogEventV1 *event = &xid.clog[i];
+		UT_ASSERT_EQ(event->kind, CLUSTER_RECOVERY_NATIVE_CLOG_TRUNCATE);
+		UT_ASSERT_EQ(event->page, 17);
+		UT_ASSERT_EQ(event->oldest_xact, 557065);
+		UT_ASSERT_EQ(event->oldest_database, 606);
+		UT_ASSERT(!event->full_birth_observed);
+		UT_ASSERT_EQ(event->full_truncate_observed, i < lengthof(epochs));
+		if (i < lengthof(epochs)) {
+			UT_ASSERT(ClogTruncateFullIsValid(&event->full_truncate));
+			UT_ASSERT_EQ(event->full_truncate.oldest_full_xid,
+				((uint64)epochs[i] << 32) | UINT64_C(557065));
+		} else
+			UT_ASSERT_EQ(memcmp(&event->full_truncate, &zero, sizeof(zero)), 0);
+	}
+	UT_ASSERT(inputs_pin_held && ctrc_set_held == 2);
+	UT_ASSERT_EQ(episode_base_calls | ctrc_set_release_calls | relmap_failed, 0);
+	episode_terminal_done(&history, &inputs);
+}

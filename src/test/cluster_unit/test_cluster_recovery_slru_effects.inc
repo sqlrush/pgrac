@@ -235,3 +235,44 @@ UT_TEST(test_native_clog_full_birth_recheck_cannot_rebase)
 	UT_ASSERT_NE(cluster_recovery_native_scan_next(scan, &effect), CLUSTER_RECOVERY_NATIVE_EFFECT);
 	cluster_recovery_native_scan_destroy(scan);
 }
+
+
+UT_TEST(test_native_clog_full_truncate_keeps_exact_cutoff_image)
+{
+	const uint32 epochs[] = {0, 7, UINT32_MAX};
+	for (unsigned i = 0; i < lengthof(epochs); i++) {
+		xl_clog_truncate_full cut = {33, 33 * CLUSTER_NATIVE_CLOG_PER_PAGE + 17, 606, 0, 0};
+		ClusterRecoveryNativeEffect effect;
+		ClusterRecoveryNativeScan *scan = NULL;
+		cut.oldest_full_xid = ((uint64)epochs[i] << 32) | cut.oldestXact;
+		fixture(RM_CLOG_ID, CLOG_TRUNCATE_FULL);
+		append(&cut, sizeof(cut));
+		UT_ASSERT_EQ(begin(&scan), CLUSTER_RECOVERY_NATIVE_MORE);
+		if (scan == NULL) continue;
+		UT_ASSERT_EQ(cluster_recovery_native_scan_primary(scan, &effect), CLUSTER_RECOVERY_NATIVE_EFFECT);
+		UT_ASSERT_EQ(effect.kind, CLUSTER_RECOVERY_NATIVE_CLOG_TRUNCATE);
+		UT_ASSERT_EQ(effect.length, sizeof(cut));
+		UT_ASSERT(memcmp(effect.bytes, &cut, sizeof(cut)) == 0);
+		cluster_recovery_native_scan_destroy(scan);
+	}
+}
+
+UT_TEST(test_native_clog_full_truncate_refuses_raw_alias_and_incomplete_image)
+{
+	for (unsigned fault = 0; fault < 7; fault++) {
+		xl_clog_truncate_full cut = {33, 33 * CLUSTER_NATIVE_CLOG_PER_PAGE + 17, 606, 0, 0};
+		ClusterRecoveryNativeScan *scan = NULL;
+		cut.oldest_full_xid = (UINT64_C(7) << 32) | cut.oldestXact;
+		if (fault == 0) cut.reserved_zero = 1;
+		if (fault == 1) cut.pageno = -1;
+		if (fault == 2) cut.pageno++;
+		if (fault == 3) cut.oldest_full_xid++;
+		if (fault == 4) cut.oldestXact = 2;
+		fixture(RM_CLOG_ID, CLOG_TRUNCATE_FULL);
+		append(&cut, sizeof(cut));
+		if (fault == 5) decoded.main_data_len--;
+		if (fault == 6) decoded.main_data_len++;
+		UT_ASSERT_EQ(begin(&scan), CLUSTER_RECOVERY_NATIVE_SHAPE);
+		UT_ASSERT(scan == NULL);
+	}
+}

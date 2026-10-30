@@ -473,6 +473,20 @@ side_owner_cold_clog_ready(RfSideOnlineProductionOwnerV1 *owner,
 			&& raw / CLUSTER_NATIVE_CLOG_PER_PAGE == (uint32)birth.pageno
 			&& cluster_undo_recovery_cold_origin_authorized_v1(thread - 1);
 	}
+	if (clog->kind == CLUSTER_SIDE_PROJECTION_CLOG
+		&& clog->normalized_info == CLOG_TRUNCATE_FULL) {
+		xl_clog_truncate_full cut;
+		if (operation->kind != RF_SIDE_ONLINE_OPERATION_PROJECTION
+			|| clog->action != CLUSTER_SIDE_PROJECTION_ACTION_TRUNCATE
+			|| thread != owner->undo_authority->duty->origin_thread_id
+			|| operation->owned_payload == NULL || operation->owned_payload_length != sizeof(cut))
+			return false;
+		memcpy(&cut, operation->owned_payload, sizeof(cut));
+		return ClogTruncateFullIsValid(&cut) && OidIsValid(cut.oldestXactDb)
+			&& cut.pageno == clog->page_number && cut.oldestXact == clog->oldest_xid
+			&& cut.oldestXactDb == clog->oldest_database
+			&& cluster_undo_recovery_cold_origin_authorized_v1(thread - 1);
+	}
 	if (operation->kind != RF_SIDE_ONLINE_OPERATION_PROJECTION
 		|| clog->kind != CLUSTER_SIDE_PROJECTION_CLOG
 		|| thread != owner->undo_authority->duty->origin_thread_id
@@ -515,7 +529,8 @@ side_owner_preflight_projection(void *arg, const RfSideOnlineOperationV1 *operat
 		|| operation == NULL || operation->kind != RF_SIDE_ONLINE_OPERATION_PROJECTION)
 		return false;
 	if (operation->projection.kind == CLUSTER_SIDE_PROJECTION_CLOG
-		&& operation->projection.normalized_info == CLOG_ZEROPAGE_FULL
+		&& (operation->projection.normalized_info == CLOG_ZEROPAGE_FULL
+			|| operation->projection.normalized_info == CLOG_TRUNCATE_FULL)
 		&& !side_owner_cold_formed(owner))
 		return false;
 	/* Validate the whole protected set before its first storage mutation. */
@@ -983,7 +998,8 @@ side_owner_apply_projection(void *arg, const RfSideOnlineOperationV1 *operation)
 		|| operation == NULL || operation->kind != RF_SIDE_ONLINE_OPERATION_PROJECTION)
 		return false;
 	if (operation->projection.kind == CLUSTER_SIDE_PROJECTION_CLOG
-		&& operation->projection.normalized_info == CLOG_ZEROPAGE_FULL
+		&& (operation->projection.normalized_info == CLOG_ZEROPAGE_FULL
+			|| operation->projection.normalized_info == CLOG_TRUNCATE_FULL)
 		&& !side_owner_cold_formed(owner))
 		return false;
 	if (side_owner_cold_formed(owner)
@@ -994,7 +1010,8 @@ side_owner_apply_projection(void *arg, const RfSideOnlineOperationV1 *operation)
 		 * Keep the original WAL order, sync/readback and cold qualification. */
 		if (!side_owner_cold_clog_ready(owner, operation))
 			return false;
-		if (operation->projection.normalized_info == CLOG_ZEROPAGE_FULL) {
+		if (operation->projection.normalized_info == CLOG_ZEROPAGE_FULL
+			|| operation->projection.normalized_info == CLOG_TRUNCATE_FULL) {
 			if (!cluster_clog_native_recovery_full_record_apply_v1(origin, &operation->projection,
 					operation->owned_payload, operation->owned_payload_length)
 				|| !cluster_clog_native_recovery_full_record_verify_v1(origin, &operation->projection,

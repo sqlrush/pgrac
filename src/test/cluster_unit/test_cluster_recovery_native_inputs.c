@@ -1174,6 +1174,11 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_FULL_TRUNCATE") != NULL) {
+		UT_PLAN(1);
+		UT_RUN(test_episode_full_truncate_retains_complete_cutoff_without_qualifying_legacy);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_PAGE_RAW") != NULL) {
 		UT_PLAN(4);
 		UT_RUN(test_page_raw_keeps_full_original_file_bytes_after_both_passes);
@@ -1578,7 +1583,8 @@ main(int argc, char **argv)
 	UT_RUN(test_census_native_records_original_final_wal_rewrite_refuses_whole_view);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(303);
+	UT_PLAN(304);
+	UT_RUN(test_episode_full_truncate_retains_complete_cutoff_without_qualifying_legacy);
 	UT_RUN(test_page_raw_keeps_full_original_file_bytes_after_both_passes);
 	UT_RUN(test_page_raw_borrowed_byte_change_revokes_whole_inventory_without_rebase);
 	UT_RUN(test_page_raw_complete_copy_is_charged_before_any_prefix_publication);

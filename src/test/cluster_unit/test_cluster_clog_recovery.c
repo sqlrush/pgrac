@@ -1534,7 +1534,10 @@ main(void)
 		full_sync_cleanup_files();
 		goto mutation_done;
 	}
-	UT_PLAN(113);
+	UT_PLAN(116);
+	UT_RUN(native_full_truncate_redo_preserves_cutoff_and_original_delete_order);
+	UT_RUN(native_full_truncate_redo_rejects_shape_before_any_native_effect);
+	UT_RUN(native_full_truncate_cold_consumer_requires_complete_original_bytes);
 	UT_RUN(native_full_sync_reads_the_original_redo_page_without_reinitializing);
 	UT_RUN(native_full_sync_rejects_shape_and_context_before_io);
 	UT_RUN(native_full_sync_io_failures_and_error_keep_native_cleanup);

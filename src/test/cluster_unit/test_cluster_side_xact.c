@@ -12618,15 +12618,17 @@ main(void)
 		return ut_failed_count != 0;
 	}
 #ifdef TEST_CLUSTER_SIDE_NATIVE_CLOG_OWNER
-	UT_PLAN(209);
+	UT_PLAN(211);
 #else
-	UT_PLAN(205);
+	UT_PLAN(207);
 #endif
 	UT_RUN(test_clog_witness_keeps_complete_native_bytes_after_reader_reuse);
 	UT_RUN(test_clog_witness_refuses_changed_full_header_payload_and_source);
 	UT_RUN(test_clog_witness_requires_original_physical_recovery_binding);
 	UT_RUN(test_clog_witness_charges_original_budget_and_counts_complete_stream);
 
+	UT_RUN(test_full_truncate_cold_owner_keeps_native_postread_before_projection);
+	UT_RUN(test_full_truncate_side_keeps_all_bytes_and_rejects_bad_frames);
 	UT_RUN(test_full_clog_plan_owns_all_original_birth_bytes);
 	UT_RUN(test_full_clog_shape_refuses_incomplete_or_unconsumed_frame);
 	UT_RUN(test_full_clog_cold_owner_keeps_native_postread_before_projection);
