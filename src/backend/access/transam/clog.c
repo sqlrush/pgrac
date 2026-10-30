@@ -1270,8 +1270,9 @@ cluster_clog_native_recovery_base_release_v1(ClusterClogNativeBaseHandleV1 **hel
 }
 
 /* Read only a clean, resident native FULL initialization whose entire page
- * equals the original fd observation. No disk reload, raw query or foreign
- * controller supplies a missing generation; this is not lifetime authority. */
+ * equals the original fd observation in its matching origin controller. No
+ * disk reload, raw query or other controller supplies a missing generation;
+ * this is not lifetime authority. */
 static bool clog_full_birth_valid(const xl_clog_zeropage_full *birth);
 
 static uint64
@@ -1606,7 +1607,7 @@ clog_relmap_base_read(const ClusterRecoveryRelmapSourceV1 *source,
 						|| base.oldest_clog_xid == ShmemVariableCache->oldestClogXid)
 					&& (!existing || memcmp(base.image, held->base.image, BLCKSZ) == 0);
 			}
-			if (ok && origin == cluster_node_id) {
+			if (ok) {
 				base.resident_first_full_xid = clog_relmap_resident_birth(ctl, page, base.image);
 				base.resident_birth_observed = base.resident_first_full_xid != 0;
 			}
@@ -1622,8 +1623,8 @@ clog_relmap_base_read(const ClusterRecoveryRelmapSourceV1 *source,
 			&& (!base.native_next_observed
 				|| base.next_full_xid == U64FromFullTransactionId(ReadNextFullTransactionId()))
 			&& clog_relmap_mutation_matches(origin, mutation_generation)
-			&& (origin != cluster_node_id || base.resident_first_full_xid
-				== clog_relmap_resident_birth(ctl, page, base.image))
+			&& base.resident_first_full_xid
+				== clog_relmap_resident_birth(ctl, page, base.image)
 			&& clog_relmap_mutation_matches(origin, mutation_generation);
 		if (!ok)
 			cluster_wal_inputs_relmap_source_fail_v1(&original);
@@ -2342,8 +2343,10 @@ static bool
 clog_recovery_record(int origin, const ClusterSideProjectionOperationV1 *op, bool verify,
 					 const uint8 *payload, uint32 length)
 {
-	volatile bool locked = false, ok = false;
+	volatile bool locked = false, ok = false, finished = false, retain_cache = false;
+	xl_clog_zeropage_full birth;
 	LWLock *lock;
+	SlruCtl ctl;
 
 	if (origin == cluster_node_id)
 		return clog_recovery_own_full_record(origin, op, verify, payload, length);
@@ -2353,6 +2356,7 @@ clog_recovery_record(int origin, const ClusterSideProjectionOperationV1 *op, boo
 	if (op->normalized_info == CLOG_ZEROPAGE_FULL) {
 		if (!clog_recovery_full_record_shape(op, payload, length))
 			return false;
+		memcpy(&birth, payload, sizeof(birth));
 	} else if (payload != NULL || length != 0)
 		return false;
 	if (op->action == CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE) {
@@ -2369,19 +2373,53 @@ clog_recovery_record(int origin, const ClusterSideProjectionOperationV1 *op, boo
 		return false;
 	if (!verify)
 		clog_relmap_native_mutation(origin);
+	ctl = &ClogRecoveryCtl[origin];
 	lock = &ClogRecoveryLocks[origin * 2 + 1].lock;
 	PG_TRY();
 	{
-		LWLockAcquire(lock, LW_EXCLUSIVE);
 		locked = true;
+		LWLockAcquire(lock, LW_EXCLUSIVE);
 		ok = op->action == CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE
 				 ? clog_recovery_zero(origin, op->page_number, verify)
 				 : clog_recovery_truncate(origin, op->page_number, verify);
+		if (ok && !verify && op->normalized_info == CLOG_ZEROPAGE_FULL) {
+			SlruShared shared = ctl->shared;
+
+			/* The original write, sync and independent disk reload succeeded.
+			 * Only this apply supplies birth to this origin's clean resident
+			 * slot; a verifier or another controller cannot recreate it. */
+			LWLockAcquire(shared->ControlLock, LW_EXCLUSIVE);
+			ok = false;
+			if (clog_recovery_permitted(origin)) {
+				for (int slot = 0; slot < shared->num_slots; slot++) {
+					if (shared->page_status[slot] != SLRU_PAGE_VALID
+						|| shared->page_number[slot] != birth.pageno
+						|| shared->page_dirty[slot])
+						continue;
+					ok = true;
+					for (int i = 0; i < BLCKSZ && ok; i++)
+						ok = shared->page_buffer[slot][i] == 0;
+					if (ok)
+						shared->page_initial_full_xid[slot] = birth.first_full_xid;
+					break;
+				}
+			}
+			LWLockRelease(shared->ControlLock);
+			retain_cache = ok;
+		}
+		finished = true;
 	}
 	PG_FINALLY();
 	{
-		if (locked) {
-			clog_recovery_cache_discard(&ClogRecoveryCtl[origin]);
+		if (locked && LWLockHeldByMe(lock)) {
+			if (!retain_cache) {
+				/* ERROR clears holdoffs even for a still-owned native lock. */
+				if (!finished && LWLockHeldByMe(ctl->shared->ControlLock))
+					HOLD_INTERRUPTS();
+				clog_recovery_cache_discard(ctl);
+			}
+			if (!finished)
+				HOLD_INTERRUPTS();
 			LWLockRelease(lock);
 		}
 		if (!verify)
