@@ -1226,10 +1226,138 @@ UT_TEST(test_folded_native_dispatch_preserves_v1_and_refuses_bad_identity)
 	}
 }
 
+
+UT_TEST(test_native_v2_lifecycle_init_validates_sealed_fresh_template)
+{
+	struct { xl_cluster_undo_segment_init header; uint8 image[BLCKSZ]; } wal = { 0 };
+	PGAlignedBlock image, before;
+
+	wal.header.instance = 3;
+	wal.header.segment_id = 513;
+	for (int fault = 0; fault < 6; fault++) {
+		UT_ASSERT(cluster_undo_segment_make_header_v2_bytes(513, 3, image.data));
+		if (fault == 2) ((UndoSegmentHeaderDataV2 *)image.data)->tt_slot_bytes = 32;
+		if (fault == 3) ((UndoSegmentHeaderDataV2 *)image.data)->tt_slots[4].original_full_xid = 701;
+		if (fault == 4) ((UndoSegmentHeaderDataV2 *)image.data)->tt_layout_version = 3;
+		((PageHeader)image.data)->pd_checksum = pg_checksum_page(image.data, 0);
+		if (fault == 1) image.data[BLCKSZ - 1] ^= 1;
+		if (fault == 5) ((PageHeader)image.data)->pd_checksum = 0;
+		memcpy(wal.image, image.data, BLCKSZ);
+		memset(disk.data, 0, BLCKSZ);
+		before = disk;
+		reset_io();
+		UT_ASSERT_EQ(replay_v2_record(XLOG_UNDO_SEGMENT_INIT, &wal, sizeof(wal)), fault == 0);
+		if (fault == 0) {
+			UT_ASSERT(memcmp(disk.data, image.data, BLCKSZ) == 0);
+			UT_ASSERT(memcmp(durable.data, image.data, BLCKSZ) == 0);
+			UT_ASSERT_EQ(writes, 1);
+			UT_ASSERT_EQ(applies, 1);
+			UT_ASSERT_EQ(dirsyncs, 1);
+		} else {
+			UT_ASSERT_EQ(opens + writes + extends + syncs + applies, 0);
+			UT_ASSERT(memcmp(disk.data, before.data, BLCKSZ) == 0);
+		}
+	}
+}
+
+UT_TEST(test_native_init_cannot_upgrade_or_downgrade_existing_layout)
+{
+	struct { xl_cluster_undo_segment_init header; uint8 image[BLCKSZ]; } wal = { 0 };
+	PGAlignedBlock image, before;
+
+	wal.header.instance = 3;
+	wal.header.segment_id = 513;
+	for (int v2 = 0; v2 < 2; v2++) {
+		if (v2) {
+			UT_ASSERT(cluster_undo_segment_make_header_v2_bytes(513, 3, image.data));
+			cluster_undo_segment_make_header_bytes(513, 3, disk.data);
+		} else {
+			cluster_undo_segment_make_header_bytes(513, 3, image.data);
+			UT_ASSERT(cluster_undo_segment_make_header_v2_bytes(513, 3, disk.data));
+		}
+		((PageHeader)image.data)->pd_checksum = pg_checksum_page(image.data, 0);
+		((PageHeader)disk.data)->pd_checksum = pg_checksum_page(disk.data, 0);
+		memcpy(wal.image, image.data, BLCKSZ);
+		before = disk;
+		reset_io();
+		UT_ASSERT(!replay_v2_record(XLOG_UNDO_SEGMENT_INIT, &wal, sizeof(wal)));
+		UT_ASSERT_EQ(writes + extends + syncs + applies, 0);
+		UT_ASSERT(memcmp(disk.data, before.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_native_v2_reuse_generation_and_format_are_exact)
+{
+	struct { xl_undo_segment_reuse header; uint8 image[BLCKSZ]; } wal = { 0 };
+	PGAlignedBlock image, before;
+
+	wal.header.instance = 3;
+	wal.header.segment_id = 513;
+	wal.header.old_generation = 8;
+	wal.header.new_generation = 9;
+	UT_ASSERT(cluster_undo_segment_make_header_v2_bytes(513, 3, image.data));
+	((UndoSegmentHeaderDataV2 *)image.data)->wrap_count = 9;
+	((PageHeader)image.data)->pd_checksum = pg_checksum_page(image.data, 0);
+	memcpy(wal.image, image.data, BLCKSZ);
+	for (int state = 0; state < 7; state++) {
+		native_v2_base((UINT64_C(7) << 32) | 701, TT_SLOT_ABORTED);
+		((UndoSegmentHeaderDataV2 *)disk.data)->wrap_count = state < 4 ? 7 + state : 8;
+		if (state == 4) cluster_undo_segment_make_header_bytes(513, 3, disk.data);
+		if (state == 5) ((UndoSegmentHeaderDataV2 *)disk.data)->tt_layout_version = 3;
+		((PageHeader)disk.data)->pd_checksum = pg_checksum_page(disk.data, 0);
+		if (state == 6) disk.data[BLCKSZ - 1] ^= 1;
+		before = disk;
+		reset_io();
+		UT_ASSERT_EQ(replay_v2_record(XLOG_UNDO_SEGMENT_REUSE, &wal, sizeof(wal)),
+					 state >= 1 && state <= 3);
+		if (state == 1 || state == 2) {
+			UT_ASSERT(memcmp(disk.data, image.data, BLCKSZ) == 0);
+			UT_ASSERT(memcmp(durable.data, image.data, BLCKSZ) == 0);
+			UT_ASSERT_EQ(writes, 1);
+			UT_ASSERT_EQ(applies, 1);
+		} else {
+			UT_ASSERT(memcmp(disk.data, before.data, BLCKSZ) == 0);
+			UT_ASSERT_EQ(writes + applies, 0);
+			UT_ASSERT_EQ(skips, state == 3 ? 1 : 0);
+		}
+	}
+}
+
+UT_TEST(test_native_v2_recycle_keeps_all_full_xids_and_checks_readback)
+{
+	xl_undo_segment_recycle rec = { 0 };
+	PGAlignedBlock expected, before;
+
+	rec.instance = 3;
+	rec.segment_id = 513;
+	rec.expected_generation = 9;
+	rec.old_state = SEGMENT_COMMITTED;
+	rec.new_state = SEGMENT_RECYCLABLE;
+	for (int fault = 0; fault < 3; fault++) {
+		native_v2_base((UINT64_C(7) << 32) | 701, TT_SLOT_ABORTED);
+		before = disk;
+		expected = disk;
+		((UndoSegmentHeaderDataV2 *)expected.data)->segment_state = SEGMENT_RECYCLABLE;
+		((PageHeader)expected.data)->pd_checksum = pg_checksum_page(expected.data, 0);
+		fail_sync = fault == 1;
+		corrupt_post_read = fault == 2;
+		UT_ASSERT_EQ(replay_v2_record(XLOG_UNDO_SEGMENT_RECYCLE, &rec, sizeof(rec)), fault == 0);
+		UT_ASSERT_EQ(applies, fault == 0 ? 1 : 0);
+		if (fault == 0) {
+			UT_ASSERT(memcmp(disk.data, expected.data, BLCKSZ) == 0);
+			UT_ASSERT(memcmp(durable.data, expected.data, BLCKSZ) == 0);
+			UT_ASSERT_EQ(reads, 2);
+			UT_ASSERT(memcmp(&((UndoSegmentHeaderDataV2 *)disk.data)->tt_slots,
+							&((UndoSegmentHeaderDataV2 *)before.data)->tt_slots,
+							sizeof(((UndoSegmentHeaderDataV2 *)disk.data)->tt_slots)) == 0);
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(21);
+	UT_PLAN(25);
 	UT_RUN(test_native_exact_commit_rejects_bad_header_before_write);
 	UT_RUN(test_private_abort_head_release_and_exact_stale_results);
 	UT_RUN(test_native_bind_uses_complete_header_identity_and_durable_slot);
@@ -1251,6 +1379,10 @@ main(void)
 	UT_RUN(test_folded_native_dispatch_preserves_v1_and_refuses_bad_identity);
 	UT_RUN(test_native_v2_bad_record_refuses_before_file_access);
 	UT_RUN(test_native_legacy_record_cannot_use_tt40_slot_geometry);
+	UT_RUN(test_native_v2_lifecycle_init_validates_sealed_fresh_template);
+	UT_RUN(test_native_init_cannot_upgrade_or_downgrade_existing_layout);
+	UT_RUN(test_native_v2_reuse_generation_and_format_are_exact);
+	UT_RUN(test_native_v2_recycle_keeps_all_full_xids_and_checks_readback);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

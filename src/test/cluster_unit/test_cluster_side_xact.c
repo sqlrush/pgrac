@@ -268,7 +268,9 @@ cluster_undo_smgr_recovery_materialize_v1(uint32 segment, uint8 instance,
 	if (canonical_materialize_failure
 		|| !cluster_undo_smgr_recovery_probe_v1(segment, instance, &observed, current.data))
 		return false;
-	UT_ASSERT(UndoSegmentHeader_identity_matches(final, segment, instance));
+	UT_ASSERT((uint8)final[57] == CLUSTER_UNDO_TT_LAYOUT_V2
+			  ? UndoSegmentHeaderV2_identity_matches(final, BLCKSZ, segment, instance)
+			  : UndoSegmentHeader_identity_matches(final, segment, instance));
 	if (observed.size != expected->size || observed.inode != expected->inode
 		|| memcmp(current.data, base, BLCKSZ) != 0)
 		return false;
@@ -3266,6 +3268,174 @@ undo_v2_slot_plan(bool conflicting_source)
 	return plan;
 }
 
+
+static void
+undo_v2_lifecycle_slot(FakeXactRecord *fake, uint32 generation, uint64 full, bool commit)
+{
+	if (commit) {
+		xl_xact_tt_commit delta;
+		uint32 offset;
+
+		undo_header_commit(fake, generation, (TransactionId)full);
+		offset = fake->u.decoded.main_data_len - sizeof(delta);
+		memcpy(&delta, fake->data + offset, sizeof(delta));
+		delta.format_version = CLUSTER_XACT_TT_COMMIT_V2_VERSION;
+		memcpy(fake->data + offset, &delta, sizeof(delta));
+		memcpy(fake->data + offset + sizeof(delta), &full, sizeof(full));
+		fake->u.decoded.main_data_len += sizeof(full);
+	} else {
+		xl_undo_tt_identity_v2 bind = { 0 };
+
+		bind.instance = 3;
+		bind.segment_id = 513;
+		bind.segment_generation = generation;
+		bind.slot_offset = 4;
+		bind.wrap = 7;
+		bind.xid = (TransactionId)full;
+		bind.format_version = CLUSTER_UNDO_TT_IDENTITY_V2_VERSION;
+		bind.original_full_xid = full;
+		make_projection_record(fake, RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_BIND, &bind, sizeof(bind));
+	}
+}
+
+static RfSideOnlinePlanV1 *
+undo_v2_lifecycle_plan(bool reuse, bool conflict)
+{
+	RfSideOnlinePlanV1 *plan = space_online_plan(reuse ? 700 : 500);
+	FakeXactRecord fake;
+	PGAlignedBlock page;
+	XLogRecPtr begin = 100;
+	uint64 full = (UINT64_C(7) << 32) | 802;
+	xl_undo_segment_recycle recycle = { 0 };
+
+	if (reuse) {
+		struct { xl_undo_segment_reuse record; uint8 page[BLCKSZ]; } wal = { 0 };
+
+		undo_v2_lifecycle_slot(&fake, 8, full, false);
+		undo_header_feed(plan, &fake, begin); begin += 100;
+		undo_v2_lifecycle_slot(&fake, 8, conflict ? full + (UINT64_C(1) << 32) : full, true);
+		undo_header_feed(plan, &fake, begin); begin += 100;
+		wal.record.instance = 3;
+		wal.record.segment_id = 513;
+		wal.record.old_generation = 8;
+		wal.record.new_generation = 9;
+		UT_ASSERT(cluster_undo_segment_make_header_v2_bytes(513, 3, page.data));
+		((UndoSegmentHeaderDataV2 *)page.data)->wrap_count = 9;
+		undo_v2_seal(&page);
+		memcpy(wal.page, page.data, BLCKSZ);
+		make_projection_record(&fake, RM_CLUSTER_UNDO_ID, XLOG_UNDO_SEGMENT_REUSE, &wal, sizeof(wal));
+	} else {
+		struct { xl_cluster_undo_segment_init record; uint8 page[BLCKSZ]; } wal = { 0 };
+
+		wal.record.instance = 3;
+		wal.record.segment_id = 513;
+		UT_ASSERT(cluster_undo_segment_make_header_v2_bytes(513, 3, page.data));
+		undo_v2_seal(&page);
+		memcpy(wal.page, page.data, BLCKSZ);
+		make_projection_record(&fake, RM_CLUSTER_UNDO_ID, XLOG_UNDO_SEGMENT_INIT, &wal, sizeof(wal));
+	}
+	undo_header_feed(plan, &fake, begin); begin += 100;
+	undo_v2_lifecycle_slot(&fake, reuse ? 9 : 0, full, false);
+	undo_header_feed(plan, &fake, begin); begin += 100;
+	undo_v2_lifecycle_slot(&fake, reuse ? 9 : 0, full, true);
+	undo_header_feed(plan, &fake, begin); begin += 100;
+	recycle.instance = 3;
+	recycle.segment_id = 513;
+	recycle.expected_generation = reuse ? 9 : 0;
+	recycle.old_state = SEGMENT_COMMITTED;
+	recycle.new_state = SEGMENT_RECYCLABLE;
+	make_projection_record(&fake, RM_CLUSTER_UNDO_ID, XLOG_UNDO_SEGMENT_RECYCLE, &recycle, sizeof(recycle));
+	undo_header_feed(plan, &fake, begin);
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	return plan;
+}
+
+UT_TEST(test_v2_lifecycle_whole_page_source_membership_and_recycle)
+{
+	for (int reuse = 0; reuse < 2; reuse++) {
+		RfSideOnlinePlanV1 *plan = undo_v2_lifecycle_plan(reuse, false);
+		RfSideUndoHeaderImageV1 image, repeated;
+		PGAlignedBlock base;
+
+		UT_ASSERT(cluster_undo_segment_make_header_v2_bytes(513, 3, base.data));
+		((UndoSegmentHeaderDataV2 *)base.data)->wrap_count = reuse ? 8 : 0;
+		undo_v2_seal(&base);
+		if (rf_side_online_plan_prepare_undo_header_v1(plan, 3, 513, base.data, &image)
+			!= RF_PAGE_PROOF_DETAIL_OK) {
+			UT_ASSERT(false);
+			rf_side_online_plan_destroy_v1(&plan);
+			continue;
+		}
+		UT_ASSERT(image.has_full_image);
+		UT_ASSERT_EQ(image.operation_count, reuse ? 6 : 4);
+		UT_ASSERT_EQ(((UndoSegmentHeaderDataV2 *)image.page.data)->wrap_count, reuse ? 9 : 0);
+		UT_ASSERT_EQ(((UndoSegmentHeaderDataV2 *)image.page.data)->segment_state, SEGMENT_RECYCLABLE);
+		UT_ASSERT_EQ(((UndoSegmentHeaderDataV2 *)image.page.data)->tt_slots[4].original_full_xid,
+					 (UINT64_C(7) << 32) | 802);
+		UT_ASSERT_EQ(rf_side_online_plan_prepare_undo_header_v1(plan, 3, 513, NULL, &repeated), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT(memcmp(repeated.page.data, image.page.data, BLCKSZ) == 0);
+		UT_ASSERT_EQ(rf_side_online_plan_prepare_undo_header_v1(plan, 3, 513, image.page.data, &repeated), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT(memcmp(repeated.page.data, image.page.data, BLCKSZ) == 0);
+		UT_ASSERT_EQ(repeated.source_index, UINT32_MAX);
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
+UT_TEST(test_v2_lifecycle_conflict_or_legacy_predecessor_never_publishes)
+{
+	for (int fault = 0; fault < 4; fault++) {
+		RfSideOnlinePlanV1 *plan = undo_v2_lifecycle_plan(true, fault == 0);
+		RfSideUndoHeaderImageV1 image, saved;
+		PGAlignedBlock base, before;
+
+		UT_ASSERT(cluster_undo_segment_make_header_v2_bytes(513, 3, base.data));
+		((UndoSegmentHeaderDataV2 *)base.data)->wrap_count = fault == 2 ? 10 : 9;
+		if (fault == 1) cluster_undo_segment_make_header_bytes(513, 3, base.data);
+		if (fault == 3) ((UndoSegmentHeaderDataV2 *)base.data)->tt_layout_version = 3;
+		undo_v2_seal(&base);
+		before = base;
+		memset(&saved, 0x92, sizeof(saved)); image = saved;
+		UT_ASSERT_EQ(rf_side_online_plan_prepare_undo_header_v1(plan, 3, 513, base.data, &image), RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
+		UT_ASSERT(memcmp(&image, &saved, sizeof(saved)) == 0);
+		UT_ASSERT(memcmp(base.data, before.data, BLCKSZ) == 0);
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
+UT_TEST(test_v2_init_owner_materializes_before_complete_header_projection)
+{
+	RfSideOnlinePlanV1 *plan = undo_v2_lifecycle_plan(false, false);
+	ClusterThreadRecoveryAuthorityV1 authority = { .duty = &canonical_duty };
+	RfSideOnlineProductionOwnerV1 owner;
+	PGAlignedBlock actual;
+
+	reset_prepare_apply();
+	canonical_file = tmpfile();
+	UT_ASSERT(canonical_file != NULL);
+	UT_ASSERT_EQ(ftruncate(fileno(canonical_file), 1), 0);
+	canonical_writes = canonical_syncs = 0;
+	canonical_expected_full_xid = (UINT64_C(7) << 32) | 802;
+	canonical_expected_xid = 802;
+	canonical_expected_wrap = 7;
+	UT_ASSERT(rf_side_online_production_owner_init_v1(&owner, &authority, canonical_authority_fresh, 19, true));
+	UT_ASSERT(rf_side_online_production_bind_undo_v1(&owner, &authority));
+	UT_ASSERT_EQ(rf_side_online_production_apply_v1(plan, &owner), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(canonical_writes, 1);
+	UT_ASSERT_EQ(prepare_apply.terminal_projection_stores, 1);
+	UT_ASSERT(pread(fileno(canonical_file), actual.data, BLCKSZ, 0) == BLCKSZ);
+	if (canonical_writes == 1) {
+		UT_ASSERT(UndoSegmentHeaderV2_identity_matches(actual.data, BLCKSZ, 513, 3));
+		UT_ASSERT_EQ(((UndoSegmentHeaderDataV2 *)actual.data)->tt_slots[4].original_full_xid, canonical_expected_full_xid);
+	}
+	UT_ASSERT(canonical_scope == NULL && canonical_writer_depth == 0 && owner.undo_headers == NULL);
+	UT_ASSERT_EQ(fclose(canonical_file), 0);
+	canonical_file = NULL;
+	canonical_expected_full_xid = 0;
+	canonical_expected_xid = 818;
+	canonical_expected_wrap = 8;
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
 UT_TEST(test_v2_header_exact_full_slot_source_membership)
 {
 	RfSideOnlinePlanV1 *plan = undo_v2_slot_plan(false);
@@ -5503,7 +5673,7 @@ UT_TEST(test_space_incarnation_end_rejects_old_uuid_reappearance_and_retained_ga
 int
 main(void)
 {
-	UT_PLAN(79);
+	UT_PLAN(82);
 	UT_RUN(test_space_incarnation_end_requires_an_actual_later_space0_contribution);
 	UT_RUN(test_space_incarnation_end_rejects_old_uuid_reappearance_and_retained_gaps);
 	UT_RUN(test_space_retained_ancestry_create_and_independent_page_terminal);
@@ -5538,6 +5708,9 @@ main(void)
 	UT_RUN(test_covered_commit_requires_owner_proof_before_projection_without_tt_rewind);
 	UT_RUN(test_undo_header_repeated_slot_exact_source_membership_without_init);
 	UT_RUN(test_undo_header_later_disk_slot_does_not_hide_conflicting_source);
+	UT_RUN(test_v2_lifecycle_whole_page_source_membership_and_recycle);
+	UT_RUN(test_v2_lifecycle_conflict_or_legacy_predecessor_never_publishes);
+	UT_RUN(test_v2_init_owner_materializes_before_complete_header_projection);
 	UT_RUN(test_v2_header_exact_full_slot_source_membership);
 	UT_RUN(test_v2_later_target_cannot_hide_full_xid_source_conflict);
 	UT_RUN(test_v2_protected_owner_installs_complete_header_before_projection);

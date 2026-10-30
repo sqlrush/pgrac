@@ -747,6 +747,26 @@ cluster_undo_emit_block_write_multi(uint8 instance, uint32 segment_id, uint32 bl
  *
  *   Errors promote to PANIC per the standard recovery contract.
  */
+/* These checks operate on private, aligned bytes. The existing lifecycle
+ * owners still perform all opens, generation decisions and durability work. */
+static bool
+cluster_undo_lifecycle_v2_checksum(const char *page)
+{
+	PGAlignedBlock copy;
+
+	memcpy(copy.data, page, BLCKSZ);
+	return ((PageHeader)page)->pd_checksum == pg_checksum_page(copy.data, 0);
+}
+
+static bool
+cluster_undo_lifecycle_v2_readback(int fd, const char *expected)
+{
+	PGAlignedBlock observed;
+
+	return pg_pread(fd, observed.data, BLCKSZ, 0) == BLCKSZ
+		   && memcmp(observed.data, expected, BLCKSZ) == 0;
+}
+
 static void
 cluster_undo_redo_segment_init(const ClusterUndoDecoded *decoded, const uint8 *payload)
 {
@@ -760,6 +780,10 @@ cluster_undo_redo_segment_init(const ClusterUndoDecoded *decoded, const uint8 *p
 		!= CLUSTER_UNDO_HEADER_APPLY)
 		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("invalid typed undo segment initialization image")));
+	if ((uint8)prepared.data[57] == CLUSTER_UNDO_TT_LAYOUT_V2
+		&& !cluster_undo_lifecycle_v2_checksum(prepared.data))
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("invalid checksum in undo segment V2 initialization image")));
 	if (build_undo_segment_path(cluster_undo_recovery_intent_for_owner(decoded->instance),
 								decoded->instance, decoded->segment_id, path, sizeof(path))
 		!= 0)
@@ -776,6 +800,35 @@ cluster_undo_redo_segment_init(const ClusterUndoDecoded *decoded, const uint8 *p
 	if (fd < 0)
 		ereport(PANIC, (errcode_for_file_access(),
 						errmsg("could not open or create undo segment file \"%s\": %m", path)));
+
+	{
+		static const char empty[BLCKSZ] = { 0 };
+		PGAlignedBlock prior;
+		ssize_t nread;
+
+		memset(prior.data, 0, BLCKSZ);
+		nread = pg_pread(fd, prior.data, BLCKSZ, 0);
+		if (nread < 0) {
+			int save_errno = errno;
+
+			close(fd);
+			errno = save_errno;
+			ereport(PANIC, (errcode_for_file_access(),
+							errmsg("could not inspect undo segment layout before initialization: %m")));
+		}
+		if (((uint8)prepared.data[57] == CLUSTER_UNDO_TT_LAYOUT_V2
+			 || (uint8)prior.data[57] == CLUSTER_UNDO_TT_LAYOUT_V2)
+			&& memcmp(prior.data, empty, BLCKSZ) != 0
+			&& (nread != BLCKSZ
+				|| ((uint8)prior.data[57] == CLUSTER_UNDO_TT_LAYOUT_V2
+					&& !cluster_undo_lifecycle_v2_checksum(prior.data))
+				|| cluster_undo_prepare_header_v1(decoded, payload, decoded->payload_length,
+												 prior.data, prepared.data) != CLUSTER_UNDO_HEADER_APPLY)) {
+			close(fd);
+			ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("undo segment initialization cannot change an existing layout")));
+		}
+	}
 
 	/*
 	 * Step 3: ensure file is exactly UNDO_SEGMENT_SIZE_BYTES (64 MB).
@@ -817,6 +870,12 @@ cluster_undo_redo_segment_init(const ClusterUndoDecoded *decoded, const uint8 *p
 						errmsg("could not fsync undo segment file \"%s\": %m", path)));
 	}
 
+	if ((uint8)prepared.data[57] == CLUSTER_UNDO_TT_LAYOUT_V2
+		&& !cluster_undo_lifecycle_v2_readback(fd, prepared.data)) {
+		close(fd);
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("undo segment V2 initialization readback mismatch")));
+	}
 	if (close(fd) != 0)
 		ereport(PANIC, (errcode_for_file_access(),
 						errmsg("could not close undo segment file \"%s\": %m", path)));
@@ -1472,6 +1531,12 @@ cluster_undo_redo_segment_recycle(const ClusterUndoDecoded *decoded)
 						errmsg("could not read undo segment header \"%s\": read %zd of %d bytes",
 							   path, nread, BLCKSZ)));
 	}
+	if ((uint8)blockbuf.data[57] == CLUSTER_UNDO_TT_LAYOUT_V2
+		&& !cluster_undo_lifecycle_v2_checksum(blockbuf.data)) {
+		close(fd);
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("invalid undo segment V2 recycle predecessor checksum")));
+	}
 	decision = cluster_undo_prepare_header_v1(decoded, NULL, 0, blockbuf.data, blockbuf.data);
 	if (decision == CLUSTER_UNDO_HEADER_BLOCKED) {
 		close(fd);
@@ -1480,7 +1545,11 @@ cluster_undo_redo_segment_recycle(const ClusterUndoDecoded *decoded)
 				 errmsg("undo segment \"%s\" has invalid identity or recycle predecessor", path)));
 	}
 	if (decision == CLUSTER_UNDO_HEADER_APPLY) {
-		ssize_t written = pg_pwrite(fd, blockbuf.data, BLCKSZ, 0);
+		ssize_t written;
+
+		if ((uint8)blockbuf.data[57] == CLUSTER_UNDO_TT_LAYOUT_V2)
+			((PageHeader)blockbuf.data)->pd_checksum = pg_checksum_page(blockbuf.data, 0);
+		written = pg_pwrite(fd, blockbuf.data, BLCKSZ, 0);
 
 		if (written != BLCKSZ || pg_fsync(fd) != 0) {
 			int save_errno = errno;
@@ -1491,6 +1560,21 @@ cluster_undo_redo_segment_recycle(const ClusterUndoDecoded *decoded)
 							errmsg("could not durably write undo segment \"%s\" recycle state: %m",
 								   path)));
 		}
+	}
+	if ((uint8)blockbuf.data[57] == CLUSTER_UNDO_TT_LAYOUT_V2
+		&& decision != CLUSTER_UNDO_HEADER_APPLY && pg_fsync(fd) != 0) {
+		int save_errno = errno;
+
+		close(fd);
+		errno = save_errno;
+		ereport(PANIC, (errcode_for_file_access(),
+						errmsg("could not make unchanged undo segment V2 recycle durable: %m")));
+	}
+	if ((uint8)blockbuf.data[57] == CLUSTER_UNDO_TT_LAYOUT_V2
+		&& !cluster_undo_lifecycle_v2_readback(fd, blockbuf.data)) {
+		close(fd);
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("undo segment V2 recycle readback failed")));
 	}
 	if (close(fd) != 0)
 		ereport(PANIC, (errcode_for_file_access(),
@@ -1525,6 +1609,10 @@ cluster_undo_redo_segment_reuse(const ClusterUndoDecoded *decoded, const uint8 *
 		!= CLUSTER_UNDO_HEADER_APPLY)
 		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("invalid typed undo segment reuse image")));
+	if ((uint8)prepared.data[57] == CLUSTER_UNDO_TT_LAYOUT_V2
+		&& !cluster_undo_lifecycle_v2_checksum(prepared.data))
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("invalid checksum in undo segment V2 reuse image")));
 	if (build_undo_segment_path(cluster_undo_recovery_intent_for_owner(decoded->instance),
 								decoded->instance, decoded->segment_id, path, sizeof(path))
 		!= 0)
@@ -1539,6 +1627,12 @@ cluster_undo_redo_segment_reuse(const ClusterUndoDecoded *decoded, const uint8 *
 						errmsg("could not open undo segment \"%s\" for reuse redo: %m", path)));
 
 	nread = pg_pread(fd, blockbuf.data, BLCKSZ, 0);
+	if (nread == BLCKSZ && (uint8)blockbuf.data[57] == CLUSTER_UNDO_TT_LAYOUT_V2
+		&& !cluster_undo_lifecycle_v2_checksum(blockbuf.data)) {
+		close(fd);
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("invalid undo segment V2 reuse predecessor checksum")));
+	}
 	decision
 		= cluster_undo_prepare_header_v1(decoded, payload, decoded->payload_length,
 										 nread == BLCKSZ ? blockbuf.data : NULL, prepared.data);
@@ -1568,6 +1662,22 @@ cluster_undo_redo_segment_reuse(const ClusterUndoDecoded *decoded, const uint8 *
 					(errcode_for_file_access(),
 					 errmsg("could not durably write undo segment \"%s\" reuse image: %m", path)));
 		}
+	}
+	if ((uint8)prepared.data[57] == CLUSTER_UNDO_TT_LAYOUT_V2
+		&& decision != CLUSTER_UNDO_HEADER_APPLY && pg_fsync(fd) != 0) {
+		int save_errno = errno;
+
+		close(fd);
+		errno = save_errno;
+		ereport(PANIC, (errcode_for_file_access(),
+						errmsg("could not make unchanged undo segment V2 reuse durable: %m")));
+	}
+	if ((uint8)prepared.data[57] == CLUSTER_UNDO_TT_LAYOUT_V2
+		&& !cluster_undo_lifecycle_v2_readback(fd,
+				decision == CLUSTER_UNDO_HEADER_APPLY ? prepared.data : blockbuf.data)) {
+		close(fd);
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("undo segment V2 reuse readback failed")));
 	}
 	if (close(fd) != 0)
 		ereport(PANIC, (errcode_for_file_access(),

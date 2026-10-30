@@ -368,7 +368,9 @@ cluster_undo_smgr_recovery_materialize_v1(uint32 segment, uint8 instance,
 	bool ok;
 
 	if (expected == NULL || block0 == NULL || final_header == NULL
-		|| !cluster_undo_segment_header_identity_ok(final_header, segment, instance)
+		|| !((uint8)final_header[57] == CLUSTER_UNDO_TT_LAYOUT_V2
+				 ? UndoSegmentHeaderV2_identity_matches(final_header, BLCKSZ, segment, instance)
+				 : cluster_undo_segment_header_identity_ok(final_header, segment, instance))
 		|| cluster_undo_path_resolve(CLUSTER_UNDO_PATH_RECOVERY_SHARED, instance, segment, path,
 									 sizeof(path))
 			   != 0)

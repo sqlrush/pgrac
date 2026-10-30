@@ -3541,8 +3541,9 @@ test_cluster_undo_block_native.inc: $(top_srcdir)/src/backend/cluster/storage/cl
 	mv $@.tmp $@
 
 test_cluster_undo_lifecycle_native.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_xlog.c Makefile
-	awk '/^cluster_undo_redo_segment_(init|recycle|reuse)\(/ { print "static void"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 3) exit 1 }' $< > $@.tmp
+	awk '/^cluster_undo_lifecycle_v2_(checksum|readback)\(/ { print "static bool"; emit=1; found++ } \
+	     /^cluster_undo_redo_segment_(init|recycle|reuse)\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 5) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_undo_bind_native.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_xlog.c Makefile
