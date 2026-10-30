@@ -323,6 +323,7 @@ OBJS = \
 	cluster_terminal_authority.o \
 	cluster_sf_dep.o \
 	cluster_tt_recovery.o \
+	cluster_recovery_undo_scan.o \
 	cluster_tt_local.o \
 	cluster_tt_status.o \
 	cluster_tt_status_hint.o \

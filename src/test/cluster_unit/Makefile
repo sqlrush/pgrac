@@ -438,6 +438,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_freeze_writer_context test_cluster_hea
 SIMPLE_TESTS := $(filter-out test_cluster_heap_horizon,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_resident_record_batch,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_tt_terminal_route,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_recovery_undo_scan,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_pgrac_protected_set test_pgrac_fenced_drain test_pgrac_fenced_map_filter test_pgrac_fenced_drain_sign_filter,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_pgrac_fenced_pacemaker test_pgrac_fenced_cib,$(SIMPLE_TESTS))
 # PGRAC: production journal validation is linked into target command tests.
@@ -479,6 +480,7 @@ TESTS += test_cluster_heap_small_redo
 TESTS += test_cluster_btree_redo test_cluster_cold_init_redo
 TESTS += test_cluster_page_dependency
 TESTS += test_cluster_undo_producer
+TESTS += test_cluster_recovery_undo_scan
 TESTS += test_cluster_undo_native_lifecycle
 TESTS += test_cluster_undo_recovery
 TESTS += test_cluster_remote_xact_directory
@@ -11196,3 +11198,27 @@ clean: clean-foreign-creation-deps
 .PHONY: clean-foreign-creation-deps
 clean-foreign-creation-deps:
 	rm -f test_cluster_heap_ctrc_creator_dependencies.inc test_cluster_heap_ctrc_creator_dependencies.inc.tmp
+
+# Original complete cold scanner with an independent checksum provider.
+cluster_unit_page_checksum.o: $(top_srcdir)/src/backend/storage/page/checksum.c \
+		$(top_srcdir)/src/include/storage/checksum_impl.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
+test_cluster_recovery_undo_scan: test_cluster_recovery_undo_scan.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_undo_scan.c \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_undo_scan.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_record.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_format.h \
+		$(top_srcdir)/src/backend/cluster/cluster_uba.c \
+		$(top_srcdir)/src/common/cluster_undo_segment_init.c \
+		$(top_srcdir)/src/include/cluster/cluster_undo_segment_init.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h \
+		$(top_srcdir)/src/include/cluster/cluster_tt_slot.h \
+		$(top_srcdir)/src/include/storage/checksum_impl.h \
+		test_cluster_heap_small_scn.inc cluster_unit_port_stubs.o cluster_unit_page_checksum.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< cluster_unit_page_checksum.o $(LDFLAGS) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+.PHONY: clean-cold-undo-scan
+clean: clean-cold-undo-scan
+clean-cold-undo-scan:
+	rm -f cluster_unit_page_checksum.o

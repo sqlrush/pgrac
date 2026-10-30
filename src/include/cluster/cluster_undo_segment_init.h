@@ -74,4 +74,15 @@ extern bool cluster_undo_segment_make_header_v2_bytes(uint32 segment_id, uint8 o
 													char *page);
 
 
+/* Integrity is independent of checkpoint coverage or transaction identity.
+ * Zero is a legacy, unverified page, never a qualification certificate. */
+typedef enum ClusterUndoHeaderIntegrity {
+	CLUSTER_UNDO_HEADER_UNVERIFIED,
+	CLUSTER_UNDO_HEADER_VALID,
+	CLUSTER_UNDO_HEADER_CORRUPT
+} ClusterUndoHeaderIntegrity;
+extern ClusterUndoHeaderIntegrity cluster_undo_segment_header_integrity(const void *page);
+/* Caller owns BLCKSZ writable bytes; input alignment is unrestricted. */
+extern bool cluster_undo_segment_header_seal(void *page);
+
 #endif /* CLUSTER_UNDO_SEGMENT_INIT_H */
