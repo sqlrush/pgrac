@@ -459,7 +459,27 @@ cluster_cold_replay_run_v1(const ClusterColdPlanV1 *plan,
 
 #ifndef FRONTEND
 
+#include "cluster/cluster_tt_slot.h"
 #include "utils/guc.h"
+
+/* Raw physical TT address; this key grants no terminal or epoch authority. */
+typedef struct ClusterColdTtSlotKeyV1 {
+	uint8 owner_instance;
+	uint32 segment_id;
+	uint32 segment_generation;
+	uint32 slot_offset;
+	TransactionId xid;
+	uint16 slot_wrap;
+} ClusterColdTtSlotKeyV1;
+
+/* Copied immutable slot input. Legacy input leaves both identity fields zero.
+ * Durable TT40 identity does not qualify a top transaction or recovery owner. */
+typedef struct ClusterColdTtSlotInputV1 {
+	ClusterColdTtSlotKeyV1 key;
+	TTSlot slot;
+	uint64 original_full_xid;
+	uint8 tt_layout_version; /* zero: legacy raw input, two: exact durable TT40 */
+} ClusterColdTtSlotInputV1;
 
 /*
  * cluster.cold_recovery_plan_memory (kB, PGC_POSTMASTER): everything one
