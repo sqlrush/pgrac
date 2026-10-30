@@ -288,6 +288,16 @@ struct RfPageCtrcOwnerCompletionV1;
 extern struct RfPageCtrcOwnerCompletionV1 ClusterColdRecoveryCtrcPageOwnerCompletion(
 	const struct ClusterRecoveryStartV1 *start, uint32 target_index,
 	const uint8 *raw_evidence, Size evidence_length, Size memory_budget);
+/* Produce all original nonempty PAGE targets as one immutable local inventory.
+ * No supplied witness, target subset, outcome or rule. Budget the entire
+ * output/snapshot/codec peak before first PAGE; WAIT/false/ERROR publishes no
+ * prefix and retains original FD/all IR-WALR/pins debt. entries is local-only:
+ * pfree it before original Start/scope/ResourceOwner ends, never close its FDs.
+ * Original current/graph/source/owner/base/lifetime checks remain mandatory
+ * before consuming these bytes. No zero-target/no-effect or joint grant. */
+struct RfPageCtrcOwnersV1;
+extern struct RfPageCtrcOwnersV1 ClusterColdRecoveryCtrcPageOwners(
+	const struct ClusterRecoveryStartV1 *start, Size memory_budget);
 struct RfPageCtrcFpiInsertV1;
 struct ClusterSharedFsPageV1;
 /* Local immutable membership only: the ORIGINAL retained result address and

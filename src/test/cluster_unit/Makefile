@@ -10899,3 +10899,5 @@ test_cluster_cold_tx_start: test_cluster_cold_ctrc_owner_round.inc
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_owner_continuation.inc
 
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_owner_completion.inc
+
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_owner_inventory.inc

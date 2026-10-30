@@ -3043,6 +3043,173 @@ cluster_recovery_cold_page_completed_same(const ClusterColdCtrcPageProgressV1 *p
 			(Size)count * sizeof(ClusterColdCtrcPageCompletedV1)) == 0;
 }
 
+/* Original complete PAGE target inventory. This creates local canonical
+ * inputs only; the original graph producer still establishes exact T/effect
+ * scope and all independent owners, base, lifetime and final current duties. */
+static bool
+cluster_recovery_cold_page_owner_evidence(const struct ClusterRecoveryStartV1 *start,
+	RfPageCtrcOwnerEvidenceV1 *entry)
+{
+	const RfPageCtrcOwnerProofV1 *proof = &entry->completed.owner;
+	const ClusterRecoveryCtrcReplaySetSourceV1 *source = NULL;
+	uint8 *atom = entry->evidence + 16, *id = atom + 10;
+	uint8 ids[MAXPGPATH + 92];
+	Size ids_length = 0, id_length, path_length;
+	char path[MAXPGPATH], *base;
+	int written;
+
+	for (uint32 i = 0; i < start->ctrc_page_source_count; i++) {
+		const ClusterRecoveryCtrcReplaySetSourceV1 *candidate = &start->ctrc_page_sources[i];
+		if (candidate->generation_index != proof->replay_source_index) continue;
+		if (source != NULL) return false;
+		source = candidate;
+	}
+	if (source == NULL || source->generation_count != proof->replay_source_count) return false;
+	base = relpathperm(proof->space.key.locator, MAIN_FORKNUM);
+	written = proof->blockno < RELSEG_SIZE
+		? snprintf(path, sizeof(path), "%s", base)
+		: snprintf(path, sizeof(path), "%s.%u", base, proof->blockno / RELSEG_SIZE);
+	pfree(base);
+	if (written <= 0 || written >= (int)sizeof(path)) return false;
+	path_length = (Size)written;
+	id_length = 46 + path_length;
+	entry->evidence_length = 50 + id_length + BLCKSZ;
+	cluster_undo_tt_ctrc_put_u64_le(entry->evidence, 1);
+	cluster_undo_tt_ctrc_put_u64_le(entry->evidence + 8, entry->evidence_length - 16);
+	cluster_undo_tt_ctrc_put_u16_le(atom, 2);
+	cluster_undo_tt_ctrc_put_u64_le(atom + 2, id_length + 16);
+	cluster_undo_tt_ctrc_put_u64_le(id, proof->space.key.system_identifier);
+	cluster_undo_tt_ctrc_put_u64_le(id + 8, proof->space.key.database_incarnation);
+	cluster_undo_tt_ctrc_put_u16_le(id + 16, source->generation.source.claim.identity.origin_node_id);
+	cluster_undo_tt_ctrc_put_u32_le(id + 18, CLUSTER_RECOVERY_FILE_RELATION);
+	cluster_undo_tt_ctrc_put_u64_le(id + 22, path_length);
+	memcpy(id + 30, path, path_length);
+	/* Explicit native no-generation value, never a qualified era/base. */
+	cluster_undo_tt_ctrc_put_u64_le(id + 30 + path_length, 0);
+	cluster_undo_tt_ctrc_put_u64_le(id + 38 + path_length, proof->blockno);
+	cluster_undo_tt_ctrc_put_u64_le(id + id_length,
+		(uint64)(proof->blockno % RELSEG_SIZE) * BLCKSZ);
+	cluster_undo_tt_ctrc_put_u64_le(id + id_length + 8, BLCKSZ);
+	cluster_undo_tt_ctrc_put_u64_le(id + id_length + 16, BLCKSZ);
+	memcpy(id + id_length + 24, proof->image.data, BLCKSZ);
+	if (!cluster_recovery_cold_page_completion_atom(start, proof, entry->evidence, entry->evidence_length)
+		|| !cluster_recovery_ctrc_witness_ids_from_evidence_v2(entry->evidence,
+			entry->evidence_length, ids, sizeof(ids), &ids_length)
+		|| ids_length > sizeof(entry->completed.completion) - 4
+		|| !cluster_recovery_ctrc_owner_completion_bytes_v2(proof->outcome, proof->rule,
+			ids, ids_length, entry->evidence, entry->evidence_length,
+			entry->completed.completion, ids_length + 4)) return false;
+	entry->completed.length = ids_length + 4;
+	return true;
+}
+
+static bool
+cluster_recovery_cold_page_owners_same(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, ClusterWalInputsV1 *scope,
+	const ClusterColdCtrcPageProgressV1 *progress,
+	const ClusterColdCtrcPageCompletedV1 *fixed, uint32 count)
+{
+	return cluster_recovery_cold_page_advance_current(start, work, scope, progress)
+		&& cluster_recovery_cold_page_completed_same(progress, fixed, count)
+		&& rf_page_online_plan_target_count_v1(start->ctrc_page_plan) == count;
+}
+
+RfPageCtrcOwnersV1
+ClusterColdRecoveryCtrcPageOwners(const struct ClusterRecoveryStartV1 *start, Size memory_budget)
+{
+	RfPageCtrcOwnersV1 out = {0};
+	RfPageCtrcOwnerEvidenceV1 *volatile entries = NULL;
+	const ClusterColdCtrcPageProgressV1 *progress;
+	const ClusterColdCtrcWorkV1 *work;
+	ClusterWalInputsV1 *scope;
+	ClusterColdCtrcPageCompletedV1 *fixed;
+	Size entry_bytes, bytes;
+	const Size scratch = sizeof(out) + 2 * sizeof(RfPageCtrcOwnerProofV1)
+		+ 2 * (MAXPGPATH + 92) + 2 * MAXPGPATH;
+	uint32 count;
+	bool ready = false;
+
+	out.detail = RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	if (start == NULL || start != cluster_recovery_cold_start
+		|| !cluster_recovery_cold_ctrc_replays_actor()) return out;
+	progress = start->ctrc_page_progress;
+	if (progress == NULL || progress->pending || progress->target_count == 0
+		|| progress->next_target != progress->target_count) return out;
+	count = progress->target_count;
+	work = start->ctrc_observation_work; scope = start->ctrc_observation_inputs;
+	/* Reserve whole output, alignment, complete operation/FD/baseline snapshot
+	 * and owner/codec/path peak before the first PAGE or yielding current call. */
+	if (count > (MaxAllocSize - scratch - MAXIMUM_ALIGNOF)
+		/ (sizeof(*entries) + sizeof(*fixed))) {
+		out.detail = RF_PAGE_PROOF_DETAIL_CAPACITY; return out;
+	}
+	entry_bytes = MAXALIGN((Size)count * sizeof(*entries));
+	bytes = entry_bytes + (Size)count * sizeof(*fixed);
+	if (memory_budget < bytes + scratch) {
+		out.detail = RF_PAGE_PROOF_DETAIL_CAPACITY; return out;
+	}
+	PG_TRY();
+	{
+		entries = MemoryContextAllocExtended(TopMemoryContext, bytes, MCXT_ALLOC_ZERO | MCXT_ALLOC_NO_OOM);
+		out.detail = RF_PAGE_PROOF_DETAIL_OOM;
+		if (entries != NULL) {
+			bool preflight;
+
+			fixed = (ClusterColdCtrcPageCompletedV1 *)((char *)entries + entry_bytes);
+			memcpy(fixed, progress->completed, (Size)count * sizeof(*fixed));
+			preflight = cluster_recovery_cold_page_owners_same(start, work, scope, progress, fixed, count);
+			out.detail = RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+			for (uint32 i = 0; preflight && i < count; i++) {
+				RfPageOnlineTargetViewV1 target;
+				ClusterRecoveryCensusPageV1 physical;
+
+				preflight = fixed[i].storage != NULL
+					&& rf_page_online_plan_target_v1(start->ctrc_page_plan, i, &target)
+					&& !target.history_only && target.page_identity.forknum == MAIN_FORKNUM
+					&& cluster_recovery_cold_page_target(start, &target, &physical) && physical.heap;
+			}
+			if (preflight) {
+				uint32 i;
+				for (i = 0; i < count; i++) {
+					RfPageCtrcOwnerProofV1 actual;
+
+					out.detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+					if (!cluster_recovery_cold_page_owners_same(start, work, scope, progress, fixed, count)) break;
+					actual = ClusterColdRecoveryCtrcPageOwnerProof(start, i);
+					out.detail = actual.detail;
+					if (actual.detail != RF_PAGE_PROOF_DETAIL_OK) break;
+					out.detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+					if (!cluster_recovery_cold_page_owners_same(start, work, scope, progress, fixed, count)) break;
+					out.detail = RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+					if (actual.owner_family != 10 || actual.outcome != 1
+						|| (actual.rule != 1 && actual.rule != 6)
+						|| actual.target_index != i || actual.target_count != count) break;
+					entries[i].completed.owner = actual;
+					if (!cluster_recovery_cold_page_owner_evidence(start, &entries[i])) break;
+				}
+				out.detail = i == count ? RF_PAGE_PROOF_DETAIL_ROOT_STALE : out.detail;
+				ready = i == count
+					&& cluster_recovery_cold_page_owners_same(start, work, scope, progress, fixed, count);
+			}
+		}
+	}
+	PG_CATCH();
+	{
+		if (entries != NULL) pfree((void *)entries);
+		cluster_recovery_cold_page_plan_refuse(cluster_recovery_cold_start, RF_PAGE_PROOF_DETAIL_INTERNAL);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (ready) {
+		out.detail = RF_PAGE_PROOF_DETAIL_OK; out.count = count; out.entries = entries;
+	} else {
+		if (entries != NULL) pfree((void *)entries);
+		if (out.detail != RF_PAGE_PROOF_DETAIL_WOULD_BLOCK && out.detail != RF_PAGE_PROOF_DETAIL_OOM)
+			cluster_recovery_cold_page_plan_refuse(cluster_recovery_cold_start, out.detail);
+	}
+	return out;
+}
+
 static bool
 cluster_recovery_cold_page_completed_recheck(const struct ClusterRecoveryStartV1 *start,
 	const ClusterColdCtrcPageCompletedV1 *fixed, uint32 fixed_count)

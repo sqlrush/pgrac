@@ -364,6 +364,20 @@ typedef struct RfPageCtrcOwnerCompletionV1 {
 	uint8 completion[MAXPGPATH + 96];
 } RfPageCtrcOwnerCompletionV1;
 
+/* Complete original PAGE target set, not a completed G_owner or release.
+ * Each entry owns exact canonical atom2/atom3 bytes from its actual reader. */
+typedef struct RfPageCtrcOwnerEvidenceV1 {
+	RfPageCtrcOwnerCompletionV1 completed;
+	Size evidence_length;
+	uint8 evidence[BLCKSZ + MAXPGPATH + 96];
+} RfPageCtrcOwnerEvidenceV1;
+
+typedef struct RfPageCtrcOwnersV1 {
+	RfPageProofDetailV1 detail;
+	uint32 count;
+	RfPageCtrcOwnerEvidenceV1 *entries;
+} RfPageCtrcOwnersV1;
+
 extern RfPageCtrcReadbackImageV1 rf_page_recovery_ctrc_replays_completed_image_v1(
 	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work,
 	const struct ClusterRecoveryCtrcReplaySetSourceV1 *source, RfPageCtrcAuthorityV1 *authority,
