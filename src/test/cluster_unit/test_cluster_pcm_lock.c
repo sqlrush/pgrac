@@ -18368,12 +18368,12 @@ UT_TEST(test_resource_x_source_settlement_debt_participates_in_same_token_r8_r10
 	UT_ASSERT_NOT_NULL(clean);
 	UT_ASSERT_NOT_NULL(clean_end);
 	UT_ASSERT(strstr(proof, "pcm_resource_x_source_settlement_debt_decode_locked(") < proof_end);
-	UT_ASSERT(strstr(proof, "RESOURCE_X_SOURCE_SETTLEMENT_PENDING") < proof_end);
+	UT_ASSERT(strstr(proof, "pcm_resource_x_source_settlement_live(state)") < proof_end);
 	UT_ASSERT(strstr(proof, "RESOURCE_X_SOURCE_SETTLEMENT_ACKED") < proof_end);
 	UT_ASSERT(strstr(sweep, "pcm_resource_x_source_settlement_debt_decode_locked(") < sweep_end);
 	UT_ASSERT(strstr(sweep, "memset(&master_state->source_settlement") < sweep_end);
 	UT_ASSERT(strstr(clean, "pcm_resource_x_source_settlement_debt_decode_locked(") < clean_end);
-	UT_ASSERT(strstr(clean, "RESOURCE_X_SOURCE_SETTLEMENT_PENDING") < clean_end);
+	UT_ASSERT(strstr(clean, "pcm_resource_x_source_settlement_live(state)") < clean_end);
 	UT_ASSERT(strstr(clean, "RESOURCE_X_SOURCE_SETTLEMENT_ACKED") < clean_end);
 	free(source);
 }

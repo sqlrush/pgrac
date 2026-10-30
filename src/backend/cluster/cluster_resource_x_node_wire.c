@@ -252,18 +252,28 @@ resource_x_pair_length(uint8 msg_type, ResourceXWireKind kind, uint16 len)
 			&& (len == RESOURCE_X_SHORT_V1_BYTES || len == RESOURCE_X_COMPLETE_V5_BYTES
 				|| len == RESOURCE_X_SOURCE_COMPLETE_V11_BYTES);
 	if (kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2)
-		return msg_type == RESOURCE_X_MSG_BLOCK_TO_N && len == RESOURCE_X_PROOF_V1_BYTES;
+		return msg_type == RESOURCE_X_MSG_BLOCK_TO_N
+			&& (len == RESOURCE_X_PROOF_V1_BYTES || len == RESOURCE_X_SOURCE_COMPLETE_V11_BYTES);
 	if (kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2)
-		return msg_type == RESOURCE_X_MSG_BLOCKED_TO_N && len == RESOURCE_X_PROOF_V1_BYTES;
+		return msg_type == RESOURCE_X_MSG_BLOCKED_TO_N
+			&& (len == RESOURCE_X_PROOF_V1_BYTES || len == RESOURCE_X_SOURCE_COMPLETE_V11_BYTES);
 	return false;
 }
 
 
 static bool
+resource_x_completion_kind(ResourceXWireKind kind)
+{
+	return kind == RESOURCE_X_WIRE_INSTALL_SETTLEMENT
+		|| kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2
+		|| kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2;
+}
+
+static bool
 resource_x_frame_length(const ResourceXDecodedFrame *frame, uint16 *len)
 {
 	if (frame->has_acquire_decision) {
-		if (frame->kind == RESOURCE_X_WIRE_INSTALL_SETTLEMENT) {
+		if (resource_x_completion_kind(frame->kind)) {
 			if (frame->has_acquire_intent || frame->blocked_has_remote_proof)
 				return false;
 			*len = frame->body.acquire_completion.decision.source_kind == RESOURCE_X_ACQUIRE_SOURCE_DISK
@@ -619,10 +629,16 @@ resource_x_pair_common_valid(uint8 msg_type, ResourceXWireKind kind,
 	if (acquire_decision) {
 		if (((kind == RESOURCE_X_WIRE_BLOCKED_TO_N && msg_type == RESOURCE_X_MSG_BLOCKED_TO_N)
 			 || (kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE && msg_type == RESOURCE_X_MSG_IMAGE_OR_GRANT)
-			 || (kind == RESOURCE_X_WIRE_INSTALL_SETTLEMENT && msg_type == RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE))
+			 || (kind == RESOURCE_X_WIRE_INSTALL_SETTLEMENT && msg_type == RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE)
+			 || (kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2 && msg_type == RESOURCE_X_MSG_BLOCK_TO_N)
+			 || (kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2 && msg_type == RESOURCE_X_MSG_BLOCKED_TO_N))
 			&& !acquire_intent) {
 			ResourceXDecodedCommon decision = *common;
 			if (common->outcome != RESOURCE_X_OUTCOME_OK
+				&& !((kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2
+					  || kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2)
+					 && (common->outcome == RESOURCE_X_OUTCOME_QUIET
+						 || common->outcome == RESOURCE_X_OUTCOME_QUIET_NO_IMAGE))
 				&& !(kind == RESOURCE_X_WIRE_INSTALL_SETTLEMENT
 					&& (common->outcome == RESOURCE_X_OUTCOME_DUPLICATE
 						|| common->outcome == RESOURCE_X_OUTCOME_QUIET
@@ -794,7 +810,7 @@ resource_x_acquire_native_valid(const ResourceXDecodedAcquireIntent *body, uint8
 static bool
 resource_x_decision_body_valid(const ResourceXDecodedFrame *frame)
 {
-	const ResourceXDecodedAcquireDecision *body = frame->kind == RESOURCE_X_WIRE_INSTALL_SETTLEMENT
+	const ResourceXDecodedAcquireDecision *body = resource_x_completion_kind(frame->kind)
 		? &frame->body.acquire_completion.decision : &frame->body.acquire_decision;
 	uint32 requester_bit = UINT32_C(1) << frame->common.logical_assertion.requester_node;
 	uint32 required;
@@ -850,6 +866,10 @@ resource_x_decision_body_valid(const ResourceXDecodedFrame *frame)
 				   || source_bit == requester_bit)
 			return false;
 	}
+	if (frame->kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2
+		|| frame->kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2)
+		return body->source_kind == RESOURCE_X_ACQUIRE_SOURCE_REMOTE_CURRENT
+			&& frame->common.action_node == body->source_node;
 	if (frame->kind == RESOURCE_X_WIRE_INSTALL_SETTLEMENT
 		&& (frame->common.outcome == RESOURCE_X_OUTCOME_DUPLICATE
 			|| frame->common.outcome == RESOURCE_X_OUTCOME_QUIET_RETIRED
@@ -1090,7 +1110,7 @@ resource_x_body_valid(const ResourceXDecodedFrame *frame, ResourceXWireReject *r
 {
 	bool valid = true;
 	if (frame->has_acquire_decision) {
-		valid = frame->kind == RESOURCE_X_WIRE_INSTALL_SETTLEMENT
+		valid = resource_x_completion_kind(frame->kind)
 			? resource_x_completion_body_valid(frame) : frame->kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE
 			? resource_x_acquire_image_valid(frame, reject)
 			: frame->kind == RESOURCE_X_WIRE_BLOCKED_TO_N
@@ -1226,7 +1246,7 @@ static bool
 resource_x_body_encode(uint8 *bytes, const ResourceXDecodedFrame *frame, ResourceXWireReject *reject)
 {
 	if (frame->has_acquire_intent || frame->has_acquire_decision) {
-		bool complete = frame->has_acquire_decision && frame->kind == RESOURCE_X_WIRE_INSTALL_SETTLEMENT;
+		bool complete = frame->has_acquire_decision && resource_x_completion_kind(frame->kind);
 		bool image = frame->has_acquire_decision && frame->kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE;
 		bool witness = frame->has_acquire_decision && (image || frame->kind == RESOURCE_X_WIRE_BLOCKED_TO_N);
 		const ResourceXDecodedAcquireDecision *decision = complete ? &frame->body.acquire_completion.decision
@@ -1390,7 +1410,7 @@ resource_x_body_decode(const uint8 *bytes, ResourceXDecodedFrame *frame,
 					   ResourceXWireReject *reject)
 {
 	if (frame->has_acquire_intent || frame->has_acquire_decision) {
-		bool complete = frame->has_acquire_decision && frame->kind == RESOURCE_X_WIRE_INSTALL_SETTLEMENT;
+		bool complete = frame->has_acquire_decision && resource_x_completion_kind(frame->kind);
 		bool image = frame->has_acquire_decision && frame->kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE;
 		bool witness = frame->has_acquire_decision && (image || frame->kind == RESOURCE_X_WIRE_BLOCKED_TO_N);
 		ResourceXDecodedAcquireWitness *w = image

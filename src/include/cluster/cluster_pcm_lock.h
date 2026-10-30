@@ -2919,6 +2919,11 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_done_exact(
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_done_resume_exact(
 	const ResourceXBootstrapWork *work);
 
+/* Retire only a compatible clean source's transport pair. Native S and all
+ * independent PI/WAL authority stay with their original owners. */
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_read_source_settlement_exact(
+	const ResourceXDecodedFrame *frame, int32 master, uint32 peer_generation);
+
 /* Read-only source-receipt join for the original, revalidated master work.
  * APPLIED proves matching A, original holder ACK and completed FORWARD sends;
  * it does not settle the source carrier, grant directory state, or authorize

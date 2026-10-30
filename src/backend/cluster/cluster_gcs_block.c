@@ -10360,12 +10360,14 @@ gcs_block_resource_x_payload_candidate(uint8 msg_type, uint32 payload_length)
 	if (msg_type == RESOURCE_X_MSG_BLOCK_TO_N)
 		return payload_length == RESOURCE_X_CONTROL_V1_BYTES
 			   || payload_length == RESOURCE_X_PROOF_V1_BYTES
-			   || payload_length == RESOURCE_X_DECISION_V4_BYTES;
+			   || payload_length == RESOURCE_X_DECISION_V4_BYTES
+			   || payload_length == RESOURCE_X_SOURCE_COMPLETE_V11_BYTES;
 	if (msg_type == RESOURCE_X_MSG_BLOCKED_TO_N)
 		return payload_length == RESOURCE_X_CONTROL_V1_BYTES
 			   || payload_length == RESOURCE_X_PROOF_V1_BYTES
 			   || payload_length == RESOURCE_X_WITNESS_V4_BYTES
-			   || payload_length == RESOURCE_X_SOURCE_WITNESS_V4_BYTES;
+			   || payload_length == RESOURCE_X_SOURCE_WITNESS_V4_BYTES
+			   || payload_length == RESOURCE_X_SOURCE_COMPLETE_V11_BYTES;
 	if (msg_type == RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE)
 		return payload_length == RESOURCE_X_CONTROL_V1_BYTES
 			   || payload_length == RESOURCE_X_SHORT_V1_BYTES
@@ -15811,6 +15813,9 @@ gcs_block_resource_x_source_settlement_run(const ClusterICEnvelope *env,
 		|| env->source_node_id >= RESOURCE_X_PROTOCOL_NODE_LIMIT
 		|| sender_connection_generation == 0)
 		return RESOURCE_X_APPLY_INVALID;
+	if (settlement->has_acquire_decision)
+		return cluster_pcm_lock_resource_x_acquire_read_source_settlement_exact(
+			settlement, (int32)env->source_node_id, sender_connection_generation);
 	memset(&plan, 0, sizeof(plan));
 	memset(&commit_observation, 0, sizeof(commit_observation));
 	memset(&prepare_observation, 0, sizeof(prepare_observation));
