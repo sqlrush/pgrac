@@ -116,6 +116,7 @@
 #include "utils/aclchk_internal.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
 #include "../../backend/cluster/cluster_control_bootstrap_private.h"
@@ -1058,6 +1059,8 @@ reset_error(void)
 	error_detail[0] = '\0';
 }
 
+static void reset_create_preflight(void);
+
 UT_TEST(test_pre1_startup_refuses_before_root_and_without_writes)
 {
 	char tmp[] = "/tmp/pgrac-fresh-scope-XXXXXX";
@@ -1310,6 +1313,7 @@ UT_TEST(test_create_concurrently_refuses_before_native_mutation)
 {
 	IndexStmt stmt = { 0 };
 	int caught;
+	reset_create_preflight();
 	stmt.type = T_IndexStmt;
 	for (int mode = 0; mode < 3; ++mode)
 		for (int concurrent = 0; concurrent <= 1; ++concurrent)
@@ -1387,6 +1391,7 @@ UT_TEST(test_shared_index_access_methods_refuse_before_utility_or_define)
 	IndexStmt stmt = { 0 };
 	int caught;
 
+	reset_create_preflight();
 	stmt.type = T_IndexStmt;
 	for (int mode = 0; mode < 3; mode++)
 		for (unsigned am = 0; am < lengthof(methods); am++)
@@ -23370,10 +23375,405 @@ UT_TEST(test_native_relation_create_other_kinds_keep_caller_responsibility)
 	relation_create_lookup_active = false;
 }
 
+/* Execute the complete native prefix through its first GUC dependency.
+ * Only the test-local function name changes; the original extracted entry
+ * above remains available to all previous index scope tests. */
+static bool index_create_lookup_active, index_create_expect_binding;
+static unsigned index_create_lookups, index_create_unbound, index_create_bad_lookup;
+
+int
+NewGUCNestLevel(void)
+{
+	index_create_lookups++;
+	if (index_create_expect_binding
+		&& (utility_binds == 0 || !TransactionIdIsValid(utility_top_xid)
+			|| utility_current_xid != utility_top_xid))
+		index_create_unbound++;
+	if (!index_create_lookup_active)
+		index_create_bad_lookup++;
+	siglongjmp(boundary, 2); /* No GUC level or catalog success is supplied. */
+}
+
+static ObjectAddress native_preflight_DefineIndex(Oid relationId, IndexStmt *stmt,
+												  Oid indexRelationId, Oid parentIndexId,
+												  Oid parentConstraintId, int total_parts,
+												  bool is_alter_table, bool check_rights,
+												  bool check_not_in_use, bool skip_build,
+												  bool quiet);
+#define DefineIndex native_preflight_DefineIndex
+#include "test_cluster_fresh_index_create.inc"
+#undef DefineIndex
+
+typedef struct IndexCreateArguments {
+	Oid relation_id, index_oid, parent_index_oid, parent_constraint_oid;
+	int total_parts;
+	bool is_alter_table, check_rights, check_not_in_use, skip_build, quiet;
+} IndexCreateArguments;
+static struct {
+	IndexStmt statement;
+	IndexElem column;
+	RangeVar relation;
+	ListCell column_cell;
+	IndexCreateArguments args;
+} index_create_case, index_create_before;
+static List index_create_columns;
+static unsigned char index_create_list_before[sizeof(List)];
+static Node *index_create_expected_statement;
+
+static void
+snapshot_native_index_create(void)
+{
+	memcpy(&index_create_before, &index_create_case, sizeof(index_create_case));
+	memcpy(index_create_list_before, &index_create_columns, sizeof(List));
+}
+
+static void
+reset_native_index_create(bool expect_binding, unsigned form)
+{
+	static const IndexCreateArguments calls[] = {
+		/* Utility CREATE, utility ALTER, ALTER add/rebuild, relation clone,
+		 * attach clone, and recursion from CREATE/ALTER. */
+		{ .relation_id = 701, .total_parts = -1, .check_rights = true, .check_not_in_use = true },
+		{ .relation_id = 702,
+		  .total_parts = 4,
+		  .is_alter_table = true,
+		  .check_rights = true,
+		  .check_not_in_use = true },
+		{ .relation_id = 703, .total_parts = -1, .is_alter_table = true, .check_rights = true },
+		{ .relation_id = 704,
+		  .total_parts = -1,
+		  .is_alter_table = true,
+		  .skip_build = true,
+		  .quiet = true },
+		{ .relation_id = 705,
+		  .parent_index_oid = 805,
+		  .parent_constraint_oid = 905,
+		  .total_parts = -1 },
+		{ .relation_id = 706,
+		  .parent_index_oid = 806,
+		  .parent_constraint_oid = 906,
+		  .total_parts = -1,
+		  .is_alter_table = true },
+		{ .relation_id = 707,
+		  .parent_index_oid = 807,
+		  .total_parts = -1,
+		  .check_rights = true,
+		  .check_not_in_use = true },
+		{ .relation_id = 708,
+		  .parent_index_oid = 808,
+		  .parent_constraint_oid = 908,
+		  .total_parts = -1,
+		  .is_alter_table = true,
+		  .skip_build = true,
+		  .quiet = true }
+	};
+	unsigned shape = form % 4;
+
+	reset_create_preflight();
+	Mode = NormalProcessing;
+	index_create_lookup_active = false;
+	index_create_expect_binding = expect_binding;
+	index_create_lookups = index_create_unbound = index_create_bad_lookup = 0;
+	memset(&index_create_case, 0, sizeof(index_create_case));
+	index_create_case.relation = (RangeVar){ .type = T_RangeVar,
+											 .schemaname = "public",
+											 .relname = "native_indexed_table",
+											 .inh = true,
+											 .relpersistence = RELPERSISTENCE_PERMANENT,
+											 .location = -1 };
+	index_create_case.column = (IndexElem){ .type = T_IndexElem,
+											.name = "id",
+											.ordering = SORTBY_DEFAULT,
+											.nulls_ordering = SORTBY_NULLS_DEFAULT };
+	one_element(&index_create_columns, &index_create_case.column_cell, &index_create_case.column);
+	index_create_case.statement = (IndexStmt){ .type = T_IndexStmt,
+											   .relation = &index_create_case.relation,
+											   .idxname = "native_created_index",
+											   .accessMethod = (shape & 1) ? "btree" : NULL,
+											   .indexParams = &index_create_columns,
+											   .unique = (shape & 1) != 0,
+											   .if_not_exists = (shape & 2) != 0,
+											   .transformed = true };
+	index_create_case.args = calls[form / 4];
+	index_create_expected_statement = (Node *)&index_create_case.statement;
+	snapshot_native_index_create();
+}
+
+static void
+native_index_create_entry(void)
+{
+	const IndexCreateArguments *args = &index_create_case.args;
+
+	index_create_lookup_active = true;
+	(void)native_preflight_DefineIndex(
+		args->relation_id, &index_create_case.statement, args->index_oid, args->parent_index_oid,
+		args->parent_constraint_oid, args->total_parts, args->is_alter_table, args->check_rights,
+		args->check_not_in_use, args->skip_build, args->quiet);
+}
+
+static void
+assert_native_index_create_unchanged(void)
+{
+	UT_ASSERT_EQ(memcmp(&index_create_case, &index_create_before, sizeof(index_create_case)), 0);
+	UT_ASSERT_EQ(memcmp(&index_create_columns, index_create_list_before, sizeof(List)), 0);
+}
+
+UT_TEST(test_native_index_create_binds_before_first_lock_in_all_profiles)
+{
+	for (unsigned form = 0; form < 32; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_index_create(binds, form);
+			set_native_operator_mode(mode);
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_index_create_entry();
+				assert_native_index_create_unchanged();
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(index_create_lookups, repeat + 1);
+				UT_ASSERT_EQ(index_create_unbound, 0);
+				UT_ASSERT_EQ(index_create_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	index_create_lookup_active = false;
+}
+
+UT_TEST(test_native_index_create_refuses_before_lock_on_publication_child_and_top_errors)
+{
+	for (unsigned form = 0; form < 32; form++) {
+		for (unsigned failure = 0; failure < 5; failure++) {
+			bool allocated = failure == 0 || failure == 2;
+			int caught;
+
+			reset_native_index_create(true, form);
+			if (failure == 0)
+				utility_bind_ok = false;
+			else if (failure == 1 || failure == 2) {
+				if (failure == 2)
+					create_sql_entry(index_create_expected_statement);
+				utility_in_child = true;
+			} else {
+				utility_current_xid = 401;
+				utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_index_create_entry();
+			assert_native_index_create_unchanged();
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, failure == 0  ? ERRCODE_DATA_CORRUPTED
+									 : failure < 3 ? ERRCODE_FEATURE_NOT_SUPPORTED
+												   : ERRCODE_INTERNAL_ERROR);
+			UT_ASSERT_STR_EQ(
+				error_message,
+				failure == 0  ? "canonical ACTIVE publication failed before shared catalog creation"
+				: failure < 3 ? "shared catalog creation does not support subtransactions"
+							  : "shared catalog top-level transaction identity mismatch");
+			UT_ASSERT_EQ(index_create_lookups, 0);
+			UT_ASSERT_EQ(index_create_unbound + index_create_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_xids, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, failure == 2 ? 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, allocated || failure == 3 ? 400 : InvalidTransactionId);
+		}
+	}
+	index_create_lookup_active = false;
+}
+
+UT_TEST(test_native_index_create_context_guards_keep_nonshared_route)
+{
+	for (unsigned form = 0; form < 32; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+
+			for (unsigned guard = 0; guard < 3; guard++) {
+				int caught;
+
+				reset_native_index_create(binds, form);
+				set_native_operator_mode(mode);
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_index_create_entry();
+				assert_native_index_create_unchanged();
+				UT_ASSERT_EQ(caught, binds ? 1 : 2);
+				UT_ASSERT_EQ(error_code, !binds		  ? 0
+										 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+													  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				UT_ASSERT_EQ(index_create_lookups, binds ? 0 : 1);
+				UT_ASSERT_EQ(index_create_unbound + index_create_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	index_create_lookup_active = false;
+}
+
+UT_TEST(test_native_index_create_utility_warm_guards_preserve_binding)
+{
+	for (unsigned form = 0; form < 32; form++) {
+		for (unsigned guard = 0; guard < 4; guard++) {
+			int caught;
+
+			reset_native_index_create(true, form);
+			create_sql_entry(index_create_expected_statement);
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			XactReadOnly = guard == 1;
+			utility_parallel = guard == 2;
+			utility_recovery = guard == 3;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_index_create_entry();
+			assert_native_index_create_unchanged();
+			UT_ASSERT_EQ(caught, guard ? 1 : 2);
+			UT_ASSERT_EQ(error_code, !guard		  ? 0
+									 : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+												  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT_EQ(index_create_lookups, guard ? 0 : 1);
+			UT_ASSERT_EQ(index_create_unbound + index_create_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_prepares, guard ? 1 : 2);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			UT_ASSERT_EQ(utility_top_xid, 400);
+		}
+	}
+	index_create_lookup_active = false;
+}
+
+static void
+set_unsupported_index_creation(unsigned kind)
+{
+	index_create_case.statement.accessMethod = kind == 1 ? "btree" : "hash";
+	index_create_case.statement.concurrent = kind != 0;
+	snapshot_native_index_create();
+}
+
+static void
+assert_denied_index_creation(unsigned kind, unsigned mode, int caught)
+{
+	static const bool refused[8] = { false, true, false, true, true, true, true, true };
+
+	UT_ASSERT_EQ(caught, refused[mode] ? 1 : 2);
+	UT_ASSERT_EQ(error_code, refused[mode] ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+	if (refused[mode]) {
+		UT_ASSERT_STR_EQ(
+			error_message,
+			kind == 1 ? "concurrent index creation or reindexing is not supported in shared mode"
+					  : "shared mode supports only btree indexes");
+		if (kind != 1)
+			UT_ASSERT_STR_EQ(error_detail,
+							 "Index access method \"hash\" is not supported in shared mode.");
+	}
+	UT_ASSERT_EQ(index_create_lookups, refused[mode] ? 0 : 1);
+	UT_ASSERT_EQ(index_create_unbound + index_create_bad_lookup, 0);
+	assert_native_index_create_unchanged();
+}
+
+UT_TEST(test_native_index_create_denials_precede_context_and_allocation)
+{
+	for (unsigned kind = 0; kind < 3; kind++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			for (unsigned bootstrap = 0; bootstrap < 2; bootstrap++) {
+				int caught;
+
+				reset_native_index_create(false, 0);
+				set_unsupported_index_creation(kind);
+				set_native_operator_mode(mode);
+				Mode = bootstrap ? BootstrapProcessing : NormalProcessing;
+				XactReadOnly = utility_parallel = utility_recovery = utility_in_child = true;
+				utility_bind_ok = false;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_index_create_entry();
+				assert_denied_index_creation(kind, mode, caught);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	Mode = NormalProcessing;
+	index_create_lookup_active = false;
+}
+
+UT_TEST(test_native_index_create_denials_preserve_existing_binding)
+{
+	for (unsigned kind = 0; kind < 3; kind++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			for (unsigned bootstrap = 0; bootstrap < 2; bootstrap++) {
+				int caught;
+
+				reset_native_index_create(false, 0);
+				create_sql_entry(index_create_expected_statement);
+				set_unsupported_index_creation(kind);
+				set_native_operator_mode(mode);
+				Mode = bootstrap ? BootstrapProcessing : NormalProcessing;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_index_create_entry();
+				assert_denied_index_creation(kind, mode, caught);
+				UT_ASSERT_EQ(utility_xids, 1);
+				UT_ASSERT_EQ(utility_prepares, 1);
+				UT_ASSERT_EQ(utility_binds, 1);
+				UT_ASSERT_EQ(utility_current_xid, 400);
+				UT_ASSERT_EQ(utility_top_xid, 400);
+			}
+		}
+	}
+	Mode = NormalProcessing;
+	index_create_lookup_active = false;
+}
+
+UT_TEST(test_native_index_create_bootstrap_keeps_original_transaction_responsibility)
+{
+	for (unsigned form = 0; form < 32; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			for (unsigned warm = 0; warm < 2; warm++) {
+				int caught;
+
+				reset_native_index_create(false, form);
+				if (warm)
+					create_sql_entry(index_create_expected_statement);
+				index_create_case.args.index_oid = 1001;
+				snapshot_native_index_create();
+				set_native_operator_mode(mode);
+				Mode = BootstrapProcessing;
+				XactReadOnly = utility_parallel = utility_recovery = utility_in_child = true;
+				utility_bind_ok = false;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_index_create_entry();
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(index_create_lookups, 1);
+				UT_ASSERT_EQ(index_create_unbound + index_create_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids, warm);
+				UT_ASSERT_EQ(utility_prepares, warm);
+				UT_ASSERT_EQ(utility_binds, warm);
+				UT_ASSERT_EQ(utility_top_xid, warm ? 400 : InvalidTransactionId);
+				assert_native_index_create_unchanged();
+			}
+		}
+	}
+	Mode = NormalProcessing;
+	index_create_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(374);
+	UT_PLAN(381);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -23751,6 +24151,13 @@ main(void)
 	UT_RUN(test_native_relation_create_denials_precede_context_and_allocation);
 	UT_RUN(test_native_relation_create_denials_preserve_existing_binding);
 	UT_RUN(test_native_relation_create_other_kinds_keep_caller_responsibility);
+	UT_RUN(test_native_index_create_binds_before_first_lock_in_all_profiles);
+	UT_RUN(test_native_index_create_refuses_before_lock_on_publication_child_and_top_errors);
+	UT_RUN(test_native_index_create_context_guards_keep_nonshared_route);
+	UT_RUN(test_native_index_create_utility_warm_guards_preserve_binding);
+	UT_RUN(test_native_index_create_denials_precede_context_and_allocation);
+	UT_RUN(test_native_index_create_denials_preserve_existing_binding);
+	UT_RUN(test_native_index_create_bootstrap_keeps_original_transaction_responsibility);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

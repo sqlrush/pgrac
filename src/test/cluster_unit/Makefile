@@ -886,6 +886,14 @@ test_cluster_fresh_boolean.inc: $(top_srcdir)/src/backend/commands/define.c Make
 	     /^errorConflictingDefElem\(/ { print "void"; emit=1; count++ } \
 	     emit { print } /^}/ { emit=0 } END { if (count != 2 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
+test_cluster_fresh_index_create.inc: $(top_srcdir)/src/backend/commands/indexcmds.c Makefile
+	awk '/^DefineIndex\(/ { print "ObjectAddress"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /root_save_nestlevel = NewGUCNestLevel\(\);/ \
+	     { print "return InvalidObjectAddress; }"; emit=0; cuts++ } \
+	     /^}/ { if (emit) bad++; emit=0 } \
+	     END { if (entries != 1 || cuts != 1 || emit || bad) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
 test_cluster_fresh_index.inc: $(top_srcdir)/src/backend/commands/indexcmds.c Makefile
 	awk '/^CheckClusterIndexAccessMethodName\(/ { print "static void"; emit=1 } \
 	     /^CheckClusterIndex(AccessMethod|Support)\(/ { print "void"; emit=1 } \
@@ -1578,7 +1586,7 @@ test_cluster_fresh_schema_dispatch.inc: $(top_srcdir)/src/backend/commands/alter
 	mv $@.tmp $@
 test_cluster_fresh_scope: test_cluster_fresh_scope.c unit_test.h \
 		test_cluster_fresh_control.inc test_cluster_fresh_startup.inc test_cluster_fresh_read.inc \
-		test_cluster_fresh_boolean.inc test_cluster_fresh_index.inc test_cluster_fresh_utility.inc \
+		test_cluster_fresh_boolean.inc test_cluster_fresh_index_create.inc test_cluster_fresh_index.inc test_cluster_fresh_utility.inc \
 		test_cluster_fresh_catalog_index.inc test_cluster_shared_utility.inc \
 		test_cluster_create_utility_entry.inc test_cluster_fresh_import.inc \
 		test_cluster_fresh_import_filter.inc test_cluster_fresh_extension.inc \
@@ -6895,7 +6903,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_space_xmax_hint.inc
 	rm -f test_cluster_page_dependency_base.o
 	rm -f test_cluster_fresh_control.inc test_cluster_fresh_startup.inc test_cluster_fresh_read.inc \
-		test_cluster_fresh_boolean.inc test_cluster_fresh_index.inc test_cluster_fresh_utility.inc \
+		test_cluster_fresh_boolean.inc test_cluster_fresh_index_create.inc test_cluster_fresh_index.inc test_cluster_fresh_utility.inc \
 		test_cluster_fresh_catalog_index.inc test_cluster_shared_utility.inc \
 		test_cluster_fresh_schema_create.inc test_cluster_fresh_schema.inc test_cluster_fresh_comment.inc test_cluster_fresh_seclabel.inc \
 		test_cluster_fresh_policy.inc test_cluster_fresh_conversion.inc test_cluster_fresh_collation.inc \
