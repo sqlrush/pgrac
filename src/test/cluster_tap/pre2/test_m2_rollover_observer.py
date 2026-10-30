@@ -237,6 +237,74 @@ class RolloverObservation(unittest.TestCase):
         self.assertFalse(any("->participant" in c or "->receipt" in c for c in commands))
         self.assertEqual(kwargs["timeout"], 5)
 
+    def test_controller_completion_during_first_point_prevents_second_attach(self):
+        self.mutate_after = lambda: (self.run / "controller-result.json").write_text("{}")
+        observer = self.observer()
+        observer.step()
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(observer.attachments, 1)
+
+    def test_deadline_during_first_point_prevents_second_attach(self):
+        observer = self.observer()
+        observer.deadline = 0.05
+        observer.step()
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(observer.attachments, 1)
+
+    def test_controller_completion_during_identity_check_prevents_charge(self):
+        (self.run / "m2-context-8.json").unlink()
+        observer = self.observer()
+        original_birth = observer._birth
+        checks = []
+
+        def birth(pid):
+            value = original_birth(pid)
+            checks.append(pid)
+            if len(checks) == 2:
+                (self.run / "controller-result.json").write_text("{}")
+            return value
+
+        observer._birth = birth
+        observer.step()
+        self.assertEqual(len(self.calls), 0)
+        self.assertEqual(observer.attachments, 0)
+        self.assertEqual(observer.records[0]["status"], "NOT_CAPTURED_STOP")
+        self.assertFalse(observer.records[0]["attach_attempted"])
+
+    def test_controller_completion_after_charge_prevents_launch(self):
+        (self.run / "m2-context-8.json").unlink()
+        observer = self.observer()
+        original_save = observer._save
+
+        def save(record):
+            original_save(record)
+            if record["status"] == "ATTACH_CHARGED_UNKNOWN":
+                (self.run / "controller-result.json").write_text("{}")
+
+        observer._save = save
+        observer.step()
+        self.assertEqual(len(self.calls), 0)
+        self.assertEqual(observer.attachments, 1)
+        self.assertEqual(observer.records[0]["status"], "NOT_CAPTURED_STOP")
+        self.assertFalse(observer.records[0]["attach_attempted"])
+
+    def test_deadline_after_charge_prevents_launch(self):
+        (self.run / "m2-context-8.json").unlink()
+        observer = self.observer()
+        original_save = observer._save
+
+        def save(record):
+            original_save(record)
+            if record["status"] == "ATTACH_CHARGED_UNKNOWN":
+                self.now = observer.deadline
+
+        observer._save = save
+        observer.step()
+        self.assertEqual(len(self.calls), 0)
+        self.assertEqual(observer.attachments, 1)
+        self.assertEqual(observer.records[0]["status"], "NOT_CAPTURED_STOP")
+        self.assertFalse(observer.records[0]["attach_attempted"])
+
 
 if __name__ == "__main__":
     unittest.main()

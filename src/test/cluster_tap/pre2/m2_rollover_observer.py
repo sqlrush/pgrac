@@ -159,6 +159,10 @@ class RolloverObserver:
         path = self.out / f"case-{record['case']}-point-{record['point']}.json"
         path.write_text(json.dumps(record, indent=2) + "\n")
 
+    def _stopped(self):
+        return (self.clock() >= self.deadline
+                or (self.run / "controller-result.json").exists())
+
     def _capture(self, number, target):
         target["points"] += 1
         point = target["points"]
@@ -187,6 +191,12 @@ class RolloverObserver:
             except (OSError, ValueError) as error:
                 record["error"] = str(error)
             else:
+                if self._stopped():
+                    record.update(status="NOT_CAPTURED_STOP",
+                                  observation_elapsed_seconds=self.clock() - started)
+                    target["next_due"] = self.clock() + GAP_SECONDS
+                    self._save(record)
+                    return
                 self.attachments += 1
                 command = self._command(context["producer_pid"])
                 record.update(status="ATTACH_CHARGED_UNKNOWN", attach_attempted=True,
@@ -195,6 +205,12 @@ class RolloverObserver:
                 environment = dict(os.environ)
                 environment.pop("LD_PRELOAD", None)
                 environment["LD_LIBRARY_PATH"] = str(self.base / "debug-tools/root/usr/lib/aarch64-linux-gnu")
+                if self._stopped():
+                    record.update(status="NOT_CAPTURED_STOP", attach_attempted=False,
+                                  observation_elapsed_seconds=self.clock() - started)
+                    target["next_due"] = self.clock() + GAP_SECONDS
+                    self._save(record)
+                    return
                 try:
                     result = self.runner(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                          stderr=subprocess.STDOUT, timeout=ATTACH_TIMEOUT, env=environment)
@@ -222,10 +238,12 @@ class RolloverObserver:
         self._save(record)
 
     def step(self):
-        if self.clock() >= self.deadline or (self.run / "controller-result.json").exists():
+        if self._stopped():
             return []
         before = len(self.records)
         for number in CASES:
+            if self._stopped():
+                break
             if number not in self.targets:
                 try:
                     context, digest = self._context(number)
