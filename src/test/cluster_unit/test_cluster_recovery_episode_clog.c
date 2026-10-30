@@ -14,6 +14,8 @@
 #include "test_cluster_recovery_episode_clog_namespace.h"
 int d3_episode_clog_main(void);
 #define TEST_CLUSTER_EPISODE_CLOG
+/* This bridge supplies the same original provider with a NULL-default route. */
+#define TEST_CLUSTER_SIDE_NATIVE_CLOG
 #include "test_cluster_clog_recovery.c"
 #include "test_cluster_recovery_episode_clog.h"
 
@@ -225,4 +227,46 @@ test_episode_native_clog_discard_resident(void)
 	UT_ASSERT(clog_relmap_mutation_snapshot(0, &after));
 	UT_ASSERT_EQ(before, after);
 	episode_clog_unlocked();
+}
+
+/* The opt-in route is scoped to one actual original FULL cold call. Original
+ * fixture authorization remains the NULL-default provider for every old case. */
+static const ClusterRecoveryRelmapSourceV1 *episode_full_source;
+
+bool
+cluster_undo_recovery_cold_origin_authorized_v1(int origin)
+{
+	return authority && (episode_full_source == NULL
+		? origin == fixture_origin
+			&& (fixture_cold_origin == NULL || fixture_cold_origin(origin))
+		: origin == episode_full_source->selected.source.claim.identity.origin_node_id
+			&& cluster_wal_inputs_relmap_source_current_v1(episode_full_source));
+}
+
+bool
+test_episode_native_clog_full_apply(const ClusterRecoveryRelmapSourceV1 *source,
+	const xl_clog_zeropage_full *birth)
+{
+	ClusterSideProjectionOperationV1 op;
+	bool prior_recovery = InRecovery;
+	volatile bool ok = false;
+
+	UT_ASSERT(episode_full_source == NULL);
+	if (source == NULL || birth == NULL
+		|| !cluster_wal_inputs_relmap_source_current_v1(source))
+		return false;
+	op = fixture_clog_record(false, birth->pageno);
+	op.normalized_info = CLOG_ZEROPAGE_FULL;
+	episode_full_source = source;
+	InRecovery = true;
+	PG_TRY(); {
+		ok = cluster_clog_native_recovery_full_record_apply_v1(
+			source->selected.source.claim.identity.origin_node_id, &op,
+			(const uint8 *)birth, sizeof(*birth));
+	} PG_FINALLY(); {
+		episode_full_source = NULL;
+		InRecovery = prior_recovery;
+	} PG_END_TRY();
+	episode_clog_unlocked();
+	return ok;
 }
