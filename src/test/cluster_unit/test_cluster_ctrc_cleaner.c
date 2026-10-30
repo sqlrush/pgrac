@@ -89,7 +89,9 @@ static void test_pool_upgrade(void);
 #undef fprintf
 #include "unit_test.h"
 
+#ifndef TEST_CLUSTER_STARTUP_CTRC
 UT_DEFINE_GLOBALS();
+#endif
 #include "cluster/cluster_undo_cleaner.h"
 
 /* The parent still executes its real shared body, returning no path rather
@@ -257,7 +259,7 @@ native_recovery_in_progress(void)
 {
 	return false;
 }
-static bool
+static bool pg_attribute_unused()
 native_lock_held_in_mode(LWLock *lock, LWLockMode mode)
 {
 	if (native_prepared_source_exit || native_reused_source_exit)
@@ -266,7 +268,7 @@ native_lock_held_in_mode(LWLock *lock, LWLockMode mode)
 				return true;
 	return native_lock_held && lock == native_held_lock && native_lock_mode == mode;
 }
-static bool
+static bool pg_attribute_unused()
 native_lock_is_held(LWLock *lock)
 {
 	return native_lock_held && lock == native_held_lock;
@@ -302,6 +304,8 @@ native_sample_future(FullTransactionId reference, FullTransactionId *future,
 #define pgstat_report_wait_end native_unexpected_wait_end
 #include "test_cluster_ctrc_native_group_exit.inc"
 #undef allProcs
+#pragma push_macro("MyBackendId")
+#undef MyBackendId
 #define MyBackendId native_backend_id
 #define IsPostmasterEnvironment native_postmaster_environment
 #define MyLockedGxact native_locked_gxact
@@ -315,6 +319,7 @@ native_sample_future(FullTransactionId reference, FullTransactionId *future,
 #undef MyLockedGxact
 #undef IsPostmasterEnvironment
 #undef MyBackendId
+#pragma pop_macro("MyBackendId")
 #undef pgstat_report_wait_end
 #undef pgstat_report_wait_start
 #undef PGSemaphoreUnlock
@@ -430,11 +435,14 @@ native_cleaner_admission_current(const ClusterSemanticActiveSampleFence *expecte
 #define cluster_undo_cleaner_active_sample_current native_cleaner_sample_current
 #define cluster_semantic_activation_active_sample_capture native_cleaner_admission_capture
 #define ProcArrayGetActiveFullXidSample native_procarray_sample
+#pragma push_macro("GetCurrentTimestamp")
+#undef GetCurrentTimestamp
 #define GetCurrentTimestamp native_status_time
 #define ConditionVariableBroadcast native_status_broadcast
 #include "test_cluster_ctrc_worker_sample.inc"
 #undef ConditionVariableBroadcast
 #undef GetCurrentTimestamp
+#pragma pop_macro("GetCurrentTimestamp")
 #undef ProcArrayGetActiveFullXidSample
 #undef cluster_semantic_activation_active_sample_capture
 #undef cluster_undo_cleaner_active_sample_current
@@ -451,8 +459,10 @@ static unsigned wake_count;
 static uint64 test_now_us = UINT64_C(1000000);
 static uint32 test_capability_generation = 19;
 static uint64 test_cluster_epoch = 13;
+#ifndef TEST_CLUSTER_STARTUP_CTRC
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
+#endif
 volatile sig_atomic_t InterruptPending;
 volatile uint32 InterruptHoldoffCount;
 static unsigned allocated;
@@ -4060,6 +4070,7 @@ driver_dispatch_boundary(const ClusterCtrcCloseDispatch *dispatches pg_attribute
 }
 
 bool ctrc_fixture_run_pass(void);
+#undef cluster_ctrc_cleaner_run_pass
 #define cluster_ctrc_cleaner_run_pass ctrc_fixture_run_pass
 #define ctrc_cleaner_clean_next_receipt driver_no_receipt
 #define ctrc_cleaner_publish_certificate driver_no_certificate

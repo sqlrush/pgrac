@@ -6823,6 +6823,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_clog_native_advance_next.inc test_cluster_clog_native_advance_next.inc.tmp
 	rm -f test_cluster_clog_native_horizon.inc test_cluster_clog_native_horizon.inc.tmp
 	rm -f test_cluster_recovery_episode_clog.o test_cluster_recovery_episode_side_owner.o test_cluster_recovery_consumed_inputs.o test_cluster_recovery_scope_native_census_product.o test_cluster_recovery_episode_allocator.o
+	rm -f test_cluster_startup_native_ctrc.o test_cluster_startup_native_ctrc_owner.inc test_cluster_startup_native_ctrc_owner.inc.tmp
 	rm -f test_cluster_side_native_clog.o
 	rm -f test_cluster_tx_exit_dispatch.inc test_cluster_tx_exit_dispatch.inc.tmp \
 		test_cluster_tx_exit_registration.inc test_cluster_tx_exit_registration.inc.tmp
@@ -13384,7 +13385,12 @@ test_cluster_cold_tx_start: test_cluster_cold_ctrc_replay_source.inc
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_replay_driver.inc
 test_cluster_cold_tx_start: $(top_srcdir)/src/include/cluster/cluster_recovery_census.h
 
-test_cluster_cold_tx_start: test_cluster_cold_tx_start.c test_cluster_cold_tx_owner.inc \
+ifeq ($(enable_pgrac_cluster),yes)
+STARTUP_NATIVE_CTRC_TEST_O = test_cluster_startup_native_ctrc.o
+STARTUP_NATIVE_CTRC_TEST_CPPFLAGS = -DTEST_CLUSTER_STARTUP_NATIVE_CTRC
+endif
+
+test_cluster_cold_tx_start: test_cluster_cold_tx_start.c test_cluster_cold_tx_owner.inc $(STARTUP_NATIVE_CTRC_TEST_O) \
 		test_cluster_cold_tx_claim_eor_boundary.inc test_cluster_cold_claim_service.inc \
 		test_cluster_cold_tx_finish_boundary.inc \
 		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h \
@@ -13405,9 +13411,10 @@ test_cluster_cold_tx_start: test_cluster_cold_tx_start.c test_cluster_cold_tx_ow
         $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c \
         $(top_srcdir)/src/backend/cluster/cluster_recovery_ctrc_record.c \
         $(top_srcdir)/src/include/cluster/cluster_recovery_ctrc_record.h $(CLUSTER_UNIT_CRYPTOHASH_O) Makefile
-	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(STARTUP_NATIVE_CTRC_TEST_CPPFLAGS) -ffunction-sections -fdata-sections $< \
         $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c \
         $(top_srcdir)/src/backend/cluster/cluster_recovery_ctrc_record.c \
+		$(STARTUP_NATIVE_CTRC_TEST_O) \
         $(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/common/libpgcommon_srv.a \
         $(CLUSTER_UNIT_PORT_LIBS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
         $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
@@ -14375,3 +14382,25 @@ test_cluster_clog_recovery test_cluster_clog_retention \
 
 
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_update_predecessors.inc
+
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_first_wal.inc
+
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_final_local_empty.inc
+
+# Original native local-directory fixture through the original Startup drain.
+test_cluster_startup_native_ctrc_owner.inc: test_cluster_ctrc_local_empty.c Makefile
+	awk '/^static LWLock \*empty_locks/ { emit=1; starts++ } \
+	     /^UT_TEST/ && emit { emit=0; stops++; exit } emit { print } \
+	     END { if (starts != 1 || stops != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_startup_native_ctrc.o: test_cluster_startup_native_ctrc.c \
+		test_cluster_startup_native_ctrc.h test_cluster_startup_native_ctrc_namespace.h \
+		test_cluster_startup_native_ctrc_owner.inc test_cluster_ctrc_cleaner.c \
+		test_cluster_pgproc_active_types.inc test_cluster_ctrc_native_exit.inc \
+		test_cluster_ctrc_native_group_exit.inc test_cluster_ctrc_native_prepare.inc \
+		test_cluster_ctrc_worker_sample.inc test_cluster_ctrc_read_scope.inc \
+		test_cluster_ctrc_run_pass.inc unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
+		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+test_cluster_cold_tx_start: test_cluster_startup_native_ctrc.h test_cluster_cold_ctrc_native_directory.inc
