@@ -22,6 +22,7 @@ static bool retention_truncation_held;
 static LWLockMode retention_xid_mode;
 static bool (*retention_terminal_match)(const ClusterRelmapOwnerSampleV2 *);
 static bool (*retention_clog_terminal_sync)(TransactionId, ClusterClogNativeTerminalV1 *);
+static bool (*retention_error_start)(int);
 #endif
 int xid_allocation_original_main(void);
 
@@ -158,6 +159,9 @@ bool
 errstart(int level, const char *domain)
 {
 	(void)domain;
+#ifdef TEST_CLUSTER_XID_RETENTION_NATIVE_CLOG
+	if (retention_error_start != NULL) return retention_error_start(level);
+#endif
 	if (!retention_error_expected || level < ERROR) abort();
 	return true;
 }
@@ -528,6 +532,7 @@ UT_TEST(retention_guard_valid_entry_observes_under_both_locks_and_returns_only_i
 #include "test_cluster_xid_retention_stage.inc"
 #include "test_cluster_xid_retention_pair.inc"
 #include "test_cluster_xid_retention_terminal.inc"
+#include "test_cluster_xid_retention_lifecycle.inc"
 #endif
 
 int
@@ -538,7 +543,9 @@ main(void)
 	bool stage_focus = getenv("PGRAC_RETENTION_NATIVE_STAGE_FOCUS") != NULL;
 	bool pair_focus = getenv("PGRAC_RETENTION_NATIVE_PAIR_FOCUS") != NULL;
 	bool terminal_focus = getenv("PGRAC_RETENTION_NATIVE_TERMINAL_FOCUS") != NULL;
-	UT_PLAN(terminal_focus ? 5 : pair_focus ? 10 : stage_focus ? 17 : focus ? 33 : 54);
+	bool lifecycle_focus = getenv("PGRAC_RETENTION_NATIVE_LIFECYCLE_FOCUS") != NULL;
+	UT_PLAN(lifecycle_focus ? 5 : terminal_focus ? 10 : pair_focus ? 15 : stage_focus ? 22 : focus ? 38 : 59);
+	if (!lifecycle_focus) {
 	if (!terminal_focus) {
 	if (!pair_focus) {
 	if (!stage_focus) {
@@ -606,6 +613,12 @@ main(void)
 	UT_RUN(retained_native_terminal_owner_change_after_sync_keeps_pairs);
 	UT_RUN(retained_native_terminal_bounds_refuse_before_clog_or_pair_io);
 
+	}
+	UT_RUN(retained_lifecycle_commit_retires_custody_after_ack_and_original_release);
+	UT_RUN(retained_lifecycle_abort_discards_before_original_release);
+	UT_RUN(retained_lifecycle_notification_failure_keeps_clean_pair_debt);
+	UT_RUN(retained_lifecycle_partial_native_or_pair_failure_stops_before_notifications);
+	UT_RUN(retained_lifecycle_release_failure_never_reenters_storage_or_s6);
 #endif
 	free(relmap_runtime_shmem);
 	UT_DONE();

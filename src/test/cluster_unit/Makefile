@@ -11609,12 +11609,31 @@ test_cluster_xid_retention_stage_product.inc: $(top_srcdir)/src/backend/utils/ca
 	     emit { print } /^}/ { emit=0 } END { if (functions != 17 || maps != 2 || states != 1 || state) exit 1 }' $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 
+# Complete original callbacks; keep this extraction separate from stage bodies.
+test_cluster_xid_retention_lifecycle_product.inc: $(top_srcdir)/src/backend/utils/cache/relmapper.c Makefile
+	awk '/^static RelMapFile (active|pending)_(shared|local)_updates;/ { print; states++ } \
+	     /^#define CLUSTER_RELMAP_PUBLISH_RETRIES / { print; retries++ } \
+	     /^(AtCCI_RelationMap|cluster_relmap_producer_(precommit|postcommit|abort)_v2)\(/ { print "void"; emit=1; functions++ } \
+	     /^relmap_producer_postcommit_current_v2\(/ { print "static bool"; emit=1; functions++ } \
+	     /^relmap_producer_(postcommit|abort)_failed_v2\(/ { print "static void pg_attribute_noreturn()"; emit=1; functions++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (states != 4 || retries != 1 || functions != 7) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_xid_retention_native_clog_main.o: $(XID_RETENTION_TEST_INPUTS) \
 		test_cluster_xid_retention_native_clog.inc test_cluster_xid_retention_native_xact.inc \
 		test_cluster_xid_retention_owner_capture.inc \
 		test_cluster_xid_retention_stage.inc test_cluster_xid_retention_stage_product.inc \
 		test_cluster_xid_retention_pair.inc test_cluster_relmap_physical_pair.h \
 		test_cluster_xid_retention_terminal.inc \
+		test_cluster_xid_retention_lifecycle.inc test_cluster_xid_retention_lifecycle_product.inc \
+		test_cluster_relmap_native_lock.h \
+		$(top_srcdir)/src/include/cluster/cluster_mode.h \
+		$(top_srcdir)/src/include/cluster/cluster_conf.h \
+		$(top_srcdir)/src/include/cluster/cluster_sinval.h \
+		$(top_srcdir)/src/include/cluster/cluster_lock_acquire.h \
+		$(top_srcdir)/src/include/storage/sinval.h \
+		$(top_srcdir)/src/include/utils/memutils.h \
 		$(top_srcdir)/src/include/utils/relmapper.h \
 		$(top_srcdir)/src/include/catalog/pg_tablespace_d.h \
 		$(top_srcdir)/src/include/catalog/storage.h \
@@ -11624,11 +11643,11 @@ test_cluster_xid_retention_native_clog_main.o: $(XID_RETENTION_TEST_INPUTS) \
 
 test_cluster_xid_retention_native_clog: test_cluster_xid_retention_native_clog_main.o \
 		test_cluster_xid_native_clog.o $(CLUSTER_XID_STRIPE_O) \
-		test_cluster_relmap_physical_pair.o \
+		test_cluster_relmap_physical_pair.o test_cluster_relmap_native_lock.o \
 		test_cluster_relmap_v2_codec_product.o $(top_builddir)/src/common/libpgcommon_srv.a
 	$(CC) $(CFLAGS) $(CPPFLAGS) test_cluster_xid_retention_native_clog_main.o \
 		test_cluster_xid_native_clog.o $(CLUSTER_XID_STRIPE_O) \
-		test_cluster_relmap_physical_pair.o \
+		test_cluster_relmap_physical_pair.o test_cluster_relmap_native_lock.o \
 		test_cluster_relmap_v2_codec_product.o $(top_builddir)/src/common/libpgcommon_srv.a \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
@@ -11637,7 +11656,8 @@ clean: clean-xid-native-clog
 clean-xid-native-clog:
 	rm -f test_cluster_xid_native_clog_main.o test_cluster_xid_native_clog.o \
 		test_cluster_xid_retention_native_clog_main.o \
-		test_cluster_xid_retention_stage_product.inc test_cluster_xid_retention_stage_product.inc.tmp
+		test_cluster_xid_retention_stage_product.inc test_cluster_xid_retention_stage_product.inc.tmp \
+		test_cluster_xid_retention_lifecycle_product.inc test_cluster_xid_retention_lifecycle_product.inc.tmp
 
 # Exercise the original recovery -> seed -> claim -> WAL gate. Dependency
 # boundaries are controlled by the test; the admission predicates are not.

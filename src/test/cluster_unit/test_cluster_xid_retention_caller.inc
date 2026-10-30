@@ -20,6 +20,7 @@ static unsigned caller_assignments, caller_owner_lock_errors;
 static FullTransactionId (*caller_top_reader)(void);
 static FullTransactionId (*caller_top_if_any_reader)(void);
 static bool (*caller_state_reader)(void);
+static bool (*caller_authority_reader)(void);
 static FullTransactionId (*caller_retained_reader)(uint64, uint64, uint16);
 static unsigned caller_writer_begins;
 
@@ -41,6 +42,7 @@ bool
 cluster_relmap_authority_x_held(void)
 {
 	caller_observation();
+	if (caller_authority_reader != NULL) return caller_authority_reader();
 	return caller_global_x;
 }
 
@@ -139,6 +141,7 @@ caller_fixture(uint64 first, unsigned origin)
 	caller_binding_drift = false;
 	caller_top_reader = caller_top_if_any_reader = NULL;
 	caller_state_reader = NULL;
+	caller_authority_reader = NULL;
 	caller_retained_reader = NULL;
 	caller_writer_begins = 0;
 	caller_assignments = caller_owner_lock_errors = 0;
