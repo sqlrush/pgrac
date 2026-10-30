@@ -2376,9 +2376,20 @@ static void startup_local_empty_reset(void);
 #endif
 
 #include "test_cluster_cold_ctrc_untouched_pages.inc"
+#include "test_cluster_cold_ctrc_post_service.inc"
 
 int main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_POST_SERVICE") != NULL) {
+		UT_PLAN(5);
+		UT_RUN(test_startup_post_service_rechecks_fpi_unchanged_and_zero_page);
+		UT_RUN(test_startup_post_service_same_fd_readback_drift_and_error_keep_debt);
+		UT_RUN(test_startup_post_service_rechecks_untouched_census_before_handoff);
+		UT_RUN(test_startup_post_service_first_directory_owner_and_cancel_keep_debt);
+		UT_RUN(test_startup_post_service_local_wait_reuses_exact_results_and_fds);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
+
 	if (getenv("PGRAC_PRE2_TEST_UNTOUCHED_PAGES") != NULL) {
 		UT_PLAN(4);
 		UT_RUN(test_startup_untouched_pages_complete_saved_set_including_zero_page_wal);
@@ -2692,14 +2703,19 @@ int main(void)
 		return ut_failed_count == 0 ? 0 : 1;
 	}
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
-	UT_PLAN(296);
+	UT_PLAN(301);
 	UT_RUN(test_startup_native_directory_empty_preserves_fpi_unchanged_and_zero_page);
 	UT_RUN(test_startup_native_directory_partial_lock_wait_repeats_same_fd_readback);
 	UT_RUN(test_startup_native_directory_real_origin_cannot_be_discharged_by_wait);
 	UT_RUN(test_startup_native_directory_invalid_layout_and_partial_error_keep_debt);
 #else
-	UT_PLAN(292);
+	UT_PLAN(297);
 #endif
+	UT_RUN(test_startup_post_service_rechecks_fpi_unchanged_and_zero_page);
+	UT_RUN(test_startup_post_service_same_fd_readback_drift_and_error_keep_debt);
+	UT_RUN(test_startup_post_service_rechecks_untouched_census_before_handoff);
+	UT_RUN(test_startup_post_service_first_directory_owner_and_cancel_keep_debt);
+	UT_RUN(test_startup_post_service_local_wait_reuses_exact_results_and_fds);
 	UT_RUN(test_startup_untouched_pages_complete_saved_set_including_zero_page_wal);
 	UT_RUN(test_startup_untouched_last_page_drift_or_absence_keeps_original_debt);
 	UT_RUN(test_startup_untouched_late_owner_loss_or_error_preserves_same_fd);

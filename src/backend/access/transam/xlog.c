@@ -8629,6 +8629,11 @@ StartupXLOG(void)
 	 * TX acceptance alone cannot transfer or destroy its private work. */
 	if (!cluster_recovery_ctrc_result_wait_v1(endOfRecoveryInfo->cluster_tx_start))
 		ereport(FATAL, (errmsg("could not complete original Startup CTRC result handoff")));
+	/* Independent service wait may yield after the earlier physical checks.
+	 * Reuse this episode's complete results/FDs before retiring any input. */
+	if (!ClusterColdRecoveryCtrcPageDrain(endOfRecoveryInfo->cluster_tx_start, 0))
+		ereport(FATAL, (errmsg("could not recheck original Startup CTRC PAGE graph after service"),
+			errdetail("%s", ClusterColdRecoveryCtrcObservationRefusal(endOfRecoveryInfo->cluster_tx_start))));
 	if (endOfRecoveryInfo->cluster_cold_inputs != NULL)
 	{
 		/* Full original file validation may yield; recheck the exact Start
