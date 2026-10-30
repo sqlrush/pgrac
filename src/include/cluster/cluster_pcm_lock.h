@@ -2059,6 +2059,17 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_s_source_service
 	const ClusterPageWalBindingV1 *page_wal, uint32 requester_connection_generation,
 	uint32 master_connection_generation, uint64 r4_record_generation,
 	uint32 authenticated_connection_generation);
+/* Same-source PI body replacement. Caller retains the immutable PAGE plan,
+ * source owners and exact native fence through the call. APPLIED moves native
+ * completion to original LMS work; caller cleanup cannot abort it. */
+#define CLUSTER_PCM_COVERED_PI_SOURCE_V1 1
+struct RfPageOnlinePlanV1;
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_s_source_covered_prepare_exact(
+	const ResourceXDecodedFrame *block, int32 authenticated_master_node, int32 buffer_id,
+	const struct ClusterPcmOwnSnapshot *prepared, const char page_bytes[BLCKSZ],
+	const ClusterPageWalBindingV1 *page_wal, uint32 requester_connection_generation,
+	uint32 master_connection_generation, uint64 r4_record_generation,
+	uint32 authenticated_connection_generation, const struct RfPageOnlinePlanV1 *coverage);
 /* Before native capture, retain the full authenticated FORWARD in the
  * original holder capacity. BUSY returns to its same background claim. */
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_s_source_forward_exact(

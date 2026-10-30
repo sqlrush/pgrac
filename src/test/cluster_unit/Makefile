@@ -5621,7 +5621,8 @@ test_cluster_pcm_settlement_ingress.inc: $(top_srcdir)/src/backend/cluster/clust
 	     END { if (count != 4 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_pcm_lock test_cluster_pcm_object_retire test_cluster_pcm_stop_cv test_cluster_pcm_read_grant test_cluster_resource_x_acquire_ingress test_cluster_resource_x_decision_send test_cluster_resource_x_decision_publish test_cluster_resource_x_holder_send test_cluster_resource_x_master_ack test_cluster_resource_x_master_done test_cluster_resource_x_master_consumed test_cluster_resource_x_master_quiet test_cluster_resource_x_master_unarmed test_cluster_resource_x_source_ack test_cluster_resource_x_s_source test_cluster_resource_x_source_done test_cluster_resource_x_clean_settlement test_cluster_resource_x_pi_carrier test_cluster_resource_x_x_source_carrier test_cluster_resource_x_pi_handoff test_cluster_resource_x_write_settlement: %: %.c test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
+RESOURCE_X_PCM_TEST_O = test_cluster_pcm_lock_clock_product.o
+test_cluster_pcm_lock test_cluster_pcm_object_retire test_cluster_pcm_stop_cv test_cluster_pcm_read_grant test_cluster_resource_x_acquire_ingress test_cluster_resource_x_decision_send test_cluster_resource_x_decision_publish test_cluster_resource_x_holder_send test_cluster_resource_x_master_ack test_cluster_resource_x_master_done test_cluster_resource_x_master_consumed test_cluster_resource_x_master_quiet test_cluster_resource_x_master_unarmed test_cluster_resource_x_source_ack test_cluster_resource_x_s_source test_cluster_resource_x_source_done test_cluster_resource_x_clean_settlement test_cluster_resource_x_pi_carrier test_cluster_resource_x_x_source_carrier test_cluster_resource_x_pi_handoff test_cluster_resource_x_write_settlement test_cluster_resource_x_pi_replace: %: %.c test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
 		test_cluster_pcm_master_durable.inc \
 		test_cluster_pcm_bootstrap_tick.inc \
 		test_cluster_pcm_settlement_ingress.inc \
@@ -5636,7 +5637,7 @@ test_cluster_pcm_lock test_cluster_pcm_object_retire test_cluster_pcm_stop_cv te
 		test_cluster_pcm_ready_scheduler.inc \
 		test_cluster_pcm_lms_intent_pump.inc \
 		test_cluster_pcm_lms_intent_wait.inc \
-		$(CLUSTER_VERSION_O) test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_VERSION_O) $(RESOURCE_X_PCM_TEST_O) $(CLUSTER_RESOURCE_X_IDENTITY_O) \
 		$(CLUSTER_RESOURCE_X_NODE_WIRE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
@@ -5644,7 +5645,7 @@ test_cluster_pcm_lock test_cluster_pcm_object_retire test_cluster_pcm_stop_cv te
 		$< \
 		test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
-		$(CLUSTER_VERSION_O) test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_VERSION_O) $(RESOURCE_X_PCM_TEST_O) $(CLUSTER_RESOURCE_X_IDENTITY_O) \
 		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
@@ -11141,3 +11142,27 @@ clean distclean maintainer-clean: clean-resource-x-write-settlement
 .PHONY: clean-resource-x-write-settlement
 clean-resource-x-write-settlement:
 	rm -f test_cluster_resource_x_write_settlement
+
+TESTS += test_cluster_resource_x_pi_replace
+all: test_cluster_resource_x_pi_replace
+test_cluster_resource_x_pi_replace: test_cluster_pi_replace_pcm.o test_cluster_resource_x_pi_fixture.inc \
+		test_cluster_resource_x_clean_fixture.inc test_cluster_resource_x_source_done_fixture.inc \
+		test_cluster_resource_x_source_ack_fixture.inc test_cluster_resource_x_master_done_ingress.inc \
+		test_cluster_resource_x_master_ack_fixture.inc test_cluster_resource_x_acquire_fixture.inc \
+		test_cluster_resource_x_acquire_candidate.inc test_cluster_resource_x_decision_owner_layout.inc \
+		cluster_unit_port_stubs.o cluster_catalog_trace_test.o $(CLUSTER_PAGE_ONLINE_PLAN_O)
+# This component executes the actual immutable PAGE plan together with PCM.
+test_cluster_resource_x_pi_replace: CLUSTER_VERSION_O += $(CLUSTER_PAGE_ONLINE_PLAN_O)
+test_cluster_resource_x_pi_replace: RESOURCE_X_PCM_TEST_O = test_cluster_pi_replace_pcm.o
+test_cluster_pi_replace_pcm.o: $(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c Makefile \
+		$(top_srcdir)/src/include/cluster/cluster_pcm_lock.h \
+		$(top_srcdir)/src/include/cluster/cluster_resource_x_node_wire.h \
+		$(top_srcdir)/src/include/cluster/cluster_page_online_plan.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
+		-Dclock_gettime=cluster_test_pcm_clock_gettime \
+		-Dcluster_page_wal_ref_retain_v1=replace_ref_retain \
+		-Dcluster_page_wal_ref_release_v1=replace_ref_release -c $< -o $@
+clean distclean maintainer-clean: clean-resource-x-pi-replace
+.PHONY: clean-resource-x-pi-replace
+clean-resource-x-pi-replace:
+	rm -f test_cluster_resource_x_pi_replace test_cluster_pi_replace_pcm.o

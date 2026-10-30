@@ -55,6 +55,7 @@
 #include "cluster/cluster_ko.h"
 #include "cluster/storage/cluster_smgr.h"
 #include "cluster/cluster_pcm_lock.h"
+#include "cluster/cluster_page_online_plan.h"
 #include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_qvotec.h"
@@ -25807,6 +25808,38 @@ pcm_resource_x_s_source_block_matches(const ClusterPcmResourceXMasterState *stat
 		&& left == sizeof(retained) && right == left && memcmp(retained, supplied, left) == 0;
 }
 
+static bool pcm_resource_x_read_source_block(const ResourceXDecodedFrame *request,
+	ResourceXDecodedFrame *block);
+
+/* Original full receipt and authority floor, independent of live buffers. */
+static bool
+pcm_resource_x_pi_prior_settlement_locked(struct GrdEntry *entry,
+	const ClusterPcmResourceXMasterState *state, const ResourceXDecodedFrame *next,
+	ResourceXDecodedFrame *prior)
+{
+	const ClusterPcmResourceXSettlementRetry *r = &state->settlement_retry;
+	ResourceXDecodedFrame receipt;
+	const ResourceXDecodedAcquireDecision *a;
+	const ResourceXDecodedAcquireDecision *b = &next->body.acquire_decision;
+
+	if (!pcm_resource_x_settlement_retry_decode_locked(entry, state, &receipt)
+		|| r->generation == 0 || r->pending || r->running || !receipt.has_acquire_decision
+		|| !pcm_resource_x_read_source_block(&receipt, prior))
+		return false;
+	a = &prior->body.acquire_decision;
+	return r->retired_authority == prior->common.authority_generation
+		&& r->retired_resource_binding == a->resource_binding
+		&& r->retired_formation == prior->common.resource_formation
+		&& r->retired_master_session == prior->common.master_session_incarnation
+		&& r->retired_master == a->master_node
+		&& a->master_node == b->master_node && a->resource_binding == b->resource_binding
+		&& a->source_node == cluster_node_id && b->source_node == cluster_node_id
+		&& a->holders[cluster_node_id].boot_incarnation == b->holders[cluster_node_id].boot_incarnation
+		&& prior->common.resource_formation == next->common.resource_formation
+		&& prior->common.master_session_incarnation == next->common.master_session_incarnation
+		&& prior->common.authority_generation < next->common.authority_generation;
+}
+
 /* Independent PI-reference decoder. It validates the unchanged original
  * body and native publication receipt, without treating a later descriptor
  * or the source-settlement ACK slot as that body's transport producer. */
@@ -25829,7 +25862,6 @@ pcm_resource_x_pi_carrier_decode_locked(const struct GrdEntry *entry,
 		|| carrier->reserved[0] != 0 || carrier->reserved[1] != 0
 		|| carrier->binding_generation != entry->binding_generation
 		|| carrier->pi_revision == UINT64_MAX
-		|| state->holder_status.valid != RESOURCE_X_HOLDER_PAIR_PUBLISHED
 		|| !pcm_resource_x_s_source_body_valid_inner(entry, state, &image)
 		|| image.common.semantic_crc32c != carrier->image_crc
 		|| (image.common.target_mode != PCM_STATE_S && image.common.target_mode != PCM_STATE_X)
@@ -25839,7 +25871,22 @@ pcm_resource_x_pi_carrier_decode_locked(const struct GrdEntry *entry,
 		|| (!carrier->transport_refs && state->holder_image_intent.state != RESOURCE_X_INTENT_SLOT_EMPTY))
 		return false;
 	expected = state->holder_acquire_s_native;
-	if (image.common.target_mode == PCM_STATE_X) {
+	if (state->holder_status.valid == RESOURCE_X_HOLDER_PAIR_PENDING) {
+		ResourceXDecodedFrame next = image, prior;
+		const ResourceXSourceDrainWork *work = &entry->resource_x_source_drain;
+
+		/* Covered body owns the exact pre-completion native reservation.
+		 * DATA may retire PI meanwhile, never this original LMS work. */
+		next.body.acquire_decision = image.body.acquire_image.source.decision;
+		if (!carrier->transport_refs || expected.flags != PCM_OWN_FLAG_REVOKING
+			|| work->r4_record_generation == 0 || work->r4_record_generation == UINT64_MAX
+			|| !pcm_resource_x_pi_prior_settlement_locked((struct GrdEntry *)entry, state, &next, &prior))
+			return false;
+		next.kind = RESOURCE_X_WIRE_BLOCK_TO_N; next.common = work->request;
+		if (!pcm_resource_x_s_source_block_matches(state, &next)) return false;
+	} else if (state->holder_status.valid != RESOURCE_X_HOLDER_PAIR_PUBLISHED) {
+		return false;
+	} else if (image.common.target_mode == PCM_STATE_X) {
 		/* Original S/X->N native handoff: the receipt, never a later
 		 * descriptor, records whether this exact fence is still owned. */
 		if ((carrier->completed.flags != 0 && carrier->completed.flags != PCM_OWN_FLAG_REVOKING)
@@ -26220,11 +26267,18 @@ pcm_resource_x_s_source_records(const ResourceXDecodedFrame *block, int32 master
 		&& image->payload_bytes == RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES;
 }
 
+typedef struct ClusterPcmPiReplacement {
+	ClusterPcmResourceXPiCarrier carrier; /* comparison only, owns no refs */
+	ClusterPcmLocalPiSnapshotV1 local;
+	ClusterPageWalRefV1 last; /* owned until moved atomically */
+} ClusterPcmPiReplacement;
+
 static ResourceXApplyResult
 pcm_resource_x_acquire_s_source_prepare_internal(const ResourceXDecodedFrame *block,
 	int32 master, int32 buffer_id, const ClusterPcmOwnSnapshot *prepared, const char page_bytes[BLCKSZ],
 	const ClusterPageWalBindingV1 *page_wal, uint32 requester_connection, uint32 master_connection,
-	uint64 r4_generation, uint32 authenticated_connection, const ResourceXSourceDrainWork *claim)
+	uint64 r4_generation, uint32 authenticated_connection, const ResourceXSourceDrainWork *claim,
+	ClusterPcmPiReplacement *replacement)
 {
 	ResourceXDecodedFrame canonical;
 	ClusterPcmResourceXHolderStatus status;
@@ -26234,6 +26288,7 @@ pcm_resource_x_acquire_s_source_prepare_internal(const ResourceXDecodedFrame *bl
 	PcmEntryAcquireResult acquired;
 	ResourceXApplyResult result;
 	ResourceXSourceDrainWork work = {0};
+	bool replace = false;
 
 	if (buffer_id < 0 || page_bytes == NULL || requester_connection == 0 || requester_connection == UINT32_MAX
 		|| master_connection == 0 || master_connection == UINT32_MAX
@@ -26261,7 +26316,30 @@ pcm_resource_x_acquire_s_source_prepare_internal(const ResourceXDecodedFrame *bl
 		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED; goto done;
 	}
 	if (state->pi_carrier.pi_refs && !pcm_resource_x_s_source_block_matches(state, &canonical)) {
-		result = RESOURCE_X_APPLY_LOCAL_WAIT; goto done;
+		ClusterPcmLocalPiSnapshotV1 local;
+		ResourceXDecodedFrame prior;
+
+		if (replacement == NULL || r4_generation == 0 || claim != NULL
+			|| state->pi_carrier.transport_refs || state->pi_carrier.completed.flags != 0
+			|| state->pi_carrier.pi_revision >= UINT64_MAX - 1
+			|| state->holder_status.valid != RESOURCE_X_HOLDER_PAIR_PUBLISHED
+			|| state->holder_status_intent.slot.state != RESOURCE_X_INTENT_SLOT_EMPTY
+			|| state->holder_image_intent.state != RESOURCE_X_INTENT_SLOT_EMPTY
+			|| state->holder_pi_first.source_flags != 0
+			|| ref.entry->resource_x_source_drain.r4_record_generation != 0
+			|| memcmp(&state->pi_carrier, &replacement->carrier, sizeof(state->pi_carrier)) != 0
+			|| !pcm_local_pi_snapshot_locked(ref.entry, &local)
+			|| memcmp(&local, &replacement->local, sizeof(local)) != 0
+			|| !pcm_resource_x_s_source_pair_valid(ref.entry, state)
+			|| !pcm_resource_x_pi_prior_settlement_locked(ref.entry, state, &canonical, &prior)
+			|| !pcm_resource_x_s_source_block_matches(state, &prior)
+			|| (buffer_id == state->holder_acquire_s_buffer_id
+				&& (prepared->generation < state->pi_carrier.completed.generation
+					|| (state->pi_carrier.completed.pcm_state == PCM_STATE_N
+						&& prepared->generation == state->pi_carrier.completed.generation)))) {
+			result = RESOURCE_X_APPLY_LOCAL_WAIT; goto done;
+		}
+		replace = true;
 	}
 	if (claim != NULL && memcmp(claim, &ref.entry->resource_x_source_drain, sizeof(*claim)) != 0) {
 		result = RESOURCE_X_APPLY_STALE; goto done;
@@ -26288,7 +26366,7 @@ pcm_resource_x_acquire_s_source_prepare_internal(const ResourceXDecodedFrame *bl
 			? 0 : canonical.common.sender_connection_generation;
 		result = RESOURCE_X_APPLY_APPLIED; goto done;
 	}
-	if (!pcm_resource_x_s_source_empty(state)) {
+	if (!replace && !pcm_resource_x_s_source_empty(state)) {
 		if (!pcm_resource_x_s_source_pair_valid(ref.entry, state)) {
 			result = RESOURCE_X_APPLY_RECOVERY_BLOCKED; goto done;
 		}
@@ -26313,10 +26391,10 @@ pcm_resource_x_acquire_s_source_prepare_internal(const ResourceXDecodedFrame *bl
 		}
 		goto done;
 	}
-	if (claim != NULL || state->holder_status.valid != 0 || state->holder_image.valid != 0
+	if (!replace && (claim != NULL || state->holder_status.valid != 0 || state->holder_image.valid != 0
 		|| state->holder_status_intent.slot.state != RESOURCE_X_INTENT_SLOT_EMPTY
 		|| state->holder_image_intent.state != RESOURCE_X_INTENT_SLOT_EMPTY
-		|| state->holder_pi_first.source_flags != 0) {
+		|| state->holder_pi_first.source_flags != 0)) {
 		result = RESOURCE_X_APPLY_BAD_STATE; goto done;
 	}
 	if (r4_generation != 0) {
@@ -26352,6 +26430,25 @@ pcm_resource_x_acquire_s_source_prepare_internal(const ResourceXDecodedFrame *bl
 	/* Both original records and the exact local native reservation become
 	 * visible atomically before the caller may finish physical S->N. No
 	 * transport can observe a half pair. Cancel/exit cannot roll this back. */
+	if (replace) {
+		ResourceXDecodedFrame decoded;
+		ResourceXWireReject reject;
+
+		if (!cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, image.payload,
+			image.payload_bytes, &decoded, &reject)) {
+			result = RESOURCE_X_APPLY_RECOVERY_BLOCKED; goto done;
+		}
+		/* Full PAGE coverage and the same immutable WAL source preserve
+		 * earliest first and the separate local scope. Only last moves. */
+		if (!cluster_page_wal_ref_release_v1(&state->pi_carrier.last))
+			elog(PANIC, "PI replacement lost its original last reference");
+		state->pi_carrier.last = replacement->last;
+		memset(&replacement->last, 0, sizeof(replacement->last));
+		state->pi_carrier.completed = *prepared;
+		state->pi_carrier.pi_revision++;
+		state->pi_carrier.image_crc = decoded.common.semantic_crc32c;
+		state->pi_carrier.transport_refs = 1;
+	}
 	state->holder_status = status;
 	state->holder_image = image;
 	state->holder_acquire_s_native = *prepared;
@@ -26376,7 +26473,7 @@ cluster_pcm_lock_resource_x_acquire_s_source_prepare_exact(const ResourceXDecode
 	const ClusterPageWalBindingV1 *page_wal, uint32 requester_connection, uint32 master_connection)
 {
 	return pcm_resource_x_acquire_s_source_prepare_internal(block, master, buffer_id, prepared,
-		page_bytes, page_wal, requester_connection, master_connection, 0, 0, NULL);
+		page_bytes, page_wal, requester_connection, master_connection, 0, 0, NULL, NULL);
 }
 
 ResourceXApplyResult
@@ -26392,7 +26489,66 @@ cluster_pcm_lock_resource_x_acquire_s_source_service_prepare_exact(const Resourc
 	 * no-abort handoff before waking LMS; the original pending generation
 	 * also makes this discoverable by the normal idle scan. */
 	return pcm_resource_x_acquire_s_source_prepare_internal(block, master, buffer_id, prepared,
-		page_bytes, page_wal, requester_connection, master_connection, r4_generation, authenticated_connection, NULL);
+		page_bytes, page_wal, requester_connection, master_connection, r4_generation, authenticated_connection, NULL, NULL);
+}
+
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_acquire_s_source_covered_prepare_exact(const ResourceXDecodedFrame *block,
+	int32 master, int32 buffer_id, const ClusterPcmOwnSnapshot *prepared, const char page_bytes[BLCKSZ],
+	const ClusterPageWalBindingV1 *page_wal, uint32 requester_connection, uint32 master_connection,
+	uint64 r4_generation, uint32 authenticated_connection, const RfPageOnlinePlanV1 *coverage)
+{
+	ClusterPcmPiReplacement *replacement;
+	ClusterPcmLocalPiSnapshotV1 scope;
+	ResourceXDecodedFrame canonical;
+	ClusterPageWalBindingV1 wal;
+	PGAlignedBlock page;
+	ResourceXApplyResult result = RESOURCE_X_APPLY_LOCAL_WAIT;
+
+	if (page_bytes == NULL || page_wal == NULL || coverage == NULL
+		|| r4_generation == 0 || r4_generation == UINT64_MAX
+		|| authenticated_connection == 0 || authenticated_connection == UINT32_MAX
+		|| !pcm_resource_x_s_source_block_valid(block, master, &canonical))
+		return RESOURCE_X_APPLY_INVALID;
+	/* Bind queried bytes to the new immutable body. Caller retains the plan,
+	 * source owners and exact native reservation continuously. */
+	memcpy(page.data, page_bytes, BLCKSZ); wal = *page_wal;
+	/* Heap-local ownership stays defined across ERROR/cancel longjmp. No
+	 * shared capacity or old reference moves until the original handoff. */
+	replacement = palloc(sizeof(*replacement));
+	memset(replacement, 0, sizeof(*replacement));
+	PG_TRY();
+	{
+		if (!pcm_resource_x_pi_carrier_observe(canonical.common.logical_assertion.resource,
+			&replacement->carrier, &scope)
+			|| !cluster_pcm_local_pi_snapshot_v1(canonical.common.logical_assertion.resource, &replacement->local))
+			result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		else {
+			const ClusterPcmLocalPiSnapshotV1 *local = &replacement->local;
+			bool needs_proof = replacement->carrier.pi_refs && !replacement->carrier.transport_refs;
+
+			/* Two endpoints cannot discard a different immutable WAL source. */
+			if (!needs_proof || (pcm_local_pi_source_equal(&scope.first.source, &wal.source)
+				&& pcm_local_pi_source_equal(&scope.last.source, &wal.source)
+				&& rf_page_online_plan_image_covers_v1(coverage, &wal, page.data, &scope.first, &scope.last)
+				&& (local->first.record_start == 0
+					|| (pcm_local_pi_source_equal(&local->first.source, &wal.source)
+						&& pcm_local_pi_source_equal(&local->last.source, &wal.source)
+						&& rf_page_online_plan_image_covers_v1(coverage, &wal, page.data, &local->first, &local->last)))
+				&& cluster_page_wal_ref_retain_v1(&wal, &replacement->last)))
+				result = pcm_resource_x_acquire_s_source_prepare_internal(&canonical, master, buffer_id, prepared,
+					page.data, &wal, requester_connection, master_connection, r4_generation, authenticated_connection,
+					NULL, needs_proof ? replacement : NULL);
+		}
+	}
+	PG_FINALLY();
+	{
+		if (replacement->last.source_flags != 0 && !cluster_page_wal_ref_release_v1(&replacement->last))
+			elog(PANIC, "PI replacement lost its unused last reference");
+		pfree(replacement);
+	}
+	PG_END_TRY();
+	return result;
 }
 
 ResourceXApplyResult
@@ -26409,7 +26565,7 @@ cluster_pcm_lock_resource_x_acquire_s_source_capture_exact(const ResourceXSource
 	if (result != RESOURCE_X_APPLY_APPLIED) return result;
 	return pcm_resource_x_acquire_s_source_prepare_internal(&block, work->master_node, buffer_id,
 		prepared, page_bytes, page_wal, requester_connection, master_connection,
-		work->r4_record_generation, work->authenticated_connection_generation, work);
+		work->r4_record_generation, work->authenticated_connection_generation, work, NULL);
 }
 
 
@@ -26496,6 +26652,7 @@ cluster_pcm_lock_resource_x_acquire_s_source_publish_exact(const ResourceXDecode
 	PcmEntryRef ref;
 	PcmEntryAcquireResult acquired;
 	ResourceXApplyResult result;
+	bool reuse_carrier;
 
 	if (buffer_id < 0 || finished == NULL || !pcm_resource_x_s_source_block_valid(block, master, &canonical)
 		|| !pcm_resource_x_s_source_native_valid(prepared, &canonical.common.logical_assertion.resource))
@@ -26542,10 +26699,18 @@ cluster_pcm_lock_resource_x_acquire_s_source_publish_exact(const ResourceXDecode
 	if (state->holder_status.valid == RESOURCE_X_HOLDER_PAIR_PUBLISHED) {
 		result = RESOURCE_X_APPLY_DUPLICATE; goto done;
 	}
-	result = pcm_resource_x_pi_carrier_prepare_locked(ref.entry, state, finished, &carrier);
-	if (result != RESOURCE_X_APPLY_APPLIED) goto done;
+	reuse_carrier = state->pi_carrier.transport_refs != 0;
+	if (reuse_carrier) {
+		/* Pending covered body already owns both refs. Failed rearm must
+		 * never release comparison copies of these live references. */
+		carrier = state->pi_carrier;
+		carrier.completed = *finished;
+	} else {
+		result = pcm_resource_x_pi_carrier_prepare_locked(ref.entry, state, finished, &carrier);
+		if (result != RESOURCE_X_APPLY_APPLIED) goto done;
+	}
 	if (!pcm_resource_x_rearm_holder_source_locked(state, &state->holder_status, &state->holder_image)) {
-		if (carrier.pi_refs) {
+		if (!reuse_carrier && carrier.pi_refs) {
 			if (!cluster_page_wal_ref_release_v1(&carrier.first)
 				|| !cluster_page_wal_ref_release_v1(&carrier.last))
 				elog(PANIC, "PI carrier lost its unpublished WAL references");
