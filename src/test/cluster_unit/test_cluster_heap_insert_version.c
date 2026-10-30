@@ -13,6 +13,16 @@
  */
 #include "postgres.h"
 
+#ifdef FIXTURE_NO_ASSERTS
+#undef USE_ASSERT_CHECKING
+#undef Assert
+#define Assert(condition) ((void)0)
+#undef AssertMacro
+#define AssertMacro(condition) ((void)0)
+#undef PG_USED_FOR_ASSERTS_ONLY
+#define PG_USED_FOR_ASSERTS_ONLY
+#endif
+
 #include "access/heapam.h"
 #include "access/hio.h"
 #include "access/heapam_xlog.h"
@@ -23,6 +33,7 @@
 #include "catalog/catalog.h"
 #include "catalog/pg_class.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_itl.h"
 #include "cluster/cluster_page_producer.h"
 #include "cluster/cluster_pcm_lock.h"
@@ -45,12 +56,18 @@ UT_DEFINE_GLOBALS();
 /* The actual AF decision now owns an exception-safe local read bracket.
  * This publication fixture has no injected decoder ERROR; never fabricate a
  * successful exception return. The dedicated local-read fixture exercises it. */
+static bool multi_loop_active;
+static sigjmp_buf multi_jump;
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
 
 void
 pg_re_throw(void)
 {
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
+	if (multi_loop_active)
+		siglongjmp(multi_jump, 1);
 	abort();
 }
 
@@ -111,7 +128,7 @@ static int vm_refresh_invalid;
 
 /* Native-batch selection/transport scheduling only. The full original loop,
  * tuple mutation, VM clear and version/WAL producer execute below. */
-static bool multi_loop_active, multi_heap_locked, multi_vm_locked;
+static bool multi_heap_locked, multi_vm_locked;
 static bool multi_vm_pins[4];
 static int multi_refusals, multi_replacements, multi_change, multi_fault;
 static int multi_selector_calls, multi_aux_calls, multi_plain_waits, multi_releases;
@@ -119,7 +136,8 @@ static int multi_context_starts, multi_target_page, multi_completed_pages;
 static int multi_refusal_page;
 static int multi_target_requests[16];
 static uint64 multi_r4 = 7;
-static sigjmp_buf multi_jump;
+static bool multi_forbid_nested, multi_missing_writer, multi_same_vm;
+static unsigned multi_captures, multi_resumes, multi_resume_refusals, multi_writer_error;
 volatile sig_atomic_t InterruptPending;
 
 static bool multi_actual_vm_clear(Relation rel, BlockNumber heapblock, Buffer vmbuffer,
@@ -191,7 +209,7 @@ RelationGetBufferForTuple(Relation rel, Size len, Buffer *other, int options,
 	if (multi_fault == 2 && multi_selector_calls > 1)
 		elog(ERROR, "controlled multi-insert target selection error");
 	heap = multi_target_page == 0 ? 1 : 3;
-	map = heap + 1;
+	map = multi_same_vm ? 2 : heap + 1;
 	if (BufferIsValid(*vm) && *vm != map) {
 		ReleaseBuffer(*vm);
 		*vm = InvalidBuffer;
@@ -251,7 +269,9 @@ ClusterLockBufferExclusiveAuxiliaryAliasAware(Buffer *buffer, Buffer *alias,
 	if (multi_loop_active && cluster_shared_config) {
 		BufferTag target;
 
-		UT_ASSERT(multi_heap_locked && !multi_vm_locked && multi_vm_pins[*buffer - 1]);
+		if (multi_forbid_nested && multi_heap_locked)
+			elog(ERROR, "ordinary VM-X acquisition below heap content lock");
+		UT_ASSERT(!multi_vm_locked && multi_vm_pins[*buffer - 1]);
 		InitBufferTag(&target, &tags[*buffer - 1], forks[*buffer - 1], blocks[*buffer - 1]);
 		multi_aux_calls++;
 		multi_assert_unpublished();
@@ -292,6 +312,45 @@ ClusterLockBufferExclusiveAuxiliaryAliasAware(Buffer *buffer, Buffer *alias,
 	}
 	LockBuffer(*buffer, BUFFER_LOCK_EXCLUSIVE);
 	memset(context, 0, sizeof(*context));
+	return true;
+}
+
+bool
+ClusterBufferCaptureMutationContext(Buffer buffer, ResourceXWriterUseContext *out,
+									uint64 *revision, bool *checked)
+{
+	UT_ASSERT(multi_loop_active && !multi_heap_locked && multi_vm_locked);
+	UT_ASSERT(multi_vm_pins[buffer - 1] && CritSectionCount == 0);
+	multi_captures++;
+	if (multi_writer_error == 1)
+		elog(ERROR, "controlled original VM writer capture error");
+	if (multi_missing_writer)
+		return false;
+	memset(out, 0, sizeof(*out));
+	out->writer_activation_token = 80 + buffer;
+	out->r4_record_generation = multi_r4;
+	*revision = 33;
+	*checked = true;
+	return true;
+}
+
+bool
+ClusterConditionalLockBufferWithMutationContext(Buffer buffer,
+		const ResourceXWriterUseContext *expected, uint64 revision, bool checked)
+{
+	UT_ASSERT(multi_loop_active && multi_heap_locked && !multi_vm_locked);
+	UT_ASSERT(multi_vm_pins[buffer - 1] && CritSectionCount == 0);
+	multi_resumes++;
+	if (multi_writer_error == 2)
+		elog(ERROR, "controlled original VM writer resume error");
+	if (multi_resume_refusals != 0) {
+		multi_resume_refusals--;
+		return false;
+	}
+	if (expected->writer_activation_token != (uint64)(80 + buffer)
+		|| expected->r4_record_generation != multi_r4 || revision != 33 || !checked)
+		return false;
+	multi_vm_locked = true;
 	return true;
 }
 
@@ -512,6 +571,7 @@ visibilitymap_get_status(Relation rel, BlockNumber heapblock, Buffer *buffer)
 #include "test_cluster_heap_multi_clear.inc"
 #undef visibilitymap_clear_locked
 #include "test_cluster_heap_multi_helpers.inc"
+#include "test_cluster_heap_insert_vm_authority.inc"
 
 void
 cluster_pcm_vm_metric_note(const BufferTag *tag, PcmVmMetric metric)
@@ -654,7 +714,7 @@ errstart(int elevel, const char *domain)
 	if (elevel == DEBUG1)
 		return false;
 	if (multi_loop_active && elevel >= ERROR)
-		siglongjmp(multi_jump, 1);
+		return true;
 	printf("# Unexpected error level %d\n", elevel);
 	abort();
 }
@@ -663,21 +723,21 @@ int
 errmsg_internal(const char *fmt, ...)
 {
 	(void)fmt;
-	abort();
+	return 0;
 }
 
 int
 errmsg(const char *fmt, ...)
 {
 	(void)fmt;
-	abort();
+	return 0;
 }
 
 int
 errcode(int code)
 {
 	(void)code;
-	abort();
+	return 0;
 }
 
 void
@@ -686,6 +746,10 @@ errfinish(const char *file, int line, const char *func)
 	(void)file;
 	(void)line;
 	(void)func;
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
+	if (multi_loop_active)
+		siglongjmp(multi_jump, 1);
 	abort();
 }
 
@@ -765,6 +829,8 @@ reset(bool versioned, bool vm, bool bit_set)
 	multi_context_starts = multi_target_page = multi_completed_pages = 0;
 	memset(multi_target_requests, 0, sizeof(multi_target_requests));
 	multi_r4 = 7;
+	multi_forbid_nested = multi_missing_writer = multi_same_vm = false;
+	multi_captures = multi_resumes = multi_resume_refusals = multi_writer_error = 0;
 	InterruptPending = false;
 	memset(pages, 0, sizeof(pages));
 	memset(images, 0, sizeof(images));
@@ -1898,6 +1964,9 @@ execute_multi_loop(int count, bool versioned, bool frozen)
 	ClusterSpaceIdentity cluster_page_identity = identity;
 	RfPageProducerBatchV1 cluster_page_versions = { 0 };
 	ResourceXAuxiliaryAcquireContext cluster_vm_context pg_attribute_unused() = { 0 };
+#ifdef FIXTURE_HAS_INSERT_VM_STATE
+	ClusterHeapVmInsertState cluster_vm_state = { 0 };
+#endif
 
 #include "test_cluster_heap_multi_loop.inc"
 	multi_done = ndone;
@@ -1925,10 +1994,10 @@ UT_TEST(test_multi_vm_refusal_reselects_before_any_batch_publication)
 			multi_replacements = replace ? refusal : 0;
 			UT_ASSERT(try_multi_loop(1, true, false));
 			UT_ASSERT_EQ(multi_plain_waits, 0);
-			UT_ASSERT_EQ(multi_selector_calls, refusal + 1);
+			UT_ASSERT_EQ(multi_selector_calls, refusal + 2);
 			UT_ASSERT_EQ(multi_aux_calls, refusal + 1);
 			UT_ASSERT_EQ(multi_context_starts, 1);
-			UT_ASSERT_EQ(multi_releases, refusal + 1);
+			UT_ASSERT_EQ(multi_releases, refusal + 2);
 			UT_ASSERT_EQ(multi_done, 1);
 			UT_ASSERT_EQ(inserts, 1);
 			UT_ASSERT_EQ(vm_clears, 1);
@@ -1960,7 +2029,7 @@ UT_TEST(test_multi_vm_retarget_preserves_or_rejects_original_context)
 		multi_refusals = multi_replacements = 1;
 		multi_change = change;
 		UT_ASSERT(try_multi_loop(1, true, false) == (change == 2));
-		UT_ASSERT_EQ(multi_selector_calls, 2);
+		UT_ASSERT_EQ(multi_selector_calls, change == 2 ? 3 : 2);
 		UT_ASSERT_EQ(multi_plain_waits, 0);
 		UT_ASSERT_EQ(multi_aux_calls, 2);
 		UT_ASSERT_EQ(multi_context_starts, change == 2 ? 2 : 1);
@@ -1991,10 +2060,10 @@ UT_TEST(test_multi_vm_retries_do_not_advance_page_accounting)
 		UT_ASSERT_EQ(multi_plain_waits, 0);
 		UT_ASSERT_EQ(multi_done, 2);
 		UT_ASSERT_EQ(multi_pages_used, 1);
-		UT_ASSERT_EQ(multi_selector_calls, 2 + refusal);
+		UT_ASSERT_EQ(multi_selector_calls, 4 + refusal);
 		UT_ASSERT_EQ(multi_target_requests[0], 2);
 		for (int attempt = 1; attempt < multi_selector_calls; attempt++)
-			UT_ASSERT_EQ(multi_target_requests[attempt], 1);
+			UT_ASSERT_EQ(multi_target_requests[attempt], attempt == 1 ? 2 : 1);
 		UT_ASSERT_EQ(inserts, 2);
 		UT_ASSERT_EQ(vm_clears, 2);
 		UT_ASSERT_EQ(PageGetMaxOffsetNumber(pages[0].data), 1);

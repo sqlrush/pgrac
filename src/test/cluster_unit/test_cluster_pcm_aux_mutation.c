@@ -12,6 +12,7 @@
 #include "catalog/pg_class.h"
 #include "cluster/cluster_content_trace.h"
 #include "cluster/cluster_pcm_lock.h"
+#include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/storage/cluster_smgr.h"
 #include "fmgr.h"
@@ -630,6 +631,13 @@ insert_aux_lock(Buffer *buffer, Buffer *alias, const ClusterBufferBarrierSiteId 
 #undef LockBuffer
 #define LockBuffer insert_raw_lock
 #define ClusterLockBufferExclusiveAuxiliaryAliasAware insert_aux_lock
+/* This original fixture is strictly nonshared. Execute the real native
+ * branch; any accidental entry into shared writer services must stop. */
+#define ClusterBufferCaptureMutationContext(...) (abort(), false)
+#define ClusterConditionalLockBufferWithMutationContext(...) (abort(), false)
+#include "test_cluster_heap_insert_vm_authority.inc"
+#undef ClusterBufferCaptureMutationContext
+#undef ClusterConditionalLockBufferWithMutationContext
 /* Retarget safety is executed with the real owner/prepare in aux_reobserve.
  * This fixture keeps one logical VM page while its physical slot changes. */
 #define cluster_heap_vm_retarget_after_repick(buffer, context) ((void)(buffer), (void)(context))
@@ -639,6 +647,8 @@ run_insert_vm_bracket(void)
 	Buffer buffer = 3, vmbuffer = 1;
 	bool vm_locked = false;
 	ResourceXAuxiliaryAcquireContext cluster_vm_context = { 0 };
+	const bool cluster_page_versioned = false;
+	ClusterHeapVmInsertState cluster_vm_state = { 0 };
 
 cluster_heap_insert_retry:
 	if (insert_entries++ != 0) {
