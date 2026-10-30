@@ -2468,9 +2468,20 @@ static void startup_local_empty_reset(void);
 #include "test_cluster_cold_ctrc_raw_records.inc"
 
 #include "test_cluster_cold_ctrc_owner_round.inc"
+#include "test_cluster_cold_ctrc_owner_continuation.inc"
 
 int main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_OWNER_CONTINUATION") != NULL) {
+		UT_PLAN(6);
+		UT_RUN(test_startup_owner_continuation_stable_directory_and_h_wait_keep_same_operations);
+		UT_RUN(test_startup_owner_continuation_directory_wait_cannot_replace_original_sample);
+		UT_RUN(test_startup_owner_continuation_h_wait_cannot_replace_original_sample);
+		UT_RUN(test_startup_owner_continuation_last_directory_callback_cannot_change_sample);
+		UT_RUN(test_startup_owner_continuation_last_h_sample_cannot_change_sample);
+		UT_RUN(test_startup_owner_continuation_directory_and_h_errors_keep_original_custody);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_OWNER_ROUND") != NULL) {
 		UT_PLAN(7);
 	UT_RUN(test_startup_owner_round_keeps_complete_fpi_and_unchanged_set);
@@ -2942,7 +2953,7 @@ int main(void)
 	}
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_FIRST
-	UT_PLAN(371);
+	UT_PLAN(377);
 	UT_RUN(test_start_raw_records_keep_complete_original_bytes_and_empty_end);
 	UT_RUN(test_start_raw_records_refuse_incomplete_changed_bytes_hash_header_and_end);
 
@@ -2952,7 +2963,7 @@ int main(void)
 	UT_RUN(test_start_compound_groups_retain_complete_member_input_and_end);
 	UT_RUN(test_start_compound_groups_refuse_missing_mixed_or_nonempty_end);
 #else
-	UT_PLAN(355);
+	UT_PLAN(361);
 #endif
 	UT_RUN(test_startup_native_images_accept_only_unchanged_complete_terminal_page);
 	UT_RUN(test_startup_native_images_reject_unresolved_ambiguous_and_mx_itls);
@@ -2963,8 +2974,14 @@ int main(void)
 	UT_RUN(test_startup_native_directory_real_origin_cannot_be_discharged_by_wait);
 	UT_RUN(test_startup_native_directory_invalid_layout_and_partial_error_keep_debt);
 #else
-	UT_PLAN(347);
+	UT_PLAN(353);
 #endif
+	UT_RUN(test_startup_owner_continuation_stable_directory_and_h_wait_keep_same_operations);
+	UT_RUN(test_startup_owner_continuation_directory_wait_cannot_replace_original_sample);
+	UT_RUN(test_startup_owner_continuation_h_wait_cannot_replace_original_sample);
+	UT_RUN(test_startup_owner_continuation_last_directory_callback_cannot_change_sample);
+	UT_RUN(test_startup_owner_continuation_last_h_sample_cannot_change_sample);
+	UT_RUN(test_startup_owner_continuation_directory_and_h_errors_keep_original_custody);
 	UT_RUN(test_startup_owner_round_keeps_complete_fpi_and_unchanged_set);
 	UT_RUN(test_startup_owner_round_later_target_cannot_change_earlier_operation);
 	UT_RUN(test_startup_owner_round_final_nonpage_check_cannot_change_completed_set);

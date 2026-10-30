@@ -46,7 +46,7 @@ ClusterColdRecoveryCtrcPageImage(const struct ClusterRecoveryStartV1 *start, uin
   || index >= start->ctrc_page_progress->target_count) {
   out.detail = RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT; return out;
  }
- out.detail = cluster_recovery_cold_page_completed_recheck(start)
+ out.detail = cluster_recovery_cold_page_completed_recheck(start, NULL, 0)
   ? RF_PAGE_PROOF_DETAIL_OK : RF_PAGE_PROOF_DETAIL_ROOT_STALE;
  return out;
 }

@@ -2912,14 +2912,16 @@ cluster_recovery_cold_page_completed_same(const ClusterColdCtrcPageProgressV1 *p
 }
 
 static bool
-cluster_recovery_cold_page_completed_recheck(const struct ClusterRecoveryStartV1 *start)
+cluster_recovery_cold_page_completed_recheck(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcPageCompletedV1 *fixed, uint32 fixed_count)
 {
 	const ClusterColdCtrcWorkV1 *work = start->ctrc_observation_work;
 	ClusterWalInputsV1 *scope = start->ctrc_observation_inputs;
 	ClusterColdCtrcPageProgressV1 *progress = start->ctrc_page_progress;
 	ClusterRecoveryTxResultObservationV1 accepted;
 	ClusterColdTtSlotInputV1 *volatile subjects = NULL;
-	ClusterColdCtrcPageCompletedV1 *volatile completed = NULL;
+	ClusterColdCtrcPageCompletedV1 *volatile owned_completed = NULL;
+	const ClusterColdCtrcPageCompletedV1 *completed = fixed;
 	volatile bool ready = false;
 	Size bytes, completed_bytes;
 	uint32 count;
@@ -2927,13 +2929,15 @@ cluster_recovery_cold_page_completed_recheck(const struct ClusterRecoveryStartV1
 	if (!cluster_recovery_cold_page_first_empty(start, work, scope, progress)
 		|| !cluster_recovery_cold_page_tx_recheck(start, work, scope, progress)) return false;
 	if (progress == NULL)
-		return rf_page_online_plan_target_count_v1(start->ctrc_page_plan) == 0
+		return fixed == NULL && fixed_count == 0
+			&& rf_page_online_plan_target_count_v1(start->ctrc_page_plan) == 0
 			&& cluster_recovery_cold_page_census_recheck(start, work, scope, progress)
 			&& cluster_recovery_cold_page_reference_terminals(start, work, scope, progress)
 			&& cluster_recovery_cold_page_first_empty(start, work, scope, progress);
 	count = rf_page_online_plan_target_count_v1(start->ctrc_page_plan);
 	if (progress->target_count != count || progress->pending || progress->next_target != count
 		|| count > MaxAllocSize / sizeof(*completed)
+		|| (fixed == NULL ? fixed_count != 0 : fixed_count != count)
 		|| work->counts.subject_count > MaxAllocSize / sizeof(*subjects)
 		|| !cluster_recovery_ctrc_terminal_result_v1(start, work, &accepted)) return false;
 	bytes = (Size)work->counts.subject_count * sizeof(*subjects);
@@ -2942,9 +2946,15 @@ cluster_recovery_cold_page_completed_recheck(const struct ClusterRecoveryStartV1
 	{
 		uint32 index = 0;
 
-		completed = MemoryContextAllocExtended(TopMemoryContext, completed_bytes,
-			MCXT_ALLOC_ZERO | MCXT_ALLOC_NO_OOM);
-		if (completed != NULL) memcpy(completed, progress->completed, completed_bytes);
+		/* Drain lends its one budgeted sample through the whole directory/H
+		 * continuation. A standalone recheck keeps its original local sample. */
+		if (completed == NULL) {
+			owned_completed = MemoryContextAllocExtended(TopMemoryContext, completed_bytes,
+				MCXT_ALLOC_ZERO | MCXT_ALLOC_NO_OOM);
+			if (owned_completed != NULL)
+				memcpy(owned_completed, progress->completed, completed_bytes);
+			completed = owned_completed;
+		}
 		if (bytes != 0)
 			subjects = MemoryContextAllocExtended(TopMemoryContext, bytes,
 				MCXT_ALLOC_ZERO | MCXT_ALLOC_NO_OOM);
@@ -3008,7 +3018,7 @@ cluster_recovery_cold_page_completed_recheck(const struct ClusterRecoveryStartV1
 	PG_FINALLY();
 	{
 		if (subjects != NULL) pfree((void *)subjects);
-		if (completed != NULL) pfree((void *)completed);
+		if (owned_completed != NULL) pfree((void *)owned_completed);
 	}
 	PG_END_TRY();
 	return ready;
@@ -3157,40 +3167,70 @@ cluster_recovery_cold_page_drain(const struct ClusterRecoveryStartV1 *start,
 			progress->pending = false;
 			progress->next_target++;
 		}
-		while (ready) {
-			const ClusterColdCtrcWorkV1 *work;
-			ClusterWalInputsV1 *scope;
-			ClusterColdCtrcPageProgressV1 *progress;
-			ClusterCtrcLocalEmptyV1 empty;
-			bool history_ready = false;
+		if (ready) {
+			const ClusterColdCtrcWorkV1 *work = state->ctrc_observation_work;
+			ClusterWalInputsV1 *scope = state->ctrc_observation_inputs;
+			ClusterColdCtrcPageProgressV1 *progress = state->ctrc_page_progress;
+			uint32 count = rf_page_online_plan_target_count_v1(start->ctrc_page_plan);
+			ClusterColdCtrcPageCompletedV1 *volatile completed = NULL;
 
-			if (start != cluster_recovery_cold_start) { ready = false; break; }
-			work = state->ctrc_observation_work;
-			scope = state->ctrc_observation_inputs;
-			progress = state->ctrc_page_progress;
-			ResetLatch(MyLatch);
-			ready = cluster_recovery_cold_page_completed_recheck(start);
-			if (!ready) break;
-			/* F4-cleared, unchanged and zero-PAGE paths still owe the
-			 * original whole local directory check. EMPTY is an instant
-			 * observation, not first/pin/history discharge or completion. */
-			empty = cluster_ctrc_recovery_local_empty_v1();
-			ready = cluster_recovery_cold_page_advance_current(start, work, scope, progress)
-				&& (progress == NULL
-					? rf_page_online_plan_target_count_v1(start->ctrc_page_plan) == 0
-					: !progress->pending && progress->next_target == progress->target_count);
-			if (!ready) break;
-			if (empty == CLUSTER_CTRC_LOCAL_EMPTY) {
-				ready = cluster_recovery_cold_page_history_ready(start, work, scope, progress,
-					&history_ready);
-				if (!ready || history_ready) break;
-			} else if (empty != CLUSTER_CTRC_LOCAL_WAIT) { ready = false; break; }
-			/* No partial directory locks survive the native probe. Keep
-			 * the same FDs/IR/WALR and redo the entire original readback
-			 * after each directory/H wait; elapsed time is not a refusal. */
-			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-				100L, WAIT_EVENT_CLUSTER_THREAD_RECOVERY);
-			HandleStartupProcInterrupts();
+			PG_TRY();
+			{
+				/* Reuse the one full sample charged before the first PAGE.
+				 * A directory/H wait cannot replace the operations it sampled. */
+				if (progress == NULL) ready = count == 0;
+				else if (count == 0 || count > MaxAllocSize / sizeof(*completed)
+					|| progress->target_count != count || progress->pending
+					|| progress->next_target != count) ready = false;
+				else {
+					Size bytes = (Size)count * sizeof(*completed);
+
+					completed = MemoryContextAllocExtended(TopMemoryContext, bytes,
+						MCXT_ALLOC_ZERO | MCXT_ALLOC_NO_OOM);
+					ready = completed != NULL;
+					if (ready) memcpy(completed, progress->completed, bytes);
+				}
+				while (ready) {
+					ClusterCtrcLocalEmptyV1 empty;
+					bool history_ready = false;
+
+					if (start != cluster_recovery_cold_start
+						|| state->ctrc_page_progress != progress) { ready = false; break; }
+					ResetLatch(MyLatch);
+					ready = cluster_recovery_cold_page_completed_recheck(start, completed, count);
+					if (!ready) break;
+					/* F4-cleared, unchanged and zero-PAGE paths still owe the
+					 * original whole local directory check. EMPTY is an instant
+					 * observation, not first/pin/history discharge or completion. */
+					empty = cluster_ctrc_recovery_local_empty_v1();
+					ready = cluster_recovery_cold_page_advance_current(start, work, scope, progress)
+						&& state->ctrc_page_progress == progress
+						&& (progress == NULL
+							? rf_page_online_plan_target_count_v1(start->ctrc_page_plan) == 0
+							: cluster_recovery_cold_page_completed_same(progress, completed, count));
+					if (!ready) break;
+					if (empty == CLUSTER_CTRC_LOCAL_EMPTY) {
+						ready = cluster_recovery_cold_page_history_ready(start, work, scope, progress,
+							&history_ready)
+							&& state->ctrc_page_progress == progress
+							&& (progress == NULL
+								? rf_page_online_plan_target_count_v1(start->ctrc_page_plan) == 0
+								: cluster_recovery_cold_page_completed_same(progress, completed, count));
+						if (!ready || history_ready) break;
+					} else if (empty != CLUSTER_CTRC_LOCAL_WAIT) { ready = false; break; }
+					/* No partial directory locks survive the native probe. Keep
+					 * the same FDs/IR/WALR and redo the entire original readback
+					 * against the fixed sample after each directory/H wait. */
+					(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						100L, WAIT_EVENT_CLUSTER_THREAD_RECOVERY);
+					HandleStartupProcInterrupts();
+				}
+			}
+			PG_FINALLY();
+			{
+				if (completed != NULL) pfree((void *)completed);
+			}
+			PG_END_TRY();
 		}
 	}
 	PG_CATCH();
