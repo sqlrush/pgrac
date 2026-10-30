@@ -19,6 +19,17 @@
  */
 #include "postgres.h"
 
+/* The release fixture must preprocess the actual product headers/bodies. */
+#ifdef FIXTURE_NO_ASSERTS
+#undef USE_ASSERT_CHECKING
+#undef Assert
+#define Assert(condition) ((void)0)
+#undef AssertMacro
+#define AssertMacro(condition) ((void)0)
+#undef PG_USED_FOR_ASSERTS_ONLY
+#define PG_USED_FOR_ASSERTS_ONLY
+#endif
+
 #include <setjmp.h>
 
 #include "access/heapam_xlog.h"
@@ -152,6 +163,10 @@ static unsigned pair_repins, pair_repin_misses, pair_heap_waits, pair_heap_unloc
 static unsigned pair_warm_success, pair_nested_success, pair_error_at, pair_reobserves;
 static Buffer pair_vm_handle;
 static ResourceXAuxiliaryAcquireContext *pair_context;
+static bool pair_heap_proof, pair_vm_proof, pair_cancel_resume;
+static unsigned pair_captures[2], pair_resumes[2], pair_local_unlocks;
+static unsigned pair_resume_refusals[2], pair_capture_error, pair_resume_error;
+static void setup_pair_scheduling(void);
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
 volatile sig_atomic_t InterruptPending;
@@ -160,7 +175,7 @@ ProcessInterrupts(void)
 {
 	if (pair_fixture) {
 		UT_ASSERT(pinned[0] && !held[0] && !held[1] && !pinned[1]);
-		UT_ASSERT(pair_cancel_refusal || pair_cancel_miss);
+		UT_ASSERT(pair_cancel_refusal || pair_cancel_miss || pair_cancel_resume);
 		InterruptPending = false;
 		elog(ERROR, "controlled cancellation at unlocked two-page repair retry");
 	}
@@ -570,6 +585,8 @@ ClusterLockBufferExclusiveAuxiliaryAware(Buffer *buffer, ResourceXAuxiliaryAcqui
 {
 	if (pair_fixture) {
 		UT_ASSERT(context != NULL && pinned[0] && pinned[1] && !held[1]);
+		if (held[0])
+			elog(ERROR, "ordinary VM acquisition entered below heap content-X");
 		UT_ASSERT_EQ(*buffer, 2);
 		UT_ASSERT_EQ(CritSectionCount, 0);
 		pair_attempts++;
@@ -680,6 +697,21 @@ bool
 ClusterBufferCaptureMutationContext(Buffer buffer, ResourceXWriterUseContext *out, uint64 *revision,
 									bool *checked)
 {
+	if (pair_fixture) {
+		UT_ASSERT(buffer >= 1 && buffer <= 2 && pinned[buffer - 1]);
+		UT_ASSERT(held[buffer - 1] && writer[buffer - 1]);
+		UT_ASSERT_EQ(CritSectionCount, 0);
+		pair_captures[buffer - 1]++;
+		if (pair_capture_error == (unsigned)buffer)
+			elog(ERROR, "controlled original writer capture failure");
+		if (!(buffer == 1 ? pair_heap_proof : pair_vm_proof))
+			return false;
+		memset(out, 0, sizeof(*out));
+		out->writer_activation_token = 80 + buffer;
+		*revision = 33;
+		*checked = true;
+		return true;
+	}
 	UT_ASSERT(empty_fixture && buffer >= 1 && buffer <= 2);
 	if (!pinned[buffer - 1] || !held[buffer - 1])
 		return false;
@@ -705,6 +737,28 @@ ClusterConditionalLockBufferWithMutationContext(Buffer buffer,
 												const ResourceXWriterUseContext *expected,
 												uint64 revision, bool checked)
 {
+	if (pair_fixture) {
+		UT_ASSERT(buffer >= 1 && buffer <= 2 && pinned[buffer - 1] && !held[buffer - 1]);
+		UT_ASSERT_EQ(expected->writer_activation_token, 80 + buffer);
+		UT_ASSERT_EQ(revision, 33);
+		UT_ASSERT(checked && pair_captures[buffer - 1] != 0);
+		UT_ASSERT_EQ(CritSectionCount, 0);
+		if (buffer == 1)
+			UT_ASSERT(!held[1] && !pinned[1]);
+		else
+			UT_ASSERT(held[0] && writer[0]);
+		pair_resumes[buffer - 1]++;
+		if (pair_resume_error == (unsigned)buffer)
+			elog(ERROR, "controlled local writer resume failure");
+		if (pair_resume_refusals[buffer - 1] != 0) {
+			pair_resume_refusals[buffer - 1]--;
+			if (pair_cancel_resume)
+				InterruptPending = true;
+			return false;
+		}
+		held[buffer - 1] = writer[buffer - 1] = true;
+		return true;
+	}
 	UT_ASSERT(empty_fixture && buffer == 2 && held[0] && !held[1] && pinned[1]);
 	UT_ASSERT_EQ(expected->writer_activation_token, 82);
 	UT_ASSERT_EQ(revision, 33);
@@ -721,6 +775,12 @@ ClusterConditionalLockBufferWithMutationContext(Buffer buffer,
 void
 ClusterUnlockBufferAfterConditionalMutation(Buffer buffer)
 {
+	if (pair_fixture) {
+		UT_ASSERT(buffer == 2 && held[0] && held[1] && writer[1]);
+		held[1] = writer[1] = false;
+		pair_local_unlocks++;
+		return;
+	}
 	UT_ASSERT(empty_fixture && buffer == 2 && held[0] && held[1] && writer[1]);
 	held[1] = writer[1] = false;
 	empty_local_unlocks++;
@@ -1071,6 +1131,8 @@ run_actual_visibility_repair(bool lpdead)
 	state.versioned = cluster_shared_config;
 	state.identity = identity;
 	repairing = true;
+	if (cluster_shared_config && !pair_fixture)
+		setup_pair_scheduling();
 	if (lpdead) {
 #include "test_cluster_vm_repair_lpdead.inc"
 	} else {
@@ -1992,24 +2054,38 @@ UT_TEST(test_vm_only_repair_error_preserves_only_the_callers_current_pin)
 
 
 static void
-setup_pair_repair(bool lpdead, bool retain_pin, unsigned refusals)
+setup_pair_scheduling(void)
 {
-	reset(true, lpdead, VISIBILITYMAP_VALID_BITS | (VISIBILITYMAP_VALID_BITS << 2));
 	pair_fixture = true;
 	memset(held, 0, sizeof(held));
 	memset(pinned, 0, sizeof(pinned));
 	memset(writer, 0, sizeof(writer));
 	pinned[0] = pinned[1] = held[0] = writer[0] = true;
-	pair_retain_pin = retain_pin;
+	pair_retain_pin = false;
 	pair_aux_driving = pair_caught = false;
 	pair_cancel_refusal = pair_cancel_miss = pair_peer_change = false;
-	pair_refusals = refusals;
+	pair_refusals = 0;
 	pair_attempts = pair_pin_calls = pair_unpins = pair_repins = pair_repin_misses = 0;
 	pair_heap_waits = pair_heap_unlocks = pair_warm_success = pair_nested_success = 0;
 	pair_error_at = pair_reobserves = 0;
 	pair_vm_handle = 2;
 	pair_context = NULL;
+	pair_heap_proof = pair_vm_proof = true;
+	pair_cancel_resume = false;
+	memset(pair_captures, 0, sizeof(pair_captures));
+	memset(pair_resumes, 0, sizeof(pair_resumes));
+	memset(pair_resume_refusals, 0, sizeof(pair_resume_refusals));
+	pair_local_unlocks = pair_capture_error = pair_resume_error = 0;
 	InterruptPending = false;
+}
+
+static void
+setup_pair_repair(bool lpdead, bool retain_pin, unsigned refusals)
+{
+	reset(true, lpdead, VISIBILITYMAP_VALID_BITS | (VISIBILITYMAP_VALID_BITS << 2));
+	setup_pair_scheduling();
+	pair_retain_pin = retain_pin;
+	pair_refusals = refusals;
 }
 
 static void
@@ -2069,13 +2145,16 @@ UT_TEST(test_pair_repair_reobserves_with_original_heap_pin)
 				setup_pair_repair(lpdead != 0, retain != 0, refusals);
 				run_pair_repair(lpdead != 0);
 				check_pair_repair(20, 30);
-				UT_ASSERT_EQ(pair_attempts, refusals == 0 ? 1 : refusals + 2);
-				UT_ASSERT_EQ(pair_heap_waits, refusals == 0 ? 0 : 1);
-				UT_ASSERT_EQ(pair_heap_unlocks, pair_heap_waits);
-				UT_ASSERT_EQ(pair_warm_success, refusals == 0 ? 0 : 1);
-				UT_ASSERT_EQ(pair_nested_success, 1);
+				UT_ASSERT_EQ(pair_attempts, refusals + 1);
+				UT_ASSERT_EQ(pair_heap_waits, 0);
+				UT_ASSERT_EQ(pair_heap_unlocks, 1);
+				UT_ASSERT_EQ(pair_warm_success, 1);
+				UT_ASSERT_EQ(pair_nested_success, 0);
+				UT_ASSERT_EQ(pair_resumes[0], 1);
+				UT_ASSERT_EQ(pair_resumes[1], 1);
+				UT_ASSERT_EQ(pair_local_unlocks, 1);
 				UT_ASSERT_EQ(pair_pin_calls, refusals);
-				UT_ASSERT_EQ(pair_unpins, refusals == 0 ? 0 : refusals + 1);
+				UT_ASSERT_EQ(pair_unpins, refusals + 1);
 				release_pair_repair();
 			}
 		}
@@ -2090,9 +2169,10 @@ UT_TEST(test_pair_repair_resident_misses_release_heap_before_vm_io)
 			pair_repin_misses = misses;
 			run_pair_repair(lpdead != 0);
 			check_pair_repair(20, 30);
-			UT_ASSERT_EQ(pair_attempts, 3);
+			UT_ASSERT_EQ(pair_attempts, 2);
 			UT_ASSERT_EQ(pair_repins, misses + 1);
-			UT_ASSERT_EQ(pair_heap_waits, misses + 1);
+			UT_ASSERT_EQ(pair_heap_waits, 0);
+			UT_ASSERT_EQ(pair_resumes[0], misses + 1);
 			UT_ASSERT_EQ(pair_heap_unlocks, misses + 1);
 			UT_ASSERT_EQ(pair_pin_calls, misses + 1);
 			UT_ASSERT_EQ(pair_unpins, misses + 2);
@@ -2128,7 +2208,8 @@ UT_TEST(test_pair_repair_cancel_keeps_only_original_heap_pin)
 			UT_ASSERT(pinned[0] && !held[0] && !pinned[1] && !held[1]);
 			UT_ASSERT_EQ(pair_vm_handle, InvalidBuffer);
 			UT_ASSERT_EQ(pair_attempts, at_miss == 0 ? 1 : 2);
-			UT_ASSERT_EQ(pair_heap_waits, at_miss);
+			UT_ASSERT_EQ(pair_heap_waits, 0);
+			UT_ASSERT_EQ(pair_resumes[0], at_miss);
 			UT_ASSERT_EQ(pair_pin_calls, at_miss);
 			UT_ASSERT_EQ(assertion_failures, 0);
 			UT_ASSERT_EQ(CritSectionCount, 0);
@@ -2153,7 +2234,8 @@ UT_TEST(test_pair_repair_error_or_unknown_version_precedes_mutation)
 			run_pair_repair(lpdead != 0);
 			UT_ASSERT(pair_caught && pinned[0] && pinned[1]);
 			UT_ASSERT_EQ(held[0], at_capture != 0);
-			UT_ASSERT_EQ(held[1], at_capture != 0);
+			UT_ASSERT(!held[1]);
+			UT_ASSERT_EQ(pair_local_unlocks, at_capture != 0);
 			UT_ASSERT_EQ(assertion_failures, 0);
 			UT_ASSERT_EQ(CritSectionCount, 0);
 			UT_ASSERT_EQ(next_token, 100);

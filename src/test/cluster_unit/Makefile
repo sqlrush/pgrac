@@ -2572,6 +2572,15 @@ test_cluster_vm_visible_empty.inc: $(top_srcdir)/src/backend/access/heap/vacuuml
 	     emit { print } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+TESTS += test_cluster_vm_pair_repair test_cluster_vm_pair_repair_noassert
+all: test_cluster_vm_pair_repair test_cluster_vm_pair_repair_noassert
+
+test_cluster_vm_pair_repair test_cluster_vm_pair_repair_noassert: test_cluster_vm_pair_repair.c $(VM_QUALIFIED_FIXTURE_DEPS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(if $(filter %_noassert,$@),-DFIXTURE_NO_ASSERTS) $< \
+		test_cluster_space_bufpage_product.o test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
 # Bind the complete original empty-page scan entry and its acquisition helper.
 test_cluster_vm_empty_scan.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
 	awk '/^lazy_publish_shared_empty\(/ { print "static void"; emit=1; helpers++ } \
