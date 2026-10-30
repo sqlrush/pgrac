@@ -883,7 +883,7 @@ resource_x_decision_body_valid(const ResourceXDecodedFrame *frame)
 		|| (required & (UINT32_C(1) << frame->common.action_node)) != 0;
 }
 
-/* Omit holders only from the original no-holder disk format. Source reads
+/* Omit holders only from the original no-holder disk format. Source completions
  * retain the complete A; codec validity is not native/source authority. */
 static bool
 resource_x_completion_body_valid(const ResourceXDecodedFrame *frame)
@@ -894,7 +894,8 @@ resource_x_completion_body_valid(const ResourceXDecodedFrame *frame)
 	bool no_image = frame->common.outcome == RESOURCE_X_OUTCOME_QUIET_NO_IMAGE
 		|| frame->common.outcome == RESOURCE_X_OUTCOME_QUIET_NO_IMAGE_RETIRED;
 
-	return frame->common.target_mode == (uint8)PCM_STATE_S
+	return (frame->common.target_mode == (uint8)PCM_STATE_S
+			|| (!disk && frame->common.target_mode == (uint8)PCM_STATE_X))
 		&& a->episode.base_generation < UINT64_MAX - 1
 		&& (disk
 			? (frame->payload_bytes == RESOURCE_X_COMPLETE_V5_BYTES

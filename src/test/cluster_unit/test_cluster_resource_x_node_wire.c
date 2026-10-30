@@ -3325,12 +3325,16 @@ UT_TEST(test_source_complete_disk_and_source_formats_cannot_alias)
 		&frame, bytes, sizeof(bytes), &len, &reject));
 	UT_ASSERT_EQ(len, 264);
 }
-UT_TEST(test_source_complete_known_x_and_invalid_kind_are_not_read_completions)
+UT_TEST(test_source_complete_known_x_preserves_full_a_and_invalid_kind_is_refused)
 {
 	uint8 bytes[TEST_SOURCE_COMPLETE_BYTES]; ResourceXDecodedFrame frame;
 	source_complete_make(bytes, PCM_STATE_X, 2, 1,
 		RESOURCE_X_ACQUIRE_SOURCE_REMOTE_CURRENT, false, 0);
-	bytes[73] = PCM_STATE_X; source_complete_reject(bytes);
+	bytes[73] = PCM_STATE_X;
+	if (!source_complete_round_trip(bytes, &frame)) return;
+	UT_ASSERT_EQ(frame.common.target_mode, PCM_STATE_X);
+	UT_ASSERT_EQ(frame.body.acquire_completion.decision.holders_bitmap, 2);
+	UT_ASSERT_EQ(frame.body.acquire_completion.decision.source_node, 1);
 	source_complete_make(bytes, PCM_STATE_X, 2, 1,
 		RESOURCE_X_ACQUIRE_SOURCE_REMOTE_CURRENT, false, 0);
 	if (!source_complete_round_trip(bytes, &frame)) return;
@@ -3485,7 +3489,7 @@ main(void)
 	UT_RUN(test_source_complete_sender_rebind_changes_only_physical_envelope);
 	UT_RUN(test_source_complete_invalid_rebind_preserves_all_bytes);
 	UT_RUN(test_source_complete_disk_and_source_formats_cannot_alias);
-	UT_RUN(test_source_complete_known_x_and_invalid_kind_are_not_read_completions);
+	UT_RUN(test_source_complete_known_x_preserves_full_a_and_invalid_kind_is_refused);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
