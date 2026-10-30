@@ -13,6 +13,7 @@
 
 #define CLUSTER_PAGE_ONLINE_PLAN_INTERFACE_V1 1
 #define CLUSTER_PAGE_DEPENDENCY_QUEUE_V1 1
+#define CLUSTER_PAGE_IMAGE_COVERAGE_V1 1
 #define RF_PAGE_ONLINE_PLAN_MAX_BYTES (8 * 1024 * 1024)
 
 typedef struct RfPageOnlinePlanV1 RfPageOnlinePlanV1;
@@ -90,6 +91,24 @@ extern RfPageProofDetailV1 rf_page_online_plan_seal_v1(RfPageOnlinePlanV1 *plan)
 extern uint32 rf_page_online_plan_target_count_v1(const RfPageOnlinePlanV1 *plan);
 extern bool rf_page_online_plan_target_v1(const RfPageOnlinePlanV1 *plan, uint32 index,
 										  RfPageOnlineTargetViewV1 *out_target);
+struct ClusterPageWalBindingV1;
+/* Pure MAIN/VM in-memory coverage, not a flush/DATA/PI-retirement proof.
+ * The aligned full image must equal a non-history-only sealed target's
+ * terminal canonical bytes. Image, first and last must share an incarnation
+ * and match full source claims/decoded records on that chain, first <= last
+ * in dependency order (never numeric token/LSN order). Only the original
+ * claim decoder ceiling may advance within an otherwise identical claim.
+ *
+ * Caller retains the immutable plan and its original source owners, and
+ * keeps image bytes stable. A true result neither transfers those owners
+ * nor grants current/native authority: any later carrier publication must
+ * recheck its exact entry/body/native ownership before moving references.
+ * No allocation, I/O, locks or reference/PI/WAL retirement occurs here.
+ * SPACE/incarnation retirement needs its separate SIDE proof and is refused. */
+extern bool rf_page_online_plan_image_covers_v1(
+	const RfPageOnlinePlanV1 *plan, const struct ClusterPageWalBindingV1 *image,
+	const char page[BLCKSZ], const struct ClusterPageWalBindingV1 *first,
+	const struct ClusterPageWalBindingV1 *last);
 /* Pure, sealed-input projection. Coverage must be sorted by page identity,
  * unique and already qualified by the physical owner. Unknown versions never
  * imply coverage; every failure leaves the output unchanged. No data I/O,

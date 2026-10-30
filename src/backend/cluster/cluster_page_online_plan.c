@@ -9,6 +9,7 @@
 
 #include "common/cryptohash.h"
 #include "cluster/cluster_page_online_plan.h"
+#include "cluster/cluster_page_wal.h"
 #include "storage/bufpage.h"
 
 #ifdef USE_CLUSTER_UNIT
@@ -1027,6 +1028,84 @@ rf_page_online_plan_target_v1(const RfPageOnlinePlanV1 *plan, uint32 index,
 		return false;
 	*out_target = plan->targets[index]->view;
 	return true;
+}
+
+static bool
+image_edge_matches(const RfPageOnlinePlanV1 *plan, const RfPageStableEdgeInputV1 *edge,
+				   const ClusterPageWalBindingV1 *binding)
+{
+	const RfPageReplayRecordIdentityV1 *record = &edge->record_identity;
+	const ClusterWalSourceRef *source;
+	ClusterWalThreadClaimRefV2 original;
+
+	if (edge->participant_index >= plan->participant_count)
+		return false;
+	source = &plan->sources[edge->participant_index];
+	/* Same contribution join as original DATA coverage: the decoder ceiling
+	 * is not immutable claim identity. This comparison grants no authority. */
+	if (binding->source.claim.max_config_generation > source->claim.max_config_generation)
+		return false;
+	original = binding->source.claim;
+	original.max_config_generation = source->claim.max_config_generation;
+	return memcmp(&original, &source->claim, sizeof(original)) == 0
+		   && binding->source.timeline == source->timeline
+		   && rf_page_identity_equal_v1(&edge->page_identity, &binding->identity)
+		   && edge->result_token == binding->version.mutation_token
+		   && memcmp(edge->edge.result_incarnation, binding->version.segment_incarnation, 16) == 0
+		   && record->system_identifier == binding->identity.system_identifier
+		   && memcmp(record->storage_uuid, binding->identity.storage_uuid, 16) == 0
+		   && record->origin_thread == binding->source.claim.identity.origin_thread_id
+		   && record->timeline_id == binding->source.timeline
+		   && record->read_rec_ptr == binding->record_start
+		   && record->end_rec_ptr == binding->record_end && record->record_crc == binding->record_crc
+		   && record->rmid == binding->rmid && record->info == binding->info;
+}
+
+bool
+rf_page_online_plan_image_covers_v1(const RfPageOnlinePlanV1 *plan,
+	const ClusterPageWalBindingV1 *image, const char page[BLCKSZ],
+	const ClusterPageWalBindingV1 *first, const ClusterPageWalBindingV1 *last)
+{
+	if (plan == NULL || plan->magic != RF_PAGE_ONLINE_PLAN_MAGIC || !plan->sealed
+		|| plan->sources == NULL || page == NULL || !cluster_page_wal_binding_shape_v1(image)
+		|| !cluster_page_wal_binding_shape_v1(first) || !cluster_page_wal_binding_shape_v1(last)
+		|| !rf_page_identity_valid_v1(&image->identity)
+		|| !rf_page_identity_valid_v1(&first->identity)
+		|| !rf_page_identity_valid_v1(&last->identity)
+		|| (image->identity.forknum != MAIN_FORKNUM
+			&& image->identity.forknum != VISIBILITYMAP_FORKNUM)
+		|| !rf_page_identity_equal_v1(&image->identity, &first->identity)
+		|| !rf_page_identity_equal_v1(&image->identity, &last->identity)
+		|| memcmp(image->version.segment_incarnation, first->version.segment_incarnation, 16) != 0
+		|| memcmp(image->version.segment_incarnation, last->version.segment_incarnation, 16) != 0
+		|| image->identity.reserved_zero != 0 || first->identity.reserved_zero != 0
+		|| last->identity.reserved_zero != 0 || !page_layout_valid(page)
+		|| !cluster_page_wal_binding_matches_v1(image, image->identity.locator,
+			image->identity.forknum, image->identity.blockno, (Page)page))
+		return false;
+	for (uint32 i = 0; i < plan->target_count; i++) {
+		const RfPageOnlineTargetV1 *target = plan->targets[i];
+		uint32 first_index = UINT32_MAX, last_index = UINT32_MAX;
+
+		if (!rf_page_identity_equal_v1(&image->identity, &target->view.page_identity))
+			continue;
+		if (target->view.history_only || target->edge_count == 0
+			|| !rf_page_version_equal_v1(&image->version, &target->view.expected_result)
+			|| memcmp(page, target->canonical.data, BLCKSZ) != 0
+			|| !image_edge_matches(plan, &target->edges[target->edge_count - 1], image))
+			return false;
+		/* Sealing already proved a complete, unique chain. Locate both full
+		 * original records on it; endpoint magnitudes establish no ancestry. */
+		for (uint32 j = 0; j < target->edge_count; j++) {
+			const RfPageStableEdgeInputV1 *edge = &target->edges[j];
+
+			if (image_edge_matches(plan, edge, first)) first_index = j;
+			if (image_edge_matches(plan, edge, last)) last_index = j;
+		}
+		return first_index != UINT32_MAX && last_index != UINT32_MAX
+			   && first_index <= last_index;
+	}
+	return false;
 }
 
 bool

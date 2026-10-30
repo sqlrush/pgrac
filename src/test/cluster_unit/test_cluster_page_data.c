@@ -12,8 +12,10 @@
 #include "catalog/pg_control.h"
 #include "catalog/pg_tablespace_d.h"
 #include "cluster/cluster_block_apply.h"
+#include "cluster/cluster_block_io_trace.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_inject.h"
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_page_data.h"
 #include "cluster/cluster_pi_write.h"
@@ -53,6 +55,30 @@ volatile uint32 CritSectionCount, InterruptHoldoffCount;
 int cluster_node_id = 0, NBuffers = 2, NLocBuffer;
 bool cluster_enabled = true, cluster_shared_config = true, cluster_shared_catalog = true;
 bool cluster_smart_fusion, cluster_past_image;
+bool cluster_trace_block_io;
+/* This physical-write fixture has no armed diagnostic/injection owner.
+ * Preserve the complete write body and its call sites; these explicit OFF
+ * leaves do not qualify trace-ON capture or injection scheduling. */
+bool
+cluster_injection_is_armed(const char *name)
+{
+	UT_ASSERT(name != NULL);
+	return false;
+}
+
+void
+cluster_block_io_trace_note(BufferTag tag, const char *event, uint64 version,
+	uint64 sequence, uint32 holders)
+{
+	UT_ASSERT(!cluster_trace_block_io);
+}
+
+void
+cluster_block_io_trace_write(BufferDesc *buf, const char *bytes)
+{
+	UT_ASSERT(!cluster_trace_block_io);
+}
+
 #ifndef PGRAC_TEST_REAL_PI_WRITEBACK
 uint32
 cluster_ic_local_capability_word(void)
@@ -491,6 +517,7 @@ static bool cluster_pcm_x_finish_retain_flush_error_context_pushed;
 static ErrorContextCallback *cluster_pcm_x_finish_retain_flush_error_context_previous;
 #ifdef ENABLE_INJECTION
 static bool cluster_pcm_x_finish_retain_flush_fault_active;
+#undef CLUSTER_INJECTION_POINT
 #define CLUSTER_INJECTION_POINT(name) ((void)0)
 #define cluster_injection_should_skip(name) false
 #endif

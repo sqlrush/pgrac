@@ -12,6 +12,7 @@
 #include "cluster/cluster_block_apply.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_page_online_plan.h"
+#include "cluster/cluster_page_wal.h"
 #include "cluster/cluster_thread_recovery.h"
 #include "cluster/cluster_thread_recovery_authority.h"
 #include "cluster/cluster_thread_recovery_fabric.h"
@@ -892,10 +893,62 @@ UT_TEST(test_actual_fabric_refuses_routed_components_without_side_consumer)
 	source_failure = 0;
 }
 
+UT_TEST(test_real_fpi_delta_image_covers_original_pi_range)
+{
+	ClusterThreadRecoveryFabricPlanV1 *fabric = NULL;
+	const RfPageOnlinePlanV1 *plan;
+	ClusterPageWalBindingV1 bindings[3] = {{0}};
+	RecordFixture record;
+	PGAlignedBlock expected;
+	uint64 records;
+	static const uint16 participants[3] = {2, 1, 0};
+	static const uint64 before[3] = {10, 900, 60};
+	static const uint64 result[3] = {900, 60, 7};
+
+	source_completed = 0;
+	UT_ASSERT_EQ(scan_three_roots(&fabric, &records), RF_PAGE_PROOF_DETAIL_OK);
+	if (fabric == NULL) return;
+	plan = cluster_thread_recovery_fabric_page_plan_v1(fabric);
+	for (unsigned i = 0; i < 3; i++) {
+		ClusterPageWalBindingV1 *binding = &bindings[i];
+		record_init(&record, before[i], result[i], i == 0, BLCKSZ - 3 + i,
+			0xa1 + i * 0x11);
+		if (i == 0) expected = record.image;
+		UT_ASSERT(rf_page_online_plan_source_v1(plan, participants[i], &binding->source));
+		binding->identity.system_identifier = 99;
+		memset(binding->identity.storage_uuid, 3, 16);
+		binding->identity.locator = (RelFileLocator){1, 2, 10};
+		binding->identity.forknum = MAIN_FORKNUM;
+		binding->identity.blockno = 4;
+		memset(binding->version.segment_incarnation, 7, 16);
+		binding->version.mutation_token = result[i];
+		binding->record_start = record.reader.ReadRecPtr;
+		binding->record_end = record.reader.EndRecPtr;
+		binding->record_crc = record.decoded.record.header.xl_crc;
+		binding->rmid = record.decoded.record.header.xl_rmid;
+		binding->info = record.decoded.record.header.xl_info;
+	}
+	/* Independent expected bytes: the real FPI, then both decoded generic
+	 * deltas. This also proves the query is not a fake-codec-only consumer. */
+	expected.data[BLCKSZ - 2] = (char)0xb2;
+	expected.data[BLCKSZ - 1] = (char)0xc3;
+	PageSetLSNPreserveOrigin(expected.data, 0x200);
+	UT_ASSERT(PageSetLSNOrigin(expected.data, 0));
+	((PageHeader)expected.data)->pd_block_scn = 7;
+	UT_ASSERT(rf_page_online_plan_image_covers_v1(plan, &bindings[2], expected.data,
+		&bindings[0], &bindings[1]));
+	UT_ASSERT(!rf_page_online_plan_image_covers_v1(plan, &bindings[2], expected.data,
+		&bindings[1], &bindings[0]));
+	expected.data[BLCKSZ - 2] ^= 1;
+	UT_ASSERT(!rf_page_online_plan_image_covers_v1(plan, &bindings[2], expected.data,
+		&bindings[0], &bindings[1]));
+	cluster_thread_recovery_fabric_plan_destroy_v1(&fabric);
+}
+
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(16);
 	UT_RUN(test_same_thread_generations_keep_separate_prefixes_and_full_claims);
 	UT_RUN(test_reverse_real_fpi_delta_chain_owns_reader_bytes);
 	UT_RUN(test_cycle_and_branch_do_not_expose_canonical_pages);
@@ -911,6 +964,7 @@ main(void)
 	UT_RUN(test_native_checkpoint_cannot_split_a_retained_record);
 	UT_RUN(test_unneeded_history_delta_does_not_require_a_new_data_base);
 	UT_RUN(test_actual_root_scan_binds_native_redo_to_complete_ancestry_input);
+	UT_RUN(test_real_fpi_delta_image_covers_original_pi_range);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

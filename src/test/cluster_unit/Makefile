@@ -1498,7 +1498,8 @@ CLUSTER_PAGE_ONLINE_PLAN_O = cluster_page_online_plan_test.o
 
 $(CLUSTER_PAGE_ONLINE_PLAN_O): \
 		$(top_srcdir)/src/backend/cluster/cluster_page_online_plan.c \
-		$(top_srcdir)/src/include/cluster/cluster_page_online_plan.h
+		$(top_srcdir)/src/include/cluster/cluster_page_online_plan.h \
+		$(top_srcdir)/src/include/cluster/cluster_page_wal.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -c $< -o $@
 
 test_cluster_page_online_plan: test_cluster_page_online_plan.c unit_test.h \
@@ -1508,6 +1509,26 @@ test_cluster_page_online_plan: test_cluster_page_online_plan.c unit_test.h \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) \
 		-lssl -lcrypto -o $@
+
+# Full-image coverage consumes the real sealed plan, retaining its original
+# detached-redo component boundary rather than substituting ancestry results.
+TESTS += test_cluster_page_image_coverage
+all: test_cluster_page_image_coverage
+test_cluster_page_online_plan_fixture.inc: test_cluster_page_online_plan.c Makefile
+	awk '/^UT_TEST\(/ { stop=1 } !stop { print; lines++ } \
+	     END { if (!stop || lines < 100) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_page_image_coverage: test_cluster_page_image_coverage.c unit_test.h \
+		test_cluster_page_online_plan_fixture.inc $(CLUSTER_PAGE_ONLINE_PLAN_O) \
+		$(top_srcdir)/src/include/cluster/cluster_page_wal.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< \
+		$(CLUSTER_PAGE_ONLINE_PLAN_O) $(top_builddir)/src/common/libpgcommon.a \
+		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -lssl -lcrypto -o $@
+clean distclean maintainer-clean: clean-page-image-coverage
+.PHONY: clean-page-image-coverage
+clean-page-image-coverage:
+	rm -f test_cluster_page_image_coverage test_cluster_page_online_plan_fixture.inc \
+		test_cluster_page_online_plan_fixture.inc.tmp
 
 test_cluster_page_dependency_base.o: $(top_srcdir)/src/backend/cluster/cluster_page_stable_base.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -ffunction-sections -fdata-sections -c $< -o $@
