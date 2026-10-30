@@ -21,17 +21,16 @@ def number(value):
     return result
 
 
-def select_blocker(case):
-    """Return a diagnostic join for one owned test client, never a verdict."""
+def select_page_owner(case):
+    """Map the lowest observed DATA slot to an owned test client, not authority."""
     trace = case['trace']
     if (trace.get('export_complete') is not True or trace.get('overflow') is not False
             or trace.get('available') is not True or trace.get('enabled') is not True):
         raise ValueError('incomplete native trace')
     holders = case['holders']
     if (not 1 <= len(holders) <= 8 or len({h['pid'] for h in holders}) != len(holders)
-            or len({(h['node'], h['xid']) for h in holders}) != len(holders)
-            or any(h['pid'] == case['waiter_pid'] for h in holders)):
-        raise ValueError('ambiguous or self producer registry')
+            or len({(h['node'], h['xid']) for h in holders}) != len(holders)):
+        raise ValueError('ambiguous producer registry')
     pages = [e for e in trace['events'] if e.get('kind') == 4
              and e.get('sequence') == case['page_sequence']]
     if len(pages) != 1 or pages[0].get('page_known') is not True or pages[0].get('tag') != case['tag']:
@@ -73,6 +72,19 @@ def select_blocker(case):
                         'root_descriptor_incarnation', 'root_id', 'root_generation'))
             or any(tt.get(k) != v for k, v in dict(xid=key['xid'], wrap=key['slot_wrap'], status=1).items())):
         raise ValueError('invalid canonical ACTIVE publication')
+    return dict(holder, slot=slot['index'], page_itl_wrap=slot['itl_wrap'],
+                key=key, authoritative=False)
+
+
+def select_blocker(case):
+    """Return a diagnostic join for one owned test client, never a verdict."""
+    if any(h['pid'] == case['waiter_pid'] for h in case['holders']):
+        raise ValueError('self producer registry')
+    selected = select_page_owner(case)
+    holder, key = selected, selected['key']
+    page = next(e for e in case['trace']['events'] if e.get('kind') == 4
+                and e.get('sequence') == case['page_sequence'])
+    slot = page['slots'][selected['slot']]
     rows = []
     for line in case['log'].splitlines():
         if 'TX_IDENTITY ' not in line:
@@ -113,8 +125,7 @@ def select_blocker(case):
     if ((words[0] & 0xffffffff) != key['segment_id'] or words[0] >> 32 == 0
             or (words[1] & 0xffff) != key['slot_offset'] or words[1] >> 32 != 0):
         raise ValueError('wait UBA and canonical coordinates disagree')
-    return dict(holder, slot=slot['index'], page_itl_wrap=slot['itl_wrap'],
-                key=key, wait_seq=number(wait['wait_seq']), authoritative=False)
+    return dict(selected, wait_seq=number(wait['wait_seq']))
 
 
 def validate_wait_exit(case):
@@ -177,11 +188,158 @@ def validate_wait_exit(case):
                 wait_seq=selected['wait_seq'], end_seq=number(end['seq']), authoritative=False)
 
 
+def _deadlock_wait_rows(log, pid, node):
+    rows = []
+    offset = 0
+    for line in log.splitlines(keepends=True):
+        offset += len(line)
+        if 'TX_IDENTITY ' not in line:
+            continue
+        pairs = re.findall(r'([a-z_0-9]+)=([^ \n]+)', line.split('TX_IDENTITY ', 1)[1])
+        row = dict(pairs)
+        if len(row) != len(pairs):
+            raise ValueError('duplicate diagnostic fields')
+        if number(row.get('pid')) != pid:
+            continue
+        if row.get('event') == 'LIMIT':
+            raise ValueError('wait identity trace overflow')
+        if number(row.get('actor_node')) != node:
+            raise ValueError('waiter node changed')
+        if row.get('event') in ('WAIT_TARGET', 'WAIT_END'):
+            if rows and number(row.get('seq')) <= number(rows[-1][0].get('seq')):
+                raise ValueError('wait trace reordered or duplicated')
+            rows.append((row, offset))
+    return rows
+
+
+def _deadlock_original_end(rows, selected):
+    if len(rows) < 2:
+        raise ValueError('both original wait endpoints are required')
+    start, end = rows[0][0], rows[1][0]
+    fields = ('node', 'xid', 'epoch', 'target_known', 'uba_known',
+              'itl_wrap', 'itl_kind', 'itl_slot', 'wait_seq', 'proc')
+    if (start['event'] != 'WAIT_TARGET' or end['event'] != 'WAIT_END'
+            or number(start.get('wait_seq')) != selected['wait_seq']
+            or any(number(start.get(k)) != number(end.get(k)) for k in fields)
+            or any(start.get(k) != end.get(k) for k in ('uba0', 'uba1'))):
+        raise ValueError('original exact wait end is missing or changed')
+    sequence = selected['wait_seq']
+    for index, (row, _) in enumerate(rows[2:]):
+        if row['event'] != ('WAIT_TARGET' if index % 2 == 0 else 'WAIT_END'):
+            raise ValueError('overlapping or duplicate wait registration')
+        current = number(row.get('wait_seq'))
+        if index % 2 == 0:
+            if current <= sequence:
+                raise ValueError('a later wait reused the original registration')
+            sequence = current
+        elif current != sequence:
+            raise ValueError('later wait endpoints disagree')
+    return end
+
+
+def validate_deadlock(case):
+    """Join original native waits, the confirmed LMD cycle and the SQL error."""
+    forward, reverse, log = case['forward'], case['reverse'], case['log']
+    if (case['cancel_sent'] is not False or forward['waiter_node'] != 0
+            or reverse['waiter_node'] != 0 or forward['tag'] == reverse['tag']
+            or not log.startswith(reverse['log'])
+            or not reverse['log'].startswith(forward['log'])):
+        raise ValueError('deadlock cell changed its original observation or sent a cancel')
+    selected = [select_blocker(forward)]
+    for page in (forward, reverse):
+        if len(page['holders']) != 8:
+            raise ValueError('deadlock requires two originally full ITL pages')
+    owners = forward['holders'] + reverse['holders']
+    if (len({number(h['pid']) for h in owners}) != 16
+            or len({(number(h['node']), number(h['xid'])) for h in owners}) != 16):
+        raise ValueError('deadlock producer groups overlap')
+    rows = [_deadlock_wait_rows(log, c['waiter_pid'], c['waiter_node'])
+            for c in (forward, reverse)]
+    if not rows[1] or rows[1][0][0]['event'] != 'WAIT_TARGET':
+        raise ValueError('reverse exact wait was never observed')
+    # Use a byte-preserving prefix of the actual log, not a synthesized wait
+    # or a live-page reread after the victim has aborted.
+    if len(reverse['log']) >= rows[1][0][1]:
+        raise ValueError('reverse page was not observed before its wait')
+    selected.append(select_blocker(dict(reverse, log=log[:rows[1][0][1]])))
+    physical = ('origin_node_id', 'segment_id', 'segment_generation', 'slot_offset', 'slot_wrap')
+    if len({tuple(s['key'][field] for field in physical) for s in selected}) != 2:
+        raise ValueError('two live xids claim the same canonical slot incarnation')
+    waiters = [selected[1], selected[0]]
+    if any(c['waiter_pid'] != w['pid'] or c['waiter_node'] != w['node']
+           for c, w in zip((forward, reverse), waiters)):
+        raise ValueError('two exact waits do not close on their original owners')
+    ends = [_deadlock_original_end(r, s) for r, s in zip(rows, selected)]
+    expected = {(number(w['node']), number(r[0][0].get('proc')), number(w['xid']),
+                 number(s['key']['formation_epoch']), 0, s['wait_seq'])
+                for w, r, s in zip(waiters, rows, selected)}
+    members = []
+    offset = 0
+    for line in log.splitlines(keepends=True):
+        offset += len(line)
+        if 'PGRAC_FAMILY=DEADLOCK PGRAC_REASON=CONFIRMED_CYCLE ' not in line:
+            continue
+        pairs = re.findall(r'([A-Za-z_0-9]+)=([^ \n]+)', line.split('PGRAC_FAMILY=', 1)[1])
+        row = dict(pairs)
+        if len(row) != len(pairs):
+            raise ValueError('duplicate confirmed cycle fields')
+        members.append((row, offset))
+    if len(members) != 2:
+        raise ValueError('one complete two-member confirmed LMD cycle is required')
+    cycle, cancel = (number(members[0][0].get(k)) for k in ('cycle', 'cancel'))
+    actual = set()
+    for member, offset in members:
+        if (not cycle or not cancel or number(member.get('cycle')) != cycle
+                or number(member.get('cancel')) != cancel or number(member.get('total')) != 2
+                or offset <= max(r[0][1] for r in rows)
+                or offset >= min(r[1][1] for r in rows)):
+            raise ValueError('confirmed cycle identity or original wait overlap is missing')
+        actual.add(tuple(number(member.get(k)) for k in
+                         ('node', 'procno', 'xid', 'epoch', 'request', 'wait_seq')))
+    if (actual != expected or {number(m[0].get('member')) for m in members} != {0, 1}):
+        raise ValueError('confirmed cycle does not match the two actual waits')
+    victim = number(case['victim_pid'])
+    if victim not in {w['pid'] for w in waiters}:
+        raise ValueError('deadlock victim is not an original participant')
+    for waiter, end, raw in zip(waiters, ends, rows):
+        if number(end.get('status')) != (5 if waiter['pid'] == victim else 0):
+            raise ValueError('original wait did not return native DEADLOCK or RESOLVED')
+        if waiter['pid'] == victim and len(raw) != 2:
+            raise ValueError('victim registered another wait before rollback')
+    errors = re.findall(r'^ERROR:\s+([0-9A-Z]{5}): (.*)$', case['stderr'], re.MULTILINE)
+    if (case['client_had_error'] is not True or case['stdout'].strip() != 'B08_SQLSTATE 40P01'
+            or errors != [('40P01', 'deadlock detected while waiting for heap update ITL '
+                           'capacity (INITRANS=8)')]):
+        raise ValueError('original ITL deadlock SQLSTATE and native cause are not proved')
+    observed = case['holders']
+    identity = lambda h: tuple(number(h[k]) for k in ('node', 'pid', 'row'))
+    by_id = {identity(h): h for h in observed}
+    if len(observed) != 16 or len(by_id) != 16 or set(by_id) != {identity(h) for h in owners}:
+        raise ValueError('an original owner disappeared or was replaced')
+    for owner in owners:
+        current = by_id[identity(owner)]
+        if owner['pid'] == victim:
+            if (current['state'] != 'idle in transaction (aborted)' or current['xid'] is not None
+                    or current.get('wait_event') == 'GesTxEnqueueWait'):
+                raise ValueError('original victim backend did not leave its wait')
+        elif (number(current['xid']) != owner['xid']
+              or current['state'] not in (('active', 'idle in transaction')
+                                         if owner['pid'] in {w['pid'] for w in waiters}
+                                         else ('idle in transaction',))):
+            raise ValueError('a surviving original owner was released or changed')
+    return dict(sqlstate='40P01', victim_pid=victim, cycle=cycle, cancel=cancel,
+                selected=selected, authoritative=False)
+
+
 if __name__ == '__main__':
     try:
         case = json.load(sys.stdin)
         if sys.argv[1:] == ['--exit']:
             print(json.dumps(dict(exit=validate_wait_exit(case))))
+        elif sys.argv[1:] == ['--page-owner']:
+            print(json.dumps(dict(selected=select_page_owner(case))))
+        elif sys.argv[1:] == ['--deadlock']:
+            print(json.dumps(dict(deadlock=validate_deadlock(case))))
         elif not sys.argv[1:]:
             print(json.dumps(dict(selected=select_blocker(case))))
         else:
