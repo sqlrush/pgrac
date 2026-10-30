@@ -1153,6 +1153,12 @@ main(int argc, char **argv)
 	test_program_path = argv[0];
 	setup_fixture();
 #ifdef RECOVERY_SCOPE_NATIVE_CENSUS
+	if (getenv("PGRAC_PRE2_TEST_SCOPE_STARTUP") != NULL) {
+		UT_PLAN(2);
+		UT_RUN(test_scope_startup_native_owner_refuses_completed_retention_inputs);
+		UT_RUN(test_scope_startup_required_inputs_cannot_borrow_complete_ir_set);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_SCOPE_REPLAY") != NULL) {
 		UT_PLAN(6);
 		UT_RUN(test_scope_replayed_census_connects_callback_initialization_and_both_pairs);
@@ -1163,7 +1169,7 @@ main(int argc, char **argv)
 		UT_RUN(test_scope_replayed_census_retains_joint_completion_boundary);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(17);
+	UT_PLAN(19);
 	UT_RUN(test_scope_native_census_uses_original_episode_and_retires_before_holders);
 	UT_RUN(test_scope_native_census_missing_corrupt_pending_pairs_keep_original_debt);
 	UT_RUN(test_scope_native_census_late_source_loss_and_error_do_not_replace_custody);
@@ -1181,6 +1187,8 @@ main(int argc, char **argv)
 	UT_RUN(test_scope_replayed_census_founder_does_not_replace_foreign_initialization);
 	UT_RUN(test_scope_replayed_census_pair_failure_preserves_replayed_pages);
 	UT_RUN(test_scope_replayed_census_retains_joint_completion_boundary);
+	UT_RUN(test_scope_startup_native_owner_refuses_completed_retention_inputs);
+	UT_RUN(test_scope_startup_required_inputs_cannot_borrow_complete_ir_set);
 	UT_DONE(); return ut_failed_count != 0;
 #endif
 	if (getenv("PGRAC_PRE2_TEST_INITIALIZED_PAGES") != NULL) {

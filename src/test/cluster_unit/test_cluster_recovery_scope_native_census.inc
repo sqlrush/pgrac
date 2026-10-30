@@ -26,6 +26,8 @@ bool cluster_shared_catalog = true;
 static int scope_native_fd = -1;
 static unsigned scope_native_destroyed, scope_native_legacy_calls;
 static void (*scope_native_records_hook)(uint8 *, ClusterRecoveryAnchorV2 *);
+static void (*scope_native_capture_hook)(ControlRootImage *);
+static ClusterControlRootResult scope_native_acquire_result;
 
 bool cluster_recovery_merge_claim_is_held(void);
 bool cluster_relmap_authority_x_held(void);
@@ -259,6 +261,7 @@ scope_native_setup_mode(ClusterWalInputsV1 **inputs, unsigned history_mode)
 	UT_ASSERT_EQ(cluster_control_root_v3_decode(bytes, sizeof(bytes), v2_storage, TEST_SYSID, &root), 0);
 	tx_ir_complete(&root.records[0]);
 	tx_ir_complete(&root.records[1]);
+	if (scope_native_capture_hook != NULL) scope_native_capture_hook(&root);
 	if (history_mode) scope_native_history(&root, &anchors[0], history_mode);
 	UT_ASSERT_EQ(cluster_control_root_v3_encode(&root), 0);
 	v2_write_roots(root.bytes);
@@ -293,7 +296,11 @@ scope_native_setup_mode(ClusterWalInputsV1 **inputs, unsigned history_mode)
 	relmap_sibling = NULL;
 	relmap_declared = true;
 	relmap_failed = 0;
-	UT_ASSERT_EQ(cluster_wal_inputs_ctrc_replays_acquire_v1(*inputs), 0);
+	scope_native_acquire_result = cluster_wal_inputs_ctrc_replays_acquire_v1(*inputs);
+	/* This opt-in fixture exercises refusal before the first native IR.
+	 * It must not proceed with namespace/census setup after that refusal. */
+	if (scope_native_capture_hook != NULL) return;
+	UT_ASSERT_EQ(scope_native_acquire_result, 0);
 	UT_ASSERT_EQ(cluster_wal_inputs_ctrc_namespace_v1(*inputs, &scope_native_fd), 0);
 	UT_ASSERT_EQ(mkdirat(scope_native_fd, "base", 0700), 0);
 	UT_ASSERT_EQ(mkdirat(scope_native_fd, "base/5", 0700), 0);
