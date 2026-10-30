@@ -1120,6 +1120,7 @@ cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **held)
 #include "test_cluster_recovery_episode_page_history.inc"
 #include "test_cluster_recovery_episode_page_sources.inc"
 #include "test_cluster_recovery_consumed_native_redo.inc"
+#include "test_cluster_recovery_native_callback.inc"
 #include "test_cluster_recovery_episode_generation_xid.inc"
 #include "test_cluster_recovery_clog_full_roots.inc"
 #include "test_cluster_recovery_scope_census.inc"
@@ -1151,6 +1152,15 @@ main(int argc, char **argv)
 	if (getenv("PGRAC_PRE2_TEST_SCOPE_CENSUS") != NULL) {
 		UT_PLAN(4);
 		scope_census_run();
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_NATIVE_CALLBACK") != NULL) {
+		UT_PLAN(5);
+		UT_RUN(test_episode_native_callback_consumes_only_after_sync_and_reads_whole_pages);
+		UT_RUN(test_episode_native_callback_sync_failures_keep_attempt_fd_and_debt);
+		UT_RUN(test_episode_native_callback_late_source_and_frame_changes_keep_one_attempt);
+		UT_RUN(test_episode_native_callback_does_not_replace_foreign_cold_consumption);
+		UT_RUN(test_episode_native_callback_cannot_replace_earlier_held_observation);
 		UT_DONE(); return ut_failed_count != 0;
 	}
 	if (getenv("PGRAC_PRE2_TEST_CONSUMED_NATIVE") != NULL) {
@@ -1403,7 +1413,7 @@ main(int argc, char **argv)
 		UT_RUN(test_episode_page_sources_preserve_unrelated_eventless_generation);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(241);
+	UT_PLAN(246);
 	scope_census_run();
 	UT_RUN(test_episode_page_sources_refuse_same_origin_without_clog);
 	UT_RUN(test_episode_page_sources_refuse_same_origin_without_counter);
@@ -1412,6 +1422,11 @@ main(int argc, char **argv)
 	UT_RUN(test_episode_page_history_refuses_postbirth_zero_and_truncate);
 	UT_RUN(test_episode_page_history_uses_each_sources_whole_page_halfspace);
 	UT_RUN(test_episode_page_history_preserves_prebirth_legacy_input);
+	UT_RUN(test_episode_native_callback_consumes_only_after_sync_and_reads_whole_pages);
+	UT_RUN(test_episode_native_callback_sync_failures_keep_attempt_fd_and_debt);
+	UT_RUN(test_episode_native_callback_late_source_and_frame_changes_keep_one_attempt);
+	UT_RUN(test_episode_native_callback_does_not_replace_foreign_cold_consumption);
+	UT_RUN(test_episode_native_callback_cannot_replace_earlier_held_observation);
 	UT_RUN(test_episode_consumed_native_redo_reaches_original_sync_and_whole_page);
 	UT_RUN(test_episode_consumed_native_dirty_status_is_not_a_disk_commit);
 	UT_RUN(test_episode_consumed_native_redo_cannot_rebase_an_earlier_held_page);

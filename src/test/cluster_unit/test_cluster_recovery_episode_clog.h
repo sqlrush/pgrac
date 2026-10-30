@@ -26,4 +26,12 @@ extern void test_episode_native_clog_redo(XLogReaderState *reader);
 /* Fixture outcome through original CLOG storage, not XACT/TT authority. */
 extern void test_episode_native_clog_set_committed(TransactionId xid);
 extern void test_episode_native_clog_write_all(void);
+/* Execute the complete original native callback. Faults occur only after
+ * original redo, before its synchronous completion/readback. */
+typedef struct TestEpisodeClogReplayStats {
+	unsigned redos, touches, file_syncs, directory_syncs;
+	bool returned;
+} TestEpisodeClogReplayStats;
+extern void test_episode_native_clog_replay(XLogReaderState *reader,
+	TimeLineID timeline, unsigned sync_fault, TestEpisodeClogReplayStats *stats);
 #endif
