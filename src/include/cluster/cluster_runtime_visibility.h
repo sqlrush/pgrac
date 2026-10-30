@@ -255,6 +255,14 @@ extern bool cluster_runtime_visibility_operation_origin_read_begin(
 	const ClusterSavepointOperation *expected, const ClusterItlSlotData *head, const BufferTag *tag,
 	ClusterTxResolveMode mode, const ClusterSemanticAdmissionToken *admission,
 	ClusterTxResolveReason *reason_out);
+/* Only an already-qualified canonical owner from this retained construction
+ * may supply V1's missing generation/FullXid. All three phases still run;
+ * every V1 byte must be unchanged, and no current publication is invented. */
+extern bool cluster_runtime_visibility_operation_origin_read_begin_retained(
+	ClusterRuntimeVisibilityOperationRead *read, const ClusterTxLocator *locator,
+	const ClusterSavepointReaderIdentity *owner, const ClusterItlSlotData *head,
+	const BufferTag *tag, ClusterTxResolveMode mode, const ClusterSemanticAdmissionToken *admission,
+	ClusterTxResolveReason *reason_out);
 extern ClusterRuntimeVisibilityOperationStep cluster_runtime_visibility_operation_origin_read_poll(
 	ClusterRuntimeVisibilityOperationRead *read, ClusterSavepointReaderIdentity *identity_out,
 	ClusterTxResolution *top_out, ClusterSavepointReaderRecord *operation_out,

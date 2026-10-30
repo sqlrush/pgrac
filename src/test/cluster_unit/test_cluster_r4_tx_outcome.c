@@ -7652,7 +7652,7 @@ UT_TEST(test_retained_slot_identity_does_not_escape_original_final_fences)
 int
 main(void)
 {
-	UT_PLAN(379);
+	UT_PLAN(387);
 	UT_RUN(test_operation_worker_real_builder_yields_before_visibility);
 	UT_RUN(test_operation_worker_real_origin_completes_private_inverse);
 	UT_RUN(test_operation_worker_pending_current_is_bounded_and_counts_once);
@@ -8033,6 +8033,14 @@ main(void)
 	UT_RUN(test_operation_own_top_head_uses_original_three_current_phases);
 	UT_RUN(test_operation_own_top_head_keeps_identity_and_fresh_data_fences);
 	UT_RUN(test_operation_own_top_head_error_cleanup_and_old_entry_refusal);
+	UT_RUN(test_holder_mixed_v1_keeps_qualified_survivors);
+	UT_RUN(test_holder_mixed_v1_refuses_drift_without_partial_result);
+	UT_RUN(test_holder_mixed_v1_requires_exact_retained_top_and_sequence);
+	UT_RUN(test_holder_mixed_v1_release_error_cleans_exact_reader);
+	UT_RUN(test_holder_mixed_v1_projects_all_modifier_roles);
+	UT_RUN(test_holder_mixed_v1_keeps_active_sample_conservative);
+	UT_RUN(test_holder_mixed_v1_cross_update_keeps_page_roles_independent);
+	UT_RUN(test_holder_mixed_v1_does_not_invent_another_top_identity);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

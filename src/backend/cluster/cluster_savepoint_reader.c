@@ -353,15 +353,17 @@ cluster_savepoint_reader_discover_head(const ClusterItlSlotData *head, const Buf
 	return true;
 }
 
-/* Only an explicit current-owner binding can qualify a V1 bridge. Its
- * missing FullXid/generation are compare inputs, not facts inferred from DATA. */
+/* A retained qualified operation supplies only the compare identity missing
+ * from V1. The original reader must still sample TT and reacquire DATA. */
 bool
-cluster_savepoint_reader_discover_own_head(const ClusterSavepointOperation *owner,
-										   const ClusterItlSlotData *head, const BufferTag *tag,
-										   const ClusterTxLocator *locator, const char page[BLCKSZ],
-										   ClusterSavepointReaderIdentity *out)
+cluster_savepoint_reader_discover_retained_head(const ClusterSavepointReaderIdentity *owner,
+												const ClusterItlSlotData *head,
+												const BufferTag *tag,
+												const ClusterTxLocator *locator,
+												const char page[BLCKSZ],
+												ClusterSavepointReaderIdentity *out)
 {
-	ClusterSavepointReaderIdentity identity = { 0 };
+	ClusterSavepointReaderIdentity identity;
 	ClusterSavepointReaderRecord decoded;
 	ClusterTxLocator exact;
 	UndoRecordHeader record;
@@ -371,35 +373,25 @@ cluster_savepoint_reader_discover_own_head(const ClusterSavepointOperation *owne
 		return false;
 	memset(out, 0, sizeof(*out));
 	if (owner == NULL || head == NULL || tag == NULL || locator == NULL
-		|| U64FromFullTransactionId(owner->operation_fxid)
-			   != U64FromFullTransactionId(owner->top_fxid)
-		|| owner->operation_sequence != 0 || owner->command_id != InvalidCommandId
-		|| owner->subid != TopSubTransactionId
+		|| owner->operation_sequence != 0
 		|| !savepoint_reader_record(locator, page, &record, &slot))
 		return false;
 	exact = *locator;
 	if (exact.tt_wrap == TT_WRAP_INVALID)
-		exact.tt_wrap = owner->top.slot_wrap;
-	if (!savepoint_reader_binding_valid(owner, &exact))
+		exact.tt_wrap = owner->canonical.wrap;
+	if (!savepoint_reader_identity_valid(owner, &exact))
 		return false;
 	if (record.flags & UNDO_REC_FLAG_HAS_OPERATION) {
 		if (!cluster_savepoint_reader_discover_head(head, tag, &exact, page, &identity)
-			|| identity.canonical_generation != owner->top.segment_generation
-			|| U64FromFullTransactionId(identity.top_fxid)
-				   != U64FromFullTransactionId(owner->top_fxid)
-			|| identity.canonical.segment_id != owner->top.segment_id
-			|| identity.canonical.slot_offset != owner->top.slot_offset
-			|| identity.canonical.wrap != owner->top.slot_wrap)
+			|| identity.canonical_generation != owner->canonical_generation
+			|| !FullTransactionIdEquals(identity.top_fxid, owner->top_fxid)
+			|| identity.canonical.segment_id != owner->canonical.segment_id
+			|| identity.canonical.xid != owner->canonical.xid
+			|| identity.canonical.slot_offset != owner->canonical.slot_offset
+			|| identity.canonical.wrap != owner->canonical.wrap)
 			return false;
 	} else {
-		identity.canonical = (ClusterTTSlotPhysicalLocator){ .segment_id = owner->top.segment_id,
-															 .xid = owner->top.xid,
-															 .slot_offset = owner->top.slot_offset,
-															 .wrap = owner->top.slot_wrap };
-		identity.canonical_generation = owner->top.segment_generation;
-		identity.top_fxid = identity.operation_fxid = owner->top_fxid;
-		identity.command_id = InvalidCommandId;
-		identity.subid = TopSubTransactionId;
+		identity = *owner;
 		if (record.target_locator.spcOid != tag->spcOid || record.target_locator.dbOid != tag->dbOid
 			|| record.target_locator.relNumber != tag->relNumber
 			|| record.target_fork != tag->forkNum
@@ -411,6 +403,41 @@ cluster_savepoint_reader_discover_own_head(const ClusterSavepointOperation *owne
 	}
 	*out = identity;
 	return true;
+}
+
+/* Own-history callers must additionally prove the original publication.
+ * Historical holders cannot fabricate that live-backend receipt. */
+bool
+cluster_savepoint_reader_discover_own_head(const ClusterSavepointOperation *owner,
+										   const ClusterItlSlotData *head, const BufferTag *tag,
+										   const ClusterTxLocator *locator, const char page[BLCKSZ],
+										   ClusterSavepointReaderIdentity *out)
+{
+	ClusterSavepointReaderIdentity identity = { 0 };
+	ClusterTxLocator exact;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (owner == NULL || locator == NULL
+		|| !FullTransactionIdEquals(owner->operation_fxid, owner->top_fxid)
+		|| owner->operation_sequence != 0 || owner->command_id != InvalidCommandId
+		|| owner->subid != TopSubTransactionId)
+		return false;
+	exact = *locator;
+	if (exact.tt_wrap == TT_WRAP_INVALID)
+		exact.tt_wrap = owner->top.slot_wrap;
+	if (!savepoint_reader_binding_valid(owner, &exact))
+		return false;
+	identity.canonical = (ClusterTTSlotPhysicalLocator){ .segment_id = owner->top.segment_id,
+														 .xid = owner->top.xid,
+														 .slot_offset = owner->top.slot_offset,
+														 .wrap = owner->top.slot_wrap };
+	identity.canonical_generation = owner->top.segment_generation;
+	identity.top_fxid = identity.operation_fxid = owner->top_fxid;
+	identity.command_id = InvalidCommandId;
+	identity.subid = TopSubTransactionId;
+	return cluster_savepoint_reader_discover_retained_head(&identity, head, tag, &exact, page, out);
 }
 
 #endif

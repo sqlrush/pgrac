@@ -70,6 +70,13 @@ cluster_savepoint_reader_extract_identity(const ClusterSavepointReaderIdentity *
  * Unknown TT wrap may be filled only from this first addressed head. */
 /* Mixed own history additionally requires the caller's published current top.
  * A zero sequence denotes a V1 link, never a child operation or CID receipt. */
+/* owner is the exact canonical identity already qualified by an operation
+ * in this same retained construction, normalized to top-only/sequence zero.
+ * It grants no LIVE/CID receipt, publication, visibility or retention proof. */
+extern bool cluster_savepoint_reader_discover_retained_head(
+	const ClusterSavepointReaderIdentity *owner, const ClusterItlSlotData *head,
+	const BufferTag *tag, const ClusterTxLocator *locator, const char page[BLCKSZ],
+	ClusterSavepointReaderIdentity *out);
 extern bool cluster_savepoint_reader_discover_own_head(
 	const ClusterSavepointOperation *owner, const ClusterItlSlotData *head, const BufferTag *tag,
 	const ClusterTxLocator *locator, const char page[BLCKSZ], ClusterSavepointReaderIdentity *out);

@@ -902,7 +902,8 @@ cr_r4_operation_top(CrR4OperationContext *operation, uint32 limit, bool *conserv
 			|| top->generation != identity->canonical_generation)
 			continue;
 		if (!FullTransactionIdEquals(top->top_fxid, identity->top_fxid)
-			|| identity->operation_sequence >= top->last_sequence)
+			|| (identity->operation_sequence != 0 && top->last_sequence != 0
+				&& identity->operation_sequence >= top->last_sequence))
 			return false;
 		break;
 	}
@@ -926,7 +927,8 @@ cr_r4_operation_top(CrR4OperationContext *operation, uint32 limit, bool *conserv
 		top->terminal_outcome = operation->top.outcome;
 		top->terminal_commit_scn = operation->top.commit_scn;
 	}
-	top->last_sequence = identity->operation_sequence;
+	if (identity->operation_sequence != 0)
+		top->last_sequence = identity->operation_sequence;
 	top->conservative |= operation->top.outcome == CLUSTER_TX_IN_PROGRESS;
 	*conservative = top->conservative;
 	return true;
@@ -1355,7 +1357,8 @@ cr_r4_operation_apply(CrR4OperationContext *operation, ClusterR4CrBuildContext *
 		return false;
 	record = (UndoRecordHeader *)record_bytes;
 	keep = !conservative
-		   && operation->operation.operation.effect_state == CLUSTER_SAVEPOINT_EFFECT_LIVE
+		   && (operation->identity.operation_sequence == 0
+			   || operation->operation.operation.effect_state == CLUSTER_SAVEPOINT_EFFECT_LIVE)
 		   && operation->top.outcome == CLUSTER_TX_COMMITTED
 		   && scn_time_cmp(operation->top.commit_scn, extension->route_proof.read_scn) <= 0;
 	*locator = operation->top.locator_echo;
@@ -1364,6 +1367,54 @@ cr_r4_operation_apply(CrR4OperationContext *operation, ClusterR4CrBuildContext *
 	operation->operation_mode = true;
 	context->record_format = 2;
 	return true;
+}
+
+/* The preliminary record selects an existing compare identity only. Original
+ * DATA/TT/fresh DATA must independently requalify that same canonical top. */
+static const CrR4OperationTop *
+cr_r4_operation_retained_top(const CrR4OperationContext *operation, const ClusterTxLocator *locator,
+							 const UndoRecordHeader *record)
+{
+	uint32 segment, block;
+	uint16 offset, row;
+
+	if (!uba_decode_record(locator->uba, &segment, &block, &offset, &row)
+		|| record->tt_wrap_plus1 == 0)
+		return NULL;
+	for (const CrR4OperationTop *top = operation->tops; top != NULL; top = top->next)
+		if (top->canonical.segment_id == record->tt_slot_segment_id
+			&& top->canonical.xid == locator->xid && top->canonical.slot_offset == offset
+			&& top->canonical.wrap == record->tt_wrap_plus1 - 1)
+			return top;
+	return NULL;
+}
+
+static bool
+cr_r4_operation_begin(CrR4OperationContext *operation, const ClusterTxLocator *locator,
+					  const ClusterR4CrSlotExtension *extension, Page page,
+					  const UndoRecordHeader *record)
+{
+	const ClusterItlSlotData *head = &ClusterPageGetItlSlots(page)[locator->itl_slot_index];
+	const BufferTag *tag = &extension->route_proof.tag;
+	ClusterTxResolveReason reason;
+	const CrR4OperationTop *top;
+	ClusterSavepointReaderIdentity owner = { 0 };
+
+	if (record->flags & UNDO_REC_FLAG_HAS_OPERATION)
+		return cluster_runtime_visibility_operation_origin_read_begin(
+			&operation->read, locator, NULL, head, tag, CLUSTER_TX_RESOLVE_VISIBILITY,
+			&operation->admission, &reason);
+	top = cr_r4_operation_retained_top(operation, locator, record);
+	if (top == NULL)
+		return false;
+	owner.canonical = top->canonical;
+	owner.canonical_generation = top->generation;
+	owner.top_fxid = owner.operation_fxid = top->top_fxid;
+	owner.command_id = InvalidCommandId;
+	owner.subid = TopSubTransactionId;
+	return cluster_runtime_visibility_operation_origin_read_begin_retained(
+		&operation->read, locator, &owner, head, tag, CLUSTER_TX_RESOLVE_VISIBILITY,
+		&operation->admission, &reason);
 }
 
 /* false is a typed refusal, including a foreign operation. The preliminary
@@ -1385,11 +1436,8 @@ cr_r4_operation_step(uint32 index, ClusterR4CrBuildContext *context, ClusterTxLo
 	if (!operation->reading) {
 		operation->locator = *locator;
 		memcpy(operation->source.data, operation->result_page, BLCKSZ);
-		if (!cluster_runtime_visibility_operation_origin_read_begin(
-				&operation->read, locator, NULL,
-				&ClusterPageGetItlSlots((Page)page)[locator->itl_slot_index],
-				&extension->route_proof.tag, CLUSTER_TX_RESOLVE_VISIBILITY, &operation->admission,
-				&reason))
+		if (!cr_r4_operation_begin(operation, locator, extension, (Page)page,
+								   (UndoRecordHeader *)record_bytes))
 			return CLUSTER_R4_CR_STEP_FAIL;
 		operation->reading = true;
 		return CLUSTER_R4_CR_STEP_PENDING;
@@ -1414,8 +1462,8 @@ cr_r4_operation_step(uint32 index, ClusterR4CrBuildContext *context, ClusterTxLo
 }
 
 /* Once an operation is seen, its restored old head is not a read-SCN horizon.
- * Inspect every retained head; an old legacy survivor is explicitly refused
- * below, until the complete mixed survivor projection is available. */
+ * Inspect every retained head. A V1 survivor needs this construction's exact
+ * previously-qualified canonical owner; an unknown owner stays refused. */
 static bool
 cr_r4_operation_reselect(ClusterR4CrBuildContext *context, Page page)
 {
@@ -1815,7 +1863,11 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation, bool 
 				return CLUSTER_R4_CR_STEP_FAIL;
 			}
 			record = (UndoRecordHeader *)record_buffer.data;
-			if ((record->flags & UNDO_REC_FLAG_HAS_OPERATION) != 0) {
+			if ((record->flags & UNDO_REC_FLAG_HAS_OPERATION) != 0
+				|| (CrR4OperationContexts[slot_index].operation_mode
+					&& cr_r4_operation_retained_top(&CrR4OperationContexts[slot_index], locator,
+													record)
+						   != NULL)) {
 				*reason_out = CLUSTER_CR_BUILD_BAD_UNDO;
 				if (record_from_foreign_page)
 					return CLUSTER_R4_CR_STEP_FAIL;

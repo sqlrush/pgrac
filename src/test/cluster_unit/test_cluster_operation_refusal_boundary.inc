@@ -33,6 +33,22 @@ cluster_runtime_visibility_operation_origin_read_begin(
 	return false;
 }
 
+/* Legacy fixtures never authorize retained operation/V1 continuations. */
+bool
+cluster_runtime_visibility_operation_origin_read_begin_retained(
+	ClusterRuntimeVisibilityOperationRead *state pg_attribute_unused(),
+	const ClusterTxLocator *locator pg_attribute_unused(),
+	const ClusterSavepointReaderIdentity *owner pg_attribute_unused(),
+	const ClusterItlSlotData *head pg_attribute_unused(),
+	const BufferTag *tag pg_attribute_unused(), ClusterTxResolveMode mode pg_attribute_unused(),
+	const ClusterSemanticAdmissionToken *admission pg_attribute_unused(),
+	ClusterTxResolveReason *reason)
+{
+	UT_ASSERT(false);
+	*reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+	return false;
+}
+
 ClusterRuntimeVisibilityOperationStep
 cluster_runtime_visibility_operation_origin_read_poll(
 	ClusterRuntimeVisibilityOperationRead *state pg_attribute_unused(),

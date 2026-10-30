@@ -4740,3 +4740,553 @@ UT_TEST(test_update_multidata_old_page_lock_does_not_create_new_role)
 		for (unsigned mode = 0; mode < 2; mode++)
 			update_multidata_latest_lock(3, layout, mode);
 }
+
+
+/* Mixed V1/child history follows a newer top, with write < commit < read.
+ * Every existing storage/current/native boundary stays unchanged. */
+static char *
+holder_mixed_record(unsigned row, UndoSlotDirEntry **directory)
+{
+	char *page
+		= row < 8 ? test_operation_page.data : test_operation_multidata_pages[row / 8 - 1].data;
+
+	*directory = (UndoSlotDirEntry *)(page + BLCKSZ - (row % 8 + 1) * sizeof(**directory));
+	return page + (*directory)->record_offset;
+}
+
+static bool
+holder_mixed_v1(unsigned row, unsigned pattern)
+{
+	return row < 12 && (pattern == 0 ? row % 2 == 0 : row < (pattern == 1 ? 10 : 11));
+}
+
+static void
+holder_mixed_init(OperationWorkerFixture *f, unsigned layout, unsigned pattern, unsigned mode)
+{
+	ClusterItlSlotData *slots;
+
+	operation_worker_multitop_data(f, 1, layout);
+	f->extension.route_proof.read_scn = 75;
+	test_tt_slot.commit_scn = mode == 2 ? 78 : 72;
+	test_mixed_top_slot.status = TT_SLOT_ACTIVE;
+	test_mixed_top_slot.commit_scn = InvalidScn;
+	test_mixed_top_native_status = TRANSACTION_STATUS_IN_PROGRESS;
+	test_twophase_xid = TEST_ORIGIN_XID + 2;
+	for (unsigned row = 0; row < 24; row++) {
+		UndoSlotDirEntry *directory;
+		char *bytes = holder_mixed_record(row, &directory);
+		UndoRecordHeader record;
+		UndoItlHistoryTrailer history;
+		UndoOperationTrailer tail;
+
+		memcpy(&record, bytes, sizeof(record));
+		memcpy(&history, bytes + sizeof(record) + sizeof(UndoInsertPayload), sizeof(history));
+		memcpy(&tail, bytes + directory->record_length - sizeof(tail), sizeof(tail));
+		if (row >= 12) {
+			record.write_scn += 8;
+			history.entries[0].after_write_scn += 8;
+			if (row > 12)
+				history.entries[0].prior.write_scn += 8;
+			else if (layout & 2)
+				history.entries[0].prior.commit_scn = test_tt_slot.commit_scn;
+		}
+		if (holder_mixed_v1(row, pattern)) {
+			record.flags &= ~UNDO_REC_FLAG_HAS_OPERATION;
+			record.xid = TEST_ORIGIN_XID;
+			record.payload_length -= sizeof(tail);
+			directory->record_length -= sizeof(tail);
+			HeapTupleHeaderSetXmin(
+				(HeapTupleHeader)PageGetItem((Page)f->cr.source.data,
+											 PageGetItemId((Page)f->cr.source.data, row + 2)),
+				TEST_ORIGIN_XID);
+		} else {
+			if (row < 12 && mode == 1 && row % 3 == 2)
+				tail.effect_state = CLUSTER_SAVEPOINT_EFFECT_DISCARDED;
+			memcpy(bytes + directory->record_length - sizeof(tail), &tail, sizeof(tail));
+		}
+		directory->flags = record.flags;
+		memcpy(bytes, &record, sizeof(record));
+		memcpy(bytes + sizeof(record) + sizeof(UndoInsertPayload), &history, sizeof(history));
+	}
+	slots = ClusterPageGetItlSlots((Page)f->cr.source.data);
+	if (!(layout & 2))
+		slots[2].commit_scn = test_tt_slot.commit_scn;
+	slots[layout & 2 ? 2 : 4].flags = ITL_FLAG_ACTIVE;
+	slots[layout & 2 ? 2 : 4].commit_scn = InvalidScn;
+	slots[layout & 2 ? 2 : 4].write_scn = 91;
+	if (mode == 3) {
+		test_tt_slot.status = TT_SLOT_ACTIVE;
+		test_tt_slot.commit_scn = InvalidScn;
+		test_native_status = TRANSACTION_STATUS_IN_PROGRESS;
+		test_twophase_xid = TEST_ORIGIN_XID;
+		test_mixed_top_slot.status = TT_SLOT_COMMITTED;
+		test_mixed_top_slot.commit_scn = 100;
+		test_mixed_top_native_status = TRANSACTION_STATUS_COMMITTED;
+		slots[2].flags = ITL_FLAG_ACTIVE;
+		slots[2].commit_scn = InvalidScn;
+		slots[4].flags = ITL_FLAG_COMMITTED;
+		slots[4].commit_scn = 100;
+	}
+}
+
+static void
+holder_mixed_expected(char expected[BLCKSZ], const OperationWorkerFixture *f, unsigned layout,
+					  unsigned pattern, unsigned mode)
+{
+	int last = -1;
+	ClusterItlSlotData *slots;
+
+	memcpy(expected, f->cr.source.data, BLCKSZ);
+	for (unsigned row = 0; row < 24; row++) {
+		bool keep
+			= row < 12 && mode < 2 && (mode != 1 || holder_mixed_v1(row, pattern) || row % 3 != 2);
+
+		if (keep)
+			last = row;
+		else
+			ItemIdSetUnused(PageGetItemId((Page)expected, row + 2));
+	}
+	slots = ClusterPageGetItlSlots((Page)expected);
+	slots[2] = (ClusterItlSlotData){ .wrap = 8 };
+	if (last >= 0)
+		slots[2]
+			= (ClusterItlSlotData){ .xid = TEST_ORIGIN_XID,
+									.wrap = 8,
+									.flags = last == 11 ? ITL_FLAG_COMMITTED : ITL_FLAG_ACTIVE,
+									.commit_scn = last == 11 ? test_tt_slot.commit_scn : InvalidScn,
+									.write_scn = 60 + last,
+									.undo_segment_head = operation_worker_multitop_address(last) };
+	if (!(layout & 2))
+		slots[4] = (ClusterItlSlotData){ .wrap = 14 };
+}
+
+static void
+holder_mixed_assert_full(OperationWorkerFixture *f, const char expected[BLCKSZ], int allocations)
+{
+	UT_ASSERT_EQ(operation_worker_long_finish(f), CLUSTER_R4_CR_STEP_FULL);
+	UT_ASSERT_EQ(f->reason, CLUSTER_CR_BUILD_NONE);
+	UT_ASSERT_EQ(memcmp(expected, f->cr.source.data, BLCKSZ), 0);
+	UT_ASSERT_EQ(f->extension.build_steps, 24);
+	UT_ASSERT_EQ(test_candidate_acquire_calls, 72);
+	UT_ASSERT_EQ(test_candidate_release_calls, 72);
+	UT_ASSERT_EQ(test_candidate_held_count, 0);
+	UT_ASSERT_EQ(test_candidate_max_held_count, 1);
+	UT_ASSERT_EQ(test_candidate_cancel_calls, 0);
+	UT_ASSERT_EQ(test_operation_multidata_request_count, 48);
+	UT_ASSERT_EQ(test_candidate_data_pin_calls, 0);
+	UT_ASSERT_EQ(test_operation_pin_depth, 0);
+	cluster_cr_build_on_holder_forget(0, 1000);
+	cluster_cr_build_on_holder_forget(0, 1000);
+	UT_ASSERT_EQ(operation_worker_allocations, allocations);
+}
+
+UT_TEST(test_holder_mixed_v1_keeps_qualified_survivors)
+{
+	for (unsigned layout = 0; layout < 4; layout++)
+		for (unsigned pattern = 0; pattern < 3; pattern++)
+			for (unsigned mode = 0; mode < 3; mode++) {
+				OperationWorkerFixture f;
+				PGAlignedBlock expected;
+				int allocations = operation_worker_allocations;
+
+				holder_mixed_init(&f, layout, pattern, mode);
+				holder_mixed_expected(expected.data, &f, layout, pattern, mode);
+				holder_mixed_assert_full(&f, expected.data, allocations);
+			}
+}
+
+static unsigned holder_mixed_fault;
+static bool holder_mixed_same_segment;
+
+/* The first V1 follows thirteen completely qualified records. */
+static void
+holder_mixed_observe(void)
+{
+	UndoSlotDirEntry *directory;
+	char *bytes;
+
+	if (test_candidate_release_calls != 40)
+		return;
+	bytes = holder_mixed_record(10, &directory);
+	if (holder_mixed_fault == 0) {
+		UndoRecordHeader record;
+
+		memcpy(&record, bytes, sizeof(record));
+		record.write_scn++;
+		memcpy(bytes, &record, sizeof(record));
+	} else if (holder_mixed_fault == 1) {
+		if (holder_mixed_same_segment)
+			test_candidate_data_generation++;
+		else
+			test_candidate_tt_generation++;
+	} else if (holder_mixed_fault == 2) {
+		test_tt_slot.status = TT_SLOT_ABORTED;
+		test_tt_slot.commit_scn = InvalidScn;
+		test_native_status = TRANSACTION_STATUS_ABORTED;
+	} else if (holder_mixed_fault == 3)
+		test_admission_revoked = true;
+	else if (holder_mixed_fault == 4)
+		test_tt_slot.status = TT_SLOT_UNUSED;
+	else if (holder_mixed_fault == 5)
+		test_tt_slot.wrap++;
+	else
+		test_tt_slot.commit_scn++;
+}
+
+UT_TEST(test_holder_mixed_v1_refuses_drift_without_partial_result)
+{
+	for (unsigned same = 0; same < 2; same++)
+		for (unsigned fault = 0; fault < 7; fault++) {
+			OperationWorkerFixture f;
+			PGAlignedBlock expected;
+			int allocations = operation_worker_allocations;
+
+			holder_mixed_init(&f, same | 2, 0, 0);
+			holder_mixed_expected(expected.data, &f, same | 2, 0, 0);
+			holder_mixed_fault = fault;
+			holder_mixed_same_segment = same;
+			test_operation_release_observer = holder_mixed_observe;
+			UT_ASSERT_EQ(operation_worker_long_finish(&f), CLUSTER_R4_CR_STEP_FAIL);
+			UT_ASSERT_EQ(f.reason,
+						 fault == 3 ? CLUSTER_CR_BUILD_PROTOCOL : CLUSTER_CR_BUILD_BAD_UNDO);
+			UT_ASSERT_EQ(memcmp(expected.data, f.cr.source.data, BLCKSZ), 0);
+			UT_ASSERT_EQ(test_candidate_held_count, 0);
+			cluster_cr_build_on_holder_forget(0, 1000);
+			UT_ASSERT_EQ(operation_worker_allocations, allocations);
+		}
+}
+
+static void
+holder_mixed_corrupt(unsigned fault)
+{
+	UndoSlotDirEntry *directory;
+	char *bytes = holder_mixed_record(fault == 6 ? 9 : 10, &directory);
+	UndoRecordHeader record;
+	UndoItlHistoryTrailer history;
+
+	memcpy(&record, bytes, sizeof(record));
+	memcpy(&history, bytes + sizeof(record) + sizeof(UndoInsertPayload), sizeof(history));
+	if (fault == 0)
+		record.xid++;
+	if (fault == 1)
+		record.tt_wrap_plus1++;
+	if (fault == 2)
+		record.tt_slot_segment_id++;
+	if (fault == 3)
+		record.target_locator.relNumber++;
+	if (fault == 4)
+		history.entries[0].after_write_scn++;
+	if (fault == 5)
+		record.flags &= ~UNDO_REC_FLAG_HAS_ITL_HISTORY;
+	if (fault == 6) {
+		UndoOperationTrailer tail;
+
+		memcpy(&tail, bytes + directory->record_length - sizeof(tail), sizeof(tail));
+		tail.operation_sequence = 511;
+		memcpy(bytes + directory->record_length - sizeof(tail), &tail, sizeof(tail));
+	}
+	memcpy(bytes, &record, sizeof(record));
+	memcpy(bytes + sizeof(record) + sizeof(UndoInsertPayload), &history, sizeof(history));
+	directory->flags = record.flags;
+}
+
+UT_TEST(test_holder_mixed_v1_requires_exact_retained_top_and_sequence)
+{
+	for (unsigned layout = 0; layout < 4; layout++)
+		for (unsigned fault = 0; fault < 7; fault++) {
+			OperationWorkerFixture f;
+			PGAlignedBlock expected;
+			int allocations = operation_worker_allocations;
+
+			holder_mixed_init(&f, layout, 0, 0);
+			holder_mixed_expected(expected.data, &f, layout, 0, 0);
+			holder_mixed_corrupt(fault);
+			UT_ASSERT_EQ(operation_worker_long_finish(&f), CLUSTER_R4_CR_STEP_FAIL);
+			UT_ASSERT_EQ(f.reason, CLUSTER_CR_BUILD_BAD_UNDO);
+			UT_ASSERT_EQ(memcmp(expected.data, f.cr.source.data, BLCKSZ), 0);
+			UT_ASSERT_EQ(test_candidate_held_count, 0);
+			cluster_cr_build_on_holder_forget(0, 1000);
+			UT_ASSERT_EQ(operation_worker_allocations, allocations);
+		}
+}
+
+UT_TEST(test_holder_mixed_v1_release_error_cleans_exact_reader)
+{
+	for (unsigned same = 0; same < 2; same++)
+		for (unsigned phase = 1; phase <= 3; phase++) {
+			OperationWorkerFixture f;
+			PGAlignedBlock expected;
+			volatile bool caught = false;
+			int allocations = operation_worker_allocations;
+
+			holder_mixed_init(&f, same | 2, 0, 0);
+			holder_mixed_expected(expected.data, &f, same | 2, 0, 0);
+			operation_worker_error_release = 39 + phase;
+			test_operation_release_observer = operation_worker_error;
+			PG_TRY();
+			{
+				(void)operation_worker_long_finish(&f);
+			}
+			PG_CATCH();
+			{
+				caught = true;
+			}
+			PG_END_TRY();
+			UT_ASSERT(caught);
+			UT_ASSERT_EQ(test_candidate_cancel_calls, 1);
+			UT_ASSERT_EQ(test_candidate_held_count, 0);
+			UT_ASSERT_EQ(memcmp(expected.data, f.cr.source.data, BLCKSZ), 0);
+			cluster_cr_build_on_holder_forget(0, 1000);
+			UT_ASSERT_EQ(operation_worker_allocations, allocations);
+		}
+}
+
+
+/* Repack one record, retaining its exact row UBA and all other bytes. */
+static void
+holder_mixed_store(unsigned row, const UndoRecordHeader *record, const char *body, uint16 length,
+				   const UndoItlHistoryTrailer *history)
+{
+	UndoSlotDirEntry *directory;
+	char *page
+		= row < 8 ? test_operation_page.data : test_operation_multidata_pages[row / 8 - 1].data;
+	UndoBlockHeader *block = (UndoBlockHeader *)page;
+	char *bytes = page + block->free_offset;
+	UndoRecordHeader saved = *record;
+
+	(void)holder_mixed_record(row, &directory);
+	saved.payload_length = length + sizeof(*history);
+	directory->record_offset = block->free_offset;
+	directory->record_length = sizeof(saved) + saved.payload_length;
+	directory->record_type = saved.record_type;
+	directory->flags = saved.flags;
+	memcpy(bytes, &saved, sizeof(saved));
+	memcpy(bytes + sizeof(saved), body, length);
+	memcpy(bytes + sizeof(saved) + length, history, sizeof(*history));
+	block->free_offset += directory->record_length;
+	UT_ASSERT(block->free_offset < BLCKSZ - block->slot_count * sizeof(*directory));
+}
+
+static void
+holder_mixed_lock_edges(OperationWorkerFixture *f, UndoItlHistoryTrailer *history)
+{
+	history->entries[0].after_kind = ITL_FLAG_LOCK_ONLY_ACTIVE;
+	for (unsigned row = 11; row < 24; row++) {
+		UndoSlotDirEntry *directory;
+		char *bytes = holder_mixed_record(row, &directory);
+		UndoItlHistoryTrailer next;
+
+		memcpy(&next, bytes + sizeof(UndoRecordHeader) + sizeof(UndoInsertPayload), sizeof(next));
+		next.entries[0].prior.wrap += row == 11 ? 1 : 2;
+		if (row == 11)
+			next.entries[0].prior.flags = ITL_FLAG_LOCK_ONLY_ACTIVE;
+		memcpy(bytes + sizeof(UndoRecordHeader) + sizeof(UndoInsertPayload), &next, sizeof(next));
+	}
+	ClusterPageGetItlSlots((Page)f->cr.source.data)[2].wrap += 2;
+}
+
+static void
+holder_mixed_modifier(OperationWorkerFixture *f, uint8 kind, bool hot, char old_root[60])
+{
+	UndoSlotDirEntry *directory;
+	char *bytes = holder_mixed_record(10, &directory);
+	UndoRecordHeader record;
+	UndoItlHistoryTrailer history;
+	char body[128] = { 0 };
+	Page page = (Page)f->cr.source.data;
+	HeapTupleHeader root = (HeapTupleHeader)PageGetItem(page, PageGetItemId(page, 1));
+	uint16 length;
+
+	memcpy(&record, bytes, sizeof(record));
+	memcpy(&history, bytes + sizeof(record) + sizeof(UndoInsertPayload), sizeof(history));
+	memcpy(old_root, root, 60);
+	record.record_type = kind;
+	record.target_offset = 1;
+	HeapTupleHeaderSetXmax(root, TEST_ORIGIN_XID);
+	root->t_infomask = 0;
+	if (kind == UNDO_RECORD_UPDATE) {
+		UndoUpdatePayload update = { .new_block = 23,
+									 .new_offset = 12,
+									 .old_tuple_length = 60,
+									 .old_tuple_offset = sizeof(update) };
+
+		length = sizeof(update) + 60;
+		memcpy(body, &update, sizeof(update));
+		memcpy(body + sizeof(update), old_root, 60);
+		ItemPointerSet(&root->t_ctid, 23, 12);
+		if (hot)
+			root->t_infomask2 |= HEAP_HOT_UPDATED;
+	} else {
+		ItemIdSetUnused(PageGetItemId(page, 12));
+		if (kind == UNDO_RECORD_DELETE) {
+			UndoDeletePayload deleted
+				= { .full_tuple_length = 60, .full_tuple_offset = sizeof(deleted) };
+
+			length = sizeof(deleted) + 60;
+			memcpy(body, &deleted, sizeof(deleted));
+			memcpy(body + sizeof(deleted), old_root, 60);
+		} else {
+			UndoItlPayload lock = { .itl_slot_idx = 2,
+									.prev_flags = ITL_FLAG_ACTIVE,
+									.new_flags = ITL_FLAG_LOCK_ONLY_ACTIVE,
+									.lock_xid = TEST_ORIGIN_XID,
+									.prev_xmax = InvalidTransactionId,
+									.prev_infomask = root->t_infomask };
+
+			lock.prev_infomask = ((HeapTupleHeader)old_root)->t_infomask;
+			lock.prev_infomask2 = ((HeapTupleHeader)old_root)->t_infomask2;
+			root->t_infomask = HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_EXCL_LOCK;
+			length = sizeof(lock);
+			memcpy(body, &lock, length);
+			holder_mixed_lock_edges(f, &history);
+		}
+	}
+	holder_mixed_store(10, &record, body, length, &history);
+}
+
+UT_TEST(test_holder_mixed_v1_projects_all_modifier_roles)
+{
+	const uint8 kinds[] = { UNDO_RECORD_UPDATE, UNDO_RECORD_DELETE, UNDO_RECORD_ITL };
+
+	for (unsigned same = 0; same < 2; same++)
+		for (unsigned kind = 0; kind < lengthof(kinds); kind++)
+			for (unsigned late = 0; late < 2; late++) {
+				OperationWorkerFixture f;
+				PGAlignedBlock expected;
+				char old_root[60];
+				int allocations = operation_worker_allocations;
+
+				holder_mixed_init(&f, same | 2, 0, late ? 2 : 0);
+				holder_mixed_modifier(&f, kinds[kind], same, old_root);
+				holder_mixed_expected(expected.data, &f, same | 2, 0, late ? 2 : 0);
+				if (late)
+					memcpy(PageGetItem((Page)expected.data, PageGetItemId((Page)expected.data, 1)),
+						   old_root, 60);
+				else if (kinds[kind] == UNDO_RECORD_ITL)
+					ClusterPageGetItlSlots((Page)expected.data)[2].wrap += 2;
+				holder_mixed_assert_full(&f, expected.data, allocations);
+			}
+}
+
+static void
+holder_mixed_commit_observe(void)
+{
+	if (test_candidate_release_calls == 38) {
+		test_tt_slot.status = TT_SLOT_COMMITTED;
+		test_tt_slot.commit_scn = 72;
+		test_native_status = TRANSACTION_STATUS_COMMITTED;
+	}
+}
+
+UT_TEST(test_holder_mixed_v1_keeps_active_sample_conservative)
+{
+	for (unsigned same = 0; same < 2; same++)
+		for (unsigned commit = 0; commit < 2; commit++) {
+			OperationWorkerFixture f;
+			PGAlignedBlock expected;
+			int allocations = operation_worker_allocations;
+
+			holder_mixed_init(&f, same, 0, 3);
+			holder_mixed_expected(expected.data, &f, same, 0, 3);
+			if (commit)
+				test_operation_release_observer = holder_mixed_commit_observe;
+			holder_mixed_assert_full(&f, expected.data, allocations);
+		}
+}
+
+
+static void
+holder_mixed_cross_update(OperationWorkerFixture *f, bool new_page, char old_root[60])
+{
+	UndoSlotDirEntry *directory;
+	UndoRecordHeader record;
+	UndoItlHistoryTrailer history;
+	UndoUpdatePayload update;
+	char body[sizeof(update) + 60];
+	char *bytes;
+	Page page = (Page)f->cr.source.data;
+
+	holder_mixed_modifier(f, UNDO_RECORD_UPDATE, false, old_root);
+	bytes = holder_mixed_record(10, &directory);
+	memcpy(&record, bytes, sizeof(record));
+	memcpy(body, bytes + sizeof(record), sizeof(body));
+	memcpy(&update, body, sizeof(update));
+	memcpy(&history, bytes + sizeof(record) + sizeof(body), sizeof(history));
+	history.count = 2;
+	if (new_page) {
+		record.target_block = 22;
+		history.entries[1] = history.entries[0];
+		history.entries[0].block = 22;
+		history.entries[0].prior = (ClusterItlSlotData){ .wrap = 8 };
+		memcpy(PageGetItem(page, PageGetItemId(page, 1)), old_root, 60);
+	} else {
+		HeapTupleHeader root = (HeapTupleHeader)PageGetItem(page, PageGetItemId(page, 1));
+
+		update.new_block = 24;
+		history.entries[1] = (UndoItlHistoryEntry){ .block = 24,
+													.slot_index = 2,
+													.after_kind = ITL_FLAG_ACTIVE,
+													.after_write_scn = 70,
+													.prior = { .wrap = 8 } };
+		ItemIdSetUnused(PageGetItemId(page, 12));
+		ItemPointerSet(&root->t_ctid, 24, 12);
+	}
+	memcpy(body, &update, sizeof(update));
+	holder_mixed_store(10, &record, body, sizeof(body), &history);
+}
+
+UT_TEST(test_holder_mixed_v1_cross_update_keeps_page_roles_independent)
+{
+	for (unsigned same = 0; same < 2; same++)
+		for (unsigned new_page = 0; new_page < 2; new_page++)
+			for (unsigned late = 0; late < 2; late++) {
+				OperationWorkerFixture f;
+				PGAlignedBlock expected;
+				char old_root[60];
+				int allocations = operation_worker_allocations;
+
+				holder_mixed_init(&f, same | 2, 0, late ? 2 : 0);
+				holder_mixed_cross_update(&f, new_page, old_root);
+				holder_mixed_expected(expected.data, &f, same | 2, 0, late ? 2 : 0);
+				if (late)
+					memcpy(PageGetItem((Page)expected.data, PageGetItemId((Page)expected.data, 1)),
+						   old_root, 60);
+				holder_mixed_assert_full(&f, expected.data, allocations);
+			}
+}
+
+UT_TEST(test_holder_mixed_v1_does_not_invent_another_top_identity)
+{
+	for (unsigned layout = 0; layout < 4; layout++) {
+		OperationWorkerFixture f;
+		PGAlignedBlock expected;
+		UndoSlotDirEntry *directory;
+		UndoRecordHeader record;
+		char *bytes;
+		int allocations = operation_worker_allocations;
+
+		holder_mixed_init(&f, layout, 2, 0);
+		bytes = holder_mixed_record(11, &directory);
+		memcpy(&record, bytes, sizeof(record));
+		record.flags &= ~UNDO_REC_FLAG_HAS_OPERATION;
+		record.xid = TEST_ORIGIN_XID;
+		record.payload_length -= sizeof(UndoOperationTrailer);
+		directory->flags = record.flags;
+		directory->record_length -= sizeof(UndoOperationTrailer);
+		memcpy(bytes, &record, sizeof(record));
+		HeapTupleHeaderSetXmin(
+			(HeapTupleHeader)PageGetItem((Page)f.cr.source.data,
+										 PageGetItemId((Page)f.cr.source.data, 13)),
+			TEST_ORIGIN_XID);
+		holder_mixed_expected(expected.data, &f, layout, 2, 0);
+		UT_ASSERT_EQ(operation_worker_long_finish(&f), CLUSTER_R4_CR_STEP_FAIL);
+		UT_ASSERT_EQ(f.reason, CLUSTER_CR_BUILD_BAD_UNDO);
+		UT_ASSERT_EQ(memcmp(expected.data, f.cr.source.data, BLCKSZ), 0);
+		UT_ASSERT_EQ(f.extension.build_steps, 13);
+		UT_ASSERT_EQ(test_candidate_acquire_calls, 36);
+		UT_ASSERT_EQ(test_candidate_release_calls, 36);
+		UT_ASSERT_EQ(test_candidate_held_count, 0);
+		cluster_cr_build_on_holder_forget(0, 1000);
+		UT_ASSERT_EQ(operation_worker_allocations, allocations);
+	}
+}
