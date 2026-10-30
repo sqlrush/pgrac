@@ -230,7 +230,7 @@ sub wait_exit_cell {
 sub judge_requalification {
  my ($case,$option)=@_;
  my %keys=('--requalify-mutation'=>'mutation','--requalify'=>'requalified',
-  '--cross-page-wait'=>'pair','--cross-page'=>'cross_page');
+  '--cross-page-setup'=>'pair_setup','--cross-page-wait'=>'pair','--cross-page'=>'cross_page');
  die 'unknown requalification evaluator' unless exists($keys{$option});
  my ($input,$out,$err)=(encode_json($case),'','');
  my $ok=run([$ENV{PYTHON} // 'python3',"$FindBin::RealBin/../pre2/m2_itl_capacity.py",$option],
@@ -403,6 +403,17 @@ sub commit_cross_page_owner {
  return $observed;
 }
 
+sub check_cross_page_setup {
+ my ($case)=@_;
+ my ($proof,$error)=judge_requalification($case,'--cross-page-setup');
+ my $json=JSON::PP->new->canonical;
+ die "pair preflight evidence refused: $error" unless defined($proof)
+  && $json->encode($proof) eq $json->encode({kind=>'pair_setup',source_tag=>$case->{source_tag},
+   destination_tag=>$case->{destination_tag},update_payload_bytes=>12+$case->{before}->{tuple_bytes},
+   inline_max_bytes=>$case->{settings}->{inline_max_bytes},authoritative=>JSON::PP::false});
+ return $proof;
+}
+
 sub cross_page_cell {
  my ($node,$nodes)=@_;
  my $name='m2_b06_pair';
@@ -414,9 +425,9 @@ sub cross_page_cell {
   # there is no buffer-choice override or fallback success path.
   $node->safe_psql('postgres',"CREATE TABLE $name(id int PRIMARY KEY,v int,pad text STORAGE PLAIN);
    INSERT INTO $name SELECT g,0,'' FROM generate_series(1,8) g;
-   INSERT INTO $name VALUES(10,0,repeat('p',5800));
-   INSERT INTO $name VALUES(9,0,repeat('o',1800));
-   INSERT INTO $name VALUES(11,0,repeat('q',5600));");
+   INSERT INTO $name VALUES(10,0,repeat('p',6472));
+   INSERT INTO $name VALUES(9,0,repeat('o',900));
+   INSERT INTO $name VALUES(11,0,repeat('q',6600));");
   $node->safe_psql('postgres',"VACUUM(FREEZE) $name");
   my $layout=decode_json($node->safe_psql('postgres',"SELECT json_agg(t ORDER BY id) FROM (
    SELECT id,ctid::text AS ctid,length(pad) AS payload_bytes FROM $name) t"));
@@ -433,10 +444,17 @@ sub cross_page_cell {
   my $source_tag=[@tag[0..3],0+$source_block];
   my $before=decode_json($node->safe_psql('postgres',"SELECT row_to_json(t) FROM (
    SELECT id,v,ctid::text AS ctid,xmin::text AS xmin,xmax::text AS xmax,
-    length(pad) AS payload_bytes FROM $name WHERE id=9) t"));
+    length(pad) AS payload_bytes,pg_column_size(original) AS tuple_bytes
+    FROM $name AS original WHERE id=9) t"));
   my $settings=decode_json($node->safe_psql('postgres',"SELECT json_build_object(
-   'block_size',current_setting('block_size')::int,'payload_storage',
+   'block_size',current_setting('block_size')::int,
+   'inline_max_bytes',current_setting('cluster.undo_record_inline_max_bytes')::int,'payload_storage',
    (SELECT attstorage::text FROM pg_attribute WHERE attrelid='$name'::regclass AND attname='pad'))"));
+  my $sql="UPDATE m2_b06_pair SET v=v+1,pad=repeat('n',480) WHERE id=9;";
+  my $setup={source_tag=>$source_tag,destination_tag=>\@tag,settings=>$settings,
+   layout=>$layout,before=>$before,sql=>$sql};
+  save_json('b06-pair-preflight',$setup);
+  check_cross_page_setup($setup);
   my (@holders,%by_pid);
   for my $row (1..8) {
    my $s=session($node);
@@ -453,7 +471,6 @@ sub cross_page_cell {
   my $waiter_xid=0+$r->query_safe('SELECT pg_current_xact_id()::text');
   save_json('b06-pair-setup',{layout=>$layout,settings=>$settings,source_tag=>$source_tag,
    destination_tag=>\@tag,before=>$before,holders=>\@holders,pid=>$pid,waiter_xid=>$waiter_xid});
-  my $sql="UPDATE m2_b06_pair SET v=v+1,pad=repeat('n',1000) WHERE id=9;";
   my $offset=-s $node->logfile;
   my $until=clock_gettime(CLOCK_MONOTONIC)+10;
   $r->query_until(qr/B06_PAIR_SENT/,"\\echo B06_PAIR_SENT\n$sql\n");
@@ -487,7 +504,7 @@ sub cross_page_cell {
   my $post_xid=0+$r->query_safe('SELECT pg_current_xact_id()::text');
   my $rows=decode_json($r->query_safe("SELECT COALESCE(json_agg(t),'[]'::json) FROM (
    SELECT id,v,ctid::text AS ctid,xmin::text AS xmin,xmax::text AS xmax,length(pad) AS payload_bytes,
-    pad=repeat('n',1000) AS payload_matches FROM $name WHERE id=9) t"));
+    pad=repeat('n',480) AS payload_matches FROM $name WHERE id=9) t"));
   my $finish={cross_page=>$original,waits=>\@waits,log=>substr(slurp_file($node->logfile),$offset),
    stdout=>$out,stderr=>$r->{stderr},client_had_error=>$had_error ? JSON::PP::true : JSON::PP::false,
    reader=>$state,waiter_xid=>$post_xid,rows=>$rows,remaining=>exit_owners($node,\@holders)};
@@ -506,11 +523,11 @@ sub cross_page_cell {
   $by_pid{$_->{pid}}->query_safe('COMMIT') for @holders;
   die 'original two-page UPDATE connection was replaced' unless $r->query_safe('SELECT pg_backend_pid()') eq "$pid";
   $r->query_safe('COMMIT');
-  my $expected=join "\n",((map {"$_|1|0|t"} 1..8),'9|1|1000|t','10|0|5800|t','11|0|5600|t');
+  my $expected=join "\n",((map {"$_|1|0|t"} 1..8),'9|1|480|t','10|0|6472|t','11|0|6600|t');
   for my $member (@$nodes) {
    die 'committed two-page rows disagree across members' unless $member->safe_psql('postgres',"SELECT
-    id,v,length(pad),pad=CASE id WHEN 9 THEN repeat('n',1000) WHEN 10 THEN repeat('p',5800)
-     WHEN 11 THEN repeat('q',5600) ELSE '' END FROM $name ORDER BY id") eq $expected;
+    id,v,length(pad),pad=CASE id WHEN 9 THEN repeat('n',480) WHEN 10 THEN repeat('p',6472)
+     WHEN 11 THEN repeat('q',6600) ELSE '' END FROM $name ORDER BY id") eq $expected;
   }
   1;
  };
