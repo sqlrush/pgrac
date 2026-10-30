@@ -475,6 +475,10 @@ cluster_merge_claim_classify(const void *buf, size_t len, uint64 expected_sysid)
 /* Backend engine (cluster_recovery_merge.c). */
 typedef struct ClusterRecoveryMergeState ClusterRecoveryMergeState;
 typedef struct ClusterRecoveryFencePlan ClusterRecoveryFencePlan;
+/* Copy this caller's original cold Startup deadline for readonly pass 1.
+ * Zero is one complete attempt; false supplies no budget or authority. */
+extern bool cluster_recovery_merge_fence_plan_deadline_v1(const ClusterRecoveryFencePlan *plan,
+														  uint64 *deadline_ns);
 
 /* Engage decision (spec-4.5 §3.1).  Computed at the top of
  * PerformWalRecovery before the redo loop.  ENGAGE means: merged

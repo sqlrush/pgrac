@@ -3531,6 +3531,25 @@ cluster_recovery_merge_fence_plan_origin_count(const ClusterRecoveryFencePlan *p
 	return recovery_fence_plan_valid(plan) && plan->sealed ? plan->origin_count : 0;
 }
 
+/* Borrow the original process-local budget before typed pass 1. No clock or
+ * GUC is sampled again, and no authority is granted by this copy. */
+bool
+cluster_recovery_merge_fence_plan_deadline_v1(const ClusterRecoveryFencePlan *plan,
+											  uint64 *deadline_ns)
+{
+	if (deadline_ns == NULL)
+		return false;
+	*deadline_ns = 0;
+	if (!recovery_fence_plan_valid(plan) || !cluster_shared_config || !plan->sealed
+		|| plan->committed || plan->serial_held || plan->serial_guards.count != 0
+		|| plan->retention_pin != NULL || plan->merge_wait_timeout_ms_snapshot < 0
+		|| plan->merge_wait_timeout_ms_snapshot > 600000
+		|| (plan->merge_wait_timeout_ms_snapshot == 0) != (plan->merge_deadline_ns == 0))
+		return false;
+	*deadline_ns = plan->merge_deadline_ns;
+	return true;
+}
+
 bool
 cluster_recovery_merge_fence_plan_revalidate_nowait(ClusterRecoveryFencePlan *plan)
 {

@@ -6506,6 +6506,7 @@ UT_TEST(ordinary_recovery_complete_roles_keep_the_original_cf_wait_policy)
 #include "test_cluster_ir_pin_deadline.h"
 #include "test_cluster_seal_deadline.h"
 #include "test_cluster_classification_cf.h"
+#include "test_cluster_typed_root_budget.h"
 
 int
 main(void)
@@ -6517,6 +6518,21 @@ main(void)
 	pg_atomic_init_u64(&owner_proc.cluster_grd_redeclare_acked_epoch, 0);
 	cluster_control_request_shmem_init();
 	retire_driver = cluster_control_request_driver_start();
+	if (getenv("PGRAC_PRE2_TEST_TYPED_ROOT_BUDGET") != NULL) {
+		UT_PLAN(10);
+		UT_RUN(typed_own_root_cannot_deliver_after_the_original_plan_deadline);
+		UT_RUN(typed_own_root_zero_budget_does_not_sleep_or_reapply);
+		UT_RUN(typed_own_root_delivers_only_after_exact_ack_with_the_remaining_budget);
+		UT_RUN(typed_own_root_zero_ready_delivers_one_complete_attempt);
+		UT_RUN(typed_own_root_keeps_the_original_deadline_across_wakes_and_guc_changes);
+		UT_RUN(typed_own_root_expired_unknown_or_submillisecond_budget_starts_no_request);
+		UT_RUN(typed_own_root_cannot_deliver_a_read_that_expires_after_grant_or_io);
+		UT_RUN(typed_own_root_rejects_invalid_plan_or_held_set_before_cf);
+		UT_RUN(typed_own_root_preserves_hard_refusal_and_error_cleanup);
+		UT_RUN(typed_own_root_ack_at_the_deadline_cannot_start_another_read);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_CLASSIFICATION_CF") != NULL) {
 		UT_PLAN(10);
 		UT_RUN(startup_root_classification_restarts_before_any_fence_admission);
@@ -6776,7 +6792,7 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(253);
+	UT_PLAN(263);
 	UT_RUN(startup_cf_timeout_waits_for_exact_completion_before_begin);
 	UT_RUN(startup_cf_completion_does_not_preserve_changed_native_input);
 	UT_RUN(startup_cf_unsafe_native_context_never_takes_a_registry_lock);
@@ -7031,6 +7047,16 @@ main(void)
 	UT_RUN(startup_root_classification_does_not_adopt_preexisting_cf_debt);
 	UT_RUN(startup_root_classification_preserves_error_cleanup_and_original_sqlstate);
 	UT_RUN(startup_root_classification_exact_ack_cannot_renew_an_expired_plan);
+	UT_RUN(typed_own_root_cannot_deliver_after_the_original_plan_deadline);
+	UT_RUN(typed_own_root_zero_budget_does_not_sleep_or_reapply);
+	UT_RUN(typed_own_root_delivers_only_after_exact_ack_with_the_remaining_budget);
+	UT_RUN(typed_own_root_zero_ready_delivers_one_complete_attempt);
+	UT_RUN(typed_own_root_keeps_the_original_deadline_across_wakes_and_guc_changes);
+	UT_RUN(typed_own_root_expired_unknown_or_submillisecond_budget_starts_no_request);
+	UT_RUN(typed_own_root_cannot_deliver_a_read_that_expires_after_grant_or_io);
+	UT_RUN(typed_own_root_rejects_invalid_plan_or_held_set_before_cf);
+	UT_RUN(typed_own_root_preserves_hard_refusal_and_error_cleanup);
+	UT_RUN(typed_own_root_ack_at_the_deadline_cannot_start_another_read);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

@@ -1464,6 +1464,7 @@ test_cluster_startup_cf_callsite.inc: $(top_srcdir)/src/backend/access/transam/x
 
 test_cluster_startup_cf_entry: test_cluster_startup_cf_entry.c test_cluster_cf_enqueue.c test_cluster_cf_deadline.h test_cluster_ir_pin_deadline.h test_cluster_seal_deadline.h \
 		test_cluster_classification_cf.h test_cluster_classification_cf.inc \
+		test_cluster_typed_root_budget.h test_cluster_typed_root_budget.inc \
 		test_cluster_prepared_cf.h test_cluster_prepared_job.h test_cluster_prepared_cf.inc \
 		$(top_srcdir)/src/include/cluster/cluster_control_root_prepared.h \
 		test_cluster_generic_cf.h test_cluster_generic_cf.inc \
@@ -1525,6 +1526,17 @@ test_cluster_pre_ir_project_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_re
 	     /^recovery_fence_project_wait\(/ { print "static ClusterMergeEngage"; emit=1; n++ } \
 	     emit { print } /^}/ { emit=0 } \
 	     END { if (n != 6 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Actual typed root collection, linked to ROOT, CF and the original plan.
+test_cluster_typed_root_budget.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_merge.c \
+		$(top_srcdir)/src/backend/cluster/cluster_cold_recovery_startup.c Makefile
+	awk 'FNR == NR && /^cluster_recovery_merge_fence_plan_origin\(/ { print "bool"; emit=1; getters++ } \
+	     FNR == NR && /^cluster_recovery_merge_fence_plan_deadline_v1\(/ { print "bool"; emit=1; getters++ } \
+	     FNR == NR && /^cluster_recovery_merge_fence_plan_origin_count\(/ { print "uint16"; emit=1; getters++ } \
+	     FNR != NR && /^cold_collect_roots\(/ { print "static bool"; emit=1; callers++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (getters != 3 || callers != 1 || emit) exit 1 }' $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 
 # Actual cold preflight classification, linked to ROOT and CF.
@@ -1623,10 +1635,12 @@ test_cluster_cold_own_root_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_col
 	     FNR == NR && /^(cold_refuse|cold_own_key_refuse|cold_identity_uuid_hex|cold_own_identity_refuse)\(/ { print "static void"; emit=1; diagnostics++ } \
 	     FNR == NR && /^cold_own_root_cf_(capture|wait)\(/ { print "static void"; emit=1; helpers++ } \
 	     FNR == NR && /^cold_own_root_cf_current\(/ { print "static bool"; emit=1; checks++ } \
+	     FNR == NR && /^cold_own_root_(monotonic_ns|deadline_current)\(/ { print "static bool"; emit=1; budgets++ } \
+	     FNR == NR && /^cold_own_root_cf_budget\(/ { print "static int"; emit=1; budgets++ } \
 	     FNR == NR && /^cold_own_root\(/ { print "static bool"; emit=1; callers++ } \
 	     FNR != NR && /^(cluster_control_root_lookup_owner_by_node_runtime|cluster_control_root_lookup_owner_deadline_v1)\(/ { print "ClusterControlRootResult"; emit=1; readers++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (flags != 1 || declarations < 1 || declarations > 2 || diagnostics != 4 || helpers > 2 || checks > 1 || callers != 1 || readers != 2 || emit || types) exit 1 }' \
+	     END { if (flags != 1 || declarations < 1 || declarations > 2 || diagnostics != 4 || helpers > 2 || checks > 1 || budgets != 3 || callers != 1 || readers != 2 || emit || types) exit 1 }' \
 	     $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 

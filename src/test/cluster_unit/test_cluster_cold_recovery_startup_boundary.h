@@ -407,6 +407,18 @@ cluster_control_root_lookup_owner_by_node_runtime(int32 node, ClusterControlRoot
 }
 
 ClusterControlRootResult
+cluster_control_root_lookup_owner_deadline_v1(int32 node, ClusterControlRootIdentity *identity,
+											  ClusterControlRootSnapshot *snapshot,
+											  ClusterControlRootReadToken *token,
+											  uint64 deadline_ns)
+{
+	/* This whole-driver leaf never waits; the CF-linked suite exercises the
+	 * actual bounded ROOT consumer and original plan deadline. */
+	UT_ASSERT_EQ(deadline_ns, 0);
+	return cluster_control_root_lookup_owner_by_node_runtime(node, identity, snapshot, token);
+}
+
+ClusterControlRootResult
 cluster_control_root_recovery_source_v1(const ClusterControlRootSnapshot *root,
 										const ClusterControlRootReadToken *token,
 										ClusterWalSourceRef *source, XLogRecPtr *redo)
@@ -522,6 +534,15 @@ cluster_recovery_merge_fence_plan_origin_count(const ClusterRecoveryFencePlan *p
 {
 	(void)plan;
 	return fence_count;
+}
+
+bool
+cluster_recovery_merge_fence_plan_deadline_v1(const ClusterRecoveryFencePlan *plan,
+											  uint64 *deadline_ns)
+{
+	(void)plan;
+	*deadline_ns = 0; /* This whole-driver boundary performs no CF wait. */
+	return true;
 }
 
 bool

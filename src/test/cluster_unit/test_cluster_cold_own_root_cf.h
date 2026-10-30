@@ -18,7 +18,9 @@ own_restart(ClusterWalSourceRef *out)
 #define cluster_recovery_duty_key_compare_for_claim rejoin_key_compare_for_claim
 #define cluster_reconfig_capture_formation_snapshot_v1 own_capture
 #define cluster_wal_thread_restart_v2_ref own_restart
+#define clock_gettime cf_budget_clock_gettime
 #include "test_cluster_cold_own_root_cf.inc"
+#undef clock_gettime
 #undef cluster_wal_thread_restart_v2_ref
 #undef cluster_reconfig_capture_formation_snapshot_v1
 #undef cluster_recovery_duty_key_compare_for_claim
@@ -68,7 +70,7 @@ own_call(bool *accepted)
 
 	PG_TRY();
 	{
-		*accepted = cold_own_root(&own_typed, 1, &own_root);
+		*accepted = cold_own_root(&own_typed, 1, &own_root, NULL);
 		completed = true;
 	}
 	PG_CATCH();

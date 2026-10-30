@@ -71,6 +71,7 @@
 #include "storage/checksum.h"
 #include "postmaster/interrupt.h"
 #include "postmaster/startup.h"
+#include "portability/instr_time.h"
 #include "storage/latch.h"
 #include "storage/lwlock.h"
 #include "storage/proc.h"
@@ -345,10 +346,48 @@ cold_own_root_cf_current(const ColdOwnRootCfWait *original)
 		   && memcmp(&original->restart, &restart, sizeof(restart)) == 0;
 }
 
+static bool
+cold_own_root_monotonic_ns(uint64 *out)
+{
+	struct timespec now;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0 || now.tv_nsec < 0
+		|| now.tv_nsec >= NS_PER_S || (uint64)now.tv_sec > (UINT64_MAX - NS_PER_S) / NS_PER_S)
+		return false;
+	*out = (uint64)now.tv_sec * NS_PER_S + (uint64)now.tv_nsec;
+	return true;
+}
+
+static bool
+cold_own_root_deadline_current(const uint64 *deadline_ns)
+{
+	uint64 now;
+
+	return deadline_ns == NULL || *deadline_ns == 0
+		   || (cold_own_root_monotonic_ns(&now) && now < *deadline_ns);
+}
+
+/* NULL preserves the ordinary caller policy; zero permits no added wait.
+ * The Startup deadline was created by the original merge plan, not here. */
+static int
+cold_own_root_cf_budget(const uint64 *deadline_ns)
+{
+	uint64 now;
+	uint64 remaining_ms;
+
+	if (deadline_ns == NULL)
+		return 20;
+	if (*deadline_ns == 0 || !cold_own_root_monotonic_ns(&now) || now >= *deadline_ns)
+		return 0;
+	remaining_ms = (*deadline_ns - now) / NS_PER_MS;
+	return (int)Min(remaining_ms, UINT64_C(100));
+}
+
 /* No serial set is held in pass 1. Retire only this lookup's failed request;
  * neither its cleanup receipt nor the read below supplies replay authority. */
 static void
-cold_own_root_cf_wait(const ColdOwnRootCfWait *original, const ClusterCfAttemptObservation *attempt)
+cold_own_root_cf_wait(const ColdOwnRootCfWait *original, const ClusterCfAttemptObservation *attempt,
+					  const uint64 *deadline_ns)
 {
 	ClusterCfRetirementSnapshot retiring;
 	bool empty = attempt->owner_state_at_return == CLUSTER_LOCK_OWNER_EMPTY;
@@ -367,11 +406,16 @@ cold_own_root_cf_wait(const ColdOwnRootCfWait *original, const ClusterCfAttemptO
 	for (;;) {
 		ClusterCfRetirementSnapshot current;
 		bool held;
+		int wait_ms;
 
 		HandleStartupProcInterrupts();
 		CHECK_FOR_INTERRUPTS();
 		reason = "CONTEXT_CHANGED_AFTER_WAIT_SLICE";
 		if (!cold_own_root_cf_current(original))
+			goto refuse;
+		reason = "MERGE_DEADLINE_OR_ZERO_ATTEMPT";
+		if (deadline_ns != NULL
+			&& (*deadline_ns == 0 || !cold_own_root_deadline_current(deadline_ns)))
 			goto refuse;
 		ResetLatch(MyLatch);
 		held = cluster_cf_held(ShareLock);
@@ -382,7 +426,10 @@ cold_own_root_cf_wait(const ColdOwnRootCfWait *original, const ClusterCfAttemptO
 				if (empty_waited)
 					return;
 				empty_waited = true;
-				(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+				wait_ms = cold_own_root_cf_budget(deadline_ns);
+				if (wait_ms <= 0)
+					goto refuse;
+				(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, wait_ms,
 								WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
 				continue;
 			}
@@ -402,9 +449,14 @@ cold_own_root_cf_wait(const ColdOwnRootCfWait *original, const ClusterCfAttemptO
 			goto refuse;
 		cluster_lock_owners_service_poll();
 		cluster_cf_retirement_poll();
-		if (cluster_cf_held(ShareLock))
-			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+		if (cluster_cf_held(ShareLock)) {
+			reason = "MERGE_DEADLINE_OR_ZERO_ATTEMPT";
+			wait_ms = cold_own_root_cf_budget(deadline_ns);
+			if (wait_ms <= 0)
+				goto refuse;
+			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, wait_ms,
 							WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
+		}
 	}
 refuse:
 	ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
@@ -416,7 +468,8 @@ refuse:
 
 /* The founder's previous generation must be sealed like every peer. */
 static bool
-cold_own_root(ClusterColdTypedV1 *typed, uint16 own_thread, ColdRoot *out)
+cold_own_root(ClusterColdTypedV1 *typed, uint16 own_thread, ColdRoot *out,
+			  const uint64 *deadline_ns)
 {
 	ClusterControlRootIdentity identity;
 	ClusterControlRootResult result;
@@ -431,8 +484,22 @@ cold_own_root(ClusterColdTypedV1 *typed, uint16 own_thread, ColdRoot *out)
 		ClusterCfAttemptObservation attempt;
 		uint64 before = startup ? cluster_cf_attempt_sequence() : 0;
 
-		result = cluster_control_root_lookup_owner_by_node_runtime((int32)own_thread - 1, &identity,
-																   &out->root, &out->token);
+		if (!cold_own_root_deadline_current(deadline_ns))
+			ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+							errmsg("cold own-root lookup exceeded its original merge deadline"),
+							errdetail("stage=merge_deadline before=own_root_read")));
+		result = deadline_ns != NULL
+					 ? cluster_control_root_lookup_owner_deadline_v1(
+						   (int32)own_thread - 1, &identity, &out->root, &out->token, *deadline_ns)
+					 : cluster_control_root_lookup_owner_by_node_runtime(
+						   (int32)own_thread - 1, &identity, &out->root, &out->token);
+		if (!cold_own_root_deadline_current(deadline_ns)) {
+			memset(&out->root, 0, sizeof(out->root));
+			memset(&out->token, 0, sizeof(out->token));
+			ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+							errmsg("cold own-root lookup exceeded its original merge deadline"),
+							errdetail("stage=merge_deadline after=own_root_read")));
+		}
 		/* The acquire can yield. Reject a fresh read from a changed context
 		 * before its provisional outputs reach any original admission gate. */
 		if (waited && !cold_own_root_cf_current(&original)) {
@@ -448,7 +515,7 @@ cold_own_root(ClusterColdTypedV1 *typed, uint16 own_thread, ColdRoot *out)
 			|| !cluster_cf_last_attempt_since(before, &attempt)
 			|| !cluster_cf_attempt_wait_slice(&attempt) || attempt.mode != ShareLock)
 			break;
-		cold_own_root_cf_wait(&original, &attempt);
+		cold_own_root_cf_wait(&original, &attempt, deadline_ns);
 		waited = true;
 	}
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
@@ -565,13 +632,23 @@ cold_collect_roots(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence, u
 {
 	uint16 count = cluster_recovery_merge_fence_plan_origin_count(fence);
 	uint16 i;
+	uint64 deadline_ns;
+	const uint64 *deadline = NULL;
 
 	if (count == 0 || (uint32)count + 1 > CLUSTER_COLD_MAX_PARTICIPANTS) {
 		cold_refuse(typed, CLUSTER_COLD_PARTICIPANT_INVALID, "fence plan names %u origins",
 					(unsigned)count);
 		return false;
 	}
-	if (!cold_own_root(typed, own_thread, &roots[0]))
+	if (cluster_shared_config && MyBackendType == B_STARTUP && AmStartupProcess()) {
+		if (!cluster_recovery_merge_fence_plan_deadline_v1(fence, &deadline_ns)) {
+			cold_refuse(typed, CLUSTER_COLD_PARTICIPANT_INVALID,
+						"stage=merge_deadline reason=ORIGINAL_PLAN_INVALID");
+			return false;
+		}
+		deadline = &deadline_ns;
+	}
+	if (!cold_own_root(typed, own_thread, &roots[0], deadline))
 		return false;
 	for (i = 0; i < count; i++) {
 		uint16 thread = 0;
@@ -584,6 +661,9 @@ cold_collect_roots(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence, u
 			return false;
 		}
 	}
+	if (!cold_own_root_deadline_current(deadline))
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+						errmsg("cold root collection exceeded its original merge deadline")));
 	typed->participant_count = (uint32)count + 1;
 	typed->own_participant = 0;
 	return true;
