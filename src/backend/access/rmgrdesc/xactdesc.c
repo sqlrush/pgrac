@@ -133,8 +133,13 @@ xact_commit_shape(uint8 info, const void *bytes, Size len)
 		return false;
 	if ((xinfo & XACT_XINFO_HAS_SCN) && !xact_commit_take(&cursor, &len, sizeof(xl_xact_scn)))
 		return false;
-	if ((xinfo & XACT_XINFO_HAS_TT_COMMIT) && !xact_commit_take(&cursor, &len, sizeof(xl_xact_tt_commit)))
-		return false;
+	if (xinfo & XACT_XINFO_HAS_TT_COMMIT) {
+		xl_xact_tt_commit_v2 tt;
+		Size bytes = cluster_xact_tt_commit_read(cursor, len, &tt);
+
+		if (bytes == 0 || !xact_commit_take(&cursor, &len, bytes))
+			return false;
+	}
 	if (xinfo & XACT_XINFO_HAS_SPACE_DROP) {
 		uint32 count;
 
@@ -278,17 +283,23 @@ ParseCommitRecord(uint8 info, xl_xact_commit *xlrec, Size len, xl_xact_parsed_co
 
 	/*
 	 * PGRAC (spec-3.18 D4.1): xl_xact_tt_commit follows xl_xact_scn in the
-	 * unaligned tail.  memcpy onto the parsed struct (24B; commit_scn at +16
-	 * needs 8-byte alignment the WAL stream does not guarantee).  Emit order in
+	 * unaligned tail. Both explicit versions retain commit_scn at +24;
+	 * folded V2 appends FullXid at +32. Emit order in
 	 * XactLogCommitRecord is origin -> scn -> tt_commit, matched here.
 	 */
 	parsed->has_tt_commit = false;
 	if (parsed->xinfo & XACT_XINFO_HAS_TT_COMMIT)
 	{
-		memcpy(&parsed->tt_commit, data, sizeof(xl_xact_tt_commit));
-		parsed->has_tt_commit = true;
+		xl_xact_tt_commit_v2 tt;
+		Size remaining = len - (Size)(data - (char *)xlrec);
+		Size bytes = cluster_xact_tt_commit_read(data, remaining, &tt);
 
-		data += sizeof(xl_xact_tt_commit);
+		if (bytes == 0)
+			return false;
+		parsed->tt_commit = tt.delta;
+		parsed->tt_original_full_xid = tt.original_full_xid;
+		parsed->has_tt_commit = true;
+		data += bytes;
 	}
 	if (parsed->xinfo & XACT_XINFO_HAS_SPACE_DROP)
 	{
@@ -564,6 +575,9 @@ xact_desc_commit(StringInfo buf, uint8 info, xl_xact_commit *xlrec, Size len, Re
 						 (unsigned) parsed.tt_commit.slot_offset,
 						 (unsigned) parsed.tt_commit.wrap, (unsigned) parsed.tt_commit.instance,
 						 SCN_FORMAT_ARG(parsed.tt_commit.commit_scn));
+	if (parsed.has_tt_commit
+		&& parsed.tt_commit.format_version == CLUSTER_XACT_TT_COMMIT_V2_VERSION)
+		appendStringInfo(buf, " v2 full " UINT64_FORMAT, parsed.tt_original_full_xid);
 }
 
 static void

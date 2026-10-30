@@ -7070,6 +7070,13 @@ xact_redo_commit(XLogReaderState *record, xl_xact_parsed_commit *parsed,
 	Assert(TransactionIdIsValid(xid));
 
 #ifdef USE_PGRAC_CLUSTER
+	/* Staged V2 parsing must not feed a FullXid-blind TT32 writer. Remove
+	 * this refusal only with the complete TT40 native owner conversion. */
+	if (parsed->has_tt_commit
+		&& (parsed->tt_commit.format_version != CLUSTER_XACT_TT_COMMIT_VERSION
+			|| parsed->tt_original_full_xid != 0))
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("folded TT commit requires an exact TT40 native owner")));
 	if (cluster_shared_config && (parsed->nrels != 0 || parsed->nspace_drops != 0)
 		&& !cluster_space_drop_replay_commit(record, xid))
 		elog(PANIC, "xact_redo: exact SPACE deletion commit refused");

@@ -1223,9 +1223,7 @@ side_plan_slot_step(const RfSideOnlineOperationV1 *op, const char *base, char *o
 	if (op->kind == RF_SIDE_ONLINE_OPERATION_XACT) {
 		const xl_xact_tt_commit *d = &op->xact.tt_delta;
 
-		return cluster_undo_prepare_commit_v1(d->instance, d->segment_id, d->segment_generation,
-											  d->slot_offset, d->wrap, d->xid, d->commit_scn, base,
-											  out);
+		return cluster_undo_prepare_xact_commit_v1(d, op->xact.tt_original_full_xid, base, out);
 	} else {
 		const ClusterUndoDecoded *d = &op->undo;
 		const UndoSegmentHeaderData *h = (const UndoSegmentHeaderData *)base;

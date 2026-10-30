@@ -3625,6 +3625,13 @@ test_cluster_undo_desc_product.o: $(top_srcdir)/src/backend/access/rmgrdesc/clus
 		$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
+# These objects share the in-memory folded identity and must not retain a
+# stale parsed/immutable layout when xact.h changes.
+test_cluster_side_xact_product.o test_cluster_side_online_plan.o \
+		test_cluster_side_online_owner_product.o test_cluster_side_xact_xactdesc.o \
+		test_cluster_side_xact_undo_product.o $(CLUSTER_SIDE_UNDO_O): \
+		$(top_srcdir)/src/include/access/xact.h
+
 CLUSTER_SIDE_XACT_O = test_cluster_side_xact_product.o
 CLUSTER_REMOTE_XACT_IDENTITY_O = \
 	$(top_builddir)/src/backend/cluster/cluster_remote_xact_identity.o

@@ -20,6 +20,7 @@
 #include "postgres.h"
 
 #include "access/rmgr.h"
+#include "access/xact.h"
 #include "access/xlogrecord.h"
 #include "cluster/cluster_side_undo.h"
 #include "cluster/cluster_tt_durable.h"
@@ -1522,6 +1523,72 @@ UT_TEST(test_tt40_bind_reuse_uses_original_wrap_transition_and_replaces_only_at_
 	}
 }
 
+UT_TEST(test_folded_v2_prepares_exact_tt40_successor_without_raw_backfill)
+{
+	const uint64 identities[] = { 1234, (UINT64_C(7) << 32) | 1234 };
+	PGAlignedBlock base, before, out, expected;
+	xl_xact_tt_commit tt = { .segment_id = 7, .segment_generation = 9,
+		.xid = 1234, .slot_offset = 3, .wrap = 5, .instance = 1,
+		.format_version = CLUSTER_XACT_TT_COMMIT_V2_VERSION, .commit_scn = 901 };
+
+	for (Size i = 0; i < lengthof(identities); i++) {
+		TTSlotV2 *slot;
+
+		make_tt40_base(&base, identities[i], TT_SLOT_ACTIVE);
+		((UndoSegmentHeaderDataV2 *)base.data)->tt_slots[3].wrap = tt.wrap;
+		before = base;
+		expected = base;
+		slot = &((UndoSegmentHeaderDataV2 *)expected.data)->tt_slots[3];
+		slot->status = TT_SLOT_COMMITTED;
+		slot->flags = TT_FLAGS_RESERVED;
+		slot->commit_scn = 901;
+		slot->first_undo_block = (UBA)InvalidUba_init;
+		UT_ASSERT_EQ(cluster_undo_prepare_xact_commit_v1(&tt, identities[i], base.data, out.data),
+			CLUSTER_UNDO_HEADER_APPLY);
+		UT_ASSERT_EQ(memcmp(out.data, expected.data, BLCKSZ), 0);
+		UT_ASSERT_EQ(memcmp(base.data, before.data, BLCKSZ), 0);
+		UT_ASSERT_EQ(cluster_undo_prepare_xact_commit_v1(&tt, identities[i], base.data, base.data),
+			CLUSTER_UNDO_HEADER_APPLY);
+		UT_ASSERT_EQ(memcmp(base.data, expected.data, BLCKSZ), 0);
+		UT_ASSERT_EQ(cluster_undo_prepare_xact_commit_v1(&tt, identities[i], base.data, base.data),
+			CLUSTER_UNDO_HEADER_ALREADY);
+		UT_ASSERT_EQ(memcmp(base.data, expected.data, BLCKSZ), 0);
+		base = before;
+		for (unsigned fault = 0; fault < 8; fault++) {
+			xl_xact_tt_commit bad = tt;
+			uint64 full = identities[i];
+			PGAlignedBlock saved;
+
+			switch (fault) {
+			case 0: full ^= UINT64_C(1) << 32; break; /* same raw, other epoch */
+			case 1: full = 0; break;
+			case 2: full = UINT64_MAX; break;
+			case 3: bad.format_version = 1; break;
+			case 4: bad.format_version = 3; break;
+			case 5: bad.flags = 1; break;
+			case 6: bad.reserved = 1; break;
+			case 7: bad.commit_scn = UINT64_MAX; break;
+			}
+			memset(out.data, 0x5a, BLCKSZ);
+			saved = out;
+			UT_ASSERT_EQ(cluster_undo_prepare_xact_commit_v1(&bad, full, base.data, out.data),
+				CLUSTER_UNDO_HEADER_BLOCKED);
+			UT_ASSERT_EQ(memcmp(out.data, saved.data, BLCKSZ), 0);
+			UT_ASSERT_EQ(memcmp(base.data, before.data, BLCKSZ), 0);
+		}
+		/* Physical generation controls stale decisions, never FullXid ordering. */
+		((UndoSegmentHeaderDataV2 *)base.data)->wrap_count++;
+		UT_ASSERT_EQ(cluster_undo_prepare_xact_commit_v1(&tt, identities[i], base.data, out.data),
+			CLUSTER_UNDO_HEADER_SKIP_STALE);
+		base = before;
+		((UndoSegmentHeaderDataV2 *)base.data)->tt_layout_version = 0;
+		UT_ASSERT_EQ(cluster_undo_prepare_xact_commit_v1(&tt, identities[i], base.data, out.data),
+			CLUSTER_UNDO_HEADER_BLOCKED);
+		UT_ASSERT_EQ(cluster_undo_prepare_xact_commit_v1(&tt, 0, before.data, out.data),
+			CLUSTER_UNDO_HEADER_BLOCKED);
+	}
+}
+
 UT_TEST(test_tt40_refuses_malformed_decoded_fields_and_preserves_caller_buffers)
 {
 	const uint64 full = (UINT64_C(7) << 32) | 1234;
@@ -1601,7 +1668,7 @@ UT_TEST(test_tt40_refuses_malformed_decoded_fields_and_preserves_caller_buffers)
 int
 main(void)
 {
-	UT_PLAN(33);
+	UT_PLAN(34);
 
 	UT_RUN(test_decode_tt_commit_fields);
 	UT_RUN(test_decode_tt_bind_exact_shape_and_reserved_bytes);
@@ -1635,6 +1702,7 @@ main(void)
 	UT_RUN(test_tt40_checks_explicit_page_layout_before_shifted_target_fields);
 	UT_RUN(test_tt40_physical_stale_and_exact_idempotent_results_do_not_publish_output);
 	UT_RUN(test_tt40_bind_reuse_uses_original_wrap_transition_and_replaces_only_at_bind);
+	UT_RUN(test_folded_v2_prepares_exact_tt40_successor_without_raw_backfill);
 	UT_RUN(test_tt40_refuses_malformed_decoded_fields_and_preserves_caller_buffers);
 
 	UT_DONE();

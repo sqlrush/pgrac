@@ -26,6 +26,7 @@
 #ifdef USE_PGRAC_CLUSTER
 
 #include "access/rmgr.h"
+#include "access/xact.h"
 #include "access/xlogrecord.h"
 #include "cluster/cluster_side_route.h"
 #include "cluster/cluster_tt_durable.h"
@@ -975,6 +976,37 @@ cluster_undo_prepare_commit_v1(uint8 instance, uint32 segment_id, uint32 generat
 	slot->first_undo_block = invalid_head;
 	memcpy(out, prepared.data, BLCKSZ);
 	return CLUSTER_UNDO_HEADER_APPLY;
+}
+
+ClusterUndoHeaderPrepareResultV1
+cluster_undo_prepare_xact_commit_v1(const xl_xact_tt_commit *delta, uint64 original_full_xid,
+								  const char *base, char *out)
+{
+	ClusterUndoDecoded decoded = { 0 };
+
+	if (delta == NULL || delta->flags != 0 || delta->reserved != 0)
+		return CLUSTER_UNDO_HEADER_BLOCKED;
+	if (delta->format_version == CLUSTER_XACT_TT_COMMIT_VERSION) {
+		if (original_full_xid != 0)
+			return CLUSTER_UNDO_HEADER_BLOCKED;
+		return cluster_undo_prepare_commit_v1(delta->instance, delta->segment_id,
+			delta->segment_generation, delta->slot_offset, delta->wrap, delta->xid,
+			delta->commit_scn, base, out);
+	}
+	if (delta->format_version != CLUSTER_XACT_TT_COMMIT_V2_VERSION)
+		return CLUSTER_UNDO_HEADER_BLOCKED;
+	decoded.kind = CLUSTER_UNDO_KIND_TT_COMMIT;
+	decoded.opcode = XLOG_UNDO_TT_SLOT_COMMIT;
+	decoded.instance = delta->instance;
+	decoded.segment_id = delta->segment_id;
+	decoded.expected_generation = delta->segment_generation;
+	decoded.slot_offset = delta->slot_offset;
+	decoded.wrap = delta->wrap;
+	decoded.xid = delta->xid;
+	decoded.commit_scn = delta->commit_scn;
+	decoded.format_version = CLUSTER_UNDO_TT_IDENTITY_V2_VERSION;
+	decoded.original_full_xid = original_full_xid;
+	return undo_prepare_tt_header_v2(&decoded, NULL, 0, base, out);
 }
 
 static bool

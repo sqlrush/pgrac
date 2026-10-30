@@ -1016,6 +1016,154 @@ reject_undo_preflight(void *arg pg_attribute_unused(), const RfSideOnlineOperati
 	return operation->kind != RF_SIDE_ONLINE_OPERATION_UNDO;
 }
 
+/* Frozen folded V2 keeps the old SCN offset and appends FullXid. */
+static XLogReaderState *
+make_commit_v2(FakeXactRecord *fake, uint64 full)
+{
+	XLogReaderState *record = make_commit(fake, (TransactionId)full, 901, 123456, false);
+	xl_xact_tt_commit tt;
+	Size offset = XLogRecGetDataLen(record) - sizeof(tt);
+
+	memcpy(&tt, fake->data + offset, sizeof(tt));
+	tt.format_version = 2;
+	memcpy(fake->data + offset, &tt, sizeof(tt));
+	memcpy(fake->data + offset + sizeof(tt), &full, sizeof(full));
+	fake->u.decoded.main_data_len += sizeof(full);
+	return record;
+}
+
+UT_TEST(test_folded_v2_native_parser_accepts_exact_distinct_layout)
+{
+	FakeXactRecord fake;
+	xl_xact_parsed_commit parsed = { 0 };
+	XLogReaderState *record = make_commit_v2(&fake, (UINT64_C(7) << 32) | 800);
+
+	UT_ASSERT(ParseCommitRecord(XLogRecGetInfo(record), (xl_xact_commit *)XLogRecGetData(record),
+		XLogRecGetDataLen(record), &parsed));
+	UT_ASSERT(parsed.has_tt_commit);
+	UT_ASSERT_EQ(parsed.tt_commit.format_version, 2);
+	UT_ASSERT_EQ(parsed.tt_commit.commit_scn, 901);
+	UT_ASSERT_EQ(parsed.tt_original_full_xid, (UINT64_C(7) << 32) | 800);
+}
+
+UT_TEST(test_folded_v2_side_decode_keeps_original_tt_identity)
+{
+	FakeXactRecord fake;
+	RfSideXactOperationV1 operation = { 0 };
+	XLogReaderState *record = make_commit_v2(&fake, (UINT64_C(7) << 32) | 800);
+
+	UT_ASSERT(rf_side_xact_decode_v1(record, UINT64_C(0x11223344), 3, &operation));
+	UT_ASSERT_EQ(operation.tt_delta.format_version, 2);
+	UT_ASSERT_EQ(operation.tt_delta.commit_scn, 901);
+	UT_ASSERT_EQ(operation.tt_original_full_xid, (UINT64_C(7) << 32) | 800);
+	memset(fake.data, 0x5a, sizeof(fake.data));
+	UT_ASSERT_EQ(operation.tt_original_full_xid, (UINT64_C(7) << 32) | 800);
+	UT_ASSERT(rf_side_xact_structural_preflight_v1(&operation));
+	reset_prepare_apply();
+	UT_ASSERT_EQ(rf_side_xact_target_preflight_owned_v1(&operation, NULL, 0), RF_SIDE_XACT_APPLY_BLOCKED);
+	UT_ASSERT_EQ(rf_side_xact_apply_v1(&operation), RF_SIDE_XACT_APPLY_BLOCKED);
+	UT_ASSERT_EQ(prepare_apply.tt_reads, 0);
+	UT_ASSERT_EQ(prepare_apply.tt_stamps, 0);
+	UT_ASSERT_EQ(prepare_apply.terminal_projection_stores, 0);
+	operation.tt_delta.format_version = 1;
+	UT_ASSERT(!rf_side_xact_structural_preflight_v1(&operation));
+	operation.tt_delta.format_version = 2;
+	operation.tt_original_full_xid = 0;
+	UT_ASSERT(!rf_side_xact_structural_preflight_v1(&operation));
+}
+
+UT_TEST(test_folded_v2_bounded_identity_and_unknown_framing)
+{
+	const uint64 good[] = { 800, (UINT64_C(7) << 32) | 800 };
+	FakeXactRecord fake;
+	xl_xact_parsed_commit parsed;
+	RfSideXactOperationV1 op;
+	const Size offset = sizeof(xl_xact_commit) + sizeof(xl_xact_xinfo) + sizeof(xl_xact_scn);
+
+	for (Size i = 0; i < lengthof(good); i++) {
+		XLogReaderState *record = make_commit_v2(&fake, good[i]);
+		xl_xact_tt_commit_v2 tt, out, saved;
+		uint8 bytes[41];
+
+		UT_ASSERT_EQ(cluster_xact_tt_commit_read(fake.data + offset, 40, &tt), 40);
+		UT_ASSERT_EQ(tt.original_full_xid, good[i]);
+		UT_ASSERT(ParseCommitRecord(XLogRecGetInfo(record), (xl_xact_commit *)fake.data,
+			XLogRecGetDataLen(record), &parsed));
+		UT_ASSERT_EQ(parsed.tt_original_full_xid, good[i]);
+		memcpy(bytes + 1, &tt, 40);
+		UT_ASSERT_EQ(cluster_xact_tt_commit_read(bytes + 1, 40, &out), 40);
+		UT_ASSERT_EQ(out.original_full_xid, good[i]);
+		for (Size len = 0; len < 40; len++) {
+			memset(&out, 0x5a, sizeof(out)); saved = out;
+			UT_ASSERT_EQ(cluster_xact_tt_commit_read(bytes + 1, len, &out), 0);
+			UT_ASSERT_EQ(memcmp(&out, &saved, sizeof(out)), 0);
+			fake.u.decoded.main_data_len = offset + len;
+			UT_ASSERT(!ParseCommitRecord(XLogRecGetInfo(record), (xl_xact_commit *)fake.data,
+				XLogRecGetDataLen(record), &parsed));
+		}
+		fake.u.decoded.main_data_len = offset + 41;
+		UT_ASSERT(!ParseCommitRecord(XLogRecGetInfo(record), (xl_xact_commit *)fake.data,
+			XLogRecGetDataLen(record), &parsed));
+	}
+	for (unsigned fault = 0; fault < 10; fault++) {
+		XLogReaderState *record = make_commit_v2(&fake, good[1]);
+		xl_xact_tt_commit_v2 tt;
+
+		memcpy(&tt, fake.data + offset, sizeof(tt));
+		switch (fault) {
+		case 0: tt.delta.format_version = 0; break;
+		case 1: tt.delta.format_version = 3; break;
+		case 2: tt.delta.flags = 1; break;
+		case 3: tt.delta.reserved = 1; break;
+		case 4: tt.original_full_xid = 0; break;
+		case 5: tt.original_full_xid = UINT64_MAX; break;
+		case 6: tt.original_full_xid++; break;
+		case 7: tt.delta.xid = 2; tt.original_full_xid = 2; break;
+		case 8: tt.delta.commit_scn = InvalidScn; break;
+		case 9: tt.delta.commit_scn = UINT64_MAX; break;
+		}
+		memcpy(fake.data + offset, &tt, sizeof(tt));
+		UT_ASSERT(!ParseCommitRecord(XLogRecGetInfo(record), (xl_xact_commit *)fake.data,
+			XLogRecGetDataLen(record), &parsed));
+		UT_ASSERT(!rf_side_xact_decode_v1(record, UINT64_C(0x11223344), 3, &op));
+	}
+	UT_ASSERT(ParseCommitRecord(XLOG_XACT_COMMIT | XLOG_XACT_HAS_INFO,
+		(xl_xact_commit *)XLogRecGetData(make_commit(&fake, 800, 901, 123456, false)),
+		offset + 32, &parsed));
+	UT_ASSERT_EQ(parsed.tt_original_full_xid, 0);
+}
+
+UT_TEST(test_folded_v2_consumes_only_its_section_before_space_tail)
+{
+	FakeXactRecord fake;
+	xl_xact_parsed_commit parsed;
+	xl_xact_tt_commit_v2 tt;
+	uint8 bytes[128 + XACT_SPACE_DROP_RECORD_BYTES] = { 0 };
+	xl_xact_commit commit = { .xact_time = 123456 };
+	xl_xact_xinfo xinfo = { .xinfo = XACT_XINFO_HAS_SCN | XACT_XINFO_HAS_TT_COMMIT
+		| XACT_XINFO_HAS_RELFILELOCATORS | XACT_XINFO_HAS_SPACE_DROP };
+	xl_xact_scn scn = { .scn = 901 };
+	int nrels = 0;
+	uint32 ndrops = 1;
+	Size pos = 0;
+
+	make_commit_v2(&fake, (UINT64_C(7) << 32) | 800);
+	memcpy(&tt, fake.data + sizeof(commit) + sizeof(xinfo) + sizeof(scn), sizeof(tt));
+	memcpy(bytes + pos, &commit, sizeof(commit)); pos += sizeof(commit);
+	memcpy(bytes + pos, &xinfo, sizeof(xinfo)); pos += sizeof(xinfo);
+	memcpy(bytes + pos, &nrels, sizeof(nrels)); pos += sizeof(nrels);
+	memcpy(bytes + pos, &scn, sizeof(scn)); pos += sizeof(scn);
+	memcpy(bytes + pos, &tt, sizeof(tt)); pos += sizeof(tt);
+	memcpy(bytes + pos, &ndrops, sizeof(ndrops)); pos += sizeof(ndrops);
+	memset(bytes + pos, 0x6b, XACT_SPACE_DROP_RECORD_BYTES);
+	UT_ASSERT(ParseCommitRecord(XLOG_XACT_COMMIT | XLOG_XACT_HAS_INFO,
+		(xl_xact_commit *)bytes, pos + XACT_SPACE_DROP_RECORD_BYTES, &parsed));
+	UT_ASSERT_EQ(parsed.tt_original_full_xid, tt.original_full_xid);
+	UT_ASSERT_EQ(parsed.nspace_drops, 1);
+	UT_ASSERT(parsed.space_drops == (char *)bytes + pos);
+	UT_ASSERT_EQ(memcmp(parsed.space_drops, bytes + pos, XACT_SPACE_DROP_RECORD_BYTES), 0);
+}
+
 UT_TEST(test_commit_decodes_to_immutable_truth_operation)
 {
 	FakeXactRecord fake;
@@ -5093,7 +5241,7 @@ UT_TEST(test_space_incarnation_end_rejects_old_uuid_reappearance_and_retained_ga
 int
 main(void)
 {
-	UT_PLAN(71);
+	UT_PLAN(75);
 	UT_RUN(test_space_incarnation_end_requires_an_actual_later_space0_contribution);
 	UT_RUN(test_space_incarnation_end_rejects_old_uuid_reappearance_and_retained_gaps);
 	UT_RUN(test_space_retained_ancestry_create_and_independent_page_terminal);
@@ -5132,6 +5280,10 @@ main(void)
 	UT_RUN(test_folded_commit_segment_must_belong_to_source_origin);
 	UT_RUN(test_online_undo_header_evolves_init_bind_and_folded_commit);
 	UT_RUN(test_online_undo_header_private_base_and_late_failure);
+	UT_RUN(test_folded_v2_native_parser_accepts_exact_distinct_layout);
+	UT_RUN(test_folded_v2_side_decode_keeps_original_tt_identity);
+	UT_RUN(test_folded_v2_bounded_identity_and_unknown_framing);
+	UT_RUN(test_folded_v2_consumes_only_its_section_before_space_tail);
 	UT_RUN(test_commit_decodes_to_immutable_truth_operation);
 	UT_RUN(test_commit_tt_conflict_is_blocked_before_apply);
 	UT_RUN(test_non_xact_and_missing_tt_are_blocked);

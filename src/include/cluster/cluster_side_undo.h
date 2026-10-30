@@ -158,6 +158,13 @@ cluster_undo_prepare_commit_v1(uint8 instance, uint32 segment_id, uint32 generat
 							   uint16 slot_offset, uint16 wrap, TransactionId xid, SCN commit_scn,
 							   const char *base, char *out);
 
+/* Bounded folded input dispatch into the original V1 or exact TT40 private
+ * successor. No target/write authority; legacy identity cannot enter TT40. */
+struct xl_xact_tt_commit;
+extern ClusterUndoHeaderPrepareResultV1
+cluster_undo_prepare_xact_commit_v1(const struct xl_xact_tt_commit *delta,
+								  uint64 original_full_xid, const char *base, char *out);
+
 typedef enum ClusterUndoApplyResultV1 {
 	CLUSTER_UNDO_APPLY_OK = 0,
 	CLUSTER_UNDO_APPLY_BLOCKED = 1,

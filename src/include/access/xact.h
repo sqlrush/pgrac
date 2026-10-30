@@ -405,6 +405,49 @@ StaticAssertDecl(offsetof(xl_xact_tt_commit, segment_generation) == 4,
 StaticAssertDecl(offsetof(xl_xact_tt_commit, commit_scn) == 24,
 				 "xl_xact_tt_commit.commit_scn must be at offset 24");
 
+/* Explicit folded V2, distinct from the standalone COMMIT40 layout. */
+#define CLUSTER_XACT_TT_COMMIT_V2_VERSION ((uint8)2)
+typedef struct xl_xact_tt_commit_v2
+{
+	xl_xact_tt_commit delta;
+	uint64 original_full_xid;
+} xl_xact_tt_commit_v2;
+
+StaticAssertDecl(sizeof(xl_xact_tt_commit_v2) == 40
+				 && offsetof(xl_xact_tt_commit_v2, delta) == 0
+				 && offsetof(xl_xact_tt_commit, format_version) == 17
+				 && offsetof(xl_xact_tt_commit_v2, original_full_xid) == 32,
+				 "folded TT V2 keeps SCN at 24 and FullXid at 32");
+
+/* Read one bounded, possibly unaligned section. A following SPACE tail is
+ * outside this section. Return consumed bytes; failure leaves out unchanged.
+ * V1 remains a raw-only observation; it cannot manufacture a FullXid. */
+static inline Size
+cluster_xact_tt_commit_read(const void *payload, Size available, xl_xact_tt_commit_v2 *out)
+{
+	xl_xact_tt_commit_v2 rec = { 0 };
+	Size bytes = sizeof(rec.delta);
+
+	if (payload == NULL || out == NULL || available < bytes)
+		return 0;
+	memcpy(&rec.delta, payload, bytes);
+	if (rec.delta.format_version == CLUSTER_XACT_TT_COMMIT_V2_VERSION) {
+		bytes = sizeof(rec);
+		if (available < bytes)
+			return 0;
+		memcpy(&rec, payload, bytes);
+		if (rec.delta.flags != 0 || rec.delta.reserved != 0
+			|| !TransactionIdIsNormal(rec.delta.xid)
+			|| rec.original_full_xid == UINT64_MAX
+			|| (TransactionId)rec.original_full_xid != rec.delta.xid
+			|| !SCN_VALID(rec.delta.commit_scn) || rec.delta.commit_scn == UINT64_MAX)
+			return 0;
+	} else if (rec.delta.format_version != CLUSTER_XACT_TT_COMMIT_VERSION)
+		return 0;
+	*out = rec;
+	return bytes;
+}
+
 typedef struct xl_xact_commit
 {
 	TimestampTz xact_time;		/* time of commit */
@@ -497,6 +540,7 @@ typedef struct xl_xact_parsed_commit
 	SCN			scn;			/* PGRAC (spec-1.18): InvalidScn if !HAS_SCN */
 	bool		has_tt_commit;	/* PGRAC (spec-3.18 D4.1): XACT_XINFO_HAS_TT_COMMIT set */
 	xl_xact_tt_commit tt_commit;	/* PGRAC (spec-3.18 D4.1): valid iff has_tt_commit */
+	uint64		tt_original_full_xid; /* explicit folded V2; zero for V1 */
 	uint32		nspace_drops;
 	const char *space_drops;		/* unaligned fixed typed pairs in this record */
 } xl_xact_parsed_commit;
