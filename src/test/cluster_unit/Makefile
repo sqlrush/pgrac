@@ -4850,9 +4850,11 @@ test_cluster_subtrans_order: test_cluster_subtrans_order.c unit_test.h test_clus
 		$(top_srcdir)/src/backend/storage/sync/sync.c \
 		$(top_srcdir)/src/backend/postmaster/checkpointer.c \
 		$(top_srcdir)/src/backend/utils/hash/dynahash.c \
-		$(top_srcdir)/src/backend/nodes/list.c $(top_srcdir)/src/common/hashfn.c
+		$(top_srcdir)/src/backend/nodes/list.c $(top_srcdir)/src/common/hashfn.c \
+		$(top_builddir)/src/backend/cluster/cluster_xid_stripe.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
-		$< $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+		$< $(top_builddir)/src/backend/cluster/cluster_xid_stripe.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 # PGRAC: actual native startup/trim, explicit memory SLRU boundaries.
 # Author: SqlRush <sqlrush@gmail.com>

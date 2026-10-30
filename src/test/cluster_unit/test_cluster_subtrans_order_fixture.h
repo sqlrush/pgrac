@@ -17,6 +17,15 @@
 #define TEST_CLUSTER_SUBTRANS_ORDER_FIXTURE_H
 
 bool cluster_shared_config = true;
+#ifdef USE_PGRAC_CLUSTER
+/* Shared-file ordering is exercised without a shared catalog/lease publisher.
+ * Keep the real truncation gate compiled; provider use must never fabricate
+ * evidence. The shared watermark consumer has its own focused target. */
+bool cluster_enabled = true;
+bool cluster_shared_catalog = false;
+bool cluster_xid_striping = false;
+VariableCache ShmemVariableCache;
+#endif
 bool IsUnderPostmaster = true;
 bool InRecovery;
 bool enableFsync = true;
@@ -68,6 +77,26 @@ fixture_panic(void)
 {
 	abort();
 }
+#ifdef USE_PGRAC_CLUSTER
+bool
+cluster_xid_stripe_sample_future(FullTransactionId reference pg_attribute_unused(),
+								FullTransactionId *future pg_attribute_unused(),
+								ClusterXidStripeSampleFence *fence pg_attribute_unused())
+{
+	fixture_panic();
+}
+bool
+cluster_xid_stripe_sample_fence_current(
+	const ClusterXidStripeSampleFence *fence pg_attribute_unused())
+{
+	fixture_panic();
+}
+bool
+cluster_heap_freeze_watermark_sample(ClusterHeapFreezeWatermark *out pg_attribute_unused())
+{
+	fixture_panic();
+}
+#endif
 void
 ExceptionalCondition(const char *condition pg_attribute_unused(),
 					 const char *file pg_attribute_unused(), int line pg_attribute_unused())
