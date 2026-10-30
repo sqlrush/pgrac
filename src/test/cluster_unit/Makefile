@@ -10449,17 +10449,18 @@ test_cluster_native_request_send.inc: $(top_srcdir)/src/backend/cluster/cluster_
 	     END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 test_cluster_native_request_ring.inc: $(top_srcdir)/src/backend/cluster/cluster_lms_outbound.c Makefile
-	awk '/^#define PGRAC_LMS_OUTBOUND_(CAPACITY|PAYLOAD_MAX) / { print; constants++ } \
+	awk '/^#define PGRAC_LMS_OUTBOUND_(CAPACITY|PAYLOAD_MAX|COMPLETION_RESERVE) / { print; constants++ } \
 	     /^typedef enum ClusterLmsOutboundKind / { emit=1; types++ } \
 	     /^typedef struct ClusterLmsOutbound(Slot|State|SharedState) / { emit=1; types++ } \
 	     /^static ClusterLmsOutbound(SharedState|State) \*cluster_lms_outbound_/ { print; globals++ } \
 	     /^static LWLock \*cluster_lms_outbound_locks/ { print; globals++ } \
 	     /^#define OB_(RING|LOCK)\(/ { print; constants++ } \
 	     /^lms_outbound_resource_x_transport_mutation_mark\(/ { print "static bool"; emit=1; bodies++ } \
+	     /^lms_outbound_wait_capacity\(/ { print "static bool"; emit=1; bodies++ } \
 	     /^cluster_lms_outbound_enqueue_resource_x_requester\(/ { print "ClusterLmsEnqueueResult"; emit=1; bodies++ } \
 	     /^cluster_lms_outbound_resource_x_send_complete\(/ { print "void"; emit=1; bodies++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (constants != 4 || types != 4 || globals != 3 || bodies != 3 || emit) exit 1 }' $< > $@.tmp
+	     END { if (constants != 5 || types != 4 || globals != 3 || bodies != 4 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 clean distclean maintainer-clean: clean-native-request-send
 .PHONY: clean-native-request-send

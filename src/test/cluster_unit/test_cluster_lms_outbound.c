@@ -299,13 +299,26 @@ static uint32 ut_requester_pending;
 static bool ut_requester_not_due;
 static ResourceXIntentSlot ut_requester_ticket;
 
+/* The native requester suite checks this predicate against actual PCM.
+ * This suite owns only ring admission/drain and never enters native capture. */
+ResourceXIntentResult
+cluster_pcm_lock_resource_x_requester_acquire_send_observe_exact(
+	const ResourceXDecodedFrame *frame, int32 master, uint64 now)
+{
+	UT_ASSERT(frame->has_acquire_intent);
+	UT_ASSERT(master >= 0 && now != 0);
+	return ut_requester_not_due || ut_requester_pending != 0
+		? RESOURCE_X_INTENT_NOT_DUE : RESOURCE_X_INTENT_STAGED;
+}
+
 bool
 cluster_resource_x_wire_encode(uint8 type, const ResourceXDecodedFrame *frame, void *out,
 							   uint16 capacity, uint16 *length, ResourceXWireReject *reject)
 {
 	UT_ASSERT_EQ(type, RESOURCE_X_MSG_ASSERT_X);
-	*length = frame->kind == RESOURCE_X_WIRE_LOCAL_PROOF_DECLARATION ? RESOURCE_X_SHORT_V1_BYTES
-																	 : RESOURCE_X_CONTROL_V1_BYTES;
+	*length = frame->has_acquire_intent ? RESOURCE_X_ACQUIRE_V3_BYTES
+		: frame->kind == RESOURCE_X_WIRE_LOCAL_PROOF_DECLARATION ? RESOURCE_X_SHORT_V1_BYTES
+		: RESOURCE_X_CONTROL_V1_BYTES;
 	UT_ASSERT(capacity >= *length);
 	memset(out, frame->kind, *length);
 	*reject = RESOURCE_X_WIRE_REJECT_NONE;
@@ -775,6 +788,14 @@ LWLockRelease(LWLock *lock)
 		abort();
 	ut_lock_depth--;
 	ut_held_lock = ut_lock_depth == 0 ? NULL : ut_lock_stack[ut_lock_depth - 1];
+}
+
+bool
+LWLockHeldByMe(LWLock *lock)
+{
+	for (unsigned i = 0; i < ut_lock_depth; i++)
+		if (ut_lock_stack[i] == lock) return true;
+	return false;
 }
 
 /* LMS wakeup + GCS pre-send hook: count-only stubs. */
@@ -2821,10 +2842,50 @@ UT_TEST(test_capacity_wait_membership_and_cancel_remove_subscription)
 	}
 }
 
+UT_TEST(test_ordinary_request_leaves_completion_capacity_and_real_drain_wakes)
+{
+	ResourceXDecodedFrame command = { 0 };
+	ResourceXIntentSlot completion;
+	ClusterLmsEnqueueResult result;
+	int worker = 1;
+	ut_captured_region->init_fn();
+	ut_reset_log();
+	command.kind = RESOURCE_X_WIRE_ASSERT_X;
+	command.has_acquire_intent = true;
+	command.common.logical_assertion.resource.blockNum = 1;
+	command.common.sender_connection_generation = 77;
+	for (int i = 0; i < 255; i++)
+		UT_ASSERT(ut_enqueue_marker(worker, UT_PEER_X, 0xc1));
+	result = cluster_lms_outbound_enqueue_resource_x_requester(UT_PEER_X, &command, NULL);
+	UT_ASSERT_EQ(result, CLUSTER_LMS_ENQUEUE_FULL);
+	if (result != CLUSTER_LMS_ENQUEUE_FULL) return;
+	UT_ASSERT_EQ(ut_requester_begins, 0);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(worker), 255);
+	/* Actual completion intake and actual drain; semantic owner/codec and
+	 * the transport's takeover are the established explicit fixture leaves. */
+	completion = ut_resource_x_settlement_intent(UT_PEER_X);
+	ut_resource_x_owner_slot = completion;
+	ut_resource_x_owner_payload[0] = 0xc2;
+	ut_peer_capabilities[UT_PEER_X] = PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1;
+	ut_peer_cap_generation[UT_PEER_X] = 77;
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_DONE;
+	UT_ASSERT_EQ(cluster_lms_outbound_enqueue_resource_x_intent(worker, &completion, 77, UINT64_MAX),
+		CLUSTER_LMS_ENQUEUE_ADMITTED);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(worker), 256);
+	while (cluster_lms_outbound_depth(worker) > 0)
+		(void)cluster_lms_outbound_drain_send(worker);
+	UT_ASSERT_EQ(ut_sent_n, 256);
+	UT_ASSERT_EQ(ut_count_marker(0xc2), 1);
+	UT_ASSERT_EQ(ut_resource_x_owner_slot.state, RESOURCE_X_INTENT_SLOT_EMPTY);
+	UT_ASSERT_EQ(ut_resource_x_complete_count, 1);
+	UT_ASSERT(ut_space_broadcasts > 0);
+	UT_ASSERT_NULL(ut_held_lock);
+}
+
 int
 main(void)
 {
-	UT_PLAN(61);
+	UT_PLAN(62);
 
 	UT_RUN(test_normal_stop_missing_outbound_is_not_empty);
 	UT_RUN(test_ring_shmem_init);
@@ -2887,6 +2948,7 @@ main(void)
 	UT_RUN(test_plain_frame_old_head_does_not_block_new_cut_frame);
 	UT_RUN(test_foreground_capacity_wait_resumes_after_native_drain);
 	UT_RUN(test_capacity_wait_membership_and_cancel_remove_subscription);
+	UT_RUN(test_ordinary_request_leaves_completion_capacity_and_real_drain_wakes);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

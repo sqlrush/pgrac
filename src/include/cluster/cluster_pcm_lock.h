@@ -2425,6 +2425,11 @@ extern ResourceXIntentResult
 cluster_pcm_lock_resource_x_requester_send_begin_exact(const ResourceXDecodedFrame *frame,
 													   int32 master, uint32 frame_count,
 													   uint64 now_us, ResourceXIntentSlot *out);
+/* Read-only original-producer full-E capacity predicate. STAGED means E may
+ * try ring admission; it is no ticket, reservation, authority or native C.
+ * NOT_DUE means the one logical send already belongs to its original owner. */
+extern ResourceXIntentResult cluster_pcm_lock_resource_x_requester_acquire_send_observe_exact(
+	const ResourceXDecodedFrame *frame, int32 master, uint64 now_us);
 extern bool
 cluster_pcm_lock_resource_x_requester_send_current_exact(const ResourceXIntentSlot *ticket);
 extern bool

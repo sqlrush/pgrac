@@ -485,6 +485,8 @@ struct BufferDesc;
 struct ClusterSemanticAdmissionToken;
 /* Bind native identity to the original prepared, unsent ordinary round.
  * ADMITTED means physical transport takeover only, never authority or C.
+ * Foreground callers wait on original ring capacity without a content lock;
+ * each wake rechecks the same E, leaving completion intake available.
  * Caller retains native/domain/terminal cleanup; no reservation is allocated. */
 extern ClusterLmsEnqueueResult cluster_lms_outbound_enqueue_resource_x_acquire(
 	int32 master, const struct ResourceXDecodedFrame *prepared, struct BufferDesc *buf,

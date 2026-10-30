@@ -53,11 +53,93 @@ request_header_lock(BufferDesc *buf)
 #include "test_cluster_native_acquire_intent.inc"
 #undef LockBufHdr
 #undef GetPrivateRefCount
+static void request_capacity_prepare(ConditionVariable *cv);
+static bool request_capacity_sleep(ConditionVariable *cv, long timeout, uint32 event);
+static void request_capacity_cancel(void);
+static uint64 request_capacity_epoch(void);
+static bool request_capacity_locked(LWLock *lock);
+#define ConditionVariablePrepareToSleep request_capacity_prepare
+#define ConditionVariableTimedSleep request_capacity_sleep
+#define ConditionVariableCancelSleep request_capacity_cancel
+#define cluster_epoch_get_current request_capacity_epoch
+#define LWLockHeldByMe request_capacity_locked
 #include "test_cluster_native_request_ring.inc"
 #include "test_cluster_native_request_send.inc"
+#undef ConditionVariablePrepareToSleep
+#undef ConditionVariableTimedSleep
+#undef ConditionVariableCancelSleep
+#undef cluster_epoch_get_current
+#undef LWLockHeldByMe
 
 static ClusterLmsOutboundSharedState request_shared;
 static LWLock request_ring_locks[CLUSTER_LMS_MAX_WORKERS];
+static ConditionVariable *request_waiting;
+static unsigned request_sleeps, request_prepares, request_cancels, request_spurious;
+static uint64 request_wait_epoch;
+static void (*request_on_prepare)(void), (*request_on_sleep)(void);
+static ClusterPcmResourceXBootstrapRound request_unsent;
+static void request_capacity_pending(void);
+
+static bool
+request_capacity_locked(LWLock *lock)
+{
+	return LWLockHeldByMeInMode(lock, LW_SHARED) || LWLockHeldByMeInMode(lock, LW_EXCLUSIVE);
+}
+
+static void
+request_capacity_assert_unlocked(void)
+{
+	UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	UT_ASSERT((pg_atomic_read_u32(&request_buf.state) & BM_LOCKED) == 0);
+}
+
+static void
+request_capacity_prepare(ConditionVariable *cv)
+{
+	request_capacity_assert_unlocked();
+	UT_ASSERT(request_waiting == NULL);
+	request_waiting = cv;
+	request_prepares++;
+	if (request_on_prepare != NULL) request_on_prepare();
+}
+
+static bool
+request_capacity_sleep(ConditionVariable *cv, long timeout, uint32 event)
+{
+	request_capacity_assert_unlocked();
+	UT_ASSERT(request_waiting == cv);
+	UT_ASSERT_EQ(timeout, 1000);
+	UT_ASSERT_EQ(event, WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
+	request_capacity_pending();
+	request_sleeps++;
+	/* Crossing a response period/legacy creation deadline is not authority
+	 * failure and must neither retire this E nor mint another REQUEST. */
+	fake_pcm_clock_us += UINT64_C(10000000);
+	if (request_sleeps > 8) { UT_ASSERT(false); pg_re_throw(); }
+	if (request_on_sleep != NULL) request_on_sleep();
+	else if (request_spurious != 0) request_spurious--;
+	else {
+		/* Explicit environment consumer cut. The separate LMS suite runs
+		 * the actual frame drain, takeover callbacks and CV broadcast. */
+		request_shared.rings[1].count = 0;
+		request_shared.rings[1].draining = 0;
+	}
+	return true; /* A response period expires; this is never a SQL failure. */
+}
+
+static void
+request_capacity_cancel(void)
+{
+	request_capacity_assert_unlocked();
+	request_waiting = NULL;
+	request_cancels++;
+}
+
+static uint64
+request_capacity_epoch(void)
+{
+	return request_wait_epoch;
+}
 
 static struct StopPcmEntryLayout *
 request_entry(void)
@@ -106,6 +188,11 @@ request_start_kind(unsigned profile, bool local, bool direct_init)
 	request_proc.pgprocno = 3;
 	request_proc.cluster_grd_generation = 71;
 	request_pins = 1; request_rechecks = 0; request_hook = NULL;
+	request_waiting = NULL;
+	request_sleeps = request_prepares = request_cancels = request_spurious = 0;
+	request_on_prepare = request_on_sleep = NULL;
+	request_wait_epoch = 17;
+	MyBackendType = B_LMS; /* Existing try-only cases never sleep. */
 	memset(&request_admission, 0, sizeof(request_admission));
 	request_admission.entered = true;
 	request_admission.side = CLUSTER_SEMANTIC_TARGET_SIDE;
@@ -185,6 +272,15 @@ request_ticket(ResourceXDecodedFrame *decoded)
 		RESOURCE_X_ACQUIRE_V3_BYTES, decoded, &reject));
 	UT_ASSERT(cluster_pcm_lock_resource_x_requester_send_current_exact(&ticket));
 	return ticket;
+}
+
+static void
+request_capacity_pending(void)
+{
+	UT_ASSERT(memcmp(&request_unsent, &request_entry()->resource_x_bootstrap_round,
+		sizeof(request_unsent)) == 0);
+	UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), PCM_OWN_FLAG_GRANT_PENDING);
+	UT_ASSERT_EQ(cluster_pcm_own_reservation_token_get(0), request_token);
 }
 
 UT_TEST(test_native_request_real_ring_retains_first_fill_and_resident_s_x)
@@ -462,10 +558,236 @@ UT_TEST(test_native_request_direct_init_round_cannot_become_an_ordinary_request)
 	request_refused(CLUSTER_LMS_ENQUEUE_INVALID);
 }
 
+static void
+request_capacity_foreground(unsigned profile)
+{
+	request_start(profile, false);
+	request_unsent = request_entry()->resource_x_bootstrap_round;
+	request_shared.rings[1].count = PGRAC_LMS_OUTBOUND_CAPACITY;
+	MyBackendType = B_BACKEND;
+}
+
+UT_TEST(test_native_request_reserves_last_position_for_completion)
+{
+	for (unsigned profile = 0; profile < 5; profile++) {
+		request_start(profile, false);
+		request_unsent = request_entry()->resource_x_bootstrap_round;
+		request_shared.rings[1].count = PGRAC_LMS_OUTBOUND_CAPACITY - 1;
+		UT_ASSERT_EQ(request_send(PCM_STATE_S), CLUSTER_LMS_ENQUEUE_FULL);
+		request_capacity_pending();
+		UT_ASSERT_EQ(request_shared.rings[1].count, PGRAC_LMS_OUTBOUND_CAPACITY - 1);
+		UT_ASSERT_EQ(request_sleeps, 0);
+		request_shared.rings[1].count--;
+		UT_ASSERT_EQ(request_send(PCM_STATE_S), CLUSTER_LMS_ENQUEUE_ADMITTED);
+		UT_ASSERT_EQ(request_shared.rings[1].count, PGRAC_LMS_OUTBOUND_CAPACITY - 1);
+	}
+}
+
+UT_TEST(test_native_request_completion_credit_includes_draining)
+{
+	request_start(0, false);
+	request_unsent = request_entry()->resource_x_bootstrap_round;
+	request_shared.rings[1].count = PGRAC_LMS_OUTBOUND_CAPACITY - 2;
+	request_shared.rings[1].draining = 1;
+	UT_ASSERT_EQ(request_send(PCM_STATE_S), CLUSTER_LMS_ENQUEUE_FULL);
+	request_capacity_pending();
+}
+
+UT_TEST(test_native_request_foreground_capacity_wait_keeps_same_episode)
+{
+	for (unsigned profile = 0; profile < 5; profile++) {
+		ResourceXDecodedFrame decoded;
+		ClusterPcmOwnEntry native;
+		uint32 state;
+		request_capacity_foreground(profile);
+		native = request_own; state = pg_atomic_read_u32(&request_buf.state);
+		request_spurious = 2;
+		{
+			ClusterLmsEnqueueResult sent = request_send(PCM_STATE_X);
+			UT_ASSERT_EQ(sent, CLUSTER_LMS_ENQUEUE_ADMITTED);
+			if (sent != CLUSTER_LMS_ENQUEUE_ADMITTED) return;
+		}
+		(void)request_ticket(&decoded);
+		UT_ASSERT_EQ(decoded.common.assertion_sequence, request_unsent.request.assertion_sequence);
+		UT_ASSERT_EQ(decoded.body.acquire_intent.reservation_token, request_token);
+		UT_ASSERT_EQ(request_sleeps, 3);
+		UT_ASSERT_EQ(request_prepares, 1);
+		UT_ASSERT_EQ(request_cancels, 1);
+		UT_ASSERT(request_waiting == NULL);
+		request_native_unchanged(&native, state);
+	}
+}
+
+static void
+request_release_before_sleep(void)
+{
+	request_capacity_pending();
+	request_shared.rings[1].count = 0;
+}
+
+UT_TEST(test_native_request_capacity_release_before_sleep_is_observed)
+{
+	request_capacity_foreground(0);
+	request_on_prepare = request_release_before_sleep;
+	UT_ASSERT_EQ(request_send(PCM_STATE_S), CLUSTER_LMS_ENQUEUE_ADMITTED);
+	UT_ASSERT_EQ(request_sleeps, 0);
+	UT_ASSERT_EQ(request_prepares, 1);
+	UT_ASSERT_EQ(request_cancels, 1);
+	UT_ASSERT(request_waiting == NULL);
+}
+
+static void
+request_membership_ends_wait(void)
+{
+	request_capacity_pending();
+	request_wait_epoch++;
+}
+
+UT_TEST(test_native_request_membership_ends_only_unpublished_capacity_wait)
+{
+	request_capacity_foreground(0);
+	request_on_sleep = request_membership_ends_wait;
+	UT_ASSERT_EQ(request_send(PCM_STATE_S), CLUSTER_LMS_ENQUEUE_UNAVAILABLE);
+	request_capacity_pending();
+	UT_ASSERT_EQ(request_sleeps, 1);
+	UT_ASSERT(request_waiting == NULL);
+}
+
+static void
+request_cancel_capacity_wait(void)
+{
+	request_capacity_pending();
+	pg_re_throw();
+}
+
+UT_TEST(test_native_request_cancel_drops_subscription_without_retiring_native)
+{
+	volatile bool caught = false;
+	request_capacity_foreground(0);
+	request_on_sleep = request_cancel_capacity_wait;
+	PG_TRY(); { (void)request_send(PCM_STATE_S); }
+	PG_CATCH(); { caught = true; }
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	request_capacity_pending();
+	UT_ASSERT(request_waiting == NULL);
+	UT_ASSERT_EQ(request_cancels, 1);
+}
+
+static void
+request_changed_while_waiting(void)
+{
+	request_capacity_pending();
+	request_shared.rings[1].count = 0;
+	pg_atomic_write_u64(&request_own.generation, request_base.generation + 1);
+}
+
+UT_TEST(test_native_request_wake_rechecks_original_native_identity)
+{
+	request_capacity_foreground(0);
+	request_on_sleep = request_changed_while_waiting;
+	UT_ASSERT_EQ(request_send(PCM_STATE_S), CLUSTER_LMS_ENQUEUE_INVALID);
+	UT_ASSERT(memcmp(&request_unsent, &request_entry()->resource_x_bootstrap_round,
+		sizeof(request_unsent)) == 0);
+	UT_ASSERT_EQ(request_shared.rings[1].count, 0);
+	UT_ASSERT(request_waiting == NULL);
+}
+
+static void
+request_domain_ends_while_waiting(void)
+{
+	request_capacity_pending();
+	request_shared.rings[1].count = 0;
+	request_admission.entered = false;
+}
+
+UT_TEST(test_native_request_wake_rechecks_original_admission)
+{
+	request_capacity_foreground(0);
+	request_on_sleep = request_domain_ends_while_waiting;
+	UT_ASSERT_EQ(request_send(PCM_STATE_S), CLUSTER_LMS_ENQUEUE_UNAVAILABLE);
+	request_capacity_pending();
+	UT_ASSERT_EQ(request_shared.rings[1].count, 0);
+	UT_ASSERT(request_waiting == NULL);
+}
+
+UT_TEST(test_native_request_no_capacity_sleep_under_content_lock)
+{
+	request_capacity_foreground(0);
+	LWLockAcquire(BufferDescriptorGetContentLock(&request_buf), LW_SHARED);
+	UT_ASSERT_EQ(request_send(PCM_STATE_S), CLUSTER_LMS_ENQUEUE_UNAVAILABLE);
+	LWLockRelease(BufferDescriptorGetContentLock(&request_buf));
+	request_capacity_pending();
+	UT_ASSERT_EQ(request_sleeps, 0);
+	UT_ASSERT_EQ(request_prepares, 0);
+}
+
+UT_TEST(test_native_request_already_handed_off_never_waits_for_new_capacity)
+{
+	ResourceXDecodedFrame decoded;
+	ResourceXIntentSlot ticket;
+	request_start(0, false);
+	UT_ASSERT_EQ(request_send(PCM_STATE_S), CLUSTER_LMS_ENQUEUE_ADMITTED);
+	ticket = request_ticket(&decoded);
+	request_shared.rings[1].count = PGRAC_LMS_OUTBOUND_CAPACITY;
+	MyBackendType = B_BACKEND;
+	UT_ASSERT_EQ(request_send(PCM_STATE_S), CLUSTER_LMS_ENQUEUE_NOT_DUE);
+	UT_ASSERT(cluster_pcm_lock_resource_x_requester_send_current_exact(&ticket));
+	UT_ASSERT_EQ(request_entry()->resource_x_bootstrap_round.send.episode, 1);
+	UT_ASSERT_EQ(request_sleeps, 0);
+	UT_ASSERT_EQ(request_prepares, 0);
+}
+
+static void
+request_provider_error_after_wake(void)
+{
+	request_shared.rings[1].count = 0;
+	request_rechecks = 0;
+	request_hook = request_provider_error;
+}
+
+UT_TEST(test_native_request_provider_error_after_wake_leaves_no_subscription_or_send)
+{
+	volatile bool caught = false;
+	request_capacity_foreground(0);
+	request_on_sleep = request_provider_error_after_wake;
+	PG_TRY(); { (void)request_send(PCM_STATE_S); }
+	PG_CATCH(); { caught = true; }
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	request_capacity_pending();
+	UT_ASSERT_EQ(request_shared.rings[1].count, 0);
+	UT_ASSERT(request_waiting == NULL);
+	UT_ASSERT_EQ(request_cancels, 1);
+}
+
+UT_TEST(test_native_request_capacity_observation_has_no_send_or_round_mutation)
+{
+	ClusterPcmResourceXBootstrapRound before;
+	ResourceXDecodedFrame frame;
+	ResourceXWireReject reject;
+	uint8 payload[RESOURCE_X_ACQUIRE_V3_BYTES];
+	uint16 bytes;
+	request_start(0, false);
+	UT_ASSERT_EQ(request_send(PCM_STATE_S), CLUSTER_LMS_ENQUEUE_ADMITTED);
+	(void)request_ticket(&frame);
+	frame.common.semantic_crc32c = 0; /* Original producer form, not wire ingress. */
+	before = request_entry()->resource_x_bootstrap_round;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_acquire_send_observe_exact(
+		&frame, 0, fake_pcm_clock_us), RESOURCE_X_INTENT_NOT_DUE);
+	UT_ASSERT(memcmp(&before, &request_entry()->resource_x_bootstrap_round, sizeof(before)) == 0);
+	frame.body.acquire_intent.backend_generation++;
+	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_ASSERT_X, &frame,
+		payload, sizeof(payload), &bytes, &reject));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_acquire_send_observe_exact(
+		&frame, 0, fake_pcm_clock_us), RESOURCE_X_INTENT_STALE);
+	UT_ASSERT(memcmp(&before, &request_entry()->resource_x_bootstrap_round, sizeof(before)) == 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(20);
+	UT_PLAN(32);
 	UT_RUN(test_native_request_real_ring_retains_first_fill_and_resident_s_x);
 	UT_RUN(test_native_request_local_master_uses_the_same_physical_owner);
 	UT_RUN(test_native_request_preserves_prepared_input_and_has_no_grant_or_native_completion);
@@ -486,6 +808,18 @@ main(void)
 	UT_RUN(test_native_request_transport_exhaustion_refuses_without_wrap_or_lost_owner);
 	UT_RUN(test_native_request_invalid_arguments_cannot_allocate_or_bind);
 	UT_RUN(test_native_request_direct_init_round_cannot_become_an_ordinary_request);
+	UT_RUN(test_native_request_reserves_last_position_for_completion);
+	UT_RUN(test_native_request_completion_credit_includes_draining);
+	UT_RUN(test_native_request_foreground_capacity_wait_keeps_same_episode);
+	UT_RUN(test_native_request_capacity_release_before_sleep_is_observed);
+	UT_RUN(test_native_request_membership_ends_only_unpublished_capacity_wait);
+	UT_RUN(test_native_request_cancel_drops_subscription_without_retiring_native);
+	UT_RUN(test_native_request_wake_rechecks_original_native_identity);
+	UT_RUN(test_native_request_wake_rechecks_original_admission);
+	UT_RUN(test_native_request_no_capacity_sleep_under_content_lock);
+	UT_RUN(test_native_request_already_handed_off_never_waits_for_new_capacity);
+	UT_RUN(test_native_request_provider_error_after_wake_leaves_no_subscription_or_send);
+	UT_RUN(test_native_request_capacity_observation_has_no_send_or_round_mutation);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

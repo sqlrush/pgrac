@@ -61,6 +61,10 @@
 
 #define PGRAC_LMS_OUTBOUND_CAPACITY 256
 #define PGRAC_LMS_OUTBOUND_PAYLOAD_MAX RESOURCE_X_PROOF_V1_BYTES
+/* Ordinary full-E requests may not consume the last original single-frame
+ * completion position. ACK/DONE/SEAL and retained intents keep full intake;
+ * their exact owners retain responsibility if even that position is busy. */
+#define PGRAC_LMS_OUTBOUND_COMPLETION_RESERVE 1
 #define PGRAC_LMS_RESOURCE_X_PROBE_BUDGET 4
 #define PGRAC_LMS_RESOURCE_X_CALLS_PER_TICK 16
 
@@ -748,6 +752,45 @@ cluster_lms_outbound_enqueue_resource_x_intent(int worker_id, const ResourceXInt
 	return CLUSTER_LMS_ENQUEUE_ADMITTED;
 }
 
+/* Only a foreground producer may sleep: DATA workers release this original
+ * capacity and broadcast space_cv after their retained frames are requeued.
+ * Enroll before checking; response periods only check shutdown/membership. */
+static bool
+lms_outbound_wait_capacity(int worker, uint64 epoch, uint32 headroom)
+{
+	ClusterLmsOutboundState *ring;
+	volatile bool ready = false;
+	uint32 limit;
+	if (worker < 0 || worker >= CLUSTER_LMS_MAX_WORKERS || OB_LOCK(worker) == NULL
+		|| cluster_lms_outbound_rings == NULL || MyBackendType != B_BACKEND
+		|| headroom >= PGRAC_LMS_OUTBOUND_CAPACITY)
+		return false;
+	limit = PGRAC_LMS_OUTBOUND_CAPACITY - headroom;
+	ring = OB_RING(worker);
+	ConditionVariablePrepareToSleep(&ring->space_cv);
+	PG_TRY();
+	{
+		for (;;) {
+			cluster_pcm_lock_check_shutdown_wait();
+			if (cluster_epoch_get_current() != epoch)
+				break;
+			LWLockAcquire(OB_LOCK(worker), LW_SHARED);
+			ready = ring->count < limit && ring->draining < limit - ring->count;
+			LWLockRelease(OB_LOCK(worker));
+			if (ready)
+				break;
+			(void)ConditionVariableTimedSleep(&ring->space_cv, 1000,
+				WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
+		}
+	}
+	PG_FINALLY();
+	{
+		ConditionVariableCancelSleep();
+	}
+	PG_END_TRY();
+	return ready;
+}
+
 /* Reserve both ASSERT and optional LOCAL_PROOF before publishing either.
  * The descriptor shares SD-90's exact tail/FIFO callbacks but is not a
  * retained authority intent. The semantic round owns reconstruction. */
@@ -764,6 +807,7 @@ cluster_lms_outbound_enqueue_resource_x_requester(int32 master,
 	ClusterLmsOutboundState *ring;
 	LWLock *lock;
 	uint32 count = proof == NULL ? 1 : 2;
+	uint32 limit;
 	uint64 now_us = lms_outbound_monotonic_us();
 	int worker;
 	if (master < 0 || master >= RESOURCE_X_PROTOCOL_NODE_LIMIT || control == NULL
@@ -796,8 +840,10 @@ cluster_lms_outbound_enqueue_resource_x_requester(int32 master,
 		return CLUSTER_LMS_ENQUEUE_INVALID;
 	lock = OB_LOCK(worker);
 	ring = OB_RING(worker);
+	limit = PGRAC_LMS_OUTBOUND_CAPACITY
+		- (control->has_acquire_intent ? PGRAC_LMS_OUTBOUND_COMPLETION_RESERVE : 0);
 	LWLockAcquire(lock, LW_EXCLUSIVE);
-	if (ring->count + ring->draining > PGRAC_LMS_OUTBOUND_CAPACITY - count) {
+	if (ring->count > limit - count || ring->draining > limit - count - ring->count) {
 		LWLockRelease(lock);
 		return CLUSTER_LMS_ENQUEUE_FULL;
 	}
@@ -844,6 +890,9 @@ cluster_lms_outbound_enqueue_resource_x_acquire(
 {
 	ResourceXDecodedFrame frame;
 	ClusterPcmOwnResult result;
+	ClusterLmsEnqueueResult enqueued;
+	ResourceXDecodedAcquireIntent checked;
+	int worker;
 
 	if (prepared == NULL || buf == NULL || base == NULL || admission == NULL
 		|| master < 0 || master >= RESOURCE_X_PROTOCOL_NODE_LIMIT
@@ -864,6 +913,10 @@ cluster_lms_outbound_enqueue_resource_x_acquire(
 		|| prepared->common.logical_assertion.requester_node != cluster_node_id
 		|| !BufferTagsEqual(&prepared->common.logical_assertion.resource, &base->tag))
 		return CLUSTER_LMS_ENQUEUE_INVALID;
+	/* No provider, raw entry reference or ring wait crosses a content lock.
+	 * The caller keeps its original pin/GP; this function never retires it. */
+	if (LWLockHeldByMe(BufferDescriptorGetContentLock(buf)))
+		return CLUSTER_LMS_ENQUEUE_UNAVAILABLE;
 
 	memset(&frame, 0, sizeof(frame));
 	frame.kind = RESOURCE_X_WIRE_ASSERT_X;
@@ -879,7 +932,32 @@ cluster_lms_outbound_enqueue_resource_x_acquire(
 	if (result != CLUSTER_PCM_OWN_OK)
 		return result == CLUSTER_PCM_OWN_BUSY || result == CLUSTER_PCM_OWN_NOT_READY
 			? CLUSTER_LMS_ENQUEUE_UNAVAILABLE : CLUSTER_LMS_ENQUEUE_INVALID;
-	return cluster_lms_outbound_enqueue_resource_x_requester(master, &frame, NULL);
+	worker = cluster_lms_shard_for_tag(&frame.common.logical_assertion.resource, cluster_lms_workers);
+	for (;;) {
+		ResourceXIntentResult observed;
+
+		enqueued = cluster_lms_outbound_enqueue_resource_x_requester(master, &frame, NULL);
+		if (enqueued != CLUSTER_LMS_ENQUEUE_FULL || MyBackendType != B_BACKEND)
+			return enqueued;
+		/* A consumed capacity credit cannot make an already-handed-off E
+		 * wait for another send. Observation changes no original round byte. */
+		observed = cluster_pcm_lock_resource_x_requester_acquire_send_observe_exact(
+			&frame, master, lms_outbound_monotonic_us());
+		if (observed == RESOURCE_X_INTENT_NOT_DUE)
+			return CLUSTER_LMS_ENQUEUE_NOT_DUE;
+		if (observed != RESOURCE_X_INTENT_STAGED)
+			return CLUSTER_LMS_ENQUEUE_INVALID;
+		if (!lms_outbound_wait_capacity(worker, frame.body.acquire_intent.cluster_epoch,
+			PGRAC_LMS_OUTBOUND_COMPLETION_RESERVE))
+			return CLUSTER_LMS_ENQUEUE_UNAVAILABLE;
+		/* Keep the immutable E across all wakes. Never resample a successor
+		 * token/backend/domain into this caller's prepared round. */
+		result = cluster_bufmgr_pcm_own_acquire_intent_exact(buf, base, reservation_token,
+			path, admission, &frame.body.acquire_intent, &checked);
+		if (result != CLUSTER_PCM_OWN_OK)
+			return result == CLUSTER_PCM_OWN_BUSY || result == CLUSTER_PCM_OWN_NOT_READY
+				? CLUSTER_LMS_ENQUEUE_UNAVAILABLE : CLUSTER_LMS_ENQUEUE_INVALID;
+	}
 }
 
 void
@@ -1576,34 +1654,7 @@ finish_batch:
 bool
 cluster_lms_outbound_wait_capacity(int worker, uint64 epoch)
 {
-	ClusterLmsOutboundState *ring;
-	volatile bool ready = false;
-	if (worker < 0 || worker >= CLUSTER_LMS_MAX_WORKERS || OB_LOCK(worker) == NULL
-		|| cluster_lms_outbound_rings == NULL || MyBackendType != B_BACKEND)
-		return false;
-	ring = OB_RING(worker);
-	ConditionVariablePrepareToSleep(&ring->space_cv);
-	PG_TRY();
-	{
-		for (;;) {
-			cluster_pcm_lock_check_shutdown_wait();
-			if (cluster_epoch_get_current() != epoch)
-				break;
-			LWLockAcquire(OB_LOCK(worker), LW_SHARED);
-			ready = ring->count + ring->draining < PGRAC_LMS_OUTBOUND_CAPACITY;
-			LWLockRelease(OB_LOCK(worker));
-			if (ready)
-				break;
-			(void)ConditionVariableTimedSleep(&ring->space_cv, 1000,
-				WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
-		}
-	}
-	PG_FINALLY();
-	{
-		ConditionVariableCancelSleep();
-	}
-	PG_END_TRY();
-	return ready;
+	return lms_outbound_wait_capacity(worker, epoch, 0);
 }
 
 uint32

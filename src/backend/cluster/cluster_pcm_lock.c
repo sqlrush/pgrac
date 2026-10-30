@@ -15485,10 +15485,9 @@ pcm_resource_x_requester_send_due_locked(const ClusterPcmResourceXBootstrapRound
 	return now_us >= after && now_us - after >= UINT64_C(500000);
 }
 
-ResourceXIntentResult
-cluster_pcm_lock_resource_x_requester_send_begin_exact(const ResourceXDecodedFrame *frame,
-													   int32 master, uint32 frame_count,
-													   uint64 now_us, ResourceXIntentSlot *out)
+static ResourceXIntentResult
+pcm_resource_x_requester_send_begin(const ResourceXDecodedFrame *frame,
+	int32 master, uint32 frame_count, uint64 now_us, ResourceXIntentSlot *out, bool reserve)
 {
 	PcmEntryRef er;
 	PcmEntryAcquireResult acquired;
@@ -15579,12 +15578,18 @@ cluster_pcm_lock_resource_x_requester_send_begin_exact(const ResourceXDecodedFra
 		|| !cluster_pcm_lock_resource_x_gate_open_exact(round->resource_formation))
 		goto done;
 	if (!pcm_resource_x_requester_send_due_locked(round, frame->kind, now_us)) {
-		if (cluster_trace_tx_identity) {
+		if (reserve && cluster_trace_tx_identity) {
 			pcm_resource_x_requester_gate_capture_locked(er.entry, frame->kind, now_us,
 				CLWAIT_REQUESTER_BEGIN, &rejected);
 			report_rejected = true;
 		}
 		result = RESOURCE_X_INTENT_NOT_DUE;
+		goto done;
+	}
+	/* Capacity observers cannot publish E, claim a send, or refresh its age.
+	 * The original ring owner repeats every predicate before real handoff. */
+	if (!reserve) {
+		result = RESOURCE_X_INTENT_STAGED;
 		goto done;
 	}
 	if (bind_acquire) {
@@ -15627,6 +15632,24 @@ done:
 	if (report_rejected)
 		cluster_wait_trace_requester_gate_emit(&rejected);
 	return result;
+}
+
+ResourceXIntentResult
+cluster_pcm_lock_resource_x_requester_send_begin_exact(const ResourceXDecodedFrame *frame,
+	int32 master, uint32 frame_count, uint64 now_us, ResourceXIntentSlot *out)
+{
+	return pcm_resource_x_requester_send_begin(frame, master, frame_count, now_us, out, true);
+}
+
+ResourceXIntentResult
+cluster_pcm_lock_resource_x_requester_acquire_send_observe_exact(
+	const ResourceXDecodedFrame *frame, int32 master, uint64 now_us)
+{
+	ResourceXIntentSlot unused;
+
+	if (frame == NULL || !frame->has_acquire_intent)
+		return RESOURCE_X_INTENT_STALE;
+	return pcm_resource_x_requester_send_begin(frame, master, 1, now_us, &unused, false);
 }
 
 static bool
