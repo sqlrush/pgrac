@@ -4974,6 +4974,7 @@ test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: t
 test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: test_cluster_recovery_consumed_native_redo.inc
 test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: test_cluster_recovery_episode_all_clog.inc test_cluster_recovery_episode_native_pages.inc
 test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: test_cluster_recovery_episode_local_bounds.inc
+test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: test_cluster_recovery_episode_resident_birth.inc
 test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: test_cluster_recovery_episode_native_bounds.inc
 
 # The original allocator and native CLOG producer lend only test observations.
@@ -14364,3 +14365,10 @@ test_cluster_clog_recovery test_cluster_clog_retention \
 
 test_cluster_terminal_ref_census: test_cluster_ctrc_plain_lock_refs.inc
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_plain_lock_refs.inc
+
+# PGRAC: complete original CLOG fixture consumers include cold birth tests.
+# Author: SqlRush <sqlrush@gmail.com>
+test_cluster_clog_recovery test_cluster_clog_retention \
+        test_cluster_side_native_clog.o test_cluster_recovery_episode_clog.o \
+        test_cluster_xid_native_clog.o test_cluster_relmap_native_clog.o \
+        test_cluster_relmap_publish_clog_bridge.o: test_cluster_clog_cold_birth.inc

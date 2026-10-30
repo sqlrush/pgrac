@@ -29,4 +29,5 @@ extern void test_episode_native_clog_write_all(void);
 extern void test_episode_native_clog_local_bounds(bool on, uint64 next, TransactionId oldest);
 extern void test_episode_native_clog_advance_next(TransactionId xid);
 extern void test_episode_native_clog_advance_oldest(TransactionId xid);
+extern void test_episode_native_clog_discard_resident(void);
 #endif

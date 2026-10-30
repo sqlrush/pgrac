@@ -99,6 +99,7 @@ static void *fixture_shared_mutation;
 static Size fixture_shared_mutation_size;
 static void (*fixture_native_sync_hook)(void);
 static void (*fixture_native_write_hook)(void);
+static void (*fixture_native_lock_hook)(LWLock *);
 static bool fixture_native_sync_fallback;
 static unsigned fixture_native_sync_requests;
 static bool fixture_native_truncate, fixture_native_truncate_flush_error;
@@ -254,6 +255,8 @@ LWLockAcquire(LWLock *lock, LWLockMode mode pg_attribute_unused())
 	fixture_locks[i].held = true;
 	if (native_fixture || base_fixture || relmap_base_interrupts)
 		HOLD_INTERRUPTS();
+	if (fixture_native_lock_hook != NULL)
+		fixture_native_lock_hook(lock);
 	if (revoke_on_lock && (lock == &ClogRecoveryLocks[3].lock
 		|| (c0_origin == 0 && lock == XactCtl->shared->ControlLock)))
 		authority = c0_authority = false;
@@ -1806,6 +1809,7 @@ native_held_base_constructor_error_and_later_refusals_keep_custody_sticky(void)
 
 #include "test_cluster_clog_full_consumer.inc"
 #include "test_cluster_clog_own_full.inc"
+#include "test_cluster_clog_cold_birth.inc"
 #include "test_cluster_clog_relmap_physical_mutation.inc"
 #include "test_cluster_clog_relmap_native_init.inc"
 #include "test_cluster_clog_relmap_writeback.inc"
@@ -1941,7 +1945,19 @@ main(void)
 	UT_RUN(resident_birth_original_slru_remap_truncate_and_delete_clear_slots);
 		goto mutation_done;
 	}
-	UT_PLAN(101);
+	if (getenv("PGRAC_COLD_BIRTH_ONLY") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(cold_birth_apply_feeds_original_held_reader);
+		UT_RUN(cold_birth_verification_never_creates_or_replaces_input);
+		UT_RUN(cold_birth_late_failures_keep_unknown_and_held_debt);
+		UT_RUN(cold_birth_final_lock_error_keeps_original_cleanup);
+		goto mutation_done;
+	}
+	UT_PLAN(105);
+	UT_RUN(cold_birth_apply_feeds_original_held_reader);
+	UT_RUN(cold_birth_verification_never_creates_or_replaces_input);
+	UT_RUN(cold_birth_late_failures_keep_unknown_and_held_debt);
+	UT_RUN(cold_birth_final_lock_error_keeps_original_cleanup);
 	UT_RUN(resident_birth_comes_from_native_full_producer_not_query);
 	UT_RUN(resident_birth_redo_legacy_and_wal_error_boundaries);
 	UT_RUN(resident_birth_cache_loss_refuses_held_rebase_and_disk_inference);
