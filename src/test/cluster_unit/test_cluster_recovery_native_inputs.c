@@ -1158,6 +1158,8 @@ cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **held)
 #include "test_cluster_recovery_census_tx_reference_edges.inc"
 #include "test_cluster_recovery_census_tx_recheck.inc"
 
+#include "test_cluster_recovery_owner_routes.inc"
+
 int
 main(int argc, char **argv)
 {
@@ -1165,6 +1167,13 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_OWNER_ROUTES") != NULL) {
+		UT_PLAN(2);
+		UT_RUN(test_census_owner_routes_keep_every_component_and_original_custody);
+		UT_RUN(test_census_owner_routes_missing_wrong_extra_and_nonempty_end_revoke_whole_group);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+
 	if (getenv("PGRAC_PRE2_TEST_CENSUS_TX_RECHECK") != NULL) {
 		UT_PLAN(3);
 		UT_RUN(test_census_tx_final_recheck_accepts_original_complete_files_and_empty_end);
@@ -1529,7 +1538,10 @@ main(int argc, char **argv)
 	UT_RUN(test_census_native_records_original_final_wal_rewrite_refuses_whole_view);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(284);
+	UT_PLAN(286);
+	UT_RUN(test_census_owner_routes_keep_every_component_and_original_custody);
+	UT_RUN(test_census_owner_routes_missing_wrong_extra_and_nonempty_end_revoke_whole_group);
+
 	UT_RUN(test_census_compound_groups_keep_all_components_without_cursor_or_io);
 	UT_RUN(test_census_compound_groups_refuse_partial_mixed_and_nonempty_end);
 	UT_RUN(test_inventory_compound_groups_charge_the_original_budget_without_prefix);

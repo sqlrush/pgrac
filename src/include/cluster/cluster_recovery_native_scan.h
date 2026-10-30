@@ -106,6 +106,89 @@ typedef struct ClusterRecoveryNativeEffect {
 	size_t length;
 } ClusterRecoveryNativeEffect;
 
+/* Fixed owner-family rows, independent of native opcode/kind numbering.
+ * These bits enumerate unresolved duties only. In particular COMMIT_TS and
+ * PREPARED do not become supported, and two invalidation duties do not prove
+ * that either the local cache or the current cohort has consumed anything. */
+#define CLUSTER_RECOVERY_OWNER_CLOG UINT16_C(1)
+#define CLUSTER_RECOVERY_OWNER_COMMIT_TS UINT16_C(2)
+#define CLUSTER_RECOVERY_OWNER_SUBTRANS UINT16_C(4)
+#define CLUSTER_RECOVERY_OWNER_MX_OFFSETS UINT16_C(8)
+#define CLUSTER_RECOVERY_OWNER_MX_MEMBERS UINT16_C(16)
+#define CLUSTER_RECOVERY_OWNER_PREPARED UINT16_C(32)
+#define CLUSTER_RECOVERY_OWNER_RELMAP UINT16_C(64)
+#define CLUSTER_RECOVERY_OWNER_LOCAL_INVALIDATION UINT16_C(128)
+#define CLUSTER_RECOVERY_OWNER_SHARED_INVALIDATION UINT16_C(256)
+#define CLUSTER_RECOVERY_OWNER_SPACE UINT16_C(1024)
+#define CLUSTER_RECOVERY_OWNER_CREATE UINT16_C(2048)
+#define CLUSTER_RECOVERY_OWNER_STATS UINT16_C(4096)
+#define CLUSTER_RECOVERY_OWNER_SIDE UINT16_C(8192)
+
+/* Project the ORIGINAL decoder's component, not a second WAL dispatcher.
+ * The complete record/flags remain the owner's input. No target count, local
+ * GUC, raw-xid match or empty message array can discharge these duties.
+ * PAGE and other families outside this decoder retain their original owners.
+ * A zero result means an invalid/unknown component, never proven no effect. */
+static inline uint16
+cluster_recovery_native_effect_owner_families_v1(const ClusterRecoveryNativeEffect *effect)
+{
+	const uint16 invalidation = CLUSTER_RECOVERY_OWNER_LOCAL_INVALIDATION
+		| CLUSTER_RECOVERY_OWNER_SHARED_INVALIDATION;
+	if (effect == NULL || effect->record == NULL || effect->bytes == NULL || effect->length == 0)
+		return 0;
+	switch (effect->kind) {
+	case CLUSTER_RECOVERY_NATIVE_TERMINAL:
+		return CLUSTER_RECOVERY_OWNER_CLOG
+			| ((effect->record->header.xl_info & XLOG_XACT_OPMASK) == XLOG_XACT_COMMIT
+				? CLUSTER_RECOVERY_OWNER_COMMIT_TS : 0)
+			| (effect->record->relcache_init_file ? invalidation : 0);
+	case CLUSTER_RECOVERY_NATIVE_ASSIGNMENT:
+	case CLUSTER_RECOVERY_NATIVE_SUBXACT:
+		return CLUSTER_RECOVERY_OWNER_SUBTRANS;
+	case CLUSTER_RECOVERY_NATIVE_INVALIDATION_BATCH:
+	case CLUSTER_RECOVERY_NATIVE_INVALIDATION:
+		return invalidation;
+	case CLUSTER_RECOVERY_NATIVE_CREATE:
+		return CLUSTER_RECOVERY_OWNER_CREATE;
+	case CLUSTER_RECOVERY_NATIVE_RELATION_DROP:
+	case CLUSTER_RECOVERY_NATIVE_SPACE_DROP:
+		return CLUSTER_RECOVERY_OWNER_SPACE;
+	case CLUSTER_RECOVERY_NATIVE_STATS_DROP:
+		return CLUSTER_RECOVERY_OWNER_STATS;
+	case CLUSTER_RECOVERY_NATIVE_TT_COMMIT:
+	case CLUSTER_RECOVERY_NATIVE_UNDO:
+		return CLUSTER_RECOVERY_OWNER_SIDE;
+	case CLUSTER_RECOVERY_NATIVE_MULTIXACT_CREATE:
+	case CLUSTER_RECOVERY_NATIVE_MULTIXACT_TRUNCATE:
+		return CLUSTER_RECOVERY_OWNER_MX_OFFSETS | CLUSTER_RECOVERY_OWNER_MX_MEMBERS;
+	case CLUSTER_RECOVERY_NATIVE_MULTIXACT_ZERO_OFFSETS:
+		return CLUSTER_RECOVERY_OWNER_MX_OFFSETS;
+	case CLUSTER_RECOVERY_NATIVE_MULTIXACT_MEMBER:
+	case CLUSTER_RECOVERY_NATIVE_MULTIXACT_ZERO_MEMBERS:
+		return CLUSTER_RECOVERY_OWNER_MX_MEMBERS;
+	case CLUSTER_RECOVERY_NATIVE_CLOG_ZERO:
+	case CLUSTER_RECOVERY_NATIVE_CLOG_TRUNCATE:
+		return CLUSTER_RECOVERY_OWNER_CLOG;
+	case CLUSTER_RECOVERY_NATIVE_COMMIT_TS_ZERO:
+	case CLUSTER_RECOVERY_NATIVE_COMMIT_TS_TRUNCATE:
+		return CLUSTER_RECOVERY_OWNER_COMMIT_TS;
+	case CLUSTER_RECOVERY_NATIVE_RELMAP_UPDATE:
+	case CLUSTER_RECOVERY_NATIVE_RELMAP_ENTRY:
+		return CLUSTER_RECOVERY_OWNER_RELMAP;
+	case CLUSTER_RECOVERY_NATIVE_PREPARE:
+	case CLUSTER_RECOVERY_NATIVE_PREPARE_SUBXACT:
+	case CLUSTER_RECOVERY_NATIVE_PREPARE_COMMIT_RELATION:
+	case CLUSTER_RECOVERY_NATIVE_PREPARE_ABORT_RELATION:
+	case CLUSTER_RECOVERY_NATIVE_PREPARE_COMMIT_STATS:
+	case CLUSTER_RECOVERY_NATIVE_PREPARE_ABORT_STATS:
+	case CLUSTER_RECOVERY_NATIVE_PREPARE_INVALIDATION:
+	case CLUSTER_RECOVERY_NATIVE_PREPARE_RESOURCE:
+	case CLUSTER_RECOVERY_NATIVE_PREPARE_END:
+		return CLUSTER_RECOVERY_OWNER_PREPARED;
+	}
+	return 0;
+}
+
 /* UNDO emits one ClusterUndoDecoded in bytes, while record->payload retains
  * the entire original main data, including images/deltas and certificates.
  * Field presence follows the original kind/version: zero in an absent

@@ -3,6 +3,7 @@
  * Copyright (c) 2026, pgrac contributors
  * Author: SqlRush <sqlrush@gmail.com> */
 static unsigned start_native_record_fault, start_native_record_calls;
+static uint16 start_native_owner_families[2][3];
 static uint64 start_native_record_count;
 static ClusterRecoveryNativeRecord start_native_records[2];
 static char start_native_payloads[2][8];
@@ -26,6 +27,7 @@ cluster_recovery_census_native_record_v1(ClusterRecoveryCensus *cursor, uint64 i
 		out.primary.record = &start_native_records[index];
 		out.primary.bytes = start_native_payloads[index]; out.primary.length = 8;
 		out.effects = start_native_components[index]; out.effect_count = index == 0 ? 1 : 3;
+		out.owner_families = start_native_owner_families[index];
 	}
 	if (start_native_record_fault == 3) out.count = observation_manifest.native_effect_count + 1;
 	if (start_native_record_fault == 4) out.source_index = out.source_count;
@@ -42,6 +44,12 @@ cluster_recovery_census_native_record_v1(ClusterRecoveryCensus *cursor, uint64 i
 	if (start_native_record_fault == 24) start_native_components[1][2].record = &start_native_records[0];
 	if (start_native_record_fault == 25) start_native_components[1][0].kind = 0;
 	if (start_native_record_fault == 26) { out.effects = start_native_components[0]; out.effect_count = 1; }
+	if (start_native_record_fault == 31) out.owner_families = NULL;
+	if (start_native_record_fault == 32) start_native_owner_families[1][0] = 0;
+	if (start_native_record_fault == 33) start_native_owner_families[1][0] = 0x8000;
+	if (start_native_record_fault == 34) start_native_owner_families[1][0] = 8;
+	if (start_native_record_fault == 35) start_native_owner_families[1][0] = 0x3fff;
+	if (start_native_record_fault == 36) out.owner_families = start_native_owner_families[0];
 	return out;
 }
 
@@ -61,6 +69,8 @@ start_native_records_ready(uint64 count)
 		start_native_records[i].payload = start_native_payloads[i];
 		start_native_records[i].payload_length = sizeof(start_native_payloads[i]);
 		start_native_payloads[i][7] = 0x73 + i;
+		start_native_owner_families[i][0] = i == 0 ? 1 : 24;
+		start_native_owner_families[i][1] = start_native_owner_families[i][2] = 16;
 		start_native_components[i][0] = (ClusterRecoveryNativeEffect){
 			i == 0 ? CLUSTER_RECOVERY_NATIVE_CLOG_ZERO : CLUSTER_RECOVERY_NATIVE_MULTIXACT_CREATE,
 			0, &start_native_records[i], start_native_payloads[i], 8 };

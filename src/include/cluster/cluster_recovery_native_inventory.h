@@ -599,6 +599,10 @@ typedef struct ClusterRecoveryNativeRecordObservationV1 {
 	 * Immutable borrowed descriptors and bytes; never a discharge verdict. */
 	const ClusterRecoveryNativeEffect *effects;
 	size_t effect_count;
+	/* One immutable mask per original effect, indexed identically. Each bit
+	 * is an unresolved fixed owner-family duty, not an executor/completion
+	 * result, qualified base, raw-record reference or semantic graph seal. */
+	const uint16 *owner_families;
 } ClusterRecoveryNativeRecordObservationV1;
 /* A complete decoder-owned group is published as one value. Upper layers
  * check its envelope before exposing borrowed components; execution and
@@ -607,14 +611,18 @@ static inline bool
 cluster_recovery_native_record_effects_valid_v1(const ClusterRecoveryNativeRecordObservationV1 *view,
 	uint64 limit)
 {
-	if (view->index == view->count) return view->effects == NULL && view->effect_count == 0;
-	if (view->effects == NULL || view->effect_count == 0 || view->effect_count > limit)
+	if (view->index == view->count) return view->effects == NULL && view->effect_count == 0
+		&& view->owner_families == NULL;
+	if (view->effects == NULL || view->owner_families == NULL
+		|| view->effect_count == 0 || view->effect_count > limit)
 		return false;
 	for (size_t i = 0; i < view->effect_count; i++) {
 		const ClusterRecoveryNativeEffect *effect = &view->effects[i];
 		if (effect->kind < CLUSTER_RECOVERY_NATIVE_TERMINAL
 			|| effect->kind > CLUSTER_RECOVERY_NATIVE_PREPARE_END
-			|| effect->record != view->primary.record || effect->bytes == NULL || effect->length == 0)
+			|| effect->record != view->primary.record || effect->bytes == NULL || effect->length == 0
+			|| view->owner_families[i] == 0
+			|| view->owner_families[i] != cluster_recovery_native_effect_owner_families_v1(effect))
 			return false;
 	}
 	return view->effects[0].kind == view->primary.kind && view->effects[0].ordinal == 0

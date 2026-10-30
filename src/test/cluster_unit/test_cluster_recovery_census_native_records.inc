@@ -2,6 +2,7 @@
  * Copyright (c) 2026, pgrac contributors
  * Author: SqlRush <sqlrush@gmail.com> */
 static unsigned census_native_record_fault, census_native_record_calls;
+static uint16 census_bad_owner_families[64];
 static ClusterRecoveryNativeEffect census_native_bad_effects[64];
 
 static ClusterRecoveryNativeRecordObservationV1
@@ -26,6 +27,16 @@ census_native_test_record(ClusterRecoveryNativeInventory *inventory, uint64 inde
 		else census_native_bad_effects[0].record = NULL;
 	}
 	if (census_native_record_fault == 26) { out.effects = census_native_bad_effects; out.effect_count = 1; }
+	if (census_native_record_fault >= 31 && census_native_record_fault <= 36) {
+		memset(census_bad_owner_families, 0, sizeof(census_bad_owner_families));
+		if (out.owner_families != NULL && out.effect_count < lengthof(census_bad_owner_families))
+			memcpy(census_bad_owner_families, out.owner_families, out.effect_count * sizeof(uint16));
+		out.owner_families = census_native_record_fault == 31 ? NULL : census_bad_owner_families;
+		if (census_native_record_fault == 32) census_bad_owner_families[0] = 0;
+		if (census_native_record_fault == 33) census_bad_owner_families[0] = 0x8000;
+		if (census_native_record_fault == 34) census_bad_owner_families[0] = 8;
+		if (census_native_record_fault == 35) census_bad_owner_families[0] |= 0x3fff;
+	}
 	return out;
 }
 
