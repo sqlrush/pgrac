@@ -33,4 +33,12 @@ extern void test_episode_native_clog_discard_resident(void);
 /* Actual cold native initialization; original episode authority is a fixture. */
 extern bool test_episode_native_clog_full_apply(const ClusterRecoveryRelmapSourceV1 *source,
 	const xl_clog_zeropage_full *birth);
+/* Execute the complete original native callback. Faults occur only after
+ * original redo, before its synchronous completion/readback. */
+typedef struct TestEpisodeClogReplayStats {
+	unsigned redos, touches, file_syncs, directory_syncs;
+	bool returned;
+} TestEpisodeClogReplayStats;
+extern void test_episode_native_clog_replay(XLogReaderState *reader,
+	TimeLineID timeline, unsigned sync_fault, TestEpisodeClogReplayStats *stats);
 #endif

@@ -236,7 +236,7 @@ static const ClusterRecoveryRelmapSourceV1 *episode_full_source;
 bool
 cluster_undo_recovery_cold_origin_authorized_v1(int origin)
 {
-	return authority && (episode_full_source == NULL ? origin == 1
+	return authority && (episode_full_source == NULL ? origin == fixture_origin
 		: origin == episode_full_source->selected.source.claim.identity.origin_node_id
 			&& cluster_wal_inputs_relmap_source_current_v1(episode_full_source));
 }
@@ -267,4 +267,84 @@ test_episode_native_clog_full_apply(const ClusterRecoveryRelmapSourceV1 *source,
 	} PG_END_TRY();
 	episode_clog_unlocked();
 	return ok;
+}
+
+/* Reuse the complete extracted callback with episode-local leaves. The old
+ * standalone fixture's fixed SCN/timeline checks and all its tests stay intact. */
+static TestEpisodeClogReplayStats *episode_callback_stats;
+static uint64 episode_callback_scn;
+static TimeLineID episode_callback_timeline;
+static unsigned episode_callback_fault;
+static bool episode_callback_foreign;
+
+static void episode_callback_set_scn(uint64 scn)
+{
+	UT_ASSERT_EQ(scn, episode_callback_scn);
+}
+
+static void episode_callback_set_foreign(bool foreign)
+{
+	UT_ASSERT(!foreign);
+	episode_callback_foreign = foreign;
+}
+
+static void episode_callback_touch(ClusterColdTouchedV1 *touched, XLogReaderState *reader)
+{
+	UT_ASSERT(touched != NULL && reader != NULL);
+	++episode_callback_stats->touches;
+}
+
+static void episode_callback_apply(XLogReaderState *reader, XLogRecord *header,
+	TimeLineID timeline)
+{
+	UT_ASSERT(header == &reader->record->header && timeline == episode_callback_timeline);
+	UT_ASSERT(!episode_callback_foreign);
+	clog_redo(reader);
+	++episode_callback_stats->redos;
+	/* Inject only at completion of the original write, never before redo. */
+	fail_sync = episode_callback_fault == 1;
+	fail_dirsync = episode_callback_fault == 2;
+}
+
+#define cluster_typed_replay_apply_native episode_clog_original_native_callback
+#define cluster_recovery_merge_set_scn episode_callback_set_scn
+#define cluster_recovery_merge_set_apply_foreign episode_callback_set_foreign
+#define cluster_cold_touched_add_record_v1 episode_callback_touch
+#define ApplyWalRecord episode_callback_apply
+#include "test_cluster_clog_native_callback.inc"
+#undef ApplyWalRecord
+#undef cluster_cold_touched_add_record_v1
+#undef cluster_recovery_merge_set_apply_foreign
+#undef cluster_recovery_merge_set_scn
+#undef cluster_typed_replay_apply_native
+
+void
+test_episode_native_clog_replay(XLogReaderState *reader, TimeLineID timeline,
+	unsigned sync_fault, TestEpisodeClogReplayStats *stats)
+{
+	ClusterColdTypedReplay replay = { .apply_foreign = false, .replayTLI = timeline };
+	bool old_recovery = InRecovery, old_error = expect_error;
+	bool old_sync = fail_sync, old_dirsync = fail_dirsync;
+	unsigned file_syncs = syncs, directory_syncs = dirsyncs;
+
+	UT_ASSERT(sync_fault <= 2 && stats != NULL && episode_callback_stats == NULL);
+	memset(stats, 0, sizeof(*stats));
+	episode_callback_stats = stats;
+	episode_callback_scn = reader->record->header.xl_scn;
+	episode_callback_timeline = timeline;
+	episode_callback_fault = sync_fault;
+	episode_callback_foreign = false;
+	InRecovery = expect_error = true;
+	PG_TRY(); {
+		episode_clog_original_native_callback(reader, &replay);
+		stats->returned = true;
+	} PG_FINALLY(); {
+		InRecovery = old_recovery;
+		expect_error = old_error;
+		fail_sync = old_sync; fail_dirsync = old_dirsync;
+		stats->file_syncs = syncs - file_syncs;
+		stats->directory_syncs = dirsyncs - directory_syncs;
+		episode_callback_stats = NULL;
+		episode_clog_unlocked();
+	} PG_END_TRY();
 }
