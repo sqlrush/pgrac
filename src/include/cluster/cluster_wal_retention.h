@@ -359,6 +359,10 @@ extern bool cluster_wal_retention_resid_encode(uint16 thread_id, ClusterResId *o
  * This scope conveys no recovery, DATA or publication authority. */
 extern ClusterWalPinResult cluster_wal_read_pin_acquire_v1(const uint16 *threads, uint16 nthreads,
 														   ClusterWalReadPinV1 **out);
+extern ClusterWalPinResult cluster_wal_read_pin_acquire_deadline_v1(const uint16 *threads,
+																	uint16 nthreads,
+																	ClusterWalReadPinV1 **out,
+																	uint64 deadline_ns);
 extern bool cluster_wal_read_pin_covers_v1(ClusterWalReadPinV1 *pin, uint16 thread);
 extern ClusterWalrReleaseResult cluster_wal_read_pin_release_v1(ClusterWalReadPinV1 **pin);
 extern ClusterWalPinResult

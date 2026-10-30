@@ -13083,6 +13083,7 @@ typedef struct RecoveryWalVisitWork {
 	RecoveryWalCfWait cf_wait;
 	bool caller_owns_cf_retry;
 	uint64 cf_deadline_ns;
+	const uint64 *prepare_deadline;
 } RecoveryWalVisitWork;
 
 /* Keep this input-only operation's original owner across both ROOT intervals.
@@ -13134,6 +13135,31 @@ recovery_wal_cf_current(const RecoveryWalVisitWork *work)
 		   && work->native_checkpoint == original->native_checkpoint;
 }
 
+/* Same pre-write plan deadline, never a new duration or cleanup budget. */
+static int
+recovery_wal_prepare_budget(const RecoveryWalVisitWork *work, int ceiling)
+{
+	struct timespec now;
+	uint64 ns;
+	if (work->prepare_deadline == NULL)
+		return ceiling;
+	if (*work->prepare_deadline == 0)
+		return 0;
+	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0 || now.tv_nsec < 0
+		|| now.tv_nsec >= NS_PER_S || (uint64)now.tv_sec > (UINT64_MAX - NS_PER_S) / NS_PER_S)
+		return 0;
+	ns = (uint64)now.tv_sec * NS_PER_S + (uint64)now.tv_nsec;
+	return ns < *work->prepare_deadline
+			   ? (int)Min((uint64)ceiling, (*work->prepare_deadline - ns) / NS_PER_MS)
+			   : 0;
+}
+static bool
+recovery_wal_prepare_current(const RecoveryWalVisitWork *work)
+{
+	return work->prepare_deadline == NULL || *work->prepare_deadline == 0
+		   || recovery_wal_prepare_budget(work, 1) > 0;
+}
+
 static void
 recovery_wal_cf_wait(const RecoveryWalVisitWork *work, const ClusterCfAttemptObservation *attempt)
 {
@@ -13154,11 +13180,15 @@ recovery_wal_cf_wait(const RecoveryWalVisitWork *work, const ClusterCfAttemptObs
 	for (;;) {
 		ClusterCfRetirementSnapshot current;
 		bool held;
+		int wait_ms = recovery_wal_prepare_budget(work, 20);
 
 		HandleStartupProcInterrupts();
 		CHECK_FOR_INTERRUPTS();
 		reason = "CONTEXT_CHANGED_AFTER_WAIT_SLICE";
 		if (!recovery_wal_cf_current(work))
+			goto refuse;
+		reason = "ORIGINAL_PLAN_DEADLINE";
+		if (wait_ms <= 0)
 			goto refuse;
 		ResetLatch(MyLatch);
 		held = cluster_cf_held(ShareLock);
@@ -13169,7 +13199,7 @@ recovery_wal_cf_wait(const RecoveryWalVisitWork *work, const ClusterCfAttemptObs
 				if (empty_waited)
 					return;
 				empty_waited = true;
-				(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+				(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, wait_ms,
 								WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
 				continue;
 			}
@@ -13189,9 +13219,14 @@ recovery_wal_cf_wait(const RecoveryWalVisitWork *work, const ClusterCfAttemptObs
 			goto refuse;
 		cluster_lock_owners_service_poll();
 		cluster_cf_retirement_poll();
-		if (cluster_cf_held(ShareLock))
-			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+		if (cluster_cf_held(ShareLock)) {
+			wait_ms = recovery_wal_prepare_budget(work, 20);
+			reason = "ORIGINAL_PLAN_DEADLINE";
+			if (wait_ms <= 0)
+				goto refuse;
+			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, wait_ms,
 							WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
+		}
 	}
 refuse:
 	ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
@@ -13219,8 +13254,12 @@ recovery_wal_visit_root(RecoveryWalVisitWork *work)
 		uint64 before = startup ? cluster_cf_attempt_sequence() : 0;
 		bool acquired;
 
-		if (work->caller_owns_cf_retry) {
-			acquired = cluster_cf_lock_deadline_v1(ShareLock, work->cf_deadline_ns);
+		if (!recovery_wal_prepare_current(work))
+			return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+		if (work->caller_owns_cf_retry || work->prepare_deadline != NULL) {
+			acquired = cluster_cf_lock_deadline_v1(ShareLock, work->prepare_deadline != NULL
+																  ? *work->prepare_deadline
+																  : work->cf_deadline_ns);
 			if (acquired && !cluster_cf_held_is_clusterwide(ShareLock)) {
 				(void)cluster_cf_unlock_confirmed(ShareLock);
 				return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
@@ -13263,7 +13302,10 @@ recovery_wal_visit_root(RecoveryWalVisitWork *work)
 		}
 	}
 	work->cf_mode = NoLock;
-	return release_cf(ShareLock, result);
+	result = release_cf(ShareLock, result);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && !recovery_wal_prepare_current(work))
+		result = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	return result;
 }
 
 static ClusterControlRootResult
@@ -13340,10 +13382,10 @@ cluster_control_root_recovery_source_deadline_v1(const ClusterControlRootSnapsho
 	return recovery_wal_source(expected, token, out, native_redo, true, deadline_ns);
 }
 
-ClusterControlRootResult
-cluster_control_root_recovery_checkpoint_v1(const ClusterControlRootSnapshot *expected,
-											const ClusterControlRootReadToken *token,
-											ClusterWalRecoveryCheckpointV1 *out)
+static ClusterControlRootResult
+recovery_wal_checkpoint(const ClusterControlRootSnapshot *expected,
+						const ClusterControlRootReadToken *token,
+						ClusterWalRecoveryCheckpointV1 *out, const uint64 *deadline)
 {
 	RecoveryWalVisitWork *work;
 	ClusterControlRootResult result;
@@ -13370,6 +13412,7 @@ cluster_control_root_recovery_checkpoint_v1(const ClusterControlRootSnapshot *ex
 	work->expected = *expected;
 	work->token = *token;
 	work->native_checkpoint = true;
+	work->prepare_deadline = deadline;
 	PG_TRY();
 	{
 		result = recovery_wal_visit_root(work);
@@ -13394,10 +13437,29 @@ cluster_control_root_recovery_checkpoint_v1(const ClusterControlRootSnapshot *ex
 	return result;
 }
 
+ClusterControlRootResult
+cluster_control_root_recovery_checkpoint_v1(const ClusterControlRootSnapshot *expected,
+											const ClusterControlRootReadToken *token,
+											ClusterWalRecoveryCheckpointV1 *out)
+{
+	return recovery_wal_checkpoint(expected, token, out, NULL);
+}
+ClusterControlRootResult
+cluster_control_root_recovery_checkpoint_deadline_v1(const ClusterControlRootSnapshot *expected,
+													 const ClusterControlRootReadToken *token,
+													 ClusterWalRecoveryCheckpointV1 *out,
+													 uint64 deadline_ns)
+{
+	if (MyBackendType != B_STARTUP)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	return recovery_wal_checkpoint(expected, token, out, &deadline_ns);
+}
+
 static ClusterControlRootResult
 recovery_wal_visit(const ClusterControlRootSnapshot *expected,
 				   const ClusterControlRootReadToken *token, ClusterWalRecordVisitor visitor,
-				   void *arg, ClusterWalTailObservation *out, bool sync_inputs)
+				   void *arg, ClusterWalTailObservation *out, bool sync_inputs,
+				   const uint64 *deadline)
 {
 	RecoveryWalVisitWork *work;
 	ClusterControlRootResult result;
@@ -13422,6 +13484,7 @@ recovery_wal_visit(const ClusterControlRootSnapshot *expected,
 	work = palloc0(sizeof(*work));
 	work->expected = *expected;
 	work->token = *token;
+	work->prepare_deadline = deadline;
 	PG_TRY();
 	{
 		result = recovery_wal_visit_root(work);
@@ -13458,7 +13521,7 @@ cluster_control_root_recovery_visit(const ClusterControlRootSnapshot *expected,
 									ClusterWalRecordVisitor visitor, void *arg,
 									ClusterWalTailObservation *out)
 {
-	return recovery_wal_visit(expected, token, visitor, arg, out, false);
+	return recovery_wal_visit(expected, token, visitor, arg, out, false, NULL);
 }
 
 ClusterControlRootResult
@@ -13466,7 +13529,18 @@ cluster_control_root_recovery_sync_v1(const ClusterControlRootSnapshot *expected
 									  const ClusterControlRootReadToken *token,
 									  ClusterWalTailObservation *out)
 {
-	return recovery_wal_visit(expected, token, NULL, NULL, out, true);
+	return recovery_wal_visit(expected, token, NULL, NULL, out, true, NULL);
+}
+
+ClusterControlRootResult
+cluster_control_root_recovery_visit_deadline_v1(const ClusterControlRootSnapshot *expected,
+												const ClusterControlRootReadToken *token,
+												ClusterWalRecordVisitor visitor, void *arg,
+												ClusterWalTailObservation *out, uint64 deadline_ns)
+{
+	if (MyBackendType != B_STARTUP)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	return recovery_wal_visit(expected, token, visitor, arg, out, false, &deadline_ns);
 }
 
 ClusterControlRootResult

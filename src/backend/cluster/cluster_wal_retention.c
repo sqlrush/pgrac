@@ -1651,8 +1651,9 @@ cluster_wal_read_pin_release_v1(ClusterWalReadPinV1 **pin)
 	return CLUSTER_WALR_RELEASE_CONFIRMED;
 }
 
-ClusterWalPinResult
-cluster_wal_read_pin_acquire_v1(const uint16 *threads, uint16 nthreads, ClusterWalReadPinV1 **out)
+static ClusterWalPinResult
+read_pin_acquire(const uint16 *threads, uint16 nthreads, ClusterWalReadPinV1 **out,
+				 const uint64 *deadline)
 {
 	ClusterWalReadPinV1 *pin;
 	ClusterWalPinResult result = CLUSTER_WAL_PIN_UNAVAILABLE;
@@ -1685,12 +1686,15 @@ cluster_wal_read_pin_acquire_v1(const uint16 *threads, uint16 nthreads, ClusterW
 		ClusterWalPinLock *lock = &pin->locks[i];
 
 		if (!walr_share_request_init(threads[i], &lock->request)
-			|| walr_request_acquire_actual(&lock->request) != CLUSTER_LOCK_ACQUIRE_OK_GRANTED)
+			|| (deadline != NULL ? walr_request_acquire(&lock->request, *deadline)
+								 : walr_request_acquire_actual(&lock->request))
+				   != CLUSTER_LOCK_ACQUIRE_OK_GRANTED)
 			goto failed;
 		lock->held = true;
 	}
 	pin->poisoned = false;
-	if (!cluster_wal_read_pin_covers_v1(pin, threads[0])) {
+	if ((deadline != NULL && *deadline != 0 && walr_deadline_budget(*deadline, 1) <= 0)
+		|| !cluster_wal_read_pin_covers_v1(pin, threads[0])) {
 		result = CLUSTER_WAL_PIN_STALE;
 		goto failed;
 	}
@@ -1702,6 +1706,20 @@ failed:
 		return CLUSTER_WAL_PIN_RELEASE_UNCERTAIN;
 	}
 	return result;
+}
+
+ClusterWalPinResult
+cluster_wal_read_pin_acquire_v1(const uint16 *threads, uint16 nthreads, ClusterWalReadPinV1 **out)
+{
+	return read_pin_acquire(threads, nthreads, out, NULL);
+}
+ClusterWalPinResult
+cluster_wal_read_pin_acquire_deadline_v1(const uint16 *threads, uint16 nthreads,
+										 ClusterWalReadPinV1 **out, uint64 deadline_ns)
+{
+	if (MyBackendType != B_STARTUP)
+		return CLUSTER_WAL_PIN_INVALID;
+	return read_pin_acquire(threads, nthreads, out, &deadline_ns);
 }
 
 static ClusterWalPinResult

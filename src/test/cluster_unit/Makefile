@@ -1465,6 +1465,7 @@ test_cluster_startup_cf_callsite.inc: $(top_srcdir)/src/backend/access/transam/x
 test_cluster_startup_cf_entry: test_cluster_startup_cf_entry.c test_cluster_cf_enqueue.c test_cluster_cf_deadline.h test_cluster_ir_pin_deadline.h test_cluster_seal_deadline.h \
 		test_cluster_classification_cf.h test_cluster_classification_cf.inc \
 		test_cluster_typed_root_budget.h test_cluster_typed_root_budget.inc \
+		test_cluster_typed_prepare_budget.h test_cluster_typed_prepare_budget.inc \
 		test_cluster_prepared_cf.h test_cluster_prepared_job.h test_cluster_prepared_cf.inc \
 		$(top_srcdir)/src/include/cluster/cluster_control_root_prepared.h \
 		test_cluster_generic_cf.h test_cluster_generic_cf.inc \
@@ -1700,10 +1701,11 @@ test_cluster_inputs_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_inputs
 	     /^inputs_(io_role|owned|scope_role|current)\(/ { print "static bool"; emit=1; predicates++ } \
 	     /^inputs_unlock\(/ { print "static void"; emit=1; cleanup++ } \
 	     /^inputs_root\(/ { print "static ClusterControlRootResult"; emit=1; consumers++ } \
-	     /^inputs_cf_wait_current\(/ { print "static bool"; emit=1; checks++ } \
+	     /^(inputs_cf_wait_current|inputs_prepare_current)\(/ { print "static bool"; emit=1; checks++ } \
+	     /^inputs_prepare_budget\(/ { print "static int"; emit=1; budgets++ } \
 	     /^inputs_cf_wait(_capture)?\(/ { print "static void"; emit=1; waiters++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (declarations != 7 || helpers > 1 || checks > 1 || waiters > 2 || predicates != 4 || cleanup != 1 || consumers != 1 || types || emit) exit 1 }' $< > $@.tmp
+	     END { if (declarations != 7 || helpers > 1 || checks != 2 || budgets != 1 || waiters > 2 || predicates != 4 || cleanup != 1 || consumers != 1 || types || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # The actual no-pin checkpoint caller, including its original cleanup paths.
@@ -1740,11 +1742,12 @@ test_cluster_recovery_wal_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_cont
 	     /^typedef struct RecoveryWalCfWait / { types=1; helpers++ } \
 	     types { print; if (/^}/) types=0; next } \
 	     /^(history_ranges_overlap|acquire_clusterwide_cf)\(/ { print "static bool"; emit=1; predicates++ } \
-	     /^recovery_wal_cf_current\(/ { print "static bool"; emit=1; checks++ } \
+	     /^(recovery_wal_cf_current|recovery_wal_prepare_current)\(/ { print "static bool"; emit=1; checks++ } \
+	     /^recovery_wal_prepare_budget\(/ { print "static int"; emit=1; budgets++ } \
 	     /^recovery_wal_cf_(capture|wait)\(/ { print "static void"; emit=1; waiters++ } \
-	     /^(recovery_wal_source|recovery_wal_visit_root|recovery_wal_visit|cluster_control_root_recovery_(source_v1|source_deadline_v1|checkpoint_v1|visit|sync_v1))\(/ { print ($$0 ~ /^cluster_control_root_/ ? "ClusterControlRootResult" : "static ClusterControlRootResult"); emit=1; consumers++ } \
+	     /^(recovery_wal_source|recovery_wal_visit_root|recovery_wal_visit|recovery_wal_checkpoint|cluster_control_root_recovery_(source_v1|source_deadline_v1|checkpoint_v1|checkpoint_deadline_v1|visit|visit_deadline_v1|sync_v1))\(/ { print ($$0 ~ /^cluster_control_root_/ ? "ClusterControlRootResult" : "static ClusterControlRootResult"); emit=1; consumers++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (work != 1 || helpers > 1 || predicates != 2 || checks > 1 || waiters > 2 || consumers != 8 || types || emit) exit 1 }' $< > $@.tmp
+	     END { if (work != 1 || helpers > 1 || predicates != 2 || checks != 2 || budgets != 1 || waiters > 2 || consumers != 11 || types || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Original Startup self-seal authorization and S/X consumer/caller/cleanup.
@@ -11900,7 +11903,7 @@ test_cluster_cold_checkpoint_publisher.o: test_cluster_cold_checkpoint_publisher
 		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -c $< -o $@
 
-test_cluster_cold_recovery_startup: test_cluster_cold_recovery_startup.c unit_test.h $(CLUSTER_COLD_STARTUP_O) \
+test_cluster_cold_recovery_startup: test_cluster_cold_recovery_startup.c test_cluster_typed_prepare_phases.h unit_test.h $(CLUSTER_COLD_STARTUP_O) \
 		test_cluster_recovery_duty_compare.inc \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
 		$(top_builddir)/src/common/libpgcommon.a \
@@ -12034,7 +12037,7 @@ test_cluster_cold_recovery_io test_cluster_cold_recovery_complete: %: %.c unit_t
 		$(CLUSTER_COLD_IO_PUBLISHER_O) \
 		test_cluster_cold_recovery_xid_core.o \
 		$(CLUSTER_COLD_PLAN_O) $(top_builddir)/src/backend/cluster/cluster_relmap_checkpoint.o \
-		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -lcrypto -o $@
 
 test_cluster_recovery_duty_compare.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_duty.c Makefile
 	awk '/^write_u(16|32|64)_le\(/ { print "static void"; emit=1; n++ } \
@@ -13520,3 +13523,10 @@ test_cluster_first_fill_retire: test_cluster_first_fill_retire.c test_cluster_pc
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-DBUFMGR_SOURCE_PATH='"$(top_srcdir)/src/backend/storage/buffer/bufmgr.c"' \
 		$< $(CLUSTER_PCM_OWN_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# Actual pre-write typed checkpoint caller.
+test_cluster_typed_prepare_budget.inc: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_startup.c Makefile
+	awk '/^cold_prepare_deadline_check\(/ { print "static void"; emit=1; checks++ } \
+	     /^cold_participant\(/ { print "static bool"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } END { if (n != 1 || checks != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@

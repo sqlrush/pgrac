@@ -99,6 +99,14 @@ cluster_control_root_recovery_checkpoint_v1(const ClusterControlRootSnapshot *ex
 											const ClusterControlRootReadToken *token,
 											ClusterWalRecoveryCheckpointV1 *out);
 
+/* Original typed prepare deadline; provisional source, never authority. */
+extern ClusterControlRootResult cluster_control_root_recovery_checkpoint_deadline_v1(
+	const ClusterControlRootSnapshot *expected, const ClusterControlRootReadToken *token,
+	ClusterWalRecoveryCheckpointV1 *out, uint64 deadline_ns);
+extern ClusterControlRootResult cluster_control_root_recovery_visit_deadline_v1(
+	const ClusterControlRootSnapshot *expected, const ClusterControlRootReadToken *token,
+	ClusterWalRecordVisitor visitor, void *arg, ClusterWalTailObservation *out, uint64 deadline_ns);
+
 /* Startup-only physical input, never a close/recovery/serving permission.
  * Zero maxima mean no PARAMETER_CHANGE record was observed; the caller must
  * also retain the predecessor/history/configuration requirements. */

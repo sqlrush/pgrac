@@ -822,6 +822,10 @@ typedef struct ClusterColdScanResultV1 {
 
 struct RfSideOnlinePlanV1;
 
+extern ClusterColdDetailV1 cluster_cold_scan_root_deadline_v1(
+	ClusterColdPlanV1 *plan, uint32 participant, const struct ClusterControlRootSnapshot *root,
+	const struct ClusterControlRootReadToken *token, bool space_active, bool foreign,
+	struct RfSideOnlinePlanV1 *side_plan, ClusterColdScanResultV1 *result, uint64 deadline_ns);
 extern ClusterColdDetailV1 cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
 													 const ClusterControlRootSnapshot *root,
 													 const ClusterControlRootReadToken *token,

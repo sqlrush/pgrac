@@ -55,17 +55,23 @@ bool InRecovery, cluster_enabled, cluster_controlfile_shared_authority;
 uint64
 GetSystemIdentifier(void)
 {
-	abort();
+	if (!prepare_probe_active)
+		abort();
+	return 9;
 }
 uint64
 cluster_grd_redeclare_generation(void)
 {
-	abort();
+	if (!prepare_probe_active)
+		abort();
+	return 1;
 }
 uint64
 cluster_qvotec_get_self_incarnation(void)
 {
-	abort();
+	if (!prepare_probe_active)
+		abort();
+	return 1;
 }
 void
 HandleStartupProcInterrupts(void)
@@ -96,12 +102,16 @@ WaitLatch(Latch *latch pg_attribute_unused(), int events pg_attribute_unused(),
 int
 errdetail(const char *format pg_attribute_unused(), ...)
 {
-	abort();
+	if (!prepare_probe_active)
+		abort();
+	return 0;
 }
 uint64
 cluster_cf_attempt_sequence(void)
 {
-	abort();
+	if (!prepare_probe_active)
+		abort();
+	return 0;
 }
 bool
 cluster_cf_last_attempt_since(uint64 before pg_attribute_unused(),
@@ -146,7 +156,9 @@ bool
 cluster_reconfig_capture_formation_snapshot_v1(
 	uint16 thread pg_attribute_unused(), ClusterFormationSnapshotV1 *out pg_attribute_unused())
 {
-	abort();
+	if (!prepare_probe_active)
+		abort();
+	return false; /* No wait in this driver-only source boundary. */
 }
 bool
 cluster_formation_snapshot_matches_v1(
@@ -202,7 +214,10 @@ MemoryContextDelete(MemoryContext context)
 void *
 palloc0(Size size)
 {
-	return calloc(1, size);
+	void *result = calloc(1, size);
+	if (prepare_probe_active && size == sizeof(ClusterColdTypedV1) && prepare_probe_typed == NULL)
+		prepare_probe_typed = result;
+	return result;
 }
 
 void *
@@ -250,6 +265,7 @@ cluster_control_native_commit_ts_profile_v1(const char *shared_root, uint32 node
 {
 	if (shared_root == NULL || strcmp(shared_root, cluster_shared_data_dir) != 0 || node >= NROOTS)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	prepare_probe_leaf(PREPARE_PROFILE);
 	commit_ts_profile_calls[node]++;
 	return commit_ts_profile_calls[node] > commit_ts_profile_fail_after[node]
 			   ? commit_ts_profile_result[node]
@@ -414,7 +430,7 @@ cluster_control_root_lookup_owner_deadline_v1(int32 node, ClusterControlRootIden
 {
 	/* This whole-driver leaf never waits; the CF-linked suite exercises the
 	 * actual bounded ROOT consumer and original plan deadline. */
-	UT_ASSERT_EQ(deadline_ns, 0);
+	UT_ASSERT_EQ(deadline_ns, prepare_probe_active ? prepare_probe_deadline : 0);
 	return cluster_control_root_lookup_owner_by_node_runtime(node, identity, snapshot, token);
 }
 
@@ -443,6 +459,12 @@ cluster_control_root_recovery_checkpoint_v1(const ClusterControlRootSnapshot *ro
 											ClusterWalRecoveryCheckpointV1 *out)
 {
 	ClusterControlRootResult result;
+	if (prepare_probe_active && !prepare_probe_census_read) {
+		++prepare_probe_checkpoints;
+		prepare_probe_leaf(prepare_probe_checkpoints <= NROOTS		 ? PREPARE_CHECKPOINT
+						   : prepare_probe_checkpoints <= 2 * NROOTS ? PREPARE_BEFORE_SEAL
+																	 : PREPARE_AFTER_SEAL);
+	}
 	*out = native_checkpoint[root->identity.origin_thread_id];
 	result
 		= cluster_control_root_recovery_source_v1(root, token, &out->source, &out->checkpoint.redo);
@@ -541,7 +563,7 @@ cluster_recovery_merge_fence_plan_deadline_v1(const ClusterRecoveryFencePlan *pl
 											  uint64 *deadline_ns)
 {
 	(void)plan;
-	*deadline_ns = 0; /* This whole-driver boundary performs no CF wait. */
+	*deadline_ns = prepare_probe_active ? prepare_probe_deadline : 0;
 	return true;
 }
 
@@ -681,6 +703,7 @@ cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
 	(void)token;
 
 	(void)space_active;
+	prepare_probe_leaf(PREPARE_SCAN);
 	scan_foreign[thread] = foreign;
 	memset(result, 0, sizeof(*result));
 	if (scan_result[thread] != CLUSTER_COLD_OK) {
@@ -906,6 +929,7 @@ static uint32 history_scan_index;
 static void
 census_refresh_inputs(void)
 {
+	prepare_probe_census_read = true;
 	memset(census_inputs, 0, sizeof(census_inputs));
 	for (uint32 i = 1; i <= NROOTS; i++) {
 		ClusterWalRecoveryCheckpointV1 selected;
@@ -975,6 +999,7 @@ census_refresh_inputs(void)
 			break;
 		}
 	}
+	prepare_probe_census_read = false;
 }
 
 static void
@@ -1075,6 +1100,7 @@ cluster_wal_inputs_cold_begin_v1(const uint8 storage_uuid[16], uint64 system_ide
 								 ClusterWalInputsV1 **out)
 {
 	census_begins++;
+	prepare_probe_leaf(PREPARE_CENSUS);
 	UT_ASSERT_EQ(system_identifier, 9);
 	UT_ASSERT_EQ(storage_uuid[0], 1);
 	census_refresh_inputs();
@@ -1653,6 +1679,40 @@ prepare(XLogRecPtr own_redo)
 	retention_root_reads = 0; /* Count input reads in this attempt. */
 	return cluster_cold_typed_prepare_v1((struct ClusterRecoveryFencePlan *)&fixture_context, 1,
 										 own_redo);
+}
+
+
+/* Deadline wrappers check forwarding only. Actual CF waits live in the
+ * companion CF/CONTROL suite, not this orchestration boundary. */
+ClusterControlRootResult
+cluster_control_root_recovery_checkpoint_deadline_v1(const ClusterControlRootSnapshot *root,
+													 const ClusterControlRootReadToken *token,
+													 ClusterWalRecoveryCheckpointV1 *out,
+													 uint64 deadline_ns)
+{
+	UT_ASSERT(prepare_probe_active);
+	UT_ASSERT_EQ(deadline_ns, prepare_probe_deadline);
+	return cluster_control_root_recovery_checkpoint_v1(root, token, out);
+}
+ClusterControlRootResult
+cluster_wal_inputs_cold_begin_deadline_v1(const uint8 storage_uuid[16], uint64 system_identifier,
+										  ClusterWalInputsV1 **out, uint64 deadline_ns)
+{
+	UT_ASSERT(prepare_probe_active);
+	UT_ASSERT_EQ(deadline_ns, prepare_probe_deadline);
+	return cluster_wal_inputs_cold_begin_v1(storage_uuid, system_identifier, out);
+}
+ClusterColdDetailV1
+cluster_cold_scan_root_deadline_v1(ClusterColdPlanV1 *plan, uint32 participant,
+								   const ClusterControlRootSnapshot *root,
+								   const ClusterControlRootReadToken *token, bool space_active,
+								   bool foreign, struct RfSideOnlinePlanV1 *side_plan,
+								   ClusterColdScanResultV1 *result, uint64 deadline_ns)
+{
+	UT_ASSERT(prepare_probe_active);
+	UT_ASSERT_EQ(deadline_ns, prepare_probe_deadline);
+	return cluster_cold_scan_root_v1(plan, participant, root, token, space_active, foreign,
+									 side_plan, result);
 }
 
 #endif /* TEST_CLUSTER_COLD_RECOVERY_STARTUP_BOUNDARY_H */

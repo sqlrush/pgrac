@@ -29,6 +29,7 @@
 #include "cluster/storage/cluster_shared_fs.h"
 #include "common/cryptohash.h"
 #include "miscadmin.h"
+#include "portability/instr_time.h"
 #include "postmaster/bgwriter.h"
 #include "postmaster/interrupt.h"
 #include "postmaster/startup.h"
@@ -105,6 +106,9 @@ struct ClusterWalInputsV1 {
 	pid_t pid;
 	bool stale;
 	bool suspended;
+	/* Immutable copy of the original Startup plan budget in this read scope. */
+	bool prepare_deadline_set;
+	uint64 prepare_deadline_ns;
 	WalInputsPurpose purpose;
 	ClusterRecoveryTxIoScopeV1 tx;
 	ClusterRecoveryCtrcIoScopeV1 ctrc;
@@ -207,12 +211,37 @@ inputs_scope_role(const ClusterWalInputsV1 *inputs)
 		&& memcmp(inputs->tx.subject, &inputs->tx.version, sizeof(inputs->tx.version)) == 0;
 }
 
+static int
+inputs_prepare_budget(const ClusterWalInputsV1 *inputs, int ceiling)
+{
+	struct timespec now;
+	uint64 ns;
+	if (!inputs->prepare_deadline_set)
+		return ceiling;
+	if (inputs->prepare_deadline_ns == 0)
+		return 0;
+	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0 || now.tv_nsec < 0
+		|| now.tv_nsec >= NS_PER_S || (uint64)now.tv_sec > (UINT64_MAX - NS_PER_S) / NS_PER_S)
+		return 0;
+	ns = (uint64)now.tv_sec * NS_PER_S + (uint64)now.tv_nsec;
+	return ns < inputs->prepare_deadline_ns
+			   ? (int)Min((uint64)ceiling, (inputs->prepare_deadline_ns - ns) / NS_PER_MS)
+			   : 0;
+}
+static bool
+inputs_prepare_current(const ClusterWalInputsV1 *inputs)
+{
+	return !inputs->prepare_deadline_set || inputs->prepare_deadline_ns == 0
+		   || inputs_prepare_budget(inputs, 1) > 0;
+}
+
 static bool
 inputs_current(ClusterWalInputsV1 *inputs)
 {
 	return cluster_enabled && cluster_shared_config && inputs_owned(inputs)
-		   && inputs_scope_role(inputs) && !inputs->stale && inputs->thread_count > 0
-		   && !inputs->suspended && inputs->thread_count <= CLUSTER_WAL_RETENTION_MAX_THREADS
+		   && inputs_scope_role(inputs) && !inputs->stale && inputs_prepare_current(inputs)
+		   && inputs->thread_count > 0 && !inputs->suspended
+		   && inputs->thread_count <= CLUSTER_WAL_RETENTION_MAX_THREADS
 		   && cluster_wal_read_pin_covers_v1(inputs->pin, inputs->threads[0]);
 }
 
@@ -603,11 +632,15 @@ inputs_cf_wait(const WalInputsCfWait *original, ClusterWalInputsV1 *inputs,
 	for (;;) {
 		ClusterCfRetirementSnapshot current;
 		bool held;
+		int wait_ms = inputs_prepare_budget(inputs, 20);
 
 		HandleStartupProcInterrupts();
 		CHECK_FOR_INTERRUPTS();
 		reason = "CONTEXT_CHANGED_AFTER_WAIT_SLICE";
 		if (!inputs_cf_wait_current(original, inputs))
+			goto refuse;
+		reason = "ORIGINAL_PLAN_DEADLINE";
+		if (wait_ms <= 0)
 			goto refuse;
 		ResetLatch(MyLatch);
 		held = cluster_cf_held(ShareLock);
@@ -618,7 +651,7 @@ inputs_cf_wait(const WalInputsCfWait *original, ClusterWalInputsV1 *inputs,
 				if (empty_waited)
 					return;
 				empty_waited = true;
-				(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+				(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, wait_ms,
 								WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
 				continue;
 			}
@@ -638,9 +671,14 @@ inputs_cf_wait(const WalInputsCfWait *original, ClusterWalInputsV1 *inputs,
 			goto refuse;
 		cluster_lock_owners_service_poll();
 		cluster_cf_retirement_poll();
-		if (cluster_cf_held(ShareLock))
-			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+		if (cluster_cf_held(ShareLock)) {
+			wait_ms = inputs_prepare_budget(inputs, 20);
+			reason = "ORIGINAL_PLAN_DEADLINE";
+			if (wait_ms <= 0)
+				goto refuse;
+			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, wait_ms,
 							WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
+		}
 	}
 refuse:
 	ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
@@ -667,8 +705,12 @@ inputs_root(ClusterWalInputsV1 *inputs, WalInputsWork *work, bool first)
 		ClusterCfAttemptObservation attempt;
 		uint64 before = startup ? cluster_cf_attempt_sequence() : 0;
 
+		if (!inputs_prepare_current(inputs))
+			return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 		work->cf_attempted = true;
-		if (cluster_cf_lock(ShareLock))
+		if (inputs->prepare_deadline_set
+				? cluster_cf_lock_deadline_v1(ShareLock, inputs->prepare_deadline_ns)
+				: cluster_cf_lock(ShareLock))
 			break;
 		if (!startup || !cluster_cf_last_attempt_since(before, &attempt)
 			|| !cluster_cf_attempt_wait_slice(&attempt) || attempt.mode != ShareLock)
@@ -685,6 +727,8 @@ inputs_root(ClusterWalInputsV1 *inputs, WalInputsWork *work, bool first)
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	result = cluster_control_root_v3_read_control_locked(
 		inputs->storage_uuid, inputs->system_identifier, &work->root, &work->common, &token);
+	if (!inputs_prepare_current(inputs))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (work->root.header.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
@@ -707,6 +751,8 @@ inputs_checkpoint(ClusterWalInputsV1 *inputs, const WalInputsWork *work,
 	ControlFileData native;
 	ClusterControlRootResult result;
 
+	if (!inputs_prepare_current(inputs))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	if (inputs->count >= CLUSTER_WAL_INPUTS_MAX)
 		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
 	item = &inputs->items[inputs->count];
@@ -726,6 +772,8 @@ inputs_checkpoint(ClusterWalInputsV1 *inputs, const WalInputsWork *work,
 	memcpy(anchor.claim_sha256, record->refs.claim_sha256, 32);
 	result = cluster_recovery_anchor_v3_read_native_window_locked(&anchor, &work->common, &native,
 																  item->native_window);
+	if (!inputs_prepare_current(inputs))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		result = cluster_recovery_anchor_v2_thread_state(&anchor, &record->snapshot, &native);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
@@ -746,9 +794,13 @@ inputs_terminal(ClusterWalInputsV1 *inputs, WalInputsWork *work, uint32 node, ui
 	ClusterControlRootResult result;
 	bool hashed;
 
+	if (!inputs_prepare_current(inputs))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	if (inputs->count >= CLUSTER_WAL_INPUTS_MAX)
 		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
 	result = cluster_wal_terminal_read_locked(&work->root, node, index, &work->terminal);
+	if (!inputs_prepare_current(inputs))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	item = &inputs->items[inputs->count];
@@ -782,9 +834,13 @@ inputs_collect(ClusterWalInputsV1 *inputs, WalInputsWork *work)
 	for (uint32 node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; node++) {
 		if (!work->root.present[node])
 			continue;
+		if (!inputs_prepare_current(inputs))
+			return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 		if (!cluster_wal_read_pin_covers_v1(inputs->pin, node + 1))
 			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 		result = cluster_wal_origin_inputs_read_locked(&work->root, node, &work->origin);
+		if (!inputs_prepare_current(inputs))
+			return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			return result;
 		if (work->origin.has_pending)
@@ -1694,7 +1750,7 @@ static ClusterControlRootResult
 inputs_begin(const uint8 storage_uuid[16], uint64 system_identifier, WalInputsPurpose purpose,
 			 const struct ClusterRecoveryStartV1 *start,
 			 const ClusterColdTopTxCensusEntryV1 *subject, const ClusterColdCtrcWorkV1 *ctrc_work,
-			 ClusterWalInputsV1 **out)
+			 ClusterWalInputsV1 **out, const uint64 *deadline)
 {
 	ClusterWalInputsV1 *inputs;
 	WalInputsWork *work;
@@ -1738,6 +1794,8 @@ inputs_begin(const uint8 storage_uuid[16], uint64 system_identifier, WalInputsPu
 	inputs->pid = getpid();
 	inputs->owner = CurrentResourceOwner;
 	inputs->purpose = purpose;
+	inputs->prepare_deadline_set = deadline != NULL;
+	inputs->prepare_deadline_ns = deadline != NULL ? *deadline : 0;
 	if (purpose == WAL_INPUTS_CTRC_CENSUS) {
 		inputs->ctrc.start = start;
 		inputs->ctrc.inputs = typed;
@@ -1787,8 +1845,11 @@ inputs_begin(const uint8 storage_uuid[16], uint64 system_identifier, WalInputsPu
 		}
 		inputs_unlock(work);
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
-			pinned = cluster_wal_read_pin_acquire_v1(inputs->threads, inputs->thread_count,
-													 &inputs->pin);
+			pinned = deadline != NULL
+						 ? cluster_wal_read_pin_acquire_deadline_v1(
+							   inputs->threads, inputs->thread_count, &inputs->pin, *deadline)
+						 : cluster_wal_read_pin_acquire_v1(inputs->threads, inputs->thread_count,
+														   &inputs->pin);
 			if (pinned != CLUSTER_WAL_PIN_OK)
 				result = pinned == CLUSTER_WAL_PIN_RELEASE_UNCERTAIN
 							 ? CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN
@@ -1830,15 +1891,28 @@ ClusterControlRootResult
 cluster_wal_inputs_begin_v1(const uint8 storage_uuid[16], uint64 system_identifier,
 							ClusterWalInputsV1 **out)
 {
-	return inputs_begin(storage_uuid, system_identifier, WAL_INPUTS_ONLINE, NULL, NULL, NULL, out);
+	return inputs_begin(storage_uuid, system_identifier, WAL_INPUTS_ONLINE, NULL, NULL, NULL, out,
+						NULL);
 }
 
 ClusterControlRootResult
 cluster_wal_inputs_cold_begin_v1(const uint8 storage_uuid[16], uint64 system_identifier,
 								 ClusterWalInputsV1 **out)
 {
-	return inputs_begin(storage_uuid, system_identifier, WAL_INPUTS_COLD_REPLAY, NULL, NULL, NULL, out);
+	return inputs_begin(storage_uuid, system_identifier, WAL_INPUTS_COLD_REPLAY, NULL, NULL, NULL,
+						out, NULL);
 }
+
+ClusterControlRootResult
+cluster_wal_inputs_cold_begin_deadline_v1(const uint8 storage_uuid[16], uint64 system_identifier,
+										  ClusterWalInputsV1 **out, uint64 deadline_ns)
+{
+	if (MyBackendType != B_STARTUP)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	return inputs_begin(storage_uuid, system_identifier, WAL_INPUTS_COLD_REPLAY, NULL, NULL, NULL,
+						out, &deadline_ns);
+}
+
 
 ClusterControlRootResult
 cluster_wal_inputs_begin_tx_closure_v1(const struct ClusterRecoveryStartV1 *start,
@@ -1854,7 +1928,7 @@ cluster_wal_inputs_begin_tx_closure_v1(const struct ClusterRecoveryStartV1 *star
 	if (typed == NULL || typed->participant_count == 0)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	result = inputs_begin(typed->sources[0].claim.identity.storage_uuid, typed->system_identifier,
-		WAL_INPUTS_TX_CLOSURE, start, subject, NULL, out);
+						  WAL_INPUTS_TX_CLOSURE, start, subject, NULL, out, NULL);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (!cluster_wal_read_pin_owner_v1((*out)->pin, &owner)) {
@@ -1885,7 +1959,7 @@ cluster_wal_inputs_begin_ctrc_census_v1(const struct ClusterRecoveryStartV1 *sta
 		|| (typed = ClusterColdRecoveryTxInputs(start)) == NULL || typed->participant_count == 0)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	result = inputs_begin(typed->sources[0].claim.identity.storage_uuid, typed->system_identifier,
-		WAL_INPUTS_CTRC_CENSUS, start, NULL, work, out);
+						  WAL_INPUTS_CTRC_CENSUS, start, NULL, work, out, NULL);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (!cluster_wal_read_pin_owner_v1((*out)->pin, &owner)) {

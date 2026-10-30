@@ -122,4 +122,17 @@ cluster_epoch_get_current(void)
 {
 	abort();
 }
+
+ClusterControlRootResult
+cluster_control_root_v3_read_canonical_deadline_v1(uint16 thread,
+												   const ClusterControlRootIdentity *expected,
+												   ClusterControlRootSnapshot *snapshot,
+												   ClusterControlRootReadToken *token,
+												   uint64 deadline_ns)
+{
+	(void)deadline_ns;
+	return cluster_control_root_read_canonical(thread, expected, CLUSTER_CONTROL_ROOT_READ_STRONG,
+											   snapshot, token);
+}
+
 #endif

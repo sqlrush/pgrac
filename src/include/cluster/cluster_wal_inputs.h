@@ -69,6 +69,9 @@ extern ClusterControlRootResult cluster_wal_inputs_begin_v1(const uint8 storage_
  * metadata only while held. Release before acquiring an execution pin, then
  * revalidate the entire selected ROOT using that original execution owner
  * before IR; copied tokens alone confer no DATA/ROOT/PI/GC authority. */
+extern ClusterControlRootResult
+cluster_wal_inputs_cold_begin_deadline_v1(const uint8 storage_uuid[16], uint64 system_identifier,
+										  ClusterWalInputsV1 **out, uint64 deadline_ns);
 extern ClusterControlRootResult cluster_wal_inputs_cold_begin_v1(const uint8 storage_uuid[16],
 																 uint64 system_identifier,
 																 ClusterWalInputsV1 **out);

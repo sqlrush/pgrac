@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "access/xlog_internal.h"
@@ -47,6 +48,7 @@ int wal_segment_size = TEST_WAL_SEG_SIZE;
 char *cluster_wal_threads_dir;
 bool cluster_shared_config;
 bool cluster_trace_control_config;
+int cluster_ges_request_timeout_ms = 1000;
 volatile uint32 CritSectionCount;
 BackendType MyBackendType = B_INVALID;
 bool proc_exit_inprogress;
@@ -72,12 +74,23 @@ pg_re_throw(void)
 /* PGRAC: this legacy geometry/guard suite retains its S1-S6 fixture boundary.
  * Actual PRE2 ownership/native unwind is test_cluster_control_walr, not these
  * scalar fixtures. Author: SqlRush <sqlrush@gmail.com> */
+static uint64 prepare_pin_now = UINT64CONST(1000000000), prepare_pin_step;
+int
+clock_gettime(clockid_t clock, struct timespec *out)
+{
+	UT_ASSERT(clock == CLOCK_MONOTONIC || clock == CLOCK_MONOTONIC_RAW);
+	out->tv_sec = prepare_pin_now / UINT64CONST(1000000000);
+	out->tv_nsec = prepare_pin_now % UINT64CONST(1000000000);
+	return 0;
+}
+
 ClusterLockAcquireResult
 cluster_lock_owner_request_acquire(ClusterLockAcquireRequest *request,
 								   ClusterControlNativeFinish finish, void *argument)
 {
 	ClusterLockAcquireResult result = cluster_lock_acquire_seven_step(request);
 
+	prepare_pin_now += prepare_pin_step;
 	if (request->control_owner_id == 0)
 		request->control_owner_id = request->request_id;
 	return result == CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK ? finish(request, argument) : result;
@@ -4391,6 +4404,73 @@ UT_TEST(test_read_owner_refuses_entire_native_owner_storage_alias)
 	reset_pin_fakes();
 }
 
+UT_TEST(test_prepare_read_pin_uses_one_budget_across_all_members)
+{
+	uint16 threads[] = { 1, 3 };
+	ClusterWalReadPinV1 *pin = NULL;
+	BackendType original = MyBackendType;
+	uint64 deadline;
+	reset_pin_fakes();
+	cluster_shared_config = true;
+	MyBackendType = B_STARTUP;
+	prepare_pin_now = UINT64CONST(1000000000);
+	prepare_pin_step = UINT64CONST(20000000);
+	deadline = prepare_pin_now + UINT64CONST(45000000);
+	UT_ASSERT_EQ(cluster_wal_read_pin_acquire_deadline_v1(threads, 2, &pin, deadline),
+				 CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(fake_acquire_requests[0].timeout_ms, 45);
+	UT_ASSERT_EQ(fake_acquire_requests[1].timeout_ms, 25);
+	UT_ASSERT_EQ(cluster_wal_read_pin_release_v1(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT_EQ(fake_release_threads[0], 3);
+	UT_ASSERT_EQ(fake_release_threads[1], 1);
+	prepare_pin_step = 0;
+	MyBackendType = original;
+	reset_pin_fakes();
+}
+UT_TEST(test_prepare_read_pin_late_reply_cleans_up_without_publishing)
+{
+	uint16 threads[] = { 1, 3 };
+	ClusterWalReadPinV1 *pin = NULL;
+	BackendType original = MyBackendType;
+	reset_pin_fakes();
+	cluster_shared_config = true;
+	MyBackendType = B_STARTUP;
+	prepare_pin_now = UINT64CONST(1000000000);
+	prepare_pin_step = UINT64CONST(45000000);
+	UT_ASSERT_EQ(cluster_wal_read_pin_acquire_deadline_v1(threads, 2, &pin,
+														  prepare_pin_now + UINT64CONST(45000000)),
+				 CLUSTER_WAL_PIN_UNAVAILABLE);
+	UT_ASSERT_NULL(pin);
+	UT_ASSERT_EQ(fake_acquire_call_count, 1);
+	UT_ASSERT_EQ(fake_release_call_count, 1);
+	UT_ASSERT_EQ(fake_release_threads[0], 1);
+	prepare_pin_step = 0;
+	MyBackendType = original;
+	reset_pin_fakes();
+}
+UT_TEST(test_prepare_read_pin_zero_ready_and_expired_never_renew)
+{
+	uint16 threads[] = { 1, 3 };
+	ClusterWalReadPinV1 *pin = NULL;
+	BackendType original = MyBackendType;
+	reset_pin_fakes();
+	cluster_shared_config = true;
+	MyBackendType = B_STARTUP;
+	UT_ASSERT_EQ(cluster_wal_read_pin_acquire_deadline_v1(threads, 2, &pin, 0), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(fake_acquire_requests[0].timeout_ms | fake_acquire_requests[1].timeout_ms, 0);
+	UT_ASSERT_EQ(cluster_wal_read_pin_release_v1(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+	reset_pin_fakes();
+	cluster_shared_config = true;
+	MyBackendType = B_STARTUP;
+	UT_ASSERT_EQ(cluster_wal_read_pin_acquire_deadline_v1(threads, 2, &pin, prepare_pin_now),
+				 CLUSTER_WAL_PIN_UNAVAILABLE);
+	UT_ASSERT_NULL(pin);
+	UT_ASSERT_EQ(fake_acquire_call_count, 0);
+	UT_ASSERT_EQ(fake_release_call_count, 0);
+	MyBackendType = original;
+	reset_pin_fakes();
+}
+
 int
 main(int argc, char **argv)
 {
@@ -4399,7 +4479,10 @@ main(int argc, char **argv)
 		return write_fixture_wal_segment(argc, argv);
 	if (argc != 1)
 		return 2;
-	UT_PLAN(95);
+	UT_PLAN(98);
+	UT_RUN(test_prepare_read_pin_uses_one_budget_across_all_members);
+	UT_RUN(test_prepare_read_pin_late_reply_cleans_up_without_publishing);
+	UT_RUN(test_prepare_read_pin_zero_ready_and_expired_never_renew);
 	UT_RUN(test_read_owner_borrows_all_original_native_grants_without_acquiring);
 	UT_RUN(test_read_owner_never_rebinds_after_same_address_reacquisition);
 	UT_RUN(test_read_owner_checks_every_member_and_preserves_original_cleanup);

@@ -66,6 +66,9 @@ ExceptionalCondition(const char *condition_name, const char *file_name, int line
 	abort();
 }
 
+#include <time.h>
+#include "test_cluster_typed_prepare_phases.h"
+
 #define CLUSTER_COLD_NATIVE_DUTY_COMPARE 1
 #include "test_cluster_cold_recovery_startup_boundary.h"
 #include "test_cluster_recovery_duty_compare.inc"
@@ -3983,10 +3986,71 @@ UT_TEST(test_original_typed_owner_retires_fence_after_dependent_read_scope)
 	tx_fence_census_release_observer = NULL;
 }
 
+UT_TEST(test_prepare_all_phases_use_the_same_original_deadline)
+{
+	for (unsigned phase = PREPARE_CHECKPOINT; phase <= PREPARE_PROFILE; ++phase) {
+		volatile bool caught = false;
+		fixture();
+		cluster_shared_config = true;
+		MyBackendType = B_STARTUP;
+		MyAuxProcType = StartupProcess;
+		prepare_probe_active = true;
+		prepare_probe_now = UINT64CONST(1000000000);
+		prepare_probe_deadline = prepare_probe_now + 45 * UINT64CONST(1000000);
+		prepare_probe_expire = phase;
+		prepare_probe_seen = prepare_probe_checkpoints = 0;
+		prepare_probe_code = 0;
+		prepare_probe_typed = NULL;
+		if (sigsetjmp(prepare_probe_exception, 0) == 0) {
+			ClusterColdTypedV1 *typed = prepare(0x800);
+			UT_ASSERT(typed->refusal != CLUSTER_COLD_OK);
+		} else
+			caught = true;
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(prepare_probe_code, ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED);
+		UT_ASSERT(prepare_probe_seen & (1U << phase));
+		if (phase == PREPARE_PROFILE)
+			UT_ASSERT_EQ(tt_base_captures, 0);
+		cluster_cold_typed_destroy_v1(&prepare_probe_typed);
+		UT_ASSERT_EQ(contexts_alive, 0);
+		prepare_probe_active = cluster_shared_config = false;
+		MyBackendType = B_INVALID;
+		MyAuxProcType = NotAnAuxProcess;
+	}
+}
+
+UT_TEST(test_prepare_ready_and_zero_budget_complete_every_phase)
+{
+	for (unsigned zero = 0; zero < 2; ++zero) {
+		ClusterColdTypedV1 *typed;
+		fixture();
+		cluster_shared_config = true;
+		MyBackendType = B_STARTUP;
+		MyAuxProcType = StartupProcess;
+		prepare_probe_active = true;
+		prepare_probe_now = UINT64CONST(1000000000);
+		prepare_probe_deadline = zero ? 0 : prepare_probe_now + 45 * UINT64CONST(1000000);
+		prepare_probe_expire = 0;
+		prepare_probe_seen = prepare_probe_checkpoints = 0;
+		prepare_probe_typed = NULL;
+		typed = prepare(0x800);
+		UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(prepare_probe_seen, 126);
+		cluster_cold_typed_destroy_v1(&typed);
+		prepare_probe_typed = NULL;
+		UT_ASSERT_EQ(contexts_alive, 0);
+		prepare_probe_active = cluster_shared_config = false;
+		MyBackendType = B_INVALID;
+		MyAuxProcType = NotAnAuxProcess;
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(151);
+	UT_PLAN(153);
+	UT_RUN(test_prepare_all_phases_use_the_same_original_deadline);
+	UT_RUN(test_prepare_ready_and_zero_budget_complete_every_phase);
 	UT_RUN(test_commit_reuses_complete_physical_union_without_replaying_the_census);
 	UT_RUN(test_commit_refuses_changed_local_input_identity_before_owner_entry);
 	UT_RUN(test_commit_owner_refusal_is_sticky_and_discards_provisional_history);
