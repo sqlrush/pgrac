@@ -5674,10 +5674,8 @@ ATExecCmd(List **wqueue, AlteredTableInfo *tab,
 			break;
 		case AT_ReAddDomainConstraint:	/* Re-add pre-existing domain check
 										 * constraint */
-			address =
-				AlterDomainAddConstraint(((AlterDomainStmt *) cmd->def)->typeName,
-										 ((AlterDomainStmt *) cmd->def)->def,
-										 NULL);
+			address = AlterDomainAddConstraintInternal(((AlterDomainStmt *)cmd->def)->typeName,
+													   ((AlterDomainStmt *)cmd->def)->def, NULL);
 			break;
 		case AT_ReAddComment:	/* Re-add existing comment */
 			address = CommentObject((CommentStmt *) cmd->def);

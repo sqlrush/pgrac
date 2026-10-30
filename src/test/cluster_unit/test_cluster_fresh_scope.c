@@ -24542,10 +24542,215 @@ UT_TEST(test_native_alter_denials_preserve_existing_binding)
 }
 
 
+/* Execute the real public constraint entry and the original rebuild case.
+ * The existing TypeName boundary never supplies allocation or query success. */
+#include "test_cluster_fresh_domain_constraint_entry.inc"
+static Constraint domain_constraint_entry_constraint;
+static A_Const domain_constraint_entry_value;
+static AlterTableCmd domain_constraint_rebuild_command;
+static ObjectAddress domain_constraint_entry_output;
+static ObjectAddress *domain_constraint_entry_output_pointer;
+static const bool domain_constraint_entry_blocked[8]
+	= { false, true, false, true, true, true, true, true };
+
+static ObjectAddress
+native_domain_constraint_rebuild_entry(AlterTableCmd *cmd)
+{
+	ObjectAddress address = InvalidObjectAddress;
+
+	switch (cmd->subtype) {
+#include "test_cluster_fresh_domain_constraint_rebuild.inc"
+	default:
+		siglongjmp(boundary, 3);
+	}
+	return address;
+}
+
+static void
+reset_native_domain_constraint_entry(unsigned form)
+{
+	reset_native_domain_alter_scope(0);
+	domain_alter_scope_names[0].length = (form & 1) ? 2 : 1;
+	domain_alter_scope_parts[0][0].sval = (form & 1) ? "constraint_schema" : "constraint_domain";
+	domain_alter_scope_parts[0][1].sval = "constraint_domain";
+	domain_constraint_entry_value = (A_Const){ .type = T_A_Const,
+											   .val.ival = { .type = T_Integer, .ival = 7 },
+											   .location = -1 };
+	domain_constraint_entry_constraint
+		= (Constraint){ .type = T_Constraint,
+						.contype = (form & 16) ? CONSTR_UNIQUE : CONSTR_CHECK,
+						.conname = (form & 2) ? "constraint_name" : NULL,
+						.raw_expr = (Node *)&domain_constraint_entry_value,
+						.skip_validation = (form & 4) != 0,
+						.location = -1 };
+	native_domain_alter_scope_statement.subtype = 'C';
+	native_domain_alter_scope_statement.def = (Node *)&domain_constraint_entry_constraint;
+	domain_constraint_rebuild_command
+		= (AlterTableCmd){ .type = T_AlterTableCmd,
+						   .subtype = AT_ReAddDomainConstraint,
+						   .def = (Node *)&native_domain_alter_scope_statement };
+	domain_constraint_entry_output
+		= (ObjectAddress){ .classId = ConstraintRelationId, .objectId = 987, .objectSubId = 3 };
+	domain_constraint_entry_output_pointer = (form & 8) ? NULL : &domain_constraint_entry_output;
+}
+
+static void
+call_native_domain_constraint_entry(void)
+{
+	(void)AlterDomainAddConstraint(native_domain_alter_scope_statement.typeName,
+								   native_domain_alter_scope_statement.def,
+								   domain_constraint_entry_output_pointer);
+}
+
+static void
+assert_domain_constraint_entry_output_untouched(void)
+{
+	UT_ASSERT_EQ(domain_constraint_entry_output.classId, ConstraintRelationId);
+	UT_ASSERT_EQ(domain_constraint_entry_output.objectId, 987);
+	UT_ASSERT_EQ(domain_constraint_entry_output.objectSubId, 3);
+}
+
+UT_TEST(test_native_domain_constraint_public_scope_matches_utility_before_lookup)
+{
+	for (unsigned form = 0; form < 32; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			int caught;
+
+			reset_native_domain_constraint_entry(form);
+			set_native_operator_mode(mode);
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				create_sql_entry((Node *)&native_domain_alter_scope_statement);
+			UT_ASSERT_EQ(caught, domain_constraint_entry_blocked[mode] ? 1 : 0);
+			UT_ASSERT_EQ(error_code,
+						 domain_constraint_entry_blocked[mode] ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+			if (domain_constraint_entry_blocked[mode]) {
+				UT_ASSERT_STR_EQ(error_message, "custom types is not supported in shared mode");
+				UT_ASSERT_STR_EQ(error_detail,
+								 "PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED");
+			}
+			UT_ASSERT_EQ(
+				domain_alter_scope_lookups + utility_xids + utility_prepares + utility_binds, 0);
+			reset_error();
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				call_native_domain_constraint_entry();
+			assert_native_domain_alter_scope_result(domain_constraint_entry_blocked[mode], caught);
+			UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			UT_ASSERT_EQ(utility_top_xid, InvalidTransactionId);
+			assert_domain_constraint_entry_output_untouched();
+		}
+	}
+	domain_alter_scope_lookup_active = false;
+}
+
+UT_TEST(test_native_domain_constraint_public_refusal_precedes_context_and_binding)
+{
+	for (unsigned form = 0; form < 32; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			for (unsigned fault = 0; fault < 7; fault++) {
+				int caught;
+
+				reset_native_domain_constraint_entry(form);
+				set_native_operator_mode(mode);
+				XactReadOnly = fault == 0;
+				utility_parallel = fault == 1;
+				utility_recovery = fault == 2;
+				utility_in_child = fault == 3;
+				if (fault == 4 || fault == 5) {
+					utility_current_xid = 401;
+					utility_top_xid = fault == 4 ? 400 : InvalidTransactionId;
+				}
+				utility_bind_ok = fault != 6;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					call_native_domain_constraint_entry();
+				assert_native_domain_alter_scope_result(domain_constraint_entry_blocked[mode],
+														caught);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+				UT_ASSERT_EQ(utility_top_xid, fault == 4 ? 400 : InvalidTransactionId);
+				UT_ASSERT_EQ(utility_current_xid,
+							 fault == 4 || fault == 5 ? 401 : InvalidTransactionId);
+				assert_domain_constraint_entry_output_untouched();
+			}
+		}
+	}
+	domain_alter_scope_lookup_active = false;
+}
+
+UT_TEST(test_native_domain_constraint_public_refusal_preserves_existing_binding)
+{
+	for (unsigned form = 0; form < 32; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			for (unsigned fault = 0; fault < 5; fault++) {
+				int caught;
+
+				reset_native_domain_constraint_entry(form);
+				create_sql_entry((Node *)&domain_alter_scope_warm_statement);
+				UT_ASSERT_EQ(utility_xids, 1);
+				UT_ASSERT_EQ(utility_prepares, 1);
+				UT_ASSERT_EQ(utility_binds, 1);
+				set_native_operator_mode(mode);
+				XactReadOnly = fault == 0;
+				utility_parallel = fault == 1;
+				utility_recovery = fault == 2;
+				utility_in_child = fault == 3;
+				utility_bind_ok = fault != 4;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					call_native_domain_constraint_entry();
+				assert_native_domain_alter_scope_result(domain_constraint_entry_blocked[mode],
+														caught);
+				UT_ASSERT_EQ(utility_xids, 1);
+				UT_ASSERT_EQ(utility_prepares, 1);
+				UT_ASSERT_EQ(utility_binds, 1);
+				UT_ASSERT_EQ(utility_top_xid, 400);
+				UT_ASSERT_EQ(utility_current_xid, 400);
+				assert_domain_constraint_entry_output_untouched();
+			}
+		}
+	}
+	domain_alter_scope_lookup_active = false;
+}
+
+UT_TEST(test_native_domain_constraint_actual_rebuild_case_keeps_original_entry)
+{
+	for (unsigned form = 0; form < 32; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			for (unsigned fault = 0; fault < 7; fault++) {
+				int caught;
+
+				reset_native_domain_constraint_entry(form);
+				set_native_operator_mode(mode);
+				XactReadOnly = fault == 0;
+				utility_parallel = fault == 1;
+				utility_recovery = fault == 2;
+				utility_in_child = fault == 3;
+				if (fault == 4 || fault == 5) {
+					utility_current_xid = 401;
+					utility_top_xid = fault == 4 ? 400 : InvalidTransactionId;
+				}
+				utility_bind_ok = fault != 6;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					(void)native_domain_constraint_rebuild_entry(
+						&domain_constraint_rebuild_command);
+				assert_native_domain_alter_scope_result(false, caught);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+				UT_ASSERT_EQ(utility_top_xid, fault == 4 ? 400 : InvalidTransactionId);
+				UT_ASSERT_EQ(utility_current_xid,
+							 fault == 4 || fault == 5 ? 401 : InvalidTransactionId);
+				assert_domain_constraint_entry_output_untouched();
+			}
+		}
+	}
+	domain_alter_scope_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(395);
+	UT_PLAN(399);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -24944,6 +25149,10 @@ main(void)
 	UT_RUN(test_native_alter_four_dynamic_candidates_keep_original_responsibility);
 	UT_RUN(test_native_alter_denials_precede_context_child_and_allocation);
 	UT_RUN(test_native_alter_denials_preserve_existing_binding);
+	UT_RUN(test_native_domain_constraint_public_scope_matches_utility_before_lookup);
+	UT_RUN(test_native_domain_constraint_public_refusal_precedes_context_and_binding);
+	UT_RUN(test_native_domain_constraint_public_refusal_preserves_existing_binding);
+	UT_RUN(test_native_domain_constraint_actual_rebuild_case_keeps_original_entry);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

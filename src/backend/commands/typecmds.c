@@ -2970,6 +2970,17 @@ ObjectAddress
 AlterDomainAddConstraint(List *names, Node *newConstraint,
 						 ObjectAddress *constrAddr)
 {
+#ifdef USE_PGRAC_CLUSTER
+	CheckClusterSharedTypeSupport();
+#endif
+
+	return AlterDomainAddConstraintInternal(names, newConstraint, constrAddr);
+}
+
+/* Rebuild an existing constraint through the original internal path. */
+ObjectAddress
+AlterDomainAddConstraintInternal(List *names, Node *newConstraint, ObjectAddress *constrAddr)
+{
 	TypeName   *typename;
 	Oid			domainoid;
 	Relation	typrel;
