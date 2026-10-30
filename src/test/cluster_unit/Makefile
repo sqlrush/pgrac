@@ -14426,3 +14426,18 @@ test_cluster_cold_recovery_decode test_cluster_cold_recovery_startup \
         test_cluster_recovery_consumed_inputs.o test_cluster_recovery_scope_native_census_product.o: \
         $(top_srcdir)/src/include/access/clog.h \
         $(top_srcdir)/src/include/cluster/cluster_recovery_native_inventory.h
+
+# Extract the actual native callback for direct CLOG file-completion tests.
+test_cluster_clog_native_callback.inc: $(top_srcdir)/src/backend/access/transam/xlogrecovery.c Makefile
+	awk '/^cluster_typed_replay_apply_native\(/ { print "static void"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_clog_recovery test_cluster_xid_native_clog.o test_cluster_recovery_episode_clog.o \
+        test_cluster_side_native_clog.o test_cluster_relmap_publish_clog_bridge.o \
+        test_cluster_relmap_native_clog.o test_cluster_clog_retention: \
+        test_cluster_clog_native_full_sync.inc test_cluster_clog_native_full_truncate_sync.inc \
+        test_cluster_clog_native_callback.inc $(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
+clean: clean-clog-native-callback
+.PHONY: clean-clog-native-callback
+clean-clog-native-callback:
+	rm -f test_cluster_clog_native_callback.inc test_cluster_clog_native_callback.inc.tmp

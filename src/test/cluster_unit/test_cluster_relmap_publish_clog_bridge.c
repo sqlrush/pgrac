@@ -3,15 +3,21 @@
  * Author: SqlRush <sqlrush@gmail.com> */
 #include "test_cluster_relmap_native_clog_namespace.h"
 #define cluster_relmap_retention_truncate_clog_v2 d3_clog_cluster_relmap_retention_truncate_clog_v2
+#undef ShmemVariableCache
 #define ShmemVariableCache d3_publish_ShmemVariableCache
-#define LWLockHeldByMeInMode d3_publish_LWLockHeldByMeInMode
+#define LWLockHeldByMeInMode d3_publish_birth_LWLockHeldByMeInMode
 #define cluster_relmap_owner_terminal_matches_v2 d3_publish_owner_terminal_matches_v2
 #define cluster_relmap_recovery_issued_publish d3_publish_issued_publish
 #define cluster_relmap_recovery_native_bounds d3_publish_native_bounds
 #define cluster_relmap_recovery_native_terminal_capture d3_publish_native_terminal_capture
 #define cluster_relmap_recovery_native_terminal_sync d3_publish_native_terminal_sync
 int d3_clog_main(void);
+#define TEST_CLUSTER_CLOG_EXTERNAL_VARIABLE_CACHE
 #include "test_cluster_clog_recovery.c"
+#undef TEST_CLUSTER_CLOG_EXTERNAL_VARIABLE_CACHE
+#undef LWLockHeldByMeInMode
+#define LWLockHeldByMeInMode d3_publish_LWLockHeldByMeInMode
+bool LWLockHeldByMeInMode(LWLock *lock, LWLockMode mode);
 #include "test_cluster_relmap_publish_clog.h"
 #include "../../backend/cluster/cluster_relmap_recovery.c"
 

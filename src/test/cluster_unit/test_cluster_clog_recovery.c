@@ -40,7 +40,7 @@ UT_DEFINE_GLOBALS();
 #endif
 
 static VariableCacheData fixture_variable_cache;
-#ifndef TEST_CLUSTER_CLOG_RETENTION
+#if !defined(TEST_CLUSTER_CLOG_RETENTION) && !defined(TEST_CLUSTER_CLOG_EXTERNAL_VARIABLE_CACHE)
 VariableCache ShmemVariableCache = &fixture_variable_cache;
 #endif
 
@@ -1824,6 +1824,8 @@ native_held_base_constructor_error_and_later_refusals_keep_custody_sticky(void)
 #include "test_cluster_clog_native_advance_next.inc"
 #include "test_cluster_clog_relmap_native_counter.inc"
 #include "test_cluster_clog_native_truncate.inc"
+#include "test_cluster_clog_native_full_sync.inc"
+#include "test_cluster_clog_native_full_truncate_sync.inc"
 
 int
 main(void)
@@ -1856,6 +1858,20 @@ main(void)
 	snprintf(path, sizeof(path), "%s/native_side/origin_0/pg_xact", fixture_root);
 	if (symlink(path, "pg_xact") != 0)
 		return 2;
+	if (getenv("PGRAC_CLOG_NATIVE_FULL_SYNC_FOCUS") != NULL) {
+		UT_PLAN(10);
+		UT_RUN(native_full_sync_rejects_shape_and_context_before_io);
+		UT_RUN(native_full_truncate_sync_rejects_invalid_context_before_io);
+		UT_RUN(native_full_truncate_sync_preserves_legacy_and_foreign);
+		UT_RUN(native_full_sync_reads_the_original_redo_page_without_reinitializing);
+		UT_RUN(native_full_sync_io_failures_and_error_keep_native_cleanup);
+		UT_RUN(native_full_sync_rejects_owner_mutation_and_changed_disk);
+		UT_RUN(native_full_sync_hook_preserves_legacy_and_foreign_routes);
+		UT_RUN(native_full_truncate_sync_finishes_only_original_delete);
+		UT_RUN(native_full_truncate_sync_rejects_incomplete_delete);
+		UT_RUN(native_full_truncate_sync_errors_keep_original_native_effects);
+		goto mutation_done;
+	}
 	if (getenv("PGRAC_RELMAP_MUTATION_ONLY") != NULL) {
 		UT_PLAN(6);
 		UT_RUN(relmap_native_terminal_aba_does_not_revive_held_observation);
@@ -1983,7 +1999,7 @@ main(void)
 		UT_RUN(terminal_residency_preconditions_and_entered_failures_keep_polarity);
 		goto mutation_done;
 	}
-	UT_PLAN(121);
+	UT_PLAN(131);
 	UT_RUN(foreign_birth_apply_uses_matching_controller_not_local_birth);
 	UT_RUN(foreign_birth_verify_legacy_and_reload_never_restore_input);
 	UT_RUN(foreign_birth_final_root_loss_refuses_without_rebasing);
@@ -2125,6 +2141,16 @@ main(void)
 	UT_RUN(relmap_writeback_clean_and_other_origin_preserve_observation);
 	UT_RUN(relmap_failed_writeback_keeps_sticky_debt_and_releases_writer);
 	UT_RUN(relmap_inflight_physical_write_refuses_new_and_original_custody);
+	UT_RUN(native_full_sync_reads_the_original_redo_page_without_reinitializing);
+	UT_RUN(native_full_sync_rejects_shape_and_context_before_io);
+	UT_RUN(native_full_sync_io_failures_and_error_keep_native_cleanup);
+	UT_RUN(native_full_sync_rejects_owner_mutation_and_changed_disk);
+	UT_RUN(native_full_sync_hook_preserves_legacy_and_foreign_routes);
+	UT_RUN(native_full_truncate_sync_finishes_only_original_delete);
+	UT_RUN(native_full_truncate_sync_rejects_incomplete_delete);
+	UT_RUN(native_full_truncate_sync_errors_keep_original_native_effects);
+	UT_RUN(native_full_truncate_sync_rejects_invalid_context_before_io);
+	UT_RUN(native_full_truncate_sync_preserves_legacy_and_foreign);
 	UT_RUN(relmap_abrupt_write_error_keeps_original_writer_debt);
 	UT_RUN(relmap_native_own_checkpoint_revokes_equal_byte_observation);
 	UT_RUN(relmap_native_own_eviction_revokes_without_logical_mutation);
