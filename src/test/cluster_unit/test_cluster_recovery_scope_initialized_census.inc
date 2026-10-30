@@ -14,6 +14,10 @@
  */
 static char scope_initialized_cwd[MAXPGPATH];
 static char scope_initialized_work[MAXPGPATH];
+/* NULL keeps every original setup path. The new composition supplies actual
+ * native callback consumption before this same scope starts observation. */
+static void (*scope_initialized_replay_hook)(ClusterWalInputsV1 *,
+	ClusterRecoveryRelmapHistory *, const ClusterRelmapV2Image *, bool);
 
 /* Populate both actual identities before the original scope captures ROOT.
  * No selected source or replay request is renamed after acquisition. */
@@ -109,24 +113,28 @@ scope_initialized_begin(ClusterWalInputsV1 **inputs, ClusterRecoveryRelmapHistor
 	if (*history == NULL) return;
 	*pending = relmap_fold_pending((*history)->inventory, 0);
 	UT_ASSERT_EQ(episode_pending_drain(*history, pending, &summary), CLUSTER_RECOVERY_RELMAP_FOLD_DRAINED);
-	consumed_mode = 1;
-	consumed_foreign_origin = 1;
-	consumed_cold_calls = 0;
-	UT_ASSERT_EQ(consumed_native_replay(*inputs, *history, pending, true, false), 0);
-	UT_ASSERT_EQ(consumed_native_calls, 1);
-	test_episode_native_clog_write_all();
-	if (foreign) {
-		unsigned matched = 0;
-		xl_clog_zeropage_full birth = {17, 0, (UINT64_C(3) << 32) | 17 * CLUSTER_NATIVE_CLOG_PER_PAGE};
-		for (uint32 i = 0; i < cluster_wal_inputs_relmap_count_v1(*inputs); ++i) {
-			ClusterRecoveryRelmapHistoryEntryV1 entry;
-			UT_ASSERT(cluster_recovery_relmap_history_source_v1(*history, i, &entry));
-			UT_ASSERT(entry.source.scope == *inputs);
-			if (entry.source.selected.source.claim.identity.origin_node_id != 1) continue;
-			UT_ASSERT(test_episode_native_clog_full_apply(&entry.source, &birth));
-			matched++;
+	if (scope_initialized_replay_hook != NULL)
+		scope_initialized_replay_hook(*inputs, *history, pending, foreign);
+	else {
+		consumed_mode = 1;
+		consumed_foreign_origin = 1;
+		consumed_cold_calls = 0;
+		UT_ASSERT_EQ(consumed_native_replay(*inputs, *history, pending, true, false), 0);
+		UT_ASSERT_EQ(consumed_native_calls, 1);
+		test_episode_native_clog_write_all();
+		if (foreign) {
+			unsigned matched = 0;
+			xl_clog_zeropage_full birth = {17, 0, (UINT64_C(3) << 32) | 17 * CLUSTER_NATIVE_CLOG_PER_PAGE};
+			for (uint32 i = 0; i < cluster_wal_inputs_relmap_count_v1(*inputs); ++i) {
+				ClusterRecoveryRelmapHistoryEntryV1 entry;
+				UT_ASSERT(cluster_recovery_relmap_history_source_v1(*history, i, &entry));
+				UT_ASSERT(entry.source.scope == *inputs);
+				if (entry.source.selected.source.claim.identity.origin_node_id != 1) continue;
+				UT_ASSERT(test_episode_native_clog_full_apply(&entry.source, &birth));
+				matched++;
+			}
+			UT_ASSERT_EQ(matched, 1);
 		}
-		UT_ASSERT_EQ(matched, 1);
 	}
 	episode_native_clog_calls = 0;
 }
