@@ -503,6 +503,17 @@ visibilitymap_clear_locked(Relation rel, BlockNumber heapBlk, Buffer vmbuf, uint
 		|| !vm_buffer_matches(rel, vmbuf, VISIBILITYMAP_FORKNUM, HEAPBLK_TO_MAPBLOCK(heapBlk)))
 		elog(ERROR, "invalid target or flags passed to visibilitymap_clear_locked");
 
+#ifdef USE_PGRAC_CLUSTER
+	/* Validate the stable image before even a no-op bitmap access. Original
+	 * DML ownership/admission was qualified before APPLY; do not acquire or
+	 * resample that authority inside its WAL critical section. Typed shared
+	 * redo uses its separate recorded image/edge apply path. */
+	if (cluster_shared_config && rel->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT
+		&& cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) == 1
+		&& !vm_redo_page_valid(BufferGetPage(vmbuf)))
+		elog(ERROR, "shared VM clear has no valid versioned page");
+#endif
+
 	map = PageGetContents(BufferGetPage(vmbuf));
 
 	if (map[mapByte] & mask)

@@ -3359,6 +3359,25 @@ test_cluster_vm_redo_consumers.inc: $(top_srcdir)/src/backend/access/heap/heapam
 	     /^}/ { inside=0 } END { if (count != 7 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+TESTS += test_cluster_vm_clear_layout test_cluster_vm_clear_layout_noassert
+all: test_cluster_vm_clear_layout test_cluster_vm_clear_layout_noassert
+
+test_cluster_vm_clear_layout_product.o test_cluster_vm_clear_layout_product_noassert.o: \
+		test_cluster_vm_clear_product.c $(top_srcdir)/src/backend/access/heap/visibilitymap.c \
+		$(top_srcdir)/src/include/access/visibilitymap.h Makefile
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(if $(filter %_noassert.o,$@),-DFIXTURE_NO_ASSERTS) \
+		-ffunction-sections -fdata-sections -c $< -o $@
+
+test_cluster_vm_clear_layout: test_cluster_vm_clear_layout.c test_cluster_vm_clear_layout_product.o \
+		test_cluster_space_bufpage_product.o unit_test.h $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_vm_clear_layout_product.o \
+		test_cluster_space_bufpage_product.o $(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
+test_cluster_vm_clear_layout_noassert: test_cluster_vm_clear_layout.c test_cluster_vm_clear_layout_product_noassert.o \
+		test_cluster_space_bufpage_product.o unit_test.h $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DFIXTURE_NO_ASSERTS $< test_cluster_vm_clear_layout_product_noassert.o \
+		test_cluster_space_bufpage_product.o $(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
 test_cluster_vm_redo_product.o: $(top_srcdir)/src/backend/access/heap/visibilitymap.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
@@ -7673,12 +7692,13 @@ test_cluster_pcm_aux_prepare.inc: $(top_srcdir)/src/backend/storage/buffer/bufmg
 
 test_cluster_pcm_aux_vm_mutation.inc: $(top_srcdir)/src/backend/access/heap/visibilitymap.c Makefile
 	awk '/^#define (MAPSIZE|HEAPBLOCKS_PER_|HEAPBLK_TO_)/ { print; defines++ } \
+	     /^vm_redo_page_valid\(/ { print "static bool"; emit=1; valid++ } \
 	     /^visibilitymap_(clear_retry_aware|clear_locked|pin_recent|pin_ok|set_retry_aware)\(/ { print "bool"; emit=1; boolean++ } \
 	     /^visibilitymap_pin\(/ { print "void"; emit=1; pin++ } \
 	     /^visibilitymap_set_locked\(/ { print "static void"; emit=1; setter++ } \
 	     /^visibilitymap_get_status\(/ { print "uint8"; emit=1; status++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (defines != 6 || boolean != 5 || pin != 1 || setter != 1 || status != 1) exit 1 }' $< > $@.tmp
+	     END { if (defines != 6 || valid != 1 || boolean != 5 || pin != 1 || setter != 1 || status != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_pcm_aux_heap_repin.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile

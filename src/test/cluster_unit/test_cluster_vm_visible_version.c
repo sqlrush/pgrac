@@ -815,6 +815,7 @@ visibilitymap_pin(Relation rel, BlockNumber block, Buffer *buffer)
 }
 
 #include "test_cluster_vm_buffer_matches.inc"
+static bool vm_redo_page_valid(Page page);
 #include "test_cluster_vm_repair_clear.inc"
 #include "test_cluster_vm_visible_log.inc"
 static void
