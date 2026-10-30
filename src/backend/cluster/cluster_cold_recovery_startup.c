@@ -2142,9 +2142,43 @@ typedef struct ColdNativeClogReplay {
 	const RfSideOnlinePlanV1 *plan;
 	ClusterWalSourceRef source;
 	ClusterColdParticipantV1 participant;
+	XLogReaderState *reader;
+	const DecodedXLogRecord *record;
 	void (*redo)(XLogReaderState *, void *);
 	void *arg;
 } ColdNativeClogReplay;
+
+static ColdNativeClogReplay *cold_native_clog_active;
+
+/* Only the original callback can supply this read-only record context. Full
+ * source/ROOT I/O stays in the original lock-free bracket below; native CLOG
+ * may check these immutable bytes while holding its existing short locks. */
+bool
+cluster_cold_typed_clog_native_record_current_v1(int origin, const XLogReaderState *reader)
+{
+	const ColdNativeClogReplay *replay = cold_native_clog_active;
+	const ClusterColdTypedV1 *typed;
+
+	if (replay == NULL || reader == NULL || replay->reader != reader
+		|| reader->record == NULL || replay->record != reader->record)
+		return false;
+	typed = replay->typed;
+	return origin >= 0 && origin <= SCN_MAX_VALID_NODE_ID && origin == cluster_node_id
+		&& typed->refusal == CLUSTER_COLD_SIDE_OWNER_MISSING
+		&& replay->fence != NULL && cluster_cold_replay_window_active_v1()
+		&& typed->plan != NULL && typed->replay_roots != NULL
+		&& typed->own_participant == 0 && typed->replay_count != 0
+		&& typed->replay_count <= typed->participant_count
+		&& typed->participant_count <= CLUSTER_COLD_MAX_PARTICIPANTS
+		&& typed->replay_root_count == typed->replay_count
+		&& replay->plan != NULL && typed->side_plans[0] == replay->plan
+		&& typed->side_capture_detail[0] == 0
+		&& replay->source.claim.identity.origin_node_id == origin
+		&& replay->source.claim.identity.origin_thread_id == origin + 1
+		&& memcmp(&typed->sources[0], &replay->source, sizeof(replay->source)) == 0
+		&& memcmp(&typed->participants[0], &replay->participant, sizeof(replay->participant)) == 0
+		&& rf_side_online_plan_clog_matches_v1(replay->plan, &replay->source, reader);
+}
 
 /* This is the founder's existing native path, not foreign SIDE/C0 authority.
  * Its original restart generation and complete held source set must survive
@@ -2182,7 +2216,18 @@ cold_native_clog_redo(XLogReaderState *reader, void *arg)
 {
 	ColdNativeClogReplay *replay = arg;
 
-	replay->redo(reader, replay->arg);
+	if (cold_native_clog_active != NULL || reader != replay->reader)
+		ereport(ERROR, (errmsg("native CLOG replay callback context changed")));
+	cold_native_clog_active = replay;
+	PG_TRY();
+	{
+		replay->redo(reader, replay->arg);
+	}
+	PG_FINALLY();
+	{
+		cold_native_clog_active = NULL;
+	}
+	PG_END_TRY();
 }
 
 bool
@@ -2192,7 +2237,7 @@ cluster_cold_typed_clog_native_v1(ClusterColdTypedV1 *typed,
 {
 	ColdNativeClogReplay replay = { .typed = typed, .fence = fence, .redo = redo, .arg = arg };
 
-	if (typed == NULL || typed->refusal != CLUSTER_COLD_OK)
+	if (typed == NULL || typed->refusal != CLUSTER_COLD_OK || cold_native_clog_active != NULL)
 		return false;
 	/* Preserve the whole episode on ERROR or a late false, just as the
 	 * original foreign record owner does. This is never COMPLETE. */
@@ -2204,6 +2249,8 @@ cluster_cold_typed_clog_native_v1(ClusterColdTypedV1 *typed,
 		|| XLogRecGetRmid(reader) != RM_CLOG_ID)
 		return false;
 	replay.plan = typed->side_plans[0];
+	replay.reader = reader;
+	replay.record = reader->record;
 	memcpy(&replay.source, &typed->sources[0], sizeof(replay.source));
 	memcpy(&replay.participant, &typed->participants[0], sizeof(replay.participant));
 	if (!side_plan_clog_native_replay(replay.plan, &replay.source, reader,

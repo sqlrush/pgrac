@@ -61,6 +61,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_wal_inputs.h"
 #include "cluster/cluster_native_startup.h"
@@ -2211,19 +2212,20 @@ clog_recovery_full_record_shape(const ClusterSideProjectionOperationV1 *op,
 }
 
 static bool
-clog_recovery_own_full_permitted(int origin)
+clog_recovery_own_full_permitted(int origin, const XLogReaderState *native)
 {
 	return cluster_shared_config && AmStartupProcess() && InRecovery
 		&& origin >= 0 && origin < CLOG_RECOVERY_ORIGINS && origin == cluster_node_id
 		&& XactCtl->shared != NULL && ClogRecoveryLocks != NULL
-		&& cluster_undo_recovery_cold_origin_authorized_v1(origin);
+		&& (native != NULL ? cluster_cold_typed_clog_native_record_current_v1(origin, native)
+			: cluster_undo_recovery_cold_origin_authorized_v1(origin));
 }
 
 static bool
-clog_recovery_own_full_directory_ready(int origin)
+clog_recovery_own_full_directory_ready(int origin, const XLogReaderState *native)
 {
-	return clog_recovery_own_full_permitted(origin) && clog_native_directory_ready(origin)
-		&& clog_recovery_own_full_permitted(origin);
+	return clog_recovery_own_full_permitted(origin, native) && clog_native_directory_ready(origin)
+		&& clog_recovery_own_full_permitted(origin, native);
 }
 
 /* The original shared cache cannot be discarded to force a physical read. */
@@ -2267,7 +2269,7 @@ clog_recovery_disk_zero(SlruCtl disk, int page, const struct stat *expected)
 }
 
 static bool
-clog_recovery_own_full_zero(int origin, int page, bool verify)
+clog_recovery_own_full_zero(int origin, int page, bool verify, const XLogReaderState *native)
 {
 	SlruCtlData disk;
 	char path[MAXPGPATH];
@@ -2276,7 +2278,7 @@ clog_recovery_own_full_zero(int origin, int page, bool verify)
 	volatile bool ok = false, finished = false;
 	int length;
 
-	if (!clog_recovery_own_full_directory_ready(origin))
+	if (!clog_recovery_own_full_directory_ready(origin, native))
 		return false;
 	/* Only disk identity/readback uses this absolute copy. Native cache and
 	 * writes keep XactCtl, its locks and unrelated dirty/group-LSN state. */
@@ -2299,7 +2301,7 @@ clog_recovery_own_full_zero(int origin, int page, bool verify)
 		int slot;
 
 		LWLockAcquire(XactCtl->shared->ControlLock, LW_EXCLUSIVE);
-		ok = clog_recovery_own_full_directory_ready(origin);
+		ok = clog_recovery_own_full_directory_ready(origin, native);
 		if (ok && verify) {
 			slot = SimpleLruReadPage(XactCtl, page, true, InvalidTransactionId);
 			for (int i = 0; i < BLCKSZ && ok; i++)
@@ -2321,7 +2323,7 @@ clog_recovery_own_full_zero(int origin, int page, bool verify)
 		}
 	}
 	PG_END_TRY();
-	if (!ok || !clog_recovery_own_full_directory_ready(origin)
+	if (!ok || !clog_recovery_own_full_directory_ready(origin, native)
 		|| !clog_recovery_page_identity(&disk, page, &after)
 		|| (exists && (before.st_dev != after.st_dev || before.st_ino != after.st_ino))
 		|| after.st_size != (verify ? before.st_size
@@ -2332,25 +2334,25 @@ clog_recovery_own_full_zero(int origin, int page, bool verify)
 		return false;
 	if (verify)
 		return clog_recovery_disk_zero(&disk, page, &after)
-			&& clog_recovery_own_full_directory_ready(origin);
+			&& clog_recovery_own_full_directory_ready(origin, native);
 	return clog_recovery_sync(&disk, page, &after) && clog_recovery_sync(&disk, -1, NULL)
-		&& clog_recovery_own_full_zero(origin, page, true);
+		&& clog_recovery_own_full_zero(origin, page, true, native);
 }
 
 static bool
 clog_recovery_own_full_record(int origin, const ClusterSideProjectionOperationV1 *op,
-	bool verify, const uint8 *payload, uint32 length)
+	bool verify, const uint8 *payload, uint32 length, const XLogReaderState *native)
 {
 	volatile bool locked = false, native_locked = false, ok = false, finished = false;
 	xl_clog_zeropage_full birth;
 	LWLock *lock;
 
 	/* Own legacy ZERO/TRUNCATE and C0 terminal permissions remain separate. */
-	if (payload == NULL || length != sizeof(birth))
+	if ((native != NULL && !verify) || payload == NULL || length != sizeof(birth))
 		return false;
 	memcpy(&birth, payload, sizeof(birth));
 	if (!clog_recovery_full_record_shape(op, (const uint8 *)&birth, sizeof(birth))
-		|| !clog_recovery_own_full_directory_ready(origin))
+		|| !clog_recovery_own_full_directory_ready(origin, native))
 		return false;
 	if (!verify)
 		clog_relmap_native_mutation(origin);
@@ -2359,7 +2361,7 @@ clog_recovery_own_full_record(int origin, const ClusterSideProjectionOperationV1
 	{
 		LWLockAcquire(lock, LW_EXCLUSIVE);
 		locked = true;
-		ok = clog_recovery_own_full_zero(origin, op->page_number, verify);
+		ok = clog_recovery_own_full_zero(origin, op->page_number, verify, native);
 		if (ok && !verify) {
 			SlruShared shared = XactCtl->shared;
 
@@ -2370,7 +2372,7 @@ clog_recovery_own_full_record(int origin, const ClusterSideProjectionOperationV1
 			native_locked = true;
 			LWLockAcquire(shared->ControlLock, LW_EXCLUSIVE);
 			ok = false;
-			if (clog_recovery_own_full_permitted(origin)) {
+			if (clog_recovery_own_full_permitted(origin, native)) {
 				for (int slot = 0; slot < shared->num_slots; slot++) {
 					bool zero = true;
 
@@ -2435,14 +2437,15 @@ clog_native_truncate_verify_file(SlruCtl ctl, char *filename, int segpage, void 
 /* Verify only: the original native redo owns horizon advancement, cache
  * retirement and deletion. A failed/best-effort delete cannot be repaired here. */
 static bool
-clog_native_truncate_absent(int origin, SlruCtl disk, const xl_clog_truncate_full *cut)
+clog_native_truncate_absent(int origin, SlruCtl disk, const xl_clog_truncate_full *cut,
+	const XLogReaderState *record)
 {
 	ClogNativeTruncateVerify scan = {cut->pageno, true};
 	TransactionId oldest = InvalidTransactionId;
 	LWLock *volatile lock = XactTruncationLock;
 	volatile bool locked = false, finished = false, native_ok = false;
 
-	if (!clog_recovery_own_full_directory_ready(origin) || ShmemVariableCache == NULL)
+	if (!clog_recovery_own_full_directory_ready(origin, record) || ShmemVariableCache == NULL)
 		return false;
 	PG_TRY();
 	{
@@ -2478,7 +2481,7 @@ clog_native_truncate_absent(int origin, SlruCtl disk, const xl_clog_truncate_ful
 		|| TransactionIdPrecedes(oldest, cut->oldestXact))
 		return false;
 	(void)SlruScanDirectory(disk, clog_native_truncate_verify_file, &scan);
-	return scan.absent && clog_recovery_own_full_directory_ready(origin);
+	return scan.absent && clog_recovery_own_full_directory_ready(origin, record);
 }
 
 static bool
@@ -2494,7 +2497,7 @@ clog_native_recovery_full_truncate_sync(int origin, const XLogReaderState *recor
 	int length;
 
 	if (!enableFsync || CritSectionCount != 0
-		|| !clog_recovery_own_full_directory_ready(origin)
+		|| !clog_recovery_own_full_directory_ready(origin, record)
 		|| LWLockHeldByMe(XactSLRULock) || LWLockHeldByMe(XactTruncationLock)
 		|| LWLockHeldByMe(XidGenLock)
 		|| LWLockHeldByMe(&ClogRecoveryLocks[origin * 2 + 1].lock)
@@ -2517,10 +2520,10 @@ clog_native_recovery_full_truncate_sync(int origin, const XLogReaderState *recor
 	length = snprintf(disk.Dir, sizeof(disk.Dir), "%s/native_side/origin_%d/pg_xact",
 		cluster_shared_data_dir, origin);
 	if (length < 0 || length >= sizeof(disk.Dir) || lstat(disk.Dir, &before) != 0
-		|| !S_ISDIR(before.st_mode) || !clog_native_truncate_absent(origin, &disk, &cut)
+		|| !S_ISDIR(before.st_mode) || !clog_native_truncate_absent(origin, &disk, &cut, record)
 		|| !clog_relmap_mutation_matches(origin, generation)
 		|| !clog_recovery_sync(&disk, -1, NULL)
-		|| !clog_native_truncate_absent(origin, &disk, &cut)
+		|| !clog_native_truncate_absent(origin, &disk, &cut, record)
 		|| lstat(disk.Dir, &after) != 0 || !S_ISDIR(after.st_mode)
 		|| !clog_recovery_same_file(&before, &after)
 		|| !clog_relmap_mutation_matches(origin, generation))
@@ -2546,13 +2549,14 @@ cluster_clog_native_recovery_full_sync_v1(int origin, const XLogReaderState *rec
 	uint64 generation;
 	int length;
 
-	if (record != NULL && record->record != NULL
-		&& XLogRecGetRmid(record) == RM_CLOG_ID
+	if (record == NULL || record->record == NULL)
+		return false;
+	if (XLogRecGetRmid(record) == RM_CLOG_ID
 		&& (XLogRecGetInfo(record) & ~XLR_INFO_MASK) == CLOG_TRUNCATE_FULL)
 		return clog_native_recovery_full_truncate_sync(origin, record);
 
 	if (!enableFsync || CritSectionCount != 0
-		|| !clog_recovery_own_full_directory_ready(origin)
+		|| !clog_recovery_own_full_directory_ready(origin, record)
 		|| LWLockHeldByMe(XactSLRULock) || LWLockHeldByMe(XactTruncationLock)
 		|| LWLockHeldByMe(XidGenLock)
 		|| LWLockHeldByMe(&ClogRecoveryLocks[origin * 2 + 1].lock)
@@ -2580,12 +2584,12 @@ cluster_clog_native_recovery_full_sync_v1(int origin, const XLogReaderState *rec
 		cluster_shared_data_dir, origin);
 	if (length < 0 || length >= sizeof(disk.Dir)
 		|| !clog_recovery_page_identity(&disk, birth.pageno, &before)
-		|| !clog_recovery_own_full_record(origin, &op, true, (const uint8 *)&birth, sizeof(birth))
+		|| !clog_recovery_own_full_record(origin, &op, true, (const uint8 *)&birth, sizeof(birth), record)
 		|| !clog_relmap_mutation_matches(origin, generation)
 		|| !clog_recovery_sync(&disk, birth.pageno, &before)
 		|| !clog_recovery_sync(&disk, -1, NULL)
-		|| !clog_recovery_own_full_directory_ready(origin)
-		|| !clog_recovery_own_full_record(origin, &op, true, (const uint8 *)&birth, sizeof(birth))
+		|| !clog_recovery_own_full_directory_ready(origin, record)
+		|| !clog_recovery_own_full_record(origin, &op, true, (const uint8 *)&birth, sizeof(birth), record)
 		|| !clog_recovery_page_identity(&disk, birth.pageno, &after)
 		|| !clog_recovery_same_file(&before, &after)
 		|| !clog_relmap_mutation_matches(origin, generation))
@@ -2607,7 +2611,7 @@ clog_recovery_record(int origin, const ClusterSideProjectionOperationV1 *op, boo
 	SlruCtl ctl;
 
 	if (origin == cluster_node_id)
-		return clog_recovery_own_full_record(origin, op, verify, payload, length);
+		return clog_recovery_own_full_record(origin, op, verify, payload, length, NULL);
 	if (!clog_recovery_permitted(origin) || op == NULL || op->kind != CLUSTER_SIDE_PROJECTION_CLOG
 		|| op->page_number < 0 || (uint32)op->page_number > UINT32_MAX / CLOG_XACTS_PER_PAGE)
 		return false;
