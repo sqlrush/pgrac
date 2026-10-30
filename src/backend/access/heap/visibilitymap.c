@@ -1227,16 +1227,18 @@ visibilitymap_prepare_truncate(Relation rel, BlockNumber nheapblocks)
 		Page		page;
 		char	   *map;
 #ifdef USE_PGRAC_CLUSTER
-		ClusterSpaceIdentity identity;
+		static const PGAlignedBlock zero;
+		ClusterSpaceIdentityObservationV1 observation;
 		RfPageProducerBatchV1 version_batch;
-		bool		versioned = !InRecovery && cluster_shared_config &&
+		bool		shared_vm = cluster_shared_config &&
 			RelationIsPermanent(rel) &&
 			cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) == 1;
+		bool		versioned = !InRecovery && shared_vm;
 
-		/* PGRAC: resolve once before VM pin/content lock, not inside WAL. */
+		/* PGRAC: retain the original observation across VM acquisition. */
 		if (versioned &&
 			(!RelationNeedsWAL(rel) ||
-			 !cluster_space_relation_get_identity(rel, &identity)))
+			 !cluster_space_relation_identity_capture_v1(rel, &observation)))
 			elog(ERROR, "shared VM truncation requires a live SPACE identity");
 #endif
 
@@ -1255,9 +1257,20 @@ visibilitymap_prepare_truncate(Relation rel, BlockNumber nheapblocks)
 		LockBuffer(mapBuffer, BUFFER_LOCK_EXCLUSIVE);
 
 #ifdef USE_PGRAC_CLUSTER
+		/* Memory-only checks precede both the no-op and the native mutation;
+		 * a fresh identity must not revive the original truncate operation. */
+		if (versioned &&
+			!cluster_space_relation_identity_current_v1(rel, &observation))
+			elog(ERROR, "shared VM truncation lost its original SPACE identity");
+		if (shared_vm &&
+			(!vm_buffer_matches(rel, mapBuffer, VISIBILITYMAP_FORKNUM, truncBlock) ||
+			 (PageIsNew(page) ? memcmp(page, zero.data, BLCKSZ) != 0 :
+			  !vm_redo_page_valid(page))))
+			elog(ERROR, "shared VM truncation requires an exact valid VM tail");
+
 		/* A real zero VM tail already represents no visible blocks. Recheck
 		 * under authority, but do not create an unversioned dirty header. */
-		if (cluster_shared_config && PageIsNew(page))
+		if (shared_vm && PageIsNew(page))
 		{
 			UnlockReleaseBuffer(mapBuffer);
 			goto check_vm_size;
@@ -1275,7 +1288,7 @@ visibilitymap_prepare_truncate(Relation rel, BlockNumber nheapblocks)
 				UnlockReleaseBuffer(mapBuffer);
 				goto check_vm_size;
 			}
-			if (!cluster_space_prepare_buffer_versions(&identity, &mapBuffer,
+			if (!cluster_space_prepare_buffer_versions(&observation.identity, &mapBuffer,
 													   &block_id, 1, &version_batch))
 				elog(ERROR, "shared VM truncation requires an exact predecessor");
 		}
@@ -1388,8 +1401,12 @@ visibilitymap_prepare_cold_truncate(Relation rel, BlockNumber nheapblocks,
 			buffer = ReadBufferExtended(rel, VISIBILITYMAP_FORKNUM, truncBlock, RBM_NORMAL, NULL);
 			LockBuffer(buffer, BUFFER_LOCK_SHARE);
 			page = BufferGetPage(buffer);
-			if (PageIsNew(page))
+			if (!vm_buffer_matches(rel, buffer, VISIBILITYMAP_FORKNUM, truncBlock))
+				clear = false;
+			else if (PageIsNew(page))
 				clear = memcmp(page, zero.data, BLCKSZ) == 0;
+			else if (!vm_redo_page_valid(page))
+				clear = false;
 			else {
 				const unsigned char *map = (unsigned char *)PageGetContents(page);
 

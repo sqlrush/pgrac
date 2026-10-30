@@ -34,6 +34,11 @@
 
 UT_DEFINE_GLOBALS();
 
+#ifdef FIXTURE_NO_ASSERTS
+#undef Assert
+#define Assert(condition) ((void)0)
+#endif
+
 /* Online page/version fixtures use TARGET_READY; recovered admission is
  * controlled separately and is never granted by these storage leaves. */
 BackendType MyBackendType = B_BACKEND;
@@ -89,6 +94,8 @@ static ReadBufferMode read_mode;
 static int last_lock_mode;
 static jmp_buf error_jump;
 static unsigned retry_replacements, retry_cancel_after, retry_handoffs, retry_cancellations;
+static unsigned truncate_epoch, truncate_drift_at, truncate_wrong_tag;
+static unsigned truncate_captures, truncate_rechecks;
 volatile sig_atomic_t InterruptPending;
 
 /* A real init handoff has already released the obsolete pin. Cancellation
@@ -137,6 +144,36 @@ cluster_space_relation_get_identity(Relation rel, ClusterSpaceIdentity *out)
 	memset(out, 0, sizeof(*out));
 	out->key.locator = rel->rd_locator;
 	return identity_ok;
+}
+
+/* Controlled SPACE publication seam: the original observation cannot be
+ * refreshed after the VM read or content lock. The cache implementation is
+ * covered separately; these leaves assert the caller's lock/IO schedule. */
+bool
+cluster_space_relation_identity_capture_v1(Relation rel, ClusterSpaceIdentityObservationV1 *out)
+{
+	ClusterSpaceIdentity identity;
+
+	truncate_captures++;
+	memset(out, 0, sizeof(*out));
+	if (!cluster_space_relation_get_identity(rel, &identity))
+		return false;
+	out->identity = identity;
+	out->invalidations = truncate_epoch;
+	return true;
+}
+
+bool
+cluster_space_relation_identity_current_v1(Relation rel,
+										   const ClusterSpaceIdentityObservationV1 *expected)
+{
+	if (rel != &relation || pins != 1 || locks != unlocks + 1
+		|| last_lock_mode != BUFFER_LOCK_EXCLUSIVE || CritSectionCount != 0
+		|| truncate_captures != 1 || identities != 1)
+		abort();
+	truncate_rechecks++;
+	return identity_ok && expected->invalidations == truncate_epoch
+		   && RelFileLocatorEquals(expected->identity.key.locator, relation.rd_locator);
 }
 
 /* The real WAL initializer is independently covered by space-copy-version.
@@ -201,6 +238,8 @@ ReadBufferExtended(Relation rel, ForkNumber forknum, BlockNumber block, ReadBuff
 	fixture_fork = forknum;
 	fixture_block = block;
 	read_mode = mode;
+	if (truncate_drift_at == 1)
+		truncate_epoch++;
 	return 1;
 }
 
@@ -307,6 +346,15 @@ LockBuffer(Buffer buffer, int mode)
 	if (mode == BUFFER_LOCK_EXCLUSIVE || mode == BUFFER_LOCK_SHARE) {
 		last_lock_mode = mode;
 		locks++;
+		if (truncate_drift_at == 2)
+			truncate_epoch++;
+		switch (truncate_wrong_tag) {
+		case 1: fixture_locator.spcOid++; break;
+		case 2: fixture_locator.dbOid++; break;
+		case 3: fixture_locator.relNumber++; break;
+		case 4: fixture_fork = MAIN_FORKNUM; break;
+		case 5: fixture_block++; break;
+		}
 	} else if (mode == BUFFER_LOCK_UNLOCK)
 		unlocks++;
 	else
@@ -467,6 +515,8 @@ reset(bool shared)
 	fixture_fork = VISIBILITYMAP_FORKNUM;
 	fixture_block = 0;
 	retry_replacements = retry_cancel_after = retry_handoffs = retry_cancellations = 0;
+	truncate_epoch = 1;
+	truncate_drift_at = truncate_wrong_tag = truncate_captures = truncate_rechecks = 0;
 	InterruptPending = false;
 }
 
@@ -667,6 +717,173 @@ UT_TEST(test_truncate_native_and_recovery_do_not_read_runtime_identity)
 		}
 }
 
+static bool
+truncate_raises_error(void)
+{
+	expecting_error = true;
+	if (setjmp(error_jump) == 0) {
+		(void)visibilitymap_prepare_truncate(&relation, 10);
+		expecting_error = false;
+		return false;
+	}
+	expecting_error = false;
+	return true;
+}
+
+/* Each corruption independently violates the existing VM page format. */
+static void
+damage_truncate_layout(unsigned variant)
+{
+	PageHeader header = (PageHeader)vm.data;
+
+	switch (variant) {
+	case 0:
+		PageSetPageSizeAndVersion(vm.data, BLCKSZ / 2, PG_PAGE_LAYOUT_VERSION);
+		break;
+	case 1:
+		PageSetPageSizeAndVersion(vm.data, BLCKSZ, 0);
+		break;
+	case 2:
+		header->pd_lower++;
+		break;
+	case 3:
+		header->pd_upper--;
+		break;
+	case 4:
+		header->pd_special--;
+		break;
+	case 5:
+		header->pd_prune_xid = FirstNormalTransactionId;
+		break;
+	case 6:
+		header->pd_flags = PD_HAS_FREE_LINES;
+		break;
+	case 7:
+		header->pd_flags = PD_LSN_ORIGIN_MASK;
+		break;
+	case 8:
+		header->pd_block_scn = 0;
+		break;
+	case 9:
+		header->pd_upper = 0;
+		break; /* PageIsNew with a nonzero header. */
+	default:
+		abort();
+	}
+}
+
+UT_TEST(test_truncate_rejects_nonpristine_new_tail_before_noop)
+{
+	for (int recovery = 0; recovery < 2; recovery++)
+		for (int position = 0; position < 2; position++) {
+			PGAlignedBlock before;
+
+			reset(true);
+			InRecovery = recovery;
+			vm.data[position ? BLCKSZ - 1 : MAXALIGN(SizeOfPageHeaderData)] = 1;
+			before = vm;
+			UT_ASSERT(truncate_raises_error());
+			UT_ASSERT(memcmp(before.data, vm.data, BLCKSZ) == 0);
+			UT_ASSERT_EQ(dirty + init_calls + prepared + wal_records + legacy_wal, 0);
+			UT_ASSERT_EQ(CritSectionCount, 0);
+			if (pins != 0)
+				UnlockReleaseBuffer(1); /* Test leaf, not ResourceOwner unwinding. */
+		}
+}
+
+UT_TEST(test_truncate_rejects_malformed_layout_before_mutation_or_noop)
+{
+	for (int recovery = 0; recovery < 2; recovery++)
+		for (int changed = 0; changed < 2; changed++)
+			for (unsigned variant = 0; variant < 10; variant++) {
+				PGAlignedBlock before;
+
+				truncate_page(true);
+				InRecovery = recovery;
+				if (!changed)
+					memset(PageGetContents(vm.data), 0, MAPSIZE);
+				damage_truncate_layout(variant);
+				before = vm;
+				UT_ASSERT(truncate_raises_error());
+				UT_ASSERT(memcmp(before.data, vm.data, BLCKSZ) == 0);
+				UT_ASSERT_EQ(dirty + init_calls + prepared + wal_records + legacy_wal, 0);
+				UT_ASSERT_EQ(CritSectionCount, 0);
+				if (pins != 0)
+					UnlockReleaseBuffer(1);
+			}
+}
+
+UT_TEST(test_truncate_rejects_wrong_target_before_mutation_or_noop)
+{
+	for (int profile = 0; profile < 3; profile++)
+		for (unsigned field = 1; field <= 5; field++) {
+			PGAlignedBlock before;
+
+			truncate_page(true);
+			if (profile == 0)
+				memset(vm.data, 0, BLCKSZ);
+			if (profile == 1)
+				memset(PageGetContents(vm.data), 0, MAPSIZE);
+			truncate_wrong_tag = field;
+			before = vm;
+			UT_ASSERT(truncate_raises_error());
+			UT_ASSERT(memcmp(before.data, vm.data, BLCKSZ) == 0);
+			UT_ASSERT_EQ(dirty + prepared + wal_records + legacy_wal, 0);
+			UT_ASSERT_EQ(CritSectionCount, 0);
+			if (pins != 0)
+				UnlockReleaseBuffer(1);
+		}
+}
+
+UT_TEST(test_truncate_cannot_refresh_original_space_after_vm_acquisition)
+{
+	for (int profile = 0; profile < 3; profile++)
+		for (unsigned phase = 1; phase <= 2; phase++) {
+			PGAlignedBlock before;
+
+			truncate_page(true);
+			if (profile == 0)
+				memset(vm.data, 0, BLCKSZ);
+			if (profile == 1)
+				memset(PageGetContents(vm.data), 0, MAPSIZE);
+			truncate_drift_at = phase;
+			before = vm;
+			UT_ASSERT(truncate_raises_error());
+			UT_ASSERT(memcmp(before.data, vm.data, BLCKSZ) == 0);
+			UT_ASSERT_EQ(truncate_captures, 1);
+			UT_ASSERT_EQ(truncate_rechecks, 1);
+			UT_ASSERT_EQ(identities, 1);
+			UT_ASSERT_EQ(dirty + prepared + wal_records + legacy_wal, 0);
+			UT_ASSERT_EQ(CritSectionCount, 0);
+			if (pins != 0)
+				UnlockReleaseBuffer(1);
+		}
+}
+
+UT_TEST(test_truncate_unlogged_keeps_native_profile)
+{
+	for (int shared = 0; shared < 2; shared++)
+		for (int zero = 0; zero < 2; zero++) {
+			truncate_page(shared);
+			relform.relpersistence = RELPERSISTENCE_UNLOGGED;
+			if (zero)
+				memset(vm.data, 0, BLCKSZ);
+			else
+				((PageHeader)vm.data)->pd_block_scn = 0;
+			UT_ASSERT_EQ(visibilitymap_prepare_truncate(&relation, 10), 1);
+			UT_ASSERT(!PageIsNew(vm.data));
+			UT_ASSERT_EQ(((PageHeader)vm.data)->pd_block_scn, 0);
+			UT_ASSERT_EQ((uint8)PageGetContents(vm.data)[2], zero ? 0 : 0x0f);
+			UT_ASSERT_EQ(read_mode, RBM_ZERO_ON_ERROR);
+			UT_ASSERT_EQ(dirty, 1);
+			UT_ASSERT_EQ(identities + truncate_captures + truncate_rechecks + prepared + wal_records
+							 + legacy_wal + version_edges,
+						 0);
+			UT_ASSERT_EQ(pins, 0);
+			UT_ASSERT_EQ(locks, unlocks);
+		}
+}
+
 UT_TEST(test_legacy_read_keeps_native_initialization)
 {
 	Buffer buffer;
@@ -820,6 +1037,55 @@ UT_TEST(test_cold_truncate_page_boundary_and_short_fork_need_no_read)
 		UT_ASSERT_EQ(size, i == 2 ? InvalidBlockNumber : (BlockNumber)i);
 		UT_ASSERT_EQ(reads + pins + locks + init_calls + dirty, 0);
 	}
+}
+
+UT_TEST(test_cold_truncate_rejects_clear_tail_with_malformed_layout)
+{
+	for (unsigned variant = 0; variant < 10; variant++) {
+		BlockNumber size = 99;
+		PGAlignedBlock before;
+
+		truncate_page(true);
+		InRecovery = true;
+		memset(PageGetContents(vm.data), 0, MAPSIZE);
+		damage_truncate_layout(variant);
+		before = vm;
+		UT_ASSERT(!visibilitymap_prepare_cold_truncate(&relation, 10, &size));
+		UT_ASSERT_EQ(size, 99);
+		UT_ASSERT(memcmp(before.data, vm.data, BLCKSZ) == 0);
+		UT_ASSERT_EQ(reads, 1);
+		UT_ASSERT_EQ(last_lock_mode, BUFFER_LOCK_SHARE);
+		UT_ASSERT_EQ(pins, 0);
+		UT_ASSERT_EQ(locks, unlocks);
+		UT_ASSERT_EQ(
+			identities + truncate_captures + truncate_rechecks + dirty + prepared + wal_records, 0);
+	}
+}
+
+UT_TEST(test_cold_truncate_rejects_clear_tail_with_wrong_target)
+{
+	for (int zero = 0; zero < 2; zero++)
+		for (unsigned field = 1; field <= 5; field++) {
+			BlockNumber size = 99;
+			PGAlignedBlock before;
+
+			reset(true);
+			InRecovery = true;
+			if (!zero) {
+				PageInit(vm.data, BLCKSZ, 0);
+				((PageHeader)vm.data)->pd_block_scn = 55;
+			}
+			truncate_wrong_tag = field;
+			before = vm;
+			UT_ASSERT(!visibilitymap_prepare_cold_truncate(&relation, 10, &size));
+			UT_ASSERT_EQ(size, 99);
+			UT_ASSERT(memcmp(before.data, vm.data, BLCKSZ) == 0);
+			UT_ASSERT_EQ(pins, 0);
+			UT_ASSERT_EQ(locks, unlocks);
+			UT_ASSERT_EQ(identities + truncate_captures + truncate_rechecks + dirty + prepared
+							 + wal_records,
+						 0);
+		}
 }
 
 UT_TEST(test_write_pin_replaces_wrong_relation_fork_or_map_block)
@@ -996,7 +1262,14 @@ UT_TEST(test_nonversioned_vm_lookup_keeps_original_interrupt_and_init_profile)
 int
 main(void)
 {
-	UT_PLAN(23);
+	UT_PLAN(30);
+	UT_RUN(test_truncate_rejects_nonpristine_new_tail_before_noop);
+	UT_RUN(test_truncate_rejects_malformed_layout_before_mutation_or_noop);
+	UT_RUN(test_truncate_rejects_wrong_target_before_mutation_or_noop);
+	UT_RUN(test_truncate_cannot_refresh_original_space_after_vm_acquisition);
+	UT_RUN(test_cold_truncate_rejects_clear_tail_with_malformed_layout);
+	UT_RUN(test_cold_truncate_rejects_clear_tail_with_wrong_target);
+	UT_RUN(test_truncate_unlogged_keeps_native_profile);
 	UT_RUN(test_shared_init_cancel_after_replacement_cannot_fetch_or_publish_again);
 	UT_RUN(test_pending_shared_vm_cancel_precedes_first_storage_access);
 	UT_RUN(test_shared_init_replacements_without_cancel_preserve_one_initialization);
