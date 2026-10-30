@@ -1313,10 +1313,298 @@ UT_TEST(rebind_ingress_without_original_success_has_no_responsibility)
 	test_first_open_finish();
 }
 
+/* A completed proof preserves the original exact RELEASE receipt tail.
+ * This observation neither repairs the cap store nor signs the sixth leg. */
+UT_TEST(rebind_completed_stop_observes_original_terminal_peer_receipt_tail)
+{
+	ClusterSemanticActivationAckTableV1 complete, ordinary;
+	ClusterSemanticOpenProofIdentity before, after;
+	SemanticControlRebindShmem shared;
+	SemanticStopTrace trace = { 0 };
+	const char *reason = NULL;
+	uint64 incarnations[4], read_seq;
+	const uint64 expected_members[4]
+		= { UINT64_C(0x445566778899aabb), UINT64_C(0x101), UINT64_C(0x102), UINT64_C(0x103) };
+	int sends[CLUSTER_MAX_NODES];
+
+	rebind_finish_proof();
+	test_terminal_stop = true;
+	IsUnderPostmaster = true;
+	MyAuxProcType = CheckpointerProcess;
+	ordinary = *SemanticActivationAckTable;
+	UT_ASSERT_EQ(semantic_open_proof_snapshot_mode(&complete, &before, true),
+				 SEMANTIC_OPEN_PROOF_REBOUND);
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_match(&test_serving_expected_open,
+													test_serving_expected_root, incarnations, NULL),
+				 CLUSTER_NORMAL_STOP_READY);
+
+	test_terminal_peer_open = test_serving_expected_open;
+	memcpy(test_terminal_peer_root, test_serving_expected_root, sizeof(test_terminal_peer_root));
+	test_terminal_peer_record_enabled = true;
+	test_terminal_peer_record = (ClusterSfPeerCap){ .valid = true,
+													.bits = test_peer_capability_word,
+													.generation = test_peer_capability_generation };
+	UT_ASSERT(cluster_sf_peer_cap_invalidate_gen(&test_terminal_peer_record,
+												 test_peer_capability_generation));
+	test_terminal_peer_eligible = false;
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_match(&test_serving_expected_open,
+													test_serving_expected_root, incarnations, NULL),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(semantic_activation_ack_complete_image_check_internal(
+					 &complete, 15, 0, 7, 0, cluster_node_id, test_local_capability_word,
+					 &test_serving_expected_open, test_serving_expected_root, NULL),
+				 CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_IMAGE_OBSERVATION_PENDING);
+	test_terminal_peer_eligible = true;
+	UT_ASSERT_EQ(semantic_activation_ack_complete_image_check_internal(
+					 &complete, 15, 0, 7, 0, cluster_node_id, test_local_capability_word,
+					 &test_serving_expected_open, test_serving_expected_root, NULL),
+				 CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH);
+
+	shared = *SemanticControlRebindState;
+	memcpy(sends, test_send_calls, sizeof(sends));
+	read_seq = pg_atomic_read_u64(&SemanticActivationShmem->record_cas_request_seq);
+	UT_ASSERT_EQ(semantic_open_proof_cut_check(&SemanticControlRebindState->progress, true),
+				 SEMANTIC_CONTROL_REBIND_SAME);
+	UT_ASSERT_EQ(semantic_open_proof_snapshot_mode(&complete, &after, true),
+				 SEMANTIC_OPEN_PROOF_REBOUND);
+	UT_ASSERT(memcmp(&before, &after, sizeof(before)) == 0);
+	UT_ASSERT_EQ(semantic_normal_stop_match_impl(&test_serving_expected_open,
+												 test_serving_expected_root, incarnations, &reason,
+												 &trace),
+				 CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_STR_EQ(reason, "SEMANTIC_STOP_IDENTITY_READY");
+	UT_ASSERT(trace.have_before && trace.have_after);
+	for (unsigned node = 0; node < 4; node++)
+		UT_ASSERT_EQ(incarnations[node], expected_members[node]);
+	UT_ASSERT(memcmp(&ordinary, SemanticActivationAckTable, sizeof(ordinary)) == 0);
+	UT_ASSERT(memcmp(&shared, SemanticControlRebindState, sizeof(shared)) == 0);
+	UT_ASSERT(memcmp(sends, test_send_calls, sizeof(sends)) == 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&SemanticActivationShmem->record_cas_request_seq), read_seq);
+	UT_ASSERT(!test_terminal_peer_record.valid);
+	UT_ASSERT_EQ(test_terminal_peer_record.bits, 0);
+	UT_ASSERT_EQ(test_terminal_peer_record.generation, 20);
+
+	test_terminal_peer_record_enabled = test_terminal_peer_eligible = false;
+	MyAuxProcType = NotAnAuxProcess;
+	test_first_open_finish();
+}
+
+/* Same-OPEN terminal-stop observations retain every original refusal. */
+static void
+rebind_stop_tail_fixture(bool complete)
+{
+	if (complete)
+		rebind_finish_proof();
+	else
+		rebind_start();
+	test_terminal_stop = true;
+	IsUnderPostmaster = true;
+	MyAuxProcType = CheckpointerProcess;
+	test_terminal_peer_open = test_serving_expected_open;
+	memcpy(test_terminal_peer_root, test_serving_expected_root, sizeof(test_terminal_peer_root));
+	test_terminal_peer_record_enabled = test_terminal_peer_eligible = true;
+	test_terminal_peer_record = (ClusterSfPeerCap){ .valid = true,
+													.bits = test_peer_capability_word,
+													.generation = test_peer_capability_generation };
+	UT_ASSERT(cluster_sf_peer_cap_invalidate_gen(&test_terminal_peer_record,
+												 test_peer_capability_generation));
+}
+
+static void
+rebind_stop_tail_finish(void)
+{
+	test_terminal_peer_record_enabled = test_terminal_peer_eligible = false;
+	MyAuxProcType = NotAnAuxProcess;
+	test_first_open_finish();
+}
+
+UT_TEST(rebind_stop_tail_never_covers_missing_evidence_or_identity_drift)
+{
+	const char *faults[] = { "missing-tail",
+							 "changed-generation",
+							 "nonzero-bits",
+							 "zero-generation",
+							 "exhausted-generation",
+							 "admitted-boot",
+							 "root-bytes",
+							 "owner-generation",
+							 "round-nonce",
+							 "completion-binding",
+							 "formation",
+							 "epoch",
+							 "observation-busy",
+							 "busy-with-known-boot-drift" };
+	for (unsigned fault = 0; fault < lengthof(faults); fault++) {
+		ClusterSemanticActivationAckTableV1 ordinary;
+		SemanticControlRebindShmem shared;
+		SemanticControlRebindRuntime owner;
+		ClusterSfPeerCap capability;
+		uint64 incarnations[4], read_seq;
+		int sends[CLUSTER_MAX_NODES];
+		ClusterNormalStopPollResult expected
+			= fault < 5 || fault == 12 ? CLUSTER_NORMAL_STOP_PENDING : CLUSTER_NORMAL_STOP_INVALID;
+		ClusterNormalStopPollResult actual;
+		rebind_stop_tail_fixture(true);
+		switch (fault) {
+		case 0:
+			test_terminal_peer_eligible = false;
+			break;
+		case 1:
+			test_terminal_peer_record.generation++;
+			break;
+		case 2:
+			test_terminal_peer_record.bits = 1;
+			break;
+		case 3:
+			test_terminal_peer_record.generation = 0;
+			break;
+		case 4:
+			test_terminal_peer_record.generation = UINT32_MAX;
+			break;
+		case 5:
+			test_remote_admitted_incarnations[3]++;
+			break;
+		case 6:
+			SemanticActivationPgrdSnapshot->descriptor_bytes[100] ^= 1;
+			break;
+		case 7:
+			test_rebind_proc.cluster_grd_generation++;
+			break;
+		case 8:
+			pg_atomic_fetch_add_u64(&SemanticControlRebindState->nonce, 1);
+			break;
+		case 9:
+			SemanticControlRebindState->completion.proof_binding[0] ^= 1;
+			break;
+		case 10:
+			test_serving_formation++;
+			break;
+		case 11:
+			test_current_epoch++;
+			break;
+		case 12:
+			test_open_proof_caps_busy = true;
+			break;
+		case 13:
+			test_open_proof_caps_busy = true;
+			test_remote_admitted_incarnations[3]++;
+			break;
+		}
+		ordinary = *SemanticActivationAckTable;
+		shared = *SemanticControlRebindState;
+		owner = semantic_control_rebind;
+		capability = test_terminal_peer_record;
+		memcpy(sends, test_send_calls, sizeof(sends));
+		read_seq = pg_atomic_read_u64(&SemanticActivationShmem->record_cas_request_seq);
+		memset(incarnations, 0xa5, sizeof(incarnations));
+		actual = cluster_semantic_normal_stop_match(&test_serving_expected_open,
+													test_serving_expected_root, incarnations, NULL);
+		printf("# CC2130 boundary %s result=%u expected=%u\n", faults[fault], actual, expected);
+		UT_ASSERT_EQ(actual, expected);
+		for (unsigned node = 0; node < 4; node++)
+			UT_ASSERT_EQ(incarnations[node], 0);
+		UT_ASSERT(memcmp(&ordinary, SemanticActivationAckTable, sizeof(ordinary)) == 0);
+		UT_ASSERT(memcmp(&shared, SemanticControlRebindState, sizeof(shared)) == 0);
+		UT_ASSERT(memcmp(&owner, &semantic_control_rebind, sizeof(owner)) == 0);
+		UT_ASSERT(memcmp(&capability, &test_terminal_peer_record, sizeof(capability)) == 0);
+		UT_ASSERT(memcmp(sends, test_send_calls, sizeof(sends)) == 0);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&SemanticActivationShmem->record_cas_request_seq),
+					 read_seq);
+		rebind_stop_tail_finish();
+	}
+}
+
+UT_TEST(rebind_unfinished_stop_tail_cannot_complete_a_round)
+{
+	SemanticControlRebindShmem shared;
+	SemanticControlRebindRuntime owner;
+	uint64 incarnations[4];
+	rebind_stop_tail_fixture(false);
+	shared = *SemanticControlRebindState;
+	owner = semantic_control_rebind;
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_match(&test_serving_expected_open,
+													test_serving_expected_root, incarnations, NULL),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	for (unsigned node = 0; node < 4; node++)
+		UT_ASSERT_EQ(incarnations[node], 0);
+	UT_ASSERT(memcmp(&shared, SemanticControlRebindState, sizeof(shared)) == 0);
+	UT_ASSERT(memcmp(&owner, &semantic_control_rebind, sizeof(owner)) == 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&SemanticControlRebindState->completion_seq), 0);
+	rebind_stop_tail_finish();
+}
+
+UT_TEST(rebind_terminal_stop_tail_never_reopens_online_consumers)
+{
+	ClusterSemanticAdmissionToken token = rebind_resource_x_token();
+	ClusterSemanticActivationAckTableV1 ordinary;
+	SemanticControlRebindShmem shared;
+	rebind_stop_tail_fixture(true);
+	ordinary = *SemanticActivationAckTable;
+	shared = *SemanticControlRebindState;
+	UT_ASSERT(cluster_semantic_activation_resource_x_peer_open_check(&token, 3, 20)
+			  != CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH);
+	token.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+	UT_ASSERT(!cluster_semantic_activation_peer_open_matches(
+		&token, 3, CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS, 20));
+	UT_ASSERT(!test_terminal_peer_record.valid);
+	UT_ASSERT_EQ(test_terminal_peer_record.bits, 0);
+	UT_ASSERT(memcmp(&ordinary, SemanticActivationAckTable, sizeof(ordinary)) == 0);
+	UT_ASSERT(memcmp(&shared, SemanticControlRebindState, sizeof(shared)) == 0);
+	rebind_stop_tail_finish();
+}
+
+/* Existing membership snapshot seam fires after the first proof cut. */
+static void
+rebind_stop_tail_republish_completion(void)
+{
+	pg_atomic_fetch_add_u64(&SemanticControlRebindState->completion_seq, 2);
+}
+
+UT_TEST(rebind_stop_tail_rechecks_late_observation_and_publication)
+{
+	for (unsigned sample = 2; sample <= 4; sample++) {
+		uint64 incarnations[4];
+		rebind_stop_tail_fixture(true);
+		test_open_proof_caps_samples = 0;
+		test_open_proof_caps_busy_at = sample;
+		UT_ASSERT_EQ(cluster_semantic_normal_stop_match(&test_serving_expected_open,
+														test_serving_expected_root, incarnations,
+														NULL),
+					 CLUSTER_NORMAL_STOP_PENDING);
+		UT_ASSERT_EQ(test_open_proof_caps_samples, sample == 2 ? 2 : 4);
+		for (unsigned node = 0; node < 4; node++)
+			UT_ASSERT_EQ(incarnations[node], 0);
+		test_open_proof_caps_busy_at = 0;
+		UT_ASSERT_EQ(cluster_semantic_normal_stop_match(&test_serving_expected_open,
+														test_serving_expected_root, incarnations,
+														NULL),
+					 CLUSTER_NORMAL_STOP_READY);
+		rebind_stop_tail_finish();
+	}
+	{
+		uint64 incarnations[4], seq;
+		rebind_stop_tail_fixture(true);
+		seq = pg_atomic_read_u64(&SemanticControlRebindState->completion_seq);
+		test_membership_snapshot_hook = rebind_stop_tail_republish_completion;
+		UT_ASSERT_EQ(cluster_semantic_normal_stop_match(&test_serving_expected_open,
+														test_serving_expected_root, incarnations,
+														NULL),
+					 CLUSTER_NORMAL_STOP_PENDING);
+		UT_ASSERT(test_membership_snapshot_hook == NULL);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&SemanticControlRebindState->completion_seq), seq + 2);
+		for (unsigned node = 0; node < 4; node++)
+			UT_ASSERT_EQ(incarnations[node], 0);
+		UT_ASSERT_EQ(cluster_semantic_normal_stop_match(&test_serving_expected_open,
+														test_serving_expected_root, incarnations,
+														NULL),
+					 CLUSTER_NORMAL_STOP_READY);
+		rebind_stop_tail_finish();
+	}
+}
 int
 main(void)
 {
-	UT_PLAN(90);
+	UT_PLAN(95);
 	UT_RUN(rebind_codec_has_independent_exact_request_and_ack_bytes);
 	UT_RUN(rebind_codec_rejects_invalid_identity_without_mutating_output);
 	UT_RUN(rebind_decoder_rejects_wrong_version_reserved_and_identity);
@@ -1407,6 +1695,11 @@ main(void)
 	UT_RUN(test_a148_postmaster_retention_hint_preserves_unknown_and_publication_history);
 	UT_RUN(test_a148_stop_poll_includes_original_phase3_handoff);
 	UT_RUN(rebind_ingress_without_original_success_has_no_responsibility);
+	UT_RUN(rebind_completed_stop_observes_original_terminal_peer_receipt_tail);
+	UT_RUN(rebind_stop_tail_never_covers_missing_evidence_or_identity_drift);
+	UT_RUN(rebind_unfinished_stop_tail_cannot_complete_a_round);
+	UT_RUN(rebind_terminal_stop_tail_never_reopens_online_consumers);
+	UT_RUN(rebind_stop_tail_rechecks_late_observation_and_publication);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

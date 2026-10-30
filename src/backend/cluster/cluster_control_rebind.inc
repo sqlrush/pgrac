@@ -780,6 +780,15 @@ semantic_open_proof_cut_check(const SemanticControlRebindProgress *progress, boo
 			if (node == (unsigned)cluster_node_id)
 				continue;
 			if (!caps[node].valid) {
+				/* Only a completed strict-stop proof may observe its original
+				 * receipt tail after disconnect; online admission stays closed. */
+				if (allow_stop && progress->phase == SEMANTIC_CONTROL_REBIND_COMPLETE
+					&& caps[node].bits == 0 && caps[node].generation != 0
+					&& caps[node].generation != UINT32_MAX
+					&& caps[node].generation == progress->generations[node]
+					&& cluster_normal_stop_peer_receipt_tail(&open, base->root, node,
+															 base->cut.members[node]))
+					continue;
 				missing = true;
 				continue;
 			}
