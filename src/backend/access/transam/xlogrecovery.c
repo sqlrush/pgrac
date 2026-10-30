@@ -2484,6 +2484,39 @@ cluster_recovery_cold_page_reference_cross_page(const ClusterRecoveryCensusPages
 			|| from->segment_generation != to->segment_generation
 			|| from->slot_offset != to->slot_offset || from->slot_wrap != to->slot_wrap
 			|| from->xid != to->xid) return false;
+		/* Native update chains cannot merge. The local HOT check cannot
+		 * see a predecessor on another page; include local ordinary links
+		 * in this same complete current view. Stale ctids and plain locks
+		 * retain their non-edge meaning, and inverse steps are not ordered
+		 * across pages. Every canonical ITL was qualified above. */
+		{
+			unsigned predecessors = 0;
+
+			for (uint32 j = 0; j < references->count; j++) {
+				const ClusterRecoveryCensusReferenceV1 *candidate = &references->entries[j];
+				const ClusterRecoveryCensusPageV1 *candidate_page;
+				HeapTupleHeaderData previous;
+
+				if (candidate->version != 0 || candidate->entry.kind != CLUSTER_RECOVERY_HEAP_ITEM
+					|| !ItemIdIsNormal(&candidate->entry.item)) continue;
+				if (candidate->page_index >= pages->count || candidate->entry.tuple_bytes == NULL
+					|| candidate->entry.tuple_length < SizeofHeapTupleHeader) return false;
+				candidate_page = &pages->entries[candidate->page_index];
+				if (candidate_page->forknum != page->forknum
+					|| !cluster_recovery_cold_reference_same_space(&page->reservation.identity,
+						&candidate_page->reservation.identity)
+					|| (candidate_page->blockno == block && candidate->entry.index == offset)) continue;
+				memcpy(&previous, candidate->entry.tuple_bytes, SizeofHeapTupleHeader);
+				if ((previous.t_infomask & (HEAP_XMAX_INVALID | HEAP_XMAX_IS_MULTI)) != 0
+					|| HEAP_XMAX_IS_LOCKED_ONLY(previous.t_infomask)
+					|| HeapTupleHeaderGetRawXmax(&previous) != xmax
+					|| !ItemPointerIsValid(&previous.t_ctid)
+					|| ItemPointerGetBlockNumber(&previous.t_ctid) != block
+					|| ItemPointerGetOffsetNumber(&previous.t_ctid) != offset) continue;
+				if (++predecessors > 1) return false;
+			}
+			if (predecessors != 1) return false;
+		}
 	}
 	return true;
 }
