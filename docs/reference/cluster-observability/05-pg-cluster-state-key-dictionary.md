@@ -1333,7 +1333,11 @@ receipt 清理、参与者 ACK、证书发表、一般状态推进、重复回�
 | `ctrc_unsettled_stats_available` | `true` / `false` | 原诊断快照成功且本实例 origin 有效时为 `true`；否则省略以下 origin 和计数，不把不可用展示成 0。 |
 | `ctrc_unsettled_origin_node_id` | 非负整数文本 | 执行观察的本实例节点号，从 0 开始；不是远端事务节点号或集群合计。 |
 | `ctrc_unsettled_count` | uint64 十进制文本 | 查询时本地 origin、participant、receipt 三张表中尚占用的责任行数之和；同一事务可占多行，不是去重事务数或累计完成数。 |
+| `ctrc_oldest_unsettled_age_stats_available` | `true` / `false` | 原快照及本实例 origin 有效，所有观察到的占用行都有有效创建时间，且本机单调时钟未早于这些时间时为 `true`；否则省略年龄，原可用计数仍展示。 |
+| `ctrc_oldest_unsettled_age_ms` | uint64 十进制文本 | 本次逐表观察到的最早责任创建时间至观察结束的毫秒数，向下取整；无占用行为 0，新责任不足 1 毫秒也可为 0，应结合计数读取。 |
 
 origin 和 participant 非全零的行计入，包含预留但仍为 `EMPTY` 的 origin、`RELEASE_PROVEN`、`ACK_FROZEN`、`BLOCKED` 和非零异常行。receipt 状态非 `FREE` 或池中位置仍占用时计入，空位置与可复用 tombstone 不计。责任只有完成原退休才退出该观察范围；异常占用并不证明身份有效或可推进。
 
 三张表分别在原保护锁下依次观察，并非同一时刻的完整切片。计数为 0 不证明无其他残留责任、停机就绪、可复用事务槽或可回收 undo；应结合原阶段、日志及实际使用路径的完整检查。该计数也不表示可供给的容量。
+
+年龄从首次占用责任行开始，重复请求和清偿阶段变化不重置；只在原责任行完成退休后结束。它是本实例当前共享内存中的诊断时长，重启后重新记录，不是事务提交时间、undo 保留期限或 worker 的 pending 观察时长。缺少创建时间的异常占用仍计数，但年龄不可用；年龄不参与回收、准入、超时或停机判定。

@@ -32,6 +32,7 @@
 #include "cluster/storage/cluster_undo_alloc.h"
 #include "port/atomics.h"
 #include "port/pg_crc32c.h"
+#include "portability/instr_time.h"
 #include "storage/lwlock.h"
 
 #ifndef CLUSTER_CTRC_UNIT_TEST
@@ -84,14 +85,22 @@
 #include "storage/procarray.h"
 #include "storage/smgr.h"
 #include "storage/shmem.h"
-#include "portability/instr_time.h"
 #include "utils/memutils.h"
 #include "utils/palloc.h"
 #include "utils/timestamp.h"
 #endif
 
+static uint64
+ctrc_monotonic_us(void)
+{
+	instr_time now;
+
+	INSTR_TIME_SET_CURRENT(now);
+	return (uint64)INSTR_TIME_GET_MICROSEC(now);
+}
+
 #define CLUSTER_CTRC_SHMEM_MAGIC UINT32_C(0x43545243)
-#define CLUSTER_CTRC_SHMEM_VERSION UINT32_C(12)
+#define CLUSTER_CTRC_SHMEM_VERSION UINT32_C(13)
 #ifndef CLUSTER_CTRC_TEST_TABLE_VISIT
 #define CLUSTER_CTRC_TEST_TABLE_VISIT(kind) ((void)0)
 #endif
@@ -1933,15 +1942,6 @@ ctrc_cleaner_owns_key(const ClusterCtrcTxnKeyV1 *key)
 }
 
 static uint64
-ctrc_monotonic_us(void)
-{
-	instr_time now;
-
-	INSTR_TIME_SET_CURRENT(now);
-	return (uint64)INSTR_TIME_GET_MICROSEC(now);
-}
-
-static uint64
 ctrc_scan_limit(CtrcCleanerScanKind kind, uint64 capacity)
 {
 	return CtrcBatch.active ? Min(capacity, CtrcBatch.remaining[kind]) : capacity;
@@ -2795,10 +2795,25 @@ cluster_ctrc_no_progress_stats_snapshot(ClusterCtrcNoProgressStats *out)
 	return true;
 }
 
+/* Read only creation metadata under the original row/pool lock. It never
+ * supplies owner, validity, release or idle evidence. */
+static void
+ctrc_debug_observe_born(uint64 born, uint64 *oldest, uint64 *newest, bool *known)
+{
+	if (born == 0)
+		*known = false;
+	else {
+		*oldest = Min(*oldest, born);
+		*newest = Max(*newest, born);
+	}
+}
+
 bool
 cluster_ctrc_debug_snapshot(ClusterCtrcDebugSnapshot *snapshot)
 {
 	uint64 i;
+	uint64 oldest = UINT64_MAX, newest = 0, observed;
+	bool birth_known = true;
 
 	if (snapshot == NULL || !cluster_ctrc_shmem_ready())
 		return false;
@@ -2814,8 +2829,11 @@ cluster_ctrc_debug_snapshot(ClusterCtrcDebugSnapshot *snapshot)
 	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
 	for (i = 0; i < CtrcShared->origin_key_entries; i++) {
 		if (snapshot->unsettled_stats_available
-			&& !ctrc_bytes_zero(&ctrc_origin_entries()[i], sizeof(ClusterCtrcOriginEntry)))
+			&& !ctrc_bytes_zero(&ctrc_origin_entries()[i], sizeof(ClusterCtrcOriginEntry))) {
 			snapshot->unsettled_count++;
+			ctrc_debug_observe_born(ctrc_origin_entries()[i].diagnostic_born_us, &oldest, &newest,
+									&birth_known);
+		}
 		switch ((ClusterCtrcOriginState)ctrc_origin_entries()[i].state) {
 		case CTRC_ORIGIN_OPEN:
 			snapshot->origin_open++;
@@ -2846,8 +2864,11 @@ cluster_ctrc_debug_snapshot(ClusterCtrcDebugSnapshot *snapshot)
 	for (i = 0; i < CtrcShared->participant_key_entries; i++) {
 		if (snapshot->unsettled_stats_available
 			&& !ctrc_bytes_zero(&ctrc_participant_entries()[i],
-								sizeof(ClusterCtrcParticipantEntry)))
+								sizeof(ClusterCtrcParticipantEntry))) {
 			snapshot->unsettled_count++;
+			ctrc_debug_observe_born(ctrc_participant_entries()[i].diagnostic_born_us, &oldest,
+									&newest, &birth_known);
+		}
 		switch ((ClusterCtrcParticipantState)ctrc_participant_entries()[i].state) {
 		case CTRC_PARTICIPANT_OPEN:
 			snapshot->participant_open++;
@@ -2877,8 +2898,11 @@ cluster_ctrc_debug_snapshot(ClusterCtrcDebugSnapshot *snapshot)
 
 		if (snapshot->unsettled_stats_available
 			&& (state != CTRC_RECEIPT_FREE
-				|| (probe != CTRC_RECEIPT_PROBE_EMPTY && probe != CTRC_RECEIPT_PROBE_TOMBSTONE)))
+				|| (probe != CTRC_RECEIPT_PROBE_EMPTY && probe != CTRC_RECEIPT_PROBE_TOMBSTONE))) {
 			snapshot->unsettled_count++;
+			ctrc_debug_observe_born(ctrc_receipt_entries()[i].diagnostic_born_us, &oldest, &newest,
+									&birth_known);
+		}
 		switch ((ClusterCtrcReceiptState)state) {
 		case CTRC_RECEIPT_PREPARED:
 			snapshot->receipt_prepared++;
@@ -2904,6 +2928,12 @@ cluster_ctrc_debug_snapshot(ClusterCtrcDebugSnapshot *snapshot)
 		}
 	}
 	LWLockRelease(&CtrcShared->receipt_lock);
+	observed = ctrc_monotonic_us();
+	snapshot->oldest_unsettled_age_available
+		= snapshot->unsettled_stats_available && birth_known && observed != 0 && newest <= observed;
+	if (snapshot->oldest_unsettled_age_available && snapshot->unsettled_count != 0)
+		snapshot->oldest_unsettled_age_ms = (observed - oldest) / 1000;
+
 	snapshot->test_barrier_hit_count = pg_atomic_read_u64(&CtrcShared->test_barrier_hit_count);
 	snapshot->test_barrier_phase = pg_atomic_read_u32(&CtrcShared->test_barrier_phase);
 	snapshot->cleaner_reason = (uint32)cluster_ctrc_cleaner_reason_get();
@@ -3110,6 +3140,7 @@ cluster_ctrc_origin_reserve_entry(ClusterCtrcOriginEntry *origin, const ClusterC
 	} else if (ctrc_bytes_zero(origin, sizeof(*origin))) {
 		origin->key = *key;
 		origin->reservation_generation = reservation_generation;
+		origin->diagnostic_born_us = ctrc_monotonic_us();
 		result = CLUSTER_CTRC_ORIGIN_RESERVED_PENDING;
 		reservation->kind = CTRC_ORIGIN_RESERVATION_PENDING_OWNED;
 	} else if (origin->state == CTRC_ORIGIN_RELEASE_PROVEN
@@ -3460,6 +3491,8 @@ cluster_ctrc_origin_open_active(ClusterCtrcOriginEntry *origin, const ClusterCtr
 		return CLUSTER_CTRC_ORIGIN_REFUSED;
 	}
 
+	if (ctrc_bytes_zero(origin, sizeof(*origin)))
+		origin->diagnostic_born_us = ctrc_monotonic_us();
 	origin->key = *key;
 	origin->grant_generation = grant_generation;
 	origin->state = CTRC_ORIGIN_OPEN;
@@ -6714,6 +6747,7 @@ cluster_ctrc_participant_open(ClusterCtrcParticipantEntry *participant,
 	participant->key = *key;
 	participant->identity = *identity;
 	participant->grant_generation = grant_generation;
+	participant->diagnostic_born_us = ctrc_monotonic_us();
 	participant->state = CTRC_PARTICIPANT_OPEN;
 	participant->next_key_sequence = 1;
 	return CLUSTER_CTRC_PARTICIPANT_OPENED;
@@ -6764,6 +6798,7 @@ ctrc_receipt_prepare_with_sequence(ClusterCtrcParticipantEntry *participant,
 	/* Until Task 8 reclaims slots, each allocation has a unique generation. */
 	receipt->publication.journal_slot_generation = journal_sequence;
 	receipt->target = *target;
+	receipt->diagnostic_born_us = ctrc_monotonic_us();
 	pg_atomic_init_u32((pg_atomic_uint32 *)&receipt->state, CTRC_RECEIPT_PREPARED);
 	participant->next_key_sequence++;
 	participant->last_key_sequence = key_sequence;
@@ -12096,6 +12131,7 @@ ctrc_normal_stop_origin_exact(const ClusterCtrcOriginEntry *origin, uint64 index
 		MemSet(&remainder.key, 0, sizeof(remainder.key));
 		remainder.reservation_generation = 0;
 		remainder.original_full_xid = InvalidFullTransactionId;
+		remainder.diagnostic_born_us = 0;
 		return origin->reservation_generation != 0
 			   && ctrc_bytes_zero(&remainder, sizeof(remainder));
 	}

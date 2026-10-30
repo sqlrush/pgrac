@@ -373,6 +373,8 @@ typedef struct ClusterCtrcOriginEntry {
 	uint8 reserved8[6];
 	ClusterCtrcParticipantIdentity touched[CLUSTER_CTRC_MAX_PARTICIPANTS];
 	uint64 close_request_id[CLUSTER_CTRC_MAX_PARTICIPANTS];
+	/* Local monotonic diagnostic only; cleared by original row retirement. */
+	uint64 diagnostic_born_us;
 } ClusterCtrcOriginEntry;
 
 typedef enum ClusterCtrcOriginReservationKind {
@@ -412,6 +414,8 @@ typedef struct ClusterCtrcParticipantEntry {
 	uint64 cancelled_count;
 	uint64 cleaned_count;
 	uint64 ack_frozen_count;
+	/* First occupation, including a CLOSE tombstone; not a release deadline. */
+	uint64 diagnostic_born_us;
 } ClusterCtrcParticipantEntry;
 
 typedef struct ClusterCtrcReceipt {
@@ -423,6 +427,8 @@ typedef struct ClusterCtrcReceipt {
 	uint8 reserved8[3];
 	XLogRecPtr highest_local_wal_lsn;
 	XLogRecPtr required_lsn[CLUSTER_SF_DEP_MAX_ORIGINS];
+	/* Immutable from pool placement through final pool-locked reclamation. */
+	uint64 diagnostic_born_us;
 } ClusterCtrcReceipt;
 
 /* A process-local observation of the original cleaner's one APPLIED
@@ -857,6 +863,7 @@ extern void cluster_ctrc_active_scan_step_source(
 
 #define CLUSTER_CTRC_PUBLISHER_STATS_V1 1
 #define CLUSTER_CTRC_UNSETTLED_STATS_V1 1
+#define CLUSTER_CTRC_UNSETTLED_AGE_STATS_V1 1
 
 typedef struct ClusterCtrcDebugSnapshot {
 	uint64 origin_open;
@@ -888,6 +895,10 @@ typedef struct ClusterCtrcDebugSnapshot {
 	uint64 unsettled_count;
 	int32 unsettled_origin_node_id;
 	bool unsettled_stats_available;
+	/* Same sampled responsibility rows; never a coherent authority cut.
+	 * Missing birth metadata or a backwards clock makes age unavailable. */
+	uint64 oldest_unsettled_age_ms;
+	bool oldest_unsettled_age_available;
 } ClusterCtrcDebugSnapshot;
 
 typedef enum ClusterCtrcCapacityDisposition {

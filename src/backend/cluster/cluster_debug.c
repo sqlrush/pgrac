@@ -4655,13 +4655,19 @@ static void
 dump_ctrc_unsettled(ReturnSetInfo *rsinfo, const ClusterCtrcDebugSnapshot *snapshot)
 {
 	bool available = snapshot != NULL && snapshot->unsettled_stats_available;
+	bool age_available = available && snapshot->oldest_unsettled_age_available;
 
 	emit_row(rsinfo, "ctrc", "ctrc_unsettled_stats_available", available ? "true" : "false");
+	emit_row(rsinfo, "ctrc", "ctrc_oldest_unsettled_age_stats_available",
+			 age_available ? "true" : "false");
 	if (!available)
 		return;
 	emit_row(rsinfo, "ctrc", "ctrc_unsettled_origin_node_id",
 			 fmt_int64(snapshot->unsettled_origin_node_id));
 	emit_row(rsinfo, "ctrc", "ctrc_unsettled_count", fmt_uint64(snapshot->unsettled_count));
+	if (age_available)
+		emit_row(rsinfo, "ctrc", "ctrc_oldest_unsettled_age_ms",
+				 fmt_uint64(snapshot->oldest_unsettled_age_ms));
 }
 
 static void

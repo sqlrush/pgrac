@@ -7773,6 +7773,250 @@ UT_TEST(test_unsettled_gauge_availability_requires_original_snapshot_success)
 	UT_ASSERT_EQ(held_count, 0);
 }
 
+/* The parent still executes its real snapshot. Missing age metadata is
+ * unavailable; it is never synthesized from a pending-worker hint. */
+static bool
+oldest_read_actual_snapshot(uint64 *age, uint64 *count, int32 *origin)
+{
+	ClusterCtrcDebugSnapshot snapshot;
+
+	if (!cluster_ctrc_debug_snapshot(&snapshot))
+		return false;
+#ifdef CLUSTER_CTRC_UNSETTLED_AGE_STATS_V1
+	if (snapshot.unsettled_stats_available && snapshot.oldest_unsettled_age_available) {
+		*age = snapshot.oldest_unsettled_age_ms;
+		*count = snapshot.unsettled_count;
+		*origin = snapshot.unsettled_origin_node_id;
+		return true;
+	}
+#endif
+	return false;
+}
+
+UT_TEST(test_oldest_age_keeps_reservation_start_until_cancel_or_original_retirement)
+{
+	ClusterCtrcTxnKeyV1 key;
+	ClusterCtrcOriginReservation reservation, duplicate;
+	ClusterCtrcOriginEntry before;
+	uint64 age = UINT64_MAX, count = UINT64_MAX;
+	uint32 grant;
+	int32 origin = -1;
+
+	reset_fixture();
+	UT_ASSERT(oldest_read_actual_snapshot(&age, &count, &origin));
+	UT_ASSERT_EQ(age, 0);
+	UT_ASSERT_EQ(count, 0);
+	key = fresh_origin_key();
+	test_my_proc.xid = key.xid;
+	test_top_full = FullTransactionIdFromEpochAndXid(7, key.xid);
+	pg_atomic_write_u64(&test_my_proc.cluster_top_full_xid_atomic,
+						U64FromFullTransactionId(test_top_full));
+	UT_ASSERT_EQ(cluster_ctrc_origin_reserve_active(&key, &reservation),
+				 CLUSTER_CTRC_ORIGIN_RESERVED_PENDING);
+	test_now_us = UINT64_C(4000999);
+	before = ctrc_origin_entries()[0];
+	UT_ASSERT(oldest_read_actual_snapshot(&age, &count, &origin));
+	UT_ASSERT_EQ(age, 3000);
+	UT_ASSERT_EQ(count, 1);
+	UT_ASSERT_EQ(origin, 0);
+	UT_ASSERT_EQ(memcmp(&before, &ctrc_origin_entries()[0], sizeof(before)), 0);
+	UT_ASSERT(cluster_ctrc_origin_cancel_pre_bind(&reservation));
+	UT_ASSERT(oldest_read_actual_snapshot(&age, &count, &origin));
+	UT_ASSERT_EQ(age, 0);
+	UT_ASSERT_EQ(count, 0);
+
+	test_now_us = UINT64_C(6000000);
+	UT_ASSERT_EQ(cluster_ctrc_origin_reserve_active(&key, &reservation),
+				 CLUSTER_CTRC_ORIGIN_RESERVED_PENDING);
+	test_now_us = UINT64_C(7000000);
+	UT_ASSERT(cluster_ctrc_origin_open_reserved(&reservation, &grant));
+	test_now_us = UINT64_C(9000000);
+	before = ctrc_origin_entries()[0];
+	UT_ASSERT_EQ(cluster_ctrc_origin_reserve_active(&key, &duplicate),
+				 CLUSTER_CTRC_ORIGIN_RESERVED_EXISTING_OPEN);
+	UT_ASSERT_EQ(memcmp(&before, &ctrc_origin_entries()[0], sizeof(before)), 0);
+	UT_ASSERT(oldest_read_actual_snapshot(&age, &count, &origin));
+	UT_ASSERT_EQ(age, 3000);
+	ctrc_origin_entries()[0].state = CTRC_ORIGIN_BLOCKED;
+	test_now_us = UINT64_C(10000000);
+	UT_ASSERT(oldest_read_actual_snapshot(&age, &count, &origin));
+	UT_ASSERT_EQ(age, 4000);
+	UT_ASSERT_EQ(count, 1);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_oldest_age_observes_each_domain_and_never_turns_missing_birth_into_zero)
+{
+	ClusterCtrcOriginEntry *entry;
+	ClusterCtrcReceiptHandle receipt, duplicate;
+	ClusterCtrcDebugSnapshot snapshot;
+	uint64 age = UINT64_MAX, count = UINT64_MAX;
+	int32 origin = -1;
+
+	reset_fixture();
+	entry = seed_origin(0, 1);
+	test_now_us = UINT64_C(3000000);
+	UT_ASSERT_EQ(prepare_fixture_receipt(entry, 801, &receipt), CLUSTER_CTRC_PREPARE_READY);
+	test_now_us = UINT64_C(5000000);
+	UT_ASSERT_EQ(prepare_fixture_receipt(entry, 801, &duplicate), CLUSTER_CTRC_PREPARE_DUPLICATE);
+	test_now_us = UINT64_C(8000000);
+	UT_ASSERT(oldest_read_actual_snapshot(&age, &count, &origin));
+	UT_ASSERT_EQ(age, 7000);
+	UT_ASSERT_EQ(count, 3);
+	/* Materialized per-domain observation inputs, not legal lifecycle steps
+ * or an orphan-reclamation proof. The real retirement path is below. */
+	MemSet(entry, 0, sizeof(*entry));
+	UT_ASSERT(oldest_read_actual_snapshot(&age, &count, &origin));
+	UT_ASSERT_EQ(age, 5000);
+	UT_ASSERT_EQ(count, 2);
+	MemSet(receipt.participant, 0, sizeof(*receipt.participant));
+	receipt.receipt->state = CTRC_RECEIPT_BLOCKED;
+	UT_ASSERT(oldest_read_actual_snapshot(&age, &count, &origin));
+	UT_ASSERT_EQ(age, 5000);
+	UT_ASSERT_EQ(count, 1);
+
+	for (unsigned domain = 0; domain < 3; domain++) {
+#ifdef CLUSTER_CTRC_UNSETTLED_AGE_STATS_V1
+		uint64 *born;
+#endif
+
+		reset_fixture();
+		entry = seed_origin(0, 1);
+		UT_ASSERT_EQ(prepare_fixture_receipt(entry, 802, &receipt), CLUSTER_CTRC_PREPARE_READY);
+		test_now_us = UINT64_C(8000000);
+		UT_ASSERT(oldest_read_actual_snapshot(&age, &count, &origin));
+#ifdef CLUSTER_CTRC_UNSETTLED_AGE_STATS_V1
+		born = domain == 0	 ? &entry->diagnostic_born_us
+			   : domain == 1 ? &receipt.participant->diagnostic_born_us
+							 : &receipt.receipt->diagnostic_born_us;
+
+		*born = 0;
+#endif
+		age = count = UINT64_MAX;
+		origin = -1;
+		UT_ASSERT(!oldest_read_actual_snapshot(&age, &count, &origin));
+		UT_ASSERT_EQ(age, UINT64_MAX);
+		UT_ASSERT_EQ(count, UINT64_MAX);
+		UT_ASSERT_EQ(origin, -1);
+		UT_ASSERT(cluster_ctrc_debug_snapshot(&snapshot));
+		UT_ASSERT(snapshot.unsettled_stats_available);
+		UT_ASSERT_EQ(snapshot.unsettled_count, 3);
+#ifdef CLUSTER_CTRC_UNSETTLED_AGE_STATS_V1
+		*born = UINT64_C(9000000);
+#endif
+		UT_ASSERT(!oldest_read_actual_snapshot(&age, &count, &origin));
+		UT_ASSERT_EQ(age, UINT64_MAX);
+	}
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_oldest_age_keeps_real_certificate_tail_and_zero_receipt_close)
+{
+	ClusterCtrcCloseDispatch dispatch;
+	ClusterCtrcSealReplyResult result;
+	ClusterCtrcOriginEntry model;
+	uint64 age = UINT64_MAX, count = UINT64_MAX, participant_index;
+	int32 origin = -1;
+
+	reset_fixture();
+	completion_prepare_original_origin(0, &dispatch);
+	test_now_us = UINT64_C(7000000);
+	UT_ASSERT(oldest_read_actual_snapshot(&age, &count, &origin));
+	UT_ASSERT_EQ(age, 6000);
+	UT_ASSERT_EQ(count, 3);
+	UT_ASSERT(cluster_ctrc_participant_certificate_batch_shared(&dispatch, 1, &result));
+	UT_ASSERT_EQ(result, CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED);
+	test_now_us = UINT64_C(8000000);
+	UT_ASSERT(oldest_read_actual_snapshot(&age, &count, &origin));
+	UT_ASSERT_EQ(age, 7000);
+	UT_ASSERT_EQ(count, 1);
+	UT_ASSERT(cluster_ctrc_origin_note_certificate_reply_shared(dispatch.request_id, 0, result));
+	UT_ASSERT(oldest_read_actual_snapshot(&age, &count, &origin));
+	UT_ASSERT_EQ(age, 0);
+	UT_ASSERT_EQ(count, 0);
+	UT_ASSERT(!cluster_ctrc_origin_note_certificate_reply_shared(dispatch.request_id, 0, result));
+
+	reset_fixture();
+	model = *seed_origin(1, 1);
+	MemSet(&ctrc_origin_entries()[1], 0, sizeof(model));
+	UT_ASSERT(ctrc_participant_index(&model.key, 0, &participant_index));
+	test_now_us = UINT64_C(3000000);
+	/* Invoke the real empty-participant CLOSE producer under its original
+ * lock. The incoming wire/admission and remote origin are boundaries. */
+	ctrc_participant_locks_acquire(ctrc_participant_lock_mask(participant_index));
+	UT_ASSERT_EQ(cluster_ctrc_participant_close_or_tombstone(
+					 &ctrc_participant_entries()[participant_index], &model.key, &model.touched[0],
+					 model.grant_generation, model.seal_generation),
+				 CLUSTER_CTRC_CLOSE_ACK_READY);
+	ctrc_participant_locks_release(ctrc_participant_lock_mask(participant_index));
+	test_now_us = UINT64_C(9000000);
+	UT_ASSERT(oldest_read_actual_snapshot(&age, &count, &origin));
+	UT_ASSERT_EQ(age, 6000);
+	UT_ASSERT_EQ(count, 1);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_oldest_age_requires_original_snapshot_clock_and_layout)
+{
+	ClusterCtrcSharedHeader *saved;
+	ClusterCtrcDebugSnapshot snapshot;
+	uint64 age = UINT64_MAX, count = UINT64_MAX;
+	int32 origin = -1;
+	int saved_node = cluster_node_id;
+
+	reset_fixture();
+	cluster_node_id = 3;
+	UT_ASSERT(oldest_read_actual_snapshot(&age, &count, &origin));
+	UT_ASSERT_EQ(age, 0);
+	UT_ASSERT_EQ(count, 0);
+	UT_ASSERT_EQ(origin, 3);
+	printf("# age_layout origin=%zu participant=%zu receipt=%zu snapshot=%zu region=" UINT64_FORMAT
+		   "\n",
+		   sizeof(ClusterCtrcOriginEntry), sizeof(ClusterCtrcParticipantEntry),
+		   sizeof(ClusterCtrcReceipt), sizeof(snapshot), CtrcShared->total_bytes);
+	for (unsigned fault = 0; fault < 7; fault++) {
+		age = count = UINT64_MAX;
+		origin = -1;
+		saved = CtrcShared;
+		if (fault == 0)
+			cluster_node_id = -1;
+		else if (fault == 1)
+			cluster_node_id = CLUSTER_CTRC_MAX_PARTICIPANTS;
+		else if (fault == 2)
+			CtrcShared = NULL;
+		else if (fault == 3)
+			CtrcShared->version--;
+		else if (fault == 4)
+			CtrcShared->total_bytes--;
+		else if (fault == 5)
+			pg_atomic_write_u32(&CtrcShared->test_barrier_phase, CTRC_TEST_BARRIER_COUNT);
+		else
+			test_now_us = 0;
+		UT_ASSERT(!oldest_read_actual_snapshot(&age, &count, &origin));
+		UT_ASSERT_EQ(age, UINT64_MAX);
+		UT_ASSERT_EQ(count, UINT64_MAX);
+		UT_ASSERT_EQ(origin, -1);
+		CtrcShared = saved;
+		if (fault == 3)
+			CtrcShared->version++;
+		if (fault == 4)
+			CtrcShared->total_bytes++;
+		pg_atomic_write_u32(&CtrcShared->test_barrier_phase, CTRC_TEST_BARRIER_NONE);
+		cluster_node_id = 3;
+		test_now_us = UINT64_C(1000000);
+	}
+	cluster_node_id = 0;
+	test_now_us = 0;
+	(void)seed_origin(0, 0);
+	test_now_us = UINT64_C(8000000);
+	UT_ASSERT(!oldest_read_actual_snapshot(&age, &count, &origin));
+	UT_ASSERT(cluster_ctrc_debug_snapshot(&snapshot));
+	UT_ASSERT(snapshot.unsettled_stats_available);
+	UT_ASSERT_EQ(snapshot.unsettled_count, 1);
+	cluster_node_id = saved_node;
+	UT_ASSERT_EQ(held_count, 0);
+}
+
 int
 main(void)
 {
@@ -7780,7 +8024,7 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(182);
+	UT_PLAN(186);
 	UT_RUN(test_bounded_pool_selectors_observe_work_after_intervening_unlock);
 	UT_RUN(test_empty_bounded_pool_scan_keeps_round_robin_position);
 	UT_RUN(test_empty_pool_selectors_cancel_without_retaining_shared_locks);
@@ -7968,6 +8212,10 @@ main(void)
 	UT_RUN(test_unsettled_gauge_keeps_shared_responsibilities_until_original_retirement);
 	UT_RUN(test_unsettled_gauge_retains_reservations_phases_and_opaque_occupancy);
 	UT_RUN(test_unsettled_gauge_availability_requires_original_snapshot_success);
+	UT_RUN(test_oldest_age_keeps_reservation_start_until_cancel_or_original_retirement);
+	UT_RUN(test_oldest_age_observes_each_domain_and_never_turns_missing_birth_into_zero);
+	UT_RUN(test_oldest_age_keeps_real_certificate_tail_and_zero_receipt_close);
+	UT_RUN(test_oldest_age_requires_original_snapshot_clock_and_layout);
 	free(CtrcShared);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
