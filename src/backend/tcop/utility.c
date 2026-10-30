@@ -86,7 +86,7 @@ ProcessUtility_hook_type ProcessUtility_hook = NULL;
 /* PGRAC: inspect the complete user command before event triggers or DDL writes.
  * Internal btree rebuilds (for example TRUNCATE) do not use a ReindexStmt.
  * Author: SqlRush <sqlrush@gmail.com> */
-static void
+void
 CheckClusterSharedUtilitySupport(Node *statement, bool isTopLevel)
 {
 	const char *unsupported = NULL;

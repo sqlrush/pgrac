@@ -908,7 +908,8 @@ test_cluster_create_utility_entry.inc: $(top_srcdir)/src/backend/tcop/utility.c 
 	     emit { print } /^}/ { inside=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 test_cluster_shared_utility.inc: $(top_srcdir)/src/backend/tcop/utility.c Makefile
-	awk '/^CheckClusterSharedUtilitySupport\(/ { print "static void"; emit=1; count++ } \
+	awk '/^(static )?void$$/ { declaration=$$0 } \
+	     /^CheckClusterSharedUtilitySupport\(/ { print declaration; emit=1; count++ } \
 	     /^ClassifyUtilityCommandAsReadOnly\(/ { print "static int"; emit=1; classify++ } \
 	     /^PreflightClusterSharedCatalog(Create|Write)\(/ \
 	     { print "static void"; emit=1; preflight++ } \
@@ -946,6 +947,14 @@ test_cluster_fresh_extension.inc: $(top_srcdir)/src/backend/commands/extension.c
 	     { print "return InvalidObjectAddress; }"; emit=0; contents=0; cuts++ } \
 	     /^}/ { emit=0 } \
 	     END { if (entries != 3 || cuts != 3 || helper != 1 || validator != 1 || create != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_schema_create.inc: $(top_srcdir)/src/backend/commands/schemacmds.c Makefile
+	awk '/^CreateSchemaCommand\(/ { print "Oid"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /GetUserIdAndSecContext\(&saved_uid, &save_sec_context\);/ \
+	     { print "return InvalidOid; }"; emit=0; cuts++ } \
+	     /^}/ { if (emit) bad++; emit=0 } \
+	     END { if (entries != 1 || cuts != 1 || emit || bad) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 test_cluster_fresh_schema.inc: $(top_srcdir)/src/backend/commands/schemacmds.c Makefile
 	awk '/^PreflightClusterSharedSchemaWrite\(/ { print "static void"; emit=1; helper++ } \
@@ -1565,7 +1574,7 @@ test_cluster_fresh_scope: test_cluster_fresh_scope.c unit_test.h \
 		test_cluster_fresh_catalog_index.inc test_cluster_shared_utility.inc \
 		test_cluster_create_utility_entry.inc test_cluster_fresh_import.inc \
 		test_cluster_fresh_import_filter.inc test_cluster_fresh_extension.inc \
-		test_cluster_fresh_schema.inc test_cluster_fresh_comment.inc test_cluster_fresh_seclabel.inc \
+		test_cluster_fresh_schema_create.inc test_cluster_fresh_schema.inc test_cluster_fresh_comment.inc test_cluster_fresh_seclabel.inc \
 		test_cluster_fresh_policy.inc test_cluster_fresh_conversion.inc test_cluster_fresh_collation.inc \
 		test_cluster_fresh_event_trigger.inc test_cluster_fresh_owner.inc test_cluster_fresh_object_depends.inc test_cluster_fresh_acl_grant.inc test_cluster_fresh_default_privileges.inc test_cluster_fresh_rename_tag.inc test_cluster_fresh_rename_dispatch.inc test_cluster_fresh_schema_dispatch.inc test_cluster_fresh_language.inc \
 		test_cluster_fresh_access_method.inc test_cluster_fresh_function.inc test_cluster_fresh_fdw.inc \
@@ -6880,7 +6889,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_fresh_control.inc test_cluster_fresh_startup.inc test_cluster_fresh_read.inc \
 		test_cluster_fresh_boolean.inc test_cluster_fresh_index.inc test_cluster_fresh_utility.inc \
 		test_cluster_fresh_catalog_index.inc test_cluster_shared_utility.inc \
-		test_cluster_fresh_schema.inc test_cluster_fresh_comment.inc test_cluster_fresh_seclabel.inc \
+		test_cluster_fresh_schema_create.inc test_cluster_fresh_schema.inc test_cluster_fresh_comment.inc test_cluster_fresh_seclabel.inc \
 		test_cluster_fresh_policy.inc test_cluster_fresh_conversion.inc test_cluster_fresh_collation.inc \
 		test_cluster_fresh_event_trigger.inc test_cluster_fresh_owner.inc test_cluster_fresh_object_depends.inc test_cluster_fresh_acl_grant.inc test_cluster_fresh_default_privileges.inc test_cluster_fresh_rename_tag.inc test_cluster_fresh_rename_dispatch.inc test_cluster_fresh_schema_dispatch.inc test_cluster_fresh_language.inc \
 		test_cluster_fresh_access_method.inc test_cluster_fresh_function.inc test_cluster_fresh_fdw.inc \

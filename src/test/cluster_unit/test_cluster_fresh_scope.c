@@ -95,6 +95,7 @@
 #include "executor/execdesc.h"
 #include "foreign/fdwapi.h"
 #include "foreign/foreign.h"
+#include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/value.h"
@@ -22521,10 +22522,451 @@ UT_TEST(test_native_truncate_utility_warm_guards_preserve_binding)
 	truncate_lookup_active = false;
 }
 
+/* Real CREATE SCHEMA root prefix. The user/context dependency is a
+ * negative boundary before any role, permission or namespace query. */
+char *namespace_search_path = "public";
+static bool schema_create_lookup_active, schema_create_expect_binding;
+static unsigned schema_create_lookups, schema_create_unbound, schema_create_bad_lookup;
+
+void
+GetUserIdAndSecContext(Oid *userid, int *sec_context)
+{
+	schema_create_lookups++;
+	if (schema_create_expect_binding
+		&& (utility_binds == 0 || !TransactionIdIsValid(utility_top_xid)
+			|| utility_current_xid != utility_top_xid))
+		schema_create_unbound++;
+	if (!schema_create_lookup_active || userid == NULL || sec_context == NULL
+		|| (void *)userid == (void *)sec_context)
+		schema_create_bad_lookup++;
+	siglongjmp(boundary, 2); /* No user identity, query or permission success is supplied. */
+}
+
+#include "test_cluster_fresh_schema_create.inc"
+static struct {
+	CreateSchemaStmt statement;
+	RoleSpec owner;
+	CreateStmt table;
+	IndexStmt index;
+	IndexElem index_column;
+	CreateSeqStmt sequence;
+	CreateTrigStmt trigger;
+	GrantStmt grant;
+	ViewStmt view;
+	SelectStmt select;
+	Constraint constraint;
+	ColumnDef column;
+	TypeName column_type;
+	RangeVar relations[6];
+	String function_name;
+	ListCell children[6], function_cell, index_cell, object_cell, grantee_cell;
+	ListCell parent_cell, constraint_cell, column_cell;
+} schema_create_case, schema_create_before;
+static List schema_create_elements, schema_create_function_names, schema_create_index_columns;
+static List schema_create_grant_objects, schema_create_grantees, schema_create_parents;
+static List schema_create_constraints, schema_create_columns;
+static List *const schema_create_lists[]
+	= { &schema_create_elements,	  &schema_create_function_names, &schema_create_index_columns,
+		&schema_create_grant_objects, &schema_create_grantees,		 &schema_create_parents,
+		&schema_create_constraints,	  &schema_create_columns };
+static unsigned char schema_create_list_headers_before[8][sizeof(List)];
+static Node *schema_create_expected_statement;
+static const char *schema_create_query;
+static int schema_create_location, schema_create_length;
+
+static void
+copy_schema_create_before(void)
+{
+	memcpy(&schema_create_before, &schema_create_case, sizeof(schema_create_case));
+	for (unsigned i = 0; i < lengthof(schema_create_lists); i++)
+		memcpy(schema_create_list_headers_before[i], schema_create_lists[i], sizeof(List));
+}
+
+static void
+reset_native_schema_create(bool expect_binding, unsigned form)
+{
+	static const char *names[] = { "schema_table", "schema_table", "schema_sequence",
+								   "schema_table", "schema_table", "schema_view" };
+	unsigned shape = form % 7;
+
+	reset_create_preflight();
+	schema_create_lookup_active = false;
+	schema_create_expect_binding = expect_binding;
+	schema_create_lookups = schema_create_unbound = schema_create_bad_lookup = 0;
+	memset(&schema_create_case, 0, sizeof(schema_create_case));
+	for (unsigned i = 0; i < lengthof(schema_create_lists); i++)
+		memset(schema_create_lists[i], 0, sizeof(List));
+	schema_create_case.owner
+		= (RoleSpec){ .type = T_RoleSpec,
+					  .roletype = shape == 0 || shape == 2 || shape == 5 ? ROLESPEC_CURRENT_USER
+								  : shape == 3 || shape == 6			 ? ROLESPEC_SESSION_USER
+																		 : ROLESPEC_CSTRING,
+					  .rolename = shape == 1 || shape == 4 ? "schema_owner" : NULL,
+					  .location = -1 };
+	for (unsigned i = 0; i < 6; i++)
+		schema_create_case.relations[i] = (RangeVar){ .type = T_RangeVar,
+													  .relname = (char *)names[i],
+													  .inh = true,
+													  .relpersistence = RELPERSISTENCE_PERMANENT,
+													  .location = -1 };
+	schema_create_case.table = (CreateStmt){ .type = T_CreateStmt,
+											 .relation = &schema_create_case.relations[0],
+											 .oncommit = ONCOMMIT_NOOP };
+	schema_create_case.index_column = (IndexElem){ .type = T_IndexElem,
+												   .name = "id",
+												   .ordering = SORTBY_DEFAULT,
+												   .nulls_ordering = SORTBY_NULLS_DEFAULT };
+	one_element(&schema_create_index_columns, &schema_create_case.index_cell,
+				&schema_create_case.index_column);
+	schema_create_case.index = (IndexStmt){ .type = T_IndexStmt,
+											.relation = &schema_create_case.relations[1],
+											.idxname = "schema_index",
+											.accessMethod = "btree",
+											.indexParams = &schema_create_index_columns };
+	schema_create_case.sequence
+		= (CreateSeqStmt){ .type = T_CreateSeqStmt, .sequence = &schema_create_case.relations[2] };
+	schema_create_case.function_name = (String){ .type = T_String, .sval = "schema_trigger_fn" };
+	one_element(&schema_create_function_names, &schema_create_case.function_cell,
+				&schema_create_case.function_name);
+	schema_create_case.trigger = (CreateTrigStmt){ .type = T_CreateTrigStmt,
+												   .relation = &schema_create_case.relations[3],
+												   .trigname = "schema_trigger",
+												   .funcname = &schema_create_function_names,
+												   .row = true,
+												   .timing = TRIGGER_TYPE_AFTER,
+												   .events = TRIGGER_TYPE_INSERT };
+	one_element(&schema_create_grant_objects, &schema_create_case.object_cell,
+				&schema_create_case.relations[4]);
+	one_element(&schema_create_grantees, &schema_create_case.grantee_cell,
+				&schema_create_case.owner);
+	schema_create_case.grant = (GrantStmt){ .type = T_GrantStmt,
+											.is_grant = true,
+											.targtype = ACL_TARGET_OBJECT,
+											.objtype = OBJECT_TABLE,
+											.objects = &schema_create_grant_objects,
+											.grantees = &schema_create_grantees,
+											.behavior = DROP_RESTRICT };
+	schema_create_case.select = (SelectStmt){ .type = T_SelectStmt, .op = SETOP_NONE };
+	schema_create_case.view = (ViewStmt){ .type = T_ViewStmt,
+										  .view = &schema_create_case.relations[5],
+										  .query = (Node *)&schema_create_case.select };
+	schema_create_case.children[0].ptr_value = &schema_create_case.table;
+	schema_create_case.children[1].ptr_value = &schema_create_case.index;
+	schema_create_case.children[2].ptr_value = &schema_create_case.sequence;
+	schema_create_case.children[3].ptr_value = &schema_create_case.trigger;
+	schema_create_case.children[4].ptr_value = &schema_create_case.grant;
+	schema_create_case.children[5].ptr_value = &schema_create_case.view;
+	schema_create_elements = (List){ .type = T_List,
+									 .length = form >= 14 && (form - 14) % 7 == 6 ? 6 : 1,
+									 .max_length = form >= 14 && (form - 14) % 7 != 6 ? 1 : 6,
+									 .elements = form >= 14 && (form - 14) % 7 != 6
+													 ? &schema_create_case.children[(form - 14) % 7]
+													 : schema_create_case.children };
+	schema_create_case.statement
+		= (CreateSchemaStmt){ .type = T_CreateSchemaStmt,
+							  .schemaname = shape < 4 ? "native_created_schema" : NULL,
+							  .authrole = shape == 0 ? NULL : &schema_create_case.owner,
+							  .schemaElts = form >= 14 ? &schema_create_elements : NIL,
+							  .if_not_exists = form >= 7 && form < 14 };
+	schema_create_query = (form & 1) != 0 ? "CREATE SCHEMA native_created_schema"
+										  : "(generated CREATE SCHEMA command)";
+	schema_create_location = (form & 1) != 0 ? 0 : -1;
+	schema_create_length = (form & 1) != 0 ? 42 : -1;
+	schema_create_expected_statement = (Node *)&schema_create_case.statement;
+	copy_schema_create_before();
+}
+
+static void
+native_schema_create_entry(void)
+{
+	schema_create_lookup_active = true;
+	(void)CreateSchemaCommand(&schema_create_case.statement, schema_create_query,
+							  schema_create_location, schema_create_length);
+}
+
+static void
+assert_native_schema_create_unchanged(void)
+{
+	UT_ASSERT_EQ(memcmp(&schema_create_case, &schema_create_before, sizeof(schema_create_case)), 0);
+	for (unsigned i = 0; i < lengthof(schema_create_lists); i++)
+		UT_ASSERT_EQ(
+			memcmp(schema_create_lists[i], schema_create_list_headers_before[i], sizeof(List)), 0);
+}
+
+UT_TEST(test_native_schema_create_binds_before_first_lock_in_all_profiles)
+{
+	for (unsigned form = 0; form < 28; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_schema_create(binds, form);
+			set_native_operator_mode(mode);
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_schema_create_entry();
+				assert_native_schema_create_unchanged();
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(schema_create_lookups, repeat + 1);
+				UT_ASSERT_EQ(schema_create_unbound, 0);
+				UT_ASSERT_EQ(schema_create_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	schema_create_lookup_active = false;
+}
+
+UT_TEST(test_native_schema_create_refuses_before_lock_on_publication_child_and_top_errors)
+{
+	for (unsigned form = 0; form < 28; form++) {
+		for (unsigned failure = 0; failure < 5; failure++) {
+			bool allocated = failure == 0 || failure == 2;
+			int caught;
+
+			reset_native_schema_create(true, form);
+			if (failure == 0)
+				utility_bind_ok = false;
+			else if (failure == 1 || failure == 2) {
+				if (failure == 2)
+					create_sql_entry(schema_create_expected_statement);
+				utility_in_child = true;
+			} else {
+				utility_current_xid = 401;
+				utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_schema_create_entry();
+			assert_native_schema_create_unchanged();
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, failure == 0  ? ERRCODE_DATA_CORRUPTED
+									 : failure < 3 ? ERRCODE_FEATURE_NOT_SUPPORTED
+												   : ERRCODE_INTERNAL_ERROR);
+			UT_ASSERT_STR_EQ(
+				error_message,
+				failure == 0  ? "canonical ACTIVE publication failed before shared catalog creation"
+				: failure < 3 ? "shared catalog creation does not support subtransactions"
+							  : "shared catalog top-level transaction identity mismatch");
+			UT_ASSERT_EQ(schema_create_lookups, 0);
+			UT_ASSERT_EQ(schema_create_unbound + schema_create_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_xids, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, failure == 2 ? 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, allocated || failure == 3 ? 400 : InvalidTransactionId);
+		}
+	}
+	schema_create_lookup_active = false;
+}
+
+UT_TEST(test_native_schema_create_context_guards_keep_nonshared_route)
+{
+	for (unsigned form = 0; form < 28; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+
+			for (unsigned guard = 0; guard < 3; guard++) {
+				int caught;
+
+				reset_native_schema_create(binds, form);
+				set_native_operator_mode(mode);
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_schema_create_entry();
+				assert_native_schema_create_unchanged();
+				UT_ASSERT_EQ(caught, binds ? 1 : 2);
+				UT_ASSERT_EQ(error_code, !binds		  ? 0
+										 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+													  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				UT_ASSERT_EQ(schema_create_lookups, binds ? 0 : 1);
+				UT_ASSERT_EQ(schema_create_unbound + schema_create_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	schema_create_lookup_active = false;
+}
+
+UT_TEST(test_native_schema_create_utility_warm_guards_preserve_binding)
+{
+	for (unsigned form = 0; form < 28; form++) {
+		for (unsigned guard = 0; guard < 4; guard++) {
+			int caught;
+
+			reset_native_schema_create(true, form);
+			create_sql_entry(schema_create_expected_statement);
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			XactReadOnly = guard == 1;
+			utility_parallel = guard == 2;
+			utility_recovery = guard == 3;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_schema_create_entry();
+			assert_native_schema_create_unchanged();
+			UT_ASSERT_EQ(caught, guard ? 1 : 2);
+			UT_ASSERT_EQ(error_code, !guard		  ? 0
+									 : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+												  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT_EQ(schema_create_lookups, guard ? 0 : 1);
+			UT_ASSERT_EQ(schema_create_unbound + schema_create_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_prepares, guard ? 1 : 2);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			UT_ASSERT_EQ(utility_top_xid, 400);
+		}
+	}
+	schema_create_lookup_active = false;
+}
+
+static void
+set_unsupported_schema_child(unsigned kind, unsigned position)
+{
+	unsigned child = kind == 2 || kind == 3 ? 1 : kind == 4 ? 2 : 0;
+	ListCell saved;
+
+	if (kind == 0)
+		schema_create_case.relations[0].relpersistence = RELPERSISTENCE_UNLOGGED;
+	else if (kind == 1) {
+		one_element(&schema_create_parents, &schema_create_case.parent_cell,
+					&schema_create_case.relations[4]);
+		schema_create_case.table.inhRelations = &schema_create_parents;
+	} else if (kind == 2)
+		schema_create_case.index.accessMethod = "gin";
+	else if (kind == 3)
+		schema_create_case.index.concurrent = true;
+	else if (kind == 4)
+		schema_create_case.relations[2].relpersistence = RELPERSISTENCE_UNLOGGED;
+	else {
+		schema_create_case.constraint
+			= (Constraint){ .type = T_Constraint,
+							.contype = kind == 5 ? CONSTR_UNIQUE : CONSTR_PRIMARY,
+							.access_method = "hash" };
+		one_element(&schema_create_constraints, &schema_create_case.constraint_cell,
+					&schema_create_case.constraint);
+		if (kind == 5)
+			schema_create_case.table.constraints = &schema_create_constraints;
+		else {
+			schema_create_case.column_type = (TypeName){ .type = T_TypeName,
+														 .typeOid = INT4OID,
+														 .typemod = -1,
+														 .location = -1 };
+			schema_create_case.column = (ColumnDef){ .type = T_ColumnDef,
+													 .colname = "id",
+													 .typeName = &schema_create_case.column_type,
+													 .constraints = &schema_create_constraints };
+			one_element(&schema_create_columns, &schema_create_case.column_cell,
+						&schema_create_case.column);
+			schema_create_case.table.tableElts = &schema_create_columns;
+		}
+	}
+	/* Put the denied child both first and last in the real six-class list. */
+	position = position == 0 ? 0 : 5;
+	saved = schema_create_case.children[position];
+	schema_create_case.children[position] = schema_create_case.children[child];
+	schema_create_case.children[child] = saved;
+	copy_schema_create_before();
+}
+
+static bool
+schema_child_refused(unsigned kind, unsigned mode)
+{
+	static const bool shared_modes[] = { false, true, false, true, true, true, true, true };
+	static const bool catalog_modes[] = { false, true, false, true, false, true, false, true };
+
+	return kind == 4 ? catalog_modes[mode] : shared_modes[mode];
+}
+
+static void
+assert_schema_child_result(unsigned kind, bool refused, int caught)
+{
+	static const char *messages[]
+		= { "UNLOGGED tables is not supported in shared mode",
+			"partition and inheritance attachment is not supported in shared mode",
+			"shared mode supports only btree indexes",
+			"concurrent index creation or reindexing is not supported in shared mode",
+			"UNLOGGED sequences is not supported in shared mode",
+			"shared mode supports only btree indexes",
+			"shared mode supports only btree indexes" };
+
+	UT_ASSERT_EQ(caught, refused ? 1 : 2);
+	UT_ASSERT_EQ(error_code, refused ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+	if (refused)
+		UT_ASSERT_STR_EQ(error_message, messages[kind]);
+	UT_ASSERT_EQ(schema_create_lookups, refused ? 0 : 1);
+	UT_ASSERT_EQ(schema_create_unbound + schema_create_bad_lookup, 0);
+	assert_native_schema_create_unchanged();
+}
+
+UT_TEST(test_native_schema_create_denied_children_precede_allocation_and_context_errors)
+{
+	for (unsigned kind = 0; kind < 7; kind++) {
+		for (unsigned position = 0; position < 2; position++) {
+			for (unsigned mode = 0; mode < 8; mode++) {
+				for (unsigned fault = 0; fault < 6; fault++) {
+					int caught;
+
+					reset_native_schema_create(false, 27);
+					set_unsupported_schema_child(kind, position);
+					set_native_operator_mode(mode);
+					XactReadOnly = fault == 1;
+					utility_parallel = fault == 2;
+					utility_recovery = fault == 3;
+					utility_in_child = fault == 4;
+					utility_bind_ok = fault != 5;
+					caught = sigsetjmp(boundary, 1);
+					if (!caught)
+						native_schema_create_entry();
+					assert_schema_child_result(kind, schema_child_refused(kind, mode), caught);
+					UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+				}
+			}
+		}
+	}
+	schema_create_lookup_active = false;
+}
+
+UT_TEST(test_native_schema_create_denied_children_preserve_existing_top_binding)
+{
+	CreateSchemaStmt warm = { .type = T_CreateSchemaStmt, .schemaname = "warm_schema" };
+
+	for (unsigned kind = 0; kind < 7; kind++) {
+		for (unsigned position = 0; position < 2; position++) {
+			for (unsigned mode = 0; mode < 8; mode++) {
+				int caught;
+
+				reset_native_schema_create(false, 27);
+				create_sql_entry((Node *)&warm);
+				set_unsupported_schema_child(kind, position);
+				set_native_operator_mode(mode);
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_schema_create_entry();
+				assert_schema_child_result(kind, schema_child_refused(kind, mode), caught);
+				UT_ASSERT_EQ(utility_xids, 1);
+				UT_ASSERT_EQ(utility_prepares, 1);
+				UT_ASSERT_EQ(utility_binds, 1);
+				UT_ASSERT_EQ(utility_top_xid, 400);
+				UT_ASSERT_EQ(utility_current_xid, 400);
+			}
+		}
+	}
+	schema_create_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(361);
+	UT_PLAN(367);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -22889,6 +23331,12 @@ main(void)
 	UT_RUN(test_native_truncate_refuses_before_lock_on_publication_child_and_top_errors);
 	UT_RUN(test_native_truncate_context_guards_keep_nonshared_route);
 	UT_RUN(test_native_truncate_utility_warm_guards_preserve_binding);
+	UT_RUN(test_native_schema_create_binds_before_first_lock_in_all_profiles);
+	UT_RUN(test_native_schema_create_refuses_before_lock_on_publication_child_and_top_errors);
+	UT_RUN(test_native_schema_create_context_guards_keep_nonshared_route);
+	UT_RUN(test_native_schema_create_utility_warm_guards_preserve_binding);
+	UT_RUN(test_native_schema_create_denied_children_precede_allocation_and_context_errors);
+	UT_RUN(test_native_schema_create_denied_children_preserve_existing_top_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
