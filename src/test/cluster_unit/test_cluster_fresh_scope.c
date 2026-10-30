@@ -22963,10 +22963,417 @@ UT_TEST(test_native_schema_create_denied_children_preserve_existing_top_binding)
 	schema_create_lookup_active = false;
 }
 
+/* Actual ordinary-table creation prefix, ending before a namespace query
+ * can supply a catalog identity or acquire a lock. Other relation kinds
+ * keep their existing caller responsibility. */
+static bool relation_create_lookup_active, relation_create_expect_binding;
+static unsigned relation_create_lookups, relation_create_unbound, relation_create_bad_lookup;
+static RangeVar *relation_create_expected_relation;
+
+Oid
+RangeVarGetAndCheckCreationNamespace(RangeVar *newRelation, LOCKMODE lockmode,
+									 Oid *existing_relation_id)
+{
+	relation_create_lookups++;
+	if (relation_create_expect_binding
+		&& (utility_binds == 0 || !TransactionIdIsValid(utility_top_xid)
+			|| utility_current_xid != utility_top_xid))
+		relation_create_unbound++;
+	if (!relation_create_lookup_active || newRelation != relation_create_expected_relation
+		|| lockmode != NoLock || existing_relation_id != NULL)
+		relation_create_bad_lookup++;
+	siglongjmp(boundary, 2); /* No namespace or permission success is supplied. */
+}
+
+#include "test_cluster_fresh_relation_create.inc"
+static struct {
+	CreateStmt statement;
+	RangeVar relation, parent;
+	ColumnDef column;
+	TypeName column_type;
+	PartitionSpec partition;
+	PartitionElem partition_column;
+	Constraint constraint;
+	String key_name;
+	ListCell column_cell, partition_cell, parent_cell, constraint_cell, key_cell;
+	ObjectAddress type_address;
+	Oid owner_id;
+	char relkind;
+} relation_create_case, relation_create_before;
+static List relation_create_columns, relation_create_partition_columns;
+static List relation_create_parents, relation_create_constraints, relation_create_keys;
+static List *const relation_create_lists[]
+	= { &relation_create_columns, &relation_create_partition_columns, &relation_create_parents,
+		&relation_create_constraints, &relation_create_keys };
+static unsigned char relation_create_list_headers_before[5][sizeof(List)];
+static Node *relation_create_expected_statement;
+static ObjectAddress *relation_create_type_address;
+static const char *relation_create_query;
+
+static void
+snapshot_native_relation_create(void)
+{
+	memcpy(&relation_create_before, &relation_create_case, sizeof(relation_create_case));
+	for (unsigned i = 0; i < lengthof(relation_create_lists); i++)
+		memcpy(relation_create_list_headers_before[i], relation_create_lists[i], sizeof(List));
+}
+
+static void
+reset_native_relation_create(bool expect_binding, unsigned form)
+{
+	reset_create_preflight();
+	relation_create_lookup_active = false;
+	relation_create_expect_binding = expect_binding;
+	relation_create_lookups = relation_create_unbound = relation_create_bad_lookup = 0;
+	memset(&relation_create_case, 0, sizeof(relation_create_case));
+	for (unsigned i = 0; i < lengthof(relation_create_lists); i++)
+		memset(relation_create_lists[i], 0, sizeof(List));
+	relation_create_case.relation
+		= (RangeVar){ .type = T_RangeVar,
+					  .schemaname = "public",
+					  .relname = "native_created_table",
+					  .inh = true,
+					  .relpersistence = (form & 1) ? RELPERSISTENCE_TEMP : RELPERSISTENCE_PERMANENT,
+					  .location = -1 };
+	relation_create_case.parent = (RangeVar){ .type = T_RangeVar,
+											  .schemaname = "public",
+											  .relname = "native_parent_table",
+											  .inh = true,
+											  .relpersistence = RELPERSISTENCE_PERMANENT,
+											  .location = -1 };
+	relation_create_case.column_type
+		= (TypeName){ .type = T_TypeName, .typeOid = INT4OID, .typemod = -1, .location = -1 };
+	relation_create_case.column = (ColumnDef){ .type = T_ColumnDef,
+											   .colname = "id",
+											   .typeName = &relation_create_case.column_type,
+											   .inhcount = 0,
+											   .is_local = true,
+											   .location = -1 };
+	one_element(&relation_create_columns, &relation_create_case.column_cell,
+				&relation_create_case.column);
+	relation_create_case.partition_column
+		= (PartitionElem){ .type = T_PartitionElem, .name = "id", .location = -1 };
+	one_element(&relation_create_partition_columns, &relation_create_case.partition_cell,
+				&relation_create_case.partition_column);
+	relation_create_case.partition
+		= (PartitionSpec){ .type = T_PartitionSpec,
+						   .strategy = PARTITION_STRATEGY_RANGE,
+						   .partParams = &relation_create_partition_columns,
+						   .location = -1 };
+	relation_create_case.statement
+		= (CreateStmt){ .type = T_CreateStmt,
+						.relation = &relation_create_case.relation,
+						.tableElts = &relation_create_columns,
+						.partspec = (form & 2) ? &relation_create_case.partition : NULL,
+						.oncommit = ONCOMMIT_NOOP,
+						.if_not_exists = (form & 16) != 0 };
+	relation_create_case.owner_id = (form & 4) ? 501 : InvalidOid;
+	relation_create_case.type_address = (ObjectAddress){ TypeRelationId, 909, 7 };
+	relation_create_type_address = (form & 8) ? &relation_create_case.type_address : NULL;
+	relation_create_query = (form & 16) ? "CREATE TABLE native_created_table (id int)" : NULL;
+	relation_create_case.relkind = RELKIND_RELATION;
+	relation_create_expected_relation = &relation_create_case.relation;
+	relation_create_expected_statement = (Node *)&relation_create_case.statement;
+	snapshot_native_relation_create();
+}
+
+static void
+native_relation_create_entry(void)
+{
+	relation_create_lookup_active = true;
+	(void)DefineRelation(&relation_create_case.statement, relation_create_case.relkind,
+						 relation_create_case.owner_id, relation_create_type_address,
+						 relation_create_query);
+}
+
+static void
+assert_native_relation_create_unchanged(void)
+{
+	UT_ASSERT_EQ(
+		memcmp(&relation_create_case, &relation_create_before, sizeof(relation_create_case)), 0);
+	for (unsigned i = 0; i < lengthof(relation_create_lists); i++)
+		UT_ASSERT_EQ(
+			memcmp(relation_create_lists[i], relation_create_list_headers_before[i], sizeof(List)),
+			0);
+}
+
+UT_TEST(test_native_relation_create_binds_before_first_lock_in_all_profiles)
+{
+	for (unsigned form = 0; form < 32; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_relation_create(binds, form);
+			set_native_operator_mode(mode);
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_relation_create_entry();
+				assert_native_relation_create_unchanged();
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(relation_create_lookups, repeat + 1);
+				UT_ASSERT_EQ(relation_create_unbound, 0);
+				UT_ASSERT_EQ(relation_create_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	relation_create_lookup_active = false;
+}
+
+UT_TEST(test_native_relation_create_refuses_before_lock_on_publication_child_and_top_errors)
+{
+	for (unsigned form = 0; form < 32; form++) {
+		for (unsigned failure = 0; failure < 5; failure++) {
+			bool allocated = failure == 0 || failure == 2;
+			int caught;
+
+			reset_native_relation_create(true, form);
+			if (failure == 0)
+				utility_bind_ok = false;
+			else if (failure == 1 || failure == 2) {
+				if (failure == 2)
+					create_sql_entry(relation_create_expected_statement);
+				utility_in_child = true;
+			} else {
+				utility_current_xid = 401;
+				utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_relation_create_entry();
+			assert_native_relation_create_unchanged();
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, failure == 0  ? ERRCODE_DATA_CORRUPTED
+									 : failure < 3 ? ERRCODE_FEATURE_NOT_SUPPORTED
+												   : ERRCODE_INTERNAL_ERROR);
+			UT_ASSERT_STR_EQ(
+				error_message,
+				failure == 0  ? "canonical ACTIVE publication failed before shared catalog creation"
+				: failure < 3 ? "shared catalog creation does not support subtransactions"
+							  : "shared catalog top-level transaction identity mismatch");
+			UT_ASSERT_EQ(relation_create_lookups, 0);
+			UT_ASSERT_EQ(relation_create_unbound + relation_create_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_xids, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, failure == 2 ? 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, allocated || failure == 3 ? 400 : InvalidTransactionId);
+		}
+	}
+	relation_create_lookup_active = false;
+}
+
+UT_TEST(test_native_relation_create_context_guards_keep_nonshared_route)
+{
+	for (unsigned form = 0; form < 32; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+
+			for (unsigned guard = 0; guard < 3; guard++) {
+				int caught;
+
+				reset_native_relation_create(binds, form);
+				set_native_operator_mode(mode);
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_relation_create_entry();
+				assert_native_relation_create_unchanged();
+				UT_ASSERT_EQ(caught, binds ? 1 : 2);
+				UT_ASSERT_EQ(error_code, !binds		  ? 0
+										 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+													  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				UT_ASSERT_EQ(relation_create_lookups, binds ? 0 : 1);
+				UT_ASSERT_EQ(relation_create_unbound + relation_create_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	relation_create_lookup_active = false;
+}
+
+UT_TEST(test_native_relation_create_utility_warm_guards_preserve_binding)
+{
+	for (unsigned form = 0; form < 32; form++) {
+		for (unsigned guard = 0; guard < 4; guard++) {
+			int caught;
+
+			reset_native_relation_create(true, form);
+			create_sql_entry(relation_create_expected_statement);
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			XactReadOnly = guard == 1;
+			utility_parallel = guard == 2;
+			utility_recovery = guard == 3;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_relation_create_entry();
+			assert_native_relation_create_unchanged();
+			UT_ASSERT_EQ(caught, guard ? 1 : 2);
+			UT_ASSERT_EQ(error_code, !guard		  ? 0
+									 : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+												  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT_EQ(relation_create_lookups, guard ? 0 : 1);
+			UT_ASSERT_EQ(relation_create_unbound + relation_create_bad_lookup, 0);
+			UT_ASSERT_EQ(utility_prepares, guard ? 1 : 2);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			UT_ASSERT_EQ(utility_top_xid, 400);
+		}
+	}
+	relation_create_lookup_active = false;
+}
+
+static void
+set_unsupported_relation_creation(unsigned kind)
+{
+	if (kind == 0)
+		relation_create_case.relation.relpersistence = RELPERSISTENCE_UNLOGGED;
+	else if (kind == 1) {
+		one_element(&relation_create_parents, &relation_create_case.parent_cell,
+					&relation_create_case.parent);
+		relation_create_case.statement.inhRelations = &relation_create_parents;
+	} else {
+		relation_create_case.constraint = (Constraint){ .type = T_Constraint,
+														.contype = CONSTR_UNIQUE,
+														.access_method = "hash",
+														.location = -1 };
+		one_element(&relation_create_constraints, &relation_create_case.constraint_cell,
+					&relation_create_case.constraint);
+		if (kind == 2) {
+			relation_create_case.key_name = (String){ .type = T_String, .sval = "id" };
+			one_element(&relation_create_keys, &relation_create_case.key_cell,
+						&relation_create_case.key_name);
+			relation_create_case.constraint.keys = &relation_create_keys;
+			relation_create_case.statement.constraints = &relation_create_constraints;
+		} else
+			relation_create_case.column.constraints = &relation_create_constraints;
+	}
+	snapshot_native_relation_create();
+}
+
+static void
+assert_denied_relation_creation(unsigned kind, unsigned mode, int caught)
+{
+	static const bool shared_modes[8] = { false, true, false, true, true, true, true, true };
+	bool refused = shared_modes[mode];
+
+	UT_ASSERT_EQ(caught, refused ? 1 : 2);
+	UT_ASSERT_EQ(error_code, refused ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+	if (refused) {
+		UT_ASSERT_STR_EQ(
+			error_message,
+			kind == 0	? "UNLOGGED tables is not supported in shared mode"
+			: kind == 1 ? "partition and inheritance attachment is not supported in shared mode"
+						: "shared mode supports only btree indexes");
+		UT_ASSERT_STR_EQ(error_detail,
+						 kind < 2
+							 ? "PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED"
+							 : "Index access method \"hash\" is not supported in shared mode.");
+	}
+	UT_ASSERT_EQ(relation_create_lookups, refused ? 0 : 1);
+	UT_ASSERT_EQ(relation_create_unbound + relation_create_bad_lookup, 0);
+	assert_native_relation_create_unchanged();
+}
+
+UT_TEST(test_native_relation_create_denials_precede_context_and_allocation)
+{
+	for (unsigned kind = 0; kind < 4; kind++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			for (unsigned fault = 0; fault < 6; fault++) {
+				int caught;
+
+				reset_native_relation_create(false, 0);
+				set_unsupported_relation_creation(kind);
+				set_native_operator_mode(mode);
+				XactReadOnly = fault == 1;
+				utility_parallel = fault == 2;
+				utility_recovery = fault == 3;
+				utility_in_child = fault == 4;
+				utility_bind_ok = fault != 5;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_relation_create_entry();
+				assert_denied_relation_creation(kind, mode, caught);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	relation_create_lookup_active = false;
+}
+
+UT_TEST(test_native_relation_create_denials_preserve_existing_binding)
+{
+	for (unsigned kind = 0; kind < 4; kind++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			int caught;
+
+			reset_native_relation_create(false, 0);
+			create_sql_entry(relation_create_expected_statement);
+			set_unsupported_relation_creation(kind);
+			set_native_operator_mode(mode);
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_relation_create_entry();
+			assert_denied_relation_creation(kind, mode, caught);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			UT_ASSERT_EQ(utility_current_xid, 400);
+			UT_ASSERT_EQ(utility_top_xid, 400);
+		}
+	}
+	relation_create_lookup_active = false;
+}
+
+UT_TEST(test_native_relation_create_other_kinds_keep_caller_responsibility)
+{
+	const char kinds[] = { RELKIND_VIEW, RELKIND_SEQUENCE, RELKIND_FOREIGN_TABLE,
+						   RELKIND_COMPOSITE_TYPE, RELKIND_MATVIEW };
+
+	for (unsigned kind = 0; kind < lengthof(kinds); kind++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			for (unsigned warm = 0; warm < 2; warm++) {
+				int caught;
+
+				reset_native_relation_create(false, 0);
+				if (warm)
+					create_sql_entry(relation_create_expected_statement);
+				relation_create_case.relkind = kinds[kind];
+				snapshot_native_relation_create();
+				set_native_operator_mode(mode);
+				XactReadOnly = utility_parallel = utility_recovery = utility_in_child = true;
+				utility_bind_ok = false;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_relation_create_entry();
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(relation_create_lookups, 1);
+				UT_ASSERT_EQ(relation_create_unbound + relation_create_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids, warm);
+				UT_ASSERT_EQ(utility_prepares, warm);
+				UT_ASSERT_EQ(utility_binds, warm);
+				UT_ASSERT_EQ(utility_top_xid, warm ? 400 : InvalidTransactionId);
+				assert_native_relation_create_unchanged();
+			}
+		}
+	}
+	relation_create_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(367);
+	UT_PLAN(374);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -23337,6 +23744,13 @@ main(void)
 	UT_RUN(test_native_schema_create_utility_warm_guards_preserve_binding);
 	UT_RUN(test_native_schema_create_denied_children_precede_allocation_and_context_errors);
 	UT_RUN(test_native_schema_create_denied_children_preserve_existing_top_binding);
+	UT_RUN(test_native_relation_create_binds_before_first_lock_in_all_profiles);
+	UT_RUN(test_native_relation_create_refuses_before_lock_on_publication_child_and_top_errors);
+	UT_RUN(test_native_relation_create_context_guards_keep_nonshared_route);
+	UT_RUN(test_native_relation_create_utility_warm_guards_preserve_binding);
+	UT_RUN(test_native_relation_create_denials_precede_context_and_allocation);
+	UT_RUN(test_native_relation_create_denials_preserve_existing_binding);
+	UT_RUN(test_native_relation_create_other_kinds_keep_caller_responsibility);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

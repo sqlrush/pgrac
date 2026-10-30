@@ -713,6 +713,37 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	const char *accessMethod = NULL;
 	Oid			accessMethodId = InvalidOid;
 
+#ifdef USE_PGRAC_CLUSTER
+	/* Native table creation must bind before its first namespace lock.
+	 * Other relation kinds retain their existing caller preflight. */
+	if (relkind == RELKIND_RELATION) {
+		CheckClusterSharedUtilitySupport((Node *)stmt, false);
+		CheckClusterIndexSupport((Node *)stmt);
+		if (cluster_shared_catalog && cluster_storage_mode_enabled()) {
+			ClusterCanonicalTxnBinding binding;
+			TransactionId current_xid;
+
+			PreventCommandIfReadOnly("CREATE TABLE");
+			PreventCommandIfParallelMode("CREATE TABLE");
+			PreventCommandDuringRecovery("CREATE TABLE");
+			if (IsSubTransaction())
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("shared catalog creation does not support subtransactions")));
+			current_xid = GetCurrentTransactionIdIfAny();
+			if (TransactionIdIsValid(current_xid)
+				&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+				ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+								errmsg("shared catalog top-level transaction identity mismatch")));
+			if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+				ereport(
+					ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("canonical ACTIVE publication failed before shared catalog creation")));
+		}
+	}
+#endif
+
 	/*
 	 * Truncate relname to appropriate length (probably a waste of time, as
 	 * parser should have done this already).
