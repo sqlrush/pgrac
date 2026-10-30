@@ -309,6 +309,21 @@ extern struct RfPageCtrcOwnersV1 ClusterColdRecoveryCtrcPageOwners(
 struct RfPageCtrcOwnerReferencesV1;
 extern struct RfPageCtrcOwnerReferencesV1 ClusterColdRecoveryCtrcPageOwnerReferences(
 	const struct ClusterRecoveryStartV1 *start, Size memory_budget);
+
+/* Original complete PAGE owner/reference inventory plus full transaction and
+ * sealed contributor scope. Canonical owner keys use original ROOT source
+ * indexes and original decoded page-class/component ordinals; evidence joins
+ * the actual whole DATA readback and its original completion predicate.
+ * No caller-supplied subset, transaction, witness or success flag. Historical,
+ * FREE, tuple and unmatched references remain separate obligations. This does
+ * not establish full G_ref/non-PAGE/base/lifetime coverage or authorize D0.
+ * On success pfree entries, related.entries and related.owners.entries before
+ * the original Start/scope ends. Do not close their original backing FDs.
+ * Full simultaneous budget precedes PAGE; WAIT/refusal/ERROR publish no prefix
+ * and preserve original FD/allIR-WALR/pins-debt. */
+struct RfPageCtrcOwnerGraphV1;
+extern struct RfPageCtrcOwnerGraphV1 ClusterColdRecoveryCtrcPageOwnerGraph(
+	const struct ClusterRecoveryStartV1 *start, Size memory_budget);
 struct RfPageCtrcFpiInsertV1;
 struct ClusterSharedFsPageV1;
 /* Local immutable membership only: the ORIGINAL retained result address and

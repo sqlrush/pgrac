@@ -50,6 +50,7 @@ cluster_recovery_census_references_v1(ClusterRecoveryCensus *cursor)
 
 static unsigned observation_page_fault;
 static unsigned observation_page_wal_fault;
+static void (*owner_graph_wal_view)(uint32, ClusterRecoveryPageWalV1 *);
 static uint32 observation_page_wal_count;
 static XLogReaderState observation_page_wal_readers[2];
 static DecodedXLogRecord observation_page_wal_records[2];
@@ -112,6 +113,7 @@ cluster_recovery_census_page_wal_at_v1(ClusterRecoveryCensus *cursor, uint32 ind
 	out->raw_length = sizeof(observation_page_wal_raw[index]);
 	if (!cluster_recovery_native_raw_sha256_v1(out->raw_record, out->raw_length,
 		out->raw_record_sha256)) abort();
+	if (owner_graph_wal_view != NULL) owner_graph_wal_view(index, out);
 	if (observation_page_wal_fault == 6) out->raw_record = NULL;
 	if (observation_page_wal_fault == 7) out->raw_length--;
 	if (observation_page_wal_fault == 8) out->raw_length++;

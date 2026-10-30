@@ -3403,6 +3403,320 @@ ClusterColdRecoveryCtrcPageOwnerReferences(const struct ClusterRecoveryStartV1 *
 	return out;
 }
 
+/* Local scope of one complete original PAGE contribution chain. */
+typedef struct ClusterColdCtrcPageOwnerScopeV1 {
+	RfPageOnlineTargetViewV1 target;
+	RfContributorVectorV1 contributors;
+	RfPageStableEdgeInputV1 *edges;
+	ClusterRecoveryCTRCOwnerEffectV2 *effects;
+	uint32 *source_indexes;
+	uint32 edge_count, source_count;
+} ClusterColdCtrcPageOwnerScopeV1;
+
+/* Join an original sealed edge to exactly one complete original WAL record.
+ * Other components of a compound record remain their own owner duties. */
+static bool
+cluster_recovery_cold_page_owner_effect(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcPageOwnerScopeV1 *scope, uint32 index,
+	const ClusterRecoveryCtrcReplaySetSourceV1 *sources,
+	const ClusterRecoveryWalSourceObservationV1 *observed, uint32 source_count,
+	uint32 wal_count, ClusterRecoveryCTRCOwnerEffectV2 *out)
+{
+	const RfPageStableEdgeInputV1 *edge = &scope->edges[index];
+	const RfPageReplayRecordIdentityV1 *id = &edge->record_identity;
+	uint32 matches = 0;
+
+	memset(out, 0, sizeof(*out));
+	if (!edge->record_complete || !edge->opcode_supported || !edge->side_complete
+		|| !edge->image_integrity_ok || edge->participant_index >= source_count
+		|| edge->edge.page_class != RF_PAGE_CLASS_ORDINARY
+		|| !rf_page_identity_equal_v1(&edge->page_identity, &scope->target.page_identity)
+		|| id->reserved_zero != 0 || id->reserved_zero2 != 0) return false;
+	for (uint32 i = 0; i < wal_count; i++) {
+		ClusterRecoveryPageWalV1 wal;
+		const DecodedXLogRecord *record;
+		const ClusterWalSourceRef *source;
+		const DecodedBkpBlock *block;
+		uint32 components = 0, blocks = 0;
+
+		if (!cluster_recovery_census_page_wal_at_v1(start->ctrc_observation_census, i, &wal)
+			|| !cluster_recovery_page_wal_raw_valid_v1(&wal) || wal.source_index >= source_count
+			|| wal.ordinal == 0
+			|| memcmp(&wal.source, &observed[wal.source_index].source, sizeof(wal.source)) != 0
+			|| memcmp(&wal.cut, &observed[wal.source_index].cut, sizeof(wal.cut)) != 0) return false;
+		record = wal.reader->record; source = &wal.source;
+		if (wal.source_index != edge->participant_index
+			|| wal.reader->ReadRecPtr != id->read_rec_ptr || wal.reader->EndRecPtr != id->end_rec_ptr)
+			continue;
+		if (++matches != 1 || id->system_identifier != source->claim.identity.system_identifier
+			|| memcmp(id->storage_uuid, source->claim.identity.storage_uuid, 16) != 0
+			|| id->origin_thread != source->claim.identity.origin_thread_id
+			|| id->timeline_id != source->timeline || id->record_crc != record->header.xl_crc
+			|| id->rmid != record->header.xl_rmid || id->info != record->header.xl_info
+			|| record->max_block_id < 0 || record->max_block_id > XLR_MAX_BLOCK_ID
+			|| record->page_version_edge.entry_count != edge->component_count
+			|| edge->component_count == 0 || edge->component_count > RF_PAGE_STABLE_MAX_COMPONENTS
+			|| record->page_version_edge.result_token != edge->result_token
+			|| edge->edge.block_id > record->max_block_id) return false;
+		for (uint32 b = 0; b <= (uint32)record->max_block_id; b++)
+			if (record->blocks[b].in_use) blocks++;
+		if (blocks != edge->component_count) return false;
+		for (uint32 c = 0; c < record->page_version_edge.entry_count; c++) {
+			const RfPageVersionEdgeEntryV1 *component = &record->page_version_edge.entries[c];
+			if (component->block_id > record->max_block_id
+				|| !record->blocks[component->block_id].in_use
+				|| component->component_ordinal != record->blocks[component->block_id].component_ordinal)
+				return false;
+			for (uint32 prior = 0; prior < c; prior++)
+				if (record->page_version_edge.entries[prior].block_id == component->block_id
+					|| record->page_version_edge.entries[prior].component_ordinal == component->component_ordinal)
+					return false;
+			if (memcmp(component, &edge->edge, sizeof(*component)) == 0) components++;
+		}
+		block = &record->blocks[edge->edge.block_id];
+		if (components != 1 || !block->in_use || block->forknum != MAIN_FORKNUM
+			|| block->rlocator.spcOid != scope->target.page_identity.locator.spcOid
+			|| block->rlocator.dbOid != scope->target.page_identity.locator.dbOid
+			|| block->rlocator.relNumber != scope->target.page_identity.locator.relNumber
+			|| block->blkno != scope->target.page_identity.blockno
+			|| sources[wal.source_index].generation_index >= source_count) return false;
+		out->record.source_index = sources[wal.source_index].generation_index;
+		out->record.start = wal.reader->ReadRecPtr; out->record.end = wal.reader->EndRecPtr;
+		out->record.raw_length = wal.raw_length;
+		memcpy(out->record.raw_record_sha256, wal.raw_record_sha256, 32);
+		out->component_kind = edge->edge.page_class;
+		out->component_ordinal = edge->edge.component_ordinal;
+	}
+	return matches == 1;
+}
+
+static bool
+cluster_recovery_cold_page_owner_scopes_current(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, ClusterWalInputsV1 *scope,
+	const ClusterColdCtrcPageOwnerScopeV1 *owners, uint32 owner_count,
+	const ClusterRecoveryCtrcReplaySetSourceV1 *sources,
+	const ClusterRecoveryWalSourceObservationV1 *observed, uint32 source_count, uint32 wal_count,
+	const ClusterRecoveryCensusReferencesV1 *references,
+	const ClusterRecoveryCensusReferenceV1 *fixed_references, uint32 reference_count)
+{
+	if (!cluster_recovery_cold_page_sources_current(start, work, scope, start->ctrc_page_plan,
+			start->ctrc_page_sources, source_count)
+		|| start->ctrc_page_source_count != source_count || start->ctrc_page_wal_count != wal_count
+		|| rf_page_online_plan_target_count_v1(start->ctrc_page_plan) != owner_count
+		|| memcmp(sources, start->ctrc_page_sources, (Size)source_count * sizeof(*sources)) != 0
+		|| start->ctrc_references != references || references->count != reference_count
+		|| memcmp(fixed_references, references->entries, (Size)reference_count * sizeof(*fixed_references)) != 0)
+		return false;
+	for (uint32 i = 0; i < source_count; i++) {
+		ClusterRecoveryWalSourceObservationV1 actual;
+		if (!cluster_recovery_census_wal_source_at_v1(start->ctrc_observation_census, i, &actual)
+			|| memcmp(&actual, &observed[i], sizeof(actual)) != 0) return false;
+	}
+	for (uint32 i = 0; i < owner_count; i++) {
+		RfPageOnlineTargetViewV1 actual;
+		const ClusterColdCtrcPageOwnerScopeV1 *saved = &owners[i];
+		if (!rf_page_online_plan_target_v1(start->ctrc_page_plan, i, &actual)
+			|| memcmp(&actual, &saved->target, sizeof(actual)) != 0
+			|| actual.contributors == NULL
+			|| memcmp(actual.contributors, &saved->contributors, sizeof(saved->contributors)) != 0
+			|| saved->contributors.participant_count != source_count
+			|| saved->contributors.cuts == NULL || saved->contributors.edges == NULL
+			|| memcmp(saved->edges, actual.contributors->edges, (Size)saved->edge_count * sizeof(*saved->edges)) != 0)
+			return false;
+		for (uint32 s = 0; s < source_count; s++)
+			if (memcmp(&saved->contributors.cuts[s], &observed[s].cut, sizeof(observed[s].cut)) != 0)
+				return false;
+		for (uint32 e = 0; e < saved->edge_count; e++) {
+			ClusterRecoveryCTRCOwnerEffectV2 effect;
+			if (!cluster_recovery_cold_page_owner_effect(start, saved, e, sources, observed,
+				source_count, wal_count, &effect) || memcmp(&effect, &saved->effects[e], sizeof(effect)) != 0)
+				return false;
+		}
+	}
+	return cluster_recovery_cold_page_sources_current(start, work, scope, start->ctrc_page_plan,
+		start->ctrc_page_sources, source_count);
+}
+
+RfPageCtrcOwnerGraphV1
+ClusterColdRecoveryCtrcPageOwnerGraph(const struct ClusterRecoveryStartV1 *start, Size memory_budget)
+{
+	RfPageCtrcOwnerGraphV1 out = {0};
+	RfPageCtrcOwnerReferencesV1 volatile related = {0};
+	RfPageCtrcOwnerGraphEntryV1 *volatile entries = NULL;
+	ClusterColdCtrcPageOwnerScopeV1 *owners;
+	ClusterRecoveryCtrcReplaySetSourceV1 *sources;
+	ClusterRecoveryWalSourceObservationV1 *observed;
+	ClusterRecoveryCensusReferenceV1 *fixed_references;
+	const ClusterRecoveryCensusReferencesV1 *references;
+	const ClusterColdCtrcWorkV1 *work;
+	ClusterWalInputsV1 *scope;
+	Size bytes = 0, entry_offset, owner_offset, source_offset, observed_offset, reference_offset;
+	Size edge_offset, effect_offset, indexes_offset, data_offset, key_capacity, stride, scratch;
+	uint32 reference_count, owner_count, source_count, wal_count, edge_count = 0, max_edges = 0;
+	bool ready = false;
+
+	out.detail = RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	if (start == NULL || start != cluster_recovery_cold_start || !cluster_recovery_cold_ctrc_replays_actor()
+		|| !start->ctrc_observation_complete || start->ctrc_references == NULL
+		|| start->ctrc_page_progress == NULL || start->ctrc_page_progress->pending
+		|| start->ctrc_page_progress->next_target != start->ctrc_page_progress->target_count
+		|| start->ctrc_page_plan == NULL || start->ctrc_page_sources == NULL) return out;
+	references = start->ctrc_references; reference_count = references->count;
+	owner_count = start->ctrc_page_progress->target_count; source_count = start->ctrc_page_source_count;
+	wal_count = start->ctrc_page_wal_count; work = start->ctrc_observation_work; scope = start->ctrc_observation_inputs;
+	out.detail = RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE;
+	if (owner_count == 0 || source_count == 0 || source_count > RF_PAGE_STABLE_MAX_PARTICIPANTS) goto refused;
+	for (uint32 i = 0; i < owner_count; i++) {
+		RfPageOnlineTargetViewV1 target;
+		if (!rf_page_online_plan_target_v1(start->ctrc_page_plan, i, &target)
+			|| target.contributors == NULL || target.contributors->edges == NULL
+			|| target.contributors->edge_count == 0) goto refused;
+		if (target.contributors->edge_count > UINT32_MAX - edge_count) {
+			out.detail = RF_PAGE_PROOF_DETAIL_CAPACITY; return out;
+		}
+		edge_count += target.contributors->edge_count;
+		max_edges = Max(max_edges, target.contributors->edge_count);
+	}
+	/* Reserve complete scope/evidence output and codec scratch before the
+	 * unchanged reference/owner factory performs its own whole PAGE preflight. */
+	out.detail = RF_PAGE_PROOF_DETAIL_CAPACITY;
+	if (owner_count > UINT32_MAX / source_count
+		|| max_edges > (MaxAllocSize - 60 - 4 * source_count) / 62) return out;
+	key_capacity = 60 + (Size)4 * source_count + (Size)62 * max_edges;
+	if (key_capacity > (MaxAllocSize - sizeof(((RfPageCtrcOwnerEvidenceV1 *)0)->evidence)
+		- sizeof(((RfPageCtrcOwnerCompletionV1 *)0)->completion) - 26) / 2) return out;
+	stride = 2 * key_capacity + sizeof(((RfPageCtrcOwnerEvidenceV1 *)0)->evidence)
+		+ sizeof(((RfPageCtrcOwnerCompletionV1 *)0)->completion) + 26;
+	scratch = key_capacity + sizeof(out) + sizeof(related) + sizeof(ClusterRecoveryCTRCOwnerScopeV2)
+		+ sizeof(ClusterRecoveryPageWalV1) + sizeof(ClusterRecoveryCTRCOwnerEffectV2)
+		+ sizeof(RfPageOnlineTargetViewV1) + sizeof(ClusterRecoveryWalSourceObservationV1);
+	if (!cluster_recovery_cold_page_reference_reserve(&bytes, Max(reference_count, 1), sizeof(*entries), &entry_offset)
+		|| !cluster_recovery_cold_page_reference_reserve(&bytes, owner_count, sizeof(*owners), &owner_offset)
+		|| !cluster_recovery_cold_page_reference_reserve(&bytes, source_count, sizeof(*sources), &source_offset)
+		|| !cluster_recovery_cold_page_reference_reserve(&bytes, source_count, sizeof(*observed), &observed_offset)
+		|| !cluster_recovery_cold_page_reference_reserve(&bytes, reference_count, sizeof(*fixed_references), &reference_offset)
+		|| !cluster_recovery_cold_page_reference_reserve(&bytes, edge_count, sizeof(RfPageStableEdgeInputV1), &edge_offset)
+		|| !cluster_recovery_cold_page_reference_reserve(&bytes, edge_count, sizeof(ClusterRecoveryCTRCOwnerEffectV2), &effect_offset)
+		|| !cluster_recovery_cold_page_reference_reserve(&bytes, owner_count * source_count, sizeof(uint32), &indexes_offset)
+		|| !cluster_recovery_cold_page_reference_reserve(&bytes, reference_count, stride, &data_offset)
+		|| memory_budget < bytes || memory_budget - bytes < scratch) return out;
+	Assert(entry_offset == 0);
+	PG_TRY();
+	{
+		entries = MemoryContextAllocExtended(TopMemoryContext, bytes, MCXT_ALLOC_ZERO | MCXT_ALLOC_NO_OOM);
+		out.detail = RF_PAGE_PROOF_DETAIL_OOM;
+		if (entries != NULL) {
+			uint32 position = 0;
+			bool valid = true;
+			owners = (ClusterColdCtrcPageOwnerScopeV1 *)((char *)entries + owner_offset);
+			sources = (ClusterRecoveryCtrcReplaySetSourceV1 *)((char *)entries + source_offset);
+			observed = (ClusterRecoveryWalSourceObservationV1 *)((char *)entries + observed_offset);
+			fixed_references = (ClusterRecoveryCensusReferenceV1 *)((char *)entries + reference_offset);
+			memcpy(sources, start->ctrc_page_sources, (Size)source_count * sizeof(*sources));
+			memcpy(fixed_references, references->entries, (Size)reference_count * sizeof(*fixed_references));
+			for (uint32 i = 0; valid && i < source_count; i++)
+				valid = cluster_recovery_census_wal_source_at_v1(start->ctrc_observation_census, i, &observed[i])
+					&& observed[i].source_index == i;
+			for (uint32 i = 0; valid && i < owner_count; i++) {
+				ClusterColdCtrcPageOwnerScopeV1 *saved = &owners[i];
+				valid = rf_page_online_plan_target_v1(start->ctrc_page_plan, i, &saved->target);
+				if (!valid) break;
+				saved->contributors = *saved->target.contributors;
+				saved->edge_count = saved->contributors.edge_count;
+				if (saved->edge_count == 0 || saved->edge_count > edge_count - position) { valid = false; break; }
+				saved->edges = (RfPageStableEdgeInputV1 *)((char *)entries + edge_offset) + position;
+				saved->effects = (ClusterRecoveryCTRCOwnerEffectV2 *)((char *)entries + effect_offset) + position;
+				saved->source_indexes = (uint32 *)((char *)entries + indexes_offset) + (Size)i * source_count;
+				memcpy(saved->edges, saved->contributors.edges, (Size)saved->edge_count * sizeof(*saved->edges));
+				for (uint32 e = 0; valid && e < saved->edge_count; e++) {
+					uint32 source, j;
+					valid = cluster_recovery_cold_page_owner_effect(start, saved, e, sources, observed,
+						source_count, wal_count, &saved->effects[e]);
+					if (!valid) break;
+					for (uint32 prior = 0; valid && prior < e; prior++)
+						valid = memcmp(&saved->effects[prior], &saved->effects[e], sizeof(saved->effects[e])) != 0;
+					if (!valid) break;
+					source = saved->effects[e].record.source_index;
+					for (j = 0; j < saved->source_count; j++) if (saved->source_indexes[j] == source) break;
+					if (j == saved->source_count) saved->source_indexes[saved->source_count++] = source;
+				}
+				position += saved->edge_count;
+			}
+			out.detail = RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE;
+			valid = valid && position == edge_count
+				&& cluster_recovery_cold_page_owner_scopes_current(start, work, scope, owners, owner_count,
+					sources, observed, source_count, wal_count, references, fixed_references, reference_count);
+			if (valid) {
+				related = ClusterColdRecoveryCtrcPageOwnerReferences(start, memory_budget - bytes - scratch);
+				out.detail = related.detail;
+				valid = related.detail == RF_PAGE_PROOF_DETAIL_OK;
+				if (valid) {
+					out.detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+					valid = related.count == reference_count && related.references == references
+						&& related.owners.count == owner_count
+						&& cluster_recovery_cold_page_owner_scopes_current(start, work, scope, owners, owner_count,
+							sources, observed, source_count, wal_count, references, fixed_references, reference_count);
+				}
+				for (uint32 i = 0; valid && i < reference_count; i++) {
+					RfPageCtrcOwnerGraphEntryV1 *entry = &entries[i];
+					const RfPageCtrcOwnerEvidenceV1 *proof;
+					ClusterColdCtrcPageOwnerScopeV1 *saved;
+					ClusterRecoveryCTRCOwnerScopeV2 encoded;
+					uint8 *key, *evidence, *atom;
+					entry->reference_index = i; entry->owner_index = related.entries[i].owner_index;
+					if (entry->owner_index == UINT32_MAX) continue;
+					if (entry->owner_index >= owner_count) { valid = false; break; }
+					saved = &owners[entry->owner_index]; proof = &related.owners.entries[entry->owner_index];
+					encoded = (ClusterRecoveryCTRCOwnerScopeV2){.transaction = fixed_references[i].transaction.transaction,
+						.owner_family = proof->completed.owner.owner_family, .source_indexes = saved->source_indexes,
+						.source_count = saved->source_count, .effects = saved->effects, .effect_count = saved->edge_count};
+					entry->key_length = 60 + (Size)4 * saved->source_count + (Size)62 * saved->edge_count;
+					key = (uint8 *)entries + data_offset + (Size)i * stride; evidence = key + key_capacity;
+					valid = proof->evidence_length <= sizeof(proof->evidence) && proof->evidence_length >= 8
+						&& cluster_undo_tt_ctrc_get_u64_le(proof->evidence) == 1
+						&& proof->completed.length <= sizeof(proof->completed.completion)
+						&& cluster_recovery_ctrc_owner_key_v2(&encoded, key, entry->key_length);
+					if (!valid) break;
+					memcpy(evidence, proof->evidence, proof->evidence_length);
+					cluster_undo_tt_ctrc_put_u64_le(evidence, 2);
+					cluster_undo_tt_ctrc_put_u64_le(evidence + proof->evidence_length,
+						18 + entry->key_length + proof->completed.length);
+					atom = evidence + proof->evidence_length + 8;
+					cluster_undo_tt_ctrc_put_u16_le(atom, 3);
+					cluster_undo_tt_ctrc_put_u64_le(atom + 2, entry->key_length);
+					memcpy(atom + 10, key, entry->key_length);
+					cluster_undo_tt_ctrc_put_u64_le(atom + 10 + entry->key_length, proof->completed.length);
+					memcpy(atom + 18 + entry->key_length, proof->completed.completion, proof->completed.length);
+					entry->key = key; entry->evidence = evidence;
+					entry->evidence_length = proof->evidence_length + 26 + entry->key_length + proof->completed.length;
+				}
+				ready = valid && cluster_recovery_cold_page_owner_scopes_current(start, work, scope, owners, owner_count,
+					sources, observed, source_count, wal_count, references, fixed_references, reference_count);
+			}
+		}
+	}
+	PG_CATCH();
+	{
+		if (related.entries != NULL) pfree(related.entries);
+		if (related.owners.entries != NULL) pfree(related.owners.entries);
+		if (entries != NULL) pfree((void *)entries);
+		cluster_recovery_cold_page_plan_refuse(cluster_recovery_cold_start, RF_PAGE_PROOF_DETAIL_INTERNAL);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (ready) {
+		out.detail = RF_PAGE_PROOF_DETAIL_OK; out.related = related; out.count = reference_count; out.entries = entries;
+		return out;
+	}
+	if (related.entries != NULL) pfree(related.entries);
+	if (related.owners.entries != NULL) pfree(related.owners.entries);
+	if (entries != NULL) pfree((void *)entries);
+refused:
+	if (out.detail != RF_PAGE_PROOF_DETAIL_WOULD_BLOCK && out.detail != RF_PAGE_PROOF_DETAIL_OOM)
+		cluster_recovery_cold_page_plan_refuse(cluster_recovery_cold_start, out.detail);
+	return out;
+}
+
 static bool
 cluster_recovery_cold_page_completed_recheck(const struct ClusterRecoveryStartV1 *start,
 	const ClusterColdCtrcPageCompletedV1 *fixed, uint32 fixed_count)

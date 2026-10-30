@@ -396,6 +396,23 @@ typedef struct RfPageCtrcOwnerReferencesV1 {
 	RfPageCtrcOwnerReferenceV1 *entries;
 } RfPageCtrcOwnerReferencesV1;
 
+#define CLUSTER_PAGE_CTRC_OWNER_GRAPH_V1 1
+typedef struct RfPageCtrcOwnerGraphEntryV1 {
+	uint32 reference_index, owner_index;
+	Size key_length, evidence_length;
+	const uint8 *key, *evidence;
+} RfPageCtrcOwnerGraphEntryV1;
+
+/* Complete reference order, with canonical PAGE owner contributions only for
+ * matched current non-FREE ITLs. Unmatched entries have no key/evidence.
+ * This is not a complete transaction graph or a discharge verdict. */
+typedef struct RfPageCtrcOwnerGraphV1 {
+	RfPageProofDetailV1 detail;
+	RfPageCtrcOwnerReferencesV1 related;
+	uint32 count;
+	RfPageCtrcOwnerGraphEntryV1 *entries;
+} RfPageCtrcOwnerGraphV1;
+
 extern RfPageCtrcReadbackImageV1 rf_page_recovery_ctrc_replays_completed_image_v1(
 	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work,
 	const struct ClusterRecoveryCtrcReplaySetSourceV1 *source, RfPageCtrcAuthorityV1 *authority,
