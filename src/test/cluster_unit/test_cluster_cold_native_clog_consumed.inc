@@ -19,6 +19,8 @@ static XLogRecord native_source_header;
 static const XLogReaderState *native_source_reader;
 static XLogRecPtr native_source_start, native_source_end;
 static unsigned native_record_queries;
+static uint8 native_source_payload[sizeof(xl_clog_truncate_full)];
+static uint32 native_source_payload_length;
 
 /* The real sealed matcher is covered by SIDE tests. This preserves the
  * fixture's independent full-header/frame check around the real owner. */
@@ -30,7 +32,11 @@ rf_side_online_plan_clog_matches_v1(const RfSideOnlinePlanV1 *plan,
 		&& source != NULL && reader != NULL && reader->record != NULL
 		&& memcmp(source, &restart_ref, sizeof(*source)) == 0
 		&& reader->ReadRecPtr == native_source_start && reader->EndRecPtr == native_source_end
-		&& memcmp(&reader->record->header, &native_source_header, sizeof(native_source_header)) == 0;
+		&& memcmp(&reader->record->header, &native_source_header, sizeof(native_source_header)) == 0
+		&& XLogRecGetDataLen(reader) == native_source_payload_length
+		&& (native_source_payload_length == 0 || (XLogRecGetData(reader) != NULL
+			&& memcmp(XLogRecGetData(reader), native_source_payload,
+				native_source_payload_length) == 0));
 }
 
 
@@ -50,6 +56,12 @@ side_plan_clog_native_replay(const RfSideOnlinePlanV1 *plan,
 		return false;
 	UT_ASSERT(plan == &side_fixture[0]);
 	UT_ASSERT(memcmp(source, &native_source_typed->sources[0], sizeof(*source)) == 0);
+	if (XLogRecGetDataLen(reader) > sizeof(native_source_payload)
+		|| (XLogRecGetDataLen(reader) != 0 && XLogRecGetData(reader) == NULL))
+		return false;
+	native_source_payload_length = XLogRecGetDataLen(reader);
+	if (native_source_payload_length != 0)
+		memcpy(native_source_payload, XLogRecGetData(reader), native_source_payload_length);
 	native_source_reader = reader;
 	native_source_header = reader->record->header;
 	native_source_start = reader->ReadRecPtr;
