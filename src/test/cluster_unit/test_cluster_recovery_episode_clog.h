@@ -20,6 +20,10 @@ extern bool test_episode_native_clog_read(const ClusterRecoveryRelmapSourceV1 *s
 extern void test_episode_native_clog_release(void **held);
 extern void test_episode_native_clog_start(const char *root);
 extern void test_episode_native_clog_stop(void);
+/* NULL keeps the original fixture leaf; an opt-in guard is the caller's real
+ * Startup owner, and disables the unrelated cold-scope fixture permission. */
+extern void test_episode_native_clog_record_guard(
+	bool (*current)(int, const XLogReaderState *));
 extern void test_episode_native_clog_error(bool on);
 extern int test_episode_native_clog_fd(void *held);
 extern void test_episode_native_clog_redo(XLogReaderState *reader);
@@ -33,4 +37,11 @@ extern void test_episode_native_clog_discard_resident(void);
 /* Actual cold native initialization; original episode authority is a fixture. */
 extern bool test_episode_native_clog_full_apply(const ClusterRecoveryRelmapSourceV1 *source,
 	const xl_clog_zeropage_full *birth);
+/* Original replay callback, with faults after redo and before physical finish. */
+typedef struct TestEpisodeClogReplayStats {
+	unsigned redos, touches, file_syncs, directory_syncs;
+	bool returned;
+} TestEpisodeClogReplayStats;
+extern void test_episode_native_clog_replay(XLogReaderState *reader,
+	TimeLineID timeline, unsigned sync_fault, TestEpisodeClogReplayStats *stats);
 #endif

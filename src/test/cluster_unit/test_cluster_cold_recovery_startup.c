@@ -3963,10 +3963,20 @@ UT_TEST(test_full_clog_truncate_dispatch_uses_original_projection_identity)
 }
 
 #include "test_cluster_cold_native_clog_consumed.inc"
+#include "test_cluster_cold_native_storage.inc"
 
 int
 main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_NATIVE_CLOG_STORAGE") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_source_native_clog_finishes_original_records_without_cold_scope);
+		UT_RUN(test_source_native_clog_rejects_unowned_and_substituted_reader);
+		UT_RUN(test_source_native_clog_sync_errors_preserve_attempt_and_bytes);
+		UT_RUN(test_source_native_clog_late_source_change_cannot_retry);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_NATIVE_CLOG_SOURCE") != NULL) {
 		UT_PLAN(5);
 		UT_RUN(test_native_clog_record_context_exists_only_in_original_callback);
@@ -3977,7 +3987,7 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(155);
+	UT_PLAN(159);
 	UT_RUN(test_full_clog_truncate_dispatch_uses_original_projection_identity);
 	UT_RUN(test_full_clog_dispatch_uses_only_original_projection_identity);
 	UT_RUN(test_execution_refusal_preserves_the_first_census_failure);
@@ -4129,6 +4139,10 @@ main(void)
 	UT_RUN(test_source_barrier_requires_cold_window_and_original_scope);
 	UT_RUN(test_source_barrier_error_does_not_leave_success);
 	UT_RUN(test_original_typed_owner_retires_fence_after_dependent_read_scope);
+	UT_RUN(test_source_native_clog_finishes_original_records_without_cold_scope);
+	UT_RUN(test_source_native_clog_rejects_unowned_and_substituted_reader);
+	UT_RUN(test_source_native_clog_sync_errors_preserve_attempt_and_bytes);
+	UT_RUN(test_source_native_clog_late_source_change_cannot_retry);
 	UT_RUN(test_native_clog_record_context_exists_only_in_original_callback);
 	UT_RUN(test_native_clog_record_context_clears_on_error_without_retry);
 	UT_RUN(test_native_clog_source_wraps_original_founder_callback);
