@@ -875,6 +875,10 @@ side_xact_apply_commit_v1(const RfSideXactOperationV1 *operation)
 	SCN durable_scn;
 	uint16 durable_segment, durable_slot, durable_wrap;
 
+	/* The bare executor owns only the legacy TT32 writer. V2 must be
+	 * installed and read back by the original protected header owner. */
+	if (operation->tt_delta.format_version != CLUSTER_XACT_TT_COMMIT_VERSION)
+		return RF_SIDE_XACT_APPLY_BLOCKED;
 	cluster_tt_durable_redo_stamp_slot_exact(
 		operation->tt_delta.instance, operation->tt_delta.segment_id,
 		operation->tt_delta.segment_generation, operation->tt_delta.slot_offset,
@@ -1288,9 +1292,7 @@ rf_side_xact_target_preflight_owned_v1(const RfSideXactOperationV1 *operation,
 	if (!rf_side_xact_structural_preflight_v1(operation)
 		|| operation->system_identifier != GetSystemIdentifier()
 		|| cluster_xid_origin_slot(operation->xid) != (int)operation->origin_thread - 1
-		|| operation->space_drop_count != 0
-		|| (operation->has_tt_delta
-			&& operation->tt_delta.format_version != CLUSTER_XACT_TT_COMMIT_VERSION))
+		|| operation->space_drop_count != 0)
 		return RF_SIDE_XACT_APPLY_BLOCKED;
 
 	if (operation->kind == RF_SIDE_XACT_COMMIT)

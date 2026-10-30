@@ -311,6 +311,93 @@ UT_TEST(test_pi_ctrc_generation_zero_is_retained_without_apply_eligibility)
 	rf_side_online_plan_destroy_v1(&plan);
 }
 
+
+static void
+pi_release_v2(FakeXactRecord *fake, uint32 generation, uint64 full, bool digest)
+{
+	xl_undo_tt_slot_ctrc_release_v2 release = { 0 };
+	uint8 wal[CLUSTER_UNDO_TT_CTRC_RELEASE_V2_BYTES];
+
+	release.release.segment_id = 513;
+	release.release.segment_generation = generation;
+	release.release.xid = (TransactionId)full;
+	release.release.cluster_epoch = 1;
+	release.release.root_id = release.release.root_generation = release.release.formation_epoch = 1;
+	release.release.admission_record_generation = release.release.seal_generation = 1;
+	release.release.touched_nodes_low = 4;
+	release.release.owner_instance = 3;
+	release.release.terminal_status = TT_SLOT_COMMITTED;
+	release.release.format_version = CLUSTER_UNDO_TT_IDENTITY_V2_VERSION;
+	release.release.flags = CLUSTER_UNDO_TT_CTRC_RELEASE_ALL_TOUCHED_ACKED;
+	if (digest)
+		memset(release.release.ack_set_digest, 0x42, sizeof(release.release.ack_set_digest));
+	release.original_full_xid = full;
+	UT_ASSERT(cluster_undo_tt_ctrc_release_v2_encode(&release, wal));
+	make_projection_record(fake, RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_CTRC_RELEASE, wal,
+						   sizeof(wal));
+}
+
+UT_TEST(test_pi_v2_release_keeps_exact_history_and_separate_execution_gate)
+{
+	const uint64 fulls[] = { 801, (UINT64_C(7) << 32) | 801 };
+
+	for (uint32 generation = 0; generation < 2; generation++) {
+		for (Size i = 0; i < lengthof(fulls); i++) {
+			FakeXactRecord fake;
+			RfPageOnlineRecordIdentityV1 identity;
+			RfDetachedRecordPlanV1 record;
+			RfSideOnlinePlanV1 *plan, *recovery;
+			RfSideOnlineOperationV1 op;
+			RfPageProofDetailV1 detail;
+
+			pi_release_v2(&fake, generation, fulls[i], true);
+			identity = pi_identity(&fake);
+			record = make_undo_record_plan(&fake);
+			plan = pi_side_plan(&identity, true);
+			detail = rf_side_online_plan_feed_record_v1(plan, &record, &identity);
+			UT_ASSERT_EQ(detail, RF_PAGE_PROOF_DETAIL_OK);
+			if (detail == RF_PAGE_PROOF_DETAIL_OK) {
+				UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+				UT_ASSERT(rf_side_online_plan_operation_v1(plan, 0, &op));
+				UT_ASSERT_EQ(op.undo.expected_generation, generation);
+				UT_ASSERT_EQ(op.undo.original_full_xid, fulls[i]);
+				UT_ASSERT_EQ(op.owned_payload_length, CLUSTER_UNDO_TT_CTRC_RELEASE_V2_BYTES);
+				if (op.owned_payload_length == CLUSTER_UNDO_TT_CTRC_RELEASE_V2_BYTES)
+					UT_ASSERT(memcmp(op.owned_payload, fake.data, op.owned_payload_length) == 0);
+			}
+			recovery = pi_side_plan(&identity, false);
+			UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(recovery, &record, &identity),
+						 generation == 0 ? RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE
+										 : RF_PAGE_PROOF_DETAIL_OK);
+			rf_side_online_plan_destroy_v1(&recovery);
+			rf_side_online_plan_destroy_v1(&plan);
+		}
+	}
+}
+
+UT_TEST(test_pi_v2_release_rejects_missing_digest_unknown_or_mismatched_identity)
+{
+	for (int variant = 0; variant < 5; variant++) {
+		FakeXactRecord fake;
+		RfPageOnlineRecordIdentityV1 identity;
+		RfDetachedRecordPlanV1 record;
+		RfSideOnlinePlanV1 *plan;
+
+		pi_release_v2(&fake, variant == 0 ? 0 : variant == 4 ? UINT32_MAX : 1,
+					  (UINT64_C(7) << 32) | 801, variant >= 2);
+		if (variant == 2)
+			fake.data[96] ^= 1; /* Same raw carrier cannot borrow another FullXid. */
+		if (variant == 3)
+			fake.data[94] = 3;
+		identity = pi_identity(&fake);
+		record = make_undo_record_plan(&fake);
+		plan = pi_side_plan(&identity, true);
+		UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(plan, &record, &identity),
+					 RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
 UT_TEST(test_pi_source_cut_must_be_complete)
 {
 	FakeXactRecord fake;
@@ -828,7 +915,7 @@ UT_TEST(test_cold_effects_acceptance_does_not_qualify_strict_or_pi_execution)
 int
 main(void)
 {
-	UT_PLAN(18);
+	UT_PLAN(20);
 	UT_RUN(test_cold_effects_acceptance_does_not_qualify_strict_or_pi_execution);
 	UT_RUN(test_pi_and_cold_effects_keep_distinct_stats_and_children_contracts);
 	UT_RUN(test_cold_effects_reject_unsupported_stats_without_changing_owner);
@@ -839,6 +926,8 @@ main(void)
 	UT_RUN(test_pi_commit_unknown_or_damaged_effects_still_refuse);
 	UT_RUN(test_pi_native_create_requires_the_typed_identity_contribution);
 	UT_RUN(test_pi_ctrc_generation_zero_is_retained_without_apply_eligibility);
+	UT_RUN(test_pi_v2_release_keeps_exact_history_and_separate_execution_gate);
+	UT_RUN(test_pi_v2_release_rejects_missing_digest_unknown_or_mismatched_identity);
 	UT_RUN(test_pi_source_cut_must_be_complete);
 	UT_RUN(test_pi_ctrc_other_fields_still_refuse);
 	UT_RUN(test_pi_create_namespace_modifier_and_page_reuse_boundaries);

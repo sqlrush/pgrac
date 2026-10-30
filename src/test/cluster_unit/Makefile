@@ -3656,13 +3656,16 @@ $(CLUSTER_SIDE_XACT_O): $(top_srcdir)/src/backend/cluster/cluster_side_xact.c \
 		$(top_srcdir)/src/include/cluster/cluster_side_xact.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DRF_SIDE_XACT_TESTING \
 		-ffunction-sections -fdata-sections -c $< -o $@
-CLUSTER_SIDE_ONLINE_PLAN_TEST_O = test_cluster_side_online_plan.o
-$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O): \
+CLUSTER_SIDE_ONLINE_PLAN_TEST_O = test_cluster_side_online_plan.o \
+	$(top_builddir)/src/backend/storage/page/checksum.o
+test_cluster_side_online_plan.o: \
 		$(top_srcdir)/src/backend/cluster/cluster_side_online_plan.c \
 		Makefile \
 		$(top_srcdir)/src/include/cluster/cluster_side_online_plan.h \
 		$(top_srcdir)/src/include/cluster/cluster_side_xact.h \
-		$(top_srcdir)/src/include/cluster/cluster_side_undo.h
+		$(top_srcdir)/src/include/cluster/cluster_side_undo.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h \
+		$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DRF_SIDE_ONLINE_TESTING -ffunction-sections -fdata-sections -c $< -o $@
 SIDE_XACT_XACTDESC_O = test_cluster_side_xact_xactdesc.o
 $(SIDE_XACT_XACTDESC_O): $(top_srcdir)/src/backend/access/rmgrdesc/xactdesc.c
@@ -3704,13 +3707,13 @@ test_cluster_side_xact_effects.inc: $(top_srcdir)/src/backend/cluster/cluster_si
 test_cluster_pi_contribution: test_cluster_page_data_stable.o test_cluster_side_xact_effects.inc
 
 test_cluster_side_xact test_cluster_pi_contribution: %: %.c unit_test.h test_cluster_side_xact.c test_cluster_undo_header_identity.inc \
-		test_cluster_side_online_owner_product.o \
+		test_cluster_side_online_owner_product.o test_cluster_undo_segment_init_backend.o \
 		$(CLUSTER_SIDE_XACT_O) $(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) \
 		$(CLUSTER_REMOTE_XACT_IDENTITY_O) \
 		$(SIDE_XACT_XACTDESC_O) $(SIDE_XACT_TT_2PC_RECORD_O) \
 		test_cluster_side_xact_undo_product.o $(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_SIDE_XACT_O) \
-		test_cluster_side_online_owner_product.o \
+		test_cluster_side_online_owner_product.o test_cluster_undo_segment_init_backend.o \
 		$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) $(SIDE_XACT_XACTDESC_O) \
 		$(CLUSTER_REMOTE_XACT_IDENTITY_O) \
 		$(SIDE_XACT_TT_2PC_RECORD_O) test_cluster_side_xact_undo_product.o \

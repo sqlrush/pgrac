@@ -699,8 +699,8 @@ undo_prepare_tt_slot(const ClusterUndoDecoded *decoded, UndoSegmentHeaderData *h
 
 /* V2 has an explicit target layout. It must never pass through the TT32
  * execution gates or borrow identity from a raw-only predecessor. */
-bool
-cluster_undo_preflight_tt_v2(const ClusterUndoDecoded *decoded)
+static bool
+undo_preflight_tt_v2_for_use(const ClusterUndoDecoded *decoded, bool pi_inspection)
 {
 	ClusterSideRouteRow route;
 	xl_undo_tt_identity_v2 identity = { 0 };
@@ -739,7 +739,7 @@ cluster_undo_preflight_tt_v2(const ClusterUndoDecoded *decoded)
 		ClusterUndoDecoded projection = *decoded;
 		xl_undo_tt_slot_ctrc_release_v1 record;
 
-		if (decoded->expected_generation == 0 || decoded->cluster_epoch == 0
+		if ((!pi_inspection && decoded->expected_generation == 0) || decoded->cluster_epoch == 0
 			|| decoded->formation_epoch == 0)
 			return false;
 		projection.format_version = CLUSTER_UNDO_TT_CTRC_RELEASE_VERSION;
@@ -748,6 +748,26 @@ cluster_undo_preflight_tt_v2(const ClusterUndoDecoded *decoded)
 	default:
 		return false;
 	}
+}
+
+bool
+cluster_undo_preflight_tt_v2(const ClusterUndoDecoded *decoded)
+{
+	return undo_preflight_tt_v2_for_use(decoded, false);
+}
+
+bool
+cluster_undo_inspect_pi_tt_v2(const ClusterUndoDecoded *decoded)
+{
+	uint8 digest = 0;
+
+	if (!undo_preflight_tt_v2_for_use(decoded, true))
+		return false;
+	if (decoded->kind != CLUSTER_UNDO_KIND_TT_CTRC_RELEASE)
+		return true;
+	for (Size i = 0; i < sizeof(decoded->ack_set_digest); i++)
+		digest |= decoded->ack_set_digest[i];
+	return digest != 0;
 }
 
 /* Private byte preparation only. The existing owner still proves source,

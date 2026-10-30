@@ -13,6 +13,7 @@
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_side_online_owner.h"
 #include "cluster/cluster_undo_smgr.h"
+#include "cluster/storage/cluster_undo_xlog.h"
 #include "storage/standbydefs.h"
 
 #ifdef RF_SIDE_OWNER_TESTING
@@ -224,6 +225,10 @@ side_owner_preflight_xact(void *arg, const RfSideOnlineOperationV1 *operation)
 												  operation->owned_payload_length)
 			   != RF_SIDE_XACT_APPLY_OK)
 		return false;
+	if (operation->xact.has_tt_delta
+		&& operation->xact.tt_delta.format_version == CLUSTER_XACT_TT_COMMIT_V2_VERSION
+		&& owner->undo_authority == NULL)
+		return false;
 	if (owner->undo_authority != NULL && operation->xact.kind == RF_SIDE_XACT_COMMIT) {
 		const xl_xact_tt_commit *delta = &operation->xact.tt_delta;
 		if (!operation->xact.has_tt_delta)
@@ -241,6 +246,9 @@ side_owner_preflight_undo(void *arg, const RfSideOnlineOperationV1 *operation)
 
 	if (owner == NULL || !owner->protected_set_active || !side_owner_authority_fresh(owner)
 		|| operation == NULL || operation->kind != RF_SIDE_ONLINE_OPERATION_UNDO)
+		return false;
+	if (operation->undo.format_version == CLUSTER_UNDO_TT_IDENTITY_V2_VERSION
+		&& owner->undo_authority == NULL)
 		return false;
 	if (owner->undo_authority != NULL) {
 		const ClusterUndoDecoded *undo = &operation->undo;

@@ -30,6 +30,7 @@
 #include "cluster/cluster_xid_stripe_xlog.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "storage/standbydefs.h"
+#include "storage/checksum.h"
 
 #include "unit_test.h"
 
@@ -106,6 +107,7 @@ static TransactionId canonical_expected_xid = 818;
 static uint16 canonical_expected_wrap = 8;
 static bool canonical_check_block, canonical_fail_data_write, canonical_corrupt_data_write;
 static bool canonical_file_io_error, canonical_materialize_failure;
+static uint64 canonical_expected_full_xid;
 static XLogRecPtr canonical_expected_block_lsn = 400;
 ClusterUndoTargetPreflightV1 fixture_preflight_tt_target(const ClusterUndoDecoded *d);
 ClusterUndoApplyResultV1 fixture_apply_tt(const ClusterUndoDecoded *d);
@@ -496,7 +498,15 @@ cluster_remote_xact_store_terminal_v2(
 
 		UT_ASSERT(canonical_scope != NULL && canonical_syncs != 0);
 		UT_ASSERT(pread(fileno(canonical_file), disk.data, BLCKSZ, 0) == BLCKSZ);
-		slot = &((UndoSegmentHeaderData *)disk.data)->tt_slots[4];
+		if (canonical_expected_full_xid != 0) {
+			const TTSlotV2 *full_slot = &((UndoSegmentHeaderDataV2 *)disk.data)->tt_slots[4];
+
+			UT_ASSERT(UndoSegmentHeaderV2_identity_matches(disk.data, BLCKSZ, 513, 3));
+			UT_ASSERT_EQ(((PageHeader)disk.data)->pd_checksum, pg_checksum_page(disk.data, 0));
+			UT_ASSERT_EQ(full_slot->original_full_xid, canonical_expected_full_xid);
+			slot = (TTSlot *)full_slot;
+		} else
+			slot = &((UndoSegmentHeaderData *)disk.data)->tt_slots[4];
 		UT_ASSERT(slot->status == TT_SLOT_COMMITTED && slot->xid == canonical_expected_xid
 				  && slot->wrap == canonical_expected_wrap);
 		canonical_projection_scn = commit_scn;
@@ -1060,7 +1070,7 @@ UT_TEST(test_folded_v2_side_decode_keeps_original_tt_identity)
 	UT_ASSERT_EQ(operation.tt_original_full_xid, (UINT64_C(7) << 32) | 800);
 	UT_ASSERT(rf_side_xact_structural_preflight_v1(&operation));
 	reset_prepare_apply();
-	UT_ASSERT_EQ(rf_side_xact_target_preflight_owned_v1(&operation, NULL, 0), RF_SIDE_XACT_APPLY_BLOCKED);
+	UT_ASSERT_EQ(rf_side_xact_target_preflight_owned_v1(&operation, NULL, 0), RF_SIDE_XACT_APPLY_OK);
 	UT_ASSERT_EQ(rf_side_xact_apply_v1(&operation), RF_SIDE_XACT_APPLY_BLOCKED);
 	UT_ASSERT_EQ(prepare_apply.tt_reads, 0);
 	UT_ASSERT_EQ(prepare_apply.tt_stamps, 0);
@@ -3192,6 +3202,258 @@ undo_repeated_slot_plan(bool wrong_second_xid)
 	return undo_repeated_slot_plan_sources(wrong_second_xid, false);
 }
 
+
+static void
+undo_v2_seal(PGAlignedBlock *page)
+{
+	((PageHeader)page->data)->pd_checksum = pg_checksum_page(page->data, 0);
+}
+
+static RfSideOnlinePlanV1 *
+undo_v2_slot_plan(bool conflicting_source)
+{
+	RfSideOnlinePlanV1 *plan = space_online_plan(500);
+
+	for (uint32 i = 0; i < 4; i++) {
+		FakeXactRecord fake;
+		uint64 full = i < 2 ? (UINT64_C(7) << 32) | 802 : 818;
+		uint16 wrap = i < 2 ? 7 : 8;
+		RfPageOnlineRecordIdentityV1 identity;
+		RfDetachedRecordPlanV1 record;
+		RfPageProofDetailV1 detail;
+		uint8 uuid[16];
+
+		if (conflicting_source && i == 3)
+			full |= UINT64_C(1) << 32;
+		if ((i & 1) == 0) {
+			xl_undo_tt_identity_v2 bind = { 0 };
+
+			bind.instance = 3;
+			bind.segment_id = 513;
+			bind.slot_offset = 4;
+			bind.wrap = wrap;
+			bind.xid = (TransactionId)full;
+			bind.format_version = CLUSTER_UNDO_TT_IDENTITY_V2_VERSION;
+			bind.original_full_xid = full;
+			make_projection_record(&fake, RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_BIND,
+								   &bind, sizeof(bind));
+		} else {
+			xl_xact_tt_commit delta;
+			uint32 offset;
+
+			undo_header_commit(&fake, 0, (TransactionId)full);
+			offset = fake.u.decoded.main_data_len - sizeof(delta);
+			memcpy(&delta, fake.data + offset, sizeof(delta));
+			delta.wrap = wrap;
+			delta.format_version = CLUSTER_XACT_TT_COMMIT_V2_VERSION;
+			memcpy(fake.data + offset, &delta, sizeof(delta));
+			memcpy(fake.data + offset + sizeof(delta), &full, sizeof(full));
+			fake.u.decoded.main_data_len += sizeof(full);
+		}
+		memset(uuid, 0x44, sizeof(uuid));
+		identity = make_identity(&fake, uuid);
+		set_identity_range(&fake, &identity, 100 + i * 100, 200 + i * 100);
+		record = (i & 1) == 0 ? make_undo_record_plan(&fake) : make_record_plan(&fake);
+		detail = rf_side_online_plan_feed_record_v1(plan, &record, &identity);
+		UT_ASSERT_EQ(detail, RF_PAGE_PROOF_DETAIL_OK);
+		if (detail != RF_PAGE_PROOF_DETAIL_OK) {
+			rf_side_online_plan_destroy_v1(&plan);
+			return NULL;
+		}
+		memset(fake.data, 0xee, sizeof(fake.data));
+	}
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	return plan;
+}
+
+UT_TEST(test_v2_header_exact_full_slot_source_membership)
+{
+	RfSideOnlinePlanV1 *plan = undo_v2_slot_plan(false);
+
+	if (plan == NULL)
+		return;
+	for (int state = 0; state < 16; state++) {
+		PGAlignedBlock base, saved, expected;
+		RfSideUndoHeaderImageV1 out, unchanged;
+		UndoSegmentHeaderDataV2 *header;
+		TTSlotV2 *slot;
+
+		UT_ASSERT(cluster_undo_segment_make_header_v2_bytes(513, 3, base.data));
+		header = (UndoSegmentHeaderDataV2 *)base.data;
+		header->last_used_at = 4321;
+		header->tt_slots[5].xid = 885;
+		header->tt_slots[5].wrap = 4;
+		header->tt_slots[5].status = TT_SLOT_ACTIVE;
+		header->tt_slots[5].original_full_xid = (UINT64_C(9) << 32) | 885;
+		slot = &header->tt_slots[4];
+		if (state != 0) {
+			slot->xid = state < 3 || state == 5 ? 802 : 818;
+			slot->wrap = state < 3 || state == 5 ? 7 : 8;
+			slot->status = state == 1 || state == 3 ? TT_SLOT_ACTIVE : TT_SLOT_COMMITTED;
+			slot->commit_scn = slot->status == TT_SLOT_COMMITTED ? 999 : InvalidScn;
+			slot->first_undo_block = (UBA)InvalidUba_init;
+			slot->original_full_xid = slot->xid == 802 ? (UINT64_C(7) << 32) | 802 : 818;
+		}
+		if (state == 5 || state == 6)
+			slot->original_full_xid += UINT64_C(1) << 32;
+		if (state == 7)
+			slot->xid = 834;
+		if (state == 8)
+			slot->wrap = 9;
+		if (state == 9)
+			slot->commit_scn = 1000;
+		if (state == 10)
+			header->wrap_count = 1;
+		if (state == 11)
+			header->tt_slot_bytes = sizeof(TTSlot);
+		if (state == 12)
+			header->tt_layout_reserved = 1;
+		if (state == 14)
+			cluster_undo_segment_make_header_bytes(513, 3, base.data);
+		undo_v2_seal(&base);
+		if (state == 13)
+			base.data[BLCKSZ - 1] ^= 1;
+		if (state == 15)
+			((PageHeader)base.data)->pd_checksum = 0;
+		saved = base;
+		expected = base;
+		slot = &((UndoSegmentHeaderDataV2 *)expected.data)->tt_slots[4];
+		memset(slot, 0, sizeof(*slot));
+		slot->xid = 818;
+		slot->wrap = 8;
+		slot->status = TT_SLOT_COMMITTED;
+		slot->commit_scn = 999;
+		slot->first_undo_block = (UBA)InvalidUba_init;
+		slot->original_full_xid = 818;
+		undo_v2_seal(&expected);
+		memset(&unchanged, 0xc5, sizeof(unchanged));
+		out = unchanged;
+		UT_ASSERT_EQ(rf_side_online_plan_prepare_undo_header_v1(plan, 3, 513, base.data, &out),
+					 state < 5 ? RF_PAGE_PROOF_DETAIL_OK : RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
+		UT_ASSERT(memcmp(base.data, saved.data, BLCKSZ) == 0);
+		if (state < 5) {
+			UT_ASSERT(memcmp(out.page.data, expected.data, BLCKSZ) == 0);
+			UT_ASSERT_EQ(out.operation_count, 4);
+			UT_ASSERT_EQ(out.source_index, state == 4 ? UINT32_MAX : 3);
+			UT_ASSERT(!out.has_full_image);
+		} else
+			UT_ASSERT(memcmp(&out, &unchanged, sizeof(out)) == 0);
+	}
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_v2_later_target_cannot_hide_full_xid_source_conflict)
+{
+	RfSideOnlinePlanV1 *plan = undo_v2_slot_plan(true);
+	PGAlignedBlock base;
+	RfSideUndoHeaderImageV1 out, unchanged;
+	TTSlotV2 *slot;
+
+	if (plan == NULL)
+		return;
+	UT_ASSERT(cluster_undo_segment_make_header_v2_bytes(513, 3, base.data));
+	slot = &((UndoSegmentHeaderDataV2 *)base.data)->tt_slots[4];
+	slot->xid = 818;
+	slot->wrap = 8;
+	slot->status = TT_SLOT_COMMITTED;
+	slot->commit_scn = 999;
+	slot->original_full_xid = (UINT64_C(1) << 32) | 818;
+	undo_v2_seal(&base);
+	memset(&unchanged, 0xa7, sizeof(unchanged));
+	out = unchanged;
+	UT_ASSERT_EQ(rf_side_online_plan_prepare_undo_header_v1(plan, 3, 513, base.data, &out),
+				 RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
+	UT_ASSERT(memcmp(&out, &unchanged, sizeof(out)) == 0);
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_v2_protected_owner_installs_complete_header_before_projection)
+{
+	for (int conflict = 0; conflict < 2; conflict++) {
+		RfSideOnlinePlanV1 *plan = undo_v2_slot_plan(false);
+		ClusterThreadRecoveryAuthorityV1 authority = { .duty = &canonical_duty };
+		RfSideOnlineProductionOwnerV1 owner;
+		PGAlignedBlock initial, after;
+
+		if (plan == NULL)
+			return;
+		reset_prepare_apply();
+		canonical_file = tmpfile();
+		UT_ASSERT(canonical_file != NULL);
+		UT_ASSERT_EQ(ftruncate(fileno(canonical_file), UNDO_SEGMENT_SIZE_BYTES), 0);
+		UT_ASSERT(cluster_undo_segment_make_header_v2_bytes(513, 3, initial.data));
+		if (conflict) {
+			TTSlotV2 *slot = &((UndoSegmentHeaderDataV2 *)initial.data)->tt_slots[4];
+
+			slot->xid = 802;
+			slot->wrap = 7;
+			slot->status = TT_SLOT_ACTIVE;
+			slot->original_full_xid = (UINT64_C(8) << 32) | 802;
+		}
+		undo_v2_seal(&initial);
+		UT_ASSERT(pwrite(fileno(canonical_file), initial.data, BLCKSZ, 0) == BLCKSZ);
+		UT_ASSERT_EQ(fsync(fileno(canonical_file)), 0);
+		canonical_writes = canonical_syncs = 0;
+		canonical_expected_full_xid = 818;
+		UT_ASSERT(rf_side_online_production_owner_init_v1(&owner, &authority,
+														  canonical_authority_fresh, 19, true));
+		UT_ASSERT(rf_side_online_production_bind_undo_v1(&owner, &authority));
+		UT_ASSERT_EQ(rf_side_online_production_preflight_v1(plan, &owner),
+					 conflict ? RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE : RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(canonical_writes, 0);
+		UT_ASSERT_EQ(prepare_apply.terminal_projection_stores, 0);
+		UT_ASSERT_EQ(rf_side_online_production_apply_v1(plan, &owner),
+					 conflict ? RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE : RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(canonical_writes, conflict ? 0 : 1);
+		UT_ASSERT_EQ(canonical_syncs, conflict ? 0 : 1);
+		UT_ASSERT_EQ(prepare_apply.terminal_projection_stores, conflict ? 0 : 2);
+		UT_ASSERT_EQ(prepare_apply.tt_stamps, 0);
+		UT_ASSERT(pread(fileno(canonical_file), after.data, BLCKSZ, 0) == BLCKSZ);
+		if (conflict)
+			UT_ASSERT(memcmp(after.data, initial.data, BLCKSZ) == 0);
+		else {
+			UT_ASSERT_EQ(((UndoSegmentHeaderDataV2 *)after.data)->tt_slots[4].original_full_xid,
+						 818);
+			UT_ASSERT_EQ(rf_side_online_production_apply_v1(plan, &owner), RF_PAGE_PROOF_DETAIL_OK);
+			UT_ASSERT_EQ(canonical_writes, 1);
+			UT_ASSERT_EQ(canonical_syncs, 2);
+			UT_ASSERT_EQ(prepare_apply.terminal_projection_stores, 4);
+		}
+		UT_ASSERT(canonical_scope == NULL && canonical_writer_depth == 0
+				  && owner.undo_headers == NULL);
+		UT_ASSERT_EQ(fclose(canonical_file), 0);
+		canonical_file = NULL;
+		canonical_expected_full_xid = 0;
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
+UT_TEST(test_v2_plan_without_undo_authority_and_bare_apply_refuse)
+{
+	RfSideOnlinePlanV1 *plan = undo_v2_slot_plan(false);
+	RfSideOnlineProductionOwnerV1 owner;
+	RfSideOnlineOperationV1 commit;
+	int original_authority;
+
+	if (plan == NULL)
+		return;
+	reset_prepare_apply();
+	UT_ASSERT(rf_side_online_plan_operation_v1(plan, 1, &commit));
+	UT_ASSERT(rf_side_xact_structural_preflight_v1(&commit.xact));
+	UT_ASSERT_EQ(rf_side_xact_apply_owned_v1(&commit.xact, NULL, 0), RF_SIDE_XACT_APPLY_BLOCKED);
+	UT_ASSERT(rf_side_online_production_owner_init_v1(&owner, &original_authority,
+													  canonical_authority_fresh, 19, true));
+	UT_ASSERT_EQ(rf_side_online_production_preflight_v1(plan, &owner),
+				 RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
+	UT_ASSERT_EQ(rf_side_online_production_apply_v1(plan, &owner),
+				 RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
+	UT_ASSERT_EQ(prepare_apply.tt_reads, 0);
+	UT_ASSERT_EQ(prepare_apply.tt_stamps, 0);
+	UT_ASSERT_EQ(prepare_apply.terminal_projection_stores, 0);
+	UT_ASSERT(!owner.protected_set_active && owner.undo_headers == NULL);
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
 UT_TEST(test_undo_header_repeated_slot_exact_source_membership_without_init)
 {
 	RfSideOnlinePlanV1 *plan = undo_repeated_slot_plan(false);
@@ -5241,7 +5503,7 @@ UT_TEST(test_space_incarnation_end_rejects_old_uuid_reappearance_and_retained_ga
 int
 main(void)
 {
-	UT_PLAN(75);
+	UT_PLAN(79);
 	UT_RUN(test_space_incarnation_end_requires_an_actual_later_space0_contribution);
 	UT_RUN(test_space_incarnation_end_rejects_old_uuid_reappearance_and_retained_gaps);
 	UT_RUN(test_space_retained_ancestry_create_and_independent_page_terminal);
@@ -5276,6 +5538,10 @@ main(void)
 	UT_RUN(test_covered_commit_requires_owner_proof_before_projection_without_tt_rewind);
 	UT_RUN(test_undo_header_repeated_slot_exact_source_membership_without_init);
 	UT_RUN(test_undo_header_later_disk_slot_does_not_hide_conflicting_source);
+	UT_RUN(test_v2_header_exact_full_slot_source_membership);
+	UT_RUN(test_v2_later_target_cannot_hide_full_xid_source_conflict);
+	UT_RUN(test_v2_protected_owner_installs_complete_header_before_projection);
+	UT_RUN(test_v2_plan_without_undo_authority_and_bare_apply_refuse);
 	UT_RUN(test_sealed_source_match_requires_observed_namespace_and_exact_cut);
 	UT_RUN(test_folded_commit_segment_must_belong_to_source_origin);
 	UT_RUN(test_online_undo_header_evolves_init_bind_and_folded_commit);
