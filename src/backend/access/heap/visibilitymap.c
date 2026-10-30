@@ -117,6 +117,7 @@
 #include "access/heapam_xlog.h"
 #include "access/htup_details.h"
 #include "access/visibilitymap.h"
+#include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "access/xlogutils.h"
 #include "miscadmin.h"
@@ -127,6 +128,7 @@
 #include "utils/inval.h"
 
 #ifdef USE_PGRAC_CLUSTER
+#include "catalog/catversion.h"
 #include "catalog/pg_control.h"
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_guc.h"
@@ -658,10 +660,7 @@ visibilitymap_set(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
 	/* PGRAC: only a real WAL redo call may reproduce an old positive bit. */
 	if (cluster_heap_maintenance_restricted(rel) &&
 		!(InRecovery && !XLogRecPtrIsInvalid(recptr)))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("all-visible publication for shared heaps is not supported"),
-				 errhint("Use ordinary heap visibility checks for shared relations.")));
+		return;
 	if (!visibilitymap_pin_ok(heapBlk, vmBuf))
 		elog(ERROR, "wrong VM buffer passed to visibilitymap_set");
 	LockBuffer(vmBuf, BUFFER_LOCK_EXCLUSIVE);
@@ -692,10 +691,7 @@ visibilitymap_set_retry_aware(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
 	/* PGRAC: only a real WAL redo call may reproduce an old positive bit. */
 	if (cluster_heap_maintenance_restricted(rel) &&
 		!(InRecovery && !XLogRecPtrIsInvalid(recptr)))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("all-visible publication for shared heaps is not supported"),
-				 errhint("Use ordinary heap visibility checks for shared relations.")));
+		return false;
 	if (!visibilitymap_pin_ok(heapBlk, *vmbuf))
 		elog(ERROR, "wrong VM buffer passed to visibilitymap_set_retry_aware");
 	if (!ClusterLockBufferExclusiveAuxiliaryAware(vmbuf, context))
@@ -1014,7 +1010,7 @@ visibilitymap_get_status_pinned(Relation rel, BlockNumber heapBlk, Buffer vmbuf,
  */
 bool
 visibilitymap_read_begin(Relation rel, BlockNumber heapBlk, Buffer *vmbuf,
-						 VisibilityMapReadScope *scope, uint8 *status)
+						 volatile VisibilityMapReadScope *scope, uint8 *status)
 {
 	BlockNumber mapBlock = HEAPBLK_TO_MAPBLOCK(heapBlk);
 	RelFileLocator locator;
@@ -1065,7 +1061,7 @@ visibilitymap_read_begin(Relation rel, BlockNumber heapBlk, Buffer *vmbuf,
  * acquisition invoke no services and prove no publication or skip permission. */
 bool
 visibilitymap_read_snapshot_begin(Relation rel, BlockNumber heapBlk, Snapshot snapshot,
-								  Buffer *vmbuf, VisibilityMapReadScope *scope, uint8 *status)
+								  Buffer *vmbuf, volatile VisibilityMapReadScope *scope, uint8 *status)
 {
 	ClusterSnapshotReadScopeV1 evaluation;
 	ClusterUndoReadAdmissionFence admission;
@@ -1086,14 +1082,19 @@ visibilitymap_read_snapshot_begin(Relation rel, BlockNumber heapBlk, Snapshot sn
 	cluster_snapshot_read_enter_v1(&evaluation, snapshot);
 	PG_TRY();
 	{
-		if (cluster_snapshot_cr_identity_v1(snapshot, &before)
-			&& cluster_undo_horizon_read_admission_capture(evaluation.read_scn, &admission)
-			&& cluster_space_relation_identity_capture_v1(rel, &identity)
-			&& visibilitymap_read_begin(rel, heapBlk, vmbuf, scope, status)
-			&& cluster_snapshot_cr_identity_v1(snapshot, &after) && before == after
-			&& cluster_undo_horizon_read_admission_current(&admission)
-			&& cluster_space_relation_identity_current_v1(rel, &identity))
-			observed = true;
+		if (cluster_snapshot_cr_identity_v1(snapshot, &before))
+		{
+			CommandId original_cid = snapshot->curcid;
+
+			if (cluster_undo_horizon_read_admission_capture(evaluation.read_scn, &admission)
+				&& cluster_space_relation_identity_capture_v1(rel, &identity)
+				&& visibilitymap_read_begin(rel, heapBlk, vmbuf, scope, status)
+				&& cluster_snapshot_cr_identity_v1(snapshot, &after) && before == after
+				&& snapshot->curcid == original_cid
+				&& cluster_undo_horizon_read_admission_current(&admission)
+				&& cluster_space_relation_identity_current_v1(rel, &identity))
+				observed = true;
+		}
 	}
 	PG_FINALLY();
 	{
@@ -1108,9 +1109,36 @@ visibilitymap_read_snapshot_begin(Relation rel, BlockNumber heapBlk, Snapshot sn
 }
 #endif
 
+/* Publication eligibility comes from guarded writers in the selected catalog;
+ * freshness still requires the original current-image and snapshot bracket. */
+bool
+visibilitymap_read_qualified_begin(Relation rel, BlockNumber heapBlk,
+								  struct SnapshotData *snapshot, Buffer *vmbuf,
+								  volatile VisibilityMapReadScope *scope, uint8 *status)
+{
+	if (status != NULL)
+		*status = 0;
+	if (rel == NULL || vmbuf == NULL || scope == NULL || status == NULL
+		|| heapBlk == InvalidBlockNumber || BufferIsValid(scope->locked_buffer))
+		return false;
+	if (!cluster_heap_maintenance_restricted(rel))
+		return visibilitymap_read_begin(rel, heapBlk, vmbuf, scope, status);
+#ifdef USE_PGRAC_CLUSTER
+	{
+		uint32 minimum_catalog = PGRAC_VM_QUALIFIED_CATALOG_VERSION;
+
+		if (minimum_catalog == 0 || GetControlFileCatalogVersion() < minimum_catalog)
+			return false;
+	}
+	return visibilitymap_read_snapshot_begin(rel, heapBlk, snapshot, vmbuf, scope, status);
+#else
+	return false;
+#endif
+}
+
 /* Release only the scope's read lock; the caller still owns the pin. */
 void
-visibilitymap_read_end(VisibilityMapReadScope *scope)
+visibilitymap_read_end(volatile VisibilityMapReadScope *scope)
 {
 	if (scope == NULL || !BufferIsValid(scope->locked_buffer))
 		return;

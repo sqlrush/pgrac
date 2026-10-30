@@ -970,14 +970,21 @@ UT_TEST(test_versioned_visible_keeps_heap_full_page_protection)
 UT_TEST(test_shared_visible_refuses_before_locks_or_capture)
 {
 	for (int bits = 0; bits <= VISIBILITYMAP_VALID_BITS; bits++) {
+		volatile bool caught = false;
 		reset(true, false, bits);
 		expecting_error = true;
-		if (setjmp(error_jump) == 0) {
+		PG_TRY();
+		{
 			visibilitymap_set(&relation, 0, 1, InvalidXLogRecPtr, 2, 70,
 							  VISIBILITYMAP_VALID_BITS, &identity);
-			UT_ASSERT(false);
 		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
 		expecting_error = false;
+		UT_ASSERT(!caught);
 		UT_ASSERT_EQ(edge_count + lock_calls + inserts + CritSectionCount, 0);
 		UT_ASSERT_EQ(memcmp(pages, before, sizeof(pages)), 0);
 	}

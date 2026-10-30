@@ -2358,6 +2358,40 @@ all: test_cluster_vm_vacuum_fsm_order test_cluster_vm_vacuum_fsm_order_noassert
 TESTS += test_cluster_vm_vacuum_post_prune test_cluster_vm_vacuum_post_prune_noassert
 all: test_cluster_vm_vacuum_post_prune test_cluster_vm_vacuum_post_prune_noassert
 
+TESTS += test_cluster_vm_qualified_ios test_cluster_vm_qualified_ios_noassert test_cluster_vm_qualified_ios_unassigned
+all: test_cluster_vm_qualified_ios test_cluster_vm_qualified_ios_noassert test_cluster_vm_qualified_ios_unassigned
+
+.PHONY: check_vm_setter_census
+check: check_vm_setter_census
+check_vm_setter_census:
+	python3 $(srcdir)/check_vm_setter_census.py $(top_srcdir)
+
+test_cluster_vm_qualified_format.inc test_cluster_vm_qualified_read.inc test_cluster_vm_qualified_ios.inc: \
+		$(srcdir)/extract_vm_qualified_ios_fixture.py $(srcdir)/extract_vacuum_mx_fixture.py \
+		$(top_srcdir)/src/backend/access/heap/visibilitymap.c \
+		$(top_srcdir)/src/backend/executor/nodeIndexonlyscan.c \
+		$(top_srcdir)/src/backend/access/transam/xlog.c
+	python3 $(srcdir)/extract_vm_qualified_ios_fixture.py $(top_srcdir)/src/backend $(patsubst test_cluster_vm_qualified_%.inc,%,$@) > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_vm_qualified_ios test_cluster_vm_qualified_ios_noassert test_cluster_vm_qualified_ios_unassigned: \
+		test_cluster_vm_qualified_ios.c test_cluster_vm_visible_version.c \
+		test_cluster_vm_qualified_format.inc test_cluster_vm_qualified_read.inc test_cluster_vm_qualified_ios.inc \
+		test_cluster_heap_maintenance_policy.inc unit_test.h \
+		$(top_srcdir)/src/include/access/visibilitymap.h $(top_srcdir)/src/include/catalog/catversion.h \
+		$(top_srcdir)/src/include/cluster/cluster_pcm_lock.h $(top_srcdir)/src/include/commands/vacuum.h \
+		test_cluster_vm_buffer_matches.inc test_cluster_vm_repair_versioned.inc \
+		test_cluster_vm_repair_clear.inc test_cluster_vm_repair_missing_heap.inc \
+		test_cluster_vm_repair_lpdead.inc test_cluster_vm_visible_body.inc test_cluster_vm_visible_log.inc \
+		test_cluster_vm_visible_wrapper.inc test_cluster_vm_visible_empty.inc \
+		test_cluster_vm_empty_scan.inc test_cluster_vm_empty_set.inc \
+		test_cluster_space_bufpage_product.o test_cluster_space_producer_product.o \
+		test_cluster_space_storage_product.o $(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(if $(filter %_noassert,$@),-DFIXTURE_NO_ASSERTS) $(if $(filter %_unassigned,$@),-DFIXTURE_UNASSIGNED_CATALOG) $< \
+		test_cluster_space_bufpage_product.o test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
 # The exact common-final caller suffix, including both deferred-clear paths.
 test_cluster_vm_vacuum_post_prune.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
 	awk '/^lazy_scan_heap\(/ { scan=1 } \

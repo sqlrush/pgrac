@@ -34,6 +34,31 @@
 
 UT_DEFINE_GLOBALS();
 
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+
+void
+pg_re_throw(void)
+{
+	abort();
+}
+
+/* This legacy-reader fixture deliberately has no qualified catalog. The
+ * real qualified reader and publisher-to-IOS chain have a separate fixture. */
+bool
+visibilitymap_read_qualified_begin(Relation rel, BlockNumber block,
+								  struct SnapshotData *snapshot, Buffer *buffer,
+								  volatile VisibilityMapReadScope *scope, uint8 *status)
+{
+	(void)rel;
+	(void)block;
+	(void)snapshot;
+	(void)buffer;
+	UT_ASSERT_EQ(scope->locked_buffer, InvalidBuffer);
+	*status = 0;
+	return false;
+}
+
 static PGAlignedBlock disk_vm, current_vm, reader_vm;
 static SMgrRelationData fixture_smgr;
 static bool fixture_shared, fixture_visible;

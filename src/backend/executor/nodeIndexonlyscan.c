@@ -126,6 +126,10 @@ IndexOnlyNext(IndexOnlyScanState *node)
 	while ((tid = index_getnext_tid(scandesc, direction)) != NULL)
 	{
 		bool		tuple_from_heap = false;
+		bool		skip_tuple = false;
+		/* Preserve cleanup state across PG_TRY error unwinding. */
+		volatile VisibilityMapReadScope vm_scope = {0};
+		uint8		vm_status = 0;
 
 		CHECK_FOR_INTERRUPTS();
 
@@ -134,7 +138,7 @@ IndexOnlyNext(IndexOnlyScanState *node)
 		 * which all tuples are known visible to everybody.  In any case,
 		 * we'll use the index tuple not the heap tuple as the data source.
 		 *
-		 * Note on Memory Ordering Effects: visibilitymap_get_status does not
+		 * For native relations, visibilitymap_get_status does not
 		 * lock the visibility map buffer, and therefore the result we read
 		 * here could be slightly stale.  However, it can't be stale enough to
 		 * matter.
@@ -163,61 +167,82 @@ IndexOnlyNext(IndexOnlyScanState *node)
 		 * It's worth going through this complexity to avoid needing to lock
 		 * the VM buffer, which could cause significant contention.
 		 */
-		/* PGRAC: a shared raw VM positive is not a visibility proof. */
-		if (cluster_heap_maintenance_restricted(scandesc->heapRelation) ||
-			!VM_ALL_VISIBLE(scandesc->heapRelation,
-							ItemPointerGetBlockNumber(tid),
-							&node->ioss_VMBuffer))
+		/* Consume this TID's index data before ending its shared VM scope.
+		 * Heap fetches and user quals must run after releasing that scope. */
+		PG_TRY();
 		{
+			if (cluster_heap_maintenance_restricted(scandesc->heapRelation) ?
+				(!visibilitymap_read_qualified_begin(scandesc->heapRelation,
+					ItemPointerGetBlockNumber(tid), estate->es_snapshot,
+					&node->ioss_VMBuffer, &vm_scope, &vm_status)
+				 || (vm_status & VISIBILITYMAP_ALL_VISIBLE) == 0) :
+				!VM_ALL_VISIBLE(scandesc->heapRelation,
+								ItemPointerGetBlockNumber(tid),
+								&node->ioss_VMBuffer))
+			{
+				visibilitymap_read_end(&vm_scope);
+				/*
+				 * Rats, we have to visit the heap to check visibility.
+				 */
+				InstrCountTuples2(node, 1);
+				if (!index_fetch_heap(scandesc, node->ioss_TableSlot))
+					skip_tuple = true;
+				else
+				{
+					ExecClearTuple(node->ioss_TableSlot);
+
+					/*
+					 * Only MVCC snapshots are supported here, so there should be no
+					 * need to keep following the HOT chain once a visible entry has
+					 * been found.  If we did want to allow that, we'd need to keep
+					 * more state to remember not to call index_getnext_tid next time.
+					 */
+					if (scandesc->xs_heap_continue)
+						elog(ERROR, "non-MVCC snapshots are not supported in index-only scans");
+
+					/*
+					 * Note: at this point we are holding a pin on the heap page, as
+					 * recorded in scandesc->xs_cbuf.  We could release that pin now,
+					 * but it's not clear whether it's a win to do so.  The next index
+					 * entry might require a visit to the same heap page.
+					 */
+
+					tuple_from_heap = true;
+				}
+			}
+
 			/*
-			 * Rats, we have to visit the heap to check visibility.
+			 * Fill the scan tuple slot with data from the index.  This might be
+			 * provided in either HeapTuple or IndexTuple format.  Conceivably an
+			 * index AM might fill both fields, in which case we prefer the heap
+			 * format, since it's probably a bit cheaper to fill a slot from.
 			 */
-			InstrCountTuples2(node, 1);
-			if (!index_fetch_heap(scandesc, node->ioss_TableSlot))
-				continue;		/* no visible tuple, try next index entry */
-
-			ExecClearTuple(node->ioss_TableSlot);
-
-			/*
-			 * Only MVCC snapshots are supported here, so there should be no
-			 * need to keep following the HOT chain once a visible entry has
-			 * been found.  If we did want to allow that, we'd need to keep
-			 * more state to remember not to call index_getnext_tid next time.
-			 */
-			if (scandesc->xs_heap_continue)
-				elog(ERROR, "non-MVCC snapshots are not supported in index-only scans");
-
-			/*
-			 * Note: at this point we are holding a pin on the heap page, as
-			 * recorded in scandesc->xs_cbuf.  We could release that pin now,
-			 * but it's not clear whether it's a win to do so.  The next index
-			 * entry might require a visit to the same heap page.
-			 */
-
-			tuple_from_heap = true;
+			if (!skip_tuple)
+			{
+				if (scandesc->xs_hitup)
+				{
+					/*
+					 * We don't take the trouble to verify that the provided tuple has
+					 * exactly the slot's format, but it seems worth doing a quick
+					 * check on the number of fields.
+					 */
+					Assert(slot->tts_tupleDescriptor->natts ==
+						   scandesc->xs_hitupdesc->natts);
+					ExecForceStoreHeapTuple(scandesc->xs_hitup, slot, false);
+				}
+				else if (scandesc->xs_itup)
+					StoreIndexTuple(node, slot, scandesc->xs_itup, scandesc->xs_itupdesc);
+				else
+					elog(ERROR, "no data returned for index-only scan");
+			}
 		}
-
-		/*
-		 * Fill the scan tuple slot with data from the index.  This might be
-		 * provided in either HeapTuple or IndexTuple format.  Conceivably an
-		 * index AM might fill both fields, in which case we prefer the heap
-		 * format, since it's probably a bit cheaper to fill a slot from.
-		 */
-		if (scandesc->xs_hitup)
+		PG_FINALLY();
 		{
-			/*
-			 * We don't take the trouble to verify that the provided tuple has
-			 * exactly the slot's format, but it seems worth doing a quick
-			 * check on the number of fields.
-			 */
-			Assert(slot->tts_tupleDescriptor->natts ==
-				   scandesc->xs_hitupdesc->natts);
-			ExecForceStoreHeapTuple(scandesc->xs_hitup, slot, false);
+			visibilitymap_read_end(&vm_scope);
 		}
-		else if (scandesc->xs_itup)
-			StoreIndexTuple(node, slot, scandesc->xs_itup, scandesc->xs_itupdesc);
-		else
-			elog(ERROR, "no data returned for index-only scan");
+		PG_END_TRY();
+		if (skip_tuple)
+			continue;
 
 		/*
 		 * If the index was lossy, we have to recheck the index quals.

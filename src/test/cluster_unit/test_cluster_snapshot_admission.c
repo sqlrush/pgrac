@@ -93,8 +93,8 @@ static BlockNumber vm_chain_block;
 static Buffer vm_chain_read_buffer;
 
 static bool vm_chain_read_begin(Relation rel, BlockNumber block, Buffer *buffer,
-								VisibilityMapReadScope *scope, uint8 *status);
-static void vm_chain_read_end(VisibilityMapReadScope *scope);
+								volatile VisibilityMapReadScope *scope, uint8 *status);
+static void vm_chain_read_end(volatile VisibilityMapReadScope *scope);
 static uint8 vm_chain_raw_status(Relation rel, BlockNumber block, Buffer *buffer);
 static bool vm_chain_pinned_status(Relation rel, BlockNumber block, Buffer buffer, uint8 *status);
 static int error_code;
@@ -1179,7 +1179,7 @@ cluster_heap_maintenance_restricted(Relation rel)
 
 bool
 visibilitymap_read_begin(Relation rel, BlockNumber block, Buffer *buffer,
-						 VisibilityMapReadScope *scope, uint8 *status)
+						 volatile VisibilityMapReadScope *scope, uint8 *status)
 {
 	if (vm_chain_enabled)
 		return vm_chain_read_begin(rel, block, buffer, scope, status);
@@ -1232,7 +1232,7 @@ visibilitymap_read_begin(Relation rel, BlockNumber block, Buffer *buffer,
 }
 
 void
-visibilitymap_read_end(VisibilityMapReadScope *scope)
+visibilitymap_read_end(volatile VisibilityMapReadScope *scope)
 {
 	if (vm_chain_enabled) {
 		vm_chain_read_end(scope);
@@ -1251,7 +1251,7 @@ visibilitymap_read_end(VisibilityMapReadScope *scope)
 /* API-absent parent: the existing VM observation does not bind a snapshot. */
 static bool
 fixture_vm_snapshot_observation(Relation rel, BlockNumber block, Snapshot snapshot, Buffer *buffer,
-								VisibilityMapReadScope *scope, uint8 *status)
+								volatile VisibilityMapReadScope *scope, uint8 *status)
 {
 	return visibilitymap_read_begin(rel, block, buffer, scope, status);
 }
@@ -1282,7 +1282,7 @@ vm_setup(Snapshot snapshot)
 }
 
 static void
-vm_observe(Snapshot snapshot, Buffer *buffer, VisibilityMapReadScope *scope, uint8 *status)
+vm_observe(Snapshot snapshot, Buffer *buffer, volatile VisibilityMapReadScope *scope, uint8 *status)
 {
 	PG_TRY();
 	{
@@ -1707,7 +1707,7 @@ vm_chain_setup(RelationData *rel, FormData_pg_class *form, Snapshot snapshot)
 
 static void
 vm_chain_observe(Relation rel, BlockNumber block, Snapshot snapshot, Buffer *buffer,
-				 VisibilityMapReadScope *scope, uint8 *status)
+				 volatile VisibilityMapReadScope *scope, uint8 *status)
 {
 	vm_result = vm_caught = false;
 	PG_TRY();
@@ -1722,7 +1722,7 @@ vm_chain_observe(Relation rel, BlockNumber block, Snapshot snapshot, Buffer *buf
 }
 
 static void
-vm_chain_finish(Snapshot snapshot, VisibilityMapReadScope *scope)
+vm_chain_finish(Snapshot snapshot, volatile VisibilityMapReadScope *scope)
 {
 	visibilitymap_read_end(scope);
 	vm_chain_enabled = vm_fixture = false;

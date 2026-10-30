@@ -713,6 +713,10 @@
 /* Target FULL CR diagnostic entry (oid 8980). Fresh homogeneous initdb only. */
 #define CATALOG_VERSION_NO 202610220
 
+/* Minimum loaded catalog admitting qualified shared VM bits. Zero keeps
+ * the shortcut disabled until the integrated catalog identity is assigned. */
+#define PGRAC_VM_QUALIFIED_CATALOG_VERSION 0
+
 /* spec-5.13 (2026-06-27): clean-leave catalog surface — cluster_get_clean_leave_state
  * SRF (oid 8960) + pg_cluster_clean_leave_state view + pg_cluster_clean_leave_request
  * operator UDF (oid 8961).  Bump 202606300 -> 202606310. */

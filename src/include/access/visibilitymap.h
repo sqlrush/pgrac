@@ -111,7 +111,7 @@ typedef struct VisibilityMapReadScope
  * block acquisition. False clears status; an active scope is left unchanged.
  * Native or missing-map success acquires no read lock. */
 extern bool visibilitymap_read_begin(Relation rel, BlockNumber heapBlk, Buffer *vmbuf,
-									 VisibilityMapReadScope *scope, uint8 *status);
+									 volatile VisibilityMapReadScope *scope, uint8 *status);
 #ifdef USE_PGRAC_CLUSTER
 struct SnapshotData;
 /* Same entry/exit and pin rules as read_begin. Shared observation also requires
@@ -121,10 +121,19 @@ struct SnapshotData;
  * Failure unwinds only the new scope, preserving any scope active on entry. */
 extern bool visibilitymap_read_snapshot_begin(Relation rel, BlockNumber heapBlk,
 											  struct SnapshotData *snapshot, Buffer *vmbuf,
-											  VisibilityMapReadScope *scope, uint8 *status);
+											  volatile VisibilityMapReadScope *scope, uint8 *status);
 #endif
+struct SnapshotData;
+/* Shared positive bits require the qualified catalog and the original
+ * snapshot/SPACE/current-S bracket. Consume only this TID inside the scope;
+ * end before heap fallback, user code, I/O or another block acquisition.
+ * Old/unknown formats refuse without acquiring VM. Caller retains snapshot
+ * and relation lifecycle; native relations keep their raw-reader behavior. */
+extern bool visibilitymap_read_qualified_begin(Relation rel, BlockNumber heapBlk,
+											  struct SnapshotData *snapshot, Buffer *vmbuf,
+											  volatile VisibilityMapReadScope *scope, uint8 *status);
 /* Idempotent; releases only this scope's read lock, never the caller's pin. */
-extern void visibilitymap_read_end(VisibilityMapReadScope *scope);
+extern void visibilitymap_read_end(volatile VisibilityMapReadScope *scope);
 /* No content locks on entry; relation lifecycle lock retained. False clears
  * status. Success observes bits only, without granting visibility/freeze skips.
  * The returned pin remains caller-owned, with no retained content lock. */
