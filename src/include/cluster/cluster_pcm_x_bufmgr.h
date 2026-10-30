@@ -1170,4 +1170,11 @@ extern ResourceXApplyResult cluster_bufmgr_pcm_own_acquire_fill_image_exact(
 	const ResourceXDecodedAcquireIntent *episode,
 	const struct ClusterSemanticAdmissionToken *admission, const ResourceXDeliveryClaim *prepared);
 
+/* Original N/CURRENT or N/PI read: preserve independent old PI first,
+ * then finish the same prepared executor through native input IO and C. */
+extern ResourceXApplyResult cluster_bufmgr_pcm_own_acquire_fill_resident_exact(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
+	const ResourceXDecodedAcquireIntent *episode,
+	const struct ClusterSemanticAdmissionToken *admission, const ResourceXDeliveryClaim *prepared);
+
 #endif /* CLUSTER_PCM_X_BUFMGR_H */

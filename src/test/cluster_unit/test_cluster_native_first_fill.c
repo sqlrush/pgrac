@@ -16,7 +16,17 @@ uint32 LockBufHdr(BufferDesc *buf) { return request_header_lock(buf); }
 #define ereport(level, rest) ordinary_report(level)
 #include "test_cluster_native_disk_guard.inc"
 #include "test_cluster_native_disk_episode.inc"
+#ifdef NATIVE_RESIDENT_FILL_COMPOSITION
+/* Retain the actual image body while exposing the same content-lock
+ * boundary leaves as the original disk staging component. */
+#define LWLockAcquire stage_content_acquire
+#define LWLockRelease stage_content_release
+#endif
 #include "test_cluster_native_image_episode.inc"
+#ifdef NATIVE_RESIDENT_FILL_COMPOSITION
+#undef LWLockRelease
+#undef LWLockAcquire
+#endif
 #include "test_cluster_native_first_fill_cleanup.inc"
 #undef GetPrivateRefCount
 #undef LockBufHdr

@@ -50,8 +50,13 @@ TerminateBufferIO(BufferDesc *buf, bool clear_dirty, uint32 set_bits)
 	UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&buf->state) & BM_VALID, 0);
 	UT_ASSERT(ResourceOwnerHasBufferIO(original_io_owner, 1));
-	if (complete_before_io_error)
+	if (complete_before_io_error) {
+#ifdef NATIVE_RESIDENT_FILL_COMPOSITION
+		/* A single injected interrupt, including during nested recovery. */
+		complete_before_io_error = false;
+#endif
 		pg_re_throw();
+	}
 	complete_actual_terminate(buf, clear_dirty, set_bits);
 	if (complete_after_io_error)
 		pg_re_throw();

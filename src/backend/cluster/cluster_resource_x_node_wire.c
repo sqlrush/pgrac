@@ -900,7 +900,7 @@ resource_x_completion_body_valid(const ResourceXDecodedFrame *frame)
 		&& (disk
 			? (frame->payload_bytes == RESOURCE_X_COMPLETE_V5_BYTES
 				&& (a->episode.path == RESOURCE_X_ACQUIRE_FIRST_FILL
-					|| (no_image && a->episode.path == RESOURCE_X_ACQUIRE_RESIDENT
+					|| (a->episode.path == RESOURCE_X_ACQUIRE_RESIDENT
 						&& frame->common.observed_mode == (uint8)PCM_STATE_N
 						&& frame->common.target_mode == (uint8)PCM_STATE_S))
 				&& a->holders_bitmap == 0 && a->required_holders_bitmap == 0 && a->pi_holders_bitmap == 0)

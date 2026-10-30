@@ -448,10 +448,81 @@ UT_TEST(test_pi_proof_window_change_keeps_both_owned_responsibilities)
 	}
 }
 
+static bool
+pi_resident_start(PiFixture *f, PcmState mode, ClusterPcmOwnSnapshot *base)
+{
+	ClusterPcmOwnSnapshot pending;
+	int32 id = -1;
+
+	if (!pi_start_target(f, true, 0, mode, PCM_STATE_X)) return false;
+	if (cluster_pcm_lock_resource_x_acquire_s_source_handoff_snapshot_exact(
+		&f->source.block, 0, &id, &pending) != RESOURCE_X_APPLY_APPLIED) return false;
+	*base = pending; base->flags = 0;
+	return cluster_pcm_lock_resource_x_acquire_s_source_handoff_exact(
+		&f->source.block, 0, id, &pending, base) == RESOURCE_X_APPLY_APPLIED;
+}
+
+UT_TEST(test_resident_PI_requires_independent_exact_body_without_retiring_owners)
+{
+	for (int x = 0; x < 2; x++) {
+		PiFixture f; ClusterPcmOwnSnapshot base; ClusterPcmResourceXMasterState before;
+		ClusterPcmLocalPiSnapshotV1 after;
+		UT_ASSERT(pi_resident_start(&f, x ? PCM_STATE_X : PCM_STATE_S, &base));
+		before = *f.source.m.state;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_resident_image_preserved_exact(&base,
+			f.source.page.data), RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT(memcmp(&before, f.source.m.state, sizeof(before)) == 0);
+		UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(base.tag, &after));
+		UT_ASSERT(memcmp(&after, &f.local, sizeof(after)) == 0);
+		pi_end();
+	}
+}
+
+UT_TEST(test_resident_PI_rejects_uncovered_bytes_identity_and_malformed_carrier)
+{
+	for (int fault = 0; fault < 7; fault++) {
+		PiFixture f; ClusterPcmOwnSnapshot base; ClusterPcmResourceXMasterState before;
+		PGIOAlignedBlock page;
+		UT_ASSERT(pi_resident_start(&f, PCM_STATE_X, &base));
+		memcpy(page.data, f.source.page.data, BLCKSZ);
+		if (fault == 0) page.data[BLCKSZ - 1] ^= 1;
+		if (fault == 1) base.generation++;
+		if (fault == 2) base.reservation_token++;
+		if (fault == 3) base.tag.blockNum++;
+		if (fault == 4) base.writer_activation_token = 1;
+		if (fault == 5) f.source.m.state->pi_carrier.reserved[0] = 1;
+		if (fault == 6) {
+			ClusterPageWalBindingV1 newer = f.last;
+			newer.record_start = newer.record_end; newer.record_end += 10;
+			newer.version.mutation_token++;
+			UT_ASSERT(cluster_pcm_local_pi_record_v1(base.tag, &newer));
+		}
+		before = *f.source.m.state;
+		UT_ASSERT(cluster_pcm_lock_resource_x_resident_image_preserved_exact(&base,
+			page.data) != RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT(memcmp(&before, f.source.m.state, sizeof(before)) == 0);
+		pi_end();
+	}
+}
+
+UT_TEST(test_resident_PI_DATA_retirement_keeps_original_transport_and_allows_refill)
+{
+	PiFixture f; ClusterPcmOwnSnapshot base; ClusterPcmResourceXMasterState before;
+	UT_ASSERT(pi_resident_start(&f, PCM_STATE_X, &base));
+	local_pi_covered = true; UT_ASSERT(pi_retire(&f, false));
+	before = *f.source.m.state;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_resident_image_preserved_exact(&base,
+		f.source.page.data), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(memcmp(&before, f.source.m.state, sizeof(before)) == 0);
+	UT_ASSERT_EQ(before.pi_carrier.transport_refs, 1);
+	UT_ASSERT_EQ(before.pi_carrier.pi_refs, 0);
+	pi_end();
+}
+
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(17);
 	UT_RUN(test_pi_master_arms_settlement_without_retiring_pi);
 	UT_RUN(test_pi_transport_settlement_keeps_original_body_and_wal_scope);
 	UT_RUN(test_pi_retirement_after_transport_releases_body_with_ack_still_owned);
@@ -466,6 +537,9 @@ main(void)
 	UT_RUN(test_pi_original_wal_floor_counts_both_owners_and_releases_exact_refs);
 	UT_RUN(test_pi_quiet_and_no_image_cleanup_preserve_independent_wal_duty);
 	UT_RUN(test_pi_proof_window_change_keeps_both_owned_responsibilities);
+	UT_RUN(test_resident_PI_requires_independent_exact_body_without_retiring_owners);
+	UT_RUN(test_resident_PI_rejects_uncovered_bytes_identity_and_malformed_carrier);
+	UT_RUN(test_resident_PI_DATA_retirement_keeps_original_transport_and_allows_refill);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

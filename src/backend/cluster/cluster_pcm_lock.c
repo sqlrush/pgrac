@@ -14066,16 +14066,15 @@ pcm_resource_x_acquire_read_unarmed(uint64 purpose)
 		|| pcm_resource_x_acquire_wait_cancel(purpose);
 }
 
-/* Resident reads share only the pre-executor no-image cancellation
- * projection. Successful/armed first-fill byte proofs stay first-fill-only. */
+/* An unarmed resident cancellation preserves valid old bytes. Once input
+ * IO is armed, the ordinary physical read/quiet proof is mandatory. */
 static bool
 pcm_resource_x_acquire_resident_wait_cancel(const ResourceXDecodedAcquireIntent *episode,
 	const ResourceXDecodedCommon *request, uint64 purpose)
 {
 	return episode->path == RESOURCE_X_ACQUIRE_RESIDENT
 		&& request->observed_mode == PCM_STATE_N && request->target_mode == PCM_STATE_S
-		&& (pcm_resource_x_acquire_wait_cancel(purpose)
-			|| purpose == RESOURCE_X_DELIVERY_ACQUIRE_UNARMED_CONSUMED);
+		&& pcm_resource_x_acquire_read_unarmed(purpose);
 }
 
 static bool
@@ -14120,8 +14119,8 @@ pcm_resource_x_acquire_read_receipt_valid_locked(const ClusterPcmResourceXBootst
 		return memcmp(r, &empty, sizeof(empty)) == 0;
 	return round->has_acquire_intent == 1
 		&& (round->acquire_intent.path == RESOURCE_X_ACQUIRE_FIRST_FILL
-			|| pcm_resource_x_acquire_resident_wait_cancel(&round->acquire_intent,
-				&round->request, round->delivery_executor_purpose))
+			|| (round->acquire_intent.path == RESOURCE_X_ACQUIRE_RESIDENT
+				&& round->request.observed_mode == PCM_STATE_N))
 		&& round->request.target_mode == PCM_STATE_S
 		&& (pcm_resource_x_acquire_wait_cancel(round->delivery_executor_purpose)
 			? r->authority_generation == 0 && r->decision_crc32c == 0
@@ -26065,6 +26064,47 @@ pcm_resource_x_read_source_pair_clear(ClusterPcmResourceXMasterState *state)
 	memset(&state->pi_carrier, 0, sizeof(state->pi_carrier));
 }
 
+/* A resident refill may overwrite old bytes only when any local PI duty
+ * has an independently retained, byte-exact body and WAL scope. This is
+ * evidence only: the caller must retain and recheck its native GP/hold. */
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_resident_image_preserved_exact(
+	const ClusterPcmOwnSnapshot *base, const char *page)
+{
+	PcmEntryRef ref;
+	PcmEntryAcquireResult acquired;
+	ClusterPcmResourceXMasterState *state;
+	ClusterPcmLocalPiSnapshotV1 local, covered;
+	ResourceXDecodedFrame image;
+	ResourceXApplyResult result = RESOURCE_X_APPLY_LOCAL_WAIT;
+
+	if (base == NULL || page == NULL || base->pcm_state != PCM_STATE_N
+		|| (base->buffer_type != BUF_TYPE_CURRENT && base->buffer_type != BUF_TYPE_PI)
+		|| base->flags != 0 || base->writer_activation_token != 0
+		|| base->resource_x_activation_generation != 0)
+		return RESOURCE_X_APPLY_INVALID;
+	if (!pcm_entry_ref_acquire(&base->tag, false, &ref, &acquired))
+		return RESOURCE_X_APPLY_NOT_FOUND;
+	LWLockAcquire(&ref.entry->entry_lock.lock, LW_SHARED);
+	state = pcm_resource_x_master_state_for_entry(ref.entry);
+	if (state == NULL || !pcm_local_pi_snapshot_locked(ref.entry, &local)
+		|| !pcm_resource_x_pi_carrier_decode_locked(ref.entry, state, &covered))
+		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	else if (local.first.record_start == 0 && !state->pi_carrier.pi_refs)
+		result = RESOURCE_X_APPLY_APPLIED;
+	else if (state->pi_carrier.pi_refs == 1
+		&& state->holder_status.valid == RESOURCE_X_HOLDER_PAIR_PUBLISHED
+		&& cluster_pcm_own_snapshot_equal_exact(base, &state->pi_carrier.completed)
+		&& cluster_page_wal_same_mutation_v1(&local.first, &covered.first)
+		&& cluster_page_wal_same_mutation_v1(&local.last, &covered.last)
+		&& pcm_resource_x_s_source_body_valid_inner(ref.entry, state, &image)
+		&& memcmp(page, image.body.acquire_image.original_image.page_bytes, BLCKSZ) == 0)
+		result = RESOURCE_X_APPLY_APPLIED;
+	LWLockRelease(&ref.entry->entry_lock.lock);
+	pcm_entry_ref_release(&ref);
+	return result;
+}
+
 static bool
 pcm_resource_x_pi_carrier_release_locked(struct GrdEntry *entry,
 	ClusterPcmResourceXMasterState *state, const ClusterPcmResourceXPiCarrier *observed)
@@ -30028,7 +30068,7 @@ pcm_resource_x_requester_acquire_frames_mode_locked(struct GrdEntry *entry,
 	state = pcm_resource_x_master_state_for_entry(entry);
 	if (closing && (claim == NULL
 			|| (episode->path != RESOURCE_X_ACQUIRE_FIRST_FILL
-				&& !pcm_resource_x_acquire_resident_wait_cancel(episode, &observation->request, claim->purpose))
+				&& (episode->path != RESOURCE_X_ACQUIRE_RESIDENT || observation->request.observed_mode != PCM_STATE_N))
 			|| observation->request.target_mode != PCM_STATE_S
 			|| (claim->purpose != RESOURCE_X_DELIVERY_ACQUIRE_READ_ARMED
 				&& claim->purpose != RESOURCE_X_DELIVERY_ACQUIRE_PREPARED
@@ -30617,7 +30657,9 @@ pcm_resource_x_acquire_read_source(const ResourceXDecodedFrame *grant,
 	const ResourceXDecodedAcquireDecision *a = &grant->body.acquire_decision;
 
 	if (grant->kind != RESOURCE_X_WIRE_AUTHORITY_GRANT || !grant->has_acquire_decision
-		|| grant->common.target_mode != PCM_STATE_S || a->episode.path != RESOURCE_X_ACQUIRE_FIRST_FILL)
+		|| grant->common.target_mode != PCM_STATE_S
+		|| (a->episode.path != RESOURCE_X_ACQUIRE_FIRST_FILL
+			&& (a->episode.path != RESOURCE_X_ACQUIRE_RESIDENT || grant->common.observed_mode != PCM_STATE_N)))
 		return false;
 	if (a->source_kind == RESOURCE_X_ACQUIRE_SOURCE_DISK)
 		return a->source_node == -1 && a->source_service_generation == 0
@@ -30663,7 +30705,8 @@ pcm_resource_x_acquire_read_owner_locked(struct GrdEntry *entry,
 		|| execution->target.reservation_token != episode->reservation_token
 		|| execution->target.buffer_id_plus_one != (uint32)episode->buffer_id + 1
 		|| execution->target.flags != PCM_OWN_FLAG_GRANT_PENDING
-		|| episode->path != RESOURCE_X_ACQUIRE_FIRST_FILL
+		|| (episode->path != RESOURCE_X_ACQUIRE_FIRST_FILL
+			&& (episode->path != RESOURCE_X_ACQUIRE_RESIDENT || execution->observation.request.observed_mode != PCM_STATE_N))
 		|| execution->observation.request.target_mode != PCM_STATE_S
 		|| (round->delivery_executor_purpose != RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING
 			&& round->delivery_executor_purpose != RESOURCE_X_DELIVERY_ACQUIRE_READ_ARMED
@@ -31226,7 +31269,8 @@ cluster_pcm_lock_resource_x_requester_acquire_unarmed_seal_exact(
 		|| receipt->authority_generation == 0 || receipt->authority_generation == UINT64_MAX
 		|| receipt->page_lsn != 0 || receipt->page_scn != 0 || receipt->page_crc32c != 0
 		|| (receipt->write_io_generation & 1) != 0 || receipt->write_io_generation >= UINT64_MAX - 1
-		|| !pcm_resource_x_acquire_read_close_shape(execution, episode, unpublished, false))
+		|| (!pcm_resource_x_acquire_read_close_shape(execution, episode, unpublished, false)
+			&& !pcm_resource_x_acquire_wait_native_shape(execution, episode, unpublished, false)))
 		return RESOURCE_X_APPLY_INVALID;
 	if (!pcm_entry_ref_acquire(&execution->observation.request.logical_assertion.resource, false, &ref, &acquired))
 		return RESOURCE_X_APPLY_NOT_FOUND;
@@ -31266,14 +31310,18 @@ cluster_pcm_lock_resource_x_requester_acquire_read_quiet_exact(
 	ResourceXApplyResult result;
 
 	if (!pcm_resource_x_acquire_read_input(execution, episode) || receipt == NULL
-		|| !pcm_resource_x_acquire_read_close_shape(execution, episode, terminal, true))
+		|| (!pcm_resource_x_acquire_read_close_shape(execution, episode, terminal, true)
+			&& !pcm_resource_x_acquire_wait_native_shape(execution, episode, terminal, true)))
 		return RESOURCE_X_APPLY_INVALID;
 	if (!pcm_entry_ref_acquire(&execution->observation.request.logical_assertion.resource, false, &ref, &acquired))
 		return RESOURCE_X_APPLY_NOT_FOUND;
 	LWLockAcquire(&ref.entry->entry_lock.lock, LW_EXCLUSIVE);
 	result = pcm_resource_x_acquire_read_close_locked(ref.entry, execution, episode, &current, &observed);
 	if (result == RESOURCE_X_APPLY_APPLIED) {
-		if (memcmp(receipt, &observed, sizeof(observed)) != 0
+		if ((!pcm_resource_x_acquire_read_close_shape(execution, episode, terminal, true)
+				&& !(pcm_resource_x_acquire_read_unarmed(current.purpose)
+					&& pcm_resource_x_acquire_wait_native_shape(execution, episode, terminal, true)))
+			|| memcmp(receipt, &observed, sizeof(observed)) != 0
 			|| !pcm_resource_x_acquire_read_closing(current.purpose)
 			|| pcm_resource_x_acquire_wait_cancel(current.purpose))
 			result = RESOURCE_X_APPLY_STALE;
