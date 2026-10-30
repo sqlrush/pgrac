@@ -80,12 +80,12 @@ clean_send(ResourceXIntentSlot *s)
 }
 
 static bool
-clean_start(CleanFixture *f, int outcome, bool publish, bool sent)
+clean_start_mode(CleanFixture *f, int outcome, bool publish, bool sent, PcmState mode)
 {
 	memset(f, 0, sizeof(*f));
-	/* Seed a clean shared directory before A exists. This is a fixture input,
+	/* Seed a clean directory before A exists. This is a fixture input,
 	 * not a product PI/writeback completion or native qualification. */
-	if (!publish_start(2, PCM_STATE_S, &f->m)) return false;
+	if (!publish_start(mode == PCM_STATE_X ? 1 : 2, PCM_STATE_S, &f->m)) return false;
 	pg_atomic_write_u32(&((struct StopPcmEntryLayout *)fake_pcm_entries.data[0])->pi_holders_bitmap, 0);
 	f->m.plan = decision_plan_read(&f->m.work);
 	publish_apply(&f->m);
@@ -105,9 +105,14 @@ clean_start(CleanFixture *f, int outcome, bool publish, bool sent)
 	f->block = publish_decode(f->m.state->block_intents[0].payload, true);
 	f->prepared.tag = f->block.common.logical_assertion.resource;
 	f->prepared.generation = 901; f->prepared.reservation_token = 77;
-	f->prepared.flags = PCM_OWN_FLAG_REVOKING; f->prepared.pcm_state = PCM_STATE_S;
-	f->prepared.buffer_type = BUF_TYPE_SCUR; f->prepared.semantic_buf_state = BM_VALID;
+	f->prepared.flags = PCM_OWN_FLAG_REVOKING; f->prepared.pcm_state = mode;
+	f->prepared.buffer_type = mode == PCM_STATE_X ? BUF_TYPE_XCUR : BUF_TYPE_SCUR;
+	f->prepared.semantic_buf_state = BM_VALID;
 	f->finished = f->prepared; f->finished.flags = 0;
+	if (mode == PCM_STATE_X) {
+		f->finished.generation++; f->finished.pcm_state = PCM_STATE_S;
+		f->finished.buffer_type = BUF_TYPE_SCUR;
+	}
 	((PageHeader)f->page.data)->pd_lower = SizeOfPageHeaderData;
 	((PageHeader)f->page.data)->pd_upper = BLCKSZ; ((PageHeader)f->page.data)->pd_special = BLCKSZ;
 	((PageHeader)f->page.data)->pd_pagesize_version = BLCKSZ | PG_PAGE_LAYOUT_VERSION;
@@ -129,6 +134,12 @@ clean_start(CleanFixture *f, int outcome, bool publish, bool sent)
 	source_done_callback(&f->m, true);
 	if (publish && sent) { clean_send(&f->m.state->holder_status_intent.slot); clean_send(&f->m.state->holder_image_intent); }
 	return true;
+}
+
+static bool
+clean_start(CleanFixture *f, int outcome, bool publish, bool sent)
+{
+	return clean_start_mode(f, outcome, publish, sent, PCM_STATE_S);
 }
 
 static bool

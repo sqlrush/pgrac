@@ -20,14 +20,14 @@ typedef struct PiFixture {
 } PiFixture;
 
 static bool
-pi_start_master(PiFixture *f, bool publish, int32 master)
+pi_start_mode(PiFixture *f, bool publish, int32 master, PcmState mode)
 {
 	CleanFixture *s = &f->source;
 	ResourceXDecodedFrame grant;
 	ClusterPageWalBindingV1 seed = local_pi_setup(make_tag(850));
 
 	memset(f, 0, sizeof(*f));
-	if (!publish_start(2, PCM_STATE_S, &s->m)) return false;
+	if (!publish_start(mode == PCM_STATE_X ? 1 : 2, PCM_STATE_S, &s->m)) return false;
 	/* The directory's original PI bit is retained before A is sealed. */
 	publish_apply(&s->m);
 	grant = publish_decode(s->m.state->grant_intent.payload, false);
@@ -62,9 +62,14 @@ pi_start_master(PiFixture *f, bool publish, int32 master)
 	s->prepared.tag = s->block.common.logical_assertion.resource;
 	s->prepared.generation = 901; s->prepared.reservation_token = 77;
 	s->prepared.flags = PCM_OWN_FLAG_REVOKING;
-	s->prepared.pcm_state = PCM_STATE_S; s->prepared.buffer_type = BUF_TYPE_SCUR;
+	s->prepared.pcm_state = mode;
+	s->prepared.buffer_type = mode == PCM_STATE_X ? BUF_TYPE_XCUR : BUF_TYPE_SCUR;
 	s->prepared.semantic_buf_state = BM_VALID;
 	s->finished = s->prepared; s->finished.flags = 0;
+	if (mode == PCM_STATE_X) {
+		s->finished.generation++; s->finished.pcm_state = PCM_STATE_S;
+		s->finished.buffer_type = BUF_TYPE_SCUR;
+	}
 	((PageHeader)s->page.data)->pd_lower = SizeOfPageHeaderData;
 	((PageHeader)s->page.data)->pd_upper = BLCKSZ;
 	((PageHeader)s->page.data)->pd_special = BLCKSZ;
@@ -117,6 +122,12 @@ pi_start_master(PiFixture *f, bool publish, int32 master)
 		}
 	}
 	return true;
+}
+
+static bool
+pi_start_master(PiFixture *f, bool publish, int32 master)
+{
+	return pi_start_mode(f, publish, master, PCM_STATE_S);
 }
 
 static bool
