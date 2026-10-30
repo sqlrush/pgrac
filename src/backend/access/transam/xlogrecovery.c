@@ -5862,6 +5862,14 @@ cluster_typed_replay_apply_native(XLogReaderState *r, void *arg)
 	cluster_cold_touched_add_record_v1(&rep->touched, r);
 	ApplyWalRecord(r, &r->record->header, rep->replayTLI);
 	cluster_recovery_merge_set_apply_foreign(false);
+	/* The original source executor cannot mark this FULL record consumed
+	 * before the founder's exact native write is synced and read back. */
+	if (!rep->apply_foreign && XLogRecGetRmid(r) == RM_CLOG_ID
+		&& (XLogRecGetInfo(r) & ~XLR_INFO_MASK) == CLOG_ZEROPAGE_FULL
+		&& !cluster_clog_native_recovery_full_sync_v1(cluster_node_id, r))
+		ereport(ERROR,
+			(errcode(ERRCODE_DATA_CORRUPTED),
+			 errmsg("native CLOG full page replay did not complete its physical write")));
 }
 
 static void

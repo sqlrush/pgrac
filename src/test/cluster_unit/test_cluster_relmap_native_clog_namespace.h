@@ -106,4 +106,5 @@
 #define ut_current_failed d3_clog_ut_current_failed
 #define ut_failed_count d3_clog_ut_failed_count
 #define ut_test_count d3_clog_ut_test_count
+#define cluster_clog_native_recovery_full_sync_v1 d3_clog_cluster_clog_native_recovery_full_sync_v1
 #endif

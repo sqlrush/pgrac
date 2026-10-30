@@ -22,6 +22,7 @@ static struct {
 
 /* Only ZERO redo is exercised here. The unrelated native TRUNCATE branch
  * must never mutate a fixture horizon to make these tests pass. */
+#ifndef TEST_CLUSTER_CLOG_EXTERNAL_WAL
 void
 AdvanceOldestClogXid(TransactionId oldest pg_attribute_unused())
 {
@@ -58,6 +59,7 @@ XLogInsert(RmgrId rmid, uint8 info)
 	if (birth_wal.fail) elog(ERROR, "full birth insertion fixture");
 	return UINT64_C(0x100000);
 }
+#endif
 
 static bool
 birth_call_caught(FullTransactionId full)

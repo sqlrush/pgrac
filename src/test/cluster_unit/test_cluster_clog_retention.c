@@ -4,8 +4,10 @@
  * Author: SqlRush <sqlrush@gmail.com>
  * Spec: 2026-10-14-pre2-m5-e1-format-closure-v1.md */
 #define main clog_recovery_original_main
+#define TEST_CLUSTER_CLOG_EXTERNAL_WAL
 int clog_recovery_original_main(void);
 #include "test_cluster_clog_recovery.c"
+#undef TEST_CLUSTER_CLOG_EXTERNAL_WAL
 #undef main
 #include "../../backend/cluster/cluster_relmap_retention.c"
 #include "../../backend/cluster/cluster_relmap_retention_runtime.c"

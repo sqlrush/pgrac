@@ -6024,9 +6024,16 @@ test_cluster_multixact_recovery test_cluster_multixact_limits_io: %: %.c unit_te
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
 		$< $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
+# Original complete native callback; no reconstructed dispatch logic.
+test_cluster_clog_native_callback.inc: $(top_srcdir)/src/backend/access/transam/xlogrecovery.c Makefile
+	awk '/^cluster_typed_replay_apply_native\(/ { print "static void"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 # PGRAC: original-origin CLOG against real disposable native SLRU files.
 # Author: SqlRush <sqlrush@gmail.com>
 test_cluster_clog_recovery: test_cluster_clog_recovery.c unit_test.h \
+		test_cluster_clog_native_full_sync.inc test_cluster_clog_native_callback.inc \
 		test_cluster_clog_relmap_participant.inc test_cluster_clog_page_birth.inc \
 		test_cluster_clog_relmap_mutation.inc \
 		test_cluster_clog_relmap_shared_mutation.inc test_cluster_clog_relmap_writeback.inc \
@@ -14135,3 +14142,15 @@ test_cluster_cold_tx_start: test_cluster_cold_ctrc_hot_refs.inc
 test_cluster_subtrans_durability test_cluster_subtrans_order \
 		test_cluster_multixact_recovery test_cluster_multixact_limits_io \
 		test_cluster_subtrans_recovery: test_cluster_slru_non_clog.h
+
+# All includers of the native CLOG fixture keep this original callback input.
+test_cluster_clog_recovery test_cluster_xid_native_clog.o test_cluster_recovery_episode_clog.o \
+ test_cluster_side_native_clog.o test_cluster_relmap_publish_clog_bridge.o \
+ test_cluster_relmap_native_clog.o test_cluster_clog_retention: \
+ test_cluster_clog_native_full_sync.inc test_cluster_clog_native_callback.inc \
+ $(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
+
+clean: clean-clog-native-callback
+.PHONY: clean-clog-native-callback
+clean-clog-native-callback:
+	rm -f test_cluster_clog_native_callback.inc test_cluster_clog_native_callback.inc.tmp

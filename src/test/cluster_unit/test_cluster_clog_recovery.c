@@ -1779,6 +1779,7 @@ native_held_base_constructor_error_and_later_refusals_keep_custody_sticky(void)
 
 #include "test_cluster_clog_full_consumer.inc"
 #include "test_cluster_clog_own_full.inc"
+#include "test_cluster_clog_native_full_sync.inc"
 
 int
 main(void)
@@ -1849,7 +1850,16 @@ main(void)
 		UT_RUN(relmap_inflight_physical_write_refuses_new_and_original_custody);
 		goto mutation_done;
 	}
-	UT_PLAN(74);
+	if (getenv("PGRAC_CLOG_NATIVE_FULL_SYNC_FOCUS") != NULL) {
+		UT_PLAN(5);
+		UT_RUN(native_full_sync_reads_the_original_redo_page_without_reinitializing);
+		UT_RUN(native_full_sync_rejects_shape_and_context_before_io);
+		UT_RUN(native_full_sync_io_failures_and_error_keep_native_cleanup);
+		UT_RUN(native_full_sync_rejects_owner_mutation_and_changed_disk);
+		UT_RUN(native_full_sync_hook_preserves_legacy_and_foreign_routes);
+		goto mutation_done;
+	}
+	UT_PLAN(79);
 	UT_RUN(separate_original_origin_controls);
 	UT_RUN(commit_and_abort_persist_full_tree_without_local_pollution);
 	UT_RUN(conflicting_late_child_refuses_before_any_tree_write);
@@ -1948,6 +1958,12 @@ main(void)
 	UT_RUN(relmap_writeback_clean_and_other_origin_preserve_observation);
 	UT_RUN(relmap_failed_writeback_keeps_sticky_debt_and_releases_writer);
 	UT_RUN(relmap_inflight_physical_write_refuses_new_and_original_custody);
+	UT_RUN(native_full_sync_reads_the_original_redo_page_without_reinitializing);
+	UT_RUN(native_full_sync_rejects_shape_and_context_before_io);
+	UT_RUN(native_full_sync_io_failures_and_error_keep_native_cleanup);
+	UT_RUN(native_full_sync_rejects_owner_mutation_and_changed_disk);
+	UT_RUN(native_full_sync_hook_preserves_legacy_and_foreign_routes);
+
 mutation_done:
 	fixture_cleanup();
 	UT_DONE();
