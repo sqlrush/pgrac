@@ -233,6 +233,17 @@ test_episode_native_clog_discard_resident(void)
  * fixture authorization remains the NULL-default provider for every old case. */
 static const ClusterRecoveryRelmapSourceV1 *episode_full_source;
 
+/* Explicit fixture teardown after the caller destroyed every held reader. */
+void
+test_episode_native_clog_discard_foreign(unsigned origin)
+{
+	episode_clog_unlocked();
+	UT_ASSERT(origin > 0 && origin < lengthof(ClogRecoveryCtl));
+	if (origin > 0 && origin < lengthof(ClogRecoveryCtl) && ClogRecoveryCtl[origin].shared != NULL)
+		clog_recovery_cache_discard(&ClogRecoveryCtl[origin]);
+	episode_clog_unlocked();
+}
+
 bool
 cluster_undo_recovery_cold_origin_authorized_v1(int origin)
 {

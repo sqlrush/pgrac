@@ -30,6 +30,7 @@ extern void test_episode_native_clog_local_bounds(bool on, uint64 next, Transact
 extern void test_episode_native_clog_advance_next(TransactionId xid);
 extern void test_episode_native_clog_advance_oldest(TransactionId xid);
 extern void test_episode_native_clog_discard_resident(void);
+extern void test_episode_native_clog_discard_foreign(unsigned origin);
 /* Actual cold native initialization; original episode authority is a fixture. */
 extern bool test_episode_native_clog_full_apply(const ClusterRecoveryRelmapSourceV1 *source,
 	const xl_clog_zeropage_full *birth);

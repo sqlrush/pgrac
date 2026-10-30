@@ -25,6 +25,7 @@ extern void cluster_relmap_retention_census_destroy(ClusterRelmapRetentionCensus
 bool cluster_shared_catalog = true;
 static int scope_native_fd = -1;
 static unsigned scope_native_destroyed, scope_native_legacy_calls;
+static void (*scope_native_records_hook)(uint8 *, ClusterRecoveryAnchorV2 *);
 
 bool cluster_recovery_merge_claim_is_held(void);
 bool cluster_relmap_authority_x_held(void);
@@ -253,6 +254,8 @@ scope_native_setup_mode(ClusterWalInputsV1 **inputs, unsigned history_mode)
 			95, anchors[i].native_window));
 		v2_anchor_object(bytes, &anchors[i], &anchors[i].identity, path);
 	}
+	if (scope_native_records_hook != NULL)
+		scope_native_records_hook(bytes, anchors);
 	UT_ASSERT_EQ(cluster_control_root_v3_decode(bytes, sizeof(bytes), v2_storage, TEST_SYSID, &root), 0);
 	tx_ir_complete(&root.records[0]);
 	tx_ir_complete(&root.records[1]);

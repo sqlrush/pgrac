@@ -5146,6 +5146,7 @@ test_cluster_relmap_retained_owner.o: $(top_srcdir)/src/backend/cluster/cluster_
 # Link the original episode owner to the real census; observe its final destructor.
 test_cluster_recovery_scope_native_census: test_cluster_recovery_native_inputs.c \
 		test_cluster_recovery_scope_native_census.inc Makefile \
+		test_cluster_recovery_scope_initialized_census.inc \
 		test_cluster_recovery_scope_native_census_product.o \
 		test_cluster_relmap_v2_codec_product.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_pending.o \

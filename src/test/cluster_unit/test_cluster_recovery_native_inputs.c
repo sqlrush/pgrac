@@ -1140,6 +1140,7 @@ cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **held)
 #undef cluster_relmap_retention_census_destroy
 #undef cluster_relmap_retention_census_execute_native_episode
 #include "test_cluster_recovery_scope_native_census.inc"
+#include "test_cluster_recovery_scope_initialized_census.inc"
 #endif
 
 
@@ -1151,13 +1152,18 @@ main(int argc, char **argv)
 	test_program_path = argv[0];
 	setup_fixture();
 #ifdef RECOVERY_SCOPE_NATIVE_CENSUS
-	UT_PLAN(6);
+	UT_PLAN(11);
 	UT_RUN(test_scope_native_census_uses_original_episode_and_retires_before_holders);
 	UT_RUN(test_scope_native_census_missing_corrupt_pending_pairs_keep_original_debt);
 	UT_RUN(test_scope_native_census_late_source_loss_and_error_do_not_replace_custody);
 	UT_RUN(test_scope_native_census_entry_roles_do_not_borrow_legacy_cold_authority);
 	UT_RUN(test_scope_native_census_keeps_real_history_in_original_two_origin_scope);
 	UT_RUN(test_scope_native_census_refuses_uncovered_and_missing_real_history_windows);
+	UT_RUN(test_scope_initialized_census_shares_complete_original_episode);
+	UT_RUN(test_scope_initialized_census_unknown_birth_preserves_custody);
+	UT_RUN(test_scope_initialized_census_pair_refusal_keeps_native_custody);
+	UT_RUN(test_scope_initialized_census_late_original_owner_loss_invalidates_both);
+	UT_RUN(test_scope_initialized_census_observations_do_not_grant_completion);
 	UT_DONE(); return ut_failed_count != 0;
 #endif
 	if (getenv("PGRAC_PRE2_TEST_INITIALIZED_PAGES") != NULL) {
