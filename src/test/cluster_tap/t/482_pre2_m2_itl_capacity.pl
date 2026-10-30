@@ -48,6 +48,170 @@ sub activity {
  SELECT pid,state,query,wait_event FROM pg_stat_activity WHERE pid=$pid) s"));
 }
 
+sub exit_owners {
+ my ($node,$holders)=@_;
+ return [map {
+  my $h=$_;
+  my $state=decode_json($node->safe_psql('postgres',"SELECT row_to_json(s) FROM (
+   SELECT pid,state,wait_event,backend_xid::text AS xid FROM pg_stat_activity
+   WHERE pid=$h->{pid}) s"));
+  die 'an original owner disappeared' unless defined($state);
+  +{%$h,%$state};
+ } @$holders];
+}
+
+sub exact_exit_wait {
+ my ($node,$r,$pid,$sql,$block,$tag,$holders,$offset,$until,$name)=@_;
+ my $last='no exact capacity wait';
+ while(clock_gettime(CLOCK_MONOTONIC)<$until) {
+  $r->{run}->pump_nb();
+  my $state=activity($node,$pid);
+  save_json("b08-$name-activity",$state);
+  die 'waiter disappeared' unless defined($state);
+  return (undef,undef)
+   if $state->{state} eq 'idle in transaction' && $state->{query} eq $sql;
+  die 'waiter failed before the exact wait was observed'
+   if $state->{state} eq 'idle in transaction (aborted)';
+  if($state->{query} eq $sql && ($state->{wait_event} // '') eq 'GesTxEnqueueWait') {
+   my $page=decode_json($node->safe_psql('postgres',"SELECT test_pgrac_native_itl_page('$name',$block)"));
+   my $trace=decode_json($node->safe_psql('postgres','SELECT test_pgrac_native_itl_trace()'));
+   my $case={holders=>[map {+{%$_}} @$holders],trace=>$trace,page_sequence=>$page->{sequence},tag=>$tag,
+    log=>substr(slurp_file($node->logfile),$offset),waiter_pid=>$pid,waiter_node=>0};
+   save_json("b08-$name-candidate",$case);
+   my ($selected,$error)=select_blocker($case);
+   $last=$error;
+   return ($case,$selected) if defined($selected);
+  }
+  sleep(0.02);
+ }
+ die "exact capacity wait was not observed under the original deadline: $last";
+}
+
+sub wait_exit_cell {
+ my ($node,$nodes,$kind)=@_;
+ my $name="m2_b08_$kind";
+ my $first_session=scalar(@sessions);
+ my ($r,$exit,$retry);
+ my $completed=eval {
+  $node->safe_psql('postgres',"CREATE TABLE $name(id int PRIMARY KEY,v int);
+   INSERT INTO $name SELECT g,0 FROM generate_series(1,9) g;");
+  $node->safe_psql('postgres',"VACUUM(FREEZE) $name");
+  my @tids=split /\n/,$node->safe_psql('postgres',"SELECT id,ctid FROM $name ORDER BY id");
+  my %blocks;
+  for my $tid (@tids) {
+   die "invalid original row location: $tid" unless $tid =~ /^\d+\|\((\d+),\d+\)$/;
+   $blocks{$1}=1;
+  }
+  die 'nine original rows do not share one block' unless @tids==9 && keys(%blocks)==1;
+  my ($block)=keys %blocks;
+  my @tag=map {0+$_} split /\|/,$node->safe_psql('postgres',"SELECT
+   COALESCE(NULLIF(c.reltablespace,0),d.dattablespace)||'|'||d.oid||'|'||
+   pg_relation_filenode(c.oid)||'|0|$block' FROM pg_class c,pg_database d
+   WHERE c.oid='$name'::regclass AND d.datname=current_database()");
+  die 'missing full relation tag' unless @tag==5;
+  my (@holders,%by_pid);
+  for my $row (1..8) {
+   my $s=session($node);
+   my $pid=0+$s->query_safe('SELECT pg_backend_pid()');
+   $s->query_safe("BEGIN; UPDATE $name SET v=1 WHERE id=$row");
+   push @holders,{row=>$row,node=>0,pid=>$pid,xid=>0+$s->query_safe('SELECT pg_current_xact_id()::text')};
+   $by_pid{$pid}=$s;
+  }
+  $r=session($node);
+  $r->query_safe('\\set VERBOSITY verbose');
+  my $pid=0+$r->query_safe('SELECT pg_backend_pid()');
+  save_json("b08-$name-setup",{tag=>\@tag,ctids=>\@tids,holders=>\@holders,pid=>$pid,
+   statement_timeout=>$r->query_safe('SHOW statement_timeout'),
+   ges_request_timeout=>$r->query_safe('SHOW cluster.ges_request_timeout_ms')});
+  $r->query_safe('BEGIN');
+  my $sql="UPDATE $name SET v=1 WHERE id=9;";
+  my $offset=-s $node->logfile;
+  my $until=clock_gettime(CLOCK_MONOTONIC)+10;
+  $r->query_until(qr/B08_SENT/,"\\echo B08_SENT\n$sql\n");
+  my ($start,$selected)=exact_exit_wait($node,$r,$pid,$sql,$block,\@tag,\@holders,$offset,$until,$name);
+  die 'UPDATE completed without the required exact capacity wait' unless defined($selected);
+  my $cancel_sent=JSON::PP::false;
+  if($kind eq 'cancel') {
+   die 'original backend cancel was refused'
+    unless $node->safe_psql('postgres',"SELECT pg_cancel_backend($pid)") eq 't';
+   $cancel_sent=JSON::PP::true;
+  }
+  # The echo is queued behind the existing UPDATE. It issues no replacement
+  # SQL and cannot restart either the statement or capacity deadline.
+  my ($out,$had_error)=$r->query("\\echo B08_SQLSTATE :SQLSTATE\n");
+  $exit={start=>$start,kind=>$kind,cancel_sent=>$cancel_sent,stdout=>$out,stderr=>$r->{stderr},
+   client_had_error=>$had_error ? JSON::PP::true : JSON::PP::false,
+   log=>substr(slurp_file($node->logfile),$offset),reader=>activity($node,$pid),
+   holders=>exit_owners($node,\@holders)};
+  save_json("b08-$name-exit",$exit);
+  my ($judge_out,$judge_error)=('','');
+  my $input=encode_json($exit);
+  my $judged=run([$ENV{PYTHON} // 'python3',"$FindBin::RealBin/../pre2/m2_itl_capacity.py",'--exit'],
+   '<',\$input,'>',\$judge_out,'2>',\$judge_error,timeout(2));
+  save_json("b08-$name-judge",{passed=>$judged ? JSON::PP::true : JSON::PP::false,
+   stdout=>$judge_out,stderr=>$judge_error});
+  my $judgement=eval {decode_json($judge_out)};
+  die "native wait exit evidence refused: $judge_out $judge_error"
+   unless $judged && ref($judgement) eq 'HASH' && ref($judgement->{exit}) eq 'HASH'
+    && ($judgement->{exit}->{kind} // '') eq $kind
+    && ($judgement->{exit}->{sqlstate} // '') eq '57014'
+    && ($judgement->{exit}->{wait_seq} // 0)==$selected->{wait_seq}
+    && exists($judgement->{exit}->{authoritative}) && !$judgement->{exit}->{authoritative};
+  $r->{stderr}='';
+  $r->query_safe('ROLLBACK');
+  die 'cancelled connection was replaced' unless $r->query_safe('SELECT pg_backend_pid()') eq "$pid";
+  $r->query_safe('BEGIN');
+  $offset=-s $node->logfile;
+  $until=clock_gettime(CLOCK_MONOTONIC)+10;
+  $r->query_until(qr/B08_RETRY_SENT/,"\\echo B08_RETRY_SENT\n$sql\n");
+  my @decisions;
+  my $done=0;
+  while(clock_gettime(CLOCK_MONOTONIC)<$until) {
+   $r->{run}->pump_nb();
+   my $state=activity($node,$pid);
+   if(defined($state) && $state->{state} eq 'idle in transaction' && $state->{query} eq $sql) {
+    $done=1; last;
+   }
+   my ($case,$next)=exact_exit_wait($node,$r,$pid,$sql,$block,\@tag,\@holders,$offset,$until,$name);
+   if(!defined($next)) {$done=1; last;}
+   die 'fresh wait reused the cancelled registration' unless $next->{wait_seq}>$selected->{wait_seq};
+   die 'more than the original eight owners were selected' if @decisions>=8;
+   save_json("b08-$name-selection-".scalar(@decisions),{evidence=>$case,selected=>$next});
+   $by_pid{$next->{pid}}->query_safe('COMMIT');
+   push @decisions,$next;
+   @holders=grep {$_->{pid}!=$next->{pid}} @holders;
+  }
+  die 'fresh UPDATE did not resume under its original deadline' unless $done && @decisions;
+  die 'fresh UPDATE did not change the ninth row' unless $r->query_safe("SELECT v FROM $name WHERE id=9") eq '1';
+  my $remaining=exit_owners($node,\@holders);
+  for my $i (0..$#holders) {
+   die 'unselected owner changed before fresh progress'
+    unless $remaining->[$i]->{state} eq 'idle in transaction'
+     && $remaining->[$i]->{xid} eq $holders[$i]->{xid};
+   $by_pid{$holders[$i]->{pid}}->query_safe('COMMIT');
+  }
+  $r->query_safe('COMMIT');
+  my $expected=join "\n",map {"$_|1"} 1..9;
+  for my $member (@$nodes) {
+   die 'committed rows disagree after fresh progress'
+    unless $member->safe_psql('postgres',"SELECT id,v FROM $name ORDER BY id") eq $expected;
+  }
+  $retry={pid=>$pid,decisions=>\@decisions,remaining=>$remaining};
+  1;
+ };
+ my $error=$@;
+ save_json("b08-$name-client",{map {$_=>$r->{$_}} qw(stdin stdout stderr)}) if defined($r);
+ my @cleanup;
+ for my $s (splice @sessions,$first_session) {
+  eval {$s->quit or die 'psql did not exit normally'; 1;} or push @cleanup,$@;
+ }
+ save_json("b08-$name-execution",{completed=>$completed ? JSON::PP::true : JSON::PP::false,
+  error=>$error,cleanup=>\@cleanup,retry=>$retry});
+ diag($error) unless $completed;
+ diag(join '\n',@cleanup) if @cleanup;
+ return $completed && !@cleanup;
+}
+
 $cluster=PostgreSQL::Test::ClusterPRE2->new_cluster('m2_b07',nodes=>4,blackbox=>1,
  required_operations=>[],extra_conf=>['autovacuum=off','cluster.trace_tx_identity=on',
   'log_error_verbosity=verbose','log_line_prefix=\'%m [%p] \'']);
@@ -165,6 +329,10 @@ for my $s (@sessions) { eval { $s->quit; 1; } or push @cleanup,$@; }
 @sessions=();
 save_json('cleanup',{errors=>\@cleanup});
 ok(!@cleanup,'all original test sessions close');
+for my $kind ('cancel','statement_timeout') {
+ ok(wait_exit_cell($node,\@nodes,$kind),
+  "B08 $kind ends only the original wait and the same backend resumes with exact owners");
+}
 $cluster->stop_cluster;
 undef $cluster;
 pass('all four normal members complete the original stop proof');

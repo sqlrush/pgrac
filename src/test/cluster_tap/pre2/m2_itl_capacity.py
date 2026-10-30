@@ -117,9 +117,75 @@ def select_blocker(case):
                 key=key, wait_seq=number(wait['wait_seq']), authoritative=False)
 
 
+def validate_wait_exit(case):
+    """Require the original wait to end without releasing any test owner."""
+    selected = select_blocker(case['start'])
+    if not case['log'].startswith(case['start']['log']):
+        raise ValueError('exit log no longer contains the original observation')
+    causes = dict(cancel='canceling statement due to user request',
+                  statement_timeout='canceling statement due to statement timeout')
+    kind = case['kind']
+    if kind not in causes or case['cancel_sent'] is not (kind == 'cancel'):
+        raise ValueError('unexpected cancellation boundary or signal')
+    errors = re.findall(r'^ERROR:\s+([0-9A-Z]{5}): (.*)$', case['stderr'], re.MULTILINE)
+    if (case['client_had_error'] is not True or case['stdout'].strip() != 'B08_SQLSTATE 57014'
+            or errors != [('57014', causes[kind])]):
+        raise ValueError('original SQLSTATE and native error cause are not proved')
+    reader = case['reader']
+    if (number(reader['pid']) != case['start']['waiter_pid']
+            or reader['state'] != 'idle in transaction (aborted)'
+            or reader.get('wait_event') == 'GesTxEnqueueWait'):
+        raise ValueError('original backend did not leave its wait in the aborted transaction')
+    identity = lambda h: tuple(number(h[k]) for k in ('node', 'pid', 'xid', 'row'))
+    expected = {identity(h) for h in case['start']['holders']}
+    holders = case['holders']
+    if (len(holders) != len(expected) or {identity(h) for h in holders} != expected
+            or any(h['state'] != 'idle in transaction' for h in holders)):
+        raise ValueError('an original owner was released, replaced or omitted')
+    rows = []
+    for line in case['log'].splitlines():
+        if 'TX_IDENTITY ' not in line:
+            continue
+        pairs = re.findall(r'([a-z_0-9]+)=([^ \n]+)', line.split('TX_IDENTITY ', 1)[1])
+        row = dict(pairs)
+        if len(row) != len(pairs):
+            raise ValueError('duplicate diagnostic fields')
+        if (number(row.get('pid')) != case['start']['waiter_pid']
+                or number(row.get('actor_node')) != case['start']['waiter_node']):
+            continue
+        if row.get('event') == 'LIMIT':
+            raise ValueError('wait identity trace overflow')
+        if row.get('event') in ('WAIT_TARGET', 'WAIT_END'):
+            rows.append(row)
+    starts = [r for r in rows if r['event'] == 'WAIT_TARGET'
+              and number(r.get('wait_seq')) == selected['wait_seq']]
+    if len(starts) != 1:
+        raise ValueError('original wait start missing or ambiguous')
+    start = starts[0]
+    sequence = number(start.get('seq'))
+    later = [r for r in rows if number(r.get('seq')) >= sequence]
+    ends = [r for r in later if r['event'] == 'WAIT_END']
+    if len(later) != 2 or len(ends) != 1 or number(ends[0].get('seq')) <= sequence:
+        raise ValueError('original wait end missing, ambiguous or superseded')
+    end = ends[0]
+    fields = ('node', 'xid', 'epoch', 'target_known', 'uba_known',
+              'itl_wrap', 'itl_kind', 'itl_slot', 'wait_seq')
+    if (any(number(start.get(k)) != number(end.get(k)) for k in fields)
+            or any(start.get(k) != end.get(k) for k in ('uba0', 'uba1'))):
+        raise ValueError('wait end does not match the original exact blocker')
+    return dict(kind=kind, sqlstate='57014', selected=selected,
+                wait_seq=selected['wait_seq'], end_seq=number(end['seq']), authoritative=False)
+
+
 if __name__ == '__main__':
     try:
-        print(json.dumps(dict(selected=select_blocker(json.load(sys.stdin)))))
+        case = json.load(sys.stdin)
+        if sys.argv[1:] == ['--exit']:
+            print(json.dumps(dict(exit=validate_wait_exit(case))))
+        elif not sys.argv[1:]:
+            print(json.dumps(dict(selected=select_blocker(case))))
+        else:
+            raise ValueError('unexpected evaluator arguments')
     except (ValueError, KeyError, TypeError) as exc:
         print(json.dumps(dict(error=str(exc))))
         raise SystemExit(1)
