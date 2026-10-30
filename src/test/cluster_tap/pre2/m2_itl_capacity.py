@@ -133,14 +133,16 @@ def validate_wait_exit(case):
     selected = select_blocker(case['start'])
     if not case['log'].startswith(case['start']['log']):
         raise ValueError('exit log no longer contains the original observation')
-    causes = dict(cancel='canceling statement due to user request',
-                  statement_timeout='canceling statement due to statement timeout')
+    causes = dict(cancel=('57014', 'canceling statement due to user request'),
+                  statement_timeout=('57014', 'canceling statement due to statement timeout'),
+                  capacity_timeout=('53R70', 'ITL slot OVERFLOW on heap page (INITRANS=8 full)'))
     kind = case['kind']
     if kind not in causes or case['cancel_sent'] is not (kind == 'cancel'):
         raise ValueError('unexpected cancellation boundary or signal')
     errors = re.findall(r'^ERROR:\s+([0-9A-Z]{5}): (.*)$', case['stderr'], re.MULTILINE)
-    if (case['client_had_error'] is not True or case['stdout'].strip() != 'B08_SQLSTATE 57014'
-            or errors != [('57014', causes[kind])]):
+    sqlstate, message = causes[kind]
+    if (case['client_had_error'] is not True or case['stdout'].strip() != 'B08_SQLSTATE ' + sqlstate
+            or errors != [(sqlstate, message)]):
         raise ValueError('original SQLSTATE and native error cause are not proved')
     reader = case['reader']
     if (number(reader['pid']) != case['start']['waiter_pid']
@@ -184,8 +186,48 @@ def validate_wait_exit(case):
     if (any(number(start.get(k)) != number(end.get(k)) for k in fields)
             or any(start.get(k) != end.get(k) for k in ('uba0', 'uba1'))):
         raise ValueError('wait end does not match the original exact blocker')
-    return dict(kind=kind, sqlstate='57014', selected=selected,
-                wait_seq=selected['wait_seq'], end_seq=number(end['seq']), authoritative=False)
+    result = dict(kind=kind, sqlstate=sqlstate, selected=selected,
+                  wait_seq=selected['wait_seq'], end_seq=number(end['seq']), authoritative=False)
+    if kind == 'capacity_timeout':
+        result['deadline_us'] = _capacity_timeout_deadline(case, selected, end)
+    return result
+
+
+def _one_diagnostic(text, family, reason, pid=None):
+    marker = 'PGRAC_FAMILY=' + family + ' PGRAC_REASON=' + reason + ' '
+    lines = [line for line in text.splitlines() if marker in line]
+    if len(lines) != 1:
+        raise ValueError('missing or duplicate original capacity timeout diagnostic')
+    line = lines[0]
+    if pid is not None and not re.search(r'\[' + str(pid) + r'\]', line.split(marker, 1)[0]):
+        raise ValueError('capacity timeout diagnostic belongs to another backend')
+    fields = re.findall(r'([A-Za-z_0-9]+)=([^ \r\n]+)', line[line.index('PGRAC_FAMILY='):])
+    if len(dict(fields)) != len(fields):
+        raise ValueError('duplicate capacity timeout fields')
+    return dict(fields)
+
+
+def _capacity_timeout_deadline(case, selected, end):
+    settings = case['settings']
+    budget, statement, xid = (number(settings[k]) for k in
+                              ('capacity_timeout_ms', 'statement_timeout_ms', 'waiter_xid'))
+    if (not 0 < budget < statement or xid < 3
+            or xid in {number(h['xid']) for h in case['start']['holders']}):
+        raise ValueError('finite original capacity budget and waiter identity are not proved')
+    error = _one_diagnostic(case['stderr'], 'ITL_CAPACITY', 'ITL_CAPACITY_WAIT_EXPIRED')
+    terminal = _one_diagnostic(case['log'], 'ITL_CAPACITY_DIAGNOSTIC', 'WAIT_TERMINAL',
+                               number(case['start']['waiter_pid']))
+    deadline = number(error.get('deadline_us'))
+    required_error = dict(PGRAC_NODE=case['start']['waiter_node'], PGRAC_ATTEMPT=0, wait_result=1)
+    # Existing ClusterTxwResult TIMEOUT=1 and ClusterTxResolveReason TIMEOUT=21.
+    required_terminal = dict(waiter_xid=xid, blocker_xid=selected['xid'],
+                             blocker_wrap=selected['key']['slot_wrap'], lock_only=0,
+                             returned=1, result=1, resolve_reason=21, deadline_us=deadline)
+    if (not 0 < deadline < 2**64 - 1 or number(end.get('status')) != 1
+            or any(number(error.get(k)) != v for k, v in required_error.items())
+            or any(number(terminal.get(k)) != v for k, v in required_terminal.items())):
+        raise ValueError('original capacity deadline, result or exact owner changed')
+    return deadline
 
 
 def _deadlock_wait_rows(log, pid, node):

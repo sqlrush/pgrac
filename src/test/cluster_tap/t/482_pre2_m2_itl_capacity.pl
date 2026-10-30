@@ -124,7 +124,19 @@ sub wait_exit_cell {
   save_json("b08-$name-setup",{tag=>\@tag,ctids=>\@tids,holders=>\@holders,pid=>$pid,
    statement_timeout=>$r->query_safe('SHOW statement_timeout'),
    ges_request_timeout=>$r->query_safe('SHOW cluster.ges_request_timeout_ms')});
+  my $original_ges=$kind eq 'capacity_timeout'
+   ? $r->query_safe('SHOW cluster.ges_request_timeout_ms') : undef;
   $r->query_safe('BEGIN');
+  my $settings;
+  if($kind eq 'capacity_timeout') {
+   # A transaction-local test input uses the existing finite ITL budget;
+   # the ordinary defaults and the original SQL timeout are unchanged.
+   $r->query_safe('SET LOCAL cluster.ges_request_timeout_ms=5000');
+   $settings=decode_json($r->query_safe(q{SELECT json_build_object(
+    'capacity_timeout_ms',(SELECT setting::bigint FROM pg_settings WHERE name='cluster.ges_request_timeout_ms'),
+    'statement_timeout_ms',(SELECT setting::bigint FROM pg_settings WHERE name='statement_timeout'),
+    'waiter_xid',pg_current_xact_id()::text)}));
+  }
   my $sql="UPDATE $name SET v=1 WHERE id=9;";
   my $offset=-s $node->logfile;
   my $until=clock_gettime(CLOCK_MONOTONIC)+10;
@@ -143,7 +155,7 @@ sub wait_exit_cell {
   $exit={start=>$start,kind=>$kind,cancel_sent=>$cancel_sent,stdout=>$out,stderr=>$r->{stderr},
    client_had_error=>$had_error ? JSON::PP::true : JSON::PP::false,
    log=>substr(slurp_file($node->logfile),$offset),reader=>activity($node,$pid),
-   holders=>exit_owners($node,\@holders)};
+   holders=>exit_owners($node,\@holders),settings=>$settings};
   save_json("b08-$name-exit",$exit);
   my ($judge_out,$judge_error)=('','');
   my $input=encode_json($exit);
@@ -155,11 +167,13 @@ sub wait_exit_cell {
   die "native wait exit evidence refused: $judge_out $judge_error"
    unless $judged && ref($judgement) eq 'HASH' && ref($judgement->{exit}) eq 'HASH'
     && ($judgement->{exit}->{kind} // '') eq $kind
-    && ($judgement->{exit}->{sqlstate} // '') eq '57014'
+    && ($judgement->{exit}->{sqlstate} // '') eq ($kind eq 'capacity_timeout' ? '53R70' : '57014')
     && ($judgement->{exit}->{wait_seq} // 0)==$selected->{wait_seq}
     && exists($judgement->{exit}->{authoritative}) && !$judgement->{exit}->{authoritative};
   $r->{stderr}='';
   $r->query_safe('ROLLBACK');
+  die 'transaction-local capacity budget escaped rollback'
+   if defined($original_ges) && $r->query_safe('SHOW cluster.ges_request_timeout_ms') ne $original_ges;
   die 'cancelled connection was replaced' unless $r->query_safe('SELECT pg_backend_pid()') eq "$pid";
   $r->query_safe('BEGIN');
   $offset=-s $node->logfile;
@@ -498,7 +512,7 @@ for my $s (@sessions) { eval { $s->quit; 1; } or push @cleanup,$@; }
 @sessions=();
 save_json('cleanup',{errors=>\@cleanup});
 ok(!@cleanup,'all original test sessions close');
-for my $kind ('cancel','statement_timeout') {
+for my $kind ('cancel','statement_timeout','capacity_timeout') {
  ok(wait_exit_cell($node,\@nodes,$kind),
   "B08 $kind ends only the original wait and the same backend resumes with exact owners");
 }
