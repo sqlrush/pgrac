@@ -3,6 +3,8 @@
  * Author: SqlRush <sqlrush@gmail.com> */
 static unsigned startup_image_calls;
 static PGAlignedBlock startup_image_expected;
+/* Optional transport observer; original default and all prior cases are unchanged. */
+static RfPageProofDetailV1 (*startup_image_observer)(uint32, RfPageProofDetailV1);
 
 RfPageCtrcReadbackImageV1
 rf_page_recovery_ctrc_replays_completed_image_v1(const struct ClusterRecoveryStartV1 *start,
@@ -14,6 +16,8 @@ rf_page_recovery_ctrc_replays_completed_image_v1(const struct ClusterRecoverySta
  startup_image_calls++;
  out.detail = rf_page_recovery_ctrc_replays_completed_readback_v1(start, work, source,
   authority, inserted, storage, count, budget);
+ if (startup_image_observer != NULL)
+  out.detail = startup_image_observer(inserted->image.block_number - 23, out.detail);
  if (out.detail == RF_PAGE_PROOF_DETAIL_OK) out.image = startup_image_expected;
  return out;
 }
@@ -27,6 +31,8 @@ rf_page_recovery_ctrc_replays_unchanged_image_v1(const struct ClusterRecoverySta
  startup_image_calls++;
  out.detail = rf_page_recovery_ctrc_replays_unchanged_readback_v1(start, work, source,
   authority, unchanged, storage, count, budget);
+ if (startup_image_observer != NULL)
+  out.detail = startup_image_observer(unchanged->blockno - 23, out.detail);
  if (out.detail == RF_PAGE_PROOF_DETAIL_OK) out.image = startup_image_expected;
  return out;
 }

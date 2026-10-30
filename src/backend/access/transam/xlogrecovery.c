@@ -1988,6 +1988,13 @@ ClusterColdRecoveryCtrcPageAdvance(const struct ClusterRecoveryStartV1 *start,
 		}
 		projection_bytes = (Size)work->counts.subject_count * sizeof(ClusterColdTtSlotInputV1)
 			+ 2 * sizeof(PGAlignedBlock) + sizeof(RfPageCtrcOwnerProofV1);
+		/* The final owner round holds a complete operation/FD sample across
+		 * every PAGE and non-PAGE callback. Charge its peak before any write. */
+		if ((Size)count * sizeof(ClusterColdCtrcPageCompletedV1) > MaxAllocSize - projection_bytes) {
+			cluster_recovery_cold_page_plan_refuse(state, RF_PAGE_PROOF_DETAIL_CAPACITY);
+			return false;
+		}
+		projection_bytes += (Size)count * sizeof(ClusterColdCtrcPageCompletedV1);
 		if (budget <= bytes || projection_bytes >= budget - bytes || storage_bytes == 0
 			|| storage_bytes > (budget - bytes - projection_bytes) / count
 			|| budget - bytes - projection_bytes <= (Size)count * storage_bytes) {
@@ -2895,6 +2902,16 @@ cluster_recovery_cold_page_tx_recheck(const struct ClusterRecoveryStartV1 *start
 }
 
 static bool
+cluster_recovery_cold_page_completed_same(const ClusterColdCtrcPageProgressV1 *progress,
+	const ClusterColdCtrcPageCompletedV1 *completed, uint32 count)
+{
+	return progress != NULL && completed != NULL && !progress->pending
+		&& progress->target_count == count && progress->next_target == count
+		&& memcmp(progress->completed, completed,
+			(Size)count * sizeof(ClusterColdCtrcPageCompletedV1)) == 0;
+}
+
+static bool
 cluster_recovery_cold_page_completed_recheck(const struct ClusterRecoveryStartV1 *start)
 {
 	const ClusterColdCtrcWorkV1 *work = start->ctrc_observation_work;
@@ -2902,8 +2919,10 @@ cluster_recovery_cold_page_completed_recheck(const struct ClusterRecoveryStartV1
 	ClusterColdCtrcPageProgressV1 *progress = start->ctrc_page_progress;
 	ClusterRecoveryTxResultObservationV1 accepted;
 	ClusterColdTtSlotInputV1 *volatile subjects = NULL;
+	ClusterColdCtrcPageCompletedV1 *volatile completed = NULL;
 	volatile bool ready = false;
-	Size bytes;
+	Size bytes, completed_bytes;
+	uint32 count;
 
 	if (!cluster_recovery_cold_page_first_empty(start, work, scope, progress)
 		|| !cluster_recovery_cold_page_tx_recheck(start, work, scope, progress)) return false;
@@ -2912,19 +2931,27 @@ cluster_recovery_cold_page_completed_recheck(const struct ClusterRecoveryStartV1
 			&& cluster_recovery_cold_page_census_recheck(start, work, scope, progress)
 			&& cluster_recovery_cold_page_reference_terminals(start, work, scope, progress)
 			&& cluster_recovery_cold_page_first_empty(start, work, scope, progress);
-	if (work->counts.subject_count > MaxAllocSize / sizeof(*subjects)
+	count = rf_page_online_plan_target_count_v1(start->ctrc_page_plan);
+	if (progress->target_count != count || progress->pending || progress->next_target != count
+		|| count > MaxAllocSize / sizeof(*completed)
+		|| work->counts.subject_count > MaxAllocSize / sizeof(*subjects)
 		|| !cluster_recovery_ctrc_terminal_result_v1(start, work, &accepted)) return false;
 	bytes = (Size)work->counts.subject_count * sizeof(*subjects);
+	completed_bytes = (Size)count * sizeof(*completed);
 	PG_TRY();
 	{
 		uint32 index = 0;
 
+		completed = MemoryContextAllocExtended(TopMemoryContext, completed_bytes,
+			MCXT_ALLOC_ZERO | MCXT_ALLOC_NO_OOM);
+		if (completed != NULL) memcpy(completed, progress->completed, completed_bytes);
 		if (bytes != 0)
 			subjects = MemoryContextAllocExtended(TopMemoryContext, bytes,
 				MCXT_ALLOC_ZERO | MCXT_ALLOC_NO_OOM);
-		if ((bytes == 0 || subjects != NULL)
+		if (completed != NULL && (bytes == 0 || subjects != NULL)
 			&& cluster_recovery_cold_page_projection_subjects(start, work, scope,
-				progress, subjects, &accepted, true)) {
+				progress, subjects, &accepted, true)
+			&& cluster_recovery_cold_page_completed_same(progress, completed, count)) {
 			for (;;) {
 				RfPageCtrcOwnerProofV1 observed;
 				PGAlignedBlock projected;
@@ -2934,8 +2961,8 @@ cluster_recovery_cold_page_completed_recheck(const struct ClusterRecoveryStartV1
 				HandleStartupProcInterrupts();
 				if (!cluster_recovery_cold_page_projection_subjects(start, work, scope,
 						progress, subjects, &accepted, false)
-					|| progress->pending || progress->next_target != progress->target_count) break;
-				if (index == progress->target_count) { ready = true; break; }
+					|| !cluster_recovery_cold_page_completed_same(progress, completed, count)) break;
+				if (index == count) { ready = true; break; }
 				/* No saved baseline qualifies history/non-heap duties. Their
 				 * independent graph/owner obligations remain unchanged. */
 				if (progress->completed[index].storage == NULL) { index++; continue; }
@@ -2943,6 +2970,12 @@ cluster_recovery_cold_page_completed_recheck(const struct ClusterRecoveryStartV1
 				if (observed.detail == RF_PAGE_PROOF_DETAIL_WOULD_BLOCK) {
 					(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
 						100L, WAIT_EVENT_CLUSTER_THREAD_RECOVERY);
+					/* Keep the original sample; a local wait cannot refresh it
+					 * or preserve a prefix of the previous physical checks. */
+					if (!cluster_recovery_cold_page_first_empty(start, work, scope, progress)
+						|| !cluster_recovery_cold_page_tx_recheck(start, work, scope, progress)
+						|| !cluster_recovery_cold_page_completed_same(progress, completed, count)) break;
+					index = 0;
 					continue;
 				}
 				/* PAGE/proof are already destroyed. Projection is a read-only
@@ -2968,12 +3001,14 @@ cluster_recovery_cold_page_completed_recheck(const struct ClusterRecoveryStartV1
 					&& cluster_recovery_cold_page_reference_terminals(start, work, scope, progress)
 					&& cluster_recovery_cold_page_projection_subjects(start, work, scope,
 						progress, subjects, &accepted, false)
-					&& cluster_recovery_cold_page_first_empty(start, work, scope, progress);
+					&& cluster_recovery_cold_page_first_empty(start, work, scope, progress)
+					&& cluster_recovery_cold_page_completed_same(progress, completed, count);
 		}
 	}
 	PG_FINALLY();
 	{
 		if (subjects != NULL) pfree((void *)subjects);
+		if (completed != NULL) pfree((void *)completed);
 	}
 	PG_END_TRY();
 	return ready;

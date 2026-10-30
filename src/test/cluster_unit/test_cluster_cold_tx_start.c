@@ -2467,8 +2467,22 @@ static void startup_local_empty_reset(void);
 
 #include "test_cluster_cold_ctrc_raw_records.inc"
 
+#include "test_cluster_cold_ctrc_owner_round.inc"
+
 int main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_OWNER_ROUND") != NULL) {
+		UT_PLAN(7);
+	UT_RUN(test_startup_owner_round_keeps_complete_fpi_and_unchanged_set);
+	UT_RUN(test_startup_owner_round_later_target_cannot_change_earlier_operation);
+	UT_RUN(test_startup_owner_round_final_nonpage_check_cannot_change_completed_set);
+	UT_RUN(test_startup_owner_round_wait_restarts_first_target_without_new_operation);
+	UT_RUN(test_startup_owner_round_wait_cannot_rebase_changed_first_operation);
+	UT_RUN(test_startup_owner_round_late_error_keeps_original_cleanup);
+	UT_RUN(test_startup_owner_round_reserves_complete_snapshot_before_first_page);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
+
 	if (getenv("PGRAC_PRE2_TEST_START_RAW_RECORDS") != NULL) {
 		UT_PLAN(2);
 		UT_RUN(test_start_raw_records_keep_complete_original_bytes_and_empty_end);
@@ -2928,7 +2942,7 @@ int main(void)
 	}
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_FIRST
-	UT_PLAN(364);
+	UT_PLAN(371);
 	UT_RUN(test_start_raw_records_keep_complete_original_bytes_and_empty_end);
 	UT_RUN(test_start_raw_records_refuse_incomplete_changed_bytes_hash_header_and_end);
 
@@ -2938,7 +2952,7 @@ int main(void)
 	UT_RUN(test_start_compound_groups_retain_complete_member_input_and_end);
 	UT_RUN(test_start_compound_groups_refuse_missing_mixed_or_nonempty_end);
 #else
-	UT_PLAN(348);
+	UT_PLAN(355);
 #endif
 	UT_RUN(test_startup_native_images_accept_only_unchanged_complete_terminal_page);
 	UT_RUN(test_startup_native_images_reject_unresolved_ambiguous_and_mx_itls);
@@ -2949,8 +2963,15 @@ int main(void)
 	UT_RUN(test_startup_native_directory_real_origin_cannot_be_discharged_by_wait);
 	UT_RUN(test_startup_native_directory_invalid_layout_and_partial_error_keep_debt);
 #else
-	UT_PLAN(340);
+	UT_PLAN(347);
 #endif
+	UT_RUN(test_startup_owner_round_keeps_complete_fpi_and_unchanged_set);
+	UT_RUN(test_startup_owner_round_later_target_cannot_change_earlier_operation);
+	UT_RUN(test_startup_owner_round_final_nonpage_check_cannot_change_completed_set);
+	UT_RUN(test_startup_owner_round_wait_restarts_first_target_without_new_operation);
+	UT_RUN(test_startup_owner_round_wait_cannot_rebase_changed_first_operation);
+	UT_RUN(test_startup_owner_round_late_error_keeps_original_cleanup);
+	UT_RUN(test_startup_owner_round_reserves_complete_snapshot_before_first_page);
 	UT_RUN(test_start_native_records_complete_unfiltered_input_and_empty_end);
 	UT_RUN(test_start_native_records_preconditions_do_not_enter_or_replace_owner);
 	UT_RUN(test_start_native_records_late_shape_source_owner_and_error_revoke_whole_view);
