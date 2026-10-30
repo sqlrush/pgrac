@@ -5508,7 +5508,7 @@ UT_TEST(test_unsupported_security_labels_refuse_before_binding)
 	}
 }
 
-UT_TEST(test_alter_rewrite_candidates_keep_native_path_without_binding)
+UT_TEST(test_alter_dynamic_candidates_bind_before_native_classifier)
 {
 	RangeVar relation = { .type = T_RangeVar,
 						  .relname = "alter_target",
@@ -5544,7 +5544,7 @@ UT_TEST(test_alter_rewrite_candidates_keep_native_path_without_binding)
 	AlterTableStmt alter
 		= { .type = T_AlterTableStmt, .objtype = OBJECT_TABLE, .relation = &relation };
 
-	/* Native dynamic precheck/locks/DDL are explicit boundaries in this fixture. */
+	/* Upper dynamic commands bind once; child refusal precedes the classifier. */
 	for (unsigned mode = 0; mode < 8; mode++) {
 		for (unsigned kind = 0; kind < lengthof(candidates); kind++) {
 			candidate_cell.ptr_value = metadata_first[1].ptr_value = metadata_last[0].ptr_value
@@ -5556,6 +5556,7 @@ UT_TEST(test_alter_rewrite_candidates_keep_native_path_without_binding)
 					candidates[kind].missing_ok = kind == 0 && skip != 0;
 					relation.inh = skip == 0;
 					for (unsigned child = 0; child < 2; child++) {
+						bool binds = (mode & 3) == 3;
 						int caught;
 
 						reset_create_preflight();
@@ -5566,11 +5567,12 @@ UT_TEST(test_alter_rewrite_candidates_keep_native_path_without_binding)
 						caught = sigsetjmp(boundary, 1);
 						if (!caught)
 							create_sql_entry((Node *)&alter);
-						UT_ASSERT_EQ(caught, 0);
-						UT_ASSERT_EQ(utility_xids, 0);
-						UT_ASSERT_EQ(utility_prepares, 0);
-						UT_ASSERT_EQ(utility_binds, 0);
-						UT_ASSERT_EQ(utility_after_preflight, 1);
+						UT_ASSERT_EQ(caught, binds && child ? 1 : 0);
+						UT_ASSERT_EQ(error_code, binds && child ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+						UT_ASSERT_EQ(utility_xids, binds && !child);
+						UT_ASSERT_EQ(utility_prepares, binds && !child);
+						UT_ASSERT_EQ(utility_binds, binds && !child);
+						UT_ASSERT_EQ(utility_after_preflight, !(binds && child));
 					}
 				}
 			}
@@ -24439,7 +24441,7 @@ UT_TEST(test_native_alter_reuses_utility_binding_and_keeps_context_denials)
 	cluster_interconnect_tier = CLUSTER_IC_TIER_1;
 }
 
-UT_TEST(test_native_alter_four_dynamic_candidates_keep_original_responsibility)
+UT_TEST(test_native_alter_dynamic_candidates_reuse_upper_binding_and_keep_locked_entry)
 {
 	static const AlterTableType candidates[4]
 		= { AT_AddColumn, AT_AlterColumnType, AT_SetAccessMethod, AT_SetLogged };
@@ -24450,8 +24452,6 @@ UT_TEST(test_native_alter_four_dynamic_candidates_keep_original_responsibility)
 					for (unsigned warm = 0; warm < 2; warm++) {
 						int caught;
 						reset_native_alter(false, 0, route);
-						if (warm)
-							create_sql_entry((Node *)&native_alter_case.statement);
 						native_alter_case.dynamic
 							= (AlterTableCmd){ .type = T_AlterTableCmd,
 											   .subtype = candidates[kind],
@@ -24464,6 +24464,10 @@ UT_TEST(test_native_alter_four_dynamic_candidates_keep_original_responsibility)
 							native_alter_case.command_cells[1].ptr_value
 								= &native_alter_case.command;
 						native_alter_commands.length = position ? 2 : 1;
+						/* Warm the actual dynamic command through its unlocked upper path.
+						 * A cold native caller still does not acquire a new binding. */
+						if (warm)
+							create_sql_entry((Node *)&native_alter_case.statement);
 						snapshot_native_alter();
 						set_native_operator_mode(mode);
 						XactReadOnly = utility_parallel = utility_recovery = utility_in_child
@@ -25174,7 +25178,7 @@ main(void)
 	UT_RUN(test_undo_tablespace_options_refuses_before_binding);
 	UT_RUN(test_database_move_keeps_native_path_without_binding);
 	UT_RUN(test_unsupported_security_labels_refuse_before_binding);
-	UT_RUN(test_alter_rewrite_candidates_keep_native_path_without_binding);
+	UT_RUN(test_alter_dynamic_candidates_bind_before_native_classifier);
 	UT_RUN(test_unsupported_alter_table_refuses_before_binding);
 	UT_RUN(test_drop_owned_autocommit_binds_before_later_work_and_reuses_top);
 	UT_RUN(test_drop_owned_autocommit_refusal_child_and_wrong_top_precede_later_work);
@@ -25518,7 +25522,7 @@ main(void)
 	UT_RUN(test_native_alter_publication_child_and_top_refuse_before_dependency);
 	UT_RUN(test_native_alter_context_guards_preserve_other_modes);
 	UT_RUN(test_native_alter_reuses_utility_binding_and_keeps_context_denials);
-	UT_RUN(test_native_alter_four_dynamic_candidates_keep_original_responsibility);
+	UT_RUN(test_native_alter_dynamic_candidates_reuse_upper_binding_and_keep_locked_entry);
 	UT_RUN(test_native_alter_denials_precede_context_child_and_allocation);
 	UT_RUN(test_native_alter_denials_preserve_existing_binding);
 	UT_RUN(test_native_domain_constraint_public_scope_matches_utility_before_lookup);

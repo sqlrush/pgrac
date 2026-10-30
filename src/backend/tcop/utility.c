@@ -358,18 +358,10 @@ PreflightClusterSharedCatalogWrite(Node *statement, bool isTopLevel)
 		&& (cluster_interconnect_tier != CLUSTER_IC_TIER_1 || IsInTransactionBlock(isTopLevel)))
 		return;
 
-	if (IsA(statement, AlterTableStmt)) {
-		ListCell *lc;
-
-		/* The original candidate precheck can already hold DDL locks. */
-		foreach (lc, ((AlterTableStmt *)statement)->cmds) {
-			AlterTableCmd *cmd = (AlterTableCmd *)lfirst(lc);
-
-			if (cmd->subtype == AT_AddColumn || cmd->subtype == AT_AlterColumnType
-				|| cmd->subtype == AT_SetAccessMethod || cmd->subtype == AT_SetLogged)
-				return;
-		}
-	}
+	/* Dynamic ALTER classification takes DDL locks. Its upper preflight must
+	 * finish even when recovery is the only active context restriction. */
+	if (IsA(statement, AlterTableStmt))
+		PreventCommandDuringRecovery("ALTER TABLE");
 
 	if (IsA(statement, AlterDatabaseStmt)) {
 		ListCell *lc;
@@ -444,7 +436,8 @@ PreflightClusterSharedCatalogDrop(Node *statement, bool isTopLevel)
 	PreflightClusterSharedCatalogWrite(statement, isTopLevel);
 }
 
-/* Reuse early binding only for commands outside the original rewrite precheck. */
+/* Dynamic native callers may already hold DDL locks. Their unlocked upper
+ * utility path binds first; this native entry keeps its original boundary. */
 void
 PreflightClusterSharedCatalogAlterTable(AlterTableStmt *stmt)
 {
@@ -1000,8 +993,6 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 	 * Author: SqlRush <sqlrush@gmail.com> */
 	CheckClusterSharedUtilitySupport(parsetree, isTopLevel);
 	CheckClusterIndexSupport(parsetree);
-	if (IsA(parsetree, AlterTableStmt))
-		CheckClusterSharedAlterTable((AlterTableStmt *) parsetree, queryString);
 #endif
 
 	/* Prohibit read/write commands in read-only states. */
@@ -1021,6 +1012,10 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 
 #ifdef USE_PGRAC_CLUSTER
 	PreflightClusterSharedCatalogWrite(parsetree, isTopLevel);
+	/* Classify dynamic rewrites only after the original binding is complete,
+	 * so a full selected segment never waits while holding this DDL lock. */
+	if (IsA(parsetree, AlterTableStmt))
+		CheckClusterSharedAlterTable((AlterTableStmt *) parsetree, queryString);
 #endif
 
 	pstate = make_parsestate(NULL);
