@@ -90,6 +90,7 @@ int cluster_cold_recovery_plan_memory = CLUSTER_COLD_PLAN_MEMORY_DEFAULT_KB;
 typedef struct ClusterColdReplayRootV1 {
 	ClusterControlRootSnapshot root;
 	ClusterControlRootReadToken token;
+	ClusterWalSourceRef source;
 	XLogRecPtr checkpoint_start;
 	CheckPoint native_checkpoint;
 	uint8 native_window[160];
@@ -596,6 +597,7 @@ cold_participant(ClusterColdTypedV1 *typed, ColdRoot *root, uint32 index, const 
 		return false;
 	}
 	typed->sources[index] = selected.source;
+	root->source = selected.source;
 	root->checkpoint_start = selected.checkpoint_start;
 	memcpy(&root->native_checkpoint, &selected.checkpoint, sizeof(root->native_checkpoint));
 	memcpy(root->native_window, selected.native_window, sizeof(root->native_window));
@@ -835,6 +837,7 @@ cold_census_take(ClusterColdTypedV1 *typed, ColdRoot *roots, const ClusterWalInp
 		typed->sources[typed->participant_count] = entry->source;
 		typed->input_index[typed->participant_count] = entry->input_index;
 		roots[typed->participant_count].root = input->checkpoint;
+		roots[typed->participant_count].source = input->source;
 		roots[typed->participant_count].checkpoint_start = input->checkpoint_start;
 		memcpy(&roots[typed->participant_count].native_checkpoint, &input->native_checkpoint,
 			   sizeof(input->native_checkpoint));
@@ -1678,34 +1681,49 @@ cold_history_side_effects_match(const ClusterColdTypedV1 *typed, uint32 particip
 	return true;
 }
 
-/* Re-read history metadata using the caller's original execution retention
- * owner. Do not acquire a census read set from inside the execution IR set. */
+/* Independent prepared copies, checked only under the original owners.
+ * Physical source drift is checked after exact IR release, never here. */
 static bool
-cold_history_sources_match(ClusterColdTypedV1 *typed)
+cold_captured_sources_match(const ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence)
 {
-	if (!typed->census_root_captured || typed->inputs != NULL)
+	if (fence == NULL || typed->replay_roots == NULL || typed->own_participant != 0
+		|| typed->replay_count == 0 || typed->replay_count > typed->participant_count
+		|| typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
+		|| typed->replay_root_count != typed->replay_count || !typed->census_root_captured
+		|| typed->inputs != NULL || typed->plan == NULL
+		|| cluster_cold_plan_participant_count_v1(typed->plan) != typed->participant_count
+		|| typed->replay_count != (uint32)cluster_recovery_merge_fence_plan_origin_count(fence) + 1)
 		return false;
-	for (uint32 i = typed->replay_count; i < typed->participant_count; i++) {
+	for (uint32 i = 0; i < typed->participant_count; ++i) {
 		const ColdRoot *selected = &typed->replay_roots[i];
 		const ClusterColdParticipantV1 *participant = &typed->participants[i];
-		ClusterWalRecoveryCheckpointV1 observed;
-
 		if (!selected->checkpoint_captured
+			|| memcmp(&selected->source, &typed->sources[i], sizeof(selected->source)) != 0
+			|| !cluster_control_root_identity_equal(&selected->source.claim.identity,
+													&selected->root.identity)
+			|| selected->source.timeline != selected->root.checkpoint_tli
 			|| participant->thread_id != selected->root.identity.origin_thread_id
 			|| participant->owner_incarnation != selected->root.identity.origin_owner_incarnation
 			|| participant->timeline != selected->root.checkpoint_tli
 			|| participant->physical_lower != selected->root.checkpoint_lower_lsn
 			|| participant->tail_end != selected->root.validated_tail_lsn_exclusive
-			|| participant->native_redo != participant->tail_end
-			|| cluster_wal_inputs_cold_checkpoint_v1(&selected->root, &typed->census_root, &observed)
-				   != CLUSTER_CONTROL_ROOT_OK_PRIMARY
-			|| memcmp(&observed.source, &typed->sources[i], sizeof(observed.source)) != 0
-			|| observed.checkpoint_start != selected->checkpoint_start
-			|| memcmp(&observed.checkpoint, &selected->native_checkpoint,
-						  sizeof(observed.checkpoint)) != 0
-			|| memcmp(observed.native_window, selected->native_window,
-					  sizeof(observed.native_window)) != 0
-			|| !cold_history_side_effects_match(typed, i))
+			|| (i < typed->replay_count
+				&& participant->native_redo != selected->native_checkpoint.redo)
+			|| !cluster_cold_plan_participant_matches_v1(typed->plan, i, participant))
+			return false;
+		if (i > 0 && i < typed->replay_count) {
+			ClusterControlRootSnapshot root;
+			ClusterControlRootReadToken token;
+			uint16 thread;
+			if (!cluster_recovery_merge_fence_plan_origin(fence, i - 1, &thread, &root, &token)
+				|| thread != participant->thread_id
+				|| memcmp(&root, &selected->root, sizeof(root)) != 0
+				|| memcmp(&token, &selected->token, sizeof(token)) != 0)
+				return false;
+		}
+		if (i >= typed->replay_count
+			&& (participant->native_redo != participant->tail_end
+				|| !cold_history_side_effects_match(typed, i)))
 			return false;
 	}
 	return true;
@@ -1735,7 +1753,7 @@ cold_replay_sources_current(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan 
 	PG_TRY();
 	{
 		matched = cluster_recovery_merge_fence_plan_revalidate_nowait(fence)
-				  && cold_sources_match(typed, fence, NULL) && cold_history_sources_match(typed)
+				  && cold_captured_sources_match(typed, fence) && cold_native_profiles_match(typed)
 				  && cluster_recovery_merge_fence_plan_revalidate_nowait(fence);
 	}
 	PG_CATCH();
@@ -1766,6 +1784,50 @@ cluster_cold_typed_sources_current_v1(ClusterColdTypedV1 *typed, ClusterRecovery
 		return false;
 	}
 	return cold_replay_sources_current(typed, fence);
+}
+
+/* Original merge caller, after exact IR release and before publication.
+ * Waits use original Startup/CF ownership, without any replay retry/budget. */
+bool
+cluster_cold_typed_sources_readback_v1(void *arg, ClusterRecoveryFencePlan *fence)
+{
+	ClusterColdTypedV1 *typed = arg;
+	bool matched = false;
+	if (typed == NULL || typed->refusal != CLUSTER_COLD_OK)
+		return false;
+	PG_TRY();
+	{
+		matched = cluster_recovery_merge_fence_plan_publish_current_v1(fence)
+				  && cold_captured_sources_match(typed, fence);
+		for (uint32 i = 0; matched && i < typed->participant_count; ++i) {
+			const ColdRoot *selected = &typed->replay_roots[i];
+			ClusterWalRecoveryCheckpointV1 observed;
+			matched = cluster_wal_inputs_cold_checkpoint_readback_v1(&selected->root,
+																	 &typed->census_root, &observed)
+						  == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+					  && memcmp(&observed.source, &selected->source, sizeof(observed.source)) == 0
+					  && observed.checkpoint_start == selected->checkpoint_start
+					  && memcmp(&observed.checkpoint, &selected->native_checkpoint,
+								sizeof(observed.checkpoint))
+							 == 0
+					  && memcmp(observed.native_window, selected->native_window,
+								sizeof(observed.native_window))
+							 == 0
+					  && cluster_recovery_merge_fence_plan_publish_current_v1(fence);
+		}
+		matched = matched && cold_captured_sources_match(typed, fence)
+				  && cold_native_profiles_match(typed)
+				  && cluster_recovery_merge_fence_plan_publish_current_v1(fence);
+	}
+	PG_CATCH();
+	{
+		cold_execution_inputs_failed(typed);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (!matched)
+		cold_execution_inputs_failed(typed);
+	return matched;
 }
 
 bool
@@ -1801,12 +1863,9 @@ cluster_cold_typed_sync_sources_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFen
 			ClusterWalTailObservation observed;
 			ClusterControlRootResult result;
 
-			if (i < typed->replay_count)
-				result = cluster_control_root_recovery_sync_v1(&selected->root, &selected->token,
-															   &observed);
-			else
-				result = cluster_wal_inputs_cold_sync_v1(&selected->root, &typed->census_root,
-														 &observed);
+			result = cluster_wal_tail_sync_sealed_v1(cluster_wal_threads_dir, &selected->source,
+													 wal_segment_size, &selected->root,
+													 selected->checkpoint_start, &observed);
 			if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 				|| observed.complete_end != selected->root.validated_tail_lsn_exclusive
 				|| observed.last_record_start != selected->root.tail_last_record_lsn

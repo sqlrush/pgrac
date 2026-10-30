@@ -2456,6 +2456,7 @@ UT_TEST(ordinary_input_cf_timeout_keeps_its_original_release_behavior)
 
 static ClusterControlRootSnapshot input_expected, input_expected_original;
 static unsigned input_selections, input_claim_reads;
+static bool input_second_selection_drift;
 char *cluster_wal_threads_dir = "startup-input-fixture";
 void *
 palloc0(Size size)
@@ -2472,7 +2473,7 @@ GetSystemIdentifier(void)
 }
 static ClusterControlRootResult
 inputs_cold_checkpoint_select(ClusterWalInputsV1 *scratch, WalInputsWork *work,
-							  const ClusterControlRootSnapshot *expected)
+							  const ClusterControlRootSnapshot *expected, bool readback)
 {
 	UT_ASSERT(work != NULL && cluster_cf_held_is_clusterwide(ShareLock));
 	++input_selections;
@@ -2480,6 +2481,8 @@ inputs_cold_checkpoint_select(ClusterWalInputsV1 *scratch, WalInputsWork *work,
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	scratch->items[0].checkpoint_start = 100;
 	scratch->items[0].source.timeline = 1;
+	if (input_second_selection_drift && input_selections == 2)
+		scratch->items[0].source.claim.claim_sha256[31]++;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 ClusterControlRootResult
@@ -6521,6 +6524,7 @@ UT_TEST(ordinary_recovery_complete_roles_keep_the_original_cf_wait_policy)
 #include "test_cluster_classification_cf.h"
 #include "test_cluster_typed_root_budget.h"
 #include "test_cluster_typed_prepare_budget.h"
+#include "test_cluster_typed_pass2.h"
 
 int
 main(void)
@@ -6532,6 +6536,18 @@ main(void)
 	pg_atomic_init_u64(&owner_proc.cluster_grd_redeclare_acked_epoch, 0);
 	cluster_control_request_shmem_init();
 	retire_driver = cluster_control_request_driver_start();
+	if (getenv("PGRAC_PRE2_TEST_TYPED_PASS2") != NULL) {
+		UT_PLAN(7);
+		UT_RUN(committed_ir_source_check_never_enters_cf);
+		UT_RUN(post_ir_checkpoint_refresh_uses_original_cf_retirement);
+		UT_RUN(post_ir_readback_wait_has_original_terminators);
+		UT_RUN(post_ir_readback_stop_is_pending_until_original_ack);
+		UT_RUN(post_ir_checkpoint_selector_preserves_the_original_source_tuple);
+		UT_RUN(post_ir_file_token_advancing_between_reads_is_not_source_drift);
+		UT_RUN(post_ir_between_read_source_drift_never_exports_a_checkpoint);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_TYPED_PREPARE_BUDGET") != NULL) {
 		UT_PLAN(10);
 		UT_RUN(prepare_census_read_expiring_during_io_never_delivers);

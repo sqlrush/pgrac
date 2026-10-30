@@ -1429,20 +1429,20 @@ pin_root_token_matches_snapshot(const ClusterControlRootReadToken *token,
 		   && (token->root_flags & ~CLUSTER_CONTROL_ROOT_FLAGS_V1) == 0;
 }
 
-static bool
-pin_root_immutable_tuple_equal(const ClusterControlRootSnapshot *left,
-							   const ClusterControlRootSnapshot *right)
+
+bool
+cluster_wal_retention_pin_sealed_current_v1(ClusterWalRetentionPin *pin)
 {
-	return memcmp(&left->identity, &right->identity, sizeof(left->identity)) == 0
-		   && left->checkpoint_tli == right->checkpoint_tli
-		   && left->checkpoint_source_kind == right->checkpoint_source_kind
-		   && left->checkpoint_lower_lsn == right->checkpoint_lower_lsn
-		   && left->checkpoint_record_crc32c == right->checkpoint_record_crc32c
-		   && left->tail_tli == right->tail_tli
-		   && left->tail_validation_kind == right->tail_validation_kind
-		   && left->validated_tail_lsn_exclusive == right->validated_tail_lsn_exclusive
-		   && left->tail_last_record_lsn == right->tail_last_record_lsn
-		   && left->tail_last_record_crc32c == right->tail_last_record_crc32c;
+	if (!pin_valid(pin) || pin->poisoned || pin->state != CLUSTER_WAL_PIN_STATE_SEALED
+		|| !pin_readers_current(pin))
+		return false;
+	for (uint16 i = 0; i < pin->nthreads; ++i) {
+		const ClusterWalPinThread *thread = &pin->threads[i];
+		if (thread->serial == NULL || thread->serial->held || thread->serial->release_uncertain
+			|| thread->pending.generation != 0 || !pin_thread_walr_current(pin, thread))
+			return false;
+	}
+	return true;
 }
 
 ClusterWalPinResult
@@ -1476,7 +1476,7 @@ cluster_wal_retention_pin_adopt_root_readback_v1(
 		|| interval->tli != expected_snapshot->tail_tli
 		|| interval->start_lsn != expected_snapshot->checkpoint_lower_lsn
 		|| interval->end_lsn != expected_snapshot->validated_tail_lsn_exclusive
-		|| !pin_root_immutable_tuple_equal(expected_snapshot, observed_snapshot)
+		|| !cluster_wal_retention_root_source_equal_v1(expected_snapshot, observed_snapshot)
 		|| observed_token->file_txn_seq < expected_token->file_txn_seq
 		|| observed_token->root_publish_seq < expected_token->root_publish_seq)
 		return CLUSTER_WAL_PIN_STALE;

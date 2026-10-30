@@ -3156,7 +3156,7 @@ cluster_wal_inputs_tx_abort_path_v1(ClusterWalInputsV1 *inputs,
  * no WALR locks; retention belongs to the caller's original execution pin. */
 static ClusterControlRootResult
 inputs_cold_checkpoint_select(ClusterWalInputsV1 *scratch, WalInputsWork *work,
-							 const ClusterControlRootSnapshot *expected)
+							  const ClusterControlRootSnapshot *expected, bool readback)
 {
 	const ClusterWalHistoryRecord *selected = NULL;
 	uint32 node = expected->identity.origin_node_id;
@@ -3175,7 +3175,14 @@ inputs_cold_checkpoint_select(ClusterWalInputsV1 *scratch, WalInputsWork *work,
 												   : &work->origin.history.records[i];
 		if (!cluster_control_root_identity_equal(&record->snapshot.identity, &expected->identity))
 			continue;
-		if (selected != NULL || memcmp(&record->snapshot, expected, sizeof(*expected)) != 0)
+		if (selected != NULL
+			|| (readback ? (!cluster_wal_retention_root_source_equal_v1(&record->snapshot, expected)
+							|| (record->snapshot.lifecycle != expected->lifecycle
+								&& !(expected->lifecycle
+										 == CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+									 && record->snapshot.lifecycle
+											== CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE)))
+						 : memcmp(&record->snapshot, expected, sizeof(*expected)) != 0))
 			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 		selected = record;
 	}
@@ -3184,15 +3191,16 @@ inputs_cold_checkpoint_select(ClusterWalInputsV1 *scratch, WalInputsWork *work,
 	return inputs_checkpoint(scratch, work, selected, selected == &work->origin.current);
 }
 
-ClusterControlRootResult
-cluster_wal_inputs_cold_checkpoint_v1(const ClusterControlRootSnapshot *expected,
-									const ClusterControlRootFileToken *root_token,
-									ClusterWalRecoveryCheckpointV1 *out)
+static ClusterControlRootResult
+inputs_cold_checkpoint(const ClusterControlRootSnapshot *expected,
+					   const ClusterControlRootFileToken *root_token,
+					   ClusterWalRecoveryCheckpointV1 *out, bool readback)
 {
 	ClusterWalInputsV1 *scratch;
 	WalInputsWork *work;
 	ClusterControlRootResult result;
 	ClusterControlRootSnapshot original;
+	ClusterWalInputV1 selected;
 
 	if (inputs_overlap(expected, sizeof(*expected), out, sizeof(*out))
 		|| inputs_overlap(root_token, sizeof(*root_token), out, sizeof(*out)))
@@ -3226,15 +3234,36 @@ cluster_wal_inputs_cold_checkpoint_v1(const ClusterControlRootSnapshot *expected
 	{
 		ClusterWalThreadClaimV2 claim;
 
-		result = inputs_root(scratch, work, false);
+		result = inputs_root(scratch, work, readback);
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-			result = inputs_cold_checkpoint_select(scratch, work, &original);
+			result = inputs_cold_checkpoint_select(scratch, work, &original, readback);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && readback)
+			selected = scratch->items[0];
 		inputs_unlock(work);
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			result = cluster_wal_claim_v2_read(cluster_wal_threads_dir,
 											   &scratch->items[0].source.claim, &claim);
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-			result = inputs_root(scratch, work, false);
+			result = inputs_root(scratch, work, readback);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && readback) {
+			/* Another origin may advance only the file token while CF is
+			 * released. Rediscover this same source under the fresh cut,
+			 * rather than treating file-token drift as a semantic gap.
+			 * The original claim read is usable only for identical bytes. */
+			const ClusterWalInputV1 *current = &scratch->items[0];
+			scratch->count = 0;
+			result = inputs_cold_checkpoint_select(scratch, work, &original, true);
+			if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+				&& (memcmp(&selected.source, &current->source, sizeof(selected.source)) != 0
+					|| selected.checkpoint_start != current->checkpoint_start
+					|| memcmp(&selected.native_checkpoint, &current->native_checkpoint,
+							  sizeof(selected.native_checkpoint))
+						   != 0
+					|| memcmp(selected.native_window, current->native_window,
+							  sizeof(selected.native_window))
+						   != 0))
+				result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		}
 		inputs_unlock(work);
 	}
 	PG_CATCH();
@@ -3254,6 +3283,26 @@ cluster_wal_inputs_cold_checkpoint_v1(const ClusterControlRootSnapshot *expected
 	pfree(work);
 	pfree(scratch);
 	return result;
+}
+
+ClusterControlRootResult
+cluster_wal_inputs_cold_checkpoint_v1(const ClusterControlRootSnapshot *expected,
+									  const ClusterControlRootFileToken *root_token,
+									  ClusterWalRecoveryCheckpointV1 *out)
+{
+	return inputs_cold_checkpoint(expected, root_token, out, false);
+}
+
+/* Original Startup post-IR readback: refresh only the file cut, then bracket
+ * the same claim and native checkpoint with two exact reads. No new pin. */
+ClusterControlRootResult
+cluster_wal_inputs_cold_checkpoint_readback_v1(const ClusterControlRootSnapshot *expected,
+											   const ClusterControlRootFileToken *root_token,
+											   ClusterWalRecoveryCheckpointV1 *out)
+{
+	if (MyBackendType != B_STARTUP || !AmStartupProcess())
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	return inputs_cold_checkpoint(expected, root_token, out, true);
 }
 
 ClusterControlRootResult

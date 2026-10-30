@@ -5000,24 +5000,22 @@ cluster_typed_replay_publish(ClusterColdTypedReplay *rep, const ClusterColdRepla
 			plan, rep->typed->sources, rep->typed->replay_count))
 		cluster_typed_replay_unpublished(
 			thread, "Original transaction isolation inputs could not be retained", 0);
-	switch (cluster_recovery_merge_fence_plan_complete_v1(plan, &thread, &detail))
-	{
-		case CLUSTER_RECOVERY_FENCE_COMPLETE_OK:
-			break;
-		case CLUSTER_RECOVERY_FENCE_COMPLETE_AUTHORITY:
-			cluster_write_fence_note_external_publish_gate_blocked();
-			cluster_typed_replay_unpublished(thread, "Its external write exclusion became stale",
-											 detail);
-		case CLUSTER_RECOVERY_FENCE_COMPLETE_IR_RELEASE:
-			ereport(FATAL,
-					(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
-					 errmsg("cold recovery serialization release was not confirmed"),
-					 errdetail("No fenced generation was published recovered (result %d).",
-							   detail)));
-			break;
-		default:
-			cluster_typed_replay_unpublished(thread, "The recovery completion handoff refused",
-											 detail);
+	switch (cluster_recovery_merge_fence_plan_complete_checked_v1(
+		plan, cluster_cold_typed_sources_readback_v1, rep->typed, &thread, &detail)) {
+	case CLUSTER_RECOVERY_FENCE_COMPLETE_OK:
+		break;
+	case CLUSTER_RECOVERY_FENCE_COMPLETE_AUTHORITY:
+		cluster_write_fence_note_external_publish_gate_blocked();
+		cluster_typed_replay_unpublished(thread, "Its external write exclusion became stale",
+										 detail);
+	case CLUSTER_RECOVERY_FENCE_COMPLETE_IR_RELEASE:
+		ereport(FATAL,
+				(errcode(ERRCODE_CLUSTER_RECOVERY_OWNER_CONFLICT),
+				 errmsg("cold recovery serialization release was not confirmed"),
+				 errdetail("No fenced generation was published recovered (result %d).", detail)));
+		break;
+	default:
+		cluster_typed_replay_unpublished(thread, "The recovery completion handoff refused", detail);
 	}
 	ereport(LOG,
 			(errmsg("cluster typed cold recovery: %u fenced writer generations published recovered",

@@ -581,8 +581,16 @@ typedef enum ClusterRecoveryFenceCompleteV1 {
 	CLUSTER_RECOVERY_FENCE_COMPLETE_PIN_SEAL = 4,
 	CLUSTER_RECOVERY_FENCE_COMPLETE_IR_RELEASE = 5, /* release not confirmed */
 	CLUSTER_RECOVERY_FENCE_COMPLETE_FINALIZE = 6,
-	CLUSTER_RECOVERY_FENCE_COMPLETE_PIN_RELEASE = 7
+	CLUSTER_RECOVERY_FENCE_COMPLETE_PIN_RELEASE = 7,
+	CLUSTER_RECOVERY_FENCE_COMPLETE_SOURCE = 8
 } ClusterRecoveryFenceCompleteV1;
+
+typedef bool (*ClusterRecoveryPostIrCheckV1)(void *arg, ClusterRecoveryFencePlan *plan);
+extern bool cluster_recovery_merge_fence_plan_publish_current_v1(ClusterRecoveryFencePlan *plan);
+extern ClusterRecoveryFenceCompleteV1
+cluster_recovery_merge_fence_plan_complete_checked_v1(ClusterRecoveryFencePlan *plan,
+													  ClusterRecoveryPostIrCheckV1 check, void *arg,
+													  uint16 *failed_thread, int *failed_detail);
 
 extern ClusterRecoveryFenceCompleteV1
 cluster_recovery_merge_fence_plan_complete_v1(ClusterRecoveryFencePlan *plan, uint16 *failed_thread,

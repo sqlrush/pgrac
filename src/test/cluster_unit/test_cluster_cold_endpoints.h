@@ -91,7 +91,8 @@ UT_TEST(test_endpoints_include_every_history_generation_original_checkpoint_cut)
 	ClusterColdTypedV1 *typed = endpoint_fixture(true);
 	UT_ASSERT(endpoint_finish(typed));
 	UT_ASSERT_EQ(typed->xid_next_after_redo, UINT64_C(0x900000009));
-	UT_ASSERT_EQ(history_checkpoint_reads, 12); /* before/after endpoints and each TT read */
+	UT_ASSERT_EQ(history_checkpoint_reads, 0);
+	/* IR: no ROOT IO. */ /* before/after endpoints and each TT read */
 	UT_ASSERT_EQ(endpoint_progress[3].next_xid, 0);
 	UT_ASSERT_EQ(typed->xid_next_at_drain[3], 0);
 	UT_ASSERT_EQ(source_sync_calls, 3);
@@ -361,6 +362,14 @@ UT_TEST(test_endpoints_require_current_original_owner_and_all_sources)
 			typed->participant_count--;
 			break;
 		}
+		if (fault == 1) {
+			UT_ASSERT(endpoint_finish(typed));
+			UT_ASSERT(test_sources_readback(typed));
+			endpoint_destroy(&typed);
+			continue;
+		}
+		if (fault == 2)
+			UT_ASSERT(!test_sources_readback(typed));
 		UT_ASSERT(!endpoint_finish(typed));
 		UT_ASSERT_EQ(typed->xid_next_after_redo, 0);
 		UT_ASSERT_NULL(typed->xid_receipt.plan);
@@ -373,7 +382,9 @@ UT_TEST(test_endpoints_require_current_original_owner_and_all_sources)
 UT_TEST(test_endpoints_recheck_original_sources_before_publishing_maximum)
 {
 	ClusterColdTypedV1 *typed = endpoint_fixture(true);
-	history_checkpoint_fault = 3;
+	/* The physical change precedes the single strong post-IR read. */
+	native_checkpoint[1].checkpoint.oldestXid++;
+	UT_ASSERT(!test_sources_readback(typed));
 	UT_ASSERT(!endpoint_finish(typed));
 	UT_ASSERT_EQ(typed->xid_next_after_redo, 0);
 	UT_ASSERT_NULL(typed->xid_receipt.plan);
@@ -391,7 +402,7 @@ UT_TEST(test_endpoints_error_discards_group_and_preserves_prior_refusal)
 	history_checkpoint_fault = 2;
 	PG_TRY();
 	{
-		(void)endpoint_finish(typed);
+		(void)test_sources_readback(typed);
 	}
 	PG_CATCH();
 	{

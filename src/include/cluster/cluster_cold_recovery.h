@@ -1156,6 +1156,10 @@ extern bool cluster_cold_top_tx_c0_v1(const ClusterColdLoserIdentityV1 *loser,
  * history inside the caller's still-held pass-2 fence/serial set. No refresh
  * or authority acquisition: failure invalidates this attempt's cached input.
  * This is not a post-EOR recovery-writer grant. */
+/* Original merge caller's post-IR, retained-WALR source check. */
+extern bool cluster_cold_typed_sources_readback_v1(void *typed,
+												   struct ClusterRecoveryFencePlan *fence);
+
 extern bool cluster_cold_typed_sources_current_v1(ClusterColdTypedV1 *typed,
 												  struct ClusterRecoveryFencePlan *fence);
 

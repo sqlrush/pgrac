@@ -519,10 +519,65 @@ UT_TEST(test_tx_request_cannot_borrow_revoked_original_proof_owner)
 	drop_plan(&plan);
 }
 
+static unsigned post_ir_checks;
+static bool post_ir_source_current;
+static bool post_ir_revoke;
+static bool
+post_ir_check(void *arg, ClusterRecoveryFencePlan *plan)
+{
+	UT_ASSERT(arg == &post_ir_checks);
+	++post_ir_checks;
+	UT_ASSERT(!plan->serial_held && plan->serial_guards.count == 0);
+	UT_ASSERT(plan->retention_pin == (ClusterWalRetentionPin *)&pin_obj);
+	UT_ASSERT(strstr(events, "release-ir;") != NULL && strstr(events, "finalize:") == NULL);
+	event("readback;");
+	if (post_ir_revoke)
+		fence_current[3] = false;
+	return post_ir_source_current && cluster_recovery_merge_fence_plan_publish_current_v1(plan);
+}
+UT_TEST(test_checked_complete_reads_only_after_exact_ir_release)
+{
+	for (unsigned fault = 0; fault < 5; ++fault) {
+		ClusterRecoveryFencePlan *plan = replayed_plan();
+		uint16 thread;
+		int detail;
+		ClusterRecoveryFenceCompleteV1 result;
+		post_ir_checks = 0;
+		post_ir_source_current = fault != 1;
+		post_ir_revoke = fault == 4;
+		if (fault == 2)
+			ir_release_result = CLUSTER_RECOVERY_SERIAL_RELEASE_UNCONFIRMED;
+		if (fault == 3)
+			fence_current[2] = false;
+		result = cluster_recovery_merge_fence_plan_complete_checked_v1(
+			plan, post_ir_check, &post_ir_checks, &thread, &detail);
+		if (fault == 0) {
+			UT_ASSERT_EQ(result, CLUSTER_RECOVERY_FENCE_COMPLETE_OK);
+			UT_ASSERT(strstr(events, "release-ir;readback;finalize:") != NULL);
+		} else {
+			UT_ASSERT_EQ(result, fault == 2	  ? CLUSTER_RECOVERY_FENCE_COMPLETE_IR_RELEASE
+								 : fault == 3 ? CLUSTER_RECOVERY_FENCE_COMPLETE_AUTHORITY
+											  : CLUSTER_RECOVERY_FENCE_COMPLETE_SOURCE);
+			UT_ASSERT(strstr(events, "finalize:") == NULL
+					  && strstr(events, "release-pin;") == NULL);
+			UT_ASSERT(plan->retention_pin != NULL);
+		}
+		UT_ASSERT_EQ(post_ir_checks, fault == 2 || fault == 3 ? 0 : 1);
+		if (fault == 1) {
+			UT_ASSERT_EQ(cluster_recovery_merge_fence_plan_complete_checked_v1(
+							 plan, post_ir_check, &post_ir_checks, &thread, &detail),
+						 CLUSTER_RECOVERY_FENCE_COMPLETE_INVALID);
+			UT_ASSERT_EQ(post_ir_checks, 1); /* No replay, reacquire or repeated publication. */
+		}
+		drop_plan(&plan);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(13);
+	UT_RUN(test_checked_complete_reads_only_after_exact_ir_release);
 	UT_RUN(test_complete_publishes_every_origin);
 	UT_RUN(test_complete_after_preflight_seal);
 	UT_RUN(test_complete_refuses_before_any_publication);

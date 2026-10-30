@@ -315,6 +315,13 @@ extern bool cluster_wal_inputs_tx_serial_current_v1(ClusterWalInputsV1 *inputs,
  * and recheck ROOT after claim I/O outside CF. Acquires no WALR scope or recovery
  * permission. The caller must revalidate its original execution owner before
  * and after the call; output is provisional metadata, never an endpoint proof. */
+/* Original Startup post-IR readback with WALR retained. The caller must
+ * compare the complete prepared source; this grants no authority. */
+extern ClusterControlRootResult
+cluster_wal_inputs_cold_checkpoint_readback_v1(const ClusterControlRootSnapshot *expected,
+											   const ClusterControlRootFileToken *root_token,
+											   ClusterWalRecoveryCheckpointV1 *out);
+
 extern ClusterControlRootResult cluster_wal_inputs_cold_checkpoint_v1(
 	const ClusterControlRootSnapshot *expected, const ClusterControlRootFileToken *root_token,
 	ClusterWalRecoveryCheckpointV1 *out);

@@ -281,6 +281,11 @@ static bool scan_space_drop;
 static bool scan_space;					/* thread 2 extends relation 300 before its page record */
 static ClusterWalSourceRef restart_ref; /* this node's bootstrap-validated restart input */
 static bool restart_ref_present;
+char *cluster_wal_threads_dir = "cold-fixture";
+int wal_segment_size = 16777216;
+static int pass2_root_reads;
+static unsigned pass2_forbidden_reads;
+static bool test_post_ir;
 static int source_sync_calls;
 static uint16 source_sync_order[NROOTS];
 static uint16 source_sync_fail_thread;
@@ -441,6 +446,11 @@ cluster_control_root_recovery_source_v1(const ClusterControlRootSnapshot *root,
 {
 	uint16 thread = root->identity.origin_thread_id;
 
+	pass2_root_reads++;
+	if (cluster_cold_replay_window_active_v1() && !test_post_ir) {
+		++pass2_forbidden_reads;
+		UT_ASSERT(false); /* Applies to every execution caller in this suite. */
+	}
 	memset(source, 0, sizeof(*source));
 	if (memcmp(token, &tokens[thread], sizeof(*token)) != 0
 		|| memcmp(root, &roots[thread], sizeof(*root)) != 0)
@@ -1019,6 +1029,11 @@ cluster_wal_inputs_cold_checkpoint_v1(const ClusterControlRootSnapshot *expected
 	UT_ASSERT(cluster_cold_replay_window_active_v1());
 	UT_ASSERT_EQ(census_begins, census_releases);
 	history_checkpoint_reads++;
+	pass2_root_reads++;
+	if (cluster_cold_replay_window_active_v1() && !test_post_ir) {
+		++pass2_forbidden_reads;
+		UT_ASSERT(false); /* Applies to every execution caller in this suite. */
+	}
 	memset(out, 0, sizeof(*out));
 	if (memcmp(root_token, &census_token, sizeof(*root_token)) != 0)
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
@@ -1093,6 +1108,88 @@ cluster_wal_inputs_cold_sync_v1(const ClusterControlRootSnapshot *expected,
 			out->database_incarnation++;
 	}
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+/* Physical-only tail fsync leaf: no ROOT selection or token reads. */
+ClusterControlRootResult
+cluster_wal_tail_sync_sealed_v1(const char *path, const ClusterWalSourceRef *source,
+								int segment_size, const ClusterControlRootSnapshot *root,
+								XLogRecPtr checkpoint, ClusterWalTailObservation *out)
+{
+	uint16 thread = root->identity.origin_thread_id;
+	unsigned call;
+	if (root->identity.origin_owner_incarnation == roots[thread].identity.origin_owner_incarnation)
+		return cluster_control_root_recovery_sync_v1(root, &tokens[thread], out);
+	call = history_sync_calls++;
+	UT_ASSERT(call < MAX_HISTORY);
+	if (call < MAX_HISTORY) {
+		history_sync_incarnations[call] = root->identity.origin_owner_incarnation;
+		history_sync_threads[call] = thread;
+	}
+	memset(out, 0, sizeof(*out));
+	out->complete_end = root->validated_tail_lsn_exclusive;
+	out->last_record_start = root->tail_last_record_lsn;
+	out->last_record_crc = root->tail_last_record_crc32c;
+	out->database_incarnation = source->claim.database_incarnation;
+	if (call + 1 == history_sync_fail_at) {
+		if (history_sync_fault == 1)
+			return CLUSTER_CONTROL_ROOT_IO_ERROR;
+		if (history_sync_fault == 2)
+			out->complete_end++;
+		if (history_sync_fault == 3)
+			out->last_record_start++;
+		if (history_sync_fault == 4)
+			out->last_record_crc++;
+		if (history_sync_fault == 5)
+			out->database_incarnation++;
+		if (history_sync_fault == 6)
+			census_token.file_txn_seq++;
+		if (history_sync_fault == 7)
+			census_input_fault = 7;
+		if (history_sync_fault == 8)
+			fence_current = false;
+		if (history_sync_fault == 9)
+			siglongjmp(*PG_exception_stack, 1);
+	}
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+bool
+cluster_recovery_merge_fence_plan_publish_current_v1(ClusterRecoveryFencePlan *plan)
+{
+	return plan != NULL && fence_current && test_post_ir;
+}
+
+ClusterControlRootResult
+cluster_wal_inputs_cold_checkpoint_readback_v1(const ClusterControlRootSnapshot *root,
+											   const ClusterControlRootFileToken *token,
+											   ClusterWalRecoveryCheckpointV1 *out)
+{
+	uint16 thread = root->identity.origin_thread_id;
+	UT_ASSERT(test_post_ir);
+	if (root->identity.origin_owner_incarnation == roots[thread].identity.origin_owner_incarnation)
+		return cluster_control_root_recovery_checkpoint_v1(root, &tokens[thread], out);
+	return cluster_wal_inputs_cold_checkpoint_v1(root, &census_token, out);
+}
+
+/* Existing negative assertions about physical ROOT drift move to this
+ * explicit post-release phase. Execution-owner failures still refuse in IR. */
+static bool
+test_sources_readback(ClusterColdTypedV1 *typed)
+{
+	bool result;
+	test_post_ir = true;
+	result = cluster_cold_typed_sources_readback_v1(typed,
+													(ClusterRecoveryFencePlan *)&fixture_context);
+	test_post_ir = false;
+	return result;
+}
+
+static bool
+test_sync_and_readback(ClusterColdTypedV1 *typed)
+{
+	return cluster_cold_typed_sync_sources_v1(typed, (ClusterRecoveryFencePlan *)&fixture_context)
+		   && test_sources_readback(typed);
 }
 
 ClusterControlRootResult
@@ -1642,6 +1739,7 @@ fixture(void)
 	restart_ref.timeline = 1;
 	restart_ref_present = true;
 	source_sync_calls = source_sync_fail_thread = source_sync_fault = 0;
+	test_post_ir = false;
 	memset(source_sync_order, 0, sizeof(source_sync_order));
 	fence_current = true;
 	scan_space_offset = 0;

@@ -2333,6 +2333,41 @@ UT_TEST(test_sealed_publisher_rechecks_formation_and_fence_without_cf)
 	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
 }
 
+UT_TEST(test_post_ir_current_requires_sealed_pin_exact_release_and_original_walr)
+{
+	ClusterWalRetentionInterval interval = { .thread_id = 1,
+											 .tli = 1,
+											 .start_lsn = TEST_WAL_SEG_SIZE,
+											 .end_lsn = TEST_WAL_SEG_SIZE * 2 };
+	ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
+	ClusterRecoverySerialGuard serial = make_serial_guard(&request);
+	ClusterWalRetentionPin *pin = NULL;
+	ResourceOwner owner;
+	reset_pin_fakes();
+	cluster_shared_config = true;
+	UT_ASSERT(!cluster_wal_retention_pin_sealed_current_v1(NULL));
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT(!cluster_wal_retention_pin_sealed_current_v1(pin));
+	UT_ASSERT_EQ(cluster_wal_retention_pin_seal_for_root_publish(pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT(!cluster_wal_retention_pin_sealed_current_v1(pin)); /* IR still held. */
+	serial.held = false;
+	UT_ASSERT(cluster_wal_retention_pin_sealed_current_v1(pin));
+	serial.release_uncertain = true;
+	UT_ASSERT(!cluster_wal_retention_pin_sealed_current_v1(pin));
+	serial.release_uncertain = false;
+	fake_control_owner_current = false;
+	UT_ASSERT(!cluster_wal_retention_pin_sealed_current_v1(pin));
+	fake_control_owner_current = true;
+	owner = CurrentResourceOwner;
+	CurrentResourceOwner = NULL;
+	UT_ASSERT(!cluster_wal_retention_pin_sealed_current_v1(pin));
+	CurrentResourceOwner = owner;
+	UT_ASSERT(cluster_wal_retention_pin_sealed_current_v1(pin));
+	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+	reset_pin_fakes();
+}
+
 UT_TEST(test_sealed_pin_adopts_same_immutable_root_readback)
 {
 	ClusterWalRetentionInterval interval = { .thread_id = 1,
@@ -4479,7 +4514,8 @@ main(int argc, char **argv)
 		return write_fixture_wal_segment(argc, argv);
 	if (argc != 1)
 		return 2;
-	UT_PLAN(98);
+	UT_PLAN(99);
+	UT_RUN(test_post_ir_current_requires_sealed_pin_exact_release_and_original_walr);
 	UT_RUN(test_prepare_read_pin_uses_one_budget_across_all_members);
 	UT_RUN(test_prepare_read_pin_late_reply_cleans_up_without_publishing);
 	UT_RUN(test_prepare_read_pin_zero_ready_and_expired_never_renew);

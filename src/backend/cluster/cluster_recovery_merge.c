@@ -3761,9 +3761,34 @@ cluster_recovery_merge_fence_plan_tx_request_v1(ClusterRecoveryFencePlan *plan,
  * the next cold start recovers them again.  Author: SqlRush
  * <sqlrush@gmail.com>
  */
+/* The original formation/exclusion and WALR owners after every IR release
+ * ACK. No reacquisition, ROOT read or plan deadline in this phase. */
+bool
+cluster_recovery_merge_fence_plan_publish_current_v1(ClusterRecoveryFencePlan *plan)
+{
+	PgracExternalFenceDenyReason reason;
+	if (!recovery_fence_plan_valid(plan) || !plan->sealed || !plan->committed || plan->completed
+		|| plan->serial_held || plan->serial_guards.count != 0 || plan->origin_count == 0
+		|| plan->retention_pin == NULL
+		|| !cluster_wal_retention_pin_sealed_current_v1(plan->retention_pin))
+		return false;
+	for (uint16 i = 0; i < plan->origin_count; ++i) {
+		const ClusterRecoveryFenceOrigin *origin = &plan->origins[i];
+		if (cluster_formation_witness_revalidate_nowait(origin->formation)
+				!= CLUSTER_FORMATION_WITNESS_READY
+			|| !cluster_external_fence_need_set_revalidate_nowait(origin->needs, origin->formation,
+																  &reason)
+			|| !cluster_external_fence_revalidate_set_nowait(origin->admissions, origin->needs,
+															 origin->formation, &reason))
+			return false;
+	}
+	return true;
+}
+
 ClusterRecoveryFenceCompleteV1
-cluster_recovery_merge_fence_plan_complete_v1(ClusterRecoveryFencePlan *plan, uint16 *failed_thread,
-											  int *failed_detail)
+cluster_recovery_merge_fence_plan_complete_checked_v1(ClusterRecoveryFencePlan *plan,
+													  ClusterRecoveryPostIrCheckV1 check, void *arg,
+													  uint16 *failed_thread, int *failed_detail)
 {
 	ClusterThreadRecoveryAuthorityV1 authority[CLUSTER_WAL_STATE_SLOT_COUNT];
 	ClusterControlRootPatch patch[CLUSTER_WAL_STATE_SLOT_COUNT];
@@ -3801,6 +3826,9 @@ cluster_recovery_merge_fence_plan_complete_v1(ClusterRecoveryFencePlan *plan, ui
 		*failed_detail = (int)released;
 		return CLUSTER_RECOVERY_FENCE_COMPLETE_IR_RELEASE;
 	}
+	if (check != NULL && !check(arg, plan))
+		return CLUSTER_RECOVERY_FENCE_COMPLETE_SOURCE;
+
 	for (i = 0; i < plan->origin_count; i++) {
 		ClusterThreadRecoveryRootFinalizeResultV1 finalized;
 		ClusterControlRootSnapshot published;
@@ -3821,6 +3849,14 @@ cluster_recovery_merge_fence_plan_complete_v1(ClusterRecoveryFencePlan *plan, ui
 	}
 	plan->completed = true;
 	return CLUSTER_RECOVERY_FENCE_COMPLETE_OK;
+}
+
+ClusterRecoveryFenceCompleteV1
+cluster_recovery_merge_fence_plan_complete_v1(ClusterRecoveryFencePlan *plan, uint16 *failed_thread,
+											  int *failed_detail)
+{
+	return cluster_recovery_merge_fence_plan_complete_checked_v1(plan, NULL, NULL, failed_thread,
+																 failed_detail);
 }
 
 bool

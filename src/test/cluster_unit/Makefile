@@ -1466,6 +1466,7 @@ test_cluster_startup_cf_entry: test_cluster_startup_cf_entry.c test_cluster_cf_e
 		test_cluster_classification_cf.h test_cluster_classification_cf.inc \
 		test_cluster_typed_root_budget.h test_cluster_typed_root_budget.inc \
 		test_cluster_typed_prepare_budget.h test_cluster_typed_prepare_budget.inc \
+        test_cluster_typed_pass2.h test_cluster_typed_pass2.inc test_cluster_typed_pass2_select.inc \
 		test_cluster_prepared_cf.h test_cluster_prepared_job.h test_cluster_prepared_cf.inc \
 		$(top_srcdir)/src/include/cluster/cluster_control_root_prepared.h \
 		test_cluster_generic_cf.h test_cluster_generic_cf.inc \
@@ -1711,9 +1712,10 @@ test_cluster_inputs_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_inputs
 # The actual no-pin checkpoint caller, including its original cleanup paths.
 test_cluster_inputs_cf_checkpoint.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_inputs.c Makefile
 	awk '/^inputs_overlap\(/ { print "static bool"; emit=1; overlaps++ } \
-	     /^cluster_wal_inputs_cold_checkpoint_v1\(/ { print "ClusterControlRootResult"; emit=1; callers++ } \
+	     /^inputs_cold_checkpoint\(/ { print "static ClusterControlRootResult"; emit=1; common++ } \
+	     /^cluster_wal_inputs_cold_checkpoint(_readback)?_v1\(/ { print "ClusterControlRootResult"; emit=1; callers++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (overlaps != 1 || callers != 1 || emit) exit 1 }' $< > $@.tmp
+	     END { if (overlaps != 1 || common != 1 || callers != 2 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Original retention consumers and their shared canonical observation, joined
@@ -13529,4 +13531,18 @@ test_cluster_typed_prepare_budget.inc: $(top_srcdir)/src/backend/cluster/cluster
 	awk '/^cold_prepare_deadline_check\(/ { print "static void"; emit=1; checks++ } \
 	     /^cold_participant\(/ { print "static bool"; emit=1; n++ } \
 	     emit { print } /^}/ { emit=0 } END { if (n != 1 || checks != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Exact committed matcher: the same product bodies, no test retry policy.
+test_cluster_typed_pass2.inc: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_startup.c Makefile
+	awk '/^(cold_captured_sources_match|cold_replay_sources_current)\(/ { print "static bool"; emit=1; checks++ } \
+	     /^cold_execution_inputs_failed\(/ { print "static void"; emit=1; cleanup++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (checks != 2 || cleanup != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_typed_pass2_select.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_inputs.c Makefile
+	awk '/^inputs_cold_checkpoint_select\(/ { print "static ClusterControlRootResult"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@

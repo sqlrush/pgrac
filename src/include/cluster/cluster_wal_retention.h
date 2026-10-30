@@ -405,6 +405,26 @@ cluster_wal_retention_pin_borrow_cold_v1(ClusterWalRetentionPin **out_pin,
 										 uint16 *out_count);
 extern ClusterWalPinResult
 cluster_wal_retention_pin_seal_for_root_publish(ClusterWalRetentionPin *pin);
+/* The original sealed-pin source tuple. Equality alone grants no authority. */
+static inline bool
+cluster_wal_retention_root_source_equal_v1(const ClusterControlRootSnapshot *left,
+										   const ClusterControlRootSnapshot *right)
+{
+	return memcmp(&left->identity, &right->identity, sizeof(left->identity)) == 0
+		   && left->checkpoint_tli == right->checkpoint_tli
+		   && left->checkpoint_source_kind == right->checkpoint_source_kind
+		   && left->checkpoint_lower_lsn == right->checkpoint_lower_lsn
+		   && left->checkpoint_record_crc32c == right->checkpoint_record_crc32c
+		   && left->tail_tli == right->tail_tli
+		   && left->tail_validation_kind == right->tail_validation_kind
+		   && left->validated_tail_lsn_exclusive == right->validated_tail_lsn_exclusive
+		   && left->tail_last_record_lsn == right->tail_last_record_lsn
+		   && left->tail_last_record_crc32c == right->tail_last_record_crc32c;
+}
+
+/* Zero IO, using only original sealed WALR and confirmed IR release. */
+extern bool cluster_wal_retention_pin_sealed_current_v1(ClusterWalRetentionPin *pin);
+
 extern ClusterWalPinResult cluster_wal_retention_pin_adopt_root_readback_v1(
 	ClusterWalRetentionPin *pin, const ClusterControlRootSnapshot *expected_snapshot,
 	const ClusterControlRootReadToken *expected_token,

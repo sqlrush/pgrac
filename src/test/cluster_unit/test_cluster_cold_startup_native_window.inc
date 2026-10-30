@@ -185,6 +185,7 @@ UT_TEST(test_checkpoint_window_original_reselect_drift_is_sticky)
 				memset(window, 0, 160);
 			else
 				window[159] ^= 1;
+			UT_ASSERT(!test_sources_readback(typed));
 			UT_ASSERT(!cluster_cold_typed_sources_current_v1(typed, fence));
 			UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SOURCE_GAP);
 			UT_ASSERT_NULL(typed->xid_receipt.plan);

@@ -893,6 +893,13 @@ cluster_thread_recovery_root_complete_patch_build_v1(
 	return true;
 }
 
+bool
+cluster_wal_retention_pin_sealed_current_v1(ClusterWalRetentionPin *pin)
+{
+	return pin == (ClusterWalRetentionPin *)&pin_obj && pin_sealed
+		   && ir_release_result == CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED;
+}
+
 ClusterWalPinResult
 cluster_wal_retention_pin_seal_for_root_publish(ClusterWalRetentionPin *pin)
 {
