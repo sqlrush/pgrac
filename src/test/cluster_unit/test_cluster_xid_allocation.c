@@ -493,6 +493,9 @@ cluster_relmap_retention_runtime_allocation_publish_v2(uint64 system_identifier,
 bool
 cluster_relmap_owner_terminal_matches_v2(const ClusterRelmapOwnerSampleV2 *owner)
 {
+#ifdef TEST_CLUSTER_XID_RETENTION_NATIVE_CLOG
+	if (retention_terminal_match != NULL) return retention_terminal_match(owner);
+#endif
 	(void)owner;
 	return false;
 } /* No original-owner authority in this fixture. */
@@ -510,7 +513,15 @@ LWLockHeldByMe(LWLock *lock)
 	return lock == XidGenLock && held;
 #endif
 }
+#ifdef TEST_CLUSTER_XID_RETENTION_NATIVE_CLOG
+bool retention_original_native_terminal_sync(const ClusterRelmapOwnerSampleV2 *,
+	ClusterRelmapRecoveryNativeTerminal *);
+#define cluster_relmap_recovery_native_terminal_sync retention_original_native_terminal_sync
+#endif
 #include "../../backend/cluster/cluster_relmap_recovery.c"
+#ifdef TEST_CLUSTER_XID_RETENTION_NATIVE_CLOG
+#undef cluster_relmap_recovery_native_terminal_sync
+#endif
 #undef LWLockHeldByMe
 #ifdef TEST_CLUSTER_EPISODE_ALLOCATOR
 #define LWLockHeldByMe d3_episode_allocator_LWLockHeldByMe

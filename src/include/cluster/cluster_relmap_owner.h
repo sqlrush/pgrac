@@ -28,6 +28,15 @@ typedef struct ClusterRelmapOwnerSampleV2 {
  * metadata. Refusal clears out; no relmap stage or retention permission. */
 extern bool cluster_relmap_owner_capture_v2(ClusterRelmapOwnerSampleV2 *out);
 
+/* Dormant retained producer only. Sample the original native writer first,
+ * derive its system/database/origin, then use the explicit retained xact
+ * allocator before mapping/XidGen locks. Keep that writer across assignment;
+ * a changed writer refuses instead of adopting its successor. False/ERROR
+ * clears out but may leave an issued XID, native CLOG and original pins/debt:
+ * follow the original abort path, never retry or infer rollback. This does
+ * not activate retained allocation or grant COMPLETE/release authority. */
+extern bool cluster_relmap_owner_capture_retained_v2(ClusterRelmapOwnerSampleV2 *out);
+
 /* While the original transaction is in progress: no XID assignment, adoption
  * of a newer writer, IO or wait. The same backend
  * keeps the global X lock; RelationMappingLock may now be held. This rechecks

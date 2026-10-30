@@ -20,6 +20,8 @@ static unsigned caller_assignments, caller_owner_lock_errors;
 static FullTransactionId (*caller_top_reader)(void);
 static FullTransactionId (*caller_top_if_any_reader)(void);
 static bool (*caller_state_reader)(void);
+static FullTransactionId (*caller_retained_reader)(uint64, uint64, uint16);
+static unsigned caller_writer_begins;
 
 static void
 caller_observation(void)
@@ -67,6 +69,7 @@ ClusterControlRootResult
 cluster_wal_writer_begin(TimeLineID timeline, ClusterWalWriterToken *out)
 {
 	caller_observation();
+	caller_writer_begins++;
 	if (!caller_writer_ready || timeline != 1 || out == NULL)
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	*out = caller_writer;
@@ -105,6 +108,15 @@ GetTopFullTransactionIdIfAny(void)
 	return caller_top;
 }
 
+FullTransactionId
+GetTopFullTransactionIdRelmap(uint64 system_identifier, uint64 database_incarnation, uint16 origin)
+{
+	caller_observation();
+	if (caller_retained_reader == NULL) return InvalidFullTransactionId;
+	caller_top = caller_retained_reader(system_identifier, database_incarnation, origin);
+	return caller_top;
+}
+
 bool
 cluster_tt_local_get_published_binding(TransactionId top, ClusterCanonicalTxnBinding *out)
 {
@@ -127,6 +139,8 @@ caller_fixture(uint64 first, unsigned origin)
 	caller_binding_drift = false;
 	caller_top_reader = caller_top_if_any_reader = NULL;
 	caller_state_reader = NULL;
+	caller_retained_reader = NULL;
+	caller_writer_begins = 0;
 	caller_assignments = caller_owner_lock_errors = 0;
 	caller_top = InvalidFullTransactionId;
 	MyBackendType = B_BACKEND;

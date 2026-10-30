@@ -49,6 +49,16 @@ GetTopFullTransactionId(void)
 }
 
 FullTransactionId
+GetTopFullTransactionIdRelmap(uint64 system_identifier, uint64 database_incarnation, uint16 origin)
+{
+	if (system_identifier != ref.claim.identity.system_identifier
+		|| database_incarnation != ref.claim.database_incarnation
+		|| origin != ref.claim.identity.origin_node_id)
+		return InvalidFullTransactionId;
+	return GetTopFullTransactionId(); /* Controlled xact leaf in this writer fixture. */
+}
+
+FullTransactionId
 GetTopFullTransactionIdIfAny(void)
 {
 	if (relmap_retention_held)
