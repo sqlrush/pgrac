@@ -1808,7 +1808,7 @@ _classify_owners(
 _classify_owners(
     "TT_STATUS_WRITER",
     "src/backend/cluster/cluster_side_undo.c",
-    ("undo_prepare_tt_slot",),
+    ("undo_prepare_tt_slot", "undo_prepare_tt_header_v2"),
     "SUCCESSOR_BEFORE_PREDECESSOR",
     "ALL_CTRC_REFERENCE_KINDS",
     "CANONICAL_TT_SLOT",
@@ -1841,7 +1841,7 @@ _classify_owners(
 _classify_owners(
     "TT_RELEASE_FLAG_WRITER",
     "src/backend/cluster/cluster_side_undo.c",
-    ("undo_prepare_tt_slot",),
+    ("undo_prepare_tt_slot", "undo_prepare_tt_header_v2"),
     "TERMINAL_PROJECTION_DISCHARGE",
     "ALL_CTRC_REFERENCE_KINDS",
     "CANONICAL_TT_SLOT",

@@ -3612,10 +3612,12 @@ test_cluster_side_undo: test_cluster_side_undo.c unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_side_undo.h \
 		$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h \
 		test_cluster_undo_desc_product.o \
+		test_cluster_undo_segment_init_backend.o \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_SIDE_UNDO_O) $(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_SIDE_UNDO_O) $(CLUSTER_SIDE_ROUTE_O) \
 		$(CLUSTER_RF_ROUTE_O) test_cluster_undo_desc_product.o \
+		test_cluster_undo_segment_init_backend.o \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 

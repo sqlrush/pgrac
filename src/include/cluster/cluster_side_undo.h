@@ -143,7 +143,10 @@ typedef enum ClusterUndoHeaderPrepareResultV1 {
  * Native generation decisions are preserved, including REUSE's torn-header
  * repair. TT records use the existing exact generation/slot transition tables
  * and preserve all unrelated header bytes. Only APPLY changes out; base and
- * out may alias. ALREADY is a byte-identical TT result, not a stale generation. */
+ * out may alias. ALREADY is a byte-identical TT result, not a stale generation.
+ * Explicit V2 standalone TT records dispatch only to a validated TT40 base;
+ * BIND establishes original FullXid and every later delta must preserve it.
+ * The V1 execution/target APIs below still reject these V2 identities. */
 extern ClusterUndoHeaderPrepareResultV1
 cluster_undo_prepare_header_v1(const ClusterUndoDecoded *decoded, const uint8 *payload,
 							   Size payload_length, const char *base, char *out);

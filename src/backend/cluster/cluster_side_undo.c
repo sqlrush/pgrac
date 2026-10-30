@@ -696,6 +696,175 @@ undo_prepare_tt_slot(const ClusterUndoDecoded *decoded, UndoSegmentHeaderData *h
 													  : CLUSTER_UNDO_HEADER_APPLY;
 }
 
+/* V2 has an explicit target layout. It must never pass through the TT32
+ * execution gates or borrow identity from a raw-only predecessor. */
+static bool
+undo_tt_v2_preflight(const ClusterUndoDecoded *decoded)
+{
+	ClusterSideRouteRow route;
+	xl_undo_tt_identity_v2 identity = { 0 };
+
+	if (decoded->kind != cluster_undo_kind_for_opcode(decoded->opcode)
+		|| decoded->format_version != CLUSTER_UNDO_TT_IDENTITY_V2_VERSION
+		|| decoded->instance == 0 || decoded->instance > UNDO_OWNER_INSTANCE_MAX
+		|| decoded->segment_id == 0
+		|| ((decoded->segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE) + 1 != decoded->instance
+		|| decoded->expected_generation == UINT32_MAX
+		|| decoded->slot_offset >= TT_SLOTS_PER_SEGMENT || decoded->wrap == TT_WRAP_INVALID
+		|| decoded->has_payload || decoded->has_fpi || decoded->payload_length != 0
+		|| !cluster_side_route_lookup(RM_CLUSTER_UNDO_ID, decoded->opcode, &route)
+		|| route.kind != CLUSTER_SIDE_ROUTE_TT_UNDO)
+		return false;
+	identity.xid = decoded->xid;
+	identity.format_version = decoded->format_version;
+	identity.original_full_xid = decoded->original_full_xid;
+	if (!cluster_undo_tt_bind_v2_decode(&identity, sizeof(identity), &identity)
+		|| (decoded->kind != CLUSTER_UNDO_KIND_TT_CTRC_RELEASE && decoded->flags != 0))
+		return false;
+	switch (decoded->kind) {
+	case CLUSTER_UNDO_KIND_TT_BIND:
+	case CLUSTER_UNDO_KIND_TT_ABORT:
+		return true;
+	case CLUSTER_UNDO_KIND_TT_COMMIT:
+		return SCN_VALID(decoded->commit_scn) && decoded->commit_scn != UINT64_MAX;
+	case CLUSTER_UNDO_KIND_TT_SET_HEAD: {
+		uint32 segment, block;
+		uint16 slot, row;
+
+		return uba_decode_record(decoded->first_undo_block, &segment, &block, &slot, &row)
+			   && segment == decoded->segment_id && slot == decoded->slot_offset;
+	}
+	case CLUSTER_UNDO_KIND_TT_CTRC_RELEASE: {
+		ClusterUndoDecoded projection = *decoded;
+		xl_undo_tt_slot_ctrc_release_v1 record;
+
+		if (decoded->expected_generation == 0 || decoded->cluster_epoch == 0
+			|| decoded->formation_epoch == 0)
+			return false;
+		projection.format_version = CLUSTER_UNDO_TT_CTRC_RELEASE_VERSION;
+		return cluster_undo_ctrc_release_from_decoded(&projection, &record);
+	}
+	default:
+		return false;
+	}
+}
+
+/* Private byte preparation only. The existing owner still proves source,
+ * current target, isolation, durability and post-read. FullXid is preserved
+ * across every non-BIND operation; its numerical order is never a reuse test. */
+static ClusterUndoHeaderPrepareResultV1
+undo_prepare_tt_header_v2(const ClusterUndoDecoded *decoded, const uint8 *payload,
+						 Size payload_length, const char *base, char *out)
+{
+	PGAlignedBlock prepared;
+	UndoSegmentHeaderDataV2 *header = (UndoSegmentHeaderDataV2 *)prepared.data;
+	TTSlotV2 *slot, before;
+	TTSlot legacy;
+	static const UBA invalid_head = InvalidUba_init;
+
+	if (base == NULL || out == NULL || payload != NULL || payload_length != 0
+		|| !undo_tt_v2_preflight(decoded))
+		return CLUSTER_UNDO_HEADER_BLOCKED;
+	memcpy(prepared.data, base, BLCKSZ);
+	/* Verify the fixed prefix before reading the V2 generation or slots. */
+	if (!UndoSegmentHeaderV2_identity_matches(prepared.data, BLCKSZ, decoded->segment_id,
+											 decoded->instance))
+		return CLUSTER_UNDO_HEADER_BLOCKED;
+	if (header->wrap_count > decoded->expected_generation)
+		return CLUSTER_UNDO_HEADER_SKIP_STALE;
+	if (header->wrap_count < decoded->expected_generation)
+		return CLUSTER_UNDO_HEADER_BLOCKED;
+	slot = &header->tt_slots[decoded->slot_offset];
+	before = *slot;
+	memcpy(&legacy, slot, sizeof(legacy));
+	if (slot->status > TT_SLOT_RECYCLABLE || slot->wrap == TT_WRAP_INVALID
+		|| (slot->flags & ~TT_SLOT_FLAGS_KNOWN) != 0 || slot->commit_scn == UINT64_MAX)
+		return CLUSTER_UNDO_HEADER_BLOCKED;
+	if (slot->status == TT_SLOT_UNUSED) {
+		if (slot->original_full_xid != 0)
+			return CLUSTER_UNDO_HEADER_BLOCKED;
+	} else if (!TransactionIdIsNormal(slot->xid) || slot->original_full_xid == UINT64_MAX
+			   || (TransactionId)slot->original_full_xid != slot->xid
+			   || (slot->wrap == decoded->wrap
+				   && slot->original_full_xid != decoded->original_full_xid))
+		return CLUSTER_UNDO_HEADER_BLOCKED;
+
+	switch (decoded->kind) {
+	case CLUSTER_UNDO_KIND_TT_BIND: {
+		ClusterTTActiveTransitionDecision decision = cluster_tt_active_transition_decide(
+			&legacy, header->wrap_count, decoded->expected_generation, decoded->xid,
+			decoded->wrap, true);
+
+		if (decision == CLUSTER_TT_ACTIVE_STALE)
+			return CLUSTER_UNDO_HEADER_SKIP_STALE;
+		if (decision == CLUSTER_TT_ACTIVE_IDEMPOTENT)
+			return CLUSTER_UNDO_HEADER_ALREADY;
+		if (decision != CLUSTER_TT_ACTIVE_APPLY)
+			return CLUSTER_UNDO_HEADER_BLOCKED;
+		memset(slot, 0, sizeof(*slot));
+		slot->xid = decoded->xid;
+		slot->wrap = decoded->wrap;
+		slot->status = TT_SLOT_ACTIVE;
+		slot->first_undo_block = invalid_head;
+		slot->original_full_xid = decoded->original_full_xid;
+		break;
+	}
+	case CLUSTER_UNDO_KIND_TT_COMMIT:
+	case CLUSTER_UNDO_KIND_TT_ABORT: {
+		uint8 status = decoded->kind == CLUSTER_UNDO_KIND_TT_COMMIT ? TT_SLOT_COMMITTED
+																		 : TT_SLOT_ABORTED;
+		SCN scn = status == TT_SLOT_COMMITTED ? decoded->commit_scn : InvalidScn;
+		ClusterTTTerminalTransitionDecision decision = cluster_tt_terminal_transition_decide(
+			&legacy, header->wrap_count, decoded->expected_generation, decoded->xid,
+			decoded->wrap, status, scn);
+
+		if (decision == CLUSTER_TT_TERMINAL_STALE)
+			return CLUSTER_UNDO_HEADER_SKIP_STALE;
+		if (decision == CLUSTER_TT_TERMINAL_IDEMPOTENT)
+			return CLUSTER_UNDO_HEADER_ALREADY;
+		if (decision != CLUSTER_TT_TERMINAL_APPLY)
+			return CLUSTER_UNDO_HEADER_BLOCKED;
+		slot->status = status;
+		slot->flags = TT_FLAGS_RESERVED;
+		slot->commit_scn = scn;
+		slot->first_undo_block = invalid_head;
+		break;
+	}
+	case CLUSTER_UNDO_KIND_TT_SET_HEAD:
+		if (slot->wrap > decoded->wrap)
+			return CLUSTER_UNDO_HEADER_SKIP_STALE;
+		if (slot->wrap != decoded->wrap || slot->xid != decoded->xid
+			|| slot->status != TT_SLOT_ABORTED || SCN_VALID(slot->commit_scn))
+			return CLUSTER_UNDO_HEADER_BLOCKED;
+		slot->first_undo_block = decoded->first_undo_block;
+		break;
+	case CLUSTER_UNDO_KIND_TT_CTRC_RELEASE: {
+		ClusterUndoDecoded projection = *decoded;
+		xl_undo_tt_slot_ctrc_release_v1 record;
+		ClusterUndoTtCtrcReleaseRedoDecision decision;
+
+		projection.format_version = CLUSTER_UNDO_TT_CTRC_RELEASE_VERSION;
+		if (!cluster_undo_ctrc_release_from_decoded(&projection, &record))
+			return CLUSTER_UNDO_HEADER_BLOCKED;
+		decision = cluster_undo_tt_ctrc_release_redo_decide(header->wrap_count, &legacy, &record);
+		if (decision == CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_SKIP_STALE)
+			return CLUSTER_UNDO_HEADER_SKIP_STALE;
+		if (decision == CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_IDEMPOTENT)
+			return CLUSTER_UNDO_HEADER_ALREADY;
+		if (decision != CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_APPLY)
+			return CLUSTER_UNDO_HEADER_BLOCKED;
+		slot->flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+		break;
+	}
+	default:
+		return CLUSTER_UNDO_HEADER_BLOCKED;
+	}
+	if (memcmp(slot, &before, sizeof(before)) == 0)
+		return CLUSTER_UNDO_HEADER_ALREADY;
+	memcpy(out, prepared.data, BLCKSZ);
+	return CLUSTER_UNDO_HEADER_APPLY;
+}
+
 ClusterUndoHeaderPrepareResultV1
 cluster_undo_prepare_header_v1(const ClusterUndoDecoded *decoded, const uint8 *payload,
 							   Size payload_length, const char *base, char *out)
@@ -705,6 +874,8 @@ cluster_undo_prepare_header_v1(const ClusterUndoDecoded *decoded, const uint8 *p
 	const UndoSegmentHeaderData *before = (const UndoSegmentHeaderData *)prior.data;
 	bool base_valid = false;
 
+	if (decoded != NULL && decoded->format_version == CLUSTER_UNDO_TT_IDENTITY_V2_VERSION)
+		return undo_prepare_tt_header_v2(decoded, payload, payload_length, base, out);
 	if (decoded == NULL || out == NULL || !cluster_undo_preflight(decoded)
 		|| decoded->kind != cluster_undo_kind_for_opcode(decoded->opcode))
 		return CLUSTER_UNDO_HEADER_BLOCKED;

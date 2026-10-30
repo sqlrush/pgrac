@@ -24,6 +24,7 @@
 #include "cluster/cluster_side_undo.h"
 #include "cluster/cluster_tt_durable.h"
 #include "cluster/cluster_tt_slot.h"
+#include "cluster/cluster_undo_segment_init.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 
 #include "unit_test.h"
@@ -1201,10 +1202,406 @@ UT_TEST(test_overlapping_undo_record_and_slot_ranges_refuse)
 	UT_ASSERT(!cluster_undo_decode(record, &out));
 }
 
+/* A complete original fresh producer supplies the V2 header. Only the target
+ * predecessor is seeded; expectations below change one complete 40-byte slot. */
+static void
+make_tt40_base(PGAlignedBlock *base, uint64 full, uint8 status)
+{
+	UndoSegmentHeaderDataV2 *header = (UndoSegmentHeaderDataV2 *)base->data;
+	TTSlotV2 *slot;
+
+	if (!cluster_undo_segment_make_header_v2_bytes(7, 1, base->data))
+		abort();
+	header->wrap_count = 9;
+	header->_reserved[4000] = 0x5a;
+	if (status == TT_SLOT_UNUSED)
+		return;
+	slot = &header->tt_slots[3];
+	slot->xid = 1234;
+	slot->status = status;
+	slot->original_full_xid = full;
+	if (status == TT_SLOT_COMMITTED)
+		slot->commit_scn = 901;
+}
+
+UT_TEST(test_tt40_bind_prepares_exact_full_identity_without_touching_other_bytes)
+{
+	const uint64 fulls[] = { 1234, (UINT64_C(7) << 32) | 1234 };
+	PGAlignedBlock base, before, expected, out;
+	FakeRecord fr;
+	uint8 bytes[33];
+	ClusterUndoDecoded decoded;
+
+	for (Size i = 0; i < lengthof(fulls); i++) {
+		TTSlotV2 *slot;
+
+		make_tt40_base(&base, 0, TT_SLOT_UNUSED);
+		before = base;
+		expected = base;
+		slot = &((UndoSegmentHeaderDataV2 *)expected.data)->tt_slots[3];
+		slot->xid = 1234;
+		slot->status = TT_SLOT_ACTIVE;
+		slot->original_full_xid = fulls[i];
+		make_bind_v2_payload(bytes + 1, fulls[i]);
+		UT_ASSERT(cluster_undo_decode(make_record(&fr, RM_CLUSTER_UNDO_ID,
+			XLOG_UNDO_TT_SLOT_BIND, bytes + 1, 32), &decoded));
+		memset(out.data, 0x6a, BLCKSZ);
+		UT_ASSERT_EQ(cluster_undo_prepare_header_v1(&decoded, NULL, 0, base.data, out.data),
+			CLUSTER_UNDO_HEADER_APPLY);
+		UT_ASSERT_EQ(memcmp(out.data, expected.data, BLCKSZ), 0);
+		UT_ASSERT_EQ(memcmp(base.data, before.data, BLCKSZ), 0);
+	}
+}
+
+UT_TEST(test_tt40_terminal_successors_preserve_original_full_identity)
+{
+	const uint64 fulls[] = { 1234, (UINT64_C(7) << 32) | 1234 };
+	const uint8 opcodes[] = { XLOG_UNDO_TT_SLOT_COMMIT, XLOG_UNDO_TT_SLOT_ABORT };
+	PGAlignedBlock base, before, expected;
+	FakeRecord fr;
+	uint8 bytes[105];
+	ClusterUndoDecoded decoded;
+
+	for (Size i = 0; i < lengthof(fulls); i++)
+		for (Size c = 0; c < lengthof(opcodes); c++) {
+			TTSlotV2 *slot;
+			Size len = make_terminal_v2_payload(opcodes[c], bytes, fulls[i]);
+
+			make_tt40_base(&base, fulls[i], TT_SLOT_ACTIVE);
+			before = base;
+			expected = base;
+			slot = &((UndoSegmentHeaderDataV2 *)expected.data)->tt_slots[3];
+			slot->status = c == 0 ? TT_SLOT_COMMITTED : TT_SLOT_ABORTED;
+			slot->commit_scn = c == 0 ? 901 : InvalidScn;
+			UT_ASSERT(cluster_undo_decode(make_record(&fr, RM_CLUSTER_UNDO_ID,
+				opcodes[c], bytes, len), &decoded));
+			UT_ASSERT_EQ(cluster_undo_prepare_header_v1(&decoded, NULL, 0, base.data, base.data),
+				CLUSTER_UNDO_HEADER_APPLY);
+			UT_ASSERT_EQ(memcmp(base.data, expected.data, BLCKSZ), 0);
+			UT_ASSERT_EQ(((UndoSegmentHeaderDataV2 *)before.data)->tt_slots[3].status,
+				TT_SLOT_ACTIVE);
+		}
+}
+
+UT_TEST(test_tt40_head_and_release_preserve_complete_predecessor_identity)
+{
+	const uint64 full = (UINT64_C(7) << 32) | 1234;
+	const uint8 opcodes[] = { XLOG_UNDO_TT_SLOT_SET_HEAD, XLOG_UNDO_TT_SLOT_CTRC_RELEASE };
+	PGAlignedBlock base, before, expected, out;
+	FakeRecord fr;
+	uint8 bytes[105];
+	ClusterUndoDecoded decoded;
+
+	for (Size c = 0; c < lengthof(opcodes); c++) {
+		TTSlotV2 *slot;
+		Size len = make_terminal_v2_payload(opcodes[c], bytes, full);
+
+		make_tt40_base(&base, full, c == 0 ? TT_SLOT_ABORTED : TT_SLOT_COMMITTED);
+		before = base;
+		expected = base;
+		slot = &((UndoSegmentHeaderDataV2 *)expected.data)->tt_slots[3];
+		UT_ASSERT(cluster_undo_decode(make_record(&fr, RM_CLUSTER_UNDO_ID,
+			opcodes[c], bytes, len), &decoded));
+		if (c == 0)
+			slot->first_undo_block = decoded.first_undo_block;
+		else
+			slot->flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+		UT_ASSERT_EQ(cluster_undo_prepare_header_v1(&decoded, NULL, 0, base.data, out.data),
+			CLUSTER_UNDO_HEADER_APPLY);
+		UT_ASSERT_EQ(memcmp(out.data, expected.data, BLCKSZ), 0);
+		UT_ASSERT_EQ(memcmp(base.data, before.data, BLCKSZ), 0);
+	}
+}
+
+static ClusterUndoDecoded
+make_tt40_decoded(uint8 opcode, uint64 full)
+{
+	ClusterUndoDecoded decoded;
+	FakeRecord fr;
+	uint8 bytes[105];
+	Size len;
+
+	if (opcode == XLOG_UNDO_TT_SLOT_BIND) {
+		make_bind_v2_payload(bytes, full);
+		len = 32;
+	} else
+		len = make_terminal_v2_payload(opcode, bytes, full);
+	if (!cluster_undo_decode(make_record(&fr, RM_CLUSTER_UNDO_ID, opcode, bytes, len), &decoded))
+		abort();
+	return decoded;
+}
+
+static uint8
+tt40_predecessor_status(uint8 opcode)
+{
+	return opcode == XLOG_UNDO_TT_SLOT_SET_HEAD ? TT_SLOT_ABORTED
+		 : opcode == XLOG_UNDO_TT_SLOT_CTRC_RELEASE ? TT_SLOT_COMMITTED : TT_SLOT_ACTIVE;
+}
+
+static void
+check_tt40_no_output(const ClusterUndoDecoded *decoded, PGAlignedBlock *base,
+					ClusterUndoHeaderPrepareResultV1 want)
+{
+	PGAlignedBlock before = *base, out, sentinel;
+
+	memset(out.data, 0x6a, BLCKSZ);
+	sentinel = out;
+	apply_read_calls = 0;
+	UT_ASSERT_EQ(cluster_undo_prepare_header_v1(decoded, NULL, 0, base->data, out.data), want);
+	UT_ASSERT_EQ(memcmp(out.data, sentinel.data, BLCKSZ), 0);
+	UT_ASSERT_EQ(memcmp(base->data, before.data, BLCKSZ), 0);
+	UT_ASSERT_EQ(cluster_undo_prepare_header_v1(decoded, NULL, 0, base->data, base->data), want);
+	UT_ASSERT_EQ(memcmp(base->data, before.data, BLCKSZ), 0);
+	UT_ASSERT_EQ(apply_read_calls, 0);
+}
+
+UT_TEST(test_tt40_all_slot_offsets_and_unaligned_private_copies)
+{
+	const uint64 full = (UINT64_C(7) << 32) | 1234;
+	PGAlignedBlock base, expected;
+	char unaligned_base[BLCKSZ + 1], unaligned_out[BLCKSZ + 1];
+
+	for (uint16 offset = 0; offset < 48; offset++) {
+		ClusterUndoDecoded decoded = make_tt40_decoded(XLOG_UNDO_TT_SLOT_BIND, full);
+		TTSlotV2 *slot;
+
+		decoded.slot_offset = offset;
+		make_tt40_base(&base, 0, TT_SLOT_UNUSED);
+		expected = base;
+		slot = &((UndoSegmentHeaderDataV2 *)expected.data)->tt_slots[offset];
+		slot->xid = 1234;
+		slot->status = TT_SLOT_ACTIVE;
+		slot->original_full_xid = full;
+		memset(unaligned_base, 0x5a, sizeof(unaligned_base));
+		memset(unaligned_out, 0x6a, sizeof(unaligned_out));
+		memcpy(unaligned_base + 1, base.data, BLCKSZ);
+		UT_ASSERT_EQ(cluster_undo_prepare_header_v1(&decoded, NULL, 0,
+			unaligned_base + 1, unaligned_out + 1), CLUSTER_UNDO_HEADER_APPLY);
+		UT_ASSERT_EQ(memcmp(unaligned_out + 1, expected.data, BLCKSZ), 0);
+		UT_ASSERT_EQ(memcmp(unaligned_base + 1, base.data, BLCKSZ), 0);
+		UT_ASSERT_EQ((uint8)unaligned_base[0], 0x5a);
+		UT_ASSERT_EQ((uint8)unaligned_out[0], 0x6a);
+	}
+}
+
+UT_TEST(test_tt40_raw_match_never_borrows_or_repairs_another_full_identity)
+{
+	const uint64 full = (UINT64_C(7) << 32) | 1234;
+	const uint64 bad_fulls[] = { 0, 1, 2, UINT64_MAX, (UINT64_C(7) << 32) | 1235,
+		1234, (UINT64_C(8) << 32) | 1234 };
+	const uint8 opcodes[] = { XLOG_UNDO_TT_SLOT_BIND, XLOG_UNDO_TT_SLOT_COMMIT,
+		XLOG_UNDO_TT_SLOT_ABORT, XLOG_UNDO_TT_SLOT_SET_HEAD, XLOG_UNDO_TT_SLOT_CTRC_RELEASE };
+	PGAlignedBlock base;
+
+	for (Size c = 0; c < lengthof(opcodes); c++) {
+		ClusterUndoDecoded decoded = make_tt40_decoded(opcodes[c], full);
+
+		for (Size i = 0; i < lengthof(bad_fulls); i++) {
+			make_tt40_base(&base, bad_fulls[i], tt40_predecessor_status(opcodes[c]));
+			check_tt40_no_output(&decoded, &base, CLUSTER_UNDO_HEADER_BLOCKED);
+		}
+		if (opcodes[c] != XLOG_UNDO_TT_SLOT_BIND) {
+			make_tt40_base(&base, 0, TT_SLOT_UNUSED);
+			check_tt40_no_output(&decoded, &base, CLUSTER_UNDO_HEADER_BLOCKED);
+		}
+	}
+}
+
+UT_TEST(test_tt40_checks_explicit_page_layout_before_shifted_target_fields)
+{
+	const uint64 full = (UINT64_C(7) << 32) | 1234;
+	const uint8 opcodes[] = { XLOG_UNDO_TT_SLOT_BIND, XLOG_UNDO_TT_SLOT_COMMIT,
+		XLOG_UNDO_TT_SLOT_ABORT, XLOG_UNDO_TT_SLOT_SET_HEAD, XLOG_UNDO_TT_SLOT_CTRC_RELEASE };
+	PGAlignedBlock base;
+
+	for (Size c = 0; c < lengthof(opcodes); c++) {
+		ClusterUndoDecoded decoded = make_tt40_decoded(opcodes[c], full);
+
+		for (unsigned fault = 0; fault < 14; fault++) {
+			UndoSegmentHeaderDataV2 *header = (UndoSegmentHeaderDataV2 *)base.data;
+
+			make_tt40_base(&base, full, tt40_predecessor_status(opcodes[c]));
+			switch (fault) {
+			case 0: header->tt_layout_version = 0; break;
+			case 1: header->tt_layout_version = 1; break;
+			case 2: header->tt_layout_version = 3; break;
+			case 3: header->tt_slot_bytes = 32; break;
+			case 4: header->tt_layout_reserved = 1; break;
+			case 5: header->tt_slots_count = 47; break;
+			case 6: header->tt_next_free_slot = 49; break;
+			case 7: header->tt_active_count = 49; break;
+			case 8: header->segment_id = 8; break;
+			case 9: header->owner_instance = 2; break;
+			case 10: header->segment_size_bytes = 0; break;
+			case 11: header->pd_flags = 0; break;
+			case 12: header->segment_state = UINT8_MAX; break;
+			case 13:
+				cluster_undo_segment_make_header_bytes(7, 1, base.data);
+				/* Plausible bytes at the shifted generation cannot qualify V1. */
+				header->wrap_count = 9;
+				break;
+			}
+			check_tt40_no_output(&decoded, &base, CLUSTER_UNDO_HEADER_BLOCKED);
+		}
+	}
+}
+
+UT_TEST(test_tt40_physical_stale_and_exact_idempotent_results_do_not_publish_output)
+{
+	const uint64 full = (UINT64_C(7) << 32) | 1234;
+	const uint8 opcodes[] = { XLOG_UNDO_TT_SLOT_BIND, XLOG_UNDO_TT_SLOT_COMMIT,
+		XLOG_UNDO_TT_SLOT_ABORT, XLOG_UNDO_TT_SLOT_SET_HEAD, XLOG_UNDO_TT_SLOT_CTRC_RELEASE };
+	PGAlignedBlock base;
+
+	for (Size c = 0; c < lengthof(opcodes); c++) {
+		ClusterUndoDecoded decoded = make_tt40_decoded(opcodes[c], full);
+		UndoSegmentHeaderDataV2 *header = (UndoSegmentHeaderDataV2 *)base.data;
+		TTSlotV2 *slot = &header->tt_slots[3];
+
+		make_tt40_base(&base, full, tt40_predecessor_status(opcodes[c]));
+		header->wrap_count = 10;
+		check_tt40_no_output(&decoded, &base, CLUSTER_UNDO_HEADER_SKIP_STALE);
+		header->wrap_count = 8;
+		check_tt40_no_output(&decoded, &base, CLUSTER_UNDO_HEADER_BLOCKED);
+		header->wrap_count = 9;
+		slot->wrap = 1;
+		/* Only physical wrap establishes staleness, not FullXid ordering. */
+		slot->original_full_xid = 1234;
+		check_tt40_no_output(&decoded, &base, CLUSTER_UNDO_HEADER_SKIP_STALE);
+		slot->wrap = TT_WRAP_INVALID;
+		check_tt40_no_output(&decoded, &base, CLUSTER_UNDO_HEADER_BLOCKED);
+
+		make_tt40_base(&base, full, opcodes[c] == XLOG_UNDO_TT_SLOT_COMMIT ? TT_SLOT_COMMITTED
+																 : tt40_predecessor_status(opcodes[c]));
+		if (opcodes[c] == XLOG_UNDO_TT_SLOT_ABORT)
+			slot->status = TT_SLOT_ABORTED;
+		if (opcodes[c] == XLOG_UNDO_TT_SLOT_SET_HEAD)
+			slot->first_undo_block = decoded.first_undo_block;
+		if (opcodes[c] == XLOG_UNDO_TT_SLOT_CTRC_RELEASE)
+			slot->flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+		check_tt40_no_output(&decoded, &base, CLUSTER_UNDO_HEADER_ALREADY);
+		if (opcodes[c] == XLOG_UNDO_TT_SLOT_COMMIT) {
+			slot->commit_scn = 902;
+			check_tt40_no_output(&decoded, &base, CLUSTER_UNDO_HEADER_BLOCKED);
+		}
+	}
+}
+
+UT_TEST(test_tt40_bind_reuse_uses_original_wrap_transition_and_replaces_only_at_bind)
+{
+	const uint64 old_full = (UINT64_C(7) << 32) | 1234;
+	const uint64 new_full = (UINT64_C(8) << 32) | 1234;
+	const uint8 statuses[] = { TT_SLOT_COMMITTED, TT_SLOT_ABORTED, TT_SLOT_RECYCLABLE };
+	PGAlignedBlock base, expected, out;
+	ClusterUndoDecoded decoded = make_tt40_decoded(XLOG_UNDO_TT_SLOT_BIND, new_full);
+
+	for (Size c = 0; c < lengthof(statuses); c++) {
+		TTSlotV2 *slot = &((UndoSegmentHeaderDataV2 *)base.data)->tt_slots[3];
+		TTSlotV2 *want = &((UndoSegmentHeaderDataV2 *)expected.data)->tt_slots[3];
+
+		make_tt40_base(&base, old_full, statuses[c]);
+		slot->wrap = 4;
+		expected = base;
+		memset(want, 0, sizeof(*want));
+		want->xid = 1234;
+		want->wrap = 5;
+		want->status = TT_SLOT_ACTIVE;
+		want->original_full_xid = new_full;
+		decoded.wrap = 5;
+		UT_ASSERT_EQ(cluster_undo_prepare_header_v1(&decoded, NULL, 0, base.data, out.data),
+			CLUSTER_UNDO_HEADER_APPLY);
+		UT_ASSERT_EQ(memcmp(out.data, expected.data, BLCKSZ), 0);
+		UT_ASSERT_EQ(slot->original_full_xid, old_full);
+		decoded.wrap = 6;
+		check_tt40_no_output(&decoded, &base, CLUSTER_UNDO_HEADER_BLOCKED);
+		decoded.wrap = 4;
+		check_tt40_no_output(&decoded, &base, CLUSTER_UNDO_HEADER_BLOCKED);
+		decoded.wrap = 5;
+		slot->first_undo_block.raw[0] = 1;
+		check_tt40_no_output(&decoded, &base, CLUSTER_UNDO_HEADER_BLOCKED);
+	}
+}
+
+UT_TEST(test_tt40_refuses_malformed_decoded_fields_and_preserves_caller_buffers)
+{
+	const uint64 full = (UINT64_C(7) << 32) | 1234;
+	const uint8 opcodes[] = { XLOG_UNDO_TT_SLOT_BIND, XLOG_UNDO_TT_SLOT_COMMIT,
+		XLOG_UNDO_TT_SLOT_ABORT, XLOG_UNDO_TT_SLOT_SET_HEAD, XLOG_UNDO_TT_SLOT_CTRC_RELEASE };
+	PGAlignedBlock base, out, saved;
+
+	for (Size c = 0; c < lengthof(opcodes); c++) {
+		ClusterUndoDecoded good = make_tt40_decoded(opcodes[c], full);
+
+		make_tt40_base(&base, full, tt40_predecessor_status(opcodes[c]));
+		for (unsigned fault = 0; fault < 17; fault++) {
+			ClusterUndoDecoded bad = good;
+
+			switch (fault) {
+			case 0: bad.format_version = 1; break;
+			case 1: bad.format_version = 3; break;
+			case 2: bad.flags = UINT8_MAX; break;
+			case 3: bad.expected_generation = UINT32_MAX; break;
+			case 4: bad.wrap = TT_WRAP_INVALID; break;
+			case 5: bad.slot_offset = 48; break;
+			case 6: bad.instance = 0; break;
+			case 7: bad.instance = 129; break;
+			case 8: bad.segment_id = 0; break;
+			case 9: bad.instance = 2; break;
+			case 10: bad.xid = 2; break;
+			case 11: bad.original_full_xid = 0; break;
+			case 12: bad.original_full_xid = UINT64_MAX; break;
+			case 13: bad.has_payload = true; break;
+			case 14: bad.has_fpi = true; break;
+			case 15: bad.payload_length = 1; break;
+			case 16: bad.opcode = XLOG_HW_RESERVE; break;
+			}
+			check_tt40_no_output(&bad, &base, CLUSTER_UNDO_HEADER_BLOCKED);
+		}
+		if (opcodes[c] == XLOG_UNDO_TT_SLOT_COMMIT) {
+			good.commit_scn = UINT64_MAX;
+			check_tt40_no_output(&good, &base, CLUSTER_UNDO_HEADER_BLOCKED);
+			good.commit_scn = InvalidScn;
+			check_tt40_no_output(&good, &base, CLUSTER_UNDO_HEADER_BLOCKED);
+		} else if (opcodes[c] == XLOG_UNDO_TT_SLOT_SET_HEAD) {
+			good.first_undo_block.raw[0] = 8 | (UINT64_C(9) << 32);
+			check_tt40_no_output(&good, &base, CLUSTER_UNDO_HEADER_BLOCKED);
+			good.first_undo_block.raw[0] = 7 | (UINT64_C(9) << 32);
+			good.first_undo_block.raw[1] = 4;
+			check_tt40_no_output(&good, &base, CLUSTER_UNDO_HEADER_BLOCKED);
+		} else if (opcodes[c] == XLOG_UNDO_TT_SLOT_CTRC_RELEASE) {
+			good.root_id = 0;
+			check_tt40_no_output(&good, &base, CLUSTER_UNDO_HEADER_BLOCKED);
+			good = make_tt40_decoded(opcodes[c], full);
+			good.cluster_epoch = 0;
+			check_tt40_no_output(&good, &base, CLUSTER_UNDO_HEADER_BLOCKED);
+			good = make_tt40_decoded(opcodes[c], full);
+			good.formation_epoch = 0;
+			check_tt40_no_output(&good, &base, CLUSTER_UNDO_HEADER_BLOCKED);
+			good = make_tt40_decoded(opcodes[c], full);
+			good.expected_generation = 0;
+			((UndoSegmentHeaderDataV2 *)base.data)->wrap_count = 0;
+			check_tt40_no_output(&good, &base, CLUSTER_UNDO_HEADER_BLOCKED);
+			((UndoSegmentHeaderDataV2 *)base.data)->wrap_count = 9;
+		}
+		good = make_tt40_decoded(opcodes[c], full);
+		memset(out.data, 0x6a, BLCKSZ);
+		saved = out;
+		UT_ASSERT_EQ(cluster_undo_prepare_header_v1(&good, NULL, 0, NULL, out.data),
+			CLUSTER_UNDO_HEADER_BLOCKED);
+		UT_ASSERT_EQ(cluster_undo_prepare_header_v1(&good, NULL, 0, base.data, NULL),
+			CLUSTER_UNDO_HEADER_BLOCKED);
+		UT_ASSERT_EQ(cluster_undo_prepare_header_v1(&good, (const uint8 *)base.data, 0,
+			base.data, out.data), CLUSTER_UNDO_HEADER_BLOCKED);
+		UT_ASSERT_EQ(cluster_undo_prepare_header_v1(&good, NULL, 1, base.data, out.data),
+			CLUSTER_UNDO_HEADER_BLOCKED);
+		UT_ASSERT_EQ(memcmp(out.data, saved.data, BLCKSZ), 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(24);
+	UT_PLAN(33);
 
 	UT_RUN(test_decode_tt_commit_fields);
 	UT_RUN(test_decode_tt_bind_exact_shape_and_reserved_bytes);
@@ -1230,6 +1627,15 @@ main(void)
 	UT_RUN(test_typed_exact_abort_requires_same_active_predecessor);
 	UT_RUN(test_typed_ctrc_release_requires_exact_terminal_generation_and_post_read);
 	UT_RUN(test_overlapping_undo_record_and_slot_ranges_refuse);
+	UT_RUN(test_tt40_bind_prepares_exact_full_identity_without_touching_other_bytes);
+	UT_RUN(test_tt40_terminal_successors_preserve_original_full_identity);
+	UT_RUN(test_tt40_head_and_release_preserve_complete_predecessor_identity);
+	UT_RUN(test_tt40_all_slot_offsets_and_unaligned_private_copies);
+	UT_RUN(test_tt40_raw_match_never_borrows_or_repairs_another_full_identity);
+	UT_RUN(test_tt40_checks_explicit_page_layout_before_shifted_target_fields);
+	UT_RUN(test_tt40_physical_stale_and_exact_idempotent_results_do_not_publish_output);
+	UT_RUN(test_tt40_bind_reuse_uses_original_wrap_transition_and_replaces_only_at_bind);
+	UT_RUN(test_tt40_refuses_malformed_decoded_fields_and_preserves_caller_buffers);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
