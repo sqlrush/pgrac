@@ -6208,6 +6208,77 @@ get_actual_variable_range(PlannerInfo *root, VariableStatData *vardata,
 	return have_data;
 }
 
+/* Copy the current index value before advancing or releasing the scan. */
+static void
+get_variable_endpoint_from_index(IndexScanDesc index_scan, Relation indexRel,
+								 int16 typLen, bool typByVal,
+								 MemoryContext outercontext, Datum *endpointDatum)
+{
+	Datum values[INDEX_MAX_KEYS];
+	bool isnull[INDEX_MAX_KEYS];
+	MemoryContext oldcontext;
+
+	/*
+	 * We expect that btree will return data in IndexTuple not HeapTuple
+	 * format.  It's not lossy either.
+	 */
+	if (!index_scan->xs_itup)
+		elog(ERROR, "no data returned for index-only scan");
+	if (index_scan->xs_recheck)
+		elog(ERROR, "unexpected recheck indication from btree");
+
+	/* OK to deconstruct the index tuple */
+	index_deform_tuple(index_scan->xs_itup,
+					   index_scan->xs_itupdesc,
+					   values, isnull);
+
+	/* Shouldn't have got a null, but be careful */
+	if (isnull[0])
+		elog(ERROR, "found unexpected null value in index \"%s\"",
+			 RelationGetRelationName(indexRel));
+
+	/* Copy the index column value out to caller's context */
+	oldcontext = MemoryContextSwitchTo(outercontext);
+	*endpointDatum = datumCopy(values[0], typByVal, typLen);
+	MemoryContextSwitchTo(oldcontext);
+}
+
+/* The index scan keeps its NonVacuumable snapshot. Only the qualified VM
+ * observation uses the query's retained active snapshot. */
+static bool
+get_shared_variable_endpoint(IndexScanDesc index_scan, BlockNumber block,
+							 Buffer *vmbuffer, int16 typLen, bool typByVal,
+							 MemoryContext outercontext, Datum *endpointDatum)
+{
+	Snapshot snapshot = ActiveSnapshotSet() ? GetActiveSnapshot() : NULL;
+	volatile VisibilityMapReadScope scope = {0};
+	uint8 status = 0;
+	bool have_data = false;
+
+	PG_TRY();
+	{
+		if (visibilitymap_read_qualified_begin(index_scan->heapRelation, block, snapshot,
+											 vmbuffer, &scope, &status) &&
+			(status & VISIBILITYMAP_ALL_VISIBLE) != 0)
+		{
+			get_variable_endpoint_from_index(index_scan, index_scan->indexRelation,
+												 typLen, typByVal, outercontext, endpointDatum);
+			have_data = true;
+		}
+	}
+	PG_FINALLY();
+	{
+		visibilitymap_read_end(&scope);
+		if (BufferIsValid(*vmbuffer))
+		{
+			ReleaseBuffer(*vmbuffer);
+			*vmbuffer = InvalidBuffer;
+		}
+	}
+	PG_END_TRY();
+	return have_data;
+}
+
 /*
  * Get one endpoint datum (min or max depending on indexscandir) from the
  * specified index.  Return true if successful, false if not.
@@ -6242,9 +6313,6 @@ get_actual_variable_endpoint(Relation heapRel,
 	BlockNumber last_heap_block = InvalidBlockNumber;
 	int			n_visited_heap_pages = 0;
 	ItemPointer tid;
-	Datum		values[INDEX_MAX_KEYS];
-	bool		isnull[INDEX_MAX_KEYS];
-	MemoryContext oldcontext;
 
 	/*
 	 * We use the index-only-scan machinery for this.  With mostly-static
@@ -6305,6 +6373,14 @@ get_actual_variable_endpoint(Relation heapRel,
 	{
 		BlockNumber block = ItemPointerGetBlockNumber(tid);
 
+		if (cluster_heap_maintenance_restricted(heapRel) &&
+			get_shared_variable_endpoint(index_scan, block, &vmbuffer, typLen, typByVal,
+										 outercontext, endpointDatum))
+		{
+			have_data = true;
+			break;
+		}
+
 		/* PGRAC: planner probes need the same exact shared visibility. */
 		if (cluster_heap_maintenance_restricted(heapRel) ||
 			!VM_ALL_VISIBLE(heapRel,
@@ -6346,29 +6422,8 @@ get_actual_variable_endpoint(Relation heapRel,
 			 */
 		}
 
-		/*
-		 * We expect that btree will return data in IndexTuple not HeapTuple
-		 * format.  It's not lossy either.
-		 */
-		if (!index_scan->xs_itup)
-			elog(ERROR, "no data returned for index-only scan");
-		if (index_scan->xs_recheck)
-			elog(ERROR, "unexpected recheck indication from btree");
-
-		/* OK to deconstruct the index tuple */
-		index_deform_tuple(index_scan->xs_itup,
-						   index_scan->xs_itupdesc,
-						   values, isnull);
-
-		/* Shouldn't have got a null, but be careful */
-		if (isnull[0])
-			elog(ERROR, "found unexpected null value in index \"%s\"",
-				 RelationGetRelationName(indexRel));
-
-		/* Copy the index column value out to caller's context */
-		oldcontext = MemoryContextSwitchTo(outercontext);
-		*endpointDatum = datumCopy(values[0], typByVal, typLen);
-		MemoryContextSwitchTo(oldcontext);
+		get_variable_endpoint_from_index(index_scan, indexRel, typLen, typByVal,
+										 outercontext, endpointDatum);
 		have_data = true;
 		break;
 	}

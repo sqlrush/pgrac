@@ -2424,6 +2424,21 @@ test_cluster_vm_statapprox test_cluster_vm_statapprox_noassert test_cluster_vm_s
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
+TESTS += test_cluster_vm_planner test_cluster_vm_planner_noassert test_cluster_vm_planner_unassigned
+all: test_cluster_vm_planner test_cluster_vm_planner_noassert test_cluster_vm_planner_unassigned
+
+test_cluster_vm_planner.inc: $(srcdir)/extract_vm_planner_fixture.py $(srcdir)/extract_vacuum_mx_fixture.py \
+		$(top_srcdir)/src/backend/utils/adt/selfuncs.c
+	python3 $(srcdir)/extract_vm_planner_fixture.py $(top_srcdir)/src/backend/utils/adt/selfuncs.c > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_vm_planner test_cluster_vm_planner_noassert test_cluster_vm_planner_unassigned: \
+		test_cluster_vm_planner.c test_cluster_vm_planner.inc test_cluster_vm_qualified_ios.c $(VM_QUALIFIED_FIXTURE_DEPS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(if $(filter %_noassert,$@),-DFIXTURE_NO_ASSERTS) $(if $(filter %_unassigned,$@),-DFIXTURE_UNASSIGNED_CATALOG) $< \
+		test_cluster_space_bufpage_product.o test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
 # The exact common-final caller suffix, including both deferred-clear paths.
 test_cluster_vm_vacuum_post_prune.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
 	awk '/^lazy_scan_heap\(/ { scan=1 } \
