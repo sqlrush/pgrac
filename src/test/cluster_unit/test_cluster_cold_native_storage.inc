@@ -8,7 +8,7 @@
  *     src/test/cluster_unit/test_cluster_cold_native_storage.inc
  * NOTES
  *     Source owner, native callback, CLOG/SLRU and files execute. The original
- *     fence/ROOT/SIDE capture boundaries remain fixtures, not native grants.
+ *     fence/ROOT capture boundaries remain fixtures, not native grants.
  *-------------------------------------------------------------------------
  */
 #include <fcntl.h>
@@ -53,6 +53,7 @@ native_storage_begin(bool truncate)
 
 	memset(&native_storage, 0, sizeof(native_storage));
 	native_storage.truncate = truncate;
+	native_side_complete_claims = true;
 	native_storage.typed = native_source_fixture(reader, decoded);
 	UT_ASSERT(getcwd(native_storage.cwd, sizeof(native_storage.cwd)) != NULL);
 	strlcpy(native_storage.root, "/tmp/pgrac-d-source-native-XXXXXX",
@@ -91,6 +92,19 @@ native_storage_begin(bool truncate)
 		decoded->main_data = (char *)&native_storage.cut;
 		decoded->main_data_len = sizeof(native_storage.cut);
 	}
+	/* Retain the entire captured cut and original redo. This synthetic native
+	 * frame spans that suffix; the immutable plan owns its full original bytes. */
+	reader->system_identifier = native_storage.typed->sources[0].claim.identity.system_identifier;
+	reader->cluster_expected_thread_id = native_storage.typed->sources[0].claim.identity.origin_thread_id;
+	reader->seg.ws_tli = native_storage.typed->sources[0].timeline;
+	reader->ReadRecPtr = decoded->lsn = side_fixture[0].redo;
+	reader->EndRecPtr = decoded->next_lsn = side_fixture[0].cut.scan_end_exclusive;
+	decoded->header.xl_tot_len = SizeOfXLogRecord + 2 + decoded->main_data_len;
+	native_source_side = test_cold_native_side_create(native_storage.typed->sources,
+		native_storage.typed->participant_count, &side_fixture[0].cut, side_fixture[0].redo, reader);
+	UT_ASSERT(native_source_side != NULL);
+	UT_ASSERT(test_cold_native_side_matches(native_source_side,
+		&native_storage.typed->sources[0], reader));
 }
 
 static void
@@ -101,6 +115,8 @@ native_storage_end(void)
 		"native_side/origin_0/pg_xact/0004", "pg_xact"};
 	const char *dirs[] = {"native_side/origin_0/pg_xact", "native_side/origin_0", "native_side"};
 
+	test_cold_native_side_destroy(&native_source_side);
+	UT_ASSERT(native_source_side == NULL);
 	test_episode_native_clog_record_guard(NULL);
 	test_episode_native_clog_local_bounds(false, 0, 0);
 	test_episode_native_clog_stop();
@@ -114,6 +130,7 @@ native_storage_end(void)
 	}
 	UT_ASSERT_EQ(rmdir(native_storage.root), 0);
 	native_source_done(&native_storage.typed);
+	native_side_complete_claims = false;
 }
 
 static void
@@ -142,6 +159,14 @@ native_storage_consume(bool *caught)
 	UT_ASSERT(!cluster_cold_typed_clog_native_record_current_v1(0, &native_storage.reader));
 	return ok;
 }
+
+static bool
+native_storage_unexpected_current(void *arg)
+{
+	UT_ASSERT(false);
+	return false;
+}
+
 
 static void
 native_storage_bytes(void)
@@ -180,7 +205,11 @@ UT_TEST(test_source_native_clog_finishes_original_records_without_cold_scope)
 		UT_ASSERT(native_storage.stats.directory_syncs > 0);
 		UT_ASSERT_EQ(native_storage.stats.file_syncs > 0, !truncate);
 		UT_ASSERT_EQ(native_storage.typed->refusal, CLUSTER_COLD_OK);
-		UT_ASSERT_EQ(native_source_checks, 2);
+		UT_ASSERT_EQ(native_source_checks, 0);
+		UT_ASSERT(test_cold_native_side_consumed(native_source_side,
+			&native_storage.typed->sources[0], &native_storage.reader));
+		UT_ASSERT(!test_cold_native_side_applied(native_source_side,
+			&native_storage.typed->sources[0], &native_storage.reader));
 		native_storage_bytes();
 		native_storage_end();
 	}
@@ -199,7 +228,8 @@ UT_TEST(test_source_native_clog_rejects_unowned_and_substituted_reader)
 		} PG_CATCH(); { unowned_error = true; } PG_END_TRY();
 		UT_ASSERT(unowned_error);
 		UT_ASSERT(!native_storage.stats.returned);
-		UT_ASSERT(!native_source_attempted);
+		UT_ASSERT(!test_cold_native_side_consumed(native_source_side,
+			&native_storage.typed->sources[0], &native_storage.reader));
 		native_storage_end();
 
 		native_storage_begin(truncate);
@@ -222,11 +252,15 @@ UT_TEST(test_source_native_clog_sync_errors_preserve_attempt_and_bytes)
 		native_storage_begin(false);
 		native_storage.fault = fault;
 		UT_ASSERT(!native_storage_consume(&caught) && caught);
-		UT_ASSERT(native_source_attempted);
+		UT_ASSERT(!test_cold_native_side_consumed(native_source_side,
+			&native_storage.typed->sources[0], &native_storage.reader));
 		UT_ASSERT(!native_storage.stats.returned);
 		UT_ASSERT_EQ(native_storage.stats.redos, 1);
 		UT_ASSERT_NE(native_storage.typed->refusal, CLUSTER_COLD_OK);
 		native_storage_bytes();
+		UT_ASSERT(!test_cold_native_side_replay(native_source_side,
+			&native_storage.typed->sources[0], &native_storage.reader,
+			native_storage_redo, native_storage_unexpected_current, &native_storage.calls));
 		native_storage.fault = 0;
 		UT_ASSERT(!native_storage_consume(&caught) && !caught);
 		UT_ASSERT_EQ(native_storage.calls, 1);
@@ -248,6 +282,58 @@ UT_TEST(test_source_native_clog_late_source_change_cannot_retry)
 		native_storage_bytes();
 		UT_ASSERT(!native_storage_consume(&caught) && !caught);
 		UT_ASSERT_EQ(native_storage.calls, 1);
+		native_storage_end();
+	}
+}
+
+UT_TEST(test_source_native_clog_sealed_bytes_refuse_before_native_attempt)
+{
+	for (unsigned truncate = 0; truncate < 2; ++truncate) {
+		for (unsigned payload = 0; payload < 2; ++payload) {
+			bool caught;
+			uint8 *changed;
+
+			native_storage_begin(truncate);
+			changed = payload ? (uint8 *)XLogRecGetData(&native_storage.reader)
+				+ XLogRecGetDataLen(&native_storage.reader) - 1
+				: (uint8 *)&native_storage.decoded.header.xl_prev;
+			*changed ^= 1;
+			UT_ASSERT(!native_storage_consume(&caught) && !caught);
+			UT_ASSERT_EQ(native_storage.calls, 0);
+			UT_ASSERT(!native_storage.stats.returned);
+			UT_ASSERT_NE(native_storage.typed->refusal, CLUSTER_COLD_OK);
+			*changed ^= 1;
+			UT_ASSERT(!native_storage_consume(&caught) && !caught);
+			UT_ASSERT_EQ(native_storage.calls, 0);
+			native_storage_end();
+		}
+	}
+}
+
+
+UT_TEST(test_source_native_clog_sealed_success_cannot_replay_or_become_cold_applied)
+{
+	for (unsigned truncate = 0; truncate < 2; ++truncate) {
+		bool caught;
+
+		native_storage_begin(truncate);
+		UT_ASSERT(native_storage_consume(&caught) && !caught);
+		UT_ASSERT(test_cold_native_side_consumed(native_source_side,
+			&native_storage.typed->sources[0], &native_storage.reader));
+		/* Mutating the reusable reader never changes the saved immutable bytes. */
+		native_storage.decoded.header.xl_crc ^= 1;
+		UT_ASSERT(!test_cold_native_side_matches(native_source_side,
+			&native_storage.typed->sources[0], &native_storage.reader));
+		native_storage.decoded.header.xl_crc ^= 1;
+		UT_ASSERT(test_cold_native_side_matches(native_source_side,
+			&native_storage.typed->sources[0], &native_storage.reader));
+		UT_ASSERT(!test_cold_native_side_replay(native_source_side,
+			&native_storage.typed->sources[0], &native_storage.reader,
+			native_storage_redo, native_storage_unexpected_current, &native_storage.calls));
+		UT_ASSERT_EQ(native_storage.calls, 1);
+		UT_ASSERT(!test_cold_native_side_applied(native_source_side,
+			&native_storage.typed->sources[0], &native_storage.reader));
+		native_storage_bytes();
 		native_storage_end();
 	}
 }
