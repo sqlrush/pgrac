@@ -976,6 +976,12 @@ extern XLogRecPtr cluster_undo_emit_tt_slot_abort_exact(uint8 instance, uint32 s
 														uint16 slot_offset, uint16 wrap,
 														TransactionId xid);
 
+/* Prepared finish: the original protected TT40 identity, same opcodes. */
+extern XLogRecPtr cluster_undo_emit_tt_slot_commit_v2(const xl_undo_tt_identity_v2 *identity,
+													  SCN commit_scn);
+extern XLogRecPtr cluster_undo_emit_tt_slot_set_head_v2(const xl_undo_tt_identity_v2 *identity,
+														UBA first_undo_block);
+
 /* spec-4.8 D7-A: emit XLOG_UNDO_TT_SLOT_SET_HEAD (durable undo-chain head). */
 extern XLogRecPtr cluster_undo_emit_tt_slot_set_head(uint8 instance, uint32 segment_id,
 													 uint16 slot_offset, uint16 wrap,

@@ -1354,10 +1354,62 @@ UT_TEST(test_native_v2_recycle_keeps_all_full_xids_and_checks_readback)
 	}
 }
 
+/* Runtime ROLLBACK PREPARED can leave the complete ABORT+HEAD image on
+ * disk before recovery starts at the earlier ABORT record. Both records must
+ * replay in order without erasing its exact original transaction/head. */
+UT_TEST(test_prepared_v2_abort_head_prefix_replay_preserves_original_head)
+{
+	for (uint32 epoch = 0; epoch <= 7; epoch += 7) {
+		const uint64 full = ((uint64)epoch << 32) | 701;
+		xl_undo_tt_identity_v2 identity = native_v2_identity(full);
+		xl_undo_tt_slot_set_head_v2 head = { .identity = identity,
+			.first_undo_block = uba_encode(513, 1, 4, 64) };
+		PGAlignedBlock expected;
+
+		native_v2_base(full, TT_SLOT_ACTIVE);
+		UT_ASSERT(replay_v2_record(XLOG_UNDO_TT_SLOT_ABORT, &identity, sizeof(identity)));
+		reset_io();
+		UT_ASSERT(replay_v2_record(XLOG_UNDO_TT_SLOT_SET_HEAD, &head, sizeof(head)));
+		expected = disk;
+		for (unsigned repeat = 0; repeat < 2; repeat++) {
+			reset_io();
+			if (repeat == 0)
+				UT_ASSERT(replay_v2_record(XLOG_UNDO_TT_SLOT_ABORT, &identity, sizeof(identity)));
+			else
+				UT_ASSERT(replay_v2_record(XLOG_UNDO_TT_SLOT_SET_HEAD, &head, sizeof(head)));
+			UT_ASSERT_EQ(memcmp(&disk, &expected, BLCKSZ), 0);
+			UT_ASSERT_EQ(memcmp(&durable, &expected, BLCKSZ), 0);
+			UT_ASSERT_EQ(writes + applies, 0);
+			UT_ASSERT_EQ(reads, 2);
+			UT_ASSERT_EQ(syncs, 1);
+			UT_ASSERT_EQ(closes, 1);
+		}
+		for (unsigned fault = 0; fault < 7; fault++) {
+			UndoSegmentHeaderDataV2 *header = (UndoSegmentHeaderDataV2 *)disk.data;
+			TTSlotV2 *slot = &header->tt_slots[4];
+			disk = expected;
+			switch (fault) {
+			case 0: slot->first_undo_block = uba_encode(513, 1, 5, 64); break;
+			case 1: slot->first_undo_block = uba_encode(514, 1, 4, 64); break;
+			case 2: slot->first_undo_block = uba_encode(513, 0, 4, 64); break;
+			case 3: slot->original_full_xid += UINT64_C(1) << 32; break;
+			case 4: slot->status = TT_SLOT_COMMITTED; slot->commit_scn = 804; break;
+			case 5: slot->flags = 0x80; break;
+			case 6: slot->flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN; break;
+			}
+			header->pd_checksum = pg_checksum_page(disk.data, 0);
+			durable = disk;
+			reset_io();
+			UT_ASSERT(!replay_v2_record(XLOG_UNDO_TT_SLOT_ABORT, &identity, sizeof(identity)));
+			UT_ASSERT_EQ(writes + applies, 0);
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(25);
+	UT_PLAN(26);
 	UT_RUN(test_native_exact_commit_rejects_bad_header_before_write);
 	UT_RUN(test_private_abort_head_release_and_exact_stale_results);
 	UT_RUN(test_native_bind_uses_complete_header_identity_and_durable_slot);
@@ -1383,6 +1435,7 @@ main(void)
 	UT_RUN(test_native_init_cannot_upgrade_or_downgrade_existing_layout);
 	UT_RUN(test_native_v2_reuse_generation_and_format_are_exact);
 	UT_RUN(test_native_v2_recycle_keeps_all_full_xids_and_checks_readback);
+	UT_RUN(test_prepared_v2_abort_head_prefix_replay_preserves_original_head);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

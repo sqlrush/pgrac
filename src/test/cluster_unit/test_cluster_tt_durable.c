@@ -78,6 +78,7 @@ scn_time_cmp(SCN a, SCN b)
 	return (la < lb) ? -1 : (la > lb) ? 1 : 0;
 }
 #include "cluster/cluster_tt_slot.h"
+#include "cluster/cluster_uba.h"
 #include "cluster/cluster_undo_segment.h"
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/storage/cluster_undo_alloc.h" /* spec-3.22: file_exists prototype */
@@ -91,6 +92,23 @@ scn_time_cmp(SCN a, SCN b)
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+
+/* Backend allocation is a fixture boundary; the staged production state and
+ * its ownership/release are executed unchanged. */
+void *
+palloc0(Size size)
+{
+	void *result = calloc(1, size);
+	if (result == NULL)
+		abort();
+	return result;
+}
+
+void
+pfree(void *pointer)
+{
+	free(pointer);
+}
 
 static void (*g_epoch_hook)(void) = NULL;
 static void (*g_modifier_recheck_hook)(void) = NULL;
@@ -826,6 +844,7 @@ XLogRecPtr
 cluster_undo_emit_tt_slot_abort_v2(const xl_undo_tt_identity_v2 *identity)
 {
 	g_abort_v2_emit_calls++;
+	note_tt_wal('a');
 	g_last_abort_v2 = *identity;
 	g_emit_delay_flags = MyProc->delayChkptFlags;
 	return g_abort_exact_lsn;
@@ -852,6 +871,32 @@ XLogFlush(XLogRecPtr record)
 		h->pd_checksum = pg_checksum_page(g_canned_block, 0);
 		memcpy(g_current_resident, g_canned_block, BLCKSZ);
 	}
+}
+
+static xl_undo_tt_slot_commit_v2 g_last_prepared_commit_v2;
+static xl_undo_tt_slot_set_head_v2 g_last_prepared_head_v2;
+static int g_prepared_commit_v2_emits, g_prepared_head_v2_emits;
+
+XLogRecPtr cluster_undo_emit_tt_slot_commit_v2(const xl_undo_tt_identity_v2 *, SCN);
+XLogRecPtr
+cluster_undo_emit_tt_slot_commit_v2(const xl_undo_tt_identity_v2 *identity, SCN scn)
+{
+	g_last_prepared_commit_v2.identity = *identity;
+	g_last_prepared_commit_v2.commit_scn = scn;
+	g_prepared_commit_v2_emits++;
+	note_tt_wal('c');
+	return 0x4900;
+}
+
+XLogRecPtr cluster_undo_emit_tt_slot_set_head_v2(const xl_undo_tt_identity_v2 *, UBA);
+XLogRecPtr
+cluster_undo_emit_tt_slot_set_head_v2(const xl_undo_tt_identity_v2 *identity, UBA head)
+{
+	g_last_prepared_head_v2.identity = *identity;
+	g_last_prepared_head_v2.first_undo_block = head;
+	g_prepared_head_v2_emits++;
+	note_tt_wal('h');
+	return 0x4a00;
 }
 
 /* spec-4.8 D7-A stub: 0x90 set-head emit (WAL machinery not linked in unit). */
@@ -930,9 +975,15 @@ cluster_undo_smgr_read_header_bytes(ClusterUndoPathIntent intent pg_attribute_un
 	g_read_hdr_calls++;
 	if (!g_read_hdr_ok
 		|| (g_read_hdr_fail_on_call > 0 && g_read_hdr_calls == g_read_hdr_fail_on_call)
-		|| buf == NULL || len != sizeof(TTSlot))
+		|| buf == NULL)
 		return false;
-	(void)offset;
+	if ((offset == offsetof(UndoSegmentHeaderData, _pad_57) && len == 7)
+		|| (offset == offsetof(UndoSegmentHeaderDataV2, wrap_count) && len == sizeof(uint32))) {
+		memcpy(buf, g_canned_block + offset, len);
+		return true;
+	}
+	if (len != sizeof(TTSlot))
+		return false;
 	memcpy(buf,
 		   (g_read_hdr_second_enabled && g_read_hdr_calls == 2) ? &g_canned_slot_second
 																: &g_canned_slot,
@@ -1208,6 +1259,9 @@ reset_current_write_mock(void)
 	g_commit_0x30_emits = 0;
 	memset(g_tt_wal_order, 0, sizeof(g_tt_wal_order));
 	g_tt_wal_count = 0;
+	g_prepared_commit_v2_emits = g_prepared_head_v2_emits = 0;
+	MemSet(&g_last_prepared_commit_v2, 0, sizeof(g_last_prepared_commit_v2));
+	MemSet(&g_last_prepared_head_v2, 0, sizeof(g_last_prepared_head_v2));
 	memset(&g_last_set_head, 0, sizeof(g_last_set_head));
 	memset(&g_fake_proc, 0, sizeof(g_fake_proc));
 }
@@ -2660,7 +2714,7 @@ UT_TEST(test_prepared_commit_stage_emits_and_writes_only_when_told)
 	head.raw[0] = UINT64_C(1) | (UINT64_C(3) << 32);
 	head.raw[1] = UINT64_C(9);
 	seed_prepared_slot(TT_SLOT_ACTIVE);
-	cluster_tt_slot_durable_prepared_stage(1, 7, 100, 5, true, scn_encode(1, 42), head, &stage);
+	cluster_tt_slot_durable_prepared_stage(1, 7, 100, 5, true, scn_encode(1, 42), head, NULL, &stage);
 	UT_ASSERT_EQ(g_write_hdr_calls, 0);
 	UT_ASSERT_EQ(g_tt_wal_count, 0);
 	UT_ASSERT_EQ(g_writer_open_calls, 1);
@@ -2693,7 +2747,7 @@ UT_TEST(test_prepared_abort_stage_carries_the_captured_head)
 	head.raw[0] = UINT64_C(1) | (UINT64_C(3) << 32);
 	head.raw[1] = UINT64_C(9);
 	seed_prepared_slot(TT_SLOT_ACTIVE);
-	cluster_tt_slot_durable_prepared_stage(1, 7, 100, 5, false, InvalidScn, head, &stage);
+	cluster_tt_slot_durable_prepared_stage(1, 7, 100, 5, false, InvalidScn, head, NULL, &stage);
 	cluster_tt_slot_durable_prepared_emit(&stage);
 	UT_ASSERT_EQ(g_tt_wal_count, 2);
 	UT_ASSERT_EQ(g_tt_wal_order[0], 'a');
@@ -2708,7 +2762,7 @@ UT_TEST(test_prepared_abort_stage_carries_the_captured_head)
 
 	head = (UBA)InvalidUba_init;
 	seed_prepared_slot(TT_SLOT_ACTIVE);
-	cluster_tt_slot_durable_prepared_stage(1, 7, 100, 5, false, InvalidScn, head, &stage);
+	cluster_tt_slot_durable_prepared_stage(1, 7, 100, 5, false, InvalidScn, head, NULL, &stage);
 	cluster_tt_slot_durable_prepared_emit(&stage);
 	UT_ASSERT_EQ(g_tt_wal_count, 1);
 	UT_ASSERT_EQ(g_tt_wal_order[0], 'a');
@@ -2743,7 +2797,7 @@ UT_TEST(test_prepared_stage_requires_the_slot_to_name_the_binding)
 		g_canned_slot.wrap = cases[i].wrap;
 		PG_TRY();
 		{
-			cluster_tt_slot_durable_prepared_stage(1, 7, 100, 5, true, scn_encode(1, 42), head,
+			cluster_tt_slot_durable_prepared_stage(1, 7, 100, 5, true, scn_encode(1, 42), head, NULL,
 												   &stage);
 		}
 		PG_CATCH();
@@ -2776,7 +2830,7 @@ UT_TEST(test_prepared_stage_io_failures_refuse_and_leave_nothing)
 			g_writer_open_ok = false;
 		PG_TRY();
 		{
-			cluster_tt_slot_durable_prepared_stage(1, 7, 100, 5, true, scn_encode(1, 42), head,
+			cluster_tt_slot_durable_prepared_stage(1, 7, 100, 5, true, scn_encode(1, 42), head, NULL,
 												   &stage);
 		}
 		PG_CATCH();
@@ -2799,7 +2853,7 @@ UT_TEST(test_prepared_apply_write_failure_panics)
 	volatile bool caught = false;
 
 	seed_prepared_slot(TT_SLOT_ACTIVE);
-	cluster_tt_slot_durable_prepared_stage(1, 7, 100, 5, true, scn_encode(1, 42), head, &stage);
+	cluster_tt_slot_durable_prepared_stage(1, 7, 100, 5, true, scn_encode(1, 42), head, NULL, &stage);
 	g_write_hdr_ok = false;
 	PG_TRY();
 	{
@@ -4143,10 +4197,234 @@ UT_TEST(test_terminal_abort_rejects_layout_replacement_between_proof_and_flush)
 	UT_ASSERT_EQ(MyProc->delayChkptFlags, 0);
 }
 
+/* Old slot-stride/executor identity or stale-page publication must fail these. */
+static bool
+prepared_v2_try(bool commit, UBA head, ClusterTTPreparedStage *stage)
+{
+	ClusterSemanticAdmissionToken admission = source_modifier_token();
+	volatile bool staged = false;
+	PG_TRY();
+	{
+		cluster_tt_slot_durable_prepared_stage(1, 7, 100, 5, commit,
+			commit ? (SCN)42 : InvalidScn, head, &admission, stage);
+		staged = true;
+	}
+	PG_CATCH();
+	{ cluster_tt_slot_durable_prepared_release(stage); }
+	PG_END_TRY();
+	return staged;
+}
+
+UT_TEST(test_prepared_v2_commit_preserves_identity_and_other_current_slots)
+{
+	ClusterTTPreparedStage stage;
+	UBA head = InvalidUba_init;
+	UndoSegmentHeaderDataV2 *disk = (UndoSegmentHeaderDataV2 *)g_canned_block;
+	UndoSegmentHeaderDataV2 *resident = (UndoSegmentHeaderDataV2 *)g_current_resident;
+	bool staged;
+	terminal_v2_seed();
+	staged = prepared_v2_try(true, head, &stage);
+	UT_ASSERT(staged);
+	if (!staged) return;
+	UT_ASSERT_EQ(g_write_hdr_calls + g_tt_wal_count, 0);
+	UT_ASSERT_EQ(disk->tt_slots[7].status, TT_SLOT_ACTIVE);
+	cluster_tt_slot_durable_prepared_emit(&stage);
+	UT_ASSERT_EQ(g_prepared_commit_v2_emits, 1);
+	UT_ASSERT_EQ(g_tt_wal_count, 1);
+	UT_ASSERT_EQ(g_last_prepared_commit_v2.identity.segment_generation, 4);
+	UT_ASSERT_EQ(g_last_prepared_commit_v2.identity.xid, 100);
+	UT_ASSERT_EQ(g_last_prepared_commit_v2.identity.original_full_xid, UINT64_C(0x700000064));
+	UT_ASSERT_EQ(g_last_prepared_commit_v2.commit_scn, 42);
+	/* Other slots can change after staging; apply must merge the current page. */
+	resident->tt_slots[8] = resident->tt_slots[7];
+	resident->tt_slots[8].xid = 101;
+	resident->tt_slots[8].original_full_xid = UINT64_C(0x700000065);
+	resident->pd_checksum = pg_checksum_page(g_current_resident, 0);
+	g_write_requires_flush = g_flush_ptr = 0x5000;
+	cluster_tt_slot_durable_prepared_apply(&stage);
+	UT_ASSERT(!g_write_before_flush);
+	UT_ASSERT_EQ(g_write_hdr_calls, 1);
+	UT_ASSERT_EQ(disk->tt_slots[7].status, TT_SLOT_COMMITTED);
+	UT_ASSERT_EQ(disk->tt_slots[7].commit_scn, 42);
+	UT_ASSERT_EQ(disk->tt_slots[7].original_full_xid, UINT64_C(0x700000064));
+	UT_ASSERT_EQ(disk->tt_slots[8].original_full_xid, UINT64_C(0x700000065));
+	UT_ASSERT_EQ(disk->pd_checksum, pg_checksum_page(g_canned_block, 0));
+	UT_ASSERT_EQ(memcmp(g_current_resident, g_canned_block, BLCKSZ), 0);
+	cluster_tt_slot_durable_prepared_release(&stage);
+	UT_ASSERT_EQ(g_writer_fd_open, 0);
+	UT_ASSERT_EQ(g_current_unpin_calls, 1);
+	UT_ASSERT(!g_pin_reserved && !g_current_active);
+}
+
+UT_TEST(test_prepared_v2_abort_preserves_identity_and_captured_head)
+{
+	for (int has_head = 0; has_head < 2; has_head++) {
+		ClusterTTPreparedStage stage;
+		UBA head = InvalidUba_init;
+		UndoSegmentHeaderDataV2 *disk = (UndoSegmentHeaderDataV2 *)g_canned_block;
+		bool staged;
+		terminal_v2_seed();
+		if (has_head) {
+			head.raw[0] = UINT64_C(1) | (UINT64_C(3) << 32);
+			head.raw[1] = 7;
+		}
+		staged = prepared_v2_try(false, head, &stage);
+		UT_ASSERT(staged);
+		if (!staged) return;
+		UT_ASSERT_EQ(g_tt_wal_count + g_write_hdr_calls, 0);
+		cluster_tt_slot_durable_prepared_emit(&stage);
+		UT_ASSERT_EQ(g_abort_v2_emit_calls, 1);
+		UT_ASSERT_EQ(g_prepared_head_v2_emits, has_head);
+		UT_ASSERT_EQ(g_tt_wal_count, 1 + has_head);
+		UT_ASSERT_EQ(g_tt_wal_order[0], 'a');
+		UT_ASSERT_EQ(g_last_abort_v2.original_full_xid, UINT64_C(0x700000064));
+		if (has_head) {
+			UT_ASSERT_EQ(g_tt_wal_order[1], 'h');
+			UT_ASSERT_EQ(memcmp(&g_last_abort_v2, &g_last_prepared_head_v2.identity,
+							   sizeof(g_last_abort_v2)), 0);
+			UT_ASSERT_EQ(memcmp(&head, &g_last_prepared_head_v2.first_undo_block, sizeof(head)), 0);
+		}
+		g_write_requires_flush = g_flush_ptr = 0x5000;
+		cluster_tt_slot_durable_prepared_apply(&stage);
+		UT_ASSERT(!g_write_before_flush);
+		UT_ASSERT_EQ(disk->tt_slots[7].status, TT_SLOT_ABORTED);
+		UT_ASSERT_EQ(disk->tt_slots[7].original_full_xid, UINT64_C(0x700000064));
+		UT_ASSERT_EQ(disk->tt_slots[7].commit_scn, InvalidScn);
+		UT_ASSERT_EQ(memcmp(&disk->tt_slots[7].first_undo_block, &head, sizeof(head)), 0);
+		UT_ASSERT_EQ(memcmp(g_current_resident, g_canned_block, BLCKSZ), 0);
+		UT_ASSERT_EQ(disk->pd_checksum, pg_checksum_page(g_canned_block, 0));
+		cluster_tt_slot_durable_prepared_release(&stage);
+		UT_ASSERT_EQ(g_writer_fd_open, 0);
+		UT_ASSERT(!g_pin_reserved && !g_current_active);
+	}
+}
+
+UT_TEST(test_prepared_v2_bad_framing_identity_or_current_is_atomic)
+{
+	for (int fault = 0; fault < 19; fault++) {
+		ClusterTTPreparedStage stage;
+		UBA head = InvalidUba_init;
+		UndoSegmentHeaderDataV2 *disk = (UndoSegmentHeaderDataV2 *)g_canned_block;
+		PGAlignedBlock before;
+		terminal_v2_seed();
+		switch (fault) {
+		case 0: disk->tt_layout_version = 3; break;
+		case 1: disk->tt_slot_bytes = 32; break;
+		case 2: disk->tt_layout_reserved = 1; break;
+		case 3: disk->tt_slots[7].original_full_xid = 0; break;
+		case 4: disk->tt_slots[7].original_full_xid = UINT64_MAX; break;
+		case 5: disk->tt_slots[7].original_full_xid++; break;
+		case 6: disk->tt_slots[7].xid = 101; break;
+		case 7: disk->tt_slots[7].wrap++; break;
+		case 8: disk->tt_slots[7].flags = 0x80; break;
+		case 9: disk->wrap_count = UINT32_MAX; break;
+		case 10: g_current_root_drift = true; break;
+		case 11: g_read_hdr_ok = false; break;
+		case 12: disk->tt_slots[7].commit_scn = UINT64_MAX; break;
+		case 13: head = uba_encode(1, 3, 8, 0); break;
+		case 14: head = uba_encode(2, 3, 7, 0); break;
+		case 15: head = uba_encode(1, 0, 7, 0); break;
+		case 16: head.raw[1] = UINT64_C(1) << 32; break;
+		case 17: g_writer_open_ok = false; break;
+		case 18: g_read_block_ok = false; break;
+		}
+		disk->pd_checksum = pg_checksum_page(g_canned_block, 0);
+		memcpy(g_current_resident, g_canned_block, BLCKSZ);
+		memcpy(before.data, g_canned_block, BLCKSZ);
+		UT_ASSERT(!prepared_v2_try(fault < 13 || fault > 16, head, &stage));
+		UT_ASSERT_EQ(g_write_hdr_calls + g_tt_wal_count, 0);
+		UT_ASSERT_EQ(g_writer_fd_open, 0);
+		UT_ASSERT_EQ(memcmp(before.data, g_canned_block, BLCKSZ), 0);
+		UT_ASSERT_EQ(memcmp(before.data, g_current_resident, BLCKSZ), 0);
+		UT_ASSERT(!g_pin_reserved && !g_current_active);
+	}
+}
+
+UT_TEST(test_prepared_v2_apply_refuses_preimage_drift_and_release_is_owned)
+{
+	for (int fault = 0; fault < 6; fault++) {
+		ClusterTTPreparedStage stage;
+		UBA head = InvalidUba_init;
+		UndoSegmentHeaderDataV2 *resident = (UndoSegmentHeaderDataV2 *)g_current_resident;
+		PGAlignedBlock before;
+		volatile bool caught = false;
+		bool staged;
+		terminal_v2_seed();
+		staged = prepared_v2_try(true, head, &stage);
+		UT_ASSERT(staged);
+		if (!staged) return;
+		if (fault == 5) {
+			cluster_tt_slot_durable_prepared_release(&stage);
+			cluster_tt_slot_durable_prepared_release(&stage);
+			UT_ASSERT_EQ(g_reservation_release_calls, 1);
+			UT_ASSERT_EQ(g_writer_fd_open + g_tt_wal_count + g_write_hdr_calls, 0);
+			continue;
+		}
+		switch (fault) {
+		case 0: resident->tt_slots[7].original_full_xid = UINT64_C(0x800000064); break;
+		case 1: resident->tt_layout_version = 3; break;
+		case 2: resident->wrap_count++; break;
+		case 3: resident->pd_checksum++; break;
+		case 4: g_write_hdr_ok = false; break;
+		}
+		if (fault < 3) resident->pd_checksum = pg_checksum_page(g_current_resident, 0);
+		memcpy(before.data, g_current_resident, BLCKSZ);
+		g_write_requires_flush = g_flush_ptr = 0x5000;
+		PG_TRY();
+		{ cluster_tt_slot_durable_prepared_apply(&stage); }
+		PG_CATCH();
+		{ caught = true; }
+		PG_END_TRY();
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(last_ereport_elevel, PANIC);
+		UT_ASSERT_EQ(g_write_hdr_calls, fault == 4 ? 1 : 0);
+		UT_ASSERT_EQ(memcmp(before.data, g_current_resident, BLCKSZ), 0);
+		g_write_hdr_ok = true;
+		cluster_tt_slot_durable_prepared_release(&stage);
+		UT_ASSERT_EQ(g_writer_fd_open, 0);
+	}
+}
+
+UT_TEST(test_prepared_v2_repeated_terminal_keeps_exact_head_and_refuses_conflict)
+{
+	for (int variant = 0; variant < 7; variant++) {
+		ClusterTTPreparedStage stage;
+		UBA head = InvalidUba_init;
+		UndoSegmentHeaderDataV2 *disk = (UndoSegmentHeaderDataV2 *)g_canned_block;
+		TTSlotV2 *slot = &disk->tt_slots[7];
+		bool commit = variant < 3;
+		bool accepted = variant == 0 || variant == 3;
+		terminal_v2_seed();
+		slot->status = variant == 1 || variant == 3 || variant == 4 || variant == 6
+			? TT_SLOT_ABORTED : TT_SLOT_COMMITTED;
+		slot->commit_scn = slot->status == TT_SLOT_COMMITTED ? 42 : InvalidScn;
+		if (variant == 2) slot->commit_scn = 43;
+		if (variant == 3 || variant == 4 || variant == 6) {
+			head = uba_encode(1, 3, 7, 64);
+			slot->first_undo_block = uba_encode(1, 3, 7, variant == 4 ? 128 : 64);
+		}
+		if (variant == 6) slot->flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+		disk->pd_checksum = pg_checksum_page(g_canned_block, 0);
+		memcpy(g_current_resident, g_canned_block, BLCKSZ);
+		UT_ASSERT_EQ(prepared_v2_try(commit, head, &stage), accepted);
+		UT_ASSERT_EQ(g_tt_wal_count + g_write_hdr_calls, 0);
+		if (accepted) {
+			cluster_tt_slot_durable_prepared_emit(&stage);
+			g_write_requires_flush = g_flush_ptr = 0x5000;
+			cluster_tt_slot_durable_prepared_apply(&stage);
+			UT_ASSERT_EQ(slot->original_full_xid, UINT64_C(0x700000064));
+			UT_ASSERT_EQ(memcmp(&slot->first_undo_block, &head, sizeof(head)), 0);
+		}
+		cluster_tt_slot_durable_prepared_release(&stage);
+		UT_ASSERT_EQ(g_writer_fd_open, 0);
+		UT_ASSERT(!g_current_active && !g_pin_reserved);
+	}
+}
+
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(122);
+	UT_PLAN(127);
 
 	UT_RUN(test_layout_sizes);
 
@@ -4283,6 +4561,11 @@ main(int argc, char **argv)
 	UT_RUN(test_terminal_v2_commit_rechecks_exact_full_page_before_private_write);
 	UT_RUN(test_terminal_v2_repeated_abort_is_readonly_and_failed_write_keeps_preimage);
 	UT_RUN(test_terminal_abort_rejects_layout_replacement_between_proof_and_flush);
+	UT_RUN(test_prepared_v2_commit_preserves_identity_and_other_current_slots);
+	UT_RUN(test_prepared_v2_abort_preserves_identity_and_captured_head);
+	UT_RUN(test_prepared_v2_bad_framing_identity_or_current_is_atomic);
+	UT_RUN(test_prepared_v2_apply_refuses_preimage_drift_and_release_is_owned);
+	UT_RUN(test_prepared_v2_repeated_terminal_keeps_exact_head_and_refuses_conflict);
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;
 }

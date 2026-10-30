@@ -51,6 +51,7 @@
 #include "cluster/cluster_side_undo.h"			/* shared cold/online decode gate */
 #include "cluster/cluster_tt_status.h"			/* spec-3.16 D5 recovery counters */
 #include "cluster/cluster_tt_durable.h"			/* spec-3.11: redo decision predicate */
+#include "cluster/cluster_uba.h"
 #include "cluster/cluster_undo_gcs.h"			/* shared-root decision (D2-2 裁决 A) */
 #include "cluster/cluster_undo_segment.h"		/* UNDO_SEGMENT_SIZE_BYTES */
 #include "cluster/storage/cluster_shared_fs.h"	/* undo shared-root dir resolve (D2-2) */
@@ -380,6 +381,29 @@ cluster_undo_emit_tt_slot_commit(uint8 instance, uint32 segment_id, uint16 slot_
 }
 
 
+/* Prepared COMMIT retains the canonical TT40 identity under the original
+ * standalone opcode. The prepared record flush carries this record. */
+XLogRecPtr
+cluster_undo_emit_tt_slot_commit_v2(const xl_undo_tt_identity_v2 *identity, SCN commit_scn)
+{
+	xl_undo_tt_slot_commit_v2 rec = { 0 };
+
+	if (!cluster_undo_tt_bind_v2_decode(identity, sizeof(rec.identity), &rec.identity)
+		|| rec.identity.instance == 0 || rec.identity.instance > UNDO_OWNER_INSTANCE_MAX
+		|| rec.identity.segment_id == 0 || rec.identity.segment_id > UINT16_MAX
+		|| (rec.identity.segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE + 1 != rec.identity.instance
+		|| rec.identity.slot_offset >= TT_SLOTS_PER_SEGMENT || rec.identity.wrap == TT_WRAP_INVALID
+		|| rec.identity.segment_generation == UINT32_MAX
+		|| !SCN_VALID(commit_scn) || commit_scn == UINT64_MAX)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("invalid canonical TT V2 COMMIT before WAL insertion")));
+	rec.commit_scn = commit_scn;
+	XLogBeginInsert();
+	XLogRegisterData((char *)&rec, sizeof(rec));
+	return XLogInsert(RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_COMMIT);
+}
+
+
 /*
  * cluster_undo_emit_tt_slot_abort -- spec-3.15 D5 (ROLLBACK PREPARED).
  *
@@ -489,6 +513,30 @@ cluster_undo_emit_tt_slot_set_head(uint8 instance, uint32 segment_id, uint16 slo
 	lsn = XLogInsert(RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_SET_HEAD);
 
 	return lsn;
+}
+
+/* Original PREPARE head, never a reconstructed raw-XID identity. */
+XLogRecPtr
+cluster_undo_emit_tt_slot_set_head_v2(const xl_undo_tt_identity_v2 *identity, UBA first_undo_block)
+{
+	xl_undo_tt_slot_set_head_v2 rec = { 0 };
+	uint32 segment, block;
+	uint16 slot, row;
+
+	if (!cluster_undo_tt_bind_v2_decode(identity, sizeof(rec.identity), &rec.identity)
+		|| rec.identity.instance == 0 || rec.identity.instance > UNDO_OWNER_INSTANCE_MAX
+		|| rec.identity.segment_id == 0 || rec.identity.segment_id > UINT16_MAX
+		|| (rec.identity.segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE + 1 != rec.identity.instance
+		|| rec.identity.slot_offset >= TT_SLOTS_PER_SEGMENT || rec.identity.wrap == TT_WRAP_INVALID
+		|| rec.identity.segment_generation == UINT32_MAX
+		|| !uba_decode_record(first_undo_block, &segment, &block, &slot, &row)
+		|| segment != rec.identity.segment_id || slot != rec.identity.slot_offset)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("invalid canonical TT V2 prepared head before WAL insertion")));
+	rec.first_undo_block = first_undo_block;
+	XLogBeginInsert();
+	XLogRegisterData((char *)&rec, sizeof(rec));
+	return XLogInsert(RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_SET_HEAD);
 }
 
 /* Spec 8.4D §12.10: insert the sole field-coded release certificate.  The

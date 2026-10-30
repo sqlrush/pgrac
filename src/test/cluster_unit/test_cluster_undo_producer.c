@@ -664,10 +664,87 @@ UT_TEST(test_v2_release_producer_preserves_104_bytes_and_rejects_before_insert)
 	}
 }
 
+UT_TEST(test_v2_prepared_commit_and_head_producers_reach_original_decoder)
+{
+	for (unsigned epoch = 0; epoch < 2; epoch++) {
+		xl_undo_tt_identity_v2 identity = { .segment_id = 513, .segment_generation = 9,
+			.xid = 801, .slot_offset = 4, .wrap = 7, .instance = 3,
+			.format_version = CLUSTER_UNDO_TT_IDENTITY_V2_VERSION };
+		xl_undo_tt_slot_commit_v2 commit;
+		xl_undo_tt_slot_set_head_v2 head_record;
+		ClusterUndoDecoded decoded;
+		UBA head = uba_encode(513, 2, 4, 0);
+		identity.original_full_xid = ((uint64)(epoch ? 7 : 0) << 32) | identity.xid;
+		UT_ASSERT_EQ(cluster_undo_emit_tt_slot_commit_v2(&identity, 42), 0x900);
+		UT_ASSERT_EQ(payload_length, 40);
+		UT_ASSERT_EQ(emitted_info, XLOG_UNDO_TT_SLOT_COMMIT);
+		UT_ASSERT(cluster_undo_tt_commit_v2_decode(payload, payload_length, &commit));
+		UT_ASSERT_EQ(memcmp(&commit.identity, &identity, sizeof(identity)), 0);
+		UT_ASSERT_EQ(commit.commit_scn, 42);
+		decoded = decode_emitted(false);
+		UT_ASSERT(cluster_undo_preflight_tt_v2(&decoded));
+		UT_ASSERT_EQ(decoded.original_full_xid, identity.original_full_xid);
+		UT_ASSERT_EQ(decoded.commit_scn, 42);
+		UT_ASSERT_EQ(cluster_undo_emit_tt_slot_set_head_v2(&identity, head), 0x900);
+		UT_ASSERT_EQ(payload_length, 48);
+		UT_ASSERT_EQ(emitted_info, XLOG_UNDO_TT_SLOT_SET_HEAD);
+		UT_ASSERT(cluster_undo_tt_set_head_v2_decode(payload, payload_length, &head_record));
+		UT_ASSERT_EQ(memcmp(&head_record.identity, &identity, sizeof(identity)), 0);
+		UT_ASSERT_EQ(memcmp(&head_record.first_undo_block, &head, sizeof(head)), 0);
+		decoded = decode_emitted(false);
+		UT_ASSERT(cluster_undo_preflight_tt_v2(&decoded));
+		UT_ASSERT_EQ(decoded.original_full_xid, identity.original_full_xid);
+		UT_ASSERT_EQ(memcmp(&decoded.first_undo_block, &head, sizeof(head)), 0);
+	}
+}
+
+UT_TEST(test_v2_prepared_emitters_reject_bad_identity_scn_or_head_before_insert)
+{
+	for (unsigned is_head = 0; is_head < 2; is_head++) {
+		for (unsigned fault = 0; fault < 15; fault++) {
+			xl_undo_tt_identity_v2 identity = { .segment_id = 513, .segment_generation = 9,
+				.xid = 801, .slot_offset = 4, .wrap = 7, .instance = 3,
+				.format_version = CLUSTER_UNDO_TT_IDENTITY_V2_VERSION,
+				.original_full_xid = UINT64_C(0x700000321) };
+			UBA head = uba_encode(513, 2, 4, 0);
+			SCN scn = 42;
+			switch (fault) {
+			case 0: identity.format_version = 1; break;
+			case 1: identity.flags = 1; break;
+			case 2: identity.reserved = 1; break;
+			case 3: identity.original_full_xid = UINT64_MAX; break;
+			case 4: identity.original_full_xid++; break;
+			case 5: identity.xid = FrozenTransactionId; break;
+			case 6: identity.instance = 0; break;
+			case 7: identity.segment_id = 1; break;
+			case 8: identity.slot_offset = TT_SLOTS_PER_SEGMENT; break;
+			case 9: identity.wrap = TT_WRAP_INVALID; break;
+			case 10: identity.segment_generation = UINT32_MAX; break;
+			case 11: break; /* NULL identity */
+			case 12: scn = InvalidScn; head = (UBA)InvalidUba_init; break;
+			case 13: scn = UINT64_MAX; head = uba_encode(513, 2, 5, 0); break;
+			case 14: scn = UINT64_MAX; head = uba_encode(514, 2, 4, 0); break;
+			}
+			payload_length = 123; emitted_info = 0xee;
+			expect_panic = true;
+			if (setjmp(panic_jump) == 0) {
+				if (is_head)
+					(void)cluster_undo_emit_tt_slot_set_head_v2(fault == 11 ? NULL : &identity, head);
+				else
+					(void)cluster_undo_emit_tt_slot_commit_v2(fault == 11 ? NULL : &identity, scn);
+				UT_ASSERT(false);
+			}
+			expect_panic = false;
+			UT_ASSERT_EQ(payload_length, 123);
+			UT_ASSERT_EQ(emitted_info, 0xee);
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(14);
 	UT_RUN(test_segment_lifecycle_producer_payloads);
 	UT_RUN(test_tt_producer_identity_and_polarity);
 	UT_RUN(test_ctrc_release_producer_certificate);
@@ -680,6 +757,8 @@ main(void)
 	UT_RUN(test_v2_bind_producer_preserves_original_fullxid_and_opcode);
 	UT_RUN(test_v2_bind_producer_refuses_bad_identity_before_insertion);
 	UT_RUN(test_v2_abort_producer_preserves_original_identity_and_rejects_before_insert);
+	UT_RUN(test_v2_prepared_commit_and_head_producers_reach_original_decoder);
+	UT_RUN(test_v2_prepared_emitters_reject_bad_identity_scn_or_head_before_insert);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

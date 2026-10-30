@@ -835,7 +835,23 @@ undo_prepare_tt_header_v2(const ClusterUndoDecoded *decoded, const uint8 *payloa
 		uint8 status = decoded->kind == CLUSTER_UNDO_KIND_TT_COMMIT ? TT_SLOT_COMMITTED
 																		 : TT_SLOT_ABORTED;
 		SCN scn = status == TT_SLOT_COMMITTED ? decoded->commit_scn : InvalidScn;
-		ClusterTTTerminalTransitionDecision decision = cluster_tt_terminal_transition_decide(
+		ClusterTTTerminalTransitionDecision decision;
+
+		/* A durable prepared ABORT+HEAD image can precede replay of its
+		 * earlier ABORT. Keep the existing exact head on that idempotent
+		 * replay; it remains part of this same FullXid's rollback state. */
+		if (status == TT_SLOT_ABORTED && legacy.status == TT_SLOT_ABORTED
+			&& !UBA_is_invalid(legacy.first_undo_block)) {
+			uint32 segment, block;
+			uint16 offset, row;
+
+			if (legacy.flags != TT_FLAGS_RESERVED
+				|| !uba_decode_record(legacy.first_undo_block, &segment, &block, &offset, &row)
+				|| segment != decoded->segment_id || offset != decoded->slot_offset)
+				return CLUSTER_UNDO_HEADER_BLOCKED;
+			legacy.first_undo_block = invalid_head;
+		}
+		decision = cluster_tt_terminal_transition_decide(
 			&legacy, header->wrap_count, decoded->expected_generation, decoded->xid,
 			decoded->wrap, status, scn);
 

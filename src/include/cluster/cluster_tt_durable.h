@@ -192,8 +192,11 @@ cluster_tt_durable_classify(int xid_matches, bool match_has_valid_scn, bool scan
  * the COMMIT/ROLLBACK PREPARED critical section, _prepared_emit inserts the
  * binding's standalone TT WAL (0x30, or 0x31 and 0x90 for a captured undo-chain
  * head) just before the record, and _prepared_apply writes the successor after
- * the record is flushed (PANIC on failure).  _prepared_release never throws.
+ * the record is flushed (PANIC on failure). TT40 borrows the existing modifier
+ * admission and retains a canonical content reservation; its FullXid comes
+ * only from that protected slot. _prepared_release never throws.
  */
+struct TTCommitStage;
 typedef struct ClusterTTPreparedStage {
 	uint32 segment_id;
 	uint16 slot_offset;
@@ -202,11 +205,13 @@ typedef struct ClusterTTPreparedStage {
 	int fd;		  /* private write descriptor, -1 when none */
 	bool emit_head;
 	TTSlot successor;
+	struct TTCommitStage *canonical_stage; /* private TT40 reservation, not persisted */
 } ClusterTTPreparedStage;
 
 extern void cluster_tt_slot_durable_prepared_stage(uint32 segment_id, uint16 slot_offset,
 												   TransactionId xid, uint16 wrap, bool commit,
 												   SCN commit_scn, UBA head,
+												   const ClusterSemanticAdmissionToken *admission,
 												   ClusterTTPreparedStage *stage);
 extern void cluster_tt_slot_durable_prepared_emit(const ClusterTTPreparedStage *stage);
 extern void cluster_tt_slot_durable_prepared_apply(ClusterTTPreparedStage *stage);

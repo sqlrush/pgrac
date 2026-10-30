@@ -178,8 +178,10 @@ void
 cluster_tt_slot_durable_prepared_stage(uint32 segment_id, uint16 slot_offset, TransactionId xid,
 									   uint16 wrap, bool commit, SCN commit_scn,
 									   UBA head pg_attribute_unused(),
+									   const ClusterSemanticAdmissionToken *admission,
 									   ClusterTTPreparedStage *stage)
 {
+	UT_ASSERT(admission != NULL && admission->entered);
 	memset(stage, 0, sizeof(*stage));
 	stage->fd = -1;
 	if (++stages == fail_stage_on)

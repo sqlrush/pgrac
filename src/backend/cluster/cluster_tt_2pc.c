@@ -538,7 +538,7 @@ cluster_tt_twophase_prefinish(TransactionId xid, SCN final_scn, bool is_commit, 
 				b->undo_segment_id, b->slot_offset, b->xid, b->wrap, is_commit,
 				is_commit ? final_scn : InvalidScn,
 				(!is_commit && p.heads != NULL) ? p.heads[i] : (UBA)InvalidUba_init,
-				&tt_2pc_stage.slots[i]);
+				&tt_2pc_stage.admission, &tt_2pc_stage.slots[i]);
 		}
 	}
 	PG_CATCH();

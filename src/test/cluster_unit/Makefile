@@ -3535,7 +3535,7 @@ test_cluster_undo_tt_transition.inc: $(top_srcdir)/src/backend/cluster/cluster_t
 test_cluster_undo_producer_owner.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_xlog.c Makefile
 	awk '/^(cluster_undo_emit_[a-z_0-9]+|cluster_hw_emit_reserve|cluster_undo_xlog_insert_tt_ctrc_release(_v2)?)\(/ \
 	     { print "XLogRecPtr"; emit=1; found++ } emit { print } /^}/ { emit=0 } \
-	     END { if (found != 15) exit 1 }' $< > $@.tmp
+	     END { if (found != 17) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_undo_block_native.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_xlog.c Makefile
