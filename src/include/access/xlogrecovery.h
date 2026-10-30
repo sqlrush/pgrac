@@ -264,6 +264,15 @@ extern bool ClusterColdRecoveryCtrcPageDrain(const struct ClusterRecoveryStartV1
 struct RfPageCtrcReadbackImageV1;
 extern struct RfPageCtrcReadbackImageV1 ClusterColdRecoveryCtrcPageImage(
 	const struct ClusterRecoveryStartV1 *start, uint32 target_index);
+/* Execute the original completed/unchanged PAGE owner predicates and bind
+ * its full readback to the exact original target/source, after PAGE/proof
+ * cleanup and complete Start/result/FD revalidation. No supplied rule or
+ * success flag. The original clearing preflight consumes this proof; it
+ * does not clear first/pin/history/companion debt or grant joint completion.
+ * Same local WAIT, sticky failure/ERROR, custody and lifetime as PageImage. */
+struct RfPageCtrcOwnerProofV1;
+extern struct RfPageCtrcOwnerProofV1 ClusterColdRecoveryCtrcPageOwnerProof(
+	const struct ClusterRecoveryStartV1 *start, uint32 target_index);
 struct RfPageCtrcFpiInsertV1;
 struct ClusterSharedFsPageV1;
 /* Local immutable membership only: the ORIGINAL retained result address and

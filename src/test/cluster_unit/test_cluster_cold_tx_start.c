@@ -2425,6 +2425,7 @@ static void startup_local_empty_reset(void);
 #include "test_cluster_cold_ctrc_completed_readback.inc"
 #include "test_cluster_cold_ctrc_unchanged_custody.inc"
 #include "test_cluster_cold_ctrc_page_image.inc"
+#include "test_cluster_cold_ctrc_page_owner.inc"
 #include "test_cluster_cold_ctrc_final_projection.inc"
 #include "test_cluster_cold_ctrc_heap_refs.inc"
 #include "test_cluster_cold_ctrc_hot_refs.inc"
@@ -2685,6 +2686,16 @@ int main(void)
 		UT_RUN(test_startup_final_projection_budget_is_reserved_before_first_page);
 		reset(); UT_DONE(); return ut_failed_count != 0;
 	}
+	if (getenv("PGRAC_PRE2_TEST_PAGE_OWNER") != NULL) {
+		UT_PLAN(6);
+		UT_RUN(test_startup_page_owner_uses_original_completed_operation_and_full_image);
+		UT_RUN(test_startup_page_owner_missing_pending_or_unsupported_target_has_no_proof);
+		UT_RUN(test_startup_page_owner_late_cleanup_drift_publishes_no_metadata_or_bytes);
+		UT_RUN(test_startup_page_owner_wait_rechecks_without_cached_rule_or_new_wal);
+		UT_RUN(test_startup_page_owner_false_or_error_preserves_all_original_custody);
+		UT_RUN(test_startup_page_owner_scratch_is_reserved_before_first_page);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_STARTUP_PAGE_IMAGE") != NULL) {
 #ifdef PGRAC_TEST_OLD_IMAGE_FORWARDING
 		UT_PLAN(1);
@@ -2917,7 +2928,7 @@ int main(void)
 	}
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_FIRST
-	UT_PLAN(358);
+	UT_PLAN(364);
 	UT_RUN(test_start_raw_records_keep_complete_original_bytes_and_empty_end);
 	UT_RUN(test_start_raw_records_refuse_incomplete_changed_bytes_hash_header_and_end);
 
@@ -3062,6 +3073,12 @@ int main(void)
 	UT_RUN(test_startup_page_image_discards_bytes_after_page_cleanup_drift);
 	UT_RUN(test_startup_page_image_wait_has_no_cached_success_or_new_wal);
 	UT_RUN(test_startup_page_image_refusal_and_error_keep_original_cleanup_debt);
+	UT_RUN(test_startup_page_owner_uses_original_completed_operation_and_full_image);
+	UT_RUN(test_startup_page_owner_missing_pending_or_unsupported_target_has_no_proof);
+	UT_RUN(test_startup_page_owner_late_cleanup_drift_publishes_no_metadata_or_bytes);
+	UT_RUN(test_startup_page_owner_wait_rechecks_without_cached_rule_or_new_wal);
+	UT_RUN(test_startup_page_owner_false_or_error_preserves_all_original_custody);
+	UT_RUN(test_startup_page_owner_scratch_is_reserved_before_first_page);
 
 	UT_RUN(test_startup_unchanged_targets_keep_fds_and_full_readback_before_service);
 	UT_RUN(test_startup_unchanged_readback_refusal_or_error_keeps_original_cleanup);

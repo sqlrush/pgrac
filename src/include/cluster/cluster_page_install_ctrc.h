@@ -322,6 +322,38 @@ typedef struct RfPageCtrcReadbackImageV1 {
 	PGAlignedBlock image;
 } RfPageCtrcReadbackImageV1;
 
+/* Original Start's PAGE-owner result, produced only after its completed
+ * operation and SAME descriptors pass the protected whole-page readback.
+ * These are the frozen family/outcome/rule values, not caller-selectable
+ * policies. replay_source_index is the original complete ROOT/input index
+ * of the replay tail, not the new FPI's writer or record source. The
+ * target indexes describe this immutable PAGE plan, not persistent IDs.
+ * original operation supplies a SEPARATE full writer and actual FPI
+ * coordinates (all zero for unchanged pages). Coordinates alone are not a
+ * canonical WAL reference without raw bytes. No FD, pointer, PID or local
+ * clock is part of this value.
+ *
+ * This proves this PAGE owner's exact synced after-image only. Complete
+ * G_ref/G_owner, native/base/lifetime qualification, first/pin/history and
+ * companion discharge, and the original joint COMPLETE-to-OPEN remain due.
+ * It is not an independent completion certificate. Keep the original Start,
+ * work, full source set and custody live; revalidate them before graph use.
+ * Refusal clears every field except detail. */
+typedef struct RfPageCtrcOwnerProofV1 {
+	RfPageProofDetailV1 detail;
+	uint16 owner_family; /* frozen row 10: PAGE/VM/FSM/retained WAL */
+	uint16 outcome;      /* 1: APPLIED_AND_DURABLE for this exact PAGE */
+	uint16 rule;         /* 1: TYPED_EFFECT_DURABLE; 6: EXACT_ALREADY_APPLIED */
+	uint32 target_index, target_count;
+	uint32 replay_source_index, replay_source_count;
+	ClusterSpaceIdentity space;
+	BlockNumber blockno;
+	RfPageVersionV1 before;
+	ClusterWalWriterToken writer; /* actual recovery FPI writer; not replay source */
+	XLogRecPtr record_start, record_end;
+	PGAlignedBlock image;
+} RfPageCtrcOwnerProofV1;
+
 extern RfPageCtrcReadbackImageV1 rf_page_recovery_ctrc_replays_completed_image_v1(
 	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work,
 	const struct ClusterRecoveryCtrcReplaySetSourceV1 *source, RfPageCtrcAuthorityV1 *authority,

@@ -1980,13 +1980,14 @@ ClusterColdRecoveryCtrcPageAdvance(const struct ClusterRecoveryStartV1 *start,
 		/* Completed raw handles outlive each native step. Reserve the full
 		 * preparation peak for every fixed target as well, before PAGE;
 		 * the active step keeps its existing independent peak check. */
-		if (work->counts.subject_count > (MaxAllocSize - 2 * sizeof(PGAlignedBlock))
+		if (work->counts.subject_count > (MaxAllocSize - 2 * sizeof(PGAlignedBlock)
+				- sizeof(RfPageCtrcOwnerProofV1))
 				/ sizeof(ClusterColdTtSlotInputV1)) {
 			cluster_recovery_cold_page_plan_refuse(state, RF_PAGE_PROOF_DETAIL_CAPACITY);
 			return false;
 		}
 		projection_bytes = (Size)work->counts.subject_count * sizeof(ClusterColdTtSlotInputV1)
-			+ 2 * sizeof(PGAlignedBlock);
+			+ 2 * sizeof(PGAlignedBlock) + sizeof(RfPageCtrcOwnerProofV1);
 		if (budget <= bytes || projection_bytes >= budget - bytes || storage_bytes == 0
 			|| storage_bytes > (budget - bytes - projection_bytes) / count
 			|| budget - bytes - projection_bytes <= (Size)count * storage_bytes) {
@@ -2001,8 +2002,8 @@ ClusterColdRecoveryCtrcPageAdvance(const struct ClusterRecoveryStartV1 *start,
 		}
 		progress->budget = budget;
 		progress->allocation_bytes = bytes;
-		/* The final original-subject snapshot and both whole-page images
-		 * share this budget, reserved before the first PAGE/FPI as well. */
+		/* The final subject snapshot, readback/projector images and complete
+		 * owner-proof value share this budget before the first PAGE/FPI. */
 		progress->reserved_bytes = bytes + (Size)count * storage_bytes + projection_bytes;
 		progress->plan = state->ctrc_page_plan;
 		progress->sources = state->ctrc_page_sources;
@@ -2266,6 +2267,103 @@ ClusterColdRecoveryCtrcPageImage(const struct ClusterRecoveryStartV1 *start, uin
 			MemSet(&result.image, 0, sizeof(result.image));
 			if (result.detail != RF_PAGE_PROOF_DETAIL_WOULD_BLOCK)
 				cluster_recovery_cold_page_plan_refuse(state, result.detail);
+		}
+	}
+	PG_CATCH();
+	{
+		cluster_recovery_cold_page_plan_refuse(state, RF_PAGE_PROOF_DETAIL_INTERNAL);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return result;
+}
+
+/* The original protected reader executes the completion predicates; this
+ * adapter accepts no caller outcome, rule, image or operation copy. Capture
+ * only immutable plan/result metadata after that reader has dropped PAGE/
+ * proof and rechecked the entire original Start and retained raw FD vector.
+ * No callback, native read, allocation or shared mutation follows publication.
+ * This is the PAGE owner's contribution, not complete graph/retention proof. */
+RfPageCtrcOwnerProofV1
+ClusterColdRecoveryCtrcPageOwnerProof(const struct ClusterRecoveryStartV1 *start, uint32 index)
+{
+	RfPageCtrcOwnerProofV1 result = {0};
+	struct ClusterRecoveryStartV1 *state = cluster_recovery_cold_start;
+	const ClusterColdCtrcPageProgressV1 *entered;
+
+	result.detail = RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	if (start == NULL || start != state || !cluster_recovery_cold_ctrc_replays_actor()) return result;
+	entered = state->ctrc_page_progress;
+	if (entered == NULL || entered->pending || entered->next_target != entered->target_count
+		|| index >= entered->target_count || entered->completed[index].storage == NULL)
+		return result;
+	PG_TRY();
+	{
+		RfPageCtrcReadbackImageV1 readback = ClusterColdRecoveryCtrcPageImage(start, index);
+		ClusterColdCtrcPageProgressV1 *progress;
+		RfPageOnlineTargetViewV1 target;
+		ClusterRecoveryCensusPageV1 physical;
+		uint32 source_index;
+
+		result.detail = readback.detail;
+		if (readback.detail == RF_PAGE_PROOF_DETAIL_OK) {
+			/* PageImage's successful final current check is the last yielding
+			 * operation. Re-locate its saved objects before reading metadata. */
+			result.detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+			progress = start == cluster_recovery_cold_start ? state->ctrc_page_progress : NULL;
+			if (progress != NULL && !progress->pending
+				&& progress->next_target == progress->target_count && index < progress->target_count
+				&& progress->completed[index].storage != NULL
+				&& progress->plan == state->ctrc_page_plan && progress->sources == state->ctrc_page_sources
+				&& progress->source_count == state->ctrc_page_source_count
+				&& rf_page_online_plan_target_v1(state->ctrc_page_plan, index, &target)
+				&& !target.history_only && target.page_identity.forknum == MAIN_FORKNUM
+				&& cluster_recovery_cold_page_target(start, &target, &physical) && physical.heap
+				&& cluster_recovery_cold_page_tail(start, &target, &source_index)) {
+				const ClusterColdCtrcPageCompletedV1 *completed = &progress->completed[index];
+				const ClusterRecoveryCtrcReplaySetSourceV1 *source = &progress->sources[source_index];
+				uint16 rule = 0;
+
+				if (completed->result.phase == RF_PAGE_CTRC_STEP_FPI_DURABLE
+					&& completed->result.inserted.wal_flushed
+					&& completed->result.inserted.record_start < completed->result.inserted.record_end
+					&& memcmp(&completed->result.inserted.image.identity,
+						&physical.reservation.identity, sizeof(result.space)) == 0
+					&& completed->result.inserted.image.block_number == physical.blockno
+					&& memcmp(&completed->result.inserted.image.version.before,
+						&target.expected_result, sizeof(result.before)) == 0)
+					rule = 1; /* Original typed install/sync/exact after readback. */
+				else if (completed->result.phase == RF_PAGE_CTRC_STEP_UNCHANGED_SYNCED
+					&& completed->unchanged.ready && completed->unchanged.blockno == physical.blockno
+					&& memcmp(&completed->unchanged.space, &physical.reservation.identity,
+						sizeof(result.space)) == 0
+					&& memcmp(&completed->unchanged.before, &target.expected_result,
+						sizeof(result.before)) == 0)
+					rule = 6; /* Original exact already-applied gate and native sync. */
+				if (rule != 0 && source->scope == state->ctrc_observation_inputs
+					&& source->generation_count == state->ctrc_wal_source_count
+					&& source->generation_index < source->generation_count) {
+					result.owner_family = 10; result.outcome = 1; result.rule = rule;
+					result.target_index = index; result.target_count = progress->target_count;
+					result.replay_source_index = source->generation_index;
+					result.replay_source_count = source->generation_count;
+					result.space = physical.reservation.identity; result.blockno = physical.blockno;
+					result.before = target.expected_result;
+					if (rule == 1) {
+						result.writer = completed->result.inserted.window.owner.writer;
+						result.record_start = completed->result.inserted.record_start;
+						result.record_end = completed->result.inserted.record_end;
+					}
+					result.image = readback.image;
+					result.detail = RF_PAGE_PROOF_DETAIL_OK;
+				}
+			}
+		}
+		if (result.detail != RF_PAGE_PROOF_DETAIL_OK) {
+			RfPageProofDetailV1 detail = result.detail;
+			MemSet(&result, 0, sizeof(result)); result.detail = detail;
+			if (detail != RF_PAGE_PROOF_DETAIL_WOULD_BLOCK)
+				cluster_recovery_cold_page_plan_refuse(state, detail);
 		}
 	}
 	PG_CATCH();
@@ -2828,7 +2926,7 @@ cluster_recovery_cold_page_completed_recheck(const struct ClusterRecoveryStartV1
 			&& cluster_recovery_cold_page_projection_subjects(start, work, scope,
 				progress, subjects, &accepted, true)) {
 			for (;;) {
-				RfPageCtrcReadbackImageV1 observed;
+				RfPageCtrcOwnerProofV1 observed;
 				PGAlignedBlock projected;
 				RfPageOnlineTargetViewV1 target;
 
@@ -2841,7 +2939,7 @@ cluster_recovery_cold_page_completed_recheck(const struct ClusterRecoveryStartV1
 				/* No saved baseline qualifies history/non-heap duties. Their
 				 * independent graph/owner obligations remain unchanged. */
 				if (progress->completed[index].storage == NULL) { index++; continue; }
-				observed = ClusterColdRecoveryCtrcPageImage(start, index);
+				observed = ClusterColdRecoveryCtrcPageOwnerProof(start, index);
 				if (observed.detail == RF_PAGE_PROOF_DETAIL_WOULD_BLOCK) {
 					(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
 						100L, WAIT_EVENT_CLUSTER_THREAD_RECOVERY);
@@ -2850,6 +2948,9 @@ cluster_recovery_cold_page_completed_recheck(const struct ClusterRecoveryStartV1
 				/* PAGE/proof are already destroyed. Projection is a read-only
 				 * assertion of the final native result, never another write. */
 				if (observed.detail != RF_PAGE_PROOF_DETAIL_OK
+					|| observed.owner_family != 10 || observed.outcome != 1
+					|| (observed.rule != 1 && observed.rule != 6)
+					|| observed.target_index != index || observed.target_count != progress->target_count
 					|| cluster_ctrc_recovery_itl_page_image_v1(subjects, work->counts.subject_count,
 						observed.image.data, projected.data) != CLUSTER_CTRC_ITL_CLEANOUT_ALREADY_TERMINAL
 					|| memcmp(&observed.image, &projected, sizeof(projected)) != 0
