@@ -168,9 +168,16 @@ check_stack_depth(void)
 {}
 /* Dynamic rewrite classification has native SQL tests; this fixture covers
  * only the preceding raw utility routing and index entry points. */
+static bool native_alter_active;
+static void native_alter_classification_boundary(AlterTableStmt *stmt, const char *queryString);
+static void native_alter_lookup_boundary(const RangeVar *relation, LOCKMODE lockmode, uint32 flags,
+										 RangeVarGetRelidCallback callback, void *callback_arg);
+
 void
 CheckClusterSharedAlterTable(AlterTableStmt *stmt, const char *queryString)
 {
+	if (native_alter_active)
+		native_alter_classification_boundary(stmt, queryString);
 	(void)stmt;
 	(void)queryString;
 }
@@ -8194,6 +8201,8 @@ Oid
 RangeVarGetRelidExtended(const RangeVar *relation, LOCKMODE lockmode, uint32 flags,
 						 RangeVarGetRelidCallback callback, void *callback_arg)
 {
+	if (native_alter_active)
+		native_alter_lookup_boundary(relation, lockmode, flags, callback, callback_arg);
 	if (truncate_lookup_active) {
 		truncate_lookups++;
 		if (truncate_expect_binding
@@ -24122,10 +24131,421 @@ UT_TEST(test_native_drop_denials_preserve_existing_binding)
 	native_drop_active = false;
 }
 
+/* Execute the complete named lookup and the original ALTER recheck prefix.
+ * Both dependencies stop before query, lock or dynamic-classification work. */
+static const bool native_alter_binding_modes[8]
+	= { false, false, false, true, false, false, false, true };
+static struct {
+	AlterTableStmt statement;
+	RangeVar relation;
+	AlterTableCmd command, extra, dynamic;
+	ColumnDef column;
+	TypeName type_name;
+	Constraint constraint;
+	A_Const constant;
+	Integer number;
+	String column_name;
+	DefElem option;
+	ListCell command_cells[2], option_cell, constraint_cell, key_cell;
+	AlterTableUtilityContext context;
+	LOCKMODE lockmode;
+	unsigned route;
+} native_alter_case, native_alter_before;
+static List native_alter_commands, native_alter_options, native_alter_constraints,
+	native_alter_keys;
+static unsigned char native_alter_lists_before[4][sizeof(List)];
+static bool native_alter_expect_binding;
+static unsigned native_alter_calls, native_alter_unbound, native_alter_bad_call;
+
+static void
+native_alter_record_boundary(unsigned route)
+{
+	native_alter_calls++;
+	if (!native_alter_active || route != native_alter_case.route)
+		native_alter_bad_call++;
+	if (native_alter_expect_binding
+		&& (utility_binds != 1 || !TransactionIdIsValid(utility_top_xid)
+			|| utility_current_xid != utility_top_xid))
+		native_alter_unbound++;
+}
+
+static void
+native_alter_lookup_boundary(const RangeVar *relation, LOCKMODE lockmode, uint32 flags,
+							 RangeVarGetRelidCallback callback, void *callback_arg)
+{
+	native_alter_record_boundary(0);
+	if (relation != &native_alter_case.relation || lockmode != native_alter_case.lockmode
+		|| flags != (native_alter_case.statement.missing_ok ? RVR_MISSING_OK : 0)
+		|| callback != RangeVarCallbackForAlterRelation
+		|| callback_arg != &native_alter_case.statement)
+		native_alter_bad_call++;
+	siglongjmp(boundary, 2); /* No lookup, lock or callback success is supplied. */
+}
+
+static void
+native_alter_classification_boundary(AlterTableStmt *stmt, const char *queryString)
+{
+	native_alter_record_boundary(1);
+	if (stmt != &native_alter_case.statement
+		|| queryString != native_alter_case.context.queryString)
+		native_alter_bad_call++;
+	siglongjmp(boundary, 2); /* No dynamic-classification success is supplied. */
+}
+#include "test_cluster_fresh_alter_lookup.inc"
+#include "test_cluster_fresh_alter_apply.inc"
+
+static void
+snapshot_native_alter(void)
+{
+	memcpy(&native_alter_before, &native_alter_case, sizeof(native_alter_case));
+	memcpy(native_alter_lists_before[0], &native_alter_commands, sizeof(List));
+	memcpy(native_alter_lists_before[1], &native_alter_options, sizeof(List));
+	memcpy(native_alter_lists_before[2], &native_alter_constraints, sizeof(List));
+	memcpy(native_alter_lists_before[3], &native_alter_keys, sizeof(List));
+}
+
+static void
+reset_native_alter(bool expect_binding, unsigned form, unsigned route)
+{
+	static const AlterTableType kinds[8]
+		= { AT_SetStatistics,  AT_ColumnDefault,	  AT_DropColumn, AT_AddConstraint,
+			AT_DropConstraint, AT_ValidateConstraint, AT_EnableTrig, AT_SetRelOptions };
+	unsigned kind = form / 4, shape = form % 4;
+
+	reset_create_preflight();
+	native_alter_active = false;
+	native_alter_expect_binding = expect_binding;
+	native_alter_calls = native_alter_unbound = native_alter_bad_call = 0;
+	utility_in_transaction = (shape & 1) != 0;
+	cluster_interconnect_tier = shape & 2 ? CLUSTER_IC_TIER_2 : CLUSTER_IC_TIER_1;
+	memset(&native_alter_case, 0, sizeof(native_alter_case));
+	native_alter_case.relation = (RangeVar){ .type = T_RangeVar,
+											 .schemaname = "public",
+											 .relname = "native_alter_target",
+											 .inh = (shape & 2) != 0,
+											 .relpersistence = RELPERSISTENCE_PERMANENT,
+											 .location = -1 };
+	native_alter_case.type_name
+		= (TypeName){ .type = T_TypeName, .typeOid = INT4OID, .typemod = -1, .location = -1 };
+	native_alter_case.column = (ColumnDef){ .type = T_ColumnDef,
+											.colname = "new_payload",
+											.typeName = &native_alter_case.type_name,
+											.location = -1 };
+	native_alter_case.constant = (A_Const){ .type = T_A_Const,
+											.val.boolval = { .type = T_Boolean, .boolval = true },
+											.location = -1 };
+	native_alter_case.number = (Integer){ .type = T_Integer, .ival = 90 };
+	native_alter_case.column_name = (String){ .type = T_String, .sval = "payload" };
+	native_alter_case.constraint = (Constraint){ .type = T_Constraint,
+												 .contype = CONSTR_CHECK,
+												 .conname = "native_alter_check",
+												 .raw_expr = (Node *)&native_alter_case.constant,
+												 .location = -1 };
+	native_alter_case.option = (DefElem){ .type = T_DefElem,
+										  .defname = "fillfactor",
+										  .arg = (Node *)&native_alter_case.number,
+										  .location = -1 };
+	one_element(&native_alter_options, &native_alter_case.option_cell, &native_alter_case.option);
+	one_element(&native_alter_constraints, &native_alter_case.constraint_cell,
+				&native_alter_case.constraint);
+	one_element(&native_alter_keys, &native_alter_case.key_cell, &native_alter_case.column_name);
+	native_alter_case.command
+		= (AlterTableCmd){ .type = T_AlterTableCmd,
+						   .subtype = kinds[kind],
+						   .name = kind == 3				? NULL
+								   : kind == 4 || kind == 5 ? "native_alter_check"
+															: "payload",
+						   .behavior = shape & 1 ? DROP_CASCADE : DROP_RESTRICT,
+						   .missing_ok = (shape & 2) != 0 };
+	if (kind == 0)
+		native_alter_case.command.def = (Node *)&native_alter_case.number;
+	else if (kind == 1)
+		native_alter_case.command.def = (Node *)&native_alter_case.constant;
+	else if (kind == 3)
+		native_alter_case.command.def = (Node *)&native_alter_case.constraint;
+	else if (kind == 7)
+		native_alter_case.command.def = (Node *)&native_alter_options;
+	native_alter_case.extra = (AlterTableCmd){ .type = T_AlterTableCmd,
+											   .subtype = AT_SetStatistics,
+											   .name = "payload",
+											   .def = (Node *)&native_alter_case.number };
+	native_alter_case.command_cells[0].ptr_value = &native_alter_case.command;
+	native_alter_case.command_cells[1].ptr_value = &native_alter_case.extra;
+	native_alter_commands = (List){ .type = T_List,
+									.length = shape & 1 ? 2 : 1,
+									.max_length = 2,
+									.elements = native_alter_case.command_cells };
+	native_alter_case.statement = (AlterTableStmt){ .type = T_AlterTableStmt,
+													.relation = &native_alter_case.relation,
+													.cmds = &native_alter_commands,
+													.objtype = OBJECT_TABLE,
+													.missing_ok = (shape & 2) != 0 };
+	native_alter_case.context
+		= (AlterTableUtilityContext){ .queryString = "ALTER TABLE native_alter_target",
+									  .relid = 701 };
+	native_alter_case.lockmode
+		= kind == 0 && !(shape & 2) ? ShareUpdateExclusiveLock : AccessExclusiveLock;
+	native_alter_case.route = route;
+	snapshot_native_alter();
+}
+
+static void
+native_alter_entry(void)
+{
+	native_alter_active = true;
+	if (native_alter_case.route == 0)
+		(void)AlterTableLookupRelation(&native_alter_case.statement, native_alter_case.lockmode);
+	else
+		AlterTable(&native_alter_case.statement, native_alter_case.lockmode,
+				   &native_alter_case.context);
+}
+
+static void
+assert_native_alter_result(int caught, int error, unsigned calls, unsigned xids, unsigned prepares,
+						   unsigned binds)
+{
+	UT_ASSERT_EQ(caught, error ? 1 : 2);
+	UT_ASSERT_EQ(error_code, error);
+	UT_ASSERT_EQ(native_alter_calls, calls);
+	UT_ASSERT_EQ(native_alter_unbound + native_alter_bad_call, 0);
+	UT_ASSERT_EQ(utility_xids, xids);
+	UT_ASSERT_EQ(utility_prepares, prepares);
+	UT_ASSERT_EQ(utility_binds, binds);
+	UT_ASSERT_EQ(memcmp(&native_alter_case, &native_alter_before, sizeof(native_alter_case)), 0);
+	UT_ASSERT_EQ(memcmp(&native_alter_commands, native_alter_lists_before[0], sizeof(List)), 0);
+	UT_ASSERT_EQ(memcmp(&native_alter_options, native_alter_lists_before[1], sizeof(List)), 0);
+	UT_ASSERT_EQ(memcmp(&native_alter_constraints, native_alter_lists_before[2], sizeof(List)), 0);
+	UT_ASSERT_EQ(memcmp(&native_alter_keys, native_alter_lists_before[3], sizeof(List)), 0);
+}
+
+UT_TEST(test_native_alter_named_entries_bind_before_their_first_dependency)
+{
+	for (unsigned route = 0; route < 2; route++)
+		for (unsigned form = 0; form < 32; form++)
+			for (unsigned mode = 0; mode < 8; mode++) {
+				bool binds = native_alter_binding_modes[mode];
+				reset_native_alter(binds, form, route);
+				set_native_operator_mode(mode);
+				for (unsigned repeat = 0; repeat < 2; repeat++) {
+					int caught = sigsetjmp(boundary, 1);
+					if (!caught)
+						native_alter_entry();
+					assert_native_alter_result(caught, 0, repeat + 1, binds, binds ? repeat + 1 : 0,
+											   binds);
+					UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+				}
+			}
+	native_alter_active = utility_in_transaction = false;
+	cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+}
+
+UT_TEST(test_native_alter_publication_child_and_top_refuse_before_dependency)
+{
+	for (unsigned route = 0; route < 2; route++)
+		for (unsigned form = 0; form < 32; form++)
+			for (unsigned failure = 0; failure < 5; failure++) {
+				bool allocated = failure == 0 || failure == 2;
+				int caught;
+				reset_native_alter(true, form, route);
+				if (failure == 0)
+					utility_bind_ok = false;
+				else if (failure == 1 || failure == 2) {
+					if (failure == 2)
+						create_sql_entry((Node *)&native_alter_case.statement);
+					utility_in_child = true;
+				} else {
+					utility_current_xid = 401;
+					utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+				}
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_alter_entry();
+				assert_native_alter_result(caught,
+										   failure == 0	 ? ERRCODE_DATA_CORRUPTED
+										   : failure < 3 ? ERRCODE_FEATURE_NOT_SUPPORTED
+														 : ERRCODE_INTERNAL_ERROR,
+										   0, allocated, allocated, failure == 2);
+				UT_ASSERT_STR_EQ(
+					error_message,
+					failure == 0
+						? "canonical ACTIVE publication failed before shared catalog alteration"
+					: failure < 3 ? "shared catalog alteration does not support subtransactions"
+								  : "shared catalog top-level transaction identity mismatch");
+				UT_ASSERT_EQ(utility_top_xid,
+							 allocated || failure == 3 ? 400 : InvalidTransactionId);
+			}
+	native_alter_active = utility_in_transaction = false;
+	cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+}
+
+UT_TEST(test_native_alter_context_guards_preserve_other_modes)
+{
+	for (unsigned route = 0; route < 2; route++)
+		for (unsigned form = 0; form < 32; form++)
+			for (unsigned mode = 0; mode < 8; mode++)
+				for (unsigned guard = 0; guard < 3; guard++) {
+					bool binds = native_alter_binding_modes[mode];
+					int caught;
+					reset_native_alter(binds, form, route);
+					set_native_operator_mode(mode);
+					XactReadOnly = guard == 0;
+					utility_parallel = guard == 1;
+					utility_recovery = guard == 2;
+					caught = sigsetjmp(boundary, 1);
+					if (!caught)
+						native_alter_entry();
+					assert_native_alter_result(caught,
+											   !binds		? 0
+											   : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+															: ERRCODE_READ_ONLY_SQL_TRANSACTION,
+											   !binds, 0, 0, 0);
+				}
+	native_alter_active = utility_in_transaction = false;
+	cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+}
+
+UT_TEST(test_native_alter_reuses_utility_binding_and_keeps_context_denials)
+{
+	for (unsigned route = 0; route < 2; route++)
+		for (unsigned form = 0; form < 32; form++)
+			for (unsigned mode = 0; mode < 8; mode++)
+				for (unsigned guard = 0; guard < 4; guard++) {
+					bool binds = native_alter_binding_modes[mode], refuses = binds && guard;
+					int caught;
+					reset_native_alter(true, form, route);
+					create_sql_entry((Node *)&native_alter_case.statement);
+					set_native_operator_mode(mode);
+					XactReadOnly = guard == 1;
+					utility_parallel = guard == 2;
+					utility_recovery = guard == 3;
+					caught = sigsetjmp(boundary, 1);
+					if (!caught)
+						native_alter_entry();
+					assert_native_alter_result(caught,
+											   !refuses		? 0
+											   : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+															: ERRCODE_READ_ONLY_SQL_TRANSACTION,
+											   !refuses, 1, binds && !guard ? 2 : 1, 1);
+					UT_ASSERT_EQ(utility_top_xid, 400);
+				}
+	native_alter_active = utility_in_transaction = false;
+	cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+}
+
+UT_TEST(test_native_alter_four_dynamic_candidates_keep_original_responsibility)
+{
+	static const AlterTableType candidates[4]
+		= { AT_AddColumn, AT_AlterColumnType, AT_SetAccessMethod, AT_SetLogged };
+	for (unsigned route = 0; route < 2; route++)
+		for (unsigned kind = 0; kind < 4; kind++)
+			for (unsigned position = 0; position < 3; position++)
+				for (unsigned mode = 0; mode < 8; mode++)
+					for (unsigned warm = 0; warm < 2; warm++) {
+						int caught;
+						reset_native_alter(false, 0, route);
+						if (warm)
+							create_sql_entry((Node *)&native_alter_case.statement);
+						native_alter_case.dynamic
+							= (AlterTableCmd){ .type = T_AlterTableCmd,
+											   .subtype = candidates[kind],
+											   .name = kind == 2 ? "heap" : "payload",
+											   .def = kind < 2 ? (Node *)&native_alter_case.column
+															   : NULL };
+						native_alter_case.command_cells[position == 2].ptr_value
+							= &native_alter_case.dynamic;
+						if (position == 1)
+							native_alter_case.command_cells[1].ptr_value
+								= &native_alter_case.command;
+						native_alter_commands.length = position ? 2 : 1;
+						snapshot_native_alter();
+						set_native_operator_mode(mode);
+						XactReadOnly = utility_parallel = utility_recovery = utility_in_child
+							= true;
+						utility_bind_ok = false;
+						caught = sigsetjmp(boundary, 1);
+						if (!caught)
+							native_alter_entry();
+						assert_native_alter_result(caught, 0, 1, warm, warm, warm);
+						UT_ASSERT_EQ(utility_top_xid, warm ? 400 : InvalidTransactionId);
+					}
+	native_alter_active = utility_in_transaction = false;
+	cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+}
+
+static void
+check_native_alter_denial(unsigned route, unsigned kind, unsigned mode, bool warm)
+{
+	static const AlterTableType denied[7] = { AT_SetUnLogged,
+											  AT_SetTableSpace,
+											  AT_AddInherit,
+											  AT_DropInherit,
+											  AT_AttachPartition,
+											  AT_DetachPartition,
+											  AT_DetachPartitionFinalize };
+	static const char *const messages[5]
+		= { "materialized views is not supported in shared mode",
+			"custom types is not supported in shared mode",
+			"UNLOGGED tables is not supported in shared mode",
+			"ALTER TABLE SET TABLESPACE is not supported in shared mode",
+			"partition and inheritance attachment or detachment is not supported in shared mode" };
+	bool refuses = native_alter_binding_modes[mode];
+	int caught;
+	reset_native_alter(false, 0, route);
+	if (warm)
+		create_sql_entry((Node *)&native_alter_case.statement);
+	if (kind < 2)
+		native_alter_case.statement.objtype = kind == 0 ? OBJECT_MATVIEW : OBJECT_TYPE;
+	else if (kind < 9)
+		native_alter_case.command.subtype = denied[kind - 2];
+	else {
+		native_alter_case.constraint.contype = CONSTR_UNIQUE;
+		native_alter_case.constraint.access_method = "hash";
+		native_alter_case.constraint.keys = &native_alter_keys;
+		native_alter_case.command.subtype = kind == 9 ? AT_AddConstraint : AT_AddColumn;
+		native_alter_case.command.def
+			= kind == 9 ? (Node *)&native_alter_case.constraint : (Node *)&native_alter_case.column;
+		native_alter_case.column.constraints = &native_alter_constraints;
+	}
+	snapshot_native_alter();
+	set_native_operator_mode(mode);
+	XactReadOnly = utility_parallel = utility_recovery = utility_in_child = true;
+	utility_bind_ok = false;
+	caught = sigsetjmp(boundary, 1);
+	if (!caught)
+		native_alter_entry();
+	assert_native_alter_result(caught, refuses ? ERRCODE_FEATURE_NOT_SUPPORTED : 0, !refuses, warm,
+							   warm, warm);
+	if (refuses)
+		UT_ASSERT_STR_EQ(error_message, kind >= 9 ? "shared mode supports only btree indexes"
+												  : messages[kind < 4 ? kind : 4]);
+	UT_ASSERT_EQ(utility_top_xid, warm ? 400 : InvalidTransactionId);
+}
+
+UT_TEST(test_native_alter_denials_precede_context_child_and_allocation)
+{
+	for (unsigned route = 0; route < 2; route++)
+		for (unsigned kind = 0; kind < 11; kind++)
+			for (unsigned mode = 0; mode < 8; mode++)
+				check_native_alter_denial(route, kind, mode, false);
+	native_alter_active = utility_in_transaction = false;
+	cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+}
+
+UT_TEST(test_native_alter_denials_preserve_existing_binding)
+{
+	for (unsigned route = 0; route < 2; route++)
+		for (unsigned kind = 0; kind < 11; kind++)
+			for (unsigned mode = 0; mode < 8; mode++)
+				check_native_alter_denial(route, kind, mode, true);
+	native_alter_active = utility_in_transaction = false;
+	cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(388);
+	UT_PLAN(395);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -24517,6 +24937,13 @@ main(void)
 	UT_RUN(test_native_drop_other_scopes_keep_original_internal_responsibility);
 	UT_RUN(test_native_drop_denials_precede_context_child_and_allocation);
 	UT_RUN(test_native_drop_denials_preserve_existing_binding);
+	UT_RUN(test_native_alter_named_entries_bind_before_their_first_dependency);
+	UT_RUN(test_native_alter_publication_child_and_top_refuse_before_dependency);
+	UT_RUN(test_native_alter_context_guards_preserve_other_modes);
+	UT_RUN(test_native_alter_reuses_utility_binding_and_keeps_context_denials);
+	UT_RUN(test_native_alter_four_dynamic_candidates_keep_original_responsibility);
+	UT_RUN(test_native_alter_denials_precede_context_child_and_allocation);
+	UT_RUN(test_native_alter_denials_preserve_existing_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

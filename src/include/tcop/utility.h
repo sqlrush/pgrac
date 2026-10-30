@@ -111,6 +111,7 @@ extern LogStmtLevel GetCommandLogLevel(Node *parsetree);
 /* Share the original utility support checks with native catalog commands. */
 extern void CheckClusterSharedUtilitySupport(Node *statement, bool isTopLevel);
 extern void PreflightClusterSharedCatalogDrop(Node *statement, bool isTopLevel);
+extern void PreflightClusterSharedCatalogAlterTable(AlterTableStmt *stmt);
 #endif
 
 extern bool CommandIsReadOnly(PlannedStmt *pstmt);

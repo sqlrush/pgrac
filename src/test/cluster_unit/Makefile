@@ -886,6 +886,18 @@ test_cluster_fresh_boolean.inc: $(top_srcdir)/src/backend/commands/define.c Make
 	     /^errorConflictingDefElem\(/ { print "void"; emit=1; count++ } \
 	     emit { print } /^}/ { emit=0 } END { if (count != 2 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
+test_cluster_fresh_alter_lookup.inc: $(top_srcdir)/src/backend/commands/tablecmds.c Makefile
+	awk '/^AlterTableLookupRelation\(/ { print "Oid"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_alter_apply.inc: $(top_srcdir)/src/backend/commands/tablecmds.c Makefile
+	awk '/^AlterTable\(/ { print "void"; emit=1; count++ } \
+	     emit && /Caller is required to provide an adequate lock/ \
+	     { print "return; }"; emit=0; cuts++ } \
+	     emit { print } /^}/ { if (emit) bad++; emit=0 } \
+	     END { if (count != 1 || cuts != 1 || emit || bad) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
 test_cluster_fresh_drop_relations.inc: $(top_srcdir)/src/backend/commands/tablecmds.c Makefile
 	awk '/^RemoveRelations\(/ { print "void"; emit=1; count++ } \
 	     emit { print } /^}/ { emit=0 } \
@@ -934,13 +946,14 @@ test_cluster_shared_utility.inc: $(top_srcdir)/src/backend/tcop/utility.c Makefi
 	awk '/^(static )?void$$/ { declaration=$$0 } \
 	     /^CheckClusterSharedUtilitySupport\(/ { print declaration; emit=1; count++ } \
 	     /^ClassifyUtilityCommandAsReadOnly\(/ { print "static int"; emit=1; classify++ } \
+	     /^PreflightClusterSharedCatalogAlterTable\(/ { print "void"; emit=1; native_alter++ } \
 	     /^PreflightClusterSharedCatalogDrop\(/ { print "void"; emit=1; native_drop++ } \
 	     /^PreflightClusterSharedCatalog(Create|Write)\(/ \
 	     { print "static void"; emit=1; preflight++ } \
 	     /^PreventCommand(IfReadOnly|IfParallelMode|DuringRecovery)\(/ \
 	     { print "void"; emit=1; guards++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (count != 1 || classify != 1 || preflight != 1 || guards != 3 || native_drop > 1 || emit) exit 1 }' $< > $@.tmp
+	     END { if (count != 1 || classify != 1 || preflight != 1 || guards != 3 || native_drop > 1 || native_alter > 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 test_cluster_fresh_catalog_index.inc: $(top_srcdir)/src/backend/catalog/index.c Makefile
 	awk '/^index_create\(/ { print "Oid"; emit=1; count++ } \
@@ -1602,7 +1615,7 @@ test_cluster_fresh_schema_dispatch.inc: $(top_srcdir)/src/backend/commands/alter
 	mv $@.tmp $@
 test_cluster_fresh_scope: test_cluster_fresh_scope.c unit_test.h \
 		test_cluster_fresh_control.inc test_cluster_fresh_startup.inc test_cluster_fresh_read.inc \
-		test_cluster_fresh_boolean.inc test_cluster_fresh_drop_relations.inc test_cluster_fresh_drop_objects.inc test_cluster_fresh_drop_owned.inc test_cluster_fresh_index_create.inc test_cluster_fresh_index.inc test_cluster_fresh_utility.inc \
+		test_cluster_fresh_boolean.inc test_cluster_fresh_alter_lookup.inc test_cluster_fresh_alter_apply.inc test_cluster_fresh_drop_relations.inc test_cluster_fresh_drop_objects.inc test_cluster_fresh_drop_owned.inc test_cluster_fresh_index_create.inc test_cluster_fresh_index.inc test_cluster_fresh_utility.inc \
 		test_cluster_fresh_catalog_index.inc test_cluster_shared_utility.inc \
 		test_cluster_create_utility_entry.inc test_cluster_fresh_import.inc \
 		test_cluster_fresh_import_filter.inc test_cluster_fresh_extension.inc \
@@ -6919,7 +6932,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_space_xmax_hint.inc
 	rm -f test_cluster_page_dependency_base.o
 	rm -f test_cluster_fresh_control.inc test_cluster_fresh_startup.inc test_cluster_fresh_read.inc \
-		test_cluster_fresh_boolean.inc test_cluster_fresh_drop_relations.inc test_cluster_fresh_drop_objects.inc test_cluster_fresh_drop_owned.inc test_cluster_fresh_index_create.inc test_cluster_fresh_index.inc test_cluster_fresh_utility.inc \
+		test_cluster_fresh_boolean.inc test_cluster_fresh_alter_lookup.inc test_cluster_fresh_alter_apply.inc test_cluster_fresh_drop_relations.inc test_cluster_fresh_drop_objects.inc test_cluster_fresh_drop_owned.inc test_cluster_fresh_index_create.inc test_cluster_fresh_index.inc test_cluster_fresh_utility.inc \
 		test_cluster_fresh_catalog_index.inc test_cluster_shared_utility.inc \
 		test_cluster_fresh_schema_create.inc test_cluster_fresh_schema.inc test_cluster_fresh_comment.inc test_cluster_fresh_seclabel.inc \
 		test_cluster_fresh_policy.inc test_cluster_fresh_conversion.inc test_cluster_fresh_collation.inc \

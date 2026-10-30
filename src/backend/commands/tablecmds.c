@@ -4484,6 +4484,10 @@ CheckAlterTableIsSafe(Relation rel)
 Oid
 AlterTableLookupRelation(AlterTableStmt *stmt, LOCKMODE lockmode)
 {
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedCatalogAlterTable(stmt);
+#endif
+
 	return RangeVarGetRelidExtended(stmt->relation, lockmode,
 									stmt->missing_ok ? RVR_MISSING_OK : 0,
 									RangeVarCallbackForAlterRelation,
@@ -4737,6 +4741,8 @@ AlterTable(AlterTableStmt *stmt, LOCKMODE lockmode,
 	Relation	rel;
 
 #ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedCatalogAlterTable(stmt);
+
 	/* PGRAC: ddl_command_start has run since the utility preflight.  It may
 	 * change coercion context (notably TimeZone) even though the relation is
 	 * locked.  Recheck before preparing any catalog or sequence commands. */

@@ -444,6 +444,29 @@ PreflightClusterSharedCatalogDrop(Node *statement, bool isTopLevel)
 	PreflightClusterSharedCatalogWrite(statement, isTopLevel);
 }
 
+/* Reuse early binding only for commands outside the original rewrite precheck. */
+void
+PreflightClusterSharedCatalogAlterTable(AlterTableStmt *stmt)
+{
+	ListCell *lc;
+
+	if (!cluster_shared_catalog || !cluster_storage_mode_enabled())
+		return;
+	CheckClusterSharedUtilitySupport((Node *)stmt, false);
+	CheckClusterIndexSupport((Node *)stmt);
+	foreach (lc, stmt->cmds) {
+		AlterTableCmd *cmd = (AlterTableCmd *)lfirst(lc);
+
+		if (cmd->subtype == AT_AddColumn || cmd->subtype == AT_AlterColumnType
+			|| cmd->subtype == AT_SetAccessMethod || cmd->subtype == AT_SetLogged)
+			return;
+	}
+	PreventCommandIfReadOnly("ALTER TABLE");
+	PreventCommandIfParallelMode("ALTER TABLE");
+	PreventCommandDuringRecovery("ALTER TABLE");
+	PreflightClusterSharedCatalogWrite((Node *)stmt, false);
+}
+
 #endif
 
 /* local function declarations */
