@@ -2078,6 +2078,15 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_s_source_drain_s
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_s_source_publish_exact(
 	const ResourceXDecodedFrame *block, int32 authenticated_master_node, int32 buffer_id,
 	const struct ClusterPcmOwnSnapshot *prepared, const struct ClusterPcmOwnSnapshot *finished);
+/* Original S/X->N carrier handoff. Snapshot returns APPLIED while its exact
+ * native fence is owned, DUPLICATE after the independent receipt is quiet.
+ * Refusals preserve outputs. Completion owns no PI/DATA retirement proof. */
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_s_source_handoff_snapshot_exact(
+	const ResourceXDecodedFrame *block, int32 authenticated_master_node, int32 *buffer_id,
+	struct ClusterPcmOwnSnapshot *completed);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_s_source_handoff_exact(
+	const ResourceXDecodedFrame *block, int32 authenticated_master_node, int32 buffer_id,
+	const struct ClusterPcmOwnSnapshot *pending, const struct ClusterPcmOwnSnapshot *completed);
 /* Process-local copy only, with no owned pin or grant. All outputs remain
  * unchanged on refusal. The source worker must revalidate the live native
  * descriptor before finish, then publish the same retained reservation. */

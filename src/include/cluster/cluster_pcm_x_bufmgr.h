@@ -1059,6 +1059,10 @@ extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_finish_revoke_retain(
 	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_revoking, XLogRecPtr expected_lsn,
 	ClusterPcmOwnSnapshot *out_retained, ClusterPcmOwnFinishRefusal *out_refusal,
 	const ResourceXSourceWalRetainedV1 *retained_wal);
+/* Full original native tuple only. Refusals preserve the output, PI bytes
+ * and all retention; exact post-state replay does not bump generation. */
+extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_release_pi_carrier_exact(int32 buffer_id,
+	const ClusterPcmOwnSnapshot *pending, ClusterPcmOwnSnapshot *completed);
 extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_release_retained_fence_preserve_pi(
 	const BufferTag *tag, uint64 source_generation, bool *release_applied_out);
 extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_release_retained_image(const BufferTag *tag,

@@ -24972,6 +24972,92 @@ cluster_bufmgr_pcm_own_finish_s_holder_revoke(
 		InvalidXLogRecPtr, out_retained, out_refusal, NULL, true);
 }
 
+/* The original full-A immutable carrier already owns the PI bytes/WAL. Only
+ * its caller may turn this exact N+PI fence into an independent quiet receipt.
+ * This is neither PI retirement nor authority for a replacement descriptor.
+ * Author: SqlRush <sqlrush@gmail.com> */
+ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_release_pi_carrier_exact(int32 buffer_id,
+	const ClusterPcmOwnSnapshot *pending, ClusterPcmOwnSnapshot *completed)
+{
+	ClusterPcmOwnSnapshot live, comparable, expected;
+	ClusterPcmOwnResult result;
+	BufferDesc *buf;
+	BufferTag tag;
+	LWLock *partition, *content;
+	uint32 hash, state;
+	int mapped_id;
+	volatile bool content_held = false;
+
+	if (completed == NULL || pending == NULL || buffer_id < 0
+		|| pending->generation == 0 || pending->generation == UINT64_MAX
+		|| pending->reservation_token == 0 || pending->reservation_token == UINT64_MAX
+		|| pending->flags != PCM_OWN_FLAG_REVOKING
+		|| pending->pcm_state != PCM_STATE_N || pending->buffer_type != BUF_TYPE_PI
+		|| pending->writer_activation_token != 0 || pending->resource_x_activation_generation != 0
+		|| (pending->semantic_buf_state & (BM_VALID | BM_DIRTY | BM_JUST_DIRTIED
+			| BM_CHECKPOINT_NEEDED | BM_IO_IN_PROGRESS | BM_IO_ERROR)) != BM_VALID)
+		return CLUSTER_PCM_OWN_INVALID;
+	if (ClusterPcmOwnArray == NULL) return CLUSTER_PCM_OWN_NOT_READY;
+	tag = pending->tag;
+	hash = BufTableHashCode(&tag); partition = BufMappingPartitionLock(hash);
+	LWLockAcquire(partition, LW_SHARED);
+	mapped_id = BufTableLookup(&tag, hash);
+	if (mapped_id != buffer_id) {
+		LWLockRelease(partition); return CLUSTER_PCM_OWN_STALE;
+	}
+	buf = GetBufferDescriptor(mapped_id);
+	state = LockBufHdr(buf);
+	cluster_pcm_own_snapshot_post_state_locked(buf, state, &live);
+	comparable = live;
+	if (comparable.flags == 0) comparable.flags = PCM_OWN_FLAG_REVOKING;
+	comparable.semantic_buf_state &= ~BM_IO_IN_PROGRESS;
+	if (!cluster_pcm_own_snapshot_equal_exact(&comparable, pending)) {
+		UnlockBufHdr(buf, state); LWLockRelease(partition);
+		return CLUSTER_PCM_OWN_STALE;
+	}
+	/* A raw pin closes retag ABA before dropping mapping authority. */
+	cluster_bufmgr_pin_for_gcs_locked(buf, state);
+	LWLockRelease(partition);
+	content = BufferDescriptorGetContentLock(buf);
+	PG_TRY();
+	{
+		if (!LWLockConditionalAcquire(content, LW_EXCLUSIVE)) result = CLUSTER_PCM_OWN_BUSY;
+		else {
+			content_held = true;
+			state = LockBufHdr(buf);
+			cluster_pcm_own_snapshot_post_state_locked(buf, state, &live);
+			comparable = live;
+			if (comparable.flags == 0) comparable.flags = PCM_OWN_FLAG_REVOKING;
+			comparable.semantic_buf_state &= ~BM_IO_IN_PROGRESS;
+			if (!cluster_pcm_own_snapshot_equal_exact(&comparable, pending)) result = CLUSTER_PCM_OWN_STALE;
+			else if ((state & BM_IO_IN_PROGRESS) != 0) result = CLUSTER_PCM_OWN_BUSY;
+			else {
+				result = live.flags == 0 ? CLUSTER_PCM_OWN_OK
+					: cluster_pcm_own_revoke_retain_release_exact(buffer_id, pending->generation,
+						pending->reservation_token);
+				if (result == CLUSTER_PCM_OWN_OK) {
+					cluster_pcm_own_snapshot_post_state_locked(buf, state, &live);
+					expected = *pending; expected.flags = 0;
+					if (!cluster_pcm_own_snapshot_equal_exact(&live, &expected)) result = CLUSTER_PCM_OWN_CORRUPT;
+					else *completed = live;
+				}
+			}
+			UnlockBufHdr(buf, state);
+			LWLockRelease(content); content_held = false;
+		}
+	}
+	PG_CATCH();
+	{
+		if (content_held) LWLockRelease(content);
+		cluster_bufmgr_unpin_for_gcs(buf);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	cluster_bufmgr_unpin_for_gcs(buf);
+	return result;
+}
+
 /* SourceSettlementV2 proves only that the exact immutable transfer carrier no
  * longer needs its REVOKING fence.  It is not durable-current coverage and
  * therefore must preserve the established N+PI/BM_VALID recovery image even

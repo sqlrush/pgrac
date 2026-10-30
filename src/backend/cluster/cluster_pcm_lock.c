@@ -25832,22 +25832,32 @@ pcm_resource_x_pi_carrier_decode_locked(const struct GrdEntry *entry,
 		|| state->holder_status.valid != RESOURCE_X_HOLDER_PAIR_PUBLISHED
 		|| !pcm_resource_x_s_source_body_valid_inner(entry, state, &image)
 		|| image.common.semantic_crc32c != carrier->image_crc
-		|| image.common.target_mode != PCM_STATE_S
+		|| (image.common.target_mode != PCM_STATE_S && image.common.target_mode != PCM_STATE_X)
 		|| (state->holder_acquire_s_native.pcm_state != PCM_STATE_S
 			&& state->holder_acquire_s_native.pcm_state != PCM_STATE_X)
-		|| (carrier->pi_revision == 0 && (carrier->pi_refs
-			|| state->holder_acquire_s_native.pcm_state == PCM_STATE_S))
+		|| (carrier->pi_revision == 0 && carrier->pi_refs)
 		|| (!carrier->transport_refs && state->holder_image_intent.state != RESOURCE_X_INTENT_SLOT_EMPTY))
 		return false;
 	expected = state->holder_acquire_s_native;
-	if (expected.pcm_state == PCM_STATE_X) {
+	if (image.common.target_mode == PCM_STATE_X) {
+		/* Original S/X->N native handoff: the receipt, never a later
+		 * descriptor, records whether this exact fence is still owned. */
+		if (carrier->completed.flags != 0 && carrier->completed.flags != PCM_OWN_FLAG_REVOKING)
+			return false;
 		expected.generation++;
-		expected.pcm_state = PCM_STATE_S;
-		expected.buffer_type = BUF_TYPE_SCUR;
+		expected.pcm_state = PCM_STATE_N;
+		expected.buffer_type = BUF_TYPE_PI;
+		expected.flags = carrier->completed.flags;
+	} else {
+		if (expected.pcm_state == PCM_STATE_X) {
+			expected.generation++;
+			expected.pcm_state = PCM_STATE_S;
+			expected.buffer_type = BUF_TYPE_SCUR;
+		}
+		expected.flags = 0;
+		expected.semantic_buf_state |= carrier->completed.semantic_buf_state
+			& (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED);
 	}
-	expected.flags = 0;
-	expected.semantic_buf_state |= carrier->completed.semantic_buf_state
-		& (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED);
 	if (!cluster_pcm_own_snapshot_equal_exact(&expected, &carrier->completed))
 		return false;
 	if (!carrier->pi_refs)
@@ -25886,16 +25896,19 @@ pcm_resource_x_pi_carrier_prepare_locked(struct GrdEntry *entry,
 	if (!pcm_local_pi_snapshot_locked(entry, &local)) return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	/* Even after DATA has retired PI, X->S needs its exact native receipt
 	 * until the original transport is quiet. Clean compatible S has no
-	 * separate native change to retain. Other handoff classes stay pending. */
+	 * separate native change to retain. S/X->N also retains its exact fence
+	 * receipt even when DATA has already retired logical PI. */
 	if (local.first.record_start == 0
 		&& !(state->holder_acquire_s_native.pcm_state == PCM_STATE_X
-			&& finished->pcm_state == PCM_STATE_S))
+			&& finished->pcm_state == PCM_STATE_S)
+		&& !(finished->pcm_state == PCM_STATE_N && finished->buffer_type == BUF_TYPE_PI
+			&& state->holder_image.kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE))
 		return RESOURCE_X_APPLY_APPLIED;
 	if (!pcm_resource_x_s_source_body_valid_inner(entry, state, &image))
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	if ((state->holder_acquire_s_native.pcm_state != PCM_STATE_S
 			&& state->holder_acquire_s_native.pcm_state != PCM_STATE_X)
-		|| image.common.target_mode != PCM_STATE_S
+		|| (image.common.target_mode != PCM_STATE_S && image.common.target_mode != PCM_STATE_X)
 		|| (local.first.record_start != 0
 			&& (body->image_flags != RESOURCE_X_IMAGE_HAS_WAL
 				|| !cluster_page_wal_same_mutation_v1(&local.last, &body->page_wal))))
@@ -26542,6 +26555,102 @@ cluster_pcm_lock_resource_x_acquire_s_source_publish_exact(const ResourceXDecode
 	state->holder_status.valid = RESOURCE_X_HOLDER_PAIR_PUBLISHED;
 	state->holder_image.valid = RESOURCE_X_HOLDER_PAIR_PUBLISHED;
 	result = RESOURCE_X_APPLY_APPLIED;
+done:
+	LWLockRelease(&ref.entry->entry_lock.lock);
+	pcm_entry_ref_release(&ref);
+	return result;
+}
+
+/* A retained S/X->N body owns this receipt before the descriptor is reusable.
+ * Replaying A after B installed must use this receipt, never B's tag state. */
+static ResourceXApplyResult
+pcm_resource_x_pi_handoff_locked(struct GrdEntry *entry,
+	ClusterPcmResourceXMasterState *state, const ResourceXDecodedFrame *block, int32 master)
+{
+	ResourceXApplyResult result;
+
+	if (state == NULL) return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (pcm_resource_x_s_source_empty(state)) return RESOURCE_X_APPLY_NOT_FOUND;
+	if (!pcm_resource_x_s_source_pair_valid(entry, state)) return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	result = pcm_resource_x_s_source_domain_locked(entry, state, block, master);
+	if (result != RESOURCE_X_APPLY_APPLIED) return result;
+	if (!pcm_resource_x_s_source_block_matches(state, block)) return RESOURCE_X_APPLY_STALE;
+	if (state->holder_status.valid != RESOURCE_X_HOLDER_PAIR_PUBLISHED)
+		return RESOURCE_X_APPLY_LOCAL_WAIT;
+	if (block->common.target_mode != PCM_STATE_X
+		|| block->body.acquire_decision.source_node != cluster_node_id
+		|| !pcm_resource_x_pi_carrier_decode_locked(entry, state, NULL)
+		|| !state->pi_carrier.transport_refs
+		|| state->pi_carrier.completed.pcm_state != PCM_STATE_N
+		|| state->pi_carrier.completed.buffer_type != BUF_TYPE_PI)
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	return state->pi_carrier.completed.flags == 0 ? RESOURCE_X_APPLY_DUPLICATE : RESOURCE_X_APPLY_APPLIED;
+}
+
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_acquire_s_source_handoff_snapshot_exact(
+	const ResourceXDecodedFrame *block, int32 master, int32 *buffer_id, ClusterPcmOwnSnapshot *completed)
+{
+	ResourceXDecodedFrame canonical;
+	ClusterPcmResourceXMasterState *state;
+	PcmEntryRef ref;
+	PcmEntryAcquireResult acquired;
+	ResourceXApplyResult result;
+
+	if (buffer_id == NULL || completed == NULL
+		|| !pcm_resource_x_s_source_block_valid(block, master, &canonical)) return RESOURCE_X_APPLY_INVALID;
+	if (ClusterPcm == NULL) return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (!pcm_entry_ref_acquire(&canonical.common.logical_assertion.resource, false, &ref, &acquired))
+		return acquired == PCM_ENTRY_ACQUIRE_NOT_FOUND ? RESOURCE_X_APPLY_NOT_FOUND : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	LWLockAcquire(&ref.entry->entry_lock.lock, LW_SHARED);
+	state = pcm_resource_x_master_state_for_entry(ref.entry);
+	result = pcm_resource_x_pi_handoff_locked(ref.entry, state, &canonical, master);
+	if (result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE) {
+		*buffer_id = state->holder_acquire_s_buffer_id;
+		*completed = state->pi_carrier.completed;
+	}
+	LWLockRelease(&ref.entry->entry_lock.lock);
+	pcm_entry_ref_release(&ref);
+	return result;
+}
+
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_acquire_s_source_handoff_exact(
+	const ResourceXDecodedFrame *block, int32 master, int32 buffer_id,
+	const ClusterPcmOwnSnapshot *pending, const ClusterPcmOwnSnapshot *completed)
+{
+	ResourceXDecodedFrame canonical;
+	ClusterPcmResourceXMasterState *state;
+	ClusterPcmOwnSnapshot expected;
+	PcmEntryRef ref;
+	PcmEntryAcquireResult acquired;
+	ResourceXApplyResult result;
+
+	if (buffer_id < 0 || pending == NULL || completed == NULL
+		|| pending->flags != PCM_OWN_FLAG_REVOKING
+		|| !pcm_resource_x_s_source_block_valid(block, master, &canonical)) return RESOURCE_X_APPLY_INVALID;
+	if (ClusterPcm == NULL) return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (!pcm_entry_ref_acquire(&canonical.common.logical_assertion.resource, false, &ref, &acquired))
+		return acquired == PCM_ENTRY_ACQUIRE_NOT_FOUND ? RESOURCE_X_APPLY_NOT_FOUND : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	pcm_entry_lock_exclusive(ref.entry);
+	state = pcm_resource_x_master_state_for_entry(ref.entry);
+	result = pcm_resource_x_pi_handoff_locked(ref.entry, state, &canonical, master);
+	if (result != RESOURCE_X_APPLY_APPLIED && result != RESOURCE_X_APPLY_DUPLICATE) goto done;
+	expected = state->pi_carrier.completed; expected.flags = PCM_OWN_FLAG_REVOKING;
+	if (buffer_id != state->holder_acquire_s_buffer_id
+		|| !cluster_pcm_own_snapshot_equal_exact(pending, &expected)) {
+		result = RESOURCE_X_APPLY_STALE; goto done;
+	}
+	expected.flags = 0;
+	if (!cluster_pcm_own_snapshot_equal_exact(completed, &expected)) {
+		result = RESOURCE_X_APPLY_STALE; goto done;
+	}
+	if (result == RESOURCE_X_APPLY_DUPLICATE) goto done;
+	if (!pcm_resource_x_intent_mark_dirty()) { result = RESOURCE_X_APPLY_RECOVERY_BLOCKED; goto done; }
+	/* Native owner produced this exact post-state outside the entry lock.
+	 * Neither transport completion nor DATA retirement is implied. */
+	state->pi_carrier.completed = *completed;
+	ConditionVariableBroadcast(&ref.entry->wait_cv);
 done:
 	LWLockRelease(&ref.entry->entry_lock.lock);
 	pcm_entry_ref_release(&ref);

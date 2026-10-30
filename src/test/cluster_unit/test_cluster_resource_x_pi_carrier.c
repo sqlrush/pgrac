@@ -20,14 +20,14 @@ typedef struct PiFixture {
 } PiFixture;
 
 static bool
-pi_start_mode(PiFixture *f, bool publish, int32 master, PcmState mode)
+pi_start_target(PiFixture *f, bool publish, int32 master, PcmState mode, PcmState target)
 {
 	CleanFixture *s = &f->source;
 	ResourceXDecodedFrame grant;
 	ClusterPageWalBindingV1 seed = local_pi_setup(make_tag(850));
 
 	memset(f, 0, sizeof(*f));
-	if (!publish_start(mode == PCM_STATE_X ? 1 : 2, PCM_STATE_S, &s->m)) return false;
+	if (!publish_start(mode == PCM_STATE_X ? 1 : 2, target, &s->m)) return false;
 	/* The directory's original PI bit is retained before A is sealed. */
 	publish_apply(&s->m);
 	grant = publish_decode(s->m.state->grant_intent.payload, false);
@@ -66,7 +66,10 @@ pi_start_mode(PiFixture *f, bool publish, int32 master, PcmState mode)
 	s->prepared.buffer_type = mode == PCM_STATE_X ? BUF_TYPE_XCUR : BUF_TYPE_SCUR;
 	s->prepared.semantic_buf_state = BM_VALID;
 	s->finished = s->prepared; s->finished.flags = 0;
-	if (mode == PCM_STATE_X) {
+	if (target == PCM_STATE_X) {
+		s->finished.generation++; s->finished.pcm_state = PCM_STATE_N;
+		s->finished.buffer_type = BUF_TYPE_PI; s->finished.flags = PCM_OWN_FLAG_REVOKING;
+	} else if (mode == PCM_STATE_X) {
 		s->finished.generation++; s->finished.pcm_state = PCM_STATE_S;
 		s->finished.buffer_type = BUF_TYPE_SCUR;
 	}
@@ -99,6 +102,8 @@ pi_start_mode(PiFixture *f, bool publish, int32 master, PcmState mode)
 		}
 		UT_ASSERT_EQ(matches, 1); if (matches != 1) return false;
 	}
+	/* target-X requester completion has a different producer, outside this fixture. */
+	if (target == PCM_STATE_X) return true;
 	s->done.kind = RESOURCE_X_WIRE_INSTALL_SETTLEMENT;
 	s->done.has_acquire_decision = true;
 	s->done.payload_bytes = RESOURCE_X_SOURCE_COMPLETE_V11_BYTES;
@@ -122,6 +127,12 @@ pi_start_mode(PiFixture *f, bool publish, int32 master, PcmState mode)
 		}
 	}
 	return true;
+}
+
+static bool
+pi_start_mode(PiFixture *f, bool publish, int32 master, PcmState mode)
+{
+	return pi_start_target(f, publish, master, mode, PCM_STATE_S);
 }
 
 static bool

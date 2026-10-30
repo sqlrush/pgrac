@@ -11320,6 +11320,48 @@ fail_closed:
 	return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 }
 
+/* Two exact owners, with no entry/content lock nesting. A native post-state
+ * can be adopted after interruption; a quiet A never consults descriptor B. */
+static ResourceXApplyResult
+gcs_block_resource_x_acquire_s_native_handoff_owned(const ResourceXDecodedFrame *block,
+	int32 master, int32 original_buffer_id)
+{
+	ClusterPcmOwnSnapshot pending, completed;
+	int32 buffer_id = -1;
+	ResourceXApplyResult result;
+	volatile ClusterPcmOwnResult own = CLUSTER_PCM_OWN_INVALID;
+	MemoryContext error_context = CurrentMemoryContext;
+
+	result = cluster_pcm_lock_resource_x_acquire_s_source_handoff_snapshot_exact(block, master,
+		&buffer_id, &pending);
+	if ((result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE)
+		&& buffer_id == original_buffer_id) {
+		if (result == RESOURCE_X_APPLY_DUPLICATE) return result;
+		PG_TRY();
+		{
+			own = cluster_bufmgr_pcm_own_release_pi_carrier_exact(buffer_id, &pending, &completed);
+		}
+		PG_CATCH();
+		{
+			ErrorData *error;
+			MemoryContextSwitchTo(error_context); error = CopyErrorData(); FlushErrorState();
+			gcs_block_resource_x_fail_closed_current();
+			ereport(LOG, (errmsg_internal("complete-A native PI handoff failed: %s",
+				error->message != NULL ? error->message : "(no message)")));
+			FreeErrorData(error); own = CLUSTER_PCM_OWN_CORRUPT;
+		}
+		PG_END_TRY();
+		if (own == CLUSTER_PCM_OWN_BUSY) return RESOURCE_X_APPLY_BAD_STATE;
+		if (own == CLUSTER_PCM_OWN_OK) {
+			result = cluster_pcm_lock_resource_x_acquire_s_source_handoff_exact(block, master,
+				buffer_id, &pending, &completed);
+			if (result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE) return result;
+		}
+	}
+	gcs_block_resource_x_fail_closed_current();
+	return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+}
+
 /* Resume only an already-retained complete-A source. The immutable pair
  * precedes native S/X->N; neither a transport callback nor a stale caller's
  * image can supply this proof. No pin/owner handle moves into this branch. */
@@ -11348,10 +11390,12 @@ gcs_block_resource_x_acquire_s_source_finish_owned(
 		|| cluster_pcm_lock_resource_x_acquire_s_source_snapshot_exact(
 			block, master, &buffer_id, &prepared, &image, &pair_state) != RESOURCE_X_APPLY_APPLIED
 		|| buffer_id != buf->buf_id
-		|| !cluster_pcm_own_snapshot_equal_exact(&prepared, caller_prepared)
-		|| cluster_bufmgr_pcm_own_snapshot_by_tag(&prepared.tag, &live_id, &live) != CLUSTER_PCM_OWN_OK
-		|| live_id != buffer_id)
+		|| !cluster_pcm_own_snapshot_equal_exact(&prepared, caller_prepared))
 		goto fail_closed;
+	if (source && pair_state == RESOURCE_X_ACQUIRE_S_SOURCE_PUBLISHED)
+		return gcs_block_resource_x_acquire_s_native_handoff_owned(block, master, buffer_id);
+	if (cluster_bufmgr_pcm_own_snapshot_by_tag(&prepared.tag, &live_id, &live) != CLUSTER_PCM_OWN_OK
+		|| live_id != buffer_id) goto fail_closed;
 	expected = prepared;
 	expected.generation++;
 	expected.pcm_state = PCM_STATE_N;
@@ -11415,7 +11459,7 @@ gcs_block_resource_x_acquire_s_source_finish_owned(
 	result = cluster_pcm_lock_resource_x_acquire_s_source_publish_exact(
 		block, master, buffer_id, &prepared, &finished);
 	if (result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE)
-		return result;
+		return source ? gcs_block_resource_x_acquire_s_native_handoff_owned(block, master, buffer_id) : result;
 fail_closed:
 	gcs_block_resource_x_fail_closed_current();
 	return RESOURCE_X_APPLY_RECOVERY_BLOCKED;

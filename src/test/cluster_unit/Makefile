@@ -5600,7 +5600,7 @@ test_cluster_pcm_settlement_ingress.inc: $(top_srcdir)/src/backend/cluster/clust
 	     END { if (count != 4 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_pcm_lock test_cluster_pcm_object_retire test_cluster_pcm_stop_cv test_cluster_pcm_read_grant test_cluster_resource_x_acquire_ingress test_cluster_resource_x_decision_send test_cluster_resource_x_decision_publish test_cluster_resource_x_holder_send test_cluster_resource_x_master_ack test_cluster_resource_x_master_done test_cluster_resource_x_master_consumed test_cluster_resource_x_master_quiet test_cluster_resource_x_master_unarmed test_cluster_resource_x_source_ack test_cluster_resource_x_s_source test_cluster_resource_x_source_done test_cluster_resource_x_clean_settlement test_cluster_resource_x_pi_carrier test_cluster_resource_x_x_source_carrier: %: %.c test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
+test_cluster_pcm_lock test_cluster_pcm_object_retire test_cluster_pcm_stop_cv test_cluster_pcm_read_grant test_cluster_resource_x_acquire_ingress test_cluster_resource_x_decision_send test_cluster_resource_x_decision_publish test_cluster_resource_x_holder_send test_cluster_resource_x_master_ack test_cluster_resource_x_master_done test_cluster_resource_x_master_consumed test_cluster_resource_x_master_quiet test_cluster_resource_x_master_unarmed test_cluster_resource_x_source_ack test_cluster_resource_x_s_source test_cluster_resource_x_source_done test_cluster_resource_x_clean_settlement test_cluster_resource_x_pi_carrier test_cluster_resource_x_x_source_carrier test_cluster_resource_x_pi_handoff: %: %.c test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
 		test_cluster_pcm_master_durable.inc \
 		test_cluster_pcm_bootstrap_tick.inc \
 		test_cluster_pcm_settlement_ingress.inc \
@@ -5685,6 +5685,7 @@ test_cluster_pcm_transition_owner.inc: $(top_srcdir)/src/backend/storage/buffer/
 	     /^cluster_bufmgr_pcm_own_finish_revoke_drop_unpinned\(/ { print "static ClusterPcmOwnResult"; emit=1; drop++ } \
 	     /^cluster_bufmgr_pcm_own_finish_revoke_retain_internal\(/ { print "static ClusterPcmOwnResult"; emit=1; finish_internal++ } \
 	     /^cluster_bufmgr_pcm_own_finish_s_holder_revoke\(/ { print "ClusterPcmOwnResult"; emit=1; holder_finish++ } \
+	     /^cluster_bufmgr_pcm_own_release_pi_carrier_exact\(/ { print "ClusterPcmOwnResult"; emit=1; pi_handoff++ } \
 	     /^cluster_bufmgr_pcm_own_finish_revoke_retain\(/ { print "ClusterPcmOwnResult"; emit=1; finish++ } \
 	     /^cluster_bufmgr_pcm_own_delivery_hold_begin_exact\(/ { print "ClusterPcmOwnResult"; emit=1; delivery_begin++ } \
 	     /^cluster_bufmgr_pcm_own_begin_x_reservation\(/ { print "ClusterPcmOwnResult"; emit=1; normal_reserve++ } \
@@ -5699,7 +5700,7 @@ test_cluster_pcm_transition_owner.inc: $(top_srcdir)/src/backend/storage/buffer/
 	     /^cluster_pcm_own_abort_grant_reservation\(/ { print "static ClusterPcmOwnResult"; emit=1; grant_abort++ } \
 	     emit { print } /^}/ { emit=0 } \
 	     END { if (retained_wal != 1 || defer_data != 1 || s_candidate != 1 || retained_candidate != 1 || storage_candidate != 1 || predecessor_observe != 1 || read_reclaim != 1 || read_delivery != 1 || held_begin != 1 || held_drain != 1 || held_drain_observed != 1 || held_abort != 1) exit 1 } \
-	     END { if (ordinary_snapshot != 1 || n_candidate != 1 || bump_failure != 1 || bump != 1 || evict != 1 || shape != 1 || wal_copy != 1 || known_new != 1 || ordinary_lookup != 1 || direct_lookup != 1 || sidecar != 1 || activate != 1 || clear != 1 || copy != 1 || held_valid != 1 || held_validate != 1 || held_adopt != 1 || held_finish != 1 || held_abandon != 1 || drop != 1 || finish_internal != 1 || holder_finish != 1 || finish != 1 || delivery_begin != 1 || delivery_snapshot != 1 || delivery_release != 1 || normal_reserve != 1 || delivery_reserve != 1 || read_publish != 1 || read_clear != 1 || read_release != 1 || grant_abort != 1) exit 1 }' $< > $@.tmp
+	     END { if (ordinary_snapshot != 1 || n_candidate != 1 || bump_failure != 1 || bump != 1 || evict != 1 || shape != 1 || wal_copy != 1 || known_new != 1 || ordinary_lookup != 1 || direct_lookup != 1 || sidecar != 1 || activate != 1 || clear != 1 || copy != 1 || held_valid != 1 || held_validate != 1 || held_adopt != 1 || held_finish != 1 || held_abandon != 1 || drop != 1 || finish_internal != 1 || holder_finish != 1 || finish != 1 || pi_handoff != 1 || delivery_begin != 1 || delivery_snapshot != 1 || delivery_release != 1 || normal_reserve != 1 || delivery_reserve != 1 || read_publish != 1 || read_clear != 1 || read_release != 1 || grant_abort != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_pcm_abort_read_image.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
@@ -5742,11 +5743,12 @@ test_cluster_pcm_source_finish_consumer.inc: $(top_srcdir)/src/backend/cluster/c
 	awk '/^gcs_block_pcm_trace_guard_capture\(/ { print "static void"; emit=1; capture++ } \
 	     /^gcs_block_pcm_trace_guard\(/ { print "static void"; emit=1; guard++ } \
 	     /^gcs_block_pcm_trace_refusal\(/ { print "static ClusterWaitTraceGuard"; emit=1; refusal++ } \
+	     /^gcs_block_resource_x_acquire_s_native_handoff_owned\(/ { print "static ResourceXApplyResult"; emit=1; pi_handoff++ } \
 	     /^gcs_block_resource_x_acquire_s_read_finish_owned\(/ { print "static ResourceXApplyResult"; emit=1; read_source++ } \
 	     /^gcs_block_resource_x_acquire_s_source_finish_owned\(/ { print "static ResourceXApplyResult"; emit=1; acquire++ } \
 	     /^gcs_block_resource_x_source_finish_owned\(/ { print "static ResourceXApplyResult"; emit=1; found++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (found != 1 || acquire != 1 || read_source != 1 || capture != 1 || guard != 1 || refusal != 1 || emit) exit 1 }' $< > $@.tmp
+	     END { if (found != 1 || acquire != 1 || read_source != 1 || pi_handoff != 1 || capture != 1 || guard != 1 || refusal != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # PGRAC: real bounded discard/PI owners, not copies of their decisions.
@@ -11092,3 +11094,16 @@ clean-native-image-episode:
 	rm -f test_cluster_native_image_episode test_cluster_native_disk_episode_fixture.inc \
 		test_cluster_native_disk_episode_fixture.inc.tmp test_cluster_native_image_episode.inc \
 		test_cluster_native_image_episode.inc.tmp
+
+TESTS += test_cluster_resource_x_pi_handoff
+all: test_cluster_resource_x_pi_handoff
+test_cluster_resource_x_pi_handoff: test_cluster_resource_x_pi_fixture.inc \
+		test_cluster_resource_x_clean_fixture.inc test_cluster_resource_x_source_done_fixture.inc \
+		test_cluster_resource_x_source_ack_fixture.inc test_cluster_resource_x_master_done_ingress.inc \
+		test_cluster_resource_x_master_ack_fixture.inc test_cluster_resource_x_acquire_fixture.inc \
+		test_cluster_resource_x_acquire_candidate.inc test_cluster_resource_x_decision_owner_layout.inc \
+		cluster_unit_port_stubs.o cluster_catalog_trace_test.o
+clean distclean maintainer-clean: clean-resource-x-pi-handoff
+.PHONY: clean-resource-x-pi-handoff
+clean-resource-x-pi-handoff:
+	rm -f test_cluster_resource_x_pi_handoff
