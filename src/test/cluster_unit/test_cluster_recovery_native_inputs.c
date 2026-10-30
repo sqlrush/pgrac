@@ -53,7 +53,11 @@ inventory_test_census(ClusterWalInputsV1 *inputs, ClusterWalCensusVisitorV1 visi
 #include "../../backend/cluster/cluster_recovery_native_inventory.c"
 #undef cluster_wal_inputs_relmap_clog_applied_v1
 #undef cluster_wal_inputs_cold_census_v1
+static ClusterRecoveryRootsResult census_current_read(ClusterRecoveryRootSet *roots,
+	uint32 index, uint64 offset, void *buffer, size_t length);
+#define cluster_recovery_root_set_read_current_relation census_current_read
 #include "../../backend/cluster/cluster_recovery_census.c"
+#undef cluster_recovery_root_set_read_current_relation
 
 static ClusterWalSourceRef inventory_fault_source;
 static XLogRecPtr inventory_commit_start, inventory_commit_previous;
@@ -1127,6 +1131,8 @@ cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **held)
 #include "test_cluster_recovery_consumed_native_redo.inc"
 #include "test_cluster_recovery_episode_generation_xid.inc"
 #include "test_cluster_recovery_clog_full_roots.inc"
+
+#include "test_cluster_recovery_census_current_pages.inc"
 #include "test_cluster_recovery_scope_census.inc"
 
 #ifdef RECOVERY_SCOPE_NATIVE_CENSUS
@@ -1153,6 +1159,15 @@ main(int argc, char **argv)
 	UT_RUN(test_scope_native_census_refuses_uncovered_and_missing_real_history_windows);
 	UT_DONE(); return ut_failed_count != 0;
 #endif
+	if (getenv("PGRAC_PRE2_TEST_CURRENT_PAGES") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_census_current_pages_keep_initial_baseline_after_owner_write);
+		UT_RUN(test_census_current_pages_refuse_replaced_short_or_unsafe_objects);
+		UT_RUN(test_census_current_pages_preconditions_do_not_enter_or_poison);
+		UT_RUN(test_census_current_pages_final_source_error_and_index_drift_are_sticky);
+		setup_fixture(); UT_DONE(); return ut_failed_count != 0;
+	}
+
 	if (getenv("PGRAC_PRE2_TEST_RESIDENT_BIRTH") != NULL) {
 		UT_PLAN(3);
 		UT_RUN(test_episode_resident_birth_reaches_original_page_and_query);
@@ -1445,7 +1460,11 @@ main(int argc, char **argv)
 		UT_RUN(test_census_references_bound_metadata_and_tuple_storage_before_publication);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(258);
+	UT_PLAN(262);
+	UT_RUN(test_census_current_pages_keep_initial_baseline_after_owner_write);
+	UT_RUN(test_census_current_pages_refuse_replaced_short_or_unsafe_objects);
+	UT_RUN(test_census_current_pages_preconditions_do_not_enter_or_poison);
+	UT_RUN(test_census_current_pages_final_source_error_and_index_drift_are_sticky);
 	scope_census_run();
 	UT_RUN(test_episode_resident_birth_reaches_original_page_and_query);
 	UT_RUN(test_episode_resident_birth_does_not_borrow_wal_or_query_epoch);

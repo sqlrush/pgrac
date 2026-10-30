@@ -183,6 +183,16 @@ extern bool cluster_recovery_root_set_storage_matches(const ClusterRecoveryRootS
 extern ClusterRecoveryRootsResult cluster_recovery_root_set_read(ClusterRecoveryRootSet *roots,
 																 uint32 index, uint64 offset,
 																 void *buffer, size_t length);
+/* Read current bytes of one original PHYSICAL relation object only. Keep
+ * initial roots/stat/digests unchanged. All original directories and file
+ * object identity/extent must still match; only the final file's content
+ * timestamps may differ from the initial scan after owner writes. Complete
+ * file stat must agree before/after the read and the named reopen. This is
+ * a candidate observation, never a stable base or permission to ignore the
+ * initial bytes, replace a PAGE owner, retire history or complete recovery. */
+extern ClusterRecoveryRootsResult cluster_recovery_root_set_read_current_relation(
+	ClusterRecoveryRootSet *roots, uint32 index, uint64 offset, void *buffer, size_t length);
+
 /* Full SHA-256 of a domain-separated, canonical path-ordered encoding.
  * No stat padding, truncated hash or CRC. Only available after OBSERVED;
  * digest equality is an index, never a substitute for the original proofs. */

@@ -1241,10 +1241,23 @@ roots_open_error(ClusterRecoveryRootSet *roots)
 								 : CLUSTER_RECOVERY_ROOTS_IO);
 }
 
+/* An owner may have changed bytes/timestamps in a relation file. This
+ * observation still requires the original physical object and extent; never
+ * copy current timestamps into the saved immutable root entry. */
+static bool
+roots_same_file_object(const struct stat *before, const struct stat *after)
+{
+	return before->st_dev == after->st_dev && before->st_ino == after->st_ino
+		&& before->st_mode == after->st_mode && before->st_uid == after->st_uid
+		&& before->st_gid == after->st_gid && before->st_nlink == after->st_nlink
+		&& before->st_size == after->st_size;
+}
+
 /* No caller-supplied path: every component must be an observed member of
  * this set. At most one newly opened parent is retained while descending. */
 static int
-roots_open_observed(ClusterRecoveryRootSet *roots, const ClusterRecoveryRootEntry *entry)
+roots_open_observed_mode(ClusterRecoveryRootSet *roots, const ClusterRecoveryRootEntry *entry,
+	bool current_relation)
 {
 	char path[MAXPGPATH];
 	char *part;
@@ -1289,7 +1302,9 @@ roots_open_observed(ClusterRecoveryRootSet *roots, const ClusterRecoveryRootEntr
 		}
 		if (fstat(fd, &held) != 0)
 			roots_fail(roots, CLUSTER_RECOVERY_ROOTS_IO);
-		else if (!cluster_recovery_namespace_stat_same(&expected->file.observed, &held))
+		else if (!(current_relation && slash == NULL
+			? roots_same_file_object(&expected->file.observed, &held)
+			: cluster_recovery_namespace_stat_same(&expected->file.observed, &held)))
 			roots_fail(roots, CLUSTER_RECOVERY_ROOTS_CHANGED);
 		if (parent != roots->root_fd && close(parent) != 0)
 			roots_fail(roots, CLUSTER_RECOVERY_ROOTS_IO);
@@ -1307,6 +1322,12 @@ roots_open_observed(ClusterRecoveryRootSet *roots, const ClusterRecoveryRootEntr
 	if (parent != roots->root_fd)
 		close(parent);
 	return -1;
+}
+
+static int
+roots_open_observed(ClusterRecoveryRootSet *roots, const ClusterRecoveryRootEntry *entry)
+{
+	return roots_open_observed_mode(roots, entry, false);
 }
 
 ClusterRecoveryRootsResult
@@ -1342,6 +1363,57 @@ cluster_recovery_root_set_read(ClusterRecoveryRootSet *roots, uint32 index, uint
 		roots_fail(roots, CLUSTER_RECOVERY_ROOTS_IO);
 	if (close(fd) != 0)
 		roots_fail(roots, CLUSTER_RECOVERY_ROOTS_IO);
+	if (roots->status != CLUSTER_RECOVERY_ROOTS_OBSERVED) {
+		memset(buffer, 0, length);
+		return roots->status;
+	}
+	return CLUSTER_RECOVERY_ROOTS_BYTES;
+}
+
+ClusterRecoveryRootsResult
+cluster_recovery_root_set_read_current_relation(ClusterRecoveryRootSet *roots, uint32 index,
+	uint64 offset, void *buffer, size_t length)
+{
+	const ClusterRecoveryRootEntry *entry;
+	volatile int fd = -1, named = -1;
+	struct stat before, after;
+
+	if (buffer != NULL && length == BLCKSZ) memset(buffer, 0, length);
+	if (roots == NULL) return CLUSTER_RECOVERY_ROOTS_INVALID;
+	if (roots->status != CLUSTER_RECOVERY_ROOTS_OBSERVED) return roots->status;
+	entry = cluster_recovery_root_set_entry(roots, index);
+	if (entry == NULL || entry->file.kind != CLUSTER_RECOVERY_FILE_RELATION
+		|| (entry->origins & CLUSTER_RECOVERY_ROOT_PHYSICAL) == 0
+		|| !S_ISREG(entry->file.observed.st_mode) || buffer == NULL || length != BLCKSZ
+		|| offset % BLCKSZ != 0 || offset > entry->file.size || length > entry->file.size-offset)
+		return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
+	PG_TRY();
+	{
+		fd = roots_open_observed_mode(roots, entry, true);
+		if (fd >= 0) {
+			if (fstat(fd, &before) != 0 || pread(fd, buffer, length, (off_t)offset) != (ssize_t)length
+				|| fstat(fd, &after) != 0)
+				roots_fail(roots, CLUSTER_RECOVERY_ROOTS_IO);
+			else if (!roots_same_file_object(&entry->file.observed, &before)
+				|| !cluster_recovery_namespace_stat_same(&before, &after))
+				roots_fail(roots, CLUSTER_RECOVERY_ROOTS_CHANGED);
+			else {
+				named = roots_open_observed_mode(roots, entry, true);
+				if (named >= 0) {
+					if (fstat(named, &after) != 0)
+						roots_fail(roots, CLUSTER_RECOVERY_ROOTS_IO);
+					else if (!cluster_recovery_namespace_stat_same(&before, &after))
+						roots_fail(roots, CLUSTER_RECOVERY_ROOTS_CHANGED);
+				}
+			}
+		}
+	}
+	PG_FINALLY();
+	{
+		if (named >= 0 && close(named) != 0) roots_fail(roots, CLUSTER_RECOVERY_ROOTS_IO);
+		if (fd >= 0 && close(fd) != 0) roots_fail(roots, CLUSTER_RECOVERY_ROOTS_IO);
+	}
+	PG_END_TRY();
 	if (roots->status != CLUSTER_RECOVERY_ROOTS_OBSERVED) {
 		memset(buffer, 0, length);
 		return roots->status;

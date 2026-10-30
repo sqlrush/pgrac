@@ -948,6 +948,46 @@ cluster_recovery_census_pages_v1(ClusterRecoveryCensus *census)
 	return cluster_recovery_census_manifest(census, &manifest) ? census->pages : NULL;
 }
 
+ClusterRecoveryCensusPageDigestV1
+cluster_recovery_census_page_digest_v1(ClusterRecoveryCensus *census, uint32 index)
+{
+	ClusterRecoveryCensusPageDigestV1 result = {0};
+	ClusterRecoveryCensusManifest before, after;
+	ClusterRecoveryCensusPageV1 saved;
+	PGAlignedBlock page;
+	uint8 digest[32];
+	bool held = false;
+	volatile bool ok = false;
+
+	if (census == NULL || census->status != CLUSTER_RECOVERY_CENSUS_DRAINED
+		|| CritSectionCount != 0 || ShutdownRequestPending) return result;
+	/* Preflight before manifest callbacks/I/O. DONE has retired the original
+	 * sequential relation scratch; its fixed budget covers this one block. */
+	ForEachLWLockHeldByMe(census_page_lock_held, &held);
+	if (held || index >= census->page_count) return result;
+	PG_TRY();
+	{
+		if (cluster_recovery_census_manifest(census, &before)) {
+			saved = census->pages->entries[index];
+			ok = cluster_recovery_root_set_read_current_relation(census->roots, saved.root_index,
+				(uint64)saved.blockno * BLCKSZ, page.data, BLCKSZ) == CLUSTER_RECOVERY_ROOTS_BYTES
+				&& census_hash_bytes(page.data, BLCKSZ, digest)
+				&& cluster_recovery_census_manifest(census, &after)
+				&& memcmp(&before, &after, sizeof(before)) == 0
+				&& memcmp(&saved, &census->pages->entries[index], sizeof(saved)) == 0;
+		}
+		if (!ok) (void)census_fail(census, CLUSTER_RECOVERY_CENSUS_REFUSED);
+	}
+	PG_CATCH();
+	{
+		(void)census_fail(census, CLUSTER_RECOVERY_CENSUS_REFUSED);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (ok) { result.observed = true; memcpy(result.sha256, digest, 32); }
+	return result;
+}
+
 const ClusterRecoveryCensusReferencesV1 *
 cluster_recovery_census_references_v1(ClusterRecoveryCensus *census)
 {

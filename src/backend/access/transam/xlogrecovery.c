@@ -2619,6 +2619,68 @@ cluster_recovery_cold_page_first_empty(const struct ClusterRecoveryStartV1 *star
 		&& memcmp(&source, &start->ctrc_page_sources[0].generation.source, sizeof(source)) == 0;
 }
 
+/* Saved reference bytes cannot stand in for a later physical observation.
+ * Re-read every original page not covered by the completed original PAGE
+ * owner. This does not establish a new namespace/history superset or replace
+ * the remaining independent owner/lifetime and retention obligations. */
+static bool
+cluster_recovery_cold_page_census_recheck(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, ClusterWalInputsV1 *scope,
+	const ClusterColdCtrcPageProgressV1 *progress)
+{
+	const ClusterRecoveryCensusPagesV1 *pages;
+	uint32 count;
+
+	if (!cluster_recovery_cold_page_advance_current(start, work, scope, progress)) return false;
+	pages = start->ctrc_pages;
+	if (pages == NULL) return false;
+	count = pages->count;
+	for (uint32 i = 0; i < count; i++) {
+		ClusterRecoveryCensusPageV1 saved;
+		unsigned covered = 0;
+
+		HandleStartupProcInterrupts();
+		if (!cluster_recovery_cold_page_advance_current(start, work, scope, progress)
+			|| start->ctrc_pages != pages || pages->count != count) return false;
+		saved = pages->entries[i];
+		if (progress != NULL) {
+			if (progress->pending || progress->next_target != progress->target_count) return false;
+			for (uint32 j = 0; j < progress->target_count; j++) {
+				RfPageOnlineTargetViewV1 target;
+				ClusterRecoveryCensusPageV1 mapped;
+
+				if (progress->completed[j].storage == NULL) continue;
+				if (!rf_page_online_plan_target_v1(start->ctrc_page_plan, j, &target)
+					|| target.history_only) return false;
+				/* Only a possible address match needs the complete unique
+				 * mapping. Avoid rescanning all pages for unrelated targets. */
+				if (target.page_identity.forknum != (uint32)saved.forknum
+					|| target.page_identity.blockno != saved.blockno
+					|| target.page_identity.locator.spcOid != saved.reservation.identity.key.locator.spcOid
+					|| target.page_identity.locator.dbOid != saved.reservation.identity.key.locator.dbOid
+					|| target.page_identity.locator.relNumber != saved.reservation.identity.key.locator.relNumber)
+					continue;
+				if (!cluster_recovery_cold_page_target(start, &target, &mapped)
+					|| memcmp(&mapped, &saved, sizeof(saved)) != 0) return false;
+				covered++;
+			}
+		}
+		if (covered > 1) return false;
+		if (covered == 0) {
+			ClusterRecoveryCensusPageDigestV1 current = cluster_recovery_census_page_digest_v1(
+				start->ctrc_observation_census, i);
+
+			if (!current.observed
+				|| !cluster_recovery_cold_page_advance_current(start, work, scope, progress)
+				|| start->ctrc_pages != pages || pages->count != count
+				|| memcmp(&saved, &pages->entries[i], sizeof(saved)) != 0
+				|| memcmp(current.sha256, saved.page_sha256, 32) != 0) return false;
+		}
+	}
+	return cluster_recovery_cold_page_advance_current(start, work, scope, progress)
+		&& start->ctrc_pages == pages && pages->count == count;
+}
+
 static bool
 cluster_recovery_cold_page_completed_recheck(const struct ClusterRecoveryStartV1 *start)
 {
@@ -2633,6 +2695,7 @@ cluster_recovery_cold_page_completed_recheck(const struct ClusterRecoveryStartV1
 	if (!cluster_recovery_cold_page_first_empty(start, work, scope, progress)) return false;
 	if (progress == NULL)
 		return rf_page_online_plan_target_count_v1(start->ctrc_page_plan) == 0
+			&& cluster_recovery_cold_page_census_recheck(start, work, scope, progress)
 			&& cluster_recovery_cold_page_reference_terminals(start, work, scope, progress)
 			&& cluster_recovery_cold_page_first_empty(start, work, scope, progress);
 	if (work->counts.subject_count > MaxAllocSize / sizeof(*subjects)
@@ -2684,7 +2747,8 @@ cluster_recovery_cold_page_completed_recheck(const struct ClusterRecoveryStartV1
 				index++;
 			}
 			if (ready)
-				ready = cluster_recovery_cold_page_reference_terminals(start, work, scope, progress)
+				ready = cluster_recovery_cold_page_census_recheck(start, work, scope, progress)
+					&& cluster_recovery_cold_page_reference_terminals(start, work, scope, progress)
 					&& cluster_recovery_cold_page_projection_subjects(start, work, scope,
 						progress, subjects, &accepted, false)
 					&& cluster_recovery_cold_page_first_empty(start, work, scope, progress);
