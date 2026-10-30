@@ -694,6 +694,48 @@ cluster_recovery_native_scan_next(ClusterRecoveryNativeScan *scan, ClusterRecove
 	return CLUSTER_RECOVERY_NATIVE_END;
 }
 
+ClusterRecoveryNativeResult
+cluster_recovery_native_scan_effects_v1(const ClusterRecoveryNativeScan *scan,
+	ClusterRecoveryNativeEffect *out, size_t capacity, size_t *count)
+{
+	ClusterRecoveryNativeScan cursor;
+	size_t required = 1;
+
+	if (count == NULL) return CLUSTER_RECOVERY_NATIVE_INVALID;
+	*count = 0;
+	if (scan == NULL || (out == NULL && capacity != 0)) return CLUSTER_RECOVERY_NATIVE_INVALID;
+	if (scan->status != CLUSTER_RECOVERY_NATIVE_MORE) return scan->status;
+	for (unsigned i = 0; i < lengthof(scan->regions); i++) {
+		if (scan->regions[i].count > SIZE_MAX - required) return CLUSTER_RECOVERY_NATIVE_CAPACITY;
+		required += scan->regions[i].count;
+	}
+	if (scan->primary == CLUSTER_RECOVERY_NATIVE_PREPARE) {
+		if (scan->record.prepared_resource_count >= SIZE_MAX - required)
+			return CLUSTER_RECOVERY_NATIVE_CAPACITY;
+		required += (size_t)scan->record.prepared_resource_count + 1; /* original END */
+	}
+	if (required > SIZE_MAX / sizeof(*out)) return CLUSTER_RECOVERY_NATIVE_CAPACITY;
+	*count = required;
+	if (out == NULL) return CLUSTER_RECOVERY_NATIVE_MORE;
+	if (capacity < required) return CLUSTER_RECOVERY_NATIVE_CAPACITY;
+	/* Reuse the SAME validated parser and walker on stack-local cursor state.
+	 * Record/undo pointers must refer to the original, never this local copy. */
+	cursor = *scan;
+	cursor.primary_returned = false;
+	cursor.region = cursor.ordinal = cursor.prepared_ordinal = 0;
+	cursor.prepared_cursor = scan->record.prepared_resources_offset;
+	for (size_t i = 0; i < required; i++) {
+		if (cluster_recovery_native_scan_next(&cursor, &out[i]) != CLUSTER_RECOVERY_NATIVE_EFFECT) {
+			memset(out, 0, required * sizeof(*out));
+			*count = 0;
+			return CLUSTER_RECOVERY_NATIVE_CHANGED;
+		}
+		out[i].record = &scan->record;
+		if (out[i].kind == CLUSTER_RECOVERY_NATIVE_UNDO) out[i].bytes = &scan->undo;
+	}
+	return CLUSTER_RECOVERY_NATIVE_EFFECT;
+}
+
 void
 cluster_recovery_native_scan_destroy(ClusterRecoveryNativeScan *scan)
 {

@@ -595,7 +595,32 @@ typedef struct ClusterRecoveryNativeRecordObservationV1 {
 	uint64 index, count, record_ordinal;
 	uint32 source_index, source_count;
 	ClusterRecoveryNativeEffect primary;
+	/* Complete primary and compound components in original decoder order.
+	 * Immutable borrowed descriptors and bytes; never a discharge verdict. */
+	const ClusterRecoveryNativeEffect *effects;
+	size_t effect_count;
 } ClusterRecoveryNativeRecordObservationV1;
+/* A complete decoder-owned group is published as one value. Upper layers
+ * check its envelope before exposing borrowed components; execution and
+ * original source/current qualification are separate duties. */
+static inline bool
+cluster_recovery_native_record_effects_valid_v1(const ClusterRecoveryNativeRecordObservationV1 *view,
+	uint64 limit)
+{
+	if (view->index == view->count) return view->effects == NULL && view->effect_count == 0;
+	if (view->effects == NULL || view->effect_count == 0 || view->effect_count > limit)
+		return false;
+	for (size_t i = 0; i < view->effect_count; i++) {
+		const ClusterRecoveryNativeEffect *effect = &view->effects[i];
+		if (effect->kind < CLUSTER_RECOVERY_NATIVE_TERMINAL
+			|| effect->kind > CLUSTER_RECOVERY_NATIVE_PREPARE_END
+			|| effect->record != view->primary.record || effect->bytes == NULL || effect->length == 0)
+			return false;
+	}
+	return view->effects[0].kind == view->primary.kind && view->effects[0].ordinal == 0
+		&& view->effects[0].bytes == view->primary.bytes
+		&& view->effects[0].length == view->primary.length;
+}
 extern ClusterRecoveryNativeRecordObservationV1 cluster_recovery_native_inventory_record_v1(
 	ClusterRecoveryNativeInventory *inventory, uint64 index);
 /* Join each retained SET_HEAD with its last preceding TT_BIND in the same

@@ -1142,6 +1142,7 @@ cluster_recovery_census_native_record_v1(ClusterRecoveryCensus *census, uint64 i
 				= cluster_recovery_native_inventory_record_v1(census->inventory, index);
 
 			ok = current.observed && current.index == index
+				&& cluster_recovery_native_record_effects_valid_v1(&current, before.native_effect_count)
 				&& current.count == census->diag.inventory.native_records + census->diag.inventory.undo_records
 				&& current.count <= before.native_effect_count
 				&& current.source_count == before.source_count

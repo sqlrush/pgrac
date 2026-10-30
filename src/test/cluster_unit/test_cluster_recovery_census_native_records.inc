@@ -2,6 +2,7 @@
  * Copyright (c) 2026, pgrac contributors
  * Author: SqlRush <sqlrush@gmail.com> */
 static unsigned census_native_record_fault, census_native_record_calls;
+static ClusterRecoveryNativeEffect census_native_bad_effects[64];
 
 static ClusterRecoveryNativeRecordObservationV1
 census_native_test_record(ClusterRecoveryNativeInventory *inventory, uint64 index)
@@ -14,6 +15,17 @@ census_native_test_record(ClusterRecoveryNativeInventory *inventory, uint64 inde
 	if (census_native_record_fault == 3) out.count++;
 	if (census_native_record_fault == 4) out.source_index = out.source_count;
 	if (census_native_record_fault == 5) out.primary.record = (void *)inventory;
+	if (census_native_record_fault == 21) out.effect_count = 0;
+	if (census_native_record_fault == 22) out.effects = NULL;
+	if (census_native_record_fault == 23) out.effect_count = SIZE_MAX;
+	if (census_native_record_fault == 24 || census_native_record_fault == 25) {
+		if (out.effects != NULL && out.effect_count < lengthof(census_native_bad_effects))
+			memcpy(census_native_bad_effects, out.effects, out.effect_count * sizeof(*out.effects));
+		out.effects = census_native_bad_effects;
+		if (census_native_record_fault == 24) census_native_bad_effects[0].kind = 0;
+		else census_native_bad_effects[0].record = NULL;
+	}
+	if (census_native_record_fault == 26) { out.effects = census_native_bad_effects; out.effect_count = 1; }
 	return out;
 }
 

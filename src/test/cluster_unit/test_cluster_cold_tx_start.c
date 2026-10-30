@@ -2432,6 +2432,7 @@ static void startup_local_empty_reset(void);
 #include "test_cluster_cold_ctrc_references.inc"
 #include "test_cluster_cold_ctrc_tx_records.inc"
 #include "test_cluster_cold_ctrc_native_records.inc"
+#include "test_cluster_cold_ctrc_compound_obligations.inc"
 #include "test_cluster_cold_ctrc_tx_dependencies.inc"
 #include "test_cluster_cold_ctrc_tx_reference_edges.inc"
 #include "test_cluster_cold_ctrc_reference_terminals.inc"
@@ -2883,6 +2884,12 @@ int main(void)
 		UT_RUN(test_start_tx_records_error_cleans_original_observation_in_order);
 		UT_DONE(); return ut_failed_count != 0;
 	}
+	if (getenv("PGRAC_PRE2_TEST_START_COMPOUND_OBLIGATIONS") != NULL) {
+		UT_PLAN(2);
+		UT_RUN(test_start_compound_groups_retain_complete_member_input_and_end);
+		UT_RUN(test_start_compound_groups_refuse_missing_mixed_or_nonempty_end);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_START_NATIVE_RECORDS") != NULL) {
 		UT_PLAN(3);
 	UT_RUN(test_start_native_records_complete_unfiltered_input_and_empty_end);
@@ -2892,7 +2899,9 @@ int main(void)
 	}
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_FIRST
-	UT_PLAN(352);
+	UT_PLAN(354);
+	UT_RUN(test_start_compound_groups_retain_complete_member_input_and_end);
+	UT_RUN(test_start_compound_groups_refuse_missing_mixed_or_nonempty_end);
 #else
 	UT_PLAN(348);
 #endif

@@ -6,6 +6,7 @@ static unsigned start_native_record_fault, start_native_record_calls;
 static uint64 start_native_record_count;
 static ClusterRecoveryNativeRecord start_native_records[2];
 static char start_native_payloads[2][8];
+static ClusterRecoveryNativeEffect start_native_components[2][3];
 
 ClusterRecoveryNativeRecordObservationV1
 cluster_recovery_census_native_record_v1(ClusterRecoveryCensus *cursor, uint64 index)
@@ -24,6 +25,7 @@ cluster_recovery_census_native_record_v1(ClusterRecoveryCensus *cursor, uint64 i
 			: CLUSTER_RECOVERY_NATIVE_MULTIXACT_CREATE;
 		out.primary.record = &start_native_records[index];
 		out.primary.bytes = start_native_payloads[index]; out.primary.length = 8;
+		out.effects = start_native_components[index]; out.effect_count = index == 0 ? 1 : 3;
 	}
 	if (start_native_record_fault == 3) out.count = observation_manifest.native_effect_count + 1;
 	if (start_native_record_fault == 4) out.source_index = out.source_count;
@@ -34,6 +36,12 @@ cluster_recovery_census_native_record_v1(ClusterRecoveryCensus *cursor, uint64 i
 	if (start_native_record_fault == 9) out.primary.record = &start_native_records[0];
 	if (start_native_record_fault == 10) out.source_count++;
 	if (start_native_record_fault == 11) out.index++;
+	if (start_native_record_fault == 21) out.effect_count = 0;
+	if (start_native_record_fault == 22) out.effects = NULL;
+	if (start_native_record_fault == 23) out.effect_count = SIZE_MAX;
+	if (start_native_record_fault == 24) start_native_components[1][2].record = &start_native_records[0];
+	if (start_native_record_fault == 25) start_native_components[1][0].kind = 0;
+	if (start_native_record_fault == 26) { out.effects = start_native_components[0]; out.effect_count = 1; }
 	return out;
 }
 
@@ -45,6 +53,7 @@ start_native_records_ready(uint64 count)
 	start_native_record_count = count;
 	memset(start_native_records, 0, sizeof(start_native_records));
 	memset(start_native_payloads, 0, sizeof(start_native_payloads));
+	memset(start_native_components, 0, sizeof(start_native_components));
 	for (unsigned i = 0; i < lengthof(start_native_records); i++) {
 		start_native_records[i].source = observation_wal_sources[0].source;
 		start_native_records[i].cut = observation_wal_sources[0].cut;
@@ -52,6 +61,13 @@ start_native_records_ready(uint64 count)
 		start_native_records[i].payload = start_native_payloads[i];
 		start_native_records[i].payload_length = sizeof(start_native_payloads[i]);
 		start_native_payloads[i][7] = 0x73 + i;
+		start_native_components[i][0] = (ClusterRecoveryNativeEffect){
+			i == 0 ? CLUSTER_RECOVERY_NATIVE_CLOG_ZERO : CLUSTER_RECOVERY_NATIVE_MULTIXACT_CREATE,
+			0, &start_native_records[i], start_native_payloads[i], 8 };
+		for (unsigned j = 1; j < 3; j++)
+			start_native_components[i][j] = (ClusterRecoveryNativeEffect){
+				CLUSTER_RECOVERY_NATIVE_MULTIXACT_MEMBER, j - 1, &start_native_records[i],
+				start_native_payloads[i] + (j - 1) * 4, 4 };
 	}
 }
 

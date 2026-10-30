@@ -1153,6 +1153,7 @@ cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **held)
 
 #include "test_cluster_recovery_census_tx_records.inc"
 #include "test_cluster_recovery_census_native_records.inc"
+#include "test_cluster_recovery_compound_obligations.inc"
 #include "test_cluster_recovery_census_tx_dependencies.inc"
 #include "test_cluster_recovery_census_tx_reference_edges.inc"
 #include "test_cluster_recovery_census_tx_recheck.inc"
@@ -1513,6 +1514,13 @@ main(int argc, char **argv)
 		UT_RUN(test_census_references_bound_metadata_and_tuple_storage_before_publication);
 		UT_DONE(); return ut_failed_count != 0;
 	}
+	if (getenv("PGRAC_PRE2_TEST_COMPOUND_OBLIGATIONS") != NULL) {
+		UT_PLAN(3);
+		UT_RUN(test_census_compound_groups_keep_all_components_without_cursor_or_io);
+		UT_RUN(test_census_compound_groups_refuse_partial_mixed_and_nonempty_end);
+		UT_RUN(test_inventory_compound_groups_charge_the_original_budget_without_prefix);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_CENSUS_NATIVE_RECORDS") != NULL) {
 		UT_PLAN(4);
 	UT_RUN(test_census_native_records_keep_entire_payload_source_and_drained_cursor);
@@ -1521,7 +1529,10 @@ main(int argc, char **argv)
 	UT_RUN(test_census_native_records_original_final_wal_rewrite_refuses_whole_view);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(281);
+	UT_PLAN(284);
+	UT_RUN(test_census_compound_groups_keep_all_components_without_cursor_or_io);
+	UT_RUN(test_census_compound_groups_refuse_partial_mixed_and_nonempty_end);
+	UT_RUN(test_inventory_compound_groups_charge_the_original_budget_without_prefix);
 	UT_RUN(test_census_native_records_keep_entire_payload_source_and_drained_cursor);
 	UT_RUN(test_census_native_records_prefix_locks_and_range_do_not_enter);
 	UT_RUN(test_census_native_records_late_current_shape_and_error_are_sticky);

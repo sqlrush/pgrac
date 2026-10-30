@@ -3233,6 +3233,8 @@ ClusterColdRecoveryCtrcNativeRecord(const struct ClusterRecoveryStartV1 *start,
 			state->ctrc_observation_census, index);
 		ClusterRecoveryWalSourceObservationV1 source;
 		bool ok = current.observed && current.index == index && index <= current.count
+			&& cluster_recovery_native_record_effects_valid_v1(&current,
+				state->ctrc_observation_manifest.native_effect_count)
 			&& current.count <= state->ctrc_observation_manifest.native_effect_count
 			&& current.source_count == state->ctrc_observation_manifest.source_count;
 

@@ -40,6 +40,8 @@ typedef struct NativeInventorySource {
 typedef struct NativeInventoryRecord {
 	struct NativeInventoryRecord *next;
 	ClusterRecoveryNativeScan *scan;
+	ClusterRecoveryNativeEffect *effects; /* complete immutable decoder sequence */
+	size_t effect_count;
 	ClusterRecoveryTerminalEntry terminal; /* normalized once by the full terminal cursor */
 	uint32 source_index;
 	uint64 ordinal;
@@ -885,7 +887,33 @@ inventory_record(XLogReaderState *reader, const ClusterWalSourceRef *source,
 									? RF_PAGE_PROOF_DETAIL_CAPACITY
 									: RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
 	}
-	work->diag.owned_bytes += sizeof(*record) + cluster_recovery_native_scan_bytes(record->scan);
+	/* Keep the whole component group under the SAME original budget before
+	 * publishing any record. Never rewind the original effect iterator. */
+	native = cluster_recovery_native_scan_effects_v1(record->scan, NULL, 0, &record->effect_count);
+	if (native == CLUSTER_RECOVERY_NATIVE_MORE) {
+		size_t remaining = work->budget - work->diag.owned_bytes - sizeof(*record)
+			- cluster_recovery_native_scan_bytes(record->scan);
+		if (record->effect_count == 0 || record->effect_count > remaining / sizeof(*record->effects))
+			native = CLUSTER_RECOVERY_NATIVE_CAPACITY;
+		else {
+			record->effects = calloc(record->effect_count, sizeof(*record->effects));
+			native = record->effects == NULL ? CLUSTER_RECOVERY_NATIVE_CAPACITY
+				: cluster_recovery_native_scan_effects_v1(record->scan, record->effects,
+					record->effect_count, &record->effect_count);
+		}
+	}
+	if (native != CLUSTER_RECOVERY_NATIVE_EFFECT) {
+		work->diag.native_result = native;
+		free(record->effects);
+		cluster_recovery_native_scan_destroy(record->scan);
+		free(record);
+		return inventory_refuse(work, native == CLUSTER_RECOVERY_NATIVE_CAPACITY
+			? CLUSTER_RECOVERY_NATIVE_INVENTORY_CAPACITY : CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED,
+			native == CLUSTER_RECOVERY_NATIVE_CAPACITY ? RF_PAGE_PROOF_DETAIL_CAPACITY
+				: RF_PAGE_PROOF_DETAIL_SOURCE_GAP);
+	}
+	work->diag.owned_bytes += sizeof(*record) + cluster_recovery_native_scan_bytes(record->scan)
+		+ record->effect_count * sizeof(*record->effects);
 	if (XLogRecGetRmid(reader) == RM_CLUSTER_UNDO_ID)
 		work->diag.undo_records++;
 	else
@@ -1291,6 +1319,7 @@ cluster_recovery_native_inventory_record_v1(ClusterRecoveryNativeInventory *inve
 	if (saved != NULL) {
 		out.source_index = saved->source_index; out.record_ordinal = saved->ordinal;
 		out.primary = primary;
+		out.effects = saved->effects; out.effect_count = saved->effect_count;
 	}
 	return out;
 }
@@ -2518,6 +2547,7 @@ cluster_recovery_native_inventory_destroy(ClusterRecoveryNativeInventory *invent
 	while (record != NULL) {
 		NativeInventoryRecord *next = record->next;
 		cluster_recovery_native_scan_destroy(record->scan);
+		free(record->effects);
 		free(record);
 		record = next;
 	}

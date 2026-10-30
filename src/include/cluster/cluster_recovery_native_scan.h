@@ -124,6 +124,14 @@ typedef struct ClusterRecoveryNativeEffect {
 
 typedef struct ClusterRecoveryNativeScan ClusterRecoveryNativeScan;
 
+/* Non-consuming copy of the original complete component sequence. A NULL
+ * output/zero capacity reports the required count with MORE; a sufficient
+ * caller-owned array receives EFFECT. CAPACITY writes no prefix. Descriptor
+ * bytes borrow this scan, including decoded undo; no apply rights follow. */
+extern ClusterRecoveryNativeResult cluster_recovery_native_scan_effects_v1(
+	const ClusterRecoveryNativeScan *scan, ClusterRecoveryNativeEffect *out,
+	size_t capacity, size_t *count);
+
 /* CLOG/COMMIT_TS ZERO and TRUNCATE keep their complete original native
  * payloads. The cutoff xid/database and page are observations, not FullXid,
  * status, timestamp-validity, retention or deletion-completion proofs.
