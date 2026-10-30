@@ -201,6 +201,20 @@ cluster_gcs_block_payload_shard(uint8 msg_type, const void *payload, uint16 payl
 			tag = &route_tag;
 			break;
 		}
+		if (payload_len == sizeof(ClusterR4OperationForwardPayload)) {
+			ClusterR4InternalForwardPayload prefix;
+			const ClusterR4InternalForwardPayload *r4 = &prefix;
+			ClusterR4OperationRequest request;
+			const ClusterR4OperationContextWire *wire
+				= (const ClusterR4OperationContextWire *)((const uint8 *)payload + sizeof(*r4));
+			memcpy(&prefix, payload, sizeof(prefix));
+			if (r4->extension.r4_version != CLUSTER_R4_WIRE_VERSION
+				|| r4->extension.r4_kind != CLUSTER_R4_WIRE_UNDO_DATA_FETCH
+				|| r4->base.requester_backend_id != CLUSTER_GCS_BLOCK_R4_INTERNAL_ENDPOINT
+				|| !ClusterR4OperationContextDecode(wire, &request))
+				return -1;
+			return n_workers > 0 ? 0 : -1;
+		}
 		if (payload_len != sizeof(GcsBlockForwardPayload)
 			&& payload_len != sizeof(ClusterR4CrForwardPayload)
 			&& payload_len != sizeof(ClusterR4InternalForwardPayload))

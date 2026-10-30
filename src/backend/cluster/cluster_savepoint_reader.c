@@ -19,8 +19,56 @@
 #include "postgres.h"
 
 #include "cluster/cluster_savepoint_reader.h"
+#include "cluster/cluster_r4_operation.h"
 
 #ifdef USE_PGRAC_CLUSTER
+
+/* Pure validation only. The original landing owns transport, current-order,
+ * retention, capability and exact dependency/worker qualification. */
+bool
+cluster_r4_peer_operation_extract(const ClusterR4OperationContextWire *request_wire,
+								  const ClusterR4PeerOperationWire *proof_wire,
+								  const ClusterTxLocator *locator, uint64 admission_generation,
+								  const char page[BLCKSZ], char record_out[BLCKSZ],
+								  size_t *length_out, ClusterTxLocator *canonical_out)
+{
+	ClusterR4OperationRequest request;
+	ClusterR4PeerOperationProof peer;
+	ClusterSavepointReaderIdentity identity = { 0 };
+	ClusterSavepointReaderRecord decoded;
+	ClusterTxLocator exact;
+	if (length_out != NULL)
+		*length_out = 0;
+	if (canonical_out != NULL)
+		memset(canonical_out, 0, sizeof(*canonical_out));
+	if (locator == NULL || page == NULL || record_out == NULL || length_out == NULL
+		|| canonical_out == NULL || !ClusterR4OperationContextDecode(request_wire, &request)
+		|| !ClusterR4PeerOperationDecode(proof_wire, &peer)
+		|| peer.admission_generation != admission_generation
+		|| !cluster_undo_record_uba_equal(peer.uba, locator->uba)
+		|| peer.identity.canonical.xid != locator->xid
+		|| (locator->tt_wrap != TT_WRAP_INVALID
+			&& locator->tt_wrap != peer.identity.canonical.wrap))
+		return false;
+	exact = *locator;
+	exact.tt_wrap = peer.identity.canonical.wrap;
+	if (!(request.retained
+			  ? cluster_savepoint_reader_discover_retained_head(
+					&request.identity, &request.head, &request.tag, &exact, page, &identity)
+			  : cluster_savepoint_reader_discover_head(&request.head, &request.tag, &exact, page,
+													   &identity))
+		|| memcmp(&identity, &peer.identity, sizeof(identity)) != 0
+		|| !cluster_savepoint_reader_extract_identity(&identity, &exact, page, record_out,
+													  length_out, &decoded)
+		|| (identity.operation_sequence != 0
+				? (peer.record_format != 2 || peer.effect != decoded.operation.effect_state)
+				: (peer.record_format != 1 || peer.effect != 0))) {
+		*length_out = 0;
+		return false;
+	}
+	*canonical_out = exact;
+	return true;
+}
 
 static bool
 savepoint_reader_binding_valid(const ClusterSavepointOperation *expected,

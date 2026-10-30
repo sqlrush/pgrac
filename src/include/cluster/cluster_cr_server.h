@@ -176,6 +176,7 @@ cluster_cr_server_test_own_xid_pair_verdict(TransactionId xid, uint32 expected_s
  *	keeps 53R97), never a garbage serve.
  */
 #define CLUSTER_LMS_CR_SLOTS 4
+#define CLUSTER_R4_OPERATION_RPC_PRESENT 1
 
 typedef enum ClusterLmsCrSlotState {
 	CLUSTER_LMS_CR_FREE = 0,
@@ -281,6 +282,8 @@ typedef struct ClusterR4CrSlotExtension {
 	uint8 terminal_reason;
 	uint8 flags;
 	uint8 reserved[26];
+	ClusterR4OperationContextWire foreign_operation;
+	ClusterR4PeerOperationWire peer_operation;
 } ClusterR4CrSlotExtension;
 
 StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, route_proof) == 0,
@@ -328,9 +331,9 @@ StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, terminal_reason) == 268,
 				 "R4 slot terminal-reason offset");
 StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, flags) == 269, "R4 slot flags offset");
 StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, reserved) == 270, "R4 slot reserved offset");
-StaticAssertDecl(sizeof(ClusterR4CrSlotExtension) == 296,
-				 "R4 slot extension must remain exactly 296 bytes");
-StaticAssertDecl(MAXALIGN(sizeof(ClusterR4CrSlotExtension)) == 296,
+StaticAssertDecl(sizeof(ClusterR4CrSlotExtension) == 496,
+				 "R4 slot extension must remain exactly 496 bytes");
+StaticAssertDecl(MAXALIGN(sizeof(ClusterR4CrSlotExtension)) == 496,
 				 "R4 slot extension must add no alignment padding");
 StaticAssertDecl(MAXALIGN(BLCKSZ) == BLCKSZ, "R4 foreign page must add no alignment padding");
 
@@ -386,14 +389,14 @@ StaticAssertDecl(sizeof(((ClusterLmsCrSlot *)0)->result_page) == BLCKSZ,
 StaticAssertDecl(offsetof(ClusterLmsCrSlot, r4) == offsetof(ClusterLmsCrSlot, result_page) + BLCKSZ,
 				 "R4 metadata must immediately follow legacy result_page");
 StaticAssertDecl(offsetof(ClusterLmsCrSlot, foreign_undo_page)
-					 == offsetof(ClusterLmsCrSlot, r4) + 296,
+					 == offsetof(ClusterLmsCrSlot, r4) + 496,
 				 "R4 foreign scratch must immediately follow metadata");
-StaticAssertDecl(sizeof(ClusterLmsCrSlot) == offsetof(ClusterLmsCrSlot, r4) + 296 + BLCKSZ,
-				 "R4 slot increment must remain exactly 8488 bytes");
-StaticAssertDecl(sizeof(ClusterR4CrSlotExtension) + BLCKSZ == 8488,
-				 "R4 per-slot increment must remain exactly 8488 bytes");
-StaticAssertDecl(CLUSTER_LMS_CR_SLOTS * (sizeof(ClusterR4CrSlotExtension) + BLCKSZ) == 33952,
-				 "R4 four-slot increment must remain exactly 33952 bytes");
+StaticAssertDecl(sizeof(ClusterLmsCrSlot) == offsetof(ClusterLmsCrSlot, r4) + 496 + BLCKSZ,
+				 "R4 slot increment must remain exactly 8688 bytes");
+StaticAssertDecl(sizeof(ClusterR4CrSlotExtension) + BLCKSZ == 8688,
+				 "R4 per-slot increment must remain exactly 8688 bytes");
+StaticAssertDecl(CLUSTER_LMS_CR_SLOTS * (sizeof(ClusterR4CrSlotExtension) + BLCKSZ) == 34752,
+				 "R4 four-slot increment must remain exactly 34752 bytes");
 
 /* CR-server counter buckets (bumped into the ClusterCRShared region owned
  * by cluster_cr.c). */
@@ -455,6 +458,11 @@ cluster_lms_cr_submit_r4(const ClusterR4CrForwardPayload *forward,
 /* Worker-0 endpoint for one already authenticated status-24 foreign undo
  * response.  The caller retains every input; true means the exact correlated
  * R4 slot release-published UNDO_READY. */
+extern bool cluster_cr_server_r4_land_peer_operation(const struct ClusterICEnvelope *env,
+													 const GcsBlockReplyHeader *header,
+													 const char undo_page[BLCKSZ],
+													 const ClusterGcsUndoAuthTrailer *undo_auth,
+													 const ClusterR4PeerOperationWire *peer_wire);
 extern bool cluster_cr_server_r4_land_foreign_undo(const ClusterICEnvelope *env,
 												   const GcsBlockReplyHeader *header,
 												   const char undo_page[BLCKSZ],

@@ -44,7 +44,7 @@ UT_TEST(test_owner_route_proof_keeps_exact_challenge)
 
 UT_TEST(test_owner_cr_wire_version_is_new_cluster_only)
 {
-	UT_ASSERT_EQ(CLUSTER_R4_WIRE_VERSION, 2);
+	UT_ASSERT_EQ(CLUSTER_R4_WIRE_VERSION, 3);
 }
 
 UT_TEST(test_owner_request_rejects_old_version)
@@ -53,8 +53,10 @@ UT_TEST(test_owner_request_rejects_old_version)
 	SCN scn;
 
 	UT_ASSERT(ClusterR4RequestExtensionSetCr(&extension, (SCN)100));
-	extension.r4_version = 1;
-	UT_ASSERT(!ClusterR4RequestExtensionGetCr(&extension, &scn));
+	for (unsigned version = 1; version < CLUSTER_R4_WIRE_VERSION; version++) {
+		extension.r4_version = version;
+		UT_ASSERT(!ClusterR4RequestExtensionGetCr(&extension, &scn));
+	}
 }
 
 UT_TEST(test_owner_forward_rejects_old_version)
@@ -64,8 +66,11 @@ UT_TEST(test_owner_forward_rejects_old_version)
 	SCN scn;
 
 	ClusterR4ForwardExtensionSetCrProof(&extension, UINT64CONST(0x100000001), 7, (SCN)99);
-	extension.r4_version = 1;
-	UT_ASSERT(!ClusterR4ForwardExtensionGetCrProof(&extension, 1, &generation, &transition, &scn));
+	for (unsigned version = 1; version < CLUSTER_R4_WIRE_VERSION; version++) {
+		extension.r4_version = version;
+		UT_ASSERT(
+			!ClusterR4ForwardExtensionGetCrProof(&extension, 1, &generation, &transition, &scn));
+	}
 }
 
 UT_TEST(test_owner_request_fits_backend_outbound_ring)

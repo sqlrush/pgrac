@@ -77,6 +77,7 @@
 #include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_tt_local.h"
 #include "cluster/cluster_tx_resolve.h"
+#include "cluster/cluster_r4_operation.h"
 #include "storage/block.h"		   /* BLCKSZ */
 #include "storage/buf_internals.h" /* BufferTag, BufferDesc */
 
@@ -2051,7 +2052,7 @@ GcsBlockForwardPayloadGetExpectedPiWatermarkScn(const GcsBlockForwardPayload *p)
 /* Stage 8 R4 keeps the legacy 64-byte prefixes and appends these exact
  * byte-array extensions.  Multibyte fields are encoded explicitly little
  * endian; no packed/native cast is a wire authority. */
-#define CLUSTER_R4_WIRE_VERSION ((uint8)2)
+#define CLUSTER_R4_WIRE_VERSION ((uint8)3)
 #define CLUSTER_R4_FORWARD_EXTENDED ((uint8)6)
 #define GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF ((uint8)7)
 #define GCS_BLOCK_FORWARD_KIND_CURRENT_MX_STATS ((uint8)8)

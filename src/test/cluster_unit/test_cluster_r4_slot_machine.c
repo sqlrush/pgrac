@@ -301,17 +301,17 @@ UT_TEST(test_91_physical_lms_slot_abi)
 	UT_ASSERT_EQ((int)sizeof(ClusterR4CrOwnerStamp), 32);
 	UT_ASSERT_EQ((int)offsetof(ClusterR4CrSlotExtension, owner), 120);
 	UT_ASSERT_EQ((int)offsetof(ClusterR4CrSlotExtension, slot_generation), 152);
-	UT_ASSERT_EQ((int)sizeof(ClusterR4CrSlotExtension), 296);
+	UT_ASSERT_EQ((int)sizeof(ClusterR4CrSlotExtension), 496);
 
 	UT_ASSERT_EQ((int)sizeof(((ClusterLmsCrSlot *)0)->result_page), BLCKSZ);
 	UT_ASSERT_EQ((int)offsetof(ClusterLmsCrSlot, r4),
 				 (int)offsetof(ClusterLmsCrSlot, result_page) + BLCKSZ);
 	UT_ASSERT_EQ((int)offsetof(ClusterLmsCrSlot, foreign_undo_page),
-				 (int)offsetof(ClusterLmsCrSlot, r4) + 296);
+				 (int)offsetof(ClusterLmsCrSlot, r4) + 496);
 	UT_ASSERT_EQ((int)sizeof(((ClusterLmsCrSlot *)0)->foreign_undo_page), BLCKSZ);
-	UT_ASSERT_EQ((int)sizeof(ClusterLmsCrSlot), (int)offsetof(ClusterLmsCrSlot, r4) + 296 + BLCKSZ);
-	UT_ASSERT_EQ((int)(sizeof(ClusterR4CrSlotExtension) + BLCKSZ), 8488);
-	UT_ASSERT_EQ((int)(CLUSTER_LMS_CR_SLOTS * (sizeof(ClusterR4CrSlotExtension) + BLCKSZ)), 33952);
+	UT_ASSERT_EQ((int)sizeof(ClusterLmsCrSlot), (int)offsetof(ClusterLmsCrSlot, r4) + 496 + BLCKSZ);
+	UT_ASSERT_EQ((int)(sizeof(ClusterR4CrSlotExtension) + BLCKSZ), 8688);
+	UT_ASSERT_EQ((int)(CLUSTER_LMS_CR_SLOTS * (sizeof(ClusterR4CrSlotExtension) + BLCKSZ)), 34752);
 }
 
 /* D4-B exact append-only LMS incarnation/drain control ABI. */
@@ -327,7 +327,7 @@ UT_TEST(test_92_physical_lms_r4_control_abi)
 				 (int)sizeof(ClusterLmsSharedState) - 80);
 	UT_ASSERT_EQ((int)(CLUSTER_LMS_CR_SLOTS * (sizeof(ClusterR4CrSlotExtension) + BLCKSZ)
 					   + sizeof(ClusterLmsR4Controls)),
-				 34032);
+				 34832);
 }
 
 int

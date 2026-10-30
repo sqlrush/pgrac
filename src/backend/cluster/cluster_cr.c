@@ -570,6 +570,8 @@ cr_r4_clear_foreign_request(ClusterR4CrSlotExtension *extension, ClusterR4CrBuil
 	extension->foreign_wrap = 0;
 	extension->foreign_tt_slot_offset = 0;
 	extension->foreign_row_offset = 0;
+	memset(&extension->foreign_operation, 0, sizeof(extension->foreign_operation));
+	memset(&extension->peer_operation, 0, sizeof(extension->peer_operation));
 	memset(&context->pending_locator, 0, sizeof(context->pending_locator));
 	context->pending_locator_valid = false;
 }
@@ -815,6 +817,7 @@ typedef struct CrR4OperationContext {
 	ClusterSavepointReaderIdentity identity;
 	ClusterTxResolution top;
 	ClusterSavepointReaderRecord operation;
+	ClusterR4OperationContextWire peer_request;
 	CrR4OperationTop *tops;
 	CrR4KeptTuple *kept_tuples;
 	uint32 top_count;
@@ -889,7 +892,8 @@ cluster_cr_build_on_holder_origin_active(void)
  * later original TT sample observes COMMITTED for this construction. A
  * terminal sample cannot change under that same complete identity. */
 static bool
-cr_r4_operation_top(CrR4OperationContext *operation, uint32 limit, bool *conservative)
+cr_r4_operation_top(CrR4OperationContext *operation, uint32 limit, ClusterTxOutcome outcome,
+					SCN commit_scn, bool *conservative)
 {
 	const ClusterSavepointReaderIdentity *identity = &operation->identity;
 	CrR4OperationTop *top;
@@ -919,17 +923,17 @@ cr_r4_operation_top(CrR4OperationContext *operation, uint32 limit, bool *conserv
 		operation->top_count++;
 	}
 	if (top->terminal_outcome != CLUSTER_TX_UNKNOWN
-		&& (top->terminal_outcome != operation->top.outcome
+		&& (top->terminal_outcome != outcome
 			|| (top->terminal_outcome == CLUSTER_TX_COMMITTED
-				&& top->terminal_commit_scn != operation->top.commit_scn)))
+				&& top->terminal_commit_scn != commit_scn)))
 		return false;
-	if (operation->top.outcome != CLUSTER_TX_IN_PROGRESS) {
-		top->terminal_outcome = operation->top.outcome;
-		top->terminal_commit_scn = operation->top.commit_scn;
+	if (outcome != CLUSTER_TX_IN_PROGRESS) {
+		top->terminal_outcome = outcome;
+		top->terminal_commit_scn = commit_scn;
 	}
 	if (identity->operation_sequence != 0)
 		top->last_sequence = identity->operation_sequence;
-	top->conservative |= operation->top.outcome == CLUSTER_TX_IN_PROGRESS;
+	top->conservative |= outcome == CLUSTER_TX_IN_PROGRESS;
 	*conservative = top->conservative;
 	return true;
 }
@@ -1340,7 +1344,8 @@ cr_r4_operation_project(CrR4OperationContext *operation, ClusterR4CrSlotExtensio
  * owner alias cannot be silently treated as another transaction's history. */
 static bool
 cr_r4_operation_owner(const CrR4OperationContext *operation,
-					  const ClusterR4CrSlotExtension *extension, bool *owned)
+					  const ClusterR4CrSlotExtension *extension, ClusterTxOutcome outcome,
+					  bool *owned)
 {
 	const ClusterR4CrOwnerChallenge *owner = &extension->route_proof.requester_owner;
 	const ClusterSavepointReaderIdentity *identity = &operation->identity;
@@ -1358,7 +1363,39 @@ cr_r4_operation_owner(const CrR4OperationContext *operation,
 		|| owner->origin_instance
 			   != (uint8)((uint32)uba_origin_node_id(operation->locator.uba) + 1))
 		return false;
-	*owned = operation->top.outcome == CLUSTER_TX_IN_PROGRESS;
+	*owned = outcome == CLUSTER_TX_IN_PROGRESS;
+	return true;
+}
+
+static bool
+cr_r4_operation_apply_proved(CrR4OperationContext *operation, ClusterR4CrBuildContext *context,
+							 ClusterTxLocator *locator, ClusterR4CrSlotExtension *extension,
+							 char page[BLCKSZ], char record_bytes[BLCKSZ],
+							 const ClusterTxLocator *exact, ClusterTxOutcome outcome,
+							 SCN commit_scn)
+{
+	UndoRecordHeader *record;
+	bool conservative, keep, owned;
+
+	if (operation->result_page == NULL
+		|| memcmp(operation->result_page, operation->source.data, BLCKSZ) != 0
+		|| outcome == CLUSTER_TX_PREPARED
+		|| (outcome != CLUSTER_TX_IN_PROGRESS && outcome != CLUSTER_TX_COMMITTED
+			&& outcome != CLUSTER_TX_ABORTED)
+		|| !cr_r4_operation_top(operation, context->max_steps, outcome, commit_scn, &conservative)
+		|| !cr_r4_operation_owner(operation, extension, outcome, &owned))
+		return false;
+	record = (UndoRecordHeader *)record_bytes;
+	keep = (operation->identity.operation_sequence == 0
+			|| operation->operation.operation.effect_state == CLUSTER_SAVEPOINT_EFFECT_LIVE)
+		   && (owned
+			   || (!conservative && outcome == CLUSTER_TX_COMMITTED
+				   && scn_time_cmp(commit_scn, extension->route_proof.read_scn) <= 0));
+	*locator = *exact;
+	if (!cr_r4_operation_project(operation, extension, locator, record, page, keep))
+		return false;
+	operation->operation_mode = true;
+	context->record_format = 2;
 	return true;
 }
 
@@ -1367,35 +1404,14 @@ cr_r4_operation_apply(CrR4OperationContext *operation, ClusterR4CrBuildContext *
 					  ClusterTxLocator *locator, ClusterR4CrSlotExtension *extension,
 					  char page[BLCKSZ], char record_bytes[BLCKSZ])
 {
-	UndoRecordHeader *record;
 	size_t length;
-	bool conservative, keep, owned;
-
-	if (operation->result_page == NULL
-		|| memcmp(operation->result_page, operation->source.data, BLCKSZ) != 0
-		|| operation->top.outcome == CLUSTER_TX_PREPARED
-		|| (operation->top.outcome != CLUSTER_TX_IN_PROGRESS
-			&& operation->top.outcome != CLUSTER_TX_COMMITTED
-			&& operation->top.outcome != CLUSTER_TX_ABORTED)
-		|| !cluster_savepoint_reader_extract_identity(&operation->identity,
-													  &operation->top.locator_echo, record_bytes,
-													  record_bytes, &length, &operation->operation)
-		|| !cr_r4_operation_top(operation, context->max_steps, &conservative)
-		|| !cr_r4_operation_owner(operation, extension, &owned))
+	if (!cluster_savepoint_reader_extract_identity(&operation->identity,
+												   &operation->top.locator_echo, record_bytes,
+												   record_bytes, &length, &operation->operation))
 		return false;
-	record = (UndoRecordHeader *)record_bytes;
-	keep = (operation->identity.operation_sequence == 0
-			|| operation->operation.operation.effect_state == CLUSTER_SAVEPOINT_EFFECT_LIVE)
-		   && (owned
-			   || (!conservative && operation->top.outcome == CLUSTER_TX_COMMITTED
-				   && scn_time_cmp(operation->top.commit_scn, extension->route_proof.read_scn)
-						  <= 0));
-	*locator = operation->top.locator_echo;
-	if (!cr_r4_operation_project(operation, extension, locator, record, page, keep))
-		return false;
-	operation->operation_mode = true;
-	context->record_format = 2;
-	return true;
+	return cr_r4_operation_apply_proved(operation, context, locator, extension, page, record_bytes,
+										&operation->top.locator_echo, operation->top.outcome,
+										operation->top.commit_scn);
 }
 
 /* The preliminary record selects an existing compare identity only. Original
@@ -1837,6 +1853,37 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation, bool 
 				context->pending_locator = *locator;
 				context->pending_locator.uba = current_uba;
 				context->pending_locator_valid = true;
+				if (CrR4OperationContexts[slot_index].enabled) {
+					CrR4OperationContext *operation = &CrR4OperationContexts[slot_index];
+					ClusterR4OperationRequest request = { 0 };
+					request.tag = extension->route_proof.tag;
+					request.head
+						= ClusterPageGetItlSlots((Page)result_page)[locator->itl_slot_index];
+					for (const CrR4OperationTop *top = operation->tops; top != NULL;
+						 top = top->next) {
+						if (top->canonical.xid != locator->xid
+							|| top->canonical.slot_offset != foreign_tt_offset
+							|| (top->canonical.segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE
+								   != (uint32)origin)
+							continue;
+						if (request.retained) {
+							*reason_out = CLUSTER_CR_BUILD_BAD_UNDO;
+							return CLUSTER_R4_CR_STEP_FAIL;
+						}
+						request.retained = true;
+						request.identity.canonical = top->canonical;
+						request.identity.canonical_generation = top->generation;
+						request.identity.top_fxid = request.identity.operation_fxid = top->top_fxid;
+						request.identity.command_id = InvalidCommandId;
+						request.identity.subid = TopSubTransactionId;
+					}
+					if (!ClusterR4OperationContextEncode(&extension->foreign_operation, &request)) {
+						*reason_out = CLUSTER_CR_BUILD_BAD_UNDO;
+						return CLUSTER_R4_CR_STEP_FAIL;
+					}
+					operation->peer_request = extension->foreign_operation;
+				}
+
 				cr_r4_undo_trace(trace, "undo.need", "PREPARED_FOREIGN_REQUEST", -1);
 				*reason_out = CLUSTER_CR_BUILD_NONE;
 				return CLUSTER_R4_CR_STEP_NEED_UNDO;
@@ -1852,6 +1899,44 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation, bool 
 												result_page, record_buffer.data, trace, reason_out);
 			cr_r4_undo_trace(trace, "undo.read.begin", "COPY_BOUNDARY", -1);
 			if (record_from_foreign_page) {
+				CrR4OperationContext *operation = &CrR4OperationContexts[slot_index];
+				if (extension->peer_operation.bytes[0] != 0) {
+					ClusterR4PeerOperationProof peer;
+					*reason_out = CLUSTER_CR_BUILD_BAD_UNDO;
+					if (!operation->enabled || context->have_previous || context->record_format == 1
+						|| memcmp(&operation->peer_request, &extension->foreign_operation,
+								  sizeof(operation->peer_request))
+							   != 0
+						|| !ClusterR4PeerOperationDecode(&extension->peer_operation, &peer)
+						|| !cluster_r4_peer_operation_extract(
+							&extension->foreign_operation, &extension->peer_operation,
+							&context->pending_locator, operation->admission.record_generation,
+							foreign_undo_page, record_buffer.data, &record_length,
+							&canonical_locator))
+						return CLUSTER_R4_CR_STEP_FAIL;
+					operation->identity = peer.identity;
+					operation->locator = canonical_locator;
+					memcpy(operation->source.data, operation->result_page, BLCKSZ);
+					if (!cluster_savepoint_reader_decode_identity(
+							&peer.identity, &canonical_locator, canonical_locator.uba,
+							(UndoRecordHeader *)record_buffer.data,
+							record_buffer.data + sizeof(UndoRecordHeader),
+							((UndoRecordHeader *)record_buffer.data)->payload_length,
+							&operation->operation)
+						|| !cr_r4_operation_apply_proved(
+							operation, context, locator, extension, result_page, record_buffer.data,
+							&canonical_locator, peer.outcome, peer.commit_scn))
+						return CLUSTER_R4_CR_STEP_FAIL;
+					cr_r4_clear_foreign_request(extension, context);
+					if (!cr_r4_operation_reselect(
+							context,
+							(Page)(operation->walk != NULL ? operation->walk->data : result_page)))
+						return CLUSTER_R4_CR_STEP_FAIL;
+					*reason_out = CLUSTER_CR_BUILD_NONE;
+					return context->candidate_count == 0 ? CLUSTER_R4_CR_STEP_FULL
+														 : CLUSTER_R4_CR_STEP_PENDING;
+				}
+
 				record_length = 0;
 				if (cluster_cr_r4_extract_resident_record(
 						foreign_undo_page, &context->pending_locator, record_buffer.data,

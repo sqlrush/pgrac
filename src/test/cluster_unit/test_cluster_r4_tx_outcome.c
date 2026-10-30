@@ -7650,13 +7650,14 @@ UT_TEST(test_retained_slot_identity_does_not_escape_original_final_fences)
 #include "test_cluster_savepoint_origin_worker.inc"
 #include "test_cluster_owner_full_fixture.h"
 #include "test_cluster_savepoint_owner_worker.inc"
+#include "test_cluster_savepoint_peer_worker.inc"
 
 int
 main(int argc, char **argv)
 {
 	if (argc == 2 && strcmp(argv[1], "--owner-full-fixture") == 0)
 		return owner_worker_export_full(stdout);
-	UT_PLAN(393);
+	UT_PLAN(396);
 	UT_RUN(test_operation_worker_real_builder_yields_before_visibility);
 	UT_RUN(test_operation_worker_real_origin_completes_private_inverse);
 	UT_RUN(test_operation_worker_pending_current_is_bounded_and_counts_once);
@@ -8051,6 +8052,9 @@ main(int argc, char **argv)
 	UT_RUN(test_owner_worker_discarded_and_other_active_are_inversed);
 	UT_RUN(test_owner_worker_raw_alias_is_explicit_refusal);
 	UT_RUN(test_owner_worker_challenge_drift_cannot_finish_old_builder);
+	UT_RUN(test_peer_operation_discarded_completes_foreign_holder);
+	UT_RUN(test_peer_operation_real_sampler_refuses_missing_original_full_id);
+	UT_RUN(test_peer_operation_mixed_history_keeps_only_qualified_effects);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

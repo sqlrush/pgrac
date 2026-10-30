@@ -77,6 +77,7 @@
 #include "cluster/cluster_scn.h" /* cluster_scn_current (spec-7.1a authority_scn co-sample) */
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_shmem.h"
+#include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_conf.h"		/* CLUSTER_MAX_NODES (D4-6 owner range) */
 #include "cluster/cluster_tt_durable.h" /* resolve_by_xid (D-i4 complete scan) */
 #include "cluster/cluster_tt_status.h"
@@ -128,6 +129,10 @@ typedef struct ClusterR4CrWorkerContext {
 	bool foreign_physical_generation_frozen;
 	uint8 reserved[2];
 	ClusterR4CrOwnerChallenge requester_owner;
+	ClusterR4OperationContextWire foreign_operation;
+	ClusterR4CrRouteProof foreign_route;
+	uint32 foreign_capability_generation;
+	int32 foreign_origin_node;
 } ClusterR4CrWorkerContext;
 
 /* Immutable finite diagnostic events; never consulted by the slot owner. */
@@ -227,6 +232,25 @@ cr_server_r4_identity_open_matches(const ClusterSemanticAdmissionToken *admissio
 		return cr_server_r4_local_open_generation_matches(admission, stored_generation);
 	return cluster_semantic_activation_peer_open_matches(
 		admission, identity_node, CR_SERVER_R4_REQUIRED_HELLO_CAPS, stored_generation);
+}
+
+/* Connection samples are process-local observations, never peer authority
+ * caches. The original dependency and its route remain the only consumer. */
+static bool
+cr_server_r4_peer_dependency_current(const ClusterLmsCrSlot *slot,
+									 const ClusterR4CrWorkerContext *context)
+{
+	uint32 generation = 0;
+	bool optional = false;
+	return context->foreign_origin_node == slot->r4.foreign_origin_node
+		   && memcmp(&context->foreign_route, &slot->r4.route_proof, sizeof(context->foreign_route))
+				  == 0
+		   && cluster_sf_peer_capability_family_sample(context->foreign_origin_node,
+													   CR_SERVER_R4_REQUIRED_HELLO_CAPS, 0,
+													   &optional, &generation)
+		   && generation != 0 && generation == context->foreign_capability_generation
+		   && cr_server_r4_identity_open_matches(&context->admission, context->foreign_origin_node,
+												 generation);
 }
 
 const char *
@@ -1174,6 +1198,7 @@ cr_server_r4_terminalize_build_error(uint32 slot_index, ClusterLmsCrSlot *slot,
 
 	memset(slot->result_page, 0, sizeof(slot->result_page));
 	memset(slot->foreign_undo_page, 0, sizeof(slot->foreign_undo_page));
+	memset(&slot->r4.peer_operation, 0, sizeof(slot->r4.peer_operation));
 	cluster_cr_build_on_holder_forget(slot_index, key->slot_generation);
 	context->builder_forgotten = true;
 	slot->r4.terminal_reason = (uint8)reason;
@@ -1241,6 +1266,8 @@ cr_server_r4_build_step(uint32 slot_index)
 			|| slot->epoch != slot->r4.route_proof.formation_epoch
 			|| !BufferTagsEqual(&slot->tag, &slot->r4.route_proof.tag)
 			|| slot->read_scn != slot->r4.route_proof.read_scn
+			|| (context->foreign_operation.bytes[0] != 0
+				&& !cr_server_r4_peer_dependency_current(slot, context))
 			|| !context->foreign_physical_generation_frozen
 			|| context->expected_foreign_physical_generation == UINT32_MAX
 			|| slot->r4.foreign_request_id == 0 || slot->r4.foreign_wrap > TT_WRAP_MAX
@@ -1270,6 +1297,7 @@ cr_server_r4_build_step(uint32 slot_index)
 		reason = step_reason;
 		if (foreign_undo_ready) {
 			memset(slot->foreign_undo_page, 0, BLCKSZ);
+			memset(&slot->r4.peer_operation, 0, sizeof(slot->r4.peer_operation));
 			context->foreign_physical_generation_frozen = false;
 			context->expected_foreign_physical_generation = 0;
 		}
@@ -1420,6 +1448,9 @@ cr_server_r4_send_foreign_undo(uint32 slot_index)
 	ClusterLmsCrSlot *slot;
 	ClusterR4CrWorkerContext *context;
 	ClusterR4InternalForwardPayload forward;
+	ClusterR4OperationForwardPayload operation_frame;
+	ClusterR4OperationRequest operation_request;
+	bool has_operation;
 	ClusterTxLocator locator;
 	ClusterICSendResult send_result;
 	uint32 request_generation;
@@ -1476,6 +1507,30 @@ cr_server_r4_send_foreign_undo(uint32 slot_index)
 													 CLUSTER_CR_BUILD_PROTOCOL);
 	}
 
+	has_operation = slot->r4.foreign_operation.bytes[0] != 0;
+	if (has_operation
+		&& !ClusterR4OperationContextDecode(&slot->r4.foreign_operation, &operation_request))
+		return cr_server_r4_publish_foreign_terminal(slot, CLUSTER_LMS_CR_R4_NEED_UNDO,
+													 CLUSTER_LMS_CR_R4_READY_FAIL,
+													 CLUSTER_CR_BUILD_PROTOCOL);
+	context->foreign_operation = slot->r4.foreign_operation;
+	if (has_operation) {
+		bool optional = false;
+		context->foreign_route = slot->r4.route_proof;
+		context->foreign_origin_node = slot->r4.foreign_origin_node;
+		if (!cluster_sf_peer_capability_family_sample(
+				context->foreign_origin_node, CR_SERVER_R4_REQUIRED_HELLO_CAPS, 0, &optional,
+				&context->foreign_capability_generation)
+			|| !cr_server_r4_peer_dependency_current(slot, context)
+			|| !cluster_semantic_activation_recheck(&context->admission))
+			return cr_server_r4_publish_foreign_terminal(slot, CLUSTER_LMS_CR_R4_NEED_UNDO,
+														 CLUSTER_LMS_CR_R4_READY_FAIL,
+														 CLUSTER_CR_BUILD_PROTOCOL);
+		memcpy(operation_frame.bytes, &forward, sizeof(forward));
+		memcpy(operation_frame.bytes + sizeof(forward), &slot->r4.foreign_operation,
+			   sizeof(slot->r4.foreign_operation));
+	}
+
 	expected = CLUSTER_LMS_CR_R4_NEED_UNDO;
 	if (!pg_atomic_compare_exchange_u32(&slot->state, &expected, CLUSTER_LMS_CR_R4_UNDO_INFLIGHT))
 		return false;
@@ -1494,8 +1549,10 @@ cr_server_r4_send_foreign_undo(uint32 slot_index)
 	pg_read_barrier();
 	context->foreign_reply_deadline
 		= TimestampTzPlusMilliseconds(GetCurrentTimestamp(), Max(cluster_gcs_reply_timeout_ms, 1));
-	send_result = cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
-										   slot->r4.foreign_origin_node, &forward, sizeof(forward));
+	send_result = cluster_ic_send_envelope(
+		PGRAC_IC_MSG_GCS_BLOCK_FORWARD, slot->r4.foreign_origin_node,
+		has_operation ? (const void *)&operation_frame : (const void *)&forward,
+		has_operation ? sizeof(operation_frame) : sizeof(forward));
 	cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_FORWARD, send_result);
 	switch (send_result) {
 	case CLUSTER_IC_SEND_DONE:
@@ -1543,6 +1600,15 @@ cr_server_r4_foreign_landing_key_valid(uint32 slot_index, ClusterLmsCrSlot *slot
 		   && ClusterR4CrOwnerEqual(&context->requester_owner,
 									&slot->r4.route_proof.requester_owner)
 		   && context->request_id == slot->request_id
+		   && memcmp(&context->foreign_operation, &slot->r4.foreign_operation,
+					 sizeof(context->foreign_operation))
+				  == 0
+		   && cr_server_bytes_zero(&slot->r4.peer_operation, sizeof(slot->r4.peer_operation))
+		   && (context->foreign_operation.bytes[0] == 0
+			   || (memcmp(&context->foreign_route, &slot->r4.route_proof,
+						  sizeof(context->foreign_route))
+					   == 0
+				   && context->foreign_origin_node == slot->r4.foreign_origin_node))
 		   && slot->r4.foreign_request_id
 				  == cluster_cr_r4_dependency_request_id(slot_index, context->slot_generation,
 														 slot->r4.build_steps)
@@ -1561,11 +1627,11 @@ cr_server_r4_foreign_landing_key_valid(uint32 slot_index, ClusterLmsCrSlot *slot
 		   && cr_server_bytes_zero(slot->r4.reserved, sizeof(slot->r4.reserved));
 }
 
-bool
-cluster_cr_server_r4_land_foreign_undo(const ClusterICEnvelope *env,
-									   const GcsBlockReplyHeader *header,
-									   const char undo_page[BLCKSZ],
-									   const ClusterGcsUndoAuthTrailer *undo_auth)
+static bool
+cr_server_r4_land_undo_internal(const ClusterICEnvelope *env, const GcsBlockReplyHeader *header,
+								const char undo_page[BLCKSZ],
+								const ClusterGcsUndoAuthTrailer *undo_auth,
+								const ClusterR4PeerOperationWire *peer_wire)
 {
 	ClusterLmsCrSlot *slot;
 	ClusterR4CrWorkerContext *context;
@@ -1594,6 +1660,7 @@ cluster_cr_server_r4_land_foreign_undo(const ClusterICEnvelope *env,
 		|| env->payload_length
 			   != GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE
 					  + (refusal ? 0 : (uint32)sizeof(ClusterGcsUndoAuthTrailer))
+					  + (peer_wire != NULL ? sizeof(*peer_wire) : 0)
 		|| env->dest_node_id != (uint32)cluster_node_id || env->epoch != header->epoch
 		|| (!refusal && header->status != (uint8)GCS_BLOCK_REPLY_R4_UNDO_DATA_RESULT)
 		|| header->requester_backend_id != CLUSTER_GCS_BLOCK_R4_INTERNAL_ENDPOINT
@@ -1608,7 +1675,10 @@ cluster_cr_server_r4_land_foreign_undo(const ClusterICEnvelope *env,
 					: header->page_lsn == InvalidXLogRecPtr)
 		|| header->request_id == 0
 		|| (!refusal && !GcsBlockReplyHeaderGetR4UndoGeneration(header, &physical_generation))
-		|| header->checksum != cluster_gcs_block_compute_checksum(undo_page))
+		|| (refusal && peer_wire != NULL)
+		|| header->checksum
+			   != (peer_wire != NULL ? ClusterR4OperationChecksum(undo_page, undo_auth, peer_wire)
+									 : cluster_gcs_block_compute_checksum(undo_page)))
 		return false;
 
 	slot_index = (uint32)(header->request_id & (CLUSTER_LMS_CR_SLOTS - 1));
@@ -1634,8 +1704,13 @@ cluster_cr_server_r4_land_foreign_undo(const ClusterICEnvelope *env,
 	authority_scn = refusal ? InvalidScn : (SCN)ClusterGcsUndoAuthTrailerGetAuthorityScn(undo_auth);
 	if (!refusal
 		&& (!SCN_VALID(authority_scn) || scn_time_cmp(authority_scn, slot->read_scn) < 0
-			|| !cluster_cr_r4_extract_resident_record(undo_page, &locator, record.data,
-													  &record_length, &canonical_locator)
+			|| !(peer_wire != NULL
+					 ? cluster_r4_peer_operation_extract(
+						   &context->foreign_operation, peer_wire, &locator,
+						   context->admission.record_generation, undo_page, record.data,
+						   &record_length, &canonical_locator)
+					 : cluster_cr_r4_extract_resident_record(undo_page, &locator, record.data,
+															 &record_length, &canonical_locator))
 			|| record_length == 0 || canonical_locator.uba.raw[0] != locator.uba.raw[0]
 			|| canonical_locator.uba.raw[1] != locator.uba.raw[1]
 			|| canonical_locator.xid != locator.xid
@@ -1658,6 +1733,8 @@ cluster_cr_server_r4_land_foreign_undo(const ClusterICEnvelope *env,
 	if (receive_admission.record_generation != frozen_context.admission.record_generation
 		|| receive_admission.formation_epoch != header->epoch
 		|| !cluster_semantic_activation_recheck(&receive_admission)
+		|| (context->foreign_operation.bytes[0] != 0
+			&& !cr_server_r4_peer_dependency_current(slot, context))
 		|| !cr_server_r4_foreign_landing_key_valid(slot_index, slot, context, &frozen_context))
 		goto out;
 
@@ -1677,6 +1754,8 @@ cluster_cr_server_r4_land_foreign_undo(const ClusterICEnvelope *env,
 	context->expected_foreign_physical_generation = physical_generation;
 	context->foreign_physical_generation_frozen = true;
 	memcpy(slot->foreign_undo_page, undo_page, BLCKSZ);
+	if (peer_wire != NULL)
+		slot->r4.peer_operation = *peer_wire;
 	slot->r4.foreign_wrap = canonical_locator.tt_wrap;
 	slot->r4.origin_live_hwm_lsn = header->page_lsn;
 	slot->r4.origin_tt_generation = tt_generation;
@@ -1693,6 +1772,27 @@ out:
 	if (landed)
 		cr_server_wake_lms();
 	return landed;
+}
+
+bool
+cluster_cr_server_r4_land_peer_operation(const ClusterICEnvelope *env,
+										 const GcsBlockReplyHeader *header,
+										 const char undo_page[BLCKSZ],
+										 const ClusterGcsUndoAuthTrailer *undo_auth,
+										 const ClusterR4PeerOperationWire *peer_wire)
+{
+	if (env == NULL || env->payload_length != CLUSTER_R4_OPERATION_REPLY_SIZE || peer_wire == NULL)
+		return false;
+	return cr_server_r4_land_undo_internal(env, header, undo_page, undo_auth, peer_wire);
+}
+
+bool
+cluster_cr_server_r4_land_foreign_undo(const ClusterICEnvelope *env,
+									   const GcsBlockReplyHeader *header,
+									   const char undo_page[BLCKSZ],
+									   const ClusterGcsUndoAuthTrailer *undo_auth)
+{
+	return cr_server_r4_land_undo_internal(env, header, undo_page, undo_auth, NULL);
 }
 
 static bool

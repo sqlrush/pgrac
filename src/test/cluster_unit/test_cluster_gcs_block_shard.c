@@ -464,6 +464,50 @@ UT_TEST(test_r4_extended_route_exact_lengths_and_tag_affinity)
  * directions.  Either half alone remains ordinary tag-sharded, and adjacent
  * lengths remain unroutable.
  * ====================================================================== */
+UT_TEST(test_operation_kind4_196_routes_only_complete_context_to_worker0)
+{
+	ClusterR4InternalForwardPayload prefix = { 0 };
+	ClusterR4OperationRequest request = { 0 };
+	ClusterR4OperationContextWire wire;
+	ClusterR4OperationForwardPayload frame;
+	prefix.base.requester_backend_id = CLUSTER_GCS_BLOCK_R4_INTERNAL_ENDPOINT;
+	prefix.extension.r4_version = CLUSTER_R4_WIRE_VERSION;
+	prefix.extension.r4_kind = CLUSTER_R4_WIRE_UNDO_DATA_FETCH;
+	request.tag = make_tag(1663, 5, 26000, MAIN_FORKNUM, 101);
+	request.head = (ClusterItlSlotData){ .xid = 798,
+										 .flags = ITL_FLAG_ACTIVE,
+										 .write_scn = 100,
+										 .undo_segment_head = uba_encode(1, 7, 3, 1) };
+	UT_ASSERT(ClusterR4OperationContextEncode(&wire, &request));
+	memcpy(frame.bytes, &prefix, sizeof(prefix));
+	memcpy(frame.bytes + sizeof(prefix), &wire, sizeof(wire));
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &frame,
+												 sizeof(frame), CLUSTER_LMS_MAX_WORKERS),
+				 0);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &frame,
+												 sizeof(frame) - 1, CLUSTER_LMS_MAX_WORKERS),
+				 -1);
+	for (unsigned variant = 0; variant < 4; variant++) {
+		ClusterR4OperationForwardPayload bad = frame;
+		if (variant == 0)
+			bad.bytes[96] ^= 1;
+		if (variant == 1)
+			bad.bytes[96 + 4] = 0x80;
+		if (variant == 2) {
+			prefix.extension.r4_kind = CLUSTER_R4_WIRE_CR_BUILD;
+			memcpy(bad.bytes, &prefix, sizeof(prefix));
+		}
+		if (variant == 3) {
+			prefix.extension.r4_kind = CLUSTER_R4_WIRE_UNDO_DATA_FETCH;
+			prefix.base.requester_backend_id = 1;
+			memcpy(bad.bytes, &prefix, sizeof(prefix));
+		}
+		UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &bad,
+													 sizeof(bad), CLUSTER_LMS_MAX_WORKERS),
+					 -1);
+	}
+}
+
 UT_TEST(test_r4_kind4_internal_endpoint_routes_only_to_data_worker0)
 {
 	ClusterR4InternalForwardPayload forward;
@@ -926,7 +970,7 @@ UT_TEST(test_first_fill_service_wire_routes_only_canonical_extension)
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(18);
 	UT_RUN(test_first_fill_service_wire_routes_only_canonical_extension);
 	UT_RUN(test_route_matches_shard_for_tag);
 	UT_RUN(test_route_ack_request_interleave_affinity);
@@ -937,6 +981,7 @@ main(void)
 	UT_RUN(test_route_ignores_non_tag_fields);
 	UT_RUN(test_r4_extended_route_exact_lengths_and_tag_affinity);
 	UT_RUN(test_r4_kind4_internal_endpoint_routes_only_to_data_worker0);
+	UT_RUN(test_operation_kind4_196_routes_only_complete_context_to_worker0);
 	UT_RUN(test_r4_kind2_terminal_census_routes_to_existing_data_worker0);
 	UT_RUN(test_r4_extended_route_length_mismatch_refused);
 	UT_RUN(test_current_mx_forward128_routes_by_request_identity);

@@ -400,10 +400,12 @@ test_cluster_gcs_block_dedup: test_cluster_gcs_block_dedup.c unit_test.h $(CLUST
 CLUSTER_GCS_BLOCK_SHARD_O = $(top_builddir)/src/backend/cluster/cluster_gcs_block_shard.o
 test_cluster_gcs_block_shard: test_cluster_gcs_block_shard.c unit_test.h $(CLUSTER_VERSION_O) \
 		$(CLUSTER_GCS_BLOCK_SHARD_O) $(CLUSTER_LMS_SHARD_O) \
-		$(CLUSTER_RESOURCE_X_IDENTITY_O) $(CLUSTER_RESOURCE_X_NODE_WIRE_O)
+		$(CLUSTER_RESOURCE_X_IDENTITY_O) $(CLUSTER_RESOURCE_X_NODE_WIRE_O) \
+		$(top_builddir)/src/backend/cluster/cluster_uba.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_GCS_BLOCK_SHARD_O) $(CLUSTER_LMS_SHARD_O) \
 		$(CLUSTER_RESOURCE_X_IDENTITY_O) $(CLUSTER_RESOURCE_X_NODE_WIRE_O) \
+		$(top_builddir)/src/backend/cluster/cluster_uba.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
@@ -7557,7 +7559,7 @@ test_cluster_r4_tx_outcome: test_cluster_r4_tx_outcome.c unit_test.h \
 		test_cluster_savepoint_origin_plan.inc $(CLUSTER_SAVEPOINT_READER_O) \
 		test_cluster_savepoint_origin_driver.inc \
 		test_cluster_savepoint_cr_consumer.inc test_cluster_savepoint_origin_poll.inc \
-		test_cluster_savepoint_origin_worker.inc test_cluster_savepoint_owner_worker.inc test_cluster_owner_full_fixture.h $(CLUSTER_OPERATION_WORKER_TEST_O) \
+		test_cluster_savepoint_origin_worker.inc test_cluster_savepoint_owner_worker.inc test_cluster_savepoint_peer_worker.inc test_cluster_owner_full_fixture.h $(CLUSTER_OPERATION_WORKER_TEST_O) \
 		test_cluster_hot_bufpage_product.o test_cluster_operation_cr_entry.inc \
 		$(top_builddir)/src/backend/cluster/cluster_cr_apply.o \
 		$(top_srcdir)/src/include/cluster/cluster_cr.h \
@@ -13149,3 +13151,11 @@ test_cluster_first_fill_retire: test_cluster_first_fill_retire.c test_cluster_pc
 # Exact new-cluster requester owner carrier (the generic standalone recipe).
 test_cluster_r4_owner_challenge: $(top_srcdir)/src/include/cluster/cluster_gcs_block.h \
 		$(top_srcdir)/src/include/cluster/cluster_grd_outbound.h
+
+# Peer operation codecs are header-only and must invalidate every consumer.
+test_cluster_r4_wire_codec test_cluster_r4_route_policy test_cluster_r4_slot_machine \
+        test_cluster_r4_slot_reservation test_cluster_r4_tx_outcome \
+        test_cluster_gcs_block_shard test_cluster_r4_gcs_block_product.o \
+        test_cluster_r4_slot_reservation_product.o test_cluster_r4_continuation_cr_product.o \
+        test_cluster_operation_worker_product.o test_cluster_r4_runtime_visibility_exact.o: \
+        $(top_srcdir)/src/include/cluster/cluster_r4_operation.h

@@ -106,7 +106,7 @@ run_wire_vector(int vector)
 			offsetof(ClusterR4ForwardExtension, kind.cr.master_resource_transition_count_le), 12);
 		break;
 	case 3:
-		UT_ASSERT_EQ(CLUSTER_R4_WIRE_VERSION, 2);
+		UT_ASSERT_EQ(CLUSTER_R4_WIRE_VERSION, 3);
 		break;
 	case 4:
 		UT_ASSERT_EQ(CLUSTER_R4_FORWARD_EXTENDED, 6);
@@ -741,10 +741,113 @@ UT_TEST(test_kind4_generation_request_distinguishes_origin_sample_from_zero)
 															 &decoded, &generation));
 }
 
+UT_TEST(test_foreign_operation_context_exact_le_and_rejects_partial)
+{
+#ifdef CLUSTER_R4_OPERATION_WIRE_PRESENT
+	ClusterR4OperationRequest input = { 0 }, output;
+	ClusterR4OperationContextWire wire, changed;
+
+	input.tag.spcOid = 0x01020304;
+	input.tag.dbOid = 5;
+	input.tag.relNumber = 6;
+	input.tag.blockNum = 7;
+	input.head.xid = 797;
+	input.head.wrap = 8;
+	input.head.flags = ITL_FLAG_COMMITTED;
+	input.head.undo_segment_head = uba_encode(1, 7, 3, 0);
+	input.head.commit_scn = 80;
+	input.head.write_scn = 70;
+	UT_ASSERT(ClusterR4OperationContextEncode(&wire, &input));
+	UT_ASSERT_EQ(sizeof(wire), 100);
+	UT_ASSERT_EQ(sizeof(ClusterR4OperationForwardPayload), 196);
+	UT_ASSERT_EQ(wire.bytes[8], 4);
+	UT_ASSERT_EQ(wire.bytes[11], 1);
+	UT_ASSERT(ClusterR4OperationContextDecode(&wire, &output));
+	UT_ASSERT_EQ(memcmp(&input, &output, sizeof(input)), 0);
+	for (unsigned i = 0; i < 24; i++) {
+		changed = wire;
+		changed.bytes[76 + i] = 1;
+		UT_ASSERT(!ClusterR4OperationContextDecode(&changed, &output));
+	}
+	for (unsigned i = 0; i < 8; i++) {
+		changed = wire;
+		changed.bytes[i] ^= 0x80;
+		UT_ASSERT(!ClusterR4OperationContextDecode(&changed, &output));
+	}
+	input.retained = true;
+	input.identity.top_fxid = input.identity.operation_fxid
+		= FullTransactionIdFromEpochAndXid(9, 797);
+	input.identity.canonical.segment_id = 2;
+	input.identity.canonical.xid = 797;
+	input.identity.canonical.slot_offset = 3;
+	input.identity.canonical.wrap = 7;
+	input.identity.canonical_generation = 23;
+	input.identity.command_id = InvalidCommandId;
+	input.identity.subid = TopSubTransactionId;
+	UT_ASSERT(ClusterR4OperationContextEncode(&wire, &input));
+	UT_ASSERT(ClusterR4OperationContextDecode(&wire, &output));
+	UT_ASSERT_EQ(memcmp(&input, &output, sizeof(input)), 0);
+#else
+	UT_ASSERT(false); /* Missing explicit 100B operation context. */
+#endif
+}
+
+UT_TEST(test_foreign_operation_proof_exact_le_and_closed_domain)
+{
+#ifdef CLUSTER_R4_OPERATION_WIRE_PRESENT
+	ClusterR4PeerOperationProof input = { 0 }, output;
+	ClusterR4PeerOperationWire wire, changed;
+	unsigned invalid_offsets[] = { 0, 4, 6, 8, 9, 10, 11, 28, 29, 30, 31 };
+
+	input.flags = CLUSTER_R4_OPERATION_ORDERED | CLUSTER_R4_OPERATION_CHILD;
+	input.identity.canonical.segment_id = 2;
+	input.identity.canonical.xid = 797;
+	input.identity.canonical.slot_offset = 3;
+	input.identity.canonical.wrap = 7;
+	input.identity.canonical_generation = 23;
+	input.identity.top_fxid = FullTransactionIdFromEpochAndXid(9, 797);
+	input.identity.operation_fxid = FullTransactionIdFromEpochAndXid(9, 798);
+	input.identity.operation_sequence = 12;
+	input.identity.command_id = 8;
+	input.identity.subid = 4;
+	input.effect = CLUSTER_SAVEPOINT_EFFECT_DISCARDED;
+	input.record_format = 2;
+	input.outcome = CLUSTER_TX_COMMITTED;
+	input.proof_kind = CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG;
+	input.commit_scn = 80;
+	input.admission_generation = 5;
+	input.uba = uba_encode(1, 7, 3, 0);
+	UT_ASSERT(ClusterR4PeerOperationEncode(&wire, &input));
+	UT_ASSERT_EQ(sizeof(wire), 96);
+	UT_ASSERT_EQ(CLUSTER_R4_OPERATION_REPLY_SIZE, 8352);
+	UT_ASSERT_EQ(CLUSTER_R4_OPERATION_CHECKSUM_SIZE, 8304);
+	UT_ASSERT_EQ(wire.bytes[32], 0x1d);
+	UT_ASSERT_EQ(wire.bytes[33], 3);
+	UT_ASSERT_EQ(wire.bytes[36], 9);
+	UT_ASSERT(ClusterR4PeerOperationDecode(&wire, &output));
+	UT_ASSERT_EQ(memcmp(&input, &output, sizeof(input)), 0);
+	for (unsigned i = 0; i < lengthof(invalid_offsets); i++) {
+		changed = wire;
+		changed.bytes[invalid_offsets[i]] ^= 0x80;
+		UT_ASSERT(!ClusterR4PeerOperationDecode(&changed, &output));
+		UT_ASSERT(bytes_are_zero((uint8 *)&output, sizeof(output)));
+	}
+	input.outcome = CLUSTER_TX_UNKNOWN;
+	UT_ASSERT(!ClusterR4PeerOperationEncode(&wire, &input));
+	input.outcome = CLUSTER_TX_IN_PROGRESS;
+	input.commit_scn = InvalidScn;
+	UT_ASSERT(ClusterR4PeerOperationEncode(&wire, &input));
+	input.flags &= ~CLUSTER_R4_OPERATION_ORDERED;
+	UT_ASSERT(!ClusterR4PeerOperationEncode(&wire, &input));
+#else
+	UT_ASSERT(false); /* Missing independent 96B peer proof. */
+#endif
+}
+
 int
 main(void)
 {
-	UT_PLAN(96);
+	UT_PLAN(98);
 	UT_RUN(test_kind4_generation_request_distinguishes_origin_sample_from_zero);
 	RUN_WIRE_TEST(0);
 	RUN_WIRE_TEST(1);
@@ -841,6 +944,8 @@ main(void)
 	UT_RUN(test_r4_and_legacy_reply_status_domains_are_disjoint);
 	UT_RUN(test_r4_undo_data_status_selects_existing_authenticated_reply_shape);
 	UT_RUN(test_r4_status24_physical_generation_echo_is_exact);
+	UT_RUN(test_foreign_operation_context_exact_le_and_rejects_partial);
+	UT_RUN(test_foreign_operation_proof_exact_le_and_closed_domain);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

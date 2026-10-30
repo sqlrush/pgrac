@@ -54,6 +54,8 @@ typedef struct ClusterTxResolution ClusterTxResolution;
 typedef struct ClusterSavepointOperation ClusterSavepointOperation;
 typedef struct ClusterSavepointReaderRecord ClusterSavepointReaderRecord;
 typedef struct ClusterSavepointReaderIdentity ClusterSavepointReaderIdentity;
+typedef struct ClusterR4OperationRequest ClusterR4OperationRequest;
+typedef struct ClusterR4PeerOperationProof ClusterR4PeerOperationProof;
 typedef struct buftag BufferTag;
 typedef struct ClusterSemanticAdmissionToken ClusterSemanticAdmissionToken;
 typedef struct ClusterUndoBlock0Generation ClusterUndoBlock0Generation;
@@ -226,6 +228,21 @@ extern ClusterTxOutcome cluster_runtime_visibility_origin_plan_copy_operation_he
 	const ClusterSemanticAdmissionToken *admission, ClusterUndoBlock0CurrentGuard *guard,
 	const ClusterUndoBlock0ResolvedRoot *root, ClusterTxResolution *top_out,
 	ClusterSavepointReaderRecord *operation_out, char data_out[BLCKSZ],
+	ClusterTxResolveReason *reason_out);
+
+extern ClusterRuntimeVisibilityOriginStep cluster_runtime_visibility_origin_plan_discover_peer_held(
+	const ClusterTxLocator *locator, const ClusterR4OperationRequest *request,
+	ClusterTxResolveMode mode, const ClusterSemanticAdmissionToken *admission,
+	const ClusterUndoBlock0Generation *expected_generation, ClusterUndoBlock0CurrentGuard *guard,
+	const ClusterUndoBlock0ResolvedRoot *root, ClusterRuntimeVisibilityOriginPlan *plan,
+	ClusterTxResolveReason *reason_out);
+/* Stages an unordered peer value. Only the original FSM may mark it ordered
+ * after the final release and qualification. Missing original FullXid refuses. */
+extern ClusterTxOutcome cluster_runtime_visibility_origin_plan_copy_peer_held(
+	ClusterRuntimeVisibilityOriginPlan *plan, ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission, ClusterUndoBlock0CurrentGuard *guard,
+	const ClusterUndoBlock0ResolvedRoot *root, ClusterTxResolution *top_out,
+	ClusterR4PeerOperationProof *peer_out, char data_out[BLCKSZ],
 	ClusterTxResolveReason *reason_out);
 
 /* Process-local, address-stable continuation. Zero-initialize before begin;

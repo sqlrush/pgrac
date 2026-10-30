@@ -227,6 +227,7 @@ static uint32 ut_state_at_enter;
 static uint32 ut_state_at_recheck;
 static uint32 ut_state_at_peer_open[2];
 static bool ut_peer_open_ok;
+static uint32 ut_origin_capability_generation = 29;
 static int ut_peer_open_calls;
 static int32 ut_peer_open_peers[2];
 static uint32 ut_peer_open_required[2];
@@ -821,6 +822,18 @@ cluster_semantic_activation_recheck(const ClusterSemanticAdmissionToken *token)
 }
 
 bool
+cluster_sf_peer_capability_family_sample(int32 peer, uint32 required, uint32 optional,
+										 bool *supported, uint32 *generation)
+{
+	(void)peer;
+	UT_ASSERT_EQ(required, UT_R4_REQUIRED_CAPABILITIES);
+	UT_ASSERT_EQ(optional, 0);
+	*supported = false;
+	*generation = ut_origin_capability_generation;
+	return true;
+}
+
+bool
 cluster_semantic_activation_peer_open_matches(const ClusterSemanticAdmissionToken *token,
 											  int32 authenticated_peer_node_id,
 											  uint32 required_hello_caps,
@@ -930,7 +943,7 @@ static ClusterR4CrForwardPayload
 submit_test_forward96(void)
 {
 	static const uint8 extension_bytes[32]
-		= { 0x02, 0x01, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00,
+		= { 0x03, 0x01, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00,
 			0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x22, 0x22,
 			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
 	ClusterR4CrForwardPayload forward;
@@ -1020,6 +1033,7 @@ reset_submit_fixture(ClusterLmsSharedState *state)
 	ut_state_at_recheck = UINT32_MAX;
 	memset(ut_state_at_peer_open, 0xff, sizeof(ut_state_at_peer_open));
 	ut_peer_open_ok = true;
+	ut_origin_capability_generation = 29;
 	ut_peer_open_calls = 0;
 	memset(ut_peer_open_peers, 0, sizeof(ut_peer_open_peers));
 	memset(ut_peer_open_required, 0, sizeof(ut_peer_open_required));
@@ -1246,6 +1260,7 @@ prepare_worker0_claim_owner(ClusterLmsSharedState *state, const ClusterR4CrOwner
 	ut_state_at_recheck = UINT32_MAX;
 	memset(ut_state_at_peer_open, 0xff, sizeof(ut_state_at_peer_open));
 	ut_peer_open_ok = true;
+	ut_origin_capability_generation = 29;
 	ut_peer_open_calls = 0;
 	memset(ut_peer_open_peers, 0, sizeof(ut_peer_open_peers));
 	memset(ut_peer_open_required, 0, sizeof(ut_peer_open_required));
@@ -1344,7 +1359,7 @@ static void
 assert_exact_foreign_undo_forward96(void)
 {
 	static const uint8 extension_bytes[32]
-		= { 0x02, 0x04, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x09, 0x00, 0x00,
+		= { 0x03, 0x04, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x09, 0x00, 0x00,
 			0x00, 0x03, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1d, 0x03,
 			0x00, 0x00, 0x07, 0x00, 0x01, 0x00, 0x04, 0x03, 0x02, 0x01 };
 	const ClusterR4InternalForwardPayload *forward
@@ -2830,6 +2845,244 @@ UT_TEST(test_all_four_legacy_submitters_use_common_reserver)
 	free(source);
 }
 
+/* Original server enqueue/landing, real record decoder; builder and physical
+ * current authority are explicit fixture boundaries. */
+static ClusterLmsCrSlot *
+prepare_peer_landing(ClusterLmsSharedState *state, PGAlignedBlock *page,
+					 GcsBlockReplyHeader *header, ClusterGcsUndoAuthTrailer *auth,
+					 ClusterICEnvelope *env, ClusterR4PeerOperationWire *wire)
+{
+	ClusterLmsCrSlot *slot = prepare_worker0_need_undo(state);
+	ClusterR4OperationRequest request = { 0 };
+	ClusterR4PeerOperationProof peer = { 0 };
+	UndoBlockHeader *block = (UndoBlockHeader *)page->data;
+	UndoRecordHeader *record = (UndoRecordHeader *)(block + 1);
+	UndoInsertPayload insert = { UT_READ_SCN + 1, 0 };
+	UndoItlHistoryTrailer history = { 0 };
+	UndoOperationTrailer tail = { 0 };
+	UndoSlotDirEntry *directory;
+	char *body = (char *)(record + 1);
+
+	request.tag = slot->tag;
+	request.head.xid = ut_pending_locator.xid;
+	request.head.flags = ut_pending_locator.itl_kind;
+	request.head.wrap = 8;
+	request.head.undo_segment_head = ut_pending_locator.uba;
+	request.head.write_scn = UT_READ_SCN + 10;
+	UT_ASSERT(ClusterR4OperationContextEncode(&slot->r4.foreign_operation, &request));
+	UT_ASSERT(cluster_cr_server_test_r4_send_foreign_undo(0));
+	UT_ASSERT_EQ(ut_send_length, 196);
+	make_foreign_undo_reply(header, auth, env, page->data);
+	env->payload_length = CLUSTER_R4_OPERATION_REPLY_SIZE;
+	memset(page->data, 0, BLCKSZ);
+	block->magic = PGRAC_UNDO_BLOCK_MAGIC;
+	block->block_version = UNDO_BLOCK_VERSION_1;
+	block->slot_count = 7;
+	record->record_type = UNDO_RECORD_INSERT;
+	record->flags
+		= UNDO_REC_FLAG_FIRST_IN_TX | UNDO_REC_FLAG_HAS_ITL_HISTORY | UNDO_REC_FLAG_HAS_OPERATION;
+	record->xid = request.head.xid + 1;
+	record->origin_node_id = 1;
+	record->tt_slot_segment_id = 258;
+	record->tt_slot_id = 4;
+	record->tt_wrap_plus1 = 8;
+	record->write_scn = request.head.write_scn;
+	record->target_locator
+		= (RelFileLocator){ request.tag.spcOid, request.tag.dbOid, request.tag.relNumber };
+	record->target_fork = request.tag.forkNum;
+	record->target_block = request.tag.blockNum;
+	record->target_offset = 1;
+	history.magic = UNDO_ITL_HISTORY_MAGIC;
+	history.version = UNDO_ITL_HISTORY_VERSION;
+	history.count = 1;
+	history.entries[0].block = request.tag.blockNum;
+	history.entries[0].slot_index = ut_pending_locator.itl_slot_index;
+	history.entries[0].after_kind = ITL_FLAG_ACTIVE;
+	history.entries[0].after_write_scn = record->write_scn;
+	history.entries[0].prior.wrap = request.head.wrap;
+	tail.version = UNDO_OPERATION_TRAILER_VERSION;
+	tail.length = sizeof(tail);
+	tail.effect_state = CLUSTER_SAVEPOINT_EFFECT_DISCARDED;
+	tail.canonical_top_fxid
+		= U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(9, request.head.xid));
+	tail.operation_fxid = tail.canonical_top_fxid + 1;
+	tail.operation_sequence = 12;
+	tail.canonical_segment_generation = 23;
+	tail.command_id = 8;
+	tail.subid = 4;
+	record->payload_length = sizeof(insert) + sizeof(history) + sizeof(tail);
+	memcpy(body, &insert, sizeof(insert));
+	memcpy(body + sizeof(insert), &history, sizeof(history));
+	memcpy(body + sizeof(insert) + sizeof(history), &tail, sizeof(tail));
+	block->free_offset = sizeof(*block) + sizeof(*record) + record->payload_length;
+	directory = UNDO_SLOT_DIR_PTR(page->data, 6);
+	directory->record_offset = sizeof(*block);
+	directory->record_length = sizeof(*record) + record->payload_length;
+	directory->record_type = record->record_type;
+	directory->flags = record->flags;
+	peer.identity.canonical = (ClusterTTSlotPhysicalLocator){ .segment_id = 258,
+															  .xid = request.head.xid,
+															  .slot_offset = 3,
+															  .wrap = 7 };
+	peer.identity.canonical_generation = 23;
+	peer.identity.top_fxid = FullTransactionIdFromU64(tail.canonical_top_fxid);
+	peer.identity.operation_fxid = FullTransactionIdFromU64(tail.operation_fxid);
+	peer.identity.operation_sequence = 12;
+	peer.identity.command_id = 8;
+	peer.identity.subid = 4;
+	peer.flags = CLUSTER_R4_OPERATION_ORDERED | CLUSTER_R4_OPERATION_CHILD;
+	peer.effect = tail.effect_state;
+	peer.record_format = 2;
+	peer.outcome = CLUSTER_TX_COMMITTED;
+	peer.proof_kind = CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG;
+	peer.commit_scn = UT_READ_SCN + 20;
+	peer.admission_generation = UT_ACTIVATION_GENERATION;
+	peer.uba = request.head.undo_segment_head;
+	UT_ASSERT(ClusterR4PeerOperationEncode(wire, &peer));
+	header->checksum = ClusterR4OperationChecksum(page->data, auth, wire);
+	return slot;
+}
+
+UT_TEST(test_peer_operation_original_enqueue_and_landing_publish_exact_ready)
+{
+	ClusterLmsSharedState state;
+	PGAlignedBlock page;
+	GcsBlockReplyHeader header;
+	ClusterICEnvelope env;
+	struct {
+		ClusterGcsUndoAuthTrailer auth;
+		ClusterR4PeerOperationWire proof;
+	} tail;
+	ClusterLmsCrSlot *slot
+		= prepare_peer_landing(&state, &page, &header, &tail.auth, &env, &tail.proof);
+
+	UT_ASSERT(!cluster_cr_server_r4_land_foreign_undo(&env, &header, page.data, &tail.auth));
+	UT_ASSERT(cluster_cr_server_r4_land_peer_operation(&env, &header, page.data, &tail.auth,
+													   &tail.proof));
+	UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state), CLUSTER_LMS_CR_R4_UNDO_READY);
+	UT_ASSERT_EQ(memcmp(&slot->r4.peer_operation, &tail.proof, sizeof(tail.proof)), 0);
+	UT_ASSERT_EQ(memcmp(slot->foreign_undo_page, page.data, BLCKSZ), 0);
+	UT_ASSERT(!cluster_cr_server_r4_land_peer_operation(&env, &header, page.data, &tail.auth,
+														&tail.proof));
+}
+
+UT_TEST(test_peer_operation_landing_rejects_changed_context_and_payload)
+{
+	for (unsigned variant = 0; variant < 21; variant++) {
+		ClusterLmsSharedState state;
+		PGAlignedBlock page;
+		GcsBlockReplyHeader header;
+		ClusterICEnvelope env;
+		struct {
+			ClusterGcsUndoAuthTrailer auth;
+			ClusterR4PeerOperationWire proof;
+		} tail;
+		ClusterLmsCrSlot *slot
+			= prepare_peer_landing(&state, &page, &header, &tail.auth, &env, &tail.proof);
+		switch (variant) {
+		case 0:
+			ut_peer_open_ok = false;
+			break;
+		case 1:
+			slot->r4.route_proof.master_authority_generation++;
+			break;
+		case 2:
+			ut_recheck_ok = false;
+			break;
+		case 3:
+			slot->r4.slot_generation++;
+			break;
+		case 4:
+			slot->r4.owner.builder_incarnation++;
+			break;
+		case 5:
+			slot->r4.owner.edge_owner_worker_id++;
+			break;
+		case 6:
+			env.source_node_id++;
+			break;
+		case 7:
+			header.request_id += CLUSTER_LMS_CR_SLOTS;
+			break;
+		case 8:
+			((uint8 *)&tail.auth)[0] ^= 1;
+			break; /* CRC includes auth */
+		case 9:
+			tail.proof.bytes[40] ^= 1;
+			break; /* CRC includes proof */
+		case 10:
+			env.payload_length--;
+			break;
+		case 11:
+			slot->r4.foreign_operation.bytes[96] ^= 1;
+			break;
+		case 12:
+			page.data[sizeof(UndoBlockHeader) + offsetof(UndoRecordHeader, target_block)] ^= 1;
+			break;
+		case 13:
+			tail.proof.bytes[32] ^= 1;
+			break;
+		case 14:
+			tail.proof.bytes[16] ^= 1;
+			break;
+		case 15:
+			tail.proof.bytes[80] ^= 1;
+			break;
+		case 16:
+			tail.proof.bytes[28] = CLUSTER_SAVEPOINT_EFFECT_LIVE;
+			break;
+		case 17:
+			tail.proof.bytes[8] = CLUSTER_R4_OPERATION_CHILD;
+			break;
+		case 18:
+			tail.proof.bytes[72] ^= 1;
+			break;
+		case 19:
+			slot->r4.route_proof.master_resource_transition_count++;
+			break;
+		case 20:
+			ut_origin_capability_generation++;
+			break;
+		}
+		if (variant >= 12)
+			header.checksum = ClusterR4OperationChecksum(page.data, &tail.auth, &tail.proof);
+		UT_ASSERT(!cluster_cr_server_r4_land_peer_operation(&env, &header, page.data, &tail.auth,
+															&tail.proof));
+		UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state), CLUSTER_LMS_CR_R4_UNDO_INFLIGHT);
+		UT_ASSERT(bytes_are(slot->foreign_undo_page, BLCKSZ, 0));
+		UT_ASSERT(bytes_are((char *)&slot->r4.peer_operation, sizeof(slot->r4.peer_operation), 0));
+	}
+}
+
+UT_TEST(test_peer_operation_ready_cleanup_and_cancel_forget_both_values)
+{
+	for (unsigned cancel = 0; cancel < 2; cancel++) {
+		ClusterLmsSharedState state;
+		PGAlignedBlock page;
+		GcsBlockReplyHeader header;
+		ClusterICEnvelope env;
+		struct {
+			ClusterGcsUndoAuthTrailer auth;
+			ClusterR4PeerOperationWire proof;
+		} tail;
+		ClusterLmsCrSlot *slot
+			= prepare_peer_landing(&state, &page, &header, &tail.auth, &env, &tail.proof);
+		UT_ASSERT(cluster_cr_server_r4_land_peer_operation(&env, &header, page.data, &tail.auth,
+														   &tail.proof));
+		ut_builder_publish_foreign_pause = false;
+		ut_builder_step_result = CLUSTER_R4_CR_STEP_FULL;
+		ut_builder_throw_query_cancel = cancel;
+		UT_ASSERT(cluster_cr_server_test_r4_build_step(0));
+		UT_ASSERT(bytes_are(slot->foreign_undo_page, BLCKSZ, 0));
+		UT_ASSERT(bytes_are((char *)&slot->r4.peer_operation, sizeof(slot->r4.peer_operation), 0));
+		UT_ASSERT(cluster_cr_server_test_r4_ship_terminal(0));
+		UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state), CLUSTER_LMS_CR_FREE);
+		UT_ASSERT_EQ(ut_forget_calls, 1);
+		UT_ASSERT(!cluster_cr_server_r4_land_peer_operation(&env, &header, page.data, &tail.auth,
+															&tail.proof));
+	}
+}
+
 UT_TEST(test_r4_worker0_ready_undo_resumes_and_releases_original_owner)
 {
 	ClusterLmsSharedState state;
@@ -3418,7 +3671,7 @@ UT_TEST(test_owner_challenge_survives_holder_full_and_cancel_terminal_cleanup)
 int
 main(void)
 {
-	UT_PLAN(55);
+	UT_PLAN(58);
 	UT_RUN(test_normal_stop_cr_requires_initialized_actual_owner);
 	UT_RUN(test_normal_stop_cr_all_owned_states_not_recovery_drain);
 	UT_RUN(test_normal_stop_cr_original_terminal_must_release_local_context);
@@ -3474,6 +3727,9 @@ main(void)
 	UT_RUN(test_all_four_legacy_submitters_use_common_reserver);
 	UT_RUN(test_r4_protocol_detail_budget_never_changes_terminal);
 	UT_RUN(test_owner_challenge_survives_holder_full_and_cancel_terminal_cleanup);
+	UT_RUN(test_peer_operation_original_enqueue_and_landing_publish_exact_ready);
+	UT_RUN(test_peer_operation_landing_rejects_changed_context_and_payload);
+	UT_RUN(test_peer_operation_ready_cleanup_and_cancel_forget_both_values);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

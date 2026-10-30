@@ -64,6 +64,7 @@
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_runtime_visibility.h"
 #include "cluster/cluster_savepoint_reader.h"
+#include "cluster/cluster_r4_operation.h"
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_semantic_activation.h"
@@ -2468,6 +2469,24 @@ cluster_runtime_visibility_origin_plan_discover_operation_head_held(
 		reason_out, false);
 }
 
+ClusterRuntimeVisibilityOriginStep
+cluster_runtime_visibility_origin_plan_discover_peer_held(
+	const ClusterTxLocator *locator, const ClusterR4OperationRequest *request,
+	ClusterTxResolveMode mode, const ClusterSemanticAdmissionToken *admission,
+	const ClusterUndoBlock0Generation *expected_generation, ClusterUndoBlock0CurrentGuard *guard,
+	const ClusterUndoBlock0ResolvedRoot *root, ClusterRuntimeVisibilityOriginPlan *plan,
+	ClusterTxResolveReason *reason_out)
+{
+	if (!ClusterR4OperationRequestValid(request)) {
+		if (reason_out != NULL)
+			*reason_out = CLUSTER_TX_RESOLVE_PROTOCOL;
+		return CLUSTER_RUNTIME_VISIBILITY_ORIGIN_FAILED;
+	}
+	return cluster_runtime_visibility_origin_plan_freeze_operation_internal(
+		locator, NULL, request->retained ? &request->identity : NULL, &request->head, &request->tag,
+		mode, admission, expected_generation, guard, root, plan, reason_out, false);
+}
+
 bool
 cluster_runtime_visibility_origin_plan_canonical_logical(
 	const ClusterRuntimeVisibilityOriginPlan *plan, ClusterUndoBlock0LogicalKey *logical_out)
@@ -2920,6 +2939,52 @@ cluster_runtime_visibility_origin_plan_copy_operation_held(
 {
 	return cluster_runtime_visibility_origin_plan_copy_operation_internal(
 		plan, mode, admission, guard, root, top_out, operation_out, data_out, reason_out, false);
+}
+
+ClusterTxOutcome
+cluster_runtime_visibility_origin_plan_copy_peer_held(
+	ClusterRuntimeVisibilityOriginPlan *plan, ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission, ClusterUndoBlock0CurrentGuard *guard,
+	const ClusterUndoBlock0ResolvedRoot *root, ClusterTxResolution *top_out,
+	ClusterR4PeerOperationProof *peer_out, char data_out[BLCKSZ],
+	ClusterTxResolveReason *reason_out)
+{
+	ClusterRuntimeVisibilityOriginPlanData *data
+		= cluster_runtime_visibility_origin_plan_data(plan);
+	ClusterSavepointReaderRecord decoded;
+	ClusterTxOutcome outcome;
+	if (peer_out != NULL)
+		memset(peer_out, 0, sizeof(*peer_out));
+	/* The DATA tail is a compare challenge, never its own FullXid source.
+	 * F's exact original/retained source must have been sampled under TT;
+	 * absence cannot cause another acquisition or a raw-xid fallback. */
+	if (data == NULL || peer_out == NULL || top_out == NULL
+		|| data->magic != CLUSTER_RUNTIME_VISIBILITY_ORIGIN_PLAN_MAGIC || !data->valid
+		|| !data->operation_plan || !data->candidate_valid
+		|| !FullTransactionIdIsNormal(data->candidate.local_original_full_xid)
+		|| !FullTransactionIdEquals(data->candidate.local_original_full_xid,
+									data->operation.top_fxid)) {
+		if (top_out != NULL)
+			memset(top_out, 0, sizeof(*top_out));
+		if (reason_out != NULL)
+			*reason_out = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+		return CLUSTER_TX_UNKNOWN;
+	}
+	outcome = cluster_runtime_visibility_origin_plan_copy_operation_held(
+		plan, mode, admission, guard, root, top_out, &decoded, data_out, reason_out);
+	if (outcome == CLUSTER_TX_UNKNOWN)
+		return outcome;
+	peer_out->identity = data->operation;
+	peer_out->flags = data->operation.operation_sequence != 0 ? CLUSTER_R4_OPERATION_CHILD
+															  : CLUSTER_R4_OPERATION_V1;
+	peer_out->effect = data->operation.operation_sequence != 0 ? decoded.operation.effect_state : 0;
+	peer_out->record_format = data->operation.operation_sequence != 0 ? 2 : 1;
+	peer_out->outcome = outcome;
+	peer_out->proof_kind = top_out->proof_kind;
+	peer_out->commit_scn = top_out->commit_scn;
+	peer_out->admission_generation = admission->record_generation;
+	peer_out->uba = data->locator.uba;
+	return outcome;
 }
 
 #define CLUSTER_OPERATION_ORIGIN_READ_MAGIC UINT32_C(0x4f505244)
