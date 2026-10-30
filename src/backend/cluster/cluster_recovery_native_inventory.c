@@ -79,6 +79,7 @@ typedef struct NativeInventoryRelmapXid {
 	bool applied_clog; /* opt-in historical execution input, not lifetime authority */
 	bool consumed_clog; /* original native/cold routes remain distinct */
 	bool local_bounds; /* compare existing own-origin native inputs only */
+	bool initialized_pages; /* require actual matching-origin FULL initialization */
 	uint32 clog_expected[CLUSTER_WAL_INPUTS_MAX], clog_matched[CLUSTER_WAL_INPUTS_MAX];
 } NativeInventoryRelmapXid;
 
@@ -3161,6 +3162,26 @@ history_pending_local_bounds(const ClusterRelmapClogBaseV1 *base,
 		&& (TransactionId)((TransactionId)query - base->oldest_clog_xid) < span;
 }
 
+/* Compare actual native initialization, never fill unknown input from WAL,
+ * query epoch or another origin. The original reads already bracket the full
+ * physical reread; no new read or rebasing is permitted at this gate. */
+static bool
+history_pending_initialized_pages(const ClusterRecoveryRelmapHistory *history)
+{
+	if (history->native_pages == NULL || history->native_page_count == 0
+		|| history->native_page_count > CLUSTER_RECOVERY_RELMAP_CLOG_HISTORY_MAX)
+		return false;
+	for (uint32 i = 0; i < history->native_page_count; ++i) {
+		const NativeRelmapPage *page = &history->native_pages[i];
+		const ClusterRelmapClogBaseV1 *native = &page->observed.native;
+
+		if (!page->read || !native->resident_birth_observed
+			|| native->resident_first_full_xid != page->observed.birth.first_full_xid)
+			return false;
+	}
+	return true;
+}
+
 static bool
 history_pending_terminal_read(ClusterRecoveryRelmapHistory *history,
 	const ClusterRelmapV2Image *pending, ClusterRecoveryRelmapPendingTerminalV1 *out,
@@ -3247,6 +3268,7 @@ history_pending_terminal_read(ClusterRecoveryRelmapHistory *history,
 					xid->all_native))
 				&& (!xid->local_bounds || history_pending_local_bounds(&result.base.native,
 					pending, &birth->inputs))
+				&& (!xid->initialized_pages || history_pending_initialized_pages(history))
 				&& memcmp(&birth->inputs.history, &result.base.history,
 					sizeof(result.base.history)) == 0
 				&& saved->source_index == birth->inputs.history.observation.source_index
@@ -3777,7 +3799,7 @@ history_pending_native_read(ClusterRecoveryRelmapHistory *history,
 	const ClusterRelmapV2Image *pending, ClusterRecoveryRelmapPendingNativeV1 *out,
 	ClusterRecoveryNativeInventoryDiag *diag, bool side_clog,
 	ClusterRecoveryRelmapPendingAllNativeV1 *all_native, bool hold_native_pages, bool applied_clog,
-	bool consumed_clog, bool local_bounds)
+	bool consumed_clog, bool local_bounds, bool initialized_pages)
 {
 	ClusterRecoveryRelmapPendingNativeV1 result = {0};
 	NativeInventoryRelmapXid xid = {0};
@@ -3788,6 +3810,7 @@ history_pending_native_read(ClusterRecoveryRelmapHistory *history,
 	xid.applied_clog = applied_clog;
 	xid.consumed_clog = consumed_clog;
 	xid.local_bounds = local_bounds;
+	xid.initialized_pages = initialized_pages;
 	if (pending == NULL || out == NULL || diag == NULL
 		|| history_overlap(out, sizeof(*out), pending, sizeof(*pending))
 		|| history_overlap(diag, sizeof(*diag), pending, sizeof(*pending))
@@ -3808,7 +3831,7 @@ cluster_recovery_relmap_history_pending_native_v1(ClusterRecoveryRelmapHistory *
 	const ClusterRelmapV2Image *pending, ClusterRecoveryRelmapPendingNativeV1 *out,
 	ClusterRecoveryNativeInventoryDiag *diag)
 {
-	return history_pending_native_read(history, pending, out, diag, false, NULL, false, false, false, false);
+	return history_pending_native_read(history, pending, out, diag, false, NULL, false, false, false, false, false);
 }
 
 bool
@@ -3816,7 +3839,7 @@ cluster_recovery_relmap_history_pending_native_side_v1(ClusterRecoveryRelmapHist
 	const ClusterRelmapV2Image *pending, ClusterRecoveryRelmapPendingNativeV1 *out,
 	ClusterRecoveryNativeInventoryDiag *diag)
 {
-	return history_pending_native_read(history, pending, out, diag, true, NULL, false, false, false, false);
+	return history_pending_native_read(history, pending, out, diag, true, NULL, false, false, false, false, false);
 }
 
 bool
@@ -3834,7 +3857,7 @@ cluster_recovery_relmap_history_pending_all_native_v1(ClusterRecoveryRelmapHisto
 		|| history_storage_overlap(history, diag, sizeof(*diag)))
 		return false;
 	memset(out, 0, sizeof(*out));
-	if (!history_pending_native_read(history, pending, &result.query, diag, true, &result, false, false, false, false))
+	if (!history_pending_native_read(history, pending, &result.query, diag, true, &result, false, false, false, false, false))
 		return false;
 	memcpy(out, &result, sizeof(result));
 	return true;
@@ -3843,7 +3866,8 @@ cluster_recovery_relmap_history_pending_all_native_v1(ClusterRecoveryRelmapHisto
 static bool
 history_pending_native_pages_read(ClusterRecoveryRelmapHistory *history,
 	const ClusterRelmapV2Image *pending, ClusterRecoveryRelmapPendingNativePagesV1 *out,
-	ClusterRecoveryNativeInventoryDiag *diag, bool applied_clog, bool consumed_clog, bool local_bounds)
+	ClusterRecoveryNativeInventoryDiag *diag, bool applied_clog, bool consumed_clog, bool local_bounds,
+	bool initialized_pages)
 {
 	ClusterRecoveryRelmapPendingNativePagesV1 result = {0};
 
@@ -3856,7 +3880,7 @@ history_pending_native_pages_read(ClusterRecoveryRelmapHistory *history,
 		return false;
 	memset(out, 0, sizeof(*out));
 	if (!history_pending_native_read(history, pending, &result.inputs.query, diag,
-		true, &result.inputs, true, applied_clog, consumed_clog, local_bounds))
+		true, &result.inputs, true, applied_clog, consumed_clog, local_bounds, initialized_pages))
 		return false;
 	result.page_count = history->native_page_count;
 	history->native_pages_complete = true;
@@ -3869,7 +3893,7 @@ cluster_recovery_relmap_history_pending_native_pages_v1(ClusterRecoveryRelmapHis
 	const ClusterRelmapV2Image *pending, ClusterRecoveryRelmapPendingNativePagesV1 *out,
 	ClusterRecoveryNativeInventoryDiag *diag)
 {
-	return history_pending_native_pages_read(history, pending, out, diag, false, false, false);
+	return history_pending_native_pages_read(history, pending, out, diag, false, false, false, false);
 }
 
 bool
@@ -3877,7 +3901,7 @@ cluster_recovery_relmap_history_pending_applied_pages_v1(ClusterRecoveryRelmapHi
 	const ClusterRelmapV2Image *pending, ClusterRecoveryRelmapPendingNativePagesV1 *out,
 	ClusterRecoveryNativeInventoryDiag *diag)
 {
-	return history_pending_native_pages_read(history, pending, out, diag, true, false, false);
+	return history_pending_native_pages_read(history, pending, out, diag, true, false, false, false);
 }
 
 bool
@@ -3885,7 +3909,7 @@ cluster_recovery_relmap_history_pending_consumed_pages_v1(ClusterRecoveryRelmapH
 	const ClusterRelmapV2Image *pending, ClusterRecoveryRelmapPendingNativePagesV1 *out,
 	ClusterRecoveryNativeInventoryDiag *diag)
 {
-	return history_pending_native_pages_read(history, pending, out, diag, false, true, false);
+	return history_pending_native_pages_read(history, pending, out, diag, false, true, false, false);
 }
 
 bool
@@ -3893,7 +3917,15 @@ cluster_recovery_relmap_history_pending_local_bounds_pages_v1(ClusterRecoveryRel
 	const ClusterRelmapV2Image *pending, ClusterRecoveryRelmapPendingNativePagesV1 *out,
 	ClusterRecoveryNativeInventoryDiag *diag)
 {
-	return history_pending_native_pages_read(history, pending, out, diag, false, true, true);
+	return history_pending_native_pages_read(history, pending, out, diag, false, true, true, false);
+}
+
+bool
+cluster_recovery_relmap_history_pending_initialized_pages_v1(ClusterRecoveryRelmapHistory *history,
+	const ClusterRelmapV2Image *pending, ClusterRecoveryRelmapPendingNativePagesV1 *out,
+	ClusterRecoveryNativeInventoryDiag *diag)
+{
+	return history_pending_native_pages_read(history, pending, out, diag, false, true, false, true);
 }
 
 bool

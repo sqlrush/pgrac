@@ -137,7 +137,7 @@ typedef struct ClusterRelmapClogBaseV1 {
 	/* Actual local next counter, not an issued XID or native era grant. */
 	bool native_next_observed;
 	uint64 next_full_xid;
-	/* Own clean resident FULL initialization, matched to the entire disk page.
+	/* Matching-origin clean resident FULL initialization, matched to the entire disk page.
 	 * Zero/unknown after legacy initialization, eviction or disk-only reload.
 	 * It is a native producer input, not issuance, era or lifetime authority. */
 	bool resident_birth_observed;
@@ -161,10 +161,13 @@ typedef struct ClusterRelmapClogBaseHandleV1 ClusterRelmapClogBaseHandleV1;
  * and whole-ROOT reads, requiring the same actual value and held baseline.
  * Its XidGenLock is released before all I/O; foreign counters stay unobserved.
  * A sampled next counter is not an issued receipt or era/lifetime authority.
- * Own clean resident FULL initialization is compared with the entire fd page,
+ * Matching-origin clean resident FULL initialization is compared with the entire fd page,
  * then sampled again after original ROOT I/O under a short native ControlLock.
  * Eviction, legacy initialization and disk-only reload supply no birth value;
  * an attached observed/value pair cannot be replaced after metadata loss.
+ * A foreign FULL cold apply supplies only its own verified recovery slot.
+ * FULL replay preserves unrelated actual resident slots at original capacity;
+ * target verification reloads disk without recreating its birth input.
  * Foreign origins never borrow this instance's resident initialization.
  * This does not exclude inter-instance writes or certify physical lifetime.
  * Missing/short/aliased files refuse. IN_PROGRESS stays IN_PROGRESS.
@@ -183,7 +186,10 @@ extern size_t cluster_clog_relmap_base_custody_bytes_v1(void);
  * complete terminal record, original source/base/era and mutation authority.
  * These calls neither resolve an unknown transaction nor publish visibility.
  * Own-origin redo retains the ordinary native CLOG owner; an exact durable
- * C0 top ABORT uses that same cache without discarding unrelated dirty bits. */
+ * C0 top ABORT uses that same cache without discarding unrelated dirty bits.
+ * Foreign targets always reload from disk and lose their cached birth input;
+ * successful calls may retain untouched clean FULL slots at native capacity.
+ * An entered failure discards all foreign cached initialization input. */
 extern bool cluster_clog_native_recovery_apply_v1(int origin, TransactionId xid, int nsubxids,
 												  const TransactionId *subxids, XidStatus status);
 extern bool cluster_clog_native_recovery_verify_v1(int origin, TransactionId xid, int nsubxids,

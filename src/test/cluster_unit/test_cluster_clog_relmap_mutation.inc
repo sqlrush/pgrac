@@ -89,6 +89,10 @@ UT_TEST(relmap_native_record_mutations_invalidate_even_unchanged_bytes)
 		else
 			UT_ASSERT(cluster_clog_native_recovery_record_apply_v1(1, &op));
 		UT_ASSERT_EQ(fixture_status(100), TRANSACTION_STATUS_IN_PROGRESS);
+		/* Drop the new clean FULL input before checking equal-byte mutation:
+		 * the original held observation must still remain invalidated. */
+		if (kind == 1)
+			clog_recovery_cache_discard(&ClogRecoveryCtl[1]);
 		relmap_mutation_refuses(&base, &held);
 	}
 }
@@ -171,8 +175,8 @@ UT_TEST(relmap_failed_native_mutation_cannot_revalidate_old_bytes)
 		UT_ASSERT(relmap_mutation_open(1, TRANSACTION_STATUS_COMMITTED, &base, &held));
 		if (held == NULL) return;
 		InRecovery = true;
-		/* Native mutation's original caller owns ERROR lock cleanup. */
-		relmap_base_interrupts = false;
+		/* Exercise terminal cleanup with elog's real holdoff reset. */
+		relmap_base_interrupts = true;
 		if (failure == 0) directory_sync_error = EIO;
 		else fail_dirsync = expect_error = true;
 		PG_TRY();

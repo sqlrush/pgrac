@@ -1810,6 +1810,9 @@ native_held_base_constructor_error_and_later_refusals_keep_custody_sticky(void)
 #include "test_cluster_clog_full_consumer.inc"
 #include "test_cluster_clog_own_full.inc"
 #include "test_cluster_clog_cold_birth.inc"
+#include "test_cluster_clog_foreign_birth.inc"
+#include "test_cluster_clog_full_residency.inc"
+#include "test_cluster_clog_terminal_residency.inc"
 #include "test_cluster_clog_relmap_physical_mutation.inc"
 #include "test_cluster_clog_relmap_native_init.inc"
 #include "test_cluster_clog_relmap_writeback.inc"
@@ -1953,7 +1956,46 @@ main(void)
 		UT_RUN(cold_birth_final_lock_error_keeps_original_cleanup);
 		goto mutation_done;
 	}
-	UT_PLAN(105);
+	if (getenv("PGRAC_FOREIGN_BIRTH_ONLY") != NULL) {
+		UT_PLAN(5);
+		UT_RUN(foreign_birth_apply_uses_matching_controller_not_local_birth);
+		UT_RUN(foreign_birth_verify_legacy_and_reload_never_restore_input);
+		UT_RUN(foreign_birth_final_root_loss_refuses_without_rebasing);
+		UT_RUN(foreign_birth_native_failures_keep_unknown_and_original_debt);
+		UT_RUN(foreign_birth_final_publication_rechecks_authority_and_error_cleanup);
+		goto mutation_done;
+	}
+	if (getenv("PGRAC_FULL_RESIDENCY_ONLY") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(full_residency_second_apply_preserves_first_native_page);
+		UT_RUN(full_residency_target_replacement_and_verify_do_not_borrow_birth);
+		UT_RUN(full_residency_actual_capacity_eviction_stays_unknown_after_reload);
+		UT_RUN(full_residency_failure_and_legacy_keep_original_complete_invalidation);
+		goto mutation_done;
+	}
+	if (getenv("PGRAC_TERMINAL_RESIDENCY_ONLY") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(terminal_residency_keeps_only_untouched_native_full_input);
+		UT_RUN(terminal_residency_never_hides_changed_physical_terminal_bits);
+		UT_RUN(terminal_residency_complete_tree_does_not_restore_target_birth);
+		UT_RUN(terminal_residency_preconditions_and_entered_failures_keep_polarity);
+		goto mutation_done;
+	}
+	UT_PLAN(118);
+	UT_RUN(foreign_birth_apply_uses_matching_controller_not_local_birth);
+	UT_RUN(foreign_birth_verify_legacy_and_reload_never_restore_input);
+	UT_RUN(foreign_birth_final_root_loss_refuses_without_rebasing);
+	UT_RUN(foreign_birth_native_failures_keep_unknown_and_original_debt);
+	UT_RUN(foreign_birth_final_publication_rechecks_authority_and_error_cleanup);
+	UT_RUN(full_residency_second_apply_preserves_first_native_page);
+	UT_RUN(full_residency_target_replacement_and_verify_do_not_borrow_birth);
+	UT_RUN(full_residency_actual_capacity_eviction_stays_unknown_after_reload);
+	UT_RUN(full_residency_failure_and_legacy_keep_original_complete_invalidation);
+	UT_RUN(terminal_residency_keeps_only_untouched_native_full_input);
+	UT_RUN(terminal_residency_never_hides_changed_physical_terminal_bits);
+	UT_RUN(terminal_residency_complete_tree_does_not_restore_target_birth);
+	UT_RUN(terminal_residency_preconditions_and_entered_failures_keep_polarity);
+
 	UT_RUN(cold_birth_apply_feeds_original_held_reader);
 	UT_RUN(cold_birth_verification_never_creates_or_replaces_input);
 	UT_RUN(cold_birth_late_failures_keep_unknown_and_held_debt);
