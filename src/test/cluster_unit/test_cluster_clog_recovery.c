@@ -63,6 +63,8 @@ static int fixture_origin = 1, c0_origin = 1;
 LWLockPadded *MainLWLockArray;
 static LWLockPadded own_main_locks[NUM_INDIVIDUAL_LWLOCKS];
 static bool authority = true, revoke_on_lock, expect_error, fail_open, fail_sync, fail_dirsync;
+static bool (*fixture_cold_origin)(int);
+static bool (*fixture_native_record)(int, const XLogReaderState *);
 static bool c0_authority;
 static bool relmap_base_interrupts;
 static bool revoke_after_read, revoke_after_sync;
@@ -181,9 +183,20 @@ AbsorbSyncRequests(void)
 bool
 cluster_undo_recovery_cold_origin_authorized_v1(int origin)
 {
-	return authority && origin == 1;
+	return authority && origin == 1
+		&& (fixture_cold_origin == NULL || fixture_cold_origin(origin));
 }
 #endif
+/* Default native fixture authorization is independent of the cold scope.
+ * The original source owner is tested separately in the Startup target. */
+extern bool cluster_cold_typed_clog_native_record_current_v1(int origin,
+	const XLogReaderState *record);
+bool
+cluster_cold_typed_clog_native_record_current_v1(int origin, const XLogReaderState *record)
+{
+	return authority && origin == fixture_origin && record != NULL && record->record != NULL
+		&& (fixture_native_record == NULL || fixture_native_record(origin, record));
+}
 bool
 cluster_undo_recovery_abort_clog_authorized_v1(int origin, TransactionId xid)
 {
@@ -1368,6 +1381,7 @@ fixture_cleanup(void)
 #include "test_cluster_clog_relmap_native_counter.inc"
 #include "test_cluster_clog_native_truncate.inc"
 #include "test_cluster_clog_native_full_truncate_sync.inc"
+#include "test_cluster_clog_native_record_owner.inc"
 
 int
 main(void)
@@ -1525,6 +1539,13 @@ main(void)
 		UT_RUN(relmap_inflight_physical_write_refuses_new_and_original_custody);
 		goto mutation_done;
 	}
+	if (getenv("PGRAC_CLOG_NATIVE_RECORD_OWNER_FOCUS") != NULL) {
+		UT_PLAN(3);
+		UT_RUN(native_full_finish_uses_native_record_without_cold_scope);
+		UT_RUN(native_full_finish_cannot_borrow_cold_scope);
+		UT_RUN(native_full_finish_rechecks_record_owner_after_sync);
+		goto mutation_done;
+	}
 	if (getenv("PGRAC_CLOG_NATIVE_FULL_SYNC_FOCUS") != NULL) {
 		UT_PLAN(5);
 		UT_RUN(native_full_sync_reads_the_original_redo_page_without_reinitializing);
@@ -1544,7 +1565,10 @@ main(void)
 		UT_RUN(native_full_truncate_sync_preserves_legacy_and_foreign);
 		goto mutation_done;
 	}
-	UT_PLAN(121);
+	UT_PLAN(124);
+	UT_RUN(native_full_finish_uses_native_record_without_cold_scope);
+	UT_RUN(native_full_finish_cannot_borrow_cold_scope);
+	UT_RUN(native_full_finish_rechecks_record_owner_after_sync);
 	UT_RUN(native_full_truncate_sync_finishes_only_original_delete);
 	UT_RUN(native_full_truncate_sync_rejects_incomplete_delete);
 	UT_RUN(native_full_truncate_sync_errors_keep_original_native_effects);

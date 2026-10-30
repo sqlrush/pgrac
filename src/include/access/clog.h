@@ -189,7 +189,9 @@ extern bool cluster_clog_native_recovery_full_record_verify_v1(
  * file/directory and reread it, or verify eligible truncated segments absent
  * around a directory sync. Never reinitialize, re-delete or discard unrelated
  * dirty cache. The original source executor must bracket full record/current
- * checks. False/ERROR retains its attempt; no era/lifetime/COMPLETE grant. */
+ * checks. Finish requires that executor's exact active native record; cold
+ * scope alone never authorizes it. False/ERROR retains its attempt; no
+ * era/lifetime/COMPLETE grant. */
 extern bool cluster_clog_native_recovery_full_sync_v1(int origin,
 	const XLogReaderState *record);
 #endif

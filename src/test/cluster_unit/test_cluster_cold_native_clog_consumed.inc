@@ -15,6 +15,24 @@ static unsigned native_source_calls, native_source_checks, native_source_fault;
 static bool native_source_attempted;
 static ClusterColdTypedV1 *native_source_typed;
 static int native_source_saved_node;
+static XLogRecord native_source_header;
+static const XLogReaderState *native_source_reader;
+static XLogRecPtr native_source_start, native_source_end;
+static unsigned native_record_queries;
+
+/* The real sealed matcher is covered by SIDE tests. This preserves the
+ * fixture's independent full-header/frame check around the real owner. */
+bool
+rf_side_online_plan_clog_matches_v1(const RfSideOnlinePlanV1 *plan,
+	const ClusterWalSourceRef *source, const XLogReaderState *reader)
+{
+	return plan == &side_fixture[0] && reader == native_source_reader
+		&& source != NULL && reader != NULL && reader->record != NULL
+		&& memcmp(source, &restart_ref, sizeof(*source)) == 0
+		&& reader->ReadRecPtr == native_source_start && reader->EndRecPtr == native_source_end
+		&& memcmp(&reader->record->header, &native_source_header, sizeof(native_source_header)) == 0;
+}
+
 
 extern bool side_plan_clog_native_replay(const RfSideOnlinePlanV1 *plan,
 	const ClusterWalSourceRef *source, XLogReaderState *reader,
@@ -32,6 +50,10 @@ side_plan_clog_native_replay(const RfSideOnlinePlanV1 *plan,
 		return false;
 	UT_ASSERT(plan == &side_fixture[0]);
 	UT_ASSERT(memcmp(source, &native_source_typed->sources[0], sizeof(*source)) == 0);
+	native_source_reader = reader;
+	native_source_header = reader->record->header;
+	native_source_start = reader->ReadRecPtr;
+	native_source_end = reader->EndRecPtr;
 	native_source_attempted = true;
 	native_source_checks++;
 	if (!current(arg))
@@ -72,6 +94,8 @@ native_source_fixture(XLogReaderState *reader, DecodedXLogRecord *decoded)
 	native_source_calls = native_source_checks = native_source_fault = 0;
 	native_source_attempted = false;
 	native_source_typed = typed;
+	native_source_reader = NULL;
+	native_record_queries = 0;
 	native_source_saved_node = cluster_node_id;
 	cluster_node_id = 0;
 	/* Like the original own-C0 fixture, use the complete captured restart
@@ -176,4 +200,72 @@ UT_TEST(test_native_clog_source_late_failure_and_error_stay_refused)
 		UT_ASSERT_EQ(native_source_calls, 1);
 		native_source_done(&typed);
 	}
+}
+
+static void
+native_record_owner_redo(XLogReaderState *reader, void *arg)
+{
+	XLogReaderState copy = *reader;
+	XLogRecord saved_header = reader->record->header;
+	ClusterColdParticipantV1 participant = native_source_typed->participants[0];
+
+	UT_ASSERT(arg == &native_record_queries);
+	UT_ASSERT(cluster_cold_typed_clog_native_record_current_v1(0, reader));
+	UT_ASSERT(!cluster_cold_typed_clog_native_record_current_v1(1, reader));
+	UT_ASSERT(!cluster_cold_typed_clog_native_record_current_v1(0, &copy));
+	UT_ASSERT(!cluster_cold_typed_clog_native_record_current_v1(0, NULL));
+	reader->record->header.xl_scn++;
+	UT_ASSERT(!cluster_cold_typed_clog_native_record_current_v1(0, reader));
+	reader->record->header = saved_header;
+	native_source_typed->participants[0].native_redo++;
+	UT_ASSERT(!cluster_cold_typed_clog_native_record_current_v1(0, reader));
+	native_source_typed->participants[0] = participant;
+	UT_ASSERT(cluster_cold_typed_clog_native_record_current_v1(0, reader));
+	/* The getter never runs the source/ROOT callback under native locks. */
+	UT_ASSERT_EQ(native_source_checks, 1);
+	native_record_queries++;
+	if (native_source_fault == 4)
+		siglongjmp(*PG_exception_stack, 1);
+}
+
+UT_TEST(test_native_clog_record_context_exists_only_in_original_callback)
+{
+	XLogReaderState reader;
+	DecodedXLogRecord decoded;
+	ClusterColdTypedV1 *typed = native_source_fixture(&reader, &decoded);
+
+	UT_ASSERT(!cluster_cold_typed_clog_native_record_current_v1(0, &reader));
+	UT_ASSERT(cluster_cold_typed_clog_native_v1(typed,
+		(ClusterRecoveryFencePlan *)&fixture_context, &reader, native_record_owner_redo,
+		&native_record_queries));
+	UT_ASSERT_EQ(native_record_queries, 1);
+	UT_ASSERT_EQ(native_source_checks, 2);
+	UT_ASSERT(!cluster_cold_typed_clog_native_record_current_v1(0, &reader));
+	native_source_done(&typed);
+}
+
+UT_TEST(test_native_clog_record_context_clears_on_error_without_retry)
+{
+	XLogReaderState reader;
+	DecodedXLogRecord decoded;
+	ClusterColdTypedV1 *typed = native_source_fixture(&reader, &decoded);
+	volatile bool caught = false;
+
+	native_source_fault = 4;
+	PG_TRY(); {
+		(void)cluster_cold_typed_clog_native_v1(typed,
+			(ClusterRecoveryFencePlan *)&fixture_context, &reader, native_record_owner_redo,
+			&native_record_queries);
+	} PG_CATCH(); { caught = true; } PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(native_record_queries, 1);
+	UT_ASSERT_NE(typed->refusal, CLUSTER_COLD_OK);
+	UT_ASSERT(!cluster_cold_typed_clog_native_record_current_v1(0, &reader));
+	UT_ASSERT(!native_source_consume(typed, &reader));
+	UT_ASSERT_EQ(native_source_calls, 0);
+	native_source_done(&typed);
+	/* A later independent fixture is not fenced by a dangling stack pointer. */
+	typed = native_source_fixture(&reader, &decoded);
+	UT_ASSERT(native_source_consume(typed, &reader));
+	native_source_done(&typed);
 }
