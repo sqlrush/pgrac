@@ -18178,7 +18178,8 @@ cluster_bufmgr_acquire_quiet_native(BufferDesc *buf, const ClusterPcmOwnSnapshot
 	expected.pcm_state = PCM_STATE_N;
 	expected.buffer_type = BUF_TYPE_CURRENT;
 	if (input && cluster_pcm_own_snapshot_equal_exact(&expected, &live)
-		&& (hold == execution->executor_sequence || (action == CLUSTER_ACQUIRE_QUIET_WITHDRAW && hold == 0)))
+		&& (hold == execution->executor_sequence || (action == CLUSTER_ACQUIRE_QUIET_WITHDRAW && hold == 0)
+			|| (no_image && execution->purpose == RESOURCE_X_DELIVERY_ACQUIRE_WAIT_SEALING && hold == 0)))
 		cut = CLUSTER_ACQUIRE_QUIET_GP;
 	expected.flags = 0;
 	if (action != CLUSTER_ACQUIRE_QUIET_OBSERVE && hold == 0) {
@@ -18382,6 +18383,68 @@ cluster_bufmgr_pcm_own_acquire_quiet_unarmed_disk_exact(BufferDesc *buf,
 	return cluster_pcm_lock_resource_x_requester_acquire_read_quiet_exact(&owned, &entered, &receipt, &native);
 }
 /* End original unarmed disk quiet. */
+
+/* Original pre-decision first-fill cancellation. Until an executor is
+ * claimed, inbound A/I only enter the original PCM join and cannot write
+ * this buffer. Seal that exact unclaimed E before retiring its native GP
+ * and IO. The original LMS, not a successor descriptor, owns late results. */
+ResourceXApplyResult
+cluster_bufmgr_pcm_own_acquire_cancel_wait_exact(BufferDesc *buf,
+	const ClusterPcmOwnSnapshot *base, const ResourceXDecodedAcquireIntent *episode,
+	const ResourceXInstallClaimJoinObservation *observation)
+{
+	ClusterPcmOwnSnapshot entered_base, native;
+	ResourceXDecodedAcquireIntent entered;
+	ResourceXDeliveryClaim sealed = {0}, current;
+	ResourceXAcquireReadReceipt receipt = {0}, retained;
+	ResourceOwner owner = CurrentResourceOwner;
+	ResourceXApplyResult result;
+
+	if (buf == NULL || base == NULL || episode == NULL || observation == NULL
+		|| ClusterPcmOwnArray == NULL)
+		return RESOURCE_X_APPLY_INVALID;
+	if (LWLockHeldByMe(BufferDescriptorGetContentLock(buf)))
+		return RESOURCE_X_APPLY_BAD_STATE;
+	entered_base = *base;
+	entered = *episode;
+	sealed.observation = *observation;
+	sealed.purpose = RESOURCE_X_DELIVERY_ACQUIRE_WAIT_SEALING;
+	if (!cluster_bufmgr_acquire_quiet_context(buf, &entered_base, &entered, &sealed, owner))
+		return RESOURCE_X_APPLY_STALE;
+	result = cluster_pcm_lock_resource_x_requester_acquire_wait_observe_exact(observation, &entered, &current, &receipt);
+	if (result == RESOURCE_X_APPLY_NOT_FOUND) {
+		receipt.write_io_generation = pg_atomic_read_u64(&ClusterPcmOwnArray[buf->buf_id].write_io_generation);
+		if ((receipt.write_io_generation & 1) != 0 || receipt.write_io_generation >= UINT64_MAX - 1
+			|| !cluster_bufmgr_acquire_unarmed_physical(buf, &entered_base, &entered, &sealed,
+				&receipt, owner, CLUSTER_ACQUIRE_QUIET_OBSERVE, &native))
+			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		result = cluster_pcm_lock_resource_x_requester_acquire_wait_seal_exact(observation, &entered,
+			receipt.write_io_generation, &native, &current);
+		if (result != RESOURCE_X_APPLY_APPLIED && result != RESOURCE_X_APPLY_DUPLICATE)
+			return result;
+	} else if (result != RESOURCE_X_APPLY_APPLIED)
+		return result;
+	/* Resample the immutable local seal after the entry-lock boundary. A
+	 * cancellation/error continuation never derives it from live admission. */
+	result = cluster_pcm_lock_resource_x_requester_acquire_wait_observe_exact(observation, &entered, &current, &retained);
+	if (result != RESOURCE_X_APPLY_APPLIED
+		|| !cluster_bufmgr_acquire_quiet_context(buf, &entered_base, &entered, &current, owner))
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	sealed = current;
+	sealed.purpose = RESOURCE_X_DELIVERY_ACQUIRE_WAIT_SEALING;
+	sealed.target.flags = PCM_OWN_FLAG_GRANT_PENDING;
+	if (current.purpose == RESOURCE_X_DELIVERY_ACQUIRE_WAIT_QUIET)
+		return cluster_bufmgr_acquire_unarmed_physical(buf, &entered_base, &entered, &sealed,
+			&retained, owner, CLUSTER_ACQUIRE_QUIET_REPLAY, &native)
+			? RESOURCE_X_APPLY_DUPLICATE : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (current.purpose != RESOURCE_X_DELIVERY_ACQUIRE_WAIT_SEALING
+		|| !cluster_bufmgr_acquire_unarmed_physical(buf, &entered_base, &entered, &sealed,
+			&retained, owner, CLUSTER_ACQUIRE_QUIET_WITHDRAW, &native)
+		|| !cluster_bufmgr_acquire_quiet_context(buf, &entered_base, &entered, &sealed, owner))
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	return cluster_pcm_lock_resource_x_requester_acquire_wait_quiet_exact(&sealed, &entered, &retained, &native);
+}
+/* End original pre-decision first-fill cancellation. */
 
 /* Original pre-C disk error guard. No native C occurs inside this scope.
  * Preserve immutable original identity on the stack until each synchronous

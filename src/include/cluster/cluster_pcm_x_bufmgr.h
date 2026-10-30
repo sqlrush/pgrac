@@ -1135,6 +1135,12 @@ extern ResourceXApplyResult cluster_bufmgr_pcm_own_acquire_quiet_unarmed_disk_ex
 	BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
 	const ResourceXDecodedAcquireIntent *episode, const ResourceXDeliveryClaim *original);
 
+/* Seal an original first-fill before any executor or physical delivery.
+ * Native IO is retired locally; the original LMS retains late A/I debt. */
+extern ResourceXApplyResult cluster_bufmgr_pcm_own_acquire_cancel_wait_exact(BufferDesc *buf,
+	const ClusterPcmOwnSnapshot *base, const ResourceXDecodedAcquireIntent *episode,
+	const ResourceXInstallClaimJoinObservation *observation);
+
 /* Guard the original PREPARED disk/S producer before ResourceOwner cleanup.
  * APPLIED retains verified ARMED and original input IO, without native C.
  * Continue that same handle explicitly; never call again to reread/rearm. */

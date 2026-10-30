@@ -1726,6 +1726,9 @@ typedef struct ResourceXDeliveryTarget {
 #define RESOURCE_X_DELIVERY_ACQUIRE_UNARMED_SEALING UINT8_C(13)
 #define RESOURCE_X_DELIVERY_ACQUIRE_UNARMED_QUIET UINT8_C(14)
 #define RESOURCE_X_DELIVERY_ACQUIRE_UNARMED_CONSUMED UINT8_C(15)
+/* Local cancellation before an executor exists; no A is manufactured. */
+#define RESOURCE_X_DELIVERY_ACQUIRE_WAIT_SEALING UINT8_C(16)
+#define RESOURCE_X_DELIVERY_ACQUIRE_WAIT_QUIET UINT8_C(17)
 /* Immutable evidence retained by the original full-E executor. This is not
  * caller authority or a PAGE/WAL memory-source proof for disk bytes. */
 typedef struct ResourceXAcquireReadReceipt {
@@ -1745,6 +1748,18 @@ typedef struct ResourceXDeliveryClaim {
 	uint8 purpose;
 	uint8 reserved[7];
 } ResourceXDeliveryClaim;
+
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_wait_observe_exact(
+	const ResourceXInstallClaimJoinObservation *observation,
+	const ResourceXDecodedAcquireIntent *episode, ResourceXDeliveryClaim *out,
+	ResourceXAcquireReadReceipt *receipt);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_wait_seal_exact(
+	const ResourceXInstallClaimJoinObservation *observation,
+	const ResourceXDecodedAcquireIntent *episode, uint64 write_io_generation,
+	const struct ClusterPcmOwnSnapshot *native, ResourceXDeliveryClaim *out);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_wait_quiet_exact(
+	const ResourceXDeliveryClaim *sealed, const ResourceXDecodedAcquireIntent *episode,
+	const ResourceXAcquireReadReceipt *receipt, const struct ClusterPcmOwnSnapshot *terminal);
 
 extern ResourceXApplyResult
 cluster_pcm_lock_resource_x_t1_grant_delivery_exact(const ResourceXAcquisitionRef *ref,
