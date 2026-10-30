@@ -298,6 +298,17 @@ extern struct RfPageCtrcOwnerCompletionV1 ClusterColdRecoveryCtrcPageOwnerComple
 struct RfPageCtrcOwnersV1;
 extern struct RfPageCtrcOwnersV1 ClusterColdRecoveryCtrcPageOwners(
 	const struct ClusterRecoveryStartV1 *start, Size memory_budget);
+/* Complete original references joined to the complete actual PAGE inventory.
+ * Validate the full original TX-reference membership, retain every other
+ * obligation and publish only after the complete saved set is unchanged.
+ * Budget the entire additional peak before PAGE. On success pfree entries
+ * and owners.entries before the original Start/scope/ResourceOwner ends;
+ * references borrows that original lifetime. On refusal all fields except
+ * detail are zero. Original failed-reader cleanup/debt policy remains;
+ * no prefix, new FD release, graph/D0 or joint success grant. */
+struct RfPageCtrcOwnerReferencesV1;
+extern struct RfPageCtrcOwnerReferencesV1 ClusterColdRecoveryCtrcPageOwnerReferences(
+	const struct ClusterRecoveryStartV1 *start, Size memory_budget);
 struct RfPageCtrcFpiInsertV1;
 struct ClusterSharedFsPageV1;
 /* Local immutable membership only: the ORIGINAL retained result address and

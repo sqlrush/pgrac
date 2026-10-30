@@ -2471,6 +2471,7 @@ static void startup_local_empty_reset(void);
 #include "test_cluster_cold_ctrc_owner_continuation.inc"
 #include "test_cluster_cold_ctrc_owner_completion.inc"
 #include "test_cluster_cold_ctrc_owner_inventory.inc"
+#include "test_cluster_cold_ctrc_owner_references.inc"
 
 #include "test_cluster_cold_ctrc_page_raw.inc"
 
@@ -2480,6 +2481,16 @@ int main(void)
 		UT_PLAN(2);
 		UT_RUN(test_start_page_raw_preserves_original_whole_bytes_and_pending_service);
 		UT_RUN(test_start_page_raw_missing_changed_and_wrong_end_revoke_whole_observation);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_OWNER_REFERENCES") != NULL) {
+		UT_PLAN(6);
+	UT_RUN(test_start_page_owner_references_keep_full_original_order_and_distinct_duties);
+	UT_RUN(test_start_page_owner_references_retain_unmatched_and_complete_empty_views);
+	UT_RUN(test_start_page_owner_references_preflight_full_member_mapping_and_shape);
+	UT_RUN(test_start_page_owner_references_reject_late_full_identity_or_set_drift);
+	UT_RUN(test_start_page_owner_references_wait_and_error_publish_no_prefix_or_release);
+	UT_RUN(test_start_page_owner_references_whole_budget_and_oom_precede_page);
 		UT_DONE(); return ut_failed_count != 0;
 	}
 	if (getenv("PGRAC_PRE2_TEST_OWNER_INVENTORY") != NULL) {
@@ -2983,7 +2994,7 @@ int main(void)
 	}
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_FIRST
-	UT_PLAN(391);
+	UT_PLAN(397);
 	UT_RUN(test_start_raw_records_keep_complete_original_bytes_and_empty_end);
 	UT_RUN(test_start_raw_records_refuse_incomplete_changed_bytes_hash_header_and_end);
 
@@ -2993,7 +3004,7 @@ int main(void)
 	UT_RUN(test_start_compound_groups_retain_complete_member_input_and_end);
 	UT_RUN(test_start_compound_groups_refuse_missing_mixed_or_nonempty_end);
 #else
-	UT_PLAN(375);
+	UT_PLAN(381);
 #endif
 	UT_RUN(test_startup_native_images_accept_only_unchanged_complete_terminal_page);
 	UT_RUN(test_startup_native_images_reject_unresolved_ambiguous_and_mx_itls);
@@ -3004,8 +3015,14 @@ int main(void)
 	UT_RUN(test_startup_native_directory_real_origin_cannot_be_discharged_by_wait);
 	UT_RUN(test_startup_native_directory_invalid_layout_and_partial_error_keep_debt);
 #else
-	UT_PLAN(367);
+	UT_PLAN(373);
 #endif
+	UT_RUN(test_start_page_owner_references_keep_full_original_order_and_distinct_duties);
+	UT_RUN(test_start_page_owner_references_retain_unmatched_and_complete_empty_views);
+	UT_RUN(test_start_page_owner_references_preflight_full_member_mapping_and_shape);
+	UT_RUN(test_start_page_owner_references_reject_late_full_identity_or_set_drift);
+	UT_RUN(test_start_page_owner_references_wait_and_error_publish_no_prefix_or_release);
+	UT_RUN(test_start_page_owner_references_whole_budget_and_oom_precede_page);
 	UT_RUN(test_startup_owner_continuation_stable_directory_and_h_wait_keep_same_operations);
 	UT_RUN(test_startup_owner_continuation_directory_wait_cannot_replace_original_sample);
 	UT_RUN(test_startup_owner_continuation_h_wait_cannot_replace_original_sample);

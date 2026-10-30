@@ -10916,3 +10916,6 @@ test_cluster_clog_recovery test_cluster_recovery_native_scan test_cluster_side_x
 test_cluster_clog_recovery test_cluster_xid_native_clog.o \
         test_cluster_recovery_episode_clog.o test_cluster_side_native_clog.o: \
         test_cluster_clog_native_full_truncate_sync.inc
+
+# Complete original reference/PAGE-owner adjacency.
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_owner_references.inc

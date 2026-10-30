@@ -3210,6 +3210,199 @@ ClusterColdRecoveryCtrcPageOwners(const struct ClusterRecoveryStartV1 *start, Si
 	return out;
 }
 
+/* Freeze the complete original reference/page/operation sets before any
+ * yielding reader. The returned links never replace the original TX forest
+ * or turn historical/unmatched references into completed PAGE obligations. */
+typedef struct ClusterColdCtrcPageReferenceSnapshotV1 {
+	const ClusterRecoveryCensusReferencesV1 *references;
+	const ClusterRecoveryCensusPagesV1 *pages;
+	const ClusterColdCtrcPageProgressV1 *progress;
+	const ClusterColdCtrcWorkV1 *work;
+	ClusterWalInputsV1 *scope;
+	ClusterRecoveryCensusReferenceV1 *fixed_references;
+	ClusterRecoveryCensusPageV1 *fixed_pages;
+	ClusterColdCtrcPageCompletedV1 *fixed_completed;
+	uint32 reference_count, page_count, owner_count;
+} ClusterColdCtrcPageReferenceSnapshotV1;
+
+static bool
+cluster_recovery_cold_page_reference_reserve(Size *bytes, uint32 count,
+	Size width, Size *offset)
+{
+	if (*bytes > MaxAllocSize - MAXIMUM_ALIGNOF) return false;
+	*offset = MAXALIGN(*bytes);
+	if (count > (MaxAllocSize - *offset) / width) return false;
+	*bytes = *offset + (Size)count * width;
+	return true;
+}
+
+static bool
+cluster_recovery_cold_page_references_same(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcPageReferenceSnapshotV1 *saved)
+{
+	return cluster_recovery_cold_page_owners_same(start, saved->work, saved->scope,
+			saved->progress, saved->fixed_completed, saved->owner_count)
+		&& start->ctrc_references == saved->references && start->ctrc_pages == saved->pages
+		&& saved->references->count == saved->reference_count && saved->pages->count == saved->page_count
+		&& memcmp(saved->references->entries, saved->fixed_references,
+			(Size)saved->reference_count * sizeof(*saved->fixed_references)) == 0
+		&& memcmp(saved->pages->entries, saved->fixed_pages,
+			(Size)saved->page_count * sizeof(*saved->fixed_pages)) == 0;
+}
+
+/* Both passes use the original full-key/record/forest membership factory,
+ * including its complete empty end. No raw-xid or positional TX join. */
+static bool
+cluster_recovery_cold_page_reference_members(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcPageReferenceSnapshotV1 *saved)
+{
+	uint32 i = 0;
+
+	for (;;) {
+		ClusterRecoveryCensusTxReferenceV1 member;
+
+		if (!cluster_recovery_cold_page_references_same(start, saved)) return false;
+		member = ClusterColdRecoveryCtrcTxReference(start, saved->work, i);
+		if (!member.observed || member.index != i || member.count != saved->reference_count
+			|| !cluster_recovery_cold_page_references_same(start, saved)) return false;
+		if (i == saved->reference_count) return member.reference == NULL;
+		if (member.reference != &saved->references->entries[i]) return false;
+		i++;
+	}
+}
+
+RfPageCtrcOwnerReferencesV1
+ClusterColdRecoveryCtrcPageOwnerReferences(const struct ClusterRecoveryStartV1 *start,
+	Size memory_budget)
+{
+	RfPageCtrcOwnerReferencesV1 out = {0};
+	RfPageCtrcOwnersV1 volatile owners = {0};
+	RfPageCtrcOwnerReferenceV1 *volatile entries = NULL;
+	ClusterColdCtrcPageReferenceSnapshotV1 saved = {0};
+	Size bytes = 0, entry_offset, reference_offset, page_offset, completed_offset, map_offset;
+	Size owner_bytes, owner_scratch, scratch = sizeof(saved) + sizeof(out) + sizeof(owners)
+		+ sizeof(RfPageOnlineTargetViewV1) + sizeof(ClusterRecoveryCensusPageV1)
+		+ sizeof(ClusterRecoveryCensusTxReferenceV1);
+	uint32 *mapping;
+	bool ready = false;
+
+	out.detail = RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	if (start == NULL || start != cluster_recovery_cold_start
+		|| !cluster_recovery_cold_ctrc_replays_actor() || !start->ctrc_observation_complete
+		|| start->ctrc_references == NULL || start->ctrc_pages == NULL
+		|| start->ctrc_page_progress == NULL || start->ctrc_page_progress->pending
+		|| start->ctrc_page_progress->target_count == 0
+		|| start->ctrc_page_progress->next_target != start->ctrc_page_progress->target_count) return out;
+	saved.references = start->ctrc_references; saved.pages = start->ctrc_pages;
+	saved.progress = start->ctrc_page_progress; saved.work = start->ctrc_observation_work;
+	saved.scope = start->ctrc_observation_inputs;
+	saved.reference_count = saved.references->count; saved.page_count = saved.pages->count;
+	saved.owner_count = saved.progress->target_count;
+	out.detail = RF_PAGE_PROOF_DETAIL_CAPACITY;
+	/* Include the unchanged PageOwners factory's entire output/snapshot/codec
+	 * reservation as well as this adapter's complete simultaneous peak. */
+	owner_scratch = sizeof(RfPageCtrcOwnersV1) + 2 * sizeof(RfPageCtrcOwnerProofV1)
+		+ 2 * (MAXPGPATH + 92) + 2 * MAXPGPATH;
+	if (saved.owner_count > (MaxAllocSize - owner_scratch - MAXIMUM_ALIGNOF)
+		/ (sizeof(RfPageCtrcOwnerEvidenceV1) + sizeof(ClusterColdCtrcPageCompletedV1))) return out;
+	owner_bytes = MAXALIGN((Size)saved.owner_count * sizeof(RfPageCtrcOwnerEvidenceV1))
+		+ (Size)saved.owner_count * sizeof(ClusterColdCtrcPageCompletedV1) + owner_scratch;
+	if (!cluster_recovery_cold_page_reference_reserve(&bytes, Max(saved.reference_count, 1),
+			sizeof(*entries), &entry_offset)
+		|| !cluster_recovery_cold_page_reference_reserve(&bytes, saved.reference_count,
+			sizeof(*saved.fixed_references), &reference_offset)
+		|| !cluster_recovery_cold_page_reference_reserve(&bytes, saved.page_count,
+			sizeof(*saved.fixed_pages), &page_offset)
+		|| !cluster_recovery_cold_page_reference_reserve(&bytes, saved.owner_count,
+			sizeof(*saved.fixed_completed), &completed_offset)
+		|| !cluster_recovery_cold_page_reference_reserve(&bytes, saved.owner_count,
+			sizeof(*mapping), &map_offset)
+		|| memory_budget < bytes || memory_budget - bytes < scratch
+		|| memory_budget - bytes - scratch < owner_bytes) return out;
+	Assert(entry_offset == 0);
+	PG_TRY();
+	{
+		entries = MemoryContextAllocExtended(TopMemoryContext, bytes, MCXT_ALLOC_ZERO | MCXT_ALLOC_NO_OOM);
+		out.detail = RF_PAGE_PROOF_DETAIL_OOM;
+		if (entries != NULL) {
+			bool preflight;
+
+			saved.fixed_references = (ClusterRecoveryCensusReferenceV1 *)((char *)entries + reference_offset);
+			saved.fixed_pages = (ClusterRecoveryCensusPageV1 *)((char *)entries + page_offset);
+			saved.fixed_completed = (ClusterColdCtrcPageCompletedV1 *)((char *)entries + completed_offset);
+			mapping = (uint32 *)((char *)entries + map_offset);
+			memcpy(saved.fixed_references, saved.references->entries,
+				(Size)saved.reference_count * sizeof(*saved.fixed_references));
+			memcpy(saved.fixed_pages, saved.pages->entries, (Size)saved.page_count * sizeof(*saved.fixed_pages));
+			memcpy(saved.fixed_completed, saved.progress->completed,
+				(Size)saved.owner_count * sizeof(*saved.fixed_completed));
+			preflight = cluster_recovery_cold_page_references_same(start, &saved);
+			out.detail = RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+			for (uint32 i = 0; preflight && i < saved.owner_count; i++) {
+				RfPageOnlineTargetViewV1 target;
+				ClusterRecoveryCensusPageV1 physical;
+				uint32 j;
+
+				preflight = rf_page_online_plan_target_v1(start->ctrc_page_plan, i, &target)
+					&& !target.history_only && target.page_identity.forknum == MAIN_FORKNUM
+					&& cluster_recovery_cold_page_target(start, &target, &physical) && physical.heap;
+				if (!preflight) break;
+				for (j = 0; j < saved.page_count; j++)
+					if (memcmp(&physical, &saved.fixed_pages[j], sizeof(physical)) == 0) break;
+				preflight = j < saved.page_count;
+				mapping[i] = j;
+				for (uint32 k = 0; preflight && k < i; k++) preflight = mapping[k] != j;
+			}
+			for (uint32 i = 0; preflight && i < saved.reference_count; i++) {
+				const ClusterRecoveryCensusReferenceV1 *ref = &saved.fixed_references[i];
+
+				preflight = ref->page_index < saved.page_count
+					&& saved.fixed_pages[ref->page_index].heap
+					&& (ref->entry.kind == CLUSTER_RECOVERY_HEAP_ITL || ref->entry.kind == CLUSTER_RECOVERY_HEAP_ITEM);
+				if (!preflight) break;
+				entries[i].reference_index = i; entries[i].owner_index = UINT32_MAX;
+				if (ref->entry.kind != CLUSTER_RECOVERY_HEAP_ITL || ref->entry.itl.flags == ITL_FLAG_FREE) continue;
+				preflight = ref->transaction.transaction.system_identifier
+						== saved.fixed_pages[ref->page_index].reservation.identity.key.system_identifier
+					&& ref->transaction.transaction.database_incarnation
+						== saved.fixed_pages[ref->page_index].reservation.identity.key.database_incarnation
+					&& ref->transaction.transaction.xid == ref->entry.itl.xid;
+				if (ref->version != 0) continue;
+				for (uint32 j = 0; j < saved.owner_count; j++)
+					if (ref->page_index == mapping[j]) entries[i].owner_index = j;
+			}
+			if (preflight && cluster_recovery_cold_page_reference_members(start, &saved)) {
+				owners = ClusterColdRecoveryCtrcPageOwners(start, memory_budget - bytes - scratch);
+				out.detail = owners.detail;
+				if (owners.detail == RF_PAGE_PROOF_DETAIL_OK) {
+					out.detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+					ready = owners.count == saved.owner_count && owners.entries != NULL
+						&& cluster_recovery_cold_page_reference_members(start, &saved)
+						&& cluster_recovery_cold_page_references_same(start, &saved);
+				}
+			}
+		}
+	}
+	PG_CATCH();
+	{
+		if (owners.entries != NULL) pfree(owners.entries);
+		if (entries != NULL) pfree((void *)entries);
+		cluster_recovery_cold_page_plan_refuse(cluster_recovery_cold_start, RF_PAGE_PROOF_DETAIL_INTERNAL);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (ready) {
+		out.detail = RF_PAGE_PROOF_DETAIL_OK; out.owners = owners;
+		out.references = saved.references; out.count = saved.reference_count; out.entries = entries;
+	} else {
+		if (owners.entries != NULL) pfree(owners.entries);
+		if (entries != NULL) pfree((void *)entries);
+		if (out.detail != RF_PAGE_PROOF_DETAIL_OOM && out.detail != RF_PAGE_PROOF_DETAIL_WOULD_BLOCK)
+			cluster_recovery_cold_page_plan_refuse(cluster_recovery_cold_start, out.detail);
+	}
+	return out;
+}
+
 static bool
 cluster_recovery_cold_page_completed_recheck(const struct ClusterRecoveryStartV1 *start,
 	const ClusterColdCtrcPageCompletedV1 *fixed, uint32 fixed_count)

@@ -378,6 +378,24 @@ typedef struct RfPageCtrcOwnersV1 {
 	RfPageCtrcOwnerEvidenceV1 *entries;
 } RfPageCtrcOwnersV1;
 
+/* Every original reference remains present, in original order. An owner
+ * index names only the actual current PAGE containing a non-FREE ITL;
+ * UINT32_MAX retains an unmatched, historical, FREE or tuple obligation.
+ * This adjacency input is not transaction-effect coverage or discharge. */
+typedef struct RfPageCtrcOwnerReferenceV1 {
+	uint32 reference_index;
+	uint32 owner_index;
+} RfPageCtrcOwnerReferenceV1;
+
+struct ClusterRecoveryCensusReferencesV1;
+typedef struct RfPageCtrcOwnerReferencesV1 {
+	RfPageProofDetailV1 detail;
+	RfPageCtrcOwnersV1 owners;
+	const struct ClusterRecoveryCensusReferencesV1 *references;
+	uint32 count;
+	RfPageCtrcOwnerReferenceV1 *entries;
+} RfPageCtrcOwnerReferencesV1;
+
 extern RfPageCtrcReadbackImageV1 rf_page_recovery_ctrc_replays_completed_image_v1(
 	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work,
 	const struct ClusterRecoveryCtrcReplaySetSourceV1 *source, RfPageCtrcAuthorityV1 *authority,

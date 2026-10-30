@@ -1,5 +1,6 @@
 /* Actual Start with controlled original lower adjacency view only. */
 static unsigned start_ref_fault,start_ref_calls;
+static bool start_ref_complete;
 ClusterRecoveryCensusTxReferenceV1
 cluster_recovery_census_tx_reference_v1(ClusterRecoveryCensus *c,uint32 i)
 {
@@ -10,10 +11,16 @@ cluster_recovery_census_tx_reference_v1(ClusterRecoveryCensus *c,uint32 i)
  d.observed=true;d.count=refs->count;d.index=i;
  if(i<refs->count) {
   d.reference=&refs->entries[i];
-  if(i==0) {
+  if(i==0 || (start_ref_complete && refs->entries[i].entry.kind==CLUSTER_RECOVERY_HEAP_ITL
+      && refs->entries[i].entry.itl.flags!=ITL_FLAG_FREE)) {
    d.transaction.count=3;d.transaction.root_count=2;d.transaction.index=0;d.transaction.root=true;
    d.transaction.value=refs->entries[i].transaction;
    d.transaction.predecessor_index=2;d.transaction.predecessor.record=&start_tx_record_bytes;
+   if(start_ref_complete) {
+    d.transaction.count=observation_manifest.tx_record_count;
+    d.transaction.root_count=Min(2,d.transaction.count);d.transaction.root=d.transaction.root_count!=0;
+    d.transaction.predecessor_index=0;d.transaction.predecessor.record=NULL;
+   }
   }
  }
  if(start_ref_fault==3) d.count++;
@@ -29,7 +36,7 @@ cluster_recovery_census_tx_reference_v1(ClusterRecoveryCensus *c,uint32 i)
 static void start_ref_ready(uint32 count)
 {
  ClusterRecoveryCensusReferencesV1 *refs;
- start_tx_records_ready(3);start_ref_calls=start_ref_fault=0;
+ start_tx_records_ready(3);start_ref_calls=start_ref_fault=0;start_ref_complete=false;
  refs=(ClusterRecoveryCensusReferencesV1 *)observation_references_storage[0].bytes;
  refs->count=count;
  if(count!=0) {
