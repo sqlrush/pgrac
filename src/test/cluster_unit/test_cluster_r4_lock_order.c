@@ -86,6 +86,25 @@ BackendId MyBackendId = 1;
 BackendType MyBackendType = B_BACKEND;
 PGPROC *MyProc = NULL;
 
+uint64
+cluster_membership_cut_generation(void)
+{
+	abort();
+}
+
+bool
+cluster_normal_stop_requested(void)
+{
+	abort();
+}
+
+bool
+cluster_recovery_checkpoint_observe_v1(
+	ClusterRecoveryCheckpointObservationV1 *out pg_attribute_unused())
+{
+	abort();
+}
+
 bool
 cluster_write_fence_allowed(void)
 {
