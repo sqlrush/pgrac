@@ -1367,6 +1367,7 @@ fixture_cleanup(void)
 #include "test_cluster_clog_native_advance_next.inc"
 #include "test_cluster_clog_relmap_native_counter.inc"
 #include "test_cluster_clog_native_truncate.inc"
+#include "test_cluster_clog_native_full_truncate_sync.inc"
 
 int
 main(void)
@@ -1534,7 +1535,21 @@ main(void)
 		full_sync_cleanup_files();
 		goto mutation_done;
 	}
-	UT_PLAN(116);
+	if (getenv("PGRAC_CLOG_NATIVE_TRUNCATE_FINISH") != NULL) {
+		UT_PLAN(5);
+		UT_RUN(native_full_truncate_sync_finishes_only_original_delete);
+		UT_RUN(native_full_truncate_sync_rejects_incomplete_delete);
+		UT_RUN(native_full_truncate_sync_errors_keep_original_native_effects);
+		UT_RUN(native_full_truncate_sync_rejects_invalid_context_before_io);
+		UT_RUN(native_full_truncate_sync_preserves_legacy_and_foreign);
+		goto mutation_done;
+	}
+	UT_PLAN(121);
+	UT_RUN(native_full_truncate_sync_finishes_only_original_delete);
+	UT_RUN(native_full_truncate_sync_rejects_incomplete_delete);
+	UT_RUN(native_full_truncate_sync_errors_keep_original_native_effects);
+	UT_RUN(native_full_truncate_sync_rejects_invalid_context_before_io);
+	UT_RUN(native_full_truncate_sync_preserves_legacy_and_foreign);
 	UT_RUN(native_full_truncate_redo_preserves_cutoff_and_original_delete_order);
 	UT_RUN(native_full_truncate_redo_rejects_shape_before_any_native_effect);
 	UT_RUN(native_full_truncate_cold_consumer_requires_complete_original_bytes);

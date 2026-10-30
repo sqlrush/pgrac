@@ -185,12 +185,11 @@ extern bool cluster_clog_native_recovery_full_record_apply_v1(
 extern bool cluster_clog_native_recovery_full_record_verify_v1(
 	int origin, const struct ClusterSideProjectionOperationV1 *operation,
 	const uint8 *payload, uint32 length);
-/* Founder Startup only, after the original FULL redo wrote its page. Sync
- * that exact native file/directory and independently reread the complete
- * zero page without reinitializing it or discarding unrelated dirty cache.
- * The original source owner must bracket this with full record/current
- * checks. False/ERROR retains its attempted obligation; this is neither a
- * FullXid issuer, continuous lifetime nor a COMPLETE/release grant. */
+/* Founder Startup only, after original FULL redo. Sync the exact zero-page
+ * file/directory and reread it, or verify eligible truncated segments absent
+ * around a directory sync. Never reinitialize, re-delete or discard unrelated
+ * dirty cache. The original source executor must bracket full record/current
+ * checks. False/ERROR retains its attempt; no era/lifetime/COMPLETE grant. */
 extern bool cluster_clog_native_recovery_full_sync_v1(int origin,
 	const XLogReaderState *record);
 #endif

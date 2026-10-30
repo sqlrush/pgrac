@@ -24,6 +24,16 @@ static unsigned full_sync_applies, full_sync_touches, full_sync_returns;
 static bool full_sync_foreign, full_sync_other, full_sync_corrupt_after_redo;
 static unsigned full_sync_drift_kind;
 static DecodedXLogRecord *full_sync_drift_record;
+static LWLock *full_sync_lock_error;
+
+static void
+full_sync_fail_lock(LWLock *lock)
+{
+	if (lock == full_sync_lock_error) {
+		fixture_native_lock_hook = NULL;
+		elog(ERROR, "native FULL finish lock fixture");
+	}
+}
 
 static void
 full_sync_drift(void)
@@ -34,6 +44,8 @@ full_sync_drift(void)
 		clog_relmap_native_mutation_end(1);
 	} else if (full_sync_drift_kind == 2)
 		full_sync_drift_record->header.xl_scn++;
+	else if (full_sync_drift_kind == 4)
+		authority = false;
 	else
 		((xl_clog_zeropage_full *)full_sync_drift_record->main_data)->reserved_zero++;
 }
@@ -62,6 +74,8 @@ full_sync_apply(XLogReaderState *record, XLogRecord *header, TimeLineID timeline
 			full_sync_drift_record = record->record;
 			fixture_native_sync_hook = full_sync_drift;
 		}
+		if (full_sync_lock_error != NULL)
+			fixture_native_lock_hook = full_sync_fail_lock;
 	}
 }
 
@@ -104,6 +118,7 @@ full_sync_reader(XLogReaderState *reader, DecodedXLogRecord *decoded,
 	full_sync_applies = full_sync_touches = full_sync_returns = 0;
 	full_sync_foreign = full_sync_other = full_sync_corrupt_after_redo = false;
 	full_sync_drift_kind = 0; full_sync_drift_record = NULL;
+	full_sync_lock_error = NULL;
 }
 
 static bool

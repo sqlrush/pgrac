@@ -10912,3 +10912,7 @@ test_cluster_clog_recovery test_cluster_recovery_native_scan test_cluster_side_x
         test_cluster_cold_recovery_startup test_cluster_recovery_consumed_inputs.o: \
         $(top_srcdir)/src/include/access/clog.h \
         $(top_srcdir)/src/include/cluster/cluster_recovery_native_inventory.h
+
+test_cluster_clog_recovery test_cluster_xid_native_clog.o \
+        test_cluster_recovery_episode_clog.o test_cluster_side_native_clog.o: \
+        test_cluster_clog_native_full_truncate_sync.inc
