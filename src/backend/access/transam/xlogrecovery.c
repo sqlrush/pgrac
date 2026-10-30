@@ -3918,7 +3918,8 @@ ClusterColdRecoveryCtrcPageWalAt(const struct ClusterRecoveryStartV1 *start,
 	PG_TRY();
 	{
 		ok = cluster_recovery_census_page_wal_at_v1(state->ctrc_observation_census, index, out);
-		if (!ok || !cluster_recovery_cold_observation_current(start)) {
+		if (!ok || !cluster_recovery_cold_observation_current(start)
+			|| !cluster_recovery_page_wal_raw_valid_v1(out)) {
 			memset(out, 0, sizeof(*out)); ok = false;
 			cluster_recovery_cold_observation_refuse(state, "page_wal", 0);
 			cluster_recovery_cold_observation_close(state);

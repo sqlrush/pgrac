@@ -1371,7 +1371,10 @@ cluster_recovery_census_page_wal_at_v1(ClusterRecoveryCensus *census, uint32 ind
 	PG_TRY();
 	{
 		ok = cluster_recovery_native_inventory_page_at_v1(census->inventory, index, out);
-		if (!ok) (void)census_fail(census, CLUSTER_RECOVERY_CENSUS_REFUSED);
+		if (!ok || !cluster_recovery_page_wal_raw_valid_v1(out)) {
+			memset(out, 0, sizeof(*out)); ok = false;
+			(void)census_fail(census, CLUSTER_RECOVERY_CENSUS_REFUSED);
+		}
 	}
 	PG_CATCH();
 	{

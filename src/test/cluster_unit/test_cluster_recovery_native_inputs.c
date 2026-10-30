@@ -1164,6 +1164,8 @@ cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **held)
 
 #include "test_cluster_recovery_raw_records.inc"
 
+#include "test_cluster_recovery_page_raw.inc"
+
 int
 main(int argc, char **argv)
 {
@@ -1172,6 +1174,14 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_PAGE_RAW") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_page_raw_keeps_full_original_file_bytes_after_both_passes);
+		UT_RUN(test_page_raw_borrowed_byte_change_revokes_whole_inventory_without_rebase);
+		UT_RUN(test_page_raw_complete_copy_is_charged_before_any_prefix_publication);
+		UT_RUN(test_page_raw_original_census_keeps_all_sources_and_rejects_changed_whole_view);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_INITIALIZED_REPLAY") != NULL) {
 		UT_PLAN(4);
 		UT_RUN(test_episode_initialized_replay_joins_complete_native_and_foreign_initialization);
@@ -1568,7 +1578,11 @@ main(int argc, char **argv)
 	UT_RUN(test_census_native_records_original_final_wal_rewrite_refuses_whole_view);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(299);
+	UT_PLAN(303);
+	UT_RUN(test_page_raw_keeps_full_original_file_bytes_after_both_passes);
+	UT_RUN(test_page_raw_borrowed_byte_change_revokes_whole_inventory_without_rebase);
+	UT_RUN(test_page_raw_complete_copy_is_charged_before_any_prefix_publication);
+	UT_RUN(test_page_raw_original_census_keeps_all_sources_and_rejects_changed_whole_view);
 	UT_RUN(test_reader_raw_record_readahead_release_seek_and_crc_failure_revoke);
 	UT_RUN(test_reader_raw_record_page_and_segment_continuations_exclude_page_headers);
 	UT_RUN(test_census_raw_records_preserve_full_file_bytes_after_both_passes);

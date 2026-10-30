@@ -10901,3 +10901,6 @@ test_cluster_cold_tx_start: test_cluster_cold_ctrc_owner_continuation.inc
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_owner_completion.inc
 
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_owner_inventory.inc
+
+test_cluster_recovery_native_inputs: test_cluster_recovery_page_raw.inc
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_page_raw.inc

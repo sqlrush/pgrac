@@ -59,8 +59,11 @@ typedef struct NativeInventoryPage {
 	uint64 ordinal;
 	int max_block_id;
 	uint8 digest[32];
+	const uint8 *raw_record;
+	uint32 raw_length;
+	uint8 raw_sha256[32];
 	char error[1024]; /* original RestoreBlockImage diagnostic workspace */
-	/* Normalized decoded header, blocks and owned payloads follow. */
+	/* Normalized decoded header, blocks, owned payloads and full raw WAL follow. */
 } NativeInventoryPage;
 
 /* Stack-local correspondence work during one explicit full physical reread.
@@ -330,6 +333,7 @@ inventory_page_current(const ClusterRecoveryNativeInventory *work, const NativeI
 	const char *end = (const char *)page + page->bytes;
 	char *at = (char *)page + fixed;
 	uint8 digest[32];
+	uint8 raw_digest[32];
 
 	if (page->bytes < fixed || page->source_index >= work->source_count
 		|| page->reader.record != record || record->max_block_id != page->max_block_id
@@ -350,7 +354,14 @@ inventory_page_current(const ClusterRecoveryNativeInventory *work, const NativeI
 			|| (block->has_image && !inventory_page_payload(&at, end, block->bkp_image, block->bimg_len)))
 			return false;
 	}
-	return at == end && inventory_page_hash(&page->reader, digest)
+	return page->raw_length >= SizeOfXLogRecord
+		&& page->raw_length == record->header.xl_tot_len
+		&& inventory_page_payload(&at, end, (const char *)page->raw_record, page->raw_length)
+		&& at == end
+		&& memcmp(page->raw_record, &record->header, SizeOfXLogRecord) == 0
+		&& cluster_recovery_native_raw_sha256_v1(page->raw_record, page->raw_length, raw_digest)
+		&& memcmp(raw_digest, page->raw_sha256, sizeof(raw_digest)) == 0
+		&& inventory_page_hash(&page->reader, digest)
 		&& memcmp(digest, page->digest, sizeof(digest)) == 0;
 }
 
@@ -382,6 +393,7 @@ static RfPageProofDetailV1
 inventory_page_save(ClusterRecoveryNativeInventory *work, XLogReaderState *reader, uint64 ordinal)
 {
 	const DecodedXLogRecord *source = reader->record;
+	const XLogRecord *raw = XLogReaderCurrentRawRecord(reader);
 	NativeInventoryPage *page;
 	DecodedXLogRecord *record;
 	size_t fixed = MAXALIGN(sizeof(*page)) + MAXALIGN(sizeof(*record)
@@ -389,6 +401,12 @@ inventory_page_save(ClusterRecoveryNativeInventory *work, XLogReaderState *reade
 	size_t bytes = fixed + MAXALIGN((size_t)source->main_data_len);
 	char *at;
 
+	if (raw == NULL || raw->xl_tot_len < SizeOfXLogRecord
+		|| raw->xl_tot_len != source->header.xl_tot_len
+		|| memcmp(raw, &source->header, SizeOfXLogRecord) != 0)
+		return inventory_refuse(work, CLUSTER_RECOVERY_NATIVE_INVENTORY_INVALID,
+			RF_PAGE_PROOF_DETAIL_SOURCE_GAP);
+	bytes += MAXALIGN((size_t)raw->xl_tot_len);
 	for (int i = 0; i <= source->max_block_id; i++) {
 		const DecodedBkpBlock *block = &source->blocks[i];
 		if (block->in_use) {
@@ -433,10 +451,13 @@ inventory_page_save(ClusterRecoveryNativeInventory *work, XLogReaderState *reade
 			block->bimg_len = block->hole_offset = block->hole_length = 0;
 		}
 	}
+	page->raw_record = (const uint8 *)at; page->raw_length = raw->xl_tot_len;
+	memcpy(at, raw, page->raw_length);
 	page->reader.system_identifier = reader->system_identifier;
 	page->reader.ReadRecPtr = reader->ReadRecPtr; page->reader.EndRecPtr = reader->EndRecPtr;
 	page->reader.record = record; page->reader.errormsg_buf = page->error;
-	if (!inventory_page_hash(reader, page->digest)
+	if (!cluster_recovery_native_raw_sha256_v1(page->raw_record, page->raw_length, page->raw_sha256)
+		|| !inventory_page_hash(reader, page->digest)
 		|| !inventory_page_current(work, page))
 		return inventory_refuse(work, CLUSTER_RECOVERY_NATIVE_INVENTORY_INVALID,
 			RF_PAGE_PROOF_DETAIL_SOURCE_GAP);
@@ -772,7 +793,11 @@ inventory_record(XLogReaderState *reader, const ClusterWalSourceRef *source,
 			if (detail != RF_PAGE_PROOF_DETAIL_OK) return detail;
 		} else {
 			NativeInventoryPage *page = work->page_cursor;
-			if (page == NULL || page->source_index != work->source_cursor || page->ordinal != ordinal)
+			raw = XLogReaderCurrentRawRecord(reader);
+			if (page == NULL || page->source_index != work->source_cursor || page->ordinal != ordinal
+				|| !inventory_page_current(work, page) || raw == NULL
+				|| raw->xl_tot_len != page->raw_length
+				|| memcmp(raw, page->raw_record, page->raw_length) != 0)
 				return inventory_refuse(work, CLUSTER_RECOVERY_NATIVE_INVENTORY_CHANGED,
 					RF_PAGE_PROOF_DETAIL_SOURCE_GAP);
 			work->page_cursor = page->next;
@@ -2575,6 +2600,8 @@ cluster_recovery_native_inventory_page_at_v1(ClusterRecoveryNativeInventory *inv
 	out->cut = inventory->sources[page->source_index].cut;
 	out->source_index = page->source_index; out->ordinal = page->ordinal;
 	out->reader = &page->reader;
+	out->raw_record = page->raw_record; out->raw_length = page->raw_length;
+	memcpy(out->raw_record_sha256, page->raw_sha256, sizeof(out->raw_record_sha256));
 	return true;
 }
 

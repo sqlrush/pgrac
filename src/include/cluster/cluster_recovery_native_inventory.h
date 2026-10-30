@@ -214,13 +214,18 @@ extern bool cluster_recovery_native_inventory_source_at_v1(
 
 /* Full decoded PageVersion-bearing input, not a contribution-graph verdict.
  * reader owns no files/callbacks and borrows this inventory's immutable copy.
- * All components, payloads and original source generations are retained. */
+ * All components, payloads and original source generations are retained.
+ * raw_record borrows the same inventory's complete original validated WAL
+ * bytes, including framing and CRC; the copied reader owns no raw buffer. */
 typedef struct ClusterRecoveryPageWalV1 {
 	ClusterWalSourceRef source;
 	RfContributorStreamCutV1 cut;
 	uint32 source_index;
 	uint64 ordinal;
 	const XLogReaderState *reader;
+	const uint8 *raw_record;
+	uint32 raw_length;
+	uint8 raw_record_sha256[32];
 } ClusterRecoveryPageWalV1;
 
 /* Complete two-pass observations only. Count zero is a complete empty set,
@@ -623,6 +628,24 @@ cluster_recovery_native_raw_sha256_v1(const uint8 *raw, uint32 length, uint8 out
 		&& pg_cryptohash_final(hash, out, 32) == 0;
 	pg_cryptohash_free(hash);
 	return ok;
+}
+/* Validate the complete borrowed envelope, not source/current authority. */
+static inline bool
+cluster_recovery_page_wal_raw_valid_v1(const ClusterRecoveryPageWalV1 *view)
+{
+	const XLogReaderState *reader = view->reader;
+	uint8 digest[32];
+
+	return reader != NULL && reader->record != NULL && view->raw_record != NULL
+		&& reader->record->has_page_version_edge
+		&& reader->ReadRecPtr == reader->record->lsn
+		&& reader->EndRecPtr == reader->record->next_lsn
+		&& reader->EndRecPtr > reader->ReadRecPtr
+		&& view->raw_length >= SizeOfXLogRecord
+		&& view->raw_length == reader->record->header.xl_tot_len
+		&& memcmp(view->raw_record, &reader->record->header, SizeOfXLogRecord) == 0
+		&& cluster_recovery_native_raw_sha256_v1(view->raw_record, view->raw_length, digest)
+		&& memcmp(digest, view->raw_record_sha256, sizeof(digest)) == 0;
 }
 /* A complete decoder-owned group is published as one value. Upper layers
  * check its envelope before exposing borrowed components; execution and
