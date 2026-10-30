@@ -15,6 +15,9 @@ static void retention_native_published(FullTransactionId issued);
 static bool retention_error_expected;
 static bool retention_wrap_ready = true;
 static void (*retention_full_clog_leaf)(FullTransactionId candidate);
+#ifdef TEST_CLUSTER_XID_RETENTION_NATIVE_CLOG
+static bool retention_mapping_held;
+#endif
 int xid_allocation_original_main(void);
 
 #define CLUSTER_XID_RETENTION_TEST
@@ -33,6 +36,15 @@ static uint64 retention_sysid, retention_dbinc;
 static bool
 retention_native_lock_acquire(LWLock *lock, LWLockMode mode)
 {
+#ifdef TEST_CLUSTER_XID_RETENTION_NATIVE_CLOG
+	if (lock == RelationMappingLock) {
+		if (held || retention_held || retention_mapping_held || mode != LW_EXCLUSIVE
+			|| CritSectionCount != 0) lock_errors++;
+		retention_mapping_held = true;
+		HOLD_INTERRUPTS();
+		return false;
+	}
+#endif
 	if (lock == XidGenLock) {
 		if (held || retention_held || mode != LW_EXCLUSIVE) lock_errors++;
 		held = true;
@@ -49,6 +61,14 @@ retention_native_lock_acquire(LWLock *lock, LWLockMode mode)
 static void
 retention_native_lock_release(LWLock *lock)
 {
+#ifdef TEST_CLUSTER_XID_RETENTION_NATIVE_CLOG
+	if (lock == RelationMappingLock) {
+		if (!retention_mapping_held || held || retention_held) lock_errors++;
+		retention_mapping_held = false;
+		RESUME_INTERRUPTS();
+		return;
+	}
+#endif
 	if (lock == XidGenLock) {
 		if (!held || retention_held) lock_errors++;
 		held = false;
@@ -69,6 +89,10 @@ retention_native_lock_release(LWLock *lock)
 static bool
 retention_native_lock_held(LWLock *lock, LWLockMode mode)
 {
+#ifdef TEST_CLUSTER_XID_RETENTION_NATIVE_CLOG
+	if (lock == RelationMappingLock)
+		return mode == LW_EXCLUSIVE && retention_mapping_held;
+#endif
 	return mode == LW_EXCLUSIVE && ((lock == XidGenLock && held)
 		|| (relmap_runtime_shmem != NULL && lock == &relmap_runtime_shmem->lock && retention_held));
 }
@@ -169,6 +193,9 @@ retention_fixture(uint64 candidate, unsigned origin)
 	retention_active = true;
 	retention_held = retention_recompute = retention_error_expected = false;
 	retention_wrap_ready = true;
+#ifdef TEST_CLUSTER_XID_RETENTION_NATIVE_CLOG
+	retention_mapping_held = false;
+#endif
 	retention_acquires = retention_final_observations = retention_fault = retention_error_code = 0;
 	InterruptHoldoffCount = 0;
 	IsUnderPostmaster = false;
@@ -467,6 +494,7 @@ UT_TEST(retention_guard_valid_entry_observes_under_both_locks_and_returns_only_i
 #include "test_cluster_xid_retention_native_clog.inc"
 #include "test_cluster_xid_retention_native_xact.inc"
 #include "test_cluster_xid_retention_owner_capture.inc"
+#include "test_cluster_xid_retention_stage.inc"
 #endif
 
 int
@@ -474,7 +502,9 @@ main(void)
 {
 #ifdef TEST_CLUSTER_XID_RETENTION_NATIVE_CLOG
 	bool focus = getenv("PGRAC_RETENTION_NATIVE_CLOG_FOCUS") != NULL;
-	UT_PLAN(focus ? 16 : 37);
+	bool stage_focus = getenv("PGRAC_RETENTION_NATIVE_STAGE_FOCUS") != NULL;
+	UT_PLAN(stage_focus ? 7 : focus ? 23 : 44);
+	if (!stage_focus) {
 	if (!focus) {
 #else
 	UT_PLAN(21);
@@ -518,6 +548,14 @@ main(void)
 	UT_RUN(retained_capture_refuses_before_ordinary_or_native_assignment);
 	UT_RUN(retained_capture_never_adopts_writer_after_assignment_drift);
 	UT_RUN(retained_capture_error_keeps_output_pins_and_failed_transaction);
+	}
+	UT_RUN(retained_stage_native_gap_and_rollover_precede_relmap_wal);
+	UT_RUN(retained_stage_native_two_namespaces_keep_top_across_child);
+	UT_RUN(retained_stage_native_early_guards_preserve_all_native_state);
+	UT_RUN(retained_stage_native_wal_error_keeps_original_unissued_debt);
+	UT_RUN(retained_stage_native_late_guard_keeps_birth_without_relmap);
+	UT_RUN(retained_stage_native_writer_drift_keeps_actual_issuance_only);
+	UT_RUN(retained_stage_native_pair_refusal_keeps_staged_pins_and_outputs);
 #endif
 	free(relmap_runtime_shmem);
 	UT_DONE();

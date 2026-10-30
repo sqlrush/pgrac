@@ -11592,23 +11592,41 @@ test_cluster_xid_native_clog: test_cluster_xid_native_clog_main.o \
 
 TESTS += test_cluster_xid_retention_native_clog
 all: test_cluster_xid_retention_native_clog
+# Original producer/runtime bodies beside the actual retained transaction.
+test_cluster_xid_retention_stage_product.inc: $(top_srcdir)/src/backend/utils/cache/relmapper.c \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_retention_runtime.c \
+		Makefile
+	awk '/^(apply_map_update|merge_map_updates)\(/ { print "static void"; emit=1; functions++ } \
+	     /^relmap_producer_stage_v2\(/ { print "static bool"; emit=1; functions++ } \
+	     /^(cluster_relmap_producer_stage_v2|cluster_relmap_retention_runtime_write_pending_v2)\(/ { print "bool"; emit=1; functions++ } \
+	     /^relmap_runtime_(producer_key|directory_matches)\(/ { print "static ClusterRelmapRetentionResult"; emit=1; functions++ } \
+	     /^cluster_relmap_retention_runtime_insert_pending_v2\(/ { print "XLogRecPtr"; emit=1; functions++ } \
+	     emit { print } /^}/ { emit=0 } END { if (functions != 8) exit 1 }' $(filter %.c,$^) > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_xid_retention_native_clog_main.o: $(XID_RETENTION_TEST_INPUTS) \
 		test_cluster_xid_retention_native_clog.inc test_cluster_xid_retention_native_xact.inc \
 		test_cluster_xid_retention_owner_capture.inc \
+		test_cluster_xid_retention_stage.inc test_cluster_xid_retention_stage_product.inc \
+		$(top_srcdir)/src/include/utils/relmapper.h \
+		$(top_srcdir)/src/include/catalog/pg_tablespace_d.h \
 		test_cluster_xid_native_clog.h Makefile
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DTEST_CLUSTER_XID_RETENTION_NATIVE_CLOG -c $< -o $@
 
 test_cluster_xid_retention_native_clog: test_cluster_xid_retention_native_clog_main.o \
-		test_cluster_xid_native_clog.o $(CLUSTER_XID_STRIPE_O)
+		test_cluster_xid_native_clog.o $(CLUSTER_XID_STRIPE_O) \
+		test_cluster_relmap_v2_codec_product.o $(top_builddir)/src/common/libpgcommon_srv.a
 	$(CC) $(CFLAGS) $(CPPFLAGS) test_cluster_xid_retention_native_clog_main.o \
 		test_cluster_xid_native_clog.o $(CLUSTER_XID_STRIPE_O) \
+		test_cluster_relmap_v2_codec_product.o $(top_builddir)/src/common/libpgcommon_srv.a \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 clean: clean-xid-native-clog
 .PHONY: clean-xid-native-clog
 clean-xid-native-clog:
 	rm -f test_cluster_xid_native_clog_main.o test_cluster_xid_native_clog.o \
-		test_cluster_xid_retention_native_clog_main.o
+		test_cluster_xid_retention_native_clog_main.o \
+		test_cluster_xid_retention_stage_product.inc test_cluster_xid_retention_stage_product.inc.tmp
 
 # Exercise the original recovery -> seed -> claim -> WAL gate. Dependency
 # boundaries are controlled by the test; the admission predicates are not.
