@@ -59,6 +59,13 @@ palloc0(Size size)
 	return calloc(1, size);
 }
 
+/* Backend common helpers use the same local allocation boundary. */
+void *
+palloc(Size size)
+{
+	return malloc(size);
+}
+
 void *
 palloc_extended(Size size, int flags)
 {
@@ -81,6 +88,8 @@ pfree(void *pointer)
 #define NROOTS 3
 static ClusterControlRootSnapshot roots[NROOTS + 1];
 static ClusterControlRootReadToken tokens[NROOTS + 1];
+/* Opt in before capture; original isolated fixtures keep their zero default. */
+static bool native_side_complete_claims;
 static XLogRecPtr native_redo[NROOTS + 1];
 static ClusterWalRecoveryCheckpointV1 native_checkpoint[NROOTS + 1];
 static ClusterControlRootResult source_result[NROOTS + 1];
@@ -269,6 +278,8 @@ cluster_control_root_recovery_source_v1(const ClusterControlRootSnapshot *root,
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	source->claim.identity = root->identity;
 	source->claim.database_incarnation = database_incarnation[thread];
+	if (native_side_complete_claims)
+		source->claim.max_config_generation = 1;
 	memset(source->claim.claim_sha256, thread, sizeof(source->claim.claim_sha256));
 	source->timeline = root->checkpoint_tli;
 	*redo = native_redo[thread];

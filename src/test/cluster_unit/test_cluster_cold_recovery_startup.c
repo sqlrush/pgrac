@@ -6,7 +6,9 @@
  *	  The real cold plan core is linked.  ROOT lookup, source selection,
  *	  fence-plan origins, the pass-1 visitor scan and DATA observation are
  *	  fixtures (test_cluster_cold_recovery_startup_boundary.h); no WAL,
- *	  storage or lock is touched.
+ *	  storage or lock is touched by the isolated driver groups. The opt-in
+ *	  native CLOG groups additionally run sealed SIDE, CLOG/SLRU and private
+ *	  files through their original implementations.
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -3914,11 +3916,13 @@ int
 main(void)
 {
 	if (getenv("PGRAC_PRE2_TEST_NATIVE_CLOG_STORAGE") != NULL) {
-		UT_PLAN(4);
+		UT_PLAN(6);
 		UT_RUN(test_source_native_clog_finishes_original_records_without_cold_scope);
 		UT_RUN(test_source_native_clog_rejects_unowned_and_substituted_reader);
 		UT_RUN(test_source_native_clog_sync_errors_preserve_attempt_and_bytes);
 		UT_RUN(test_source_native_clog_late_source_change_cannot_retry);
+		UT_RUN(test_source_native_clog_sealed_bytes_refuse_before_native_attempt);
+		UT_RUN(test_source_native_clog_sealed_success_cannot_replay_or_become_cold_applied);
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
@@ -3932,7 +3936,7 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(146);
+	UT_PLAN(148);
 	UT_RUN(test_full_clog_truncate_dispatch_uses_original_projection_identity);
 	UT_RUN(test_full_clog_dispatch_uses_only_original_projection_identity);
 	UT_RUN(test_execution_refusal_preserves_the_first_census_failure);
@@ -4075,6 +4079,8 @@ main(void)
 	UT_RUN(test_source_native_clog_rejects_unowned_and_substituted_reader);
 	UT_RUN(test_source_native_clog_sync_errors_preserve_attempt_and_bytes);
 	UT_RUN(test_source_native_clog_late_source_change_cannot_retry);
+	UT_RUN(test_source_native_clog_sealed_bytes_refuse_before_native_attempt);
+	UT_RUN(test_source_native_clog_sealed_success_cannot_replay_or_become_cold_applied);
 	UT_RUN(test_native_clog_record_context_exists_only_in_original_callback);
 	UT_RUN(test_native_clog_record_context_clears_on_error_without_retry);
 	UT_RUN(test_native_clog_source_wraps_original_founder_callback);

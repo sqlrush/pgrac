@@ -5238,6 +5238,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_clog_native_counter.inc test_cluster_clog_native_counter.inc.tmp
 	rm -f test_cluster_clog_native_advance_next.inc test_cluster_clog_native_advance_next.inc.tmp
 	rm -f test_cluster_clog_native_horizon.inc test_cluster_clog_native_horizon.inc.tmp
+	rm -f test_cluster_cold_native_side.o
 	rm -f test_cluster_recovery_episode_clog.o test_cluster_recovery_episode_side_owner.o test_cluster_recovery_consumed_inputs.o test_cluster_recovery_episode_allocator.o
 	rm -f test_cluster_startup_native_ctrc.o test_cluster_startup_native_ctrc_owner.inc test_cluster_startup_native_ctrc_owner.inc.tmp
 	rm -f test_cluster_side_native_clog.o
@@ -9727,13 +9728,30 @@ test_cluster_cold_source_completion.inc: $(top_srcdir)/src/backend/cluster/clust
 	awk '/^cluster_cold_completion_proven_v1\(/ { print "bool"; emit=1; count++ } emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_cold_native_side.o: test_cluster_cold_native_side.c \
+		Makefile $(top_builddir)/src/include/pg_config.h \
+		$(top_srcdir)/src/include/access/xlogreader.h \
+		$(top_srcdir)/src/include/cluster/cluster_rf_route.h \
+		test_cluster_cold_native_side.h test_cluster_cold_native_side_namespace.h \
+		$(top_srcdir)/src/backend/cluster/cluster_side_online_plan.c \
+		$(top_srcdir)/src/backend/cluster/cluster_side_online_plan_internal.h \
+		$(top_srcdir)/src/include/cluster/cluster_side_online_plan.h \
+		$(top_srcdir)/src/include/access/clog.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
+COLD_NATIVE_SIDE_OBJS = test_cluster_cold_native_side.o $(CLUSTER_SIDE_XACT_O) \
+	$(SIDE_XACT_XACTDESC_O) $(SIDE_XACT_TT_2PC_RECORD_O) \
+	test_cluster_side_xact_undo_product.o $(CLUSTER_SIDE_ROUTE_O) \
+	$(CLUSTER_RF_ROUTE_O) $(CLUSTER_REMOTE_XACT_IDENTITY_O)
+
 test_cluster_cold_recovery_startup: test_cluster_cold_recovery_startup.c unit_test.h $(CLUSTER_COLD_STARTUP_O) \
+		$(COLD_NATIVE_SIDE_OBJS) test_cluster_cold_native_side.h \
 		test_cluster_cold_native_storage.inc test_cluster_recovery_episode_clog.o \
 		test_cluster_recovery_episode_clog.h \
 		test_cluster_cold_native_clog_consumed.inc \
 		test_cluster_recovery_duty_compare.inc \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
-		$(top_builddir)/src/common/libpgcommon.a \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
 		test_cluster_cold_source_completion.inc \
 		test_cluster_cold_endpoints.h test_cluster_cold_recovery_xid_core.o \
 		test_cluster_cold_recovery_replay_core.o \
@@ -9744,10 +9762,11 @@ test_cluster_cold_recovery_startup: test_cluster_cold_recovery_startup.c unit_te
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_census.h \
 		cluster_unit_port_stubs.o $(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< $(CLUSTER_COLD_STARTUP_O) \
+		$(COLD_NATIVE_SIDE_OBJS) \
 		test_cluster_recovery_episode_clog.o $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		test_cluster_cold_recovery_xid_core.o test_cluster_cold_recovery_replay_core.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
-		$(top_builddir)/src/common/libpgcommon.a \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -lcrypto -o $@
 
 D_COLD_REFAIL_O = test_cluster_cold_recovery_refail_plan_core.o $(CLUSTER_COLD_PLAN_SPLIT_O)
