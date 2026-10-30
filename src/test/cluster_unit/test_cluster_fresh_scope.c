@@ -1028,6 +1028,8 @@ CheckOwnedObjectsStorageDrop(DropOwnedStmt *stmt, bool isTopLevel)
 #include "test_cluster_fresh_index.inc"
 #include "test_cluster_fresh_catalog_index.inc"
 
+static void reset_create_preflight(void);
+
 static void
 sql_entry(Node *node)
 {
@@ -1695,7 +1697,8 @@ UT_TEST(test_shared_two_phase_refuses_but_transaction_control_remains_native)
 UT_TEST(test_rdma_drop_checks_native_targets_before_later_utility_work)
 {
 	ObjectType kinds[] = { OBJECT_TABLE, OBJECT_INDEX, OBJECT_SEQUENCE, OBJECT_SCHEMA };
-	cluster_shared_config = true;
+	reset_create_preflight();
+	cluster_shared_config = cluster_shared_catalog = true;
 	for (int tier = CLUSTER_IC_TIER_2; tier <= CLUSTER_IC_TIER_3; tier++) {
 		cluster_interconnect_tier = tier;
 		for (unsigned i = 0; i < lengthof(kinds); i++) {
@@ -1706,13 +1709,14 @@ UT_TEST(test_rdma_drop_checks_native_targets_before_later_utility_work)
 			reset_error();
 			caught = sigsetjmp(boundary, 1);
 			if (!caught)
-				sql_entry((Node *)&drop);
+				create_sql_entry((Node *)&drop);
 			UT_ASSERT_EQ(caught, 1);
 			UT_ASSERT_EQ(error_code, ERRCODE_FEATURE_NOT_SUPPORTED);
 			UT_ASSERT_EQ(storage_drop_preflights, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
 			UT_ASSERT_EQ(utility_after_preflight, 0);
 			drop_target_shared = false;
-			sql_entry((Node *)&drop);
+			create_sql_entry((Node *)&drop);
 			UT_ASSERT_EQ(storage_drop_preflights, 2);
 			UT_ASSERT_EQ(utility_after_preflight, 1);
 		}
@@ -1725,9 +1729,10 @@ UT_TEST(test_rdma_drop_checks_native_targets_before_later_utility_work)
 		reset_error();
 		caught = sigsetjmp(boundary, 1);
 		if (!caught)
-			sql_entry((Node *)&owned);
+			create_sql_entry((Node *)&owned);
 		UT_ASSERT_EQ(caught, 1);
 		UT_ASSERT_EQ(storage_drop_preflights, 1);
+		UT_ASSERT_EQ(utility_binds, 1);
 		UT_ASSERT_EQ(utility_after_preflight, 0);
 	}
 	cluster_interconnect_tier = CLUSTER_IC_TIER_1;
@@ -5772,7 +5777,7 @@ UT_TEST(test_drop_owned_autocommit_readonly_parallel_precede_binding)
 	}
 }
 
-UT_TEST(test_drop_owned_locked_storage_precheck_keeps_original_path_without_binding)
+UT_TEST(test_drop_owned_locked_storage_checks_follow_approved_upper_binding)
 {
 	DropOwnedFixture fixture;
 
@@ -5803,9 +5808,9 @@ UT_TEST(test_drop_owned_locked_storage_precheck_keeps_original_path_without_bind
 							UT_ASSERT_EQ(error_code, transaction ? ERRCODE_ACTIVE_SQL_TRANSACTION
 																 : ERRCODE_FEATURE_NOT_SUPPORTED);
 						UT_ASSERT_EQ(storage_drop_preflights, prechecked ? 1 : 0);
-						UT_ASSERT_EQ(utility_xids, 0);
-						UT_ASSERT_EQ(utility_prepares, 0);
-						UT_ASSERT_EQ(utility_binds, 0);
+						UT_ASSERT_EQ(utility_xids, (mode & 3) == 3 ? 1 : 0);
+						UT_ASSERT_EQ(utility_prepares, (mode & 3) == 3 ? 1 : 0);
+						UT_ASSERT_EQ(utility_binds, (mode & 3) == 3 ? 1 : 0);
 						UT_ASSERT_EQ(utility_after_preflight, caught ? 0 : 1);
 					}
 				}
@@ -5966,7 +5971,7 @@ UT_TEST(test_drop_autocommit_readonly_parallel_precede_binding)
 	}
 }
 
-UT_TEST(test_drop_locked_or_concurrent_paths_keep_original_checks_without_binding)
+UT_TEST(test_drop_locked_or_concurrent_paths_follow_approved_upper_order)
 {
 	DropFixture fixture;
 	List objects;
@@ -5987,6 +5992,7 @@ UT_TEST(test_drop_locked_or_concurrent_paths_keep_original_checks_without_bindin
 							bool prechecked
 								= (mode & 2) != 0 && (tier != CLUSTER_IC_TIER_1 || scope != 0);
 							bool index_rejected = concurrent && (mode & 5) != 0;
+							bool early = (mode & 3) == 3;
 							int caught;
 
 							reset_create_preflight();
@@ -6004,16 +6010,16 @@ UT_TEST(test_drop_locked_or_concurrent_paths_keep_original_checks_without_bindin
 							UT_ASSERT_EQ(caught != 0,
 										 (prechecked && shared != 0) || index_rejected);
 							if (caught)
-								UT_ASSERT_EQ(error_code, prechecked && shared != 0 && scope != 0
+								UT_ASSERT_EQ(error_code, prechecked && shared != 0 && scope != 0 && !(early && index_rejected)
 															 ? ERRCODE_ACTIVE_SQL_TRANSACTION
 															 : ERRCODE_FEATURE_NOT_SUPPORTED);
-							if (index_rejected && !(prechecked && shared != 0))
+							if (index_rejected && (early || !(prechecked && shared != 0)))
 								UT_ASSERT(strstr(error_message, "concurrent index removal")
 										  != NULL);
-							UT_ASSERT_EQ(storage_drop_preflights, prechecked ? 1 : 0);
-							UT_ASSERT_EQ(utility_xids, 0);
-							UT_ASSERT_EQ(utility_prepares, 0);
-							UT_ASSERT_EQ(utility_binds, 0);
+							UT_ASSERT_EQ(storage_drop_preflights, prechecked && !(early && index_rejected) ? 1 : 0);
+							UT_ASSERT_EQ(utility_xids, early && !index_rejected ? 1 : 0);
+							UT_ASSERT_EQ(utility_prepares, early && !index_rejected ? 1 : 0);
+							UT_ASSERT_EQ(utility_binds, early && !index_rejected ? 1 : 0);
 							UT_ASSERT_EQ(utility_after_preflight, caught ? 0 : 1);
 						}
 					}
@@ -25183,11 +25189,11 @@ main(void)
 	UT_RUN(test_drop_owned_autocommit_binds_before_later_work_and_reuses_top);
 	UT_RUN(test_drop_owned_autocommit_refusal_child_and_wrong_top_precede_later_work);
 	UT_RUN(test_drop_owned_autocommit_readonly_parallel_precede_binding);
-	UT_RUN(test_drop_owned_locked_storage_precheck_keeps_original_path_without_binding);
+	UT_RUN(test_drop_owned_locked_storage_checks_follow_approved_upper_binding);
 	UT_RUN(test_drop_autocommit_binds_before_later_work_and_reuses_top);
 	UT_RUN(test_drop_autocommit_refusal_and_wrong_top_precede_later_work);
 	UT_RUN(test_drop_autocommit_readonly_parallel_precede_binding);
-	UT_RUN(test_drop_locked_or_concurrent_paths_keep_original_checks_without_binding);
+	UT_RUN(test_drop_locked_or_concurrent_paths_follow_approved_upper_order);
 	UT_RUN(test_drop_unsupported_objects_refuse_before_binding);
 	UT_RUN(test_native_import_binds_before_lookup_and_callback_in_all_profiles);
 	UT_RUN(test_native_import_refusal_and_invalid_scope_precede_catalogs);

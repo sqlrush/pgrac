@@ -86,8 +86,39 @@ ProcessUtility_hook_type ProcessUtility_hook = NULL;
 /* PGRAC: inspect the complete user command before event triggers or DDL writes.
  * Internal btree rebuilds (for example TRUNCATE) do not use a ReindexStmt.
  * Author: SqlRush <sqlrush@gmail.com> */
-void
-CheckClusterSharedUtilitySupport(Node *statement, bool isTopLevel)
+static void
+CheckClusterSharedStorageDrop(Node *statement, bool isTopLevel)
+{
+	if (!cluster_storage_mode_enabled())
+		return;
+	/* Resolve the original roots and complete dependency closure before
+	 * ddl_command_start can run. The final deletion pass rechecks its own
+	 * closure because a trigger may change dependencies in this transaction. */
+	if ((cluster_interconnect_tier != CLUSTER_IC_TIER_1 || IsInTransactionBlock(isTopLevel))
+		&& IsA(statement, DropStmt)) {
+		DropStmt *drop = (DropStmt *)statement;
+
+		switch (drop->removeType) {
+		case OBJECT_TABLE:
+		case OBJECT_INDEX:
+		case OBJECT_SEQUENCE:
+		case OBJECT_VIEW:
+		case OBJECT_MATVIEW:
+		case OBJECT_FOREIGN_TABLE:
+			CheckRelationsStorageDrop(drop, isTopLevel);
+			break;
+		default:
+			CheckObjectsStorageDrop(drop, isTopLevel);
+			break;
+		}
+	}
+	if ((cluster_interconnect_tier != CLUSTER_IC_TIER_1 || IsInTransactionBlock(isTopLevel))
+		&& IsA(statement, DropOwnedStmt))
+		CheckOwnedObjectsStorageDrop((DropOwnedStmt *)statement, isTopLevel);
+}
+
+static void
+CheckClusterSharedUtilitySupportInternal(Node *statement, bool isTopLevel, bool check_storage)
 {
 	const char *unsupported = NULL;
 	ObjectType object_type = OBJECT_TABLE;
@@ -202,7 +233,7 @@ CheckClusterSharedUtilitySupport(Node *statement, bool isTopLevel)
 				unsupported = "materialized views";
 			else
 				foreach(lc, ((AlterTableStmt *) statement)->cmds)
-					CheckClusterSharedUtilitySupport((Node *) lfirst(lc), false);
+					CheckClusterSharedUtilitySupportInternal((Node *) lfirst(lc), false, check_storage);
 			break;
 		case T_AlterTableCmd:
 			if (((AlterTableCmd *) statement)->subtype == AT_SetUnLogged)
@@ -249,7 +280,7 @@ CheckClusterSharedUtilitySupport(Node *statement, bool isTopLevel)
 			break;
 		case T_CreateSchemaStmt:
 			foreach(lc, ((CreateSchemaStmt *) statement)->schemaElts)
-				CheckClusterSharedUtilitySupport((Node *) lfirst(lc), false);
+				CheckClusterSharedUtilitySupportInternal((Node *) lfirst(lc), false, check_storage);
 			break;
 		default:
 			break;
@@ -280,32 +311,14 @@ CheckClusterSharedUtilitySupport(Node *statement, bool isTopLevel)
 				 errmsg("%s is not supported in shared mode", unsupported),
 				 errdetail("PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED")));
 storage_preflight:
-	if (!cluster_storage_mode_enabled())
-		return;
-	/* Resolve the original roots and complete dependency closure before
-	 * ddl_command_start can run. The final deletion pass rechecks its own
-	 * closure because a trigger may change dependencies in this transaction. */
-	if ((cluster_interconnect_tier != CLUSTER_IC_TIER_1 || IsInTransactionBlock(isTopLevel))
-		&& IsA(statement, DropStmt)) {
-		DropStmt *drop = (DropStmt *)statement;
+	if (check_storage)
+		CheckClusterSharedStorageDrop(statement, isTopLevel);
+}
 
-		switch (drop->removeType) {
-		case OBJECT_TABLE:
-		case OBJECT_INDEX:
-		case OBJECT_SEQUENCE:
-		case OBJECT_VIEW:
-		case OBJECT_MATVIEW:
-		case OBJECT_FOREIGN_TABLE:
-			CheckRelationsStorageDrop(drop, isTopLevel);
-			break;
-		default:
-			CheckObjectsStorageDrop(drop, isTopLevel);
-			break;
-		}
-	}
-	if ((cluster_interconnect_tier != CLUSTER_IC_TIER_1 || IsInTransactionBlock(isTopLevel))
-		&& IsA(statement, DropOwnedStmt))
-		CheckOwnedObjectsStorageDrop((DropOwnedStmt *)statement, isTopLevel);
+void
+CheckClusterSharedUtilitySupport(Node *statement, bool isTopLevel)
+{
+	CheckClusterSharedUtilitySupportInternal(statement, isTopLevel, true);
 }
 
 /* PGRAC: complete the original top binding before these catalog writes reach
@@ -354,15 +367,12 @@ PreflightClusterSharedCatalogWrite(Node *statement, bool isTopLevel)
 			&& !IsA(statement, TruncateStmt)))
 		return;
 
-	/* Other drop scopes retain their earlier storage check. */
-	if ((IsA(statement, DropOwnedStmt) || IsA(statement, DropStmt))
-		&& (cluster_interconnect_tier != CLUSTER_IC_TIER_1 || IsInTransactionBlock(isTopLevel)))
-		return;
-
-	/* Dynamic ALTER classification takes DDL locks. Its upper preflight must
-	 * finish even when recovery is the only active context restriction. */
+	/* Dynamic ALTER and DROP classification takes DDL locks. Finish context
+	 * checks even when recovery is the only active restriction. */
 	if (IsA(statement, AlterTableStmt))
 		PreventCommandDuringRecovery("ALTER TABLE");
+	else if (IsA(statement, DropStmt) || IsA(statement, DropOwnedStmt))
+		PreventCommandDuringRecovery("DROP");
 
 	if (IsA(statement, AlterDatabaseStmt)) {
 		ListCell *lc;
@@ -993,7 +1003,13 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 #ifdef USE_PGRAC_CLUSTER
 	/* PGRAC: reject unsupported index AMs/constraints before event triggers.
 	 * Author: SqlRush <sqlrush@gmail.com> */
-	CheckClusterSharedUtilitySupport(parsetree, isTopLevel);
+	/* Only the unlocked upper DROP path defers its storage closure. Native
+	 * callers keep the exported support check and its original lock boundary. */
+	if (cluster_shared_catalog && cluster_storage_mode_enabled()
+		&& (IsA(parsetree, DropStmt) || IsA(parsetree, DropOwnedStmt)))
+		CheckClusterSharedUtilitySupportInternal(parsetree, isTopLevel, false);
+	else
+		CheckClusterSharedUtilitySupport(parsetree, isTopLevel);
 	CheckClusterIndexSupport(parsetree);
 #endif
 
@@ -1014,6 +1030,11 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 
 #ifdef USE_PGRAC_CLUSTER
 	PreflightClusterSharedCatalogWrite(parsetree, isTopLevel);
+	/* The full original binding precedes the first storage/dependency lock.
+	 * Keep the original closure and its final deletion-pass recheck. */
+	if (cluster_shared_catalog && cluster_storage_mode_enabled()
+		&& (IsA(parsetree, DropStmt) || IsA(parsetree, DropOwnedStmt)))
+		CheckClusterSharedStorageDrop(parsetree, isTopLevel);
 	/* Classify dynamic rewrites only after the original binding is complete,
 	 * so a full selected segment never waits while holding this DDL lock. */
 	if (IsA(parsetree, AlterTableStmt))
