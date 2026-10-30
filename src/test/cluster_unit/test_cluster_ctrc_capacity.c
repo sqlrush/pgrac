@@ -30,6 +30,7 @@ static PGAlignedBlock certificate_resident;
 static bool certificate_current, certificate_pin, certificate_error_after_flush;
 static unsigned certificate_wal_calls, certificate_flush_calls;
 static bool sample_copy_error;
+static uint32 sample_generation_override;
 
 int
 cluster_conf_node_count(void)
@@ -197,7 +198,10 @@ cluster_undo_block0_current_sample_generation(
 	ClusterUndoBlock0Generation *out)
 {
 	out->known = true;
-	out->value = sample_header.wrap_count;
+	out->value = sample_generation_override != 0 ? sample_generation_override
+		: sample_header._pad_57[0] != 0
+			? ((const UndoSegmentHeaderDataV2 *)&sample_header)->wrap_count
+			: sample_header.wrap_count;
 	return CLUSTER_UNDO_BLOCK0_OK;
 }
 
@@ -343,7 +347,220 @@ reset_capacity_sample(void)
 	certificate_current = certificate_pin = certificate_error_after_flush = false;
 	certificate_wal_calls = certificate_flush_calls = 0;
 	sample_copy_error = false;
+	sample_generation_override = 0;
 	return origin->key;
+}
+
+static ClusterCtrcTxnKeyV1
+reset_capacity_tt40(bool aborted)
+{
+	ClusterCtrcTxnKeyV1 key = reset_capacity_sample();
+	UndoSegmentHeaderDataV2 *page = (UndoSegmentHeaderDataV2 *)&sample_header;
+	TTSlotV2 *slot;
+
+	MemSet(page, 0, BLCKSZ);
+	((PageHeader)page)->pd_lower = SizeOfPageHeaderData;
+	((PageHeader)page)->pd_upper = BLCKSZ;
+	((PageHeader)page)->pd_special = BLCKSZ;
+	page->pd_flags = PD_UNDO_SEG_HEADER;
+	page->pd_pagesize_version = BLCKSZ | PG_PAGE_LAYOUT_VERSION;
+	page->segment_id = key.segment_id;
+	page->segment_size_bytes = UNDO_SEGMENT_SIZE_BYTES;
+	page->owner_instance = key.owner_instance;
+	page->segment_state = SEGMENT_ACTIVE;
+	page->tt_slots_count = TT_SLOTS_PER_SEGMENT;
+	page->tt_layout_version = CLUSTER_UNDO_TT_LAYOUT_V2;
+	page->tt_slot_bytes = CLUSTER_UNDO_TT_SLOT_V2_BYTES;
+	page->wrap_count = key.segment_generation;
+	slot = &page->tt_slots[key.slot_offset];
+	slot->xid = key.xid;
+	slot->wrap = key.slot_wrap;
+	slot->status = aborted ? TT_SLOT_ABORTED : TT_SLOT_COMMITTED;
+	slot->commit_scn = aborted ? InvalidScn : 1000;
+	slot->original_full_xid = U64FromFullTransactionId(ctrc_origin_entries()[0].original_full_xid);
+	page->pd_checksum = pg_checksum_page((char *)page, 0);
+	sample_commit = !aborted;
+	sample_abort = aborted;
+	return key;
+}
+
+UT_TEST(test_tt40_original_sampling_certificate_and_release_chain)
+{
+	test_cluster_epoch = 23;
+	for (unsigned aborted = 0; aborted < 2; aborted++) {
+		ClusterCtrcTxnKeyV1 key = reset_capacity_tt40(aborted != 0);
+		ClusterCtrcOriginCertificateSnapshot snapshot;
+		ClusterCtrcTxnKeyV1 continuation = { 0 };
+		ClusterCtrcTerminalStatus status = CTRC_TERMINAL_UNKNOWN;
+		SCN scn = UINT64_MAX;
+		UndoSegmentHeaderDataV2 *page = (UndoSegmentHeaderDataV2 *)&sample_header;
+		uint64 original = page->tt_slots[0].original_full_xid;
+
+		UT_ASSERT(ctrc_cleaner_terminal_sample_exact(&key, &status, &scn));
+		if (ut_current_failed) break;
+		UT_ASSERT_EQ(status, aborted ? CTRC_TERMINAL_ABORTED : CTRC_TERMINAL_COMMITTED);
+		UT_ASSERT_EQ(scn, aborted ? InvalidScn : 1000);
+		UT_ASSERT_EQ(cluster_ctrc_capacity_probe_current(1, 2000, 23, &continuation),
+					 CLUSTER_CTRC_CAPACITY_WAIT);
+		UT_ASSERT(!cluster_ctrc_terminal_release_sample_exact(
+			1, 0, key.xid, key.slot_wrap, aborted ? TT_SLOT_ABORTED : TT_SLOT_COMMITTED,
+			aborted ? InvalidScn : 1000, 23));
+		UT_ASSERT(ctrc_origin_certificate_snapshot_index_locked(0, &snapshot));
+		UT_ASSERT(ctrc_cleaner_publish_certificate(&snapshot));
+		UT_ASSERT_EQ(certificate_wal_calls, 1);
+		UT_ASSERT_EQ(certificate_flush_calls, 1);
+		UT_ASSERT_EQ(page->tt_slots[0].original_full_xid, original);
+		UT_ASSERT_EQ(page->pd_checksum, pg_checksum_page((char *)page, 0));
+		UT_ASSERT(!ctrc_cleaner_terminal_sample_exact(&key, NULL, NULL));
+		UT_ASSERT(cluster_ctrc_terminal_release_sample_exact(
+			1, 0, key.xid, key.slot_wrap, aborted ? TT_SLOT_ABORTED : TT_SLOT_COMMITTED,
+			aborted ? InvalidScn : 1000, 23));
+		UT_ASSERT(cluster_ctrc_reuse_handoff_complete(&sample_header, INVALID_TT_SLOT_OFFSET));
+		MemSet(&ctrc_origin_entries()[0], 0, sizeof(ClusterCtrcOriginEntry));
+		UT_ASSERT(cluster_ctrc_terminal_release_sample_exact(
+			1, 0, key.xid, key.slot_wrap, aborted ? TT_SLOT_ABORTED : TT_SLOT_COMMITTED,
+			aborted ? InvalidScn : 1000, 23));
+		UT_ASSERT_EQ(cluster_ctrc_capacity_probe_current(1, 2000, 23, &continuation),
+					 CLUSTER_CTRC_CAPACITY_WAIT);
+		UT_ASSERT_EQ(sample_holds, sample_releases);
+		UT_ASSERT_EQ(sample_enters, sample_leaves);
+	}
+	test_cluster_epoch = 13;
+}
+
+UT_TEST(test_tt40_sampling_rejects_malformed_identity_before_output)
+{
+	test_cluster_epoch = 23;
+	for (unsigned fault = 0; fault < 17; fault++) {
+		ClusterCtrcTxnKeyV1 key = reset_capacity_tt40(false);
+		UndoSegmentHeaderDataV2 *page = (UndoSegmentHeaderDataV2 *)&sample_header;
+		TTSlotV2 *slot = &page->tt_slots[0];
+		ClusterCtrcTerminalStatus status = CTRC_TERMINAL_COMMITTED;
+		SCN scn = 2000;
+		ClusterCtrcOriginEntry origin = ctrc_origin_entries()[0];
+		PGAlignedBlock before;
+
+		sample_generation_override = key.segment_generation;
+		switch (fault) {
+		case 0: page->tt_layout_version = 3; break;
+		case 1: page->tt_slot_bytes = 32; break;
+		case 2: page->tt_layout_reserved = 1; break;
+		case 3: page->owner_instance = 2; break;
+		case 4: page->segment_id = 2; break;
+		case 5:
+			page->wrap_count++;
+			/* A valid-looking legacy offset must not replace V2 generation. */
+			sample_header.wrap_count = key.segment_generation;
+			break;
+		case 6: page->tt_slots_count--; break;
+		case 7: break;
+		case 8: slot->original_full_xid = UINT64_MAX; break;
+		case 9: slot->original_full_xid++; break;
+		case 10: slot->original_full_xid = 0; break;
+		case 11: slot->xid++; break;
+		case 12: slot->wrap++; break;
+		case 13: slot->flags = 0x80; break;
+		case 14: slot->commit_scn = UINT64_MAX; break;
+		case 15: ((PageHeader)page)->pd_upper = 0; break;
+		case 16: page->wrap_count = UINT32_MAX; break;
+		}
+		if (fault != 15) page->pd_checksum = pg_checksum_page((char *)page, 0);
+		if (fault == 7) page->pd_checksum ^= 1;
+		memcpy(before.data, page, BLCKSZ);
+		UT_ASSERT(!ctrc_cleaner_terminal_sample_exact(&key, &status, &scn));
+		UT_ASSERT_EQ(status, CTRC_TERMINAL_UNKNOWN);
+		UT_ASSERT_EQ(scn, InvalidScn);
+		UT_ASSERT(!cluster_ctrc_terminal_release_sample_exact(
+			1, 0, key.xid, key.slot_wrap, TT_SLOT_COMMITTED, 1000, 23));
+		UT_ASSERT_EQ(memcmp(before.data, page, BLCKSZ), 0);
+		UT_ASSERT_EQ(memcmp(&origin, &ctrc_origin_entries()[0], sizeof(origin)), 0);
+		UT_ASSERT_EQ(certificate_wal_calls + certificate_flush_calls, 0);
+		UT_ASSERT_EQ(sample_holds, sample_releases);
+		UT_ASSERT_EQ(sample_enters, sample_leaves);
+		if (ut_current_failed) printf("# TT40 malformed sample %u\n", fault);
+	}
+	test_cluster_epoch = 13;
+}
+
+UT_TEST(test_tt40_reuse_handoff_requires_original_full_identity_and_all_slots)
+{
+	ClusterCtrcOriginCertificateSnapshot snapshot;
+	ClusterCtrcOriginEntry original;
+	UndoSegmentHeaderDataV2 *page = (UndoSegmentHeaderDataV2 *)&sample_header;
+	PGAlignedBlock before;
+
+	test_cluster_epoch = 23;
+	(void)reset_capacity_tt40(false);
+	UT_ASSERT(ctrc_origin_certificate_snapshot_index_locked(0, &snapshot));
+	/* Keep the original RELEASE_PROVEN row pending notification. The
+	 * shared wrapper legitimately reclaims this zero-participant fixture. */
+	UT_ASSERT(cluster_ctrc_origin_certificate_commit_entry(&ctrc_origin_entries()[0], &snapshot));
+	UT_ASSERT(cluster_ctrc_reuse_handoff_complete(&sample_header, 0));
+	if (!ut_current_failed) {
+		original = ctrc_origin_entries()[0];
+		for (unsigned fault = 0; fault < 4; fault++) {
+			ClusterCtrcOriginEntry observed;
+			switch (fault) {
+			case 0: ctrc_origin_entries()[0].original_full_xid = FullTransactionIdFromEpochAndXid(8, original.key.xid); break;
+			case 1: ctrc_origin_entries()[0].original_full_xid = InvalidFullTransactionId; break;
+			case 2: ctrc_origin_entries()[0].state = CTRC_ORIGIN_CERTIFYING; break;
+			case 3: ctrc_origin_entries()[0].key.segment_generation++; break;
+			}
+			observed = ctrc_origin_entries()[0];
+			memcpy(before.data, page, BLCKSZ);
+			UT_ASSERT(!cluster_ctrc_reuse_handoff_complete(&sample_header, 0));
+			UT_ASSERT_EQ(memcmp(before.data, page, BLCKSZ), 0);
+			UT_ASSERT_EQ(memcmp(&observed, &ctrc_origin_entries()[0], sizeof(observed)), 0);
+			ctrc_origin_entries()[0] = original;
+		}
+		{
+			ClusterCtrcOriginEntry *last = seed_origin(TT_SLOTS_PER_SEGMENT - 1, 0);
+			TTSlotV2 *slot = &page->tt_slots[TT_SLOTS_PER_SEGMENT - 1];
+			(void)ctrc_origin_dispatchable_locked(last);
+			slot->xid = last->key.xid;
+			slot->wrap = last->key.slot_wrap;
+			slot->status = TT_SLOT_COMMITTED;
+			slot->commit_scn = 1000;
+			slot->original_full_xid = U64FromFullTransactionId(last->original_full_xid);
+			page->pd_checksum = pg_checksum_page((char *)page, 0);
+			UT_ASSERT(cluster_ctrc_reuse_handoff_complete(&sample_header, 0));
+			UT_ASSERT(!cluster_ctrc_reuse_handoff_complete(&sample_header, INVALID_TT_SLOT_OFFSET));
+			UT_ASSERT(ctrc_origin_certificate_snapshot_index_locked(TT_SLOTS_PER_SEGMENT - 1, &snapshot));
+			UT_ASSERT(cluster_ctrc_origin_certificate_commit_entry(last, &snapshot));
+			UT_ASSERT(cluster_ctrc_reuse_handoff_complete(&sample_header, INVALID_TT_SLOT_OFFSET));
+		}
+	}
+	test_cluster_epoch = 13;
+}
+
+UT_TEST(test_tt40_sampling_retains_native_current_and_error_cleanup_gates)
+{
+	test_cluster_epoch = 23;
+	for (unsigned fault = 0; fault < 3; fault++) {
+		ClusterCtrcTxnKeyV1 key = reset_capacity_tt40(false);
+		PGAlignedBlock before;
+		volatile bool caught = false;
+
+		memcpy(before.data, &sample_header, BLCKSZ);
+		if (fault == 0) sample_native_drift = true;
+		if (fault == 1) sample_recheck = false;
+		if (fault == 2) sample_copy_error = true;
+		PG_TRY();
+		{
+			UT_ASSERT(!ctrc_cleaner_terminal_sample_exact(&key, NULL, NULL));
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, fault == 2);
+		UT_ASSERT_EQ(memcmp(before.data, &sample_header, BLCKSZ), 0);
+		UT_ASSERT_EQ(certificate_wal_calls + certificate_flush_calls, 0);
+		UT_ASSERT_EQ(sample_holds, sample_releases);
+		UT_ASSERT_EQ(sample_enters, sample_leaves);
+	}
+	test_cluster_epoch = 13;
 }
 
 UT_TEST(test_sampler_error_releases_current_and_admission_under_optimization)
@@ -645,7 +862,7 @@ UT_TEST(test_capacity_abort_and_witness_loss_are_not_guessed)
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(12);
 	UT_RUN(test_sampler_error_releases_current_and_admission_under_optimization);
 	UT_RUN(test_actual_certificate_error_after_flush_retains_then_replays_handoff);
 	UT_RUN(test_handoff_exact_identity_and_all_slot_scan_never_mutate);
@@ -654,6 +871,10 @@ main(void)
 	UT_RUN(test_capacity_continues_after_release_without_weakening_seal);
 	UT_RUN(test_capacity_proof_negative_matrix_retains_all_bytes);
 	UT_RUN(test_capacity_abort_and_witness_loss_are_not_guessed);
+	UT_RUN(test_tt40_original_sampling_certificate_and_release_chain);
+	UT_RUN(test_tt40_sampling_rejects_malformed_identity_before_output);
+	UT_RUN(test_tt40_reuse_handoff_requires_original_full_identity_and_all_slots);
+	UT_RUN(test_tt40_sampling_retains_native_current_and_error_cleanup_gates);
 	free(CtrcShared);
 	UT_DONE();
 	return ut_failed_count != 0;

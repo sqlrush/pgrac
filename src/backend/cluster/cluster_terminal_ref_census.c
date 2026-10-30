@@ -5666,6 +5666,50 @@ cluster_ctrc_participant_delegated_ack_land_shared(const ClusterCtrcDelegationCl
 }
 
 #ifndef CLUSTER_CTRC_UNIT_TEST
+/* Read the explicit layout before any shifted slot or generation. V2 keeps
+ * its persistent original identity; the 32-byte projection grants no new
+ * terminal/release authority. All callers own this private page image. */
+static bool
+ctrc_terminal_slot_read(char *page, uint32 segment_id, uint8 owner_instance,
+					   uint32 generation, uint16 slot_offset, TTSlot *slot,
+					   uint64 *original_full_xid)
+{
+	const uint8 legacy_reserved[7] = { 0 };
+	TTSlot projected;
+	uint64 original = 0;
+
+	if (page == NULL || slot == NULL || slot_offset >= TT_SLOTS_PER_SEGMENT)
+		return false;
+	if ((uint8)page[57] != 0) {
+		const UndoSegmentHeaderDataV2 *header = (const UndoSegmentHeaderDataV2 *)page;
+		const TTSlotV2 *v2;
+
+		if (!UndoSegmentHeaderV2_identity_matches(page, BLCKSZ, segment_id, owner_instance)
+			|| header->wrap_count != generation || generation == UINT32_MAX
+			|| PageIsNew((Page)page)
+			|| header->pd_checksum != pg_checksum_page(page, 0))
+			return false;
+		v2 = &header->tt_slots[slot_offset];
+		original = v2->original_full_xid;
+		if (!TransactionIdIsNormal((TransactionId)original) || original == UINT64_MAX
+			|| (TransactionId)original != v2->xid || v2->commit_scn == UINT64_MAX)
+			return false;
+		memcpy(&projected, v2, sizeof(projected));
+	} else {
+		const UndoSegmentHeaderData *header = (const UndoSegmentHeaderData *)page;
+
+		if (memcmp(page + 57, legacy_reserved, sizeof(legacy_reserved)) != 0
+			|| header->segment_id != segment_id || header->owner_instance != owner_instance
+			|| header->wrap_count != generation || header->tt_slots_count != TT_SLOTS_PER_SEGMENT)
+			return false;
+		projected = header->tt_slots[slot_offset];
+	}
+	*slot = projected;
+	if (original_full_xid != NULL)
+		*original_full_xid = original;
+	return true;
+}
+
 static bool
 ctrc_cleaner_terminal_sample_mode(const ClusterCtrcTxnKeyV1 *key, bool capacity_probe,
 								  ClusterCtrcTerminalStatus *status_out, SCN *commit_scn_out,
@@ -5681,7 +5725,6 @@ ctrc_cleaner_terminal_sample_mode(const ClusterCtrcTxnKeyV1 *key, bool capacity_
 	ClusterUndoBlock0CurrentStep step;
 	ClusterUndoBlock0Result failure = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
 	PGAlignedBlock page;
-	const UndoSegmentHeaderData *header;
 	TTSlot slot;
 	bool native_commit_before;
 	bool native_abort_before;
@@ -5758,12 +5801,9 @@ ctrc_cleaner_terminal_sample_mode(const ClusterCtrcTxnKeyV1 *key, bool capacity_
 		native_commit_before = TransactionIdDidCommit(key->xid);
 		native_abort_before = TransactionIdDidAbort(key->xid);
 		native_progress_before = TransactionIdIsInProgress(key->xid);
-		header = (const UndoSegmentHeaderData *)page.data;
-		if (header->segment_id != key->segment_id || header->owner_instance != key->owner_instance
-			|| header->wrap_count != key->segment_generation
-			|| header->tt_slots_count != TT_SLOTS_PER_SEGMENT)
+		if (!ctrc_terminal_slot_read(page.data, key->segment_id, key->owner_instance,
+								 key->segment_generation, key->slot_offset, &slot, NULL))
 			goto sample_done;
-		slot = header->tt_slots[key->slot_offset];
 		native_commit_after = TransactionIdDidCommit(key->xid);
 		native_abort_after = TransactionIdDidAbort(key->xid);
 		native_progress_after = TransactionIdIsInProgress(key->xid);
@@ -5954,7 +5994,10 @@ bool
 cluster_ctrc_reuse_handoff_complete(const UndoSegmentHeaderData *header, uint16 slot_offset)
 {
 #ifndef CLUSTER_CTRC_UNIT_TEST
+	const UndoSegmentHeaderDataV2 *v2 = NULL;
+	const uint8 legacy_reserved[7] = { 0 };
 	uint32 first;
+	uint32 generation;
 	uint64 start;
 	bool complete = true;
 	unsigned begin = slot_offset == INVALID_TT_SLOT_OFFSET ? 0 : slot_offset;
@@ -5962,10 +6005,30 @@ cluster_ctrc_reuse_handoff_complete(const UndoSegmentHeaderData *header, uint16 
 
 	if (header == NULL || cluster_node_id < 0 || cluster_node_id >= CLUSTER_CTRC_MAX_PARTICIPANTS
 		|| header->owner_instance != (uint8)(cluster_node_id + 1)
-		|| header->tt_slots_count != TT_SLOTS_PER_SEGMENT || header->wrap_count == UINT32_MAX
+		|| header->tt_slots_count != TT_SLOTS_PER_SEGMENT
 		|| begin >= TT_SLOTS_PER_SEGMENT || end > TT_SLOTS_PER_SEGMENT
 		|| !cluster_ctrc_shmem_ready())
 		return false;
+	if ((uint8)((const char *)header)[57] != 0) {
+		PGAlignedBlock checksum_image;
+
+		v2 = (const UndoSegmentHeaderDataV2 *)header;
+		if (!UndoSegmentHeaderV2_identity_matches((const char *)header, BLCKSZ,
+				header->segment_id, header->owner_instance)
+			|| PageIsNew((Page)header) || v2->wrap_count == UINT32_MAX)
+			return false;
+		/* The supplied snapshot is const. Do not transiently zero its
+		 * checksum, and do all checksum work before the origin lock. */
+		memcpy(checksum_image.data, header, BLCKSZ);
+		if (v2->pd_checksum != pg_checksum_page(checksum_image.data, 0))
+			return false;
+		generation = v2->wrap_count;
+	} else {
+		if (memcmp(header->_pad_57, legacy_reserved, sizeof(legacy_reserved)) != 0
+			|| header->wrap_count == UINT32_MAX)
+			return false;
+		generation = header->wrap_count;
+	}
 	first = (uint32)cluster_node_id * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
 	if (header->segment_id < first || header->segment_id - first >= CLUSTER_UNDO_SEGS_PER_INSTANCE)
 		return false;
@@ -5976,15 +6039,30 @@ cluster_ctrc_reuse_handoff_complete(const UndoSegmentHeaderData *header, uint16 
 	for (unsigned i = begin; i < end; i++) {
 		const ClusterCtrcOriginEntry *origin = &ctrc_origin_entries()[start + i];
 		const ClusterCtrcTxnKeyV1 *key = &origin->key;
-		const TTSlot *slot = &header->tt_slots[i];
+		TTSlot projected;
+		const TTSlot *slot;
 
 		if (ctrc_bytes_zero(origin, sizeof(*origin)))
 			continue;
+		if (v2 != NULL) {
+			const TTSlotV2 *persistent = &v2->tt_slots[i];
+
+			if (persistent->original_full_xid == UINT64_MAX
+				|| !TransactionIdIsNormal((TransactionId)persistent->original_full_xid)
+				|| (TransactionId)persistent->original_full_xid != persistent->xid
+				|| persistent->original_full_xid != U64FromFullTransactionId(origin->original_full_xid)) {
+				complete = false;
+				break;
+			}
+			memcpy(&projected, persistent, sizeof(projected));
+			slot = &projected;
+		} else
+			slot = &header->tt_slots[i];
 		if (origin->state != CTRC_ORIGIN_RELEASE_PROVEN || !ctrc_txn_key_valid(key)
 			|| key->owner_instance != header->owner_instance
 			|| key->origin_node_id != (uint16)cluster_node_id
 			|| key->segment_id != header->segment_id
-			|| key->segment_generation != header->wrap_count || key->slot_offset != i
+			|| key->segment_generation != generation || key->slot_offset != i
 			|| key->slot_wrap != slot->wrap || key->xid != slot->xid) {
 			complete = false;
 			break;
@@ -6096,11 +6174,9 @@ cluster_ctrc_terminal_release_sample_exact(uint32 segment_id, uint16 slot_offset
 		native_abort_before = TransactionIdDidAbort(xid);
 		native_progress_before = TransactionIdIsInProgress(xid);
 		header = (const UndoSegmentHeaderData *)page.data;
-		if (header->segment_id != segment_id || header->owner_instance != owner_instance
-			|| header->wrap_count != generation.value
-			|| header->tt_slots_count != TT_SLOTS_PER_SEGMENT)
+		if (!ctrc_terminal_slot_read(page.data, segment_id, owner_instance,
+								 generation.value, slot_offset, &slot, NULL))
 			goto release_sample_done;
-		slot = header->tt_slots[slot_offset];
 		native_commit_after = TransactionIdDidCommit(xid);
 		native_abort_after = TransactionIdDidAbort(xid);
 		native_progress_after = TransactionIdIsInProgress(xid);
@@ -6169,50 +6245,27 @@ cluster_ctrc_terminal_release_sample_exact(uint32 segment_id, uint16 slot_offset
 }
 
 #ifndef CLUSTER_CTRC_UNIT_TEST
-/* Only the original pinned certificate publisher consumes this view. Check
- * framing before any shifted field and bind TT40 to its retained origin. */
+/* The publisher additionally binds the persistent V2 identity to its
+ * protected retained origin, before WAL and again after exact readback. */
 static bool
 ctrc_certificate_slot_read(char *page, const ClusterCtrcTxnKeyV1 *key,
 						   FullTransactionId original, bool *tt_v2, TTSlot *slot)
 {
-	const uint8 legacy_reserved[7] = { 0 };
+	uint64 persistent_original;
 
-	if (page == NULL || key == NULL || tt_v2 == NULL || slot == NULL
-		|| key->slot_offset >= TT_SLOTS_PER_SEGMENT)
+	if (key == NULL || tt_v2 == NULL
+		|| !ctrc_terminal_slot_read(page, key->segment_id, key->owner_instance,
+				key->segment_generation, key->slot_offset, slot, &persistent_original))
 		return false;
-	if ((uint8)page[57] != 0) {
-		const UndoSegmentHeaderDataV2 *header = (const UndoSegmentHeaderDataV2 *)page;
-		const TTSlotV2 *v2;
-
-		if (!UndoSegmentHeaderV2_identity_matches(page, BLCKSZ, key->segment_id,
-											  key->owner_instance)
-			|| header->wrap_count != key->segment_generation
-			|| header->wrap_count == 0 || header->wrap_count == UINT32_MAX
+	if ((uint8)page[57] != 0
+		&& (key->segment_generation == 0
 			|| key->cluster_epoch == 0 || key->formation_epoch == 0
-			|| PageIsNew((Page)page)
-			|| header->pd_checksum != pg_checksum_page(page, 0)
 			|| !FullTransactionIdIsNormal(original)
 			|| U64FromFullTransactionId(original) == UINT64_MAX
-			|| XidFromFullTransactionId(original) != key->xid)
-			return false;
-		v2 = &header->tt_slots[key->slot_offset];
-		if (v2->original_full_xid != U64FromFullTransactionId(original)
-			|| v2->commit_scn == UINT64_MAX)
-			return false;
-		memcpy(slot, v2, sizeof(*slot));
-		*tt_v2 = true;
-	} else {
-		const UndoSegmentHeaderData *header = (const UndoSegmentHeaderData *)page;
-
-		if (memcmp(page + 57, legacy_reserved, sizeof(legacy_reserved)) != 0
-			|| header->segment_id != key->segment_id
-			|| header->owner_instance != key->owner_instance
-			|| header->wrap_count != key->segment_generation
-			|| header->tt_slots_count != TT_SLOTS_PER_SEGMENT)
-			return false;
-		*slot = header->tt_slots[key->slot_offset];
-		*tt_v2 = false;
-	}
+			|| XidFromFullTransactionId(original) != key->xid
+			|| persistent_original != U64FromFullTransactionId(original)))
+		return false;
+	*tt_v2 = (uint8)page[57] != 0;
 	return slot->xid == key->xid && slot->wrap == key->slot_wrap
 		&& (slot->status == TT_SLOT_COMMITTED || slot->status == TT_SLOT_ABORTED)
 		&& ((slot->status == TT_SLOT_COMMITTED) == SCN_VALID(slot->commit_scn))
