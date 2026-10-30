@@ -24,7 +24,8 @@ typedef enum ClusterWalInputsJobStateV1 {
 #define WAL_INPUT_JOB_FLAG_CANCELLED UINT16_C(0x1)
 #define WAL_INPUT_JOB_FLAG_ERROR UINT16_C(0x2)
 #define WAL_INPUT_JOB_FLAG_REVOKED UINT16_C(0x4)
-#define WAL_INPUT_JOB_FLAGS UINT16_C(0x7)
+#define WAL_INPUT_JOB_FLAG_DETECT UINT16_C(0x8)
+#define WAL_INPUT_JOB_FLAGS UINT16_C(0xf)
 
 struct ClusterWalInputsJobV1 {
 	MemoryContext context;
@@ -39,7 +40,9 @@ struct ClusterWalInputsJobV1 {
 	ClusterCfJobReceiptV1 cf;
 	uint16 walr_next, flags;
 	uint32 original_result;
-	uint8 reserved[8];
+	/* Original reserved bytes hold the unconsumed read verdict, never authority. */
+	uint32 detect_result;
+	uint8 reserved[4];
 };
 
 /* These mirrors are outside the borrowed allocation. Validate the locator
@@ -93,6 +96,11 @@ typedef struct ClusterWalInputsJobControlBudgetV1 {
 extern ClusterControlRootResult cluster_wal_inputs_job_open_aux_v1(
 	ClusterWalInputsConsumerV1 consumer, ClusterWalInputsJobV1 **job);
 extern bool cluster_wal_inputs_job_revoke_v1(ClusterWalInputsJobV1 *job, bool error);
+extern bool cluster_wal_inputs_job_consumer_matches_v1(ClusterWalInputsJobV1 *job,
+	ClusterWalInputsConsumerV1 consumer);
+/* Exact original ResourceOwner callback, including native process exit. */
+extern bool cluster_wal_inputs_job_owner_revoke_v1(ClusterWalInputsJobV1 *job,
+	ClusterWalInputsConsumerV1 consumer, bool error);
 
 /* Local binding checks never grant input authority. The original active
  * pin and its process generation independently witness the job backlink. */
@@ -106,6 +114,11 @@ extern bool cluster_wal_inputs_job_pin_detach_v1(ClusterWalInputsJobV1 *job,
 	ClusterWalReadPinV1 *pin, uint64 generation);
 extern bool cluster_wal_inputs_job_pin_cleanup_v1(ClusterWalInputsJobV1 *job,
 	ClusterWalReadPinV1 *pin, uint64 generation, bool error, bool owner_cleanup);
+
+/* Caller business recheck after debt is DONE. False returns a cached/wait
+ * verdict; true permits one original read, never input use or a pin. */
+extern bool cluster_wal_inputs_job_detect_next_v1(ClusterWalInputsJobV1 *job,
+	ClusterWalInputsV1 **scope, ClusterControlRootResult *result);
 
 /* BUILDING storage only, never input-use or ROOT admission. */
 extern bool cluster_wal_inputs_job_scope_create_v1(ClusterWalInputsJobV1 *job);

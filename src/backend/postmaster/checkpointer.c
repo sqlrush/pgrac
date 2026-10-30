@@ -619,7 +619,14 @@ CheckpointerMain(void)
 
 #ifdef USE_PGRAC_CLUSTER
 			/* Native checkpoint owns the next ROOT/WALR operation. */
-			cluster_pi_writeback_checkpointer_release_v1();
+			if (!cluster_pi_writeback_checkpointer_release_v1())
+			{
+				/* Reset preceded the original ACK poll at the loop head.
+				 * Do not consume checkpoint flags or enter ROOT/WAL yet. */
+				(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_EXIT_ON_PM_DEATH,
+								0, WAIT_EVENT_CHECKPOINTER_MAIN);
+				continue;
+			}
 			pi_pending = false;
 #endif
 

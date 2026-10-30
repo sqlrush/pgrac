@@ -218,7 +218,8 @@ extern void cluster_pi_writeback_ingress_v1(const ClusterICEnvelope *env, const 
 extern void cluster_pi_writeback_lmon_tick_v1(void);
 extern bool cluster_pi_writeback_bgwriter_tick_v1(void);
 extern bool cluster_pi_writeback_checkpointer_tick_v1(void);
-extern void cluster_pi_writeback_checkpointer_release_v1(void);
+/* True only after the original batch and its input debts are retired. */
+extern bool cluster_pi_writeback_checkpointer_release_v1(void);
 extern ClusterNormalStopPollResult cluster_pi_writeback_normal_stop_poll_v1(const char **reason);
 extern void cluster_pi_writeback_register_v1(void);
 extern void cluster_pi_writeback_shmem_register_v1(void);

@@ -109,10 +109,11 @@ struct ClusterPiWritebackNoticeV1 {
 		ClusterPiWritebackMessageV2 request_v2;
 	};
 	ClusterWalInputsV1 *inputs;
+	ClusterWalInputsJobV1 *inputs_job;
 	ClusterThreadRecoveryFabricPlanV1 *plan;
 };
 
-StaticAssertDecl(sizeof(ClusterPiWritebackNoticeV1) + CLUSTER_WAL_INPUT_JOB_BACKLINK_RESERVE
+StaticAssertDecl(sizeof(ClusterPiWritebackNoticeV1)
 				 <= CLUSTER_WAL_INPUT_JOB_NOTICE_BYTES,
 				 "WAL input notice exceeds its payload envelope");
 
@@ -143,11 +144,12 @@ typedef struct WritebackBatch {
 	ClusterPiDataV1 *data_job;
 	ClusterPiWritebackJobV1 *physical_job;
 	ClusterWalInputsV1 *inputs;
+	ClusterWalInputsJobV1 *inputs_job;
 	ClusterThreadRecoveryFabricPlanV1 *plan;
 	ClusterWalSourceRef sources[CLUSTER_WAL_INPUTS_MAX];
 } WritebackBatch;
 
-StaticAssertDecl(sizeof(WritebackBatch) + CLUSTER_WAL_INPUT_JOB_BACKLINK_RESERVE
+StaticAssertDecl(sizeof(WritebackBatch)
 				 <= CLUSTER_WAL_INPUT_JOB_BATCH_BYTES,
 				 "WAL input batch exceeds its payload envelope");
 
@@ -1202,6 +1204,61 @@ wb_forget_server(void)
 	wb_notice = NULL;
 }
 
+/* Revoke borrowed work before the original working context can reset. */
+static void
+wb_notice_revoke(bool error)
+{
+	if (wb_notice->pid != getpid()
+		|| !cluster_wal_inputs_job_owner_revoke_v1(wb_notice->inputs_job, WAL_INPUT_JOB_PI_NOTICE, error))
+		elog(FATAL, "invalid original PI notice input cleanup");
+	wb_notice->inputs = NULL;
+	wb_notice->plan = NULL;
+}
+
+static void
+wb_batch_revoke(bool error)
+{
+	if (wb_batch->pid != getpid()
+		|| !cluster_wal_inputs_job_owner_revoke_v1(wb_batch->inputs_job, WAL_INPUT_JOB_PI_BATCH, error))
+		elog(FATAL, "invalid original PI batch input cleanup");
+	wb_batch->inputs = NULL;
+	wb_batch->plan = NULL;
+	wb_batch->data_job = NULL;
+	wb_batch->physical_job = NULL;
+	memset(wb_batch->receipts, 0, sizeof(wb_batch->receipts));
+	memset(wb_batch->structural, 0, sizeof(wb_batch->structural));
+	memset(wb_batch->acks, 0, sizeof(wb_batch->acks));
+	memset(wb_batch->structural_acks, 0, sizeof(wb_batch->structural_acks));
+	memset(wb_batch->ack_count, 0, sizeof(wb_batch->ack_count));
+}
+
+static bool
+wb_inputs_retire(ClusterWalInputsJobV1 *job)
+{
+	ClusterWalInputsJobResultV1 result = cluster_wal_inputs_job_retire_v1(job);
+	if (result == WAL_INPUT_JOB_INVALID)
+		elog(FATAL, "invalid original PI input retirement");
+	return result == WAL_INPUT_JOB_DONE;
+}
+
+static ClusterWalInputsJobV1 *
+wb_inputs_open(ClusterWalInputsConsumerV1 consumer)
+{
+	ClusterWalInputsJobV1 *job = NULL;
+	ClusterControlRootResult result = cluster_wal_inputs_job_open_aux_v1(consumer, &job);
+	if (result == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT && job != NULL) {
+		/* An allocation ERROR may leave a registered job before its header
+		 * is published. Complete that original job before allocating again. */
+		if (wb_inputs_retire(job)
+			&& cluster_wal_inputs_job_finish_v1(&job) != WAL_INPUT_JOB_DONE)
+			elog(FATAL, "invalid original PI input completion");
+		return NULL;
+	}
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		elog(FATAL, "invalid original PI auxiliary input caller");
+	return job;
+}
+
 static void
 wb_resource_release(ResourceReleasePhase phase, bool commit pg_attribute_unused(),
 					bool top pg_attribute_unused(), void *arg pg_attribute_unused())
@@ -1212,12 +1269,10 @@ wb_resource_release(ResourceReleasePhase phase, bool commit pg_attribute_unused(
 		wb_scan_owner = NULL;
 	if (wb_active != NULL && wb_active->owner == CurrentResourceOwner)
 		wb_cancel(wb_active);
-	/* Native ROOT/WALR callbacks own their handles during ERROR. Do not try
-	 * releasing an input scope after its native pin has already unwound. */
 	if (wb_notice != NULL && wb_notice->owner == CurrentResourceOwner)
-		wb_forget_server();
+		wb_notice_revoke(!commit);
 	if (wb_batch != NULL && wb_batch->owner == CurrentResourceOwner)
-		wb_forget_batch();
+		wb_batch_revoke(!commit);
 }
 
 static void
@@ -1825,10 +1880,13 @@ wb_server_finish(const void *reply)
 {
 	uint64 revision = wb_notice->revision;
 	uint32 version = wb_notice->version;
+	ClusterWalInputsJobV1 *job = wb_notice->inputs_job;
+	if (wb_notice->pid != getpid() || wb_notice->owner != CurrentResourceOwner
+		|| !cluster_wal_inputs_job_consumer_matches_v1(job, WAL_INPUT_JOB_PI_NOTICE))
+		elog(FATAL, "invalid original PI notice release identity");
 	cluster_thread_recovery_fabric_plan_destroy_v1(&wb_notice->plan);
-	cluster_wal_inputs_release_v1(&wb_notice->inputs);
-	pfree(wb_notice);
-	wb_notice = NULL;
+	if (!wb_inputs_retire(job))
+		return;
 	SpinLockAcquire(&wb_shared->lock);
 	if (wb_shared->inbound_state == WB_RUNNING && wb_shared->inbound_pid == MyProcPid
 		&& wb_shared->inbound_revision == revision && wb_shared->inbound_version == version) {
@@ -1845,6 +1903,9 @@ wb_server_finish(const void *reply)
 		wb_shared->reply_pending = reply != NULL;
 	}
 	SpinLockRelease(&wb_shared->lock);
+	wb_notice = NULL;
+	if (cluster_wal_inputs_job_finish_v1(&job) != WAL_INPUT_JOB_DONE)
+		elog(FATAL, "invalid original PI notice completion");
 	cluster_lmon_wakeup();
 }
 
@@ -1852,6 +1913,7 @@ static bool
 wb_notice_current(void)
 {
 	return wb_notice != NULL && wb_notice->pid == getpid()
+		   && cluster_wal_inputs_job_context_v1(wb_notice->inputs_job) != NULL
 		   && cluster_normal_stop_continuation_allowed()
 		   && wb_notice->owner == CurrentResourceOwner
 		   && (wb_notice->version == 2
@@ -1930,7 +1992,14 @@ cluster_pi_writeback_bgwriter_tick_v1(void)
 	bool queued, v2;
 	ClusterControlRootResult result;
 	RfPageProofDetailV1 detail;
+	if (wb_notice != NULL
+		&& !cluster_wal_inputs_job_consumer_matches_v1(wb_notice->inputs_job, WAL_INPUT_JOB_PI_NOTICE))
+		elog(FATAL, "invalid original PI notice caller binding");
 	cluster_pi_writeback_bgwriter_quiesced_v1();
+	if (wb_notice != NULL && cluster_wal_inputs_job_context_v1(wb_notice->inputs_job) == NULL) {
+		wb_server_finish(NULL);
+		return true;
+	}
 	if (MyBackendType != B_BG_WRITER || wb_shared == NULL || !wb_background() || !cluster_enabled
 		|| !cluster_shared_config || !cluster_normal_stop_continuation_allowed())
 		return false;
@@ -1971,8 +2040,13 @@ cluster_pi_writeback_bgwriter_tick_v1(void)
 	revision = wb_shared->inbound_revision;
 	SpinLockRelease(&wb_shared->lock);
 	if (queued && wb_notice == NULL) {
-		ClusterPiWritebackNoticeV1 *notice = palloc0(sizeof(*notice));
+		ClusterWalInputsJobV1 *job = wb_inputs_open(WAL_INPUT_JOB_PI_NOTICE);
+		ClusterPiWritebackNoticeV1 *notice;
 		bool claimed = false;
+		if (job == NULL)
+			return true;
+		notice = MemoryContextAllocZero(cluster_wal_inputs_job_context_v1(job), sizeof(*notice));
+		notice->inputs_job = job;
 		/* Allocation may ERROR and resume this same bgwriter. Establish its
 		 * ResourceOwner before exposing RUNNING; recheck cancellation or a
 		 * replacement queue item after the allocating interval. */
@@ -1993,8 +2067,11 @@ cluster_pi_writeback_bgwriter_tick_v1(void)
 			claimed = true;
 		}
 		SpinLockRelease(&wb_shared->lock);
-		if (!claimed)
-			pfree(notice);
+		if (!claimed) {
+			if (!wb_inputs_retire(job)
+				|| cluster_wal_inputs_job_finish_v1(&job) != WAL_INPUT_JOB_DONE)
+				elog(FATAL, "invalid unclaimed PI notice cleanup");
+		}
 	}
 	if (wb_notice == NULL)
 		return false;
@@ -2020,8 +2097,9 @@ cluster_pi_writeback_bgwriter_tick_v1(void)
 		epoch = request.epoch;
 		request_count = request.count;
 	}
-	if (wb_notice->inputs == NULL) {
-		result = cluster_wal_inputs_begin_v1(peer->claim.identity.storage_uuid,
+	if (wb_notice->inputs_job->state == WAL_INPUT_JOB_STATE_NEW) {
+		result = cluster_wal_inputs_job_begin_v1(wb_notice->inputs_job,
+			peer->claim.identity.storage_uuid,
 											 peer->claim.identity.system_identifier,
 											 &wb_notice->inputs);
 		if (result == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT)
@@ -2029,7 +2107,7 @@ cluster_pi_writeback_bgwriter_tick_v1(void)
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			goto invalid;
 	}
-	result = cluster_wal_inputs_resume_v1(wb_notice->inputs);
+	result = cluster_wal_inputs_job_resume_v1(wb_notice->inputs_job, &wb_notice->inputs);
 	if (result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE)
 		goto wait;
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
@@ -2047,7 +2125,7 @@ cluster_pi_writeback_bgwriter_tick_v1(void)
 			goto invalid;
 	}
 	if (!wb_notice_current() || !wb_plan_sources(wb_notice->plan, sources, &count)
-		|| cluster_wal_inputs_revalidate_v1(wb_notice->inputs) != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		|| cluster_wal_inputs_job_revalidate_v1(wb_notice->inputs_job) != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto invalid;
 	page = cluster_thread_recovery_fabric_page_plan_v1(wb_notice->plan);
 	if (v2) {
@@ -2121,12 +2199,12 @@ cluster_pi_writeback_bgwriter_tick_v1(void)
 	}
 	if (!wb_notice_current()
 		|| (v2 ? !wb_reply_current_v2(&request_v2, &reply_v2) : !wb_current(&reply, false))
-		|| cluster_wal_inputs_revalidate_v1(wb_notice->inputs) != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		|| cluster_wal_inputs_job_revalidate_v1(wb_notice->inputs_job) != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto invalid;
 	wb_server_finish(v2 ? (const void *)&reply_v2 : (const void *)&reply);
 	return true;
 wait:
-	if (cluster_wal_inputs_suspend_v1(wb_notice->inputs) == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+	if (cluster_wal_inputs_job_suspend_v1(wb_notice->inputs_job) == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return true;
 invalid:
 	wb_server_finish(NULL);
@@ -2137,8 +2215,11 @@ static void
 wb_batch_release(void)
 {
 	WritebackBatch *batch = wb_batch;
-	if (batch == NULL || batch->pid != getpid() || batch->owner != CurrentResourceOwner)
+	if (batch == NULL)
 		return;
+	if (batch->pid != getpid() || batch->owner != CurrentResourceOwner
+		|| !cluster_wal_inputs_job_consumer_matches_v1(batch->inputs_job, WAL_INPUT_JOB_PI_BATCH))
+		elog(FATAL, "invalid original PI batch release identity");
 	cluster_pi_writeback_release_v1(&batch->physical_job);
 	cluster_pi_data_release_v1(&batch->data_job);
 	for (uint32 i = 0; i < batch->count; i++) {
@@ -2148,20 +2229,27 @@ wb_batch_release(void)
 		}
 		cluster_page_data_receipt_free_v1(&batch->receipts[i]);
 		cluster_page_structural_receipt_free_v2(&batch->structural[i]);
+		batch->ack_count[i] = 0;
 	}
 	cluster_thread_recovery_fabric_plan_destroy_v1(&batch->plan);
-	cluster_wal_inputs_release_v1(&batch->inputs);
-	wb_forget_batch();
-	pfree(batch);
+	if (!wb_inputs_retire(batch->inputs_job))
+		return;
+	{
+		ClusterWalInputsJobV1 *job = batch->inputs_job;
+		wb_forget_batch();
+		if (cluster_wal_inputs_job_finish_v1(&job) != WAL_INPUT_JOB_DONE)
+			elog(FATAL, "invalid original PI batch completion");
+	}
 }
 
-void
+bool
 cluster_pi_writeback_checkpointer_release_v1(void)
 {
 	/* Native checkpoint/stop or explicit cancellation ends this scan hint,
 	 * including the interval after a batch has already been released. */
 	wb_scan_owner = NULL;
 	wb_batch_release();
+	return wb_batch == NULL;
 }
 
 static bool
@@ -2169,6 +2257,7 @@ wb_batch_current(void)
 {
 	ClusterWalSourceRef local;
 	return wb_batch != NULL && wb_batch->pid == getpid() && wb_batch->owner == CurrentResourceOwner
+		   && cluster_wal_inputs_job_context_v1(wb_batch->inputs_job) != NULL
 		   && !RecoveryInProgress() && !cluster_normal_stop_requested()
 		   && cluster_qvotec_in_quorum() && !cluster_reconfig_has_pending_prebump_stage()
 		   && cluster_epoch_get_current() == wb_batch->epoch
@@ -2179,14 +2268,19 @@ wb_batch_current(void)
 		   && memcmp(&local, &wb_batch->local, sizeof(local)) == 0;
 }
 
-static void
+static bool
 wb_batch_allocate(const ClusterWalSourceRef *local)
 {
-	wb_batch = palloc0(sizeof(*wb_batch));
+	ClusterWalInputsJobV1 *job = wb_inputs_open(WAL_INPUT_JOB_PI_BATCH);
+	if (job == NULL)
+		return false;
+	wb_batch = MemoryContextAllocZero(cluster_wal_inputs_job_context_v1(job), sizeof(*wb_batch));
+	wb_batch->inputs_job = job;
 	wb_batch->owner = CurrentResourceOwner;
 	wb_batch->pid = getpid();
 	wb_batch->local = *local;
 	wb_batch->epoch = cluster_epoch_get_current();
+	return true;
 }
 
 static bool
@@ -2208,7 +2302,8 @@ wb_batch_offer_start(const ClusterWalSourceRef *local)
 			wb_offer_scan[peer] = 0;
 			continue;
 		}
-		wb_batch_allocate(local);
+		if (!wb_batch_allocate(local))
+			return false;
 		wb_batch->structure_offer = true;
 		wb_batch->offer_started = GetCurrentTimestamp();
 		wb_batch->offer_slot = wb_offer_scan[peer] - 1;
@@ -2270,7 +2365,8 @@ wb_batch_structure_start(const ClusterWalSourceRef *local)
 			tags[selected++] = tags[i];
 	if (selected == 0)
 		return false;
-	wb_batch_allocate(local);
+	if (!wb_batch_allocate(local))
+		return false;
 	wb_batch->structure_pages = true;
 	wb_batch->offer_started = GetCurrentTimestamp();
 	wb_batch->offer_slot = slot;
@@ -2300,7 +2396,8 @@ wb_batch_data_start(const ClusterWalSourceRef *local, bool *scan_pending)
 	}
 	if (count == 0)
 		return false;
-	wb_batch_allocate(local);
+	if (!wb_batch_allocate(local))
+		return false;
 	for (uint32 i = 0; i < count; i++) {
 		uint32 next = wb_batch->count;
 		if (!cluster_pcm_lock_pi_write_snapshot_v1(tags[i], &wb_batch->write_cuts[next])
@@ -2310,8 +2407,7 @@ wb_batch_data_start(const ClusterWalSourceRef *local, bool *scan_pending)
 		wb_batch->count++;
 	}
 	if (wb_batch->count == 0) {
-		pfree(wb_batch);
-		wb_batch = NULL;
+		wb_batch_release();
 		return false;
 	}
 	if (wb_scan_cursor != 0 && wb_scan_cursor != before) {
@@ -2548,7 +2644,7 @@ wb_batch_structure_pages(void)
 		cluster_pi_writeback_release_v1(&wb_batch->physical_job);
 	}
 	if (!wb_batch_current()
-		|| cluster_wal_inputs_revalidate_v1(wb_batch->inputs) != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		|| cluster_wal_inputs_job_revalidate_v1(wb_batch->inputs_job) != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	for (uint32 i = 0; i < wb_batch->count; i++) {
 		uint32 holders;
@@ -2570,6 +2666,13 @@ cluster_pi_writeback_checkpointer_tick_v1(void)
 	const RfPageOnlinePlanV1 *page;
 	ClusterControlRootResult result;
 	bool scan_pending = false;
+	if (wb_batch != NULL
+		&& !cluster_wal_inputs_job_consumer_matches_v1(wb_batch->inputs_job, WAL_INPUT_JOB_PI_BATCH))
+		elog(FATAL, "invalid original PI batch caller binding");
+	if (wb_batch != NULL && cluster_wal_inputs_job_context_v1(wb_batch->inputs_job) == NULL) {
+		wb_batch_release();
+		return true;
+	}
 	if (MyBackendType != B_CHECKPOINTER || wb_shared == NULL || !wb_background() || !cluster_enabled
 		|| !cluster_shared_config || !cluster_normal_stop_continuation_allowed()) {
 		wb_scan_owner = NULL;
@@ -2596,8 +2699,9 @@ cluster_pi_writeback_checkpointer_tick_v1(void)
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			goto done;
 	}
-	if (wb_batch->inputs == NULL) {
-		result = cluster_wal_inputs_begin_v1(wb_batch->local.claim.identity.storage_uuid,
+	if (wb_batch->inputs_job->state == WAL_INPUT_JOB_STATE_NEW) {
+		result = cluster_wal_inputs_job_begin_v1(wb_batch->inputs_job,
+			wb_batch->local.claim.identity.storage_uuid,
 											 wb_batch->local.claim.identity.system_identifier,
 											 &wb_batch->inputs);
 		if (result == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT)
@@ -2605,7 +2709,7 @@ cluster_pi_writeback_checkpointer_tick_v1(void)
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			goto done;
 	}
-	result = cluster_wal_inputs_resume_v1(wb_batch->inputs);
+	result = cluster_wal_inputs_job_resume_v1(wb_batch->inputs_job, &wb_batch->inputs);
 	if (result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE)
 		goto wait;
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
@@ -2624,7 +2728,7 @@ cluster_pi_writeback_checkpointer_tick_v1(void)
 				goto done;
 			goto wait;
 		}
-		if (cluster_wal_inputs_revalidate_v1(wb_batch->inputs) == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		if (cluster_wal_inputs_job_revalidate_v1(wb_batch->inputs_job) == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			wb_batch->offer_completed = cluster_ko_shared_structure_offer_complete_v2(
 				wb_batch->offer_slot, wb_batch->offer_serial, wb_batch->physical_job);
 		goto done;
@@ -2672,7 +2776,7 @@ cluster_pi_writeback_checkpointer_tick_v1(void)
 	}
 	page = cluster_thread_recovery_fabric_page_plan_v1(wb_batch->plan);
 	if (!wb_batch_current()
-		|| cluster_wal_inputs_revalidate_v1(wb_batch->inputs) != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		|| cluster_wal_inputs_job_revalidate_v1(wb_batch->inputs_job) != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto done;
 	for (; wb_batch->peer_index < RESOURCE_X_PROTOCOL_NODE_LIMIT; wb_batch->peer_index++) {
 		int32 node = wb_batch->peer_index;
@@ -2753,7 +2857,7 @@ cluster_pi_writeback_checkpointer_tick_v1(void)
 		cluster_pi_writeback_release_v1(&wb_batch->physical_job);
 	}
 	if (!wb_batch_current()
-		|| cluster_wal_inputs_revalidate_v1(wb_batch->inputs) != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		|| cluster_wal_inputs_job_revalidate_v1(wb_batch->inputs_job) != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto done;
 	for (uint32 i = 0; i < wb_batch->count; i++) {
 		uint32 holders;
@@ -2787,7 +2891,7 @@ wait:
 		}
 	}
 	if (wb_batch->inputs == NULL
-		|| cluster_wal_inputs_suspend_v1(wb_batch->inputs) == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		|| cluster_wal_inputs_job_suspend_v1(wb_batch->inputs_job) == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return true;
 done:
 	if (wb_batch->structure_pages && !wb_batch->structure_handled)

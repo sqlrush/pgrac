@@ -6,6 +6,7 @@
 #include "test_cluster_wal_inputs_job_pin.c"
 #include "cluster/cluster_pi_writeback.h"
 #include "cluster/cluster_clean_leave.h"
+#include "test_cluster_pi_empty_batch_fixture.h"
 #include "storage/spin.h"
 
 static unsigned loop_interrupts, loop_resets;

@@ -426,9 +426,9 @@ UT_TEST(job_census_checks_invalid_slots_before_pending)
 	UT_ASSERT(cluster_cf_lock(ShareLock));
 	UT_ASSERT_EQ(cluster_cf_unlock_job_v1(ShareLock, NULL, &pending->cf), CF_JOB_PENDING);
 	UT_ASSERT_EQ(cluster_wal_inputs_job_retire_v1(pending), WAL_INPUT_JOB_PENDING);
-	other->reserved[7] = 1;
+	other->reserved[sizeof(other->reserved) - 1] = 1;
 	UT_ASSERT_EQ(cluster_wal_inputs_jobs_stop_census_v1(), WAL_INPUT_JOB_INVALID);
-	other->reserved[7] = 0;
+	other->reserved[sizeof(other->reserved) - 1] = 0;
 	UT_ASSERT_EQ(cluster_wal_inputs_jobs_stop_census_v1(), WAL_INPUT_JOB_PENDING);
 	job_ack(&pending->cf);
 	foundation_finish(&pending);

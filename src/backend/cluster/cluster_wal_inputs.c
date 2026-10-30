@@ -3479,6 +3479,59 @@ cluster_wal_inputs_revalidate_v1(ClusterWalInputsV1 *inputs)
 	return result;
 }
 
+/* The failed business header outlives DONE, without input authority. A
+ * detection's own release stays in the same receipt until its exact ACK. */
+ClusterControlRootResult
+cluster_wal_inputs_job_failed_root_v1(ClusterWalInputsJobV1 *job)
+{
+	ClusterWalInputsV1 *inputs;
+	ClusterControlRootResult result;
+	ClusterCfJobResultV1 released = CF_JOB_CONFIRMED;
+	WalInputsWork *work;
+	uint64 before;
+
+	if (!cluster_wal_inputs_job_detect_next_v1(job, &inputs, &result))
+		return result;
+	result = cluster_wal_inputs_job_cf_prepare_v1(job, &before);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		job->detect_result = result;
+		(void)cluster_wal_inputs_job_detect_next_v1(job, &inputs, &result);
+		return result;
+	}
+	work = palloc0(sizeof(*work));
+	PG_TRY();
+	{
+		ClusterCfAttemptObservation attempt;
+
+		result = inputs_root(inputs, work, false);
+		if (result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE
+			&& cluster_cf_last_attempt_since(before, &attempt) && cluster_cf_attempt_wait_slice(&attempt))
+			result = CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+		job->detect_result = result;
+		if (work->cf_attempted)
+			released = cluster_wal_inputs_job_cf_release_v1(job, before);
+		work->cf_attempted = false;
+		if (released == CF_JOB_INVALID)
+			elog(FATAL, "invalid original failed PI ROOT detection release");
+	}
+	PG_CATCH();
+	{
+		if (work->cf_attempted && cluster_wal_inputs_job_cf_release_v1(job, before) == CF_JOB_INVALID)
+			elog(FATAL, "invalid original failed PI ROOT detection after error");
+		if (!cluster_wal_inputs_job_owner_revoke_v1(job, WAL_INPUT_JOB_PI_REBUILD, true))
+			elog(FATAL, "invalid original failed PI ROOT detection owner");
+		pfree(work);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	pfree(work);
+	if (released == CF_JOB_PENDING)
+		return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+	if (cluster_wal_inputs_job_detect_next_v1(job, &inputs, &result))
+		elog(FATAL, "failed PI ROOT detection lost its original verdict");
+	return result;
+}
+
 ClusterControlRootResult
 cluster_wal_inputs_suspend_v1(ClusterWalInputsV1 *inputs)
 {

@@ -2,6 +2,10 @@
  * The shared ROOT input scope and transport scheduling are explicit fixtures;
  * PAGE ancestry and file DATA write/fsync/read are the real implementations.
  * Author: SqlRush <sqlrush@gmail.com> */
+#include "postgres.h"
+#include "cluster/cluster_inject.h"
+#undef CLUSTER_INJECTION_POINT /* page fixture supplies its original injection boundary */
+#include "cluster/cluster_block_io_trace.h"
 #define PGRAC_TEST_REAL_PI_WRITEBACK 1
 int page_data_boundary_test_main(void);
 #define main page_data_boundary_test_main
@@ -29,6 +33,10 @@ extern void *ShmemInitStruct(const char *name, Size size, bool *found);
 
 int MyProcPid = 100;
 int cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+/* Real trace bodies use the configured, disabled diagnostic GUC. */
+bool cluster_trace_block_io = false;
+/* Tracing is disabled above; an unexpected diagnostic dispatch refuses. */
+void write_stderr(const char *fmt,...) { (void)fmt; abort(); }
 PGPROC *MyProc;
 PROC_HDR *ProcGlobal;
 static uint64 wb_epoch = 1, wb_nonce;
@@ -1032,6 +1040,8 @@ cluster_semantic_activation_recovered_open_current(void)
 	return test_recovered_open;
 }
 
+#include "test_cluster_pi_inputs_boundary.h"
+#define MemoryContextAllocZero pi_boundary_alloc
 #include "../../backend/cluster/cluster_pi_writeback.c"
 #undef cluster_page_structural_pi_fact_v2
 #undef cluster_ko_shared_structure_offer_next_v2
@@ -1046,6 +1056,7 @@ cluster_semantic_activation_recovered_open_current(void)
 #undef cluster_page_structural_receipt_free_v2
 #undef cluster_page_structural_pi_ack_free_v2
 #include "../../backend/cluster/cluster_pi_rebuild.c"
+#undef MemoryContextAllocZero
 #undef palloc0
 
 static void
@@ -1960,6 +1971,10 @@ UT_TEST(writeback_initial_allocation_error_cannot_orphan_running_owner)
 	}
 	PG_END_TRY();
 	UT_ASSERT(caught);
+	if (wb_notice != NULL) {
+		UT_ASSERT(cluster_wal_inputs_job_context_v1(wb_notice->inputs_job) == NULL);
+		UT_ASSERT(cluster_pi_writeback_bgwriter_tick_v1());
+	}
 	UT_ASSERT(wb_notice == NULL);
 	UT_ASSERT_EQ(wb_shared->inbound_state, WB_QUEUED);
 	UT_ASSERT(cluster_pi_writeback_bgwriter_tick_v1());
@@ -2356,6 +2371,10 @@ UT_TEST(retained_rebuild_error_cleanup_and_postapply_root_check)
 	}
 	PG_END_TRY();
 	UT_ASSERT(caught);
+	if (pi_rebuild_job != NULL) {
+		UT_ASSERT(cluster_wal_inputs_job_context_v1(pi_rebuild_job->inputs_job) == NULL);
+		UT_ASSERT_EQ(cluster_pi_rebuild_bgwriter_tick_v1(), CLUSTER_PI_REBUILD_IDLE);
+	}
 	UT_ASSERT(pi_rebuild_job == NULL);
 	UT_ASSERT(!wb_inputs_pinned[0]);
 	rebuild_root_drift = true;
@@ -2474,6 +2493,9 @@ UT_TEST(writeback_error_after_physical_keeps_original_retry_owner)
 	PG_END_TRY();
 	UT_ASSERT(caught);
 	UT_ASSERT_EQ(pi_discards, 1);
+	UT_ASSERT(wb_notice != NULL);
+	UT_ASSERT(cluster_wal_inputs_job_context_v1(wb_notice->inputs_job) == NULL);
+	UT_ASSERT(cluster_pi_writeback_bgwriter_tick_v1());
 	UT_ASSERT(wb_notice == NULL);
 	UT_ASSERT_EQ(wb_shared->inbound_revision, revision);
 	UT_ASSERT_EQ(wb_shared->inbound_state, WB_QUEUED);
@@ -2759,6 +2781,8 @@ UT_TEST(writeback_stop_entered_io_retries_and_sends_bound_reply)
   UT_ASSERT(caught);
   UT_ASSERT_EQ(pi_discards,1);
   UT_ASSERT(wb_shared->physical_started);
+  UT_ASSERT(wb_notice != NULL && wb_shared->inbound_state == WB_RUNNING);
+  UT_ASSERT(cluster_pi_writeback_bgwriter_tick_v1());
   UT_ASSERT_EQ(wb_shared->inbound_state,WB_QUEUED);
   wb_stop=true;
   wb_select(1,B_LMON);

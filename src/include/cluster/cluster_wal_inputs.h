@@ -60,6 +60,8 @@ extern ClusterControlRootResult cluster_wal_inputs_job_resume_v1(ClusterWalInput
 	ClusterWalInputsV1 **usable);
 /* Permanently revoke the scope and advance only its original cleanup. */
 extern ClusterWalInputsJobResultV1 cluster_wal_inputs_job_wait_failed_v1(ClusterWalInputsJobV1 *job);
+/* Original failed PI caller: read-only ROOT comparison after debt is DONE. */
+extern ClusterControlRootResult cluster_wal_inputs_job_failed_root_v1(ClusterWalInputsJobV1 *job);
 extern ClusterWalInputsJobResultV1 cluster_wal_inputs_job_retire_v1(ClusterWalInputsJobV1 *job);
 extern ClusterWalInputsJobResultV1 cluster_wal_inputs_job_poll_v1(ClusterWalInputsJobV1 *job);
 extern ClusterWalInputsJobResultV1 cluster_wal_inputs_job_finish_v1(ClusterWalInputsJobV1 **job);

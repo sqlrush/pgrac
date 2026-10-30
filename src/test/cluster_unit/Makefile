@@ -139,7 +139,7 @@ TESTS = test_cluster_relmap_lock test_cluster_vm_read_visibility test_cluster_he
 		test_cluster_control_owner_poll \
 		test_cluster_control_owner_custody \
 		test_cluster_wal_inputs_job \
-		test_cluster_wal_inputs_job_pin \
+		test_cluster_wal_inputs_job_pi test_cluster_wal_inputs_job_pin \
 		test_cluster_wal_inputs_job_scope \
 		test_cluster_wal_inputs_job_cf \
 		test_cluster_wal_inputs_job_begin \
@@ -431,7 +431,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_wal_inputs_job_scope,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_wal_inputs_job_cf,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_wal_inputs_job_begin,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_wal_inputs_job_revalidate,$(SIMPLE_TESTS))
-SIMPLE_TESTS := $(filter-out test_cluster_wal_inputs_job_lifecycle test_cluster_wal_inputs_job_service test_cluster_wal_inputs_job_retained,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_wal_inputs_job_lifecycle test_cluster_wal_inputs_job_service test_cluster_wal_inputs_job_retained test_cluster_wal_inputs_job_pi,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_heap_cr_reuse test_cluster_snapshot_admission test_cluster_undo_header_durability test_cluster_tt_2pc_finish test_cluster_control_transport test_cluster_cr_native_origin test_cluster_cr_mvcc_origin test_cluster_tt_abort_owner test_cluster_tt_active_owner test_cluster_pcm_aux_consumer test_cluster_pcm_aux_reobserve test_cluster_multixact_current_stats test_cluster_vacuum_native_window test_cluster_subtrans_watermark \
 		test_cluster_r4_production_reachability test_cluster_heap_update_temp_lock test_cluster_heap_dml_lifetime \
 		test_cluster_pcm_aux_mutation test_cluster_heap_extend_current test_cluster_heap_pair_scope \
@@ -3300,7 +3300,12 @@ test_cluster_abort_writer_flush.inc: $(top_srcdir)/src/backend/storage/buffer/bu
 test_cluster_pi_drop_storage: test_cluster_pi_drop_storage.c test_cluster_page_data.c
 test_cluster_page_data test_cluster_pi_writeback test_cluster_sync_error test_cluster_pi_drop_storage test_cluster_abort_writer: PI_WRITEBACK_CODEC_OBJS = $(CLUSTER_KO_O)
 test_cluster_page_data test_cluster_sync_error test_cluster_pi_drop_storage test_cluster_abort_writer: $(CLUSTER_KO_O)
-test_cluster_pi_writeback: test_cluster_pi_writeback_v2.inc $(CLUSTER_KO_O)
+test_cluster_pi_writeback: test_cluster_pi_writeback_v2.inc $(CLUSTER_KO_O) $(CLUSTER_INJECT_O) cluster_pi_io_trace_test.o
+# Keep inherited FlushBuffer diagnostics bound to their real implementations.
+test_cluster_pi_writeback: PI_WRITEBACK_DIAGNOSTIC_OBJS = $(CLUSTER_INJECT_O) cluster_pi_io_trace_test.o
+cluster_pi_io_trace_test.o: $(top_srcdir)/src/backend/cluster/cluster_block_io_trace.c \
+		$(top_srcdir)/src/include/cluster/cluster_block_io_trace.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 test_cluster_pi_writeback: test_cluster_pi_writeback.c test_cluster_page_data.c \
 		$(top_srcdir)/src/backend/cluster/cluster_pi_rebuild.c \
 		$(top_srcdir)/src/include/cluster/cluster_pi_rebuild.h \
@@ -3322,7 +3327,7 @@ test_cluster_page_data test_cluster_pi_writeback test_cluster_sync_error test_cl
 		$(top_builddir)/src/common/libpgcommon_srv.a $(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(srcdir)/$@.c test_cluster_page_data_stable.o test_cluster_page_wal_product.o $(CLUSTER_WAL_CLAIM_O) \
-		$(PAGE_DATA_SPACE_OBJS) $(PI_WRITEBACK_CODEC_OBJS) \
+		$(PAGE_DATA_SPACE_OBJS) $(PI_WRITEBACK_CODEC_OBJS) $(PI_WRITEBACK_DIAGNOSTIC_OBJS) \
 		$(top_builddir)/src/backend/storage/lmgr/s_lock.o \
 		$(CLUSTER_PAGE_ONLINE_PLAN_O) $(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) \
 		$(CLUSTER_BLOCK_APPLY_O) test_cluster_space_bufpage_product.o xlogreader_fs.o \
@@ -5252,9 +5257,9 @@ test_cluster_wal_inputs_job_begin_types.inc: $(top_srcdir)/src/backend/cluster/c
 	mv $@.tmp $@
 
 test_cluster_wal_inputs_job_begin_bodies.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_inputs.c Makefile
-	awk '/^(inputs_build_current|inputs_revalidate|inputs_unlock|inputs_root|inputs_checkpoint|inputs_terminal|inputs_collect|inputs_claims|inputs_remote_sample|cluster_wal_inputs_prepare_live_v1|inputs_job_root_phase|cluster_wal_inputs_job_begin_v1|cluster_wal_inputs_job_revalidate_v1|cluster_wal_inputs_job_suspend_v1|cluster_wal_inputs_job_resume_v1|cluster_wal_inputs_revalidate_v1|cluster_wal_inputs_suspend_v1|cluster_wal_inputs_wait_failed_v1|cluster_wal_inputs_resume_v1|cluster_wal_inputs_root_token_v1|cluster_wal_inputs_at_v1)\(/ { print prev; emit=1; count++ } \
+	awk '/^(inputs_build_current|inputs_revalidate|inputs_unlock|inputs_root|inputs_checkpoint|inputs_terminal|inputs_collect|inputs_claims|inputs_remote_sample|cluster_wal_inputs_prepare_live_v1|inputs_job_root_phase|cluster_wal_inputs_job_begin_v1|cluster_wal_inputs_job_failed_root_v1|cluster_wal_inputs_job_revalidate_v1|cluster_wal_inputs_job_suspend_v1|cluster_wal_inputs_job_resume_v1|cluster_wal_inputs_revalidate_v1|cluster_wal_inputs_suspend_v1|cluster_wal_inputs_wait_failed_v1|cluster_wal_inputs_resume_v1|cluster_wal_inputs_root_token_v1|cluster_wal_inputs_at_v1)\(/ { print prev; emit=1; count++ } \
 	     emit { print } /^}/ { emit=0 } { prev=$$0 } \
-	     END { if (count != 21 || emit) exit 1 }' $< > $@.tmp
+	     END { if (count != 22 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_wal_inputs_job_cf: test_cluster_wal_inputs_job_cf.c test_cluster_wal_inputs_job_pin.c \
@@ -8185,7 +8190,7 @@ test_cluster_checkpoint_pi_order.inc: $(top_srcdir)/src/backend/access/transam/x
 		fn && /^}/ { exit } \
 		function at(name) { if (!(name in line)) line[name] = NR } \
 		fn && /CheckPointBuffers\(flags\);/ { at("buffers") } \
-		fn && /cluster_pi_writeback_checkpointer_release_v1\(\);/ { at("release") } \
+		fn && /ClusterCheckpointReleasePiInputs\(flags\);/ { at("release") } \
 		fn && /cluster_undo_buf_flush_all\(/ { at("undo") } \
 		fn && /ProcessSyncRequests\(\);/ { at("sync") } \
 		END { n = split("buffers release undo sync", k, " "); \
@@ -13507,3 +13512,73 @@ test_cluster_wal_inputs_retained_caller.inc: $(top_srcdir)/src/backend/cluster/c
 test_cluster_wal_inputs_job_retained: test_cluster_wal_inputs_retained_claim.inc test_cluster_wal_inputs_retained_caller.inc $(top_srcdir)/src/backend/cluster/cluster_wal_retained_cut_internal.h
 
 test_cluster_wal_retained_cut test_cluster_wal_retained_cut_records: test_cluster_wal_retained_job_boundary.h $(top_srcdir)/src/backend/cluster/cluster_wal_inputs_job_private.h
+
+# Real input/ACK bodies combined with the original PI caller lifecycle.
+test_cluster_wal_inputs_job_pi: test_cluster_wal_inputs_job_pi.c test_cluster_wal_inputs_job_pin.c \
+		test_cluster_wal_inputs_job.c test_cluster_cf_job_retirement.c test_cluster_cf_enqueue.c \
+		test_cluster_wal_inputs_job_begin_fixture.h test_cluster_wal_inputs_job_begin_types.inc \
+		test_cluster_wal_inputs_job_begin_bodies.inc \
+		unit_test.h test_cluster_cf_job_ack.inc test_cluster_wal_inputs_job_callback.inc \
+		test_cluster_cf_blocker_trace.inc test_cluster_startup_interrupt.inc \
+		test_cluster_startup_interrupt_fixture.h \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_inputs_job.c \
+		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
+		$(CLUSTER_CF_ENQUEUE_O) $(CLUSTER_LOCK_OWNER_O) $(CLUSTER_CONTROL_REQUEST_O) \
+		$(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_CRYPTOHASH_O) $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(top_srcdir)/src/backend/cluster $< \
+		$(CLUSTER_CF_ENQUEUE_O) $(CLUSTER_LOCK_OWNER_O) $(CLUSTER_CONTROL_REQUEST_O) \
+		$(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_CRYPTOHASH_O) $(CLUSTER_UNIT_PORT_LIBS) \
+		$(LDFLAGS) $(filter -lcrypto,$(LIBS)) -o $@
+
+test_cluster_wal_inputs_job_pi: test_cluster_wal_inputs_job_pin_fixture.h test_cluster_wal_inputs_job_pin_types.inc test_cluster_wal_inputs_job_pin_bodies.inc test_cluster_wal_inputs_job_scope_fixture.h test_cluster_wal_inputs_job_scope_types.inc test_cluster_wal_inputs_job_scope_bodies.inc $(top_srcdir)/src/backend/cluster/cluster_wal_inputs_job_private.h
+
+test_cluster_wal_inputs_job_pi: test_cluster_wal_inputs_pi_types.inc test_cluster_wal_inputs_pi_callbacks.inc \
+		test_cluster_pi_checkpoint_wait.inc test_cluster_pi_checkpoint_release.inc \
+		$(top_srcdir)/src/include/cluster/cluster_pi_writeback.h \
+		$(top_srcdir)/src/include/cluster/cluster_pi_rebuild.h \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_inputs_job_payload_private.h
+
+test_cluster_wal_inputs_pi_types.inc: $(top_srcdir)/src/backend/cluster/cluster_pi_writeback.c $(top_srcdir)/src/backend/cluster/cluster_pi_rebuild.c Makefile
+	awk '/^enum { WB_EMPTY/ { emit=1; starts++ } \
+	     emit && /^wb_local_advance_locked\(/ { emit=0; ends++ } \
+	     emit { if (line != "") print line; line=$$0 } \
+	     END { if (starts != 1 || ends != 1 || emit) exit 1 }' $< > $@.tmp
+	awk '/^#define PI_REBUILD_BATCH / { emit=1; starts++ } \
+	     emit && /^pi_rebuild_release\(/ { emit=0; ends++ } \
+	     emit { if (line != "") print line; line=$$0 } \
+	     END { if (starts != 1 || ends != 1 || emit) exit 1 }' \
+	     $(top_srcdir)/src/backend/cluster/cluster_pi_rebuild.c >> $@.tmp
+	mv $@.tmp $@
+
+test_cluster_wal_inputs_pi_callbacks.inc: $(top_srcdir)/src/backend/cluster/cluster_pi_writeback.c $(top_srcdir)/src/backend/cluster/cluster_pi_rebuild.c Makefile
+	awk '/^(wb_forget_batch|wb_cancel|wb_forget_server|wb_notice_revoke|wb_batch_revoke|wb_resource_release|wb_inputs_retire|wb_inputs_open|wb_server_finish|wb_batch_release|wb_batch_allocate|cluster_pi_writeback_checkpointer_release_v1)\(/ { print prev; emit=1; functions++ } \
+	     emit { print } /^}/ { emit=0 } { prev=$$0 } \
+	     END { if (functions != 12 || emit) exit 1 }' $< > $@.tmp
+	awk '/^(pi_rebuild_owner_release|pi_rebuild_release|pi_rebuild_failed_wait)\(/ { print prev; emit=1; functions++ } \
+	     emit { print } /^}/ { emit=0 } { prev=$$0 } \
+	     END { if (functions != 3 || emit) exit 1 }' \
+	     $(top_srcdir)/src/backend/cluster/cluster_pi_rebuild.c >> $@.tmp
+	mv $@.tmp $@
+
+test_cluster_pi_checkpoint_wait.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
+	awk '/^(ClusterCheckpointYieldForShutdown|ClusterCheckpointReleasePiInputs)\(/ { print prev; emit=1; functions++ } \
+	     emit { print } /^}/ { emit=0 } { prev=$$0 } \
+	     END { if (functions != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_pi_checkpoint_release.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
+	awk '/CheckPointBuffers\(flags\);/ { phase=1 } \
+	     phase && /if \(MyBackendType == B_CHECKPOINTER\)/ { print; emit=1; blocks++; next } \
+	     emit { print; emit=0; phase=0; ends++ } \
+	     END { if (blocks != 1 || ends != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_pi_writeback: test_cluster_pi_inputs_boundary.h
+
+test_cluster_pi_empty_batch_release.inc: $(top_srcdir)/src/backend/cluster/cluster_pi_writeback.c Makefile
+	awk '/^cluster_pi_writeback_checkpointer_release_v1\(/ { print prev; emit=1; functions++ } \
+	     emit { print } /^}/ { emit=0 } { prev=$$0 } \
+	     END { if (functions != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_wal_inputs_job_service test_cluster_normal_stop: test_cluster_pi_empty_batch_fixture.h test_cluster_pi_empty_batch_release.inc $(top_srcdir)/src/include/cluster/cluster_pi_writeback.h

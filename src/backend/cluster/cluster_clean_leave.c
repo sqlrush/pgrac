@@ -59,6 +59,7 @@
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_wal_inputs.h"
+#include "cluster/cluster_pi_writeback.h"
 #include "cluster/cluster_lock_owner.h"
 #include "cluster/cluster_ko.h"
 #include "cluster/cluster_conf.h"
@@ -3831,6 +3832,9 @@ cl_normal_stop_checkpoint_run(ClusterPhase1FullStopPlan *plan,
 		cluster_cf_retirement_poll();
 		cluster_lock_owners_service_poll();
 		cluster_wal_inputs_jobs_service_poll_v1();
+		/* This original caller finishes the batch header only after ACK.
+		 * The passive census and the existing absolute deadline stay below. */
+		(void)cluster_pi_writeback_checkpointer_release_v1();
 		if (step == 0 && !after_checkpoint
 			&& pg_atomic_read_u32(&cl_normal_stop->phase) < CLUSTER_NORMAL_STOP_CHECKPOINT
 			&& pg_atomic_read_u32(&cl_normal_stop->service_seal) == 0

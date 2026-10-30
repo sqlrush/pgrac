@@ -70,6 +70,14 @@ inputs_job_find(ClusterWalInputsJobV1 *job, bool owner_cleanup)
 				|| job->owner_procno != (uint32)MyProc->pgprocno
 				|| job->owner_proc_generation != MyProc->cluster_grd_generation
 				|| (job->flags & ~WAL_INPUT_JOB_FLAGS) != 0
+				|| ((job->flags & WAL_INPUT_JOB_FLAG_DETECT) != 0
+					? (job->consumer != WAL_INPUT_JOB_PI_REBUILD || job->pin != NULL
+						|| job->walr_next != 0
+						|| (job->flags & (WAL_INPUT_JOB_FLAG_ERROR | WAL_INPUT_JOB_FLAG_CANCELLED)) != 0
+						|| (job->state != WAL_INPUT_JOB_STATE_DONE
+							&& job->state != WAL_INPUT_JOB_STATE_RETIRING_CF)
+						|| job->detect_result > CLUSTER_CONTROL_ROOT_ADMISSION_PENDING)
+					: job->detect_result != 0)
 				|| job->cf.job_generation != job->generation || job->cf.reserved != 0
 				|| job->cf.state > CF_JOB_RECEIPT_CONFIRMED)
 				return NULL;
@@ -125,18 +133,37 @@ inputs_job_transition(ClusterWalInputsJobSlotV1 *slot, uint32 state, uint16 flag
 }
 
 bool
+cluster_wal_inputs_job_owner_revoke_v1(ClusterWalInputsJobV1 *job,
+	ClusterWalInputsConsumerV1 consumer, bool error)
+{
+	ClusterWalInputsJobSlotV1 *slot = inputs_job_find(job, true);
+
+	if (slot == NULL || job->consumer != (uint32)consumer)
+		return false;
+	if (error)
+		job->detect_result = 0;
+	inputs_job_transition(slot, job->state == WAL_INPUT_JOB_STATE_DONE ? WAL_INPUT_JOB_STATE_DONE
+		: job->state == WAL_INPUT_JOB_STATE_RETIRING_WALR || job->walr_next != 0
+			? WAL_INPUT_JOB_STATE_RETIRING_WALR : WAL_INPUT_JOB_STATE_RETIRING_CF,
+		(error ? job->flags & ~WAL_INPUT_JOB_FLAG_DETECT : job->flags)
+			| WAL_INPUT_JOB_FLAG_REVOKED | (error ? WAL_INPUT_JOB_FLAG_ERROR : 0));
+	return true;
+}
+
+bool
+cluster_wal_inputs_job_consumer_matches_v1(ClusterWalInputsJobV1 *job,
+	ClusterWalInputsConsumerV1 consumer)
+{
+	return inputs_job_find(job, false) != NULL && job->consumer == (uint32)consumer;
+}
+
+bool
 cluster_wal_inputs_job_revoke_v1(ClusterWalInputsJobV1 *job, bool error)
 {
-	ClusterWalInputsJobSlotV1 *slot = inputs_job_find(job, false);
-
-	if (slot == NULL)
+	if (inputs_job_find(job, false) == NULL)
 		return false;
-	if (job->state != WAL_INPUT_JOB_STATE_DONE)
-		inputs_job_transition(slot,
-			job->state == WAL_INPUT_JOB_STATE_RETIRING_WALR || job->walr_next != 0
-				? WAL_INPUT_JOB_STATE_RETIRING_WALR : WAL_INPUT_JOB_STATE_RETIRING_CF,
-			job->flags | WAL_INPUT_JOB_FLAG_REVOKED | (error ? WAL_INPUT_JOB_FLAG_ERROR : 0));
-	return true;
+	return cluster_wal_inputs_job_owner_revoke_v1(job,
+		(ClusterWalInputsConsumerV1)job->consumer, error);
 }
 
 ClusterControlRootResult
@@ -288,9 +315,11 @@ cluster_wal_inputs_job_cf_prepare_v1(ClusterWalInputsJobV1 *job, uint64 *before)
 	if (slot == NULL)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	if (job->state == WAL_INPUT_JOB_STATE_RETIRING_CF
-		|| job->state == WAL_INPUT_JOB_STATE_RETIRING_WALR || job->state == WAL_INPUT_JOB_STATE_DONE)
+		|| job->state == WAL_INPUT_JOB_STATE_RETIRING_WALR
+		|| (job->state == WAL_INPUT_JOB_STATE_DONE && (job->flags & WAL_INPUT_JOB_FLAG_DETECT) == 0))
 		return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
-	if (job->state != WAL_INPUT_JOB_STATE_BUILDING || job->inputs == NULL || job->flags != 0)
+	if (job->inputs == NULL || !((job->state == WAL_INPUT_JOB_STATE_BUILDING && job->flags == 0)
+		|| (job->state == WAL_INPUT_JOB_STATE_DONE && (job->flags & WAL_INPUT_JOB_FLAG_DETECT) != 0)))
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	if (job->cf.state != CF_JOB_RECEIPT_UNBOUND) {
 		ClusterCfJobResultV1 result;
@@ -337,7 +366,8 @@ cluster_wal_inputs_job_cf_release_v1(ClusterWalInputsJobV1 *job, uint64 before)
 	 * original service loop owns the existing receipt's later polling. */
 	if (job->state == WAL_INPUT_JOB_STATE_RETIRING_CF)
 		return CF_JOB_PENDING;
-	if (job->state != WAL_INPUT_JOB_STATE_BUILDING || job->inputs == NULL || job->flags != 0
+	if (job->inputs == NULL || !((job->state == WAL_INPUT_JOB_STATE_BUILDING && job->flags == 0)
+		|| (job->state == WAL_INPUT_JOB_STATE_DONE && (job->flags & WAL_INPUT_JOB_FLAG_DETECT) != 0))
 		|| job->cf.state != CF_JOB_RECEIPT_UNBOUND || before >= UINT64_MAX - 1
 		|| !cluster_cf_last_attempt_since(before, &attempt) || attempt.sequence != before + 1
 		|| attempt.mode != ShareLock || attempt.cooperative || attempt.caller != NULL
@@ -438,10 +468,9 @@ inputs_jobs_resource_release(ResourceReleasePhase phase, bool isCommit,
 			elog(FATAL, "invalid original WAL input job during owner cleanup");
 		if (job->state == WAL_INPUT_JOB_STATE_DONE)
 			continue;
-		inputs_job_transition(&inputs_jobs[i],
-			job->state == WAL_INPUT_JOB_STATE_RETIRING_WALR || job->walr_next != 0
-				? WAL_INPUT_JOB_STATE_RETIRING_WALR : WAL_INPUT_JOB_STATE_RETIRING_CF,
-			job->flags | WAL_INPUT_JOB_FLAG_REVOKED | (isCommit ? 0 : WAL_INPUT_JOB_FLAG_ERROR));
+		if (!cluster_wal_inputs_job_owner_revoke_v1(job,
+				(ClusterWalInputsConsumerV1)i, !isCommit))
+			elog(FATAL, "invalid original WAL input job revocation during owner cleanup");
 		/* Only revoke. The original service loop observes ACK completion;
 		 * this callback neither waits nor releases the caller's context. */
 	}
@@ -522,6 +551,38 @@ cluster_wal_inputs_job_open_v1(ClusterWalInputsConsumerV1 consumer, MemoryContex
 	slot->job = job;
 	*out = job;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+bool
+cluster_wal_inputs_job_detect_next_v1(ClusterWalInputsJobV1 *job,
+	ClusterWalInputsV1 **scope, ClusterControlRootResult *result)
+{
+	ClusterWalInputsJobSlotV1 *slot = inputs_job_find(job, false);
+
+	*scope = NULL;
+	*result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (slot == NULL || job->consumer != WAL_INPUT_JOB_PI_REBUILD || job->inputs == NULL
+		|| (job->flags & (WAL_INPUT_JOB_FLAG_ERROR | WAL_INPUT_JOB_FLAG_CANCELLED)) != 0)
+		return false;
+	if (job->state == WAL_INPUT_JOB_STATE_RETIRING_CF && (job->flags & WAL_INPUT_JOB_FLAG_DETECT) != 0) {
+		*result = CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+		return false;
+	}
+	if (job->state != WAL_INPUT_JOB_STATE_DONE)
+		return false;
+	if ((job->flags & WAL_INPUT_JOB_FLAG_DETECT) != 0) {
+		*result = (ClusterControlRootResult)job->detect_result;
+		job->detect_result = 0;
+		inputs_job_transition(slot, WAL_INPUT_JOB_STATE_DONE, job->flags & ~WAL_INPUT_JOB_FLAG_DETECT);
+		return false;
+	}
+	if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock)) {
+		*result = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+		return false;
+	}
+	inputs_job_transition(slot, WAL_INPUT_JOB_STATE_DONE, job->flags | WAL_INPUT_JOB_FLAG_DETECT);
+	*scope = job->inputs;
+	return true;
 }
 
 MemoryContext

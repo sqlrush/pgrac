@@ -36,6 +36,7 @@
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 #include "../../backend/cluster/cluster_clean_leave.c"
+#include "test_cluster_pi_empty_batch_fixture.h"
 #include "../../backend/cluster/cluster_service_observe.c"
 
 #undef printf

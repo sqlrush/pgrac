@@ -143,12 +143,13 @@ record(char c)
 	trace[trace_pos++] = c;
 	trace[trace_pos] = 0;
 }
-void
+bool
 cluster_pi_writeback_checkpointer_release_v1(void)
 {
 	pi_scope_retained = false;
 	pi_scope_releases++;
 	record('R');
+	return true;
 }
 static void
 UpdateSharedMemoryConfig(void)

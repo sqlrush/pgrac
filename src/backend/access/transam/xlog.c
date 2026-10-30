@@ -9239,6 +9239,47 @@ ClusterCheckpointRecoveryBegin(int flags, struct ClusterRecoveryCheckpointScopeV
 				 errmsg("checkpoint lacks its installed recovery owner")));
 }
 
+/* PGRAC: a PI batch can run during the native write phase. Preserve
+ * its original cleanup owner; ROOT/WAL may follow only after exact ACKs.
+ * Ordinary cleanup is latch driven, with no timeout-to-error conversion.
+ * Shutdown retains the existing checkpoint wait-budget accounting. */
+static void
+ClusterCheckpointReleasePiInputs(int flags)
+{
+	bool stopping = (flags & CHECKPOINT_IS_SHUTDOWN) != 0 && cluster_normal_stop_requested();
+	ClusterWalSourceRef ref;
+	uint64 epoch = 0;
+
+	if (MyBackendType != B_CHECKPOINTER)
+		return;
+	if (stopping) {
+		epoch = cluster_epoch_get_current();
+		if (epoch == 0 || !cluster_wal_thread_current_v2_ref(&ref))
+			ereport(ERROR, (errmsg("PI checkpoint cleanup lost its original WAL identity")));
+	}
+	for (;;) {
+		uint64 started_us = stopping ? cluster_checkpoint_wait_budget_now() : 0;
+		long timeout_ms = 0;
+
+		CHECK_FOR_INTERRUPTS();
+		ResetLatch(MyLatch);
+		cluster_cf_retirement_poll();
+		cluster_lock_owners_service_poll();
+		cluster_wal_inputs_jobs_service_poll_v1();
+		if (cluster_pi_writeback_checkpointer_release_v1()) {
+			if (stopping)
+				(void)cluster_checkpoint_wait_budget_charge(false, started_us, &ref, epoch);
+			return;
+		}
+		AbsorbSyncRequests();
+		ClusterCheckpointYieldForShutdown((flags & (CHECKPOINT_IS_SHUTDOWN | CHECKPOINT_END_OF_RECOVERY)) == 0);
+		if (stopping)
+			timeout_ms = cluster_checkpoint_wait_budget_charge(true, started_us, &ref, epoch);
+		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_EXIT_ON_PM_DEATH | (stopping ? WL_TIMEOUT : 0),
+			timeout_ms, WAIT_EVENT_CHECKPOINTER_MAIN);
+	}
+}
+
 static void
 ClusterCheckpointV3Prepare(int flags, ControlFileData *selected,
 						   const struct ClusterRecoveryCheckpointScopeV1 *recovery_scope)
@@ -9602,6 +9643,7 @@ CreateCheckPoint(int flags)
 	 * transitions still need their separate owner. No CF skip grants permission. */
 	if (cluster_shared_config)
 	{
+		ClusterCheckpointReleasePiInputs(flags);
 		ClusterCheckpointRecoveryBegin(flags, &recovery_checkpoint_scope);
 		ClusterCheckpointV3Prepare(flags, &v3_checkpoint, recovery_checkpoint_scope);
 		if (fullPageWrites != Insert->fullPageWrites)
@@ -10651,7 +10693,7 @@ CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 	 * <sqlrush@gmail.com>
 	 */
 	if (MyBackendType == B_CHECKPOINTER)
-		cluster_pi_writeback_checkpointer_release_v1();
+		ClusterCheckpointReleasePiInputs(flags);
 
 	/*
 	 * PGRAC: spec-3.18 D2b — flush the undo buffer pool's write-back dirty
