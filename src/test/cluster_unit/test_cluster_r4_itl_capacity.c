@@ -50,6 +50,12 @@
 static unsigned origin_calls;
 static unsigned active_publications;
 static int origin_fault;
+static bool retained_probe_active;
+static unsigned retained_calls;
+static int retained_fault;
+
+/* The included fixture aliases this declaration; use the real allocator. */
+bool cluster_itl_has_allocatable_slot(Buffer buffer, TransactionId top_xid, bool lock_only);
 
 /* Materialization is a startup fact, constant throughout this process. */
 bool
@@ -142,6 +148,20 @@ itl_origin(const ClusterTxLocator *locator, uint64 epoch, ClusterTxResolution *o
 		}
 		if (origin_fault == 9 && locator->xid == 1207)
 			pg_atomic_write_u64(&ut_itl_census_semantic.record_generation, 74);
+	} else if (origin_fault >= 10 && origin_fault <= 14) {
+		if (locator->xid == 1206 || (locator->xid == 1203 && origin_fault == 10)) {
+			out->outcome = CLUSTER_TX_UNKNOWN;
+			*reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+		} else if (locator->xid == 1203) {
+			if (origin_fault == 11) {
+				out->outcome = CLUSTER_TX_COMMITTED;
+				out->commit_scn = 9001;
+			} else if (origin_fault == 13) {
+				out->outcome = CLUSTER_TX_PREPARED;
+				out->proof_kind = CLUSTER_TX_PROOF_ORIGIN_TWOPHASE;
+			} else if (origin_fault == 14)
+				out->outcome = CLUSTER_TX_ABORTED;
+		}
 	}
 	return out->outcome;
 }
@@ -172,7 +192,69 @@ cluster_runtime_visibility_resolve_terminal_census_retained_exact(
 	const ClusterSemanticAdmissionToken *admission, ClusterTxResolution *out,
 	ClusterTxResolveReason *reason)
 {
-	abort(); /* No precommit/retained terminal is supplied by this probe. */
+	if (!retained_probe_active)
+		abort(); /* Original probes must not reach this controlled leaf. */
+	retained_calls++;
+	UT_ASSERT(!ut_hot_content_lock_held);
+	UT_ASSERT(admission->entered);
+	UT_ASSERT_EQ(admission->formation_epoch, 9);
+	UT_ASSERT_EQ(locator->itl_kind, ITL_FLAG_NEEDS_CLEANOUT);
+	UT_ASSERT_EQ(locator->itl_slot_index, 3);
+	UT_ASSERT_EQ(locator->xid, 1203);
+	UT_ASSERT_EQ(locator->tt_wrap, TT_WRAP_INVALID);
+	UT_ASSERT_EQ(retained_scn, 9001);
+	memset(out, 0, sizeof(*out));
+	out->locator_echo = *locator;
+	out->locator_echo.tt_wrap = 42;
+	out->top_xid = locator->xid;
+	out->outcome = CLUSTER_TX_COMMITTED;
+	out->commit_scn = retained_scn;
+	out->proof_kind = CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG;
+	out->authority.origin_epoch = admission->formation_epoch;
+	out->authority.tt_generation = 77;
+	out->authority.authority_scn = 9002;
+	*reason = CLUSTER_TX_RESOLVE_NONE;
+	switch (retained_fault) {
+	case 0:
+		break;
+	case 1:
+		out->commit_scn++; /* C1b differs from the captured precommit SCN. */
+		break;
+	case 2:
+		out->locator_echo.xid++;
+		break;
+	case 3:
+		out->locator_echo.tt_wrap = TT_WRAP_INVALID;
+		break;
+	case 4:
+		out->proof_kind = CLUSTER_TX_PROOF_NONE;
+		break;
+	case 5:
+		out->outcome = CLUSTER_TX_UNKNOWN;
+		*reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+		return out->outcome;
+	case 6:
+		out->outcome = CLUSTER_TX_PREPARED;
+		out->commit_scn = InvalidScn;
+		out->proof_kind = CLUSTER_TX_PROOF_ORIGIN_TWOPHASE;
+		break;
+	case 7:
+		pg_atomic_write_u64(&ut_itl_census_semantic.record_generation, 74);
+		break;
+	case 8:
+		out->authority.origin_epoch++;
+		break;
+	case 9:
+		out->outcome = CLUSTER_TX_ABORTED;
+		out->commit_scn = InvalidScn;
+		return CLUSTER_TX_COMMITTED; /* The envelope and returned kind differ. */
+	case 10:
+		out->commit_scn = InvalidScn;
+		break;
+	default:
+		abort();
+	}
+	return out->outcome;
 }
 
 UT_TEST(test_exact_active_owner_reaches_capacity_wait_through_real_resolver)
@@ -529,10 +611,189 @@ UT_TEST(test_confirmed_deadlock_wins_over_simultaneous_capacity_deadline)
 	ut_itl_census_end();
 }
 
+/* The runtime retained reply below is controlled; capture, resolution,
+ * qualification, application and materialized-history selection are real. */
+static void
+itl_retained_begin(UtR4HotProductFixture *fixture, HeapHotSearchResult *hot,
+				   bool independent_active)
+{
+	ClusterItlSlotData *slots;
+
+	ut_itl_census_begin(fixture, hot, false);
+	origin_fault = 10;
+	origin_calls = active_publications = retained_calls = 0;
+	retained_fault = 0;
+	retained_probe_active = true;
+	pg_atomic_write_u64(&ut_itl_census_semantic.active_bits,
+						CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1);
+	slots = ClusterPageGetItlSlots((Page)fixture->live_page);
+	for (int i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
+		slots[i].undo_segment_head = uba_encode(257, i + 1, i, 0);
+		if (!independent_active) {
+			slots[i].flags = ITL_FLAG_COMMITTED;
+			slots[i].commit_scn = 9000;
+		}
+	}
+	slots[3].flags = ITL_FLAG_NEEDS_CLEANOUT;
+	slots[3].commit_scn = 9001;
+}
+
+UT_TEST(test_retained_precommit_applies_once_then_waits_or_protects_history)
+{
+	for (int independent_active = 0; independent_active < 2; independent_active++) {
+		UtR4HotProductFixture fixture;
+		HeapHotSearchResult hot;
+		PGAlignedBlock before;
+		PGAlignedBlock expected;
+		ClusterItlSlotData *slots;
+		uint64 deadline = 0;
+		uint64 saved_deadline = 0;
+		const char *reason = NULL;
+
+		itl_retained_begin(&fixture, &hot, independent_active != 0);
+		slots = ClusterPageGetItlSlots((Page)fixture.live_page);
+		memcpy(before.data, fixture.live_page, BLCKSZ);
+		UT_ASSERT_EQ(cluster_heap_test_itl_wait_capacity(1, 1, 1, 9900, &deadline, &reason),
+					 CLUSTER_TXW_RETRY);
+		UT_ASSERT_STR_EQ(reason, "ITL_FRESH_REQUALIFY");
+		UT_ASSERT_EQ(retained_calls, 1);
+		UT_ASSERT_EQ(origin_calls, independent_active ? 9 : 2);
+		UT_ASSERT_EQ(deadline, 0);
+		UT_ASSERT_EQ(ut_itl_wait_calls, 0);
+		UT_ASSERT_EQ(memcmp(before.data, fixture.live_page, BLCKSZ), 0);
+		UT_ASSERT(!ut_hot_content_lock_held);
+		LockBuffer(1, BUFFER_LOCK_EXCLUSIVE);
+		UT_ASSERT_EQ(cluster_heap_test_itl_capacity_outcome(1, 9900, false),
+					 CLUSTER_HEAP_ITL_CAPACITY_EXHAUSTED_OR_REFUSED);
+		memcpy(expected.data, before.data, BLCKSZ);
+		ClusterPageGetItlSlots((Page)expected.data)[3].flags = ITL_FLAG_COMMITTED;
+		UT_ASSERT_EQ(memcmp(expected.data, fixture.live_page, BLCKSZ), 0);
+		UT_ASSERT_EQ(slots[3].commit_scn, 9001);
+		UT_ASSERT_EQ(slots[3].wrap, ClusterPageGetItlSlots((Page)before.data)[3].wrap);
+		UT_ASSERT_EQ(ut_itl_census_dirty_hint_calls, 1);
+		UT_ASSERT_EQ(retained_calls, 2);
+
+		for (int round = 0; round < 3; round++) {
+			UT_ASSERT_EQ(cluster_heap_test_itl_capacity_outcome(1, 9900, false),
+						 CLUSTER_HEAP_ITL_CAPACITY_EXHAUSTED_OR_REFUSED);
+			UT_ASSERT_EQ(cluster_heap_test_itl_wait_capacity(1, 1, 1, 9900, &deadline, &reason),
+						 independent_active ? CLUSTER_TXW_RESOLVED : CLUSTER_TXW_UNPROVABLE);
+			UT_ASSERT_STR_EQ(reason, independent_active ? "ITL_FRESH_REQUALIFY"
+														: "ITL_PROTECTED_HISTORY_CAPACITY");
+			UT_ASSERT_EQ(memcmp(expected.data, fixture.live_page, BLCKSZ), 0);
+			UT_ASSERT_EQ(retained_calls, 2);
+			UT_ASSERT_EQ(ut_itl_census_dirty_hint_calls, 1);
+			UT_ASSERT_EQ(ut_itl_wait_calls, independent_active ? round + 1 : 0);
+			UT_ASSERT(!ut_hot_content_lock_held);
+			UT_ASSERT(!ut_itl_recycle_guard_active);
+			if (independent_active) {
+				UT_ASSERT_EQ(ut_itl_wait_locator.itl_slot_index, 0);
+				UT_ASSERT_EQ(ut_itl_wait_locator.xid, 1200);
+				UT_ASSERT_EQ(ut_itl_wait_locator.tt_wrap, 42);
+				UT_ASSERT_EQ(ut_itl_wait_locator.itl_kind, ITL_FLAG_ACTIVE);
+				UT_ASSERT_EQ(
+					memcmp(&ut_itl_wait_locator.uba, &slots[0].undo_segment_head, sizeof(UBA)), 0);
+				UT_ASSERT(deadline > 0);
+				if (round == 0)
+					saved_deadline = deadline;
+				else
+					UT_ASSERT_EQ(deadline, saved_deadline);
+			} else
+				UT_ASSERT_EQ(deadline, 0);
+			LockBuffer(1, BUFFER_LOCK_EXCLUSIVE);
+		}
+		UT_ASSERT_EQ(origin_calls, independent_active ? 17 + 3 * 14 : 3);
+		ut_itl_census_end();
+		retained_probe_active = false;
+	}
+}
+
+UT_TEST(test_retained_precommit_invalid_proofs_never_mutate_any_slot)
+{
+	for (int fault = 1; fault <= 10; fault++) {
+		UtR4HotProductFixture fixture;
+		HeapHotSearchResult hot;
+		PGAlignedBlock before;
+
+		itl_retained_begin(&fixture, &hot, false);
+		retained_fault = fault;
+		memcpy(before.data, fixture.live_page, BLCKSZ);
+		UT_ASSERT_EQ(cluster_heap_test_itl_capacity_outcome(1, 9900, false),
+					 fault == 1 ? CLUSTER_HEAP_ITL_CAPACITY_RETRY_REQUALIFY
+								: CLUSTER_HEAP_ITL_CAPACITY_EXHAUSTED_OR_REFUSED);
+		UT_ASSERT_EQ(origin_calls, 1);
+		UT_ASSERT_EQ(retained_calls, 1);
+		UT_ASSERT_EQ(memcmp(before.data, fixture.live_page, BLCKSZ), 0);
+		UT_ASSERT_EQ(ut_itl_census_dirty_hint_calls, 0);
+		UT_ASSERT_EQ(ut_itl_wait_calls, 0);
+		UT_ASSERT(!cluster_itl_has_allocatable_slot(1, 9900, false));
+		UT_ASSERT(!ut_itl_recycle_guard_active);
+		ut_itl_census_end();
+		retained_probe_active = false;
+	}
+}
+
+UT_TEST(test_precommit_current_verdict_keeps_terminal_active_and_prepared_polarity)
+{
+	for (int current = 11; current <= 14; current++) {
+		UtR4HotProductFixture fixture;
+		HeapHotSearchResult hot;
+		PGAlignedBlock before;
+		PGAlignedBlock expected;
+		uint64 deadline = 0;
+		const char *reason = NULL;
+		bool terminal = current == 11 || current == 14;
+
+		itl_retained_begin(&fixture, &hot, false);
+		origin_fault = current;
+		memcpy(before.data, fixture.live_page, BLCKSZ);
+		UT_ASSERT_EQ(cluster_heap_test_itl_capacity_outcome(1, 9900, false),
+					 CLUSTER_HEAP_ITL_CAPACITY_EXHAUSTED_OR_REFUSED);
+		memcpy(expected.data, before.data, BLCKSZ);
+		if (terminal) {
+			ClusterItlSlotData *slot = &ClusterPageGetItlSlots((Page)expected.data)[3];
+
+			slot->flags = current == 11 ? ITL_FLAG_COMMITTED : ITL_FLAG_ABORTED;
+			slot->commit_scn = current == 11 ? 9001 : InvalidScn;
+		}
+		UT_ASSERT_EQ(memcmp(expected.data, fixture.live_page, BLCKSZ), 0);
+		UT_ASSERT_EQ(ut_itl_census_dirty_hint_calls, terminal ? 1 : 0);
+		UT_ASSERT_EQ(retained_calls, 0);
+		UT_ASSERT_EQ(origin_calls, 1);
+		UT_ASSERT_EQ(cluster_heap_test_itl_wait_capacity(1, 1, 1, 9900, &deadline, &reason),
+					 current == 12 ? CLUSTER_TXW_RESOLVED : CLUSTER_TXW_UNPROVABLE);
+		UT_ASSERT_EQ(retained_calls, 0);
+		UT_ASSERT_EQ(origin_calls, terminal ? 1 : 2);
+		UT_ASSERT_EQ(ut_itl_wait_calls, current == 12 ? 1 : 0);
+		if (current == 12) {
+			UT_ASSERT_STR_EQ(reason, "ITL_FRESH_REQUALIFY");
+			UT_ASSERT_EQ(ut_itl_wait_locator.itl_slot_index, 3);
+			UT_ASSERT_EQ(ut_itl_wait_locator.xid, 1203);
+			UT_ASSERT_EQ(ut_itl_wait_locator.tt_wrap, 42);
+			UT_ASSERT_EQ(ut_itl_wait_locator.itl_kind, ITL_FLAG_NEEDS_CLEANOUT);
+			UT_ASSERT_EQ(memcmp(&ut_itl_wait_locator.uba,
+								&ClusterPageGetItlSlots((Page)before.data)[3].undo_segment_head,
+								sizeof(UBA)),
+						 0);
+			UT_ASSERT(deadline > 0);
+		} else {
+			UT_ASSERT_EQ(deadline, 0);
+			UT_ASSERT_STR_EQ(reason, terminal ? "ITL_PROTECTED_HISTORY_CAPACITY"
+											  : "ITL_BLOCKER_UNPROVABLE");
+		}
+		UT_ASSERT_EQ(memcmp(expected.data, fixture.live_page, BLCKSZ), 0);
+		UT_ASSERT(!ut_hot_content_lock_held);
+		UT_ASSERT(!ut_itl_recycle_guard_active);
+		LockBuffer(1, BUFFER_LOCK_EXCLUSIVE);
+		ut_itl_census_end();
+		retained_probe_active = false;
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(13);
 	UT_RUN(test_applied_protected_terminal_rechecks_wait_without_repeated_retry);
 	UT_RUN(test_all_applied_protected_terminals_refuse_without_retry_or_wait);
 	UT_RUN(test_partial_terminal_apply_leaves_unknown_and_active_slots_unchanged);
@@ -543,6 +804,9 @@ main(void)
 	UT_RUN(test_capacity_keeps_unknown_identity_prepared_and_admission_refusals);
 	UT_RUN(test_origin_abort_releases_eight_lock_only_slots_through_real_census);
 	UT_RUN(test_lock_capacity_does_not_mistake_self_data_slot_for_lock_capacity);
+	UT_RUN(test_retained_precommit_applies_once_then_waits_or_protects_history);
+	UT_RUN(test_retained_precommit_invalid_proofs_never_mutate_any_slot);
+	UT_RUN(test_precommit_current_verdict_keeps_terminal_active_and_prepared_polarity);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
