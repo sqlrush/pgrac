@@ -27,6 +27,31 @@ extern bool test_xid_native_clog_extend(FullTransactionId candidate);
 extern void test_xid_native_clog_state(XidNativeClogState *out);
 extern void test_xid_native_clog_stop(void);
 
+/* Optional local native directory beside the default cold-origin fixture. */
+typedef enum XidNativeClogTerminalFault
+{
+	XID_CLOG_TERMINAL_VALID,
+	XID_CLOG_TERMINAL_FILE_SYNC,
+	XID_CLOG_TERMINAL_DIRECTORY_SYNC,
+	XID_CLOG_TERMINAL_SHORT,
+	XID_CLOG_TERMINAL_CORRUPT,
+	XID_CLOG_TERMINAL_CLOSE,
+	XID_CLOG_TERMINAL_OPEN_ERROR
+} XidNativeClogTerminalFault;
+typedef struct XidNativeClogTerminalState
+{
+	unsigned calls, writes, wal_flushes, file_syncs, directory_syncs;
+	int transient_fds;
+	XidStatus disk_status;
+	bool file_present, dirty, truncation_held, slru_held, caught;
+} XidNativeClogTerminalState;
+extern void test_xid_native_clog_use_local_directory(void);
+extern void test_xid_native_clog_set_status(TransactionId top, int nchildren,
+	TransactionId *children, XidStatus status);
+extern bool test_xid_native_clog_terminal(TransactionId xid, XidNativeClogTerminalFault fault,
+	void (*sync_hook)(void), ClusterClogNativeTerminalV1 *out, bool *caught);
+extern void test_xid_native_clog_terminal_state(TransactionId xid, XidNativeClogTerminalState *out);
+
 typedef enum XidNativeClogReplayFault
 {
 	XID_CLOG_REPLAY_VALID,

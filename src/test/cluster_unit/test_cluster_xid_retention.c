@@ -16,8 +16,12 @@ static bool retention_error_expected;
 static bool retention_wrap_ready = true;
 static void (*retention_full_clog_leaf)(FullTransactionId candidate);
 #ifdef TEST_CLUSTER_XID_RETENTION_NATIVE_CLOG
+#include "access/clog.h"
 static bool retention_mapping_held;
+static bool retention_truncation_held;
+static LWLockMode retention_xid_mode;
 static bool (*retention_terminal_match)(const ClusterRelmapOwnerSampleV2 *);
+static bool (*retention_clog_terminal_sync)(TransactionId, ClusterClogNativeTerminalV1 *);
 #endif
 int xid_allocation_original_main(void);
 
@@ -38,6 +42,13 @@ static bool
 retention_native_lock_acquire(LWLock *lock, LWLockMode mode)
 {
 #ifdef TEST_CLUSTER_XID_RETENTION_NATIVE_CLOG
+	if (lock == XactTruncationLock) {
+		if (held || retention_held || retention_mapping_held || retention_truncation_held
+			|| mode != LW_SHARED) lock_errors++;
+		retention_truncation_held = true;
+		HOLD_INTERRUPTS();
+		return false;
+	}
 	if (lock == RelationMappingLock) {
 		if (held || retention_held || retention_mapping_held || mode != LW_EXCLUSIVE
 			|| CritSectionCount != 0) lock_errors++;
@@ -47,7 +58,12 @@ retention_native_lock_acquire(LWLock *lock, LWLockMode mode)
 	}
 #endif
 	if (lock == XidGenLock) {
+#ifdef TEST_CLUSTER_XID_RETENTION_NATIVE_CLOG
+		if (held || retention_held || mode != (retention_truncation_held ? LW_SHARED : LW_EXCLUSIVE)) lock_errors++;
+		retention_xid_mode = mode;
+#else
 		if (held || retention_held || mode != LW_EXCLUSIVE) lock_errors++;
+#endif
 		held = true;
 	} else {
 		if (relmap_runtime_shmem == NULL || lock != &relmap_runtime_shmem->lock
@@ -63,6 +79,12 @@ static void
 retention_native_lock_release(LWLock *lock)
 {
 #ifdef TEST_CLUSTER_XID_RETENTION_NATIVE_CLOG
+	if (lock == XactTruncationLock) {
+		if (!retention_truncation_held || held || retention_held || retention_mapping_held) lock_errors++;
+		retention_truncation_held = false;
+		RESUME_INTERRUPTS();
+		return;
+	}
 	if (lock == RelationMappingLock) {
 		if (!retention_mapping_held || held || retention_held) lock_errors++;
 		retention_mapping_held = false;
@@ -91,6 +113,10 @@ static bool
 retention_native_lock_held(LWLock *lock, LWLockMode mode)
 {
 #ifdef TEST_CLUSTER_XID_RETENTION_NATIVE_CLOG
+	if (lock == XactTruncationLock)
+		return mode == LW_SHARED && retention_truncation_held;
+	if (lock == XidGenLock)
+		return held && mode == retention_xid_mode;
 	if (lock == RelationMappingLock)
 		return mode == LW_EXCLUSIVE && retention_mapping_held;
 #endif
@@ -196,7 +222,10 @@ retention_fixture(uint64 candidate, unsigned origin)
 	retention_wrap_ready = true;
 #ifdef TEST_CLUSTER_XID_RETENTION_NATIVE_CLOG
 	retention_mapping_held = false;
+	retention_truncation_held = false;
+	retention_xid_mode = LW_EXCLUSIVE;
 	retention_terminal_match = NULL;
+	retention_clog_terminal_sync = NULL;
 #endif
 	retention_acquires = retention_final_observations = retention_fault = retention_error_code = 0;
 	InterruptHoldoffCount = 0;
@@ -498,6 +527,7 @@ UT_TEST(retention_guard_valid_entry_observes_under_both_locks_and_returns_only_i
 #include "test_cluster_xid_retention_owner_capture.inc"
 #include "test_cluster_xid_retention_stage.inc"
 #include "test_cluster_xid_retention_pair.inc"
+#include "test_cluster_xid_retention_terminal.inc"
 #endif
 
 int
@@ -507,7 +537,9 @@ main(void)
 	bool focus = getenv("PGRAC_RETENTION_NATIVE_CLOG_FOCUS") != NULL;
 	bool stage_focus = getenv("PGRAC_RETENTION_NATIVE_STAGE_FOCUS") != NULL;
 	bool pair_focus = getenv("PGRAC_RETENTION_NATIVE_PAIR_FOCUS") != NULL;
-	UT_PLAN(pair_focus ? 5 : stage_focus ? 12 : focus ? 28 : 49);
+	bool terminal_focus = getenv("PGRAC_RETENTION_NATIVE_TERMINAL_FOCUS") != NULL;
+	UT_PLAN(terminal_focus ? 5 : pair_focus ? 10 : stage_focus ? 17 : focus ? 33 : 54);
+	if (!terminal_focus) {
 	if (!pair_focus) {
 	if (!stage_focus) {
 	if (!focus) {
@@ -567,6 +599,13 @@ main(void)
 	UT_RUN(retained_pair_native_partial_prepare_keeps_custody_and_input);
 	UT_RUN(retained_pair_native_partial_finish_is_one_shot);
 	UT_RUN(retained_pair_native_late_owner_drift_keeps_all_debt);
+	}
+	UT_RUN(retained_native_terminal_commits_both_pairs_after_original_clog);
+	UT_RUN(retained_native_terminal_refuses_uncommitted_and_aborted);
+	UT_RUN(retained_native_terminal_io_failure_and_error_keep_custody);
+	UT_RUN(retained_native_terminal_owner_change_after_sync_keeps_pairs);
+	UT_RUN(retained_native_terminal_bounds_refuse_before_clog_or_pair_io);
+
 #endif
 	free(relmap_runtime_shmem);
 	UT_DONE();
