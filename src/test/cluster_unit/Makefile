@@ -1113,6 +1113,13 @@ test_cluster_fresh_fdw.inc: $(top_srcdir)/src/backend/commands/foreigncmds.c Mak
 	     /^}/ { emit=0 } \
 	     END { if (helpers > 1 || entries != 2 || cuts != 2 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
+test_cluster_fresh_foreign_table_create.inc: $(top_srcdir)/src/backend/commands/foreigncmds.c Makefile
+	awk '/^CreateForeignTable\(/ { print "void"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /^[[:space:]]*CommandCounterIncrement\(\);/ { print "return; }"; emit=0; cuts++ } \
+	     /^}/ { if (emit) bad++; emit=0 } \
+	     END { if (entries != 1 || cuts != 1 || emit || bad) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
 test_cluster_fresh_foreign_server.inc: $(top_srcdir)/src/backend/commands/foreigncmds.c Makefile
 	awk '/^CreateForeignServer\(/ || /^AlterForeignServer\(/ \
 	     { print "ObjectAddress"; emit=1; entry=1; entries++ } \
@@ -1637,7 +1644,7 @@ test_cluster_fresh_scope: test_cluster_fresh_scope.c unit_test.h \
 		test_cluster_fresh_policy.inc test_cluster_fresh_conversion.inc test_cluster_fresh_collation.inc \
 		test_cluster_fresh_event_trigger.inc test_cluster_fresh_owner.inc test_cluster_fresh_object_depends.inc test_cluster_fresh_acl_grant.inc test_cluster_fresh_default_privileges.inc test_cluster_fresh_rename_tag.inc test_cluster_fresh_rename_dispatch.inc test_cluster_fresh_schema_dispatch.inc test_cluster_fresh_language.inc \
 		test_cluster_fresh_access_method.inc test_cluster_fresh_function.inc test_cluster_fresh_fdw.inc \
-		test_cluster_fresh_foreign_server.inc test_cluster_fresh_user_mapping.inc \
+		test_cluster_fresh_foreign_table_create.inc test_cluster_fresh_foreign_server.inc test_cluster_fresh_user_mapping.inc \
 		test_cluster_fresh_statistics_alter.inc test_cluster_fresh_statistics_create.inc test_cluster_fresh_operator.inc \
 		test_cluster_fresh_opclass.inc test_cluster_fresh_aggregate.inc test_cluster_fresh_tsearch.inc \
 		test_cluster_fresh_publication.inc test_cluster_fresh_publication_owner.inc test_cluster_fresh_foreign_owner.inc test_cluster_fresh_subscription_owner.inc test_cluster_fresh_rule_rename.inc test_cluster_fresh_trigger_rename.inc test_cluster_fresh_tablespace_options.inc test_cluster_fresh_column_rename.inc test_cluster_fresh_relation_rename.inc test_cluster_fresh_constraint_rename.inc test_cluster_fresh_table_namespace.inc test_cluster_fresh_vacuum_scope.inc test_cluster_fresh_tablespace_move_scope.inc test_cluster_fresh_tablespace_rename.inc test_cluster_fresh_tablespace_create_scope.inc test_cluster_fresh_tablespace_drop_scope.inc test_cluster_fresh_cluster_scope.inc test_cluster_fresh_matview_scope.inc test_cluster_fresh_domain_constraint_entry.inc test_cluster_fresh_domain_constraint_rebuild.inc test_cluster_fresh_domain_alter_scope.inc test_cluster_fresh_type_factory_scope.inc test_cluster_fresh_type_creation_scope.inc test_cluster_fresh_enum_scope.inc test_cluster_fresh_type_mutation_scope.inc test_cluster_fresh_type_scope.inc test_cluster_fresh_database_settings.inc test_cluster_fresh_database_identity.inc test_cluster_fresh_database_options.inc \
@@ -6952,7 +6959,7 @@ clean distclean maintainer-clean:
 		test_cluster_fresh_policy.inc test_cluster_fresh_conversion.inc test_cluster_fresh_collation.inc \
 		test_cluster_fresh_event_trigger.inc test_cluster_fresh_owner.inc test_cluster_fresh_object_depends.inc test_cluster_fresh_acl_grant.inc test_cluster_fresh_default_privileges.inc test_cluster_fresh_rename_tag.inc test_cluster_fresh_rename_dispatch.inc test_cluster_fresh_schema_dispatch.inc test_cluster_fresh_language.inc \
 		test_cluster_fresh_access_method.inc test_cluster_fresh_function.inc test_cluster_fresh_fdw.inc \
-		test_cluster_fresh_foreign_server.inc test_cluster_fresh_user_mapping.inc \
+		test_cluster_fresh_foreign_table_create.inc test_cluster_fresh_foreign_server.inc test_cluster_fresh_user_mapping.inc \
 		test_cluster_fresh_statistics_alter.inc test_cluster_fresh_statistics_create.inc test_cluster_fresh_operator.inc \
 		test_cluster_fresh_opclass.inc test_cluster_fresh_aggregate.inc test_cluster_fresh_tsearch.inc \
 		test_cluster_fresh_publication.inc test_cluster_fresh_publication_owner.inc test_cluster_fresh_foreign_owner.inc test_cluster_fresh_subscription_owner.inc test_cluster_fresh_rule_rename.inc test_cluster_fresh_trigger_rename.inc test_cluster_fresh_tablespace_options.inc test_cluster_fresh_column_rename.inc test_cluster_fresh_relation_rename.inc test_cluster_fresh_constraint_rename.inc test_cluster_fresh_table_namespace.inc test_cluster_fresh_vacuum_scope.inc test_cluster_fresh_tablespace_move_scope.inc test_cluster_fresh_tablespace_rename.inc test_cluster_fresh_tablespace_create_scope.inc test_cluster_fresh_tablespace_drop_scope.inc test_cluster_fresh_cluster_scope.inc test_cluster_fresh_matview_scope.inc test_cluster_fresh_domain_constraint_entry.inc test_cluster_fresh_domain_constraint_rebuild.inc test_cluster_fresh_domain_alter_scope.inc test_cluster_fresh_type_factory_scope.inc test_cluster_fresh_type_creation_scope.inc test_cluster_fresh_enum_scope.inc test_cluster_fresh_type_mutation_scope.inc test_cluster_fresh_type_scope.inc test_cluster_fresh_database_settings.inc test_cluster_fresh_database_identity.inc test_cluster_fresh_database_options.inc \

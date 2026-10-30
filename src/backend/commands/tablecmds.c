@@ -716,7 +716,7 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 #ifdef USE_PGRAC_CLUSTER
 	/* Native table creation must bind before its first namespace lock.
 	 * Other relation kinds retain their existing caller preflight. */
-	if (relkind == RELKIND_RELATION) {
+	if (relkind == RELKIND_RELATION || relkind == RELKIND_FOREIGN_TABLE) {
 		CheckClusterSharedUtilitySupport((Node *)stmt, false);
 		CheckClusterIndexSupport((Node *)stmt);
 		if (cluster_shared_catalog && cluster_storage_mode_enabled()) {

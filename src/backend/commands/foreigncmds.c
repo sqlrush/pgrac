@@ -1543,6 +1543,12 @@ CreateForeignTable(CreateForeignTableStmt *stmt, Oid relid)
 	ForeignDataWrapper *fdw;
 	ForeignServer *server;
 
+#ifdef USE_PGRAC_CLUSTER
+	CheckClusterSharedUtilitySupport((Node *)stmt, false);
+	CheckClusterIndexSupport((Node *)stmt);
+	PreflightClusterSharedFdwWrite((Node *)stmt, false);
+#endif
+
 	/*
 	 * Advance command counter to ensure the pg_attribute tuple is visible;
 	 * the tuple might be updated to add constraints in previous step.

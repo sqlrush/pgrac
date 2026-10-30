@@ -41,6 +41,7 @@
 #include "catalog/pg_extension.h"
 #include "catalog/pg_foreign_data_wrapper.h"
 #include "catalog/pg_foreign_server.h"
+#include "catalog/pg_foreign_table.h"
 #include "catalog/pg_language.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_opclass.h"
@@ -6291,9 +6292,14 @@ ProcessUtility(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree,
 	pfree(pstmt);
 }
 
+static bool foreign_table_create_active;
+static void foreign_table_creation_boundary(void);
+
 void
 CommandCounterIncrement(void)
 {
+	if (foreign_table_create_active)
+		foreign_table_creation_boundary();
 	import_ccis++;
 }
 
@@ -23356,6 +23362,7 @@ UT_TEST(test_native_relation_create_other_kinds_keep_caller_responsibility)
 	for (unsigned kind = 0; kind < lengthof(kinds); kind++) {
 		for (unsigned mode = 0; mode < 8; mode++) {
 			for (unsigned warm = 0; warm < 2; warm++) {
+				bool preflight = kinds[kind] == RELKIND_FOREIGN_TABLE && (mode == 3 || mode == 7);
 				int caught;
 
 				reset_native_relation_create(false, 0);
@@ -23369,9 +23376,9 @@ UT_TEST(test_native_relation_create_other_kinds_keep_caller_responsibility)
 				caught = sigsetjmp(boundary, 1);
 				if (!caught)
 					native_relation_create_entry();
-				UT_ASSERT_EQ(caught, 2);
-				UT_ASSERT_EQ(error_code, 0);
-				UT_ASSERT_EQ(relation_create_lookups, 1);
+				UT_ASSERT_EQ(caught, preflight ? 1 : 2);
+				UT_ASSERT_EQ(error_code, preflight ? ERRCODE_READ_ONLY_SQL_TRANSACTION : 0);
+				UT_ASSERT_EQ(relation_create_lookups, preflight ? 0 : 1);
 				UT_ASSERT_EQ(relation_create_unbound + relation_create_bad_lookup, 0);
 				UT_ASSERT_EQ(utility_xids, warm);
 				UT_ASSERT_EQ(utility_prepares, warm);
@@ -24747,10 +24754,375 @@ UT_TEST(test_native_domain_constraint_actual_rebuild_case_keeps_original_entry)
 	domain_alter_scope_lookup_active = false;
 }
 
+/* Execute both real foreign-table creation prefixes. The namespace and CCI
+ * boundaries never supply catalog, command-counter or lock success. */
+#include "test_cluster_fresh_foreign_table_create.inc"
+static CreateForeignTableStmt foreign_table_create_statement, foreign_table_create_before;
+static DefElem foreign_table_create_option;
+static String foreign_table_create_option_value;
+static List foreign_table_create_options;
+static ListCell foreign_table_create_option_cell;
+static unsigned char foreign_table_create_options_before[sizeof(List)];
+static unsigned foreign_table_create_route, foreign_table_create_ccis, foreign_table_create_unbound;
+static const bool foreign_table_create_binds[8]
+	= { false, false, false, true, false, false, false, true };
+static const bool foreign_table_create_shared[8]
+	= { false, true, false, true, true, true, true, true };
+static PartitionBoundSpec foreign_table_create_partition_bound;
+
+static void
+foreign_table_creation_boundary(void)
+{
+	foreign_table_create_ccis++;
+	if (!foreign_table_create_active || foreign_table_create_route != 1
+		|| (relation_create_expect_binding
+			&& (utility_binds == 0 || !TransactionIdIsValid(utility_top_xid)
+				|| utility_current_xid != utility_top_xid)))
+		foreign_table_create_unbound++;
+	siglongjmp(boundary, 2); /* Stop before command-counter or catalog work. */
+}
+
+static void
+snapshot_native_foreign_table_create(void)
+{
+	snapshot_native_relation_create();
+	foreign_table_create_before = foreign_table_create_statement;
+	memcpy(foreign_table_create_options_before, &foreign_table_create_options, sizeof(List));
+}
+
+static void
+reset_native_foreign_table_create(bool expect_binding, unsigned form)
+{
+	reset_native_relation_create(expect_binding, form);
+	relation_create_case.statement.partspec = NULL;
+	relation_create_case.relkind = RELKIND_FOREIGN_TABLE;
+	relation_create_query
+		= (form & 16) ? "CREATE FOREIGN TABLE foreign_target (id int) SERVER target" : NULL;
+	foreign_table_create_option_value = (String){ .type = T_String, .sval = "remote_table" };
+	foreign_table_create_option = (DefElem){ .type = T_DefElem,
+											 .defname = "table_name",
+											 .arg = (Node *)&foreign_table_create_option_value,
+											 .location = -1 };
+	one_element(&foreign_table_create_options, &foreign_table_create_option_cell,
+				&foreign_table_create_option);
+	foreign_table_create_statement
+		= (CreateForeignTableStmt){ .base = relation_create_case.statement,
+									.servername = (form & 2) ? "other_server" : "target_server",
+									.options = (form & 2) ? &foreign_table_create_options : NIL };
+	foreign_table_create_statement.base.type = T_CreateForeignTableStmt;
+	relation_create_expected_statement = (Node *)&foreign_table_create_statement;
+	foreign_table_create_active = false;
+	foreign_table_create_ccis = foreign_table_create_unbound = 0;
+	import_ccis = 0;
+	snapshot_native_foreign_table_create();
+}
+
+static void
+native_foreign_table_create_entry(unsigned route)
+{
+	foreign_table_create_route = route;
+	foreign_table_create_active = route == 1;
+	relation_create_lookup_active = route == 0;
+	if (route == 0)
+		(void)DefineRelation(&foreign_table_create_statement.base, RELKIND_FOREIGN_TABLE,
+							 relation_create_case.owner_id, relation_create_type_address,
+							 relation_create_query);
+	else
+		CreateForeignTable(&foreign_table_create_statement, 1234);
+}
+
+static void
+assert_foreign_table_create_boundary(unsigned route, unsigned visits)
+{
+	UT_ASSERT_EQ(relation_create_lookups, route == 0 ? visits : 0);
+	UT_ASSERT_EQ(foreign_table_create_ccis, route == 1 ? visits : 0);
+	UT_ASSERT_EQ(
+		relation_create_unbound + relation_create_bad_lookup + foreign_table_create_unbound, 0);
+	UT_ASSERT_EQ(import_ccis, 0);
+	assert_native_relation_create_unchanged();
+	UT_ASSERT_EQ(memcmp(&foreign_table_create_statement, &foreign_table_create_before,
+						sizeof(foreign_table_create_statement)),
+				 0);
+	UT_ASSERT_EQ(
+		memcmp(&foreign_table_create_options, foreign_table_create_options_before, sizeof(List)),
+		0);
+}
+
+static void
+finish_native_foreign_table_create(void)
+{
+	foreign_table_create_active = relation_create_lookup_active = false;
+}
+
+UT_TEST(test_native_foreign_table_both_entries_bind_before_first_dependency)
+{
+	for (unsigned route = 0; route < 2; route++) {
+		for (unsigned form = 0; form < 32; form++) {
+			for (unsigned mode = 0; mode < 8; mode++) {
+				bool binds = foreign_table_create_binds[mode];
+
+				reset_native_foreign_table_create(binds, form);
+				set_native_operator_mode(mode);
+				for (unsigned repeat = 0; repeat < 2; repeat++) {
+					int caught = sigsetjmp(boundary, 1);
+
+					if (!caught)
+						native_foreign_table_create_entry(route);
+					UT_ASSERT_EQ(caught, 2);
+					UT_ASSERT_EQ(error_code, 0);
+					assert_foreign_table_create_boundary(route, repeat + 1);
+					UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+					UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+					UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+					UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+				}
+			}
+		}
+	}
+	finish_native_foreign_table_create();
+}
+
+UT_TEST(test_native_foreign_table_publication_child_and_top_refuse_before_dependency)
+{
+	for (unsigned route = 0; route < 2; route++) {
+		for (unsigned form = 0; form < 32; form++) {
+			for (unsigned mode = 0; mode < 8; mode++) {
+				for (unsigned fault = 0; fault < 5; fault++) {
+					bool binds = foreign_table_create_binds[mode];
+					bool warm = fault == 4;
+					int caught;
+
+					reset_native_foreign_table_create(binds, form);
+					if (warm)
+						create_sql_entry((Node *)&foreign_table_create_statement);
+					set_native_operator_mode(mode);
+					utility_bind_ok = fault != 0;
+					utility_in_child = fault == 1 || warm;
+					if (fault == 2 || fault == 3) {
+						utility_current_xid = 401;
+						utility_top_xid = fault == 2 ? 400 : InvalidTransactionId;
+					}
+					caught = sigsetjmp(boundary, 1);
+					if (!caught)
+						native_foreign_table_create_entry(route);
+					UT_ASSERT_EQ(caught, binds ? 1 : 2);
+					UT_ASSERT_EQ(error_code, !binds		  ? 0
+											 : fault == 0 ? ERRCODE_DATA_CORRUPTED
+											 : fault == 2 || fault == 3
+												 ? ERRCODE_INTERNAL_ERROR
+												 : ERRCODE_FEATURE_NOT_SUPPORTED);
+					if (binds)
+						UT_ASSERT_STR_EQ(
+							error_message,
+							fault == 0 ? "canonical ACTIVE publication failed before shared "
+										 "catalog creation"
+							: fault == 2 || fault == 3
+								? "shared catalog top-level transaction identity mismatch"
+								: "shared catalog creation does not support subtransactions");
+					assert_foreign_table_create_boundary(route, binds ? 0 : 1);
+					UT_ASSERT_EQ(utility_binds, warm ? 1 : 0);
+					UT_ASSERT_EQ(utility_prepares, warm || (binds && fault == 0) ? 1 : 0);
+					UT_ASSERT_EQ(utility_xids, warm || (binds && fault == 0) ? 1 : 0);
+					UT_ASSERT_EQ(utility_top_xid, warm || fault == 2 || (binds && fault == 0)
+													  ? 400
+													  : InvalidTransactionId);
+					UT_ASSERT_EQ(utility_current_xid, fault == 2 || fault == 3 ? 401
+													  : warm || (binds && fault == 0)
+														  ? 400
+														  : InvalidTransactionId);
+				}
+			}
+		}
+	}
+	finish_native_foreign_table_create();
+}
+
+UT_TEST(test_native_foreign_table_context_guards_preserve_other_modes)
+{
+	for (unsigned route = 0; route < 2; route++) {
+		for (unsigned form = 0; form < 32; form++) {
+			for (unsigned mode = 0; mode < 8; mode++) {
+				for (unsigned guard = 0; guard < 3; guard++) {
+					bool blocked = foreign_table_create_binds[mode];
+					const char *command = route == 0 ? "CREATE TABLE" : "CREATE FOREIGN TABLE";
+					int caught;
+
+					reset_native_foreign_table_create(blocked, form);
+					set_native_operator_mode(mode);
+					XactReadOnly = guard == 0;
+					utility_parallel = guard == 1;
+					utility_recovery = guard == 2;
+					caught = sigsetjmp(boundary, 1);
+					if (!caught)
+						native_foreign_table_create_entry(route);
+					UT_ASSERT_EQ(caught, blocked ? 1 : 2);
+					UT_ASSERT_EQ(error_code, !blocked	  ? 0
+											 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+														  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+					if (blocked) {
+						char expected[128];
+
+						snprintf(expected, sizeof(expected),
+								 guard == 0	  ? "cannot execute %s in a read-only transaction"
+								 : guard == 1 ? "cannot execute %s during a parallel operation"
+											  : "cannot execute %s during recovery",
+								 command);
+						UT_ASSERT_STR_EQ(error_message, expected);
+					}
+					assert_foreign_table_create_boundary(route, blocked ? 0 : 1);
+					UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+				}
+			}
+		}
+	}
+	finish_native_foreign_table_create();
+}
+
+UT_TEST(test_native_foreign_table_reuses_utility_or_root_binding_and_context_guards)
+{
+	for (unsigned route = 0; route < 2; route++) {
+		for (unsigned form = 0; form < 32; form++) {
+			for (unsigned mode = 0; mode < 8; mode++) {
+				for (unsigned via_root = 0; via_root < 2; via_root++) {
+					for (unsigned guard = 0; guard < 4; guard++) {
+						bool binds = foreign_table_create_binds[mode];
+						bool blocked = binds && guard != 0;
+						int caught;
+
+						reset_native_foreign_table_create(true, form);
+						if (via_root) {
+							caught = sigsetjmp(boundary, 1);
+							if (!caught)
+								native_foreign_table_create_entry(0);
+							UT_ASSERT_EQ(caught, 2);
+							assert_foreign_table_create_boundary(0, 1);
+							relation_create_lookups = 0;
+						} else
+							create_sql_entry((Node *)&foreign_table_create_statement);
+						UT_ASSERT_EQ(utility_xids, 1);
+						UT_ASSERT_EQ(utility_prepares, 1);
+						UT_ASSERT_EQ(utility_binds, 1);
+						reset_error();
+						set_native_operator_mode(mode);
+						relation_create_expect_binding = binds;
+						XactReadOnly = guard == 1;
+						utility_parallel = guard == 2;
+						utility_recovery = guard == 3;
+						caught = sigsetjmp(boundary, 1);
+						if (!caught)
+							native_foreign_table_create_entry(route);
+						UT_ASSERT_EQ(caught, blocked ? 1 : 2);
+						UT_ASSERT_EQ(error_code, !blocked	  ? 0
+												 : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+															  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+						assert_foreign_table_create_boundary(route, blocked ? 0 : 1);
+						UT_ASSERT_EQ(utility_xids, 1);
+						UT_ASSERT_EQ(utility_prepares, binds && !blocked ? 2 : 1);
+						UT_ASSERT_EQ(utility_binds, 1);
+						UT_ASSERT_EQ(utility_top_xid, 400);
+						UT_ASSERT_EQ(utility_current_xid, 400);
+					}
+				}
+			}
+		}
+	}
+	finish_native_foreign_table_create();
+}
+
+static void
+set_unsupported_foreign_table_creation(unsigned kind)
+{
+	set_unsupported_relation_creation(kind < 4 ? kind : 1);
+	foreign_table_create_statement.base = relation_create_case.statement;
+	foreign_table_create_statement.base.type = T_CreateForeignTableStmt;
+	if (kind == 4) {
+		foreign_table_create_partition_bound
+			= (PartitionBoundSpec){ .type = T_PartitionBoundSpec, .is_default = true };
+		foreign_table_create_statement.base.partbound = &foreign_table_create_partition_bound;
+	}
+	snapshot_native_foreign_table_create();
+}
+
+static void
+assert_denied_foreign_table_creation(unsigned route, unsigned kind, unsigned mode, int caught)
+{
+	bool refused = foreign_table_create_shared[mode];
+
+	UT_ASSERT_EQ(caught, refused ? 1 : 2);
+	UT_ASSERT_EQ(error_code, refused ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+	if (refused) {
+		UT_ASSERT_STR_EQ(
+			error_message,
+			kind == 0 ? "UNLOGGED tables is not supported in shared mode"
+			: kind == 1 || kind == 4
+				? "partition and inheritance attachment is not supported in shared mode"
+				: "shared mode supports only btree indexes");
+		UT_ASSERT_STR_EQ(error_detail,
+						 kind < 2 || kind == 4
+							 ? "PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED"
+							 : "Index access method \"hash\" is not supported in shared mode.");
+	}
+	assert_foreign_table_create_boundary(route, refused ? 0 : 1);
+}
+
+UT_TEST(test_native_foreign_table_denials_precede_context_child_and_allocation)
+{
+	for (unsigned route = 0; route < 2; route++) {
+		for (unsigned kind = 0; kind < 5; kind++) {
+			for (unsigned mode = 0; mode < 8; mode++) {
+				for (unsigned fault = 0; fault < 6; fault++) {
+					int caught;
+
+					reset_native_foreign_table_create(false, 31);
+					set_unsupported_foreign_table_creation(kind);
+					set_native_operator_mode(mode);
+					XactReadOnly = fault == 1;
+					utility_parallel = fault == 2;
+					utility_recovery = fault == 3;
+					utility_in_child = fault == 4;
+					utility_bind_ok = fault != 5;
+					caught = sigsetjmp(boundary, 1);
+					if (!caught)
+						native_foreign_table_create_entry(route);
+					assert_denied_foreign_table_creation(route, kind, mode, caught);
+					UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+				}
+			}
+		}
+	}
+	finish_native_foreign_table_create();
+}
+
+UT_TEST(test_native_foreign_table_denials_preserve_existing_binding)
+{
+	for (unsigned route = 0; route < 2; route++) {
+		for (unsigned kind = 0; kind < 5; kind++) {
+			for (unsigned mode = 0; mode < 8; mode++) {
+				int caught;
+
+				reset_native_foreign_table_create(false, 31);
+				create_sql_entry((Node *)&foreign_table_create_statement);
+				set_unsupported_foreign_table_creation(kind);
+				set_native_operator_mode(mode);
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_foreign_table_create_entry(route);
+				assert_denied_foreign_table_creation(route, kind, mode, caught);
+				UT_ASSERT_EQ(utility_xids, 1);
+				UT_ASSERT_EQ(utility_prepares, 1);
+				UT_ASSERT_EQ(utility_binds, 1);
+				UT_ASSERT_EQ(utility_top_xid, 400);
+				UT_ASSERT_EQ(utility_current_xid, 400);
+			}
+		}
+	}
+	finish_native_foreign_table_create();
+}
+
 int
 main(void)
 {
-	UT_PLAN(399);
+	UT_PLAN(405);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -25153,6 +25525,12 @@ main(void)
 	UT_RUN(test_native_domain_constraint_public_refusal_precedes_context_and_binding);
 	UT_RUN(test_native_domain_constraint_public_refusal_preserves_existing_binding);
 	UT_RUN(test_native_domain_constraint_actual_rebuild_case_keeps_original_entry);
+	UT_RUN(test_native_foreign_table_both_entries_bind_before_first_dependency);
+	UT_RUN(test_native_foreign_table_publication_child_and_top_refuse_before_dependency);
+	UT_RUN(test_native_foreign_table_context_guards_preserve_other_modes);
+	UT_RUN(test_native_foreign_table_reuses_utility_or_root_binding_and_context_guards);
+	UT_RUN(test_native_foreign_table_denials_precede_context_child_and_allocation);
+	UT_RUN(test_native_foreign_table_denials_preserve_existing_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

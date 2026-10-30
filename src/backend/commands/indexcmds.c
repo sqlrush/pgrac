@@ -124,22 +124,17 @@ CheckClusterIndexSupport(Node *statement)
 	{
 		foreach(lc, ((ColumnDef *) statement)->constraints)
 			CheckClusterIndexSupport((Node *) lfirst(lc));
-	}
-	else if (IsA(statement, CreateStmt))
-	{
+	} else if (IsA(statement, CreateStmt) || IsA(statement, CreateForeignTableStmt)) {
 		CreateStmt *create = (CreateStmt *) statement;
 
 		foreach(lc, create->tableElts)
 			CheckClusterIndexSupport((Node *) lfirst(lc));
 		foreach(lc, create->constraints)
 			CheckClusterIndexSupport((Node *) lfirst(lc));
-	}
-	else if (IsA(statement, AlterTableStmt))
-	{
+	} else if (IsA(statement, AlterTableStmt)) {
 		foreach(lc, ((AlterTableStmt *) statement)->cmds)
 			CheckClusterIndexSupport((Node *) lfirst(lc));
-	}
-	else if (IsA(statement, AlterTableCmd))
+	} else if (IsA(statement, AlterTableCmd))
 		CheckClusterIndexSupport(((AlterTableCmd *) statement)->def);
 	else if (IsA(statement, CreateSchemaStmt))
 	{
