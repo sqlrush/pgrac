@@ -373,6 +373,142 @@ def validate_deadlock(case):
                 selected=selected, authoritative=False)
 
 
+def _requalification_tid(value):
+    if not isinstance(value, str) or not re.fullmatch(r'\([0-9]+,[0-9]+\)', value):
+        raise ValueError('invalid observed tuple location')
+    block, offset = map(int, value[1:-1].split(','))
+    if block >= 2**32 or not 0 < offset < 2**16:
+        raise ValueError('observed tuple location out of range')
+    return block, offset
+
+
+def _requalification_owners(holders, expected):
+    identity = lambda h: tuple(number(h[k]) for k in ('node', 'pid', 'xid', 'row'))
+    wanted = {identity(h) for h in expected}
+    if (len(wanted) != len(expected) or len(holders) != len(wanted)
+            or {identity(h) for h in holders} != wanted
+            or any(h['state'] != 'idle in transaction' for h in holders)):
+        raise ValueError('an original owner was released, replaced or omitted')
+
+
+def validate_requalification_mutation(case):
+    """Check the owned mutator while the original exact capacity wait is live."""
+    start, kind = case['start'], case['kind']
+    selected = select_blocker(start)
+    if (len(start['holders']) != 8 or kind not in ('update', 'delete')
+            or case['sql'] != 'UPDATE m2_b06_' + kind + ' SET v=v+1 WHERE id=9;'
+            or number(case['waiter_xid']) < 3
+            or number(case['waiter_xid']) in {number(h['xid']) for h in start['holders']}
+            or number(case['mutator_pid']) != selected['pid']
+            or number(case['mutator_xid']) != selected['xid']):
+        raise ValueError('original UPDATE, mutator or transaction identity changed')
+    before, changed = case['before'], case['mutation_row']
+    old_tid, new_tid = (_requalification_tid(r['ctid']) for r in (before, changed))
+    if (len(start['tag']) != 5 or number(start['tag'][3]) != 0
+            or old_tid[0] != number(start['tag'][4]) or new_tid[0] != old_tid[0]
+            or number(before['id']) != 9 or number(before['v']) != 0
+            or number(before['xmin']) == 0 or number(before['xmax']) != 0
+            or number(changed['id']) != 9):
+        raise ValueError('original target or same-page mutation is not proved')
+    if kind == 'update':
+        if (number(changed['v']) != 10 or number(changed['xmin']) != selected['xid']
+                or number(changed['xmax']) != 0 or new_tid == old_tid):
+            raise ValueError('mutator did not produce the new target value')
+    elif (number(changed['v']) != 0 or new_tid != old_tid
+          or number(changed['xmin']) != number(before['xmin'])):
+        raise ValueError('mutator did not delete the original target')
+    reader = case['reader']
+    if (number(reader['pid']) != start['waiter_pid'] or reader['state'] != 'active'
+            or reader['query'] != case['sql'] or reader['wait_event'] != 'GesTxEnqueueWait'
+            or not case['log'].startswith(start['log'])
+            or select_blocker(dict(start, log=case['log'])) != selected):
+        raise ValueError('original exact wait ended or changed before mutation confirmation')
+    _requalification_owners(case['holders'], start['holders'])
+    return dict(kind=kind, selected=selected, authoritative=False)
+
+
+def _requalification_wait_identity(row):
+    fields = ('actor_node', 'pid', 'node', 'xid', 'epoch', 'target_known',
+              'uba_known', 'itl_wrap', 'itl_kind', 'itl_slot')
+    # Some existing traces also record the backend ProcNumber. When present,
+    # it must agree at both ends, but its absence is not an invented value.
+    proc = number(row['proc']) if 'proc' in row else None
+    return tuple(number(row.get(k)) for k in fields) + (row.get('uba0'), row.get('uba1'), proc)
+
+
+def validate_requalification_finish(case):
+    """Require the same UPDATE to recheck the changed row after exact waits."""
+    mutation = case['mutation']
+    proof = validate_requalification_mutation(mutation)
+    start, kind = mutation['start'], proof['kind']
+    reader = case['reader']
+    if (case['stdout'].strip() != 'B06_SQLSTATE 00000' or case['stderr'] != ''
+            or case['client_had_error'] is not False
+            or number(reader['pid']) != start['waiter_pid']
+            or reader['state'] != 'idle in transaction' or reader['query'] != mutation['sql']
+            or reader.get('wait_event') == 'GesTxEnqueueWait'
+            or number(case['waiter_xid']) != number(mutation['waiter_xid'])
+            or not case['log'].startswith(mutation['log'])):
+        raise ValueError('original backend and transaction did not finish the original UPDATE')
+    rows = case['rows']
+    if kind == 'update':
+        if len(rows) != 1:
+            raise ValueError('updated target row is missing or ambiguous')
+        row = rows[0]
+        tid = _requalification_tid(row['ctid'])
+        if (number(row['id']) != 9 or number(row['v']) != 11
+                or number(row['xmin']) != number(mutation['waiter_xid'])
+                or number(row['xmax']) != 0 or tid[0] != number(start['tag'][4])
+                or row['ctid'] in (mutation['before']['ctid'], mutation['mutation_row']['ctid'])):
+            raise ValueError('original UPDATE reused its stale tuple or row plan')
+    elif rows != []:
+        raise ValueError('original UPDATE did not observe the deleted target')
+    waits = case['waits']
+    if not 1 <= len(waits) <= 8 or waits[0] != start:
+        raise ValueError('original wait or bounded owner decisions are missing')
+    remaining = list(start['holders'])
+    decisions = []
+    for current in waits:
+        if (current['holders'] != remaining or current['tag'] != start['tag']
+                or current['waiter_pid'] != start['waiter_pid']
+                or current['waiter_node'] != start['waiter_node']
+                or not case['log'].startswith(current['log'])):
+            raise ValueError('a later owner decision changed the original waiter or registry')
+        selected = select_blocker(current)
+        raw = _deadlock_wait_rows(current['log'], start['waiter_pid'], start['waiter_node'])
+        target = raw[-1][0]
+        decisions.append((number(target['seq']), number(target['wait_seq']),
+                          _requalification_wait_identity(target)))
+        remaining = [h for h in remaining if h['pid'] != selected['pid']]
+    _requalification_owners(case['remaining'], remaining)
+    raw = _deadlock_wait_rows(case['log'], start['waiter_pid'], start['waiter_node'])
+    if len(raw) % 2 or len(raw) < 2 * len(decisions):
+        raise ValueError('an exact capacity wait has no unique completion')
+    expected = iter(decisions)
+    decision = next(expected, None)
+    confirmed = set()
+    registration = 0
+    for index in range(0, len(raw), 2):
+        target, end = raw[index][0], raw[index + 1][0]
+        identity = _requalification_wait_identity(target)
+        current = (number(target['seq']), number(target['wait_seq']), identity)
+        if (target['event'] != 'WAIT_TARGET' or end['event'] != 'WAIT_END'
+                or number(target['wait_seq']) <= registration
+                or number(end['wait_seq']) != number(target['wait_seq'])
+                or _requalification_wait_identity(end) != identity or number(end['status']) != 0):
+            raise ValueError('an original exact wait failed, changed or reused its registration')
+        registration = number(target['wait_seq'])
+        if current == decision:
+            confirmed.add(identity)
+            decision = next(expected, None)
+        elif identity not in confirmed:
+            raise ValueError('a later capacity wait has no raw exact owner decision')
+    if decision is not None:
+        raise ValueError('an owner was released without its observed wait completing')
+    return dict(kind=kind, selected=proof['selected'], completed_waits=len(raw) // 2,
+                released_owners=len(decisions), authoritative=False)
+
+
 if __name__ == '__main__':
     try:
         case = json.load(sys.stdin)
@@ -382,6 +518,10 @@ if __name__ == '__main__':
             print(json.dumps(dict(selected=select_page_owner(case))))
         elif sys.argv[1:] == ['--deadlock']:
             print(json.dumps(dict(deadlock=validate_deadlock(case))))
+        elif sys.argv[1:] == ['--requalify-mutation']:
+            print(json.dumps(dict(mutation=validate_requalification_mutation(case))))
+        elif sys.argv[1:] == ['--requalify']:
+            print(json.dumps(dict(requalified=validate_requalification_finish(case))))
         elif not sys.argv[1:]:
             print(json.dumps(dict(selected=select_blocker(case))))
         else:
