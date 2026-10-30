@@ -10571,6 +10571,168 @@ gcs_block_resource_x_observation_pause(void)
 	pg_usleep((long)Max(cluster_gcs_block_retransmit_initial_backoff_ms, 1) * 1000L);
 }
 
+/* Ordinary first-fill request driver. No requester rearm or retry outcome.
+ * The existing master owns the request after the single ring handoff. */
+static bool gcs_block_resource_x_target_peer_matches_exact(
+	const ClusterSemanticAdmissionToken *admission, int32 peer_node, uint32 connection);
+static ResourceXApplyResult gcs_block_resource_x_target_peer_result_exact(
+	const ClusterSemanticAdmissionToken *admission, int32 peer_node, uint32 connection);
+
+static ResourceXApplyResult
+gcs_block_first_fill_current(ClusterGcsFirstFill *fill)
+{
+	ResourceXApplyResult result;
+	uint32 requester = 0, master = 0;
+
+	if (!cluster_semantic_activation_recheck(&fill->admission))
+		return RESOURCE_X_APPLY_STALE;
+	result = gcs_block_resource_x_gate_session_recheck_result(
+		&fill->prepared.common.logical_assertion.resource, &fill->gate,
+		fill->master_node, fill->master_session);
+	if (result != RESOURCE_X_APPLY_APPLIED)
+		return result;
+	if (!gcs_block_pcm_x_resource_x_peer_ready_exact(fill->master_node, &requester)
+		|| !gcs_block_pcm_x_resource_x_peer_ready_exact(fill->master_node, &master))
+		return RESOURCE_X_APPLY_BAD_STATE; /* Observation unavailable: retain E. */
+	if (requester != fill->requester_connection || master != fill->master_connection)
+		return RESOURCE_X_APPLY_STALE;
+	return gcs_block_resource_x_target_peer_result_exact(
+		&fill->admission, fill->master_node, master);
+}
+
+ResourceXApplyResult
+cluster_gcs_block_first_fill_begin(BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
+	uint64 token, ClusterGcsFirstFill *fill)
+{
+	ResourceXAssertion assertion;
+	ResourceXAcquisitionRef unused;
+	ResourceXBootstrapRoundAction action;
+	ResourceXApplyResult result;
+	ClusterLmsEnqueueResult sent;
+	PcmXSessionAuthResult session;
+	uint64 now, slice, diagnostic_budget;
+
+	if (buf == NULL || base == NULL || fill == NULL
+		|| fill->admission.entered || fill->round_prepared || fill->preparing)
+		return RESOURCE_X_APPLY_INVALID;
+	if (cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1,
+		CLUSTER_SEMANTIC_TARGET_SIDE, &fill->admission) != CLUSTER_SEMANTIC_ADMISSION_OK)
+		return RESOURCE_X_APPLY_BAD_STATE;
+	/* No protocol producer has run yet. Unavailable membership/session/peer
+	 * observations are local backpressure, without a transaction deadline. */
+	for (;;) {
+		if (!cluster_semantic_activation_recheck(&fill->admission))
+			return RESOURCE_X_APPLY_STALE;
+		memset(&fill->gate, 0, sizeof(fill->gate));
+		session = gcs_block_resource_x_gate_session_snapshot_result(&base->tag,
+			&fill->gate, &fill->master_node, &fill->master_session);
+		if (session != PCM_X_SESSION_AUTH_OK) {
+			if (!cluster_gcs_pcm_x_auth_result_retryable(session))
+				return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		} else if (gcs_block_pcm_x_resource_x_peer_ready_exact(fill->master_node, &fill->requester_connection)
+			&& gcs_block_pcm_x_resource_x_peer_ready_exact(fill->master_node, &fill->master_connection)
+			&& gcs_block_resource_x_target_peer_matches_exact(&fill->admission,
+				fill->master_node, fill->master_connection))
+			break;
+		gcs_block_resource_x_observation_pause();
+	}
+	if (cluster_bufmgr_pcm_own_acquire_intent_exact(buf, base, token,
+		RESOURCE_X_ACQUIRE_FIRST_FILL, &fill->admission, NULL, &fill->episode) != CLUSTER_PCM_OWN_OK
+		|| !resource_x_assertion_init(&base->tag, cluster_node_id, &assertion))
+		return RESOURCE_X_APPLY_STALE;
+	/* Preparing the original round allocates no wire or authority. Old
+	 * diagnostic timestamps are retained, but never consumed as a timeout. */
+	for (;;) {
+		fill->prepared.common.logical_assertion = assertion;
+		result = gcs_block_first_fill_current(fill);
+		if (result == RESOURCE_X_APPLY_BAD_STATE) {
+			gcs_block_resource_x_observation_pause();
+			continue;
+		}
+		if (result != RESOURCE_X_APPLY_APPLIED)
+			return result;
+		now = gcs_block_pcm_x_monotonic_us();
+		slice = (uint64)Max(cluster_gcs_block_retransmit_initial_backoff_ms, 1) * UINT64_C(1000);
+		diagnostic_budget = gcs_block_pcm_x_retry_timeout_us();
+		if (now == 0 || now == UINT64_MAX || diagnostic_budget == 0
+			|| now >= UINT64_MAX - diagnostic_budget)
+			return RESOURCE_X_APPLY_INVALID;
+		fill->preparing = true;
+		action = cluster_pcm_lock_resource_x_bootstrap_round_step_exact(&assertion,
+			fill->master_node, fill->gate.formation, fill->master_session,
+			fill->admission.record_generation, fill->requester_connection, fill->master_connection,
+			now + diagnostic_budget, diagnostic_budget, now, slice, false, 0, &fill->prepared, &unused);
+		if (action == RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST)
+			fill->round_prepared = true;
+		fill->preparing = false;
+		if (fill->round_prepared)
+			break;
+		if (action != RESOURCE_X_BOOTSTRAP_ROUND_WAIT
+			&& action != RESOURCE_X_BOOTSTRAP_ROUND_PREDECESSOR_WAIT
+			&& action != RESOURCE_X_BOOTSTRAP_ROUND_BACKPRESSURE)
+			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		/* No request from this E exists while an earlier resource owner is
+		 * completing. Observe the same domain again; never consume its grant. */
+		gcs_block_resource_x_observation_pause();
+	}
+	result = cluster_pcm_lock_resource_x_install_claim_join_observe_exact(&assertion,
+		fill->master_node, fill->gate.formation, fill->master_session,
+		fill->admission.record_generation, fill->requester_connection, fill->master_connection,
+		&fill->observation);
+	if (result != RESOURCE_X_APPLY_APPLIED)
+		return result;
+	/* All capacity sleep/revalidation and the atomic full-E/ring takeover
+	 * remain in the original sender. This call is made exactly once. */
+	sent = cluster_lms_outbound_enqueue_resource_x_acquire(fill->master_node, &fill->prepared,
+		buf, base, token, RESOURCE_X_ACQUIRE_FIRST_FILL, PCM_STATE_S, &fill->admission);
+	if (sent != CLUSTER_LMS_ENQUEUE_ADMITTED)
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	return cluster_pcm_lock_resource_x_install_claim_join_observe_exact(&assertion,
+		fill->master_node, fill->gate.formation, fill->master_session,
+		fill->admission.record_generation, fill->requester_connection, fill->master_connection,
+		&fill->observation);
+}
+
+ResourceXApplyResult
+cluster_gcs_block_first_fill_wait(ClusterGcsFirstFill *fill)
+{
+	ResourceXApplyResult result;
+
+	if (fill == NULL || !fill->round_prepared || !fill->admission.entered)
+		return RESOURCE_X_APPLY_INVALID;
+	for (;;) {
+		result = gcs_block_first_fill_current(fill);
+		if (result == RESOURCE_X_APPLY_BAD_STATE) {
+			gcs_block_resource_x_observation_pause();
+			continue;
+		}
+		if (result != RESOURCE_X_APPLY_APPLIED)
+			return result;
+		result = cluster_pcm_lock_resource_x_requester_acquire_wait_exact(
+			&fill->observation, &fill->episode);
+		if (result == RESOURCE_X_APPLY_APPLIED) {
+			/* A wakeup is not a session/transport witness. Recheck after
+			 * completion, before the caller can claim physical execution. */
+			result = gcs_block_first_fill_current(fill);
+			if (result == RESOURCE_X_APPLY_BAD_STATE) {
+				gcs_block_resource_x_observation_pause();
+				continue;
+			}
+			return result;
+		}
+		if (result != RESOURCE_X_APPLY_NOT_FOUND)
+			return result;
+	}
+}
+
+void
+cluster_gcs_block_first_fill_end(ClusterGcsFirstFill *fill)
+{
+	if (fill != NULL && fill->admission.entered)
+		cluster_semantic_activation_leave(&fill->admission);
+}
+/* End ordinary first-fill request driver. */
+
 static void
 gcs_block_resource_x_fail_closed_current(void)
 {

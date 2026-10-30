@@ -1753,6 +1753,16 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_wait_o
 	const ResourceXInstallClaimJoinObservation *observation,
 	const ResourceXDecodedAcquireIntent *episode, ResourceXDeliveryClaim *out,
 	ResourceXAcquireReadReceipt *receipt);
+/* APPLIED retires only an original unsent round. DUPLICATE retains the
+ * handed-off full E and returns its actual observation for exact cancel. */
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_first_fill_retire_unsent_exact(
+	const ResourceXInstallClaimJoinObservation *prepared,
+	const ResourceXDecodedAcquireIntent *episode, ResourceXInstallClaimJoinObservation *issued);
+/* One local interruptible CV slice. NOT_FOUND means incomplete material,
+ * never requester retry, a new attempt, or permission to read bytes. */
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_wait_exact(
+	const ResourceXInstallClaimJoinObservation *observation,
+	const ResourceXDecodedAcquireIntent *episode);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_wait_seal_exact(
 	const ResourceXInstallClaimJoinObservation *observation,
 	const ResourceXDecodedAcquireIntent *episode, uint64 write_io_generation,

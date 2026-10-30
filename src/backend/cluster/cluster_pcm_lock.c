@@ -30119,6 +30119,171 @@ cluster_pcm_lock_resource_x_requester_acquire_frames_exact(
 	return result;
 }
 
+/* Cancel before the ring's atomic ownership handoff. A full E may have
+ * appeared inside an ERROR-capable enqueue; it must use its own existing
+ * cancellation owner instead. No native IO is inferred from this result. */
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_first_fill_retire_unsent_exact(
+	const ResourceXInstallClaimJoinObservation *prepared,
+	const ResourceXDecodedAcquireIntent *episode, ResourceXInstallClaimJoinObservation *issued)
+{
+	PcmEntryRef ref;
+	PcmEntryAcquireResult acquired;
+	ClusterPcmResourceXBootstrapRound *round;
+	ClusterPcmResourceXMasterState *state;
+	ResourceXDecodedCommon expected;
+	ResourceXApplyResult result = RESOURCE_X_APPLY_STALE;
+	static const ClusterPcmResourceXRequesterSend empty_send;
+	static const ResourceXDecodedCommon empty_common;
+	static const ResourceXAcquisitionRef empty_ref;
+	static const ResourceXDeliveryTarget empty_target;
+
+	if (prepared == NULL || episode == NULL || issued == NULL
+		|| !resource_x_assertion_valid(&prepared->request.logical_assertion)
+		|| prepared->request.logical_assertion.requester_node != cluster_node_id
+		|| prepared->entry_binding_generation == 0
+		|| prepared->entry_binding_generation == UINT64_MAX
+		|| episode->path != RESOURCE_X_ACQUIRE_FIRST_FILL)
+		return RESOURCE_X_APPLY_INVALID;
+	expected = prepared->request;
+	expected.observed_mode = PCM_STATE_N;
+	expected.target_mode = PCM_STATE_S;
+	expected.flags = 0;
+	if (!pcm_resource_x_acquire_identity_valid(&expected, episode, prepared->r4_record_generation))
+		return RESOURCE_X_APPLY_INVALID;
+	if (!pcm_entry_ref_acquire(&expected.logical_assertion.resource, false, &ref, &acquired))
+		return RESOURCE_X_APPLY_NOT_FOUND;
+	pcm_entry_lock_exclusive(ref.entry);
+	round = &ref.entry->resource_x_bootstrap_round;
+	state = pcm_resource_x_master_state_for_entry(ref.entry);
+	if (!pcm_resource_x_requester_acquire_valid_locked(round)
+		|| !pcm_resource_x_install_claim_valid_locked(round)
+		|| !pcm_resource_x_local_owner_valid_locked(&ref.entry->resource_x_local_owner)) {
+		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		goto done;
+	}
+	if (ref.binding_generation != prepared->entry_binding_generation
+		|| !pcm_resource_x_node_request_key_matches_locked(round,
+			&expected.logical_assertion, prepared->master_node, expected.resource_formation,
+			expected.master_session_incarnation, prepared->r4_record_generation,
+			expected.sender_connection_generation, prepared->master_ingress_connection_generation)
+		|| round->phase != RESOURCE_X_BOOTSTRAP_ROUND_REQUEST_DISPATCHED
+		|| round->request.assertion_sequence != prepared->request.assertion_sequence
+		|| round->request.assertion_sequence != round->highest_attempt_floor
+		|| round->failed_attempt_floor >= round->request.assertion_sequence
+		|| round->cancelled_attempt_floor > round->request.assertion_sequence)
+		goto done;
+	if (round->has_acquire_intent) {
+		/* The wire encoder seals its CRC while the ring takes E. All other
+		 * common fields must still be the original prepared request. */
+		expected.semantic_crc32c = round->request.semantic_crc32c;
+		if (!pcm_resource_x_common_equal(&expected, &round->request)
+			|| !pcm_resource_x_acquire_identity_equal(episode, &round->acquire_intent))
+			goto done;
+		*issued = *prepared;
+		issued->request = round->request;
+		result = RESOURCE_X_APPLY_DUPLICATE;
+		goto done;
+	}
+	if (!pcm_resource_x_common_equal(&prepared->request, &round->request)
+		|| state == NULL || !pcm_resource_x_requester_join_empty_locked(&state->requester_join)
+		|| memcmp(&round->send, &empty_send, sizeof(empty_send)) != 0
+		|| round->accepted_base != 0 || round->terminal_authority_generation != 0
+		|| round->cached_ownership_generation != 0 || round->head_failure_reason != 0
+		|| round->delivery_executor_sequence != 0 || round->delivery_executor_purpose != 0
+		|| memcmp(&round->delivery_target, &empty_target, sizeof(empty_target)) != 0
+		|| memcmp(&round->ack, &empty_common, sizeof(empty_common)) != 0
+		|| memcmp(&round->assertion, &empty_common, sizeof(empty_common)) != 0
+		|| memcmp(&round->terminal_ref, &empty_ref, sizeof(empty_ref)) != 0
+		|| round->install_claim_source != RESOURCE_X_INSTALL_CLAIM_NONE
+		|| !pcm_resource_x_active_empty_locked(ref.entry)
+		|| ref.entry->resource_x_local_owner.state != RESOURCE_X_LOCAL_OWNER_EMPTY) {
+		result = RESOURCE_X_APPLY_BAD_STATE;
+		goto done;
+	}
+	pcm_resource_x_semantic_mutation_mark();
+	round->cancelled_attempt_floor = Max(round->cancelled_attempt_floor, round->request.assertion_sequence);
+	pcm_resource_x_bootstrap_round_clear_binding_locked(round);
+	ConditionVariableBroadcast(&ref.entry->wait_cv);
+	result = RESOURCE_X_APPLY_APPLIED;
+done:
+	LWLockRelease(&ref.entry->entry_lock.lock);
+	pcm_entry_ref_release(&ref);
+	return result;
+}
+
+/* Incomplete A/I is local waiting, distinct from an invalid stage, broken
+ * owner or malformed join. Enrollment precedes the locked predicate so an
+ * ingress broadcast between the caller's observation and this wait is kept. */
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_requester_acquire_wait_exact(
+	const ResourceXInstallClaimJoinObservation *observation,
+	const ResourceXDecodedAcquireIntent *episode)
+{
+	PcmEntryWaitContext context;
+	PcmEntryAcquireResult acquired;
+	ResourceXDecodedFrame grant, image;
+	ResourceXRequesterJoinSnapshot snapshot;
+	ClusterWaitTrace wait = {0};
+	volatile ResourceXApplyResult result = RESOURCE_X_APPLY_INVALID;
+
+	if (observation == NULL || episode == NULL
+		|| !resource_x_assertion_valid(&observation->request.logical_assertion)
+		|| observation->request.logical_assertion.requester_node != cluster_node_id
+		|| observation->request.target_mode != PCM_STATE_S
+		|| observation->entry_binding_generation == 0
+		|| observation->entry_binding_generation == UINT64_MAX
+		|| episode->path != RESOURCE_X_ACQUIRE_FIRST_FILL
+		|| episode->buffer_id < 0 || episode->buffer_id >= NBuffers
+		|| !pcm_resource_x_acquire_identity_valid(&observation->request, episode,
+			observation->r4_record_generation))
+		return RESOURCE_X_APPLY_INVALID;
+	memset(&context, 0, sizeof(context));
+	if (!pcm_entry_ref_acquire(&observation->request.logical_assertion.resource, false,
+		&context.ref, &acquired))
+		return RESOURCE_X_APPLY_STALE;
+	PG_TRY();
+	{
+		struct GrdEntry *entry = context.ref.entry;
+		ClusterPcmResourceXMasterState *state;
+
+		pcm_entry_wait_ref_begin(&context);
+		context.cv_prepared = true;
+		ConditionVariablePrepareToSleep(&entry->wait_cv);
+		LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
+		result = cluster_pcm_lock_resource_x_gate_open_exact(observation->request.resource_formation)
+			? pcm_resource_x_requester_acquire_frames_locked(entry, observation, episode,
+				NULL, &grant, &image, &snapshot) : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		state = pcm_resource_x_master_state_for_entry(entry);
+		if (result == RESOURCE_X_APPLY_BAD_STATE && state != NULL
+			&& pcm_resource_x_acquire_frames_stage_locked(entry, episode, NULL, false)
+			&& state->requester_join.acquire_format == 1
+			&& pcm_resource_x_requester_join_decode_locked(&state->requester_join, &grant, &image)
+			&& pcm_resource_x_requester_join_snapshot_locked(&state->requester_join, &snapshot)
+			&& (snapshot.flags & RESOURCE_X_REQUESTER_JOIN_EVIDENCE_COMPLETE) == 0)
+			result = RESOURCE_X_APPLY_NOT_FOUND;
+		LWLockRelease(&entry->entry_lock.lock);
+		if (result == RESOURCE_X_APPLY_NOT_FOUND) {
+			if (cluster_trace_tx_identity)
+				pcm_trace_wait(entry, CLWAIT_SITE_PCM_BOOTSTRAP, PCM_LOCK_MODE_S,
+					observation->master_node, cluster_node_id,
+					observation->request.assertion_sequence, true, false, &wait);
+			pcm_frontend_wait_check_shutdown();
+			(void)ConditionVariableTimedSleep(&entry->wait_cv, 1000,
+				WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
+			pcm_frontend_wait_check_shutdown();
+			if (!pcm_entry_ref_identity_exact(&context.ref))
+				result = RESOURCE_X_APPLY_STALE;
+		}
+	}
+	PG_FINALLY();
+	{
+		pcm_entry_wait_context_cleanup(&context);
+	}
+	PG_END_TRY();
+	return result;
+}
+
 /* Claim only the original local executor. Native IO/publication requires
  * its own exact handoff; complete evidence alone never grants it. */
 ResourceXApplyResult

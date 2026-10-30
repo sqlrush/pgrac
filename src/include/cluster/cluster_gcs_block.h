@@ -81,6 +81,26 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+/* Stack-only observations; authority stays in the original PCM round. */
+typedef struct ClusterGcsFirstFill {
+	ClusterSemanticAdmissionToken admission;
+	ResourceXGateSnapshot gate;
+	ResourceXDecodedFrame prepared;
+	ResourceXDecodedAcquireIntent episode;
+	ResourceXInstallClaimJoinObservation observation;
+	uint64 master_session;
+	int32 master_node;
+	uint32 requester_connection;
+	uint32 master_connection;
+	bool preparing;
+	bool round_prepared;
+} ClusterGcsFirstFill;
+
+extern ResourceXApplyResult cluster_gcs_block_first_fill_begin(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *base, uint64 token, ClusterGcsFirstFill *fill);
+extern ResourceXApplyResult cluster_gcs_block_first_fill_wait(ClusterGcsFirstFill *fill);
+extern void cluster_gcs_block_first_fill_end(ClusterGcsFirstFill *fill);
+
 /* One bounded, local requester-delivery callback on the existing LMS loop.
  * No wire ownership or foreground success is implied by this result. */
 extern ResourceXApplyResult

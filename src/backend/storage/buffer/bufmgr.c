@@ -3158,6 +3158,7 @@ cluster_bufmgr_pcm_own_acquire_input_exact(
 	ResourceXDecodedAcquireIntent episode, checked;
 	ResourceXDecodedFrame grant, image;
 	ResourceXRequesterJoinSnapshot snapshot;
+	ResourceXGateSnapshot gate;
 	ClusterPcmOwnResult native;
 	ResourceXApplyResult result;
 
@@ -3173,8 +3174,11 @@ cluster_bufmgr_pcm_own_acquire_input_exact(
 	if (!BufferTagsEqual(&observed.request.logical_assertion.resource, &base->tag)
 		|| observed.request.observed_mode != base->pcm_state
 		|| observed.r4_record_generation != episode.r4_generation
-		|| observed.request.resource_formation != episode.cluster_epoch
 		|| cluster_gcs_lookup_master(base->tag) != observed.master_node)
+		return RESOURCE_X_APPLY_STALE;
+	if (!cluster_pcm_lock_resource_x_gate_snapshot(&gate))
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (observed.request.resource_formation != gate.formation)
 		return RESOURCE_X_APPLY_STALE;
 	result = cluster_pcm_lock_resource_x_requester_acquire_frames_exact(
 		&observed, &episode, &grant, &image, &snapshot);
@@ -3212,6 +3216,7 @@ cluster_bufmgr_pcm_own_acquire_claim_exact(
 	ResourceXDecodedFrame grant, image;
 	ResourceXRequesterJoinSnapshot snapshot;
 	ResourceXDeliveryClaim claim;
+	ResourceXGateSnapshot gate;
 	ClusterPcmOwnResult native;
 	volatile ResourceXApplyResult result;
 	volatile bool exported = false;
@@ -3228,8 +3233,11 @@ cluster_bufmgr_pcm_own_acquire_claim_exact(
 	if (!BufferTagsEqual(&observed.request.logical_assertion.resource, &base->tag)
 		|| observed.request.observed_mode != base->pcm_state
 		|| observed.r4_record_generation != episode.r4_generation
-		|| observed.request.resource_formation != episode.cluster_epoch
 		|| cluster_gcs_lookup_master(base->tag) != observed.master_node)
+		return RESOURCE_X_APPLY_STALE;
+	if (!cluster_pcm_lock_resource_x_gate_snapshot(&gate))
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (observed.request.resource_formation != gate.formation)
 		return RESOURCE_X_APPLY_STALE;
 	result = cluster_pcm_lock_resource_x_requester_acquire_claim_exact(
 		&observed, &episode, &grant, &image, &snapshot, &claim);
@@ -3331,6 +3339,7 @@ cluster_bufmgr_pcm_own_acquire_stage_begin_exact(BufferDesc *buf,
 	ClusterPcmOwnSnapshot original, quiet;
 	ResourceXDecodedAcquireIntent episode, checked;
 	ResourceXDeliveryClaim owned, prepared;
+	ResourceXGateSnapshot gate;
 	ClusterPcmOwnResult native;
 	volatile ResourceXApplyResult result;
 	volatile bool exported = false;
@@ -3347,8 +3356,11 @@ cluster_bufmgr_pcm_own_acquire_stage_begin_exact(BufferDesc *buf,
 	if (!BufferTagsEqual(&original.tag, &owned.observation.request.logical_assertion.resource)
 		|| owned.observation.request.observed_mode != original.pcm_state
 		|| owned.observation.r4_record_generation != episode.r4_generation
-		|| owned.observation.request.resource_formation != episode.cluster_epoch
 		|| cluster_gcs_lookup_master(original.tag) != owned.observation.master_node)
+		return RESOURCE_X_APPLY_STALE;
+	if (!cluster_pcm_lock_resource_x_gate_snapshot(&gate))
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (owned.observation.request.resource_formation != gate.formation)
 		return RESOURCE_X_APPLY_STALE;
 	result = cluster_pcm_lock_resource_x_requester_acquire_stage_begin_exact(&owned, &episode, &prepared);
 	if (result != RESOURCE_X_APPLY_APPLIED)
@@ -3360,7 +3372,7 @@ cluster_bufmgr_pcm_own_acquire_stage_begin_exact(BufferDesc *buf,
 		if (native != CLUSTER_PCM_OWN_OK)
 			result = native == CLUSTER_PCM_OWN_BUSY || native == CLUSTER_PCM_OWN_NOT_READY
 				? RESOURCE_X_APPLY_BAD_STATE : RESOURCE_X_APPLY_STALE;
-		else if (!cluster_pcm_lock_resource_x_gate_open_exact(episode.cluster_epoch))
+		else if (!cluster_pcm_lock_resource_x_gate_open_exact(owned.observation.request.resource_formation))
 			result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 		else if (cluster_gcs_lookup_master(original.tag) != owned.observation.master_node)
 			result = RESOURCE_X_APPLY_STALE;
@@ -6737,7 +6749,13 @@ ExtendBufferedRelTo(BufferManagerRelation bmr,
 }
 
 #ifdef USE_PGRAC_CLUSTER
-/* Automatic first-fill receipt; no shared state or new protocol lifecycle. */
+static void cluster_bufmgr_acquire_first_fill_cleanup(BufferDesc *buf,
+	const ClusterPcmOwnSnapshot *base, const ResourceXDecodedAcquireIntent *episode,
+	const ResourceXDeliveryClaim *prepared, bool executor_entered);
+
+/* Legacy typed-source component guards. Ordinary ReadBuffer uses the full-E
+ * first-fill driver below; these private guards retain the existing probes
+ * while the remaining native callers migrate. No runtime fallback. */
 typedef struct ClusterBufmgrReadSource
 {
 	BufferDesc *buf;
@@ -6748,7 +6766,7 @@ typedef struct ClusterBufmgrReadSource
 	bool content_locked;
 } ClusterBufmgrReadSource;
 
-static void
+static void pg_attribute_unused()
 cluster_bufmgr_pcm_read_source_begin(BufferDesc *buf, ClusterBufmgrReadSource *read)
 {
 	ClusterPcmOwnResult result;
@@ -6781,7 +6799,7 @@ cluster_bufmgr_pcm_read_source_begin(BufferDesc *buf, ClusterBufmgrReadSource *r
 			errmsg("first buffer fill has no proven GCS source")));
 }
 
-static bool
+static bool pg_attribute_unused()
 cluster_bufmgr_pcm_read_source_owned(BufferDesc *buf, ClusterBufmgrReadSource *read)
 {
 	uint32 state = LockBufHdr(buf);
@@ -6798,14 +6816,14 @@ cluster_bufmgr_pcm_read_source_owned(BufferDesc *buf, ClusterBufmgrReadSource *r
 	return allowed;
 }
 
-static bool
+static bool pg_attribute_unused()
 cluster_bufmgr_pcm_read_source_disk_allowed(BufferDesc *buf, ClusterBufmgrReadSource *read)
 {
 	return read->source.kind == CLUSTER_PCM_SOURCE_DISK_GRANT && read->source.durable
 		&& cluster_bufmgr_pcm_read_source_owned(buf, read);
 }
 
-static void
+static void pg_attribute_unused()
 cluster_bufmgr_pcm_read_source_finish(BufferDesc *buf, ClusterBufmgrReadSource *read)
 {
 	ClusterPcmOwnResult result;
@@ -6848,7 +6866,7 @@ cluster_bufmgr_pcm_read_source_finish(BufferDesc *buf, ClusterBufmgrReadSource *
 	read->content_locked = false;
 }
 
-static void
+static void pg_attribute_unused()
 cluster_bufmgr_pcm_read_source_cleanup(BufferDesc *buf, ClusterBufmgrReadSource *read)
 {
 	if (read->content_locked)
@@ -6886,12 +6904,189 @@ cluster_bufmgr_pcm_read_source_cleanup(BufferDesc *buf, ClusterBufmgrReadSource 
 }
 
 /* Also runs at native FATAL/backend-exit before generic resource cleanup. */
-static void
+static void pg_attribute_unused()
 cluster_bufmgr_pcm_read_source_error(int code pg_attribute_unused(), Datum arg)
 {
 	ClusterBufmgrReadSource *read = (ClusterBufmgrReadSource *)DatumGetPointer(arg);
 	cluster_bufmgr_pcm_read_source_cleanup(read->buf, read);
 }
+/* End legacy typed-source component guards. */
+
+/* Ordinary first-fill owns one native reservation and one master request.
+ * Stack observations select cleanup; exact PCM/native proofs authorize it. */
+typedef struct ClusterBufmgrFirstFill
+{
+	BufferDesc *buf;
+	ClusterPcmOwnSnapshot base;
+	ClusterGcsFirstFill request;
+	ResourceXDeliveryClaim claim;
+	ResourceOwner owner;
+	uint64 token;
+	uint64 backend_generation;
+	BackendId backend_id;
+	bool pending;
+	bool delegated;
+	bool unsent_retired;
+	bool unissued_quiet;
+} ClusterBufmgrFirstFill;
+
+static bool
+cluster_bufmgr_first_fill_local_owner(const ClusterBufmgrFirstFill *read)
+{
+	return read->owner != NULL && CurrentResourceOwner == read->owner
+		&& MyProc != NULL && MyProc->pid == MyProcPid && MyProcPid > 0
+		&& MyBackendId == read->backend_id && MyProc->backendId == read->backend_id
+		&& MyProc->cluster_grd_generation == read->backend_generation
+		&& GetPrivateRefCount(BufferDescriptorGetBuffer(read->buf)) > 0;
+}
+
+/* Only before the physical sender is called, or after entry-locked exact
+ * retirement proves it never took E. No disk or image producer exists in
+ * this scope. Never use generic AbortBufferIO to infer that proof. */
+static bool
+cluster_bufmgr_first_fill_abort_unissued(ClusterBufmgrFirstFill *read)
+{
+	ClusterPcmOwnSnapshot expected = read->base, live;
+	ClusterPcmOwnResult result;
+	uint32 state;
+
+	if (!cluster_bufmgr_first_fill_local_owner(read)
+		|| !ResourceOwnerHasBufferIO(read->owner, BufferDescriptorGetBuffer(read->buf)))
+		return false;
+	expected.reservation_token = read->token;
+	expected.flags = read->unissued_quiet ? 0 : PCM_OWN_FLAG_GRANT_PENDING;
+	state = LockBufHdr(read->buf);
+	cluster_pcm_own_snapshot_locked(read->buf, &live);
+	if (!cluster_pcm_own_snapshot_equal_exact(&expected, &live)
+		|| live.pcm_state != PCM_STATE_N || live.buffer_type != BUF_TYPE_CURRENT
+		|| live.semantic_buf_state != (BM_TAG_VALID | BM_IO_IN_PROGRESS)
+		|| cluster_pcm_own_delivery_attempt_get(read->buf->buf_id) != 0
+		|| (pg_atomic_read_u64(&ClusterPcmOwnArray[read->buf->buf_id].write_io_generation) & 1) != 0) {
+		UnlockBufHdr(read->buf, state);
+		return false;
+	}
+	result = read->unissued_quiet ? CLUSTER_PCM_OWN_OK
+		: cluster_pcm_own_reservation_abort_exact(read->buf->buf_id, read->base.generation,
+			read->token, PCM_OWN_FLAG_GRANT_PENDING);
+	if (result == CLUSTER_PCM_OWN_OK)
+		read->unissued_quiet = true;
+	UnlockBufHdr(read->buf, state);
+	if (result != CLUSTER_PCM_OWN_OK)
+		return false;
+	AbortBufferIO(BufferDescriptorGetBuffer(read->buf));
+	return true;
+}
+
+static void
+cluster_bufmgr_first_fill_cleanup(BufferDesc *buf, ClusterBufmgrFirstFill *read)
+{
+	ResourceXInstallClaimJoinObservation issued;
+	ResourceXApplyResult result;
+
+	if (!read->pending) {
+		cluster_gcs_block_first_fill_end(&read->request);
+		return;
+	}
+	if (!cluster_bufmgr_first_fill_local_owner(read) || read->request.preparing)
+		goto unproven;
+	if (read->claim.purpose == RESOURCE_X_DELIVERY_ACQUIRE_PREPARED) {
+		/* The existing executor guard seals before IO release, or rolls C
+		 * forward. Its exact native proof is also used on nested ERROR. */
+		cluster_bufmgr_acquire_first_fill_cleanup(buf, &read->base,
+			&read->request.episode, &read->claim, read->delegated);
+		read->pending = false;
+	} else {
+		if (read->claim.purpose != 0) {
+			if (read->claim.purpose != RESOURCE_X_DELIVERY_NORMAL
+				|| cluster_pcm_lock_resource_x_requester_acquire_claim_release_exact(&read->claim)
+					!= RESOURCE_X_APPLY_APPLIED)
+				goto unproven;
+			memset(&read->claim, 0, sizeof(read->claim));
+		}
+		if (read->request.round_prepared && !read->unsent_retired) {
+			result = cluster_pcm_lock_resource_x_first_fill_retire_unsent_exact(
+				&read->request.observation, &read->request.episode, &issued);
+			if (result == RESOURCE_X_APPLY_DUPLICATE) {
+				result = cluster_bufmgr_pcm_own_acquire_cancel_wait_exact(buf, &read->base,
+					&read->request.episode, &issued);
+				if (result != RESOURCE_X_APPLY_APPLIED && result != RESOURCE_X_APPLY_DUPLICATE)
+					goto unproven;
+				read->pending = false;
+			} else if (result == RESOURCE_X_APPLY_APPLIED)
+				read->unsent_retired = true;
+			else
+				goto unproven;
+		}
+		if (read->pending) {
+			if (!cluster_bufmgr_first_fill_abort_unissued(read))
+				goto unproven;
+			read->pending = false;
+		}
+	}
+	cluster_gcs_block_first_fill_end(&read->request);
+	return;
+unproven:
+	ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
+		errmsg("could not settle original first buffer fill before IO cleanup")));
+}
+
+/* Also runs before generic FATAL/backend-exit resource cleanup. */
+static void
+cluster_bufmgr_first_fill_error(int code pg_attribute_unused(), Datum arg)
+{
+	ClusterBufmgrFirstFill *read = (ClusterBufmgrFirstFill *)DatumGetPointer(arg);
+	cluster_bufmgr_first_fill_cleanup(read->buf, read);
+}
+
+static void
+cluster_bufmgr_first_fill_begin(BufferDesc *buf, ClusterBufmgrFirstFill *read,
+	IOObject io_object, IOContext io_context)
+{
+	ResourceXDecodedFrame grant, image;
+	ResourceXRequesterJoinSnapshot joined;
+	ResourceXApplyResult result;
+	ClusterPcmOwnResult native;
+	bool covered = false;
+
+	read->owner = CurrentResourceOwner;
+	if (MyProc == NULL || MyProc->pid != MyProcPid || MyProcPid <= 0)
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("first buffer fill has no native process owner")));
+	read->backend_id = MyBackendId;
+	read->backend_generation = MyProc->cluster_grd_generation;
+	native = cluster_bufmgr_pcm_begin_grant_reservation_wait(buf, PCM_LOCK_MODE_S,
+		&read->base, &read->token, &covered, NULL);
+	if (native != CLUSTER_PCM_OWN_OK || covered)
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("first buffer fill could not reserve its exact source")));
+	read->pending = true;
+	result = cluster_gcs_block_first_fill_begin(buf, &read->base, read->token, &read->request);
+	if (result == RESOURCE_X_APPLY_APPLIED)
+		result = cluster_gcs_block_first_fill_wait(&read->request);
+	if (result == RESOURCE_X_APPLY_APPLIED)
+		result = cluster_bufmgr_pcm_own_acquire_claim_exact(buf, &read->base, read->token,
+			RESOURCE_X_ACQUIRE_FIRST_FILL, &read->request.admission, &read->request.observation,
+			&grant, &image, &joined, &read->claim);
+	if (result == RESOURCE_X_APPLY_APPLIED)
+		result = cluster_bufmgr_pcm_own_acquire_stage_begin_exact(buf, &read->base, read->token,
+			RESOURCE_X_ACQUIRE_FIRST_FILL, &read->request.admission, &read->claim, &read->claim);
+	if (result == RESOURCE_X_APPLY_APPLIED) {
+		read->delegated = true;
+		if (grant.body.acquire_decision.source_kind == RESOURCE_X_ACQUIRE_SOURCE_DISK) {
+			instr_time io_start = pgstat_prepare_io_time();
+			result = cluster_bufmgr_pcm_own_acquire_fill_disk_exact(buf, &read->base,
+				&read->request.episode, &read->request.admission, &read->claim);
+			if (result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE)
+				pgstat_count_io_op_time(io_object, io_context, IOOP_READ, io_start, 1);
+		} else
+			result = cluster_bufmgr_pcm_own_acquire_fill_image_exact(buf, &read->base,
+				&read->request.episode, &read->request.admission, &read->claim);
+	}
+	if (result != RESOURCE_X_APPLY_APPLIED && result != RESOURCE_X_APPLY_DUPLICATE)
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+			errmsg("first buffer fill could not complete its original GCS acquisition: result=%d", result)));
+	read->pending = false;
+	cluster_gcs_block_first_fill_end(&read->request);
+}
+/* End ordinary first-fill native driver. */
 #endif
 
 /*
@@ -6912,7 +7107,7 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	bool		isLocalBuf = SmgrIsTemp(smgr);
 #ifdef USE_PGRAC_CLUSTER
 	ClusterPcmDirectInitProof direct_init_proof;
-	ClusterPcmReadSource completed_source = {0};
+	bool cluster_first_fill_complete = false;
 #endif
 
 	*hit = false;
@@ -7062,30 +7257,25 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	else
 	{
 #ifdef USE_PGRAC_CLUSTER
-		volatile ClusterBufmgrReadSource read;
+		volatile ClusterBufmgrFirstFill read;
 		bool tracked = !isLocalBuf && cluster_pcm_is_active()
 			&& cluster_bufmgr_should_pcm_track(bufHdr);
 
 		memset((void *)&read, 0, sizeof(read));
 		read.buf = bufHdr;
-		PG_ENSURE_ERROR_CLEANUP(cluster_bufmgr_pcm_read_source_error,
-			PointerGetDatum((ClusterBufmgrReadSource *)&read));
+		PG_ENSURE_ERROR_CLEANUP(cluster_bufmgr_first_fill_error,
+			PointerGetDatum((ClusterBufmgrFirstFill *)&read));
 		{
 			if (tracked)
-				cluster_bufmgr_pcm_read_source_begin(bufHdr, (ClusterBufmgrReadSource *)&read);
-			if (!tracked || read.source.kind == CLUSTER_PCM_SOURCE_DISK_GRANT)
+				{
+				cluster_bufmgr_first_fill_begin(bufHdr, (ClusterBufmgrFirstFill *)&read, io_object, io_context);
+				cluster_first_fill_complete = true;
+			}
+			if (!tracked)
 #endif
 			{
 				instr_time io_start = pgstat_prepare_io_time();
 				bool verified;
-#ifdef USE_PGRAC_CLUSTER
-				if (tracked && !cluster_bufmgr_pcm_read_source_disk_allowed(bufHdr,
-					(ClusterBufmgrReadSource *)&read))
-					ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
-						errmsg("refusing physical read without its exact GCS disk grant")));
-				if (tracked)
-					cluster_block_io_trace_source((const ClusterPcmReadSource *)&read.source, "DISK_BEGIN");
-#endif
 				smgrread(smgr, forkNum, blockNum, bufBlock);
 
 				pgstat_count_io_op_time(io_object, io_context,
@@ -7178,20 +7368,11 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 										blockNum,
 										relpath(smgr->smgr_rlocator, forkNum))));
 				}
-#ifdef USE_PGRAC_CLUSTER
-				if (tracked)
-					cluster_gcs_block_fallback_verify_refresh(bufHdr, read.source.tag,
-						(SCN)read.source.watermark);
-#endif
 			}
 #ifdef USE_PGRAC_CLUSTER
-			if (tracked) {
-				cluster_bufmgr_pcm_read_source_finish(bufHdr, (ClusterBufmgrReadSource *)&read);
-				completed_source = read.source;
-			}
 		}
-		PG_END_ENSURE_ERROR_CLEANUP(cluster_bufmgr_pcm_read_source_error,
-			PointerGetDatum((ClusterBufmgrReadSource *)&read));
+		PG_END_ENSURE_ERROR_CLEANUP(cluster_bufmgr_first_fill_error,
+			PointerGetDatum((ClusterBufmgrFirstFill *)&read));
 #endif
 	}
 	/*
@@ -7230,10 +7411,10 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	else
 	{
 		/* Set BM_VALID, terminate IO, and wake up any waiters */
-		TerminateBufferIO(bufHdr, false, BM_VALID);
 #ifdef USE_PGRAC_CLUSTER
-		cluster_gcs_block_read_source_complete(bufHdr, &completed_source, true);
+		if (!cluster_first_fill_complete)
 #endif
+			TerminateBufferIO(bufHdr, false, BM_VALID);
 	}
 
 	VacuumPageMiss++;
@@ -18931,6 +19112,55 @@ cluster_bufmgr_pcm_own_acquire_fill_image_exact(BufferDesc *buf,
 	return result;
 }
 /* End original first-fill current-image lifecycle. */
+
+/* The enclosing ordinary scope may see an ERROR after the inner executor
+ * guard already sealed IO or completed C. It never aborts installed bytes.
+ * Absence of IO alone proves nothing: the original synchronous executor was
+ * entered under that guard, which publishes its shared C/quiet before IO
+ * release. Check its original token, native terminal and zero delivery hold
+ * as well, without borrowing a successor's tag-level state. */
+static void
+cluster_bufmgr_acquire_first_fill_cleanup(BufferDesc *buf,
+	const ClusterPcmOwnSnapshot *base, const ResourceXDecodedAcquireIntent *episode,
+	const ResourceXDeliveryClaim *prepared, bool executor_entered)
+{
+	ClusterAcquireDiskGuard guard;
+	ClusterPcmOwnSnapshot native;
+	bool terminal = false;
+	uint32 state;
+
+	guard.buf = buf;
+	guard.owner = CurrentResourceOwner;
+	guard.base = *base;
+	guard.episode = *episode;
+	guard.original = *prepared;
+	if (ResourceOwnerHasBufferIO(guard.owner, BufferDescriptorGetBuffer(buf))) {
+		cluster_bufmgr_acquire_disk_episode_cleanup(0, PointerGetDatum(&guard));
+		return;
+	}
+	if (executor_entered && prepared->purpose == RESOURCE_X_DELIVERY_ACQUIRE_PREPARED
+		&& cluster_bufmgr_acquire_quiet_context(buf, base, episode, prepared, guard.owner)) {
+		state = LockBufHdr(buf);
+		cluster_pcm_own_snapshot_locked(buf, &native);
+		terminal = BufferTagsEqual(&native.tag, &base->tag)
+			&& native.reservation_token == episode->reservation_token
+			&& native.flags == 0 && native.writer_activation_token == 0
+			&& native.resource_x_activation_generation == 0
+			&& cluster_pcm_own_delivery_attempt_get(buf->buf_id) == 0
+			&& (pg_atomic_read_u64(&ClusterPcmOwnArray[buf->buf_id].write_io_generation) & 1) == 0
+			&& ((native.generation == episode->base_generation
+				&& native.pcm_state == PCM_STATE_N && native.buffer_type == BUF_TYPE_CURRENT
+				&& native.semantic_buf_state == (BM_TAG_VALID | BM_IO_ERROR))
+				|| (native.generation == episode->base_generation + 1
+					&& native.pcm_state == PCM_STATE_S && native.buffer_type == BUF_TYPE_SCUR
+					&& native.semantic_buf_state == (BM_TAG_VALID | BM_VALID)));
+		UnlockBufHdr(buf, state);
+	}
+	if (!terminal)
+		ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
+			errmsg("could not prove original first buffer fill executor terminal")));
+}
+/* End ordinary first-fill executor cleanup. */
 
 #endif
 

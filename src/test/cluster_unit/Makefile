@@ -9735,7 +9735,7 @@ test_cluster_pcm_read_source_owner.inc: $(top_srcdir)/src/backend/storage/buffer
 	     emit { print } /^}/ { emit=0 } \
 	     END { if (found != 1 || abort_owner != 1 || finish_owner != 1 || pending_owner != 1 || aborted_owner != 1 || emit) exit 1 }' $< > $@.tmp
 	awk '/^typedef struct ClusterBufmgrReadSource$$/ { emit=1; found++ } \
-	     /^#endif/ && emit { emit=0 } emit { print } \
+	     /^\/\* End legacy typed-source component guards/ && emit { emit=0 } emit { print } \
 	     END { if (found != 1 || emit) exit 1 }' $< >> $@.tmp
 	mv $@.tmp $@
 
@@ -11032,6 +11032,55 @@ clean distclean maintainer-clean: clean-native-wait-cancel
 clean-native-wait-cancel:
 	rm -f test_cluster_native_wait_cancel test_cluster_native_wait_cancel.inc \
 		test_cluster_native_wait_cancel.inc.tmp
+
+# Ordinary miss composition retains the actual original cancellation bodies.
+TESTS += test_cluster_native_first_fill
+all: test_cluster_native_first_fill
+test_cluster_native_first_fill: test_cluster_native_first_fill.c test_cluster_native_wait_cancel \
+		test_cluster_native_wait_fixture.inc test_cluster_native_disk_guard.inc \
+		test_cluster_native_disk_episode.inc test_cluster_native_image_episode.inc \
+		test_cluster_native_first_fill_gcs.inc test_cluster_native_first_fill_native.inc \
+		test_cluster_native_first_fill_cleanup.inc test_cluster_native_first_fill_evidence.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+test_cluster_native_wait_fixture.inc: test_cluster_native_wait_cancel.c Makefile
+	awk '/^UT_TEST\(/ { stop=1 } !stop { print }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_native_first_fill_gcs.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^\/\* Ordinary first-fill request driver/ { emit=1; found++ } \
+	     /^\/\* End ordinary first-fill request driver/ { emit=0; stop=1 } \
+	     emit { print } END { if (found != 1 || !stop) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_native_first_fill_native.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^\/\* Ordinary first-fill owns one native reservation/ { emit=1; found++ } \
+	     /^\/\* End ordinary first-fill native driver/ { emit=0; stop=1 } \
+	     emit { print } END { if (found != 1 || !stop) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_native_first_fill_cleanup.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^\/\* The enclosing ordinary scope/ { emit=1; found++ } \
+	     /^\/\* End ordinary first-fill executor cleanup/ { emit=0; stop=1 } \
+	     emit { print } END { if (found != 1 || !stop) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_native_first_fill_evidence.inc: test_cluster_acquire_evidence_fixture.inc Makefile
+	awk '/^evidence_begin\(/ { print "static bool"; emit=1; found++ } \
+	     emit { print } /^}/ && emit { emit=0; stop=1 } \
+	     END { if (found != 1 || !stop) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+clean distclean maintainer-clean: clean-native-first-fill
+.PHONY: clean-native-first-fill
+clean-native-first-fill:
+	rm -f test_cluster_native_first_fill test_cluster_native_wait_fixture.inc \
+		test_cluster_native_wait_fixture.inc.tmp test_cluster_native_first_fill_gcs.inc \
+		test_cluster_native_first_fill_gcs.inc.tmp test_cluster_native_first_fill_native.inc \
+		test_cluster_native_first_fill_native.inc.tmp test_cluster_native_first_fill_cleanup.inc \
+		test_cluster_native_first_fill_cleanup.inc.tmp test_cluster_native_first_fill_evidence.inc \
+		test_cluster_native_first_fill_evidence.inc.tmp
 
 # Original pre-C disk execution is bracketed before native IO/pin cleanup.
 TESTS += test_cluster_native_disk_guard

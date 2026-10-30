@@ -23,7 +23,14 @@ static bool wait_seal_error, wait_before_abort_error, wait_after_abort_error, wa
 static void
 wait_broadcast(ConditionVariable *cv)
 {
+#ifdef NATIVE_FIRST_FILL_COMPOSITION
+	/* The composing ordinary-entry fixture also exercises the same real
+	 * unarmed IO abort after preparation. Its case checks the exact phase. */
+	UT_ASSERT(request_entry()->resource_x_bootstrap_round.delivery_executor_purpose == WAIT_SEALING
+		|| request_entry()->resource_x_bootstrap_round.delivery_executor_purpose == RESOURCE_X_DELIVERY_ACQUIRE_UNARMED_SEALING);
+#else
 	UT_ASSERT_EQ(request_entry()->resource_x_bootstrap_round.delivery_executor_purpose, WAIT_SEALING);
+#endif
 	UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0);
 	UT_ASSERT_EQ(cluster_pcm_own_delivery_attempt_get(0), 0);
 	UT_ASSERT(!ResourceOwnerHasBufferIO(original_io_owner, 1));
