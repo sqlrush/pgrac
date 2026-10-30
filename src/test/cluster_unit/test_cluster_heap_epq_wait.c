@@ -983,6 +983,15 @@ heap_hot_search_buffer(ItemPointer tid, Relation relation, Buffer buffer, Snapsh
 	return false;
 }
 
+bool
+cluster_heap_hot_search_buffer(ItemPointer tid, Relation relation, Buffer buffer,
+	Snapshot snapshot, HeapTuple tuple, const ClusterHeapPageVisibility *observation)
+{
+	/* This existing lifetime fixture has no qualified catalog. */
+	(void)observation;
+	return heap_hot_search_buffer(tid, relation, buffer, snapshot, tuple, NULL, true);
+}
+
 static bool SampleHeapTupleVisible(TableScanDesc scan, Buffer buffer, HeapTuple tuple,
 								   OffsetNumber offset);
 #include "test_cluster_heap_scan_consumers.inc"

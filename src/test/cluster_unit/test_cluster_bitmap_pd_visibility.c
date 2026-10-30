@@ -31,6 +31,7 @@ bitmap_predicate(Relation rel, ItemPointer tid, Snapshot snapshot,
 	bitmap_predicates++;
 }
 
+#ifndef BITMAP_PD_REAL_HOT
 static bool
 bitmap_hot(ItemPointer tid, Relation rel, Buffer buffer, Snapshot snapshot,
 		   HeapTuple tuple, bool *all_dead, bool first_call)
@@ -46,6 +47,7 @@ bitmap_hot(ItemPointer tid, Relation rel, Buffer buffer, Snapshot snapshot,
 	(void)tuple;
 	return true;
 }
+#endif
 
 #undef IsolationIsSerializable
 #define IsolationIsSerializable() bitmap_serializable
@@ -54,6 +56,12 @@ bitmap_hot(ItemPointer tid, Relation rel, Buffer buffer, Snapshot snapshot,
 #define heap_hot_search_buffer bitmap_hot
 #undef pgstat_count_heap_fetch
 #define pgstat_count_heap_fetch(rel) ((void)(rel), bitmap_fetches++)
+#ifdef BITMAP_PD_REAL_HOT
+#include "test_cluster_bitmap_hot_visibility.inc"
+#else
+#define cluster_heap_hot_search_buffer(tid, rel, buffer, snapshot, tuple, observation) \
+	bitmap_hot(tid, rel, buffer, snapshot, tuple, NULL, true)
+#endif
 #include "test_cluster_bitmap_pd_visibility.inc"
 
 static void
@@ -218,7 +226,11 @@ UT_TEST(exact_bitmap_retains_original_hot_returned_offset)
 	result->offsets[2] = 4;
 	UT_ASSERT(bitmap_page(result));
 	UT_ASSERT_EQ(bitmap_hot_calls, 3);
+#ifdef FIXTURE_HAS_BITMAP_EXACT_PD
+	UT_ASSERT_EQ(pd_prepares, PGRAC_VM_QUALIFIED_CATALOG_VERSION == 0 ? 0 : 1);
+#else
 	UT_ASSERT_EQ(pd_prepares, 0);
+#endif
 	UT_ASSERT_EQ(bitmap_predicates, 0);
 	UT_ASSERT_EQ(pd_scan.rs_ntuples, 1);
 	UT_ASSERT(heapam_scan_bitmap_next_tuple((TableScanDesc)&pd_scan, result, &slot));
@@ -295,8 +307,11 @@ UT_TEST(lossy_error_exits_new_snapshot_evaluators)
 	}
 }
 
+#ifndef BITMAP_PD_VISIBILITY_MAIN
+#define BITMAP_PD_VISIBILITY_MAIN main
+#endif
 int
-main(void)
+BITMAP_PD_VISIBILITY_MAIN(void)
 {
 	if (PGRAC_VM_QUALIFIED_CATALOG_VERSION == 0)
 	{

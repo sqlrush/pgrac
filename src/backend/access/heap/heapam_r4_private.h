@@ -60,6 +60,9 @@ extern void cluster_heap_page_visibility_prepare(Relation relation, BlockNumber 
 	Snapshot snapshot, ClusterHeapPageVisibility *observation);
 extern bool cluster_heap_page_all_visible(Relation relation, Buffer buffer, Page page,
 	Snapshot snapshot, const ClusterHeapPageVisibility *observation);
+/* Exact bitmap first-call search, retaining the caller's original heap S. */
+extern bool cluster_heap_hot_search_buffer(ItemPointer tid, Relation relation, Buffer buffer,
+	Snapshot snapshot, HeapTuple heapTuple, const ClusterHeapPageVisibility *observation);
 
 /* Exact remote Dirty wait channel for the built-in successor consumer only. */
 extern bool cluster_heap_fetch_waitable(Relation relation, Snapshot snapshot, HeapTuple tuple,

@@ -2629,9 +2629,8 @@ heapam_scan_bitmap_next_block(TableScanDesc scan,
 
 #ifdef USE_PGRAC_CLUSTER
 	/* Prepare potentially cold identity evidence before the original heap
-	 * acquisition, without a content lock. Exact entries retain HOT search. */
-	if (tbmres->ntuples < 0)
-		cluster_heap_page_visibility_prepare(scan->rs_rd, block,
+	 * acquisition, without a content lock. Both branches retain TID checks. */
+	cluster_heap_page_visibility_prepare(scan->rs_rd, block,
 											scan->rs_snapshot, &visibility);
 #endif
 
@@ -2678,8 +2677,13 @@ heapam_scan_bitmap_next_block(TableScanDesc scan,
 			HeapTupleData heapTuple;
 
 			ItemPointerSet(&tid, block, offnum);
+#ifdef USE_PGRAC_CLUSTER
+			if (cluster_heap_hot_search_buffer(&tid, scan->rs_rd, buffer, snapshot,
+												  &heapTuple, &visibility))
+#else
 			if (heap_hot_search_buffer(&tid, scan->rs_rd, buffer, snapshot,
 									   &heapTuple, NULL, true))
+#endif
 				hscan->rs_vistuples[ntup++] = ItemPointerGetOffsetNumber(&tid);
 		}
 	}

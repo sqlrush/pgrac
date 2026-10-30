@@ -4274,10 +4274,10 @@ extern bool cluster_heap_test_r4_surely_dead(HeapTuple tuple,
  * Unlike heap_fetch, the caller must already have pin and (at least) share
  * lock on the buffer; it is still pinned/locked at exit.
  */
-bool
-heap_hot_search_buffer(ItemPointer tid, Relation relation, Buffer buffer,
+static bool
+heap_hot_search_buffer_impl(ItemPointer tid, Relation relation, Buffer buffer,
 					   Snapshot snapshot, HeapTuple heapTuple,
-					   bool *all_dead, bool first_call)
+					   bool *all_dead, bool first_call, bool all_visible)
 {
 	Page		page = BufferGetPage(buffer);
 	TransactionId prev_xmax = InvalidTransactionId;
@@ -4391,7 +4391,7 @@ cluster_hot_search_restart:
 		if (!skip)
 		{
 			/* If it's visible per the snapshot, we must return it */
-			valid = HeapHotLiveVisibility(heapTuple, snapshot, buffer);
+			valid = all_visible || HeapHotLiveVisibility(heapTuple, snapshot, buffer);
 			HeapHotConflictOut(valid, relation, heapTuple, buffer, snapshot);
 
 			if (valid)
@@ -4483,7 +4483,32 @@ cluster_hot_search_restart:
 	return false;
 }
 
+bool
+heap_hot_search_buffer(ItemPointer tid, Relation relation, Buffer buffer,
+					   Snapshot snapshot, HeapTuple heapTuple,
+					   bool *all_dead, bool first_call)
+{
+	return heap_hot_search_buffer_impl(tid, relation, buffer, snapshot, heapTuple,
+									   all_dead, first_call, false);
+}
+
 #ifdef USE_PGRAC_CLUSTER
+/* Bitmap's qualified entry is first-call-only and never asks for all_dead.
+ * The first legal member returns under this same S bracket before any HOT/MX
+ * successor path can release it. Failed qualification stays false throughout
+ * the original traversal/restarts; a later image cannot borrow permission. */
+bool
+cluster_heap_hot_search_buffer(ItemPointer tid, Relation relation, Buffer buffer,
+	Snapshot snapshot, HeapTuple heapTuple,
+	const ClusterHeapPageVisibility *observation)
+{
+	bool all_visible = cluster_heap_page_all_visible(relation, buffer,
+														   BufferGetPage(buffer), snapshot, observation);
+
+	return heap_hot_search_buffer_impl(tid, relation, buffer, snapshot, heapTuple,
+									   NULL, true, all_visible);
+}
+
 typedef enum HeapHotR4CycleOutcome
 {
 	HEAP_HOT_R4_CYCLE_DORMANT = 0,
