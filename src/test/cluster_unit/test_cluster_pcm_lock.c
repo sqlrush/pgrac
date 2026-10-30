@@ -162,6 +162,7 @@ static char pi_ack_fixtures[3];
 static uint32 pi_ack_available;
 static uint32 pi_ack_imported;
 static bool local_pi_writer_ready, local_pi_covered;
+static bool (*local_pi_coverage_filter)(const ClusterPcmLocalPiSnapshotV1 *);
 static char structural_receipt_fixture, structural_ack_fixture;
 static bool structural_ack_valid;
 static char structural_master_receipt_fixture, structural_master_ack_fixture;
@@ -339,13 +340,15 @@ cluster_page_data_covers_local_pi_v1(const ClusterPageDataReceiptV1 *receipt,
 {
 	/* The actual sealed-plan/physical receipt owner is exercised separately
 	 * in test_cluster_page_data. This fixture never constructs DATA proof. */
-	return local_pi_covered && (const void *)receipt == &pi_receipt_fixture;
+	return local_pi_covered && (const void *)receipt == &pi_receipt_fixture
+		&& (local_pi_coverage_filter == NULL || local_pi_coverage_filter(local));
 }
 bool
 cluster_page_structural_covers_local_pi_v2(const ClusterPageStructuralReceiptV2 *receipt,
 										   const ClusterPcmLocalPiSnapshotV1 *local)
 {
-	return local_pi_covered && (const void *)receipt == &structural_receipt_fixture;
+	return local_pi_covered && (const void *)receipt == &structural_receipt_fixture
+		&& (local_pi_coverage_filter == NULL || local_pi_coverage_filter(local));
 }
 bool
 cluster_page_structural_pi_ack_read_v2(const ClusterPiStructuralAckV2 *ack,
@@ -790,6 +793,7 @@ s_lock(volatile slock_t *lock, const char *file pg_attribute_unused(),
 static void
 reset_fake_pcm_runtime(int max_entries)
 {
+	local_pi_coverage_filter = NULL;
 	auth_peer_boot = 31; auth_slot_generation = 1; auth_epoch = 17;
 	auth_connection_valid = auth_slot_valid = auth_fresh = true;
 	auth_slot_reads = auth_connection_reads = 0;

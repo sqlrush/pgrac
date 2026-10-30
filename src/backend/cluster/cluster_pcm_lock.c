@@ -716,6 +716,22 @@ typedef struct ClusterPcmResourceXHolderImage {
 	uint8 payload[RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES];
 } ClusterPcmResourceXHolderImage;
 
+/* Both references address the original immutable holder body. Transport
+ * completion cannot consume the PI reference or its independently owned
+ * first/last WAL claims. The completed native tuple is an old-owner receipt,
+ * never a sample of a replacement descriptor. */
+typedef struct ClusterPcmResourceXPiCarrier {
+	ClusterPcmOwnSnapshot completed;
+	ClusterPageWalRefV1 first, last;
+	uint64 binding_generation;
+	uint64 pi_revision;
+	uint32 image_crc;
+	uint8 transport_refs;
+	uint8 pi_refs;
+	uint8 reserved[2];
+} ClusterPcmResourceXPiCarrier;
+StaticAssertDecl(sizeof(ClusterPcmResourceXPiCarrier) == 184, "bounded PI body references");
+
 typedef struct ClusterPcmResourceXRequesterJoin {
 	uint64 t_image_us;
 	uint64 t_grant_us;
@@ -796,6 +812,7 @@ typedef struct ClusterPcmResourceXMasterState {
 	ClusterPcmResourceXSourceSettlement source_settlement;
 	ClusterPcmResourceXSettlementRetry settlement_retry;
 	ClusterPcmResourceXHolderImage holder_image;
+	ClusterPcmResourceXPiCarrier pi_carrier;
 	/* D S09 R-A22: local only, never in a frame or the wire.  While the pair
 	 * is PENDING it owns the source's first own record since the page was
 	 * clean; publication moves it into the local PI responsibility. */
@@ -847,7 +864,7 @@ StaticAssertDecl(sizeof(ClusterPcmResourceXRequesterJoin) == 13680,
 				 "Resource-X requester join must bound A, image and original ACKs");
 StaticAssertDecl(sizeof(ClusterPcmResourceXDeferredSettlement) == 784,
 				 "Resource-X deferred settlement must remain bounded");
-StaticAssertDecl(sizeof(ClusterPcmResourceXMasterState) == 85112,
+StaticAssertDecl(sizeof(ClusterPcmResourceXMasterState) == 85296,
 				 "D4 Resource-X master state must bind object generation");
 
 typedef struct ClusterPcmShared {
@@ -1109,6 +1126,13 @@ static void pcm_local_pi_release_locked(struct GrdEntry *entry);
 static bool pcm_local_pi_snapshot_locked(struct GrdEntry *entry,
 										ClusterPcmLocalPiSnapshotV1 *out);
 static bool pcm_local_pi_source_equal(const ClusterWalSourceRef *a, const ClusterWalSourceRef *b);
+static bool pcm_resource_x_pi_carrier_decode_locked(const struct GrdEntry *entry,
+	const ClusterPcmResourceXMasterState *state, ClusterPcmLocalPiSnapshotV1 *scope);
+static bool pcm_resource_x_pi_carrier_observe(BufferTag tag,
+	ClusterPcmResourceXPiCarrier *observation, ClusterPcmLocalPiSnapshotV1 *scope);
+static bool pcm_resource_x_pi_carrier_release_locked(struct GrdEntry *entry,
+	ClusterPcmResourceXMasterState *state, const ClusterPcmResourceXPiCarrier *observed);
+static void pcm_resource_x_read_source_pair_clear(ClusterPcmResourceXMasterState *state);
 static uint64 pcm_resource_x_monotonic_us(void);
 static bool pcm_resource_x_head_changed_locked(struct GrdEntry *entry, bool semantic_progress,
 											   uint64 now_us);
@@ -2150,7 +2174,7 @@ pcm_resource_x_settlement_retry_decode_locked(struct GrdEntry *entry,
 		const ResourceXDecodedAcquireDecision *a = &decoded.body.acquire_completion.decision;
 
 		if (a->master_node != retry->master || a->source_node != cluster_node_id
-			|| a->directory_mode != PCM_STATE_S || a->pi_holders_bitmap != 0
+			|| a->directory_mode != PCM_STATE_S
 			|| decoded.common.sender_connection_generation != PGRAC_RESOURCE_X_RETAINED_SENDER_GENERATION)
 			return false;
 	}
@@ -2385,6 +2409,8 @@ pcm_entry_retire_eligible_locked(struct GrdEntry *entry, uint64 expected_generat
 	}
 	if (!pcm_read_grant_state_valid(state) || state->pending_s_bitmap != 0
 		|| !pcm_resource_x_holder_grants_valid_locked(entry, state)
+		|| !pcm_resource_x_pi_carrier_decode_locked(entry, state, NULL)
+		|| state->pi_carrier.transport_refs || state->pi_carrier.pi_refs
 		|| state->holder_status.valid != 0 || state->holder_image.valid != 0
 		|| state->holder_pi_first.source_flags != 0 /* D S09 R-A22 */
 		|| state->holder_status_intent.slot.state != RESOURCE_X_INTENT_SLOT_EMPTY
@@ -3064,6 +3090,10 @@ pcm_resource_x_reconfig_proof_slot_locked(struct GrdEntry *entry,
 				: source_settlement.body.blocked_to_n.source_carrier_generation);
 	}
 
+	if (!pcm_resource_x_pi_carrier_decode_locked(entry, state, NULL))
+		return false;
+	for (Size n = 0; n < sizeof(state->pi_carrier); n++)
+		digest = pcm_resource_x_proof_digest_u64(digest, ((const uint8 *)&state->pi_carrier)[n]);
 	if (!pcm_resource_x_settlement_retry_decode_locked(entry, state, &source_settlement))
 		return false;
 	digest = pcm_resource_x_proof_digest_u64(digest, state->settlement_retry.generation);
@@ -4440,7 +4470,9 @@ pcm_resource_x_terminal_state_locked(struct GrdEntry *entry,
 	if (!pcm_resource_x_holder_grants_valid_locked(entry, state))
 		return pcm_protocol_refuse(diagnostic, 220, __LINE__, -1);
 	/* D S09 R-A22: a PENDING first record is unretired WAL responsibility. */
-	if (state->holder_pi_first.source_flags != 0)
+	if (!pcm_resource_x_pi_carrier_decode_locked(entry, state, NULL)
+		|| state->pi_carrier.transport_refs || state->pi_carrier.pi_refs
+		|| state->holder_pi_first.source_flags != 0)
 		return pcm_protocol_refuse(diagnostic, 203, __LINE__, -1);
 	if (state->holder_status.valid != 0 || state->holder_image.valid != 0
 		|| state->holder_status_intent.slot.state != RESOURCE_X_INTENT_SLOT_EMPTY
@@ -10328,6 +10360,10 @@ pcm_resource_x_protocol_state_locked(struct GrdEntry *entry, bool *active_out, b
 	}
 
 	if (state != NULL) {
+		if (!pcm_resource_x_pi_carrier_decode_locked(entry, state, NULL))
+			PCM_PROTOCOL_INVALID(146, -1);
+		if (state->pi_carrier.transport_refs || state->pi_carrier.pi_refs)
+			retained = true;
 		if (!pcm_read_grant_state_valid(state))
 			PCM_PROTOCOL_INVALID(145, -1);
 		if (state->pending_s_bitmap != 0)
@@ -12594,6 +12630,9 @@ cluster_pcm_local_pi_retire_v1(const ClusterPcmLocalPiSnapshotV1 *local,
 							   uint32 source_count, const ClusterPiPhysicalAckV1 *ack)
 {
 	ClusterPcmLocalPiSnapshotV1 current;
+	ClusterPcmLocalPiSnapshotV1 carrier_scope;
+	ClusterPcmResourceXPiCarrier carrier;
+	ClusterPcmResourceXMasterState *state;
 	PcmEntryRef ref;
 	PcmEntryAcquireResult acquired;
 	int32 ack_node;
@@ -12602,14 +12641,20 @@ cluster_pcm_local_pi_retire_v1(const ClusterPcmLocalPiSnapshotV1 *local,
 		|| !cluster_page_data_pi_ack_read_v1(ack, receipt, &ack_node) || ack_node != cluster_node_id
 		|| !cluster_page_data_covers_local_pi_v1(receipt, plan, sources, source_count, local))
 		return false;
+	if (!pcm_resource_x_pi_carrier_observe(local->resource, &carrier, &carrier_scope)
+		|| (carrier.pi_refs && !cluster_page_data_covers_local_pi_v1(
+			receipt, plan, sources, source_count, &carrier_scope)))
+		return false;
 	if (!pcm_entry_ref_acquire(&local->resource, false, &ref, &acquired))
 		return acquired == PCM_ENTRY_ACQUIRE_NOT_FOUND && local->binding_generation == 0
 			   && local->revision == 0 && local->first.record_start == 0
 			   && local->last.record_start == 0;
 	pcm_entry_lock_exclusive(ref.entry);
+	state = pcm_resource_x_master_state_for_entry(ref.entry);
 	result = pcm_local_pi_snapshot_locked(ref.entry, &current)
 			 && memcmp(&current, local, sizeof(current)) == 0
-			 && ref.entry->local_pi_revision < UINT64_MAX - 1;
+			 && ref.entry->local_pi_revision < UINT64_MAX - 1
+			 && state != NULL && pcm_resource_x_pi_carrier_release_locked(ref.entry, state, &carrier);
 	if (result)
 		pcm_local_pi_release_locked(ref.entry);
 	LWLockRelease(&ref.entry->entry_lock.lock);
@@ -12623,6 +12668,9 @@ cluster_pcm_local_pi_retire_structural_v2(const ClusterPcmLocalPiSnapshotV1 *loc
 										  const ClusterPiStructuralAckV2 *ack)
 {
 	ClusterPcmLocalPiSnapshotV1 current;
+	ClusterPcmLocalPiSnapshotV1 carrier_scope;
+	ClusterPcmResourceXPiCarrier carrier;
+	ClusterPcmResourceXMasterState *state;
 	PcmEntryRef ref;
 	PcmEntryAcquireResult acquired;
 	int32 node;
@@ -12631,14 +12679,19 @@ cluster_pcm_local_pi_retire_structural_v2(const ClusterPcmLocalPiSnapshotV1 *loc
 		|| !cluster_page_structural_pi_ack_read_v2(ack, receipt, &node) || node != cluster_node_id
 		|| !cluster_page_structural_covers_local_pi_v2(receipt, local))
 		return false;
+	if (!pcm_resource_x_pi_carrier_observe(local->resource, &carrier, &carrier_scope)
+		|| (carrier.pi_refs && !cluster_page_structural_covers_local_pi_v2(receipt, &carrier_scope)))
+		return false;
 	if (!pcm_entry_ref_acquire(&local->resource, false, &ref, &acquired))
 		return acquired == PCM_ENTRY_ACQUIRE_NOT_FOUND && local->binding_generation == 0
 			   && local->revision == 0 && local->first.record_start == 0
 			   && local->last.record_start == 0;
 	pcm_entry_lock_exclusive(ref.entry);
+	state = pcm_resource_x_master_state_for_entry(ref.entry);
 	result = pcm_local_pi_snapshot_locked(ref.entry, &current)
 			 && memcmp(&current, local, sizeof(current)) == 0
-			 && ref.entry->local_pi_revision < UINT64_MAX - 1;
+			 && ref.entry->local_pi_revision < UINT64_MAX - 1
+			 && state != NULL && pcm_resource_x_pi_carrier_release_locked(ref.entry, state, &carrier);
 	if (result)
 		pcm_local_pi_release_locked(ref.entry);
 	LWLockRelease(&ref.entry->entry_lock.lock);
@@ -12745,7 +12798,7 @@ cluster_pcm_local_pi_floor_v1(const ClusterWalSourceRef *source, ClusterPcmLocal
 		return false;
 	for (int i = 0; i < pcm_grd_effective; i++) {
 		ClusterPcmResourceXSlot slot;
-		ClusterPcmLocalPiSnapshotV1 local;
+		ClusterPcmLocalPiSnapshotV1 local, carrier = {0};
 		ClusterPageWalBindingV1 pending;
 		struct GrdEntry *entry;
 		bool found = false, valid;
@@ -12772,6 +12825,9 @@ cluster_pcm_local_pi_floor_v1(const ClusterWalSourceRef *source, ClusterPcmLocal
 
 			LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
 			valid = pcm_local_pi_snapshot_locked(entry, &local);
+			if (valid)
+				valid = state->binding_generation == slot.binding_generation
+					&& pcm_resource_x_pi_carrier_decode_locked(entry, state, &carrier);
 			/* D S09 R-A22: a PENDING holder pair already owes its first record:
 			 * it carries the lower from the descriptor to the local PI. */
 			memset(&pending, 0, sizeof(pending));
@@ -12801,16 +12857,20 @@ cluster_pcm_local_pi_floor_v1(const ClusterWalSourceRef *source, ClusterPcmLocal
 				value.unbounded++;
 			}
 		}
-		if (local.first.record_start == InvalidXLogRecPtr)
-			continue;
-		if (pcm_local_pi_source_equal(&local.first.source, source)) {
-			value.bounded++;
-			if (value.floor == InvalidXLogRecPtr || local.first.record_start < value.floor)
-				value.floor = local.first.record_start;
-		} else if (pcm_local_pi_source_equal(&local.last.source, source))
-			value.unbounded++;
-		else
-			value.foreign++;
+		/* The carrier owns an independent lower even if the current logical
+		 * PI has advanced. Never substitute a newer native page or its LSN. */
+		for (int owner = 0; owner < 2; owner++) {
+			const ClusterPcmLocalPiSnapshotV1 *scope = owner ? &carrier : &local;
+			if (scope->first.record_start == InvalidXLogRecPtr) continue;
+			if (pcm_local_pi_source_equal(&scope->first.source, source)) {
+				value.bounded++;
+				if (value.floor == InvalidXLogRecPtr || scope->first.record_start < value.floor)
+					value.floor = scope->first.record_start;
+			} else if (pcm_local_pi_source_equal(&scope->last.source, source))
+				value.unbounded++;
+			else
+				value.foreign++;
+		}
 	}
 	*out = value;
 	return true;
@@ -13216,7 +13276,9 @@ pcm_resource_x_role_pending_locked(struct GrdEntry *entry,
 				PCM_PENDING_NOTE(CLUSTER_PCM_PI_PENDING_HOLDER_PAIR);
 			}
 		}
-		if (state->holder_pi_first.source_flags != 0) {
+		if (state->holder_pi_first.source_flags != 0
+			|| state->pi_carrier.pi_refs || state->pi_carrier.transport_refs
+			|| !pcm_resource_x_pi_carrier_decode_locked(entry, state, NULL)) {
 			local = directory = true;
 			PCM_PENDING_NOTE(CLUSTER_PCM_PI_PENDING_HOLDER_PAIR);
 		}
@@ -13302,6 +13364,8 @@ pcm_ko_local_terminal_discard_locked(struct GrdEntry *entry,
 			&& request->phase != RESOURCE_X_MASTER_SETTLED
 			&& request->phase != RESOURCE_X_MASTER_RELEASED)
 		|| state->holder_pi_first.source_flags != 0
+		|| state->pi_carrier.pi_refs || state->pi_carrier.transport_refs
+		|| !pcm_resource_x_pi_carrier_decode_locked(entry, state, NULL)
 		|| state->requester_settlement_intent.slot.state != RESOURCE_X_INTENT_SLOT_EMPTY
 		|| state->settlement_retry.pending || state->settlement_retry.running
 		|| pcm_resource_x_source_settlement_live(state))
@@ -25456,6 +25520,12 @@ cluster_pcm_lock_resource_x_acquire_s_source_forward_exact(const ResourceXDecode
 	if (result != RESOURCE_X_APPLY_APPLIED) goto done;
 	result = pcm_resource_x_s_source_domain_locked(ref.entry, state, &canonical, master);
 	if (result != RESOURCE_X_APPLY_APPLIED) goto done;
+	if (!pcm_resource_x_pi_carrier_decode_locked(ref.entry, state, NULL)) {
+		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED; goto done;
+	}
+	if (state->pi_carrier.pi_refs && !pcm_resource_x_s_source_block_matches(state, &canonical)) {
+		result = RESOURCE_X_APPLY_LOCAL_WAIT; goto done;
+	}
 	if (state->holder_status.valid == RESOURCE_X_HOLDER_SOURCE_FORWARD) {
 		if (!pcm_resource_x_s_source_forward_valid(ref.entry, state, &retained)) {
 			result = RESOURCE_X_APPLY_RECOVERY_BLOCKED; goto done;
@@ -25502,8 +25572,8 @@ done:
 /* Validate retained evidence independently of current membership. R8 must
  * still recognize an old formation's exact debt after the gate freezes. */
 static bool
-pcm_resource_x_s_source_pair_valid_inner(const struct GrdEntry *entry,
-	const ClusterPcmResourceXMasterState *state)
+pcm_resource_x_s_source_body_valid_inner(const struct GrdEntry *entry,
+	const ClusterPcmResourceXMasterState *state, ResourceXDecodedFrame *image_out)
 {
 	const ClusterPcmResourceXHolderStatus *status = &state->holder_status;
 	const ClusterPcmResourceXHolderImage *image = &state->holder_image;
@@ -25566,8 +25636,20 @@ pcm_resource_x_s_source_pair_valid_inner(const struct GrdEntry *entry,
 		|| memcmp(&witness, &frame.body.acquire_image.source, sizeof(witness)) != 0)
 		return false;
 	common.semantic_crc32c = frame.common.semantic_crc32c;
-	if (!pcm_resource_x_common_equal(&common, &frame.common)
-		|| !pcm_resource_x_holder_source_slots_exact(state, status, image))
+	if (!pcm_resource_x_common_equal(&common, &frame.common))
+		return false;
+	if (image_out != NULL) *image_out = frame;
+	return true;
+}
+
+static bool
+pcm_resource_x_s_source_pair_valid_inner(const struct GrdEntry *entry,
+	const ClusterPcmResourceXMasterState *state)
+{
+	const ClusterPcmResourceXHolderStatus *status = &state->holder_status;
+
+	if (!pcm_resource_x_s_source_body_valid_inner(entry, state, NULL)
+		|| !pcm_resource_x_holder_source_slots_exact(state, status, &state->holder_image))
 		return false;
 	if (status->valid == RESOURCE_X_HOLDER_PAIR_PENDING)
 		return state->holder_status_intent.slot.state == RESOURCE_X_INTENT_SLOT_EMPTY
@@ -25683,6 +25765,11 @@ static bool
 pcm_resource_x_s_source_pair_valid(const struct GrdEntry *entry,
 	const ClusterPcmResourceXMasterState *state)
 {
+	if (!pcm_resource_x_pi_carrier_decode_locked(entry, state, NULL)) return false;
+	/* A separately proved PI-only body has no original transport slots.
+	 * The old transport decoder below retains every original condition. */
+	if (state->pi_carrier.pi_refs == 1 && state->pi_carrier.transport_refs == 0)
+		return pcm_resource_x_pi_carrier_decode_locked(entry, state, NULL);
 	return state->holder_status.payload_bytes == RESOURCE_X_WITNESS_V4_BYTES
 		? pcm_resource_x_s_holder_pair_valid(entry, state)
 		: pcm_resource_x_s_source_pair_valid_inner(entry, state);
@@ -25717,6 +25804,154 @@ pcm_resource_x_s_source_block_matches(const ClusterPcmResourceXMasterState *stat
 		&& cluster_resource_x_wire_encode(RESOURCE_X_MSG_BLOCK_TO_N, block,
 			supplied, sizeof(supplied), &right, &reject)
 		&& left == sizeof(retained) && right == left && memcmp(retained, supplied, left) == 0;
+}
+
+/* Independent PI-reference decoder. It validates the unchanged original
+ * body and native publication receipt, without treating a later descriptor
+ * or the source-settlement ACK slot as that body's transport producer. */
+static bool
+pcm_resource_x_pi_carrier_decode_locked(const struct GrdEntry *entry,
+	const ClusterPcmResourceXMasterState *state, ClusterPcmLocalPiSnapshotV1 *scope)
+{
+	static const ClusterPcmResourceXPiCarrier empty;
+	static const ClusterPageWalRefV1 empty_ref;
+	const ClusterPcmResourceXPiCarrier *carrier = &state->pi_carrier;
+	ClusterPcmLocalPiSnapshotV1 value = {0};
+	ClusterPcmOwnSnapshot expected;
+	ResourceXDecodedFrame image;
+	const ResourceXDecodedImageEnvelope *body = &image.body.acquire_image.original_image;
+
+	if (scope != NULL) memset(scope, 0, sizeof(*scope));
+	if (carrier->transport_refs == 0 && carrier->pi_refs == 0)
+		return memcmp(carrier, &empty, sizeof(empty)) == 0;
+	if (carrier->transport_refs > 1 || carrier->pi_refs > 1
+		|| carrier->reserved[0] != 0 || carrier->reserved[1] != 0
+		|| carrier->binding_generation != entry->binding_generation
+		|| carrier->pi_revision == 0 || carrier->pi_revision == UINT64_MAX
+		|| state->holder_status.valid != RESOURCE_X_HOLDER_PAIR_PUBLISHED
+		|| !pcm_resource_x_s_source_body_valid_inner(entry, state, &image)
+		|| image.common.semantic_crc32c != carrier->image_crc
+		|| image.common.target_mode != PCM_STATE_S
+		|| state->holder_acquire_s_native.pcm_state != PCM_STATE_S
+		|| (!carrier->transport_refs && state->holder_image_intent.state != RESOURCE_X_INTENT_SLOT_EMPTY))
+		return false;
+	expected = state->holder_acquire_s_native;
+	expected.flags = 0;
+	expected.semantic_buf_state |= carrier->completed.semantic_buf_state
+		& (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED);
+	if (!cluster_pcm_own_snapshot_equal_exact(&expected, &carrier->completed))
+		return false;
+	if (!carrier->pi_refs)
+		return memcmp(&carrier->first, &empty_ref, sizeof(empty_ref)) == 0
+			&& memcmp(&carrier->last, &empty_ref, sizeof(empty_ref)) == 0;
+	value.resource = entry->tag;
+	value.binding_generation = carrier->binding_generation;
+	value.revision = carrier->pi_revision;
+	if (body->image_flags != RESOURCE_X_IMAGE_HAS_WAL
+		|| !cluster_page_wal_ref_read_v1(&carrier->first, BufTagGetRelFileLocator(&entry->tag),
+			entry->tag.forkNum, entry->tag.blockNum, &value.first)
+		|| !cluster_page_wal_ref_read_v1(&carrier->last, BufTagGetRelFileLocator(&entry->tag),
+			entry->tag.forkNum, entry->tag.blockNum, &value.last)
+		|| !cluster_page_wal_same_mutation_v1(&value.last, &body->page_wal)
+		|| memcmp(value.first.version.segment_incarnation, value.last.version.segment_incarnation, 16) != 0)
+		return false;
+	if (scope != NULL) *scope = value;
+	return true;
+}
+
+static ResourceXApplyResult
+pcm_resource_x_pi_carrier_prepare_locked(struct GrdEntry *entry,
+	ClusterPcmResourceXMasterState *state, const ClusterPcmOwnSnapshot *finished,
+	ClusterPcmResourceXPiCarrier *prepared)
+{
+	ClusterPcmLocalPiSnapshotV1 local;
+	ResourceXDecodedFrame image;
+	const ResourceXDecodedImageEnvelope *body = &image.body.acquire_image.original_image;
+
+	memset(prepared, 0, sizeof(*prepared));
+	if (!pcm_resource_x_pi_carrier_decode_locked(entry, state, NULL))
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (state->pi_carrier.transport_refs || state->pi_carrier.pi_refs)
+		return cluster_pcm_own_snapshot_equal_exact(&state->pi_carrier.completed, finished)
+			? RESOURCE_X_APPLY_DUPLICATE : RESOURCE_X_APPLY_LOCAL_WAIT;
+	if (!pcm_local_pi_snapshot_locked(entry, &local)) return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (local.first.record_start == 0) return RESOURCE_X_APPLY_APPLIED;
+	if (!pcm_resource_x_s_source_body_valid_inner(entry, state, &image))
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	/* Compatible S is the first connected carrier class. X/native handoff
+	 * and migration retain their original pending owner until connected. */
+	if (state->holder_acquire_s_native.pcm_state != PCM_STATE_S
+		|| image.common.target_mode != PCM_STATE_S
+		|| body->image_flags != RESOURCE_X_IMAGE_HAS_WAL
+		|| !cluster_page_wal_same_mutation_v1(&local.last, &body->page_wal))
+		return RESOURCE_X_APPLY_LOCAL_WAIT;
+	prepared->completed = *finished;
+	prepared->binding_generation = entry->binding_generation;
+	prepared->pi_revision = local.revision;
+	prepared->image_crc = image.common.semantic_crc32c;
+	prepared->transport_refs = prepared->pi_refs = 1;
+	if (!cluster_page_wal_ref_retain_v1(&local.first, &prepared->first))
+		return RESOURCE_X_APPLY_LOCAL_WAIT;
+	if (!cluster_page_wal_ref_retain_v1(&local.last, &prepared->last)) {
+		if (!cluster_page_wal_ref_release_v1(&prepared->first))
+			elog(PANIC, "PI carrier lost its prepared WAL reference");
+		memset(prepared, 0, sizeof(*prepared));
+		return RESOURCE_X_APPLY_LOCAL_WAIT;
+	}
+	return RESOURCE_X_APPLY_APPLIED;
+}
+
+/* Observation copies references for equality/read only; it owns none. */
+static bool
+pcm_resource_x_pi_carrier_observe(BufferTag tag, ClusterPcmResourceXPiCarrier *observation,
+	ClusterPcmLocalPiSnapshotV1 *scope)
+{
+	PcmEntryRef ref;
+	PcmEntryAcquireResult acquired;
+	ClusterPcmResourceXMasterState *state;
+	bool valid;
+
+	memset(observation, 0, sizeof(*observation));
+	memset(scope, 0, sizeof(*scope));
+	if (!pcm_entry_ref_acquire(&tag, false, &ref, &acquired))
+		return acquired == PCM_ENTRY_ACQUIRE_NOT_FOUND;
+	LWLockAcquire(&ref.entry->entry_lock.lock, LW_SHARED);
+	state = pcm_resource_x_master_state_for_entry(ref.entry);
+	valid = state != NULL && pcm_resource_x_pi_carrier_decode_locked(ref.entry, state, scope);
+	if (valid) *observation = state->pi_carrier;
+	LWLockRelease(&ref.entry->entry_lock.lock);
+	pcm_entry_ref_release(&ref);
+	return valid;
+}
+
+static void
+pcm_resource_x_read_source_pair_clear(ClusterPcmResourceXMasterState *state)
+{
+	memset(&state->holder_status, 0, sizeof(state->holder_status));
+	memset(&state->holder_image, 0, sizeof(state->holder_image));
+	memset(&state->holder_image_intent, 0, sizeof(state->holder_image_intent));
+	memset(&state->holder_acquire_s_native, 0, sizeof(state->holder_acquire_s_native));
+	state->holder_acquire_s_buffer_id = state->holder_acquire_s_forward_connection = 0;
+	memset(&state->pi_carrier, 0, sizeof(state->pi_carrier));
+}
+
+static bool
+pcm_resource_x_pi_carrier_release_locked(struct GrdEntry *entry,
+	ClusterPcmResourceXMasterState *state, const ClusterPcmResourceXPiCarrier *observed)
+{
+	ClusterPcmResourceXPiCarrier *carrier = &state->pi_carrier;
+
+	if (memcmp(carrier, observed, sizeof(*carrier)) != 0
+		|| !pcm_resource_x_pi_carrier_decode_locked(entry, state, NULL)) return false;
+	if (!carrier->pi_refs) return true;
+	if (!pcm_resource_x_intent_mark_dirty()) return false;
+	if (!cluster_page_wal_ref_release_v1(&carrier->first)
+		|| !cluster_page_wal_ref_release_v1(&carrier->last))
+		elog(PANIC, "PI carrier lost its owned WAL references");
+	carrier->pi_refs = 0;
+	if (!carrier->transport_refs) pcm_resource_x_read_source_pair_clear(state);
+	ConditionVariableBroadcast(&entry->wait_cv);
+	return true;
 }
 
 /* The remote master is authenticated by the caller. A colocated master
@@ -25991,6 +26226,12 @@ pcm_resource_x_acquire_s_source_prepare_internal(const ResourceXDecodedFrame *bl
 	if (result != RESOURCE_X_APPLY_APPLIED) goto done;
 	result = pcm_resource_x_s_source_domain_locked(ref.entry, state, &canonical, master);
 	if (result != RESOURCE_X_APPLY_APPLIED) goto done;
+	if (!pcm_resource_x_pi_carrier_decode_locked(ref.entry, state, NULL)) {
+		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED; goto done;
+	}
+	if (state->pi_carrier.pi_refs && !pcm_resource_x_s_source_block_matches(state, &canonical)) {
+		result = RESOURCE_X_APPLY_LOCAL_WAIT; goto done;
+	}
 	if (claim != NULL && memcmp(claim, &ref.entry->resource_x_source_drain, sizeof(*claim)) != 0) {
 		result = RESOURCE_X_APPLY_STALE; goto done;
 	}
@@ -26219,6 +26460,7 @@ cluster_pcm_lock_resource_x_acquire_s_source_publish_exact(const ResourceXDecode
 {
 	ResourceXDecodedFrame canonical;
 	ClusterPcmOwnSnapshot expected;
+	ClusterPcmResourceXPiCarrier carrier;
 	ClusterPcmResourceXMasterState *state;
 	PcmEntryRef ref;
 	PcmEntryAcquireResult acquired;
@@ -26241,6 +26483,8 @@ cluster_pcm_lock_resource_x_acquire_s_source_publish_exact(const ResourceXDecode
 		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED; goto done;
 	}
 	result = pcm_resource_x_s_source_domain_locked(ref.entry, state, &canonical, master);
+	if (result != RESOURCE_X_APPLY_APPLIED) goto done;
+	result = pcm_resource_x_s_source_retired_locked(ref.entry, state, &canonical);
 	if (result != RESOURCE_X_APPLY_APPLIED) goto done;
 	expected = *prepared;
 	if (canonical.common.target_mode == PCM_STATE_S) {
@@ -26267,9 +26511,17 @@ cluster_pcm_lock_resource_x_acquire_s_source_publish_exact(const ResourceXDecode
 	if (state->holder_status.valid == RESOURCE_X_HOLDER_PAIR_PUBLISHED) {
 		result = RESOURCE_X_APPLY_DUPLICATE; goto done;
 	}
+	result = pcm_resource_x_pi_carrier_prepare_locked(ref.entry, state, finished, &carrier);
+	if (result != RESOURCE_X_APPLY_APPLIED) goto done;
 	if (!pcm_resource_x_rearm_holder_source_locked(state, &state->holder_status, &state->holder_image)) {
+		if (carrier.pi_refs) {
+			if (!cluster_page_wal_ref_release_v1(&carrier.first)
+				|| !cluster_page_wal_ref_release_v1(&carrier.last))
+				elog(PANIC, "PI carrier lost its unpublished WAL references");
+		}
 		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED; goto done;
 	}
+	state->pi_carrier = carrier; /* move both references, before either send */
 	state->holder_status.valid = RESOURCE_X_HOLDER_PAIR_PUBLISHED;
 	state->holder_image.valid = RESOURCE_X_HOLDER_PAIR_PUBLISHED;
 	result = RESOURCE_X_APPLY_APPLIED;
@@ -26279,8 +26531,8 @@ done:
 	return result;
 }
 
-/* Full read settlement is a transport retirement, never PI/WAL retirement.
- * Only a compatible, originally clean S source is covered here. */
+/* Full read settlement is transport retirement, never PI/WAL retirement.
+ * Only a compatible S source with separately retained PI is covered here. */
 static bool
 pcm_resource_x_read_source_frame(const ResourceXDecodedFrame *input,
 	ResourceXWireKind kind, ResourceXDecodedFrame *canonical, uint8 *bytes)
@@ -26303,7 +26555,7 @@ pcm_resource_x_read_source_frame(const ResourceXDecodedFrame *input,
 		return false;
 	a = &canonical->body.acquire_completion.decision;
 	if (a->source_kind != RESOURCE_X_ACQUIRE_SOURCE_REMOTE_CURRENT
-		|| a->directory_mode != PCM_STATE_S || a->pi_holders_bitmap != 0)
+		|| a->directory_mode != PCM_STATE_S)
 		return false;
 	canonical->common.sender_connection_generation = PGRAC_RESOURCE_X_RETAINED_SENDER_GENERATION;
 	grant = *canonical;
@@ -26396,7 +26648,8 @@ pcm_resource_x_read_source_ack_send_valid(struct GrdEntry *entry,
 
 /* The original received-request owner survives local producer/send busy.
  * Once native publication and both original physical callbacks are quiet,
- * replace only their clean immutable transport pair with its exact ACK. */
+ * replace the transport owner with its exact ACK. An independently owned
+ * PI reference keeps the original immutable body and WAL lower. */
 ResourceXApplyResult
 cluster_pcm_lock_resource_x_acquire_read_source_settlement_exact(
 	const ResourceXDecodedFrame *input, int32 master, uint32 peer_generation)
@@ -26428,7 +26681,8 @@ cluster_pcm_lock_resource_x_acquire_read_source_settlement_exact(
 	result = pcm_resource_x_s_source_domain_locked(ref.entry, state, &block, master);
 	if (result != RESOURCE_X_APPLY_APPLIED) goto done;
 	retry = &state->settlement_retry;
-	if (!pcm_resource_x_settlement_retry_decode_locked(ref.entry, state, NULL)) {
+	if (!pcm_resource_x_settlement_retry_decode_locked(ref.entry, state, NULL)
+		|| !pcm_resource_x_pi_carrier_decode_locked(ref.entry, state, NULL)) {
 		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED; goto done;
 	}
 	same = retry->generation != 0 && retry->master == master
@@ -26440,8 +26694,10 @@ cluster_pcm_lock_resource_x_acquire_read_source_settlement_exact(
 				? RESOURCE_X_APPLY_DUPLICATE : RESOURCE_X_APPLY_LOCAL_WAIT;
 			goto done;
 		}
-		if (state->holder_status.valid != 0 || state->holder_image.valid != 0
-			|| !pcm_resource_x_s_source_empty(state)) {
+		if ((state->holder_status.valid != 0 || state->holder_image.valid != 0
+			 || !pcm_resource_x_s_source_empty(state))
+			&& !(state->pi_carrier.pi_refs == 1 && state->pi_carrier.transport_refs == 0
+				&& pcm_resource_x_s_source_block_matches(state, &block))) {
 			result = RESOURCE_X_APPLY_LOCAL_WAIT; goto done;
 		}
 		if (!pcm_resource_x_read_source_ack_prepare(&request,
@@ -26472,6 +26728,12 @@ cluster_pcm_lock_resource_x_acquire_read_source_settlement_exact(
 		|| memcmp(&state->holder_pi_first, &empty_pi, sizeof(empty_pi)) != 0) {
 		result = RESOURCE_X_APPLY_LOCAL_WAIT; goto done;
 	}
+	if ((request.body.acquire_completion.decision.pi_holders_bitmap
+		 & (UINT32_C(1) << cluster_node_id)) != 0 && state->pi_carrier.transport_refs != 1) {
+		/* A directory PI bit alone cannot prove an immutable carrier or
+		 * that its independent durable responsibility has retired. */
+		result = RESOURCE_X_APPLY_LOCAL_WAIT; goto done;
+	}
 	if (!same) {
 		if (retry->generation >= UINT64_MAX - 1 || !pcm_resource_x_intent_mark_pending(false)) {
 			result = RESOURCE_X_APPLY_RECOVERY_BLOCKED; goto done;
@@ -26492,11 +26754,8 @@ cluster_pcm_lock_resource_x_acquire_read_source_settlement_exact(
 		|| !pcm_resource_x_intent_mark_dirty()) {
 		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED; goto done;
 	}
-	memset(&state->holder_status, 0, sizeof(state->holder_status));
-	memset(&state->holder_image, 0, sizeof(state->holder_image));
-	memset(&state->holder_image_intent, 0, sizeof(state->holder_image_intent));
-	memset(&state->holder_acquire_s_native, 0, sizeof(state->holder_acquire_s_native));
-	state->holder_acquire_s_buffer_id = state->holder_acquire_s_forward_connection = 0;
+	state->pi_carrier.transport_refs = 0;
+	if (!state->pi_carrier.pi_refs) pcm_resource_x_read_source_pair_clear(state);
 	state->holder_status_intent = ack;
 	retry->pending = 0;
 	retry->retired_authority = request.common.authority_generation;
@@ -34273,8 +34532,9 @@ pcm_resource_x_acquire_clean_source_progress_locked(struct GrdEntry *entry,
 	const ResourceXDecodedAcquireDecision *a = &notice->body.acquire_completion.decision;
 	uint16 length = 0;
 
-	/* X->S and PI sources keep their independent logical carrier duties. */
-	if (a->directory_mode != PCM_STATE_S || a->pi_holders_bitmap != 0)
+	/* X->S still requires its separate native/carrier handoff. A compatible
+	 * S source independently acknowledges transport while preserving PI. */
+	if (a->directory_mode != PCM_STATE_S)
 		return RESOURCE_X_APPLY_LOCAL_WAIT;
 	result = pcm_resource_x_acquire_source_ready_locked(state, notice);
 	if (result != RESOURCE_X_APPLY_APPLIED) return result;

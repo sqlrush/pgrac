@@ -239,7 +239,15 @@ UT_TEST(test_source_done_all_arrival_orders_return_same_read_only_evidence)
 			sizeof(out.body.acquire_completion)) == 0);
 		UT_ASSERT_EQ(out.common.sender_connection_generation, 1);
 		UT_ASSERT(memcmp(&before, f.state, sizeof(before)) == 0);
-		/* Existing resume cannot discharge a source debt or arm consumed. */
+		/* Compatible S may now arm one source settlement, but cannot
+		 * discharge PI or arm consumed without that source's exact ACK. */
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_done_resume_exact(&f.work), RESOURCE_X_APPLY_LOCAL_WAIT);
+		if (scenario == 2) {
+			UT_ASSERT_EQ(f.state->source_settlement.state, RESOURCE_X_SOURCE_SETTLEMENT_PENDING);
+			UT_ASSERT_EQ(f.state->source_settlement.intent.slot.payload_bytes, RESOURCE_X_SOURCE_COMPLETE_V11_BYTES);
+			before.source_settlement = f.state->source_settlement;
+		}
+		UT_ASSERT(memcmp(&before, f.state, sizeof(before)) == 0);
 		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_done_resume_exact(&f.work), RESOURCE_X_APPLY_LOCAL_WAIT);
 		UT_ASSERT(memcmp(&before, f.state, sizeof(before)) == 0);
 	}

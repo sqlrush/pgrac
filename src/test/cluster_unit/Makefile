@@ -5600,7 +5600,7 @@ test_cluster_pcm_settlement_ingress.inc: $(top_srcdir)/src/backend/cluster/clust
 	     END { if (count != 4 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_pcm_lock test_cluster_pcm_object_retire test_cluster_pcm_stop_cv test_cluster_pcm_read_grant test_cluster_resource_x_acquire_ingress test_cluster_resource_x_decision_send test_cluster_resource_x_decision_publish test_cluster_resource_x_holder_send test_cluster_resource_x_master_ack test_cluster_resource_x_master_done test_cluster_resource_x_master_consumed test_cluster_resource_x_master_quiet test_cluster_resource_x_master_unarmed test_cluster_resource_x_source_ack test_cluster_resource_x_s_source test_cluster_resource_x_source_done test_cluster_resource_x_clean_settlement: %: %.c test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
+test_cluster_pcm_lock test_cluster_pcm_object_retire test_cluster_pcm_stop_cv test_cluster_pcm_read_grant test_cluster_resource_x_acquire_ingress test_cluster_resource_x_decision_send test_cluster_resource_x_decision_publish test_cluster_resource_x_holder_send test_cluster_resource_x_master_ack test_cluster_resource_x_master_done test_cluster_resource_x_master_consumed test_cluster_resource_x_master_quiet test_cluster_resource_x_master_unarmed test_cluster_resource_x_source_ack test_cluster_resource_x_s_source test_cluster_resource_x_source_done test_cluster_resource_x_clean_settlement test_cluster_resource_x_pi_carrier: %: %.c test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
 		test_cluster_pcm_master_durable.inc \
 		test_cluster_pcm_bootstrap_tick.inc \
 		test_cluster_pcm_settlement_ingress.inc \
@@ -10256,6 +10256,23 @@ clean distclean maintainer-clean: clean-resource-x-clean-settlement
 clean-resource-x-clean-settlement:
 	rm -f test_cluster_resource_x_clean_settlement test_cluster_resource_x_source_done_fixture.inc \
 		test_cluster_resource_x_source_done_fixture.inc.tmp
+
+TESTS += test_cluster_resource_x_pi_carrier
+all: test_cluster_resource_x_pi_carrier
+test_cluster_resource_x_pi_carrier: test_cluster_resource_x_clean_fixture.inc \
+		test_cluster_resource_x_source_done_fixture.inc test_cluster_resource_x_source_ack_fixture.inc \
+		test_cluster_resource_x_master_done_ingress.inc test_cluster_resource_x_master_ack_fixture.inc \
+		test_cluster_resource_x_acquire_fixture.inc test_cluster_resource_x_acquire_candidate.inc \
+		test_cluster_resource_x_decision_owner_layout.inc cluster_unit_port_stubs.o cluster_catalog_trace_test.o
+test_cluster_resource_x_clean_fixture.inc: test_cluster_resource_x_clean_settlement.c Makefile
+	awk '/^UT_TEST\(/ { stop=1 } !stop { print; lines++ } \
+	     END { if (!stop || lines < 100) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+clean distclean maintainer-clean: clean-resource-x-pi-carrier
+.PHONY: clean-resource-x-pi-carrier
+clean-resource-x-pi-carrier:
+	rm -f test_cluster_resource_x_pi_carrier test_cluster_resource_x_clean_fixture.inc \
+		test_cluster_resource_x_clean_fixture.inc.tmp
 
 TESTS += test_cluster_resource_x_s_source
 all: test_cluster_resource_x_s_source
