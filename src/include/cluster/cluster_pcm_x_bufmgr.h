@@ -1140,6 +1140,11 @@ extern ResourceXApplyResult cluster_bufmgr_pcm_own_acquire_quiet_unarmed_disk_ex
 extern ResourceXApplyResult cluster_bufmgr_pcm_own_acquire_cancel_wait_exact(BufferDesc *buf,
 	const ClusterPcmOwnSnapshot *base, const ResourceXDecodedAcquireIntent *episode,
 	const ResourceXInstallClaimJoinObservation *observation);
+/* Resident N/CURRENT or N/PI cancellation retires only the exact GP;
+ * BM_VALID, resident bytes and PI remain. There is no target BufferIO. */
+extern ResourceXApplyResult cluster_bufmgr_pcm_own_acquire_cancel_resident_wait_exact(BufferDesc *buf,
+	const ClusterPcmOwnSnapshot *base, const ResourceXDecodedAcquireIntent *episode,
+	const ResourceXInstallClaimJoinObservation *observation);
 
 /* Guard the original PREPARED disk/S producer before ResourceOwner cleanup.
  * APPLIED retains verified ARMED and original input IO, without native C.

@@ -98,6 +98,10 @@ typedef struct ClusterGcsFirstFill {
 
 extern ResourceXApplyResult cluster_gcs_block_first_fill_begin(
 	BufferDesc *buf, const ClusterPcmOwnSnapshot *base, uint64 token, ClusterGcsFirstFill *fill);
+/* Shares the stack request/wait context; native resident installation is
+ * separate from joining a master decision. Only N/CURRENT or N/PI -> S. */
+extern ResourceXApplyResult cluster_gcs_block_resident_read_begin(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *base, uint64 token, ClusterGcsFirstFill *fill);
 extern ResourceXApplyResult cluster_gcs_block_first_fill_wait(ClusterGcsFirstFill *fill);
 extern void cluster_gcs_block_first_fill_end(ClusterGcsFirstFill *fill);
 

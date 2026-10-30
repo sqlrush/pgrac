@@ -14066,6 +14066,18 @@ pcm_resource_x_acquire_read_unarmed(uint64 purpose)
 		|| pcm_resource_x_acquire_wait_cancel(purpose);
 }
 
+/* Resident reads share only the pre-executor no-image cancellation
+ * projection. Successful/armed first-fill byte proofs stay first-fill-only. */
+static bool
+pcm_resource_x_acquire_resident_wait_cancel(const ResourceXDecodedAcquireIntent *episode,
+	const ResourceXDecodedCommon *request, uint64 purpose)
+{
+	return episode->path == RESOURCE_X_ACQUIRE_RESIDENT
+		&& request->observed_mode == PCM_STATE_N && request->target_mode == PCM_STATE_S
+		&& (pcm_resource_x_acquire_wait_cancel(purpose)
+			|| purpose == RESOURCE_X_DELIVERY_ACQUIRE_UNARMED_CONSUMED);
+}
+
 static bool
 pcm_resource_x_acquire_read_is_quiet(uint64 purpose)
 {
@@ -14106,7 +14118,10 @@ pcm_resource_x_acquire_read_receipt_valid_locked(const ClusterPcmResourceXBootst
 	if (round->delivery_executor_purpose != RESOURCE_X_DELIVERY_ACQUIRE_READ_ARMED && !complete
 		&& !pcm_resource_x_acquire_read_closing(round->delivery_executor_purpose))
 		return memcmp(r, &empty, sizeof(empty)) == 0;
-	return round->has_acquire_intent == 1 && round->acquire_intent.path == RESOURCE_X_ACQUIRE_FIRST_FILL
+	return round->has_acquire_intent == 1
+		&& (round->acquire_intent.path == RESOURCE_X_ACQUIRE_FIRST_FILL
+			|| pcm_resource_x_acquire_resident_wait_cancel(&round->acquire_intent,
+				&round->request, round->delivery_executor_purpose))
 		&& round->request.target_mode == PCM_STATE_S
 		&& (pcm_resource_x_acquire_wait_cancel(round->delivery_executor_purpose)
 			? r->authority_generation == 0 && r->decision_crc32c == 0
@@ -30011,7 +30026,9 @@ pcm_resource_x_requester_acquire_frames_mode_locked(struct GrdEntry *entry,
 
 	round = &entry->resource_x_bootstrap_round;
 	state = pcm_resource_x_master_state_for_entry(entry);
-	if (closing && (claim == NULL || episode->path != RESOURCE_X_ACQUIRE_FIRST_FILL
+	if (closing && (claim == NULL
+			|| (episode->path != RESOURCE_X_ACQUIRE_FIRST_FILL
+				&& !pcm_resource_x_acquire_resident_wait_cancel(episode, &observation->request, claim->purpose))
 			|| observation->request.target_mode != PCM_STATE_S
 			|| (claim->purpose != RESOURCE_X_DELIVERY_ACQUIRE_READ_ARMED
 				&& claim->purpose != RESOURCE_X_DELIVERY_ACQUIRE_PREPARED
@@ -30143,7 +30160,8 @@ cluster_pcm_lock_resource_x_first_fill_retire_unsent_exact(
 		|| prepared->request.logical_assertion.requester_node != cluster_node_id
 		|| prepared->entry_binding_generation == 0
 		|| prepared->entry_binding_generation == UINT64_MAX
-		|| episode->path != RESOURCE_X_ACQUIRE_FIRST_FILL)
+		|| (episode->path != RESOURCE_X_ACQUIRE_FIRST_FILL
+			&& episode->path != RESOURCE_X_ACQUIRE_RESIDENT))
 		return RESOURCE_X_APPLY_INVALID;
 	expected = prepared->request;
 	expected.observed_mode = PCM_STATE_N;
@@ -30233,7 +30251,8 @@ cluster_pcm_lock_resource_x_requester_acquire_wait_exact(
 		|| observation->request.target_mode != PCM_STATE_S
 		|| observation->entry_binding_generation == 0
 		|| observation->entry_binding_generation == UINT64_MAX
-		|| episode->path != RESOURCE_X_ACQUIRE_FIRST_FILL
+		|| (episode->path != RESOURCE_X_ACQUIRE_FIRST_FILL
+			&& (episode->path != RESOURCE_X_ACQUIRE_RESIDENT || observation->request.observed_mode != PCM_STATE_N))
 		|| episode->buffer_id < 0 || episode->buffer_id >= NBuffers
 		|| !pcm_resource_x_acquire_identity_valid(&observation->request, episode,
 			observation->r4_record_generation))
@@ -30886,7 +30905,10 @@ pcm_resource_x_acquire_read_close_locked(struct GrdEntry *entry,
 		&execution->observation, episode, &candidate, &grant, &image, &join, true);
 	if (result != RESOURCE_X_APPLY_APPLIED)
 		return result;
-	if (!pcm_resource_x_acquire_read_source(&grant, &image)
+	/* The full canonical A/I/witness join above is still mandatory. Only
+	 * an unarmed resident cancellation may settle without a native I proof. */
+	if ((!pcm_resource_x_acquire_resident_wait_cancel(episode, &execution->observation.request, candidate.purpose)
+			&& !pcm_resource_x_acquire_read_source(&grant, &image))
 		|| (candidate.purpose != RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING
 			&& candidate.purpose != RESOURCE_X_DELIVERY_ACQUIRE_PREPARED
 			&& !pcm_resource_x_acquire_wait_cancel(candidate.purpose)
@@ -30956,10 +30978,33 @@ pcm_resource_x_acquire_wait_input(const ResourceXInstallClaimJoinObservation *ob
 		&& observation->request.target_mode == PCM_STATE_S
 		&& observation->entry_binding_generation != 0
 		&& observation->entry_binding_generation != UINT64_MAX
-		&& episode->path == RESOURCE_X_ACQUIRE_FIRST_FILL
+		&& (episode->path == RESOURCE_X_ACQUIRE_FIRST_FILL
+			|| (episode->path == RESOURCE_X_ACQUIRE_RESIDENT && observation->request.observed_mode == PCM_STATE_N))
 		&& episode->buffer_id >= 0 && episode->buffer_id < NBuffers
 		&& pcm_resource_x_acquire_identity_valid(&observation->request, episode,
 			observation->r4_record_generation);
+}
+
+static bool
+pcm_resource_x_acquire_wait_native_shape(const ResourceXDeliveryClaim *execution,
+	const ResourceXDecodedAcquireIntent *episode, const ClusterPcmOwnSnapshot *native, bool quiet)
+{
+	static const uint8 reserved[2];
+
+	if (episode->path == RESOURCE_X_ACQUIRE_FIRST_FILL)
+		return pcm_resource_x_acquire_read_close_shape(execution, episode, native, quiet);
+	return episode->path == RESOURCE_X_ACQUIRE_RESIDENT && native != NULL
+		&& execution->observation.request.observed_mode == PCM_STATE_N
+		&& execution->observation.request.target_mode == PCM_STATE_S
+		&& native->generation == episode->base_generation
+		&& native->reservation_token == episode->reservation_token
+		&& native->flags == (quiet ? 0 : PCM_OWN_FLAG_GRANT_PENDING)
+		&& native->writer_activation_token == 0 && native->resource_x_activation_generation == 0
+		&& native->pcm_state == PCM_STATE_N
+		&& (native->buffer_type == BUF_TYPE_CURRENT || native->buffer_type == BUF_TYPE_PI)
+		&& native->semantic_buf_state == (BM_TAG_VALID | BM_VALID)
+		&& memcmp(native->_reserved, reserved, sizeof(reserved)) == 0
+		&& BufferTagsEqual(&native->tag, &execution->observation.request.logical_assertion.resource);
 }
 
 static ResourceXApplyResult
@@ -31053,7 +31098,7 @@ cluster_pcm_lock_resource_x_requester_acquire_wait_seal_exact(
 		|| (write_io_generation & 1) != 0 || write_io_generation >= UINT64_MAX - 1)
 		return RESOURCE_X_APPLY_INVALID;
 	observed.observation = *observation;
-	if (!pcm_resource_x_acquire_read_close_shape(&observed, episode, native, false))
+	if (!pcm_resource_x_acquire_wait_native_shape(&observed, episode, native, false))
 		return RESOURCE_X_APPLY_STALE;
 	if (!pcm_entry_ref_acquire(&observation->request.logical_assertion.resource, false, &ref, &acquired))
 		return RESOURCE_X_APPLY_NOT_FOUND;
@@ -31103,7 +31148,7 @@ cluster_pcm_lock_resource_x_requester_acquire_wait_quiet_exact(
 	if (sealed == NULL || receipt == NULL
 		|| !pcm_resource_x_acquire_wait_input(&sealed->observation, episode)
 		|| sealed->purpose != RESOURCE_X_DELIVERY_ACQUIRE_WAIT_SEALING
-		|| !pcm_resource_x_acquire_read_close_shape(sealed, episode, terminal, true))
+		|| !pcm_resource_x_acquire_wait_native_shape(sealed, episode, terminal, true))
 		return RESOURCE_X_APPLY_INVALID;
 	if (!pcm_entry_ref_acquire(&sealed->observation.request.logical_assertion.resource, false, &ref, &acquired))
 		return RESOURCE_X_APPLY_NOT_FOUND;

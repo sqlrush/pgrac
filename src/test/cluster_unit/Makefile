@@ -11083,6 +11083,33 @@ clean-native-first-fill:
 		test_cluster_native_first_fill_evidence.inc.tmp
 
 # Original pre-C disk execution is bracketed before native IO/pin cleanup.
+TESTS += test_cluster_native_resident_request
+all: test_cluster_native_resident_request
+test_cluster_native_resident_request: test_cluster_native_resident_request.c test_cluster_native_first_fill \
+		test_cluster_native_first_fill_fixture.inc test_cluster_native_resident_wait_cancel.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+test_cluster_native_first_fill_fixture.inc: test_cluster_native_first_fill.c Makefile
+	awk '/^UT_TEST\(/ { stop=1 } !stop { print }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_native_resident_wait_cancel.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^\/\* Original resident read cancellation/ { emit=1; found++ } \
+	     /^\/\* End original resident read cancellation/ { emit=0; stop=1 } \
+	     emit { print } END { if (found != 1 || !stop) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+clean distclean maintainer-clean: clean-native-resident-request
+.PHONY: clean-native-resident-request
+clean-native-resident-request:
+	rm -f test_cluster_native_resident_request test_cluster_native_first_fill_fixture.inc \
+		test_cluster_native_first_fill_fixture.inc.tmp test_cluster_native_resident_wait_cancel.inc \
+		test_cluster_native_resident_wait_cancel.inc.tmp
+
 TESTS += test_cluster_native_disk_guard
 all: test_cluster_native_disk_guard
 test_cluster_native_disk_guard: test_cluster_native_disk_guard.c \

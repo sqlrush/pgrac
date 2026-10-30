@@ -1753,8 +1753,9 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_wait_o
 	const ResourceXInstallClaimJoinObservation *observation,
 	const ResourceXDecodedAcquireIntent *episode, ResourceXDeliveryClaim *out,
 	ResourceXAcquireReadReceipt *receipt);
-/* APPLIED retires only an original unsent round. DUPLICATE retains the
- * handed-off full E and returns its actual observation for exact cancel. */
+/* N->S first-fill/resident read: APPLIED retires only an original unsent
+ * round. DUPLICATE retains the handed-off full E and returns its actual
+ * observation for exact cancel. Neither result authorizes native bytes. */
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_first_fill_retire_unsent_exact(
 	const ResourceXInstallClaimJoinObservation *prepared,
 	const ResourceXDecodedAcquireIntent *episode, ResourceXInstallClaimJoinObservation *issued);

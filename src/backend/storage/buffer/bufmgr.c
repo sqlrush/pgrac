@@ -18627,6 +18627,125 @@ cluster_bufmgr_pcm_own_acquire_cancel_wait_exact(BufferDesc *buf,
 }
 /* End original pre-decision first-fill cancellation. */
 
+/* Original resident read cancellation. The entry seal prevents any new
+ * executor for this E. Retire only its native GP: the resident bytes and
+ * any PI responsibility survive, with no BufferIO operation or error bit. */
+static bool
+cluster_bufmgr_acquire_resident_wait_context(BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
+	const ResourceXDecodedAcquireIntent *episode, const ResourceXInstallClaimJoinObservation *observation,
+	ResourceOwner owner)
+{
+	return owner != NULL && CurrentResourceOwner == owner && MyProc != NULL && MyProcPid > 0
+		&& MyProc->pid == MyProcPid && MyProc->pgprocno >= 0
+		&& MyBackendId == episode->backend_id && MyProc->backendId == episode->backend_id
+		&& MyProc->cluster_grd_generation == episode->backend_generation
+		&& episode->buffer_id >= 0 && episode->buffer_id < NBuffers && buf->buf_id == episode->buffer_id
+		&& GetPrivateRefCount(BufferDescriptorGetBuffer(buf)) > 0
+		&& !ResourceOwnerHasBufferIO(owner, BufferDescriptorGetBuffer(buf))
+		&& cluster_qvotec_get_self_incarnation() == episode->requester_incarnation
+		&& episode->path == RESOURCE_X_ACQUIRE_RESIDENT
+		&& observation->request.observed_mode == PCM_STATE_N && observation->request.target_mode == PCM_STATE_S
+		&& base->pcm_state == PCM_STATE_N && base->semantic_buf_state == (BM_TAG_VALID | BM_VALID)
+		&& (base->buffer_type == BUF_TYPE_CURRENT || base->buffer_type == BUF_TYPE_PI)
+		&& base->writer_activation_token == 0 && base->resource_x_activation_generation == 0
+		&& base->generation == episode->base_generation && base->generation < UINT64_MAX - 1 && base->flags == 0
+		&& base->reservation_token < UINT64_MAX - 1 && episode->reservation_token == base->reservation_token + 1
+		&& BufferTagsEqual(&base->tag, &observation->request.logical_assertion.resource);
+}
+
+static bool
+cluster_bufmgr_acquire_resident_wait_native(BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
+	const ResourceXDecodedAcquireIntent *episode, const ResourceXAcquireReadReceipt *receipt,
+	ResourceOwner owner, ClusterAcquireQuietAction action, ClusterPcmOwnSnapshot *out)
+{
+	ClusterPcmOwnSnapshot expected = *base, native;
+	uint32 state;
+	bool exact = false;
+
+	if (receipt->write_io_generation >= UINT64_MAX - 1 || (receipt->write_io_generation & 1) != 0)
+		return false;
+	state = LockBufHdr(buf);
+	cluster_pcm_own_snapshot_locked(buf, &native);
+	if (CurrentResourceOwner != owner || ResourceOwnerHasBufferIO(owner, BufferDescriptorGetBuffer(buf))
+		|| cluster_pcm_own_delivery_attempt_get(buf->buf_id) != 0
+		|| pg_atomic_read_u64(&ClusterPcmOwnArray[buf->buf_id].write_io_generation) != receipt->write_io_generation)
+		goto done;
+	expected.reservation_token = episode->reservation_token;
+	expected.flags = PCM_OWN_FLAG_GRANT_PENDING;
+	if (action != CLUSTER_ACQUIRE_QUIET_REPLAY && cluster_pcm_own_snapshot_equal_exact(&expected, &native)) {
+		if (action == CLUSTER_ACQUIRE_QUIET_OBSERVE)
+			exact = true;
+		else if (cluster_pcm_own_reservation_abort_exact(buf->buf_id, base->generation,
+				episode->reservation_token, PCM_OWN_FLAG_GRANT_PENDING) == CLUSTER_PCM_OWN_OK) {
+			cluster_pcm_own_snapshot_locked(buf, &native);
+			expected.flags = 0;
+			exact = cluster_pcm_own_snapshot_equal_exact(&expected, &native);
+		}
+	}
+	/* ERROR after the original abort, before publishing the quiet receipt,
+	 * resumes this same seal. It cannot abort a later native reservation. */
+	expected.flags = 0;
+	if (action != CLUSTER_ACQUIRE_QUIET_OBSERVE && cluster_pcm_own_snapshot_equal_exact(&expected, &native))
+		exact = true;
+	if (exact)
+		*out = native;
+done:
+	UnlockBufHdr(buf, state);
+	return exact;
+}
+
+ResourceXApplyResult
+cluster_bufmgr_pcm_own_acquire_cancel_resident_wait_exact(BufferDesc *buf,
+	const ClusterPcmOwnSnapshot *base, const ResourceXDecodedAcquireIntent *episode,
+	const ResourceXInstallClaimJoinObservation *observation)
+{
+	ClusterPcmOwnSnapshot entered_base, native;
+	ResourceXDecodedAcquireIntent entered;
+	ResourceXInstallClaimJoinObservation original;
+	ResourceXDeliveryClaim sealed, current;
+	ResourceXAcquireReadReceipt receipt = {0}, retained;
+	ResourceOwner owner = CurrentResourceOwner;
+	ResourceXApplyResult result;
+
+	if (buf == NULL || base == NULL || episode == NULL || observation == NULL || ClusterPcmOwnArray == NULL)
+		return RESOURCE_X_APPLY_INVALID;
+	if (LWLockHeldByMe(BufferDescriptorGetContentLock(buf)))
+		return RESOURCE_X_APPLY_BAD_STATE;
+	entered_base = *base;
+	entered = *episode;
+	original = *observation;
+	if (!cluster_bufmgr_acquire_resident_wait_context(buf, &entered_base, &entered, &original, owner))
+		return RESOURCE_X_APPLY_STALE;
+	result = cluster_pcm_lock_resource_x_requester_acquire_wait_observe_exact(&original, &entered, &current, &receipt);
+	if (result == RESOURCE_X_APPLY_NOT_FOUND) {
+		receipt.write_io_generation = pg_atomic_read_u64(&ClusterPcmOwnArray[buf->buf_id].write_io_generation);
+		if (!cluster_bufmgr_acquire_resident_wait_native(buf, &entered_base, &entered, &receipt,
+			owner, CLUSTER_ACQUIRE_QUIET_OBSERVE, &native))
+			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		result = cluster_pcm_lock_resource_x_requester_acquire_wait_seal_exact(&original, &entered,
+			receipt.write_io_generation, &native, &current);
+		if (result != RESOURCE_X_APPLY_APPLIED && result != RESOURCE_X_APPLY_DUPLICATE)
+			return result;
+	} else if (result != RESOURCE_X_APPLY_APPLIED)
+		return result;
+	result = cluster_pcm_lock_resource_x_requester_acquire_wait_observe_exact(&original, &entered, &current, &retained);
+	if (result != RESOURCE_X_APPLY_APPLIED
+		|| !cluster_bufmgr_acquire_resident_wait_context(buf, &entered_base, &entered, &original, owner))
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (current.purpose == RESOURCE_X_DELIVERY_ACQUIRE_WAIT_QUIET)
+		return cluster_bufmgr_acquire_resident_wait_native(buf, &entered_base, &entered, &retained,
+			owner, CLUSTER_ACQUIRE_QUIET_REPLAY, &native)
+			? RESOURCE_X_APPLY_DUPLICATE : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (current.purpose != RESOURCE_X_DELIVERY_ACQUIRE_WAIT_SEALING
+		|| !cluster_bufmgr_acquire_resident_wait_native(buf, &entered_base, &entered, &retained,
+			owner, CLUSTER_ACQUIRE_QUIET_WITHDRAW, &native)
+		|| !cluster_bufmgr_acquire_resident_wait_context(buf, &entered_base, &entered, &original, owner))
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	sealed = current;
+	return cluster_pcm_lock_resource_x_requester_acquire_wait_quiet_exact(&sealed, &entered, &retained, &native);
+}
+/* End original resident read cancellation. */
+
 /* Original pre-C disk error guard. No native C occurs inside this scope.
  * Preserve immutable original identity on the stack until each synchronous
  * producer has stopped. Shared quiet/DONE remains the existing LMS debt. */

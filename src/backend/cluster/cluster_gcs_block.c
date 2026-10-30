@@ -10600,9 +10600,9 @@ gcs_block_first_fill_current(ClusterGcsFirstFill *fill)
 		&fill->admission, fill->master_node, master);
 }
 
-ResourceXApplyResult
-cluster_gcs_block_first_fill_begin(BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
-	uint64 token, ClusterGcsFirstFill *fill)
+static ResourceXApplyResult
+gcs_block_read_acquire_begin(BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
+	uint64 token, uint8 path, ClusterGcsFirstFill *fill)
 {
 	ResourceXAssertion assertion;
 	ResourceXAcquisitionRef unused;
@@ -10614,6 +10614,9 @@ cluster_gcs_block_first_fill_begin(BufferDesc *buf, const ClusterPcmOwnSnapshot 
 
 	if (buf == NULL || base == NULL || fill == NULL
 		|| fill->admission.entered || fill->round_prepared || fill->preparing)
+		return RESOURCE_X_APPLY_INVALID;
+	if (path != RESOURCE_X_ACQUIRE_FIRST_FILL
+		&& (path != RESOURCE_X_ACQUIRE_RESIDENT || base->pcm_state != PCM_STATE_N))
 		return RESOURCE_X_APPLY_INVALID;
 	if (cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1,
 		CLUSTER_SEMANTIC_TARGET_SIDE, &fill->admission) != CLUSTER_SEMANTIC_ADMISSION_OK)
@@ -10637,7 +10640,7 @@ cluster_gcs_block_first_fill_begin(BufferDesc *buf, const ClusterPcmOwnSnapshot 
 		gcs_block_resource_x_observation_pause();
 	}
 	if (cluster_bufmgr_pcm_own_acquire_intent_exact(buf, base, token,
-		RESOURCE_X_ACQUIRE_FIRST_FILL, &fill->admission, NULL, &fill->episode) != CLUSTER_PCM_OWN_OK
+		path, &fill->admission, NULL, &fill->episode) != CLUSTER_PCM_OWN_OK
 		|| !resource_x_assertion_init(&base->tag, cluster_node_id, &assertion))
 		return RESOURCE_X_APPLY_STALE;
 	/* Preparing the original round allocates no wire or authority. Old
@@ -10684,13 +10687,29 @@ cluster_gcs_block_first_fill_begin(BufferDesc *buf, const ClusterPcmOwnSnapshot 
 	/* All capacity sleep/revalidation and the atomic full-E/ring takeover
 	 * remain in the original sender. This call is made exactly once. */
 	sent = cluster_lms_outbound_enqueue_resource_x_acquire(fill->master_node, &fill->prepared,
-		buf, base, token, RESOURCE_X_ACQUIRE_FIRST_FILL, PCM_STATE_S, &fill->admission);
+		buf, base, token, path, PCM_STATE_S, &fill->admission);
 	if (sent != CLUSTER_LMS_ENQUEUE_ADMITTED)
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	return cluster_pcm_lock_resource_x_install_claim_join_observe_exact(&assertion,
 		fill->master_node, fill->gate.formation, fill->master_session,
 		fill->admission.record_generation, fill->requester_connection, fill->master_connection,
 		&fill->observation);
+}
+
+ResourceXApplyResult
+cluster_gcs_block_first_fill_begin(BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
+	uint64 token, ClusterGcsFirstFill *fill)
+{
+	return gcs_block_read_acquire_begin(buf, base, token, RESOURCE_X_ACQUIRE_FIRST_FILL, fill);
+}
+
+/* Resident N bytes are only candidates. This requests a new S decision;
+ * neither the request nor its passive wait authorizes those old bytes. */
+ResourceXApplyResult
+cluster_gcs_block_resident_read_begin(BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
+	uint64 token, ClusterGcsFirstFill *fill)
+{
+	return gcs_block_read_acquire_begin(buf, base, token, RESOURCE_X_ACQUIRE_RESIDENT, fill);
 }
 
 ResourceXApplyResult
