@@ -27,6 +27,7 @@
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "parser/parse_type.h"
+#include "tcop/utility.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
@@ -140,6 +141,10 @@ RemoveObjectsInternal(DropStmt *stmt, bool check_storage_only, bool isTopLevel)
 void
 RemoveObjects(DropStmt *stmt, bool isTopLevel)
 {
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedCatalogDrop((Node *)stmt, isTopLevel);
+#endif
+
 	RemoveObjectsInternal(stmt, false, isTopLevel);
 }
 

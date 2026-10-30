@@ -110,6 +110,7 @@ extern LogStmtLevel GetCommandLogLevel(Node *parsetree);
 #ifdef USE_PGRAC_CLUSTER
 /* Share the original utility support checks with native catalog commands. */
 extern void CheckClusterSharedUtilitySupport(Node *statement, bool isTopLevel);
+extern void PreflightClusterSharedCatalogDrop(Node *statement, bool isTopLevel);
 #endif
 
 extern bool CommandIsReadOnly(PlannedStmt *pstmt);

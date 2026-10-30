@@ -23770,10 +23770,362 @@ UT_TEST(test_native_index_create_bootstrap_keeps_original_transaction_responsibi
 	index_create_lookup_active = false;
 }
 
+/* Execute all three complete native DROP wrappers; the original internal
+ * call is a negative boundary, not a successful deletion or lock lookup. */
+static const bool native_drop_binding_modes[8]
+	= { false, false, false, true, false, false, false, true };
+static struct {
+	DropStmt drop;
+	DropOwnedStmt owned;
+	ObjectWithArgs routine;
+	String names[2];
+	RoleSpec roles[2];
+	ListCell name_cells[2], target_cell, role_cells[2];
+	unsigned route;
+	bool top;
+} native_drop_case, native_drop_before;
+static List native_drop_names, native_drop_targets, native_drop_roles;
+static unsigned char native_drop_lists_before[3][sizeof(List)];
+static Node *native_drop_statement;
+static bool native_drop_active, native_drop_expect_binding;
+static unsigned native_drop_calls, native_drop_unbound, native_drop_bad_call;
+
+static void
+native_drop_internal_boundary(Node *statement, unsigned route, bool check_storage_only, bool top)
+{
+	native_drop_calls++;
+	if (!native_drop_active || statement != native_drop_statement || route != native_drop_case.route
+		|| check_storage_only || top != native_drop_case.top)
+		native_drop_bad_call++;
+	if (native_drop_expect_binding
+		&& (utility_binds != 1 || !TransactionIdIsValid(utility_top_xid)
+			|| utility_current_xid != utility_top_xid))
+		native_drop_unbound++;
+	siglongjmp(boundary, 2); /* No lock, catalog or deletion success is supplied. */
+}
+
+static void
+RemoveRelationsInternal(DropStmt *stmt, bool check_storage_only, bool top)
+{
+	native_drop_internal_boundary((Node *)stmt, 0, check_storage_only, top);
+}
+static void
+RemoveObjectsInternal(DropStmt *stmt, bool check_storage_only, bool top)
+{
+	native_drop_internal_boundary((Node *)stmt, 1, check_storage_only, top);
+}
+static void
+DropOwnedObjectsInternal(DropOwnedStmt *stmt, bool check_storage_only, bool top)
+{
+	native_drop_internal_boundary((Node *)stmt, 2, check_storage_only, top);
+}
+#include "test_cluster_fresh_drop_relations.inc"
+#include "test_cluster_fresh_drop_objects.inc"
+#include "test_cluster_fresh_drop_owned.inc"
+
+static void
+snapshot_native_drop(void)
+{
+	memcpy(&native_drop_before, &native_drop_case, sizeof(native_drop_case));
+	memcpy(native_drop_lists_before[0], &native_drop_names, sizeof(List));
+	memcpy(native_drop_lists_before[1], &native_drop_targets, sizeof(List));
+	memcpy(native_drop_lists_before[2], &native_drop_roles, sizeof(List));
+}
+
+static void
+reset_native_drop(bool expect_binding, unsigned form)
+{
+	static const ObjectType kinds[7]
+		= { OBJECT_TABLE,		  OBJECT_INDEX,	   OBJECT_SEQUENCE, OBJECT_VIEW,
+			OBJECT_FOREIGN_TABLE, OBJECT_FUNCTION, OBJECT_PROCEDURE };
+	unsigned call = form / 4, shape = form % 4;
+
+	reset_create_preflight();
+	cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+	utility_in_transaction = drop_target_shared = false;
+	storage_drop_preflights = 0;
+	native_drop_active = false;
+	native_drop_expect_binding = expect_binding;
+	native_drop_calls = native_drop_unbound = native_drop_bad_call = 0;
+	memset(&native_drop_case, 0, sizeof(native_drop_case));
+	native_drop_case.names[0] = (String){ .type = T_String, .sval = "public" };
+	native_drop_case.names[1] = (String){ .type = T_String, .sval = "native_drop_target" };
+	for (unsigned i = 0; i < 2; i++)
+		native_drop_case.name_cells[i].ptr_value = &native_drop_case.names[i];
+	native_drop_names = (List){ .type = T_List,
+								.length = 2,
+								.max_length = 2,
+								.elements = native_drop_case.name_cells };
+	native_drop_case.routine = (ObjectWithArgs){ .type = T_ObjectWithArgs,
+												 .objname = &native_drop_names,
+												 .args_unspecified = true };
+	one_element(&native_drop_targets, &native_drop_case.target_cell,
+				call == 5 || call == 6 ? (void *)&native_drop_case.routine
+									   : (void *)&native_drop_names);
+	native_drop_case.roles[0] = (RoleSpec){ .type = T_RoleSpec,
+											.roletype = ROLESPEC_CSTRING,
+											.rolename = "native_drop_role",
+											.location = -1 };
+	native_drop_case.roles[1]
+		= (RoleSpec){ .type = T_RoleSpec, .roletype = ROLESPEC_CURRENT_USER, .location = -1 };
+	for (unsigned i = 0; i < 2; i++)
+		native_drop_case.role_cells[i].ptr_value = &native_drop_case.roles[i];
+	native_drop_roles = (List){ .type = T_List,
+								.length = 2,
+								.max_length = 2,
+								.elements = native_drop_case.role_cells };
+	native_drop_case.drop = (DropStmt){ .type = T_DropStmt,
+										.objects = shape & 2 ? NIL : &native_drop_targets,
+										.removeType = call == 7 ? OBJECT_TABLE : kinds[call],
+										.behavior = shape & 1 ? DROP_CASCADE : DROP_RESTRICT,
+										.missing_ok = (shape & 2) != 0 };
+	native_drop_case.owned
+		= (DropOwnedStmt){ .type = T_DropOwnedStmt,
+						   .roles = shape & 2 ? NIL : &native_drop_roles,
+						   .behavior = shape & 1 ? DROP_CASCADE : DROP_RESTRICT };
+	native_drop_case.route = call < 5 ? 0 : call < 7 ? 1 : 2;
+	native_drop_case.top = true;
+	native_drop_statement
+		= call == 7 ? (Node *)&native_drop_case.owned : (Node *)&native_drop_case.drop;
+	snapshot_native_drop();
+}
+
+static void
+native_drop_entry(void)
+{
+	native_drop_active = true;
+	if (native_drop_case.route == 0)
+		RemoveRelations(&native_drop_case.drop, native_drop_case.top);
+	else if (native_drop_case.route == 1)
+		RemoveObjects(&native_drop_case.drop, native_drop_case.top);
+	else
+		DropOwnedObjects(&native_drop_case.owned, native_drop_case.top);
+}
+
+static void
+assert_native_drop_boundary(int caught, unsigned calls)
+{
+	UT_ASSERT_EQ(caught, calls ? 2 : 1);
+	UT_ASSERT_EQ(native_drop_calls, calls);
+	UT_ASSERT_EQ(native_drop_unbound + native_drop_bad_call, 0);
+	UT_ASSERT_EQ(storage_drop_preflights, 0);
+	UT_ASSERT_EQ(memcmp(&native_drop_case, &native_drop_before, sizeof(native_drop_case)), 0);
+	UT_ASSERT_EQ(memcmp(&native_drop_names, native_drop_lists_before[0], sizeof(List)), 0);
+	UT_ASSERT_EQ(memcmp(&native_drop_targets, native_drop_lists_before[1], sizeof(List)), 0);
+	UT_ASSERT_EQ(memcmp(&native_drop_roles, native_drop_lists_before[2], sizeof(List)), 0);
+}
+
+UT_TEST(test_native_drop_wrappers_bind_before_internal_work_in_all_profiles)
+{
+	for (unsigned form = 0; form < 32; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = native_drop_binding_modes[mode];
+			reset_native_drop(binds, form);
+			set_native_operator_mode(mode);
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				int caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_drop_entry();
+				assert_native_drop_boundary(caught, repeat + 1);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	native_drop_active = false;
+}
+
+UT_TEST(test_native_drop_publication_child_and_top_fail_before_internal_work)
+{
+	for (unsigned form = 0; form < 32; form++) {
+		for (unsigned failure = 0; failure < 5; failure++) {
+			bool allocated = failure == 0 || failure == 2;
+			int caught;
+			reset_native_drop(true, form);
+			if (failure == 0)
+				utility_bind_ok = false;
+			else if (failure == 1 || failure == 2) {
+				if (failure == 2)
+					create_sql_entry(native_drop_statement);
+				utility_in_child = true;
+			} else {
+				utility_current_xid = 401;
+				utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_drop_entry();
+			assert_native_drop_boundary(caught, 0);
+			UT_ASSERT_EQ(error_code, failure == 0  ? ERRCODE_DATA_CORRUPTED
+									 : failure < 3 ? ERRCODE_FEATURE_NOT_SUPPORTED
+												   : ERRCODE_INTERNAL_ERROR);
+			UT_ASSERT_STR_EQ(
+				error_message,
+				failure == 0
+					? "canonical ACTIVE publication failed before shared catalog alteration"
+				: failure < 3 ? "shared catalog alteration does not support subtransactions"
+							  : "shared catalog top-level transaction identity mismatch");
+			UT_ASSERT_EQ(utility_xids, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, failure == 2 ? 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, allocated || failure == 3 ? 400 : InvalidTransactionId);
+		}
+	}
+	native_drop_active = false;
+}
+
+UT_TEST(test_native_drop_context_guards_preserve_other_modes)
+{
+	for (unsigned form = 0; form < 32; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = native_drop_binding_modes[mode];
+			for (unsigned guard = 0; guard < 3; guard++) {
+				int caught;
+				reset_native_drop(binds, form);
+				set_native_operator_mode(mode);
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_drop_entry();
+				assert_native_drop_boundary(caught, binds ? 0 : 1);
+				UT_ASSERT_EQ(error_code, !binds		  ? 0
+										 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+													  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	native_drop_active = false;
+}
+
+UT_TEST(test_native_drop_rechecks_utility_binding_without_replacing_it)
+{
+	for (unsigned form = 0; form < 32; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = native_drop_binding_modes[mode];
+			for (unsigned guard = 0; guard < 4; guard++) {
+				int caught;
+				reset_native_drop(true, form);
+				create_sql_entry(native_drop_statement);
+				set_native_operator_mode(mode);
+				XactReadOnly = guard == 1;
+				utility_parallel = guard == 2;
+				utility_recovery = guard == 3;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_drop_entry();
+				assert_native_drop_boundary(caught, binds && guard ? 0 : 1);
+				UT_ASSERT_EQ(error_code, !binds || !guard ? 0
+										 : guard == 2	  ? ERRCODE_INVALID_TRANSACTION_STATE
+														  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				UT_ASSERT_EQ(utility_xids, 1);
+				UT_ASSERT_EQ(utility_binds, 1);
+				UT_ASSERT_EQ(utility_prepares, binds && !guard ? 2 : 1);
+				UT_ASSERT_EQ(utility_top_xid, 400);
+			}
+		}
+	}
+	native_drop_active = false;
+}
+
+UT_TEST(test_native_drop_other_scopes_keep_original_internal_responsibility)
+{
+	for (unsigned form = 0; form < 32; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			for (unsigned scope = 0; scope < 4; scope++) {
+				int caught;
+				reset_native_drop(false, form);
+				set_native_operator_mode(mode);
+				cluster_interconnect_tier
+					= scope == 0 || scope == 3 ? CLUSTER_IC_TIER_2 : CLUSTER_IC_TIER_1;
+				utility_in_transaction = scope == 1 || scope == 3;
+				native_drop_case.top = scope != 2;
+				snapshot_native_drop();
+				XactReadOnly = utility_parallel = utility_recovery = utility_in_child = true;
+				utility_bind_ok = false;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_drop_entry();
+				assert_native_drop_boundary(caught, 1);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+	utility_in_transaction = native_drop_active = false;
+}
+
+static void
+check_native_drop_denial(unsigned kind, unsigned mode, bool warm)
+{
+	static const ObjectType kinds[8]
+		= { OBJECT_MATVIEW,	 OBJECT_INDEX,	 OBJECT_TYPE,	  OBJECT_DOMAIN,
+			OBJECT_OPERATOR, OBJECT_OPCLASS, OBJECT_OPFAMILY, OBJECT_EXTENSION };
+	static const char *const messages[8]
+		= { "materialized views is not supported in shared mode",
+			"concurrent index removal is not supported in shared mode",
+			"custom types is not supported in shared mode",
+			"custom types is not supported in shared mode",
+			"custom operators is not supported in shared mode",
+			"custom operators is not supported in shared mode",
+			"custom operators is not supported in shared mode",
+			"CREATE/DROP EXTENSION is not supported in shared mode" };
+	bool refuses = native_drop_binding_modes[mode];
+	int caught;
+
+	reset_native_drop(false, 0);
+	if (warm)
+		create_sql_entry(native_drop_statement);
+	native_drop_case.drop.removeType = kinds[kind];
+	native_drop_case.drop.concurrent = kind == 1;
+	native_drop_case.route = kind < 2 ? 0 : 1;
+	if (kind == 4)
+		native_drop_case.target_cell.ptr_value = &native_drop_case.routine;
+	if (kind == 7)
+		native_drop_case.target_cell.ptr_value = &native_drop_case.names[1];
+	snapshot_native_drop();
+	set_native_operator_mode(mode);
+	XactReadOnly = utility_parallel = utility_recovery = utility_in_child = true;
+	utility_bind_ok = false;
+	caught = sigsetjmp(boundary, 1);
+	if (!caught)
+		native_drop_entry();
+	assert_native_drop_boundary(caught, refuses ? 0 : 1);
+	UT_ASSERT_EQ(error_code, refuses ? ERRCODE_FEATURE_NOT_SUPPORTED : 0);
+	if (refuses)
+		UT_ASSERT_STR_EQ(error_message, messages[kind]);
+	UT_ASSERT_EQ(utility_xids, warm);
+	UT_ASSERT_EQ(utility_prepares, warm);
+	UT_ASSERT_EQ(utility_binds, warm);
+	UT_ASSERT_EQ(utility_top_xid, warm ? 400 : InvalidTransactionId);
+}
+
+UT_TEST(test_native_drop_denials_precede_context_child_and_allocation)
+{
+	for (unsigned kind = 0; kind < 8; kind++)
+		for (unsigned mode = 0; mode < 8; mode++)
+			check_native_drop_denial(kind, mode, false);
+	native_drop_active = false;
+}
+
+UT_TEST(test_native_drop_denials_preserve_existing_binding)
+{
+	for (unsigned kind = 0; kind < 8; kind++)
+		for (unsigned mode = 0; mode < 8; mode++)
+			check_native_drop_denial(kind, mode, true);
+	native_drop_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(381);
+	UT_PLAN(388);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -24158,6 +24510,13 @@ main(void)
 	UT_RUN(test_native_index_create_denials_precede_context_and_allocation);
 	UT_RUN(test_native_index_create_denials_preserve_existing_binding);
 	UT_RUN(test_native_index_create_bootstrap_keeps_original_transaction_responsibility);
+	UT_RUN(test_native_drop_wrappers_bind_before_internal_work_in_all_profiles);
+	UT_RUN(test_native_drop_publication_child_and_top_fail_before_internal_work);
+	UT_RUN(test_native_drop_context_guards_preserve_other_modes);
+	UT_RUN(test_native_drop_rechecks_utility_binding_without_replacing_it);
+	UT_RUN(test_native_drop_other_scopes_keep_original_internal_responsibility);
+	UT_RUN(test_native_drop_denials_precede_context_child_and_allocation);
+	UT_RUN(test_native_drop_denials_preserve_existing_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

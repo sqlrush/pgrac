@@ -1575,6 +1575,10 @@ RemoveRelationsInternal(DropStmt *drop, bool check_storage_only, bool isTopLevel
 void
 RemoveRelations(DropStmt *drop, bool isTopLevel)
 {
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedCatalogDrop((Node *)drop, isTopLevel);
+#endif
+
 	RemoveRelationsInternal(drop, false, isTopLevel);
 }
 

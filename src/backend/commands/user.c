@@ -1768,6 +1768,10 @@ DropOwnedObjectsInternal(DropOwnedStmt *stmt, bool check_storage_only, bool isTo
 void
 DropOwnedObjects(DropOwnedStmt *stmt, bool isTopLevel)
 {
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedCatalogDrop((Node *)stmt, isTopLevel);
+#endif
+
 	DropOwnedObjectsInternal(stmt, false, isTopLevel);
 }
 

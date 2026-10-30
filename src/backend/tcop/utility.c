@@ -427,6 +427,23 @@ PreflightClusterSharedCatalogWrite(Node *statement, bool isTopLevel)
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("canonical ACTIVE publication failed before shared catalog %s", action)));
 }
+
+/* Complete the original early DROP preflight before native deletion work. */
+void
+PreflightClusterSharedCatalogDrop(Node *statement, bool isTopLevel)
+{
+	if (!cluster_shared_catalog || !cluster_storage_mode_enabled()
+		|| cluster_interconnect_tier != CLUSTER_IC_TIER_1 || IsInTransactionBlock(isTopLevel))
+		return;
+
+	CheckClusterSharedUtilitySupport(statement, isTopLevel);
+	CheckClusterIndexSupport(statement);
+	PreventCommandIfReadOnly("DROP");
+	PreventCommandIfParallelMode("DROP");
+	PreventCommandDuringRecovery("DROP");
+	PreflightClusterSharedCatalogWrite(statement, isTopLevel);
+}
+
 #endif
 
 /* local function declarations */
