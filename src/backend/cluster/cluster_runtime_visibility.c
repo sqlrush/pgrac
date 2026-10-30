@@ -2397,10 +2397,14 @@ cluster_runtime_visibility_origin_plan_freeze_operation_internal(
 			&& (!expected_generation->known || expected_generation->value != generation.value))
 		|| !cluster_runtime_visibility_origin_data_copy(segment, data->data_logical.owner_instance,
 														block, page.data, allow_readthrough)
-		|| !(expected != NULL ? cluster_savepoint_reader_identity_from_operation(expected, locator,
-																				 &data->operation)
-							  : cluster_savepoint_reader_discover_head(
-									head, tag, locator, page.data, &data->operation)))
+		|| !(expected != NULL
+				 ? (expected->operation_sequence == 0
+						? cluster_savepoint_reader_discover_own_head(expected, head, tag, locator,
+																	 page.data, &data->operation)
+						: cluster_savepoint_reader_identity_from_operation(expected, locator,
+																		   &data->operation))
+				 : cluster_savepoint_reader_discover_head(head, tag, locator, page.data,
+														  &data->operation)))
 		goto failed;
 	data->locator = data->canonical_locator = *locator;
 	data->locator.tt_wrap = data->canonical_locator.tt_wrap = data->operation.canonical.wrap;
@@ -2821,6 +2825,8 @@ cluster_runtime_visibility_operation_record_matches(
 	uint8 previous;
 	uint8 next;
 
+	if (plan->operation.operation_sequence == 0)
+		return length == plan->record_length && memcmp(plan->record_buf.data, current, length) == 0;
 	if (length != plan->record_length || length < sizeof(UndoOperationTrailer))
 		return false;
 	effect = length - sizeof(UndoOperationTrailer) + offsetof(UndoOperationTrailer, effect_state);
@@ -2927,6 +2933,7 @@ typedef struct ClusterOperationOriginRead {
 	bool active;
 	bool observed;
 	bool has_expected;
+	bool has_head;
 	bool allow_readthrough;
 	bool wait_pending;
 	ClusterTxLocator locator;
@@ -3004,9 +3011,10 @@ cluster_runtime_visibility_operation_read_begin_internal(
 	read->magic = CLUSTER_OPERATION_ORIGIN_READ_MAGIC;
 	read->locator = *locator;
 	read->has_expected = expected != NULL;
+	read->has_head = head != NULL && tag != NULL;
 	if (expected != NULL)
 		read->expected = *expected;
-	else {
+	if (read->has_head) {
 		read->head = *head;
 		read->tag = *tag;
 	}
@@ -3049,9 +3057,9 @@ cluster_runtime_visibility_operation_origin_observe(ClusterOperationOriginRead *
 		read->data_root = read->root;
 		frozen = cluster_runtime_visibility_origin_plan_freeze_operation_internal(
 					 &read->locator, read->has_expected ? &read->expected : NULL,
-					 read->has_expected ? NULL : &read->head,
-					 read->has_expected ? NULL : &read->tag, read->mode, &read->admission, NULL,
-					 &read->guard, &read->root, &read->plan, &read->reason, read->allow_readthrough)
+					 read->has_head ? &read->head : NULL, read->has_head ? &read->tag : NULL,
+					 read->mode, &read->admission, NULL, &read->guard, &read->root, &read->plan,
+					 &read->reason, read->allow_readthrough)
 					 == CLUSTER_RUNTIME_VISIBILITY_ORIGIN_NEEDS_CANONICAL
 				 && cluster_runtime_visibility_origin_plan_canonical_logical(&read->plan,
 																			 &read->tt_logical);
@@ -3302,6 +3310,20 @@ cluster_runtime_visibility_resolve_operation_head_origin_admitted(
 	return cluster_runtime_visibility_resolve_operation_origin_internal(
 		locator, NULL, head, tag, mode, admission, identity_out, top_out, operation_out, data_out,
 		reason_out);
+}
+
+/* This opt-in keeps the old operation-only head readers unchanged. */
+ClusterTxOutcome
+cluster_runtime_visibility_resolve_own_operation_head_origin_admitted(
+	const ClusterTxLocator *locator, const ClusterItlSlotData *head, const BufferTag *tag,
+	const ClusterSavepointOperation *owner, ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission, ClusterSavepointReaderIdentity *identity_out,
+	ClusterTxResolution *top_out, ClusterSavepointReaderRecord *operation_out,
+	char data_out[BLCKSZ], ClusterTxResolveReason *reason_out)
+{
+	return cluster_runtime_visibility_resolve_operation_origin_internal(
+		locator, owner, owner != NULL ? head : NULL, tag, mode, admission, identity_out, top_out,
+		operation_out, data_out, reason_out);
 }
 
 bool

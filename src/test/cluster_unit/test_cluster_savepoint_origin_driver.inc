@@ -64,6 +64,9 @@ operation_driver_release(void)
 	case 8:
 		test_candidate_tt_generation++;
 		break;
+	case 10:
+		((UndoRecordHeader *)(test_operation_page.data + sizeof(UndoBlockHeader)))->target_offset++;
+		break;
 	case 9:
 		pg_re_throw();
 		break;
@@ -343,6 +346,166 @@ UT_TEST(test_operation_driver_bad_and_foreign_inputs)
 		UT_ASSERT_EQ(outcome, CLUSTER_TX_UNKNOWN);
 		UT_ASSERT_EQ(test_candidate_acquire_calls, 0);
 		UT_ASSERT_EQ(test_remote_origin_calls, 0);
+		operation_driver_assert_refused(&f);
+	}
+}
+
+/* A V1 link has the caller's exact current top, never a fabricated tail. */
+static void
+operation_own_head_init(OperationPlanFixture *f, bool same, ClusterItlSlotData *head,
+						BufferTag *tag)
+{
+	UndoRecordHeader *record;
+	UndoBlockHeader *block;
+	UndoSlotDirEntry *slot;
+
+	operation_driver_init(f, same);
+	f->expected.operation_fxid = f->expected.top_fxid;
+	f->expected.operation_sequence = 0;
+	f->expected.command_id = InvalidCommandId;
+	f->expected.subid = TopSubTransactionId;
+	test_origin_locator.itl_slot_index = 2;
+	*tag = (BufferTag){ .spcOid = 1663,
+						.dbOid = 42,
+						.relNumber = 77,
+						.forkNum = MAIN_FORKNUM,
+						.blockNum = 23 };
+	*head = (ClusterItlSlotData){ .xid = TEST_ORIGIN_XID,
+								  .wrap = 8,
+								  .flags = ITL_FLAG_ACTIVE,
+								  .write_scn = scn_encode(0, 70),
+								  .undo_segment_head = test_origin_locator.uba };
+	block = (UndoBlockHeader *)test_operation_page.data;
+	record = (UndoRecordHeader *)(test_operation_page.data + sizeof(*block));
+	slot = (UndoSlotDirEntry *)(test_operation_page.data + BLCKSZ - sizeof(*slot));
+	record->flags &= ~UNDO_REC_FLAG_HAS_OPERATION;
+	record->xid = TEST_ORIGIN_XID;
+	record->payload_length -= sizeof(UndoOperationTrailer);
+	slot->flags = record->flags;
+	slot->record_length -= sizeof(UndoOperationTrailer);
+	block->free_offset -= sizeof(UndoOperationTrailer);
+	test_tt_slot.status = TT_SLOT_ACTIVE;
+	test_tt_slot.commit_scn = InvalidScn;
+	test_native_status = TRANSACTION_STATUS_IN_PROGRESS;
+	test_twophase_xid = TEST_ORIGIN_XID;
+}
+
+static ClusterTxOutcome
+operation_own_head_read(OperationPlanFixture *f, const ClusterItlSlotData *head,
+						const BufferTag *tag, ClusterSavepointReaderIdentity *identity)
+{
+	return cluster_runtime_visibility_resolve_own_operation_head_origin_admitted(
+		&test_origin_locator, head, tag, &f->expected, CLUSTER_TX_RESOLVE_VISIBILITY, &f->admission,
+		identity, &f->top, &f->operation, f->output.data, &f->reason);
+}
+
+UT_TEST(test_operation_own_top_head_uses_original_three_current_phases)
+{
+	for (int same = 0; same < 2; same++)
+		for (int commit = 0; commit < 2; commit++) {
+			OperationPlanFixture f;
+			ClusterItlSlotData head;
+			BufferTag tag;
+			ClusterSavepointReaderIdentity identity;
+
+			operation_own_head_init(&f, same, &head, &tag);
+			operation_driver_action = commit ? 2 : 0;
+			operation_driver_action_release = 2;
+			UT_ASSERT_EQ(operation_own_head_read(&f, &head, &tag, &identity),
+						 CLUSTER_TX_IN_PROGRESS);
+			UT_ASSERT_EQ(f.reason, CLUSTER_TX_RESOLVE_NONE);
+			UT_ASSERT_EQ(identity.operation_sequence, 0);
+			UT_ASSERT_EQ(identity.operation_fxid.value, f.expected.top_fxid.value);
+			UT_ASSERT_EQ(identity.canonical_generation, same ? 17 : 23);
+			UT_ASSERT_EQ(f.operation.operation.effect_state, 0);
+			UT_ASSERT_EQ(f.operation.history.count, 1);
+			UT_ASSERT_EQ(memcmp(f.output.data, test_operation_page.data, BLCKSZ), 0);
+			UT_ASSERT_EQ(test_candidate_acquire_calls, 3);
+			UT_ASSERT_EQ(test_candidate_release_calls, 3);
+			UT_ASSERT_EQ(test_candidate_acquire_segments[0], 1);
+			UT_ASSERT_EQ(test_candidate_acquire_segments[1], same ? 1 : 2);
+			UT_ASSERT_EQ(test_candidate_acquire_segments[2], 1);
+			UT_ASSERT_EQ(test_candidate_max_held_count, 1);
+			UT_ASSERT_EQ(test_candidate_held_count, 0);
+			UT_ASSERT_EQ(test_operation_pin_depth, 0);
+		}
+}
+
+UT_TEST(test_operation_own_top_head_keeps_identity_and_fresh_data_fences)
+{
+	for (int same = 0; same < 2; same++)
+		for (int fault = 0; fault < 10; fault++) {
+			OperationPlanFixture f;
+			ClusterItlSlotData head;
+			BufferTag tag;
+			ClusterSavepointReaderIdentity identity;
+			UndoRecordHeader *record;
+
+			operation_own_head_init(&f, same, &head, &tag);
+			record = (UndoRecordHeader *)(test_operation_page.data + sizeof(UndoBlockHeader));
+			if (fault == 0)
+				record->xid++;
+			if (fault == 1)
+				head.write_scn++;
+			if (fault == 2)
+				f.expected.top.segment_generation++;
+			if (fault == 3)
+				f.expected.top.slot_wrap++;
+			if (fault == 4)
+				tag.relNumber++;
+			if (fault == 5)
+				f.expected.top.publish_state = CLUSTER_CANONICAL_TXN_RESERVED;
+			if (fault >= 6) {
+				const int action[] = { 3, 4, 8, 10 };
+				operation_driver_action = fault == 8 && same ? 3 : action[fault - 6];
+				operation_driver_action_release = fault == 8 ? 1 : 2;
+			}
+			UT_ASSERT_EQ(operation_own_head_read(&f, &head, &tag, &identity), CLUSTER_TX_UNKNOWN);
+			UT_ASSERT_EQ(identity.operation_sequence, 0);
+			operation_driver_assert_refused(&f);
+			UT_ASSERT_EQ(test_candidate_acquire_calls, test_candidate_release_calls);
+			UT_ASSERT_EQ(test_operation_pin_depth, 0);
+		}
+}
+
+UT_TEST(test_operation_own_top_head_error_cleanup_and_old_entry_refusal)
+{
+	for (int release = 1; release <= 3; release++) {
+		OperationPlanFixture f;
+		ClusterItlSlotData head;
+		BufferTag tag;
+		ClusterSavepointReaderIdentity identity;
+		volatile bool caught = false;
+
+		operation_own_head_init(&f, false, &head, &tag);
+		operation_driver_action = 9;
+		operation_driver_action_release = release;
+		PG_TRY();
+		{
+			(void)operation_own_head_read(&f, &head, &tag, &identity);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(caught);
+		f.reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+		operation_driver_assert_refused(&f);
+		UT_ASSERT_EQ(test_candidate_cancel_calls, 1);
+		UT_ASSERT_EQ(test_operation_pin_depth, 0);
+	}
+	for (int same = 0; same < 2; same++) {
+		OperationPlanFixture f;
+		ClusterItlSlotData head;
+		BufferTag tag;
+		ClusterSavepointReaderIdentity identity;
+
+		operation_own_head_init(&f, same, &head, &tag);
+		UT_ASSERT_EQ(cluster_runtime_visibility_resolve_operation_head_origin_admitted(
+						 &test_origin_locator, &head, &tag, CLUSTER_TX_RESOLVE_VISIBILITY,
+						 &f.admission, &identity, &f.top, &f.operation, f.output.data, &f.reason),
+					 CLUSTER_TX_UNKNOWN);
 		operation_driver_assert_refused(&f);
 	}
 }

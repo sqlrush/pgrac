@@ -233,7 +233,8 @@ extern ClusterTxOutcome cluster_tx_resolve_exact(const ClusterTxLocator *locator
  * the original source/undo read scope and holds no heap content lock. */
 extern ClusterTxOutcome
 cluster_tx_resolve_operation_head(const ClusterTxLocator *locator, const ClusterItlSlotData *head,
-								  const BufferTag *tag, ClusterSavepointReaderIdentity *identity,
+								  const BufferTag *tag, const ClusterSavepointOperation *owner,
+								  ClusterSavepointReaderIdentity *identity,
 								  ClusterTxResolution *top, ClusterSavepointReaderRecord *operation,
 								  char data[BLCKSZ], ClusterTxResolveReason *reason_out);
 extern ClusterTxOutcome

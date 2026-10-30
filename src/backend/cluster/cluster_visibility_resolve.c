@@ -1420,6 +1420,7 @@ vis_scratch_own_operation(Page page, HeapTuple tuple, const BufferTag *tag, uint
 	ClusterTxLocator unused_wait;
 	ClusterTxResolution top;
 	ClusterSavepointReaderIdentity identity;
+	ClusterSavepointOperation owner = { 0 };
 	ClusterSavepointReaderRecord operation;
 	ClusterItlSlotData head = ClusterPageGetItlSlots(page)[slot_index];
 	ClusterTxResolveReason reason;
@@ -1431,8 +1432,12 @@ vis_scratch_own_operation(Page page, HeapTuple tuple, const BufferTag *tag, uint
 	uint64 top_value = U64FromFullTransactionId(top_fxid);
 	uint32 delta = raw_xid - XidFromFullTransactionId(top_fxid);
 
-	if (!cluster_vis_exact_locators_for_ref(page, slot_index, CLUSTER_VIS_XMIN, ref->local_xid, ref,
-											&locator, &unused_wait)
+	owner.top_fxid = owner.operation_fxid = top_fxid;
+	owner.command_id = InvalidCommandId;
+	owner.subid = TopSubTransactionId;
+	if (!cluster_tt_local_get_published_binding(ref->local_xid, &owner.top)
+		|| !cluster_vis_exact_locators_for_ref(page, slot_index, CLUSTER_VIS_XMIN, ref->local_xid,
+											   ref, &locator, &unused_wait)
 		|| delta == 0 || delta >= (uint32)0x80000000 || top_value > UINT64_MAX - delta)
 		return;
 	for (;;) {
@@ -1440,8 +1445,8 @@ vis_scratch_own_operation(Page page, HeapTuple tuple, const BufferTag *tag, uint
 		cluster_vis_resolve_depth++;
 		PG_TRY();
 		{
-			outcome = cluster_tx_resolve_operation_head(&locator, &head, tag, &identity, &top,
-														&operation, data.data, &reason);
+			outcome = cluster_tx_resolve_operation_head(&locator, &head, tag, &owner, &identity,
+														&top, &operation, data.data, &reason);
 		}
 		PG_FINALLY();
 		{
@@ -1456,7 +1461,8 @@ vis_scratch_own_operation(Page page, HeapTuple tuple, const BufferTag *tag, uint
 			|| identity.canonical.slot_offset != top.local_canonical.slot_offset
 			|| identity.canonical.wrap != top.local_canonical.wrap
 			|| identity.canonical_generation != top.local_canonical_generation
-			|| (sequence != 0 && identity.operation_sequence >= sequence)
+			|| (sequence != 0 && identity.operation_sequence != 0
+				&& identity.operation_sequence >= sequence)
 			|| U64FromFullTransactionId(GetTopFullTransactionIdIfAny()) != top_value
 			|| !cluster_savepoint_reader_extract_identity(&identity, &top.locator_echo, data.data,
 														  data.data, &length, &operation))
@@ -1474,7 +1480,8 @@ vis_scratch_own_operation(Page page, HeapTuple tuple, const BufferTag *tag, uint
 			out->diagnostic_reason = NULL;
 			return;
 		}
-		sequence = identity.operation_sequence;
+		if (identity.operation_sequence != 0)
+			sequence = identity.operation_sequence;
 		locator = top.locator_echo;
 		if (!vis_scratch_operation_prior(&operation, tag, record, &locator, &head))
 			return;

@@ -1050,16 +1050,16 @@ GetTopFullTransactionIdIfAny(void)
 	return InvalidFullTransactionId;
 }
 
-extern ClusterTxOutcome
-cluster_tx_resolve_operation_head(const ClusterTxLocator *, const ClusterItlSlotData *,
-								  const BufferTag *, ClusterSavepointReaderIdentity *,
-								  ClusterTxResolution *, ClusterSavepointReaderRecord *,
-								  char[BLCKSZ], ClusterTxResolveReason *);
+extern ClusterTxOutcome cluster_tx_resolve_operation_head(
+	const ClusterTxLocator *, const ClusterItlSlotData *, const BufferTag *,
+	const ClusterSavepointOperation *, ClusterSavepointReaderIdentity *, ClusterTxResolution *,
+	ClusterSavepointReaderRecord *, char[BLCKSZ], ClusterTxResolveReason *);
 
 ClusterTxOutcome
 cluster_tx_resolve_operation_head(const ClusterTxLocator *locator pg_attribute_unused(),
 								  const ClusterItlSlotData *head pg_attribute_unused(),
 								  const BufferTag *tag pg_attribute_unused(),
+								  const ClusterSavepointOperation *owner pg_attribute_unused(),
 								  ClusterSavepointReaderIdentity *identity pg_attribute_unused(),
 								  ClusterTxResolution *top pg_attribute_unused(),
 								  ClusterSavepointReaderRecord *operation pg_attribute_unused(),

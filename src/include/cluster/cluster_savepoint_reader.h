@@ -68,6 +68,11 @@ cluster_savepoint_reader_extract_identity(const ClusterSavepointReaderIdentity *
  * an invented ACTIVE LSN. No outcome is granted: sample canonical TT, then
  * reacquire current DATA and compare all immutable bytes before consumption.
  * Unknown TT wrap may be filled only from this first addressed head. */
+/* Mixed own history additionally requires the caller's published current top.
+ * A zero sequence denotes a V1 link, never a child operation or CID receipt. */
+extern bool cluster_savepoint_reader_discover_own_head(
+	const ClusterSavepointOperation *owner, const ClusterItlSlotData *head, const BufferTag *tag,
+	const ClusterTxLocator *locator, const char page[BLCKSZ], ClusterSavepointReaderIdentity *out);
 extern bool cluster_savepoint_reader_discover_head(const ClusterItlSlotData *head,
 												   const BufferTag *tag,
 												   const ClusterTxLocator *locator,

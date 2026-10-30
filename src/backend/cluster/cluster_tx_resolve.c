@@ -467,7 +467,8 @@ done:
 
 ClusterTxOutcome
 cluster_tx_resolve_operation_head(const ClusterTxLocator *locator, const ClusterItlSlotData *head,
-								  const BufferTag *tag, ClusterSavepointReaderIdentity *identity,
+								  const BufferTag *tag, const ClusterSavepointOperation *owner,
+								  ClusterSavepointReaderIdentity *identity,
 								  ClusterTxResolution *top, ClusterSavepointReaderRecord *operation,
 								  char data[BLCKSZ], ClusterTxResolveReason *reason_out)
 {
@@ -494,9 +495,9 @@ cluster_tx_resolve_operation_head(const ClusterTxLocator *locator, const Cluster
 	}
 	PG_TRY();
 	{
-		outcome = cluster_runtime_visibility_resolve_operation_head_origin_admitted(
-			locator, head, tag, CLUSTER_TX_RESOLVE_VISIBILITY, &admission, identity, top, operation,
-			data, &reason);
+		outcome = cluster_runtime_visibility_resolve_own_operation_head_origin_admitted(
+			locator, head, tag, owner, CLUSTER_TX_RESOLVE_VISIBILITY, &admission, identity, top,
+			operation, data, &reason);
 	}
 	PG_FINALLY();
 	{

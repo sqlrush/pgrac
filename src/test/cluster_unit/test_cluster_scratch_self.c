@@ -63,6 +63,8 @@ enum SelfHistoryDefect {
 	SELF_HISTORY_UNKNOWN,
 	SELF_HISTORY_OLD_HOFF
 };
+static int self_mixed_mode;
+static int self_mixed_defect;
 static int self_history_records;
 static bool self_history_cross_page;
 static enum SelfHistoryDefect self_history_defect;
@@ -144,11 +146,10 @@ cluster_tx_resolve_exact(const ClusterTxLocator *locator, ClusterTxResolveMode m
 }
 
 extern FullTransactionId GetTopFullTransactionIdIfAny(void);
-extern ClusterTxOutcome
-cluster_tx_resolve_operation_head(const ClusterTxLocator *, const ClusterItlSlotData *,
-								  const BufferTag *, ClusterSavepointReaderIdentity *,
-								  ClusterTxResolution *, ClusterSavepointReaderRecord *,
-								  char[BLCKSZ], ClusterTxResolveReason *);
+extern ClusterTxOutcome cluster_tx_resolve_operation_head(
+	const ClusterTxLocator *, const ClusterItlSlotData *, const BufferTag *,
+	const ClusterSavepointOperation *, ClusterSavepointReaderIdentity *, ClusterTxResolution *,
+	ClusterSavepointReaderRecord *, char[BLCKSZ], ClusterTxResolveReason *);
 
 ClusterNormalStartState
 cluster_semantic_normal_start_state(void)
@@ -486,6 +487,56 @@ self_history_store(const char bytes[BLCKSZ], unsigned index)
 	block->free_offset += directory->record_length;
 }
 
+/* V1 top records are page-history links, never child-operation receipts. */
+static void
+self_mixed_record(char bytes[BLCKSZ], unsigned index)
+{
+	UndoRecordHeader *record = (UndoRecordHeader *)(bytes + 256);
+	UndoSlotDirEntry *directory;
+	UndoItlHistoryTrailer history;
+	uint16 length;
+	uint32 segment, block;
+	uint16 tt, row;
+	bool last = index + 1 == self_history_records;
+	bool plain = !last
+				 && (self_mixed_mode == 2 || (self_mixed_mode == 1 && index == 1)
+					 || (self_mixed_mode == 3 && index % 2 == 0));
+
+	if (last && self_mixed_defect == 7) {
+		UndoOperationTrailer operation;
+		char *tail = (char *)(record + 1) + record->payload_length - sizeof(operation);
+		memcpy(&operation, tail, sizeof(operation));
+		operation.operation_sequence = self_history_records;
+		memcpy(tail, &operation, sizeof(operation));
+	}
+	if (!plain)
+		return;
+	record->flags &= ~UNDO_REC_FLAG_HAS_OPERATION;
+	record->xid = UT_RAW_XID;
+	record->payload_length -= sizeof(UndoOperationTrailer);
+	UT_ASSERT(cluster_undo_record_decode_payload(record, record + 1, record->payload_length,
+												 &length, &history));
+	if (index == (self_mixed_mode == 1 ? 1 : 0)) {
+		if (self_mixed_defect == 1)
+			record->xid++;
+		if (self_mixed_defect == 2)
+			record->tt_wrap_plus1++;
+		if (self_mixed_defect == 3)
+			record->target_locator.relNumber++;
+		if (self_mixed_defect == 4) {
+			history.entries[history.entries[0].block == 0 ? 0 : 1].slot_index++;
+			memcpy((char *)(record + 1) + length, &history, sizeof(history));
+		}
+		if (self_mixed_defect == 5)
+			record->prev_uba = self_history_heads[index].undo_segment_head;
+	}
+	UT_ASSERT(uba_decode_record(self_history_heads[index].undo_segment_head, &segment, &block, &tt,
+								&row));
+	directory = (UndoSlotDirEntry *)(bytes + BLCKSZ - ((size_t)row + 1) * sizeof(*directory));
+	directory->record_length = sizeof(*record) + record->payload_length;
+	directory->flags = record->flags;
+}
+
 static void
 self_history_build(bool creator, const BufferTag *tag)
 {
@@ -524,6 +575,8 @@ self_history_build(bool creator, const BufferTag *tag)
 		UT_ASSERT(cluster_undo_record_decode_operation_payload(
 			record, bytes.data + 256 + sizeof(*record), record->payload_length,
 			&decoded.body_length, &decoded.history, &decoded.operation));
+		if (self_mixed_mode != 0)
+			self_mixed_record(bytes.data, i);
 		self_history_store(bytes.data, i);
 	}
 }
@@ -545,11 +598,12 @@ self_history_copy(const ClusterTxLocator *locator, const ClusterItlSlotData *hea
 }
 
 ClusterTxOutcome
-cluster_runtime_visibility_resolve_operation_head_origin_admitted(
+cluster_runtime_visibility_resolve_own_operation_head_origin_admitted(
 	const ClusterTxLocator *locator, const ClusterItlSlotData *head, const BufferTag *tag,
-	ClusterTxResolveMode mode, const ClusterSemanticAdmissionToken *admission,
-	ClusterSavepointReaderIdentity *identity, ClusterTxResolution *top,
-	ClusterSavepointReaderRecord *operation, char data[BLCKSZ], ClusterTxResolveReason *reason)
+	const ClusterSavepointOperation *owner, ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission, ClusterSavepointReaderIdentity *identity,
+	ClusterTxResolution *top, ClusterSavepointReaderRecord *operation, char data[BLCKSZ],
+	ClusterTxResolveReason *reason)
 {
 	PGAlignedBlock record;
 	ClusterTxLocator exact = *locator;
@@ -574,7 +628,7 @@ cluster_runtime_visibility_resolve_operation_head_origin_admitted(
 		if (self_update_layout != 0)
 			self_update_record(data, (tuple->t_infomask & HEAP_XMAX_INVALID) != 0);
 	}
-	if (!cluster_savepoint_reader_discover_head(head, tag, locator, data, identity))
+	if (!cluster_savepoint_reader_discover_own_head(owner, head, tag, locator, data, identity))
 		return CLUSTER_TX_UNKNOWN;
 	exact.tt_wrap = identity->canonical.wrap;
 	if (!cluster_savepoint_reader_extract_identity(identity, &exact, data, record.data, &length,
@@ -1051,10 +1105,58 @@ UT_TEST(test_own_child_history_matching_bad_image_stops)
 	self_history_defect = SELF_HISTORY_OK;
 }
 
+UT_TEST(test_own_child_mixed_top_history_commands)
+{
+	for (int length = 3; length <= 24; length += 21) {
+		self_history_records = length;
+		for (self_mixed_mode = 1; self_mixed_mode <= 3; self_mixed_mode++)
+			for (int cross = 0; cross < 2; cross++) {
+				self_history_cross_page = cross;
+				for (self_update_layout = 0; self_update_layout <= 2; self_update_layout++) {
+					self_history_case(true, 2, false, false, length);
+					self_history_case(true, 3, true, false, length);
+					self_history_case(false, 2, true, false, length);
+					self_history_case(false, 3, false, false, length);
+				}
+			}
+	}
+	self_history_records = self_update_layout = self_mixed_mode = 0;
+	self_history_cross_page = false;
+}
+UT_TEST(test_own_child_mixed_top_history_refusals)
+{
+	self_history_records = 3;
+	for (self_mixed_mode = 1; self_mixed_mode <= 2; self_mixed_mode++)
+		for (int cross = 0; cross < 2; cross++) {
+			self_history_cross_page = cross;
+			for (self_mixed_defect = 1; self_mixed_defect <= 7; self_mixed_defect++) {
+				int calls = self_mixed_defect == 7 ? 3 : self_mixed_mode == 1 ? 2 : 1;
+				if (self_mixed_defect == 6 || (self_mixed_defect == 7 && self_mixed_mode == 2))
+					continue;
+				self_history_case(true, 3, false, true, calls);
+				self_history_case(false, 3, false, true, calls);
+			}
+		}
+	self_history_records = self_mixed_mode = self_mixed_defect = 0;
+	self_history_cross_page = false;
+}
+UT_TEST(test_own_child_mixed_top_history_error_unwinds)
+{
+	self_history_records = 3;
+	self_mixed_mode = 2;
+	for (self_history_defect = SELF_HISTORY_ERROR; self_history_defect <= SELF_HISTORY_UNKNOWN;
+		 self_history_defect++) {
+		self_history_case(true, 3, false, true, 2);
+		self_history_case(false, 3, false, true, 2);
+	}
+	self_history_records = self_mixed_mode = 0;
+	self_history_defect = SELF_HISTORY_OK;
+}
+
 int
 main(void)
 {
-	UT_PLAN(24);
+	UT_PLAN(27);
 	UT_RUN(test_existing_delete_current_command);
 	UT_RUN(test_existing_delete_next_command);
 	UT_RUN(test_update_old_version_next_command);
@@ -1079,6 +1181,9 @@ main(void)
 	UT_RUN(test_own_child_history_prior_refusals);
 	UT_RUN(test_own_child_history_error_unwinds_every_read);
 	UT_RUN(test_own_child_history_matching_bad_image_stops);
+	UT_RUN(test_own_child_mixed_top_history_commands);
+	UT_RUN(test_own_child_mixed_top_history_refusals);
+	UT_RUN(test_own_child_mixed_top_history_error_unwinds);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

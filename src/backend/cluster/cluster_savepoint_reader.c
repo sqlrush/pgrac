@@ -23,8 +23,8 @@
 #ifdef USE_PGRAC_CLUSTER
 
 static bool
-savepoint_reader_expected_valid(const ClusterSavepointOperation *expected,
-								const ClusterTxLocator *locator)
+savepoint_reader_binding_valid(const ClusterSavepointOperation *expected,
+							   const ClusterTxLocator *locator)
 {
 	const ClusterCanonicalTxnBinding *top = &expected->top;
 
@@ -36,7 +36,14 @@ savepoint_reader_expected_valid(const ClusterSavepointOperation *expected,
 		   && (top->segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE == top->origin_instance - 1
 		   && top->publish_state == CLUSTER_CANONICAL_TXN_PUBLISHED && top->reserved16 == 0
 		   && !XLogRecPtrIsInvalid(top->active_lsn) && locator->xid == top->xid
-		   && locator->tt_wrap == top->slot_wrap
+		   && locator->tt_wrap == top->slot_wrap;
+}
+
+static bool
+savepoint_reader_expected_valid(const ClusterSavepointOperation *expected,
+								const ClusterTxLocator *locator)
+{
+	return savepoint_reader_binding_valid(expected, locator)
 		   && TransactionIdIsNormal(XidFromFullTransactionId(expected->operation_fxid))
 		   && U64FromFullTransactionId(expected->operation_fxid)
 				  > U64FromFullTransactionId(expected->top_fxid)
@@ -84,10 +91,14 @@ savepoint_reader_identity_valid(const ClusterSavepointReaderIdentity *expected,
 		   && top->slot_offset < TT_SLOTS_PER_SEGMENT && top->wrap <= TT_WRAP_MAX
 		   && locator->xid == top->xid && locator->tt_wrap == top->wrap
 		   && TransactionIdIsNormal(XidFromFullTransactionId(expected->operation_fxid))
-		   && U64FromFullTransactionId(expected->operation_fxid)
-				  > U64FromFullTransactionId(expected->top_fxid)
-		   && expected->operation_sequence != 0 && expected->command_id != InvalidCommandId
-		   && expected->subid > TopSubTransactionId;
+		   && ((U64FromFullTransactionId(expected->operation_fxid)
+					> U64FromFullTransactionId(expected->top_fxid)
+				&& expected->operation_sequence != 0 && expected->command_id != InvalidCommandId
+				&& expected->subid > TopSubTransactionId)
+			   || (U64FromFullTransactionId(expected->operation_fxid)
+					   == U64FromFullTransactionId(expected->top_fxid)
+				   && expected->operation_sequence == 0 && expected->command_id == InvalidCommandId
+				   && expected->subid == TopSubTransactionId));
 }
 
 /* A transaction predecessor need not be this page's ITL prior. Retain the
@@ -135,16 +146,22 @@ cluster_savepoint_reader_decode_identity(const ClusterSavepointReaderIdentity *e
 			   != (expected->canonical.segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE
 		|| record->xid != XidFromFullTransactionId(expected->operation_fxid)
 		|| cluster_undo_record_uba_equal(record->prev_uba, current_uba)
-		|| !cluster_undo_record_decode_operation_payload(record, body, payload_length,
-														 &decoded.body_length, &decoded.history,
-														 &decoded.operation))
+		|| (expected->operation_sequence == 0
+				? (!(record->flags & UNDO_REC_FLAG_HAS_ITL_HISTORY)
+				   || !cluster_undo_record_decode_payload(record, body, payload_length,
+														  &decoded.body_length, &decoded.history))
+				: !cluster_undo_record_decode_operation_payload(
+					  record, body, payload_length, &decoded.body_length, &decoded.history,
+					  &decoded.operation)))
 		return false;
-	if (decoded.operation.canonical_top_fxid != U64FromFullTransactionId(expected->top_fxid)
-		|| decoded.operation.operation_fxid != U64FromFullTransactionId(expected->operation_fxid)
-		|| decoded.operation.canonical_segment_generation != expected->canonical_generation
-		|| decoded.operation.operation_sequence != expected->operation_sequence
-		|| decoded.operation.command_id != expected->command_id
-		|| decoded.operation.subid != expected->subid)
+	if (expected->operation_sequence != 0
+		&& (decoded.operation.canonical_top_fxid != U64FromFullTransactionId(expected->top_fxid)
+			|| decoded.operation.operation_fxid
+				   != U64FromFullTransactionId(expected->operation_fxid)
+			|| decoded.operation.canonical_segment_generation != expected->canonical_generation
+			|| decoded.operation.operation_sequence != expected->operation_sequence
+			|| decoded.operation.command_id != expected->command_id
+			|| decoded.operation.subid != expected->subid))
 		return false;
 
 	/* The old physical key validator remains top-only. Project only its
@@ -332,6 +349,66 @@ cluster_savepoint_reader_discover_head(const ClusterItlSlotData *head, const Buf
 	if (!cluster_savepoint_reader_decode_identity(&identity, &canonical, locator->uba, &record,
 												  body, record.payload_length, &decoded))
 		return false;
+	*out = identity;
+	return true;
+}
+
+/* Only an explicit current-owner binding can qualify a V1 bridge. Its
+ * missing FullXid/generation are compare inputs, not facts inferred from DATA. */
+bool
+cluster_savepoint_reader_discover_own_head(const ClusterSavepointOperation *owner,
+										   const ClusterItlSlotData *head, const BufferTag *tag,
+										   const ClusterTxLocator *locator, const char page[BLCKSZ],
+										   ClusterSavepointReaderIdentity *out)
+{
+	ClusterSavepointReaderIdentity identity = { 0 };
+	ClusterSavepointReaderRecord decoded;
+	ClusterTxLocator exact;
+	UndoRecordHeader record;
+	UndoSlotDirEntry slot;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (owner == NULL || head == NULL || tag == NULL || locator == NULL
+		|| U64FromFullTransactionId(owner->operation_fxid)
+			   != U64FromFullTransactionId(owner->top_fxid)
+		|| owner->operation_sequence != 0 || owner->command_id != InvalidCommandId
+		|| owner->subid != TopSubTransactionId
+		|| !savepoint_reader_record(locator, page, &record, &slot))
+		return false;
+	exact = *locator;
+	if (exact.tt_wrap == TT_WRAP_INVALID)
+		exact.tt_wrap = owner->top.slot_wrap;
+	if (!savepoint_reader_binding_valid(owner, &exact))
+		return false;
+	if (record.flags & UNDO_REC_FLAG_HAS_OPERATION) {
+		if (!cluster_savepoint_reader_discover_head(head, tag, &exact, page, &identity)
+			|| identity.canonical_generation != owner->top.segment_generation
+			|| U64FromFullTransactionId(identity.top_fxid)
+				   != U64FromFullTransactionId(owner->top_fxid)
+			|| identity.canonical.segment_id != owner->top.segment_id
+			|| identity.canonical.slot_offset != owner->top.slot_offset
+			|| identity.canonical.wrap != owner->top.slot_wrap)
+			return false;
+	} else {
+		identity.canonical = (ClusterTTSlotPhysicalLocator){ .segment_id = owner->top.segment_id,
+															 .xid = owner->top.xid,
+															 .slot_offset = owner->top.slot_offset,
+															 .wrap = owner->top.slot_wrap };
+		identity.canonical_generation = owner->top.segment_generation;
+		identity.top_fxid = identity.operation_fxid = owner->top_fxid;
+		identity.command_id = InvalidCommandId;
+		identity.subid = TopSubTransactionId;
+		if (record.target_locator.spcOid != tag->spcOid || record.target_locator.dbOid != tag->dbOid
+			|| record.target_locator.relNumber != tag->relNumber
+			|| record.target_fork != tag->forkNum
+			|| !cluster_savepoint_reader_decode_identity(&identity, &exact, locator->uba, &record,
+														 page + slot.record_offset + sizeof(record),
+														 record.payload_length, &decoded)
+			|| !savepoint_reader_head_matches(head, tag, &exact, &decoded.history))
+			return false;
+	}
 	*out = identity;
 	return true;
 }

@@ -278,6 +278,13 @@ extern ClusterTxOutcome cluster_runtime_visibility_resolve_operation_origin_admi
 /* Blocking original origin owner for immutable-head discovery. The identity
  * is compare data, not a parent mapping or terminal/cache/reclamation proof.
  * All outputs remain private through the final release/admission fence. */
+/* Explicit current-top challenge permits V1 links in own-operation history. */
+extern ClusterTxOutcome cluster_runtime_visibility_resolve_own_operation_head_origin_admitted(
+	const ClusterTxLocator *locator, const ClusterItlSlotData *head, const BufferTag *tag,
+	const ClusterSavepointOperation *owner, ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission, ClusterSavepointReaderIdentity *identity_out,
+	ClusterTxResolution *top_out, ClusterSavepointReaderRecord *operation_out,
+	char data_out[BLCKSZ], ClusterTxResolveReason *reason_out);
 extern ClusterTxOutcome cluster_runtime_visibility_resolve_operation_head_origin_admitted(
 	const ClusterTxLocator *locator, const ClusterItlSlotData *head, const BufferTag *tag,
 	ClusterTxResolveMode mode, const ClusterSemanticAdmissionToken *admission,
