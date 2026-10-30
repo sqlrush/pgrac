@@ -44,6 +44,17 @@ clog_desc(StringInfo buf, XLogReaderState *record)
 		appendStringInfo(buf, "page %d; firstFullXid " UINT64_FORMAT,
 						 birth.pageno, birth.first_full_xid);
 	}
+	else if (info == CLOG_TRUNCATE_FULL)
+	{
+		xl_clog_truncate_full cut;
+		if (rec == NULL || XLogRecGetDataLen(record) != sizeof(cut)) {
+			appendStringInfoString(buf, "invalid full truncate record");
+			return;
+		}
+		memcpy(&cut, rec, sizeof(cut));
+		appendStringInfo(buf, "page %d; oldestFullXid " UINT64_FORMAT,
+			cut.pageno, cut.oldest_full_xid);
+	}
 	else if (info == CLOG_ZEROPAGE)
 	{
 		int			pageno;
@@ -73,6 +84,9 @@ clog_identify(uint8 info)
 			break;
 		case CLOG_ZEROPAGE_FULL:
 			id = "ZEROPAGE_FULL";
+			break;
+		case CLOG_TRUNCATE_FULL:
+			id = "TRUNCATE_FULL";
 			break;
 		case CLOG_TRUNCATE:
 			id = "TRUNCATE";

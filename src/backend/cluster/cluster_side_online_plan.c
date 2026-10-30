@@ -556,6 +556,24 @@ side_projection_decode(const RfDetachedRecordPlanV1 *record_plan,
 			projection->action = CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE;
 			return projection->page_number >= 0;
 		}
+		if (info == CLOG_TRUNCATE_FULL) {
+			xl_clog_truncate_full cut;
+			if (data == NULL || data_length != sizeof(cut)
+				|| XLogRecGetInfo(record) != CLOG_TRUNCATE_FULL
+				|| XLogRecHasAnyBlockRefs(record)
+				|| XLogRecGetOrigin(record) != InvalidRepOriginId
+				|| record->record->has_page_version_edge)
+				return false;
+			memcpy(&cut, data, sizeof(cut));
+			if (!ClogTruncateFullIsValid(&cut) || !OidIsValid(cut.oldestXactDb))
+				return false;
+			projection->action = CLUSTER_SIDE_PROJECTION_ACTION_TRUNCATE;
+			projection->page_number = cut.pageno;
+			projection->oldest_xid = cut.oldestXact;
+			projection->oldest_database = cut.oldestXactDb;
+			*payload_length = sizeof(cut);
+			return true;
+		}
 		if (info == CLOG_TRUNCATE) {
 			xl_clog_truncate trunc;
 

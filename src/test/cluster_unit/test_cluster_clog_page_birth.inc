@@ -20,6 +20,7 @@ static struct {
 	bool fail;
 } birth_wal;
 
+#ifndef TEST_CLUSTER_CLOG_RETENTION
 #include "test_cluster_clog_native_horizon.inc"
 
 /* TRUNCATE opts into the original lock/advance body. Other fixtures retain
@@ -71,6 +72,7 @@ XLogInsert(RmgrId rmid, uint8 info)
 	if (birth_wal.fail) elog(ERROR, "full birth insertion fixture");
 	return UINT64_C(0x100000);
 }
+#endif
 
 static bool
 birth_call_caught(FullTransactionId full)

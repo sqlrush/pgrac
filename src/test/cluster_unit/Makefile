@@ -14413,3 +14413,16 @@ test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: t
 
 # Original FULL initialization fixtures are shared by the native episode bridge.
 test_cluster_clog_recovery test_cluster_recovery_episode_clog.o: test_cluster_clog_foreign_birth.inc test_cluster_clog_full_residency.inc test_cluster_clog_terminal_residency.inc test_cluster_clog_full_consumer.inc test_cluster_clog_relmap_mutation.inc
+
+# Complete native FULL truncation payloads change retained input layout.
+test_cluster_recovery_native_scan test_cluster_clog_retention test_cluster_side_xact \
+        test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census \
+        test_cluster_recovery_episode_clog.o test_cluster_side_native_clog.o: \
+        $(top_srcdir)/src/include/access/clog.h \
+        $(top_srcdir)/src/include/cluster/cluster_recovery_native_inventory.h
+test_cluster_clog_retention: test_cluster_clog_native_truncate.inc test_cluster_clog_page_birth.inc
+
+test_cluster_cold_recovery_decode test_cluster_cold_recovery_startup \
+        test_cluster_recovery_consumed_inputs.o test_cluster_recovery_scope_native_census_product.o: \
+        $(top_srcdir)/src/include/access/clog.h \
+        $(top_srcdir)/src/include/cluster/cluster_recovery_native_inventory.h

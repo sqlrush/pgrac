@@ -27,6 +27,10 @@ static const xl_clog_zeropage_full side_full_birth = {
 	97, 0, (UINT64_C(7) << 32) | UINT64_C(3178496)
 };
 
+static const xl_clog_truncate_full side_full_cut = {
+	97, 3178505, 606, 0, (UINT64_C(7) << 32) | UINT64_C(3178505)
+};
+
 bool
 cluster_clog_native_recovery_full_record_apply_v1(
 	int origin, const ClusterSideProjectionOperationV1 *operation,
@@ -38,9 +42,15 @@ cluster_clog_native_recovery_full_record_apply_v1(
 		return test_side_native_clog_apply(origin, operation, payload, length);
 	}
 #endif
+	if (operation->normalized_info == CLOG_TRUNCATE_FULL) {
+		UT_ASSERT_EQ(length, sizeof(side_full_cut));
+		UT_ASSERT(payload != NULL && length == sizeof(side_full_cut)
+			&& memcmp(payload, &side_full_cut, length) == 0);
+	} else {
 	UT_ASSERT_EQ(length, sizeof(side_full_birth));
 	UT_ASSERT(payload != NULL && memcmp(payload, &side_full_birth, length) == 0);
 	UT_ASSERT_EQ(operation->normalized_info, CLOG_ZEROPAGE_FULL);
+	}
 	return cluster_clog_native_recovery_record_apply_v1(origin, operation);
 }
 
@@ -55,9 +65,15 @@ cluster_clog_native_recovery_full_record_verify_v1(
 		return test_side_native_clog_verify(origin, operation, payload, length);
 	}
 #endif
+	if (operation->normalized_info == CLOG_TRUNCATE_FULL) {
+		UT_ASSERT_EQ(length, sizeof(side_full_cut));
+		UT_ASSERT(payload != NULL && length == sizeof(side_full_cut)
+			&& memcmp(payload, &side_full_cut, length) == 0);
+	} else {
 	UT_ASSERT_EQ(length, sizeof(side_full_birth));
 	UT_ASSERT(payload != NULL && memcmp(payload, &side_full_birth, length) == 0);
 	UT_ASSERT_EQ(operation->normalized_info, CLOG_ZEROPAGE_FULL);
+	}
 	return cluster_clog_native_recovery_record_verify_v1(origin, operation);
 }
 
@@ -201,6 +217,101 @@ UT_TEST(test_full_clog_cold_owner_keeps_native_postread_before_projection)
 		control_scope_test = false;
 		cold_clog_apply_fail = cold_clog_verify_fail = cold_clog_throw
 			= cold_clog_stale_after_verify = false;
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
+UT_TEST(test_full_truncate_cold_owner_keeps_native_postread_before_projection)
+{
+	for (unsigned fault = 0; fault < 7; fault++) {
+		RfSideOnlinePlanV1 *plan = space_online_plan(200);
+		FakeXactRecord fake;
+		RfSideOnlineProductionOwnerV1 owner;
+		ClusterRecoverySerialGuard guard = { .mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED };
+		ClusterThreadRecoveryAuthorityV1 authority
+			= { .duty = &canonical_duty, .serial_guard = &guard };
+		volatile bool caught = false;
+		RfPageProofDetailV1 result = RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+		bool captured;
+
+		make_projection_record(&fake, RM_CLOG_ID, CLOG_TRUNCATE_FULL,
+							   &side_full_cut, sizeof(side_full_cut));
+		fake.u.decoded.max_block_id = -1;
+		captured = side_full_feed(plan, &fake) == RF_PAGE_PROOF_DETAIL_OK;
+		UT_ASSERT(captured);
+		if (!captured) {
+			rf_side_online_plan_destroy_v1(&plan);
+			continue;
+		}
+		UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+		if (fault == 6) guard.mode = CLUSTER_RECOVERY_SERIAL_ONLINE;
+		cold_clog_test = cold_clog_record_test = control_scope_test = true;
+		control_scope_denied = false;
+		control_scope_fault = 0;
+		cold_clog_record_online = false;
+		cold_clog_denied = fault == 4;
+		cold_clog_apply_fail = fault == 1;
+		cold_clog_verify_fail = fault == 2;
+		cold_clog_stale_after_verify = fault == 3;
+		cold_clog_throw = fault == 5;
+		cold_clog_applies = cold_clog_verifies = cold_clog_record_projections = 0;
+		UT_ASSERT(rf_side_online_production_owner_init_v1(
+			&owner, &authority, canonical_authority_fresh, 19, true));
+		UT_ASSERT(rf_side_online_production_bind_undo_v1(&owner, &authority));
+		PG_TRY();
+		{
+			result = rf_side_online_production_apply_v1(plan, &owner);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, fault == 5);
+		if (!caught)
+			UT_ASSERT_EQ(result, fault == 0 ? RF_PAGE_PROOF_DETAIL_OK
+										  : RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
+		UT_ASSERT_EQ(cold_clog_applies, fault == 4 || fault == 6 ? 0 : 1);
+		UT_ASSERT_EQ(cold_clog_verifies, fault == 0 || fault == 2 || fault == 3 ? 1 : 0);
+		UT_ASSERT_EQ(cold_clog_record_projections, fault == 0 ? 1 : 0);
+		UT_ASSERT_EQ(owner.protected_set_complete, fault == 0);
+		UT_ASSERT(canonical_scope == NULL && canonical_writer_depth == 0
+				  && !owner.protected_set_active);
+		cold_clog_record_test = cold_clog_record_online = cold_clog_test = cold_clog_denied = false;
+		control_scope_test = false;
+		cold_clog_apply_fail = cold_clog_verify_fail = cold_clog_throw
+			= cold_clog_stale_after_verify = false;
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
+UT_TEST(test_full_truncate_side_keeps_all_bytes_and_rejects_bad_frames)
+{
+	for (unsigned fault = 0; fault < 10; fault++) {
+		RfSideOnlinePlanV1 *plan = space_online_plan(200);
+		FakeXactRecord fake;
+		xl_clog_truncate_full cut = side_full_cut;
+		RfSideOnlineOperationV1 operation;
+		if (fault == 1) cut.reserved_zero = 1;
+		if (fault == 2) cut.oldest_full_xid++;
+		if (fault == 3) cut.pageno++;
+		if (fault == 4) cut.oldestXact = 2;
+		make_projection_record(&fake, RM_CLOG_ID, CLOG_TRUNCATE_FULL, &cut, sizeof(cut));
+		fake.u.decoded.max_block_id = -1;
+		if (fault == 5) fake.u.decoded.main_data_len--;
+		if (fault == 6) fake.u.decoded.main_data_len++;
+		if (fault == 7) fake.u.decoded.has_page_version_edge = true;
+		if (fault == 8) fake.u.decoded.record_origin = 1;
+		if (fault == 9) fake.u.decoded.max_block_id = 0;
+		if (fault == 0) {
+			UT_ASSERT_EQ(side_full_feed(plan, &fake), RF_PAGE_PROOF_DETAIL_OK);
+			UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+			memset(fake.data, 0x5a, sizeof(cut));
+			UT_ASSERT(rf_side_online_plan_operation_v1(plan, 0, &operation));
+			UT_ASSERT_EQ(operation.owned_payload_length, sizeof(cut));
+			UT_ASSERT(memcmp(operation.owned_payload, &cut, sizeof(cut)) == 0);
+		} else
+			UT_ASSERT(!rf_side_online_projection_record_shape_v1(&fake.reader, true));
 		rf_side_online_plan_destroy_v1(&plan);
 	}
 }

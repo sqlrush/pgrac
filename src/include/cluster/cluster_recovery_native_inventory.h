@@ -375,6 +375,10 @@ typedef struct ClusterRecoveryRelmapClogEventV1 {
 	 * a queried transaction's era, no-reuse or continuous physical lifetime. */
 	bool full_birth_observed;
 	xl_clog_zeropage_full full_birth;
+	/* Complete actual reserved cutoff; legacy TRUNCATE stays unknown.
+	 * Even FULL WAL records an attempt, never successful deletion/lifetime. */
+	bool full_truncate_observed;
+	xl_clog_truncate_full full_truncate;
 } ClusterRecoveryRelmapClogEventV1;
 
 /* One original physical generation's complete native-redo counter fold.

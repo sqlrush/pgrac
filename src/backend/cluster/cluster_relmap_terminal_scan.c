@@ -143,6 +143,14 @@ terminal_scan_clog_retains_base(const ClusterRelmapTerminalScanV1 *scan, XLogRea
 			return false;
 		return !scan->terminal_seen || (uint32)page != target / per_page;
 	}
+	if (info == CLOG_TRUNCATE_FULL) {
+		xl_clog_truncate_full cut;
+		if (length != sizeof(cut))
+			return false;
+		memcpy(&cut, data, sizeof(cut));
+		/* Exact producer cutoff alone still does not qualify native lifetime. */
+		return ClogTruncateFullIsValid(&cut) && !scan->terminal_seen;
+	}
 	if (info == CLOG_TRUNCATE) {
 		xl_clog_truncate trunc;
 		if (length != sizeof(trunc))

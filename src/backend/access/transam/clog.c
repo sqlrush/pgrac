@@ -2429,6 +2429,15 @@ clog_recovery_record(int origin, const ClusterSideProjectionOperationV1 *op, boo
 		if (!clog_recovery_full_record_shape(op, payload, length))
 			return false;
 		memcpy(&birth, payload, sizeof(birth));
+	} else if (op->normalized_info == CLOG_TRUNCATE_FULL) {
+		xl_clog_truncate_full cut;
+
+		if (payload == NULL || length != sizeof(cut))
+			return false;
+		memcpy(&cut, payload, sizeof(cut));
+		if (!ClogTruncateFullIsValid(&cut) || cut.pageno != op->page_number
+			|| cut.oldestXact != op->oldest_xid || cut.oldestXactDb != op->oldest_database)
+			return false;
 	} else if (payload != NULL || length != 0)
 		return false;
 	if (op->action == CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE) {
@@ -2437,7 +2446,8 @@ clog_recovery_record(int origin, const ClusterSideProjectionOperationV1 *op, boo
 			|| OidIsValid(op->oldest_database))
 			return false;
 	} else if (op->action == CLUSTER_SIDE_PROJECTION_ACTION_TRUNCATE) {
-		if (op->normalized_info != CLOG_TRUNCATE || !TransactionIdIsNormal(op->oldest_xid)
+		if ((op->normalized_info != CLOG_TRUNCATE && op->normalized_info != CLOG_TRUNCATE_FULL)
+			|| !TransactionIdIsNormal(op->oldest_xid)
 			|| !OidIsValid(op->oldest_database)
 			|| TransactionIdToPage(op->oldest_xid) != op->page_number)
 			return false;
@@ -2525,7 +2535,8 @@ cluster_clog_native_recovery_full_record_apply_v1(
 	int origin, const ClusterSideProjectionOperationV1 *operation,
 	const uint8 *payload, uint32 length)
 {
-	return operation != NULL && operation->normalized_info == CLOG_ZEROPAGE_FULL
+	return operation != NULL && (operation->normalized_info == CLOG_ZEROPAGE_FULL
+		|| operation->normalized_info == CLOG_TRUNCATE_FULL)
 		&& clog_recovery_record(origin, operation, false, payload, length);
 }
 
@@ -2534,7 +2545,8 @@ cluster_clog_native_recovery_full_record_verify_v1(
 	int origin, const ClusterSideProjectionOperationV1 *operation,
 	const uint8 *payload, uint32 length)
 {
-	return operation != NULL && operation->normalized_info == CLOG_ZEROPAGE_FULL
+	return operation != NULL && (operation->normalized_info == CLOG_ZEROPAGE_FULL
+		|| operation->normalized_info == CLOG_TRUNCATE_FULL)
 		&& clog_recovery_record(origin, operation, true, payload, length);
 }
 
@@ -2870,8 +2882,8 @@ ExtendCLOGFull(FullTransactionId newestXact)
  * actually remove a segment is fairly rare, and so it seems best not to do
  * the XLOG flush unless we have confirmed that there is a removable segment.
  */
-void
-TruncateCLOG(TransactionId oldestXact, Oid oldestxid_datoid)
+static void
+TruncateCLOGInternal(TransactionId oldestXact, Oid oldestxid_datoid, uint64 full_cutoff)
 {
 	int			cutoffPage;
 
@@ -2880,6 +2892,11 @@ TruncateCLOG(TransactionId oldestXact, Oid oldestxid_datoid)
 	 * pass the *page* containing oldestXact to SimpleLruTruncate.
 	 */
 	cutoffPage = TransactionIdToPage(oldestXact);
+	if (full_cutoff != 0) {
+		xl_clog_truncate_full cut = { cutoffPage, oldestXact, oldestxid_datoid, 0, full_cutoff };
+		if (!ClogTruncateFullIsValid(&cut))
+			elog(PANIC, "invalid reserved full CLOG truncate cutoff");
+	}
 
 	/* Check to see if there's any files that could be removed */
 	if (!SlruScanDirectory(XactCtl, SlruScanDirCbReportPresence, &cutoffPage))
@@ -2905,7 +2922,17 @@ TruncateCLOG(TransactionId oldestXact, Oid oldestxid_datoid)
 	 * ahead of clog truncation in case we crash, and so a standby finds out
 	 * the new valid xid before the next checkpoint.
 	 */
-	WriteTruncateXlogRec(cutoffPage, oldestXact, oldestxid_datoid);
+	if (full_cutoff != 0) {
+		xl_clog_truncate_full cut = { cutoffPage, oldestXact, oldestxid_datoid, 0, full_cutoff };
+		XLogRecPtr recptr;
+
+		/* The only FULL caller supplies the original runtime reservation. */
+		XLogBeginInsert();
+		XLogRegisterData((char *)&cut, sizeof(cut));
+		recptr = XLogInsert(RM_CLOG_ID, CLOG_TRUNCATE_FULL);
+		XLogFlush(recptr);
+	} else
+		WriteTruncateXlogRec(cutoffPage, oldestXact, oldestxid_datoid);
 
 	/* Now we can remove the old CLOG segment(s) */
 	SimpleLruTruncate(XactCtl, cutoffPage);
@@ -2917,6 +2944,12 @@ TruncateCLOG(TransactionId oldestXact, Oid oldestxid_datoid)
 	}
 	PG_END_TRY();
 #endif
+}
+
+void
+TruncateCLOG(TransactionId oldestXact, Oid oldestxid_datoid)
+{
+	TruncateCLOGInternal(oldestXact, oldestxid_datoid, 0);
 }
 
 #ifdef USE_PGRAC_CLUSTER
@@ -2951,7 +2984,7 @@ cluster_relmap_retention_truncate_clog_v2(FullTransactionId oldestXact, Oid olde
 
 	PG_TRY();
 	{
-		TruncateCLOG(cutoff, oldestxid_datoid);
+		TruncateCLOGInternal(cutoff, oldestxid_datoid, reservation.reservation.cutoff);
 		/* Native SLRU can return after wrap protection or ignore unlink
 		 * failure. Normal return alone does not establish a completed cut. */
 		if (!SlruScanDirectory(XactCtl, SlruScanDirCbReportPresence, &cutoffPage))
@@ -3057,7 +3090,8 @@ clog_redo(XLogReaderState *record)
 	uint8		info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
 
 	/* Backup blocks are not used in clog records */
-	Assert(info == CLOG_ZEROPAGE_FULL || !XLogRecHasAnyBlockRefs(record));
+	Assert(info == CLOG_ZEROPAGE_FULL || info == CLOG_TRUNCATE_FULL
+		|| !XLogRecHasAnyBlockRefs(record));
 
 	if (info == CLOG_ZEROPAGE_FULL)
 	{
@@ -3096,11 +3130,24 @@ clog_redo(XLogReaderState *record)
 
 		LWLockRelease(XactSLRULock);
 	}
-	else if (info == CLOG_TRUNCATE)
+	else if (info == CLOG_TRUNCATE || info == CLOG_TRUNCATE_FULL)
 	{
 		xl_clog_truncate xlrec;
 
-		memcpy(&xlrec, XLogRecGetData(record), sizeof(xl_clog_truncate));
+		if (info == CLOG_TRUNCATE_FULL) {
+			xl_clog_truncate_full cut;
+
+			if (XLogRecHasAnyBlockRefs(record) || XLogRecGetData(record) == NULL
+				|| XLogRecGetDataLen(record) != sizeof(cut))
+				elog(PANIC, "clog_redo: invalid full truncate record");
+			memcpy(&cut, XLogRecGetData(record), sizeof(cut));
+			if (!ClogTruncateFullIsValid(&cut))
+				elog(PANIC, "clog_redo: invalid full truncate cutoff");
+			xlrec.pageno = cut.pageno;
+			xlrec.oldestXact = cut.oldestXact;
+			xlrec.oldestXactDb = cut.oldestXactDb;
+		} else
+			memcpy(&xlrec, XLogRecGetData(record), sizeof(xl_clog_truncate));
 
 #ifdef USE_PGRAC_CLUSTER
 		clog_relmap_native_mutation(cluster_node_id);
