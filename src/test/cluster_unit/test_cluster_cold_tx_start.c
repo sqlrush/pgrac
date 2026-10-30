@@ -2345,9 +2345,20 @@ static void startup_local_empty_reset(void);
 #include "test_cluster_cold_ctrc_reference_terminals.inc"
 #include "test_cluster_cold_ctrc_reference_tuples.inc"
 #include "test_cluster_cold_ctrc_census_hot.inc"
+#include "test_cluster_cold_ctrc_cross_page.inc"
 
 int main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_CROSS_PAGE") != NULL) {
+		UT_PLAN(6);
+		UT_RUN(test_startup_cross_page_pairs_use_complete_current_untouched_view);
+		UT_RUN(test_startup_cross_page_raw_xid_cannot_borrow_another_canonical_terminal);
+		UT_RUN(test_startup_cross_page_matching_pair_cannot_be_heap_only);
+		UT_RUN(test_startup_cross_page_does_not_join_stale_or_inverse_or_other_space);
+		UT_RUN(test_startup_cross_page_repeat_rechecks_without_new_page_or_wal);
+		UT_RUN(test_startup_cross_page_zero_page_wal_still_checks_pair_identity);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_CENSUS_HOT") != NULL) {
 		UT_PLAN(5);
 		UT_RUN(test_startup_census_hot_checks_untouched_current_and_inverse_without_mutation);
@@ -2597,7 +2608,13 @@ int main(void)
 		UT_DONE();
 		return ut_failed_count == 0 ? 0 : 1;
 	}
-	UT_PLAN(265);
+	UT_PLAN(271);
+	UT_RUN(test_startup_cross_page_pairs_use_complete_current_untouched_view);
+	UT_RUN(test_startup_cross_page_raw_xid_cannot_borrow_another_canonical_terminal);
+	UT_RUN(test_startup_cross_page_matching_pair_cannot_be_heap_only);
+	UT_RUN(test_startup_cross_page_does_not_join_stale_or_inverse_or_other_space);
+	UT_RUN(test_startup_cross_page_repeat_rechecks_without_new_page_or_wal);
+	UT_RUN(test_startup_cross_page_zero_page_wal_still_checks_pair_identity);
 	UT_RUN(test_startup_census_hot_checks_untouched_current_and_inverse_without_mutation);
 	UT_RUN(test_startup_census_hot_late_refusal_current_drift_and_error_keep_debt);
 	UT_RUN(test_startup_census_hot_rejects_missing_duplicate_and_gapped_items);

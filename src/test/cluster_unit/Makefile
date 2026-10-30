@@ -14292,3 +14292,4 @@ test_cluster_terminal_ref_census: test_cluster_ctrc_census_tuple_refs.inc
 # Complete saved page/version HOT consumers.
 test_cluster_terminal_ref_census: test_cluster_ctrc_census_hot.inc
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_census_hot.inc
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_cross_page.inc
