@@ -2038,6 +2038,7 @@ cluster_remote_live_xmax_keeps_visible(Buffer buffer, HeapTupleHeader tuple, Sna
 static pg_attribute_noreturn() void
 cluster_r4_scratch_visibility_unknown(TransactionId xid, const char *reason)
 {
+	cluster_catalog_stats_vis_unknown_inc();
 	ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
 					errmsg("cluster TT status unknown for R4 scratch xid %u: %s", xid, reason),
 					errdetail("PGRAC_FAMILY=TT_AUTHORITY PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
@@ -2069,6 +2070,41 @@ cluster_r4_scratch_creator_slot(Page page, uint8 writer_index, TransactionId xmi
 												  "scratch creator DATA is ambiguous or malformed");
 	}
 	return writer_index;
+}
+
+/* Peer receipts remain independent of local TT observations and never
+ * trigger requester resampling or raw child history fallback. */
+static void
+cluster_r4_scratch_resolve(const ClusterR4HotScratchTestContext *context, HeapTuple tuple,
+						   uint8 slot, ClusterVisXidKind which, ClusterVisResolve *out)
+{
+	ClusterUndoTTSlotRef ref = { 0 };
+	ClusterR4ProjectionEntry entry;
+	uint8 role
+		= which == CLUSTER_VIS_XMIN ? CLUSTER_R4_PROJECTION_XMIN : CLUSTER_R4_PROJECTION_XMAX;
+	if (context->projection == NULL
+		|| (cluster_itl_get_tt_ref(context->scratch_page, slot, &ref)
+			&& ref.origin_node_id == cluster_node_id)) {
+		cluster_visibility_resolve_scratch_tuple_scn(context->scratch_page, tuple, &context->tag,
+													 slot, which, context->read_scn, out);
+		return;
+	}
+	memset(out, 0, sizeof(*out));
+	out->status = CLUSTER_TT_STATUS_UNKNOWN;
+	out->evidence = CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS;
+	out->diagnostic_reason = "PEER_PROJECTION_UNPROVABLE";
+	if (!cluster_itl_get_tt_ref(context->scratch_page, slot, &ref)
+		|| !ClusterR4ProjectionFind(&context->projection->wire,
+									ItemPointerGetOffsetNumber(&tuple->t_self), role, &entry)
+		|| entry.itl_index != slot
+		|| !ClusterR4ProjectionEntryMatches(&entry, context->scratch_page, context->read_scn,
+											cluster_node_id))
+		return;
+	out->ref = ref;
+	out->status = CLUSTER_TT_STATUS_COMMITTED;
+	out->evidence = CLUSTER_VIS_EVIDENCE_REMOTE;
+	out->commit_scn = entry.operation.commit_scn;
+	out->diagnostic_reason = NULL;
 }
 
 /* Observe already validated private bytes; no authority or page mutation. */
@@ -2222,6 +2258,12 @@ HeapTupleSatisfiesMVCCScratchInternal(HeapTuple htup, Snapshot snapshot,
 		|| ItemPointerGetBlockNumber(&context->logical_root) != context->tag.blockNum)
 		cluster_r4_scratch_visibility_unknown(InvalidTransactionId,
 										  "malformed or cross-block scratch tuple");
+	if (context->projection != NULL
+		&& !ClusterR4ProjectionScratchValid(context->projection, page, &context->tag,
+											snapshot->read_scn, snapshot->read_epoch,
+											cluster_node_id))
+		cluster_r4_scratch_visibility_unknown(InvalidTransactionId,
+											  "FULL projection is incomplete or mismatched");
 	observation = cluster_r4_scratch_observe(context, htup);
 
 	/* A frozen creator is already proved by the immutable tuple flags.
@@ -2234,7 +2276,16 @@ HeapTupleSatisfiesMVCCScratchInternal(HeapTuple htup, Snapshot snapshot,
 		&& !TransactionIdEquals(raw_xmin, BootstrapTransactionId)) {
 		if (!TransactionIdIsNormal(raw_xmin))
 			cluster_r4_scratch_visibility_unknown(raw_xmin, "scratch xmin is not a normal xid");
-		creator_index = cluster_r4_scratch_creator_slot(page, tuple->t_itl_slot_idx, raw_xmin);
+		{
+			ClusterR4ProjectionEntry entry;
+			creator_index
+				= context->projection != NULL
+						  && ClusterR4ProjectionFind(&context->projection->wire,
+													 ItemPointerGetOffsetNumber(&htup->t_self),
+													 CLUSTER_R4_PROJECTION_XMIN, &entry)
+					  ? entry.itl_index
+					  : cluster_r4_scratch_creator_slot(page, tuple->t_itl_slot_idx, raw_xmin);
+		}
 		if (observation != NULL)
 			observation->creator_slot = creator_index;
 		if (creator_index >= CLUSTER_ITL_INITRANS_DEFAULT)
@@ -2250,9 +2301,7 @@ HeapTupleSatisfiesMVCCScratchInternal(HeapTuple htup, Snapshot snapshot,
 												  "scratch xmin lacks a valid DATA ITL reference");
 
 		/* PGRAC: bind child SELF proof to this exact scratch tuple. */
-		cluster_visibility_resolve_scratch_tuple_scn(page, htup, &context->tag, creator_index,
-													 CLUSTER_VIS_XMIN, snapshot->read_scn,
-													 &resolved);
+		cluster_r4_scratch_resolve(context, htup, creator_index, CLUSTER_VIS_XMIN, &resolved);
 		if (unlikely(cluster_trace_visibility_enabled)) {
 			cluster_catalog_trace_event("scratch.authority", "status", resolved.status);
 			cluster_catalog_trace_event("scratch.authority", "evidence", resolved.evidence);
@@ -2339,9 +2388,8 @@ HeapTupleSatisfiesMVCCScratchInternal(HeapTuple htup, Snapshot snapshot,
 											  "scratch xmax lacks a valid DATA ITL reference");
 
 	/* PGRAC: bind child SELF proof to this exact scratch tuple. */
-	cluster_visibility_resolve_scratch_tuple_scn(page, htup, &context->tag, tuple->t_itl_slot_idx,
-												 CLUSTER_VIS_XMAX_UPDATE, snapshot->read_scn,
-												 &resolved);
+	cluster_r4_scratch_resolve(context, htup, tuple->t_itl_slot_idx, CLUSTER_VIS_XMAX_UPDATE,
+							   &resolved);
 	if (unlikely(cluster_trace_visibility_enabled)) {
 		cluster_catalog_trace_event("scratch.authority", "status", resolved.status);
 		cluster_catalog_trace_event("scratch.authority", "evidence", resolved.evidence);

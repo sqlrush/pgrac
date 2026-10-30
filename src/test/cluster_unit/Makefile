@@ -7757,6 +7757,7 @@ $(CLUSTER_R4_CONTINUATION_CR_O): $(top_srcdir)/src/backend/cluster/cluster_cr.c 
 		-Dcluster_cr_build_on_holder_step=continuation_real_step \
 		-Dcluster_cr_build_on_holder_step_admitted=continuation_real_step_admitted \
 		-Dcluster_cr_build_on_holder_forget=continuation_real_forget \
+        -Dcluster_cr_build_on_holder_projection=continuation_real_projection \
 		-Dcluster_cr_build_on_holder_pending_locator=continuation_real_pending \
 		-Dcluster_cr_r4_extract_resident_record=continuation_real_extract \
 		-c $< -o $@
@@ -9772,10 +9773,10 @@ test_cluster_scratch_itl_ref.inc: $(top_srcdir)/src/backend/cluster/cluster_itl.
 	mv $@.tmp $@
 
 test_cluster_scratch_self: test_cluster_scratch_self.c test_cluster_r4_scratch_resolver.c \
-        test_cluster_owner_full_fixture.h test_cluster_r4_tx_outcome \
+        test_cluster_owner_full_fixture.h test_cluster_r4_tx_outcome test_cluster_r4_slot_reservation test_cluster_r4_route_policy \
         test_cluster_scratch_itl_ref.inc \
         test_cluster_scratch_nonowner.inc \
-        test_cluster_scratch_peer.inc \
+        test_cluster_scratch_peer.inc test_cluster_scratch_projection.inc \
         test_cluster_scratch_operation_entry.inc \
         test_cluster_native_prehistory_proof.inc cluster_snapshot_test_stubs.h unit_test.h \
         $(top_srcdir)/src/backend/utils/time/combocid.c \
@@ -13160,3 +13161,11 @@ test_cluster_r4_wire_codec test_cluster_r4_route_policy test_cluster_r4_slot_mac
         test_cluster_r4_slot_reservation_product.o test_cluster_r4_continuation_cr_product.o \
         test_cluster_operation_worker_product.o test_cluster_r4_runtime_visibility_exact.o: \
         $(top_srcdir)/src/include/cluster/cluster_r4_operation.h
+
+$(CLUSTER_OPERATION_WORKER_TEST_O) $(CLUSTER_R4_GCS_BLOCK_TEST_O) $(CLUSTER_R4_SLOT_RESERVATION_TEST_O) $(CLUSTER_R4_HOT_VIS_TEST_O): $(top_srcdir)/src/include/cluster/cluster_r4_projection.h
+
+# Nonempty FULL transport fixture uses the original holder and server programs.
+test_cluster_r4_route_policy: test_cluster_r4_tx_outcome test_cluster_r4_slot_reservation
+$(CLUSTER_R4_CONTINUATION_CR_O): $(top_srcdir)/src/include/cluster/cluster_r4_projection.h
+
+$(CLUSTER_R4_HOT_HEAPAM_TEST_O) $(CLUSTER_R4_HOT_HANDLER_TEST_O) $(CLUSTER_R4_HOT_VIS_TEST_O) test_cluster_heap_cr_reuse test_cluster_heap_hot_full_trace: $(top_srcdir)/src/backend/access/heap/heapam_r4_private.h

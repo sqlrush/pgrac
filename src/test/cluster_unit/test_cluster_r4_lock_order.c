@@ -2578,6 +2578,21 @@ cluster_gcs_block_cr_fetch_and_wait(BufferTag tag, SCN read_scn, char dst_page[B
 	return CLUSTER_CR_BUILD_FULL;
 }
 
+void cluster_catalog_stats_vis_unknown_inc(void);
+void
+cluster_catalog_stats_vis_unknown_inc(void)
+{}
+
+ClusterCrBuildResult
+cluster_gcs_block_cr_fetch_projection(BufferTag tag, SCN read_scn, char dst_page[BLCKSZ],
+									  ClusterR4ProjectionScratch *projection,
+									  ClusterCrBuildReason *reason)
+{
+	ClusterR4ProjectionForget(projection);
+	return cluster_gcs_block_cr_fetch_and_wait(tag, read_scn, dst_page, reason);
+}
+
+
 static HeapTupleHeader
 ut_r4_hot_tuple_at(Page page, OffsetNumber offnum)
 {
@@ -2944,9 +2959,14 @@ UT_TEST(test_34_owned_scratch_result_survives_source_and_live_poison)
 	buffer_slot = (BufferHeapTupleTableSlot *)slot;
 	call_again = true;
 	all_dead = true;
+	memset(&result.projection, 0x5a, sizeof(result.projection));
+	result.projection.valid = true;
 	stored = cluster_heap_test_r4_store_hot_result(&result, slot, UT_HOT_BUFFER, &call_again,
 												   &all_dead);
 	UT_ASSERT_EQ(stored, TABLE_INDEX_FETCH_FOUND);
+	UT_ASSERT(!result.projection.valid);
+	UT_ASSERT_EQ(ClusterR4ProjectionCrc(result.scratch_page, BLCKSZ),
+				 ClusterR4ProjectionCrc((char[BLCKSZ]){ 0 }, BLCKSZ));
 	UT_ASSERT(!call_again);
 	UT_ASSERT(!all_dead);
 	UT_ASSERT_EQ(buffer_slot->buffer, InvalidBuffer);

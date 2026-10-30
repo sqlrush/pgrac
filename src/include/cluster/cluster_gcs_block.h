@@ -2052,7 +2052,7 @@ GcsBlockForwardPayloadGetExpectedPiWatermarkScn(const GcsBlockForwardPayload *p)
 /* Stage 8 R4 keeps the legacy 64-byte prefixes and appends these exact
  * byte-array extensions.  Multibyte fields are encoded explicitly little
  * endian; no packed/native cast is a wire authority. */
-#define CLUSTER_R4_WIRE_VERSION ((uint8)3)
+#define CLUSTER_R4_WIRE_VERSION ((uint8)4)
 #define CLUSTER_R4_FORWARD_EXTENDED ((uint8)6)
 #define GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF ((uint8)7)
 #define GCS_BLOCK_FORWARD_KIND_CURRENT_MX_STATS ((uint8)8)
@@ -2172,6 +2172,10 @@ cluster_cr_build_result_for_reason(ClusterCrBuildReason reason)
 #define CLUSTER_R4_CR_OWNER_WIRE_VERSION UINT32_C(1)
 #define CLUSTER_R4_CR_REPLY_PAYLOAD_SIZE                                                           \
 	(GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE + CLUSTER_R4_CR_OWNER_WIRE_BYTES)
+
+#include "cluster/cluster_r4_projection.h"
+#define CLUSTER_R4_CR_FULL_PAYLOAD_SIZE                                                            \
+	(CLUSTER_R4_CR_REPLY_PAYLOAD_SIZE + CLUSTER_R4_PROJECTION_BYTES)
 
 typedef struct ClusterR4CrOwnerChallenge {
 	FullTransactionId top_fxid;
@@ -2655,6 +2659,11 @@ cluster_r4_transition_lookup(ClusterR4OperationState state, ClusterR4OperationEv
 #undef CLUSTER_R4_FORWARD_OWNERS
 #undef CLUSTER_R4_ROUTE_OWNERS
 
+extern ClusterCrBuildResult
+cluster_gcs_block_cr_fetch_projection(BufferTag tag, SCN read_scn, char dst_page[BLCKSZ],
+									  ClusterR4ProjectionScratch *projection,
+									  ClusterCrBuildReason *reason_out);
+
 extern const char *cluster_cr_build_reason_name(ClusterCrBuildReason reason);
 
 typedef enum ClusterR4WireKind {
@@ -2765,6 +2774,10 @@ extern bool cluster_gcs_block_test_decode_r4_reply(
 	const struct ClusterICEnvelope *env, const void *payload, uint64 expected_request_id,
 	uint64 expected_epoch, int32 expected_requester_backend_id, uint8 expected_transition_id,
 	int32 expected_sender_node, int32 expected_forwarding_master_node, uint8 expected_reply_domain);
+extern bool cluster_gcs_block_test_copy_r4_projection(char page[BLCKSZ],
+													  ClusterR4ProjectionScratch *projection);
+extern bool cluster_gcs_block_test_bind_r4_projection_request(const BufferTag *tag, SCN read_scn,
+															  uint64 generation);
 extern bool cluster_gcs_block_test_arm_r4_reply_slot(uint64 request_id, uint64 request_epoch,
 													 int32 requester_backend_id,
 													 uint8 transition_id,
@@ -2785,6 +2798,8 @@ extern bool cluster_gcs_block_test_snapshot_r4_requester_slot(
 	BufferTag *tag_out, uint64 *request_epoch_out, int32 *expected_master_node_out,
 	ClusterGcsBlockDirectState *direct_state_out, bool *direct_target_prepared_out);
 extern bool cluster_gcs_block_test_release_r4_requester_slot(void);
+extern bool cluster_gcs_block_test_copy_r4_projection(char page[BLCKSZ],
+													  ClusterR4ProjectionScratch *projection);
 extern bool cluster_gcs_block_test_r4_fetch_and_wait(BufferTag tag, SCN read_scn,
 													 int32 real_master_node,
 													 char dst_page[GCS_BLOCK_DATA_SIZE]);

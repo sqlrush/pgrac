@@ -818,6 +818,10 @@ typedef struct CrR4OperationContext {
 	ClusterTxResolution top;
 	ClusterSavepointReaderRecord operation;
 	ClusterR4OperationContextWire peer_request;
+	ClusterR4PeerOperationWire current_projection_proof;
+	ClusterR4ProjectionEntry receipts[CLUSTER_R4_PROJECTION_CAPACITY];
+	unsigned receipt_count;
+	bool receipt_overflow;
 	CrR4OperationTop *tops;
 	CrR4KeptTuple *kept_tuples;
 	uint32 top_count;
@@ -1260,6 +1264,59 @@ cr_r4_operation_project_covered(const CrR4OperationContext *operation,
 /* Walk every qualified record, but keep visible LIVE effects in the result.
  * A newer full modification may cover an older mutation of the same root.
  * The result's newest kept ITL is independent of the older walk cursor. */
+/* Save only a role addressed by this qualified record. Reverse traversal
+ * keeps the newest retained writer; a later creator may fill its other role.
+ * Full-page CRCs are taken only after the whole projection is complete. */
+static unsigned
+cr_r4_operation_stage_receipts(const CrR4OperationContext *operation,
+							   const UndoRecordHeader *record, const BufferTag *tag,
+							   ClusterR4ProjectionEntry staged[2])
+{
+	ClusterR4PeerOperationProof proof;
+	OffsetNumber creation = cr_r4_operation_creation_offset(record, tag);
+	unsigned count = 0;
+	if (!ClusterR4PeerOperationDecode(&operation->current_projection_proof, &proof))
+		return 0;
+	for (uint8 role = CLUSTER_R4_PROJECTION_XMIN; role <= CLUSTER_R4_PROJECTION_XMAX; role++) {
+		OffsetNumber off = role == CLUSTER_R4_PROJECTION_XMIN ? creation : record->target_offset;
+		Page page = (Page)operation->result_page;
+		ItemId item;
+		HeapTupleHeader tuple;
+		bool present = false;
+		if (role == CLUSTER_R4_PROJECTION_XMAX
+			&& (record->target_block != tag->blockNum
+				|| (record->record_type != UNDO_RECORD_UPDATE
+					&& record->record_type != UNDO_RECORD_DELETE)))
+			continue;
+		if (off < FirstOffsetNumber || off > PageGetMaxOffsetNumber(page))
+			continue;
+		item = PageGetItemId(page, off);
+		if (!ItemIdIsNormal(item))
+			continue;
+		tuple = (HeapTupleHeader)PageGetItem(page, item);
+		if ((role == CLUSTER_R4_PROJECTION_XMIN ? HeapTupleHeaderGetRawXmin(tuple)
+												: HeapTupleHeaderGetRawXmax(tuple))
+				!= record->xid
+			|| (role == CLUSTER_R4_PROJECTION_XMAX
+				&& ((tuple->t_infomask & (HEAP_XMAX_INVALID | HEAP_XMAX_IS_MULTI)) != 0
+					|| HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask))))
+			continue;
+		for (unsigned i = 0; i < operation->receipt_count; i++)
+			present |= operation->receipts[i].offset == off && operation->receipts[i].role == role;
+		if (present)
+			continue;
+		staged[count++]
+			= (ClusterR4ProjectionEntry){ .operation = proof,
+										  .offset = off,
+										  .length = ItemIdGetLength(item),
+										  .record_type = record->record_type,
+										  .role = role,
+										  .itl_index = operation->locator.itl_slot_index,
+										  .raw_xid = record->xid };
+	}
+	return count;
+}
+
 static bool
 cr_r4_operation_project(CrR4OperationContext *operation, ClusterR4CrSlotExtension *extension,
 						const ClusterTxLocator *locator, const UndoRecordHeader *record,
@@ -1273,6 +1330,8 @@ cr_r4_operation_project(CrR4OperationContext *operation, ClusterR4CrSlotExtensio
 	ClusterItlSlotData after;
 	PGAlignedBlock candidate;
 	CrR4KeptTuple staged[2];
+	ClusterR4ProjectionEntry receipts[2];
+	unsigned receipt_count = 0;
 
 	count = cr_r4_operation_offsets(record, tag, body, offsets);
 	if (count == 0
@@ -1284,6 +1343,8 @@ cr_r4_operation_project(CrR4OperationContext *operation, ClusterR4CrSlotExtensio
 									   operation->walk != NULL ? operation->walk->data : page,
 									   record, tag, offsets, count, staged))
 		return false;
+	if (keep)
+		receipt_count = cr_r4_operation_stage_receipts(operation, record, tag, receipts);
 	if (operation->walk == NULL && !keep)
 		return cluster_cr_history_inverse_operation_identity(page, tag, locator, locator->uba,
 															 record, body, record->payload_length,
@@ -1303,6 +1364,12 @@ cr_r4_operation_project(CrR4OperationContext *operation, ClusterR4CrSlotExtensio
 		if (!cluster_semantic_activation_recheck(&operation->admission))
 			return false;
 		cr_r4_operation_publish_kept(operation, staged, count);
+		for (unsigned i = 0; i < receipt_count; i++) {
+			if (operation->receipt_count == CLUSTER_R4_PROJECTION_CAPACITY)
+				operation->receipt_overflow = true;
+			else
+				operation->receipts[operation->receipt_count++] = receipts[i];
+		}
 		if ((operation->kept_slots & (1U << locator->itl_slot_index)) == 0)
 			ClusterPageGetItlSlots((Page)operation->result_page)[locator->itl_slot_index] = after;
 		operation->kept_slots |= 1U << locator->itl_slot_index;
@@ -1409,6 +1476,26 @@ cr_r4_operation_apply(CrR4OperationContext *operation, ClusterR4CrBuildContext *
 												   &operation->top.locator_echo, record_bytes,
 												   record_bytes, &length, &operation->operation))
 		return false;
+	memset(&operation->current_projection_proof, 0, sizeof(operation->current_projection_proof));
+	/* The operation tail is not an independent original top FullXid source.
+	 * Until TT40 is integrated, a local build may not export such a receipt. */
+	if (FullTransactionIdIsNormal(operation->top.local_original_full_xid)
+		&& FullTransactionIdEquals(operation->top.local_original_full_xid,
+								   operation->identity.top_fxid)) {
+		ClusterR4PeerOperationProof proof
+			= { .identity = operation->identity,
+				.flags = CLUSTER_R4_OPERATION_ORDERED,
+				.record_format = operation->identity.operation_sequence != 0 ? 2 : 1,
+				.outcome = operation->top.outcome,
+				.proof_kind = operation->top.proof_kind,
+				.commit_scn = operation->top.commit_scn,
+				.admission_generation = operation->admission.record_generation,
+				.uba = operation->top.locator_echo.uba };
+		proof.flags
+			|= proof.record_format == 2 ? CLUSTER_R4_OPERATION_CHILD : CLUSTER_R4_OPERATION_V1;
+		proof.effect = proof.record_format == 2 ? operation->operation.operation.effect_state : 0;
+		(void)ClusterR4PeerOperationEncode(&operation->current_projection_proof, &proof);
+	}
 	return cr_r4_operation_apply_proved(operation, context, locator, extension, page, record_bytes,
 										&operation->top.locator_echo, operation->top.outcome,
 										operation->top.commit_scn);
@@ -1915,6 +2002,7 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation, bool 
 							&canonical_locator))
 						return CLUSTER_R4_CR_STEP_FAIL;
 					operation->identity = peer.identity;
+					operation->current_projection_proof = extension->peer_operation;
 					operation->locator = canonical_locator;
 					memcpy(operation->source.data, operation->result_page, BLCKSZ);
 					if (!cluster_savepoint_reader_decode_identity(
@@ -2236,6 +2324,62 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation, bool 
 	cr_r4_undo_trace(trace, "build.full", "ORIGINAL_WALK_COMPLETED", 1);
 	*reason_out = CLUSTER_CR_BUILD_NONE;
 	return CLUSTER_R4_CR_STEP_FULL;
+}
+
+/* Export before exact forget, from this same admitted construction only.
+ * This does no origin I/O and never manufactures a FullXid from a raw xid. */
+bool
+cluster_cr_build_on_holder_projection(uint32 index, uint64 generation, int32 requester,
+									  const ClusterR4CrSlotExtension *extension,
+									  const char page[BLCKSZ], ClusterR4ProjectionWire *projection,
+									  unsigned *count)
+{
+	CrR4OperationContext *operation;
+	ClusterR4CrOwnerWire owner;
+	if (projection != NULL)
+		memset(projection, 0, sizeof(*projection));
+	if (count != NULL)
+		*count = 0;
+	if (index >= CLUSTER_LMS_CR_SLOTS || extension == NULL || page == NULL || projection == NULL
+		|| count == NULL)
+		return false;
+	operation = &CrR4OperationContexts[index];
+	if (!operation->enabled || operation->slot_generation != generation || generation == 0
+		|| operation->builder_incarnation != extension->owner.builder_incarnation
+		|| memcmp(&operation->route, &extension->route_proof, sizeof(operation->route)) != 0
+		|| !operation->admission.entered || operation->receipt_overflow
+		|| !cluster_semantic_activation_recheck(&operation->admission))
+		return false;
+	for (unsigned i = 0; i < operation->receipt_count; i++) {
+		ClusterR4ProjectionEntry entry = operation->receipts[i];
+		Page result = (Page)page;
+		ItemId item;
+		HeapTupleHeader tuple;
+		uint32 origin
+			= (entry.operation.identity.canonical.segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE;
+		if ((int32)origin == requester)
+			continue;
+		if (entry.offset > PageGetMaxOffsetNumber(result))
+			continue;
+		item = PageGetItemId(result, entry.offset);
+		if (!ItemIdIsNormal(item) || ItemIdGetLength(item) != entry.length)
+			continue;
+		tuple = (HeapTupleHeader)PageGetItem(result, item);
+		if ((entry.role == CLUSTER_R4_PROJECTION_XMIN ? HeapTupleHeaderGetRawXmin(tuple)
+													  : HeapTupleHeaderGetRawXmax(tuple))
+			!= entry.raw_xid)
+			continue;
+		entry.tuple_crc = ClusterR4ProjectionCrc(tuple, entry.length);
+		if (!ClusterR4ProjectionEntryPut(projection, *count, &entry))
+			return false;
+		(*count)++;
+	}
+	if (!ClusterR4CrOwnerWireSet(&owner, &extension->route_proof.requester_owner))
+		return false;
+	memcpy(projection->bytes + 140, &owner, sizeof(owner));
+	ClusterR4OperationWrite(projection->bytes + 8, 2, *count);
+	return ClusterR4ProjectionPageComplete(projection, (Page)page, extension->route_proof.read_scn,
+										   requester);
 }
 
 bool

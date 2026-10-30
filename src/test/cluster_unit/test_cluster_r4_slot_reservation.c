@@ -32,6 +32,7 @@
 #undef snprintf
 
 #include "unit_test.h"
+#include "test_cluster_owner_full_fixture.h"
 
 #ifndef CR_SERVER_SOURCE_PATH
 #error "CR_SERVER_SOURCE_PATH must identify cluster_cr_server.c"
@@ -278,7 +279,7 @@ static uint8 ut_send_msg_type;
 static int32 ut_send_dest;
 static uint32 ut_send_length;
 static uint32 ut_state_at_send;
-static char ut_send_payload[CLUSTER_R4_CR_REPLY_PAYLOAD_SIZE];
+static char ut_send_payload[CLUSTER_R4_CR_FULL_PAYLOAD_SIZE];
 static int ut_note_send_calls;
 static GcsBlockSendFamily ut_note_send_family;
 static ClusterICSendResult ut_note_send_result;
@@ -294,7 +295,7 @@ static int ut_local_dispatch_calls;
 static int ut_local_dispatch_sequence;
 static int32 ut_local_dispatch_peer;
 static uint32 ut_state_at_local_dispatch;
-static char ut_local_dispatch_payload[CLUSTER_R4_CR_REPLY_PAYLOAD_SIZE];
+static char ut_local_dispatch_payload[CLUSTER_R4_CR_FULL_PAYLOAD_SIZE];
 static bool ut_write_fence_enforcing;
 static bool ut_write_fence_allowed;
 static int ut_checksum_calls;
@@ -317,6 +318,33 @@ static ClusterTxLocator ut_extract_locator;
 static bool ut_reclaim_race_on_proof;
 static bool ut_reclaim_race_injected;
 static bool ut_real_builder;
+static bool ut_projection_pipeline;
+static TestOwnerFullFixture ut_projection_fixture;
+extern bool continuation_real_projection(uint32, uint64, int32, const ClusterR4CrSlotExtension *,
+										 const char *, ClusterR4ProjectionWire *, unsigned *);
+
+bool
+cluster_cr_build_on_holder_projection(uint32 index, uint64 generation, int32 requester,
+									  const ClusterR4CrSlotExtension *extension,
+									  const char page[BLCKSZ], ClusterR4ProjectionWire *wire,
+									  unsigned *count)
+{
+	if (ut_real_builder)
+		return continuation_real_projection(index, generation, requester, extension, page, wire,
+											count);
+	memset(wire, 0, sizeof(*wire));
+	*count = 0;
+	if (ut_projection_pipeline) {
+		UT_ASSERT_EQ(memcmp(page, ut_projection_fixture.full.data, BLCKSZ), 0);
+		UT_ASSERT_EQ(generation, 1000);
+		UT_ASSERT_EQ(extension->owner.builder_incarnation, 9000);
+		*wire = ut_projection_fixture.projection.wire;
+		*count = ClusterR4OperationRead(wire->bytes + 8, 2);
+	}
+	/* Existing server controls double the builder boundary only. */
+	return true;
+}
+
 int cluster_cr_chain_walk_max_steps = 4096;
 MemoryContext TopMemoryContext = (MemoryContext)0x1;
 extern ClusterR4CrBuildStepResult
@@ -658,7 +686,7 @@ cluster_gcs_block_compute_checksum(const char *block_data)
 {
 	ut_checksum_calls++;
 	UT_ASSERT_NOT_NULL(block_data);
-	return ut_checksum_value;
+	return ut_projection_pipeline ? ClusterR4ProjectionCrc(block_data, BLCKSZ) : ut_checksum_value;
 }
 
 ClusterICSendResult
@@ -943,7 +971,7 @@ static ClusterR4CrForwardPayload
 submit_test_forward96(void)
 {
 	static const uint8 extension_bytes[32]
-		= { 0x03, 0x01, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00,
+		= { 0x04, 0x01, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00,
 			0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x22, 0x22,
 			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
 	ClusterR4CrForwardPayload forward;
@@ -1141,6 +1169,7 @@ reset_submit_fixture(ClusterLmsSharedState *state)
 	ut_reclaim_race_on_proof = false;
 	ut_reclaim_race_injected = false;
 	ut_real_builder = false;
+	ut_projection_pipeline = false;
 	cluster_cr_server_test_r4_reset_contexts();
 
 	cluster_cr_server_shmem_register();
@@ -1359,7 +1388,7 @@ static void
 assert_exact_foreign_undo_forward96(void)
 {
 	static const uint8 extension_bytes[32]
-		= { 0x03, 0x04, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x09, 0x00, 0x00,
+		= { 0x04, 0x04, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x09, 0x00, 0x00,
 			0x00, 0x03, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1d, 0x03,
 			0x00, 0x00, 0x07, 0x00, 0x01, 0x00, 0x04, 0x03, 0x02, 0x01 };
 	const ClusterR4InternalForwardPayload *forward
@@ -2574,7 +2603,7 @@ UT_TEST(test_r4_worker0_remote_full_ship_transfers_frame_and_cleans_context)
 		UT_ASSERT_EQ(ut_send_calls, 1);
 		UT_ASSERT_EQ(ut_send_msg_type, PGRAC_IC_MSG_GCS_BLOCK_REPLY);
 		UT_ASSERT_EQ(ut_send_dest, UT_REQUESTER_NODE);
-		UT_ASSERT_EQ(ut_send_length, CLUSTER_R4_CR_REPLY_PAYLOAD_SIZE);
+		UT_ASSERT_EQ(ut_send_length, CLUSTER_R4_CR_FULL_PAYLOAD_SIZE);
 		header = (GcsBlockReplyHeader *)ut_send_payload;
 		UT_ASSERT_EQ(header->request_id, UT_REQUEST_ID);
 		UT_ASSERT_EQ(header->page_lsn, UT_COPIED_PAGE_LSN);
@@ -2627,7 +2656,7 @@ UT_TEST(test_r4_worker0_local_full_uses_registered_dispatch_and_cleans_context)
 	UT_ASSERT_EQ(ut_envelope_msg_type, PGRAC_IC_MSG_GCS_BLOCK_REPLY);
 	UT_ASSERT_EQ(ut_envelope_source, UT_HOLDER_NODE);
 	UT_ASSERT_EQ(ut_envelope_dest, UT_HOLDER_NODE);
-	UT_ASSERT_EQ(ut_envelope_payload_length, CLUSTER_R4_CR_REPLY_PAYLOAD_SIZE);
+	UT_ASSERT_EQ(ut_envelope_payload_length, CLUSTER_R4_CR_FULL_PAYLOAD_SIZE);
 	UT_ASSERT_EQ(ut_local_dispatch_calls, 1);
 	UT_ASSERT_EQ(ut_local_dispatch_peer, UT_HOLDER_NODE);
 	UT_ASSERT_EQ(ut_state_at_local_dispatch, CLUSTER_LMS_CR_R4_SHIPPING);
@@ -3229,6 +3258,7 @@ UT_TEST(test_r4_worker0_foreign_dependency_preserves_current_zero_epoch_open)
 	 * formation; changing the token after claim would be a stale test. */
 	ut_expected_admission.formation_epoch = 0;
 	slot->epoch = slot->r4.route_proof.formation_epoch = 0;
+	slot->r4.route_proof.master_authority_generation = 4;
 	UT_ASSERT(cluster_cr_server_test_r4_claim_queued(0));
 	ut_builder_step_result = CLUSTER_R4_CR_STEP_NEED_UNDO;
 	ut_builder_step_reason = CLUSTER_CR_BUILD_NONE;
@@ -3652,7 +3682,8 @@ UT_TEST(test_owner_challenge_survives_holder_full_and_cancel_terminal_cleanup)
 		UT_ASSERT(cluster_cr_server_test_r4_ship_terminal(0));
 		UT_ASSERT_EQ(ut_send_calls, 1);
 		UT_ASSERT_EQ(ut_send_dest, UT_REQUESTER_NODE);
-		UT_ASSERT_EQ(ut_send_length, CLUSTER_R4_CR_REPLY_PAYLOAD_SIZE);
+		UT_ASSERT_EQ(ut_send_length,
+					 cancel ? CLUSTER_R4_CR_REPLY_PAYLOAD_SIZE : CLUSTER_R4_CR_FULL_PAYLOAD_SIZE);
 		header = (GcsBlockReplyHeader *)ut_send_payload;
 		UT_ASSERT_EQ(header->status,
 					 cancel ? GCS_BLOCK_REPLY_R4_DENIED : GCS_BLOCK_REPLY_R4_CR_FULL);
@@ -3668,9 +3699,49 @@ UT_TEST(test_owner_challenge_survives_holder_full_and_cancel_terminal_cleanup)
 	}
 }
 
-int
-main(void)
+/* The page and typed receipts are produced by the real holder in another
+ * host process. Only that builder boundary is supplied here; the original
+ * server claim, shipment, route binding and cleanup execute unchanged. */
+static int
+peer_projection_ship(FILE *input, FILE *output)
 {
+	TestOwnerFullFixture fixture;
+	TestPeerFullFrame frame = { 0 };
+	ClusterLmsSharedState state;
+	ClusterLmsCrSlot *slot;
+	if (fread(&fixture, sizeof(fixture), 1, input) != 1 || !fixture.projection.valid)
+		return 1;
+	slot = prepare_worker0_claim(&state);
+	ut_projection_fixture = fixture;
+	ut_projection_pipeline = true;
+	slot->tag = fixture.tag;
+	slot->read_scn = fixture.read_scn;
+	slot->requester_backend = 1;
+	slot->r4.route_proof.tag = fixture.tag;
+	slot->r4.route_proof.read_scn = fixture.read_scn;
+	slot->r4.route_proof.expected_page_scn = 70;
+	slot->r4.slot_generation = 1000;
+	state.r4_controls.data_worker_incarnation[0] = 9000;
+	memcpy(slot->result_page, fixture.full.data, BLCKSZ);
+	slot->r4.copied_page_lsn = 0;
+	if (!cluster_cr_server_test_r4_claim_queued(0) || !cluster_cr_server_test_r4_build_step(0)
+		|| !cluster_cr_server_test_r4_ship_terminal(0))
+		return 1;
+	if (ut_send_length != CLUSTER_R4_CR_FULL_PAYLOAD_SIZE
+		|| ((GcsBlockReplyHeader *)ut_send_payload)->status != GCS_BLOCK_REPLY_R4_CR_FULL
+		|| !slot_is_canonical_free_with_generation(slot, 1000) || ut_failed_count != 0)
+		return 1;
+	frame.fixture = fixture;
+	frame.length = ut_send_length;
+	memcpy(frame.bytes, ut_send_payload, frame.length);
+	return fwrite(&frame, sizeof(frame), 1, output) == 1 ? 0 : 1;
+}
+
+int
+main(int argc, char **argv)
+{
+	if (argc == 2 && strcmp(argv[1], "--peer-full-frame-fixture") == 0)
+		return peer_projection_ship(stdin, stdout);
 	UT_PLAN(58);
 	UT_RUN(test_normal_stop_cr_requires_initialized_actual_owner);
 	UT_RUN(test_normal_stop_cr_all_owned_states_not_recovery_drain);

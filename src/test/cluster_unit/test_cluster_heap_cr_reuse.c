@@ -880,6 +880,27 @@ UT_TEST(full_with_unsupported_other_tuple_is_not_published)
 	UT_ASSERT(!stored);
 }
 
+UT_TEST(private_projection_page_stays_uncacheable_after_forget)
+{
+	for (unsigned forgotten = 0; forgotten < 2; forgotten++) {
+		setup();
+		seed_cached_page();
+		stored = false;
+		build_page(result.scratch_page);
+		result.kind = HEAP_HOT_SEARCH_NOT_FOUND;
+		result.cr_full_page = true;
+		result.cr_private_projection = true;
+		result.projection.valid = true;
+		ClusterR4OperationWrite(result.projection.wire.bytes + 8, 2, 1);
+		if (forgotten)
+			ClusterR4ProjectionForget(&result.projection);
+		heap_index_publish_cr_result(&scan, 7, &snapshot, &result);
+		UT_ASSERT_EQ(publishes + reserves, 0);
+		UT_ASSERT(!stored);
+		UT_ASSERT_EQ(admission_depth + snapshot_depth + pins, 0);
+	}
+}
+
 int
 main(void)
 {
@@ -905,7 +926,8 @@ main(void)
 	UT_RUN(live_point_fetch_and_rescan_add_no_full_or_publication);
 	UT_RUN(lock_only_multixact_cache_remains_eligible);
 	UT_RUN(full_with_unsupported_other_tuple_is_not_published);
-	printf("1..22\n");
+	UT_RUN(private_projection_page_stays_uncacheable_after_forget);
+	printf("1..23\n");
 	UT_DONE();
 	return ut_failed_count != 0;
 }

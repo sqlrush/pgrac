@@ -1160,9 +1160,12 @@ BufferGetTag(Buffer buffer pg_attribute_unused(), RelFileLocator *rlocator, Fork
 void
 cluster_catalog_stats_vis_resolve_inc(void)
 {}
+static unsigned ut_vis_unknown_count;
 void
 cluster_catalog_stats_vis_unknown_inc(void)
-{}
+{
+	ut_vis_unknown_count++;
+}
 
 /* Native transaction and page-mutation boundaries are traps in these legs.
  * The real resolver above supplies the status; these never manufacture it. */

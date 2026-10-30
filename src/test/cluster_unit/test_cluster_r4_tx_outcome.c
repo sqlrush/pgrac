@@ -7657,6 +7657,10 @@ main(int argc, char **argv)
 {
 	if (argc == 2 && strcmp(argv[1], "--owner-full-fixture") == 0)
 		return owner_worker_export_full(stdout);
+	if ((argc == 2 || argc == 3) && strcmp(argv[1], "--peer-full-proof-fixture") == 0) {
+		peer_projection_kind = argc == 3 ? (unsigned)atoi(argv[2]) : 0;
+		return peer_worker_export_full_mode(stdout, true);
+	}
 	if (argc == 2 && strcmp(argv[1], "--peer-full-fixture") == 0)
 		return peer_worker_export_full(stdout);
 	UT_PLAN(396);

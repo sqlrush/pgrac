@@ -28,6 +28,7 @@
 #include "cluster/cluster_scn.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_mode.h"
+#include "cluster/cluster_r4_projection.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_tx_resolve.h"
 #include "cluster/cluster_tx_enqueue.h"
@@ -173,9 +174,11 @@ typedef struct HeapHotSearchResult
 #ifdef USE_PGRAC_CLUSTER
 	bool		remote_xmax_wait;
 	bool		cr_full_page; /* Original FULL, after live-input revalidation. */
+	bool cr_private_projection; /* Page cannot outlive its private proof. */
 	bool		cr_unsupported; /* Optional cache cannot evaluate this shape. */
 	ClusterTxLocator remote_wait_locator;
 	ClusterR4ScratchTrace visibility_trace;
+	ClusterR4ProjectionScratch projection;
 #endif
 	char scratch_page[BLCKSZ] pg_attribute_aligned(MAXIMUM_ALIGNOF);
 } HeapHotSearchResult;
@@ -198,6 +201,7 @@ typedef struct ClusterR4HotScratchTestContext
 	bool allow_cleanout;
 #ifdef USE_PGRAC_CLUSTER
 	ClusterR4ScratchTrace *visibility_trace;
+	const ClusterR4ProjectionScratch *projection;
 #endif
 } ClusterR4HotScratchTestContext;
 

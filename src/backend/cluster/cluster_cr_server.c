@@ -1825,7 +1825,11 @@ cr_server_r4_ship_terminal(uint32 slot_index)
 {
 	ClusterLmsCrSlot *slot;
 	ClusterR4CrWorkerContext *context;
-	char frame[CLUSTER_R4_CR_REPLY_PAYLOAD_SIZE];
+	char frame[CLUSTER_R4_CR_FULL_PAYLOAD_SIZE];
+	uint32 frame_size = CLUSTER_R4_CR_REPLY_PAYLOAD_SIZE;
+	ClusterR4ProjectionWire *projection
+		= (ClusterR4ProjectionWire *)(frame + CLUSTER_R4_CR_REPLY_PAYLOAD_SIZE);
+	unsigned projection_count = 0;
 	GcsBlockReplyHeader *header = (GcsBlockReplyHeader *)frame;
 	ClusterICEnvelope envelope;
 	ClusterICSendResult send_result;
@@ -1902,6 +1906,45 @@ cr_server_r4_ship_terminal(uint32 slot_index)
 		memcpy(frame + sizeof(*header), slot->result_page, BLCKSZ);
 	}
 	header->checksum = cluster_gcs_block_compute_checksum(frame + sizeof(*header));
+	if (terminal_state == CLUSTER_LMS_CR_R4_READY_FULL) {
+		ClusterR4ProjectionBinding binding = { 0 };
+		const ClusterR4CrRouteProof *route = &slot->r4.route_proof;
+		binding.tag = route->tag;
+		binding.read_scn = route->read_scn;
+		binding.request_id = slot->request_id;
+		binding.formation_epoch = route->formation_epoch;
+		binding.activation_generation = route->activation_generation;
+		binding.master_generation = route->master_authority_generation;
+		binding.master_transition = route->master_resource_transition_count;
+		binding.expected_page_scn = route->expected_page_scn;
+		binding.master = route->real_master_node;
+		binding.holder = route->selected_holder_node;
+		binding.requester = slot->requester_node;
+		binding.backend = slot->requester_backend;
+		binding.slot_generation = slot_generation;
+		binding.builder_incarnation = context->builder_incarnation;
+		binding.admission_generation = context->admission.record_generation;
+		binding.capability_generation = slot->r4.requester_capability_generation;
+		binding.page_lsn = header->page_lsn;
+		memcpy(binding.owner, frame + GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE, 40);
+		if (context->builder_forgotten
+			|| !cluster_cr_build_on_holder_projection(
+				slot_index, slot_generation, slot->requester_node, &slot->r4, slot->result_page,
+				projection, &projection_count)
+			|| !ClusterR4ProjectionSeal(projection, projection_count, &binding, header,
+										frame + sizeof(*header))) {
+			terminal_state = CLUSTER_LMS_CR_R4_READY_FAIL;
+			terminal_reason = CLUSTER_CR_BUILD_BAD_UNDO;
+			slot->r4.terminal_reason = terminal_reason;
+			header->status = GCS_BLOCK_REPLY_R4_DENIED;
+			header->page_lsn = 0;
+			memset(frame + sizeof(*header), 0, BLCKSZ);
+			memset(projection, 0, sizeof(*projection));
+			header->checksum = cluster_gcs_block_compute_checksum(frame + sizeof(*header));
+		} else
+			frame_size = CLUSTER_R4_CR_FULL_PAYLOAD_SIZE;
+	}
+
 	if (!cr_server_r4_identity_open_matches(&context->admission, slot->requester_node,
 											slot->r4.requester_capability_generation)
 		|| !cluster_semantic_activation_recheck(&context->admission))
@@ -1914,6 +1957,8 @@ cr_server_r4_ship_terminal(uint32 slot_index)
 		terminal_state = CLUSTER_LMS_CR_R4_READY_RETRY;
 		terminal_reason = CLUSTER_CR_BUILD_HOLDER_MOVED;
 		slot->r4.terminal_reason = (uint8)terminal_reason;
+		frame_size = CLUSTER_R4_CR_REPLY_PAYLOAD_SIZE;
+		memset(projection, 0, sizeof(*projection));
 		header->status = (uint8)GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED;
 		header->page_lsn = 0;
 		memset(frame + sizeof(*header), 0, BLCKSZ);
@@ -1928,14 +1973,14 @@ cr_server_r4_ship_terminal(uint32 slot_index)
 	if (slot->requester_node == cluster_node_id) {
 		if (!cluster_ic_envelope_build(&envelope, PGRAC_IC_MSG_GCS_BLOCK_REPLY,
 									   (uint32)cluster_node_id, (uint32)cluster_node_id, frame,
-									   sizeof(frame)))
+									   frame_size))
 			send_result = CLUSTER_IC_SEND_HARD_ERROR;
 		else
 			send_result = cluster_ic_dispatch_send_result(
 				cluster_ic_dispatch_envelope(&envelope, frame, cluster_node_id));
 	} else
 		send_result = cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, slot->requester_node,
-											   frame, sizeof(frame));
+											   frame, frame_size);
 	cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_REPLY, send_result);
 	switch (send_result) {
 	case CLUSTER_IC_SEND_DONE:

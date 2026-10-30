@@ -1310,11 +1310,12 @@ UT_TEST(test_real_owner_full_producer_reaches_native_self_cid_consumer)
 }
 
 #include "test_cluster_scratch_peer.inc"
+#include "test_cluster_scratch_projection.inc"
 
 int
 main(void)
 {
-	UT_PLAN(36);
+	UT_PLAN(39);
 	UT_RUN(test_existing_delete_current_command);
 	UT_RUN(test_existing_delete_next_command);
 	UT_RUN(test_update_old_version_next_command);
@@ -1352,6 +1353,9 @@ main(void)
 	UT_RUN(test_real_owner_full_producer_reaches_native_self_cid_consumer);
 	UT_RUN(test_peer_full_raw_child_verdict_never_authorizes_operation);
 	UT_RUN(test_peer_full_possible_child_refusals_cover_both_tuple_roles);
+	UT_RUN(test_peer_projection_full_reaches_real_tuple_consumer);
+	UT_RUN(test_peer_projection_whole_page_rejects_incomplete_or_changed_receipts);
+	UT_RUN(test_peer_projection_modifier_roles_reach_real_consumer);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

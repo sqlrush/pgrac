@@ -145,6 +145,12 @@ extern bool cluster_cr_r4_extract_resident_record(const char resident_undo_page[
 												  char record_out[BLCKSZ],
 												  size_t *record_length_out,
 												  ClusterTxLocator *canonical_locator_out);
+extern bool cluster_cr_build_on_holder_projection(uint32 index, uint64 generation, int32 requester,
+												  const ClusterR4CrSlotExtension *extension,
+												  const char page[BLCKSZ],
+												  ClusterR4ProjectionWire *projection,
+												  unsigned *count);
+
 extern bool cluster_cr_build_on_holder_pending_locator(uint32 slot_index, uint64 slot_generation,
 													   ClusterTxLocator *locator_out);
 extern void cluster_cr_build_on_holder_forget(uint32 slot_index, uint64 slot_generation);

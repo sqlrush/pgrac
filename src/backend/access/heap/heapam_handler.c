@@ -89,9 +89,8 @@ static TableIndexFetchTupleResult heapam_index_fetch_cluster_hot(
  * buffer slot; OWNED_SCRATCH is copied while the scratch page is alive.
  */
 static TableIndexFetchTupleResult
-heapam_store_hot_search_result(HeapHotSearchResult *result,
-							   TupleTableSlot *slot, Buffer buffer,
-							   bool *call_again, bool *all_dead)
+heapam_store_hot_search_result_internal(HeapHotSearchResult *result, TupleTableSlot *slot,
+										Buffer buffer, bool *call_again, bool *all_dead)
 {
 	BufferHeapTupleTableSlot *bslot = (BufferHeapTupleTableSlot *) slot;
 
@@ -130,6 +129,28 @@ heapam_store_hot_search_result(HeapHotSearchResult *result,
 		*all_dead = false;
 
 	return TABLE_INDEX_FETCH_FOUND;
+}
+
+static TableIndexFetchTupleResult
+heapam_store_hot_search_result(HeapHotSearchResult *result, TupleTableSlot *slot, Buffer buffer,
+							   bool *call_again, bool *all_dead)
+{
+	TableIndexFetchTupleResult outcome;
+	PG_TRY();
+	{
+		outcome
+			= heapam_store_hot_search_result_internal(result, slot, buffer, call_again, all_dead);
+	}
+	PG_FINALLY();
+	{
+#ifdef USE_PGRAC_CLUSTER
+		ClusterR4ProjectionForget(&result->projection);
+		if (result->kind == HEAP_HOT_SEARCH_OWNED_SCRATCH)
+			memset(result->scratch_page, 0, sizeof(result->scratch_page));
+#endif
+	}
+	PG_END_TRY();
+	return outcome;
 }
 
 #ifdef USE_PGRAC_CLUSTER

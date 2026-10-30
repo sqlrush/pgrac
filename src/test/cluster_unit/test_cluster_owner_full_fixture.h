@@ -21,6 +21,7 @@
 #ifndef TEST_CLUSTER_OWNER_FULL_FIXTURE_H
 #define TEST_CLUSTER_OWNER_FULL_FIXTURE_H
 #include "cluster/cluster_savepoint.h"
+#include "cluster/cluster_r4_projection.h"
 #include "storage/buf_internals.h"
 #include "storage/bufpage.h"
 typedef struct TestOwnerFullFixture {
@@ -30,7 +31,13 @@ typedef struct TestOwnerFullFixture {
 	SCN read_scn;
 	PGAlignedBlock full;
 	PGAlignedBlock undo;
+	ClusterR4ProjectionScratch projection;
 } TestOwnerFullFixture;
+typedef struct TestPeerFullFrame {
+	TestOwnerFullFixture fixture;
+	uint32 length;
+	char bytes[12056];
+} TestPeerFullFrame;
 #define TEST_PEER_FULL_MAGIC UINT64CONST(0x4a50454546554c4c)
 #define TEST_OWNER_FULL_MAGIC UINT64CONST(0x4a4f574e46554c4c)
 #endif

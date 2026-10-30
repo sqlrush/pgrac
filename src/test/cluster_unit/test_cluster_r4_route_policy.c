@@ -63,6 +63,9 @@
 #undef printf
 
 #include "unit_test.h"
+#include "test_cluster_owner_full_fixture.h"
+extern bool cluster_gcs_block_test_copy_r4_projection(char[BLCKSZ], ClusterR4ProjectionScratch *);
+extern bool cluster_gcs_block_test_bind_r4_projection_request(const BufferTag *, SCN, uint64);
 
 UT_DEFINE_GLOBALS();
 
@@ -1451,6 +1454,41 @@ route_test_envelope(uint8 msg_type, uint32 source, uint32 dest, uint32 payload_l
 	return env;
 }
 
+/* Existing route controls double the holder boundary. The independent
+ * pipeline below supplies actual nonempty holder projection receipts. */
+static void
+route_seal_full(void *payload, const BufferTag *tag, SCN read_scn)
+{
+	GcsBlockReplyHeader *header = payload;
+	char *page = (char *)payload + sizeof(*header);
+	ClusterR4ProjectionWire *wire
+		= (ClusterR4ProjectionWire *)((char *)payload + CLUSTER_R4_CR_REPLY_PAYLOAD_SIZE);
+	ClusterR4ProjectionBinding binding = { 0 };
+	if (header->status != GCS_BLOCK_REPLY_R4_CR_FULL)
+		return;
+	binding.tag = tag != NULL ? *tag : route_test_tag();
+	binding.read_scn = read_scn;
+	binding.request_id = header->request_id;
+	binding.formation_epoch = header->epoch;
+	binding.activation_generation = route_seam.activation_generation != 0
+										? route_seam.activation_generation
+										: UT_ACTIVATION_GENERATION;
+	binding.admission_generation = binding.activation_generation;
+	binding.master_generation = (header->epoch << 32) | 4;
+	binding.master_transition = 7;
+	binding.expected_page_scn = 70;
+	binding.master = GcsBlockReplyHeaderGetForwardingMasterNode(header);
+	binding.holder = header->sender_node;
+	binding.requester = cluster_node_id;
+	binding.backend = header->requester_backend_id;
+	binding.slot_generation = 1000;
+	binding.builder_incarnation = 9000;
+	binding.capability_generation = 42;
+	binding.page_lsn = header->page_lsn;
+	memcpy(binding.owner, page + BLCKSZ, 40);
+	UT_ASSERT(ClusterR4ProjectionSeal(wire, 0, &binding, header, page));
+}
+
 bool
 cluster_ic_envelope_build(ClusterICEnvelope *out_env, uint8 msg_type, uint32 source_node_id,
 						  uint32 dest_node_id, const void *payload, uint32 payload_length)
@@ -1470,6 +1508,7 @@ cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload, 
 		GcsBlockReplyHeader header;
 		char block_data[GCS_BLOCK_DATA_SIZE];
 		ClusterR4CrOwnerWire requester_owner;
+		ClusterR4ProjectionWire projection;
 	} TestR4Reply8240;
 	const ClusterR4CrRequestPayload *request;
 	TestR4Reply8240 reply;
@@ -1521,6 +1560,8 @@ cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload, 
 		reply.requester_owner = request->requester_owner;
 		memset(reply.block_data, 0x6d, sizeof(reply.block_data));
 		reply.header.checksum = cluster_gcs_block_compute_checksum(reply.block_data);
+		route_seal_full(&reply, &request->base.tag,
+						ClusterR4OperationRead(request->extension.read_scn_le, 8));
 		reply_env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, UT_HOLDER_NODE,
 										(uint32)cluster_node_id, sizeof(reply));
 		cluster_gcs_handle_block_reply_envelope(&reply_env, &reply);
@@ -1586,6 +1627,7 @@ cluster_grd_outbound_enqueue_backend_msg(uint8 msg_type, uint32 dest_node_id, co
 		GcsBlockReplyHeader header;
 		char block_data[GCS_BLOCK_DATA_SIZE];
 		ClusterR4CrOwnerWire requester_owner;
+		ClusterR4ProjectionWire projection;
 	} TestR4Reply8240;
 	TestR4Reply8240 reply;
 	ClusterICEnvelope env;
@@ -1811,13 +1853,18 @@ cluster_grd_outbound_enqueue_backend_msg(uint8 msg_type, uint32 dest_node_id, co
 	memset(reply.block_data, reply_step.block_fill, sizeof(reply.block_data));
 	memcpy(requester_send.reply_page, reply.block_data, sizeof(reply.block_data));
 	reply.header.checksum = cluster_gcs_block_compute_checksum(reply.block_data);
+	route_seal_full(&reply, &requester_send.request.base.tag,
+					ClusterR4OperationRead(requester_send.request.extension.read_scn_le, 8));
 	if (requester_send.corrupt_reply_checksum)
 		reply.header.checksum ^= UINT32_C(1);
 	if (requester_send.corrupt_reply_identity)
 		reply.header.request_id++;
 	env = route_test_envelope(
 		PGRAC_IC_MSG_GCS_BLOCK_REPLY, reply_step.envelope_source_node, (uint32)cluster_node_id,
-		requester_send.legacy_read ? GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE : sizeof(reply));
+		requester_send.legacy_read ? GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE
+								   : (reply.header.status == GCS_BLOCK_REPLY_R4_CR_FULL
+										  ? sizeof(reply)
+										  : CLUSTER_R4_CR_REPLY_PAYLOAD_SIZE));
 	cluster_gcs_handle_block_reply_envelope(&env, &reply);
 	if (requester_owner_drift == 1)
 		requester_top_fxid = FullTransactionIdFromEpochAndXid(10, requester_binding.xid);
@@ -1847,7 +1894,7 @@ route_test_request80(void)
 	request.base.reserved_0[2] = 0xe8;
 	request.base.reserved_0[3] = 0x03;
 	extension = (uint8 *)&request.extension;
-	extension[0] = 3;
+	extension[0] = 4;
 	extension[1] = 1;
 	extension[4] = 0x34;
 	extension[5] = 0x12;
@@ -1859,7 +1906,7 @@ static ClusterR4CrForwardPayload
 route_test_forward96(void)
 {
 	static const uint8 extension_bytes[32]
-		= { 0x03, 0x01, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00,
+		= { 0x04, 0x01, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00,
 			0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x22, 0x22,
 			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
 	ClusterR4CrForwardPayload forward;
@@ -3341,6 +3388,7 @@ UT_TEST(test_r4_reply_decoder_binds_domain_status_length_and_undo_authority)
 		GcsBlockReplyHeader header;
 		char block_data[GCS_BLOCK_DATA_SIZE];
 		ClusterR4CrOwnerWire requester_owner;
+		ClusterR4ProjectionWire projection;
 	} TestR4Reply8240;
 	typedef struct TestR4Reply8256 {
 		struct {
@@ -3353,7 +3401,7 @@ UT_TEST(test_r4_reply_decoder_binds_domain_status_length_and_undo_authority)
 	TestR4Reply8256 reply8256;
 	ClusterICEnvelope env;
 
-	UT_ASSERT_EQ(sizeof(reply8240), 8280);
+	UT_ASSERT_EQ(sizeof(reply8240), CLUSTER_R4_CR_FULL_PAYLOAD_SIZE);
 	UT_ASSERT_EQ(sizeof(reply8256), 8256);
 
 	/* A holder's finished CR is an exact 8280-byte R4_CR-domain reply. */
@@ -3368,6 +3416,7 @@ UT_TEST(test_r4_reply_decoder_binds_domain_status_length_and_undo_authority)
 	GcsBlockReplyHeaderSetForwardingMasterNode(&reply8240.header, UT_MASTER_NODE);
 	reply8240.block_data[0] = 0x5a;
 	reply8240.header.checksum = cluster_gcs_block_compute_checksum(reply8240.block_data);
+	route_seal_full(&reply8240, NULL, UT_READ_SCN);
 	env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, UT_HOLDER_NODE, cluster_node_id,
 							  sizeof(reply8240));
 	UT_ASSERT(cluster_gcs_block_test_decode_r4_reply(
@@ -3461,7 +3510,7 @@ UT_TEST(test_r4_reply_decoder_binds_domain_status_length_and_undo_authority)
 											   GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
 	reply8240.header.checksum = cluster_gcs_block_compute_checksum(reply8240.block_data);
 	env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, UT_MASTER_NODE, cluster_node_id,
-							  sizeof(reply8240));
+							  CLUSTER_R4_CR_REPLY_PAYLOAD_SIZE);
 	reply8240.header.status = GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED;
 	UT_ASSERT(cluster_gcs_block_test_decode_r4_reply(
 		&env, &reply8240, UT_REQUEST_ID, UT_FORMATION_EPOCH, UT_REQUESTER_BACKEND, PCM_TRANS_N_TO_S,
@@ -3573,15 +3622,15 @@ UT_TEST(test_r4_reply_decoder_checks_minimum_length_before_header_read)
 }
 
 /* The registered reply handler must select the R4 decoder from the armed
- * slot domain before the legacy 8240-byte decoder rejects status 21.  Once
- * landed, an authenticated duplicate is first-reply-wins and cannot tear the
- * page already visible to the waiting backend. */
+ * slot domain before the legacy 8240-byte decoder rejects status 21.  A duplicate while the requester owns the slot invalidates
+ * the projection before private consumption. */
 UT_TEST(test_r4_full_reply_lands_once_in_armed_r4_slot)
 {
 	typedef struct TestR4Reply8240 {
 		GcsBlockReplyHeader header;
 		char block_data[GCS_BLOCK_DATA_SIZE];
 		ClusterR4CrOwnerWire requester_owner;
+		ClusterR4ProjectionWire projection;
 	} TestR4Reply8240;
 	TestR4Reply8240 first;
 	TestR4Reply8240 duplicate;
@@ -3603,6 +3652,7 @@ UT_TEST(test_r4_full_reply_lands_once_in_armed_r4_slot)
 	GcsBlockReplyHeaderSetForwardingMasterNode(&first.header, UT_MASTER_NODE);
 	memset(first.block_data, 0x5a, sizeof(first.block_data));
 	first.header.checksum = cluster_gcs_block_compute_checksum(first.block_data);
+	route_seal_full(&first, NULL, UT_READ_SCN);
 	env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, UT_HOLDER_NODE, cluster_node_id,
 							  sizeof(first));
 
@@ -3630,11 +3680,12 @@ UT_TEST(test_r4_full_reply_lands_once_in_armed_r4_slot)
 	UT_ASSERT(cluster_gcs_block_test_snapshot_r4_reply_slot(&landed_header, landed_block,
 															&reply_received, &stale_drop_count));
 	UT_ASSERT(reply_received);
-	UT_ASSERT_EQ(memcmp(&landed_header, &first.header, sizeof(first.header)), 0);
-	UT_ASSERT_EQ(memcmp(landed_block, first.block_data, sizeof(landed_block)), 0);
+	UT_ASSERT_EQ(landed_header.status, GCS_BLOCK_REPLY_R4_DENIED);
+	UT_ASSERT_EQ(ClusterR4ProjectionCrc(landed_block, BLCKSZ),
+				 ClusterR4ProjectionCrc((char[BLCKSZ]){ 0 }, BLCKSZ));
 	UT_ASSERT_EQ(reply_lock_acquire_calls, 2);
 	UT_ASSERT_EQ(reply_lock_release_calls, 2);
-	UT_ASSERT_EQ(reply_cv_signal_calls, 1);
+	UT_ASSERT_EQ(reply_cv_signal_calls, 2);
 	UT_ASSERT_EQ(stale_drop_count, 1);
 }
 
@@ -5778,13 +5829,13 @@ UT_TEST(test_target_wrapper_denied_and_corrupt_full_never_publish)
 		} else
 			caught = true;
 		PG_exception_stack = saved_stack;
-		UT_ASSERT_EQ(caught, mode != 0);
-		if (mode == 0) {
+		UT_ASSERT_EQ(caught, mode == 2);
+		if (mode != 2) {
 			UT_ASSERT_EQ(result, CLUSTER_CR_BUILD_FAIL_CLOSED);
 			UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_PROTOCOL);
 		}
 		UT_ASSERT_EQ(requester_send.calls, 1);
-		UT_ASSERT_EQ(requester_send.done_calls, mode == 0 ? 1 : 0);
+		UT_ASSERT_EQ(requester_send.done_calls, mode != 2 ? 1 : 0);
 		UT_ASSERT_EQ(route_seam.enter_calls, 1);
 		UT_ASSERT_EQ(route_seam.leave_calls, 1);
 		UT_ASSERT_EQ(memcmp(page, before, sizeof(page)), 0);
@@ -5971,7 +6022,7 @@ UT_TEST(test_target_wrapper_recheck_drift_keeps_dst_and_canonicalizes_slot)
 UT_TEST(test_request80_routes_stored_proof_to_real_forward96_handler)
 {
 	static const uint8 expected_extension[32]
-		= { 0x03, 0x01, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00,
+		= { 0x04, 0x01, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00,
 			0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x22, 0x22,
 			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
 	ClusterR4CrRequestPayload request = route_test_request80();
@@ -8220,10 +8271,111 @@ UT_TEST(test_registered_forward_ingress_keeps_foreign_or_malformed_frames_closed
 	cluster_node_id = saved_node;
 }
 
-int
-main(void)
+UT_TEST(test_peer_full_registered_landing_rejects_corrupt_stale_replayed_and_cancelled_frames)
 {
-	UT_PLAN(165);
+	TestPeerFullFrame original, frame;
+	FILE *producer = popen("./test_cluster_r4_tx_outcome --peer-full-proof-fixture | "
+						   "./test_cluster_r4_slot_reservation --peer-full-frame-fixture",
+						   "r");
+	bool received = producer != NULL && fread(&original, sizeof(original), 1, producer) == 1;
+	int rc = producer != NULL ? pclose(producer) : -1;
+	int saved_node = cluster_node_id;
+	UT_ASSERT(received && rc == 0);
+	if (!received || rc != 0)
+		return;
+	for (unsigned fault = 0; fault < 11; fault++) {
+		ClusterICEnvelope env;
+		GcsBlockReplyHeader *header;
+		ClusterR4ProjectionWire *wire;
+		ClusterR4ProjectionBinding binding;
+		ClusterR4ProjectionScratch result = { 0 };
+		PGAlignedBlock page;
+		GcsBlockReplyHeader landed;
+		bool terminal;
+		uint64 drops;
+		frame = original;
+		header = (GcsBlockReplyHeader *)frame.bytes;
+		wire = (ClusterR4ProjectionWire *)(frame.bytes + CLUSTER_R4_CR_REPLY_PAYLOAD_SIZE);
+		route_seam_reset();
+		cluster_node_id = 2;
+		UT_ASSERT(cluster_gcs_block_test_arm_r4_reply_slot(header->request_id, header->epoch, 1,
+														   header->transition_id, 1));
+		UT_ASSERT(cluster_gcs_block_test_bind_r4_projection_request(&frame.fixture.tag,
+																	frame.fixture.read_scn, 12));
+		env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, 3, 2, frame.length);
+		UT_ASSERT(ClusterR4ProjectionDecode(wire, header, frame.bytes + 48, frame.bytes + 8240,
+											&binding));
+		if (fault == 1)
+			wire->bytes[12] ^= 1;
+		if (fault == 2)
+			env.payload_length--;
+		if (fault == 3)
+			binding.tag.relNumber++;
+		if (fault == 4)
+			binding.read_scn++;
+		if (fault == 5)
+			binding.holder = 0;
+		if (fault == 6)
+			binding.activation_generation = ++binding.admission_generation;
+		if (fault == 7)
+			binding.requester = 1;
+		if (fault >= 3 && fault <= 7)
+			UT_ASSERT(ClusterR4ProjectionSeal(wire, ClusterR4OperationRead(wire->bytes + 8, 2),
+											  &binding, header, frame.bytes + 48));
+		if (fault == 8)
+			UT_ASSERT(cluster_gcs_block_test_release_r4_requester_slot());
+		cluster_gcs_handle_block_reply_envelope(&env, frame.bytes);
+		if (fault == 9)
+			cluster_gcs_handle_block_reply_envelope(&env, frame.bytes);
+		if (fault == 10) {
+			UT_ASSERT(cluster_gcs_block_test_copy_r4_projection(page.data, &result));
+			ClusterR4ProjectionForget(&result);
+			cluster_gcs_handle_block_reply_envelope(&env, frame.bytes);
+		}
+		UT_ASSERT_EQ(
+			cluster_gcs_block_test_snapshot_r4_reply_slot(&landed, page.data, &terminal, &drops),
+			fault != 8 && fault != 10);
+		drops = cluster_gcs_get_block_stale_reply_drop_count();
+		UT_ASSERT_EQ(cluster_gcs_block_test_copy_r4_projection(page.data, &result), fault == 0);
+		UT_ASSERT_EQ(result.valid, fault == 0);
+		UT_ASSERT_EQ(drops, fault == 0 ? 0 : 1);
+	}
+	cluster_node_id = saved_node;
+}
+
+static int
+peer_projection_land(FILE *input, FILE *output)
+{
+	TestPeerFullFrame frame;
+	ClusterICEnvelope env;
+	GcsBlockReplyHeader *header;
+	if (fread(&frame, sizeof(frame), 1, input) != 1
+		|| frame.length != CLUSTER_R4_CR_FULL_PAYLOAD_SIZE)
+		return 1;
+	header = (GcsBlockReplyHeader *)frame.bytes;
+	route_seam_reset();
+	cluster_node_id = 2;
+	if (!cluster_gcs_block_test_arm_r4_reply_slot(header->request_id, header->epoch, 1,
+												  header->transition_id, 1))
+		return 1;
+	if (!cluster_gcs_block_test_bind_r4_projection_request(&frame.fixture.tag,
+														   frame.fixture.read_scn, 12))
+		return 1;
+	env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, 3, 2, frame.length);
+	cluster_gcs_handle_block_reply_envelope(&env, frame.bytes);
+	if (!cluster_gcs_block_test_copy_r4_projection(frame.fixture.full.data,
+												   &frame.fixture.projection)
+		|| ut_failed_count != 0)
+		return 1;
+	return fwrite(&frame.fixture, sizeof(frame.fixture), 1, output) == 1 ? 0 : 1;
+}
+
+int
+main(int argc, char **argv)
+{
+	if (argc == 2 && strcmp(argv[1], "--peer-full-land-fixture") == 0)
+		return peer_projection_land(stdin, stdout);
+	UT_PLAN(166);
 	UT_RUN(test_native_retry_trace_samples_owner_generation_and_clears);
 	UT_RUN(test_current_mx_updater_precommit_final_release_failure_is_unknown);
 	UT_RUN(test_current_mx_origin_retry_keeps_unknown_release_and_deadline_fences);
@@ -8389,6 +8541,7 @@ main(void)
 	UT_RUN(test_owner_full_is_not_consumed_after_top_or_receipt_drift);
 	UT_RUN(test_registered_forward_ingress_delivers_cr_owner_challenge);
 	UT_RUN(test_registered_forward_ingress_keeps_foreign_or_malformed_frames_closed);
+	UT_RUN(test_peer_full_registered_landing_rejects_corrupt_stale_replayed_and_cancelled_frames);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

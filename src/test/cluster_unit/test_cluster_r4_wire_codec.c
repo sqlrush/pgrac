@@ -106,7 +106,7 @@ run_wire_vector(int vector)
 			offsetof(ClusterR4ForwardExtension, kind.cr.master_resource_transition_count_le), 12);
 		break;
 	case 3:
-		UT_ASSERT_EQ(CLUSTER_R4_WIRE_VERSION, 3);
+		UT_ASSERT_EQ(CLUSTER_R4_WIRE_VERSION, 4);
 		break;
 	case 4:
 		UT_ASSERT_EQ(CLUSTER_R4_FORWARD_EXTENDED, 6);

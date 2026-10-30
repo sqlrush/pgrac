@@ -44,7 +44,7 @@ UT_TEST(test_owner_route_proof_keeps_exact_challenge)
 
 UT_TEST(test_owner_cr_wire_version_is_new_cluster_only)
 {
-	UT_ASSERT_EQ(CLUSTER_R4_WIRE_VERSION, 3);
+	UT_ASSERT_EQ(CLUSTER_R4_WIRE_VERSION, 4);
 }
 
 UT_TEST(test_owner_request_rejects_old_version)

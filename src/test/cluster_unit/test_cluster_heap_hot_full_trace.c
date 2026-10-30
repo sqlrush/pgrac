@@ -78,11 +78,14 @@ void LockBuffer(Buffer buffer pg_attribute_unused(), int mode)
 	else abort();
 }
 ClusterCrBuildResult
-cluster_gcs_block_cr_fetch_and_wait(BufferTag input, SCN scn, char out[BLCKSZ],
-								   ClusterCrBuildReason *reason)
+cluster_gcs_block_cr_fetch_projection(BufferTag input, SCN scn, char out[BLCKSZ],
+									  ClusterR4ProjectionScratch *projection,
+									  ClusterCrBuildReason *reason)
 {
 	if (locked || !BufferTagsEqual(&input, &tag) || scn != snapshot.read_scn) abort();
 	fetches++;
+	memset(projection, 0x5a, sizeof(*projection));
+	projection->valid = true;
 	if (fetch_error) siglongjmp(*PG_exception_stack, 1);
 	memcpy(out, full.data, BLCKSZ);
 	*reason = fetch_reason;
@@ -188,6 +191,8 @@ UT_TEST(default_off_has_no_log_or_clock_and_preserves_full)
 	UT_ASSERT_EQ(run_cycle(), HEAP_HOT_R4_CYCLE_FOUND);
 	UT_ASSERT(locked == 1 && fetches == 1 && searches == 1);
 	UT_ASSERT(events == 0 && clock_reads == 0);
+	UT_ASSERT(result.projection.valid);
+	UT_ASSERT(result.cr_private_projection);
 }
 UT_TEST(actual_tag_root_and_queried_item_are_distinct)
 {
@@ -220,6 +225,7 @@ UT_TEST(fetch_failure_keeps_refusal_and_hides_unqualified_scratch)
 	UT_ASSERT_EQ(run_cycle(), HEAP_HOT_R4_CYCLE_FAILED);
 	UT_ASSERT(searches == 0 && locked == 1 && events == 2);
 	UT_ASSERT(actual_result == fetch_result && actual_reason == fetch_reason);
+	UT_ASSERT(!result.projection.valid);
 	UT_ASSERT(strstr(logs, "event=full.fetch.end") && !strstr(logs, "full_known=1"));
 }
 UT_TEST(dormant_keeps_target_disabled_exception)
@@ -235,6 +241,8 @@ UT_TEST(not_found_logs_real_retained_decision_formatter)
 	UT_ASSERT_EQ(run_cycle(), HEAP_HOT_R4_CYCLE_NOT_FOUND);
 	UT_ASSERT(strstr(logs, "event=full.search.end") && strstr(logs, "total=1 kept=1;off=3"));
 	UT_ASSERT(strstr(logs, "done=1,visible=0"));
+	UT_ASSERT(!result.projection.valid);
+	UT_ASSERT(result.cr_private_projection);
 }
 UT_TEST(begin_log_error_restores_share_before_rethrow)
 {
@@ -247,18 +255,22 @@ UT_TEST(fetch_error_restores_share_before_rethrow)
 	reset_fixture(true); fetch_error = true;
 	UT_ASSERT(run_catching());
 	UT_ASSERT(locked == 1 && fetches == 1 && searches == 0);
+	UT_ASSERT(!result.projection.valid);
 }
 UT_TEST(fetch_end_log_error_restores_share_before_rethrow)
 {
 	reset_fixture(true); log_error_event = 2;
 	UT_ASSERT(run_catching());
 	UT_ASSERT(locked == 1 && fetches == 1 && searches == 0);
+	UT_ASSERT(!result.projection.valid);
 }
 UT_TEST(search_end_log_error_restores_share_before_rethrow)
 {
 	reset_fixture(true); log_error_event = 3;
 	UT_ASSERT(run_catching());
 	UT_ASSERT(locked == 1 && fetches == 1 && searches == 1);
+	UT_ASSERT(!result.projection.valid);
+	UT_ASSERT(result.cr_private_projection);
 }
 UT_TEST(invalid_page_is_unavailable_not_a_diagnostic_rejection)
 {

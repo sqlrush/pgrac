@@ -5044,6 +5044,7 @@ heap_hot_r4_search_scratch(const BufferTag *tag,
 	context.allow_hint = false;
 	context.allow_cleanout = false;
 	context.visibility_trace = &result->visibility_trace;
+	context.projection = result->projection.valid ? &result->projection : NULL;
 
 	for (;;)
 	{
@@ -5527,6 +5528,7 @@ heap_hot_r4_full_cycle(Buffer buffer, const BufferTag *tag,
 	volatile ClusterCrBuildResult build_result = CLUSTER_CR_BUILD_FAIL_CLOSED;
 	volatile ClusterCrBuildReason build_reason = CLUSTER_CR_BUILD_PROTOCOL;
 	uint64 trace_cycle = 0;
+	volatile bool completed = false;
 
 	memset(result, 0, sizeof(*result));
 	result->kind = HEAP_HOT_SEARCH_NOT_FOUND;
@@ -5537,9 +5539,8 @@ heap_hot_r4_full_cycle(Buffer buffer, const BufferTag *tag,
 		heap_hot_r4_full_trace(buffer, tag, logical_root, queried, before,
 							   snapshot, result, false, build_result, build_reason,
 							   false, &trace_cycle, "full.fetch.begin");
-		build_result = cluster_gcs_block_cr_fetch_and_wait(
-			*tag, snapshot->read_scn, result->scratch_page,
-			&raw_reason);
+		build_result = cluster_gcs_block_cr_fetch_projection(
+			*tag, snapshot->read_scn, result->scratch_page, &result->projection, &raw_reason);
 		build_reason = raw_reason;
 		heap_hot_r4_full_trace(buffer, tag, logical_root, queried, before,
 							   snapshot, result, true, build_result, build_reason,
@@ -5547,6 +5548,10 @@ heap_hot_r4_full_cycle(Buffer buffer, const BufferTag *tag,
 		if (build_result == CLUSTER_CR_BUILD_FULL
 			&& build_reason == CLUSTER_CR_BUILD_NONE)
 		{
+			/* Forgetting proof must not make its dependent page cacheable. */
+			result->cr_private_projection
+				= result->projection.valid
+				  && ClusterR4OperationRead(result->projection.wire.bytes + 8, 2) != 0;
 			if (heap_hot_r4_search_scratch(tag, logical_root, relation,
 										 snapshot, result, false))
 				result->kind = HEAP_HOT_SEARCH_OWNED_SCRATCH;
@@ -5554,9 +5559,13 @@ heap_hot_r4_full_cycle(Buffer buffer, const BufferTag *tag,
 								   snapshot, result, true, build_result, build_reason,
 								   true, &trace_cycle, "full.search.end");
 		}
+		completed = true;
 	}
 	PG_FINALLY();
 	{
+		if (!completed || result->kind != HEAP_HOT_SEARCH_OWNED_SCRATCH) {
+			ClusterR4ProjectionForget(&result->projection);
+		}
 		LockBuffer(buffer, BUFFER_LOCK_SHARE);
 	}
 	PG_END_TRY();
@@ -5782,8 +5791,11 @@ heap_index_publish_cr_result(IndexFetchHeapData *hscan, BlockNumber block,
 	BufferCrKey key;
 	Buffer volatile reservation = InvalidBuffer;
 
-	if (!result->cr_full_page || hscan->cr_scope.scan_id == 0
-		|| !heap_index_cr_page_supported((Page) result->scratch_page))
+	if (!result->cr_full_page || result->cr_private_projection
+		|| (result->projection.valid
+			&& ClusterR4OperationRead(result->projection.wire.bytes + 8, 2) != 0)
+		|| hscan->cr_scope.scan_id == 0
+		|| !heap_index_cr_page_supported((Page)result->scratch_page))
 		return;
 	if (cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
 										 CLUSTER_SEMANTIC_TARGET_SIDE, &admission)
