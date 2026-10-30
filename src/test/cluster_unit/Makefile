@@ -10889,3 +10889,6 @@ clean: clean-clog-native-callback
 .PHONY: clean-clog-native-callback
 clean-clog-native-callback:
 	rm -f test_cluster_clog_native_callback.inc test_cluster_clog_native_callback.inc.tmp
+
+# Original native callback through the same episode consumption and held pages.
+test_cluster_recovery_native_inputs: test_cluster_recovery_native_callback.inc
