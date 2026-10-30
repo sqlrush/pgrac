@@ -470,6 +470,9 @@ retained_record(XLogReaderState *record, const ClusterWalSourceRef *source,
 									  retained_space, work, &owners);
 	if (detail != RF_PAGE_PROOF_DETAIL_OK)
 		return work->detail = retained_native_record(work, record, detail);
+	if (XLogRecGetRmid(record) == RM_XACT_ID
+		&& (owners.owners & RF_SIDE_CONTRIBUTION_NATIVE_STRUCTURE) != 0)
+		retained_structure(work);
 	retained_side_record(work, record, source, cut, owners.owners);
 	for (uint32 i = 0; i < plan.component_count; i++) {
 		const RfDetachedComponentPlanV1 *component = &plan.components[i];
