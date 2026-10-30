@@ -1146,6 +1146,7 @@ cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **held)
 #include "test_cluster_recovery_episode_page_sources.inc"
 #include "test_cluster_recovery_consumed_native_redo.inc"
 #include "test_cluster_recovery_native_callback.inc"
+#include "test_cluster_recovery_initialized_replay.inc"
 #include "test_cluster_recovery_episode_generation_xid.inc"
 #include "test_cluster_recovery_clog_full_roots.inc"
 
@@ -1171,6 +1172,14 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_INITIALIZED_REPLAY") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_episode_initialized_replay_joins_complete_native_and_foreign_initialization);
+		UT_RUN(test_episode_initialized_replay_missing_or_wrong_foreign_birth_keeps_all_fds);
+		UT_RUN(test_episode_initialized_replay_sync_error_does_not_supply_consumption);
+		UT_RUN(test_episode_initialized_replay_lost_birth_cannot_rebase_held_pages);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_NATIVE_CALLBACK") != NULL) {
 		UT_PLAN(5);
 		UT_RUN(test_episode_native_callback_consumes_only_after_sync_and_reads_whole_pages);
@@ -1559,7 +1568,7 @@ main(int argc, char **argv)
 	UT_RUN(test_census_native_records_original_final_wal_rewrite_refuses_whole_view);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(295);
+	UT_PLAN(299);
 	UT_RUN(test_reader_raw_record_readahead_release_seek_and_crc_failure_revoke);
 	UT_RUN(test_reader_raw_record_page_and_segment_continuations_exclude_page_headers);
 	UT_RUN(test_census_raw_records_preserve_full_file_bytes_after_both_passes);
@@ -1633,6 +1642,10 @@ main(int argc, char **argv)
 	UT_RUN(test_episode_native_callback_late_source_and_frame_changes_keep_one_attempt);
 	UT_RUN(test_episode_native_callback_does_not_replace_foreign_cold_consumption);
 	UT_RUN(test_episode_native_callback_cannot_replace_earlier_held_observation);
+	UT_RUN(test_episode_initialized_replay_joins_complete_native_and_foreign_initialization);
+	UT_RUN(test_episode_initialized_replay_missing_or_wrong_foreign_birth_keeps_all_fds);
+	UT_RUN(test_episode_initialized_replay_sync_error_does_not_supply_consumption);
+	UT_RUN(test_episode_initialized_replay_lost_birth_cannot_rebase_held_pages);
 	UT_RUN(test_episode_consumed_native_redo_reaches_original_sync_and_whole_page);
 	UT_RUN(test_episode_consumed_native_dirty_status_is_not_a_disk_commit);
 	UT_RUN(test_episode_consumed_native_redo_cannot_rebase_an_earlier_held_page);

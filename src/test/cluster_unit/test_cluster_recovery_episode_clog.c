@@ -236,7 +236,7 @@ static const ClusterRecoveryRelmapSourceV1 *episode_full_source;
 bool
 cluster_undo_recovery_cold_origin_authorized_v1(int origin)
 {
-	return authority && (episode_full_source == NULL ? origin == 1
+	return authority && (episode_full_source == NULL ? origin == fixture_origin
 		: origin == episode_full_source->selected.source.claim.identity.origin_node_id
 			&& cluster_wal_inputs_relmap_source_current_v1(episode_full_source));
 }
