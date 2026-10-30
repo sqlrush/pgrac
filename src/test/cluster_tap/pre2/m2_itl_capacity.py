@@ -463,6 +463,11 @@ def validate_requalification_finish(case):
             raise ValueError('original UPDATE reused its stale tuple or row plan')
     elif rows != []:
         raise ValueError('original UPDATE did not observe the deleted target')
+    return dict(kind=kind, selected=proof['selected'],
+                **_requalification_completed_waits(start, case), authoritative=False)
+
+
+def _requalification_completed_waits(start, case):
     waits = case['waits']
     if not 1 <= len(waits) <= 8 or waits[0] != start:
         raise ValueError('original wait or bounded owner decisions are missing')
@@ -505,8 +510,73 @@ def validate_requalification_finish(case):
             raise ValueError('a later capacity wait has no raw exact owner decision')
     if decision is not None:
         raise ValueError('an owner was released without its observed wait completing')
-    return dict(kind=kind, selected=proof['selected'], completed_waits=len(raw) // 2,
-                released_owners=len(decisions), authoritative=False)
+    return dict(completed_waits=len(raw) // 2, released_owners=len(decisions))
+
+
+def validate_cross_page_wait(case):
+    """Distinguish the UPDATE source from the actual full destination page."""
+    start, source, before = case['start'], case['source_tag'], case['before']
+    selected = select_blocker(start)
+    destination = start['tag']
+    if (len(source) != 5 or len(destination) != 5 or source[:4] != destination[:4]
+            or number(source[3]) != 0 or number(source[4]) == number(destination[4])
+            or number(case['settings']['block_size']) != 8192
+            or case['settings']['payload_storage'] != 'p'
+            or len(start['holders']) != 8
+            or {number(h['row']) for h in start['holders']} != set(range(1, 9))
+            or number(case['waiter_xid']) < 3
+            or number(case['waiter_xid']) in {number(h['xid']) for h in start['holders']}
+            or case['sql'] != "UPDATE m2_b06_pair SET v=v+1,pad=repeat('n',1000) WHERE id=9;"):
+        raise ValueError('original two-page UPDATE and inline fixture identity are not proved')
+    layout = case['layout']
+    locations = {number(r['id']): _requalification_tid(r['ctid']) for r in layout}
+    if (len(layout) != 11 or set(locations) != set(range(1, 12))
+            or len(set(locations.values())) != 11):
+        raise ValueError('initial two-page row layout is missing or ambiguous')
+    for row in layout:
+        ident = number(row['id'])
+        block = number(source[4] if ident in (9, 11) else destination[4])
+        size = {9: 1800, 10: 5800, 11: 5600}.get(ident, 0)
+        if locations[ident][0] != block or number(row['payload_bytes']) != size:
+            raise ValueError('initial source or destination geometry changed')
+    if (number(before['id']) != 9 or number(before['v']) != 0
+            or _requalification_tid(before['ctid']) != locations[9]
+            or number(before['payload_bytes']) != 1800
+            or number(before['xmin']) == 0 or number(before['xmax']) != 0
+            or any(_requalification_tid(h['ctid'])[0] != number(destination[4])
+                   for h in start['holders'])):
+        raise ValueError('target or original owners are not on the observed distinct pages')
+    reader = case['reader']
+    if (number(reader['pid']) != start['waiter_pid'] or reader['state'] != 'active'
+            or reader['query'] != case['sql'] or reader['wait_event'] != 'GesTxEnqueueWait'
+            or not case['log'].startswith(start['log'])
+            or select_blocker(dict(start, log=case['log'])) != selected):
+        raise ValueError('original exact destination wait ended or changed')
+    _requalification_owners(case['holders'], start['holders'])
+    return dict(kind='pair', selected=selected, source_tag=source,
+                destination_tag=destination, authoritative=False)
+
+
+def validate_cross_page_finish(case):
+    """Check the original UPDATE's moved successor and exact wait cleanup."""
+    original = case['cross_page']
+    proof = validate_cross_page_wait(original)
+    start, reader = original['start'], case['reader']
+    if (case['stdout'].strip() != 'B06_PAIR_SQLSTATE 00000' or case['stderr'] != ''
+            or case['client_had_error'] is not False
+            or number(reader['pid']) != start['waiter_pid']
+            or reader['state'] != 'idle in transaction' or reader['query'] != original['sql']
+            or reader.get('wait_event') == 'GesTxEnqueueWait'
+            or number(case['waiter_xid']) != number(original['waiter_xid'])
+            or not case['log'].startswith(original['log']) or len(case['rows']) != 1):
+        raise ValueError('original two-page UPDATE did not complete in its original transaction')
+    row = case['rows'][0]
+    if (number(row['id']) != 9 or number(row['v']) != 1
+            or number(row['payload_bytes']) != 1000 or row['payload_matches'] is not True
+            or _requalification_tid(row['ctid'])[0] != number(start['tag'][4])
+            or number(row['xmin']) != number(original['waiter_xid']) or number(row['xmax']) != 0):
+        raise ValueError('original UPDATE did not publish the expected moved successor')
+    return dict(proof, **_requalification_completed_waits(start, case))
 
 
 if __name__ == '__main__':
@@ -522,6 +592,10 @@ if __name__ == '__main__':
             print(json.dumps(dict(mutation=validate_requalification_mutation(case))))
         elif sys.argv[1:] == ['--requalify']:
             print(json.dumps(dict(requalified=validate_requalification_finish(case))))
+        elif sys.argv[1:] == ['--cross-page-wait']:
+            print(json.dumps(dict(pair=validate_cross_page_wait(case))))
+        elif sys.argv[1:] == ['--cross-page']:
+            print(json.dumps(dict(cross_page=validate_cross_page_finish(case))))
         elif not sys.argv[1:]:
             print(json.dumps(dict(selected=select_blocker(case))))
         else:
