@@ -20,6 +20,10 @@ extern bool test_episode_native_clog_read(const ClusterRecoveryRelmapSourceV1 *s
 extern void test_episode_native_clog_release(void **held);
 extern void test_episode_native_clog_start(const char *root);
 extern void test_episode_native_clog_stop(void);
+/* NULL keeps the original fixture leaf; an opt-in guard is the caller's real
+ * Startup owner, and disables the unrelated cold-scope fixture permission. */
+extern void test_episode_native_clog_record_guard(
+	bool (*current)(int, const XLogReaderState *));
 extern void test_episode_native_clog_error(bool on);
 extern int test_episode_native_clog_fd(void *held);
 extern void test_episode_native_clog_redo(XLogReaderState *reader);
@@ -42,4 +46,8 @@ typedef struct TestEpisodeClogReplayStats {
 extern void test_episode_native_clog_replay(XLogReaderState *reader,
 	const ClusterRecoveryRelmapSourceV1 *source, unsigned sync_fault,
 	TestEpisodeClogReplayStats *stats);
+/* Keep the existing source-scoped API above; this test-only route forwards
+ * the real Startup callback record owner, without a relmap fixture source. */
+extern void test_episode_native_clog_replay_record(XLogReaderState *reader,
+	TimeLineID timeline, unsigned sync_fault, TestEpisodeClogReplayStats *stats);
 #endif

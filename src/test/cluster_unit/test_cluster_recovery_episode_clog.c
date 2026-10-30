@@ -229,6 +229,16 @@ test_episode_native_clog_discard_resident(void)
 	episode_clog_unlocked();
 }
 
+static bool episode_native_record_only;
+
+void
+test_episode_native_clog_record_guard(bool (*current)(int, const XLogReaderState *))
+{
+	episode_clog_unlocked();
+	fixture_native_record = current;
+	episode_native_record_only = current != NULL;
+}
+
 /* The opt-in route is scoped to one actual original FULL cold call. Original
  * fixture authorization remains the NULL-default provider for every old case. */
 static const ClusterRecoveryRelmapSourceV1 *episode_full_source;
@@ -236,7 +246,8 @@ static const ClusterRecoveryRelmapSourceV1 *episode_full_source;
 bool
 cluster_undo_recovery_cold_origin_authorized_v1(int origin)
 {
-	return authority && (episode_full_source == NULL ? origin == fixture_origin
+	return !episode_native_record_only && authority
+		&& (episode_full_source == NULL ? origin == fixture_origin
 		: origin == episode_full_source->selected.source.claim.identity.origin_node_id
 			&& cluster_wal_inputs_relmap_source_current_v1(episode_full_source));
 }
@@ -349,6 +360,45 @@ test_episode_native_clog_replay(XLogReaderState *reader,
 		InRecovery = old_recovery;
 		expect_error = old_error;
 		fail_sync = old_sync; fail_dirsync = old_dirsync;
+		stats->file_syncs = syncs - file_syncs;
+		stats->directory_syncs = dirsyncs - directory_syncs;
+		episode_callback_stats = NULL;
+		episode_clog_unlocked();
+	} PG_END_TRY();
+}
+
+/* This added test route uses the real Startup record owner. Keep the old
+ * source-scoped replay API/body above intact for all existing episode cases. */
+void
+test_episode_native_clog_replay_record(XLogReaderState *reader, TimeLineID timeline,
+	unsigned sync_fault, TestEpisodeClogReplayStats *stats)
+{
+	ClusterColdTypedReplay replay = { .apply_foreign = false, .replayTLI = timeline };
+	bool old_recovery = InRecovery, old_error = expect_error;
+	bool old_sync = fail_sync, old_dirsync = fail_dirsync;
+	bool old_truncate = fixture_native_truncate;
+	unsigned file_syncs = syncs, directory_syncs = dirsyncs;
+
+	UT_ASSERT(sync_fault <= 2 && stats != NULL && episode_callback_stats == NULL);
+	UT_ASSERT(episode_native_record_only && episode_full_source == NULL);
+	memset(stats, 0, sizeof(*stats));
+	episode_callback_stats = stats;
+	episode_callback_scn = reader->record->header.xl_scn;
+	episode_callback_timeline = timeline;
+	episode_callback_fault = sync_fault;
+	episode_callback_foreign = false;
+	InRecovery = expect_error = true;
+	/* Select the original native horizon provider only for this record. */
+	if ((XLogRecGetInfo(reader) & ~XLR_INFO_MASK) == CLOG_TRUNCATE_FULL)
+		fixture_native_truncate = true;
+	PG_TRY(); {
+		episode_clog_original_native_callback(reader, &replay);
+		stats->returned = true;
+	} PG_FINALLY(); {
+		InRecovery = old_recovery;
+		expect_error = old_error;
+		fail_sync = old_sync; fail_dirsync = old_dirsync;
+		fixture_native_truncate = old_truncate;
 		stats->file_syncs = syncs - file_syncs;
 		stats->directory_syncs = dirsyncs - directory_syncs;
 		episode_callback_stats = NULL;

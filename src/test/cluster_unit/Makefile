@@ -3553,7 +3553,7 @@ test_cluster_recovery_episode_clog.o: test_cluster_recovery_episode_clog.c \
         $(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
         $(top_srcdir)/src/include/storage/proc.h \
         $(top_builddir)/src/include/pg_config.h Makefile
-	$(CC) $(CFLAGS) $(CPPFLAGS) -Werror -c $< -o $@
+	$(CC) $(CFLAGS) $(CPPFLAGS) -Werror -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_recovery_native_inputs: test_cluster_recovery_episode_native_clog.inc \
         test_cluster_recovery_episode_clog.h test_cluster_recovery_episode_clog.o
@@ -9728,6 +9728,8 @@ test_cluster_cold_source_completion.inc: $(top_srcdir)/src/backend/cluster/clust
 	mv $@.tmp $@
 
 test_cluster_cold_recovery_startup: test_cluster_cold_recovery_startup.c unit_test.h $(CLUSTER_COLD_STARTUP_O) \
+		test_cluster_cold_native_storage.inc test_cluster_recovery_episode_clog.o \
+		test_cluster_recovery_episode_clog.h \
 		test_cluster_cold_native_clog_consumed.inc \
 		test_cluster_recovery_duty_compare.inc \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
@@ -9742,6 +9744,7 @@ test_cluster_cold_recovery_startup: test_cluster_cold_recovery_startup.c unit_te
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_census.h \
 		cluster_unit_port_stubs.o $(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< $(CLUSTER_COLD_STARTUP_O) \
+		test_cluster_recovery_episode_clog.o $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		test_cluster_cold_recovery_xid_core.o test_cluster_cold_recovery_replay_core.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
 		$(top_builddir)/src/common/libpgcommon.a \
