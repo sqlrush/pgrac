@@ -3358,6 +3358,34 @@ dump_undo(ReturnSetInfo *rsinfo)
 					 fmt_uint64(stats.ambiguous_count));
 			emit_row(rsinfo, "undo", "old_tt_locator_fallback_result.scan_unavailable",
 					 fmt_uint64(stats.unavailable_count));
+			{
+				static const char *const names[CLUSTER_TT_LOCATOR_FAMILY_COUNT]
+					= { "runtime_active", "runtime_terminal", "mx_current_origin",
+						"mx_projection" };
+				for (unsigned family = 0; family < CLUSTER_TT_LOCATOR_FAMILY_COUNT; family++) {
+					const ClusterTTDurableLocatorFamilyStats *row = &stats.families[family];
+
+					emit_row(rsinfo, "undo",
+							 psprintf("old_tt_locator_family.%s.fallback_count", names[family]),
+							 fmt_uint64(row->fallback_count));
+					emit_row(
+						rsinfo, "undo",
+						psprintf("old_tt_locator_family.%s.fallback_result.found", names[family]),
+						fmt_uint64(row->found_count));
+					emit_row(
+						rsinfo, "undo",
+						psprintf("old_tt_locator_family.%s.fallback_result.missing", names[family]),
+						fmt_uint64(row->missing_count));
+					emit_row(rsinfo, "undo",
+							 psprintf("old_tt_locator_family.%s.fallback_result.ambiguous",
+									  names[family]),
+							 fmt_uint64(row->ambiguous_count));
+					emit_row(rsinfo, "undo",
+							 psprintf("old_tt_locator_family.%s.fallback_result.scan_unavailable",
+									  names[family]),
+							 fmt_uint64(row->unavailable_count));
+				}
+			}
 		}
 	}
 

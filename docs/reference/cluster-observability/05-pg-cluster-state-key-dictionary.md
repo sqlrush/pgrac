@@ -956,6 +956,11 @@
 | `old_tt_locator_fallback_result.missing` | uint64 十进制文本 | 查询正常返回完整扫描无匹配的次数。 | 诊断值不能代替当前查询和身份复核，不作负缓存。 |
 | `old_tt_locator_fallback_result.ambiguous` | uint64 十进制文本 | 查询正常返回多个匹配的次数。 | 与调用数独立原子采样，不要求并发读取的结果和恰好等于调用数。 |
 | `old_tt_locator_fallback_result.scan_unavailable` | uint64 十进制文本 | 查询正常返回扫描不可用的次数，含原无效参数结果。 | 不同于完整扫描无匹配；与其他计数结合做时间窗增量。 |
+| `old_tt_locator_family.<family>.fallback_count` | uint64 十进制文本 | 本实例带调用族标签的位置查询入口次数。 | `<family>` 为 `runtime_active`、`runtime_terminal`、`mx_current_origin`、`mx_projection`；分别对应运行期活动身份、运行期终态身份、current-MX来源成员及MX投影成员查询。 |
+| `old_tt_locator_family.<family>.fallback_result.found` | uint64 十进制文本 | 该调用族正常返回唯一位置的次数。 | 原 `old_tt_locator_stats_available=false` 时省略全部调用族键；来源沿用 `old_tt_locator_origin_node_id`。 |
+| `old_tt_locator_family.<family>.fallback_result.missing` | uint64 十进制文本 | 该调用族正常返回完整扫描无匹配的次数。 | 不包含扫描不可用；不作负缓存或回收授权。 |
+| `old_tt_locator_family.<family>.fallback_result.ambiguous` | uint64 十进制文本 | 该调用族正常返回多个匹配的次数。 | 调用和结果独立原子读取，并发采样不要求相等。 |
+| `old_tt_locator_family.<family>.fallback_result.scan_unavailable` | uint64 十进制文本 | 该调用族正常返回扫描不可用的次数。 | ERROR保留入口计数，不补造正常返回结果；原未带标签API仍只计原总数。调用数不等于物理读次数，不能证明状态或换权成功。 |
 | `retention_horizon_scn` | 十进制整数文本 | 保留 / `horizon`对应的集群 SCN。 | 与同分类其他键组成快照，不单独作为 authority 证明。 |
 | `retention_max_recycle_horizon` | 十进制整数文本 | 保留 / 上限 / `recycle` / `horizon`的当前快照值。 | 与同分类其他键组成快照，不单独作为 authority 证明。 |
 | `tt_slot_retain_skip_count` | 十进制整数文本 | `tt` / 槽位 / `retain` / `skip`的累计计数。 | 先做时间窗增量；单个绝对值不能直接判定当前故障。 |

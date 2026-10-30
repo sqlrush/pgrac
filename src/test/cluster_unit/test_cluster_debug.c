@@ -3064,6 +3064,21 @@ cluster_tt_durable_locator_stats_snapshot(ClusterTTDurableLocatorStats *out)
 	out->missing_count = 3;
 	out->ambiguous_count = 5;
 	out->unavailable_count = 7;
+#ifdef CLUSTER_TT_DURABLE_LOCATOR_FAMILY_STATS_V1
+	{
+		static const uint64 values[4][5] = { { UINT64_MAX, UINT64_C(9223372036854775809), 3, 5, 7 },
+											 { 11, 13, 17, 19, 23 },
+											 { 29, 31, 37, 41, 43 },
+											 { 47, 53, 59, 61, 67 } };
+		for (unsigned i = 0; i < 4; i++) {
+			out->families[i].fallback_count = values[i][0];
+			out->families[i].found_count = values[i][1];
+			out->families[i].missing_count = values[i][2];
+			out->families[i].ambiguous_count = values[i][3];
+			out->families[i].unavailable_count = values[i][4];
+		}
+	}
+#endif
 	return true;
 }
 #endif
@@ -6779,10 +6794,52 @@ UT_TEST(test_debug_oldest_age_requires_snapshot_and_independent_age_availability
 	ctrc_debug_snapshot_available = true;
 }
 
+UT_TEST(test_debug_locator_families_keep_availability_origin_and_unsigned_values)
+{
+	LOCAL_FCINFO(fcinfo, 0);
+	ReturnSetInfo rsinfo;
+	static const char *const families[]
+		= { "runtime_active", "runtime_terminal", "mx_current_origin", "mx_projection" };
+	static const char *const suffixes[]
+		= { "fallback_count", "fallback_result.found", "fallback_result.missing",
+			"fallback_result.ambiguous", "fallback_result.scan_unavailable" };
+	static const char *const expected[4][5]
+		= { { "18446744073709551615", "9223372036854775809", "3", "5", "7" },
+			{ "11", "13", "17", "19", "23" },
+			{ "29", "31", "37", "41", "43" },
+			{ "47", "53", "59", "61", "67" } };
+
+	for (int available = 0; available < 2; available++) {
+		memset(fcinfo, 0, SizeForFunctionCallInfo(0));
+		memset(&rsinfo, 0, sizeof(rsinfo));
+		captured_dump_row_count = captured_formatted_value_count = 0;
+		fcinfo->resultinfo = (fmNodePtr)&rsinfo;
+		locator_stats_available = available != 0;
+		(void)cluster_dump_state(fcinfo);
+		UT_ASSERT_EQ(captured_dump_count("undo", "old_tt_locator_stats_available"), 1);
+		UT_ASSERT_STR_EQ(captured_dump_value("undo", "old_tt_locator_stats_available"),
+						 available ? "true" : "false");
+		UT_ASSERT_EQ(captured_dump_count("undo", "old_tt_locator_origin_node_id"), available);
+		if (available)
+			UT_ASSERT_STR_EQ(captured_dump_value("undo", "old_tt_locator_origin_node_id"), "3");
+		for (unsigned i = 0; i < 4; i++) {
+			for (unsigned j = 0; j < 5; j++) {
+				char key[128];
+
+				snprintf(key, sizeof(key), "old_tt_locator_family.%s.%s", families[i], suffixes[j]);
+				UT_ASSERT_EQ(captured_dump_count("undo", key), available);
+				if (available && captured_dump_count("undo", key) == 1)
+					UT_ASSERT_STR_EQ(captured_dump_value("undo", key), expected[i][j]);
+			}
+		}
+	}
+	locator_stats_available = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(34);
+	UT_PLAN(35);
 	UT_RUN(test_debug_dump_retention_observations_preserve_availability_and_unsigned_values);
 	UT_RUN(test_debug_dump_exposes_native_drop_context_and_real_io_observation);
 	UT_RUN(test_debug_dump_exposes_pcm_first_refusal_identity_and_subpredicate);
@@ -6817,6 +6874,7 @@ main(void)
 	UT_RUN(test_debug_publisher_gauge_preserves_availability_zero_unsigned_and_origin);
 	UT_RUN(test_debug_unsettled_gauge_preserves_availability_zero_unsigned_and_origin);
 	UT_RUN(test_debug_oldest_age_requires_snapshot_and_independent_age_availability);
+	UT_RUN(test_debug_locator_families_keep_availability_origin_and_unsigned_values);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

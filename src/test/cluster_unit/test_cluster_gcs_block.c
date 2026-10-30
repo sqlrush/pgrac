@@ -4506,7 +4506,7 @@ UT_TEST(test_current_mx_member_proof_reuses_nonblocking_target_origin_context)
 			"GCS_BLOCK_R4_TX_ORIGIN_TT_ACQUIRE_BEGIN" };
 	static const char *const locator_contract[]
 		= { "cluster_tt_slot_current_owner_by_xid(",
-			"cluster_tt_slot_durable_locate_any_by_xid_origin(" };
+			"cluster_tt_slot_durable_locate_any_by_xid_origin_profiled(" };
 	static const char *const step_contract[]
 		= { "cluster_undo_block0_current_acquire_begin_admitted(",
 			"cluster_undo_block0_current_acquire_poll(",

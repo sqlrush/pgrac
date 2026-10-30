@@ -168,6 +168,8 @@ cluster_tt_slot_durable_locate_any_by_xid_origin(int origin_node pg_attribute_un
 	return CLUSTER_TT_DURABLE_LOCATE_MISSING;
 }
 
+#include "test_cluster_tt_locator_family.inc"
+
 static void
 reset_admission(ClusterSemanticAdmissionResult result, bool recheck_ok)
 {

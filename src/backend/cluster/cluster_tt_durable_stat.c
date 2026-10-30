@@ -83,6 +83,12 @@ typedef struct ClusterTTDurableShared {
 	pg_atomic_uint64 locator_missing_count;
 	pg_atomic_uint64 locator_ambiguous_count;
 	pg_atomic_uint64 locator_unavailable_count;
+
+	pg_atomic_uint64 locator_family_fallback_count[CLUSTER_TT_LOCATOR_FAMILY_COUNT];
+	pg_atomic_uint64 locator_family_found_count[CLUSTER_TT_LOCATOR_FAMILY_COUNT];
+	pg_atomic_uint64 locator_family_missing_count[CLUSTER_TT_LOCATOR_FAMILY_COUNT];
+	pg_atomic_uint64 locator_family_ambiguous_count[CLUSTER_TT_LOCATOR_FAMILY_COUNT];
+	pg_atomic_uint64 locator_family_unavailable_count[CLUSTER_TT_LOCATOR_FAMILY_COUNT];
 } ClusterTTDurableShared;
 
 #ifdef USE_PGRAC_CLUSTER
@@ -103,6 +109,7 @@ void
 cluster_tt_durable_shmem_init(void)
 {
 	bool found;
+	unsigned family;
 
 	TTDurableShared
 		= ShmemInitStruct("ClusterTTDurableShared", cluster_tt_durable_shmem_size(), &found);
@@ -135,6 +142,13 @@ cluster_tt_durable_shmem_init(void)
 		pg_atomic_init_u64(&TTDurableShared->locator_missing_count, 0);
 		pg_atomic_init_u64(&TTDurableShared->locator_ambiguous_count, 0);
 		pg_atomic_init_u64(&TTDurableShared->locator_unavailable_count, 0);
+		for (family = 0; family < CLUSTER_TT_LOCATOR_FAMILY_COUNT; family++) {
+			pg_atomic_init_u64(&TTDurableShared->locator_family_fallback_count[family], 0);
+			pg_atomic_init_u64(&TTDurableShared->locator_family_found_count[family], 0);
+			pg_atomic_init_u64(&TTDurableShared->locator_family_missing_count[family], 0);
+			pg_atomic_init_u64(&TTDurableShared->locator_family_ambiguous_count[family], 0);
+			pg_atomic_init_u64(&TTDurableShared->locator_family_unavailable_count[family], 0);
+		}
 	}
 }
 
@@ -226,6 +240,7 @@ bool
 cluster_tt_durable_locator_stats_snapshot(ClusterTTDurableLocatorStats *out)
 {
 	ClusterTTDurableLocatorStats snapshot;
+	unsigned family;
 
 	if (TTDurableShared == NULL || out == NULL || cluster_node_id < 0)
 		return false;
@@ -236,8 +251,57 @@ cluster_tt_durable_locator_stats_snapshot(ClusterTTDurableLocatorStats *out)
 	snapshot.missing_count = pg_atomic_read_u64(&TTDurableShared->locator_missing_count);
 	snapshot.ambiguous_count = pg_atomic_read_u64(&TTDurableShared->locator_ambiguous_count);
 	snapshot.unavailable_count = pg_atomic_read_u64(&TTDurableShared->locator_unavailable_count);
+	for (family = 0; family < CLUSTER_TT_LOCATOR_FAMILY_COUNT; family++) {
+		snapshot.families[family].fallback_count
+			= pg_atomic_read_u64(&TTDurableShared->locator_family_fallback_count[family]);
+		snapshot.families[family].found_count
+			= pg_atomic_read_u64(&TTDurableShared->locator_family_found_count[family]);
+		snapshot.families[family].missing_count
+			= pg_atomic_read_u64(&TTDurableShared->locator_family_missing_count[family]);
+		snapshot.families[family].ambiguous_count
+			= pg_atomic_read_u64(&TTDurableShared->locator_family_ambiguous_count[family]);
+		snapshot.families[family].unavailable_count
+			= pg_atomic_read_u64(&TTDurableShared->locator_family_unavailable_count[family]);
+	}
 	*out = snapshot;
 	return true;
+}
+
+ClusterTTDurableLocate
+cluster_tt_slot_durable_locate_any_by_xid_origin_profiled(ClusterTTDurableLocatorFamily family,
+														  int origin_node, TransactionId xid,
+														  uint16 *out_seg, uint16 *out_slot,
+														  uint16 *out_wrap, uint8 *out_status)
+{
+	bool profile = TTDurableShared != NULL && (unsigned)family < CLUSTER_TT_LOCATOR_FAMILY_COUNT;
+	ClusterTTDurableLocate result;
+	pg_atomic_uint64 *counter = NULL;
+
+	if (profile)
+		pg_atomic_fetch_add_u64(&TTDurableShared->locator_family_fallback_count[family], 1);
+	result = cluster_tt_slot_durable_locate_any_by_xid_origin(origin_node, xid, out_seg, out_slot,
+															  out_wrap, out_status);
+	if (profile) {
+		switch (result) {
+		case CLUSTER_TT_DURABLE_LOCATE_FOUND:
+			counter = &TTDurableShared->locator_family_found_count[family];
+			break;
+		case CLUSTER_TT_DURABLE_LOCATE_MISSING:
+			counter = &TTDurableShared->locator_family_missing_count[family];
+			break;
+		case CLUSTER_TT_DURABLE_LOCATE_AMBIGUOUS:
+			counter = &TTDurableShared->locator_family_ambiguous_count[family];
+			break;
+		case CLUSTER_TT_DURABLE_LOCATE_SCAN_UNAVAILABLE:
+			counter = &TTDurableShared->locator_family_unavailable_count[family];
+			break;
+		default:
+			break;
+		}
+		if (counter != NULL)
+			pg_atomic_fetch_add_u64(counter, 1);
+	}
+	return result;
 }
 
 /* ------------------------------------------------------------ */
@@ -383,6 +447,17 @@ cluster_tt_durable_locator_stats_snapshot(ClusterTTDurableLocatorStats *out)
 {
 	(void)out;
 	return false;
+}
+
+ClusterTTDurableLocate
+cluster_tt_slot_durable_locate_any_by_xid_origin_profiled(ClusterTTDurableLocatorFamily family,
+														  int origin_node, TransactionId xid,
+														  uint16 *out_seg, uint16 *out_slot,
+														  uint16 *out_wrap, uint8 *out_status)
+{
+	(void)family;
+	return cluster_tt_slot_durable_locate_any_by_xid_origin(origin_node, xid, out_seg, out_slot,
+															out_wrap, out_status);
 }
 
 Size

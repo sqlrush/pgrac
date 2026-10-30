@@ -8795,8 +8795,9 @@ gcs_block_current_mx_origin_locate_physical(TransactionId xid,
 	 * current allocator index.  The durable scan supplies only a unique
 	 * physical identity: its status output is not requested or consumed.
 	 * Exact SCUR bytes plus the native bracket decide the verdict. */
-	durable_locate_result = cluster_tt_slot_durable_locate_any_by_xid_origin(
-		cluster_node_id, xid, &segment_id, &slot_offset, &wrap, NULL);
+	durable_locate_result = cluster_tt_slot_durable_locate_any_by_xid_origin_profiled(
+		CLUSTER_TT_LOCATOR_MX_CURRENT_ORIGIN, cluster_node_id, xid, &segment_id, &slot_offset,
+		&wrap, NULL);
 	*durable_locate_result_out = durable_locate_result;
 	if (durable_locate_result != CLUSTER_TT_DURABLE_LOCATE_FOUND)
 		return false;
