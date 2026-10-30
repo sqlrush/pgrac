@@ -4638,6 +4638,8 @@ test_cluster_wal_retained_cut_records: test_cluster_wal_retained_cut_records.c u
 # PGRAC: real exact-generation claim validation for physical WAL reuse tests.
 # Author: SqlRush <sqlrush@gmail.com>
 test_cluster_wal_retention: test_cluster_wal_retention.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_inputs_job_private.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
 		$(CLUSTER_WAL_RETENTION_O) $(top_builddir)/src/backend/cluster/cluster_wal_claim.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_WAL_RETENTION_O) \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \

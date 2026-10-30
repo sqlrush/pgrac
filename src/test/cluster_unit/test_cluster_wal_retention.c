@@ -29,13 +29,94 @@
 #include "cluster/cluster_wal_source.h"
 #include "common/cryptohash.h"
 #include "miscadmin.h"
+#include "storage/latch.h"
 #include "storage/lock.h"
 #include "utils/resowner.h"
 
 #include "unit_test.h"
 #include "../../backend/cluster/cluster_control_root_private.h"
+#include "../../backend/cluster/cluster_wal_inputs_job_private.h"
 
 UT_DEFINE_GLOBALS();
+
+/* This legacy suite creates only non-job pins. Job custody, memory and ACK
+ * progression run with real bodies in test_cluster_wal_inputs_job_pin.
+ * Reject every unsupported job entry rather than supplying ownership proof. */
+Latch *MyLatch;
+
+void
+SetLatch(Latch *latch pg_attribute_unused())
+{
+	abort();
+}
+
+void *
+MemoryContextAllocZero(MemoryContext context pg_attribute_unused(), Size size pg_attribute_unused())
+{
+	abort();
+}
+
+MemoryContext
+cluster_wal_inputs_job_context_v1(ClusterWalInputsJobV1 *job pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+cluster_wal_inputs_job_pin_bind_v1(ClusterWalInputsJobV1 *job pg_attribute_unused(),
+								   ClusterWalReadPinV1 *pin pg_attribute_unused(),
+								   uint64 generation pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+cluster_wal_inputs_job_pin_matches_v1(ClusterWalInputsJobV1 *job pg_attribute_unused(),
+									  ClusterWalReadPinV1 *pin pg_attribute_unused(),
+									  uint64 generation pg_attribute_unused(),
+									  bool owner_cleanup pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+cluster_wal_inputs_job_pin_detach_v1(ClusterWalInputsJobV1 *job pg_attribute_unused(),
+									 ClusterWalReadPinV1 *pin pg_attribute_unused(),
+									 uint64 generation pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+cluster_wal_inputs_job_pin_cleanup_v1(ClusterWalInputsJobV1 *job pg_attribute_unused(),
+									  ClusterWalReadPinV1 *pin pg_attribute_unused(),
+									  uint64 generation pg_attribute_unused(),
+									  bool error pg_attribute_unused(),
+									  bool owner_cleanup pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+cluster_wal_inputs_scope_job_suspended_v1(ClusterWalInputsJobV1 *job pg_attribute_unused())
+{
+	abort();
+}
+
+ClusterLockAcquireResult
+cluster_lock_owner_request_acquire_retained(
+	ClusterLockAcquireRequest *request pg_attribute_unused(),
+	ClusterControlNativeFinish finish pg_attribute_unused(), void *argument pg_attribute_unused())
+{
+	abort();
+}
+
+ClusterLockAcquireResult
+cluster_lock_owner_request_release_poll(
+	const ClusterLockAcquireRequest *request pg_attribute_unused())
+{
+	abort();
+}
 
 #define TEST_WAL_SEG_SIZE (16 * 1024 * 1024)
 #define UT_ASSERT_TRUE(condition) UT_ASSERT(condition)
