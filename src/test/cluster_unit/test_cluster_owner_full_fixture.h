@@ -31,5 +31,6 @@ typedef struct TestOwnerFullFixture {
 	PGAlignedBlock full;
 	PGAlignedBlock undo;
 } TestOwnerFullFixture;
+#define TEST_PEER_FULL_MAGIC UINT64CONST(0x4a50454546554c4c)
 #define TEST_OWNER_FULL_MAGIC UINT64CONST(0x4a4f574e46554c4c)
 #endif

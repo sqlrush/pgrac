@@ -7657,6 +7657,8 @@ main(int argc, char **argv)
 {
 	if (argc == 2 && strcmp(argv[1], "--owner-full-fixture") == 0)
 		return owner_worker_export_full(stdout);
+	if (argc == 2 && strcmp(argv[1], "--peer-full-fixture") == 0)
+		return peer_worker_export_full(stdout);
 	UT_PLAN(396);
 	UT_RUN(test_operation_worker_real_builder_yields_before_visibility);
 	UT_RUN(test_operation_worker_real_origin_completes_private_inverse);

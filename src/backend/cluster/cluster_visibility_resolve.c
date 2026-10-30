@@ -1659,9 +1659,14 @@ cluster_visibility_resolve_scratch_tuple_scn(Page page, HeapTuple tuple, const B
 		&& PageHasItl(page) && PageGetSpecialSize(page) >= CLUSTER_ITL_ARRAY_SIZE
 		&& slot_index < CLUSTER_ITL_INITRANS_DEFAULT
 		&& cluster_itl_get_tt_ref(page, slot_index, &ref) && ref.local_xid != raw_xid
-		&& ref.origin_node_id == cluster_node_id
 		&& (uint32)(raw_xid - ref.local_xid) < (uint32)0x80000000) {
 		out->ref = ref;
+		if (ref.origin_node_id != cluster_node_id) {
+			/* The holder's peer receipt is not part of the FULL page.
+			 * Raw child history cannot replace that operation proof. */
+			out->diagnostic_reason = "PEER_OPERATION_UNPROVABLE";
+			return;
+		}
 		out->diagnostic_reason = "OPERATION_UNPROVABLE";
 		vis_scratch_other_operation(page, tuple, tag, slot_index, which, raw_xid, &ref, out);
 		return;

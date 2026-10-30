@@ -9775,6 +9775,7 @@ test_cluster_scratch_self: test_cluster_scratch_self.c test_cluster_r4_scratch_r
         test_cluster_owner_full_fixture.h test_cluster_r4_tx_outcome \
         test_cluster_scratch_itl_ref.inc \
         test_cluster_scratch_nonowner.inc \
+        test_cluster_scratch_peer.inc \
         test_cluster_scratch_operation_entry.inc \
         test_cluster_native_prehistory_proof.inc cluster_snapshot_test_stubs.h unit_test.h \
         $(top_srcdir)/src/backend/utils/time/combocid.c \

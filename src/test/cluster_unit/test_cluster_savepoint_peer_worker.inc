@@ -203,3 +203,49 @@ UT_TEST(test_peer_operation_mixed_history_keeps_only_qualified_effects)
 			cluster_node_id = 0;
 		}
 }
+
+/* Host-only fixture transport. The actual holder validates DATA and typed
+ * peer proof before producing these immutable bytes; outcome is a boundary
+ * double until the independent TT40 source is integrated. */
+static int
+peer_worker_export_full(FILE *stream)
+{
+	TestOwnerFullFixture fixture = { 0 };
+	OperationWorkerFixture f;
+	ClusterItlSlotData *head;
+	HeapTupleHeader tuple;
+	ClusterR4CrBuildStepResult step;
+	unsigned old_count = 0;
+	int allocations = operation_worker_allocations;
+
+	operation_worker_init(&f, false);
+	operation_plan_effect(CLUSTER_SAVEPOINT_EFFECT_LIVE);
+	f.extension.route_proof.read_scn = 100;
+	head = &ClusterPageGetItlSlots((Page)f.cr.source.data)[2];
+	head->flags = ITL_FLAG_ACTIVE;
+	head->commit_scn = InvalidScn;
+	tuple = (HeapTupleHeader)PageGetItem((Page)f.cr.source.data,
+										 PageGetItemId((Page)f.cr.source.data, 3));
+	tuple->t_itl_slot_idx = 2;
+	tuple->t_choice.t_heap.t_field3.t_cid = InvalidCommandId;
+	cluster_node_id = 1;
+	step = operation_worker_step(&f);
+	if (step == CLUSTER_R4_CR_STEP_NEED_UNDO && peer_fixture_supply(&f, 0, &old_count))
+		step = cluster_cr_build_on_holder_step_admitted(0, 1000, true, &f.extension,
+														f.cr.source.data, f.foreign.data,
+														&f.cr.origin.admission, &f.reason);
+	fixture.magic = TEST_PEER_FULL_MAGIC;
+	fixture.expected = f.cr.origin.expected;
+	fixture.tag = f.cr.tag;
+	fixture.read_scn = f.extension.route_proof.read_scn;
+	memcpy(fixture.full.data, f.cr.source.data, BLCKSZ);
+	memcpy(fixture.undo.data, test_operation_page.data, BLCKSZ);
+	cluster_cr_build_on_holder_forget(0, 1000);
+	cluster_node_id = 0;
+	if (step != CLUSTER_R4_CR_STEP_FULL || f.reason != CLUSTER_CR_BUILD_NONE
+		|| !operation_cr_has_child(fixture.full.data) || ut_failed_count != 0
+		|| test_candidate_acquire_calls != 0 || test_candidate_held_count != 0
+		|| operation_worker_allocations != allocations)
+		return 1;
+	return fwrite(&fixture, sizeof(fixture), 1, stream) == 1 ? 0 : 1;
+}

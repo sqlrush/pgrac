@@ -5,12 +5,17 @@
 #include "postgres.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_undo_record.h"
+#include "cluster/cluster_undo_verdict.h"
+extern ClusterUndoVerdictResult self_unused_history(int, uint32, TransactionId, uint32, SCN, bool);
+extern int self_unused_xid_origin(TransactionId);
 extern bool cluster_undo_horizon_read_admission_enforce(SCN read_scn);
 int scratch_fixture_main(void);
 extern NodeId self_unused_origin(UBA address);
 extern ClusterTxOutcome self_unused_exact(const ClusterTxLocator *, ClusterTxResolveMode,
 	ClusterTxResolution *, ClusterTxResolveReason *);
 extern bool self_unused_itl_locator(Page, uint8, ClusterTxLocator *, ClusterTxResolveReason *);
+#define cluster_undo_verdict_resolve self_unused_history
+#define cluster_xid_origin_slot self_unused_xid_origin
 #define main scratch_fixture_main
 #define GetTopFullTransactionIdIfAny self_unused_top_full
 #define cluster_tx_resolve_operation_head self_unused_operation_head
@@ -24,6 +29,8 @@ extern bool self_unused_itl_locator(Page, uint8, ClusterTxLocator *, ClusterTxRe
 #define uba_origin_node_id self_unused_origin
 #include "test_cluster_r4_scratch_resolver.c"
 #undef main
+#undef cluster_undo_verdict_resolve
+#undef cluster_xid_origin_slot
 #undef GetTopFullTransactionIdIfAny
 #undef cluster_tx_resolve_operation_head
 #undef cluster_tx_resolve_retained_operation_head
@@ -50,6 +57,8 @@ volatile uint32 CritSectionCount = 0;
 #include "test_cluster_owner_full_fixture.h"
 static bool self_owner_full_pipe;
 static TestOwnerFullFixture self_owner_full;
+static bool self_peer_full_pipe;
+static ClusterUndoVerdictResult self_peer_raw_verdict;
 static bool self_current;
 static bool self_child;
 static int self_update_layout;
@@ -1300,10 +1309,12 @@ UT_TEST(test_real_owner_full_producer_reaches_native_self_cid_consumer)
 	cluster_node_id = UT_SELF_NODE;
 }
 
+#include "test_cluster_scratch_peer.inc"
+
 int
 main(void)
 {
-	UT_PLAN(34);
+	UT_PLAN(36);
 	UT_RUN(test_existing_delete_current_command);
 	UT_RUN(test_existing_delete_next_command);
 	UT_RUN(test_update_old_version_next_command);
@@ -1339,6 +1350,8 @@ main(void)
 	UT_RUN(test_nonowner_page_prior_and_matched_bad_image_refuse);
 	printf("# nonowner subcases=%d\n", nonowner_cases);
 	UT_RUN(test_real_owner_full_producer_reaches_native_self_cid_consumer);
+	UT_RUN(test_peer_full_raw_child_verdict_never_authorizes_operation);
+	UT_RUN(test_peer_full_possible_child_refusals_cover_both_tuple_roles);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
