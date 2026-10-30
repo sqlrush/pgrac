@@ -452,6 +452,11 @@ static unsigned column_rename_unexpected_callbacks;
 static RangeVar *column_rename_expected_relation;
 static uint32 column_rename_expected_flags;
 
+static bool truncate_lookup_active, truncate_expect_binding;
+static unsigned truncate_lookups, truncate_unbound, truncate_bad_lookup;
+static unsigned truncate_unexpected_callbacks;
+static const RangeVar *truncate_expected_relation;
+static void RangeVarCallbackForTruncate(const RangeVar *, Oid, Oid, void *);
 static bool trigger_create_lookup_active, trigger_create_expect_binding;
 static unsigned trigger_create_lookups, trigger_create_unbound, trigger_create_bad_lookup;
 static Oid trigger_create_expected_oid;
@@ -8183,6 +8188,17 @@ Oid
 RangeVarGetRelidExtended(const RangeVar *relation, LOCKMODE lockmode, uint32 flags,
 						 RangeVarGetRelidCallback callback, void *callback_arg)
 {
+	if (truncate_lookup_active) {
+		truncate_lookups++;
+		if (truncate_expect_binding
+			&& (utility_binds == 0 || !TransactionIdIsValid(utility_top_xid)
+				|| utility_current_xid != utility_top_xid))
+			truncate_unbound++;
+		if (relation != truncate_expected_relation || lockmode != AccessExclusiveLock || flags != 0
+			|| callback != RangeVarCallbackForTruncate || callback_arg != NULL)
+			truncate_bad_lookup++;
+		siglongjmp(boundary, 2); /* Stop before query, lock or permission callback. */
+	}
 	if (cluster_scope_lookup_active) {
 		cluster_scope_lookups++;
 		if (relation != cluster_scope_expected_relation || lockmode != AccessExclusiveLock
@@ -22294,10 +22310,221 @@ UT_TEST(test_native_trigger_create_internal_partition_roles_preserve_caller_resp
 	trigger_create_lookup_active = false;
 }
 
+/* The real root TRUNCATE prefix stops at its first relation query/lock.
+ * The callback is a trap, never a successful permission substitute. */
+static void
+RangeVarCallbackForTruncate(const RangeVar *relation, Oid relid, Oid oldrelid, void *arg)
+{
+	(void)relation;
+	(void)relid;
+	(void)oldrelid;
+	(void)arg;
+	truncate_unexpected_callbacks++;
+	siglongjmp(boundary, 3);
+}
+
+#include "test_cluster_fresh_truncate.inc"
+static TruncateStmt native_truncate_statement, truncate_statement_before;
+static RangeVar truncate_targets[2], truncate_targets_before[2];
+static ListCell truncate_target_cells[2];
+static List truncate_relations;
+static Node *truncate_expected_statement;
+static bool truncate_is_top_level;
+
+static void
+reset_native_truncate(bool expect_binding, unsigned form)
+{
+	reset_create_preflight();
+	truncate_lookup_active = false;
+	truncate_expect_binding = expect_binding;
+	truncate_lookups = truncate_unbound = truncate_bad_lookup = 0;
+	truncate_unexpected_callbacks = 0;
+	truncate_is_top_level = (form & 8) != 0;
+	truncate_targets[0] = (RangeVar){ .type = T_RangeVar,
+									  .schemaname = (form & 16) != 0 ? "truncate_schema" : NULL,
+									  .relname = "native_truncate_first",
+									  .inh = (form & 16) == 0,
+									  .relpersistence = RELPERSISTENCE_PERMANENT,
+									  .location = -1 };
+	truncate_targets[1] = (RangeVar){ .type = T_RangeVar,
+									  .relname = "native_truncate_second",
+									  .inh = false,
+									  .relpersistence = RELPERSISTENCE_TEMP,
+									  .location = -1 };
+	truncate_target_cells[0].ptr_value = &truncate_targets[0];
+	truncate_target_cells[1].ptr_value = &truncate_targets[1];
+	truncate_relations = (List){ .type = T_List,
+								 .length = (form & 1) != 0 ? 2 : 1,
+								 .max_length = 2,
+								 .elements = truncate_target_cells };
+	native_truncate_statement
+		= (TruncateStmt){ .type = T_TruncateStmt,
+						  .relations = &truncate_relations,
+						  .restart_seqs = (form & 2) != 0,
+						  .behavior = (form & 4) != 0 ? DROP_CASCADE : DROP_RESTRICT };
+	memcpy(&truncate_statement_before, &native_truncate_statement, sizeof(TruncateStmt));
+	memcpy(truncate_targets_before, truncate_targets, sizeof(truncate_targets));
+	truncate_expected_relation = &truncate_targets[0];
+	truncate_expected_statement = (Node *)&native_truncate_statement;
+}
+
+static void
+native_truncate_entry(void)
+{
+	truncate_lookup_active = true;
+	ExecuteTruncate(&native_truncate_statement, truncate_is_top_level);
+}
+
+static void
+assert_native_truncate_unchanged(void)
+{
+	UT_ASSERT_EQ(
+		memcmp(&native_truncate_statement, &truncate_statement_before, sizeof(TruncateStmt)), 0);
+	UT_ASSERT_EQ(memcmp(truncate_targets, truncate_targets_before, sizeof(truncate_targets)), 0);
+	UT_ASSERT_EQ(truncate_unexpected_callbacks, 0);
+}
+
+UT_TEST(test_native_truncate_binds_before_first_lock_in_all_profiles)
+{
+	for (unsigned form = 0; form < 32; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+			int caught;
+
+			reset_native_truncate(binds, form);
+			set_native_operator_mode(mode);
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_truncate_entry();
+				assert_native_truncate_unchanged();
+				UT_ASSERT_EQ(caught, 2);
+				UT_ASSERT_EQ(error_code, 0);
+				UT_ASSERT_EQ(truncate_lookups, repeat + 1);
+				UT_ASSERT_EQ(truncate_unbound, 0);
+				UT_ASSERT_EQ(truncate_bad_lookup, 0);
+				UT_ASSERT_EQ(utility_xids, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_prepares, binds ? repeat + 1 : 0);
+				UT_ASSERT_EQ(utility_binds, binds ? 1 : 0);
+				UT_ASSERT_EQ(utility_top_xid, binds ? 400 : InvalidTransactionId);
+			}
+		}
+	}
+	truncate_lookup_active = false;
+}
+
+UT_TEST(test_native_truncate_refuses_before_lock_on_publication_child_and_top_errors)
+{
+	for (unsigned form = 0; form < 32; form++) {
+		for (unsigned failure = 0; failure < 5; failure++) {
+			bool allocated = failure == 0 || failure == 2;
+			int caught;
+
+			reset_native_truncate(true, form);
+			if (failure == 0)
+				utility_bind_ok = false;
+			else if (failure == 1 || failure == 2) {
+				if (failure == 2)
+					create_sql_entry(truncate_expected_statement);
+				utility_in_child = true;
+			} else {
+				utility_current_xid = 401;
+				utility_top_xid = failure == 3 ? 400 : InvalidTransactionId;
+			}
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_truncate_entry();
+			assert_native_truncate_unchanged();
+			UT_ASSERT_EQ(caught, 1);
+			UT_ASSERT_EQ(error_code, failure == 0  ? ERRCODE_DATA_CORRUPTED
+									 : failure < 3 ? ERRCODE_FEATURE_NOT_SUPPORTED
+												   : ERRCODE_INTERNAL_ERROR);
+			UT_ASSERT_STR_EQ(
+				error_message,
+				failure == 0
+					? "canonical ACTIVE publication failed before shared catalog truncation"
+				: failure < 3 ? "shared catalog truncation does not support subtransactions"
+							  : "shared catalog top-level transaction identity mismatch");
+			UT_ASSERT_EQ(truncate_lookups, 0);
+			UT_ASSERT_EQ(truncate_unbound + truncate_bad_lookup + truncate_unexpected_callbacks, 0);
+			UT_ASSERT_EQ(utility_xids, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_prepares, allocated ? 1 : 0);
+			UT_ASSERT_EQ(utility_binds, failure == 2 ? 1 : 0);
+			UT_ASSERT_EQ(utility_top_xid, allocated || failure == 3 ? 400 : InvalidTransactionId);
+		}
+	}
+	truncate_lookup_active = false;
+}
+
+UT_TEST(test_native_truncate_context_guards_keep_nonshared_route)
+{
+	for (unsigned form = 0; form < 32; form++) {
+		for (unsigned mode = 0; mode < 8; mode++) {
+			bool binds = mode == 3 || mode == 7;
+
+			for (unsigned guard = 0; guard < 3; guard++) {
+				int caught;
+
+				reset_native_truncate(binds, form);
+				set_native_operator_mode(mode);
+				XactReadOnly = guard == 0;
+				utility_parallel = guard == 1;
+				utility_recovery = guard == 2;
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					native_truncate_entry();
+				assert_native_truncate_unchanged();
+				UT_ASSERT_EQ(caught, binds ? 1 : 2);
+				UT_ASSERT_EQ(error_code, !binds		  ? 0
+										 : guard == 1 ? ERRCODE_INVALID_TRANSACTION_STATE
+													  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+				UT_ASSERT_EQ(truncate_lookups, binds ? 0 : 1);
+				UT_ASSERT_EQ(truncate_unbound + truncate_bad_lookup + truncate_unexpected_callbacks,
+							 0);
+				UT_ASSERT_EQ(utility_xids + utility_prepares + utility_binds, 0);
+			}
+		}
+	}
+	truncate_lookup_active = false;
+}
+
+UT_TEST(test_native_truncate_utility_warm_guards_preserve_binding)
+{
+	for (unsigned form = 0; form < 32; form++) {
+		for (unsigned guard = 0; guard < 4; guard++) {
+			int caught;
+
+			reset_native_truncate(true, form);
+			create_sql_entry(truncate_expected_statement);
+			UT_ASSERT_EQ(utility_prepares, 1);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			XactReadOnly = guard == 1;
+			utility_parallel = guard == 2;
+			utility_recovery = guard == 3;
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				native_truncate_entry();
+			assert_native_truncate_unchanged();
+			UT_ASSERT_EQ(caught, guard ? 1 : 2);
+			UT_ASSERT_EQ(error_code, !guard		  ? 0
+									 : guard == 2 ? ERRCODE_INVALID_TRANSACTION_STATE
+												  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+			UT_ASSERT_EQ(truncate_lookups, guard ? 0 : 1);
+			UT_ASSERT_EQ(truncate_unbound + truncate_bad_lookup + truncate_unexpected_callbacks, 0);
+			UT_ASSERT_EQ(utility_prepares, guard ? 1 : 2);
+			UT_ASSERT_EQ(utility_xids, 1);
+			UT_ASSERT_EQ(utility_binds, 1);
+			UT_ASSERT_EQ(utility_top_xid, 400);
+		}
+	}
+	truncate_lookup_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(357);
+	UT_PLAN(361);
 	UT_RUN(test_unsupported_rename_or_schema_move_refuses_before_binding);
 	UT_RUN(test_unsupported_index_refuses_before_binding_and_schema_work);
 	UT_RUN(test_catalog_writes_bind_before_later_work_and_reuse_top);
@@ -22658,6 +22885,10 @@ main(void)
 	UT_RUN(test_native_trigger_create_context_guards_keep_nonshared_route);
 	UT_RUN(test_native_trigger_create_utility_warm_guards_preserve_binding);
 	UT_RUN(test_native_trigger_create_internal_partition_roles_preserve_caller_responsibility);
+	UT_RUN(test_native_truncate_binds_before_first_lock_in_all_profiles);
+	UT_RUN(test_native_truncate_refuses_before_lock_on_publication_child_and_top_errors);
+	UT_RUN(test_native_truncate_context_guards_keep_nonshared_route);
+	UT_RUN(test_native_truncate_utility_warm_guards_preserve_binding);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

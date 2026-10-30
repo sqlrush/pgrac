@@ -1726,6 +1726,31 @@ ExecuteTruncate(TruncateStmt *stmt, bool isTopLevel)
 	List	   *relids_logged = NIL;
 	ListCell   *cell;
 
+#ifdef USE_PGRAC_CLUSTER
+	/* Complete the original binding before any target query or table lock. */
+	if (cluster_shared_catalog && cluster_storage_mode_enabled()) {
+		ClusterCanonicalTxnBinding binding;
+		TransactionId current_xid;
+
+		PreventCommandIfReadOnly("TRUNCATE TABLE");
+		PreventCommandIfParallelMode("TRUNCATE TABLE");
+		PreventCommandDuringRecovery("TRUNCATE TABLE");
+		if (IsSubTransaction())
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("shared catalog truncation does not support subtransactions")));
+		current_xid = GetCurrentTransactionIdIfAny();
+		if (TransactionIdIsValid(current_xid)
+			&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("shared catalog top-level transaction identity mismatch")));
+		if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+			ereport(
+				ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("canonical ACTIVE publication failed before shared catalog truncation")));
+	}
+#endif
+
 	/*
 	 * Open, exclusive-lock, and check all the explicitly-specified relations
 	 */
