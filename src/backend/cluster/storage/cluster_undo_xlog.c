@@ -539,6 +539,22 @@ cluster_undo_emit_tt_slot_set_head_v2(const xl_undo_tt_identity_v2 *identity, UB
 	return XLogInsert(RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_SET_HEAD);
 }
 
+/* Explicit operation identity from the protected canonical owner. No new
+ * record/flush: the caller retains the original control publication order. */
+XLogRecPtr
+cluster_undo_emit_tt_slot_set_head_operation_v2(
+	const xl_undo_tt_slot_set_head_operation_v2 *record)
+{
+	xl_undo_tt_slot_set_head_operation_v2 candidate;
+
+	if (!cluster_undo_tt_set_head_operation_v2_decode(record, sizeof(candidate), &candidate))
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("invalid canonical TT40 operation head before WAL insertion")));
+	XLogBeginInsert();
+	XLogRegisterData((char *)&candidate, sizeof(candidate));
+	return XLogInsert(RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_SET_HEAD);
+}
+
 /* Spec 8.4D §12.10: insert the sole field-coded release certificate.  The
  * caller owns block-0 X-current and flushes this LSN before publishing the
  * exact TT release bit. */
@@ -1423,6 +1439,24 @@ cluster_tt_durable_redo_tt_v2(const ClusterUndoDecoded *decoded)
 						errmsg("invalid TT40 predecessor header in undo segment \"%s\"", path)));
 	}
 	decision = cluster_undo_prepare_header_v1(decoded, NULL, 0, before.data, prepared.data);
+	if (decision != CLUSTER_UNDO_HEADER_BLOCKED
+		&& decoded->kind == CLUSTER_UNDO_KIND_TT_SET_HEAD
+		&& decoded->flags == CLUSTER_UNDO_TT_SET_HEAD_OPERATION_FLAG) {
+		xl_undo_tt_slot_set_head_operation_v2 operation;
+		ClusterUndoHeadOperationDecision proof = CLUSTER_UNDO_HEAD_OPERATION_BLOCKED;
+
+		if (cluster_undo_head_operation_v2_from_decoded(decoded, &operation))
+			proof = cluster_tt_durable_set_head_operation_v2_preflight(&operation, before.data);
+		if (proof == CLUSTER_UNDO_HEAD_OPERATION_BLOCKED) {
+			(void)close(fd);
+			ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("cannot prove exact TT40 operation head redo target")));
+		}
+		/* A later retained head is an exact ancestry proof, not a numeric
+		 * UBA/sequence heuristic. Never overwrite it with this older record. */
+		if (proof == CLUSTER_UNDO_HEAD_OPERATION_STALE)
+			decision = CLUSTER_UNDO_HEADER_SKIP_STALE;
+	}
 	if (decision != CLUSTER_UNDO_HEADER_APPLY && decision != CLUSTER_UNDO_HEADER_ALREADY
 		&& decision != CLUSTER_UNDO_HEADER_SKIP_STALE) {
 		(void)close(fd);
@@ -1557,6 +1591,16 @@ cluster_undo_redo_tt_slot_abort(const ClusterUndoDecoded *decoded)
 static void
 cluster_undo_redo_tt_slot_set_head(const ClusterUndoDecoded *decoded)
 {
+	if (decoded->flags == CLUSTER_UNDO_TT_SET_HEAD_OPERATION_FLAG) {
+		xl_undo_tt_slot_set_head_operation record;
+
+		if (!cluster_undo_head_operation_from_decoded(decoded, &record))
+			ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("invalid legacy operation TT head redo identity")));
+		cluster_tt_durable_redo_set_head_operation(&record);
+		return;
+	}
+
 	cluster_tt_durable_redo_set_head_slot(decoded->instance, decoded->segment_id,
 										  decoded->slot_offset, decoded->wrap, decoded->xid,
 										  decoded->first_undo_block);

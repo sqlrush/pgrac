@@ -44,6 +44,7 @@
 #include "cluster/cluster_scn.h"	  /* SCN */
 #include "cluster/cluster_itl_slot.h" /* UBA */
 #include "cluster/cluster_tt_slot.h"
+#include "cluster/storage/cluster_undo_xlog.h"
 #include "storage/itemptr.h" /* TransactionId */
 
 typedef enum ClusterUndoDecodedKind {
@@ -104,6 +105,7 @@ typedef struct ClusterUndoDecoded {
 	uint8 reserved_zero[1];
 	UBA first_undo_block;
 	uint64 original_full_xid; /* explicit V2 identity; zero for legacy records */
+	UndoOperationTrailer head_operation; /* explicit 80B/96B operation only */
 } ClusterUndoDecoded;
 
 /*
@@ -112,6 +114,10 @@ typedef struct ClusterUndoDecoded {
  * payload length — the caller must not mutate anything (U-SIDE-04).
  */
 extern bool cluster_undo_decode(XLogReaderState *record, ClusterUndoDecoded *out);
+extern bool cluster_undo_head_operation_from_decoded(
+	const ClusterUndoDecoded *decoded, xl_undo_tt_slot_set_head_operation *record);
+extern bool cluster_undo_head_operation_v2_from_decoded(
+	const ClusterUndoDecoded *decoded, xl_undo_tt_slot_set_head_operation_v2 *record);
 
 /*
  * §2.1-2 preflight: route (D-SIDE-01) + field integrity for the parsed

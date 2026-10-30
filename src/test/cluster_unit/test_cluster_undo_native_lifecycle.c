@@ -38,6 +38,10 @@ static uint32 reads;
 static bool fail_open, fail_write, fail_close, corrupt_post_read;
 static uint32 short_read_number;
 static jmp_buf panic_jump;
+static PGAlignedBlock operation_pages[8];
+static uint32 operation_header_reads, operation_data_reads;
+static bool fail_operation_read, drift_operation_header;
+
 
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
@@ -197,6 +201,59 @@ fixture_dir_sync(const char *path, bool isdir)
 #define cluster_tt_durable_count_redo_apply() ((void)0)
 static const UBA InvalidUbaVal = InvalidUba_init; /* the legacy stamp's head reset */
 #include "test_cluster_undo_bind_native.inc"
+/* Original recovery namespace/physical reads only. All payload and TT
+ * validation below runs in the actual retained-chain implementation. */
+bool
+cluster_undo_smgr_read_block(ClusterUndoPathIntent intent, uint32 segment, uint8 owner,
+							 uint32 block, char *out)
+{
+	UT_ASSERT_EQ(intent, CLUSTER_UNDO_PATH_RECOVERY_SHARED);
+	UT_ASSERT_EQ(owner, 3);
+	if (segment != 513 || block >= lengthof(operation_pages))
+		return false;
+	if (block == 0) {
+		operation_header_reads++;
+		memcpy(out, disk.data, BLCKSZ);
+		if (drift_operation_header && operation_header_reads == 2)
+			((UndoSegmentHeaderDataV2 *)out)->tt_slots[4].original_full_xid ^= UINT64_C(1) << 32;
+	} else {
+		operation_data_reads++;
+		if (fail_operation_read)
+			return false;
+		memcpy(out, operation_pages[block].data, BLCKSZ);
+	}
+	return true;
+}
+
+bool
+cluster_undo_smgr_write_header_bytes(ClusterUndoPathIntent intent, uint32 segment, uint8 owner,
+									uint32 offset, const char *bytes, uint32 length)
+{
+	UT_ASSERT_EQ(intent, CLUSTER_UNDO_PATH_RECOVERY_SHARED);
+	UT_ASSERT_EQ(segment, 513);
+	UT_ASSERT_EQ(owner, 3);
+	return fixture_write(42, bytes, length, offset) == length;
+}
+
+bool
+cluster_undo_smgr_fsync_segment_file(uint32 segment, uint8 owner)
+{
+	UT_ASSERT_EQ(segment, 513);
+	UT_ASSERT_EQ(owner, 3);
+	return fixture_sync(42) == 0;
+}
+
+/* Wait instrumentation and checkpoint accounting are not I/O authority. */
+#define cluster_tt_durable_io_wait_start() ((void)0)
+#define cluster_tt_durable_io_wait_end() ((void)0)
+#define tt_redo_present_durable(instance_, segment_) \
+	do { if (fixture_sync(42) != 0) abort(); } while (0)
+#include "test_cluster_heap_small_scn.inc"
+#include "test_cluster_undo_head_operation_native.inc"
+#undef tt_redo_present_durable
+#undef cluster_tt_durable_io_wait_start
+#undef cluster_tt_durable_io_wait_end
+
 #include "test_cluster_undo_tt_v2_native.inc"
 
 /* Other legacy terminal/data-block owners are outside this fixture. An
@@ -221,6 +278,8 @@ reset_io(void)
 	reads = 0;
 	fail_open = fail_write = fail_close = corrupt_post_read = false;
 	short_read_number = 0;
+	operation_header_reads = operation_data_reads = 0;
+	fail_operation_read = drift_operation_header = false;
 }
 
 static void
@@ -1406,10 +1465,230 @@ UT_TEST(test_prepared_v2_abort_head_prefix_replay_preserves_original_head)
 	}
 }
 
+static xl_undo_tt_slot_set_head_operation_v2
+native_operation(uint64 top, uint32 block, uint64 sequence)
+{
+	xl_undo_tt_slot_set_head_operation_v2 record = { 0 };
+
+	record.head.identity = native_v2_identity(top);
+	record.head.identity.flags = CLUSTER_UNDO_TT_SET_HEAD_OPERATION_FLAG;
+	record.head.first_undo_block = uba_encode(513, block, 4, 0);
+	record.operation.version = UNDO_OPERATION_TRAILER_VERSION;
+	record.operation.length = UNDO_OPERATION_TRAILER_LENGTH;
+	record.operation.effect_state = CLUSTER_SAVEPOINT_EFFECT_LIVE;
+	record.operation.canonical_top_fxid = top;
+	record.operation.operation_fxid = top + 1;
+	record.operation.operation_sequence = sequence;
+	record.operation.canonical_segment_generation = 9;
+	record.operation.command_id = 7;
+	record.operation.subid = 2;
+	return record;
+}
+
+static void
+native_operation_member(uint32 block, const xl_undo_tt_slot_set_head_operation_v2 *operation,
+						 UBA previous)
+{
+	PGAlignedBlock *page = &operation_pages[block];
+	UndoBlockHeader *header = (UndoBlockHeader *)page->data;
+	UndoRecordHeader member = { 0 };
+	UndoSlotDirEntry *directory;
+	UndoSavepointRollbackPayload control = { 0 };
+	UndoInsertPayload insert = { 0 };
+	char *payload;
+
+	memset(page->data, 0, BLCKSZ);
+	header->magic = PGRAC_UNDO_BLOCK_MAGIC;
+	header->block_version = UNDO_BLOCK_VERSION_1;
+	header->slot_count = 1;
+	header->block_lsn = 0x800;
+	member.record_type = operation ? UNDO_RECORD_SAVEPOINT_ROLLBACK : UNDO_RECORD_INSERT;
+	member.flags = operation ? UNDO_REC_FLAG_HAS_OPERATION : 0;
+	if (UBA_is_invalid(previous)) member.flags |= UNDO_REC_FLAG_FIRST_IN_TX;
+	member.payload_length = operation ? UNDO_SAVEPOINT_ROLLBACK_PAYLOAD_LENGTH : sizeof(insert);
+	member.xid = operation ? (TransactionId)operation->operation.operation_fxid : 701;
+	member.origin_node_id = 2;
+	member.tt_slot_segment_id = 513;
+	member.tt_slot_id = 5;
+	member.tt_wrap_plus1 = 3;
+	member.write_scn = 51;
+	member.prev_uba = previous;
+	directory = UNDO_SLOT_DIR_PTR(page->data, 0);
+	directory->record_offset = sizeof(*header);
+	directory->record_length = sizeof(member) + member.payload_length;
+	directory->record_type = member.record_type;
+	directory->flags = member.flags;
+	header->free_offset = sizeof(*header) + directory->record_length;
+	memcpy(page->data + directory->record_offset, &member, sizeof(member));
+	payload = page->data + directory->record_offset + sizeof(member);
+	if (operation != NULL) {
+		control.version = UNDO_SAVEPOINT_ROLLBACK_VERSION;
+		control.length = UNDO_SAVEPOINT_ROLLBACK_LENGTH;
+		control.phase = UNDO_SAVEPOINT_ROLLBACK_PENDING;
+		control.rollback_sequence = operation->operation.operation_sequence;
+		control.start_uba = control.next_uba = previous;
+		control.scope_child_fxid = operation->operation.operation_fxid;
+		memcpy(payload, &control, sizeof(control));
+		memcpy(payload + sizeof(control), &operation->operation, sizeof(operation->operation));
+	} else
+		memcpy(payload, &insert, sizeof(insert));
+}
+
+UT_TEST(test_operation_v2_native_control_and_exact_ancestry_keep_tt40_identity)
+{
+	for (uint32 epoch = 0; epoch <= 7; epoch += 7) {
+		const uint64 top = ((uint64)epoch << 32) | 701;
+		xl_undo_tt_slot_set_head_operation_v2 operation = native_operation(top, 2, 3);
+		xl_undo_tt_slot_set_head_operation_v2 newer = native_operation(top, 3, 4);
+		PGAlignedBlock expected, before;
+		TTSlotV2 *slot = &((UndoSegmentHeaderDataV2 *)disk.data)->tt_slots[4];
+
+		native_v2_base(top, TT_SLOT_ACTIVE);
+		native_operation_member(1, NULL, (UBA)InvalidUba_init);
+		native_operation_member(2, &operation, uba_encode(513, 1, 4, 0));
+		native_operation_member(3, &newer, operation.head.first_undo_block);
+		expected = disk;
+		((UndoSegmentHeaderDataV2 *)expected.data)->tt_slots[4].first_undo_block
+			= operation.head.first_undo_block;
+		UT_ASSERT(replay_v2_record(XLOG_UNDO_TT_SLOT_SET_HEAD, &operation, sizeof(operation)));
+		check_native_v2_page(&expected);
+		UT_ASSERT_EQ(operation_header_reads, 2);
+		UT_ASSERT(operation_data_reads >= 2);
+		UT_ASSERT_EQ(slot->original_full_xid, top);
+		before = disk;
+		reset_io();
+		UT_ASSERT(replay_v2_record(XLOG_UNDO_TT_SLOT_SET_HEAD, &operation, sizeof(operation)));
+		UT_ASSERT_EQ(writes, 0);
+		UT_ASSERT_EQ(syncs, 1);
+		UT_ASSERT_EQ(memcmp(disk.data, before.data, BLCKSZ), 0);
+		reset_io();
+		UT_ASSERT(replay_v2_record(XLOG_UNDO_TT_SLOT_SET_HEAD, &newer, sizeof(newer)));
+		UT_ASSERT_EQ(writes, 1);
+		UT_ASSERT(cluster_undo_record_uba_equal(slot->first_undo_block, newer.head.first_undo_block));
+		before = disk;
+		reset_io();
+		UT_ASSERT(replay_v2_record(XLOG_UNDO_TT_SLOT_SET_HEAD, &operation, sizeof(operation)));
+		UT_ASSERT_EQ(writes, 0);
+		UT_ASSERT_EQ(syncs, 1);
+		UT_ASSERT_EQ(skips, 1);
+		UT_ASSERT_EQ(memcmp(disk.data, before.data, BLCKSZ), 0);
+	}
+}
+
+UT_TEST(test_operation_v2_native_refuses_bad_control_chain_and_owner_before_write)
+{
+	const uint64 top = (UINT64_C(7) << 32) | 701;
+
+	for (unsigned fault = 0; fault < 14; fault++) {
+		xl_undo_tt_slot_set_head_operation_v2 operation = native_operation(top, 2, 3);
+		UndoRecordHeader *member;
+		UndoSavepointRollbackPayload *control;
+		UndoOperationTrailer *tail;
+		PGAlignedBlock before;
+		TTSlotV2 *slot;
+
+		native_v2_base(top, TT_SLOT_ACTIVE);
+		native_operation_member(1, NULL, (UBA)InvalidUba_init);
+		native_operation_member(2, &operation, uba_encode(513, 1, 4, 0));
+		member = (UndoRecordHeader *)(operation_pages[2].data + sizeof(UndoBlockHeader));
+		control = (UndoSavepointRollbackPayload *)((char *)member + sizeof(*member));
+		tail = (UndoOperationTrailer *)((char *)control + sizeof(*control));
+		slot = &((UndoSegmentHeaderDataV2 *)disk.data)->tt_slots[4];
+		switch (fault) {
+		case 0: tail->canonical_top_fxid ^= UINT64_C(1) << 32; break;
+		case 1: control->phase = UNDO_SAVEPOINT_ROLLBACK_RESERVED; break;
+		case 2: tail->operation_sequence++; break;
+		case 3: member->tt_wrap_plus1++; break;
+		case 4: operation_pages[1].data[0] ^= 1; break;
+		case 5: fail_operation_read = true; break;
+		case 6: drift_operation_header = true; break;
+		case 7: slot->original_full_xid ^= UINT64_C(1) << 32; break;
+		case 8: slot->first_undo_block = uba_encode(513, 4, 4, 0); break;
+		case 9: tail->effect_state = CLUSTER_SAVEPOINT_EFFECT_DISCARDED; break;
+		case 10: control->next_uba = operation.head.first_undo_block; break;
+		case 11: ((UndoBlockHeader *)operation_pages[2].data)->slot_count = 0; break;
+		case 12: member->payload_length--; break;
+		case 13: slot->wrap++; slot->original_full_xid = 0; break;
+		}
+		((PageHeader)disk.data)->pd_checksum = pg_checksum_page(disk.data, 0);
+		before = disk;
+		UT_ASSERT(!replay_v2_record(XLOG_UNDO_TT_SLOT_SET_HEAD, &operation, sizeof(operation)));
+		UT_ASSERT_EQ(writes + syncs + applies + skips, 0);
+		UT_ASSERT_EQ(closes, 1);
+		UT_ASSERT_EQ(memcmp(disk.data, before.data, BLCKSZ), 0);
+	}
+}
+
+UT_TEST(test_operation_v2_native_physical_stale_and_old_format_are_separate)
+{
+	const uint64 top = (UINT64_C(7) << 32) | 701;
+	xl_undo_tt_slot_set_head_operation_v2 operation = native_operation(top, 2, 3);
+	xl_undo_tt_slot_set_head_operation legacy;
+	PGAlignedBlock before;
+
+	UT_ASSERT(cluster_undo_head_operation_v2_project(&operation, &legacy));
+	native_v2_base(top, TT_SLOT_ACTIVE);
+	before = disk;
+	UT_ASSERT_EQ(cluster_tt_durable_set_head_operation_preflight(&legacy),
+		CLUSTER_UNDO_HEAD_OPERATION_BLOCKED);
+	UT_ASSERT_EQ(writes + syncs, 0);
+	UT_ASSERT_EQ(memcmp(disk.data, before.data, BLCKSZ), 0);
+	for (unsigned stale = 0; stale < 3; stale++) {
+		UndoSegmentHeaderDataV2 *header;
+
+		native_v2_base(top, TT_SLOT_ACTIVE);
+		header = (UndoSegmentHeaderDataV2 *)disk.data;
+		if (stale == 0) header->wrap_count++;
+		if (stale == 1) header->tt_slots[4].wrap++;
+		if (stale == 2) header->tt_slots[4].status = TT_SLOT_ABORTED;
+		header->pd_checksum = pg_checksum_page(disk.data, 0);
+		before = disk;
+		UT_ASSERT(replay_v2_record(XLOG_UNDO_TT_SLOT_SET_HEAD, &operation, sizeof(operation)));
+		UT_ASSERT_EQ(operation_data_reads + writes, 0);
+		UT_ASSERT_EQ(syncs, 1);
+		UT_ASSERT_EQ(skips, 1);
+		UT_ASSERT_EQ(memcmp(disk.data, before.data, BLCKSZ), 0);
+	}
+}
+
+UT_TEST(test_legacy_operation80_retains_original_control_and_tt32_owner)
+{
+	const uint64 top = (UINT64_C(7) << 32) | 701;
+	xl_undo_tt_slot_set_head_operation_v2 v2 = native_operation(top, 2, 3);
+	xl_undo_tt_slot_set_head_operation legacy;
+	UndoSegmentHeaderData *header = (UndoSegmentHeaderData *)disk.data;
+	PGAlignedBlock expected;
+
+	UT_ASSERT(cluster_undo_head_operation_v2_project(&v2, &legacy));
+	cluster_undo_segment_make_header_bytes(513, 3, disk.data);
+	header->wrap_count = 9;
+	header->tt_slots[4].status = TT_SLOT_ACTIVE;
+	header->tt_slots[4].xid = 701;
+	header->tt_slots[4].wrap = 2;
+	native_operation_member(1, NULL, (UBA)InvalidUba_init);
+	native_operation_member(2, &v2, uba_encode(513, 1, 4, 0));
+	expected = disk;
+	((UndoSegmentHeaderData *)expected.data)->tt_slots[4].first_undo_block
+		= v2.head.first_undo_block;
+	reset_io();
+	cluster_tt_durable_redo_set_head_operation(&legacy);
+	UT_ASSERT_EQ(writes, 1);
+	UT_ASSERT_EQ(syncs, 1);
+	UT_ASSERT_EQ(applies, 1);
+	UT_ASSERT_EQ(memcmp(disk.data, expected.data, BLCKSZ), 0);
+	UT_ASSERT_EQ(memcmp(durable.data, expected.data, BLCKSZ), 0);
+	reset_io();
+	cluster_tt_durable_redo_set_head_operation(&legacy);
+	UT_ASSERT_EQ(writes, 0);
+	UT_ASSERT_EQ(syncs, 1);
+	UT_ASSERT_EQ(skips, 1);
+	UT_ASSERT_EQ(memcmp(disk.data, expected.data, BLCKSZ), 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(26);
+	UT_PLAN(30);
 	UT_RUN(test_native_exact_commit_rejects_bad_header_before_write);
 	UT_RUN(test_private_abort_head_release_and_exact_stale_results);
 	UT_RUN(test_native_bind_uses_complete_header_identity_and_durable_slot);
@@ -1436,6 +1715,10 @@ main(void)
 	UT_RUN(test_native_v2_reuse_generation_and_format_are_exact);
 	UT_RUN(test_native_v2_recycle_keeps_all_full_xids_and_checks_readback);
 	UT_RUN(test_prepared_v2_abort_head_prefix_replay_preserves_original_head);
+	UT_RUN(test_operation_v2_native_control_and_exact_ancestry_keep_tt40_identity);
+	UT_RUN(test_operation_v2_native_refuses_bad_control_chain_and_owner_before_write);
+	UT_RUN(test_operation_v2_native_physical_stale_and_old_format_are_separate);
+	UT_RUN(test_legacy_operation80_retains_original_control_and_tt32_owner);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

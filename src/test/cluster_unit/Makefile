@@ -3535,7 +3535,7 @@ test_cluster_undo_tt_transition.inc: $(top_srcdir)/src/backend/cluster/cluster_t
 test_cluster_undo_producer_owner.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_xlog.c Makefile
 	awk '/^(cluster_undo_emit_[a-z_0-9]+|cluster_hw_emit_reserve|cluster_undo_xlog_insert_tt_ctrc_release(_v2)?)\(/ \
 	     { print "XLogRecPtr"; emit=1; found++ } emit { print } /^}/ { emit=0 } \
-	     END { if (found != 17) exit 1 }' $< > $@.tmp
+	     END { if (found != 18) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_undo_block_native.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_xlog.c Makefile
@@ -3557,6 +3557,25 @@ test_cluster_undo_bind_native.inc: $(top_srcdir)/src/backend/cluster/storage/clu
 test_cluster_undo_dispatch_native.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_xlog.c Makefile
 	awk '/^cluster_undo_redo\(/ { print "void"; emit=1; found++ } \
 	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Direct header dependencies for the shared explicit operation/control ABI.
+UNDO_OPERATION_HEADER_DEPS = $(top_srcdir)/src/include/cluster/cluster_undo_record.h \
+	$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h \
+	$(top_srcdir)/src/include/cluster/cluster_side_undo.h
+cluster_unit_port_stubs.o test_cluster_side_xact_undo_product.o \
+		test_cluster_undo_desc_product.o test_cluster_undo_native_lifecycle \
+		test_cluster_undo_producer test_cluster_side_undo: $(UNDO_OPERATION_HEADER_DEPS)
+
+# The retained control/complete ancestry algorithm is the production body;
+# only the original physical smgr/syscall boundaries are supplied by the fixture.
+test_cluster_undo_head_operation_native.inc: $(top_srcdir)/src/backend/cluster/cluster_tt_durable.c Makefile
+	awk '/^tt_slot_file_offset\(/ { print "static inline uint32"; emit=1; found++ } \
+	     /^tt_head_operation_(member_payload|read_member|walk)\(/ { print "static bool"; emit=1; found++ } \
+	     /^tt_head_operation_(existing_order|target)\(/ { print "static ClusterUndoHeadOperationDecision"; emit=1; found++ } \
+	     /^cluster_tt_durable_set_head_operation(_v2)?_preflight\(/ { print "ClusterUndoHeadOperationDecision"; emit=1; found++ } \
+	     /^cluster_tt_durable_redo_set_head_operation\(/ { print "void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 9) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_undo_tt_v2_native.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_xlog.c Makefile
@@ -3600,10 +3619,11 @@ test_cluster_undo_recovery: test_cluster_undo_recovery.c unit_test.h \
 		$(top_builddir)/src/backend/cluster/cluster_undo_resid.o $(CLUSTER_UNIT_PORT_LIBS) \
 		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
-test_cluster_undo_native_lifecycle: test_cluster_undo_native_lifecycle.c unit_test.h \
+test_cluster_undo_native_lifecycle: test_cluster_undo_native_lifecycle.c unit_test.h $(CLUSTER_UBA_O) \
 		test_cluster_undo_lifecycle_native.inc test_cluster_undo_header_identity.inc \
 		test_cluster_undo_bind_native.inc test_cluster_undo_dispatch_native.inc \
-		test_cluster_undo_tt_v2_native.inc \
+		test_cluster_undo_tt_v2_native.inc test_cluster_undo_head_operation_native.inc \
+		test_cluster_heap_small_scn.inc \
 		$(top_srcdir)/src/include/access/xact.h \
 		$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h \
 		$(top_srcdir)/src/include/cluster/cluster_side_undo.h \
@@ -3615,10 +3635,10 @@ test_cluster_undo_native_lifecycle: test_cluster_undo_native_lifecycle.c unit_te
 		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) \
 		$(top_builddir)/src/backend/storage/page/checksum.o \
 		test_cluster_undo_segment_init_backend.o \
-		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UBA_O) $(CLUSTER_UNIT_PORT_LIBS) \
 		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
-test_cluster_undo_producer: test_cluster_undo_producer.c unit_test.h \
+test_cluster_undo_producer: test_cluster_undo_producer.c unit_test.h $(CLUSTER_UBA_O) \
 		test_cluster_undo_producer_owner.inc test_cluster_undo_block_native.inc \
 		$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h \
 		$(top_srcdir)/src/include/cluster/cluster_side_undo.h \
@@ -3626,10 +3646,10 @@ test_cluster_undo_producer: test_cluster_undo_producer.c unit_test.h \
 		xlogreader_fs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_side_xact_undo_product.o \
 		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) xlogreader_fs.o \
-		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UBA_O) $(CLUSTER_UNIT_PORT_LIBS) \
 		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -lssl -lcrypto $(filter -llz4 -lzstd,$(LIBS)) -o $@
 
-test_cluster_side_undo: test_cluster_side_undo.c unit_test.h \
+test_cluster_side_undo: test_cluster_side_undo.c unit_test.h $(CLUSTER_UBA_O) \
 		$(top_srcdir)/src/include/cluster/cluster_side_undo.h \
 		$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h \
 		test_cluster_undo_desc_product.o \
@@ -3640,7 +3660,7 @@ test_cluster_side_undo: test_cluster_side_undo.c unit_test.h \
 		$(CLUSTER_RF_ROUTE_O) test_cluster_undo_desc_product.o \
 		test_cluster_undo_segment_init_backend.o \
 		$(top_builddir)/src/common/libpgcommon.a \
-		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+		$(CLUSTER_UBA_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 test_cluster_undo_desc_product.o: $(top_srcdir)/src/backend/access/rmgrdesc/clusterundodesc.c \
 		$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h
@@ -5499,6 +5519,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_space_extend.inc test_cluster_space_extend_finish.inc test_cluster_space_extend_resize.inc test_cluster_space_extend_zero.inc test_cluster_space_extend_handoff.inc
 	rm -f test_cluster_undo_producer_owner.inc test_cluster_undo_block_native.inc
 	rm -f test_cluster_undo_lifecycle_native.inc test_cluster_undo_header_identity.inc
+	rm -f test_cluster_undo_head_operation_native.inc
 	rm -f test_cluster_undo_bind_native.inc test_cluster_undo_tt_transition.inc
 	rm -f test_cluster_undo_path_native.inc test_cluster_undo_fd_native.inc test_cluster_undo_dir_native.inc
 	rm -f test_cluster_heap_lock_vm_needed.inc

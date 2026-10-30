@@ -25,6 +25,7 @@ UT_DEFINE_GLOBALS();
 
 static char payload[BLCKSZ + 256];
 static uint32 payload_length;
+static uint32 inserts_begun;
 static RmgrId emitted_rmid;
 static uint8 emitted_info;
 static bool writeback, full_page_writes;
@@ -46,6 +47,7 @@ ExceptionalCondition(const char *condition, const char *file, int line)
 void
 XLogBeginInsert(void)
 {
+	inserts_begun++;
 	payload_length = 0;
 	memset(payload, 0, sizeof(payload));
 }
@@ -741,10 +743,91 @@ UT_TEST(test_v2_prepared_emitters_reject_bad_identity_scn_or_head_before_insert)
 	}
 }
 
+static xl_undo_tt_slot_set_head_operation_v2
+producer_operation(uint64 top)
+{
+	xl_undo_tt_slot_set_head_operation_v2 record = { 0 };
+
+	record.head.identity.segment_id = 513;
+	record.head.identity.segment_generation = 9;
+	record.head.identity.xid = (TransactionId)top;
+	record.head.identity.slot_offset = 4;
+	record.head.identity.wrap = 7;
+	record.head.identity.instance = 3;
+	record.head.identity.format_version = CLUSTER_UNDO_TT_IDENTITY_V2_VERSION;
+	record.head.identity.flags = CLUSTER_UNDO_TT_SET_HEAD_OPERATION_FLAG;
+	record.head.identity.original_full_xid = top;
+	/* A retained data segment may differ from the canonical TT segment. */
+	record.head.first_undo_block = uba_encode(514, 2, 4, 0);
+	record.operation.version = UNDO_OPERATION_TRAILER_VERSION;
+	record.operation.length = UNDO_OPERATION_TRAILER_LENGTH;
+	record.operation.effect_state = CLUSTER_SAVEPOINT_EFFECT_LIVE;
+	record.operation.canonical_top_fxid = top;
+	record.operation.operation_fxid = top + 1;
+	record.operation.operation_sequence = 3;
+	record.operation.canonical_segment_generation = 9;
+	record.operation.command_id = 7;
+	record.operation.subid = 2;
+	return record;
+}
+
+UT_TEST(test_operation_v2_producer_preserves_96_bytes_through_native_wal_decode)
+{
+	const uint64 tops[] = { 801, (UINT64_C(7) << 32) | 801 };
+
+	for (Size i = 0; i < lengthof(tops); i++) {
+		xl_undo_tt_slot_set_head_operation_v2 record = producer_operation(tops[i]);
+		ClusterUndoDecoded decoded;
+
+		UT_ASSERT_EQ(cluster_undo_emit_tt_slot_set_head_operation_v2(&record), 0x900);
+		UT_ASSERT_EQ(payload_length, 96);
+		UT_ASSERT_EQ(emitted_info, XLOG_UNDO_TT_SLOT_SET_HEAD);
+		UT_ASSERT_EQ(memcmp(payload, &record, sizeof(record)), 0);
+		decoded = decode_emitted(false);
+		UT_ASSERT(cluster_undo_preflight_tt_v2(&decoded));
+		UT_ASSERT_EQ(decoded.original_full_xid, tops[i]);
+		UT_ASSERT_EQ(decoded.head_operation.operation_fxid, tops[i] + 1);
+		UT_ASSERT_EQ(memcmp(&decoded.head_operation, &record.operation, 48), 0);
+	}
+}
+
+UT_TEST(test_operation_v2_producer_refuses_before_any_wal_insertion)
+{
+	const uint64 top = (UINT64_C(7) << 32) | 801;
+
+	for (unsigned fault = 0; fault < 13; fault++) {
+		xl_undo_tt_slot_set_head_operation_v2 record = producer_operation(top);
+		uint32 prior = inserts_begun;
+
+		switch (fault) {
+		case 0: record.head.identity.original_full_xid ^= UINT64_C(1) << 32; break;
+		case 1: record.operation.operation_fxid = top; break;
+		case 2: record.operation.canonical_top_fxid ^= UINT64_C(1) << 32; break;
+		case 3: record.head.identity.flags = 0; break;
+		case 4: record.head.identity.reserved = 1; break;
+		case 5: record.head.identity.format_version = 3; break;
+		case 6: record.head.identity.segment_generation++; break;
+		case 7: record.operation.effect_state = CLUSTER_SAVEPOINT_EFFECT_DISCARDED; break;
+		case 8: record.operation.reserved_end = 1; break;
+		case 9: record.head.first_undo_block = uba_encode(1, 2, 4, 0); break;
+		case 10: record.operation.operation_sequence = 0; break;
+		case 11: record.operation.version++; break;
+		case 12: break; /* NULL */
+		}
+		expect_panic = true;
+		if (setjmp(panic_jump) == 0) {
+			cluster_undo_emit_tt_slot_set_head_operation_v2(fault == 12 ? NULL : &record);
+			UT_ASSERT(false);
+		}
+		expect_panic = false;
+		UT_ASSERT_EQ(inserts_begun, prior);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(16);
 	UT_RUN(test_segment_lifecycle_producer_payloads);
 	UT_RUN(test_tt_producer_identity_and_polarity);
 	UT_RUN(test_ctrc_release_producer_certificate);
@@ -759,6 +842,8 @@ main(void)
 	UT_RUN(test_v2_abort_producer_preserves_original_identity_and_rejects_before_insert);
 	UT_RUN(test_v2_prepared_commit_and_head_producers_reach_original_decoder);
 	UT_RUN(test_v2_prepared_emitters_reject_bad_identity_scn_or_head_before_insert);
+	UT_RUN(test_operation_v2_producer_preserves_96_bytes_through_native_wal_decode);
+	UT_RUN(test_operation_v2_producer_refuses_before_any_wal_insertion);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

@@ -189,6 +189,40 @@ cluster_undo_desc(StringInfo buf, XLogReaderState *record)
 	case XLOG_UNDO_TT_SLOT_SET_HEAD: {
 		xl_undo_tt_slot_set_head rec;
 
+		if (XLogRecGetDataLen(record) == sizeof(xl_undo_tt_slot_set_head_operation_v2)) {
+			xl_undo_tt_slot_set_head_operation_v2 v2;
+
+			if (!cluster_undo_tt_set_head_operation_v2_decode(payload,
+														 XLogRecGetDataLen(record), &v2))
+				appendStringInfoString(buf, "malformed TT operation SET_HEAD V2 payload");
+			else
+				appendStringInfo(buf,
+					"instance %u segment %u generation %u slot %u wrap %u xid %u original_full_xid " UINT64_FORMAT
+					" operation_full_xid " UINT64_FORMAT " sequence " UINT64_FORMAT " (set operation undo head v2)",
+					(unsigned)v2.head.identity.instance, (unsigned)v2.head.identity.segment_id,
+					(unsigned)v2.head.identity.segment_generation,
+					(unsigned)v2.head.identity.slot_offset, (unsigned)v2.head.identity.wrap,
+					(unsigned)v2.head.identity.xid, v2.head.identity.original_full_xid,
+					v2.operation.operation_fxid, v2.operation.operation_sequence);
+			break;
+		}
+		if (XLogRecGetDataLen(record) == sizeof(xl_undo_tt_slot_set_head_operation)) {
+			xl_undo_tt_slot_set_head_operation operation;
+
+			memcpy(&operation, payload, sizeof(operation));
+			if (!cluster_undo_head_operation_valid(&operation))
+				appendStringInfoString(buf, "malformed TT operation SET_HEAD payload");
+			else
+				appendStringInfo(buf,
+					"instance %u segment %u slot %u wrap %u xid %u canonical_top_fxid " UINT64_FORMAT
+					" operation_full_xid " UINT64_FORMAT " sequence " UINT64_FORMAT " (set operation undo head)",
+					(unsigned)operation.head.instance, (unsigned)operation.head.segment_id,
+					(unsigned)operation.head.slot_offset, (unsigned)operation.head.wrap,
+					(unsigned)operation.head.xid, operation.operation.canonical_top_fxid,
+					operation.operation.operation_fxid, operation.operation.operation_sequence);
+			break;
+		}
+
 		if (XLogRecGetDataLen(record) == sizeof(xl_undo_tt_slot_set_head_v2)) {
 			xl_undo_tt_slot_set_head_v2 v2;
 

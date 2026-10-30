@@ -15,6 +15,7 @@
 #include "postgres.h"
 #include "cluster/cluster_visibility_trace_filter.h"
 #include "cluster/cluster_uba.h"
+#include "cluster/storage/cluster_undo_xlog.h"
 #include "cluster/cluster_update_trace.h"
 #include "cluster/cluster_xnode_profile.h"
 #include "cluster/cluster_storage_quorum.h"
@@ -134,6 +135,22 @@ cluster_tt_local_get_published_binding(TransactionId xid, ClusterCanonicalTxnBin
 }
 __attribute__((weak)) bool
 HeapTupleHeaderCommandIdIsAvailable(HeapTupleHeader tuple)
+{
+	abort();
+}
+
+/* Physical operation replay is never a successful unit-test fallback.
+ * The native lifecycle target supplies the actual retained-chain owner. */
+ClusterUndoHeadOperationDecision __attribute__((weak))
+cluster_tt_durable_set_head_operation_preflight(
+	const xl_undo_tt_slot_set_head_operation *record pg_attribute_unused())
+{
+	abort();
+}
+
+void __attribute__((weak))
+cluster_tt_durable_redo_set_head_operation(
+	const xl_undo_tt_slot_set_head_operation *record pg_attribute_unused())
 {
 	abort();
 }

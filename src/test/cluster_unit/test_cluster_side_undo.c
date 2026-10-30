@@ -1665,10 +1665,190 @@ UT_TEST(test_tt40_refuses_malformed_decoded_fields_and_preserves_caller_buffers)
 	}
 }
 
+/* Literal wire construction keeps the TT identity independent of the child. */
+static void
+make_operation_head_v2_payload(uint8 bytes[96], uint64 top)
+{
+	const uint16 flag = 1, version = 1, length = 48;
+	const uint64 child = top + 1, sequence = 3;
+	const uint32 generation = 9, cid = 7, subid = 2;
+	UBA head = { { 7 | (UINT64_C(9) << 32), 3 } };
+
+	memset(bytes, 0, 96);
+	make_bind_v2_payload(bytes, top);
+	memcpy(bytes + 18, &flag, 2);
+	memcpy(bytes + 32, &head, 16);
+	memcpy(bytes + 48, &version, 2);
+	memcpy(bytes + 50, &length, 2);
+	bytes[52] = 1;
+	memcpy(bytes + 56, &top, 8);
+	memcpy(bytes + 64, &child, 8);
+	memcpy(bytes + 72, &sequence, 8);
+	memcpy(bytes + 80, &generation, 4);
+	memcpy(bytes + 84, &cid, 4);
+	memcpy(bytes + 88, &subid, 4);
+}
+
+UT_TEST(test_operation_head_v2_decodes_original_top_not_child)
+{
+	const uint64 tops[] = { 1234, (UINT64_C(7) << 32) | 1234 };
+	FakeRecord fr;
+	uint8 bytes[97];
+	ClusterUndoDecoded decoded;
+
+	for (Size i = 0; i < lengthof(tops); i++) {
+		make_operation_head_v2_payload(bytes + 1, tops[i]);
+		UT_ASSERT(cluster_undo_decode(make_record(&fr, RM_CLUSTER_UNDO_ID,
+			XLOG_UNDO_TT_SLOT_SET_HEAD, bytes + 1, 96), &decoded));
+		UT_ASSERT_EQ(decoded.original_full_xid, tops[i]);
+		UT_ASSERT_EQ(decoded.format_version, 2);
+		UT_ASSERT_EQ(decoded.flags, 1);
+		UT_ASSERT_EQ(decoded.expected_generation, 9);
+		UT_ASSERT(cluster_undo_preflight_tt_v2(&decoded));
+		UT_ASSERT(!cluster_undo_preflight(&decoded));
+		UT_ASSERT(!cluster_undo_inspect_pi(&decoded));
+	}
+}
+
+UT_TEST(test_operation_head_v2_changes_only_exact_active_tt40_head)
+{
+	const uint64 top = (UINT64_C(7) << 32) | 1234;
+	PGAlignedBlock base, expected, out;
+	FakeRecord fr;
+	uint8 bytes[96];
+	ClusterUndoDecoded decoded;
+	TTSlotV2 *slot;
+
+	make_tt40_base(&base, top, TT_SLOT_ACTIVE);
+	expected = base;
+	slot = &((UndoSegmentHeaderDataV2 *)expected.data)->tt_slots[3];
+	make_operation_head_v2_payload(bytes, top);
+	memcpy(&slot->first_undo_block, bytes + 32, 16);
+	UT_ASSERT(cluster_undo_decode(make_record(&fr, RM_CLUSTER_UNDO_ID,
+		XLOG_UNDO_TT_SLOT_SET_HEAD, bytes, 96), &decoded));
+	memset(out.data, 0x5c, BLCKSZ);
+	UT_ASSERT_EQ(cluster_undo_prepare_header_v1(&decoded, NULL, 0, base.data, out.data),
+		CLUSTER_UNDO_HEADER_APPLY);
+	UT_ASSERT_EQ(memcmp(out.data, expected.data, BLCKSZ), 0);
+	base = out;
+	memset(out.data, 0x5c, BLCKSZ);
+	UT_ASSERT_EQ(cluster_undo_prepare_header_v1(&decoded, NULL, 0, base.data, out.data),
+		CLUSTER_UNDO_HEADER_ALREADY);
+	for (Size i = 0; i < BLCKSZ; i++) UT_ASSERT_EQ((uint8)out.data[i], 0x5c);
+	((UndoSegmentHeaderDataV2 *)base.data)->tt_slots[3].original_full_xid ^= UINT64_C(1) << 32;
+	UT_ASSERT_EQ(cluster_undo_prepare_header_v1(&decoded, NULL, 0, base.data, out.data),
+		CLUSTER_UNDO_HEADER_BLOCKED);
+}
+
+
+UT_TEST(test_operation_head_v2_rejects_wrong_version_top_generation_or_tail)
+{
+	const uint64 top = (UINT64_C(7) << 32) | 1234;
+	FakeRecord fr;
+
+	for (unsigned fault = 0; fault < 18; fault++) {
+		uint8 bytes[97] = { 0 };
+		ClusterUndoDecoded decoded;
+		uint64 different = top ^ (UINT64_C(1) << 32);
+		Size length = 96;
+
+		make_operation_head_v2_payload(bytes + 1, top);
+		switch (fault) {
+		case 0: bytes[1 + 17] = 1; break;
+		case 1: bytes[1 + 18] = 0; break;
+		case 2: bytes[1 + 19] = 1; break;
+		case 3: bytes[1 + 20] = 1; break;
+		case 4: memcpy(bytes + 1 + 24, &different, 8); break;
+		case 5: memcpy(bytes + 1 + 56, &different, 8); break;
+		case 6: bytes[1 + 48] = 2; break;
+		case 7: bytes[1 + 50] = 47; break;
+		case 8: bytes[1 + 52] = CLUSTER_SAVEPOINT_EFFECT_DISCARDED; break;
+		case 9: bytes[1 + 53] = 1; break;
+		case 10: memset(bytes + 1 + 72, 0, 8); break;
+		case 11: bytes[1 + 80]++; break;
+		case 12: bytes[1 + 92] = 1; break;
+		case 13: memcpy(bytes + 1 + 64, &top, 8); break;
+		case 14: bytes[1 + 88] = TopSubTransactionId; break;
+		case 15: length = 95; break;
+		case 16: length = 80; break;
+		case 17: length = 48; break;
+		}
+		UT_ASSERT(!cluster_undo_decode(make_record(&fr, RM_CLUSTER_UNDO_ID,
+			XLOG_UNDO_TT_SLOT_SET_HEAD, bytes + 1, length), &decoded));
+	}
+}
+
+UT_TEST(test_operation_head_legacy80_and_tt40_96_remain_explicit)
+{
+	const uint64 top = (UINT64_C(7) << 32) | 1234;
+	xl_undo_tt_slot_set_head_operation_v2 record;
+	xl_undo_tt_slot_set_head_operation legacy;
+	uint8 bytes[97];
+	FakeRecord fr;
+	ClusterUndoDecoded decoded;
+	PGAlignedBlock base, output;
+
+	make_operation_head_v2_payload(bytes + 1, top);
+	UT_ASSERT(cluster_undo_tt_set_head_operation_v2_decode(bytes + 1, 96, &record));
+	UT_ASSERT(cluster_undo_head_operation_v2_project(&record, &legacy));
+	memcpy(bytes + 1, &legacy, sizeof(legacy));
+	UT_ASSERT(cluster_undo_decode(make_record(&fr, RM_CLUSTER_UNDO_ID,
+		XLOG_UNDO_TT_SLOT_SET_HEAD, bytes + 1, sizeof(legacy)), &decoded));
+	UT_ASSERT_EQ(decoded.format_version, 0);
+	UT_ASSERT_EQ(decoded.original_full_xid, 0);
+	UT_ASSERT_EQ(decoded.head_operation.canonical_top_fxid, top);
+	UT_ASSERT(cluster_undo_preflight(&decoded));
+	UT_ASSERT(!cluster_undo_preflight_tt_v2(&decoded));
+	make_tt40_base(&base, top, TT_SLOT_ACTIVE);
+	memset(output.data, 0x6e, BLCKSZ);
+	UT_ASSERT_EQ(cluster_undo_prepare_header_v1(&decoded, NULL, 0, base.data, output.data),
+		CLUSTER_UNDO_HEADER_BLOCKED);
+	for (Size i = 0; i < BLCKSZ; i++) UT_ASSERT_EQ((uint8)output.data[i], 0x6e);
+	UT_ASSERT(!cluster_undo_decode(make_record(&fr, RM_CLUSTER_UNDO_ID,
+		XLOG_UNDO_TT_SLOT_SET_HEAD, bytes + 1, sizeof(legacy.head)), &decoded));
+	legacy.head._pad[0] = 0;
+	UT_ASSERT(!cluster_undo_decode(make_record(&fr, RM_CLUSTER_UNDO_ID,
+		XLOG_UNDO_TT_SLOT_SET_HEAD, &legacy, sizeof(legacy)), &decoded));
+}
+
+UT_TEST(test_operation_head_descriptors_keep_top_child_and_explicit_version)
+{
+	const uint64 top = (UINT64_C(7) << 32) | 1234;
+	uint8 bytes[97];
+	FakeRecord fr;
+	xl_undo_tt_slot_set_head_operation_v2 record;
+	xl_undo_tt_slot_set_head_operation legacy;
+	char text[512], expected[64];
+	StringInfoData buf = { .data = text, .maxlen = sizeof(text) };
+
+	make_operation_head_v2_payload(bytes + 1, top);
+	resetStringInfo(&buf);
+	cluster_undo_desc(&buf, make_record(&fr, RM_CLUSTER_UNDO_ID,
+		XLOG_UNDO_TT_SLOT_SET_HEAD, bytes + 1, 96));
+	snprintf(expected, sizeof(expected), "original_full_xid " UINT64_FORMAT, top);
+	UT_ASSERT(strstr(text, expected) != NULL);
+	snprintf(expected, sizeof(expected), "operation_full_xid " UINT64_FORMAT, top + 1);
+	UT_ASSERT(strstr(text, expected) != NULL);
+	UT_ASSERT(strstr(text, "sequence 3 (set operation undo head v2)") != NULL);
+	UT_ASSERT(cluster_undo_tt_set_head_operation_v2_decode(bytes + 1, 96, &record));
+	UT_ASSERT(cluster_undo_head_operation_v2_project(&record, &legacy));
+	resetStringInfo(&buf);
+	cluster_undo_desc(&buf, make_record(&fr, RM_CLUSTER_UNDO_ID,
+		XLOG_UNDO_TT_SLOT_SET_HEAD, &legacy, sizeof(legacy)));
+	UT_ASSERT(strstr(text, expected) != NULL);
+	UT_ASSERT(strstr(text, "original_full_xid") == NULL);
+	bytes[1 + 18] = 0;
+	resetStringInfo(&buf);
+	cluster_undo_desc(&buf, make_record(&fr, RM_CLUSTER_UNDO_ID,
+		XLOG_UNDO_TT_SLOT_SET_HEAD, bytes + 1, 96));
+	UT_ASSERT(strstr(text, "malformed") != NULL);
+	UT_ASSERT(strstr(text, "original_full_xid") == NULL);
+}
+
 int
 main(void)
 {
-	UT_PLAN(34);
+	UT_PLAN(39);
 
 	UT_RUN(test_decode_tt_commit_fields);
 	UT_RUN(test_decode_tt_bind_exact_shape_and_reserved_bytes);
@@ -1704,6 +1884,12 @@ main(void)
 	UT_RUN(test_tt40_bind_reuse_uses_original_wrap_transition_and_replaces_only_at_bind);
 	UT_RUN(test_folded_v2_prepares_exact_tt40_successor_without_raw_backfill);
 	UT_RUN(test_tt40_refuses_malformed_decoded_fields_and_preserves_caller_buffers);
+
+	UT_RUN(test_operation_head_v2_decodes_original_top_not_child);
+	UT_RUN(test_operation_head_v2_changes_only_exact_active_tt40_head);
+	UT_RUN(test_operation_head_v2_rejects_wrong_version_top_generation_or_tail);
+	UT_RUN(test_operation_head_legacy80_and_tt40_96_remain_explicit);
+	UT_RUN(test_operation_head_descriptors_keep_top_child_and_explicit_version);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
