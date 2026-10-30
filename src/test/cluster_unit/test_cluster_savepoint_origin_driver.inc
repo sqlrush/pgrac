@@ -509,3 +509,156 @@ UT_TEST(test_operation_own_top_head_error_cleanup_and_old_entry_refusal)
 		operation_driver_assert_refused(&f);
 	}
 }
+
+static ClusterTxOutcome
+operation_retained_head_read(OperationPlanFixture *f, const ClusterItlSlotData *head,
+							 const BufferTag *tag, const ClusterSavepointReaderIdentity *retained,
+							 ClusterSavepointReaderIdentity *identity)
+{
+	return cluster_runtime_visibility_resolve_retained_operation_head_origin_admitted(
+		&test_origin_locator, head, tag, retained, CLUSTER_TX_RESOLVE_VISIBILITY, &f->admission,
+		identity, &f->top, &f->operation, f->output.data, &f->reason);
+}
+
+/* First qualify an actual operation. The older V1 occupies another DATA row,
+ * and keeps that canonical generation/FullXid challenge without publication. */
+static void
+operation_retained_head_init(OperationPlanFixture *f, bool same, ClusterItlSlotData *head,
+							 BufferTag *tag, ClusterSavepointReaderIdentity *retained)
+{
+	ClusterSavepointReaderIdentity first;
+	UndoBlockHeader *block;
+	UndoRecordHeader *record;
+	UndoSlotDirEntry *slot;
+	UndoItlHistoryTrailer history;
+
+	operation_driver_init(f, same);
+	test_origin_locator.itl_slot_index = 2;
+	*tag = (BufferTag){ .spcOid = 1663,
+						.dbOid = 42,
+						.relNumber = 77,
+						.forkNum = MAIN_FORKNUM,
+						.blockNum = 23 };
+	*head = (ClusterItlSlotData){ .xid = TEST_ORIGIN_XID,
+								  .wrap = 8,
+								  .flags = ITL_FLAG_ACTIVE,
+								  .write_scn = scn_encode(0, 70),
+								  .undo_segment_head = test_origin_locator.uba };
+	UT_ASSERT_EQ(operation_retained_head_read(f, head, tag, NULL, &first), CLUSTER_TX_COMMITTED);
+	UT_ASSERT_EQ(test_candidate_acquire_calls, 3);
+	UT_ASSERT_EQ(test_candidate_release_calls, 3);
+	*retained = first;
+	retained->operation_fxid = first.top_fxid;
+	retained->operation_sequence = 0;
+	retained->command_id = InvalidCommandId;
+	retained->subid = TopSubTransactionId;
+	block = (UndoBlockHeader *)test_operation_page.data;
+	slot = (UndoSlotDirEntry *)(test_operation_page.data + BLCKSZ - sizeof(*slot));
+	memcpy(test_operation_page.data + 1024, test_operation_page.data + sizeof(*block),
+		   slot->record_length);
+	slot--;
+	*slot = *(slot + 1);
+	slot->record_offset = 1024;
+	slot->record_length -= sizeof(UndoOperationTrailer);
+	slot->flags &= ~UNDO_REC_FLAG_HAS_OPERATION;
+	record = (UndoRecordHeader *)(test_operation_page.data + 1024);
+	record->flags = slot->flags;
+	record->xid = TEST_ORIGIN_XID;
+	record->payload_length -= sizeof(UndoOperationTrailer);
+	record->write_scn = scn_encode(0, 69);
+	memcpy(&history, (char *)(record + 1) + sizeof(UndoInsertPayload), sizeof(history));
+	history.entries[0].after_write_scn = record->write_scn;
+	memcpy((char *)(record + 1) + sizeof(UndoInsertPayload), &history, sizeof(history));
+	block->slot_count = 2;
+	block->free_offset = 1024 + slot->record_length;
+	test_origin_locator.uba = uba_encode(TEST_RECORD_SEGMENT, 7, TEST_TT_OFFSET, 1);
+	test_origin_locator.tt_wrap = retained->canonical.wrap;
+	head->undo_segment_head = test_origin_locator.uba;
+	head->write_scn = record->write_scn;
+	memset(f->output.data, 0xa5, BLCKSZ);
+}
+
+UT_TEST(test_operation_retained_blocking_head_repeats_three_current_phases)
+{
+	for (int same = 0; same < 2; same++) {
+		OperationPlanFixture f;
+		ClusterItlSlotData head;
+		BufferTag tag;
+		ClusterSavepointReaderIdentity retained, identity;
+
+		operation_retained_head_init(&f, same, &head, &tag, &retained);
+		UT_ASSERT_EQ(operation_retained_head_read(&f, &head, &tag, &retained, &identity),
+					 CLUSTER_TX_COMMITTED);
+		UT_ASSERT_EQ(identity.operation_sequence, 0);
+		UT_ASSERT(FullTransactionIdEquals(identity.top_fxid, retained.top_fxid));
+		UT_ASSERT_EQ(identity.canonical_generation, same ? 17 : 23);
+		UT_ASSERT_EQ(test_candidate_acquire_calls, 6);
+		UT_ASSERT_EQ(test_candidate_release_calls, 6);
+		UT_ASSERT_EQ(test_candidate_max_held_count, 1);
+		UT_ASSERT_EQ(test_candidate_held_count, 0);
+		UT_ASSERT_EQ(test_operation_pin_depth, 0);
+		UT_ASSERT_EQ(test_candidate_cancel_calls, 0);
+		UT_ASSERT_EQ(memcmp(f.output.data, test_operation_page.data, BLCKSZ), 0);
+	}
+}
+
+UT_TEST(test_operation_retained_blocking_refusal_and_error_cleanup)
+{
+	for (int same = 0; same < 2; same++)
+		for (int fault = 0; fault < 14; fault++) {
+			OperationPlanFixture f;
+			ClusterItlSlotData head;
+			BufferTag tag;
+			ClusterSavepointReaderIdentity retained, identity;
+			volatile bool caught = false;
+			volatile ClusterTxOutcome outcome = CLUSTER_TX_UNKNOWN;
+
+			operation_retained_head_init(&f, same, &head, &tag, &retained);
+			if (fault == 0)
+				retained.canonical_generation++;
+			if (fault == 1)
+				retained.top_fxid.value++, retained.operation_fxid.value++;
+			if (fault == 2)
+				retained.canonical.wrap++;
+			if (fault == 3)
+				retained.canonical.xid++;
+			if (fault == 4)
+				retained.canonical.slot_offset++;
+			if (fault == 5)
+				retained.command_id = 8;
+			if (fault == 6)
+				tag.relNumber++;
+			if (fault == 7)
+				head.write_scn++;
+			if (fault >= 8) {
+				operation_driver_action = fault == 8 || (fault == 9 && same) ? 3
+										  : fault == 9						 ? 8
+										  : fault == 10						 ? 4
+																			 : 9;
+				operation_driver_action_release = fault == 9 ? 4 : fault < 11 ? 5 : fault - 7;
+			}
+			PG_TRY();
+			{
+				outcome = operation_retained_head_read(&f, &head, &tag, &retained, &identity);
+			}
+			PG_CATCH();
+			{
+				caught = true;
+			}
+			PG_END_TRY();
+			if (caught != (fault >= 11) || outcome != CLUSTER_TX_UNKNOWN)
+				printf("# retained same=%d fault=%d outcome=%d caught=%d releases=%d\n", same,
+					   fault, outcome, caught, test_candidate_release_calls);
+			UT_ASSERT_EQ(caught, fault >= 11);
+			UT_ASSERT_EQ(outcome, CLUSTER_TX_UNKNOWN);
+			if (caught)
+				f.reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+			operation_driver_assert_refused(&f);
+			UT_ASSERT_EQ(identity.operation_sequence, 0);
+			UT_ASSERT_EQ(test_operation_pin_depth, 0);
+			if (!caught)
+				UT_ASSERT_EQ(test_candidate_acquire_calls, test_candidate_release_calls);
+			else
+				UT_ASSERT_EQ(test_candidate_cancel_calls, 1);
+		}
+}

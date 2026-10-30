@@ -1070,6 +1070,27 @@ cluster_tx_resolve_operation_head(const ClusterTxLocator *locator pg_attribute_u
 	return CLUSTER_TX_UNKNOWN;
 }
 
+extern ClusterTxOutcome cluster_tx_resolve_retained_operation_head(
+	const ClusterTxLocator *locator, const ClusterItlSlotData *head, const BufferTag *tag,
+	const ClusterSavepointReaderIdentity *retained, ClusterSavepointReaderIdentity *identity,
+	ClusterTxResolution *top, ClusterSavepointReaderRecord *operation, char data[BLCKSZ],
+	ClusterTxResolveReason *reason);
+
+ClusterTxOutcome
+cluster_tx_resolve_retained_operation_head(
+	const ClusterTxLocator *locator pg_attribute_unused(),
+	const ClusterItlSlotData *head pg_attribute_unused(),
+	const BufferTag *tag pg_attribute_unused(),
+	const ClusterSavepointReaderIdentity *retained pg_attribute_unused(),
+	ClusterSavepointReaderIdentity *identity pg_attribute_unused(),
+	ClusterTxResolution *top pg_attribute_unused(),
+	ClusterSavepointReaderRecord *operation pg_attribute_unused(),
+	char data[BLCKSZ] pg_attribute_unused(), ClusterTxResolveReason *reason pg_attribute_unused())
+{
+	UT_ASSERT(false);
+	return CLUSTER_TX_UNKNOWN;
+}
+
 bool
 cluster_itl_get_tt_ref(Page page, uint8 index, ClusterUndoTTSlotRef *out)
 {

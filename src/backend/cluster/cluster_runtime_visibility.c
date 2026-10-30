@@ -3273,10 +3273,11 @@ cluster_runtime_visibility_operation_read_wait(ClusterOperationOriginRead *read)
 static ClusterTxOutcome
 cluster_runtime_visibility_resolve_operation_origin_internal(
 	const ClusterTxLocator *locator, const ClusterSavepointOperation *expected,
-	const ClusterItlSlotData *head, const BufferTag *tag, ClusterTxResolveMode mode,
-	const ClusterSemanticAdmissionToken *admission, ClusterSavepointReaderIdentity *identity_out,
-	ClusterTxResolution *top_out, ClusterSavepointReaderRecord *operation_out,
-	char data_out[BLCKSZ], ClusterTxResolveReason *reason_out)
+	const ClusterSavepointReaderIdentity *retained, const ClusterItlSlotData *head,
+	const BufferTag *tag, ClusterTxResolveMode mode, const ClusterSemanticAdmissionToken *admission,
+	ClusterSavepointReaderIdentity *identity_out, ClusterTxResolution *top_out,
+	ClusterSavepointReaderRecord *operation_out, char data_out[BLCKSZ],
+	ClusterTxResolveReason *reason_out)
 {
 	ClusterRuntimeVisibilityOperationRead state = { 0 };
 	ClusterOperationOriginRead *read = cluster_runtime_visibility_operation_read_data(&state);
@@ -3293,7 +3294,7 @@ cluster_runtime_visibility_resolve_operation_origin_internal(
 	if ((expected == NULL && identity_out == NULL) || top_out == NULL || operation_out == NULL
 		|| data_out == NULL
 		|| !cluster_runtime_visibility_operation_read_begin_internal(
-			&state, locator, expected, NULL, head, tag, mode, admission, &reason, true))
+			&state, locator, expected, retained, head, tag, mode, admission, &reason, true))
 		goto done;
 	PG_ENSURE_ERROR_CLEANUP(cluster_runtime_visibility_operation_read_cleanup,
 							PointerGetDatum(&state));
@@ -3325,8 +3326,8 @@ cluster_runtime_visibility_resolve_operation_origin_admitted(
 	char data_out[BLCKSZ], ClusterTxResolveReason *reason_out)
 {
 	return cluster_runtime_visibility_resolve_operation_origin_internal(
-		locator, expected, NULL, NULL, mode, admission, NULL, top_out, operation_out, data_out,
-		reason_out);
+		locator, expected, NULL, NULL, NULL, mode, admission, NULL, top_out, operation_out,
+		data_out, reason_out);
 }
 
 ClusterTxOutcome
@@ -3338,8 +3339,8 @@ cluster_runtime_visibility_resolve_operation_head_origin_admitted(
 	ClusterTxResolveReason *reason_out)
 {
 	return cluster_runtime_visibility_resolve_operation_origin_internal(
-		locator, NULL, head, tag, mode, admission, identity_out, top_out, operation_out, data_out,
-		reason_out);
+		locator, NULL, NULL, head, tag, mode, admission, identity_out, top_out, operation_out,
+		data_out, reason_out);
 }
 
 /* This opt-in keeps the old operation-only head readers unchanged. */
@@ -3352,8 +3353,24 @@ cluster_runtime_visibility_resolve_own_operation_head_origin_admitted(
 	char data_out[BLCKSZ], ClusterTxResolveReason *reason_out)
 {
 	return cluster_runtime_visibility_resolve_operation_origin_internal(
-		locator, owner, owner != NULL ? head : NULL, tag, mode, admission, identity_out, top_out,
-		operation_out, data_out, reason_out);
+		locator, owner, NULL, owner != NULL ? head : NULL, tag, mode, admission, identity_out,
+		top_out, operation_out, data_out, reason_out);
+}
+
+
+/* NULL retained discovers an operation head; a later V1 link requires the
+ * canonical identity already qualified by this same construction. */
+ClusterTxOutcome
+cluster_runtime_visibility_resolve_retained_operation_head_origin_admitted(
+	const ClusterTxLocator *locator, const ClusterItlSlotData *head, const BufferTag *tag,
+	const ClusterSavepointReaderIdentity *retained, ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission, ClusterSavepointReaderIdentity *identity_out,
+	ClusterTxResolution *top_out, ClusterSavepointReaderRecord *operation_out,
+	char data_out[BLCKSZ], ClusterTxResolveReason *reason_out)
+{
+	return cluster_runtime_visibility_resolve_operation_origin_internal(
+		locator, NULL, retained, head, tag, mode, admission, identity_out, top_out, operation_out,
+		data_out, reason_out);
 }
 
 bool

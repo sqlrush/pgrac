@@ -9754,12 +9754,14 @@ $(CLUSTER_R4_SCRATCH_RESOLVER_TEST_O): \
 test_cluster_scratch_operation_entry.inc: $(top_srcdir)/src/backend/cluster/cluster_tx_resolve.c
 	awk '/^cluster_tx_resolve_recovered_open_admitted\(/ { print "static bool"; emit=1; n++ } \
 	     /^cluster_tx_resolve_operation_head\(/ { print "ClusterTxOutcome"; emit=1; n++ } \
-	     emit { print } /^}/ { emit=0 } END { if (n != 2) exit 1 }' $< > $@.tmp
+	     /^cluster_tx_resolve_retained_operation_head\(/ { print "ClusterTxOutcome"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } END { if (n != 3) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 TESTS += test_cluster_scratch_self
 all: test_cluster_scratch_self
 test_cluster_scratch_self: test_cluster_scratch_self.c test_cluster_r4_scratch_resolver.c \
+        test_cluster_scratch_nonowner.inc \
         test_cluster_scratch_operation_entry.inc \
         test_cluster_native_prehistory_proof.inc cluster_snapshot_test_stubs.h unit_test.h \
         $(top_srcdir)/src/backend/utils/time/combocid.c \

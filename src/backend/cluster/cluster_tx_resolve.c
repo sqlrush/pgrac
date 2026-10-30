@@ -510,6 +510,54 @@ done:
 	return outcome;
 }
 
+/* Non-owner DATA history has no current backend publication receipt. */
+ClusterTxOutcome
+cluster_tx_resolve_retained_operation_head(const ClusterTxLocator *locator,
+										   const ClusterItlSlotData *head, const BufferTag *tag,
+										   const ClusterSavepointReaderIdentity *retained,
+										   ClusterSavepointReaderIdentity *identity,
+										   ClusterTxResolution *top,
+										   ClusterSavepointReaderRecord *operation,
+										   char data[BLCKSZ], ClusterTxResolveReason *reason_out)
+{
+	ClusterSemanticAdmissionToken admission;
+	ClusterSemanticAdmissionResult admitted;
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_RF_DEFERRED;
+	ClusterTxOutcome outcome = CLUSTER_TX_UNKNOWN;
+
+	if (identity != NULL)
+		memset(identity, 0, sizeof(*identity));
+	if (top != NULL)
+		memset(top, 0, sizeof(*top));
+	if (operation != NULL)
+		memset(operation, 0, sizeof(*operation));
+	memset(&admission, 0, sizeof(admission));
+	if (!cluster_tx_resolve_recovered_open_admitted())
+		goto done;
+	admitted = cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+												 CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
+	if (admitted != CLUSTER_SEMANTIC_ADMISSION_OK) {
+		if (admitted == CLUSTER_SEMANTIC_ADMISSION_TARGET_DISABLED)
+			reason = CLUSTER_TX_RESOLVE_TARGET_DISABLED;
+		goto done;
+	}
+	PG_TRY();
+	{
+		outcome = cluster_runtime_visibility_resolve_retained_operation_head_origin_admitted(
+			locator, head, tag, retained, CLUSTER_TX_RESOLVE_VISIBILITY, &admission, identity, top,
+			operation, data, &reason);
+	}
+	PG_FINALLY();
+	{
+		cluster_semantic_activation_leave(&admission);
+	}
+	PG_END_TRY();
+done:
+	if (reason_out != NULL)
+		*reason_out = reason;
+	return outcome;
+}
+
 ClusterTxOutcome
 cluster_tx_resolve_multixact(MultiXactId mxid, ClusterMultiResolution *out,
 							 ClusterTxResolveReason *reason_out)

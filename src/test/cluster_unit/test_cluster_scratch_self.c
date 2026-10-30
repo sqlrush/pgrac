@@ -13,6 +13,7 @@ extern ClusterTxOutcome self_unused_exact(const ClusterTxLocator *, ClusterTxRes
 #define main scratch_fixture_main
 #define GetTopFullTransactionIdIfAny self_unused_top_full
 #define cluster_tx_resolve_operation_head self_unused_operation_head
+#define cluster_tx_resolve_retained_operation_head self_unused_retained_operation_head
 #define TransactionIdIsCurrentTransactionId self_unused_current
 #define HeapTupleHeaderGetCmin self_unused_cmin
 #define HeapTupleHeaderGetCmax self_unused_cmax
@@ -22,6 +23,7 @@ extern ClusterTxOutcome self_unused_exact(const ClusterTxLocator *, ClusterTxRes
 #undef main
 #undef GetTopFullTransactionIdIfAny
 #undef cluster_tx_resolve_operation_head
+#undef cluster_tx_resolve_retained_operation_head
 #undef TransactionIdIsCurrentTransactionId
 #undef HeapTupleHeaderGetCmin
 #undef HeapTupleHeaderGetCmax
@@ -77,6 +79,7 @@ static int self_admission_enters;
 static int self_admission_leaves;
 static bool self_admission_held;
 static bool self_binding_present;
+static int self_binding_reads;
 static int self_drift;
 static int self_cid_calls;
 static ClusterCanonicalTxnBinding self_binding;
@@ -109,6 +112,7 @@ HeapTupleHeaderGetCmax(HeapTupleHeader tuple)
 bool
 cluster_tt_local_get_published_binding(TransactionId xid, ClusterCanonicalTxnBinding *out)
 {
+	self_binding_reads++;
 	if (!self_binding_present || xid != self_binding.xid)
 		return false;
 	*out = self_binding;
@@ -1153,10 +1157,12 @@ UT_TEST(test_own_child_mixed_top_history_error_unwinds)
 	self_history_defect = SELF_HISTORY_OK;
 }
 
+#include "test_cluster_scratch_nonowner.inc"
+
 int
 main(void)
 {
-	UT_PLAN(27);
+	UT_PLAN(33);
 	UT_RUN(test_existing_delete_current_command);
 	UT_RUN(test_existing_delete_next_command);
 	UT_RUN(test_update_old_version_next_command);
@@ -1184,6 +1190,13 @@ main(void)
 	UT_RUN(test_own_child_mixed_top_history_commands);
 	UT_RUN(test_own_child_mixed_top_history_refusals);
 	UT_RUN(test_own_child_mixed_top_history_error_unwinds);
+	UT_RUN(test_nonowner_live_child_outcomes_and_roles);
+	UT_RUN(test_nonowner_history_mixed_live_roles);
+	UT_RUN(test_nonowner_unknown_identity_discard_and_admission_refuse);
+	UT_RUN(test_nonowner_history_identity_and_terminal_stability);
+	UT_RUN(test_nonowner_initial_v1_never_fabricates_owner);
+	UT_RUN(test_nonowner_page_prior_and_matched_bad_image_refuse);
+	printf("# nonowner subcases=%d\n", nonowner_cases);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

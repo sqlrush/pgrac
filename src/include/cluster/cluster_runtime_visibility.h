@@ -299,6 +299,15 @@ extern ClusterTxOutcome cluster_runtime_visibility_resolve_operation_head_origin
 	ClusterSavepointReaderIdentity *identity_out, ClusterTxResolution *top_out,
 	ClusterSavepointReaderRecord *operation_out, char data_out[BLCKSZ],
 	ClusterTxResolveReason *reason_out);
+/* Same blocking lifecycle without a backend publication receipt. NULL retained
+ * permits only an operation-bearing first head; V1 needs a qualified identity
+ * from this construction and still repeats every original current phase. */
+extern ClusterTxOutcome cluster_runtime_visibility_resolve_retained_operation_head_origin_admitted(
+	const ClusterTxLocator *locator, const ClusterItlSlotData *head, const BufferTag *tag,
+	const ClusterSavepointReaderIdentity *retained, ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission, ClusterSavepointReaderIdentity *identity_out,
+	ClusterTxResolution *top_out, ClusterSavepointReaderRecord *operation_out,
+	char data_out[BLCKSZ], ClusterTxResolveReason *reason_out);
 extern bool cluster_runtime_visibility_origin_plan_canonical_logical(
 	const ClusterRuntimeVisibilityOriginPlan *plan, ClusterUndoBlock0LogicalKey *logical_out);
 extern bool cluster_runtime_visibility_origin_plan_canonical_physical(

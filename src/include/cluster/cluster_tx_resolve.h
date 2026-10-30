@@ -237,6 +237,13 @@ cluster_tx_resolve_operation_head(const ClusterTxLocator *locator, const Cluster
 								  ClusterSavepointReaderIdentity *identity,
 								  ClusterTxResolution *top, ClusterSavepointReaderRecord *operation,
 								  char data[BLCKSZ], ClusterTxResolveReason *reason_out);
+/* NULL retained discovers an operation head. Subsequent V1 links require a
+ * same-construction qualified canonical identity; never a synthetic receipt. */
+extern ClusterTxOutcome cluster_tx_resolve_retained_operation_head(
+	const ClusterTxLocator *locator, const ClusterItlSlotData *head, const BufferTag *tag,
+	const ClusterSavepointReaderIdentity *retained, ClusterSavepointReaderIdentity *identity,
+	ClusterTxResolution *top, ClusterSavepointReaderRecord *operation, char data[BLCKSZ],
+	ClusterTxResolveReason *reason_out);
 extern ClusterTxOutcome
 cluster_tx_resolve_exact_admitted(const ClusterTxLocator *locator, ClusterTxResolveMode mode,
 								  const ClusterSemanticAdmissionToken *admission,

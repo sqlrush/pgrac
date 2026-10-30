@@ -1488,6 +1488,136 @@ vis_scratch_own_operation(Page page, HeapTuple tuple, const BufferTag *tag, uint
 	}
 }
 
+/* Private same-construction identity, never a published receipt or cache. */
+typedef struct VisScratchOperationChain {
+	ClusterSavepointReaderIdentity owner;
+	ClusterTxOutcome terminal;
+	SCN commit_scn;
+	uint64 sequence;
+	bool conservative;
+} VisScratchOperationChain;
+
+static bool
+vis_scratch_other_top_proven(const ClusterUndoTTSlotRef *ref, const ClusterTxLocator *locator,
+							 const ClusterSavepointReaderIdentity *identity,
+							 const ClusterTxResolution *top, uint64 epoch,
+							 VisScratchOperationChain *chain)
+{
+	const ClusterSavepointReaderIdentity *owner = &chain->owner;
+
+	if (epoch > UINT32_MAX || ref->cluster_epoch != (uint32)epoch
+		|| cluster_epoch_get_current() != epoch || top->authority.origin_epoch != epoch
+		|| !SCN_VALID(top->authority.authority_scn)
+		|| top->proof_kind != CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG
+		|| !cluster_tx_locator_reply_matches(locator, &top->locator_echo)
+		|| !top->local_canonical_valid || top->top_xid != ref->local_xid
+		|| XidFromFullTransactionId(identity->top_fxid) != ref->local_xid
+		|| identity->canonical.segment_id != top->local_canonical.segment_id
+		|| identity->canonical.xid != top->local_canonical.xid
+		|| identity->canonical.slot_offset != top->local_canonical.slot_offset
+		|| identity->canonical.wrap != top->local_canonical.wrap
+		|| identity->canonical_generation != top->local_canonical_generation
+		|| (top->outcome != CLUSTER_TX_IN_PROGRESS && top->outcome != CLUSTER_TX_ABORTED
+			&& top->outcome != CLUSTER_TX_COMMITTED)
+		|| (top->outcome == CLUSTER_TX_COMMITTED && !SCN_VALID(top->commit_scn)))
+		return false;
+	if (owner->canonical.segment_id != 0
+		&& (!FullTransactionIdEquals(owner->top_fxid, identity->top_fxid)
+			|| owner->canonical.segment_id != identity->canonical.segment_id
+			|| owner->canonical.xid != identity->canonical.xid
+			|| owner->canonical.slot_offset != identity->canonical.slot_offset
+			|| owner->canonical.wrap != identity->canonical.wrap
+			|| owner->canonical_generation != identity->canonical_generation))
+		return false;
+	if ((chain->sequence != 0 && identity->operation_sequence != 0
+		 && identity->operation_sequence >= chain->sequence)
+		|| (chain->terminal != CLUSTER_TX_UNKNOWN
+			&& (chain->terminal != top->outcome
+				|| (chain->terminal == CLUSTER_TX_COMMITTED
+					&& chain->commit_scn != top->commit_scn))))
+		return false;
+	chain->owner = *identity;
+	chain->owner.operation_fxid = identity->top_fxid;
+	chain->owner.operation_sequence = 0;
+	chain->owner.command_id = InvalidCommandId;
+	chain->owner.subid = TopSubTransactionId;
+	if (identity->operation_sequence != 0)
+		chain->sequence = identity->operation_sequence;
+	if (top->outcome != CLUSTER_TX_IN_PROGRESS) {
+		chain->terminal = top->outcome;
+		chain->commit_scn = top->commit_scn;
+	}
+	chain->conservative |= top->outcome == CLUSTER_TX_IN_PROGRESS;
+	return true;
+}
+
+/* FULL is already projected: prove the retained role without applying undo
+ * to it. A matching DISCARDED effect remaining in FULL is inconsistent,
+ * not evidence that the shared top transaction aborted. */
+static void
+vis_scratch_other_operation(Page page, HeapTuple tuple, const BufferTag *tag, uint8 slot_index,
+							ClusterVisXidKind which, TransactionId raw_xid,
+							const ClusterUndoTTSlotRef *ref, ClusterVisResolve *out)
+{
+	VisScratchOperationChain chain = { 0 };
+	ClusterTxLocator locator;
+	ClusterTxLocator unused_wait;
+	ClusterTxResolution top;
+	ClusterSavepointReaderIdentity identity;
+	ClusterSavepointReaderRecord operation;
+	ClusterItlSlotData head = ClusterPageGetItlSlots(page)[slot_index];
+	ClusterTxResolveReason reason;
+	ClusterTxOutcome outcome;
+	PGAlignedBlock data;
+	size_t length;
+	uint64 epoch = cluster_epoch_get_current();
+	uint32 delta = raw_xid - ref->local_xid;
+
+	if (!cluster_vis_exact_locators_for_ref(page, slot_index, CLUSTER_VIS_XMIN, ref->local_xid, ref,
+											&locator, &unused_wait))
+		return;
+	for (;;) {
+		const UndoRecordHeader *record = (const UndoRecordHeader *)data.data;
+		uint64 top_value;
+
+		cluster_vis_resolve_depth++;
+		PG_TRY();
+		{
+			outcome = cluster_tx_resolve_retained_operation_head(
+				&locator, &head, tag, chain.owner.canonical.segment_id != 0 ? &chain.owner : NULL,
+				&identity, &top, &operation, data.data, &reason);
+		}
+		PG_FINALLY();
+		{
+			cluster_vis_resolve_depth--;
+		}
+		PG_END_TRY();
+		if (outcome != top.outcome
+			|| !vis_scratch_other_top_proven(ref, &locator, &identity, &top, epoch, &chain)
+			|| !cluster_savepoint_reader_extract_identity(&identity, &top.locator_echo, data.data,
+														  data.data, &length, &operation))
+			return;
+		top_value = U64FromFullTransactionId(identity.top_fxid);
+		if (vis_scratch_operation_addresses_tuple(tuple, tag, which, raw_xid, record)) {
+			if (top_value > UINT64_MAX - delta
+				|| U64FromFullTransactionId(identity.operation_fxid) != top_value + delta
+				|| operation.operation.effect_state != CLUSTER_SAVEPOINT_EFFECT_LIVE
+				|| !vis_scratch_operation_target(page, tuple, tag, which, raw_xid, record)
+				|| !cluster_vis_from_exact_tx_resolution(outcome, &top, out))
+				return;
+			if (chain.conservative) {
+				out->status = CLUSTER_TT_STATUS_IN_PROGRESS;
+				out->commit_scn = InvalidScn;
+			}
+			out->diagnostic_reason = NULL;
+			return;
+		}
+		locator = top.locator_echo;
+		if (!vis_scratch_operation_prior(&operation, tag, record, &locator, &head))
+			return;
+	}
+}
+
 void
 cluster_visibility_resolve_scratch_tuple_scn(Page page, HeapTuple tuple, const BufferTag *tag,
 											 uint8 slot_index, ClusterVisXidKind which,
@@ -1520,6 +1650,20 @@ cluster_visibility_resolve_scratch_tuple_scn(Page page, HeapTuple tuple, const B
 		out->ref = ref;
 		vis_scratch_own_operation(page, tuple, tag, slot_index, which, raw_xid, top_fxid, &ref,
 								  out);
+		return;
+	}
+	/* A possible child is only a branch selector. The exact operation chain
+	 * supplies FullXid/role/disposition; failure cannot fall back to a raw-xid
+	 * historical verdict that would lose the operation's rollback state. */
+	if (page != NULL && tag != NULL && SCN_VALID(read_scn) && TransactionIdIsNormal(raw_xid)
+		&& PageHasItl(page) && PageGetSpecialSize(page) >= CLUSTER_ITL_ARRAY_SIZE
+		&& slot_index < CLUSTER_ITL_INITRANS_DEFAULT
+		&& cluster_itl_get_tt_ref(page, slot_index, &ref) && ref.local_xid != raw_xid
+		&& ref.origin_node_id == cluster_node_id
+		&& (uint32)(raw_xid - ref.local_xid) < (uint32)0x80000000) {
+		out->ref = ref;
+		out->diagnostic_reason = "OPERATION_UNPROVABLE";
+		vis_scratch_other_operation(page, tuple, tag, slot_index, which, raw_xid, &ref, out);
 		return;
 	}
 	cluster_visibility_resolve_scratch_scn(page, slot_index, raw_xid, read_scn, out);
