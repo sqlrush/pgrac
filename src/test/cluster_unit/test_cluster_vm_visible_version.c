@@ -1384,6 +1384,14 @@ typedef struct LVRelState {
 	VacDeadItems *dead_items;
 	int nindexes;
 	bool do_index_vacuuming;
+	/* Original second-pass caller metadata; no proof or visibility grant. */
+	bool do_index_cleanup;
+	int num_index_scans;
+	BlockNumber blkno;
+	int64 lpdead_items;
+	BlockNumber lpdead_item_pages;
+	char *relname;
+	BufferAccessStrategy bstrategy;
 } LVRelState;
 /* Identity transport leaves are controlled here; the cache fixture separately
  * executes the real storage guards. Keep every original publication body. */

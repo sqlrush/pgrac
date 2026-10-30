@@ -35,10 +35,19 @@ static OffsetNumber vacuum_offsets[MaxHeapTuplesPerPage];
 static uint16 vacuum_offset_count;
 static uint8 vacuum_buffer_flags;
 static PGAlignedBlock vacuum_image;
+static bool second_pass_active;
+static unsigned second_pass_reads, second_pass_phases, second_pass_outer_restores;
+static unsigned second_pass_after_cleanup;
 
 void
 pgstat_progress_update_param(int index, int64 value)
 {
+	if (second_pass_active && index == PROGRESS_VACUUM_PHASE) {
+		UT_ASSERT_EQ(value, PROGRESS_VACUUM_PHASE_VACUUM_HEAP);
+		UT_ASSERT(!held[0] && !held[1] && !pinned[0] && !pinned[1]);
+		second_pass_phases++;
+		return;
+	}
 	UT_ASSERT_EQ(index, PROGRESS_VACUUM_HEAP_BLKS_VACUUMED);
 	UT_ASSERT_EQ(value, 0);
 	UT_ASSERT(held[0] && pinned[0]);
@@ -50,7 +59,10 @@ update_vacuum_error_info(LVRelState *state, LVSavedErrInfo *saved, int phase, Bl
 {
 	UT_ASSERT(state->rel == &relation && saved != NULL);
 	UT_ASSERT_EQ(phase, VACUUM_ERRCB_PHASE_VACUUM_HEAP);
-	UT_ASSERT_EQ(block, 0);
+	if (second_pass_active && block == InvalidBlockNumber)
+		UT_ASSERT(!held[0] && !held[1] && !pinned[0] && !pinned[1]);
+	else
+		UT_ASSERT_EQ(block, 0);
 	UT_ASSERT_EQ(offset, InvalidOffsetNumber);
 	*saved = 19;
 	vacuum_updates++;
@@ -60,6 +72,12 @@ static void
 restore_vacuum_error_info(LVRelState *state, const LVSavedErrInfo *saved)
 {
 	UT_ASSERT(state->rel == &relation && saved != NULL && *saved == 19);
+	if (second_pass_active && !pinned[0]) {
+		UT_ASSERT(!held[0] && !held[1] && !pinned[1]);
+		second_pass_outer_restores++;
+		vacuum_restores++;
+		return;
+	}
 	UT_ASSERT(held[0] && pinned[0] && !held[1]);
 	UT_ASSERT_EQ(CritSectionCount, 0);
 	vacuum_restores++;
@@ -137,6 +155,12 @@ vacuum_insert(RmgrId rmgr, uint8 info)
 	 * The next native version allocator must see that full post-vacuum image. */
 	memcpy(before, pages, sizeof(pages));
 	PageSetLSN(before[0].data, lsn);
+	/* Schedule a change only after native cleanup, never during its input
+	 * acquisition. The original publisher must recheck the changed image. */
+	if (second_pass_active && second_pass_after_cleanup == 1)
+		empty_race = 1;
+	else if (second_pass_active && second_pass_after_cleanup == 2)
+		empty_vm_race = 1;
 	return lsn;
 }
 
@@ -151,6 +175,46 @@ vacuum_insert(RmgrId rmgr, uint8 info)
 #undef XLogRegisterBufData
 #undef XLogRegisterBuffer
 #undef XLogRegisterData
+
+Buffer
+ReadBufferExtended(Relation rel, ForkNumber fork, BlockNumber block, ReadBufferMode mode,
+				   BufferAccessStrategy strategy)
+{
+	UT_ASSERT(second_pass_active && rel == &relation && block == 0);
+	UT_ASSERT_EQ(fork, MAIN_FORKNUM);
+	UT_ASSERT_EQ(mode, RBM_NORMAL);
+	UT_ASSERT(strategy == NULL && !pinned[0] && !held[0] && !held[1]);
+	if (cluster_shared_config)
+		UT_ASSERT(!pinned[1]);
+	pinned[0] = true;
+	second_pass_reads++;
+	return 1;
+}
+
+/* The indexed second pass must use ordinary non-cleanup X. These conditional
+ * cleanup leaves are linked for the first-pass helper but must not run here. */
+bool
+ConditionalLockBufferForCleanup(Buffer buffer)
+{
+	(void)buffer;
+	abort();
+}
+
+bool
+IsBufferCleanupOK(Buffer buffer)
+{
+	(void)buffer;
+	abort();
+}
+
+void
+vacuum_delay_point(void)
+{
+	UT_ASSERT(second_pass_active && !pinned[0] && !held[0] && !held[1]);
+}
+
+#include "test_cluster_vm_vacuum_acquire.inc"
+#include "test_cluster_vm_vacuum_second_pass.inc"
 
 static int
 vacuum_page(LVRelState *state, Buffer *vm, bool cleanup)
@@ -174,6 +238,7 @@ vacuum_reset(LVRelState *state, uint16 count, bool indexed)
 	PageHeader header;
 
 	*state = empty_reset(false, VISIBILITYMAP_VALID_BITS << 2);
+	second_pass_active = false;
 	state->nindexes = indexed ? 1 : 0;
 	state->do_index_vacuuming = indexed;
 	state->dead_items = (VacDeadItems *)storage.bytes;
@@ -380,10 +445,197 @@ UT_TEST(test_cancel_after_cleanup_wal_releases_only_publication_scope)
 	release_empty_cancel_fixture();
 }
 
+static void
+second_pass_reset(LVRelState *state, uint16 count)
+{
+	vacuum_reset(state, count, true);
+	state->do_index_cleanup = true;
+	state->num_index_scans = 1;
+	state->blkno = InvalidBlockNumber;
+	state->lpdead_items = count;
+	state->lpdead_item_pages = 1;
+	state->relname = "fixture";
+	state->bstrategy = NULL;
+	/* Exercise one real physical heap/VM pair. The page fixture's following
+	 * block sentinel is outside this relation-wide caller's input batch. */
+	state->dead_items->num_items = count;
+	pinned[0] = pinned[1] = held[0] = held[1] = writer[0] = writer[1] = false;
+	second_pass_reads = second_pass_phases = second_pass_outer_restores = 0;
+	second_pass_after_cleanup = 0;
+	second_pass_active = true;
+}
+
+static void
+second_pass_finished(LVRelState *state, uint16 count)
+{
+	UT_ASSERT_EQ(state->blkno, InvalidBlockNumber);
+	UT_ASSERT_EQ(state->dead_items->num_items, count);
+	UT_ASSERT_EQ(vacuum_records, 1);
+	UT_ASSERT_EQ(vacuum_updates, 2);
+	UT_ASSERT_EQ(vacuum_restores, 2);
+	UT_ASSERT_EQ(second_pass_phases, 1);
+	UT_ASSERT_EQ(second_pass_outer_restores, 1);
+	UT_ASSERT_EQ(empty_fsm, 1);
+	UT_ASSERT_EQ(empty_cleanup_waits, 0);
+	UT_ASSERT(!pinned[0] && !pinned[1] && !held[0] && !held[1]);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT_EQ(assertion_failures, 0);
+	second_pass_active = false;
+}
+
+UT_TEST(test_second_pass_publishes_through_original_caller_and_native_wal)
+{
+	const uint16 counts[] = { 1, 8, MaxHeapTuplesPerPage };
+
+	for (unsigned n = 0; n < lengthof(counts); n++) {
+		LVRelState state;
+
+		second_pass_reset(&state, counts[n]);
+		lazy_vacuum_heap_rel(&state);
+		UT_ASSERT_EQ(second_pass_reads, 1);
+		UT_ASSERT_EQ(empty_heap_waits, 2);
+		UT_ASSERT_EQ(empty_aux_calls, 1);
+		UT_ASSERT_EQ(vacuum_token, 101);
+		UT_ASSERT_EQ(inserts, 1);
+		UT_ASSERT_EQ(next_token, 102);
+		UT_ASSERT_EQ(PageGetLSN(pages[0].data), UINT64_C(0x9000));
+		UT_ASSERT_EQ(PageGetLSN(pages[1].data), UINT64_C(0x9000));
+		UT_ASSERT_EQ((uint8)*PageGetContents(pages[1].data), 15);
+		UT_ASSERT(PageIsAllVisible(pages[0].data));
+		second_pass_finished(&state, counts[n]);
+	}
+}
+
+UT_TEST(test_second_pass_preserves_remaining_used_items_without_av)
+{
+	for (unsigned kind = 0; kind < 3; kind++) {
+		LVRelState state;
+		ItemId item;
+
+		second_pass_reset(&state, 1);
+		((PageHeader)pages[0].data)->pd_lower += sizeof(ItemIdData);
+		item = PageGetItemId(pages[0].data, 2);
+		if (kind == 0)
+			empty_insert_row_at(2);
+		else if (kind == 1)
+			ItemIdSetRedirect(item, 1);
+		else
+			ItemIdSetDead(item);
+		memcpy(before, pages, sizeof(pages));
+		lazy_vacuum_heap_rel(&state);
+		UT_ASSERT_EQ(second_pass_reads, 1);
+		UT_ASSERT_EQ(empty_heap_waits, 1);
+		UT_ASSERT_EQ(inserts + empty_aux_calls, 0);
+		UT_ASSERT_EQ(next_token, 101);
+		UT_ASSERT(!PageIsAllVisible(pages[0].data));
+		second_pass_finished(&state, 1);
+	}
+}
+
+UT_TEST(test_second_pass_recent_misses_release_both_pins_before_retry)
+{
+	for (unsigned misses = 1; misses <= 3; misses++) {
+		LVRelState state;
+
+		second_pass_reset(&state, 8);
+		empty_repin_misses = misses;
+		lazy_vacuum_heap_rel(&state);
+		UT_ASSERT_EQ(second_pass_reads, misses + 1);
+		UT_ASSERT_EQ(empty_heap_waits, misses + 2);
+		UT_ASSERT_EQ(empty_repins, misses + 2);
+		UT_ASSERT_EQ(inserts, 1);
+		UT_ASSERT_EQ(next_token, 102);
+		second_pass_finished(&state, 8);
+	}
+}
+
+UT_TEST(test_second_pass_publication_refusal_keeps_completed_cleanup)
+{
+	for (unsigned variant = 0; variant < 5; variant++) {
+		LVRelState state;
+
+		second_pass_reset(&state, 8);
+		if (variant == 0)
+			empty_resume = false;
+		else if (variant == 1)
+			empty_aux = false;
+		else if (variant == 2)
+			second_pass_after_cleanup = 1;
+		else if (variant == 3)
+			second_pass_after_cleanup = 2;
+		else
+			empty_identity_change_phase = 1;
+		lazy_vacuum_heap_rel(&state);
+		UT_ASSERT_EQ(inserts + empty_publication_notes, 0);
+		UT_ASSERT_EQ(next_token, 101);
+		UT_ASSERT_EQ(PageGetLSN(pages[0].data), UINT64_C(0x8000));
+		UT_ASSERT(!PageIsAllVisible(pages[0].data));
+		UT_ASSERT_EQ(visibilitymap_heap_page_is_empty(pages[0].data), variant != 2);
+		second_pass_finished(&state, 8);
+	}
+}
+
+UT_TEST(test_second_pass_cancel_before_cleanup_and_after_cleanup_wal)
+{
+	static LVRelState state;
+
+	for (unsigned phase = 0; phase < 2; phase++) {
+		volatile bool caught = false;
+
+		second_pass_reset(&state, 8);
+		if (phase == 0) {
+			empty_repin_misses = 1;
+			empty_cancel_repin = true;
+		} else
+			empty_cancel_after_capture = true;
+		expecting_error = true;
+		PG_TRY();
+		{
+			lazy_vacuum_heap_rel(&state);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		expecting_error = false;
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(vacuum_records, phase);
+		UT_ASSERT_EQ(next_token, 100 + phase);
+		UT_ASSERT_EQ(inserts + empty_publication_notes + empty_fsm, 0);
+		UT_ASSERT_EQ(pinned[0], phase);
+		UT_ASSERT(!pinned[1] && !held[0] && !held[1]);
+		UT_ASSERT_EQ(state.dead_items->num_items, 8);
+		UT_ASSERT_EQ(CritSectionCount, 0);
+		UT_ASSERT_EQ(assertion_failures, 0);
+		release_empty_cancel_fixture();
+		second_pass_active = false;
+	}
+}
+
+UT_TEST(test_second_pass_nonshared_keeps_native_acquire_and_classifier)
+{
+	LVRelState state;
+
+	second_pass_reset(&state, 8);
+	state.versioned = state.shared_maintenance_restricted = false;
+	cluster_shared_config = false;
+	lazy_vacuum_heap_rel(&state);
+	UT_ASSERT_EQ(second_pass_reads, 1);
+	UT_ASSERT_EQ(empty_heap_waits, 1);
+	UT_ASSERT_EQ(empty_repins + empty_aux_calls + empty_identity_captures, 0);
+	UT_ASSERT_EQ(vacuum_classifications, 1);
+	UT_ASSERT_EQ(next_token, 100);
+	UT_ASSERT_EQ(inserts, 0);
+	second_pass_finished(&state, 8);
+}
+
 int
 main(void)
 {
-	UT_PLAN(7);
+	/* Keep the original acquire body linked in the parent RED control too. */
+	(void)lazy_read_shared_heap;
+	UT_PLAN(13);
 	UT_RUN(test_last_dead_cleanup_publishes_both_versions_in_each_lock_mode);
 	UT_RUN(test_remaining_used_items_do_not_enter_empty_publication);
 	UT_RUN(test_concurrent_insert_after_cleanup_prevents_positive_publication);
@@ -391,6 +643,12 @@ main(void)
 	UT_RUN(test_resident_misses_restore_cleanup_before_native_publication);
 	UT_RUN(test_nonshared_cleanup_keeps_original_classifier_and_vm_pin);
 	UT_RUN(test_cancel_after_cleanup_wal_releases_only_publication_scope);
+	UT_RUN(test_second_pass_publishes_through_original_caller_and_native_wal);
+	UT_RUN(test_second_pass_preserves_remaining_used_items_without_av);
+	UT_RUN(test_second_pass_recent_misses_release_both_pins_before_retry);
+	UT_RUN(test_second_pass_publication_refusal_keeps_completed_cleanup);
+	UT_RUN(test_second_pass_cancel_before_cleanup_and_after_cleanup_wal);
+	UT_RUN(test_second_pass_nonshared_keeps_native_acquire_and_classifier);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

@@ -2389,7 +2389,13 @@ test_cluster_vm_vacuum_empty.inc: $(top_srcdir)/src/backend/access/heap/vacuumla
 	mv $@.tmp $@
 
 test_cluster_vm_vacuum_empty test_cluster_vm_vacuum_empty_noassert: test_cluster_vm_vacuum_empty.c \
-		test_cluster_vm_vacuum_empty.inc $(top_srcdir)/src/include/commands/progress.h
+		test_cluster_vm_vacuum_empty.inc test_cluster_vm_vacuum_acquire.inc \
+		test_cluster_vm_vacuum_second_pass.inc $(top_srcdir)/src/include/commands/progress.h
+
+test_cluster_vm_vacuum_second_pass.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
+	awk '/^lazy_vacuum_heap_rel\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
 
 # PGRAC: native VM setter and its original heap-visible WAL logger.
 test_cluster_vm_visible_body.inc: $(top_srcdir)/src/backend/access/heap/visibilitymap.c Makefile
@@ -6534,6 +6540,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_vm_snapshot_read.inc
 	rm -f test_cluster_vm_native_chain.inc
 	rm -f test_cluster_vm_vacuum_acquire.inc test_cluster_vm_vacuum_onepass.inc
+	rm -f test_cluster_vm_vacuum_second_pass.inc
 	rm -f test_cluster_vm_buffer_matches.inc test_cluster_vm_repair_clear.inc test_cluster_vm_repair_missing_heap.inc test_cluster_vm_repair_lpdead.inc
 	rm -f test_cluster_btree_build_writer.inc test_cluster_btree_build_state.inc \
 		test_cluster_btree_build_finish.inc test_cluster_btree_build_leaf.inc

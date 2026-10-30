@@ -1078,7 +1078,9 @@ lazy_lock_buffer_for_cleanup(LVRelState *vacrel, Buffer buffer)
 
 #ifdef USE_PGRAC_CLUSTER
 /* Acquire the original ordinary writer without carrying a passive VM pin
- * into the wait. A local conditional cleanup lock cannot supply that writer. */
+ * into the wait. A local conditional cleanup lock cannot supply that writer.
+ * A NULL cleanup_lock requests ordinary non-cleanup X for the indexed second
+ * pass; otherwise preserve the first pass's conditional/forced cleanup choice. */
 static Buffer
 lazy_read_shared_heap(LVRelState *vacrel, BlockNumber blkno, Buffer *vmbuffer, bool force_cleanup,
 					  bool *cleanup_lock)
@@ -1091,7 +1093,9 @@ lazy_read_shared_heap(LVRelState *vacrel, BlockNumber blkno, Buffer *vmbuffer, b
 		ReleaseBuffer(recent_vm);
 		*vmbuffer = InvalidBuffer;
 		buf = ReadBufferExtended(vacrel->rel, MAIN_FORKNUM, blkno, RBM_NORMAL, vacrel->bstrategy);
-		if (force_cleanup) {
+		if (cleanup_lock == NULL)
+			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		else if (force_cleanup) {
 			LockBufferForCleanup(buf);
 			*cleanup_lock = true;
 		} else {
@@ -3864,6 +3868,10 @@ lazy_vacuum_all_indexes(LVRelState *vacrel)
  * Note: the reason for doing this as a second pass is we cannot remove the
  * tuples until we've removed their index entries, and we want to process
  * index entry removal in batches as large as possible.
+ *
+ * PGRAC: drop the passive VM pin before the shared heap read or X wait, then
+ * repin only the exact resident VM page. Keep non-cleanup X: index readers
+ * may still hold heap pins after their entries have been removed.
  */
 static void
 lazy_vacuum_heap_rel(LVRelState *vacrel)
@@ -3906,9 +3914,16 @@ lazy_vacuum_heap_rel(LVRelState *vacrel)
 		visibilitymap_pin(vacrel->rel, blkno, &vmbuffer);
 
 		/* We need a non-cleanup exclusive lock to mark dead_items unused */
-		buf = ReadBufferExtended(vacrel->rel, MAIN_FORKNUM, blkno, RBM_NORMAL,
-								 vacrel->bstrategy);
-		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+#ifdef USE_PGRAC_CLUSTER
+		if (vacrel->shared_maintenance_restricted)
+			buf = lazy_read_shared_heap(vacrel, blkno, &vmbuffer, false, NULL);
+		else
+#endif
+		{
+			buf = ReadBufferExtended(vacrel->rel, MAIN_FORKNUM, blkno, RBM_NORMAL,
+									 vacrel->bstrategy);
+			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		}
 		index = lazy_vacuum_heap_page(vacrel, blkno, buf, index, &vmbuffer, false);
 
 		/* Now that we've vacuumed the page, record its available space */
