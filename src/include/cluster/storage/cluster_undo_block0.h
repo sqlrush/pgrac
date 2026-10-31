@@ -23,6 +23,8 @@
 #ifndef CLUSTER_UNDO_BLOCK0_H
 #define CLUSTER_UNDO_BLOCK0_H
 
+#include "cluster/cluster_tt_startup.h"
+
 #include "c.h"
 
 #include "access/xlogdefs.h"
@@ -108,6 +110,7 @@ typedef struct ClusterUndoBlock0RecoveryGuard {
 	ClusterUndoBlock0LogicalKey logical;
 	ClusterUndoBlock0ResolvedRoot resolved_root;
 	ClusterUndoBlock0AuthorityProof proof;
+	const ClusterTTStartupLocalContext *startup_local;
 	bool content_x_held;
 } ClusterUndoBlock0RecoveryGuard;
 
@@ -217,6 +220,15 @@ extern void cluster_undo_block0_recovery_private_finish(ClusterUndoBlock0Recover
 														XLogRecPtr replay_lsn, bool write_image,
 														bool fsync_parent);
 extern void cluster_undo_block0_recovery_private_abort(ClusterUndoBlock0RecoveryGuard *guard);
+
+/* Nonshared, pre-open local Startup only. Never accepts a ROOT/redo proof or
+ * an admission token. The whole selected TT40 image must still match disk. */
+extern ClusterUndoBlock0Result cluster_undo_block0_startup_local_begin(
+	const ClusterTTStartupLocalContext *context, const ClusterUndoBlock0LogicalKey *logical,
+	const char selected_base[BLCKSZ], ClusterUndoBlock0RecoveryGuard *guard,
+	char private_page[BLCKSZ]);
+extern void cluster_undo_block0_startup_local_finish(ClusterUndoBlock0RecoveryGuard *guard,
+	const char predecessor[BLCKSZ], const char successor[BLCKSZ], XLogRecPtr wal_lsn);
 extern ClusterUndoBlock0Result cluster_undo_block0_provision_begin(
 	const ClusterUndoBlock0LogicalKey *logical, const ClusterUndoBlock0ResolvedRoot *target_root,
 	const ClusterUndoBlock0AuthorityProof *proof, ClusterUndoBlock0FrameToken *token,

@@ -61,10 +61,14 @@
 #include "cluster/cluster_uba.h"
 #include "cluster/cluster_tt_status.h"
 #include "cluster/cluster_undo_segment.h"		/* UndoSegmentHeaderData */
+#include "cluster/cluster_undo_segment_init.h"
 #include "cluster/cluster_undo_smgr.h"			/* header-bytes + block I/O */
 #include "cluster/storage/cluster_undo_alloc.h" /* CLUSTER_UNDO_SEGS_PER_INSTANCE */
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "cluster/storage/cluster_undo_xlog.h" /* cluster_undo_emit_tt_slot_commit */
+
+static bool durable_scan_header_valid(const char block[BLCKSZ], uint32 segment_id,
+									 uint8 owner, bool *is_v2);
 
 
 /* Absolute byte offset of TTSlot[slot_offset] within segment header block 0. */
@@ -1865,6 +1869,76 @@ cluster_tt_slot_durable_abort_exact(uint32 segment_id, uint32 segment_generation
 }
 
 
+/* The original nonshared pre-open scanner owns selected_base. The content-X
+ * guard below compares the complete durable predecessor before WAL and again
+ * before the whole-page write. No receiver epoch or shared proof is invented. */
+XLogRecPtr
+cluster_tt_slot_durable_abort_startup_local(const ClusterTTStartupLocalContext *context,
+										 uint32 segment_id, uint16 slot_offset,
+										 char selected_base[BLCKSZ])
+{
+	ClusterUndoBlock0LogicalKey logical;
+	ClusterUndoBlock0RecoveryGuard guard;
+	PGAlignedBlock before;
+	PGAlignedBlock successor;
+	UndoSegmentHeaderDataV2 *header = (UndoSegmentHeaderDataV2 *)successor.data;
+	TTSlotV2 *slot;
+	xl_undo_tt_identity_v2 identity = {0};
+	XLogRecPtr abort_lsn = InvalidXLogRecPtr;
+	bool is_v2;
+
+	logical.segment_id = segment_id;
+	logical.owner_instance = tt_owner_instance_for_segment(segment_id);
+	if (!cluster_tt_startup_local_context_valid(context, logical.owner_instance)
+		|| selected_base == NULL || slot_offset >= TT_SLOTS_PER_SEGMENT || MyProc == NULL
+		|| (MyProc->delayChkptFlags & DELAY_CHKPT_START) != 0
+		|| !durable_scan_header_valid(selected_base, segment_id, logical.owner_instance, &is_v2)
+		|| !is_v2 || ((UndoSegmentHeaderDataV2 *)selected_base)->wrap_count == UINT32_MAX
+		|| cluster_undo_segment_header_integrity(selected_base) != CLUSTER_UNDO_HEADER_VALID
+		|| ((UndoSegmentHeaderDataV2 *)selected_base)->tt_slots[slot_offset].status != TT_SLOT_ACTIVE)
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("TT40 startup ABORT requires an exact local ACTIVE base")));
+
+	memset(&guard, 0, sizeof(guard));
+	guard.slot = -1;
+	PG_TRY();
+	{
+		ClusterUndoBlock0Result result = cluster_undo_block0_startup_local_begin(
+			context, &logical, selected_base, &guard, before.data);
+
+		if (result != CLUSTER_UNDO_BLOCK0_OK)
+			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("TT40 startup ABORT predecessor refused: %d", (int)result)));
+		memcpy(successor.data, before.data, BLCKSZ);
+		slot = &header->tt_slots[slot_offset];
+		identity.segment_id = segment_id;
+		identity.segment_generation = header->wrap_count;
+		identity.xid = slot->xid;
+		identity.slot_offset = slot_offset;
+		identity.wrap = slot->wrap;
+		identity.instance = logical.owner_instance;
+		identity.format_version = CLUSTER_UNDO_TT_IDENTITY_V2_VERSION;
+		identity.original_full_xid = slot->original_full_xid;
+		slot->status = TT_SLOT_ABORTED;
+		slot->flags = TT_FLAGS_RESERVED;
+		slot->commit_scn = InvalidScn;
+		slot->first_undo_block = InvalidUbaVal;
+		if (!cluster_undo_segment_header_seal(successor.data))
+			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("cannot seal TT40 startup ABORT")));
+		MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+		abort_lsn = cluster_undo_emit_tt_slot_abort_v2(&identity);
+		cluster_undo_block0_startup_local_finish(&guard, before.data, successor.data, abort_lsn);
+		memcpy(selected_base, successor.data, BLCKSZ);
+	}
+	PG_FINALLY();
+	{
+		MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
+		cluster_undo_block0_recovery_private_abort(&guard);
+	}
+	PG_END_TRY();
+	return abort_lsn;
+}
+
 /*
  * cluster_tt_slot_durable_abort -- spec-3.15 D5 (crash-left ACTIVE resolution).
  *
@@ -1880,6 +1954,10 @@ cluster_tt_slot_durable_abort(uint32 segment_id, uint16 slot_offset, Transaction
 	uint32 off = tt_slot_file_offset(slot_offset);
 	TTSlot slot;
 
+	if (cluster_shared_config)
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+						errmsg("legacy TT abort cannot supply shared recovery proof"),
+						errhint("Preserve the original DATA and WAL for exact shared transaction recovery.")));
 	Assert(slot_offset < TT_SLOTS_PER_SEGMENT);
 	Assert(TransactionIdIsValid(xid));
 

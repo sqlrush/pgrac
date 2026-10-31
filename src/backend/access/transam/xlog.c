@@ -6624,6 +6624,71 @@ ClusterXLogStartupNativeEmptyMultiXactInput(void)
 /*
  * This must be called ONCE during postmaster or standalone-backend startup
  */
+#ifdef USE_PGRAC_CLUSTER
+/* STARTUP_LOCAL owner begin */
+/* Only the original pre-open legacy sweep can mint this local capability.
+ * Hot standby may already have admitted read-only backends, so it is excluded
+ * even after RecoveryInProgress becomes false. No admission/redo proof is used. */
+struct ClusterTTStartupLocalContext {
+	uint8 owner_instance;
+};
+static const ClusterTTStartupLocalContext *StartupLocalTTContext;
+
+bool
+cluster_tt_startup_local_context_valid(const ClusterTTStartupLocalContext *context,
+									 uint8 owner_instance)
+{
+	return context != NULL && context == StartupLocalTTContext
+		&& !cluster_shared_config
+		&& (AmStartupProcess() || (!IsUnderPostmaster && !IsPostmasterEnvironment
+									&& MyBackendType == B_STANDALONE_BACKEND))
+		&& !RecoveryInProgress()
+		&& !HotStandbyActive() && LocalXLogInsertAllowed == 1
+		&& cluster_node_id >= 0 && cluster_node_id <= SCN_MAX_VALID_NODE_ID
+		&& owner_instance == cluster_node_id + 1
+		&& context->owner_instance == owner_instance;
+}
+
+const ClusterTTStartupLocalContext *
+cluster_tt_startup_local_context_current(void)
+{
+	return cluster_node_id >= 0 && cluster_node_id <= SCN_MAX_VALID_NODE_ID
+		&& cluster_tt_startup_local_context_valid(StartupLocalTTContext,
+												(uint8)(cluster_node_id + 1))
+		? StartupLocalTTContext : NULL;
+}
+
+static int
+ClusterTTResolveActiveLocalStartup(void)
+{
+	ClusterTTStartupLocalContext context;
+	int resolved = 0;
+
+	if (!cluster_enabled || !cluster_tt_recovery_resolve_active)
+		return 0;
+	if (StartupLocalTTContext != NULL || cluster_shared_config
+		|| !(AmStartupProcess() || (!IsUnderPostmaster && !IsPostmasterEnvironment
+									 && MyBackendType == B_STANDALONE_BACKEND))
+		|| RecoveryInProgress() || HotStandbyActive() || LocalXLogInsertAllowed != 1
+		|| cluster_node_id < 0 || cluster_node_id > SCN_MAX_VALID_NODE_ID)
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("TT local startup sweep requires the original pre-open Startup owner")));
+	context.owner_instance = (uint8)(cluster_node_id + 1);
+	StartupLocalTTContext = &context;
+	PG_TRY();
+	{
+		resolved = cluster_tt_recovery_resolve_active_slots();
+	}
+	PG_FINALLY();
+	{
+		StartupLocalTTContext = NULL;
+	}
+	PG_END_TRY();
+	return resolved;
+}
+/* STARTUP_LOCAL owner end */
+#endif
+
 void
 StartupXLOG(void)
 {
@@ -7821,8 +7886,9 @@ StartupXLOG(void)
 	 */
 	/* A classified normal TARGET validates terminal history without changing
 	 * it. Its strict complete census below replaces these recovery-only jobs. */
-	if (cluster_semantic_normal_start_state() != CLUSTER_NORMAL_START_TARGET_LOADING)
-		cluster_tt_recovery_resolve_active_slots();
+	if (!cluster_shared_config
+		&& cluster_semantic_normal_start_state() != CLUSTER_NORMAL_START_TARGET_LOADING)
+		(void)ClusterTTResolveActiveLocalStartup();
 
 	/*
 	 * PGRAC MODIFICATIONS (spec-4.8 D5, L222): advance cluster_scn to the

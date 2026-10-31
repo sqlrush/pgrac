@@ -38,26 +38,13 @@
  * NOTES
  *	  This is a pgrac-original file (no derivation from PostgreSQL).
  *
- *	  spec-4.8 D0 measure-first finding (Option A reframe): the on-disk TT
- *	  header slots are NEVER written TT_SLOT_ACTIVE.  The only durable header
- *	  writes are durable_commit (-> COMMITTED) and durable_abort (-> ABORTED),
- *	  each a targeted 32-byte RMW; the in-flight ("active") binding lives only
- *	  in the in-memory allocator (CTS_ACTIVE, ClusterTTSlotAllocState) and is
- *	  lost on crash ("BIND is not WAL'd").  So a simple in-flight crash leaves
- *	  the on-disk slot UNUSED (fresh) or a stale prior COMMITTED/ABORTED state
- *	  (reused, below the retention horizon) -- never ACTIVE.  Single-node
- *	  correctness for a crashed in-flight xact is therefore already provided by
- *	  PG-native CLOG (the xact is not committed -> MVCC-invisible).
- *
- *	  cluster_tt_recovery_resolve_active_slots() is consequently a FAIL-CLOSED
- *	  DEFENSIVE NET, not the load-bearing single-node correctness fix: it
- *	  normally resolves 0 slots, but would safely abort any on-disk ACTIVE slot
- *	  that ever appeared (a torn write, a future durable-bind, or corruption),
- *	  never treating it as committed (规则 8.A).  The crash-left in-flight xact
- *	  handling that DOES carry weight lives elsewhere: cross-node TT authority
- *	  (D2) and physical heap rollback apply (D7, which identifies crashed xacts
- *	  via undo records + cluster_tt_recovery_xact_liveness, not on-disk ACTIVE
- *	  TT slots).  The pure classifier + xact_liveness here are reused by both.
+ *	  Explicit TT40 ACTIVE is persisted by the canonical publication owner.
+ *	  Its nonshared pre-open sweep takes the original FullXid from the exact
+ *	  selected base, logs V2 ABORT, and writes one sealed page through the
+ *	  block-zero content owner. The older TT32 writer is kept for V1 pages.
+ *	  Shared recovery uses its original ROOT/SIDE authority and never this
+ *	  local Startup context. CLOG/proc-array liveness is not a historical
+ *	  FullXid or receiver-retention certificate.
  *
  *-------------------------------------------------------------------------
  */
@@ -80,11 +67,16 @@
 #include "cluster/cluster_undo_record.h"		/* UndoRecordHeader, UNDO_RECORD_DELETE (D7) */
 #include "cluster/cluster_undo_record_api.h"	/* cluster_undo_get_record (D7) */
 #include "cluster/cluster_undo_segment.h"		/* UndoSegmentHeaderData */
+#include "cluster/cluster_undo_segment_init.h"
 #include "cluster/cluster_undo_smgr.h"			/* cluster_undo_smgr_read_block */
 #include "cluster/storage/cluster_undo_alloc.h" /* CLUSTER_UNDO_SEGS_PER_INSTANCE */
 
 /* spec-4.8 D7: hard cap on an undo chain walk (malformed-chain loop guard). */
 #define CLUSTER_TT_RECOVERY_MAX_CHAIN_STEPS 1000000
+
+static bool startup_scan_header_valid(const char block[BLCKSZ], uint32 segment_id,
+									 uint8 owner, bool *is_v2);
+static TTSlot startup_scan_slot(const char block[BLCKSZ], bool is_v2, uint16 offset);
 
 /*
  * cluster_tt_recovery_xact_liveness -- spec-4.8 D1.
@@ -129,9 +121,9 @@ cluster_tt_recovery_xact_liveness(TransactionId xid)
  *	Fail-safe on read failure: an existing-but-unreadable or absent segment is
  *	skipped (we never abort a slot we cannot read).  Leaving a slot ACTIVE is no
  *	worse than the pre-D1 behaviour (the by-xid 0-match path); aborting a slot we
- *	cannot read would risk a false-abort.  durable_abort does its own targeted
- *	32-byte RMW per slot, so the in-memory header snapshot used to iterate stays
- *	valid across slot resolutions within a segment.
+ *	cannot read would risk a false-abort. TT40 validates all 48 slots and the
+ *	checksum before any transition, then carries the successful sealed successor
+ *	forward as the exact base for the next slot. V1 retains its 32-byte writer.
  */
 int
 cluster_tt_recovery_resolve_active_slots(void)
@@ -142,8 +134,12 @@ cluster_tt_recovery_resolve_active_slots(void)
 	uint32 seg_hi;
 	uint32 segment_id;
 	PGAlignedBlock blockbuf;
+	const ClusterTTStartupLocalContext *context = cluster_tt_startup_local_context_current();
 	int resolved = 0;
 
+	if (cluster_shared_config)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("legacy ACTIVE sweep cannot supply shared recovery proof")));
 	if (!cluster_enabled || !cluster_tt_recovery_resolve_active)
 		return 0;
 	if (cluster_node_id < 0)
@@ -155,16 +151,23 @@ cluster_tt_recovery_resolve_active_slots(void)
 	seg_hi = seg_lo + CLUSTER_UNDO_SEGS_PER_INSTANCE - 1;
 
 	for (segment_id = seg_lo; segment_id <= seg_hi; segment_id++) {
-		UndoSegmentHeaderData *hdr;
+		bool is_v2;
 		uint16 i;
 
 		if (!cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(owner), segment_id, owner,
 										  0, blockbuf.data))
 			continue; /* absent / unreadable -> skip (never false-abort) */
 
-		hdr = (UndoSegmentHeaderData *)blockbuf.data;
+		if (!startup_scan_header_valid(blockbuf.data, segment_id, owner, &is_v2)
+			|| (is_v2 && (cluster_undo_segment_header_integrity(blockbuf.data)
+							!= CLUSTER_UNDO_HEADER_VALID
+				|| !cluster_tt_startup_local_context_valid(context, owner))))
+			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("invalid TT base or local Startup owner in ACTIVE sweep of segment %u",
+								   segment_id)));
 		for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
-			const TTSlot *s = &hdr->tt_slots[i];
+			TTSlot slot = startup_scan_slot(blockbuf.data, is_v2, i);
+			const TTSlot *s = &slot;
 			ClusterTtRecoveryLiveness verdict;
 
 			if (s->status != (uint8)TT_SLOT_ACTIVE)
@@ -177,7 +180,11 @@ cluster_tt_recovery_resolve_active_slots(void)
 				continue; /* committed / resurrected prepared -> keep ACTIVE */
 
 			/* DEAD or AMBIGUOUS -> fail-closed ABORTED (durable, WAL 0x60). */
-			cluster_tt_slot_durable_abort(segment_id, i, s->xid, s->wrap);
+			if (is_v2)
+				(void)cluster_tt_slot_durable_abort_startup_local(context, segment_id, i,
+															 blockbuf.data);
+			else
+				cluster_tt_slot_durable_abort(segment_id, i, s->xid, s->wrap);
 			cluster_tt_recovery_count_active_resolved_aborted();
 			resolved++;
 		}

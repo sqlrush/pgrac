@@ -1797,6 +1797,7 @@ _classify_owners(
         "cluster_tt_durable_redo_abort_slot",
         "cluster_tt_durable_redo_abort_slot_exact",
         "cluster_tt_slot_durable_abort",
+        "cluster_tt_slot_durable_abort_startup_local",
     ),
     "TERMINAL_PROJECTION_DISCHARGE",
     "ALL_CTRC_REFERENCE_KINDS",

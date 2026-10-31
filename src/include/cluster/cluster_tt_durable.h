@@ -39,6 +39,7 @@
 #include "cluster/cluster_itl_slot.h" /* UBA (spec-4.8 D7-A set_head) */
 #include "cluster/cluster_scn.h"	  /* SCN */
 #include "cluster/cluster_tt_slot.h"  /* TTSlot */
+#include "cluster/cluster_tt_startup.h"
 
 typedef struct ClusterSemanticAdmissionToken ClusterSemanticAdmissionToken;
 
@@ -470,6 +471,12 @@ extern ClusterTtRecoveryLiveness cluster_tt_recovery_xact_liveness(TransactionId
  *	to ABORTED.  Backend-only (cluster_tt_recovery.c).
  */
 extern int cluster_tt_recovery_resolve_active_slots(void);
+
+/* Exact TT40 predecessor from the original local Startup scanner. Returns
+ * the sealed successor in selected_base for the next slot in the same scan. */
+extern XLogRecPtr cluster_tt_slot_durable_abort_startup_local(
+	const ClusterTTStartupLocalContext *context, uint32 segment_id, uint16 slot_offset,
+	char selected_base[BLCKSZ]);
 
 /*
  * cluster_tt_recovery_observe_scn_highwater -- spec-4.8 D5 (L222): scan this

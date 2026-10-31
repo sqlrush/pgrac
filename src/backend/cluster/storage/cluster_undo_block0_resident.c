@@ -21,6 +21,7 @@
 #include "access/xlog.h"
 #include "miscadmin.h"
 #include "cluster/cluster_undo_smgr.h"
+#include "cluster/cluster_undo_segment_init.h"
 #include "cluster/cluster_undo_root_descriptor.h"
 #include "cluster/storage/cluster_undo_block0.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
@@ -1300,6 +1301,115 @@ cluster_undo_block0_prove_strict_empty(const ClusterUndoBlock0LogicalKey *logica
 	return result;
 }
 
+
+/* Local Startup has no shared ROOT/SIDE/admission authority. It can borrow
+ * only a strictly empty local logical slot, retaining its original content-X
+ * owner across compare/WAL/whole-page write. No resident frame is published. */
+ClusterUndoBlock0Result
+cluster_undo_block0_startup_local_begin(const ClusterTTStartupLocalContext *context,
+									 const ClusterUndoBlock0LogicalKey *logical,
+									 const char selected_base[BLCKSZ],
+									 ClusterUndoBlock0RecoveryGuard *guard,
+									 char private_page[BLCKSZ])
+{
+	ClusterUndoBlock0SlotData *meta;
+	ClusterUndoBlock0OwnedResource *owned;
+	ClusterUndoBlock0Generation generation;
+	uint32 slotno;
+
+	block0_recovery_guard_clear(guard);
+	if (guard == NULL || selected_base == NULL || private_page == NULL
+		|| cluster_undo_block0_logical_slot(logical, &slotno) != CLUSTER_UNDO_BLOCK0_OK)
+		return CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
+	if (!cluster_tt_startup_local_context_valid(context, logical->owner_instance))
+		return CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+	if (Block0Ctl == NULL)
+		return CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED;
+	owned = block0_resource_prepare(guard, CLUSTER_UNDO_BLOCK0_OWNED_RECOVERY);
+	meta = &Block0Slots[slotno].data;
+	LWLockAcquire(&meta->content_lock, LW_EXCLUSIVE);
+	if (pg_atomic_read_u32(&meta->state) != CLUSTER_UNDO_BLOCK0_SLOT_EMPTY
+		|| pg_atomic_read_u32(&meta->pincount) != 0
+		|| meta->frame_index != CLUSTER_UNDO_BLOCK0_FRAME_INVALID
+		|| !XLogRecPtrIsInvalid(meta->last_wal_lsn)) {
+		LWLockRelease(&meta->content_lock);
+		if (owned != NULL)
+			pfree(owned);
+		return CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED;
+	}
+	guard->slot = (int)slotno;
+	guard->logical = *logical;
+	guard->startup_local = context;
+	guard->content_x_held = true;
+	if (owned != NULL) {
+		owned->slot = slotno;
+		block0_resource_link(owned);
+	}
+	if (!cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(logical->owner_instance),
+			logical->segment_id, logical->owner_instance, 0, private_page)) {
+		cluster_undo_block0_recovery_private_abort(guard);
+		return CLUSTER_UNDO_BLOCK0_IO_ERROR;
+	}
+	if (!cluster_tt_startup_local_context_valid(context, logical->owner_instance)
+		|| !UndoSegmentHeaderV2_identity_matches(private_page, BLCKSZ,
+			logical->segment_id, logical->owner_instance)
+		|| !block0_page_identity(private_page, logical, &generation)
+		|| !generation.known || generation.value == UINT32_MAX
+		|| cluster_undo_segment_header_integrity(private_page) != CLUSTER_UNDO_HEADER_VALID
+		|| memcmp(private_page, selected_base, BLCKSZ) != 0) {
+		cluster_undo_block0_recovery_private_abort(guard);
+		return CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
+	}
+	return CLUSTER_UNDO_BLOCK0_OK;
+}
+
+void
+cluster_undo_block0_startup_local_finish(ClusterUndoBlock0RecoveryGuard *guard,
+									  const char predecessor[BLCKSZ],
+									  const char successor[BLCKSZ], XLogRecPtr wal_lsn)
+{
+	ClusterUndoBlock0SlotData *meta;
+	ClusterUndoBlock0OwnedResource *owned;
+	PGAlignedBlock disk;
+	uint32 slotno;
+
+	if (guard == NULL || !guard->content_x_held || predecessor == NULL || successor == NULL
+		|| Block0Ctl == NULL || XLogRecPtrIsInvalid(wal_lsn)
+		|| cluster_undo_block0_logical_slot(&guard->logical, &slotno) != CLUSTER_UNDO_BLOCK0_OK
+		|| guard->slot != (int)slotno
+		|| !cluster_tt_startup_local_context_valid(guard->startup_local, guard->logical.owner_instance)
+		|| !UndoSegmentHeaderV2_identity_matches(successor, BLCKSZ,
+			guard->logical.segment_id, guard->logical.owner_instance)
+		|| cluster_undo_segment_header_integrity(successor) != CLUSTER_UNDO_HEADER_VALID)
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("invalid local Startup block-zero finish")));
+	meta = &Block0Slots[slotno].data;
+	owned = block0_resource_find(guard, CLUSTER_UNDO_BLOCK0_OWNED_RECOVERY);
+	if (pg_atomic_read_u32(&meta->state) != CLUSTER_UNDO_BLOCK0_SLOT_EMPTY
+		|| pg_atomic_read_u32(&meta->pincount) != 0
+		|| meta->frame_index != CLUSTER_UNDO_BLOCK0_FRAME_INVALID
+		|| !XLogRecPtrIsInvalid(meta->last_wal_lsn))
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("local Startup block zero is resident")));
+
+	/* WAL reaches durable storage before this private whole-page data write.
+	 * ERROR after insertion retains that WAL debt; caller FINALLY drops only
+	 * this content-X/resource, never a shared protection or recovery proof. */
+	XLogFlush(wal_lsn);
+	if (!cluster_tt_startup_local_context_valid(guard->startup_local, guard->logical.owner_instance)
+		|| !cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(guard->logical.owner_instance),
+			guard->logical.segment_id, guard->logical.owner_instance, 0, disk.data)
+		|| memcmp(disk.data, predecessor, BLCKSZ) != 0)
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("local Startup TT40 base changed after WAL")));
+	if (!cluster_undo_smgr_write_block(cluster_undo_intent_for_owner(guard->logical.owner_instance),
+			guard->logical.segment_id, guard->logical.owner_instance, 0, successor, true)
+		|| !cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(guard->logical.owner_instance),
+			guard->logical.segment_id, guard->logical.owner_instance, 0, disk.data)
+		|| memcmp(disk.data, successor, BLCKSZ) != 0
+		|| cluster_undo_segment_header_integrity(disk.data) != CLUSTER_UNDO_HEADER_VALID)
+		ereport(ERROR, (errcode(ERRCODE_IO_ERROR), errmsg("could not durably apply local Startup TT40 ABORT")));
+	LWLockRelease(&meta->content_lock);
+	block0_resource_forget(owned);
+	block0_recovery_guard_clear(guard);
+}
 
 ClusterUndoBlock0Result
 cluster_undo_block0_recovery_private_begin(const ClusterUndoBlock0LogicalKey *logical,
