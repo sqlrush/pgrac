@@ -513,20 +513,14 @@ def _requalification_completed_waits(start, case):
     return dict(completed_waits=len(raw) // 2, released_owners=len(decisions))
 
 
-def validate_cross_page_wait(case):
-    """Distinguish the UPDATE source from the actual full destination page."""
-    start, source, before = case['start'], case['source_tag'], case['before']
-    selected = select_blocker(start)
-    destination = start['tag']
+def validate_cross_page_setup(case):
+    """Check the ordinary inline layout and the live undo preparation bound."""
+    source, destination, before = case['source_tag'], case['destination_tag'], case['before']
     if (len(source) != 5 or len(destination) != 5 or source[:4] != destination[:4]
             or number(source[3]) != 0 or number(source[4]) == number(destination[4])
             or number(case['settings']['block_size']) != 8192
             or case['settings']['payload_storage'] != 'p'
-            or len(start['holders']) != 8
-            or {number(h['row']) for h in start['holders']} != set(range(1, 9))
-            or number(case['waiter_xid']) < 3
-            or number(case['waiter_xid']) in {number(h['xid']) for h in start['holders']}
-            or case['sql'] != "UPDATE m2_b06_pair SET v=v+1,pad=repeat('n',1000) WHERE id=9;"):
+            or case['sql'] != "UPDATE m2_b06_pair SET v=v+1,pad=repeat('n',480) WHERE id=9;"):
         raise ValueError('original two-page UPDATE and inline fixture identity are not proved')
     layout = case['layout']
     locations = {number(r['id']): _requalification_tid(r['ctid']) for r in layout}
@@ -536,16 +530,38 @@ def validate_cross_page_wait(case):
     for row in layout:
         ident = number(row['id'])
         block = number(source[4] if ident in (9, 11) else destination[4])
-        size = {9: 1800, 10: 5800, 11: 5600}.get(ident, 0)
+        size = {9: 900, 10: 6472, 11: 6600}.get(ident, 0)
         if locations[ident][0] != block or number(row['payload_bytes']) != size:
             raise ValueError('initial source or destination geometry changed')
     if (number(before['id']) != 9 or number(before['v']) != 0
             or _requalification_tid(before['ctid']) != locations[9]
-            or number(before['payload_bytes']) != 1800
-            or number(before['xmin']) == 0 or number(before['xmax']) != 0
+            or number(before['payload_bytes']) != 900
+            or number(before['xmin']) == 0 or number(before['xmax']) != 0):
+        raise ValueError('target is not on the observed distinct source page')
+    # This fixed, non-null int/int/plain-text schema has 24 header bytes,
+    # two int4 values and the four-byte header for its 900-byte inline text.
+    # UndoUpdatePayload is the existing fixed 12-byte UPDATE header.
+    tuple_bytes = number(before['tuple_bytes'])
+    capacity = number(case['settings']['inline_max_bytes'])
+    if tuple_bytes != 936 or not 16 <= capacity <= 8192 or tuple_bytes + 12 > capacity:
+        raise ValueError('original UPDATE undo payload does not fit its unchanged preparation capacity')
+    return dict(kind='pair_setup', source_tag=source, destination_tag=destination,
+                update_payload_bytes=tuple_bytes + 12, inline_max_bytes=capacity, authoritative=False)
+
+
+def validate_cross_page_wait(case):
+    """Distinguish the UPDATE source from the actual full destination page."""
+    start, source = case['start'], case['source_tag']
+    selected = select_blocker(start)
+    destination = start['tag']
+    validate_cross_page_setup(dict(case, destination_tag=destination))
+    if (len(start['holders']) != 8
+            or {number(h['row']) for h in start['holders']} != set(range(1, 9))
+            or number(case['waiter_xid']) < 3
+            or number(case['waiter_xid']) in {number(h['xid']) for h in start['holders']}
             or any(_requalification_tid(h['ctid'])[0] != number(destination[4])
                    for h in start['holders'])):
-        raise ValueError('target or original owners are not on the observed distinct pages')
+        raise ValueError('original owners are not on the observed destination page')
     reader = case['reader']
     if (number(reader['pid']) != start['waiter_pid'] or reader['state'] != 'active'
             or reader['query'] != case['sql'] or reader['wait_event'] != 'GesTxEnqueueWait'
@@ -572,7 +588,7 @@ def validate_cross_page_finish(case):
         raise ValueError('original two-page UPDATE did not complete in its original transaction')
     row = case['rows'][0]
     if (number(row['id']) != 9 or number(row['v']) != 1
-            or number(row['payload_bytes']) != 1000 or row['payload_matches'] is not True
+            or number(row['payload_bytes']) != 480 or row['payload_matches'] is not True
             or _requalification_tid(row['ctid'])[0] != number(start['tag'][4])
             or number(row['xmin']) != number(original['waiter_xid']) or number(row['xmax']) != 0):
         raise ValueError('original UPDATE did not publish the expected moved successor')
@@ -592,6 +608,8 @@ if __name__ == '__main__':
             print(json.dumps(dict(mutation=validate_requalification_mutation(case))))
         elif sys.argv[1:] == ['--requalify']:
             print(json.dumps(dict(requalified=validate_requalification_finish(case))))
+        elif sys.argv[1:] == ['--cross-page-setup']:
+            print(json.dumps(dict(pair_setup=validate_cross_page_setup(case))))
         elif sys.argv[1:] == ['--cross-page-wait']:
             print(json.dumps(dict(pair=validate_cross_page_wait(case))))
         elif sys.argv[1:] == ['--cross-page']:

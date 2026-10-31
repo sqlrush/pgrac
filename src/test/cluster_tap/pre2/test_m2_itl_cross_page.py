@@ -11,13 +11,13 @@ def cross_page():
     for i, holder in enumerate(start['holders']):
         holder['ctid'] = '(0,' + str(10+i) + ')'
     layout = [dict(id=i, ctid='(0,'+str(i)+')', payload_bytes=0) for i in range(1, 9)]
-    layout += [dict(id=9, ctid='(1,1)', payload_bytes=1800),
-               dict(id=10, ctid='(0,9)', payload_bytes=5800),
-               dict(id=11, ctid='(1,2)', payload_bytes=5600)]
-    sql = "UPDATE m2_b06_pair SET v=v+1,pad=repeat('n',1000) WHERE id=9;"
+    layout += [dict(id=9, ctid='(1,1)', payload_bytes=900),
+               dict(id=10, ctid='(0,9)', payload_bytes=6472),
+               dict(id=11, ctid='(1,2)', payload_bytes=6600)]
+    sql = "UPDATE m2_b06_pair SET v=v+1,pad=repeat('n',480) WHERE id=9;"
     return dict(start=start, source_tag=[1663,5,20000,0,1],
-                settings=dict(block_size=8192, payload_storage='p'), layout=layout,
-                before=dict(id=9, v=0, ctid='(1,1)', xmin='1100', xmax='0', payload_bytes=1800),
+                settings=dict(block_size=8192, payload_storage='p', inline_max_bytes=1024), layout=layout,
+                before=dict(id=9, v=0, ctid='(1,1)', xmin='1100', xmax='0', payload_bytes=900, tuple_bytes=936),
                 sql=sql, waiter_xid=1400, log=start['log'],
                 reader=dict(pid=200, state='active', query=sql, wait_event='GesTxEnqueueWait'),
                 holders=[dict(h, state='idle in transaction') for h in start['holders']])
@@ -30,7 +30,7 @@ def completed():
                 reader=dict(pid=200, state='idle in transaction', query=c['sql'], wait_event='ClientRead'),
                 waiter_xid=1400,
                 rows=[dict(id=9, v=1, ctid='(0,18)', xmin='1400', xmax='0',
-                           payload_bytes=1000, payload_matches=True)],
+                           payload_bytes=480, payload_matches=True)],
                 remaining=[dict(h, state='idle in transaction') for h in c['start']['holders'][1:]])
 
 
