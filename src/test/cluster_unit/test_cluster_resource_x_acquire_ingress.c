@@ -11,10 +11,12 @@
  * Author: SqlRush <sqlrush@gmail.com>
  *-------------------------------------------------------------------------
  */
+#ifndef RESOURCE_X_ACQUIRE_REUSE_PCM_FIXTURE
 int pcm_acquire_fixture_main(void);
 #define main pcm_acquire_fixture_main
 #include "test_cluster_pcm_lock.c"
 #undef main
+#endif
 
 #include "test_cluster_resource_x_acquire_candidate.inc"
 

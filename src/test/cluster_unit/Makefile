@@ -11498,3 +11498,45 @@ clean distclean maintainer-clean: clean-resource-x-pi-replace
 .PHONY: clean-resource-x-pi-replace
 clean-resource-x-pi-replace:
 	rm -f test_cluster_resource_x_pi_replace test_cluster_pi_replace_pcm.o
+
+# Join actual holder BufferDesc operations to the conditional PCM pair.
+TESTS += test_cluster_native_holder
+all: test_cluster_native_holder
+test_cluster_native_holder: test_cluster_native_holder.c test_cluster_native_first_fill \
+		test_cluster_native_first_fill_fixture.inc test_cluster_resource_x_acquire_fixture.inc \
+		test_cluster_resource_x_master_ack_fixture.inc test_cluster_resource_x_acquire_candidate.inc \
+		test_cluster_native_holder_bufmgr.inc test_cluster_native_holder_gcs.inc test_cluster_native_holder_itl.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+test_cluster_native_holder_bufmgr.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^cluster_bufmgr_pcm_current_image_locked\(/ { print "static inline bool"; emit=1; shape++ } \
+	     /^typedef enum ClusterPcmOwnSSourceHardFailureReason/ { emit=1; types++ } \
+	     /^} ClusterPcmOwnSSourceHardFailureReason;/ { print; emit=0; next } \
+	     /^cluster_bufmgr_pcm_own_(snapshot_by_tag|begin_s_revoke|abort_s_revoke|begin_x_revoke|abort_x_revoke|prepare_x_source_image|finish_x_source|prepare_s_source_image|finish_s_source)\(/ { print "ClusterPcmOwnResult"; emit=1; pub++ } \
+	     /^cluster_bufmgr_pcm_own_(finish_x_to_s_downgrade|capture_x_source_locked|prepare_x_source_image_internal|prepare_s_source_image_internal|copy_source_image_exact)\(/ { print "static ClusterPcmOwnResult"; emit=1; priv++ } \
+	     /^cluster_bufmgr_downgrade_record_pi\(/ { print "static bool"; emit=1; pi++ } \
+	     emit { print } /^}/ { emit=0 } END { if (shape != 1 || types != 1 || pi != 1 || pub != 9 || priv != 5) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_native_holder_gcs.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^gcs_block_resource_x_acquire_s_read_finish_owned\(/ { print "static ResourceXApplyResult"; emit=1; n++ } \
+	     /^gcs_block_resource_x_acquire_s_source_capture_owned\(/ { print "static ResourceXApplyResult"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } END { if (n != 2) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+clean distclean maintainer-clean: clean-native-holder
+.PHONY: clean-native-holder
+clean-native-holder:
+	rm -f test_cluster_native_holder test_cluster_native_holder_itl.inc \
+		test_cluster_native_holder_itl.inc.tmp test_cluster_native_holder_bufmgr.inc \
+		test_cluster_native_holder_bufmgr.inc.tmp test_cluster_native_holder_gcs.inc \
+		test_cluster_native_holder_gcs.inc.tmp
+
+test_cluster_native_holder_itl.inc: $(top_srcdir)/src/backend/cluster/cluster_itl.c Makefile
+	awk '/^cluster_itl_page_has_active_slot\(/ { print "bool"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0; exit } END { if (n != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@

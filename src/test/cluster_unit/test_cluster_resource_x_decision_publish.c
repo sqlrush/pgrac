@@ -11,7 +11,9 @@
 #define cluster_test_pcm_clock_gettime cluster_publish_fixture_clock_gettime
 #include "test_cluster_resource_x_acquire_fixture.inc"
 #undef cluster_test_pcm_clock_gettime
+#ifndef RESOURCE_X_ACQUIRE_REUSE_PCM_FIXTURE
 #include "test_cluster_resource_x_decision_owner_layout.inc"
+#endif
 
 static bool publish_zero_clock;
 int cluster_test_pcm_clock_gettime(clockid_t clock_id, struct timespec *time_out);
