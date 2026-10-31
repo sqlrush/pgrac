@@ -13326,6 +13326,24 @@ test_cluster_vm_report_pin test_cluster_vm_report_pin_noassert: test_cluster_vm_
 		test_cluster_vm_read_visibility.inc $(top_srcdir)/src/include/access/visibilitymap.h Makefile
 	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(srcdir) $(if $(filter %_noassert,$@),-DFIXTURE_NO_ASSERTS) $< $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
+TESTS += test_cluster_vm_corrupt_repin test_cluster_vm_corrupt_repin_noassert
+all: test_cluster_vm_corrupt_repin test_cluster_vm_corrupt_repin_noassert
+
+test_cluster_vm_corrupt_repin.inc: $(top_srcdir)/contrib/pg_visibility/pg_visibility.c \
+		$(srcdir)/extract_vm_report_fixture.py $(srcdir)/extract_vacuum_mx_fixture.py
+	python3 $(srcdir)/extract_vm_report_fixture.py $< --corrupt > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_vm_corrupt_repin test_cluster_vm_corrupt_repin_noassert: test_cluster_vm_corrupt_repin.c \
+		test_cluster_vm_read_visibility.c unit_test.h test_cluster_vm_corrupt_repin.inc \
+		test_cluster_vm_read_visibility.inc $(top_srcdir)/src/include/access/visibilitymap.h Makefile
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(srcdir) $(if $(filter %_noassert,$@),-DFIXTURE_NO_ASSERTS) $< $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+clean: clean-corrupt-vm-repin
+.PHONY: clean-corrupt-vm-repin
+clean-corrupt-vm-repin:
+	rm -f test_cluster_vm_corrupt_repin.inc test_cluster_vm_corrupt_repin.inc.tmp
+
 TESTS += test_cluster_vm_amcheck_pin test_cluster_vm_amcheck_pin_noassert
 all: test_cluster_vm_amcheck_pin test_cluster_vm_amcheck_pin_noassert
 
