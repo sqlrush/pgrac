@@ -61,6 +61,10 @@ static bool empty_input, cancel_input_on_recheck, latch_on_header;
 static unsigned empty_input_calls, proven_logs, unbound_logs;
 static bool need_vacuum;
 static bool latch_on_unlock, poison_on_unlock, move_cursor_on_observe;
+static bool change_next_on_unlock, change_slot_on_unlock, change_floor_on_unlock;
+static bool forget_members_on_unlock;
+static int zeroed_offsets[4096];
+static unsigned offset_zeroes;
 static char last_detail[512];
 static MultiXactId changed_next;
 static MultiXactId changed_g, last_read;
@@ -259,6 +263,22 @@ LWLockRelease(LWLock *lock)
 		change_g_on_unlock = false;
 		state.oldestMultiXactId = changed_g;
 	}
+	if (lock == MultiXactGenLock && change_next_on_unlock) {
+		change_next_on_unlock = false;
+		state.nextMXact = changed_next;
+	}
+	if (lock == MultiXactGenLock && change_slot_on_unlock) {
+		change_slot_on_unlock = false;
+		cluster_node_id++;
+	}
+	if (lock == MultiXactGenLock && change_floor_on_unlock) {
+		change_floor_on_unlock = false;
+		mxid_stripe_runtime.floor_mxid += CLUSTER_MXID_STRIDE;
+	}
+	if (lock == MultiXactGenLock && forget_members_on_unlock) {
+		forget_members_on_unlock = false;
+		state.oldestOffsetKnown = false;
+	}
 }
 bool
 LWLockHeldByMe(LWLock *lock)
@@ -301,6 +321,11 @@ int
 SimpleLruZeroPage(SlruCtl ctl, int page)
 {
 	zeroes++;
+	if (ctl == MultiXactOffsetCtl) {
+		if (offset_zeroes < lengthof(zeroed_offsets))
+			zeroed_offsets[offset_zeroes] = page;
+		offset_zeroes++;
+	}
 	memset(ctl->shared->page_buffer[page & 3], 0, BLCKSZ);
 	return page & 3;
 }
@@ -438,6 +463,9 @@ reset_fixture(int slot, MultiXactId floor, MultiXactId lower, MultiXactId next,
 	observation.mxid_disk_state = CLUSTER_MXID_DISK_ABSENT;
 	empty_input = cancel_input_on_recheck = latch_on_header = false;
 	latch_on_unlock = poison_on_unlock = move_cursor_on_observe = false;
+	change_next_on_unlock = change_slot_on_unlock = change_floor_on_unlock = false;
+	forget_members_on_unlock = false;
+	offset_zeroes = 0;
 	empty_input_calls = proven_logs = unbound_logs = 0;
 	need_vacuum = true;
 	last_detail[0] = '\0';
@@ -588,16 +616,15 @@ UT_TEST(unknown_endpoint_refuses_all_truncation)
 		UT_ASSERT_EQ(state.oldestMultiXactId, 48);
 	}
 }
-UT_TEST(allocation_refuses_candidate_behind_current_lower_bound)
+UT_TEST(allocation_catches_up_to_current_lower_bound)
 {
 	MultiXactId id = 0;
 	reset_fixture(0, 32, 100, 33, 500);
-	UT_ASSERT(allocate_error(&id));
-	UT_ASSERT_EQ(last_error, ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE);
-	UT_ASSERT_EQ(state.nextMXact, 33);
-	UT_ASSERT_EQ(state.nextOffset, 500);
+	UT_ASSERT(!allocate_error(&id));
+	UT_ASSERT_EQ(id, 112);
+	UT_ASSERT_EQ(state.nextMXact, 113);
+	UT_ASSERT_EQ(state.nextOffset, 502);
 	UT_ASSERT_EQ(zeroes + wal_records, 0);
-	UT_ASSERT_EQ(error_gen_lock, 0);
 }
 UT_TEST(allocation_rechecks_lower_bound_after_warning_unlock)
 {
@@ -607,16 +634,143 @@ UT_TEST(allocation_rechecks_lower_bound_after_warning_unlock)
 		state.multiVacLimit = 32;
 		changed_g = move ? 100 : 32;
 		change_g_on_unlock = true;
-		UT_ASSERT_EQ(allocate_error(&id), move != 0);
+		UT_ASSERT(!allocate_error(&id));
 		UT_ASSERT(reentries >= 2);
-		if (move) {
-			UT_ASSERT_EQ(last_error, ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE);
+		UT_ASSERT_EQ(id, move ? 112 : 48);
+		UT_ASSERT_EQ(state.nextMXact, id + 1);
+		UT_ASSERT_EQ(state.nextOffset, 502);
+	}
+}
+
+UT_TEST(allocation_both_candidates_use_native_order_for_every_stripe)
+{
+	static const struct {
+		MultiXactId floor, next, lower;
+		MultiXactId expected[16];
+	} cases[] = {
+		{32, 100, 37, {112,113,114,115,100,101,102,103,104,105,106,107,108,109,110,111}},
+		{32, 100, 100, {112,113,114,115,100,101,102,103,104,105,106,107,108,109,110,111}},
+		{32, 33, 100, {112,113,114,115,100,101,102,103,104,105,106,107,108,109,110,111}},
+		{UINT32_MAX - 63, UINT32_MAX - 31, 17,
+		 {32,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31}}
+	};
+	for (unsigned c = 0; c < lengthof(cases); c++) {
+		for (int warning = 0; warning < 2; warning++) {
+			for (int slot = 0; slot < 16; slot++) {
+				MultiXactId id = 0;
+				reset_fixture(slot, cases[c].floor, cases[c].lower, cases[c].next, 500);
+				if (warning)
+					state.multiVacLimit = cases[c].lower;
+				UT_ASSERT(!allocate_error(&id));
+				UT_ASSERT_EQ(id, cases[c].expected[slot]);
+				UT_ASSERT_EQ(id % 16, slot);
+				UT_ASSERT_EQ(state.nextMXact, id + 1);
+				UT_ASSERT_EQ(state.nextOffset, 502);
+			}
+		}
+	}
+}
+
+UT_TEST(warning_rechecks_counter_identity_and_member_protection)
+{
+	for (int fault = 0; fault < 6; fault++) {
+		MultiXactId id = 0;
+		reset_fixture(0, 32, 32, 33, 500);
+		state.multiVacLimit = 32;
+		changed_next = 100;
+		changed_g = 129;
+		change_next_on_unlock = fault < 2;
+		change_g_on_unlock = fault == 1;
+		change_floor_on_unlock = fault == 2;
+		change_slot_on_unlock = fault == 3;
+		poison_on_unlock = fault == 4;
+		forget_members_on_unlock = fault == 5;
+		UT_ASSERT_EQ(allocate_error(&id), fault >= 2);
+		if (fault < 2) {
+			UT_ASSERT_EQ(id, fault ? 144 : 112);
+			UT_ASSERT_EQ(state.nextOffset, 502);
+		} else {
+			/* Poison removes the floor, retaining the original reacquired
+			 * half-space refusal and normal ERROR lock cleanup. */
+			UT_ASSERT_EQ(last_error, fault == 4 ? ERRCODE_CLUSTER_MXID_HALFSPACE_LIMIT
+												  : ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE);
+			UT_ASSERT_EQ(error_gen_lock, fault == 4 ? 1 : 0);
 			UT_ASSERT_EQ(state.nextMXact, 33);
 			UT_ASSERT_EQ(state.nextOffset, 500);
 			UT_ASSERT_EQ(zeroes + wal_records, 0);
-			UT_ASSERT_EQ(error_gen_lock, 0);
-		} else
-			UT_ASSERT_EQ(id, 48);
+		}
+	}
+}
+
+UT_TEST(shared_member_stop_precedes_any_offset_extension)
+{
+	static const MultiXactOffset starts[] = {500, 0, UINT32_MAX};
+	static const MultiXactOffset stops[] = {501, 2, 1};
+	for (unsigned i = 0; i < lengthof(starts); i++) {
+		MultiXactId id = 0;
+		reset_fixture(15, 32, 2047, 2047, starts[i]);
+		state.offsetStopLimit = stops[i];
+		UT_ASSERT(allocate_error(&id));
+		UT_ASSERT_EQ(last_error, ERRCODE_PROGRAM_LIMIT_EXCEEDED);
+		UT_ASSERT_EQ(error_gen_lock, 0);
+		UT_ASSERT_EQ(state.nextMXact, 2047);
+		UT_ASSERT_EQ(state.nextOffset, starts[i]);
+		UT_ASSERT_EQ(zeroes + wal_records, 0);
+		UT_ASSERT_EQ(signals, 1);
+	}
+}
+
+UT_TEST(gap_skips_truncated_pages_and_keeps_prepared_next_page)
+{
+	MultiXactId id = 0;
+	reset_fixture(0, 32, 8193, 33, 500);
+	put_offset(48, 777);
+	UT_ASSERT(!allocate_error(&id));
+	UT_ASSERT_EQ(id, 8208);
+	UT_ASSERT_EQ(offset_zeroes, 1);
+	UT_ASSERT_EQ(zeroed_offsets[0], 4);
+	/* A different fixture page aliases the four-slot cache: check the actual
+	 * already prepared page separately, not a claim of disk persistence. */
+	for (int warning = 0; warning < 2; warning++) {
+		reset_fixture(1, 32, 2000, 2048, 500);
+		put_offset(2048, 499);
+		if (warning)
+			state.multiVacLimit = 2000;
+		UT_ASSERT(!allocate_error(&id));
+		UT_ASSERT_EQ(id, 2049);
+		UT_ASSERT_EQ(offset_zeroes, 0);
+		UT_ASSERT_EQ(((MultiXactOffset *)off_pages[1])[0], 499);
+	}
+}
+
+UT_TEST(qualified_empty_floor_gap_extends_each_new_page_once)
+{
+	MultiXactId id = 0;
+	reset_fixture(3, 8193, FirstMultiXactId, FirstMultiXactId, 500);
+	UT_ASSERT(!limits_error(true));
+	UT_ASSERT_EQ(state.oldestOffset, 500);
+	UT_ASSERT(!allocate_error(&id));
+	UT_ASSERT_EQ(id, 8195);
+	UT_ASSERT_EQ(offset_zeroes, 4);
+	for (unsigned i = 0; i < offset_zeroes; i++)
+		UT_ASSERT_EQ(zeroed_offsets[i], i + 1);
+	UT_ASSERT(!allocate_error(&id));
+	UT_ASSERT_EQ(id, 8211);
+	UT_ASSERT_EQ(offset_zeroes, 4);
+}
+
+UT_TEST(allocation_does_not_reinterpret_an_ambiguous_id_boundary)
+{
+	for (int input = 0; input < 2; input++) {
+		MultiXactId id = 0;
+		reset_fixture(0, 32, 32, 33, 500);
+		if (input)
+			state.nextMXact = 32 + CLUSTER_MXID_HALFSPACE + 16;
+		else
+			state.oldestMultiXactId = 32 + CLUSTER_MXID_HALFSPACE + 16;
+		UT_ASSERT(allocate_error(&id));
+		UT_ASSERT_EQ(zeroes + wal_records, 0);
+		UT_ASSERT_EQ(state.nextOffset, 500);
 	}
 }
 UT_TEST(unproven_limit_blocks_maintenance_and_allocation_before_normalization)
@@ -1023,7 +1177,7 @@ UT_TEST(single_shared_dense_mode_retains_native_limits_and_allocation)
 int
 main(void)
 {
-	UT_PLAN(29);
+	UT_PLAN(35);
 	UT_RUN(foreign_lower_uses_first_exact_local_id);
 	UT_RUN(local_empty_accepts_zero_and_lower_beyond_next);
 	UT_RUN(native_prefix_requires_qualified_empty_input);
@@ -1033,8 +1187,14 @@ main(void)
 	UT_RUN(vacuum_limit_recalculation_keeps_local_member_protection);
 	UT_RUN(truncation_uses_two_local_endpoints_and_preserves_live_segment);
 	UT_RUN(unknown_endpoint_refuses_all_truncation);
-	UT_RUN(allocation_refuses_candidate_behind_current_lower_bound);
+	UT_RUN(allocation_catches_up_to_current_lower_bound);
 	UT_RUN(allocation_rechecks_lower_bound_after_warning_unlock);
+	UT_RUN(allocation_both_candidates_use_native_order_for_every_stripe);
+	UT_RUN(warning_rechecks_counter_identity_and_member_protection);
+	UT_RUN(shared_member_stop_precedes_any_offset_extension);
+	UT_RUN(gap_skips_truncated_pages_and_keeps_prepared_next_page);
+	UT_RUN(qualified_empty_floor_gap_extends_each_new_page_once);
+	UT_RUN(allocation_does_not_reinterpret_an_ambiguous_id_boundary);
 	UT_RUN(unproven_limit_blocks_maintenance_and_allocation_before_normalization);
 	UT_RUN(concurrent_cut_or_origin_change_cannot_install_new_limit);
 	UT_RUN(invalid_native_binding_and_ambiguous_id_windows_are_refused);
