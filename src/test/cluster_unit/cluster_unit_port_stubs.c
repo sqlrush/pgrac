@@ -55,6 +55,16 @@ cluster_native_itl_trace_terminal(ClusterNativeItlTraceKind kind pg_attribute_un
 		abort();
 }
 void __attribute__((weak))
+cluster_native_itl_trace_update_retry(uint8 phase pg_attribute_unused(),
+	const ClusterCanonicalTxnBinding *binding pg_attribute_unused(),
+	Buffer old_vm pg_attribute_unused(), Buffer new_vm pg_attribute_unused(),
+	uint64 deadline pg_attribute_unused(),
+	const struct ClusterUndoRecordPrepareReceipt *receipt pg_attribute_unused())
+{
+	if (cluster_trace_tx_identity)
+		abort();
+}
+void __attribute__((weak))
 cluster_tx_identity_trace_emit(ClusterTxIdentityTraceKind kind pg_attribute_unused(),
 								const ClusterTxIdentityTrace *row pg_attribute_unused())
 {

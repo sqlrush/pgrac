@@ -15626,6 +15626,8 @@ l_pgrac_itl_capacity_wait: {
 	const char *wait_reason;
 	ClusterTxwResult wait_result;
 
+	cluster_native_itl_trace_update_retry(CLNITL_RETRY_BEFORE_VM_RELEASE, &canonical_binding,
+		vmbuffer, vmbuffer_new, itl_capacity_absolute_deadline_us, &undo_receipt);
 	/* No VM pin may cross the capacity wait. Reentry uses the existing
 	 * repin/page-choice owners; aliased handles each own a reference. */
 	if (BufferIsValid(vmbuffer)) {
@@ -15636,6 +15638,8 @@ l_pgrac_itl_capacity_wait: {
 		ReleaseBuffer(vmbuffer_new);
 		vmbuffer_new = InvalidBuffer;
 	}
+	cluster_native_itl_trace_update_retry(CLNITL_RETRY_BEFORE_WAIT, &canonical_binding,
+		vmbuffer, vmbuffer_new, itl_capacity_absolute_deadline_us, &undo_receipt);
 	{
 		ClusterXpScope xp_itl;
 
@@ -15675,6 +15679,8 @@ l_pgrac_itl_capacity_wait: {
 				(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
 				 errmsg("cluster undo reservation expired before heap update capacity retry"),
 				 cluster_heap_undo_receipt_errdetail(false)));
+	cluster_native_itl_trace_update_retry(CLNITL_RETRY_REQUALIFIED, &canonical_binding,
+		vmbuffer, vmbuffer_new, itl_capacity_absolute_deadline_us, &undo_receipt);
 	if (old_tuple_temp_locked)
 		goto l_pgrac_reacquire;
 	cluster_heap_lock_with_vm_repin(relation, block, buffer, &vmbuffer);

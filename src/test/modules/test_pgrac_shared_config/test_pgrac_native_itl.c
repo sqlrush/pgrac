@@ -95,7 +95,23 @@ static void append_event(StringInfo out, const ClusterNativeItlTraceEvent *r)
 		append_hex(out, &s->undo_segment_head, sizeof(UBA));
 		appendStringInfoString(out, "\",\"tt_wrap_known\":false}");
 	}
-	appendStringInfoString(out, "]}");
+	appendStringInfo(out,
+		"],\"update_retry\":{\"observed\":%s,\"phase\":%u,\"old_vm\":%d,\"new_vm\":%d,"
+		"\"wait_deadline_us\":\"" UINT64_FORMAT "\",\"receipt_present\":%s,"
+		"\"receipt_projection_only\":true,\"ready_known\":false,"
+		"\"shared_retirement_known\":false,\"vm_reference_counts_known\":false,"
+		"\"magic\":%u,\"record_type\":%u,\"owner_instance\":%u,\"payload_capacity\":%u,"
+		"\"segment_id\":%u,\"slot_offset\":%u,\"actual_segment_id\":%u,"
+		"\"reservation_sequence\":\"" UINT64_FORMAT "\",\"prepare_deadline_us\":\"" UINT64_FORMAT "\","
+		"\"attempt_generation\":%u,\"pending_mask\":%u,\"prepared_mask\":%u,"
+		"\"applied_mask\":%u,\"reuse_mask\":%u}}",
+		r->retry.observed ? "true" : "false", r->retry.phase,
+		r->retry.old_vm, r->retry.new_vm, r->retry.wait_deadline_us,
+		r->retry.receipt_present ? "true" : "false", r->retry.magic, r->retry.record_type,
+		r->retry.owner_instance, r->retry.payload_capacity, r->retry.segment_id,
+		r->retry.slot_offset, r->retry.actual_segment_id, r->retry.reservation_sequence,
+		r->retry.prepare_deadline_us, r->retry.attempt_generation, r->retry.pending_mask,
+		r->retry.prepared_mask, r->retry.applied_mask, r->retry.reuse_mask);
 }
 #endif
 

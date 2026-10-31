@@ -16,8 +16,28 @@ typedef enum ClusterNativeItlTraceKind {
 	CLNITL_SLOT_SELECTED,
 	CLNITL_PAGE_REREAD,
 	CLNITL_TT_COMMITTED,
-	CLNITL_TT_ABORTED
+	CLNITL_TT_ABORTED,
+	CLNITL_UPDATE_RETRY
 } ClusterNativeItlTraceKind;
+
+typedef enum ClusterNativeItlRetryPhase {
+	CLNITL_RETRY_BEFORE_VM_RELEASE = 1,
+	CLNITL_RETRY_BEFORE_WAIT,
+	CLNITL_RETRY_REQUALIFIED
+} ClusterNativeItlRetryPhase;
+
+/* Local diagnostic projection, not a receipt or a READY/retirement proof. */
+typedef struct ClusterNativeItlRetryCopy {
+	bool observed, receipt_present;
+	uint8 phase, record_type, owner_instance;
+	Buffer old_vm, new_vm;
+	uint64 wait_deadline_us, reservation_sequence, prepare_deadline_us;
+	uint32 magic, actual_segment_id, attempt_generation;
+	uint16 payload_capacity, segment_id, slot_offset;
+	uint8 pending_mask, prepared_mask, applied_mask, reuse_mask;
+} ClusterNativeItlRetryCopy;
+
+struct ClusterUndoRecordPrepareReceipt;
 
 typedef struct ClusterNativeItlTraceEvent {
 	uint64 sequence;
@@ -39,6 +59,7 @@ typedef struct ClusterNativeItlTraceEvent {
 	TransactionId caller_xid;
 	uint8 selected_slot;
 	ClusterItlSlotData slots[CLUSTER_ITL_INITRANS_DEFAULT];
+	ClusterNativeItlRetryCopy retry;
 } ClusterNativeItlTraceEvent;
 
 typedef struct ClusterNativeItlTracePrefix {
@@ -62,6 +83,9 @@ extern void cluster_native_itl_trace_terminal(ClusterNativeItlTraceKind kind,
 	uint8 owner, uint32 segment, uint32 generation, uint16 offset,
 	const TTSlot *successor, XLogRecPtr terminal_lsn,
 	const ClusterCanonicalTxnBinding *binding);
+extern void cluster_native_itl_trace_update_retry(uint8 phase,
+	const ClusterCanonicalTxnBinding *binding, Buffer old_vm, Buffer new_vm,
+	uint64 wait_deadline_us, const struct ClusterUndoRecordPrepareReceipt *receipt);
 #else
 /* Standalone authority fixtures have no diagnostic shared-memory region. */
 static inline void cluster_native_itl_trace_tt(ClusterNativeItlTraceKind kind,
@@ -74,6 +98,10 @@ static inline void cluster_native_itl_trace_terminal(ClusterNativeItlTraceKind k
 	const TTSlot *slot, XLogRecPtr lsn, const ClusterCanonicalTxnBinding *binding)
 { (void)kind; (void)owner; (void)segment; (void)generation; (void)offset;
   (void)slot; (void)lsn; (void)binding; }
+static inline void cluster_native_itl_trace_update_retry(uint8 phase,
+	const ClusterCanonicalTxnBinding *binding, Buffer old_vm, Buffer new_vm,
+	uint64 deadline, const struct ClusterUndoRecordPrepareReceipt *receipt)
+{ (void)phase; (void)binding; (void)old_vm; (void)new_vm; (void)deadline; (void)receipt; }
 #endif
 
 #endif
