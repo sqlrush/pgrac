@@ -344,44 +344,44 @@ cluster_tt_local_active_wait_owner(uint32 segment_id, TransactionId top_xid,
  * cluster_tt_local_wait_for_active_slot -- Wait in the original deadlock graph.
  * Inputs: unchanged selected segment and unpublished caller. Returns only an
  * allocator recheck request. Side Effects: original native VXID wait; finally
- * retires frontend scope on caller timeout/cancel/deadlock/other ERROR.
+ * retires entered frontend scope and restores the event on every probe/wait exit.
  */
 static bool
 cluster_tt_local_wait_for_active_slot(uint32 segment_id, TransactionId top_xid)
 {
 	VirtualTransactionId owner;
 	bool recheck;
-	volatile bool completed = false;
+	volatile bool retry = false;
+	volatile bool wait_started = false;
 	uint32 previous_wait_event = *my_wait_event_info;
 
-	if (!cluster_undo_cleaner_capacity_context_safe()) {
-		cluster_undo_cleaner_note_capacity_refusal(true);
-		return false;
-	}
-	if (!cluster_tt_local_active_wait_owner(segment_id, top_xid, &owner, &recheck)) {
-		cluster_undo_cleaner_note_capacity_refusal(false);
-		return false;
-	}
-	if (recheck)
-		return true;
-	if (!cluster_undo_cleaner_capacity_context_safe()) {
-		cluster_undo_cleaner_note_capacity_refusal(true);
-		return false;
-	}
-	cluster_undo_cleaner_tx_slot_wait_begin();
 	PG_TRY();
 	{
-		(void)VirtualXactLock(owner, true);
-		completed = true;
+		if (!cluster_undo_cleaner_capacity_context_safe())
+			cluster_undo_cleaner_note_capacity_refusal(true);
+		else if (!cluster_tt_local_active_wait_owner(segment_id, top_xid, &owner, &recheck))
+			cluster_undo_cleaner_note_capacity_refusal(false);
+		else if (recheck)
+			retry = true;
+		else if (!cluster_undo_cleaner_capacity_context_safe())
+			cluster_undo_cleaner_note_capacity_refusal(true);
+		else {
+			cluster_undo_cleaner_tx_slot_wait_begin();
+			wait_started = true;
+			(void)VirtualXactLock(owner, true);
+			retry = true;
+		}
 	}
 	PG_FINALLY();
 	{
-		cluster_undo_cleaner_tx_slot_wait_end(!completed && geterrcode() == ERRCODE_QUERY_CANCELED);
+		if (wait_started)
+			cluster_undo_cleaner_tx_slot_wait_end(!retry && geterrcode() == ERRCODE_QUERY_CANCELED);
 		pgstat_report_wait_start(previous_wait_event);
 	}
 	PG_END_TRY();
-	cluster_undo_cleaner_note_tx_slot_recheck();
-	return true;
+	if (wait_started)
+		cluster_undo_cleaner_note_tx_slot_recheck();
+	return retry;
 }
 
 static void

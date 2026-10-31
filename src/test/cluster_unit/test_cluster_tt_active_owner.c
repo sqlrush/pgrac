@@ -82,6 +82,7 @@ static unsigned slot_wait_cancels;
 static unsigned slot_wait_drift, slot_wait_owner_kind;
 static int slot_wait_error;
 static bool slot_wait_commit, slot_wait_terminal_capacity;
+static bool slot_wait_probe_contention;
 static uint32 slot_wait_event;
 uint32 *my_wait_event_info = &slot_wait_event;
 static void fill_selected_segment(ClusterTTSlotAllocStatus status);
@@ -148,6 +149,11 @@ repalloc(void *pointer, Size size)
 bool
 LWLockAcquire(LWLock *lock, LWLockMode mode pg_attribute_unused())
 {
+	/* A contended real snapshot lock ends its diagnostic before returning. */
+	if (slot_wait_probe_contention && lock == &allocator_storage.per_node[0].lock) {
+		pgstat_report_wait_start(PG_WAIT_LWLOCK | lock->tranche);
+		pgstat_report_wait_end();
+	}
 	if (undo_cleaner_state != NULL && lock == &undo_cleaner_state->lwlock)
 		slot_stats_lock_acquires++;
 	lock_depth++;
@@ -380,7 +386,8 @@ geterrcode(void)
 VirtualTransactionId *
 GetLockConflicts(const LOCKTAG *tag, LOCKMODE mode, int *count)
 {
-	VirtualTransactionId *owners = calloc(3, sizeof(*owners));
+	/* The original non-recovery lookup allocates before reading its lock table. */
+	VirtualTransactionId *owners = palloc0(3 * sizeof(*owners));
 
 	UT_ASSERT(slot_wait_test);
 	UT_ASSERT_EQ(tag->locktag_type, LOCKTAG_TRANSACTION);
@@ -590,6 +597,7 @@ reset_active_owner(void)
 	slot_wait_cancels = 0;
 	slot_wait_drift = slot_wait_owner_kind = 0;
 	slot_wait_error = 0;
+	slot_wait_probe_contention = false;
 	slot_wait_event = WAIT_EVENT_CLIENT_READ;
 	modifier_refused = false;
 	cluster_shared_config = false;
@@ -1938,6 +1946,130 @@ UT_TEST(test_native_wakeup_counter_is_initialized_unsigned_unavailable_and_lock_
 		   sizeof(UndoCleanerSharedState), sizeof(ClusterUndoCapacityStats), sizeof(pg_atomic_uint64));
 }
 
+UT_TEST(test_native_owner_probe_rechecks_restore_the_entering_event)
+{
+	const uint32 events[]
+		= { 0, WAIT_EVENT_CLIENT_READ, WAIT_EVENT_CLUSTER_BGPROC_UNDO_CLEANER_MAIN_LOOP };
+
+	for (unsigned e = 0; e < lengthof(events); e++) {
+		for (unsigned change = 0; change < 6; change++) {
+			uint32 selected = 1;
+			ClusterUndoCapacityStats stats;
+
+			start_full_active_test();
+			if (change == 0)
+				selected = 2;
+			else if (change == 1)
+				cluster_tt_slot_free(1, 0);
+			else if (change == 2)
+				cluster_tt_slot_mark_committed(1, 0, 200,
+											 allocator_storage.per_node[0].slots[0].wrap, (SCN)91);
+			else if (change == 3)
+				cluster_tt_slot_mark_aborted(1, 0, 200,
+										   allocator_storage.per_node[0].slots[0].wrap);
+			else
+				slot_wait_drift = change - 3;
+			slot_wait_probe_contention = true;
+			pgstat_report_wait_start(events[e]);
+			UT_ASSERT(cluster_tt_local_wait_for_active_slot(selected, 100));
+			UT_ASSERT_EQ(slot_wait_event, events[e]);
+			UT_ASSERT_EQ(slot_wait_calls + slot_wait_begins + slot_wait_ends, 0);
+			UT_ASSERT_EQ(g_bind_emit_calls + cold_selection_calls + capacity_waits + lock_depth, 0);
+			assert_active_refusal_stats(0, 0);
+			UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&stats));
+			UT_ASSERT_EQ(native_wakeup_rechecks(&stats), 0);
+		}
+	}
+}
+
+UT_TEST(test_native_owner_probe_refusals_restore_event_without_entering_wait)
+{
+	const uint32 events[]
+		= { 0, WAIT_EVENT_CLIENT_READ, WAIT_EVENT_CLUSTER_BGPROC_UNDO_CLEANER_MAIN_LOOP };
+
+	for (unsigned e = 0; e < lengthof(events); e++) {
+		for (unsigned refusal = 0; refusal < 6; refusal++) {
+			ClusterUndoCapacityStats stats;
+
+			start_full_active_test();
+			if (refusal == 0)
+				slot_wait_context_safe = false;
+			else if (refusal == 1)
+				allocator_storage.per_node[0].binding_generation = 0;
+			else
+				slot_wait_owner_kind = refusal - 1;
+			slot_wait_probe_contention = true;
+			pgstat_report_wait_start(events[e]);
+			UT_ASSERT(!cluster_tt_local_wait_for_active_slot(1, 100));
+			UT_ASSERT_EQ(slot_wait_event, events[e]);
+			UT_ASSERT_EQ(slot_wait_calls + slot_wait_begins + slot_wait_ends, 0);
+			UT_ASSERT_EQ(g_bind_emit_calls + cold_selection_calls + capacity_waits + lock_depth, 0);
+			assert_active_refusal_stats(refusal == 0 || refusal == 5,
+									refusal != 0 && refusal != 5);
+			UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&stats));
+			UT_ASSERT_EQ(native_wakeup_rechecks(&stats), 0);
+		}
+	}
+}
+
+UT_TEST(test_native_owner_probe_error_restores_event_and_preserves_fresh_wait)
+{
+	const uint32 events[]
+		= { 0, WAIT_EVENT_CLIENT_READ, WAIT_EVENT_CLUSTER_BGPROC_UNDO_CLEANER_MAIN_LOOP };
+	const int errors[] = { ERRCODE_OUT_OF_MEMORY, ERRCODE_QUERY_CANCELED,
+						   ERRCODE_LOCK_NOT_AVAILABLE, ERRCODE_T_R_DEADLOCK_DETECTED,
+						   ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS, ERRCODE_IO_ERROR, 0 };
+
+	for (unsigned e = 0; e < lengthof(events); e++) {
+		for (unsigned i = 0; i < lengthof(errors); i++) {
+			ClusterUndoCapacityStats stats;
+			volatile bool caught = false, retry = false;
+			volatile int caught_code = 0;
+
+			start_full_active_test();
+			fail_next_memory_allocation = i == 0;
+			slot_wait_error = i == 0 ? 0 : errors[i];
+			slot_wait_probe_contention = true;
+			pgstat_report_wait_start(events[e]);
+			PG_TRY();
+			{
+				retry = cluster_tt_local_wait_for_active_slot(1, 100);
+			}
+			PG_CATCH();
+			{
+				caught = true;
+				caught_code = geterrcode();
+			}
+			PG_END_TRY();
+			UT_ASSERT_EQ(slot_wait_event, events[e]);
+			UT_ASSERT_EQ(caught, errors[i] != 0);
+			UT_ASSERT_EQ(caught_code, errors[i]);
+			UT_ASSERT_EQ(retry, errors[i] == 0);
+			UT_ASSERT_EQ(slot_wait_begins, i != 0);
+			UT_ASSERT_EQ(slot_wait_ends, i != 0);
+			UT_ASSERT(!slot_wait_in_native);
+			UT_ASSERT_EQ(slot_wait_cancels, errors[i] == ERRCODE_QUERY_CANCELED);
+			UT_ASSERT_EQ(g_bind_emit_calls + cold_selection_calls + capacity_waits + lock_depth, 0);
+			assert_active_refusal_stats(0, 0);
+			UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&stats));
+			UT_ASSERT_EQ(native_wakeup_rechecks(&stats), errors[i] == 0);
+			if (errors[i] != 0) {
+				/* Retire the injected boundary, then use the original full caller. */
+				slot_wait_probe_contention = false;
+				slot_wait_error = 0;
+				pgstat_report_wait_start(events[e]);
+				require_published_on(1);
+				UT_ASSERT_EQ(slot_wait_event, events[e]);
+				UT_ASSERT_EQ(slot_wait_begins, i == 0 ? 1 : 2);
+				UT_ASSERT_EQ(slot_wait_ends, slot_wait_begins);
+				UT_ASSERT(!slot_wait_in_native);
+				UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&stats));
+				UT_ASSERT_EQ(native_wakeup_rechecks(&stats), 1);
+			}
+		}
+	}
+}
+
 #ifdef TT_ACTIVE_OWNER_FIXTURE_MAIN
 int TT_ACTIVE_OWNER_FIXTURE_MAIN(void);
 #define main TT_ACTIVE_OWNER_FIXTURE_MAIN
@@ -1946,7 +2078,7 @@ int TT_ACTIVE_OWNER_FIXTURE_MAIN(void);
 int
 main(void)
 {
-	UT_PLAN(55);
+	UT_PLAN(58);
 	UT_RUN(test_current_origin_snapshot_uses_original_terminal_slot_provenance);
 	UT_RUN(test_current_origin_snapshot_rejects_missing_or_malformed_original_identity);
 	UT_RUN(test_current_origin_snapshot_never_initializes_or_outlives_original_slot);
@@ -2002,6 +2134,9 @@ main(void)
 	UT_RUN(test_native_wakeup_recheck_counts_normal_owner_commit_and_abort_once);
 	UT_RUN(test_native_wakeup_recheck_excludes_errors_drift_and_refusals);
 	UT_RUN(test_native_wakeup_counter_is_initialized_unsigned_unavailable_and_lock_free);
+	UT_RUN(test_native_owner_probe_rechecks_restore_the_entering_event);
+	UT_RUN(test_native_owner_probe_refusals_restore_event_without_entering_wait);
+	UT_RUN(test_native_owner_probe_error_restores_event_and_preserves_fresh_wait);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
