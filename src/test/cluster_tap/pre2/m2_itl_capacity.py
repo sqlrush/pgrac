@@ -595,6 +595,143 @@ def validate_cross_page_finish(case):
     return dict(proof, **_requalification_completed_waits(start, case))
 
 
+def _retry_trace(trace):
+    events = trace['events']
+    if (not isinstance(events, list) or len(events) > 4096
+            or number(trace.get('version')) != 1 or trace.get('sequence_domain') != 'NATIVE_ITL'
+            or trace.get('atomic_graph') is not False or number(trace.get('capacity')) != 4096
+            or any(trace.get(k) is not True for k in ('available', 'enabled', 'export_complete'))
+            or trace.get('overflow') is not False or number(trace.get('dropped')) != 0
+            or any(number(trace.get(k)) != len(events)
+                   for k in ('reserved_before', 'reserved_after', 'exported', 'last_seq'))
+            or number(trace.get('first_seq')) != (1 if events else 0)
+            or any(not isinstance(e, dict) or number(e.get('sequence')) != i
+                   for i, e in enumerate(events, 1))):
+        raise ValueError('retry observation prefix is incomplete, reordered or overflowed')
+    return events
+
+
+def _retry_actor(row):
+    actor = tuple(number(row.get(k)) for k in
+                  ('node', 'pid', 'procno', 'backend_id', 'backend_start', 'process_incarnation'))
+    if (actor[0] >= 4 or not 0 < actor[1] < 2**31 or actor[2] >= 2**31
+            or not 0 < actor[3] < 2**31 or not actor[4] or not actor[5]
+            or row.get('authoritative') is not False):
+        raise ValueError('retry observation actor identity is incomplete')
+    return actor
+
+
+def _retry_projection(row):
+    copy = row['update_retry']
+    if (any(copy.get(k) is not True for k in ('observed', 'receipt_present', 'receipt_projection_only'))
+            or any(copy.get(k) is not False for k in
+                   ('ready_known', 'shared_retirement_known', 'vm_reference_counts_known'))):
+        raise ValueError('retry observation does not retain its unknown authority boundary')
+    fields = ('magic', 'record_type', 'owner_instance', 'payload_capacity', 'segment_id',
+              'slot_offset', 'actual_segment_id', 'reservation_sequence', 'prepare_deadline_us',
+              'attempt_generation', 'pending_mask', 'prepared_mask', 'applied_mask', 'reuse_mask')
+    values = {k: number(copy.get(k)) for k in fields}
+    if (values['magic'] != 0x55525250 or values['record_type'] != 2
+            or not values['reservation_sequence'] or not 16 <= values['payload_capacity'] <= 8192
+            or not values['attempt_generation'] or values['applied_mask'] != 0
+            or values['pending_mask'] not in (0, 1, 3)
+            or values['prepared_mask'] & ~values['pending_mask']
+            or values['reuse_mask'] & ~values['prepared_mask']):
+        raise ValueError('retry local receipt projection is missing or contradictory')
+    return values
+
+
+def validate_retry_observations(case):
+    """Observe one original UPDATE; no READY, pin-count or retirement verdict."""
+    finish = case['finish']
+    pair = validate_cross_page_finish(finish)
+    original = finish['cross_page']
+    start = original['start']
+    pid, node, xid = (number(start['waiter_pid']), number(start['waiter_node']),
+                      number(original['waiter_xid']))
+    events = _retry_trace(case['trace'])
+    active = [e for e in events if e.get('kind') == 2 and e.get('pid') == pid
+              and e.get('node') == node and e.get('key', {}).get('xid') == xid]
+    if len(active) != 1 or active[0].get('key_known') is not True:
+        raise ValueError('original waiter ACTIVE publication is missing or ambiguous')
+    producer = active[0]
+    actor = _retry_actor(producer)
+    key = {k: number(producer['key'].get(k)) for k in KEY_FIELDS}
+    slot = producer['tt_slot']
+    lsn = number(producer.get('bind_lsn'))
+    if (key['format_version'] != 1 or key['owner_instance'] != node + 1
+            or key['origin_node_id'] != node or key['xid'] != xid
+            or not 0 <= key['slot_wrap'] < 65535 or not lsn
+            or any(not key[k] for k in ('segment_id', 'system_identifier', 'origin_boot_incarnation',
+                                        'admission_record_generation', 'root_descriptor_incarnation',
+                                        'root_id', 'root_generation'))
+            or any(number(slot.get(k)) != v for k, v in
+                   dict(xid=xid, wrap=key['slot_wrap'], status=1).items())):
+        raise ValueError('original waiter full canonical identity is not proved')
+    expected_binding = {k: key[k] for k in
+                        ('segment_id', 'segment_generation', 'xid', 'slot_offset', 'slot_wrap')}
+    expected_binding.update(origin_instance=key['owner_instance'], publish_state=3,
+                            reserved16=0, active_lsn=lsn)
+    cuts = [e for e in events if e.get('kind') == 7 and e.get('pid') == pid and e.get('node') == node]
+    if not cuts or len(cuts) % 3:
+        raise ValueError('retry observation lacks a complete three-point span')
+    baseline, deadline, handle_slots, alias = None, 0, 0, False
+    for offset in range(0, len(cuts), 3):
+        group = cuts[offset:offset+3]
+        projections, stamps = [], []
+        for phase, row in enumerate(group, 1):
+            copy = row['update_retry']
+            if (_retry_actor(row) != actor or number(row['sequence']) <= number(producer['sequence'])
+                    or row.get('key_known') is not False or row.get('native_binding_known') is not True
+                    or number(copy.get('phase')) != phase or number(row.get('bind_lsn')) != lsn
+                    or any(number(row['native_binding'].get(k)) != v for k, v in expected_binding.items())):
+                raise ValueError('retry phase, actual actor or native binding changed')
+            projections.append(_retry_projection(row))
+            stamps.append(number(copy.get('wait_deadline_us')))
+            old, new = (number(copy.get(k)) for k in ('old_vm', 'new_vm'))
+            if old >= 2**31 or new >= 2**31 or (phase != 1 and (old or new)):
+                raise ValueError('retry retained a VM handle across its wait')
+            if phase == 1:
+                handle_slots = max(handle_slots, bool(old) + bool(new))
+                alias |= old != 0 and old == new
+        if projections[0] != projections[1] or projections[0] != projections[2]:
+            raise ValueError('local receipt projection changed across the capacity wait')
+        projection = projections[0]
+        if (projection['owner_instance'] != key['owner_instance']
+                or projection['segment_id'] != key['segment_id']
+                or projection['slot_offset'] != key['slot_offset']):
+            raise ValueError('local reservation does not belong to the original waiter')
+        identity = {k: projection[k] for k in tuple(projection)[:9]}
+        if baseline is not None and baseline != identity:
+            raise ValueError('a later capacity cycle replaced the original local reservation')
+        baseline = identity
+        if (stamps[0] != stamps[1] or not stamps[2]
+                or (stamps[0] and stamps[0] != stamps[2])
+                or (deadline and (stamps[0] != deadline or stamps[2] != deadline))):
+            raise ValueError('original capacity deadline changed or was renewed')
+        deadline = stamps[2]
+    if not handle_slots:
+        raise ValueError('no owned VM handle was observed before the capacity wait')
+    for snapshot in finish['waits']:
+        observed = _retry_trace(snapshot['trace'])
+        if events[:len(observed)] != observed:
+            raise ValueError('retry completion replaced an immutable wait observation')
+        pending = [e for e in observed if e.get('kind') == 7
+                   and e.get('pid') == pid and e.get('node') == node]
+        if len(pending) % 3 != 2 or cuts[:len(pending)] != pending:
+            raise ValueError('actual wait was not observed inside an open capacity span')
+        if number(cuts[len(pending)]['sequence']) <= len(observed):
+            raise ValueError('retry was already qualified before the actual wait snapshot')
+    return dict(kind='pair_retry', waiter_pid=pid, waiter_xid=xid, key=key,
+                source_tag=pair['source_tag'], destination_tag=pair['destination_tag'],
+                cycles=len(cuts)//3, completed_waits=pair['completed_waits'],
+                reservation_sequence=str(baseline['reservation_sequence']),
+                prepare_deadline_us=str(baseline['prepare_deadline_us']), wait_deadline_us=str(deadline),
+                vm_handle_slots_observed=handle_slots, aliased_handles_observed=alias,
+                scope='local_projection_only', authoritative=False, ready_known=False,
+                shared_retirement_known=False, vm_reference_counts_known=False)
+
+
 if __name__ == '__main__':
     try:
         case = json.load(sys.stdin)
@@ -614,6 +751,8 @@ if __name__ == '__main__':
             print(json.dumps(dict(pair=validate_cross_page_wait(case))))
         elif sys.argv[1:] == ['--cross-page']:
             print(json.dumps(dict(cross_page=validate_cross_page_finish(case))))
+        elif sys.argv[1:] == ['--retry-observation']:
+            print(json.dumps(dict(retry_observation=validate_retry_observations(case))))
         elif not sys.argv[1:]:
             print(json.dumps(dict(selected=select_blocker(case))))
         else:
