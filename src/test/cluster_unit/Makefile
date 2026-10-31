@@ -872,6 +872,8 @@ test_cluster_relmap_v2: test_cluster_relmap_v2.c unit_test.h \
 test_cluster_cold_relmap_executor.o: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_relmap.c \
 		$(top_srcdir)/src/include/cluster/cluster_side_online_plan.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_relmap.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_lock.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_plan_internal.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_PGRAC_CLUSTER -DUSE_CLUSTER_UNIT -ffunction-sections -fdata-sections -c $< -o $@
 
@@ -12571,6 +12573,7 @@ test_cluster_cold_recovery_startup: test_cluster_cold_recovery_startup.c unit_te
 		test_cluster_cold_startup_relmap.inc \
 		$(COLD_NATIVE_SIDE_OBJS) $(COLD_STARTUP_RELMAP_OBJS) test_cluster_cold_native_side.h \
 		test_cluster_cold_startup_relmap_replay.inc test_cluster_cold_startup_relmap_storage.h \
+		test_cluster_cold_startup_relmap_producer.inc \
 		test_cluster_cold_native_storage.inc test_cluster_recovery_episode_clog.o \
 		test_cluster_recovery_episode_clog.h \
 		test_cluster_cold_native_clog_consumed.inc \
@@ -14575,12 +14578,16 @@ test_cluster_cold_startup_relmap_executor.o: $(top_srcdir)/src/backend/cluster/c
 		test_cluster_cold_native_side_namespace.h test_cluster_cold_startup_relmap_storage_namespace.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_relmap.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_plan_internal.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_lock.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h \
 		$(top_srcdir)/src/include/cluster/cluster_side_online_plan.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_PGRAC_CLUSTER -DUSE_CLUSTER_UNIT \
 		-include test_cluster_cold_native_side_namespace.h \
-		-DLWLockAcquire=startup_relmap_storage_LWLockAcquire \
+		-DLWLockAcquire=test_cold_relmap_storage_acquire \
 		-DLWLockRelease=startup_relmap_storage_LWLockRelease \
 		-DLWLockHeldByMe=startup_relmap_storage_LWLockHeldByMe \
+		-DenableFsync=startup_relmap_storage_enableFsync \
+		-Dcluster_relmap_authority_x_held=startup_relmap_storage_cluster_relmap_authority_x_held \
 		-ffunction-sections -fdata-sections -c $< -o $@
 
 .PHONY: clean-startup-relmap-replay

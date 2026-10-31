@@ -16,7 +16,7 @@
 #undef error_context_stack
 #undef pg_re_throw
 #define write relmap_test_write
-#define read relmap_test_read
+#define read test_cold_relmap_storage_read
 #define renameat relmap_test_renameat
 #define close relmap_test_close
 #include "../../backend/cluster/cluster_relmap_authority.c"

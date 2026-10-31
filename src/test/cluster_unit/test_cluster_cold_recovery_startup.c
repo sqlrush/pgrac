@@ -3975,6 +3975,7 @@ UT_TEST(test_full_clog_truncate_dispatch_uses_original_projection_identity)
 #include "test_cluster_cold_native_storage.inc"
 #include "test_cluster_cold_startup_relmap.inc"
 #include "test_cluster_cold_startup_relmap_replay.inc"
+#include "test_cluster_cold_startup_relmap_producer.inc"
 
 int
 main(void)
@@ -4017,7 +4018,16 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(168);
+	if (getenv("PGRAC_PRE2_TEST_STARTUP_RELMAP_PRODUCER") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_startup_relmap_produces_declaration_from_original_pin_and_wal);
+		UT_RUN(test_relmap_producer_preflights_whole_batch_and_budget_before_io);
+		UT_RUN(test_relmap_producer_late_record_or_pin_error_is_sticky);
+		UT_RUN(test_startup_relmap_producer_rechecks_sources_before_pass_one);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
+	UT_PLAN(172);
 	UT_RUN(test_full_clog_truncate_dispatch_uses_original_projection_identity);
 	UT_RUN(test_full_clog_dispatch_uses_only_original_projection_identity);
 	UT_RUN(test_execution_refusal_preserves_the_first_census_failure);
@@ -4187,6 +4197,10 @@ main(void)
 	UT_RUN(test_startup_relmap_missing_or_changed_carrier_refuses_before_files);
 	UT_RUN(test_startup_relmap_partial_write_and_late_error_retain_original_debt);
 	UT_RUN(test_startup_relmap_final_receipt_rechecks_original_source_and_side);
+	UT_RUN(test_startup_relmap_produces_declaration_from_original_pin_and_wal);
+	UT_RUN(test_relmap_producer_preflights_whole_batch_and_budget_before_io);
+	UT_RUN(test_relmap_producer_late_record_or_pin_error_is_sticky);
+	UT_RUN(test_startup_relmap_producer_rechecks_sources_before_pass_one);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

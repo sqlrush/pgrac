@@ -17,6 +17,7 @@
 #include "cluster/cluster_cold_recovery_plan_internal.h"
 #include "cluster/cluster_relmap_authority.h"
 #include "cluster/cluster_relmap_retention.h"
+#include "cluster/cluster_relmap_lock.h"
 #include "cluster/cluster_side_online_plan.h"
 #include "storage/lwlock.h"
 #include "utils/relmapper.h"
@@ -128,6 +129,130 @@ relmap_record_matches(const ClusterColdRelmapInputV1 *input, XLogReaderState *re
 		&& header.nbytes == sizeof(RelMapFile)
 		&& memcmp(XLogRecGetData(reader) + MinSizeOfRelmapUpdate, &input->staged.pending,
 			sizeof(RelMapFile)) == 0;
+}
+
+static bool
+relmap_wal_input(const ClusterColdPlanV1 *plan, const ClusterWalSourceRef *sources,
+	uint32 replay_count, const ClusterColdRelmapWalV1 *wal, ClusterColdRelmapInputV1 *input)
+{
+	XLogReaderState *reader = wal->reader;
+	const DecodedXLogRecord *record;
+	ClusterRelmapV2Image checked;
+	unsigned char encoded[CLUSTER_RELMAP_V2_FILE_SIZE];
+
+	if (wal->participant >= replay_count || wal->generation < 2
+		|| wal->owner.wal_end != 0 || reader == NULL || reader->record == NULL)
+		return false;
+	record = reader->record;
+	if (record->header.xl_rmid != RM_RELMAP_ID || record->header.xl_info != XLOG_RELMAP_UPDATE
+		|| record->main_data == NULL
+		|| record->main_data_len != MinSizeOfRelmapUpdate + sizeof(RelMapFile)
+		|| reader->system_identifier != wal->identity.system_identifier
+		|| reader->cluster_expected_thread_id != sources[wal->participant].claim.identity.origin_thread_id
+		|| reader->seg.ws_tli != sources[wal->participant].timeline)
+		return false;
+	input->participant = wal->participant;
+	input->cut = plan->participants[plan->canonical[wal->participant]].cut;
+	input->source = sources[wal->participant];
+	input->frame = (ClusterColdRecordFrameV1){reader->ReadRecPtr, reader->EndRecPtr,
+		record->header.xl_crc, wal->participant, record->header.xl_xid,
+		record->toplevel_xid, 0, 0, record->header.xl_rmid, record->header.xl_info, false};
+	input->staged.identity = wal->identity;
+	input->staged.committed_generation = wal->generation - 1;
+	input->staged.pending_generation = wal->generation;
+	input->staged.pending_owner = wal->owner;
+	input->staged.pending_owner.wal_end = reader->EndRecPtr;
+	memcpy(&input->staged.pending, record->main_data + MinSizeOfRelmapUpdate, sizeof(RelMapFile));
+	input->retention = wal->retention;
+	input->retention_lock = wal->retention_lock;
+	/* Validate the WAL image before any physical baseline read. This local
+	 * duplicate is only codec input; it never supplies the committed base. */
+	checked = input->staged;
+	checked.committed = checked.pending;
+	return relmap_record_matches(input, reader)
+		&& cluster_relmap_v2_encode(&checked, encoded, sizeof(encoded)) == CLUSTER_RELMAP_V2_VALID;
+}
+
+ClusterColdDetailV1
+cluster_cold_plan_relmap_from_wal_v1(ClusterColdPlanV1 *plan,
+	const ClusterWalSourceRef *sources, uint32 replay_count,
+	const ClusterColdRelmapWalV1 *wal, uint32 count)
+{
+	ClusterColdRelmapInputV1 *inputs;
+	Size scratch, total;
+	volatile ClusterColdDetailV1 detail = CLUSTER_COLD_STRUCTURAL_UNSUPPORTED;
+
+	if (!plan_valid(plan) || sources == NULL || wal == NULL || count == 0
+		|| count > CLUSTER_COLD_RELMAP_MAX_INPUTS || replay_count == 0
+		|| replay_count > plan->participant_count)
+		return CLUSTER_COLD_INVALID_ARGUMENT;
+	if (plan->phase != COLD_PHASE_FEEDING || plan->relmap_failed
+		|| plan->input_frame_count != 0 || plan->relmap_inputs != NULL)
+		return CLUSTER_COLD_STATE;
+	/* No reentry once any original provider may be reached. The complete
+	 * scratch AND copied declarations must fit the original plan budget. */
+	plan->relmap_failed = true;
+	plan->phase = COLD_PHASE_FAILED;
+	scratch = (Size)count * sizeof(*inputs);
+	total = scratch + (Size)count * sizeof(ColdRelmapInput);
+	if (total > plan->memory_budget || plan->memory_used > plan->memory_budget - total)
+		return CLUSTER_COLD_CAPACITY;
+	inputs = cold_plan_scratch(plan, scratch, NULL);
+	if (inputs == NULL)
+		return CLUSTER_COLD_CAPACITY;
+	PG_TRY();
+	{
+		bool ok = enableFsync && cluster_relmap_authority_x_held();
+		for (uint32 i = 0; i < count && ok; ++i)
+			ok = relmap_wal_input(plan, sources, replay_count, &wal[i], &inputs[i]);
+		if (ok)
+			ok = cold_relmap_inputs_valid(plan, inputs, count) == CLUSTER_COLD_OK;
+		/* Complete shape/source/namespace and all original pins first. */
+		for (uint32 i = 0; i < count && ok; ++i)
+			ok = relmap_pin(&inputs[i], false);
+		for (uint32 i = 0; i < count && ok; ++i) {
+			ClusterRelmapV2View base;
+			unsigned char encoded[CLUSTER_RELMAP_V2_FILE_SIZE];
+			ok = cluster_relmap_authority_x_held() && relmap_pin(&inputs[i], false)
+				&& cluster_relmap_authority_v2_read(&inputs[i].staged.identity, &base)
+					== CLUSTER_RELMAP_V2_PAIR_VALID
+				&& base.pending_complete && !base.has_pending
+				&& base.committed_generation == inputs[i].staged.committed_generation;
+			if (ok) {
+				inputs[i].staged.committed = base.committed;
+				ok = cluster_relmap_v2_encode(&inputs[i].staged, encoded, sizeof(encoded))
+					== CLUSTER_RELMAP_V2_VALID;
+			}
+		}
+		/* A later read may invalidate an earlier pin or reuse its reader.
+		 * Recheck the complete original batch before publishing any output. */
+		for (uint32 i = 0; i < count && ok; ++i)
+			ok = cluster_relmap_authority_x_held() && relmap_pin(&inputs[i], false)
+				&& wal[i].reader != NULL
+				&& wal[i].reader->system_identifier == inputs[i].staged.identity.system_identifier
+				&& wal[i].reader->cluster_expected_thread_id == inputs[i].cut.thread_id
+				&& wal[i].reader->seg.ws_tli == inputs[i].cut.timeline
+				&& relmap_record_matches(&inputs[i], wal[i].reader);
+		if (ok) {
+			plan->phase = COLD_PHASE_FEEDING;
+			detail = cluster_cold_plan_relmap_declare_v1(plan, inputs, count);
+		}
+	}
+	PG_CATCH();
+	{
+		plan->phase = COLD_PHASE_FAILED;
+		cold_free(inputs);
+		cold_plan_release(plan, scratch);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	cold_free(inputs);
+	cold_plan_release(plan, scratch);
+	if (detail == CLUSTER_COLD_OK)
+		plan->relmap_failed = false;
+	else
+		plan->phase = COLD_PHASE_FAILED;
+	return detail;
 }
 
 bool

@@ -67,7 +67,7 @@ startup_relmap_feed(RfSideOnlinePlanV1 *side, bool image)
 }
 
 static void
-startup_relmap_replay_begin(void)
+startup_relmap_replay_fixture(void)
 {
 	xl_relmap_update header = {InvalidOid, GLOBALTABLESPACE_OID, sizeof(RelMapFile)};
 	ClusterColdRelmapInputV1 *input = &startup_relmap_replay.input;
@@ -96,6 +96,13 @@ startup_relmap_replay_begin(void)
 	memcpy(decoded->main_data + MinSizeOfRelmapUpdate, &input->staged.pending,
 		sizeof(RelMapFile));
 	startup_relmap_real_side = true;
+}
+
+static void
+startup_relmap_replay_begin(void)
+{
+	ClusterColdRelmapInputV1 *input = &startup_relmap_replay.input;
+	startup_relmap_replay_fixture();
 	startup_relmap_replay.typed = startup_relmap_prepare(input);
 	UT_ASSERT_NOT_NULL(startup_relmap_replay.typed);
 	UT_ASSERT_EQ(startup_relmap_replay.typed->refusal, CLUSTER_COLD_OK);

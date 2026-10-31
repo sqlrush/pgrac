@@ -35,6 +35,35 @@ typedef struct ClusterColdRelmapInputV1 {
 	struct LWLock *retention_lock;
 } ClusterColdRelmapInputV1;
 
+/* Original owner pin plus a complete decoded WAL record. The owner supplies
+ * its actual FullXid/era and pin generation, never an epoch inferred from WAL.
+ * owner.wal_end must be zero: the producer takes the actual record end.
+ * All pointers are borrowed through prepare; the resulting declaration owns
+ * copied values and retains only the original directory/lock pointers. */
+typedef struct ClusterColdRelmapWalV1 {
+	uint32 participant;
+	ClusterRelmapV2Namespace identity;
+	uint64 generation;
+	ClusterRelmapV2Owner owner;
+	struct ClusterRelmapRetentionDirectory *retention;
+	struct LWLock *retention_lock;
+	struct XLogReaderState *reader;
+} ClusterColdRelmapWalV1;
+
+/* Explicit original-source adapter before pass-1. Whole-batch validation and
+ * exact unstaged pins precede clean-pair I/O outside the retention lock.
+ * Sources must be the original selected replay generations; the Startup
+ * entry below brackets this call with original ROOT/fence revalidation.
+ * Entered failure/ERROR poisons the plan, keeps all original pins/debt and
+ * permits no retry. No retention qualification, COMPLETE or activation. */
+extern ClusterColdDetailV1 cluster_cold_plan_relmap_from_wal_v1(ClusterColdPlanV1 *plan,
+	const ClusterWalSourceRef *sources, uint32 replay_count,
+	const ClusterColdRelmapWalV1 *inputs, uint32 count);
+
+extern ClusterColdTypedV1 *cluster_cold_typed_prepare_relmap_wal_v1(
+	struct ClusterRecoveryFencePlan *fence, uint16 own_thread, XLogRecPtr own_redo,
+	const ClusterColdRelmapWalV1 *inputs, uint32 count);
+
 extern ClusterColdDetailV1 cluster_cold_plan_relmap_declare_v1(ClusterColdPlanV1 *plan,
 	const ClusterColdRelmapInputV1 *inputs, uint32 count);
 
