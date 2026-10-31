@@ -260,16 +260,32 @@ UT_TEST(test_X_quiet_late_reply_does_not_use_successor_descriptor)
 UT_TEST(test_X_disk_quiet_cannot_be_relabelled_as_normal_completion)
 {
 	EvidenceFixture f; ResourceXIntentSlot slot; ResourceXDecodedFrame frame;
-	uint8 bytes[RESOURCE_X_COMPLETE_V5_BYTES]; uint16 len; ResourceXWireReject reject;
+	uint8 bytes[RESOURCE_X_COMPLETE_V5_BYTES]; uint16 len = 0; ResourceXWireReject reject;
+	ResourceXAcquireReadReceipt original_receipt;
+	ClusterPcmResourceXReadIntent original_intent;
 	UT_ASSERT(x_seed(&f, 1, 1)); X_REQUIRE(x_cancel(), RESOURCE_X_APPLY_APPLIED);
 	input_complete(&f, 1); UT_ASSERT(x_anchor(&f)); UT_ASSERT(qn_probe(&slot));
 	UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE,
 		qn_intent->payload, slot.payload_bytes, &frame, &reject));
 	UT_ASSERT_EQ(frame.common.target_mode, PCM_STATE_X);
 	UT_ASSERT_EQ(frame.common.outcome, RESOURCE_X_OUTCOME_QUIET_NO_IMAGE);
-	frame.common.outcome = RESOURCE_X_OUTCOME_OK; frame.body.acquire_completion.native_generation++;
+	original_receipt = request_entry()->resource_x_bootstrap_round.acquire_read_receipt;
+	original_intent = *qn_intent;
+	/* The retained native generation is cancellation evidence, not success. */
+	frame.common.outcome = RESOURCE_X_OUTCOME_OK;
 	UT_ASSERT(!cluster_resource_x_wire_encode(RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE, &frame,
-		bytes, sizeof(bytes), &len, &reject)); complete_idle();
+		bytes, sizeof(bytes), &len, &reject));
+	/* A structurally legal normal ACK cannot consume a quiet native receipt.
+	 * Codec validity never substitutes for the original owner's exact I. */
+	frame.body.acquire_completion.native_generation++;
+	frame.common.outcome = RESOURCE_X_OUTCOME_DUPLICATE;
+	frame.common.action_node = frame.body.acquire_completion.decision.master_node;
+	UT_ASSERT(qn_wire(&frame));
+	UT_ASSERT(settle_gcs(&frame, NULL) != RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(memcmp(&original_receipt, &request_entry()->resource_x_bootstrap_round.acquire_read_receipt,
+		sizeof(original_receipt)) == 0);
+	UT_ASSERT(memcmp(&original_intent, qn_intent, sizeof(original_intent)) == 0);
+	x_preserved(); complete_idle();
 }
 
 int main(void)

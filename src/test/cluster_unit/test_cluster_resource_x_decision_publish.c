@@ -33,7 +33,7 @@ typedef struct PublishFixture {
 } PublishFixture;
 
 static bool
-publish_start(int scenario, PcmState target, PublishFixture *f)
+publish_start_path(int scenario, PcmState target, uint8 path, PublishFixture *f)
 {
 	ClusterPcmResourceXMasterRequest canonical = {0};
 	unsigned matches = 0;
@@ -53,8 +53,7 @@ publish_start(int scenario, PcmState target, PublishFixture *f)
 				|| decision_plan_inject_shared_holder(3, 103) == NULL) return false;
 		}
 	}
-	f->request = acquire_frame(requester, scenario == 3 ? RESOURCE_X_ACQUIRE_RESIDENT
-		: RESOURCE_X_ACQUIRE_FIRST_FILL, scenario == 3 ? PCM_STATE_X : PCM_STATE_N, target);
+	f->request = acquire_frame(requester, path, scenario == 3 ? PCM_STATE_X : PCM_STATE_N, target);
 	if (scenario == 3) {
 		ResourceXWireReject reject;
 		uint8 bytes[RESOURCE_X_ACQUIRE_V3_BYTES];
@@ -86,6 +85,13 @@ publish_start(int scenario, PcmState target, PublishFixture *f)
 	UT_ASSERT((unsigned char *)(f->state + 1) <= memory + fake_pcm_header_requested_size);
 	fake_pcm_clock_us = 100000;
 	return matches == 1;
+}
+
+static bool
+publish_start(int scenario, PcmState target, PublishFixture *f)
+{
+	return publish_start_path(scenario, target, scenario == 3 ? RESOURCE_X_ACQUIRE_RESIDENT
+		: RESOURCE_X_ACQUIRE_FIRST_FILL, f);
 }
 
 static void
@@ -185,13 +191,21 @@ UT_TEST(test_publish_compatible_s_keeps_source_outside_required_set)
 	UT_ASSERT_EQ(f.plan.service_holders_bitmap, 1);
 }
 
-UT_TEST(test_publish_requester_current_retains_self_downgrade_responsibility)
+UT_TEST(test_publish_requester_current_keeps_self_conversion_with_native_completion)
 {
 	for (PcmState target = PCM_STATE_S; target <= PCM_STATE_X; target++) {
 		PublishFixture f;
+		struct StopPcmEntryLayout *directory;
 		if (!publish_start(3, target, &f)) continue;
 		publish_apply(&f); publish_check(&f);
-		UT_ASSERT_EQ(f.plan.service_holders_bitmap, target == PCM_STATE_S ? 1 : 0);
+		/* Publication retains the old X. R's own native C performs its
+		 * conversion; no forwarded self service or synthetic ACK replaces C. */
+		directory = (void *)fake_pcm_entries.data[0];
+		UT_ASSERT_EQ(f.plan.service_holders_bitmap, 0);
+		UT_ASSERT_EQ(f.plan.decision.required_holders_bitmap, 0);
+		UT_ASSERT_EQ(f.state->block_intents[0].slot.state, RESOURCE_X_INTENT_SLOT_EMPTY);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&directory->master_state), PCM_STATE_X);
+		UT_ASSERT_EQ(directory->x_holder_node, 0);
 	}
 }
 
@@ -613,7 +627,7 @@ main(void)
 	UT_RUN(test_publish_remote_x_to_s_retains_one_a_without_fourth_hop_grant);
 	UT_RUN(test_publish_all_shared_blockers_are_armed_in_parallel);
 	UT_RUN(test_publish_compatible_s_keeps_source_outside_required_set);
-	UT_RUN(test_publish_requester_current_retains_self_downgrade_responsibility);
+	UT_RUN(test_publish_requester_current_keeps_self_conversion_with_native_completion);
 	UT_RUN(test_publish_duplicate_never_bumps_authority_or_rearms);
 	UT_RUN(test_publish_stale_expected_cut_preserves_entire_master);
 	UT_RUN(test_publish_changed_native_episode_never_takes_successor_responsibility);

@@ -3361,10 +3361,166 @@ UT_TEST(test_source_complete_known_x_preserves_full_a_and_invalid_kind_is_refuse
 	source_complete_encode_reject(&frame, sizeof(bytes));
 }
 
+/* Independent compact disk completion bytes. Codec success does not supply
+ * native X installation, T1--T3 or writer activation evidence. */
+static void
+disk_x_complete_make(uint8 *bytes, bool resident, unsigned result)
+{
+	uint8 grant[RESOURCE_X_DECISION_V4_BYTES];
+	make_decision_bytes(grant, false, PCM_STATE_N, 0, PCM_STATE_X, -1,
+		RESOURCE_X_ACQUIRE_SOURCE_DISK);
+	if (resident) grant[152] = RESOURCE_X_ACQUIRE_RESIDENT;
+	test_put_u64_be(grant + 216, UINT64_C(0x0203040506070809));
+	test_reseal(grant, sizeof(grant));
+	memcpy(bytes, grant, 224); memset(bytes + 224, 0, 40);
+	bytes[0] = (uint8)(5 + result); bytes[1] = RESOURCE_X_WIRE_INSTALL_SETTLEMENT;
+	bytes[2] = 1; bytes[3] = 8; bytes[80] = source_complete_outcomes[result];
+	test_put_u32_be(bytes + 68, result % 2 ? 2 : 3);
+	test_put_u64_be(bytes + 224, UINT64_C(0x9192939495969798) + (result < 2 ? 1 : 0));
+	test_put_u64_be(bytes + 232, UINT64_C(0x0102030405060708));
+	if (result < 4) {
+		test_put_u64_be(bytes + 240, UINT64_C(0x1122334455667788));
+		test_put_u64_be(bytes + 248, UINT64_C(0x0203040506070809));
+		test_put_u32_be(bytes + 256, UINT32_C(0x12345678));
+	}
+	test_put_u32_be(bytes + 260, ship_get_u32(grant + 4));
+	test_reseal(bytes, RESOURCE_X_COMPLETE_V5_BYTES);
+}
+
+static bool
+disk_x_complete_round_trip(uint8 *bytes, ResourceXDecodedFrame *frame)
+{
+	uint8 encoded[RESOURCE_X_COMPLETE_V5_BYTES]; uint16 len = 0;
+	ResourceXWireReject reject;
+	bool ok = cluster_resource_x_wire_decode(RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE,
+		bytes, sizeof(encoded), frame, &reject);
+	UT_ASSERT(ok); if (!ok) return false;
+	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE,
+		frame, encoded, sizeof(encoded), &len, &reject));
+	UT_ASSERT_EQ(len, sizeof(encoded));
+	UT_ASSERT(memcmp(bytes, encoded, sizeof(encoded)) == 0);
+	return true;
+}
+
+static void
+disk_x_complete_reject(uint8 *bytes)
+{
+	test_reseal(bytes, RESOURCE_X_COMPLETE_V5_BYTES);
+	test_acquire_rejected(RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE, bytes, RESOURCE_X_COMPLETE_V5_BYTES);
+}
+
+UT_TEST(test_disk_x_complete_first_fill_resident_and_all_six_results)
+{
+	uint8 bytes[RESOURCE_X_COMPLETE_V5_BYTES]; ResourceXDecodedFrame frame;
+	for (int resident = 0; resident < 2; resident++)
+		for (unsigned result = 0; result < lengthof(source_complete_outcomes); result++) {
+			disk_x_complete_make(bytes, resident, result);
+			if (!disk_x_complete_round_trip(bytes, &frame)) continue;
+			UT_ASSERT_EQ(frame.common.target_mode, PCM_STATE_X);
+			UT_ASSERT_EQ(frame.common.outcome, source_complete_outcomes[result]);
+			UT_ASSERT_EQ(frame.body.acquire_completion.decision.episode.path,
+				resident ? RESOURCE_X_ACQUIRE_RESIDENT : RESOURCE_X_ACQUIRE_FIRST_FILL);
+			UT_ASSERT_EQ(frame.body.acquire_completion.decision.source_kind, RESOURCE_X_ACQUIRE_SOURCE_DISK);
+			UT_ASSERT_EQ(frame.body.acquire_completion.native_generation,
+				UINT64_C(0x9192939495969798) + (result < 2 ? 1 : 0));
+		}
+}
+UT_TEST(test_disk_x_complete_result_version_and_direction_cannot_alias)
+{
+	uint8 bytes[RESOURCE_X_COMPLETE_V5_BYTES];
+	for (unsigned result = 0; result < lengthof(source_complete_outcomes); result++) {
+		for (int version = 1; version <= 16; version++) {
+			if (version == 5 + result) continue;
+			disk_x_complete_make(bytes, false, result); bytes[0] = version;
+			disk_x_complete_reject(bytes);
+		}
+		disk_x_complete_make(bytes, false, result);
+		test_put_u32_be(bytes + 68, result % 2 ? 3 : 2); disk_x_complete_reject(bytes);
+	}
+}
+UT_TEST(test_disk_x_complete_native_generation_and_write_IO_remain_strict)
+{
+	uint8 bytes[RESOURCE_X_COMPLETE_V5_BYTES];
+	for (unsigned result = 0; result < lengthof(source_complete_outcomes); result++) {
+		disk_x_complete_make(bytes, true, result);
+		test_put_u64_be(bytes + 224, UINT64_C(0x9192939495969798) + (result < 2 ? 0 : 1));
+		disk_x_complete_reject(bytes);
+		disk_x_complete_make(bytes, true, result); bytes[239] |= 1; disk_x_complete_reject(bytes);
+	}
+}
+UT_TEST(test_disk_x_complete_watermark_and_absent_image_are_not_relaxed)
+{
+	uint8 bytes[RESOURCE_X_COMPLETE_V5_BYTES];
+	for (unsigned result = 0; result < lengthof(source_complete_outcomes); result++) {
+		if (result < 4) {
+			disk_x_complete_make(bytes, false, result);
+			test_put_u64_be(bytes + 248, UINT64_C(0x0203040506070808)); disk_x_complete_reject(bytes);
+		} else {
+			const unsigned offsets[] = {240, 248, 256};
+			for (unsigned n = 0; n < lengthof(offsets); n++) {
+				disk_x_complete_make(bytes, false, result); bytes[offsets[n]] = 1; disk_x_complete_reject(bytes);
+			}
+		}
+	}
+}
+UT_TEST(test_disk_x_complete_cannot_omit_holders_or_claim_resident_S)
+{
+	uint8 bytes[RESOURCE_X_COMPLETE_V5_BYTES];
+	const unsigned fields[] = {176, 192, 196, 200, 212};
+	for (unsigned n = 0; n < lengthof(fields); n++) {
+		disk_x_complete_make(bytes, true, 0); bytes[fields[n]] = 1; disk_x_complete_reject(bytes);
+	}
+	disk_x_complete_make(bytes, true, 0); test_put_u32_be(bytes + 188, 1); disk_x_complete_reject(bytes);
+	disk_x_complete_make(bytes, true, 0); bytes[213] = RESOURCE_X_ACQUIRE_SOURCE_REMOTE_CURRENT; disk_x_complete_reject(bytes);
+	disk_x_complete_make(bytes, true, 0); bytes[72] = PCM_STATE_S; disk_x_complete_reject(bytes);
+	disk_x_complete_make(bytes, false, 0); bytes[73] = PCM_STATE_N; disk_x_complete_reject(bytes);
+}
+UT_TEST(test_disk_x_complete_prefix_extra_length_and_crc_remain_strict)
+{
+	uint8 bytes[RESOURCE_X_COMPLETE_V5_BYTES + 1];
+	for (unsigned result = 0; result < lengthof(source_complete_outcomes); result++) {
+		disk_x_complete_make(bytes, false, result); bytes[sizeof(bytes) - 1] = 0;
+		for (unsigned len = 0; len < sizeof(bytes) - 1; len++)
+			test_acquire_rejected(RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE, bytes, len);
+		test_acquire_rejected(RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE, bytes, sizeof(bytes));
+		bytes[256] ^= 1;
+		test_acquire_rejected(RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE, bytes, sizeof(bytes) - 1);
+	}
+}
+UT_TEST(test_disk_x_complete_reserved_episode_and_encoder_refusal_are_atomic)
+{
+	uint8 bytes[RESOURCE_X_COMPLETE_V5_BYTES]; ResourceXDecodedFrame frame;
+	const unsigned offsets[] = {153, 154, 155, 156, 214, 215};
+	for (unsigned n = 0; n < lengthof(offsets); n++) {
+		disk_x_complete_make(bytes, true, 0); bytes[offsets[n]] = 1; disk_x_complete_reject(bytes);
+	}
+	disk_x_complete_make(bytes, false, 0);
+	if (!disk_x_complete_round_trip(bytes, &frame)) return;
+	for (unsigned cap = 0; cap < sizeof(bytes); cap++) source_complete_encode_reject(&frame, cap);
+	frame.body.acquire_completion.decision.episode.reservation_token = 0;
+	source_complete_encode_reject(&frame, sizeof(bytes));
+}
+UT_TEST(test_disk_x_complete_rebind_preserves_full_A_and_native_I)
+{
+	uint8 bytes[RESOURCE_X_COMPLETE_V5_BYTES]; ResourceXDecodedFrame before, after;
+	ResourceXWireReject reject;
+	for (unsigned result = 0; result < lengthof(source_complete_outcomes); result++) {
+		disk_x_complete_make(bytes, true, result);
+		if (!disk_x_complete_round_trip(bytes, &before)) continue;
+		UT_ASSERT(cluster_resource_x_wire_rebind_sender_generation(RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE,
+			bytes, sizeof(bytes), 91, &reject));
+		UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE,
+			bytes, sizeof(bytes), &after, &reject));
+		UT_ASSERT_EQ(after.common.sender_connection_generation, 91);
+		UT_ASSERT(memcmp(&before.body.acquire_completion, &after.body.acquire_completion,
+			sizeof(before.body.acquire_completion)) == 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(142);
+	UT_PLAN(150);
 	UT_RUN(test_wire_kind_and_proof_domains_are_closed);
 	UT_RUN(test_reused_message_numbers_remain_exact);
 	UT_RUN(test_common_wire_layout_is_exact);
@@ -3507,6 +3663,14 @@ main(void)
 	UT_RUN(test_source_complete_invalid_rebind_preserves_all_bytes);
 	UT_RUN(test_source_complete_disk_and_source_formats_cannot_alias);
 	UT_RUN(test_source_complete_known_x_preserves_full_a_and_invalid_kind_is_refused);
+	UT_RUN(test_disk_x_complete_first_fill_resident_and_all_six_results);
+	UT_RUN(test_disk_x_complete_result_version_and_direction_cannot_alias);
+	UT_RUN(test_disk_x_complete_native_generation_and_write_IO_remain_strict);
+	UT_RUN(test_disk_x_complete_watermark_and_absent_image_are_not_relaxed);
+	UT_RUN(test_disk_x_complete_cannot_omit_holders_or_claim_resident_S);
+	UT_RUN(test_disk_x_complete_prefix_extra_length_and_crc_remain_strict);
+	UT_RUN(test_disk_x_complete_reserved_episode_and_encoder_refusal_are_atomic);
+	UT_RUN(test_disk_x_complete_rebind_preserves_full_A_and_native_I);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
