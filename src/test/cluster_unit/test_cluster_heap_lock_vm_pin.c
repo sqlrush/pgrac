@@ -11,10 +11,22 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+
+#ifdef FIXTURE_NO_ASSERTS
+#undef USE_ASSERT_CHECKING
+#undef Assert
+#define Assert(condition) ((void)0)
+#undef AssertMacro
+#define AssertMacro(condition) ((void)0)
+#undef PG_USED_FOR_ASSERTS_ONLY
+#define PG_USED_FOR_ASSERTS_ONLY
+#endif
 #include "access/heapam.h"
 #include "access/visibilitymap.h"
 #include "access/xact.h"
+#include "miscadmin.h"
 #include "cluster/cluster_itl.h"
+#include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_tt_local.h"
 #include "storage/bufmgr.h"
@@ -48,6 +60,12 @@ static int warm_change;
 static unsigned nested_refusals, nested_replaces, warm_refusals;
 static unsigned nested_calls, warm_calls, plain_vm_waits, chain_fallthroughs;
 static unsigned context_starts;
+static bool vm_forbid_nested, vm_missing_writer, vm_invalidate_on_relock;
+static unsigned vm_captures, vm_resumes, vm_resume_refusals, vm_writer_error;
+static uint64 vm_r4 = 80;
+static bool vm_cancel_after_warm;
+static unsigned vm_interrupts;
+volatile sig_atomic_t InterruptPending;
 static unsigned dml_waits;
 static unsigned transaction_wait_pins, tuple_wait_pins, tuple_wait_calls, member_frees;
 static int transaction_wait_error;
@@ -142,6 +160,10 @@ LockBuffer(Buffer buffer, int mode)
 	waits_with_vm += vm_pinned;
 	if (wait_error)
 		elog(ERROR, "controlled heap-current acquisition error");
+	if (vm_invalidate_on_relock && vm_captures > 0) {
+		vm_r4++;
+		vm_invalidate_on_relock = false;
+	}
 	if (replace_image) {
 		memcpy(pages[0].data, incoming.data, BLCKSZ);
 		replace_image = false;
@@ -206,6 +228,8 @@ ClusterLockBufferExclusiveAuxiliaryAliasAware(Buffer *buffer, Buffer *alias,
 		UT_ASSERT_EQ(context->absolute_deadline_us, 4242);
 	if (locked) {
 		nested_calls++;
+		if (vm_forbid_nested)
+			elog(ERROR, "ordinary VM acquisition below heap content");
 		if (nested_refusals > 0) {
 			nested_refusals--;
 			if (nested_replaces > 0) {
@@ -241,6 +265,68 @@ ClusterLockBufferExclusiveAuxiliaryAliasAware(Buffer *buffer, Buffer *alias,
 	memset(context, 0, sizeof(*context));
 	return true;
 }
+
+/* Original writer/KO validators are controlled here; the real backend
+ * validator has its own unit tests. Missing/moved proof never owns VM X. */
+bool
+ClusterBufferCaptureMutationContext(Buffer buffer, ResourceXWriterUseContext *out,
+				   uint64 *revision, bool *checked)
+{
+	UT_ASSERT_EQ(buffer, 2);
+	UT_ASSERT(!locked && vm_pinned && vm_locked);
+	vm_captures++;
+	if (vm_writer_error == 1)
+		elog(ERROR, "controlled VM writer capture error");
+	if (vm_missing_writer)
+		return false;
+	memset(out, 0, sizeof(*out));
+	out->writer_activation_token = 82;
+	out->r4_record_generation = vm_r4;
+	*revision = 33;
+	*checked = true;
+	if (vm_cancel_after_warm)
+		InterruptPending = true;
+	return true;
+}
+
+bool
+ClusterConditionalLockBufferWithMutationContext(Buffer buffer,
+	const ResourceXWriterUseContext *expected, uint64 revision, bool checked)
+{
+	UT_ASSERT_EQ(buffer, 2);
+	UT_ASSERT(locked && vm_pinned && !vm_locked);
+	vm_resumes++;
+	if (vm_writer_error == 2)
+		elog(ERROR, "controlled VM writer resume error");
+	if (vm_resume_refusals > 0) {
+		vm_resume_refusals--;
+		return false;
+	}
+	if (expected->writer_activation_token != 82
+		|| expected->r4_record_generation != vm_r4 || revision != 33 || !checked)
+		return false;
+	vm_locked = true;
+	return true;
+}
+
+void
+ProcessInterrupts(void)
+{
+	InterruptPending = false;
+	vm_interrupts++;
+	UT_ASSERT(!locked && !vm_locked && !vm_pinned);
+	elog(ERROR, "controlled cancellation after VM preparation");
+}
+
+void
+pg_re_throw(void)
+{
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
+	abort();
+}
+
+#include "test_cluster_heap_insert_vm_authority.inc"
 
 /* Coherent AF classification is tested separately.  This controlled leaf
  * permits changes during the original unlocked VM-acquisition boundary. */
@@ -289,6 +375,12 @@ reset(bool cached, bool visible)
 	waits = waits_with_vm = prepares = releases = repins = misses = 0;
 	locked = wait_error = false;
 	vm_locked = warm_error = warm_replaces_pin = false;
+	vm_forbid_nested = vm_missing_writer = vm_invalidate_on_relock = false;
+	vm_captures = vm_resumes = vm_resume_refusals = vm_writer_error = 0;
+	vm_r4 = 80;
+	vm_cancel_after_warm = false;
+	vm_interrupts = 0;
+	InterruptPending = false;
 	needs_clear = true;
 	warm_change = 0;
 	nested_refusals = nested_replaces = warm_refusals = 0;
@@ -932,6 +1024,11 @@ chain_vm(bool itl)
 	bool pinned_desired_page;
 	bool cluster_chain_vm_locked = false, cluster_page_versioned = true;
 	ResourceXAuxiliaryAcquireContext cluster_chain_vm_context = { 0 };
+	ClusterHeapVmMutationState cluster_chain_vm_state = { 0 };
+
+	(void)cluster_chain_vm_state;
+	(void)cluster_heap_vm_mutation_lock;
+	(void)cluster_heap_vm_mutation_prepare;
 
 	(void)cluster_chain_vm_context; /* Also compile the unchanged parent. */
 	(void)cluster_heap_vm_barrier_warm;
@@ -958,8 +1055,8 @@ UT_TEST(chain_cached_vm_current_preserves_both_locks_and_rebind)
 		chain_vm(itl != 0);
 		check_current();
 		UT_ASSERT(vm_locked && vm_pinned);
-		UT_ASSERT_EQ(waits, 1);
-		UT_ASSERT_EQ(warm_calls, 0);
+		UT_ASSERT_EQ(waits, 2);
+		UT_ASSERT_EQ(warm_calls, 1);
 		UT_ASSERT_EQ(chain_fallthroughs, 1);
 	}
 }
@@ -968,13 +1065,13 @@ UT_TEST(chain_vm_refusal_unlocks_heap_before_warm_and_requalification)
 {
 	for (int itl = 0; itl < 2; itl++) {
 		reset(true, true);
-		nested_refusals = 1;
+		vm_resume_refusals = 1;
 		chain_vm(itl != 0);
 		check_current();
 		UT_ASSERT(vm_locked && vm_pinned);
 		UT_ASSERT_EQ(plain_vm_waits, 0);
-		UT_ASSERT_EQ(waits, 2);
-		UT_ASSERT_EQ(warm_calls, 1);
+		UT_ASSERT_EQ(waits, 3);
+		UT_ASSERT_EQ(warm_calls, 2);
 		UT_ASSERT_EQ(chain_fallthroughs, 1);
 	}
 }
@@ -983,13 +1080,13 @@ UT_TEST(chain_repeated_vm_refusals_do_not_fall_through_or_wait_with_heap)
 {
 	for (int itl = 0; itl < 2; itl++) {
 		reset(true, true);
-		nested_refusals = 3;
+		vm_resume_refusals = 3;
 		chain_vm(itl != 0);
 		check_current();
 		UT_ASSERT(vm_locked && vm_pinned);
 		UT_ASSERT_EQ(plain_vm_waits, 0);
-		UT_ASSERT_EQ(waits, 4);
-		UT_ASSERT_EQ(warm_calls, 3);
+		UT_ASSERT_EQ(waits, 5);
+		UT_ASSERT_EQ(warm_calls, 4);
 		UT_ASSERT_EQ(chain_fallthroughs, 1);
 	}
 }
@@ -998,13 +1095,14 @@ UT_TEST(chain_replaced_vm_handle_is_prepared_before_heap_reentry)
 {
 	for (int itl = 0; itl < 2; itl++) {
 		reset(true, true);
-		nested_refusals = nested_replaces = 1;
+		warm_refusals = 1;
+		warm_replaces_pin = true;
 		chain_vm(itl != 0);
 		check_current();
 		UT_ASSERT(vm_locked && vm_pinned);
-		UT_ASSERT_EQ(waits, 2);
-		UT_ASSERT_EQ(prepares, 1);
-		UT_ASSERT_EQ(warm_calls, 0);
+		UT_ASSERT_EQ(waits, 3);
+		UT_ASSERT_EQ(prepares, 2);
+		UT_ASSERT_EQ(warm_calls, 2);
 		UT_ASSERT_EQ(context_starts, 1);
 	}
 }
@@ -1013,18 +1111,17 @@ UT_TEST(chain_warm_replacement_preserves_original_acquisition_age)
 {
 	for (int itl = 0; itl < 2; itl++) {
 		reset(true, true);
-		nested_refusals = 2;
 		warm_refusals = 1;
 		warm_replaces_pin = true;
 		chain_vm(itl != 0);
 		check_current();
 		UT_ASSERT(vm_locked && vm_pinned);
 		UT_ASSERT_EQ(waits, 3);
-		UT_ASSERT_EQ(prepares, 1);
+		UT_ASSERT_EQ(prepares, 2);
 		UT_ASSERT_EQ(warm_calls, 2);
-		/* The first failed warm/reobserve cannot reset the context.  The
-		 * successful second warm finishes it, then cached-X starts anew. */
-		UT_ASSERT_EQ(context_starts, 2);
+		/* Clean refusal retains the first cursor until the successful warm.
+		 * Conditional resume never begins another ordinary acquisition. */
+		UT_ASSERT_EQ(context_starts, 1);
 		UT_ASSERT_EQ(chain_fallthroughs, 1);
 	}
 }
@@ -1033,13 +1130,12 @@ UT_TEST(chain_rechecks_frozen_clear_decision_after_unlocked_vm_wait)
 {
 	for (int itl = 0; itl < 2; itl++) {
 		reset(true, true);
-		nested_refusals = 1;
 		warm_change = 1;
 		chain_vm(itl != 0);
 		check_current();
 		UT_ASSERT(!vm_locked && vm_pinned);
 		UT_ASSERT_EQ(waits, 2);
-		UT_ASSERT_EQ(nested_calls, 1);
+		UT_ASSERT_EQ(nested_calls, 0);
 		UT_ASSERT_EQ(chain_fallthroughs, 1);
 	}
 }
@@ -1048,13 +1144,12 @@ UT_TEST(chain_nonvisible_current_discards_the_old_vm_pin_after_wait)
 {
 	for (int itl = 0; itl < 2; itl++) {
 		reset(true, true);
-		nested_refusals = 1;
 		warm_change = 2;
 		chain_vm(itl != 0);
 		check_current();
 		UT_ASSERT(!vm_locked && !vm_pinned && vm == InvalidBuffer);
 		UT_ASSERT_EQ(waits, 2);
-		UT_ASSERT_EQ(nested_calls, 1);
+		UT_ASSERT_EQ(nested_calls, 0);
 		UT_ASSERT_EQ(chain_fallthroughs, 1);
 	}
 }
@@ -1116,12 +1211,13 @@ receipt_interrupt(void)
 	receipt_interrupts++;
 }
 
+#pragma push_macro("CHECK_FOR_INTERRUPTS")
 #undef CHECK_FOR_INTERRUPTS
 #define CHECK_FOR_INTERRUPTS() receipt_interrupt()
 #define cluster_heap_prepare_undo_record_call cluster_undo_record_prepare
 #include "test_cluster_heap_chain_receipt_types.inc"
 #undef cluster_heap_prepare_undo_record_call
-#undef CHECK_FOR_INTERRUPTS
+#pragma pop_macro("CHECK_FOR_INTERRUPTS")
 
 /* Services may block only after the actual retry block released content
  * ownership. Their canonical/receipt decisions are controlled leaves. */

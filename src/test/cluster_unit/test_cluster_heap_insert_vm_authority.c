@@ -21,7 +21,7 @@ execute_single_bracket(bool versioned)
 	bool vm_locked, cluster_page_versioned pg_attribute_unused() = versioned;
 	ResourceXAuxiliaryAcquireContext cluster_vm_context = { 0 };
 #ifdef FIXTURE_HAS_INSERT_VM_STATE
-	ClusterHeapVmInsertState cluster_vm_state = { 0 };
+	ClusterHeapVmMutationState cluster_vm_state = { 0 };
 #endif
 
 cluster_heap_insert_retry:

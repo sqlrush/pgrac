@@ -338,7 +338,17 @@ bool
 ClusterConditionalLockBufferWithMutationContext(Buffer buffer,
 		const ResourceXWriterUseContext *expected, uint64 revision, bool checked)
 {
-	UT_ASSERT(multi_loop_active && multi_heap_locked && !multi_vm_locked);
+	/* These legacy cases start after writer preparation and cover only
+	 * capture/mutation/WAL. Require their exact controlled original writer;
+	 * acquisition, loss and error paths run in tuple_vm_authority. */
+	if (!multi_loop_active) {
+		if (buffer != 2 || expected->writer_activation_token != 82
+			|| expected->r4_record_generation != 7 || revision != 33 || !checked)
+			return false;
+		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+		return true;
+	}
+	UT_ASSERT(multi_heap_locked && !multi_vm_locked);
 	UT_ASSERT(multi_vm_pins[buffer - 1] && CritSectionCount == 0);
 	multi_resumes++;
 	if (multi_writer_error == 2)
@@ -1435,6 +1445,21 @@ run_tuple_lock(bool versioned, bool recomposed)
 	tuple_locking = false;
 }
 
+/* Explicit input to the legacy publication-only cases: the same original
+ * writer formerly supplied by their ordinary-X leaf. This does not exercise
+ * writer preparation; the dedicated tuple/chain fixture executes that path. */
+static ClusterHeapVmMutationState
+publication_vm_writer(void)
+{
+	ClusterHeapVmMutationState state = { 0 };
+
+	state.writer.writer_activation_token = 82;
+	state.writer.r4_record_generation = 7;
+	state.object_revision = 33;
+	state.object_checked = state.prepared = true;
+	return state;
+}
+
 static void
 run_chain_lock(bool versioned, bool itl)
 {
@@ -1447,6 +1472,7 @@ run_chain_lock(bool versioned, bool itl)
 	bool cleared_all_frozen = false, cluster_chain_lock_stamp = itl;
 	bool cluster_chain_vm_locked = want_vm, cluster_page_versioned = versioned;
 	ResourceXAuxiliaryAcquireContext cluster_chain_vm_context = {0};
+	ClusterHeapVmMutationState cluster_chain_vm_state = publication_vm_writer();
 	ClusterSpaceIdentity cluster_page_identity = identity;
 	uint8 cluster_chain_slot_idx = 0;
 	SCN cluster_chain_write_scn = 811;
@@ -1580,6 +1606,7 @@ UT_TEST(test_actual_lock_capture_is_read_only_and_no_itl_locks_vm)
 			bool vm_locked = vm != 0, cluster_chain_vm_locked = owner == 2 ? false : vm != 0;
 			bool cluster_page_versioned = true;
 			ResourceXAuxiliaryAcquireContext cluster_chain_vm_context = {0};
+			ClusterHeapVmMutationState cluster_chain_vm_state = publication_vm_writer();
 			ClusterSpaceIdentity cluster_page_identity;
 			RfPageProducerBatchV1 cluster_page_versions = { 0 };
 			PGAlignedBlock before[4];
@@ -1965,7 +1992,7 @@ execute_multi_loop(int count, bool versioned, bool frozen)
 	RfPageProducerBatchV1 cluster_page_versions = { 0 };
 	ResourceXAuxiliaryAcquireContext cluster_vm_context pg_attribute_unused() = { 0 };
 #ifdef FIXTURE_HAS_INSERT_VM_STATE
-	ClusterHeapVmInsertState cluster_vm_state = { 0 };
+	ClusterHeapVmMutationState cluster_vm_state = { 0 };
 #endif
 
 #include "test_cluster_heap_multi_loop.inc"

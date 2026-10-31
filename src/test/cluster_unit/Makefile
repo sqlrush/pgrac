@@ -3306,6 +3306,25 @@ clean: clean-insert-vm-authority
 clean-insert-vm-authority:
 	rm -f test_cluster_heap_insert_vm_authority.inc test_cluster_heap_insert_vm_authority.inc.tmp
 
+
+# Execute original row/chain VM requalification with controlled writer leaves.
+TESTS += test_cluster_heap_tuple_vm_authority test_cluster_heap_tuple_vm_authority_noassert
+all: test_cluster_heap_tuple_vm_authority test_cluster_heap_tuple_vm_authority_noassert
+
+test_cluster_heap_vm_tuple_writer.inc: extract_insert_vm_authority_fixture.py extract_vacuum_mx_fixture.py $(top_srcdir)/src/backend/access/heap/heapam.c
+	python3 $(srcdir)/extract_insert_vm_authority_fixture.py $(top_srcdir)/src/backend/access/heap/heapam.c --tuple-writer > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_tuple_vm_authority test_cluster_heap_tuple_vm_authority_noassert: test_cluster_heap_tuple_vm_authority.c test_cluster_heap_lock_vm_pin test_cluster_heap_vm_tuple_lock.inc test_cluster_heap_vm_tuple_writer.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(if $(filter %_noassert,$@),-DFIXTURE_NO_ASSERTS) $< \
+		$(CLUSTER_HOT_BUFPAGE_TEST_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+clean: clean-tuple-vm-authority
+.PHONY: clean-tuple-vm-authority
+clean-tuple-vm-authority:
+	rm -f test_cluster_heap_vm_tuple_writer.inc test_cluster_heap_vm_tuple_writer.inc.tmp
+
 # PGRAC: the real INSERT mutation/WAL block and native tuple/page insertion.
 # Bind the complete native batch loop, including original selection/accounting.
 test_cluster_heap_multi_loop.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
@@ -10070,7 +10089,7 @@ test_cluster_heap_lock_vm_recent.inc: $(top_srcdir)/src/backend/access/heap/visi
 test_cluster_heap_lock_chain_pin.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
 	awk '/^heap_lock_updated_tuple_rec\(/ { in_chain=1 } \
 	     in_chain && /^l4:/ { ready=1 } \
-	     ready && !emit && /if \(PageIsAllVisible\(BufferGetPage\(buf\)\)\)/ { emit=1; found++ } \
+	     ready && !emit && /CHECK_FOR_INTERRUPTS\(\);/ { emit=1; found++ } \
 	     emit && /^[ \t]*if \(expected_successor.valid$$/ { \
 	       if (lines[count] != "#ifdef USE_PGRAC_CLUSTER") exit 1; \
 	       for (i=1; i<count; i++) print lines[i]; done++; exit } \
@@ -10204,7 +10223,7 @@ test_cluster_heap_row_wait_helpers.inc: $(top_srcdir)/src/backend/access/heap/he
 	     END { if (tables != 1 || helpers != 2 || macros != 2 || done != 3 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_heap_lock_vm_pin test_cluster_heap_lock_vm_pin_noassert: test_cluster_heap_lock_vm_pin.c unit_test.h \
+test_cluster_heap_lock_vm_pin test_cluster_heap_lock_vm_pin_noassert: test_cluster_heap_lock_vm_pin.c unit_test.h test_cluster_heap_insert_vm_authority.inc \
 		test_cluster_heap_lock_rebind.inc test_cluster_heap_vm_unwind_helpers.inc \
 		test_cluster_heap_dml_vm_relock.inc \
 		test_cluster_heap_receipt_delete_vm.inc test_cluster_heap_receipt_update_vm.inc \

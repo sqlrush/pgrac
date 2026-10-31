@@ -648,7 +648,7 @@ run_insert_vm_bracket(void)
 	bool vm_locked = false;
 	ResourceXAuxiliaryAcquireContext cluster_vm_context = { 0 };
 	const bool cluster_page_versioned = false;
-	ClusterHeapVmInsertState cluster_vm_state = { 0 };
+	ClusterHeapVmMutationState cluster_vm_state = { 0 };
 
 cluster_heap_insert_retry:
 	if (insert_entries++ != 0) {
@@ -716,6 +716,24 @@ tuple_vm_warm(Buffer *buffer, Buffer *alias, ResourceXAuxiliaryAcquireContext *c
 	}
 }
 
+/* This inherited fixture remains strictly native. Shared tuple writer
+ * cancellation/resume runs in the dedicated original-bracket fixture. */
+static bool
+tuple_vm_writer_lock(Buffer *buffer, bool versioned, ClusterHeapVmMutationState *state,
+					 ResourceXAuxiliaryAcquireContext *context, int *plan)
+{
+	bool replaced = false;
+	bool acquired;
+
+	UT_ASSERT(!versioned);
+	acquired = tuple_vm_lock(*buffer, false, (ClusterBufferBarrierSiteId)0,
+		&replaced, plan, NULL, context, NULL);
+	if (replaced)
+		*buffer = InvalidBuffer;
+	return acquired;
+}
+
+#define cluster_heap_vm_tuple_writer_lock tuple_vm_writer_lock
 #define cluster_current_mx_stamp_lock_buffer tuple_vm_lock
 #define cluster_current_mx_stamp_cancel(plan) (*(plan) = 0)
 #define cluster_current_mx_operation_restart(plan) (*(plan) = 0)
@@ -732,6 +750,7 @@ run_tuple_vm_bracket(void)
 	ItemPointer tid = &tid_data;
 	BlockNumber block = 0;
 	ResourceXAuxiliaryAcquireContext cluster_vm_context = { 0 };
+	ClusterHeapVmMutationState cluster_vm_state = { 0 };
 	int cluster_current_mx_lock_plan = 1, cluster_current_mx_operation = 1;
 	bool cluster_did_lock_stamp = true, cluster_lock_needs_itl_slot = true;
 	bool cluster_lock_undo_ready = true, vm_locked = false;
@@ -877,6 +896,7 @@ dml_observe(ClusterBufferBarrierPhase phase)
 #undef BufferGetTag
 #undef ClusterLockBufferExclusiveAuxiliaryAliasAware
 #undef cluster_current_mx_stamp_lock_buffer
+#undef cluster_heap_vm_tuple_writer_lock
 #undef cluster_heap_vm_barrier_warm
 #define LockBuffer dml_lock
 #define ReleaseBuffer dml_release

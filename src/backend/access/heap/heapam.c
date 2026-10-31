@@ -6616,19 +6616,19 @@ cluster_heap_vm_retarget_after_repick(Buffer buffer, ResourceXAuxiliaryAcquireCo
 
 /* Operation-local proof of the original VM writer. Every use must resume
  * that exact writer; the structure grants no authority by itself. */
-typedef struct ClusterHeapVmInsertState
+typedef struct ClusterHeapVmMutationState
 {
 	ResourceXWriterUseContext writer;
 	uint64 object_revision;
 	bool object_checked;
 	bool prepared;
-} ClusterHeapVmInsertState;
+} ClusterHeapVmMutationState;
 
-/* Shared INSERT cannot enter ordinary VM acquisition below heap content-X:
+/* Shared mutations cannot enter ordinary VM acquisition below heap content-X:
  * even a cached request can wait in membership preflight. Nonshared owners
  * retain their original auxiliary path. */
 static bool
-cluster_heap_vm_insert_lock(Buffer *vmbuf, bool versioned, ClusterHeapVmInsertState *state,
+cluster_heap_vm_mutation_lock(Buffer *vmbuf, bool versioned, ClusterHeapVmMutationState *state,
 							ResourceXAuxiliaryAcquireContext *context)
 {
 	if (!versioned)
@@ -6642,11 +6642,11 @@ cluster_heap_vm_insert_lock(Buffer *vmbuf, bool versioned, ClusterHeapVmInsertSt
 	return false;
 }
 
-/* Caller has abandoned its heap target before this ordinary VM acquisition.
+/* Caller has released heap content before this ordinary VM acquisition.
  * Keep the original cursor on a clean refusal; the caller drops any remaining
  * pin before cancellation and the original target/receipt retry. */
 static void
-cluster_heap_vm_insert_prepare(Buffer *vmbuf, ClusterHeapVmInsertState *state,
+cluster_heap_vm_mutation_prepare(Buffer *vmbuf, ClusterHeapVmMutationState *state,
 							   ResourceXAuxiliaryAcquireContext *context)
 {
 	bool captured = false;
@@ -6668,7 +6668,7 @@ cluster_heap_vm_insert_prepare(Buffer *vmbuf, ClusterHeapVmInsertState *state,
 	}
 	PG_END_TRY();
 	if (!captured)
-		elog(ERROR, "shared heap insert cannot retain its original VM writer");
+		elog(ERROR, "shared heap mutation cannot retain its original VM writer");
 	state->prepared = true;
 }
 
@@ -6686,7 +6686,7 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	bool		all_visible_cleared = false;
 #ifdef USE_PGRAC_CLUSTER
 	ResourceXAuxiliaryAcquireContext cluster_vm_context = { 0 };
-	ClusterHeapVmInsertState cluster_vm_state = { 0 };
+	ClusterHeapVmMutationState cluster_vm_state = { 0 };
 	/* PGRAC: static shared profile; identity precedes every content lock. */
 	bool		cluster_page_versioned = false;
 	ClusterSpaceIdentity cluster_page_identity;
@@ -6953,13 +6953,13 @@ cluster_heap_insert_retry:
 	{
 #ifdef USE_PGRAC_CLUSTER
 		cluster_heap_vm_retarget_after_repick(vmbuffer, &cluster_vm_context);
-		if (!cluster_heap_vm_insert_lock(&vmbuffer, cluster_page_versioned,
+		if (!cluster_heap_vm_mutation_lock(&vmbuffer, cluster_page_versioned,
 										 &cluster_vm_state, &cluster_vm_context)) {
 			/* No receipt APPLY or tuple publication has occurred. The target
 			 * and its ITL/receipt plan must be selected again after this wait. */
 			UnlockReleaseBuffer(buffer);
 			if (cluster_page_versioned)
-				cluster_heap_vm_insert_prepare(&vmbuffer, &cluster_vm_state, &cluster_vm_context);
+				cluster_heap_vm_mutation_prepare(&vmbuffer, &cluster_vm_state, &cluster_vm_context);
 			if (BufferIsValid(vmbuffer))
 				ReleaseBuffer(vmbuffer);
 			vmbuffer = InvalidBuffer;
@@ -7481,7 +7481,7 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 	ClusterSpaceIdentity cluster_page_identity;
 	RfPageProducerBatchV1 cluster_page_versions;
 	ResourceXAuxiliaryAcquireContext cluster_vm_context = { 0 };
-	ClusterHeapVmInsertState cluster_vm_state = { 0 };
+	ClusterHeapVmMutationState cluster_vm_state = { 0 };
 #endif
 
 	/* PGRAC: reject before acquiring a bulk lease or preparing tuple bytes. */
@@ -7649,13 +7649,13 @@ cluster_heap_multi_insert_retry:
 		{
 #ifdef USE_PGRAC_CLUSTER
 			cluster_heap_vm_retarget_after_repick(vmbuffer, &cluster_vm_context);
-			if (!cluster_heap_vm_insert_lock(&vmbuffer, cluster_page_versioned,
+			if (!cluster_heap_vm_mutation_lock(&vmbuffer, cluster_page_versioned,
 										 &cluster_vm_state, &cluster_vm_context)) {
 				/* Reselect this unconsumed batch without counting another page.
 				 * No tuple or page version has been published before this wait. */
 				UnlockReleaseBuffer(buffer);
 				if (cluster_page_versioned)
-					cluster_heap_vm_insert_prepare(&vmbuffer, &cluster_vm_state, &cluster_vm_context);
+					cluster_heap_vm_mutation_prepare(&vmbuffer, &cluster_vm_state, &cluster_vm_context);
 				if (BufferIsValid(vmbuffer))
 					ReleaseBuffer(vmbuffer);
 				vmbuffer = InvalidBuffer;
@@ -10819,6 +10819,28 @@ cluster_current_mx_stamp_lock_buffer(Buffer buffer, bool barrier_aware,
 	{
 		cluster_current_mx_stamp_cancel(first);
 		cluster_current_mx_stamp_cancel(second);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return acquired;
+}
+
+/* Preserve the tuple owner's original plan cleanup on VM-lock ERROR. */
+static bool
+cluster_heap_vm_tuple_writer_lock(Buffer *vmbuffer, bool versioned,
+				 ClusterHeapVmMutationState *state,
+				 ResourceXAuxiliaryAcquireContext *context,
+				 ClusterCurrentMxStampPlan *plan)
+{
+	bool acquired = false;
+
+	PG_TRY();
+	{
+		acquired = cluster_heap_vm_mutation_lock(vmbuffer, versioned, state, context);
+	}
+	PG_CATCH();
+	{
+		cluster_current_mx_stamp_cancel(plan);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
@@ -16578,6 +16600,7 @@ heap_lock_tuple_internal(Relation relation, HeapTuple tuple,
 	ClusterSpaceIdentity cluster_page_identity;
 	RfPageProducerBatchV1 cluster_page_versions;
 	ResourceXAuxiliaryAcquireContext cluster_vm_context = { 0 };
+	ClusterHeapVmMutationState cluster_vm_state = { 0 };
 	bool		cluster_did_lock_stamp = false;
 	uint64 cluster_writer_wait_deadline_us = 0;
 	bool		cluster_did_multixact_member_bind = false;
@@ -17857,11 +17880,8 @@ failed:
 		)
 	{
 #ifdef USE_PGRAC_CLUSTER
-		bool vm_pin_replaced = false;
-
-		if (!cluster_current_mx_stamp_lock_buffer(vmbuffer, false, (ClusterBufferBarrierSiteId)0,
-												  &vm_pin_replaced, &cluster_current_mx_lock_plan,
-												  NULL, &cluster_vm_context, NULL)) {
+		if (!cluster_heap_vm_tuple_writer_lock(&vmbuffer, cluster_page_versioned,
+				&cluster_vm_state, &cluster_vm_context, &cluster_current_mx_lock_plan)) {
 			cluster_current_mx_stamp_cancel(&cluster_current_mx_lock_plan);
 			cluster_current_mx_operation_restart(&cluster_current_mx_operation);
 			cluster_did_lock_stamp = false;
@@ -17869,8 +17889,8 @@ failed:
 			cluster_lock_undo_ready = false;
 			cluster_lock_slot_idx = CLUSTER_ITL_SLOT_UNALLOCATED;
 			LockBuffer(*buffer, BUFFER_LOCK_UNLOCK);
-			if (vm_pin_replaced)
-				vmbuffer = InvalidBuffer;
+			if (cluster_page_versioned)
+				cluster_heap_vm_mutation_prepare(&vmbuffer, &cluster_vm_state, &cluster_vm_context);
 			else
 				cluster_heap_vm_barrier_warm(&vmbuffer, NULL, &cluster_vm_context);
 			cluster_heap_lock_with_vm_repin(relation, block, *buffer, &vmbuffer);
@@ -18839,6 +18859,7 @@ heap_lock_updated_tuple_rec(Relation rel, TransactionId priorXmax,
 	uint64 cluster_chain_capacity_deadline_us = 0;
 	bool		cluster_chain_vm_locked = false;
 	ResourceXAuxiliaryAcquireContext cluster_chain_vm_context = {0};
+	ClusterHeapVmMutationState cluster_chain_vm_state = {0};
 	uint8		cluster_chain_slot_idx = CLUSTER_ITL_SLOT_UNALLOCATED;
 	UBA			cluster_chain_uba = InvalidUba_init;
 	SCN			cluster_chain_write_scn = InvalidScn;
@@ -18877,6 +18898,7 @@ heap_lock_updated_tuple_rec(Relation rel, TransactionId priorXmax,
 		cluster_chain_needs_itl = false;
 		cluster_chain_vm_locked = false;
 		MemSet(&cluster_chain_vm_context, 0, sizeof(cluster_chain_vm_context));
+		MemSet(&cluster_chain_vm_state, 0, sizeof(cluster_chain_vm_state));
 		cluster_chain_slot_idx = CLUSTER_ITL_SLOT_UNALLOCATED;
 		cluster_chain_uba = (UBA) InvalidUba_init;
 		cluster_chain_write_scn = InvalidScn;
@@ -19345,12 +19367,24 @@ l4:
 				&& (!cluster_page_versioned
 					|| cluster_heap_lock_vm_needs_clear(rel, block, vmbuffer)))
 			{
-				if (!ClusterLockBufferExclusiveAuxiliaryAliasAware(
-						&vmbuffer, NULL, NULL, &cluster_chain_vm_context))
+				if (!cluster_heap_vm_mutation_lock(&vmbuffer, cluster_page_versioned,
+						&cluster_chain_vm_state, &cluster_chain_vm_context))
 				{
 					/* Retry from the unlocked tuple check before receipt APPLY. */
 					LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-					cluster_heap_vm_barrier_warm(&vmbuffer, NULL, &cluster_chain_vm_context);
+					if (cluster_page_versioned)
+					{
+						cluster_heap_vm_mutation_prepare(&vmbuffer, &cluster_chain_vm_state,
+							&cluster_chain_vm_context);
+						/* Cancellation and heap acquisition retain no VM pin. */
+						if (BufferIsValid(vmbuffer))
+						{
+							ReleaseBuffer(vmbuffer);
+							vmbuffer = InvalidBuffer;
+						}
+					}
+					else
+						cluster_heap_vm_barrier_warm(&vmbuffer, NULL, &cluster_chain_vm_context);
 					goto l4;
 				}
 				cluster_chain_vm_locked = true;
@@ -19472,11 +19506,23 @@ l4:
 			if (PageIsAllVisible(BufferGetPage(buf)) && BufferIsValid(vmbuffer)
 				&& cluster_heap_lock_vm_needs_clear(rel, block, vmbuffer))
 			{
-				if (!ClusterLockBufferExclusiveAuxiliaryAliasAware(
-						&vmbuffer, NULL, NULL, &cluster_chain_vm_context))
+				if (!cluster_heap_vm_mutation_lock(&vmbuffer, cluster_page_versioned,
+						&cluster_chain_vm_state, &cluster_chain_vm_context))
 				{
 					LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-					cluster_heap_vm_barrier_warm(&vmbuffer, NULL, &cluster_chain_vm_context);
+					if (cluster_page_versioned)
+					{
+						cluster_heap_vm_mutation_prepare(&vmbuffer, &cluster_chain_vm_state,
+							&cluster_chain_vm_context);
+						/* Cancellation and heap acquisition retain no VM pin. */
+						if (BufferIsValid(vmbuffer))
+						{
+							ReleaseBuffer(vmbuffer);
+							vmbuffer = InvalidBuffer;
+						}
+					}
+					else
+						cluster_heap_vm_barrier_warm(&vmbuffer, NULL, &cluster_chain_vm_context);
 					goto l4;
 				}
 				cluster_chain_vm_locked = true;
