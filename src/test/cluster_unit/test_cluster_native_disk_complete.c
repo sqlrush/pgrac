@@ -23,8 +23,13 @@ static void
 complete_broadcast(ConditionVariable *cv)
 {
 	complete_broadcasts++;
+#ifdef NATIVE_X_DISK_COMPOSITION
+	UT_ASSERT_EQ(request_buf.pcm_state, input_observation.request.target_mode);
+	UT_ASSERT_EQ(request_buf.buffer_type, request_buf.pcm_state == PCM_STATE_X ? BUF_TYPE_XCUR : BUF_TYPE_SCUR);
+#else
 	UT_ASSERT_EQ(request_buf.pcm_state, PCM_STATE_S);
 	UT_ASSERT_EQ(request_buf.buffer_type, BUF_TYPE_SCUR);
+#endif
 	UT_ASSERT_EQ(pg_atomic_read_u32(&request_buf.state) & BM_IO_IN_PROGRESS, 0);
 	UT_ASSERT(pg_atomic_read_u32(&request_buf.state) & BM_VALID);
 	UT_ASSERT(!ResourceOwnerHasBufferIO(original_io_owner, 1));
@@ -46,7 +51,11 @@ static void
 TerminateBufferIO(BufferDesc *buf, bool clear_dirty, uint32 set_bits)
 {
 	complete_io_calls++;
+#ifdef NATIVE_X_DISK_COMPOSITION
+	UT_ASSERT_EQ(buf->pcm_state, input_observation.request.target_mode);
+#else
 	UT_ASSERT_EQ(buf->pcm_state, PCM_STATE_S);
+#endif
 	UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&buf->state) & BM_VALID, 0);
 	UT_ASSERT(ResourceOwnerHasBufferIO(original_io_owner, 1));

@@ -3927,7 +3927,9 @@ cluster_bufmgr_pcm_own_acquire_stage_disk_exact(BufferDesc *buf,
 		|| (episode->path != RESOURCE_X_ACQUIRE_FIRST_FILL
 			&& (episode->path != RESOURCE_X_ACQUIRE_RESIDENT
 				|| execution->observation.request.observed_mode != PCM_STATE_N))
-		|| execution->observation.request.target_mode != PCM_STATE_S)
+		|| (execution->observation.request.target_mode != PCM_STATE_S
+			&& (episode->path != RESOURCE_X_ACQUIRE_FIRST_FILL
+				|| execution->observation.request.target_mode != PCM_STATE_X)))
 		return RESOURCE_X_APPLY_BAD_STATE;
 	original = *base;
 	entered = *episode;
@@ -17780,7 +17782,9 @@ cluster_bufmgr_acquire_read_context(BufferDesc *buf, const ClusterPcmOwnSnapshot
 			|| (episode->path == RESOURCE_X_ACQUIRE_RESIDENT
 				&& execution->observation.request.observed_mode == PCM_STATE_N))
 		&& execution->purpose == RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING
-		&& execution->observation.request.target_mode == PCM_STATE_S
+		&& (execution->observation.request.target_mode == PCM_STATE_S
+			|| (episode->path == RESOURCE_X_ACQUIRE_FIRST_FILL
+				&& execution->observation.request.target_mode == PCM_STATE_X))
 		&& base->pcm_state == PCM_STATE_N && base->buffer_type == BUF_TYPE_CURRENT
 		&& base->semantic_buf_state == (BM_TAG_VALID | BM_IO_IN_PROGRESS)
 		&& base->generation == episode->base_generation && base->generation < UINT64_MAX - 1
@@ -17872,8 +17876,11 @@ cluster_bufmgr_acquire_read_terminal(BufferDesc *buf, const ClusterPcmOwnSnapsho
 	expected.reservation_token = episode->reservation_token;
 	expected.semantic_buf_state = BM_TAG_VALID | BM_VALID;
 	expected.flags = 0;
-	expected.pcm_state = PCM_STATE_S;
-	expected.buffer_type = BUF_TYPE_SCUR;
+	if (execution->observation.request.target_mode != PCM_STATE_S
+		&& execution->observation.request.target_mode != PCM_STATE_X)
+		return false;
+	expected.pcm_state = execution->observation.request.target_mode;
+	expected.buffer_type = expected.pcm_state == PCM_STATE_X ? BUF_TYPE_XCUR : BUF_TYPE_SCUR;
 	state = LockBufHdr(buf);
 	cluster_pcm_own_snapshot_locked(buf, &live);
 	hold = cluster_pcm_own_delivery_attempt_get(buf->buf_id);
@@ -17914,7 +17921,9 @@ cluster_bufmgr_pcm_own_acquire_complete_disk_exact(BufferDesc *buf,
 		|| (episode->path != RESOURCE_X_ACQUIRE_FIRST_FILL
 			&& (episode->path != RESOURCE_X_ACQUIRE_RESIDENT
 				|| execution->observation.request.observed_mode != PCM_STATE_N))
-		|| execution->observation.request.target_mode != PCM_STATE_S)
+		|| (execution->observation.request.target_mode != PCM_STATE_S
+			&& (episode->path != RESOURCE_X_ACQUIRE_FIRST_FILL
+				|| execution->observation.request.target_mode != PCM_STATE_X)))
 		return RESOURCE_X_APPLY_BAD_STATE;
 	original = *base;
 	entered = *episode;
@@ -17933,6 +17942,10 @@ cluster_bufmgr_pcm_own_acquire_complete_disk_exact(BufferDesc *buf,
 			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 		return RESOURCE_X_APPLY_DUPLICATE;
 	}
+	/* X uses its original T1/T2/T3 continuation below. This legacy S entry
+	 * may replay an already committed X C, but cannot install one itself. */
+	if (owned.observation.request.target_mode != PCM_STATE_S)
+		return RESOURCE_X_APPLY_BAD_STATE;
 	if (!cluster_bufmgr_acquire_read_context(buf, &original, &entered, admission, &owned, io_owner, true))
 		return RESOURCE_X_APPLY_BAD_STATE;
 	result = cluster_bufmgr_pcm_own_acquire_stage_disk_exact(buf, &original, &entered, admission, &owned, &staged);
@@ -18156,7 +18169,8 @@ typedef enum ClusterAcquireReadCut {
 	CLUSTER_ACQUIRE_READ_CUT_INVALID = 0,
 	CLUSTER_ACQUIRE_READ_CUT_NATIVE,
 	CLUSTER_ACQUIRE_READ_CUT_IO,
-	CLUSTER_ACQUIRE_READ_CUT_PUBLISH
+	CLUSTER_ACQUIRE_READ_CUT_PUBLISH,
+	CLUSTER_ACQUIRE_READ_CUT_X_FENCED
 } ClusterAcquireReadCut;
 
 static ClusterAcquireReadCut
@@ -18180,7 +18194,6 @@ cluster_bufmgr_acquire_read_cut(BufferDesc *buf, const ClusterPcmOwnSnapshot *ba
 	if (CurrentResourceOwner != owner || owner == NULL || MyProc == NULL || MyProcPid <= 0
 		|| MyProc->pid != MyProcPid || MyProc->pgprocno < 0 || MyBackendId != episode->backend_id
 		|| MyProc->backendId != episode->backend_id || MyProc->cluster_grd_generation != episode->backend_generation
-		|| live.writer_activation_token != 0 || live.resource_x_activation_generation != 0
 		|| cluster_pcm_own_delivery_attempt_get(buf->buf_id) != execution->executor_sequence
 		|| pg_atomic_read_u64(&ClusterPcmOwnArray[buf->buf_id].write_io_generation) != receipt->write_io_generation)
 		goto done;
@@ -18195,8 +18208,19 @@ cluster_bufmgr_acquire_read_cut(BufferDesc *buf, const ClusterPcmOwnSnapshot *ba
 	}
 	expected.generation = episode->base_generation + 1;
 	expected.flags = 0;
-	expected.pcm_state = PCM_STATE_S;
-	expected.buffer_type = BUF_TYPE_SCUR;
+	expected.pcm_state = execution->observation.request.target_mode;
+	expected.buffer_type = expected.pcm_state == PCM_STATE_X ? BUF_TYPE_XCUR : BUF_TYPE_SCUR;
+	if (expected.pcm_state == PCM_STATE_X) {
+		expected.writer_activation_token = episode->reservation_token;
+		expected.resource_x_activation_generation = execution->observation.request.assertion_sequence;
+		if (input && cluster_pcm_own_snapshot_equal_exact(&expected, &live)) {
+			cut = CLUSTER_ACQUIRE_READ_CUT_X_FENCED;
+			goto done;
+		}
+		expected.writer_activation_token = 0;
+		expected.resource_x_activation_generation = 0;
+	} else if (expected.pcm_state != PCM_STATE_S)
+		goto done;
 	if (input && cluster_pcm_own_snapshot_equal_exact(&expected, &live))
 		cut = CLUSTER_ACQUIRE_READ_CUT_IO;
 	expected.semantic_buf_state = BM_TAG_VALID | BM_VALID;
@@ -18216,6 +18240,10 @@ cluster_bufmgr_acquire_read_continue_native(BufferDesc *buf, const ClusterPcmOwn
 
 	if (cut == CLUSTER_ACQUIRE_READ_CUT_INVALID)
 		return false;
+	if (cut == CLUSTER_ACQUIRE_READ_CUT_X_FENCED
+		|| (cut == CLUSTER_ACQUIRE_READ_CUT_NATIVE
+			&& execution->observation.request.target_mode != PCM_STATE_S))
+		return false;
 	if (cut == CLUSTER_ACQUIRE_READ_CUT_NATIVE
 		&& !cluster_bufmgr_acquire_read_native(buf, base, episode, execution, owner, receipt))
 		return false;
@@ -18225,6 +18253,165 @@ cluster_bufmgr_acquire_read_continue_native(BufferDesc *buf, const ClusterPcmOwn
 		TerminateBufferIO(buf, false, BM_VALID);
 	}
 	return true;
+}
+
+/* Observe original bytes and native ownership without nesting entry locks
+ * below content/header. A fenced X is installed responsibility, not quiet. */
+static ClusterAcquireReadCut
+cluster_bufmgr_acquire_x_disk_cut(BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
+	const ResourceXDecodedAcquireIntent *episode, const ResourceXDeliveryClaim *execution,
+	const ResourceXAcquireReadReceipt *receipt, ResourceOwner owner)
+{
+	LWLock *content = BufferDescriptorGetContentLock(buf);
+	volatile ClusterAcquireReadCut cut = CLUSTER_ACQUIRE_READ_CUT_INVALID;
+
+	LWLockAcquire(content, LW_EXCLUSIVE);
+	PG_TRY();
+	{
+		cut = cluster_bufmgr_acquire_read_cut(buf, base, episode, execution, receipt, owner);
+	}
+	PG_FINALLY();
+	{
+		LWLockRelease(content);
+	}
+	PG_END_TRY();
+	return cut;
+}
+
+/* All fallible observations precede BufHdr. The original writer commit
+ * and activation owner remain the only writers of their native fences. */
+static bool
+cluster_bufmgr_acquire_x_disk_native_step(BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
+	const ResourceXDecodedAcquireIntent *episode, const ResourceXDeliveryClaim *execution,
+	const ResourceXAcquireReadReceipt *receipt, ResourceOwner owner, bool activate)
+{
+	LWLock *content = BufferDescriptorGetContentLock(buf);
+	ClusterPcmOwnSnapshot expected = *base, live;
+	volatile bool applied = false;
+	uint64 generation;
+	uint32 state;
+	ClusterAcquireReadCut cut;
+
+	LWLockAcquire(content, LW_EXCLUSIVE);
+	PG_TRY();
+	{
+		cut = cluster_bufmgr_acquire_read_cut(buf, base, episode, execution, receipt, owner);
+		if (cut == (activate ? CLUSTER_ACQUIRE_READ_CUT_X_FENCED : CLUSTER_ACQUIRE_READ_CUT_NATIVE)) {
+			expected.reservation_token = episode->reservation_token;
+			expected.semantic_buf_state = BM_TAG_VALID | BM_IO_IN_PROGRESS;
+			expected.flags = PCM_OWN_FLAG_GRANT_PENDING;
+			if (activate) {
+				expected.generation = episode->base_generation + 1;
+				expected.flags = 0;
+				expected.pcm_state = PCM_STATE_X;
+				expected.buffer_type = BUF_TYPE_XCUR;
+				expected.writer_activation_token = episode->reservation_token;
+				expected.resource_x_activation_generation = execution->observation.request.assertion_sequence;
+			}
+			state = LockBufHdr(buf);
+			cluster_pcm_own_snapshot_locked(buf, &live);
+			applied = cluster_pcm_own_snapshot_equal_exact(&expected, &live)
+				&& cluster_pcm_own_delivery_attempt_get(buf->buf_id) == execution->executor_sequence
+				&& pg_atomic_read_u64(&ClusterPcmOwnArray[buf->buf_id].write_io_generation)
+					== receipt->write_io_generation;
+			if (applied && activate)
+				applied = cluster_pcm_own_resource_x_activation_clear_exact(buf->buf_id,
+					live.generation, episode->reservation_token,
+					execution->observation.request.assertion_sequence) == CLUSTER_PCM_OWN_OK;
+			else if (applied) {
+				applied = cluster_pcm_own_writer_grant_commit_exact(buf->buf_id, base->generation,
+					episode->reservation_token, &generation) == CLUSTER_PCM_OWN_OK;
+				if (applied)
+					applied = generation == episode->base_generation + 1
+						&& cluster_pcm_own_resource_x_activation_bind_exact(buf->buf_id, generation,
+							episode->reservation_token, execution->observation.request.assertion_sequence)
+							== CLUSTER_PCM_OWN_OK;
+				if (applied) {
+					buf->pcm_state = PCM_STATE_X;
+					buf->buffer_type = BUF_TYPE_XCUR;
+				}
+			}
+			UnlockBufHdr(buf, state);
+		}
+	}
+	PG_FINALLY();
+	{
+		LWLockRelease(content);
+	}
+	PG_END_TRY();
+	return applied;
+}
+
+/* No REQUEST, disk read or new executor occurs here. Normal continuation
+ * may perform the initial native commit; cleanup (admission==NULL) may only
+ * finish an already-installed X. Original T1/T2/T3 preserve full E/A/I and
+ * own their independently locked progress. Domain loss retains fail-closed
+ * responsibility rather than rolling an installed X back to empty. */
+static ResourceXApplyResult
+cluster_bufmgr_acquire_x_disk_continue(BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
+	const ResourceXDecodedAcquireIntent *episode, const ClusterSemanticAdmissionToken *admission,
+	const ResourceXDeliveryClaim *execution, const ResourceXAcquireReadReceipt *receipt, ResourceOwner owner)
+{
+	ResourceXAcquisitionRef ref;
+	ResourceXBufferInstallProof installed;
+	ResourceXBufferActivationProof activated;
+	ResourceXApplyResult result;
+	ClusterAcquireReadCut cut;
+	LWLock *content = BufferDescriptorGetContentLock(buf);
+	volatile bool continued = false;
+
+	if (LWLockHeldByMe(content) || episode->path != RESOURCE_X_ACQUIRE_FIRST_FILL
+		|| execution->observation.request.target_mode != PCM_STATE_X)
+		return RESOURCE_X_APPLY_BAD_STATE;
+	ref.assertion = execution->observation.request.logical_assertion;
+	ref.formation = execution->observation.request.resource_formation;
+	ref.acquisition_generation = execution->observation.request.assertion_sequence;
+	cut = cluster_bufmgr_acquire_x_disk_cut(buf, base, episode, execution, receipt, owner);
+	if (cut == CLUSTER_ACQUIRE_READ_CUT_NATIVE) {
+		if (admission == NULL)
+			return RESOURCE_X_APPLY_BAD_STATE; /* original unpublished quiet owner */
+		if (!cluster_bufmgr_acquire_read_context(buf, base, episode, admission, execution, owner, true))
+			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		result = cluster_pcm_lock_resource_x_t1_grant_delivery_exact(&ref, execution);
+		if (result != RESOURCE_X_APPLY_APPLIED && result != RESOURCE_X_APPLY_DUPLICATE)
+			return result;
+		if (!cluster_bufmgr_acquire_read_context(buf, base, episode, admission, execution, owner, true)
+			|| !cluster_bufmgr_acquire_x_disk_native_step(buf, base, episode, execution, receipt, owner, false))
+			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		cut = CLUSTER_ACQUIRE_READ_CUT_X_FENCED;
+	}
+	if (cut == CLUSTER_ACQUIRE_READ_CUT_X_FENCED) {
+		installed.ownership_generation = episode->base_generation + 1;
+		installed.writer_activation_token = episode->reservation_token;
+		installed.resource_x_activation_generation = ref.acquisition_generation;
+		result = cluster_pcm_lock_resource_x_requester_apply_delivery_exact(&ref, &installed, execution);
+		if (result != RESOURCE_X_APPLY_APPLIED && result != RESOURCE_X_APPLY_DUPLICATE)
+			return result;
+		if ((admission != NULL
+				&& !cluster_bufmgr_acquire_read_context(buf, base, episode, admission, execution, owner, true))
+			|| !cluster_bufmgr_acquire_x_disk_native_step(buf, base, episode, execution, receipt, owner, true))
+			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		cut = CLUSTER_ACQUIRE_READ_CUT_IO;
+	}
+	if (cut != CLUSTER_ACQUIRE_READ_CUT_IO && cut != CLUSTER_ACQUIRE_READ_CUT_PUBLISH)
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	activated.ownership_generation = episode->base_generation + 1;
+	activated.writer_activation_token = 0;
+	activated.resource_x_activation_generation = 0;
+	result = cluster_pcm_lock_resource_x_requester_activate_delivery_exact(&ref, &activated, execution);
+	if (result != RESOURCE_X_APPLY_APPLIED && result != RESOURCE_X_APPLY_DUPLICATE)
+		return result;
+	LWLockAcquire(content, LW_EXCLUSIVE);
+	PG_TRY();
+	{
+		continued = cluster_bufmgr_acquire_read_continue_native(buf, base, episode, execution, receipt, owner);
+	}
+	PG_FINALLY();
+	{
+		LWLockRelease(content);
+	}
+	PG_END_TRY();
+	return continued ? RESOURCE_X_APPLY_APPLIED : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 }
 
 ResourceXApplyResult
@@ -18272,16 +18459,24 @@ cluster_bufmgr_pcm_own_acquire_continue_disk_exact(BufferDesc *buf,
 	if (result != RESOURCE_X_APPLY_APPLIED || latest.purpose != RESOURCE_X_DELIVERY_ACQUIRE_READ_ARMED
 		|| memcmp(&receipt, &retained, sizeof(receipt)) != 0)
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
-	LWLockAcquire(content, LW_EXCLUSIVE);
-	PG_TRY();
-	{
-		continued = cluster_bufmgr_acquire_read_continue_native(buf, &entered_base, &entered, &owned, &receipt, owner);
+	if (owned.observation.request.target_mode == PCM_STATE_X) {
+		result = cluster_bufmgr_acquire_x_disk_continue(buf, &entered_base, &entered,
+			admission, &owned, &receipt, owner);
+		if (result != RESOURCE_X_APPLY_APPLIED)
+			return result;
+		continued = true;
+	} else {
+		LWLockAcquire(content, LW_EXCLUSIVE);
+		PG_TRY();
+		{
+			continued = cluster_bufmgr_acquire_read_continue_native(buf, &entered_base, &entered, &owned, &receipt, owner);
+		}
+		PG_FINALLY();
+		{
+			LWLockRelease(content);
+		}
+		PG_END_TRY();
 	}
-	PG_FINALLY();
-	{
-		LWLockRelease(content);
-	}
-	PG_END_TRY();
 	if (!continued || !cluster_bufmgr_acquire_read_context(buf, &entered_base, &entered, admission, &owned, owner, false))
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	result = cluster_pcm_lock_resource_x_requester_acquire_read_resume_exact(&owned, &entered, &latest, &retained);
@@ -18318,9 +18513,7 @@ cluster_bufmgr_acquire_quiet_context(BufferDesc *buf, const ClusterPcmOwnSnapsho
 				&& execution->observation.request.observed_mode == PCM_STATE_N))
 		&& (execution->observation.request.target_mode == PCM_STATE_S
 			|| (episode->path == RESOURCE_X_ACQUIRE_FIRST_FILL
-				&& execution->observation.request.target_mode == PCM_STATE_X
-				&& (execution->purpose == RESOURCE_X_DELIVERY_ACQUIRE_WAIT_SEALING
-					|| execution->purpose == RESOURCE_X_DELIVERY_ACQUIRE_WAIT_QUIET)))
+				&& execution->observation.request.target_mode == PCM_STATE_X))
 		&& base->generation == episode->base_generation && base->generation < UINT64_MAX - 1 && base->flags == 0
 		&& base->reservation_token < UINT64_MAX - 1 && episode->reservation_token == base->reservation_token + 1
 		&& BufferTagsEqual(&base->tag, &execution->observation.request.logical_assertion.resource);
@@ -18942,34 +19135,44 @@ cluster_bufmgr_acquire_disk_installed_handoff(const ClusterAcquireDiskGuard *gua
 			|| current.purpose > RESOURCE_X_DELIVERY_ACQUIRE_READ_SETTLED))
 		return RESOURCE_X_APPLY_BAD_STATE;
 	execution.purpose = RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING;
-	LWLockAcquire(content, LW_EXCLUSIVE);
-	PG_TRY();
-	{
-		if (current.purpose == RESOURCE_X_DELIVERY_ACQUIRE_READ_ARMED) {
-			cut = cluster_bufmgr_acquire_read_cut(guard->buf, &guard->base,
-				&guard->episode, &execution, &receipt, guard->owner);
-			/* A native GP is still unpublished: let its original quiet owner
-			 * seal and abort it. Cleanup must not call read_native here. */
-			if (cut == CLUSTER_ACQUIRE_READ_CUT_IO || cut == CLUSTER_ACQUIRE_READ_CUT_PUBLISH) {
-				if (cut == CLUSTER_ACQUIRE_READ_CUT_IO)
-					TerminateBufferIO(guard->buf, false, BM_VALID);
+	if (execution.observation.request.target_mode == PCM_STATE_X
+		&& current.purpose == RESOURCE_X_DELIVERY_ACQUIRE_READ_ARMED) {
+		result = cluster_bufmgr_acquire_x_disk_continue(guard->buf, &guard->base,
+			&guard->episode, NULL, &execution, &receipt, guard->owner);
+		if (result != RESOURCE_X_APPLY_APPLIED)
+			return result;
+		physical = cluster_bufmgr_acquire_read_terminal(guard->buf, &guard->base,
+			&guard->episode, &execution, &receipt, CLUSTER_ACQUIRE_READ_HELD, &terminal);
+	} else {
+		LWLockAcquire(content, LW_EXCLUSIVE);
+		PG_TRY();
+		{
+			if (current.purpose == RESOURCE_X_DELIVERY_ACQUIRE_READ_ARMED) {
+				cut = cluster_bufmgr_acquire_read_cut(guard->buf, &guard->base,
+					&guard->episode, &execution, &receipt, guard->owner);
+				/* A native GP is still unpublished: let its original quiet owner
+				 * seal and abort it. Cleanup must not call read_native here. */
+				if (cut == CLUSTER_ACQUIRE_READ_CUT_IO || cut == CLUSTER_ACQUIRE_READ_CUT_PUBLISH) {
+					if (cut == CLUSTER_ACQUIRE_READ_CUT_IO)
+						TerminateBufferIO(guard->buf, false, BM_VALID);
+					physical = cluster_bufmgr_acquire_read_terminal(guard->buf, &guard->base,
+						&guard->episode, &execution, &receipt, CLUSTER_ACQUIRE_READ_HELD, &terminal);
+				}
+			} else if (!ResourceOwnerHasBufferIO(guard->owner, BufferDescriptorGetBuffer(guard->buf))
+				&& cluster_gcs_block_compute_checksum(page) == receipt.page_crc32c
+				&& PageGetLSN(page) == receipt.page_lsn
+				&& (uint64)((PageHeader)page)->pd_block_scn == receipt.page_scn)
 				physical = cluster_bufmgr_acquire_read_terminal(guard->buf, &guard->base,
-					&guard->episode, &execution, &receipt, CLUSTER_ACQUIRE_READ_HELD, &terminal);
-			}
-		} else if (!ResourceOwnerHasBufferIO(guard->owner, BufferDescriptorGetBuffer(guard->buf))
-			&& cluster_gcs_block_compute_checksum(page) == receipt.page_crc32c
-			&& PageGetLSN(page) == receipt.page_lsn
-			&& (uint64)((PageHeader)page)->pd_block_scn == receipt.page_scn)
-			physical = cluster_bufmgr_acquire_read_terminal(guard->buf, &guard->base,
-				&guard->episode, &execution, &receipt,
-				current.purpose == RESOURCE_X_DELIVERY_ACQUIRE_READ_COMPLETE
-					? CLUSTER_ACQUIRE_READ_RELEASE : CLUSTER_ACQUIRE_READ_RELEASED, &terminal);
+					&guard->episode, &execution, &receipt,
+					current.purpose == RESOURCE_X_DELIVERY_ACQUIRE_READ_COMPLETE
+						? CLUSTER_ACQUIRE_READ_RELEASE : CLUSTER_ACQUIRE_READ_RELEASED, &terminal);
+		}
+		PG_FINALLY();
+		{
+			LWLockRelease(content);
+		}
+		PG_END_TRY();
 	}
-	PG_FINALLY();
-	{
-		LWLockRelease(content);
-	}
-	PG_END_TRY();
 	if (cut == CLUSTER_ACQUIRE_READ_CUT_NATIVE)
 		return RESOURCE_X_APPLY_BAD_STATE;
 	if (!physical)
@@ -19129,7 +19332,8 @@ cluster_bufmgr_acquire_image_owned(BufferDesc *buf, const ClusterPcmOwnSnapshot 
 	ResourceXRequesterJoinSnapshot join;
 	ClusterPcmOwnSnapshot live;
 
-	if (LWLockHeldByMe(BufferDescriptorGetContentLock(buf))
+	if (execution->observation.request.target_mode != PCM_STATE_S
+		|| LWLockHeldByMe(BufferDescriptorGetContentLock(buf))
 		|| !cluster_bufmgr_acquire_read_context(buf, base, episode, admission, execution, owner, true)
 		|| cluster_pcm_lock_resource_x_requester_acquire_execute_frames_exact(
 			execution, episode, grant, image, &join) != RESOURCE_X_APPLY_APPLIED
@@ -19241,7 +19445,8 @@ cluster_bufmgr_pcm_own_acquire_fill_image_exact(BufferDesc *buf,
 	guard.base = *base;
 	guard.episode = *episode;
 	guard.original = *prepared;
-	if (guard.original.purpose != RESOURCE_X_DELIVERY_ACQUIRE_PREPARED
+	if (guard.original.observation.request.target_mode != PCM_STATE_S
+		|| guard.original.purpose != RESOURCE_X_DELIVERY_ACQUIRE_PREPARED
 		|| LWLockHeldByMe(BufferDescriptorGetContentLock(buf))
 		|| !cluster_bufmgr_acquire_quiet_context(buf, &guard.base, &guard.episode, &guard.original, guard.owner))
 		return RESOURCE_X_APPLY_BAD_STATE;

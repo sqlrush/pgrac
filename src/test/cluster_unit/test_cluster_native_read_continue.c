@@ -26,7 +26,13 @@
 #define LWLockAcquire complete_content_acquire
 #define GetPrivateRefCount(buffer) request_private_pin(buffer)
 #define cluster_pcm_lock_resource_x_requester_acquire_read_complete_exact complete_publish
+#ifdef NATIVE_X_DISK_COMPOSITION
+#define LWLockRelease xd_content_release
+#endif
 #include "test_cluster_native_read_continue.inc"
+#ifdef NATIVE_X_DISK_COMPOSITION
+#undef LWLockRelease
+#endif
 #undef cluster_pcm_lock_resource_x_requester_acquire_read_complete_exact
 #undef GetPrivateRefCount
 #undef LWLockAcquire

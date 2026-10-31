@@ -11251,6 +11251,24 @@ clean distclean maintainer-clean: clean-native-x-phase
 clean-native-x-phase:
 	rm -f test_cluster_native_x_phase
 
+# Physical first-fill disk X, using the original IO and cleanup scopes.
+TESTS += test_cluster_native_x_disk
+all: test_cluster_native_x_disk
+test_cluster_native_x_disk: test_cluster_native_x_disk.c test_cluster_native_disk_episode \
+		test_cluster_native_disk_episode_fixture.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+clean distclean maintainer-clean: clean-native-x-disk
+.PHONY: clean-native-x-disk
+clean-native-x-disk:
+	rm -f test_cluster_native_x_disk
+
 TESTS += test_cluster_native_disk_guard
 all: test_cluster_native_disk_guard
 test_cluster_native_disk_guard: test_cluster_native_disk_guard.c \

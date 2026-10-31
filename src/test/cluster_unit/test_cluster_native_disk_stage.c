@@ -149,14 +149,28 @@ UT_TEST(test_disk_stage_accepts_no_caller_supplied_page_or_scalar)
 	UT_ASSERT(memcmp(disk_shared.data, disk_bytes.data, BLCKSZ) == 0);
 	UT_ASSERT_EQ(disk_reads, 1);
 }
-UT_TEST(test_disk_stage_known_X_remote_resident_and_PI_do_not_enter_S_installer)
+UT_TEST(test_disk_stage_disk_X_remains_unpublished_and_other_sources_cannot_stage)
 {
 	for (int profile = 1; profile < 8; profile++) {
 		EvidenceFixture f;
 		UT_ASSERT(stage_disk_start(&f, profile));
-		UT_ASSERT(stage_disk_run() != RESOURCE_X_APPLY_APPLIED);
-		UT_ASSERT_EQ(disk_reads, 0);
-		stage_no_copy();
+		if (profile == 1) {
+			/* The same physical staging owner now accepts DISK/X. Staged
+			 * bytes are still not native X or a usable completion. */
+			UT_ASSERT_EQ(stage_disk_run(), RESOURCE_X_APPLY_APPLIED);
+			UT_ASSERT_EQ(disk_reads, 1);
+			UT_ASSERT(memcmp(disk_shared.data, disk_bytes.data, BLCKSZ) == 0);
+			UT_ASSERT_EQ(request_buf.pcm_state, PCM_STATE_N);
+			UT_ASSERT_EQ(request_buf.buffer_type, BUF_TYPE_CURRENT);
+			UT_ASSERT_EQ(cluster_pcm_own_gen_get(0), request_base.generation);
+			UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), PCM_OWN_FLAG_GRANT_PENDING);
+			UT_ASSERT(pg_atomic_read_u32(&request_buf.state) & BM_IO_IN_PROGRESS);
+			UT_ASSERT_EQ(pg_atomic_read_u32(&request_buf.state) & BM_VALID, 0);
+		} else {
+			UT_ASSERT(stage_disk_run() != RESOURCE_X_APPLY_APPLIED);
+			UT_ASSERT_EQ(disk_reads, 0);
+			stage_no_copy();
+		}
 	}
 }
 UT_TEST(test_disk_stage_stale_executor_never_enters_storage)
@@ -328,7 +342,7 @@ main(void)
 	UT_PLAN(18);
 	UT_RUN(test_disk_stage_actual_bytes_remain_unpublished_under_original_fence);
 	UT_RUN(test_disk_stage_accepts_no_caller_supplied_page_or_scalar);
-	UT_RUN(test_disk_stage_known_X_remote_resident_and_PI_do_not_enter_S_installer);
+	UT_RUN(test_disk_stage_disk_X_remains_unpublished_and_other_sources_cannot_stage);
 	UT_RUN(test_disk_stage_stale_executor_never_enters_storage);
 	UT_RUN(test_disk_stage_storage_cancel_retains_original_execution_and_IO);
 	UT_RUN(test_disk_stage_real_checksum_failure_never_touches_shared_page);
