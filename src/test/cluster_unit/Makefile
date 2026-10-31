@@ -2366,6 +2366,11 @@ check: check_vm_setter_census
 check_vm_setter_census:
 	python3 $(srcdir)/check_vm_setter_census.py $(top_srcdir)
 
+.PHONY: check_vm_reader_census
+check: check_vm_reader_census
+check_vm_reader_census:
+	python3 $(srcdir)/check_vm_reader_census.py $(top_srcdir)
+
 test_cluster_vm_qualified_format.inc test_cluster_vm_qualified_read.inc test_cluster_vm_qualified_ios.inc: \
 		$(srcdir)/extract_vm_qualified_ios_fixture.py $(srcdir)/extract_vacuum_mx_fixture.py \
 		$(top_srcdir)/src/backend/access/heap/visibilitymap.c \
