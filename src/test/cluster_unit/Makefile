@@ -14998,7 +14998,8 @@ test_cluster_cold_tx_start: test_cluster_cold_ctrc_plain_lock_refs.inc
 test_cluster_clog_recovery test_cluster_clog_retention \
         test_cluster_side_native_clog.o test_cluster_recovery_episode_clog.o \
         test_cluster_xid_native_clog.o test_cluster_relmap_native_clog.o \
-        test_cluster_relmap_publish_clog_bridge.o: test_cluster_clog_cold_birth.inc test_cluster_clog_foreign_birth.inc
+        test_cluster_relmap_publish_clog_bridge.o: test_cluster_clog_cold_birth.inc test_cluster_clog_foreign_birth.inc \
+        test_cluster_clog_full_residency.inc
 
 
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_update_predecessors.inc
