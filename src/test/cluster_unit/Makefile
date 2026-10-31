@@ -9560,6 +9560,55 @@ clean-collation-import-preflight:
 	rm -f test_cluster_collation_import_preflight test_cluster_collation_import_preflight.inc \
 		test_cluster_collation_import_preflight.inc.tmp
 
+# Keep complete explicit DISCARD and namespace cleanup bodies together.
+test_cluster_discard_preflight.inc: $(top_srcdir)/src/backend/commands/discard.c \
+		$(top_srcdir)/src/backend/catalog/namespace.c \
+		$(top_srcdir)/src/backend/tcop/utility.c \
+		$(top_srcdir)/src/backend/access/transam/xact.c Makefile
+	awk 'FNR == NR { if (/^DiscardTemp\(/) helpers++; next } \
+	     FNR == 1 { print "static void DiscardAll(bool isTopLevel);"; \
+	                 if (helpers) print "static void DiscardTemp(void);" } \
+	     /^DiscardCommand\(/ { print "void"; emit=1; entries++ } \
+	     /^Discard(All|Temp)\(/ { print "static void"; emit=1; private_entries++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (entries != 1 || helpers > 1 || private_entries != 1 + helpers || emit) exit 1 }' \
+		$< $< > $@.tmp
+	awk '/^(GetTempNamespaceState|ResetTempTableNamespace)\(/ { print "void"; emit=1; entries++ } \
+	     /^RemoveTempRelations(Callback)?\(/ { print "static void"; emit=1; private_entries++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (entries != 2 || private_entries != 2 || emit) exit 1 }' $(word 2,$^) >> $@.tmp
+	awk '/^PreventCommand(IfReadOnly|IfParallelMode|DuringRecovery)\(/ \
+	     { print "void"; emit=1; entries++ } emit { print } \
+	     emit && /^}/ { emit=0 } END { if (entries != 3 || emit) exit 1 }' $(word 3,$^) >> $@.tmp
+	awk '/^PreventInTransactionBlock\(/ { print "void"; emit=1; entries++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (entries != 1 || emit) exit 1 }' $(word 4,$^) >> $@.tmp
+	mv $@.tmp $@
+
+test_cluster_discard_xact_types.inc: $(top_srcdir)/src/backend/access/transam/xact.c Makefile
+	awk '/^typedef enum TBlockState/ { emit=1; entries++ } emit { print } \
+	     /^} TBlockState;/ { emit=0 } \
+	     END { if (entries != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_discard_preflight: test_cluster_discard_preflight.c \
+		test_cluster_tt_active_owner.c test_cluster_tt_durable.c unit_test.h \
+		test_cluster_discard_preflight.inc test_cluster_discard_xact_types.inc \
+		test_cluster_active_capacity_stats.inc test_cluster_tt_locator_stats.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_local.c \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_slot.c $(CLUSTER_TT_DURABLE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(CLUSTER_TT_DURABLE_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+clean distclean maintainer-clean: clean-discard-preflight
+.PHONY: clean-discard-preflight
+clean-discard-preflight:
+	rm -f test_cluster_discard_preflight test_cluster_discard_preflight.inc \
+		test_cluster_discard_preflight.inc.tmp test_cluster_discard_xact_types.inc \
+		test_cluster_discard_xact_types.inc.tmp
+
 test_cluster_tt_active_owner: test_cluster_tt_active_owner.c test_cluster_tt_durable.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_tt_local.c \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h \
