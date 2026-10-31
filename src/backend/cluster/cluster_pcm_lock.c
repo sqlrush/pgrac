@@ -30304,6 +30304,7 @@ cluster_pcm_lock_resource_x_first_fill_retire_unsent_exact(
 
 	if (prepared == NULL || episode == NULL || issued == NULL
 		|| !resource_x_assertion_valid(&prepared->request.logical_assertion)
+		|| (prepared->request.flags != 0 && prepared->request.flags != RESOURCE_X_COMMON_FLAG_REMOTE_ADMISSION)
 		|| prepared->request.logical_assertion.requester_node != cluster_node_id
 		|| prepared->entry_binding_generation == 0
 		|| prepared->entry_binding_generation == UINT64_MAX
@@ -30339,10 +30340,18 @@ cluster_pcm_lock_resource_x_first_fill_retire_unsent_exact(
 		|| round->cancelled_attempt_floor > round->request.assertion_sequence)
 		goto done;
 	if (round->has_acquire_intent) {
-		/* The wire encoder seals its CRC while the ring takes E. All other
-		 * common fields must still be the original prepared request. */
+		ResourceXDecodedCommon issued_expected = prepared->request;
+
+		/* A returned full-E observation already carries its exact S/X
+		 * modes. An ERROR inside the original S sender can still carry
+		 * the old bootstrap observation, whose N/S normalization above
+		 * is retained. The original sender clears REMOTE_ADMISSION and
+		 * seals the CRC; every other field and full E must match. */
 		expected.semantic_crc32c = round->request.semantic_crc32c;
-		if (!pcm_resource_x_common_equal(&expected, &round->request)
+		issued_expected.flags = 0;
+		issued_expected.semantic_crc32c = round->request.semantic_crc32c;
+		if ((!pcm_resource_x_common_equal(&issued_expected, &round->request)
+				&& !pcm_resource_x_common_equal(&expected, &round->request))
 			|| !pcm_resource_x_acquire_identity_equal(episode, &round->acquire_intent))
 			goto done;
 		*issued = *prepared;
@@ -30762,9 +30771,7 @@ pcm_resource_x_acquire_read_source(const ResourceXDecodedFrame *grant,
 	const ResourceXDecodedAcquireDecision *a = &grant->body.acquire_decision;
 
 	if (grant->kind != RESOURCE_X_WIRE_AUTHORITY_GRANT || !grant->has_acquire_decision
-		|| (grant->common.target_mode != PCM_STATE_S
-			&& (grant->common.target_mode != PCM_STATE_X
-				|| a->source_kind != RESOURCE_X_ACQUIRE_SOURCE_DISK))
+		|| (grant->common.target_mode != PCM_STATE_S && grant->common.target_mode != PCM_STATE_X)
 		|| (a->episode.path != RESOURCE_X_ACQUIRE_FIRST_FILL
 			&& (a->episode.path != RESOURCE_X_ACQUIRE_RESIDENT || grant->common.observed_mode != PCM_STATE_N)))
 		return false;
@@ -30911,7 +30918,7 @@ pcm_resource_x_acquire_x_transition_locked(struct GrdEntry *entry,
 		&round->acquire_intent, &current, &grant, &image, &join);
 	if (result != RESOURCE_X_APPLY_APPLIED)
 		return result;
-	if (grant.body.acquire_decision.source_kind != RESOURCE_X_ACQUIRE_SOURCE_DISK
+	if (!pcm_resource_x_acquire_read_source(&grant, &image)
 		|| grant.common.base_authority_generation == 0
 		|| grant.common.base_authority_generation >= UINT64_MAX - 1
 		|| grant.common.authority_generation <= grant.common.base_authority_generation
@@ -31186,6 +31193,35 @@ cluster_pcm_lock_resource_x_requester_acquire_read_close_observe_exact(
 		return RESOURCE_X_APPLY_NOT_FOUND;
 	LWLockAcquire(&ref.entry->entry_lock.lock, LW_SHARED);
 	result = pcm_resource_x_acquire_read_close_locked(ref.entry, execution, episode, current_out, receipt_out);
+	LWLockRelease(&ref.entry->entry_lock.lock);
+	pcm_entry_ref_release(&ref);
+	return result;
+}
+
+/* An exact shared handoff already proves original C, IO termination and
+ * released native fences. Later valid cached-X writes cannot reopen that
+ * old debt. This observer neither samples nor authorizes current bytes. */
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_requester_acquire_read_handed_off_exact(
+	const ResourceXDeliveryClaim *execution, const ResourceXDecodedAcquireIntent *episode)
+{
+	PcmEntryRef ref;
+	PcmEntryAcquireResult acquired;
+	ResourceXDeliveryClaim current;
+	ResourceXAcquireReadReceipt receipt;
+	ResourceXApplyResult result;
+
+	if (!pcm_resource_x_acquire_read_input(execution, episode))
+		return RESOURCE_X_APPLY_INVALID;
+	if (!pcm_entry_ref_acquire(&execution->observation.request.logical_assertion.resource, false, &ref, &acquired))
+		return RESOURCE_X_APPLY_NOT_FOUND;
+	LWLockAcquire(&ref.entry->entry_lock.lock, LW_SHARED);
+	result = pcm_resource_x_acquire_read_close_locked(ref.entry, execution, episode, &current, &receipt);
+	if (result == RESOURCE_X_APPLY_APPLIED
+		&& (current.purpose < RESOURCE_X_DELIVERY_ACQUIRE_READ_NOTICE
+			|| current.purpose > RESOURCE_X_DELIVERY_ACQUIRE_READ_SETTLED
+			|| ref.entry->resource_x_bootstrap_round.acquire_read_handoff != 1))
+		result = RESOURCE_X_APPLY_BAD_STATE;
 	LWLockRelease(&ref.entry->entry_lock.lock);
 	pcm_entry_ref_release(&ref);
 	return result;

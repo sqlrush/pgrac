@@ -11211,6 +11211,32 @@ clean-native-resident-request:
 		test_cluster_native_first_fill_fixture.inc.tmp test_cluster_native_resident_wait_cancel.inc \
 		test_cluster_native_resident_wait_cancel.inc.tmp
 
+# Resident X shares the original disk/image native completion owners.
+TESTS += test_cluster_native_resident_x
+all: test_cluster_native_resident_x
+test_cluster_native_resident_x: test_cluster_native_resident_x.c test_cluster_native_resident_fill \
+		test_cluster_native_resident_fill_fixture.inc test_cluster_native_x_writer_gcs.inc \
+		test_cluster_native_x_writer_ledger.inc test_cluster_native_resident_x_driver.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+test_cluster_native_resident_x_driver.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^cluster_bufmgr_pcm_own_begin_x_reservation\(/ { print "ClusterPcmOwnResult"; emit=1; native++ } \
+	     /^cluster_bufmgr_pcm_acquire_resident_x\(/ { print "static ResourceXApplyResult"; emit=1; driver++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (native != 1 || driver != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+clean distclean maintainer-clean: clean-native-resident-x
+.PHONY: clean-native-resident-x
+clean-native-resident-x:
+	rm -f test_cluster_native_resident_x test_cluster_native_resident_x_driver.inc \
+		test_cluster_native_resident_x_driver.inc.tmp
+
 # Full X requester intent and original waiting-phase cancellation.
 TESTS += test_cluster_native_x_request
 all: test_cluster_native_x_request

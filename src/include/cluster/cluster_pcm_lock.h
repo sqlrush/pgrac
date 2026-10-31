@@ -2942,6 +2942,9 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_read_r
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_read_handoff_exact(
 	const ResourceXDeliveryClaim *execution, const ResourceXDecodedAcquireIntent *episode,
 	const ResourceXAcquireReadReceipt *receipt, const struct ClusterPcmOwnSnapshot *terminal);
+/* Observe only an already-retained exact handoff; never native permission. */
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_read_handed_off_exact(
+	const ResourceXDeliveryClaim *execution, const ResourceXDecodedAcquireIntent *episode);
 /* Master consumption is independent of local physical delivery quiescence. */
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_acquire_read_consumed_exact(
 	const ResourceXDecodedFrame *notice, int32 authenticated_master,

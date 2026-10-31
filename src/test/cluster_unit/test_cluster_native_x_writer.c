@@ -103,7 +103,11 @@ static bool wc_object_current(uint64 revision)
 #define cluster_smgr_which_for(...) 1
 #define cluster_ko_peer_delivery_begin_v3 wc_object_begin
 #define cluster_ko_peer_delivery_current_v3 wc_object_current
+/* This component starts after physical C; the resident N entrance is
+ * exercised with its real body by test_cluster_native_resident_x. */
+#define cluster_bufmgr_pcm_acquire_resident_x(...) RESOURCE_X_APPLY_NOT_FOUND
 #include "test_cluster_native_x_writer_ledger.inc"
+#undef cluster_bufmgr_pcm_acquire_resident_x
 #undef cluster_ko_peer_delivery_current_v3
 #undef cluster_ko_peer_delivery_begin_v3
 #undef cluster_smgr_which_for
