@@ -23,6 +23,8 @@
 #include "port/pg_crc32c.h"
 
 char *BufferBlocks;
+/* Real page-WAL observers resolve this sole original descriptor. */
+BufferDescPadded *BufferDescriptors = (BufferDescPadded *)&request_buf;
 int NLocBuffer;
 Block *LocalBufferBlockPointers;
 static ResourceXDiskStageObservation staged;

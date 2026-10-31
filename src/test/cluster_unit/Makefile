@@ -11226,10 +11226,12 @@ test_cluster_native_resident_x: test_cluster_native_resident_x.c test_cluster_na
 		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
 test_cluster_native_resident_x_driver.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
-	awk '/^cluster_bufmgr_pcm_own_begin_x_reservation\(/ { print "ClusterPcmOwnResult"; emit=1; native++ } \
+	awk '/^cluster_bufmgr_pcm_current_image_locked\(/ { print "static inline bool"; emit=1; shape++ } \
+	     /^cluster_bufmgr_pcm_own_(begin_x_reservation|begin_s_revoke|abort_s_revoke|handoff_revoke_to_x_reservation|handoff_s_revoke_to_x_reservation)\(/ { print "ClusterPcmOwnResult"; emit=1; native++ } \
+	     /^cluster_bufmgr_pcm_begin_s_x_reservation\(/ { print "static ClusterPcmOwnResult"; emit=1; convert++ } \
 	     /^cluster_bufmgr_pcm_acquire_resident_x\(/ { print "static ResourceXApplyResult"; emit=1; driver++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (native != 1 || driver != 1) exit 1 }' $< > $@.tmp
+	     END { if (shape != 1 || native != 5 || convert != 1 || driver != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 clean distclean maintainer-clean: clean-native-resident-x
 .PHONY: clean-native-resident-x

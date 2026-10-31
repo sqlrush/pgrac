@@ -19,7 +19,6 @@
 
 /* The product WAL sidecar uses the same actual descriptor as the native
  * episode; only this fixture's one-buffer address is supplied here. */
-BufferDescPadded *BufferDescriptors = (BufferDescPadded *)&request_buf;
 uint32
 LockBufHdr(BufferDesc *buf)
 {

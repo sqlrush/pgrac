@@ -7,7 +7,6 @@
 #include "cluster/cluster_xnode_profile.h"
 #include "miscadmin.h"
 
-BufferDescPadded *BufferDescriptors = (BufferDescPadded *)&request_buf;
 static unsigned wc_legacy, wc_failures, wc_waits, wc_object_checks;
 static bool wc_object_enabled, wc_object_valid = true;
 static uint64 wc_r4 = 77, wc_session_id = 31;

@@ -23,7 +23,6 @@ cluster_bufmgr_acquire_resident_scope_cleanup(BufferDesc *buf,
 	ordinary_report(PANIC);
 }
 #endif
-BufferDescPadded *BufferDescriptors = (BufferDescPadded *)&request_buf;
 uint32 LockBufHdr(BufferDesc *buf) { return request_header_lock(buf); }
 #define LockBufHdr stage_header_lock
 #define GetPrivateRefCount(buffer) request_private_pin(buffer)
@@ -246,7 +245,7 @@ ordinary_deliver(void)
 	input_grant = ordinary_material.decision;
 	input_grant.common.sender_connection_generation = PGRAC_RESOURCE_X_RETAINED_SENDER_GENERATION;
 	UT_ASSERT(evidence_wire(&input_grant));
-	if (ordinary_profile >= 2) {
+	if (ordinary_profile >= 2 && ordinary_profile <= 5) {
 		image = &ordinary_material.image.body.acquire_image.original_image;
 		proof = &ordinary_material.image.body.acquire_image.source.original_proof;
 		image->image_flags = 0;

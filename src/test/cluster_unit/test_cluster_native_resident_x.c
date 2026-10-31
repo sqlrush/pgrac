@@ -4,10 +4,16 @@
 #include "postgres.h"
 #include "storage/lwlock.h"
 static void xd_content_release(LWLock *lock);
+static void (*rx_native_boundary)(void);
+static void rx_local_bytes(void);
 #define NATIVE_X_DISK_COMPOSITION
 #include "test_cluster_native_resident_fill_fixture.inc"
 #undef NATIVE_X_DISK_COMPOSITION
-static void xd_content_release(LWLock *lock) { LWLockRelease(lock); }
+static void xd_content_release(LWLock *lock)
+{
+	LWLockRelease(lock);
+	if (rx_native_boundary != NULL) rx_native_boundary();
+}
 
 static ResourceXApplyResult cluster_bufmgr_pcm_acquire_resident_x(
 	BufferDesc *buf, const BufferTag *expected, uint64 r4, bool *barrier);
@@ -183,7 +189,7 @@ rx_writer_start(unsigned native, int source)
 	wc_r4 = 77; wc_path = RESOURCE_X_WRITER_TARGET;
 	wc_session_id = 31; wc_master = 0;
 	wc_unavailable = wc_pauses = 0; wc_cancel_pause = false;
-	rx_barrier = rx_cancel_wait = false;
+	rx_barrier = rx_cancel_wait = false; rx_native_boundary = NULL;
 	cluster_xnode_profile_enabled = cluster_update_trace_enabled = false;
 	MemSet(cluster_bufmgr_pcm_x_writer_ledger, 0, sizeof(cluster_bufmgr_pcm_x_writer_ledger));
 }
@@ -204,7 +210,7 @@ static ClusterPcmXWriterLedgerEntry *rx_prepare(bool *barrier)
 static bool
 rx_start(ClusterGcsFirstFill *request, unsigned native, int source)
 {
-	resident_start(request, native);
+	resident_start(request, native); rx_native_boundary = NULL;
 	if (native == 0) ResourceOwnerRememberBufferIO(CurrentResourceOwner, 1);
 	ordinary_profile = source;
 	rf_enlarge_error = false;
@@ -468,42 +474,43 @@ UT_TEST(test_resident_X_C_callback_and_authenticated_ACK_retire_independently)
 
 UT_TEST(test_old_completed_X_cleanup_never_revalidates_successor_local_writes)
 {
-	for (int settled = 0; settled < 2; settled++) {
-		ClusterGcsFirstFill request; ClusterPcmXWriterLedgerEntry *entry;
-		ClusterPcmOwnEntry own; uint32 state; PGIOAlignedBlock before;
-		volatile bool caught = false;
-		RX_REQUIRE(rx_start(&request, 2, 4));
-		RESIDENT_REQUIRE_EQ(rf_run(), RESOURCE_X_APPLY_APPLIED);
-		if (settled) {
-			ResourceXIntentSlot slot = qn_stage();
-			UT_ASSERT_EQ(rf_ack(false), RESOURCE_X_APPLY_APPLIED);
-			UT_ASSERT(cluster_pcm_lock_resource_x_outbound_transport_complete_exact(&slot, true, ++fake_pcm_clock_us));
+	for (int native = 2; native <= 3; native++)
+		for (int settled = 0; settled < 2; settled++) {
+			ClusterGcsFirstFill request; ClusterPcmXWriterLedgerEntry *entry;
+			ClusterPcmOwnEntry own; uint32 state; PGIOAlignedBlock before;
+			volatile bool caught = false;
+			RX_REQUIRE(rx_start(&request, native, native == 3 ? 6 : 4));
+			if (native == 3) rx_local_bytes();
+			RESIDENT_REQUIRE_EQ(rf_run(), RESOURCE_X_APPLY_APPLIED);
+			if (settled) {
+				ResourceXIntentSlot slot = qn_stage();
+				UT_ASSERT_EQ(rf_ack(false), RESOURCE_X_APPLY_APPLIED);
+				UT_ASSERT(cluster_pcm_lock_resource_x_outbound_transport_complete_exact(&slot, true, ++fake_pcm_clock_us));
+			}
+			wc_r4 = 77; wc_path = RESOURCE_X_WRITER_TARGET; wc_master = 0; wc_session_id = 31;
+			wc_unavailable = 0; wc_object_enabled = false;
+			MemSet(cluster_bufmgr_pcm_x_writer_ledger, 0, sizeof(cluster_bufmgr_pcm_x_writer_ledger));
+			entry = rx_prepare(NULL); RX_REQUIRE(entry != NULL);
+			LWLockAcquire(BufferDescriptorGetContentLock(&request_buf), LW_EXCLUSIVE);
+			RX_REQUIRE(cluster_bufmgr_pcm_x_writer_activate(entry, true));
+			disk_shared.data[BLCKSZ-1] ^= 1;
+			pg_atomic_fetch_or_u32(&request_buf.state, BM_DIRTY | BM_JUST_DIRTIED);
+			cluster_bufmgr_pcm_x_writer_mark_releasing(entry);
+			LWLockRelease(BufferDescriptorGetContentLock(&request_buf));
+			cluster_bufmgr_pcm_x_writer_release(entry);
+			own = request_own; state = pg_atomic_read_u32(&request_buf.state);
+			memcpy(before.data, disk_shared.data, BLCKSZ);
+			PG_TRY(); {
+				cluster_bufmgr_acquire_resident_scope_cleanup(&request_buf, &request_base,
+					&prepared_episode, &prepared_claim);
+			} PG_CATCH(); { caught = true; } PG_END_TRY();
+			UT_ASSERT(!caught);
+			request_native_unchanged(&own, state);
+			UT_ASSERT(memcmp(before.data, disk_shared.data, BLCKSZ) == 0);
+			UT_ASSERT_EQ(ordinary_sends, 1);
+			cluster_gcs_block_first_fill_end(&request); complete_idle();
 		}
-		wc_r4 = 77; wc_path = RESOURCE_X_WRITER_TARGET; wc_master = 0; wc_session_id = 31;
-		wc_unavailable = 0; wc_object_enabled = false;
-		MemSet(cluster_bufmgr_pcm_x_writer_ledger, 0, sizeof(cluster_bufmgr_pcm_x_writer_ledger));
-		entry = rx_prepare(NULL); RX_REQUIRE(entry != NULL);
-		LWLockAcquire(BufferDescriptorGetContentLock(&request_buf), LW_EXCLUSIVE);
-		RX_REQUIRE(cluster_bufmgr_pcm_x_writer_activate(entry, true));
-		disk_shared.data[BLCKSZ-1] ^= 1;
-		pg_atomic_fetch_or_u32(&request_buf.state, BM_DIRTY | BM_JUST_DIRTIED);
-		cluster_bufmgr_pcm_x_writer_mark_releasing(entry);
-		LWLockRelease(BufferDescriptorGetContentLock(&request_buf));
-		cluster_bufmgr_pcm_x_writer_release(entry);
-		own = request_own; state = pg_atomic_read_u32(&request_buf.state);
-		memcpy(before.data, disk_shared.data, BLCKSZ);
-		PG_TRY(); {
-			cluster_bufmgr_acquire_resident_scope_cleanup(&request_buf, &request_base,
-				&prepared_episode, &prepared_claim);
-		} PG_CATCH(); { caught = true; } PG_END_TRY();
-		UT_ASSERT(!caught);
-		request_native_unchanged(&own, state);
-		UT_ASSERT(memcmp(before.data, disk_shared.data, BLCKSZ) == 0);
-		UT_ASSERT_EQ(ordinary_sends, 1);
-		cluster_gcs_block_first_fill_end(&request); complete_idle();
-	}
 }
-
 
 UT_TEST(test_X_handoff_observer_requires_original_E_and_existing_shared_handoff)
 {
@@ -568,10 +575,337 @@ UT_TEST(test_ordinary_X_ERROR_inside_admitted_enqueue_quiets_original_E)
 	cluster_bufmgr_pcm_x_writer_exception_cleanup_all(); complete_idle();
 }
 
+/* The local current stays in place: the original pinned S is the source,
+ * while independently encoded master/other-holder evidence is still real. */
+static void
+rx_local_bytes(void)
+{
+	memcpy(disk_shared.data, disk_bytes.data, BLCKSZ);
+}
+static void
+rx_local_installed(uint32 original_state)
+{
+	UT_ASSERT_EQ(request_buf.pcm_state, PCM_STATE_X);
+	UT_ASSERT_EQ(request_buf.buffer_type, BUF_TYPE_XCUR);
+	UT_ASSERT_EQ(cluster_pcm_own_gen_get(0), request_base.generation + 1);
+	UT_ASSERT_EQ(cluster_pcm_own_reservation_token_get(0), request_base.reservation_token + 1);
+	UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0);
+	UT_ASSERT_EQ(cluster_pcm_own_delivery_attempt_get(0), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&request_buf.state) & CLUSTER_PCM_OWN_SEMANTIC_BUF_STATE_MASK,
+		original_state);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&request_own.writer_activation_token), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&request_own.resource_x_activation_generation), 0);
+	UT_ASSERT_EQ(disk_reads, 0); UT_ASSERT_EQ(complete_io_calls, 0);
+	UT_ASSERT(!ResourceOwnerHasBufferIO(original_io_owner, 1));
+	UT_ASSERT(memcmp(disk_shared.data, disk_bytes.data, BLCKSZ) == 0);
+	UT_ASSERT_EQ(ordinary_sends, 1);
+	UT_ASSERT_EQ(request_entry()->resource_x_bootstrap_round.delivery_executor_purpose,
+		RESOURCE_X_DELIVERY_ACQUIRE_READ_NOTICE);
+}
+UT_TEST(test_local_S_X_current_completes_without_disk_copy_or_input_IO)
+{
+	ClusterGcsFirstFill request;
+	RX_REQUIRE(rx_start(&request, 3, 6)); rx_local_bytes();
+	RESIDENT_REQUIRE_EQ(rf_run(), RESOURCE_X_APPLY_APPLIED);
+	rx_local_installed(BM_TAG_VALID | BM_VALID);
+	UT_ASSERT_EQ(rf_run(), RESOURCE_X_APPLY_DUPLICATE);
+	rx_local_installed(BM_TAG_VALID | BM_VALID);
+	cluster_gcs_block_first_fill_end(&request); complete_idle();
+}
+UT_TEST(test_ordinary_S_X_uses_original_current_and_one_writer_cover)
+{
+	bool barrier = false; ClusterPcmXWriterLedgerEntry *entry;
+	rx_writer_start(3, 6); rx_local_bytes();
+	entry = rx_prepare(&barrier);
+	RX_REQUIRE(entry != NULL);
+	UT_ASSERT_EQ(wc_legacy, 0); UT_ASSERT(!barrier);
+	rx_local_installed(BM_TAG_VALID | BM_VALID);
+	LWLockAcquire(entry->content_lock, LW_EXCLUSIVE);
+	UT_ASSERT(cluster_bufmgr_pcm_x_writer_activate(entry, true));
+	cluster_bufmgr_pcm_x_writer_mark_releasing(entry);
+	LWLockRelease(entry->content_lock); cluster_bufmgr_pcm_x_writer_release(entry);
+	UT_ASSERT_EQ(ordinary_sends, 1); complete_idle();
+}
+UT_TEST(test_ordinary_S_X_cancel_waiting_for_decision_preserves_old_S)
+{
+	bool barrier = false;
+	rx_writer_start(3, 6); rx_local_bytes(); ordinary_cancel_at = 1;
+	UT_ASSERT(rx_prepare(&barrier) == NULL);
+	UT_ASSERT_EQ(ordinary_sends, 1); UT_ASSERT_EQ(wc_legacy, 0);
+	UT_ASSERT_EQ(request_buf.pcm_state, PCM_STATE_S);
+	UT_ASSERT_EQ(cluster_pcm_own_gen_get(0), request_base.generation);
+	UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0);
+	UT_ASSERT_EQ(cluster_pcm_own_delivery_attempt_get(0), 0);
+	UT_ASSERT_EQ(disk_reads, 0); UT_ASSERT_EQ(complete_io_calls, 0);
+	UT_ASSERT(memcmp(disk_shared.data, disk_bytes.data, BLCKSZ) == 0);
+	cluster_bufmgr_pcm_x_writer_exception_cleanup_all(); complete_idle();
+}
+UT_TEST(test_local_S_X_native_identity_refusal_keeps_original_current_and_no_C)
+{
+	ClusterGcsFirstFill request; ClusterPcmOwnEntry own; uint32 state;
+	RX_REQUIRE(rx_start(&request, 3, 6)); rx_local_bytes();
+	request_proc.cluster_grd_generation++; own = request_own;
+	state = pg_atomic_read_u32(&request_buf.state);
+	UT_ASSERT(rf_run() != RESOURCE_X_APPLY_APPLIED);
+	request_native_unchanged(&own, state);
+	UT_ASSERT_EQ(request_buf.pcm_state, PCM_STATE_S);
+	UT_ASSERT(memcmp(disk_shared.data, disk_bytes.data, BLCKSZ) == 0);
+	UT_ASSERT_EQ(disk_reads, 0); UT_ASSERT_EQ(complete_io_calls, 0);
+	cluster_gcs_block_first_fill_end(&request); complete_idle();
+}
+
+static void
+rx_local_pre_C_error(void)
+{
+	if (request_buf.pcm_state == PCM_STATE_S
+		&& request_entry()->resource_x_bootstrap_round.delivery_executor_purpose == RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING) {
+		stage_after_content = NULL; pg_re_throw();
+	}
+}
+static void
+rx_local_armed_error(void)
+{
+	if (request_buf.pcm_state == PCM_STATE_S
+		&& request_entry()->resource_x_bootstrap_round.delivery_executor_purpose == RESOURCE_X_DELIVERY_ACQUIRE_READ_ARMED) {
+		rx_native_boundary = NULL; pg_re_throw();
+	}
+}
+static void
+rx_local_post_commit_error(void)
+{
+	if (request_buf.pcm_state == PCM_STATE_X
+		&& cluster_pcm_own_gen_get(0) == prepared_episode.base_generation + 1) {
+		rx_native_boundary = NULL; pg_re_throw();
+	}
+}
+UT_TEST(test_local_S_X_preserves_dirty_current_and_passive_pins)
+{
+	ClusterPcmXWriterLedgerEntry *entry;
+	rx_writer_start(3, 6); rx_local_bytes();
+	pg_atomic_fetch_or_u32(&request_buf.state, BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED
+		| (BUF_REFCOUNT_ONE * 2));
+	entry = rx_prepare(NULL); RX_REQUIRE(entry != NULL);
+	rx_local_installed(BM_TAG_VALID | BM_VALID | BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED);
+	UT_ASSERT_EQ(BUF_STATE_GET_REFCOUNT(pg_atomic_read_u32(&request_buf.state)), 3);
+	cluster_bufmgr_pcm_x_writer_exception_cleanup_all(); complete_idle();
+}
+UT_TEST(test_local_S_X_content_reader_wait_precedes_reservation_and_request)
+{
+	ClusterPcmXWriterLedgerEntry *entry;
+	rx_writer_start(3, 6); rx_local_bytes(); fake_lwlock_conditional_fail_once = true;
+	entry = rx_prepare(NULL); RX_REQUIRE(entry != NULL);
+	UT_ASSERT_EQ(wc_waits, 1);
+	rx_local_installed(BM_TAG_VALID | BM_VALID);
+	UT_ASSERT_EQ(cluster_pcm_own_reservation_token_get(0), request_base.reservation_token + 1);
+	cluster_bufmgr_pcm_x_writer_exception_cleanup_all(); complete_idle();
+}
+UT_TEST(test_local_S_X_ERROR_before_C_quiets_same_E_without_IO_or_old_S_loss)
+{
+	ClusterGcsFirstFill request;
+	RX_REQUIRE(rx_start(&request, 3, 6)); rx_local_bytes();
+	stage_after_content = rx_local_pre_C_error;
+	UT_ASSERT(rf_catches()); UT_ASSERT_EQ(ordinary_panics, 0);
+	UT_ASSERT_EQ(cluster_pcm_own_gen_get(0), request_base.generation);
+	UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0);
+	UT_ASSERT_EQ(cluster_pcm_own_delivery_attempt_get(0), 0);
+	UT_ASSERT_EQ(request_buf.pcm_state, PCM_STATE_S);
+	UT_ASSERT_EQ(request_buf.buffer_type, BUF_TYPE_SCUR);
+	UT_ASSERT_EQ(request_entry()->resource_x_bootstrap_round.delivery_executor_purpose,
+		RESOURCE_X_DELIVERY_ACQUIRE_UNARMED_QUIET);
+	UT_ASSERT_EQ(disk_reads, 0); UT_ASSERT_EQ(complete_io_calls, 0);
+	UT_ASSERT(memcmp(disk_shared.data, disk_bytes.data, BLCKSZ) == 0);
+	cluster_gcs_block_first_fill_end(&request); complete_idle();
+}
+UT_TEST(test_local_S_X_ERROR_after_native_commit_completes_original_X)
+{
+	ClusterGcsFirstFill request;
+	RX_REQUIRE(rx_start(&request, 3, 6)); rx_local_bytes();
+	rx_native_boundary = rx_local_post_commit_error;
+	UT_ASSERT(rf_catches()); UT_ASSERT_EQ(ordinary_panics, 0);
+	rx_local_installed(BM_TAG_VALID | BM_VALID);
+	cluster_gcs_block_first_fill_end(&request); complete_idle();
+}
+UT_TEST(test_ordinary_S_X_nested_ERROR_observes_original_unarmed_armed_or_completed_owner)
+{
+	for (int cut = 0; cut < 3; cut++) {
+		rx_writer_start(3, 6); rx_local_bytes();
+		if (cut == 0) stage_after_content = rx_local_pre_C_error;
+		else rx_native_boundary = cut == 1 ? rx_local_armed_error : rx_local_post_commit_error;
+		UT_ASSERT(rx_prepare(NULL) == NULL); UT_ASSERT_EQ(ordinary_panics, 0);
+		UT_ASSERT_EQ(ordinary_sends, 1); UT_ASSERT_EQ(wc_legacy, 0);
+		if (cut < 2) {
+			UT_ASSERT_EQ(cluster_pcm_own_gen_get(0), request_base.generation);
+			UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0);
+			UT_ASSERT_EQ(cluster_pcm_own_delivery_attempt_get(0), 0);
+			UT_ASSERT_EQ(request_buf.pcm_state, PCM_STATE_S);
+			UT_ASSERT_EQ(request_buf.buffer_type, BUF_TYPE_SCUR);
+			UT_ASSERT_EQ(request_entry()->resource_x_bootstrap_round.delivery_executor_purpose,
+				cut == 0 ? RESOURCE_X_DELIVERY_ACQUIRE_UNARMED_QUIET : RESOURCE_X_DELIVERY_ACQUIRE_READ_QUIET);
+		} else rx_local_installed(BM_TAG_VALID | BM_VALID);
+		UT_ASSERT_EQ(disk_reads, 0); UT_ASSERT_EQ(complete_io_calls, 0);
+		UT_ASSERT(memcmp(disk_shared.data, disk_bytes.data, BLCKSZ) == 0);
+		cluster_bufmgr_pcm_x_writer_exception_cleanup_all(); complete_idle();
+	}
+}
+UT_TEST(test_local_S_X_C_callback_and_master_ACK_are_independent_debts)
+{
+	for (int order = 0; order < 2; order++) {
+		ClusterGcsFirstFill request; ResourceXIntentSlot slot;
+		RX_REQUIRE(rx_start(&request, 3, 6)); rx_local_bytes();
+		RESIDENT_REQUIRE_EQ(rf_run(), RESOURCE_X_APPLY_APPLIED);
+		slot = qn_stage();
+		if (order == 0) {
+			UT_ASSERT_EQ(rf_ack(false), RESOURCE_X_APPLY_APPLIED);
+			UT_ASSERT(cluster_pcm_lock_resource_x_outbound_transport_complete_exact(&slot, true, ++fake_pcm_clock_us));
+		} else {
+			UT_ASSERT(cluster_pcm_lock_resource_x_outbound_transport_complete_exact(&slot, true, ++fake_pcm_clock_us));
+			UT_ASSERT_EQ(rf_ack(false), RESOURCE_X_APPLY_APPLIED);
+		}
+		UT_ASSERT_EQ(request_entry()->resource_x_bootstrap_round.delivery_executor_purpose,
+			RESOURCE_X_DELIVERY_ACQUIRE_READ_SETTLED);
+		UT_ASSERT(!qn_probe(&slot)); UT_ASSERT_EQ(request_buf.pcm_state, PCM_STATE_X);
+		UT_ASSERT_EQ(ordinary_sends, 1);
+		cluster_gcs_block_first_fill_end(&request); complete_idle();
+	}
+}
+UT_TEST(test_local_S_X_requires_other_holder_witness_before_preparation)
+{
+	ClusterGcsFirstFill request; ResourceXRequesterJoinSnapshot join;
+	resident_start(&request, 3); ordinary_profile = 6;
+	RESIDENT_REQUIRE_EQ(cluster_gcs_block_acquire_begin(&request_buf, &request_base, request_token,
+		RESOURCE_X_ACQUIRE_RESIDENT, PCM_STATE_X, &request), RESOURCE_X_APPLY_APPLIED);
+	fake_cv_prepare_hook = NULL;
+	RX_REQUIRE(ordinary_evidence_begin(&ordinary_material, 6));
+	prepared_episode = ordinary_material.request.body.acquire_intent;
+	input_observation = request.observation; input_grant = ordinary_material.decision;
+	input_grant.common.sender_connection_generation = PGRAC_RESOURCE_X_RETAINED_SENDER_GENERATION;
+	RX_REQUIRE(evidence_wire(&input_grant));
+	RX_REQUIRE(evidence_accept(&ordinary_material.decision, &join));
+	UT_ASSERT((join.flags & RESOURCE_X_REQUESTER_JOIN_EVIDENCE_COMPLETE) == 0);
+	UT_ASSERT(claim_get() != RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_own_gen_get(0), request_base.generation);
+	UT_ASSERT_EQ(request_buf.pcm_state, PCM_STATE_S);
+	RX_REQUIRE(evidence_accept(&ordinary_material.witness, &join));
+	RESIDENT_REQUIRE_EQ(claim_get(), RESOURCE_X_APPLY_APPLIED);
+	RESIDENT_REQUIRE_EQ(cluster_bufmgr_pcm_own_acquire_stage_begin_exact(&request_buf, &request_base,
+		request_token, RESOURCE_X_ACQUIRE_RESIDENT, &request_admission, &acquire_claim, &prepared_claim),
+		RESOURCE_X_APPLY_APPLIED);
+	cluster_enabled = cluster_shared_config = true; cluster_page_wal_shmem_init(); auth_peer_boot = 31; rx_local_bytes();
+	RESIDENT_REQUIRE_EQ(rf_run(), RESOURCE_X_APPLY_APPLIED);
+	rx_local_installed(BM_TAG_VALID | BM_VALID);
+	cluster_gcs_block_first_fill_end(&request); complete_idle();
+}
+
+UT_TEST(test_local_S_X_cancel_before_or_inside_enqueue_keeps_original_S)
+{
+	for (int cut = 0; cut < 4; cut++) {
+		uint32 semantic = BM_TAG_VALID | BM_VALID;
+		rx_writer_start(3, 6); rx_local_bytes();
+		if (cut >= 2) {
+			semantic |= BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED;
+			pg_atomic_fetch_or_u32(&request_buf.state, semantic);
+		}
+		if ((cut & 1) == 0) {
+			request_ring_locks[1].tranche = 0;
+			request_shared.rings[1].count = PGRAC_LMS_OUTBOUND_CAPACITY;
+			request_on_sleep = rx_cancel_capacity;
+		} else ordinary_send_error = true;
+		UT_ASSERT(rx_prepare(NULL) == NULL); UT_ASSERT_EQ(ordinary_panics, 0);
+		UT_ASSERT_EQ(ordinary_sends, 1); UT_ASSERT_EQ(wc_legacy, 0);
+		UT_ASSERT_EQ(cluster_pcm_own_gen_get(0), request_base.generation);
+		UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0);
+		UT_ASSERT_EQ(cluster_pcm_own_delivery_attempt_get(0), 0);
+		UT_ASSERT_EQ(request_buf.pcm_state, PCM_STATE_S);
+		UT_ASSERT_EQ(request_buf.buffer_type, BUF_TYPE_SCUR);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&request_buf.state) & CLUSTER_PCM_OWN_SEMANTIC_BUF_STATE_MASK, semantic);
+		UT_ASSERT(memcmp(disk_shared.data, disk_bytes.data, BLCKSZ) == 0);
+		UT_ASSERT_EQ(disk_reads, 0); UT_ASSERT_EQ(complete_io_calls, 0);
+		cluster_bufmgr_pcm_x_writer_exception_cleanup_all(); complete_idle();
+	}
+}
+UT_TEST(test_local_S_X_old_sender_observation_cannot_cancel_another_E)
+{
+	ClusterGcsFirstFill request;
+	ResourceXInstallClaimJoinObservation bootstrap, wrong, issued;
+	ResourceXDecodedAcquireIntent episode;
+	ClusterPcmResourceXBootstrapRound before;
+
+	resident_start(&request, 3); ordinary_profile = 6;
+	RESIDENT_REQUIRE_EQ(cluster_gcs_block_acquire_begin(&request_buf, &request_base, request_token,
+		RESOURCE_X_ACQUIRE_RESIDENT, PCM_STATE_X, &request), RESOURCE_X_APPLY_APPLIED);
+	fake_cv_prepare_hook = NULL;
+	bootstrap = request.observation; bootstrap.request = request_unsent.request;
+	before = request_entry()->resource_x_bootstrap_round;
+	for (int n = 0; n < 8; n++) {
+		wrong = bootstrap; episode = request.episode;
+		if (n == 0) wrong.entry_binding_generation++;
+		if (n == 1) wrong.request.assertion_sequence++;
+		if (n == 2) wrong.request.master_session_incarnation++;
+		if (n == 3) wrong.request.sender_connection_generation++;
+		if (n == 4) episode.reservation_token++;
+		if (n == 5) episode.backend_generation++;
+		if (n == 6) wrong.request.logical_assertion.resource.blockNum++;
+		if (n == 7) wrong.request.flags = 0;
+		UT_ASSERT(cluster_pcm_lock_resource_x_first_fill_retire_unsent_exact(&wrong, &episode,
+			&issued) != RESOURCE_X_APPLY_DUPLICATE);
+		UT_ASSERT(memcmp(&before, &request_entry()->resource_x_bootstrap_round, sizeof(before)) == 0);
+	}
+	RESIDENT_REQUIRE_EQ(cluster_pcm_lock_resource_x_first_fill_retire_unsent_exact(&bootstrap,
+		&request.episode, &issued), RESOURCE_X_APPLY_DUPLICATE);
+	UT_ASSERT(memcmp(&issued.request, &request.observation.request, sizeof(issued.request)) == 0);
+	UT_ASSERT(memcmp(&before, &request_entry()->resource_x_bootstrap_round, sizeof(before)) == 0);
+	UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), PCM_OWN_FLAG_GRANT_PENDING);
+	RESIDENT_REQUIRE_EQ(cluster_bufmgr_pcm_own_acquire_cancel_resident_wait_exact(&request_buf,
+		&request_base, &request.episode, &issued), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0);
+	UT_ASSERT_EQ(request_buf.pcm_state, PCM_STATE_S);
+	cluster_gcs_block_first_fill_end(&request); complete_idle();
+}
+UT_TEST(test_local_S_X_retains_exact_local_WAL_binding_and_independent_PI)
+{
+	ClusterPageWalBindingV1 wal = local_pi_setup(make_tag(851)), observed;
+	ClusterPageWalInstallV1 install = {0};
+	ClusterPcmLocalPiSnapshotV1 before, after;
+	ClusterPcmXWriterLedgerEntry *entry;
+	LWLock *content;
+	rx_writer_start(3, 6); rx_local_bytes();
+	wal.identity.locator = BufTagGetRelFileLocator(&request_base.tag);
+	wal.identity.forknum = request_base.tag.forkNum; wal.identity.blockno = request_base.tag.blockNum;
+	wal.version.mutation_token = ((PageHeader)disk_shared.data)->pd_block_scn;
+	wal.record_end = PageGetLSN(disk_shared.data);
+	wal.source.claim.identity.origin_node_id = cluster_node_id;
+	wal.source.claim.identity.origin_thread_id = cluster_node_id + 1;
+	wal.source.claim.identity.origin_owner_incarnation = cluster_qvotec_get_self_incarnation();
+	local_pi_writer = wal.source; local_pi_writer_ready = true;
+	RX_REQUIRE(PageSetLSNOrigin(disk_shared.data, cluster_node_id));
+	memcpy(disk_bytes.data, disk_shared.data, BLCKSZ);
+	pg_atomic_fetch_or_u32(&request_buf.state, BM_PERMANENT | BM_DIRTY);
+	content = BufferDescriptorGetContentLock(&request_buf);
+	LWLockAcquire(content, LW_EXCLUSIVE);
+	UT_ASSERT(cluster_page_wal_prepare_install_v1(1, &wal, disk_shared.data, &install));
+	UT_ASSERT(cluster_page_wal_publish_install_v1(1, &install));
+	cluster_page_wal_release_install_v1(&install);
+	UT_ASSERT(cluster_page_wal_snapshot_v1(1, &observed));
+	UT_ASSERT(memcmp(&observed, &wal, sizeof(wal)) == 0);
+	LWLockRelease(content);
+	RX_REQUIRE(cluster_pcm_local_pi_record_v1(request_base.tag, &wal));
+	RX_REQUIRE(cluster_pcm_local_pi_snapshot_v1(request_base.tag, &before));
+	entry = rx_prepare(NULL); RX_REQUIRE(entry != NULL);
+	rx_local_installed(BM_TAG_VALID | BM_VALID | BM_DIRTY);
+	LWLockAcquire(content, LW_EXCLUSIVE);
+	UT_ASSERT(cluster_page_wal_install_matches_v1(1, &wal));
+	UT_ASSERT(cluster_page_wal_snapshot_v1(1, &observed));
+	UT_ASSERT(memcmp(&observed, &wal, sizeof(wal)) == 0);
+	LWLockRelease(content);
+	RX_REQUIRE(cluster_pcm_local_pi_snapshot_v1(request_base.tag, &after));
+	UT_ASSERT(memcmp(&before, &after, sizeof(before)) == 0);
+	cluster_bufmgr_pcm_x_writer_exception_cleanup_all(); complete_idle();
+}
+
 int main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(18);
+	UT_PLAN(32);
 	UT_RUN(test_resident_X_disk_and_remote_S_X_complete_original_native_owners);
 	UT_RUN(test_resident_X_completed_replay_never_copies_or_commits_twice);
 	UT_RUN(test_resident_X_ERROR_before_IO_preserves_old_PI_and_quiets_same_E);
@@ -590,5 +924,19 @@ int main(void)
 	UT_RUN(test_X_handoff_observer_requires_original_E_and_existing_shared_handoff);
 	UT_RUN(test_resident_X_uncovered_PI_wait_retains_bytes_carrier_and_same_prepared_E);
 	UT_RUN(test_ordinary_X_ERROR_inside_admitted_enqueue_quiets_original_E);
+	UT_RUN(test_local_S_X_current_completes_without_disk_copy_or_input_IO);
+	UT_RUN(test_ordinary_S_X_uses_original_current_and_one_writer_cover);
+	UT_RUN(test_ordinary_S_X_cancel_waiting_for_decision_preserves_old_S);
+	UT_RUN(test_local_S_X_native_identity_refusal_keeps_original_current_and_no_C);
+	UT_RUN(test_local_S_X_preserves_dirty_current_and_passive_pins);
+	UT_RUN(test_local_S_X_content_reader_wait_precedes_reservation_and_request);
+	UT_RUN(test_local_S_X_ERROR_before_C_quiets_same_E_without_IO_or_old_S_loss);
+	UT_RUN(test_local_S_X_ERROR_after_native_commit_completes_original_X);
+	UT_RUN(test_ordinary_S_X_nested_ERROR_observes_original_unarmed_armed_or_completed_owner);
+	UT_RUN(test_local_S_X_C_callback_and_master_ACK_are_independent_debts);
+	UT_RUN(test_local_S_X_requires_other_holder_witness_before_preparation);
+	UT_RUN(test_local_S_X_cancel_before_or_inside_enqueue_keeps_original_S);
+	UT_RUN(test_local_S_X_old_sender_observation_cannot_cancel_another_E);
+	UT_RUN(test_local_S_X_retains_exact_local_WAL_binding_and_independent_PI);
 	UT_DONE(); return ut_failed_count ? 1 : 0;
 }

@@ -14148,6 +14148,35 @@ pcm_resource_x_acquire_read_completed(uint64 purpose)
 		|| purpose == RESOURCE_X_DELIVERY_ACQUIRE_READ_SETTLED;
 }
 
+/* Ordinary local S current converts under the same original native token.
+ * It never substitutes for a disk grant or a remote source witness. */
+static bool
+pcm_resource_x_acquire_local_s_x(const ResourceXDecodedAcquireIntent *episode,
+	const ResourceXDecodedCommon *request)
+{
+	return episode->path == RESOURCE_X_ACQUIRE_RESIDENT
+		&& request->observed_mode == PCM_STATE_S && request->target_mode == PCM_STATE_X;
+}
+
+static bool
+pcm_resource_x_acquire_read_path(const ResourceXDecodedAcquireIntent *episode,
+	const ResourceXDecodedCommon *request)
+{
+	return (request->observed_mode == PCM_STATE_N
+			&& (episode->path == RESOURCE_X_ACQUIRE_FIRST_FILL || episode->path == RESOURCE_X_ACQUIRE_RESIDENT))
+		|| pcm_resource_x_acquire_local_s_x(episode, request);
+}
+
+static bool
+pcm_resource_x_acquire_terminal_semantic(const ResourceXDecodedAcquireIntent *episode,
+	const ResourceXDecodedCommon *request, uint32 state)
+{
+	if (!pcm_resource_x_acquire_local_s_x(episode, request))
+		return state == (BM_TAG_VALID | BM_VALID);
+	return (state & (BM_TAG_VALID | BM_VALID)) == (BM_TAG_VALID | BM_VALID)
+		&& (state & ~(BM_TAG_VALID | BM_VALID | BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED)) == 0;
+}
+
 /* The disk-X bridge retains its original T3 cover alongside full E/A/I.
  * No legacy ACK/assertion is synthesized. The frames owner independently
  * checks these authority scalars against the canonical master decision. */
@@ -14156,9 +14185,8 @@ pcm_resource_x_acquire_x_terminal_round_valid(const ClusterPcmResourceXBootstrap
 {
 	return round->has_acquire_intent == 1
 		&& round->phase == RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED
-		&& round->request.target_mode == PCM_STATE_X && round->request.observed_mode == PCM_STATE_N
-		&& (round->acquire_intent.path == RESOURCE_X_ACQUIRE_FIRST_FILL
-			|| round->acquire_intent.path == RESOURCE_X_ACQUIRE_RESIDENT)
+		&& round->request.target_mode == PCM_STATE_X
+		&& pcm_resource_x_acquire_read_path(&round->acquire_intent, &round->request)
 		&& (round->delivery_executor_purpose == RESOURCE_X_DELIVERY_ACQUIRE_READ_ARMED
 			|| pcm_resource_x_acquire_read_completed(round->delivery_executor_purpose))
 		&& round->accepted_base != 0 && round->accepted_base < UINT64_MAX - 1
@@ -14187,9 +14215,7 @@ pcm_resource_x_acquire_read_receipt_valid_locked(const ClusterPcmResourceXBootst
 		&& (pcm_resource_x_acquire_wait_close(&round->acquire_intent, &round->request,
 				round->delivery_executor_purpose)
 			|| ((round->request.target_mode == PCM_STATE_S || round->request.target_mode == PCM_STATE_X)
-				&& (round->acquire_intent.path == RESOURCE_X_ACQUIRE_FIRST_FILL
-					|| (round->acquire_intent.path == RESOURCE_X_ACQUIRE_RESIDENT
-						&& round->request.observed_mode == PCM_STATE_N))))
+				&& pcm_resource_x_acquire_read_path(&round->acquire_intent, &round->request)))
 		&& (pcm_resource_x_acquire_wait_cancel(round->delivery_executor_purpose)
 			? r->authority_generation == 0 && r->decision_crc32c == 0
 				&& r->write_io_generation < UINT64_MAX - 1
@@ -30097,7 +30123,7 @@ pcm_resource_x_acquire_x_active_locked(const struct GrdEntry *entry)
 	ref.formation = round->resource_formation;
 	ref.acquisition_generation = round->request.assertion_sequence;
 	return round->has_acquire_intent == 1 && round->request.target_mode == PCM_STATE_X
-		&& round->request.observed_mode == PCM_STATE_N
+		&& pcm_resource_x_acquire_read_path(&round->acquire_intent, &round->request)
 		&& round->phase == RESOURCE_X_BOOTSTRAP_ROUND_REQUEST_DISPATCHED
 		&& (round->delivery_executor_purpose == RESOURCE_X_DELIVERY_ACQUIRE_READ_ARMED
 			|| round->delivery_executor_purpose == RESOURCE_X_DELIVERY_ACQUIRE_READ_SEALING)
@@ -30170,8 +30196,7 @@ pcm_resource_x_requester_acquire_frames_mode_locked(struct GrdEntry *entry,
 	state = pcm_resource_x_master_state_for_entry(entry);
 	if (closing && (claim == NULL
 			|| (!pcm_resource_x_acquire_wait_close(episode, &observation->request, claim->purpose)
-				&& ((episode->path != RESOURCE_X_ACQUIRE_FIRST_FILL
-					&& (episode->path != RESOURCE_X_ACQUIRE_RESIDENT || observation->request.observed_mode != PCM_STATE_N))
+				&& (!pcm_resource_x_acquire_read_path(episode, &observation->request)
 					|| (observation->request.target_mode != PCM_STATE_S
 						&& observation->request.target_mode != PCM_STATE_X)))
 			|| (claim->purpose != RESOURCE_X_DELIVERY_ACQUIRE_READ_ARMED
@@ -30350,6 +30375,19 @@ cluster_pcm_lock_resource_x_first_fill_retire_unsent_exact(
 		expected.semantic_crc32c = round->request.semantic_crc32c;
 		issued_expected.flags = 0;
 		issued_expected.semantic_crc32c = round->request.semantic_crc32c;
+		/* The original S->X sender can throw after takeover but before
+		 * returning its observation. Only that unchanged bootstrap N/X
+		 * observation may discover the same full-E S/X request here.
+		 * This returns ownership to its cancellation path; it neither
+		 * retires E nor supplies an authority grant. The native owner
+		 * still has to prove the exact original S/token before quieting. */
+		if (prepared->request.flags == RESOURCE_X_COMMON_FLAG_REMOTE_ADMISSION
+			&& prepared->request.observed_mode == PCM_STATE_N
+			&& prepared->request.target_mode == PCM_STATE_X
+			&& pcm_resource_x_acquire_local_s_x(episode, &round->request)) {
+			expected = issued_expected;
+			expected.observed_mode = PCM_STATE_S;
+		}
 		if ((!pcm_resource_x_common_equal(&issued_expected, &round->request)
 				&& !pcm_resource_x_common_equal(&expected, &round->request))
 			|| !pcm_resource_x_acquire_identity_equal(episode, &round->acquire_intent))
@@ -30772,9 +30810,17 @@ pcm_resource_x_acquire_read_source(const ResourceXDecodedFrame *grant,
 
 	if (grant->kind != RESOURCE_X_WIRE_AUTHORITY_GRANT || !grant->has_acquire_decision
 		|| (grant->common.target_mode != PCM_STATE_S && grant->common.target_mode != PCM_STATE_X)
-		|| (a->episode.path != RESOURCE_X_ACQUIRE_FIRST_FILL
-			&& (a->episode.path != RESOURCE_X_ACQUIRE_RESIDENT || grant->common.observed_mode != PCM_STATE_N)))
+		|| !pcm_resource_x_acquire_read_path(&a->episode, &grant->common))
 		return false;
+	if (a->source_kind == RESOURCE_X_ACQUIRE_SOURCE_LOCAL_CURRENT)
+		return pcm_resource_x_acquire_local_s_x(&a->episode, &grant->common)
+			&& a->directory_mode == PCM_STATE_S
+			&& a->source_node == grant->common.logical_assertion.requester_node
+			&& (a->holders_bitmap & (UINT32_C(1) << a->source_node)) != 0
+			&& (a->required_holders_bitmap & (UINT32_C(1) << a->source_node)) == 0
+			&& a->holders[a->source_node].boot_incarnation == a->episode.requester_incarnation;
+	if (pcm_resource_x_acquire_local_s_x(&a->episode, &grant->common))
+		return false; /* this conversion must retain its original current */
 	if (a->source_kind == RESOURCE_X_ACQUIRE_SOURCE_DISK)
 		return a->source_node == -1 && a->source_service_generation == 0
 			&& a->directory_mode == PCM_STATE_N && a->holders_bitmap == 0
@@ -30794,6 +30840,7 @@ pcm_resource_x_acquire_read_image_matches(const ResourceXDecodedFrame *grant,
 	const ResourceXDecodedImageEnvelope *i = &image->body.acquire_image.original_image;
 
 	return grant->body.acquire_decision.source_kind == RESOURCE_X_ACQUIRE_SOURCE_DISK
+		|| grant->body.acquire_decision.source_kind == RESOURCE_X_ACQUIRE_SOURCE_LOCAL_CURRENT
 		|| (receipt->page_lsn == PageGetLSN((Page)i->page_bytes)
 			&& receipt->page_scn == (uint64)((PageHeader)i->page_bytes)->pd_block_scn
 			&& receipt->page_crc32c == i->page_checksum);
@@ -30819,8 +30866,7 @@ pcm_resource_x_acquire_read_owner_locked(struct GrdEntry *entry,
 		|| execution->target.reservation_token != episode->reservation_token
 		|| execution->target.buffer_id_plus_one != (uint32)episode->buffer_id + 1
 		|| execution->target.flags != PCM_OWN_FLAG_GRANT_PENDING
-		|| (episode->path != RESOURCE_X_ACQUIRE_FIRST_FILL
-			&& (episode->path != RESOURCE_X_ACQUIRE_RESIDENT || execution->observation.request.observed_mode != PCM_STATE_N))
+		|| !pcm_resource_x_acquire_read_path(episode, &execution->observation.request)
 		|| (execution->observation.request.target_mode != PCM_STATE_S
 			&& execution->observation.request.target_mode != PCM_STATE_X)
 		|| (round->delivery_executor_purpose != RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING
@@ -30868,7 +30914,8 @@ pcm_resource_x_acquire_x_transition_locked(struct GrdEntry *entry,
 	uint16 t1 = RESOURCE_X_PROGRESS_BOUND | RESOURCE_X_PROGRESS_T1;
 
 	if (claim == NULL || !pcm_resource_x_install_claim_ref_exact_locked(round, ref)
-		|| round->request.target_mode != PCM_STATE_X || round->request.observed_mode != PCM_STATE_N)
+		|| round->request.target_mode != PCM_STATE_X
+		|| !pcm_resource_x_acquire_read_path(&round->acquire_intent, &round->request))
 		return RESOURCE_X_APPLY_STALE;
 	result = pcm_resource_x_acquire_read_owner_locked(entry, claim, &round->acquire_intent,
 		&current, &receipt);
@@ -31069,7 +31116,7 @@ pcm_resource_x_acquire_read_complete_mode(
 		|| terminal->pcm_state != execution->observation.request.target_mode
 		|| (terminal->pcm_state == PCM_STATE_S ? terminal->buffer_type != BUF_TYPE_SCUR
 			: terminal->pcm_state != PCM_STATE_X || terminal->buffer_type != BUF_TYPE_XCUR)
-		|| terminal->semantic_buf_state != (BM_TAG_VALID | BM_VALID)
+		|| !pcm_resource_x_acquire_terminal_semantic(episode, &execution->observation.request, terminal->semantic_buf_state)
 		|| memcmp(terminal->_reserved, reserved, sizeof(reserved)) != 0
 		|| !BufferTagsEqual(&terminal->tag, &execution->observation.request.logical_assertion.resource))
 		return RESOURCE_X_APPLY_INVALID;
@@ -31237,8 +31284,11 @@ pcm_resource_x_acquire_read_close_shape(const ResourceXDeliveryClaim *execution,
 		&& native->reservation_token == episode->reservation_token
 		&& native->flags == (quiet ? 0 : PCM_OWN_FLAG_GRANT_PENDING)
 		&& native->writer_activation_token == 0 && native->resource_x_activation_generation == 0
-		&& native->pcm_state == PCM_STATE_N && native->buffer_type == BUF_TYPE_CURRENT
-		&& native->semantic_buf_state == (BM_TAG_VALID | (quiet ? BM_IO_ERROR : BM_IO_IN_PROGRESS))
+		&& (pcm_resource_x_acquire_local_s_x(episode, &execution->observation.request)
+			? native->pcm_state == PCM_STATE_S && native->buffer_type == BUF_TYPE_SCUR
+				&& pcm_resource_x_acquire_terminal_semantic(episode, &execution->observation.request, native->semantic_buf_state)
+			: native->pcm_state == PCM_STATE_N && native->buffer_type == BUF_TYPE_CURRENT
+				&& native->semantic_buf_state == (BM_TAG_VALID | (quiet ? BM_IO_ERROR : BM_IO_IN_PROGRESS)))
 		&& memcmp(native->_reserved, reserved, sizeof(reserved)) == 0
 		&& BufferTagsEqual(&native->tag, &execution->observation.request.logical_assertion.resource);
 }
@@ -31689,7 +31739,7 @@ pcm_resource_x_acquire_read_notice_mode(
 	if (!pcm_resource_x_acquire_read_input(execution, episode) || receipt == NULL || terminal == NULL
 		|| terminal->generation != episode->base_generation + 1 || terminal->flags != 0
 		|| terminal->reservation_token != episode->reservation_token
-		|| terminal->semantic_buf_state != (BM_TAG_VALID | BM_VALID)
+		|| !pcm_resource_x_acquire_terminal_semantic(episode, &execution->observation.request, terminal->semantic_buf_state)
 		|| terminal->pcm_state != execution->observation.request.target_mode
 		|| (terminal->pcm_state == PCM_STATE_S ? terminal->buffer_type != BUF_TYPE_SCUR
 			: terminal->pcm_state != PCM_STATE_X || terminal->buffer_type != BUF_TYPE_XCUR)
@@ -32210,7 +32260,7 @@ cluster_pcm_lock_resource_x_requester_acquire_read_settle_exact(
 	if (!pcm_resource_x_acquire_read_input(execution, episode) || receipt == NULL || terminal == NULL
 		|| terminal->generation != episode->base_generation + 1 || terminal->flags != 0
 		|| terminal->reservation_token != episode->reservation_token
-		|| terminal->semantic_buf_state != (BM_TAG_VALID | BM_VALID)
+		|| !pcm_resource_x_acquire_terminal_semantic(episode, &execution->observation.request, terminal->semantic_buf_state)
 		|| terminal->pcm_state != execution->observation.request.target_mode
 		|| (terminal->pcm_state == PCM_STATE_S ? terminal->buffer_type != BUF_TYPE_SCUR
 			: terminal->pcm_state != PCM_STATE_X || terminal->buffer_type != BUF_TYPE_XCUR)
