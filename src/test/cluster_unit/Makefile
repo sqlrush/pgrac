@@ -11269,6 +11269,49 @@ clean distclean maintainer-clean: clean-native-x-disk
 clean-native-x-disk:
 	rm -f test_cluster_native_x_disk
 
+# Installed full-E X through the ordinary target writer/use owner.
+TESTS += test_cluster_native_x_writer
+all: test_cluster_native_x_writer
+test_cluster_native_x_disk_fixture.inc: test_cluster_native_x_disk.c Makefile
+	awk '/^UT_TEST\(/ { exit } { print }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_native_x_writer_gcs.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^gcs_block_resource_x_acquire_cached_x_ref_exact\(/ { print "static ResourceXApplyResult"; emit=1; cache++ } \
+	     /^gcs_block_resource_x_target_acquire_internal\(/ { print "static ResourceXApplyResult"; emit=1; driver++ } \
+	     /^cluster_gcs_resource_x_target_(acquire_until_exact|acquire_reobserve_exact|context_recheck_result_exact|itl_recycle_cancel_exact)\(/ { print "ResourceXApplyResult"; emit=1; public++ } \
+	     /^cluster_gcs_resource_x_target_context_recheck_exact\(/ { print "bool"; emit=1; boolean++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (cache != 1 || driver != 1 || public != 4 || boolean != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_native_x_writer_ledger.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^typedef (enum ClusterPcmXWriterLedgerPhase|struct ClusterPcmXWriterLedgerEntry)/ { emit=1; types++ } \
+	     /^cluster_bufmgr_pcm_own_snapshot\(/ { print "ClusterPcmOwnResult"; emit=1; snapshot++ } \
+	     /^static ClusterPcmXWriterLedgerEntry cluster_bufmgr_pcm_x_writer_ledger\[/ { print; array++ } \
+	     /^cluster_bufmgr_pcm_x_writer_(find|free_entry|prepare_target)\(/ { print "static ClusterPcmXWriterLedgerEntry *"; emit=1; pointer++ } \
+	     /^cluster_bufmgr_pcm_x_writer_(entry_exact|activate)\(/ { print "static bool"; emit=1; boolean++ } \
+	     /^cluster_bufmgr_pcm_x_writer_(clear|object_sample|mark_releasing|release|exception_cleanup_all)\(/ { print "static void"; emit=1; action++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (types != 2 || snapshot != 1 || array != 1 || pointer != 3 || boolean != 2 || action != 5) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_native_x_writer: test_cluster_native_x_writer.c test_cluster_native_x_disk \
+		test_cluster_native_x_disk_fixture.inc test_cluster_native_x_writer_gcs.inc \
+		test_cluster_native_x_writer_ledger.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+clean distclean maintainer-clean: clean-native-x-writer
+.PHONY: clean-native-x-writer
+clean-native-x-writer:
+	rm -f test_cluster_native_x_writer test_cluster_native_x_disk_fixture.inc \
+		test_cluster_native_x_disk_fixture.inc.tmp test_cluster_native_x_writer_gcs.inc \
+		test_cluster_native_x_writer_gcs.inc.tmp test_cluster_native_x_writer_ledger.inc \
+		test_cluster_native_x_writer_ledger.inc.tmp
+
 TESTS += test_cluster_native_disk_guard
 all: test_cluster_native_disk_guard
 test_cluster_native_disk_guard: test_cluster_native_disk_guard.c \

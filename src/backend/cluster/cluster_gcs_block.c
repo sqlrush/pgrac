@@ -16730,7 +16730,66 @@ static ResourceXApplyResult gcs_block_resource_x_target_acquire_internal_trace_i
 	uint64 *absolute_deadline_us_io, ResourceXAuxiliaryAcquireContext *aux_context,
 	bool *creation_reobserve_out, ResourceXAcquisitionRef *ref_out);
 
-/* PGRAC: observational scope only; preserve every result and exception. */
+/* A completed ordinary X keeps node residency independently of its original
+ * executor. Export its original ref to the existing writer/use ledger; this
+ * local proof does not reacquire, publish or retire any authority. */
+static ResourceXApplyResult
+gcs_block_resource_x_acquire_cached_x_ref_exact(BufferDesc *buf,
+	const BufferTag *expected_resource, uint64 r4_record_generation,
+	const uint64 *absolute_deadline_us_io, bool auxiliary, ResourceXAcquisitionRef *ref_out)
+{
+	ClusterPcmOwnSnapshot own;
+	ResourceXAssertion assertion;
+	ResourceXGateSnapshot gate;
+	PcmXSessionAuthResult session_result;
+	ResourceXWriterPath path;
+	uint64 r4, session;
+	int32 master;
+
+	if (ref_out != NULL)
+		memset(ref_out, 0, sizeof(*ref_out));
+	if (buf == NULL || expected_resource == NULL || ref_out == NULL
+		|| buf->buf_id < 0 || buf->buf_id >= NBuffers
+		|| r4_record_generation == 0 || r4_record_generation == UINT64_MAX
+		|| (absolute_deadline_us_io != NULL && *absolute_deadline_us_io == UINT64_MAX))
+		return RESOURCE_X_APPLY_INVALID;
+	for (;;) {
+		if (cluster_bufmgr_pcm_own_snapshot(buf, &own) != CLUSTER_PCM_OWN_OK
+			|| own.pcm_state != PCM_STATE_X || own.buffer_type != BUF_TYPE_XCUR
+			|| own.flags != 0 || own.writer_activation_token != 0
+			|| own.resource_x_activation_generation != 0
+			|| (own.semantic_buf_state & (BM_TAG_VALID | BM_VALID | BM_IO_IN_PROGRESS | BM_IO_ERROR))
+				!= (BM_TAG_VALID | BM_VALID)
+			|| cluster_pcm_own_delivery_attempt_get(buf->buf_id) != 0
+			|| (pg_atomic_read_u64(&ClusterPcmOwnArray[buf->buf_id].write_io_generation) & 1) != 0)
+			return RESOURCE_X_APPLY_NOT_FOUND;
+		if (!BufferTagsEqual(&own.tag, expected_resource))
+			/* Only the original auxiliary owner can classify an unpinned
+			 * descriptor's reuse as caller-owned repin rather than stale. */
+			return auxiliary ? RESOURCE_X_APPLY_NOT_FOUND : RESOURCE_X_APPLY_STALE;
+		path = cluster_resource_x_writer_path_snapshot(&r4);
+		if (path != RESOURCE_X_WRITER_TARGET || r4 != r4_record_generation)
+			return RESOURCE_X_APPLY_STALE;
+		session_result = gcs_block_resource_x_gate_session_snapshot_result(
+			expected_resource, &gate, &master, &session);
+		if (cluster_gcs_pcm_x_auth_result_retryable(session_result)) {
+			/* A missing observation grants nothing. Keep the original cached
+			 * owner intact and reobserve locally, with no request or deadline. */
+			CHECK_FOR_INTERRUPTS();
+			pg_usleep(1000L);
+			continue;
+		}
+		if (session_result != PCM_X_SESSION_AUTH_OK)
+			return RESOURCE_X_APPLY_STALE;
+		assertion.resource = *expected_resource;
+		assertion.requester_node = cluster_node_id;
+		return cluster_pcm_lock_resource_x_acquire_cached_x_ref_exact(&assertion,
+			master, gate.formation, session, r4_record_generation, own.generation, ref_out);
+	}
+}
+
+/* Keep the existing trace bracket around cached ordinary use and the
+ * original non-cached/direct-init owner. */
 static ResourceXApplyResult
 gcs_block_resource_x_target_acquire_internal(
 	BufferDesc *buf, const BufferTag *expected_resource, uint64 r4_record_generation,
@@ -16742,6 +16801,14 @@ gcs_block_resource_x_target_acquire_internal(
 	ResourceXApplyResult result;
 
 	if (likely(!cluster_update_trace_enabled && !cluster_xnode_profile_enabled)) {
+		if (expected_resource != NULL && direct_init_ownership_generation == 0
+			&& direct_init_reservation_token == 0 && !join_only) {
+			result = gcs_block_resource_x_acquire_cached_x_ref_exact(
+				buf, expected_resource, r4_record_generation, absolute_deadline_us_io,
+				aux_context != NULL, ref_out);
+			if (result != RESOURCE_X_APPLY_NOT_FOUND)
+				return result;
+		}
 		return gcs_block_resource_x_target_acquire_internal_trace_impl(
 			buf, expected_resource, r4_record_generation, direct_init_ownership_generation,
 			direct_init_reservation_token, join_only, absolute_deadline_us_io, aux_context,
@@ -16750,10 +16817,17 @@ gcs_block_resource_x_target_acquire_internal(
 	cluster_xp_begin(&trace, CLXP_RESOURCE_X_ACQUIRE);
 	PG_TRY();
 	{
-		result = gcs_block_resource_x_target_acquire_internal_trace_impl(
-			buf, expected_resource, r4_record_generation, direct_init_ownership_generation,
-			direct_init_reservation_token, join_only, absolute_deadline_us_io, aux_context,
-			creation_reobserve_out, ref_out);
+		result = RESOURCE_X_APPLY_NOT_FOUND;
+		if (expected_resource != NULL && direct_init_ownership_generation == 0
+			&& direct_init_reservation_token == 0 && !join_only)
+			result = gcs_block_resource_x_acquire_cached_x_ref_exact(
+				buf, expected_resource, r4_record_generation, absolute_deadline_us_io,
+				aux_context != NULL, ref_out);
+		if (result == RESOURCE_X_APPLY_NOT_FOUND)
+			result = gcs_block_resource_x_target_acquire_internal_trace_impl(
+				buf, expected_resource, r4_record_generation, direct_init_ownership_generation,
+				direct_init_reservation_token, join_only, absolute_deadline_us_io, aux_context,
+				creation_reobserve_out, ref_out);
 	}
 	PG_FINALLY();
 	{

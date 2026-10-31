@@ -31759,6 +31759,59 @@ pcm_resource_x_acquire_read_execution_locked(const struct GrdEntry *entry,
 	execution->purpose = RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING;
 }
 
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_acquire_cached_x_ref_exact(
+	const ResourceXAssertion *assertion, int32 current_master_node, uint64 resource_formation,
+	uint64 master_session_incarnation, uint64 r4_record_generation,
+	uint64 cached_ownership_generation, ResourceXAcquisitionRef *ref_out)
+{
+	PcmEntryRef entry_ref;
+	PcmEntryAcquireResult acquired;
+	ClusterPcmResourceXBootstrapRound *round;
+	ResourceXDeliveryClaim execution, current;
+	ResourceXAcquireReadReceipt receipt;
+	ResourceXApplyResult result;
+
+	if (!resource_x_assertion_valid(assertion) || assertion->requester_node != cluster_node_id
+		|| current_master_node < 0 || current_master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+		|| resource_formation == 0 || resource_formation == UINT64_MAX
+		|| master_session_incarnation == 0 || master_session_incarnation == UINT64_MAX
+		|| r4_record_generation == 0 || r4_record_generation == UINT64_MAX
+		|| cached_ownership_generation == 0 || cached_ownership_generation == UINT64_MAX
+		|| ref_out == NULL)
+		return RESOURCE_X_APPLY_INVALID;
+	if (!pcm_entry_ref_acquire(&assertion->resource, false, &entry_ref, &acquired))
+		return RESOURCE_X_APPLY_NOT_FOUND;
+	LWLockAcquire(&entry_ref.entry->entry_lock.lock, LW_SHARED);
+	round = &entry_ref.entry->resource_x_bootstrap_round;
+	if (round->has_acquire_intent == 0)
+		result = RESOURCE_X_APPLY_NOT_FOUND; /* Unchanged non-full-E owner. */
+	else if (!pcm_resource_x_requester_acquire_valid_locked(round)
+		|| !pcm_resource_x_acquire_read_completed(round->delivery_executor_purpose)
+		|| !pcm_resource_x_acquire_x_terminal_round_valid(round))
+		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	else if (round->current_master_node != current_master_node
+		|| !resource_x_assertion_equal(&round->terminal_ref.assertion, assertion)
+		|| round->resource_formation != resource_formation
+		|| !cluster_pcm_lock_resource_x_gate_open_exact(resource_formation)
+		|| !pcm_resource_x_bootstrap_round_terminal_cover_exact_locked(entry_ref.entry,
+			round, &round->terminal_ref, master_session_incarnation, r4_record_generation,
+			cached_ownership_generation))
+		result = RESOURCE_X_APPLY_STALE;
+	else {
+		/* Validate the original canonical A, retained I and completed native
+		 * receipt. A scalar terminal-X cover alone is not this projection. */
+		pcm_resource_x_acquire_read_execution_locked(entry_ref.entry, &execution);
+		result = pcm_resource_x_acquire_read_owner_locked(entry_ref.entry, &execution,
+			&round->acquire_intent, &current, &receipt);
+		if (result == RESOURCE_X_APPLY_APPLIED)
+			*ref_out = round->terminal_ref;
+	}
+	LWLockRelease(&entry_ref.entry->entry_lock.lock);
+	pcm_entry_ref_release(&entry_ref);
+	return result;
+}
+
 /* A quiet receipt already proves physical native termination. Reconstruct
  * only that original E/A/I; a later same-tag descriptor is not an input. */
 static ResourceXApplyResult

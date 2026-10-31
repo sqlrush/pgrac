@@ -2035,6 +2035,12 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_bootstrap_round_failure_
 extern bool cluster_pcm_lock_resource_x_bootstrap_round_cover_matches_exact(
 	const ResourceXAcquisitionRef *ref, uint64 master_session_incarnation,
 	uint64 r4_record_generation, uint64 cached_ownership_generation);
+/* Read-only full-E completion projection. The caller must still recheck
+ * native ownership and the current domain before using content-X. */
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_cached_x_ref_exact(
+	const ResourceXAssertion *assertion, int32 current_master_node, uint64 resource_formation,
+	uint64 master_session_incarnation, uint64 r4_record_generation,
+	uint64 cached_ownership_generation, ResourceXAcquisitionRef *ref_out);
 extern ResourceXApplyResult
 cluster_pcm_lock_resource_x_bootstrap_round_invalidate_ownership_loss_exact(
 	const ResourceXAssertion *assertion, int32 current_master_node, uint64 resource_formation,

@@ -21,15 +21,25 @@
  */
 #include "postgres.h"
 
+#include "cluster/cluster_content_trace.h"
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_pcm_direct_init.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_tx_identity_trace.h"
 #include "storage/bufmgr.h"
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+
+/* These consumer cases run with observation off, not a trace collector. */
+void
+cluster_content_trace_pair_event(Buffer target, ClusterContentTracePairEvent event, int32 result)
+{
+	(void)target; (void)event; (void)result;
+	UT_ASSERT(!cluster_trace_tx_identity);
+}
 
 static BufferDesc fixture_buf;
 static ClusterPcmDirectInitSnapshot fixture_state;
