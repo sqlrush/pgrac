@@ -2811,6 +2811,11 @@ heapam_scan_sample_next_block(TableScanDesc scan, SampleScanState *scanstate)
 	TsmRoutine *tsm = scanstate->tsmroutine;
 	BlockNumber blockno;
 
+#ifdef USE_PGRAC_CLUSTER
+	/* Retire the previous observation even if the sampler ends or errors. */
+	cluster_heap_scan_forget_owned(hscan);
+#endif
+
 	/* return false immediately if relation is empty */
 	if (hscan->rs_nblocks == 0)
 		return false;
@@ -2881,6 +2886,61 @@ heapam_scan_sample_next_block(TableScanDesc scan, SampleScanState *scanstate)
 	return true;
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* Sample offsets retain their original order over the same private FULL. */
+static bool
+cluster_heap_scan_sample_next_tuple_full(HeapScanDesc hscan, SampleScanState *scanstate,
+										 TupleTableSlot *slot)
+{
+	volatile bool finished = false;
+	volatile bool found = false;
+
+	PG_TRY();
+	{
+		Page page = cluster_heap_scan_page(hscan);
+		OffsetNumber maxoffset = PageGetMaxOffsetNumber(page);
+
+		for (;;) {
+			OffsetNumber offset;
+			ItemId item;
+			HeapTuple tuple = &hscan->rs_ctup;
+
+			CHECK_FOR_INTERRUPTS();
+			offset = scanstate->tsmroutine->NextSampleTuple(scanstate, hscan->rs_cblock, maxoffset);
+			/* The callback may cancel or invalidate this observation. */
+			page = cluster_heap_scan_page(hscan);
+			if (!OffsetNumberIsValid(offset)) {
+				cluster_heap_scan_forget_owned(hscan);
+				ExecClearTuple(slot);
+				break;
+			}
+			if (offset > maxoffset)
+				cluster_heap_scan_full_unknown(hscan);
+			item = PageGetItemId(page, offset);
+			if (!ItemIdIsNormal(item))
+				continue;
+			tuple->t_data = (HeapTupleHeader)PageGetItem(page, item);
+			tuple->t_len = ItemIdGetLength(item);
+			ItemPointerSet(&tuple->t_self, hscan->rs_cblock, offset);
+			if (!SampleHeapTupleVisible((TableScanDesc)hscan, hscan->rs_cbuf, tuple, offset))
+				continue;
+			cluster_heap_scan_store(hscan, slot);
+			pgstat_count_heap_getnext(hscan->rs_base.rs_rd);
+			found = true;
+			break;
+		}
+		finished = true;
+	}
+	PG_FINALLY();
+	{
+		if (!finished)
+			cluster_heap_scan_forget_owned(hscan);
+	}
+	PG_END_TRY();
+	return found;
+}
+#endif
+
 static bool
 heapam_scan_sample_next_tuple(TableScanDesc scan, SampleScanState *scanstate,
 							  TupleTableSlot *slot)
@@ -2893,6 +2953,11 @@ heapam_scan_sample_next_tuple(TableScanDesc scan, SampleScanState *scanstate,
 	Page		page;
 	bool		all_visible;
 	OffsetNumber maxoffset;
+
+#ifdef USE_PGRAC_CLUSTER
+	if (hscan->rs_owned_kind == 3)
+		return cluster_heap_scan_sample_next_tuple_full(hscan, scanstate, slot);
+#endif
 
 	/*
 	 * When not using pagemode, we must lock the buffer during tuple
@@ -3049,9 +3114,13 @@ SampleHeapTupleVisible(TableScanDesc scan, Buffer buffer,
 					   OffsetNumber tupoffset)
 {
 	HeapScanDesc hscan = (HeapScanDesc) scan;
+	bool preselected = (scan->rs_flags & SO_ALLOW_PAGEMODE) != 0;
 
-	if (scan->rs_flags & SO_ALLOW_PAGEMODE)
-	{
+#ifdef USE_PGRAC_CLUSTER
+	/* FULL selection covers the entire page in row mode too. */
+	preselected |= hscan->rs_owned_kind == 3;
+#endif
+	if (preselected) {
 		/*
 		 * In pageatatime mode, heapgetpage() already did visibility checks,
 		 * so just look at the info it left in rs_vistuples[].
@@ -3078,9 +3147,7 @@ SampleHeapTupleVisible(TableScanDesc scan, Buffer buffer,
 		}
 
 		return false;
-	}
-	else
-	{
+	} else {
 		/* Otherwise, we have to check the tuple individually. */
 		return HeapTupleSatisfiesVisibility(tuple, scan->rs_snapshot,
 											buffer);

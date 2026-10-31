@@ -2904,7 +2904,8 @@ cluster_heap_scan_fetch_full(HeapScanDesc scan)
 
 	if (!cluster_heap_read_needs_copy(scan->rs_base.rs_rd)
 		|| !(scan->rs_base.rs_flags
-			 & (SO_TYPE_SEQSCAN | SO_TYPE_TIDRANGESCAN | SO_TYPE_BITMAPSCAN | SO_TYPE_TIDSCAN))
+			 & (SO_TYPE_SEQSCAN | SO_TYPE_TIDRANGESCAN | SO_TYPE_BITMAPSCAN | SO_TYPE_TIDSCAN
+				| SO_TYPE_SAMPLESCAN))
 		|| snapshot == NULL || snapshot->snapshot_type != SNAPSHOT_MVCC
 		|| snapshot->cluster_source != SNAPSHOT_SOURCE_CLUSTER)
 		return false;
