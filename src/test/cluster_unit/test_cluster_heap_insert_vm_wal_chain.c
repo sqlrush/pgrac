@@ -239,8 +239,11 @@ UT_TEST(native_owner_keeps_original_wal_without_shared_writer_calls)
 		UT_ASSERT(!registered[1]);
 	}
 }
+#ifndef INSERT_VM_WAL_MAIN
+#define INSERT_VM_WAL_MAIN main
+#endif
 int
-main(void)
+INSERT_VM_WAL_MAIN(void)
 {
 	UT_PLAN(10);
 	UT_RUN(cold_writer_reaches_actual_clear_and_two_page_wal);
