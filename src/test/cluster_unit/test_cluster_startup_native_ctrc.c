@@ -103,3 +103,10 @@ test_startup_native_ctrc_hot(const char *image, BlockNumber block)
 {
 	return cluster_ctrc_recovery_heap_hot_references_v1(image, block);
 }
+
+/* Packed tuple grammar from the same complete original production TU. */
+bool
+test_startup_native_ctrc_tuple(const ClusterItlSlotData *slots, const char *bytes, Size length)
+{
+	return cluster_ctrc_recovery_heap_tuple_itl_references_v1(slots, bytes, length);
+}

@@ -3647,6 +3647,115 @@ cluster_recovery_cold_page_reference_key(const ClusterRecoveryCensusReferenceV1 
 	entry->reference_evidence = proof->evidence; entry->reference_evidence_length = proof->evidence_length;
 }
 
+/* The census owns packed tuple bytes separately from its reference structs.
+ * Preserve both the original pointer identity and its complete private bytes
+ * across PAGE/terminal calls that can yield. Never rebase onto a fresh tuple. */
+static bool
+cluster_recovery_cold_page_tuple_bytes_current(const ClusterRecoveryCensusReferencesV1 *references,
+	const ClusterRecoveryCensusReferenceV1 *fixed, uint32 count, const Size *offsets, const char *bytes)
+{
+	if (references->count != count) return false;
+	for (uint32 i = 0; i < count; i++) {
+		const ClusterRecoveryHeapEntry *saved = &fixed[i].entry, *current = &references->entries[i].entry;
+		if (saved->kind != CLUSTER_RECOVERY_HEAP_ITEM) continue;
+		if (current->kind != saved->kind || current->tuple_bytes != saved->tuple_bytes
+			|| current->tuple_length != saved->tuple_length
+			|| (saved->tuple_length != 0
+				&& memcmp(current->tuple_bytes, bytes + offsets[i], saved->tuple_length) != 0)) return false;
+	}
+	return true;
+}
+
+/* A current tuple has no independent canonical T in the census. Resolve its
+ * fields ONLY through the complete original same-page/version ITLs, each
+ * already joined to a full forest T and actual PAGE owner above. Replaying
+ * all those original slots and this complete tuple into private scratch must
+ * reproduce the WHOLE actual after-image. Scratch is never DATA/base evidence.
+ * Select every field before publishing any; history/MX/HOT remain unresolved. */
+static uint16
+cluster_recovery_cold_page_tuple_fields(const ClusterRecoveryCensusReferenceV1 *references,
+	uint32 reference_count, uint32 index, const char *bytes, const RfPageCtrcOwnerGraphEntryV1 *entries,
+	const volatile RfPageCtrcOwnerReferencesV1 *related, const ClusterColdTtSlotInputV1 *terminals,
+	uint32 terminal_count, uint32 fields[2], Size offsets[2])
+{
+	const ClusterRecoveryCensusReferenceV1 *reference = &references[index];
+	const ClusterRecoveryHeapEntry *entry = &reference->entry;
+	ClusterItlSlotData slots[CLUSTER_ITL_INITRANS_DEFAULT];
+	uint32 indexes[CLUSTER_ITL_INITRANS_DEFAULT], seen = 0, owner = UINT32_MAX;
+	HeapTupleHeaderData header;
+	HeapTupleHeader tuple = &header;
+	const RfPageCtrcOwnerEvidenceV1 *proof;
+	const PageHeaderData *page;
+	PGAlignedBlock scratch;
+	ClusterCtrcItlCleanoutApplyResult result;
+	uint16 count = 0;
+	Size offset;
+
+	if (reference->version != 0 || entry->kind != CLUSTER_RECOVERY_HEAP_ITEM
+		|| entry->index < FirstOffsetNumber || !ItemIdIsNormal(&entry->item)
+		|| entry->tuple_length < SizeofHeapTupleHeader || entry->tuple_length > BLCKSZ
+		|| entry->tuple_length != ItemIdGetLength(&entry->item)) return 0;
+	for (uint32 i = 0; i < reference_count; i++) {
+		const ClusterRecoveryCensusReferenceV1 *candidate = &references[i];
+		uint32 slot;
+		if (candidate->page_index != reference->page_index || candidate->version != reference->version
+			|| candidate->entry.kind != CLUSTER_RECOVERY_HEAP_ITL) continue;
+		slot = candidate->entry.index;
+		if (slot >= CLUSTER_ITL_INITRANS_DEFAULT || (seen & (UINT32_C(1) << slot)) != 0) return 0;
+		seen |= UINT32_C(1) << slot; slots[slot] = candidate->entry.itl; indexes[slot] = i;
+		if (slots[slot].flags == ITL_FLAG_FREE) continue;
+		if (entries[i].reference_edge_kind != 4 || entries[i].reference_field_count != 1
+			|| entries[i].owner_index >= related->owners.count) return 0;
+		if (owner == UINT32_MAX) owner = entries[i].owner_index;
+		else if (owner != entries[i].owner_index) return 0;
+	}
+	if (seen != (UINT32_C(1) << CLUSTER_ITL_INITRANS_DEFAULT) - 1 || owner == UINT32_MAX
+		|| !cluster_ctrc_recovery_heap_tuple_itl_references_v1(slots, bytes, entry->tuple_length)) return 0;
+	memcpy(&header, bytes, SizeofHeapTupleHeader);
+	if ((tuple->t_infomask & HEAP_MOVED) != 0
+		|| (tuple->t_infomask2 & (HEAP_HOT_UPDATED | HEAP_ONLY_TUPLE)) != 0) return 0;
+	if (!HeapTupleHeaderXminFrozen(tuple) && HeapTupleHeaderGetRawXmin(tuple) != BootstrapTransactionId
+		&& HeapTupleHeaderGetRawXmin(tuple) != FrozenTransactionId) {
+		uint32 selected = UINT32_MAX;
+		for (uint32 slot = 0; slot < CLUSTER_ITL_INITRANS_DEFAULT; slot++) {
+			if (slots[slot].xid != HeapTupleHeaderGetRawXmin(tuple)
+				|| slots[slot].flags == ITL_FLAG_FREE || ITL_FLAG_IS_LOCK_ONLY(slots[slot].flags)) continue;
+			if (selected != UINT32_MAX) return 0;
+			selected = slot;
+		}
+		if (selected == UINT32_MAX) return 0;
+		fields[count] = indexes[selected]; offsets[count++] = offsetof(HeapTupleHeaderData, t_choice.t_heap.t_xmin);
+	}
+	if ((tuple->t_infomask & HEAP_XMAX_INVALID) == 0) {
+		uint32 selected = UINT32_MAX;
+		if ((tuple->t_infomask & HEAP_XMAX_IS_MULTI) != 0) return 0;
+		if (HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask)) {
+			for (uint32 slot = 0; slot < CLUSTER_ITL_INITRANS_DEFAULT; slot++) {
+				if (slots[slot].xid != HeapTupleHeaderGetRawXmax(tuple) || !ITL_FLAG_IS_LOCK_ONLY(slots[slot].flags)) continue;
+				if (selected != UINT32_MAX) return 0;
+				selected = slot;
+			}
+		} else if (tuple->t_itl_slot_idx < CLUSTER_ITL_INITRANS_DEFAULT) selected = tuple->t_itl_slot_idx;
+		if (selected == UINT32_MAX) return 0;
+		fields[count] = indexes[selected]; offsets[count++] = offsetof(HeapTupleHeaderData, t_choice.t_heap.t_xmax);
+	}
+	if (count == 0) return 0;
+	proof = &related->owners.entries[owner]; page = (const PageHeaderData *)proof->completed.owner.image.data;
+	offset = ItemIdGetOffset(&entry->item);
+	if (entry->index > PageGetMaxOffsetNumber((Page)page)
+		|| memcmp(&entry->item, PageGetItemId((Page)page, entry->index), sizeof(entry->item)) != 0
+		|| offset < page->pd_upper || offset > page->pd_special
+		|| entry->tuple_length > page->pd_special - offset) return 0;
+	scratch = proof->completed.owner.image;
+	memcpy(scratch.data + page->pd_special, slots, sizeof(slots));
+	memcpy(scratch.data + offset, bytes, entry->tuple_length);
+	result = cluster_ctrc_recovery_itl_page_image_v1(terminals, terminal_count, scratch.data, scratch.data);
+	if ((result != CLUSTER_CTRC_ITL_CLEANOUT_REWRITTEN && result != CLUSTER_CTRC_ITL_CLEANOUT_ALREADY_TERMINAL)
+		|| memcmp(scratch.data, proof->completed.owner.image.data, BLCKSZ) != 0) return 0;
+	for (uint16 f = 0; f < count; f++) offsets[f] += offset;
+	return count;
+}
+
 static RfPageCtrcOwnerGraphV1
 cluster_recovery_cold_page_owner_graph(const struct ClusterRecoveryStartV1 *start, Size memory_budget, bool projected)
 {
@@ -3660,7 +3769,9 @@ cluster_recovery_cold_page_owner_graph(const struct ClusterRecoveryStartV1 *star
 	ClusterColdTtSlotInputV1 *terminals;
 	ClusterRecoveryCTRCGraphNodeV2 *nodes;
 	ClusterRecoveryCTRCGraphEdgeV2 *edges;
-	size_t *roots;
+	size_t *roots, *reference_nodes;
+	Size *tuple_offsets;
+	char *tuple_bytes;
 	ClusterRecoveryCTRCGraphV2 contribution = {0};
 	ClusterRecoveryTxResultObservationV1 accepted = {0};
 	const ClusterRecoveryCensusReferencesV1 *references;
@@ -3669,6 +3780,8 @@ cluster_recovery_cold_page_owner_graph(const struct ClusterRecoveryStartV1 *star
 	Size bytes = 0, entry_offset, owner_offset, source_offset, observed_offset, reference_offset;
 	Size edge_offset, effect_offset, indexes_offset, data_offset, terminal_offset, key_capacity, stride, scratch;
 	Size graph_node_offset = 0, graph_edge_offset = 0, graph_root_offset = 0;
+	Size tuple_offsets_offset = 0, tuple_bytes_offset = 0, tuple_key_offset = 0, reference_node_offset = 0;
+	Size tuple_length = 0;
 	const Size reference_capacity = MAXPGPATH + 105;
 	uint32 reference_count, owner_count, source_count, wal_count, terminal_count, edge_count = 0, max_edges = 0;
 	uint32 unresolved_count = 0;
@@ -3687,6 +3800,20 @@ cluster_recovery_cold_page_owner_graph(const struct ClusterRecoveryStartV1 *star
 	terminal_count = projected ? work->counts.subject_count : 0;
 	out.detail = RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE;
 	if (owner_count == 0 || source_count == 0 || source_count > RF_PAGE_STABLE_MAX_PARTICIPANTS) goto refused;
+	if (projected && reference_count > UINT32_MAX / 2) {
+		out.detail = RF_PAGE_PROOF_DETAIL_CAPACITY; return out;
+	}
+	if (projected) {
+		for (uint32 i = 0; i < reference_count; i++) {
+			const ClusterRecoveryHeapEntry *entry = &references->entries[i].entry;
+			if (entry->kind != CLUSTER_RECOVERY_HEAP_ITEM) continue;
+			if (entry->tuple_length > BLCKSZ || (entry->tuple_length == 0) != (entry->tuple_bytes == NULL)) goto refused;
+			if (entry->tuple_length > MaxAllocSize - tuple_length) {
+				out.detail = RF_PAGE_PROOF_DETAIL_CAPACITY; return out;
+			}
+			tuple_length += entry->tuple_length;
+		}
+	}
 	for (uint32 i = 0; i < owner_count; i++) {
 		RfPageOnlineTargetViewV1 target;
 		if (!rf_page_online_plan_target_v1(start->ctrc_page_plan, i, &target)
@@ -3701,7 +3828,7 @@ cluster_recovery_cold_page_owner_graph(const struct ClusterRecoveryStartV1 *star
 	/* Reserve complete scope/evidence output and codec scratch before the
 	 * unchanged reference/owner factory performs its own whole PAGE preflight. */
 	out.detail = RF_PAGE_PROOF_DETAIL_CAPACITY;
-	if (owner_count > UINT32_MAX / source_count || (projected && reference_count > UINT32_MAX / 2)
+	if (owner_count > UINT32_MAX / source_count
 		|| max_edges > (MaxAllocSize - 60 - 4 * source_count) / 62) return out;
 	key_capacity = 60 + (Size)4 * source_count + (Size)62 * max_edges;
 	if (key_capacity > (MaxAllocSize - sizeof(((RfPageCtrcOwnerEvidenceV1 *)0)->evidence)
@@ -3711,7 +3838,8 @@ cluster_recovery_cold_page_owner_graph(const struct ClusterRecoveryStartV1 *star
 	scratch = key_capacity + sizeof(out) + sizeof(related) + sizeof(ClusterRecoveryCTRCOwnerScopeV2)
 		+ sizeof(ClusterRecoveryPageWalV1) + sizeof(ClusterRecoveryCTRCOwnerEffectV2)
 		+ sizeof(RfPageOnlineTargetViewV1) + sizeof(ClusterRecoveryWalSourceObservationV1) + 128
-		+ sizeof(accepted) + (projected ? 3 * BLCKSZ + sizeof(ClusterRecoveryCensusReferenceV1) : 0);
+		+ sizeof(accepted) + (projected ? 5 * BLCKSZ + sizeof(ClusterRecoveryCensusReferenceV1)
+			+ sizeof(HeapTupleHeaderData) + CLUSTER_ITL_INITRANS_DEFAULT * (sizeof(ClusterItlSlotData) + sizeof(uint32)) : 0);
 	if (!cluster_recovery_cold_page_reference_reserve(&bytes, Max(reference_count, 1), sizeof(*entries), &entry_offset)
 		|| !cluster_recovery_cold_page_reference_reserve(&bytes, owner_count, sizeof(*owners), &owner_offset)
 		|| !cluster_recovery_cold_page_reference_reserve(&bytes, source_count, sizeof(*sources), &source_offset)
@@ -3723,8 +3851,12 @@ cluster_recovery_cold_page_owner_graph(const struct ClusterRecoveryStartV1 *star
 		|| !cluster_recovery_cold_page_reference_reserve(&bytes, reference_count, stride, &data_offset)
 		|| !cluster_recovery_cold_page_reference_reserve(&bytes, terminal_count, sizeof(*terminals), &terminal_offset)
 		|| (projected && (!cluster_recovery_cold_page_reference_reserve(&bytes, 2 * reference_count, sizeof(*nodes), &graph_node_offset)
-			|| !cluster_recovery_cold_page_reference_reserve(&bytes, reference_count, sizeof(*edges), &graph_edge_offset)
-			|| !cluster_recovery_cold_page_reference_reserve(&bytes, reference_count, sizeof(*roots), &graph_root_offset)))
+			|| !cluster_recovery_cold_page_reference_reserve(&bytes, 2 * reference_count, sizeof(*edges), &graph_edge_offset)
+			|| !cluster_recovery_cold_page_reference_reserve(&bytes, 2 * reference_count, sizeof(*roots), &graph_root_offset)
+			|| !cluster_recovery_cold_page_reference_reserve(&bytes, reference_count, sizeof(*reference_nodes), &reference_node_offset)
+			|| !cluster_recovery_cold_page_reference_reserve(&bytes, reference_count, sizeof(*tuple_offsets), &tuple_offsets_offset)
+			|| !cluster_recovery_cold_page_reference_reserve(&bytes, tuple_length, 1, &tuple_bytes_offset)
+			|| !cluster_recovery_cold_page_reference_reserve(&bytes, 2 * reference_count, reference_capacity, &tuple_key_offset)))
 		|| memory_budget < bytes || memory_budget - bytes < scratch) return out;
 	Assert(entry_offset == 0);
 	PG_TRY();
@@ -3741,6 +3873,20 @@ cluster_recovery_cold_page_owner_graph(const struct ClusterRecoveryStartV1 *star
 			terminals = (ClusterColdTtSlotInputV1 *)((char *)entries + terminal_offset);
 			memcpy(sources, start->ctrc_page_sources, (Size)source_count * sizeof(*sources));
 			memcpy(fixed_references, references->entries, (Size)reference_count * sizeof(*fixed_references));
+			tuple_offsets = (Size *)((char *)entries + tuple_offsets_offset);
+			tuple_bytes = (char *)entries + tuple_bytes_offset;
+			if (projected) {
+				Size position = 0;
+				for (uint32 i = 0; i < reference_count; i++) {
+					const ClusterRecoveryHeapEntry *entry = &fixed_references[i].entry;
+					tuple_offsets[i] = position;
+					if (entry->kind == CLUSTER_RECOVERY_HEAP_ITEM && entry->tuple_length != 0) {
+						memcpy(tuple_bytes + position, entry->tuple_bytes, entry->tuple_length);
+						position += entry->tuple_length;
+					}
+				}
+				Assert(position == tuple_length);
+			}
 			for (uint32 i = 0; valid && i < source_count; i++)
 				valid = cluster_recovery_census_wal_source_at_v1(start->ctrc_observation_census, i, &observed[i])
 					&& observed[i].source_index == i;
@@ -3787,7 +3933,9 @@ cluster_recovery_cold_page_owner_graph(const struct ClusterRecoveryStartV1 *star
 					valid = related.count == reference_count && related.references == references
 						&& related.owners.count == owner_count
 						&& cluster_recovery_cold_page_owner_scopes_current(start, work, scope, owners, owner_count,
-							sources, observed, source_count, wal_count, references, fixed_references, reference_count);
+							sources, observed, source_count, wal_count, references, fixed_references, reference_count)
+						&& (!projected || cluster_recovery_cold_page_tuple_bytes_current(references,
+							fixed_references, reference_count, tuple_offsets, tuple_bytes));
 				}
 				for (uint32 i = 0; valid && i < reference_count; i++) {
 					RfPageCtrcOwnerGraphEntryV1 *entry = &entries[i];
@@ -3825,13 +3973,16 @@ cluster_recovery_cold_page_owner_graph(const struct ClusterRecoveryStartV1 *star
 						terminals, terminal_count)) {
 						cluster_recovery_cold_page_reference_key(&fixed_references[i], proof, projected,
 							key + stride - reference_capacity, entry);
-						if (projected && entry->reference_key != NULL) entry->reference_edge_kind = 4;
+						if (projected && entry->reference_key != NULL) {
+							entry->reference_edge_kind = 4; entry->reference_field_count = 1;
+						}
 					}
 				}
 				if (valid && projected) {
 					nodes = (ClusterRecoveryCTRCGraphNodeV2 *)((char *)entries + graph_node_offset);
 					edges = (ClusterRecoveryCTRCGraphEdgeV2 *)((char *)entries + graph_edge_offset);
 					roots = (size_t *)((char *)entries + graph_root_offset);
+					reference_nodes = (size_t *)((char *)entries + reference_node_offset);
 					for (uint32 i = 0; valid && i < reference_count; i++) {
 						const RfPageCtrcOwnerGraphEntryV1 *entry = &entries[i];
 						size_t n = contribution.node_count, r;
@@ -3856,7 +4007,42 @@ cluster_recovery_cold_page_owner_graph(const struct ClusterRecoveryStartV1 *star
 								&& memcmp(key->data, entry->reference_key, key->length) == 0) break;
 						}
 						if (r == contribution.root_count) roots[contribution.root_count++] = n;
+						reference_nodes[i] = n;
 						contribution.node_count += 2;
+					}
+					for (uint32 i = 0; valid && i < reference_count; i++) {
+						uint32 fields[2]; Size offsets[2]; uint16 count;
+						const ClusterRecoveryCensusReferenceV1 *reference = &fixed_references[i];
+						if (reference->entry.kind != CLUSTER_RECOVERY_HEAP_ITEM) continue;
+						count = cluster_recovery_cold_page_tuple_fields(fixed_references, reference_count, i,
+							tuple_bytes + tuple_offsets[i], entries, &related, terminals, terminal_count, fields, offsets);
+						if (count == 0) continue;
+						valid = contribution.node_count <= (Size)2 * reference_count - count
+							&& contribution.edge_count <= (Size)2 * reference_count - count
+							&& contribution.root_count <= (Size)2 * reference_count - count;
+						for (uint16 f = 0; valid && f < count; f++) {
+							const RfPageCtrcOwnerGraphEntryV1 *itl = &entries[fields[f]];
+							uint8 *key = (uint8 *)entries + tuple_key_offset + ((Size)2 * i + f) * reference_capacity;
+							Size length = itl->reference_key_length; size_t n = contribution.node_count, r;
+							/* Reuse the original full-T and actual DATA-id envelope;
+							 * replace only the precise tuple field offset/ordinal. */
+							memcpy(key, itl->reference_key, length);
+							cluster_undo_tt_ctrc_put_u64_le(key + length - 16, offsets[f]);
+							cluster_undo_tt_ctrc_put_u64_le(key + length - 8, reference->entry.index);
+							nodes[n] = (ClusterRecoveryCTRCGraphNodeV2){1, {key, length},
+								{itl->reference_evidence, itl->reference_evidence_length}};
+							edges[contribution.edge_count++] = (ClusterRecoveryCTRCGraphEdgeV2){2, n, reference_nodes[fields[f]]};
+							for (r = 0; r < contribution.root_count; r++) {
+								const ClusterRecoveryCTRCGraphBytesV2 *prior = &nodes[roots[r]].key;
+								if (prior->length == length && memcmp(prior->data, key, length) == 0) break;
+							}
+							if (r == contribution.root_count) roots[contribution.root_count++] = n;
+							contribution.node_count++;
+						}
+						if (valid) {
+							entries[i].reference_edge_kind = 2; entries[i].reference_field_count = count;
+							unresolved_count--;
+						}
 					}
 					if (contribution.node_count != 0) {
 						contribution.nodes = nodes; contribution.edges = edges; contribution.roots = roots;
@@ -3867,7 +4053,9 @@ cluster_recovery_cold_page_owner_graph(const struct ClusterRecoveryStartV1 *star
 						&& cluster_recovery_cold_page_projection_subjects(start, work, scope, start->ctrc_page_progress,
 							terminals, &accepted, false);
 				ready = valid && cluster_recovery_cold_page_owner_scopes_current(start, work, scope, owners, owner_count,
-					sources, observed, source_count, wal_count, references, fixed_references, reference_count);
+					sources, observed, source_count, wal_count, references, fixed_references, reference_count)
+					&& (!projected || cluster_recovery_cold_page_tuple_bytes_current(references,
+						fixed_references, reference_count, tuple_offsets, tuple_bytes));
 			}
 		}
 	}

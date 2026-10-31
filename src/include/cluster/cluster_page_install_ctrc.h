@@ -406,9 +406,12 @@ typedef struct RfPageCtrcOwnerGraphEntryV1 {
 	 * NULL/zero retains an unresolved field, never a zero-reference proof. */
 	Size reference_key_length, reference_evidence_length;
 	const uint8 *reference_key, *reference_evidence;
-	/* Zero in the observation API. The explicit projected graph may supply
-	 * kind4 (discharged_by) for this current ITL only, never its history. */
+	/* Zero in the observation API. Projected mode: kind4 for one proven
+	 * current ITL, kind2 for every tuple field referencing its original ITL.
+	 * Tuple keys/evidence live in contribution, not the singular fields above.
+	 * Count zero preserves the WHOLE unresolved original census entry. */
 	uint16 reference_edge_kind;
+	uint16 reference_field_count;
 } RfPageCtrcOwnerGraphEntryV1;
 
 /* Complete reference order, with canonical PAGE owner contributions only for
@@ -417,12 +420,15 @@ typedef struct RfPageCtrcOwnerGraphEntryV1 {
  * full T from the twice-checked original forest member and the SAME owner's
  * complete after-image witness. Evidence borrows related.owners.entries;
  * keys belong to entries. Keep both original result allocations alive.
- * Changed/moved/invalid fields and historical/FREE/tuple references retain
- * NULL reference fields, including when a PAGE owner key is available.
+ * Changed/moved/invalid fields and historical/FREE references retain NULL
+ * reference fields, including when a PAGE owner key is available.
  * The observation API creates no discharged_by edge. The explicit projected
  * API additionally executes the original terminal projection and marks kind4
- * for that current ITL only; all other entries remain unresolved. Neither API
- * supplies a complete graph, history/first/pin retirement or D0 verdict. */
+ * for that current ITL. Current tuple xmin/xmax/plain-lock fields require ALL
+ * same-page/version ITLs with original full T and a byte-exact native whole
+ * projection. Every field is selected together or the WHOLE tuple remains
+ * unresolved. MX/HOT/history/no-storage references remain unresolved. Neither
+ * API supplies a complete graph, history/first/pin retirement or D0 verdict. */
 typedef struct RfPageCtrcOwnerGraphV1 {
 	RfPageProofDetailV1 detail;
 	RfPageCtrcOwnerReferencesV1 related;

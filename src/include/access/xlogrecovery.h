@@ -329,11 +329,16 @@ extern struct RfPageCtrcOwnerReferencesV1 ClusterColdRecoveryCtrcPageOwnerRefere
 struct RfPageCtrcOwnerGraphV1;
 extern struct RfPageCtrcOwnerGraphV1 ClusterColdRecoveryCtrcPageOwnerGraph(
 	const struct ClusterRecoveryStartV1 *start, Size memory_budget);
-/* Explicit current-ITL projection contribution. Revalidate the entire original
+/* Explicit current-field projection contribution. Revalidate the entire original
  * canonical terminal vector before/after the same actual PAGE owners, then
  * use the original pure ITL projector to check the same field's final bytes.
  * Only exact DATA/plain-lock terminal projections supply kind4 to that PAGE
- * owner. Historical/FREE/tuple/MX/unmatched references remain unresolved.
+ * owner. Current tuple xmin/xmax/plain-lock fields use the complete same-page
+ * original ITL set's full identities, exact item/payload snapshot and original
+ * whole native projector; kind2 references those proven ITLs. All fields of a
+ * tuple contribute together. Historical/FREE/MX/HOT/unmatched references remain
+ * unresolved. Complete tuple bytes and all output arrays are budgeted before
+ * the first PAGE and rechecked with original source/terminal identity at return.
  * Return canonical nodes/edges and unique current-reference roots in the
  * contribution, alongside the complete original entry order and unresolved
  * count. Its arrays share entries' lifetime; no caller subset is accepted.

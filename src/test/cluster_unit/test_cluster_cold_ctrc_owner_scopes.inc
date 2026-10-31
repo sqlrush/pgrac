@@ -10,6 +10,7 @@ typedef struct RfPageCtrcOwnerGraphEntryV1 {
 	Size reference_key_length, reference_evidence_length;
 	const uint8 *reference_key, *reference_evidence;
 	uint16 reference_edge_kind;
+	uint16 reference_field_count;
 } RfPageCtrcOwnerGraphEntryV1;
 typedef struct RfPageCtrcOwnerGraphV1 {
 	RfPageProofDetailV1 detail;
