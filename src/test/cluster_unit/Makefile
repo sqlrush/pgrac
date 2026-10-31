@@ -14564,6 +14564,7 @@ $(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) test_cluster_cold_recovery_io_core.o: \
 # Original Startup declaration, sealed SIDE and dual-copy storage in one component.
 test_cluster_cold_recovery_startup: test_cluster_cold_startup_relmap_early_retention.inc
 test_cluster_cold_recovery_startup: test_cluster_cold_startup_relmap_handoff.inc
+test_cluster_cold_recovery_startup: test_cluster_cold_startup_relmap_recheck.inc
 test_cluster_cold_tx_start: test_cluster_cold_tx_relmap_handoff.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_cold_recovery_relmap.c \
 		$(top_srcdir)/src/include/cluster/cluster_cold_relmap.h \
@@ -14589,6 +14590,7 @@ test_cluster_cold_startup_relmap_authority.o: test_cluster_cold_startup_relmap_a
 
 test_cluster_cold_startup_relmap_executor.o: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_relmap.c \
 		test_cluster_cold_native_side_namespace.h test_cluster_cold_startup_relmap_storage_namespace.h \
+		$(top_srcdir)/src/include/access/xlogrecovery.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_relmap.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_plan_internal.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_lock.h \
@@ -14601,6 +14603,10 @@ test_cluster_cold_startup_relmap_executor.o: $(top_srcdir)/src/backend/cluster/c
 		-DLWLockHeldByMe=startup_relmap_storage_LWLockHeldByMe \
 		-DenableFsync=startup_relmap_storage_enableFsync \
 		-Dcluster_relmap_authority_x_held=startup_relmap_storage_cluster_relmap_authority_x_held \
+		-DForEachLWLockHeldByMe=test_cold_relmap_storage_each_lock \
+		-DClusterColdRecoveryRelmapCurrent=test_cold_relmap_start_current \
+		-DClusterColdRecoveryTxInputs=test_cold_relmap_start_inputs \
+		-DClusterColdRecoveryRelmapFail=test_cold_relmap_start_fail \
 		-ffunction-sections -fdata-sections -c $< -o $@
 
 .PHONY: clean-startup-relmap-replay

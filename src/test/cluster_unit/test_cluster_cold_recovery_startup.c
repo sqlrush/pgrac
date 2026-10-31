@@ -3979,6 +3979,7 @@ UT_TEST(test_full_clog_truncate_dispatch_uses_original_projection_identity)
 #include "test_cluster_cold_startup_relmap_pin_custody.inc"
 #include "test_cluster_cold_startup_relmap_early_retention.inc"
 #include "test_cluster_cold_startup_relmap_handoff.inc"
+#include "test_cluster_cold_startup_relmap_recheck.inc"
 
 int
 main(void)
@@ -4058,7 +4059,19 @@ main(void)
 		UT_RUN(test_relmap_saved_receipt_refuses_partial_failed_or_other_source_batch);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(186);
+	if (getenv("PGRAC_PRE2_TEST_STARTUP_RELMAP_RECHECK") != NULL) {
+		UT_PLAN(8);
+		UT_RUN(test_relmap_start_recheck_reads_staged_pair_after_replay_window);
+		UT_RUN(test_relmap_start_recheck_preflights_original_receipt_and_side_before_io);
+		UT_RUN(test_relmap_start_recheck_original_pin_drift_refuses_before_io);
+		UT_RUN(test_relmap_start_recheck_requires_both_complete_physical_copies);
+		UT_RUN(test_relmap_start_recheck_late_input_owner_or_pin_change_stays_failed);
+		UT_RUN(test_relmap_start_recheck_first_owner_pin_and_read_error_revoke);
+		UT_RUN(test_relmap_start_recheck_caller_preconditions_do_not_consume_receipts);
+		UT_RUN(test_relmap_start_recheck_whole_scratch_budget_refuses_before_io);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	UT_PLAN(194);
 	UT_RUN(test_full_clog_truncate_dispatch_uses_original_projection_identity);
 	UT_RUN(test_full_clog_dispatch_uses_only_original_projection_identity);
 	UT_RUN(test_execution_refusal_preserves_the_first_census_failure);
@@ -4246,6 +4259,14 @@ main(void)
 	UT_RUN(test_relmap_early_pin_hold_survives_startup_replay_and_destruction);
 	UT_RUN(test_relmap_saved_receipt_carries_actual_replay_without_new_io);
 	UT_RUN(test_relmap_saved_receipt_refuses_partial_failed_or_other_source_batch);
+	UT_RUN(test_relmap_start_recheck_reads_staged_pair_after_replay_window);
+	UT_RUN(test_relmap_start_recheck_preflights_original_receipt_and_side_before_io);
+	UT_RUN(test_relmap_start_recheck_original_pin_drift_refuses_before_io);
+	UT_RUN(test_relmap_start_recheck_requires_both_complete_physical_copies);
+	UT_RUN(test_relmap_start_recheck_late_input_owner_or_pin_change_stays_failed);
+	UT_RUN(test_relmap_start_recheck_first_owner_pin_and_read_error_revoke);
+	UT_RUN(test_relmap_start_recheck_caller_preconditions_do_not_consume_receipts);
+	UT_RUN(test_relmap_start_recheck_whole_scratch_budget_refuses_before_io);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

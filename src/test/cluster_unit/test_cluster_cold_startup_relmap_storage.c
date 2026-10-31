@@ -228,3 +228,25 @@ test_cold_relmap_storage_matches(const ClusterColdRelmapInputV1 *input, bool pen
 		&& memcmp(&view.committed, &input->staged.committed, sizeof(RelMapFile)) == 0
 		&& (!pending || memcmp(&view.pending, &input->staged.pending, sizeof(RelMapFile)) == 0);
 }
+
+void
+test_cold_relmap_storage_damage_copy(unsigned copy)
+{
+	unsigned char bytes[2176];
+	if (copy > 1) abort();
+	read_copy(copy, bytes);
+	write_copy(copy, bytes, 100);
+}
+
+void
+test_cold_relmap_storage_each_lock(void (*callback)(LWLock *, LWLockMode, void *), void *arg)
+{
+	if (retention_held) callback(held_retention_lock, LW_EXCLUSIVE, arg);
+	if (mapping_held) callback(RelationMappingLock, LW_EXCLUSIVE, arg);
+}
+
+void
+test_cold_relmap_storage_unlock(LWLock *lock)
+{
+	LWLockRelease(lock);
+}

@@ -14,6 +14,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 #include "access/xlogreader.h"
+#include "access/xlogrecovery.h"
 #include "cluster/cluster_cold_recovery_plan_internal.h"
 #include "cluster/cluster_relmap_authority.h"
 #include "cluster/cluster_relmap_retention.h"
@@ -448,5 +449,137 @@ cluster_cold_typed_relmap_replay_input_v1(const ClusterColdTypedV1 *typed, uint3
 	value.index = index;
 	memcpy(&value.input, &typed->plan->relmap_inputs[index].input, sizeof(value.input));
 	return value;
+}
+
+typedef struct RelmapReplayCheck {
+	const struct ClusterRecoveryStartV1 *start;
+	const ClusterColdTypedV1 *typed;
+	ClusterColdPlanV1 *plan;
+	const ColdRelmapInput *original, *saved;
+	uint32 count, replay_count, participant_count;
+	uint64 system_identifier;
+} RelmapReplayCheck;
+
+static void
+relmap_recheck_held_lock(LWLock *lock, LWLockMode mode, void *arg)
+{
+	(void)lock;
+	(void)mode;
+	*(bool *)arg = true;
+}
+
+static bool
+relmap_recheck_current(const RelmapReplayCheck *check)
+{
+	const ClusterColdTypedV1 *typed = check->typed;
+	const ClusterColdPlanV1 *plan = check->plan;
+
+	/* Revalidate the opaque owner before dereferencing its borrowed inputs.
+	 * The saved array also detects a provider changing a receipt already read. */
+	if (!ClusterColdRecoveryRelmapCurrent(check->start)
+		|| ClusterColdRecoveryTxInputs(check->start) != typed
+		|| typed->refusal != CLUSTER_COLD_OK || typed->plan != plan || !plan_valid(plan)
+		|| plan->phase != COLD_PHASE_SEALED || !plan->relmap_failed
+		|| plan->relmap_inputs != check->original || plan->relmap_count != check->count
+		|| typed->replay_count != check->replay_count
+		|| typed->participant_count != check->participant_count
+		|| plan->participant_count != check->participant_count
+		|| typed->system_identifier != check->system_identifier
+		|| memcmp(check->original, check->saved, (Size)check->count * sizeof(*check->saved)) != 0)
+		return false;
+	for (uint32 i = 0; i < check->count; ++i) {
+		const ClusterColdRelmapInputV1 *input = &check->saved[i].input;
+		uint32 p = input->participant;
+		if (p >= check->replay_count || !cold_relmap_cut_equal(&input->cut, &typed->participants[p])
+			|| memcmp(&input->source, &typed->sources[p], sizeof(input->source)) != 0)
+			return false;
+	}
+	return true;
+}
+
+bool
+cluster_cold_relmap_replay_recheck_v1(const struct ClusterRecoveryStartV1 *start)
+{
+	RelmapReplayCheck check = {0};
+	ColdRelmapInput *volatile saved = NULL;
+	ClusterColdPlanV1 *volatile cleanup_plan = NULL;
+	volatile Size bytes = 0;
+	volatile bool ok = false;
+	bool held = false;
+
+	if (start == NULL || MyBackendType != B_STARTUP || CritSectionCount != 0)
+		return false;
+	ForEachLWLockHeldByMe(relmap_recheck_held_lock, &held);
+	if (held)
+		return false;
+	PG_TRY();
+	{
+		do {
+			if (!ClusterColdRecoveryRelmapCurrent(start))
+				break;
+			check.start = start;
+			check.typed = ClusterColdRecoveryTxInputs(start);
+			check.count = cluster_cold_typed_relmap_replay_count_v1(check.typed);
+			if (check.typed == NULL || !plan_valid(check.typed->plan))
+				break;
+			check.plan = cleanup_plan = check.typed->plan;
+			/* The first Start provider is inside TRY too. Once original inputs
+			 * are located, all incomplete batches and provider/I/O failures are
+			 * sticky before any further external call or allocation. */
+			check.plan->relmap_failed = true;
+			if (check.count == 0 || check.count == UINT32_MAX)
+				break;
+			check.original = check.plan->relmap_inputs;
+			check.replay_count = check.typed->replay_count;
+			check.participant_count = check.typed->participant_count;
+			check.system_identifier = check.typed->system_identifier;
+			saved = cold_plan_scratch(check.plan, (Size)check.count * sizeof(*saved), NULL);
+			if (saved == NULL)
+				break;
+			bytes = (Size)check.count * sizeof(*saved);
+			memcpy(saved, check.original, bytes);
+			check.saved = saved;
+			ok = enableFsync && cluster_relmap_authority_x_held() && relmap_recheck_current(&check);
+			/* Complete the original batch preflight before opening any file. */
+			for (uint32 i = 0; i < check.count && ok; ++i) {
+				const ColdRelmapInput *entry = &check.saved[i];
+				ok = cold_relmap_inputs_valid(check.plan, &entry->input, 1) == CLUSTER_COLD_OK
+					&& relmap_side_matches(check.typed, &entry->input, NULL)
+					&& relmap_entry_pin(entry, true);
+			}
+			for (uint32 i = 0; i < check.count && ok; ++i) {
+				const ColdRelmapInput *entry = &check.saved[i];
+				ok = relmap_recheck_current(&check) && relmap_entry_pin(entry, true)
+					&& cluster_relmap_authority_v2_check_staged(&entry->input.staged)
+					&& relmap_recheck_current(&check) && relmap_entry_pin(entry, true)
+					&& relmap_side_matches(check.typed, &entry->input, NULL);
+			}
+			/* A later file/provider may invalidate an earlier pin. Recheck the
+			 * entire original batch and owner before publishing this observation. */
+			for (uint32 i = 0; i < check.count && ok; ++i)
+				ok = relmap_entry_pin(&check.saved[i], true)
+					&& relmap_side_matches(check.typed, &check.saved[i].input, NULL);
+			ok = ok && relmap_recheck_current(&check);
+		} while (false);
+	}
+	PG_CATCH();
+	{
+		ClusterColdRecoveryRelmapFail(start);
+		if (saved != NULL) {
+			cold_free(saved);
+			cold_plan_release(cleanup_plan, bytes);
+		}
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (saved != NULL) {
+		cold_free(saved);
+		cold_plan_release(cleanup_plan, bytes);
+	}
+	if (ok)
+		check.plan->relmap_failed = false;
+	else
+		ClusterColdRecoveryRelmapFail(start);
+	return ok;
 }
 #endif

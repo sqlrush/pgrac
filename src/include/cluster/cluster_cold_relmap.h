@@ -19,6 +19,7 @@
 #define CLUSTER_COLD_RELMAP_MAX_INPUTS 64
 struct ClusterRelmapRetentionDirectory;
 struct LWLock;
+struct ClusterRecoveryStartV1;
 
 /* Original pending custody, not a way to infer FullXid/era from raw WAL.
  * The original owner supplies its exact retained pin and image. Declaration
@@ -65,6 +66,17 @@ typedef struct ClusterColdRelmapReplayReceiptV1 {
 extern uint32 cluster_cold_typed_relmap_replay_count_v1(const ClusterColdTypedV1 *typed);
 extern ClusterColdRelmapReplayReceiptV1 cluster_cold_typed_relmap_replay_input_v1(
 	const ClusterColdTypedV1 *typed, uint32 index);
+
+/* Recheck the complete saved staging batch under the same declared Start,
+ * after pass-2's window has ended. Requires Startup, no critical section or
+ * caller-held LWLocks and the original namespace X. Whole-batch saved values,
+ * SIDE and original pins precede file I/O; both complete physical copies and
+ * the same inputs/pins/Start are checked before returning. Scratch uses the
+ * original plan budget. Entered refusal/ERROR revokes the original episode
+ * and keeps its plan, FD, pins and debt; no retry, rewrite or cleanup follows.
+ * Success is a current staging observation only, not terminal/era/lifetime
+ * qualification, a reusable certificate, COMPLETE or a release permission. */
+extern bool cluster_cold_relmap_replay_recheck_v1(const struct ClusterRecoveryStartV1 *start);
 
 /* Explicit original-source adapter before pass-1. Whole-batch validation of
  * exact unstaged pins precedes any mutation. Recheck and arm every original
