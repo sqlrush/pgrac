@@ -3380,6 +3380,22 @@ clean: clean-insert-vm-wal-chain
 clean-insert-vm-wal-chain:
 	rm -f test_cluster_heap_insert_capture.inc test_cluster_heap_insert_capture.inc.tmp
 
+# Direct repair must not bypass shared heap/VM publication obligations.
+TESTS += test_cluster_heap_surgery_admission test_cluster_heap_surgery_admission_noassert
+all: test_cluster_heap_surgery_admission test_cluster_heap_surgery_admission_noassert
+
+test_cluster_heap_surgery_entry.inc: extract_surgery_fixture.py extract_vacuum_mx_fixture.py $(top_srcdir)/contrib/pg_surgery/heap_surgery.c
+	python3 $(srcdir)/extract_surgery_fixture.py $(top_srcdir)/contrib/pg_surgery/heap_surgery.c > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_surgery_admission test_cluster_heap_surgery_admission_noassert: test_cluster_heap_surgery_admission.c unit_test.h test_cluster_heap_surgery_entry.inc test_cluster_heap_maintenance_policy.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(if $(filter %_noassert,$@),-DFIXTURE_NO_ASSERTS) $< $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+clean: clean-surgery-admission
+.PHONY: clean-surgery-admission
+clean-surgery-admission:
+	rm -f test_cluster_heap_surgery_entry.inc test_cluster_heap_surgery_entry.inc.tmp
+
 # PGRAC: the real INSERT mutation/WAL block and native tuple/page insertion.
 # Bind the complete native batch loop, including original selection/accounting.
 test_cluster_heap_multi_loop.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
