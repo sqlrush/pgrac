@@ -2365,7 +2365,8 @@ cluster_runtime_visibility_origin_plan_freeze_operation_internal(
 	const BufferTag *tag, ClusterTxResolveMode mode, const ClusterSemanticAdmissionToken *admission,
 	const ClusterUndoBlock0Generation *expected_generation, ClusterUndoBlock0CurrentGuard *guard,
 	const ClusterUndoBlock0ResolvedRoot *root, ClusterRuntimeVisibilityOriginPlan *plan,
-	ClusterTxResolveReason *reason_out, bool allow_readthrough)
+	ClusterTxResolveReason *reason_out, bool allow_readthrough,
+	const ClusterSavepointOperationKey *mx_key)
 {
 	ClusterRuntimeVisibilityOriginPlanData *data;
 	ClusterUndoBlock0Generation generation = { 0 };
@@ -2378,7 +2379,9 @@ cluster_runtime_visibility_origin_plan_freeze_operation_internal(
 
 	if (plan != NULL)
 		memset(plan, 0, sizeof(*plan));
-	if (locator == NULL || (expected == NULL && (head == NULL || tag == NULL)) || admission == NULL
+	if (locator == NULL || (mx_key == NULL && expected == NULL && (head == NULL || tag == NULL))
+		|| admission == NULL
+		|| (mx_key != NULL && (expected != NULL || retained != NULL || head != NULL || tag != NULL))
 		|| (expected != NULL && retained != NULL) || guard == NULL || root == NULL || plan == NULL
 		|| (mode != CLUSTER_TX_RESOLVE_VISIBILITY && mode != CLUSTER_TX_RESOLVE_TERMINAL_CENSUS)) {
 		reason = CLUSTER_TX_RESOLVE_PROTOCOL;
@@ -2400,7 +2403,10 @@ cluster_runtime_visibility_origin_plan_freeze_operation_internal(
 		|| !cluster_runtime_visibility_origin_data_copy(segment, data->data_logical.owner_instance,
 														block, page.data, allow_readthrough))
 		goto failed;
-	if (retained != NULL)
+	if (mx_key != NULL)
+		discovered
+			= cluster_savepoint_reader_discover_mx_operation(mx_key, page.data, &data->operation);
+	else if (retained != NULL)
 		discovered = cluster_savepoint_reader_discover_retained_head(retained, head, tag, locator,
 																	 page.data, &data->operation);
 	else if (expected != NULL)
@@ -2453,7 +2459,7 @@ cluster_runtime_visibility_origin_plan_freeze_operation_held(
 {
 	return cluster_runtime_visibility_origin_plan_freeze_operation_internal(
 		locator, expected, NULL, NULL, NULL, mode, admission, expected_generation, guard, root,
-		plan, reason_out, false);
+		plan, reason_out, false, NULL);
 }
 
 ClusterRuntimeVisibilityOriginStep
@@ -2466,7 +2472,7 @@ cluster_runtime_visibility_origin_plan_discover_operation_head_held(
 {
 	return cluster_runtime_visibility_origin_plan_freeze_operation_internal(
 		locator, NULL, NULL, head, tag, mode, admission, expected_generation, guard, root, plan,
-		reason_out, false);
+		reason_out, false, NULL);
 }
 
 ClusterRuntimeVisibilityOriginStep
@@ -2484,7 +2490,7 @@ cluster_runtime_visibility_origin_plan_discover_peer_held(
 	}
 	return cluster_runtime_visibility_origin_plan_freeze_operation_internal(
 		locator, NULL, request->retained ? &request->identity : NULL, &request->head, &request->tag,
-		mode, admission, expected_generation, guard, root, plan, reason_out, false);
+		mode, admission, expected_generation, guard, root, plan, reason_out, false, NULL);
 }
 
 bool
@@ -3007,9 +3013,11 @@ typedef struct ClusterOperationOriginRead {
 	bool has_expected;
 	bool has_head;
 	bool has_retained;
+	bool has_mx_key;
 	bool allow_readthrough;
 	bool wait_pending;
 	ClusterTxLocator locator;
+	ClusterSavepointOperationKey mx_key;
 	ClusterSavepointOperation expected;
 	ClusterItlSlotData head;
 	BufferTag tag;
@@ -3064,14 +3072,16 @@ cluster_runtime_visibility_operation_read_begin_internal(
 	const ClusterSavepointOperation *expected, const ClusterSavepointReaderIdentity *retained,
 	const ClusterItlSlotData *head, const BufferTag *tag, ClusterTxResolveMode mode,
 	const ClusterSemanticAdmissionToken *admission, ClusterTxResolveReason *reason_out,
-	bool allow_readthrough)
+	bool allow_readthrough, const ClusterSavepointOperationKey *mx_key)
 {
 	ClusterOperationOriginRead *read = cluster_runtime_visibility_operation_read_data(state);
 	uint32 segment, block;
 	uint16 slot, row;
 	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
 
-	if (state == NULL || locator == NULL || (expected == NULL && (head == NULL || tag == NULL))
+	if (state == NULL || locator == NULL
+		|| (mx_key == NULL && expected == NULL && (head == NULL || tag == NULL))
+		|| (mx_key != NULL && (expected != NULL || retained != NULL || head != NULL || tag != NULL))
 		|| admission == NULL || read->magic != 0 || (expected != NULL && retained != NULL)
 		|| (mode != CLUSTER_TX_RESOLVE_VISIBILITY && mode != CLUSTER_TX_RESOLVE_TERMINAL_CENSUS))
 		goto failed;
@@ -3084,6 +3094,9 @@ cluster_runtime_visibility_operation_read_begin_internal(
 	memset(state, 0, sizeof(*state));
 	read->magic = CLUSTER_OPERATION_ORIGIN_READ_MAGIC;
 	read->locator = *locator;
+	read->has_mx_key = mx_key != NULL;
+	if (mx_key != NULL)
+		read->mx_key = *mx_key;
 	read->has_expected = expected != NULL;
 	read->has_retained = retained != NULL;
 	if (retained != NULL)
@@ -3120,7 +3133,18 @@ cluster_runtime_visibility_operation_origin_read_begin(
 	ClusterTxResolveReason *reason_out)
 {
 	return cluster_runtime_visibility_operation_read_begin_internal(
-		read, locator, expected, NULL, head, tag, mode, admission, reason_out, false);
+		read, locator, expected, NULL, head, tag, mode, admission, reason_out, false, NULL);
+}
+
+bool
+cluster_runtime_visibility_mx_operation_origin_read_begin(
+	ClusterRuntimeVisibilityOperationRead *state, const ClusterSavepointOperationKey *key,
+	ClusterTxResolveMode mode, const ClusterSemanticAdmissionToken *admission,
+	ClusterTxResolveReason *reason_out)
+{
+	return cluster_runtime_visibility_operation_read_begin_internal(
+		state, key != NULL ? &key->locator : NULL, NULL, NULL, NULL, NULL, mode, admission,
+		reason_out, false, key);
 }
 
 /* Retained canonical compare inputs, without a fabricated backend binding. */
@@ -3137,7 +3161,7 @@ cluster_runtime_visibility_operation_origin_read_begin_retained(
 		return false;
 	}
 	return cluster_runtime_visibility_operation_read_begin_internal(
-		read, locator, NULL, owner, head, tag, mode, admission, reason_out, false);
+		read, locator, NULL, owner, head, tag, mode, admission, reason_out, false, NULL);
 }
 
 /* These are the original held-only operations. No guard or DATA pin spans
@@ -3154,7 +3178,8 @@ cluster_runtime_visibility_operation_origin_observe(ClusterOperationOriginRead *
 				  &read->locator, read->has_expected ? &read->expected : NULL,
 				  read->has_retained ? &read->identity : NULL, read->has_head ? &read->head : NULL,
 				  read->has_head ? &read->tag : NULL, read->mode, &read->admission, NULL,
-				  &read->guard, &read->root, &read->plan, &read->reason, read->allow_readthrough)
+				  &read->guard, &read->root, &read->plan, &read->reason, read->allow_readthrough,
+				  read->has_mx_key ? &read->mx_key : NULL)
 				  == CLUSTER_RUNTIME_VISIBILITY_ORIGIN_NEEDS_CANONICAL
 			  && cluster_runtime_visibility_origin_plan_canonical_logical(&read->plan,
 																		  &read->tt_logical);
@@ -3162,9 +3187,24 @@ cluster_runtime_visibility_operation_origin_observe(ClusterOperationOriginRead *
 			read->identity = cluster_runtime_visibility_origin_plan_data(&read->plan)->operation;
 		return frozen;
 	}
-	if (read->phase == 1)
-		return cluster_runtime_visibility_origin_plan_sample_canonical_held(
-			&read->plan, read->mode, &read->admission, &read->guard, &read->root, &read->reason);
+	if (read->phase == 1) {
+		const ClusterRuntimeVisibilityOriginPlanData *data;
+		if (!cluster_runtime_visibility_origin_plan_sample_canonical_held(
+				&read->plan, read->mode, &read->admission, &read->guard, &read->root,
+				&read->reason))
+			return false;
+		data = cluster_runtime_visibility_origin_plan_data(&read->plan);
+		/* The first DATA tail is only a challenge. Original TT provenance,
+		 * never that tail/raw xid, must independently bind the high epoch. */
+		if (read->has_mx_key
+			&& (!FullTransactionIdIsNormal(data->candidate.local_original_full_xid)
+				|| !FullTransactionIdEquals(data->candidate.local_original_full_xid,
+											read->mx_key.top_fxid))) {
+			read->reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+			return false;
+		}
+		return true;
+	}
 	return cluster_runtime_visibility_origin_plan_copy_operation_internal(
 			   &read->plan, read->mode, &read->admission, &read->guard, &read->root, &read->top,
 			   &read->operation, read->page.data, &read->reason, read->allow_readthrough)
@@ -3315,6 +3355,50 @@ failed:
 	return CLUSTER_RUNTIME_VISIBILITY_OPERATION_FAILED;
 }
 
+ClusterRuntimeVisibilityOperationStep
+cluster_runtime_visibility_mx_operation_origin_read_poll(
+	ClusterRuntimeVisibilityOperationRead *state, ClusterSavepointEffectProof *effect_out,
+	ClusterTxResolveReason *reason_out)
+{
+	ClusterOperationOriginRead *read = cluster_runtime_visibility_operation_read_data(state);
+	ClusterSavepointOperationKey key;
+	ClusterSemanticAdmissionToken admission;
+	ClusterTxResolveMode mode;
+	ClusterSavepointReaderIdentity identity;
+	ClusterTxResolution top;
+	ClusterSavepointReaderRecord operation;
+	ClusterSavepointEffectProof effect;
+	ClusterRuntimeVisibilityOperationStep step;
+	PGAlignedBlock page;
+
+	if (effect_out != NULL)
+		memset(effect_out, 0, sizeof(*effect_out));
+	if (read == NULL || read->magic != CLUSTER_OPERATION_ORIGIN_READ_MAGIC || !read->has_mx_key
+		|| effect_out == NULL) {
+		cluster_runtime_visibility_operation_origin_read_cancel(state);
+		if (reason_out != NULL)
+			*reason_out = CLUSTER_TX_RESOLVE_PROTOCOL;
+		return CLUSTER_RUNTIME_VISIBILITY_OPERATION_FAILED;
+	}
+	/* The original poll consumes its state after the final current release.
+	 * Keep only these immutable begin inputs; publish no intermediate result. */
+	key = read->mx_key;
+	admission = read->admission;
+	mode = read->mode;
+	step = cluster_runtime_visibility_operation_origin_read_poll(state, &identity, &top, &operation,
+																 page.data, reason_out);
+	if (step != CLUSTER_RUNTIME_VISIBILITY_OPERATION_COMPLETE)
+		return step;
+	if (!cluster_savepoint_reader_mx_effect(&key, &top, page.data, &effect)
+		|| !cluster_runtime_visibility_admission_current(mode, &admission)) {
+		if (reason_out != NULL)
+			*reason_out = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+		return CLUSTER_RUNTIME_VISIBILITY_OPERATION_FAILED;
+	}
+	*effect_out = effect;
+	return CLUSTER_RUNTIME_VISIBILITY_OPERATION_COMPLETE;
+}
+
 /* Waiting belongs only to the existing blocking owner, outside every
  * resident-only poll. A wake always returns to the next original poll. */
 static void
@@ -3331,6 +3415,43 @@ cluster_runtime_visibility_operation_read_wait(ClusterOperationOriginRead *read)
 	cluster_vis_evidence_note(CLUSTER_VIS_METRIC_TRANSIENT_PENDING);
 	if (!cluster_undo_block0_current_wait_reply(&read->guard, site))
 		pg_usleep(1000L);
+}
+
+bool
+cluster_runtime_visibility_resolve_mx_operation_origin_admitted(
+	const ClusterSavepointOperationKey *key, ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission, ClusterSavepointEffectProof *effect_out,
+	ClusterTxResolveReason *reason_out)
+{
+	ClusterRuntimeVisibilityOperationRead state = { 0 };
+	ClusterOperationOriginRead *read = cluster_runtime_visibility_operation_read_data(&state);
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+	ClusterRuntimeVisibilityOperationStep step = CLUSTER_RUNTIME_VISIBILITY_OPERATION_FAILED;
+
+	if (effect_out != NULL)
+		memset(effect_out, 0, sizeof(*effect_out));
+	if (effect_out == NULL
+		|| !cluster_runtime_visibility_operation_read_begin_internal(
+			&state, key != NULL ? &key->locator : NULL, NULL, NULL, NULL, NULL, mode, admission,
+			&reason, true, key))
+		goto done;
+	PG_ENSURE_ERROR_CLEANUP(cluster_runtime_visibility_operation_read_cleanup,
+							PointerGetDatum(&state));
+	{
+		do {
+			step = cluster_runtime_visibility_mx_operation_origin_read_poll(&state, effect_out,
+																			&reason);
+			if (step == CLUSTER_RUNTIME_VISIBILITY_OPERATION_PENDING)
+				cluster_runtime_visibility_operation_read_wait(read);
+		} while (step == CLUSTER_RUNTIME_VISIBILITY_OPERATION_PENDING);
+	}
+	PG_END_ENSURE_ERROR_CLEANUP(cluster_runtime_visibility_operation_read_cleanup,
+								PointerGetDatum(&state));
+
+done:
+	if (reason_out != NULL)
+		*reason_out = reason;
+	return step == CLUSTER_RUNTIME_VISIBILITY_OPERATION_COMPLETE;
 }
 
 /* Only the existing blocking owner waits or fills cold DATA. It shares every
@@ -3359,7 +3480,7 @@ cluster_runtime_visibility_resolve_operation_origin_internal(
 	if ((expected == NULL && identity_out == NULL) || top_out == NULL || operation_out == NULL
 		|| data_out == NULL
 		|| !cluster_runtime_visibility_operation_read_begin_internal(
-			&state, locator, expected, retained, head, tag, mode, admission, &reason, true))
+			&state, locator, expected, retained, head, tag, mode, admission, &reason, true, NULL))
 		goto done;
 	PG_ENSURE_ERROR_CLEANUP(cluster_runtime_visibility_operation_read_cleanup,
 							PointerGetDatum(&state));

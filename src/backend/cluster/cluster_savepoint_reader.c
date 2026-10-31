@@ -301,20 +301,13 @@ savepoint_mx_outcome_valid(ClusterTxOutcome outcome, SCN commit_scn)
 				  && commit_scn == InvalidScn);
 }
 
-bool
-cluster_savepoint_reader_mx_effect_valid(const ClusterSavepointEffectProof *effect)
+static bool
+savepoint_mx_identity_valid(const ClusterSavepointOperationKey *key,
+							const ClusterSavepointReaderIdentity *identity)
 {
 	uint32 segment, block;
 	uint16 tt_offset, row;
-	const ClusterSavepointOperationKey *key;
-	const ClusterSavepointReaderIdentity *identity;
-
-	if (effect == NULL)
-		return false;
-	key = &effect->key;
-	identity = &effect->identity;
-	return effect->reserved16 == 0 && savepoint_mx_target_valid(&key->target)
-		   && identity->canonical.reserved32 == 0
+	return savepoint_mx_target_valid(&key->target) && identity->canonical.reserved32 == 0
 		   && savepoint_reader_identity_valid(identity, &key->locator)
 		   && identity->operation_sequence != 0
 		   && U64FromFullTransactionId(key->top_fxid) != UINT64_MAX
@@ -328,7 +321,14 @@ cluster_savepoint_reader_mx_effect_valid(const ClusterSavepointEffectProof *effe
 		   && uba_decode_record(key->locator.uba, &segment, &block, &tt_offset, &row)
 		   && tt_offset == identity->canonical.slot_offset
 		   && uba_origin_node_id(key->locator.uba)
-				  == (identity->canonical.segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE
+				  == (identity->canonical.segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE;
+}
+
+bool
+cluster_savepoint_reader_mx_effect_valid(const ClusterSavepointEffectProof *effect)
+{
+	return effect != NULL && effect->reserved16 == 0
+		   && savepoint_mx_identity_valid(&effect->key, &effect->identity)
 		   && (effect->effect_state == CLUSTER_SAVEPOINT_EFFECT_LIVE
 			   || effect->effect_state == CLUSTER_SAVEPOINT_EFFECT_DISCARDED)
 		   && savepoint_mx_outcome_valid(effect->top_outcome, effect->top_commit_scn);
@@ -403,6 +403,49 @@ cluster_savepoint_reader_mx_effect(const ClusterSavepointOperationKey *key,
 		|| !savepoint_mx_target_matches(&key->target, &record, body))
 		return false;
 	*out = effect;
+	return true;
+}
+
+bool
+cluster_savepoint_reader_discover_mx_operation(const ClusterSavepointOperationKey *key,
+											   const char page[BLCKSZ],
+											   ClusterSavepointReaderIdentity *out)
+{
+	ClusterSavepointReaderIdentity identity = { 0 };
+	ClusterSavepointReaderRecord decoded;
+	UndoRecordHeader record;
+	UndoSlotDirEntry slot;
+	uint32 segment, block;
+	uint16 tt, row;
+	const char *body;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (key == NULL || page == NULL || out == NULL
+		|| !savepoint_reader_record(&key->locator, page, &record, &slot)
+		|| !uba_decode_record(key->locator.uba, &segment, &block, &tt, &row))
+		return false;
+	body = page + slot.record_offset + sizeof(record);
+	if (!cluster_undo_record_decode_operation_payload(&record, body, record.payload_length,
+													  &decoded.body_length, &decoded.history,
+													  &decoded.operation))
+		return false;
+	identity.canonical = (ClusterTTSlotPhysicalLocator){ .segment_id = record.tt_slot_segment_id,
+														 .xid = key->locator.xid,
+														 .slot_offset = tt,
+														 .wrap = key->locator.tt_wrap };
+	identity.canonical_generation = decoded.operation.canonical_segment_generation;
+	identity.top_fxid = key->top_fxid;
+	identity.operation_fxid = key->operation_fxid;
+	identity.operation_sequence = decoded.operation.operation_sequence;
+	identity.command_id = decoded.operation.command_id;
+	identity.subid = decoded.operation.subid;
+	if (!savepoint_mx_identity_valid(key, &identity)
+		|| !cluster_savepoint_reader_decode_identity(&identity, &key->locator, key->locator.uba,
+													 &record, body, record.payload_length, &decoded)
+		|| !savepoint_mx_target_matches(&key->target, &record, body))
+		return false;
+	*out = identity;
 	return true;
 }
 

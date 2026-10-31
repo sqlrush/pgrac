@@ -52,6 +52,8 @@ typedef enum ClusterTxOutcome ClusterTxOutcome;
 typedef struct ClusterTxLocator ClusterTxLocator;
 typedef struct ClusterTxResolution ClusterTxResolution;
 typedef struct ClusterSavepointOperation ClusterSavepointOperation;
+typedef struct ClusterSavepointOperationKey ClusterSavepointOperationKey;
+typedef struct ClusterSavepointEffectProof ClusterSavepointEffectProof;
 typedef struct ClusterSavepointReaderRecord ClusterSavepointReaderRecord;
 typedef struct ClusterSavepointReaderIdentity ClusterSavepointReaderIdentity;
 typedef struct ClusterR4OperationRequest ClusterR4OperationRequest;
@@ -286,6 +288,23 @@ extern ClusterRuntimeVisibilityOperationStep cluster_runtime_visibility_operatio
 	char data_out[BLCKSZ], ClusterTxResolveReason *reason_out);
 extern void cluster_runtime_visibility_operation_origin_read_cancel(
 	ClusterRuntimeVisibilityOperationRead *read);
+
+/* Exact MX compare inputs use the same original DATA/TT/fresh-DATA guard
+ * lifecycle. The caller zeroes the address-stable state before begin and
+ * owns cancellation. Pending/failure clears effect; resident poll never
+ * waits or reads through. Only the blocking variant may wait/read through. */
+extern bool cluster_runtime_visibility_mx_operation_origin_read_begin(
+	ClusterRuntimeVisibilityOperationRead *state, const ClusterSavepointOperationKey *key,
+	ClusterTxResolveMode mode, const ClusterSemanticAdmissionToken *admission,
+	ClusterTxResolveReason *reason_out);
+extern ClusterRuntimeVisibilityOperationStep
+cluster_runtime_visibility_mx_operation_origin_read_poll(
+	ClusterRuntimeVisibilityOperationRead *state, ClusterSavepointEffectProof *effect_out,
+	ClusterTxResolveReason *reason_out);
+extern bool cluster_runtime_visibility_resolve_mx_operation_origin_admitted(
+	const ClusterSavepointOperationKey *key, ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission, ClusterSavepointEffectProof *effect_out,
+	ClusterTxResolveReason *reason_out);
 
 /* Synchronous local-origin owner for the explicit operation plan. It performs
  * three original SCUR acquisitions, releases every phase and stages outputs

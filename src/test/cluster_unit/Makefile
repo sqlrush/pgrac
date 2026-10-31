@@ -7586,6 +7586,18 @@ test_cluster_r4_tx_outcome: test_cluster_r4_tx_outcome.c unit_test.h \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
+# Reuse the complete origin fixture and real provider for exact MX context.
+test_cluster_mx_operation_origin: test_cluster_mx_operation_origin.c test_cluster_r4_tx_outcome
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_OPERATION_WORKER_TEST_O) \
+		$(CLUSTER_SAVEPOINT_READER_O) test_cluster_hot_bufpage_product.o \
+		$(top_builddir)/src/backend/cluster/cluster_cr_apply.o \
+		test_cluster_undo_pending_product.o \
+		$(CLUSTER_R4_RUNTIME_VIS_TEST_O) $(CLUSTER_R4_RUNTIME_VIS_UBA_O) \
+		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
+		$(CLUSTER_CR_SERVER_POLICY_O) $(CLUSTER_RUNTIME_VIS_POLICY_O) test_cluster_r4_multi_resolve_product.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
 # Real CR shared predicate plus real stripe derivation, with only the
 # process/lock/nextXid boundaries supplied by the fixture.
 test_cluster_cr_native_origin: test_cluster_cr_native_origin.c unit_test.h \
@@ -13264,8 +13276,8 @@ test_cluster_heap_sample_full: test_cluster_heap_sample_full.c test_cluster_heap
         $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(top_builddir)/src/common/libpgcommon_srv.a \
         $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
-TESTS += test_cluster_mx_operation_core
-all: test_cluster_mx_operation_core
+TESTS += test_cluster_mx_operation_core test_cluster_mx_operation_origin
+all: test_cluster_mx_operation_core test_cluster_mx_operation_origin
 
 $(CLUSTER_SAVEPOINT_READER_O): $(top_srcdir)/src/include/cluster/cluster_savepoint_reader.h \
         $(top_srcdir)/src/include/cluster/cluster_undo_record_api.h

@@ -76,6 +76,12 @@ extern bool cluster_savepoint_reader_mx_effect(const ClusterSavepointOperationKe
 											   ClusterSavepointEffectProof *out);
 extern bool cluster_savepoint_reader_mx_effect_valid(const ClusterSavepointEffectProof *effect);
 
+/* Provisional compare identity from addressed DATA only. This grants no
+ * original FullXid, outcome, publication receipt or retention authority. */
+extern bool cluster_savepoint_reader_discover_mx_operation(const ClusterSavepointOperationKey *key,
+														   const char page[BLCKSZ],
+														   ClusterSavepointReaderIdentity *out);
+
 extern bool
 cluster_savepoint_reader_identity_from_operation(const ClusterSavepointOperation *expected,
 												 const ClusterTxLocator *locator,
