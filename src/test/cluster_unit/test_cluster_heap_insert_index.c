@@ -273,8 +273,11 @@ UT_TEST(owned_tuple_is_freed_after_tid_copy_and_before_index)
 	UT_ASSERT_EQ(publication_indexes, 1);
 	UT_ASSERT_EQ(publication_frees, 1);
 }
+#ifndef INSERT_INDEX_MAIN
+#define INSERT_INDEX_MAIN main
+#endif
 int
-main(void)
+INSERT_INDEX_MAIN(void)
 {
 	UT_PLAN(8);
 	UT_RUN(index_callback_observes_shared_clear_wal_and_slot_publication);

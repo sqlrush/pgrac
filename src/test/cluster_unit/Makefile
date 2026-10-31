@@ -3433,6 +3433,30 @@ clean-copy-vm-index:
 	rm -f test_cluster_copy_flush.inc test_cluster_copy_flush.inc.tmp \
 		test_cluster_copy_heap_insert.inc test_cluster_copy_heap_insert.inc.tmp
 
+# Speculative INSERT preserves clear, index, completion and wakeup ordering.
+TESTS += test_cluster_heap_speculative_index test_cluster_heap_speculative_index_noassert
+all: test_cluster_heap_speculative_index test_cluster_heap_speculative_index_noassert
+
+test_cluster_heap_speculative_am.inc: extract_insert_index_fixture.py extract_vacuum_mx_fixture.py check_vm_setter_census.py $(top_srcdir)/src/backend/access/heap/heapam_handler.c
+	python3 $(srcdir)/extract_insert_index_fixture.py $(top_srcdir)/src/backend/access/heap/heapam_handler.c --speculative-am > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_speculative_index.inc: extract_insert_index_fixture.py extract_vacuum_mx_fixture.py check_vm_setter_census.py $(top_srcdir)/src/backend/executor/nodeModifyTable.c
+	python3 $(srcdir)/extract_insert_index_fixture.py $(top_srcdir)/src/backend/executor/nodeModifyTable.c --speculative > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_speculative_index test_cluster_heap_speculative_index_noassert: test_cluster_heap_speculative_index.c test_cluster_heap_insert_index.c test_cluster_heap_insert_index test_cluster_heap_speculative_am.inc test_cluster_heap_speculative_index.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(if $(filter %_noassert,$@),-DFIXTURE_NO_ASSERTS) $< \
+		test_cluster_space_bufpage_product.o test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
+clean: clean-speculative-index
+.PHONY: clean-speculative-index
+clean-speculative-index:
+	rm -f test_cluster_heap_speculative_am.inc test_cluster_heap_speculative_am.inc.tmp \
+		test_cluster_heap_speculative_index.inc test_cluster_heap_speculative_index.inc.tmp
+
 # Join the original DML writer helpers, final capture and native clear/WAL.
 TESTS += test_cluster_heap_dml_vm_wal_chain test_cluster_heap_dml_vm_wal_chain_noassert
 all: test_cluster_heap_dml_vm_wal_chain test_cluster_heap_dml_vm_wal_chain_noassert

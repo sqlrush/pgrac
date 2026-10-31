@@ -16,7 +16,7 @@ int insert_vm_wal_inherited_main(void);
 #undef main
 
 static void
-execute_single_wal_chain(bool versioned)
+execute_single_wal_chain_with_options(bool versioned, int options)
 {
 	Relation relation = &relation_data;
 	HeapTuple heaptup = &tuple;
@@ -28,7 +28,6 @@ execute_single_wal_chain(bool versioned)
 	TransactionId canonical_xid = 500;
 	SCN cluster_itl_write_scn = 800;
 	UBA cluster_itl_uba = InvalidUba_init;
-	int options = 0;
 	bool cluster_page_versioned = versioned;
 	ClusterSpaceIdentity cluster_page_identity = identity;
 	RfPageProducerBatchV1 cluster_page_versions = { 0 };
@@ -53,6 +52,12 @@ cluster_heap_insert_retry:
 	UnlockReleaseBuffer(buffer);
 	if (BufferIsValid(vmbuffer))
 		ReleaseBuffer(vmbuffer);
+}
+
+static void
+execute_single_wal_chain(bool versioned)
+{
+	execute_single_wal_chain_with_options(versioned, 0);
 }
 
 static bool
