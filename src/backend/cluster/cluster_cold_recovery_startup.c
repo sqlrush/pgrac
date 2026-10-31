@@ -1134,6 +1134,17 @@ cold_side_create(ClusterColdTypedV1 *typed)
 			&& !rf_side_online_plan_bind_sources_v1(typed->side_plans[i], typed->sources,
 													typed->participant_count))
 			detail = RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+		/* Declared relmap feed retains the complete native carrier. Its
+		 * database identity must be fixed before the first record, not only
+		 * when the optional ordinary SIDE plan is sealed after scanning. */
+		if (cluster_cold_plan_relmap_required_v1(typed->plan, i)) {
+			if (detail == RF_PAGE_PROOF_DETAIL_OK
+				&& !rf_side_online_plan_bind_database_v1(typed->side_plans[i],
+					typed->observer.database_incarnation))
+				detail = RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+			if (detail != RF_PAGE_PROOF_DETAIL_OK)
+				cluster_cold_plan_relmap_invalidate_v1(typed->plan);
+		}
 		if (detail != RF_PAGE_PROOF_DETAIL_OK) {
 			cold_refuse(typed,
 						detail == RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH
@@ -1226,6 +1237,13 @@ cold_scan_and_seal(ClusterColdTypedV1 *typed, const ColdRoot *roots,
 		if (scan.side_capture_detail != 0) {
 			typed->side_capture_detail[i] = scan.side_capture_detail;
 			typed->side_capture_read_rec_ptr[i] = scan.side_capture_read_rec_ptr;
+			if (cluster_cold_plan_relmap_required_v1(typed->plan, i)) {
+				cluster_cold_plan_relmap_invalidate_v1(typed->plan);
+				cold_refuse(typed, CLUSTER_COLD_SIDE_OWNER_MISSING,
+					"declared relmap thread %u lost SIDE capture (detail %u)",
+					(unsigned)typed->participants[i].thread_id, (unsigned)scan.side_capture_detail);
+				return false;
+			}
 			rf_side_online_plan_destroy_v1(&typed->side_plans[i]);
 		}
 	}
@@ -1244,13 +1262,30 @@ cold_scan_and_seal(ClusterColdTypedV1 *typed, const ColdRoot *roots,
 	}
 	for (uint32 i = 0; i < typed->participant_count; i++) {
 		RfPageProofDetailV1 side_detail;
-		if (typed->side_plans[i] == NULL)
+		if (typed->side_plans[i] == NULL) {
+			if (cluster_cold_plan_relmap_required_v1(typed->plan, i)) {
+				cluster_cold_plan_relmap_invalidate_v1(typed->plan);
+				cold_refuse(typed, CLUSTER_COLD_SIDE_OWNER_MISSING,
+					"declared relmap thread %u has no SIDE plan",
+					(unsigned)typed->participants[i].thread_id);
+				return false;
+			}
 			continue;
+		}
 		if (!rf_side_online_plan_bind_database_v1(typed->side_plans[i],
 												  typed->observer.database_incarnation))
 			side_detail = RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
 		else
 			side_detail = rf_side_online_plan_seal_v1(typed->side_plans[i]);
+		if (side_detail != RF_PAGE_PROOF_DETAIL_OK
+			&& cluster_cold_plan_relmap_required_v1(typed->plan, i)) {
+			typed->side_capture_detail[i] = (uint8)side_detail;
+			cluster_cold_plan_relmap_invalidate_v1(typed->plan);
+			cold_refuse(typed, CLUSTER_COLD_SIDE_OWNER_MISSING,
+				"declared relmap thread %u SIDE seal refused (detail %u)",
+				(unsigned)typed->participants[i].thread_id, (unsigned)side_detail);
+			return false;
+		}
 		if (side_detail == RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE
 			|| side_detail == RF_PAGE_PROOF_DETAIL_OPCODE_UNSUPPORTED) {
 			/* Original native/history coverage can exceed this execution

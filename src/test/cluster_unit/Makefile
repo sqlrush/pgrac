@@ -870,6 +870,7 @@ test_cluster_relmap_v2: test_cluster_relmap_v2.c unit_test.h \
 		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a -o $@
 
 test_cluster_cold_relmap_executor.o: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_relmap.c \
+		$(top_srcdir)/src/include/cluster/cluster_side_online_plan.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_relmap.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_plan_internal.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_PGRAC_CLUSTER -DUSE_CLUSTER_UNIT -ffunction-sections -fdata-sections -c $< -o $@
@@ -878,7 +879,10 @@ test_cluster_cold_relmap: test_cluster_cold_relmap.c test_cluster_relmap_v2_stor
 		unit_test.h $(top_srcdir)/src/include/cluster/cluster_cold_relmap.h \
 		$(CLUSTER_COLD_PLAN_O) test_cluster_cold_recovery_replay_core.o \
 		test_cluster_cold_relmap_executor.o test_cluster_relmap_v2_storage_product.o \
-		test_cluster_relmap_pending_product.o \
+		test_cluster_relmap_pending_product.o test_cluster_side_online_plan.o \
+		test_cluster_side_xact_product.o test_cluster_side_xact_xactdesc.o \
+		$(top_builddir)/src/backend/cluster/cluster_remote_xact_identity.o \
+		$(top_builddir)/src/backend/cluster/cluster_tt_2pc_record.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_retention_restore.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
@@ -886,7 +890,10 @@ test_cluster_cold_relmap: test_cluster_cold_relmap.c test_cluster_relmap_v2_stor
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_PGRAC_CLUSTER -ffunction-sections -fdata-sections $< \
 		$(CLUSTER_COLD_PLAN_O) test_cluster_cold_recovery_replay_core.o \
 		test_cluster_cold_relmap_executor.o test_cluster_relmap_v2_storage_product.o \
-		test_cluster_relmap_pending_product.o \
+		test_cluster_relmap_pending_product.o test_cluster_side_online_plan.o \
+		test_cluster_side_xact_product.o test_cluster_side_xact_xactdesc.o \
+		$(top_builddir)/src/backend/cluster/cluster_remote_xact_identity.o \
+		$(top_builddir)/src/backend/cluster/cluster_tt_2pc_record.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_retention_restore.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
@@ -12506,6 +12513,7 @@ test_cluster_cold_tt_base: test_cluster_cold_tt_base.c unit_test.h test_cluster_
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
 
 test_cluster_cold_recovery_startup_core.o: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_startup.c \
+		$(top_srcdir)/src/include/cluster/cluster_cold_relmap.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_checkpoint.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h \
 		$(top_srcdir)/src/backend/cluster/cluster_control_bootstrap_private.h \
@@ -12554,6 +12562,7 @@ COLD_NATIVE_SIDE_OBJS = test_cluster_cold_native_side.o $(CLUSTER_SIDE_XACT_O) \
 	$(CLUSTER_RF_ROUTE_O) $(CLUSTER_REMOTE_XACT_IDENTITY_O)
 
 test_cluster_cold_recovery_startup: test_cluster_cold_recovery_startup.c unit_test.h $(CLUSTER_COLD_STARTUP_O) \
+		test_cluster_cold_startup_relmap.inc \
 		$(COLD_NATIVE_SIDE_OBJS) test_cluster_cold_native_side.h \
 		test_cluster_cold_native_storage.inc test_cluster_recovery_episode_clog.o \
 		test_cluster_recovery_episode_clog.h \

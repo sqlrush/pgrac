@@ -1525,6 +1525,41 @@ rf_side_online_plan_relmap_matches_v1(const RfSideOnlinePlanV1 *plan,
 	return found != NULL;
 }
 
+bool
+rf_side_online_plan_relmap_input_matches_v1(const RfSideOnlinePlanV1 *plan,
+	const ClusterColdRelmapInputV1 *input)
+{
+	bool found = false;
+	if (input == NULL || rf_side_online_plan_relmap_count_v1(plan, &input->source) == UINT32_MAX)
+		return false;
+	for (const SideNativeRelmapWitness *w = plan->native_relmaps; w != NULL; w = w->next) {
+#define SAME(field_) (w->input.field_ == input->field_)
+		if (!SAME(participant) || !SAME(cut.thread_id) || !SAME(cut.reserved_zero)
+			|| !SAME(cut.timeline) || !SAME(cut.owner_incarnation) || !SAME(cut.physical_lower)
+			|| !SAME(cut.native_redo) || !SAME(cut.tail_end)
+			|| memcmp(&w->input.source, &input->source, sizeof(input->source)) != 0
+			|| !SAME(frame.read_rec_ptr) || !SAME(frame.end_rec_ptr) || !SAME(frame.record_crc)
+			|| !SAME(frame.participant) || !SAME(frame.source_xid) || !SAME(frame.source_top_xid)
+			|| !SAME(frame.page_components) || !SAME(frame.space_effects)
+			|| !SAME(frame.rmid) || !SAME(frame.info) || !SAME(frame.history)
+			|| !SAME(staged.identity.system_identifier) || !SAME(staged.identity.database_incarnation)
+			|| !SAME(staged.identity.dbid) || !SAME(staged.identity.shared)
+			|| !SAME(staged.committed_generation) || !SAME(staged.pending_generation)
+			|| !SAME(staged.pending_owner.node) || !SAME(staged.pending_owner.top_full_xid)
+			|| !SAME(staged.pending_owner.membership_epoch) || !SAME(staged.pending_owner.admitted_incarnation)
+			|| !SAME(staged.pending_owner.wal_end) || !SAME(staged.pending_owner.boot_incarnation)
+			|| memcmp(&w->input.staged.committed, &input->staged.committed, sizeof(RelMapFile)) != 0
+			|| memcmp(&w->input.staged.pending, &input->staged.pending, sizeof(RelMapFile)) != 0
+			|| !SAME(retention) || !SAME(retention_lock))
+			continue;
+#undef SAME
+		if (found)
+			return false;
+		found = true;
+	}
+	return found;
+}
+
 RfPageProofDetailV1
 rf_side_online_plan_feed_record_v1(RfSideOnlinePlanV1 *plan,
 								   const RfDetachedRecordPlanV1 *record_plan,

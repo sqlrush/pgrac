@@ -38,6 +38,9 @@
 #include "storage/standbydefs.h"
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_cold_relmap.h"
+#include "utils/relmapper.h"
+#include "catalog/pg_tablespace_d.h"
 #include "cluster/cluster_xid_stripe_xlog.h"
 #include "cluster/cluster_cold_recovery_census.h"
 #include "cluster/cluster_cold_recovery_plan_internal.h"
@@ -3966,6 +3969,7 @@ UT_TEST(test_full_clog_truncate_dispatch_uses_original_projection_identity)
 
 #include "test_cluster_cold_native_clog_consumed.inc"
 #include "test_cluster_cold_native_storage.inc"
+#include "test_cluster_cold_startup_relmap.inc"
 
 int
 main(void)
@@ -3991,7 +3995,15 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(161);
+	if (getenv("PGRAC_PRE2_TEST_STARTUP_RELMAP") != NULL) {
+		UT_PLAN(3);
+		UT_RUN(test_startup_declared_relmap_binds_database_before_capture);
+		UT_RUN(test_startup_declared_relmap_cannot_drop_scan_or_seal_failure);
+		UT_RUN(test_startup_relmap_early_binding_refuses_before_scan);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
+	UT_PLAN(164);
 	UT_RUN(test_full_clog_truncate_dispatch_uses_original_projection_identity);
 	UT_RUN(test_full_clog_dispatch_uses_only_original_projection_identity);
 	UT_RUN(test_execution_refusal_preserves_the_first_census_failure);
@@ -4154,6 +4166,9 @@ main(void)
 	UT_RUN(test_native_clog_source_wraps_original_founder_callback);
 	UT_RUN(test_native_clog_source_refuses_changed_inputs_before_callback);
 	UT_RUN(test_native_clog_source_late_failure_and_error_stay_refused);
+	UT_RUN(test_startup_declared_relmap_binds_database_before_capture);
+	UT_RUN(test_startup_declared_relmap_cannot_drop_scan_or_seal_failure);
+	UT_RUN(test_startup_relmap_early_binding_refuses_before_scan);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

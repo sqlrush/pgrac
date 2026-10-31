@@ -17,6 +17,7 @@
 #include "cluster/cluster_cold_recovery_plan_internal.h"
 #include "cluster/cluster_relmap_authority.h"
 #include "cluster/cluster_relmap_retention.h"
+#include "cluster/cluster_side_online_plan.h"
 #include "storage/lwlock.h"
 #include "utils/relmapper.h"
 #include "miscadmin.h"
@@ -36,6 +37,31 @@ relmap_current(ClusterColdTypedV1 *typed, struct ClusterRecoveryFencePlan *fence
 		&& cold_relmap_cut_equal(&input->cut, &typed->participants[p])
 		&& memcmp(&input->source, &typed->sources[p], sizeof(input->source)) == 0
 		&& cluster_cold_typed_sources_current_v1(typed, fence);
+}
+
+static bool
+relmap_side_matches(const ClusterColdTypedV1 *typed, const ClusterColdRelmapInputV1 *input,
+	const XLogReaderState *reader)
+{
+	const ClusterColdPlanV1 *plan = typed->plan;
+	const RfSideOnlinePlanV1 *side;
+	uint32 expected = 0;
+
+	if (input->participant >= typed->participant_count)
+		return false;
+	side = typed->side_plans[input->participant];
+	if (!rf_side_online_plan_recovery_sources_match_v1(side, typed->sources, typed->participant_count))
+		return false;
+	for (uint32 i = 0; i < plan->relmap_count; ++i) {
+		const ColdRelmapInput *entry = &plan->relmap_inputs[i];
+		if (entry->input.participant != input->participant)
+			continue;
+		if (!entry->captured || !rf_side_online_plan_relmap_input_matches_v1(side, &entry->input))
+			return false;
+		++expected;
+	}
+	return expected != 0 && expected == rf_side_online_plan_relmap_count_v1(side, &input->source)
+		&& (reader == NULL || rf_side_online_plan_relmap_matches_v1(side, &input->source, reader));
 }
 
 static bool
@@ -137,6 +163,7 @@ cluster_cold_typed_relmap_record_v1(ClusterColdTypedV1 *typed,
 	PG_TRY();
 	{
 		if (entry->captured && relmap_current(typed, fence, input)
+			&& relmap_side_matches(typed, input, reader)
 			&& relmap_record_matches(input, reader)
 			&& cluster_relmap_v2_encode(&input->staged, encoded, sizeof(encoded)) == CLUSTER_RELMAP_V2_VALID
 			&& relmap_pin(input, entry->applied)) {
@@ -146,12 +173,14 @@ cluster_cold_typed_relmap_record_v1(ClusterColdTypedV1 *typed,
 					== CLUSTER_RELMAP_V2_PAIR_VALID && !base.has_pending
 				&& base.committed_generation == input->staged.committed_generation
 				&& memcmp(&base.committed, &input->staged.committed, sizeof(RelMapFile)) == 0
-				&& relmap_current(typed, fence, input) && relmap_pin(input, false))
+				&& relmap_current(typed, fence, input) && relmap_side_matches(typed, input, reader)
+				&& relmap_pin(input, false))
 				ok = cluster_relmap_authority_v2_write_pending(&input->staged.identity,
 					input->staged.pending_generation, &input->staged.pending_owner,
 					&input->staged.pending, input->retention, input->retention_lock)
 					&& cluster_relmap_authority_v2_check_staged(&input->staged);
-			ok = ok && relmap_current(typed, fence, input) && relmap_pin(input, true);
+			ok = ok && relmap_current(typed, fence, input) && relmap_pin(input, true)
+				&& relmap_side_matches(typed, input, reader);
 		}
 	}
 	PG_CATCH();
@@ -187,9 +216,11 @@ cluster_cold_typed_relmap_ready_v1(ClusterColdTypedV1 *typed, struct ClusterReco
 	plan->relmap_failed = true;
 	for (uint32 i = 0; i < plan->relmap_count && ok; ++i) {
 		const ClusterColdRelmapInputV1 *input = &plan->relmap_inputs[i].input;
-		ok = relmap_current(typed, fence, input) && relmap_pin(input, true)
+		ok = relmap_current(typed, fence, input) && relmap_side_matches(typed, input, NULL)
+			&& relmap_pin(input, true)
 			&& cluster_relmap_authority_v2_check_staged(&input->staged)
-			&& relmap_current(typed, fence, input) && relmap_pin(input, true);
+			&& relmap_current(typed, fence, input) && relmap_pin(input, true)
+			&& relmap_side_matches(typed, input, NULL);
 	}
 	if (ok)
 		plan->relmap_failed = false;
