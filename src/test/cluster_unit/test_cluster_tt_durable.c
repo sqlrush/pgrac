@@ -1108,6 +1108,13 @@ cluster_undo_segment_file_exists(uint8 owner_instance pg_attribute_unused(), uin
 }
 
 
+/* Scan fixtures use the real complete V1 header, not a raw slot array. */
+static void
+seed_scan_header_v1(void)
+{
+	cluster_undo_segment_make_header_bytes(1, 1, g_canned_block);
+}
+
 /* helper: seed g_canned_block's TT slot i with (status, xid, commit_scn). */
 static void
 seed_block_slot(int i, uint8 status, TransactionId xid, SCN commit_scn)
@@ -3064,7 +3071,7 @@ UT_TEST(test_by_xid_zero_match_miss)
 	SCN got = InvalidScn;
 
 	cluster_node_id = 0;
-	memset(g_canned_block, 0, sizeof(g_canned_block)); /* all UNUSED */
+	seed_scan_header_v1(); /* all UNUSED */
 	UT_ASSERT_EQ((int)cluster_tt_slot_durable_lookup_by_xid(12345, &got), 0);
 }
 UT_TEST(test_by_xid_one_match)
@@ -3072,7 +3079,7 @@ UT_TEST(test_by_xid_one_match)
 	SCN got = InvalidScn;
 
 	cluster_node_id = 0;
-	memset(g_canned_block, 0, sizeof(g_canned_block));
+	seed_scan_header_v1();
 	seed_block_slot(3, TT_SLOT_COMMITTED, 12345, scn_encode(1, 77));
 	UT_ASSERT_EQ((int)cluster_tt_slot_durable_lookup_by_xid(12345, &got), 1);
 	UT_ASSERT_EQ((int)(scn_local(got)), 77);
@@ -3082,7 +3089,7 @@ UT_TEST(test_by_xid_two_match_ambiguous_failclosed)
 	SCN got = InvalidScn;
 
 	cluster_node_id = 0;
-	memset(g_canned_block, 0, sizeof(g_canned_block));
+	seed_scan_header_v1();
 	seed_block_slot(3, TT_SLOT_COMMITTED, 12345, scn_encode(1, 77));
 	seed_block_slot(9, TT_SLOT_COMMITTED, 12345, scn_encode(1, 88)); /* duplicate xid */
 	/* 规则 8.A: >1 match -> fail-closed (never first-match). */
@@ -3141,7 +3148,7 @@ UT_TEST(test_resolve_zero_match_recycled)
 
 	cluster_node_id = 0;
 	g_unreadable_existing_segment = 0;
-	memset(g_canned_block, 0, sizeof(g_canned_block));
+	seed_scan_header_v1();
 	/* slot recycled to a DIFFERENT owner xid -> 0 matches for the target. */
 	seed_block_slot(5, TT_SLOT_COMMITTED, 999, scn_encode(1, 50));
 	UT_ASSERT_EQ((int)cluster_tt_slot_durable_resolve_by_xid(12345, CLUSTER_TT_WRAP_ANY, &got, NULL,
@@ -3155,7 +3162,7 @@ UT_TEST(test_resolve_one_valid_resolved)
 
 	cluster_node_id = 0;
 	g_unreadable_existing_segment = 0;
-	memset(g_canned_block, 0, sizeof(g_canned_block));
+	seed_scan_header_v1();
 	seed_block_slot(3, TT_SLOT_COMMITTED, 12345, scn_encode(1, 77));
 	UT_ASSERT_EQ((int)cluster_tt_slot_durable_resolve_by_xid(12345, CLUSTER_TT_WRAP_ANY, &got, NULL,
 															 NULL, NULL),
@@ -3174,7 +3181,7 @@ UT_TEST(test_resolve_reports_matched_identity)
 
 	cluster_node_id = 0;
 	g_unreadable_existing_segment = 0;
-	memset(g_canned_block, 0, sizeof(g_canned_block));
+	seed_scan_header_v1();
 	seed_block_slot(5, TT_SLOT_COMMITTED, 12345, scn_encode(1, 77));
 	UT_ASSERT_EQ((int)cluster_tt_slot_durable_resolve_by_xid(12345, CLUSTER_TT_WRAP_ANY, &got, &seg,
 															 &slot, &wrap),
@@ -3185,7 +3192,7 @@ UT_TEST(test_resolve_reports_matched_identity)
 
 	/* a 0-match (RECYCLED) leaves the out params untouched (only set on RESOLVED). */
 	seg = slot = wrap = 0xffff;
-	memset(g_canned_block, 0, sizeof(g_canned_block));
+	seed_scan_header_v1();
 	seed_block_slot(5, TT_SLOT_COMMITTED, 999, scn_encode(1, 50)); /* different xid */
 	got = InvalidScn;
 	UT_ASSERT_EQ((int)cluster_tt_slot_durable_resolve_by_xid(12345, CLUSTER_TT_WRAP_ANY, &got, &seg,
@@ -3202,7 +3209,7 @@ UT_TEST(test_resolve_xid_match_invalid_scn_not_recycled)
 	 * recycled.  The resolve enum must report XID_MATCH_INVALID_SCN. */
 	cluster_node_id = 0;
 	g_unreadable_existing_segment = 0;
-	memset(g_canned_block, 0, sizeof(g_canned_block));
+	seed_scan_header_v1();
 	seed_block_slot(7, TT_SLOT_COMMITTED, 12345, InvalidScn);
 	UT_ASSERT_EQ((int)cluster_tt_slot_durable_resolve_by_xid(12345, CLUSTER_TT_WRAP_ANY, &got, NULL,
 															 NULL, NULL),
@@ -3215,7 +3222,7 @@ UT_TEST(test_resolve_two_match_ambiguous)
 
 	cluster_node_id = 0;
 	g_unreadable_existing_segment = 0;
-	memset(g_canned_block, 0, sizeof(g_canned_block));
+	seed_scan_header_v1();
 	seed_block_slot(3, TT_SLOT_COMMITTED, 12345, scn_encode(1, 77));
 	seed_block_slot(9, TT_SLOT_COMMITTED, 12345, scn_encode(1, 88));
 	UT_ASSERT_EQ((int)cluster_tt_slot_durable_resolve_by_xid(12345, CLUSTER_TT_WRAP_ANY, &got, NULL,
@@ -3242,7 +3249,7 @@ UT_TEST(test_resolve_unreadable_existing_segment_unavailable)
 	 * never a 0-match.  Segment 2 is not the canned block (read_block fails) but
 	 * file_exists() reports it present (I/O error on a real segment). */
 	cluster_node_id = 0;
-	memset(g_canned_block, 0, sizeof(g_canned_block));
+	seed_scan_header_v1();
 	g_unreadable_existing_segment = 2;
 	UT_ASSERT_EQ((int)cluster_tt_slot_durable_resolve_by_xid(12345, CLUSTER_TT_WRAP_ANY, &got, NULL,
 															 NULL, NULL),
@@ -3256,13 +3263,13 @@ UT_TEST(test_resolve_lookup_wrapper_maps_resolved_only)
 
 	cluster_node_id = 0;
 	g_unreadable_existing_segment = 0;
-	memset(g_canned_block, 0, sizeof(g_canned_block));
+	seed_scan_header_v1();
 	seed_block_slot(3, TT_SLOT_COMMITTED, 12345, scn_encode(1, 77));
 	UT_ASSERT_EQ((int)cluster_tt_slot_durable_lookup_by_xid(12345, &got), 1);
 	UT_ASSERT_EQ((int)(scn_local(got)), 77);
 
 	/* unstamped owned-by-xid -> wrapper false (was already false legacy-side). */
-	memset(g_canned_block, 0, sizeof(g_canned_block));
+	seed_scan_header_v1();
 	seed_block_slot(3, TT_SLOT_COMMITTED, 12345, InvalidScn);
 	UT_ASSERT_EQ((int)cluster_tt_slot_durable_lookup_by_xid(12345, &got), 0);
 }
@@ -3277,7 +3284,7 @@ UT_TEST(test_locate_any_state_reports_active_exact_identity)
 
 	cluster_node_id = 0;
 	g_unreadable_existing_segment = 0;
-	memset(g_canned_block, 0, sizeof(g_canned_block));
+	seed_scan_header_v1();
 	seed_block_slot(6, TT_SLOT_ACTIVE, 12345, InvalidScn);
 	header->tt_slots[6].wrap = 9;
 	UT_ASSERT_EQ((int)cluster_tt_slot_durable_locate_any_by_xid_origin(0, 12345, &seg, &slot, &wrap,
@@ -3295,7 +3302,7 @@ UT_TEST(test_locate_any_state_distinguishes_missing_and_ambiguous)
 
 	cluster_node_id = 0;
 	g_unreadable_existing_segment = 0;
-	memset(g_canned_block, 0, sizeof(g_canned_block));
+	seed_scan_header_v1();
 	UT_ASSERT_EQ(
 		(int)cluster_tt_slot_durable_locate_any_by_xid_origin(0, 12345, &seg, NULL, NULL, NULL),
 		(int)CLUSTER_TT_DURABLE_LOCATE_MISSING);
@@ -3309,7 +3316,7 @@ UT_TEST(test_locate_any_state_distinguishes_missing_and_ambiguous)
 
 UT_TEST(test_locate_any_state_incomplete_scan_fails_closed)
 {
-	memset(g_canned_block, 0, sizeof(g_canned_block));
+	seed_scan_header_v1();
 	g_unreadable_existing_segment = 2;
 	UT_ASSERT_EQ(
 		(int)cluster_tt_slot_durable_locate_any_by_xid_origin(0, 12345, NULL, NULL, NULL, NULL),
@@ -3331,7 +3338,7 @@ UT_TEST(test_resolve_resamples_a_publication_crossing)
 	g_canned_block_segment = 1;
 	g_unreadable_existing_segment = 1;
 	g_read_block_absent_once_segment = 1;
-	memset(g_canned_block, 0, sizeof(g_canned_block));
+	seed_scan_header_v1();
 	seed_block_slot(3, TT_SLOT_COMMITTED, 12345, scn_encode(1, 77));
 	UT_ASSERT_EQ(cluster_tt_slot_durable_resolve_by_xid_origin(0, 12345, CLUSTER_TT_WRAP_ANY, &got,
 															   &seg, &slot, NULL),
@@ -3357,7 +3364,7 @@ UT_TEST(test_locate_resamples_a_publication_crossing)
 		g_canned_block_segment = 1;
 		g_unreadable_existing_segment = 1;
 		g_read_block_absent_once_segment = 1;
-		memset(g_canned_block, 0, sizeof(g_canned_block));
+		seed_scan_header_v1();
 		seed_block_slot(6, states[i], 12345, InvalidScn);
 		UT_ASSERT_EQ(
 			cluster_tt_slot_durable_locate_any_by_xid_origin(0, 12345, &seg, &slot, NULL, &status),
@@ -3380,7 +3387,7 @@ UT_TEST(test_scan_pass_classifies_inventory)
 	ClusterUndoCleanerPassStats stats = { 0 };
 	bool ok;
 
-	memset(g_canned_block, 0, sizeof(g_canned_block));
+	seed_scan_header_v1();
 	seed_block_slot(0, TT_SLOT_COMMITTED, (TransactionId)100, (SCN)5);	/* below */
 	seed_block_slot(1, TT_SLOT_COMMITTED, (TransactionId)101, (SCN)20); /* == horizon: retained */
 	seed_block_slot(2, TT_SLOT_COMMITTED, (TransactionId)102, (SCN)0);	/* unresolved (8.A) */
@@ -3402,7 +3409,7 @@ UT_TEST(test_scan_pass_writes_nothing)
 	ClusterUndoCleanerPassStats stats = { 0 };
 	char before[BLCKSZ];
 
-	memset(g_canned_block, 0, sizeof(g_canned_block));
+	seed_scan_header_v1();
 	seed_block_slot(0, TT_SLOT_COMMITTED, (TransactionId)100, (SCN)5);
 	memcpy(before, g_canned_block, BLCKSZ);
 	g_write_hdr_calls = 0;
@@ -4421,10 +4428,255 @@ UT_TEST(test_prepared_v2_repeated_terminal_keeps_exact_head_and_refuses_conflict
 	}
 }
 
+/* These scans observe original durable bytes; they do not grant FullXid or
+ * terminal/retention authority to a raw-xid caller. Real whole product CU. */
+static void
+scan_v2_reset(void)
+{
+	reset_current_write_mock();
+	cluster_node_id = 0;
+	g_unreadable_existing_segment = 0;
+	g_read_block_absent_once_segment = 0;
+	if (!cluster_undo_segment_make_header_v2_bytes(1, 1, g_canned_block))
+		abort();
+}
+
+static void
+seed_scan_v2_slot(uint16 offset, uint8 status, TransactionId xid, uint32 epoch, SCN scn)
+{
+	UndoSegmentHeaderDataV2 *header = (UndoSegmentHeaderDataV2 *)g_canned_block;
+	TTSlotV2 *slot = &header->tt_slots[offset];
+
+	slot->xid = xid;
+	slot->original_full_xid = ((uint64)epoch << 32) | xid;
+	slot->status = status;
+	slot->wrap = 9;
+	slot->commit_scn = scn;
+}
+
+static void
+scan_expect_unavailable_without_output(void)
+{
+	SCN scn = 77;
+	uint16 segment = 0xfffe, offset = 0xfffd, wrap = 0xfffc;
+	uint8 status = 0xfb;
+	ClusterUndoCleanerPassStats stats = { 0 }, before;
+	PGAlignedBlock image;
+
+	stats.segments_scanned = 7;
+	stats.header_retained_committed = 3;
+	memcpy(&before, &stats, sizeof(stats));
+	memcpy(image.data, g_canned_block, BLCKSZ);
+	UT_ASSERT_EQ(cluster_tt_slot_durable_resolve_by_xid_origin(
+				 0, 100, CLUSTER_TT_WRAP_ANY, &scn, &segment, &offset, &wrap),
+				 CLUSTER_TT_DURABLE_SCAN_UNAVAILABLE);
+	UT_ASSERT_EQ(scn, InvalidScn);
+	UT_ASSERT_EQ(segment, 0xfffe);
+	UT_ASSERT_EQ(offset, 0xfffd);
+	UT_ASSERT_EQ(wrap, 0xfffc);
+	UT_ASSERT_EQ(cluster_tt_slot_durable_locate_any_by_xid_origin(
+				 0, 100, &segment, &offset, &wrap, &status),
+				 CLUSTER_TT_DURABLE_LOCATE_SCAN_UNAVAILABLE);
+	UT_ASSERT_EQ(segment, 0xfffe);
+	UT_ASSERT_EQ(offset, 0xfffd);
+	UT_ASSERT_EQ(wrap, 0xfffc);
+	UT_ASSERT_EQ(status, 0xfb);
+	UT_ASSERT(!cluster_undo_segment_tt_header_scan_pass(1, 1, 20, &stats));
+	UT_ASSERT_EQ(memcmp(&before, &stats, sizeof(stats)), 0);
+	UT_ASSERT_EQ(memcmp(image.data, g_canned_block, BLCKSZ), 0);
+	UT_ASSERT_EQ(g_write_hdr_calls, 0);
+	UT_ASSERT_EQ(g_tt_wal_count, 0);
+}
+
+UT_TEST(test_scan_v2_resolve_stride_wrap_unstamped_and_ambiguity)
+{
+	const uint16 offsets[] = { 0, 1, 47 };
+
+	for (int i = 0; i < lengthof(offsets); i++) {
+		SCN scn = InvalidScn;
+		uint16 segment = 0, offset = 0, wrap = 0;
+
+		scan_v2_reset();
+		seed_scan_v2_slot(offsets[i], TT_SLOT_COMMITTED, 100, 0, 77);
+		UT_ASSERT_EQ(cluster_tt_slot_durable_resolve_by_xid_origin(
+					 0, 100, 9, &scn, &segment, &offset, &wrap),
+					 CLUSTER_TT_DURABLE_RESOLVED_SCN);
+		UT_ASSERT_EQ(scn, 77);
+		UT_ASSERT_EQ(segment, 1);
+		UT_ASSERT_EQ(offset, offsets[i]);
+		UT_ASSERT_EQ(wrap, 9);
+		UT_ASSERT_EQ(cluster_tt_slot_durable_resolve_by_xid_origin(
+					 0, 100, 10, &scn, NULL, NULL, NULL),
+					 CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH);
+		UT_ASSERT_EQ(scn, InvalidScn);
+		seed_scan_v2_slot(offsets[i], TT_SLOT_COMMITTED, 100, 7, InvalidScn);
+		UT_ASSERT_EQ(cluster_tt_slot_durable_resolve_by_xid_origin(
+					 0, 100, 9, &scn, NULL, NULL, NULL),
+					 CLUSTER_TT_DURABLE_XID_MATCH_INVALID_SCN);
+	}
+	scan_v2_reset();
+	seed_scan_v2_slot(1, TT_SLOT_COMMITTED, 100, 7, 77);
+	seed_scan_v2_slot(47, TT_SLOT_COMMITTED, 100, 8, 88);
+	{
+		SCN scn = 99;
+		uint16 segment = 0xfffe;
+
+		UT_ASSERT_EQ(cluster_tt_slot_durable_resolve_by_xid_origin(
+					 0, 100, 9, &scn, &segment, NULL, NULL),
+					 CLUSTER_TT_DURABLE_AMBIGUOUS_WRAP);
+		UT_ASSERT_EQ(scn, InvalidScn);
+		UT_ASSERT_EQ(segment, 0xfffe);
+	}
+}
+
+UT_TEST(test_scan_v2_locate_all_live_states_and_raw_ambiguity)
+{
+	const uint8 states[] = { TT_SLOT_ACTIVE, TT_SLOT_COMMITTED, TT_SLOT_ABORTED };
+
+	for (int i = 0; i < lengthof(states); i++) {
+		uint16 segment = 0, offset = 0, wrap = 0;
+		uint8 status = TT_SLOT_INVALID;
+
+		scan_v2_reset();
+		seed_scan_v2_slot(47, states[i], 100, 7,
+						  states[i] == TT_SLOT_COMMITTED ? 77 : InvalidScn);
+		UT_ASSERT_EQ(cluster_tt_slot_durable_locate_any_by_xid_origin(
+					 0, 100, &segment, &offset, &wrap, &status),
+					 CLUSTER_TT_DURABLE_LOCATE_FOUND);
+		UT_ASSERT_EQ(segment, 1);
+		UT_ASSERT_EQ(offset, 47);
+		UT_ASSERT_EQ(wrap, 9);
+		UT_ASSERT_EQ(status, states[i]);
+		seed_scan_v2_slot(0, TT_SLOT_ABORTED, 100, 8, InvalidScn);
+		UT_ASSERT_EQ(cluster_tt_slot_durable_locate_any_by_xid_origin(
+					 0, 100, NULL, NULL, NULL, NULL),
+					 CLUSTER_TT_DURABLE_LOCATE_AMBIGUOUS);
+	}
+}
+
+UT_TEST(test_scan_v2_inventory_is_complete_and_readonly)
+{
+	ClusterUndoCleanerPassStats stats = { 0 };
+	PGAlignedBlock before;
+
+	scan_v2_reset();
+	seed_scan_v2_slot(0, TT_SLOT_COMMITTED, 100, 7, 5);
+	seed_scan_v2_slot(1, TT_SLOT_COMMITTED, 101, 7, 20);
+	seed_scan_v2_slot(2, TT_SLOT_COMMITTED, 102, 7, InvalidScn);
+	seed_scan_v2_slot(46, TT_SLOT_ACTIVE, 103, 7, InvalidScn);
+	seed_scan_v2_slot(47, TT_SLOT_ABORTED, 104, 7, InvalidScn);
+	memcpy(before.data, g_canned_block, BLCKSZ);
+	UT_ASSERT(cluster_undo_segment_tt_header_scan_pass(1, 1, 20, &stats));
+	UT_ASSERT_EQ(stats.header_tt_slots_below_horizon, 1);
+	UT_ASSERT_EQ(stats.header_retained_committed, 1);
+	UT_ASSERT_EQ(stats.header_unresolved_committed, 1);
+	UT_ASSERT_EQ(stats.stale_active_skipped, 1);
+	UT_ASSERT_EQ(stats.segments_scanned, 1);
+	UT_ASSERT_EQ(g_read_block_calls, 1);
+	UT_ASSERT_EQ(g_write_hdr_calls, 0);
+	UT_ASSERT_EQ(memcmp(before.data, g_canned_block, BLCKSZ), 0);
+}
+
+UT_TEST(test_scan_rejects_bad_or_unknown_header_before_any_output)
+{
+	for (int v2 = 0; v2 < 2; v2++) {
+		for (int fault = 0; fault < 12; fault++) {
+			UndoSegmentHeaderData *v1 = (UndoSegmentHeaderData *)g_canned_block;
+			UndoSegmentHeaderDataV2 *header = (UndoSegmentHeaderDataV2 *)g_canned_block;
+
+			scan_v2_reset();
+			if (v2)
+				seed_scan_v2_slot(0, TT_SLOT_COMMITTED, 100, 7, 5);
+			else {
+				seed_scan_header_v1();
+				seed_block_slot(0, TT_SLOT_COMMITTED, 100, 5);
+			}
+			switch (fault) {
+			case 0: v1->pd_flags = 0; break;
+			case 1: v1->pd_pagesize_version = 0; break;
+			case 2: v1->segment_id = 2; break;
+			case 3: v1->segment_size_bytes--; break;
+			case 4: v1->owner_instance = 2; break;
+			case 5: v1->tt_slots_count--; break;
+			case 6: v1->segment_state = 0xff; break;
+			case 7: g_canned_block[57] = 3; break;
+			case 8: g_canned_block[58] = 32; break;
+			case 9: g_canned_block[60] = 1; break;
+			case 10:
+				if (v2) header->tt_next_free_slot = 49;
+				else g_canned_block[63] = 1;
+				break;
+			case 11:
+				if (v2) header->tt_active_count = 49;
+				else g_canned_block[57] = 1;
+				break;
+			}
+			scan_expect_unavailable_without_output();
+		}
+	}
+}
+
+UT_TEST(test_scan_v2_invalid_unrelated_last_slot_poison_is_atomic)
+{
+	for (int fault = 0; fault < 10; fault++) {
+		UndoSegmentHeaderDataV2 *header = (UndoSegmentHeaderDataV2 *)g_canned_block;
+		TTSlotV2 *last = &header->tt_slots[47];
+
+		scan_v2_reset();
+		seed_scan_v2_slot(0, TT_SLOT_COMMITTED, 100, 7, 5);
+		seed_scan_v2_slot(47, TT_SLOT_COMMITTED, 200, 7, 30);
+		switch (fault) {
+		case 0: last->xid = FrozenTransactionId; break;
+		case 1: last->original_full_xid = 0; break;
+		case 2: last->original_full_xid++; break;
+		case 3: last->original_full_xid = UINT64_MAX; break;
+		case 4: last->status = TT_SLOT_INVALID; break;
+		case 5: last->flags = 0x80; break;
+		case 6: last->wrap = TT_WRAP_INVALID; break;
+		case 7: last->commit_scn = UINT64_MAX; break;
+		case 8: last->status = TT_SLOT_UNUSED; break;
+		case 9: last->status = TT_SLOT_ABORTED; break;
+		}
+		scan_expect_unavailable_without_output();
+	}
+}
+
+UT_TEST(test_scan_v2_preserves_existing_publication_retry_and_incomplete_scan)
+{
+	SCN scn = InvalidScn;
+	uint16 offset = 0;
+
+	scan_v2_reset();
+	seed_scan_v2_slot(47, TT_SLOT_COMMITTED, 100, 7, 77);
+	g_read_block_absent_once_segment = g_unreadable_existing_segment = 1;
+	UT_ASSERT_EQ(cluster_tt_slot_durable_resolve_by_xid_origin(
+				 0, 100, 9, &scn, NULL, &offset, NULL),
+				 CLUSTER_TT_DURABLE_RESOLVED_SCN);
+	UT_ASSERT_EQ(scn, 77);
+	UT_ASSERT_EQ(offset, 47);
+	UT_ASSERT_EQ(g_read_block_calls, CLUSTER_UNDO_SEGS_PER_INSTANCE + 1);
+	g_read_block_calls = 0;
+	g_read_block_absent_once_segment = 1;
+	UT_ASSERT_EQ(cluster_tt_slot_durable_locate_any_by_xid_origin(
+				 0, 100, NULL, &offset, NULL, NULL),
+				 CLUSTER_TT_DURABLE_LOCATE_FOUND);
+	UT_ASSERT_EQ(offset, 47);
+	UT_ASSERT_EQ(g_read_block_calls, CLUSTER_UNDO_SEGS_PER_INSTANCE + 1);
+	g_unreadable_existing_segment = 2;
+	UT_ASSERT_EQ(cluster_tt_slot_durable_resolve_by_xid_origin(
+				 0, 100, 9, &scn, NULL, NULL, NULL),
+				 CLUSTER_TT_DURABLE_SCAN_UNAVAILABLE);
+	UT_ASSERT_EQ(scn, InvalidScn);
+	UT_ASSERT_EQ(cluster_tt_slot_durable_locate_any_by_xid_origin(
+				 0, 100, NULL, NULL, NULL, NULL),
+				 CLUSTER_TT_DURABLE_LOCATE_SCAN_UNAVAILABLE);
+	UT_ASSERT_EQ(g_write_hdr_calls, 0);
+}
+
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(127);
+	UT_PLAN(133);
 
 	UT_RUN(test_layout_sizes);
 
@@ -4566,6 +4818,12 @@ main(int argc, char **argv)
 	UT_RUN(test_prepared_v2_bad_framing_identity_or_current_is_atomic);
 	UT_RUN(test_prepared_v2_apply_refuses_preimage_drift_and_release_is_owned);
 	UT_RUN(test_prepared_v2_repeated_terminal_keeps_exact_head_and_refuses_conflict);
+	UT_RUN(test_scan_v2_resolve_stride_wrap_unstamped_and_ambiguity);
+	UT_RUN(test_scan_v2_locate_all_live_states_and_raw_ambiguity);
+	UT_RUN(test_scan_v2_inventory_is_complete_and_readonly);
+	UT_RUN(test_scan_rejects_bad_or_unknown_header_before_any_output);
+	UT_RUN(test_scan_v2_invalid_unrelated_last_slot_poison_is_atomic);
+	UT_RUN(test_scan_v2_preserves_existing_publication_retry_and_incomplete_scan);
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;
 }

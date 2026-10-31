@@ -2667,6 +2667,54 @@ cluster_tt_recovery_classify_revert(bool is_delete_record, bool record_xid_abort
 	return CLUSTER_TT_REVERT_APPLY;
 }
 
+/* The smgr supplied one complete aligned block. Select its explicit layout
+ * before interpreting any slot. A malformed V2 slot poisons the whole scan,
+ * including matches/counts found before that slot; this grants no new raw-xid
+ * or FullXid authority to any caller. Legacy slot semantics remain unchanged. */
+static bool
+durable_scan_header_valid(const char block[BLCKSZ], uint32 segment_id, uint8 owner,
+						  bool *is_v2)
+{
+	const UndoSegmentHeaderDataV2 *header = (const UndoSegmentHeaderDataV2 *)block;
+
+	*is_v2 = false;
+	if (segment_id == 0 || owner == 0 || owner > UNDO_OWNER_INSTANCE_MAX)
+		return false;
+	if (!UndoSegmentHeaderV2_identity_matches(block, BLCKSZ, segment_id, owner))
+		return UndoSegmentHeader_identity_matches(block, segment_id, owner);
+	for (uint16 i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
+		const TTSlotV2 *slot = &header->tt_slots[i];
+
+		if (slot->status > TT_SLOT_RECYCLABLE || (slot->flags & ~TT_SLOT_FLAGS_KNOWN) != 0
+			|| slot->wrap == TT_WRAP_INVALID || slot->commit_scn == UINT64_MAX)
+			return false;
+		if (slot->status == TT_SLOT_UNUSED) {
+			if (slot->original_full_xid != 0)
+				return false;
+		} else if (!TransactionIdIsNormal(slot->xid) || slot->original_full_xid == UINT64_MAX
+				   || (TransactionId)slot->original_full_xid != slot->xid)
+			return false;
+		if (slot->status == TT_SLOT_ABORTED && SCN_VALID(slot->commit_scn))
+			return false;
+	}
+	*is_v2 = true;
+	return true;
+}
+
+/* Both layouts retain the same 32-byte slot prefix. Copy it only after the
+ * complete immutable image has passed the corresponding header/slot checks. */
+static TTSlot
+durable_scan_slot(const char block[BLCKSZ], bool is_v2, uint16 offset)
+{
+	TTSlot slot;
+	Size stride = is_v2 ? sizeof(TTSlotV2) : sizeof(TTSlot);
+
+	Assert(offset < TT_SLOTS_PER_SEGMENT);
+	memcpy(&slot, block + offsetof(UndoSegmentHeaderData, tt_slots) + offset * stride,
+		   sizeof(slot));
+	return slot;
+}
+
 /* A failed open and the following existence probe are separate observations.
  * A complete segment may be published between them. Read that image once
  * before declaring the scan incomplete; never skip an existing unreadable
@@ -2756,15 +2804,19 @@ cluster_tt_slot_durable_resolve_by_xid_origin(int origin_node, TransactionId xid
 	 */
 	cluster_tt_durable_io_wait_start();
 	for (segment_id = seg_lo; segment_id <= seg_hi; segment_id++) {
-		UndoSegmentHeaderData *hdr;
+		bool is_v2;
 		uint16 i;
 
 		if (!durable_scan_read_header(owner, segment_id, blockbuf.data, &scan_complete))
 			continue;
 
-		hdr = (UndoSegmentHeaderData *)blockbuf.data;
+		if (!durable_scan_header_valid(blockbuf.data, segment_id, owner, &is_v2)) {
+			scan_complete = false;
+			continue;
+		}
 		for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
-			const TTSlot *s = &hdr->tt_slots[i];
+			TTSlot observed = durable_scan_slot(blockbuf.data, is_v2, i);
+			const TTSlot *s = &observed;
 
 			/* spec-4.5a G4 (F3): a known expected_wrap excludes a slot recycled
 			 * to a same-valued xid of a NEWER generation -- that exclusion turns
@@ -2829,14 +2881,18 @@ cluster_tt_slot_durable_locate_any_by_xid_origin(int origin_node, TransactionId 
 	cluster_tt_durable_count_by_xid_scan();
 	cluster_tt_durable_io_wait_start();
 	for (segment_id = seg_lo; segment_id <= seg_hi; segment_id++) {
-		const UndoSegmentHeaderData *header;
+		bool is_v2;
 		uint16 i;
 
 		if (!durable_scan_read_header(owner, segment_id, blockbuf.data, &scan_complete))
 			continue;
-		header = (const UndoSegmentHeaderData *)blockbuf.data;
+		if (!durable_scan_header_valid(blockbuf.data, segment_id, owner, &is_v2)) {
+			scan_complete = false;
+			continue;
+		}
 		for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
-			const TTSlot *slot = &header->tt_slots[i];
+			TTSlot observed = durable_scan_slot(blockbuf.data, is_v2, i);
+			const TTSlot *slot = &observed;
 
 			if (slot->xid != xid
 				|| (slot->status != TT_SLOT_ACTIVE && slot->status != TT_SLOT_COMMITTED
@@ -2887,8 +2943,8 @@ cluster_tt_slot_durable_lookup_by_xid(TransactionId xid, SCN *commit_scn)
  * scan-only).
  *
  *	READ-ONLY classification of one segment's durable TTSlot[] (block 0
- *	@ offset 112, 48 x 32B).  Produces inventory counts for the segment-
- *	level evaluation (D3) and observability (D6); deliberately writes
+ *	@ offset 112, 48 x 32B V1 or 48 x 40B V2). Produces inventory counts for
+ *	the segment-level evaluation (D3) and observability (D6); deliberately writes
  *	NOTHING:
  *	  - rewriting COMMITTED -> RECYCLABLE has zero effect on the segment
  *	    predicate (it only watermarks TT_SLOT_COMMITTED), and
@@ -2909,7 +2965,7 @@ cluster_undo_segment_tt_header_scan_pass(uint32 segment_id, uint8 owner_instance
 										 ClusterUndoCleanerPassStats *stats)
 {
 	PGAlignedBlock block;
-	const UndoSegmentHeaderData *hdr;
+	bool is_v2;
 	int i;
 
 	Assert(stats != NULL);
@@ -2921,11 +2977,13 @@ cluster_undo_segment_tt_header_scan_pass(uint32 segment_id, uint8 owner_instance
 		cluster_undo_cleaner_scan_wait_end();
 		return false; /* absent / I/O: caller counts and moves on */
 	}
-	hdr = (const UndoSegmentHeaderData *)block.data;
 	cluster_undo_cleaner_scan_wait_end();
+	if (!durable_scan_header_valid(block.data, segment_id, owner_instance, &is_v2))
+		return false; /* no partial inventory from an invalid image */
 
 	for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
-		const TTSlot *s = &hdr->tt_slots[i];
+		TTSlot observed = durable_scan_slot(block.data, is_v2, i);
+		const TTSlot *s = &observed;
 
 		switch (s->status) {
 		case TT_SLOT_COMMITTED:
