@@ -2513,10 +2513,168 @@ UT_TEST(test_block0_v2_bad_framing_never_publishes_resident_generation)
 	}
 }
 
+/* The normal-stop owner reads canonical resident bytes, not the allocator
+ * mirror. Keep its full-page, pin and durability observations real. */
+UT_TEST(test_stop_block0_v2_checks_every_slot_and_preserves_original_identity)
+{
+	ClusterUndoBlock0LogicalKey logical = make_key(128, 32768);
+	ClusterUndoBlock0AuthorityProof proof = make_live_proof(128, 7);
+	ClusterUndoBlock0Pin pin;
+	UndoSegmentHeaderDataV2 *header;
+	char before[BLCKSZ];
+	char *page;
+
+	stop_block0_setup(2);
+	make_valid_block0(32768, 128, 0, 0);
+	UT_ASSERT(cluster_undo_segment_make_header_v2_bytes(32768, 128, smgr_image));
+	header = (UndoSegmentHeaderDataV2 *)smgr_image;
+	header->wrap_count = 7;
+	((UndoSegmentHeaderData *)smgr_image)->wrap_count = UINT32_MAX;
+	stop_block0_load(32768, 128, &pin, &page);
+	header = (UndoSegmentHeaderDataV2 *)page;
+	cluster_undo_block0_unpin(&pin);
+	UT_ASSERT_EQ(stop_block0_poll(false), CLUSTER_NORMAL_STOP_READY);
+	for (int i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
+		UT_ASSERT_EQ(cluster_undo_block0_pin(&logical, &stop_root, NULL,
+			CLUSTER_UNDO_BLOCK0_EXCLUSIVE, &proof, &pin, &page), CLUSTER_UNDO_BLOCK0_OK);
+		header->tt_slots[i].xid = (TransactionId)(500 + i);
+		header->tt_slots[i].wrap = (uint16)(i + 1);
+		header->tt_slots[i].status = TT_SLOT_ACTIVE;
+		header->tt_slots[i].original_full_xid = ((uint64)(i % 2) << 32) | (500 + i);
+		cluster_undo_block0_flush_sync(&pin, page, (XLogRecPtr)(600 + i), false);
+		cluster_undo_block0_unpin(&pin);
+		memcpy(before, page, BLCKSZ);
+		UT_ASSERT_EQ(stop_block0_poll(false), CLUSTER_NORMAL_STOP_PENDING);
+		UT_ASSERT_EQ(stop_segment, 32768);
+		UT_ASSERT_EQ(stop_tt_slot, i);
+		UT_ASSERT_STR_EQ(stop_reason, "UNDO_BLOCK0_TT_ACTIVE");
+		UT_ASSERT(memcmp(before, page, BLCKSZ) == 0);
+		UT_ASSERT_EQ(cluster_undo_block0_pin(&logical, &stop_root, NULL,
+			CLUSTER_UNDO_BLOCK0_EXCLUSIVE, &proof, &pin, &page), CLUSTER_UNDO_BLOCK0_OK);
+		header->tt_slots[i].status = TT_SLOT_COMMITTED;
+		header->tt_slots[i].commit_scn = scn_encode(127, 1000 + i);
+		cluster_undo_block0_flush_sync(&pin, page, (XLogRecPtr)(700 + i), false);
+		cluster_undo_block0_unpin(&pin);
+		memcpy(before, page, BLCKSZ);
+		UT_ASSERT_EQ(stop_block0_poll(false), CLUSTER_NORMAL_STOP_READY);
+		UT_ASSERT_EQ(stop_block0_poll(true), CLUSTER_NORMAL_STOP_READY);
+		UT_ASSERT(memcmp(before, page, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_stop_block0_v2_retains_last_slot_undo_and_checkpoint_debt)
+{
+	ClusterUndoBlock0LogicalKey logical = make_key(1, 1);
+	ClusterUndoBlock0AuthorityProof proof = make_live_proof(1, 7);
+	ClusterUndoBlock0Pin pin;
+	UndoSegmentHeaderDataV2 *header;
+	char before[BLCKSZ];
+	char *page;
+
+	stop_block0_setup(2);
+	make_valid_block0(1, 1, 0, 0);
+	UT_ASSERT(cluster_undo_segment_make_header_v2_bytes(1, 1, smgr_image));
+	stop_block0_load(1, 1, &pin, &page);
+	header = (UndoSegmentHeaderDataV2 *)page;
+	header->tt_slots[47].xid = 1000;
+	header->tt_slots[47].wrap = 3;
+	header->tt_slots[47].status = TT_SLOT_ABORTED;
+	header->tt_slots[47].original_full_xid = UINT64_C(0x7000003e8);
+	header->tt_slots[47].first_undo_block.raw[0] = UINT64_C(0x100000001);
+	cluster_undo_block0_flush_sync(&pin, page, 800, false);
+	cluster_undo_block0_unpin(&pin);
+	memcpy(before, page, BLCKSZ);
+	UT_ASSERT_EQ(stop_block0_poll(false), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(stop_tt_slot, 47);
+	UT_ASSERT_STR_EQ(stop_reason, "UNDO_BLOCK0_TT_UNDO_PENDING");
+	UT_ASSERT_EQ(stop_block0_poll(true), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT(memcmp(before, page, BLCKSZ) == 0);
+	UT_ASSERT_EQ(cluster_undo_block0_pin(&logical, &stop_root, NULL,
+		CLUSTER_UNDO_BLOCK0_EXCLUSIVE, &proof, &pin, &page), CLUSTER_UNDO_BLOCK0_OK);
+	memset(&header->tt_slots[47].first_undo_block, 0, sizeof(UBA));
+	cluster_undo_block0_flush_sync(&pin, page, 801, false);
+	cluster_undo_block0_mark_wal_dirty(&pin, 802);
+	cluster_undo_block0_unpin(&pin);
+	memcpy(before, page, BLCKSZ);
+	UT_ASSERT_EQ(stop_block0_poll(false), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(stop_block0_poll(true), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_STR_EQ(stop_reason, "UNDO_BLOCK0_DURABILITY_PENDING");
+	UT_ASSERT(memcmp(before, page, BLCKSZ) == 0);
+	UT_ASSERT_EQ(cluster_undo_block0_pin(&logical, &stop_root, NULL,
+		CLUSTER_UNDO_BLOCK0_EXCLUSIVE, &proof, &pin, &page), CLUSTER_UNDO_BLOCK0_OK);
+	cluster_undo_block0_flush_sync(&pin, page, 802, false);
+	cluster_undo_block0_unpin(&pin);
+	UT_ASSERT_EQ(stop_block0_poll(true), CLUSTER_NORMAL_STOP_READY);
+}
+
+UT_TEST(test_stop_block0_v2_late_corruption_overrides_earlier_pending_without_mutation)
+{
+	for (unsigned fault = 0; fault < 17; fault++) {
+		ClusterUndoBlock0Pin pin;
+		UndoSegmentHeaderDataV2 *header;
+		TTSlotV2 *slot;
+		char before[BLCKSZ];
+		char *page;
+
+		stop_block0_setup(2);
+		make_valid_block0(1, 1, 0, 0);
+		UT_ASSERT(cluster_undo_segment_make_header_v2_bytes(1, 1, smgr_image));
+		stop_block0_load(1, 1, &pin, &page);
+		header = (UndoSegmentHeaderDataV2 *)page;
+		header->tt_slots[0].xid = 600;
+		header->tt_slots[0].status = TT_SLOT_ACTIVE;
+		header->tt_slots[0].original_full_xid = 600;
+		slot = &header->tt_slots[47];
+		slot->xid = 700;
+		slot->wrap = 1;
+		slot->status = TT_SLOT_COMMITTED;
+		slot->commit_scn = scn_encode(0, 1000);
+		slot->original_full_xid = UINT64_C(0x7000002bc);
+		/* Corruption is an input boundary, never a publication by a successful
+		 * durable owner. Poll must not repair or release these bytes. */
+		switch (fault) {
+		case 0: slot->original_full_xid = 0; break;
+		case 1: slot->original_full_xid++; break;
+		case 2: slot->original_full_xid = UINT64_MAX; break;
+		case 3: slot->original_full_xid = UINT64_C(0x700000002); break;
+		case 4:
+			memset(slot, 0, sizeof(*slot));
+			slot->original_full_xid = 700;
+			break;
+		case 5: slot->status = TT_SLOT_UNUSED; slot->original_full_xid = 0; break;
+		case 6: slot->status = TT_SLOT_RECYCLABLE + 1; break;
+		case 7: slot->flags = 0x80; break;
+		case 8: slot->wrap = TT_WRAP_INVALID; break;
+		case 9: slot->commit_scn = InvalidScn; break;
+		case 10: slot->status = TT_SLOT_ABORTED; break;
+		case 11:
+			slot->status = TT_SLOT_ACTIVE;
+			slot->commit_scn = InvalidScn;
+			slot->flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+			break;
+		case 12: header->tt_layout_version = 3; break;
+		case 13: header->tt_slot_bytes = 32; break;
+		case 14: header->tt_layout_reserved = 1; break;
+		case 15: header->wrap_count = UINT32_MAX; break;
+		case 16: header->tt_active_count = TT_SLOTS_PER_SEGMENT + 1; break;
+		}
+		cluster_undo_block0_unpin(&pin);
+		memcpy(before, page, BLCKSZ);
+		UT_ASSERT_EQ(stop_block0_poll(false), CLUSTER_NORMAL_STOP_INVALID);
+		UT_ASSERT_EQ(stop_segment, 1);
+		if (fault < 12) {
+			UT_ASSERT_EQ(stop_tt_slot, 47);
+			UT_ASSERT_STR_EQ(stop_reason, "UNDO_BLOCK0_TT_SHAPE_INVALID");
+		} else
+			UT_ASSERT_STR_EQ(stop_reason, "UNDO_BLOCK0_RESIDENT_IMAGE_INVALID");
+		UT_ASSERT(memcmp(before, page, BLCKSZ) == 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(60);
+	UT_PLAN(63);
 	UT_RUN(test_block0_key_endpoints_map_to_direct_slots);
 	UT_RUN(test_block0_key_rejects_owner_segment_aliases);
 	UT_RUN(test_block0_root_requires_pgrd_identity_and_declared_intent);
@@ -2577,6 +2735,9 @@ main(void)
 	UT_RUN(test_stop_block0_two_actual_segment_roots_share_one_pgrd_not_one_file_id);
 	UT_RUN(test_block0_v2_reads_original_generation_before_current_pin);
 	UT_RUN(test_block0_v2_bad_framing_never_publishes_resident_generation);
+	UT_RUN(test_stop_block0_v2_checks_every_slot_and_preserves_original_identity);
+	UT_RUN(test_stop_block0_v2_retains_last_slot_undo_and_checkpoint_debt);
+	UT_RUN(test_stop_block0_v2_late_corruption_overrides_earlier_pending_without_mutation);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -1701,14 +1701,30 @@ cluster_undo_block0_normal_stop_poll(
 			block0_normal_stop_note(&observation, CLUSTER_NORMAL_STOP_PENDING, slotno + 1, -1,
 									"UNDO_BLOCK0_PIN_PENDING");
 		for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
+			TTSlot prefix;
 			const TTSlot *tt = &header->tt_slots[i];
 			const TTSlot zero = { 0 };
+			bool full_identity_valid = true;
 			bool valid;
 
+			/* Page identity above has already dispatched the complete layout.
+			 * Read the original prefix at its actual stride; the extra V2
+			 * identity is evidence to check, never a new stop/release grant. */
+			if ((uint8)header->_pad_57[0] == CLUSTER_UNDO_TT_LAYOUT_V2) {
+				const TTSlotV2 *slot = &((const UndoSegmentHeaderDataV2 *)header)->tt_slots[i];
+
+				memcpy(&prefix, slot, sizeof(prefix));
+				tt = &prefix;
+				full_identity_valid = tt->status == TT_SLOT_UNUSED
+					? slot->original_full_xid == 0
+					: slot->original_full_xid != UINT64_MAX
+						&& (TransactionId)slot->original_full_xid == tt->xid;
+			}
 			if (tt->status == TT_SLOT_UNUSED)
-				valid = memcmp(tt, &zero, sizeof(zero)) == 0;
+				valid = full_identity_valid && memcmp(tt, &zero, sizeof(zero)) == 0;
 			else
-				valid = TransactionIdIsNormal(tt->xid) && tt->wrap != TT_WRAP_INVALID
+				valid = full_identity_valid && TransactionIdIsNormal(tt->xid)
+						&& tt->wrap != TT_WRAP_INVALID
 						&& tt->status <= TT_SLOT_RECYCLABLE
 						&& (tt->flags & ~TT_SLOT_FLAGS_KNOWN) == 0
 						&& ((tt->status == TT_SLOT_COMMITTED && SCN_VALID(tt->commit_scn))
