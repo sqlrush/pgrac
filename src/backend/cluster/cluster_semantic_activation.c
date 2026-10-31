@@ -13175,21 +13175,61 @@ done:
 static bool
 normal_start_terminal_header(const PGAlignedBlock *page, uint32 segment, uint8 owner, SCN *maximum)
 {
-	const UndoSegmentHeaderData *h = (const UndoSegmentHeaderData *)page->data;
+	const UndoSegmentHeaderData *h;
+	const UndoSegmentHeaderDataV2 *v2;
+	const uint8 legacy_reserved[7] = { 0 };
+	uint32 generation, active_count, next_slot;
+	bool tt_v2;
 	int i;
+
+	if (page == NULL || maximum == NULL)
+		return false;
+	h = (const UndoSegmentHeaderData *)page->data;
+	v2 = (const UndoSegmentHeaderDataV2 *)page->data;
+	tt_v2 = v2->tt_layout_version == CLUSTER_UNDO_TT_LAYOUT_V2;
+	/* Dispatch the fixed prefix before reading counters, generation or slots.
+	 * Unknown framing must never fall through to the legacy stride. */
+	if (tt_v2) {
+		if (!UndoSegmentHeaderV2_identity_matches(page->data, BLCKSZ, segment, owner))
+			return false;
+		generation = v2->wrap_count;
+		active_count = v2->tt_active_count;
+		next_slot = v2->tt_next_free_slot;
+	} else {
+		if (memcmp(h->_pad_57, legacy_reserved, sizeof(legacy_reserved)) != 0)
+			return false;
+		generation = h->wrap_count;
+		active_count = h->tt_active_count;
+		next_slot = h->tt_next_free_slot;
+	}
 	if ((h->pd_flags & PD_UNDO_SEG_HEADER) == 0 || PageGetPageSize((Page)h) != BLCKSZ
 		|| PageGetPageLayoutVersion((Page)h) != PG_PAGE_LAYOUT_VERSION || h->segment_id != segment
 		|| h->owner_instance != owner || h->segment_size_bytes != UNDO_SEGMENT_SIZE_BYTES
-		|| h->tt_slots_count != TT_SLOTS_PER_SEGMENT || h->wrap_count == UINT32_MAX
-		|| h->segment_state > SEGMENT_RECYCLABLE || h->tt_active_count > TT_SLOTS_PER_SEGMENT
-		|| h->tt_next_free_slot >= TT_SLOTS_PER_SEGMENT
+		|| h->tt_slots_count != TT_SLOTS_PER_SEGMENT || generation == UINT32_MAX
+		|| h->segment_state > SEGMENT_RECYCLABLE || active_count > TT_SLOTS_PER_SEGMENT
+		|| next_slot >= TT_SLOTS_PER_SEGMENT
 		|| (h->segment_flags & ~UNDO_SEGMENT_FLAG_FULL) != 0)
 		return false;
 	for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
-		const TTSlot *tt = &h->tt_slots[i];
+		TTSlot prefix;
+		const TTSlot *tt;
 		const TTSlot zero = { 0 };
 		uint32 undo_segment, block;
 		uint16 slot, offset;
+
+		if (tt_v2) {
+			const TTSlotV2 *full = &v2->tt_slots[i];
+
+			memcpy(&prefix, full, sizeof(prefix));
+			tt = &prefix;
+			if (full->status == TT_SLOT_UNUSED ? full->original_full_xid != 0
+				: (!TransactionIdIsNormal(full->xid) || full->original_full_xid == UINT64_MAX
+					|| (TransactionId)full->original_full_xid != full->xid))
+				return false;
+			if (full->commit_scn == UINT64_MAX)
+				return false;
+		} else
+			tt = &h->tt_slots[i];
 		if (tt->status == TT_SLOT_UNUSED) {
 			if (memcmp(tt, &zero, sizeof(zero)) != 0)
 				return false;
@@ -13261,7 +13301,11 @@ normal_start_load(NormalStartPass *pass, const char **failure)
 		item->logical.segment_id = first + index;
 		item->logical.owner_instance = owner;
 		item->generation.known = true;
-		item->generation.value = ((UndoSegmentHeaderData *)page.data)->wrap_count;
+		item->generation.value
+			= ((const UndoSegmentHeaderDataV2 *)page.data)->tt_layout_version
+					  == CLUSTER_UNDO_TT_LAYOUT_V2
+				  ? ((const UndoSegmentHeaderDataV2 *)page.data)->wrap_count
+				  : ((const UndoSegmentHeaderData *)page.data)->wrap_count;
 		item->proof.kind = CLUSTER_UNDO_BLOCK0_LIVE_OWNER;
 		item->proof.owner_instance = owner;
 		item->proof.cluster_epoch_present = true;
