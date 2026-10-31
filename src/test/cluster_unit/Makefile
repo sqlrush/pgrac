@@ -13414,10 +13414,18 @@ test_cluster_pcm_lock_clock_product.o test_cluster_ko_extend_recovery: \
         $(top_srcdir)/src/include/cluster/cluster_wait_trace.h
 
 # Native TT/ITL recorder; real publisher with backend environment boundaries.
+test_cluster_native_itl_json.inc: $(top_srcdir)/src/test/modules/test_pgrac_shared_config/test_pgrac_native_itl.c Makefile
+	awk '/^static void append_(hex|event)\(/ { emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (found != 2 || done != 2) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_native_itl_trace: test_cluster_native_itl_trace.c unit_test.h \
         $(top_srcdir)/src/backend/cluster/cluster_native_itl_trace.c \
-        $(top_srcdir)/src/include/cluster/cluster_native_itl_trace.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
+        $(top_srcdir)/src/include/cluster/cluster_native_itl_trace.h \
+        test_cluster_native_itl_json.inc cluster_unit_port_stubs.o cluster_catalog_trace_test.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 test_cluster_tt_terminal_trace: test_cluster_tt_terminal_trace.c test_cluster_tt_durable.c \
         unit_test.h $(top_srcdir)/src/backend/cluster/cluster_native_itl_trace.c \

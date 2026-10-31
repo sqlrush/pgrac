@@ -3,6 +3,7 @@
 #include "cluster/cluster_native_itl_trace.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_shmem.h"
+#include "cluster/cluster_undo_record_api.h"
 #include "miscadmin.h"
 #include "storage/proc.h"
 #include "storage/shmem.h"
@@ -177,6 +178,52 @@ cluster_native_itl_trace_selected(Buffer buffer, TransactionId xid, uint8 select
 	if (buffer > 0)
 		(void)cluster_native_itl_trace_capture_page(
 			&GetBufferDescriptor(buffer - 1)->tag, BufferGetPage(buffer), &row);
+	(void)cluster_native_itl_trace_append(&row, NULL);
+}
+
+void
+cluster_native_itl_trace_update_retry(uint8 phase,
+	const ClusterCanonicalTxnBinding *binding, Buffer old_vm, Buffer new_vm,
+	uint64 wait_deadline_us, const ClusterUndoRecordPrepareReceipt *receipt)
+{
+	ClusterNativeItlTraceEvent row = {0};
+	ClusterNativeItlRetryCopy *copy = &row.retry;
+
+	if (!cluster_trace_tx_identity)
+		return;
+	row.kind = CLNITL_UPDATE_RETRY;
+	copy->observed = true;
+	copy->phase = phase;
+	copy->old_vm = old_vm;
+	copy->new_vm = new_vm;
+	copy->wait_deadline_us = wait_deadline_us;
+	/* Only owned local values: no buffer dereference, TT/receipt lookup,
+	 * allocation, logging, new lock or authority inferred from this copy. */
+	if (binding != NULL) {
+		row.native_binding = *binding;
+		row.native_binding_known = binding->publish_state == CLUSTER_CANONICAL_TXN_PUBLISHED &&
+			binding->reserved16 == 0 && !XLogRecPtrIsInvalid(binding->active_lsn) &&
+			TransactionIdIsNormal(binding->xid) && binding->slot_wrap != TT_WRAP_INVALID;
+		if (row.native_binding_known)
+			row.bind_lsn = binding->active_lsn;
+	}
+	if (receipt != NULL) {
+		copy->receipt_present = true;
+		copy->magic = receipt->magic;
+		copy->record_type = receipt->record_type;
+		copy->owner_instance = receipt->owner_instance;
+		copy->payload_capacity = receipt->payload_capacity;
+		copy->segment_id = receipt->tt_slot_segment_id;
+		copy->slot_offset = receipt->tt_slot_offset;
+		copy->actual_segment_id = receipt->actual_segment_id;
+		copy->reservation_sequence = receipt->reservation_sequence;
+		copy->prepare_deadline_us = receipt->absolute_deadline_us;
+		copy->attempt_generation = receipt->ctrc_attempt_generation;
+		copy->pending_mask = receipt->ctrc_pending_mask;
+		copy->prepared_mask = receipt->ctrc_prepared_mask;
+		copy->applied_mask = receipt->ctrc_applied_mask;
+		copy->reuse_mask = receipt->ctrc_reuse_mask;
+	}
 	(void)cluster_native_itl_trace_append(&row, NULL);
 }
 

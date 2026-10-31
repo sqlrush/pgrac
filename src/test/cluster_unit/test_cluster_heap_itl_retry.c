@@ -28,6 +28,7 @@ int original_itl_undo_fixture_main(int argc, char **argv);
 #include "access/visibilitymap.h"
 #include "cluster/cluster_tx_enqueue.h"
 #include "cluster/cluster_tt_status.h"
+#include "cluster/cluster_native_itl_trace.h"
 
 extern bool heap_receipt_test_capture(Page page, bool first, uint8 operation,
 									  ClusterCtrcTargetV1 *target);
@@ -58,6 +59,40 @@ static uint64 expected_capacity_deadline;
 static OffsetNumber fresh_offset;
 static ClusterCanonicalTxnBinding *retry_binding;
 static ClusterUndoRecordPrepareReceipt before_wait_receipt;
+
+/* Observe the actual extracted consumer's arguments and ordering. The
+ * recorder itself is exercised separately with its real shared publisher. */
+static struct RetryTraceCut {
+	uint8 phase;
+	Buffer old_vm, new_vm;
+	uint64 deadline;
+	int waits, vm_refs;
+	bool old_locked, new_locked;
+	ClusterCanonicalTxnBinding binding;
+	ClusterUndoRecordPrepareReceipt receipt;
+} retry_trace[4];
+static unsigned retry_trace_count;
+
+static void
+retry_observe(uint8 phase, const ClusterCanonicalTxnBinding *binding,
+	Buffer old_vm, Buffer new_vm, uint64 deadline,
+	const ClusterUndoRecordPrepareReceipt *receipt)
+{
+	struct RetryTraceCut *cut;
+
+	UT_ASSERT(retry_trace_count < lengthof(retry_trace));
+	cut = &retry_trace[retry_trace_count++];
+	cut->phase = phase;
+	cut->old_vm = old_vm;
+	cut->new_vm = new_vm;
+	cut->deadline = deadline;
+	cut->waits = wait_calls;
+	cut->vm_refs = pins[3] + pins[4];
+	cut->old_locked = heap_locked[1];
+	cut->new_locked = heap_locked[2];
+	cut->binding = *binding;
+	cut->receipt = *receipt;
+}
 
 bool cluster_update_trace_enabled;
 
@@ -363,6 +398,8 @@ run_retry(bool pair, bool temporary_lock, int vm_kind, RetryFault fault, Cluster
 	heap_locked[1] = true;
 	heap_locked[2] = pair;
 	wait_calls = key_frees = heap_relocks = recent_calls = 0;
+	retry_trace_count = 0;
+	memset(retry_trace, 0, sizeof(retry_trace));
 	vm_pins_during_wait = vm_pins_at_relock = -1;
 	pair_case = pair;
 	retry_fault = fault;
@@ -372,7 +409,9 @@ run_retry(bool pair, bool temporary_lock, int vm_kind, RetryFault fault, Cluster
 	receipt_trap_error = true;
 	if (sigsetjmp(receipt_error_jump, 1) == 0) {
 		goto l_pgrac_itl_capacity_wait;
+#define cluster_native_itl_trace_update_retry retry_observe
 #include "test_cluster_heap_itl_retry_consumer.inc"
+#undef cluster_native_itl_trace_update_retry
 	l_pgrac_reacquire:
 		observed.reacquire = true;
 		goto done;
@@ -407,6 +446,65 @@ run_retry(bool pair, bool temporary_lock, int vm_kind, RetryFault fault, Cluster
 #undef old_key_tuple
 #undef old_key_copied
 	return observed;
+}
+
+UT_TEST(retry_observations_bracket_actual_vm_release_and_exact_receipt_retry)
+{
+	for (int pair = 0; pair <= 1; pair++)
+		for (int vm_kind = 0; vm_kind <= 3; vm_kind++) {
+			ClusterUndoRecordPrepareReceipt receipt;
+			RetryObservation observed;
+			int refs = vm_kind ? 1 + (pair && vm_kind > 1) : 0;
+
+			recent_misses = 0;
+			observed = run_retry(pair, pair, vm_kind, RETRY_FAULT_NONE,
+							 CLUSTER_TXW_RESOLVED, &receipt);
+			UT_ASSERT(!observed.errored);
+			UT_ASSERT_EQ(retry_trace_count, 3);
+			for (unsigned i = 0; i < 3; i++) {
+				UT_ASSERT_EQ(retry_trace[i].phase, i + 1);
+				UT_ASSERT_EQ(retry_trace[i].deadline, 500);
+				UT_ASSERT_EQ(retry_trace[i].waits, i == 2 ? 1 : 0);
+				UT_ASSERT_EQ(retry_trace[i].vm_refs, i == 0 ? refs : 0);
+				UT_ASSERT_EQ(retry_trace[i].old_locked, i < 2);
+				UT_ASSERT_EQ(retry_trace[i].new_locked, pair && i < 2);
+				UT_ASSERT_EQ(retry_trace[i].old_vm,
+							 i == 0 && vm_kind ? 3 : InvalidBuffer);
+				UT_ASSERT_EQ(retry_trace[i].new_vm,
+							 i == 0 && pair && vm_kind > 1 ? (vm_kind == 2 ? 3 : 4)
+																 : InvalidBuffer);
+				UT_ASSERT_EQ(retry_trace[i].binding.xid, 0); /* Supplied fixture binding. */
+				UT_ASSERT_EQ(retry_trace[i].binding.segment_id, receipt.tt_slot_segment_id);
+				UT_ASSERT_EQ(retry_trace[i].binding.slot_offset, receipt.tt_slot_offset);
+				UT_ASSERT_EQ(memcmp(&retry_trace[i].receipt, &before_wait_receipt,
+								   sizeof(receipt)), 0);
+			}
+			cluster_undo_record_cancel_prepared(&receipt);
+		}
+}
+
+UT_TEST(failed_wait_or_requalification_never_emits_a_completed_retry)
+{
+	for (unsigned failure = 0; failure < 4; failure++) {
+		ClusterUndoRecordPrepareReceipt receipt;
+		RetryObservation observed;
+		ClusterTxwResult result = failure == 0 ? CLUSTER_TXW_TIMEOUT
+			: failure == 1 ? CLUSTER_TXW_DEADLOCK : CLUSTER_TXW_RESOLVED;
+		RetryFault fault = failure == 2 ? RETRY_FAULT_CANCEL
+			: failure == 3 ? RETRY_FAULT_MODIFIER : RETRY_FAULT_NONE;
+
+		recent_misses = 0;
+		observed = run_retry(true, true, 2, fault, result, &receipt);
+		UT_ASSERT(observed.errored);
+		UT_ASSERT_EQ(retry_trace_count, 2);
+		UT_ASSERT_EQ(retry_trace[0].phase, 1);
+		UT_ASSERT_EQ(retry_trace[1].phase, 2);
+		UT_ASSERT_EQ(retry_trace[1].old_vm, InvalidBuffer);
+		UT_ASSERT_EQ(retry_trace[1].new_vm, InvalidBuffer);
+		UT_ASSERT_EQ(retry_trace[1].waits, 0);
+		UT_ASSERT_EQ(memcmp(&retry_trace[1].receipt, &before_wait_receipt, sizeof(receipt)), 0);
+		receipt_abort_after_lwlock_release();
+	}
 }
 
 UT_TEST(single_page_retry_releases_vm_before_wait_and_reloads_tuple)
@@ -721,7 +819,7 @@ UT_TEST(vm_repin_errors_keep_ready_receipt_for_exact_abort_owner)
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(12);
 	UT_RUN(single_page_retry_releases_vm_before_wait_and_reloads_tuple);
 	UT_RUN(pair_retry_releases_each_vm_reference_before_page_choice_reentry);
 	UT_RUN(repin_retries_a_resident_miss_without_carrying_a_vm_pin);
@@ -732,6 +830,8 @@ main(void)
 	UT_RUN(wait_errors_preserve_cancel_or_admission_sqlstate_and_abort_owner);
 	UT_RUN(pruned_tuple_after_capacity_wait_refuses_and_keeps_exact_abort_owner);
 	UT_RUN(vm_repin_errors_keep_ready_receipt_for_exact_abort_owner);
+	UT_RUN(retry_observations_bracket_actual_vm_release_and_exact_receipt_retry);
+	UT_RUN(failed_wait_or_requalification_never_emits_a_completed_retry);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

@@ -2,10 +2,12 @@
 #define USE_PGRAC_CLUSTER 1
 #include "postgres.h"
 #include "cluster/cluster_native_itl_trace.h"
+#include "cluster/cluster_undo_record_api.h"
 #include "cluster/cluster_shmem.h"
 #include "miscadmin.h"
 #include "storage/proc.h"
 #include "storage/shmem.h"
+#include "lib/stringinfo.h"
 #include <assert.h>
 #undef printf
 #undef fprintf
@@ -26,8 +28,13 @@ void ExceptionalCondition(const char *c, const char *f, int l)
 void *ShmemInitStruct(const char *name, Size size, bool *found)
 { (void) name; *found = false; return calloc(1, size); }
 void cluster_shmem_register_region(const ClusterShmemRegion *r) { registered = r; }
+void *palloc(Size size) { void *p = malloc(size); if (!p) abort(); return p; }
+void *repalloc(void *p, Size size) { p = realloc(p, size); if (!p) abort(); return p; }
+void pfree(void *p) { free(p); }
+int errdetail(const char *fmt, ...) { (void)fmt; abort(); }
 
 #include "../../backend/cluster/cluster_native_itl_trace.c"
+#include "test_cluster_native_itl_json.inc"
 
 static void reset(void)
 {
@@ -317,9 +324,133 @@ static void terminal_invalid_lsn_is_not_an_active_key_proof(void)
 	UT_ASSERT_EQ(row.active_sequence, 0); UT_ASSERT_EQ(row.terminal_lsn, 0);
 }
 
-int main(void)
+static ClusterUndoRecordPrepareReceipt retry_receipt(void)
 {
-	UT_PLAN(22);
+	ClusterUndoRecordPrepareReceipt r = {0};
+	r.magic = 1234; r.record_type = 2; r.owner_instance = 3;
+	r.payload_capacity = 1024; r.tt_slot_segment_id = 12; r.tt_slot_offset = 5;
+	r.actual_segment_id = 34; r.reservation_sequence = UINT64_C(9007199254740993);
+	r.absolute_deadline_us = UINT64_C(18446744073709551614);
+	r.ctrc_pending_mask = 3; r.ctrc_prepared_mask = 1; r.ctrc_reuse_mask = 1;
+	r.ctrc_attempt_generation = 7;
+	return r;
+}
+
+static void retry_copies_owned_handles_and_local_receipt_without_inventing_key(void)
+{
+	ClusterCanonicalTxnBinding binding = terminal_binding();
+	ClusterUndoRecordPrepareReceipt receipt = retry_receipt();
+	ClusterNativeItlTraceEvent row = {0};
+	reset(); seed_terminal_active();
+	cluster_native_itl_trace_update_retry(CLNITL_RETRY_BEFORE_VM_RELEASE, &binding,
+		3, 3, UINT64_C(9223372036854775808), &receipt);
+	memset(&binding, 0, sizeof(binding)); memset(&receipt, 0, sizeof(receipt));
+	UT_ASSERT(cluster_native_itl_trace_read(1, &row));
+	UT_ASSERT_EQ(row.kind, CLNITL_UPDATE_RETRY);
+	UT_ASSERT(!row.key_known && !row.page_known); UT_ASSERT_EQ(row.active_sequence, 0);
+	UT_ASSERT(row.native_binding_known); UT_ASSERT_EQ(row.native_binding.active_lsn, 123);
+	UT_ASSERT_EQ(row.pid, 700); UT_ASSERT_EQ(row.process_incarnation, 6);
+	UT_ASSERT(row.retry.observed && row.retry.receipt_present);
+	UT_ASSERT_EQ(row.retry.phase, 1); UT_ASSERT_EQ(row.retry.old_vm, 3);
+	UT_ASSERT_EQ(row.retry.new_vm, 3);
+	UT_ASSERT_EQ(row.retry.wait_deadline_us, UINT64_C(9223372036854775808));
+	UT_ASSERT_EQ(row.retry.reservation_sequence, UINT64_C(9007199254740993));
+	UT_ASSERT_EQ(row.retry.prepare_deadline_us, UINT64_C(18446744073709551614));
+	UT_ASSERT_EQ(row.retry.magic, 1234); UT_ASSERT_EQ(row.retry.record_type, 2);
+	UT_ASSERT_EQ(row.retry.owner_instance, 3); UT_ASSERT_EQ(row.retry.payload_capacity, 1024);
+	UT_ASSERT_EQ(row.retry.segment_id, 12); UT_ASSERT_EQ(row.retry.slot_offset, 5);
+	UT_ASSERT_EQ(row.retry.actual_segment_id, 34); UT_ASSERT_EQ(row.retry.attempt_generation, 7);
+	UT_ASSERT_EQ(row.retry.pending_mask, 3); UT_ASSERT_EQ(row.retry.prepared_mask, 1);
+	UT_ASSERT_EQ(row.retry.applied_mask, 0); UT_ASSERT_EQ(row.retry.reuse_mask, 1);
+}
+
+static void retry_missing_inputs_are_preserved_as_unknown(void)
+{
+	ClusterNativeItlTraceEvent row = {0};
+	reset();
+	cluster_native_itl_trace_update_retry(CLNITL_RETRY_BEFORE_WAIT, NULL,
+		InvalidBuffer, InvalidBuffer, 500, NULL);
+	UT_ASSERT(cluster_native_itl_trace_read(0, &row));
+	UT_ASSERT(row.retry.observed); UT_ASSERT(!row.retry.receipt_present);
+	UT_ASSERT(!row.native_binding_known && !row.key_known);
+	UT_ASSERT_EQ(row.retry.phase, 2); UT_ASSERT_EQ(row.retry.reservation_sequence, 0);
+	UT_ASSERT_EQ(row.retry.old_vm, InvalidBuffer); UT_ASSERT_EQ(row.retry.new_vm, InvalidBuffer);
+}
+
+static void retry_invalid_native_binding_is_copied_but_not_qualified(void)
+{
+	for (unsigned i = 0; i < 4; i++) {
+		ClusterCanonicalTxnBinding binding = terminal_binding();
+		ClusterNativeItlTraceEvent row = {0};
+		reset();
+		if (i == 0) binding.publish_state = CLUSTER_CANONICAL_TXN_NONE;
+		if (i == 1) binding.reserved16 = 1;
+		if (i == 2) binding.active_lsn = InvalidXLogRecPtr;
+		if (i == 3) binding.xid = InvalidTransactionId;
+		cluster_native_itl_trace_update_retry(CLNITL_RETRY_REQUALIFIED, &binding,
+			InvalidBuffer, InvalidBuffer, 500, NULL);
+		UT_ASSERT(cluster_native_itl_trace_read(0, &row));
+		UT_ASSERT(!row.native_binding_known && !row.key_known);
+		UT_ASSERT_EQ(memcmp(&row.native_binding, &binding, sizeof(binding)), 0);
+	}
+}
+
+static void retry_disabled_does_not_dereference_supplied_inputs(void)
+{
+	reset(); cluster_trace_tx_identity = false; MyProc = NULL;
+	cluster_native_itl_trace_update_retry(CLNITL_RETRY_BEFORE_WAIT,
+		(const ClusterCanonicalTxnBinding *)(uintptr_t)1, 3, 4, 500,
+		(const ClusterUndoRecordPrepareReceipt *)(uintptr_t)1);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&native_itl_trace->next), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&native_itl_trace->dropped), 0);
+}
+
+static void retry_export_preserves_integer_precision_and_unknown_scope(void)
+{
+	ClusterCanonicalTxnBinding binding = terminal_binding();
+	ClusterUndoRecordPrepareReceipt receipt = retry_receipt();
+	ClusterNativeItlTraceEvent row = {0};
+	StringInfoData out;
+	reset();
+	cluster_native_itl_trace_update_retry(CLNITL_RETRY_REQUALIFIED, &binding,
+		InvalidBuffer, InvalidBuffer, UINT64_C(9223372036854775808), &receipt);
+	UT_ASSERT(cluster_native_itl_trace_read(0, &row));
+	initStringInfo(&out); append_event(&out, &row);
+	UT_ASSERT_STR_CONTAINS(out.data, "\"update_retry\":{\"observed\":true,\"phase\":3,\"old_vm\":0,\"new_vm\":0");
+	UT_ASSERT_STR_CONTAINS(out.data, "\"wait_deadline_us\":\"9223372036854775808\"");
+	UT_ASSERT_STR_CONTAINS(out.data, "\"reservation_sequence\":\"9007199254740993\"");
+	UT_ASSERT_STR_CONTAINS(out.data, "\"prepare_deadline_us\":\"18446744073709551614\"");
+	UT_ASSERT_STR_CONTAINS(out.data, "\"receipt_present\":true,\"receipt_projection_only\":true");
+	UT_ASSERT_STR_CONTAINS(out.data, "\"ready_known\":false");
+	UT_ASSERT_STR_CONTAINS(out.data, "\"shared_retirement_known\":false");
+	UT_ASSERT_STR_CONTAINS(out.data, "\"vm_reference_counts_known\":false");
+	UT_ASSERT_STR_CONTAINS(out.data, "\"key_known\":false");
+	free(out.data);
+	row = sample(); initStringInfo(&out); append_event(&out, &row);
+	UT_ASSERT_STR_CONTAINS(out.data, "\"update_retry\":{\"observed\":false");
+	free(out.data);
+}
+
+static int retry_json(bool missing)
+{
+	ClusterCanonicalTxnBinding binding = terminal_binding();
+	ClusterUndoRecordPrepareReceipt receipt = retry_receipt();
+	ClusterNativeItlTraceEvent row = {0};
+	StringInfoData out;
+	reset();
+	cluster_native_itl_trace_update_retry(CLNITL_RETRY_REQUALIFIED,
+		missing ? NULL : &binding, InvalidBuffer, InvalidBuffer,
+		UINT64_C(9223372036854775808), missing ? NULL : &receipt);
+	if (!cluster_native_itl_trace_read(0, &row)) return 1;
+	initStringInfo(&out); append_event(&out, &row); puts(out.data); free(out.data);
+	return 0;
+}
+
+int main(int argc, char **argv)
+{
+	if (argc == 2 && strcmp(argv[1], "--retry-json") == 0) return retry_json(false);
+	if (argc == 2 && strcmp(argv[1], "--missing-retry-json") == 0) return retry_json(true);
+	UT_PLAN(27);
 	UT_RUN(disabled_is_inert); UT_RUN(immutable_owned_copy); UT_RUN(prefix_is_complete);
 	UT_RUN(unpublished_hole_is_incomplete); UT_RUN(full_never_overwrites);
 	UT_RUN(unavailable_is_incomplete); UT_RUN(missing_actor_is_not_invented);
@@ -337,5 +468,10 @@ int main(void)
 	UT_RUN(terminal_conflicting_active_keys_are_unknown);
 	UT_RUN(terminal_disabled_is_inert_without_actor);
 	UT_RUN(terminal_invalid_lsn_is_not_an_active_key_proof);
+	UT_RUN(retry_copies_owned_handles_and_local_receipt_without_inventing_key);
+	UT_RUN(retry_missing_inputs_are_preserved_as_unknown);
+	UT_RUN(retry_invalid_native_binding_is_copied_but_not_qualified);
+	UT_RUN(retry_disabled_does_not_dereference_supplied_inputs);
+	UT_RUN(retry_export_preserves_integer_precision_and_unknown_scope);
 	UT_DONE(); return ut_failed_count ? 1 : 0;
 }
