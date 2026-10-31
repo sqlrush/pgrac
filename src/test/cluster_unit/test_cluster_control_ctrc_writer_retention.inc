@@ -40,7 +40,7 @@ UT_TEST(test_ctrc_writer_retention_binds_both_original_sources_without_new_cut)
 		}
 		UT_ASSERT_EQ(test_cf_lock_calls, cf); UT_ASSERT_EQ(test_tx_ir_grants, grants);
 		UT_ASSERT_EQ(test_tx_ir_releases, releases); UT_ASSERT_EQ(inputs_pin_generation, pin);
-		UT_ASSERT(inputs_pin_held && ctrc_set_held == 2);
+		UT_ASSERT(inputs_recovery_held && ctrc_set_held == 2);
 		ctrc_set_finish(&inputs);
 	}
 }
@@ -89,7 +89,7 @@ UT_TEST(test_ctrc_writer_retention_requires_actual_writer_thread_not_first_pin)
 	inputs_pin_threads[1] = 2;
 	UT_ASSERT(cluster_wal_inputs_ctrc_replays_source_current_v1(&source));
 	UT_ASSERT(!cluster_wal_inputs_ctrc_writer_retained_v1(&source, &writer));
-	UT_ASSERT(inputs_pin_held && ctrc_set_held == 2 && test_tx_ir_releases == 0);
+	UT_ASSERT(inputs_recovery_held && ctrc_set_held == 2 && test_tx_ir_releases == 0);
 	inputs_pin_threads[1] = 128;
 	ctrc_set_finish(&inputs);
 }
@@ -109,7 +109,7 @@ UT_TEST(test_ctrc_writer_retention_loss_preserves_original_cleanup_debt)
 		if (fault == 3) CritSectionCount++;
 		if (fault == 4) ShutdownRequestPending = true;
 		UT_ASSERT(!cluster_wal_inputs_ctrc_writer_retained_v1(&source, &writer));
-		UT_ASSERT(inputs_pin_held && ctrc_set_held == 2 && test_tx_ir_releases == 0);
+		UT_ASSERT(inputs_recovery_held && ctrc_set_held == 2 && test_tx_ir_releases == 0);
 		inputs_pin_current = test_input_current = true;
 		if (fault == 2) ctrc_inputs_work.generation--;
 		if (fault == 3) CritSectionCount--;
@@ -130,7 +130,7 @@ UT_TEST(test_ctrc_writer_retention_old_incarnation_cannot_borrow_reopened_scope)
 	UT_ASSERT(!cluster_wal_inputs_ctrc_writer_retained_v1(&source, &writer));
 	ctrc_writer_retention_fixture(&inputs, 1);
 	UT_ASSERT(!cluster_wal_inputs_ctrc_writer_retained_v1(&source, &writer));
-	UT_ASSERT(inputs_pin_held && ctrc_set_held == 2);
+	UT_ASSERT(inputs_recovery_held && ctrc_set_held == 2);
 	ctrc_set_finish(&inputs);
 }
 
@@ -165,7 +165,7 @@ UT_TEST(test_ctrc_writer_retention_rechecks_complete_inputs_after_original_callb
 		ctrc_replay_current_override = ctrc_writer_retention_change;
 		UT_ASSERT(!cluster_wal_inputs_ctrc_writer_retained_v1(&source, &writer));
 		UT_ASSERT(ctrc_writer_changed_source == NULL && ctrc_writer_changed_writer == NULL);
-		UT_ASSERT(inputs_pin_held && ctrc_set_held == 2 && test_tx_ir_releases == 0);
+		UT_ASSERT(inputs_recovery_held && ctrc_set_held == 2 && test_tx_ir_releases == 0);
 		ctrc_set_finish(&inputs);
 	}
 }

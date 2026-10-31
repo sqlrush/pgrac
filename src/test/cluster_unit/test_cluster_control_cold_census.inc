@@ -21,7 +21,7 @@ cold_census_source(const ClusterWalSourceRef *source, const RfContributorStreamC
 	ColdCensusTest *work = arg;
 
 	UT_ASSERT_EQ(test_actual_cf, NoLock);
-	UT_ASSERT(inputs_pin_held && inputs_pin_current);
+	UT_ASSERT((inputs_pin_held || inputs_recovery_held) && inputs_pin_current);
 	UT_ASSERT_EQ(source->claim.identity.origin_thread_id, cut->failed_thread);
 	UT_ASSERT_EQ(source->claim.identity.origin_owner_incarnation, cut->origin_owner_incarnation);
 	UT_ASSERT_EQ(source->timeline, cut->timeline_id);
@@ -69,7 +69,7 @@ cold_census_record(XLogReaderState *reader, const ClusterWalSourceRef *source,
 
 	UT_ASSERT(work->active);
 	UT_ASSERT_EQ(test_actual_cf, NoLock);
-	UT_ASSERT(inputs_pin_held && inputs_pin_current);
+	UT_ASSERT((inputs_pin_held || inputs_recovery_held) && inputs_pin_current);
 	UT_ASSERT_EQ(memcmp(&work->source, source, sizeof(*source)), 0);
 	UT_ASSERT_EQ(memcmp(&work->cut, cut, sizeof(*cut)), 0);
 	UT_ASSERT(reader->ReadRecPtr >= cut->scan_begin_inclusive);

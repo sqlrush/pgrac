@@ -22591,6 +22591,7 @@ UT_TEST(test_config_poll_requires_background_role_and_preserves_aliased_input)
  * anchor, history and physical WAL use actual files and production readers.
  * test_cluster_wal_writer separately executes the actual native owner. */
 static bool inputs_pin_held, inputs_pin_current;
+static bool inputs_recovery_held;
 static unsigned inputs_absorbs;
 void AbsorbSyncRequests(void);
 void
@@ -22690,7 +22691,7 @@ cluster_shared_fs_undo_path_resolve(uint8 owner, uint32 segment, char *out, size
 	tx_inputs_path_calls++;
 	UT_ASSERT_EQ(owner, 1);
 	UT_ASSERT_EQ(segment, 1);
-	UT_ASSERT(inputs_pin_held && test_actual_cf == NoLock);
+	UT_ASSERT((inputs_pin_held || inputs_recovery_held) && test_actual_cf == NoLock);
 	if (tx_inputs_path_fault == 1)
 		return -1;
 	if (tx_inputs_path_fault == 2)
@@ -22716,7 +22717,7 @@ test_wal_inputs_claim_read(const char *path, const ClusterWalThreadClaimRefV2 *r
 	if (inputs_claim_observe) {
 		inputs_claim_calls++;
 		inputs_claim_under_cf += test_actual_cf != NoLock;
-		inputs_claim_unpinned += !inputs_pin_held || !inputs_pin_current;
+		inputs_claim_unpinned += (!inputs_pin_held && !inputs_recovery_held) || !inputs_pin_current;
 	}
 	result = cluster_wal_claim_v2_read(path, ref, out);
 	if (inputs_claim_observe && inputs_claim_calls == (inputs_checkpoint_observe ? 1 : 2)) {
@@ -22743,7 +22744,7 @@ struct ClusterWalCutV1 {
 ClusterControlRootResult
 cluster_wal_cut_begin_v1(const ClusterWalSourceRef *source, ClusterWalCutV1 **out)
 {
-	UT_ASSERT(inputs_pin_held && test_actual_cf == NoLock);
+	UT_ASSERT((inputs_pin_held || inputs_recovery_held) && test_actual_cf == NoLock);
 	UT_ASSERT(source->claim.identity.origin_node_id != cluster_node_id);
 	UT_ASSERT(*out == NULL);
 	*out = palloc0(sizeof(**out));
@@ -22754,7 +22755,7 @@ cluster_wal_cut_begin_v1(const ClusterWalSourceRef *source, ClusterWalCutV1 **ou
 ClusterControlRootResult
 cluster_wal_cut_poll_v1(ClusterWalCutV1 *cut, ClusterWalWriterFlushV1 *out)
 {
-	UT_ASSERT(inputs_pin_held && test_actual_cf == NoLock && cut != NULL);
+	UT_ASSERT((inputs_pin_held || inputs_recovery_held) && test_actual_cf == NoLock && cut != NULL);
 	memset(out, 0, sizeof(*out));
 	if (inputs_peer_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return inputs_peer_result;
@@ -22801,7 +22802,7 @@ RecoveryInProgress(void)
 ClusterControlRootResult
 cluster_wal_writer_begin(TimeLineID timeline, ClusterWalWriterToken *out)
 {
-	UT_ASSERT(inputs_pin_held && test_actual_cf == NoLock);
+	UT_ASSERT((inputs_pin_held || inputs_recovery_held) && test_actual_cf == NoLock);
 	inputs_native_begin_calls++;
 	*out = inputs_native_writer;
 	return timeline == out->ref.timeline ? CLUSTER_CONTROL_ROOT_OK_PRIMARY
@@ -22811,7 +22812,7 @@ cluster_wal_writer_begin(TimeLineID timeline, ClusterWalWriterToken *out)
 ClusterControlRootResult
 cluster_wal_writer_check(const ClusterWalWriterToken *token)
 {
-	UT_ASSERT(inputs_pin_held && test_actual_cf == NoLock);
+	UT_ASSERT((inputs_pin_held || inputs_recovery_held) && test_actual_cf == NoLock);
 	return memcmp(token, &inputs_native_writer, sizeof(*token)) == 0
 			   ? CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		   : inputs_native_reconfigured ? CLUSTER_CONTROL_ROOT_RECONFIG_WAIT
@@ -22821,7 +22822,7 @@ cluster_wal_writer_check(const ClusterWalWriterToken *token)
 ClusterControlRootResult
 cluster_wal_writer_flushed_v1(ClusterWalWriterFlushV1 *out)
 {
-	UT_ASSERT(inputs_pin_held && test_actual_cf == NoLock);
+	UT_ASSERT((inputs_pin_held || inputs_recovery_held) && test_actual_cf == NoLock);
 	inputs_native_flush_calls++;
 	memset(out, 0, sizeof(*out));
 	if (inputs_native_wait)
@@ -22834,7 +22835,7 @@ ClusterControlRootResult
 cluster_wal_writer_flush_sample_v1(const ClusterWalWriterSampleV1 *sample,
 								   ClusterWalWriterFlushV1 *out)
 {
-	UT_ASSERT(inputs_pin_held && test_actual_cf == NoLock);
+	UT_ASSERT((inputs_pin_held || inputs_recovery_held) && test_actual_cf == NoLock);
 	inputs_native_flush_calls++;
 	memset(out, 0, sizeof(*out));
 	if (memcmp(&sample->writer, &inputs_native_writer, sizeof(sample->writer)) != 0)
@@ -22850,10 +22851,28 @@ cluster_wal_writer_flush_sample_v1(const ClusterWalWriterSampleV1 *sample,
 }
 
 static uint64 inputs_pin_generation;
+static uint64 inputs_pin_acquires, inputs_pin_releases;
+static unsigned inputs_recovery_borrows;
+
+ClusterWalReadPinOwnerV1
+ClusterColdRecoveryTxInputOwnerV1(const struct ClusterRecoveryStartV1 *start)
+{
+	ClusterWalReadPinOwnerV1 owner = {0};
+	if (inputs_pin_race && ++inputs_recovery_borrows >= 2) {
+		inputs_pin_race = false;
+		v2_checkpoint_root_race();
+	}
+	if (ClusterColdRecoveryTxCurrent(start) && inputs_recovery_held && inputs_pin_current) {
+		owner.recovery_pin = (ClusterWalRetentionPin *)&inputs_recovery_held;
+		owner.recovery_generation = inputs_pin_generation;
+	}
+	return owner;
+}
 
 ClusterWalPinResult
 cluster_wal_read_pin_acquire_v1(const uint16 *threads, uint16 count, ClusterWalReadPinV1 **out)
 {
+	inputs_pin_acquires++;
 	UT_ASSERT_EQ(test_actual_cf, NoLock);
 	*out = NULL;
 	if (inputs_pin_refuse)
@@ -22889,19 +22908,34 @@ bool
 cluster_wal_read_pin_owner_v1(ClusterWalReadPinV1 *pin, ClusterWalReadPinOwnerV1 *out)
 {
 	if (out == NULL || !cluster_wal_read_pin_covers_v1(pin, inputs_pin_threads[0])) return false;
-	*out = (ClusterWalReadPinOwnerV1){pin, inputs_pin_generation};
+	*out = (ClusterWalReadPinOwnerV1){.pin = pin, .generation = inputs_pin_generation};
 	return true;
 }
 bool
 cluster_wal_read_pin_owner_current_v1(const ClusterWalReadPinOwnerV1 *owner)
 {
+	if (owner != NULL && owner->recovery_pin != NULL)
+		return owner->pin == NULL && owner->generation == 0
+			&& owner->recovery_pin == (ClusterWalRetentionPin *)&inputs_recovery_held
+			&& owner->recovery_generation == inputs_pin_generation
+			&& inputs_recovery_held && inputs_pin_current;
 	return owner != NULL && owner->generation == inputs_pin_generation
 		&& cluster_wal_read_pin_covers_v1(owner->pin, inputs_pin_threads[0]);
+}
+
+bool
+cluster_wal_read_pin_owner_covers_v1(const ClusterWalReadPinOwnerV1 *owner, uint16 thread)
+{
+	if (!cluster_wal_read_pin_owner_current_v1(owner)) return false;
+	for (uint16 i = 0; i < inputs_pin_count; i++)
+		if (inputs_pin_threads[i] == thread) return true;
+	return false;
 }
 
 ClusterWalrReleaseResult
 cluster_wal_read_pin_release_v1(ClusterWalReadPinV1 **pin)
 {
+	inputs_pin_releases++;
 	UT_ASSERT_EQ(test_actual_cf, NoLock);
 	UT_ASSERT(!test_tx_ir_held);
 	UT_ASSERT(*pin == (ClusterWalReadPinV1 *)&inputs_pin_held && inputs_pin_held);
@@ -22923,6 +22957,7 @@ inputs_fixture(uint8 bytes[66048], ClusterRecoveryAnchorV2 anchors[2])
 	test_actual_cf = test_cf_mode = NoLock;
 	test_cf_local_caller = NULL;
 	test_cf_grant = test_cf_release_confirmed = true;
+	inputs_recovery_held = false;
 	inputs_pin_held = inputs_pin_refuse = inputs_pin_race = inputs_pin_throw = false;
 	inputs_native_begin_calls = inputs_native_flush_calls = 0;
 	inputs_absorbs = 0;
@@ -22946,7 +22981,7 @@ inputs_visit_record(XLogReaderState *reader, void *arg)
 {
 	InputsVisitTest *visit = arg;
 	UT_ASSERT_EQ(test_actual_cf, NoLock);
-	UT_ASSERT(inputs_pin_held && inputs_pin_current);
+	UT_ASSERT((inputs_pin_held || inputs_recovery_held) && inputs_pin_current);
 	UT_ASSERT(reader->ReadRecPtr < reader->EndRecPtr);
 	visit->calls++;
 	if (visit->fault == 1) {
@@ -24062,6 +24097,7 @@ UT_TEST(test_wal_inputs_initialized_predecessor_needs_exact_installed_origin)
 		return;
 	cluster_node_id = 0;
 	MyBackendType = B_BG_WRITER;
+	inputs_recovery_held = false;
 	inputs_pin_held = inputs_pin_refuse = inputs_pin_race = inputs_pin_throw = false;
 	inputs_pin_current = true;
 	inputs_exit_valid = false;
@@ -24141,6 +24177,7 @@ UT_TEST(test_wal_inputs_installed_predecessor_needs_exact_original_exit)
 	UT_ASSERT(!ut_current_failed);
 	cluster_node_id = 0;
 	MyBackendType = B_BG_WRITER;
+	inputs_recovery_held = false;
 	inputs_pin_held = inputs_pin_refuse = inputs_pin_race = inputs_pin_throw = false;
 	inputs_pin_current = true;
 	UT_ASSERT_EQ(cluster_wal_inputs_begin_v1(v2_storage, TEST_SYSID, &inputs), 0);
@@ -24201,6 +24238,7 @@ inputs_cold_checkpoint_fixture(ClusterControlRootFileToken *token, ClusterWalInp
 	test_actual_cf = test_cf_mode = NoLock;
 	test_cf_local_caller = NULL;
 	test_cf_grant = test_cf_release_confirmed = true;
+	inputs_recovery_held = false;
 	inputs_pin_held = inputs_pin_refuse = inputs_pin_race = inputs_pin_throw = false;
 	inputs_claim_observe = inputs_checkpoint_observe = false;
 	cluster_shared_config = true;
@@ -25140,6 +25178,8 @@ tx_inputs_activate(void)
 	tx_inputs_start = (const struct ClusterRecoveryStartV1 *)&tx_inputs_typed;
 	tx_inputs_owner = CurrentResourceOwner;
 	tx_inputs_owner_current = true;
+	inputs_recovery_held = inputs_pin_current = true;
+	inputs_recovery_borrows = 0;
 	tx_inputs_generation = 17;
 	tx_inputs_serial = 1;
 	memset(&tx_inputs_candidate, 0, sizeof(tx_inputs_candidate));
@@ -25584,7 +25624,7 @@ UT_TEST(test_tx_retention_uncertain_ir_release_preserves_original_scope_debt)
 	PG_END_TRY();
 	test_capture_error_level = false;
 	UT_ASSERT(caught && test_last_error_level == FATAL);
-	UT_ASSERT(inputs != NULL && inputs_pin_held && test_tx_ir_held);
+	UT_ASSERT(inputs != NULL && inputs_recovery_held && test_tx_ir_held);
 	UT_ASSERT(!cluster_wal_inputs_tx_retention_current_v1(&view));
 	test_input_release = true;
 	cluster_wal_inputs_release_v1(&inputs);
@@ -25621,7 +25661,7 @@ UT_TEST(test_tx_ir_post_grant_root_drift_refuses_before_any_mutation)
 	UT_ASSERT_EQ(cluster_wal_inputs_tx_abort_acquire_v1(inputs, &tx_inputs_candidate.record),
 		CLUSTER_CONTROL_ROOT_STALE_TOKEN);
 	UT_ASSERT_EQ(test_tx_ir_grants, 1);
-	UT_ASSERT(test_tx_ir_held && inputs_pin_held);
+	UT_ASSERT(test_tx_ir_held && inputs_recovery_held);
 	UT_ASSERT(!cluster_wal_inputs_tx_abort_authorized_v1(inputs, &tx_inputs_candidate.record));
 	cluster_wal_inputs_release_v1(&inputs);
 	UT_ASSERT_EQ(test_tx_ir_releases, 1);
@@ -25680,7 +25720,7 @@ UT_TEST(test_tx_ir_contention_and_suspend_do_not_renew_old_permission)
 	test_input_acquire = CLUSTER_RECOVERY_SERIAL_BUSY;
 	UT_ASSERT_EQ(cluster_wal_inputs_tx_abort_acquire_v1(inputs, &tx_inputs_candidate.record),
 		CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
-	UT_ASSERT(!test_tx_ir_held && inputs_pin_held);
+	UT_ASSERT(!test_tx_ir_held && inputs_recovery_held);
 	test_input_acquire = CLUSTER_RECOVERY_SERIAL_GRANTED;
 	UT_ASSERT_EQ(cluster_wal_inputs_tx_abort_acquire_v1(inputs, &tx_inputs_candidate.record), 0);
 	UT_ASSERT_EQ(cluster_wal_inputs_suspend_v1(inputs), 0);
@@ -25729,7 +25769,7 @@ UT_TEST(test_tx_ir_unconfirmed_release_retains_scope_pin_and_original_owner)
 	PG_END_TRY();
 	test_capture_error_level = false;
 	UT_ASSERT(caught && test_last_error_level == FATAL);
-	UT_ASSERT(inputs != NULL && test_tx_ir_held && inputs_pin_held);
+	UT_ASSERT(inputs != NULL && test_tx_ir_held && inputs_recovery_held);
 	UT_ASSERT(!cluster_wal_inputs_tx_abort_authorized_v1(inputs, &tx_inputs_candidate.record));
 	test_input_release = true;
 	cluster_wal_inputs_release_v1(&inputs);
@@ -25759,6 +25799,7 @@ UT_TEST(test_tx_ir_exact_history_source_is_selected_without_current_rr_fallback)
 	UT_ASSERT_EQ(cluster_control_root_v3_encode(&root), 0);
 	v2_write_roots(root.bytes);
 	cluster_shared_config = true; MyBackendType = B_BG_WORKER;
+	inputs_recovery_held = false;
 	inputs_pin_held = inputs_pin_refuse = inputs_pin_race = inputs_pin_throw = false;
 	UT_ASSERT_EQ(cluster_wal_inputs_begin_v1(v2_storage, TEST_SYSID, &inputs), 0);
 	for (uint32 i = 0; i < cluster_wal_inputs_count_v1(inputs); i++) {
@@ -25821,6 +25862,7 @@ UT_TEST(test_tx_subject_authority_binds_exact_selected_history)
 	UT_ASSERT_EQ(cluster_control_root_v3_encode(&root), 0);
 	v2_write_roots(root.bytes);
 	cluster_shared_config = true; MyBackendType = B_BG_WORKER;
+	inputs_recovery_held = false;
 	inputs_pin_held = inputs_pin_refuse = inputs_pin_race = inputs_pin_throw = false;
 	UT_ASSERT_EQ(cluster_wal_inputs_begin_v1(v2_storage, TEST_SYSID, &inputs), 0);
 	for (uint32 i = 0; i < cluster_wal_inputs_count_v1(inputs); i++) {
@@ -26013,6 +26055,58 @@ UT_TEST(test_tx_inputs_parent_subject_and_wait_revalidation)
 }
 
 #include "test_cluster_control_ctrc_inputs.inc"
+
+UT_TEST(test_post_eor_scopes_borrow_original_walr_without_native_acquire_or_release)
+{
+	for (unsigned census = 0; census < 2; census++) {
+		ClusterWalInputsV1 *inputs = NULL, *second = NULL;
+		ClusterWalReadPinOwnerV1 original, after;
+		uint64 acquired, released;
+
+		if (census) ctrc_inputs_fixture(); else tx_inputs_fixture();
+		original = ClusterColdRecoveryTxInputOwnerV1(tx_inputs_start);
+		acquired = inputs_pin_acquires; released = inputs_pin_releases;
+		UT_ASSERT(original.recovery_pin != NULL);
+		UT_ASSERT_EQ(census ? ctrc_inputs_begin(&inputs) : tx_inputs_begin(&inputs), 0);
+		UT_ASSERT(inputs != NULL && !inputs_pin_held && inputs_recovery_held);
+		UT_ASSERT_EQ(census ? ctrc_inputs_begin(&second) : tx_inputs_begin(&second),
+			CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+		UT_ASSERT(second == NULL);
+		UT_ASSERT_EQ(cluster_wal_inputs_suspend_v1(inputs), 0);
+		UT_ASSERT(inputs_recovery_held);
+		UT_ASSERT_EQ(cluster_wal_inputs_resume_v1(inputs), 0);
+		cluster_wal_inputs_release_v1(&inputs);
+		after = ClusterColdRecoveryTxInputOwnerV1(tx_inputs_start);
+		UT_ASSERT(memcmp(&after, &original, sizeof(after)) == 0);
+		UT_ASSERT(cluster_wal_read_pin_owner_current_v1(&after));
+		UT_ASSERT_EQ(inputs_pin_acquires, acquired);
+		UT_ASSERT_EQ(inputs_pin_releases, released);
+		test_inputs_startup_cf = false;
+	}
+}
+
+UT_TEST(test_post_eor_borrow_missing_member_and_late_owner_loss_keep_original_debt)
+{
+	for (unsigned fault = 0; fault < 3; fault++) {
+		ClusterWalInputsV1 *inputs = NULL;
+		uint64 acquired, released;
+		tx_inputs_fixture();
+		acquired = inputs_pin_acquires; released = inputs_pin_releases;
+		if (fault == 0) inputs_pin_count--;
+		else if (fault == 1) inputs_recovery_held = false;
+		UT_ASSERT_EQ(tx_inputs_begin(&inputs), fault < 2 ? CLUSTER_CONTROL_ROOT_STALE_TOKEN : 0);
+		if (fault == 2) {
+			inputs_pin_generation++;
+			UT_ASSERT_EQ(cluster_wal_inputs_revalidate_v1(inputs), CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+			cluster_wal_inputs_release_v1(&inputs);
+			UT_ASSERT(inputs_recovery_held);
+		}
+		UT_ASSERT(inputs == NULL && !inputs_pin_held);
+		UT_ASSERT_EQ(inputs_pin_acquires, acquired);
+		UT_ASSERT_EQ(inputs_pin_releases, released);
+		test_inputs_startup_cf = false;
+	}
+}
 #include "test_cluster_control_ctrc_local_wal.inc"
 #include "test_cluster_control_ctrc_namespace.inc"
 #include "test_cluster_control_ctrc_ir.inc"
@@ -26621,7 +26715,9 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(629);
+	UT_PLAN(631);
+	UT_RUN(test_post_eor_scopes_borrow_original_walr_without_native_acquire_or_release);
+	UT_RUN(test_post_eor_borrow_missing_member_and_late_owner_loss_keep_original_debt);
 	UT_RUN(test_ctrc_writer_retention_binds_both_original_sources_without_new_cut);
 	UT_RUN(test_ctrc_writer_retention_rejects_different_complete_writer_or_source);
 	UT_RUN(test_ctrc_writer_retention_requires_actual_writer_thread_not_first_pin);

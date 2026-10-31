@@ -246,7 +246,7 @@ UT_TEST(test_ctrc_native_read_exact_five_reads_under_original_owners)
 		UT_ASSERT_EQ(ctrc_read_native_reads, 5); UT_ASSERT_EQ(ctrc_read_native_opens, 1);
 		UT_ASSERT_EQ(test_cf_lock_calls, cf); UT_ASSERT_EQ(test_tx_ir_grants, grants);
 		UT_ASSERT_EQ(test_tx_ir_releases, releases); UT_ASSERT_EQ(ctrc_set_held, 2);
-		UT_ASSERT(inputs_pin_held); ctrc_read_native_finish(&f);
+		UT_ASSERT(inputs_recovery_held); ctrc_read_native_finish(&f);
 	}
 }
 
@@ -320,7 +320,7 @@ UT_TEST(test_ctrc_native_read_lost_owner_after_each_read_retains_page_and_debt)
 		ctrc_read_native_fixture(&f, true); releases = test_tx_ir_releases;
 		ctrc_read_native_drift_at = read;
 		ctrc_read_native_refused(&f); UT_ASSERT_EQ(ctrc_read_native_reads, read);
-		UT_ASSERT_EQ(test_tx_ir_releases, releases); UT_ASSERT(inputs_pin_held && ctrc_set_held == 2);
+		UT_ASSERT_EQ(test_tx_ir_releases, releases); UT_ASSERT(inputs_recovery_held && ctrc_set_held == 2);
 		UT_ASSERT(rf_page_guard_preflight_v1(&f.page.target.page_identity, &pre));
 		UT_ASSERT(!rf_page_guard_promote_nowait_v1(&pre, &probe));
 		ctrc_read_native_finish(&f);
@@ -360,7 +360,7 @@ UT_TEST(test_ctrc_native_read_error_propagates_without_retiring_owners)
 		PG_TRY(); { (void)ctrc_read_native_image(&f); }
 		PG_CATCH(); { caught = true; } PG_END_TRY();
 		UT_ASSERT(caught); UT_ASSERT_EQ(ctrc_read_native_reads, read);
-		UT_ASSERT_EQ(test_tx_ir_releases, releases); UT_ASSERT(inputs_pin_held && ctrc_set_held == 2);
+		UT_ASSERT_EQ(test_tx_ir_releases, releases); UT_ASSERT(inputs_recovery_held && ctrc_set_held == 2);
 		UT_ASSERT_EQ(rf_page_authority_ctrc_replays_revalidate_nowait_v1(f.page.page.authority), 0);
 		ctrc_read_native_finish(&f);
 	}

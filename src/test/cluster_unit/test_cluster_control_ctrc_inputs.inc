@@ -224,7 +224,7 @@ UT_TEST(test_ctrc_inputs_wait_resume_keeps_original_work_and_whole_root)
 		if (fault == 4) ctrc_inputs_owner.install_generation++;
 		UT_ASSERT_EQ(cluster_wal_inputs_resume_v1(inputs), fault == 0 ? 0
 			: CLUSTER_CONTROL_ROOT_STALE_TOKEN);
-		UT_ASSERT_EQ(inputs_pin_held, fault == 0);
+		UT_ASSERT(!inputs_pin_held && inputs_recovery_held);
 		cluster_wal_inputs_release_v1(&inputs);
 		UT_ASSERT(!inputs_pin_held && test_actual_cf == NoLock);
 	}

@@ -1131,18 +1131,22 @@ cluster_cold_typed_destroy_v1(ClusterColdTypedV1 **typed_address)
 	typed = *typed_address;
 	if (typed->inputs != NULL)
 		cluster_wal_inputs_release_v1(&typed->inputs);
+	cold_side_destroy(typed);
+	cluster_cold_tt_base_destroy_v1(typed);
+	if (typed->plan != NULL)
+		cluster_cold_plan_destroy_v1(&typed->plan);
+	if (typed->replay_roots != NULL) {
+		pfree(typed->replay_roots);
+		typed->replay_roots = NULL;
+	}
 	if (typed->tx_fence != NULL) {
+		if (!cluster_recovery_merge_fence_plan_release_serial(typed->tx_fence))
+			elog(FATAL, "could not release original cold input retention owner");
 		cluster_recovery_merge_fence_plan_destroy(&typed->tx_fence);
 		if (typed->tx_fence != NULL)
 			elog(FATAL, "could not release original cold transaction fence owner");
 	}
 	*typed_address = NULL;
-	cold_side_destroy(typed);
-	cluster_cold_tt_base_destroy_v1(typed);
-	if (typed->plan != NULL)
-		cluster_cold_plan_destroy_v1(&typed->plan);
-	if (typed->replay_roots != NULL)
-		pfree(typed->replay_roots);
 	MemoryContextDelete(typed->context);
 }
 

@@ -126,6 +126,7 @@ struct ClusterRecoveryFencePlan {
 	ClusterRecoveryFenceOrigin origins[CLUSTER_WAL_STATE_SLOT_COUNT];
 	ClusterRecoverySerialGuardSet serial_guards;
 	ClusterWalRetentionPin *retention_pin;
+	ClusterWalReadPinOwnerV1 tx_owner;
 };
 
 void
@@ -2541,8 +2542,8 @@ cluster_recovery_merge_fence_plan_bind_tx_inputs_v1(ClusterRecoveryFencePlan *pl
 	return true;
 }
 
-/* Original isolation evidence survives COMPLETE and INSTALL as owned input.
- * It is not the released RR serial/pin and grants no replay/PAGE permission.
+/* Original isolation evidence and the SAME WALR survive COMPLETE/INSTALL.
+ * Original IR was released before ROOT publication; no replay/PAGE permission.
  * A source, membership, provider or process-owner change must not be adopted
  * by this same post-EOR attempt. Ordinary RR revalidation remains unchanged. */
 bool
@@ -2551,14 +2552,21 @@ cluster_recovery_merge_fence_plan_tx_current_v1(ClusterRecoveryFencePlan *plan,
 {
 	PgracExternalFenceDenyReason reason;
 	bool matched = source == NULL;
+	ClusterWalReadPinOwnerV1 owner;
 
 	if (!recovery_fence_plan_valid(plan) || !cluster_shared_config || !plan->sealed
 		|| !plan->committed || !plan->completed || !plan->tx_inputs_bound || plan->tx_stale
-		|| plan->serial_held || plan->serial_guards.count != 0 || plan->retention_pin != NULL
+		|| plan->serial_held || plan->serial_guards.count != 0 || plan->retention_pin == NULL
 		|| plan->origin_count == 0)
 		return false;
 	if (plan->owner == NULL || plan->owner != CurrentResourceOwner || plan->owner_boot == 0
 		|| plan->owner_boot != cluster_qvotec_get_self_incarnation()) {
+		plan->tx_stale = true;
+		return false;
+	}
+	owner = plan->tx_owner;
+	if (owner.recovery_pin != plan->retention_pin
+		|| !cluster_wal_read_pin_owner_current_v1(&owner)) {
 		plan->tx_stale = true;
 		return false;
 	}
@@ -2577,7 +2585,25 @@ cluster_recovery_merge_fence_plan_tx_current_v1(ClusterRecoveryFencePlan *plan,
 		if (source != NULL && memcmp(source, &origin->tx_source, sizeof(*source)) == 0)
 			matched = true;
 	}
+	/* The proof-owner callbacks above cannot renew original native custody.
+	 * Reject a late process/incarnation/holder loss before returning it. */
+	if (plan->owner != CurrentResourceOwner
+		|| plan->owner_boot != cluster_qvotec_get_self_incarnation()
+		|| !cluster_wal_read_pin_owner_current_v1(&owner)) {
+		plan->tx_stale = true;
+		return false;
+	}
 	return matched;
+}
+
+ClusterWalReadPinOwnerV1
+cluster_recovery_merge_fence_plan_tx_owner_v1(ClusterRecoveryFencePlan *plan)
+{
+	ClusterWalReadPinOwnerV1 empty = {0};
+
+	if (!cluster_recovery_merge_fence_plan_tx_current_v1(plan, NULL))
+		return empty;
+	return plan->tx_owner;
 }
 
 bool
@@ -2678,11 +2704,47 @@ cluster_recovery_merge_fence_plan_complete_v1(ClusterRecoveryFencePlan *plan, ui
 			*failed_detail = (int)finalized;
 			return CLUSTER_RECOVERY_FENCE_COMPLETE_FINALIZE;
 		}
+		/* The patch was consumed; retain the actual complete record in its
+		 * existing stack slot for the whole-cohort identity check below. */
+		patch[i].desired = published;
 	}
-	pin_released = cluster_wal_retention_pin_release(&plan->retention_pin);
-	if (pin_released != CLUSTER_WALR_RELEASE_CONFIRMED) {
-		*failed_detail = (int)pin_released;
-		return CLUSTER_RECOVERY_FENCE_COMPLETE_PIN_RELEASE;
+	/* Bound typed inputs keep the ORIGINAL WALR for their later Start. */
+	if (plan->tx_inputs_bound) {
+		uint64 file_txn_seq = 0;
+
+		/* Later origins advance the shared ROOT file version. Reobserve the
+		 * exact already-published records only after all IR is released; a
+		 * changed record or a moving whole-file cut refuses the handoff. */
+		for (i = 0; i < plan->origin_count; i++) {
+			const ClusterRecoveryFenceOrigin *origin = &plan->origins[i];
+			ClusterControlRootSnapshot observed;
+			ClusterControlRootReadToken token, expected;
+			ClusterControlRootResult read;
+
+			expected = cluster_wal_retention_pin_root_read_v1(plan->retention_pin,
+				origin->origin_thread);
+			read = cluster_control_root_read_canonical(origin->origin_thread, &origin->duty,
+				CLUSTER_CONTROL_ROOT_READ_STRONG, &observed, &token);
+			if ((read != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+				 && read != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+				|| (file_txn_seq != 0 && file_txn_seq != token.file_txn_seq)
+				|| cluster_wal_retention_pin_adopt_root_readback_v1(plan->retention_pin,
+					&patch[i].desired, &expected, &observed, &token) != CLUSTER_WAL_PIN_OK) {
+				*failed_thread = origin->origin_thread;
+				return CLUSTER_RECOVERY_FENCE_COMPLETE_PIN_HANDOFF;
+			}
+			file_txn_seq = token.file_txn_seq;
+		}
+		plan->tx_owner = cluster_wal_retention_pin_handoff_v1(plan->retention_pin);
+		if (plan->tx_owner.recovery_pin != plan->retention_pin
+			|| !cluster_wal_read_pin_owner_current_v1(&plan->tx_owner))
+			return CLUSTER_RECOVERY_FENCE_COMPLETE_PIN_HANDOFF;
+	} else {
+		pin_released = cluster_wal_retention_pin_release(&plan->retention_pin);
+		if (pin_released != CLUSTER_WALR_RELEASE_CONFIRMED) {
+			*failed_detail = (int)pin_released;
+			return CLUSTER_RECOVERY_FENCE_COMPLETE_PIN_RELEASE;
+		}
 	}
 	plan->completed = true;
 	return CLUSTER_RECOVERY_FENCE_COMPLETE_OK;

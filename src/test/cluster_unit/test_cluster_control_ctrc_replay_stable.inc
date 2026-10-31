@@ -117,7 +117,7 @@ UT_TEST(test_ctrc_replay_stable_two_actual_origins_without_tt)
 	UT_ASSERT(!rf_page_stable_base_proof_matches_sources_v1(built.proof,
 		&f.graph.page_identity, &f.graph.expected_result, NULL, 2, &f.source, &f.vector));
 	rf_page_stable_base_proof_destroy_v1(&built.proof);
-	UT_ASSERT(inputs_pin_held && ctrc_set_held == 2 && test_tx_ir_releases == 0);
+	UT_ASSERT(inputs_recovery_held && ctrc_set_held == 2 && test_tx_ir_releases == 0);
 	ctrc_set_finish(&f.inputs);
 }
 
@@ -159,7 +159,7 @@ UT_TEST(test_ctrc_replay_stable_refuses_changed_native_source_or_uncovered_cut)
 		}
 		built = ctrc_replay_stable_build(&f);
 		UT_ASSERT(built.detail != RF_PAGE_PROOF_DETAIL_OK && built.proof == NULL);
-		UT_ASSERT(inputs_pin_held && ctrc_set_held == 2); ctrc_set_finish(&f.inputs);
+		UT_ASSERT(inputs_recovery_held && ctrc_set_held == 2); ctrc_set_finish(&f.inputs);
 	}
 }
 
@@ -179,7 +179,7 @@ UT_TEST(test_ctrc_replay_stable_preserves_budget_and_full_graph_refusals)
 			built = ctrc_replay_stable_build(&f);
 			UT_ASSERT(built.detail != RF_PAGE_PROOF_DETAIL_OK);
 		}
-		UT_ASSERT(built.proof == NULL && inputs_pin_held && ctrc_set_held == 2);
+		UT_ASSERT(built.proof == NULL && inputs_recovery_held && ctrc_set_held == 2);
 		ctrc_set_finish(&f.inputs);
 	}
 }
@@ -211,15 +211,15 @@ UT_TEST(test_ctrc_replay_stable_cf_wait_and_lost_holder_keep_all_debt)
 	ctrc_replay_stable_fixture(&f); test_cf_grant = false;
 	built = ctrc_replay_stable_build(&f);
 	UT_ASSERT_EQ(built.detail, RF_PAGE_PROOF_DETAIL_WOULD_BLOCK);
-	UT_ASSERT(built.proof == NULL && inputs_pin_held && ctrc_set_held == 2);
+	UT_ASSERT(built.proof == NULL && inputs_recovery_held && ctrc_set_held == 2);
 	test_cf_grant = true; built = ctrc_replay_stable_build(&f);
 	UT_ASSERT_EQ(built.detail, RF_PAGE_PROOF_DETAIL_OK);
 	test_input_current = false; UT_ASSERT(!ctrc_replay_stable_matches(&f, built.proof));
-	UT_ASSERT(inputs_pin_held && ctrc_set_held == 2);
+	UT_ASSERT(inputs_recovery_held && ctrc_set_held == 2);
 	rf_page_stable_base_proof_destroy_v1(&built.proof); ctrc_set_finish(&f.inputs);
 	ctrc_replay_stable_fixture(&f); v2_checkpoint_root_race(); built = ctrc_replay_stable_build(&f);
 	UT_ASSERT_EQ(built.detail, RF_PAGE_PROOF_DETAIL_ROOT_STALE);
-	UT_ASSERT(built.proof == NULL && inputs_pin_held && ctrc_set_held == 2);
+	UT_ASSERT(built.proof == NULL && inputs_recovery_held && ctrc_set_held == 2);
 	ctrc_set_finish(&f.inputs);
 }
 
@@ -252,7 +252,7 @@ UT_TEST(test_ctrc_replay_stable_late_change_or_error_never_publishes)
 		PG_END_TRY(); test_stop_share_hook = NULL; ctrc_replay_stable_io_fixture = NULL;
 		UT_ASSERT_EQ((bool)caught, fault == 6);
 		if (!caught) UT_ASSERT(built.detail != RF_PAGE_PROOF_DETAIL_OK && built.proof == NULL);
-		UT_ASSERT(inputs_pin_held && ctrc_set_held == 2); ctrc_set_finish(&f.inputs);
+		UT_ASSERT(inputs_recovery_held && ctrc_set_held == 2); ctrc_set_finish(&f.inputs);
 	}
 }
 

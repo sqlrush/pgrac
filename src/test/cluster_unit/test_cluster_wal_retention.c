@@ -2357,6 +2357,73 @@ UT_TEST(test_sealed_pin_adopts_same_immutable_root_readback)
 	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
 }
 
+/* Actual pin/readback/publisher path; only native grants and ROOT I/O are
+ * controlled. Later origin publication may advance the whole file header,
+ * but cannot replace a byte of this origin's completed record. */
+UT_TEST(test_completed_pin_keeps_exact_published_record_at_new_file_version)
+{
+	ClusterWalRetentionInterval interval = { .thread_id = 1, .tli = 1,
+		.start_lsn = TEST_WAL_SEG_SIZE, .end_lsn = TEST_WAL_SEG_SIZE * 2 };
+	ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
+	ClusterRecoverySerialGuard serial = make_serial_guard(&request);
+	ClusterControlRootSnapshot before = make_pin_root_snapshot(&request, &interval);
+	ClusterControlRootSnapshot completed = before, drift;
+	ClusterControlRootReadToken published = request.root_read, refreshed, actual, empty = {0};
+	ClusterWalRetentionPin *pin = NULL;
+	ClusterWalRootPublishGuard *publisher = NULL;
+	ClusterWalReadPinOwnerV1 owner;
+
+	reset_pin_fakes();
+	cluster_shared_config = true;
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_seal_for_root_publish(pin), CLUSTER_WAL_PIN_OK);
+	actual = cluster_wal_retention_pin_root_read_v1(pin, 1);
+	UT_ASSERT_EQ(memcmp(&actual, &empty, sizeof(actual)), 0); /* IR still held. */
+	serial.held = false;
+	completed.lifecycle = published.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE;
+	completed.root_publish_seq++;
+	completed.recovered_through_lsn_exclusive = interval.end_lsn;
+	published.root_publish_seq++;
+	published.file_txn_seq++;
+	published.record_crc32c++;
+	UT_ASSERT_EQ(cluster_wal_retention_pin_adopt_root_readback_v1(pin, &before,
+		&request.root_read, &completed, &published), CLUSTER_WAL_PIN_OK);
+	refreshed = published;
+	refreshed.file_txn_seq += 2; /* Two later origin publications. */
+	drift = completed;
+	drift.recovered_through_lsn_exclusive--;
+	UT_ASSERT_EQ(cluster_wal_retention_pin_adopt_root_readback_v1(pin, &completed,
+		&published, &drift, &refreshed), CLUSTER_WAL_PIN_STALE);
+	actual = refreshed;
+	actual.record_crc32c++;
+	UT_ASSERT_EQ(cluster_wal_retention_pin_adopt_root_readback_v1(pin, &completed,
+		&published, &completed, &actual), CLUSTER_WAL_PIN_STALE);
+	actual = published;
+	actual.file_txn_seq--;
+	UT_ASSERT_EQ(cluster_wal_retention_pin_adopt_root_readback_v1(pin, &completed,
+		&published, &completed, &actual), CLUSTER_WAL_PIN_STALE);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_adopt_root_readback_v1(pin, &completed,
+		&published, &completed, &refreshed), CLUSTER_WAL_PIN_OK);
+	actual = cluster_wal_retention_pin_root_read_v1(pin, 1);
+	UT_ASSERT_EQ(memcmp(&actual, &refreshed, sizeof(actual)), 0);
+	actual = cluster_wal_retention_pin_root_read_v1(pin, 2);
+	UT_ASSERT_EQ(memcmp(&actual, &empty, sizeof(actual)), 0);
+	owner = cluster_wal_retention_pin_handoff_v1(pin);
+	UT_ASSERT(owner.recovery_pin == pin);
+	UT_ASSERT(cluster_wal_read_pin_owner_current_v1(&owner));
+	UT_ASSERT_EQ(fake_acquire_call_count, 1); /* No replacement read pin. */
+	UT_ASSERT_EQ(cluster_wal_retention_root_publish_begin_exact(&published, true, &publisher),
+		CLUSTER_WAL_PIN_STALE);
+	UT_ASSERT_NULL(publisher);
+	UT_ASSERT_EQ(cluster_wal_retention_root_publish_begin_exact(&refreshed, true, &publisher),
+		CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_root_publish_end(&publisher), CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT_FALSE(cluster_wal_read_pin_owner_current_v1(&owner));
+	reset_pin_fakes();
+}
+
 UT_TEST(test_sealed_pin_rejects_immutable_root_drift)
 {
 	ClusterWalRetentionInterval interval = { .thread_id = 1,
@@ -4390,6 +4457,90 @@ UT_TEST(test_read_owner_refuses_entire_native_owner_storage_alias)
 	reset_pin_fakes();
 }
 
+/* The original sealed owner, including read-only history/founder sources,
+ * is borrowed after IR release without a second native acquisition. */
+UT_TEST(test_recovery_owner_keeps_original_union_until_explicit_cleanup)
+{
+	const uint16 threads[] = {1, 2, 3};
+	ClusterWalRetentionInterval interval;
+	ClusterWalRetentionPinThreadRequest request;
+	ClusterRecoverySerialGuard serial;
+	ClusterWalRetentionPin *pin = NULL;
+	ClusterWalReadPinOwnerV1 owner, changed;
+	ClusterWalReadPinV1 *replacement = NULL;
+
+	reset_pin_fakes(); cluster_shared_config = true;
+	request = input_pin_request(2, &interval);
+	serial = make_serial_guard(&request);
+	serial.mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED;
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire_inputs_v1(&request, 1, threads, 3, &pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_seal_for_root_publish(pin), CLUSTER_WAL_PIN_OK);
+	owner = cluster_wal_retention_pin_owner_v1(pin);
+	UT_ASSERT(owner.recovery_pin == NULL); /* original IR still held */
+	owner = cluster_wal_retention_pin_handoff_v1(pin);
+	UT_ASSERT(owner.recovery_pin == NULL);
+	serial.held = false;
+	owner = cluster_wal_retention_pin_handoff_v1(pin);
+	UT_ASSERT(owner.recovery_pin == pin && owner.recovery_generation != 0);
+	UT_ASSERT(owner.pin == NULL && owner.generation == 0);
+	for (unsigned i = 0; i < lengthof(threads); i++)
+		UT_ASSERT(cluster_wal_read_pin_owner_covers_v1(&owner, threads[i]));
+	UT_ASSERT(!cluster_wal_read_pin_owner_covers_v1(&owner, 4));
+	UT_ASSERT_EQ(fake_acquire_call_count, 3);
+	UT_ASSERT_EQ(fake_release_call_count, 0);
+	UT_ASSERT_EQ(cluster_wal_read_pin_acquire_v1(threads, 3, &replacement), CLUSTER_WAL_PIN_CAPACITY);
+	UT_ASSERT(replacement == NULL);
+	changed = owner; changed.recovery_generation++;
+	UT_ASSERT(!cluster_wal_read_pin_owner_current_v1(&changed));
+	changed = owner; changed.pin = (ClusterWalReadPinV1 *)pin;
+	UT_ASSERT(!cluster_wal_read_pin_owner_current_v1(&changed));
+	UT_ASSERT(cluster_wal_read_pin_owner_current_v1(&owner));
+	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT(!cluster_wal_read_pin_owner_current_v1(&owner));
+	UT_ASSERT_EQ(fake_release_call_count, 3);
+	reset_pin_fakes();
+}
+
+UT_TEST(test_recovery_owner_loss_is_sticky_and_retains_cleanup_debt)
+{
+	for (unsigned fault = 0; fault < 5; fault++) {
+		const uint16 threads[] = {1, 2, 3};
+		ClusterWalRetentionInterval interval;
+		ClusterWalRetentionPinThreadRequest request;
+		ClusterRecoverySerialGuard serial;
+		ClusterWalRetentionPin *pin = NULL;
+		ClusterWalReadPinOwnerV1 owner;
+		ResourceOwner saved = CurrentResourceOwner;
+
+		reset_pin_fakes(); cluster_shared_config = true;
+		request = input_pin_request(2, &interval);
+		serial = make_serial_guard(&request); serial.mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED;
+		UT_ASSERT_EQ(cluster_wal_retention_pin_acquire_inputs_v1(&request, 1, threads, 3, &pin), CLUSTER_WAL_PIN_OK);
+		UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial), CLUSTER_WAL_PIN_OK);
+		UT_ASSERT_EQ(cluster_wal_retention_pin_seal_for_root_publish(pin), CLUSTER_WAL_PIN_OK);
+		serial.held = false;
+		owner = cluster_wal_retention_pin_handoff_v1(pin);
+		UT_ASSERT(cluster_wal_read_pin_owner_current_v1(&owner));
+		if (fault == 0) CurrentResourceOwner = (ResourceOwner)&owner;
+		else if (fault < 4) fake_control_owner_stale_thread = threads[fault - 1];
+		else fake_resource_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, false,
+			fake_resource_release_arg);
+		UT_ASSERT(!cluster_wal_read_pin_owner_current_v1(&owner));
+		UT_ASSERT_EQ(fake_release_call_count, 0);
+		CurrentResourceOwner = saved;
+		fake_control_owner_stale_thread = 0;
+		if (fault != 0) UT_ASSERT(!cluster_wal_read_pin_owner_current_v1(&owner));
+		fake_release_result = CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
+		UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_UNCONFIRMED);
+		UT_ASSERT(pin != NULL);
+		UT_ASSERT(!cluster_wal_read_pin_owner_current_v1(&owner));
+		fake_release_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+		UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+	}
+	reset_pin_fakes();
+}
+
 int
 main(int argc, char **argv)
 {
@@ -4398,7 +4549,9 @@ main(int argc, char **argv)
 		return write_fixture_wal_segment(argc, argv);
 	if (argc != 1)
 		return 2;
-	UT_PLAN(95);
+	UT_PLAN(98);
+	UT_RUN(test_recovery_owner_keeps_original_union_until_explicit_cleanup);
+	UT_RUN(test_recovery_owner_loss_is_sticky_and_retains_cleanup_debt);
 	UT_RUN(test_read_owner_borrows_all_original_native_grants_without_acquiring);
 	UT_RUN(test_read_owner_never_rebinds_after_same_address_reacquisition);
 	UT_RUN(test_read_owner_checks_every_member_and_preserves_original_cleanup);
@@ -4470,6 +4623,7 @@ main(int argc, char **argv)
 	UT_RUN(test_sealed_publish_uncertain_downgrade_is_cleanup_only);
 	UT_RUN(test_sealed_publisher_rechecks_formation_and_fence_without_cf);
 	UT_RUN(test_sealed_pin_adopts_same_immutable_root_readback);
+	UT_RUN(test_completed_pin_keeps_exact_published_record_at_new_file_version);
 	UT_RUN(test_sealed_pin_rejects_immutable_root_drift);
 	UT_RUN(test_pin_resource_owner_abort_releases_live_grant);
 	UT_RUN(test_pin_explicit_release_prevents_owner_double_release);

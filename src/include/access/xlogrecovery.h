@@ -185,6 +185,11 @@ extern bool ClusterColdRecoveryTxTopProofCurrent(
 
 extern const struct ClusterColdTypedV1 *
 ClusterColdRecoveryTxInputs(const struct ClusterRecoveryStartV1 *start);
+struct ClusterWalReadPinOwnerV1;
+/* Same original episode's continuous WALR, borrowed by value. No new pin,
+ * scope or recovery permission; retire borrowers before original cleanup. */
+extern struct ClusterWalReadPinOwnerV1
+ClusterColdRecoveryTxInputOwnerV1(const struct ClusterRecoveryStartV1 *start);
 
 /* Check the entire original opaque Start extent without exposing its layout.
  * Storage separation only; this grants no input/current/write authority. */

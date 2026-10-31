@@ -1495,6 +1495,7 @@ cluster_thread_recovery_finalize_test.o: \
 
 test_cluster_thread_recovery_authority: \
 		test_cluster_thread_recovery_authority.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_private.h \
 		$(CLUSTER_THREAD_RECOVERY_AUTHORITY_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< \
 		$(CLUSTER_THREAD_RECOVERY_AUTHORITY_O) \

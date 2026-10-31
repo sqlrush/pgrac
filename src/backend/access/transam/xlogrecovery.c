@@ -863,8 +863,8 @@ cluster_recovery_cold_inputs_cleanup(int code, Datum arg)
 	cluster_cold_typed_destroy_v1(&cluster_recovery_cold_inputs);
 }
 
-/* Keep original inputs and their original formation/isolation proof owners
- * across EOR, never a live read scope or the old execution guards/pin.
+/* Keep original inputs, formation/isolation owners and continuous WALR
+ * across EOR. Original IR is already released; no live read scope survives.
  * Later mutation still needs fresh source, serial and writer authorization. */
 static void
 cluster_recovery_cold_inputs_retain(ClusterColdTypedV1 **typed)
@@ -943,6 +943,7 @@ ClusterColdRecoveryTxCurrent(const struct ClusterRecoveryStartV1 *start)
 		|| start->inputs != cluster_recovery_cold_inputs || start->inputs == NULL
 		|| start->inputs->inputs != NULL || start->inputs->plan == NULL
 		|| start->tx_fence == NULL || start->tx_fence != start->inputs->tx_fence
+		|| !cluster_recovery_merge_fence_plan_tx_current_v1(start->tx_fence, NULL)
 		|| start->census != start->inputs->top_tx_census || start->census == NULL
 		|| start->census->plan != start->inputs->plan
 		|| !ClusterStartupInstalledRecoveryWriterV1(&writer, operation_uuid, &install_generation))
@@ -1020,6 +1021,17 @@ const struct ClusterColdTypedV1 *
 ClusterColdRecoveryTxInputs(const struct ClusterRecoveryStartV1 *start)
 {
 	return ClusterColdRecoveryTxCurrent(start) ? start->inputs : NULL;
+}
+
+ClusterWalReadPinOwnerV1
+ClusterColdRecoveryTxInputOwnerV1(const struct ClusterRecoveryStartV1 *start)
+{
+	ClusterWalReadPinOwnerV1 owner, empty = {0};
+
+	if (!ClusterColdRecoveryTxCurrent(start))
+		return empty;
+	owner = cluster_recovery_merge_fence_plan_tx_owner_v1(start->tx_fence);
+	return ClusterColdRecoveryTxCurrent(start) ? owner : empty;
 }
 
 bool
@@ -8331,10 +8343,8 @@ cluster_typed_replay_finish(ClusterColdTypedReplay *rep, const ClusterColdReplay
 	cluster_typed_replay_publish(rep, result);
 	if (*rep->fence_plan != NULL)
 	{
-		if (!cluster_recovery_merge_fence_plan_release_serial(*rep->fence_plan))
-			ereport(FATAL,
-					(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
-					 errmsg("cold recovery serialization release was not confirmed")));
+		/* COMPLETE already confirmed original IR release. Transfer that same
+		 * owner and its still-held WALR; never release/reacquire retention. */
 		if (rep->typed->tx_fence != NULL
 			|| !cluster_recovery_merge_fence_plan_tx_current_v1(*rep->fence_plan, NULL))
 			cluster_typed_replay_unpublished(

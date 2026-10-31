@@ -107,6 +107,17 @@ cluster_recovery_merge_fence_plan_tx_current_v1(struct ClusterRecoveryFencePlan 
 	return tx_fence_current && (source == NULL || tx_fence_subject_current);
 }
 
+ClusterWalReadPinOwnerV1
+cluster_recovery_merge_fence_plan_tx_owner_v1(struct ClusterRecoveryFencePlan *plan)
+{
+	ClusterWalReadPinOwnerV1 owner = {0};
+	if (cluster_recovery_merge_fence_plan_tx_current_v1(plan, NULL)) {
+		owner.recovery_pin = (ClusterWalRetentionPin *)&tx_fence_object;
+		owner.recovery_generation = 11;
+	}
+	return owner;
+}
+
 bool
 cluster_recovery_merge_fence_plan_tx_request_v1(struct ClusterRecoveryFencePlan *plan,
 	const ClusterWalSourceRef *source, ClusterRecoverySerialRequest *out)
@@ -968,6 +979,28 @@ UT_TEST(test_process_cleanup_revokes_start_before_destroying_original_inputs)
 	UT_ASSERT_EQ(input_destroys, destroyed + 1);
 	UT_ASSERT(cluster_recovery_cold_inputs == NULL);
 	UT_ASSERT(!ClusterBeginColdRecoveryTx(&info));
+}
+
+UT_TEST(test_start_borrows_only_its_original_completed_retention_owner)
+{
+	ClusterWalReadPinOwnerV1 owner, refused;
+	const struct ClusterRecoveryStartV1 *original;
+	reset(); retain();
+	UT_ASSERT(ClusterBeginColdRecoveryTx(&info));
+	original = info.cluster_tx_start;
+	owner = ClusterColdRecoveryTxInputOwnerV1(original);
+	UT_ASSERT(owner.pin == NULL && owner.generation == 0);
+	UT_ASSERT(owner.recovery_pin == (ClusterWalRetentionPin *)&tx_fence_object);
+	UT_ASSERT_EQ(owner.recovery_generation, 11);
+	refused = ClusterColdRecoveryTxInputOwnerV1((const struct ClusterRecoveryStartV1 *)&owner);
+	UT_ASSERT(refused.recovery_pin == NULL);
+	tx_fence_current = false;
+	refused = ClusterColdRecoveryTxInputOwnerV1(original);
+	UT_ASSERT(refused.recovery_pin == NULL);
+	UT_ASSERT(cluster_recovery_cold_inputs != NULL); /* refusal does not release */
+	cluster_recovery_cold_inputs_cleanup(1, (Datum)0);
+	refused = ClusterColdRecoveryTxInputOwnerV1(original);
+	UT_ASSERT(refused.recovery_pin == NULL);
 }
 
 static void active_subject(void)
@@ -3006,7 +3039,8 @@ int main(void)
 	}
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_FIRST
-	UT_PLAN(404);
+	UT_PLAN(405);
+	UT_RUN(test_start_borrows_only_its_original_completed_retention_owner);
 	UT_RUN(test_start_raw_records_keep_complete_original_bytes_and_empty_end);
 	UT_RUN(test_start_raw_records_refuse_incomplete_changed_bytes_hash_header_and_end);
 

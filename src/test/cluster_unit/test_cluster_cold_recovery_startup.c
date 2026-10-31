@@ -3850,23 +3850,29 @@ UT_TEST(test_original_typed_owner_retires_fence_after_dependent_read_scope)
 	ClusterColdTypedV1 *typed;
 	static char original_fence;
 	unsigned before;
+	unsigned released;
 
 	fixture();
 	typed = prepare(0x800);
 	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
 	before = tx_fences_destroyed;
+	released = tx_fences_released;
 	typed->tx_fence = (ClusterRecoveryFencePlan *)&original_fence;
 	typed->inputs = (ClusterWalInputsV1 *)&census_scope;
 	tx_fence_expected_census_releases = census_releases + 1;
 	tx_fence_census_release_observer = &census_releases;
+	tx_fence_cleanup_observer = typed;
 	cluster_cold_typed_destroy_v1(&typed);
 	UT_ASSERT(typed == NULL);
 	UT_ASSERT_EQ(tx_fences_destroyed, before + 1);
+	UT_ASSERT_EQ(tx_fences_released, released + 1);
 	UT_ASSERT_EQ(census_releases, tx_fence_expected_census_releases);
 	UT_ASSERT_EQ(contexts_alive, 0);
 	cluster_cold_typed_destroy_v1(&typed);
 	UT_ASSERT_EQ(tx_fences_destroyed, before + 1);
+	UT_ASSERT_EQ(tx_fences_released, released + 1);
 	tx_fence_census_release_observer = NULL;
+	tx_fence_cleanup_observer = NULL;
 }
 
 UT_TEST(test_full_clog_dispatch_uses_only_original_projection_identity)

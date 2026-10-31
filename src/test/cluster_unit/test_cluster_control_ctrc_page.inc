@@ -117,7 +117,7 @@ UT_TEST(test_ctrc_page_native_loss_before_promotion_preserves_original_debt)
 	UT_ASSERT(rf_page_authority_ctrc_replays_promote_nowait_v1(f.page.authority) != 0);
 	UT_ASSERT(rf_page_guard_preflight_v1(&f.target.page_identity, &pre));
 	UT_ASSERT(rf_page_guard_promote_nowait_v1(&pre, &other)); rf_page_guard_release_v1(&other);
-	UT_ASSERT(inputs_pin_held && ctrc_set_held == 2 && test_tx_ir_releases == 0);
+	UT_ASSERT(inputs_recovery_held && ctrc_set_held == 2 && test_tx_ir_releases == 0);
 	ctrc_page_finish(&f);
 }
 
@@ -129,7 +129,7 @@ UT_TEST(test_ctrc_page_wait_retries_same_original_set_without_deadline)
 	UT_ASSERT(rf_page_guard_promote_nowait_v1(&pre, &blocker));
 	UT_ASSERT_EQ(rf_page_authority_ctrc_replays_promote_nowait_v1(f.page.authority),
 		RF_PAGE_AUTHORITY_WOULD_BLOCK);
-	UT_ASSERT(inputs_pin_held && ctrc_set_held == 2 && test_tx_ir_releases == 0);
+	UT_ASSERT(inputs_recovery_held && ctrc_set_held == 2 && test_tx_ir_releases == 0);
 	rf_page_guard_release_v1(&blocker);
 	UT_ASSERT_EQ(rf_page_authority_ctrc_replays_promote_nowait_v1(f.page.authority), 0);
 	ctrc_page_finish(&f);

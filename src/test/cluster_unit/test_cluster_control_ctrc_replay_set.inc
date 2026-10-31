@@ -162,7 +162,7 @@ UT_TEST(test_ctrc_set_holds_unordered_original_origins_without_tt_subjects)
 	UT_ASSERT_EQ(cluster_wal_inputs_ctrc_replays_release_v1(inputs), 0);
 	UT_ASSERT(!cluster_wal_inputs_ctrc_replays_source_current_v1(&first));
 	UT_ASSERT_EQ(cluster_wal_inputs_ctrc_replays_acquire_v1(inputs), CLUSTER_CONTROL_ROOT_STALE_TOKEN);
-	UT_ASSERT(inputs_pin_held); ctrc_set_finish(&inputs);
+	UT_ASSERT(inputs_recovery_held); ctrc_set_finish(&inputs);
 }
 
 UT_TEST(test_ctrc_set_partial_native_wait_withholds_every_source_view)
@@ -172,7 +172,7 @@ UT_TEST(test_ctrc_set_partial_native_wait_withholds_every_source_view)
 		ctrc_set_fixture(3, false, &inputs); ctrc_set_block_thread = 128;
 		ctrc_set_block_result = retry ? CLUSTER_RECOVERY_SERIAL_RETRY : CLUSTER_RECOVERY_SERIAL_BUSY;
 		UT_ASSERT_EQ(cluster_wal_inputs_ctrc_replays_acquire_v1(inputs), CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
-		UT_ASSERT_EQ(ctrc_set_held, 1); UT_ASSERT(inputs_pin_held);
+		UT_ASSERT_EQ(ctrc_set_held, 1); UT_ASSERT(inputs_recovery_held);
 		UT_ASSERT(!cluster_wal_inputs_ctrc_replays_authorized_v1(inputs));
 		source = cluster_wal_inputs_ctrc_replays_source_v1(inputs, 0);
 		UT_ASSERT(memcmp(&source, &zero, sizeof(zero)) == 0);
@@ -201,7 +201,7 @@ UT_TEST(test_ctrc_set_validates_every_source_before_first_native_grant)
 		ClusterWalInputsV1 *inputs = NULL;
 		ctrc_set_fixture(mask, false, &inputs);
 		UT_ASSERT_EQ(cluster_wal_inputs_ctrc_replays_acquire_v1(inputs), CLUSTER_CONTROL_ROOT_STALE_TOKEN);
-		UT_ASSERT_EQ(test_tx_ir_grants, 0); UT_ASSERT(inputs_pin_held);
+		UT_ASSERT_EQ(test_tx_ir_grants, 0); UT_ASSERT(inputs_recovery_held);
 		ctrc_set_finish(&inputs);
 	}
 }
@@ -223,7 +223,7 @@ UT_TEST(test_ctrc_set_late_original_loss_never_discards_native_cleanup_debt)
 		ClusterWalInputsV1 *inputs = NULL;
 		ctrc_set_fixture(3, false, &inputs); ctrc_set_after_grant = ctrc_set_late_change;
 		UT_ASSERT_EQ(cluster_wal_inputs_ctrc_replays_acquire_v1(inputs), CLUSTER_CONTROL_ROOT_STALE_TOKEN);
-		UT_ASSERT_EQ(ctrc_set_held, 2); UT_ASSERT(inputs_pin_held);
+		UT_ASSERT_EQ(ctrc_set_held, 2); UT_ASSERT(inputs_recovery_held);
 		UT_ASSERT(!cluster_wal_inputs_ctrc_replays_authorized_v1(inputs));
 		ctrc_set_after_grant = NULL; ctrc_set_finish(&inputs);
 	}
@@ -262,7 +262,7 @@ UT_TEST(test_ctrc_set_reverse_uncertain_release_keeps_remaining_ir_and_walr)
 	PG_END_TRY(); test_capture_error_level = false;
 	UT_ASSERT(caught && test_last_error_level == FATAL);
 	UT_ASSERT_EQ(ctrc_set_release_threads[0], 128); UT_ASSERT_EQ(ctrc_set_release_threads[1], 1);
-	UT_ASSERT_EQ(ctrc_set_held, 1); UT_ASSERT(inputs_pin_held);
+	UT_ASSERT_EQ(ctrc_set_held, 1); UT_ASSERT(inputs_recovery_held);
 	UT_ASSERT(!cluster_wal_inputs_ctrc_replays_authorized_v1(inputs));
 	ctrc_set_fail_release = 0; ctrc_set_finish(&inputs);
 	UT_ASSERT_EQ(ctrc_set_release_threads[2], 1);
@@ -276,7 +276,7 @@ UT_TEST(test_ctrc_set_native_error_keeps_exact_holders_and_original_purpose)
 	PG_TRY(); { (void)cluster_wal_inputs_ctrc_replays_acquire_v1(inputs); }
 	PG_CATCH(); { caught = true; }
 	PG_END_TRY(); ctrc_set_after_grant = NULL;
-	UT_ASSERT(caught && ctrc_set_held == 2 && inputs_pin_held);
+	UT_ASSERT(caught && ctrc_set_held == 2 && inputs_recovery_held);
 	UT_ASSERT(!cluster_wal_inputs_ctrc_replays_authorized_v1(inputs));
 	UT_ASSERT_EQ(cluster_wal_inputs_ctrc_replays_acquire_v1(inputs), CLUSTER_CONTROL_ROOT_STALE_TOKEN);
 	ctrc_set_finish(&inputs);

@@ -99,9 +99,9 @@ UT_TEST(test_ctrc_source_plan_other_origin_drift_keeps_native_cleanup_debt)
 	authority = cluster_wal_inputs_ctrc_replay_source_v1(inputs, 0);
 	tx_inputs_typed.participants[1].reserved_zero = 1;
 	UT_ASSERT(!cluster_wal_inputs_ctrc_replay_source_current_v1(&authority));
-	UT_ASSERT(test_tx_ir_held && inputs_pin_held);
+	UT_ASSERT(test_tx_ir_held && inputs_recovery_held);
 	UT_ASSERT_EQ(cluster_wal_inputs_ctrc_replay_release_v1(inputs, 0), 0);
-	UT_ASSERT(!test_tx_ir_held && inputs_pin_held);
+	UT_ASSERT(!test_tx_ir_held && inputs_recovery_held);
 	cluster_wal_inputs_release_v1(&inputs); test_inputs_startup_cf = false;
 }
 

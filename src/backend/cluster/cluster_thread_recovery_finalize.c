@@ -82,6 +82,22 @@ cluster_thread_recovery_root_finalize_after_ir_v1(const ClusterThreadRecoveryAut
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
 			if (!root_complete_matches(&published, &published_token, authority->duty, patch))
 				return CLUSTER_THREAD_ROOT_FINALIZE_BLOCKED;
+			/* Continuous original WALR must carry the exact result of its own
+			 * publication into the next phase, just as on canonical readback.
+			 * This validates the unchanged recovery interval; it never borrows
+			 * a later token or changes native lock custody. */
+			switch (cluster_wal_retention_pin_adopt_root_readback_v1(authority->retention_pin,
+																 &current_snapshot, &current_token,
+																 &published, &published_token)) {
+			case CLUSTER_WAL_PIN_OK:
+				break;
+			case CLUSTER_WAL_PIN_RELEASE_UNCERTAIN:
+				return CLUSTER_THREAD_ROOT_FINALIZE_CLEANUP_UNCERTAIN;
+			case CLUSTER_WAL_PIN_STALE:
+				return CLUSTER_THREAD_ROOT_FINALIZE_RETRY;
+			default:
+				return CLUSTER_THREAD_ROOT_FINALIZE_BLOCKED;
+			}
 			*out_snapshot = published;
 			return CLUSTER_THREAD_ROOT_FINALIZE_OK;
 		}

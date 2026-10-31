@@ -15,6 +15,7 @@
 #endif
 
 #include "unit_test.h"
+#include "../../backend/cluster/cluster_control_root_private.h"
 
 UT_DEFINE_GLOBALS();
 
@@ -482,6 +483,7 @@ UT_TEST(test_root_finalize_exact_cas_succeeds)
 				 CLUSTER_THREAD_ROOT_FINALIZE_OK);
 	UT_ASSERT_EQ(finalize_publish_calls, 1);
 	UT_ASSERT_EQ(finalize_read_calls, 0);
+	UT_ASSERT_EQ(finalize_adopt_calls, 1);
 	UT_ASSERT_EQ(published.lifecycle, CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE);
 }
 
@@ -509,7 +511,37 @@ UT_TEST(test_root_finalize_stale_token_reconciles_without_page_replay)
 				 CLUSTER_THREAD_ROOT_FINALIZE_OK);
 	UT_ASSERT_EQ(finalize_publish_calls, 2);
 	UT_ASSERT_EQ(finalize_read_calls, 1);
-	UT_ASSERT_EQ(finalize_adopt_calls, 1);
+	UT_ASSERT_EQ(finalize_adopt_calls, 2);
+}
+
+UT_TEST(test_root_finalize_keeps_publication_refused_when_original_pin_cannot_adopt)
+{
+	const ClusterWalPinResult refused[] = { CLUSTER_WAL_PIN_STALE,
+		CLUSTER_WAL_PIN_INVALID, CLUSTER_WAL_PIN_RELEASE_UNCERTAIN };
+	const ClusterThreadRecoveryRootFinalizeResultV1 expected[] = {
+		CLUSTER_THREAD_ROOT_FINALIZE_RETRY, CLUSTER_THREAD_ROOT_FINALIZE_BLOCKED,
+		CLUSTER_THREAD_ROOT_FINALIZE_CLEANUP_UNCERTAIN };
+
+	for (unsigned i = 0; i < lengthof(refused); i++) {
+		ClusterRecoveryDutyKey duty;
+		ClusterControlRootSnapshot root, published, zero = {0};
+		ClusterControlRootReadToken token;
+		ClusterRecoverySerialGuard serial;
+		ClusterThreadRecoveryAuthorityV1 authority;
+		ClusterControlRootPatch patch;
+
+		prepare_finalize_case(&duty, &root, &token, &serial, &authority, &patch);
+		finalize_publish_results[0] = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+		finalize_publish_result_count = 1;
+		finalize_adopt_result = refused[i];
+		memset(&published, 0xa5, sizeof(published));
+		UT_ASSERT_EQ(cluster_thread_recovery_root_finalize_after_ir_v1(&authority, &patch, &published),
+			expected[i]);
+		UT_ASSERT_EQ(finalize_adopt_calls, 1);
+		UT_ASSERT_EQ(finalize_publish_calls, 1);
+		UT_ASSERT_EQ(finalize_read_calls, 0);
+		UT_ASSERT(memcmp(&published, &zero, sizeof(zero)) == 0);
+	}
 }
 
 UT_TEST(test_root_finalize_adopts_already_complete_readback)
@@ -580,7 +612,7 @@ UT_TEST(test_root_finalize_release_uncertain_preserves_cleanup_ownership)
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(18);
 	UT_RUN(test_exact_root_builds_one_pin_interval);
 	UT_RUN(test_foreign_root_identity_is_zero_output);
 	UT_RUN(test_cross_timeline_interval_fails_closed);
@@ -594,6 +626,7 @@ main(void)
 	UT_RUN(test_complete_window_builds_exact_root_patch);
 	UT_RUN(test_short_window_cannot_build_complete_root_patch);
 	UT_RUN(test_root_finalize_exact_cas_succeeds);
+	UT_RUN(test_root_finalize_keeps_publication_refused_when_original_pin_cannot_adopt);
 	UT_RUN(test_root_finalize_stale_token_reconciles_without_page_replay);
 	UT_RUN(test_root_finalize_adopts_already_complete_readback);
 	UT_RUN(test_root_finalize_immutable_drift_requests_fresh_plan);

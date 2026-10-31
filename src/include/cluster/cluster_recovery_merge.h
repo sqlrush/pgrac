@@ -534,9 +534,9 @@ struct ClusterThreadRecoveryAuthorityV1;
 extern bool
 cluster_recovery_merge_fence_plan_authority(ClusterRecoveryFencePlan *plan, uint16 origin_thread,
 											struct ClusterThreadRecoveryAuthorityV1 *out);
-/* Bind original immutable input refs before pass-2 IR/WALR release. After
- * complete confirmed release, retain this same plan's original proof owners
- * for the original post-EOR Start. This is isolation input, not IR, a PAGE
+/* Bind original immutable input refs before pass-2 IR release. After
+ * confirmed IR release and completion, retain this same plan's original
+ * WALR and proof owners for the original post-EOR Start. This is not IR, a PAGE
  * grant, a new writer or ordinary RR replay authority. A non-NULL source must
  * match one exact bound ref. Any observed owner/proof loss is sticky. */
 struct ClusterWalSourceRef;
@@ -544,6 +544,10 @@ extern bool cluster_recovery_merge_fence_plan_bind_tx_inputs_v1(ClusterRecoveryF
 	const struct ClusterWalSourceRef *sources, uint32 count);
 extern bool cluster_recovery_merge_fence_plan_tx_current_v1(ClusterRecoveryFencePlan *plan,
 	const struct ClusterWalSourceRef *source);
+struct ClusterWalReadPinOwnerV1;
+/* Borrow original sealed WALR custody, never an acquire or replay grant. */
+extern struct ClusterWalReadPinOwnerV1
+cluster_recovery_merge_fence_plan_tx_owner_v1(ClusterRecoveryFencePlan *plan);
 struct ClusterRecoverySerialRequest;
 /* Borrow the original completed proof owner's exact old-subject request.
  * It still needs the purpose-bound current-history scope and a new IR grant. */
@@ -558,7 +562,9 @@ extern void cluster_recovery_merge_fence_plan_destroy(ClusterRecoveryFencePlan *
  * each origin's terminal patch is built while the serial set is held, the
  * retention pin is sealed, the serial set (IR) is released with
  * confirmation, then each root is compare-and-swapped to RECOVERY_COMPLETE
- * through the sealed pin, and the pin is released.  The caller has proven
+ * through the sealed pin. Bound typed inputs retain that SAME WALR through
+ * later Start scopes; the original owner releases it after dependents. An
+ * unbound legacy completion releases it here. The caller has proven
  * every origin's pass-2 cut and made the replayed changes durable.  On a
  * failure nothing further is published; *failed_thread / *failed_detail
  * name the origin and the callee's result.  Author: SqlRush
@@ -572,7 +578,8 @@ typedef enum ClusterRecoveryFenceCompleteV1 {
 	CLUSTER_RECOVERY_FENCE_COMPLETE_PIN_SEAL = 4,
 	CLUSTER_RECOVERY_FENCE_COMPLETE_IR_RELEASE = 5, /* release not confirmed */
 	CLUSTER_RECOVERY_FENCE_COMPLETE_FINALIZE = 6,
-	CLUSTER_RECOVERY_FENCE_COMPLETE_PIN_RELEASE = 7
+	CLUSTER_RECOVERY_FENCE_COMPLETE_PIN_RELEASE = 7,
+	CLUSTER_RECOVERY_FENCE_COMPLETE_PIN_HANDOFF = 8
 } ClusterRecoveryFenceCompleteV1;
 
 extern ClusterRecoveryFenceCompleteV1

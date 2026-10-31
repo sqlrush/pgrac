@@ -328,7 +328,7 @@ UT_TEST(test_legacy_profile_rejects_generation_claim_crc)
 				 CLUSTER_RECOVERY_DUTY_COMPARE_INVALID);
 }
 
-/* The same original input refs survive completion, never its old IR/pin. */
+/* The same original input refs and WALR survive completion; old IR does not. */
 static void
 tx_sources(ClusterRecoveryFencePlan *plan, ClusterWalSourceRef *sources)
 {
@@ -340,6 +340,43 @@ tx_sources(ClusterRecoveryFencePlan *plan, ClusterWalSourceRef *sources)
 		sources[i].claim.claim_sha256[31] = plan->origins[i].origin_thread;
 		sources[i].timeline = plan->origins[i].root_snapshot.checkpoint_tli;
 	}
+}
+
+/* The typed episode keeps the original WALR across cache publication.  A
+ * later Start borrows it; completion must not release and replace it. */
+UT_TEST(test_tx_completion_keeps_original_walr_until_owner_cleanup)
+{
+	ClusterRecoveryFencePlan *plan = replayed_plan();
+	ClusterWalSourceRef sources[NODES];
+	ClusterWalRetentionPin *original;
+	uint16 thread;
+	int detail;
+
+	if (plan == NULL) return;
+	original = plan->retention_pin;
+	continuous_root_file_version = true;
+	tx_sources(plan, sources);
+	UT_ASSERT(cluster_recovery_merge_fence_plan_bind_tx_inputs_v1(plan, sources, plan->origin_count));
+	UT_ASSERT_EQ(complete(plan, &thread, &detail), CLUSTER_RECOVERY_FENCE_COMPLETE_OK);
+	UT_ASSERT(!plan->serial_held && plan->serial_guards.count == 0);
+	UT_ASSERT(plan->retention_pin == original);
+	UT_ASSERT(strcmp(events, "patch:2;patch:3;patch:4;seal-pin;release-ir;finalize:2;"
+		"finalize:3;finalize:4;read:2;read:3;read:4;") == 0);
+	for (uint16 tid = 2; tid <= NODES; tid++)
+		UT_ASSERT_EQ(memcmp(&retained_root_tokens[tid], &tokens[tid], sizeof(tokens[tid])), 0);
+	UT_ASSERT(cluster_recovery_merge_fence_plan_tx_current_v1(plan, &sources[0]));
+	/* Original custody can disappear while the other proof owners are read.
+	 * A successful first native sample must not authorize that late loss. */
+	retained_pin_drop_after_check = true;
+	UT_ASSERT(!cluster_recovery_merge_fence_plan_tx_current_v1(plan, &sources[0]));
+	retained_pin_drop_after_check = false;
+	retained_pin_current = true;
+	UT_ASSERT(!cluster_recovery_merge_fence_plan_tx_current_v1(plan, &sources[0]));
+	UT_ASSERT(cluster_recovery_merge_fence_plan_release_serial(plan));
+	UT_ASSERT(plan->retention_pin == NULL);
+	UT_ASSERT(!cluster_recovery_merge_fence_plan_tx_current_v1(plan, &sources[0]));
+	cluster_recovery_merge_fence_plan_destroy(&plan);
+	UT_ASSERT(plan == NULL);
 }
 
 UT_TEST(test_tx_proof_owner_survives_only_complete_confirmed_handoff)
@@ -359,23 +396,35 @@ UT_TEST(test_tx_proof_owner_survives_only_complete_confirmed_handoff)
 	for (uint16 i = 0; i < plan->origin_count; i++)
 		UT_ASSERT(cluster_recovery_merge_fence_plan_tx_current_v1(plan, &sources[i]));
 	UT_ASSERT(!cluster_recovery_merge_fence_plan_revalidate_nowait(plan));
-	UT_ASSERT(!plan->serial_held && plan->serial_guards.count == 0 && plan->retention_pin == NULL);
+	UT_ASSERT(!plan->serial_held && plan->serial_guards.count == 0
+		&& plan->retention_pin == (void *)&pin_obj);
 	UT_ASSERT(!cluster_recovery_merge_fence_plan_bind_tx_inputs_v1(plan, sources, plan->origin_count));
 	UT_ASSERT(cluster_recovery_merge_fence_plan_tx_current_v1(plan, &sources[0]));
+	UT_ASSERT(cluster_recovery_merge_fence_plan_release_serial(plan));
 	cluster_recovery_merge_fence_plan_destroy(&plan);
 	UT_ASSERT(plan == NULL);
 	UT_ASSERT_EQ(formations_destroyed, 3);
 
 	/* COMPLETE must never make unbound or partly completed proof owners usable. */
-	for (unsigned fault = 0; fault < 4; fault++) {
+	for (unsigned fault = 0; fault < 7; fault++) {
 		plan = replayed_plan();
 		tx_sources(plan, sources);
 		if (fault != 0)
 			UT_ASSERT(cluster_recovery_merge_fence_plan_bind_tx_inputs_v1(plan, sources, plan->origin_count));
 		if (fault == 1) ir_release_result = CLUSTER_RECOVERY_SERIAL_RELEASE_UNCONFIRMED;
 		if (fault == 2) finalize_result[3] = CLUSTER_THREAD_ROOT_FINALIZE_OK + 2;
-		if (fault == 3) pin_release_result = CLUSTER_WALR_RELEASE_UNCONFIRMED;
-		(void)complete(plan, &thread, &detail);
+		if (fault == 3) retained_pin_current = false;
+		if (fault >= 4) continuous_root_file_version = true;
+		if (fault == 4) handoff_changed_record = 3;
+		if (fault == 5) handoff_moving_file = 3;
+		if (fault == 6) handoff_adopt_refused = 3;
+		if (fault >= 4) {
+			UT_ASSERT_EQ(complete(plan, &thread, &detail), CLUSTER_RECOVERY_FENCE_COMPLETE_PIN_HANDOFF);
+			UT_ASSERT_EQ(thread, 3);
+			UT_ASSERT(plan->retention_pin == (void *)&pin_obj && !plan->completed);
+			UT_ASSERT(strstr(events, "release-pin;") == NULL);
+		} else
+			(void)complete(plan, &thread, &detail);
 		UT_ASSERT(!cluster_recovery_merge_fence_plan_tx_current_v1(plan, &sources[0]));
 		UT_ASSERT_EQ(formations_destroyed, 0);
 		drop_plan(&plan);
@@ -488,7 +537,7 @@ UT_TEST(test_tx_request_borrows_only_exact_completed_old_subject_proofs)
 	UT_ASSERT(request.fence_admission_set == plan->origins[0].admissions);
 	UT_ASSERT_EQ(request.acquire_timeout_ms, plan->acquire_timeout_ms_snapshot);
 	UT_ASSERT_EQ(request.release_timeout_ms, plan->acquire_timeout_ms_snapshot);
-	UT_ASSERT(!plan->serial_held && plan->retention_pin == NULL);
+	UT_ASSERT(!plan->serial_held && plan->retention_pin == (void *)&pin_obj);
 	UT_ASSERT(!cluster_recovery_merge_fence_plan_tx_request_v1(plan, &sources[0],
 		(ClusterRecoverySerialRequest *)plan));
 	UT_ASSERT(!cluster_recovery_merge_fence_plan_tx_request_v1(plan, &sources[0],
@@ -522,7 +571,13 @@ UT_TEST(test_tx_request_cannot_borrow_revoked_original_proof_owner)
 int
 main(void)
 {
-	UT_PLAN(12);
+	if (getenv("PGRAC_PRE2_TEST_WALR_CONTINUITY") != NULL) {
+		UT_PLAN(1);
+		UT_RUN(test_tx_completion_keeps_original_walr_until_owner_cleanup);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
+	UT_PLAN(13);
 	UT_RUN(test_complete_publishes_every_origin);
 	UT_RUN(test_complete_after_preflight_seal);
 	UT_RUN(test_complete_refuses_before_any_publication);
@@ -535,6 +590,7 @@ main(void)
 	UT_RUN(test_tx_original_proof_or_resource_loss_is_sticky);
 	UT_RUN(test_tx_request_borrows_only_exact_completed_old_subject_proofs);
 	UT_RUN(test_tx_request_cannot_borrow_revoked_original_proof_owner);
+	UT_RUN(test_tx_completion_keeps_original_walr_until_owner_cleanup);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

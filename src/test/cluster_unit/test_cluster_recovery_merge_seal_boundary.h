@@ -74,6 +74,10 @@ static ClusterRecoveryWorkerPool pool;
 static bool pool_present;
 static ClusterControlRootSnapshot roots[NODES + 1];
 static ClusterControlRootReadToken tokens[NODES + 1];
+/* Opt-in completion fixture: later origins advance the whole ROOT file. */
+static bool continuous_root_file_version;
+static ClusterControlRootReadToken retained_root_tokens[NODES + 1];
+static uint16 handoff_changed_record, handoff_moving_file, handoff_adopt_refused;
 static XLogRecPtr redo[NODES + 1];
 static XLogRecPtr tail_end[NODES + 1];
 static ClusterControlRootResult open_result[NODES + 1];
@@ -416,6 +420,10 @@ cluster_control_root_read_canonical(uint16 origin_thread_id,
 	*out_snapshot = roots[origin_thread_id];
 	out_snapshot->root_flags &= ~readback_cleared[origin_thread_id];
 	*out_token = tokens[origin_thread_id];
+	if (origin_thread_id == handoff_changed_record)
+		out_snapshot->root_publish_seq++;
+	if (origin_thread_id == handoff_moving_file)
+		out_token->file_txn_seq++;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
@@ -476,7 +484,11 @@ root_publish(uint16 tid)
 	tokens[tid].root_publish_seq = roots[tid].root_publish_seq;
 	tokens[tid].lifecycle = roots[tid].lifecycle;
 	tokens[tid].root_flags = roots[tid].root_flags;
-	tokens[tid].file_txn_seq++;
+	if (continuous_root_file_version) {
+		for (uint16 i = 2; i <= NODES; i++)
+			tokens[i].file_txn_seq++;
+	} else
+		tokens[tid].file_txn_seq++;
 }
 
 ClusterControlRootResult
@@ -706,6 +718,67 @@ static ClusterWalPinResult pin_seal_result;
 static ClusterRecoverySerialReleaseResult ir_release_result;
 static ClusterWalrReleaseResult pin_release_result;
 static bool pin_sealed;
+static bool retained_pin_current = true;
+static bool retained_pin_drop_after_check;
+
+ClusterWalReadPinOwnerV1
+cluster_wal_retention_pin_owner_v1(ClusterWalRetentionPin *pin)
+{
+	ClusterWalReadPinOwnerV1 owner = {0};
+	if (pin == (void *)&pin_obj && pin_sealed && retained_pin_current) {
+		owner.recovery_pin = pin;
+		owner.recovery_generation = 1;
+	}
+	return owner;
+}
+
+ClusterWalReadPinOwnerV1
+cluster_wal_retention_pin_handoff_v1(ClusterWalRetentionPin *pin)
+{
+	return cluster_wal_retention_pin_owner_v1(pin);
+}
+
+ClusterControlRootReadToken
+cluster_wal_retention_pin_root_read_v1(ClusterWalRetentionPin *pin, uint16 thread_id)
+{
+	ClusterControlRootReadToken empty = {0};
+
+	UT_ASSERT(pin == (void *)&pin_obj && pin_sealed);
+	UT_ASSERT(thread_id > 1 && thread_id <= NODES);
+	return retained_pin_current ? retained_root_tokens[thread_id] : empty;
+}
+
+ClusterWalPinResult
+cluster_wal_retention_pin_adopt_root_readback_v1(
+	ClusterWalRetentionPin *pin, const ClusterControlRootSnapshot *expected,
+	const ClusterControlRootReadToken *expected_token,
+	const ClusterControlRootSnapshot *observed, const ClusterControlRootReadToken *observed_token)
+{
+	uint16 tid = expected->identity.origin_thread_id;
+	ClusterControlRootReadToken whole = retained_root_tokens[tid];
+
+	UT_ASSERT(pin == (void *)&pin_obj && pin_sealed);
+	UT_ASSERT(tid > 1 && tid <= NODES);
+	whole.file_txn_seq = observed_token->file_txn_seq;
+	if (!retained_pin_current || tid == handoff_adopt_refused
+		|| memcmp(expected_token, &retained_root_tokens[tid], sizeof(*expected_token)) != 0
+		|| memcmp(expected, observed, sizeof(*expected)) != 0
+		|| memcmp(&whole, observed_token, sizeof(whole)) != 0)
+		return CLUSTER_WAL_PIN_STALE;
+	retained_root_tokens[tid] = *observed_token;
+	return CLUSTER_WAL_PIN_OK;
+}
+
+bool
+cluster_wal_read_pin_owner_current_v1(const ClusterWalReadPinOwnerV1 *owner)
+{
+	bool current = owner != NULL && owner->pin == NULL && owner->generation == 0
+		&& owner->recovery_pin == (void *)&pin_obj && owner->recovery_generation == 1
+		&& retained_pin_current;
+	if (retained_pin_drop_after_check)
+		retained_pin_current = false;
+	return current;
+}
 
 static void
 completion_reset(void)
@@ -719,6 +792,11 @@ completion_reset(void)
 	ir_release_result = CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED;
 	pin_release_result = CLUSTER_WALR_RELEASE_CONFIRMED;
 	pin_sealed = false;
+	retained_pin_current = true;
+	retained_pin_drop_after_check = false;
+	continuous_root_file_version = false;
+	memset(retained_root_tokens, 0, sizeof(retained_root_tokens));
+	handoff_changed_record = handoff_moving_file = handoff_adopt_refused = 0;
 }
 
 ClusterThreadRecoveryAuthorityResultV1
@@ -794,8 +872,10 @@ cluster_thread_recovery_root_finalize_after_ir_v1(const ClusterThreadRecoveryAut
 		root_publish(tid);
 	}
 	if (result == CLUSTER_THREAD_ROOT_FINALIZE_OK
-		|| result == CLUSTER_THREAD_ROOT_FINALIZE_ALREADY_COMPLETE)
+		|| result == CLUSTER_THREAD_ROOT_FINALIZE_ALREADY_COMPLETE) {
 		*out_snapshot = roots[tid];
+		retained_root_tokens[tid] = tokens[tid];
+	}
 	return result;
 }
 

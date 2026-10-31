@@ -367,8 +367,28 @@ cluster_control_root_recovery_sync_v1(const ClusterControlRootSnapshot *root,
 
 /* The original input destructor alone retires this completed proof owner. */
 static unsigned tx_fences_destroyed;
+static unsigned tx_fences_released;
 static int tx_fence_expected_census_releases;
 static int *tx_fence_census_release_observer;
+static ClusterColdTypedV1 *tx_fence_cleanup_observer;
+bool
+cluster_recovery_merge_fence_plan_release_serial(ClusterRecoveryFencePlan *plan)
+{
+	UT_ASSERT(plan != NULL);
+	if (tx_fence_cleanup_observer != NULL) {
+		ClusterColdTypedV1 *typed = tx_fence_cleanup_observer;
+
+		UT_ASSERT(typed->tx_fence == plan);
+		UT_ASSERT(typed->inputs == NULL && typed->plan == NULL && typed->replay_roots == NULL);
+		UT_ASSERT(!tt_base_captured && !tt_after_captured);
+		for (uint32 i = 0; i < CLUSTER_COLD_MAX_PARTICIPANTS; i++)
+			UT_ASSERT(typed->side_plans[i] == NULL);
+		UT_ASSERT_EQ(*tx_fence_census_release_observer, tx_fence_expected_census_releases);
+	}
+	tx_fences_released++;
+	return true;
+}
+
 void
 cluster_recovery_merge_fence_plan_destroy(ClusterRecoveryFencePlan **plan)
 {

@@ -162,6 +162,8 @@ struct ClusterRecoverySerialGuard;
  * and discharge still require their own consumers and proofs. */
 typedef struct ClusterRecoveryTxRetentionV1 {
 	ClusterWalInputsV1 *scope;
+	/* Process-local scope incarnation, distinct from continuous WALR custody. */
+	uint64 scope_generation;
 	struct ClusterRecoverySerialGuard *serial;
 	ClusterWalReadPinOwnerV1 input_owner;
 } ClusterRecoveryTxRetentionV1;
@@ -279,6 +281,8 @@ extern ClusterControlRootResult cluster_wal_inputs_ctrc_replays_release_v1(
  * the scope. This is neither RR/PAGE authority nor a completion receipt. */
 typedef struct ClusterRecoveryCtrcReplaySetSourceV1 {
 	ClusterWalInputsV1 *scope;
+	/* Reject a retired view even if a later scope reuses the same address. */
+	uint64 scope_generation;
 	ClusterWalReadPinOwnerV1 input_owner;
 	uint64 ir_request_id;
 	uint64 work_generation;
@@ -328,6 +332,8 @@ extern bool cluster_wal_inputs_ctrc_writer_retained_v1(
  * No new scope, acquire, release or per-origin owner is created. */
 typedef struct ClusterRecoveryRelmapSourceV1 {
 	ClusterWalInputsV1 *scope;
+	/* Captured with scope; checked before dereferencing the borrowed owner. */
+	uint64 scope_generation;
 	ClusterWalReadPinOwnerV1 input_owner;
 	uint64 work_generation, ir_request_id;
 	uint32 input_index, input_count, replay_index, replay_count;

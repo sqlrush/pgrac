@@ -71,11 +71,13 @@ typedef struct ClusterWalPinThread {
 
 struct ClusterWalRetentionPin {
 	uint32 magic;
+	uint64 generation;
 	int32 owner_pid;
 	ResourceOwner owner;
 	uint16 nthreads;
 	uint8 state;
 	bool poisoned;
+	bool handed_off;
 	ClusterRecoverySerialGuardSet *serial_set;
 	ClusterWalPinThread *threads;
 	uint16 nreaders;
@@ -121,6 +123,7 @@ static ClusterWalRetentionPin *active_pin;
 static ClusterWalReadPinV1 *active_read_pin;
 /* Process-local incarnation only; never wrap or reuse one for a new grant set. */
 static uint64 read_pin_generation;
+static uint64 recovery_pin_generation;
 static ClusterWalRootPublishGuard *active_root_publish_guard;
 static ClusterWalReuseActionGuard *active_reuse_guard;
 static ClusterWalRetentionE1Context *active_e1_context;
@@ -594,6 +597,7 @@ static bool
 pin_valid(const ClusterWalRetentionPin *pin)
 {
 	return pin != NULL && pin == active_pin && pin->magic == CLUSTER_WAL_PIN_MAGIC
+		   && pin->generation != 0
 		   && pin->owner_pid == MyProcPid && pin->owner == CurrentResourceOwner && pin->nthreads > 0
 		   && pin->nthreads <= CLUSTER_WAL_RETENTION_MAX_THREADS && pin->threads != NULL
 		   && pin->nreaders <= CLUSTER_WAL_RETENTION_MAX_THREADS - pin->nthreads
@@ -804,7 +808,7 @@ pin_acquire_inputs(const ClusterWalRetentionPinThreadRequest *requests, uint16 n
 		|| ninput_threads > CLUSTER_WAL_RETENTION_MAX_THREADS
 		|| (ninput_threads != 0 && input_threads == NULL))
 		return CLUSTER_WAL_PIN_INVALID;
-	if (active_pin != NULL || active_read_pin != NULL)
+	if (active_pin != NULL || active_read_pin != NULL || recovery_pin_generation == UINT64_MAX)
 		return CLUSTER_WAL_PIN_CAPACITY;
 	total_bytes = sizeof(*pin);
 	if (nthreads > (MaxAllocSize - total_bytes) / sizeof(ClusterWalPinThread))
@@ -836,6 +840,7 @@ pin_acquire_inputs(const ClusterWalRetentionPinThreadRequest *requests, uint16 n
 	pin = palloc0(sizeof(*pin));
 	pin->threads = palloc0((Size)nthreads * sizeof(*pin->threads));
 	pin->magic = CLUSTER_WAL_PIN_MAGIC;
+	pin->generation = ++recovery_pin_generation;
 	pin->owner_pid = MyProcPid;
 	pin->owner = CurrentResourceOwner;
 	pin->nthreads = nthreads;
@@ -1110,6 +1115,7 @@ cluster_wal_retention_pin_adopt_root_readback_v1(
 {
 	ClusterWalPinThread *thread;
 	const ClusterWalRetentionInterval *interval;
+	bool complete_readback;
 
 	if (!pin_valid(pin) || expected_snapshot == NULL || expected_token == NULL
 		|| observed_snapshot == NULL || observed_token == NULL)
@@ -1124,7 +1130,20 @@ cluster_wal_retention_pin_adopt_root_readback_v1(
 		|| !pin_root_token_matches_snapshot(observed_token, observed_snapshot, &thread->duty))
 		return CLUSTER_WAL_PIN_STALE;
 	interval = &thread->intervals[0];
-	if (expected_snapshot->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+	/* A later origin's publication advances the WHOLE file version. For an
+	 * already completed record, accept only that header advance: every byte
+	 * of the original observed record and all other token fields stay exact. */
+	complete_readback = expected_snapshot->lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE;
+	if (complete_readback) {
+		ClusterControlRootReadToken same_record = *expected_token;
+
+		same_record.file_txn_seq = observed_token->file_txn_seq;
+		if (memcmp(expected_snapshot, observed_snapshot, sizeof(*expected_snapshot)) != 0
+			|| memcmp(&same_record, observed_token, sizeof(same_record)) != 0)
+			return CLUSTER_WAL_PIN_STALE;
+	}
+	if ((!complete_readback
+		 && expected_snapshot->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED)
 		|| (observed_snapshot->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
 			&& observed_snapshot->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE)
 		|| interval->thread_id != thread->duty.origin_thread_id
@@ -1235,14 +1254,93 @@ cluster_wal_read_pin_owner_v1(ClusterWalReadPinV1 *pin, ClusterWalReadPinOwnerV1
 	return true;
 }
 
+static bool
+pin_post_ir_current(ClusterWalRetentionPin *pin)
+{
+	if (!cluster_shared_config || !pin_valid(pin) || pin->poisoned
+		|| pin->state != CLUSTER_WAL_PIN_STATE_SEALED
+		|| (pin->serial_set != NULL && pin->serial_set->count != 0))
+		return false;
+	if (!pin_readers_current(pin))
+		return false;
+	for (uint16 i = 0; i < pin->nthreads; i++) {
+		const ClusterWalPinThread *thread = &pin->threads[i];
+
+		if (thread->serial == NULL || thread->serial->held || thread->serial->release_uncertain)
+			return false;
+		if (!pin_thread_walr_current(pin, thread)) {
+			pin->poisoned = true;
+			return false;
+		}
+	}
+	return true;
+}
+
+ClusterControlRootReadToken
+cluster_wal_retention_pin_root_read_v1(ClusterWalRetentionPin *pin, uint16 thread_id)
+{
+	ClusterControlRootReadToken empty = {0};
+	ClusterWalPinThread *thread;
+
+	if (!pin_post_ir_current(pin) || (thread = pin_find_thread(pin, thread_id)) == NULL)
+		return empty;
+	return thread->root_read;
+}
+
 bool
 cluster_wal_read_pin_owner_current_v1(const ClusterWalReadPinOwnerV1 *owner)
 {
 	/* Locate the active allocation and its incarnation before reading any
 	 * child of a released pin, even if an allocator reused its address. */
-	return owner != NULL && read_pin_valid(owner->pin)
+	if (owner == NULL || !cluster_shared_config)
+		return false;
+	if (owner->recovery_pin != NULL || owner->recovery_generation != 0) {
+		ClusterWalRetentionPin *pin = owner->recovery_pin;
+
+		if (owner->pin != NULL || owner->generation != 0 || !pin_valid(pin)
+			|| owner->recovery_generation != pin->generation || !pin->handed_off)
+			return false;
+		return pin_post_ir_current(pin);
+	}
+	return read_pin_valid(owner->pin)
 		&& owner->generation == owner->pin->generation
 		&& cluster_wal_read_pin_covers_v1(owner->pin, owner->pin->locks[0].request.resid.field1);
+}
+
+ClusterWalReadPinOwnerV1
+cluster_wal_retention_pin_owner_v1(ClusterWalRetentionPin *pin)
+{
+	ClusterWalReadPinOwnerV1 owner = {0}, empty = {0};
+
+	if (!pin_valid(pin))
+		return empty;
+	owner.recovery_pin = pin;
+	owner.recovery_generation = pin->generation;
+	return cluster_wal_read_pin_owner_current_v1(&owner) ? owner : empty;
+}
+
+ClusterWalReadPinOwnerV1
+cluster_wal_retention_pin_handoff_v1(ClusterWalRetentionPin *pin)
+{
+	ClusterWalReadPinOwnerV1 empty = {0};
+
+	if (!pin_post_ir_current(pin))
+		return empty;
+	/* Original caller retains ownership of this allocation and its native
+	 * cleanup, rather than allowing the generic ResourceOwner fallback to
+	 * free it while its typed episode still contains borrowed descriptors. */
+	pin->handed_off = true;
+	return cluster_wal_retention_pin_owner_v1(pin);
+}
+
+bool
+cluster_wal_read_pin_owner_covers_v1(const ClusterWalReadPinOwnerV1 *owner, uint16 thread_id)
+{
+	if (!cluster_wal_read_pin_owner_current_v1(owner))
+		return false;
+	if (owner->recovery_pin != NULL)
+		return pin_walr_for_thread(owner->recovery_pin, thread_id) != NULL;
+	return cluster_wal_read_pin_covers_v1(owner->pin, thread_id);
 }
 
 ClusterWalrReleaseResult
@@ -1940,10 +2038,14 @@ walr_resource_release_callback(ResourceReleasePhase phase, bool isCommit, bool i
 	if (active_pin != NULL && active_pin->owner == CurrentResourceOwner) {
 		ClusterWalRetentionPin *pin = active_pin;
 
-		if (pin_release_locks(pin) != CLUSTER_WALR_RELEASE_CONFIRMED)
-			elog(FATAL, "could not confirm WALR retained-source cleanup");
-		active_pin = NULL;
-		pin_free(pin);
+		if (pin->handed_off)
+			pin->poisoned = true; /* original typed destructor still owns all debt */
+		else {
+			if (pin_release_locks(pin) != CLUSTER_WALR_RELEASE_CONFIRMED)
+				elog(FATAL, "could not confirm WALR retained-source cleanup");
+			active_pin = NULL;
+			pin_free(pin);
+		}
 	}
 	if (active_read_pin != NULL && active_read_pin->owner == CurrentResourceOwner) {
 		ClusterWalReadPinV1 *pin = active_read_pin;
