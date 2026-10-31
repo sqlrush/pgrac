@@ -157,6 +157,13 @@ extern bool ClusterColdRecoveryTxCurrent(const struct ClusterRecoveryStartV1 *st
 extern bool ClusterColdRecoveryRelmapDeclare(const struct ClusterRecoveryStartV1 *start);
 extern bool ClusterColdRecoveryRelmapCurrent(const struct ClusterRecoveryStartV1 *start);
 extern void ClusterColdRecoveryRelmapFail(const struct ClusterRecoveryStartV1 *start);
+struct ClusterColdRelmapReplayReceiptV1;
+/* Original Start only; copied replay input, zero on refusal. The returned
+ * count covers the whole saved batch. Borrowed retention pointers expire
+ * with Start. This does not validate physical sources or grant era/lifetime,
+ * terminal, COMPLETE or release authority. No caller completion setter. */
+extern struct ClusterColdRelmapReplayReceiptV1 ClusterColdRecoveryRelmapReplayInput(
+	const struct ClusterRecoveryStartV1 *start, uint32 index);
 struct ClusterRecoveryCheckpointOwnerV1;
 /* Original recovered INSTALL only; ordinary CLEAN/first creation cannot
  * provide this checkpoint input. The output clears on refusal. */

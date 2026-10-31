@@ -3978,6 +3978,7 @@ UT_TEST(test_full_clog_truncate_dispatch_uses_original_projection_identity)
 #include "test_cluster_cold_startup_relmap_producer.inc"
 #include "test_cluster_cold_startup_relmap_pin_custody.inc"
 #include "test_cluster_cold_startup_relmap_early_retention.inc"
+#include "test_cluster_cold_startup_relmap_handoff.inc"
 
 int
 main(void)
@@ -4051,7 +4052,13 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(184);
+	if (getenv("PGRAC_PRE2_TEST_STARTUP_RELMAP_HANDOFF") != NULL) {
+		UT_PLAN(2);
+		UT_RUN(test_relmap_saved_receipt_carries_actual_replay_without_new_io);
+		UT_RUN(test_relmap_saved_receipt_refuses_partial_failed_or_other_source_batch);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	UT_PLAN(186);
 	UT_RUN(test_full_clog_truncate_dispatch_uses_original_projection_identity);
 	UT_RUN(test_full_clog_dispatch_uses_only_original_projection_identity);
 	UT_RUN(test_execution_refusal_preserves_the_first_census_failure);
@@ -4237,6 +4244,8 @@ main(void)
 	UT_RUN(test_relmap_partial_batch_arm_error_keeps_already_armed_pin);
 	UT_RUN(test_relmap_late_producer_refusal_or_error_keeps_armed_debt);
 	UT_RUN(test_relmap_early_pin_hold_survives_startup_replay_and_destruction);
+	UT_RUN(test_relmap_saved_receipt_carries_actual_replay_without_new_io);
+	UT_RUN(test_relmap_saved_receipt_refuses_partial_failed_or_other_source_batch);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

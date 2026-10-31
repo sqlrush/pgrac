@@ -998,6 +998,46 @@ ClusterColdRecoveryRelmapFail(const struct ClusterRecoveryStartV1 *start)
 	/* Dependents, IR and WALR remain for the original reverse cleanup. */
 }
 
+struct ClusterColdRelmapReplayReceiptV1
+ClusterColdRecoveryRelmapReplayInput(const struct ClusterRecoveryStartV1 *start, uint32 index)
+{
+	ClusterColdRelmapReplayReceiptV1 value = {0}, empty = {0};
+
+	if (start == NULL || start != cluster_recovery_cold_start || !start->relmap_declared)
+		return empty;
+	/* The first current provider can throw too. Revoke the matching episode
+	 * on entered failure; never close its original plan, pins or dependents. */
+	PG_TRY();
+	{
+		uint32 count = cluster_cold_typed_relmap_replay_count_v1(start->inputs);
+
+		if (!ClusterColdRecoveryRelmapCurrent(start) || count == UINT32_MAX)
+			ClusterColdRecoveryRelmapFail(start);
+		else if (index < count) {
+			ClusterColdRelmapReplayReceiptV1 confirmed;
+
+			value = cluster_cold_typed_relmap_replay_input_v1(start->inputs, index);
+			if (!ClusterColdRecoveryRelmapCurrent(start)) {
+				value = empty;
+				ClusterColdRecoveryRelmapFail(start);
+			} else {
+				confirmed = cluster_cold_typed_relmap_replay_input_v1(start->inputs, index);
+				if (value.count != count || memcmp(&value, &confirmed, sizeof(value)) != 0) {
+					value = empty;
+					ClusterColdRecoveryRelmapFail(start);
+				}
+			}
+		}
+	}
+	PG_CATCH();
+	{
+		ClusterColdRecoveryRelmapFail(start);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return value;
+}
+
 const struct ClusterColdTypedV1 *
 ClusterColdRecoveryTxInputs(const struct ClusterRecoveryStartV1 *start)
 {
@@ -3479,6 +3519,7 @@ ClusterBeginColdRecoveryTx(EndOfWalRecoveryInfo *info)
 	ClusterWalWriterToken writer;
 	uint8 operation_uuid[16];
 	uint64 owner_boot, install_generation, claim_owner;
+	uint32 relmap_count;
 
 	if (info == NULL)
 		return false;
@@ -3497,6 +3538,11 @@ ClusterBeginColdRecoveryTx(EndOfWalRecoveryInfo *info)
 		|| CurrentResourceOwner == NULL || MyProcPid <= 0
 		|| cluster_recovery_cold_generation == PG_UINT64_MAX
 		|| !ClusterStartupInstalledRecoveryWriterV1(&writer, operation_uuid, &install_generation))
+		return false;
+	/* The original replay participant must not depend on a later optional
+	 * Declare call. This is saved input only, never physical qualification. */
+	relmap_count = cluster_cold_typed_relmap_replay_count_v1(cluster_recovery_cold_inputs);
+	if (relmap_count == UINT32_MAX)
 		return false;
 	/* Original retained recovery is still serialized by its exact creator.
 	 * This full file check runs before target protection, not in Current. */
@@ -3527,11 +3573,39 @@ ClusterBeginColdRecoveryTx(EndOfWalRecoveryInfo *info)
 	start->writer = writer;
 	memcpy(start->operation_uuid, operation_uuid, 16);
 	cluster_recovery_cold_start = start;
-	if (!ClusterColdRecoveryTxCurrent(start)
-		|| !cluster_recovery_checkpoint_register_v1(start)) {
-		cluster_recovery_cold_start = NULL;
-		pfree(start);
-		return false;
+	if (relmap_count == 0) {
+		if (!ClusterColdRecoveryTxCurrent(start)
+			|| !cluster_recovery_checkpoint_register_v1(start)) {
+			cluster_recovery_cold_start = NULL;
+			pfree(start);
+			return false;
+		}
+	} else {
+		volatile bool declared = false;
+
+		PG_TRY();
+		{
+			declared = ClusterColdRecoveryTxCurrent(start)
+				&& cluster_recovery_checkpoint_register_v1(start)
+				&& ClusterColdRecoveryRelmapDeclare(start)
+				&& relmap_count == cluster_cold_typed_relmap_replay_count_v1(start->inputs);
+		}
+		PG_CATCH();
+		{
+			cluster_recovery_cold_inputs->refusal = CLUSTER_COLD_SOURCE_GAP;
+			cluster_recovery_checkpoint_revoke_v1(start);
+			cluster_recovery_cold_start = NULL;
+			pfree(start);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+		if (!declared) {
+			cluster_recovery_cold_inputs->refusal = CLUSTER_COLD_SOURCE_GAP;
+			cluster_recovery_checkpoint_revoke_v1(start);
+			cluster_recovery_cold_start = NULL;
+			pfree(start);
+			return false;
+		}
 	}
 	info->cluster_tx_start = start;
 	return true;

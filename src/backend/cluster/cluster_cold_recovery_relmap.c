@@ -400,4 +400,53 @@ cluster_cold_typed_relmap_ready_v1(ClusterColdTypedV1 *typed, struct ClusterReco
 		plan->relmap_failed = false;
 	return ok;
 }
+
+/* The original plan owns these immutable saved values across EOR. Reading
+ * them cannot reuse pass-2's expired replay window as current authority. */
+uint32
+cluster_cold_typed_relmap_replay_count_v1(const ClusterColdTypedV1 *typed)
+{
+	const ClusterColdPlanV1 *plan;
+
+	if (typed == NULL || typed->refusal != CLUSTER_COLD_OK || !plan_valid(typed->plan))
+		return UINT32_MAX;
+	plan = typed->plan;
+	if (plan->phase != COLD_PHASE_SEALED || plan->relmap_failed
+		|| plan->relmap_count > CLUSTER_COLD_RELMAP_MAX_INPUTS)
+		return UINT32_MAX;
+	if (plan->relmap_count == 0)
+		return plan->relmap_inputs == NULL ? 0 : UINT32_MAX;
+	if (plan->relmap_inputs == NULL || typed->replay_count == 0
+		|| typed->replay_count > typed->participant_count
+		|| typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
+		|| typed->participant_count != plan->participant_count)
+		return UINT32_MAX;
+	for (uint32 i = 0; i < plan->relmap_count; ++i) {
+		const ColdRelmapInput *entry = &plan->relmap_inputs[i];
+		const ClusterColdRelmapInputV1 *input = &entry->input;
+		uint32 p = input->participant;
+
+		if (!entry->captured || !entry->attempted || !entry->applied
+			|| p >= typed->replay_count || input->frame.participant != p
+			|| input->staged.identity.system_identifier != typed->system_identifier
+			|| !cold_relmap_cut_equal(&input->cut, &typed->participants[p])
+			|| memcmp(&input->source, &typed->sources[p], sizeof(input->source)) != 0)
+			return UINT32_MAX;
+	}
+	return plan->relmap_count;
+}
+
+ClusterColdRelmapReplayReceiptV1
+cluster_cold_typed_relmap_replay_input_v1(const ClusterColdTypedV1 *typed, uint32 index)
+{
+	ClusterColdRelmapReplayReceiptV1 value = {0};
+	uint32 count = cluster_cold_typed_relmap_replay_count_v1(typed);
+
+	if (count == UINT32_MAX || index >= count)
+		return value;
+	value.count = count;
+	value.index = index;
+	memcpy(&value.input, &typed->plan->relmap_inputs[index].input, sizeof(value.input));
+	return value;
+}
 #endif

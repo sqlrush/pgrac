@@ -14563,6 +14563,11 @@ $(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) test_cluster_cold_recovery_io_core.o: \
 
 # Original Startup declaration, sealed SIDE and dual-copy storage in one component.
 test_cluster_cold_recovery_startup: test_cluster_cold_startup_relmap_early_retention.inc
+test_cluster_cold_recovery_startup: test_cluster_cold_startup_relmap_handoff.inc
+test_cluster_cold_tx_start: test_cluster_cold_tx_relmap_handoff.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_cold_recovery_relmap.c \
+		$(top_srcdir)/src/include/cluster/cluster_cold_relmap.h \
+		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_plan_internal.h
 
 test_cluster_cold_startup_relmap_storage.o: test_cluster_cold_startup_relmap_storage.c \
 		test_cluster_cold_startup_relmap_storage.h test_cluster_cold_startup_relmap_storage_namespace.h \

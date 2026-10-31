@@ -10,6 +10,7 @@
 #include "access/xloginsert.h"
 #include "access/xlogrecovery.h"
 #include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_cold_recovery_plan_internal.h"
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_ir.h"
 #include "cluster/cluster_guc.h"
@@ -80,6 +81,7 @@ cluster_page_wal_dirty_floor_v1(const ClusterWalSourceRef *source,
 
 static bool tx_fence_current, tx_fence_subject_current;
 static unsigned tx_fence_checks;
+static void (*relmap_owner_check_step)(void);
 static void (*ctrc_request_step)(void);
 static bool invalidate_fence_in_pre, invalidate_fence_on_flush;
 static union {
@@ -247,7 +249,11 @@ bool cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out)
 	return true;
 }
 
-uint64 cluster_qvotec_get_self_incarnation(void) { return owner_boot; }
+uint64 cluster_qvotec_get_self_incarnation(void)
+{
+	if (relmap_owner_check_step != NULL) relmap_owner_check_step();
+	return owner_boot;
+}
 ClusterControlRootResult
 cluster_wal_writer_begin(TimeLineID timeline, ClusterWalWriterToken *out)
 {
@@ -391,6 +397,10 @@ static void actual_startup_eor_claim(EndOfWalRecoveryInfo *endOfRecoveryInfo)
 }
 
 #include "test_cluster_cold_tx_writer.inc"
+/* Exercise the original saved-receipt readers, not a handoff status stub.
+ * Mutation/I/O functions in this unit are not called; the Startup replay
+ * component separately executes them with its original storage bridge. */
+#include "../../backend/cluster/cluster_cold_recovery_relmap.c"
 #include "test_cluster_cold_tx_owner.inc"
 #include "test_cluster_cold_tx_xid_maximum.inc"
 #include "test_cluster_cold_tx_consumer.inc"
@@ -408,6 +418,8 @@ static void actual_startup_tx_begin(EndOfWalRecoveryInfo *endOfRecoveryInfo)
 }
 
 static ClusterColdTypedV1 typed;
+static ClusterColdPlanV1 relmap_start_plan;
+static ColdRelmapInput relmap_start_entries[2];
 static bool ctrc_census_ok, ctrc_census_drift;
 static unsigned ctrc_census_calls;
 static ClusterColdCtrcReleaseCensusV1 ctrc_census;
@@ -614,6 +626,7 @@ bool cluster_undo_smgr_recovery_abort_write_v1(ClusterUndoSmgrRecoveryStampV1 st
 
 static void reset(void)
 {
+	relmap_owner_check_step = NULL;
 	memset(&startup_first_floor, 0, sizeof(startup_first_floor));
 	startup_first_calls = 0; startup_first_available = true; startup_first_step = NULL;
 	ctrc_driver_acquires = ctrc_driver_authorizations = ctrc_driver_waits = 0;
@@ -656,7 +669,11 @@ static void reset(void)
 	memset(&clusterStartupWriter, 0, sizeof(clusterStartupWriter));
 	memset(&observed_writer, 0, sizeof(observed_writer));
 	typed.tx_fence = (struct ClusterRecoveryFencePlan *)&tx_fence_object;
-	typed.plan = (ClusterColdPlanV1 *)&typed;
+	memset(&relmap_start_plan, 0, sizeof(relmap_start_plan));
+	memset(relmap_start_entries, 0, sizeof(relmap_start_entries));
+	relmap_start_plan.magic = CLUSTER_COLD_PLAN_MAGIC;
+	relmap_start_plan.phase = COLD_PHASE_SEALED;
+	typed.plan = &relmap_start_plan;
 	typed.top_tx_census = &census;
 	census.plan = typed.plan;
 	typed.participant_count = 1;
@@ -2377,8 +2394,21 @@ static void startup_local_empty_reset(void);
 
 #include "test_cluster_cold_ctrc_untouched_pages.inc"
 
+#include "test_cluster_cold_tx_relmap_handoff.inc"
+
 int main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_RELMAP_START_HANDOFF") != NULL) {
+		UT_PLAN(7);
+		UT_RUN(test_start_automatically_keeps_replayed_relmap_in_joint_obligation);
+		UT_RUN(test_start_refuses_incomplete_or_failed_relmap_receipts);
+		UT_RUN(test_start_cannot_silently_drop_relmap_source_or_cut);
+		UT_RUN(test_start_relmap_receipt_is_complete_by_value_and_bound_to_original_owner);
+		UT_RUN(test_start_relmap_receipt_drift_or_owner_error_revokes_without_destruction);
+		UT_RUN(test_start_relmap_registration_refusal_or_error_keeps_original_inputs);
+		UT_RUN(test_start_relmap_registration_rechecks_saved_batch_after_providers);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_UNTOUCHED_PAGES") != NULL) {
 		UT_PLAN(4);
 		UT_RUN(test_startup_untouched_pages_complete_saved_set_including_zero_page_wal);
@@ -2692,14 +2722,21 @@ int main(void)
 		return ut_failed_count == 0 ? 0 : 1;
 	}
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
-	UT_PLAN(296);
+	UT_PLAN(303);
 	UT_RUN(test_startup_native_directory_empty_preserves_fpi_unchanged_and_zero_page);
 	UT_RUN(test_startup_native_directory_partial_lock_wait_repeats_same_fd_readback);
 	UT_RUN(test_startup_native_directory_real_origin_cannot_be_discharged_by_wait);
 	UT_RUN(test_startup_native_directory_invalid_layout_and_partial_error_keep_debt);
 #else
-	UT_PLAN(292);
+	UT_PLAN(299);
 #endif
+	UT_RUN(test_start_automatically_keeps_replayed_relmap_in_joint_obligation);
+	UT_RUN(test_start_refuses_incomplete_or_failed_relmap_receipts);
+	UT_RUN(test_start_cannot_silently_drop_relmap_source_or_cut);
+	UT_RUN(test_start_relmap_receipt_is_complete_by_value_and_bound_to_original_owner);
+	UT_RUN(test_start_relmap_receipt_drift_or_owner_error_revokes_without_destruction);
+	UT_RUN(test_start_relmap_registration_refusal_or_error_keeps_original_inputs);
+	UT_RUN(test_start_relmap_registration_rechecks_saved_batch_after_providers);
 	UT_RUN(test_startup_untouched_pages_complete_saved_set_including_zero_page_wal);
 	UT_RUN(test_startup_untouched_last_page_drift_or_absence_keeps_original_debt);
 	UT_RUN(test_startup_untouched_late_owner_loss_or_error_preserves_same_fd);

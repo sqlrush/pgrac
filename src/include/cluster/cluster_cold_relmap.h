@@ -50,6 +50,22 @@ typedef struct ClusterColdRelmapWalV1 {
 	struct XLogReaderState *reader;
 } ClusterColdRelmapWalV1;
 
+/* Saved pass-2 input, not a current physical/pin/terminal certificate. Values
+ * are copied; directory/lock stay borrowed from this exact original plan.
+ * They must not outlive the original Start and its reverse cleanup. */
+typedef struct ClusterColdRelmapReplayReceiptV1 {
+	uint32 count, index;
+	ClusterColdRelmapInputV1 input;
+} ClusterColdRelmapReplayReceiptV1;
+
+/* Local immutable receipt checks only, including the complete batch and
+ * original selected source/cut. UINT32_MAX means invalid/incomplete; zero
+ * means no declared participant. No replay-window check, I/O, acquire,
+ * cancellation, source revalidation or new lifetime/retention grant. */
+extern uint32 cluster_cold_typed_relmap_replay_count_v1(const ClusterColdTypedV1 *typed);
+extern ClusterColdRelmapReplayReceiptV1 cluster_cold_typed_relmap_replay_input_v1(
+	const ClusterColdTypedV1 *typed, uint32 index);
+
 /* Explicit original-source adapter before pass-1. Whole-batch validation of
  * exact unstaged pins precedes any mutation. Recheck and arm every original
  * pin with the actual WAL end before the first clean-pair I/O, outside the
