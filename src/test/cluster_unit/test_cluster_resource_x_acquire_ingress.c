@@ -1030,7 +1030,7 @@ UT_TEST(test_service_snapshot_complete_shared_set_obeys_requested_mode)
 	}
 }
 
-UT_TEST(test_service_snapshot_x_to_s_includes_even_requester_downgrade)
+UT_TEST(test_service_snapshot_x_to_s_excludes_requester_native_completion)
 {
 	for (int holder = 0; holder < 4; holder++)
 		for (int mode = PCM_STATE_S; mode <= PCM_STATE_X; mode++) {
@@ -1044,7 +1044,7 @@ UT_TEST(test_service_snapshot_x_to_s_includes_even_requester_downgrade)
 				RESOURCE_X_APPLY_APPLIED);
 			UT_ASSERT_EQ(out.current_holders_bitmap, UINT32_C(1) << holder);
 			UT_ASSERT_EQ(out.required_holders_bitmap,
-				mode == PCM_STATE_X && holder == 1 ? 0 : UINT32_C(1) << holder);
+				holder == 1 ? 0 : UINT32_C(1) << holder);
 			UT_ASSERT_EQ(out.directory.x_holder_node, holder);
 		}
 }
@@ -2006,10 +2006,8 @@ UT_TEST(test_decision_plan_local_current_is_not_another_remote_fetch)
 			plan = decision_plan_read(&work);
 			UT_ASSERT_EQ(plan.decision.source_kind, RESOURCE_X_ACQUIRE_SOURCE_LOCAL_CURRENT);
 			UT_ASSERT_EQ(plan.decision.source_node, 0);
-			UT_ASSERT_EQ(plan.decision.required_holders_bitmap,
-				state == PCM_STATE_X && target == PCM_STATE_S ? 1 : 0);
-			UT_ASSERT_EQ(plan.service_holders_bitmap,
-				state == PCM_STATE_X && target == PCM_STATE_S ? 1 : 0);
+			UT_ASSERT_EQ(plan.decision.required_holders_bitmap, 0);
+			UT_ASSERT_EQ(plan.service_holders_bitmap, 0);
 			UT_ASSERT_EQ(plan.decision.episode.requester_incarnation, 31);
 			(void)decision_plan_codec_frame(&plan, false, 0);
 		}
@@ -2352,7 +2350,7 @@ main(void)
 	UT_RUN(test_service_snapshot_exact_n_head_is_input_not_authority);
 	UT_RUN(test_service_snapshot_all_native_paths_preserve_original_episode);
 	UT_RUN(test_service_snapshot_complete_shared_set_obeys_requested_mode);
-	UT_RUN(test_service_snapshot_x_to_s_includes_even_requester_downgrade);
+	UT_RUN(test_service_snapshot_x_to_s_excludes_requester_native_completion);
 	UT_RUN(test_service_snapshot_pi_and_watermarks_never_become_current);
 	UT_RUN(test_service_snapshot_every_retained_identity_difference_is_stale);
 	UT_RUN(test_service_snapshot_requires_canonical_head_and_preserves_fifo);

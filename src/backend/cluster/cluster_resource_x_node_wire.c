@@ -830,7 +830,7 @@ resource_x_decision_body_valid(const ResourceXDecodedFrame *frame)
 		return false;
 	required = frame->common.target_mode == (uint8)PCM_STATE_X
 		? body->holders_bitmap & ~requester_bit
-		: body->directory_mode == (uint8)PCM_STATE_X ? body->holders_bitmap : 0;
+		: body->directory_mode == (uint8)PCM_STATE_X ? body->holders_bitmap & ~requester_bit : 0;
 	if (body->required_holders_bitmap != required)
 		return false;
 	for (int node = 0; node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++) {

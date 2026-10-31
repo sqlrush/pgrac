@@ -1674,7 +1674,7 @@ make_decision_bytes(uint8 *bytes, bool forward, uint8 directory_mode,
 	test_put_u32_be(bytes + 188, (uint32)source_node);
 	test_put_u32_be(bytes + 192, holders);
 	required = target_mode == PCM_STATE_X ? holders & ~UINT32_C(8)
-		: directory_mode == PCM_STATE_X ? holders : 0;
+		: directory_mode == PCM_STATE_X ? holders & ~UINT32_C(8) : 0;
 	test_put_u32_be(bytes + 196, required);
 	test_put_u32_be(bytes + 204, 17);
 	test_put_u32_be(bytes + 208, 19);
@@ -1816,6 +1816,10 @@ UT_TEST(test_decision_local_current_is_bound_to_requester_boot)
 				continue;
 			UT_ASSERT_EQ(decoded.body.acquire_decision.holders[3].boot_incarnation,
 				decoded.body.acquire_decision.episode.requester_incarnation);
+			UT_ASSERT_EQ(decoded.body.acquire_decision.required_holders_bitmap, 0);
+			test_put_u32_be(bytes + 196, 8); /* R cannot be its own external ACK. */
+			test_reseal(bytes, RESOURCE_X_DECISION_V4_BYTES);
+			test_acquire_rejected(RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes, sizeof(bytes));
 		}
 }
 
@@ -2302,12 +2306,25 @@ UT_TEST(test_witness_x_source_keeps_downgrade_and_revoke_distinct)
 	}
 }
 
-UT_TEST(test_witness_local_source_self_downgrade_is_a_plain_native_ack)
+UT_TEST(test_witness_local_source_self_downgrade_has_no_external_ack)
 {
-	uint8 bytes[1048]; ResourceXDecodedFrame frame;
-	make_decision_bytes(bytes, true, PCM_STATE_X, 8, PCM_STATE_S, 3, RESOURCE_X_ACQUIRE_SOURCE_LOCAL_CURRENT);
-	(void)witness_attach(bytes, 3, false);
-	if (witness_round_trip(bytes, 832, &frame)) UT_ASSERT_EQ(frame.body.acquire_witness.original_ack.target_mode, PCM_STATE_S);
+	uint8 bytes[1048]; ResourceXDecodedFrame decision, witness = {0};
+	ResourceXWireReject reject; uint16 length = 0;
+	make_decision_bytes(bytes, false, PCM_STATE_X, 8, PCM_STATE_S, 3, RESOURCE_X_ACQUIRE_SOURCE_LOCAL_CURRENT);
+	if (!decision_round_trip(bytes, false, &decision)) return;
+	UT_ASSERT_EQ(decision.body.acquire_decision.required_holders_bitmap, 0);
+	witness.kind = RESOURCE_X_WIRE_BLOCKED_TO_N;
+	witness.payload_bytes = RESOURCE_X_WITNESS_V4_BYTES;
+	witness.has_acquire_decision = true;
+	witness.common = decision.common;
+	witness.common.action_node = 3; witness.common.outcome = RESOURCE_X_OUTCOME_OK;
+	witness.body.acquire_witness.decision = decision.body.acquire_decision;
+	witness.body.acquire_witness.original_ack = witness.common;
+	witness.body.acquire_witness.original_ack.authority_generation = decision.common.base_authority_generation;
+	witness.body.acquire_witness.original_ack.observed_mode = PCM_STATE_X;
+	witness.body.acquire_witness.original_ack.target_mode = PCM_STATE_S;
+	UT_ASSERT(!cluster_resource_x_wire_encode(RESOURCE_X_MSG_BLOCKED_TO_N, &witness,
+		bytes, sizeof(bytes), &length, &reject));
 }
 
 UT_TEST(test_witness_required_holder_bit31_is_not_lost)
@@ -3419,7 +3436,7 @@ main(void)
 	UT_RUN(test_witness_plain_required_holder_round_trips_original_ack);
 	UT_RUN(test_witness_shared_source_retains_original_proof);
 	UT_RUN(test_witness_x_source_keeps_downgrade_and_revoke_distinct);
-	UT_RUN(test_witness_local_source_self_downgrade_is_a_plain_native_ack);
+	UT_RUN(test_witness_local_source_self_downgrade_has_no_external_ack);
 	UT_RUN(test_witness_required_holder_bit31_is_not_lost);
 	UT_RUN(test_witness_every_prefix_and_extra_byte_is_rejected);
 	UT_RUN(test_witness_other_message_types_and_kinds_are_rejected);

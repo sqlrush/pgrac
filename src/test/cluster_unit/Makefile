@@ -5622,7 +5622,7 @@ test_cluster_pcm_settlement_ingress.inc: $(top_srcdir)/src/backend/cluster/clust
 	mv $@.tmp $@
 
 RESOURCE_X_PCM_TEST_O = test_cluster_pcm_lock_clock_product.o
-test_cluster_pcm_lock test_cluster_pcm_object_retire test_cluster_pcm_stop_cv test_cluster_pcm_read_grant test_cluster_resource_x_acquire_ingress test_cluster_resource_x_decision_send test_cluster_resource_x_decision_publish test_cluster_resource_x_holder_send test_cluster_resource_x_master_ack test_cluster_resource_x_master_done test_cluster_resource_x_master_consumed test_cluster_resource_x_master_quiet test_cluster_resource_x_master_unarmed test_cluster_resource_x_source_ack test_cluster_resource_x_s_source test_cluster_resource_x_source_done test_cluster_resource_x_clean_settlement test_cluster_resource_x_pi_carrier test_cluster_resource_x_x_source_carrier test_cluster_resource_x_pi_handoff test_cluster_resource_x_write_settlement test_cluster_resource_x_pi_replace: %: %.c test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
+test_cluster_pcm_lock test_cluster_pcm_object_retire test_cluster_pcm_stop_cv test_cluster_pcm_read_grant test_cluster_resource_x_acquire_ingress test_cluster_resource_x_decision_send test_cluster_resource_x_decision_publish test_cluster_resource_x_holder_send test_cluster_resource_x_master_ack test_cluster_resource_x_master_done test_cluster_resource_x_master_consumed test_cluster_resource_x_master_quiet test_cluster_resource_x_master_unarmed test_cluster_resource_x_source_ack test_cluster_resource_x_s_source test_cluster_resource_x_source_done test_cluster_resource_x_local_done test_cluster_resource_x_clean_settlement test_cluster_resource_x_pi_carrier test_cluster_resource_x_x_source_carrier test_cluster_resource_x_pi_handoff test_cluster_resource_x_write_settlement test_cluster_resource_x_pi_replace: %: %.c test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
 		test_cluster_pcm_master_durable.inc \
 		test_cluster_pcm_bootstrap_tick.inc \
 		test_cluster_pcm_settlement_ingress.inc \
@@ -10276,6 +10276,15 @@ test_cluster_resource_x_source_done_fixture.inc: test_cluster_resource_x_source_
 	awk '/^UT_TEST\(/ { stop=1 } !stop { print; lines++ } \
 	     END { if (!stop || lines < 70) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
+TESTS += test_cluster_resource_x_local_done
+all: test_cluster_resource_x_local_done
+test_cluster_resource_x_local_done: test_cluster_resource_x_source_done_fixture.inc \
+		test_cluster_resource_x_source_done test_cluster_resource_x_consumed_ring.inc \
+		test_cluster_resource_x_consumed_lms.inc
+clean distclean maintainer-clean: clean-resource-x-local-done
+.PHONY: clean-resource-x-local-done
+clean-resource-x-local-done:
+	rm -f test_cluster_resource_x_local_done
 clean distclean maintainer-clean: clean-resource-x-clean-settlement
 .PHONY: clean-resource-x-clean-settlement
 clean-resource-x-clean-settlement:
