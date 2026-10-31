@@ -8,14 +8,26 @@
  *     src/test/cluster_unit/test_cluster_recovery_scope_handoff.inc
  * NOTES
  *     Native replay, immutable SIDE, held pages and both map copies execute.
+ *     The original complete ROOT scan refuses an undeclared relmap effect.
+ *     The older receipt-handoff cases retain their controlled plan boundary.
  *     ROOT completion, installed Start and external authority remain fixtures.
  *     This is no lifetime, completion or retention-release qualification.
  *-------------------------------------------------------------------------
  */
+#include "pgstat.h"
+
+void
+pgstat_report_checksum_failure(void)
+{
+	abort(); /* This CLOG-only plan must not report a PAGE checksum failure. */
+}
+
 static ClusterWalInputV1 scope_handoff_selected[2];
 static const RfSideOnlinePlanV1 *scope_handoff_plans[2];
 static unsigned scope_handoff_fault;
 static bool scope_handoff_published;
+static ClusterColdDetailV1 scope_handoff_plan_result;
+static bool scope_handoff_original_plan;
 static uint32 scope_handoff_wait_event;
 uint32 *my_wait_event_info = &scope_handoff_wait_event;
 
@@ -122,13 +134,21 @@ scope_handoff_before_done(ClusterWalInputsV1 **original, ControlRootImage *root)
 	UT_ASSERT(!inputs_pin_held);
 	/* Installed original plan/fence and ROOT publication are fixture leaves.
 	 * No post-EOR owner exists while the real native owner is executing. */
-	tx_inputs_typed.plan = (ClusterColdPlanV1 *)&tx_inputs_typed;
 	tx_inputs_typed.top_tx_census = &ctrc_inputs_top;
 	ctrc_set_held = ctrc_set_calls = ctrc_set_release_calls = 0;
 	scope_handoff_replaying = true;
 	test_restart_ref = tx_inputs_typed.sources[0];
 	test_restart_ref_valid = true;
-	UT_ASSERT(test_scope_startup_attach_cold(&tx_inputs_typed, scope_handoff_selected));
+	if (scope_handoff_original_plan) {
+		scope_handoff_plan_result = test_scope_startup_prepare_plan(&tx_inputs_typed,
+			scope_handoff_selected, 8 * 1024 * 1024);
+		if (scope_handoff_plan_result != CLUSTER_COLD_OK) return false;
+	} else {
+		/* Retain D442's explicitly controlled receipt-handoff component.
+		 * It is not the real-plan relmap participant tested separately. */
+		tx_inputs_typed.plan = (ClusterColdPlanV1 *)&tx_inputs_typed;
+		UT_ASSERT(test_scope_startup_attach_cold(&tx_inputs_typed, scope_handoff_selected));
+	}
 	test_capture_error_level = true;
 	PG_TRY(); {
 		ok = scope_handoff_replay(0) && scope_handoff_replay(1);
@@ -207,6 +227,8 @@ scope_handoff_end(ClusterWalInputsV1 **inputs, ClusterRecoveryRelmapHistory **hi
 			rf_side_online_plan_destroy_v1(&tx_inputs_typed.side_plans[i]);
 		scope_initialized_storage_end();
 	}
+	if (scope_handoff_original_plan)
+		cluster_cold_plan_destroy_v1(&tx_inputs_typed.plan);
 }
 
 UT_TEST(test_scope_handoff_reuses_native_receipt_without_replaying_after_eor)
@@ -257,6 +279,23 @@ UT_TEST(test_scope_handoff_reuses_native_receipt_without_replaying_after_eor)
 		UT_ASSERT_EQ(relmap_failed | ctrc_set_release_calls | scope_native_legacy_calls, 0);
 	}
 	scope_handoff_end(&inputs, &history, fds);
+}
+
+UT_TEST(test_scope_handoff_original_plan_refuses_missing_relmap_declaration)
+{
+	ClusterWalInputsV1 *inputs = NULL;
+	ClusterRecoveryRelmapHistory *history = NULL;
+	ClusterRelmapV2Image pending;
+	int fds[2] = {-1, -1};
+	bool ready;
+
+	scope_handoff_fault = 0;
+	scope_handoff_original_plan = true;
+	ready = scope_handoff_begin(&inputs, &history, &pending);
+	scope_handoff_end(&inputs, &history, fds);
+	scope_handoff_original_plan = false;
+	UT_ASSERT_EQ(scope_handoff_plan_result, CLUSTER_COLD_STRUCTURAL_UNSUPPORTED);
+	UT_ASSERT(!ready && !scope_handoff_published && scope_replay_calls == 0);
 }
 
 UT_TEST(test_scope_handoff_native_failure_cannot_publish_or_retry)

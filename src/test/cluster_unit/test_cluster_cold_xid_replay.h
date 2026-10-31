@@ -7,6 +7,7 @@
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_wal_tail.h"
 #include "cluster/cluster_write_fence.h"
+#include "cluster/cluster_cold_relmap.h"
 
 static ClusterColdTypedV1 replay_typed;
 static ClusterWalRecoveryCheckpointV1 replay_checkpoints[3];
@@ -25,6 +26,7 @@ static bool replay_endpoint_ok, replay_readback_ok, replay_barrier_ok;
 static unsigned replay_effects_calls;
 static unsigned replay_census_calls;
 static bool replay_census_ok;
+static bool replay_relmap_ok;
 
 /* The original publish function must stop before handing off any failed cut. */
 static bool replay_ready_ok, replay_fatal_armed;
@@ -35,6 +37,18 @@ static ClusterRecoveryFenceCompleteV1 replay_complete_result;
 static jmp_buf replay_fatal;
 static char replay_events[16], replay_message[256];
 static unsigned replay_event_count;
+
+/* The native pair executor is exercised by test_cluster_cold_relmap.
+ * Here it is a fail-able participant at the original joint publish gate. */
+bool
+cluster_cold_typed_relmap_ready_v1(ClusterColdTypedV1 *typed,
+	struct ClusterRecoveryFencePlan *fence)
+{
+	UT_ASSERT(typed == &replay_typed);
+	UT_ASSERT(fence == (struct ClusterRecoveryFencePlan *)&replay_fence);
+	return replay_relmap_ok;
+}
+
 
 static void
 replay_event(char event)
@@ -219,6 +233,14 @@ cluster_cold_typed_top_tx_census_v1(ClusterColdTypedV1 *typed,
 }
 
 bool
+cluster_recovery_merge_fence_plan_bind_tx_inputs_v1(ClusterRecoveryFencePlan *plan,
+	const struct ClusterWalSourceRef *sources, uint32 count)
+{
+	return plan == (struct ClusterRecoveryFencePlan *)&replay_fence
+		&& sources == replay_typed.sources && count == replay_typed.replay_count;
+}
+
+bool
 cluster_cold_typed_checkpoint_v1(const ClusterColdTypedV1 *typed, uint32 participant,
 								 ClusterControlRootSnapshot *root,
 								 ClusterWalRecoveryCheckpointV1 *checkpoint)
@@ -351,7 +373,7 @@ replay_xid_reset(int count)
 	replay_ready_calls = replay_complete_calls = replay_external_calls = 0;
 	replay_fatal_calls = replay_log_calls = 0;
 	replay_error_level = replay_sqlstate = 0;
-	replay_ready_ok = replay_barrier_ok = replay_readback_ok = replay_endpoint_ok = true;
+	replay_ready_ok = replay_barrier_ok = replay_readback_ok = replay_endpoint_ok = replay_relmap_ok = true;
 	replay_fatal_armed = false;
 	replay_complete_result = CLUSTER_RECOVERY_FENCE_COMPLETE_OK;
 	replay_event_count = 0;
@@ -631,6 +653,25 @@ UT_TEST(test_startup_publish_stops_before_handoff_on_incomplete_inputs)
 													 : "ECBRXL")
 				  == 0);
 		UT_ASSERT(strstr(replay_message, "could not publish thread 3 recovered") != NULL);
+	}
+}
+
+UT_TEST(test_startup_publish_requires_both_original_and_relmap_receipts)
+{
+	for (unsigned state = 0; state < 4; ++state) {
+		ClusterColdReplayResultV1 result = {.detail = CLUSTER_COLD_REPLAY_OK};
+		bool refused = false;
+		replay_xid_reset(1);
+		replay_ready_ok = (state & 1) != 0;
+		replay_relmap_ok = (state & 2) != 0;
+		replay_fatal_armed = true;
+		if (setjmp(replay_fatal) == 0)
+			cluster_typed_replay_publish(&replay_adapter, &result);
+		else
+			refused = true;
+		replay_fatal_armed = false;
+		UT_ASSERT_EQ(refused, state != 3);
+		UT_ASSERT_EQ(replay_complete_calls, state == 3);
 	}
 }
 

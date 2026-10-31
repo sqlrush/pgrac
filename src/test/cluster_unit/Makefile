@@ -578,6 +578,9 @@ SIMPLE_TESTS := $(filter-out test_cluster_relmap_arb,$(SIMPLE_TESTS))
 TESTS += test_cluster_relmap_v2
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_v2,$(SIMPLE_TESTS))
 TESTS += test_cluster_relmap_v2_storage
+TESTS += test_cluster_cold_relmap
+SIMPLE_TESTS := $(filter-out test_cluster_cold_relmap,$(SIMPLE_TESTS))
+all: test_cluster_cold_relmap
 TESTS += test_cluster_relmap_publish_native
 TESTS += test_cluster_relmap_publish_clog
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_v2_storage,$(SIMPLE_TESTS))
@@ -865,6 +868,30 @@ test_cluster_relmap_v2: test_cluster_relmap_v2.c unit_test.h \
 		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND $< \
 		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a -o $@
+
+test_cluster_cold_relmap_executor.o: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_relmap.c \
+		$(top_srcdir)/src/include/cluster/cluster_cold_relmap.h \
+		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_plan_internal.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_PGRAC_CLUSTER -DUSE_CLUSTER_UNIT -ffunction-sections -fdata-sections -c $< -o $@
+
+test_cluster_cold_relmap: test_cluster_cold_relmap.c test_cluster_relmap_v2_storage.c \
+		unit_test.h $(top_srcdir)/src/include/cluster/cluster_cold_relmap.h \
+		$(CLUSTER_COLD_PLAN_O) test_cluster_cold_recovery_replay_core.o \
+		test_cluster_cold_relmap_executor.o test_cluster_relmap_v2_storage_product.o \
+		test_cluster_relmap_pending_product.o \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_retention_restore.o \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
+		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) $(CLUSTER_UNIT_PORT_LIBS) $(top_builddir)/src/common/libpgcommon_srv.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_PGRAC_CLUSTER -ffunction-sections -fdata-sections $< \
+		$(CLUSTER_COLD_PLAN_O) test_cluster_cold_recovery_replay_core.o \
+		test_cluster_cold_relmap_executor.o test_cluster_relmap_v2_storage_product.o \
+		test_cluster_relmap_pending_product.o \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_retention_restore.o \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
+		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(filter -lcrypto,$(LIBS)) -o $@
 
 # Recovery record headers and pure history checks also serve pg_waldump.
 TESTS += test_cluster_recovery_frontend
@@ -5273,6 +5300,12 @@ test_cluster_wal_retained_cut: test_cluster_wal_retained_cut.c unit_test.h \
 CLUSTER_COLD_PLAN_SPLIT_O = test_cluster_cold_recovery_plan_store_core.o test_cluster_cold_recovery_plan_seal_core.o \
 	test_cluster_cold_recovery_plan_space_core.o test_cluster_cold_recovery_plan_schedule_core.o
 CLUSTER_COLD_PLAN_O = test_cluster_cold_recovery_plan_core.o $(CLUSTER_COLD_PLAN_SPLIT_O)
+
+test_cluster_cold_relmap: $(CLUSTER_COLD_PLAN_O)
+$(CLUSTER_COLD_PLAN_O) test_cluster_cold_recovery_startup_plan_core.o \
+		test_cluster_cold_recovery_refail_plan_core.o test_cluster_cold_recovery_replay_plan_core.o \
+		test_cluster_cold_recovery_startup_core.o test_cluster_recovery_scope_startup.o: \
+		$(top_srcdir)/src/include/cluster/cluster_cold_relmap.h
 
 RETAINED_RECORD_OBJS = $(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) \
 		$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) $(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) \
@@ -12331,11 +12364,13 @@ $(CLUSTER_COLD_DECODE_O): $(top_srcdir)/src/backend/cluster/cluster_cold_recover
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -c $< -o $@
 
 test_cluster_cold_recovery_decode: test_cluster_cold_recovery_decode.c unit_test.h $(CLUSTER_COLD_DECODE_O) \
+		test_cluster_cold_recovery_replay_core.o $(CLUSTER_COLD_PLAN_O) \
 		$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) \
 		$(CLUSTER_SIDE_UNDO_O) $(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		cluster_unit_port_stubs.o $(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< $(CLUSTER_COLD_DECODE_O) \
+		test_cluster_cold_recovery_replay_core.o $(CLUSTER_COLD_PLAN_O) \
 		$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) \
 		$(CLUSTER_SIDE_UNDO_O) $(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \

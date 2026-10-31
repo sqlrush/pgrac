@@ -44,6 +44,7 @@
 #include "storage/standbydefs.h"
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_cold_relmap.h"
 #include "cluster/cluster_cold_recovery_census.h"
 #include "cluster/cluster_side_online_plan.h"
 #include "cluster/cluster_side_online_owner.h"
@@ -1270,9 +1271,9 @@ cold_scan_and_seal(ClusterColdTypedV1 *typed, const ColdRoot *roots,
 	return true;
 }
 
-ClusterColdTypedV1 *
-cluster_cold_typed_prepare_v1(ClusterRecoveryFencePlan *fence, uint16 own_thread,
-							  XLogRecPtr own_redo)
+static ClusterColdTypedV1 *
+cold_typed_prepare(ClusterRecoveryFencePlan *fence, uint16 own_thread,
+	XLogRecPtr own_redo, const ClusterColdRelmapInputV1 *relmap, uint32 relmap_count)
 {
 	MemoryContext context;
 	MemoryContext old_context;
@@ -1309,6 +1310,21 @@ cluster_cold_typed_prepare_v1(ClusterRecoveryFencePlan *fence, uint16 own_thread
 		cold_refuse(typed, detail, "plan creation refused: %s", cold_detail_name(detail));
 		goto done;
 	}
+	if (relmap_count != 0) {
+		detail = cluster_cold_plan_relmap_declare_v1(typed->plan, relmap, relmap_count);
+		if (detail != CLUSTER_COLD_OK) {
+			cold_refuse(typed, detail, "declared relmap input refused");
+			goto done;
+		}
+		for (uint32 i = 0; i < relmap_count; ++i) {
+			uint32 p = relmap[i].participant;
+			if (p >= typed->replay_count
+				|| memcmp(&relmap[i].source, &typed->sources[p], sizeof(relmap[i].source)) != 0) {
+				cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "declared relmap source changed");
+				goto done;
+			}
+		}
+	}
 	if (cold_scan_and_seal(typed, roots, fence))
 		typed->refusal = CLUSTER_COLD_OK;
 
@@ -1319,6 +1335,22 @@ done:
 	}
 	MemoryContextSwitchTo(old_context);
 	return typed;
+}
+
+ClusterColdTypedV1 *
+cluster_cold_typed_prepare_v1(ClusterRecoveryFencePlan *fence, uint16 own_thread, XLogRecPtr own_redo)
+{
+	return cold_typed_prepare(fence, own_thread, own_redo, NULL, 0);
+}
+
+ClusterColdTypedV1 *
+cluster_cold_typed_prepare_relmap_v1(ClusterRecoveryFencePlan *fence, uint16 own_thread,
+	XLogRecPtr own_redo, const ClusterColdRelmapInputV1 *inputs, uint32 count)
+{
+	/* Invalid declaration never falls back to the ordinary undeclared mode. */
+	if (inputs == NULL || count == 0 || count > CLUSTER_COLD_RELMAP_MAX_INPUTS)
+		return NULL;
+	return cold_typed_prepare(fence, own_thread, own_redo, inputs, count);
 }
 
 void

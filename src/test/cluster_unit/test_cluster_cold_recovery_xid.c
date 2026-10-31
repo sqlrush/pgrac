@@ -1,6 +1,7 @@
 /* Ordered cold counter candidates never authorize replay or transaction state. */
 #include "postgres.h"
 #include "cluster/cluster_cold_recovery.h"
+#include "utils/relmapper.h"
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
@@ -319,10 +320,35 @@ UT_TEST(test_null_and_uninitialized_inputs)
 
 #include "test_cluster_cold_xid_replay.h"
 
+UT_TEST(test_relmap_counter_input_preserves_structural_effect_obligation)
+{
+	for (unsigned fault = 0; fault < 3; ++fault) {
+		ClusterColdParticipantV1 s = source(1);
+		ClusterColdXidProgressV1 p;
+		ClusterColdRecordV1 r = record(0);
+		ClusterColdXidInputV1 input = {.record_xid = 110, .complete = true};
+		RelMapFile map = {0};
+		uint64 result;
+		r.rmid = fault == 1 ? RM_DBASE_ID : RM_RELMAP_ID;
+		r.info = XLOG_RELMAP_UPDATE;
+		r.record_flags = CLUSTER_COLD_RECORD_STRUCTURAL;
+		r.relmap_image = fault == 2 ? NULL : &map;
+		UT_ASSERT(cluster_cold_xid_begin_v1(&p, &s, full(8, 100), 1));
+		UT_ASSERT_EQ(cluster_cold_xid_record_v1(&p, &s, &r, &input), fault == 0);
+		if (fault == 0) {
+			UT_ASSERT(cluster_cold_xid_candidate_v1(&p, &s, &result));
+			UT_ASSERT_EQ(result, full(8, 111));
+			UT_ASSERT_EQ(cluster_cold_unscheduled_v1(&r), CLUSTER_COLD_UNSCHEDULED_REFUSE);
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(31);
+	UT_PLAN(33);
+	UT_RUN(test_relmap_counter_input_preserves_structural_effect_obligation);
+	UT_RUN(test_startup_publish_requires_both_original_and_relmap_receipts);
 	UT_RUN(test_startup_publish_refuses_missing_effects_before_completion);
 	UT_RUN(test_startup_publish_rejects_inconsistent_coverage_and_clears_receipt);
 	UT_RUN(test_startup_publish_empty_sealed_cut_keeps_later_gates);

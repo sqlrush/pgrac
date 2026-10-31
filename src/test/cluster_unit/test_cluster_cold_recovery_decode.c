@@ -45,6 +45,7 @@
 #include "cluster/cluster_xid_stripe_xlog.h"
 #include "replication/message.h"
 #include "storage/standbydefs.h"
+#include "utils/relmapper.h"
 
 #include "unit_test.h"
 
@@ -471,6 +472,25 @@ native_smgr_record(FakeRecord *record, bool truncate)
 	}
 }
 
+static void
+native_relmap_record(FakeRecord *record)
+{
+	xl_relmap_update header = {InvalidOid, GLOBALTABLESPACE_OID, sizeof(RelMapFile)};
+	RelMapFile map = {0};
+
+	fake_record(record, RM_RELMAP_ID, XLOG_RELMAP_UPDATE, 0);
+	record->storage.decoded.header.xl_xid = 97;
+	map.magic = RELMAPPER_FILEMAGIC;
+	map.num_mappings = 1;
+	map.mappings[0] = (RelMapping){1259, 40001};
+	INIT_CRC32C(map.crc);
+	COMP_CRC32C(map.crc, &map, offsetof(RelMapFile, crc));
+	FIN_CRC32C(map.crc);
+	memcpy(record->data, &header, MinSizeOfRelmapUpdate);
+	memcpy(record->data + MinSizeOfRelmapUpdate, &map, sizeof(map));
+	record->storage.decoded.main_data_len = MinSizeOfRelmapUpdate + sizeof(map);
+}
+
 UT_TEST(test_storage_lifecycle_classification)
 {
 	FakeRecord record;
@@ -498,6 +518,8 @@ UT_TEST(test_storage_lifecycle_classification)
 			standby_record(&record, cases[i].info, true);
 		else
 			fake_record(&record, cases[i].rmid, cases[i].info, 0);
+		if (cases[i].rmid == RM_RELMAP_ID)
+			native_relmap_record(&record);
 		if (cases[i].rmid == RM_XLOG_ID)
 			record.storage.decoded.main_data_len = sizeof(Oid);
 		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, false, &out),
@@ -1214,10 +1236,61 @@ UT_TEST(test_full_clog_truncate_keeps_native_and_foreign_owner_routes)
 		}
 }
 
+UT_TEST(test_relmap_complete_image_keeps_structural_and_exclusive_participant_route)
+{
+	for (unsigned foreign = 0; foreign < 2; ++foreign) {
+		FakeRecord record;
+		ClusterColdDecodedV1 out = {0};
+		ClusterColdStepV1 step = {0};
+		native_relmap_record(&record);
+		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, foreign, &out), CLUSTER_COLD_OK);
+		UT_ASSERT((out.record.record_flags & CLUSTER_COLD_RECORD_STRUCTURAL) != 0);
+		UT_ASSERT_EQ(memcmp(out.record.relmap_image, record.data + MinSizeOfRelmapUpdate, sizeof(RelMapFile)), 0);
+		UT_ASSERT_EQ(out.effects.participant_apply, CLUSTER_COLD_EFFECT_RECORD);
+		UT_ASSERT_EQ(out.effects.native_apply | out.effects.no_effect | out.effects.refused, 0);
+		UT_ASSERT(out.xid_input.complete && out.xid_input.record_xid == 97);
+		step.step_kind = CLUSTER_COLD_STEP_RELMAP;
+		step.read_rec_ptr = out.record.read_rec_ptr;
+		step.end_rec_ptr = out.record.end_rec_ptr;
+		step.record_crc = out.record.record_crc;
+		step.rmid = out.record.rmid;
+		step.info = out.record.info;
+		UT_ASSERT(cluster_cold_replay_effects_v1(&out, &step, !foreign));
+		UT_ASSERT(!cluster_cold_replay_effects_v1(&out, NULL, !foreign));
+		step.step_kind = CLUSTER_COLD_STEP_PAGE;
+		UT_ASSERT(!cluster_cold_replay_effects_v1(&out, &step, !foreign));
+		cluster_cold_decoded_release_v1(&out);
+	}
+}
+
+UT_TEST(test_relmap_incomplete_or_corrupt_native_bytes_cannot_get_a_route)
+{
+	for (unsigned fault = 0; fault < 7; ++fault) {
+		FakeRecord record;
+		ClusterColdDecodedV1 out = {0};
+		xl_relmap_update header;
+		native_relmap_record(&record);
+		memcpy(&header, record.data, MinSizeOfRelmapUpdate);
+		if (fault == 0) record.storage.decoded.main_data_len--;
+		if (fault == 1) header.nbytes--;
+		if (fault == 2) header.tsid = DEFAULTTABLESPACE_OID;
+		if (fault == 3) record.data[MinSizeOfRelmapUpdate + 500] ^= 1;
+		if (fault == 4) record.storage.decoded.header.xl_info = 0x10;
+		if (fault == 5) record.storage.decoded.has_page_version_edge = true;
+		if (fault == 6) record.storage.decoded.record_origin = 1;
+		memcpy(record.data, &header, MinSizeOfRelmapUpdate);
+		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, false, &out), CLUSTER_COLD_COMPONENT_INVALID);
+		UT_ASSERT_EQ(out.effects.participant_apply, 0);
+		cluster_cold_decoded_release_v1(&out);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(23);
+	UT_PLAN(25);
+	UT_RUN(test_relmap_complete_image_keeps_structural_and_exclusive_participant_route);
+	UT_RUN(test_relmap_incomplete_or_corrupt_native_bytes_cannot_get_a_route);
 	UT_RUN(test_full_clog_truncate_keeps_native_and_foreign_owner_routes);
 	UT_RUN(test_full_clog_birth_keeps_native_and_foreign_owner_routes);
 	UT_RUN(test_stripe_join_uses_real_native_or_foreign_consumer);

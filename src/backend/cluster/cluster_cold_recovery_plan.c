@@ -45,6 +45,100 @@
 #include "cluster/cluster_cold_recovery_plan_internal.h"
 #include "cluster/cluster_xid_stripe_xlog.h"
 #include "cluster/storage/cluster_undo_xlog.h"
+#include "utils/relmapper.h"
+#include "catalog/pg_tablespace_d.h"
+
+ClusterColdDetailV1
+cluster_cold_plan_relmap_declare_v1(ClusterColdPlanV1 *plan,
+	const ClusterColdRelmapInputV1 *inputs, uint32 count)
+{
+	Size bytes;
+
+	if (!plan_valid(plan) || inputs == NULL || count == 0
+		|| count > CLUSTER_COLD_RELMAP_MAX_INPUTS)
+		return CLUSTER_COLD_INVALID_ARGUMENT;
+	if (plan->phase != COLD_PHASE_FEEDING || plan->input_frame_count != 0
+		|| plan->relmap_inputs != NULL)
+		return CLUSTER_COLD_STATE;
+	for (uint32 i = 0; i < count; ++i) {
+		const ClusterColdRelmapInputV1 *in = &inputs[i];
+		const ClusterRelmapV2Image *image = &in->staged;
+		const ClusterRelmapV2Owner *owner = &image->pending_owner;
+		const ClusterWalSourceRef *source = &in->source;
+
+		if (in->participant >= plan->participant_count || in->retention == NULL
+			|| in->retention_lock == NULL
+			|| !cold_relmap_cut_equal(&in->cut,
+				&plan->participants[plan->canonical[in->participant]].cut)
+			|| in->frame.participant != in->participant || in->frame.history
+			|| in->frame.rmid != RM_RELMAP_ID || in->frame.info != XLOG_RELMAP_UPDATE
+			|| in->frame.page_components != 0 || in->frame.space_effects != 0
+			|| in->frame.read_rec_ptr < in->cut.native_redo
+			|| in->frame.read_rec_ptr >= in->frame.end_rec_ptr
+			|| in->frame.end_rec_ptr > in->cut.tail_end
+			|| image->identity.system_identifier == 0 || image->identity.database_incarnation == 0
+			|| (image->identity.shared ? OidIsValid(image->identity.dbid)
+				: !OidIsValid(image->identity.dbid))
+			|| image->committed_generation == 0 || image->committed_generation == PG_UINT64_MAX
+			|| image->pending_generation != image->committed_generation + 1
+			|| (uint32)owner->node + 1 != in->cut.thread_id
+			|| source->claim.identity.origin_node_id != owner->node
+			|| owner->admitted_incarnation != in->cut.owner_incarnation
+			|| owner->boot_incarnation == 0 || !TransactionIdIsNormal((TransactionId)owner->top_full_xid)
+			|| (TransactionId)owner->top_full_xid != in->frame.source_xid
+			|| (TransactionIdIsValid(in->frame.source_top_xid)
+				&& in->frame.source_top_xid != in->frame.source_xid)
+			|| owner->wal_end != in->frame.end_rec_ptr
+			|| source->timeline != in->cut.timeline
+			|| source->claim.identity.origin_thread_id != in->cut.thread_id
+			|| source->claim.identity.origin_owner_incarnation != in->cut.owner_incarnation
+			|| source->claim.identity.system_identifier != image->identity.system_identifier
+			|| source->claim.database_incarnation != image->identity.database_incarnation
+			|| source->claim.max_config_generation == 0
+			|| !bytes_nonzero(source->claim.identity.storage_uuid, 16)
+			|| !bytes_nonzero(source->claim.claim_sha256, 32))
+			return CLUSTER_COLD_STRUCTURAL_UNSUPPORTED;
+		/* One pending pair per namespace. Multiple writes to that pair need
+		 * the original terminal owner, never an implicit stage overwrite. */
+		for (uint32 k = 0; k < i; ++k)
+			if (inputs[k].staged.identity.dbid == image->identity.dbid
+				&& inputs[k].staged.identity.shared == image->identity.shared)
+				return CLUSTER_COLD_STRUCTURAL_UNSUPPORTED;
+	}
+	bytes = (Size)count * sizeof(ColdRelmapInput);
+	if (!cold_plan_reserve(plan, bytes))
+		return CLUSTER_COLD_CAPACITY;
+	plan->relmap_inputs = cold_alloc0(bytes);
+	if (plan->relmap_inputs == NULL) {
+		cold_plan_release(plan, bytes);
+		return CLUSTER_COLD_CAPACITY;
+	}
+	plan->relmap_count = count;
+	for (uint32 i = 0; i < count; ++i)
+		plan->relmap_inputs[i].input = inputs[i];
+	return CLUSTER_COLD_OK;
+}
+
+static uint32
+relmap_capture(ClusterColdPlanV1 *plan, uint32 participant, const ClusterColdRecordV1 *record)
+{
+	if (record->record_flags != CLUSTER_COLD_RECORD_STRUCTURAL
+			&& record->record_flags != (CLUSTER_COLD_RECORD_STRUCTURAL | CLUSTER_COLD_RECORD_SIDE_UNOWNED))
+		return CLUSTER_COLD_NO_INDEX;
+	for (uint32 i = 0; i < plan->relmap_count; ++i) {
+		ColdRelmapInput *entry = &plan->relmap_inputs[i];
+		const ClusterColdRelmapInputV1 *in = &entry->input;
+		if (!entry->captured && in->participant == participant
+			&& cold_relmap_frame_equal(&in->frame, record)
+			&& record->relmap_image != NULL && record->relmap_dbid == in->staged.identity.dbid
+			&& record->relmap_tsid == (in->staged.identity.shared ? GLOBALTABLESPACE_OID : DEFAULTTABLESPACE_OID)
+			&& memcmp(record->relmap_image, &in->staged.pending, sizeof(RelMapFile)) == 0) {
+			entry->captured = true;
+			return i;
+		}
+	}
+	return CLUSTER_COLD_NO_INDEX;
+}
 
 static int
 identity_compare(const RfPageIdentityV1 *left, const RfPageIdentityV1 *right)
@@ -509,9 +603,13 @@ cluster_cold_plan_feed_v1(ClusterColdPlanV1 *plan, uint32 participant,
 		detail = CLUSTER_COLD_COMPONENT_INVALID;
 	else {
 		uint32 previous_records = plan->record_count;
+		uint32 relmap = CLUSTER_COLD_NO_INDEX;
 
 		owner = &plan->participants[plan->canonical[participant]];
 		detail = record_cursor_check(owner, record);
+		if (detail == CLUSTER_COLD_OK && record->rmid == RM_RELMAP_ID
+			&& record->end_rec_ptr > owner->cut.native_redo)
+			relmap = relmap_capture(plan, participant, record);
 		/* C0 names a separate target. The writer's checkpoint is not
 		 * target coverage, including an entirely historical source. */
 		if (detail == CLUSTER_COLD_OK && record->rmid == RM_CLUSTER_UNDO_ID
@@ -523,11 +621,13 @@ cluster_cold_plan_feed_v1(ClusterColdPlanV1 *plan, uint32 participant,
 		if (detail == CLUSTER_COLD_OK
 			&& ((record->record_flags & CLUSTER_COLD_RECORD_UNSUPPORTED) != 0
 				|| ((record->record_flags & CLUSTER_COLD_RECORD_STRUCTURAL) != 0
-					&& record->end_rec_ptr > owner->cut.native_redo)))
+					&& record->end_rec_ptr > owner->cut.native_redo
+					&& relmap == CLUSTER_COLD_NO_INDEX)))
 			detail = CLUSTER_COLD_STRUCTURAL_UNSUPPORTED;
 		/* A side effect without a cold owner is never replayed as a no-op. */
 		if (detail == CLUSTER_COLD_OK
 			&& (record->record_flags & CLUSTER_COLD_RECORD_SIDE_UNOWNED) != 0
+			&& relmap == CLUSTER_COLD_NO_INDEX
 			&& record->end_rec_ptr > owner->cut.native_redo)
 			detail = CLUSTER_COLD_SIDE_OWNER_MISSING;
 		/* Every JOIN, including retained history, must agree before any
@@ -557,8 +657,14 @@ cluster_cold_plan_feed_v1(ClusterColdPlanV1 *plan, uint32 participant,
 			detail = CLUSTER_COLD_SPACE_INVALID;
 		if (detail == CLUSTER_COLD_OK && record->space_count != 0)
 			detail = space_record_store(plan, plan->canonical[participant], record);
-		if (detail == CLUSTER_COLD_OK && record->component_count != 0)
+		if (detail == CLUSTER_COLD_OK
+			&& (record->component_count != 0 || relmap != CLUSTER_COLD_NO_INDEX))
 			detail = record_store(plan, plan->canonical[participant], record);
+		if (detail == CLUSTER_COLD_OK && relmap != CLUSTER_COLD_NO_INDEX) {
+			ColdRecord *stored = cold_record(plan, previous_records);
+			stored->flags |= COLD_RECORD_RELMAP;
+			stored->first_component = relmap;
+		}
 		if (detail == CLUSTER_COLD_OK)
 			detail = input_frame_store(plan, participant, record, previous_records);
 		if (detail == CLUSTER_COLD_OK) {
@@ -643,6 +749,10 @@ cluster_cold_plan_step_v1(const ClusterColdPlanV1 *plan, uint32 index, ClusterCo
 	out->record_crc = record->record_crc;
 	out->rmid = record->rmid;
 	out->info = record->info;
+	if ((record->flags & COLD_RECORD_RELMAP) != 0) {
+		out->step_kind = CLUSTER_COLD_STEP_RELMAP;
+		return true;
+	}
 	if ((record->flags & COLD_RECORD_SPACE) != 0) {
 		const ColdSpaceOp *op = cold_space_op(plan, record->first_component);
 
@@ -912,6 +1022,8 @@ cluster_cold_plan_destroy_v1(ClusterColdPlanV1 **plan_address)
 		cold_free(plan->omitted_frame_chunks);
 	cold_plan_intern_free(&plan->relations);
 	cold_plan_intern_free(&plan->segments);
+	if (plan->relmap_inputs != NULL)
+		cold_free(plan->relmap_inputs);
 	cold_free(plan->canonical);
 	cold_free(plan->participants);
 	cold_free(plan);

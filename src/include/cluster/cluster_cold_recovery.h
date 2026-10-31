@@ -48,6 +48,8 @@
 #ifndef CLUSTER_COLD_RECOVERY_H
 #define CLUSTER_COLD_RECOVERY_H
 
+#include "common/relmap.h"
+
 #include "access/xlogrecord.h"
 #include "cluster/cluster_page_stable_base.h"
 #include "cluster/cluster_page_detached.h"
@@ -186,6 +188,11 @@ typedef struct ClusterColdRecordV1 {
 	const ClusterColdComponentV1 *components;
 	uint32 space_count; /* a record has SPACE effects or page components, not both */
 	const ClusterColdSpaceOpV1 *space_ops;
+	/* Borrowed complete native image; only an exact declared participant
+	 * may consume this structural effect. Never a page/no-op route. */
+	Oid relmap_dbid;
+	Oid relmap_tsid;
+	const RelMapFile *relmap_image;
 } ClusterColdRecordV1;
 
 /* Original record frame metadata, not an ownership or effects proof. */
@@ -258,7 +265,8 @@ typedef struct ClusterColdBlockStepV1 {
  * commit's relation drops) to the SPACE owner. */
 typedef enum ClusterColdStepKindV1 {
 	CLUSTER_COLD_STEP_PAGE = 0,
-	CLUSTER_COLD_STEP_SPACE = 1
+	CLUSTER_COLD_STEP_SPACE = 1,
+	CLUSTER_COLD_STEP_RELMAP = 2
 } ClusterColdStepKindV1;
 
 typedef struct ClusterColdStepV1 {
@@ -431,7 +439,8 @@ typedef enum ClusterColdPageActionV1 {
 	CLUSTER_COLD_PAGE_APPLY = 0,
 	CLUSTER_COLD_PAGE_SKIP = 1,
 	CLUSTER_COLD_PAGE_SKIP_ADVANCE_XID = 2,
-	CLUSTER_COLD_SPACE_STEP = 3 /* hand the step's SPACE effects to the SPACE owner */
+	CLUSTER_COLD_SPACE_STEP = 3, /* hand the step's SPACE effects to the SPACE owner */
+	CLUSTER_COLD_RELMAP_STEP = 4
 } ClusterColdPageActionV1;
 
 extern ClusterColdPageActionV1 cluster_cold_page_action_v1(const ClusterColdStepV1 *step, bool own);
@@ -591,6 +600,7 @@ typedef struct ClusterColdEffectRoutesV1 {
 	uint32 space_apply;
 	uint32 no_effect;
 	uint32 refused;
+	uint32 participant_apply;
 } ClusterColdEffectRoutesV1;
 
 /* Original-thread native cold-replay counter inputs, applied in this order:
@@ -663,6 +673,7 @@ typedef struct ClusterColdDecodedV1 {
 	uint8 route_detail; /* RfPageProofDetailV1 of a refused record */
 	ClusterColdSpaceOpV1 *space_ops;
 	uint32 space_capacity;
+	RelMapFile relmap_image;
 } ClusterColdDecodedV1;
 
 /* Classify one decoded record of the exact source namespace. Reserved raw/top
