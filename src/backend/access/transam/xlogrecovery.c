@@ -3675,7 +3675,7 @@ static bool
 cluster_recovery_cold_page_hot_projection(const ClusterRecoveryCensusReferenceV1 *references,
 	uint32 count, uint32 index, const Size *tuple_offsets, const char *tuple_bytes,
 	const ClusterItlSlotData *slots, const RfPageCtrcOwnerEvidenceV1 *proof,
-	const ClusterColdTtSlotInputV1 *terminals, uint32 terminal_count, PGAlignedBlock *scratch)
+	const ClusterColdTtSlotInputV1 *terminals, uint32 terminal_count, PGAlignedBlock *scratch, bool complete)
 {
 	const ClusterRecoveryCensusReferenceV1 *reference = &references[index];
 	Page page = (Page)proof->completed.owner.image.data;
@@ -3707,7 +3707,7 @@ cluster_recovery_cold_page_hot_projection(const ClusterRecoveryCensusReferenceV1
 		memcpy(&h, tuple_bytes + tuple_offsets[i], SizeofHeapTupleHeader);
 		if ((h.t_infomask2 & (HEAP_HOT_UPDATED | HEAP_ONLY_TUPLE)) != 0) hot = true;
 	}
-	if (!hot) return true;
+	if (!hot && !complete) return true;
 	*scratch = proof->completed.owner.image;
 	memcpy(scratch->data + header->pd_special, slots,
 		CLUSTER_ITL_INITRANS_DEFAULT * sizeof(*slots));
@@ -3819,7 +3819,7 @@ cluster_recovery_cold_page_tuple_fields(const ClusterRecoveryCensusReferenceV1 *
 	if (count == 0) return 0;
 	proof = &related->owners.entries[owner]; page = (const PageHeaderData *)proof->completed.owner.image.data;
 	if (!cluster_recovery_cold_page_hot_projection(references, reference_count, index,
-		tuple_offsets, tuple_bytes, slots, proof, terminals, terminal_count, &scratch)) return 0;
+		tuple_offsets, tuple_bytes, slots, proof, terminals, terminal_count, &scratch, false)) return 0;
 	offset = ItemIdGetOffset(&entry->item);
 	if (entry->index > PageGetMaxOffsetNumber((Page)page)
 		|| memcmp(&entry->item, PageGetItemId((Page)page, entry->index), sizeof(entry->item)) != 0
@@ -4201,6 +4201,263 @@ RfPageCtrcOwnerGraphV1
 ClusterColdRecoveryCtrcPageProjectedGraph(const struct ClusterRecoveryStartV1 *start, Size memory_budget)
 {
 	return cluster_recovery_cold_page_owner_graph(start, memory_budget, true);
+}
+
+/* Local snapshots borrow the original Start and PAGE ownership; their one
+ * allocation remains independently budgeted alongside all graph allocations. */
+typedef struct ClusterColdCtrcPageCoverageV1 {
+	ClusterColdCtrcPageReferenceSnapshotV1 saved;
+	Size *tuple_offsets;
+	char *tuple_bytes;
+	ClusterColdTtSlotInputV1 *terminals;
+	ClusterRecoveryTxResultObservationV1 accepted;
+	uint32 terminal_count;
+	uint32 *mapping;
+} ClusterColdCtrcPageCoverageV1;
+
+static bool
+cluster_recovery_cold_page_coverage_current(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcPageCoverageV1 *snapshot, bool capture)
+{
+	const ClusterColdCtrcPageReferenceSnapshotV1 *saved = &snapshot->saved;
+
+	return cluster_recovery_cold_page_references_same(start, saved)
+		&& cluster_recovery_cold_page_tuple_bytes_current(saved->references, saved->fixed_references,
+			saved->reference_count, snapshot->tuple_offsets, snapshot->tuple_bytes)
+		&& saved->work->counts.subject_count == snapshot->terminal_count
+		&& cluster_recovery_cold_page_projection_subjects(start, saved->work, saved->scope,
+			start->ctrc_page_progress, snapshot->terminals, &snapshot->accepted, capture);
+}
+
+/* This stronger opt-in check does not change the old per-field graph API.
+ * EVERY current slot/item must reconstruct the SAME whole actual PAGE, even
+ * when none of its entries contributes a transaction edge. */
+static bool
+cluster_recovery_cold_page_coverage_complete(const ClusterColdCtrcPageCoverageV1 *snapshot,
+	uint32 page_index, const volatile RfPageCtrcOwnerGraphV1 *graph)
+{
+	const ClusterColdCtrcPageReferenceSnapshotV1 *saved = &snapshot->saved;
+	uint32 owner = snapshot->mapping[page_index], seen = 0, first = UINT32_MAX;
+	ClusterItlSlotData slots[CLUSTER_ITL_INITRANS_DEFAULT];
+	const RfPageCtrcOwnerEvidenceV1 *proof;
+	PGAlignedBlock scratch;
+
+	if (owner >= graph->related.owners.count) return false;
+	proof = &graph->related.owners.entries[owner];
+	if (!cluster_ctrc_recovery_heap_itl_references_v1(proof->completed.owner.image.data)) return false;
+	for (uint32 i = 0; i < saved->reference_count; i++) {
+		const ClusterRecoveryCensusReferenceV1 *r = &saved->fixed_references[i];
+		uint32 index = r->entry.index;
+		if (r->page_index != page_index || r->version != 0) continue;
+		if (r->entry.kind == CLUSTER_RECOVERY_HEAP_ITEM) continue;
+		if (r->entry.kind != CLUSTER_RECOVERY_HEAP_ITL || index >= CLUSTER_ITL_INITRANS_DEFAULT
+			|| (seen & (UINT32_C(1) << index)) != 0) return false;
+		seen |= UINT32_C(1) << index; slots[index] = r->entry.itl; first = i;
+		if (slots[index].flags != ITL_FLAG_FREE
+			&& (graph->entries[i].owner_index != owner || graph->entries[i].reference_edge_kind != 4
+				|| graph->entries[i].reference_field_count != 1)) return false;
+	}
+	return seen == (UINT32_C(1) << CLUSTER_ITL_INITRANS_DEFAULT) - 1
+		&& cluster_recovery_cold_page_hot_projection(saved->fixed_references, saved->reference_count,
+			first, snapshot->tuple_offsets, snapshot->tuple_bytes, slots, proof,
+			snapshot->terminals, snapshot->terminal_count, &scratch, true);
+}
+
+/* Native FREE and tuple predicates run on the complete page above. No-storage
+ * redirects still carry topology. A frozen tuple's allocated slot, moved or
+ * HOT flags remain outside this narrow absence rule; invalid xmax retains its
+ * original native precedence over stale raw xmax/MX bits. */
+static bool
+cluster_recovery_cold_page_no_current_tx(const ClusterRecoveryCensusReferenceV1 *r,
+	const char *tuple_bytes)
+{
+	HeapTupleHeaderData h;
+
+	if (r->version != 0) return false;
+	if (r->entry.kind == CLUSTER_RECOVERY_HEAP_ITL) return r->entry.itl.flags == ITL_FLAG_FREE;
+	if (r->entry.kind != CLUSTER_RECOVERY_HEAP_ITEM) return false;
+	if (!ItemIdHasStorage(&r->entry.item))
+		return !ItemIdIsRedirected(&r->entry.item)
+			&& (ItemIdIsDead(&r->entry.item) || !ItemIdIsUsed(&r->entry.item));
+	if (!ItemIdIsNormal(&r->entry.item) || r->entry.tuple_length < SizeofHeapTupleHeader) return false;
+	memcpy(&h, tuple_bytes, SizeofHeapTupleHeader);
+	return (HeapTupleHeaderXminFrozen(&h) || HeapTupleHeaderGetRawXmin(&h) == FrozenTransactionId
+			|| HeapTupleHeaderGetRawXmin(&h) == BootstrapTransactionId)
+		&& (h.t_infomask & HEAP_XMAX_INVALID) != 0 && (h.t_infomask & HEAP_MOVED) == 0
+		&& h.t_itl_slot_idx == CLUSTER_ITL_SLOT_UNALLOCATED
+		&& (h.t_infomask2 & (HEAP_HOT_UPDATED | HEAP_ONLY_TUPLE)) == 0;
+}
+
+/* Reserve and freeze the entire original coverage vector before the first
+ * yielding PAGE call. classes starts this allocation, including private
+ * snapshots; caller frees it alongside the unchanged graph result. */
+static uint8 *
+cluster_recovery_cold_page_coverage_snapshot(const struct ClusterRecoveryStartV1 *start,
+	Size memory_budget, Size *charged, ClusterColdCtrcPageCoverageV1 *snapshot, RfPageProofDetailV1 *detail)
+{
+	ClusterColdCtrcPageReferenceSnapshotV1 *saved = &snapshot->saved;
+	Size bytes = 0, classes_offset, references_offset, pages_offset, completed_offset, mapping_offset;
+	Size offsets_offset, payload_offset, terminals_offset, payload = 0, position = 0;
+	uint8 *allocation;
+
+	*detail = RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	if (start == NULL || start != cluster_recovery_cold_start || !cluster_recovery_cold_ctrc_replays_actor()
+		|| !start->ctrc_observation_complete || start->ctrc_references == NULL || start->ctrc_pages == NULL
+		|| start->ctrc_observation_work == NULL || start->ctrc_page_progress == NULL
+		|| start->ctrc_page_progress->pending || start->ctrc_page_plan == NULL) return NULL;
+	saved->references = start->ctrc_references; saved->pages = start->ctrc_pages;
+	saved->progress = start->ctrc_page_progress; saved->work = start->ctrc_observation_work;
+	saved->scope = start->ctrc_observation_inputs;
+	saved->reference_count = saved->references->count; saved->page_count = saved->pages->count;
+	saved->owner_count = saved->progress->target_count; snapshot->terminal_count = saved->work->counts.subject_count;
+	*detail = RF_PAGE_PROOF_DETAIL_CAPACITY;
+	if (!cluster_recovery_cold_page_reference_reserve(&bytes, Max(saved->reference_count, 1), 1, &classes_offset)
+		|| !cluster_recovery_cold_page_reference_reserve(&bytes, saved->reference_count, sizeof(*saved->fixed_references), &references_offset)
+		|| !cluster_recovery_cold_page_reference_reserve(&bytes, saved->page_count, sizeof(*saved->fixed_pages), &pages_offset)
+		|| !cluster_recovery_cold_page_reference_reserve(&bytes, saved->owner_count, sizeof(*saved->fixed_completed), &completed_offset)
+		|| !cluster_recovery_cold_page_reference_reserve(&bytes, saved->page_count, sizeof(*snapshot->mapping), &mapping_offset)
+		|| !cluster_recovery_cold_page_reference_reserve(&bytes, saved->reference_count, sizeof(Size), &offsets_offset)
+		|| !cluster_recovery_cold_page_reference_reserve(&bytes, snapshot->terminal_count, sizeof(*snapshot->terminals), &terminals_offset)
+		|| memory_budget < bytes) return NULL;
+	for (uint32 i = 0; i < saved->reference_count; i++) {
+		const ClusterRecoveryHeapEntry *entry = &saved->references->entries[i].entry;
+		if (entry->kind != CLUSTER_RECOVERY_HEAP_ITEM) continue;
+		*detail = RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE;
+		if (entry->tuple_length > BLCKSZ || (entry->tuple_length == 0) != (entry->tuple_bytes == NULL)) return NULL;
+		*detail = RF_PAGE_PROOF_DETAIL_CAPACITY;
+		if (entry->tuple_length > MaxAllocSize - payload) return NULL;
+		payload += entry->tuple_length;
+	}
+	if (!cluster_recovery_cold_page_reference_reserve(&bytes, payload, 1, &payload_offset)
+		|| bytes > MaxAllocSize - *charged || memory_budget < bytes + *charged) return NULL;
+	*charged += bytes;
+	Assert(classes_offset == 0);
+	*detail = RF_PAGE_PROOF_DETAIL_OOM;
+	allocation = MemoryContextAllocExtended(TopMemoryContext, bytes, MCXT_ALLOC_ZERO | MCXT_ALLOC_NO_OOM);
+	if (allocation == NULL) return NULL;
+	saved->fixed_references = (ClusterRecoveryCensusReferenceV1 *)(allocation + references_offset);
+	saved->fixed_pages = (ClusterRecoveryCensusPageV1 *)(allocation + pages_offset);
+	saved->fixed_completed = (ClusterColdCtrcPageCompletedV1 *)(allocation + completed_offset);
+	snapshot->mapping = (uint32 *)(allocation + mapping_offset);
+	snapshot->tuple_offsets = (Size *)(allocation + offsets_offset);
+	snapshot->terminals = (ClusterColdTtSlotInputV1 *)(allocation + terminals_offset);
+	snapshot->tuple_bytes = (char *)allocation + payload_offset;
+	memcpy(saved->fixed_references, saved->references->entries, (Size)saved->reference_count * sizeof(*saved->fixed_references));
+	memcpy(saved->fixed_pages, saved->pages->entries, (Size)saved->page_count * sizeof(*saved->fixed_pages));
+	memcpy(saved->fixed_completed, saved->progress->completed, (Size)saved->owner_count * sizeof(*saved->fixed_completed));
+	for (uint32 i = 0; i < saved->reference_count; i++) {
+		const ClusterRecoveryHeapEntry *entry = &saved->fixed_references[i].entry;
+		snapshot->tuple_offsets[i] = position;
+		if (entry->kind == CLUSTER_RECOVERY_HEAP_ITEM && entry->tuple_length != 0) {
+			memcpy(snapshot->tuple_bytes + position, entry->tuple_bytes, entry->tuple_length);
+			position += entry->tuple_length;
+		}
+	}
+	return allocation;
+}
+
+/* Preserve every original reference, and separately count physical pages for
+ * which missing metadata cannot be represented by a reference entry at all. */
+static uint32
+cluster_recovery_cold_page_coverage_classes(const struct ClusterRecoveryStartV1 *start,
+	ClusterColdCtrcPageCoverageV1 *snapshot, const volatile RfPageCtrcOwnerGraphV1 *graph,
+	uint8 *classes, uint32 *absent, uint32 *unresolved)
+{
+	const ClusterColdCtrcPageReferenceSnapshotV1 *saved = &snapshot->saved;
+	uint32 uncovered = 0;
+
+	for (uint32 p = 0; p < saved->page_count; p++) snapshot->mapping[p] = UINT32_MAX;
+	for (uint32 o = 0; o < saved->owner_count; o++) {
+		RfPageOnlineTargetViewV1 target;
+		ClusterRecoveryCensusPageV1 page;
+		if (!rf_page_online_plan_target_v1(start->ctrc_page_plan, o, &target)
+			|| !cluster_recovery_cold_page_target(start, &target, &page)) continue;
+		for (uint32 p = 0; p < saved->page_count; p++)
+			if (memcmp(&page, &saved->fixed_pages[p], sizeof(page)) == 0)
+				snapshot->mapping[p] = snapshot->mapping[p] == UINT32_MAX ? o : UINT32_MAX - 1;
+	}
+	for (uint32 i = 0; i < saved->reference_count; i++) {
+		const RfPageCtrcOwnerGraphEntryV1 *entry = &graph->entries[i];
+		if (saved->fixed_references[i].version == 0
+			&& (entry->reference_edge_kind == 2 || entry->reference_edge_kind == 4)
+			&& entry->reference_field_count != 0) classes[i] = RF_PAGE_CTRC_REFERENCE_GRAPH;
+	}
+	for (uint32 p = 0; p < saved->page_count; p++) {
+		if (!cluster_recovery_cold_page_coverage_complete(snapshot, p, graph)) { uncovered++; continue; }
+		for (uint32 i = 0; i < saved->reference_count; i++) {
+			const ClusterRecoveryCensusReferenceV1 *r = &saved->fixed_references[i];
+			if (r->page_index == p && classes[i] == RF_PAGE_CTRC_REFERENCE_UNRESOLVED
+				&& cluster_recovery_cold_page_no_current_tx(r, snapshot->tuple_bytes + snapshot->tuple_offsets[i]))
+				classes[i] = RF_PAGE_CTRC_REFERENCE_NO_CURRENT_TX;
+		}
+	}
+	for (uint32 i = 0; i < saved->reference_count; i++) {
+		if (classes[i] == RF_PAGE_CTRC_REFERENCE_NO_CURRENT_TX) (*absent)++;
+		if (classes[i] == RF_PAGE_CTRC_REFERENCE_UNRESOLVED) (*unresolved)++;
+	}
+	return uncovered;
+}
+
+RfPageCtrcReferenceCoverageV1
+ClusterColdRecoveryCtrcPageReferenceCoverage(const struct ClusterRecoveryStartV1 *start, Size memory_budget)
+{
+	RfPageCtrcReferenceCoverageV1 out = {0};
+	RfPageCtrcOwnerGraphV1 volatile graph = {0};
+	ClusterColdCtrcPageCoverageV1 snapshot = {0};
+	uint8 *volatile classes = NULL;
+	/* Include nested original page/batch/slot projectors and HOT scratch. */
+	Size charged = sizeof(out) + sizeof(graph) + sizeof(snapshot) + 5 * BLCKSZ
+		+ sizeof(RfPageOnlineTargetViewV1) + sizeof(ClusterRecoveryCensusPageV1)
+		+ CLUSTER_ITL_INITRANS_DEFAULT * sizeof(ClusterItlSlotData) + MaxHeapTuplesPerPage;
+	uint32 absent = 0, unresolved = 0, uncovered = 0;
+	bool ready = false;
+
+	PG_TRY();
+	{
+		classes = cluster_recovery_cold_page_coverage_snapshot(start, memory_budget, &charged, &snapshot, &out.detail);
+		if (classes != NULL) {
+			out.detail = RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE;
+			if (cluster_recovery_ctrc_terminal_result_v1(start, snapshot.saved.work, &snapshot.accepted)
+				&& cluster_recovery_cold_page_coverage_current(start, &snapshot, true)) {
+				graph = ClusterColdRecoveryCtrcPageProjectedGraph(start, memory_budget - charged);
+				out.detail = graph.detail;
+				if (graph.detail == RF_PAGE_PROOF_DETAIL_OK) {
+					out.detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+					if (graph.count == snapshot.saved.reference_count
+						&& graph.related.owners.count == snapshot.saved.owner_count
+						&& cluster_recovery_cold_page_coverage_current(start, &snapshot, false)) {
+						uncovered = cluster_recovery_cold_page_coverage_classes(start, &snapshot, &graph,
+							classes, &absent, &unresolved);
+						ready = cluster_recovery_cold_page_coverage_current(start, &snapshot, false);
+					}
+				}
+			}
+		}
+	}
+	PG_CATCH();
+	{
+		if (graph.related.owners.entries != NULL) pfree(graph.related.owners.entries);
+		if (graph.related.entries != NULL) pfree(graph.related.entries);
+		if (graph.entries != NULL) pfree(graph.entries);
+		if (classes != NULL) pfree((void *)classes);
+		cluster_recovery_cold_page_plan_refuse(cluster_recovery_cold_start, RF_PAGE_PROOF_DETAIL_INTERNAL);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (ready) {
+		out.detail = RF_PAGE_PROOF_DETAIL_OK; out.graph = graph; out.count = snapshot.saved.reference_count;
+		out.classes = classes; out.no_reference_count = absent; out.unresolved_count = unresolved;
+		out.uncovered_page_count = uncovered;
+		return out;
+	}
+	if (graph.related.owners.entries != NULL) pfree(graph.related.owners.entries);
+	if (graph.related.entries != NULL) pfree(graph.related.entries);
+	if (graph.entries != NULL) pfree(graph.entries);
+	if (classes != NULL) pfree((void *)classes);
+	if (out.detail != RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT && out.detail != RF_PAGE_PROOF_DETAIL_WOULD_BLOCK
+		&& out.detail != RF_PAGE_PROOF_DETAIL_OOM)
+		cluster_recovery_cold_page_plan_refuse(cluster_recovery_cold_start, out.detail);
+	return out;
 }
 
 static bool

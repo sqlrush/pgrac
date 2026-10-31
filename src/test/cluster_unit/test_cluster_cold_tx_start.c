@@ -2513,6 +2513,7 @@ static void startup_local_empty_reset(void);
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
 #include "test_cluster_cold_ctrc_tuple_graph.inc"
 #include "test_cluster_cold_ctrc_hot_graph.inc"
+#include "test_cluster_cold_ctrc_reference_coverage.inc"
 #endif
 
 #include "test_cluster_cold_ctrc_page_raw.inc"
@@ -2520,6 +2521,15 @@ static void startup_local_empty_reset(void);
 int main(void)
 {
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
+	if (getenv("PGRAC_PRE2_TEST_REFERENCE_COVERAGE") != NULL) {
+		UT_PLAN(5);
+		UT_RUN(test_start_reference_coverage_classifies_free_without_changing_original_graph);
+		UT_RUN(test_start_reference_coverage_frozen_empty_dead_and_free_wrap_use_whole_page);
+		UT_RUN(test_start_reference_coverage_missing_duplicate_history_and_changed_members_remain);
+		UT_RUN(test_start_reference_coverage_does_not_erase_redirect_history_or_tuple_duties);
+		UT_RUN(test_start_reference_coverage_late_change_wait_error_and_whole_budget_keep_debt);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_HOT_GRAPH") != NULL) {
 		UT_PLAN(4);
 		UT_RUN(test_start_hot_graph_binds_complete_native_current_chains);
@@ -3095,7 +3105,7 @@ int main(void)
 	}
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_FIRST
-	UT_PLAN(435);
+	UT_PLAN(440);
 	UT_RUN(test_start_borrows_only_its_original_completed_retention_owner);
 	UT_RUN(test_start_raw_records_keep_complete_original_bytes_and_empty_end);
 	UT_RUN(test_start_raw_records_refuse_incomplete_changed_bytes_hash_header_and_end);
@@ -3106,8 +3116,13 @@ int main(void)
 	UT_RUN(test_start_compound_groups_retain_complete_member_input_and_end);
 	UT_RUN(test_start_compound_groups_refuse_missing_mixed_or_nonempty_end);
 #else
-	UT_PLAN(418);
+	UT_PLAN(423);
 #endif
+	UT_RUN(test_start_reference_coverage_classifies_free_without_changing_original_graph);
+	UT_RUN(test_start_reference_coverage_frozen_empty_dead_and_free_wrap_use_whole_page);
+	UT_RUN(test_start_reference_coverage_missing_duplicate_history_and_changed_members_remain);
+	UT_RUN(test_start_reference_coverage_does_not_erase_redirect_history_or_tuple_duties);
+	UT_RUN(test_start_reference_coverage_late_change_wait_error_and_whole_budget_keep_debt);
 	UT_RUN(test_start_hot_graph_binds_complete_native_current_chains);
 	UT_RUN(test_start_hot_graph_missing_or_changed_member_keeps_entire_chain);
 	UT_RUN(test_start_hot_graph_late_change_wait_error_preserves_whole_debt);

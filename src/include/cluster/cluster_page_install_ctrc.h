@@ -446,6 +446,25 @@ typedef struct RfPageCtrcOwnerGraphV1 {
 	uint32 unresolved_count;
 } RfPageCtrcOwnerGraphV1;
 
+typedef enum RfPageCtrcReferenceClassV1 {
+	RF_PAGE_CTRC_REFERENCE_UNRESOLVED = 0,
+	RF_PAGE_CTRC_REFERENCE_GRAPH,
+	RF_PAGE_CTRC_REFERENCE_NO_CURRENT_TX
+} RfPageCtrcReferenceClassV1;
+
+/* Explicit current PAGE coverage, separate from the unchanged graph API.
+ * NO_CURRENT_TX requires complete original slots/items and the same actual
+ * PAGE after-image under native projection. History and unknown fields stay
+ * unresolved; pages without that complete match increment uncovered_page_count.
+ * Neither zero count proves full G_ref, owner completion or retention transfer.
+ * Free classes plus all three graph allocations, before the original Start. */
+typedef struct RfPageCtrcReferenceCoverageV1 {
+	RfPageProofDetailV1 detail;
+	RfPageCtrcOwnerGraphV1 graph;
+	uint32 count, no_reference_count, unresolved_count, uncovered_page_count;
+	uint8 *classes;
+} RfPageCtrcReferenceCoverageV1;
+
 extern RfPageCtrcReadbackImageV1 rf_page_recovery_ctrc_replays_completed_image_v1(
 	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work,
 	const struct ClusterRecoveryCtrcReplaySetSourceV1 *source, RfPageCtrcAuthorityV1 *authority,

@@ -351,6 +351,15 @@ extern struct RfPageCtrcOwnerGraphV1 ClusterColdRecoveryCtrcPageOwnerGraph(
  * G_ref/G_owner coverage, D0 admission or joint completion is provided. */
 extern struct RfPageCtrcOwnerGraphV1 ClusterColdRecoveryCtrcPageProjectedGraph(
 	const struct ClusterRecoveryStartV1 *start, Size memory_budget);
+/* Complete current PAGE slot/item coverage around the original graph factory.
+ * Native FREE, no-storage unused/dead and exact frozen/invalid-xmax tuples
+ * may have no current transaction reference. Missing/duplicate/current-byte
+ * mismatches and unmapped physical pages cannot disappear from coverage.
+ * History, other owners, first/pin debt and full graph/joint completion remain
+ * separate duties. Old APIs retain their unresolved counts and semantics. */
+struct RfPageCtrcReferenceCoverageV1;
+extern struct RfPageCtrcReferenceCoverageV1 ClusterColdRecoveryCtrcPageReferenceCoverage(
+	const struct ClusterRecoveryStartV1 *start, Size memory_budget);
 struct RfPageCtrcFpiInsertV1;
 struct ClusterSharedFsPageV1;
 /* Local immutable membership only: the ORIGINAL retained result address and

@@ -1,6 +1,8 @@
 /* Actual Start with controlled original lower adjacency view only. */
 static unsigned start_ref_fault,start_ref_calls;
 static bool start_ref_complete;
+/* NULL preserves every original fixture's synthetic first transaction. */
+static bool (*start_ref_first_transaction)(const ClusterRecoveryCensusReferenceV1 *);
 ClusterRecoveryCensusTxReferenceV1
 cluster_recovery_census_tx_reference_v1(ClusterRecoveryCensus *c,uint32 i)
 {
@@ -11,7 +13,8 @@ cluster_recovery_census_tx_reference_v1(ClusterRecoveryCensus *c,uint32 i)
  d.observed=true;d.count=refs->count;d.index=i;
  if(i<refs->count) {
   d.reference=&refs->entries[i];
-  if(i==0 || (start_ref_complete && refs->entries[i].entry.kind==CLUSTER_RECOVERY_HEAP_ITL
+  if((i==0 && (start_ref_first_transaction==NULL || start_ref_first_transaction(&refs->entries[i])))
+      || (start_ref_complete && refs->entries[i].entry.kind==CLUSTER_RECOVERY_HEAP_ITL
       && refs->entries[i].entry.itl.flags!=ITL_FLAG_FREE)) {
    d.transaction.count=3;d.transaction.root_count=2;d.transaction.index=0;d.transaction.root=true;
    d.transaction.value=refs->entries[i].transaction;
