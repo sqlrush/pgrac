@@ -36,6 +36,9 @@
 #include "access/xlogreader.h"
 #include "miscadmin.h"
 #include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_cold_relmap.h"
+#include "catalog/pg_tablespace_d.h"
+#include "utils/relmapper.h"
 #include "cluster/cluster_cold_recovery_census.h"
 #include "cluster/cluster_control_root.h"
 #include "cluster/cluster_recovery_merge.h"
@@ -329,6 +332,9 @@ scan(ClusterColdScanResultV1 *result, bool foreign)
 static void
 scan_reset(void)
 {
+	decode_relmap = NULL;
+	relmap_capture_calls = 0;
+	relmap_capture_throw = false;
 	visit_count = 2;
 	visit_read[0] = 0x1000;
 	visit_end[0] = 0x1100;
@@ -1455,12 +1461,127 @@ UT_TEST(test_original_retained_visit_binds_later_postflush_issuance)
 		}
 }
 
+/* Original scanner and cold plan; the SIDE leaf records the exact input.
+ * Native SIDE carrier/consumer behavior is covered by cold_relmap_side. */
+UT_TEST(test_declared_relmap_scan_keeps_side_and_refuses_carrier_failure)
+{
+	static int pin, lock;
+	for (unsigned fault = 0; fault < 8; ++fault) {
+		ClusterColdPlanV1 *plan = scan_plan();
+		ClusterColdRelmapInputV1 input = {0};
+		ClusterControlRootSnapshot root = {0};
+		ClusterControlRootReadToken token = {0};
+		ClusterColdScanResultV1 result;
+		ClusterColdDetailV1 detail = CLUSTER_COLD_SIDE_OWNER_MISSING;
+		volatile bool caught = false;
+		scan_reset();
+		input.cut = (ClusterColdParticipantV1){2, 0, 1, 12, 0x1000, 0x1000, 0x1300};
+		input.source.timeline = 1;
+		input.source.claim.database_incarnation = 9;
+		input.source.claim.max_config_generation = 1;
+		input.source.claim.identity.system_identifier = 77;
+		input.source.claim.identity.origin_thread_id = 2;
+		input.source.claim.identity.origin_node_id = 1;
+		input.source.claim.identity.origin_owner_incarnation = 12;
+		memset(input.source.claim.identity.storage_uuid, 5, 16);
+		memset(input.source.claim.claim_sha256, 6, 32);
+		input.frame = (ClusterColdRecordFrameV1){0x1000, 0x1100, 0x9876, 0, 120,
+			0, 0, 0, RM_RELMAP_ID, XLOG_RELMAP_UPDATE, false};
+		input.staged.identity = (ClusterRelmapV2Namespace){77, 9, InvalidOid, true};
+		input.staged.committed_generation = 7;
+		input.staged.pending_generation = 8;
+		input.staged.pending_owner = (ClusterRelmapV2Owner){1,
+			(UINT64_C(7) << 32) | 120, 7, 12, 0x1100, 41};
+		input.retention = (struct ClusterRelmapRetentionDirectory *)&pin;
+		input.retention_lock = (struct LWLock *)&lock;
+		if (fault == 4) {
+			input.frame.read_rec_ptr = 0x1100;
+			input.frame.end_rec_ptr = input.staged.pending_owner.wal_end = 0x1300;
+		}
+		if (fault != 3)
+			UT_ASSERT_EQ(cluster_cold_plan_relmap_declare_v1(plan, &input, 1), 0);
+		decode_relmap = &input;
+		decode_record_flags[fault == 4 ? 1 : 0]
+			= CLUSTER_COLD_RECORD_STRUCTURAL | CLUSTER_COLD_RECORD_SIDE_UNOWNED;
+		side_capture_calls = 0;
+		side_capture_fail_at = fault == 1 || fault == 2 || fault == 4 ? 1 : fault == 5 ? 2 : 0;
+		side_capture_refusal = fault == 1 || fault == 4 || fault == 5 ? RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE
+			: RF_PAGE_PROOF_DETAIL_CAPACITY;
+		relmap_capture_throw = fault == 7;
+		root.identity = input.source.claim.identity;
+		root.checkpoint_tli = 1;
+		root.checkpoint_lower_lsn = 0x1000;
+		root.validated_tail_lsn_exclusive = 0x1300;
+		PG_TRY(); {
+		detail = cluster_cold_scan_root_v1(plan, 0, &root, &token, false, true,
+			fault == 6 ? NULL : (RfSideOnlinePlanV1 *)&side_capture_token, &result);
+		} PG_CATCH(); { caught = true; } PG_END_TRY();
+		relmap_capture_throw = false;
+		UT_ASSERT_EQ(caught, fault == 7);
+		UT_ASSERT_EQ(detail, fault == 0 ? CLUSTER_COLD_OK
+			: fault == 1 ? CLUSTER_COLD_SIDE_OWNER_MISSING
+			: fault == 2 ? CLUSTER_COLD_CAPACITY
+			: fault == 3 ? CLUSTER_COLD_STRUCTURAL_UNSUPPORTED : CLUSTER_COLD_SIDE_OWNER_MISSING);
+		UT_ASSERT_EQ(relmap_capture_calls, fault == 3 || fault == 4 || fault == 6 ? 0 : 1);
+		UT_ASSERT_EQ(side_capture_calls, fault == 0 || fault == 5 ? 2
+			: fault == 3 || fault == 6 ? 0 : 1);
+		if (fault != 3 && fault != 4 && fault != 6)
+			UT_ASSERT(memcmp(&input, &captured_relmap, sizeof(input)) == 0);
+		if (fault == 0) {
+			UT_ASSERT_EQ(result.side_capture_detail, 0);
+			UT_ASSERT_EQ(result.records, 2);
+		}
+		if (fault != 0 && fault != 3) {
+			ClusterColdRecordV1 again = {0};
+			UT_ASSERT(cluster_cold_plan_relmap_required_v1(plan, 0));
+			UT_ASSERT_EQ(cluster_cold_plan_feed_v1(plan, 0, &again), CLUSTER_COLD_STATE);
+		}
+		cluster_cold_plan_destroy_v1(&plan);
+		decode_relmap = NULL;
+	}
+}
+
+UT_TEST(test_historical_undeclared_relmap_keeps_original_optional_side_refusal)
+{
+	ClusterColdParticipantV1 cut = {2, 0, 1, 12, 0x1000, 0x1000, 0x1300};
+	ClusterColdPlanV1 *plan = NULL;
+	ClusterColdRelmapInputV1 input = {0};
+	ClusterControlRootSnapshot root = {0};
+	ClusterControlRootReadToken token = {0};
+	ClusterColdScanResultV1 result;
+	scan_reset();
+	/* This immutable old generation has no replay suffix and no declaration. */
+	cut.native_redo = cut.tail_end;
+	UT_ASSERT_EQ(cluster_cold_plan_create_v1(&cut, 1, 1048576, &plan), 0);
+	input.frame.read_rec_ptr = 0x1000;
+	decode_relmap = &input;
+	decode_record_flags[0] = CLUSTER_COLD_RECORD_STRUCTURAL;
+	side_capture_calls = 0;
+	side_capture_fail_at = 1;
+	side_capture_refusal = RF_PAGE_PROOF_DETAIL_OPCODE_UNSUPPORTED;
+	root.identity.system_identifier = 77;
+	root.identity.origin_thread_id = 2;
+	memset(root.identity.storage_uuid, 5, 16);
+	root.checkpoint_tli = 1;
+	root.checkpoint_lower_lsn = 0x1000;
+	root.validated_tail_lsn_exclusive = 0x1300;
+	UT_ASSERT_EQ(cluster_cold_scan_root_v1(plan, 0, &root, &token, false, true,
+		(RfSideOnlinePlanV1 *)&side_capture_token, &result), 0);
+	UT_ASSERT_EQ(relmap_capture_calls, 0);
+	UT_ASSERT_EQ(result.side_capture_detail, RF_PAGE_PROOF_DETAIL_OPCODE_UNSUPPORTED);
+	UT_ASSERT_EQ(result.records, 2);
+	cluster_cold_plan_destroy_v1(&plan);
+	decode_relmap = NULL;
+}
+
 #include "test_cluster_cold_io_checkpoint_publisher.inc"
 
 int
 main(void)
 {
-	UT_PLAN(33);
+	UT_PLAN(35);
+	UT_RUN(test_declared_relmap_scan_keeps_side_and_refuses_carrier_failure);
+	UT_RUN(test_historical_undeclared_relmap_keeps_original_optional_side_refusal);
 	UT_RUN(test_original_checkpointer_window_survives_both_complete_io_routes);
 	UT_RUN(test_original_checkpointer_io_refuses_mismatch_and_incomplete_visits);
 	UT_RUN(test_original_checkpointer_unknown_io_keeps_only_original_legacy_fold);

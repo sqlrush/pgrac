@@ -53,6 +53,7 @@
 #include "access/xlogreader.h"
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_cold_relmap.h"
 #include "cluster/cluster_cold_recovery_census.h"
 #include "cluster/cluster_control_root.h"
 #include "cluster/cluster_guc.h"
@@ -328,6 +329,7 @@ cluster_cold_data_readback_v1(ClusterColdTypedV1 *typed)
 typedef struct ColdScanWork {
 	ClusterColdPlanV1 *plan;
 	RfSideOnlinePlanV1 *side_plan;
+	bool relmap_required;
 	uint16 source_thread;
 	TimeLineID timeline;
 	uint32 participant;
@@ -359,12 +361,43 @@ cold_scan_failed_record(ClusterColdScanResultV1 *result, XLogReaderState *reader
 	result->failed_record_data_length = XLogRecGetDataLen(reader);
 }
 
+/* A declared external obligation cannot survive a discarded SIDE prefix. */
+static RfPageProofDetailV1
+cold_declared_side_capture(ColdScanWork *work, const RfPageOnlineRecordIdentityV1 *identity,
+	const ClusterColdRelmapInputV1 *input)
+{
+	RfPageProofDetailV1 captured;
+	PG_TRY();
+	{
+		captured = input != NULL
+			? rf_side_online_plan_feed_relmap_v1(work->side_plan, &work->decoded.detached,
+				identity, input)
+			: rf_side_online_plan_feed_record_v1(work->side_plan, &work->decoded.detached, identity);
+	}
+	PG_CATCH();
+	{
+		cluster_cold_plan_relmap_invalidate_v1(work->plan);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (captured != RF_PAGE_PROOF_DETAIL_OK)
+		cluster_cold_plan_relmap_invalidate_v1(work->plan);
+	return captured;
+}
+
 static bool
 cold_scan_visit(XLogReaderState *reader, void *arg)
 {
 	ColdScanWork *work = (ColdScanWork *)arg;
 
 	CHECK_FOR_INTERRUPTS();
+	if (work->relmap_required && work->side_plan == NULL) {
+		cluster_cold_plan_relmap_invalidate_v1(work->plan);
+		work->detail = CLUSTER_COLD_SIDE_OWNER_MISSING;
+		work->result->failed_read_rec_ptr = reader->ReadRecPtr;
+		cold_scan_failed_record(work->result, reader);
+		return false;
+	}
 	/*
 	 * The selected control-file copy must describe this exact native WAL
 	 * record. Keep every field, including counters, bound to its source.
@@ -423,6 +456,8 @@ cold_scan_visit(XLogReaderState *reader, void *arg)
 		const ClusterColdRecordV1 *record = &work->decoded.record;
 		RfPageOnlineRecordIdentityV1 identity = { 0 };
 		RfPageProofDetailV1 captured;
+		const ClusterColdRelmapInputV1 *relmap_input = record->rmid == RM_RELMAP_ID
+			? cluster_cold_plan_relmap_captured_v1(work->plan, work->participant, record) : NULL;
 
 		/* Each SIDE plan owns exactly this original source, independently
 		 * of the PAGE plan's participant order and history-only sources. */
@@ -435,8 +470,15 @@ cold_scan_visit(XLogReaderState *reader, void *arg)
 		identity.record.record_crc = record->record_crc;
 		identity.record.rmid = record->rmid;
 		identity.record.info = record->info;
-		captured = rf_side_online_plan_feed_record_v1(work->side_plan, &work->decoded.detached,
-													  &identity);
+		captured = work->relmap_required
+			? cold_declared_side_capture(work, &identity, relmap_input)
+			: rf_side_online_plan_feed_record_v1(work->side_plan, &work->decoded.detached, &identity);
+		if (work->relmap_required && captured != RF_PAGE_PROOF_DETAIL_OK) {
+			work->decoded.route_detail = (uint8)captured;
+			work->detail = captured == RF_PAGE_PROOF_DETAIL_CAPACITY
+				? CLUSTER_COLD_CAPACITY : CLUSTER_COLD_SIDE_OWNER_MISSING;
+		}
+
 		if (captured == RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE
 			|| captured == RF_PAGE_PROOF_DETAIL_OPCODE_UNSUPPORTED) {
 			/* The original plan above owns native/history acceptance. A
@@ -470,6 +512,7 @@ cold_scan_work(ClusterColdPlanV1 *plan, uint32 participant, const ClusterControl
 
 	work->plan = plan;
 	work->participant = participant;
+	work->relmap_required = cluster_cold_plan_relmap_required_v1(plan, participant);
 	work->system_identifier = id->system_identifier;
 	work->source_identity = *id;
 	memcpy(work->storage_uuid, id->storage_uuid, 16);

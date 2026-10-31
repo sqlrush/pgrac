@@ -578,9 +578,9 @@ SIMPLE_TESTS := $(filter-out test_cluster_relmap_arb,$(SIMPLE_TESTS))
 TESTS += test_cluster_relmap_v2
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_v2,$(SIMPLE_TESTS))
 TESTS += test_cluster_relmap_v2_storage
-TESTS += test_cluster_cold_relmap
-SIMPLE_TESTS := $(filter-out test_cluster_cold_relmap,$(SIMPLE_TESTS))
-all: test_cluster_cold_relmap
+TESTS += test_cluster_cold_relmap test_cluster_cold_relmap_side
+SIMPLE_TESTS := $(filter-out test_cluster_cold_relmap test_cluster_cold_relmap_side,$(SIMPLE_TESTS))
+all: test_cluster_cold_relmap test_cluster_cold_relmap_side
 TESTS += test_cluster_relmap_publish_native
 TESTS += test_cluster_relmap_publish_clog
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_v2_storage,$(SIMPLE_TESTS))
@@ -4561,7 +4561,7 @@ test_cluster_side_xact_stats.inc: $(top_srcdir)/src/backend/utils/activity/pgsta
 
 test_cluster_side_xact: $(top_builddir)/src/backend/cluster/cluster_wal_claim.o
 
-test_cluster_side_xact test_cluster_pi_contribution test_cluster_recovery_c0_plan test_cluster_cold_tt_redo test_cluster_relmap_pending_side test_cluster_relmap_census_side: %: %.c unit_test.h test_cluster_side_xact.c test_cluster_side_xact_stats.inc test_cluster_undo_header_identity.inc test_cluster_heap_small_scn.inc \
+test_cluster_cold_relmap_side test_cluster_side_xact test_cluster_pi_contribution test_cluster_recovery_c0_plan test_cluster_cold_tt_redo test_cluster_relmap_pending_side test_cluster_relmap_census_side: %: %.c unit_test.h test_cluster_side_xact.c test_cluster_side_xact_stats.inc test_cluster_undo_header_identity.inc test_cluster_heap_small_scn.inc \
 		test_cluster_side_online_owner_product.o $(CLUSTER_SIDE_HEAD_READER_O) \
 		test_cluster_side_xact_budget_product.o $(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) \
 		$(CLUSTER_REMOTE_XACT_IDENTITY_O) \
@@ -14522,3 +14522,17 @@ clean: clean-clog-native-callback
 .PHONY: clean-clog-native-callback
 clean-clog-native-callback:
 	rm -f test_cluster_clog_native_callback.inc test_cluster_clog_native_callback.inc.tmp
+
+# Original cold declaration and SIDE input coexistence; no live activation.
+test_cluster_cold_relmap_side: $(CLUSTER_COLD_PLAN_O) $(CLUSTER_WAL_CLAIM_O) test_cluster_cold_relmap_side.inc \
+		$(top_srcdir)/src/include/cluster/cluster_cold_relmap.h
+.PHONY: clean-cold-relmap-side
+clean: clean-cold-relmap-side
+clean-cold-relmap-side:
+	rm -f test_cluster_cold_relmap_side
+
+$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) test_cluster_cold_recovery_io_core.o: \
+		$(top_srcdir)/src/include/cluster/cluster_cold_relmap.h \
+		$(top_srcdir)/src/include/cluster/cluster_side_online_plan.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
+		$(top_srcdir)/src/include/utils/relmapper.h

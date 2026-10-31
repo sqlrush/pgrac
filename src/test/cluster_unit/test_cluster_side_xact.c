@@ -12839,9 +12839,24 @@ UT_TEST(test_native_terminal_witness_rejects_unbound_plan)
 #include "test_cluster_side_native_clog.inc"
 #endif
 
+#ifdef TEST_CLUSTER_COLD_RELMAP_SIDE
+#include "test_cluster_cold_relmap_side.inc"
+#endif
+
 int
 main(void)
 {
+#ifdef TEST_CLUSTER_COLD_RELMAP_SIDE
+	UT_PLAN(6);
+	UT_RUN(test_declared_relmap_capture_keeps_complete_side_bytes);
+	UT_RUN(test_relmap_carrier_refuses_missing_owner_and_keeps_original_refusal);
+	UT_RUN(test_relmap_carrier_rejects_source_frame_cut_payload_and_purpose_drift);
+	UT_RUN(test_relmap_carrier_charges_original_budget_and_duplicate_is_sticky);
+	UT_RUN(test_relmap_carrier_checks_entire_header_main_and_source_after_seal);
+	UT_RUN(test_relmap_and_clog_coexist_but_side_cannot_publish_whole_source);
+	UT_DONE();
+	return ut_failed_count != 0;
+#endif
 	if (getenv("PGRAC_PRE2_TEST_NATIVE_CLOG_CONSUMED") != NULL) {
 		UT_PLAN(4);
 		UT_RUN(test_native_clog_consumed_runs_original_callback_once_without_cold_applied);

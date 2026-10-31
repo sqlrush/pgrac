@@ -140,6 +140,47 @@ relmap_capture(ClusterColdPlanV1 *plan, uint32 participant, const ClusterColdRec
 	return CLUSTER_COLD_NO_INDEX;
 }
 
+bool
+cluster_cold_plan_relmap_required_v1(const ClusterColdPlanV1 *plan, uint32 participant)
+{
+	if (!plan_valid(plan) || participant >= plan->participant_count)
+		return false;
+	for (uint32 i = 0; i < plan->relmap_count; ++i)
+		if (plan->relmap_inputs[i].input.participant == participant)
+			return true;
+	return false;
+}
+
+void
+cluster_cold_plan_relmap_invalidate_v1(ClusterColdPlanV1 *plan)
+{
+	if (plan_valid(plan) && plan->relmap_count != 0) {
+		plan->relmap_failed = true;
+		plan->phase = COLD_PHASE_FAILED;
+	}
+}
+
+const ClusterColdRelmapInputV1 *
+cluster_cold_plan_relmap_captured_v1(const ClusterColdPlanV1 *plan, uint32 participant,
+	const ClusterColdRecordV1 *record)
+{
+	if (!plan_valid(plan) || plan->phase != COLD_PHASE_FEEDING || plan->relmap_failed
+		|| participant >= plan->participant_count || record == NULL || record->relmap_image == NULL)
+		return NULL;
+	for (uint32 i = 0; i < plan->relmap_count; ++i) {
+		const ColdRelmapInput *entry = &plan->relmap_inputs[i];
+		const ClusterColdRelmapInputV1 *input = &entry->input;
+		if (entry->captured && input->participant == participant
+			&& cold_relmap_frame_equal(&input->frame, record)
+			&& record->relmap_dbid == input->staged.identity.dbid
+			&& record->relmap_tsid == (input->staged.identity.shared
+				? GLOBALTABLESPACE_OID : DEFAULTTABLESPACE_OID)
+			&& memcmp(record->relmap_image, &input->staged.pending, sizeof(RelMapFile)) == 0)
+			return input;
+	}
+	return NULL;
+}
+
 static int
 identity_compare(const RfPageIdentityV1 *left, const RfPageIdentityV1 *right)
 {
