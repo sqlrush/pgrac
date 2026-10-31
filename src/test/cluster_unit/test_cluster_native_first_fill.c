@@ -8,6 +8,21 @@
 
 /* Retain the complete real preparation, disk/image execution and cleanup. */
 static void ordinary_report(int level);
+static void cluster_bufmgr_acquire_resident_scope_cleanup(BufferDesc *buf,
+	const ClusterPcmOwnSnapshot *base, const ResourceXDecodedAcquireIntent *episode,
+	const ResourceXDeliveryClaim *prepared);
+#ifndef NATIVE_RESIDENT_FILL_COMPOSITION
+/* This first-fill-only composition never sets resident. Keep accidental
+ * dispatch a hard failure, not an implementation of resident cleanup. */
+static void
+cluster_bufmgr_acquire_resident_scope_cleanup(BufferDesc *buf,
+	const ClusterPcmOwnSnapshot *base, const ResourceXDecodedAcquireIntent *episode,
+	const ResourceXDeliveryClaim *prepared)
+{
+	(void)buf; (void)base; (void)episode; (void)prepared;
+	ordinary_report(PANIC);
+}
+#endif
 BufferDescPadded *BufferDescriptors = (BufferDescPadded *)&request_buf;
 uint32 LockBufHdr(BufferDesc *buf) { return request_header_lock(buf); }
 #define LockBufHdr stage_header_lock
@@ -185,7 +200,14 @@ static void ordinary_count(IOObject object, IOContext context, IOOp op, instr_ti
 #define AbortBufferIO ordinary_actual_abort
 #define pgstat_prepare_io_time() ((instr_time){0})
 #define pgstat_count_io_op_time ordinary_count
+#ifndef NATIVE_RESIDENT_REQUEST_COMPOSITION
+#define cluster_bufmgr_pcm_own_acquire_cancel_resident_wait_exact(...) \
+	(ordinary_report(PANIC), RESOURCE_X_APPLY_INVALID)
+#endif
 #include "test_cluster_native_first_fill_native.inc"
+#ifndef NATIVE_RESIDENT_REQUEST_COMPOSITION
+#undef cluster_bufmgr_pcm_own_acquire_cancel_resident_wait_exact
+#endif
 #undef ereport
 #undef pgstat_count_io_op_time
 #undef pgstat_prepare_io_time

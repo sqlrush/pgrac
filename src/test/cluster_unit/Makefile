@@ -11083,6 +11083,59 @@ clean-native-first-fill:
 		test_cluster_native_first_fill_evidence.inc.tmp
 
 # Original pre-C disk execution is bracketed before native IO/pin cleanup.
+TESTS += test_cluster_native_resident_lock
+all: test_cluster_native_resident_lock
+test_cluster_native_resident_lock: test_cluster_native_resident_lock.c test_cluster_native_resident_fill \
+		test_cluster_native_resident_fill_fixture.inc test_cluster_native_resident_lock_reserve.inc \
+		test_cluster_native_resident_lock.inc test_cluster_native_resident_unlock.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+test_cluster_native_resident_fill_fixture.inc: test_cluster_native_resident_fill.c Makefile
+	awk '/^UT_TEST\(/ { stop=1 } !stop { print }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_native_resident_lock_reserve.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^cluster_bufmgr_pcm_own_snapshot\(/ { print "ClusterPcmOwnResult"; emit=1; snapshot++ } \
+	     /^cluster_pcm_own_begin_grant_reservation\(/ { print "static ClusterPcmOwnResult"; emit=1; begin++ } \
+	     /^cluster_pcm_own_abort_grant_reservation\(/ { print "static ClusterPcmOwnResult"; emit=1; cancel++ } \
+	     /^cluster_bufmgr_pcm_begin_grant_reservation_wait\(/ { print "static ClusterPcmOwnResult"; emit=1; wait++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (snapshot != 1 || begin != 1 || cancel != 1 || wait != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_native_resident_lock.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^\/\* Ordinary resident SHARE driver/ { emit=1; found++ } \
+	     /^\/\* End ordinary resident SHARE driver/ { emit=0; stop=1 } \
+	     emit { print } END { if (found != 1 || !stop) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_native_resident_unlock.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk 'BEGIN { print "static void rl_actual_unlock(BufferDesc *buf) {"; \
+	       print "const int mode = BUFFER_LOCK_UNLOCK;"; \
+	       print "ClusterPcmXWriterLedgerEntry *pcm_x_writer = NULL;"; \
+	       print "bool pcm_x_writer_managed = false, pcm_shared_read_unlock = false;"; \
+	       print "uint64 pcm_read_image_released_generation = 0;"; \
+	       print "ClusterPcmOwnResult pcm_read_image_release_result = CLUSTER_PCM_OWN_STALE;"; \
+	       print "bool pcm_read_image_release_attempted = false;"; \
+	       print "(void)pcm_shared_read_unlock; if (mode == BUFFER_LOCK_UNLOCK) {" } \
+	     /^\t\tpcm_x_writer = cluster_bufmgr_pcm_x_writer_find\(buf\);/ { emit=1; body++ } \
+	     /^\telse if \(cluster_pcm_is_active\(\)/ && emit { emit=0; done++ } \
+	     /^\tif \(mode == BUFFER_LOCK_UNLOCK$$/ { emit=1; tail++ } \
+	     /^\treturn;$$/ && tail && emit { emit=0; stop++ } \
+	     emit { print } END { print "}"; if (body != 1 || done != 1 || tail != 1 || stop != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+clean distclean maintainer-clean: clean-native-resident-lock
+.PHONY: clean-native-resident-lock
+clean-native-resident-lock:
+	rm -f test_cluster_native_resident_lock test_cluster_native_resident_fill_fixture.inc \
+		test_cluster_native_resident_fill_fixture.inc.tmp test_cluster_native_resident_lock_reserve.inc \
+		test_cluster_native_resident_lock_reserve.inc.tmp test_cluster_native_resident_lock.inc \
+		test_cluster_native_resident_lock.inc.tmp test_cluster_native_resident_unlock.inc \
+		test_cluster_native_resident_unlock.inc.tmp
+
 TESTS += test_cluster_native_resident_request
 TESTS += test_cluster_native_resident_fill
 all: test_cluster_native_resident_fill

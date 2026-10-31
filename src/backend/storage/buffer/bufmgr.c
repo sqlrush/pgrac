@@ -2460,7 +2460,9 @@ cluster_pcm_own_begin_grant_reservation(BufferDesc *buf, PcmLockMode requested_m
 	 * minting a fresh-token S_NEW/X_NEW shape. */
 	if (result == CLUSTER_PCM_OWN_INVALID)
 	{
-		if (cluster_gcs_block_local_cache
+		/* S is resident read authority, including when the optional X cache
+		 * is disabled. Never open another S request from an existing S/X. */
+		if ((cluster_gcs_block_local_cache || requested_mode == PCM_LOCK_MODE_S)
 			&& cluster_pcm_x_cached_cover_reverify_accepts(
 				(uint8)requested_mode, out_base->generation, out_base->generation,
 				out_base->pcm_state, out_base->flags, out_base->writer_activation_token,
@@ -2469,13 +2471,23 @@ cluster_pcm_own_begin_grant_reservation(BufferDesc *buf, PcmLockMode requested_m
 			*out_covered = true;
 			result = CLUSTER_PCM_OWN_OK;
 		}
-		else if (cluster_gcs_block_local_cache && out_base->flags == 0
+		else if ((cluster_gcs_block_local_cache || requested_mode == PCM_LOCK_MODE_S)
+				 && out_base->flags == 0
 				 && cluster_pcm_mode_covers((PcmLockMode)out_base->pcm_state,
 					 requested_mode)
 				 && !cluster_pcm_x_activation_fence_open(
 						out_base->writer_activation_token,
 						out_base->resource_x_activation_generation))
 			result = CLUSTER_PCM_OWN_BUSY;
+		else if (requested_mode == PCM_LOCK_MODE_S && out_base->pcm_state == PCM_STATE_N
+				 && ((out_base->semantic_buf_state & BM_IO_IN_PROGRESS) != 0
+					 || (pg_atomic_read_u64(&ClusterPcmOwnArray[buf->buf_id].write_io_generation) & 1) != 0))
+		{
+			/* The existing physical writer owns this IO. Wait before making
+			 * our GP, so cancellation cannot adopt or abort somebody else's IO. */
+			result = CLUSTER_PCM_OWN_BUSY;
+			*wait_reason = CLUSTER_PCM_GRANT_WAIT_LIVE_RESERVATION;
+		}
 		else
 		{
 			result = cluster_pcm_own_reservation_begin_exact(
@@ -2832,7 +2844,7 @@ cluster_pcm_own_abort_grant_after_master_rollback(BufferDesc *buf,
 	return result;
 }
 
-static void
+static void pg_attribute_unused()
 cluster_pcm_own_finish_grant_or_rollback(BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
 										 uint64 reservation_token, uint8 new_pcm_state,
 										 PcmLockMode acquired_mode,
@@ -4086,7 +4098,7 @@ typedef enum ClusterBufmgrPcmRetryRearmResult
  * short yield is sufficient to avoid a busy spin.  A successful rearm always
  * publishes a fresh token, while the subsequent GCS call allocates a fresh
  * request_id. */
-static ClusterBufmgrPcmRetryRearmResult
+static ClusterBufmgrPcmRetryRearmResult pg_attribute_unused()
 cluster_bufmgr_pcm_retry_denied_rearm(BufferDesc *buf, PcmLockMode pcm_mode,
 										 ClusterPcmOwnSnapshot *base,
 										 uint64 *reservation_token, uint32 wait_index,
@@ -6761,6 +6773,9 @@ ExtendBufferedRelTo(BufferManagerRelation bmr,
 static void cluster_bufmgr_acquire_first_fill_cleanup(BufferDesc *buf,
 	const ClusterPcmOwnSnapshot *base, const ResourceXDecodedAcquireIntent *episode,
 	const ResourceXDeliveryClaim *prepared, bool executor_entered);
+static void cluster_bufmgr_acquire_resident_scope_cleanup(BufferDesc *buf,
+	const ClusterPcmOwnSnapshot *base, const ResourceXDecodedAcquireIntent *episode,
+	const ResourceXDeliveryClaim *prepared);
 
 /* Legacy typed-source component guards. Ordinary ReadBuffer uses the full-E
  * first-fill driver below; these private guards retain the existing probes
@@ -6937,6 +6952,7 @@ typedef struct ClusterBufmgrFirstFill
 	bool delegated;
 	bool unsent_retired;
 	bool unissued_quiet;
+	bool resident;
 } ClusterBufmgrFirstFill;
 
 static bool
@@ -6960,15 +6976,16 @@ cluster_bufmgr_first_fill_abort_unissued(ClusterBufmgrFirstFill *read)
 	uint32 state;
 
 	if (!cluster_bufmgr_first_fill_local_owner(read)
-		|| !ResourceOwnerHasBufferIO(read->owner, BufferDescriptorGetBuffer(read->buf)))
+		|| ResourceOwnerHasBufferIO(read->owner, BufferDescriptorGetBuffer(read->buf)) == read->resident)
 		return false;
 	expected.reservation_token = read->token;
 	expected.flags = read->unissued_quiet ? 0 : PCM_OWN_FLAG_GRANT_PENDING;
 	state = LockBufHdr(read->buf);
 	cluster_pcm_own_snapshot_locked(read->buf, &live);
 	if (!cluster_pcm_own_snapshot_equal_exact(&expected, &live)
-		|| live.pcm_state != PCM_STATE_N || live.buffer_type != BUF_TYPE_CURRENT
-		|| live.semantic_buf_state != (BM_TAG_VALID | BM_IO_IN_PROGRESS)
+		|| live.pcm_state != PCM_STATE_N
+		|| (live.buffer_type != BUF_TYPE_CURRENT && (!read->resident || live.buffer_type != BUF_TYPE_PI))
+		|| live.semantic_buf_state != (BM_TAG_VALID | (read->resident ? BM_VALID : BM_IO_IN_PROGRESS))
 		|| cluster_pcm_own_delivery_attempt_get(read->buf->buf_id) != 0
 		|| (pg_atomic_read_u64(&ClusterPcmOwnArray[read->buf->buf_id].write_io_generation) & 1) != 0) {
 		UnlockBufHdr(read->buf, state);
@@ -6982,7 +6999,8 @@ cluster_bufmgr_first_fill_abort_unissued(ClusterBufmgrFirstFill *read)
 	UnlockBufHdr(read->buf, state);
 	if (result != CLUSTER_PCM_OWN_OK)
 		return false;
-	AbortBufferIO(BufferDescriptorGetBuffer(read->buf));
+	if (!read->resident)
+		AbortBufferIO(BufferDescriptorGetBuffer(read->buf));
 	return true;
 }
 
@@ -7001,8 +7019,12 @@ cluster_bufmgr_first_fill_cleanup(BufferDesc *buf, ClusterBufmgrFirstFill *read)
 	if (read->claim.purpose == RESOURCE_X_DELIVERY_ACQUIRE_PREPARED) {
 		/* The existing executor guard seals before IO release, or rolls C
 		 * forward. Its exact native proof is also used on nested ERROR. */
-		cluster_bufmgr_acquire_first_fill_cleanup(buf, &read->base,
-			&read->request.episode, &read->claim, read->delegated);
+		if (read->resident)
+			cluster_bufmgr_acquire_resident_scope_cleanup(buf, &read->base,
+				&read->request.episode, &read->claim);
+		else
+			cluster_bufmgr_acquire_first_fill_cleanup(buf, &read->base,
+				&read->request.episode, &read->claim, read->delegated);
 		read->pending = false;
 	} else {
 		if (read->claim.purpose != 0) {
@@ -7016,8 +7038,11 @@ cluster_bufmgr_first_fill_cleanup(BufferDesc *buf, ClusterBufmgrFirstFill *read)
 			result = cluster_pcm_lock_resource_x_first_fill_retire_unsent_exact(
 				&read->request.observation, &read->request.episode, &issued);
 			if (result == RESOURCE_X_APPLY_DUPLICATE) {
-				result = cluster_bufmgr_pcm_own_acquire_cancel_wait_exact(buf, &read->base,
-					&read->request.episode, &issued);
+				result = read->resident
+					? cluster_bufmgr_pcm_own_acquire_cancel_resident_wait_exact(buf, &read->base,
+						&read->request.episode, &issued)
+					: cluster_bufmgr_pcm_own_acquire_cancel_wait_exact(buf, &read->base,
+						&read->request.episode, &issued);
 				if (result != RESOURCE_X_APPLY_APPLIED && result != RESOURCE_X_APPLY_DUPLICATE)
 					goto unproven;
 				read->pending = false;
@@ -7096,6 +7121,131 @@ cluster_bufmgr_first_fill_begin(BufferDesc *buf, ClusterBufmgrFirstFill *read,
 	cluster_gcs_block_first_fill_end(&read->request);
 }
 /* End ordinary first-fill native driver. */
+
+/* Ordinary resident SHARE driver. One native reservation owns one request;
+ * a completed node cover is rechecked under content authority before use. */
+static bool
+cluster_bufmgr_pcm_lock_shared(BufferDesc *buf, bool *barrier_refused)
+{
+	volatile ClusterBufmgrFirstFill storage = {0};
+	ClusterBufmgrFirstFill *read = (ClusterBufmgrFirstFill *)&storage;
+	BufferTag tag = buf->tag;
+	volatile bool locked = false;
+
+	read->buf = buf;
+	read->resident = true;
+	read->owner = CurrentResourceOwner;
+	if (MyProc == NULL || MyProc->pid != MyProcPid || MyProcPid <= 0)
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("resident read has no native process owner")));
+	read->backend_id = MyBackendId;
+	read->backend_generation = MyProc->cluster_grd_generation;
+	if (!cluster_bufmgr_first_fill_local_owner(read))
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("resident read has no original pinned resource owner")));
+	PG_ENSURE_ERROR_CLEANUP(cluster_bufmgr_first_fill_error, PointerGetDatum(read));
+	{
+		for (;;)
+		{
+			ResourceXDecodedFrame grant, image;
+			ResourceXRequesterJoinSnapshot joined;
+			ClusterPcmOwnSnapshot live;
+			ResourceXApplyResult result;
+			ClusterPcmOwnResult native;
+			bool covered = false;
+			uint32 waits = 0;
+
+			/* Only a completed and subsequently revoked cover can re-enter
+			 * here. A pending E never loops back into begin or REQUEST. */
+			memset(&read->request, 0, sizeof(read->request));
+			memset(&read->claim, 0, sizeof(read->claim));
+			read->delegated = read->unsent_retired = read->unissued_quiet = false;
+			native = cluster_bufmgr_pcm_begin_grant_reservation_wait(buf, PCM_LOCK_MODE_S,
+				&read->base, &read->token, &covered, barrier_refused);
+			if (barrier_refused != NULL && *barrier_refused)
+				break;
+			if (native != CLUSTER_PCM_OWN_OK)
+				cluster_pcm_own_report_bump_failure(buf, native, read->base.generation,
+					read->base.flags, "LockBuffer resident S reservation");
+			read->pending = !covered;
+			if (!BufferTagsEqual(&tag, &read->base.tag))
+				ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("resident read buffer tag changed")));
+			if (!covered)
+			{
+				result = cluster_gcs_block_resident_read_begin(buf, &read->base, read->token, &read->request);
+				if (result == RESOURCE_X_APPLY_APPLIED)
+					result = cluster_gcs_block_first_fill_wait(&read->request);
+				if (result == RESOURCE_X_APPLY_APPLIED)
+					result = cluster_bufmgr_pcm_own_acquire_claim_exact(buf, &read->base, read->token,
+						RESOURCE_X_ACQUIRE_RESIDENT, &read->request.admission, &read->request.observation,
+						&grant, &image, &joined, &read->claim);
+				if (result == RESOURCE_X_APPLY_APPLIED)
+					result = cluster_bufmgr_pcm_own_acquire_stage_begin_exact(buf, &read->base, read->token,
+						RESOURCE_X_ACQUIRE_RESIDENT, &read->request.admission, &read->claim, &read->claim);
+				if (result == RESOURCE_X_APPLY_APPLIED)
+				{
+					read->delegated = true;
+					for (;;)
+					{
+						result = cluster_bufmgr_pcm_own_acquire_fill_resident_exact(buf, &read->base,
+							&read->request.episode, &read->request.admission, &read->claim);
+						if (result != RESOURCE_X_APPLY_LOCAL_WAIT)
+							break;
+						/* PI/write completion is a local event under this same
+						 * prepared E, not permission to request another source. */
+						if (!cluster_bufmgr_resource_x_wait_retry(BufferDescriptorGetContentLock(buf),
+								buf->buf_id, waits, barrier_refused))
+							break;
+						if (waits < PG_UINT32_MAX) waits++;
+					}
+				}
+				if (barrier_refused != NULL && *barrier_refused)
+				{
+					cluster_bufmgr_first_fill_cleanup(buf, read);
+					break;
+				}
+				if (result != RESOURCE_X_APPLY_APPLIED && result != RESOURCE_X_APPLY_DUPLICATE)
+					ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("resident read could not complete its original GCS acquisition: result=%d", result)));
+				read->pending = false;
+				cluster_gcs_block_first_fill_end(&read->request);
+			}
+			if (barrier_refused != NULL && !*barrier_refused)
+				CLUSTER_INJECTION_POINT("cluster-pcm-share-barrier-refuse-after-acquire");
+			if (barrier_refused != NULL
+				&& cluster_injection_should_skip("cluster-pcm-share-barrier-refuse-after-acquire"))
+				*barrier_refused = true;
+			if (barrier_refused != NULL && *barrier_refused)
+				break;
+			LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_SHARED);
+			if (cluster_bufmgr_pcm_own_snapshot(buf, &live) != CLUSTER_PCM_OWN_OK
+				|| !BufferTagsEqual(&tag, &live.tag)
+				|| (live.semantic_buf_state & (BM_TAG_VALID | BM_VALID | BM_IO_ERROR)) != (BM_TAG_VALID | BM_VALID)
+				|| (live.buffer_type != BUF_TYPE_CURRENT && live.buffer_type != BUF_TYPE_PI
+					&& live.buffer_type != BUF_TYPE_SCUR && live.buffer_type != BUF_TYPE_XCUR))
+			{
+				LWLockRelease(BufferDescriptorGetContentLock(buf));
+				ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("resident read has no valid current page")));
+			}
+			if (cluster_pcm_x_cached_cover_reverify_accepts(PCM_STATE_S,
+					read->base.generation, live.generation, live.pcm_state, live.flags,
+					live.writer_activation_token, live.resource_x_activation_generation))
+			{
+				if ((live.pcm_state == PCM_STATE_S && live.buffer_type != BUF_TYPE_SCUR)
+					|| (live.pcm_state == PCM_STATE_X && live.buffer_type != BUF_TYPE_XCUR))
+				{
+					LWLockRelease(BufferDescriptorGetContentLock(buf));
+					ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("resident read current type disagrees with authority")));
+				}
+				locked = true;
+				break;
+			}
+			LWLockRelease(BufferDescriptorGetContentLock(buf));
+			CHECK_FOR_INTERRUPTS();
+		}
+	}
+	PG_END_ENSURE_ERROR_CLEANUP(cluster_bufmgr_first_fill_error, PointerGetDatum(read));
+	return locked;
+}
+/* End ordinary resident SHARE driver. */
 #endif
 
 /*
@@ -16505,22 +16655,17 @@ LockBufferInternal_trace_impl(Buffer buffer, int mode, bool *pcm_barrier_refused
 	ClusterBufmgrPcmAuxPinHandoff pcm_aux_pin_handoff = {0};
 	bool pcm_acquired = false;
 	bool pcm_aux_pin_required = false;
-	bool pcm_covered = false;
 	bool pcm_pending_set = false;
 	bool pcm_x_writer_managed = false;
+	bool pcm_shared_read_unlock = false;
 	PcmLockMode pcm_mode = PCM_LOCK_MODE_N;
-	ClusterPcmOwnResult pcm_pending_result = CLUSTER_PCM_OWN_OK;
 	ClusterPcmOwnSnapshot pcm_pending_base = {0};
-	ClusterPcmOwnSnapshot pcm_initial_own = {0};
 	ClusterPcmXWriterLedgerEntry *pcm_x_writer = NULL;
 	ResourceXWriterPath pcm_writer_path = RESOURCE_X_WRITER_CLOSED;
 	uint64 pcm_writer_r4_generation = 0;
 	uint64 pcm_x_absolute_deadline_us = 0;
 	uint64 pcm_pending_token = 0;
-	uint64 pcm_covered_gen = 0;
-	uint64 pcm_committed_generation = 0;
 	uint64 pcm_read_image_released_generation = 0;
-	uint32 pcm_retry_wait_index = 0;
 	ClusterPcmOwnResult pcm_read_image_release_result = CLUSTER_PCM_OWN_STALE;
 	bool pcm_read_image_release_attempted = false;
 #endif
@@ -16546,6 +16691,7 @@ LockBufferInternal_trace_impl(Buffer buffer, int mode, bool *pcm_barrier_refused
 	if (mode == BUFFER_LOCK_UNLOCK)
 	{
 		pcm_x_writer = cluster_bufmgr_pcm_x_writer_find(buf);
+		pcm_shared_read_unlock = LWLockHeldByMeInMode(BufferDescriptorGetContentLock(buf), LW_SHARED);
 		pcm_x_writer_managed = pcm_x_writer != NULL;
 		cluster_bufmgr_pcm_x_writer_mark_releasing(pcm_x_writer);
 		/* READ_IMAGE is node-exclusive while this content bracket remains
@@ -16663,169 +16809,8 @@ LockBufferInternal_trace_impl(Buffer buffer, int mode, bool *pcm_barrier_refused
 				CHECK_FOR_INTERRUPTS();
 			}
 		}
-		else
-		{
-			for (;;)
-			{
-				bool begin_covered = false;
-
-				pcm_covered = false;
-				pcm_acquired = false;
-				pcm_pending_set = false;
-				memset(&pcm_initial_own, 0, sizeof(pcm_initial_own));
-				if (cluster_gcs_block_local_cache
-					&& cluster_bufmgr_pcm_own_snapshot(
-						buf, &pcm_initial_own) == CLUSTER_PCM_OWN_OK
-					&& pcm_initial_own.flags == 0
-					&& cluster_pcm_mode_covers(
-						(PcmLockMode) pcm_initial_own.pcm_state,
-						PCM_LOCK_MODE_S)
-					&& cluster_pcm_x_activation_fence_open(
-						pcm_initial_own.writer_activation_token,
-						pcm_initial_own.resource_x_activation_generation))
-				{
-					pcm_covered = true;
-					pcm_covered_gen = pcm_initial_own.generation;
-				}
-				if (!pcm_covered)
-				{
-					pcm_pending_result
-						= cluster_bufmgr_pcm_begin_grant_reservation_wait(
-							buf, PCM_LOCK_MODE_S, &pcm_pending_base,
-							&pcm_pending_token, &begin_covered,
-							pcm_barrier_refused);
-					if (pcm_barrier_refused != NULL
-						&& *pcm_barrier_refused)
-						goto cluster_lockbuffer_barrier_refusal;
-					if (pcm_pending_result != CLUSTER_PCM_OWN_OK)
-						cluster_pcm_own_report_bump_failure(
-							buf, pcm_pending_result,
-							pcm_pending_base.generation,
-							pcm_pending_base.flags,
-							"LockBuffer S reservation");
-					if (begin_covered)
-					{
-						pcm_covered = true;
-						pcm_covered_gen = pcm_pending_base.generation;
-					}
-					else
-					{
-						for (;;)
-						{
-							ClusterBufmgrPcmRetryRearmResult rearm_result;
-							bool retry_denied = false;
-
-							pcm_pending_set = true;
-							pcm_acquired = cluster_bufmgr_pcm_acquire_shared_owned(
-								buf, &pcm_pending_base, pcm_pending_token,
-								&retry_denied, NULL);
-							if (!retry_denied)
-								break;
-							pcm_pending_set = false;
-							pcm_acquired = false;
-							rearm_result
-								= cluster_bufmgr_pcm_retry_denied_rearm(
-									buf, PCM_LOCK_MODE_S,
-									&pcm_pending_base,
-									&pcm_pending_token,
-									pcm_retry_wait_index,
-									pcm_barrier_refused,
-									&pcm_covered_gen);
-							if (pcm_retry_wait_index < PG_UINT32_MAX)
-								pcm_retry_wait_index++;
-							if (rearm_result
-								== CLUSTER_BUFMGR_PCM_RETRY_BARRIER_REFUSED)
-								goto cluster_lockbuffer_barrier_refusal;
-							if (rearm_result
-								== CLUSTER_BUFMGR_PCM_RETRY_COVERED)
-							{
-								pcm_covered = true;
-								break;
-							}
-						}
-					}
-				}
-
-				if (pcm_barrier_refused != NULL
-					&& !*pcm_barrier_refused)
-				CLUSTER_INJECTION_POINT(
-					"cluster-pcm-share-barrier-refuse-after-acquire");
-				if (pcm_barrier_refused != NULL
-					&& cluster_injection_should_skip(
-						"cluster-pcm-share-barrier-refuse-after-acquire"))
-					*pcm_barrier_refused = true;
-				if (pcm_barrier_refused != NULL
-					&& *pcm_barrier_refused)
-					goto cluster_lockbuffer_barrier_refusal;
-
-				LWLockAcquire(
-					BufferDescriptorGetContentLock(buf), LW_SHARED);
-				if (pcm_covered)
-				{
-					ClusterPcmOwnSnapshot live;
-
-					if (cluster_bufmgr_pcm_own_snapshot(buf, &live)
-							!= CLUSTER_PCM_OWN_OK
-						|| !cluster_pcm_x_cached_cover_reverify_accepts(
-							(uint8) PCM_LOCK_MODE_S,
-							pcm_covered_gen, live.generation,
-							live.pcm_state, live.flags,
-							live.writer_activation_token,
-							live.resource_x_activation_generation))
-					{
-						LWLockRelease(
-							BufferDescriptorGetContentLock(buf));
-						pcm_covered = false;
-						continue;
-					}
-				}
-				if (pcm_acquired)
-				{
-					CLUSTER_INJECTION_POINT(
-						"cluster-pcm-grant-finalize-deliver-invalidate");
-					if (cluster_injection_should_skip(
-							"cluster-pcm-grant-finalize-deliver-invalidate")
-						&& cluster_gcs_block_test_deliver_self_invalidate(
-							buf->tag))
-						elog(WARNING,
-							 "cluster W3 delivery shim: synthetic INVALIDATE was ACKed instead of parked");
-					cluster_pcm_own_finish_grant_or_rollback(
-						buf, &pcm_pending_base, pcm_pending_token,
-						(uint8) PCM_STATE_S, PCM_LOCK_MODE_S,
-						&pcm_committed_generation);
-					pcm_pending_set = false;
-				}
-				else if (pcm_pending_set)
-				{
-					ClusterPcmOwnResult abort_result;
-
-					pcm_pending_result
-						= cluster_pcm_own_publish_read_image_exact(
-							buf, &pcm_pending_base, pcm_pending_token,
-							&pcm_committed_generation);
-					if (pcm_pending_result != CLUSTER_PCM_OWN_OK)
-					{
-						abort_result = cluster_pcm_own_abort_grant_reservation(
-							buf, &pcm_pending_base, pcm_pending_token);
-						pcm_pending_set = false;
-						if (abort_result != CLUSTER_PCM_OWN_OK
-							&& abort_result != CLUSTER_PCM_OWN_STALE)
-							cluster_pcm_own_report_bump_failure(
-								buf, abort_result,
-								pcm_pending_base.generation,
-								pcm_pending_base.flags,
-								"LockBuffer S read-image abort");
-						cluster_pcm_own_report_bump_failure(
-							buf, pcm_pending_result,
-							pcm_pending_base.generation,
-							pcm_pending_base.flags,
-							"LockBuffer S read-image publish");
-					}
-					pcm_pending_set = false;
-				}
-				break;
-			}
-		}
+		else if (!cluster_bufmgr_pcm_lock_shared(buf, pcm_barrier_refused))
+			goto cluster_lockbuffer_barrier_refusal;
 
 	}
 	else
@@ -16847,7 +16832,11 @@ LockBufferInternal_trace_impl(Buffer buffer, int mode, bool *pcm_barrier_refused
 	{
 		PcmLockMode old_mode = (PcmLockMode) buf->pcm_state;
 
-		if (!cluster_gcs_block_local_cache && !pcm_x_writer_managed)
+		/* A reader borrows resident S or X without acquiring a writer's
+		 * release responsibility. Neither that bracket nor an S residency
+		 * can be replaced by a tag-only release/generation bump. */
+		if (!cluster_gcs_block_local_cache && !pcm_x_writer_managed
+			&& !pcm_shared_read_unlock && old_mode != PCM_LOCK_MODE_S)
 		{
 			cluster_pcm_lock_unlock_content_buffer(buf, old_mode);
 			cluster_pcm_own_transition(
@@ -19418,6 +19407,26 @@ cluster_bufmgr_acquire_resident_cleanup(int code, Datum arg)
 	} else
 		cluster_bufmgr_acquire_first_fill_cleanup(guard->physical.buf, &guard->physical.base,
 			&guard->physical.episode, &guard->physical.original, true);
+}
+
+/* The enclosing ordinary caller also owns PREPARED while PI/write IO is
+ * incomplete, before the physical executor installs its narrower guard. */
+static void
+cluster_bufmgr_acquire_resident_scope_cleanup(BufferDesc *buf,
+	const ClusterPcmOwnSnapshot *base, const ResourceXDecodedAcquireIntent *episode,
+	const ResourceXDeliveryClaim *prepared)
+{
+	ClusterAcquireResidentGuard guard;
+
+	guard.original.buf = buf;
+	guard.original.owner = CurrentResourceOwner;
+	guard.original.base = *base;
+	guard.original.episode = *episode;
+	guard.original.original = *prepared;
+	guard.physical = guard.original;
+	guard.physical.base.buffer_type = BUF_TYPE_CURRENT;
+	guard.physical.base.semantic_buf_state = BM_TAG_VALID | BM_IO_IN_PROGRESS;
+	cluster_bufmgr_acquire_resident_cleanup(0, PointerGetDatum(&guard));
 }
 
 ResourceXApplyResult

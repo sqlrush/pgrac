@@ -1,6 +1,8 @@
 /* Resident N/CURRENT and N/PI read request responsibility. Actual native,
  * PCM, wire and LMS bodies; authenticated peers and interrupts are leaves. */
+#define NATIVE_RESIDENT_REQUEST_COMPOSITION
 #include "test_cluster_native_first_fill_fixture.inc"
+#undef NATIVE_RESIDENT_REQUEST_COMPOSITION
 
 static unsigned resident_aborts;
 static bool resident_after_abort_error;
