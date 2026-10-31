@@ -13296,3 +13296,22 @@ test_cluster_mx_operation_core: test_cluster_mx_operation_core.c test_cluster_sa
         $(CLUSTER_R4_SLOT_RESERVATION_UBA_O) $(CLUSTER_SAVEPOINT_READER_O) \
         $(CLUSTER_MULTIXACT_CURRENT_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
         $(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# Dormant operation wire codecs; transport activation is a separate whole-family change.
+TESTS += test_cluster_mx_operation_wire
+all: test_cluster_mx_operation_wire
+
+test_cluster_mx_operation_wire: test_cluster_mx_operation_wire.c \
+        test_cluster_multixact_current.c test_cluster_multixact_current \
+        $(top_srcdir)/src/include/cluster/cluster_multixact_operation_wire.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		-DHEAPAM_CURRENT_MX_SOURCE_PATH='"$(top_srcdir)/src/backend/access/heap/heapam.c"' \
+		-DMULTIXACT_SOURCE_PATH='"$(top_srcdir)/src/backend/access/transam/multixact.c"' \
+		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
+		$(CLUSTER_CR_SERVER_C0_TEST_O) $(CLUSTER_MULTIXACT_MATERIALIZER_TEST_O) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PGPORT) -o $@
+
+$(CLUSTER_MULTIXACT_CURRENT_WIRE_O): \
+        $(top_srcdir)/src/include/cluster/cluster_multixact_operation_wire.h \
+        $(top_srcdir)/src/include/cluster/cluster_savepoint_reader.h
