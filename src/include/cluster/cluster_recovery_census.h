@@ -264,6 +264,28 @@ typedef struct ClusterRecoveryCensusReferencesV1 {
 extern const ClusterRecoveryCensusReferencesV1 *cluster_recovery_census_references_v1(
 	ClusterRecoveryCensus *census);
 
+/* Indexed view of the original complete, second-read TX forest. Every saved
+ * predecessor is included, with its independent physical record generation.
+ * observed=true and value.record=NULL at index==count is the complete end,
+ * including a real empty forest. Invalid/prefix/refused results are all zero.
+ * The record and its complete payload/history bytes borrow the original
+ * census/graph lifetime; callers must not mutate or outlive those owners.
+ *
+ * DONE/manifest/source and observed-forest/count checks bracket every lookup.
+ * This saved-forest view is not a fresh physical-file/lifetime proof.
+ * No implicit cursor progress, traversal, root insertion or extra record read.
+ * Call outside LWLocks/critical sections. Entered failure/ERROR invalidates the
+ * original census, retaining its original input owner's pins/debt. No complete
+ * semantic graph, terminal/owner proof, retention transfer, discharge or OPEN
+ * authority follows from the supplied stable TX forest alone. */
+typedef struct ClusterRecoveryCensusTxRecordV1 {
+	bool observed;
+	uint32 count;
+	ClusterRecoveryGraphRecord value;
+} ClusterRecoveryCensusTxRecordV1;
+extern ClusterRecoveryCensusTxRecordV1
+cluster_recovery_census_tx_record_v1(ClusterRecoveryCensus *census, uint32 index);
+
 /* Borrow the original live cold inputs and their ROOT-selected isolated
  * namespace fd. The caller holds isolation, retention and these owners for
  * the entire cursor lifetime; this API establishes none of those premises.

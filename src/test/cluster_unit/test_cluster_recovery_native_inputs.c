@@ -56,11 +56,15 @@ inventory_test_census(ClusterWalInputsV1 *inputs, ClusterWalCensusVisitorV1 visi
 static ClusterRecoveryRootsResult census_current_read(ClusterRecoveryRootSet *roots,
 	uint32 index, uint64 offset, void *buffer, size_t length);
 static void census_namespace_interrupts(void);
+static ClusterRecoveryGraphResult census_tx_test_at(const ClusterRecoveryReferenceGraph *graph,
+	uint32 index, ClusterRecoveryGraphRecord *out);
+#define cluster_recovery_reference_graph_at census_tx_test_at
 #define HandleStartupProcInterrupts census_namespace_interrupts
 #define cluster_recovery_root_set_read_current_relation census_current_read
 #include "../../backend/cluster/cluster_recovery_census.c"
 #undef cluster_recovery_root_set_read_current_relation
 #undef HandleStartupProcInterrupts
+#undef cluster_recovery_reference_graph_at
 
 static ClusterWalSourceRef inventory_fault_source;
 static XLogRecPtr inventory_commit_start, inventory_commit_previous;
@@ -1149,6 +1153,7 @@ cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **held)
 #include "test_cluster_recovery_scope_handoff.inc"
 #endif
 #include "test_cluster_recovery_census_namespace.inc"
+#include "test_cluster_recovery_census_tx_records.inc"
 
 
 int
@@ -1158,6 +1163,14 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_CENSUS_TX_RECORDS") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_census_tx_records_include_real_cross_relation_predecessor);
+		UT_RUN(test_census_tx_records_preconditions_and_range_do_not_advance);
+		UT_RUN(test_census_tx_records_late_source_graph_error_and_count_are_sticky);
+		UT_RUN(test_census_tx_records_original_second_read_refuses_file_rewrite);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 #ifdef RECOVERY_SCOPE_NATIVE_CENSUS
 	if (getenv("PGRAC_PRE2_TEST_SCOPE_HANDOFF_PLAN") != NULL) {
 		UT_PLAN(1);
@@ -1538,7 +1551,11 @@ main(int argc, char **argv)
 		UT_RUN(test_census_references_bound_metadata_and_tuple_storage_before_publication);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(275);
+	UT_PLAN(279);
+	UT_RUN(test_census_tx_records_include_real_cross_relation_predecessor);
+	UT_RUN(test_census_tx_records_preconditions_and_range_do_not_advance);
+	UT_RUN(test_census_tx_records_late_source_graph_error_and_count_are_sticky);
+	UT_RUN(test_census_tx_records_original_second_read_refuses_file_rewrite);
 	UT_RUN(test_episode_multipage_init_keeps_both_actual_foreign_births);
 	UT_RUN(test_episode_multipage_init_wrong_foreign_epoch_closes_whole_group);
 	UT_RUN(test_episode_multipage_init_real_eviction_stays_unknown);

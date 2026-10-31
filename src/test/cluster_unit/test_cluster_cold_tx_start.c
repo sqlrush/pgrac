@@ -2375,6 +2375,7 @@ static void startup_local_empty_reset(void);
 #include "test_cluster_cold_ctrc_hot_refs.inc"
 
 #include "test_cluster_cold_ctrc_references.inc"
+#include "test_cluster_cold_ctrc_tx_records.inc"
 #include "test_cluster_cold_ctrc_reference_terminals.inc"
 #include "test_cluster_cold_ctrc_reference_tuples.inc"
 #include "test_cluster_cold_ctrc_census_hot.inc"
@@ -2750,11 +2751,19 @@ int main(void)
 		UT_DONE();
 		return ut_failed_count == 0 ? 0 : 1;
 	}
+	if (getenv("PGRAC_PRE2_TEST_START_TX_RECORDS") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_start_tx_records_keep_same_full_original_owner_and_empty_end);
+		UT_RUN(test_start_tx_records_preconditions_do_not_enter_or_replace_work);
+		UT_RUN(test_start_tx_records_late_refusal_count_and_owner_revoke_whole_start);
+		UT_RUN(test_start_tx_records_error_cleans_original_observation_in_order);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_FIRST
-	UT_PLAN(314);
+	UT_PLAN(318);
 #else
-	UT_PLAN(310);
+	UT_PLAN(314);
 #endif
 	UT_RUN(test_startup_native_images_accept_only_unchanged_complete_terminal_page);
 	UT_RUN(test_startup_native_images_reject_unresolved_ambiguous_and_mx_itls);
@@ -2765,8 +2774,12 @@ int main(void)
 	UT_RUN(test_startup_native_directory_real_origin_cannot_be_discharged_by_wait);
 	UT_RUN(test_startup_native_directory_invalid_layout_and_partial_error_keep_debt);
 #else
-	UT_PLAN(302);
+	UT_PLAN(306);
 #endif
+	UT_RUN(test_start_tx_records_keep_same_full_original_owner_and_empty_end);
+	UT_RUN(test_start_tx_records_preconditions_do_not_enter_or_replace_work);
+	UT_RUN(test_start_tx_records_late_refusal_count_and_owner_revoke_whole_start);
+	UT_RUN(test_start_tx_records_error_cleans_original_observation_in_order);
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_FIRST
 	UT_RUN(test_startup_native_first_exact_clean_write_releases_only_first_reference);
 	UT_RUN(test_startup_native_first_failed_write_keeps_debt_and_cannot_revive_start);
