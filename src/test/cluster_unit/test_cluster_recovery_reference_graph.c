@@ -671,10 +671,17 @@ UT_TEST(test_observed_index_exposes_every_predecessor_without_io)
 	cluster_recovery_reference_graph_destroy(graph);
 }
 
+#include "test_cluster_recovery_tx_dependencies.inc"
+
 int
 main(void)
 {
-	UT_PLAN(16);
+	UT_PLAN(20);
+	UT_RUN(test_tx_dependencies_preserve_roots_shared_tail_and_physical_generation);
+	UT_RUN(test_tx_dependencies_keep_an_already_root_predecessor_and_native_uba);
+	UT_RUN(test_tx_dependencies_prefix_empty_end_range_and_invalidation);
+	UT_RUN(test_tx_dependencies_refuse_inconsistent_original_edge_without_partial_view);
+
 	UT_RUN(test_cross_relation_and_segment_chain_is_not_page_history);
 	UT_RUN(test_multiple_roots_share_a_tail_without_a_false_cycle);
 	UT_RUN(test_active_path_cycle_and_self_edge_are_refused);

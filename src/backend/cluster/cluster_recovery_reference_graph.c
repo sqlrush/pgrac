@@ -436,6 +436,52 @@ cluster_recovery_reference_graph_at(const ClusterRecoveryReferenceGraph *graph, 
 	return CLUSTER_RECOVERY_GRAPH_RECORD;
 }
 
+/* Use the edges resolved by the original walk, not a second traversal or
+ * a caller-provided root list. Native UBA128 and both physical generations
+ * stay in the original records; these indexes are only local adjacency. */
+ClusterRecoveryGraphResult
+cluster_recovery_reference_graph_dependency_at(const ClusterRecoveryReferenceGraph *graph,
+	uint32 index, ClusterRecoveryGraphDependency *out)
+{
+	ClusterRecoveryGraphDependency current = {0};
+	const RecoveryRecordNode *node, *previous;
+
+	if (out != NULL) memset(out, 0, sizeof(*out));
+	if (out == NULL || !cluster_recovery_reference_graph_observed(graph)
+		|| graph->root_count > graph->count || index > graph->count)
+		return CLUSTER_RECOVERY_GRAPH_INVALID;
+	current.count = graph->count;
+	current.root_count = graph->root_count;
+	current.index = index;
+	if (index == graph->count) {
+		*out = current;
+		return CLUSTER_RECOVERY_GRAPH_DRAINED;
+	}
+	node = &graph->nodes[index];
+	if (cluster_recovery_reference_graph_at(graph, index, &current.value)
+			!= CLUSTER_RECOVERY_GRAPH_RECORD
+		|| !cluster_undo_record_uba_equal(node->address, node->record.address))
+		return CLUSTER_RECOVERY_GRAPH_INVALID;
+	current.root = index < graph->root_count;
+	if (UBA_is_invalid(node->record.header.prev_uba)) {
+		if (node->predecessor != RECOVERY_GRAPH_NONE)
+			return CLUSTER_RECOVERY_GRAPH_INVALID;
+	} else {
+		if (node->predecessor >= graph->count || node->predecessor == index)
+			return CLUSTER_RECOVERY_GRAPH_INVALID;
+		previous = &graph->nodes[node->predecessor];
+		if (!recovery_graph_key_equal(&node->transaction, &previous->transaction)
+			|| !cluster_undo_record_uba_equal(node->record.header.prev_uba, previous->address)
+			|| !cluster_undo_record_uba_equal(previous->address, previous->record.address)
+			|| cluster_recovery_reference_graph_at(graph, node->predecessor,
+				&current.predecessor) != CLUSTER_RECOVERY_GRAPH_RECORD)
+			return CLUSTER_RECOVERY_GRAPH_INVALID;
+		current.predecessor_index = node->predecessor;
+	}
+	*out = current;
+	return CLUSTER_RECOVERY_GRAPH_RECORD;
+}
+
 ClusterRecoveryGraphLookupResult
 cluster_recovery_reference_lookup_begin(const ClusterRecoveryReferenceGraph *graph,
 										uint64 system_identifier, uint64 database_incarnation,

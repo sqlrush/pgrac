@@ -286,6 +286,19 @@ typedef struct ClusterRecoveryCensusTxRecordV1 {
 extern ClusterRecoveryCensusTxRecordV1
 cluster_recovery_census_tx_record_v1(ClusterRecoveryCensus *census, uint32 index);
 
+/* Original complete TX roots and resolved predecessor edges, indexed in the
+ * same original second-read forest. observed with value.index==value.count
+ * is complete end; invalid/prefix/refused results are all zero. This view
+ * constructs native TX adjacency only, not the complete D0 reference/owner
+ * graph or its canonical transcript. No UBA128 truncation or history discharge.
+ * Same manifest/source/lock/lifetime/error contract as tx_record_v1 above. */
+typedef struct ClusterRecoveryCensusTxDependencyV1 {
+	bool observed;
+	ClusterRecoveryGraphDependency value;
+} ClusterRecoveryCensusTxDependencyV1;
+extern ClusterRecoveryCensusTxDependencyV1
+cluster_recovery_census_tx_dependency_v1(ClusterRecoveryCensus *census, uint32 index);
+
 /* Borrow the original live cold inputs and their ROOT-selected isolated
  * namespace fd. The caller holds isolation, retention and these owners for
  * the entire cursor lifetime; this API establishes none of those premises.

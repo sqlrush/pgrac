@@ -1082,6 +1082,51 @@ cluster_recovery_census_tx_record_v1(ClusterRecoveryCensus *census, uint32 index
 	return out;
 }
 
+ClusterRecoveryCensusTxDependencyV1
+cluster_recovery_census_tx_dependency_v1(ClusterRecoveryCensus *census, uint32 index)
+{
+	ClusterRecoveryCensusTxDependencyV1 out = {0};
+	ClusterRecoveryCensusManifest before, after;
+	ClusterRecoveryGraphDependency dependency;
+	ClusterRecoveryGraphResult result;
+	bool held = false;
+	bool ok = false;
+
+	if (census == NULL || census->status != CLUSTER_RECOVERY_CENSUS_DRAINED
+		|| CritSectionCount != 0 || ShutdownRequestPending
+		|| index > census->manifest.tx_record_count) return out;
+	ForEachLWLockHeldByMe(census_page_lock_held, &held);
+	if (held) return out;
+	PG_TRY();
+	{
+		if (cluster_recovery_census_manifest(census, &before)) {
+			result = cluster_recovery_reference_graph_dependency_at(census->graph, index,
+				&dependency);
+			ok = dependency.count == before.tx_record_count && dependency.index == index
+				&& dependency.root_count <= dependency.count
+				&& dependency.root == (index < dependency.root_count)
+				&& (index == before.tx_record_count
+					? result == CLUSTER_RECOVERY_GRAPH_DRAINED && dependency.value.record == NULL
+						&& dependency.predecessor.record == NULL
+					: result == CLUSTER_RECOVERY_GRAPH_RECORD && dependency.value.record != NULL)
+				&& cluster_recovery_census_manifest(census, &after)
+				&& memcmp(&before, &after, sizeof(before)) == 0;
+			if (ok) {
+				out.observed = true;
+				out.value = dependency;
+			}
+		}
+		if (!ok) (void)census_fail(census, CLUSTER_RECOVERY_CENSUS_REFUSED);
+	}
+	PG_CATCH();
+	{
+		(void)census_fail(census, CLUSTER_RECOVERY_CENSUS_REFUSED);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return out;
+}
+
 bool
 cluster_recovery_census_wal_source_count_v1(ClusterRecoveryCensus *census, uint32 *out)
 {
