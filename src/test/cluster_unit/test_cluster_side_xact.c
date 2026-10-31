@@ -357,6 +357,15 @@ cluster_tt_slot_durable_read_exact_stable(uint32 segment_id pg_attribute_unused(
 	return true;
 }
 
+/* This fixture supplies only the original V1 slot model. V2 rejection is
+ * covered with the actual SIDE and durable readers in the durable test. */
+bool
+cluster_tt_slot_durable_read_exact_legacy_stable(uint32 segment_id, uint16 slot_offset,
+												 TransactionId xid, uint16 wrap, TTSlot *out)
+{
+	return cluster_tt_slot_durable_read_exact_stable(segment_id, slot_offset, xid, wrap, out);
+}
+
 TwoPhaseRecoveryPendingResult
 TwoPhaseRecoveryPendingPreflight(TransactionId xid pg_attribute_unused(),
 								 Oid database pg_attribute_unused(),

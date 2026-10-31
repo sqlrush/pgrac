@@ -172,7 +172,7 @@ cluster_tt_durable_redo_set_head_slot(uint8 instance pg_attribute_unused(),
 }
 
 bool
-cluster_tt_slot_durable_read_exact_stable(uint32 segment_id pg_attribute_unused(),
+cluster_tt_slot_durable_read_exact_legacy_stable(uint32 segment_id pg_attribute_unused(),
 										  uint16 slot_offset pg_attribute_unused(),
 										  TransactionId xid, uint16 expected_wrap, TTSlot *slot_out)
 {

@@ -1354,7 +1354,7 @@ cluster_undo_preflight_tt_target_v1(const ClusterUndoDecoded *decoded)
 	if (decoded->kind != CLUSTER_UNDO_KIND_TT_COMMIT && decoded->kind != CLUSTER_UNDO_KIND_TT_ABORT
 		&& decoded->kind != CLUSTER_UNDO_KIND_TT_SET_HEAD)
 		return CLUSTER_UNDO_TARGET_BLOCKED;
-	if (!cluster_tt_slot_durable_read_exact_stable(decoded->segment_id, decoded->slot_offset,
+	if (!cluster_tt_slot_durable_read_exact_legacy_stable(decoded->segment_id, decoded->slot_offset,
 												   decoded->xid, decoded->wrap, &slot))
 		return CLUSTER_UNDO_TARGET_BLOCKED;
 
@@ -1463,7 +1463,7 @@ cluster_undo_apply_tt_v1(const ClusterUndoDecoded *decoded)
 	default:
 		return CLUSTER_UNDO_APPLY_BLOCKED;
 	}
-	if (!cluster_tt_slot_durable_read_exact_stable(decoded->segment_id, decoded->slot_offset,
+	if (!cluster_tt_slot_durable_read_exact_legacy_stable(decoded->segment_id, decoded->slot_offset,
 												   decoded->xid, decoded->wrap, &post_slot))
 		return CLUSTER_UNDO_APPLY_POST_READ_FAILED;
 	switch (decoded->kind) {

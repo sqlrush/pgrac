@@ -3588,8 +3588,10 @@ test_cluster_undo_tt_v2_native.inc: $(top_srcdir)/src/backend/cluster/storage/cl
 	mv $@.tmp $@
 
 test_cluster_undo_header_identity.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_alloc.c Makefile
-	awk '/^cluster_undo_segment_header_identity_ok\(/ { print "bool"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	awk '/^typedef struct ClusterUndoLifecycleHeaderView/ { emit=1; found++ } \
+	     /^lifecycle_header_view\(/ { print "static bool"; emit=1; found++ } \
+	     /^cluster_undo_segment_header_identity_ok\(/ { print "bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 3) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_undo_path_native.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_alloc.c Makefile
@@ -5496,6 +5498,7 @@ clean distclean maintainer-clean:
 		test_cluster_sync_dispatch.inc test_cluster_sync_smgr.inc
 	rm -f test_cluster_tt_rollback_entry.inc
 	rm -f test_cluster_tt_startup_local_owner.inc
+	rm -f test_cluster_tt_reader_side_product.o
 	rm -f test_cluster_tt_normal_start.inc test_cluster_tt_normal_start.inc.tmp
 	rm -f test_cluster_tt_terminal_route.inc test_cluster_tt_terminal_route.inc.tmp
 	rm -f test_cluster_typed_redo_reader.inc test_cluster_typed_redo_fpi.inc test_cluster_cold_init_native.inc
@@ -7984,10 +7987,21 @@ $(top_builddir)/src/backend/cluster/cluster_tt_durable.o test_cluster_tt_durable
 # spec-3.11 D2/D9: test_cluster_tt_durable — pure decision predicates
 # (redo wrap table / slot match) + lookup / by-xid scan with a mocked
 # cluster_undo_smgr.  File-I/O behavior is e2e in cluster_tap t/219.
+# Link the real SIDE reader with the real durable producer, without the
+# transition copies used by the standalone SIDE fixture.
+test_cluster_tt_reader_side_product.o: $(top_srcdir)/src/backend/cluster/cluster_side_undo.c \
+		$(top_srcdir)/src/include/cluster/cluster_side_undo.h \
+		$(top_srcdir)/src/include/cluster/cluster_tt_durable.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h \
+		$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
 test_cluster_tt_durable: test_cluster_tt_durable.c unit_test.h \
-		$(CLUSTER_TT_DURABLE_O)
+		$(CLUSTER_TT_DURABLE_O) test_cluster_tt_reader_side_product.o \
+		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(CLUSTER_TT_DURABLE_O) \
+		$(CLUSTER_TT_DURABLE_O) test_cluster_tt_reader_side_product.o \
+		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 

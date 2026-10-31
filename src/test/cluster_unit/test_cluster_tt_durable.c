@@ -77,6 +77,7 @@ scn_time_cmp(SCN a, SCN b)
 
 	return (la < lb) ? -1 : (la > lb) ? 1 : 0;
 }
+#include "cluster/cluster_side_undo.h"
 #include "cluster/cluster_tt_slot.h"
 #include "cluster/cluster_uba.h"
 #include "cluster/cluster_undo_segment.h"
@@ -95,6 +96,7 @@ UT_DEFINE_GLOBALS();
 
 /* Backend allocation is a fixture boundary; the staged production state and
  * its ownership/release are executed unchanged. */
+#ifndef TT_DURABLE_REAL_ALLOCATOR_FIXTURE
 void *
 palloc0(Size size)
 {
@@ -103,6 +105,8 @@ palloc0(Size size)
 		abort();
 	return result;
 }
+
+#endif
 
 void
 pfree(void *pointer)
@@ -571,6 +575,11 @@ static TTSlot g_canned_slot_second;
 static bool g_read_hdr_second_enabled = false;
 static int g_read_hdr_calls = 0;
 static int g_read_hdr_fail_on_call = 0;
+/* Complete selected disk images for the layout-aware reader tests. Legacy
+ * lookup tests still supply their original 32-byte slot, in a real V1 frame. */
+static bool g_lookup_complete_image;
+static bool g_lookup_second_image;
+static PGAlignedBlock g_lookup_successor;
 
 static char g_canned_block[BLCKSZ];		  /* returned by read_block for segment 1 */
 static uint32 g_canned_block_segment = 1; /* which segment_id the canned block answers */
@@ -977,6 +986,21 @@ cluster_undo_smgr_read_header_bytes(ClusterUndoPathIntent intent pg_attribute_un
 		|| (g_read_hdr_fail_on_call > 0 && g_read_hdr_calls == g_read_hdr_fail_on_call)
 		|| buf == NULL)
 		return false;
+	if (g_lookup_complete_image) {
+		if ((uint64)offset + len > BLCKSZ)
+			return false;
+		memcpy(buf, (g_lookup_second_image && g_read_hdr_calls == 2
+				? g_lookup_successor.data : g_canned_block) + offset, len);
+		return true;
+	}
+	if (offset == 0 && len == BLCKSZ) {
+		UndoSegmentHeaderData *header = (UndoSegmentHeaderData *)buf;
+
+		cluster_undo_segment_make_header_bytes(segment_id, owner_instance, buf);
+		header->tt_slots[0] = (g_read_hdr_second_enabled && g_read_hdr_calls == 2)
+			? g_canned_slot_second : g_canned_slot;
+		return true;
+	}
 	if ((offset == offsetof(UndoSegmentHeaderData, _pad_57) && len == 7)
 		|| (offset == offsetof(UndoSegmentHeaderDataV2, wrap_count) && len == sizeof(uint32))) {
 		memcpy(buf, g_canned_block + offset, len);
@@ -1147,6 +1171,7 @@ reset_header_read_mock(void)
 	g_read_hdr_second_enabled = false;
 	g_read_hdr_calls = 0;
 	g_read_hdr_fail_on_call = 0;
+	g_lookup_complete_image = g_lookup_second_image = false;
 	memset(&g_canned_slot, 0, sizeof(g_canned_slot));
 	memset(&g_canned_slot_second, 0, sizeof(g_canned_slot_second));
 	g_commit_check_result = true;
@@ -4673,10 +4698,243 @@ UT_TEST(test_scan_v2_preserves_existing_publication_retry_and_incomplete_scan)
 	UT_ASSERT_EQ(g_write_hdr_calls, 0);
 }
 
+
+/* The three raw-xid readers retain their old output contracts. A valid V2
+ * image is an input format, not an epoch inference or new history grant. */
+static void
+lookup_v2_seed(uint16 offset, uint8 status)
+{
+	scan_v2_reset();
+	seed_scan_v2_slot(offset, status, 100, 7,
+		status == TT_SLOT_COMMITTED ? scn_encode(1, 42) : InvalidScn);
+	g_lookup_complete_image = true;
+	if (!cluster_undo_segment_header_seal(g_canned_block))
+		abort();
+}
+
+UT_TEST(test_lookup_v2_reads_all_48_original_slots_at_their_actual_stride)
+{
+	for (uint16 offset = 0; offset < 48; offset++) {
+		SCN got = InvalidScn;
+		TTSlot exact;
+		PGAlignedBlock before;
+		UndoSegmentHeaderDataV2 *header = (UndoSegmentHeaderDataV2 *)g_canned_block;
+
+		lookup_v2_seed(offset, TT_SLOT_COMMITTED);
+		if (offset == 0) {
+			header->tt_slots[0].original_full_xid = 100; /* normal epoch zero */
+			UT_ASSERT(cluster_undo_segment_header_seal(g_canned_block));
+		}
+		memcpy(before.data, g_canned_block, BLCKSZ);
+		UT_ASSERT(cluster_tt_slot_durable_lookup(1, offset, 100, 9, &got));
+		UT_ASSERT_EQ(got, scn_encode(1, 42));
+		g_read_hdr_calls = 0;
+		UT_ASSERT(cluster_tt_slot_durable_lookup_committed_stable(
+			1, offset, 100, 9, mock_xid_committed, &got));
+		UT_ASSERT_EQ(g_read_hdr_calls, 2);
+		UT_ASSERT_EQ(g_commit_check_read_calls_seen, 1);
+		g_read_hdr_calls = 0;
+		UT_ASSERT(cluster_tt_slot_durable_read_exact_stable(1, offset, 100, 9, &exact));
+		UT_ASSERT_EQ(memcmp(&exact, &header->tt_slots[offset], sizeof(exact)), 0);
+		UT_ASSERT_EQ(g_read_hdr_calls, 2);
+		UT_ASSERT_EQ(memcmp(before.data, g_canned_block, BLCKSZ), 0);
+		UT_ASSERT_EQ(g_write_hdr_calls + g_tt_wal_count, 0);
+	}
+	reset_header_read_mock();
+}
+
+UT_TEST(test_lookup_v2_stable_window_rejects_fullxid_generation_layout_or_slot_drift)
+{
+	for (int variant = 0; variant < 5; variant++) {
+		SCN got = 77;
+		TTSlot exact, zero = { 0 };
+		UndoSegmentHeaderDataV2 *second = (UndoSegmentHeaderDataV2 *)g_lookup_successor.data;
+
+		lookup_v2_seed(0, TT_SLOT_COMMITTED);
+		memcpy(second, g_canned_block, BLCKSZ);
+		switch (variant) {
+		case 0: second->tt_slots[0].original_full_xid = UINT64_C(0x800000064); break;
+		case 1: second->wrap_count++; break;
+		case 2:
+			cluster_undo_segment_make_header_bytes(1, 1, g_lookup_successor.data);
+			memcpy(&((UndoSegmentHeaderData *)second)->tt_slots[0],
+				&((UndoSegmentHeaderDataV2 *)g_canned_block)->tt_slots[0], sizeof(TTSlot));
+			break;
+		case 3: second->tt_slots[0].first_undo_block = uba_encode(1, 1, 3, 64); break;
+		case 4: second->tt_slots[0].commit_scn = scn_encode(1, 43); break;
+		}
+		UT_ASSERT(cluster_undo_segment_header_seal(second));
+		g_lookup_second_image = true;
+		UT_ASSERT(!cluster_tt_slot_durable_lookup_committed_stable(
+			1, 0, 100, 9, mock_xid_committed, &got));
+		UT_ASSERT_EQ(got, 77);
+		UT_ASSERT_EQ(g_read_hdr_calls, 2);
+		g_read_hdr_calls = 0;
+		memset(&exact, 0xa5, sizeof(exact));
+		UT_ASSERT(!cluster_tt_slot_durable_read_exact_stable(1, 0, 100, 9, &exact));
+		UT_ASSERT_EQ(memcmp(&exact, &zero, sizeof(exact)), 0);
+		UT_ASSERT_EQ(g_read_hdr_calls, 2);
+	}
+	reset_header_read_mock();
+}
+
+UT_TEST(test_lookup_v2_rejects_corrupt_frames_and_unrelated_bad_last_slot_before_output)
+{
+	for (int variant = 0; variant < 16; variant++) {
+		SCN got = 77;
+		TTSlot exact, zero = { 0 };
+		UndoSegmentHeaderDataV2 *header = (UndoSegmentHeaderDataV2 *)g_canned_block;
+
+		lookup_v2_seed(0, TT_SLOT_COMMITTED);
+		switch (variant) {
+		case 0: header->tt_layout_version = 3; break;
+		case 1: header->tt_slot_bytes = 32; break;
+		case 2: header->tt_layout_reserved = 1; break;
+		case 3: header->segment_id = 2; break;
+		case 4: header->owner_instance = 2; break;
+		case 5: header->tt_slots_count = 47; break;
+		case 6: header->tt_slots[47].status = 99; break;
+		case 7: header->tt_slots[0].original_full_xid = 0; break;
+		case 8: header->tt_slots[0].original_full_xid = UINT64_MAX; break;
+		case 9: header->tt_slots[0].original_full_xid++; break;
+		case 10: header->tt_slots[0].flags = 0x80; break;
+		case 11: header->tt_slots[0].wrap = TT_WRAP_INVALID; break;
+		case 12: header->tt_slots[47].original_full_xid = 100; break;
+		case 13: header->tt_active_count = 49; break;
+		case 14: case 15: break; /* damaged or unverified checksum below */
+		}
+		UT_ASSERT(cluster_undo_segment_header_seal(header));
+		if (variant == 14) g_canned_block[BLCKSZ - 1] ^= 1;
+		if (variant == 15) ((PageHeader)header)->pd_checksum = 0;
+		UT_ASSERT(!cluster_tt_slot_durable_lookup(1, 0, 100, 9, &got));
+		UT_ASSERT_EQ(got, 77);
+		UT_ASSERT(!cluster_tt_slot_durable_lookup_committed_stable(
+			1, 0, 100, 9, mock_xid_committed, &got));
+		UT_ASSERT_EQ(got, 77);
+		UT_ASSERT_EQ(g_commit_check_calls, 0);
+		memset(&exact, 0xa5, sizeof(exact));
+		UT_ASSERT(!cluster_tt_slot_durable_read_exact_stable(1, 0, 100, 9, &exact));
+		UT_ASSERT_EQ(memcmp(&exact, &zero, sizeof(exact)), 0);
+		UT_ASSERT_EQ(g_write_hdr_calls + g_tt_wal_count, 0);
+	}
+	reset_header_read_mock();
+}
+
+UT_TEST(test_lookup_v2_exact_keeps_known_terminal_prefix_and_unrelated_progress)
+{
+	const uint8 states[] = { TT_SLOT_ACTIVE, TT_SLOT_COMMITTED, TT_SLOT_ABORTED,
+		TT_SLOT_RECYCLABLE };
+
+	for (int i = 0; i < lengthof(states); i++) {
+		TTSlot exact;
+		UndoSegmentHeaderDataV2 *first = (UndoSegmentHeaderDataV2 *)g_canned_block;
+		UndoSegmentHeaderDataV2 *second = (UndoSegmentHeaderDataV2 *)g_lookup_successor.data;
+
+		lookup_v2_seed(47, states[i]);
+		first->tt_slots[47].first_undo_block = uba_encode(1, 1, 2, 64);
+		UT_ASSERT(cluster_undo_segment_header_seal(first));
+		memcpy(second, first, BLCKSZ);
+		second->tt_slots[3] = first->tt_slots[47];
+		second->tt_slots[3].xid = 101;
+		second->tt_slots[3].original_full_xid++;
+		UT_ASSERT(cluster_undo_segment_header_seal(second));
+		g_lookup_second_image = true;
+		UT_ASSERT(cluster_tt_slot_durable_read_exact_stable(1, 47, 100, 9, &exact));
+		UT_ASSERT_EQ(memcmp(&exact, &first->tt_slots[47], sizeof(exact)), 0);
+		UT_ASSERT_EQ(g_read_hdr_calls, 2);
+	}
+	reset_header_read_mock();
+}
+
+UT_TEST(test_lookup_v2_stable_io_and_native_rejections_preserve_output)
+{
+	for (int variant = 0; variant < 3; variant++) {
+		SCN got = 77;
+		TTSlot exact, zero = { 0 };
+
+		lookup_v2_seed(47, TT_SLOT_COMMITTED);
+		if (variant < 2) g_read_hdr_fail_on_call = variant + 1;
+		else g_commit_check_result = false;
+		UT_ASSERT(!cluster_tt_slot_durable_lookup_committed_stable(
+			1, 47, 100, 9, mock_xid_committed, &got));
+		UT_ASSERT_EQ(got, 77);
+		UT_ASSERT_EQ(g_read_hdr_calls, variant == 1 ? 2 : 1);
+		if (variant < 2) {
+			g_read_hdr_calls = 0;
+			memset(&exact, 0xa5, sizeof(exact));
+			UT_ASSERT(!cluster_tt_slot_durable_read_exact_stable(1, 47, 100, 9, &exact));
+			UT_ASSERT_EQ(memcmp(&exact, &zero, sizeof(exact)), 0);
+		}
+	}
+	reset_header_read_mock();
+}
+
+UT_TEST(test_lookup_invalid_physical_identity_refuses_before_io)
+{
+	const uint32 segments[] = { 0, 32769, UINT32_MAX };
+	TTSlot exact, zero = { 0 };
+	SCN got = 77;
+
+	for (int i = 0; i < lengthof(segments); i++) {
+		lookup_v2_seed(0, TT_SLOT_COMMITTED);
+		UT_ASSERT(!cluster_tt_slot_durable_lookup(segments[i], 0, 100, 9, &got));
+		UT_ASSERT(!cluster_tt_slot_durable_lookup_committed_stable(
+			segments[i], 0, 100, 9, mock_xid_committed, &got));
+		memset(&exact, 0xa5, sizeof(exact));
+		UT_ASSERT(!cluster_tt_slot_durable_read_exact_stable(segments[i], 0, 100, 9, &exact));
+		UT_ASSERT_EQ(memcmp(&exact, &zero, sizeof(exact)), 0);
+		UT_ASSERT_EQ(got, 77);
+		UT_ASSERT_EQ(g_read_hdr_calls + g_commit_check_calls, 0);
+	}
+	reset_header_read_mock();
+}
+
+
+/* Real SIDE target preflight + durable reader. The old WAL carries no V2
+ * identity and must not turn a TT40 prefix into TT32 mutation permission. */
+UT_TEST(test_lookup_v2_prefix_cannot_authorize_legacy_side_mutations)
+{
+	const ClusterUndoDecodedKind kinds[] = { CLUSTER_UNDO_KIND_TT_COMMIT,
+		CLUSTER_UNDO_KIND_TT_ABORT, CLUSTER_UNDO_KIND_TT_SET_HEAD };
+	const uint8 opcodes[] = { XLOG_UNDO_TT_SLOT_COMMIT, XLOG_UNDO_TT_SLOT_ABORT,
+		XLOG_UNDO_TT_SLOT_SET_HEAD };
+
+	for (int i = 0; i < lengthof(kinds); i++) {
+		ClusterUndoDecoded operation = { 0 };
+		UBA invalid_head = { 0 };
+		uint8 status = i == 2 ? TT_SLOT_ABORTED : TT_SLOT_ACTIVE;
+		TTSlot prefix;
+		PGAlignedBlock before;
+
+		lookup_v2_seed(1, status);
+		operation.kind = kinds[i];
+		operation.opcode = opcodes[i];
+		operation.instance = 1;
+		operation.segment_id = 1;
+		operation.slot_offset = 1;
+		operation.wrap = 9;
+		operation.xid = 100;
+		operation.commit_scn = i == 0 ? scn_encode(1, 42) : InvalidScn;
+		operation.first_undo_block = i == 2 ? uba_encode(1, 2, 1, 64) : invalid_head;
+		memcpy(before.data, g_canned_block, BLCKSZ);
+		/* A valid read-only observation does not authorize the old writer. */
+		UT_ASSERT(cluster_tt_slot_durable_read_exact_stable(1, 1, 100, 9, &prefix));
+		UT_ASSERT_EQ(cluster_undo_preflight_tt_target_v1(&operation), CLUSTER_UNDO_TARGET_BLOCKED);
+		UT_ASSERT_EQ(memcmp(before.data, g_canned_block, BLCKSZ), 0);
+		UT_ASSERT_EQ(g_write_hdr_calls + g_tt_wal_count, 0);
+
+		/* The same original legacy record still accepts its actual V1 page. */
+		cluster_undo_segment_make_header_bytes(1, 1, g_canned_block);
+		((UndoSegmentHeaderData *)g_canned_block)->tt_slots[1] = prefix;
+		UT_ASSERT_EQ(cluster_undo_preflight_tt_target_v1(&operation), CLUSTER_UNDO_TARGET_APPLY);
+	}
+	reset_header_read_mock();
+}
+
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(133);
+	UT_PLAN(140);
 
 	UT_RUN(test_layout_sizes);
 
@@ -4824,6 +5082,13 @@ main(int argc, char **argv)
 	UT_RUN(test_scan_rejects_bad_or_unknown_header_before_any_output);
 	UT_RUN(test_scan_v2_invalid_unrelated_last_slot_poison_is_atomic);
 	UT_RUN(test_scan_v2_preserves_existing_publication_retry_and_incomplete_scan);
+	UT_RUN(test_lookup_v2_reads_all_48_original_slots_at_their_actual_stride);
+	UT_RUN(test_lookup_v2_stable_window_rejects_fullxid_generation_layout_or_slot_drift);
+	UT_RUN(test_lookup_v2_rejects_corrupt_frames_and_unrelated_bad_last_slot_before_output);
+	UT_RUN(test_lookup_v2_exact_keeps_known_terminal_prefix_and_unrelated_progress);
+	UT_RUN(test_lookup_v2_stable_io_and_native_rejections_preserve_output);
+	UT_RUN(test_lookup_invalid_physical_identity_refuses_before_io);
+	UT_RUN(test_lookup_v2_prefix_cannot_authorize_legacy_side_mutations);
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;
 }

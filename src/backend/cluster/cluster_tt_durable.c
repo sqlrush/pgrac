@@ -1993,41 +1993,80 @@ cluster_tt_slot_durable_abort(uint32 segment_id, uint16 slot_offset, Transaction
 }
 
 
+/* Raw-xid APIs expose only the old slot prefix. Keep the complete V2 identity
+ * private so a stable read cannot accept an equal raw xid from another epoch
+ * or generation. This observation grants no FullXid or retention authority. */
+typedef struct DurableSlotObservation {
+	TTSlotV2 slot;
+	uint32 generation;
+	bool is_v2;
+} DurableSlotObservation;
+
+static bool
+durable_slot_read(uint32 segment_id, uint16 slot_offset, DurableSlotObservation *out)
+{
+	PGAlignedBlock block;
+	uint8 owner;
+	bool read_ok;
+	bool is_v2;
+
+	if (segment_id == 0 || segment_id > UNDO_OWNER_INSTANCE_MAX * CLUSTER_UNDO_SEGS_PER_INSTANCE
+		|| slot_offset >= TT_SLOTS_PER_SEGMENT)
+		return false;
+	owner = tt_owner_instance_for_segment(segment_id);
+	cluster_tt_durable_io_wait_start();
+	read_ok = cluster_undo_smgr_read_header_bytes(cluster_undo_recovery_intent_for_owner(owner),
+												  segment_id, owner, 0, block.data, BLCKSZ);
+	cluster_tt_durable_io_wait_end();
+	if (!read_ok || !durable_scan_header_valid(block.data, segment_id, owner, &is_v2)
+		|| (is_v2 && cluster_undo_segment_header_integrity(block.data) != CLUSTER_UNDO_HEADER_VALID))
+		return false;
+
+	memset(out, 0, sizeof(*out));
+	out->is_v2 = is_v2;
+	if (is_v2) {
+		const UndoSegmentHeaderDataV2 *header = (const UndoSegmentHeaderDataV2 *)block.data;
+
+		out->slot = header->tt_slots[slot_offset];
+		out->generation = header->wrap_count;
+	} else {
+		const UndoSegmentHeaderData *header = (const UndoSegmentHeaderData *)block.data;
+
+		memcpy(&out->slot, &header->tt_slots[slot_offset], sizeof(TTSlot));
+		out->generation = header->wrap_count;
+	}
+	return true;
+}
+
+static bool
+durable_slot_unchanged(const DurableSlotObservation *first, const DurableSlotObservation *second)
+{
+	return first->is_v2 == second->is_v2 && first->generation == second->generation
+		&& memcmp(&first->slot, &second->slot, sizeof(first->slot)) == 0;
+}
+
 bool
 cluster_tt_slot_durable_lookup(uint32 segment_id, uint16 slot_offset, TransactionId xid,
 							   uint32 expected_wrap, SCN *commit_scn)
 {
-	uint8 owner;
-	uint32 off;
-	TTSlot slot;
+	DurableSlotObservation read;
 
 	if (commit_scn == NULL || slot_offset >= TT_SLOTS_PER_SEGMENT)
 		return false;
-
-	owner = tt_owner_instance_for_segment(segment_id);
-	off = tt_slot_file_offset(slot_offset);
-
-	cluster_tt_durable_io_wait_start();
-	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_recovery_intent_for_owner(owner),
-											 segment_id, owner, off, (char *)&slot, sizeof(slot))) {
-		cluster_tt_durable_io_wait_end();
-		cluster_tt_durable_count_lookup(false);
-		return false; /* segment absent / I/O -> miss (caller fail-closes) */
-	}
-	cluster_tt_durable_io_wait_end();
-
-	/*
-	 * spec-3.11 C5 (规则 8.A): the slot must still be bound to this xid and be
-	 * COMMITTED with a valid commit_scn.  xid mismatch = the slot was recycled
-	 * by a later owner; never return that owner's commit_scn.
-	 */
-	if (!cluster_tt_durable_slot_match(slot.status, slot.xid, slot.wrap, slot.commit_scn, xid,
-									   expected_wrap)) {
+	if (!durable_slot_read(segment_id, slot_offset, &read)) {
 		cluster_tt_durable_count_lookup(false);
 		return false;
 	}
 
-	*commit_scn = slot.commit_scn;
+	/* Never return the commit SCN of a later slot owner. Callers still owe
+	 * the original CLOG cross-check; V2 framing does not replace it. */
+	if (!cluster_tt_durable_slot_match(read.slot.status, read.slot.xid, read.slot.wrap,
+									   read.slot.commit_scn, xid, expected_wrap)) {
+		cluster_tt_durable_count_lookup(false);
+		return false;
+	}
+
+	*commit_scn = read.slot.commit_scn;
 	cluster_tt_durable_count_lookup(true);
 	return true;
 }
@@ -2038,28 +2077,16 @@ cluster_tt_slot_durable_lookup_committed_stable(uint32 segment_id, uint16 slot_o
 												ClusterTTDurableXidCommitCheck xid_committed,
 												SCN *commit_scn)
 {
-	uint8 owner;
-	uint32 off;
-	TTSlot first;
-	TTSlot second;
+	DurableSlotObservation first;
+	DurableSlotObservation second;
 
 	if (commit_scn == NULL || xid_committed == NULL || slot_offset >= TT_SLOTS_PER_SEGMENT)
 		return false;
-
-	owner = tt_owner_instance_for_segment(segment_id);
-	off = tt_slot_file_offset(slot_offset);
-
-	cluster_tt_durable_io_wait_start();
-	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_recovery_intent_for_owner(owner),
-											 segment_id, owner, off, (char *)&first,
-											 sizeof(first))) {
-		cluster_tt_durable_io_wait_end();
+	if (!durable_slot_read(segment_id, slot_offset, &first))
 		return false;
-	}
-	cluster_tt_durable_io_wait_end();
 
-	if (!cluster_tt_durable_slot_match(first.status, first.xid, first.wrap, first.commit_scn, xid,
-									   expected_wrap)) {
+	if (!cluster_tt_durable_slot_match(first.slot.status, first.slot.xid, first.slot.wrap,
+									   first.slot.commit_scn, xid, expected_wrap)) {
 		cluster_tt_durable_count_lookup(false);
 		return false;
 	}
@@ -2069,36 +2096,29 @@ cluster_tt_slot_durable_lookup_committed_stable(uint32 segment_id, uint16 slot_o
 		return false;
 	}
 
-	cluster_tt_durable_io_wait_start();
-	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_recovery_intent_for_owner(owner),
-											 segment_id, owner, off, (char *)&second,
-											 sizeof(second))) {
-		cluster_tt_durable_io_wait_end();
-		cluster_tt_durable_count_lookup(false);
-		return false;
-	}
-	cluster_tt_durable_io_wait_end();
-
-	if (memcmp(&first, &second, sizeof(first)) != 0
-		|| !cluster_tt_durable_slot_match(second.status, second.xid, second.wrap, second.commit_scn,
-										  xid, expected_wrap)) {
+	if (!durable_slot_read(segment_id, slot_offset, &second)) {
 		cluster_tt_durable_count_lookup(false);
 		return false;
 	}
 
-	*commit_scn = second.commit_scn;
+	if (!durable_slot_unchanged(&first, &second)
+		|| !cluster_tt_durable_slot_match(second.slot.status, second.slot.xid, second.slot.wrap,
+										  second.slot.commit_scn, xid, expected_wrap)) {
+		cluster_tt_durable_count_lookup(false);
+		return false;
+	}
+
+	*commit_scn = second.slot.commit_scn;
 	cluster_tt_durable_count_lookup(true);
 	return true;
 }
 
-bool
-cluster_tt_slot_durable_read_exact_stable(uint32 segment_id, uint16 slot_offset, TransactionId xid,
-										  uint16 expected_wrap, TTSlot *slot_out)
+static bool
+durable_slot_read_exact_stable(uint32 segment_id, uint16 slot_offset, TransactionId xid,
+							  uint16 expected_wrap, bool legacy_only, TTSlot *slot_out)
 {
-	uint8 owner;
-	uint32 off;
-	TTSlot first;
-	TTSlot second;
+	DurableSlotObservation first;
+	DurableSlotObservation second;
 
 	if (slot_out == NULL)
 		return false;
@@ -2110,37 +2130,43 @@ cluster_tt_slot_durable_read_exact_stable(uint32 segment_id, uint16 slot_offset,
 		|| expected_wrap == TT_WRAP_INVALID)
 		return false;
 
-	owner = tt_owner_instance_for_segment(segment_id);
-	off = tt_slot_file_offset(slot_offset);
-
-	cluster_tt_durable_io_wait_start();
-	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_recovery_intent_for_owner(owner),
-											 segment_id, owner, off, (char *)&first,
-											 sizeof(first))) {
-		cluster_tt_durable_io_wait_end();
+	if (!durable_slot_read(segment_id, slot_offset, &first)) {
 		cluster_tt_durable_count_lookup(false);
 		return false;
 	}
-	cluster_tt_durable_io_wait_end();
 
-	if (first.status > (uint8)TT_SLOT_RECYCLABLE || first.xid != xid || first.wrap != expected_wrap)
+	/* A legacy mutation consumer cannot turn a TT40 read-only prefix into
+	 * permission for a fixed-stride writer that carries no FullXid. */
+	if ((legacy_only && first.is_v2)
+		|| first.slot.status > (uint8)TT_SLOT_RECYCLABLE || first.slot.xid != xid
+		|| first.slot.wrap != expected_wrap)
 		return false;
 
-	cluster_tt_durable_io_wait_start();
-	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_recovery_intent_for_owner(owner),
-											 segment_id, owner, off, (char *)&second,
-											 sizeof(second))) {
-		cluster_tt_durable_io_wait_end();
-		return false;
-	}
-	cluster_tt_durable_io_wait_end();
-
-	if (memcmp(&first, &second, sizeof(first)) != 0 || second.status > (uint8)TT_SLOT_RECYCLABLE
-		|| second.xid != xid || second.wrap != expected_wrap)
+	if (!durable_slot_read(segment_id, slot_offset, &second))
 		return false;
 
-	*slot_out = second;
+	if (!durable_slot_unchanged(&first, &second) || second.slot.status > (uint8)TT_SLOT_RECYCLABLE
+		|| second.slot.xid != xid || second.slot.wrap != expected_wrap)
+		return false;
+
+	memcpy(slot_out, &second.slot, sizeof(*slot_out));
 	return true;
+}
+
+
+bool
+cluster_tt_slot_durable_read_exact_stable(uint32 segment_id, uint16 slot_offset, TransactionId xid,
+										  uint16 expected_wrap, TTSlot *slot_out)
+{
+	return durable_slot_read_exact_stable(segment_id, slot_offset, xid, expected_wrap, false, slot_out);
+}
+
+bool
+cluster_tt_slot_durable_read_exact_legacy_stable(uint32 segment_id, uint16 slot_offset,
+												 TransactionId xid, uint16 expected_wrap,
+												 TTSlot *slot_out)
+{
+	return durable_slot_read_exact_stable(segment_id, slot_offset, xid, expected_wrap, true, slot_out);
 }
 
 

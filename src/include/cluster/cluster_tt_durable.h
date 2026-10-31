@@ -271,6 +271,9 @@ extern void cluster_tt_slot_durable_abort(uint32 segment_id, uint16 slot_offset,
  *	by a later owner) or UNUSED -> false (never returns another owner's
  *	commit_scn -- spec-3.11 C5).  Returns true + *commit_scn on hit.  Callers
  *	must apply the C1b CLOG cross-check (the slot is stamped at pre-commit).
+ * Selects the actual V1/V2 stride from a complete header; V2 checksum and all
+ * slot identities must validate. This raw-xid interface grants no FullXid
+ * authority and leaves commit_scn unchanged on rejection.
  */
 extern bool cluster_tt_slot_durable_lookup(uint32 segment_id, uint16 slot_offset, TransactionId xid,
 										   uint32 expected_wrap, SCN *commit_scn);
@@ -281,11 +284,14 @@ typedef bool (*ClusterTTDurableXidCommitCheck)(TransactionId xid);
  * cluster_tt_slot_durable_lookup_committed_stable -- durable lookup variant for
  * visibility paths that need the CLOG cross-check inside the slot-read window.
  *
- * Reads the 32B TTSlot, verifies COMMITTED/exact xid/optional wrap, verifies
- * xid_committed(xid), then re-reads the same 32B slot and requires the bytes to
- * be unchanged before returning commit_scn.  This fail-closes a reader racing a
- * redo/data-file RMW of the same slot; callers that cannot tolerate a torn slot
- * must use this API instead of lookup()+external CLOG check.
+ * Selects the slot from a complete V1/V2 header, verifies COMMITTED/exact
+ * xid/optional wrap, verifies xid_committed(xid), then re-reads the same slot.
+ * Layout, segment generation and all 32/40 slot bytes must be unchanged before
+ * returning commit_scn. V2 also requires a valid checksum and all 48 slot
+ * identities. The raw-xid API supplies no new epoch/history authority.
+ * This fail-closes a reader racing a redo/data-file RMW of the same slot.
+ * Use this API instead of lookup()+external CLOG check when a torn slot
+ * cannot be tolerated.
  */
 extern bool cluster_tt_slot_durable_lookup_committed_stable(
 	uint32 segment_id, uint16 slot_offset, TransactionId xid, uint32 expected_wrap,
@@ -293,8 +299,9 @@ extern bool cluster_tt_slot_durable_lookup_committed_stable(
 
 /*
  * cluster_tt_slot_durable_read_exact_stable -- R4 D5 exact durable slot
- * snapshot.  Reads the same 32-byte on-disk slot twice and publishes it only
- * when both byte images are identical, the status is in the closed on-disk
+ * snapshot. Selects the explicit V1/V2 layout from complete header reads,
+ * requiring unchanged layout/generation and all 32/40 slot bytes. Publishes
+ * only the original 32-byte prefix when the status is in the closed on-disk
  * domain, and both images match the exact xid/wrap identity.  This API never
  * scans by xid and never writes durable or shared state.  On every rejection,
  * a non-NULL slot_out remains canonical zero.
@@ -302,6 +309,12 @@ extern bool cluster_tt_slot_durable_lookup_committed_stable(
 extern bool cluster_tt_slot_durable_read_exact_stable(uint32 segment_id, uint16 slot_offset,
 													  TransactionId xid, uint16 expected_wrap,
 													  TTSlot *slot_out);
+
+/* Same zero-on-refusal stable snapshot, strictly V1. Legacy WAL mutation
+ * consumers must use this entry point: the generic read-only V2 prefix is
+ * never permission to invoke a fixed-32B writer. */
+extern bool cluster_tt_slot_durable_read_exact_legacy_stable(
+	uint32 segment_id, uint16 slot_offset, TransactionId xid, uint16 expected_wrap, TTSlot *slot_out);
 
 /*
  * Recovery-only typed TT mutations.  Unlike the normal transaction helpers,
