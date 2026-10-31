@@ -192,6 +192,54 @@ cluster_tt_recovery_resolve_active_slots(void)
 	return resolved;
 }
 
+/* Startup's read-only consumers must select the actual layout before
+ * indexing any slot. Validate all TT40 identities before observing an SCN
+ * or handing a chain to the existing nonshared rollback owner. This is not
+ * permission to use the legacy ACTIVE abort writer on a TT40 page. */
+static bool
+startup_scan_header_valid(const char block[BLCKSZ], uint32 segment_id, uint8 owner,
+						  bool *is_v2)
+{
+	const UndoSegmentHeaderDataV2 *header = (const UndoSegmentHeaderDataV2 *)block;
+
+	*is_v2 = false;
+	if (segment_id == 0 || owner == 0 || owner > UNDO_OWNER_INSTANCE_MAX)
+		return false;
+	if (!UndoSegmentHeaderV2_identity_matches(block, BLCKSZ, segment_id, owner))
+		return UndoSegmentHeader_identity_matches(block, segment_id, owner);
+	if (header->wrap_count == UINT32_MAX)
+		return false;
+	for (uint16 i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
+		const TTSlotV2 *slot = &header->tt_slots[i];
+
+		if (slot->status > TT_SLOT_RECYCLABLE || (slot->flags & ~TT_SLOT_FLAGS_KNOWN) != 0
+			|| slot->wrap == TT_WRAP_INVALID || slot->commit_scn == UINT64_MAX)
+			return false;
+		if (slot->status == TT_SLOT_UNUSED) {
+			if (slot->original_full_xid != 0)
+				return false;
+		} else if (!TransactionIdIsNormal(slot->xid) || slot->original_full_xid == UINT64_MAX
+				   || (TransactionId)slot->original_full_xid != slot->xid)
+			return false;
+		if (slot->status == TT_SLOT_ABORTED && SCN_VALID(slot->commit_scn))
+			return false;
+	}
+	*is_v2 = true;
+	return true;
+}
+
+static TTSlot
+startup_scan_slot(const char block[BLCKSZ], bool is_v2, uint16 offset)
+{
+	TTSlot slot;
+	Size stride = is_v2 ? sizeof(TTSlotV2) : sizeof(TTSlot);
+
+	Assert(offset < TT_SLOTS_PER_SEGMENT);
+	memcpy(&slot, block + offsetof(UndoSegmentHeaderData, tt_slots) + offset * stride,
+		   sizeof(slot));
+	return slot;
+}
+
 /*
  * cluster_tt_recovery_observe_scn_highwater -- spec-4.8 D5 (L222).
  *
@@ -234,16 +282,20 @@ cluster_tt_recovery_observe_scn_highwater(void)
 	seg_hi = seg_lo + CLUSTER_UNDO_SEGS_PER_INSTANCE - 1;
 
 	for (segment_id = seg_lo; segment_id <= seg_hi; segment_id++) {
-		UndoSegmentHeaderData *hdr;
+		bool is_v2;
 		uint16 i;
 
 		if (!cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(owner), segment_id, owner,
 										  0, blockbuf.data))
 			continue; /* absent / unreadable -> skip */
 
-		hdr = (UndoSegmentHeaderData *)blockbuf.data;
+		if (!startup_scan_header_valid(blockbuf.data, segment_id, owner, &is_v2))
+			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("invalid TT block zero in startup SCN scan of segment %u",
+								   segment_id)));
 		for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
-			const TTSlot *s = &hdr->tt_slots[i];
+			TTSlot slot = startup_scan_slot(blockbuf.data, is_v2, i);
+			const TTSlot *s = &slot;
 
 			if (s->status != (uint8)TT_SLOT_COMMITTED)
 				continue;
@@ -494,16 +546,20 @@ cluster_tt_recovery_physical_rollback(void)
 	seg_hi = seg_lo + CLUSTER_UNDO_SEGS_PER_INSTANCE - 1;
 
 	for (segment_id = seg_lo; segment_id <= seg_hi; segment_id++) {
-		UndoSegmentHeaderData *hdr;
+		bool is_v2;
 		uint16 i;
 
 		if (!cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(owner), segment_id, owner,
 										  0, blockbuf.data))
 			continue; /* absent / unreadable -> skip */
 
-		hdr = (UndoSegmentHeaderData *)blockbuf.data;
+		if (!startup_scan_header_valid(blockbuf.data, segment_id, owner, &is_v2))
+			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("invalid TT block zero in startup rollback scan of segment %u",
+								   segment_id)));
 		for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
-			const TTSlot *s = &hdr->tt_slots[i];
+			TTSlot slot = startup_scan_slot(blockbuf.data, is_v2, i);
+			const TTSlot *s = &slot;
 
 			if (s->status != (uint8)TT_SLOT_ABORTED)
 				continue;

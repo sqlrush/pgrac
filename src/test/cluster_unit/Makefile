@@ -8009,9 +8009,13 @@ test_cluster_tt_normal_start: test_cluster_tt_normal_start.c unit_test.h \
 test_cluster_tt_rollback_entry.inc: $(top_srcdir)/src/backend/cluster/cluster_tt_recovery.c Makefile
 	awk '/^typedef struct TTRevertExpect/ { fields=1; types++ } \
 	     fields { print } /^} TTRevertExpect;/ { fields=0 } \
-	     /^cluster_tt_recovery_physical_rollback\(/ { print "int"; emit=1; found++ } \
+	     /^startup_scan_header_valid\(/ { print "static bool"; emit=1; helpers++ } \
+	     /^startup_scan_slot\(/ { print "static TTSlot"; emit=1; helpers++ } \
+	     /^cluster_tt_recovery_(observe_scn_highwater|physical_rollback)\(/ \
+	         { print "int"; emit=1; found++ } \
 	     emit { print } emit && /^}/ { emit=0 } \
-	     END { if (types != 1 || found != 1) exit 1 }' $< > $@
+	     END { if (types != 1 || helpers != 2 || found != 2) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
 
 test_cluster_tt_rollback_entry: test_cluster_tt_rollback_entry.c test_cluster_tt_durable.c \
 		unit_test.h test_cluster_tt_rollback_entry.inc $(CLUSTER_TT_DURABLE_O)
