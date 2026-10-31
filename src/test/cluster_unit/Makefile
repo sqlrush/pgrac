@@ -9566,11 +9566,16 @@ clean distclean maintainer-clean: clean-analyze-preflight
 clean-analyze-preflight:
 	rm -f test_cluster_analyze_preflight.inc test_cluster_analyze_preflight.inc.tmp
 
-# Complete native LO deletion entry; dependency deletion is a negative boundary.
+# Complete native LO mutation entries; operation bodies stop at ERROR-only leaves.
 test_cluster_largeobject_preflight.inc: $(top_srcdir)/src/backend/storage/large_object/inv_api.c \
 		$(top_srcdir)/src/backend/tcop/utility.c Makefile
-	awk '/^inv_drop\(/ { print "int"; emit=1; found++ } emit { print } \
-	     emit && /^}/ { emit=0 } END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
+	awk '/^PreflightClusterSharedLargeObjectWrite\(/ { print "static void"; emit=1; helpers++ } \
+	     /^getdatafield\(/ { print "static void"; emit=1; found++ } \
+	     /^inv_create\(/ { print "Oid"; emit=1; found++ } \
+	     /^inv_(drop|write)\(/ { print "int"; emit=1; found++ } \
+	     /^inv_truncate\(/ { print "void"; emit=1; found++ } emit { print } \
+	     emit && /^}/ { emit=0 } \
+	     END { if (found != 5 || helpers > 1 || emit) exit 1 }' $< > $@.tmp
 	awk '/^PreventCommand(IfReadOnly|IfParallelMode|DuringRecovery)\(/ \
 	     { print "void"; emit=1; found++ } emit { print } \
 	     emit && /^}/ { emit=0 } END { if (found != 3 || emit) exit 1 }' \

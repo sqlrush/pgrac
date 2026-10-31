@@ -73,6 +73,36 @@ static Relation lo_heap_r = NULL;
 static Relation lo_index_r = NULL;
 
 
+#ifdef USE_PGRAC_CLUSTER
+/* Finish the original binding before LO mutation takes catalog/object locks. */
+static void
+PreflightClusterSharedLargeObjectWrite(const char *command, bool create)
+{
+	if (cluster_shared_catalog && cluster_storage_mode_enabled()) {
+		ClusterCanonicalTxnBinding binding;
+		TransactionId current_xid;
+		const char *action = create ? "creation" : "alteration";
+
+		PreventCommandIfReadOnly(command);
+		PreventCommandIfParallelMode(command);
+		PreventCommandDuringRecovery(command);
+		if (IsSubTransaction())
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("shared catalog %s does not support subtransactions", action)));
+		current_xid = GetCurrentTransactionIdIfAny();
+		if (TransactionIdIsValid(current_xid)
+			&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("shared catalog top-level transaction identity mismatch")));
+		if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("canonical ACTIVE publication failed before shared catalog %s", action)));
+	}
+}
+#endif
+
+
 /*
  * Open pg_largeobject and its index, if not already done in current xact
  */
@@ -218,6 +248,10 @@ inv_create(Oid lobjId)
 {
 	Oid			lobjId_new;
 
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedLargeObjectWrite("lo_create()", true);
+#endif
+
 	/*
 	 * Create a new largeobject with empty data pages
 	 */
@@ -357,27 +391,7 @@ inv_drop(Oid lobjId)
 	ObjectAddress object;
 
 #ifdef USE_PGRAC_CLUSTER
-	/* Bind before dependency deletion takes the target's strong object lock. */
-	if (cluster_shared_catalog && cluster_storage_mode_enabled()) {
-		ClusterCanonicalTxnBinding binding;
-		TransactionId current_xid;
-
-		PreventCommandIfReadOnly("lo_unlink()");
-		PreventCommandIfParallelMode("lo_unlink()");
-		PreventCommandDuringRecovery("lo_unlink()");
-		if (IsSubTransaction())
-			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							errmsg("shared catalog alteration does not support subtransactions")));
-		current_xid = GetCurrentTransactionIdIfAny();
-		if (TransactionIdIsValid(current_xid)
-			&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
-			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
-							errmsg("shared catalog top-level transaction identity mismatch")));
-		if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("canonical ACTIVE publication failed before shared catalog alteration")));
-	}
+	PreflightClusterSharedLargeObjectWrite("lo_unlink()", false);
 #endif
 
 	/*
@@ -657,6 +671,10 @@ inv_write(LargeObjectDesc *obj_desc, const char *buf, int nbytes)
 				 errmsg("invalid large object write request size: %d",
 						nbytes)));
 
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedLargeObjectWrite("lowrite()", false);
+#endif
+
 	open_lo_relation();
 
 	indstate = CatalogOpenIndexes(lo_heap_r);
@@ -846,6 +864,10 @@ inv_truncate(LargeObjectDesc *obj_desc, int64 len)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg_internal("invalid large object truncation target: " INT64_FORMAT,
 								 len)));
+
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedLargeObjectWrite("lo_truncate()", false);
+#endif
 
 	open_lo_relation();
 
