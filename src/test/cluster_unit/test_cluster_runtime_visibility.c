@@ -448,6 +448,112 @@ UT_TEST(test_ttproof_exact_identity_failclosed)
 				 CLUSTER_VIS_TT_PROOF_NONE);
 }
 
+static UndoSegmentHeaderDataV2 *
+mk_exact_header_v2(void)
+{
+	UndoSegmentHeaderDataV2 *hdr;
+
+	mk_exact_header(PROOF_SEG, PROOF_OWNER, 41);
+	hdr = (UndoSegmentHeaderDataV2 *)exact_proof_block.data;
+	hdr->tt_layout_version = CLUSTER_UNDO_TT_LAYOUT_V2;
+	hdr->tt_slot_bytes = sizeof(TTSlotV2);
+	hdr->wrap_count = 41;
+	return hdr;
+}
+
+UT_TEST(test_ttproof_v2_scan_and_exact_all_slots)
+{
+	for (uint32 i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
+		UndoSegmentHeaderDataV2 *hdr = mk_exact_header_v2();
+		SCN scn = InvalidScn;
+		uint16 wrap = TT_WRAP_INVALID;
+		int matches = -1;
+		ClusterVisTtProof proof = CLUSTER_VIS_TT_PROOF_NONE;
+
+		hdr->tt_slots[i].xid = 1000;
+		hdr->tt_slots[i].wrap = 12;
+		hdr->tt_slots[i].status = i % 2 ? TT_SLOT_ABORTED : TT_SLOT_COMMITTED;
+		hdr->tt_slots[i].commit_scn = i % 2 ? InvalidScn : (SCN)777;
+		hdr->tt_slots[i].original_full_xid = ((uint64)i << 32) | 1000;
+		UT_ASSERT_EQ(cluster_vis_tt_block_xid_scan(exact_proof_block.data, PROOF_SEG,
+			PROOF_OWNER, 1000, &matches, &proof, &scn, &wrap), CLUSTER_VIS_TT_BLOCK_SCAN_OK);
+		UT_ASSERT_EQ(matches, 1);
+		UT_ASSERT_EQ(proof, i % 2 ? CLUSTER_VIS_TT_PROOF_ABORTED : CLUSTER_VIS_TT_PROOF_COMMITTED);
+		UT_ASSERT_EQ(scn, i % 2 ? InvalidScn : (SCN)777);
+		UT_ASSERT_EQ(wrap, 12);
+		UT_ASSERT_EQ(cluster_vis_tt_block_exact_proof(exact_proof_block.data, PROOF_SEG,
+			PROOF_OWNER, 41, i, 1000, 12, &scn), proof);
+		UT_ASSERT_EQ(scn, i % 2 ? InvalidScn : (SCN)777);
+	}
+}
+
+UT_TEST(test_ttproof_v2_scan_ambiguity_and_poison)
+{
+	UndoSegmentHeaderDataV2 *hdr = mk_exact_header_v2();
+	int matches;
+	ClusterVisTtProof proof;
+	SCN scn;
+	uint16 wrap;
+
+	for (uint32 i = 0; i < 2; i++) {
+		hdr->tt_slots[i].xid = 1000;
+		hdr->tt_slots[i].status = TT_SLOT_COMMITTED;
+		hdr->tt_slots[i].commit_scn = 777;
+		hdr->tt_slots[i].original_full_xid = ((uint64)(i + 1) << 32) | 1000;
+	}
+	UT_ASSERT_EQ(cluster_vis_tt_block_xid_scan(exact_proof_block.data, PROOF_SEG,
+		PROOF_OWNER, 1000, &matches, &proof, &scn, &wrap), CLUSTER_VIS_TT_BLOCK_SCAN_OK);
+	UT_ASSERT_EQ(matches, 2);
+	UT_ASSERT_EQ(proof, CLUSTER_VIS_TT_PROOF_NONE);
+	UT_ASSERT_EQ(scn, InvalidScn);
+	UT_ASSERT_EQ(wrap, TT_WRAP_INVALID);
+	/* An unrelated occupied slot with unknown identity poisons the complete scan. */
+	hdr->tt_slots[47].xid = 2000;
+	hdr->tt_slots[47].status = TT_SLOT_ACTIVE;
+	hdr->tt_slots[47].original_full_xid = 0;
+	UT_ASSERT_EQ(cluster_vis_tt_block_xid_scan(exact_proof_block.data, PROOF_SEG,
+		PROOF_OWNER, 1000, &matches, &proof, &scn, &wrap), CLUSTER_VIS_TT_BLOCK_SCAN_POISONED);
+	UT_ASSERT_EQ(matches, 0);
+	UT_ASSERT_EQ(proof, CLUSTER_VIS_TT_PROOF_NONE);
+	UT_ASSERT_EQ(scn, InvalidScn);
+	UT_ASSERT_EQ(wrap, TT_WRAP_INVALID);
+}
+
+UT_TEST(test_ttproof_unknown_layout_poison)
+{
+	for (int variant = 0; variant < 5; variant++) {
+		UndoSegmentHeaderDataV2 *hdr = mk_exact_header_v2();
+		int matches = -1;
+		ClusterVisTtProof proof = CLUSTER_VIS_TT_PROOF_COMMITTED;
+		SCN scn = 777;
+		uint16 wrap = 12;
+
+		switch (variant) {
+		case 0:
+			hdr->tt_layout_version = 3;
+			break;
+		case 1:
+			hdr->tt_slot_bytes = 32;
+			break;
+		case 2:
+			hdr->tt_layout_reserved = 1;
+			break;
+		case 3:
+			hdr->tt_layout_version = 0;
+			break;
+		case 4:
+			memset((char *)hdr + 57, 0, 7); ((char *)hdr)[63] = 1;
+			break;
+		}
+		UT_ASSERT_EQ(cluster_vis_tt_block_xid_scan(exact_proof_block.data, PROOF_SEG,
+			PROOF_OWNER, 1000, &matches, &proof, &scn, &wrap), CLUSTER_VIS_TT_BLOCK_SCAN_POISONED);
+		UT_ASSERT_EQ(matches, 0);
+		UT_ASSERT_EQ(proof, CLUSTER_VIS_TT_PROOF_NONE);
+		UT_ASSERT_EQ(scn, InvalidScn);
+		UT_ASSERT_EQ(wrap, TT_WRAP_INVALID);
+	}
+}
+
 /* Exactly-one terminal match resolves; UNUSED same-xid bytes are ignored. */
 UT_TEST(test_ttproof_committed_and_aborted)
 {
@@ -1337,7 +1443,7 @@ UT_TEST(test_page_exact_locator_preserves_selected_slot)
 int
 main(void)
 {
-	UT_PLAN(32);
+	UT_PLAN(35);
 	UT_RUN(test_covers_when_epoch_match_and_scn_ge_demand);
 	UT_RUN(test_covers_ignores_cross_thread_lsn);
 	UT_RUN(test_failclosed_when_epoch_differs);
@@ -1352,6 +1458,9 @@ main(void)
 	UT_RUN(test_ttproof_committed_and_aborted);
 	UT_RUN(test_ttproof_exact_identity);
 	UT_RUN(test_ttproof_exact_identity_failclosed);
+	UT_RUN(test_ttproof_v2_scan_and_exact_all_slots);
+	UT_RUN(test_ttproof_v2_scan_ambiguity_and_poison);
+	UT_RUN(test_ttproof_unknown_layout_poison);
 	UT_RUN(test_ttproof_committed_is_evidence_not_verdict);
 	UT_RUN(test_ttproof_recycled_same_xid_reports_bumped_wrap_not_gated);
 	UT_RUN(test_ttproof_zero_match_active_invalid_scn);

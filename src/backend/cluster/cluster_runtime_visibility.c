@@ -3813,9 +3813,10 @@ cluster_runtime_visibility_remote_exact_tt_batch(int origin_node, uint32 segment
 		return false;
 
 	for (uint32 i = 0; i < request_count; i++) {
-		batch.proofs[i] = cluster_vis_tt_block_exact_proof(
+		batch.proofs[i] = cluster_vis_tt_block_exact_fact(
 			page.data, segment_id, (uint8)((uint32)origin_node + 1), segment_generation,
-			requests[i].slot_offset, requests[i].xid, requests[i].slot_wrap, &batch.commit_scns[i]);
+			requests[i].slot_offset, requests[i].xid, requests[i].slot_wrap, &batch.commit_scns[i],
+			&batch.original_full_xids[i]);
 		if (batch.proofs[i] == CLUSTER_VIS_TT_PROOF_NONE)
 			return false;
 	}

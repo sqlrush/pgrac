@@ -34,6 +34,7 @@
 #ifndef CLUSTER_RUNTIME_VISIBILITY_H
 #define CLUSTER_RUNTIME_VISIBILITY_H
 
+#include "access/transam.h"
 #include "access/xlogdefs.h"
 #include "cluster/cluster_itl_slot.h" /* UBA */
 #include "cluster/cluster_scn.h"	  /* SCN */
@@ -435,6 +436,15 @@ extern ClusterVisTtProof cluster_vis_tt_block_exact_proof(
 	uint32 expected_segment_generation, uint16 expected_slot_offset,
 	TransactionId expected_xid, uint16 expected_wrap, SCN *out_commit_scn);
 
+/* Same exact predicate, additionally copying the persisted TT40 FullXid.
+ * TT32 leaves it invalid; no epoch is inferred. NONE clears both outputs.
+ * A known FullXid from an independent carrier must still match in full. */
+extern ClusterVisTtProof cluster_vis_tt_block_exact_fact(
+	const char *block, uint32 expected_segment_id, uint8 expected_owner_instance,
+	uint32 expected_segment_generation, uint16 expected_slot_offset,
+	TransactionId expected_xid, uint16 expected_wrap, SCN *out_commit_scn,
+	FullTransactionId *out_original_full_xid);
+
 /* A local, bounded same-header batch; no wire or persistent layout. */
 #define CLUSTER_VIS_TT_EXACT_BATCH_MAX CLUSTER_ITL_INITRANS_DEFAULT
 
@@ -448,6 +458,8 @@ typedef struct ClusterVisTtExactBatch {
 	uint32 count;
 	ClusterVisTtProof proofs[CLUSTER_VIS_TT_EXACT_BATCH_MAX];
 	SCN commit_scns[CLUSTER_VIS_TT_EXACT_BATCH_MAX];
+	/* Same exact TT40 bytes; legacy TT32 leaves these invalid. No grant. */
+	FullTransactionId original_full_xids[CLUSTER_VIS_TT_EXACT_BATCH_MAX];
 	ClusterLiveAuthority authority;
 } ClusterVisTtExactBatch;
 
@@ -458,6 +470,8 @@ typedef struct ClusterVisTtExactBatch {
  * in request order; any missing/mismatching fact refuses the complete batch
  * and zeroes out.  Input and output must not overlap.  Equal xids are never
  * coalesced: each slot/wrap is checked independently against the same bytes.
+ * TT40 also returns that exact slot's persisted FullXid; TT32 leaves it
+ * invalid. A known caller FullXid must match in full before consumption.
  *
  * These are TT facts, not row terminal verdicts: COMMITTED remains precommit
  * evidence requiring the origin's C1b finalization.  The caller must still

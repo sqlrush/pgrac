@@ -126,6 +126,49 @@ cluster_vis_committed_bound_admissible(SCN horizon_scn, SCN read_scn)
 	return scn_time_cmp(horizon_scn, read_scn) <= 0;
 }
 
+/* Complete aligned header only; no checksum/current/terminal authority. */
+static bool
+cluster_vis_tt_v2_header_matches(const char *block, uint32 segment_id, uint8 owner)
+{
+#ifdef USE_PGRAC_CLUSTER
+	return UndoSegmentHeaderV2_identity_matches(block, BLCKSZ, segment_id, owner);
+#else
+	const UndoSegmentHeaderDataV2 *hdr = (const UndoSegmentHeaderDataV2 *)block;
+
+	/* Standalone policy builds enforce the same explicit framing first. */
+	return hdr->tt_layout_version == CLUSTER_UNDO_TT_LAYOUT_V2
+		   && hdr->tt_slot_bytes == CLUSTER_UNDO_TT_SLOT_V2_BYTES && hdr->tt_layout_reserved == 0
+		   && (hdr->pd_flags & PD_UNDO_SEG_HEADER) != 0
+		   && PageGetPageSize((Page)block) == BLCKSZ
+		   && PageGetPageLayoutVersion((Page)block) == PG_PAGE_LAYOUT_VERSION
+		   && segment_id != 0 && owner != 0 && owner <= UNDO_OWNER_INSTANCE_MAX
+		   && hdr->segment_id == segment_id && hdr->segment_size_bytes == UNDO_SEGMENT_SIZE_BYTES
+		   && hdr->owner_instance == owner && hdr->tt_slots_count == TT_SLOTS_PER_SEGMENT
+		   && hdr->tt_next_free_slot <= TT_SLOTS_PER_SEGMENT
+		   && hdr->tt_active_count <= TT_SLOTS_PER_SEGMENT
+		   && (hdr->segment_state == SEGMENT_ALLOCATED || hdr->segment_state == SEGMENT_ACTIVE
+			   || hdr->segment_state == SEGMENT_COMMITTED || hdr->segment_state == SEGMENT_RECYCLABLE);
+#endif
+}
+
+static bool
+cluster_vis_tt_v2_slot_copy(const TTSlotV2 *source, TTSlot *out)
+{
+	if (source->status > TT_SLOT_RECYCLABLE || (source->flags & ~TT_SLOT_FLAGS_KNOWN) != 0
+		|| source->wrap == TT_WRAP_INVALID || source->commit_scn == UINT64_MAX)
+		return false;
+	if (source->status == TT_SLOT_UNUSED) {
+		if (source->original_full_xid != 0)
+			return false;
+	} else if (!TransactionIdIsNormal(source->xid) || source->original_full_xid == UINT64_MAX
+			   || (TransactionId)source->original_full_xid != source->xid)
+		return false;
+	if (source->status == TT_SLOT_ABORTED && SCN_VALID(source->commit_scn))
+		return false;
+	memcpy(out, source, sizeof(*out));
+	return true;
+}
+
 /*
  * cluster_vis_tt_block_xid_scan
  *
@@ -149,8 +192,11 @@ cluster_vis_tt_block_xid_scan(const char *block, uint32 expected_segment_id,
 							  ClusterVisTtProof *out_proof, SCN *out_commit_scn, uint16 *out_wrap)
 {
 	const UndoSegmentHeaderData *hdr;
+	const UndoSegmentHeaderDataV2 *v2;
+	const uint8 legacy_reserved[7] = { 0 };
+	bool is_v2;
 	int nmatch = 0;
-	const TTSlot *match = NULL;
+	TTSlot match = { 0 };
 
 	if (out_nmatch != NULL)
 		*out_nmatch = 0;
@@ -173,6 +219,13 @@ cluster_vis_tt_block_xid_scan(const char *block, uint32 expected_segment_id,
 	 * means the scan below would not be evidence about `xid` — poisoned.
 	 */
 	hdr = (const UndoSegmentHeaderData *)block;
+	v2 = (const UndoSegmentHeaderDataV2 *)block;
+	is_v2 = v2->tt_layout_version == CLUSTER_UNDO_TT_LAYOUT_V2;
+	if (is_v2) {
+		if (!cluster_vis_tt_v2_header_matches(block, expected_segment_id, expected_owner_instance))
+			return CLUSTER_VIS_TT_BLOCK_SCAN_POISONED;
+	} else if (memcmp(hdr->_pad_57, legacy_reserved, sizeof(legacy_reserved)) != 0)
+		return CLUSTER_VIS_TT_BLOCK_SCAN_POISONED;
 	if (hdr->segment_id != expected_segment_id)
 		return CLUSTER_VIS_TT_BLOCK_SCAN_POISONED;
 	if (hdr->owner_instance != expected_owner_instance)
@@ -181,18 +234,24 @@ cluster_vis_tt_block_xid_scan(const char *block, uint32 expected_segment_id,
 		return CLUSTER_VIS_TT_BLOCK_SCAN_POISONED;
 
 	for (int i = 0; i < (int)hdr->tt_slots_count; i++) {
-		const TTSlot *slot = &hdr->tt_slots[i];
+		TTSlot slot;
+
+		if (is_v2) {
+			if (!cluster_vis_tt_v2_slot_copy(&v2->tt_slots[i], &slot))
+				return CLUSTER_VIS_TT_BLOCK_SCAN_POISONED;
+		} else
+			slot = hdr->tt_slots[i];
 
 		/*
 		 * Any status byte outside the known range poisons the whole block:
 		 * we cannot claim to have understood a TT whose slots we cannot
 		 * parse (refuse, never PANIC).
 		 */
-		if (slot->status > (uint8)TT_SLOT_RECYCLABLE)
+		if (slot.status > (uint8)TT_SLOT_RECYCLABLE)
 			return CLUSTER_VIS_TT_BLOCK_SCAN_POISONED;
 
 		/* UNUSED carries no transaction; its xid bytes are placeholder. */
-		if (slot->status == (uint8)TT_SLOT_UNUSED)
+		if (slot.status == (uint8)TT_SLOT_UNUSED)
 			continue;
 
 		/*
@@ -200,7 +259,7 @@ cluster_vis_tt_block_xid_scan(const char *block, uint32 expected_segment_id,
 		 * counts as a match candidate: same-xid residue in a RECYCLABLE slot
 		 * is ambiguity evidence even though it can never itself resolve.
 		 */
-		if (slot->xid == xid) {
+		if (slot.xid == xid) {
 			nmatch++;
 			match = slot;
 		}
@@ -210,18 +269,18 @@ cluster_vis_tt_block_xid_scan(const char *block, uint32 expected_segment_id,
 		*out_nmatch = nmatch;
 
 	if (nmatch == 1) {
-		if (match->status == (uint8)TT_SLOT_COMMITTED && SCN_VALID(match->commit_scn)) {
+		if (match.status == (uint8)TT_SLOT_COMMITTED && SCN_VALID(match.commit_scn)) {
 			if (out_proof != NULL)
 				*out_proof = CLUSTER_VIS_TT_PROOF_COMMITTED;
 			if (out_commit_scn != NULL)
-				*out_commit_scn = match->commit_scn;
+				*out_commit_scn = match.commit_scn;
 			if (out_wrap != NULL)
-				*out_wrap = match->wrap;
-		} else if (match->status == (uint8)TT_SLOT_ABORTED) {
+				*out_wrap = match.wrap;
+		} else if (match.status == (uint8)TT_SLOT_ABORTED) {
 			if (out_proof != NULL)
 				*out_proof = CLUSTER_VIS_TT_PROOF_ABORTED;
 			if (out_wrap != NULL)
-				*out_wrap = match->wrap;
+				*out_wrap = match.wrap;
 		}
 		/* ACTIVE / RECYCLABLE / COMMITTED-without-scn: found (nmatch=1) but
 		 * in-doubt — proof stays NONE. */
@@ -257,7 +316,7 @@ cluster_vis_tt_block_positive_proof(const char *block, uint32 expected_segment_i
 }
 
 /*
- * cluster_vis_tt_block_exact_proof
+ * cluster_vis_tt_block_exact_fact
  *
  * 2.14 M1 level-3 proof for the authority-separated path.  The caller has
  * already carried the exact physical binding (segment generation, slot
@@ -267,17 +326,24 @@ cluster_vis_tt_block_positive_proof(const char *block, uint32 expected_segment_i
  * Pure; no I/O, locks, shmem, or terminal memo side effects.
  */
 ClusterVisTtProof
-cluster_vis_tt_block_exact_proof(const char *block, uint32 expected_segment_id,
+cluster_vis_tt_block_exact_fact(const char *block, uint32 expected_segment_id,
 								 uint8 expected_owner_instance,
 								 uint32 expected_segment_generation,
 								 uint16 expected_slot_offset, TransactionId expected_xid,
-								 uint16 expected_wrap, SCN *out_commit_scn)
+								 uint16 expected_wrap, SCN *out_commit_scn,
+								 FullTransactionId *out_original_full_xid)
 {
 	const UndoSegmentHeaderData *hdr;
-	const TTSlot *slot;
+	const UndoSegmentHeaderDataV2 *v2;
+	const uint8 legacy_reserved[7] = { 0 };
+	TTSlot slot;
+	FullTransactionId original = InvalidFullTransactionId;
+	bool is_v2;
 
 	if (out_commit_scn != NULL)
 		*out_commit_scn = InvalidScn;
+	if (out_original_full_xid != NULL)
+		*out_original_full_xid = InvalidFullTransactionId;
 
 	/* These are the wire/ref domains.  Refuse widened or sentinel values. */
 	if (block == NULL || expected_segment_id == 0 || expected_segment_id > UINT16_MAX
@@ -288,55 +354,85 @@ cluster_vis_tt_block_exact_proof(const char *block, uint32 expected_segment_id,
 		|| !TransactionIdIsNormal(expected_xid) || expected_wrap > TT_WRAP_MAX)
 		return CLUSTER_VIS_TT_PROOF_NONE;
 
-#ifdef USE_PGRAC_CLUSTER
-	if (!UndoSegmentHeader_identity_matches(block, expected_segment_id, expected_owner_instance))
-		return CLUSTER_VIS_TT_PROOF_NONE;
-#else
-	/* Standalone policy builds retain the same page/identity refusal. */
-	{
-		const PageHeader ph = (PageHeader)block;
-		const UndoSegmentHeaderData *candidate = (const UndoSegmentHeaderData *)block;
-
-		if ((ph->pd_flags & PD_UNDO_SEG_HEADER) == 0
-			|| PageGetPageSize((Page)block) != BLCKSZ
-			|| PageGetPageLayoutVersion((Page)block) != PG_PAGE_LAYOUT_VERSION
-			|| candidate->segment_id != expected_segment_id
-			|| candidate->segment_size_bytes != UNDO_SEGMENT_SIZE_BYTES
-			|| candidate->owner_instance != expected_owner_instance
-			|| candidate->tt_slots_count != TT_SLOTS_PER_SEGMENT
-			|| (candidate->segment_state != SEGMENT_ALLOCATED
-				&& candidate->segment_state != SEGMENT_ACTIVE
-				&& candidate->segment_state != SEGMENT_COMMITTED
-				&& candidate->segment_state != SEGMENT_RECYCLABLE))
+	hdr = (const UndoSegmentHeaderData *)block;
+	v2 = (const UndoSegmentHeaderDataV2 *)block;
+	is_v2 = v2->tt_layout_version == CLUSTER_UNDO_TT_LAYOUT_V2;
+	if (is_v2) {
+		if (!cluster_vis_tt_v2_header_matches(block, expected_segment_id, expected_owner_instance)
+			|| v2->wrap_count != expected_segment_generation
+			|| !cluster_vis_tt_v2_slot_copy(&v2->tt_slots[expected_slot_offset], &slot))
 			return CLUSTER_VIS_TT_PROOF_NONE;
-	}
+		original = FullTransactionIdFromU64(v2->tt_slots[expected_slot_offset].original_full_xid);
+	} else {
+		if (memcmp(hdr->_pad_57, legacy_reserved, sizeof(legacy_reserved)) != 0)
+			return CLUSTER_VIS_TT_PROOF_NONE;
+#ifdef USE_PGRAC_CLUSTER
+		if (!UndoSegmentHeader_identity_matches(block, expected_segment_id, expected_owner_instance))
+			return CLUSTER_VIS_TT_PROOF_NONE;
+#else
+		/* Standalone policy builds retain the same page/identity refusal. */
+		{
+			const PageHeader ph = (PageHeader)block;
+			const UndoSegmentHeaderData *candidate = (const UndoSegmentHeaderData *)block;
+
+			if ((ph->pd_flags & PD_UNDO_SEG_HEADER) == 0
+				|| PageGetPageSize((Page)block) != BLCKSZ
+				|| PageGetPageLayoutVersion((Page)block) != PG_PAGE_LAYOUT_VERSION
+				|| candidate->segment_id != expected_segment_id
+				|| candidate->segment_size_bytes != UNDO_SEGMENT_SIZE_BYTES
+				|| candidate->owner_instance != expected_owner_instance
+				|| candidate->tt_slots_count != TT_SLOTS_PER_SEGMENT
+				|| (candidate->segment_state != SEGMENT_ALLOCATED
+					&& candidate->segment_state != SEGMENT_ACTIVE
+					&& candidate->segment_state != SEGMENT_COMMITTED
+					&& candidate->segment_state != SEGMENT_RECYCLABLE))
+				return CLUSTER_VIS_TT_PROOF_NONE;
+		}
 #endif
 
-	hdr = (const UndoSegmentHeaderData *)block;
-	if (hdr->wrap_count != expected_segment_generation)
+		if (hdr->wrap_count != expected_segment_generation)
+			return CLUSTER_VIS_TT_PROOF_NONE;
+		slot = hdr->tt_slots[expected_slot_offset];
+	}
+
+	if (slot.xid != expected_xid || slot.wrap != expected_wrap
+		|| (slot.flags & (uint8)~TT_SLOT_FLAGS_KNOWN) != 0
+		|| slot.status > TT_SLOT_RECYCLABLE)
 		return CLUSTER_VIS_TT_PROOF_NONE;
 
-	slot = &hdr->tt_slots[expected_slot_offset];
-	if (slot->xid != expected_xid || slot->wrap != expected_wrap
-		|| (slot->flags & (uint8)~TT_SLOT_FLAGS_KNOWN) != 0
-		|| slot->status > TT_SLOT_RECYCLABLE)
-		return CLUSTER_VIS_TT_PROOF_NONE;
-
-	switch (slot->status) {
+	switch (slot.status) {
 	case TT_SLOT_COMMITTED:
-		if (!SCN_VALID(slot->commit_scn))
+		if (!SCN_VALID(slot.commit_scn))
 			return CLUSTER_VIS_TT_PROOF_NONE;
 		if (out_commit_scn != NULL)
-			*out_commit_scn = slot->commit_scn;
+			*out_commit_scn = slot.commit_scn;
+		if (out_original_full_xid != NULL)
+			*out_original_full_xid = original;
 		return CLUSTER_VIS_TT_PROOF_COMMITTED;
 	case TT_SLOT_ABORTED:
 		/* An abort carries no commit SCN; any residue is ambiguous. */
-		return SCN_VALID(slot->commit_scn) ? CLUSTER_VIS_TT_PROOF_NONE
-										 : CLUSTER_VIS_TT_PROOF_ABORTED;
+		if (SCN_VALID(slot.commit_scn))
+			return CLUSTER_VIS_TT_PROOF_NONE;
+		if (out_original_full_xid != NULL)
+			*out_original_full_xid = original;
+		return CLUSTER_VIS_TT_PROOF_ABORTED;
 	default:
 		/* UNUSED / ACTIVE / RECYCLABLE are non-terminal or unbound. */
 		return CLUSTER_VIS_TT_PROOF_NONE;
 	}
+}
+
+/* Legacy API keeps its result shape and shares the complete fact reader. */
+ClusterVisTtProof
+cluster_vis_tt_block_exact_proof(const char *block, uint32 expected_segment_id,
+								 uint8 expected_owner_instance,
+								 uint32 expected_segment_generation,
+								 uint16 expected_slot_offset, TransactionId expected_xid,
+								 uint16 expected_wrap, SCN *out_commit_scn)
+{
+	return cluster_vis_tt_block_exact_fact(block, expected_segment_id, expected_owner_instance,
+		expected_segment_generation, expected_slot_offset, expected_xid, expected_wrap,
+		out_commit_scn, NULL);
 }
 
 /*
