@@ -1811,6 +1811,133 @@ UT_TEST(test_current_origin_snapshot_never_initializes_or_outlives_original_slot
 	UT_ASSERT_EQ(lock_depth, 0);
 }
 
+/* An absent parent producer reads zero, so the same expectations fail RED. */
+static uint64
+native_wakeup_rechecks(const ClusterUndoCapacityStats *stats pg_attribute_unused())
+{
+#ifdef CLUSTER_UNDO_CAPACITY_NATIVE_RECHECK_STATS_V1
+	return stats->native_wakeup_recheck_count;
+#else
+	return 0;
+#endif
+}
+
+static void
+note_native_wakeup_recheck(void)
+{
+#ifdef CLUSTER_UNDO_CAPACITY_NATIVE_RECHECK_STATS_V1
+	cluster_undo_cleaner_note_tx_slot_recheck();
+#endif
+}
+
+UT_TEST(test_native_wakeup_recheck_counts_normal_owner_commit_and_abort_once)
+{
+	for (unsigned commit = 0; commit < 2; commit++) {
+		ClusterUndoCapacityStats stats;
+
+		start_full_active_test();
+		slot_wait_commit = commit != 0;
+		require_published_on(1);
+		UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&stats));
+		UT_ASSERT_EQ(native_wakeup_rechecks(&stats), 1);
+		UT_ASSERT_EQ(stats.wakeup_recheck_count, 0);
+		UT_ASSERT_EQ(slot_wait_calls, 1);
+		UT_ASSERT_EQ(slot_wait_begins, 1);
+		UT_ASSERT_EQ(slot_wait_ends, 1);
+		UT_ASSERT(!slot_wait_in_native);
+		UT_ASSERT_EQ(slot_wait_event, WAIT_EVENT_CLIENT_READ);
+		UT_ASSERT_EQ(cold_selection_calls + capacity_waits + lock_depth, 0);
+		require_published_on(1);
+		UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&stats));
+		UT_ASSERT_EQ(native_wakeup_rechecks(&stats), 1);
+		UT_ASSERT_EQ(slot_wait_calls, 1);
+	}
+}
+
+UT_TEST(test_native_wakeup_recheck_excludes_errors_drift_and_refusals)
+{
+	static const int errors[]
+		= { ERRCODE_QUERY_CANCELED, ERRCODE_LOCK_NOT_AVAILABLE, ERRCODE_T_R_DEADLOCK_DETECTED,
+			ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS, ERRCODE_IO_ERROR };
+	ClusterUndoCapacityStats stats;
+
+	for (unsigned i = 0; i < lengthof(errors); i++) {
+		start_full_active_test();
+		slot_wait_error = errors[i];
+		require_capacity_error(errors[i]);
+		UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&stats));
+		UT_ASSERT_EQ(native_wakeup_rechecks(&stats), 0);
+		UT_ASSERT_EQ(slot_wait_calls, 1);
+		UT_ASSERT_EQ(slot_wait_begins, 1);
+		UT_ASSERT_EQ(slot_wait_ends, 1);
+		UT_ASSERT(!slot_wait_in_native);
+		UT_ASSERT_EQ(slot_wait_event, WAIT_EVENT_CLIENT_READ);
+		UT_ASSERT_EQ(g_bind_emit_calls + cold_selection_calls + capacity_waits + lock_depth, 0);
+	}
+	for (unsigned drift = 1; drift < 3; drift++) {
+		start_full_active_test();
+		slot_wait_drift = drift;
+		UT_ASSERT(cluster_tt_local_wait_for_active_slot(1, 100));
+		UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&stats));
+		UT_ASSERT_EQ(native_wakeup_rechecks(&stats), 0);
+		UT_ASSERT_EQ(slot_wait_calls + slot_wait_begins + slot_wait_ends + g_bind_emit_calls, 0);
+		/* A generation-only drift still needs one later native handoff. */
+		require_published_on(1);
+		UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&stats));
+		UT_ASSERT_EQ(native_wakeup_rechecks(&stats), drift == 1 ? 1 : 0);
+		UT_ASSERT_EQ(slot_wait_calls, drift == 1 ? 1 : 0);
+	}
+	for (unsigned refusal = 0; refusal < 5; refusal++) {
+		start_full_active_test();
+		slot_wait_context_safe = refusal != 0;
+		slot_wait_owner_kind = refusal;
+		require_capacity_error(ERRCODE_PROGRAM_LIMIT_EXCEEDED);
+		UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&stats));
+		UT_ASSERT_EQ(native_wakeup_rechecks(&stats), 0);
+		UT_ASSERT_EQ(slot_wait_calls + slot_wait_begins + slot_wait_ends + g_bind_emit_calls, 0);
+	}
+}
+
+UT_TEST(test_native_wakeup_counter_is_initialized_unsigned_unavailable_and_lock_free)
+{
+	ClusterUndoCapacityStats stats, before;
+	UndoCleanerSharedState *saved;
+	unsigned lock_acquires;
+
+	reset_active_owner();
+	UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&stats));
+	UT_ASSERT_EQ(native_wakeup_rechecks(&stats), 0);
+	lock_acquires = slot_stats_lock_acquires;
+	note_native_wakeup_recheck();
+	note_native_wakeup_recheck();
+	UT_ASSERT_EQ(slot_stats_lock_acquires, lock_acquires);
+	UT_ASSERT_EQ(lock_depth, 0);
+	UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&stats));
+	UT_ASSERT_EQ(native_wakeup_rechecks(&stats), 2);
+	UT_ASSERT_EQ(stats.wakeup_recheck_count, 0);
+#ifdef CLUSTER_UNDO_CAPACITY_NATIVE_RECHECK_STATS_V1
+	pg_atomic_write_u64(&undo_cleaner_state->active_full_wakeup_recheck_count,
+						UINT64_C(9223372036854775809));
+	UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&stats));
+	UT_ASSERT_EQ(native_wakeup_rechecks(&stats), UINT64_C(9223372036854775809));
+#endif
+	before = stats;
+	saved = undo_cleaner_state;
+	undo_cleaner_state = NULL;
+	note_native_wakeup_recheck();
+	UT_ASSERT(!cluster_undo_cleaner_capacity_stats_snapshot(&stats));
+	UT_ASSERT_EQ(memcmp(&stats, &before, sizeof(stats)), 0);
+	undo_cleaner_state = saved;
+	UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&stats));
+	UT_ASSERT_EQ(native_wakeup_rechecks(&stats), native_wakeup_rechecks(&before));
+	UT_ASSERT(!cluster_undo_cleaner_capacity_stats_snapshot(NULL));
+	reset_active_owner();
+	UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&stats));
+	UT_ASSERT_EQ(native_wakeup_rechecks(&stats), 0);
+	printf("# capacity layout shared=%zu snapshot=%zu atomic=%zu\n",
+		   sizeof(UndoCleanerSharedState), sizeof(ClusterUndoCapacityStats), sizeof(pg_atomic_uint64));
+}
+
 #ifdef TT_ACTIVE_OWNER_FIXTURE_MAIN
 int TT_ACTIVE_OWNER_FIXTURE_MAIN(void);
 #define main TT_ACTIVE_OWNER_FIXTURE_MAIN
@@ -1819,7 +1946,7 @@ int TT_ACTIVE_OWNER_FIXTURE_MAIN(void);
 int
 main(void)
 {
-	UT_PLAN(52);
+	UT_PLAN(55);
 	UT_RUN(test_current_origin_snapshot_uses_original_terminal_slot_provenance);
 	UT_RUN(test_current_origin_snapshot_rejects_missing_or_malformed_original_identity);
 	UT_RUN(test_current_origin_snapshot_never_initializes_or_outlives_original_slot);
@@ -1872,6 +1999,9 @@ main(void)
 	UT_RUN(test_capacity_unknown_rollover_effects_do_not_enter_wait);
 	UT_RUN(test_capacity_passive_winner_adoption_preserves_safe_wait);
 	UT_RUN(test_capacity_after_unpublished_reservation_does_not_reenter_preflight);
+	UT_RUN(test_native_wakeup_recheck_counts_normal_owner_commit_and_abort_once);
+	UT_RUN(test_native_wakeup_recheck_excludes_errors_drift_and_refusals);
+	UT_RUN(test_native_wakeup_counter_is_initialized_unsigned_unavailable_and_lock_free);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

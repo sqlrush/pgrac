@@ -3553,6 +3553,8 @@ cluster_undo_cleaner_main_loop_iters(void)
 /* Cross-module monitoring accessors; no cleaner is started by this fixture. */
 static bool capacity_stats_available = true;
 static uint64 capacity_retention_counts[9];
+static uint64 capacity_native_rechecks;
+static uint64 capacity_pool_rechecks = UINT64_C(9223372036854775809);
 
 bool
 cluster_undo_cleaner_capacity_stats_snapshot(ClusterUndoCapacityStats *out)
@@ -3563,7 +3565,10 @@ cluster_undo_cleaner_capacity_stats_snapshot(ClusterUndoCapacityStats *out)
 	out->origin_node_id = 3;
 	out->active_full_wait_count = 42;
 	out->pool_wait_count = UINT64_MAX;
-	out->wakeup_recheck_count = UINT64_C(9223372036854775809);
+	out->wakeup_recheck_count = capacity_pool_rechecks;
+#ifdef CLUSTER_UNDO_CAPACITY_NATIVE_RECHECK_STATS_V1
+	out->native_wakeup_recheck_count = capacity_native_rechecks;
+#endif
 	out->cancel_count = 17;
 	out->refused_context_count = 19;
 	out->refused_proof_count = 23;
@@ -5925,6 +5930,49 @@ UT_TEST(test_debug_dump_exposes_capacity_counts_without_fake_zero_or_signed_wrap
 }
 
 
+UT_TEST(test_debug_capacity_wakeup_sums_native_and_cv_without_changing_cv_alias)
+{
+	LOCAL_FCINFO(fcinfo, 0);
+	ReturnSetInfo rsinfo;
+	static const struct {
+		uint64 pool, native;
+		const char *total, *legacy;
+	} cases[] = { { 5, 7, "12", "5" },
+				  { 0, UINT64_C(9223372036854775809), "9223372036854775809", "0" },
+				  { UINT64_C(9223372036854775809), 7, "9223372036854775816",
+					"9223372036854775809" } };
+
+	for (unsigned i = 0; i < lengthof(cases); i++) {
+		capacity_pool_rechecks = cases[i].pool;
+		capacity_native_rechecks = cases[i].native;
+		for (int available = 0; available < 2; available++) {
+			memset(fcinfo, 0, SizeForFunctionCallInfo(0));
+			memset(&rsinfo, 0, sizeof(rsinfo));
+			captured_dump_row_count = captured_formatted_value_count = 0;
+			fcinfo->resultinfo = (fmNodePtr)&rsinfo;
+			capacity_stats_available = available != 0;
+			(void)cluster_dump_state(fcinfo);
+			UT_ASSERT_EQ(captured_dump_count("undo_cleaner", "tt_capacity_stats_available"), 1);
+			UT_ASSERT_STR_EQ(captured_dump_value("undo_cleaner", "tt_capacity_stats_available"),
+							 available ? "true" : "false");
+			UT_ASSERT_EQ(captured_dump_count("undo_cleaner", "tt_capacity_wakeup_recheck_count"),
+						 available);
+			UT_ASSERT_EQ(captured_dump_count("undo_cleaner", "capacity_wait_repolled"), available);
+			UT_ASSERT_EQ(captured_dump_count("undo_cleaner", "tt_capacity_origin_node_id"), available);
+			if (available) {
+				UT_ASSERT_STR_EQ(captured_dump_value("undo_cleaner", "tt_capacity_wakeup_recheck_count"),
+								 cases[i].total);
+				UT_ASSERT_STR_EQ(captured_dump_value("undo_cleaner", "capacity_wait_repolled"),
+								 cases[i].legacy);
+				UT_ASSERT_STR_EQ(captured_dump_value("undo_cleaner", "tt_capacity_origin_node_id"), "3");
+			}
+		}
+	}
+	capacity_native_rechecks = 0;
+	capacity_pool_rechecks = UINT64_C(9223372036854775809);
+	capacity_stats_available = true;
+}
+
 UT_TEST(test_debug_dump_retention_observations_preserve_availability_and_unsigned_values)
 {
 	LOCAL_FCINFO(fcinfo, 0);
@@ -6839,7 +6887,7 @@ UT_TEST(test_debug_locator_families_keep_availability_origin_and_unsigned_values
 int
 main(void)
 {
-	UT_PLAN(35);
+	UT_PLAN(36);
 	UT_RUN(test_debug_dump_retention_observations_preserve_availability_and_unsigned_values);
 	UT_RUN(test_debug_dump_exposes_native_drop_context_and_real_io_observation);
 	UT_RUN(test_debug_dump_exposes_pcm_first_refusal_identity_and_subpredicate);
@@ -6856,6 +6904,7 @@ main(void)
 	UT_RUN(test_debug_dump_exposes_receipt_lifetime_and_cancel_before_counters);
 	UT_RUN(test_debug_dump_exposes_retained_rollover_counts_without_fake_zero);
 	UT_RUN(test_debug_dump_exposes_capacity_counts_without_fake_zero_or_signed_wrap);
+	UT_RUN(test_debug_capacity_wakeup_sums_native_and_cv_without_changing_cv_alias);
 	UT_RUN(test_debug_dump_exposes_tt_and_itl_reason_counters_without_fake_zero);
 	UT_RUN(test_debug_dump_exposes_closed_ctrc_observability);
 	UT_RUN(test_debug_inject_get_count_callable);

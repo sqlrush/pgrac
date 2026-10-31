@@ -147,6 +147,7 @@ cluster_undo_cleaner_shmem_init(void)
 		pg_atomic_init_u64(&undo_cleaner_state->capacity_wait_refused_context, 0);
 		pg_atomic_init_u64(&undo_cleaner_state->capacity_wait_refused_proof, 0);
 		pg_atomic_init_u64(&undo_cleaner_state->capacity_wait_cancelled, 0);
+		pg_atomic_init_u64(&undo_cleaner_state->active_full_wakeup_recheck_count, 0);
 	}
 }
 
@@ -240,6 +241,8 @@ cluster_undo_cleaner_capacity_stats_snapshot(ClusterUndoCapacityStats *out)
 	snapshot.active_full_wait_count = undo_cleaner_state->active_full_wait_count;
 	snapshot.pool_wait_count = undo_cleaner_state->capacity_wait_entered;
 	snapshot.wakeup_recheck_count = undo_cleaner_state->capacity_wait_repolled;
+	snapshot.native_wakeup_recheck_count
+		= pg_atomic_read_u64(&undo_cleaner_state->active_full_wakeup_recheck_count);
 	snapshot.refused_context_count
 		= pg_atomic_read_u64(&undo_cleaner_state->capacity_wait_refused_context);
 	snapshot.refused_proof_count
@@ -263,6 +266,15 @@ cluster_undo_cleaner_note_capacity_refusal(bool unsafe_context)
 		pg_atomic_fetch_add_u64(&undo_cleaner_state->capacity_wait_refused_context, 1);
 	else
 		pg_atomic_fetch_add_u64(&undo_cleaner_state->capacity_wait_refused_proof, 1);
+}
+
+/* Count only the normal native handoff, after its original finally cleanup.
+ * No extra lock, wait state or allocation authority is introduced here. */
+void
+cluster_undo_cleaner_note_tx_slot_recheck(void)
+{
+	if (undo_cleaner_state != NULL)
+		pg_atomic_fetch_add_u64(&undo_cleaner_state->active_full_wakeup_recheck_count, 1);
 }
 
 bool

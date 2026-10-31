@@ -9506,15 +9506,15 @@ test_cluster_tt_abort_owner: test_cluster_tt_abort_owner.c test_cluster_tt_durab
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
-# Keep the original refusal producer, initialization and snapshot in one fixture.
+# Keep the original diagnostic producers, initialization and snapshot together.
 test_cluster_active_capacity_stats.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_cleaner.c \
 		$(top_srcdir)/src/include/cluster/cluster_undo_cleaner.h Makefile
-	awk 'FNR == NR { if (/^extern void cluster_undo_cleaner_note_capacity_refusal\(/) expected++; next } \
+	awk 'FNR == NR { if (/^extern void cluster_undo_cleaner_note_(capacity_refusal|tx_slot_recheck)\(/) expected++; next } \
 	     /^cluster_undo_cleaner_shmem_init\(/ { print "void"; emit=1; basic++ } \
 	     /^cluster_undo_cleaner_capacity_stats_snapshot\(/ { print "bool"; emit=1; basic++ } \
-	     /^cluster_undo_cleaner_note_capacity_refusal\(/ { print "void"; emit=1; hooks++ } \
+	     /^cluster_undo_cleaner_note_(capacity_refusal|tx_slot_recheck)\(/ { print "void"; emit=1; hooks++ } \
 	     emit { print } emit && /^}/ { emit=0 } \
-	     END { if (basic != 2 || hooks != expected || expected > 1 || emit) exit 1 }' \
+	     END { if (basic != 2 || hooks != expected || expected > 2 || emit) exit 1 }' \
 		$(top_srcdir)/src/include/cluster/cluster_undo_cleaner.h $< > $@.tmp
 	mv $@.tmp $@
 

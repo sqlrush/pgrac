@@ -996,14 +996,14 @@ dump_undo_cleaner(ReturnSetInfo *rsinfo)
 		emit_row(rsinfo, "undo_cleaner", "tt_capacity_pool_wait_count",
 				 fmt_uint64(capacity.pool_wait_count));
 		emit_row(rsinfo, "undo_cleaner", "tt_capacity_wakeup_recheck_count",
-				 fmt_uint64(capacity.wakeup_recheck_count));
+				 fmt_uint64(capacity.wakeup_recheck_count + capacity.native_wakeup_recheck_count));
 		emit_row(rsinfo, "undo_cleaner", "tt_capacity_cancel_count",
 				 fmt_uint64(capacity.cancel_count));
 		emit_row(rsinfo, "undo_cleaner", "tt_capacity_refuse_by_reason.context",
 				 fmt_uint64(capacity.refused_context_count));
 		emit_row(rsinfo, "undo_cleaner", "tt_capacity_refuse_by_reason.proof",
 				 fmt_uint64(capacity.refused_proof_count));
-		/* Keep the original names as aliases of the same available sample. */
+		/* Preserve the original names and CV-only repoll scope in this sample. */
 		emit_row(rsinfo, "undo_cleaner", "capacity_wait_entered",
 				 fmt_uint64(capacity.pool_wait_count));
 		emit_row(rsinfo, "undo_cleaner", "capacity_wait_repolled",

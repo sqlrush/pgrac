@@ -104,6 +104,7 @@ typedef struct ClusterUndoCleanerActiveSample {
 /* Bit positions match ClusterUndoRetainReason; these are observations only. */
 #define CLUSTER_UNDO_CAPACITY_RETAIN_STATS_V1 1
 #define CLUSTER_UNDO_CAPACITY_RETAIN_REASON_COUNT 9
+#define CLUSTER_UNDO_CAPACITY_NATIVE_RECHECK_STATS_V1 1
 
 /* Postmaster-lifetime diagnostics for this origin's existing capacity wait.
  * Counts do not prove pool coverage, owner progress, or reusable capacity. */
@@ -111,12 +112,13 @@ typedef struct ClusterUndoCapacityStats {
 	int32 origin_node_id;
 	uint64 active_full_wait_count;
 	uint64 pool_wait_count;
-	uint64 wakeup_recheck_count;
+	uint64 wakeup_recheck_count; /* Original pool CV repolls only. */
 	uint64 cancel_count;
 	/* Original full-pool and selected-slot gate refusals, counted per attempt. */
 	uint64 refused_context_count;
 	uint64 refused_proof_count;
 	uint64 retain_by_reason[CLUSTER_UNDO_CAPACITY_RETAIN_REASON_COUNT];
+	uint64 native_wakeup_recheck_count;
 } ClusterUndoCapacityStats;
 
 
@@ -168,6 +170,7 @@ typedef struct UndoCleanerSharedState {
 	pg_atomic_uint64 capacity_wait_refused_context;
 	pg_atomic_uint64 capacity_wait_refused_proof;
 	pg_atomic_uint64 capacity_wait_cancelled;
+	pg_atomic_uint64 active_full_wakeup_recheck_count;
 	uint64 retain_by_reason[CLUSTER_UNDO_CAPACITY_RETAIN_REASON_COUNT];
 
 	/*
@@ -270,6 +273,8 @@ extern bool cluster_undo_cleaner_worker_snapshot(unsigned worker_id, UndoCleaner
 extern bool cluster_undo_cleaner_capacity_stats_snapshot(ClusterUndoCapacityStats *out);
 /* Original pool/native-slot refusal only; does not decide whether to wait. */
 extern void cluster_undo_cleaner_note_capacity_refusal(bool unsafe_context);
+/* A normal native wait return requests recheck; it does not grant a slot. */
+extern void cluster_undo_cleaner_note_tx_slot_recheck(void);
 extern bool cluster_undo_cleaner_active_sample(ClusterUndoCleanerActiveSample *out);
 extern bool
 cluster_undo_cleaner_active_sample_current(const ClusterUndoCleanerActiveSample *expected);

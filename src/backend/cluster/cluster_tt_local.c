@@ -380,6 +380,7 @@ cluster_tt_local_wait_for_active_slot(uint32 segment_id, TransactionId top_xid)
 		pgstat_report_wait_start(previous_wait_event);
 	}
 	PG_END_TRY();
+	cluster_undo_cleaner_note_tx_slot_recheck();
 	return true;
 }
 
