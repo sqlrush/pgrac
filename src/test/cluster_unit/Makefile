@@ -13326,6 +13326,31 @@ test_cluster_vm_report_pin test_cluster_vm_report_pin_noassert: test_cluster_vm_
 		test_cluster_vm_read_visibility.inc $(top_srcdir)/src/include/access/visibilitymap.h Makefile
 	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(srcdir) $(if $(filter %_noassert,$@),-DFIXTURE_NO_ASSERTS) $< $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
+TESTS += test_cluster_vm_amcheck_pin test_cluster_vm_amcheck_pin_noassert
+all: test_cluster_vm_amcheck_pin test_cluster_vm_amcheck_pin_noassert
+
+test_cluster_vm_amcheck_types.inc: $(top_srcdir)/contrib/amcheck/verify_heapam.c \
+		$(srcdir)/extract_amcheck_vm_fixture.py $(srcdir)/extract_vacuum_mx_fixture.py
+	python3 $(srcdir)/extract_amcheck_vm_fixture.py $< --types > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_vm_amcheck_entry.inc: $(top_srcdir)/contrib/amcheck/verify_heapam.c \
+		$(srcdir)/extract_amcheck_vm_fixture.py $(srcdir)/extract_vacuum_mx_fixture.py
+	python3 $(srcdir)/extract_amcheck_vm_fixture.py $< --entry > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_vm_amcheck_pin test_cluster_vm_amcheck_pin_noassert: test_cluster_vm_amcheck_pin.c \
+		test_cluster_vm_read_visibility.c unit_test.h test_cluster_vm_amcheck_types.inc \
+		test_cluster_vm_amcheck_entry.inc test_cluster_vm_read_visibility.inc \
+		$(top_srcdir)/src/include/access/visibilitymap.h Makefile
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(srcdir) $(if $(filter %_noassert,$@),-DFIXTURE_NO_ASSERTS) $< $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+clean: clean-amcheck-vm-pin
+.PHONY: clean-amcheck-vm-pin
+clean-amcheck-vm-pin:
+	rm -f test_cluster_vm_amcheck_types.inc test_cluster_vm_amcheck_types.inc.tmp \
+		test_cluster_vm_amcheck_entry.inc test_cluster_vm_amcheck_entry.inc.tmp
+
 # PGRAC: reuse the actual pure relation policy in existing native fixtures.
 test_cluster_heap_maintenance_policy.inc: $(top_srcdir)/src/backend/access/heap/visibilitymap.c Makefile
 	awk '/^cluster_heap_maintenance_restricted\(/ { print "bool"; emit=1; found++ } \

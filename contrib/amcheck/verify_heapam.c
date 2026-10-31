@@ -420,6 +420,15 @@ verify_heapam(PG_FUNCTION_ARGS)
 
 			mapbits = (int32) visibilitymap_get_status(ctx.rel, ctx.blkno,
 													   &vmbuffer);
+			/* Keep the raw diagnostic bits, but do not obstruct a shared VM
+			 * holder during heap I/O or the next interrupt check. */
+			if (cluster_heap_maintenance_restricted(ctx.rel) && BufferIsValid(vmbuffer))
+			{
+				Buffer		buffer = vmbuffer;
+
+				vmbuffer = InvalidBuffer;
+				ReleaseBuffer(buffer);
+			}
 			if (skip_option == SKIP_PAGES_ALL_FROZEN)
 			{
 				if ((mapbits & VISIBILITYMAP_ALL_FROZEN) != 0)
