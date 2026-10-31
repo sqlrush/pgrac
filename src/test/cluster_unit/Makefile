@@ -3361,6 +3361,25 @@ clean: clean-update-pair-vm-authority
 clean-update-pair-vm-authority:
 	rm -f test_cluster_heap_vm_pair_writer.inc test_cluster_heap_vm_pair_writer.inc.tmp
 
+# Join original single INSERT VM authority, final capture and WAL publication.
+TESTS += test_cluster_heap_insert_vm_wal_chain test_cluster_heap_insert_vm_wal_chain_noassert
+all: test_cluster_heap_insert_vm_wal_chain test_cluster_heap_insert_vm_wal_chain_noassert
+
+test_cluster_heap_insert_capture.inc: extract_insert_vm_authority_fixture.py extract_vacuum_mx_fixture.py $(top_srcdir)/src/backend/access/heap/heapam.c
+	python3 $(srcdir)/extract_insert_vm_authority_fixture.py $(top_srcdir)/src/backend/access/heap/heapam.c --insert-capture > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_insert_vm_wal_chain test_cluster_heap_insert_vm_wal_chain_noassert: test_cluster_heap_insert_vm_wal_chain.c test_cluster_heap_insert_version test_cluster_heap_vm_insert.inc test_cluster_heap_insert_capture.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(if $(filter %_noassert,$@),-DFIXTURE_NO_ASSERTS) $< \
+		test_cluster_space_bufpage_product.o test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
+clean: clean-insert-vm-wal-chain
+.PHONY: clean-insert-vm-wal-chain
+clean-insert-vm-wal-chain:
+	rm -f test_cluster_heap_insert_capture.inc test_cluster_heap_insert_capture.inc.tmp
+
 # PGRAC: the real INSERT mutation/WAL block and native tuple/page insertion.
 # Bind the complete native batch loop, including original selection/accounting.
 test_cluster_heap_multi_loop.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
