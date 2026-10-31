@@ -216,6 +216,26 @@ typedef struct ClusterRecoveryCensusPagesV1 {
 extern const ClusterRecoveryCensusPagesV1 *cluster_recovery_census_pages_v1(
 	ClusterRecoveryCensus *census);
 
+/* Complete bytes from each original physical page and each inverse history
+ * version. page_index addresses the original physical PAGE collection;
+ * version is its inverse ordinal. No fragments, new reads or rebuilt images.
+ * Opt-in begin reserves all image capacity within its total budget. A readonly
+ * view exists only after the original complete manifest, lives until census
+ * failure/destruction, and grants no owner, discharge or completion rights. */
+typedef struct ClusterRecoveryCensusImageV1 {
+	uint32 page_index;
+	uint64 version;
+	PGAlignedBlock bytes;
+} ClusterRecoveryCensusImageV1;
+
+typedef struct ClusterRecoveryCensusImagesV1 {
+	uint32 count;
+	ClusterRecoveryCensusImageV1 entries[FLEXIBLE_ARRAY_MEMBER];
+} ClusterRecoveryCensusImagesV1;
+
+extern const ClusterRecoveryCensusImagesV1 *cluster_recovery_census_images_v1(
+	ClusterRecoveryCensus *census);
+
 /* Current bytes from the same original physical relation object. This is
  * only a by-value observation; the initial page/root baselines never change. */
 typedef struct ClusterRecoveryCensusPageDigestV1 {
@@ -353,6 +373,14 @@ extern ClusterRecoveryCensusResult cluster_recovery_census_begin(ClusterWalInput
  * The original caller must still hold isolation/retention/freeze. This is an
  * observation component, not a service driver, semantic seal or write grant. */
 extern ClusterRecoveryCensusResult cluster_recovery_census_begin_ctrc(
+	ClusterWalInputsV1 *inputs, size_t memory_budget, ClusterRecoveryCensus **out);
+
+/* Same original factories, with a separate bounded reservation for complete
+ * page/version bytes. Legacy factories retain the original metadata-only mode.
+ * All original source/namespace/isolation/retention premises still apply. */
+extern ClusterRecoveryCensusResult cluster_recovery_census_begin_images_v1(
+	ClusterWalInputsV1 *inputs, int root_fd, size_t memory_budget, ClusterRecoveryCensus **out);
+extern ClusterRecoveryCensusResult cluster_recovery_census_begin_ctrc_images_v1(
 	ClusterWalInputsV1 *inputs, size_t memory_budget, ClusterRecoveryCensus **out);
 
 /* Run the existing ROOT/WAL union, all TT slots, physical PAGE/history root

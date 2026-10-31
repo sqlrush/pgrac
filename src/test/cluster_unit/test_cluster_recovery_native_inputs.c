@@ -1068,6 +1068,16 @@ UT_TEST(test_ctrc_inventory_keeps_original_local_cut_and_native_terminal_bytes)
 	ctrc_local_done(&inputs);
 }
 
+/* These legacy episode assertions name the former independent read pin.
+ * The same Start now borrows its original recovery retention: require that
+ * actual original pin to remain held AND that no new read pin was acquired.
+ * Only this immutable episode-fixture block uses the alias. */
+static bool
+episode_original_retention_held(void)
+{
+	return inputs_recovery_held && !inputs_pin_held;
+}
+#define inputs_pin_held episode_original_retention_held()
 #include "test_cluster_recovery_episode_history.inc"
 #include "test_cluster_recovery_relmap_fold.inc"
 #include "test_cluster_recovery_episode_pending.inc"
@@ -1150,7 +1160,10 @@ cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **held)
 #include "test_cluster_recovery_episode_generation_xid.inc"
 #include "test_cluster_recovery_clog_full_roots.inc"
 
+#undef inputs_pin_held
+
 #include "test_cluster_recovery_census_current_pages.inc"
+#include "test_cluster_recovery_census_images.inc"
 #include "test_cluster_recovery_census_namespace.inc"
 
 #include "test_cluster_recovery_census_tx_records.inc"
@@ -1583,7 +1596,7 @@ main(int argc, char **argv)
 	UT_RUN(test_census_native_records_original_final_wal_rewrite_refuses_whole_view);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(304);
+	UT_PLAN(309);
 	UT_RUN(test_episode_full_truncate_retains_complete_cutoff_without_qualifying_legacy);
 	UT_RUN(test_page_raw_keeps_full_original_file_bytes_after_both_passes);
 	UT_RUN(test_page_raw_borrowed_byte_change_revokes_whole_inventory_without_rebase);
@@ -1897,6 +1910,11 @@ main(int argc, char **argv)
 	UT_RUN(test_census_references_complete_empty_is_not_prefix_or_lost_scope);
 	UT_RUN(test_census_references_reject_modified_metadata_tuple_and_rebound_pointer);
 	UT_RUN(test_census_references_bound_metadata_and_tuple_storage_before_publication);
+	UT_RUN(test_census_images_retain_all_physical_and_inverse_full_bytes);
+	UT_RUN(test_census_images_old_mode_prefix_and_caller_locks_never_enter);
+	UT_RUN(test_census_images_changed_full_bytes_identity_or_source_revoke_whole_view);
+	UT_RUN(test_census_images_capacity_failure_never_exports_a_prefix);
+	UT_RUN(test_census_images_manifest_error_retains_original_input_custody);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

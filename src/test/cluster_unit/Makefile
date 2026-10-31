@@ -10949,3 +10949,9 @@ test_cluster_recovery_episode_clog.o test_cluster_side_native_clog.o: \
 	test_cluster_clog_native_record_owner.inc
 
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_owner_scopes.inc
+
+test_cluster_recovery_native_inputs: test_cluster_recovery_census_images.inc
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_images.inc
+
+# The relation wrapper owns the complete expanded reference output.
+$(top_builddir)/src/backend/cluster/cluster_recovery_relation_census.o: 	$(top_srcdir)/src/include/cluster/cluster_recovery_page_census.h

@@ -2464,6 +2464,7 @@ static void startup_local_empty_reset(void);
 #include "test_cluster_cold_ctrc_hot_refs.inc"
 
 #include "test_cluster_cold_ctrc_references.inc"
+#include "test_cluster_cold_ctrc_images.inc"
 #include "test_cluster_cold_ctrc_tx_records.inc"
 #include "test_cluster_cold_ctrc_native_records.inc"
 #include "test_cluster_cold_ctrc_compound_obligations.inc"
@@ -3039,7 +3040,7 @@ int main(void)
 	}
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_FIRST
-	UT_PLAN(405);
+	UT_PLAN(409);
 	UT_RUN(test_start_borrows_only_its_original_completed_retention_owner);
 	UT_RUN(test_start_raw_records_keep_complete_original_bytes_and_empty_end);
 	UT_RUN(test_start_raw_records_refuse_incomplete_changed_bytes_hash_header_and_end);
@@ -3050,7 +3051,7 @@ int main(void)
 	UT_RUN(test_start_compound_groups_retain_complete_member_input_and_end);
 	UT_RUN(test_start_compound_groups_refuse_missing_mixed_or_nonempty_end);
 #else
-	UT_PLAN(388);
+	UT_PLAN(392);
 #endif
 	UT_RUN(test_startup_native_images_accept_only_unchanged_complete_terminal_page);
 	UT_RUN(test_startup_native_images_reject_unresolved_ambiguous_and_mx_itls);
@@ -3061,7 +3062,7 @@ int main(void)
 	UT_RUN(test_startup_native_directory_real_origin_cannot_be_discharged_by_wait);
 	UT_RUN(test_startup_native_directory_invalid_layout_and_partial_error_keep_debt);
 #else
-	UT_PLAN(380);
+	UT_PLAN(384);
 #endif
 	UT_RUN(test_start_page_owner_scopes_bind_full_transaction_effects_and_completion);
 	UT_RUN(test_start_page_owner_scopes_preserve_unmatched_and_other_transaction_duties);
@@ -3469,6 +3470,10 @@ int main(void)
 	UT_RUN(test_ctrc_references_cannot_rebind_same_start_to_another_complete_view);
 	UT_RUN(test_ctrc_references_error_uses_original_failure_and_reverse_cleanup);
 	UT_RUN(test_ctrc_references_after_getter_owner_drift_refuses_without_new_scope);
+	UT_RUN(test_start_images_borrow_full_original_versions_and_complete_empty_view);
+	UT_RUN(test_start_images_preconditions_never_enter_or_start_a_replacement);
+	UT_RUN(test_start_images_missing_or_rebound_collection_revokes_same_observation);
+	UT_RUN(test_start_images_error_or_late_owner_drift_preserve_original_cleanup);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

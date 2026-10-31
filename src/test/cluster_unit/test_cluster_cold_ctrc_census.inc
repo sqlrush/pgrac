@@ -34,6 +34,26 @@ static union {
 		+ 24 * sizeof(ClusterRecoveryCensusReferenceV1)];
 } observation_references_storage[2];
 static unsigned observation_reference_fault, observation_reference_calls;
+static union {
+	uint64 align;
+	uint8 bytes[offsetof(ClusterRecoveryCensusImagesV1, entries)
+		+ 3 * sizeof(ClusterRecoveryCensusImageV1)];
+} observation_images_storage[2];
+static unsigned observation_image_fault, observation_image_calls, observation_image_begins;
+
+const ClusterRecoveryCensusImagesV1 *
+cluster_recovery_census_images_v1(ClusterRecoveryCensus *cursor)
+{
+	if (cursor != (ClusterRecoveryCensus *)&observation_cursor_object
+		|| !observation_cursor_live || !observation_scope_live || observation_steps < 3) abort();
+	observation_image_calls++;
+	if (observation_image_fault == 1) return NULL;
+	if (observation_image_fault == 3) pg_re_throw();
+	if (observation_image_fault == 4) owner_boot++;
+	return (const ClusterRecoveryCensusImagesV1 *)observation_images_storage[
+		observation_image_fault == 2 ? 1 : 0].bytes;
+}
+
 
 const ClusterRecoveryCensusReferencesV1 *
 cluster_recovery_census_references_v1(ClusterRecoveryCensus *cursor)
@@ -146,6 +166,8 @@ observation_fixture_reset(void)
 	observation_physical_count = observation_fail_allocation = 0;
 	observation_release_error = observation_early_read = false;
 	observation_reference_fault = observation_reference_calls = 0;
+	observation_image_fault = observation_image_calls = observation_image_begins = 0;
+	memset(observation_images_storage, 0, sizeof(observation_images_storage));
 	memset(observation_references_storage, 0, sizeof(observation_references_storage));
 	observation_page_fault = 0;
 	observation_page_wal_fault = 0;
@@ -235,6 +257,14 @@ cluster_recovery_census_begin_ctrc(ClusterWalInputsV1 *inputs, size_t memory_bud
 	observation_cursor_live = true;
 	*out = (ClusterRecoveryCensus *)&observation_cursor_object;
 	return CLUSTER_RECOVERY_CENSUS_MORE;
+}
+
+ClusterRecoveryCensusResult
+cluster_recovery_census_begin_ctrc_images_v1(ClusterWalInputsV1 *inputs, size_t memory_budget,
+	ClusterRecoveryCensus **out)
+{
+	observation_image_begins++;
+	return cluster_recovery_census_begin_ctrc(inputs, memory_budget, out);
 }
 
 ClusterRecoveryCensusResult

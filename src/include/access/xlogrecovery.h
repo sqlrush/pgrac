@@ -384,6 +384,14 @@ struct ClusterRecoveryCensusReferencesV1;
 extern const struct ClusterRecoveryCensusReferencesV1 *ClusterColdRecoveryCtrcReferences(
 	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work);
 
+/* Complete original physical/history page versions under this same Start.
+ * The original census reserves and owns every full image; callers only borrow
+ * its complete immutable collection before PAGE/content locks. No image is
+ * reconstructed from references and no graph/discharge right is supplied. */
+struct ClusterRecoveryCensusImagesV1;
+extern const struct ClusterRecoveryCensusImagesV1 *ClusterColdRecoveryCtrcImages(
+	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work);
+
 /* Original complete TX forest through this SAME Start/work/accepted-TX and
  * full simultaneous IR/WALR observation. The by-value wrapper never accepts a
  * caller graph or source. Includes non-root predecessors, complete native

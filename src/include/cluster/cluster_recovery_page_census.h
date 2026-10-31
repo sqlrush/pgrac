@@ -33,6 +33,9 @@ typedef struct ClusterRecoveryPageReference {
 	ClusterRecoveryHeapEntry entry;
 	/* Non-FREE ITL only. Borrowed from the graph, no terminal authority. */
 	ClusterRecoveryGraphRecord transaction;
+	/* Same complete history version, valid through this entry until next().
+	 * Borrowed bytes, never a reconstructed image from tuple/reference data. */
+	const char *page;
 } ClusterRecoveryPageReference;
 
 /* Copies a MAIN heap page produced by the original SPACE-bound relation
