@@ -8319,8 +8319,9 @@ test_cluster_undo_block0: test_cluster_undo_block0.c unit_test.h \
 # as well would create duplicate definitions instead of adding coverage.
 test_cluster_undo_block0_current: test_cluster_undo_block0_current.c unit_test.h \
 		$(CLUSTER_UNDO_BLOCK0_CURRENT_O) $(CLUSTER_UNDO_BLOCK0_O) \
-		$(CLUSTER_UNDO_BLOCK0_RESIDENT_O) $(CLUSTER_GES_REPLY_WAIT_O) $(CLUSTER_GES_O)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_UNDO_BLOCK0_RESIDENT_O) $(CLUSTER_GES_REPLY_WAIT_O) $(CLUSTER_GES_O) \
+		test_cluster_undo_segment_init_backend.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_undo_segment_init_backend.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 

@@ -1908,16 +1908,13 @@ static bool
 current_reuse_page_identity(const char page[BLCKSZ], const ClusterUndoBlock0LogicalKey *key,
 							uint32 generation, uint8 expected_state)
 {
-	const PageHeader ph = (const PageHeader)page;
 	const UndoSegmentHeaderData *header = (const UndoSegmentHeaderData *)page;
 
-	return page != NULL && key != NULL && (ph->pd_flags & PD_UNDO_SEG_HEADER) != 0
-		   && PageGetPageSize((Page)page) == BLCKSZ
-		   && PageGetPageLayoutVersion((Page)page) == PG_PAGE_LAYOUT_VERSION
-		   && header->segment_id == key->segment_id
-		   && header->segment_size_bytes == UNDO_SEGMENT_SIZE_BYTES
-		   && header->owner_instance == key->owner_instance
-		   && header->tt_slots_count == TT_SLOTS_PER_SEGMENT && header->wrap_count == generation
+	/* The reuse/recycle producer chain below still consumes V1 TT/bitmap
+	 * offsets. Never authenticate V2 using the old generation offset. */
+	return page != NULL && key != NULL
+		   && UndoSegmentHeader_identity_matches(page, key->segment_id, key->owner_instance)
+		   && header->wrap_count == generation
 		   && header->segment_state == expected_state;
 }
 
@@ -1954,6 +1951,42 @@ current_reuse_successor_exact(const char successor_page[BLCKSZ],
 	return memcmp(successor_page, fresh.data, BLCKSZ) == 0;
 }
 
+/* Ordinary same-generation mutation accepts either explicit layout. Validate
+ * the whole TT40 image before preserving/rebasing it, not just a raw xid or
+ * the bitmap bytes that occupied V1's generation offset. No new authority. */
+static bool
+current_lifecycle_page_valid(const char page[BLCKSZ], const ClusterUndoBlock0LogicalKey *key,
+							 uint32 generation, bool *is_v2)
+{
+	const UndoSegmentHeaderDataV2 *header = (const UndoSegmentHeaderDataV2 *)page;
+
+	*is_v2 = false;
+	if (page == NULL || key == NULL)
+		return false;
+	if ((uint8)page[57] != CLUSTER_UNDO_TT_LAYOUT_V2)
+		return current_reuse_page_identity(page, key, generation, header->segment_state);
+	if (!UndoSegmentHeaderV2_identity_matches(page, BLCKSZ, key->segment_id, key->owner_instance)
+		|| header->wrap_count != generation)
+		return false;
+	for (uint16 i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
+		const TTSlotV2 *slot = &header->tt_slots[i];
+
+		if (slot->status > TT_SLOT_RECYCLABLE || (slot->flags & ~TT_SLOT_FLAGS_KNOWN) != 0
+			|| slot->wrap == TT_WRAP_INVALID || slot->commit_scn == UINT64_MAX)
+			return false;
+		if (slot->status == TT_SLOT_UNUSED) {
+			if (slot->original_full_xid != 0)
+				return false;
+		} else if (!TransactionIdIsNormal(slot->xid) || slot->original_full_xid == UINT64_MAX
+				   || (TransactionId)slot->original_full_xid != slot->xid)
+			return false;
+		if (slot->status == TT_SLOT_ABORTED && SCN_VALID(slot->commit_scn))
+			return false;
+	}
+	*is_v2 = true;
+	return true;
+}
+
 /* A normal live lifecycle transition may change only the monotonic metadata
  * owned by the segment lifecycle.  Canonical TT bytes, generation, page
  * identity and all unnamed/reserved bytes remain byte-identical. */
@@ -1966,12 +1999,24 @@ current_lifecycle_successor_exact(const char predecessor_page[BLCKSZ],
 	const UndoSegmentHeaderData *after = (const UndoSegmentHeaderData *)successor_page;
 	PGAlignedBlock allowed;
 	UndoSegmentHeaderData *allowed_header = (UndoSegmentHeaderData *)allowed.data;
+	bool before_v2;
+	bool after_v2;
+	Size bitmap_offset;
+	const uint8 *before_bitmap;
+	const uint8 *after_bitmap;
 	uint32 i;
 
 	if (predecessor_page == NULL || successor_page == NULL || key == NULL
-		|| !current_reuse_page_identity(predecessor_page, key, generation, before->segment_state)
-		|| !current_reuse_page_identity(successor_page, key, generation, after->segment_state))
+		|| !current_lifecycle_page_valid(predecessor_page, key, generation, &before_v2)
+		|| !current_lifecycle_page_valid(successor_page, key, generation, &after_v2)
+		|| before_v2 != after_v2)
 		return false;
+	/* Only the fixed metadata prefix is shared. Select the moved bitmap after
+	 * validating both layouts; the complete TT/generation stay immutable. */
+	bitmap_offset = before_v2 ? offsetof(UndoSegmentHeaderDataV2, free_block_bitmap)
+							  : offsetof(UndoSegmentHeaderData, free_block_bitmap);
+	before_bitmap = (const uint8 *)predecessor_page + bitmap_offset;
+	after_bitmap = (const uint8 *)successor_page + bitmap_offset;
 	if (!(after->segment_state == before->segment_state
 		  || (before->segment_state == SEGMENT_ALLOCATED && after->segment_state == SEGMENT_ACTIVE)
 		  || (before->segment_state == SEGMENT_ACTIVE
@@ -2004,8 +2049,7 @@ current_lifecycle_successor_exact(const char predecessor_page[BLCKSZ],
 				   < 0))
 		return false;
 	for (i = 0; i < UNDO_FREE_BITMAP_BYTES; i++) {
-		if ((after->free_block_bitmap[i] & before->free_block_bitmap[i])
-			!= before->free_block_bitmap[i])
+		if ((after_bitmap[i] & before_bitmap[i]) != before_bitmap[i])
 			return false;
 	}
 
@@ -2017,8 +2061,7 @@ current_lifecycle_successor_exact(const char predecessor_page[BLCKSZ],
 												UndoSegmentHeader_record_seal_upper_scn(after));
 	UndoSegmentHeader_set_record_drain_upper_scn(allowed_header,
 												 UndoSegmentHeader_record_drain_upper_scn(after));
-	memcpy(allowed_header->free_block_bitmap, after->free_block_bitmap,
-		   sizeof(allowed_header->free_block_bitmap));
+	memcpy(allowed.data + bitmap_offset, after_bitmap, UNDO_FREE_BITMAP_BYTES);
 	return memcmp(allowed.data, successor_page, BLCKSZ) == 0;
 }
 
@@ -2041,8 +2084,6 @@ cluster_undo_block0_current_live_owner_mutate_exact(const ClusterUndoBlock0Logic
 	ClusterUndoBlock0Generation observed = { false, 0 };
 	PGAlignedBlock disk_block;
 	PGAlignedBlock rebased_block;
-	UndoSegmentHeaderData *rebased = (UndoSegmentHeaderData *)rebased_block.data;
-	const UndoSegmentHeaderData *disk = (const UndoSegmentHeaderData *)disk_block.data;
 	const char *publish_page = successor_page;
 	char *resident_page = NULL;
 	volatile ClusterUndoBlock0LiveOwnerCleanup cleanup;
@@ -2141,12 +2182,23 @@ cluster_undo_block0_current_live_owner_mutate_exact(const ClusterUndoBlock0Logic
 			goto mutate_done;
 		}
 		if (memcmp(disk_block.data, predecessor_page, BLCKSZ) != 0) {
+			bool disk_v2;
+			Size slots_bytes;
+
 			/* A canonical TT publish may have landed after the lifecycle
 			 * caller froze its predecessor.  Rebase only the requested,
 			 * monotonic lifecycle fields onto the exact current page; the
 			 * validator below rejects every non-TT or non-monotonic drift. */
+			if (!current_lifecycle_page_valid(disk_block.data, key, expected->value, &disk_v2)
+				|| disk_v2 != ((uint8)predecessor_page[57] == CLUSTER_UNDO_TT_LAYOUT_V2)) {
+				result = CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
+				goto mutate_done;
+			}
+			slots_bytes = disk_v2 ? sizeof(((UndoSegmentHeaderDataV2 *)0)->tt_slots)
+							 : sizeof(((UndoSegmentHeaderData *)0)->tt_slots);
 			memcpy(rebased_block.data, successor_page, BLCKSZ);
-			memcpy(rebased->tt_slots, disk->tt_slots, sizeof(rebased->tt_slots));
+			memcpy(rebased_block.data + offsetof(UndoSegmentHeaderData, tt_slots),
+				   disk_block.data + offsetof(UndoSegmentHeaderData, tt_slots), slots_bytes);
 			if (!current_lifecycle_successor_exact(disk_block.data, rebased_block.data, key,
 												   expected->value)) {
 				result = CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
