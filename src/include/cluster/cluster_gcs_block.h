@@ -96,6 +96,11 @@ typedef struct ClusterGcsFirstFill {
 	bool round_prepared;
 } ClusterGcsFirstFill;
 
+/* One S/X request on the original owned reservation. Joining evidence does
+ * not install bytes, commit native ownership or activate an X writer. */
+extern ResourceXApplyResult cluster_gcs_block_acquire_begin(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *base, uint64 token,
+	uint8 path, uint8 target_mode, ClusterGcsFirstFill *fill);
 extern ResourceXApplyResult cluster_gcs_block_first_fill_begin(
 	BufferDesc *buf, const ClusterPcmOwnSnapshot *base, uint64 token, ClusterGcsFirstFill *fill);
 /* Shares the stack request/wait context; native resident installation is

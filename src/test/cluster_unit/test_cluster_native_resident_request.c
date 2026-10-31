@@ -332,7 +332,8 @@ UT_TEST(test_resident_disk_quiet_codec_never_authorizes_normal_disk_completion)
 	for (int n = 0; n < 4; n++) {
 		bad = frame;
 		if (n == 0) bad.common.outcome = RESOURCE_X_OUTCOME_OK;
-		if (n == 1) bad.common.target_mode = PCM_STATE_X;
+		/* X/no-image is a waiting cancellation, never normal disk completion. */
+		if (n == 1) bad.common.target_mode = PCM_STATE_N;
 		if (n == 2) bad.common.observed_mode = PCM_STATE_S;
 		if (n == 3) bad.body.acquire_completion.page_crc32c = 1;
 		UT_ASSERT(!cluster_resource_x_wire_encode(RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE, &bad,

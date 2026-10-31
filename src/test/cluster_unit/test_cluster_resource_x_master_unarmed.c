@@ -245,10 +245,51 @@ UT_TEST(test_master_unarmed_rebind_keeps_E_A_I_and_quiet_version)
 	UT_ASSERT(memcmp(&out.body.acquire_completion,&quiet.body.acquire_completion,sizeof(quiet.body.acquire_completion))==0);
 }
 
+UT_TEST(test_master_unarmed_X_disk_cancel_consumes_A_without_publishing_X)
+{
+	for (int early = 0; early < 2; early++) {
+		PublishFixture f; ResourceXDecodedFrame grant, quiet = {0}, ack;
+		ResourceXIntentSlot slot;
+		if (!publish_start(0, PCM_STATE_X, &f)) return;
+		publish_apply(&f);
+		grant = publish_decode(f.state->grant_intent.payload, false);
+		quiet.kind = RESOURCE_X_WIRE_INSTALL_SETTLEMENT;
+		quiet.payload_bytes = RESOURCE_X_COMPLETE_V5_BYTES;
+		quiet.has_acquire_decision = true;
+		quiet.common = grant.common;
+		quiet.common.action_node = quiet.common.logical_assertion.requester_node;
+		quiet.common.outcome = MUQ_QUIET;
+		quiet.common.sender_connection_generation = 71;
+		quiet.body.acquire_completion.decision = grant.body.acquire_decision;
+		quiet.body.acquire_completion.native_generation = grant.body.acquire_decision.episode.base_generation;
+		quiet.body.acquire_completion.decision_crc32c = grant.common.semantic_crc32c;
+		if (!master_done_round_trip(&quiet)) return;
+		if (early) {
+			slot = master_done_stage(&f);
+			UT_ASSERT_EQ(master_done_receive(&quiet), RESOURCE_X_APPLY_APPLIED);
+			UT_ASSERT_EQ(f.state->deferred_settlement.present, 2);
+			UT_ASSERT_EQ(cluster_gcs_block_resource_x_bootstrap_tick(&f.work), RESOURCE_X_APPLY_LOCAL_WAIT);
+			UT_ASSERT(cluster_pcm_lock_resource_x_outbound_transport_complete_exact(&slot, true, ++fake_pcm_clock_us));
+			UT_ASSERT_EQ(cluster_gcs_block_resource_x_bootstrap_tick(&f.work), RESOURCE_X_APPLY_APPLIED);
+		} else {
+			master_done_send(&f);
+			UT_ASSERT_EQ(master_done_receive(&quiet), RESOURCE_X_APPLY_APPLIED);
+		}
+		UT_ASSERT_EQ(f.state->deferred_settlement.present, 3); muq_directory(&f);
+		ack = consumed_decode(&f);
+		UT_ASSERT_EQ(ack.common.target_mode, PCM_STATE_X);
+		UT_ASSERT_EQ(ack.common.outcome, MUQ_RETIRED);
+		UT_ASSERT(memcmp(&ack.body.acquire_completion, &quiet.body.acquire_completion,
+			sizeof(quiet.body.acquire_completion)) == 0);
+		master_done_send(&f);
+		UT_ASSERT_EQ(f.state->deferred_settlement.present, 0); muq_directory(&f);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(16);
 	UT_RUN(test_master_unarmed_consumes_only_original_request_without_S_grant);
 	UT_RUN(test_master_unarmed_early_receipt_waits_original_GRANT_callback);
 	UT_RUN(test_master_unarmed_duplicate_retains_one_exact_reverse_notice);
@@ -264,5 +305,6 @@ main(void)
 	UT_RUN(test_master_unarmed_codec_exact_versions_length_and_legacy_rejection);
 	UT_RUN(test_master_unarmed_codec_refuses_installed_generation_and_wrong_role);
 	UT_RUN(test_master_unarmed_rebind_keeps_E_A_I_and_quiet_version);
+	UT_RUN(test_master_unarmed_X_disk_cancel_consumes_A_without_publishing_X);
 	UT_DONE(); return ut_failed_count?1:0;
 }

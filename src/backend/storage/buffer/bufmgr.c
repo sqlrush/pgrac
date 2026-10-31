@@ -18316,7 +18316,11 @@ cluster_bufmgr_acquire_quiet_context(BufferDesc *buf, const ClusterPcmOwnSnapsho
 		&& (episode->path == RESOURCE_X_ACQUIRE_FIRST_FILL
 			|| (episode->path == RESOURCE_X_ACQUIRE_RESIDENT
 				&& execution->observation.request.observed_mode == PCM_STATE_N))
-		&& execution->observation.request.target_mode == PCM_STATE_S
+		&& (execution->observation.request.target_mode == PCM_STATE_S
+			|| (episode->path == RESOURCE_X_ACQUIRE_FIRST_FILL
+				&& execution->observation.request.target_mode == PCM_STATE_X
+				&& (execution->purpose == RESOURCE_X_DELIVERY_ACQUIRE_WAIT_SEALING
+					|| execution->purpose == RESOURCE_X_DELIVERY_ACQUIRE_WAIT_QUIET)))
 		&& base->generation == episode->base_generation && base->generation < UINT64_MAX - 1 && base->flags == 0
 		&& base->reservation_token < UINT64_MAX - 1 && episode->reservation_token == base->reservation_token + 1
 		&& BufferTagsEqual(&base->tag, &execution->observation.request.logical_assertion.resource);
@@ -18659,9 +18663,17 @@ cluster_bufmgr_acquire_resident_wait_context(BufferDesc *buf, const ClusterPcmOw
 		&& !ResourceOwnerHasBufferIO(owner, BufferDescriptorGetBuffer(buf))
 		&& cluster_qvotec_get_self_incarnation() == episode->requester_incarnation
 		&& episode->path == RESOURCE_X_ACQUIRE_RESIDENT
-		&& observation->request.observed_mode == PCM_STATE_N && observation->request.target_mode == PCM_STATE_S
-		&& base->pcm_state == PCM_STATE_N && base->semantic_buf_state == (BM_TAG_VALID | BM_VALID)
-		&& (base->buffer_type == BUF_TYPE_CURRENT || base->buffer_type == BUF_TYPE_PI)
+		&& observation->request.observed_mode == base->pcm_state
+		&& (observation->request.target_mode == PCM_STATE_X
+			|| (observation->request.target_mode == PCM_STATE_S && base->pcm_state == PCM_STATE_N))
+		&& ((base->pcm_state == PCM_STATE_N
+				&& (base->buffer_type == BUF_TYPE_CURRENT || base->buffer_type == BUF_TYPE_PI)
+				&& base->semantic_buf_state == (BM_TAG_VALID | BM_VALID))
+			|| (((base->pcm_state == PCM_STATE_S && base->buffer_type == BUF_TYPE_SCUR)
+					|| (base->pcm_state == PCM_STATE_X && base->buffer_type == BUF_TYPE_XCUR))
+				&& (base->semantic_buf_state & (BM_TAG_VALID | BM_VALID)) == (BM_TAG_VALID | BM_VALID)
+				&& (base->semantic_buf_state & ~(BM_TAG_VALID | BM_VALID | BM_DIRTY
+					| BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED)) == 0))
 		&& base->writer_activation_token == 0 && base->resource_x_activation_generation == 0
 		&& base->generation == episode->base_generation && base->generation < UINT64_MAX - 1 && base->flags == 0
 		&& base->reservation_token < UINT64_MAX - 1 && episode->reservation_token == base->reservation_token + 1

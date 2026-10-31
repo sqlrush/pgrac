@@ -895,14 +895,14 @@ resource_x_completion_body_valid(const ResourceXDecodedFrame *frame)
 		|| frame->common.outcome == RESOURCE_X_OUTCOME_QUIET_NO_IMAGE_RETIRED;
 
 	return (frame->common.target_mode == (uint8)PCM_STATE_S
-			|| (!disk && frame->common.target_mode == (uint8)PCM_STATE_X))
+			|| ((!disk || no_image) && frame->common.target_mode == (uint8)PCM_STATE_X))
 		&& a->episode.base_generation < UINT64_MAX - 1
 		&& (disk
 			? (frame->payload_bytes == RESOURCE_X_COMPLETE_V5_BYTES
 				&& (a->episode.path == RESOURCE_X_ACQUIRE_FIRST_FILL
 					|| (a->episode.path == RESOURCE_X_ACQUIRE_RESIDENT
 						&& frame->common.observed_mode == (uint8)PCM_STATE_N
-						&& frame->common.target_mode == (uint8)PCM_STATE_S))
+						&& (frame->common.target_mode == (uint8)PCM_STATE_S || no_image)))
 				&& a->holders_bitmap == 0 && a->required_holders_bitmap == 0 && a->pi_holders_bitmap == 0)
 			: (frame->payload_bytes == RESOURCE_X_SOURCE_COMPLETE_V11_BYTES
 				&& (a->source_kind == RESOURCE_X_ACQUIRE_SOURCE_REMOTE_CURRENT
