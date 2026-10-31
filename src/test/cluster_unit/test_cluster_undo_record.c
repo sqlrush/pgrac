@@ -122,6 +122,8 @@ static int undo_test_stop_lock_depth;
 static uint32 undo_test_wait_event_info;
 static PGAlignedBlock undo_test_lifecycle_disk;
 static bool undo_test_publish_tt_after_block0_read;
+static bool undo_test_supply_reads_files;
+static void undo_test_segment_path(uint32 segment_id, char *path, size_t path_size);
 static TimestampTz receipt_clock_us;
 static TimestampTz receipt_clock_after_unref;
 static bool receipt_log_enabled;
@@ -609,6 +611,25 @@ cluster_undo_smgr_read_block(ClusterUndoPathIntent intent pg_attribute_unused(),
 							 uint8 owner_instance, uint32 block_no, char *buf)
 {
 	UndoSegmentHeaderData *disk = (UndoSegmentHeaderData *)undo_test_lifecycle_disk.data;
+
+	/* Only the new restart-selection tests read their own temporary pool.
+	 * The original lifecycle provider below remains the default. */
+	if (undo_test_supply_reads_files) {
+		char path[MAXPGPATH];
+		ssize_t nread;
+		int fd;
+
+		if (owner_instance != 1 || segment_id < 1
+			|| segment_id > CLUSTER_UNDO_SEGS_PER_INSTANCE || block_no != 0 || buf == NULL)
+			return false;
+		undo_test_segment_path(segment_id, path, sizeof(path));
+		fd = BasicOpenFile(path, O_RDONLY | PG_BINARY);
+		if (fd < 0)
+			return false;
+		nread = pg_pread(fd, buf, BLCKSZ, 0);
+		close(fd);
+		return nread == BLCKSZ;
+	}
 
 	if (segment_id != disk->segment_id || owner_instance != disk->owner_instance || block_no != 0
 		|| buf == NULL)
@@ -3860,10 +3881,325 @@ UT_TEST(test_a148_undo_stop_does_not_confuse_extent_and_cursor_cache_with_writer
 	undo_stop_fixture_done();
 }
 
+/* Independent TT40 fixtures: explicit framing, actual generation and all48
+ * complete slots. No allocator initializer or receiver-side epoch inference. */
+static void
+undo_test_make_supply_v2(uint32 segment_id, uint8 state, uint32 generation, char *page)
+{
+	UndoSegmentHeaderDataV2 *header = (UndoSegmentHeaderDataV2 *)page;
+
+	undo_test_make_header(segment_id, 1, state, page);
+	header->tt_layout_version = 2;
+	header->tt_slot_bytes = 40;
+	header->wrap_count = generation;
+	/* Poison the old TT32 generation offset, which is V2 bitmap data. */
+	((UndoSegmentHeaderData *)page)->wrap_count = 91;
+}
+
+static bool
+undo_test_write_supply_page(uint32 segment_id, const char *page)
+{
+	char path[MAXPGPATH];
+	ssize_t written;
+	int fd;
+	int close_rc;
+
+	undo_test_segment_path(segment_id, path, sizeof(path));
+	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+	if (fd < 0)
+		return false;
+	written = write(fd, page, BLCKSZ);
+	close_rc = close(fd);
+	return written == BLCKSZ && close_rc == 0;
+}
+
+static bool
+undo_test_supply_page_unchanged(uint32 segment_id, const char *expected)
+{
+	PGAlignedBlock page;
+	char path[MAXPGPATH];
+	ssize_t nread;
+	int fd;
+
+	undo_test_segment_path(segment_id, path, sizeof(path));
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return false;
+	nread = read(fd, page.data, BLCKSZ);
+	close(fd);
+	return nread == BLCKSZ && memcmp(page.data, expected, BLCKSZ) == 0;
+}
+
+UT_TEST(test_tt40_supply_requires_all_complete_slots_empty_and_actual_generation)
+{
+	PGAlignedBlock first;
+	PGAlignedBlock second;
+	UndoSegmentHeaderDataV2 *header = (UndoSegmentHeaderDataV2 *)first.data;
+	ClusterUndoSegmentExtendPlan plan;
+	unsigned mutate_calls = undo_test_lifecycle_mutate_calls;
+
+	if (!undo_test_fixture_begin())
+		return;
+	undo_test_make_supply_v2(1, SEGMENT_ALLOCATED, 7, first.data);
+	undo_test_make_header(2, 1, SEGMENT_ALLOCATED, second.data);
+	UT_ASSERT(undo_test_write_supply_page(1, first.data));
+	UT_ASSERT(undo_test_write_supply_page(2, second.data));
+	UT_ASSERT(cluster_undo_segment_extend_or_create(1, &plan));
+	UT_ASSERT_EQ(plan.segment_id, 1);
+	UT_ASSERT_EQ(plan.generation, 7);
+	UT_ASSERT(!plan.needs_reuse && !plan.needs_provision && !plan.at_hard_cap);
+	UT_ASSERT(undo_test_supply_page_unchanged(1, first.data));
+	/* Last TT40 slot lies beyond the old 48x32B range. Both an occupied
+	 * slot and nonzero UNUSED bytes must prevent fresh supply selection. */
+	for (unsigned variant = 0; variant < 2; variant++) {
+		TTSlotV2 *last = &header->tt_slots[47];
+
+		memset(last, 0, sizeof(*last));
+		last->xid = 701;
+		if (variant == 0) {
+			last->status = TT_SLOT_ACTIVE;
+			last->wrap = 4;
+			last->original_full_xid = (UINT64CONST(2) << 32) | 701;
+		}
+		UT_ASSERT(undo_test_write_supply_page(1, first.data));
+		UT_ASSERT(cluster_undo_segment_extend_or_create(1, &plan));
+		UT_ASSERT_EQ(plan.segment_id, 2);
+		UT_ASSERT_EQ(plan.generation, 0);
+		UT_ASSERT(!plan.needs_reuse && !plan.needs_provision);
+		UT_ASSERT(undo_test_supply_page_unchanged(1, first.data));
+		UT_ASSERT(undo_test_supply_page_unchanged(2, second.data));
+	}
+	UT_ASSERT_EQ(undo_test_lifecycle_mutate_calls, mutate_calls);
+	undo_test_fixture_end();
+}
+
+UT_TEST(test_tt40_recyclable_supply_preserves_original_selection_order_without_writes)
+{
+	PGAlignedBlock first;
+	PGAlignedBlock second;
+	ClusterUndoSegmentExtendPlan plan;
+	unsigned mutate_calls = undo_test_lifecycle_mutate_calls;
+
+	if (!undo_test_fixture_begin())
+		return;
+	undo_test_make_header(1, 1, SEGMENT_COMMITTED, first.data);
+	undo_test_make_supply_v2(2, SEGMENT_RECYCLABLE, 19, second.data);
+	UT_ASSERT(undo_test_write_supply_page(1, first.data));
+	UT_ASSERT(undo_test_write_supply_page(2, second.data));
+	UT_ASSERT(cluster_undo_segment_extend_or_create(1, &plan));
+	UT_ASSERT_EQ(plan.segment_id, 2);
+	UT_ASSERT_EQ(plan.generation, 19);
+	UT_ASSERT(plan.needs_reuse && !plan.needs_provision);
+	UT_ASSERT(undo_test_supply_page_unchanged(1, first.data));
+	UT_ASSERT(undo_test_supply_page_unchanged(2, second.data));
+	((UndoSegmentHeaderData *)first.data)->segment_state = SEGMENT_RECYCLABLE;
+	((UndoSegmentHeaderData *)first.data)->wrap_count = 11;
+	UT_ASSERT(undo_test_write_supply_page(1, first.data));
+	UT_ASSERT(cluster_undo_segment_extend_or_create(1, &plan));
+	UT_ASSERT_EQ(plan.segment_id, 1);
+	UT_ASSERT_EQ(plan.generation, 11);
+	UT_ASSERT(plan.needs_reuse && !plan.needs_provision);
+	UT_ASSERT(undo_test_supply_page_unchanged(1, first.data));
+	UT_ASSERT(undo_test_supply_page_unchanged(2, second.data));
+	UT_ASSERT_EQ(undo_test_lifecycle_mutate_calls, mutate_calls);
+	undo_test_fixture_end();
+}
+
+UT_TEST(test_tt40_bad_supply_is_taken_and_pool_observation_refuses_atomic_output)
+{
+	PGAlignedBlock bad;
+	PGAlignedBlock good;
+	ClusterUndoSegmentExtendPlan plan;
+	ClusterUndoPoolObservation observation;
+	unsigned mutate_calls = undo_test_lifecycle_mutate_calls;
+
+	if (!undo_test_fixture_begin())
+		return;
+	undo_test_make_supply_v2(2, SEGMENT_ALLOCATED, 17, good.data);
+	UT_ASSERT(undo_test_write_supply_page(2, good.data));
+	for (unsigned variant = 0; variant < 15; variant++) {
+		UndoSegmentHeaderDataV2 *header = (UndoSegmentHeaderDataV2 *)bad.data;
+		TTSlotV2 *last = &header->tt_slots[47];
+
+		undo_test_make_supply_v2(1, SEGMENT_ALLOCATED, 7, bad.data);
+		switch (variant) {
+		case 0: header->tt_layout_version = 3; break;
+		case 1: header->tt_slot_bytes = 32; break;
+		case 2: header->tt_layout_reserved = 1; break;
+		case 3: header->tt_slots_count = 47; break;
+		case 4: header->tt_next_free_slot = 49; break;
+		case 5: header->tt_active_count = 49; break;
+		case 6: last->status = UINT8_MAX; break;
+		case 7: last->flags = UINT8_MAX; break;
+		case 8: last->wrap = TT_WRAP_INVALID; break;
+		case 9: last->commit_scn = UINT64_MAX; break;
+		case 10:
+			last->status = TT_SLOT_ACTIVE;
+			last->xid = 2;
+			last->original_full_xid = (UINT64CONST(2) << 32) | 2;
+			break;
+		case 11:
+			last->status = TT_SLOT_ACTIVE;
+			last->xid = 701;
+			last->original_full_xid = UINT64_MAX;
+			break;
+		case 12:
+			last->status = TT_SLOT_ACTIVE;
+			last->xid = 701;
+			last->original_full_xid = (UINT64CONST(2) << 32) | 702;
+			break;
+		case 13: last->original_full_xid = (UINT64CONST(2) << 32) | 701; break;
+		case 14:
+			last->status = TT_SLOT_ABORTED;
+			last->xid = 701;
+			last->original_full_xid = (UINT64CONST(2) << 32) | 701;
+			last->commit_scn = scn_encode(0, 70);
+			break;
+		}
+		UT_ASSERT(undo_test_write_supply_page(1, bad.data));
+		UT_ASSERT(cluster_undo_segment_extend_or_create(1, &plan));
+		UT_ASSERT_EQ(plan.segment_id, 2);
+		UT_ASSERT_EQ(plan.generation, 17);
+		UT_ASSERT(!plan.needs_reuse && !plan.needs_provision);
+		memset(&observation, 0xff, sizeof(observation));
+		UT_ASSERT_EQ(cluster_undo_segment_observe_pool(1, &observation),
+					 CLUSTER_UNDO_POOL_OBS_INVALID_HEADER);
+		UT_ASSERT_EQ(observation.allocated_count, 0);
+		UT_ASSERT_EQ(observation.configured_cap, 0);
+		UT_ASSERT_EQ(observation.effective_cap, 0);
+		UT_ASSERT(undo_test_supply_page_unchanged(1, bad.data));
+		UT_ASSERT(undo_test_supply_page_unchanged(2, good.data));
+	}
+	UT_ASSERT_EQ(undo_test_lifecycle_mutate_calls, mutate_calls);
+	undo_test_fixture_end();
+}
+
+UT_TEST(test_tt40_complete_pool_observation_counts_mixed_layouts_across_gaps)
+{
+	PGAlignedBlock first;
+	PGAlignedBlock third;
+	PGAlignedBlock last;
+	UndoSegmentHeaderDataV2 *header = (UndoSegmentHeaderDataV2 *)third.data;
+	ClusterUndoPoolObservation observation;
+	unsigned mutate_calls = undo_test_lifecycle_mutate_calls;
+
+	if (!undo_test_fixture_begin())
+		return;
+	undo_test_make_header(1, 1, SEGMENT_ACTIVE, first.data);
+	undo_test_make_supply_v2(3, SEGMENT_COMMITTED, 7, third.data);
+	header->tt_slots[47].status = TT_SLOT_COMMITTED;
+	header->tt_slots[47].xid = 701;
+	header->tt_slots[47].original_full_xid = (UINT64CONST(2) << 32) | 701;
+	header->tt_slots[47].commit_scn = scn_encode(0, 70);
+	undo_test_make_supply_v2(256, SEGMENT_RECYCLABLE, 19, last.data);
+	UT_ASSERT(undo_test_write_supply_page(1, first.data));
+	UT_ASSERT(undo_test_write_supply_page(3, third.data));
+	UT_ASSERT(undo_test_write_supply_page(256, last.data));
+	cluster_undo_segments_max_per_instance = 2;
+	undo_test_track_observer_opens = true;
+	UT_ASSERT_EQ(cluster_undo_segment_observe_pool(1, &observation), CLUSTER_UNDO_POOL_OBS_OK);
+	undo_test_track_observer_opens = false;
+	UT_ASSERT_EQ(undo_test_observer_open_calls, 256);
+	UT_ASSERT_EQ(observation.allocated_count, 3);
+	UT_ASSERT_EQ(observation.configured_cap, 16);
+	UT_ASSERT_EQ(observation.effective_cap, 16);
+	UT_ASSERT(undo_test_supply_page_unchanged(1, first.data));
+	UT_ASSERT(undo_test_supply_page_unchanged(3, third.data));
+	UT_ASSERT(undo_test_supply_page_unchanged(256, last.data));
+	undo_test_segment_path(3, undo_test_open_fail_path, sizeof(undo_test_open_fail_path));
+	memset(&observation, 0xff, sizeof(observation));
+	UT_ASSERT_EQ(cluster_undo_segment_observe_pool(1, &observation), CLUSTER_UNDO_POOL_OBS_IO_ERROR);
+	UT_ASSERT_EQ(observation.allocated_count, 0);
+	UT_ASSERT_EQ(observation.configured_cap, 0);
+	UT_ASSERT_EQ(observation.effective_cap, 0);
+	UT_ASSERT_EQ(undo_test_lifecycle_mutate_calls, mutate_calls);
+	undo_test_fixture_end();
+}
+
+UT_TEST(test_tt40_restart_selects_unique_writable_active_with_original_gap_rule)
+{
+	PGAlignedBlock first;
+	PGAlignedBlock second;
+	PGAlignedBlock third;
+	char path[MAXPGPATH];
+	unsigned mutate_calls = undo_test_lifecycle_mutate_calls;
+
+	if (!undo_test_fixture_begin())
+		return;
+	undo_test_make_header(1, 1, SEGMENT_COMMITTED, first.data);
+	undo_test_make_supply_v2(2, SEGMENT_ACTIVE, 7, second.data);
+	undo_test_make_supply_v2(3, SEGMENT_ACTIVE, 19, third.data);
+	((UndoSegmentHeaderDataV2 *)third.data)->segment_flags = UNDO_SEGMENT_FLAG_FULL;
+	UT_ASSERT(undo_test_write_supply_page(1, first.data));
+	UT_ASSERT(undo_test_write_supply_page(2, second.data));
+	UT_ASSERT(undo_test_write_supply_page(3, third.data));
+	undo_test_supply_reads_files = true;
+	UT_ASSERT_EQ(cluster_undo_segment_scan_resumable_active(1), 2);
+	UT_ASSERT(undo_test_supply_page_unchanged(2, second.data));
+	undo_test_make_header(3, 1, SEGMENT_ACTIVE, third.data);
+	UT_ASSERT(undo_test_write_supply_page(3, third.data));
+	UT_ASSERT_EQ(cluster_undo_segment_scan_resumable_active(1), 0);
+	((UndoSegmentHeaderData *)third.data)->segment_state = SEGMENT_COMMITTED;
+	((UndoSegmentHeaderDataV2 *)second.data)->segment_flags = UNDO_SEGMENT_FLAG_FULL;
+	UT_ASSERT(undo_test_write_supply_page(2, second.data));
+	UT_ASSERT(undo_test_write_supply_page(3, third.data));
+	UT_ASSERT_EQ(cluster_undo_segment_scan_resumable_active(1), 0);
+	((UndoSegmentHeaderDataV2 *)second.data)->segment_flags = 0;
+	UT_ASSERT(undo_test_write_supply_page(2, second.data));
+	UT_ASSERT_EQ(cluster_undo_segment_scan_resumable_active(1), 2);
+	undo_test_segment_path(1, path, sizeof(path));
+	UT_ASSERT_EQ(unlink(path), 0);
+	UT_ASSERT_EQ(cluster_undo_segment_scan_resumable_active(1), 0);
+	UT_ASSERT_EQ(cluster_undo_segment_scan_resumable_active(0), 0);
+	UT_ASSERT(undo_test_supply_page_unchanged(2, second.data));
+	UT_ASSERT(undo_test_supply_page_unchanged(3, third.data));
+	undo_test_supply_reads_files = false;
+	UT_ASSERT_EQ(undo_test_lifecycle_mutate_calls, mutate_calls);
+	undo_test_fixture_end();
+}
+
+UT_TEST(test_tt40_restart_rejects_present_bad_header_after_an_earlier_candidate)
+{
+	PGAlignedBlock first;
+	PGAlignedBlock second;
+	PGAlignedBlock third;
+	unsigned mutate_calls = undo_test_lifecycle_mutate_calls;
+
+	if (!undo_test_fixture_begin())
+		return;
+	undo_test_make_supply_v2(1, SEGMENT_ACTIVE, 7, first.data);
+	undo_test_make_header(2, 1, SEGMENT_COMMITTED, second.data);
+	UT_ASSERT(undo_test_write_supply_page(1, first.data));
+	UT_ASSERT(undo_test_write_supply_page(2, second.data));
+	undo_test_supply_reads_files = true;
+	for (unsigned variant = 0; variant < 3; variant++) {
+		UndoSegmentHeaderDataV2 *header = (UndoSegmentHeaderDataV2 *)third.data;
+
+		undo_test_make_supply_v2(3, SEGMENT_COMMITTED, 19, third.data);
+		if (variant == 0)
+			header->tt_layout_version = 3;
+		else if (variant == 1)
+			header->tt_slot_bytes = 32;
+		else {
+			header->tt_slots[47].status = TT_SLOT_ACTIVE;
+			header->tt_slots[47].xid = 701;
+			header->tt_slots[47].original_full_xid = (UINT64CONST(2) << 32) | 702;
+		}
+		UT_ASSERT(undo_test_write_supply_page(3, third.data));
+		UT_ASSERT_EQ(cluster_undo_segment_scan_resumable_active(1), 0);
+		UT_ASSERT(undo_test_supply_page_unchanged(1, first.data));
+		UT_ASSERT(undo_test_supply_page_unchanged(2, second.data));
+		UT_ASSERT(undo_test_supply_page_unchanged(3, third.data));
+	}
+	undo_test_supply_reads_files = false;
+	UT_ASSERT_EQ(undo_test_lifecycle_mutate_calls, mutate_calls);
+	undo_test_fixture_end();
+}
+
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(79);
+	UT_PLAN(85);
 	UT_RUN(test_itl_prepare_requires_original_fullxid_before_receiver_publication);
 	UT_RUN(test_itl_prepare_passes_exact_original_envelope_to_receiver);
 	UT_RUN(test_abort_prepared_after_lock_release_is_idempotent);
@@ -3944,6 +4280,12 @@ main(int argc, char **argv)
 	UT_RUN(test_cancel_before_snapshot_violation_counter_is_live);
 	UT_RUN(test_update_toast_releases_outer_receipt_before_nested_producers);
 	UT_RUN(test_update_itl_wait_returns_through_receipt_and_page_requalification);
+	UT_RUN(test_tt40_supply_requires_all_complete_slots_empty_and_actual_generation);
+	UT_RUN(test_tt40_recyclable_supply_preserves_original_selection_order_without_writes);
+	UT_RUN(test_tt40_bad_supply_is_taken_and_pool_observation_refuses_atomic_output);
+	UT_RUN(test_tt40_complete_pool_observation_counts_mixed_layouts_across_gaps);
+	UT_RUN(test_tt40_restart_selects_unique_writable_active_with_original_gap_rule);
+	UT_RUN(test_tt40_restart_rejects_present_bad_header_after_an_earlier_candidate);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;

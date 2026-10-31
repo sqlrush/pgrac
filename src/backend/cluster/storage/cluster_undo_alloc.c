@@ -395,8 +395,7 @@ read_segment_header_via_smgr(uint32 segment_id, uint8 owner_instance, char *bloc
 	return true;
 }
 
-/* Only the metadata prefix through byte 111 is shared by both layouts.
- * Supply selection retains its separate contract. */
+/* Only the metadata prefix through byte 111 is shared by both layouts. */
 typedef struct ClusterUndoLifecycleHeaderView {
 	UndoSegmentHeaderData *prefix;
 	Size bitmap_offset;
@@ -404,14 +403,12 @@ typedef struct ClusterUndoLifecycleHeaderView {
 } ClusterUndoLifecycleHeaderView;
 
 static bool
-read_lifecycle_header_via_smgr(uint32 segment_id, uint8 owner_instance, char *blockbuf,
-							   ClusterUndoLifecycleHeaderView *out)
+lifecycle_header_view(uint32 segment_id, uint8 owner_instance, char *blockbuf,
+					  ClusterUndoLifecycleHeaderView *out)
 {
-	UndoSegmentHeaderData *prefix;
+	UndoSegmentHeaderData *prefix = (UndoSegmentHeaderData *)blockbuf;
 	ClusterUndoLifecycleHeaderView candidate;
 
-	if (!read_segment_header_via_smgr(segment_id, owner_instance, blockbuf, &prefix))
-		return false;
 	if ((uint8)blockbuf[57] == CLUSTER_UNDO_TT_LAYOUT_V2) {
 		const UndoSegmentHeaderDataV2 *header = (const UndoSegmentHeaderDataV2 *)blockbuf;
 
@@ -447,6 +444,17 @@ read_lifecycle_header_via_smgr(uint32 segment_id, uint8 owner_instance, char *bl
 	candidate.prefix = prefix;
 	*out = candidate;
 	return true;
+}
+
+static bool
+read_lifecycle_header_via_smgr(uint32 segment_id, uint8 owner_instance, char *blockbuf,
+							   ClusterUndoLifecycleHeaderView *out)
+{
+	UndoSegmentHeaderData *prefix;
+
+	if (!read_segment_header_via_smgr(segment_id, owner_instance, blockbuf, &prefix))
+		return false;
+	return lifecycle_header_view(segment_id, owner_instance, blockbuf, out);
 }
 
 
@@ -952,29 +960,32 @@ cluster_undo_segment_extend_or_create(uint8 owner_instance, ClusterUndoSegmentEx
 			 * overwrite a segment we cannot positively classify).
 			 */
 			PGAlignedBlock peek;
+			ClusterUndoLifecycleHeaderView view;
 			ssize_t rb = pg_pread(fd, peek.data, BLCKSZ, 0);
 
 			close(fd);
 			if (rb == BLCKSZ
-				&& cluster_undo_segment_header_identity_ok(peek.data, new_segment_id,
-														   owner_instance)) {
-				UndoSegmentHeaderData *header = (UndoSegmentHeaderData *)peek.data;
+				&& lifecycle_header_view(new_segment_id, owner_instance, peek.data, &view)) {
+				UndoSegmentHeaderData *header = view.prefix;
 
 				if (header->segment_state == SEGMENT_RECYCLABLE) {
 					plan->segment_id = new_segment_id;
-					plan->generation = header->wrap_count;
+					plan->generation = view.generation;
 					plan->needs_reuse = true;
 					return true;
 				}
 				if (header->segment_state == SEGMENT_ALLOCATED) {
-					TTSlot empty_slots[TT_SLOTS_PER_SEGMENT] = { { 0 } };
+					TTSlotV2 empty_slots[TT_SLOTS_PER_SEGMENT] = { { 0 } };
+					Size slot_bytes = (uint8)peek.data[57] == CLUSTER_UNDO_TT_LAYOUT_V2
+										  ? sizeof(empty_slots)
+										  : sizeof(header->tt_slots);
 
 					/* The state byte alone cannot authorize FREE/wrap0. A
 					 * previous incarnation may have bound a TT before its first
 					 * DATA write. Preserve any occupied slot, including ACTIVE. */
-					if (memcmp(header->tt_slots, empty_slots, sizeof(empty_slots)) == 0) {
+					if (memcmp(header->tt_slots, empty_slots, slot_bytes) == 0) {
 						plan->segment_id = new_segment_id;
-						plan->generation = header->wrap_count;
+						plan->generation = view.generation;
 						plan->needs_reuse = false;
 						return true;
 					}
@@ -1102,10 +1113,16 @@ cluster_undo_segment_scan_resumable_active(uint8 owner_instance)
 	for (slot = 0; slot < CLUSTER_UNDO_SEGS_PER_INSTANCE; slot++) {
 		PGAlignedBlock blockbuf;
 		UndoSegmentHeaderData *hdr;
+		ClusterUndoLifecycleHeaderView view;
 		uint32 probe_id = base_segment_id + slot;
 
 		if (!read_segment_header_via_smgr(probe_id, owner_instance, blockbuf.data, &hdr))
 			break; /* gap or end of pool (file absent / unreadable) */
+		/* A present but unqualified page may hide another writable ACTIVE.
+		 * Never return an earlier candidate from this partial pool. */
+		if (!lifecycle_header_view(probe_id, owner_instance, blockbuf.data, &view))
+			return 0;
+		hdr = view.prefix;
 
 		if (hdr->segment_state == SEGMENT_ACTIVE
 			&& (hdr->segment_flags & UNDO_SEGMENT_FLAG_FULL) == 0) {
@@ -1141,6 +1158,7 @@ cluster_undo_segment_observe_pool(uint8 owner_instance, ClusterUndoPoolObservati
 	base_segment_id = (uint32)(owner_instance - 1) * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
 	for (slot = 0; slot < CLUSTER_UNDO_SEGS_PER_INSTANCE; slot++) {
 		PGAlignedBlock blockbuf;
+		ClusterUndoLifecycleHeaderView view;
 		char path[MAXPGPATH];
 		uint32 segment_id = base_segment_id + slot;
 		ssize_t nread;
@@ -1162,7 +1180,7 @@ cluster_undo_segment_observe_pool(uint8 owner_instance, ClusterUndoPoolObservati
 		if (nread < 0)
 			return CLUSTER_UNDO_POOL_OBS_IO_ERROR;
 		if (nread != BLCKSZ
-			|| !cluster_undo_segment_header_identity_ok(blockbuf.data, segment_id, owner_instance))
+			|| !lifecycle_header_view(segment_id, owner_instance, blockbuf.data, &view))
 			return CLUSTER_UNDO_POOL_OBS_INVALID_HEADER;
 		allocated++;
 	}
