@@ -21,6 +21,7 @@
 #include "catalog/pg_class.h"
 #include "catalog/pg_control.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_semantic_activation.h"
@@ -96,6 +97,9 @@ static jmp_buf error_jump;
 static unsigned retry_replacements, retry_cancel_after, retry_handoffs, retry_cancellations;
 static unsigned truncate_epoch, truncate_drift_at, truncate_wrong_tag;
 static unsigned truncate_captures, truncate_rechecks;
+static unsigned truncate_aux_calls, truncate_aux_retries, truncate_aux_cancel_at;
+static bool truncate_aux_consumes, truncate_aux_missing;
+static ResourceXAuxiliaryAcquireContext *truncate_aux_context;
 volatile sig_atomic_t InterruptPending;
 
 /* A real init handoff has already released the obsolete pin. Cancellation
@@ -368,6 +372,52 @@ UnlockReleaseBuffer(Buffer buffer)
 	ReleaseBuffer(buffer);
 }
 
+/* Original auxiliary API outcomes, not native transport or refcount proof.
+ * A clean refusal owns no content lock and may have consumed the old pin. */
+bool
+ClusterLockBufferExclusiveAuxiliaryAware(Buffer *buffer, ResourceXAuxiliaryAcquireContext *context)
+{
+	UT_ASSERT(buffer != NULL && *buffer == 1 && context != NULL);
+	UT_ASSERT_EQ(pins, 1);
+	UT_ASSERT_EQ(locks, unlocks);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT(!InRecovery && cluster_shared_config && RelationIsPermanent(&relation));
+	truncate_aux_calls++;
+	if (truncate_aux_context == NULL) {
+		truncate_aux_context = context;
+		UT_ASSERT(!context->active);
+		UT_ASSERT_EQ(context->absolute_deadline_us, 0);
+		context->active = true;
+		context->absolute_deadline_us = 12345;
+		context->diagnostic_request_sequence = 71;
+	} else {
+		UT_ASSERT(context == truncate_aux_context);
+		UT_ASSERT(context->active);
+		UT_ASSERT_EQ(context->absolute_deadline_us, 12345);
+		UT_ASSERT_EQ(context->diagnostic_request_sequence, 71);
+		UT_ASSERT_EQ(context->reobserve_count, truncate_aux_calls - 1);
+	}
+	if (truncate_aux_retries > 0) {
+		truncate_aux_retries--;
+		context->reobserve = true;
+		context->reobserve_count++;
+		if (truncate_aux_consumes) {
+			ReleaseBuffer(*buffer);
+			*buffer = InvalidBuffer;
+		}
+		if (truncate_drift_at == 3)
+			truncate_epoch++;
+		if (truncate_aux_missing)
+			storage.smgr_cached_nblocks[VISIBILITYMAP_FORKNUM] = 0;
+		if (truncate_aux_cancel_at == truncate_aux_calls)
+			InterruptPending = true;
+		return false;
+	}
+	LockBuffer(*buffer, BUFFER_LOCK_EXCLUSIVE);
+	memset(context, 0, sizeof(*context));
+	return true;
+}
+
 void
 MarkBufferDirty(Buffer buffer)
 {
@@ -517,6 +567,9 @@ reset(bool shared)
 	retry_replacements = retry_cancel_after = retry_handoffs = retry_cancellations = 0;
 	truncate_epoch = 1;
 	truncate_drift_at = truncate_wrong_tag = truncate_captures = truncate_rechecks = 0;
+	truncate_aux_calls = truncate_aux_retries = truncate_aux_cancel_at = 0;
+	truncate_aux_consumes = truncate_aux_missing = false;
+	truncate_aux_context = NULL;
 	InterruptPending = false;
 }
 
@@ -1259,10 +1312,126 @@ UT_TEST(test_nonversioned_vm_lookup_keeps_original_interrupt_and_init_profile)
 	}
 }
 
+UT_TEST(test_truncate_reobserves_one_original_auxiliary_operation)
+{
+	for (int consumed = 0; consumed < 2; consumed++)
+		for (unsigned retries = 1; retries <= 4; retries += 3)
+			for (int profile = 0; profile < 3; profile++) {
+				truncate_page(true);
+				if (profile == 1)
+					memset(PageGetContents(vm.data), 0, MAPSIZE);
+				if (profile == 2)
+					memset(vm.data, 0, BLCKSZ);
+				truncate_aux_retries = retries;
+				truncate_aux_consumes = consumed != 0;
+				UT_ASSERT_EQ(visibilitymap_prepare_truncate(&relation, 10), 1);
+				UT_ASSERT_EQ(truncate_aux_calls, retries + 1);
+				UT_ASSERT_EQ(reads, retries + 1);
+				UT_ASSERT_EQ(releases, retries + 1);
+				UT_ASSERT_EQ(pins, 0);
+				UT_ASSERT_EQ(identities, 1);
+				UT_ASSERT_EQ(truncate_captures, 1);
+				UT_ASSERT_EQ(truncate_rechecks, 1);
+				UT_ASSERT_EQ(locks, 1);
+				UT_ASSERT_EQ(unlocks, 1);
+				UT_ASSERT_EQ(prepared, profile == 0);
+				UT_ASSERT_EQ(wal_records, profile == 0);
+				UT_ASSERT_EQ(dirty, profile == 0);
+				UT_ASSERT_EQ(init_calls + legacy_wal, 0);
+				if (profile == 0) {
+					UT_ASSERT_EQ(wal_edge.before.mutation_token, 55);
+					UT_ASSERT_EQ((uint8)PageGetContents(vm.data)[2], 0x0f);
+					UT_ASSERT_EQ(PageGetContents(vm.data)[MAPSIZE - 1], 0);
+				}
+			}
+}
+
+UT_TEST(test_truncate_cancel_after_refusal_precedes_repin_and_wal)
+{
+	for (int consumed = 0; consumed < 2; consumed++)
+		for (unsigned cancel = 1; cancel <= 4; cancel += 3) {
+			PGAlignedBlock before;
+
+			truncate_page(true);
+			before = vm;
+			truncate_aux_retries = truncate_aux_cancel_at = cancel;
+			truncate_aux_consumes = consumed != 0;
+			UT_ASSERT(truncate_raises_error());
+			UT_ASSERT_EQ(truncate_aux_calls, cancel);
+			UT_ASSERT_EQ(reads, cancel);
+			UT_ASSERT_EQ(releases, cancel);
+			UT_ASSERT_EQ(pins + locks + unlocks, 0);
+			UT_ASSERT_EQ(retry_cancellations, 1);
+			UT_ASSERT_EQ(truncate_captures, 1);
+			UT_ASSERT_EQ(truncate_rechecks, 0);
+			UT_ASSERT_EQ(init_calls + dirty + prepared + wal_records + legacy_wal, 0);
+			UT_ASSERT(memcmp(before.data, vm.data, BLCKSZ) == 0);
+		}
+}
+
+UT_TEST(test_truncate_reobservation_cannot_refresh_original_space)
+{
+	for (int consumed = 0; consumed < 2; consumed++)
+		for (int profile = 0; profile < 3; profile++) {
+			PGAlignedBlock before;
+
+			truncate_page(true);
+			if (profile == 1)
+				memset(PageGetContents(vm.data), 0, MAPSIZE);
+			if (profile == 2)
+				memset(vm.data, 0, BLCKSZ);
+			before = vm;
+			truncate_aux_retries = 1;
+			truncate_aux_consumes = consumed != 0;
+			truncate_drift_at = 3;
+			UT_ASSERT(truncate_raises_error());
+			UT_ASSERT_EQ(truncate_aux_calls, 2);
+			UT_ASSERT_EQ(reads, 2);
+			UT_ASSERT_EQ(identities, 1);
+			UT_ASSERT_EQ(truncate_captures, 1);
+			UT_ASSERT_EQ(truncate_rechecks, 1);
+			UT_ASSERT_EQ(init_calls + dirty + prepared + wal_records + legacy_wal, 0);
+			UT_ASSERT(memcmp(before.data, vm.data, BLCKSZ) == 0);
+			if (pins != 0)
+				UnlockReleaseBuffer(1); /* Test leaf, not ResourceOwner. */
+		}
+}
+
+UT_TEST(test_truncate_missing_tail_and_nonversioned_profiles_keep_owners)
+{
+	for (int consumed = 0; consumed < 2; consumed++) {
+		PGAlignedBlock before;
+
+		truncate_page(true);
+		before = vm;
+		truncate_aux_retries = 1;
+		truncate_aux_consumes = consumed != 0;
+		truncate_aux_missing = true;
+		UT_ASSERT_EQ(visibilitymap_prepare_truncate(&relation, 10), InvalidBlockNumber);
+		UT_ASSERT_EQ(truncate_aux_calls, 1);
+		UT_ASSERT_EQ(reads, 1);
+		UT_ASSERT_EQ(releases, 1);
+		UT_ASSERT_EQ(pins + locks + unlocks, 0);
+		UT_ASSERT_EQ(init_calls + dirty + prepared + wal_records + legacy_wal, 0);
+		UT_ASSERT(memcmp(before.data, vm.data, BLCKSZ) == 0);
+	}
+	for (int profile = 0; profile < 3; profile++) {
+		truncate_page(profile != 0);
+		if (profile == 1)
+			InRecovery = true;
+		if (profile == 2)
+			relform.relpersistence = RELPERSISTENCE_UNLOGGED;
+		UT_ASSERT_EQ(visibilitymap_prepare_truncate(&relation, 10), 1);
+		UT_ASSERT_EQ(truncate_aux_calls, 0);
+		UT_ASSERT_EQ(pins, 0);
+		UT_ASSERT_EQ(locks, unlocks);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(30);
+	UT_PLAN(34);
 	UT_RUN(test_truncate_rejects_nonpristine_new_tail_before_noop);
 	UT_RUN(test_truncate_rejects_malformed_layout_before_mutation_or_noop);
 	UT_RUN(test_truncate_rejects_wrong_target_before_mutation_or_noop);
@@ -1293,6 +1462,10 @@ main(void)
 	UT_RUN(test_legacy_extension_keeps_native_zero_on_error);
 	UT_RUN(test_write_pin_replaces_wrong_relation_fork_or_map_block);
 	UT_RUN(test_write_pin_reuses_exact_initialized_target_without_io);
+	UT_RUN(test_truncate_reobserves_one_original_auxiliary_operation);
+	UT_RUN(test_truncate_cancel_after_refusal_precedes_repin_and_wal);
+	UT_RUN(test_truncate_reobservation_cannot_refresh_original_space);
+	UT_RUN(test_truncate_missing_tail_and_nonversioned_profiles_keep_owners);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

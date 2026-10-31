@@ -1278,6 +1278,7 @@ visibilitymap_prepare_truncate(Relation rel, BlockNumber nheapblocks)
 			RelationIsPermanent(rel) &&
 			cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) == 1;
 		bool		versioned = !InRecovery && shared_vm;
+		ResourceXAuxiliaryAcquireContext context = {0};
 
 		/* PGRAC: retain the original observation across VM acquisition. */
 		if (versioned &&
@@ -1288,17 +1289,35 @@ visibilitymap_prepare_truncate(Relation rel, BlockNumber nheapblocks)
 
 		newnblocks = truncBlock + 1;
 
-		mapBuffer = vm_readbuf(rel, truncBlock, false);
-		if (!BufferIsValid(mapBuffer))
+		for (;;)
 		{
-			/* nothing to do, the file was already smaller */
-			return InvalidBlockNumber;
+			mapBuffer = vm_readbuf(rel, truncBlock, false);
+			if (!BufferIsValid(mapBuffer))
+			{
+				/* nothing to do, the file was already smaller */
+				return InvalidBlockNumber;
+			}
+#ifdef USE_PGRAC_CLUSTER
+			if (versioned)
+			{
+				if (ClusterLockBufferExclusiveAuxiliaryAware(&mapBuffer, &context))
+					break;
+				/* The handoff may have consumed the old pin. Retain this
+				 * operation's cursor while reobserving its exact relation. */
+				if (BufferIsValid(mapBuffer))
+					ReleaseBuffer(mapBuffer);
+				mapBuffer = InvalidBuffer;
+				CHECK_FOR_INTERRUPTS();
+				continue;
+			}
+#endif
+			LockBuffer(mapBuffer, BUFFER_LOCK_EXCLUSIVE);
+			break;
 		}
 
+		/* A replacement-aware acquisition can change the numeric handle. */
 		page = BufferGetPage(mapBuffer);
 		map = PageGetContents(page);
-
-		LockBuffer(mapBuffer, BUFFER_LOCK_EXCLUSIVE);
 
 #ifdef USE_PGRAC_CLUSTER
 		/* Memory-only checks precede both the no-op and the native mutation;
