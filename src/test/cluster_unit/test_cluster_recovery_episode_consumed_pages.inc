@@ -24,6 +24,7 @@ extern bool test_episode_consumed_cold_applied(const RfSideOnlinePlanV1 *plan,
 	const ClusterWalSourceRef *source, const XLogReaderState *reader);
 
 static unsigned consumed_mode, consumed_cold_calls, consumed_redo_calls;
+static unsigned consumed_foreign_origin = 127;
 static bool consumed_include_foreign;
 static ClusterRecoveryRelmapHistory *consumed_history;
 
@@ -33,7 +34,7 @@ bool
 test_episode_consumed_cold_applied(const RfSideOnlinePlanV1 *plan,
 	const ClusterWalSourceRef *source, const XLogReaderState *reader)
 {
-	if (consumed_mode == 0 || source->claim.identity.origin_node_id != 127)
+	if (consumed_mode == 0 || source->claim.identity.origin_node_id != consumed_foreign_origin)
 		return rf_side_online_plan_clog_applied_v1(plan, source, reader);
 	if (!rf_side_online_plan_clog_matches_v1(plan, source, reader))
 		return false;

@@ -5181,6 +5181,11 @@ test_cluster_relmap_retained_owner.o: $(top_srcdir)/src/backend/cluster/cluster_
 # Link the original episode owner to the real census; observe its final destructor.
 test_cluster_recovery_scope_native_census: test_cluster_recovery_native_inputs.c \
 		test_cluster_recovery_scope_native_census.inc Makefile \
+		test_cluster_recovery_scope_initialized_census.inc \
+		test_cluster_recovery_scope_replayed_census.inc \
+		test_cluster_recovery_scope_startup.h \
+		test_cluster_recovery_scope_startup.o \
+		test_cluster_cold_recovery_startup_plan_core.o \
 		test_cluster_recovery_scope_native_census_product.o \
 		test_cluster_relmap_v2_codec_product.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_pending.o \
@@ -5228,6 +5233,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_recov
 		$(top_srcdir)/src/include/cluster/cluster_wal_tail.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
 		$(if $(filter test_cluster_recovery_scope_native_census,$@),test_cluster_recovery_scope_native_census_product.o test_cluster_relmap_v2_codec_product.o $(top_builddir)/src/backend/cluster/cluster_relmap_pending.o $(top_builddir)/src/backend/cluster/cluster_relmap_retention.o) \
+		$(if $(filter test_cluster_recovery_scope_native_census,$@),test_cluster_recovery_scope_startup.o test_cluster_cold_recovery_startup_plan_core.o $(CLUSTER_COLD_PLAN_SPLIT_O)) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_retained_owner.o) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_cold_checkpoint_publisher.o) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_native_owner.o) \
@@ -6859,7 +6865,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_clog_native_advance_next.inc test_cluster_clog_native_advance_next.inc.tmp
 	rm -f test_cluster_clog_native_horizon.inc test_cluster_clog_native_horizon.inc.tmp
 	rm -f test_cluster_cold_native_side.o
-	rm -f test_cluster_recovery_episode_clog.o test_cluster_recovery_episode_side_owner.o test_cluster_recovery_consumed_inputs.o test_cluster_recovery_scope_native_census_product.o test_cluster_recovery_episode_allocator.o
+	rm -f test_cluster_recovery_episode_clog.o test_cluster_recovery_episode_side_owner.o test_cluster_recovery_consumed_inputs.o test_cluster_recovery_scope_native_census_product.o test_cluster_recovery_episode_allocator.o test_cluster_recovery_scope_startup.o
 	rm -f test_cluster_startup_native_ctrc.o test_cluster_startup_native_ctrc_owner.inc test_cluster_startup_native_ctrc_owner.inc.tmp
 	rm -f test_cluster_side_native_clog.o
 	rm -f test_cluster_tx_exit_dispatch.inc test_cluster_tx_exit_dispatch.inc.tmp \
@@ -12463,6 +12469,23 @@ test_cluster_cold_recovery_effects: test_cluster_cold_recovery_effects.c unit_te
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -lssl -lcrypto -o $@
 
 CLUSTER_COLD_STARTUP_O = test_cluster_cold_recovery_startup_core.o test_cluster_cold_recovery_startup_plan_core.o $(CLUSTER_COLD_PLAN_SPLIT_O)
+
+# Reuse the full Startup core; only pass-1/fence installation is a fixture.
+test_cluster_recovery_scope_startup.o: test_cluster_recovery_scope_startup.c \
+		test_cluster_recovery_scope_startup.h \
+		$(top_srcdir)/src/backend/cluster/cluster_cold_recovery_startup.c \
+		$(top_srcdir)/src/backend/cluster/cluster_side_online_plan_internal.h \
+		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_checkpoint.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h \
+		$(top_srcdir)/src/backend/cluster/cluster_control_bootstrap_private.h \
+		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_census.h \
+		$(top_srcdir)/src/include/cluster/cluster_side_online_plan.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h \
+		$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -c $< -o $@
+
+test_cluster_recovery_scope_native_census: $(CLUSTER_COLD_PLAN_SPLIT_O)
 
 test_cluster_cold_tt_base: test_cluster_cold_tt_base.c unit_test.h test_cluster_heap_small_scn.inc \
 		test_cluster_cold_tt_after_redo.h \

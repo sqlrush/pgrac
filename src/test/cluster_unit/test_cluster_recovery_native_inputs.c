@@ -1140,6 +1140,8 @@ cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **held)
 #undef cluster_relmap_retention_census_destroy
 #undef cluster_relmap_retention_census_execute_native_episode
 #include "test_cluster_recovery_scope_native_census.inc"
+#include "test_cluster_recovery_scope_initialized_census.inc"
+#include "test_cluster_recovery_scope_replayed_census.inc"
 #endif
 
 
@@ -1151,13 +1153,42 @@ main(int argc, char **argv)
 	test_program_path = argv[0];
 	setup_fixture();
 #ifdef RECOVERY_SCOPE_NATIVE_CENSUS
-	UT_PLAN(6);
+	if (getenv("PGRAC_PRE2_TEST_SCOPE_STARTUP") != NULL) {
+		UT_PLAN(2);
+		UT_RUN(test_scope_startup_native_owner_refuses_completed_retention_inputs);
+		UT_RUN(test_scope_startup_required_inputs_cannot_borrow_complete_ir_set);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_SCOPE_REPLAY") != NULL) {
+		UT_PLAN(6);
+		UT_RUN(test_scope_replayed_census_connects_callback_initialization_and_both_pairs);
+		UT_RUN(test_scope_replayed_census_sync_errors_preserve_attempt_and_early_fds);
+		UT_RUN(test_scope_replayed_census_late_source_change_does_not_replay);
+		UT_RUN(test_scope_replayed_census_founder_does_not_replace_foreign_initialization);
+		UT_RUN(test_scope_replayed_census_pair_failure_preserves_replayed_pages);
+		UT_RUN(test_scope_replayed_census_retains_joint_completion_boundary);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	UT_PLAN(19);
 	UT_RUN(test_scope_native_census_uses_original_episode_and_retires_before_holders);
 	UT_RUN(test_scope_native_census_missing_corrupt_pending_pairs_keep_original_debt);
 	UT_RUN(test_scope_native_census_late_source_loss_and_error_do_not_replace_custody);
 	UT_RUN(test_scope_native_census_entry_roles_do_not_borrow_legacy_cold_authority);
 	UT_RUN(test_scope_native_census_keeps_real_history_in_original_two_origin_scope);
 	UT_RUN(test_scope_native_census_refuses_uncovered_and_missing_real_history_windows);
+	UT_RUN(test_scope_initialized_census_shares_complete_original_episode);
+	UT_RUN(test_scope_initialized_census_unknown_birth_preserves_custody);
+	UT_RUN(test_scope_initialized_census_pair_refusal_keeps_native_custody);
+	UT_RUN(test_scope_initialized_census_late_original_owner_loss_invalidates_both);
+	UT_RUN(test_scope_initialized_census_observations_do_not_grant_completion);
+	UT_RUN(test_scope_replayed_census_connects_callback_initialization_and_both_pairs);
+	UT_RUN(test_scope_replayed_census_sync_errors_preserve_attempt_and_early_fds);
+	UT_RUN(test_scope_replayed_census_late_source_change_does_not_replay);
+	UT_RUN(test_scope_replayed_census_founder_does_not_replace_foreign_initialization);
+	UT_RUN(test_scope_replayed_census_pair_failure_preserves_replayed_pages);
+	UT_RUN(test_scope_replayed_census_retains_joint_completion_boundary);
+	UT_RUN(test_scope_startup_native_owner_refuses_completed_retention_inputs);
+	UT_RUN(test_scope_startup_required_inputs_cannot_borrow_complete_ir_set);
 	UT_DONE(); return ut_failed_count != 0;
 #endif
 	if (getenv("PGRAC_PRE2_TEST_INITIALIZED_PAGES") != NULL) {
