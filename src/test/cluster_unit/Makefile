@@ -545,7 +545,7 @@ TESTS += test_cluster_recovery_heap_scan
 TESTS += test_cluster_recovery_undo_scan
 TESTS += test_cluster_recovery_reference_graph
 TESTS += test_cluster_recovery_page_history
-TESTS += test_cluster_recovery_root_set
+TESTS += test_cluster_recovery_root_set test_cluster_recovery_final_namespace
 TESTS += test_cluster_recovery_undo_store
 TESTS += test_cluster_recovery_relation_scan
 TESTS += test_cluster_recovery_native_scan
@@ -560,7 +560,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_recovery_heap_scan,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_undo_scan,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_reference_graph,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_page_history,$(SIMPLE_TESTS))
-SIMPLE_TESTS := $(filter-out test_cluster_recovery_root_set,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_recovery_root_set test_cluster_recovery_final_namespace,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_undo_store,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_relation_scan,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_native_scan,$(SIMPLE_TESTS))
@@ -15335,3 +15335,22 @@ clean: clean-startup-relmap-replay
 clean-startup-relmap-replay:
 	rm -f test_cluster_cold_startup_relmap_storage.o test_cluster_cold_startup_relmap_authority.o \
 		test_cluster_cold_startup_relmap_executor.o
+
+# Final observation uses the original root fixture and backend ERROR boundary.
+test_cluster_recovery_final_namespace: test_cluster_recovery_final_namespace.c test_cluster_recovery_root_set.c test_cluster_recovery_namespace.c test_cluster_recovery_crypto_boundary.h unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_root_set.c \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_root_set.h \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_namespace.c \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_namespace.h \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/backend/cluster/cluster_wal_claim.o cluster_unit_port_stubs.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(top_builddir)/src/backend/cluster/cluster_wal_claim.o $(LDFLAGS) $(CLUSTER_UNIT_CRYPTOHASH_O) \
+		$(CLUSTER_UNIT_PORT_LIBS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+
+clean: clean-final-namespace
+.PHONY: clean-final-namespace
+clean-final-namespace:
+	rm -f test_cluster_recovery_final_namespace
+
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_final_namespace.inc
+
+test_cluster_recovery_native_inputs: test_cluster_recovery_census_namespace.inc

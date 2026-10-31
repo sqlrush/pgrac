@@ -94,8 +94,6 @@ ClusterCfJobResultV1 cluster_wal_inputs_job_cf_release_v1(ClusterWalInputsJobV1 
 { (void)job; (void)before; abort(); }
 bool cluster_wal_inputs_job_begin_outcome_v1(ClusterWalInputsJobV1 *job, uint32 result, bool error)
 { (void)job; (void)result; (void)error; abort(); }
-bool cluster_cf_attempt_wait_slice(const ClusterCfAttemptObservation *observation)
-{ (void)observation; abort(); }
 ClusterControlRootResult cluster_wal_cut_begin_in_context_v1(const ClusterWalSourceRef *source,
 	MemoryContext context, ClusterWalCutV1 **out)
 { (void)source; (void)context; (void)out; abort(); }
@@ -121,6 +119,40 @@ ClusterControlRootResult cluster_wal_cut_begin_in_context_v1(const ClusterWalSou
 #include "cluster/cluster_thread_recovery_authority.h"
 #include "cluster/cluster_write_fence.h"
 #include "cluster/cluster_grd.h"
+
+/* This legacy file fixture never enters typed deadline acquisition. Keep the
+ * new product link dependencies explicit and reject accidental entry. */
+bool
+cluster_cf_lock_deadline_v1(LOCKMODE mode, uint64 deadline_ns)
+{
+	(void)mode; (void)deadline_ns;
+	abort();
+}
+
+ClusterRecoverySerialAcquireResult
+cluster_recovery_serial_input_acquire_deadline_v1(const ClusterRecoverySerialRequest *request,
+	ClusterRecoverySerialGuard *guard, uint64 deadline_ns)
+{
+	(void)request; (void)guard; (void)deadline_ns;
+	abort();
+}
+
+ClusterWalPinResult
+cluster_wal_read_pin_acquire_deadline_v1(const uint16 *threads, uint16 nthreads,
+	ClusterWalReadPinV1 **out, uint64 deadline_ns)
+{
+	(void)threads; (void)nthreads; (void)out; (void)deadline_ns;
+	abort();
+}
+
+ClusterWalPinResult
+cluster_wal_retention_root_publish_begin_deadline_v1(
+	const ClusterControlRootReadToken *expected_root, ClusterWalRootPublishGuard **out_guard,
+	uint64 deadline_ns)
+{
+	(void)expected_root; (void)out_guard; (void)deadline_ns;
+	abort();
+}
 
 /* backend global provided by xlog.c in a real server; the cluster_unit
  * fixture uses the default 16MiB segment size (segment 1 covers

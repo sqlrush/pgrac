@@ -233,6 +233,11 @@ typedef struct ClusterRecoveryCensusPageDigestV1 {
 extern ClusterRecoveryCensusPageDigestV1
 cluster_recovery_census_page_digest_v1(ClusterRecoveryCensus *census, uint32 index);
 
+/* Complete original physical collection, including an originally empty set.
+ * Same owner-written relation objects are permitted; no candidate adoption,
+ * manifest refresh, discharge, retention or completion permission. */
+extern bool cluster_recovery_census_namespace_current_v1(ClusterRecoveryCensus *census);
+
 /* Complete original heap/history emissions. page_index addresses the original
  * physical PAGE view above; version is the original inverse-step ordinal, not
  * an SCN/LSN or a coverage claim. ITL transaction records borrow the original

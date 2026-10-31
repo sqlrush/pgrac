@@ -2377,9 +2377,20 @@ static void startup_local_empty_reset(void);
 
 #include "test_cluster_cold_ctrc_untouched_pages.inc"
 #include "test_cluster_cold_ctrc_post_service.inc"
+#include "test_cluster_cold_ctrc_final_namespace.inc"
 
 int main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_FINAL_NAMESPACE") != NULL) {
+		UT_PLAN(5);
+	UT_RUN(test_startup_final_namespace_covers_completed_and_zero_page_sets);
+	UT_RUN(test_startup_final_namespace_refusal_keeps_same_fd_and_original_scope);
+	UT_RUN(test_startup_final_namespace_late_owner_and_error_keep_debt);
+	UT_RUN(test_startup_final_namespace_repeat_and_wait_cannot_cache_empty_set);
+	UT_RUN(test_startup_final_namespace_rechecks_after_independent_service_wait);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
+
 	if (getenv("PGRAC_PRE2_TEST_POST_SERVICE") != NULL) {
 		UT_PLAN(5);
 		UT_RUN(test_startup_post_service_rechecks_fpi_unchanged_and_zero_page);
@@ -2703,14 +2714,19 @@ int main(void)
 		return ut_failed_count == 0 ? 0 : 1;
 	}
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
-	UT_PLAN(301);
+	UT_PLAN(306);
 	UT_RUN(test_startup_native_directory_empty_preserves_fpi_unchanged_and_zero_page);
 	UT_RUN(test_startup_native_directory_partial_lock_wait_repeats_same_fd_readback);
 	UT_RUN(test_startup_native_directory_real_origin_cannot_be_discharged_by_wait);
 	UT_RUN(test_startup_native_directory_invalid_layout_and_partial_error_keep_debt);
 #else
-	UT_PLAN(297);
+	UT_PLAN(302);
 #endif
+	UT_RUN(test_startup_final_namespace_covers_completed_and_zero_page_sets);
+	UT_RUN(test_startup_final_namespace_refusal_keeps_same_fd_and_original_scope);
+	UT_RUN(test_startup_final_namespace_late_owner_and_error_keep_debt);
+	UT_RUN(test_startup_final_namespace_repeat_and_wait_cannot_cache_empty_set);
+	UT_RUN(test_startup_final_namespace_rechecks_after_independent_service_wait);
 	UT_RUN(test_startup_post_service_rechecks_fpi_unchanged_and_zero_page);
 	UT_RUN(test_startup_post_service_same_fd_readback_drift_and_error_keep_debt);
 	UT_RUN(test_startup_post_service_rechecks_untouched_census_before_handoff);

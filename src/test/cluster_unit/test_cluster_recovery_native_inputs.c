@@ -55,9 +55,12 @@ inventory_test_census(ClusterWalInputsV1 *inputs, ClusterWalCensusVisitorV1 visi
 #undef cluster_wal_inputs_cold_census_v1
 static ClusterRecoveryRootsResult census_current_read(ClusterRecoveryRootSet *roots,
 	uint32 index, uint64 offset, void *buffer, size_t length);
+static void census_namespace_interrupts(void);
+#define HandleStartupProcInterrupts census_namespace_interrupts
 #define cluster_recovery_root_set_read_current_relation census_current_read
 #include "../../backend/cluster/cluster_recovery_census.c"
 #undef cluster_recovery_root_set_read_current_relation
+#undef HandleStartupProcInterrupts
 
 static ClusterWalSourceRef inventory_fault_source;
 static XLogRecPtr inventory_commit_start, inventory_commit_previous;
@@ -1144,6 +1147,7 @@ cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **held)
 #include "test_cluster_recovery_scope_replayed_census.inc"
 #include "test_cluster_recovery_scope_handoff.inc"
 #endif
+#include "test_cluster_recovery_census_namespace.inc"
 
 
 int
@@ -1208,6 +1212,13 @@ main(int argc, char **argv)
 	UT_RUN(test_scope_handoff_original_plan_refuses_missing_relmap_declaration);
 	UT_DONE(); return ut_failed_count != 0;
 #endif
+	if (getenv("PGRAC_PRE2_TEST_CENSUS_NAMESPACE") != NULL) {
+		UT_PLAN(3);
+	UT_RUN(test_census_namespace_complete_set_keeps_original_pages_and_manifest);
+	UT_RUN(test_census_namespace_added_object_revokes_private_census_not_original_pin);
+	UT_RUN(test_census_namespace_preflight_and_entered_source_or_error_keep_pin);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_INITIALIZED_PAGES") != NULL) {
 		UT_PLAN(5);
 		UT_RUN(test_episode_initialized_pages_uses_both_actual_producers);
@@ -1518,7 +1529,11 @@ main(int argc, char **argv)
 		UT_RUN(test_census_references_bound_metadata_and_tuple_storage_before_publication);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(268);
+	UT_PLAN(271);
+	UT_RUN(test_census_namespace_complete_set_keeps_original_pages_and_manifest);
+	UT_RUN(test_census_namespace_added_object_revokes_private_census_not_original_pin);
+	UT_RUN(test_census_namespace_preflight_and_entered_source_or_error_keep_pin);
+
 	UT_RUN(test_episode_initialized_pages_uses_both_actual_producers);
 	UT_RUN(test_episode_initialized_pages_refuses_each_unknown_origin);
 	UT_RUN(test_episode_initialized_pages_refuses_equal_bytes_wrong_birth);
