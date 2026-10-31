@@ -242,6 +242,7 @@ test_episode_native_clog_record_guard(bool (*current)(int, const XLogReaderState
 /* The opt-in route is scoped to one actual original FULL cold call. Original
  * fixture authorization remains the NULL-default provider for every old case. */
 static const ClusterRecoveryRelmapSourceV1 *episode_full_source;
+static const ClusterWalSourceRef *episode_full_cold_source;
 
 /* Explicit fixture teardown after the caller destroyed every held reader. */
 void
@@ -258,9 +259,37 @@ bool
 cluster_undo_recovery_cold_origin_authorized_v1(int origin)
 {
 	return !episode_native_record_only && authority
-		&& (episode_full_source == NULL ? origin == fixture_origin
+		&& (episode_full_cold_source != NULL
+			? origin == episode_full_cold_source->claim.identity.origin_node_id
+			: episode_full_source == NULL ? origin == fixture_origin
 		: origin == episode_full_source->selected.source.claim.identity.origin_node_id
 			&& cluster_wal_inputs_relmap_source_current_v1(episode_full_source));
+}
+
+bool
+test_episode_native_clog_cold_full_apply(const ClusterWalSourceRef *source,
+	const xl_clog_zeropage_full *birth, bool (*current)(void *), void *arg)
+{
+	ClusterSideProjectionOperationV1 op;
+	bool prior_recovery = InRecovery;
+	volatile bool ok = false;
+
+	UT_ASSERT(episode_full_source == NULL && episode_full_cold_source == NULL);
+	if (source == NULL || birth == NULL || current == NULL || !current(arg))
+		return false;
+	op = fixture_clog_record(false, birth->pageno);
+	op.normalized_info = CLOG_ZEROPAGE_FULL;
+	episode_full_cold_source = source;
+	InRecovery = true;
+	PG_TRY(); {
+		ok = cluster_clog_native_recovery_full_record_apply_v1(
+			source->claim.identity.origin_node_id, &op, (const uint8 *)birth, sizeof(*birth));
+	} PG_FINALLY(); {
+		episode_full_cold_source = NULL;
+		InRecovery = prior_recovery;
+	} PG_END_TRY();
+	episode_clog_unlocked();
+	return ok && current(arg);
 }
 
 bool

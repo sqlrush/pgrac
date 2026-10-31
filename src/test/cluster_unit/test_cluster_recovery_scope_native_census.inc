@@ -27,6 +27,7 @@ static int scope_native_fd = -1;
 static unsigned scope_native_destroyed, scope_native_legacy_calls;
 static void (*scope_native_records_hook)(uint8 *, ClusterRecoveryAnchorV2 *);
 static void (*scope_native_capture_hook)(ControlRootImage *);
+static bool (*scope_native_handoff_hook)(ClusterWalInputsV1 **, ControlRootImage *);
 static ClusterControlRootResult scope_native_acquire_result;
 
 bool cluster_recovery_merge_claim_is_held(void);
@@ -265,7 +266,13 @@ scope_native_setup_mode(ClusterWalInputsV1 **inputs, unsigned history_mode)
 	if (history_mode) scope_native_history(&root, &anchors[0], history_mode);
 	UT_ASSERT_EQ(cluster_control_root_v3_encode(&root), 0);
 	v2_write_roots(root.bytes);
-	UT_ASSERT_EQ(cluster_wal_inputs_begin_v1(v2_storage, TEST_SYSID, &original), 0);
+	if (scope_native_handoff_hook != NULL) {
+		MyBackendType = B_STARTUP;
+		inputs_native_recovery = true;
+		test_inputs_startup_cf = true;
+		UT_ASSERT_EQ(cluster_wal_inputs_cold_begin_v1(v2_storage, TEST_SYSID, &original), 0);
+	} else
+		UT_ASSERT_EQ(cluster_wal_inputs_begin_v1(v2_storage, TEST_SYSID, &original), 0);
 	tx_inputs_capture(original, NULL);
 	if (history_mode) {
 		uint32 count = 0;
@@ -278,6 +285,10 @@ scope_native_setup_mode(ClusterWalInputsV1 **inputs, unsigned history_mode)
 			}
 		UT_ASSERT_EQ(count, 2);
 		tx_inputs_typed.participant_count = tx_inputs_typed.replay_count = count;
+	}
+	if (scope_native_handoff_hook != NULL && !scope_native_handoff_hook(&original, &root)) {
+		cluster_wal_inputs_release_v1(&original);
+		return;
 	}
 	cluster_wal_inputs_release_v1(&original);
 	tx_inputs_activate();
@@ -299,7 +310,7 @@ scope_native_setup_mode(ClusterWalInputsV1 **inputs, unsigned history_mode)
 	scope_native_acquire_result = cluster_wal_inputs_ctrc_replays_acquire_v1(*inputs);
 	/* This opt-in fixture exercises refusal before the first native IR.
 	 * It must not proceed with namespace/census setup after that refusal. */
-	if (scope_native_capture_hook != NULL) return;
+	if (scope_native_capture_hook != NULL && scope_native_handoff_hook == NULL) return;
 	UT_ASSERT_EQ(scope_native_acquire_result, 0);
 	UT_ASSERT_EQ(cluster_wal_inputs_ctrc_namespace_v1(*inputs, &scope_native_fd), 0);
 	UT_ASSERT_EQ(mkdirat(scope_native_fd, "base", 0700), 0);

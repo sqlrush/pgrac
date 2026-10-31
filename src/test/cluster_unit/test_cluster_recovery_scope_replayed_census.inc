@@ -24,6 +24,7 @@ static int scope_replay_early_fds[2];
 
 #include "test_cluster_recovery_scope_startup.h"
 static bool scope_replay_startup;
+static bool scope_handoff_replaying;
 static ClusterWalInputsV1 *scope_startup_inputs;
 static ClusterRecoveryRelmapSourceV1 scope_startup_sources[2];
 
@@ -33,6 +34,11 @@ static ClusterRecoveryRelmapSourceV1 scope_startup_sources[2];
 bool
 cluster_recovery_merge_fence_plan_revalidate_nowait(ClusterRecoveryFencePlan *fence)
 {
+	/* The pre-EOR fence is a controlled external leaf, distinct from the
+	 * later complete-scope IRs. Real Startup rechecks every REQUIRED ROOT. */
+	if (scope_handoff_replaying)
+		return fence == (ClusterRecoveryFencePlan *)&tx_inputs_typed
+			&& RecoveryInProgress() && !inputs_pin_held && ctrc_set_held == 0;
 	if (!scope_replay_startup || fence != (ClusterRecoveryFencePlan *)&tx_inputs_typed
 		|| scope_startup_inputs == NULL || ctrc_set_held != 2 || !inputs_pin_held)
 		return false;

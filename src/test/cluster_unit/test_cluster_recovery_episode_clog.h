@@ -38,6 +38,10 @@ extern void test_episode_native_clog_discard_foreign(unsigned origin);
 /* Actual cold native initialization; original episode authority is a fixture. */
 extern bool test_episode_native_clog_full_apply(const ClusterRecoveryRelmapSourceV1 *source,
 	const xl_clog_zeropage_full *birth);
+/* Pre-EOR foreign native leaf, bracketed by the original Startup source owner.
+ * The external cold authority is still controlled, never a relmap grant. */
+extern bool test_episode_native_clog_cold_full_apply(const ClusterWalSourceRef *source,
+	const xl_clog_zeropage_full *birth, bool (*current)(void *), void *arg);
 /* Original replay callback, with faults after redo and before physical finish. */
 typedef struct TestEpisodeClogReplayStats {
 	unsigned redos, touches, file_syncs, directory_syncs;
