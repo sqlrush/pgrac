@@ -5183,8 +5183,11 @@ test_cluster_recovery_scope_native_census: test_cluster_recovery_native_inputs.c
 		test_cluster_recovery_scope_native_census.inc Makefile \
 		test_cluster_recovery_scope_initialized_census.inc \
 		test_cluster_recovery_scope_replayed_census.inc \
+		test_cluster_recovery_scope_handoff.inc \
 		test_cluster_recovery_scope_startup.h \
 		test_cluster_recovery_scope_startup.o \
+		test_cluster_cold_recovery_io_core.o \
+		$(top_builddir)/src/backend/cluster/cluster_wal_restart_read.o \
 		test_cluster_cold_recovery_startup_plan_core.o \
 		test_cluster_recovery_scope_native_census_product.o \
 		test_cluster_relmap_v2_codec_product.o \
@@ -5233,7 +5236,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_recov
 		$(top_srcdir)/src/include/cluster/cluster_wal_tail.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
 		$(if $(filter test_cluster_recovery_scope_native_census,$@),test_cluster_recovery_scope_native_census_product.o test_cluster_relmap_v2_codec_product.o $(top_builddir)/src/backend/cluster/cluster_relmap_pending.o $(top_builddir)/src/backend/cluster/cluster_relmap_retention.o) \
-		$(if $(filter test_cluster_recovery_scope_native_census,$@),test_cluster_recovery_scope_startup.o test_cluster_cold_recovery_startup_plan_core.o $(CLUSTER_COLD_PLAN_SPLIT_O)) \
+		$(if $(filter test_cluster_recovery_scope_native_census,$@),test_cluster_recovery_scope_startup.o test_cluster_cold_recovery_io_core.o $(top_builddir)/src/backend/cluster/cluster_wal_restart_read.o test_cluster_cold_recovery_startup_plan_core.o $(CLUSTER_COLD_PLAN_SPLIT_O)) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_retained_owner.o) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_cold_checkpoint_publisher.o) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_native_owner.o) \

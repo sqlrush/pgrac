@@ -1142,6 +1142,7 @@ cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **held)
 #include "test_cluster_recovery_scope_native_census.inc"
 #include "test_cluster_recovery_scope_initialized_census.inc"
 #include "test_cluster_recovery_scope_replayed_census.inc"
+#include "test_cluster_recovery_scope_handoff.inc"
 #endif
 
 
@@ -1153,6 +1154,13 @@ main(int argc, char **argv)
 	test_program_path = argv[0];
 	setup_fixture();
 #ifdef RECOVERY_SCOPE_NATIVE_CENSUS
+	if (getenv("PGRAC_PRE2_TEST_SCOPE_HANDOFF") != NULL) {
+		UT_PLAN(3);
+		UT_RUN(test_scope_handoff_reuses_native_receipt_without_replaying_after_eor);
+		UT_RUN(test_scope_handoff_native_failure_cannot_publish_or_retry);
+		UT_RUN(test_scope_handoff_late_census_failures_keep_receipts_and_held_pages);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_SCOPE_STARTUP") != NULL) {
 		UT_PLAN(2);
 		UT_RUN(test_scope_startup_native_owner_refuses_completed_retention_inputs);
@@ -1169,7 +1177,7 @@ main(int argc, char **argv)
 		UT_RUN(test_scope_replayed_census_retains_joint_completion_boundary);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(19);
+	UT_PLAN(22);
 	UT_RUN(test_scope_native_census_uses_original_episode_and_retires_before_holders);
 	UT_RUN(test_scope_native_census_missing_corrupt_pending_pairs_keep_original_debt);
 	UT_RUN(test_scope_native_census_late_source_loss_and_error_do_not_replace_custody);
@@ -1189,6 +1197,9 @@ main(int argc, char **argv)
 	UT_RUN(test_scope_replayed_census_retains_joint_completion_boundary);
 	UT_RUN(test_scope_startup_native_owner_refuses_completed_retention_inputs);
 	UT_RUN(test_scope_startup_required_inputs_cannot_borrow_complete_ir_set);
+	UT_RUN(test_scope_handoff_reuses_native_receipt_without_replaying_after_eor);
+	UT_RUN(test_scope_handoff_native_failure_cannot_publish_or_retry);
+	UT_RUN(test_scope_handoff_late_census_failures_keep_receipts_and_held_pages);
 	UT_DONE(); return ut_failed_count != 0;
 #endif
 	if (getenv("PGRAC_PRE2_TEST_INITIALIZED_PAGES") != NULL) {

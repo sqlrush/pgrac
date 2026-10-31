@@ -20,6 +20,50 @@ static ColdRoot scope_startup_roots[2];
 static uint32 scope_startup_count;
 
 bool
+test_scope_startup_sources_current(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence)
+{
+	/* The native record owner uses this exact ROOT/checkpoint/fence bracket.
+	 * The general SIDE sequencer's installed plan is still a fixture here. */
+	return typed != NULL && typed->refusal == CLUSTER_COLD_OK
+		&& typed->replay_roots == scope_startup_roots && scope_startup_count == 2
+		&& typed->replay_root_count == scope_startup_count
+		&& cluster_cold_replay_window_active_v1() && cold_replay_sources_current(typed, fence);
+}
+
+bool
+test_scope_startup_attach_cold(ClusterColdTypedV1 *typed, const ClusterWalInputV1 *sources)
+{
+	if (scope_startup_count != 0 || typed == NULL || sources == NULL || typed->plan == NULL
+		|| typed->replay_roots != NULL || typed->participant_count != lengthof(scope_startup_roots)
+		|| typed->replay_count != typed->participant_count)
+		return false;
+	memset(scope_startup_roots, 0, sizeof(scope_startup_roots));
+	for (uint32 i = 0; i < typed->participant_count; ++i) {
+		ColdRoot *root = &scope_startup_roots[i];
+		const ClusterWalInputV1 *selected = &sources[i];
+
+		if (memcmp(&selected->source, &typed->sources[i], sizeof(selected->source)) != 0
+			|| selected->checkpoint.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+			|| cluster_control_root_read_canonical(selected->source.claim.identity.origin_thread_id,
+				&selected->source.claim.identity, CLUSTER_CONTROL_ROOT_READ_STRONG,
+				&root->root, &root->token) != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			|| memcmp(&root->root, &selected->checkpoint, sizeof(root->root)) != 0)
+			return false;
+		root->checkpoint_start = selected->checkpoint_start;
+		root->native_checkpoint = selected->native_checkpoint;
+		memcpy(root->native_window, selected->native_window, sizeof(root->native_window));
+		root->checkpoint_captured = true;
+	}
+	typed->replay_roots = scope_startup_roots;
+	typed->replay_root_count = typed->replay_count;
+	memcpy(typed->observer.storage_uuid, typed->sources[0].claim.identity.storage_uuid, 16);
+	typed->observer.database_incarnation = typed->sources[0].claim.database_incarnation;
+	scope_startup_count = typed->participant_count;
+	cluster_cold_replay_window_enter_v1();
+	return true;
+}
+
+bool
 test_scope_startup_attach(ClusterColdTypedV1 *typed,
 	const ClusterRecoveryRelmapSourceV1 *sources)
 {

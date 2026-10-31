@@ -77,23 +77,12 @@ scope_initialized_records(uint8 *bytes, ClusterRecoveryAnchorV2 *anchors)
 }
 
 static void
-scope_initialized_begin(ClusterWalInputsV1 **inputs, ClusterRecoveryRelmapHistory **history,
-	ClusterRelmapV2Image *pending, bool foreign)
+scope_initialized_storage(void)
 {
 	const char *dirs[] = {"native_side", "native_side/origin_0", "native_side/origin_0/pg_xact",
 		"native_side/origin_1", "native_side/origin_1/pg_xact"};
-	ClusterRecoveryNativeInventoryDiag diag;
-	ClusterRecoveryRelmapFoldSummary summary;
 	char path[MAXPGPATH];
 
-	episode_base_reset();
-	episode_native_clog = true;
-	episode_birth_match_mode = 0;
-	episode_native_pages_foreign = 1;
-	episode_native_pages_duplicate = false;
-	scope_native_records_hook = scope_initialized_records;
-	scope_native_setup(inputs);
-	scope_native_records_hook = NULL;
 	for (unsigned i = 0; i < lengthof(dirs); ++i) {
 		snprintf(path, sizeof(path), "%s/%s", cluster_shared_data_dir, dirs[i]);
 		UT_ASSERT_EQ(mkdir(path, 0700), 0);
@@ -107,6 +96,24 @@ scope_initialized_begin(ClusterWalInputsV1 **inputs, ClusterRecoveryRelmapHistor
 	episode_native_pages_file(0, 128, 0, 0);
 	episode_native_pages_file(1, 17, 0, 0);
 	test_episode_native_clog_start(cluster_shared_data_dir);
+}
+
+static void
+scope_initialized_begin(ClusterWalInputsV1 **inputs, ClusterRecoveryRelmapHistory **history,
+	ClusterRelmapV2Image *pending, bool foreign)
+{
+	ClusterRecoveryNativeInventoryDiag diag;
+	ClusterRecoveryRelmapFoldSummary summary;
+
+	episode_base_reset();
+	episode_native_clog = true;
+	episode_birth_match_mode = 0;
+	episode_native_pages_foreign = 1;
+	episode_native_pages_duplicate = false;
+	scope_native_records_hook = scope_initialized_records;
+	scope_native_setup(inputs);
+	scope_native_records_hook = NULL;
+	scope_initialized_storage();
 	episode_clog_side_fault = 0;
 	episode_clog_side_plans(*inputs);
 	UT_ASSERT_EQ(episode_history_build(*inputs, 8 * 1024 * 1024, history, &diag), 0);
@@ -163,19 +170,12 @@ scope_initialized_read(ClusterRecoveryRelmapHistory *history, const ClusterRelma
 }
 
 static void
-scope_initialized_end(ClusterWalInputsV1 **inputs, ClusterRecoveryRelmapHistory **history,
-	const int fds[2])
+scope_initialized_storage_end(void)
 {
 	char path[MAXPGPATH];
 	const char *dirs[] = {"native_side/origin_0/pg_xact", "native_side/origin_0",
 		"native_side/origin_1/pg_xact", "native_side/origin_1", "native_side"};
 
-	cluster_recovery_relmap_history_destroy_v1(history);
-	for (unsigned i = 0; i < 2; ++i) if (fds[i] >= 0) UT_ASSERT_EQ(fcntl(fds[i], F_GETFD), -1);
-	UT_ASSERT(ctrc_set_held == 2 && inputs_pin_held && fcntl(scope_native_fd, F_GETFD) >= 0);
-	for (uint32 p = 0; p < tx_inputs_typed.participant_count; ++p)
-		rf_side_online_plan_destroy_v1(&tx_inputs_typed.side_plans[p]);
-	scope_native_finish(inputs); /* The original scope retires its census before IR/WALR. */
 	test_episode_native_clog_discard_foreign(1);
 	test_episode_native_clog_stop();
 	episode_native_pages_path(path, 0, 128); UT_ASSERT_EQ(unlink(path), 0);
@@ -190,6 +190,19 @@ scope_initialized_end(ClusterWalInputsV1 **inputs, ClusterRecoveryRelmapHistory 
 	episode_native_clog = false;
 	consumed_mode = 0;
 	consumed_foreign_origin = 127;
+}
+
+static void
+scope_initialized_end(ClusterWalInputsV1 **inputs, ClusterRecoveryRelmapHistory **history,
+	const int fds[2])
+{
+	cluster_recovery_relmap_history_destroy_v1(history);
+	for (unsigned i = 0; i < 2; ++i) if (fds[i] >= 0) UT_ASSERT_EQ(fcntl(fds[i], F_GETFD), -1);
+	UT_ASSERT(ctrc_set_held == 2 && inputs_pin_held && fcntl(scope_native_fd, F_GETFD) >= 0);
+	for (uint32 p = 0; p < tx_inputs_typed.participant_count; ++p)
+		rf_side_online_plan_destroy_v1(&tx_inputs_typed.side_plans[p]);
+	scope_native_finish(inputs); /* The original scope retires its census before IR/WALR. */
+	scope_initialized_storage_end();
 }
 
 UT_TEST(test_scope_initialized_census_shares_complete_original_episode)

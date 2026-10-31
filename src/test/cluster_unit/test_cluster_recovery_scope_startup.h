@@ -17,6 +17,10 @@
 
 extern bool test_scope_startup_attach(ClusterColdTypedV1 *typed,
 	const ClusterRecoveryRelmapSourceV1 *sources);
+extern bool test_scope_startup_attach_cold(ClusterColdTypedV1 *typed,
+	const ClusterWalInputV1 *sources);
+extern bool test_scope_startup_sources_current(ClusterColdTypedV1 *typed,
+	struct ClusterRecoveryFencePlan *fence);
 extern bool test_scope_startup_origin(uint16 index, uint16 *thread,
 	ClusterControlRootSnapshot *root, ClusterControlRootReadToken *token);
 extern void test_scope_startup_detach(ClusterColdTypedV1 *typed);
