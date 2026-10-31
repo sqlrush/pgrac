@@ -12,6 +12,12 @@ static unsigned hot_refs_calls, hot_refs_fault;
 bool
 cluster_ctrc_recovery_heap_hot_references_v1(const char *image, BlockNumber block)
 {
+#ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
+	if (startup_native_images) {
+		startup_native_image_calls[2]++;
+		return test_startup_native_ctrc_hot(image, block);
+	}
+#endif
 	if (!hot_refs_check) return true;
 	hot_refs_calls++;
 	UT_ASSERT(image != NULL);

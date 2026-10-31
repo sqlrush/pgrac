@@ -178,6 +178,11 @@ static ClusterUndoBlock0Pin *reserved_target;
 static ClusterUndoBlock0LogicalKey target_key;
 static ClusterUndoBlock0AuthorityProof target_proof;
 static char scope_storage;
+#ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
+#include "test_cluster_startup_native_ctrc.h"
+static bool startup_native_images;
+static unsigned startup_native_image_calls[3];
+#endif
 static unsigned stamp_prepares, stamp_closes, projections;
 static bool projection_ok;
 static bool stamp_prepare_ok, stamp_close_ok, stamp_live, invalidate_writer_on_prepare;
@@ -2380,6 +2385,7 @@ static void startup_local_empty_reset(void);
 #include "test_cluster_cold_ctrc_final_local_empty.inc"
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
 #include "test_cluster_cold_ctrc_native_directory.inc"
+#include "test_cluster_cold_ctrc_native_images.inc"
 #endif
 
 #include "test_cluster_cold_ctrc_untouched_pages.inc"
@@ -2391,6 +2397,17 @@ static void startup_local_empty_reset(void);
 
 int main(void)
 {
+#ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
+	if (getenv("PGRAC_PRE2_TEST_START_NATIVE_IMAGES") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_startup_native_images_accept_only_unchanged_complete_terminal_page);
+		UT_RUN(test_startup_native_images_reject_unresolved_ambiguous_and_mx_itls);
+		UT_RUN(test_startup_native_images_reject_dangling_tuple_hot_and_residual_locks);
+		UT_RUN(test_startup_native_images_wait_and_repeat_keep_same_fd_and_sticky_debt);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
+#endif
+
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_FIRST
 	if (getenv("PGRAC_PRE2_TEST_START_NATIVE_FIRST") != NULL) {
 		UT_PLAN(4);
@@ -2735,10 +2752,14 @@ int main(void)
 	}
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_FIRST
-	UT_PLAN(310);
+	UT_PLAN(314);
 #else
-	UT_PLAN(306);
+	UT_PLAN(310);
 #endif
+	UT_RUN(test_startup_native_images_accept_only_unchanged_complete_terminal_page);
+	UT_RUN(test_startup_native_images_reject_unresolved_ambiguous_and_mx_itls);
+	UT_RUN(test_startup_native_images_reject_dangling_tuple_hot_and_residual_locks);
+	UT_RUN(test_startup_native_images_wait_and_repeat_keep_same_fd_and_sticky_debt);
 	UT_RUN(test_startup_native_directory_empty_preserves_fpi_unchanged_and_zero_page);
 	UT_RUN(test_startup_native_directory_partial_lock_wait_repeats_same_fd_readback);
 	UT_RUN(test_startup_native_directory_real_origin_cannot_be_discharged_by_wait);
