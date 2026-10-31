@@ -806,10 +806,91 @@ UT_TEST(test_capacity_failure_cannot_partially_enroll_published_binding)
 				 CLUSTER_RELMAP_RETENTION_RETAINED);
 }
 
+UT_TEST(test_prepare_snapshot_copies_actual_pin_and_allows_exact_stage_only)
+{
+	ClusterRelmapRetentionDirectory d, before;
+	ClusterRelmapRetentionKey key = key_for(42, BASE + 100);
+	ClusterRelmapRetentionKey other = key_for(43, BASE + 200);
+	ClusterCanonicalTxnBinding binding = binding_for(key.top_full_xid);
+	ClusterRelmapRetentionSnapshot snapshot;
+
+	ready(&d);
+	UT_ASSERT_EQ(cluster_relmap_retention_begin_bound(&d, &key, &binding), OK);
+	UT_ASSERT_EQ(cluster_relmap_retention_begin(&d, &other), OK);
+	before = d;
+	UT_ASSERT_EQ(cluster_relmap_retention_prepare_capture(&d, &key, &snapshot), OK);
+	UT_ASSERT(memcmp(&d, &before, sizeof(d)) == 0);
+	UT_ASSERT(snapshot.pin.occupied && snapshot.pin.has_tt_binding);
+	UT_ASSERT_EQ(snapshot.pin.binding.active_lsn, binding.active_lsn);
+	UT_ASSERT_EQ(snapshot.generation, d.generation);
+	UT_ASSERT_EQ(snapshot.native_floor, d.native_floor);
+	UT_ASSERT_EQ(snapshot.last_issued, d.last_issued);
+	UT_ASSERT_EQ(cluster_relmap_retention_prepare_matches(&d, &key, &snapshot, false, 0), OK);
+	UT_ASSERT_NE(cluster_relmap_retention_prepare_matches(&d, &other, &snapshot, false, 0), OK);
+	UT_ASSERT_NE(cluster_relmap_retention_prepare_matches(&d, &key, &snapshot, true, 0x888), OK);
+	UT_ASSERT_EQ(cluster_relmap_retention_stage_start(&d, &other, 0x777), OK);
+	UT_ASSERT_EQ(cluster_relmap_retention_prepare_matches(&d, &key, &snapshot, false, 0), OK);
+	UT_ASSERT_EQ(cluster_relmap_retention_stage_start(&d, &key, 0x888), OK);
+	UT_ASSERT_EQ(cluster_relmap_retention_prepare_matches(&d, &key, &snapshot, true, 0x888), OK);
+	UT_ASSERT_NE(cluster_relmap_retention_prepare_matches(&d, &key, &snapshot, true, 0x889), OK);
+	UT_ASSERT_NE(cluster_relmap_retention_prepare_matches(&d, &key, &snapshot, false, 0), OK);
+	UT_ASSERT(!snapshot.pin.may_be_staged && snapshot.pin.wal_end == 0);
+}
+
+UT_TEST(test_prepare_snapshot_refuses_every_original_binding_field_change)
+{
+	for (unsigned fault = 0; fault < 10; ++fault) {
+		ClusterRelmapRetentionDirectory d, before;
+		ClusterRelmapRetentionKey key = key_for(42, BASE + 100);
+		ClusterCanonicalTxnBinding binding = binding_for(key.top_full_xid);
+		ClusterRelmapRetentionSnapshot snapshot;
+		ready(&d);
+		UT_ASSERT_EQ(cluster_relmap_retention_begin_bound(&d, &key, &binding), OK);
+		UT_ASSERT_EQ(cluster_relmap_retention_prepare_capture(&d, &key, &snapshot), OK);
+		switch (fault) {
+		case 0: ++d.pins[0].binding.segment_id; break;
+		case 1: ++d.pins[0].binding.segment_generation; break;
+		case 2: ++d.pins[0].binding.xid; break;
+		case 3: --d.pins[0].binding.slot_offset; break;
+		case 4: ++d.pins[0].binding.slot_wrap; break;
+		case 5: ++d.pins[0].binding.origin_instance; break;
+		case 6: ++d.pins[0].binding.active_lsn; break;
+		case 7: d.pins[0].binding.publish_state = 0; break;
+		case 8: ++d.pins[0].binding.reserved16; break;
+		case 9: d.pins[0].has_tt_binding = false; break;
+		}
+		before = d;
+		UT_ASSERT_NE(cluster_relmap_retention_prepare_matches(&d, &key, &snapshot, false, 0), OK);
+		UT_ASSERT(memcmp(&d, &before, sizeof(d)) == 0);
+	}
+}
+
+UT_TEST(test_prepare_snapshot_alias_refusal_preserves_original_storage)
+{
+	ClusterRelmapRetentionDirectory d, before;
+	ClusterRelmapRetentionKey key = key_for(42, BASE + 100), key_before;
+	ClusterRelmapRetentionSnapshot snapshot, zero = {0};
+	ready(&d);
+	UT_ASSERT_EQ(cluster_relmap_retention_begin(&d, &key), OK);
+	before = d;
+	key_before = key;
+	UT_ASSERT_NE(cluster_relmap_retention_prepare_capture(&d, &key,
+		(ClusterRelmapRetentionSnapshot *)&d.pins[0]), OK);
+	UT_ASSERT_NE(cluster_relmap_retention_prepare_capture(&d, &key,
+		(ClusterRelmapRetentionSnapshot *)&key), OK);
+	UT_ASSERT(memcmp(&d, &before, sizeof(d)) == 0);
+	UT_ASSERT(memcmp(&key, &key_before, sizeof(key)) == 0);
+	memset(&snapshot, 0xa5, sizeof(snapshot));
+	UT_ASSERT_NE(cluster_relmap_retention_prepare_capture(NULL, &key, &snapshot), OK);
+	UT_ASSERT(memcmp(&snapshot, &zero, sizeof(snapshot)) == 0);
+	UT_ASSERT_NE(cluster_relmap_retention_prepare_matches(&d, &key, NULL, false, 0), OK);
+	UT_ASSERT_NE(cluster_relmap_retention_prepare_matches(&d, &key, &zero, false, 0), OK);
+}
+
 int
 main(void)
 {
-	UT_PLAN(38);
+	UT_PLAN(41);
 	UT_RUN(test_unknown_and_building_cannot_authorize_consumers);
 	UT_RUN(test_complete_empty_census_allows_normal_progress);
 	UT_RUN(test_begin_first_clamps_native_truncate_to_pin);
@@ -848,6 +929,9 @@ main(void)
 	UT_RUN(test_cancel_clears_only_unstaged_relmap_binding_edge);
 	UT_RUN(test_restored_pending_needs_real_tt_enrollment);
 	UT_RUN(test_capacity_failure_cannot_partially_enroll_published_binding);
+	UT_RUN(test_prepare_snapshot_copies_actual_pin_and_allows_exact_stage_only);
+	UT_RUN(test_prepare_snapshot_refuses_every_original_binding_field_change);
+	UT_RUN(test_prepare_snapshot_alias_refusal_preserves_original_storage);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

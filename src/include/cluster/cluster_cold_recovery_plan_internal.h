@@ -31,6 +31,7 @@
 
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_cold_relmap.h"
+#include "cluster/cluster_relmap_retention.h"
 
 #ifdef USE_CLUSTER_UNIT
 #define cold_alloc0(size_) calloc(1, (size_))
@@ -106,6 +107,8 @@ typedef struct ColdRelmapInput {
 	bool captured;
 	bool attempted;
 	bool applied;
+	bool has_retention_snapshot;
+	ClusterRelmapRetentionSnapshot retention_snapshot;
 } ColdRelmapInput;
 
 /* Shared shape validation; caller has validated plan/count/storage. */

@@ -66,7 +66,8 @@ relmap_side_matches(const ClusterColdTypedV1 *typed, const ClusterColdRelmapInpu
 }
 
 static bool
-relmap_pin(const ClusterColdRelmapInputV1 *input, bool staged)
+relmap_pin(const ClusterColdRelmapInputV1 *input, bool staged,
+	const ClusterRelmapRetentionSnapshot *expected, ClusterRelmapRetentionSnapshot *capture)
 {
 	const ClusterRelmapV2Image *image = &input->staged;
 	const ClusterRelmapV2Owner *owner = &image->pending_owner;
@@ -87,10 +88,18 @@ relmap_pin(const ClusterColdRelmapInputV1 *input, bool staged)
 	{
 		LWLockAcquire(input->retention_lock, LW_EXCLUSIVE);
 		locked = true;
-		ok = (staged
-			? cluster_relmap_retention_stage_check(input->retention, &key, owner->wal_end)
-			: cluster_relmap_retention_prepare_check(input->retention, &key))
-			== CLUSTER_RELMAP_RETENTION_OK;
+		if (capture != NULL)
+			ok = !staged && expected == NULL
+				&& cluster_relmap_retention_prepare_capture(input->retention, &key, capture)
+					== CLUSTER_RELMAP_RETENTION_OK;
+		else if (expected != NULL)
+			ok = cluster_relmap_retention_prepare_matches(input->retention, &key, expected,
+				staged, staged ? owner->wal_end : 0) == CLUSTER_RELMAP_RETENTION_OK;
+		else
+			ok = (staged
+				? cluster_relmap_retention_stage_check(input->retention, &key, owner->wal_end)
+				: cluster_relmap_retention_prepare_check(input->retention, &key))
+				== CLUSTER_RELMAP_RETENTION_OK;
 		LWLockRelease(input->retention_lock);
 		locked = false;
 	}
@@ -103,6 +112,13 @@ relmap_pin(const ClusterColdRelmapInputV1 *input, bool staged)
 	}
 	PG_END_TRY();
 	return ok;
+}
+
+static bool
+relmap_entry_pin(const ColdRelmapInput *entry, bool staged)
+{
+	return relmap_pin(&entry->input, staged,
+		entry->has_retention_snapshot ? &entry->retention_snapshot : NULL, NULL);
 }
 
 static bool
@@ -179,7 +195,8 @@ cluster_cold_plan_relmap_from_wal_v1(ClusterColdPlanV1 *plan,
 	const ClusterColdRelmapWalV1 *wal, uint32 count)
 {
 	ClusterColdRelmapInputV1 *inputs;
-	Size scratch, total;
+	ClusterRelmapRetentionSnapshot *snapshots;
+	Size input_bytes, scratch, total;
 	volatile ClusterColdDetailV1 detail = CLUSTER_COLD_STRUCTURAL_UNSUPPORTED;
 
 	if (!plan_valid(plan) || sources == NULL || wal == NULL || count == 0
@@ -193,13 +210,15 @@ cluster_cold_plan_relmap_from_wal_v1(ClusterColdPlanV1 *plan,
 	 * scratch AND copied declarations must fit the original plan budget. */
 	plan->relmap_failed = true;
 	plan->phase = COLD_PHASE_FAILED;
-	scratch = (Size)count * sizeof(*inputs);
+	input_bytes = MAXALIGN((Size)count * sizeof(*inputs));
+	scratch = input_bytes + (Size)count * sizeof(*snapshots);
 	total = scratch + (Size)count * sizeof(ColdRelmapInput);
 	if (total > plan->memory_budget || plan->memory_used > plan->memory_budget - total)
 		return CLUSTER_COLD_CAPACITY;
 	inputs = cold_plan_scratch(plan, scratch, NULL);
 	if (inputs == NULL)
 		return CLUSTER_COLD_CAPACITY;
+	snapshots = (ClusterRelmapRetentionSnapshot *)((char *)inputs + input_bytes);
 	PG_TRY();
 	{
 		bool ok = enableFsync && cluster_relmap_authority_x_held();
@@ -209,11 +228,12 @@ cluster_cold_plan_relmap_from_wal_v1(ClusterColdPlanV1 *plan,
 			ok = cold_relmap_inputs_valid(plan, inputs, count) == CLUSTER_COLD_OK;
 		/* Complete shape/source/namespace and all original pins first. */
 		for (uint32 i = 0; i < count && ok; ++i)
-			ok = relmap_pin(&inputs[i], false);
+			ok = relmap_pin(&inputs[i], false, NULL, &snapshots[i]);
 		for (uint32 i = 0; i < count && ok; ++i) {
 			ClusterRelmapV2View base;
 			unsigned char encoded[CLUSTER_RELMAP_V2_FILE_SIZE];
-			ok = cluster_relmap_authority_x_held() && relmap_pin(&inputs[i], false)
+			ok = cluster_relmap_authority_x_held()
+				&& relmap_pin(&inputs[i], false, &snapshots[i], NULL)
 				&& cluster_relmap_authority_v2_read(&inputs[i].staged.identity, &base)
 					== CLUSTER_RELMAP_V2_PAIR_VALID
 				&& base.pending_complete && !base.has_pending
@@ -227,7 +247,8 @@ cluster_cold_plan_relmap_from_wal_v1(ClusterColdPlanV1 *plan,
 		/* A later read may invalidate an earlier pin or reuse its reader.
 		 * Recheck the complete original batch before publishing any output. */
 		for (uint32 i = 0; i < count && ok; ++i)
-			ok = cluster_relmap_authority_x_held() && relmap_pin(&inputs[i], false)
+			ok = cluster_relmap_authority_x_held()
+				&& relmap_pin(&inputs[i], false, &snapshots[i], NULL)
 				&& wal[i].reader != NULL
 				&& wal[i].reader->system_identifier == inputs[i].staged.identity.system_identifier
 				&& wal[i].reader->cluster_expected_thread_id == inputs[i].cut.thread_id
@@ -236,6 +257,11 @@ cluster_cold_plan_relmap_from_wal_v1(ClusterColdPlanV1 *plan,
 		if (ok) {
 			plan->phase = COLD_PHASE_FEEDING;
 			detail = cluster_cold_plan_relmap_declare_v1(plan, inputs, count);
+			if (detail == CLUSTER_COLD_OK)
+				for (uint32 i = 0; i < count; ++i) {
+					plan->relmap_inputs[i].retention_snapshot = snapshots[i];
+					plan->relmap_inputs[i].has_retention_snapshot = true;
+				}
 		}
 	}
 	PG_CATCH();
@@ -291,7 +317,7 @@ cluster_cold_typed_relmap_record_v1(ClusterColdTypedV1 *typed,
 			&& relmap_side_matches(typed, input, reader)
 			&& relmap_record_matches(input, reader)
 			&& cluster_relmap_v2_encode(&input->staged, encoded, sizeof(encoded)) == CLUSTER_RELMAP_V2_VALID
-			&& relmap_pin(input, entry->applied)) {
+			&& relmap_entry_pin(entry, entry->applied)) {
 			if (entry->applied)
 				ok = cluster_relmap_authority_v2_check_staged(&input->staged);
 			else if (cluster_relmap_authority_v2_read(&input->staged.identity, &base)
@@ -299,12 +325,12 @@ cluster_cold_typed_relmap_record_v1(ClusterColdTypedV1 *typed,
 				&& base.committed_generation == input->staged.committed_generation
 				&& memcmp(&base.committed, &input->staged.committed, sizeof(RelMapFile)) == 0
 				&& relmap_current(typed, fence, input) && relmap_side_matches(typed, input, reader)
-				&& relmap_pin(input, false))
+				&& relmap_entry_pin(entry, false))
 				ok = cluster_relmap_authority_v2_write_pending(&input->staged.identity,
 					input->staged.pending_generation, &input->staged.pending_owner,
 					&input->staged.pending, input->retention, input->retention_lock)
 					&& cluster_relmap_authority_v2_check_staged(&input->staged);
-			ok = ok && relmap_current(typed, fence, input) && relmap_pin(input, true)
+			ok = ok && relmap_current(typed, fence, input) && relmap_entry_pin(entry, true)
 				&& relmap_side_matches(typed, input, reader);
 		}
 	}
@@ -340,11 +366,12 @@ cluster_cold_typed_relmap_ready_v1(ClusterColdTypedV1 *typed, struct ClusterReco
 		return true;
 	plan->relmap_failed = true;
 	for (uint32 i = 0; i < plan->relmap_count && ok; ++i) {
-		const ClusterColdRelmapInputV1 *input = &plan->relmap_inputs[i].input;
+		const ColdRelmapInput *entry = &plan->relmap_inputs[i];
+		const ClusterColdRelmapInputV1 *input = &entry->input;
 		ok = relmap_current(typed, fence, input) && relmap_side_matches(typed, input, NULL)
-			&& relmap_pin(input, true)
+			&& relmap_entry_pin(entry, true)
 			&& cluster_relmap_authority_v2_check_staged(&input->staged)
-			&& relmap_current(typed, fence, input) && relmap_pin(input, true)
+			&& relmap_current(typed, fence, input) && relmap_entry_pin(entry, true)
 			&& relmap_side_matches(typed, input, NULL);
 	}
 	if (ok)

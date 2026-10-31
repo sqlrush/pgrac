@@ -78,6 +78,17 @@ typedef struct ClusterRelmapRetentionDirectory {
 	ClusterRelmapRetentionPin pins[CLUSTER_RELMAP_RETENTION_CAPACITY];
 } ClusterRelmapRetentionDirectory;
 
+/* Read-only custody of an actual uniquely enumerated, unstaged pin. This
+ * records original volatile inputs, not a reservation or lifetime authority. */
+typedef struct ClusterRelmapRetentionSnapshot {
+	ClusterRelmapRetentionPin pin;
+	uint64 generation;
+	uint64 native_floor;
+	uint64 last_issued;
+	uint64 truncate_serial;
+	ClusterRelmapRetentionTruncate inflight;
+} ClusterRelmapRetentionSnapshot;
+
 /* Start on zeroed, unpublished storage only; cannot reset an old directory.
  * The original Startup owner must qualify the actual native floor and issued
  * FullXid observations, enumerate ALL namespaces/BOTH copies, restore every
@@ -130,6 +141,18 @@ extern ClusterRelmapRetentionResult cluster_relmap_retention_tt_release_check(
  * WAL end or grants stage/terminal/release authority after unlocking. */
 extern ClusterRelmapRetentionResult cluster_relmap_retention_prepare_check(
 	const ClusterRelmapRetentionDirectory *directory, const ClusterRelmapRetentionKey *key);
+/* Capture and match under the original caller-held retention lock. Enumerate
+ * the entire bounded directory, refusing duplicate/conflicting namespace pins.
+ * Capture output must not overlap the directory or key. A match allows only
+ * the original pin's unstaged -> exact WAL-end staged transition; TT binding,
+ * directory generation, floor/issued and truncate metadata must remain exact.
+ * Nothing here acquires, updates, releases or qualifies any retained input. */
+extern ClusterRelmapRetentionResult cluster_relmap_retention_prepare_capture(
+	const ClusterRelmapRetentionDirectory *directory, const ClusterRelmapRetentionKey *key,
+	ClusterRelmapRetentionSnapshot *snapshot);
+extern ClusterRelmapRetentionResult cluster_relmap_retention_prepare_matches(
+	const ClusterRelmapRetentionDirectory *directory, const ClusterRelmapRetentionKey *key,
+	const ClusterRelmapRetentionSnapshot *snapshot, bool staged, uint64 wal_end);
 extern ClusterRelmapRetentionResult cluster_relmap_retention_stage_start(
 	ClusterRelmapRetentionDirectory *directory, const ClusterRelmapRetentionKey *key,
 	uint64 wal_end);

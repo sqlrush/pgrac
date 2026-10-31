@@ -3976,6 +3976,7 @@ UT_TEST(test_full_clog_truncate_dispatch_uses_original_projection_identity)
 #include "test_cluster_cold_startup_relmap.inc"
 #include "test_cluster_cold_startup_relmap_replay.inc"
 #include "test_cluster_cold_startup_relmap_producer.inc"
+#include "test_cluster_cold_startup_relmap_pin_custody.inc"
 
 int
 main(void)
@@ -4027,7 +4028,18 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(172);
+	if (getenv("PGRAC_PRE2_TEST_STARTUP_RELMAP_PIN_CUSTODY") != NULL) {
+		UT_PLAN(6);
+		UT_RUN(test_relmap_pin_snapshot_refuses_drift_during_baseline_read);
+		UT_RUN(test_relmap_pin_snapshot_enumerates_duplicate_slots_before_io);
+		UT_RUN(test_relmap_pin_snapshot_survives_startup_declaration_until_replay);
+		UT_RUN(test_relmap_pin_snapshot_refuses_drift_after_durable_pair_write);
+		UT_RUN(test_relmap_pin_snapshot_rechecks_receipt_and_duplicate_without_writes);
+		UT_RUN(test_relmap_pin_snapshot_allows_only_original_stage_transition);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
+	UT_PLAN(178);
 	UT_RUN(test_full_clog_truncate_dispatch_uses_original_projection_identity);
 	UT_RUN(test_full_clog_dispatch_uses_only_original_projection_identity);
 	UT_RUN(test_execution_refusal_preserves_the_first_census_failure);
@@ -4201,6 +4213,12 @@ main(void)
 	UT_RUN(test_relmap_producer_preflights_whole_batch_and_budget_before_io);
 	UT_RUN(test_relmap_producer_late_record_or_pin_error_is_sticky);
 	UT_RUN(test_startup_relmap_producer_rechecks_sources_before_pass_one);
+	UT_RUN(test_relmap_pin_snapshot_refuses_drift_during_baseline_read);
+	UT_RUN(test_relmap_pin_snapshot_enumerates_duplicate_slots_before_io);
+	UT_RUN(test_relmap_pin_snapshot_survives_startup_declaration_until_replay);
+	UT_RUN(test_relmap_pin_snapshot_refuses_drift_after_durable_pair_write);
+	UT_RUN(test_relmap_pin_snapshot_rechecks_receipt_and_duplicate_without_writes);
+	UT_RUN(test_relmap_pin_snapshot_allows_only_original_stage_transition);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

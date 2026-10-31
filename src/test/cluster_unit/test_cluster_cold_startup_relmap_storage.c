@@ -93,6 +93,44 @@ test_cold_relmap_storage_pin_error(void)
 	producer_pin_error = true;
 }
 
+/* Preserve the exact original key while changing its retained context. */
+void
+test_cold_relmap_storage_pin_drift(unsigned fault)
+{
+	ClusterCanonicalTxnBinding binding = {0};
+
+	LWLockAcquire(&retention_lock, LW_EXCLUSIVE);
+	switch (fault) {
+	case 0: ++writer_retention.generation; break;
+	case 1: ++writer_retention.native_floor; break;
+	case 2: ++writer_retention.last_issued; break;
+	case 3: ++writer_retention.truncate_serial; break;
+	case 4:
+		writer_retention.inflight = (ClusterRelmapRetentionTruncate){
+			writer_retention.generation, 1, writer_retention.native_floor};
+		break;
+	case 5:
+		binding.segment_id = 17;
+		binding.xid = (TransactionId)writer_key.top_full_xid;
+		binding.slot_wrap = 0;
+		binding.origin_instance = writer_key.origin + 1;
+		binding.publish_state = CLUSTER_CANONICAL_TXN_PUBLISHED;
+		binding.active_lsn = 0x4567;
+		if (cluster_relmap_retention_bind(&writer_retention, writer_key.top_full_xid,
+			&binding) != CLUSTER_RELMAP_RETENTION_OK)
+			abort();
+		break;
+	case 6:
+	case 7:
+		writer_retention.pins[1] = writer_retention.pins[0];
+		if (fault == 7) ++writer_retention.pins[1].key.boot_incarnation;
+		break;
+	case 8: ++writer_retention.pins[0].binding.active_lsn; break;
+	default: abort();
+	}
+	LWLockRelease(&retention_lock);
+}
+
 bool
 test_cold_relmap_storage_acquire(LWLock *lock, LWLockMode mode)
 {

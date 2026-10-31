@@ -5314,7 +5314,9 @@ test_cluster_cold_relmap: $(CLUSTER_COLD_PLAN_O)
 $(CLUSTER_COLD_PLAN_O) test_cluster_cold_recovery_startup_plan_core.o \
 		test_cluster_cold_recovery_refail_plan_core.o test_cluster_cold_recovery_replay_plan_core.o \
 		test_cluster_cold_recovery_startup_core.o test_cluster_recovery_scope_startup.o: \
-		$(top_srcdir)/src/include/cluster/cluster_cold_relmap.h
+		$(top_srcdir)/src/include/cluster/cluster_cold_relmap.h \
+		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_plan_internal.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h
 
 RETAINED_RECORD_OBJS = $(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) \
 		$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) $(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) \
@@ -12574,6 +12576,9 @@ test_cluster_cold_recovery_startup: test_cluster_cold_recovery_startup.c unit_te
 		$(COLD_NATIVE_SIDE_OBJS) $(COLD_STARTUP_RELMAP_OBJS) test_cluster_cold_native_side.h \
 		test_cluster_cold_startup_relmap_replay.inc test_cluster_cold_startup_relmap_storage.h \
 		test_cluster_cold_startup_relmap_producer.inc \
+		test_cluster_cold_startup_relmap_pin_custody.inc \
+		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_plan_internal.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h \
 		test_cluster_cold_native_storage.inc test_cluster_recovery_episode_clog.o \
 		test_cluster_recovery_episode_clog.h \
 		test_cluster_cold_native_clog_consumed.inc \
@@ -14562,7 +14567,8 @@ test_cluster_cold_startup_relmap_storage.o: test_cluster_cold_startup_relmap_sto
 		test_cluster_relmap_v2_storage.c test_cluster_relmap_runtime_storage.inc \
 		test_cluster_relmap_recovery_arbitration.inc test_cluster_relmap_owner_conversion.inc \
 		test_cluster_relmap_staged_observation.inc unit_test.h \
-		$(top_srcdir)/src/include/cluster/cluster_cold_relmap.h
+		$(top_srcdir)/src/include/cluster/cluster_cold_relmap.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_PGRAC_CLUSTER -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_cold_startup_relmap_authority.o: test_cluster_cold_startup_relmap_authority.c \

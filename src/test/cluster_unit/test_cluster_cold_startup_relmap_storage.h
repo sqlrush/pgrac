@@ -29,6 +29,7 @@ extern void test_cold_relmap_storage_fault(unsigned write, void (*hook)(bool));
 extern void test_cold_relmap_storage_read_hook(void (*hook)(unsigned));
 extern ssize_t test_cold_relmap_storage_read(int fd, void *bytes, size_t len);
 extern void test_cold_relmap_storage_pin_error(void);
+extern void test_cold_relmap_storage_pin_drift(unsigned fault);
 extern bool test_cold_relmap_storage_acquire(LWLock *lock, LWLockMode mode);
 extern TestColdRelmapStorageStats test_cold_relmap_storage_stats(void);
 extern bool test_cold_relmap_storage_matches(const ClusterColdRelmapInputV1 *input, bool pending);
