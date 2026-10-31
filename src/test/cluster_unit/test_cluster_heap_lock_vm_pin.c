@@ -54,6 +54,7 @@ static HeapTupleData tuple;
 static TransactionId creator;
 static Buffer vm;
 static bool vm_pinned, locked, replace_image, wait_error;
+static unsigned extra_vm_pins;
 static unsigned waits, waits_with_vm, prepares, releases, repins, misses;
 static bool vm_locked, needs_clear, warm_error, warm_replaces_pin;
 static int warm_change;
@@ -128,7 +129,10 @@ ReleaseBuffer(Buffer buffer)
 {
 	UT_ASSERT_EQ(buffer, 2);
 	UT_ASSERT(vm_pinned);
-	vm_pinned = false;
+	if (extra_vm_pins > 0)
+		extra_vm_pins--;
+	else
+		vm_pinned = false;
 	releases++;
 }
 
@@ -218,8 +222,13 @@ ClusterLockBufferExclusiveAuxiliaryAliasAware(Buffer *buffer, Buffer *alias,
 											  const ClusterBufferBarrierSiteId *site,
 											  ResourceXAuxiliaryAcquireContext *context)
 {
+	bool equal_alias = alias != NULL && alias != buffer && *alias == *buffer;
+
 	UT_ASSERT(*buffer == 2 && vm_pinned && !vm_locked);
-	UT_ASSERT(alias == NULL && site == NULL && context != NULL);
+
+	UT_ASSERT((alias == NULL || !BufferIsValid(*alias) || equal_alias)
+		&& site == NULL && context != NULL);
+	UT_ASSERT_EQ(extra_vm_pins, equal_alias ? 1 : 0);
 	if (!context->active) {
 		context->active = true;
 		context->absolute_deadline_us = 4242;
@@ -234,6 +243,10 @@ ClusterLockBufferExclusiveAuxiliaryAliasAware(Buffer *buffer, Buffer *alias,
 			nested_refusals--;
 			if (nested_replaces > 0) {
 				nested_replaces--;
+				if (equal_alias) {
+					ReleaseBuffer(*alias);
+					*alias = InvalidBuffer;
+				}
 				ReleaseBuffer(*buffer);
 				*buffer = InvalidBuffer;
 			}
@@ -255,6 +268,10 @@ ClusterLockBufferExclusiveAuxiliaryAliasAware(Buffer *buffer, Buffer *alias,
 		if (warm_refusals > 0) {
 			warm_refusals--;
 			if (warm_replaces_pin) {
+				if (equal_alias) {
+					ReleaseBuffer(*alias);
+					*alias = InvalidBuffer;
+				}
 				ReleaseBuffer(*buffer);
 				*buffer = InvalidBuffer;
 			}
@@ -387,6 +404,7 @@ reset(bool cached, bool visible)
 	nested_calls = warm_calls = plain_vm_waits = chain_fallthroughs = context_starts = 0;
 	vm = cached ? 2 : InvalidBuffer;
 	vm_pinned = cached;
+	extra_vm_pins = 0;
 	creator = 700;
 	header->t_hoff = SizeofHeapTupleHeader;
 	header->t_infomask = HEAP_XMAX_INVALID;

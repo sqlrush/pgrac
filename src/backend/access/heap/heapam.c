@@ -6646,14 +6646,14 @@ cluster_heap_vm_mutation_lock(Buffer *vmbuf, bool versioned, ClusterHeapVmMutati
  * Keep the original cursor on a clean refusal; the caller drops any remaining
  * pin before cancellation and the original target/receipt retry. */
 static void
-cluster_heap_vm_mutation_prepare(Buffer *vmbuf, ClusterHeapVmMutationState *state,
+cluster_heap_vm_mutation_prepare(Buffer *vmbuf, Buffer *alias, ClusterHeapVmMutationState *state,
 							   ResourceXAuxiliaryAcquireContext *context)
 {
 	bool captured = false;
 
 	state->prepared = false;
 	if (!BufferIsValid(*vmbuf)
-		|| !ClusterLockBufferExclusiveAuxiliaryAliasAware(vmbuf, NULL, NULL, context))
+		|| !ClusterLockBufferExclusiveAuxiliaryAliasAware(vmbuf, alias, NULL, context))
 		return;
 	PG_TRY();
 	{
@@ -6959,7 +6959,7 @@ cluster_heap_insert_retry:
 			 * and its ITL/receipt plan must be selected again after this wait. */
 			UnlockReleaseBuffer(buffer);
 			if (cluster_page_versioned)
-				cluster_heap_vm_mutation_prepare(&vmbuffer, &cluster_vm_state, &cluster_vm_context);
+				cluster_heap_vm_mutation_prepare(&vmbuffer, NULL, &cluster_vm_state, &cluster_vm_context);
 			if (BufferIsValid(vmbuffer))
 				ReleaseBuffer(vmbuffer);
 			vmbuffer = InvalidBuffer;
@@ -7655,7 +7655,7 @@ cluster_heap_multi_insert_retry:
 				 * No tuple or page version has been published before this wait. */
 				UnlockReleaseBuffer(buffer);
 				if (cluster_page_versioned)
-					cluster_heap_vm_mutation_prepare(&vmbuffer, &cluster_vm_state, &cluster_vm_context);
+					cluster_heap_vm_mutation_prepare(&vmbuffer, NULL, &cluster_vm_state, &cluster_vm_context);
 				if (BufferIsValid(vmbuffer))
 					ReleaseBuffer(vmbuffer);
 				vmbuffer = InvalidBuffer;
@@ -10847,6 +10847,38 @@ cluster_heap_vm_tuple_writer_lock(Buffer *vmbuffer, bool versioned,
 	return acquired;
 }
 
+/* Keep native barrier-site/alias handling and the original plan cleanup. */
+static bool
+cluster_heap_vm_dml_writer_lock(Buffer *vmbuffer, bool versioned,
+		ClusterHeapVmMutationState *state, ClusterBufferBarrierSiteId site,
+		bool *pin_replaced, ClusterCurrentMxStampPlan *plan,
+		ResourceXAuxiliaryAcquireContext *context, Buffer *alias)
+{
+	bool acquired = false;
+
+	*pin_replaced = false;
+	if (!versioned)
+	{
+		acquired = cluster_current_mx_stamp_lock_buffer(*vmbuffer, true, site,
+			pin_replaced, plan, NULL, context, alias);
+		if (*pin_replaced)
+			*vmbuffer = InvalidBuffer;
+		return acquired;
+	}
+	PG_TRY();
+	{
+		acquired = cluster_heap_vm_mutation_lock(vmbuffer, true, state, context);
+	}
+	PG_CATCH();
+	{
+		cluster_current_mx_stamp_cancel(plan);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return acquired;
+}
+
+
 /*
  * spec-3.14 D2b + spec-5.2 §3.2 (C4/D11): cross-node writer/locker wait.
  *
@@ -11758,6 +11790,7 @@ heap_delete(Relation relation, ItemPointer tid,
 	bool		old_key_copied = false;
 #ifdef USE_PGRAC_CLUSTER
 	ResourceXAuxiliaryAcquireContext cluster_vm_context = { 0 };
+	ClusterHeapVmMutationState cluster_vm_state = { 0 };
 	/* PGRAC: exact versions of this DELETE and its optional VM mutation. */
 	bool		cluster_page_versioned = false;
 	ClusterSpaceIdentity cluster_page_identity;
@@ -12395,9 +12428,10 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 
 			PG_TRY();
 			{
-				vm_acquired = cluster_current_mx_stamp_lock_buffer(
-					vmbuffer, true, CLUSTER_BUFFER_BARRIER_SITE_HEAP_DELETE_VM, &vm_pin_replaced,
-					&cluster_current_mx_plan, NULL, &cluster_vm_context, NULL);
+				vm_acquired = cluster_heap_vm_dml_writer_lock(
+					&vmbuffer, cluster_page_versioned, &cluster_vm_state,
+					CLUSTER_BUFFER_BARRIER_SITE_HEAP_DELETE_VM, &vm_pin_replaced,
+					&cluster_current_mx_plan, &cluster_vm_context, NULL);
 			}
 			PG_CATCH();
 			{
@@ -12435,7 +12469,16 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 				refused_rlocator, refused_forknum, refused_blocknum,
 				CLUSTER_BUFFER_BARRIER_OUTCOME_POSTCONDITION_OK,
 				CLUSTER_BUFFER_BARRIER_PROOF_CALLER_POST);
-			if (!vm_pin_replaced)
+			if (cluster_page_versioned)
+			{
+				cluster_heap_vm_mutation_prepare(&vmbuffer, NULL,
+					&cluster_vm_state, &cluster_vm_context);
+				if (BufferIsValid(vmbuffer))
+					ReleaseBuffer(vmbuffer);
+				vmbuffer = InvalidBuffer;
+				CHECK_FOR_INTERRUPTS();
+			}
+			else if (!vm_pin_replaced)
 			{
 				cluster_heap_vm_barrier_warm(&vmbuffer, NULL, &cluster_vm_context);
 				if (BufferIsValid(vmbuffer))
@@ -12999,6 +13042,7 @@ heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
 	bool		old_tuple_temp_locked = false;	/* PGRAC: t/400 L3 item 3 */
 #ifdef USE_PGRAC_CLUSTER
 	ResourceXAuxiliaryAcquireContext cluster_vm_context = { 0 };
+	ClusterHeapVmMutationState cluster_vm_state = { 0 };
 	ResourceXAuxiliaryAcquireContext cluster_vm_new_context = { 0 };
 	/* PGRAC: TEMP_LOCK and final UPDATE are distinct WAL/version batches. */
 	bool		cluster_page_versioned = false;
@@ -13977,9 +14021,10 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 		BufferGetTag(vmbuffer, &refused_rlocator, &refused_forknum,
 					 &refused_blocknum);
 
-		vm_acquired = cluster_current_mx_stamp_lock_buffer(
-			vmbuffer, true, CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_PRETOAST_VM, &vm_pin_replaced,
-			cluster_current_mx_recomposed ? &cluster_current_mx_temp_lock_plan : NULL, NULL,
+		vm_acquired = cluster_heap_vm_dml_writer_lock(
+			&vmbuffer, cluster_page_versioned, &cluster_vm_state,
+			CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_PRETOAST_VM, &vm_pin_replaced,
+			cluster_current_mx_recomposed ? &cluster_current_mx_temp_lock_plan : NULL,
 			&cluster_vm_context, &vmbuffer_new);
 		if (!vm_acquired)
 		{
@@ -14007,7 +14052,22 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 					refused_rlocator, refused_forknum, refused_blocknum,
 					CLUSTER_BUFFER_BARRIER_OUTCOME_POSTCONDITION_OK,
 					CLUSTER_BUFFER_BARRIER_PROOF_CALLER_POST);
-			if (!vm_pin_replaced)
+			if (cluster_page_versioned)
+			{
+				cluster_heap_vm_mutation_prepare(&vmbuffer, &vmbuffer_new,
+					&cluster_vm_state, &cluster_vm_context);
+				/* Drop both declared pins before cancellation or heap wait. */
+				if (BufferIsValid(vmbuffer_new))
+				{
+					ReleaseBuffer(vmbuffer_new);
+					vmbuffer_new = InvalidBuffer;
+				}
+				if (BufferIsValid(vmbuffer))
+					ReleaseBuffer(vmbuffer);
+				vmbuffer = InvalidBuffer;
+				CHECK_FOR_INTERRUPTS();
+			}
+			else if (!vm_pin_replaced)
 			{
 				cluster_heap_vm_barrier_warm(&vmbuffer, &vmbuffer_new, &cluster_vm_context);
 				if (BufferIsValid(vmbuffer))
@@ -17890,7 +17950,7 @@ failed:
 			cluster_lock_slot_idx = CLUSTER_ITL_SLOT_UNALLOCATED;
 			LockBuffer(*buffer, BUFFER_LOCK_UNLOCK);
 			if (cluster_page_versioned)
-				cluster_heap_vm_mutation_prepare(&vmbuffer, &cluster_vm_state, &cluster_vm_context);
+				cluster_heap_vm_mutation_prepare(&vmbuffer, NULL, &cluster_vm_state, &cluster_vm_context);
 			else
 				cluster_heap_vm_barrier_warm(&vmbuffer, NULL, &cluster_vm_context);
 			cluster_heap_lock_with_vm_repin(relation, block, *buffer, &vmbuffer);
@@ -19374,7 +19434,7 @@ l4:
 					LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 					if (cluster_page_versioned)
 					{
-						cluster_heap_vm_mutation_prepare(&vmbuffer, &cluster_chain_vm_state,
+						cluster_heap_vm_mutation_prepare(&vmbuffer, NULL, &cluster_chain_vm_state,
 							&cluster_chain_vm_context);
 						/* Cancellation and heap acquisition retain no VM pin. */
 						if (BufferIsValid(vmbuffer))
@@ -19512,7 +19572,7 @@ l4:
 					LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 					if (cluster_page_versioned)
 					{
-						cluster_heap_vm_mutation_prepare(&vmbuffer, &cluster_chain_vm_state,
+						cluster_heap_vm_mutation_prepare(&vmbuffer, NULL, &cluster_chain_vm_state,
 							&cluster_chain_vm_context);
 						/* Cancellation and heap acquisition retain no VM pin. */
 						if (BufferIsValid(vmbuffer))

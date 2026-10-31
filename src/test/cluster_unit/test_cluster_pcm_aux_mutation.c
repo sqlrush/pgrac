@@ -860,6 +860,21 @@ dml_stamp_lock(Buffer buffer, bool barrier, ClusterBufferBarrierSiteId site, boo
 	return result;
 }
 
+/* These original native consumers must not enter shared writer services. */
+static bool
+native_single_dml_writer(Buffer *buffer, bool versioned, ClusterHeapVmMutationState *state,
+		ClusterBufferBarrierSiteId site, bool *replaced, int *plan,
+		ResourceXAuxiliaryAcquireContext *context, Buffer *alias)
+{
+	bool acquired;
+
+	UT_ASSERT(!versioned);
+	acquired = dml_stamp_lock(*buffer, true, site, replaced, plan, NULL, context, alias);
+	if (*replaced)
+		*buffer = InvalidBuffer;
+	return acquired;
+}
+
 static void
 dml_pin(Relation relation, BlockNumber heap, Buffer *vm)
 {
@@ -904,6 +919,7 @@ dml_observe(ClusterBufferBarrierPhase phase)
 #define BufferGetTag dml_tag
 #define ClusterLockBufferExclusiveAuxiliaryAliasAware dml_aux_lock
 #define cluster_current_mx_stamp_lock_buffer dml_stamp_lock
+#define cluster_heap_vm_dml_writer_lock native_single_dml_writer
 #define cluster_heap_vm_barrier_warm dml_warm
 #define cluster_heap_lock_with_vm_repin dml_repin
 #define visibilitymap_pin dml_pin
@@ -1055,6 +1071,8 @@ run_delete_vm_bracket(void)
 	CommandId cid = 2, pgrac_entry_cid = 1;
 	int cluster_current_mx_plan = 1;
 	ResourceXAuxiliaryAcquireContext cluster_vm_context = { 0 };
+	ClusterHeapVmMutationState cluster_vm_state = { 0 };
+	bool cluster_page_versioned = false;
 
 	dml_old_vm = 1;
 	dml_refs[0] = dml_refs[2] = 1;
@@ -1086,6 +1104,8 @@ run_pretoast_vm_bracket(void)
 	CommandId cid = 2, pgrac_entry_cid = 1;
 	int cluster_current_mx_temp_lock_plan = 1, cluster_current_mx_operation = 1;
 	ResourceXAuxiliaryAcquireContext cluster_vm_context = { 0 };
+	ClusterHeapVmMutationState cluster_vm_state = { 0 };
+	bool cluster_page_versioned = false;
 
 	dml_old_vm = 1;
 	dml_refs[0] = dml_refs[2] = 1;

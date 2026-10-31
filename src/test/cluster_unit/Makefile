@@ -3325,6 +3325,24 @@ clean: clean-tuple-vm-authority
 clean-tuple-vm-authority:
 	rm -f test_cluster_heap_vm_tuple_writer.inc test_cluster_heap_vm_tuple_writer.inc.tmp
 
+# Single-heap DML consumers, with the original retry/rebind and VM writer.
+TESTS += test_cluster_heap_dml_single_vm_authority test_cluster_heap_dml_single_vm_authority_noassert
+all: test_cluster_heap_dml_single_vm_authority test_cluster_heap_dml_single_vm_authority_noassert
+
+test_cluster_heap_vm_dml_writer.inc: extract_insert_vm_authority_fixture.py extract_vacuum_mx_fixture.py $(top_srcdir)/src/backend/access/heap/heapam.c
+	python3 $(srcdir)/extract_insert_vm_authority_fixture.py $(top_srcdir)/src/backend/access/heap/heapam.c --dml-writer > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_dml_single_vm_authority test_cluster_heap_dml_single_vm_authority_noassert: test_cluster_heap_dml_single_vm_authority.c test_cluster_heap_lock_vm_pin test_cluster_heap_vm_delete.inc test_cluster_heap_vm_pretoast.inc test_cluster_heap_vm_dml_writer.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(if $(filter %_noassert,$@),-DFIXTURE_NO_ASSERTS) $< \
+		$(CLUSTER_HOT_BUFPAGE_TEST_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+clean: clean-dml-single-vm-authority
+.PHONY: clean-dml-single-vm-authority
+clean-dml-single-vm-authority:
+	rm -f test_cluster_heap_vm_dml_writer.inc test_cluster_heap_vm_dml_writer.inc.tmp
+
 # PGRAC: the real INSERT mutation/WAL block and native tuple/page insertion.
 # Bind the complete native batch loop, including original selection/accounting.
 test_cluster_heap_multi_loop.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
