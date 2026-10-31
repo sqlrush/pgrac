@@ -10,6 +10,14 @@ import sys
 from extract_vacuum_mx_fixture import function
 
 source = pathlib.Path(sys.argv[1]).read_text()
+if len(sys.argv) > 2 and sys.argv[2] == "--delete-capture":
+    owner = function(source, "heap_delete", "TM_Result")
+    start = owner.index("\t\tif (cluster_page_versioned)",
+                        owner.index("PGRAC: after final VM acquisition"))
+    end = owner.index("\n\t\tMemSet(&undo_plan", start)
+    print(owner[start:end])
+    sys.exit(0)
+
 if len(sys.argv) > 2 and sys.argv[2] == "--insert-capture":
     owner = function(source, "heap_insert", "void")
     start = owner.index("\tif (cluster_page_versioned)",
