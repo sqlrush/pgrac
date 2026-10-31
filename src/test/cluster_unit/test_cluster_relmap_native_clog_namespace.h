@@ -104,4 +104,7 @@
 #define ut_current_failed d3_clog_ut_current_failed
 #define ut_failed_count d3_clog_ut_failed_count
 #define ut_test_count d3_clog_ut_test_count
+#define cluster_cf_held d3_clog_cluster_cf_held
+#define cluster_wal_inputs_relmap_source_current_v1 d3_clog_cluster_wal_inputs_relmap_source_current_v1
+#define cluster_wal_inputs_relmap_source_fail_v1 d3_clog_cluster_wal_inputs_relmap_source_fail_v1
 #endif
