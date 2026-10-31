@@ -1010,7 +1010,7 @@
 | `horizon_admission_refuse_count` | 十进制整数文本 | `horizon` / 准入 / `refuse`的累计计数。 | 先做时间窗增量；单个绝对值不能直接判定当前故障。 |
 | `horizon_last_floor_scn` | 十进制整数文本 | `horizon` / 最近 / `floor`对应的集群 SCN。 | 与同分类其他键组成快照，不单独作为 authority 证明。 |
 | `horizon_idle_sentinel_sent_count` | 十进制整数文本 | `horizon` / `idle` / `sentinel` / `sent`的累计计数。 | 先做时间窗增量；单个绝对值不能直接判定当前故障。 |
-| `horizon_peer_reports` | 枚举/名称/格式化文本 | `horizon` / 对端 / `reports`的当前快照值。 | 与同分类其他键组成快照，不单独作为 authority 证明。 |
+| `horizon_peer_reports` | 格式化文本 | 原对端报告及 V2 采样状态；READY 时追加限制 H 的 `h_source=n<节点>`：`scn`、采样 `clock`、`kind`、`token`。远端另有 `report_seq`、接收后 `age_ms`；本地采样无这两项。 | kind：0 UNKNOWN、1 CLOCK、2 SNAPSHOT、3 PREPARED、4 REPLICATION。同 SCN 时间的来源全部列出；非 READY 不列来源。年龄不可计算时为 -1。来源信息不证明读者仍存活、全池已扫描或容量可回收。 |
 | `cleaner_header_tt_slots_below_horizon` | 十进制整数文本 | `cleaner` / `header` / `tt` / `slots` / `below` / `horizon`的当前快照值。 | 与同分类其他键组成快照，不单独作为 authority 证明。 |
 | `undo_buf_held_wal` | 十进制整数文本 | undo / `buf` / `held` / WAL的当前快照值。 | 与同分类其他键组成快照，不单独作为 authority 证明。 |
 | `undo_buf_held_evidence` | 十进制整数文本 | undo / `buf` / `held` / `evidence`的当前快照值。 | 与同分类其他键组成快照，不单独作为 authority 证明。 |

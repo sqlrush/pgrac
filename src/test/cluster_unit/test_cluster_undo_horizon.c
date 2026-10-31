@@ -506,6 +506,8 @@ GetCurrentTimestamp(void)
 			test_sender_sample.sample_id++;
 		else if (test_clock_change_kind == 3)
 			test_v2_fence.admission_publication_seq += 2;
+		else if (test_clock_change_kind == 4)
+			return test_horizon_now - 2000;
 	}
 	return test_horizon_now;
 }
@@ -2765,6 +2767,170 @@ UT_TEST(test_v2_cohort_single_member_still_requires_local_evidence)
 	UT_ASSERT_EQ(cluster_heap_freeze_cohort_observe(NULL), CLUSTER_HEAP_FREEZE_COHORT_INVALID);
 }
 
+UT_TEST(test_v2_summary_reports_local_h_source_without_inventing_a_report)
+{
+	const char *summary;
+	unsigned cuts;
+
+	(void)reset_v2_cohort(false);
+	test_v2_fence.admitted_members_lo = 1;
+	test_sender_sample.admission_fence = test_v2_fence;
+	test_retention_sample.contributor_token = UINT64_MAX;
+	cuts = test_retention_sample_calls;
+	summary = cluster_undo_horizon_peer_reports_summary();
+	UT_ASSERT(strstr(summary, "v2_observation=READY,") != NULL);
+	UT_ASSERT(strstr(summary, " h_source=n0:scn=400,clock=700,kind=2,token=18446744073709551615")
+			  != NULL);
+	UT_ASSERT(strstr(summary, " h_source=n1:") == NULL);
+	UT_ASSERT(strstr(summary, "report_seq=") == NULL);
+	UT_ASSERT(strstr(summary, "n1:v=") != NULL);
+	UT_ASSERT_EQ(test_retention_sample_calls, cuts + 1);
+}
+
+UT_TEST(test_v2_summary_keeps_all_equal_time_h_sources_and_unknown_kinds)
+{
+	for (unsigned kind = 0; kind <= 4; kind++) {
+		ClusterHeapFreezeReportV2 report = reset_v2_cohort(true);
+		const char *summary;
+		char expected[160];
+		unsigned cuts;
+
+		report.report_sequence = UINT64CONST(9223372036854775810);
+		report.h_contributor_kind = CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_REPLICATION;
+		report.h_contributor_token = UINT64_MAX;
+		cohort_receive(1, report);
+		report.report_sequence = 9;
+		report.horizon_scn = scn_encode(65, 300);
+		report.h_contributor_kind = kind;
+		report.h_contributor_token = 55;
+		cohort_receive(65, report);
+		cuts = test_retention_sample_calls;
+		summary = cluster_undo_horizon_peer_reports_summary();
+		UT_ASSERT(strstr(summary, " h_source=n1:scn=300,clock=600,kind=4,token="
+								  "18446744073709551615,report_seq=9223372036854775810,age_ms=0")
+				  != NULL);
+		snprintf(expected, sizeof(expected),
+				 " h_source=n65:scn=4683743612465316140,clock=600,kind=%u,token=55,report_seq=9,"
+				 "age_ms=0",
+				 kind);
+		UT_ASSERT(strstr(summary, expected) != NULL);
+		UT_ASSERT(strstr(summary, " h_source=n0:") == NULL);
+		UT_ASSERT(strstr(summary, " h_source=n2:") == NULL);
+		UT_ASSERT_EQ(test_retention_sample_calls, cuts + 1);
+	}
+}
+
+UT_TEST(test_v2_summary_tracks_new_reports_without_refreshing_replayed_h)
+{
+	ClusterHeapFreezeReportV2 report = reset_v2_cohort(false);
+	const char *summary;
+	unsigned cuts;
+
+	summary = cluster_undo_horizon_peer_reports_summary();
+	UT_ASSERT(strstr(summary, " h_source=n1:scn=300,clock=600,kind=1,token=0,report_seq=1,age_ms=0")
+			  != NULL);
+	report.report_sequence = 2;
+	report.h_contributor_kind = CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT;
+	report.h_contributor_token = 99;
+	cohort_receive(1, report);
+	test_horizon_now += 1000;
+	/* Same sequence with changed metadata must retain the original report. */
+	report.h_contributor_token = 100;
+	cohort_receive(1, report);
+	cuts = test_retention_sample_calls;
+	summary = cluster_undo_horizon_peer_reports_summary();
+	UT_ASSERT(
+		strstr(summary, " h_source=n1:scn=300,clock=600,kind=2,token=99,report_seq=2,age_ms=1")
+		!= NULL);
+	UT_ASSERT(strstr(summary, "token=100") == NULL);
+	UT_ASSERT_EQ(test_retention_sample_calls, cuts + 1);
+	/* The formatting clock can move backward after the qualified cut. */
+	test_clock_change_at = test_clock_reads + 4;
+	test_clock_change_kind = 4;
+	summary = cluster_undo_horizon_peer_reports_summary();
+	UT_ASSERT_EQ(test_clock_change_at, 0);
+	UT_ASSERT(strstr(summary, "v2_observation=READY,") != NULL);
+	UT_ASSERT(strstr(summary, "token=99,report_seq=2,age_ms=-1") != NULL);
+}
+
+UT_TEST(test_v2_summary_omits_previous_h_sources_after_every_cohort_refusal)
+{
+	for (unsigned fault = 0; fault < 7; fault++) {
+		const char *summary;
+
+		ClusterHeapFreezeReportV2 report = reset_v2_cohort(fault == 6);
+		if (fault == 6)
+			cohort_receive(65, report);
+		UT_ASSERT(strstr(cluster_undo_horizon_peer_reports_summary(), " h_source=n1:") != NULL);
+		switch (fault) {
+		case 0:
+			test_horizon_store.freeze_slots[1].valid = false;
+			break;
+		case 1:
+			pg_atomic_write_u32(&test_horizon_store.freeze_slots[1].seq, 3);
+			break;
+		case 2:
+			test_cohort_generations[1]++;
+			break;
+		case 3:
+			test_horizon_now += 10000001;
+			break;
+		case 4:
+			test_horizon_store.freeze_slots[1].view.horizon_regression_flagged = true;
+			break;
+		case 5:
+			test_sender_change_on_recheck = true;
+			break;
+		case 6:
+			test_cohort_trigger_peer = 65;
+			test_cohort_changed_peer = 1;
+			test_cohort_change = 1;
+			break;
+		}
+		summary = cluster_undo_horizon_peer_reports_summary();
+		UT_ASSERT(strstr(summary, "v2_observation=READY,") == NULL);
+		UT_ASSERT(strstr(summary, " h_source=") == NULL);
+		UT_ASSERT(strstr(summary, "n1:v=") != NULL);
+	}
+}
+
+UT_TEST(test_v2_summary_fits_all_required_h_sources_with_full_width_values)
+{
+	ClusterHeapFreezeReportV2 report = reset_v2_cohort(false);
+	const char *summary;
+	const char *cursor;
+	unsigned count = 0;
+	unsigned cuts;
+
+	test_v2_fence.admitted_members_lo = UINT64_MAX;
+	test_v2_fence.admitted_members_hi = UINT64_MAX;
+	for (unsigned peer = 1; peer < 128; peer++)
+		test_v2_fence.admitted_incarnation[peer] = 100 + peer;
+	test_sender_sample.admission_fence = test_v2_fence;
+	test_retention_sample.contributor_token = UINT64_MAX;
+	report.report_sequence = UINT64_MAX;
+	report.h_contributor_kind = CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_PREPARED;
+	report.h_contributor_token = UINT64_MAX;
+	for (unsigned peer = 1; peer < 128; peer++) {
+		report.horizon_scn = scn_encode(peer, 400);
+		report.h_sample_clock_scn = scn_encode(peer, 700);
+		cohort_receive(peer, report);
+	}
+	cuts = test_retention_sample_calls;
+	summary = cluster_undo_horizon_peer_reports_summary();
+	UT_ASSERT(strstr(summary, "v2_observation=READY,") != NULL);
+	for (cursor = summary; (cursor = strstr(cursor, " h_source=")) != NULL; cursor++)
+		count++;
+	UT_ASSERT_EQ(count, 128);
+	UT_ASSERT(strstr(summary, " h_source=n0:scn=400,clock=700,kind=2,token=18446744073709551615")
+			  != NULL);
+	UT_ASSERT(
+		strstr(summary, " h_source=n127:scn=9151314442816848272,clock=9151314442816848572,kind=3,"
+						"token=18446744073709551615,report_seq=18446744073709551615,age_ms=0")
+		!= NULL);
+	UT_ASSERT_EQ(test_retention_sample_calls, cuts + 1);
+}
+
 UT_TEST(test_v2_summary_refusal_does_not_reuse_observed_values)
 {
 	const char *summary;
@@ -3785,7 +3951,7 @@ UT_TEST(test_original_cleaner_retirement_keeps_native_cut_until_new_complete_fol
 int
 main(void)
 {
-	UT_PLAN(123);
+	UT_PLAN(128);
 	UndoHorizonShmem = &test_horizon_store;
 
 	UT_RUN(test_u1_no_required_peer);
@@ -3873,6 +4039,11 @@ main(void)
 	UT_RUN(test_v2_cohort_defends_against_malformed_slots);
 	UT_RUN(test_v2_cohort_single_member_still_requires_local_evidence);
 	UT_RUN(test_v2_summary_refusal_does_not_reuse_observed_values);
+	UT_RUN(test_v2_summary_reports_local_h_source_without_inventing_a_report);
+	UT_RUN(test_v2_summary_keeps_all_equal_time_h_sources_and_unknown_kinds);
+	UT_RUN(test_v2_summary_tracks_new_reports_without_refreshing_replayed_h);
+	UT_RUN(test_v2_summary_omits_previous_h_sources_after_every_cohort_refusal);
+	UT_RUN(test_v2_summary_fits_all_required_h_sources_with_full_width_values);
 	UT_RUN(test_v2_lmon_observes_once_per_interval_without_an_extra_retention_cut);
 	UT_RUN(test_real_lmon_candidate_caps_native_subtrans_without_raising_its_cut);
 	UT_RUN(test_unqualified_publication_keeps_native_subtrans_until_fresh_fold);

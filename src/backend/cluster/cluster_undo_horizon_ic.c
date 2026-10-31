@@ -1011,6 +1011,7 @@ undo_horizon_v2_observe_peer(int32 peer, const ClusterSemanticActiveSampleFence 
 	candidate->source_peer_history[peer].sample_clock_scn = report->h_sample_clock_scn;
 	candidate->source_peer_history[peer].contributor_kind = report->h_contributor_kind;
 	candidate->source_peer_history[peer].contributor_token = report->h_contributor_token;
+	candidate->source_peer_report_sequence[peer] = report->report_sequence;
 	identity->covered = undo_horizon_maintenance_coverage(peer, report->future_full_xid);
 	candidate->future_full_xid_max = Max(candidate->future_full_xid_max, report->future_full_xid);
 	candidate->requested_full_xid_max
@@ -1590,6 +1591,69 @@ cluster_undo_horizon_epoch_fence_tripped(uint64 expected_epoch)
 	return cluster_epoch_get_current() != expected_epoch;
 }
 
+/* Format only the retained observation; do not reread a peer publication. */
+static size_t
+undo_horizon_history_source_summary(char *buf, size_t size, int32 peer, SCN horizon,
+									const ClusterHeapFreezeHistorySourceObservationV1 *source,
+									bool local, uint64 report_sequence, int64 age_ms)
+{
+	int written;
+	size_t off;
+
+	if (size == 0)
+		return 0;
+	written = snprintf(buf, size,
+					   " h_source=n%d:scn=" UINT64_FORMAT ",clock=" UINT64_FORMAT
+					   ",kind=%u,token=" UINT64_FORMAT,
+					   peer, (uint64)horizon, source->sample_clock_scn,
+					   (unsigned)source->contributor_kind, source->contributor_token);
+	if (written < 0 || (size_t)written >= size) {
+		buf[size - 1] = '\0';
+		return size - 1;
+	}
+	off = (size_t)written;
+	/* A fresh local sample is not a received LMON report. */
+	if (local)
+		return off;
+	written = snprintf(buf + off, size - off, ",report_seq=" UINT64_FORMAT ",age_ms=" INT64_FORMAT,
+					   report_sequence, age_ms);
+	if (written < 0 || (size_t)written >= size - off) {
+		buf[size - 1] = '\0';
+		return size - 1;
+	}
+	return off + (size_t)written;
+}
+
+/* Every equal-time limiting source is diagnostic, including CLOCK/UNKNOWN.
+ * None proves a live protector, two reports or complete capacity coverage. */
+static void
+undo_horizon_history_sources_summary(char *buf, size_t size,
+									 const ClusterHeapFreezeCohortObservation *observation,
+									 uint64 now_us)
+{
+	size_t off = 0;
+
+	for (int32 peer = 0; peer < CLUSTER_MAX_NODES && off < size; peer++) {
+		uint64 members
+			= peer < 64 ? observation->admitted_members_lo : observation->admitted_members_hi;
+		bool local = peer == observation->admission_fence.local_node_id;
+		SCN horizon = (SCN)(local ? observation->source_local_horizon_scn
+								  : observation->source_peer_horizon_scn[peer]);
+		const ClusterHeapFreezeHistorySourceObservationV1 *source
+			= local ? &observation->source_local_history : &observation->source_peer_history[peer];
+		uint64 received = observation->source_peers[peer].recv_at_us;
+		int64 age_ms
+			= received == 0 || now_us < received ? -1 : (int64)((now_us - received) / 1000);
+
+		if (((members >> (peer % 64)) & 1) == 0
+			|| scn_time_cmp(horizon, (SCN)observation->horizon_scn) != 0)
+			continue;
+		off += undo_horizon_history_source_summary(
+			buf + off, size - off, peer, horizon, source, local,
+			observation->source_peer_report_sequence[peer], age_ms);
+	}
+}
+
 /*
  * Per-peer report summary for the dump surface (D5-5): one static line
  * "n<id>:v=<valid>,cap=<cap>,e=<epoch>,scn=<scn>,age_ms=<age>,iv=<ms>,fl=<flag>"
@@ -1601,7 +1665,8 @@ cluster_undo_horizon_peer_reports_summary(void)
 {
 	static const char *const names[]
 		= { "READY", "INCOMPLETE", "H_STALE", "BUSY_PUBLISH", "IDENTITY_CHANGED", "INVALID" };
-	static char buf[256 + CLUSTER_MAX_NODES * 96];
+	/* Full-width V1 and V2 source records for every admitted member. */
+	static char buf[512 + CLUSTER_MAX_NODES * 384];
 	ClusterHeapFreezeCohortObservation observation;
 	ClusterHeapFreezeCohortStatus status;
 	uint64 now_us = (uint64)GetCurrentTimestamp();
@@ -1637,6 +1702,9 @@ cluster_undo_horizon_peer_reports_summary(void)
 			cluster_sf_peer_supports_undo_horizon(i) ? 1 : 0, slot->epoch, slot->horizon_scn,
 			(long long)age_ms, slot->sender_interval_ms, slot->regression_flagged ? 1 : 0);
 	}
+	if (status == CLUSTER_HEAP_FREEZE_COHORT_READY && off < sizeof(buf))
+		undo_horizon_history_sources_summary(buf + off, sizeof(buf) - off, &observation,
+											 (uint64)GetCurrentTimestamp());
 	return buf;
 }
 

@@ -181,6 +181,8 @@ typedef struct ClusterHeapFreezeCohortObservation {
 	/* Same original cuts as the H scalars above; never resampled on handoff. */
 	ClusterHeapFreezeHistorySourceObservationV1 source_local_history;
 	ClusterHeapFreezeHistorySourceObservationV1 source_peer_history[CLUSTER_MAX_NODES];
+	/* Same decoded reports as the H inputs; process-local diagnostics only. */
+	uint64 source_peer_report_sequence[CLUSTER_MAX_NODES];
 	uint64 source_local_sample_id;
 	uint64 source_started_at_us;
 	uint32 source_interval_ms;
