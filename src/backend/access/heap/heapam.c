@@ -10878,6 +10878,43 @@ cluster_heap_vm_dml_writer_lock(Buffer *vmbuffer, bool versioned,
 	return acquired;
 }
 
+/* UPDATE owns two plans. Keep F's native helper and new-target cursor rule;
+ * shared callers can only resume a writer prepared outside all content. */
+static bool
+cluster_heap_vm_pair_writer_lock(Buffer *vmbuffer, bool versioned,
+		ClusterHeapVmMutationState *state, ClusterBufferBarrierSiteId site,
+		bool *pin_replaced, ClusterCurrentMxStampPlan *first,
+		ClusterCurrentMxStampPlan *second,
+		ResourceXAuxiliaryAcquireContext *context, Buffer *alias)
+{
+	bool acquired = false;
+
+	*pin_replaced = false;
+	if (!versioned)
+	{
+		acquired = cluster_current_mx_stamp_lock_buffer(*vmbuffer, true, site,
+			pin_replaced, first, second, context, alias);
+		if (*pin_replaced)
+			*vmbuffer = InvalidBuffer;
+		return acquired;
+	}
+	PG_TRY();
+	{
+		if (site == CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_NEW
+			|| site == CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_PAIR_NEW_FIRST)
+			cluster_heap_vm_retarget_after_repick(*vmbuffer, context);
+		acquired = cluster_heap_vm_mutation_lock(vmbuffer, true, state, context);
+	}
+	PG_CATCH();
+	{
+		cluster_current_mx_stamp_cancel(first);
+		cluster_current_mx_stamp_cancel(second);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return acquired;
+}
+
 
 /*
  * spec-3.14 D2b + spec-5.2 §3.2 (C4/D11): cross-node writer/locker wait.
@@ -13044,6 +13081,7 @@ heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
 	ResourceXAuxiliaryAcquireContext cluster_vm_context = { 0 };
 	ClusterHeapVmMutationState cluster_vm_state = { 0 };
 	ResourceXAuxiliaryAcquireContext cluster_vm_new_context = { 0 };
+	ClusterHeapVmMutationState cluster_vm_new_state = { 0 };
 	/* PGRAC: TEMP_LOCK and final UPDATE are distinct WAL/version batches. */
 	bool		cluster_page_versioned = false;
 	ClusterSpaceIdentity cluster_page_identity;
@@ -15189,6 +15227,8 @@ l_pgrac_reacquire:
 			Buffer *alias = is_new ? &vmbuffer : &vmbuffer_new;
 			ResourceXAuxiliaryAcquireContext *context
 				= is_new ? &cluster_vm_new_context : &cluster_vm_context;
+			ClusterHeapVmMutationState *state
+				= is_new ? &cluster_vm_new_state : &cluster_vm_state;
 			ClusterBufferBarrierSiteId site
 				= is_new ? (new_first ? CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_PAIR_NEW_FIRST
 									  : CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_NEW)
@@ -15201,8 +15241,9 @@ l_pgrac_reacquire:
 				continue;
 #ifdef USE_PGRAC_CLUSTER
 			requested = *target;
-			if (!cluster_current_mx_stamp_lock_buffer(
-					requested, true, site, &refused_pin_replaced, &cluster_current_mx_old_plan,
+			if (!cluster_heap_vm_pair_writer_lock(
+					target, cluster_page_versioned, state, site, &refused_pin_replaced,
+					&cluster_current_mx_old_plan,
 					&cluster_current_mx_new_plan, context, alias)) {
 				refused_vm = requested;
 				refused_vm_is_new = is_new;
@@ -15277,16 +15318,26 @@ l_pgrac_reacquire:
 					CLUSTER_BUFFER_BARRIER_OUTCOME_POSTCONDITION_OK,
 					CLUSTER_BUFFER_BARRIER_PROOF_CALLER_POST);
 				if (!refused_pin_replaced)
-					cluster_heap_vm_barrier_warm(refused_vm_is_new ? &vmbuffer_new : &vmbuffer,
-												 refused_vm_is_new ? &vmbuffer : &vmbuffer_new,
-												 refused_vm_is_new ? &cluster_vm_new_context
-																   : &cluster_vm_context);
+				{
+					if (cluster_page_versioned)
+						cluster_heap_vm_mutation_prepare(
+							refused_vm_is_new ? &vmbuffer_new : &vmbuffer,
+							refused_vm_is_new ? &vmbuffer : &vmbuffer_new,
+							refused_vm_is_new ? &cluster_vm_new_state : &cluster_vm_state,
+							refused_vm_is_new ? &cluster_vm_new_context : &cluster_vm_context);
+					else
+						cluster_heap_vm_barrier_warm(refused_vm_is_new ? &vmbuffer_new : &vmbuffer,
+							refused_vm_is_new ? &vmbuffer : &vmbuffer_new,
+							refused_vm_is_new ? &cluster_vm_new_context : &cluster_vm_context);
+				}
 				if (BufferIsValid(vmbuffer))
 					ReleaseBuffer(vmbuffer);
 				vmbuffer = InvalidBuffer;
 				if (BufferIsValid(vmbuffer_new))
 					ReleaseBuffer(vmbuffer_new);
 				vmbuffer_new = InvalidBuffer;
+				if (cluster_page_versioned)
+					CHECK_FOR_INTERRUPTS();
 				cluster_heap_lock_with_vm_repin(relation, block, buffer, &vmbuffer);
 				page = BufferGetPage(buffer);
 				lp = PageGetItemId(page, ItemPointerGetOffsetNumber(otid));
@@ -15323,16 +15374,26 @@ l_pgrac_reacquire:
 				CLUSTER_BUFFER_BARRIER_OUTCOME_POSTCONDITION_OK,
 				CLUSTER_BUFFER_BARRIER_PROOF_CALLER_POST);
 			if (!refused_pin_replaced)
-				cluster_heap_vm_barrier_warm(refused_vm_is_new ? &vmbuffer_new : &vmbuffer,
-											 refused_vm_is_new ? &vmbuffer : &vmbuffer_new,
-											 refused_vm_is_new ? &cluster_vm_new_context
-															   : &cluster_vm_context);
+			{
+				if (cluster_page_versioned)
+					cluster_heap_vm_mutation_prepare(
+						refused_vm_is_new ? &vmbuffer_new : &vmbuffer,
+						refused_vm_is_new ? &vmbuffer : &vmbuffer_new,
+						refused_vm_is_new ? &cluster_vm_new_state : &cluster_vm_state,
+						refused_vm_is_new ? &cluster_vm_new_context : &cluster_vm_context);
+				else
+					cluster_heap_vm_barrier_warm(refused_vm_is_new ? &vmbuffer_new : &vmbuffer,
+						refused_vm_is_new ? &vmbuffer : &vmbuffer_new,
+						refused_vm_is_new ? &cluster_vm_new_context : &cluster_vm_context);
+			}
 			if (BufferIsValid(vmbuffer))
 				ReleaseBuffer(vmbuffer);
 			vmbuffer = InvalidBuffer;
 			if (BufferIsValid(vmbuffer_new))
 				ReleaseBuffer(vmbuffer_new);
 			vmbuffer_new = InvalidBuffer;
+			if (cluster_page_versioned)
+				CHECK_FOR_INTERRUPTS();
 			ClusterObserveBufferBarrierReceipt(
 				refused_site, CLUSTER_BUFFER_BARRIER_PHASE_REENTRY,
 				refused_rlocator, refused_forknum, refused_blocknum,

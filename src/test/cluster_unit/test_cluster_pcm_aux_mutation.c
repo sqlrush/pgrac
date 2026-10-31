@@ -875,6 +875,20 @@ native_single_dml_writer(Buffer *buffer, bool versioned, ClusterHeapVmMutationSt
 	return acquired;
 }
 
+static bool
+native_pair_vm_writer(Buffer *buffer, bool versioned, ClusterHeapVmMutationState *state,
+		ClusterBufferBarrierSiteId site, bool *replaced, int *first, int *second,
+		ResourceXAuxiliaryAcquireContext *context, Buffer *alias)
+{
+	bool acquired;
+
+	UT_ASSERT(!versioned);
+	acquired = dml_stamp_lock(*buffer, true, site, replaced, first, second, context, alias);
+	if (*replaced)
+		*buffer = InvalidBuffer;
+	return acquired;
+}
+
 static void
 dml_pin(Relation relation, BlockNumber heap, Buffer *vm)
 {
@@ -920,6 +934,7 @@ dml_observe(ClusterBufferBarrierPhase phase)
 #define ClusterLockBufferExclusiveAuxiliaryAliasAware dml_aux_lock
 #define cluster_current_mx_stamp_lock_buffer dml_stamp_lock
 #define cluster_heap_vm_dml_writer_lock native_single_dml_writer
+#define cluster_heap_vm_pair_writer_lock native_pair_vm_writer
 #define cluster_heap_vm_barrier_warm dml_warm
 #define cluster_heap_lock_with_vm_repin dml_repin
 #define visibilitymap_pin dml_pin
@@ -943,6 +958,8 @@ run_update_vm_bracket(bool same_vm, bool reverse, bool temp_locked)
 	bool old_key_copied = false, iscombo = true;
 	CommandId cid = 2, pgrac_entry_cid = 1;
 	ResourceXAuxiliaryAcquireContext cluster_vm_context = { 0 }, cluster_vm_new_context = { 0 };
+	ClusterHeapVmMutationState cluster_vm_state = { 0 }, cluster_vm_new_state = { 0 };
+	bool cluster_page_versioned = false;
 	int cluster_current_mx_old_plan = 1, cluster_current_mx_new_plan = 1;
 	Page page;
 	ItemId lp;
