@@ -623,6 +623,8 @@ struct RfSideOnlinePlanV1 {
 static RfSideOnlinePlanV1 side_fixture[CLUSTER_COLD_MAX_PARTICIPANTS];
 static int side_creates, side_seals, side_destroys, side_fault;
 static Size side_budget_total;
+static const ClusterColdRelmapInputV1 *scan_relmap_input;
+static bool scan_relmap_require_early_binding;
 
 RfPageProofDetailV1
 rf_side_online_plan_create_v1(const RfSideOnlinePlanRequestV1 *request, RfSideOnlinePlanV1 **out)
@@ -666,8 +668,14 @@ bool
 rf_side_online_plan_bind_database_v1(RfSideOnlinePlanV1 *plan, uint64 database)
 {
 	UT_ASSERT_EQ(database, 5);
-	UT_ASSERT(side_creates >= NROOTS);
-	UT_ASSERT_EQ(census_releases, 1);
+	if (scan_relmap_input != NULL && plan == &side_fixture[scan_relmap_input->participant]
+		&& plan->captured == 0) {
+		UT_ASSERT_EQ(census_releases, 0);
+		if (side_fault == 17) return false;
+	} else {
+		UT_ASSERT(side_creates >= NROOTS);
+		UT_ASSERT_EQ(census_releases, 1);
+	}
 	if (side_fault == 2 && plan == &side_fixture[1])
 		return false;
 	if (side_fault == 13 && plan == &side_fixture[NROOTS])
@@ -685,6 +693,8 @@ rf_side_online_plan_seal_v1(RfSideOnlinePlanV1 *plan)
 		return RF_PAGE_PROOF_DETAIL_SOURCE_GAP;
 	if (side_fault == 7 && plan == &side_fixture[0])
 		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	if (side_fault == 16 && plan == &side_fixture[0])
+		return RF_PAGE_PROOF_DETAIL_OPCODE_UNSUPPORTED;
 	if (plan == &side_fixture[NROOTS]) {
 		if (side_fault == 11)
 			return RF_PAGE_PROOF_DETAIL_OPCODE_UNSUPPORTED;
@@ -793,6 +803,20 @@ cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
 													: root->checkpoint_lower_lsn;
 	record.component_count = 1;
 	record.components = &component;
+	if (scan_relmap_input != NULL && scan_relmap_input->participant == participant) {
+		if (scan_relmap_require_early_binding && (side_plan == NULL || !side_plan->bound))
+			return CLUSTER_COLD_SIDE_OWNER_MISSING;
+		record.record_crc = scan_relmap_input->frame.record_crc;
+		record.source_xid = scan_relmap_input->frame.source_xid;
+		record.rmid = RM_RELMAP_ID;
+		record.info = XLOG_RELMAP_UPDATE;
+		record.component_count = 0;
+		record.components = NULL;
+		record.record_flags = CLUSTER_COLD_RECORD_STRUCTURAL | CLUSTER_COLD_RECORD_SIDE_UNOWNED;
+		record.relmap_image = &scan_relmap_input->staged.pending;
+		record.relmap_dbid = InvalidOid;
+		record.relmap_tsid = GLOBALTABLESPACE_OID;
+	}
 	detail = cluster_cold_plan_feed_v1(plan, participant, &record);
 	result->records = 2;
 	if (side_plan != NULL) {
@@ -1696,6 +1720,8 @@ fixture(void)
 	memset(side_fixture, 0, sizeof(side_fixture));
 	side_creates = side_seals = side_destroys = side_fault = 0;
 	side_budget_total = 0;
+	scan_relmap_input = NULL;
+	scan_relmap_require_early_binding = false;
 
 	memset(roots, 0, sizeof(roots));
 	memset(tokens, 0, sizeof(tokens));

@@ -56,7 +56,8 @@ extern ClusterColdTypedV1 *cluster_cold_typed_prepare_relmap_v1(
 	const ClusterColdRelmapInputV1 *inputs, uint32 count);
 
 /* Original scheduled position only. Requires the original executable source
- * bracket and namespace X; uses the original retained FullXid pin for stage.
+ * bracket, complete sealed SIDE carrier and namespace X; uses the original
+ * retained FullXid pin for stage.
  * Attempt is latched before the first current check or I/O. False/ERROR is
  * sticky, leaves both physical copies and every original pin/debt in place,
  * and permits no retry. A successful duplicate only checks the saved receipt
@@ -67,7 +68,8 @@ extern bool cluster_cold_typed_relmap_record_v1(ClusterColdTypedV1 *typed,
 
 /* One conjunct at the original completion cut, not a completion setter.
  * Every declared input must have been captured and consumed; current source,
- * exact original pins and complete staged pairs are reread. No declaration
+ * complete sealed SIDE declarations, exact original pins and staged pairs
+ * are revalidated. No declaration
  * does not waive pass-1's original structural refusal. No cleanup/release. */
 extern bool cluster_cold_typed_relmap_ready_v1(ClusterColdTypedV1 *typed,
 	struct ClusterRecoveryFencePlan *fence);

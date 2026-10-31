@@ -158,6 +158,10 @@ extern uint32 rf_side_online_plan_relmap_count_v1(const RfSideOnlinePlanV1 *plan
 	const ClusterWalSourceRef *source);
 extern bool rf_side_online_plan_relmap_matches_v1(const RfSideOnlinePlanV1 *plan,
 	const ClusterWalSourceRef *source, const XLogReaderState *reader);
+/* Same sealed declaration, including the original borrowed pin directory
+ * and lock. Compares values rather than transient structure padding. */
+extern bool rf_side_online_plan_relmap_input_matches_v1(const RfSideOnlinePlanV1 *plan,
+	const struct ClusterColdRelmapInputV1 *input);
 /* Exact same-source native MAIN CREATE / typed CREATE pair. This is an
  * immutable dependency lookup, never an execution or file-existence proof. */
 extern bool rf_side_online_plan_native_creation_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
