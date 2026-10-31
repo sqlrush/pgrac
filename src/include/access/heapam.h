@@ -37,6 +37,9 @@
 #include "storage/shm_toc.h"
 #include "utils/relcache.h"
 #include "utils/snapshot.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_r4_projection.h"
+#endif
 
 
 /* "options" flag bits for heap_insert */
@@ -110,14 +113,17 @@ typedef struct HeapScanDescData
 	 */
 	ParallelBlockTableScanWorkerData *rs_parallelworkerdata;
 
-	/* these fields only used in page-at-a-time mode and for bitmap scans */
+	/* Also used by private R4 FULL row-mode scans. */
 	int			rs_cindex;		/* current tuple's index in vistuples */
 	int			rs_ntuples;		/* number of visible tuples on page */
 	OffsetNumber rs_vistuples[MaxHeapTuplesPerPage];	/* their offsets */
 #ifdef USE_PGRAC_CLUSTER
 	/* Private scan result bytes; no shared-memory or persisted layout. */
-	uint8 rs_owned_kind; /* 0 absent, 1 visibility-matched page, 2 selected row */
+	uint8 rs_owned_kind; /* 0 absent, 1 captured page, 2 selected row, 3 R4 FULL */
 	char rs_owned_page[BLCKSZ] pg_attribute_aligned(MAXIMUM_ALIGNOF);
+	ClusterR4ProjectionScratch rs_projection;
+	Snapshot rs_full_snapshot;
+	CommandId rs_full_curcid;
 #endif
 }			HeapScanDescData;
 typedef struct HeapScanDescData *HeapScanDesc;

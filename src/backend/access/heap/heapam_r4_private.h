@@ -27,6 +27,8 @@
 #include "access/tableam.h"
 #include "cluster/cluster_scn.h"
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_catalog_stats.h"
+#include "cluster/cluster_epoch.h"
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_r4_projection.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
@@ -76,10 +78,34 @@ cluster_heap_copy_read_tuple(char storage[BLCKSZ], HeapTuple tuple)
 }
 
 static inline void
+cluster_heap_scan_forget_owned(HeapScanDesc scan)
+{
+	if (scan->rs_owned_kind == 3) {
+		memset(scan->rs_owned_page, 0, BLCKSZ);
+		scan->rs_ctup.t_data = NULL;
+	}
+	ClusterR4ProjectionForget(&scan->rs_projection);
+	scan->rs_full_snapshot = NULL;
+	scan->rs_full_curcid = InvalidCommandId;
+	scan->rs_owned_kind = 0;
+}
+
+static inline pg_attribute_noreturn() void cluster_heap_scan_full_unknown(HeapScanDesc scan)
+{
+	cluster_heap_scan_forget_owned(scan);
+	cluster_catalog_stats_vis_unknown_inc();
+	ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+					errmsg("cluster heap scan cannot prove its private FULL page"),
+					errdetail("PGRAC_FAMILY=TT_AUTHORITY PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
+							  "PGRAC_NODE=%d PGRAC_ATTEMPT=0",
+							  cluster_node_id)));
+	pg_unreachable();
+}
+
+static inline void
 cluster_heap_scan_capture_page(HeapScanDesc scan)
 {
-	if (cluster_heap_read_needs_copy(scan->rs_base.rs_rd))
-	{
+	if (scan->rs_owned_kind != 3 && cluster_heap_read_needs_copy(scan->rs_base.rs_rd)) {
 		memcpy(scan->rs_owned_page, BufferGetPage(scan->rs_cbuf), BLCKSZ);
 		scan->rs_owned_kind = 1;
 	}
@@ -88,8 +114,7 @@ cluster_heap_scan_capture_page(HeapScanDesc scan)
 static inline void
 cluster_heap_scan_capture_tuple(HeapScanDesc scan)
 {
-	if (cluster_heap_read_needs_copy(scan->rs_base.rs_rd))
-	{
+	if (scan->rs_owned_kind != 3 && cluster_heap_read_needs_copy(scan->rs_base.rs_rd)) {
 		cluster_heap_copy_read_tuple(scan->rs_owned_page, &scan->rs_ctup);
 		scan->rs_ctup.t_data = (HeapTupleHeader) scan->rs_owned_page;
 		scan->rs_owned_kind = 2;
@@ -99,6 +124,22 @@ cluster_heap_scan_capture_tuple(HeapScanDesc scan)
 static inline Page
 cluster_heap_scan_page(HeapScanDesc scan)
 {
+	if (scan->rs_owned_kind == 3) {
+		Snapshot snapshot = scan->rs_base.rs_snapshot;
+		BufferTag tag;
+
+		InitBufferTag(&tag, &scan->rs_base.rs_rd->rd_locator, MAIN_FORKNUM, scan->rs_cblock);
+		if (!cluster_heap_read_needs_copy(scan->rs_base.rs_rd) || snapshot == NULL
+			|| snapshot != scan->rs_full_snapshot || snapshot->snapshot_type != SNAPSHOT_MVCC
+			|| snapshot->cluster_source != SNAPSHOT_SOURCE_CLUSTER
+			|| snapshot->curcid != scan->rs_full_curcid
+			|| snapshot->read_epoch != cluster_epoch_get_current()
+			|| !ClusterR4ProjectionScratchValid(&scan->rs_projection, scan->rs_owned_page, &tag,
+												snapshot->read_scn, snapshot->read_epoch,
+												cluster_node_id))
+			cluster_heap_scan_full_unknown(scan);
+		return (Page)scan->rs_owned_page;
+	}
 	if (cluster_heap_read_needs_copy(scan->rs_base.rs_rd))
 	{
 		Assert(scan->rs_owned_kind == 1);
@@ -110,6 +151,9 @@ cluster_heap_scan_page(HeapScanDesc scan)
 static inline void
 cluster_heap_scan_store(HeapScanDesc scan, TupleTableSlot *slot)
 {
+	/* Recheck the original binding before the executor owns the copied row. */
+	if (scan->rs_owned_kind == 3)
+		(void)cluster_heap_scan_page(scan);
 	if (cluster_heap_read_needs_copy(scan->rs_base.rs_rd))
 	{
 		HeapTupleData selected = scan->rs_ctup;

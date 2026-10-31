@@ -13,6 +13,8 @@
 #include "storage/predicate.h"
 #include "access/syncscan.h"
 #include "access/valid.h"
+#include "access/visibilitymap.h"
+#include "cluster/cluster_gcs_block.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "../../backend/access/heap/heapam_r4_private.h"
@@ -22,6 +24,8 @@
 #undef snprintf
 #include "unit_test.h"
 UT_DEFINE_GLOBALS();
+#include "cluster_snapshot_test_stubs.h"
+#include "test_cluster_heap_maintenance_policy.inc"
 
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
@@ -929,6 +933,42 @@ getmissingattr(TupleDesc desc, int attnum, bool *isnull)
 	return 0;
 }
 
+/* These older witnesses use local snapshots. Trap any unexpected FULL request;
+ * the private FULL scan family is exercised with real MVCC in scan_full. */
+uint64
+cluster_epoch_get_current(void)
+{
+	abort();
+}
+void
+cluster_catalog_stats_vis_unknown_inc(void)
+{
+	abort();
+}
+ClusterCrBuildResult
+cluster_gcs_block_cr_fetch_projection(BufferTag tag, SCN scn, char page[BLCKSZ],
+									  ClusterR4ProjectionScratch *projection,
+									  ClusterCrBuildReason *reason)
+{
+	abort();
+}
+bool
+HeapTupleSatisfiesMVCCScratch(HeapTuple tuple, Snapshot snapshot,
+							  const ClusterR4HotScratchTestContext *context)
+{
+	abort();
+}
+void
+RelationDecrementReferenceCount(Relation relation)
+{
+	abort();
+}
+void
+UnregisterSnapshot(Snapshot snapshot)
+{
+	abort();
+}
+#include "test_cluster_heap_scan_r4.inc"
 #include "test_cluster_heap_scan_lifetime.inc"
 
 Buffer

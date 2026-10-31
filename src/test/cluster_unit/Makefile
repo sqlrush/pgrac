@@ -6263,6 +6263,7 @@ clean distclean maintainer-clean:
 		test_cluster_heap_update_owned.inc test_cluster_heap_toast_capture.inc \
 		test_cluster_heap_toast_consume.inc \
 		test_cluster_heap_lock_strength.inc test_cluster_heap_scan_lifetime.inc \
+		test_cluster_heap_scan_r4.inc \
 		test_cluster_heap_scan_consumers.inc test_cluster_heap_snapshot_consumer.inc \
 		test_cluster_heap_index_recheck.inc test_cluster_heap_index_recapture.inc \
 		test_cluster_heap_copy_entry.inc test_cluster_heap_copy_exit.inc \
@@ -13169,3 +13170,28 @@ test_cluster_r4_route_policy: test_cluster_r4_tx_outcome test_cluster_r4_slot_re
 $(CLUSTER_R4_CONTINUATION_CR_O): $(top_srcdir)/src/include/cluster/cluster_r4_projection.h
 
 $(CLUSTER_R4_HOT_HEAPAM_TEST_O) $(CLUSTER_R4_HOT_HANDLER_TEST_O) $(CLUSTER_R4_HOT_VIS_TEST_O) test_cluster_heap_cr_reuse test_cluster_heap_hot_full_trace: $(top_srcdir)/src/backend/access/heap/heapam_r4_private.h
+
+TESTS += test_cluster_heap_scan_full
+all: test_cluster_heap_scan_full
+
+test_cluster_heap_epq_wait: test_cluster_heap_scan_r4.inc test_cluster_heap_maintenance_policy.inc \
+        $(top_srcdir)/src/backend/access/heap/heapam_r4_private.h cluster_snapshot_test_stubs.h
+
+test_cluster_heap_scan_r4.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk 'BEGIN { print "static bool heap_hot_r4_scratch_page_valid(Page page);" } \
+	     /^(cluster_heap_scan_fetch_full|cluster_heap_scan_r4_visible|heap_hot_r4_scratch_page_valid)\(/ { print "static bool"; emit=1; found++ } \
+	     /^cluster_heap_scan_select_full\(/ { print "static void"; emit=1; found++ } \
+	     /^heap_endscan\(/ { print "void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 5) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_scan_full: test_cluster_heap_scan_full.c test_cluster_scratch_self.c \
+        test_cluster_r4_scratch_resolver.c test_cluster_heap_scan_r4.inc \
+        test_cluster_heap_scan_lifetime.inc test_cluster_heap_maintenance_policy.inc test_cluster_scratch_self \
+        $(top_srcdir)/src/backend/access/heap/heapam_r4_private.h \
+        $(top_srcdir)/src/include/access/heapam.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+        $(CLUSTER_R4_SCRATCH_RESOLVER_TEST_O) $(CLUSTER_VIS_VERDICT_O) $(CLUSTER_R4_HOT_VIS_TEST_O) \
+        $(CLUSTER_SAVEPOINT_READER_O) \
+        $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(top_builddir)/src/common/libpgcommon_srv.a \
+        $(CLUSTER_UNIT_PORT_LIBS) -o $@

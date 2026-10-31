@@ -2811,7 +2811,9 @@ initscan(HeapScanDesc scan, ScanKey key, bool keep_startblock)
 	scan->rs_numblocks = InvalidBlockNumber;
 	scan->rs_inited = false;
 #ifdef USE_PGRAC_CLUSTER
-	scan->rs_owned_kind = 0;
+	if (!keep_startblock)
+		scan->rs_owned_kind = 0; /* The descriptor was allocated with palloc. */
+	cluster_heap_scan_forget_owned(scan);
 #endif
 	scan->rs_ctup.t_data = NULL;
 	ItemPointerSetInvalid(&scan->rs_ctup.t_self);
@@ -2857,6 +2859,116 @@ heap_setscanlimits(TableScanDesc sscan, BlockNumber startBlk, BlockNumber numBlk
 	scan->rs_numblocks = numBlks;
 }
 
+#ifdef USE_PGRAC_CLUSTER
+static bool heap_hot_r4_scratch_page_valid(Page page);
+
+/* Select every row before exposing any of this private FULL observation. */
+static void
+cluster_heap_scan_select_full(HeapScanDesc scan)
+{
+	ClusterR4HotScratchTestContext context = { 0 };
+	Page page = cluster_heap_scan_page(scan);
+	OffsetNumber off, maxoff = PageGetMaxOffsetNumber(page);
+
+	context.scratch_page = page;
+	InitBufferTag(&context.tag, &scan->rs_base.rs_rd->rd_locator, MAIN_FORKNUM, scan->rs_cblock);
+	context.read_scn = scan->rs_base.rs_snapshot->read_scn;
+	context.already_full = true;
+	context.projection = &scan->rs_projection;
+	scan->rs_ntuples = 0;
+	for (off = FirstOffsetNumber; off <= maxoff; off++) {
+		ItemId item = PageGetItemId(page, off);
+		HeapTupleData tuple;
+
+		if (!ItemIdIsNormal(item))
+			continue;
+		tuple.t_tableOid = RelationGetRelid(scan->rs_base.rs_rd);
+		tuple.t_data = (HeapTupleHeader)PageGetItem(page, item);
+		tuple.t_len = ItemIdGetLength(item);
+		ItemPointerSet(&tuple.t_self, scan->rs_cblock, off);
+		context.logical_root = tuple.t_self;
+		if (HeapTupleSatisfiesMVCCScratch(&tuple, scan->rs_base.rs_snapshot, &context))
+			scan->rs_vistuples[scan->rs_ntuples++] = off;
+	}
+}
+
+/* One original CR request, outside content locks; no raw or live-page fallback. */
+static bool
+cluster_heap_scan_fetch_full(HeapScanDesc scan)
+{
+	Snapshot snapshot = scan->rs_base.rs_snapshot;
+	ClusterSnapshotReadScopeV1 scope;
+	ClusterCrBuildReason reason = CLUSTER_CR_BUILD_NONE;
+	BufferTag tag;
+	volatile bool full = false;
+
+	if (!cluster_heap_read_needs_copy(scan->rs_base.rs_rd)
+		|| !(scan->rs_base.rs_flags & (SO_TYPE_SEQSCAN | SO_TYPE_TIDRANGESCAN)) || snapshot == NULL
+		|| snapshot->snapshot_type != SNAPSHOT_MVCC
+		|| snapshot->cluster_source != SNAPSHOT_SOURCE_CLUSTER)
+		return false;
+
+	InitBufferTag(&tag, &scan->rs_base.rs_rd->rd_locator, MAIN_FORKNUM, scan->rs_cblock);
+	cluster_snapshot_read_enter_v1(&scope, snapshot);
+	scan->rs_owned_kind = 3;
+	scan->rs_full_snapshot = snapshot;
+	scan->rs_full_curcid = snapshot->curcid;
+	PG_TRY();
+	{
+		ClusterCrBuildResult result = cluster_gcs_block_cr_fetch_projection(
+			tag, snapshot->read_scn, scan->rs_owned_page, &scan->rs_projection, &reason);
+
+		if (!(result == CLUSTER_CR_BUILD_RETRYABLE && reason == CLUSTER_CR_BUILD_TARGET_DISABLED)) {
+			if (reason == CLUSTER_CR_BUILD_SNAPSHOT_TOO_OLD)
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_CR_SNAPSHOT_TOO_OLD),
+						 errmsg("cluster heap scan is older than the retained undo horizon")));
+			if (result != CLUSTER_CR_BUILD_FULL || reason != CLUSTER_CR_BUILD_NONE
+				|| !heap_hot_r4_scratch_page_valid(scan->rs_owned_page))
+				cluster_heap_scan_full_unknown(scan);
+			/* As in HOT scratch, FULL cannot preserve the native SSI checks. */
+			if (IsolationIsSerializable())
+				cluster_heap_scan_full_unknown(scan);
+			if (SCN_VALID(ClusterPageGetItlHeader(scan->rs_owned_page)->itl_recycle_watermark_scn)
+				&& scn_time_cmp(
+					   ClusterPageGetItlHeader(scan->rs_owned_page)->itl_recycle_watermark_scn,
+					   snapshot->read_scn)
+					   > 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_CR_SNAPSHOT_TOO_OLD),
+						 errmsg("cluster heap scan is older than its page recycle horizon")));
+			cluster_heap_scan_select_full(scan);
+			full = true;
+		}
+	}
+	PG_FINALLY();
+	{
+		if (!full)
+			cluster_heap_scan_forget_owned(scan);
+		cluster_snapshot_read_exit_v1(&scope);
+	}
+	PG_END_TRY();
+	return full;
+}
+
+/* Row mode consumes the same sorted selection as page mode, without I/O. */
+static bool
+cluster_heap_scan_r4_visible(HeapScanDesc scan, OffsetNumber offset)
+{
+	int low = 0, high = scan->rs_ntuples;
+
+	while (low < high) {
+		int middle = low + (high - low) / 2;
+
+		if (scan->rs_vistuples[middle] < offset)
+			low = middle + 1;
+		else
+			high = middle;
+	}
+	return low < scan->rs_ntuples && scan->rs_vistuples[low] == offset;
+}
+#endif
+
 /*
  * heapgetpage - subroutine for heapgettup()
  *
@@ -2878,7 +2990,7 @@ heapgetpage(TableScanDesc sscan, BlockNumber block)
 
 	Assert(block < scan->rs_nblocks);
 #ifdef USE_PGRAC_CLUSTER
-	scan->rs_owned_kind = 0;
+	cluster_heap_scan_forget_owned(scan);
 #endif
 
 	/* release previous scan buffer, if any */
@@ -2900,6 +3012,11 @@ heapgetpage(TableScanDesc sscan, BlockNumber block)
 									   RBM_NORMAL, scan->rs_strategy);
 	scan->rs_cblock = block;
 
+#ifdef USE_PGRAC_CLUSTER
+	/* FULL selection owns its bytes and proof in both scan modes. */
+	if (cluster_heap_scan_fetch_full(scan))
+		return;
+#endif
 	if (!(scan->rs_base.rs_flags & SO_ALLOW_PAGEMODE))
 		return;
 
@@ -3063,7 +3180,11 @@ heapgettup_start_page(HeapScanDesc scan, ScanDirection dir, int *linesleft,
 	Assert(BufferIsValid(scan->rs_cbuf));
 
 	/* Caller is responsible for ensuring buffer is locked if needed */
-	page = BufferGetPage(scan->rs_cbuf);
+	page =
+#ifdef USE_PGRAC_CLUSTER
+		scan->rs_owned_kind == 3 ? cluster_heap_scan_page(scan) :
+#endif
+								 BufferGetPage(scan->rs_cbuf);
 
 	TestForOldSnapshot(scan->rs_base.rs_snapshot, scan->rs_base.rs_rd, page);
 
@@ -3096,7 +3217,11 @@ heapgettup_continue_page(HeapScanDesc scan, ScanDirection dir, int *linesleft,
 	Assert(BufferIsValid(scan->rs_cbuf));
 
 	/* Caller is responsible for ensuring buffer is locked if needed */
-	page = BufferGetPage(scan->rs_cbuf);
+	page =
+#ifdef USE_PGRAC_CLUSTER
+		scan->rs_owned_kind == 3 ? cluster_heap_scan_page(scan) :
+#endif
+								 BufferGetPage(scan->rs_cbuf);
 
 	TestForOldSnapshot(scan->rs_base.rs_snapshot, scan->rs_base.rs_rd, page);
 
@@ -3236,6 +3361,9 @@ heapgettup(HeapScanDesc scan,
 	Page		page;
 	OffsetNumber lineoff;
 	int			linesleft;
+#ifdef USE_PGRAC_CLUSTER
+	bool private_full;
+#endif
 
 	if (unlikely(!scan->rs_inited))
 	{
@@ -3249,7 +3377,13 @@ heapgettup(HeapScanDesc scan,
 		/* continue from previously returned page/tuple */
 		block = scan->rs_cblock;
 
-		LockBuffer(scan->rs_cbuf, BUFFER_LOCK_SHARE);
+#ifdef USE_PGRAC_CLUSTER
+		private_full = scan->rs_owned_kind == 3;
+		if (private_full)
+			(void)cluster_heap_scan_page(scan); /* Fail before a content lock. */
+		else
+#endif
+			LockBuffer(scan->rs_cbuf, BUFFER_LOCK_SHARE);
 		page = heapgettup_continue_page(scan, dir, &linesleft, &lineoff);
 		goto continue_page;
 	}
@@ -3261,7 +3395,11 @@ heapgettup(HeapScanDesc scan,
 	while (block != InvalidBlockNumber)
 	{
 		heapgetpage((TableScanDesc) scan, block);
-		LockBuffer(scan->rs_cbuf, BUFFER_LOCK_SHARE);
+#ifdef USE_PGRAC_CLUSTER
+		private_full = scan->rs_owned_kind == 3;
+		if (!private_full)
+#endif
+			LockBuffer(scan->rs_cbuf, BUFFER_LOCK_SHARE);
 		page = heapgettup_start_page(scan, dir, &linesleft, &lineoff);
 continue_page:
 
@@ -3284,9 +3422,13 @@ continue_page:
 			tuple->t_len = ItemIdGetLength(lpp);
 			ItemPointerSet(&(tuple->t_self), block, lineoff);
 
-			visible = HeapTupleSatisfiesVisibility(tuple,
-												   scan->rs_base.rs_snapshot,
-												   scan->rs_cbuf);
+			visible =
+#ifdef USE_PGRAC_CLUSTER
+				private_full
+					? cluster_heap_scan_r4_visible(scan, lineoff)
+					:
+#endif
+					HeapTupleSatisfiesVisibility(tuple, scan->rs_base.rs_snapshot, scan->rs_cbuf);
 
 			HeapCheckForSerializableConflictOut(visible, scan->rs_base.rs_rd,
 												tuple, scan->rs_cbuf,
@@ -3304,6 +3446,7 @@ continue_page:
 
 #ifdef USE_PGRAC_CLUSTER
 			cluster_heap_scan_capture_tuple(scan);
+			if (!private_full)
 #endif
 			LockBuffer(scan->rs_cbuf, BUFFER_LOCK_UNLOCK);
 			scan->rs_coffset = lineoff;
@@ -3314,7 +3457,10 @@ continue_page:
 		 * if we get here, it means we've exhausted the items on this page and
 		 * it's time to move to the next.
 		 */
-		LockBuffer(scan->rs_cbuf, BUFFER_LOCK_UNLOCK);
+#ifdef USE_PGRAC_CLUSTER
+		if (!private_full)
+#endif
+			LockBuffer(scan->rs_cbuf, BUFFER_LOCK_UNLOCK);
 
 		/* get the BlockNumber to scan next */
 		block = heapgettup_advance_block(scan, block, dir);
@@ -3329,7 +3475,7 @@ continue_page:
 	tuple->t_data = NULL;
 	scan->rs_inited = false;
 #ifdef USE_PGRAC_CLUSTER
-	scan->rs_owned_kind = 0;
+	cluster_heap_scan_forget_owned(scan);
 #endif
 }
 
@@ -3442,7 +3588,7 @@ continue_page:
 	tuple->t_data = NULL;
 	scan->rs_inited = false;
 #ifdef USE_PGRAC_CLUSTER
-	scan->rs_owned_kind = 0;
+	cluster_heap_scan_forget_owned(scan);
 #endif
 }
 
@@ -3588,6 +3734,9 @@ heap_endscan(TableScanDesc sscan)
 	if (BufferIsValid(scan->rs_cbuf))
 		ReleaseBuffer(scan->rs_cbuf);
 
+#ifdef USE_PGRAC_CLUSTER
+	cluster_heap_scan_forget_owned(scan);
+#endif
 	/*
 	 * decrement relation reference count and free scan descriptor storage
 	 */
@@ -3800,8 +3949,19 @@ heap_getnextslot_tidrange(TableScanDesc sscan, ScanDirection direction,
 			 * Future tuples in this direction will be lower still, so we can
 			 * just return false to indicate there will be no more tuples.
 			 */
-			if (ScanDirectionIsBackward(direction))
+			if (ScanDirectionIsBackward(direction)) {
+#ifdef USE_PGRAC_CLUSTER
+				/* The range is exhausted; retire its private page with the pin. */
+				if (scan->rs_owned_kind == 3) {
+					cluster_heap_scan_forget_owned(scan);
+					ReleaseBuffer(scan->rs_cbuf);
+					scan->rs_cbuf = InvalidBuffer;
+					scan->rs_cblock = InvalidBlockNumber;
+					scan->rs_inited = false;
+				}
+#endif
 				return false;
+			}
 
 			continue;
 		}
@@ -3819,8 +3979,18 @@ heap_getnextslot_tidrange(TableScanDesc sscan, ScanDirection direction,
 			 * Future tuples in this direction will be higher still, so we can
 			 * just return false to indicate there will be no more tuples.
 			 */
-			if (ScanDirectionIsForward(direction))
+			if (ScanDirectionIsForward(direction)) {
+#ifdef USE_PGRAC_CLUSTER
+				if (scan->rs_owned_kind == 3) {
+					cluster_heap_scan_forget_owned(scan);
+					ReleaseBuffer(scan->rs_cbuf);
+					scan->rs_cbuf = InvalidBuffer;
+					scan->rs_cblock = InvalidBlockNumber;
+					scan->rs_inited = false;
+				}
+#endif
 				return false;
+			}
 			continue;
 		}
 

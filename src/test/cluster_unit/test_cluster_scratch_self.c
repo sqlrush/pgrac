@@ -1312,8 +1312,11 @@ UT_TEST(test_real_owner_full_producer_reaches_native_self_cid_consumer)
 #include "test_cluster_scratch_peer.inc"
 #include "test_cluster_scratch_projection.inc"
 
+#ifndef CLUSTER_SCRATCH_SELF_ENTRY
+#define CLUSTER_SCRATCH_SELF_ENTRY main
+#endif
 int
-main(void)
+CLUSTER_SCRATCH_SELF_ENTRY(void)
 {
 	UT_PLAN(39);
 	UT_RUN(test_existing_delete_current_command);
