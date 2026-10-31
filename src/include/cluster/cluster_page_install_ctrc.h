@@ -25,6 +25,7 @@
 #include "storage/bufpage.h"
 
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_recovery_ctrc_record.h"
 #include "cluster/cluster_recovery_stamp.h"
 struct ClusterRecoveryStartV1;
 struct ClusterColdCtrcWorkV1;
@@ -427,6 +428,13 @@ typedef struct RfPageCtrcOwnerGraphV1 {
 	RfPageCtrcOwnerReferencesV1 related;
 	uint32 count;
 	RfPageCtrcOwnerGraphEntryV1 *entries;
+	/* Projected mode only: current-reference roots and their actual PAGE
+	 * owners/edges. Arrays belong to entries; evidence also borrows related.
+	 * Duplicate canonical roots occur once. All original entries remain in
+	 * count, including unresolved_count entries absent from this contribution.
+	 * An empty contribution is zero, never a complete/zero-reference proof. */
+	ClusterRecoveryCTRCGraphV2 contribution;
+	uint32 unresolved_count;
 } RfPageCtrcOwnerGraphV1;
 
 extern RfPageCtrcReadbackImageV1 rf_page_recovery_ctrc_replays_completed_image_v1(

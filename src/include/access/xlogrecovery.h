@@ -334,6 +334,9 @@ extern struct RfPageCtrcOwnerGraphV1 ClusterColdRecoveryCtrcPageOwnerGraph(
  * use the original pure ITL projector to check the same field's final bytes.
  * Only exact DATA/plain-lock terminal projections supply kind4 to that PAGE
  * owner. Historical/FREE/tuple/MX/unmatched references remain unresolved.
+ * Return canonical nodes/edges and unique current-reference roots in the
+ * contribution, alongside the complete original entry order and unresolved
+ * count. Its arrays share entries' lifetime; no caller subset is accepted.
  * The ordinary observation API above stays unchanged. Same whole budget,
  * output/lifetime/WAIT/ERROR contract; no first/pin/history retirement, full
  * G_ref/G_owner coverage, D0 admission or joint completion is provided. */

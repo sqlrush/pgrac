@@ -3658,14 +3658,20 @@ cluster_recovery_cold_page_owner_graph(const struct ClusterRecoveryStartV1 *star
 	ClusterRecoveryWalSourceObservationV1 *observed;
 	ClusterRecoveryCensusReferenceV1 *fixed_references;
 	ClusterColdTtSlotInputV1 *terminals;
+	ClusterRecoveryCTRCGraphNodeV2 *nodes;
+	ClusterRecoveryCTRCGraphEdgeV2 *edges;
+	size_t *roots;
+	ClusterRecoveryCTRCGraphV2 contribution = {0};
 	ClusterRecoveryTxResultObservationV1 accepted = {0};
 	const ClusterRecoveryCensusReferencesV1 *references;
 	const ClusterColdCtrcWorkV1 *work;
 	ClusterWalInputsV1 *scope;
 	Size bytes = 0, entry_offset, owner_offset, source_offset, observed_offset, reference_offset;
 	Size edge_offset, effect_offset, indexes_offset, data_offset, terminal_offset, key_capacity, stride, scratch;
+	Size graph_node_offset = 0, graph_edge_offset = 0, graph_root_offset = 0;
 	const Size reference_capacity = MAXPGPATH + 105;
 	uint32 reference_count, owner_count, source_count, wal_count, terminal_count, edge_count = 0, max_edges = 0;
+	uint32 unresolved_count = 0;
 	bool ready = false;
 
 	out.detail = RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
@@ -3695,7 +3701,7 @@ cluster_recovery_cold_page_owner_graph(const struct ClusterRecoveryStartV1 *star
 	/* Reserve complete scope/evidence output and codec scratch before the
 	 * unchanged reference/owner factory performs its own whole PAGE preflight. */
 	out.detail = RF_PAGE_PROOF_DETAIL_CAPACITY;
-	if (owner_count > UINT32_MAX / source_count
+	if (owner_count > UINT32_MAX / source_count || (projected && reference_count > UINT32_MAX / 2)
 		|| max_edges > (MaxAllocSize - 60 - 4 * source_count) / 62) return out;
 	key_capacity = 60 + (Size)4 * source_count + (Size)62 * max_edges;
 	if (key_capacity > (MaxAllocSize - sizeof(((RfPageCtrcOwnerEvidenceV1 *)0)->evidence)
@@ -3716,6 +3722,9 @@ cluster_recovery_cold_page_owner_graph(const struct ClusterRecoveryStartV1 *star
 		|| !cluster_recovery_cold_page_reference_reserve(&bytes, owner_count * source_count, sizeof(uint32), &indexes_offset)
 		|| !cluster_recovery_cold_page_reference_reserve(&bytes, reference_count, stride, &data_offset)
 		|| !cluster_recovery_cold_page_reference_reserve(&bytes, terminal_count, sizeof(*terminals), &terminal_offset)
+		|| (projected && (!cluster_recovery_cold_page_reference_reserve(&bytes, 2 * reference_count, sizeof(*nodes), &graph_node_offset)
+			|| !cluster_recovery_cold_page_reference_reserve(&bytes, reference_count, sizeof(*edges), &graph_edge_offset)
+			|| !cluster_recovery_cold_page_reference_reserve(&bytes, reference_count, sizeof(*roots), &graph_root_offset)))
 		|| memory_budget < bytes || memory_budget - bytes < scratch) return out;
 	Assert(entry_offset == 0);
 	PG_TRY();
@@ -3819,6 +3828,40 @@ cluster_recovery_cold_page_owner_graph(const struct ClusterRecoveryStartV1 *star
 						if (projected && entry->reference_key != NULL) entry->reference_edge_kind = 4;
 					}
 				}
+				if (valid && projected) {
+					nodes = (ClusterRecoveryCTRCGraphNodeV2 *)((char *)entries + graph_node_offset);
+					edges = (ClusterRecoveryCTRCGraphEdgeV2 *)((char *)entries + graph_edge_offset);
+					roots = (size_t *)((char *)entries + graph_root_offset);
+					for (uint32 i = 0; valid && i < reference_count; i++) {
+						const RfPageCtrcOwnerGraphEntryV1 *entry = &entries[i];
+						size_t n = contribution.node_count, r;
+						ClusterRecoveryCTRCGraphBytesV2 evidence = {entry->evidence, entry->evidence_length};
+						if (entry->reference_edge_kind != 4) { unresolved_count++; continue; }
+						valid = n <= (Size)2 * reference_count - 2
+							&& contribution.edge_count < reference_count && contribution.root_count < reference_count
+							&& entry->reference_key != NULL && entry->reference_key_length != 0
+							&& entry->reference_evidence != NULL && entry->reference_evidence_length != 0
+							&& cluster_recovery_ctrc_owner_graph_node_v2(entry->key, entry->key_length, &evidence, &nodes[n + 1]);
+						if (!valid) break;
+						nodes[n] = (ClusterRecoveryCTRCGraphNodeV2){1,
+							{entry->reference_key, entry->reference_key_length},
+							{entry->reference_evidence, entry->reference_evidence_length}};
+						edges[contribution.edge_count++] = (ClusterRecoveryCTRCGraphEdgeV2){4, n, n + 1};
+						/* Keep every original reference entry and contribution. Only
+						 * the canonical coverage root set is unique. Conflicting
+						 * evidence remains visible to the original graph consumer. */
+						for (r = 0; r < contribution.root_count; r++) {
+							const ClusterRecoveryCTRCGraphBytesV2 *key = &nodes[roots[r]].key;
+							if (key->length == entry->reference_key_length
+								&& memcmp(key->data, entry->reference_key, key->length) == 0) break;
+						}
+						if (r == contribution.root_count) roots[contribution.root_count++] = n;
+						contribution.node_count += 2;
+					}
+					if (contribution.node_count != 0) {
+						contribution.nodes = nodes; contribution.edges = edges; contribution.roots = roots;
+					}
+				}
 				if (valid && projected)
 					valid = work->counts.subject_count == terminal_count
 						&& cluster_recovery_cold_page_projection_subjects(start, work, scope, start->ctrc_page_progress,
@@ -3839,6 +3882,7 @@ cluster_recovery_cold_page_owner_graph(const struct ClusterRecoveryStartV1 *star
 	PG_END_TRY();
 	if (ready) {
 		out.detail = RF_PAGE_PROOF_DETAIL_OK; out.related = related; out.count = reference_count; out.entries = entries;
+		out.contribution = contribution; out.unresolved_count = unresolved_count;
 		return out;
 	}
 	if (related.entries != NULL) pfree(related.entries);

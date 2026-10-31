@@ -10968,3 +10968,4 @@ test_cluster_ctrc_projector.inc: $(top_srcdir)/src/backend/cluster/cluster_termi
 	mv $@.tmp $@
 
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_projected_graph.inc test_cluster_ctrc_projector.inc
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_graph_contribution.inc

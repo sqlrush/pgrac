@@ -2509,11 +2509,21 @@ static void startup_local_empty_reset(void);
 #include "test_cluster_cold_ctrc_owner_scopes.inc"
 #include "test_cluster_cold_ctrc_reference_graph.inc"
 #include "test_cluster_cold_ctrc_projected_graph.inc"
+#include "test_cluster_cold_ctrc_graph_contribution.inc"
 
 #include "test_cluster_cold_ctrc_page_raw.inc"
 
 int main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_PAGE_GRAPH_CONTRIBUTION") != NULL) {
+		UT_PLAN(5);
+		UT_RUN(test_start_page_contribution_reaches_original_graph_consumer_with_whole_evidence);
+		UT_RUN(test_start_page_contribution_keeps_unresolved_references_and_observation_optout);
+		UT_RUN(test_start_page_contribution_deduplicates_roots_without_dropping_original_entries);
+		UT_RUN(test_start_page_contribution_wait_error_and_late_drift_publish_no_prefix);
+		UT_RUN(test_start_page_contribution_whole_budget_and_oom_precede_first_page);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_PROJECTED_GRAPH") != NULL) {
 		UT_PLAN(6);
 		UT_RUN(test_start_projected_graph_binds_real_data_and_lock_terminal_projection);
@@ -3061,7 +3071,7 @@ int main(void)
 	}
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_FIRST
-	UT_PLAN(420);
+	UT_PLAN(425);
 	UT_RUN(test_start_borrows_only_its_original_completed_retention_owner);
 	UT_RUN(test_start_raw_records_keep_complete_original_bytes_and_empty_end);
 	UT_RUN(test_start_raw_records_refuse_incomplete_changed_bytes_hash_header_and_end);
@@ -3072,7 +3082,7 @@ int main(void)
 	UT_RUN(test_start_compound_groups_retain_complete_member_input_and_end);
 	UT_RUN(test_start_compound_groups_refuse_missing_mixed_or_nonempty_end);
 #else
-	UT_PLAN(403);
+	UT_PLAN(408);
 #endif
 	UT_RUN(test_startup_native_images_accept_only_unchanged_complete_terminal_page);
 	UT_RUN(test_startup_native_images_reject_unresolved_ambiguous_and_mx_itls);
@@ -3083,8 +3093,13 @@ int main(void)
 	UT_RUN(test_startup_native_directory_real_origin_cannot_be_discharged_by_wait);
 	UT_RUN(test_startup_native_directory_invalid_layout_and_partial_error_keep_debt);
 #else
-	UT_PLAN(395);
+	UT_PLAN(400);
 #endif
+	UT_RUN(test_start_page_contribution_reaches_original_graph_consumer_with_whole_evidence);
+	UT_RUN(test_start_page_contribution_keeps_unresolved_references_and_observation_optout);
+	UT_RUN(test_start_page_contribution_deduplicates_roots_without_dropping_original_entries);
+	UT_RUN(test_start_page_contribution_wait_error_and_late_drift_publish_no_prefix);
+	UT_RUN(test_start_page_contribution_whole_budget_and_oom_precede_first_page);
 	UT_RUN(test_start_projected_graph_binds_real_data_and_lock_terminal_projection);
 	UT_RUN(test_start_projected_graph_rejects_changed_terminal_or_unrelated_itl_bytes);
 	UT_RUN(test_start_projected_graph_requires_full_canonical_identity_and_keeps_other_duties);

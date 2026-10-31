@@ -16,6 +16,8 @@ typedef struct RfPageCtrcOwnerGraphV1 {
 	RfPageCtrcOwnerReferencesV1 related;
 	uint32 count;
 	RfPageCtrcOwnerGraphEntryV1 *entries;
+	ClusterRecoveryCTRCGraphV2 contribution;
+	uint32 unresolved_count;
 } RfPageCtrcOwnerGraphV1;
 extern RfPageCtrcOwnerGraphV1 ClusterColdRecoveryCtrcPageOwnerGraph(
 	const struct ClusterRecoveryStartV1 *, Size);
