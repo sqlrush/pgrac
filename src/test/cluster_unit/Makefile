@@ -5237,6 +5237,7 @@ check_r11_source_removal_census:
 clean distclean maintainer-clean:
 	rm -f test_cluster_cold_history_scn.inc test_cluster_cold_history_scn.inc.tmp
 	rm -f test_cluster_clog_native_counter.inc test_cluster_clog_native_counter.inc.tmp
+	rm -f test_cluster_ctrc_projector.inc test_cluster_ctrc_projector.inc.tmp
 	rm -f test_cluster_clog_native_advance_next.inc test_cluster_clog_native_advance_next.inc.tmp
 	rm -f test_cluster_clog_native_horizon.inc test_cluster_clog_native_horizon.inc.tmp
 	rm -f test_cluster_cold_native_side.o
@@ -10958,3 +10959,12 @@ $(top_builddir)/src/backend/cluster/cluster_recovery_relation_census.o: 	$(top_s
 
 # Exact current ITL references use the original owner graph fixture.
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_reference_graph.inc
+
+# Reuse the complete original pure native ITL projector in this owner fixture.
+test_cluster_ctrc_projector.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
+	awk '/^(ctrc_itl_terminal_projection|ctrc_itl_image_overlaps|ctrc_itl_image_slot|ctrc_recovery_itl_tuples_valid|cluster_ctrc_recovery_itl_cleanout_image_v1)\(/ { print previous; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; complete++ } { previous=$$0 } \
+	     END { if (found != 5 || complete != 5) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_projected_graph.inc test_cluster_ctrc_projector.inc

@@ -405,6 +405,9 @@ typedef struct RfPageCtrcOwnerGraphEntryV1 {
 	 * NULL/zero retains an unresolved field, never a zero-reference proof. */
 	Size reference_key_length, reference_evidence_length;
 	const uint8 *reference_key, *reference_evidence;
+	/* Zero in the observation API. The explicit projected graph may supply
+	 * kind4 (discharged_by) for this current ITL only, never its history. */
+	uint16 reference_edge_kind;
 } RfPageCtrcOwnerGraphEntryV1;
 
 /* Complete reference order, with canonical PAGE owner contributions only for
@@ -415,7 +418,10 @@ typedef struct RfPageCtrcOwnerGraphEntryV1 {
  * keys belong to entries. Keep both original result allocations alive.
  * Changed/moved/invalid fields and historical/FREE/tuple references retain
  * NULL reference fields, including when a PAGE owner key is available.
- * This creates no discharged_by edge, complete graph or discharge verdict. */
+ * The observation API creates no discharged_by edge. The explicit projected
+ * API additionally executes the original terminal projection and marks kind4
+ * for that current ITL only; all other entries remain unresolved. Neither API
+ * supplies a complete graph, history/first/pin retirement or D0 verdict. */
 typedef struct RfPageCtrcOwnerGraphV1 {
 	RfPageProofDetailV1 detail;
 	RfPageCtrcOwnerReferencesV1 related;

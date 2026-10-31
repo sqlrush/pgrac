@@ -3555,14 +3555,64 @@ cluster_recovery_cold_page_owner_scopes_current(const struct ClusterRecoveryStar
 		start->ctrc_page_sources, source_count);
 }
 
-/* The original forest member is authoritative only while its complete ITL
- * is still present at that same field in the actual owner after-image.
+/* Verify one current field's original terminal projection, not a synthetic
+ * persistent before-image. Restore only that saved ITL into private scratch,
+ * invoke the original native projector, and require the WHOLE actual owner
+ * after-image back. This scratch never becomes DATA/base evidence. Its UBA,
+ * wrap, SCNs and first-change bytes cannot be replaced by another slot or T.
+ * Other tuple/HOT/history and owner effects remain separate obligations. */
+static bool
+cluster_recovery_cold_page_projected_reference(const ClusterRecoveryCensusReferenceV1 *reference,
+	const RfPageCtrcOwnerEvidenceV1 *proof, const ClusterColdTtSlotInputV1 *subjects, uint32 count)
+{
+	const ClusterRecoveryTxnKey *t = &reference->transaction.transaction;
+	const ClusterColdTtSlotInputV1 *subject = NULL;
+	const PageHeaderData *header = (const PageHeaderData *)proof->completed.owner.image.data;
+	const ClusterSpaceIdentityKey *space = &proof->completed.owner.space.key;
+	PGAlignedBlock scratch;
+	ClusterCtrcItlCleanoutApplyResult result;
+	uint8 itl_class;
+
+	if (reference->version != 0 || reference->entry.kind != CLUSTER_RECOVERY_HEAP_ITL
+		|| reference->entry.index >= CLUSTER_ITL_INITRANS_DEFAULT
+		|| t->system_identifier != space->system_identifier
+		|| t->database_incarnation != space->database_incarnation
+		|| header->pd_special != BLCKSZ - MAXALIGN(CLUSTER_ITL_SPECIAL_SIZE)) return false;
+	switch (reference->entry.itl.flags) {
+		case ITL_FLAG_ACTIVE: case ITL_FLAG_COMMITTED: case ITL_FLAG_ABORTED:
+		case ITL_FLAG_NEEDS_CLEANOUT: itl_class = 1; break;
+		case ITL_FLAG_LOCK_ONLY_ACTIVE: case ITL_FLAG_LOCK_ONLY_COMMITTED:
+		case ITL_FLAG_LOCK_ONLY_ABORTED: itl_class = 2; break;
+		default: return false;
+	}
+	for (uint32 i = 0; i < count; i++) {
+		const ClusterColdTtSlotKeyV1 *key = &subjects[i].key;
+		if (key->owner_instance == 0 || (uint32)t->origin_node_id + 1 != key->owner_instance
+			|| t->segment_id != key->segment_id || t->segment_generation != key->segment_generation
+			|| t->slot_offset != key->slot_offset || t->slot_wrap != key->slot_wrap || t->xid != key->xid)
+			continue;
+		if (subject != NULL) return false;
+		subject = &subjects[i];
+	}
+	if (subject == NULL) return false;
+	scratch = proof->completed.owner.image;
+	memcpy(scratch.data + header->pd_special + (Size)reference->entry.index * sizeof(ClusterItlSlotData),
+		&reference->entry.itl, sizeof(reference->entry.itl));
+	result = cluster_ctrc_recovery_itl_cleanout_image_v1(subject, reference->entry.index,
+		reference->entry.itl.wrap, itl_class, scratch.data, scratch.data);
+	return (result == CLUSTER_CTRC_ITL_CLEANOUT_REWRITTEN || result == CLUSTER_CTRC_ITL_CLEANOUT_ALREADY_TERMINAL)
+		&& memcmp(scratch.data, proof->completed.owner.image.data, BLCKSZ) == 0;
+}
+
+/* The observation mode requires the complete ITL unchanged at the same
+ * field. The explicit projected mode first executes the native predicate
+ * above against the original canonical terminal and actual owner image.
  * Reuse that image's DATA atom: inverse ordinals are not file generations,
  * and a different before-image must not borrow this after-image witness.
  * Missing/moved/changed fields remain explicit unresolved entries. */
 static void
 cluster_recovery_cold_page_reference_key(const ClusterRecoveryCensusReferenceV1 *reference,
-	const RfPageCtrcOwnerEvidenceV1 *proof, uint8 *key, RfPageCtrcOwnerGraphEntryV1 *entry)
+	const RfPageCtrcOwnerEvidenceV1 *proof, bool projected, uint8 *key, RfPageCtrcOwnerGraphEntryV1 *entry)
 {
 	const PageHeaderData *header = (const PageHeaderData *)proof->completed.owner.image.data;
 	const uint8 *id = proof->evidence + 26;
@@ -3582,7 +3632,7 @@ cluster_recovery_cold_page_reference_key(const ClusterRecoveryCensusReferenceV1 
 		|| (header->pd_lower - SizeOfPageHeaderData) % sizeof(ItemIdData) != 0)
 		return;
 	field = header->pd_special + (Size)reference->entry.index * sizeof(ClusterItlSlotData);
-	if (memcmp((const uint8 *)header + field, &reference->entry.itl, sizeof(reference->entry.itl)) != 0)
+	if (!projected && memcmp((const uint8 *)header + field, &reference->entry.itl, sizeof(reference->entry.itl)) != 0)
 		return;
 	/* Both envelopes were produced by the original owner codecs above; T34
 	 * comes from the full original forest/effect scope, never from raw xid. */
@@ -3597,8 +3647,8 @@ cluster_recovery_cold_page_reference_key(const ClusterRecoveryCensusReferenceV1 
 	entry->reference_evidence = proof->evidence; entry->reference_evidence_length = proof->evidence_length;
 }
 
-RfPageCtrcOwnerGraphV1
-ClusterColdRecoveryCtrcPageOwnerGraph(const struct ClusterRecoveryStartV1 *start, Size memory_budget)
+static RfPageCtrcOwnerGraphV1
+cluster_recovery_cold_page_owner_graph(const struct ClusterRecoveryStartV1 *start, Size memory_budget, bool projected)
 {
 	RfPageCtrcOwnerGraphV1 out = {0};
 	RfPageCtrcOwnerReferencesV1 volatile related = {0};
@@ -3607,13 +3657,15 @@ ClusterColdRecoveryCtrcPageOwnerGraph(const struct ClusterRecoveryStartV1 *start
 	ClusterRecoveryCtrcReplaySetSourceV1 *sources;
 	ClusterRecoveryWalSourceObservationV1 *observed;
 	ClusterRecoveryCensusReferenceV1 *fixed_references;
+	ClusterColdTtSlotInputV1 *terminals;
+	ClusterRecoveryTxResultObservationV1 accepted = {0};
 	const ClusterRecoveryCensusReferencesV1 *references;
 	const ClusterColdCtrcWorkV1 *work;
 	ClusterWalInputsV1 *scope;
 	Size bytes = 0, entry_offset, owner_offset, source_offset, observed_offset, reference_offset;
-	Size edge_offset, effect_offset, indexes_offset, data_offset, key_capacity, stride, scratch;
+	Size edge_offset, effect_offset, indexes_offset, data_offset, terminal_offset, key_capacity, stride, scratch;
 	const Size reference_capacity = MAXPGPATH + 105;
-	uint32 reference_count, owner_count, source_count, wal_count, edge_count = 0, max_edges = 0;
+	uint32 reference_count, owner_count, source_count, wal_count, terminal_count, edge_count = 0, max_edges = 0;
 	bool ready = false;
 
 	out.detail = RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
@@ -3625,6 +3677,8 @@ ClusterColdRecoveryCtrcPageOwnerGraph(const struct ClusterRecoveryStartV1 *start
 	references = start->ctrc_references; reference_count = references->count;
 	owner_count = start->ctrc_page_progress->target_count; source_count = start->ctrc_page_source_count;
 	wal_count = start->ctrc_page_wal_count; work = start->ctrc_observation_work; scope = start->ctrc_observation_inputs;
+	if (work == NULL) return out;
+	terminal_count = projected ? work->counts.subject_count : 0;
 	out.detail = RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE;
 	if (owner_count == 0 || source_count == 0 || source_count > RF_PAGE_STABLE_MAX_PARTICIPANTS) goto refused;
 	for (uint32 i = 0; i < owner_count; i++) {
@@ -3650,7 +3704,8 @@ ClusterColdRecoveryCtrcPageOwnerGraph(const struct ClusterRecoveryStartV1 *start
 		+ sizeof(((RfPageCtrcOwnerCompletionV1 *)0)->completion) + 26 + reference_capacity;
 	scratch = key_capacity + sizeof(out) + sizeof(related) + sizeof(ClusterRecoveryCTRCOwnerScopeV2)
 		+ sizeof(ClusterRecoveryPageWalV1) + sizeof(ClusterRecoveryCTRCOwnerEffectV2)
-		+ sizeof(RfPageOnlineTargetViewV1) + sizeof(ClusterRecoveryWalSourceObservationV1) + 128;
+		+ sizeof(RfPageOnlineTargetViewV1) + sizeof(ClusterRecoveryWalSourceObservationV1) + 128
+		+ sizeof(accepted) + (projected ? 3 * BLCKSZ + sizeof(ClusterRecoveryCensusReferenceV1) : 0);
 	if (!cluster_recovery_cold_page_reference_reserve(&bytes, Max(reference_count, 1), sizeof(*entries), &entry_offset)
 		|| !cluster_recovery_cold_page_reference_reserve(&bytes, owner_count, sizeof(*owners), &owner_offset)
 		|| !cluster_recovery_cold_page_reference_reserve(&bytes, source_count, sizeof(*sources), &source_offset)
@@ -3660,6 +3715,7 @@ ClusterColdRecoveryCtrcPageOwnerGraph(const struct ClusterRecoveryStartV1 *start
 		|| !cluster_recovery_cold_page_reference_reserve(&bytes, edge_count, sizeof(ClusterRecoveryCTRCOwnerEffectV2), &effect_offset)
 		|| !cluster_recovery_cold_page_reference_reserve(&bytes, owner_count * source_count, sizeof(uint32), &indexes_offset)
 		|| !cluster_recovery_cold_page_reference_reserve(&bytes, reference_count, stride, &data_offset)
+		|| !cluster_recovery_cold_page_reference_reserve(&bytes, terminal_count, sizeof(*terminals), &terminal_offset)
 		|| memory_budget < bytes || memory_budget - bytes < scratch) return out;
 	Assert(entry_offset == 0);
 	PG_TRY();
@@ -3673,6 +3729,7 @@ ClusterColdRecoveryCtrcPageOwnerGraph(const struct ClusterRecoveryStartV1 *start
 			sources = (ClusterRecoveryCtrcReplaySetSourceV1 *)((char *)entries + source_offset);
 			observed = (ClusterRecoveryWalSourceObservationV1 *)((char *)entries + observed_offset);
 			fixed_references = (ClusterRecoveryCensusReferenceV1 *)((char *)entries + reference_offset);
+			terminals = (ClusterColdTtSlotInputV1 *)((char *)entries + terminal_offset);
 			memcpy(sources, start->ctrc_page_sources, (Size)source_count * sizeof(*sources));
 			memcpy(fixed_references, references->entries, (Size)reference_count * sizeof(*fixed_references));
 			for (uint32 i = 0; valid && i < source_count; i++)
@@ -3707,6 +3764,11 @@ ClusterColdRecoveryCtrcPageOwnerGraph(const struct ClusterRecoveryStartV1 *start
 			valid = valid && position == edge_count
 				&& cluster_recovery_cold_page_owner_scopes_current(start, work, scope, owners, owner_count,
 					sources, observed, source_count, wal_count, references, fixed_references, reference_count);
+			if (valid && projected)
+				valid = work->counts.subject_count == terminal_count
+					&& cluster_recovery_ctrc_terminal_result_v1(start, work, &accepted)
+					&& cluster_recovery_cold_page_projection_subjects(start, work, scope, start->ctrc_page_progress,
+						terminals, &accepted, true);
 			if (valid) {
 				related = ClusterColdRecoveryCtrcPageOwnerReferences(start, memory_budget - bytes - scratch);
 				out.detail = related.detail;
@@ -3750,9 +3812,17 @@ ClusterColdRecoveryCtrcPageOwnerGraph(const struct ClusterRecoveryStartV1 *start
 					memcpy(atom + 18 + entry->key_length, proof->completed.completion, proof->completed.length);
 					entry->key = key; entry->evidence = evidence;
 					entry->evidence_length = proof->evidence_length + 26 + entry->key_length + proof->completed.length;
-					cluster_recovery_cold_page_reference_key(&fixed_references[i], proof,
-						key + stride - reference_capacity, entry);
+					if (!projected || cluster_recovery_cold_page_projected_reference(&fixed_references[i], proof,
+						terminals, terminal_count)) {
+						cluster_recovery_cold_page_reference_key(&fixed_references[i], proof, projected,
+							key + stride - reference_capacity, entry);
+						if (projected && entry->reference_key != NULL) entry->reference_edge_kind = 4;
+					}
 				}
+				if (valid && projected)
+					valid = work->counts.subject_count == terminal_count
+						&& cluster_recovery_cold_page_projection_subjects(start, work, scope, start->ctrc_page_progress,
+							terminals, &accepted, false);
 				ready = valid && cluster_recovery_cold_page_owner_scopes_current(start, work, scope, owners, owner_count,
 					sources, observed, source_count, wal_count, references, fixed_references, reference_count);
 			}
@@ -3778,6 +3848,18 @@ refused:
 	if (out.detail != RF_PAGE_PROOF_DETAIL_WOULD_BLOCK && out.detail != RF_PAGE_PROOF_DETAIL_OOM)
 		cluster_recovery_cold_page_plan_refuse(cluster_recovery_cold_start, out.detail);
 	return out;
+}
+
+RfPageCtrcOwnerGraphV1
+ClusterColdRecoveryCtrcPageOwnerGraph(const struct ClusterRecoveryStartV1 *start, Size memory_budget)
+{
+	return cluster_recovery_cold_page_owner_graph(start, memory_budget, false);
+}
+
+RfPageCtrcOwnerGraphV1
+ClusterColdRecoveryCtrcPageProjectedGraph(const struct ClusterRecoveryStartV1 *start, Size memory_budget)
+{
+	return cluster_recovery_cold_page_owner_graph(start, memory_budget, true);
 }
 
 static bool

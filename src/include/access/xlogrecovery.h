@@ -329,6 +329,16 @@ extern struct RfPageCtrcOwnerReferencesV1 ClusterColdRecoveryCtrcPageOwnerRefere
 struct RfPageCtrcOwnerGraphV1;
 extern struct RfPageCtrcOwnerGraphV1 ClusterColdRecoveryCtrcPageOwnerGraph(
 	const struct ClusterRecoveryStartV1 *start, Size memory_budget);
+/* Explicit current-ITL projection contribution. Revalidate the entire original
+ * canonical terminal vector before/after the same actual PAGE owners, then
+ * use the original pure ITL projector to check the same field's final bytes.
+ * Only exact DATA/plain-lock terminal projections supply kind4 to that PAGE
+ * owner. Historical/FREE/tuple/MX/unmatched references remain unresolved.
+ * The ordinary observation API above stays unchanged. Same whole budget,
+ * output/lifetime/WAIT/ERROR contract; no first/pin/history retirement, full
+ * G_ref/G_owner coverage, D0 admission or joint completion is provided. */
+extern struct RfPageCtrcOwnerGraphV1 ClusterColdRecoveryCtrcPageProjectedGraph(
+	const struct ClusterRecoveryStartV1 *start, Size memory_budget);
 struct RfPageCtrcFpiInsertV1;
 struct ClusterSharedFsPageV1;
 /* Local immutable membership only: the ORIGINAL retained result address and

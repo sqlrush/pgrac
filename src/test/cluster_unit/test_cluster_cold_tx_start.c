@@ -2508,11 +2508,22 @@ static void startup_local_empty_reset(void);
 #include "test_cluster_cold_ctrc_owner_references.inc"
 #include "test_cluster_cold_ctrc_owner_scopes.inc"
 #include "test_cluster_cold_ctrc_reference_graph.inc"
+#include "test_cluster_cold_ctrc_projected_graph.inc"
 
 #include "test_cluster_cold_ctrc_page_raw.inc"
 
 int main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_PROJECTED_GRAPH") != NULL) {
+		UT_PLAN(6);
+		UT_RUN(test_start_projected_graph_binds_real_data_and_lock_terminal_projection);
+		UT_RUN(test_start_projected_graph_rejects_changed_terminal_or_unrelated_itl_bytes);
+		UT_RUN(test_start_projected_graph_requires_full_canonical_identity_and_keeps_other_duties);
+		UT_RUN(test_start_projected_graph_ordinary_mode_never_claims_discharge);
+		UT_RUN(test_start_projected_graph_late_terminal_wait_error_preserve_whole_output_and_debt);
+		UT_RUN(test_start_projected_graph_reserves_whole_terminal_vector_before_page);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_START_PAGE_RAW") != NULL) {
 		UT_PLAN(2);
 		UT_RUN(test_start_page_raw_preserves_original_whole_bytes_and_pending_service);
@@ -3050,7 +3061,7 @@ int main(void)
 	}
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_FIRST
-	UT_PLAN(414);
+	UT_PLAN(420);
 	UT_RUN(test_start_borrows_only_its_original_completed_retention_owner);
 	UT_RUN(test_start_raw_records_keep_complete_original_bytes_and_empty_end);
 	UT_RUN(test_start_raw_records_refuse_incomplete_changed_bytes_hash_header_and_end);
@@ -3061,7 +3072,7 @@ int main(void)
 	UT_RUN(test_start_compound_groups_retain_complete_member_input_and_end);
 	UT_RUN(test_start_compound_groups_refuse_missing_mixed_or_nonempty_end);
 #else
-	UT_PLAN(397);
+	UT_PLAN(403);
 #endif
 	UT_RUN(test_startup_native_images_accept_only_unchanged_complete_terminal_page);
 	UT_RUN(test_startup_native_images_reject_unresolved_ambiguous_and_mx_itls);
@@ -3072,8 +3083,14 @@ int main(void)
 	UT_RUN(test_startup_native_directory_real_origin_cannot_be_discharged_by_wait);
 	UT_RUN(test_startup_native_directory_invalid_layout_and_partial_error_keep_debt);
 #else
-	UT_PLAN(389);
+	UT_PLAN(395);
 #endif
+	UT_RUN(test_start_projected_graph_binds_real_data_and_lock_terminal_projection);
+	UT_RUN(test_start_projected_graph_rejects_changed_terminal_or_unrelated_itl_bytes);
+	UT_RUN(test_start_projected_graph_requires_full_canonical_identity_and_keeps_other_duties);
+	UT_RUN(test_start_projected_graph_ordinary_mode_never_claims_discharge);
+	UT_RUN(test_start_projected_graph_late_terminal_wait_error_preserve_whole_output_and_debt);
+	UT_RUN(test_start_projected_graph_reserves_whole_terminal_vector_before_page);
 	UT_RUN(test_start_reference_graph_uses_actual_itl_offset_full_identity_and_same_owner_bytes);
 	UT_RUN(test_start_reference_graph_does_not_borrow_equal_xid_or_another_physical_slot);
 	UT_RUN(test_start_reference_graph_preserves_history_free_tuple_and_invalid_layout_as_unresolved);
