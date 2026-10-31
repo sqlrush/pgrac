@@ -13049,9 +13049,16 @@ COLD_NATIVE_SIDE_OBJS = test_cluster_cold_native_side.o $(CLUSTER_SIDE_XACT_O) \
 	test_cluster_side_xact_undo_product.o $(CLUSTER_SIDE_ROUTE_O) \
 	$(CLUSTER_RF_ROUTE_O) $(CLUSTER_REMOTE_XACT_IDENTITY_O)
 
+COLD_STARTUP_RELMAP_OBJS = test_cluster_cold_startup_relmap_storage.o \
+	test_cluster_cold_startup_relmap_authority.o test_cluster_cold_startup_relmap_executor.o \
+	test_cluster_relmap_pending_product.o \
+	$(top_builddir)/src/backend/cluster/cluster_relmap_retention_restore.o \
+	$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o
+
 test_cluster_cold_recovery_startup: test_cluster_cold_recovery_startup.c test_cluster_typed_prepare_phases.h unit_test.h $(CLUSTER_COLD_STARTUP_O) \
 		test_cluster_cold_startup_relmap.inc \
-		$(COLD_NATIVE_SIDE_OBJS) $(CLUSTER_UNIT_CRYPTOHASH_O) test_cluster_cold_native_side.h \
+		$(COLD_NATIVE_SIDE_OBJS) $(CLUSTER_UNIT_CRYPTOHASH_O) $(COLD_STARTUP_RELMAP_OBJS) test_cluster_cold_native_side.h \
+		test_cluster_cold_startup_relmap_replay.inc test_cluster_cold_startup_relmap_storage.h \
 		test_cluster_cold_native_storage.inc test_cluster_recovery_episode_clog.o \
 		test_cluster_recovery_episode_clog.h \
 		test_cluster_cold_native_clog_consumed.inc \
@@ -13075,7 +13082,7 @@ test_cluster_cold_recovery_startup: test_cluster_cold_recovery_startup.c test_cl
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_census.h \
 		cluster_unit_port_stubs.o $(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< $(CLUSTER_COLD_STARTUP_O) \
-		$(COLD_NATIVE_SIDE_OBJS) $(CLUSTER_UNIT_CRYPTOHASH_O) \
+		$(COLD_NATIVE_SIDE_OBJS) $(CLUSTER_UNIT_CRYPTOHASH_O) $(COLD_STARTUP_RELMAP_OBJS) \
 		test_cluster_recovery_episode_clog.o $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		test_cluster_cold_checkpoint_publisher.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_checkpoint.o \
@@ -15292,3 +15299,39 @@ $(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) test_cluster_cold_recovery_io_core.o: \
 		$(top_srcdir)/src/include/cluster/cluster_side_online_plan.h \
 		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
 		$(top_srcdir)/src/include/utils/relmapper.h
+
+# Original Startup declaration, sealed SIDE and dual-copy storage in one component.
+test_cluster_cold_startup_relmap_storage.o: test_cluster_cold_startup_relmap_storage.c \
+		test_cluster_cold_startup_relmap_storage.h test_cluster_cold_startup_relmap_storage_namespace.h \
+		test_cluster_relmap_v2_storage.c test_cluster_relmap_runtime_storage.inc \
+		test_cluster_relmap_recovery_arbitration.inc test_cluster_relmap_owner_conversion.inc \
+		test_cluster_relmap_staged_observation.inc unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_cold_relmap.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_PGRAC_CLUSTER -ffunction-sections -fdata-sections -c $< -o $@
+
+test_cluster_cold_startup_relmap_authority.o: test_cluster_cold_startup_relmap_authority.c \
+		test_cluster_cold_startup_relmap_storage_namespace.h \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_authority.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_authority.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_pending.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_v2.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_PGRAC_CLUSTER -ffunction-sections -fdata-sections -c $< -o $@
+
+test_cluster_cold_startup_relmap_executor.o: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_relmap.c \
+		test_cluster_cold_native_side_namespace.h test_cluster_cold_startup_relmap_storage_namespace.h \
+		$(top_srcdir)/src/include/cluster/cluster_cold_relmap.h \
+		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_plan_internal.h \
+		$(top_srcdir)/src/include/cluster/cluster_side_online_plan.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_PGRAC_CLUSTER -DUSE_CLUSTER_UNIT \
+		-include $(srcdir)/test_cluster_cold_native_side_namespace.h \
+		-DLWLockAcquire=startup_relmap_storage_LWLockAcquire \
+		-DLWLockRelease=startup_relmap_storage_LWLockRelease \
+		-DLWLockHeldByMe=startup_relmap_storage_LWLockHeldByMe \
+		-ffunction-sections -fdata-sections -c $< -o $@
+
+.PHONY: clean-startup-relmap-replay
+clean: clean-startup-relmap-replay
+clean-startup-relmap-replay:
+	rm -f test_cluster_cold_startup_relmap_storage.o test_cluster_cold_startup_relmap_authority.o \
+		test_cluster_cold_startup_relmap_executor.o

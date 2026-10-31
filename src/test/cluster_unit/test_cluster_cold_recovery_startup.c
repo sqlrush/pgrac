@@ -59,10 +59,14 @@
 #include "cluster/cluster_wal_tail.h"
 #include "utils/memutils.h"
 
+#include "test_cluster_cold_native_side.h"
+#include "test_cluster_cold_startup_relmap_storage.h"
+
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
 bool cluster_shared_config;
+volatile uint32 InterruptHoldoffCount;
 
 void
 ExceptionalCondition(const char *condition_name, const char *file_name, int line_number)
@@ -4125,6 +4129,7 @@ UT_TEST(test_full_clog_truncate_dispatch_uses_original_projection_identity)
 #include "test_cluster_cold_native_clog_consumed.inc"
 #include "test_cluster_cold_native_storage.inc"
 #include "test_cluster_cold_startup_relmap.inc"
+#include "test_cluster_cold_startup_relmap_replay.inc"
 
 UT_TEST(test_prepare_all_phases_use_the_same_original_deadline)
 {
@@ -4209,6 +4214,15 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
+	if (getenv("PGRAC_PRE2_TEST_STARTUP_RELMAP_REPLAY") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_startup_relmap_replays_original_sealed_carrier_between_other_pages);
+		UT_RUN(test_startup_relmap_missing_or_changed_carrier_refuses_before_files);
+		UT_RUN(test_startup_relmap_partial_write_and_late_error_retain_original_debt);
+		UT_RUN(test_startup_relmap_final_receipt_rechecks_original_source_and_side);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_STARTUP_RELMAP") != NULL) {
 		UT_PLAN(3);
 		UT_RUN(test_startup_declared_relmap_binds_database_before_capture);
@@ -4217,7 +4231,7 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(171);
+	UT_PLAN(175);
 	UT_RUN(test_pass2_source_drift_waits_for_post_ir_and_never_replays);
 	UT_RUN(test_pass2_current_and_sync_do_not_read_root);
 
@@ -4393,6 +4407,10 @@ main(void)
 	UT_RUN(test_startup_declared_relmap_binds_database_before_capture);
 	UT_RUN(test_startup_declared_relmap_cannot_drop_scan_or_seal_failure);
 	UT_RUN(test_startup_relmap_early_binding_refuses_before_scan);
+	UT_RUN(test_startup_relmap_replays_original_sealed_carrier_between_other_pages);
+	UT_RUN(test_startup_relmap_missing_or_changed_carrier_refuses_before_files);
+	UT_RUN(test_startup_relmap_partial_write_and_late_error_retain_original_debt);
+	UT_RUN(test_startup_relmap_final_receipt_rechecks_original_source_and_side);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
